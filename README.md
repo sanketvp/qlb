@@ -118,6 +118,22 @@ Place `.js` adapter files in `~/.qlb/plugins/`. QLB loads valid plugins alongsid
 
 See [docs/plugins.md](docs/plugins.md) for the exact adapter shape and a complete example.
 
+## Documentation
+
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — the core pipeline: adapters, live-query capacity model, confidence levels, headroom scoring, single-flight poll coalescing, credential refresh, storage, and the proxy.
+- [docs/PROVIDERS.md](docs/PROVIDERS.md) — per-provider detail for the five built-in adapters: credential source, usage signal, confidence level, and caveats.
+- [docs/CLI.md](docs/CLI.md) — full command reference with real flags and captured example output.
+- [docs/CREDENTIAL-SAFETY.md](docs/CREDENTIAL-SAFETY.md) — what QLB will and will not do with your credentials, and the crash-safety guarantees of the ownership migration.
+- [docs/DESIGN-HISTORY.md](docs/DESIGN-HISTORY.md) — how the design was reviewed, and why local usage accounting was deliberately removed.
+- [docs/plugins.md](docs/plugins.md) — adding custom providers as local JavaScript plugins.
+
+## Design philosophy
+
+Two documents are the most important reads before trusting this tool with real credentials:
+
+- [CREDENTIAL-SAFETY.md](docs/CREDENTIAL-SAFETY.md) — QLB can optionally take ownership of your credentials, but every credential-touching operation requires an explicit confirmation flag, has a rehearsal step before any real cutover, and has a documented rollback path. Every crash point resolves to "native still works" or "QLB works," never neither.
+- [DESIGN-HISTORY.md](docs/DESIGN-HISTORY.md) — the design went through six rounds of adversarial review before implementation, including one deliberate pivot: a local usage-reservation system was designed, found to have unfixable crash-safety issues, and replaced with the simpler pure-live-query model that shipped. "Why we don't do local usage reservations" is a real design note for anyone extending this.
+
 ## Development
 
 ```bash
