@@ -12,6 +12,14 @@ import {
 import { listPolicies, setPolicy } from './policy';
 import { LoopbackProxy } from './proxy';
 import { resolveFromSnapshots, providerForModel } from './resolve';
+import {
+  checkRetirementEligibility,
+  defaultNativePathForHarness,
+  defaultPingFn,
+  isRetireHarness,
+  retireNativeStore,
+  type RetireHarness,
+} from './retire';
 import { getStore, openStore, type Store } from './store';
 import type { AccountSnapshot, Adapter } from './types';
 
@@ -28,6 +36,8 @@ const USAGE = `Usage:
   qlb migrate rollback --pool-file <path> --owner-file <path> [--db <path>] [--target-dir <path>] [--confirm-real-cutover]
   qlb migrate resume   --pool-file <path> --owner-file <path> [--db <path>] [--target-dir <path>] [--confirm-real-cutover]
   qlb migrate status   [--pool-file <path>] [--owner-file <path>] [--db <path>] [--target-dir <path>] [--json]
+  qlb retire status  --harness claude-code|codex-cli [--json] [--db <path>]
+  qlb retire execute --harness claude-code|codex-cli --confirm-real-retirement [--db <path>]
 
 SAFETY: running migrate stage/rehearse/commit/rollback/resume without path
 overrides targets the REAL ~/.pi/agent/anthropic-pool.json and
@@ -36,7 +46,11 @@ overrides targets the REAL ~/.pi/agent/anthropic-pool.json and
 --pool-file / --owner-file (or --target-dir) pointing at a temp copy.
 Do NOT pass --confirm-real-cutover unless you intend to cut over live Pi.
 qlb gate codex makes a handful of real Codex backend requests (read-only
-use of ~/.codex/auth.json). Automated tests never take this path.`;
+use of ~/.codex/auth.json). Automated tests never take this path.
+qlb retire status is read-only. qlb retire execute is refused unless
+--confirm-real-retirement is passed AND eligibility gates pass (QLB_OWNED,
+7-day soak, 20 clean decisions, live ping). Do NOT run retire execute until
+those production soak criteria are actually met.`;
 
 type StatusOpts = { cmd: 'status'; json: boolean };
 type ResolveOpts = {
@@ -91,7 +105,16 @@ type ProxyOpts = {
   infoPath?: string;
   idleMs?: number;
 };
-type Opts = StatusOpts | ResolveOpts | MigrateOpts | PolicyOpts | GateOpts | ProxyOpts;
+type RetireSub = 'status' | 'execute';
+type RetireOpts = {
+  cmd: 'retire';
+  sub: RetireSub;
+  json: boolean;
+  harness: RetireHarness;
+  db?: string;
+  confirmRealRetirement: boolean;
+};
+type Opts = StatusOpts | ResolveOpts | MigrateOpts | PolicyOpts | GateOpts | ProxyOpts | RetireOpts;
 
 const MIGRATE_SUBS: readonly MigrateSub[] = [
   'stage',
@@ -288,6 +311,56 @@ function parseProxyArgs(argsIn: string[]): ProxyOpts {
   return { cmd: 'proxy', json, db, infoPath, idleMs };
 }
 
+function parseRetireArgs(argsIn: string[]): RetireOpts {
+  const args = [...argsIn];
+  const sub = args.shift();
+  if (sub === '-h' || sub === '--help' || sub === undefined) {
+    console.log(USAGE);
+    process.exit(0);
+  }
+  if (sub !== 'status' && sub !== 'execute') {
+    console.error('qlb retire: unknown subcommand. Expected status|execute');
+    console.error(USAGE);
+    process.exit(1);
+  }
+  const json = args.includes('--json');
+  if (json) args.splice(args.indexOf('--json'), 1);
+  const confirmRealRetirement = args.includes('--confirm-real-retirement');
+  if (confirmRealRetirement) {
+    args.splice(args.indexOf('--confirm-real-retirement'), 1);
+  }
+  const db = takeFlag(args, '--db');
+  const harnessRaw = takeFlag(args, '--harness');
+  if (args.length > 0) {
+    console.error(`qlb retire ${sub}: unknown argument ${args[0]}`);
+    console.error(USAGE);
+    process.exit(1);
+  }
+  if (!isRetireHarness(harnessRaw)) {
+    console.error(
+      'qlb retire: --harness is required and must be claude-code or codex-cli',
+    );
+    console.error(USAGE);
+    process.exit(1);
+  }
+  if (sub === 'execute' && !confirmRealRetirement) {
+    console.error(
+      'REFUSED: qlb retire execute requires --confirm-real-retirement.\n' +
+        'This would retire a native Claude Code / Codex CLI credential store.\n' +
+        'Run `qlb retire status --harness <h>` (read-only) first.',
+    );
+    process.exit(2);
+  }
+  return {
+    cmd: 'retire',
+    sub,
+    json,
+    harness: harnessRaw,
+    db,
+    confirmRealRetirement,
+  };
+}
+
 function parseArgs(argv: string[]): Opts {
   const raw = argv.slice(2);
   if (raw[0] === '-h' || raw[0] === '--help') {
@@ -305,6 +378,9 @@ function parseArgs(argv: string[]): Opts {
   }
   if (raw[0] === 'proxy') {
     return parseProxyArgs(raw.slice(1));
+  }
+  if (raw[0] === 'retire') {
+    return parseRetireArgs(raw.slice(1));
   }
 
   let cmd: 'status' | 'resolve' = 'status';
@@ -782,6 +858,52 @@ async function runProxy(opts: ProxyOpts): Promise<number> {
   return 0;
 }
 
+function printRetireStatus(
+  result: ReturnType<typeof checkRetirementEligibility>,
+  json: boolean,
+): void {
+  if (json) {
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+  console.log(`harness:    ${result.harness}`);
+  console.log(`eligible:   ${result.eligible ? 'yes' : 'no'}`);
+  console.log(`state:      ${result.migrationState ?? '(none)'}`);
+  console.log(
+    `committed:  ${result.committedAt != null ? new Date(result.committedAt).toISOString() : '(none)'}`,
+  );
+  console.log(`ok:         ${result.okDecisionCount} / 20`);
+  console.log(`failed:     ${result.failedDecisionCount}`);
+  if (result.reasons.length > 0) {
+    console.log('reasons:');
+    for (const reason of result.reasons) {
+      console.log(`  - ${reason}`);
+    }
+  }
+}
+
+async function runRetire(opts: RetireOpts): Promise<number> {
+  return withStore(opts.db, async (store) => {
+    if (opts.sub === 'status') {
+      const result = checkRetirementEligibility(store, opts.harness);
+      printRetireStatus(result, opts.json);
+      return result.eligible ? 0 : 1;
+    }
+    const result = await retireNativeStore(store, opts.harness, {
+      nativePathToRemove: defaultNativePathForHarness(opts.harness),
+      confirmRealRetirement: opts.confirmRealRetirement,
+      pingFn: () => defaultPingFn(opts.harness),
+    });
+    if (opts.json) {
+      console.log(JSON.stringify(result, null, 2));
+    } else {
+      console.log(`retired ${opts.harness}: ${result.nativePathRemoved} → ${result.backupPath}`);
+      console.log(`state:   ${result.state}`);
+    }
+    return 0;
+  });
+}
+
 async function main(): Promise<void> {
   const opts = parseArgs(process.argv);
   if (opts.cmd === 'status') {
@@ -825,6 +947,16 @@ async function main(): Promise<void> {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`qlb proxy: ${msg}`);
+      process.exit(1);
+    }
+  }
+  if (opts.cmd === 'retire') {
+    try {
+      const code = await runRetire(opts);
+      process.exit(code);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`qlb retire ${opts.sub}: ${msg}`);
       process.exit(1);
     }
   }

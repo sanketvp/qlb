@@ -89,6 +89,21 @@ export interface DecisionInput {
   snapshot_json: string;
 }
 
+/** Row shape of `decisions` as stored today (no `outcome` column). */
+export interface DecisionRow {
+  id: number;
+  ts: number;
+  session: string | null;
+  harness: string | null;
+  requested_model: string;
+  effort: string | null;
+  served_model: string | null;
+  account_id: string | null;
+  mode: string;
+  reason: string;
+  snapshot_json: string;
+}
+
 function ensurePrivateDir(dir: string): void {
   if (!existsSync(dir)) {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -519,6 +534,29 @@ export class Store {
       input.snapshot_json,
     );
     return Number(result.lastInsertRowid);
+  }
+
+  /**
+   * Read-only query over `decisions`. There is no `outcome` column — callers
+   * (Phase 4 retirement) classify ok/failed from mode/reason/snapshot_json.
+   */
+  listDecisions(opts: {
+    harnesses?: string[];
+    sinceTs?: number;
+  } = {}): DecisionRow[] {
+    const since = opts.sinceTs ?? 0;
+    const rows = this.db
+      .prepare(
+        `SELECT id, ts, session, harness, requested_model, effort, served_model,
+                account_id, mode, reason, snapshot_json
+         FROM decisions
+         WHERE ts >= ?
+         ORDER BY ts ASC`,
+      )
+      .all(since) as unknown as DecisionRow[];
+    if (!opts.harnesses || opts.harnesses.length === 0) return rows;
+    const allowed = new Set(opts.harnesses);
+    return rows.filter((r) => r.harness != null && allowed.has(r.harness));
   }
 
   getOverride(accountId: string): OverrideRow | null {
