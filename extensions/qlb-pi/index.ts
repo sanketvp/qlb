@@ -1,8 +1,18 @@
 // qlb-pi — Pi extension that selects accounts via `qlb resolve` (§4.9.1 / §4.8.3a).
 //
-// UNTESTED against a live Pi runtime. Do NOT install this into
-// ~/.pi/agent/extensions/ until you have manually verified it in a throwaway
-// Pi session. Activation is gated on ~/.pi/agent/qlb-owner.json (or
+// Request-shaping is intentionally duplicated from anthropic-pool
+// (request-shaping.ts / system-prompt-shaping.ts / constants.ts). A live
+// 2026-09-08 verification showed that sending an OAuth token without that
+// shaping is rejected as a third-party app (HTTP 400: "Third-party apps now
+// draw from your extra usage"). This copy is kept because Pi's jiti loader
+// loads each extension from its own directory; qlb-pi must not depend on
+// anthropic-pool remaining installed.
+//
+// NOT re-verified against a live Pi runtime after this fix — code compared
+// against the working anthropic-pool transport and covered by unit tests for
+// payload shaping + audit outcome classification. Do NOT install this into
+// ~/.pi/agent/extensions/ until a throwaway Pi session confirms a real OAuth
+// request succeeds. Activation is gated on ~/.pi/agent/qlb-owner.json (or
 // QLB_PI_REHEARSAL=1); without that marker the extension is inert, so even a
 // premature copy into the extensions dir cannot steal anthropic-pool's
 // registration. Copy/symlink is an explicit, deliberate user step — this
@@ -11,9 +21,10 @@
 // When active:
 //   - unregisters the built-in anthropic provider (same hook anthropic-pool
 //     uses at index.ts:55-60) and re-registers with a streamSimple that asks
-//     `qlb resolve` for the account, then injects that account's Keychain
-//     access token into the builtin Anthropic transport;
-//   - records each decision's outcome for audit (jsonl);
+//     `qlb resolve` for the account, injects that account's Keychain access
+//     token, and applies anthropic-pool's OAuth payload shaping via onPayload;
+//   - records each decision's outcome for audit (jsonl) from the real stream
+//     events / HTTP status — never assumed "ok";
 //   - adds `/qlb` (status / migrate status).
 //
 // QLB_PI_REHEARSAL=1  → force-active (forward rehearsal, S3), even with no owner file.
@@ -30,6 +41,12 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import type { Api, Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
+import {
+  classifyHttpStatus,
+  classifyProviderStreamEvent,
+  STREAM_ENDED_WITHOUT_SUCCESS,
+} from "./outcome.js";
+import { shapeAnthropicOAuthPayload } from "./request-shaping.js";
 
 const OWNER_FILE = join(homedir(), ".pi", "agent", "qlb-owner.json");
 const AUDIT_DIR = join(homedir(), ".qlb");
@@ -198,15 +215,40 @@ export default async function (pi: ExtensionAPI): Promise<void> {
             decision.accountId,
             label,
           );
-          const stream = builtin(model, context, { ...options, apiKey: access });
+          const callerOnPayload = options?.onPayload;
+          const onPayload: SimpleStreamOptions["onPayload"] = async (
+            payload: unknown,
+            payloadModel: unknown,
+          ) => {
+            const upstream = callerOnPayload
+              ? ((await callerOnPayload(payload, payloadModel as Model<Api>)) ??
+                payload)
+              : payload;
+            return shapeAnthropicOAuthPayload(upstream);
+          };
+          const stream = builtin(model, context, {
+            ...options,
+            apiKey: access,
+            onPayload,
+          });
+          let outcome: "ok" | "failed" = "failed";
+          let errorMessage: string | undefined = STREAM_ENDED_WITHOUT_SUCCESS;
           for await (const event of stream) {
             output.push(event as never);
+            const classified = classifyProviderStreamEvent(event);
+            if (classified) {
+              outcome = classified.outcome;
+              errorMessage = classified.error;
+            }
           }
           recordOutcome({
             decisionId: decision.decisionId,
             accountId: decision.accountId,
             model: model.id,
-            outcome: "ok",
+            outcome,
+            ...(outcome === "failed" && errorMessage
+              ? { error: errorMessage }
+              : {}),
           });
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
@@ -248,13 +290,15 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   });
 
   pi.on("after_provider_response", (event) => {
+    const status = (event as { status?: unknown }).status;
     recordOutcome({
       kind: "after_provider_response",
       decisionId: lastDecision?.decisionId,
       accountId: lastDecision?.accountId,
       model: lastDecision?.model,
-      provider: (event as { provider?: string })?.provider ?? lastDecision?.provider,
-      outcome: "ok",
+      provider: lastDecision?.provider,
+      status,
+      outcome: classifyHttpStatus(status),
     });
   });
 
