@@ -1,0 +1,15 @@
+{
+  "name": "qlb",
+  "owner": {
+    "name": "sanketvp",
+    "email": "54746633+sanketvp@users.noreply.github.com"
+  },
+  "description": "QLB's own marketplace: a single self-contained plugin for cross-provider AI quota load balancing.",
+  "plugins": [
+    {
+      "name": "qlb",
+      "source": "./",
+      "description": "Cross-provider quota load balancer: local quota visibility and multi-account selection across AI coding providers (Claude, Codex, Grok, Kimi, OpenRouter)."
+    }
+  ]
+}

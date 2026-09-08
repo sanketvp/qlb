@@ -62,6 +62,25 @@ This registers the extension file with Pi — **it is a separate step from insta
 
 Even fully installed this way, the extension is **inert by default**: it only activates when `~/.pi/agent/qlb-owner.json` exists, which is created solely by QLB's own `qlb migrate ... --confirm-real-cutover` flow — never automatically by `pi install`. See [Credential Safety](docs/CREDENTIAL-SAFETY.md) before running that migration.
 
+## Installing as a Claude Code plugin
+
+QLB ships a `.claude-plugin/` directory so this repo can act as its own [Claude Code](https://docs.claude.com/en/docs/claude-code) plugin marketplace — no central registry, no separate repo to publish. `.claude-plugin/marketplace.json` declares one plugin (`qlb`) sourced from `./`; `.claude-plugin/plugin.json` is that plugin's manifest, plus a single read-only slash command at `commands/qlb-status.md`.
+
+```bash
+claude plugin marketplace add https://github.com/sanketvp/qlb   # register this repo as a marketplace
+claude plugin install qlb@qlb                                    # install the qlb plugin from it
+```
+
+Both commands accept `-s/--scope user|project|local` (default `user`); prefer `--scope local` for a per-checkout test that never touches your global Claude Code config (verified: it writes only to that project's `.claude/settings.local.json`).
+
+What's included, deliberately minimal:
+
+- **`/qlb-status` slash command** — shells out to `qlb status` and shows the output verbatim. Read-only, fail-open: if `qlb` isn't installed or the call errors, it says so plainly instead of failing.
+
+A fuller integration (a hook that surfaces `qlb resolve` advisory info before each request, mirroring the Pi extension and the `qlb_advisory` pattern in `pi-dispatch.sh`) was considered but deferred — Claude Code's hook lifecycle/event shape for this use case wasn't exercised enough in this pass to ship with confidence under the same fail-open safety bar as the rest of QLB's integrations. The slash command above is the safe, minimal starting point; a hook can follow once validated the same way.
+
+As with the Pi extension, this **registers** the plugin — it does not install the `qlb` CLI itself. Run `bash scripts/install.sh` (or `npm install && npm run build && npm link`) from this repo first so `qlb status` has something to call.
+
 ## Status views
 
 `qlb status` (default human view) is a **dashboard**: one block per account with a health glyph, credential-ownership state, and any active override, then indented bucket rows.
