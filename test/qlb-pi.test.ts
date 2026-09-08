@@ -168,60 +168,107 @@ describe('qlb-pi footer helpers', () => {
 
   it('always returns exactly 2 lines and degrades when width is small', () => {
     const identity = (s: string) => s;
-    const wide = buildFooterLines({
-      width: 80,
-      account: {
-        accountId: 'account-3',
-        label: 'sanket.patel@gmail.com',
-        model: 'claude-sonnet-5',
-        index: 2,
-        buckets: [{ key: '5h', usedPct: 20 }, { key: '7d', usedPct: 20 }],
-      },
-      health: { ...EMPTY_HEALTH, ownedStores: 5, accountCount: 8, overall: 'PASS' },
-      model: 'claude-sonnet-5',
+    const painters = {
       paintAccount: identity,
       paintDim: identity,
       paintWarn: identity,
-      truncate: (text, width) => text.slice(0, width),
-      visible: (text) => text.length,
+      paintAccent: identity,
+      truncate: (text: string, width: number) => text.slice(0, width),
+      visible: (text: string) => text.length,
+    };
+    const session = {
+      sessionId: '01a07d63-7a10-717c-8fa1-587b5bb7dc3e',
+      repo: 'qlb',
+      branch: 'main',
+      contextPercent: 12.4,
+    };
+    const account = {
+      accountId: 'account-3',
+      label: 'sanket.patel@gmail.com',
+      model: 'claude-sonnet-5',
+      index: 2,
+      buckets: [{ key: '5h', usedPct: 20 }, { key: '7d', usedPct: 20 }],
+    };
+    const wide = buildFooterLines({
+      width: 120,
+      session,
+      account,
+      health: { ...EMPTY_HEALTH, ownedStores: 5, accountCount: 8, overall: 'PASS' },
+      model: 'claude-sonnet-5',
+      ...painters,
     });
     assert.equal(wide.length, 2);
-    assert.match(wide[0], /★ sanket.patel/);
-    assert.match(wide[0], /5h 20%/);
+    assert.match(wide[0], /sid:01a07d63-7a10-717c-8fa1-587b5bb7dc3e/);
+    assert.match(wide[0], /qlb/);
+    assert.match(wide[0], /main/);
+    assert.match(wide[0], /12%ctx/);
+    assert.match(wide[0], /claude-sonnet-5/);
+    assert.match(wide[1], /★ sanket.patel/);
+    assert.match(wide[1], /5h 20%/);
     assert.match(wide[1], /sync ok/);
+    assert.match(wide[1], /5 owned/);
 
     const narrow = buildFooterLines({
       width: 12,
-      account: {
-        accountId: 'account-3',
-        label: 'sanket.patel@gmail.com',
-        model: 'claude-sonnet-5',
-        index: 2,
-        buckets: [{ key: '5h', usedPct: 20 }, { key: '7d', usedPct: 20 }],
-      },
+      session,
+      account,
       health: { ...EMPTY_HEALTH, ownedStores: 5, accountCount: 8, overall: 'WARN', nativeSyncWarn: 1 },
       model: 'claude-sonnet-5',
-      paintAccount: identity,
-      paintDim: identity,
-      paintWarn: identity,
-      truncate: (text, width) => text.slice(0, width),
-      visible: (text) => text.length,
+      ...painters,
     });
     assert.equal(narrow.length, 2);
     assert.ok(narrow[0].length <= 12);
     assert.ok(narrow[1].length <= 12);
+    assert.match(narrow[0], /sid:/);
 
     const empty = buildFooterLines({
       width: 0,
+      session,
       account: null,
       health: EMPTY_HEALTH,
+      model: 'claude-sonnet-5',
+      ...painters,
+    });
+    assert.deepEqual(empty, ['', '']);
+  });
+
+  it('keeps usage numbers on line 2 ahead of account counts when width is tight', () => {
+    const identity = (s: string) => s;
+    const mid = buildFooterLines({
+      width: 42,
+      session: {
+        sessionId: 'abc',
+        repo: 'qlb',
+        branch: 'main',
+        contextPercent: null,
+      },
+      account: {
+        accountId: 'account-1',
+        label: 'sanket.patel@gmail.com',
+        model: 'claude-sonnet-5',
+        index: 0,
+        buckets: [{ key: '5h', usedPct: 12 }, { key: '7d', usedPct: 33 }],
+      },
+      health: {
+        ...EMPTY_HEALTH,
+        ownedStores: 5,
+        accountCount: 8,
+        nativeSyncWarn: 1,
+        overall: 'WARN',
+      },
       model: 'claude-sonnet-5',
       paintAccount: identity,
       paintDim: identity,
       paintWarn: identity,
+      paintAccent: identity,
       truncate: (text, width) => text.slice(0, width),
       visible: (text) => text.length,
     });
-    assert.deepEqual(empty, ['', '']);
+    assert.equal(mid.length, 2);
+    assert.match(mid[0], /sid:abc/);
+    assert.match(mid[0], /ctx\?/);
+    assert.match(mid[1], /5h 12%/);
+    assert.match(mid[1], /1 drift/);
+    assert.equal(mid[1].includes('8 accts'), false);
   });
 });
