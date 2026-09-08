@@ -12,6 +12,7 @@ export interface QlbConfig {
   pluginsDir: string;
   proxyInfoPath: string;
   claudeCodeCredentialsPath: string;
+  defaultStrategy: string;
   configPath: string;
 }
 
@@ -27,6 +28,7 @@ const FIELD_META: Record<ConfigField, { env: string; flag: string }> = {
   pluginsDir: { env: 'QLB_PLUGINS_DIR', flag: '--plugins-dir' },
   proxyInfoPath: { env: 'QLB_PROXY_INFO_PATH', flag: '--proxy-info-path' },
   claudeCodeCredentialsPath: { env: 'QLB_CLAUDE_CODE_CREDENTIALS_PATH', flag: '--claude-code-credentials-path' },
+  defaultStrategy: { env: 'QLB_DEFAULT_STRATEGY', flag: '--default-strategy' },
 };
 
 export const CONFIG_ENV_VARS = Object.fromEntries(
@@ -45,6 +47,7 @@ export function defaultConfig(home: string = homedir()): QlbConfig {
     pluginsDir: join(qlbDir, 'plugins'),
     proxyInfoPath: join(qlbDir, 'proxy.json'),
     claudeCodeCredentialsPath: join(home, '.claude', 'Claude Code-credentials'),
+    defaultStrategy: 'headroom',
     configPath: join(qlbDir, 'config.json'),
   };
 }
@@ -100,6 +103,16 @@ export function resolveConfig(options: ResolveConfigOptions = {}): QlbConfig {
   ]>) {
     const raw = cliValue(argv, meta.flag) ?? env[meta.env] ?? fileConfig[field] ?? defaults[field];
     if (typeof raw !== 'string' || raw.length === 0) continue;
+    if (field === 'defaultStrategy') {
+      const allowed = new Set(['headroom', 'spread', 'round-robin', 'failover']);
+      if (!allowed.has(raw)) {
+        warn(`qlb: ignoring invalid defaultStrategy '${raw}'; using 'headroom'`);
+        result[field] = 'headroom';
+        continue;
+      }
+      result[field] = raw;
+      continue;
+    }
     result[field] = field.endsWith('Path') || field.endsWith('File') || field.endsWith('Dir')
       ? expandPath(raw, home)
       : raw;

@@ -27,7 +27,9 @@ import {
 } from './migration';
 import { listPolicies, setPolicy } from './policy';
 import { LoopbackProxy } from './proxy';
+import { parseUntil } from './overrides';
 import { resolveFromSnapshots, providerForModel } from './resolve';
+import { isStrategy, STRATEGIES, type Strategy } from './scoring';
 import {
   checkRetirementEligibility,
   defaultNativePathForHarness,
@@ -54,7 +56,12 @@ const USAGE = `Usage:
   qlb native-resync --provider anthropic|xai|kimi-coding|openai-codex|openrouter --account <id> [--json] [--db <path>]
   qlb status [--json] [--dashboard|--flat]
   qlb setup pi|claude-code|codex-cli|generic [--json]
-  qlb resolve --model <modelId> [--fallback m1,m2,...] [--session <id>] [--harness pi|claude-code|codex|dispatch] [--effort <lvl>] [--json]
+  qlb resolve --model <modelId> [--fallback m1,m2,...] [--session <id>] [--harness pi|claude-code|codex|dispatch] [--effort <lvl>] [--strategy headroom|spread|round-robin|failover] [--json]
+  qlb override pin --session <id> --account <account-id> [--until <ISO-datetime|2h>] [--db <path>] [--json]
+  qlb override reserve --account <account-id> [--until <ISO-datetime|2h>] [--db <path>] [--json]
+  qlb override drain-first --account <account-id> [--until <ISO-datetime|2h>] [--db <path>] [--json]
+  qlb override clear --session <id> | --account <account-id> | --all [--db <path>] [--json]
+  qlb override list [--db <path>] [--json]
   qlb policy set --harness <h> --virtual-model <name> --real-model <id> --effort <lvl> [--fallback m1,m2] [--session-mode header|anon] [--db <path>] [--json]
   qlb policy list [--harness <h>] [--db <path>] [--json]
   qlb gate codex [--json] [--db <path>]
@@ -92,9 +99,11 @@ health glyph, ownership, overrides). Pass --flat for the original bucket
 table. --json keeps {fetchedAt, accounts} and adds ownership, override,
 health, healthGlyph on each account (additive; existing fields unchanged).
 qlb setup prints copy-paste snippets only and never edits files outside
-this repo (setup pi writes scripts/hooks/pi-advisory.sh here). No override
-CLI is wired yet — status shows override=none unless a row already exists
-in the overrides table.`;
+this repo (setup pi writes scripts/hooks/pi-advisory.sh here).
+qlb override pin/reserve/drain-first: --until defaults to 24h from now when
+omitted (ISO datetime or duration like 2h/30m/1d). Pin forces that account
+for one session id; reserve excludes an account from automatic selection;
+drain-first biases selection toward an account.`;
 
 type StatusOpts = { cmd: 'status'; json: boolean; view: 'dashboard' | 'flat' };
 type SetupOpts = { cmd: 'setup'; json: boolean; harness: SetupHarness };
@@ -108,7 +117,41 @@ type ResolveOpts = {
   session?: string;
   harness?: string;
   effort?: string;
+  strategy: Strategy;
 };
+type OverridePinOpts = {
+  cmd: 'override';
+  sub: 'pin';
+  json: boolean;
+  db?: string;
+  session: string;
+  account: string;
+  until?: string;
+};
+type OverrideAccountOpts = {
+  cmd: 'override';
+  sub: 'reserve' | 'drain-first';
+  json: boolean;
+  db?: string;
+  account: string;
+  until?: string;
+};
+type OverrideClearOpts = {
+  cmd: 'override';
+  sub: 'clear';
+  json: boolean;
+  db?: string;
+  session?: string;
+  account?: string;
+  all: boolean;
+};
+type OverrideListOpts = {
+  cmd: 'override';
+  sub: 'list';
+  json: boolean;
+  db?: string;
+};
+type OverrideOpts = OverridePinOpts | OverrideAccountOpts | OverrideClearOpts | OverrideListOpts;
 type MigrateSub = 'stage' | 'rehearse' | 'commit' | 'rollback' | 'resume' | 'status';
 type MigrateOpts = {
   cmd: 'migrate';
@@ -170,7 +213,7 @@ type NativeResyncOpts = {
   account: string;
   db?: string;
 };
-type Opts = InitOpts | DoctorOpts | StatusOpts | SetupOpts | ResolveOpts | MigrateOpts | PolicyOpts | GateOpts | ProxyOpts | RetireOpts | NativeResyncOpts;
+type Opts = InitOpts | DoctorOpts | StatusOpts | SetupOpts | ResolveOpts | MigrateOpts | PolicyOpts | GateOpts | ProxyOpts | RetireOpts | NativeResyncOpts | OverrideOpts;
 
 const MIGRATE_SUBS: readonly MigrateSub[] = [
   'stage',
@@ -501,6 +544,64 @@ function parseNativeResyncArgs(argsIn: string[]): NativeResyncOpts {
   return { cmd: 'native-resync', json, provider: providerRaw, account, db };
 }
 
+function parseOverrideArgs(argsIn: string[]): OverrideOpts {
+  const args = [...argsIn];
+  const sub = args.shift();
+  if (sub === '-h' || sub === '--help' || sub === undefined) {
+    console.log(USAGE);
+    process.exit(0);
+  }
+  const known = new Set(['pin', 'reserve', 'drain-first', 'clear', 'list']);
+  if (!known.has(sub)) {
+    console.error('qlb override: unknown subcommand. Expected pin|reserve|drain-first|clear|list');
+    console.error(USAGE);
+    process.exit(1);
+  }
+  const json = args.includes('--json');
+  if (json) args.splice(args.indexOf('--json'), 1);
+  const all = args.includes('--all');
+  if (all) args.splice(args.indexOf('--all'), 1);
+  const db = takeFlag(args, '--db');
+  const session = takeFlag(args, '--session');
+  const account = takeFlag(args, '--account');
+  const until = takeFlag(args, '--until');
+  if (args.length > 0) {
+    console.error(`qlb override ${sub}: unknown argument ${args[0]}`);
+    console.error(USAGE);
+    process.exit(1);
+  }
+  if (sub === 'list') {
+    return { cmd: 'override', sub: 'list', json, db };
+  }
+  if (sub === 'clear') {
+    if (!session && !account && !all) {
+      console.error('qlb override clear: require --session, --account, or --all');
+      console.error(USAGE);
+      process.exit(1);
+    }
+    return { cmd: 'override', sub: 'clear', json, db, session, account, all };
+  }
+  if (sub === 'pin') {
+    if (!session || !account) {
+      console.error('qlb override pin: --session and --account are required');
+      console.error(USAGE);
+      process.exit(1);
+    }
+    return { cmd: 'override', sub: 'pin', json, db, session, account, until };
+  }
+  if (sub !== 'reserve' && sub !== 'drain-first') {
+    console.error('qlb override: unknown subcommand. Expected pin|reserve|drain-first|clear|list');
+    console.error(USAGE);
+    process.exit(1);
+  }
+  if (!account) {
+    console.error(`qlb override ${sub}: --account is required`);
+    console.error(USAGE);
+    process.exit(1);
+  }
+  return { cmd: 'override', sub, json, db, account, until };
+}
+
 function parseArgs(argv: string[]): Opts {
   const raw = stripConfigArgs(argv).slice(2);
   if (raw[0] === '-h' || raw[0] === '--help') {
@@ -547,6 +648,9 @@ function parseArgs(argv: string[]): Opts {
   if (raw[0] === 'native-resync') {
     return parseNativeResyncArgs(raw.slice(1));
   }
+  if (raw[0] === 'override') {
+    return parseOverrideArgs(raw.slice(1));
+  }
   if (raw[0] === 'setup') {
     return parseSetupArgs(raw.slice(1));
   }
@@ -564,6 +668,7 @@ function parseArgs(argv: string[]): Opts {
   let session: string | undefined;
   let harness: string | undefined;
   let effort: string | undefined;
+  let strategyRaw: string | undefined;
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
@@ -602,6 +707,10 @@ function parseArgs(argv: string[]): Opts {
       effort = args[++i];
       continue;
     }
+    if (arg === '--strategy') {
+      strategyRaw = args[++i];
+      continue;
+    }
     if (arg === '-h' || arg === '--help') {
       console.log(USAGE);
       process.exit(0);
@@ -616,7 +725,15 @@ function parseArgs(argv: string[]): Opts {
       console.error(USAGE);
       process.exit(1);
     }
-    return { cmd, json, model, fallback, session, harness, effort };
+    const strategyCandidate = strategyRaw ?? config.defaultStrategy;
+    if (!isStrategy(strategyCandidate)) {
+      console.error(
+        `qlb resolve: --strategy must be ${STRATEGIES.join('|')} (got '${strategyCandidate}')`,
+      );
+      console.error(USAGE);
+      process.exit(1);
+    }
+    return { cmd, json, model, fallback, session, harness, effort, strategy: strategyCandidate };
   }
   return { cmd: 'status', json, view };
 }
@@ -806,6 +923,11 @@ async function collectSnapshots(models: string[]): Promise<AccountSnapshot[]> {
 
 function printResolveHuman(decision: ReturnType<typeof resolveFromSnapshots>): void {
   if (!decision.ok) {
+    if (decision.error === 'PINNED_UNAVAILABLE') {
+      console.log('PINNED_UNAVAILABLE');
+      console.log(decision.reason);
+      return;
+    }
     console.log('EXHAUSTED');
     if (decision.earliestReset) {
       console.log(
@@ -825,6 +947,7 @@ function printResolveHuman(decision: ReturnType<typeof resolveFromSnapshots>): v
   console.log(`requested: ${decision.requestedModel}`);
   console.log(`served:    ${decision.servedModel}`);
   console.log(`mode:      ${decision.mode}`);
+  console.log(`strategy:  ${decision.strategy}`);
   console.log(`reason:    ${decision.reason}`);
   for (const [bucket, reading] of Object.entries(decision.snapshot.buckets)) {
     console.log(
@@ -835,6 +958,22 @@ function printResolveHuman(decision: ReturnType<typeof resolveFromSnapshots>): v
 
 function printResolveJson(decision: ReturnType<typeof resolveFromSnapshots>): void {
   if (!decision.ok) {
+    if (decision.error === 'PINNED_UNAVAILABLE') {
+      console.log(
+        JSON.stringify(
+          {
+            error: 'PINNED_UNAVAILABLE',
+            requestedModel: decision.requestedModel,
+            accountId: decision.accountId,
+            reason: decision.reason,
+            decisionId: decision.decisionId,
+          },
+          null,
+          2,
+        ),
+      );
+      return;
+    }
     console.log(
       JSON.stringify(
         {
@@ -860,6 +999,7 @@ function printResolveJson(decision: ReturnType<typeof resolveFromSnapshots>): vo
         servedModel: decision.servedModel,
         reason: decision.reason,
         mode: decision.mode,
+        strategy: decision.strategy,
         snapshot: decision.snapshot,
       },
       null,
@@ -881,6 +1021,7 @@ async function runResolve(opts: ResolveOpts): Promise<number> {
     session: opts.session,
     harness: opts.harness,
     effort: opts.effort,
+    strategy: opts.strategy,
     snapshots,
     store: getStore(),
   });
@@ -1124,6 +1265,70 @@ async function runRetire(opts: RetireOpts): Promise<number> {
   });
 }
 
+function printOverride(row: { kind: string; account_id: string; session: string | null; until: number | null }, json: boolean): void {
+  if (json) {
+    console.log(JSON.stringify(row));
+    return;
+  }
+  const until =
+    row.until == null ? 'never' : new Date(row.until).toISOString();
+  const session = row.session ? ` session=${row.session}` : '';
+  console.log(`${row.kind}  account=${row.account_id}${session}  until=${until}`);
+}
+
+async function runOverride(opts: OverrideOpts): Promise<number> {
+  return withStore(opts.db, (store) => {
+    if (opts.sub === 'list') {
+      const rows = store.listActiveOverrides();
+      if (opts.json) {
+        console.log(JSON.stringify({ overrides: rows }, null, 2));
+      } else if (rows.length === 0) {
+        console.log('(no overrides)');
+      } else {
+        for (const row of rows) printOverride(row, false);
+      }
+      return 0;
+    }
+    if (opts.sub === 'clear') {
+      const cleared = store.clearOverrides({
+        all: opts.all,
+        session: opts.session,
+        accountId: opts.account,
+      });
+      if (opts.json) {
+        console.log(JSON.stringify({ cleared }));
+      } else {
+        console.log(`cleared ${cleared} override${cleared === 1 ? '' : 's'}`);
+      }
+      return 0;
+    }
+    let until: number;
+    try {
+      until = parseUntil(opts.until);
+    } catch (err) {
+      console.error(`qlb override ${opts.sub}: ${err instanceof Error ? err.message : String(err)}`);
+      return 1;
+    }
+    const account = opts.account;
+    const session = opts.sub === 'pin' ? opts.session : null;
+    const row = store.upsertOverride({
+      kind: opts.sub,
+      accountId: account,
+      session,
+      until,
+    });
+    if (opts.json) {
+      console.log(JSON.stringify(row, null, 2));
+    } else {
+      printOverride(row, false);
+      if (!opts.until) {
+        console.log('(until defaulted to 24h from now)');
+      }
+    }
+    return 0;
+  });
+}
+
 async function runNativeResync(opts: NativeResyncOpts): Promise<number> {
   return withStore(opts.db, async (store) => {
     const resync = bindDetectAndResync({
@@ -1230,6 +1435,16 @@ async function main(): Promise<void> {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`qlb native-resync: ${msg}`);
+      process.exit(1);
+    }
+  }
+  if (opts.cmd === 'override') {
+    try {
+      const code = await runOverride(opts);
+      process.exit(code);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`qlb override: ${msg}`);
       process.exit(1);
     }
   }

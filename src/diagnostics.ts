@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
 import { builtInAdapters } from './adapters';
@@ -246,6 +246,58 @@ function combineOverall(checks: Array<{ level: CheckLevel }>): CheckLevel {
   return 'PASS';
 }
 
+function parseDetailJson(raw: string | null | undefined): Record<string, unknown> {
+  if (!raw) return {};
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+  } catch {
+    // ignore
+  }
+  return {};
+}
+
+function ownerPathForMigrationStore(
+  store: string,
+  config: QlbConfig,
+  detail: Record<string, unknown>,
+): string {
+  if (typeof detail.ownerFilePath === 'string' && detail.ownerFilePath.length > 0) {
+    return detail.ownerFilePath;
+  }
+  const dir = dirname(config.piAuthJsonPath);
+  if (store === 'pi-pool') return join(dir, 'qlb-owner.json');
+  const provider = store.startsWith('pi-') ? store.slice(3) : store;
+  return join(dir, `qlb-owner-${provider}.json`);
+}
+
+function ownerFilePresence(ownerPath: string): 'absent' | 'staging' | 'present' {
+  if (existsSync(ownerPath)) return 'present';
+  if (existsSync(`${ownerPath}.staging`)) return 'staging';
+  return 'absent';
+}
+
+/**
+ * Incomplete / mid-flight migrations WARN. Terminal states PASS:
+ * NATIVE, QLB_OWNED, RETIRED, and post-rollback VALIDATED with ownerFile absent.
+ */
+function isStuckMigration(
+  migration: { store: string; state: string; detail_json?: string },
+  config: QlbConfig,
+): boolean {
+  if (migration.state === 'NATIVE' || migration.state === 'QLB_OWNED' || migration.state === 'RETIRED') {
+    return false;
+  }
+  if (migration.state === 'VALIDATED') {
+    const detail = parseDetailJson(migration.detail_json);
+    const ownerPath = ownerPathForMigrationStore(migration.store, config, detail);
+    return ownerFilePresence(ownerPath) !== 'absent';
+  }
+  return true;
+}
+
 function probeCredentialStore(command?: CommandRunner): DoctorCheck {
   // Tests inject a command runner and still speak the macOS `security` CLI.
   if (command) {
@@ -304,7 +356,7 @@ export async function doctorQlb(
   } = {},
 ): Promise<DoctorReport> {
   const checks: DoctorCheck[] = [];
-  let migrations: Array<{ store: string; state: string }> = [];
+  let migrations: Array<{ store: string; state: string; detail_json?: string }> = [];
   let accounts: Array<{ id: string; provider: string; label: string }> = [];
 
   if (!existsSync(config.dbPath)) {
@@ -321,7 +373,11 @@ export async function doctorQlb(
       }
       const table = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='migrations'").get();
       if (table) {
-        migrations = db.prepare('SELECT store, state FROM migrations').all() as Array<{ store: string; state: string }>;
+        migrations = db.prepare('SELECT store, state, detail_json FROM migrations').all() as Array<{
+          store: string;
+          state: string;
+          detail_json?: string;
+        }>;
       }
       const acctTable = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='accounts'").get();
       if (acctTable) {
@@ -338,7 +394,7 @@ export async function doctorQlb(
     }
   }
 
-  const stuck = migrations.filter((migration) => !['NATIVE', 'QLB_OWNED'].includes(migration.state));
+  const stuck = migrations.filter((migration) => isStuckMigration(migration, config));
   checks.push(stuck.length > 0
     ? {
         name: 'migrations',

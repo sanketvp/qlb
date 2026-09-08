@@ -414,6 +414,61 @@ describe('inspectOwnedNativeDrift (read-only)', () => {
   });
 });
 
+describe('openai-codex JWT credential parsing', () => {
+  it('reads a tokens.access_token Keychain payload without reporting unreadable', () => {
+    const jwt =
+      'eyJhbGciOiJIUzI1NiJ9.eyJjaGF0Z3B0X2FjY291bnRfaWQiOiJhY2N0LWNvZGV4LTEifQ.sig';
+    const payload = JSON.stringify({
+      tokens: {
+        access_token: jwt,
+        refresh_token: 'rt-codex',
+        id_token: jwt,
+        account_id: 'acct-codex-1',
+      },
+    });
+    const parsed = parseResyncCredential(payload);
+    assert.equal(parsed.access, jwt);
+    assert.ok(!('type' in parsed && (parsed as { type?: string }).type === 'api-key'));
+  });
+
+  it('doctor native-sync compares an openai-codex JWT credential stored under accountId not email label', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-codex-jwt-'));
+    temps.push(home);
+    const cfg = defaultConfig(home);
+    const accountId = 'acct-codex-1';
+    const emailLabel = 'codex-user@example.com';
+    const jwt =
+      'eyJhbGciOiJIUzI1NiJ9.eyJjaGF0Z3B0X2FjY291bnRfaWQiOiJhY2N0LWNvZGV4LTEifQ.sig';
+    const store = openStore(cfg.dbPath);
+    store.upsertAccount(accountId, 'openai-codex', emailLabel);
+    store.upsertMigration('pi-openai-codex', 'QLB_OWNED');
+    store.close();
+
+    const kc = new MockKeychain();
+    const cred = JSON.stringify({
+      tokens: {
+        access_token: jwt,
+        refresh_token: 'rt-codex',
+        id_token: jwt,
+        account_id: accountId,
+      },
+    });
+    kc.setSync(qlbKeychainService('openai-codex', accountId), accountId, cred);
+
+    const report = await doctorQlb(cfg, {
+      command: () => 'ok',
+      keychain: kc,
+      readNativeCredential: async () => parseResyncCredential(cred),
+    });
+    const check = report.checks.find((c) => c.name === `native-sync:${accountId}`);
+    assert.ok(check, JSON.stringify(report.checks));
+    assert.notEqual(check.level, 'WARN');
+    assert.equal(check.level, 'PASS');
+    assert.equal((check.detail as { matches?: boolean } | undefined)?.matches, true);
+    assert.doesNotMatch(check.message, /unreadable/);
+  });
+});
+
 describe('qlb doctor native-sync checks', () => {
   it('reports drift for a QLB_OWNED account without writing Keychain', async () => {
     const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-resync-'));

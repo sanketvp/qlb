@@ -149,6 +149,15 @@ describe('CLI smoke — documented commands', () => {
     }
   });
 
+  it('override list --json exits 0 with an empty list', () => {
+    const env = isolatedEnv();
+    const result = runCli(['override', 'list', '--json', '--db', env.QLB_DB_PATH!], env);
+    assert.equal(result.status, 0, result.stderr);
+    const body = parseJson(result.stdout) as { overrides: unknown[] };
+    assert.ok(Array.isArray(body.overrides));
+    assert.equal(body.overrides.length, 0);
+  });
+
   it('policy list --json exits 0', () => {
     const env = isolatedEnv();
     const result = runCli(['policy', 'list', '--json', '--db', env.QLB_DB_PATH!], env);

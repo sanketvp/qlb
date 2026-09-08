@@ -75,12 +75,74 @@ export function isApiKeyCredential(c: ResyncCredential): c is ApiKeyPayload {
   return (c as ApiKeyPayload).type === 'api-key';
 }
 
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  return value as Record<string, unknown>;
+}
+
+function grantFromAccess(
+  access: string,
+  refresh: string,
+  extra?: Record<string, unknown>,
+  expires?: number,
+  generation?: number,
+): Grant {
+  const grant: Grant = {
+    access,
+    refresh,
+    expires: expires ?? 0,
+    generation: generation ?? 0,
+  };
+  if (extra) grant.extra = extra;
+  return grant;
+}
+
+/**
+ * Parse a QLB-owned Keychain payload. Accepts the Grant shape, api-key
+ * payloads, and the openai-codex JWT / `tokens.access_token` shape used by
+ * Codex CLI `auth.json` copies.
+ */
 export function parseResyncCredential(raw: string): ResyncCredential {
   const parsed: unknown = JSON.parse(raw);
-  if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-    const obj = parsed as Record<string, unknown>;
-    if (obj.type === 'api-key') return parseApiKeyPayload(raw);
+  const obj = asRecord(parsed);
+  if (!obj) {
+    throw new Error('invalid credential JSON');
   }
+  if (obj.type === 'api-key') return parseApiKeyPayload(raw);
+
+  if (typeof obj.access === 'string' && obj.access.length > 0) {
+    const extra = asRecord(obj.extra) ?? undefined;
+    const grant: Grant = {
+      access: obj.access,
+      refresh: typeof obj.refresh === 'string' ? obj.refresh : '',
+      expires: Number(obj.expires) || 0,
+      generation: Number(obj.generation) || 0,
+    };
+    if (typeof obj.writtenBy === 'string') grant.writtenBy = obj.writtenBy;
+    if (extra) grant.extra = extra;
+    return grant;
+  }
+
+  const tokens = asRecord(obj.tokens);
+  if (tokens && typeof tokens.access_token === 'string' && tokens.access_token.length > 0) {
+    const extra: Record<string, unknown> = { shape: 'openai-codex-tokens' };
+    if (typeof tokens.id_token === 'string') extra.id_token = tokens.id_token;
+    if (typeof tokens.account_id === 'string') extra.accountId = tokens.account_id;
+    return grantFromAccess(
+      tokens.access_token,
+      typeof tokens.refresh_token === 'string' ? tokens.refresh_token : '',
+      extra,
+    );
+  }
+
+  if (typeof obj.access_token === 'string' && obj.access_token.length > 0) {
+    return grantFromAccess(
+      obj.access_token,
+      typeof obj.refresh_token === 'string' ? obj.refresh_token : '',
+      { shape: 'openai-codex-tokens' },
+    );
+  }
+
   return parseGrant(raw);
 }
 
@@ -246,15 +308,22 @@ export function readOwnedCredentialFromKeychain(
   accountId: string,
   label: string,
 ): ResyncCredential | null {
-  try {
-    const service = qlbKeychainService(provider, accountId);
-    const account = label || accountId;
-    const raw = keychain.getSync(service, account);
-    if (isStaticKeyProvider(provider)) return parseApiKeyPayload(raw);
-    return parseResyncCredential(raw);
-  } catch {
-    return null;
+  const service = qlbKeychainService(provider, accountId);
+  const names = [label, accountId].filter((n) => typeof n === 'string' && n.length > 0);
+  const tried = new Set<string>();
+  for (const account of names) {
+    if (tried.has(account)) continue;
+    tried.add(account);
+    try {
+      const raw = keychain.getSync(service, account);
+      if (isStaticKeyProvider(provider)) return parseApiKeyPayload(raw);
+      return parseResyncCredential(raw);
+    } catch {
+      // try the next account name (Codex adapter labels with JWT email,
+      // while migration stores the item under the chatgpt_account_id).
+    }
   }
+  return null;
 }
 
 export function writeOwnedCredentialToKeychain(

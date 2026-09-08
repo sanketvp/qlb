@@ -56,7 +56,7 @@ If `npm link` cannot write a global bin, the script prints fallbacks (`PATH`, el
 | ⚠ | any bucket 80–99% |
 | ✗ | any bucket at 100%, or the account has an error |
 
-Ownership is `NATIVE` / `MIRRORED` / `VALIDATED` / `QLB_OWNED` / `RETIRED` from `qlb migrate status` for that provider. Overrides show `none` unless a row already exists in the `overrides` table (no pin/reserve/drain-first CLI is wired yet).
+Ownership is `NATIVE` / `MIRRORED` / `VALIDATED` / `QLB_OWNED` / `RETIRED` from `qlb migrate status` for that provider. Overrides show `none` unless a pin/reserve/drain-first row is active (`qlb override …`).
 
 ```bash
 qlb status                 # dashboard (default)
@@ -104,6 +104,7 @@ Values resolve in this order: command-line flag, environment variable, `~/.qlb/c
 | `pluginsDir` | `QLB_PLUGINS_DIR` | `--plugins-dir` |
 | `proxyInfoPath` | `QLB_PROXY_INFO_PATH` | `--proxy-info-path` |
 | `claudeCodeCredentialsPath` | `QLB_CLAUDE_CODE_CREDENTIALS_PATH` | `--claude-code-credentials-path` |
+| `defaultStrategy` | `QLB_DEFAULT_STRATEGY` | `--default-strategy` |
 
 Use `QLB_CONFIG_PATH` or `--config` to select a different JSON config file.
 

@@ -879,6 +879,103 @@ export class Store {
   setConfig(key: string, value: string): void {
     this.setConfigStmt.run(key, value);
   }
+
+  getPinOverride(session: string, now: number = Date.now()): OverrideRow | null {
+    const row = this.db
+      .prepare(
+        `SELECT kind, account_id, session, until FROM overrides
+         WHERE kind = 'pin' AND session = ? AND (until IS NULL OR until > ?)
+         ORDER BY rowid DESC
+         LIMIT 1`,
+      )
+      .get(session, now) as OverrideRow | undefined;
+    return row ?? null;
+  }
+
+  listActiveOverrides(now: number = Date.now()): OverrideRow[] {
+    return this.db
+      .prepare(
+        `SELECT kind, account_id, session, until FROM overrides
+         WHERE until IS NULL OR until > ?
+         ORDER BY kind, account_id, session`,
+      )
+      .all(now) as unknown as OverrideRow[];
+  }
+
+  upsertOverride(row: {
+    kind: string;
+    accountId: string;
+    session?: string | null;
+    until: number | null;
+  }): OverrideRow {
+    const session = row.session ?? null;
+    this.runImmediate(() => {
+      if (row.kind === 'pin') {
+        this.db
+          .prepare(`DELETE FROM overrides WHERE kind = 'pin' AND session = ?`)
+          .run(session);
+      } else {
+        this.db
+          .prepare(
+            `DELETE FROM overrides WHERE kind = ? AND account_id = ? AND (session IS NULL OR session = ?)`,
+          )
+          .run(row.kind, row.accountId, session);
+      }
+      this.db
+        .prepare(
+          `INSERT INTO overrides (kind, account_id, session, until) VALUES (?, ?, ?, ?)`,
+        )
+        .run(row.kind, row.accountId, session, row.until);
+    });
+    return {
+      kind: row.kind,
+      account_id: row.accountId,
+      session,
+      until: row.until,
+    };
+  }
+
+  clearOverrides(opts: {
+    session?: string;
+    accountId?: string;
+    all?: boolean;
+    now?: number;
+  }): number {
+    return this.runImmediate(() => {
+      if (opts.all) {
+        const result = this.db.prepare('DELETE FROM overrides').run();
+        return Number(result.changes);
+      }
+      if (opts.session) {
+        const result = this.db
+          .prepare('DELETE FROM overrides WHERE session = ?')
+          .run(opts.session);
+        return Number(result.changes);
+      }
+      if (opts.accountId) {
+        const result = this.db
+          .prepare('DELETE FROM overrides WHERE account_id = ?')
+          .run(opts.accountId);
+        return Number(result.changes);
+      }
+      return 0;
+    });
+  }
+
+  /**
+   * Atomically increment a per-provider round-robin index modulo `count`.
+   * Uses BEGIN IMMEDIATE so concurrent resolvers cannot observe the same slot.
+   */
+  nextRoundRobinIndex(key: string, count: number): number {
+    if (count <= 0) return 0;
+    return this.runImmediate(() => {
+      const raw = this.getConfig(key);
+      const last = raw != null && /^-?\d+$/.test(raw) ? Number(raw) : -1;
+      const next = (last + 1) % count;
+      this.setConfig(key, String(next));
+      return next;
+    });
+  }
 }
 
 export function newestFetchedAt(buckets: Record<string, BucketReading>): number | null {

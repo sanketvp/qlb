@@ -203,7 +203,33 @@ $ qlb resolve --model claude-sonnet-5 --json
 
 (`earliestReset` is `null` when no candidate has a known reset time.) Exit code `1`.
 
-Flags: `--model <modelId>` (required), `[--fallback m1,m2,...]`, `[--session <id>]`, `[--harness pi|claude-code|codex|dispatch]`, `[--effort <lvl>]`, `[--json]`. Model → provider mapping is documented in `src/scoring.ts`: `claude*` → anthropic, `gpt-*`/`*sol*`/`*astra*`/`*luna*`/`*terra*` → openai-codex, `*grok*` → xai, `*k3*`/`*kimi*` → kimi-coding, `openrouter/*`, `z-ai/*`, `*glm*` → openrouter.
+Flags: `--model <modelId>` (required), `[--fallback m1,m2,...]`, `[--session <id>]`, `[--harness pi|claude-code|codex|dispatch]`, `[--effort <lvl>]`, `[--strategy headroom|spread|round-robin|failover]` (default `headroom`, or `defaultStrategy` from config), `[--json]`. Model → provider mapping is documented in `src/scoring.ts`: `claude*` → anthropic, `gpt-*`/`*sol*`/`*astra*`/`*luna*`/`*terra*` → openai-codex, `*grok*` → xai, `*k3*`/`*kimi*` → kimi-coding, `openrouter/*`, `z-ai/*`, `*glm*` → openrouter.
+
+Strategies:
+
+- `headroom` — existing Rule-S score, single best account, headroom-then-all-in (default; unchanged).
+- `spread` — same scoring, but near-tied candidates (within `SPREAD_MARGIN` = 10) are split across session ids via a deterministic hash of `--session`. No session id → falls back to `headroom`.
+- `round-robin` — ignore scores except to skip exhausted/error accounts; cycle in account-id order using a SQLite counter.
+- `failover` — stick to the current account while every relevant bucket is under 100%; switch only when it is genuinely exhausted.
+
+## `qlb override`
+
+Explicit pin / reserve / drain-first over the existing `overrides` table. `--until` is an ISO datetime or a duration like `2h` / `30m` / `1d`. When omitted, the default lifetime is **24 hours from now**.
+
+```console
+$ qlb override pin --session synth-session-1 --account acct-a --until 2h --json
+$ qlb override reserve --account acct-b --json
+$ qlb override drain-first --account acct-c --json
+$ qlb override list --json
+{ "overrides": [] }
+$ qlb override clear --all --json
+```
+
+- `pin` — `resolve --session <id>` always returns that account (bypassing scoring). If the pinned account is unusable, resolve fails with `PINNED_UNAVAILABLE` rather than silently substituting.
+- `reserve` — exclude the account from automatic selection for every session.
+- `drain-first` — consider this account before the others until it is exhausted.
+- `clear` — `--session`, `--account`, or `--all`.
+- `list` — active (non-expired) rows only.
 
 ## `qlb policy`
 

@@ -606,6 +606,14 @@ export class LoopbackProxy {
     });
 
     if (!decision.ok) {
+      if (decision.error === 'PINNED_UNAVAILABLE') {
+        sendJson(req, res, 503, {
+          error: 'PINNED_UNAVAILABLE',
+          accountId: decision.accountId,
+          reason: decision.reason,
+        });
+        return;
+      }
       sendJson(req, res, 503, {
         error: 'EXHAUSTED',
         earliestReset: decision.earliestReset,

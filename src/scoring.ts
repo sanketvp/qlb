@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import type { AccountSnapshot, Adapter, BucketReading } from './types';
 
 /** Spec §4.3.1 Rule S / §4.4. Far below any real (positive) headroom score. */
@@ -7,6 +8,21 @@ export const WEEKLY_SCARCITY = 0.6;
 export const FIVE_H_SCARCITY = 1.0;
 export const DEFAULT_CEILING = 80;
 export const ALL_IN_CEILING = 100;
+
+/** A2-4 near-tie window (Rule-S score points). Used by the `spread` strategy. */
+export const SPREAD_MARGIN = 10;
+
+export const STRATEGIES = ['headroom', 'spread', 'round-robin', 'failover'] as const;
+export type Strategy = (typeof STRATEGIES)[number];
+
+export function isStrategy(value: string | undefined): value is Strategy {
+  return !!value && (STRATEGIES as readonly string[]).includes(value);
+}
+
+/** Deterministic, process-stable hash of a session id for `spread`. */
+export function hashSession(session: string): number {
+  return createHash('sha256').update(session).digest().readUInt32BE(0);
+}
 
 export type BucketClass = '5h' | 'weekly' | 'balance' | 'other';
 

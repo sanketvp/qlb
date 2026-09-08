@@ -40,6 +40,10 @@ const OK_MODES = new Set([
   'all-in',
   'fallback',
   'fallback-all-in',
+  'pin',
+  'spread',
+  'round-robin',
+  'failover',
 ]);
 
 export function isRetireHarness(value: string | undefined): value is RetireHarness {

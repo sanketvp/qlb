@@ -30,6 +30,40 @@ describe('configuration precedence', () => {
     assert.equal(config.anthropicPoolPath, join(home, 'from-cli.json'));
     assert.equal(config.piAuthJsonPath, join(home, 'pi-from-env.json'));
     assert.equal(config.codexAuthJsonPath, join(home, '.codex', 'auth.json'));
+    assert.equal(config.defaultStrategy, 'headroom');
+  });
+
+  it('resolves defaultStrategy from env/file and rejects unknown names', () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-config-strategy-'));
+    const configPath = join(home, '.qlb', 'config.json');
+    mkdirSync(join(home, '.qlb'));
+    writeFileSync(configPath, JSON.stringify({ defaultStrategy: 'spread' }));
+
+    const fromFile = resolveConfig({
+      home,
+      argv: [],
+      env: { QLB_CONFIG_PATH: configPath },
+      warn: () => undefined,
+    });
+    assert.equal(fromFile.defaultStrategy, 'spread');
+
+    const fromEnv = resolveConfig({
+      home,
+      argv: [],
+      env: { QLB_CONFIG_PATH: configPath, QLB_DEFAULT_STRATEGY: 'failover' },
+      warn: () => undefined,
+    });
+    assert.equal(fromEnv.defaultStrategy, 'failover');
+
+    const warnings: string[] = [];
+    const invalid = resolveConfig({
+      home,
+      argv: ['--default-strategy', 'not-a-strategy'],
+      env: { QLB_CONFIG_PATH: configPath },
+      warn: (m) => warnings.push(m),
+    });
+    assert.equal(invalid.defaultStrategy, 'headroom');
+    assert.ok(warnings.some((w) => /defaultStrategy/.test(w)));
   });
 
   it('expands both ~/ and ~\\ home prefixes', () => {
