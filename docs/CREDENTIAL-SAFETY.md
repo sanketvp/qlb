@@ -60,6 +60,17 @@ Providers differ in how their credentials are stored, and QLB adapts rather than
 - **Shared `auth.json` entries** (xai, kimi-coding, openai-codex live as keys in one file used by other providers too): QLB **never deletes or renames that shared file**. The native entry is shadow-retained on disk; ownership is recorded in a per-provider owner file and the migration journal, and QLB's consumers prefer the Keychain copy for that provider.
 - **OpenRouter's static API key**: lives in your Keychain under its original service name. QLB reads it and never writes that service at all.
 
+## Native credential drift: the shadow-retain tradeoff
+
+For the shadow-retain providers (**xai, kimi-coding, openai-codex, openrouter** — and for any provider whose migration is only partially rolled out), QLB's owned credential is a *copy* of a credential that still exists natively and may still be used by native tooling. If anything else on the machine refreshes the same underlying account independently — a native extension, another CLI, a scheduled job — the provider may rotate the access token on each refresh, and each rotation silently invalidates QLB's frozen copy. The symptom is an authentication error (for example, `401 ... token has been revoked` or `401 token expired`) on a QLB-owned account, with QLB's own refresh machinery showing no involvement.
+
+This is a known, **structural property of sharing credentials with native tooling**, not a bug to be fully eliminated. QLB's refresh fencing (generation CAS, heartbeat lease) coordinates QLB's own processes; it cannot coordinate with a refresher that doesn't know QLB exists. The risk is mitigated, not removed:
+
+- **Detection is planned**: a mechanism to detect native credential drift and resync QLB's owned copy was identified as necessary and is in active development. Once it ships, `qlb doctor` is expected to surface this condition proactively rather than leaving it to be discovered as an auth failure. (As of this writing it is planned, not shipped.)
+- **Immediate manual fallback**: re-authenticate the affected account through the **native tool's own login flow**, then bring QLB's ownership of that credential back to a clean state. The credential-safety design has always treated native re-auth as the ultimate fallback — QLB never blocks the native tool from re-authenticating its own accounts, which is exactly what makes recovery straightforward when drift bites.
+
+If you run both QLB-owned and native consumers against the same accounts simultaneously, treat an unexpected auth error on the QLB side as a likely native drift event first, and a QLB-side refresh failure second — check `qlb status` / `qlb doctor`, and check whether a native tool refreshed the account recently.
+
 ## Concurrent refreshes: fenced, not hopeful
 
 Once QLB owns a grant, several processes may need to refresh it at once (a token is single-use under rotation, so only one refresher may talk to the provider). Two mechanisms protect this (`src/refresh-lease.ts`):
@@ -90,3 +101,4 @@ Even after QLB owns your credentials, the original native stores for harnesses l
 | Stale backups | Never trusted: rollback re-exports QLB's *current* grants; backups are used only with a fingerprint proving they were never rotated |
 | Proxy credential access | Fails closed unless the journal says `QLB_OWNED`/`RETIRED` |
 | Native store removal | Last step, gated on a 7-day / 20-clean-decision soak plus an explicit flag |
+| Native refresh invalidating QLB's copy (shadow-retain providers) | Structural risk of shared credentials, mitigated not eliminated; see [Native credential drift](#native-credential-drift-the-shadow-retain-tradeoff) — drift detection/resync planned, native re-auth is the manual fallback |
