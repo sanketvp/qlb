@@ -27,7 +27,48 @@ qlb status --json
 qlb resolve --model claude-sonnet-5 --json
 ```
 
+Or run the idempotent installer (Node.js >= 22, `npm ci`/`npm install`, build, optional global `npm link`, then `qlb init`):
+
+```bash
+bash scripts/install.sh
+```
+
+If `npm link` cannot write a global bin, the script prints fallbacks (`PATH`, `sudo`, or `npx`) and still bootstraps via `node dist/cli.js init`.
+
 `qlb init` detects existing credential sources, reports anything missing, and writes a reviewable starter file at `~/.qlb/config.json`. It never prompts, so it is safe to use in scripts and CI. `qlb doctor` performs local checks only by default; add `--live` to opt into provider network calls.
+
+## Status views
+
+`qlb status` (default human view) is a **dashboard**: one block per account with a health glyph, credential-ownership state, and any active override, then indented bucket rows.
+
+| Glyph | Meaning |
+|---|---|
+| ✓ | every bucket under 80% |
+| ⚠ | any bucket 80–99% |
+| ✗ | any bucket at 100%, or the account has an error |
+
+Ownership is `NATIVE` / `MIRRORED` / `VALIDATED` / `QLB_OWNED` / `RETIRED` from `qlb migrate status` for that provider. Overrides show `none` unless a row already exists in the `overrides` table (no pin/reserve/drain-first CLI is wired yet).
+
+```bash
+qlb status                 # dashboard (default)
+qlb status --dashboard     # same as default
+qlb status --flat          # original provider | account | bucket table
+qlb status --json          # additive JSON: existing fields kept; adds ownership, override, health, healthGlyph
+```
+
+`--json` does not remove or rename fields, so existing parsers of `qlb status --json` keep working.
+
+## Harness setup (`qlb setup`)
+
+Non-destructive. Prints copy-paste snippets only; never edits files outside this repo (the `pi` harness also writes `scripts/hooks/pi-advisory.sh` here so you can `source` it).
+
+```bash
+qlb setup pi                 # verbatim qlb_advisory() from Pi dispatch; source scripts/hooks/pi-advisory.sh
+qlb setup claude-code        # ANTHROPIC_BASE_URL + Bearer / x-api-key against qlb proxy
+qlb setup codex-cli          # ~/.codex/config.toml model_provider pointing at POST /v1/responses
+qlb setup generic            # qlb resolve --json + jq, for cron / CI / any shell runner
+qlb setup pi --json          # { harness, instructions, snippetWritten? }
+```
 
 ## Built-in providers
 

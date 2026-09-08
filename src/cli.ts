@@ -31,13 +31,23 @@ import {
   retireNativeStore,
   type RetireHarness,
 } from './retire';
+import {
+  enrichAccounts,
+  formatDashboard,
+  formatRelative,
+  formatUsedPct,
+  makeOwnershipReader,
+  overrideFromStore,
+} from './dashboard';
+import { isSetupHarness, setupHarness, type SetupHarness } from './setup';
 import { getStore, openStore, type Store } from './store';
 import type { AccountSnapshot, Adapter } from './types';
 
 const USAGE = `Usage:
   qlb init [--json]
   qlb doctor [--json] [--live]
-  qlb status [--json]
+  qlb status [--json] [--dashboard|--flat]
+  qlb setup pi|claude-code|codex-cli|generic [--json]
   qlb resolve --model <modelId> [--fallback m1,m2,...] [--session <id>] [--harness pi|claude-code|codex|dispatch] [--effort <lvl>] [--json]
   qlb policy set --harness <h> --virtual-model <name> --real-model <id> --effort <lvl> [--fallback m1,m2] [--session-mode header|anon] [--db <path>] [--json]
   qlb policy list [--harness <h>] [--db <path>] [--json]
@@ -70,9 +80,18 @@ use of ~/.codex/auth.json). Automated tests never take this path.
 qlb retire status is read-only. qlb retire execute is refused unless
 --confirm-real-retirement is passed AND eligibility gates pass (QLB_OWNED,
 7-day soak, 20 clean decisions, live ping). Do NOT run retire execute until
-those production soak criteria are actually met.`;
+those production soak criteria are actually met.
+Default qlb status human view is the dashboard (grouped by account with
+health glyph, ownership, overrides). Pass --flat for the original bucket
+table. --json keeps {fetchedAt, accounts} and adds ownership, override,
+health, healthGlyph on each account (additive; existing fields unchanged).
+qlb setup prints copy-paste snippets only and never edits files outside
+this repo (setup pi writes scripts/hooks/pi-advisory.sh here). No override
+CLI is wired yet — status shows override=none unless a row already exists
+in the overrides table.`;
 
-type StatusOpts = { cmd: 'status'; json: boolean };
+type StatusOpts = { cmd: 'status'; json: boolean; view: 'dashboard' | 'flat' };
+type SetupOpts = { cmd: 'setup'; json: boolean; harness: SetupHarness };
 type InitOpts = { cmd: 'init'; json: boolean };
 type DoctorOpts = { cmd: 'doctor'; json: boolean; live: boolean };
 type ResolveOpts = {
@@ -138,7 +157,7 @@ type RetireOpts = {
   db?: string;
   confirmRealRetirement: boolean;
 };
-type Opts = InitOpts | DoctorOpts | StatusOpts | ResolveOpts | MigrateOpts | PolicyOpts | GateOpts | ProxyOpts | RetireOpts;
+type Opts = InitOpts | DoctorOpts | StatusOpts | SetupOpts | ResolveOpts | MigrateOpts | PolicyOpts | GateOpts | ProxyOpts | RetireOpts;
 
 const MIGRATE_SUBS: readonly MigrateSub[] = [
   'stage',
@@ -414,6 +433,30 @@ function parseRetireArgs(argsIn: string[]): RetireOpts {
   };
 }
 
+function parseSetupArgs(argsIn: string[]): SetupOpts {
+  const args = [...argsIn];
+  if (args[0] === '-h' || args[0] === '--help') {
+    console.log(USAGE);
+    process.exit(0);
+  }
+  const json = args.includes('--json');
+  if (json) args.splice(args.indexOf('--json'), 1);
+  const harness = args.shift();
+  if (args.length > 0) {
+    console.error(`qlb setup: unknown argument ${args[0]}`);
+    console.error(USAGE);
+    process.exit(1);
+  }
+  if (!isSetupHarness(harness)) {
+    console.error(
+      'qlb setup: harness is required (pi|claude-code|codex-cli|generic)',
+    );
+    console.error(USAGE);
+    process.exit(1);
+  }
+  return { cmd: 'setup', json, harness };
+}
+
 function parseArgs(argv: string[]): Opts {
   const raw = stripConfigArgs(argv).slice(2);
   if (raw[0] === '-h' || raw[0] === '--help') {
@@ -457,6 +500,9 @@ function parseArgs(argv: string[]): Opts {
   if (raw[0] === 'retire') {
     return parseRetireArgs(raw.slice(1));
   }
+  if (raw[0] === 'setup') {
+    return parseSetupArgs(raw.slice(1));
+  }
 
   let cmd: 'status' | 'resolve' = 'status';
   const args = [...raw];
@@ -465,6 +511,7 @@ function parseArgs(argv: string[]): Opts {
   }
 
   let json = false;
+  let view: 'dashboard' | 'flat' = 'dashboard';
   let model: string | undefined;
   let fallback: string[] = [];
   let session: string | undefined;
@@ -475,6 +522,14 @@ function parseArgs(argv: string[]): Opts {
     const arg = args[i];
     if (arg === '--json') {
       json = true;
+      continue;
+    }
+    if (arg === '--dashboard') {
+      view = 'dashboard';
+      continue;
+    }
+    if (arg === '--flat') {
+      view = 'flat';
       continue;
     }
     if (arg === '--model') {
@@ -516,7 +571,7 @@ function parseArgs(argv: string[]): Opts {
     }
     return { cmd, json, model, fallback, session, harness, effort };
   }
-  return { cmd: 'status', json };
+  return { cmd: 'status', json, view };
 }
 
 function assertSafeMigratePaths(opts: MigrateOpts): void {
@@ -554,28 +609,6 @@ async function safeFetch(adapter: Adapter): Promise<AccountSnapshot[]> {
       },
     ];
   }
-}
-
-function formatRelative(resetAt?: number): string {
-  if (resetAt == null || !Number.isFinite(resetAt)) return '-';
-  const deltaMs = resetAt - Date.now();
-  const absMs = Math.abs(deltaMs);
-  const totalMins = Math.round(absMs / 60_000);
-  let rel: string;
-  if (totalMins < 1) {
-    rel = '<1m';
-  } else if (totalMins < 60) {
-    rel = `${totalMins}m`;
-  } else {
-    const hours = Math.floor(totalMins / 60);
-    const mins = totalMins % 60;
-    rel = mins === 0 ? `${hours}h` : `${hours}h ${mins}m`;
-  }
-  return deltaMs >= 0 ? `in ${rel}` : `${rel} ago`;
-}
-
-function formatUsedPct(usedPct: number | null): string {
-  return usedPct == null ? '—' : `${usedPct}%`;
 }
 
 function pad(value: string, width: number): string {
@@ -691,14 +724,23 @@ function printDoctor(report: DoctorReport, json: boolean): void {
   console.log(`Overall: ${report.overall}`);
 }
 
-async function runStatus(json: boolean): Promise<void> {
+async function runStatus(opts: StatusOpts): Promise<void> {
   const nested = await Promise.all(adapters.map((adapter) => safeFetch(adapter)));
   const accounts = nested.flat();
-  if (json) {
-    console.log(JSON.stringify({ fetchedAt: Date.now(), accounts }, null, 2));
-  } else {
-    printTable(accounts);
+  const store = getStore();
+  const enriched = enrichAccounts(accounts, {
+    ownershipForProvider: makeOwnershipReader(store),
+    overrideForAccount: (id) => overrideFromStore(store, id),
+  });
+  if (opts.json) {
+    console.log(JSON.stringify({ fetchedAt: Date.now(), accounts: enriched }, null, 2));
+    return;
   }
+  if (opts.view === 'flat') {
+    printTable(accounts);
+    return;
+  }
+  console.log(formatDashboard(enriched));
 }
 
 async function collectSnapshots(models: string[]): Promise<AccountSnapshot[]> {
@@ -1038,8 +1080,20 @@ async function main(): Promise<void> {
     printDoctor(report, opts.json);
     process.exit(report.overall === 'FAIL' ? 1 : 0);
   }
+  if (opts.cmd === 'setup') {
+    const result = setupHarness(opts.harness);
+    if (opts.json) {
+      console.log(JSON.stringify(result, null, 2));
+    } else {
+      console.log(result.instructions);
+      if (result.snippetWritten) {
+        console.log(`\nWrote ${result.snippetWritten}`);
+      }
+    }
+    process.exit(0);
+  }
   if (opts.cmd === 'status') {
-    await runStatus(opts.json);
+    await runStatus(opts);
     process.exit(0);
   }
   if (opts.cmd === 'migrate') {
