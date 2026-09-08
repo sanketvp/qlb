@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 import { adapters } from './adapters';
 import { createDefaultCodexGateDeps, runCodexGate } from './codex-gate';
+import { config, stripConfigArgs } from './config';
+import { doctorQlb, initializeQlb, type DoctorReport, type InitReport } from './diagnostics';
 import { macosKeychain } from './keychain';
 import { createOwnedCredentialSource } from './credentials';
 import {
@@ -33,6 +35,8 @@ import { getStore, openStore, type Store } from './store';
 import type { AccountSnapshot, Adapter } from './types';
 
 const USAGE = `Usage:
+  qlb init [--json]
+  qlb doctor [--json] [--live]
   qlb status [--json]
   qlb resolve --model <modelId> [--fallback m1,m2,...] [--session <id>] [--harness pi|claude-code|codex|dispatch] [--effort <lvl>] [--json]
   qlb policy set --harness <h> --virtual-model <name> --real-model <id> --effort <lvl> [--fallback m1,m2] [--session-mode header|anon] [--db <path>] [--json]
@@ -69,6 +73,8 @@ qlb retire status is read-only. qlb retire execute is refused unless
 those production soak criteria are actually met.`;
 
 type StatusOpts = { cmd: 'status'; json: boolean };
+type InitOpts = { cmd: 'init'; json: boolean };
+type DoctorOpts = { cmd: 'doctor'; json: boolean; live: boolean };
 type ResolveOpts = {
   cmd: 'resolve';
   json: boolean;
@@ -132,7 +138,7 @@ type RetireOpts = {
   db?: string;
   confirmRealRetirement: boolean;
 };
-type Opts = StatusOpts | ResolveOpts | MigrateOpts | PolicyOpts | GateOpts | ProxyOpts | RetireOpts;
+type Opts = InitOpts | DoctorOpts | StatusOpts | ResolveOpts | MigrateOpts | PolicyOpts | GateOpts | ProxyOpts | RetireOpts;
 
 const MIGRATE_SUBS: readonly MigrateSub[] = [
   'stage',
@@ -409,10 +415,32 @@ function parseRetireArgs(argsIn: string[]): RetireOpts {
 }
 
 function parseArgs(argv: string[]): Opts {
-  const raw = argv.slice(2);
+  const raw = stripConfigArgs(argv).slice(2);
   if (raw[0] === '-h' || raw[0] === '--help') {
     console.log(USAGE);
     process.exit(0);
+  }
+  if (raw[0] === 'init') {
+    const rest = raw.slice(1);
+    const json = rest.includes('--json');
+    if (json) rest.splice(rest.indexOf('--json'), 1);
+    if (rest.length > 0) {
+      console.error(`qlb init: unknown argument ${rest[0]}`);
+      process.exit(1);
+    }
+    return { cmd: 'init', json };
+  }
+  if (raw[0] === 'doctor') {
+    const rest = raw.slice(1);
+    const json = rest.includes('--json');
+    if (json) rest.splice(rest.indexOf('--json'), 1);
+    const live = rest.includes('--live');
+    if (live) rest.splice(rest.indexOf('--live'), 1);
+    if (rest.length > 0) {
+      console.error(`qlb doctor: unknown argument ${rest[0]}`);
+      process.exit(1);
+    }
+    return { cmd: 'doctor', json, live };
   }
   if (raw[0] === 'migrate') {
     return parseMigrateArgs(raw.slice(1));
@@ -634,6 +662,33 @@ function printTable(accounts: AccountSnapshot[]): void {
       line(row.provider, row.label, row.bucket, row.usedPct, row.confidence, `resets ${row.reset}`),
     );
   }
+}
+
+function printInit(report: InitReport, json: boolean): void {
+  if (json) {
+    console.log(JSON.stringify(report, null, 2));
+    return;
+  }
+  console.log(`${report.overall}: QLB setup scan`);
+  console.log(`${report.configWritten ? 'Wrote' : 'Kept existing'} config: ${report.configPath}`);
+  for (const provider of report.providers) {
+    console.log(`[${provider.level}] ${provider.provider}: ${provider.message}`);
+  }
+}
+
+function printDoctor(report: DoctorReport, json: boolean): void {
+  if (json) {
+    console.log(JSON.stringify(report, null, 2));
+    return;
+  }
+  for (const check of report.checks) {
+    console.log(`[${check.level}] ${check.name}: ${check.message}`);
+  }
+  for (const provider of report.providers) {
+    const live = provider.live ? `; ${provider.live.message}` : '';
+    console.log(`[${provider.level}] ${provider.provider}: ${provider.message}${live}`);
+  }
+  console.log(`Overall: ${report.overall}`);
 }
 
 async function runStatus(json: boolean): Promise<void> {
@@ -973,6 +1028,16 @@ async function runRetire(opts: RetireOpts): Promise<number> {
 
 async function main(): Promise<void> {
   const opts = parseArgs(process.argv);
+  if (opts.cmd === 'init') {
+    const report = initializeQlb(config);
+    printInit(report, opts.json);
+    process.exit(0);
+  }
+  if (opts.cmd === 'doctor') {
+    const report = await doctorQlb(config, { live: opts.live });
+    printDoctor(report, opts.json);
+    process.exit(report.overall === 'FAIL' ? 1 : 0);
+  }
   if (opts.cmd === 'status') {
     await runStatus(opts.json);
     process.exit(0);

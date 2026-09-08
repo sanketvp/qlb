@@ -1,11 +1,10 @@
 import { readFile } from 'node:fs/promises';
-import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { config } from '../config';
 import { fetchAndCache } from '../single-flight';
 import { getStore } from '../store';
 import type { AccountSnapshot, Adapter, BucketReading } from '../types';
 
-const KEY_FILE = join(homedir(), 'DEV_vault', '04-Security', 'kimi-code-credentials.md');
+const KEY_FILE = config.kimiCredentialsFile;
 const USAGES_URL = 'https://api.kimi.com/coding/v1/usages';
 const TIMEOUT_MS = 10_000;
 
@@ -33,7 +32,14 @@ interface KimiUsagesResponse {
 }
 
 async function readStaticKey(): Promise<string> {
-  const content = await readFile(KEY_FILE, 'utf8');
+  let content: string;
+  try {
+    content = await readFile(KEY_FILE, 'utf8');
+  } catch {
+    throw new Error(
+      `Kimi credentials file not found at ${KEY_FILE}; set QLB_KIMI_CREDENTIALS_FILE or configure kimiCredentialsFile`,
+    );
+  }
   const match = content.match(/sk-kimi-[A-Za-z0-9]+/);
   if (!match) {
     throw new Error(`no sk-kimi key found in ${KEY_FILE}`);

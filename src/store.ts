@@ -4,12 +4,12 @@
 // provides that without a native addon, so we use it instead of adding a
 // dependency. If `node:sqlite` is ever unavailable, switch to `better-sqlite3`.
 import { chmodSync, existsSync, mkdirSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname } from 'node:path';
 import { DatabaseSync, type StatementSync } from 'node:sqlite';
+import { config } from './config';
 import type { BucketReading, Confidence } from './types';
 
-export const DEFAULT_DB_PATH = join(homedir(), '.qlb', 'qlb.db');
+export const DEFAULT_DB_PATH = config.dbPath;
 
 export interface AccountRow {
   id: string;

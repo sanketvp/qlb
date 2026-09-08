@@ -1,17 +1,18 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 
+import { config } from '../config';
 import { fetchAndCache } from '../single-flight';
 import { getStore } from '../store';
 import type { AccountSnapshot, Adapter, BucketReading } from '../types';
 
-const KEYCHAIN_SERVICE = 'pi-openrouter';
+const KEYCHAIN_SERVICE = config.openrouterKeychainService;
 const CREDITS_URL = 'https://openrouter.ai/api/v1/credits';
 const TIMEOUT_MS = 10_000;
 const ACCOUNT_ID = 'openrouter-default';
 const LABEL = 'OpenRouter';
 const KEY_MISSING_ERROR =
-  'OpenRouter key not found in macOS Keychain (service pi-openrouter)';
+  `OpenRouter key not found in macOS Keychain (service ${KEYCHAIN_SERVICE})`;
 const CREDIT_DETAIL =
   'OpenRouter account-wide credit balance from /api/v1/credits; not a rolling request/token rate-limit window';
 

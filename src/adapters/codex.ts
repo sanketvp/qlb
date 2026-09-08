@@ -1,15 +1,13 @@
 import { readFile } from 'node:fs/promises';
-import { homedir } from 'node:os';
-import { join } from 'node:path';
-
+import { config } from '../config';
 import { getStore } from '../store';
 import type { Adapter } from '../types';
 
 // Codex exposes quota only in response headers from real, quota-consuming requests.
 // Phase 0 therefore reports an authenticated account with no buckets and never probes;
 // Phase 1+ can populate buckets from response headers observed by qlb-pi/qlb-proxy traffic.
-const AUTH_PATH = join(homedir(), '.codex', 'auth.json');
-const INVALID_CREDENTIALS_ERROR = 'no valid Codex credentials found in ~/.codex/auth.json';
+const AUTH_PATH = config.codexAuthJsonPath;
+const INVALID_CREDENTIALS_ERROR = `no valid Codex credentials found in ${AUTH_PATH}`;
 
 type JsonObject = Record<string, unknown>;
 

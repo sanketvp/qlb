@@ -1,6 +1,5 @@
 import { readFile } from 'node:fs/promises';
-import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { config } from '../config';
 import { fetchAndCache } from '../single-flight';
 import { getStore } from '../store';
 import type { AccountSnapshot, Adapter, BucketReading } from '../types';
@@ -8,7 +7,7 @@ import type { AccountSnapshot, Adapter, BucketReading } from '../types';
 // Read-only mirror of Pi's OAuth grants (Phase 0: never write/refresh — the
 // native harness owns the refresh flow; if the grant expires we surface an
 // error and the user refreshes via pi itself).
-const AUTH_FILE = join(homedir(), '.pi', 'agent', 'auth.json');
+const AUTH_FILE = config.piAuthJsonPath;
 
 const ADVISORY_DETAIL =
   'xAI developer-API allowance — NOT proven to match the SuperGrok Heavy in-app meter the user sees on grok.com; treat as advisory only (spec §3, §7 R2)';

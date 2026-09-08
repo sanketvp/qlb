@@ -164,7 +164,7 @@ export type MigrateProvider = 'anthropic' | SingleGrantProvider | StaticKeyProvi
 export type MigrationKind = 'pool' | 'single-grant' | 'static-key';
 export type NativeStrategy = 'rename' | 'shadow-retain' | 'keychain-retain';
 
-export const NATIVE_OPENROUTER_KEYCHAIN_SERVICE = 'pi-openrouter';
+export const NATIVE_OPENROUTER_KEYCHAIN_SERVICE = config.openrouterKeychainService;
 
 export function isSingleGrantProvider(value: string | undefined): value is SingleGrantProvider {
   return (
@@ -402,7 +402,7 @@ export function readOpenRouterNativeKey(): string {
     // Normalize Keychain lookup failures without exposing command output.
   }
   throw new Error(
-    'OpenRouter key not found in macOS Keychain (service pi-openrouter)',
+    `OpenRouter key not found in macOS Keychain (service ${NATIVE_OPENROUTER_KEYCHAIN_SERVICE})`,
   );
 }
 
@@ -1021,7 +1021,7 @@ export class Migration {
     const key = this.readNativeKey().trim();
     if (!key) {
       throw new Error(
-        'OpenRouter key not found in macOS Keychain (service pi-openrouter)',
+        `OpenRouter key not found in macOS Keychain (service ${NATIVE_OPENROUTER_KEYCHAIN_SERVICE})`,
       );
     }
     const id = ADAPTER_ACCOUNT_IDS[this.provider];

@@ -19,6 +19,7 @@ import { dirname, join, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
 
 import { CODEX_GATE_CONFIG_KEY } from './codex-gate';
+import { config } from './config';
 import { atomicWriteFile, preQlbPath, sidecarPath } from './migration';
 import type { DecisionRow, MigrationRow, Store } from './store';
 
@@ -47,12 +48,11 @@ export function isRetireHarness(value: string | undefined): value is RetireHarne
 
 export function defaultNativePathForHarness(harness: RetireHarness): string {
   if (harness === 'codex-cli') {
-    return join(homedir(), '.codex', 'auth.json');
+    return config.codexAuthJsonPath;
   }
-  // Spec §3.1: Claude Code holds its grant in the macOS Keychain item
-  // `Claude Code-credentials`. The library API is file-path based so tests
-  // can point at a fixture; the CLI default is this conventional export path.
-  return join(homedir(), '.claude', 'Claude Code-credentials');
+  // The library API is file-path based so tests can point at a fixture; the
+  // configurable CLI default is the conventional Claude Code export path.
+  return config.claudeCodeCredentialsPath;
 }
 
 /** Proxy records Codex traffic as harness `codex`; the retire CLI uses `codex-cli`. */

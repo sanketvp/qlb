@@ -1,11 +1,10 @@
 import { existsSync, readFileSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { config } from '../config';
 import { fetchAndCache } from '../single-flight';
 import { getStore } from '../store';
 import type { AccountSnapshot, Adapter, BucketReading } from '../types';
 
-const POOL_FILE_PATH = join(homedir(), '.pi', 'agent', 'anthropic-pool.json');
+const POOL_FILE_PATH = config.anthropicPoolPath;
 const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
 const AUTH_EXPIRED = 'auth expired or invalid — needs re-login';
 const FETCH_TIMEOUT_MS = 10_000;

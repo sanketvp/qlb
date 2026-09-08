@@ -1,8 +1,7 @@
 import { execFile } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
 import * as http from 'node:http';
-import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { config } from './config';
 import { promisify } from 'node:util';
 
 import type { Store } from './store';
@@ -11,7 +10,7 @@ const execFileAsync = promisify(execFile);
 
 export const CODEX_GATE_CONFIG_KEY = 'codex_gate_result';
 export const CODEX_BACKEND_URL = 'https://chatgpt.com/backend-api/codex/responses';
-const AUTH_PATH = join(homedir(), '.codex', 'auth.json');
+const AUTH_PATH = config.codexAuthJsonPath;
 
 export type GateVerdict = 'GO' | 'NO-GO';
 export type GateStepId = 'G0' | 'G1' | 'G2' | 'G3' | 'G4';
@@ -439,7 +438,7 @@ export async function sendCodexRequestDefault(
 ): Promise<CodexGateHttpResponse> {
   const auth = await readCodexAuthFromDisk();
   if (!auth) {
-    throw new Error('no valid Codex credentials in ~/.codex/auth.json (read-only)');
+    throw new Error(`no valid Codex credentials in ${AUTH_PATH} (read-only)`);
   }
   const res = await fetch(CODEX_BACKEND_URL, {
     method: 'POST',

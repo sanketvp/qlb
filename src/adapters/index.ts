@@ -1,14 +1,22 @@
+import { config } from '../config';
+import { loadPlugins } from '../plugins';
 import type { Adapter } from '../types';
-import { xaiAdapter } from './xai';
-import { codexAdapter } from './codex';
 import { anthropicAdapter } from './anthropic';
-import { openRouterAdapter } from './openrouter';
-
-// populated by adapter modules — see src/adapters/{anthropic,codex,xai,kimi,openrouter}.ts
-export const adapters: Adapter[] = [];
+import { codexAdapter } from './codex';
 import { kimiAdapter } from './kimi';
-adapters.push(kimiAdapter);
-adapters.push(xaiAdapter);
-adapters.push(codexAdapter);
-adapters.push(anthropicAdapter);
-adapters.push(openRouterAdapter);
+import { openRouterAdapter } from './openrouter';
+import { xaiAdapter } from './xai';
+
+export const builtInAdapters: Adapter[] = [
+  kimiAdapter,
+  xaiAdapter,
+  codexAdapter,
+  anthropicAdapter,
+  openRouterAdapter,
+];
+
+/** Built-ins plus any valid ~/.qlb/plugins/*.js adapters. */
+export const adapters: Adapter[] = [
+  ...builtInAdapters,
+  ...loadPlugins(config.pluginsDir),
+];

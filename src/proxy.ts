@@ -9,8 +9,7 @@ import {
 } from 'node:fs';
 import * as http from 'node:http';
 import * as https from 'node:https';
-import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname } from 'node:path';
 import type { AddressInfo } from 'node:net';
 import type { IncomingHttpHeaders, IncomingMessage, ServerResponse } from 'node:http';
 
@@ -21,12 +20,13 @@ import {
   unmappedErrorBody,
 } from './policy';
 import { resolveFromSnapshots, snapshotsFromStore } from './resolve';
+import { config } from './config';
 import type { Store } from './store';
 import type { BucketReading } from './types';
 
 export const PROXY_BIND_HOST = '127.0.0.1';
 export const DEFAULT_IDLE_TIMEOUT_MS = 10 * 60 * 1000;
-export const DEFAULT_PROXY_INFO_PATH = join(homedir(), '.qlb', 'proxy.json');
+export const DEFAULT_PROXY_INFO_PATH = config.proxyInfoPath;
 
 const ALLOWED_PATHS = new Set([
   '/v1/messages',
