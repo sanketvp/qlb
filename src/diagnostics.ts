@@ -7,9 +7,17 @@ import { builtInAdapters } from './adapters';
 import { CONFIG_ENV_VARS, type QlbConfig } from './config';
 import {
   defaultCommandExists,
+  platformKeychain,
   readNativeOpenRouterKey,
   selectBackendKind,
+  type KeychainBackend,
 } from './keychain';
+import {
+  createNativeCredentialReader,
+  inspectOwnedNativeDrift,
+  readOwnedCredentialFromKeychain,
+  type ResyncCredential,
+} from './native-resync';
 import type { AccountSnapshot, Adapter } from './types';
 
 export type CheckLevel = 'PASS' | 'WARN' | 'FAIL';
@@ -283,10 +291,21 @@ function probeCredentialStore(command?: CommandRunner): DoctorCheck {
 
 export async function doctorQlb(
   config: QlbConfig,
-  options: { live?: boolean; command?: CommandRunner } = {},
+  options: {
+    live?: boolean;
+    command?: CommandRunner;
+    /** Tests inject MockKeychain. Production defaults to platformKeychain. */
+    keychain?: KeychainBackend;
+    /** Tests inject a fake. Production reads native files / OpenRouter Keychain. */
+    readNativeCredential?: (
+      provider: string,
+      accountId: string,
+    ) => Promise<ResyncCredential | null>;
+  } = {},
 ): Promise<DoctorReport> {
   const checks: DoctorCheck[] = [];
   let migrations: Array<{ store: string; state: string }> = [];
+  let accounts: Array<{ id: string; provider: string; label: string }> = [];
 
   if (!existsSync(config.dbPath)) {
     checks.push({ name: 'sqlite', level: 'WARN', message: `database does not exist yet: ${config.dbPath}; run qlb status` });
@@ -303,6 +322,14 @@ export async function doctorQlb(
       const table = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='migrations'").get();
       if (table) {
         migrations = db.prepare('SELECT store, state FROM migrations').all() as Array<{ store: string; state: string }>;
+      }
+      const acctTable = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='accounts'").get();
+      if (acctTable) {
+        accounts = db.prepare('SELECT id, provider, label FROM accounts').all() as Array<{
+          id: string;
+          provider: string;
+          label: string;
+        }>;
       }
     } catch (err) {
       checks.push({ name: 'sqlite', level: 'FAIL', message: `database check failed: ${err instanceof Error ? err.message : String(err)}` });
@@ -322,6 +349,33 @@ export async function doctorQlb(
     : { name: 'migrations', level: 'PASS', message: 'no incomplete migrations detected' });
 
   checks.push(probeCredentialStore(options.command));
+
+  const owned = migrations.filter((m) => m.state === 'QLB_OWNED' || m.state === 'RETIRED');
+  if (owned.length > 0 && accounts.length > 0) {
+    const keychain = options.keychain ?? platformKeychain;
+    const readNative =
+      options.readNativeCredential ??
+      createNativeCredentialReader({
+        poolFilePath: config.anthropicPoolPath,
+        authJsonPath: config.piAuthJsonPath,
+        readOpenRouterKey: () => readNativeOpenRouterKey(config.openrouterKeychainService),
+      });
+    const drift = await inspectOwnedNativeDrift({
+      accounts,
+      migrations,
+      readNativeCredential: readNative,
+      readOwnedCredential: async (provider, accountId, label) =>
+        readOwnedCredentialFromKeychain(keychain, provider, accountId, label),
+    });
+    for (const row of drift) {
+      checks.push({
+        name: `native-sync:${row.accountId}`,
+        level: row.level,
+        message: row.message,
+        detail: { provider: row.provider, matches: row.matches },
+      });
+    }
+  }
 
   const providers = inspectProviders(config, options.command);
   if (options.live) {

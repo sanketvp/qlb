@@ -9,6 +9,21 @@ export function classifyHttpStatus(status: unknown): AuditOutcome {
     : "failed";
 }
 
+export function isAuthHttpStatus(status: unknown): boolean {
+  return status === 401;
+}
+
+/** True for 401 / revoked-token / invalid_grant messages. Not generic failures. */
+export function isAuthFailureText(error: string | undefined): boolean {
+  if (!error) return false;
+  return (
+    /(?:^|[^0-9])401(?:[^0-9]|$)/.test(error) ||
+    /unauthorized/i.test(error) ||
+    /access token has been revoked/i.test(error) ||
+    /invalid_grant/i.test(error)
+  );
+}
+
 function readErrorMessage(value: unknown): string | undefined {
   if (typeof value === "string" && value.length > 0) return value;
   if (!value || typeof value !== "object") return undefined;

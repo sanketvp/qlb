@@ -41,11 +41,8 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import type { Api, Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
-import {
-  classifyHttpStatus,
-  classifyProviderStreamEvent,
-  STREAM_ENDED_WITHOUT_SUCCESS,
-} from "./outcome.js";
+import { streamWithAuthRetry } from "./auth-retry.js";
+import { classifyHttpStatus } from "./outcome.js";
 import { shapeAnthropicOAuthPayload } from "./request-shaping.js";
 
 const OWNER_FILE = join(homedir(), ".pi", "agent", "qlb-owner.json");
@@ -122,6 +119,33 @@ async function qlbResolve(model: string, effort?: string): Promise<ResolveOk> {
     );
   }
   return JSON.parse(result.stdout) as ResolveOk;
+}
+
+async function qlbNativeResync(
+  provider: string,
+  accountId: string,
+): Promise<{ resynced: boolean; reason: string }> {
+  try {
+    const result = await runQlb(
+      ["native-resync", "--provider", provider, "--account", accountId, "--json"],
+    );
+    if (result.code !== 0) {
+      return {
+        resynced: false,
+        reason: result.stderr || result.stdout || `exit ${result.code}`,
+      };
+    }
+    const parsed = JSON.parse(result.stdout) as { resynced?: unknown; reason?: unknown };
+    return {
+      resynced: parsed.resynced === true,
+      reason: typeof parsed.reason === "string" ? parsed.reason : "native-resync",
+    };
+  } catch (err) {
+    return {
+      resynced: false,
+      reason: err instanceof Error ? err.message : String(err),
+    };
+  }
 }
 
 function recordOutcome(entry: Record<string, unknown>): void {
@@ -209,12 +233,8 @@ export default async function (pi: ExtensionAPI): Promise<void> {
           if (!decision.accountId) {
             throw new Error("qlb resolve returned no accountId");
           }
+          const provider = decision.provider || "anthropic";
           const label = ownerAccountLabel(decision.accountId);
-          const { access } = readKeychainGrant(
-            decision.provider || "anthropic",
-            decision.accountId,
-            label,
-          );
           const callerOnPayload = options?.onPayload;
           const onPayload: SimpleStreamOptions["onPayload"] = async (
             payload: unknown,
@@ -226,29 +246,40 @@ export default async function (pi: ExtensionAPI): Promise<void> {
               : payload;
             return shapeAnthropicOAuthPayload(upstream);
           };
-          const stream = builtin(model, context, {
-            ...options,
-            apiKey: access,
-            onPayload,
+          const result = await streamWithAuthRetry({
+            readAccess: () =>
+              readKeychainGrant(provider, decision.accountId!, label).access,
+            startStream: (access) =>
+              builtin(model, context, {
+                ...options,
+                apiKey: access,
+                onPayload,
+              }),
+            resync: () => qlbNativeResync(provider, decision.accountId!),
+            onEvent: (event) => {
+              output.push(event as never);
+            },
+            onResync: (resync) => {
+              recordOutcome({
+                kind: "native_resync",
+                decisionId: decision.decisionId,
+                accountId: decision.accountId,
+                provider,
+                model: model.id,
+                resynced: resync.resynced,
+                reason: resync.reason,
+              });
+            },
           });
-          let outcome: "ok" | "failed" = "failed";
-          let errorMessage: string | undefined = STREAM_ENDED_WITHOUT_SUCCESS;
-          for await (const event of stream) {
-            output.push(event as never);
-            const classified = classifyProviderStreamEvent(event);
-            if (classified) {
-              outcome = classified.outcome;
-              errorMessage = classified.error;
-            }
-          }
           recordOutcome({
             decisionId: decision.decisionId,
             accountId: decision.accountId,
             model: model.id,
-            outcome,
-            ...(outcome === "failed" && errorMessage
-              ? { error: errorMessage }
+            outcome: result.outcome,
+            ...(result.outcome === "failed" && result.error
+              ? { error: result.error }
               : {}),
+            ...(result.retried ? { retriedAfterNativeResync: true } : {}),
           });
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);

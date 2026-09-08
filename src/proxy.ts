@@ -21,6 +21,11 @@ import {
 } from './policy';
 import { resolveFromSnapshots, snapshotsFromStore } from './resolve';
 import { config } from './config';
+import {
+  attemptWithNativeResyncRetry,
+  nativeResyncAuditEntry,
+  type ResyncResult,
+} from './native-resync';
 import type { Store } from './store';
 import type { BucketReading } from './types';
 
@@ -55,6 +60,7 @@ export interface ProxyInfo {
 export type GetCredentialForAccount = (accountId: string) => Promise<string>;
 
 /** Runtime source: `createOwnedCredentialSource` in `./credentials`. Tests inject a mock. */
+export type ResyncFromNative = (accountId: string, provider: string) => Promise<ResyncResult>;
 
 export interface ProxyOptions {
   store: Store;
@@ -62,6 +68,12 @@ export interface ProxyOptions {
   infoPath?: string;
   idleTimeoutMs?: number;
   getCredentialForAccount: GetCredentialForAccount;
+  /**
+   * Optional. When set, an upstream 401 triggers exactly one native-resync
+   * attempt and, if the credential actually drifted, one retry of the same
+   * request. Tests inject a mock; production wires `bindDetectAndResync`.
+   */
+  resyncFromNative?: ResyncFromNative;
   upstreams?: {
     anthropicBase?: string;
     codexBase?: string;
@@ -291,6 +303,19 @@ function forwardHeaders(
   return out;
 }
 
+function discardIncoming(res: IncomingMessage): Promise<void> {
+  return new Promise((resolve) => {
+    if (res.readableEnded) {
+      resolve();
+      return;
+    }
+    res.resume();
+    res.on('end', () => resolve());
+    res.on('close', () => resolve());
+    res.on('error', () => resolve());
+  });
+}
+
 function requestUpstream(
   urlStr: string,
   method: string,
@@ -328,6 +353,7 @@ export class LoopbackProxy {
   readonly idleTimeoutMs: number;
   private readonly store: Store;
   private readonly getCredential: GetCredentialForAccount;
+  private readonly resyncFromNative?: ResyncFromNative;
   private readonly upstreams: { anthropicBase: string; codexBase: string };
   private readonly onIdle?: () => void;
   private readonly token: string;
@@ -345,6 +371,7 @@ export class LoopbackProxy {
     this.infoPath = opts.infoPath ?? DEFAULT_PROXY_INFO_PATH;
     this.idleTimeoutMs = opts.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
     this.getCredential = opts.getCredentialForAccount;
+    this.resyncFromNative = opts.resyncFromNative;
     this.upstreams = {
       anthropicBase: opts.upstreams?.anthropicBase ?? DEFAULT_UPSTREAMS.anthropicBase,
       codexBase: opts.upstreams?.codexBase ?? DEFAULT_UPSTREAMS.codexBase,
@@ -614,14 +641,55 @@ export class LoopbackProxy {
 
     const target = upstreamUrl(harness, pathname, this.upstreams);
     const t0 = Date.now();
-    let upRes: IncomingMessage;
-    try {
-      upRes = await requestUpstream(
+    const requestOnce = async (): Promise<IncomingMessage> => {
+      extra.authorization = `Bearer ${await this.getCredential(decision.accountId)}`;
+      return requestUpstream(
         target,
         'POST',
         forwardHeaders(req.headers, extra, forwardBody.length),
         forwardBody,
       );
+    };
+    let upRes: IncomingMessage;
+    try {
+      if (this.resyncFromNative) {
+        const provider =
+          this.store.getAccount(decision.accountId)?.provider ?? 'unknown';
+        const wrapped = await attemptWithNativeResyncRetry({
+          attempt: requestOnce,
+          isAuthFailure: (res) => res.statusCode === 401,
+          resync: () => this.resyncFromNative!(decision.accountId, provider),
+          onResync: (result) => {
+            try {
+              this.store.recordDecision({
+                session: sid,
+                harness,
+                requested_model: policy.realModel,
+                effort: policy.effort,
+                served_model: decision.servedModel,
+                account_id: decision.accountId,
+                mode: 'native_resync',
+                reason: result.reason,
+                snapshot_json: JSON.stringify(
+                  nativeResyncAuditEntry({ provider, accountId: decision.accountId, result }),
+                ),
+              });
+            } catch {
+              // store errors must not crash the proxy
+            }
+          },
+          discardFirst: discardIncoming,
+        });
+        upRes = wrapped.result;
+      } else {
+        extra.authorization = `Bearer ${credential}`;
+        upRes = await requestUpstream(
+          target,
+          'POST',
+          forwardHeaders(req.headers, extra, forwardBody.length),
+          forwardBody,
+        );
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       this.store.recordDecision({

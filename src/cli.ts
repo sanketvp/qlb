@@ -7,6 +7,10 @@ import { doctorQlb, initializeQlb, type DoctorReport, type InitReport } from './
 import { platformKeychain } from './keychain';
 import { createOwnedCredentialSource } from './credentials';
 import {
+  bindDetectAndResync,
+  createNativeCredentialReader,
+} from './native-resync';
+import {
   DEFAULT_AUTH_JSON,
   DEFAULT_POOL_FILE,
   Migration,
@@ -47,6 +51,7 @@ import type { AccountSnapshot, Adapter } from './types';
 const USAGE = `Usage:
   qlb init [--json]
   qlb doctor [--json] [--live]
+  qlb native-resync --provider anthropic|xai|kimi-coding|openai-codex|openrouter --account <id> [--json] [--db <path>]
   qlb status [--json] [--dashboard|--flat]
   qlb setup pi|claude-code|codex-cli|generic [--json]
   qlb resolve --model <modelId> [--fallback m1,m2,...] [--session <id>] [--harness pi|claude-code|codex|dispatch] [--effort <lvl>] [--json]
@@ -158,7 +163,14 @@ type RetireOpts = {
   db?: string;
   confirmRealRetirement: boolean;
 };
-type Opts = InitOpts | DoctorOpts | StatusOpts | SetupOpts | ResolveOpts | MigrateOpts | PolicyOpts | GateOpts | ProxyOpts | RetireOpts;
+type NativeResyncOpts = {
+  cmd: 'native-resync';
+  json: boolean;
+  provider: MigrateProvider;
+  account: string;
+  db?: string;
+};
+type Opts = InitOpts | DoctorOpts | StatusOpts | SetupOpts | ResolveOpts | MigrateOpts | PolicyOpts | GateOpts | ProxyOpts | RetireOpts | NativeResyncOpts;
 
 const MIGRATE_SUBS: readonly MigrateSub[] = [
   'stage',
@@ -458,6 +470,37 @@ function parseSetupArgs(argsIn: string[]): SetupOpts {
   return { cmd: 'setup', json, harness };
 }
 
+function parseNativeResyncArgs(argsIn: string[]): NativeResyncOpts {
+  const args = [...argsIn];
+  if (args[0] === '-h' || args[0] === '--help') {
+    console.log(USAGE);
+    process.exit(0);
+  }
+  const json = args.includes('--json');
+  if (json) args.splice(args.indexOf('--json'), 1);
+  const db = takeFlag(args, '--db');
+  const providerRaw = takeFlag(args, '--provider');
+  const account = takeFlag(args, '--account');
+  if (args.length > 0) {
+    console.error(`qlb native-resync: unknown argument ${args[0]}`);
+    console.error(USAGE);
+    process.exit(1);
+  }
+  if (!isMigrateProvider(providerRaw)) {
+    console.error(
+      'qlb native-resync: --provider is required and must be anthropic|xai|kimi-coding|openai-codex|openrouter',
+    );
+    console.error(USAGE);
+    process.exit(1);
+  }
+  if (!account) {
+    console.error('qlb native-resync: --account is required');
+    console.error(USAGE);
+    process.exit(1);
+  }
+  return { cmd: 'native-resync', json, provider: providerRaw, account, db };
+}
+
 function parseArgs(argv: string[]): Opts {
   const raw = stripConfigArgs(argv).slice(2);
   if (raw[0] === '-h' || raw[0] === '--help') {
@@ -500,6 +543,9 @@ function parseArgs(argv: string[]): Opts {
   }
   if (raw[0] === 'retire') {
     return parseRetireArgs(raw.slice(1));
+  }
+  if (raw[0] === 'native-resync') {
+    return parseNativeResyncArgs(raw.slice(1));
   }
   if (raw[0] === 'setup') {
     return parseSetupArgs(raw.slice(1));
@@ -994,6 +1040,15 @@ async function runProxy(opts: ProxyOpts): Promise<number> {
       store,
       keychain: platformKeychain,
     }),
+    resyncFromNative: bindDetectAndResync({
+      store,
+      keychain: platformKeychain,
+      readNativeCredential: createNativeCredentialReader({
+        poolFilePath: config.anthropicPoolPath,
+        authJsonPath: config.piAuthJsonPath,
+        readOpenRouterKey: readOpenRouterNativeKey,
+      }),
+    }),
     onIdle: () => {
       if (opened) store.close();
       process.exit(0);
@@ -1064,6 +1119,27 @@ async function runRetire(opts: RetireOpts): Promise<number> {
     } else {
       console.log(`retired ${opts.harness}: ${result.nativePathRemoved} → ${result.backupPath}`);
       console.log(`state:   ${result.state}`);
+    }
+    return 0;
+  });
+}
+
+async function runNativeResync(opts: NativeResyncOpts): Promise<number> {
+  return withStore(opts.db, async (store) => {
+    const resync = bindDetectAndResync({
+      store,
+      keychain: platformKeychain,
+      readNativeCredential: createNativeCredentialReader({
+        poolFilePath: config.anthropicPoolPath,
+        authJsonPath: config.piAuthJsonPath,
+        readOpenRouterKey: readOpenRouterNativeKey,
+      }),
+    });
+    const result = await resync(opts.account, opts.provider);
+    if (opts.json) {
+      console.log(JSON.stringify(result));
+    } else {
+      console.log(`${result.resynced ? 'resynced' : 'unchanged'}: ${result.reason}`);
     }
     return 0;
   });
@@ -1144,6 +1220,16 @@ async function main(): Promise<void> {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`qlb retire ${opts.sub}: ${msg}`);
+      process.exit(1);
+    }
+  }
+  if (opts.cmd === 'native-resync') {
+    try {
+      const code = await runNativeResync(opts);
+      process.exit(code);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`qlb native-resync: ${msg}`);
       process.exit(1);
     }
   }
