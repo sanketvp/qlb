@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { adapters } from './adapters';
+import { createDefaultCodexGateDeps, runCodexGate } from './codex-gate';
 import { macosKeychain } from './keychain';
 import {
   DEFAULT_OWNER_FILE,
@@ -8,6 +9,8 @@ import {
   defaultRehearseFn,
   isRealPiAgentPath,
 } from './migration';
+import { listPolicies, setPolicy } from './policy';
+import { LoopbackProxy } from './proxy';
 import { resolveFromSnapshots, providerForModel } from './resolve';
 import { getStore, openStore, type Store } from './store';
 import type { AccountSnapshot, Adapter } from './types';
@@ -15,6 +18,10 @@ import type { AccountSnapshot, Adapter } from './types';
 const USAGE = `Usage:
   qlb status [--json]
   qlb resolve --model <modelId> [--fallback m1,m2,...] [--session <id>] [--harness pi|claude-code|codex|dispatch] [--effort <lvl>] [--json]
+  qlb policy set --harness <h> --virtual-model <name> --real-model <id> --effort <lvl> [--fallback m1,m2] [--session-mode header|anon] [--db <path>] [--json]
+  qlb policy list [--harness <h>] [--db <path>] [--json]
+  qlb gate codex [--json] [--db <path>]
+  qlb proxy [--info-path <path>] [--idle-ms <n>] [--db <path>]
   qlb migrate stage    --pool-file <path> --owner-file <path> [--db <path>] [--target-dir <path>] [--confirm-real-cutover]
   qlb migrate rehearse --pool-file <path> --owner-file <path> [--db <path>] [--target-dir <path>] [--confirm-real-cutover]
   qlb migrate commit   --pool-file <path> --owner-file <path> [--db <path>] [--target-dir <path>] [--confirm-real-cutover]
@@ -27,7 +34,9 @@ overrides targets the REAL ~/.pi/agent/anthropic-pool.json and
 ~/.pi/agent/qlb-owner.json. That is a REAL cutover and is refused unless
 --confirm-real-cutover is also passed. Tests and dry runs MUST pass
 --pool-file / --owner-file (or --target-dir) pointing at a temp copy.
-Do NOT pass --confirm-real-cutover unless you intend to cut over live Pi.`;
+Do NOT pass --confirm-real-cutover unless you intend to cut over live Pi.
+qlb gate codex makes a handful of real Codex backend requests (read-only
+use of ~/.codex/auth.json). Automated tests never take this path.`;
 
 type StatusOpts = { cmd: 'status'; json: boolean };
 type ResolveOpts = {
@@ -49,7 +58,40 @@ type MigrateOpts = {
   db?: string;
   confirmRealCutover: boolean;
 };
-type Opts = StatusOpts | ResolveOpts | MigrateOpts;
+type PolicySetOpts = {
+  cmd: 'policy';
+  sub: 'set';
+  json: boolean;
+  db?: string;
+  harness: string;
+  virtualModel: string;
+  realModel: string;
+  effort: string;
+  fallback: string[];
+  sessionMode: string;
+};
+type PolicyListOpts = {
+  cmd: 'policy';
+  sub: 'list';
+  json: boolean;
+  db?: string;
+  harness?: string;
+};
+type PolicyOpts = PolicySetOpts | PolicyListOpts;
+type GateOpts = {
+  cmd: 'gate';
+  target: 'codex';
+  json: boolean;
+  db?: string;
+};
+type ProxyOpts = {
+  cmd: 'proxy';
+  json: boolean;
+  db?: string;
+  infoPath?: string;
+  idleMs?: number;
+};
+type Opts = StatusOpts | ResolveOpts | MigrateOpts | PolicyOpts | GateOpts | ProxyOpts;
 
 const MIGRATE_SUBS: readonly MigrateSub[] = [
   'stage',
@@ -134,6 +176,118 @@ function parseMigrateArgs(args: string[]): MigrateOpts {
   };
 }
 
+function takeFlag(args: string[], name: string): string | undefined {
+  const i = args.indexOf(name);
+  if (i === -1) return undefined;
+  const v = args[i + 1];
+  args.splice(i, 2);
+  return v;
+}
+
+function parsePolicyArgs(argsIn: string[]): PolicyOpts {
+  const args = [...argsIn];
+  const sub = args.shift();
+  if (sub === '-h' || sub === '--help' || sub === undefined) {
+    console.log(USAGE);
+    process.exit(0);
+  }
+  if (sub !== 'set' && sub !== 'list') {
+    console.error('qlb policy: unknown subcommand. Expected set|list');
+    console.error(USAGE);
+    process.exit(1);
+  }
+  const json = args.includes('--json');
+  if (json) args.splice(args.indexOf('--json'), 1);
+  const db = takeFlag(args, '--db');
+  const harness = takeFlag(args, '--harness');
+  if (sub === 'list') {
+    if (args.length > 0) {
+      console.error(`qlb policy list: unknown argument ${args[0]}`);
+      process.exit(1);
+    }
+    return { cmd: 'policy', sub: 'list', json, db, harness };
+  }
+  const virtualModel =
+    takeFlag(args, '--virtual-model') ?? takeFlag(args, '--virtual');
+  const realModel = takeFlag(args, '--real-model') ?? takeFlag(args, '--real');
+  const effort = takeFlag(args, '--effort');
+  const fallbackRaw = takeFlag(args, '--fallback');
+  const sessionMode = takeFlag(args, '--session-mode') ?? 'header';
+  if (args.length > 0) {
+    console.error(`qlb policy set: unknown argument ${args[0]}`);
+    console.error(USAGE);
+    process.exit(1);
+  }
+  if (!harness || !virtualModel || !realModel || !effort) {
+    console.error(
+      'qlb policy set: --harness, --virtual-model, --real-model, and --effort are required',
+    );
+    console.error(USAGE);
+    process.exit(1);
+  }
+  const fallback = (fallbackRaw ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return {
+    cmd: 'policy',
+    sub: 'set',
+    json,
+    db,
+    harness,
+    virtualModel,
+    realModel,
+    effort,
+    fallback,
+    sessionMode,
+  };
+}
+
+function parseGateArgs(argsIn: string[]): GateOpts {
+  const args = [...argsIn];
+  const target = args.shift();
+  if (target === '-h' || target === '--help' || target === undefined) {
+    console.log(USAGE);
+    process.exit(0);
+  }
+  if (target !== 'codex') {
+    console.error('qlb gate: unknown target. Expected: qlb gate codex');
+    console.error(USAGE);
+    process.exit(1);
+  }
+  const json = args.includes('--json');
+  if (json) args.splice(args.indexOf('--json'), 1);
+  const db = takeFlag(args, '--db');
+  if (args.length > 0) {
+    console.error(`qlb gate: unknown argument ${args[0]}`);
+    process.exit(1);
+  }
+  return { cmd: 'gate', target: 'codex', json, db };
+}
+
+function parseProxyArgs(argsIn: string[]): ProxyOpts {
+  const args = [...argsIn];
+  if (args[0] === '-h' || args[0] === '--help') {
+    console.log(USAGE);
+    process.exit(0);
+  }
+  const json = args.includes('--json');
+  if (json) args.splice(args.indexOf('--json'), 1);
+  const db = takeFlag(args, '--db');
+  const infoPath = takeFlag(args, '--info-path');
+  const idleRaw = takeFlag(args, '--idle-ms');
+  if (args.length > 0) {
+    console.error(`qlb proxy: unknown argument ${args[0]}`);
+    process.exit(1);
+  }
+  const idleMs = idleRaw != null ? Number(idleRaw) : undefined;
+  if (idleRaw != null && (!Number.isFinite(idleMs) || (idleMs ?? 0) <= 0)) {
+    console.error('qlb proxy: --idle-ms must be a positive number');
+    process.exit(1);
+  }
+  return { cmd: 'proxy', json, db, infoPath, idleMs };
+}
+
 function parseArgs(argv: string[]): Opts {
   const raw = argv.slice(2);
   if (raw[0] === '-h' || raw[0] === '--help') {
@@ -142,6 +296,15 @@ function parseArgs(argv: string[]): Opts {
   }
   if (raw[0] === 'migrate') {
     return parseMigrateArgs(raw.slice(1));
+  }
+  if (raw[0] === 'policy') {
+    return parsePolicyArgs(raw.slice(1));
+  }
+  if (raw[0] === 'gate') {
+    return parseGateArgs(raw.slice(1));
+  }
+  if (raw[0] === 'proxy') {
+    return parseProxyArgs(raw.slice(1));
   }
 
   let cmd: 'status' | 'resolve' = 'status';
@@ -507,6 +670,118 @@ async function runMigrate(opts: MigrateOpts): Promise<number> {
   }
 }
 
+function withStore<T>(db: string | undefined, fn: (store: Store) => Promise<T> | T): Promise<T> {
+  const opened = !!db;
+  const store = db ? openStore(db) : getStore();
+  const run = async (): Promise<T> => {
+    try {
+      return await fn(store);
+    } finally {
+      if (opened) store.close();
+    }
+  };
+  return run();
+}
+
+async function runPolicy(opts: PolicyOpts): Promise<number> {
+  return withStore(opts.db, (store) => {
+    if (opts.sub === 'list') {
+      const rows = listPolicies(store, opts.harness);
+      if (opts.json) {
+        console.log(JSON.stringify({ policies: rows }, null, 2));
+      } else if (rows.length === 0) {
+        console.log('(no policies)');
+      } else {
+        for (const p of rows) {
+          const fb = p.fallback.length ? p.fallback.join(',') : '-';
+          console.log(
+            `${p.harness}  ${p.virtualModel}  →  ${p.realModel}  effort=${p.effort}  fallback=${fb}  session=${p.sessionMode}`,
+          );
+        }
+      }
+      return 0;
+    }
+    const policy = setPolicy(store, {
+      harness: opts.harness,
+      virtualModel: opts.virtualModel,
+      realModel: opts.realModel,
+      effort: opts.effort,
+      fallback: opts.fallback,
+      sessionMode: opts.sessionMode,
+    });
+    if (opts.json) {
+      console.log(JSON.stringify(policy, null, 2));
+    } else {
+      console.log(
+        `set ${policy.harness} ${policy.virtualModel} → ${policy.realModel} effort=${policy.effort}`,
+      );
+    }
+    return 0;
+  });
+}
+
+async function runGate(opts: GateOpts): Promise<number> {
+  return withStore(opts.db, async (store) => {
+    const result = await runCodexGate(store, createDefaultCodexGateDeps());
+    if (opts.json) {
+      console.log(JSON.stringify(result, null, 2));
+    } else {
+      console.log(`verdict:  ${result.verdict}`);
+      console.log(`version:  ${result.codexVersion ?? 'unknown'}`);
+      console.log(`time:     ${new Date(result.timestamp).toISOString()}`);
+      if (result.path) console.log(`path:     ${result.path}`);
+      for (const step of result.steps) {
+        const mark = step.skipped ? 'skip' : step.passed ? 'pass' : 'FAIL';
+        console.log(`  ${step.step}  ${mark}  ${step.detail}`);
+      }
+    }
+    return result.verdict === 'GO' ? 0 : 1;
+  });
+}
+
+async function runProxy(opts: ProxyOpts): Promise<number> {
+  const opened = !!opts.db;
+  const store = opts.db ? openStore(opts.db) : getStore();
+  const proxy = new LoopbackProxy({
+    store,
+    infoPath: opts.infoPath,
+    idleTimeoutMs: opts.idleMs,
+    getCredentialForAccount: async (accountId) => {
+      const envTok = process.env.QLB_UPSTREAM_TOKEN;
+      if (envTok && envTok.length > 0) return envTok;
+      throw new Error(
+        `no credential for account ${accountId}; set QLB_UPSTREAM_TOKEN (Phase 2 cutover not wired into the proxy yet)`,
+      );
+    },
+    onIdle: () => {
+      if (opened) store.close();
+      process.exit(0);
+    },
+  });
+  const info = await proxy.start();
+  const publicInfo = { port: info.port, pid: info.pid, startedAt: info.startedAt };
+  if (opts.json) {
+    console.log(JSON.stringify({ ...publicInfo, infoPath: proxy.infoPath }, null, 2));
+  } else {
+    console.log(`qlb-proxy listening on 127.0.0.1:${info.port} (token in ${proxy.infoPath}, mode 0600)`);
+  }
+  const stop = async () => {
+    await proxy.stop();
+    if (opened) store.close();
+    process.exit(0);
+  };
+  process.on('SIGINT', () => {
+    void stop();
+  });
+  process.on('SIGTERM', () => {
+    void stop();
+  });
+  await new Promise(() => {
+    /* stay alive until idle-exit or signal */
+  });
+  return 0;
+}
+
 async function main(): Promise<void> {
   const opts = parseArgs(process.argv);
   if (opts.cmd === 'status') {
@@ -520,6 +795,36 @@ async function main(): Promise<void> {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`qlb migrate ${opts.sub}: ${msg}`);
+      process.exit(1);
+    }
+  }
+  if (opts.cmd === 'policy') {
+    try {
+      const code = await runPolicy(opts);
+      process.exit(code);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`qlb policy ${opts.sub}: ${msg}`);
+      process.exit(1);
+    }
+  }
+  if (opts.cmd === 'gate') {
+    try {
+      const code = await runGate(opts);
+      process.exit(code);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`qlb gate ${opts.target}: ${msg}`);
+      process.exit(1);
+    }
+  }
+  if (opts.cmd === 'proxy') {
+    try {
+      const code = await runProxy(opts);
+      process.exit(code);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`qlb proxy: ${msg}`);
       process.exit(1);
     }
   }

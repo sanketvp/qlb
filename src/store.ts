@@ -44,6 +44,17 @@ export interface MigrationRow {
   detail_json: string;
 }
 
+/** Virtual-model policy lookup (§4.9.2b). */
+export interface PolicyRow {
+  harness: string;
+  virtual_model: string;
+  real_model: string;
+  effort: string;
+  fallback_json: string;
+  session_mode: string;
+  created_at: number;
+}
+
 export function refreshLeaseName(accountId: string): string {
   return `refresh:${accountId}`;
 }
@@ -138,6 +149,12 @@ export class Store {
   private readonly getMigrationStmt: StatementSync;
   private readonly upsertMigrationStmt: StatementSync;
   private readonly listMigrationsStmt: StatementSync;
+  private readonly upsertPolicyStmt: StatementSync;
+  private readonly getPolicyStmt: StatementSync;
+  private readonly listPoliciesStmt: StatementSync;
+  private readonly listPoliciesByHarnessStmt: StatementSync;
+  private readonly getConfigStmt: StatementSync;
+  private readonly setConfigStmt: StatementSync;
 
   constructor(dbPath: string = DEFAULT_DB_PATH) {
     this.dbPath = dbPath;
@@ -327,17 +344,42 @@ export class Store {
     this.listMigrationsStmt = this.db.prepare(
       'SELECT store, state, updated_at, detail_json FROM migrations',
     );
+    this.upsertPolicyStmt = this.db.prepare(`
+      INSERT INTO policies (
+        harness, virtual_model, real_model, effort, fallback_json, session_mode, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(harness, virtual_model) DO UPDATE SET
+        real_model = excluded.real_model,
+        effort = excluded.effort,
+        fallback_json = excluded.fallback_json,
+        session_mode = excluded.session_mode
+    `);
+    this.getPolicyStmt = this.db.prepare(
+      'SELECT harness, virtual_model, real_model, effort, fallback_json, session_mode, created_at FROM policies WHERE harness = ? AND virtual_model = ?',
+    );
+    this.listPoliciesStmt = this.db.prepare(
+      'SELECT harness, virtual_model, real_model, effort, fallback_json, session_mode, created_at FROM policies ORDER BY harness, virtual_model',
+    );
+    this.listPoliciesByHarnessStmt = this.db.prepare(
+      'SELECT harness, virtual_model, real_model, effort, fallback_json, session_mode, created_at FROM policies WHERE harness = ? ORDER BY virtual_model',
+    );
+    this.getConfigStmt = this.db.prepare('SELECT value FROM config WHERE key = ?');
+    this.setConfigStmt = this.db.prepare(`
+      INSERT INTO config (key, value) VALUES (?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `);
   }
 
   /**
    * Additive schema:
    *   v1 → v2: `accounts.grant_generation` + `leases` table (§4.7 / §4.8.2).
    *   v2 → v3: `migrations` journal (§4.8.3).
+   *   v3 → v4: `policies` table (§4.9.2b).
    * Generation lives on `accounts` (not a side table) so the fenced CAS in
    * §4.8.2 step 5 is a single-row UPDATE on the account itself.
    */
   private migrateIfNeeded(): void {
-    const SCHEMA_VERSION = 3;
+    const SCHEMA_VERSION = 4;
     const version = readUserVersion(this.db);
     if (version > SCHEMA_VERSION) {
       throw new Error(
@@ -374,6 +416,21 @@ export class Store {
         );
       `);
       this.db.exec('PRAGMA user_version = 3');
+    }
+    if (version < 4) {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS policies (
+          harness TEXT,
+          virtual_model TEXT,
+          real_model TEXT,
+          effort TEXT,
+          fallback_json TEXT,
+          session_mode TEXT,
+          created_at INTEGER,
+          PRIMARY KEY (harness, virtual_model)
+        );
+      `);
+      this.db.exec('PRAGMA user_version = 4');
     }
   }
 
@@ -742,6 +799,47 @@ export class Store {
     updatedAt: number = Date.now(),
   ): void {
     this.upsertMigrationStmt.run(store, state, updatedAt, detailJson);
+  }
+
+  upsertPolicy(row: {
+    harness: string;
+    virtualModel: string;
+    realModel: string;
+    effort: string;
+    fallback?: string[];
+    sessionMode?: string;
+    createdAt?: number;
+  }): void {
+    this.upsertPolicyStmt.run(
+      row.harness,
+      row.virtualModel,
+      row.realModel,
+      row.effort,
+      JSON.stringify(row.fallback ?? []),
+      row.sessionMode ?? 'header',
+      row.createdAt ?? Date.now(),
+    );
+  }
+
+  getPolicy(harness: string, virtualModel: string): PolicyRow | null {
+    const row = this.getPolicyStmt.get(harness, virtualModel) as PolicyRow | undefined;
+    return row ?? null;
+  }
+
+  listPolicies(harness?: string): PolicyRow[] {
+    const rows = harness
+      ? this.listPoliciesByHarnessStmt.all(harness)
+      : this.listPoliciesStmt.all();
+    return rows as unknown as PolicyRow[];
+  }
+
+  getConfig(key: string): string | null {
+    const row = this.getConfigStmt.get(key) as { value: string } | undefined;
+    return row?.value ?? null;
+  }
+
+  setConfig(key: string, value: string): void {
+    this.setConfigStmt.run(key, value);
   }
 }
 
