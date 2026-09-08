@@ -36,6 +36,14 @@ export interface LeaseRow {
   generation: number;
 }
 
+/** Credential-migration journal (§4.8.3). One row per native store. */
+export interface MigrationRow {
+  store: string;
+  state: string;
+  updated_at: number;
+  detail_json: string;
+}
+
 export function refreshLeaseName(accountId: string): string {
   return `refresh:${accountId}`;
 }
@@ -127,6 +135,9 @@ export class Store {
   private readonly heartbeatLeaseStmt: StatementSync;
   private readonly deleteLeaseByHolderStmt: StatementSync;
   private readonly stealLeaseStmt: StatementSync;
+  private readonly getMigrationStmt: StatementSync;
+  private readonly upsertMigrationStmt: StatementSync;
+  private readonly listMigrationsStmt: StatementSync;
 
   constructor(dbPath: string = DEFAULT_DB_PATH) {
     this.dbPath = dbPath;
@@ -302,40 +313,68 @@ export class Store {
     this.stealLeaseStmt = this.db.prepare(
       'UPDATE leases SET holder_id = ? WHERE name = ?',
     );
+    this.getMigrationStmt = this.db.prepare(
+      'SELECT store, state, updated_at, detail_json FROM migrations WHERE store = ?',
+    );
+    this.upsertMigrationStmt = this.db.prepare(`
+      INSERT INTO migrations (store, state, updated_at, detail_json)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(store) DO UPDATE SET
+        state = excluded.state,
+        updated_at = excluded.updated_at,
+        detail_json = excluded.detail_json
+    `);
+    this.listMigrationsStmt = this.db.prepare(
+      'SELECT store, state, updated_at, detail_json FROM migrations',
+    );
   }
 
   /**
-   * Additive v1 → v2: `accounts.grant_generation` + `leases` table (§4.7).
+   * Additive schema:
+   *   v1 → v2: `accounts.grant_generation` + `leases` table (§4.7 / §4.8.2).
+   *   v2 → v3: `migrations` journal (§4.8.3).
    * Generation lives on `accounts` (not a side table) so the fenced CAS in
    * §4.8.2 step 5 is a single-row UPDATE on the account itself.
    */
   private migrateIfNeeded(): void {
+    const SCHEMA_VERSION = 3;
     const version = readUserVersion(this.db);
-    if (version > 2) {
+    if (version > SCHEMA_VERSION) {
       throw new Error(
-        `qlb.db schema user_version=${version} is newer than this binary (2); upgrade qlb`,
+        `qlb.db schema user_version=${version} is newer than this binary (${SCHEMA_VERSION}); upgrade qlb`,
       );
     }
-    if (version >= 2) return;
-
-    const cols = this.db.prepare('PRAGMA table_info(accounts)').all() as Array<{
-      name: string;
-    }>;
-    if (!cols.some((c) => c.name === 'grant_generation')) {
-      this.db.exec(
-        'ALTER TABLE accounts ADD COLUMN grant_generation INTEGER DEFAULT 0',
-      );
+    if (version < 2) {
+      const cols = this.db.prepare('PRAGMA table_info(accounts)').all() as Array<{
+        name: string;
+      }>;
+      if (!cols.some((c) => c.name === 'grant_generation')) {
+        this.db.exec(
+          'ALTER TABLE accounts ADD COLUMN grant_generation INTEGER DEFAULT 0',
+        );
+      }
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS leases (
+          name TEXT PRIMARY KEY,
+          holder_pid INTEGER,
+          holder_id TEXT,
+          until INTEGER,
+          generation INTEGER
+        );
+      `);
+      this.db.exec('PRAGMA user_version = 2');
     }
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS leases (
-        name TEXT PRIMARY KEY,
-        holder_pid INTEGER,
-        holder_id TEXT,
-        until INTEGER,
-        generation INTEGER
-      );
-    `);
-    this.db.exec('PRAGMA user_version = 2');
+    if (version < 3) {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS migrations (
+          store TEXT PRIMARY KEY,
+          state TEXT NOT NULL,
+          updated_at INTEGER NOT NULL,
+          detail_json TEXT
+        );
+      `);
+      this.db.exec('PRAGMA user_version = 3');
+    }
   }
 
   close(): void {
@@ -685,6 +724,24 @@ export class Store {
   /** Fault injection for T-CONC-6 (`lease:steal`). Not used in production paths. */
   stealLease(name: string, newHolderId: string): void {
     this.stealLeaseStmt.run(newHolderId, name);
+  }
+
+  getMigration(store: string): MigrationRow | null {
+    const row = this.getMigrationStmt.get(store) as MigrationRow | undefined;
+    return row ?? null;
+  }
+
+  listMigrations(): MigrationRow[] {
+    return this.listMigrationsStmt.all() as unknown as MigrationRow[];
+  }
+
+  upsertMigration(
+    store: string,
+    state: string,
+    detailJson: string = '{}',
+    updatedAt: number = Date.now(),
+  ): void {
+    this.upsertMigrationStmt.run(store, state, updatedAt, detailJson);
   }
 }
 

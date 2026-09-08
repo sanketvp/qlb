@@ -1,12 +1,33 @@
 #!/usr/bin/env node
 import { adapters } from './adapters';
+import { macosKeychain } from './keychain';
+import {
+  DEFAULT_OWNER_FILE,
+  DEFAULT_POOL_FILE,
+  Migration,
+  defaultRehearseFn,
+  isRealPiAgentPath,
+} from './migration';
 import { resolveFromSnapshots, providerForModel } from './resolve';
-import { getStore } from './store';
+import { getStore, openStore, type Store } from './store';
 import type { AccountSnapshot, Adapter } from './types';
 
 const USAGE = `Usage:
   qlb status [--json]
-  qlb resolve --model <modelId> [--fallback m1,m2,...] [--session <id>] [--harness pi|claude-code|codex|dispatch] [--effort <lvl>] [--json]`;
+  qlb resolve --model <modelId> [--fallback m1,m2,...] [--session <id>] [--harness pi|claude-code|codex|dispatch] [--effort <lvl>] [--json]
+  qlb migrate stage    --pool-file <path> --owner-file <path> [--db <path>] [--target-dir <path>] [--confirm-real-cutover]
+  qlb migrate rehearse --pool-file <path> --owner-file <path> [--db <path>] [--target-dir <path>] [--confirm-real-cutover]
+  qlb migrate commit   --pool-file <path> --owner-file <path> [--db <path>] [--target-dir <path>] [--confirm-real-cutover]
+  qlb migrate rollback --pool-file <path> --owner-file <path> [--db <path>] [--target-dir <path>] [--confirm-real-cutover]
+  qlb migrate resume   --pool-file <path> --owner-file <path> [--db <path>] [--target-dir <path>] [--confirm-real-cutover]
+  qlb migrate status   [--pool-file <path>] [--owner-file <path>] [--db <path>] [--target-dir <path>] [--json]
+
+SAFETY: running migrate stage/rehearse/commit/rollback/resume without path
+overrides targets the REAL ~/.pi/agent/anthropic-pool.json and
+~/.pi/agent/qlb-owner.json. That is a REAL cutover and is refused unless
+--confirm-real-cutover is also passed. Tests and dry runs MUST pass
+--pool-file / --owner-file (or --target-dir) pointing at a temp copy.
+Do NOT pass --confirm-real-cutover unless you intend to cut over live Pi.`;
 
 type StatusOpts = { cmd: 'status'; json: boolean };
 type ResolveOpts = {
@@ -18,10 +39,111 @@ type ResolveOpts = {
   harness?: string;
   effort?: string;
 };
-type Opts = StatusOpts | ResolveOpts;
+type MigrateSub = 'stage' | 'rehearse' | 'commit' | 'rollback' | 'resume' | 'status';
+type MigrateOpts = {
+  cmd: 'migrate';
+  sub: MigrateSub;
+  json: boolean;
+  poolFile: string;
+  ownerFile: string;
+  db?: string;
+  confirmRealCutover: boolean;
+};
+type Opts = StatusOpts | ResolveOpts | MigrateOpts;
+
+const MIGRATE_SUBS: readonly MigrateSub[] = [
+  'stage',
+  'rehearse',
+  'commit',
+  'rollback',
+  'resume',
+  'status',
+];
+
+function isMigrateSub(s: string | undefined): s is MigrateSub {
+  return !!s && (MIGRATE_SUBS as readonly string[]).includes(s);
+}
+
+function parseMigrateArgs(args: string[]): MigrateOpts {
+  const subRaw = args[0];
+  if (subRaw === '-h' || subRaw === '--help' || subRaw === undefined) {
+    console.log(USAGE);
+    process.exit(0);
+  }
+  if (!isMigrateSub(subRaw)) {
+    console.error('qlb migrate: unknown subcommand. Expected stage|rehearse|commit|rollback|resume|status');
+    console.error(USAGE);
+    process.exit(1);
+  }
+  const rest = args.slice(1);
+  let json = false;
+  let poolFile: string | undefined;
+  let ownerFile: string | undefined;
+  let targetDir: string | undefined;
+  let db: string | undefined;
+  let confirmRealCutover = false;
+
+  for (let i = 0; i < rest.length; i++) {
+    const arg = rest[i];
+    if (arg === '--json') {
+      json = true;
+      continue;
+    }
+    if (arg === '--confirm-real-cutover') {
+      confirmRealCutover = true;
+      continue;
+    }
+    if (arg === '--pool-file') {
+      poolFile = rest[++i];
+      continue;
+    }
+    if (arg === '--owner-file') {
+      ownerFile = rest[++i];
+      continue;
+    }
+    if (arg === '--target-dir') {
+      targetDir = rest[++i];
+      continue;
+    }
+    if (arg === '--db') {
+      db = rest[++i];
+      continue;
+    }
+    if (arg === '-h' || arg === '--help') {
+      console.log(USAGE);
+      process.exit(0);
+    }
+    console.error(`qlb migrate: unknown argument ${arg}`);
+    console.error(USAGE);
+    process.exit(1);
+  }
+
+  if (targetDir) {
+    if (!ownerFile) ownerFile = `${targetDir.replace(/\/$/, '')}/qlb-owner.json`;
+    if (!poolFile) poolFile = `${targetDir.replace(/\/$/, '')}/anthropic-pool.json`;
+  }
+
+  return {
+    cmd: 'migrate',
+    sub: subRaw,
+    json,
+    poolFile: poolFile ?? DEFAULT_POOL_FILE,
+    ownerFile: ownerFile ?? DEFAULT_OWNER_FILE,
+    db,
+    confirmRealCutover,
+  };
+}
 
 function parseArgs(argv: string[]): Opts {
   const raw = argv.slice(2);
+  if (raw[0] === '-h' || raw[0] === '--help') {
+    console.log(USAGE);
+    process.exit(0);
+  }
+  if (raw[0] === 'migrate') {
+    return parseMigrateArgs(raw.slice(1));
+  }
+
   let cmd: 'status' | 'resolve' = 'status';
   const args = [...raw];
   if (args[0] === 'status' || args[0] === 'resolve') {
@@ -64,6 +186,10 @@ function parseArgs(argv: string[]): Opts {
       effort = args[++i];
       continue;
     }
+    if (arg === '-h' || arg === '--help') {
+      console.log(USAGE);
+      process.exit(0);
+    }
     console.error(USAGE);
     process.exit(1);
   }
@@ -77,6 +203,21 @@ function parseArgs(argv: string[]): Opts {
     return { cmd, json, model, fallback, session, harness, effort };
   }
   return { cmd: 'status', json };
+}
+
+function assertSafeMigratePaths(opts: MigrateOpts): void {
+  if (opts.sub === 'status') return;
+  const real =
+    isRealPiAgentPath(opts.poolFile) || isRealPiAgentPath(opts.ownerFile);
+  if (real && !opts.confirmRealCutover) {
+    console.error(
+      'REFUSED: resolved --pool-file / --owner-file is inside ~/.pi/agent/.\n' +
+        'This would perform a REAL Pi credential cutover.\n' +
+        'Pass --pool-file and --owner-file pointing at a temp copy, or pass\n' +
+        '--confirm-real-cutover if you truly intend to cut over live Pi.',
+    );
+    process.exit(2);
+  }
 }
 
 async function safeFetch(adapter: Adapter): Promise<AccountSnapshot[]> {
@@ -313,11 +454,74 @@ async function runResolve(opts: ResolveOpts): Promise<number> {
   return decision.ok ? 0 : 1;
 }
 
+function printMigrate(status: ReturnType<Migration['status']>, json: boolean): void {
+  if (json) {
+    console.log(JSON.stringify(status, null, 2));
+    return;
+  }
+  console.log(`store:     ${status.store}`);
+  console.log(`state:     ${status.state}`);
+  console.log(`owner:     ${status.ownerFile}`);
+  console.log(`native:    ${status.nativeStore}`);
+  console.log(`pi next:   ${status.piAtNextLaunch}`);
+  console.log(`resume:    ${status.resumeAction}`);
+}
+
+async function runMigrate(opts: MigrateOpts): Promise<number> {
+  assertSafeMigratePaths(opts);
+  let store: Store;
+  let opened = false;
+  if (opts.db) {
+    store = openStore(opts.db);
+    opened = true;
+  } else {
+    store = getStore();
+  }
+  try {
+    const mig = new Migration(store, macosKeychain, opts.poolFile, opts.ownerFile);
+    let status;
+    switch (opts.sub) {
+      case 'stage':
+        status = mig.stage();
+        break;
+      case 'rehearse':
+        status = await mig.rehearse(defaultRehearseFn);
+        break;
+      case 'commit':
+        status = mig.commit();
+        break;
+      case 'rollback':
+        status = mig.rollback();
+        break;
+      case 'resume':
+        status = mig.resume();
+        break;
+      case 'status':
+        status = mig.status();
+        break;
+    }
+    printMigrate(status, opts.json);
+    return 0;
+  } finally {
+    if (opened) store.close();
+  }
+}
+
 async function main(): Promise<void> {
   const opts = parseArgs(process.argv);
   if (opts.cmd === 'status') {
     await runStatus(opts.json);
     process.exit(0);
+  }
+  if (opts.cmd === 'migrate') {
+    try {
+      const code = await runMigrate(opts);
+      process.exit(code);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`qlb migrate ${opts.sub}: ${msg}`);
+      process.exit(1);
+    }
   }
   const code = await runResolve(opts);
   process.exit(code);
