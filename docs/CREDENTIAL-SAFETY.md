@@ -66,7 +66,15 @@ For the shadow-retain providers (**xai, kimi-coding, openai-codex, openrouter** 
 
 This is a known, **structural property of sharing credentials with native tooling**, not a bug to be fully eliminated. QLB's refresh fencing (generation CAS, heartbeat lease) coordinates QLB's own processes; it cannot coordinate with a refresher that doesn't know QLB exists. The risk is mitigated, not removed:
 
-- **Detection is planned**: a mechanism to detect native credential drift and resync QLB's owned copy was identified as necessary and is in active development. Once it ships, `qlb doctor` is expected to surface this condition proactively rather than leaving it to be discovered as an auth failure. (As of this writing it is planned, not shipped.)
+- **Detection and auto-resync (shipped).** When an authentication failure occurs on a QLB-owned credential (for example a `401` in the proxy path), QLB compares its owned copy against the provider's current native credential — a SHA-256 fingerprint of the access token, never the token material itself. If the fingerprints **differ**, the native store refreshed independently: QLB overwrites its Keychain copy with native's current credential and retries the request **exactly once**. If the fingerprints are **identical**, the credential was genuinely revoked externally: QLB does **not** retry and surfaces the real error, because a retry would fail identically — the fix is re-authenticating the account through the **native tool's own login flow**. Each resync attempt (recovered or genuine-revocation) is written to the audit trail so the two cases stay distinguishable after the fact. The same compare-and-resync can be triggered manually at any time with `qlb native-resync --provider <p> --account <id>` (see [CLI.md](CLI.md#qlb-native-resync)).
+- **`qlb doctor` surfaces drift proactively (shipped).** Doctor compares owned vs. native fingerprints for every QLB-owned account before anything fails, so drift is visible as a warning rather than discovered as an auth error:
+
+  ```console
+  $ qlb doctor
+  [WARN] native-sync:acct-kimi: QLB Keychain copy DIFFERS from native for acct-kimi (kimi-coding) — native may have refreshed independently; next 401 will auto-resync
+  ```
+
+  (Account id illustrative; the message text is exactly what the code emits. A matching fingerprint prints a `[PASS]` line instead, and for rename-strategy providers like Anthropic whose native store is intentionally gone, doctor reports that no comparison is possible rather than warning.)
 - **Immediate manual fallback**: re-authenticate the affected account through the **native tool's own login flow**, then bring QLB's ownership of that credential back to a clean state. The credential-safety design has always treated native re-auth as the ultimate fallback — QLB never blocks the native tool from re-authenticating its own accounts, which is exactly what makes recovery straightforward when drift bites.
 
 If you run both QLB-owned and native consumers against the same accounts simultaneously, treat an unexpected auth error on the QLB side as a likely native drift event first, and a QLB-side refresh failure second — check `qlb status` / `qlb doctor`, and check whether a native tool refreshed the account recently.
@@ -101,4 +109,4 @@ Even after QLB owns your credentials, the original native stores for harnesses l
 | Stale backups | Never trusted: rollback re-exports QLB's *current* grants; backups are used only with a fingerprint proving they were never rotated |
 | Proxy credential access | Fails closed unless the journal says `QLB_OWNED`/`RETIRED` |
 | Native store removal | Last step, gated on a 7-day / 20-clean-decision soak plus an explicit flag |
-| Native refresh invalidating QLB's copy (shadow-retain providers) | Structural risk of shared credentials, mitigated not eliminated; see [Native credential drift](#native-credential-drift-the-shadow-retain-tradeoff) — drift detection/resync planned, native re-auth is the manual fallback |
+| Native refresh invalidating QLB's copy (shadow-retain providers) | Structural risk of shared credentials, mitigated not eliminated; see [Native credential drift](#native-credential-drift-the-shadow-retain-tradeoff) — drift is fingerprint-detected and auto-resynced (one retry) on the next 401, surfaced proactively by `qlb doctor`, and manually triggerable via `qlb native-resync`; a fingerprint-identical (genuinely revoked) credential still requires native re-auth |

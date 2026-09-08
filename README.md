@@ -1,6 +1,6 @@
 # QLB — Cross-Provider Quota Load Balancer
 
-**The headline feature: if you have multiple Claude accounts, multiple Codex accounts, or both, QLB automatically load-balances your usage across all of them.** Run out of headroom on one Claude account and QLB routes the next request to whichever of your other Claude accounts still has room — same for Codex — so you stop babysitting which login is about to hit its 5-hour or weekly limit and manually switching. It picks the best account for every request based on real, live usage data (not guesses), spreads normal usage so no single account gets drained first, and only reaches for a genuinely different model/provider as a fallback when you've explicitly said that's OK.
+**The headline feature: if you have multiple Claude accounts, multiple Codex accounts, or both, QLB automatically load-balances your usage across all of them.** Run out of headroom on one Claude account and QLB routes the next request to whichever of your other Claude accounts still has room — same for Codex — so you stop babysitting which login is about to hit its 5-hour or weekly limit and manually switching. It picks the best account for every request based on real, live usage data (not guesses), spreads normal usage so no single account gets drained first, and only reaches for a genuinely different model/provider as a fallback when you've explicitly said that's OK. And when you *want* a specific session on a specific account — deliberate multi-account parallel use — you can pin it explicitly with `qlb override pin` for a guaranteed parallel spread instead of relying on automatic scoring, or switch the automatic policy itself with `qlb resolve --strategy headroom|spread|round-robin|failover` (see the [CLI reference](docs/CLI.md)).
 
 QLB extends the same account-pooling idea to Grok, Kimi K3, and OpenRouter too — the same load-balancing engine works across any number of accounts on any provider, not just Claude and Codex.
 
@@ -45,6 +45,22 @@ powershell -File scripts/install.ps1   # Windows
 If `npm link` cannot write a global bin, the script prints fallbacks (`PATH`, elevated prompt / `sudo`, or `npx`) and still bootstraps via `node dist/cli.js init`.
 
 `qlb init` detects existing credential sources, reports anything missing, and writes a reviewable starter file at `~/.qlb/config.json`. It never prompts, so it is safe to use in scripts and CI. `qlb doctor` performs local checks only by default; add `--live` to opt into provider network calls.
+
+## Installing as a Pi extension
+
+QLB ships a Pi extension at `extensions/qlb-pi/index.ts` that lets [Pi](https://github.com/earendil-works/pi) route Anthropic requests through `qlb resolve` for account selection. `package.json` declares it via the `"pi": { "extensions": [...] }` manifest field that Pi's package installer reads, so it installs like any other Pi package:
+
+```bash
+pi install https://github.com/sanketvp/qlb          # global (~/.pi/agent/settings.json)
+pi install https://github.com/sanketvp/qlb -l        # project-local (.pi/settings.json)
+```
+
+This registers the extension file with Pi — **it is a separate step from installing the `qlb` CLI itself**, and both are required for the extension to actually do anything:
+
+1. **Register the extension** with `pi install` (above).
+2. **Make the `qlb` CLI available.** The extension shells out to a `qlb` binary at runtime (`findQlbCli()` in `extensions/qlb-pi/index.ts`): it looks for a built `dist/cli.js` next to the extension first, then falls back to whatever `qlb` resolves to on `PATH`. Installing the Pi extension alone does **not** build or install that CLI — run `bash scripts/install.sh` (or `npm install && npm run build && npm link`) from this repo so `qlb` is on `PATH`, or otherwise ensure a built `dist/cli.js` ships alongside the installed extension.
+
+Even fully installed this way, the extension is **inert by default**: it only activates when `~/.pi/agent/qlb-owner.json` exists, which is created solely by QLB's own `qlb migrate ... --confirm-real-cutover` flow — never automatically by `pi install`. See [Credential Safety](docs/CREDENTIAL-SAFETY.md) before running that migration.
 
 ## Status views
 

@@ -8,15 +8,26 @@
 // loads each extension from its own directory; qlb-pi must not depend on
 // anthropic-pool remaining installed.
 //
-// NOT re-verified against a live Pi runtime after this fix — code compared
-// against the working anthropic-pool transport and covered by unit tests for
-// payload shaping + audit outcome classification. Do NOT install this into
-// ~/.pi/agent/extensions/ until a throwaway Pi session confirms a real OAuth
-// request succeeds. Activation is gated on ~/.pi/agent/qlb-owner.json (or
-// QLB_PI_REHEARSAL=1); without that marker the extension is inert, so even a
-// premature copy into the extensions dir cannot steal anthropic-pool's
-// registration. Copy/symlink is an explicit, deliberate user step — this
-// repo never writes into ~/.pi/agent/extensions/.
+// Verified live 2026-09-08 against a real Pi runtime: real Anthropic
+// requests were sent through this extension's streamSimple/onPayload path
+// and succeeded (HTTP 200, correct completions), and the audit log recorded
+// accurate outcomes for those requests, after two bug fixes (request-shaping
+// and audit-log accuracy — see repo history for details).
+//
+// The extension remains INERT by default. Activation is gated on
+// ~/.pi/agent/qlb-owner.json (or QLB_PI_REHEARSAL=1); that file is only
+// created by QLB's own `qlb migrate ... --confirm-real-cutover` flow. This
+// means installing the package via `pi install` (which just registers the
+// extension file per package.json's "pi" manifest) does NOT by itself
+// activate anything, touch credentials, or affect anthropic-pool's
+// registration — a separate, explicit migration step is required first.
+//
+// Known structural risk: for any account in QLB_OWNED state, the native
+// provider's own credential store can drift out of sync with QLB's copy
+// (native-credential-drift). This is mitigated by the native-resync
+// mechanism added in src/native-resync.ts as of today, but the risk is
+// structural to the QLB_OWNED model, not fully eliminated — see
+// docs/CREDENTIAL-SAFETY.md.
 //
 // When active:
 //   - unregisters the built-in anthropic provider (same hook anthropic-pool

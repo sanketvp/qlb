@@ -111,6 +111,17 @@ Selection then proceeds in a fixed ladder (`src/resolve.ts`):
 
 Every decision is persisted to the `decisions` table with a per-bucket `snapshot_json` (value, confidence, source, `ageMs`) so any past decision can be audited after the fact.
 
+## Selection strategies
+
+Rule-S scoring is the engine, not the whole policy. `src/strategies.ts` layers four selectable selection policies on top of it, chosen per resolve via `qlb resolve --strategy <headroom|spread|round-robin|failover>` (default `headroom`; `defaultStrategy` in the config sets a different default persistently):
+
+- **`headroom`** (default) — the scoring section above verbatim: single best account by Rule-S score, headroom-then-all-in, then the fallback-model walk.
+- **`spread`** — same scoring, but candidates within `SPREAD_MARGIN` (10 points) of the best score are treated as tied, and the tie is broken by a deterministic hash of the session id. Concurrent sessions with equal-quality options therefore land on different accounts instead of piling onto one; a resolve with no session id falls back to plain `headroom`.
+- **`round-robin`** — scores are used only to exclude exhausted and errored accounts; selection cycles through the remaining accounts in account-id order using a persistent per-provider counter in the store.
+- **`failover`** — stick with the current account while every relevant bucket with a known reading is under 100%; switch only when it is genuinely exhausted. Minimizes account churn at the cost of even spreading.
+
+`headroom` is the default and the most-tested path. The other three exist because "pick the single best account" is not always the goal: `spread` and `round-robin` deliberately trade peak headroom for parallel multi-account coverage, and `failover` trades spreading for stability. All four share the same override layer (`src/overrides.ts`): a session pin beats any strategy, reserved accounts are removed before selection, and drain-first accounts are tried before the rest — so explicit operator intent always outranks the automatic policy. Every decision still records the strategy used, keeping the audit trail attributable regardless of policy.
+
 ## Single-flight poll coalescing
 
 Without coordination, N processes that notice the same stale cache at the same instant would each fire their own usage GET. QLB coalesces them with a TTL-only claim (`poll_claims` table, `src/single-flight.ts`):
@@ -135,6 +146,10 @@ The crash analysis is explicit (C1–C4 in `refresh-lease.ts`): every crash poin
 
 Reads are lock-free and fast-path: if the cached grant doesn't expire within 60 s, no lock is taken at all.
 
+### Native credential drift and resync
+
+Fencing coordinates QLB's processes against each other; it cannot coordinate with a *native* refresher that doesn't know QLB exists. For the shadow-retain providers (and during a partial Anthropic rollout where a native extension may still be live), native tooling can legitimately refresh the same underlying account and rotate its access token, silently invalidating QLB's frozen Keychain copy — surfacing as a `401` on an account QLB itself never refreshed. When that happens (`src/native-resync.ts`), QLB compares its owned credential to the provider's current native credential by SHA-256 fingerprint of the access token. Fingerprints **differ** → native refreshed independently: QLB overwrites its Keychain item with native's current credential (a single overwrite, preserving the owned grant's generation — no re-migration) and retries the request exactly once. Fingerprints are **identical** → the credential was genuinely revoked externally: QLB does not retry and surfaces the real error, since re-authentication through the native tool is the only fix. The same comparison runs read-only in `qlb doctor` (`native-sync:<accountId>` checks) so drift is visible before any request fails, and can be triggered manually via `qlb native-resync`. Every attempt lands in the audit trail, distinguishing "recovered via resync" from "genuine revocation."
+
 ## Storage
 
 `src/store.ts` uses Node's built-in `node:sqlite` (synchronous, so a `BEGIN IMMEDIATE` transaction is a straight-line code block with no awaits). The database (default `~/.qlb/qlb.db`) runs in WAL mode with `busy_timeout` and holds:
@@ -145,7 +160,7 @@ Reads are lock-free and fast-path: if the cached grant doesn't expire within 60 
 - `poll_claims` / `leases` — the two single-flight mechanisms above
 - `migrations` — the credential-ownership journal
 - `policies` — virtual-model → real-model mappings for the proxy
-- `overrides` — pin/reserve/drain-first rows (the table exists; **no override CLI is wired yet** — status shows `override=none` unless a row was inserted manually)
+- `overrides` — pin/reserve/drain-first rows, written and managed by `qlb override pin|reserve|drain-first|clear|list`; `qlb status` displays any active row, and `resolve` honors them (pin beats any strategy, reserved accounts are excluded, drain-first accounts are tried first)
 
 Snapshot caching is *politeness*, not correctness: a caller reuses its last observation rather than re-fetching, and any newer reading from any source replaces it. No decisions ever depend on data QLB generated itself.
 

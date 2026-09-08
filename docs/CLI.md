@@ -67,6 +67,24 @@ Overall: WARN
 
 Flags: `[--json] [--live]`. Exit `1` when overall is `FAIL`.
 
+For QLB-owned accounts, doctor also runs a native-credential drift check (one `[PASS]`/`[WARN]` line per owned account, name `native-sync:<accountId>`) — see [CREDENTIAL-SAFETY.md](CREDENTIAL-SAFETY.md#native-credential-drift-the-shadow-retain-tradeoff).
+
+## `qlb native-resync`
+
+Compare a QLB-owned credential with the provider's current native credential and resync QLB's Keychain copy if they differ. This is the manual trigger for the same fingerprint-compare-and-resync the proxy runs automatically on an auth failure — mechanism and the differ-vs-identical semantics are described in [CREDENTIAL-SAFETY.md](CREDENTIAL-SAFETY.md#native-credential-drift-the-shadow-retain-tradeoff). It is one Keychain overwrite at most, never a re-migration, and exits `0` either way:
+
+```console
+$ qlb native-resync --provider kimi-coding --account acct-kimi
+unchanged: native credential identical to QLB copy (genuine revocation; re-auth required)
+
+$ qlb native-resync --provider kimi-coding --account acct-kimi --json
+{"resynced":true,"reason":"native credential differed from QLB copy for kimi-coding/acct-kimi; Keychain updated"}
+```
+
+`resynced: true` means native had refreshed independently and QLB's copy was updated — whatever failed with an auth error is safe to retry. `resynced: false` with the "genuine revocation" reason means the credential is dead for real and needs a native re-login; QLB deliberately does not retry in that case.
+
+Flags: `--provider <anthropic|xai|kimi-coding|openai-codex|openrouter>` (required), `--account <id>` (required), `[--db <path>]`, `[--json]`.
+
 ## `qlb status`
 
 The dashboard view (default): one block per account with a health glyph, credential-ownership state, and any active override, then indented bucket rows.
@@ -214,7 +232,7 @@ Strategies:
 
 ## `qlb override`
 
-Explicit pin / reserve / drain-first over the existing `overrides` table. `--until` is an ISO datetime or a duration like `2h` / `30m` / `1d`. When omitted, the default lifetime is **24 hours from now**.
+Explicit pin / reserve / drain-first over the existing `overrides` table. This is what makes **deliberate multi-account parallel use** possible: automatic scoring picks one best account, but you can pin different sessions to different accounts for a guaranteed parallel spread, take an account out of rotation entirely, or bias traffic toward one account to drain it. `--until` is an ISO datetime or a duration like `2h` / `30m` / `1d`. When omitted, the default lifetime is **24 hours from now**.
 
 ```console
 $ qlb override pin --session synth-session-1 --account acct-a --until 2h --json
@@ -412,5 +430,4 @@ Flags: `[--info-path <path>]`, `[--idle-ms <n>]` (positive integer), `[--db <pat
 
 ## Not yet wired (honest gaps)
 
-- **Overrides CLI.** The `overrides` table (pin / reserve / drain-first) exists in the store and `qlb status` displays any row, but no CLI writes overrides yet — status shows `override=none` unless a row was inserted manually.
 - **Probes from the CLI.** Codex/xAI readings in the CLI path come from organic traffic (xAI via its minimal probe inside the adapter, coalesced single-flight) and from the proxy's header parsing; the spec's `qlb refresh --allow-probe` / `qlb audit` / `qlb why` surface is not implemented yet.

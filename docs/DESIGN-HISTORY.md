@@ -31,7 +31,7 @@ The effect on the rest of the design was disproportionate to the size of the del
 
 ## What shipped vs. what the spec proposed
 
-The implementation follows the reviewed design's architecture (adapters → live-query capacity model → confidence-based scoring → resolve → SQLite store → Keychain-backed credentials with a generation-CAS-fenced refresh → loopback proxy), with the final implementation as ground truth. Known gaps are documented rather than glossed over — for example, the `overrides` table exists in the store and is displayed by `qlb status`, but no override CLI is wired yet; see the "Not yet wired" section in [CLI.md](CLI.md).
+The implementation follows the reviewed design's architecture (adapters → live-query capacity model → confidence-based scoring → resolve → SQLite store → Keychain-backed credentials with a generation-CAS-fenced refresh → loopback proxy), with the final implementation as ground truth. Known gaps are documented rather than glossed over — for example, the `overrides` table initially shipped in the store (displayed by `qlb status`) without a CLI to write rows; the `qlb override` CLI and selectable selection strategies have since been implemented (see the strategy section in [ARCHITECTURE.md](ARCHITECTURE.md)).
 
 ## September 8, 2026: real cutover incident — native/QLB credential drift
 
@@ -50,6 +50,8 @@ After fixing both and re-verifying, `qlb-pi` was rolled out across most (not all
 **The structural finding.** The revoked-token failure mode is not a one-off partial-rollout bug. For xai, kimi-coding, openai-codex, and openrouter, QLB uses the **shadow-retain** migration strategy: native credentials are intentionally never removed, because the underlying file or Keychain service is shared with other things or kept native-accessible by design. That means "something native refreshes the same underlying account independently and silently invalidates QLB's owned copy" is a **permanent structural property** of those four providers, not a temporary migration-window risk the way it was for Anthropic. The spec treated cutover as a one-time atomic event with a clean before/after; it did not fully anticipate a long-lived state in which both owners are live simultaneously.
 
 A mitigation — detecting native credential drift and resyncing QLB's owned copy — was identified as necessary during this incident and was in active development as of this writing; see [CREDENTIAL-SAFETY.md](CREDENTIAL-SAFETY.md) for the user-facing guidance in the meantime.
+
+**September 8, 2026 follow-up: the drift mitigation shipped, and immediately proved itself.** The native-resync mechanism described above — fingerprint-compare the owned copy against the native credential on an auth failure, resync-and-retry once on a mismatch, refuse to retry on a fingerprint-identical genuine revocation, plus proactive `qlb doctor` drift checks — was implemented and deployed the same day. Shortly after deployment it caught a real drift event in production (the Kimi credential had been refreshed independently by native tooling): instead of surfacing as another `401 token has been revoked` outage, the mismatch was detected, QLB's Keychain copy was resynced from the native credential, and the retried request succeeded. That is the incident's structural finding validated by an actual occurrence, not a test: the failure mode this fix targets is real, recurring, and now self-healing, with `qlb doctor` able to show the drift before it costs a failed request.
 
 **Lessons taken:**
 
