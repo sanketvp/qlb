@@ -4,7 +4,7 @@
   "private": true,
   "description": "Local quota visibility and account selection across AI coding providers",
   "license": "MIT",
-  "repository": "git+https://github.com/<owner>/qlb.git",
+  "repository": "git+https://github.com/sanketvp/qlb.git",
   "keywords": [
     "ai",
     "cli",
