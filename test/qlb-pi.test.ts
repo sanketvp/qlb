@@ -12,6 +12,16 @@ import {
   PI_DEFAULT_PROMPT_PREFIX,
   PI_DEFAULT_PROMPT_TERMINATOR,
 } from '../extensions/qlb-pi/constants';
+import {
+  accountColorIndex,
+  buildFooterLines,
+  EMPTY_HEALTH,
+  formatHealthText,
+  formatUsage,
+  parseDoctorJson,
+  pickBuckets,
+  shortLabel,
+} from '../extensions/qlb-pi/footer';
 
 describe('qlb-pi audit outcome classification', () => {
   it('treats 2xx HTTP statuses as ok and everything else as failed', () => {
@@ -104,5 +114,114 @@ describe('qlb-pi OAuth request shaping (parity with anthropic-pool)', () => {
   it('leaves non-Anthropic payloads untouched', () => {
     const payload = { foo: 1 };
     assert.equal(shapeAnthropicOAuthPayload(payload), payload);
+  });
+});
+
+describe('qlb-pi footer helpers', () => {
+  it('colors anthropic account-N by stable slot index', () => {
+    assert.equal(accountColorIndex('account-1'), 0);
+    assert.equal(accountColorIndex('account-4'), 3);
+    assert.equal(accountColorIndex('xai-default', ['kimi-default', 'xai-default']), 1);
+  });
+
+  it('shortens email labels to the local part', () => {
+    assert.equal(shortLabel('sanket.patel@gmail.com'), 'sanket.patel');
+    assert.equal(shortLabel('Grok (xAI)'), 'Grok (xAI)');
+  });
+
+  it('formats preferred usage buckets compactly', () => {
+    const usage = formatUsage([
+      { key: '7d:Fable', usedPct: 4 },
+      { key: '7d', usedPct: 33.4 },
+      { key: '5h', usedPct: 12 },
+    ]);
+    assert.equal(usage, '5h 12% · 7d 33%');
+    assert.deepEqual(
+      pickBuckets([{ key: 'weekly', usedPct: 68 }, { key: '5h', usedPct: 3 }]).map((b) => b.key),
+      ['5h', 'weekly'],
+    );
+  });
+
+  it('parses native-sync doctor checks into a drift summary', () => {
+    const parsed = parseDoctorJson(JSON.stringify({
+      overall: 'WARN',
+      checks: [
+        { name: 'sqlite', level: 'PASS', message: 'ok' },
+        { name: 'native-sync:account-1', level: 'PASS', message: 'matches' },
+        { name: 'native-sync:xai-default', level: 'WARN', message: 'native drifted' },
+      ],
+    }));
+    assert.equal(parsed.nativeSyncPass, 1);
+    assert.equal(parsed.nativeSyncWarn, 1);
+    assert.equal(parsed.nativeSyncFail, 0);
+    assert.equal(parsed.overall, 'WARN');
+    assert.equal(parsed.driftMessage, 'native drifted');
+    const health = formatHealthText({
+      ...EMPTY_HEALTH,
+      ownedStores: 5,
+      accountCount: 8,
+      ...parsed,
+    });
+    assert.equal(health.warn, true);
+    assert.equal(health.text, 'qlb · 5 owned · 8 accts · 1 drift');
+  });
+
+  it('always returns exactly 2 lines and degrades when width is small', () => {
+    const identity = (s: string) => s;
+    const wide = buildFooterLines({
+      width: 80,
+      account: {
+        accountId: 'account-3',
+        label: 'sanket.patel@gmail.com',
+        model: 'claude-sonnet-5',
+        index: 2,
+        buckets: [{ key: '5h', usedPct: 20 }, { key: '7d', usedPct: 20 }],
+      },
+      health: { ...EMPTY_HEALTH, ownedStores: 5, accountCount: 8, overall: 'PASS' },
+      model: 'claude-sonnet-5',
+      paintAccount: identity,
+      paintDim: identity,
+      paintWarn: identity,
+      truncate: (text, width) => text.slice(0, width),
+      visible: (text) => text.length,
+    });
+    assert.equal(wide.length, 2);
+    assert.match(wide[0], /★ sanket.patel/);
+    assert.match(wide[0], /5h 20%/);
+    assert.match(wide[1], /sync ok/);
+
+    const narrow = buildFooterLines({
+      width: 12,
+      account: {
+        accountId: 'account-3',
+        label: 'sanket.patel@gmail.com',
+        model: 'claude-sonnet-5',
+        index: 2,
+        buckets: [{ key: '5h', usedPct: 20 }, { key: '7d', usedPct: 20 }],
+      },
+      health: { ...EMPTY_HEALTH, ownedStores: 5, accountCount: 8, overall: 'WARN', nativeSyncWarn: 1 },
+      model: 'claude-sonnet-5',
+      paintAccount: identity,
+      paintDim: identity,
+      paintWarn: identity,
+      truncate: (text, width) => text.slice(0, width),
+      visible: (text) => text.length,
+    });
+    assert.equal(narrow.length, 2);
+    assert.ok(narrow[0].length <= 12);
+    assert.ok(narrow[1].length <= 12);
+
+    const empty = buildFooterLines({
+      width: 0,
+      account: null,
+      health: EMPTY_HEALTH,
+      model: 'claude-sonnet-5',
+      paintAccount: identity,
+      paintDim: identity,
+      paintWarn: identity,
+      truncate: (text, width) => text.slice(0, width),
+      visible: (text) => text.length,
+    });
+    assert.deepEqual(empty, ['', '']);
   });
 });

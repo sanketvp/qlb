@@ -49,10 +49,20 @@ import { join } from "node:path";
 import type {
   ExtensionAPI,
   ExtensionCommandContext,
+  ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import type { Api, Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
+import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { streamWithAuthRetry } from "./auth-retry.js";
+import {
+  accountFg,
+  buildFooterLines,
+  parseDoctorJson,
+  readAccountFooterData,
+  readCheapHealth,
+  type HealthFooterData,
+} from "./footer.js";
 import { classifyHttpStatus } from "./outcome.js";
 import { shapeAnthropicOAuthPayload } from "./request-shaping.js";
 
@@ -224,7 +234,11 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   }
 
   let lastDecision: ResolveOk | null = null;
+  let footerModelId: string | undefined;
   let builtin: StreamSimple;
+  pi.on("model_select", (event) => {
+    footerModelId = event.model.id;
+  });
   try {
     builtin = await resolveBuiltinAnthropicStreamSimple();
   } catch (err) {
@@ -364,7 +378,114 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     },
   });
 
+  const installFooter = (ctx: ExtensionContext) => {
+    if (typeof ctx.ui.setFooter !== "function") return;
+    try {
+      ctx.ui.setFooter((tui, theme) => {
+        let cachedAccount = readAccountFooterData({
+          lastDecision,
+          currentModel: footerModelId || ctx.model?.id,
+        });
+        let cachedHealth: HealthFooterData = readCheapHealth();
+        let lastSnapKey = "";
+        let disposed = false;
+        let healthFetchedAt = 0;
+        let healthInFlight = false;
+
+        const refreshDoctor = () => {
+          if (disposed || healthInFlight) return;
+          healthInFlight = true;
+          void runQlb(["doctor", "--json"], 12_000)
+            .then((result) => {
+              if (disposed) return;
+              const parsed = parseDoctorJson(result.stdout);
+              cachedHealth = {
+                ...cachedHealth,
+                ...parsed,
+              };
+              healthFetchedAt = Date.now();
+              tui.requestRender();
+            })
+            .catch(() => {
+              healthFetchedAt = Date.now();
+            })
+            .finally(() => {
+              healthInFlight = false;
+            });
+        };
+
+        const tick = () => {
+          if (disposed) return;
+          try {
+            cachedAccount = readAccountFooterData({
+              lastDecision,
+              currentModel: footerModelId || ctx.model?.id,
+            });
+            const cheap = readCheapHealth();
+            cachedHealth = {
+              ...cachedHealth,
+              ownedStores: cheap.ownedStores,
+              accountCount: cheap.accountCount,
+            };
+          } catch {
+            // fail-open: keep previous snapshot
+          }
+          if (Date.now() - healthFetchedAt > 60_000) {
+            refreshDoctor();
+          }
+          const key =
+            JSON.stringify(cachedAccount) +
+            "|" +
+            JSON.stringify(cachedHealth) +
+            "|" +
+            (footerModelId || ctx.model?.id || "");
+          if (key !== lastSnapKey) {
+            lastSnapKey = key;
+            tui.requestRender();
+          }
+        };
+
+        const timer = setInterval(tick, 5000);
+        refreshDoctor();
+
+        return {
+          dispose: () => {
+            disposed = true;
+            clearInterval(timer);
+          },
+          invalidate() {},
+          render(width: number): string[] {
+            try {
+              const model =
+                footerModelId ||
+                ctx.model?.id ||
+                cachedAccount?.model ||
+                "no-model";
+              const index = cachedAccount?.index ?? 0;
+              return buildFooterLines({
+                width,
+                account: cachedAccount,
+                health: cachedHealth,
+                model,
+                paintAccount: (text) => accountFg(index, text),
+                paintDim: (text) => theme.fg("dim", text),
+                paintWarn: (text) => theme.fg("warning", text),
+                truncate: truncateToWidth,
+                visible: visibleWidth,
+              });
+            } catch {
+              return ["", ""];
+            }
+          },
+        };
+      });
+    } catch (err) {
+      console.error("[qlb-pi] failed to install footer:", err);
+    }
+  };
+
   pi.on("session_start", (_event, ctx) => {
     ctx.ui.setStatus("qlb", "qlb-pi active");
+    installFooter(ctx);
   });
 }
