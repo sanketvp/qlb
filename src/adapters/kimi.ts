@@ -1,6 +1,8 @@
 import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { fetchAndCache } from '../single-flight';
+import { getStore } from '../store';
 import type { AccountSnapshot, Adapter, BucketReading } from '../types';
 
 const KEY_FILE = join(homedir(), 'DEV_vault', '04-Security', 'kimi-code-credentials.md');
@@ -105,7 +107,8 @@ export const kimiAdapter: Adapter = {
   displayName: 'Kimi K3',
 
   async fetchSnapshots(): Promise<AccountSnapshot[]> {
-    const fetchedAt = Date.now();
+    const claimId = 'kimi-default';
+    getStore().upsertAccount(claimId, 'kimi-coding', 'Kimi K3');
 
     let key: string;
     try {
@@ -114,49 +117,65 @@ export const kimiAdapter: Adapter = {
       return [errorSnapshot(err instanceof Error ? err.message : String(err))];
     }
 
-    let res: Response;
+    let liveAccountId = claimId;
+    let liveLabel = 'Kimi K3';
+    let lastError: string | undefined;
+
     try {
-      res = await fetch(USAGES_URL, {
-        headers: { Authorization: `Bearer ${key}` },
-        signal: AbortSignal.timeout(TIMEOUT_MS),
+      const buckets = await fetchAndCache(claimId, async () => {
+        const fetchedAt = Date.now();
+        let res: Response;
+        try {
+          res = await fetch(USAGES_URL, {
+            headers: { Authorization: `Bearer ${key}` },
+            signal: AbortSignal.timeout(TIMEOUT_MS),
+          });
+        } catch (err) {
+          lastError = `request failed: ${err instanceof Error ? err.message : String(err)}`;
+          throw new Error(lastError);
+        }
+        if (!res.ok) {
+          lastError = `usages endpoint returned HTTP ${res.status}`;
+          throw new Error(lastError);
+        }
+        let body: KimiUsagesResponse;
+        try {
+          body = (await res.json()) as KimiUsagesResponse;
+        } catch {
+          lastError = 'malformed JSON from usages endpoint';
+          throw new Error(lastError);
+        }
+        if (!body.usage) {
+          lastError = 'response missing usage block';
+          throw new Error(lastError);
+        }
+        const parsed: Record<string, BucketReading> = {
+          weekly: toReading(body.usage, fetchedAt),
+        };
+        for (const entry of body.limits ?? []) {
+          if (!entry.detail) continue;
+          const minutes = windowMinutes(entry.window);
+          parsed[windowBucketKey(minutes)] = toReading(entry.detail, fetchedAt, minutes);
+        }
+        liveAccountId = body.user?.userId ?? claimId;
+        const level = body.user?.membership?.level;
+        liveLabel = level ? `Kimi K3 (${level})` : 'Kimi K3';
+        return parsed;
       });
+
+      if (buckets && Object.keys(buckets).length > 0) {
+        return [
+          {
+            accountId: liveAccountId,
+            provider: 'kimi-coding',
+            label: liveLabel,
+            buckets,
+          },
+        ];
+      }
+      return [errorSnapshot(lastError ?? 'response missing usage block')];
     } catch (err) {
-      return [errorSnapshot(`request failed: ${err instanceof Error ? err.message : String(err)}`)];
+      return [errorSnapshot(err instanceof Error ? err.message : String(err))];
     }
-
-    if (!res.ok) {
-      return [errorSnapshot(`usages endpoint returned HTTP ${res.status}`)];
-    }
-
-    let body: KimiUsagesResponse;
-    try {
-      body = (await res.json()) as KimiUsagesResponse;
-    } catch {
-      return [errorSnapshot('malformed JSON from usages endpoint')];
-    }
-
-    if (!body.usage) {
-      return [errorSnapshot('response missing usage block')];
-    }
-
-    const buckets: Record<string, BucketReading> = {
-      weekly: toReading(body.usage, fetchedAt),
-    };
-
-    for (const entry of body.limits ?? []) {
-      if (!entry.detail) continue;
-      const minutes = windowMinutes(entry.window);
-      buckets[windowBucketKey(minutes)] = toReading(entry.detail, fetchedAt, minutes);
-    }
-
-    const level = body.user?.membership?.level;
-    return [
-      {
-        accountId: body.user?.userId ?? 'kimi-default',
-        provider: 'kimi-coding',
-        label: level ? `Kimi K3 (${level})` : 'Kimi K3',
-        buckets,
-      },
-    ];
   },
 };

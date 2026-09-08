@@ -1,6 +1,8 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { fetchAndCache } from '../single-flight';
+import { getStore } from '../store';
 import type { AccountSnapshot, Adapter, BucketReading } from '../types';
 
 const POOL_FILE_PATH = join(homedir(), '.pi', 'agent', 'anthropic-pool.json');
@@ -219,46 +221,59 @@ function loadPoolAccounts(): PoolAccount[] | { error: string } {
   return parsed.accounts;
 }
 
-async function fetchOne(account: PoolAccount, index: number): Promise<AccountSnapshot> {
+async function fetchUsageBuckets(account: PoolAccount): Promise<Record<string, BucketReading>> {
+  const access = account.credentials?.access;
+  const expires = account.credentials?.expires;
+  if (!access || (typeof expires === 'number' && expires < Date.now())) {
+    throw new Error(AUTH_EXPIRED);
+  }
+
+  const res = await fetch(USAGE_URL, {
+    headers: {
+      Authorization: `Bearer ${access}`,
+      'anthropic-beta': 'oauth-2025-04-20',
+    },
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+  });
+
+  if (res.status === 401) {
+    throw new Error(AUTH_EXPIRED);
+  }
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status}`);
+  }
+
+  let data: unknown;
   try {
-    const access = account.credentials?.access;
-    const expires = account.credentials?.expires;
-    if (!access || (typeof expires === 'number' && expires < Date.now())) {
-      return errorSnapshot(account, index, AUTH_EXPIRED);
-    }
+    data = await res.json();
+  } catch {
+    throw new Error('malformed JSON');
+  }
+  if (typeof data !== 'object' || data === null) {
+    throw new Error('malformed JSON');
+  }
 
-    const res = await fetch(USAGE_URL, {
-      headers: {
-        Authorization: `Bearer ${access}`,
-        'anthropic-beta': 'oauth-2025-04-20',
-      },
-      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+  return parseUsage(data as Record<string, unknown>, Date.now());
+}
+
+async function fetchOne(account: PoolAccount, index: number): Promise<AccountSnapshot> {
+  const accountId = accountIdOf(account, index);
+  const label = accountLabelOf(account, index);
+  try {
+    getStore().upsertAccount(accountId, 'anthropic', label);
+    let lastError = AUTH_EXPIRED;
+    const buckets = await fetchAndCache(accountId, async () => {
+      try {
+        return await fetchUsageBuckets(account);
+      } catch (err) {
+        lastError = shortReason(err);
+        throw err;
+      }
     });
-
-    if (res.status === 401) {
-      return errorSnapshot(account, index, AUTH_EXPIRED);
+    if (buckets && Object.keys(buckets).length > 0) {
+      return { accountId, provider: 'anthropic', label, buckets };
     }
-    if (!res.ok) {
-      return errorSnapshot(account, index, `HTTP ${res.status}`);
-    }
-
-    let data: unknown;
-    try {
-      data = await res.json();
-    } catch {
-      return errorSnapshot(account, index, 'malformed JSON');
-    }
-    if (typeof data !== 'object' || data === null) {
-      return errorSnapshot(account, index, 'malformed JSON');
-    }
-
-    const fetchedAt = Date.now();
-    return {
-      accountId: accountIdOf(account, index),
-      provider: 'anthropic',
-      label: accountLabelOf(account, index),
-      buckets: parseUsage(data as Record<string, unknown>, fetchedAt),
-    };
+    return errorSnapshot(account, index, lastError);
   } catch (err) {
     return errorSnapshot(account, index, shortReason(err));
   }

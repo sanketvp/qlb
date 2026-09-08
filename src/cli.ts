@@ -1,22 +1,82 @@
 #!/usr/bin/env node
 import { adapters } from './adapters';
+import { resolveFromSnapshots, providerForModel } from './resolve';
+import { getStore } from './store';
 import type { AccountSnapshot, Adapter } from './types';
 
-const USAGE = 'Usage: qlb [status] [--json]';
+const USAGE = `Usage:
+  qlb status [--json]
+  qlb resolve --model <modelId> [--fallback m1,m2,...] [--session <id>] [--harness pi|claude-code|codex|dispatch] [--effort <lvl>] [--json]`;
 
-function parseArgs(argv: string[]): { json: boolean } {
-  const args = argv.slice(2);
+type StatusOpts = { cmd: 'status'; json: boolean };
+type ResolveOpts = {
+  cmd: 'resolve';
+  json: boolean;
+  model: string;
+  fallback: string[];
+  session?: string;
+  harness?: string;
+  effort?: string;
+};
+type Opts = StatusOpts | ResolveOpts;
+
+function parseArgs(argv: string[]): Opts {
+  const raw = argv.slice(2);
+  let cmd: 'status' | 'resolve' = 'status';
+  const args = [...raw];
+  if (args[0] === 'status' || args[0] === 'resolve') {
+    cmd = args.shift() as 'status' | 'resolve';
+  }
+
   let json = false;
-  for (const arg of args) {
-    if (arg === 'status') continue;
+  let model: string | undefined;
+  let fallback: string[] = [];
+  let session: string | undefined;
+  let harness: string | undefined;
+  let effort: string | undefined;
+
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
     if (arg === '--json') {
       json = true;
+      continue;
+    }
+    if (arg === '--model') {
+      model = args[++i];
+      continue;
+    }
+    if (arg === '--fallback') {
+      fallback = (args[++i] ?? '')
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+      continue;
+    }
+    if (arg === '--session') {
+      session = args[++i];
+      continue;
+    }
+    if (arg === '--harness') {
+      harness = args[++i];
+      continue;
+    }
+    if (arg === '--effort') {
+      effort = args[++i];
       continue;
     }
     console.error(USAGE);
     process.exit(1);
   }
-  return { json };
+
+  if (cmd === 'resolve') {
+    if (!model) {
+      console.error('qlb resolve: --model is required');
+      console.error(USAGE);
+      process.exit(1);
+    }
+    return { cmd, json, model, fallback, session, harness, effort };
+  }
+  return { cmd: 'status', json };
 }
 
 async function safeFetch(adapter: Adapter): Promise<AccountSnapshot[]> {
@@ -144,8 +204,7 @@ function printTable(accounts: AccountSnapshot[]): void {
   }
 }
 
-async function main(): Promise<void> {
-  const { json } = parseArgs(process.argv);
+async function runStatus(json: boolean): Promise<void> {
   const nested = await Promise.all(adapters.map((adapter) => safeFetch(adapter)));
   const accounts = nested.flat();
   if (json) {
@@ -153,7 +212,115 @@ async function main(): Promise<void> {
   } else {
     printTable(accounts);
   }
-  process.exit(0);
+}
+
+async function collectSnapshots(models: string[]): Promise<AccountSnapshot[]> {
+  const providers = new Set<Adapter['id']>();
+  for (const m of models) {
+    const p = providerForModel(m);
+    if (p) providers.add(p);
+  }
+  const snaps: AccountSnapshot[] = [];
+  for (const adapter of adapters) {
+    if (!providers.has(adapter.id)) continue;
+    snaps.push(...(await safeFetch(adapter)));
+  }
+  return snaps;
+}
+
+function printResolveHuman(decision: ReturnType<typeof resolveFromSnapshots>): void {
+  if (!decision.ok) {
+    console.log('EXHAUSTED');
+    if (decision.earliestReset) {
+      console.log(
+        `earliest reset: ${decision.earliestReset.accountId} ${decision.earliestReset.limitType} ${formatRelative(decision.earliestReset.at)}`,
+      );
+    } else {
+      console.log('earliest reset: unknown');
+    }
+    return;
+  }
+  const substituted = decision.servedModel !== decision.requestedModel;
+  if (substituted) {
+    console.log(`⚠ served by ${decision.servedModel}`);
+  }
+  console.log(`provider:  ${decision.provider}`);
+  console.log(`account:   ${decision.snapshot.label} (${decision.accountId})`);
+  console.log(`requested: ${decision.requestedModel}`);
+  console.log(`served:    ${decision.servedModel}`);
+  console.log(`mode:      ${decision.mode}`);
+  console.log(`reason:    ${decision.reason}`);
+  for (const [bucket, reading] of Object.entries(decision.snapshot.buckets)) {
+    console.log(
+      `  ${bucket}  ${formatUsedPct(reading.usedPct)}  ${reading.confidence}  resets ${formatRelative(reading.resetAt)}`,
+    );
+  }
+}
+
+function printResolveJson(decision: ReturnType<typeof resolveFromSnapshots>): void {
+  if (!decision.ok) {
+    console.log(
+      JSON.stringify(
+        {
+          error: 'EXHAUSTED',
+          requestedModel: decision.requestedModel,
+          earliestReset: decision.earliestReset,
+          decisionId: decision.decisionId,
+        },
+        null,
+        2,
+      ),
+    );
+    return;
+  }
+  console.log(
+    JSON.stringify(
+      {
+        decisionId: decision.decisionId,
+        provider: decision.provider,
+        accountId: decision.accountId,
+        model: decision.requestedModel,
+        requestedModel: decision.requestedModel,
+        servedModel: decision.servedModel,
+        reason: decision.reason,
+        mode: decision.mode,
+        snapshot: decision.snapshot,
+      },
+      null,
+      2,
+    ),
+  );
+}
+
+async function runResolve(opts: ResolveOpts): Promise<number> {
+  if (!providerForModel(opts.model)) {
+    console.error(`qlb resolve: unknown model '${opts.model}' (cannot map to a provider)`);
+    return 1;
+  }
+  const models = [opts.model, ...opts.fallback];
+  const snapshots = await collectSnapshots(models);
+  const decision = resolveFromSnapshots({
+    model: opts.model,
+    fallback: opts.fallback,
+    session: opts.session,
+    harness: opts.harness,
+    effort: opts.effort,
+    snapshots,
+    store: getStore(),
+  });
+  if (opts.json) printResolveJson(decision);
+  else printResolveHuman(decision);
+  return decision.ok ? 0 : 1;
+}
+
+async function main(): Promise<void> {
+  const opts = parseArgs(process.argv);
+  if (opts.cmd === 'status') {
+    await runStatus(opts.json);
+    process.exit(0);
+  }
+  const code = await runResolve(opts);
+  process.exit(code);
 }
 
 void main();

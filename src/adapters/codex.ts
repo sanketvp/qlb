@@ -2,6 +2,7 @@ import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
+import { getStore } from '../store';
 import type { Adapter } from '../types';
 
 // Codex exposes quota only in response headers from real, quota-consuming requests.
@@ -73,10 +74,16 @@ export const codexAdapter: Adapter = {
       const idToken = auth.tokens.id_token;
       const payload = typeof idToken === 'string' ? parseJwtPayload(idToken) : undefined;
 
+      const accountId = stringClaim(payload, 'chatgpt_account_id') ?? 'codex-default';
+      const label = stringClaim(payload, 'email') ?? 'codex-default';
+      // Phase 0/1: no free usage GET and probes are off. Persist the account
+      // row so resolve can see it; buckets stay empty (unknown) until organic
+      // headers or an explicit probe land in a later phase.
+      getStore().upsertAccount(accountId, 'openai-codex', label);
       return [{
-        accountId: stringClaim(payload, 'chatgpt_account_id') ?? 'codex-default',
+        accountId,
         provider: 'openai-codex',
-        label: stringClaim(payload, 'email') ?? 'codex-default',
+        label,
         buckets: {},
       }];
     } catch {

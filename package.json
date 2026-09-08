@@ -2,7 +2,7 @@
   "name": "qlb",
   "version": "0.0.0",
   "private": true,
-  "description": "Cross-Provider Quota Load Balancer — Phase 0 read-only status CLI",
+  "description": "Cross-Provider Quota Load Balancer — Phase 1: status + resolve",
   "type": "commonjs",
   "bin": {
     "qlb": "./dist/cli.js"
@@ -11,7 +11,7 @@
     "build": "tsc",
     "start": "node dist/cli.js",
     "dev": "ts-node src/cli.ts",
-    "test": "node --test dist/**/*.test.js"
+    "test": "tsc -p tsconfig.test.json && node --test dist-test/test/*.test.js"
   },
   "engines": {
     "node": ">=18"
