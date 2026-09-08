@@ -1,8 +1,10 @@
 # QLB — Cross-Provider Quota Load Balancer
 
-QLB is a local command-line tool that gives one view of quota and usage across multiple AI coding providers. It discovers credentials without modifying them, caches provider readings in SQLite, and can select an account or fallback model using available headroom.
+**The headline feature: if you have multiple Claude accounts, multiple Codex accounts, or both, QLB automatically load-balances your usage across all of them.** Run out of headroom on one Claude account and QLB routes the next request to whichever of your other Claude accounts still has room — same for Codex — so you stop babysitting which login is about to hit its 5-hour or weekly limit and manually switching. It picks the best account for every request based on real, live usage data (not guesses), spreads normal usage so no single account gets drained first, and only reaches for a genuinely different model/provider as a fallback when you've explicitly said that's OK.
 
-QLB ships with five provider adapters and can load additional providers as local JavaScript plugins. Network-backed usage checks are isolated so one unavailable provider or broken plugin does not crash the overall status command.
+QLB extends the same account-pooling idea to Grok, Kimi K3, and OpenRouter too — the same load-balancing engine works across any number of accounts on any provider, not just Claude and Codex.
+
+QLB ships with five built-in provider adapters (Claude/Anthropic, Codex, Grok/xAI, Kimi K3, OpenRouter) and can load additional providers as local JavaScript plugins for anything else you use. It never modifies your existing credentials unless you explicitly opt in to full account ownership (see [Credential Safety](docs/CREDENTIAL-SAFETY.md)), and one unavailable provider or broken plugin never crashes the overall status/routing commands.
 
 ## Requirements
 
