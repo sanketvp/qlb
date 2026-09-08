@@ -15,14 +15,14 @@ export interface BucketReading {
 
 export interface AccountSnapshot {
   accountId: string;
-  provider: 'anthropic' | 'openai-codex' | 'xai' | 'kimi-coding';
+  provider: 'anthropic' | 'openai-codex' | 'xai' | 'kimi-coding' | 'openrouter';
   label: string;
   buckets: Record<string, BucketReading>;
   error?: string;
 }
 
 export interface Adapter {
-  id: 'anthropic' | 'openai-codex' | 'xai' | 'kimi-coding';
+  id: 'anthropic' | 'openai-codex' | 'xai' | 'kimi-coding' | 'openrouter';
   displayName: string;
   /** Read-only: fetch current usage for all accounts this adapter knows about. Must NEVER throw — catch internally and return an AccountSnapshot with `error` set instead. Must NEVER write/mutate any credential or config file (Phase 0 is read-only). */
   fetchSnapshots(): Promise<AccountSnapshot[]>;

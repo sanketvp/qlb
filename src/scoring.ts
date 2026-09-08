@@ -8,7 +8,7 @@ export const FIVE_H_SCARCITY = 1.0;
 export const DEFAULT_CEILING = 80;
 export const ALL_IN_CEILING = 100;
 
-export type BucketClass = '5h' | 'weekly' | 'other';
+export type BucketClass = '5h' | 'weekly' | 'balance' | 'other';
 
 /**
  * Phase 1 model → provider mapping (documented; refine later):
@@ -16,9 +16,13 @@ export type BucketClass = '5h' | 'weekly' | 'other';
  *   gpt-* or name contains sol/astra/luna/terra → openai-codex
  *   grok*                                 → xai
  *   k3 / kimi                             → kimi-coding
+ *   OpenRouter-prefixed, z-ai/*, or glm   → openrouter
  */
 export function providerForModel(modelId: string): Adapter['id'] | null {
   const m = modelId.toLowerCase();
+  if (m.startsWith('openrouter/') || m.startsWith('z-ai/') || m.includes('glm')) {
+    return 'openrouter';
+  }
   if (m.startsWith('claude-') || m.startsWith('claude')) return 'anthropic';
   if (
     m.startsWith('gpt-') ||
@@ -55,6 +59,8 @@ export function relevantBuckets(snapshot: AccountSnapshot, requestedModel: strin
       return ['5h', 'weekly'];
     case 'xai':
       return ['tokens', 'requests'];
+    case 'openrouter':
+      return ['credits'];
     default:
       return Object.keys(snapshot.buckets);
   }
@@ -63,6 +69,7 @@ export function relevantBuckets(snapshot: AccountSnapshot, requestedModel: strin
 export function bucketClass(bucket: string, windowMin?: number): BucketClass {
   if (windowMin === 300) return '5h';
   if (windowMin === 10_080 || windowMin === 7 * 24 * 60) return 'weekly';
+  if (bucket === 'credits') return 'balance';
   if (bucket === '5h' || bucket === 'secondary' || bucket.endsWith(':secondary')) return '5h';
   if (
     bucket === '7d' ||
@@ -77,7 +84,7 @@ export function bucketClass(bucket: string, windowMin?: number): BucketClass {
 }
 
 export function scarcityDiscount(klass: BucketClass): number {
-  if (klass === '5h') return FIVE_H_SCARCITY;
+  if (klass === '5h' || klass === 'balance') return FIVE_H_SCARCITY;
   if (klass === 'weekly') return WEEKLY_SCARCITY;
   return 0;
 }
