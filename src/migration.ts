@@ -113,7 +113,76 @@ import type { Grant } from './types';
 
 export const DEFAULT_POOL_FILE = join(homedir(), '.pi', 'agent', 'anthropic-pool.json');
 export const DEFAULT_OWNER_FILE = join(homedir(), '.pi', 'agent', 'qlb-owner.json');
+export const DEFAULT_AUTH_JSON = join(homedir(), '.pi', 'agent', 'auth.json');
 export const PI_POOL_STORE = 'pi-pool';
+
+/**
+ * Single-grant providers live as named top-level keys in Pi's shared
+ * `auth.json` (one OAuth grant each). This is a DELIBERATE design difference
+ * from Anthropic:
+ *
+ *   Anthropic  — dedicated multi-account file (`anthropic-pool.json`).
+ *                Commit hygiene RENAMES it to `.pre-qlb`.
+ *   xai / kimi-coding / openai-codex — one shared multi-provider file.
+ *                Commit must NOT rename or delete `auth.json`, because Pi
+ *                still needs it for every provider that has not been
+ *                migrated yet. The native entry is shadow-retained on disk;
+ *                QLB records ownership in a per-provider owner file
+ *                (`qlb-owner-<provider>.json`) and in the migration journal.
+ *                Once QLB-owned, qlb-pi / qlb-proxy MUST prefer the
+ *                Keychain copy over reading `auth.json` for that provider.
+ *
+ * Crash-safety is the same state machine (stage → rehearse → commit via
+ * atomic owner-file rename → rollback / resume). Hygiene is simply simpler:
+ * there is no native rename, so H1–H4 are journal/owner-file only.
+ */
+export const SINGLE_GRANT_PROVIDERS = ['xai', 'kimi-coding', 'openai-codex'] as const;
+export type SingleGrantProvider = (typeof SINGLE_GRANT_PROVIDERS)[number];
+export type MigrateProvider = 'anthropic' | SingleGrantProvider;
+export type MigrationKind = 'pool' | 'single-grant';
+
+export function isSingleGrantProvider(value: string | undefined): value is SingleGrantProvider {
+  return (
+    value === 'xai' || value === 'kimi-coding' || value === 'openai-codex'
+  );
+}
+
+export function isMigrateProvider(value: string | undefined): value is MigrateProvider {
+  return value === 'anthropic' || isSingleGrantProvider(value);
+}
+
+/**
+ * Phase 0 adapter accountId conventions. MUST stay in lockstep with
+ * `src/adapters/{xai,kimi,codex}.ts` so resolve/scoring keep working after
+ * cutover. Codex falls back to `codex-default` when the grant has no
+ * chatgpt_account_id (the adapter does the same).
+ */
+export const ADAPTER_ACCOUNT_IDS: Record<SingleGrantProvider, string> = {
+  xai: 'xai-default',
+  'kimi-coding': 'kimi-default',
+  'openai-codex': 'codex-default',
+};
+
+export const ADAPTER_ACCOUNT_LABELS: Record<SingleGrantProvider, string> = {
+  xai: 'Grok (xAI)',
+  'kimi-coding': 'Kimi K3',
+  'openai-codex': 'codex-default',
+};
+
+export function migrationStoreNameFor(provider: string): string {
+  if (provider === 'anthropic') return PI_POOL_STORE;
+  return `pi-${provider}`;
+}
+
+export function defaultOwnerFileFor(provider: MigrateProvider): string {
+  if (provider === 'anthropic') return DEFAULT_OWNER_FILE;
+  return join(homedir(), '.pi', 'agent', `qlb-owner-${provider}.json`);
+}
+
+export function defaultNativePathFor(provider: MigrateProvider): string {
+  if (provider === 'anthropic') return DEFAULT_POOL_FILE;
+  return DEFAULT_AUTH_JSON;
+}
 
 export type MigrationState =
   | 'NATIVE'
@@ -147,6 +216,13 @@ export interface OwnerFile {
     label: string;
     fingerprint: string;
   }>;
+  /**
+   * `rename` (Anthropic pool): native file is moved to `.pre-qlb` after commit.
+   * `shadow-retain` (single-grant): `auth.json` is left in place; ownership is
+   * recorded only in this file + the journal.
+   */
+  nativeStrategy?: 'rename' | 'shadow-retain';
+  authJsonKey?: string;
 }
 
 export interface MigrationStatus {
@@ -158,6 +234,22 @@ export interface MigrationStatus {
   piAtNextLaunch: 'native works' | 'QLB works' | 'unknown';
   resumeAction: string;
   detail: Record<string, unknown>;
+  nativeStrategy?: 'rename' | 'shadow-retain';
+  provider?: string;
+}
+
+export interface MigrationConfig {
+  kind?: MigrationKind;
+  provider?: string;
+  authJsonKey?: string;
+}
+
+export interface AuthJsonGrantInput {
+  type?: string;
+  access: string;
+  refresh: string;
+  expires: number;
+  accountId?: string;
 }
 
 export interface PoolAccountInput {
@@ -336,6 +428,83 @@ export function parsePoolFile(raw: string): {
   return { parsed: file, accounts };
 }
 
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function chatgptAccountIdFromJwt(token: string | undefined): string | undefined {
+  if (!token) return undefined;
+  try {
+    const parts = token.split('.');
+    if (parts.length !== 3 || !parts[1]) return undefined;
+    const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8')) as unknown;
+    if (!isObjectRecord(payload)) return undefined;
+    const direct = payload.chatgpt_account_id;
+    if (typeof direct === 'string' && direct.length > 0) return direct;
+    for (const value of Object.values(payload)) {
+      if (!isObjectRecord(value)) continue;
+      const nested = value.chatgpt_account_id;
+      if (typeof nested === 'string' && nested.length > 0) return nested;
+    }
+  } catch {
+    // not a JWT — expected for test fixtures
+  }
+  return undefined;
+}
+
+/**
+ * AccountId used for Keychain + journal. Must match Phase 0 adapters:
+ *   xai.ts          → 'xai-default'
+ *   kimi.ts         → 'kimi-default'
+ *   codex.ts        → JWT chatgpt_account_id ?? 'codex-default'
+ */
+export function accountIdForSingleGrant(
+  provider: SingleGrantProvider,
+  grant: { accountId?: string; access?: string },
+): string {
+  if (provider === 'openai-codex') {
+    if (typeof grant.accountId === 'string' && grant.accountId.length > 0) {
+      return grant.accountId;
+    }
+    return chatgptAccountIdFromJwt(grant.access) ?? ADAPTER_ACCOUNT_IDS[provider];
+  }
+  return ADAPTER_ACCOUNT_IDS[provider];
+}
+
+export function labelForSingleGrant(
+  provider: SingleGrantProvider,
+  grant: { accountId?: string; access?: string },
+): string {
+  if (provider === 'openai-codex') {
+    return accountIdForSingleGrant(provider, grant);
+  }
+  return ADAPTER_ACCOUNT_LABELS[provider];
+}
+
+export function parseAuthJsonGrant(raw: string, keyName: string): AuthJsonGrantInput {
+  const parsed: unknown = JSON.parse(raw);
+  if (!isObjectRecord(parsed)) {
+    throw new Error('auth.json is not a JSON object');
+  }
+  const entry = parsed[keyName];
+  if (!isObjectRecord(entry)) {
+    throw new Error(`auth.json missing importable OAuth grant under key '${keyName}'`);
+  }
+  if (typeof entry.access !== 'string' || typeof entry.refresh !== 'string') {
+    throw new Error(`auth.json key '${keyName}' is missing access/refresh`);
+  }
+  const out: AuthJsonGrantInput = {
+    access: entry.access,
+    refresh: entry.refresh,
+    expires: Number(entry.expires) || 0,
+  };
+  if (typeof entry.type === 'string') out.type = entry.type;
+  if (typeof entry.accountId === 'string' && entry.accountId.length > 0) {
+    out.accountId = entry.accountId;
+  }
+  return out;
+}
+
 /**
  * Default rehearsal: one live Anthropic usage GET with the staged access
  * token. NEVER used by tests — they inject a mock. NEVER refreshes.
@@ -351,21 +520,69 @@ export async function defaultRehearseFn(
         'staged access token expired — use the native harness once so IT refreshes, then re-run. QLB will not refresh a grant it does not own',
     };
   }
-  if (account.provider !== 'anthropic') {
-    return { ok: false, error: `no default rehearse implementation for ${account.provider}` };
-  }
   try {
-    const res = await fetch('https://api.anthropic.com/api/oauth/usage', {
-      headers: {
-        Authorization: `Bearer ${account.grant.access}`,
-        'anthropic-beta': 'oauth-2025-04-20',
-      },
-      signal: AbortSignal.timeout(10_000),
-    });
-    if (!res.ok) {
-      return { ok: false, error: `rehearse HTTP ${res.status}` };
+    if (account.provider === 'anthropic') {
+      const res = await fetch('https://api.anthropic.com/api/oauth/usage', {
+        headers: {
+          Authorization: `Bearer ${account.grant.access}`,
+          'anthropic-beta': 'oauth-2025-04-20',
+        },
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (!res.ok) return { ok: false, error: `rehearse HTTP ${res.status}` };
+      return { ok: true };
     }
-    return { ok: true };
+    if (account.provider === 'xai') {
+      const res = await fetch('https://api.x.ai/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${account.grant.access}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model: 'grok-4.6',
+          messages: [{ role: 'user', content: 'hi' }],
+          max_tokens: 1,
+        }),
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (!res.ok) return { ok: false, error: `rehearse HTTP ${res.status}` };
+      return { ok: true };
+    }
+    if (account.provider === 'kimi-coding') {
+      const res = await fetch('https://api.kimi.com/coding/v1/usages', {
+        headers: { Authorization: `Bearer ${account.grant.access}` },
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (!res.ok) return { ok: false, error: `rehearse HTTP ${res.status}` };
+      return { ok: true };
+    }
+    if (account.provider === 'openai-codex') {
+      const headers: Record<string, string> = {
+        Authorization: `Bearer ${account.grant.access}`,
+        'Content-Type': 'application/json',
+        originator: 'codex_cli_rs',
+      };
+      if (account.id !== 'codex-default') {
+        headers['chatgpt-account-id'] = account.id;
+      }
+      const res = await fetch('https://chatgpt.com/backend-api/codex/responses', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          model: 'gpt-5.4',
+          input: 'ping',
+          store: false,
+          stream: false,
+        }),
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (res.status === 401 || res.status === 403) {
+        return { ok: false, error: `rehearse HTTP ${res.status}` };
+      }
+      return { ok: true };
+    }
+    return { ok: false, error: `no default rehearse implementation for ${account.provider}` };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     return { ok: false, error: msg };
@@ -378,6 +595,9 @@ export class Migration {
   private readonly poolFilePath: string;
   private readonly ownerFilePath: string;
   readonly storeName: string;
+  readonly kind: MigrationKind;
+  readonly provider: string | undefined;
+  readonly authJsonKey: string | undefined;
 
   constructor(
     store: Store,
@@ -385,12 +605,16 @@ export class Migration {
     poolFilePath: string,
     ownerFilePath: string,
     storeName: string = PI_POOL_STORE,
+    config: MigrationConfig = {},
   ) {
     this.store = store;
     this.keychain = keychain;
     this.poolFilePath = poolFilePath;
     this.ownerFilePath = ownerFilePath;
     this.storeName = storeName;
+    this.kind = config.kind ?? 'pool';
+    this.provider = config.provider;
+    this.authJsonKey = config.authJsonKey ?? config.provider;
   }
 
   status(): MigrationStatus {
@@ -416,15 +640,22 @@ export class Migration {
     if (ownerPresent) piAtNextLaunch = 'QLB works';
     else if (nativePresent) piAtNextLaunch = 'native works';
 
+    const shadow = this.kind === 'single-grant';
     let resumeAction: string;
     if (intent) {
-      resumeAction = 'continue rollback to VALIDATED (native restored, owner unlinked)';
+      resumeAction = shadow
+        ? 'continue rollback to VALIDATED (owner unlinked; auth.json was never moved)'
+        : 'continue rollback to VALIDATED (native restored, owner unlinked)';
     } else if (ownerPresent && STATE_RANK[state] < STATE_RANK.QLB_OWNED) {
-      resumeAction = 'already committed; finish hygiene (H1–H2) → QLB_OWNED';
-    } else if (ownerPresent && nativePresent && !prePresent) {
+      resumeAction = shadow
+        ? 'already committed; finish hygiene (journal only; auth.json shadow-retained) → QLB_OWNED'
+        : 'already committed; finish hygiene (H1–H2) → QLB_OWNED';
+    } else if (ownerPresent && nativePresent && !prePresent && !shadow) {
       resumeAction = 'finish hygiene: rename native → .pre-qlb';
     } else if (ownerPresent) {
-      resumeAction = 'noop (already QLB_OWNED)';
+      resumeAction = shadow
+        ? 'noop (already QLB_OWNED; native auth.json shadow-retained)'
+        : 'noop (already QLB_OWNED)';
     } else if (state === 'QLB_OWNED' && !ownerPresent && nativePresent) {
       resumeAction = 'post-RC hygiene: journal VALIDATED';
     } else if (state === 'VALIDATED' && ownerStaging) {
@@ -444,12 +675,17 @@ export class Migration {
       piAtNextLaunch,
       resumeAction,
       detail,
+      nativeStrategy: shadow ? 'shadow-retain' : 'rename',
+      provider: this.provider,
     };
   }
 
   /**
-   * S2 — copy native pool credentials into the QLB Keychain as a STAGING
-   * copy and write qlb-owner.json.staging. Native file is never written.
+   * S2 — copy native credentials into the QLB Keychain as a STAGING copy
+   * and write qlb-owner.json.staging. Native file is never written.
+   *
+   * Pool (Anthropic): N accounts from anthropic-pool.json.
+   * Single-grant: 1 account from a named top-level key in auth.json.
    */
   stage(): MigrationStatus {
     const current = this.status();
@@ -457,6 +693,9 @@ export class Migration {
       throw new Error(
         `cannot stage: migration already ${current.state} (owner file ${current.ownerFile})`,
       );
+    }
+    if (this.kind === 'single-grant') {
+      return this.stageSingleGrant();
     }
     if (!existsSync(this.poolFilePath)) {
       throw new Error(`pool file not found: ${this.poolFilePath}`);
@@ -614,6 +853,66 @@ export class Migration {
 
   // --- internals -----------------------------------------------------------
 
+  /**
+   * S2 for a single OAuth grant in auth.json. Writes Keychain + staging
+   * owner file. NEVER writes auth.json.
+   */
+  private stageSingleGrant(): MigrationStatus {
+    if (!this.provider || !isSingleGrantProvider(this.provider)) {
+      throw new Error('single-grant migration requires provider xai|kimi-coding|openai-codex');
+    }
+    const keyName = this.authJsonKey ?? this.provider;
+    if (!existsSync(this.poolFilePath)) {
+      throw new Error(`auth.json not found: ${this.poolFilePath}`);
+    }
+
+    const raw = readFileSync(this.poolFilePath, 'utf8');
+    const parsed = parseAuthJsonGrant(raw, keyName);
+    const mtime = statSync(this.poolFilePath).mtimeMs;
+    const id = accountIdForSingleGrant(this.provider, parsed);
+    const label = labelForSingleGrant(this.provider, parsed);
+    const extra: Record<string, unknown> = { type: parsed.type ?? 'oauth', authJsonKey: keyName };
+    if (parsed.accountId) extra.accountId = parsed.accountId;
+    const grant: Grant = {
+      access: parsed.access,
+      refresh: parsed.refresh,
+      expires: parsed.expires,
+      generation: 0,
+      writtenBy: 'migrate-stage',
+      extra,
+    };
+    const fingerprint = fingerprintRefresh(grant.refresh);
+    const { service, account } = keychainCoords(this.provider, id, label);
+    this.keychain.setSync(service, account, JSON.stringify(grant));
+    this.store.upsertAccount(id, this.provider, label, 'imported-unvalidated');
+
+    const owner: OwnerFile = {
+      owner: 'qlb',
+      stagedAt: Date.now(),
+      committedAt: null,
+      exportSeq: 0,
+      qlbAccountIds: [id],
+      stores: [this.storeName],
+      accounts: [{ id, provider: this.provider, label, fingerprint }],
+      nativeStrategy: 'shadow-retain',
+      authJsonKey: keyName,
+    };
+    atomicWriteFile(stagingOwnerPath(this.ownerFilePath), JSON.stringify(owner, null, 2) + '\n');
+
+    this.journal('MIRRORED', {
+      accounts: owner.accounts,
+      qlbAccountIds: owner.qlbAccountIds,
+      nativeMtime: mtime,
+      poolFilePath: this.poolFilePath,
+      ownerFilePath: this.ownerFilePath,
+      stagedAt: owner.stagedAt,
+      nativeStrategy: 'shadow-retain',
+      authJsonKey: keyName,
+      provider: this.provider,
+    });
+    return this.status();
+  }
+
   private journalState(): MigrationState {
     return asState(this.store.getMigration(this.storeName)?.state);
   }
@@ -691,6 +990,13 @@ export class Migration {
     }
 
     this.journal('QLB_OWNED', { committedAt: now, intent: undefined });
+
+    if (this.kind === 'single-grant') {
+      // Shadow-retain: auth.json is a shared multi-provider file. Renaming it
+      // would steal every unmigrated provider's grant. Ownership is the owner
+      // file + journal; qlb-pi prefers Keychain for QLB-owned providers.
+      return this.status();
+    }
 
     const native = this.poolFilePath;
     const retired = preQlbPath(native);
@@ -778,4 +1084,45 @@ export class Migration {
     });
     return this.status();
   }
+}
+
+export function createSingleGrantMigration(
+  store: Store,
+  keychain: KeychainBackend,
+  provider: SingleGrantProvider,
+  authJsonPath: string,
+  ownerFilePath: string,
+  keyName: string = provider,
+): Migration {
+  return new Migration(
+    store,
+    keychain,
+    authJsonPath,
+    ownerFilePath,
+    migrationStoreNameFor(provider),
+    { kind: 'single-grant', provider, authJsonKey: keyName },
+  );
+}
+
+/**
+ * Stage one OAuth grant from a named top-level key in auth.json into the
+ * QLB Keychain. Native auth.json is never written. Same crash-safe S2 as
+ * the Anthropic pool path.
+ */
+export function stageGenericGrant(
+  store: Store,
+  keychain: KeychainBackend,
+  provider: SingleGrantProvider,
+  authJsonPath: string,
+  keyName: string,
+  ownerFilePath: string,
+): MigrationStatus {
+  return createSingleGrantMigration(
+    store,
+    keychain,
+    provider,
+    authJsonPath,
+    ownerFilePath,
+    keyName,
+  ).stage();
 }

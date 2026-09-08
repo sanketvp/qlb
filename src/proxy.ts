@@ -54,6 +54,8 @@ export interface ProxyInfo {
 
 export type GetCredentialForAccount = (accountId: string) => Promise<string>;
 
+/** Runtime source: `createOwnedCredentialSource` in `./credentials`. Tests inject a mock. */
+
 export interface ProxyOptions {
   store: Store;
   /** Tests MUST pass a temp path. Default is ~/.qlb/proxy.json. */

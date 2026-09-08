@@ -2,12 +2,18 @@
 import { adapters } from './adapters';
 import { createDefaultCodexGateDeps, runCodexGate } from './codex-gate';
 import { macosKeychain } from './keychain';
+import { createOwnedCredentialSource } from './credentials';
 import {
-  DEFAULT_OWNER_FILE,
+  DEFAULT_AUTH_JSON,
   DEFAULT_POOL_FILE,
   Migration,
+  createSingleGrantMigration,
+  defaultOwnerFileFor,
   defaultRehearseFn,
+  isMigrateProvider,
   isRealPiAgentPath,
+  isSingleGrantProvider,
+  type MigrateProvider,
 } from './migration';
 import { listPolicies, setPolicy } from './policy';
 import { LoopbackProxy } from './proxy';
@@ -30,21 +36,25 @@ const USAGE = `Usage:
   qlb policy list [--harness <h>] [--db <path>] [--json]
   qlb gate codex [--json] [--db <path>]
   qlb proxy [--info-path <path>] [--idle-ms <n>] [--db <path>]
-  qlb migrate stage    --pool-file <path> --owner-file <path> [--db <path>] [--target-dir <path>] [--confirm-real-cutover]
-  qlb migrate rehearse --pool-file <path> --owner-file <path> [--db <path>] [--target-dir <path>] [--confirm-real-cutover]
-  qlb migrate commit   --pool-file <path> --owner-file <path> [--db <path>] [--target-dir <path>] [--confirm-real-cutover]
-  qlb migrate rollback --pool-file <path> --owner-file <path> [--db <path>] [--target-dir <path>] [--confirm-real-cutover]
-  qlb migrate resume   --pool-file <path> --owner-file <path> [--db <path>] [--target-dir <path>] [--confirm-real-cutover]
-  qlb migrate status   [--pool-file <path>] [--owner-file <path>] [--db <path>] [--target-dir <path>] [--json]
+  qlb migrate stage    [--provider anthropic|xai|kimi-coding|openai-codex] --pool-file <path> --owner-file <path> [--auth-json <path>] [--db <path>] [--target-dir <path>] [--confirm-real-cutover]
+  qlb migrate rehearse [--provider anthropic|xai|kimi-coding|openai-codex] --pool-file <path> --owner-file <path> [--auth-json <path>] [--db <path>] [--target-dir <path>] [--confirm-real-cutover]
+  qlb migrate commit   [--provider anthropic|xai|kimi-coding|openai-codex] --pool-file <path> --owner-file <path> [--auth-json <path>] [--db <path>] [--target-dir <path>] [--confirm-real-cutover]
+  qlb migrate rollback [--provider anthropic|xai|kimi-coding|openai-codex] --pool-file <path> --owner-file <path> [--auth-json <path>] [--db <path>] [--target-dir <path>] [--confirm-real-cutover]
+  qlb migrate resume   [--provider anthropic|xai|kimi-coding|openai-codex] --pool-file <path> --owner-file <path> [--auth-json <path>] [--db <path>] [--target-dir <path>] [--confirm-real-cutover]
+  qlb migrate status   [--provider anthropic|xai|kimi-coding|openai-codex] [--pool-file <path>] [--owner-file <path>] [--auth-json <path>] [--db <path>] [--target-dir <path>] [--json]
   qlb retire status  --harness claude-code|codex-cli [--json] [--db <path>]
   qlb retire execute --harness claude-code|codex-cli --confirm-real-retirement [--db <path>]
 
 SAFETY: running migrate stage/rehearse/commit/rollback/resume without path
-overrides targets the REAL ~/.pi/agent/anthropic-pool.json and
-~/.pi/agent/qlb-owner.json. That is a REAL cutover and is refused unless
+overrides targets the REAL ~/.pi/agent/ files (anthropic-pool.json for
+--provider anthropic, auth.json for xai|kimi-coding|openai-codex, plus the
+matching qlb-owner*.json). That is a REAL cutover and is refused unless
 --confirm-real-cutover is also passed. Tests and dry runs MUST pass
---pool-file / --owner-file (or --target-dir) pointing at a temp copy.
-Do NOT pass --confirm-real-cutover unless you intend to cut over live Pi.
+--pool-file / --auth-json / --owner-file (or --target-dir) pointing at a
+temp copy. Do NOT pass --confirm-real-cutover unless you intend to cut over
+live Pi. Default --provider is anthropic (backward compatible).
+Single-grant providers (xai, kimi-coding, openai-codex) shadow-retain the
+native auth.json entry — QLB never deletes or renames that shared file.
 qlb gate codex makes a handful of real Codex backend requests (read-only
 use of ~/.codex/auth.json). Automated tests never take this path.
 qlb retire status is read-only. qlb retire execute is refused unless
@@ -67,8 +77,10 @@ type MigrateOpts = {
   cmd: 'migrate';
   sub: MigrateSub;
   json: boolean;
+  provider: MigrateProvider;
   poolFile: string;
   ownerFile: string;
+  authJson: string;
   db?: string;
   confirmRealCutover: boolean;
 };
@@ -144,9 +156,11 @@ function parseMigrateArgs(args: string[]): MigrateOpts {
   let json = false;
   let poolFile: string | undefined;
   let ownerFile: string | undefined;
+  let authJson: string | undefined;
   let targetDir: string | undefined;
   let db: string | undefined;
   let confirmRealCutover = false;
+  let providerRaw: string | undefined;
 
   for (let i = 0; i < rest.length; i++) {
     const arg = rest[i];
@@ -166,6 +180,14 @@ function parseMigrateArgs(args: string[]): MigrateOpts {
       ownerFile = rest[++i];
       continue;
     }
+    if (arg === '--auth-json') {
+      authJson = rest[++i];
+      continue;
+    }
+    if (arg === '--provider') {
+      providerRaw = rest[++i];
+      continue;
+    }
     if (arg === '--target-dir') {
       targetDir = rest[++i];
       continue;
@@ -183,17 +205,36 @@ function parseMigrateArgs(args: string[]): MigrateOpts {
     process.exit(1);
   }
 
+  const providerRawOrDefault = providerRaw ?? 'anthropic';
+  if (!isMigrateProvider(providerRawOrDefault)) {
+    console.error(
+      'qlb migrate: --provider must be anthropic|xai|kimi-coding|openai-codex',
+    );
+    console.error(USAGE);
+    process.exit(1);
+  }
+  const provider: MigrateProvider = providerRawOrDefault;
+
   if (targetDir) {
-    if (!ownerFile) ownerFile = `${targetDir.replace(/\/$/, '')}/qlb-owner.json`;
-    if (!poolFile) poolFile = `${targetDir.replace(/\/$/, '')}/anthropic-pool.json`;
+    const dir = targetDir.replace(/\/$/, '');
+    if (!ownerFile) {
+      ownerFile =
+        provider === 'anthropic'
+          ? `${dir}/qlb-owner.json`
+          : `${dir}/qlb-owner-${provider}.json`;
+    }
+    if (!poolFile) poolFile = `${dir}/anthropic-pool.json`;
+    if (!authJson) authJson = `${dir}/auth.json`;
   }
 
   return {
     cmd: 'migrate',
     sub: subRaw,
     json,
+    provider,
     poolFile: poolFile ?? DEFAULT_POOL_FILE,
-    ownerFile: ownerFile ?? DEFAULT_OWNER_FILE,
+    ownerFile: ownerFile ?? defaultOwnerFileFor(provider),
+    authJson: authJson ?? DEFAULT_AUTH_JSON,
     db,
     confirmRealCutover,
   };
@@ -446,14 +487,15 @@ function parseArgs(argv: string[]): Opts {
 
 function assertSafeMigratePaths(opts: MigrateOpts): void {
   if (opts.sub === 'status') return;
+  const nativePath = opts.provider === 'anthropic' ? opts.poolFile : opts.authJson;
   const real =
-    isRealPiAgentPath(opts.poolFile) || isRealPiAgentPath(opts.ownerFile);
+    isRealPiAgentPath(nativePath) || isRealPiAgentPath(opts.ownerFile);
   if (real && !opts.confirmRealCutover) {
     console.error(
-      'REFUSED: resolved --pool-file / --owner-file is inside ~/.pi/agent/.\n' +
+      'REFUSED: resolved native / owner path is inside ~/.pi/agent/.\n' +
         'This would perform a REAL Pi credential cutover.\n' +
-        'Pass --pool-file and --owner-file pointing at a temp copy, or pass\n' +
-        '--confirm-real-cutover if you truly intend to cut over live Pi.',
+        'Pass --pool-file / --auth-json and --owner-file pointing at a temp copy,\n' +
+        'or pass --confirm-real-cutover if you truly intend to cut over live Pi.',
     );
     process.exit(2);
   }
@@ -699,6 +741,8 @@ function printMigrate(status: ReturnType<Migration['status']>, json: boolean): v
     return;
   }
   console.log(`store:     ${status.store}`);
+  if (status.provider) console.log(`provider:  ${status.provider}`);
+  if (status.nativeStrategy) console.log(`strategy:  ${status.nativeStrategy}`);
   console.log(`state:     ${status.state}`);
   console.log(`owner:     ${status.ownerFile}`);
   console.log(`native:    ${status.nativeStore}`);
@@ -717,7 +761,15 @@ async function runMigrate(opts: MigrateOpts): Promise<number> {
     store = getStore();
   }
   try {
-    const mig = new Migration(store, macosKeychain, opts.poolFile, opts.ownerFile);
+    const mig = isSingleGrantProvider(opts.provider)
+      ? createSingleGrantMigration(
+          store,
+          macosKeychain,
+          opts.provider,
+          opts.authJson,
+          opts.ownerFile,
+        )
+      : new Migration(store, macosKeychain, opts.poolFile, opts.ownerFile);
     let status;
     switch (opts.sub) {
       case 'stage':
@@ -822,13 +874,10 @@ async function runProxy(opts: ProxyOpts): Promise<number> {
     store,
     infoPath: opts.infoPath,
     idleTimeoutMs: opts.idleMs,
-    getCredentialForAccount: async (accountId) => {
-      const envTok = process.env.QLB_UPSTREAM_TOKEN;
-      if (envTok && envTok.length > 0) return envTok;
-      throw new Error(
-        `no credential for account ${accountId}; set QLB_UPSTREAM_TOKEN (Phase 2 cutover not wired into the proxy yet)`,
-      );
-    },
+    getCredentialForAccount: createOwnedCredentialSource({
+      store,
+      keychain: macosKeychain,
+    }),
     onIdle: () => {
       if (opened) store.close();
       process.exit(0);
