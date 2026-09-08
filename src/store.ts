@@ -17,6 +17,7 @@ export interface AccountRow {
   label: string;
   status: string;
   created_at: number;
+  grant_generation: number;
 }
 
 export interface PollClaimRow {
@@ -24,6 +25,29 @@ export interface PollClaimRow {
   holder_id: string;
   claimed_at: number;
   until: number;
+}
+
+/** Credential-refresh lease (§4.7 / §4.8.2). De-duplication only — not a correctness fence. */
+export interface LeaseRow {
+  name: string;
+  holder_pid: number;
+  holder_id: string;
+  until: number;
+  generation: number;
+}
+
+export function refreshLeaseName(accountId: string): string {
+  return `refresh:${accountId}`;
+}
+
+function readUserVersion(db: DatabaseSync): number {
+  const row = db.prepare('PRAGMA user_version').get() as
+    | { user_version?: number }
+    | number
+    | undefined;
+  if (typeof row === 'number') return row;
+  if (row && typeof row.user_version === 'number') return row.user_version;
+  return 0;
 }
 
 export interface OverrideRow {
@@ -94,6 +118,15 @@ export class Store {
   private readonly upsertAccountStmt: StatementSync;
   private readonly listAccountsStmt: StatementSync;
   private readonly listAccountsByProviderStmt: StatementSync;
+  private readonly getAccountStmt: StatementSync;
+  private readonly getGenStmt: StatementSync;
+  private readonly setGenCasStmt: StatementSync;
+  private readonly setStatusStmt: StatementSync;
+  private readonly getLeaseStmt: StatementSync;
+  private readonly upsertLeaseStmt: StatementSync;
+  private readonly heartbeatLeaseStmt: StatementSync;
+  private readonly deleteLeaseByHolderStmt: StatementSync;
+  private readonly stealLeaseStmt: StatementSync;
 
   constructor(dbPath: string = DEFAULT_DB_PATH) {
     this.dbPath = dbPath;
@@ -162,8 +195,8 @@ export class Store {
         key TEXT PRIMARY KEY,
         value TEXT
       );
-      PRAGMA user_version = 1;
     `);
+    this.migrateIfNeeded();
 
     if (dbPath !== ':memory:') {
       try {
@@ -231,11 +264,78 @@ export class Store {
         label = excluded.label
     `);
     this.listAccountsStmt = this.db.prepare(
-      'SELECT id, provider, label, status, created_at FROM accounts',
+      'SELECT id, provider, label, status, created_at, grant_generation FROM accounts',
     );
     this.listAccountsByProviderStmt = this.db.prepare(
-      'SELECT id, provider, label, status, created_at FROM accounts WHERE provider = ?',
+      'SELECT id, provider, label, status, created_at, grant_generation FROM accounts WHERE provider = ?',
     );
+    this.getAccountStmt = this.db.prepare(
+      'SELECT id, provider, label, status, created_at, grant_generation FROM accounts WHERE id = ?',
+    );
+    this.getGenStmt = this.db.prepare(
+      'SELECT grant_generation FROM accounts WHERE id = ?',
+    );
+    this.setGenCasStmt = this.db.prepare(
+      'UPDATE accounts SET grant_generation = ? WHERE id = ? AND grant_generation = ?',
+    );
+    this.setStatusStmt = this.db.prepare(
+      'UPDATE accounts SET status = ? WHERE id = ?',
+    );
+    this.getLeaseStmt = this.db.prepare(
+      'SELECT name, holder_pid, holder_id, until, generation FROM leases WHERE name = ?',
+    );
+    this.upsertLeaseStmt = this.db.prepare(`
+      INSERT INTO leases (name, holder_pid, holder_id, until, generation)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(name) DO UPDATE SET
+        holder_pid = excluded.holder_pid,
+        holder_id = excluded.holder_id,
+        until = excluded.until,
+        generation = excluded.generation
+    `);
+    this.heartbeatLeaseStmt = this.db.prepare(
+      'UPDATE leases SET until = ? WHERE name = ? AND holder_id = ?',
+    );
+    this.deleteLeaseByHolderStmt = this.db.prepare(
+      'DELETE FROM leases WHERE name = ? AND holder_id = ?',
+    );
+    this.stealLeaseStmt = this.db.prepare(
+      'UPDATE leases SET holder_id = ? WHERE name = ?',
+    );
+  }
+
+  /**
+   * Additive v1 → v2: `accounts.grant_generation` + `leases` table (§4.7).
+   * Generation lives on `accounts` (not a side table) so the fenced CAS in
+   * §4.8.2 step 5 is a single-row UPDATE on the account itself.
+   */
+  private migrateIfNeeded(): void {
+    const version = readUserVersion(this.db);
+    if (version > 2) {
+      throw new Error(
+        `qlb.db schema user_version=${version} is newer than this binary (2); upgrade qlb`,
+      );
+    }
+    if (version >= 2) return;
+
+    const cols = this.db.prepare('PRAGMA table_info(accounts)').all() as Array<{
+      name: string;
+    }>;
+    if (!cols.some((c) => c.name === 'grant_generation')) {
+      this.db.exec(
+        'ALTER TABLE accounts ADD COLUMN grant_generation INTEGER DEFAULT 0',
+      );
+    }
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS leases (
+        name TEXT PRIMARY KEY,
+        holder_pid INTEGER,
+        holder_id TEXT,
+        until INTEGER,
+        generation INTEGER
+      );
+    `);
+    this.db.exec('PRAGMA user_version = 2');
   }
 
   close(): void {
@@ -435,6 +535,156 @@ export class Store {
       this.db.exec('ROLLBACK');
       throw err;
     }
+  }
+
+  /**
+   * Run `fn` inside BEGIN IMMEDIATE. `fn` MUST be synchronous — no `await` —
+   * so another coroutine cannot interleave a second BEGIN on this connection.
+   * Keychain I/O inside `fn` must use the sync backend (C3: if the Keychain
+   * write lands and this throws before COMMIT, SQLite rolls back and the next
+   * reader repairs via kgen > gen).
+   */
+  runImmediate<T>(fn: () => T): T {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const result = fn();
+      this.db.exec('COMMIT');
+      return result;
+    } catch (err) {
+      try {
+        this.db.exec('ROLLBACK');
+      } catch {
+        // BEGIN may have failed, or SQLite already rolled back
+      }
+      throw err;
+    }
+  }
+
+  getAccount(id: string): AccountRow | null {
+    const row = this.getAccountStmt.get(id) as AccountRow | undefined;
+    if (!row) return null;
+    return { ...row, grant_generation: Number(row.grant_generation ?? 0) };
+  }
+
+  getGrantGeneration(accountId: string): number | null {
+    const row = this.getGenStmt.get(accountId) as
+      | { grant_generation: number | null }
+      | undefined;
+    if (!row) return null;
+    return Number(row.grant_generation ?? 0);
+  }
+
+  /** CAS: set generation to `toGen` only if it currently equals `fromGen`. Returns changes. */
+  casGrantGeneration(accountId: string, fromGen: number, toGen: number): number {
+    const result = this.setGenCasStmt.run(toGen, accountId, fromGen);
+    return Number(result.changes);
+  }
+
+  bumpGrantGeneration(accountId: string, expectedGen: number): number {
+    return this.casGrantGeneration(accountId, expectedGen, expectedGen + 1);
+  }
+
+  repairGrantGeneration(accountId: string, fromGen: number, toGen: number): void {
+    this.runImmediate(() => {
+      this.casGrantGeneration(accountId, fromGen, toGen);
+    });
+  }
+
+  setAccountStatus(accountId: string, status: string): void {
+    this.setStatusStmt.run(status, accountId);
+  }
+
+  getLease(name: string): LeaseRow | null {
+    const row = this.getLeaseStmt.get(name) as LeaseRow | undefined;
+    return row ?? null;
+  }
+
+  /**
+   * Step 3 of §4.8.2: re-check generation, skip if another holder is live,
+   * otherwise UPSERT the lease. Own BEGIN IMMEDIATE.
+   */
+  acquireRefreshLease(
+    accountId: string,
+    holderId: string,
+    holderPid: number,
+    expectedGen: number,
+    ttlMs: number,
+  ): 'acquired' | 'busy' | 'stale_gen' {
+    const name = refreshLeaseName(accountId);
+    const now = Date.now();
+    return this.runImmediate(() => {
+      const gen = this.getGrantGeneration(accountId);
+      if (gen === null) {
+        throw new Error(`unknown account ${accountId}`);
+      }
+      if (gen !== expectedGen) return 'stale_gen';
+      const row = this.getLease(name);
+      if (row && row.until > now && row.holder_id !== holderId) {
+        return 'busy';
+      }
+      this.upsertLeaseStmt.run(name, holderPid, holderId, now + ttlMs, expectedGen);
+      return 'acquired';
+    });
+  }
+
+  /**
+   * Step 4 heartbeat: ok iff we still hold the lease AND generation is unchanged.
+   * Renews `until` when ok. Own BEGIN IMMEDIATE.
+   */
+  heartbeatRefreshLease(
+    accountId: string,
+    holderId: string,
+    expectedGen: number,
+    ttlMs: number,
+  ): boolean {
+    const name = refreshLeaseName(accountId);
+    const now = Date.now();
+    return this.runImmediate(() => {
+      const gen = this.getGrantGeneration(accountId);
+      const row = this.getLease(name);
+      const ok = row?.holder_id === holderId && gen === expectedGen;
+      if (ok) {
+        this.heartbeatLeaseStmt.run(now + ttlMs, name, holderId);
+      }
+      return ok;
+    });
+  }
+
+  releaseRefreshLease(accountId: string, holderId: string): void {
+    const name = refreshLeaseName(accountId);
+    this.runImmediate(() => {
+      this.deleteLeaseByHolderStmt.run(name, holderId);
+    });
+  }
+
+  /** No-txn variant for use inside an already-open write transaction (step 5). */
+  deleteLeaseIfHolder(name: string, holderId: string): void {
+    this.deleteLeaseByHolderStmt.run(name, holderId);
+  }
+
+  /**
+   * Step 4 `invalid_grant` handler. Returns true if this is a lost race
+   * (generation moved — not revocation). Otherwise marks the account
+   * `auth_revoked` and returns false.
+   */
+  handleAuthRevoked(
+    accountId: string,
+    holderId: string,
+    expectedGen: number,
+  ): boolean {
+    const name = refreshLeaseName(accountId);
+    return this.runImmediate(() => {
+      const gen = this.getGrantGeneration(accountId);
+      this.deleteLeaseByHolderStmt.run(name, holderId);
+      if (gen !== expectedGen) return true;
+      this.setStatusStmt.run('auth_revoked', accountId);
+      return false;
+    });
+  }
+
+  /** Fault injection for T-CONC-6 (`lease:steal`). Not used in production paths. */
+  stealLease(name: string, newHolderId: string): void {
+    this.stealLeaseStmt.run(newHolderId, name);
   }
 }
 
