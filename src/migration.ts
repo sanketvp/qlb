@@ -90,6 +90,7 @@
 // renamed, because H2 is strictly after C and rollback restores native
 // strictly before unlinking the owner file.
 
+import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
   chmodSync,
@@ -103,17 +104,17 @@ import {
   statSync,
   writeSync,
 } from 'node:fs';
-import { homedir } from 'node:os';
 import { dirname, join, resolve, sep } from 'node:path';
+import { config } from './config';
 import type { KeychainBackend } from './keychain';
 import { qlbKeychainService } from './keychain';
 import { parseGrant } from './refresh-lease';
 import type { Store } from './store';
 import type { Grant } from './types';
 
-export const DEFAULT_POOL_FILE = join(homedir(), '.pi', 'agent', 'anthropic-pool.json');
-export const DEFAULT_OWNER_FILE = join(homedir(), '.pi', 'agent', 'qlb-owner.json');
-export const DEFAULT_AUTH_JSON = join(homedir(), '.pi', 'agent', 'auth.json');
+export const DEFAULT_POOL_FILE = config.anthropicPoolPath;
+export const DEFAULT_OWNER_FILE = join(dirname(config.piAuthJsonPath), 'qlb-owner.json');
+export const DEFAULT_AUTH_JSON = config.piAuthJsonPath;
 export const PI_POOL_STORE = 'pi-pool';
 
 /**
@@ -132,14 +133,38 @@ export const PI_POOL_STORE = 'pi-pool';
  *                Once QLB-owned, qlb-pi / qlb-proxy MUST prefer the
  *                Keychain copy over reading `auth.json` for that provider.
  *
+ * Static-key providers (OpenRouter) are a third shape, NOT stuffed into Grant:
+ *
+ *   openrouter — a single static API key in macOS Keychain service
+ *                `pi-openrouter`. No OAuth, no refresh token, no expiry,
+ *                no refresh-lease. Native source is Keychain (READ-ONLY);
+ *                QLB never writes `pi-openrouter`. Ownership is recorded in
+ *                `qlb-owner-openrouter.json` + journal store `pi-openrouter`.
+ *                The QLB Keychain payload is `{ type: 'api-key', access }`
+ *                rather than an OAuth Grant (which requires refresh/expires).
+ *                Native strategy is `keychain-retain`.
+ *
  * Crash-safety is the same state machine (stage → rehearse → commit via
  * atomic owner-file rename → rollback / resume). Hygiene is simply simpler:
  * there is no native rename, so H1–H4 are journal/owner-file only.
  */
 export const SINGLE_GRANT_PROVIDERS = ['xai', 'kimi-coding', 'openai-codex'] as const;
 export type SingleGrantProvider = (typeof SINGLE_GRANT_PROVIDERS)[number];
-export type MigrateProvider = 'anthropic' | SingleGrantProvider;
-export type MigrationKind = 'pool' | 'single-grant';
+
+/**
+ * Static API-key providers. Distinct from SINGLE_GRANT_PROVIDERS because
+ * `Grant` is OAuth-shaped (`access` + `refresh` + `expires`) and OpenRouter
+ * has none of those fields except the key itself. Do not force a dummy
+ * refresh token into Grant — persist `ApiKeyPayload` instead.
+ */
+export const STATIC_KEY_PROVIDERS = ['openrouter'] as const;
+export type StaticKeyProvider = (typeof STATIC_KEY_PROVIDERS)[number];
+
+export type MigrateProvider = 'anthropic' | SingleGrantProvider | StaticKeyProvider;
+export type MigrationKind = 'pool' | 'single-grant' | 'static-key';
+export type NativeStrategy = 'rename' | 'shadow-retain' | 'keychain-retain';
+
+export const NATIVE_OPENROUTER_KEYCHAIN_SERVICE = 'pi-openrouter';
 
 export function isSingleGrantProvider(value: string | undefined): value is SingleGrantProvider {
   return (
@@ -147,26 +172,32 @@ export function isSingleGrantProvider(value: string | undefined): value is Singl
   );
 }
 
+export function isStaticKeyProvider(value: string | undefined): value is StaticKeyProvider {
+  return value === 'openrouter';
+}
+
 export function isMigrateProvider(value: string | undefined): value is MigrateProvider {
-  return value === 'anthropic' || isSingleGrantProvider(value);
+  return value === 'anthropic' || isSingleGrantProvider(value) || isStaticKeyProvider(value);
 }
 
 /**
  * Phase 0 adapter accountId conventions. MUST stay in lockstep with
- * `src/adapters/{xai,kimi,codex}.ts` so resolve/scoring keep working after
- * cutover. Codex falls back to `codex-default` when the grant has no
- * chatgpt_account_id (the adapter does the same).
+ * `src/adapters/{xai,kimi,codex,openrouter}.ts` so resolve/scoring keep
+ * working after cutover. Codex falls back to `codex-default` when the grant
+ * has no chatgpt_account_id (the adapter does the same).
  */
-export const ADAPTER_ACCOUNT_IDS: Record<SingleGrantProvider, string> = {
+export const ADAPTER_ACCOUNT_IDS: Record<SingleGrantProvider | StaticKeyProvider, string> = {
   xai: 'xai-default',
   'kimi-coding': 'kimi-default',
   'openai-codex': 'codex-default',
+  openrouter: 'openrouter-default',
 };
 
-export const ADAPTER_ACCOUNT_LABELS: Record<SingleGrantProvider, string> = {
+export const ADAPTER_ACCOUNT_LABELS: Record<SingleGrantProvider | StaticKeyProvider, string> = {
   xai: 'Grok (xAI)',
   'kimi-coding': 'Kimi K3',
   'openai-codex': 'codex-default',
+  openrouter: 'OpenRouter',
 };
 
 export function migrationStoreNameFor(provider: string): string {
@@ -176,11 +207,12 @@ export function migrationStoreNameFor(provider: string): string {
 
 export function defaultOwnerFileFor(provider: MigrateProvider): string {
   if (provider === 'anthropic') return DEFAULT_OWNER_FILE;
-  return join(homedir(), '.pi', 'agent', `qlb-owner-${provider}.json`);
+  return join(dirname(config.piAuthJsonPath), `qlb-owner-${provider}.json`);
 }
 
 export function defaultNativePathFor(provider: MigrateProvider): string {
   if (provider === 'anthropic') return DEFAULT_POOL_FILE;
+  if (provider === 'openrouter') return '';
   return DEFAULT_AUTH_JSON;
 }
 
@@ -220,9 +252,12 @@ export interface OwnerFile {
    * `rename` (Anthropic pool): native file is moved to `.pre-qlb` after commit.
    * `shadow-retain` (single-grant): `auth.json` is left in place; ownership is
    * recorded only in this file + the journal.
+   * `keychain-retain` (static-key / OpenRouter): native Keychain service
+   * `pi-openrouter` is never written; ownership is this file + the journal.
    */
-  nativeStrategy?: 'rename' | 'shadow-retain';
+  nativeStrategy?: NativeStrategy;
   authJsonKey?: string;
+  nativeKeychainService?: string;
 }
 
 export interface MigrationStatus {
@@ -234,7 +269,7 @@ export interface MigrationStatus {
   piAtNextLaunch: 'native works' | 'QLB works' | 'unknown';
   resumeAction: string;
   detail: Record<string, unknown>;
-  nativeStrategy?: 'rename' | 'shadow-retain';
+  nativeStrategy?: NativeStrategy;
   provider?: string;
 }
 
@@ -242,6 +277,23 @@ export interface MigrationConfig {
   kind?: MigrationKind;
   provider?: string;
   authJsonKey?: string;
+  /**
+   * Static-key (OpenRouter): injectable native-key reader.
+   * Tests MUST pass a function that returns a fake key. The CLI passes
+   * `readOpenRouterNativeKey` (read-only `security find-generic-password
+   * -s pi-openrouter -w`). Never writes the native service.
+   */
+  readNativeKey?: () => string;
+}
+
+/**
+ * QLB Keychain payload for static API keys. Deliberately NOT a `Grant`:
+ * Grant requires `refresh` + `expires` (OAuth). OpenRouter has neither.
+ */
+export interface ApiKeyPayload {
+  type: 'api-key';
+  access: string;
+  writtenBy?: string;
 }
 
 export interface AuthJsonGrantInput {
@@ -279,7 +331,7 @@ const STATE_RANK: Record<MigrationState, number> = {
 };
 
 export function realPiAgentDir(): string {
-  return resolve(join(homedir(), '.pi', 'agent'));
+  return resolve(dirname(config.piAuthJsonPath));
 }
 
 /** True if `p` is the live Pi agent dir or a file inside it. */
@@ -291,6 +343,67 @@ export function isRealPiAgentPath(p: string): boolean {
 
 export function fingerprintRefresh(refreshToken: string): string {
   return createHash('sha256').update(refreshToken, 'utf8').digest('hex');
+}
+
+/** SHA-256 of a static API key. Same hash as fingerprintRefresh; named for callers. */
+export function fingerprintApiKey(key: string): string {
+  return fingerprintRefresh(key);
+}
+
+export function parseApiKeyPayload(raw: string): ApiKeyPayload {
+  const parsed: unknown = JSON.parse(raw);
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('invalid api-key payload');
+  }
+  const obj = parsed as Record<string, unknown>;
+  if (obj.type !== 'api-key' || typeof obj.access !== 'string' || obj.access.length === 0) {
+    throw new Error('invalid api-key payload: type/access required');
+  }
+  const out: ApiKeyPayload = { type: 'api-key', access: obj.access };
+  if (typeof obj.writtenBy === 'string') out.writtenBy = obj.writtenBy;
+  return out;
+}
+
+/**
+ * In-memory Grant *view* of an ApiKeyPayload so RehearseFn can keep using
+ * `account.grant.access`. This is NOT how the key is persisted — Keychain
+ * stores ApiKeyPayload (no refresh/expires). `refresh` is '' and `expires`
+ * is 0 (never expires / skip the OAuth expiry gate).
+ */
+export function grantViewFromApiKeyPayload(raw: string): Grant {
+  const payload = parseApiKeyPayload(raw);
+  const grant: Grant = {
+    access: payload.access,
+    refresh: '',
+    expires: 0,
+    generation: 0,
+    extra: { type: 'api-key' },
+  };
+  if (payload.writtenBy) grant.writtenBy = payload.writtenBy;
+  return grant;
+}
+
+/**
+ * READ-ONLY lookup of the native OpenRouter API key from macOS Keychain
+ * service `pi-openrouter`. Never writes that service or any `qlb:openrouter:*`
+ * entry. Automated tests MUST NOT call this — inject a fake `readNativeKey`
+ * into `createStaticKeyMigration` instead.
+ */
+export function readOpenRouterNativeKey(): string {
+  try {
+    const stdout = execFileSync(
+      'security',
+      ['find-generic-password', '-s', NATIVE_OPENROUTER_KEYCHAIN_SERVICE, '-w'],
+      { encoding: 'utf8' },
+    );
+    const key = String(stdout).replace(/\n$/, '').trim();
+    if (key.length > 0) return key;
+  } catch {
+    // Normalize Keychain lookup failures without exposing command output.
+  }
+  throw new Error(
+    'OpenRouter key not found in macOS Keychain (service pi-openrouter)',
+  );
 }
 
 export function stagingOwnerPath(ownerFilePath: string): string {
@@ -582,6 +695,14 @@ export async function defaultRehearseFn(
       }
       return { ok: true };
     }
+    if (account.provider === 'openrouter') {
+      const res = await fetch('https://openrouter.ai/api/v1/credits', {
+        headers: { Authorization: `Bearer ${account.grant.access}` },
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (!res.ok) return { ok: false, error: `rehearse HTTP ${res.status}` };
+      return { ok: true };
+    }
     return { ok: false, error: `no default rehearse implementation for ${account.provider}` };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -598,6 +719,7 @@ export class Migration {
   readonly kind: MigrationKind;
   readonly provider: string | undefined;
   readonly authJsonKey: string | undefined;
+  private readonly readNativeKey: (() => string) | undefined;
 
   constructor(
     store: Store,
@@ -615,6 +737,18 @@ export class Migration {
     this.kind = config.kind ?? 'pool';
     this.provider = config.provider;
     this.authJsonKey = config.authJsonKey ?? config.provider;
+    this.readNativeKey = config.readNativeKey;
+  }
+
+  /** True when commit must not rename/delete the native store. */
+  private retainsNative(): boolean {
+    return this.kind === 'single-grant' || this.kind === 'static-key';
+  }
+
+  private strategy(): NativeStrategy {
+    if (this.kind === 'static-key') return 'keychain-retain';
+    if (this.kind === 'single-grant') return 'shadow-retain';
+    return 'rename';
   }
 
   status(): MigrationStatus {
@@ -623,8 +757,10 @@ export class Migration {
     const detail = parseDetail(row?.detail_json);
     const ownerPresent = existsSync(this.ownerFilePath);
     const ownerStaging = existsSync(stagingOwnerPath(this.ownerFilePath));
-    const nativePresent = existsSync(this.poolFilePath);
-    const prePresent = existsSync(preQlbPath(this.poolFilePath));
+    const nativePresent =
+      this.kind === 'static-key' ? true : existsSync(this.poolFilePath);
+    const prePresent =
+      this.kind === 'static-key' ? false : existsSync(preQlbPath(this.poolFilePath));
     const intent = detail.intent === 'rollback';
 
     let ownerFile: MigrationStatus['ownerFile'] = 'absent';
@@ -632,7 +768,10 @@ export class Migration {
     else if (ownerStaging) ownerFile = 'staging';
 
     let nativeStore: MigrationStatus['nativeStore'] = 'missing';
-    if (nativePresent && prePresent) nativeStore = 'both';
+    if (this.kind === 'static-key') {
+      // Native Keychain service is never mutated by QLB.
+      nativeStore = 'intact';
+    } else if (nativePresent && prePresent) nativeStore = 'both';
     else if (nativePresent) nativeStore = 'intact';
     else if (prePresent) nativeStore = 'pre-qlb';
 
@@ -640,22 +779,29 @@ export class Migration {
     if (ownerPresent) piAtNextLaunch = 'QLB works';
     else if (nativePresent) piAtNextLaunch = 'native works';
 
-    const shadow = this.kind === 'single-grant';
+    const retains = this.retainsNative();
+    const staticKey = this.kind === 'static-key';
     let resumeAction: string;
     if (intent) {
-      resumeAction = shadow
-        ? 'continue rollback to VALIDATED (owner unlinked; auth.json was never moved)'
-        : 'continue rollback to VALIDATED (native restored, owner unlinked)';
+      resumeAction = staticKey
+        ? 'continue rollback to VALIDATED (owner unlinked; native Keychain was never moved)'
+        : retains
+          ? 'continue rollback to VALIDATED (owner unlinked; auth.json was never moved)'
+          : 'continue rollback to VALIDATED (native restored, owner unlinked)';
     } else if (ownerPresent && STATE_RANK[state] < STATE_RANK.QLB_OWNED) {
-      resumeAction = shadow
-        ? 'already committed; finish hygiene (journal only; auth.json shadow-retained) → QLB_OWNED'
-        : 'already committed; finish hygiene (H1–H2) → QLB_OWNED';
-    } else if (ownerPresent && nativePresent && !prePresent && !shadow) {
+      resumeAction = staticKey
+        ? 'already committed; finish hygiene (journal only; native Keychain retained) → QLB_OWNED'
+        : retains
+          ? 'already committed; finish hygiene (journal only; auth.json shadow-retained) → QLB_OWNED'
+          : 'already committed; finish hygiene (H1–H2) → QLB_OWNED';
+    } else if (ownerPresent && nativePresent && !prePresent && !retains) {
       resumeAction = 'finish hygiene: rename native → .pre-qlb';
     } else if (ownerPresent) {
-      resumeAction = shadow
-        ? 'noop (already QLB_OWNED; native auth.json shadow-retained)'
-        : 'noop (already QLB_OWNED)';
+      resumeAction = staticKey
+        ? 'noop (already QLB_OWNED; native Keychain retained)'
+        : retains
+          ? 'noop (already QLB_OWNED; native auth.json shadow-retained)'
+          : 'noop (already QLB_OWNED)';
     } else if (state === 'QLB_OWNED' && !ownerPresent && nativePresent) {
       resumeAction = 'post-RC hygiene: journal VALIDATED';
     } else if (state === 'VALIDATED' && ownerStaging) {
@@ -675,7 +821,7 @@ export class Migration {
       piAtNextLaunch,
       resumeAction,
       detail,
-      nativeStrategy: shadow ? 'shadow-retain' : 'rename',
+      nativeStrategy: this.strategy(),
       provider: this.provider,
     };
   }
@@ -686,6 +832,7 @@ export class Migration {
    *
    * Pool (Anthropic): N accounts from anthropic-pool.json.
    * Single-grant: 1 account from a named top-level key in auth.json.
+   * Static-key (OpenRouter): 1 API key from native Keychain (read-only).
    */
   stage(): MigrationStatus {
     const current = this.status();
@@ -693,6 +840,9 @@ export class Migration {
       throw new Error(
         `cannot stage: migration already ${current.state} (owner file ${current.ownerFile})`,
       );
+    }
+    if (this.kind === 'static-key') {
+      return this.stageStaticKey();
     }
     if (this.kind === 'single-grant') {
       return this.stageSingleGrant();
@@ -838,7 +988,7 @@ export class Migration {
     if (
       current.state === 'QLB_OWNED' &&
       !existsSync(this.ownerFilePath) &&
-      existsSync(this.poolFilePath)
+      (this.kind === 'static-key' || existsSync(this.poolFilePath))
     ) {
       return this.finishRollbackJournal();
     }
@@ -852,6 +1002,64 @@ export class Migration {
   }
 
   // --- internals -----------------------------------------------------------
+
+  /**
+   * S2 for a static API key (OpenRouter). Reads native Keychain via the
+   * injected `readNativeKey` (tests: fake key; CLI: read-only `pi-openrouter`).
+   * Writes QLB Keychain `qlb:openrouter:openrouter-default` as ApiKeyPayload.
+   * NEVER writes the native `pi-openrouter` service.
+   */
+  private stageStaticKey(): MigrationStatus {
+    if (!this.provider || !isStaticKeyProvider(this.provider)) {
+      throw new Error('static-key migration requires provider openrouter');
+    }
+    if (!this.readNativeKey) {
+      throw new Error(
+        'static-key migration requires readNativeKey (tests must inject a fake key; never call the real Keychain from automated tests)',
+      );
+    }
+    const key = this.readNativeKey().trim();
+    if (!key) {
+      throw new Error(
+        'OpenRouter key not found in macOS Keychain (service pi-openrouter)',
+      );
+    }
+    const id = ADAPTER_ACCOUNT_IDS[this.provider];
+    const label = ADAPTER_ACCOUNT_LABELS[this.provider];
+    const payload: ApiKeyPayload = {
+      type: 'api-key',
+      access: key,
+      writtenBy: 'migrate-stage',
+    };
+    const fingerprint = fingerprintApiKey(key);
+    const { service, account } = keychainCoords(this.provider, id, label);
+    this.keychain.setSync(service, account, JSON.stringify(payload));
+    this.store.upsertAccount(id, this.provider, label, 'imported-unvalidated');
+
+    const owner: OwnerFile = {
+      owner: 'qlb',
+      stagedAt: Date.now(),
+      committedAt: null,
+      exportSeq: 0,
+      qlbAccountIds: [id],
+      stores: [this.storeName],
+      accounts: [{ id, provider: this.provider, label, fingerprint }],
+      nativeStrategy: 'keychain-retain',
+      nativeKeychainService: NATIVE_OPENROUTER_KEYCHAIN_SERVICE,
+    };
+    atomicWriteFile(stagingOwnerPath(this.ownerFilePath), JSON.stringify(owner, null, 2) + '\n');
+
+    this.journal('MIRRORED', {
+      accounts: owner.accounts,
+      qlbAccountIds: owner.qlbAccountIds,
+      ownerFilePath: this.ownerFilePath,
+      stagedAt: owner.stagedAt,
+      nativeStrategy: 'keychain-retain',
+      nativeKeychainService: NATIVE_OPENROUTER_KEYCHAIN_SERVICE,
+      provider: this.provider,
+    });
+    return this.status();
+  }
 
   /**
    * S2 for a single OAuth grant in auth.json. Writes Keychain + staging
@@ -961,7 +1169,11 @@ export class Migration {
     const out: StagedAccount[] = [];
     for (const meta of owner.accounts) {
       const { service, account } = keychainCoords(meta.provider, meta.id, meta.label);
-      const grant = parseGrant(this.keychain.getSync(service, account));
+      const raw = this.keychain.getSync(service, account);
+      const grant =
+        this.kind === 'static-key'
+          ? grantViewFromApiKeyPayload(raw)
+          : parseGrant(raw);
       out.push({
         id: meta.id,
         provider: meta.provider,
@@ -991,10 +1203,11 @@ export class Migration {
 
     this.journal('QLB_OWNED', { committedAt: now, intent: undefined });
 
-    if (this.kind === 'single-grant') {
-      // Shadow-retain: auth.json is a shared multi-provider file. Renaming it
-      // would steal every unmigrated provider's grant. Ownership is the owner
-      // file + journal; qlb-pi prefers Keychain for QLB-owned providers.
+    if (this.retainsNative()) {
+      // single-grant: auth.json is a shared multi-provider file. Renaming it
+      // would steal every unmigrated provider's grant.
+      // static-key: native Keychain service `pi-openrouter` is never written.
+      // Ownership is the owner file + journal in both cases.
       return this.status();
     }
 
@@ -1053,6 +1266,13 @@ export class Migration {
   }
 
   private continueRollback(): MigrationStatus {
+    if (this.retainsNative()) {
+      // Native was never moved (auth.json shadow-retained, or Keychain retained).
+      unlinkIfExists(this.ownerFilePath);
+      unlinkIfExists(stagingOwnerPath(this.ownerFilePath));
+      return this.finishRollbackJournal();
+    }
+
     const native = this.poolFilePath;
     const retired = preQlbPath(native);
 
@@ -1075,8 +1295,10 @@ export class Migration {
 
   /** RH1 + RH2 */
   private finishRollbackJournal(): MigrationStatus {
-    unlinkIfExists(sidecarPath(this.poolFilePath));
-    unlinkIfExists(preQlbPath(this.poolFilePath));
+    if (this.kind !== 'static-key' && this.poolFilePath) {
+      unlinkIfExists(sidecarPath(this.poolFilePath));
+      unlinkIfExists(preQlbPath(this.poolFilePath));
+    }
     this.journal('VALIDATED', {
       intent: undefined,
       rolledBackAt: Date.now(),
@@ -1101,6 +1323,28 @@ export function createSingleGrantMigration(
     ownerFilePath,
     migrationStoreNameFor(provider),
     { kind: 'single-grant', provider, authJsonKey: keyName },
+  );
+}
+
+/**
+ * OpenRouter (and future static-key providers): no auth.json, no OAuth Grant.
+ * `readNativeKey` is required so tests inject a fake and never touch the real
+ * `pi-openrouter` Keychain service. The CLI passes `readOpenRouterNativeKey`.
+ */
+export function createStaticKeyMigration(
+  store: Store,
+  keychain: KeychainBackend,
+  provider: StaticKeyProvider,
+  ownerFilePath: string,
+  readNativeKey: () => string,
+): Migration {
+  return new Migration(
+    store,
+    keychain,
+    '',
+    ownerFilePath,
+    migrationStoreNameFor(provider),
+    { kind: 'static-key', provider, readNativeKey },
   );
 }
 

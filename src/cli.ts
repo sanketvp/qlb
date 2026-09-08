@@ -8,11 +8,14 @@ import {
   DEFAULT_POOL_FILE,
   Migration,
   createSingleGrantMigration,
+  createStaticKeyMigration,
   defaultOwnerFileFor,
   defaultRehearseFn,
   isMigrateProvider,
   isRealPiAgentPath,
   isSingleGrantProvider,
+  isStaticKeyProvider,
+  readOpenRouterNativeKey,
   type MigrateProvider,
 } from './migration';
 import { listPolicies, setPolicy } from './policy';
@@ -36,12 +39,12 @@ const USAGE = `Usage:
   qlb policy list [--harness <h>] [--db <path>] [--json]
   qlb gate codex [--json] [--db <path>]
   qlb proxy [--info-path <path>] [--idle-ms <n>] [--db <path>]
-  qlb migrate stage    [--provider anthropic|xai|kimi-coding|openai-codex] --pool-file <path> --owner-file <path> [--auth-json <path>] [--db <path>] [--target-dir <path>] [--confirm-real-cutover]
-  qlb migrate rehearse [--provider anthropic|xai|kimi-coding|openai-codex] --pool-file <path> --owner-file <path> [--auth-json <path>] [--db <path>] [--target-dir <path>] [--confirm-real-cutover]
-  qlb migrate commit   [--provider anthropic|xai|kimi-coding|openai-codex] --pool-file <path> --owner-file <path> [--auth-json <path>] [--db <path>] [--target-dir <path>] [--confirm-real-cutover]
-  qlb migrate rollback [--provider anthropic|xai|kimi-coding|openai-codex] --pool-file <path> --owner-file <path> [--auth-json <path>] [--db <path>] [--target-dir <path>] [--confirm-real-cutover]
-  qlb migrate resume   [--provider anthropic|xai|kimi-coding|openai-codex] --pool-file <path> --owner-file <path> [--auth-json <path>] [--db <path>] [--target-dir <path>] [--confirm-real-cutover]
-  qlb migrate status   [--provider anthropic|xai|kimi-coding|openai-codex] [--pool-file <path>] [--owner-file <path>] [--auth-json <path>] [--db <path>] [--target-dir <path>] [--json]
+  qlb migrate stage    [--provider anthropic|xai|kimi-coding|openai-codex|openrouter] --pool-file <path> --owner-file <path> [--auth-json <path>] [--db <path>] [--target-dir <path>] [--confirm-real-cutover]
+  qlb migrate rehearse [--provider anthropic|xai|kimi-coding|openai-codex|openrouter] --pool-file <path> --owner-file <path> [--auth-json <path>] [--db <path>] [--target-dir <path>] [--confirm-real-cutover]
+  qlb migrate commit   [--provider anthropic|xai|kimi-coding|openai-codex|openrouter] --pool-file <path> --owner-file <path> [--auth-json <path>] [--db <path>] [--target-dir <path>] [--confirm-real-cutover]
+  qlb migrate rollback [--provider anthropic|xai|kimi-coding|openai-codex|openrouter] --pool-file <path> --owner-file <path> [--auth-json <path>] [--db <path>] [--target-dir <path>] [--confirm-real-cutover]
+  qlb migrate resume   [--provider anthropic|xai|kimi-coding|openai-codex|openrouter] --pool-file <path> --owner-file <path> [--auth-json <path>] [--db <path>] [--target-dir <path>] [--confirm-real-cutover]
+  qlb migrate status   [--provider anthropic|xai|kimi-coding|openai-codex|openrouter] [--pool-file <path>] [--owner-file <path>] [--auth-json <path>] [--db <path>] [--target-dir <path>] [--json]
   qlb retire status  --harness claude-code|codex-cli [--json] [--db <path>]
   qlb retire execute --harness claude-code|codex-cli --confirm-real-retirement [--db <path>]
 
@@ -55,6 +58,9 @@ temp copy. Do NOT pass --confirm-real-cutover unless you intend to cut over
 live Pi. Default --provider is anthropic (backward compatible).
 Single-grant providers (xai, kimi-coding, openai-codex) shadow-retain the
 native auth.json entry — QLB never deletes or renames that shared file.
+OpenRouter is a static API key in Keychain service pi-openrouter (read-only;
+QLB never writes that service). Ownership is qlb-owner-openrouter.json +
+journal pi-openrouter; the QLB copy lives at qlb:openrouter:openrouter-default.
 qlb gate codex makes a handful of real Codex backend requests (read-only
 use of ~/.codex/auth.json). Automated tests never take this path.
 qlb retire status is read-only. qlb retire execute is refused unless
@@ -208,7 +214,7 @@ function parseMigrateArgs(args: string[]): MigrateOpts {
   const providerRawOrDefault = providerRaw ?? 'anthropic';
   if (!isMigrateProvider(providerRawOrDefault)) {
     console.error(
-      'qlb migrate: --provider must be anthropic|xai|kimi-coding|openai-codex',
+      'qlb migrate: --provider must be anthropic|xai|kimi-coding|openai-codex|openrouter',
     );
     console.error(USAGE);
     process.exit(1);
@@ -487,7 +493,11 @@ function parseArgs(argv: string[]): Opts {
 
 function assertSafeMigratePaths(opts: MigrateOpts): void {
   if (opts.sub === 'status') return;
-  const nativePath = opts.provider === 'anthropic' ? opts.poolFile : opts.authJson;
+  const nativePath = isStaticKeyProvider(opts.provider)
+    ? opts.ownerFile
+    : opts.provider === 'anthropic'
+      ? opts.poolFile
+      : opts.authJson;
   const real =
     isRealPiAgentPath(nativePath) || isRealPiAgentPath(opts.ownerFile);
   if (real && !opts.confirmRealCutover) {
@@ -761,15 +771,23 @@ async function runMigrate(opts: MigrateOpts): Promise<number> {
     store = getStore();
   }
   try {
-    const mig = isSingleGrantProvider(opts.provider)
-      ? createSingleGrantMigration(
+    const mig = isStaticKeyProvider(opts.provider)
+      ? createStaticKeyMigration(
           store,
           macosKeychain,
           opts.provider,
-          opts.authJson,
           opts.ownerFile,
+          readOpenRouterNativeKey,
         )
-      : new Migration(store, macosKeychain, opts.poolFile, opts.ownerFile);
+      : isSingleGrantProvider(opts.provider)
+        ? createSingleGrantMigration(
+            store,
+            macosKeychain,
+            opts.provider,
+            opts.authJson,
+            opts.ownerFile,
+          )
+        : new Migration(store, macosKeychain, opts.poolFile, opts.ownerFile);
     let status;
     switch (opts.sub) {
       case 'stage':

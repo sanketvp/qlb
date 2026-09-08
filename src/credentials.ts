@@ -10,6 +10,7 @@ import { qlbKeychainService } from './keychain';
 import {
   ADAPTER_ACCOUNT_IDS,
   migrationStoreNameFor,
+  parseApiKeyPayload,
 } from './migration';
 import { parseGrant } from './refresh-lease';
 import type { Store } from './store';
@@ -26,6 +27,13 @@ function providerPretty(provider: string | undefined, accountId: string): string
   if (provider === 'kimi-coding' || accountId === 'kimi-default' || accountId.startsWith('kimi')) {
     return 'kimi-coding';
   }
+  if (
+    provider === 'openrouter' ||
+    accountId === 'openrouter-default' ||
+    accountId.startsWith('openrouter')
+  ) {
+    return 'OpenRouter';
+  }
   if (provider === 'anthropic') return 'Anthropic';
   return provider ?? accountId;
 }
@@ -37,6 +45,12 @@ function guessProvider(accountId: string): string | undefined {
   }
   if (accountId === ADAPTER_ACCOUNT_IDS['openai-codex'] || accountId.startsWith('codex')) {
     return 'openai-codex';
+  }
+  if (
+    accountId === ADAPTER_ACCOUNT_IDS.openrouter ||
+    accountId.startsWith('openrouter')
+  ) {
+    return 'openrouter';
   }
   return undefined;
 }
@@ -63,7 +77,12 @@ export function createOwnedCredentialSource(opts: {
     }
     const service = qlbKeychainService(acct.provider, acct.id);
     const account = acct.label || acct.id;
-    const grant = parseGrant(opts.keychain.getSync(service, account));
-    return grant.access;
+    const raw = opts.keychain.getSync(service, account);
+    // OpenRouter is ownership-gated the same way even though qlb-proxy does
+    // not yet route OpenRouter traffic (no-op for the proxy today).
+    if (acct.provider === 'openrouter') {
+      return parseApiKeyPayload(raw).access;
+    }
+    return parseGrant(raw).access;
   };
 }

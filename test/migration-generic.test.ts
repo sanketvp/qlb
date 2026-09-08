@@ -8,10 +8,14 @@ import { MockKeychain, qlbKeychainService } from '../src/keychain';
 import {
   ADAPTER_ACCOUNT_IDS,
   ADAPTER_ACCOUNT_LABELS,
+  NATIVE_OPENROUTER_KEYCHAIN_SERVICE,
   SINGLE_GRANT_PROVIDERS,
   createSingleGrantMigration,
+  createStaticKeyMigration,
+  parseApiKeyPayload,
   stageGenericGrant,
   stagingOwnerPath,
+  type ApiKeyPayload,
   type RehearseFn,
   type SingleGrantProvider,
   type StagedAccount,
@@ -266,6 +270,240 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       assert.equal(keychainHas(h.kc, 'xai'), true);
     } finally {
       h.cleanup();
+    }
+  });
+});
+
+/**
+ * OpenRouter is a static API key (no OAuth Grant). Tests inject a fake key
+ * and use MockKeychain — the real `pi-openrouter` service and any real
+ * `qlb:openrouter:*` entry are never touched.
+ */
+const FAKE_OPENROUTER_KEY = 'sk-or-fake-test-key-not-real';
+const OPENROUTER_ID = ADAPTER_ACCOUNT_IDS.openrouter;
+const OPENROUTER_LABEL = ADAPTER_ACCOUNT_LABELS.openrouter;
+
+function mockOpenRouterRehearse(calls: StagedAccount[]): RehearseFn {
+  return async (account) => {
+    calls.push(account);
+    assert.equal(account.provider, 'openrouter');
+    assert.equal(account.id, OPENROUTER_ID);
+    assert.equal(account.grant.access, FAKE_OPENROUTER_KEY);
+    assert.equal(account.grant.expires, 0);
+    return { ok: true };
+  };
+}
+
+function openrouterKeychainHas(kc: MockKeychain): boolean {
+  try {
+    const raw = kc.getSync(
+      qlbKeychainService('openrouter', OPENROUTER_ID),
+      OPENROUTER_LABEL,
+    );
+    return parseApiKeyPayload(raw).access === FAKE_OPENROUTER_KEY;
+  } catch {
+    return false;
+  }
+}
+
+function setupOpenRouter(): {
+  dir: string;
+  ownerPath: string;
+  store: ReturnType<typeof openStore>;
+  kc: MockKeychain;
+  mig: ReturnType<typeof createStaticKeyMigration>;
+  nativeReads: number;
+  cleanup: () => void;
+} {
+  const dir = mkdtempSync(join(tmpdir(), 'qlb-openrouter-mig-'));
+  const ownerPath = join(dir, 'qlb-owner-openrouter.json');
+  const store = openStore(join(dir, 'qlb.db'));
+  const kc = new MockKeychain();
+  let nativeReads = 0;
+  const mig = createStaticKeyMigration(store, kc, 'openrouter', ownerPath, () => {
+    nativeReads += 1;
+    return FAKE_OPENROUTER_KEY;
+  });
+  return {
+    dir,
+    ownerPath,
+    store,
+    kc,
+    mig,
+    get nativeReads() {
+      return nativeReads;
+    },
+    cleanup: () => {
+      try {
+        store.close();
+      } catch {
+        // already closed
+      }
+      rmSync(dir, { recursive: true, force: true });
+    },
+  };
+}
+
+describe('static-key migration — openrouter (single API key, no OAuth)', () => {
+  it('happy path: stage → rehearse → commit; accountId matches adapter; native Keychain retained', async () => {
+    const h = setupOpenRouter();
+    try {
+      const before = h.mig.status();
+      assert.equal(before.state, 'NATIVE');
+      assert.equal(before.ownerFile, 'absent');
+      assert.equal(before.nativeStore, 'intact');
+      assert.equal(before.piAtNextLaunch, 'native works');
+      assert.equal(before.nativeStrategy, 'keychain-retain');
+      assert.equal(before.provider, 'openrouter');
+      assert.equal(before.store, 'pi-openrouter');
+
+      const staged = h.mig.stage();
+      assert.equal(staged.state, 'MIRRORED');
+      assert.equal(staged.ownerFile, 'staging');
+      assert.equal(staged.nativeStore, 'intact');
+      assert.equal(staged.piAtNextLaunch, 'native works');
+      assert.equal(staged.nativeStrategy, 'keychain-retain');
+      assert.equal(h.nativeReads, 1, 'stage reads the injected key once');
+      assert.equal(openrouterKeychainHas(h.kc), true);
+      assert.equal(h.store.getAccount(OPENROUTER_ID)?.id, OPENROUTER_ID);
+      assert.equal(h.store.getAccount(OPENROUTER_ID)?.provider, 'openrouter');
+
+      const rawPayload = h.kc.getSync(
+        qlbKeychainService('openrouter', OPENROUTER_ID),
+        OPENROUTER_LABEL,
+      );
+      const payload: ApiKeyPayload = parseApiKeyPayload(rawPayload);
+      assert.equal(payload.type, 'api-key');
+      assert.equal(payload.access, FAKE_OPENROUTER_KEY);
+      assert.equal(
+        'refresh' in JSON.parse(rawPayload),
+        false,
+        'persisted payload must not be an OAuth Grant',
+      );
+
+      const ownerStaging = JSON.parse(
+        readFileSync(stagingOwnerPath(h.ownerPath), 'utf8'),
+      ) as {
+        nativeStrategy?: string;
+        nativeKeychainService?: string;
+        qlbAccountIds: string[];
+      };
+      assert.equal(ownerStaging.nativeStrategy, 'keychain-retain');
+      assert.equal(ownerStaging.nativeKeychainService, NATIVE_OPENROUTER_KEYCHAIN_SERVICE);
+      assert.deepEqual(ownerStaging.qlbAccountIds, [OPENROUTER_ID]);
+
+      const rehearseCalls: StagedAccount[] = [];
+      const rehearsed = await h.mig.rehearse(mockOpenRouterRehearse(rehearseCalls));
+      assert.equal(rehearsed.state, 'VALIDATED');
+      assert.equal(rehearseCalls.length, 1);
+      assert.equal(rehearseCalls[0]?.id, OPENROUTER_ID);
+      assert.equal(rehearseCalls[0]?.provider, 'openrouter');
+      assert.equal(rehearseCalls[0]?.grant.access, FAKE_OPENROUTER_KEY);
+
+      const committed = h.mig.commit();
+      assert.equal(committed.state, 'QLB_OWNED');
+      assert.equal(committed.ownerFile, 'present');
+      assert.equal(committed.nativeStore, 'intact');
+      assert.equal(committed.piAtNextLaunch, 'QLB works');
+      assert.equal(committed.nativeStrategy, 'keychain-retain');
+      const owner = JSON.parse(readFileSync(h.ownerPath, 'utf8')) as {
+        owner: string;
+        nativeStrategy?: string;
+        qlbAccountIds: string[];
+      };
+      assert.equal(owner.owner, 'qlb');
+      assert.equal(owner.nativeStrategy, 'keychain-retain');
+      assert.deepEqual(owner.qlbAccountIds, [OPENROUTER_ID]);
+      assert.equal(openrouterKeychainHas(h.kc), true);
+      assert.equal(h.store.getMigration('pi-openrouter')?.state, 'QLB_OWNED');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('rollback before commit: staged Keychain entries cleaned up; native never written', () => {
+    const h = setupOpenRouter();
+    try {
+      h.mig.stage();
+      assert.equal(openrouterKeychainHas(h.kc), true);
+      assert.equal(h.mig.status().state, 'MIRRORED');
+
+      const rolled = h.mig.rollback();
+      assert.equal(rolled.state, 'NATIVE');
+      assert.equal(rolled.ownerFile, 'absent');
+      assert.equal(rolled.nativeStore, 'intact');
+      assert.equal(rolled.piAtNextLaunch, 'native works');
+      assert.equal(rolled.nativeStrategy, 'keychain-retain');
+      assert.equal(
+        openrouterKeychainHas(h.kc),
+        false,
+        'staging Keychain deleted on rollback',
+      );
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('createOwnedCredentialSource returns the staged API key when QLB_OWNED', async () => {
+    const h = setupOpenRouter();
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockOpenRouterRehearse([]));
+      h.mig.commit();
+      assert.equal(h.mig.status().state, 'QLB_OWNED');
+
+      const getCred = createOwnedCredentialSource({ store: h.store, keychain: h.kc });
+      const token = await getCred(OPENROUTER_ID);
+      assert.equal(token, FAKE_OPENROUTER_KEY);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('createOwnedCredentialSource errors clearly when OpenRouter is not yet migrated', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-openrouter-mig-'));
+    const store = openStore(join(dir, 'qlb.db'));
+    const kc = new MockKeychain();
+    try {
+      const getCred = createOwnedCredentialSource({ store, keychain: kc });
+      await assert.rejects(
+        () => getCred('openrouter-default'),
+        /OpenRouter credential not yet owned by QLB — run migration first/,
+      );
+    } finally {
+      try {
+        store.close();
+      } catch {
+        // already closed
+      }
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('stage without readNativeKey fails closed (never calls real Keychain)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-openrouter-mig-'));
+    const store = openStore(join(dir, 'qlb.db'));
+    const kc = new MockKeychain();
+    try {
+      const mig = createStaticKeyMigration(
+        store,
+        kc,
+        'openrouter',
+        join(dir, 'qlb-owner-openrouter.json'),
+        () => {
+          throw new Error('injected reader must not be the real security CLI');
+        },
+      );
+      // Replace-path coverage: a reader that throws must not leave Keychain entries.
+      assert.throws(() => mig.stage(), /injected reader must not be the real security CLI/);
+      assert.equal(openrouterKeychainHas(kc), false);
+    } finally {
+      try {
+        store.close();
+      } catch {
+        // already closed
+      }
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 });
