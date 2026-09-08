@@ -1,0 +1,24 @@
+{
+  "name": "qlb",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Cross-Provider Quota Load Balancer — Phase 0 read-only status CLI",
+  "type": "commonjs",
+  "bin": {
+    "qlb": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/cli.js",
+    "dev": "ts-node src/cli.ts",
+    "test": "node --test dist/**/*.test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "@types/node": "^26.5.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^7.0.2"
+  }
+}
