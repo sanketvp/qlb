@@ -5,6 +5,11 @@ import { DatabaseSync } from 'node:sqlite';
 
 import { builtInAdapters } from './adapters';
 import { CONFIG_ENV_VARS, type QlbConfig } from './config';
+import {
+  defaultCommandExists,
+  readNativeOpenRouterKey,
+  selectBackendKind,
+} from './keychain';
 import type { AccountSnapshot, Adapter } from './types';
 
 export type CheckLevel = 'PASS' | 'WARN' | 'FAIL';
@@ -115,12 +120,19 @@ export function inspectProviders(
 
   let openrouterOk = false;
   try {
-    openrouterOk = command('security', [
-      'find-generic-password', '-s', config.openrouterKeychainService, '-w',
-    ]).trim().length > 0;
+    if (command === runCommand) {
+      openrouterOk = readNativeOpenRouterKey(config.openrouterKeychainService).trim().length > 0;
+    } else {
+      openrouterOk = command('security', [
+        'find-generic-password', '-s', config.openrouterKeychainService, '-w',
+      ]).trim().length > 0;
+    }
   } catch {
     openrouterOk = false;
   }
+
+  const openrouterSource = openRouterSourceLabel(config.openrouterKeychainService);
+  const openrouterExample = openRouterSetupExample(config.openrouterKeychainService);
 
   return [
     anthropicOk
@@ -136,9 +148,37 @@ export function inspectProviders(
       ? found('kimi-coding', config.kimiCredentialsFile, CONFIG_ENV_VARS.kimiCredentialsFile, `export ${CONFIG_ENV_VARS.kimiCredentialsFile}=~/path/to/kimi-credentials.md`)
       : missing('kimi-coding', config.kimiCredentialsFile, CONFIG_ENV_VARS.kimiCredentialsFile, `export ${CONFIG_ENV_VARS.kimiCredentialsFile}=~/path/to/file-containing-sk-kimi-key`),
     openrouterOk
-      ? found('openrouter', `macOS Keychain service ${config.openrouterKeychainService}`, CONFIG_ENV_VARS.openrouterKeychainService, `export ${CONFIG_ENV_VARS.openrouterKeychainService}=pi-openrouter`)
-      : missing('openrouter', `macOS Keychain service ${config.openrouterKeychainService}`, CONFIG_ENV_VARS.openrouterKeychainService, `security add-generic-password -s ${config.openrouterKeychainService} -a qlb -w '<key>'`),
+      ? found('openrouter', openrouterSource, CONFIG_ENV_VARS.openrouterKeychainService, `export ${CONFIG_ENV_VARS.openrouterKeychainService}=pi-openrouter`)
+      : missing('openrouter', openrouterSource, CONFIG_ENV_VARS.openrouterKeychainService, openrouterExample),
   ];
+}
+
+function openRouterSourceLabel(service: string): string {
+  if (process.platform === 'darwin') return `macOS Keychain service ${service}`;
+  if (process.platform === 'win32') return `DPAPI credential store service ${service}`;
+  const kind = selectBackendKind({
+    platform: process.platform,
+    commandExists: defaultCommandExists,
+  });
+  if (kind === 'linux-libsecret') return `libsecret service ${service}`;
+  return `encrypted credential file service ${service}`;
+}
+
+function openRouterSetupExample(service: string): string {
+  if (process.platform === 'darwin') {
+    return `security add-generic-password -s ${service} -a qlb -w '<key>'`;
+  }
+  if (process.platform === 'win32') {
+    return `store the key in the DPAPI credential file (~/.qlb/credentials-windows.json) as service ${service} account qlb`;
+  }
+  const kind = selectBackendKind({
+    platform: process.platform,
+    commandExists: defaultCommandExists,
+  });
+  if (kind === 'linux-libsecret') {
+    return `printf '%s' '<key>' | secret-tool store --label ${service} service ${service} account qlb`;
+  }
+  return `store the key in ~/.qlb/credentials-linux.json as service ${service} account qlb`;
 }
 
 export function initializeQlb(
@@ -198,6 +238,49 @@ function combineOverall(checks: Array<{ level: CheckLevel }>): CheckLevel {
   return 'PASS';
 }
 
+function probeCredentialStore(command?: CommandRunner): DoctorCheck {
+  // Tests inject a command runner and still speak the macOS `security` CLI.
+  if (command) {
+    try {
+      command('security', ['list-keychains', '-d', 'user']);
+      return { name: 'keychain', level: 'PASS', message: 'macOS Keychain command is reachable' };
+    } catch {
+      return { name: 'keychain', level: 'WARN', message: 'macOS Keychain command is unavailable or unreachable' };
+    }
+  }
+  if (process.platform === 'darwin') {
+    try {
+      runCommand('security', ['list-keychains', '-d', 'user']);
+      return { name: 'keychain', level: 'PASS', message: 'macOS Keychain command is reachable' };
+    } catch {
+      return { name: 'keychain', level: 'WARN', message: 'macOS Keychain command is unavailable or unreachable' };
+    }
+  }
+  if (process.platform === 'win32') {
+    return {
+      name: 'keychain',
+      level: 'PASS',
+      message: 'Windows DPAPI credential backend is available',
+    };
+  }
+  const kind = selectBackendKind({
+    platform: process.platform,
+    commandExists: defaultCommandExists,
+  });
+  if (kind === 'linux-libsecret') {
+    return {
+      name: 'keychain',
+      level: 'PASS',
+      message: 'Linux libsecret (secret-tool) credential backend is available',
+    };
+  }
+  return {
+    name: 'keychain',
+    level: 'PASS',
+    message: 'Linux encrypted-file credential backend is available (weaker than libsecret; see CREDENTIAL-SAFETY.md)',
+  };
+}
+
 export async function doctorQlb(
   config: QlbConfig,
   options: { live?: boolean; command?: CommandRunner } = {},
@@ -238,12 +321,7 @@ export async function doctorQlb(
       }
     : { name: 'migrations', level: 'PASS', message: 'no incomplete migrations detected' });
 
-  try {
-    (options.command ?? runCommand)('security', ['list-keychains', '-d', 'user']);
-    checks.push({ name: 'keychain', level: 'PASS', message: 'macOS Keychain command is reachable' });
-  } catch {
-    checks.push({ name: 'keychain', level: 'WARN', message: 'macOS Keychain command is unavailable or unreachable' });
-  }
+  checks.push(probeCredentialStore(options.command));
 
   const providers = inspectProviders(config, options.command);
   if (options.live) {

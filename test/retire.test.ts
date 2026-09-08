@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join, resolve, sep } from 'node:path';
 import { after, describe, it } from 'node:test';
 import {
   checkRetirementEligibility,
@@ -255,11 +255,11 @@ describe('retireNativeStore — extra safety gates', () => {
 
     const resolved = resolve(fixture);
     assert.ok(
-      resolved.startsWith(resolve(dir) + '/'),
+      resolved.startsWith(resolve(dir) + sep),
       `fixture must live under the temp dir, got ${resolved}`,
     );
-    assert.equal(resolved.includes('/.codex/'), false);
-    assert.equal(resolved.includes('/.claude/'), false);
+    assert.equal(resolved.includes(`${sep}.codex${sep}`), false);
+    assert.equal(resolved.includes(`${sep}.claude${sep}`), false);
 
     try {
       const result = await retireNativeStore(store, HARNESS, {

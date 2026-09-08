@@ -51,7 +51,9 @@ export function defaultConfig(home: string = homedir()): QlbConfig {
 
 function expandPath(value: string, home: string): string {
   if (value === '~') return home;
-  if (value.startsWith('~/')) return join(home, value.slice(2));
+  if (value.startsWith('~/') || value.startsWith('~\\')) {
+    return join(home, value.slice(2));
+  }
   return isAbsolute(value) ? value : resolve(value);
 }
 

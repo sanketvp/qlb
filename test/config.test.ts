@@ -31,4 +31,23 @@ describe('configuration precedence', () => {
     assert.equal(config.piAuthJsonPath, join(home, 'pi-from-env.json'));
     assert.equal(config.codexAuthJsonPath, join(home, '.codex', 'auth.json'));
   });
+
+  it('expands both ~/ and ~\\ home prefixes', () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-config-home-'));
+    const posix = resolveConfig({
+      home,
+      argv: ['--db-path', '~/posix.db'],
+      env: {},
+      warn: () => undefined,
+    });
+    assert.equal(posix.dbPath, join(home, 'posix.db'));
+
+    const win = resolveConfig({
+      home,
+      argv: ['--db-path', '~\\win.db'],
+      env: {},
+      warn: () => undefined,
+    });
+    assert.equal(win.dbPath, join(home, 'win.db'));
+  });
 });

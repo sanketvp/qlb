@@ -90,7 +90,6 @@
 // renamed, because H2 is strictly after C and rollback restores native
 // strictly before unlinking the owner file.
 
-import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
   chmodSync,
@@ -107,7 +106,7 @@ import {
 import { dirname, join, resolve, sep } from 'node:path';
 import { config } from './config';
 import type { KeychainBackend } from './keychain';
-import { qlbKeychainService } from './keychain';
+import { openRouterMissingKeyMessage, qlbKeychainService, readNativeOpenRouterKey } from './keychain';
 import { parseGrant } from './refresh-lease';
 import type { Store } from './store';
 import type { Grant } from './types';
@@ -135,9 +134,10 @@ export const PI_POOL_STORE = 'pi-pool';
  *
  * Static-key providers (OpenRouter) are a third shape, NOT stuffed into Grant:
  *
- *   openrouter — a single static API key in macOS Keychain service
+ *   openrouter — a single static API key in the platform credential store
+ *                (macOS Keychain / libsecret / DPAPI file) service
  *                `pi-openrouter`. No OAuth, no refresh token, no expiry,
- *                no refresh-lease. Native source is Keychain (READ-ONLY);
+ *                no refresh-lease. Native source is READ-ONLY;
  *                QLB never writes `pi-openrouter`. Ownership is recorded in
  *                `qlb-owner-openrouter.json` + journal store `pi-openrouter`.
  *                The QLB Keychain payload is `{ type: 'api-key', access }`
@@ -280,8 +280,8 @@ export interface MigrationConfig {
   /**
    * Static-key (OpenRouter): injectable native-key reader.
    * Tests MUST pass a function that returns a fake key. The CLI passes
-   * `readOpenRouterNativeKey` (read-only `security find-generic-password
-   * -s pi-openrouter -w`). Never writes the native service.
+   * `readOpenRouterNativeKey` (read-only platform lookup of `pi-openrouter`).
+   * Never writes the native service.
    */
   readNativeKey?: () => string;
 }
@@ -384,26 +384,14 @@ export function grantViewFromApiKeyPayload(raw: string): Grant {
 }
 
 /**
- * READ-ONLY lookup of the native OpenRouter API key from macOS Keychain
- * service `pi-openrouter`. Never writes that service or any `qlb:openrouter:*`
+ * READ-ONLY lookup of the native OpenRouter API key from the platform
+ * credential store (macOS Keychain service `pi-openrouter`, or the Linux/
+ * Windows equivalent). Never writes that service or any `qlb:openrouter:*`
  * entry. Automated tests MUST NOT call this — inject a fake `readNativeKey`
  * into `createStaticKeyMigration` instead.
  */
 export function readOpenRouterNativeKey(): string {
-  try {
-    const stdout = execFileSync(
-      'security',
-      ['find-generic-password', '-s', NATIVE_OPENROUTER_KEYCHAIN_SERVICE, '-w'],
-      { encoding: 'utf8' },
-    );
-    const key = String(stdout).replace(/\n$/, '').trim();
-    if (key.length > 0) return key;
-  } catch {
-    // Normalize Keychain lookup failures without exposing command output.
-  }
-  throw new Error(
-    `OpenRouter key not found in macOS Keychain (service ${NATIVE_OPENROUTER_KEYCHAIN_SERVICE})`,
-  );
+  return readNativeOpenRouterKey(NATIVE_OPENROUTER_KEYCHAIN_SERVICE);
 }
 
 export function stagingOwnerPath(ownerFilePath: string): string {
@@ -1020,9 +1008,7 @@ export class Migration {
     }
     const key = this.readNativeKey().trim();
     if (!key) {
-      throw new Error(
-        `OpenRouter key not found in macOS Keychain (service ${NATIVE_OPENROUTER_KEYCHAIN_SERVICE})`,
-      );
+      throw new Error(openRouterMissingKeyMessage(NATIVE_OPENROUTER_KEYCHAIN_SERVICE));
     }
     const id = ADAPTER_ACCOUNT_IDS[this.provider];
     const label = ADAPTER_ACCOUNT_LABELS[this.provider];

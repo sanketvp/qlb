@@ -1,7 +1,5 @@
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
-
 import { config } from '../config';
+import { openRouterMissingKeyMessage, readNativeOpenRouterKey } from '../keychain';
 import { fetchAndCache } from '../single-flight';
 import { getStore } from '../store';
 import type { AccountSnapshot, Adapter, BucketReading } from '../types';
@@ -11,12 +9,9 @@ const CREDITS_URL = 'https://openrouter.ai/api/v1/credits';
 const TIMEOUT_MS = 10_000;
 const ACCOUNT_ID = 'openrouter-default';
 const LABEL = 'OpenRouter';
-const KEY_MISSING_ERROR =
-  `OpenRouter key not found in macOS Keychain (service ${KEYCHAIN_SERVICE})`;
+const KEY_MISSING_ERROR = openRouterMissingKeyMessage(KEYCHAIN_SERVICE);
 const CREDIT_DETAIL =
   'OpenRouter account-wide credit balance from /api/v1/credits; not a rolling request/token rate-limit window';
-
-const execFileAsync = promisify(execFile);
 
 type FetchFn = typeof fetch;
 type FetchAndCacheFn = (
@@ -40,18 +35,7 @@ export interface OpenRouterAdapterDeps {
 }
 
 async function readKeyFromKeychain(): Promise<string> {
-  try {
-    const result = await execFileAsync(
-      'security',
-      ['find-generic-password', '-s', KEYCHAIN_SERVICE, '-w'],
-      { encoding: 'utf8' },
-    );
-    const key = String(result.stdout).trim();
-    if (key.length > 0) return key;
-  } catch {
-    // Normalize Keychain lookup failures without exposing command output.
-  }
-  throw new Error(KEY_MISSING_ERROR);
+  return readNativeOpenRouterKey(KEYCHAIN_SERVICE);
 }
 
 function errorSnapshot(reason: string): AccountSnapshot {

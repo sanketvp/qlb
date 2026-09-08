@@ -9,7 +9,7 @@ import {
   isSingleGrantProvider,
   isStaticKeyProvider,
 } from './migration';
-import { macosKeychain } from './keychain';
+import { platformKeychain } from './keychain';
 import type { Store } from './store';
 import type { AccountSnapshot } from './types';
 
@@ -76,16 +76,16 @@ export function readOwnership(store: Store, provider: string): string {
   try {
     const ownerFile = defaultOwnerFileFor(provider);
     const mig = isStaticKeyProvider(provider)
-      ? createStaticKeyMigration(store, macosKeychain, provider, ownerFile, () => '')
+      ? createStaticKeyMigration(store, platformKeychain, provider, ownerFile, () => '')
       : isSingleGrantProvider(provider)
         ? createSingleGrantMigration(
             store,
-            macosKeychain,
+            platformKeychain,
             provider,
             DEFAULT_AUTH_JSON,
             ownerFile,
           )
-        : new Migration(store, macosKeychain, DEFAULT_POOL_FILE, ownerFile);
+        : new Migration(store, platformKeychain, DEFAULT_POOL_FILE, ownerFile);
     return mig.status().state;
   } catch {
     return 'unknown';

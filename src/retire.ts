@@ -15,7 +15,7 @@ import { createHash } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { existsSync, readFileSync, renameSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, join, resolve, sep } from 'node:path';
+import { dirname, join, parse, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
 
 import { CODEX_GATE_CONFIG_KEY } from './codex-gate';
@@ -247,7 +247,8 @@ function assertSafeFilePath(nativePath: string): string {
     refuse('REFUSED: nativePathToRemove is required');
   }
   const resolved = resolve(nativePath);
-  if (resolved === '/' || resolved === homedir() || resolved === dirname(homedir())) {
+  const root = parse(resolved).root;
+  if (resolved === root || resolved === homedir() || resolved === dirname(homedir())) {
     refuse(`REFUSED: nativePathToRemove is not a credential file: ${resolved}`);
   }
   if (resolved.endsWith(sep)) {

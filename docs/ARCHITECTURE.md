@@ -20,8 +20,8 @@ QLB gives one answer to the question *"which account should serve this request?"
 └───────────────────┘   └────────────────────┘   ┌──────────▼───────────┐
                                                  │ consumers:           │
          credentials ────────────────────────▶   │  qlb resolve (CLI)   │
-         macOS Keychain (grants, CAS-fenced      │  qlb proxy (loopback │
-         refresh lease)                          │   HTTP for harnesses)│
+         OS credential store (macOS Keychain /   │  qlb proxy (loopback │
+         libsecret / DPAPI; CAS-fenced refresh)  │   HTTP for harnesses)│
                                                  └──────────────────────┘
 ```
 
@@ -124,7 +124,7 @@ The same claim coalesces N concurrent callers *inside one process* as well: the 
 
 ## Credential ownership and the fenced refresh
 
-When a user opts in (always via an explicit migration flow), QLB takes ownership of OAuth grants: each grant lives as a JSON payload in a macOS Keychain item (`service qlb:<provider>:<accountId>`), and the journal in SQLite records a monotonically increasing `grant_generation` per account.
+When a user opts in (always via an explicit migration flow), QLB takes ownership of OAuth grants: each grant lives as a JSON payload in the platform credential store (`service qlb:<provider>:<accountId>` — macOS Keychain, Linux libsecret or encrypted-file fallback, Windows DPAPI), and the journal in SQLite records a monotonically increasing `grant_generation` per account.
 
 Two mechanisms with two distinct jobs protect concurrent refreshes (`src/refresh-lease.ts`):
 

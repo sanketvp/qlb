@@ -2,6 +2,19 @@
 
 QLB can optionally take **ownership** of your provider credentials — holding OAuth grants itself, refreshing them, and injecting them per request. That is the most useful thing it does and the most sensitive, so its rules around credentials are deliberately strict. This document explains exactly what QLB will and will not do, and what happens if it crashes at the worst possible moment.
 
+## Where QLB stores the secrets it owns
+
+QLB-owned grants (the `qlb:<provider>:<accountId>` items written by `qlb migrate`) live in an OS-specific backend. The public API (`keychainSet` / `keychainGet` / `keychainDelete`) is the same on every platform; only the storage changes.
+
+| Platform | Backend | What actually protects the secret |
+|---|---|---|
+| macOS | Keychain via the `security` CLI | The macOS Keychain, unlocked with your login keychain. Strongest of the three. |
+| Windows | DPAPI via PowerShell (`ConvertTo-SecureString` / `ConvertFrom-SecureString`), blobs in `%USERPROFILE%\.qlb\credentials-windows.json` | Data Protection API, bound to the Windows user login. Comparable in intent to Keychain: another logged-in user on the same machine cannot decrypt the blobs. |
+| Linux (preferred) | `secret-tool` (libsecret / GNOME Keyring) when `secret-tool` is on `PATH` | The session keyring. Similar idea to Keychain, but only if a libsecret daemon is actually running. |
+| Linux (fallback) | AES-256-GCM file at `~/.qlb/credentials-linux.json`, key in `~/.qlb/.credkey` (both mode 0600) | **Encrypted at rest, not OS-keychain-protected.** The key is a random 32-byte file created on first use. Anyone who can read both files — the same user, root, or a copied home directory — can decrypt the secrets. There is no passphrase, TPM, or login-session binding. Prefer `secret-tool` when you can install it. |
+
+The Linux file fallback exists so QLB still runs on servers and distros without GNOME Keyring. Do not treat it as equivalent to Keychain or DPAPI. Native (non-QLB) OpenRouter keys are looked up in the same backend (macOS: Keychain service `pi-openrouter`; Linux/Windows: service `pi-openrouter`, account `qlb`). QLB never writes that native item.
+
 ## The default is read-only
 
 Out of the box, QLB never modifies a credential. The provider adapters *discover* credential sources — a pool JSON file, an `auth.json` entry, a Keychain service — and read them to fetch usage numbers. They do not write, move, rename, or refresh anything. If a grant is expired, QLB reports the account as needing re-login rather than trying to refresh a grant it doesn't own.

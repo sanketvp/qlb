@@ -1,9 +1,10 @@
 #!/usr/bin/env node
+import { join } from 'node:path';
 import { adapters } from './adapters';
 import { createDefaultCodexGateDeps, runCodexGate } from './codex-gate';
 import { config, stripConfigArgs } from './config';
 import { doctorQlb, initializeQlb, type DoctorReport, type InitReport } from './diagnostics';
-import { macosKeychain } from './keychain';
+import { platformKeychain } from './keychain';
 import { createOwnedCredentialSource } from './credentials';
 import {
   DEFAULT_AUTH_JSON,
@@ -247,15 +248,15 @@ function parseMigrateArgs(args: string[]): MigrateOpts {
   const provider: MigrateProvider = providerRawOrDefault;
 
   if (targetDir) {
-    const dir = targetDir.replace(/\/$/, '');
+    const dir = targetDir.replace(/[/\\]+$/, '');
     if (!ownerFile) {
       ownerFile =
         provider === 'anthropic'
-          ? `${dir}/qlb-owner.json`
-          : `${dir}/qlb-owner-${provider}.json`;
+          ? join(dir, 'qlb-owner.json')
+          : join(dir, `qlb-owner-${provider}.json`);
     }
-    if (!poolFile) poolFile = `${dir}/anthropic-pool.json`;
-    if (!authJson) authJson = `${dir}/auth.json`;
+    if (!poolFile) poolFile = join(dir, 'anthropic-pool.json');
+    if (!authJson) authJson = join(dir, 'auth.json');
   }
 
   return {
@@ -871,7 +872,7 @@ async function runMigrate(opts: MigrateOpts): Promise<number> {
     const mig = isStaticKeyProvider(opts.provider)
       ? createStaticKeyMigration(
           store,
-          macosKeychain,
+          platformKeychain,
           opts.provider,
           opts.ownerFile,
           readOpenRouterNativeKey,
@@ -879,12 +880,12 @@ async function runMigrate(opts: MigrateOpts): Promise<number> {
       : isSingleGrantProvider(opts.provider)
         ? createSingleGrantMigration(
             store,
-            macosKeychain,
+            platformKeychain,
             opts.provider,
             opts.authJson,
             opts.ownerFile,
           )
-        : new Migration(store, macosKeychain, opts.poolFile, opts.ownerFile);
+        : new Migration(store, platformKeychain, opts.poolFile, opts.ownerFile);
     let status;
     switch (opts.sub) {
       case 'stage':
@@ -991,7 +992,7 @@ async function runProxy(opts: ProxyOpts): Promise<number> {
     idleTimeoutMs: opts.idleMs,
     getCredentialForAccount: createOwnedCredentialSource({
       store,
-      keychain: macosKeychain,
+      keychain: platformKeychain,
     }),
     onIdle: () => {
       if (opened) store.close();

@@ -210,4 +210,15 @@ describe('CLI smoke — documented commands', () => {
     assert.match(text, /npm link/);
     assert.match(text, /qlb init/);
   });
+
+  it('install.ps1 encodes the documented Windows installer steps', () => {
+    const script = join(__dirname, '..', '..', 'scripts', 'install.ps1');
+    assert.ok(existsSync(script));
+    const text = readFileSync(script, 'utf8');
+    assert.match(text, /Node\.js >= 22/);
+    assert.match(text, /npm ci/);
+    assert.match(text, /npm run build/);
+    assert.match(text, /npm link/);
+    assert.match(text, /qlb init/);
+  });
 });

@@ -129,7 +129,11 @@ function atomicWrite0600(path: string, contents: string): void {
   }
   const tmp = `${path}.tmp.${process.pid}`;
   writeFileSync(tmp, contents, { encoding: 'utf8' });
-  chmodSync(tmp, 0o600);
+  try {
+    chmodSync(tmp, 0o600);
+  } catch {
+    // Windows cannot honor Unix modes.
+  }
   renameSync(tmp, path);
   try {
     chmodSync(path, 0o600);

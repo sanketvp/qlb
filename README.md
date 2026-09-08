@@ -8,8 +8,11 @@ QLB ships with five built-in provider adapters (Claude/Anthropic, Codex, Grok/xA
 
 ## Requirements
 
-- Node.js 22 or newer
-- macOS for Keychain-backed credentials (other status and configuration features remain usable elsewhere)
+- Node.js 22 or newer on macOS, Linux, or Windows
+- A per-OS credential backend (QLB picks this automatically):
+  - **macOS:** Keychain via the `security` CLI (OS-native, strongest of the three)
+  - **Windows:** DPAPI via PowerShell (tied to the Windows user login)
+  - **Linux:** `secret-tool` / libsecret when available; otherwise an AES-256-GCM file at `~/.qlb/credentials-linux.json` whose key lives in `~/.qlb/.credkey` (mode 0600). The file fallback is encrypted at rest but **not** OS-keychain-protected — see [Credential Safety](docs/CREDENTIAL-SAFETY.md).
 
 ## Quickstart
 
@@ -32,10 +35,14 @@ qlb resolve --model claude-sonnet-5 --json
 Or run the idempotent installer (Node.js >= 22, `npm ci`/`npm install`, build, optional global `npm link`, then `qlb init`):
 
 ```bash
-bash scripts/install.sh
+bash scripts/install.sh          # macOS / Linux
 ```
 
-If `npm link` cannot write a global bin, the script prints fallbacks (`PATH`, `sudo`, or `npx`) and still bootstraps via `node dist/cli.js init`.
+```powershell
+powershell -File scripts/install.ps1   # Windows
+```
+
+If `npm link` cannot write a global bin, the script prints fallbacks (`PATH`, elevated prompt / `sudo`, or `npx`) and still bootstraps via `node dist/cli.js init`.
 
 `qlb init` detects existing credential sources, reports anything missing, and writes a reviewable starter file at `~/.qlb/config.json`. It never prompts, so it is safe to use in scripts and CI. `qlb doctor` performs local checks only by default; add `--live` to opt into provider network calls.
 

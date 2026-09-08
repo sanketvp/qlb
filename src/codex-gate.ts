@@ -323,9 +323,10 @@ export async function runCodexGate(
 
 async function whichCodexDefault(): Promise<string | null> {
   try {
-    const { stdout } = await execFileAsync('which', ['codex'], { encoding: 'utf8' });
-    const path = stdout.trim();
-    return path.length > 0 ? path : null;
+    const finder = process.platform === 'win32' ? 'where' : 'which';
+    const { stdout } = await execFileAsync(finder, ['codex'], { encoding: 'utf8' });
+    const found = stdout.trim().split(/\r?\n/)[0]?.trim() ?? '';
+    return found.length > 0 ? found : null;
   } catch {
     return null;
   }
