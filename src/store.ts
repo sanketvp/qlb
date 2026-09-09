@@ -189,11 +189,14 @@ export class Store {
     }
 
     this.db = new DatabaseSync(dbPath);
-    if (dbPath !== ':memory:') {
-      this.db.exec('PRAGMA journal_mode = WAL');
-    }
-    this.db.exec('PRAGMA busy_timeout = 5000');
-    this.db.exec('PRAGMA synchronous = NORMAL');
+    try {
+      // Install the busy handler before the first lock-taking SQL operation
+      // after open. Keep this before WAL/schema initialization.
+      this.db.exec('PRAGMA busy_timeout = 5000');
+      if (dbPath !== ':memory:') {
+        this.db.exec('PRAGMA journal_mode = WAL');
+      }
+      this.db.exec('PRAGMA synchronous = NORMAL');
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS accounts (
         id TEXT PRIMARY KEY,
@@ -400,6 +403,14 @@ export class Store {
       'DELETE FROM poll_claims WHERE account_id = ?',
     );
     this.deleteLeaseByNameStmt = this.db.prepare('DELETE FROM leases WHERE name = ?');
+    } catch (err) {
+      try {
+        this.db.close();
+      } catch {
+        // Best-effort cleanup; preserve the original initialization error.
+      }
+      throw err;
+    }
   }
 
   /**

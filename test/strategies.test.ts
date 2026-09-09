@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Worker } from 'node:worker_threads';
@@ -196,6 +196,82 @@ describe('strategy: round-robin', () => {
       ),
     );
     assert.equal(new Set(results).size, count);
+  });
+
+  it('T4 drains 25 rounds of 8 worker-thread constructor/index lifecycles', { timeout: 30_000 }, async () => {
+    const rounds = 25;
+    const count = 8;
+    const workerPath = join(__dirname, '..', 'src', 'store.js');
+    let completedRounds = 0;
+    for (let round = 0; round < rounds; round++) {
+      const dir = mkdtempSync(join(tmpdir(), `qlb-rr-t4-${round}-`));
+      const dbPath = join(dir, 'qlb.db');
+      const setup = openStore(dbPath);
+      setup.close();
+      try {
+        const workers = Array.from({ length: count }, (_, workerIndex) =>
+          new Promise<{
+            workerIndex: number;
+            value?: number;
+            code: number;
+            signal: string | null;
+            error?: string;
+            timedOut: boolean;
+          }>((resolve) => {
+            let value: number | undefined;
+            let workerError: string | undefined;
+            let timedOut = false;
+            const worker = new Worker(
+              `
+              const { openStore } = require(${JSON.stringify(workerPath)});
+              const { parentPort, workerData } = require('node:worker_threads');
+              const store = openStore(workerData.dbPath);
+              try {
+                parentPort.postMessage(store.nextRoundRobinIndex(workerData.key, workerData.count));
+              } finally {
+                store.close();
+              }
+              `,
+              {
+                eval: true,
+                workerData: { dbPath, key: 'round-robin:t4', count: 1000 },
+              },
+            );
+            worker.on('message', (idx: number) => { value = idx; });
+            worker.on('error', (err) => {
+              workerError = err instanceof Error ? err.stack || err.message : String(err);
+            });
+            const timer = setTimeout(() => {
+              timedOut = true;
+              void worker.terminate();
+            }, 10_000);
+            worker.once('exit', (code) => {
+              clearTimeout(timer);
+              resolve({
+                workerIndex,
+                value,
+                code,
+                signal: null,
+                error: workerError,
+                timedOut,
+              });
+            });
+          }),
+        );
+        const outcomes = await Promise.all(workers);
+        const failures = outcomes.filter((row) =>
+          row.timedOut || row.code !== 0 || row.error !== undefined || row.value === undefined,
+        );
+        assert.deepEqual(failures, [], `round ${round} lifecycle failures: ${JSON.stringify(outcomes)}`);
+        const values = outcomes.map((row) => row.value as number);
+        assert.equal(values.length, count, `round ${round} values`);
+        assert.equal(new Set(values).size, count, `round ${round} distinct indices`);
+        completedRounds += 1;
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+    assert.equal(completedRounds, rounds);
   });
 });
 
