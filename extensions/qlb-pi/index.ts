@@ -57,10 +57,14 @@ import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { streamWithAuthRetry } from "./auth-retry.js";
 import {
   accountFg,
+  buildExpandPanelLines,
   buildFooterLines,
+  EXPAND_SHORTCUT,
   parseDoctorJson,
   readAccountFooterData,
   readCheapHealth,
+  readExpandPanelData,
+  type ExpandPanelData,
   type HealthFooterData,
 } from "./footer.js";
 import { classifyHttpStatus } from "./outcome.js";
@@ -235,7 +239,18 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 
   let lastDecision: ResolveOk | null = null;
   let footerModelId: string | undefined;
+  let footerExpanded = false;
+  let requestFooterRender: (() => void) | null = null;
   let builtin: StreamSimple;
+
+  const toggleFooterExpand = () => {
+    try {
+      footerExpanded = !footerExpanded;
+      requestFooterRender?.();
+    } catch {
+      // fail-open: leave the compact footer as-is
+    }
+  };
   pi.on("model_select", (event) => {
     footerModelId = event.model.id;
   });
@@ -359,9 +374,21 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   });
 
   pi.registerCommand("qlb", {
-    description: "QLB status / migrate status (read-only). Subcommands: status, migrate",
+    description:
+      "QLB status / migrate status (read-only). Subcommands: status, migrate, expand",
     handler: async (args: string, ctx: ExtensionCommandContext) => {
       const [sub] = args.trim().split(/\s+/);
+      if (sub === "expand" || sub === "details") {
+        try {
+          toggleFooterExpand();
+        } catch (err) {
+          ctx.ui.notify(
+            `qlb expand failed: ${err instanceof Error ? err.message : String(err)}`,
+            "error",
+          );
+        }
+        return;
+      }
       try {
         const argv = sub === "migrate" ? ["migrate", "status", "--json"] : ["status", "--json"];
         const result = await runQlb(argv);
@@ -378,6 +405,20 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     },
   });
 
+  // ctrl+q is app.message.followUp; ctrl+shift+letter is often indistinguishable
+  // from ctrl+letter in tmux/legacy terminals. ctrl+alt+q is unused in Pi's
+  // KEYBINDINGS and is the same class of binding as plan-mode's ctrl+alt+p.
+  try {
+    pi.registerShortcut(EXPAND_SHORTCUT, {
+      description: "Toggle QLB footer details",
+      handler: () => {
+        toggleFooterExpand();
+      },
+    });
+  } catch (err) {
+    console.error("[qlb-pi] failed to register expand shortcut:", err);
+  }
+
   const installFooter = (ctx: ExtensionContext) => {
     if (typeof ctx.ui.setFooter !== "function") return;
     try {
@@ -387,10 +428,33 @@ export default async function (pi: ExtensionAPI): Promise<void> {
           currentModel: footerModelId || ctx.model?.id,
         });
         let cachedHealth: HealthFooterData = readCheapHealth();
+        let cachedExpand: ExpandPanelData | null = null;
+        let expandFailed = false;
         let lastSnapKey = "";
         let disposed = false;
         let healthFetchedAt = 0;
         let healthInFlight = false;
+
+        requestFooterRender = () => {
+          if (!disposed) tui.requestRender();
+        };
+
+        const refreshExpand = () => {
+          if (disposed) return;
+          try {
+            let sessionId: string | undefined;
+            try {
+              sessionId = ctx.sessionManager?.getSessionId?.() || undefined;
+            } catch {
+              sessionId = undefined;
+            }
+            cachedExpand = readExpandPanelData({ sessionId, limit: 5 });
+            expandFailed = cachedExpand == null;
+          } catch {
+            cachedExpand = null;
+            expandFailed = true;
+          }
+        };
 
         // Worktree-safe repo name, duplicated from anthropic-pool: Pi's jiti
         // loader cannot import across extensions. `git rev-parse --git-common-dir`
@@ -471,6 +535,9 @@ export default async function (pi: ExtensionAPI): Promise<void> {
           } catch {
             // fail-open: keep previous snapshot
           }
+          if (footerExpanded) {
+            refreshExpand();
+          }
           if (Date.now() - healthFetchedAt > 60_000) {
             refreshDoctor();
           }
@@ -499,7 +566,11 @@ export default async function (pi: ExtensionAPI): Promise<void> {
             "|" +
             branch +
             "|" +
-            (repoNameCache.get(ctx.cwd) || "");
+            (repoNameCache.get(ctx.cwd) || "") +
+            "|" +
+            (footerExpanded ? "1" : "0") +
+            "|" +
+            (footerExpanded ? JSON.stringify(cachedExpand) : "");
           if (key !== lastSnapKey) {
             lastSnapKey = key;
             tui.requestRender();
@@ -518,6 +589,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
         return {
           dispose: () => {
             disposed = true;
+            if (requestFooterRender) requestFooterRender = null;
             clearInterval(timer);
             try {
               unsub();
@@ -562,7 +634,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
               }
               const repo =
                 repoNameCache.get(ctx.cwd) || ctx.cwd.split("/").pop() || ctx.cwd;
-              return buildFooterLines({
+              const compact = buildFooterLines({
                 width,
                 session: { sessionId, repo, branch, contextPercent },
                 account: cachedAccount,
@@ -575,6 +647,28 @@ export default async function (pi: ExtensionAPI): Promise<void> {
                 truncate: truncateToWidth,
                 visible: visibleWidth,
               });
+              if (!footerExpanded) return compact;
+              try {
+                if (!cachedExpand && !expandFailed) refreshExpand();
+                const extra = buildExpandPanelLines({
+                  width,
+                  data: expandFailed ? null : cachedExpand,
+                  health: cachedHealth,
+                  selectedAccountId: cachedAccount?.accountId,
+                  shortcut: EXPAND_SHORTCUT,
+                  paintAccount: (text) => accountFg(index, text),
+                  paintDim: (text) => theme.fg("dim", text),
+                  paintWarn: (text) => theme.fg("warning", text),
+                  paintAccent: (text) => theme.fg("accent", text),
+                  truncate: truncateToWidth,
+                });
+                return [...extra, ...compact];
+              } catch {
+                return [
+                  truncateToWidth("unable to load QLB details", width),
+                  ...compact,
+                ];
+              }
             } catch {
               return ["", ""];
             }

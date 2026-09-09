@@ -14,8 +14,11 @@ import {
 } from '../extensions/qlb-pi/constants';
 import {
   accountColorIndex,
+  buildExpandPanelLines,
   buildFooterLines,
   EMPTY_HEALTH,
+  EXPAND_SHORTCUT,
+  formatAllUsage,
   formatHealthText,
   formatUsage,
   parseDoctorJson,
@@ -270,5 +273,123 @@ describe('qlb-pi footer helpers', () => {
     assert.match(mid[1], /5h 12%/);
     assert.match(mid[1], /1 drift/);
     assert.equal(mid[1].includes('8 accts'), false);
+  });
+
+  it('keeps per-account native-sync drift from doctor JSON', () => {
+    const parsed = parseDoctorJson(JSON.stringify({
+      overall: 'WARN',
+      checks: [
+        { name: 'native-sync:account-1', level: 'PASS', message: 'matches' },
+        { name: 'native-sync:xai-default', level: 'WARN', message: 'native drifted' },
+        { name: 'native-sync:kimi-default', level: 'FAIL', message: 'unreadable' },
+      ],
+    }));
+    assert.equal(parsed.drifts?.length, 3);
+    assert.deepEqual(parsed.drifts?.map((d) => d.accountId), [
+      'account-1',
+      'xai-default',
+      'kimi-default',
+    ]);
+    assert.equal(parsed.drifts?.[1]?.level, 'WARN');
+    assert.equal(parsed.drifts?.[2]?.level, 'FAIL');
+  });
+
+  it('formats every usage bucket, not just the compact pair', () => {
+    assert.equal(
+      formatAllUsage([
+        { key: '7d:Fable', usedPct: 21 },
+        { key: '7d', usedPct: 31 },
+        { key: '5h', usedPct: 41 },
+      ]),
+      '5h 41% · 7d 31% · 7d:Fable 21%',
+    );
+  });
+
+  it('renders the expand panel with all providers, drift, and decisions', () => {
+    const identity = (s: string) => s;
+    const lines = buildExpandPanelLines({
+      width: 100,
+      data: {
+        ownershipByProvider: {
+          anthropic: 'QLB_OWNED',
+          xai: 'QLB_OWNED',
+          'kimi-coding': 'QLB_OWNED',
+          'openai-codex': 'QLB_OWNED',
+          openrouter: 'QLB_OWNED',
+        },
+        accounts: [
+          {
+            accountId: 'account-3',
+            provider: 'anthropic',
+            label: 'sanket.patel@gmail.com',
+            ownership: 'QLB_OWNED',
+            buckets: [{ key: '5h', usedPct: 41 }, { key: '7d', usedPct: 31 }],
+          },
+          {
+            accountId: 'xai-default',
+            provider: 'xai',
+            label: 'Grok (xAI)',
+            ownership: 'QLB_OWNED',
+            buckets: [{ key: 'tokens', usedPct: 0 }],
+          },
+        ],
+        decisions: [
+          {
+            id: 855,
+            ts: Date.parse('2026-09-09T12:03:09Z'),
+            session: '',
+            accountId: 'account-3',
+            model: 'claude-fable-5-1',
+            mode: 'headroom',
+            reason: 'headroom score 29.4',
+          },
+        ],
+      },
+      health: {
+        ...EMPTY_HEALTH,
+        overall: 'WARN',
+        nativeSyncWarn: 1,
+        drifts: [
+          { accountId: 'account-1', level: 'PASS', message: 'matches' },
+          { accountId: 'xai-default', level: 'WARN', message: 'native drifted' },
+        ],
+      },
+      selectedAccountId: 'account-3',
+      shortcut: EXPAND_SHORTCUT,
+      paintAccount: identity,
+      paintDim: identity,
+      paintWarn: identity,
+      paintAccent: identity,
+      truncate: (text, width) => text.slice(0, width),
+    });
+    const text = lines.join('\n');
+    assert.match(text, /qlb details/);
+    assert.match(text, /ctrl\+alt\+q/);
+    assert.match(text, /anthropic  QLB_OWNED/);
+    assert.match(text, /xai  QLB_OWNED/);
+    assert.match(text, /kimi-coding  QLB_OWNED/);
+    assert.match(text, /openai-codex  QLB_OWNED/);
+    assert.match(text, /openrouter  QLB_OWNED/);
+    assert.match(text, /★ sanket.patel/);
+    assert.match(text, /5h 41%/);
+    assert.match(text, /xai-default  WARN  native drifted/);
+    assert.equal(text.includes('account-1  PASS'), false);
+    assert.match(text, /#855/);
+    assert.match(text, /claude-fable-5-1/);
+    assert.match(text, /headroom score 29.4/);
+  });
+
+  it('shows a fail-open message when expand data cannot be loaded', () => {
+    const identity = (s: string) => s;
+    const lines = buildExpandPanelLines({
+      width: 40,
+      data: null,
+      paintAccount: identity,
+      paintDim: identity,
+      paintWarn: identity,
+      paintAccent: identity,
+      truncate: (text, width) => text.slice(0, width),
+    });
+    assert.deepEqual(lines, ['unable to load QLB details']);
   });
 });
