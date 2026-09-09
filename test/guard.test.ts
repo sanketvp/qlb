@@ -5,20 +5,12 @@ import { describe, it } from 'node:test';
 
 const support = join(__dirname, '..', '..', 'test', 'support');
 const guard = join(support, 'guard.cjs');
-const inert = join(support, 'guard-inert-selftest.cjs');
 
 describe('T-GUARD-1 isolation guard', () => {
-  it('inert capture proofs deny bypass shapes without live I/O', () => {
-    const r = spawnSync(process.execPath, [inert], {
-      encoding: 'utf8',
-      timeout: 10_000,
-    });
-    assert.equal(r.status, 0, r.stderr || r.stdout);
-    const report = JSON.parse(r.stdout) as { ok: boolean; failures: string[] };
-    assert.equal(report.ok, true);
-    assert.deepEqual(report.failures, []);
-  });
-
+  // The stub-first inert bypass matrix is intentionally executed as a
+  // separate preflight (`node test/support/guard-inert-selftest.cjs`) before
+  // this guarded suite. Running it as a child here would correctly propagate
+  // the already-loaded guard before the script can install inert stubs.
   it('denies spawn(sh) in a guarded child', () => {
     const r = spawnSync(process.execPath, ['--require', guard, '-e', "require('child_process').exec('true')"], {
       encoding: 'utf8',
@@ -26,6 +18,19 @@ describe('T-GUARD-1 isolation guard', () => {
     });
     assert.notEqual(r.status, 0);
     assert.match(`${r.stderr}${r.stdout}`, /ISOLATION_DENIED:spawn:sh/);
+  });
+
+  it('explicitly mocks the production native-resync reader by default', () => {
+    const nativeResync = join(__dirname, '..', 'src', 'native-resync.js');
+    const r = spawnSync(process.execPath, ['--require', guard, '-e', `
+      const { createNativeCredentialReader } = require(${JSON.stringify(nativeResync)});
+      createNativeCredentialReader({
+        poolFilePath: '/qlb-inert-native-pool',
+        authJsonPath: '/qlb-inert-native-auth',
+      });
+    `], { encoding: 'utf8', timeout: 10_000 });
+    assert.notEqual(r.status, 0);
+    assert.match(`${r.stderr}${r.stdout}`, /ISOLATION_DENIED:native:default-native-reader/);
   });
 
   it('allows a test-owned loopback fixture in one process', () => {

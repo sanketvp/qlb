@@ -3,6 +3,7 @@
 // test-owned 127.0.0.1/::1 listeners only, effective URL+options destinations.
 
 const Module = require('module');
+const fs = require('fs');
 const path = require('path');
 const http = require('http');
 const https = require('https');
@@ -133,6 +134,9 @@ function wrapClient(mod) {
     const options = rest && rest[0] && typeof rest[0] === 'object' && typeof rest[0] !== 'function'
       ? rest[0]
       : undefined;
+    if ((urlOrOpts && typeof urlOrOpts === 'object' && urlOrOpts.socketPath) || options?.socketPath) {
+      denied('net', 'unix');
+    }
     assertOwnedLoopback(effectiveDestination(urlOrOpts, options), 'http');
   }
   mod.request = function guardedRequest(urlOrOpts, ...rest) {
@@ -149,18 +153,22 @@ wrapClient(https);
 
 function wrapNetConnect(orig) {
   return function guardedConnect(...args) {
-    const first = args[0];
+    // Node's own net.createConnection normalizes options into a single array
+    // argument before delegating to Socket.prototype.connect.
+    const inspectedArgs = Array.isArray(args[0]) ? args[0] : args;
+    const first = inspectedArgs[0];
     let host = null;
     let port = null;
     if (typeof first === 'number') {
       port = first;
-      host = typeof args[1] === 'string' ? args[1] : '127.0.0.1';
+      host = typeof inspectedArgs[1] === 'string' ? inspectedArgs[1] : '127.0.0.1';
     } else if (typeof first === 'string' && first.startsWith('/')) {
       denied('net', 'unix');
     } else if (typeof first === 'string') {
       host = first;
-      port = typeof args[1] === 'number' ? args[1] : null;
+      port = typeof inspectedArgs[1] === 'number' ? inspectedArgs[1] : null;
     } else if (first && typeof first === 'object') {
+      if (first.path != null) denied('net', 'unix');
       host = first.hostname || first.host || first.address;
       port = first.port;
     }
@@ -169,27 +177,33 @@ function wrapNetConnect(orig) {
   };
 }
 
+const origSocketConnect = net.Socket.prototype.connect;
+net.Socket.prototype.connect = wrapNetConnect(origSocketConnect);
 net.connect = wrapNetConnect(net.connect);
 net.createConnection = wrapNetConnect(net.createConnection);
 tls.connect = wrapNetConnect(tls.connect);
 
 if (typeof globalThis.fetch === 'function') {
   const origFetch = globalThis.fetch;
-  globalThis.fetch = async function guardedFetch(input, init) {
+  globalThis.fetch = function guardedFetch(input, init) {
     const url = typeof input === 'string' || input instanceof URL
       ? String(input)
       : (input && input.url) || '';
-    assertOwnedLoopback(effectiveDestination(url, init), 'fetch');
+    if (init?.dispatcher || init?.agent) denied('net', 'fetch-custom-transport');
+    // RequestInit hostname/host/port fields are ignored by fetch and therefore
+    // must never override the URL that fetch will actually request.
+    assertOwnedLoopback(effectiveDestination(url), 'fetch');
     const nextInit = { ...(init || {}), redirect: 'manual' };
-    const res = await origFetch.call(this, input, nextInit);
-    if (res && res.status >= 300 && res.status < 400 && typeof res.headers?.get === 'function') {
-      const loc = res.headers.get('location');
-      if (loc) {
-        const abs = new URL(loc, url).toString();
-        assertOwnedLoopback(effectiveDestination(abs), 'fetch-redirect');
+    return Promise.resolve(origFetch.call(this, input, nextInit)).then((res) => {
+      if (res && res.status >= 300 && res.status < 400 && typeof res.headers?.get === 'function') {
+        const loc = res.headers.get('location');
+        if (loc) {
+          const abs = new URL(loc, url).toString();
+          assertOwnedLoopback(effectiveDestination(abs), 'fetch-redirect');
+        }
       }
-    }
-    return res;
+      return res;
+    });
   };
 }
 
@@ -197,13 +211,8 @@ function isNodeExec(file) {
   return typeof file === 'string' && file === process.execPath;
 }
 
-function isInertSelftest(argv) {
-  return (argv || []).some((a) => typeof a === 'string' && path.basename(a) === 'guard-inert-selftest.cjs');
-}
-
 function withPreload(argv) {
   const list = Array.isArray(argv) ? argv.slice() : [];
-  if (isInertSelftest(list)) return list;
   for (let i = 0; i < list.length - 1; i++) {
     if (list[i] === '--require' && path.resolve(String(list[i + 1])) === path.resolve(GUARD_FILE)) {
       return list;
@@ -225,6 +234,7 @@ function wrapSpawn(orig) {
       denied('spawn', typeof file === 'string' ? file : String(file));
     }
     const split = splitSpawn(file, args, options);
+    if (split.opts?.shell) denied('spawn', 'shell');
     return orig.call(this, file, withPreload(split.argv), split.opts);
   };
 }
@@ -293,11 +303,42 @@ Module._load = function guardedLoad(request, parent, isMain) {
         exp.__qlbGuardMocked = true;
       }
     }
-  } catch {
+    if (/[/\\]native-resync\.js$/.test(resolved) && exp && typeof exp.createNativeCredentialReader === 'function') {
+      if (!exp.__qlbGuardNativeReaderMocked) {
+        const productionReader = exp.createNativeCredentialReader;
+        exp.createNativeCredentialReader = function guardedNativeCredentialReader(opts) {
+          const fixtureRoot = process.env.QLB_TEST_NATIVE_READER_ROOT;
+          if (!fixtureRoot) denied('native', 'default-native-reader');
+          const root = fs.realpathSync(path.resolve(fixtureRoot));
+          const underFixtureRoot = (candidate) => {
+            const resolvedPath = path.resolve(String(candidate || ''));
+            const parent = fs.realpathSync(path.dirname(resolvedPath));
+            if (parent !== root && !parent.startsWith(`${root}${path.sep}`)) return false;
+            if (!fs.existsSync(resolvedPath)) return true;
+            const real = fs.realpathSync(resolvedPath);
+            return real.startsWith(`${root}${path.sep}`);
+          };
+          if (!underFixtureRoot(opts?.poolFilePath) || !underFixtureRoot(opts?.authJsonPath)) {
+            denied('native', 'reader-outside-fixture-root');
+          }
+          return productionReader(opts);
+        };
+        exp.__qlbGuardNativeReaderMocked = true;
+      }
+    }
+  } catch (err) {
+    if (err?.code === 'ISOLATION_DENIED') throw err;
     // resolution can fail for builtins
   }
   return exp;
 };
+
+Object.defineProperty(globalThis, '__qlbIsolationGuard', {
+  value: Object.freeze({ path: GUARD_FILE }),
+  configurable: false,
+  enumerable: false,
+  writable: false,
+});
 
 module.exports = {
   isAllowedLoopbackHost,

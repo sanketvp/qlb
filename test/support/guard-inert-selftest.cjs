@@ -2,33 +2,38 @@
 // Inert capture proofs. Install stubs FIRST, then load the guard.
 // Never opens a real socket, never execs a captured subprocess.
 
+const fs = require('fs');
 const http = require('http');
 const net = require('net');
 const cp = require('child_process');
 const path = require('path');
 
 const seen = [];
-http.request = function stubHttp(...args) {
-  seen.push({ transport: 'http.request', args });
-  return { end() {}, on() { return this; } };
-};
+function capture(transport, result) {
+  return function inertCapture(...args) {
+    seen.push({ transport, args });
+    return result;
+  };
+}
+
+http.request = capture('http.request', { end() {}, on() { return this; } });
 http.get = http.request;
-net.connect = function stubNet(...args) {
-  seen.push({ transport: 'net.connect', args });
-  return { on() { return this; }, end() {} };
-};
+net.connect = capture('net.connect', { on() { return this; }, end() {} });
 net.createConnection = net.connect;
-net.Socket.prototype.connect = function stubSock(...args) {
-  seen.push({ transport: 'socket.connect', args });
-  return this;
-};
-const origSpawnSync = cp.spawnSync;
-cp.spawnSync = function stubSpawn(...args) {
-  seen.push({ transport: 'spawnSync', args });
-  return { status: 0, stdout: 'stub', stderr: '' };
-};
+net.Socket.prototype.connect = capture('socket.connect', null);
+net.Server.prototype.listen = capture('server.listen', null);
+globalThis.fetch = capture('fetch', Promise.resolve({ status: 200, headers: { get: () => null } }));
+cp.spawnSync = capture('spawnSync', { status: 0, stdout: 'stub', stderr: '' });
 
 const guard = require('./guard.cjs');
+
+// Register an inert simulation of a fixture-owned listener through the guard's
+// real registration hook. No bind/listen operation occurs.
+const server = new net.Server();
+server.address = () => ({ address: '127.0.0.1', port: 31819, family: 'IPv4' });
+server.listen(0, '127.0.0.1');
+server.emit('listening');
+seen.length = 0;
 
 function run(name, fn) {
   const before = seen.length;
@@ -49,34 +54,71 @@ function run(name, fn) {
 const results = [
   run('external-control', () => http.request('https://external-fixture.invalid')),
   run('unowned-loopback-port', () => http.request('http://127.0.0.1:9/')),
-  run('url-options-override', () => http.request(new URL('http://127.0.0.1:9'), { hostname: 'external-fixture.invalid' })),
-  run('raw-net-bypass', () => net.connect(443, 'external-fixture.invalid')),
+  run('owned-loopback-control', () => http.request('http://127.0.0.1:31819/')),
+  run('url-options-override', () => http.request(new URL('http://127.0.0.1:31819'), { hostname: 'external-fixture.invalid' })),
+  run('direct-socket-connect', () => new net.Socket().connect(443, 'external-fixture.invalid')),
+  run('fetch-ignored-init-hostname', () => fetch('https://external-fixture.invalid/', { hostname: '127.0.0.1', port: 31819 })),
+  run('http-socket-path', () => http.request('http://127.0.0.1:31819/', { socketPath: '/tmp/qlb-inert-not-a-real-socket' })),
+  run('net-path-override', () => net.connect({ host: '127.0.0.1', port: 31819, path: '/tmp/qlb-inert-not-a-real-socket' })),
   run('node-child-preload-propagation', () => cp.spawnSync(process.execPath, ['-e', '/* inert fixture */'], { env: { HOME: process.env.HOME } })),
+  run('node-child-arbitrary-selftest-basename', () => cp.spawnSync(process.execPath, ['-e', '/* inert fixture */', 'guard-inert-selftest.cjs'], { env: { HOME: process.env.HOME } })),
+  run('node-child-shell-option', () => cp.spawnSync(process.execPath, ['-e', '/* inert fixture */'], { shell: true, env: { HOME: process.env.HOME } })),
+  run('non-node-control', () => cp.spawnSync('sh', ['-c', '/* inert */'])),
 ];
+
+const nativeModule = path.join(__dirname, '..', '..', 'dist', 'native-resync.js');
+if (fs.existsSync(nativeModule)) {
+  results.push(run('default-native-reader', () => {
+    const { createNativeCredentialReader } = require(nativeModule);
+    createNativeCredentialReader({
+      poolFilePath: '/qlb-inert-native-pool',
+      authJsonPath: '/qlb-inert-native-auth',
+    });
+  }));
+} else {
+  results.push({
+    name: 'default-native-reader',
+    underlyingStubReached: false,
+    error: { code: 'SELFTEST_SETUP', message: `compiled module missing: ${nativeModule}` },
+    captured: [],
+  });
+}
 
 const hosts = ['localhost', '0', '::', '127.0.0.1', '::1'].map((host) => ({
   host,
   allowed: guard.isAllowedLoopbackHost(host),
 }));
 
+const byName = new Map(results.map((row) => [row.name, row]));
 const failures = [];
-if (results[0].underlyingStubReached || results[0].error?.code !== 'ISOLATION_DENIED') {
-  failures.push('external-control');
+function expectDenied(name) {
+  const row = byName.get(name);
+  if (!row || row.underlyingStubReached || row.error?.code !== 'ISOLATION_DENIED') failures.push(name);
 }
-if (results[1].underlyingStubReached || !/unowned|ISOLATION_DENIED/.test(results[1].error?.message || '')) {
-  failures.push('unowned-loopback-port');
+for (const name of [
+  'external-control',
+  'unowned-loopback-port',
+  'url-options-override',
+  'direct-socket-connect',
+  'fetch-ignored-init-hostname',
+  'http-socket-path',
+  'net-path-override',
+  'node-child-shell-option',
+  'non-node-control',
+  'default-native-reader',
+]) expectDenied(name);
+
+if (!byName.get('owned-loopback-control')?.underlyingStubReached || byName.get('owned-loopback-control')?.error) {
+  failures.push('owned-loopback-control');
 }
-if (results[2].underlyingStubReached || results[2].error?.code !== 'ISOLATION_DENIED') {
-  failures.push('url-options-override');
+for (const name of ['node-child-preload-propagation', 'node-child-arbitrary-selftest-basename']) {
+  const row = byName.get(name);
+  const argv = row?.captured?.[0]?.args?.[1] || [];
+  const injected = Array.isArray(argv)
+    && argv.includes('--require')
+    && argv.some((a) => path.resolve(String(a)) === path.resolve(__dirname, 'guard.cjs'));
+  if (!row?.underlyingStubReached || row.error || !injected) failures.push(name);
 }
-if (results[3].underlyingStubReached || results[3].error?.code !== 'ISOLATION_DENIED') {
-  failures.push('raw-net-bypass');
-}
-const child = results[4];
-const childArgs = child.captured[0]?.args || [];
-const argv = childArgs[1] || [];
-const injected = Array.isArray(argv) && argv.includes('--require') && argv.some((a) => String(a).includes('guard.cjs'));
-if (!injected) failures.push('node-child-preload-propagation');
 if (hosts.find((h) => h.host === 'localhost')?.allowed) failures.push('localhost-not-loopback');
 if (hosts.find((h) => h.host === '0')?.allowed) failures.push('zero-not-loopback');
 if (hosts.find((h) => h.host === '::')?.allowed) failures.push('unspec-not-loopback');
