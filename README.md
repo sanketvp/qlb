@@ -62,6 +62,20 @@ This registers the extension file with Pi — **it is a separate step from insta
 
 Even fully installed this way, the extension is **inert by default**: it only activates when `~/.pi/agent/qlb-owner.json` exists, which is created solely by QLB's own `qlb migrate ... --confirm-real-cutover` flow — never automatically by `pi install`. See [Credential Safety](docs/CREDENTIAL-SAFETY.md) before running that migration.
 
+## qlb-pi footer
+
+Once active, `qlb-pi` replaces Pi's footer with a compact 2-line status view rendered every session (`extensions/qlb-pi/footer.ts` / `index.ts`):
+
+```
+sid:a1b2c3d4 · qlb · main · 42%ctx · claude-opus-5
+★ user@example.com  5h 12% · 7d 38%  ·  4 owned  9 accts  sync ok
+```
+
+- Line 1 is the same identity info Pi's footer already showed: session id, repo, git branch, context-window percent, and the active model.
+- Line 2 is QLB's own summary: the currently selected account (colored, `★`-marked), its top usage buckets, and a rollup of QLB_OWNED store count / total account count / native-credential drift status (`sync ok`, `N drift`, or `FAIL`).
+
+Press **`ctrl+alt+q`** (or run **`/qlb expand`**, alias `/qlb details`) to toggle an expanded detail panel above the compact footer, showing every configured provider grouped by ownership state, each account's full per-bucket usage, any native-sync drift rows from `qlb doctor`, and the last few `qlb resolve` decisions made in this session. Press the same shortcut (or run the command again) to collapse it back to the 2-line view.
+
 ## Installing as a Claude Code plugin
 
 QLB ships a `.claude-plugin/` directory so this repo can act as its own [Claude Code](https://docs.claude.com/en/docs/claude-code) plugin marketplace — no central registry, no separate repo to publish. `.claude-plugin/marketplace.json` declares one plugin (`qlb`) sourced from `./`; `.claude-plugin/plugin.json` is that plugin's manifest, plus a single read-only slash command at `commands/qlb-status.md`.

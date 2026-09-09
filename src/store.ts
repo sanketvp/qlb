@@ -170,6 +170,10 @@ export class Store {
   private readonly listPoliciesByHarnessStmt: StatementSync;
   private readonly getConfigStmt: StatementSync;
   private readonly setConfigStmt: StatementSync;
+  private readonly deleteAccountStmt: StatementSync;
+  private readonly deleteSnapshotsByAccountStmt: StatementSync;
+  private readonly deleteOverridesByAccountStmt: StatementSync;
+  private readonly deletePollClaimsByAccountStmt: StatementSync;
 
   constructor(dbPath: string = DEFAULT_DB_PATH) {
     this.dbPath = dbPath;
@@ -383,6 +387,16 @@ export class Store {
       INSERT INTO config (key, value) VALUES (?, ?)
       ON CONFLICT(key) DO UPDATE SET value = excluded.value
     `);
+    this.deleteAccountStmt = this.db.prepare('DELETE FROM accounts WHERE id = ?');
+    this.deleteSnapshotsByAccountStmt = this.db.prepare(
+      'DELETE FROM snapshots WHERE account_id = ?',
+    );
+    this.deleteOverridesByAccountStmt = this.db.prepare(
+      'DELETE FROM overrides WHERE account_id = ?',
+    );
+    this.deletePollClaimsByAccountStmt = this.db.prepare(
+      'DELETE FROM poll_claims WHERE account_id = ?',
+    );
   }
 
   /**
@@ -726,6 +740,27 @@ export class Store {
 
   setAccountStatus(accountId: string, status: string): void {
     this.setStatusStmt.run(status, accountId);
+  }
+
+  /**
+   * Hard-delete an account and every row referencing it (`snapshots`,
+   * `overrides`, `poll_claims`). Caller (accounts-prune.ts) is responsible
+   * for refusing to call this on a QLB_OWNED account — this method has no
+   * ownership awareness of its own, it just removes rows.
+   */
+  deleteAccountCascade(accountId: string): {
+    accounts: number;
+    snapshots: number;
+    overrides: number;
+    pollClaims: number;
+  } {
+    return this.runImmediate(() => {
+      const snapshots = Number(this.deleteSnapshotsByAccountStmt.run(accountId).changes);
+      const overrides = Number(this.deleteOverridesByAccountStmt.run(accountId).changes);
+      const pollClaims = Number(this.deletePollClaimsByAccountStmt.run(accountId).changes);
+      const accounts = Number(this.deleteAccountStmt.run(accountId).changes);
+      return { accounts, snapshots, overrides, pollClaims };
+    });
   }
 
   getLease(name: string): LeaseRow | null {
