@@ -48,7 +48,11 @@ try {
 
 const guardPath = path.join(buildRoot, 'test/support/guard.cjs');
 const loadedGuard = globalThis.__qlbIsolationGuard;
-if (!loadedGuard || path.resolve(loadedGuard.path) !== path.resolve(guardPath) || !require.cache[require.resolve(guardPath)]) {
+const expectedGuardRealpath = fs.realpathSync(guardPath);
+const loadedGuardRealpath = loadedGuard?.path && fs.existsSync(loadedGuard.path)
+  ? fs.realpathSync(loadedGuard.path)
+  : null;
+if (loadedGuardRealpath !== expectedGuardRealpath || !require.cache[require.resolve(guardPath)]) {
   die('isolation guard is not loaded from the provenance-bound build root');
 }
 fs.mkdirSync(artifactRoot, { recursive: true });
