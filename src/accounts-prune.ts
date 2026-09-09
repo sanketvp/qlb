@@ -11,68 +11,25 @@
 // appears in the `qlbAccountIds` (or `accounts[].id`) list of any migration
 // row whose state is MIRRORED, in-flight VALIDATED, QLB_OWNED, or RETIRED.
 // NATIVE after a clean rollback, terminal post-commit-rollback VALIDATED
-// (owner file absent — same distinction `qlb doctor` uses), or no migration
-// record at all, is safe.
+// (affirmative `rolledBackFrom: 'post-commit'` + explicit owner path whose
+// owner and staging files are both absent), or no migration record at all,
+// is safe.
 //
-// Fail-closed: any error while reading an unsafe-state journal row is treated
-// as "owned" (refuse to prune) rather than "safe to prune".
+// Fail-closed: any error while reading an unsafe-state journal row, or any
+// unknown/ambiguous VALIDATED classification, is treated as "owned" (refuse
+// to prune) rather than "safe to prune".
 
-import { config, type QlbConfig } from './config';
-import { isStuckMigration } from './migration-health';
+import { classifyMigration, parseAccountIds } from './migration-health';
 import type { MigrationRow, Store } from './store';
+
+export { parseAccountIds } from './migration-health';
+export type { ParseAccountIdsResult } from './migration-health';
 
 export interface AccountOwnershipCheck {
   owned: boolean;
   store?: string;
   state?: string;
   reason?: 'owned' | 'in_flight' | 'untrusted';
-}
-
-export type ParseAccountIdsResult =
-  | { ok: true; ids: Set<string> }
-  | { ok: false };
-
-/**
- * Parse a migration `detail_json` into the set of account IDs it names.
- * Returns `{ ok: false }` on ANY parse failure or wrong-shaped payload —
- * callers must treat that as untrusted, not as "no owned accounts".
- */
-export function parseAccountIds(detailJson: string | null | undefined): ParseAccountIdsResult {
-  if (detailJson == null || detailJson === '') return { ok: false };
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(detailJson);
-  } catch {
-    return { ok: false };
-  }
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    return { ok: false };
-  }
-  const detail = parsed as { qlbAccountIds?: unknown; accounts?: unknown };
-  const hasQlb = Object.prototype.hasOwnProperty.call(detail, 'qlbAccountIds');
-  const hasAccounts = Object.prototype.hasOwnProperty.call(detail, 'accounts');
-  if (!hasQlb && !hasAccounts) return { ok: false };
-
-  const ids = new Set<string>();
-  if (hasQlb) {
-    if (!Array.isArray(detail.qlbAccountIds)) return { ok: false };
-    for (const id of detail.qlbAccountIds) {
-      if (typeof id !== 'string') return { ok: false };
-      ids.add(id);
-    }
-  }
-  if (hasAccounts) {
-    if (!Array.isArray(detail.accounts)) return { ok: false };
-    for (const account of detail.accounts) {
-      if (!account || typeof account !== 'object' || Array.isArray(account)) {
-        return { ok: false };
-      }
-      const id = (account as { id?: unknown }).id;
-      if (typeof id !== 'string' || id.length === 0) return { ok: false };
-      ids.add(id);
-    }
-  }
-  return { ok: true, ids };
 }
 
 const SAFE_STATES = new Set(['NATIVE']);
@@ -89,18 +46,22 @@ export type AccountSafety =
  * Fail-closed: malformed / wrong-shaped detail on any non-NATIVE row, or any
  * unknown state, is treated as unsafe.
  *
- * VALIDATED is overloaded: a completed post-commit rollback (owner file
- * absent) is terminal and safe, matching `isStuckMigration` in diagnostics.
- * A pre-commit / mid-hygiene VALIDATED (owner present or staging) is in-flight.
+ * VALIDATED uses `classifyMigration` (shared with `qlb doctor`):
+ *   terminal — completed post-commit rollback; skip like NATIVE
+ *   active   — in-flight; refuse if this account is named
+ *   unknown  — refuse the whole prune (never skip before ID validation)
  */
 export function inspectAccountSafety(
   migrations: MigrationRow[],
   accountId: string,
-  cfg: QlbConfig = config,
 ): AccountSafety {
   for (const row of migrations) {
     if (SAFE_STATES.has(row.state)) continue;
-    if (row.state === 'VALIDATED' && !isStuckMigration(row, cfg)) continue;
+    const health = classifyMigration(row);
+    if (health === 'unknown') {
+      return { unsafe: true, store: row.store, state: row.state, reason: 'untrusted' };
+    }
+    if (row.state === 'VALIDATED' && health === 'terminal') continue;
     if (!UNSAFE_STATES.has(row.state)) {
       return { unsafe: true, store: row.store, state: row.state, reason: 'untrusted' };
     }
@@ -195,8 +156,10 @@ function refuse(message: string): never {
  * Remove an account's rows from `accounts`, `snapshots`, `overrides`,
  * `poll_claims`, and the account's refresh lease. Refuses if the account
  * does not exist, is currently QLB_OWNED / RETIRED / in-flight (MIRRORED or
- * pre-commit VALIDATED), has an unreadable journal, or `--confirm` was not passed.
- * A completed post-commit-rollback VALIDATED (owner file absent) is not in-flight.
+ * pre-commit VALIDATED), has an unreadable or ambiguous journal, or
+ * `--confirm` was not passed.
+ * A completed post-commit-rollback VALIDATED (explicit owner path absent
+ * and not staging, `rolledBackFrom: 'post-commit'`) is not in-flight.
  * `decisions` rows are left alone — they are audit history, not live state.
  *
  * Existence + journal inspection + cascade delete run in ONE BEGIN IMMEDIATE

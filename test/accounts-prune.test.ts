@@ -188,6 +188,8 @@ describe('accounts-prune fail-closed journal parse', () => {
       parseAccountIds(JSON.stringify({ accounts: [{ id: 'ok' }, {}] })).ok,
       false,
     );
+    assert.equal(parseAccountIds(JSON.stringify({ qlbAccountIds: [''] })).ok, false);
+    assert.equal(parseAccountIds(JSON.stringify({ qlbAccountIds: ['ok', ''] })).ok, false);
   });
 
   it('refuses prune when a QLB_OWNED journal row is malformed JSON', () => {
@@ -244,6 +246,35 @@ describe('accounts-prune fail-closed journal parse', () => {
         err instanceof PruneRefusedError && /cannot be proven unowned/.test(err.message),
     );
     assert.ok(store.getAccount('acct-empty-id'));
+    store.close();
+  });
+
+  it('refuses prune when qlbAccountIds is [""] (empty string id is untrusted)', () => {
+    const store = openTempStore();
+    store.upsertAccount('victim', 'anthropic', 'v@example.com', 'active');
+    store.upsertMigration('pi-pool', 'QLB_OWNED', JSON.stringify({ qlbAccountIds: [''] }), Date.now());
+    assert.throws(
+      () => pruneAccount(store, { accountId: 'victim', confirm: true }),
+      (err: unknown) => err instanceof PruneRefusedError && /cannot be proven unowned/.test(err.message),
+    );
+    assert.ok(store.getAccount('victim'));
+    store.close();
+  });
+
+  it('refuses prune when qlbAccountIds is ["ok",""] (mixed empty id is whole-row untrusted)', () => {
+    const store = openTempStore();
+    store.upsertAccount('victim', 'anthropic', 'v@example.com', 'active');
+    store.upsertMigration(
+      'pi-pool',
+      'QLB_OWNED',
+      JSON.stringify({ qlbAccountIds: ['ok', ''] }),
+      Date.now(),
+    );
+    assert.throws(
+      () => pruneAccount(store, { accountId: 'victim', confirm: true }),
+      (err: unknown) => err instanceof PruneRefusedError && /cannot be proven unowned/.test(err.message),
+    );
+    assert.ok(store.getAccount('victim'));
     store.close();
   });
 
@@ -349,6 +380,119 @@ describe('accounts-prune in-flight migration refusal', () => {
     const result = pruneAccount(store, { accountId: 'account-rolled-back', confirm: true });
     assert.equal(result.ok, true);
     assert.equal(store.getAccount('account-rolled-back'), null);
+    store.close();
+  });
+
+  function refuseUntrustedValidated(detailJson: string, extra?: { stagingAt?: string }): void {
+    const store = openTempStore();
+    if (extra?.stagingAt) writeFileSync(`${extra.stagingAt}.staging`, '{"owner":"qlb"}\n');
+    store.upsertAccount('victim', 'anthropic', 'v@example.com', 'active');
+    store.upsertMigration('pi-pool', 'VALIDATED', detailJson, Date.now());
+    assert.throws(
+      () => pruneAccount(store, { accountId: 'victim', confirm: true }),
+      (err: unknown) => err instanceof PruneRefusedError && /cannot be proven unowned|in-flight/.test((err as Error).message),
+    );
+    assert.ok(store.getAccount('victim'));
+    store.close();
+  }
+
+  it('refuses VALIDATED with malformed JSON (does not skip before ID validation)', () => {
+    refuseUntrustedValidated('not-json');
+  });
+
+  it('refuses VALIDATED with missing ownerFilePath (does not guess a default path)', () => {
+    refuseUntrustedValidated(JSON.stringify({
+      qlbAccountIds: ['victim'],
+      rolledBackFrom: 'post-commit',
+    }));
+  });
+
+  it('refuses VALIDATED with empty ownerFilePath', () => {
+    refuseUntrustedValidated(JSON.stringify({
+      qlbAccountIds: ['victim'],
+      ownerFilePath: '',
+      rolledBackFrom: 'post-commit',
+    }));
+  });
+
+  it('refuses VALIDATED with wrong-typed ownerFilePath even if a custom staging file exists', () => {
+    const store = openTempStore();
+    const customOwner = join(dirname(store.dbPath), 'custom-owner.json');
+    writeFileSync(`${customOwner}.staging`, '{"owner":"qlb"}\n');
+    store.upsertAccount('victim', 'anthropic', 'v@example.com', 'active');
+    store.upsertMigration(
+      'pi-pool',
+      'VALIDATED',
+      JSON.stringify({ qlbAccountIds: ['victim'], ownerFilePath: 123 }),
+      Date.now(),
+    );
+    assert.throws(
+      () => pruneAccount(store, { accountId: 'victim', confirm: true }),
+      PruneRefusedError,
+    );
+    assert.ok(store.getAccount('victim'));
+    store.close();
+  });
+
+  it('refuses VALIDATED with files absent but missing rolledBackFrom (not proven terminal)', () => {
+    const store = openTempStore();
+    const ownerFile = join(dirname(store.dbPath), 'qlb-owner.json');
+    store.upsertAccount('victim', 'anthropic', 'v@example.com', 'active');
+    store.upsertMigration(
+      'pi-pool',
+      'VALIDATED',
+      JSON.stringify({ qlbAccountIds: ['victim'], ownerFilePath: ownerFile }),
+      Date.now(),
+    );
+    assert.throws(
+      () => pruneAccount(store, { accountId: 'victim', confirm: true }),
+      (err: unknown) => err instanceof PruneRefusedError && /cannot be proven unowned/.test((err as Error).message),
+    );
+    assert.ok(store.getAccount('victim'));
+    store.close();
+  });
+
+  it('refuses VALIDATED with invalid rolledBackFrom even when owner files are absent', () => {
+    const store = openTempStore();
+    const ownerFile = join(dirname(store.dbPath), 'qlb-owner.json');
+    store.upsertAccount('victim', 'anthropic', 'v@example.com', 'active');
+    store.upsertMigration(
+      'pi-pool',
+      'VALIDATED',
+      JSON.stringify({
+        qlbAccountIds: ['victim'],
+        ownerFilePath: ownerFile,
+        rolledBackFrom: 'pre-commit',
+      }),
+      Date.now(),
+    );
+    assert.throws(
+      () => pruneAccount(store, { accountId: 'victim', confirm: true }),
+      PruneRefusedError,
+    );
+    assert.ok(store.getAccount('victim'));
+    store.close();
+  });
+
+  it('refuses VALIDATED with empty/mixed qlbAccountIds even with rollback evidence', () => {
+    const store = openTempStore();
+    const ownerFile = join(dirname(store.dbPath), 'qlb-owner.json');
+    store.upsertAccount('victim', 'anthropic', 'v@example.com', 'active');
+    store.upsertMigration(
+      'pi-pool',
+      'VALIDATED',
+      JSON.stringify({
+        qlbAccountIds: ['ok', ''],
+        ownerFilePath: ownerFile,
+        rolledBackFrom: 'post-commit',
+      }),
+      Date.now(),
+    );
+    assert.throws(
+      () => pruneAccount(store, { accountId: 'victim', confirm: true }),
+      PruneRefusedError,
+    );
+    assert.ok(store.getAccount('victim'));
     store.close();
   });
 
@@ -571,6 +715,54 @@ describe('accounts-prune CLI exit codes', () => {
     const result = runCli(
       ['accounts', 'prune', '--account', 'acct-empty-id', '--confirm', '--db', dbPath],
       { ...process.env, QLB_DB_PATH: dbPath },
+    );
+    assert.equal(result.status, 2, result.stderr || result.stdout);
+    assert.match(result.stderr, /cannot be proven unowned/);
+  });
+
+  it('exits 2 when QLB_OWNED qlbAccountIds is [""]', () => {
+    const store = openTempStore();
+    store.upsertAccount('victim', 'anthropic', 'v@example.com', 'active');
+    store.upsertMigration('pi-pool', 'QLB_OWNED', JSON.stringify({ qlbAccountIds: [''] }), Date.now());
+    const dbPath = store.dbPath;
+    store.close();
+    const result = runCli(
+      ['accounts', 'prune', '--account', 'victim', '--confirm', '--db', dbPath],
+      { ...process.env, QLB_DB_PATH: dbPath },
+    );
+    assert.equal(result.status, 2, result.stderr || result.stdout);
+    assert.match(result.stderr, /cannot be proven unowned/);
+  });
+
+  it('exits 2 when QLB_OWNED qlbAccountIds is ["ok",""]', () => {
+    const store = openTempStore();
+    store.upsertAccount('victim', 'anthropic', 'v@example.com', 'active');
+    store.upsertMigration(
+      'pi-pool',
+      'QLB_OWNED',
+      JSON.stringify({ qlbAccountIds: ['ok', ''] }),
+      Date.now(),
+    );
+    const dbPath = store.dbPath;
+    store.close();
+    const result = runCli(
+      ['accounts', 'prune', '--account', 'victim', '--confirm', '--db', dbPath],
+      { ...process.env, QLB_DB_PATH: dbPath },
+    );
+    assert.equal(result.status, 2, result.stderr || result.stdout);
+    assert.match(result.stderr, /cannot be proven unowned/);
+  });
+
+  it('exits 2 when VALIDATED detail is malformed JSON', () => {
+    const store = openTempStore();
+    store.upsertAccount('victim', 'anthropic', 'v@example.com', 'active');
+    store.upsertMigration('pi-pool', 'VALIDATED', 'not-json', Date.now());
+    const dbPath = store.dbPath;
+    store.close();
+    const isolatedAuth = join(dirname(dbPath), 'auth.json');
+    const result = runCli(
+      ['accounts', 'prune', '--account', 'victim', '--confirm', '--db', dbPath],
+      { ...process.env, QLB_DB_PATH: dbPath, QLB_PI_AUTH_JSON_PATH: isolatedAuth },
     );
     assert.equal(result.status, 2, result.stderr || result.stdout);
     assert.match(result.stderr, /cannot be proven unowned/);
