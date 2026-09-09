@@ -3,66 +3,159 @@
 // This is NOT a general-purpose account deletion tool. It exists to clean up
 // accounts that are no longer real (e.g. a duplicate ID left behind after a
 // native credential file was manually edited) while making it structurally
-// impossible to remove an account that QLB currently considers QLB_OWNED.
+// impossible to remove an account that QLB currently considers owned or that
+// is mid-cutover.
 //
-// Ownership is determined from the `migrations` journal (§4.8.3), not from
-// `accounts.status` — a store can be QLB_OWNED while its detail_json still
-// lists the specific account IDs that were migrated. An account counts as
-// "QLB_OWNED" if it appears in the `qlbAccountIds` (or `accounts[].id`) list
-// of any migration row whose state is QLB_OWNED or RETIRED.
+// Ownership / participation is determined from the `migrations` journal
+// (§4.8.3), not from `accounts.status`. An account is unsafe to prune if it
+// appears in the `qlbAccountIds` (or `accounts[].id`) list of any migration
+// row whose state is MIRRORED, VALIDATED, QLB_OWNED, or RETIRED. NATIVE after
+// a clean rollback, or no migration record at all, is the only safe case.
+//
+// Fail-closed: any error while reading an unsafe-state journal row is treated
+// as "owned" (refuse to prune) rather than "safe to prune".
 
-import type { Store } from './store';
+import type { MigrationRow, Store } from './store';
 
 export interface AccountOwnershipCheck {
   owned: boolean;
   store?: string;
   state?: string;
+  reason?: 'owned' | 'in_flight' | 'untrusted';
 }
 
-function parseAccountIds(detailJson: string | null | undefined): Set<string> {
-  const ids = new Set<string>();
-  if (!detailJson) return ids;
-  try {
-    const parsed: unknown = JSON.parse(detailJson);
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return ids;
-    const detail = parsed as {
-      qlbAccountIds?: unknown;
-      accounts?: Array<{ id?: unknown }>;
-    };
-    if (Array.isArray(detail.qlbAccountIds)) {
-      for (const id of detail.qlbAccountIds) {
-        if (typeof id === 'string') ids.add(id);
-      }
-    }
-    if (Array.isArray(detail.accounts)) {
-      for (const account of detail.accounts) {
-        if (account && typeof account.id === 'string') ids.add(account.id);
-      }
-    }
-  } catch {
-    // malformed journal detail — treat as no known owned accounts
-  }
-  return ids;
-}
-
-const OWNED_STATES = new Set(['QLB_OWNED', 'RETIRED']);
+export type ParseAccountIdsResult =
+  | { ok: true; ids: Set<string> }
+  | { ok: false };
 
 /**
- * Is `accountId` part of the migrated/owned account set for any store in
- * QLB_OWNED or RETIRED state? Fail-closed: any error while reading the
- * journal is treated as "owned" (refuse to prune) rather than "safe to
- * prune".
+ * Parse a migration `detail_json` into the set of account IDs it names.
+ * Returns `{ ok: false }` on ANY parse failure or wrong-shaped payload —
+ * callers must treat that as untrusted, not as "no owned accounts".
  */
-export function checkAccountOwnership(store: Store, accountId: string): AccountOwnershipCheck {
-  const migrations = store.listMigrations();
-  for (const row of migrations) {
-    if (!OWNED_STATES.has(row.state)) continue;
-    const ids = parseAccountIds(row.detail_json);
-    if (ids.has(accountId)) {
-      return { owned: true, store: row.store, state: row.state };
+export function parseAccountIds(detailJson: string | null | undefined): ParseAccountIdsResult {
+  if (detailJson == null || detailJson === '') return { ok: false };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(detailJson);
+  } catch {
+    return { ok: false };
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { ok: false };
+  }
+  const detail = parsed as { qlbAccountIds?: unknown; accounts?: unknown };
+  const hasQlb = Object.prototype.hasOwnProperty.call(detail, 'qlbAccountIds');
+  const hasAccounts = Object.prototype.hasOwnProperty.call(detail, 'accounts');
+  if (!hasQlb && !hasAccounts) return { ok: false };
+
+  const ids = new Set<string>();
+  if (hasQlb) {
+    if (!Array.isArray(detail.qlbAccountIds)) return { ok: false };
+    for (const id of detail.qlbAccountIds) {
+      if (typeof id !== 'string') return { ok: false };
+      ids.add(id);
     }
   }
-  return { owned: false };
+  if (hasAccounts) {
+    if (!Array.isArray(detail.accounts)) return { ok: false };
+    for (const account of detail.accounts) {
+      if (!account || typeof account !== 'object' || Array.isArray(account)) {
+        return { ok: false };
+      }
+      const id = (account as { id?: unknown }).id;
+      if (id === undefined) continue;
+      if (typeof id !== 'string') return { ok: false };
+      ids.add(id);
+    }
+  }
+  return { ok: true, ids };
+}
+
+const SAFE_STATES = new Set(['NATIVE']);
+const IN_FLIGHT_STATES = new Set(['MIRRORED', 'VALIDATED']);
+const OWNED_STATES = new Set(['QLB_OWNED', 'RETIRED']);
+const UNSAFE_STATES = new Set([...IN_FLIGHT_STATES, ...OWNED_STATES]);
+
+export type AccountSafety =
+  | { unsafe: false }
+  | { unsafe: true; store: string; state: string; reason: 'owned' | 'in_flight' | 'untrusted' };
+
+/**
+ * Decide whether `accountId` is safe to prune given the current journal.
+ * Fail-closed: malformed / wrong-shaped detail on any non-NATIVE row, or any
+ * unknown state, is treated as unsafe.
+ */
+export function inspectAccountSafety(migrations: MigrationRow[], accountId: string): AccountSafety {
+  for (const row of migrations) {
+    if (SAFE_STATES.has(row.state)) continue;
+    if (!UNSAFE_STATES.has(row.state)) {
+      return { unsafe: true, store: row.store, state: row.state, reason: 'untrusted' };
+    }
+    const parsed = parseAccountIds(row.detail_json);
+    if (!parsed.ok) {
+      return { unsafe: true, store: row.store, state: row.state, reason: 'untrusted' };
+    }
+    if (parsed.ids.has(accountId)) {
+      return {
+        unsafe: true,
+        store: row.store,
+        state: row.state,
+        reason: IN_FLIGHT_STATES.has(row.state) ? 'in_flight' : 'owned',
+      };
+    }
+  }
+  return { unsafe: false };
+}
+
+export function safetyRefusalMessage(
+  accountId: string,
+  safety: Extract<AccountSafety, { unsafe: true }>,
+): string {
+  if (safety.reason === 'untrusted') {
+    return (
+      `account '${accountId}' cannot be proven unowned ` +
+      `(unreadable migration journal for store '${safety.store}', state ${safety.state}); will not prune`
+    );
+  }
+  if (safety.reason === 'in_flight') {
+    return (
+      `account '${accountId}' is participating in an in-flight migration ` +
+      `(via store '${safety.store}', state ${safety.state}); will not prune`
+    );
+  }
+  return (
+    `account '${accountId}' is QLB_OWNED (via store '${safety.store}', ` +
+    `state ${safety.state}); will not prune a real owned account`
+  );
+}
+
+/**
+ * Is `accountId` unsafe to prune (owned, in-flight, or untrusted journal)?
+ * Fail-closed: any error while reading an unsafe-state journal is treated as
+ * "owned" (refuse to prune) rather than "safe to prune".
+ *
+ * The live prune path does not use this helper for the delete decision —
+ * `Store.pruneAccountIfUnowned` re-runs the same inspection inside the
+ * delete's BEGIN IMMEDIATE so a concurrent journal commit cannot sneak in.
+ */
+export function checkAccountOwnership(store: Store, accountId: string): AccountOwnershipCheck {
+  const safety = inspectAccountSafety(store.listMigrations(), accountId);
+  if (!safety.unsafe) return { owned: false };
+  return {
+    owned: true,
+    store: safety.store,
+    state: safety.state,
+    reason: safety.reason,
+  };
+}
+
+export class PruneRefusedError extends Error {
+  readonly exitCode = 2 as const;
+  constructor(message: string) {
+    super(message);
+    this.name = 'PruneRefusedError';
+  }
 }
 
 export interface PruneAccountOpts {
@@ -78,38 +171,36 @@ export interface PruneAccountResult {
     snapshots: number;
     overrides: number;
     pollClaims: number;
+    leases: number;
   };
 }
 
 function refuse(message: string): never {
-  throw new Error(message);
+  throw new PruneRefusedError(message);
 }
 
 /**
- * Remove an account's rows from `accounts`, `snapshots`, `overrides`, and
- * `poll_claims`. Refuses if the account does not exist, is currently
- * QLB_OWNED (per the migrations journal), or `--confirm` was not passed.
- * `decisions` rows are left alone \u2014 they are audit history, not live state.
+ * Remove an account's rows from `accounts`, `snapshots`, `overrides`,
+ * `poll_claims`, and the account's refresh lease. Refuses if the account
+ * does not exist, is currently QLB_OWNED / RETIRED / in-flight (MIRRORED or
+ * VALIDATED), has an unreadable journal, or `--confirm` was not passed.
+ * `decisions` rows are left alone — they are audit history, not live state.
+ *
+ * Existence + journal inspection + cascade delete run in ONE BEGIN IMMEDIATE
+ * (see `Store.pruneAccountIfUnowned`) so a concurrent process cannot commit
+ * QLB_OWNED between the check and the delete.
  */
 export function pruneAccount(store: Store, opts: PruneAccountOpts): PruneAccountResult {
   const { accountId } = opts;
   if (!accountId) {
     refuse('REFUSED: --account is required');
   }
-  const account = store.getAccount(accountId);
-  if (!account) {
-    refuse(`REFUSED: no account found with id '${accountId}'`);
-  }
-  const ownership = checkAccountOwnership(store, accountId);
-  if (ownership.owned) {
-    refuse(
-      `REFUSED: account '${accountId}' is QLB_OWNED (via store '${ownership.store}', ` +
-        `state ${ownership.state}); will not prune a real owned account`,
-    );
-  }
   if (opts.confirm !== true) {
     refuse('REFUSED: --confirm is required to prune an account (this deletes rows permanently)');
   }
-  const removed = store.deleteAccountCascade(accountId);
-  return { ok: true, accountId, removed };
+  const outcome = store.pruneAccountIfUnowned(accountId);
+  if (!outcome.deleted) {
+    refuse(`REFUSED: ${outcome.reason}`);
+  }
+  return { ok: true, accountId, removed: outcome.removed };
 }

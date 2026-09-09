@@ -68,11 +68,11 @@ Once active, `qlb-pi` replaces Pi's footer with a compact 2-line status view ren
 
 ```
 sid:a1b2c3d4 · qlb · main · 42%ctx · claude-opus-5
-★ user@example.com  5h 12% · 7d 38%  ·  4 owned  9 accts  sync ok
+★ user · 5h 12% · 7d 38% · sync ok · 4 owned · 9 accts
 ```
 
 - Line 1 is the same identity info Pi's footer already showed: session id, repo, git branch, context-window percent, and the active model.
-- Line 2 is QLB's own summary: the currently selected account (colored, `★`-marked), its top usage buckets, and a rollup of QLB_OWNED store count / total account count / native-credential drift status (`sync ok`, `N drift`, or `FAIL`).
+- Line 2 is QLB's own summary: the currently selected account (colored, `★`-marked), its top usage buckets, then native-credential drift status (`sync ok`, `N drift`, or `FAIL`), QLB_OWNED store count, and total account count — joined with ` · `. Email labels are shortened to the local part (`user@example.com` → `user`).
 
 Press **`ctrl+alt+q`** (or run **`/qlb expand`**, alias `/qlb details`) to toggle an expanded detail panel above the compact footer, showing every configured provider grouped by ownership state, each account's full per-bucket usage, any native-sync drift rows from `qlb doctor`, and the last few `qlb resolve` decisions made in this session. Press the same shortcut (or run the command again) to collapse it back to the 2-line view.
 

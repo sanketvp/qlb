@@ -38,7 +38,7 @@ import {
   retireNativeStore,
   type RetireHarness,
 } from './retire';
-import { pruneAccount } from './accounts-prune';
+import { pruneAccount, PruneRefusedError } from './accounts-prune';
 import {
   enrichAccounts,
   formatDashboard,
@@ -481,8 +481,8 @@ function parseAccountsArgs(argsIn: string[]): AccountsOpts {
   if (!confirm) {
     console.error(
       'REFUSED: qlb accounts prune requires --confirm.\n' +
-        'This permanently deletes the account\'s rows from accounts/snapshots/overrides/poll_claims.\n' +
-        'It is refused unconditionally if the account is QLB_OWNED.',
+        'This permanently deletes the account\'s rows from accounts/snapshots/overrides/poll_claims/leases.\n' +
+        'It is refused unconditionally if the account is QLB_OWNED, RETIRED, or in-flight (MIRRORED/VALIDATED).',
     );
     process.exit(2);
   }
@@ -1306,7 +1306,8 @@ async function runAccounts(opts: AccountsOpts): Promise<number> {
         console.log(`pruned account ${result.accountId}`);
         console.log(
           `removed: accounts=${result.removed.accounts} snapshots=${result.removed.snapshots} ` +
-            `overrides=${result.removed.overrides} poll_claims=${result.removed.pollClaims}`,
+            `overrides=${result.removed.overrides} poll_claims=${result.removed.pollClaims} ` +
+            `leases=${result.removed.leases}`,
         );
       }
       return 0;
@@ -1507,7 +1508,7 @@ async function main(): Promise<void> {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`qlb accounts ${opts.sub}: ${msg}`);
-      process.exit(1);
+      process.exit(err instanceof PruneRefusedError ? 2 : 1);
     }
   }
   if (opts.cmd === 'native-resync') {

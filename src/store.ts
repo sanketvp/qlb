@@ -6,6 +6,7 @@
 import { chmodSync, existsSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { DatabaseSync, type StatementSync } from 'node:sqlite';
+import { inspectAccountSafety, safetyRefusalMessage } from './accounts-prune';
 import { config } from './config';
 import type { BucketReading, Confidence } from './types';
 
@@ -174,6 +175,7 @@ export class Store {
   private readonly deleteSnapshotsByAccountStmt: StatementSync;
   private readonly deleteOverridesByAccountStmt: StatementSync;
   private readonly deletePollClaimsByAccountStmt: StatementSync;
+  private readonly deleteLeaseByNameStmt: StatementSync;
 
   constructor(dbPath: string = DEFAULT_DB_PATH) {
     this.dbPath = dbPath;
@@ -397,6 +399,7 @@ export class Store {
     this.deletePollClaimsByAccountStmt = this.db.prepare(
       'DELETE FROM poll_claims WHERE account_id = ?',
     );
+    this.deleteLeaseByNameStmt = this.db.prepare('DELETE FROM leases WHERE name = ?');
   }
 
   /**
@@ -744,22 +747,63 @@ export class Store {
 
   /**
    * Hard-delete an account and every row referencing it (`snapshots`,
-   * `overrides`, `poll_claims`). Caller (accounts-prune.ts) is responsible
-   * for refusing to call this on a QLB_OWNED account — this method has no
-   * ownership awareness of its own, it just removes rows.
+   * `overrides`, `poll_claims`, refresh `leases`). No ownership check — the
+   * prune path must use `pruneAccountIfUnowned` so the journal inspection
+   * and this delete share one BEGIN IMMEDIATE.
    */
   deleteAccountCascade(accountId: string): {
     accounts: number;
     snapshots: number;
     overrides: number;
     pollClaims: number;
+    leases: number;
   } {
+    return this.runImmediate(() => this.deleteAccountCascadeUnlocked(accountId));
+  }
+
+  private deleteAccountCascadeUnlocked(accountId: string): {
+    accounts: number;
+    snapshots: number;
+    overrides: number;
+    pollClaims: number;
+    leases: number;
+  } {
+    const snapshots = Number(this.deleteSnapshotsByAccountStmt.run(accountId).changes);
+    const overrides = Number(this.deleteOverridesByAccountStmt.run(accountId).changes);
+    const pollClaims = Number(this.deletePollClaimsByAccountStmt.run(accountId).changes);
+    const leases = Number(this.deleteLeaseByNameStmt.run(refreshLeaseName(accountId)).changes);
+    const accounts = Number(this.deleteAccountStmt.run(accountId).changes);
+    return { accounts, snapshots, overrides, pollClaims, leases };
+  }
+
+  /**
+   * Atomically: read the account, inspect every migrations journal row, and
+   * cascade-delete only if the account is unowned and not in-flight.
+   * One BEGIN IMMEDIATE covers the check and the delete (closes the TOCTOU
+   * between a prior `listMigrations()` and `deleteAccountCascade()`).
+   */
+  pruneAccountIfUnowned(accountId: string):
+    | {
+        deleted: true;
+        removed: {
+          accounts: number;
+          snapshots: number;
+          overrides: number;
+          pollClaims: number;
+          leases: number;
+        };
+      }
+    | { deleted: false; reason: string } {
     return this.runImmediate(() => {
-      const snapshots = Number(this.deleteSnapshotsByAccountStmt.run(accountId).changes);
-      const overrides = Number(this.deleteOverridesByAccountStmt.run(accountId).changes);
-      const pollClaims = Number(this.deletePollClaimsByAccountStmt.run(accountId).changes);
-      const accounts = Number(this.deleteAccountStmt.run(accountId).changes);
-      return { accounts, snapshots, overrides, pollClaims };
+      const account = this.getAccount(accountId);
+      if (!account) {
+        return { deleted: false as const, reason: `no account found with id '${accountId}'` };
+      }
+      const safety = inspectAccountSafety(this.listMigrations(), accountId);
+      if (safety.unsafe) {
+        return { deleted: false as const, reason: safetyRefusalMessage(accountId, safety) };
+      }
+      return { deleted: true as const, removed: this.deleteAccountCascadeUnlocked(accountId) };
     });
   }
 

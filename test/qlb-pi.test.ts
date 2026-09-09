@@ -210,6 +210,10 @@ describe('qlb-pi footer helpers', () => {
     assert.match(wide[1], /5h 20%/);
     assert.match(wide[1], /sync ok/);
     assert.match(wide[1], /5 owned/);
+    assert.equal(
+      wide[1],
+      '★ sanket.patel · 5h 20% · 7d 20% · sync ok · 5 owned · 8 accts',
+    );
 
     const narrow = buildFooterLines({
       width: 12,

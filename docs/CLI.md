@@ -373,16 +373,16 @@ $ qlb accounts prune --account account-1699999999999 --confirm --json
 {
   "ok": true,
   "accountId": "account-1699999999999",
-  "removed": { "accounts": 1, "snapshots": 3, "overrides": 0, "pollClaims": 0 }
+  "removed": { "accounts": 1, "snapshots": 3, "overrides": 0, "pollClaims": 0, "leases": 0 }
 }
 ```
 
-Deletes the account's rows from `accounts`, `snapshots`, `overrides`, and `poll_claims`. `decisions` rows are left untouched (audit history, not live state). **Refused unconditionally** if the account is currently QLB_OWNED — i.e. its ID appears in the `qlbAccountIds` list of any `migrations` row whose state is `QLB_OWNED` or `RETIRED`:
+Deletes the account's rows from `accounts`, `snapshots`, `overrides`, `poll_claims`, and the account's refresh `leases` row. `decisions` rows are left untouched (audit history, not live state). **Refused unconditionally** if the account is currently QLB_OWNED / RETIRED or participating in an in-flight migration (`MIRRORED` / `VALIDATED`) — i.e. its ID appears in the `qlbAccountIds` (or `accounts[].id`) list of any `migrations` row in those states, or if such a row's `detail_json` cannot be trusted:
 
 ```console
 $ qlb accounts prune --account account-1 --confirm
 REFUSED: account 'account-1' is QLB_OWNED (via store 'pi-pool', state QLB_OWNED); will not prune a real owned account
-(exit 1)
+(exit 2)
 ```
 
 Also refused without `--confirm`, or if the account id doesn't exist. Flags: `--account <id>` (required), `--confirm` (required), `[--db <path>]`, `[--json]`.
