@@ -203,6 +203,42 @@ describe('strategy: round-robin', () => {
     const count = 8;
     const workerPath = join(__dirname, '..', 'src', 'store.js');
     let completedRounds = 0;
+    type WorkerErrorDetails = {
+      name?: string;
+      message?: string;
+      stack?: string;
+      code?: unknown;
+      errcode?: unknown;
+      errstr?: unknown;
+    };
+    const captureErrorDetails = (err: unknown): WorkerErrorDetails => {
+      if (err instanceof Error) {
+        const withNativeFields = err as Error & {
+          code?: unknown;
+          errcode?: unknown;
+          errstr?: unknown;
+        };
+        return {
+          name: withNativeFields.name,
+          message: withNativeFields.message,
+          stack: withNativeFields.stack,
+          code: withNativeFields.code,
+          errcode: withNativeFields.errcode,
+          errstr: withNativeFields.errstr,
+        };
+      }
+      return { message: String(err) };
+    };
+    type WorkerOutcome = {
+      workerIndex: number;
+      value?: number;
+      code: number;
+      signal: string | null;
+      error?: string;
+      errorDetails?: WorkerErrorDetails;
+      timedOut: boolean;
+      launchFailed?: boolean;
+    };
     for (let round = 0; round < rounds; round++) {
       const dir = mkdtempSync(join(tmpdir(), `qlb-rr-t4-${round}-`));
       const dbPath = join(dir, 'qlb.db');
@@ -210,16 +246,10 @@ describe('strategy: round-robin', () => {
       setup.close();
       try {
         const workers = Array.from({ length: count }, (_, workerIndex) =>
-          new Promise<{
-            workerIndex: number;
-            value?: number;
-            code: number;
-            signal: string | null;
-            error?: string;
-            timedOut: boolean;
-          }>((resolve) => {
+          new Promise<WorkerOutcome>((resolve) => {
             let value: number | undefined;
             let workerError: string | undefined;
+            let workerErrorDetails: WorkerErrorDetails | undefined;
             let timedOut = false;
             const worker = new Worker(
               `
@@ -240,6 +270,7 @@ describe('strategy: round-robin', () => {
             worker.on('message', (idx: number) => { value = idx; });
             worker.on('error', (err) => {
               workerError = err instanceof Error ? err.stack || err.message : String(err);
+              workerErrorDetails = captureErrorDetails(err);
             });
             const timer = setTimeout(() => {
               timedOut = true;
@@ -253,16 +284,45 @@ describe('strategy: round-robin', () => {
                 code,
                 signal: null,
                 error: workerError,
+                errorDetails: workerErrorDetails,
                 timedOut,
               });
             });
           }),
         );
-        const outcomes = await Promise.all(workers);
+        // Promise.allSettled (not Promise.all) is required here: a synchronous
+        // `new Worker()` constructor throw rejects that slot's promise
+        // immediately, and Promise.all would short-circuit on the first
+        // rejection while the other launched workers are still running. That
+        // let `finally`'s rmSync(dir) race with active workers still using the
+        // fixture. allSettled guarantees every launched worker's promise
+        // (settled only on its real `exit`) is observed before this await
+        // returns, so cleanup below cannot run while any launched worker is
+        // still active.
+        const settled = await Promise.allSettled(workers);
+        const outcomes: WorkerOutcome[] = settled.map((result, workerIndex) => {
+          if (result.status === 'fulfilled') return result.value;
+          return {
+            workerIndex,
+            code: -1,
+            signal: null,
+            error:
+              result.reason instanceof Error
+                ? result.reason.stack || result.reason.message
+                : String(result.reason),
+            errorDetails: captureErrorDetails(result.reason),
+            timedOut: false,
+            launchFailed: true,
+          };
+        });
         const failures = outcomes.filter((row) =>
           row.timedOut || row.code !== 0 || row.error !== undefined || row.value === undefined,
         );
-        assert.deepEqual(failures, [], `round ${round} lifecycle failures: ${JSON.stringify(outcomes)}`);
+        assert.deepEqual(
+          failures,
+          [],
+          `round ${round}/${rounds} (completedRounds=${completedRounds}) lifecycle failures: ${JSON.stringify(outcomes)}`,
+        );
         const values = outcomes.map((row) => row.value as number);
         assert.equal(values.length, count, `round ${round} values`);
         assert.equal(new Set(values).size, count, `round ${round} distinct indices`);
