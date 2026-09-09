@@ -364,6 +364,29 @@ Run `qlb retire status --harness <h>` (read-only) first.
 
 Flags: `--harness <claude-code|codex-cli>` (required), `[--confirm-real-retirement]` (execute only), `[--db <path>]`, `[--json]`.
 
+## `qlb accounts`
+
+Maintenance for the local account store. Currently one subcommand, `prune`, for removing a stale/orphaned account row — e.g. a duplicate account ID left behind after a native credential file was hand-edited, whose corresponding `accounts`/`snapshots` rows were never cleaned up.
+
+```console
+$ qlb accounts prune --account account-1699999999999 --confirm --json
+{
+  "ok": true,
+  "accountId": "account-1699999999999",
+  "removed": { "accounts": 1, "snapshots": 3, "overrides": 0, "pollClaims": 0, "leases": 0 }
+}
+```
+
+Deletes the account's rows from `accounts`, `snapshots`, `overrides`, `poll_claims`, and the account's refresh `leases` row. `decisions` rows are left untouched (audit history, not live state). **Refused unconditionally** if the account is currently QLB_OWNED / RETIRED or participating in an in-flight migration (`MIRRORED` / pre-commit `VALIDATED`) — i.e. its ID appears in the `qlbAccountIds` (or `accounts[].id`) list of any `migrations` row in those states, or if such a row's `detail_json` cannot be trusted (malformed JSON, empty IDs, missing/invalid owner path, or ambiguous `VALIDATED`). A completed post-commit-rollback `VALIDATED` is not in-flight only when the journal proves it (`rolledBackFrom: 'post-commit'`, explicit `ownerFilePath`, owner and `.staging` both absent — same classifier `qlb doctor` uses):
+
+```console
+$ qlb accounts prune --account account-1 --confirm
+REFUSED: account 'account-1' is QLB_OWNED (via store 'pi-pool', state QLB_OWNED); will not prune a real owned account
+(exit 2)
+```
+
+Also refused without `--confirm`, or if the account id doesn't exist. Flags: `--account <id>` (required), `--confirm` (required), `[--db <path>]`, `[--json]`.
+
 ## `qlb setup`
 
 Non-destructive harness wiring: prints copy-paste snippets only, never edits files outside this repo.
@@ -427,6 +450,18 @@ $ qlb proxy --json
 ```
 
 Flags: `[--info-path <path>]`, `[--idle-ms <n>]` (positive integer), `[--db <path>]`, `[--json]`. Security posture: loopback-only bind (refuses anything else), per-launch random 32-byte token, constant-time token comparison, `Host` header allow-list, path allow-list (`/v1/messages`, `/v1/messages/count_tokens`, `/v1/responses`, `/backend-api/codex/responses`, `/qlb/health`), local auth-failure rate limiting, and credentials injected only for providers whose migration journal says `QLB_OWNED` or `RETIRED`.
+
+## `/qlb` (Pi in-session command)
+
+When `qlb-pi` is active (see [README · qlb-pi footer](../README.md#qlb-pi-footer)), Pi registers an in-session `/qlb` command (`extensions/qlb-pi/index.ts`, `pi.registerCommand('qlb', ...)`):
+
+| Command | Effect |
+|---|---|
+| `/qlb` (no args), or `/qlb status` | Runs `qlb status --json` and shows the result via a Pi notification. |
+| `/qlb migrate` | Runs `qlb migrate status --json` and shows the result the same way. |
+| `/qlb expand` (alias `/qlb details`) | Toggles the footer's expanded detail panel — the same panel opened by the `ctrl+alt+q` shortcut. |
+
+All three are read-only from the extension's side (they only shell out to `qlb status`/`qlb migrate status`, or toggle a UI panel) and fail open: a failed `qlb` invocation is reported via a notification rather than crashing the session.
 
 ## Not yet wired (honest gaps)
 

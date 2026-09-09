@@ -38,6 +38,7 @@ import {
   retireNativeStore,
   type RetireHarness,
 } from './retire';
+import { pruneAccount, PruneRefusedError } from './accounts-prune';
 import {
   enrichAccounts,
   formatDashboard,
@@ -74,6 +75,7 @@ const USAGE = `Usage:
   qlb migrate status   [--provider anthropic|xai|kimi-coding|openai-codex|openrouter] [--pool-file <path>] [--owner-file <path>] [--auth-json <path>] [--db <path>] [--target-dir <path>] [--json]
   qlb retire status  --harness claude-code|codex-cli [--json] [--db <path>]
   qlb retire execute --harness claude-code|codex-cli --confirm-real-retirement [--db <path>]
+  qlb accounts prune --account <id> --confirm [--json] [--db <path>]
 
 SAFETY: running migrate stage/rehearse/commit/rollback/resume without path
 overrides targets the REAL ~/.pi/agent/ files (anthropic-pool.json for
@@ -213,7 +215,16 @@ type NativeResyncOpts = {
   account: string;
   db?: string;
 };
-type Opts = InitOpts | DoctorOpts | StatusOpts | SetupOpts | ResolveOpts | MigrateOpts | PolicyOpts | GateOpts | ProxyOpts | RetireOpts | NativeResyncOpts | OverrideOpts;
+type AccountsSub = 'prune';
+type AccountsOpts = {
+  cmd: 'accounts';
+  sub: AccountsSub;
+  json: boolean;
+  account: string;
+  confirm: boolean;
+  db?: string;
+};
+type Opts = InitOpts | DoctorOpts | StatusOpts | SetupOpts | ResolveOpts | MigrateOpts | PolicyOpts | GateOpts | ProxyOpts | RetireOpts | NativeResyncOpts | OverrideOpts | AccountsOpts;
 
 const MIGRATE_SUBS: readonly MigrateSub[] = [
   'stage',
@@ -439,6 +450,45 @@ function parseProxyArgs(argsIn: string[]): ProxyOpts {
   return { cmd: 'proxy', json, db, infoPath, idleMs };
 }
 
+function parseAccountsArgs(argsIn: string[]): AccountsOpts {
+  const args = [...argsIn];
+  const sub = args.shift();
+  if (sub === '-h' || sub === '--help' || sub === undefined) {
+    console.log(USAGE);
+    process.exit(0);
+  }
+  if (sub !== 'prune') {
+    console.error('qlb accounts: unknown subcommand. Expected prune');
+    console.error(USAGE);
+    process.exit(1);
+  }
+  const json = args.includes('--json');
+  if (json) args.splice(args.indexOf('--json'), 1);
+  const confirm = args.includes('--confirm');
+  if (confirm) args.splice(args.indexOf('--confirm'), 1);
+  const db = takeFlag(args, '--db');
+  const account = takeFlag(args, '--account');
+  if (args.length > 0) {
+    console.error(`qlb accounts ${sub}: unknown argument ${args[0]}`);
+    console.error(USAGE);
+    process.exit(1);
+  }
+  if (!account) {
+    console.error('qlb accounts prune: --account is required');
+    console.error(USAGE);
+    process.exit(1);
+  }
+  if (!confirm) {
+    console.error(
+      'REFUSED: qlb accounts prune requires --confirm.\n' +
+        'This permanently deletes the account\'s rows from accounts/snapshots/overrides/poll_claims/leases.\n' +
+        'It is refused unconditionally if the account is QLB_OWNED, RETIRED, or in-flight (MIRRORED/VALIDATED).',
+    );
+    process.exit(2);
+  }
+  return { cmd: 'accounts', sub, json, account, confirm, db };
+}
+
 function parseRetireArgs(argsIn: string[]): RetireOpts {
   const args = [...argsIn];
   const sub = args.shift();
@@ -653,6 +703,9 @@ function parseArgs(argv: string[]): Opts {
   }
   if (raw[0] === 'setup') {
     return parseSetupArgs(raw.slice(1));
+  }
+  if (raw[0] === 'accounts') {
+    return parseAccountsArgs(raw.slice(1));
   }
 
   let cmd: 'status' | 'resolve' = 'status';
@@ -1243,6 +1296,26 @@ function printRetireStatus(
   }
 }
 
+async function runAccounts(opts: AccountsOpts): Promise<number> {
+  return withStore(opts.db, (store) => {
+    if (opts.sub === 'prune') {
+      const result = pruneAccount(store, { accountId: opts.account, confirm: opts.confirm });
+      if (opts.json) {
+        console.log(JSON.stringify(result, null, 2));
+      } else {
+        console.log(`pruned account ${result.accountId}`);
+        console.log(
+          `removed: accounts=${result.removed.accounts} snapshots=${result.removed.snapshots} ` +
+            `overrides=${result.removed.overrides} poll_claims=${result.removed.pollClaims} ` +
+            `leases=${result.removed.leases}`,
+        );
+      }
+      return 0;
+    }
+    return 1;
+  });
+}
+
 async function runRetire(opts: RetireOpts): Promise<number> {
   return withStore(opts.db, async (store) => {
     if (opts.sub === 'status') {
@@ -1426,6 +1499,16 @@ async function main(): Promise<void> {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`qlb retire ${opts.sub}: ${msg}`);
       process.exit(1);
+    }
+  }
+  if (opts.cmd === 'accounts') {
+    try {
+      const code = await runAccounts(opts);
+      process.exit(code);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`qlb accounts ${opts.sub}: ${msg}`);
+      process.exit(err instanceof PruneRefusedError ? 2 : 1);
     }
   }
   if (opts.cmd === 'native-resync') {

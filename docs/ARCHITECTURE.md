@@ -164,6 +164,8 @@ Fencing coordinates QLB's processes against each other; it cannot coordinate wit
 
 Snapshot caching is *politeness*, not correctness: a caller reuses its last observation rather than re-fetching, and any newer reading from any source replaces it. No decisions ever depend on data QLB generated itself.
 
+The `qlb-pi` Pi extension's footer (`extensions/qlb-pi/footer.ts`) is a live, read-only view into this same store — the same `accounts`/`snapshots`/`decisions`/`migrations` rows described above, just rendered in Pi's status bar instead of `qlb status`. See [README · qlb-pi footer](../README.md#qlb-pi-footer) and [CLI.md · /qlb](CLI.md#qlb-pi-in-session-command) for what it shows and how to expand it.
+
 ## The proxy
 
 `qlb proxy` starts a loopback-only HTTP helper (`src/proxy.ts`) that harnesses such as Claude Code or Codex CLI can be pointed at instead of their provider's endpoint:
