@@ -45,7 +45,7 @@
 import { execFileSync, spawn } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import type {
   ExtensionAPI,
   ExtensionCommandContext,
@@ -381,7 +381,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   const installFooter = (ctx: ExtensionContext) => {
     if (typeof ctx.ui.setFooter !== "function") return;
     try {
-      ctx.ui.setFooter((tui, theme) => {
+      ctx.ui.setFooter((tui, theme, footerData) => {
         let cachedAccount = readAccountFooterData({
           lastDecision,
           currentModel: footerModelId || ctx.model?.id,
@@ -391,6 +391,47 @@ export default async function (pi: ExtensionAPI): Promise<void> {
         let disposed = false;
         let healthFetchedAt = 0;
         let healthInFlight = false;
+
+        // Worktree-safe repo name, duplicated from anthropic-pool: Pi's jiti
+        // loader cannot import across extensions. `git rev-parse --git-common-dir`
+        // always resolves to the MAIN repo's .git even from a linked worktree.
+        const repoNameCache = new Map<string, string>();
+        const repoNamePending = new Set<string>();
+        const resolveRepoName = (cwd: string) => {
+          if (repoNameCache.has(cwd) || repoNamePending.has(cwd)) return;
+          repoNamePending.add(cwd);
+          try {
+            const proc = spawn("git", [
+              "-C",
+              cwd,
+              "rev-parse",
+              "--path-format=absolute",
+              "--git-common-dir",
+            ]);
+            let out = "";
+            proc.stdout?.on("data", (d: Buffer) => {
+              out += d.toString();
+            });
+            proc.on("close", (code) => {
+              repoNamePending.delete(cwd);
+              const commonDir = out.trim();
+              const name =
+                code === 0 && commonDir
+                  ? basename(dirname(commonDir))
+                  : cwd.split("/").pop() || cwd;
+              repoNameCache.set(cwd, name);
+              tui.requestRender();
+            });
+            proc.on("error", () => {
+              repoNamePending.delete(cwd);
+              repoNameCache.set(cwd, cwd.split("/").pop() || cwd);
+              tui.requestRender();
+            });
+          } catch {
+            repoNamePending.delete(cwd);
+            repoNameCache.set(cwd, cwd.split("/").pop() || cwd);
+          }
+        };
 
         const refreshDoctor = () => {
           if (disposed || healthInFlight) return;
@@ -433,12 +474,32 @@ export default async function (pi: ExtensionAPI): Promise<void> {
           if (Date.now() - healthFetchedAt > 60_000) {
             refreshDoctor();
           }
+          let usagePct = "";
+          try {
+            const usage = ctx.getContextUsage?.();
+            usagePct =
+              usage?.percent != null ? String(usage.percent) : "";
+          } catch {
+            // fail-open
+          }
+          let branch = "";
+          try {
+            branch = footerData.getGitBranch?.() || "";
+          } catch {
+            // fail-open
+          }
           const key =
             JSON.stringify(cachedAccount) +
             "|" +
             JSON.stringify(cachedHealth) +
             "|" +
-            (footerModelId || ctx.model?.id || "");
+            (footerModelId || ctx.model?.id || "") +
+            "|" +
+            usagePct +
+            "|" +
+            branch +
+            "|" +
+            (repoNameCache.get(ctx.cwd) || "");
           if (key !== lastSnapKey) {
             lastSnapKey = key;
             tui.requestRender();
@@ -447,11 +508,22 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 
         const timer = setInterval(tick, 5000);
         refreshDoctor();
+        let unsub = () => {};
+        try {
+          unsub = footerData.onBranchChange(() => tui.requestRender());
+        } catch {
+          // fail-open: static branch until next tick
+        }
 
         return {
           dispose: () => {
             disposed = true;
             clearInterval(timer);
+            try {
+              unsub();
+            } catch {
+              // already gone
+            }
           },
           invalidate() {},
           render(width: number): string[] {
@@ -462,14 +534,44 @@ export default async function (pi: ExtensionAPI): Promise<void> {
                 cachedAccount?.model ||
                 "no-model";
               const index = cachedAccount?.index ?? 0;
+              let sessionId = "?";
+              let contextPercent: number | null = null;
+              let branch: string | null = null;
+              try {
+                sessionId = ctx.sessionManager?.getSessionId?.() || "?";
+              } catch {
+                // fail-open
+              }
+              try {
+                const usage = ctx.getContextUsage?.();
+                if (usage && typeof usage.percent === "number") {
+                  contextPercent = usage.percent;
+                }
+              } catch {
+                // fail-open
+              }
+              try {
+                branch = footerData.getGitBranch?.() ?? null;
+              } catch {
+                // fail-open
+              }
+              try {
+                resolveRepoName(ctx.cwd);
+              } catch {
+                // fail-open
+              }
+              const repo =
+                repoNameCache.get(ctx.cwd) || ctx.cwd.split("/").pop() || ctx.cwd;
               return buildFooterLines({
                 width,
+                session: { sessionId, repo, branch, contextPercent },
                 account: cachedAccount,
                 health: cachedHealth,
                 model,
                 paintAccount: (text) => accountFg(index, text),
                 paintDim: (text) => theme.fg("dim", text),
                 paintWarn: (text) => theme.fg("warning", text),
+                paintAccent: (text) => theme.fg("accent", text),
                 truncate: truncateToWidth,
                 visible: visibleWidth,
               });
