@@ -206,14 +206,6 @@ describe('T-FS-0 no filesystem in prune decoder', () => {
   });
 });
 
-describe('T-TXN-2c coverage limitation', () => {
-  it('real COMMIT fault is NOT RUN (no production seam; runImmediate unchanged)', () => {
-    // Recorded explicitly per rev-3 §6: do not fake a COMMIT fault by
-    // modifying production runImmediate.
-    assert.equal(true, true);
-  });
-});
-
 describe('T-RECOVER marker encoding', () => {
   it('absent marker allows orphan prune; any present string refuses', () => {
     const dir = mkdtempSync(join(tmpdir(), 'qlb-recover-'));

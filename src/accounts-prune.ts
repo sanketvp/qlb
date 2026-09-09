@@ -33,7 +33,7 @@ export interface PruneStore {
       }
     | { deleted: false; reason: string };
   listMigrations(): JournalRow[];
-  getAccount(id: string): { provider: string } | null;
+  getAccount(id: string): { provider: string | null } | null;
 }
 
 export { parseAccountIds } from './migration-health';
@@ -57,7 +57,10 @@ export type AccountSafety =
       token: string;
     };
 
-export type ProviderLookup = (id: string) => string | null | undefined;
+/** Distinguish a missing account row from a present row with SQL NULL provider. */
+export type ProviderLookup = (id: string) =>
+  | { present: false }
+  | { present: true; provider: string | null };
 
 /**
  * Decide whether `accountId` is safe to prune given the current journal.
@@ -90,7 +93,8 @@ export function inspectAccountSafety(
       if (!ev.trusted) continue;
       for (const [id, provider] of ev.providers) {
         const existing = lookupProvider(id);
-        if (existing != null && existing !== provider) {
+        if (!existing.present) continue;
+        if (existing.provider !== provider) {
           return {
             unsafe: true,
             store: row.store,
@@ -131,7 +135,9 @@ export function checkAccountOwnership(
   accountId: string,
 ): AccountOwnershipCheck {
   const safety = inspectAccountSafety(store.listMigrations(), accountId, (id) => {
-    return store.getAccount(id)?.provider ?? null;
+    const row = store.getAccount(id);
+    if (!row) return { present: false };
+    return { present: true, provider: row.provider ?? null };
   });
   if (!safety.unsafe) return { owned: false };
   return {

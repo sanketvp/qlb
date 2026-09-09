@@ -803,7 +803,9 @@ export class Store {
         return { deleted: false as const, reason: 'recovery_pending' };
       }
       const safety = inspectAccountSafety(this.listMigrations(), accountId, (id) => {
-        return this.getAccount(id)?.provider ?? null;
+        const row = this.getAccount(id);
+        if (!row) return { present: false as const };
+        return { present: true as const, provider: row.provider ?? null };
       });
       if (safety.unsafe) {
         return { deleted: false as const, reason: safetyRefusalMessage(accountId, safety) };

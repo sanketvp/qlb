@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -865,6 +865,44 @@ describe('T-ID provider consistency',
       store.close();
     });
 
+    it('SQL NULL provider on an existing row is not treated as a missing row', () => {
+      const store = openTempStore();
+      seedOrphanAccount(store, 'victim');
+      store.upsertOverride({ kind: 'pin', accountId: 'victim', until: Date.now() + 60_000 });
+      store.claimPoll('victim', 'h', 15_000);
+      store.acquireRefreshLease('victim', 'h', process.pid, 0, 15_000);
+      store.recordDecision({
+        requested_model: 'x',
+        mode: 'proxy',
+        reason: 'ok',
+        snapshot_json: '{}',
+        account_id: 'victim',
+      });
+      store.upsertAccount('a', 'anthropic', 'a');
+      const db = (store as unknown as { db: DatabaseSync }).db;
+      db.exec("UPDATE accounts SET provider = NULL WHERE id = 'a'");
+      store.upsertMigration(
+        'pi-pool',
+        'QLB_OWNED',
+        JSON.stringify({
+          qlbAccountIds: ['a'],
+          accounts: [{ id: 'a', provider: 'anthropic' }],
+        }),
+        Date.now(),
+      );
+      assert.throws(
+        () => pruneAccount(store, { accountId: 'victim', confirm: true }),
+        (err: unknown) =>
+          err instanceof PruneRefusedError && /untrusted:provider_mismatch/.test((err as Error).message),
+      );
+      assert.ok(store.getAccount('victim'));
+      assert.ok(store.getAllSnapshots('victim')['5h']);
+      assert.ok(store.getPollClaim('victim'));
+      assert.ok(store.getLease(refreshLeaseName('victim')));
+      assert.equal(store.listDecisions().filter((d) => d.account_id === 'victim').length, 1);
+      store.close();
+    });
+
     it('pending MIRRORED participant without an account row is allowed',
       () => {
         const store = openTempStore();
@@ -886,27 +924,119 @@ describe('T-ID provider consistency',
   },
 );
 
-describe('T-TXN-2a delete abort preserves rows',
+function seedSix(store: Store, id = 'victim'): void {
+  store.upsertAccount(id, 'anthropic', 'Victim');
+  store.upsertSnapshot(id, '5h', {
+    usedPct: 1,
+    fetchedAt: Date.now(),
+    source: 'poll',
+    confidence: 'authoritative',
+  });
+  store.upsertOverride({ kind: 'pin', accountId: id, until: Date.now() + 60_000 });
+  store.claimPoll(id, 'holder', 15_000);
+  store.acquireRefreshLease(id, 'holder', process.pid, 0, 15_000);
+  store.recordDecision({
+    requested_model: 'x',
+    mode: 'proxy',
+    reason: 'ok',
+    snapshot_json: '{}',
+    account_id: id,
+  });
+}
+
+function assertSixSurvive(store: Store, id: string): void {
+  assert.ok(store.getAccount(id), 'accounts');
+  assert.ok(store.getAllSnapshots(id)['5h'], 'snapshots');
+  assert.ok(store.getPollClaim(id), 'poll_claims');
+  assert.ok(store.getLease(refreshLeaseName(id)), 'leases');
+  assert.equal(store.listDecisions().filter((d) => d.account_id === id).length, 1, 'decisions');
+}
+
+function storeDb(store: Store): DatabaseSync {
+  return (store as unknown as { db: DatabaseSync }).db;
+}
+
+describe('T-TXN delete/commit faults',
   () => {
-    it('RAISE(ABORT) on accounts delete rolls back the cascade', () => {
-      const store = openTempStore();
-      seedOrphanAccount(store);
-      store.recordDecision({
-        requested_model: 'x',
-        mode: 'proxy',
-        reason: 'ok',
-        snapshot_json: '{}',
-        account_id: 'account-orphan',
+    const tables = [
+      { table: 'snapshots', col: 'account_id' },
+      { table: 'overrides', col: 'account_id' },
+      { table: 'poll_claims', col: 'account_id' },
+      { table: 'leases', col: 'name' },
+      { table: 'accounts', col: 'id' },
+    ];
+
+    for (const { table } of tables) {
+      it(`T-TXN-2a RAISE(ABORT) on ${table} restores all six rows`, () => {
+        const store = openTempStore();
+        seedSix(store, 'victim');
+        storeDb(store).exec(
+          `CREATE TRIGGER abort_${table} BEFORE DELETE ON ${table} BEGIN
+            SELECT RAISE(ABORT, 'review-${table}-abort');
+          END;`,
+        );
+        let caught: unknown;
+        try {
+          pruneAccount(store, { accountId: 'victim', confirm: true });
+        } catch (err) {
+          caught = err;
+        }
+        assert.ok(caught instanceof Error);
+        const rec = caught as Error & { code?: string; errcode?: number };
+        assert.equal(rec, caught);
+        assert.equal(rec.code, 'ERR_SQLITE_ERROR');
+        assert.equal(rec.errcode, 1811);
+        assertSixSurvive(store, 'victim');
+        const dbPath = store.dbPath;
+        store.close();
+        const cli = runCli(
+          ['accounts', 'prune', '--account', 'victim', '--confirm', '--db', dbPath],
+          { ...process.env, QLB_DB_PATH: dbPath },
+        );
+        assert.equal(cli.status, 1, cli.stderr);
+        assert.match(cli.stderr, /code=ERR_SQLITE_ERROR errcode=1811/);
       });
-      const DatabaseSync = require('node:sqlite').DatabaseSync as typeof import('node:sqlite').DatabaseSync;
-      const raw = new DatabaseSync(store.dbPath);
-      raw.exec(`CREATE TRIGGER abort_accounts BEFORE DELETE ON accounts BEGIN
-        SELECT RAISE(ABORT, 'test-abort');
-      END;`);
-      raw.close();
-      assert.throws(() => pruneAccount(store, { accountId: 'account-orphan', confirm: true }));
-      assert.ok(store.getAccount('account-orphan'));
-      assert.ok(store.getAllSnapshots('account-orphan')['5h']);
+    }
+
+    it('T-TXN-2b AFTER DELETE on accounts aborts before COMMIT', () => {
+      const store = openTempStore();
+      seedSix(store, 'victim');
+      storeDb(store).exec(
+        `CREATE TRIGGER precommit_abort AFTER DELETE ON accounts BEGIN
+          SELECT RAISE(ABORT, 'review-precommit-abort');
+        END;`,
+      );
+      assert.throws(() => pruneAccount(store, { accountId: 'victim', confirm: true }));
+      assertSixSurvive(store, 'victim');
+      store.close();
+    });
+
+    it('T-TXN-2c real COMMIT fails via deferred FK without a production seam', () => {
+      const store = openTempStore();
+      seedSix(store, 'victim');
+      const db = storeDb(store);
+      db.exec('PRAGMA foreign_keys = ON');
+      db.exec(`
+        CREATE TABLE prune_commit_trap (
+          account_id TEXT NOT NULL,
+          FOREIGN KEY (account_id) REFERENCES accounts(id) DEFERRABLE INITIALLY DEFERRED
+        );
+        CREATE TRIGGER prune_commit_trap_ins AFTER DELETE ON accounts BEGIN
+          INSERT INTO prune_commit_trap(account_id) VALUES (OLD.id);
+        END;
+      `);
+      let caught: unknown;
+      try {
+        pruneAccount(store, { accountId: 'victim', confirm: true });
+      } catch (err) {
+        caught = err;
+      }
+      assert.ok(caught instanceof Error);
+      const rec = caught as Error & { code?: string; errcode?: number };
+      assert.equal(rec.code, 'ERR_SQLITE_ERROR');
+      assert.equal(rec.errcode, 787);
+      assert.match(rec.message, /FOREIGN KEY/i);
+      assertSixSurvive(store, 'victim');
       store.close();
     });
   },
@@ -997,28 +1127,66 @@ describe('T-KIND native-retirement writer',
   },
 );
 
+function independentHead(root: string): string {
+  const receipt = join(root, 'HEAD.receipt');
+  if (existsSync(receipt)) {
+    const value = readFileSync(receipt, 'utf8').trim().split(/\s+/)[0];
+    assert.match(value, /^[0-9a-f]{40}$/);
+    return value;
+  }
+  const gitHead = join(root, '.git', 'HEAD');
+  if (!existsSync(gitHead)) {
+    assert.fail('no independent head at build-root (HEAD.receipt or .git)');
+  }
+  let head = readFileSync(gitHead, 'utf8').trim();
+  if (head.startsWith('ref: ')) {
+    head = readFileSync(join(root, '.git', head.slice(5).trim()), 'utf8').trim();
+  }
+  assert.match(head, /^[0-9a-f]{40}$/);
+  return head;
+}
+
 describe('T-SCEN parameterized driver',
   () => {
-    it('binds to the current head and expects F1/F2/F3 refusals', () => {
+    it('binds to independently obtained input head and ignores artifact receipts', () => {
       const root = join(__dirname, '..', '..');
       const driver = join(root, 'test', 'support', 'prune-scenarios.cjs');
+      const guard = join(root, 'test', 'support', 'guard.cjs');
       const artifact = mkdtempSync(join(tmpdir(), 'qlb-scen-'));
       temps.push(artifact);
-      const gitHead = join(root, '.git', 'HEAD');
-      let head = readFileSync(gitHead, 'utf8').trim();
-      if (head.startsWith('ref: ')) {
-        head = readFileSync(join(root, '.git', head.slice(5).trim()), 'utf8').trim();
-      }
-      writeFileSync(join(artifact, 'HEAD.receipt'), `${head}\n`);
+      const head = independentHead(root);
+      writeFileSync(join(artifact, 'HEAD.receipt'), `${'f'.repeat(40)}\n`);
       const result = spawnSync(
         process.execPath,
-        [driver, '--build-root', root, '--expect-head', head, '--artifact-root', artifact],
-        { encoding: 'utf8', timeout: 30_000 },
+        ['--require', guard, driver, '--build-root', root, '--expect-head', head, '--artifact-root', artifact],
+        { encoding: 'utf8', timeout: 60_000 },
       );
       assert.equal(result.status, 0, result.stderr || result.stdout);
-      const report = JSON.parse(readFileSync(join(artifact, 'scenarios.json'), 'utf8')) as { testedHead: string; ok: boolean };
+      const report = JSON.parse(readFileSync(join(artifact, 'scenarios.json'), 'utf8')) as {
+        testedHead: string;
+        ok: boolean;
+        results: Array<{ id: string }>;
+      };
       assert.equal(report.testedHead, head);
+      assert.notEqual(report.testedHead, 'f'.repeat(40));
       assert.equal(report.ok, true);
+      assert.ok(report.results.length >= 20, `expected >=20 scenarios, got ${report.results.length}`);
+    });
+
+    it('rejects a false expect-head even if the artifact receipt matches it', () => {
+      const root = join(__dirname, '..', '..');
+      const driver = join(root, 'test', 'support', 'prune-scenarios.cjs');
+      const artifact = mkdtempSync(join(tmpdir(), 'qlb-scen-false-'));
+      temps.push(artifact);
+      const fake = 'f'.repeat(40);
+      writeFileSync(join(artifact, 'HEAD.receipt'), `${fake}\n`);
+      const result = spawnSync(
+        process.execPath,
+        [driver, '--build-root', root, '--expect-head', fake, '--artifact-root', artifact],
+        { encoding: 'utf8', timeout: 15_000 },
+      );
+      assert.equal(result.status, 2, result.stderr || result.stdout);
+      assert.match(result.stderr, /head mismatch/);
     });
   },
 );
