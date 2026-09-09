@@ -1,8 +1,8 @@
 'use strict';
-// Trusted verifier preflight: independently compile the verified source tree,
-// require its bytes to match the build under test, then write a manifest
-// OUTSIDE that build root. The scenario driver only accepts such a manifest;
-// a build-root HEAD receipt alone is never provenance.
+// Trusted verifier preflight: first require source bytes to match an external
+// Git-object oracle for the exact commit, then independently compile that
+// source, require its bytes to match the build under test, and write a manifest
+// OUTSIDE that build root. A build-root HEAD receipt alone is never provenance.
 
 const crypto = require('crypto');
 const fs = require('fs');
@@ -88,13 +88,29 @@ function readInputHead(root) {
   return readGitHead(root);
 }
 
-function verifyManifest(buildRoot, manifest, expectHead) {
-  if (!manifest || manifest.version !== 1) throw new Error('unsupported provenance manifest');
+function verifyManifest(buildRoot, manifest, expectHead, sourceOraclePath) {
+  if (!manifest || manifest.version !== 2) throw new Error('unsupported provenance manifest');
   if (manifest.verifiedHead !== expectHead) {
     throw new Error(`provenance head mismatch: manifest=${manifest.verifiedHead} expect=${expectHead}`);
   }
-  if (fs.realpathSync(buildRoot) !== manifest.buildRoot) {
-    throw new Error(`provenance build-root mismatch: manifest=${manifest.buildRoot} actual=${fs.realpathSync(buildRoot)}`);
+  const buildRootRealpath = fs.realpathSync(buildRoot);
+  if (buildRootRealpath !== manifest.buildRoot) {
+    throw new Error(`provenance build-root mismatch: manifest=${manifest.buildRoot} actual=${buildRootRealpath}`);
+  }
+  if (!sourceOraclePath) throw new Error('source oracle is required');
+  const oraclePath = fs.realpathSync(path.resolve(sourceOraclePath));
+  if (oraclePath === buildRootRealpath || oraclePath.startsWith(`${buildRootRealpath}${path.sep}`)) {
+    throw new Error('source oracle must be outside build root');
+  }
+  const oracleBytes = fs.readFileSync(oraclePath);
+  if (sha256File(oraclePath) !== manifest.sourceOracle?.sha256) throw new Error('source oracle hash mismatch');
+  const oracle = JSON.parse(oracleBytes.toString('utf8'));
+  if (oracle.version !== 1 || oracle.commit !== expectHead || oracle.tree !== manifest.sourceOracle.tree) {
+    throw new Error('source oracle commit/tree mismatch');
+  }
+  if (!sameEntries(oracle.files, manifest.source?.files)) throw new Error('source oracle file binding mismatch');
+  if (treeSha256(oracle.files) !== oracle.sourceTreeSha256 || oracle.sourceTreeSha256 !== manifest.source.treeSha256) {
+    throw new Error('source oracle tree digest mismatch');
   }
   const sourceTreeSha256 = verifyEntries(buildRoot, manifest.source?.files, sourcePaths, 'source');
   const buildTreeSha256 = verifyEntries(buildRoot, manifest.build?.files, buildPaths, 'build');
@@ -105,6 +121,7 @@ function verifyManifest(buildRoot, manifest, expectHead) {
     ['guard', 'test/support/guard.cjs', manifest.guardSha256],
     ['scenario-driver', 'test/support/prune-scenarios.cjs', manifest.scenarioDriverSha256],
     ['provenance-builder', 'test/support/build-provenance.cjs', manifest.provenanceBuilderSha256],
+    ['source-oracle-builder', 'test/support/source-oracle.cjs', manifest.sourceOracleBuilderSha256],
   ]) {
     const actual = sha256File(path.join(buildRoot, rel));
     if (actual !== expected) throw new Error(`${label} provenance mismatch`);
@@ -121,14 +138,34 @@ function main() {
   const buildRootArg = valueArg(process.argv, '--build-root');
   const expectHead = valueArg(process.argv, '--expect-head');
   const outputArg = valueArg(process.argv, '--output');
-  if (!buildRootArg || !expectHead || !outputArg) {
-    throw new Error('usage: build-provenance.cjs --build-root <root> --expect-head <sha> --output <external-json>');
+  const sourceOracleArg = valueArg(process.argv, '--source-oracle');
+  if (!buildRootArg || !expectHead || !outputArg || !sourceOracleArg) {
+    throw new Error('usage: build-provenance.cjs --build-root <root> --expect-head <sha> --source-oracle <external-json> --output <external-json>');
   }
   if (!/^[0-9a-f]{40}$/.test(expectHead)) throw new Error(`invalid expected head: ${expectHead}`);
   const buildRoot = fs.realpathSync(path.resolve(buildRootArg));
-  const output = path.resolve(outputArg);
+  fs.mkdirSync(path.dirname(path.resolve(outputArg)), { recursive: true });
+  const output = path.join(fs.realpathSync(path.dirname(path.resolve(outputArg))), path.basename(outputArg));
+  const sourceOraclePath = fs.realpathSync(path.resolve(sourceOracleArg));
   if (output === buildRoot || output.startsWith(`${buildRoot}${path.sep}`)) {
     throw new Error('provenance manifest must be outside the build root');
+  }
+  if (sourceOraclePath === buildRoot || sourceOraclePath.startsWith(`${buildRoot}${path.sep}`)) {
+    throw new Error('source oracle must be outside the build root');
+  }
+  const oracleBytes = fs.readFileSync(sourceOraclePath);
+  const oracle = JSON.parse(oracleBytes.toString('utf8'));
+  if (oracle.version !== 1 || oracle.commit !== expectHead || !/^[0-9a-f]{40}$/.test(oracle.tree || '')) {
+    throw new Error('source oracle does not bind the requested Git commit/tree');
+  }
+  if (treeSha256(oracle.files) !== oracle.sourceTreeSha256) throw new Error('source oracle digest mismatch');
+  const initialSource = entriesFor(buildRoot, sourcePaths(buildRoot));
+  if (!sameEntries(initialSource, oracle.files)) {
+    const oracleByPath = new Map(oracle.files.map((row) => [row.path, row.sha256]));
+    const sourceByPath = new Map(initialSource.map((row) => [row.path, row.sha256]));
+    const mismatches = [...new Set([...oracleByPath.keys(), ...sourceByPath.keys()])]
+      .filter((p) => oracleByPath.get(p) !== sourceByPath.get(p));
+    throw new Error(`source does not match Git oracle for ${expectHead}: ${mismatches.slice(0, 8).join(',')}`);
   }
   const inputHead = readInputHead(buildRoot);
   if (inputHead !== expectHead) throw new Error(`input head mismatch: input=${inputHead} expect=${expectHead}`);
@@ -156,25 +193,33 @@ function main() {
       throw new Error(`build does not match clean source compile: ${mismatches.slice(0, 8).join(',')}`);
     }
     const source = entriesFor(buildRoot, sourcePaths(buildRoot));
+    if (!sameEntries(source, initialSource)) throw new Error('source changed during provenance build');
     const manifest = {
-      version: 1,
+      version: 2,
       verifiedHead: expectHead,
       buildRoot,
+      sourceOracle: {
+        sha256: sha256File(sourceOraclePath),
+        commit: oracle.commit,
+        tree: oracle.tree,
+      },
       source: { treeSha256: treeSha256(source), files: source },
       build: { treeSha256: treeSha256(built), files: built },
       guardSha256: sha256File(path.join(buildRoot, 'test/support/guard.cjs')),
       scenarioDriverSha256: sha256File(path.join(buildRoot, 'test/support/prune-scenarios.cjs')),
       provenanceBuilderSha256: sha256File(__filename),
+      sourceOracleBuilderSha256: sha256File(path.join(buildRoot, 'test/support/source-oracle.cjs')),
       compiler: {
         executable: process.execPath,
         typescriptVersion: require(path.join(buildRoot, 'node_modules/typescript/package.json')).version,
       },
     };
-    fs.mkdirSync(path.dirname(output), { recursive: true });
     fs.writeFileSync(output, `${JSON.stringify(manifest, null, 2)}\n`, { flag: 'wx' });
     process.stdout.write(`${JSON.stringify({
       manifest: output,
       verifiedHead: manifest.verifiedHead,
+      gitTree: manifest.sourceOracle.tree,
+      sourceOracleSha256: manifest.sourceOracle.sha256,
       sourceTreeSha256: manifest.source.treeSha256,
       buildTreeSha256: manifest.build.treeSha256,
     })}\n`);

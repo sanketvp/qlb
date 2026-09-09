@@ -169,7 +169,16 @@ function wrapNetConnect(orig) {
       port = typeof inspectedArgs[1] === 'number' ? inspectedArgs[1] : null;
     } else if (first && typeof first === 'object') {
       if (first.path != null) denied('net', 'unix');
-      host = first.hostname || first.host || first.address;
+      if (typeof first.lookup === 'function') denied('net', 'custom-lookup');
+      if (first.hostname != null && first.hostname !== first.host) {
+        denied('net', 'ambiguous-hostname');
+      }
+      if (first.address != null && first.address !== first.host) {
+        denied('net', 'ambiguous-address');
+      }
+      // Installed Node net/Socket routing consumes options.host || localhost;
+      // hostname/address are not destination aliases for this API.
+      host = first.host || 'localhost';
       port = first.port;
     }
     assertOwnedLoopback({ host: normalizeHost(host), port: port == null ? null : Number(port) }, 'net');
@@ -213,11 +222,9 @@ function isNodeExec(file) {
 
 function withPreload(argv) {
   const list = Array.isArray(argv) ? argv.slice() : [];
-  for (let i = 0; i < list.length - 1; i++) {
-    if (list[i] === '--require' && path.resolve(String(list[i + 1])) === path.resolve(GUARD_FILE)) {
-      return list;
-    }
-  }
+  // Never scan application argv for an apparent preload: Node stops parsing
+  // runtime options at the script entry or `--`. Duplicate loading is safe
+  // (CommonJS caches this file); a false exemption is not.
   return ['--require', GUARD_FILE, ...list];
 }
 

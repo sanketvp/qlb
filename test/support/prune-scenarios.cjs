@@ -25,13 +25,22 @@ function sha256(file) {
 
 const buildRoot = path.resolve(arg('--build-root', process.cwd()));
 const expectHead = arg('--expect-head');
-const provenancePath = path.resolve(arg('--provenance-manifest', ''));
+const provenanceArg = path.resolve(arg('--provenance-manifest', ''));
+const sourceOracleArg = path.resolve(arg('--source-oracle', ''));
 const artifactRoot = path.resolve(arg('--artifact-root', path.join(os.tmpdir(), 'qlb-scenarios')));
 if (!expectHead || !/^[0-9a-f]{40}$/.test(expectHead)) die(`invalid or missing --expect-head: ${expectHead || ''}`);
 if (!arg('--provenance-manifest')) die('missing --provenance-manifest from trusted verifier preflight');
-if (!fs.existsSync(provenancePath)) die(`provenance manifest missing: ${provenancePath}`);
-if (provenancePath === buildRoot || provenancePath.startsWith(`${buildRoot}${path.sep}`)) {
+if (!arg('--source-oracle')) die('missing --source-oracle anchored to the requested Git commit');
+if (!fs.existsSync(provenanceArg)) die(`provenance manifest missing: ${provenanceArg}`);
+if (!fs.existsSync(sourceOracleArg)) die(`source oracle missing: ${sourceOracleArg}`);
+const buildRootRealpath = fs.realpathSync(buildRoot);
+const provenancePath = fs.realpathSync(provenanceArg);
+const sourceOraclePath = fs.realpathSync(sourceOracleArg);
+if (provenancePath === buildRootRealpath || provenancePath.startsWith(`${buildRootRealpath}${path.sep}`)) {
   die('provenance manifest must be outside build root');
+}
+if (sourceOraclePath === buildRootRealpath || sourceOraclePath.startsWith(`${buildRootRealpath}${path.sep}`)) {
+  die('source oracle must be outside build root');
 }
 if (artifactRoot.includes('qlb-astra-16f1642') || artifactRoot.includes('qlb-astra-bcd9dfc')) {
   die('refusing to write into historical Astra evidence paths');
@@ -41,7 +50,7 @@ let provenance;
 let binding;
 try {
   provenance = JSON.parse(fs.readFileSync(provenancePath, 'utf8'));
-  binding = verifyManifest(buildRoot, provenance, expectHead);
+  binding = verifyManifest(buildRoot, provenance, expectHead, sourceOraclePath);
 } catch (err) {
   die(`provenance rejected: ${err instanceof Error ? err.message : String(err)}`);
 }
@@ -377,6 +386,9 @@ function runProtectedWriter(id, fixture) {
     artifactRoot,
     provenanceManifest: provenancePath,
     provenanceManifestSha256: sha256(provenancePath),
+    sourceOracle: sourceOraclePath,
+    sourceOracleSha256: sha256(sourceOraclePath),
+    gitTree: provenance.sourceOracle.tree,
     sourceTreeSha256: binding.sourceTreeSha256,
     buildTreeSha256: binding.buildTreeSha256,
     guardSha256: provenance.guardSha256,

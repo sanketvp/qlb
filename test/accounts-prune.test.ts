@@ -1243,13 +1243,37 @@ function independentHead(root: string): string {
 
 describe('T-SCEN parameterized driver',
   () => {
-    function prepareProvenance(root: string, head: string, output: string): void {
-      const builder = join(root, 'test', 'support', 'build-provenance.cjs');
+    function sourceOracle(root: string, head: string, trustedDir: string): string {
+      const supplied = process.env.QLB_TEST_SOURCE_ORACLE;
+      if (supplied) return supplied;
+      const oracle = join(trustedDir, 'source-oracle.json');
+      const generator = join(root, 'test', 'support', 'source-oracle.cjs');
       const result = spawnSync(
         process.execPath,
-        [builder, '--build-root', root, '--expect-head', head, '--output', output],
+        [
+          generator, '--trusted-repo', root, '--expect-head', head,
+          '--candidate-root', root, '--output', oracle,
+        ],
         { encoding: 'utf8', timeout: 60_000 },
       );
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+      return oracle;
+    }
+
+    function runProvenance(root: string, head: string, oracle: string, output: string) {
+      const builder = join(root, 'test', 'support', 'build-provenance.cjs');
+      return spawnSync(
+        process.execPath,
+        [
+          builder, '--build-root', root, '--expect-head', head,
+          '--source-oracle', oracle, '--output', output,
+        ],
+        { encoding: 'utf8', timeout: 60_000 },
+      );
+    }
+
+    function prepareProvenance(root: string, head: string, oracle: string, output: string): void {
+      const result = runProvenance(root, head, oracle, output);
       assert.equal(result.status, 0, result.stderr || result.stdout);
     }
 
@@ -1257,6 +1281,7 @@ describe('T-SCEN parameterized driver',
       root: string;
       expectHead: string;
       provenance: string;
+      oracle: string;
       artifact: string;
       guarded?: boolean;
     }) {
@@ -1270,6 +1295,7 @@ describe('T-SCEN parameterized driver',
           '--build-root', opts.root,
           '--expect-head', opts.expectHead,
           '--provenance-manifest', opts.provenance,
+          '--source-oracle', opts.oracle,
           '--artifact-root', opts.artifact,
         ],
         { encoding: 'utf8', timeout: 90_000 },
@@ -1282,10 +1308,11 @@ describe('T-SCEN parameterized driver',
       const trusted = mkdtempSync(join(tmpdir(), 'qlb-provenance-'));
       temps.push(artifact, trusted);
       const head = independentHead(root);
+      const oracle = sourceOracle(root, head, trusted);
       const provenance = join(trusted, 'build-provenance.json');
-      prepareProvenance(root, head, provenance);
+      prepareProvenance(root, head, oracle, provenance);
       writeFileSync(join(artifact, 'HEAD.receipt'), `${'f'.repeat(40)}\n`);
-      const result = runScenarioDriver({ root, expectHead: head, provenance, artifact });
+      const result = runScenarioDriver({ root, expectHead: head, provenance, oracle, artifact });
       assert.equal(result.status, 0, result.stderr || result.stdout);
       const report = JSON.parse(readFileSync(join(artifact, 'scenarios.json'), 'utf8')) as {
         testedHead: string;
@@ -1321,12 +1348,21 @@ describe('T-SCEN parameterized driver',
       }
       symlinkSync(join(root, 'node_modules'), join(fixture, 'node_modules'), 'dir');
       writeFileSync(join(fixture, 'HEAD.receipt'), `${head}\n`);
+      const oracle = sourceOracle(root, head, trusted);
+      const source = join(fixture, 'src', 'accounts-prune.ts');
+      const originalSource = readFileSync(source, 'utf8');
+      writeFileSync(source, `${originalSource}\n// mixed-source-before-preflight\n`);
+      const mixed = runProvenance(fixture, head, oracle, join(trusted, 'must-not-exist.json'));
+      assert.equal(mixed.status, 2, mixed.stderr || mixed.stdout);
+      assert.match(mixed.stderr, /source does not match Git oracle/);
+      writeFileSync(source, originalSource);
+
       const provenance = join(trusted, 'build-provenance.json');
-      prepareProvenance(fixture, head, provenance);
+      prepareProvenance(fixture, head, oracle, provenance);
 
       const fake = 'f'.repeat(40);
       const mismatch = runScenarioDriver({
-        root: fixture, expectHead: fake, provenance,
+        root: fixture, expectHead: fake, provenance, oracle,
         artifact: join(trusted, 'mismatch-artifacts'), guarded: false,
       });
       assert.equal(mismatch.status, 2, mismatch.stderr || mismatch.stdout);
@@ -1336,17 +1372,16 @@ describe('T-SCEN parameterized driver',
       const originalBinary = readFileSync(binary, 'utf8');
       writeFileSync(binary, `${originalBinary}\n// stale binary fixture\n`);
       const stale = runScenarioDriver({
-        root: fixture, expectHead: head, provenance,
+        root: fixture, expectHead: head, provenance, oracle,
         artifact: join(trusted, 'stale-artifacts'), guarded: false,
       });
       assert.equal(stale.status, 2, stale.stderr || stale.stdout);
       assert.match(stale.stderr, /build provenance mismatch: dist\/accounts-prune\.js/);
       writeFileSync(binary, originalBinary);
 
-      const source = join(fixture, 'src', 'accounts-prune.ts');
       writeFileSync(source, `${readFileSync(source, 'utf8')}\n// modified source fixture\n`);
       const modified = runScenarioDriver({
-        root: fixture, expectHead: head, provenance,
+        root: fixture, expectHead: head, provenance, oracle,
         artifact: join(trusted, 'modified-artifacts'), guarded: false,
       });
       assert.equal(modified.status, 2, modified.stderr || modified.stdout);

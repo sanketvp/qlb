@@ -62,7 +62,12 @@ const results = [
   run('net-path-override', () => net.connect({ host: '127.0.0.1', port: 31819, path: '/tmp/qlb-inert-not-a-real-socket' })),
   run('node-child-preload-propagation', () => cp.spawnSync(process.execPath, ['-e', '/* inert fixture */'], { env: { HOME: process.env.HOME } })),
   run('node-child-arbitrary-selftest-basename', () => cp.spawnSync(process.execPath, ['-e', '/* inert fixture */', 'guard-inert-selftest.cjs'], { env: { HOME: process.env.HOME } })),
+  run('node-child-preload-after-script', () => cp.spawnSync(process.execPath, ['fixture.js', '--require', guard.GUARD_FILE], { env: { HOME: process.env.HOME } })),
+  run('node-child-preload-after-terminator', () => cp.spawnSync(process.execPath, ['-e', '/* inert fixture */', '--', '--require', guard.GUARD_FILE], { env: { HOME: process.env.HOME } })),
   run('node-child-shell-option', () => cp.spawnSync(process.execPath, ['-e', '/* inert fixture */'], { shell: true, env: { HOME: process.env.HOME } })),
+  run('socket-conflicting-hostname', () => new net.Socket().connect({
+    host: 'external-fixture.invalid', hostname: '127.0.0.1', port: 31819,
+  })),
   run('non-node-control', () => cp.spawnSync('sh', ['-c', '/* inert */'])),
 ];
 
@@ -104,6 +109,7 @@ for (const name of [
   'http-socket-path',
   'net-path-override',
   'node-child-shell-option',
+  'socket-conflicting-hostname',
   'non-node-control',
   'default-native-reader',
 ]) expectDenied(name);
@@ -111,7 +117,12 @@ for (const name of [
 if (!byName.get('owned-loopback-control')?.underlyingStubReached || byName.get('owned-loopback-control')?.error) {
   failures.push('owned-loopback-control');
 }
-for (const name of ['node-child-preload-propagation', 'node-child-arbitrary-selftest-basename']) {
+for (const name of [
+  'node-child-preload-propagation',
+  'node-child-arbitrary-selftest-basename',
+  'node-child-preload-after-script',
+  'node-child-preload-after-terminator',
+]) {
   const row = byName.get(name);
   const argv = row?.captured?.[0]?.args?.[1] || [];
   const injected = Array.isArray(argv)
