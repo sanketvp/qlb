@@ -6,148 +6,105 @@ import { describe, it } from 'node:test';
 
 import { defaultConfig } from '../src/config';
 import { doctorQlb } from '../src/diagnostics';
+import { validatedAdvisoryMessage } from '../src/migration-health';
 import { openStore } from '../src/store';
 
-async function doctorMigrations(
+async function doctorReport(
   home: string,
-  seed: (store: ReturnType<typeof openStore>, config: ReturnType<typeof defaultConfig>) => void,
+  seed: (store: ReturnType<typeof openStore>) => void,
 ) {
   const config = defaultConfig(home);
   const store = openStore(config.dbPath);
-  seed(store, config);
+  seed(store);
   store.close();
-  const report = await doctorQlb(config, {
+  return doctorQlb(config, {
     command: (_command, args) => args[0] === 'list-keychains' ? 'ok' : '',
   });
-  return report.checks.find((check) => check.name === 'migrations');
 }
 
 describe('qlb doctor', () => {
-  it('passes SQLite integrity and prominently warns about an incomplete migration', async () => {
+  it('passes SQLite integrity and WARNs for an in-flight MIRRORED migration', async () => {
     const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-test-'));
-    const config = defaultConfig(home);
-    const store = openStore(config.dbPath);
-    store.upsertMigration('pi-pool', 'MIRRORED', JSON.stringify({ qlbAccountIds: ['acct-a'] }));
-    store.close();
-
-    const report = await doctorQlb(config, {
-      command: (_command, args) => args[0] === 'list-keychains' ? 'ok' : '',
+    const report = await doctorReport(home, (store) => {
+      store.upsertMigration('pi-pool', 'MIRRORED', JSON.stringify({ qlbAccountIds: ['acct-a'] }));
     });
     assert.equal(report.checks.find((check) => check.name === 'sqlite')?.level, 'PASS');
     const migration = report.checks.find((check) => check.name === 'migrations');
     assert.equal(migration?.level, 'WARN');
-    assert.match(migration?.message ?? '', /migrate resume or qlb migrate rollback/);
+    assert.match(migration?.message ?? '', /pi-pool=MIRRORED/);
     assert.equal(report.overall, 'WARN');
   });
 
-  it('treats post-rollback VALIDATED with ownerFile absent as PASS, not WARN', async () => {
+  it('T-DOC-1: VALIDATED is advisory WARN, not complete/terminal/rolled-back', async () => {
     const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-validated-'));
-    const migration = await doctorMigrations(home, (store) => {
+    const report = await doctorReport(home, (store) => {
       store.upsertMigration('pi-pool', 'VALIDATED', JSON.stringify({
         qlbAccountIds: ['acct-a'],
         rolledBackFrom: 'post-commit',
         ownerFilePath: join(home, '.pi', 'agent', 'qlb-owner.json'),
       }));
     });
-    assert.equal(migration?.level, 'PASS');
-    assert.match(migration?.message ?? '', /no incomplete migrations/);
+    const migration = report.checks.find((check) => check.name === 'migrations');
+    assert.equal(migration?.level, 'WARN');
+    const expected = validatedAdvisoryMessage('pi-pool', 1);
+    assert.match(migration?.message ?? '', new RegExp(expected.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+    assert.doesNotMatch(migration?.message ?? '', /terminal/i);
+    assert.match(migration?.message ?? '', /not distinguished/);
   });
 
-  it('still WARNs for VALIDATED when the owner file is mid-flight (present)', async () => {
+  it('WARNs for pre-switch VALIDATED with owner file present', async () => {
     const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-validated-mid-'));
     const ownerDir = join(home, '.pi', 'agent');
     mkdirSync(ownerDir, { recursive: true });
     const ownerFile = join(ownerDir, 'qlb-owner.json');
     writeFileSync(ownerFile, '{"owner":"qlb"}\n');
-    const migration = await doctorMigrations(home, (store) => {
+    const report = await doctorReport(home, (store) => {
       store.upsertMigration('pi-pool', 'VALIDATED', JSON.stringify({
         qlbAccountIds: ['acct-a'],
         ownerFilePath: ownerFile,
       }));
     });
+    const migration = report.checks.find((check) => check.name === 'migrations');
     assert.equal(migration?.level, 'WARN');
+    assert.match(migration?.message ?? '', /prune-protected/);
   });
 
-  it('WARNs for VALIDATED with malformed JSON', async () => {
+  it('WARNs untrusted VALIDATED JSON with the reason token', async () => {
     const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-validated-badjson-'));
-    const migration = await doctorMigrations(home, (store) => {
+    const report = await doctorReport(home, (store) => {
       store.upsertMigration('pi-pool', 'VALIDATED', 'not-json');
     });
+    const migration = report.checks.find((check) => check.name === 'migrations');
     assert.equal(migration?.level, 'WARN');
+    assert.match(migration?.message ?? '', /untrusted \(malformed_json\)/);
   });
 
-  it('WARNs for VALIDATED with missing ownerFilePath (does not guess default)', async () => {
-    const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-validated-nopath-'));
-    const migration = await doctorMigrations(home, (store) => {
-      store.upsertMigration('pi-pool', 'VALIDATED', JSON.stringify({
-        qlbAccountIds: ['acct-a'],
-        rolledBackFrom: 'post-commit',
+  it('native-retirement RETIRED with valid shape is not stuck (N1)', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-retired-'));
+    const report = await doctorReport(home, (store) => {
+      store.upsertMigration('claude-code', 'RETIRED', JSON.stringify({
+        retiredAt: Date.now(),
+        retiredPath: '/tmp/cc',
+        backupPath: '/tmp/cc.pre-qlb',
+        sidecarPath: '/tmp/cc.pre-qlb.sidecar.json',
+        fingerprint: 'ab'.repeat(32),
       }));
     });
-    assert.equal(migration?.level, 'WARN');
+    const migration = report.checks.find((check) => check.name === 'migrations');
+    assert.equal(migration?.level, 'PASS');
   });
 
-  it('WARNs for VALIDATED with empty ownerFilePath', async () => {
-    const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-validated-emptypath-'));
-    const migration = await doctorMigrations(home, (store) => {
-      store.upsertMigration('pi-pool', 'VALIDATED', JSON.stringify({
-        qlbAccountIds: ['acct-a'],
-        ownerFilePath: '',
-        rolledBackFrom: 'post-commit',
-      }));
+  it('WARNs when recovery marker is present', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-recovery-'));
+    const report = await doctorReport(home, (store) => {
+      store.setConfig('migrations.recovery_pending', '1');
     });
-    assert.equal(migration?.level, 'WARN');
-  });
-
-  it('WARNs for VALIDATED with wrong-typed ownerFilePath even if custom staging exists', async () => {
-    const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-validated-wrongpath-'));
-    const customOwner = join(home, 'custom-owner.json');
-    writeFileSync(`${customOwner}.staging`, '{"owner":"qlb"}\n');
-    const migration = await doctorMigrations(home, (store) => {
-      store.upsertMigration('pi-pool', 'VALIDATED', JSON.stringify({
-        qlbAccountIds: ['acct-a'],
-        ownerFilePath: 123,
-      }));
-    });
-    assert.equal(migration?.level, 'WARN');
-  });
-
-  it('WARNs for VALIDATED with files absent but missing rollback evidence', async () => {
-    const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-validated-noreb-'));
-    const ownerFile = join(home, '.pi', 'agent', 'qlb-owner.json');
-    const migration = await doctorMigrations(home, (store) => {
-      store.upsertMigration('pi-pool', 'VALIDATED', JSON.stringify({
-        qlbAccountIds: ['acct-a'],
-        ownerFilePath: ownerFile,
-      }));
-    });
-    assert.equal(migration?.level, 'WARN');
-  });
-
-  it('WARNs for VALIDATED with invalid rolledBackFrom', async () => {
-    const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-validated-badreb-'));
-    const ownerFile = join(home, '.pi', 'agent', 'qlb-owner.json');
-    const migration = await doctorMigrations(home, (store) => {
-      store.upsertMigration('pi-pool', 'VALIDATED', JSON.stringify({
-        qlbAccountIds: ['acct-a'],
-        ownerFilePath: ownerFile,
-        rolledBackFrom: 'pre-commit',
-      }));
-    });
-    assert.equal(migration?.level, 'WARN');
-  });
-
-  it('WARNs for VALIDATED with empty/mixed qlbAccountIds even with rollback evidence', async () => {
-    const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-validated-emptyids-'));
-    const ownerFile = join(home, '.pi', 'agent', 'qlb-owner.json');
-    const migration = await doctorMigrations(home, (store) => {
-      store.upsertMigration('pi-pool', 'VALIDATED', JSON.stringify({
-        qlbAccountIds: ['ok', ''],
-        ownerFilePath: ownerFile,
-        rolledBackFrom: 'post-commit',
-      }));
-    });
-    assert.equal(migration?.level, 'WARN');
+    const recovery = report.checks.find((check) => check.name === 'recovery');
+    assert.equal(recovery?.level, 'WARN');
+    assert.equal(
+      recovery?.message,
+      'recovery marker present — destructive maintenance refused until reconciled',
+    );
   });
 
   it('returns FAIL for a corrupt SQLite store', async () => {

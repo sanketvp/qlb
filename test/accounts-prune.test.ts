@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -135,7 +135,7 @@ describe('accounts-prune', () => {
 
     assert.throws(
       () => pruneAccount(store, { accountId: 'account-orphan', confirm: false }),
-      (err: unknown) => err instanceof PruneRefusedError && /--confirm/.test(err.message),
+      (err: unknown) => err instanceof PruneRefusedError && /not_confirmed/.test(err.message),
     );
     assert.ok(store.getAccount('account-orphan'));
     store.close();
@@ -145,7 +145,7 @@ describe('accounts-prune', () => {
     const store = openTempStore();
     assert.throws(
       () => pruneAccount(store, { accountId: 'does-not-exist', confirm: true }),
-      (err: unknown) => err instanceof PruneRefusedError && /no account found/.test(err.message),
+      (err: unknown) => err instanceof PruneRefusedError && /no_such_account/.test(err.message),
     );
     store.close();
   });
@@ -199,7 +199,7 @@ describe('accounts-prune fail-closed journal parse', () => {
     assert.equal(checkAccountOwnership(store, 'acct-malformed').owned, true);
     assert.throws(
       () => pruneAccount(store, { accountId: 'acct-malformed', confirm: true }),
-      (err: unknown) => err instanceof PruneRefusedError && /cannot be proven unowned/.test(err.message),
+      (err: unknown) => err instanceof PruneRefusedError && /untrusted:/.test(err.message),
     );
     assert.ok(store.getAccount('acct-malformed'));
     store.close();
@@ -243,7 +243,7 @@ describe('accounts-prune fail-closed journal parse', () => {
     assert.throws(
       () => pruneAccount(store, { accountId: 'acct-empty-id', confirm: true }),
       (err: unknown) =>
-        err instanceof PruneRefusedError && /cannot be proven unowned/.test(err.message),
+        err instanceof PruneRefusedError && /untrusted:/.test(err.message),
     );
     assert.ok(store.getAccount('acct-empty-id'));
     store.close();
@@ -255,7 +255,7 @@ describe('accounts-prune fail-closed journal parse', () => {
     store.upsertMigration('pi-pool', 'QLB_OWNED', JSON.stringify({ qlbAccountIds: [''] }), Date.now());
     assert.throws(
       () => pruneAccount(store, { accountId: 'victim', confirm: true }),
-      (err: unknown) => err instanceof PruneRefusedError && /cannot be proven unowned/.test(err.message),
+      (err: unknown) => err instanceof PruneRefusedError && /untrusted:/.test(err.message),
     );
     assert.ok(store.getAccount('victim'));
     store.close();
@@ -272,7 +272,7 @@ describe('accounts-prune fail-closed journal parse', () => {
     );
     assert.throws(
       () => pruneAccount(store, { accountId: 'victim', confirm: true }),
-      (err: unknown) => err instanceof PruneRefusedError && /cannot be proven unowned/.test(err.message),
+      (err: unknown) => err instanceof PruneRefusedError && /untrusted:/.test(err.message),
     );
     assert.ok(store.getAccount('victim'));
     store.close();
@@ -308,7 +308,7 @@ describe('accounts-prune fail-closed journal parse (owned via accounts[].id)', (
     store.upsertMigration('other-pool', 'QLB_OWNED', 'not-json', Date.now());
     assert.throws(
       () => pruneAccount(store, { accountId: 'account-orphan', confirm: true }),
-      (err: unknown) => err instanceof PruneRefusedError && /cannot be proven unowned/.test(err.message),
+      (err: unknown) => err instanceof PruneRefusedError && /untrusted:/.test(err.message),
     );
     assert.ok(store.getAccount('account-orphan'));
     store.close();
@@ -329,7 +329,7 @@ describe('accounts-prune in-flight migration refusal', () => {
       () => pruneAccount(store, { accountId: 'account-mirrored', confirm: true }),
       (err: unknown) =>
         err instanceof PruneRefusedError &&
-        /in-flight migration/.test(err.message) &&
+        /protected:/.test(err.message) &&
         /MIRRORED/.test(err.message),
     );
     assert.ok(store.getAccount('account-mirrored'));
@@ -354,14 +354,14 @@ describe('accounts-prune in-flight migration refusal', () => {
       () => pruneAccount(store, { accountId: 'account-validated', confirm: true }),
       (err: unknown) =>
         err instanceof PruneRefusedError &&
-        /in-flight migration/.test(err.message) &&
+        /protected:/.test(err.message) &&
         /VALIDATED/.test(err.message),
     );
     assert.ok(store.getAccount('account-validated'));
     store.close();
   });
 
-  it('allows prune of a completed post-commit-rollback VALIDATED (owner absent)', () => {
+  it('REFUSES prune of a completed post-commit-rollback VALIDATED (option A)', () => {
     const store = openTempStore();
     seedOrphanAccount(store, 'account-rolled-back');
     const ownerFile = join(dirname(store.dbPath), 'qlb-owner.json');
@@ -376,10 +376,13 @@ describe('accounts-prune in-flight migration refusal', () => {
       Date.now(),
     );
     const check = checkAccountOwnership(store, 'account-rolled-back');
-    assert.equal(check.owned, false);
-    const result = pruneAccount(store, { accountId: 'account-rolled-back', confirm: true });
-    assert.equal(result.ok, true);
-    assert.equal(store.getAccount('account-rolled-back'), null);
+    assert.equal(check.owned, true);
+    assert.equal(check.token, 'protected:VALIDATED');
+    assert.throws(
+      () => pruneAccount(store, { accountId: 'account-rolled-back', confirm: true }),
+      (err: unknown) => err instanceof PruneRefusedError && /protected:VALIDATED/.test((err as Error).message),
+    );
+    assert.ok(store.getAccount('account-rolled-back'));
     store.close();
   });
 
@@ -390,7 +393,7 @@ describe('accounts-prune in-flight migration refusal', () => {
     store.upsertMigration('pi-pool', 'VALIDATED', detailJson, Date.now());
     assert.throws(
       () => pruneAccount(store, { accountId: 'victim', confirm: true }),
-      (err: unknown) => err instanceof PruneRefusedError && /cannot be proven unowned|in-flight/.test((err as Error).message),
+      (err: unknown) => err instanceof PruneRefusedError && /untrusted:|protected:/.test((err as Error).message),
     );
     assert.ok(store.getAccount('victim'));
     store.close();
@@ -446,7 +449,7 @@ describe('accounts-prune in-flight migration refusal', () => {
     );
     assert.throws(
       () => pruneAccount(store, { accountId: 'victim', confirm: true }),
-      (err: unknown) => err instanceof PruneRefusedError && /cannot be proven unowned/.test((err as Error).message),
+      (err: unknown) => err instanceof PruneRefusedError && /protected:VALIDATED/.test((err as Error).message),
     );
     assert.ok(store.getAccount('victim'));
     store.close();
@@ -652,7 +655,7 @@ describe('accounts-prune vs Migration.stage() pre-journal window', () => {
           () => pruneAccount(peer, { accountId: id, confirm: true }),
           (err: unknown) =>
             err instanceof PruneRefusedError &&
-            /in-flight migration/.test((err as Error).message) &&
+            /protected:/.test((err as Error).message) &&
             /MIRRORED/.test((err as Error).message),
         );
         pruneRefusedWhileVisible = true;
@@ -717,7 +720,7 @@ describe('accounts-prune CLI exit codes', () => {
       { ...process.env, QLB_DB_PATH: dbPath },
     );
     assert.equal(result.status, 2, result.stderr || result.stdout);
-    assert.match(result.stderr, /cannot be proven unowned/);
+    assert.match(result.stderr, /untrusted:/);
   });
 
   it('exits 2 when QLB_OWNED qlbAccountIds is [""]', () => {
@@ -731,7 +734,7 @@ describe('accounts-prune CLI exit codes', () => {
       { ...process.env, QLB_DB_PATH: dbPath },
     );
     assert.equal(result.status, 2, result.stderr || result.stdout);
-    assert.match(result.stderr, /cannot be proven unowned/);
+    assert.match(result.stderr, /untrusted:/);
   });
 
   it('exits 2 when QLB_OWNED qlbAccountIds is ["ok",""]', () => {
@@ -750,7 +753,7 @@ describe('accounts-prune CLI exit codes', () => {
       { ...process.env, QLB_DB_PATH: dbPath },
     );
     assert.equal(result.status, 2, result.stderr || result.stdout);
-    assert.match(result.stderr, /cannot be proven unowned/);
+    assert.match(result.stderr, /untrusted:/);
   });
 
   it('exits 2 when VALIDATED detail is malformed JSON', () => {
@@ -765,7 +768,7 @@ describe('accounts-prune CLI exit codes', () => {
       { ...process.env, QLB_DB_PATH: dbPath, QLB_PI_AUTH_JSON_PATH: isolatedAuth },
     );
     assert.equal(result.status, 2, result.stderr || result.stdout);
-    assert.match(result.stderr, /cannot be proven unowned/);
+    assert.match(result.stderr, /untrusted:/);
   });
 
   it('exits 2 when the account id does not exist', () => {
@@ -777,6 +780,245 @@ describe('accounts-prune CLI exit codes', () => {
       { ...process.env, QLB_DB_PATH: dbPath },
     );
     assert.equal(result.status, 2, result.stderr || result.stdout);
-    assert.match(result.stderr, /no account found/);
+    assert.match(result.stderr, /no_such_account/);
   });
+
+  it('T-EXIT-1: missing --confirm exits 2 with not_confirmed',
+    () => {
+      const store = openTempStore();
+      seedOrphanAccount(store);
+      const dbPath = store.dbPath;
+      store.close();
+      const result = runCli(
+        ['accounts', 'prune', '--account', 'account-orphan', '--db', dbPath],
+        { ...process.env, QLB_DB_PATH: dbPath },
+      );
+      assert.equal(result.status, 2, result.stderr || result.stdout);
+      assert.match(result.stderr, /^qlb accounts prune: REFUSED: not_confirmed|^REFUSED: not_confirmed/m);
+    },
+  );
+
+  it('missing --account is usage exit 1',
+    () => {
+      const store = openTempStore();
+      const dbPath = store.dbPath;
+      store.close();
+      const result = runCli(['accounts', 'prune', '--confirm', '--db', dbPath], {
+        ...process.env,
+        QLB_DB_PATH: dbPath,
+      });
+      assert.equal(result.status, 1, result.stderr || result.stdout);
+    },
+  );
 });
+
+describe('T-PRUNE-1 valid Pi inventory',
+  () => {
+    it('equal dual lists prune an unrelated target and protect named ones', () => {
+      const store = openTempStore();
+      store.upsertAccount('a', 'anthropic', 'a');
+      store.upsertAccount('b', 'anthropic', 'b');
+      store.upsertAccount('z', 'anthropic', 'z');
+      store.upsertMigration(
+        'pi-pool',
+        'QLB_OWNED',
+        JSON.stringify({
+          qlbAccountIds: ['a', 'b'],
+          accounts: [{ id: 'b' }, { id: 'a' }],
+        }),
+        Date.now(),
+      );
+      assert.throws(
+        () => pruneAccount(store, { accountId: 'a', confirm: true }),
+        (err: unknown) => err instanceof PruneRefusedError && /protected:QLB_OWNED/.test((err as Error).message),
+      );
+      const result = pruneAccount(store, { accountId: 'z', confirm: true });
+      assert.equal(result.ok, true);
+      assert.equal(store.getAccount('z'), null);
+      assert.ok(store.getAccount('a'));
+      store.close();
+    });
+  },
+);
+
+describe('T-ID provider consistency',
+  () => {
+    it('global provider_mismatch refuses an unrelated target', () => {
+      const store = openTempStore();
+      store.upsertAccount('a', 'anthropic', 'a');
+      store.upsertAccount('z', 'anthropic', 'z');
+      store.upsertMigration(
+        'pi-pool',
+        'QLB_OWNED',
+        JSON.stringify({
+          qlbAccountIds: ['a'],
+          accounts: [{ id: 'a', provider: 'xai' }],
+        }),
+        Date.now(),
+      );
+      assert.throws(
+        () => pruneAccount(store, { accountId: 'z', confirm: true }),
+        (err: unknown) =>
+          err instanceof PruneRefusedError && /untrusted:provider_mismatch/.test((err as Error).message),
+      );
+      assert.ok(store.getAccount('z'));
+      store.close();
+    });
+
+    it('pending MIRRORED participant without an account row is allowed',
+      () => {
+        const store = openTempStore();
+        store.upsertAccount('z', 'anthropic', 'z');
+        store.upsertMigration(
+          'pi-pool',
+          'MIRRORED',
+          JSON.stringify({
+            qlbAccountIds: ['pending'],
+            accounts: [{ id: 'pending', provider: 'anthropic' }],
+          }),
+          Date.now(),
+        );
+        const result = pruneAccount(store, { accountId: 'z', confirm: true });
+        assert.equal(result.ok, true);
+        store.close();
+      },
+    );
+  },
+);
+
+describe('T-TXN-2a delete abort preserves rows',
+  () => {
+    it('RAISE(ABORT) on accounts delete rolls back the cascade', () => {
+      const store = openTempStore();
+      seedOrphanAccount(store);
+      store.recordDecision({
+        requested_model: 'x',
+        mode: 'proxy',
+        reason: 'ok',
+        snapshot_json: '{}',
+        account_id: 'account-orphan',
+      });
+      const DatabaseSync = require('node:sqlite').DatabaseSync as typeof import('node:sqlite').DatabaseSync;
+      const raw = new DatabaseSync(store.dbPath);
+      raw.exec(`CREATE TRIGGER abort_accounts BEFORE DELETE ON accounts BEGIN
+        SELECT RAISE(ABORT, 'test-abort');
+      END;`);
+      raw.close();
+      assert.throws(() => pruneAccount(store, { accountId: 'account-orphan', confirm: true }));
+      assert.ok(store.getAccount('account-orphan'));
+      assert.ok(store.getAllSnapshots('account-orphan')['5h']);
+      store.close();
+    });
+  },
+);
+
+describe('T-KIND native-retirement writer',
+  () => {
+    it('retireNativeStore without inherited inventory: unrelated prune allowed; doctor PASS', async () => {
+      const { checkRetirementEligibility, MIN_OK_DECISIONS, retireNativeStore, SOAK_MS } = await import('../src/retire');
+      const { doctorQlb } = await import('../src/diagnostics');
+      const { defaultConfig } = await import('../src/config');
+      const dir = mkdtempSync(join(tmpdir(), 'qlb-kind-retire-'));
+      temps.push(dir);
+      const nativePath = join(dir, 'auth.json');
+      writeFileSync(nativePath, '{"tokens":{}}\n');
+      const store = openStore(join(dir, 'qlb.db'));
+      const committedAt = Date.now() - SOAK_MS - 86400000;
+      store.upsertMigration('codex-cli', 'QLB_OWNED', JSON.stringify({ committedAt }), committedAt);
+      for (let i = 0; i < MIN_OK_DECISIONS; i++) {
+        store.recordDecision({
+          ts: committedAt + 1000 + i,
+          harness: 'codex-cli',
+          requested_model: 'gpt-5.4',
+          mode: 'proxy',
+          reason: 'ok',
+          snapshot_json: JSON.stringify({ outcome: 'ok' }),
+        });
+      }
+      store.upsertAccount('unrelated', 'anthropic', 'u');
+      await retireNativeStore(store, 'codex-cli', {
+        nativePathToRemove: nativePath,
+        confirmRealRetirement: true,
+        pingFn: async () => true,
+      });
+      const result = pruneAccount(store, { accountId: 'unrelated', confirm: true });
+      assert.equal(result.ok, true);
+      const cfg = defaultConfig(dir);
+      cfg.dbPath = store.dbPath;
+      const report = await doctorQlb(cfg, { command: () => 'ok' });
+      const migration = report.checks.find((c) => c.name === 'migrations');
+      assert.equal(migration?.level, 'PASS');
+      store.close();
+    });
+
+    it('inherited nonempty inventory protects the named account', async () => {
+      const { MIN_OK_DECISIONS, retireNativeStore, SOAK_MS } = await import('../src/retire');
+      const dir = mkdtempSync(join(tmpdir(), 'qlb-kind-protect-'));
+      temps.push(dir);
+      const nativePath = join(dir, 'auth.json');
+      writeFileSync(nativePath, '{"x":1}\n');
+      const store = openStore(join(dir, 'qlb.db'));
+      const committedAt = Date.now() - SOAK_MS - 86400000;
+      store.upsertMigration(
+        'claude-code',
+        'QLB_OWNED',
+        JSON.stringify({
+          committedAt,
+          qlbAccountIds: ['victim'],
+          accounts: [{ id: 'victim', provider: 'anthropic' }],
+        }),
+        committedAt,
+      );
+      for (let i = 0; i < MIN_OK_DECISIONS; i++) {
+        store.recordDecision({
+          ts: committedAt + 1000 + i,
+          harness: 'claude-code',
+          requested_model: 'opus',
+          mode: 'proxy',
+          reason: 'ok',
+          snapshot_json: JSON.stringify({ outcome: 'ok' }),
+        });
+      }
+      store.upsertAccount('victim', 'anthropic', 'v');
+      store.upsertAccount('unrelated', 'anthropic', 'u');
+      await retireNativeStore(store, 'claude-code', {
+        nativePathToRemove: nativePath,
+        confirmRealRetirement: true,
+        pingFn: async () => true,
+      });
+      assert.throws(
+        () => pruneAccount(store, { accountId: 'victim', confirm: true }),
+        (err: unknown) => err instanceof PruneRefusedError && /protected:RETIRED/.test((err as Error).message),
+      );
+      const result = pruneAccount(store, { accountId: 'unrelated', confirm: true });
+      assert.equal(result.ok, true);
+      store.close();
+    });
+  },
+);
+
+describe('T-SCEN parameterized driver',
+  () => {
+    it('binds to the current head and expects F1/F2/F3 refusals', () => {
+      const root = join(__dirname, '..', '..');
+      const driver = join(root, 'test', 'support', 'prune-scenarios.cjs');
+      const artifact = mkdtempSync(join(tmpdir(), 'qlb-scen-'));
+      temps.push(artifact);
+      const gitHead = join(root, '.git', 'HEAD');
+      let head = readFileSync(gitHead, 'utf8').trim();
+      if (head.startsWith('ref: ')) {
+        head = readFileSync(join(root, '.git', head.slice(5).trim()), 'utf8').trim();
+      }
+      writeFileSync(join(artifact, 'HEAD.receipt'), `${head}\n`);
+      const result = spawnSync(
+        process.execPath,
+        [driver, '--build-root', root, '--expect-head', head, '--artifact-root', artifact],
+        { encoding: 'utf8', timeout: 30_000 },
+      );
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+      const report = JSON.parse(readFileSync(join(artifact, 'scenarios.json'), 'utf8')) as { testedHead: string; ok: boolean };
+      assert.equal(report.testedHead, head);
+      assert.equal(report.ok, true);
+    });
+  },
+);

@@ -480,9 +480,10 @@ function parseAccountsArgs(argsIn: string[]): AccountsOpts {
   }
   if (!confirm) {
     console.error(
-      'REFUSED: qlb accounts prune requires --confirm.\n' +
-        'This permanently deletes the account\'s rows from accounts/snapshots/overrides/poll_claims/leases.\n' +
-        'It is refused unconditionally if the account is QLB_OWNED, RETIRED, or in-flight (MIRRORED/VALIDATED).',
+      'REFUSED: not_confirmed — qlb accounts prune requires --confirm.\n' +
+        'This permanently deletes the account\'s local metadata rows (accounts/snapshots/overrides/poll_claims/leases).\n' +
+        'Credentials (Keychain, native stores, owner files) are never removed.\n' +
+        'Participants of any trusted MIRRORED/VALIDATED/QLB_OWNED/RETIRED journal row are refused, including after rollback (post-rollback prune is deferred).',
     );
     process.exit(2);
   }
@@ -1507,8 +1508,17 @@ async function main(): Promise<void> {
       process.exit(code);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      console.error(`qlb accounts ${opts.sub}: ${msg}`);
-      process.exit(err instanceof PruneRefusedError ? 2 : 1);
+      if (err instanceof PruneRefusedError) {
+        console.error(`qlb accounts ${opts.sub}: ${msg}`);
+        process.exit(2);
+      }
+      const rec = err && typeof err === 'object' ? (err as { code?: unknown; errcode?: unknown }) : {};
+      const bits: string[] = [];
+      if (rec.code != null) bits.push(`code=${String(rec.code)}`);
+      if (rec.errcode != null) bits.push(`errcode=${String(rec.errcode)}`);
+      const extra = bits.length > 0 ? ` [${bits.join(' ')}]` : '';
+      console.error(`qlb accounts ${opts.sub}: ${msg}${extra}`);
+      process.exit(1);
     }
   }
   if (opts.cmd === 'native-resync') {

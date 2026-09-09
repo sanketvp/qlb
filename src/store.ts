@@ -777,10 +777,10 @@ export class Store {
   }
 
   /**
-   * Atomically: read the account, inspect every migrations journal row, and
-   * cascade-delete only if the account is unowned and not in-flight.
-   * One BEGIN IMMEDIATE covers the check and the delete (closes the TOCTOU
-   * between a prior `listMigrations()` and `deleteAccountCascade()`).
+   * Atomically: read the account, recovery marker, decode every journal row,
+   * check provider consistency, and cascade-delete only if the account is
+   * unprotected. One BEGIN IMMEDIATE covers check+delete. No filesystem,
+   * Keychain, or network I/O inside this transaction.
    */
   pruneAccountIfUnowned(accountId: string):
     | {
@@ -797,9 +797,14 @@ export class Store {
     return this.runImmediate(() => {
       const account = this.getAccount(accountId);
       if (!account) {
-        return { deleted: false as const, reason: `no account found with id '${accountId}'` };
+        return { deleted: false as const, reason: 'no_such_account' };
       }
-      const safety = inspectAccountSafety(this.listMigrations(), accountId);
+      if (this.getConfig('migrations.recovery_pending') !== null) {
+        return { deleted: false as const, reason: 'recovery_pending' };
+      }
+      const safety = inspectAccountSafety(this.listMigrations(), accountId, (id) => {
+        return this.getAccount(id)?.provider ?? null;
+      });
       if (safety.unsafe) {
         return { deleted: false as const, reason: safetyRefusalMessage(accountId, safety) };
       }

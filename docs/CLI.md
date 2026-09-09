@@ -377,15 +377,25 @@ $ qlb accounts prune --account account-1699999999999 --confirm --json
 }
 ```
 
-Deletes the account's rows from `accounts`, `snapshots`, `overrides`, `poll_claims`, and the account's refresh `leases` row. `decisions` rows are left untouched (audit history, not live state). **Refused unconditionally** if the account is currently QLB_OWNED / RETIRED or participating in an in-flight migration (`MIRRORED` / pre-commit `VALIDATED`) — i.e. its ID appears in the `qlbAccountIds` (or `accounts[].id`) list of any `migrations` row in those states, or if such a row's `detail_json` cannot be trusted (malformed JSON, empty IDs, missing/invalid owner path, or ambiguous `VALIDATED`). A completed post-commit-rollback `VALIDATED` is not in-flight only when the journal proves it (`rolledBackFrom: 'post-commit'`, explicit `ownerFilePath`, owner and `.staging` both absent — same classifier `qlb doctor` uses):
+Deletes **local account metadata only**: `accounts`, `snapshots`, `overrides`, `poll_claims`, and the account's refresh `leases` row. Credentials are never removed, moved, or rewritten (Keychain items, native stores, `.pre-qlb` backups, sidecars, owner files). `decisions` / `errors` rows are left untouched (audit history, not live state).
+
+**Refused (exit 2)** with a stable reason token:
+
+- `protected:<STATE>` — the account is named by a trusted `MIRRORED`, `VALIDATED`, `QLB_OWNED`, or `RETIRED` journal row **including after a completed rollback**. Post-rollback prune of `VALIDATED` participants is deferred until a separately reviewed cycle-bound receipt protocol and current-grant rollback both exist.
+- `untrusted:<reason>` — some journal row cannot be decoded (malformed JSON, empty/mismatched inventories, bad shape, unknown store/state/version, provider conflict, …).
+- `recovery_pending` — `config('migrations.recovery_pending')` is set; destructive maintenance is refused until an explicit reviewed reconciliation clears it.
+- `no_such_account` — the id does not exist.
+- `not_confirmed` — `--confirm` was not passed.
+
+Usage errors (unknown subcommand/flag, missing `--account`) exit **1**. Infrastructure errors (SQLite, I/O) exit **1** and print the original error `code`/`errcode`/message. Refusals name the store and never print a command that could delete or rewrite credentials.
 
 ```console
 $ qlb accounts prune --account account-1 --confirm
-REFUSED: account 'account-1' is QLB_OWNED (via store 'pi-pool', state QLB_OWNED); will not prune a real owned account
+REFUSED: protected:QLB_OWNED (store 'pi-pool')
 (exit 2)
 ```
 
-Also refused without `--confirm`, or if the account id doesn't exist. Flags: `--account <id>` (required), `--confirm` (required), `[--db <path>]`, `[--json]`.
+Flags: `--account <id>` (required), `--confirm` (required), `[--db <path>]`, `[--json]`.
 
 ## `qlb setup`
 
