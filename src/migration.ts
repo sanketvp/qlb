@@ -8,13 +8,25 @@
 // Everything after that is idempotent hygiene (native → .pre-qlb).
 //
 // =============================================================================
-// Crash-point analysis — 7 forward (S2, S3, C, H1, H2, H3, H4) + 4 rollback
+// Crash-point analysis — 8 forward (S1, S2, S3, C, H1, H2, H3, H4) + 4 rollback
 // (R2/R3, R4, RC, RH1). Every point resolves to "native works" OR "QLB works",
 // never neither. `qlb migrate status` reports the filesystem+journal view;
 // `qlb migrate resume` converges as stated.
 // =============================================================================
 //
 // FORWARD
+//
+// S1  Crash after MIRRORED intent journal, before Keychain writes,
+//     upsertAccount(), or the staging owner file.
+//     Owner file: absent. Native: intact. Journal: MIRRORED (target account
+//     IDs already recorded).
+//     Pi at next launch: NATIVE WORKS (native file never touched; staging
+//     Keychain may be partial or absent).
+//     status(): state=MIRRORED, ownerFile=absent.
+//     resume(): MIRRORED → rollback (delete any staging Keychain entries
+//     named in the journal, journal NATIVE). Native untouched.
+//     Concurrent accounts prune: cannot observe "account row exists" without
+//     also observing this MIRRORED journal, because the journal lands first.
 //
 // S2  Crash after stage, before rehearse.
 //     Owner file: .staging only. Native: intact. Journal: MIRRORED.
@@ -818,6 +830,11 @@ export class Migration {
    * S2 — copy native credentials into the QLB Keychain as a STAGING copy
    * and write qlb-owner.json.staging. Native file is never written.
    *
+   * MIRRORED is journaled (with target account IDs) BEFORE Keychain writes
+   * and upsertAccount() so a concurrent `accounts prune` cannot observe an
+   * unprotected account row (S1). The later staging-file write does not
+   * change the journal payload.
+   *
    * Pool (Anthropic): N accounts from anthropic-pool.json.
    * Single-grant: 1 account from a named top-level key in auth.json.
    * Static-key (OpenRouter): 1 API key from native Keychain (read-only).
@@ -843,12 +860,6 @@ export class Migration {
     const { accounts } = parsePoolFile(raw);
     const mtime = statSync(this.poolFilePath).mtimeMs;
 
-    for (const acct of accounts) {
-      const { service, account } = keychainCoords(acct.provider, acct.id, acct.label);
-      this.keychain.setSync(service, account, JSON.stringify(acct.grant));
-      this.store.upsertAccount(acct.id, acct.provider, acct.label, 'imported-unvalidated');
-    }
-
     const owner: OwnerFile = {
       owner: 'qlb',
       stagedAt: Date.now(),
@@ -863,8 +874,8 @@ export class Migration {
         fingerprint: a.fingerprint,
       })),
     };
-    atomicWriteFile(stagingOwnerPath(this.ownerFilePath), JSON.stringify(owner, null, 2) + '\n');
-
+    // Intent journal FIRST so a concurrent prune cannot observe the account
+    // row without a MIRRORED journal naming it.
     this.journal('MIRRORED', {
       accounts: owner.accounts,
       qlbAccountIds: owner.qlbAccountIds,
@@ -873,6 +884,14 @@ export class Migration {
       ownerFilePath: this.ownerFilePath,
       stagedAt: owner.stagedAt,
     });
+
+    for (const acct of accounts) {
+      const { service, account } = keychainCoords(acct.provider, acct.id, acct.label);
+      this.keychain.setSync(service, account, JSON.stringify(acct.grant));
+      this.store.upsertAccount(acct.id, acct.provider, acct.label, 'imported-unvalidated');
+    }
+
+    atomicWriteFile(stagingOwnerPath(this.ownerFilePath), JSON.stringify(owner, null, 2) + '\n');
     return this.status();
   }
 
@@ -1019,8 +1038,6 @@ export class Migration {
     };
     const fingerprint = fingerprintApiKey(key);
     const { service, account } = keychainCoords(this.provider, id, label);
-    this.keychain.setSync(service, account, JSON.stringify(payload));
-    this.store.upsertAccount(id, this.provider, label, 'imported-unvalidated');
 
     const owner: OwnerFile = {
       owner: 'qlb',
@@ -1033,8 +1050,6 @@ export class Migration {
       nativeStrategy: 'keychain-retain',
       nativeKeychainService: NATIVE_OPENROUTER_KEYCHAIN_SERVICE,
     };
-    atomicWriteFile(stagingOwnerPath(this.ownerFilePath), JSON.stringify(owner, null, 2) + '\n');
-
     this.journal('MIRRORED', {
       accounts: owner.accounts,
       qlbAccountIds: owner.qlbAccountIds,
@@ -1044,6 +1059,10 @@ export class Migration {
       nativeKeychainService: NATIVE_OPENROUTER_KEYCHAIN_SERVICE,
       provider: this.provider,
     });
+
+    this.keychain.setSync(service, account, JSON.stringify(payload));
+    this.store.upsertAccount(id, this.provider, label, 'imported-unvalidated');
+    atomicWriteFile(stagingOwnerPath(this.ownerFilePath), JSON.stringify(owner, null, 2) + '\n');
     return this.status();
   }
 
@@ -1077,8 +1096,6 @@ export class Migration {
     };
     const fingerprint = fingerprintRefresh(grant.refresh);
     const { service, account } = keychainCoords(this.provider, id, label);
-    this.keychain.setSync(service, account, JSON.stringify(grant));
-    this.store.upsertAccount(id, this.provider, label, 'imported-unvalidated');
 
     const owner: OwnerFile = {
       owner: 'qlb',
@@ -1091,8 +1108,6 @@ export class Migration {
       nativeStrategy: 'shadow-retain',
       authJsonKey: keyName,
     };
-    atomicWriteFile(stagingOwnerPath(this.ownerFilePath), JSON.stringify(owner, null, 2) + '\n');
-
     this.journal('MIRRORED', {
       accounts: owner.accounts,
       qlbAccountIds: owner.qlbAccountIds,
@@ -1104,6 +1119,10 @@ export class Migration {
       authJsonKey: keyName,
       provider: this.provider,
     });
+
+    this.keychain.setSync(service, account, JSON.stringify(grant));
+    this.store.upsertAccount(id, this.provider, label, 'imported-unvalidated');
+    atomicWriteFile(stagingOwnerPath(this.ownerFilePath), JSON.stringify(owner, null, 2) + '\n');
     return this.status();
   }
 

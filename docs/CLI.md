@@ -377,7 +377,7 @@ $ qlb accounts prune --account account-1699999999999 --confirm --json
 }
 ```
 
-Deletes the account's rows from `accounts`, `snapshots`, `overrides`, `poll_claims`, and the account's refresh `leases` row. `decisions` rows are left untouched (audit history, not live state). **Refused unconditionally** if the account is currently QLB_OWNED / RETIRED or participating in an in-flight migration (`MIRRORED` / `VALIDATED`) — i.e. its ID appears in the `qlbAccountIds` (or `accounts[].id`) list of any `migrations` row in those states, or if such a row's `detail_json` cannot be trusted:
+Deletes the account's rows from `accounts`, `snapshots`, `overrides`, `poll_claims`, and the account's refresh `leases` row. `decisions` rows are left untouched (audit history, not live state). **Refused unconditionally** if the account is currently QLB_OWNED / RETIRED or participating in an in-flight migration (`MIRRORED` / pre-commit `VALIDATED`) — i.e. its ID appears in the `qlbAccountIds` (or `accounts[].id`) list of any `migrations` row in those states, or if such a row's `detail_json` cannot be trusted. A completed post-commit-rollback `VALIDATED` (owner file absent, same distinction `qlb doctor` uses) is not in-flight and may be pruned:
 
 ```console
 $ qlb accounts prune --account account-1 --confirm

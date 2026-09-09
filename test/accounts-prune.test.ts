@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { after, describe, it } from 'node:test';
 import {
@@ -11,6 +11,8 @@ import {
   pruneAccount,
   PruneRefusedError,
 } from '../src/accounts-prune';
+import { MockKeychain } from '../src/keychain';
+import { Migration } from '../src/migration';
 import { openStore, refreshLeaseName, type Store } from '../src/store';
 
 const temps: string[] = [];
@@ -180,6 +182,12 @@ describe('accounts-prune fail-closed journal parse', () => {
     assert.equal(parseAccountIds(JSON.stringify({ qlbAccountIds: 'account-owned' })).ok, false);
     assert.equal(parseAccountIds(JSON.stringify({ qlbAccountIds: [1, 2] })).ok, false);
     assert.equal(parseAccountIds(JSON.stringify({ accounts: { id: 'x' } })).ok, false);
+    assert.equal(parseAccountIds(JSON.stringify({ accounts: [{}] })).ok, false);
+    assert.equal(parseAccountIds(JSON.stringify({ accounts: [{ id: '' }] })).ok, false);
+    assert.equal(
+      parseAccountIds(JSON.stringify({ accounts: [{ id: 'ok' }, {}] })).ok,
+      false,
+    );
   });
 
   it('refuses prune when a QLB_OWNED journal row is malformed JSON', () => {
@@ -221,6 +229,21 @@ describe('accounts-prune fail-closed journal parse', () => {
       PruneRefusedError,
     );
     assert.ok(store.getAccount('acct-wrong'));
+    store.close();
+  });
+
+  it('refuses prune when QLB_OWNED detail is {"accounts":[{}]} (missing id is untrusted)', () => {
+    const store = openTempStore();
+    store.upsertAccount('acct-empty-id', 'anthropic', 'empty@example.com', 'active');
+    store.upsertMigration('pi-pool', 'QLB_OWNED', '{"accounts":[{}]}', Date.now());
+    assert.equal(parseAccountIds('{"accounts":[{}]}').ok, false);
+    assert.equal(checkAccountOwnership(store, 'acct-empty-id').owned, true);
+    assert.throws(
+      () => pruneAccount(store, { accountId: 'acct-empty-id', confirm: true }),
+      (err: unknown) =>
+        err instanceof PruneRefusedError && /cannot be proven unowned/.test(err.message),
+    );
+    assert.ok(store.getAccount('acct-empty-id'));
     store.close();
   });
 
@@ -282,13 +305,18 @@ describe('accounts-prune in-flight migration refusal', () => {
     store.close();
   });
 
-  it('REFUSES to prune an account listed in a VALIDATED journal row', () => {
+  it('REFUSES to prune an account listed in a pre-commit VALIDATED journal row', () => {
     const store = openTempStore();
+    const ownerFile = join(dirname(store.dbPath), 'qlb-owner.json');
+    writeFileSync(`${ownerFile}.staging`, '{"owner":"qlb"}\n');
     store.upsertAccount('account-validated', 'anthropic', 'v@example.com', 'active');
     store.upsertMigration(
       'pi-pool',
       'VALIDATED',
-      JSON.stringify({ qlbAccountIds: ['account-validated'] }),
+      JSON.stringify({
+        qlbAccountIds: ['account-validated'],
+        ownerFilePath: ownerFile,
+      }),
       Date.now(),
     );
     assert.throws(
@@ -299,6 +327,28 @@ describe('accounts-prune in-flight migration refusal', () => {
         /VALIDATED/.test(err.message),
     );
     assert.ok(store.getAccount('account-validated'));
+    store.close();
+  });
+
+  it('allows prune of a completed post-commit-rollback VALIDATED (owner absent)', () => {
+    const store = openTempStore();
+    seedOrphanAccount(store, 'account-rolled-back');
+    const ownerFile = join(dirname(store.dbPath), 'qlb-owner.json');
+    store.upsertMigration(
+      'pi-pool',
+      'VALIDATED',
+      JSON.stringify({
+        qlbAccountIds: ['account-rolled-back'],
+        ownerFilePath: ownerFile,
+        rolledBackFrom: 'post-commit',
+      }),
+      Date.now(),
+    );
+    const check = checkAccountOwnership(store, 'account-rolled-back');
+    assert.equal(check.owned, false);
+    const result = pruneAccount(store, { accountId: 'account-rolled-back', confirm: true });
+    assert.equal(result.ok, true);
+    assert.equal(store.getAccount('account-rolled-back'), null);
     store.close();
   });
 
@@ -407,6 +457,73 @@ describe('accounts-prune TOCTOU / two-connection', () => {
   });
 });
 
+describe('accounts-prune vs Migration.stage() pre-journal window', () => {
+  it('refuses concurrent prune at upsertAccount: MIRRORED journal already names the id', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-accounts-prune-stage-'));
+    temps.push(dir);
+    const poolPath = join(dir, 'anthropic-pool.json');
+    const ownerPath = join(dir, 'qlb-owner.json');
+    const dbPath = join(dir, 'qlb.db');
+    writeFileSync(
+      poolPath,
+      JSON.stringify({
+        version: 1,
+        accounts: [
+          {
+            id: 'acct-stage-race',
+            name: 'Stage Race',
+            credentials: {
+              type: 'oauth',
+              access: 'sk-ant-oat-fake',
+              refresh: 'sk-ant-ort-fake',
+              expires: Date.now() + 7 * 24 * 3600 * 1000,
+            },
+          },
+        ],
+      }) + '\n',
+    );
+    const store = openStore(dbPath);
+    const kc = new MockKeychain();
+    const mig = new Migration(store, kc, poolPath, ownerPath);
+    const origUpsert = store.upsertAccount.bind(store);
+    let pruneRefusedWhileVisible = false;
+    let upserts = 0;
+    store.upsertAccount = (id, provider, label, status) => {
+      const peer = openStore(dbPath);
+      try {
+        const journal = peer.getMigration('pi-pool');
+        assert.ok(journal, 'MIRRORED journal must exist before upsertAccount');
+        assert.equal(journal.state, 'MIRRORED');
+        const parsed = parseAccountIds(journal.detail_json);
+        assert.equal(parsed.ok, true);
+        if (parsed.ok) {
+          assert.ok(
+            parsed.ids.has(id),
+            'journal must name the account before the row becomes visible',
+          );
+        }
+        origUpsert(id, provider, label, status);
+        upserts += 1;
+        assert.throws(
+          () => pruneAccount(peer, { accountId: id, confirm: true }),
+          (err: unknown) =>
+            err instanceof PruneRefusedError &&
+            /in-flight migration/.test((err as Error).message) &&
+            /MIRRORED/.test((err as Error).message),
+        );
+        pruneRefusedWhileVisible = true;
+      } finally {
+        peer.close();
+      }
+    };
+    mig.stage();
+    assert.equal(upserts, 1);
+    assert.equal(pruneRefusedWhileVisible, true);
+    assert.ok(store.getAccount('acct-stage-race'));
+    store.close();
+  });
+});
+
 describe('accounts-prune cascade includes refresh lease', () => {
   it('removes a held refresh lease for the pruned account', () => {
     const store = openTempStore();
@@ -442,6 +559,21 @@ describe('accounts-prune CLI exit codes', () => {
       result.stderr.includes('PruneRefusedError') || /REFUSED:/.test(result.stderr),
       true,
     );
+  });
+
+  it('exits 2 when QLB_OWNED detail is {"accounts":[{}]} (missing id is untrusted)', () => {
+    const store = openTempStore();
+    store.upsertAccount('acct-empty-id', 'anthropic', 'empty@example.com', 'active');
+    store.upsertMigration('pi-pool', 'QLB_OWNED', '{"accounts":[{}]}', Date.now());
+    const dbPath = store.dbPath;
+    store.close();
+
+    const result = runCli(
+      ['accounts', 'prune', '--account', 'acct-empty-id', '--confirm', '--db', dbPath],
+      { ...process.env, QLB_DB_PATH: dbPath },
+    );
+    assert.equal(result.status, 2, result.stderr || result.stdout);
+    assert.match(result.stderr, /cannot be proven unowned/);
   });
 
   it('exits 2 when the account id does not exist', () => {

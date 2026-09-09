@@ -9,12 +9,16 @@
 // Ownership / participation is determined from the `migrations` journal
 // (§4.8.3), not from `accounts.status`. An account is unsafe to prune if it
 // appears in the `qlbAccountIds` (or `accounts[].id`) list of any migration
-// row whose state is MIRRORED, VALIDATED, QLB_OWNED, or RETIRED. NATIVE after
-// a clean rollback, or no migration record at all, is the only safe case.
+// row whose state is MIRRORED, in-flight VALIDATED, QLB_OWNED, or RETIRED.
+// NATIVE after a clean rollback, terminal post-commit-rollback VALIDATED
+// (owner file absent — same distinction `qlb doctor` uses), or no migration
+// record at all, is safe.
 //
 // Fail-closed: any error while reading an unsafe-state journal row is treated
 // as "owned" (refuse to prune) rather than "safe to prune".
 
+import { config, type QlbConfig } from './config';
+import { isStuckMigration } from './migration-health';
 import type { MigrationRow, Store } from './store';
 
 export interface AccountOwnershipCheck {
@@ -64,8 +68,7 @@ export function parseAccountIds(detailJson: string | null | undefined): ParseAcc
         return { ok: false };
       }
       const id = (account as { id?: unknown }).id;
-      if (id === undefined) continue;
-      if (typeof id !== 'string') return { ok: false };
+      if (typeof id !== 'string' || id.length === 0) return { ok: false };
       ids.add(id);
     }
   }
@@ -85,10 +88,19 @@ export type AccountSafety =
  * Decide whether `accountId` is safe to prune given the current journal.
  * Fail-closed: malformed / wrong-shaped detail on any non-NATIVE row, or any
  * unknown state, is treated as unsafe.
+ *
+ * VALIDATED is overloaded: a completed post-commit rollback (owner file
+ * absent) is terminal and safe, matching `isStuckMigration` in diagnostics.
+ * A pre-commit / mid-hygiene VALIDATED (owner present or staging) is in-flight.
  */
-export function inspectAccountSafety(migrations: MigrationRow[], accountId: string): AccountSafety {
+export function inspectAccountSafety(
+  migrations: MigrationRow[],
+  accountId: string,
+  cfg: QlbConfig = config,
+): AccountSafety {
   for (const row of migrations) {
     if (SAFE_STATES.has(row.state)) continue;
+    if (row.state === 'VALIDATED' && !isStuckMigration(row, cfg)) continue;
     if (!UNSAFE_STATES.has(row.state)) {
       return { unsafe: true, store: row.store, state: row.state, reason: 'untrusted' };
     }
@@ -183,7 +195,8 @@ function refuse(message: string): never {
  * Remove an account's rows from `accounts`, `snapshots`, `overrides`,
  * `poll_claims`, and the account's refresh lease. Refuses if the account
  * does not exist, is currently QLB_OWNED / RETIRED / in-flight (MIRRORED or
- * VALIDATED), has an unreadable journal, or `--confirm` was not passed.
+ * pre-commit VALIDATED), has an unreadable journal, or `--confirm` was not passed.
+ * A completed post-commit-rollback VALIDATED (owner file absent) is not in-flight.
  * `decisions` rows are left alone — they are audit history, not live state.
  *
  * Existence + journal inspection + cascade delete run in ONE BEGIN IMMEDIATE

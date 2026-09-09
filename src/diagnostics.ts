@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
 import { builtInAdapters } from './adapters';
@@ -12,6 +12,7 @@ import {
   selectBackendKind,
   type KeychainBackend,
 } from './keychain';
+import { isStuckMigration } from './migration-health';
 import {
   createNativeCredentialReader,
   inspectOwnedNativeDrift,
@@ -244,58 +245,6 @@ function combineOverall(checks: Array<{ level: CheckLevel }>): CheckLevel {
   if (checks.some((check) => check.level === 'FAIL')) return 'FAIL';
   if (checks.some((check) => check.level === 'WARN')) return 'WARN';
   return 'PASS';
-}
-
-function parseDetailJson(raw: string | null | undefined): Record<string, unknown> {
-  if (!raw) return {};
-  try {
-    const parsed: unknown = JSON.parse(raw);
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-      return parsed as Record<string, unknown>;
-    }
-  } catch {
-    // ignore
-  }
-  return {};
-}
-
-function ownerPathForMigrationStore(
-  store: string,
-  config: QlbConfig,
-  detail: Record<string, unknown>,
-): string {
-  if (typeof detail.ownerFilePath === 'string' && detail.ownerFilePath.length > 0) {
-    return detail.ownerFilePath;
-  }
-  const dir = dirname(config.piAuthJsonPath);
-  if (store === 'pi-pool') return join(dir, 'qlb-owner.json');
-  const provider = store.startsWith('pi-') ? store.slice(3) : store;
-  return join(dir, `qlb-owner-${provider}.json`);
-}
-
-function ownerFilePresence(ownerPath: string): 'absent' | 'staging' | 'present' {
-  if (existsSync(ownerPath)) return 'present';
-  if (existsSync(`${ownerPath}.staging`)) return 'staging';
-  return 'absent';
-}
-
-/**
- * Incomplete / mid-flight migrations WARN. Terminal states PASS:
- * NATIVE, QLB_OWNED, RETIRED, and post-rollback VALIDATED with ownerFile absent.
- */
-function isStuckMigration(
-  migration: { store: string; state: string; detail_json?: string },
-  config: QlbConfig,
-): boolean {
-  if (migration.state === 'NATIVE' || migration.state === 'QLB_OWNED' || migration.state === 'RETIRED') {
-    return false;
-  }
-  if (migration.state === 'VALIDATED') {
-    const detail = parseDetailJson(migration.detail_json);
-    const ownerPath = ownerPathForMigrationStore(migration.store, config, detail);
-    return ownerFilePresence(ownerPath) !== 'absent';
-  }
-  return true;
 }
 
 function probeCredentialStore(command?: CommandRunner): DoctorCheck {
