@@ -28,7 +28,7 @@ import {
 import { listPolicies, setPolicy } from './policy';
 import { LoopbackProxy } from './proxy';
 import { parseUntil } from './overrides';
-import { resolveFromSnapshots, providerForModel } from './resolve';
+import { resolveFromSnapshots, snapshotsFromStore, providerForModel } from './resolve';
 import { isStrategy, STRATEGIES, type Strategy } from './scoring';
 import {
   checkRetirementEligibility,
@@ -50,6 +50,7 @@ import {
 import { isSetupHarness, setupHarness, type SetupHarness } from './setup';
 import { refreshCommand } from './refresh';
 import { DEFAULT_AUDIT_LIMIT, formatAudit, listAuditDecisions } from './audit';
+import { defaultWhyModel, explainWhy, formatWhyHuman } from './why';
 import { getStore, openStore, type Store } from './store';
 import type { AccountSnapshot, Adapter } from './types';
 
@@ -61,6 +62,7 @@ const USAGE = `Usage:
   qlb status [--json] [--dashboard|--flat]
   qlb setup pi|claude-code|codex-cli|generic [--json]
   qlb resolve --model <modelId> [--fallback m1,m2,...] [--session <id>] [--harness pi|claude-code|codex|dispatch] [--effort <lvl>] [--strategy headroom|spread|round-robin|failover] [--json]
+  qlb why [--json]
   qlb override pin --session <id> --account <account-id> [--until <ISO-datetime|2h>] [--db <path>] [--json]
   qlb override reserve --account <account-id> [--until <ISO-datetime|2h>] [--db <path>] [--json]
   qlb override drain-first --account <account-id> [--until <ISO-datetime|2h>] [--db <path>] [--json]
@@ -118,6 +120,14 @@ type SetupOpts = { cmd: 'setup'; json: boolean; harness: SetupHarness };
 type InitOpts = { cmd: 'init'; json: boolean };
 type DoctorOpts = { cmd: 'doctor'; json: boolean; live: boolean };
 type RefreshOpts = { cmd: 'refresh'; json: boolean; allowProbe: boolean };
+type WhyOpts = {
+  cmd: 'why';
+  json: boolean;
+  model?: string;
+  fallback: string[];
+  session?: string;
+  strategy?: Strategy;
+};
 type ResolveOpts = {
   cmd: 'resolve';
   json: boolean;
@@ -237,7 +247,7 @@ type AuditOpts = {
   limit: number;
   db?: string;
 };
-type Opts = InitOpts | DoctorOpts | RefreshOpts | StatusOpts | SetupOpts | ResolveOpts | MigrateOpts | PolicyOpts | GateOpts | ProxyOpts | RetireOpts | NativeResyncOpts | OverrideOpts | AccountsOpts | AuditOpts;
+type Opts = InitOpts | DoctorOpts | RefreshOpts | WhyOpts | StatusOpts | SetupOpts | ResolveOpts | MigrateOpts | PolicyOpts | GateOpts | ProxyOpts | RetireOpts | NativeResyncOpts | OverrideOpts | AccountsOpts | AuditOpts;
 
 const MIGRATE_SUBS: readonly MigrateSub[] = [
   'stage',
@@ -695,6 +705,41 @@ function parseOverrideArgs(argsIn: string[]): OverrideOpts {
   return { cmd: 'override', sub, json, db, account, until };
 }
 
+function parseWhyArgs(argsIn: string[]): WhyOpts {
+  const args = [...argsIn];
+  if (args[0] === '-h' || args[0] === '--help') {
+    console.log(USAGE);
+    process.exit(0);
+  }
+  const json = args.includes('--json');
+  if (json) args.splice(args.indexOf('--json'), 1);
+  const model = takeFlag(args, '--model');
+  const session = takeFlag(args, '--session');
+  const strategyRaw = takeFlag(args, '--strategy');
+  const fallbackRaw = takeFlag(args, '--fallback');
+  if (args.length > 0) {
+    console.error(`qlb why: unknown argument ${args[0]}`);
+    console.error(USAGE);
+    process.exit(1);
+  }
+  let strategy: Strategy | undefined;
+  if (strategyRaw !== undefined) {
+    if (!isStrategy(strategyRaw)) {
+      console.error(
+        `qlb why: --strategy must be ${STRATEGIES.join('|')} (got '${strategyRaw}')`,
+      );
+      console.error(USAGE);
+      process.exit(1);
+    }
+    strategy = strategyRaw;
+  }
+  const fallback = (fallbackRaw ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return { cmd: 'why', json, model, fallback, session, strategy };
+}
+
 function parseArgs(argv: string[]): Opts {
   const raw = stripConfigArgs(argv).slice(2);
   if (raw[0] === '-h' || raw[0] === '--help') {
@@ -734,6 +779,9 @@ function parseArgs(argv: string[]): Opts {
       process.exit(1);
     }
     return { cmd: 'refresh', json, allowProbe };
+  }
+  if (raw[0] === 'why') {
+    return parseWhyArgs(raw.slice(1));
   }
   if (raw[0] === 'migrate') {
     return parseMigrateArgs(raw.slice(1));
@@ -1139,6 +1187,25 @@ async function runResolve(opts: ResolveOpts): Promise<number> {
   if (opts.json) printResolveJson(decision);
   else printResolveHuman(decision);
   return decision.ok ? 0 : 1;
+}
+
+function runWhy(opts: WhyOpts): number {
+  const store = getStore();
+  const snapshots = snapshotsFromStore(store);
+  const strategy: Strategy = opts.strategy
+    ?? (isStrategy(config.defaultStrategy) ? config.defaultStrategy : 'headroom');
+  const model = opts.model ?? defaultWhyModel(snapshots);
+  const report = explainWhy({
+    model,
+    fallback: opts.fallback,
+    session: opts.session,
+    strategy,
+    snapshots,
+    store,
+  });
+  if (opts.json) console.log(JSON.stringify(report, null, 2));
+  else console.log(formatWhyHuman(report));
+  return 0;
 }
 
 function printMigrate(status: ReturnType<Migration['status']>, json: boolean): void {
@@ -1618,6 +1685,9 @@ async function main(): Promise<void> {
       console.error(`qlb override: ${msg}`);
       process.exit(1);
     }
+  }
+  if (opts.cmd === 'why') {
+    process.exit(runWhy(opts));
   }
   const code = await runResolve(opts);
   process.exit(code);
