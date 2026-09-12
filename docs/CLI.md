@@ -69,6 +69,35 @@ Flags: `[--json] [--live]`. Exit `1` when overall is `FAIL`.
 
 For QLB-owned accounts, doctor also runs a native-credential drift check (one `[PASS]`/`[WARN]` line per owned account, name `native-sync:<accountId>`) — see [CREDENTIAL-SAFETY.md](CREDENTIAL-SAFETY.md#native-credential-drift-the-shadow-retain-tradeoff).
 
+## `qlb refresh`
+
+Poll every enabled adapter for a fresh gauge reading. Without `--allow-probe` this is a no-network no-op (exit 0). Pass `--allow-probe` to invoke each adapter's `fetchSnapshots()` — network reads go through the existing single-flight cache.
+
+`--allow-probe` makes **real provider requests** with your stored credentials. For xAI that is a 1-token completion that consumes quota. Codex has no probe: it only reads the local auth file and will show `[NONE]` (its readings come from the proxy's header parsing).
+
+```console
+$ qlb refresh
+refresh: no probes run (pass --allow-probe to poll providers)
+
+$ qlb refresh --allow-probe
+[OK]   xai (xAI): 1 account(s)
+[NONE] openai-codex (Codex (ChatGPT Pro)): authenticated, no gauge — provider has no probe (readings come from proxy traffic)
+[FAIL] openrouter (OpenRouter): no snapshots returned
+Probed 3 provider(s): 1 ok, 1 no-data, 1 failed
+```
+
+Per-provider statuses:
+
+| Glyph | `status` | Meaning |
+|---|---|---|
+| `[OK]` | `ok` | At least one snapshot with a bucket reading and no error. |
+| `[NONE]` | `no-data` | Snapshots returned without `error` but none have gauge buckets — the provider has no probe; readings come from proxy traffic. |
+| `[FAIL]` | `error` | The adapter threw/rejected, returned no snapshots, or every snapshot had `error` set. One failed provider never aborts the others. |
+
+`--json` prints `{ probed, results }` where each result is `{ provider, displayName, ok, status, accounts, error?, snapshots }`. Without `--allow-probe` that is `{"probed":false,"results":[]}`.
+
+Flags: `[--allow-probe] [--json]`. Exit `0` always on a completed refresh (a failed provider is a result, not a crash). Unknown arguments exit `1`.
+
 ## `qlb native-resync`
 
 Compare a QLB-owned credential with the provider's current native credential and resync QLB's Keychain copy if they differ. This is the manual trigger for the same fingerprint-compare-and-resync the proxy runs automatically on an auth failure — mechanism and the differ-vs-identical semantics are described in [CREDENTIAL-SAFETY.md](CREDENTIAL-SAFETY.md#native-credential-drift-the-shadow-retain-tradeoff). It is one Keychain overwrite at most, never a re-migration, and exits `0` either way:
@@ -475,4 +504,4 @@ All three are read-only from the extension's side (they only shell out to `qlb s
 
 ## Not yet wired (honest gaps)
 
-- **Probes from the CLI.** Codex/xAI readings in the CLI path come from organic traffic (xAI via its minimal probe inside the adapter, coalesced single-flight) and from the proxy's header parsing; the spec's `qlb refresh --allow-probe` / `qlb audit` / `qlb why` surface is not implemented yet.
+- **Audit / why.** `qlb audit` and `qlb why` are not implemented yet. Provider probes from the CLI are available via [`qlb refresh --allow-probe`](#qlb-refresh); Codex/xAI readings otherwise come from organic traffic (xAI via its minimal probe inside the adapter, coalesced single-flight) and from the proxy's header parsing.

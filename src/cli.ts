@@ -48,12 +48,14 @@ import {
   overrideFromStore,
 } from './dashboard';
 import { isSetupHarness, setupHarness, type SetupHarness } from './setup';
+import { refreshCommand } from './refresh';
 import { getStore, openStore, type Store } from './store';
 import type { AccountSnapshot, Adapter } from './types';
 
 const USAGE = `Usage:
   qlb init [--json]
   qlb doctor [--json] [--live]
+  qlb refresh [--allow-probe] [--json]
   qlb native-resync --provider anthropic|xai|kimi-coding|openai-codex|openrouter --account <id> [--json] [--db <path>]
   qlb status [--json] [--dashboard|--flat]
   qlb setup pi|claude-code|codex-cli|generic [--json]
@@ -111,6 +113,7 @@ type StatusOpts = { cmd: 'status'; json: boolean; view: 'dashboard' | 'flat' };
 type SetupOpts = { cmd: 'setup'; json: boolean; harness: SetupHarness };
 type InitOpts = { cmd: 'init'; json: boolean };
 type DoctorOpts = { cmd: 'doctor'; json: boolean; live: boolean };
+type RefreshOpts = { cmd: 'refresh'; json: boolean; allowProbe: boolean };
 type ResolveOpts = {
   cmd: 'resolve';
   json: boolean;
@@ -224,7 +227,7 @@ type AccountsOpts = {
   confirm: boolean;
   db?: string;
 };
-type Opts = InitOpts | DoctorOpts | StatusOpts | SetupOpts | ResolveOpts | MigrateOpts | PolicyOpts | GateOpts | ProxyOpts | RetireOpts | NativeResyncOpts | OverrideOpts | AccountsOpts;
+type Opts = InitOpts | DoctorOpts | RefreshOpts | StatusOpts | SetupOpts | ResolveOpts | MigrateOpts | PolicyOpts | GateOpts | ProxyOpts | RetireOpts | NativeResyncOpts | OverrideOpts | AccountsOpts;
 
 const MIGRATE_SUBS: readonly MigrateSub[] = [
   'stage',
@@ -680,6 +683,18 @@ function parseArgs(argv: string[]): Opts {
       process.exit(1);
     }
     return { cmd: 'doctor', json, live };
+  }
+  if (raw[0] === 'refresh') {
+    const rest = raw.slice(1);
+    const json = rest.includes('--json');
+    if (json) rest.splice(rest.indexOf('--json'), 1);
+    const allowProbe = rest.includes('--allow-probe');
+    if (allowProbe) rest.splice(rest.indexOf('--allow-probe'), 1);
+    if (rest.length > 0) {
+      console.error(`qlb refresh: unknown argument ${rest[0]}`);
+      process.exit(1);
+    }
+    return { cmd: 'refresh', json, allowProbe };
   }
   if (raw[0] === 'migrate') {
     return parseMigrateArgs(raw.slice(1));
@@ -1435,6 +1450,9 @@ async function main(): Promise<void> {
     const report = await doctorQlb(config, { live: opts.live });
     printDoctor(report, opts.json);
     process.exit(report.overall === 'FAIL' ? 1 : 0);
+  }
+  if (opts.cmd === 'refresh') {
+    process.exit(await refreshCommand(adapters, { allowProbe: opts.allowProbe, json: opts.json }));
   }
   if (opts.cmd === 'setup') {
     const result = setupHarness(opts.harness);
