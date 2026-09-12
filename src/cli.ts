@@ -49,6 +49,7 @@ import {
 } from './dashboard';
 import { isSetupHarness, setupHarness, type SetupHarness } from './setup';
 import { refreshCommand } from './refresh';
+import { DEFAULT_AUDIT_LIMIT, formatAudit, listAuditDecisions } from './audit';
 import { getStore, openStore, type Store } from './store';
 import type { AccountSnapshot, Adapter } from './types';
 
@@ -78,6 +79,7 @@ const USAGE = `Usage:
   qlb retire status  --harness claude-code|codex-cli [--json] [--db <path>]
   qlb retire execute --harness claude-code|codex-cli --confirm-real-retirement [--db <path>]
   qlb accounts prune --account <id> --confirm [--json] [--db <path>]
+  qlb audit [--limit N] [--json] [--db <path>]
 
 SAFETY: running migrate stage/rehearse/commit/rollback/resume without path
 overrides targets the REAL ~/.pi/agent/ files (anthropic-pool.json for
@@ -107,7 +109,9 @@ this repo (setup pi writes scripts/hooks/pi-advisory.sh here).
 qlb override pin/reserve/drain-first: --until defaults to 24h from now when
 omitted (ISO datetime or duration like 2h/30m/1d). Pin forces that account
 for one session id; reserve excludes an account from automatic selection;
-drain-first biases selection toward an account.`;
+drain-first biases selection toward an account.
+qlb audit is read-only: last N routing decisions (default 20, newest first).
+Empty store prints "no decisions" or [].`;
 
 type StatusOpts = { cmd: 'status'; json: boolean; view: 'dashboard' | 'flat' };
 type SetupOpts = { cmd: 'setup'; json: boolean; harness: SetupHarness };
@@ -227,7 +231,13 @@ type AccountsOpts = {
   confirm: boolean;
   db?: string;
 };
-type Opts = InitOpts | DoctorOpts | RefreshOpts | StatusOpts | SetupOpts | ResolveOpts | MigrateOpts | PolicyOpts | GateOpts | ProxyOpts | RetireOpts | NativeResyncOpts | OverrideOpts | AccountsOpts;
+type AuditOpts = {
+  cmd: 'audit';
+  json: boolean;
+  limit: number;
+  db?: string;
+};
+type Opts = InitOpts | DoctorOpts | RefreshOpts | StatusOpts | SetupOpts | ResolveOpts | MigrateOpts | PolicyOpts | GateOpts | ProxyOpts | RetireOpts | NativeResyncOpts | OverrideOpts | AccountsOpts | AuditOpts;
 
 const MIGRATE_SUBS: readonly MigrateSub[] = [
   'stage',
@@ -493,6 +503,35 @@ function parseAccountsArgs(argsIn: string[]): AccountsOpts {
   return { cmd: 'accounts', sub, json, account, confirm, db };
 }
 
+function parseAuditArgs(argsIn: string[]): AuditOpts {
+  const args = [...argsIn];
+  if (args[0] === '-h' || args[0] === '--help') {
+    console.log(USAGE);
+    process.exit(0);
+  }
+  const json = args.includes('--json');
+  if (json) args.splice(args.indexOf('--json'), 1);
+  const db = takeFlag(args, '--db');
+  let limit = DEFAULT_AUDIT_LIMIT;
+  const limitIdx = args.indexOf('--limit');
+  if (limitIdx !== -1) {
+    const raw = args[limitIdx + 1];
+    if (raw == null || !/^[0-9]+$/.test(raw)) {
+      console.error('qlb audit: --limit must be a non-negative integer');
+      console.error(USAGE);
+      process.exit(1);
+    }
+    args.splice(limitIdx, 2);
+    limit = Number(raw);
+  }
+  if (args.length > 0) {
+    console.error(`qlb audit: unknown argument ${args[0]}`);
+    console.error(USAGE);
+    process.exit(1);
+  }
+  return { cmd: 'audit', json, db, limit };
+}
+
 function parseRetireArgs(argsIn: string[]): RetireOpts {
   const args = [...argsIn];
   const sub = args.shift();
@@ -722,6 +761,9 @@ function parseArgs(argv: string[]): Opts {
   }
   if (raw[0] === 'accounts') {
     return parseAccountsArgs(raw.slice(1));
+  }
+  if (raw[0] === 'audit') {
+    return parseAuditArgs(raw.slice(1));
   }
 
   let cmd: 'status' | 'resolve' = 'status';
@@ -1365,6 +1407,14 @@ function printOverride(row: { kind: string; account_id: string; session: string 
   console.log(`${row.kind}  account=${row.account_id}${session}  until=${until}`);
 }
 
+async function runAudit(opts: AuditOpts): Promise<number> {
+  return withStore(opts.db, (store) => {
+    const rows = listAuditDecisions(store, opts.limit);
+    console.log(formatAudit(rows, opts.json));
+    return 0;
+  });
+}
+
 async function runOverride(opts: OverrideOpts): Promise<number> {
   return withStore(opts.db, (store) => {
     if (opts.sub === 'list') {
@@ -1469,6 +1519,16 @@ async function main(): Promise<void> {
   if (opts.cmd === 'status') {
     await runStatus(opts);
     process.exit(0);
+  }
+  if (opts.cmd === 'audit') {
+    try {
+      const code = await runAudit(opts);
+      process.exit(code);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`qlb audit: ${msg}`);
+      process.exit(1);
+    }
   }
   if (opts.cmd === 'migrate') {
     try {

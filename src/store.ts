@@ -587,6 +587,20 @@ export class Store {
     return rows.filter((r) => r.harness != null && allowed.has(r.harness));
   }
 
+  /** Newest-first audit read. Tie-break on id DESC. Does not change listDecisions. */
+  listRecentDecisions(limit: number): DecisionRow[] {
+    const n = Number.isFinite(limit) ? Math.max(0, Math.trunc(limit)) : 0;
+    return this.db
+      .prepare(
+        `SELECT id, ts, session, harness, requested_model, effort, served_model,
+                account_id, mode, reason, snapshot_json
+         FROM decisions
+         ORDER BY ts DESC, id DESC
+         LIMIT ?`,
+      )
+      .all(n) as unknown as DecisionRow[];
+  }
+
   getOverride(accountId: string): OverrideRow | null {
     const row = this.getOverrideStmt.get(accountId, Date.now()) as OverrideRow | undefined;
     return row ?? null;
