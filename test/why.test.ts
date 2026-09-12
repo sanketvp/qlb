@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import type { AccountSnapshot, BucketReading, Confidence } from '../src/types';
 import { openStore } from '../src/store';
-import { snapshotsFromStore } from '../src/resolve';
+import { snapshotsFromStore, resolveFromSnapshots } from '../src/resolve';
+import { failoverConfigKey, roundRobinConfigKey } from '../src/overrides';
 import { DEFAULT_CEILING, scoreAccount } from '../src/scoring';
 import { explainWhy } from '../src/why';
 
@@ -145,5 +146,129 @@ describe('explainWhy', () => {
     assert.ok(c);
     assert.equal(c!.reason, 'unavailable');
     assert.match(c!.detail, /auth_revoked/);
+  });
+
+  it('matches resolve under drain-first and does not persist a decision', () => {
+    const store = openStore(':memory:');
+    store.upsertOverride({
+      kind: 'drain-first',
+      accountId: 'C',
+      until: Date.now() + 60_000,
+    });
+    const snapshots = [
+      anthropic('A', { '5h': reading(10), '7d': reading(10) }),
+      anthropic('B', { '5h': reading(40), '7d': reading(40) }),
+      anthropic('C', { '5h': reading(70), '7d': reading(70) }),
+    ];
+    const before = store.listDecisions().length;
+    const why = explainWhy({
+      model: 'claude-sonnet-5',
+      snapshots,
+      store,
+    });
+    assert.equal(store.listDecisions().length, before, 'why must not persist a decision');
+    const resolved = resolveFromSnapshots({
+      model: 'claude-sonnet-5',
+      snapshots,
+      store,
+    });
+    assert.equal(resolved.ok, true);
+    if (!resolved.ok) return;
+    assert.equal(why.accountId, resolved.accountId);
+    assert.equal(why.accountId, 'C');
+    store.close();
+  });
+
+  it('matches resolve under sticky failover and does not write failover config', () => {
+    const store = openStore(':memory:');
+    const key = failoverConfigKey('anthropic');
+    store.setConfig(key, 'B');
+    const snapshots = [
+      anthropic('A', { '5h': reading(10), '7d': reading(10) }),
+      anthropic('B', { '5h': reading(40), '7d': reading(40) }),
+      anthropic('C', { '5h': reading(70), '7d': reading(70) }),
+    ];
+    const why = explainWhy({
+      model: 'claude-sonnet-5',
+      strategy: 'failover',
+      snapshots,
+      store,
+    });
+    assert.equal(store.getConfig(key), 'B', 'why must not rewrite failover stickiness');
+    const resolved = resolveFromSnapshots({
+      model: 'claude-sonnet-5',
+      strategy: 'failover',
+      snapshots,
+      store,
+    });
+    assert.equal(resolved.ok, true);
+    if (!resolved.ok) return;
+    assert.equal(why.accountId, resolved.accountId);
+    assert.equal(why.accountId, 'B');
+    assert.equal(store.getConfig(key), 'B');
+    store.close();
+  });
+
+  it('peeks failover without setConfig, then matches the subsequent resolve', () => {
+    const store = openStore(':memory:');
+    const key = failoverConfigKey('anthropic');
+    const snapshots = [
+      anthropic('A', { '5h': reading(10), '7d': reading(10) }),
+      anthropic('B', { '5h': reading(40), '7d': reading(40) }),
+      anthropic('C', { '5h': reading(70), '7d': reading(70) }),
+    ];
+    assert.equal(store.getConfig(key), null);
+    const why = explainWhy({
+      model: 'claude-sonnet-5',
+      strategy: 'failover',
+      snapshots,
+      store,
+    });
+    assert.equal(store.getConfig(key), null, 'why must not write failover config');
+    const resolved = resolveFromSnapshots({
+      model: 'claude-sonnet-5',
+      strategy: 'failover',
+      snapshots,
+      store,
+    });
+    assert.equal(resolved.ok, true);
+    if (!resolved.ok) return;
+    assert.equal(why.accountId, resolved.accountId);
+    assert.equal(store.getConfig(key), resolved.accountId);
+    store.close();
+  });
+
+  it('matches resolve under round-robin without advancing the cursor', () => {
+    const store = openStore(':memory:');
+    const key = roundRobinConfigKey('anthropic');
+    const snapshots = [
+      anthropic('A', { '5h': reading(10), '7d': reading(10) }),
+      anthropic('B', { '5h': reading(40), '7d': reading(40) }),
+      anthropic('C', { '5h': reading(70), '7d': reading(70) }),
+    ];
+    const req = {
+      model: 'claude-sonnet-5',
+      strategy: 'round-robin' as const,
+      snapshots,
+      store,
+    };
+
+    const cursor0 = store.getConfig(key);
+    const why1 = explainWhy(req);
+    assert.equal(store.getConfig(key), cursor0, 'why must not advance round-robin');
+    const resolved1 = resolveFromSnapshots(req);
+    assert.equal(resolved1.ok, true);
+    if (!resolved1.ok) return;
+    assert.equal(why1.accountId, resolved1.accountId);
+
+    const cursor1 = store.getConfig(key);
+    const why2 = explainWhy(req);
+    assert.equal(store.getConfig(key), cursor1, 'why must not advance round-robin');
+    const resolved2 = resolveFromSnapshots(req);
+    assert.equal(resolved2.ok, true);
+    if (!resolved2.ok) return;
+    assert.equal(why2.accountId, resolved2.accountId);
+    assert.notEqual(why1.accountId, why2.accountId);
+    store.close();
   });
 });

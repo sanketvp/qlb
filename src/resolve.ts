@@ -17,6 +17,8 @@ export interface ResolveRequest {
   snapshots: AccountSnapshot[];
   store?: Store;
   strategy?: Strategy;
+  /** When false, skip decision persistence and strategy cursor writes. Default true. */
+  persist?: boolean;
 }
 
 export interface ResolveOk {
@@ -139,7 +141,7 @@ function snapshotJson(decision: ResolveDecision): string {
 }
 
 function record(store: Store | undefined, req: ResolveRequest, decision: ResolveDecision): number | undefined {
-  if (!store) return undefined;
+  if (!store || req.persist === false) return undefined;
   if (decision.ok) {
     return store.recordDecision({
       session: req.session,
@@ -261,7 +263,8 @@ function resolvePinned(
 /**
  * Selection over already-fetched snapshots, then fallback walk.
  * Pin overrides (if any) are applied before any strategy.
- * Does not touch the network. Persists a decisions row when `store` is provided.
+ * Does not touch the network. Persists a decisions row when `store` is provided
+ * unless `persist` is false (dry-run / `qlb why`).
  */
 export function resolveFromSnapshots(req: ResolveRequest): ResolveDecision {
   const fallback = req.fallback ?? [];
@@ -288,6 +291,7 @@ export function resolveFromSnapshots(req: ResolveRequest): ResolveDecision {
       session: req.session,
       store: req.store,
       drainFirstIds: drainFirst,
+      persist: req.persist,
     });
     if (!picked) continue;
 

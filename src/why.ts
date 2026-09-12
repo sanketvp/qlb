@@ -63,67 +63,10 @@ function reservedIds(store: Store | undefined): Set<string> {
   return reserved;
 }
 
-function explainPinned(
-  req: WhyRequest,
-  pinAccountId: string,
-  chain: string[],
-): WhyReport {
-  const snapshots = req.snapshots;
-  const snap = snapshots.find((s) => s.accountId === pinAccountId);
-  const losers: WhyLoser[] = snapshots
-    .filter((s) => s.accountId !== pinAccountId)
-    .map((s) => ({
-      accountId: s.accountId,
-      reason: 'pinned' as const,
-      detail: `session pinned to ${pinAccountId}`,
-    }));
-
-  const unavailable = (reason: string): WhyReport => ({
-    model: req.model,
-    accountId: pinAccountId,
-    strategy: 'pin',
-    score: null,
-    error: 'PINNED_UNAVAILABLE',
-    reason,
-    losers,
-  });
-
-  if (!snap) {
-    return unavailable(
-      `pinned account unavailable: ${pinAccountId} not in candidate snapshots`,
-    );
-  }
-  if (snap.error) {
-    return unavailable(
-      `pinned account unavailable: ${pinAccountId} is in an error state (${snap.error})`,
-    );
-  }
-
-  for (let i = 0; i < chain.length; i++) {
-    const candidateModel = chain[i];
-    const provider = providerForModel(candidateModel);
-    if (!provider || snap.provider !== provider) continue;
-    if (isFullyExhausted(snap, candidateModel)) continue;
-    const score = scoreAccount(snap, candidateModel, ALL_IN_CEILING);
-    const substituted = i > 0;
-    const reason = substituted
-      ? `pin override session=${req.session} account=${snap.accountId} fallback ${candidateModel}`
-      : `pin override session=${req.session} account=${snap.accountId}`;
-    return {
-      model: req.model,
-      accountId: snap.accountId,
-      strategy: 'pin',
-      score,
-      mode: 'pin',
-      error: null,
-      reason,
-      losers,
-    };
-  }
-
-  return unavailable(
-    `pinned account unavailable: ${pinAccountId} has no remaining headroom for ${req.model}`,
-  );
+function pinnedAccountId(decision: ResolveDecision): string | null {
+  if (decision.ok && decision.strategy === 'pin') return decision.accountId;
+  if (!decision.ok && decision.error === 'PINNED_UNAVAILABLE') return decision.accountId;
+  return null;
 }
 
 function describeLoser(
@@ -133,8 +76,16 @@ function describeLoser(
     winnerScore: number | null;
     ceiling: number;
     reserved: Set<string>;
+    pinnedTo: string | null;
   },
 ): WhyLoser {
+  if (ctx.pinnedTo && snap.accountId !== ctx.pinnedTo) {
+    return {
+      accountId: snap.accountId,
+      reason: 'pinned',
+      detail: `session pinned to ${ctx.pinnedTo}`,
+    };
+  }
   if (snap.error) {
     return {
       accountId: snap.accountId,
@@ -181,34 +132,34 @@ function describeLoser(
 
 /**
  * Explain the account `resolveFromSnapshots` would pick from already-stored
- * snapshots. Read-only: does not persist a decision or probe the network.
+ * snapshots. Read-only: does not persist a decision, advance rotation, or
+ * probe the network.
  */
 export function explainWhy(req: WhyRequest): WhyReport {
   const strategy: Strategy = req.strategy ?? 'headroom';
   const fallback = req.fallback ?? [];
-  const chain = [req.model, ...fallback];
 
-  if (req.session && req.store) {
-    const pin = req.store.getPinOverride(req.session);
-    if (pin) return explainPinned(req, pin.account_id, chain);
-  }
-
-  const reserved = reservedIds(req.store);
-  const candidates = req.snapshots.filter((s) => !reserved.has(s.accountId));
-  // No `store` — skip recording / round-robin mutation; reserved already filtered.
   const decision: ResolveDecision = resolveFromSnapshots({
     model: req.model,
     fallback,
     session: req.session,
     strategy,
-    snapshots: candidates,
+    snapshots: req.snapshots,
+    store: req.store,
+    persist: false,
   });
 
-  const winnerId = decision.ok ? decision.accountId : null;
+  const reserved = reservedIds(req.store);
+  const pinnedTo = pinnedAccountId(decision);
+  const winnerId = decision.ok
+    ? decision.accountId
+    : decision.error === 'PINNED_UNAVAILABLE'
+      ? decision.accountId
+      : null;
   const winnerScore = decision.ok ? decision.score : null;
   const ceiling = decision.ok ? decision.ceiling : ALL_IN_CEILING;
   const servedModel = decision.ok ? decision.servedModel : req.model;
-  const reportStrategy = decision.ok ? decision.strategy : strategy;
+  const reportStrategy = decision.ok ? decision.strategy : pinnedTo ? 'pin' : strategy;
   const error = decision.ok
     ? null
     : decision.error === 'PINNED_UNAVAILABLE'
@@ -228,6 +179,7 @@ export function explainWhy(req: WhyRequest): WhyReport {
         winnerScore,
         ceiling,
         reserved,
+        pinnedTo,
       }),
     );
 
