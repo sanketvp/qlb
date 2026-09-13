@@ -131,6 +131,8 @@ Without coordination, N processes that notice the same stale cache at the same i
 3. The winner fetches *outside* any transaction and writes results back only if its claim is still current at write time ("Rule W": a slow holder whose claim expired or was taken over has its late response silently discarded, so a takeover's fresher read always wins).
 4. If a holder crashes, nothing is corrupted: the claim simply expires after its TTL and the next process takes over. A lost cache refresh costs one GET to redo — which is exactly why this mechanism deliberately uses a plain TTL claim rather than the heartbeat-and-generation fencing that credential refreshes need (see below).
 
+Every fetch resolves to an explicit outcome (`FetchOutcome` in `src/types.ts`): `fetched` (a real provider call), `coalesced` (another caller's fresh result was reused), or `cached-after-failure` (the fetch failed inside the single-flight TTL, so the cached reading was kept). `cached-after-failure` is surfaced by `qlb refresh` (the account is classified `failed`) but it does **not** change what `resolve`/`status` select — they keep using the cached buckets as ordinary snapshot data.
+
 The same claim coalesces N concurrent callers *inside one process* as well: the holder id is per-operation (`processUuid:opId`), not per-process, so two async callers in one process cannot mistake each other's live claim for their own.
 
 ## Credential ownership and the fenced refresh
@@ -156,7 +158,8 @@ Fencing coordinates QLB's processes against each other; it cannot coordinate wit
 
 - `accounts` — accounts discovered by adapters (plus `grant_generation` for owned grants)
 - `snapshots` — the gauge cache, one row per `(account, bucket)`, upsert-guarded by `fetched_at` so a late-landing older reading never overwrites a newer one
-- `decisions` — audit of every resolve (inputs, reason, mode, per-bucket ages)
+- `config` — a generic `key`/`value` table; besides round-robin and failover state it holds one **persisted per-provider observation** under the key `observed:<provider>` (`observationConfigKey()` in `src/candidates.ts`), written by `qlb resolve`, `qlb refresh --allow-probe`, and `qlb status`. Each entry carries a monotonically increasing generation counter, the fetch outcome (`ok` / `failed`), and the normalized snapshots QLB saw — including per-account bucket readings — with a per-account `failed` flag set by refresh when a probe failed (`cached-after-failure` or an error snapshot). `qlb why` reproduces a pick from exactly this record.
+- `decisions` — audit of every resolve (inputs, reason, mode, per-bucket ages), with the **additive** `strategy` and `provider` columns persisted on new rows (added by `ensureDecisionColumnsOn()` in `src/store.ts` via `ALTER TABLE`; the schema stays version-neutral so `user_version` remains 4, and legacy rows fall back to derived strategy/provider)
 - `poll_claims` / `leases` — the two single-flight mechanisms above
 - `migrations` — the credential-ownership journal
 - `policies` — virtual-model → real-model mappings for the proxy

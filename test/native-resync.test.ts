@@ -343,22 +343,29 @@ describe('createNativeCredentialReader (temp files only)', () => {
         'openai-codex': { type: 'oauth', access: 'codex-a', refresh: 'codex-r', expires: 9 },
       }) + '\n',
     );
-    const read = createNativeCredentialReader({
-      poolFilePath: pool,
-      authJsonPath: auth,
-      readOpenRouterKey: () => 'sk-or-fake',
-    });
-    const anth = await read('anthropic', 'acct-a');
-    const xai = await read('xai', ADAPTER_ACCOUNT_IDS.xai);
-    const kimi = await read('kimi-coding', ADAPTER_ACCOUNT_IDS['kimi-coding']);
-    const codex = await read('openai-codex', ADAPTER_ACCOUNT_IDS['openai-codex']);
-    const or = await read('openrouter', ADAPTER_ACCOUNT_IDS.openrouter);
-    assert.equal(anth && 'access' in anth ? anth.access : null, 'anth-access');
-    assert.equal(xai && 'access' in xai ? xai.access : null, 'xai-a');
-    assert.equal(kimi && 'access' in kimi ? kimi.access : null, 'kimi-a');
-    assert.equal(codex && 'access' in codex ? codex.access : null, 'codex-a');
-    assert.ok(or && 'type' in or && or.type === 'api-key');
-    assert.equal(or.access, 'sk-or-fake');
+    // The isolation preload denies this production reader by default. This
+    // dedicated unit fixture opts in only for paths beneath its temp root.
+    process.env.QLB_TEST_NATIVE_READER_ROOT = dir;
+    try {
+      const read = createNativeCredentialReader({
+        poolFilePath: pool,
+        authJsonPath: auth,
+        readOpenRouterKey: () => 'sk-or-fake',
+      });
+      const anth = await read('anthropic', 'acct-a');
+      const xai = await read('xai', ADAPTER_ACCOUNT_IDS.xai);
+      const kimi = await read('kimi-coding', ADAPTER_ACCOUNT_IDS['kimi-coding']);
+      const codex = await read('openai-codex', ADAPTER_ACCOUNT_IDS['openai-codex']);
+      const or = await read('openrouter', ADAPTER_ACCOUNT_IDS.openrouter);
+      assert.equal(anth && 'access' in anth ? anth.access : null, 'anth-access');
+      assert.equal(xai && 'access' in xai ? xai.access : null, 'xai-a');
+      assert.equal(kimi && 'access' in kimi ? kimi.access : null, 'kimi-a');
+      assert.equal(codex && 'access' in codex ? codex.access : null, 'codex-a');
+      assert.ok(or && 'type' in or && or.type === 'api-key');
+      assert.equal(or.access, 'sk-or-fake');
+    } finally {
+      delete process.env.QLB_TEST_NATIVE_READER_ROOT;
+    }
   });
 });
 

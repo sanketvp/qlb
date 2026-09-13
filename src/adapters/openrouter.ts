@@ -2,7 +2,8 @@ import { config } from '../config';
 import { openRouterMissingKeyMessage, readNativeOpenRouterKey } from '../keychain';
 import { fetchAndCache } from '../single-flight';
 import { getStore } from '../store';
-import type { AccountSnapshot, Adapter, BucketReading } from '../types';
+import type { AccountSnapshot, Adapter, BucketReading, FetchOutcome } from '../types';
+import type { SingleFlightOpts } from '../single-flight';
 
 const KEYCHAIN_SERVICE = config.openrouterKeychainService;
 const CREDITS_URL = 'https://openrouter.ai/api/v1/credits';
@@ -17,6 +18,7 @@ type FetchFn = typeof fetch;
 type FetchAndCacheFn = (
   accountId: string,
   fetcher: () => Promise<Record<string, BucketReading>>,
+  opts?: SingleFlightOpts,
 ) => Promise<Record<string, BucketReading> | null>;
 
 interface OpenRouterCreditsResponse {
@@ -109,6 +111,8 @@ export function createOpenRouterAdapter(
         }
 
         let lastError: string | undefined;
+        let probeOutcome: FetchOutcome | undefined;
+        let probeDetail: string | undefined;
         const buckets = await fetchCached(ACCOUNT_ID, async () => {
           let response: Response;
           try {
@@ -140,10 +144,21 @@ export function createOpenRouterAdapter(
             lastError = err instanceof Error ? err.message : String(err);
             throw err;
           }
+        }, {
+          onOutcome(outcome, detail) {
+            probeOutcome = outcome;
+            probeDetail = detail;
+          },
         });
 
+        const probe = probeOutcome
+          ? {
+              outcome: probeOutcome,
+              detail: probeOutcome === 'cached-after-failure' ? (lastError ?? probeDetail) : probeDetail,
+            }
+          : undefined;
         if (lastError) {
-          return [errorSnapshot(lastError)];
+          return [{ ...errorSnapshot(lastError), ...(probe ? { probe } : {}) }];
         }
         if (buckets && Object.keys(buckets).length > 0) {
           const credit = buckets.credits;
@@ -156,6 +171,7 @@ export function createOpenRouterAdapter(
               provider: 'openrouter',
               label: LABEL,
               buckets: detailedBuckets,
+              ...(probe ? { probe } : {}),
             },
           ];
         }

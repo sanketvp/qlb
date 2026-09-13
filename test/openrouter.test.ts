@@ -5,8 +5,10 @@ import {
   createOpenRouterAdapter,
   type OpenRouterAdapterDeps,
 } from '../src/adapters/openrouter';
+import { resolveFromSnapshots } from '../src/resolve';
 import { providerForModel } from '../src/scoring';
-import type { BucketReading } from '../src/types';
+import { openStore } from '../src/store';
+import type { AccountSnapshot, BucketReading } from '../src/types';
 
 const directFetch: NonNullable<OpenRouterAdapterDeps['fetchAndCacheFn']> = async (
   _accountId: string,
@@ -110,5 +112,73 @@ describe('OpenRouter adapter', () => {
         error: 'malformed response from credits endpoint',
       },
     ]);
+  });
+
+  it('cached-after-failure returning cached buckets still sets snapshot.error', async () => {
+    const cached: Record<string, BucketReading> = {
+      credits: {
+        usedPct: 10,
+        used: 10,
+        limit: 100,
+        remaining: 90,
+        source: 'poll',
+        confidence: 'authoritative',
+        fetchedAt: 1,
+      },
+    };
+    const adapter = adapterWith({
+      fetchFn: async () => new Response('denied', { status: 401 }),
+      fetchAndCacheFn: async (_accountId, fetcher, opts) => {
+        try {
+          return await fetcher();
+        } catch (err) {
+          opts?.onOutcome?.(
+            'cached-after-failure',
+            err instanceof Error ? err.message : String(err),
+          );
+          return cached;
+        }
+      },
+    });
+
+    const snapshots = await adapter.fetchSnapshots();
+    assert.equal(snapshots.length, 1);
+    assert.ok(snapshots[0]?.error);
+    assert.match(snapshots[0]?.error ?? '', /credits endpoint returned HTTP 401/);
+    assert.equal(snapshots[0]?.probe?.outcome, 'cached-after-failure');
+    assert.deepEqual(snapshots[0]?.buckets, {});
+  });
+
+  it('cached-after-failure OpenRouter account is not selected when a healthy alternative exists', async () => {
+    const store = openStore(':memory:');
+    const credits = (usedPct: number): BucketReading => ({
+      usedPct,
+      source: 'poll',
+      confidence: 'authoritative',
+      fetchedAt: Date.now(),
+    });
+    const failed: AccountSnapshot = {
+      accountId: 'openrouter-default',
+      provider: 'openrouter',
+      label: 'OpenRouter',
+      buckets: { credits: credits(10) },
+      error: 'credits endpoint returned HTTP 401',
+      probe: { outcome: 'cached-after-failure', detail: 'credits endpoint returned HTTP 401' },
+    };
+    const healthy: AccountSnapshot = {
+      accountId: 'openrouter-healthy',
+      provider: 'openrouter',
+      label: 'OpenRouter healthy',
+      buckets: { credits: credits(5) },
+    };
+    const decision = resolveFromSnapshots({
+      model: 'openrouter/auto',
+      snapshots: [failed, healthy],
+      store,
+    });
+    assert.equal(decision.ok, true);
+    if (!decision.ok) return;
+    assert.equal(decision.accountId, 'openrouter-healthy');
+    store.close();
   });
 });

@@ -69,6 +69,39 @@ Flags: `[--json] [--live]`. Exit `1` when overall is `FAIL`.
 
 For QLB-owned accounts, doctor also runs a native-credential drift check (one `[PASS]`/`[WARN]` line per owned account, name `native-sync:<accountId>`) — see [CREDENTIAL-SAFETY.md](CREDENTIAL-SAFETY.md#native-credential-drift-the-shadow-retain-tradeoff).
 
+## `qlb refresh`
+
+Poll every enabled adapter for a fresh gauge reading. Without `--allow-probe` this is a no-network no-op (exit 0). Pass `--allow-probe` to invoke each adapter's `fetchSnapshots()` — network reads go through the existing single-flight cache.
+
+`--allow-probe` makes **real provider requests** with your stored credentials. For xAI that is a 1-token completion that consumes quota. Codex has no probe (`probes: false`): it only reads the local auth file and is reported as `no-probe` (readings come from the proxy's header parsing). Invalid/missing Codex credentials are `error`, not `no-probe`.
+
+A fetch that fails inside the single-flight TTL keeps cached buckets and is classified **failed** (`probe.outcome = cached-after-failure`). Mixed ok + failed accounts on one provider are `partial` (`ok: false`).
+
+```console
+$ qlb refresh
+refresh: no probes run (pass --allow-probe to poll providers)
+
+$ qlb refresh --allow-probe
+[OK]   xai (xAI): 1 account(s)
+[NONE] openai-codex (Codex (ChatGPT Pro)): no probe available — readings come from proxy traffic (1 account(s) from credentials)
+[FAIL] openrouter (OpenRouter): no snapshots returned
+Probed 3 provider(s): 1 ok, 0 partial, 0 no-data, 1 no-probe, 1 failed
+```
+
+Per-provider statuses:
+
+| Glyph | `status` | Meaning |
+|---|---|---|
+| `[OK]` | `ok` | At least one account with a bucket reading and no error / cached-after-failure. |
+| `[PART]` | `partial` | Some accounts ok and some failed. `ok` is false. One line per failed account. |
+| `[NONE]` | `no-data` | Snapshots returned without `error` but none have gauge buckets. |
+| `[NONE]` | `no-probe` | Adapter declares `probes: false` (Codex, some plugins). Readings come from proxy traffic. |
+| `[FAIL]` | `error` | The adapter threw/rejected, returned no snapshots, every snapshot had `error`, or every account was `cached-after-failure`. One failed provider never aborts the others. |
+
+`--json` prints `{ probed, results }` where each result is `{ provider, displayName, ok, status, accounts, accountsOk, accountsFailed, error?, errors, snapshots }`. `status` is one of `ok`, `partial`, `no-data`, `no-probe`, `error`. `errors` is `{accountId, error}[]`. Without `--allow-probe` that is `{"probed":false,"results":[]}`. Plugins that omit `probe` on snapshots are treated as fetched.
+
+Flags: `[--allow-probe] [--json]`. Exit `0` always on a completed refresh (a failed provider is a result, not a crash). Unknown arguments exit `1`.
+
 ## `qlb native-resync`
 
 Compare a QLB-owned credential with the provider's current native credential and resync QLB's Keychain copy if they differ. This is the manual trigger for the same fingerprint-compare-and-resync the proxy runs automatically on an auth failure — mechanism and the differ-vs-identical semantics are described in [CREDENTIAL-SAFETY.md](CREDENTIAL-SAFETY.md#native-credential-drift-the-shadow-retain-tradeoff). It is one Keychain overwrite at most, never a re-migration, and exits `0` either way:
@@ -230,6 +263,42 @@ Strategies:
 - `round-robin` — ignore scores except to skip exhausted/error accounts; cycle in account-id order using a SQLite counter.
 - `failover` — stick to the current account while every relevant bucket is under 100%; switch only when it is genuinely exhausted.
 
+## `qlb why`
+
+Explain the account the resolver would pick **based on the latest persisted observation per provider**. `qlb why` never probes the network and never writes a decision row or advances round-robin/failover state. Observations are recorded per provider by `qlb resolve`, `qlb refresh --allow-probe`, and `qlb status`. Enough normalized candidate data (including buckets) is stored so the observed pick can be reproduced; later live-store bucket changes do **not** change `why` until a new observation is recorded.
+
+Plugins that declare `persistsSnapshots: false` (or observations that fail validation) are excluded from the parity guarantee and labelled `observation: unavailable`.
+
+When `--model` is omitted, `why` uses `requested_model` of the newest routing decision, else `claude-sonnet-5`. Unknown `--model` exits `1` (same as `resolve`). Human output includes `model: X (from last routing decision|default)`, an `observed:` timestamp/generation (or `never probed — store snapshots only`), and a hint to run `qlb refresh --allow-probe` to update. `--json` emits an `observations` array (one entry per provider), not a singular object.
+
+```console
+$ qlb why --json
+{
+  "model": "claude-sonnet-5",
+  "modelSource": "default",
+  "accountId": null,
+  "strategy": "headroom",
+  "score": null,
+  "error": "EXHAUSTED",
+  "reason": "EXHAUSTED",
+  "losers": [],
+  "observations": [],
+  "hint": "run qlb refresh --allow-probe to update"
+}
+```
+
+Flags: `[--model <modelId>]`, `[--fallback m1,m2,...]`, `[--session <id>]`, `[--strategy headroom|spread|round-robin|failover]`, `[--json]`. Unknown model exits `1`; otherwise `0`.
+
+## `qlb audit`
+
+Read-only listing of recent **routing** decisions (newest first, default `--limit 20`). Non-routing proxy rows (`proxy`, `proxy_error`, `proxy_auth_reject`, `policy_unmapped`, `native_resync`, `proxy_upstream_error`) are filtered **before** LIMIT.
+
+`strategy` and `provider` are persisted on new rows. Legacy v4 rows derive strategy only when unambiguous (`pin|spread|round-robin|failover` → itself; `headroom|all-in` → `headroom`; otherwise `?` / `null`). Provider falls back `recorded` → `accounts` → `snapshot_json` → `providerForModel(requested_model)` → none. JSON includes `strategySource` and `providerSource` ∈ `recorded|derived|accounts|snapshot|model|none`.
+
+The command opens the store with `readOnly: true` and never migrates. A missing path prints `no decisions` / `[]` and exits `0` without creating files. Zero-mutation promise = main-file bytes, mode, `user_version`, and all directory entries other than `<db>-wal` / `<db>-shm` (a WAL-mode DB may require those sidecars for any reader; audit may create or leave them). If the directory is unwritable and SQLite cannot create/map `-shm` for a WAL-mode file, audit does **not** fall back to a writable open: it prints `qlb audit: store is not readable without write access to <dir> (WAL sidecar); run from a writable location or vacuum the store`, exits `1`, prints no stack, and creates no new entries. Other open failures print `qlb audit: cannot open store read-only (<reason>)` and also exit `1`. `--limit` must be a positive safe integer; an invalid value exits `1` with a single stderr line.
+
+Flags: `[--limit N]` (default 20), `[--json]`, `[--db <path>]`.
+
 ## `qlb override`
 
 Explicit pin / reserve / drain-first over the existing `overrides` table. This is what makes **deliberate multi-account parallel use** possible: automatic scoring picks one best account, but you can pin different sessions to different accounts for a guaranteed parallel spread, take an account out of rotation entirely, or bias traffic toward one account to drain it. `--until` is an ISO datetime or a duration like `2h` / `30m` / `1d`. When omitted, the default lifetime is **24 hours from now**.
@@ -377,15 +446,25 @@ $ qlb accounts prune --account account-1699999999999 --confirm --json
 }
 ```
 
-Deletes the account's rows from `accounts`, `snapshots`, `overrides`, `poll_claims`, and the account's refresh `leases` row. `decisions` rows are left untouched (audit history, not live state). **Refused unconditionally** if the account is currently QLB_OWNED / RETIRED or participating in an in-flight migration (`MIRRORED` / pre-commit `VALIDATED`) — i.e. its ID appears in the `qlbAccountIds` (or `accounts[].id`) list of any `migrations` row in those states, or if such a row's `detail_json` cannot be trusted (malformed JSON, empty IDs, missing/invalid owner path, or ambiguous `VALIDATED`). A completed post-commit-rollback `VALIDATED` is not in-flight only when the journal proves it (`rolledBackFrom: 'post-commit'`, explicit `ownerFilePath`, owner and `.staging` both absent — same classifier `qlb doctor` uses):
+Deletes **local account metadata only**: `accounts`, `snapshots`, `overrides`, `poll_claims`, and the account's refresh `leases` row. Credentials are never removed, moved, or rewritten (Keychain items, native stores, `.pre-qlb` backups, sidecars, owner files). `decisions` / `errors` rows are left untouched (audit history, not live state).
+
+**Refused (exit 2)** with a stable reason token:
+
+- `protected:<STATE>` — the account is named by a trusted `MIRRORED`, `VALIDATED`, `QLB_OWNED`, or `RETIRED` journal row **including after a completed rollback**. Post-rollback prune of `VALIDATED` participants is deferred until a separately reviewed cycle-bound receipt protocol and current-grant rollback both exist.
+- `untrusted:<reason>` — some journal row cannot be decoded (malformed JSON, empty/mismatched inventories, bad shape, unknown store/state/version, provider conflict, …).
+- `recovery_pending` — `config('migrations.recovery_pending')` is set; destructive maintenance is refused until an explicit reviewed reconciliation clears it.
+- `no_such_account` — the id does not exist.
+- `not_confirmed` — `--confirm` was not passed.
+
+Usage errors (unknown subcommand/flag, missing `--account`) exit **1**. Infrastructure errors (SQLite, I/O) exit **1** and print the original error `code`/`errcode`/message. Refusals name the store and never print a command that could delete or rewrite credentials.
 
 ```console
 $ qlb accounts prune --account account-1 --confirm
-REFUSED: account 'account-1' is QLB_OWNED (via store 'pi-pool', state QLB_OWNED); will not prune a real owned account
+REFUSED: protected:QLB_OWNED (store 'pi-pool')
 (exit 2)
 ```
 
-Also refused without `--confirm`, or if the account id doesn't exist. Flags: `--account <id>` (required), `--confirm` (required), `[--db <path>]`, `[--json]`.
+Flags: `--account <id>` (required), `--confirm` (required), `[--db <path>]`, `[--json]`.
 
 ## `qlb setup`
 
@@ -465,4 +544,4 @@ All three are read-only from the extension's side (they only shell out to `qlb s
 
 ## Not yet wired (honest gaps)
 
-- **Probes from the CLI.** Codex/xAI readings in the CLI path come from organic traffic (xAI via its minimal probe inside the adapter, coalesced single-flight) and from the proxy's header parsing; the spec's `qlb refresh --allow-probe` / `qlb audit` / `qlb why` surface is not implemented yet.
+- **Organic Codex/xAI gauges.** Codex has no probe; xAI's CLI probe is a quota-consuming 1-token completion. Otherwise those readings still come from organic traffic (proxy header parsing) until `qlb refresh --allow-probe` or `qlb status`/`qlb resolve` records an observation.

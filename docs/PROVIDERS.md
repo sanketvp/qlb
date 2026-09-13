@@ -7,6 +7,11 @@ QLB ships with five built-in provider adapters (`src/adapters/`). Each one is re
 
 An adapter must never throw: failures become an error snapshot on the account (visible in `qlb status`), so one unavailable provider never breaks the overall status command.
 
+Two optional `Adapter` fields (`src/types.ts`) tailor refresh behavior; absent means `true`:
+
+- **`probes?: boolean`** — `false` when the provider has no probe, so `qlb refresh --allow-probe` reports it as `no-probe` instead of calling `fetchSnapshots()`. Codex is the built-in example: it exposes no usage endpoint and only reads the local auth file, so its readings come from proxy header parsing.
+- **`persistsSnapshots?: boolean`** — `false` when the adapter does not persist snapshots; `qlb why` then labels that provider's accounts `observation: unavailable` because a pick cannot be reproduced from a persisted observation.
+
 ---
 
 ## Anthropic / Claude (`anthropic`)

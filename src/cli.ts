@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { adapters } from './adapters';
 import { createDefaultCodexGateDeps, runCodexGate } from './codex-gate';
 import { config, stripConfigArgs } from './config';
@@ -48,16 +48,30 @@ import {
   overrideFromStore,
 } from './dashboard';
 import { isSetupHarness, setupHarness, type SetupHarness } from './setup';
-import { getStore, openStore, type Store } from './store';
-import type { AccountSnapshot, Adapter } from './types';
+import { formatRefresh, refreshCommand, runRefresh } from './refresh';
+import { DEFAULT_AUDIT_LIMIT, formatAudit, toAuditDecision } from './audit';
+import { DEFAULT_WHY_MODEL, explainWhy, formatWhyHuman } from './why';
+import { collectCandidates, recordObservation, safeFetch } from './candidates';
+import {
+  getStore,
+  isWalSidecarUnreadableError,
+  openDecisionsReader,
+  openStore,
+  WAL_SIDECAR_UNREADABLE,
+  walSidecarUnreadableMessage,
+  type Store,
+} from './store';
+import type { AccountSnapshot } from './types';
 
 const USAGE = `Usage:
   qlb init [--json]
   qlb doctor [--json] [--live]
+  qlb refresh [--allow-probe] [--json]
   qlb native-resync --provider anthropic|xai|kimi-coding|openai-codex|openrouter --account <id> [--json] [--db <path>]
   qlb status [--json] [--dashboard|--flat]
   qlb setup pi|claude-code|codex-cli|generic [--json]
   qlb resolve --model <modelId> [--fallback m1,m2,...] [--session <id>] [--harness pi|claude-code|codex|dispatch] [--effort <lvl>] [--strategy headroom|spread|round-robin|failover] [--json]
+  qlb why [--model <modelId>] [--fallback m1,m2,...] [--session <id>] [--strategy headroom|spread|round-robin|failover] [--json]
   qlb override pin --session <id> --account <account-id> [--until <ISO-datetime|2h>] [--db <path>] [--json]
   qlb override reserve --account <account-id> [--until <ISO-datetime|2h>] [--db <path>] [--json]
   qlb override drain-first --account <account-id> [--until <ISO-datetime|2h>] [--db <path>] [--json]
@@ -76,6 +90,7 @@ const USAGE = `Usage:
   qlb retire status  --harness claude-code|codex-cli [--json] [--db <path>]
   qlb retire execute --harness claude-code|codex-cli --confirm-real-retirement [--db <path>]
   qlb accounts prune --account <id> --confirm [--json] [--db <path>]
+  qlb audit [--limit N] [--json] [--db <path>]
 
 SAFETY: running migrate stage/rehearse/commit/rollback/resume without path
 overrides targets the REAL ~/.pi/agent/ files (anthropic-pool.json for
@@ -105,12 +120,23 @@ this repo (setup pi writes scripts/hooks/pi-advisory.sh here).
 qlb override pin/reserve/drain-first: --until defaults to 24h from now when
 omitted (ISO datetime or duration like 2h/30m/1d). Pin forces that account
 for one session id; reserve excludes an account from automatic selection;
-drain-first biases selection toward an account.`;
+drain-first biases selection toward an account.
+qlb audit is read-only: last N routing decisions (default 20, newest first).
+Empty store prints "no decisions" or [].`;
 
 type StatusOpts = { cmd: 'status'; json: boolean; view: 'dashboard' | 'flat' };
 type SetupOpts = { cmd: 'setup'; json: boolean; harness: SetupHarness };
 type InitOpts = { cmd: 'init'; json: boolean };
 type DoctorOpts = { cmd: 'doctor'; json: boolean; live: boolean };
+type RefreshOpts = { cmd: 'refresh'; json: boolean; allowProbe: boolean };
+type WhyOpts = {
+  cmd: 'why';
+  json: boolean;
+  model?: string;
+  fallback: string[];
+  session?: string;
+  strategy?: Strategy;
+};
 type ResolveOpts = {
   cmd: 'resolve';
   json: boolean;
@@ -224,7 +250,13 @@ type AccountsOpts = {
   confirm: boolean;
   db?: string;
 };
-type Opts = InitOpts | DoctorOpts | StatusOpts | SetupOpts | ResolveOpts | MigrateOpts | PolicyOpts | GateOpts | ProxyOpts | RetireOpts | NativeResyncOpts | OverrideOpts | AccountsOpts;
+type AuditOpts = {
+  cmd: 'audit';
+  json: boolean;
+  limit: number;
+  db?: string;
+};
+type Opts = InitOpts | DoctorOpts | RefreshOpts | WhyOpts | StatusOpts | SetupOpts | ResolveOpts | MigrateOpts | PolicyOpts | GateOpts | ProxyOpts | RetireOpts | NativeResyncOpts | OverrideOpts | AccountsOpts | AuditOpts;
 
 const MIGRATE_SUBS: readonly MigrateSub[] = [
   'stage',
@@ -480,13 +512,42 @@ function parseAccountsArgs(argsIn: string[]): AccountsOpts {
   }
   if (!confirm) {
     console.error(
-      'REFUSED: qlb accounts prune requires --confirm.\n' +
-        'This permanently deletes the account\'s rows from accounts/snapshots/overrides/poll_claims/leases.\n' +
-        'It is refused unconditionally if the account is QLB_OWNED, RETIRED, or in-flight (MIRRORED/VALIDATED).',
+      'REFUSED: not_confirmed — qlb accounts prune requires --confirm.\n' +
+        'This permanently deletes the account\'s local metadata rows (accounts/snapshots/overrides/poll_claims/leases).\n' +
+        'Credentials (Keychain, native stores, owner files) are never removed.\n' +
+        'Participants of any trusted MIRRORED/VALIDATED/QLB_OWNED/RETIRED journal row are refused, including after rollback (post-rollback prune is deferred).',
     );
     process.exit(2);
   }
   return { cmd: 'accounts', sub, json, account, confirm, db };
+}
+
+function parseAuditArgs(argsIn: string[]): AuditOpts {
+  const args = [...argsIn];
+  if (args[0] === '-h' || args[0] === '--help') {
+    console.log(USAGE);
+    process.exit(0);
+  }
+  const json = args.includes('--json');
+  if (json) args.splice(args.indexOf('--json'), 1);
+  const db = takeFlag(args, '--db');
+  let limit = DEFAULT_AUDIT_LIMIT;
+  const limitIdx = args.indexOf('--limit');
+  if (limitIdx !== -1) {
+    const raw = args[limitIdx + 1];
+    if (raw === undefined || !/^[1-9]\d*$/.test(raw) || !Number.isSafeInteger(Number(raw))) {
+      console.error('qlb audit: --limit must be a positive integer');
+      process.exit(1);
+    }
+    args.splice(limitIdx, 2);
+    limit = Number(raw);
+  }
+  if (args.length > 0) {
+    console.error(`qlb audit: unknown argument ${args[0]}`);
+    console.error(USAGE);
+    process.exit(1);
+  }
+  return { cmd: 'audit', json, db, limit };
 }
 
 function parseRetireArgs(argsIn: string[]): RetireOpts {
@@ -652,6 +713,41 @@ function parseOverrideArgs(argsIn: string[]): OverrideOpts {
   return { cmd: 'override', sub, json, db, account, until };
 }
 
+function parseWhyArgs(argsIn: string[]): WhyOpts {
+  const args = [...argsIn];
+  if (args[0] === '-h' || args[0] === '--help') {
+    console.log(USAGE);
+    process.exit(0);
+  }
+  const json = args.includes('--json');
+  if (json) args.splice(args.indexOf('--json'), 1);
+  const model = takeFlag(args, '--model');
+  const session = takeFlag(args, '--session');
+  const strategyRaw = takeFlag(args, '--strategy');
+  const fallbackRaw = takeFlag(args, '--fallback');
+  if (args.length > 0) {
+    console.error(`qlb why: unknown argument ${args[0]}`);
+    console.error(USAGE);
+    process.exit(1);
+  }
+  let strategy: Strategy | undefined;
+  if (strategyRaw !== undefined) {
+    if (!isStrategy(strategyRaw)) {
+      console.error(
+        `qlb why: --strategy must be ${STRATEGIES.join('|')} (got '${strategyRaw}')`,
+      );
+      console.error(USAGE);
+      process.exit(1);
+    }
+    strategy = strategyRaw;
+  }
+  const fallback = (fallbackRaw ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return { cmd: 'why', json, model, fallback, session, strategy };
+}
+
 function parseArgs(argv: string[]): Opts {
   const raw = stripConfigArgs(argv).slice(2);
   if (raw[0] === '-h' || raw[0] === '--help') {
@@ -680,6 +776,21 @@ function parseArgs(argv: string[]): Opts {
     }
     return { cmd: 'doctor', json, live };
   }
+  if (raw[0] === 'refresh') {
+    const rest = raw.slice(1);
+    const json = rest.includes('--json');
+    if (json) rest.splice(rest.indexOf('--json'), 1);
+    const allowProbe = rest.includes('--allow-probe');
+    if (allowProbe) rest.splice(rest.indexOf('--allow-probe'), 1);
+    if (rest.length > 0) {
+      console.error(`qlb refresh: unknown argument ${rest[0]}`);
+      process.exit(1);
+    }
+    return { cmd: 'refresh', json, allowProbe };
+  }
+  if (raw[0] === 'why') {
+    return parseWhyArgs(raw.slice(1));
+  }
   if (raw[0] === 'migrate') {
     return parseMigrateArgs(raw.slice(1));
   }
@@ -706,6 +817,9 @@ function parseArgs(argv: string[]): Opts {
   }
   if (raw[0] === 'accounts') {
     return parseAccountsArgs(raw.slice(1));
+  }
+  if (raw[0] === 'audit') {
+    return parseAuditArgs(raw.slice(1));
   }
 
   let cmd: 'status' | 'resolve' = 'status';
@@ -808,23 +922,6 @@ function assertSafeMigratePaths(opts: MigrateOpts): void {
         'or pass --confirm-real-cutover if you truly intend to cut over live Pi.',
     );
     process.exit(2);
-  }
-}
-
-async function safeFetch(adapter: Adapter): Promise<AccountSnapshot[]> {
-  try {
-    return await adapter.fetchSnapshots();
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    return [
-      {
-        accountId: adapter.id,
-        provider: adapter.id,
-        label: adapter.displayName,
-        buckets: {},
-        error: message,
-      },
-    ];
   }
 }
 
@@ -942,9 +1039,18 @@ function printDoctor(report: DoctorReport, json: boolean): void {
 }
 
 async function runStatus(opts: StatusOpts): Promise<void> {
-  const nested = await Promise.all(adapters.map((adapter) => safeFetch(adapter)));
-  const accounts = nested.flat();
   const store = getStore();
+  const nested = await Promise.all(adapters.map(async (adapter) => {
+    const snaps = await safeFetch(adapter);
+    recordObservation(
+      store,
+      { provider: adapter.id, persistsSnapshots: adapter.persistsSnapshots },
+      snaps,
+      'status',
+    );
+    return snaps;
+  }));
+  const accounts = nested.flat();
   const enriched = enrichAccounts(accounts, {
     ownershipForProvider: makeOwnershipReader(store),
     overrideForAccount: (id) => overrideFromStore(store, id),
@@ -958,20 +1064,6 @@ async function runStatus(opts: StatusOpts): Promise<void> {
     return;
   }
   console.log(formatDashboard(enriched));
-}
-
-async function collectSnapshots(models: string[]): Promise<AccountSnapshot[]> {
-  const providers = new Set<Adapter['id']>();
-  for (const m of models) {
-    const p = providerForModel(m);
-    if (p) providers.add(p);
-  }
-  const snaps: AccountSnapshot[] = [];
-  for (const adapter of adapters) {
-    if (!providers.has(adapter.id)) continue;
-    snaps.push(...(await safeFetch(adapter)));
-  }
-  return snaps;
 }
 
 function printResolveHuman(decision: ReturnType<typeof resolveFromSnapshots>): void {
@@ -1066,8 +1158,15 @@ async function runResolve(opts: ResolveOpts): Promise<number> {
     console.error(`qlb resolve: unknown model '${opts.model}' (cannot map to a provider)`);
     return 1;
   }
+  const store = getStore();
   const models = [opts.model, ...opts.fallback];
-  const snapshots = await collectSnapshots(models);
+  const { snapshots } = await collectCandidates({
+    adapters,
+    store,
+    models,
+    probe: true,
+    recordAs: 'resolve',
+  });
   const decision = resolveFromSnapshots({
     model: opts.model,
     fallback: opts.fallback,
@@ -1076,11 +1175,55 @@ async function runResolve(opts: ResolveOpts): Promise<number> {
     effort: opts.effort,
     strategy: opts.strategy,
     snapshots,
-    store: getStore(),
+    store,
   });
   if (opts.json) printResolveJson(decision);
   else printResolveHuman(decision);
   return decision.ok ? 0 : 1;
+}
+
+async function runWhy(opts: WhyOpts): Promise<number> {
+  const store = getStore();
+  let model: string;
+  let modelSource: 'flag' | 'last routing decision' | 'default';
+  if (opts.model) {
+    if (!providerForModel(opts.model)) {
+      console.error(`qlb why: unknown model '${opts.model}' (cannot map to a provider)`);
+      return 1;
+    }
+    model = opts.model;
+    modelSource = 'flag';
+  } else {
+    const last = store.listRoutingDecisions(1)[0];
+    if (last?.requested_model && providerForModel(last.requested_model)) {
+      model = last.requested_model;
+      modelSource = 'last routing decision';
+    } else {
+      model = DEFAULT_WHY_MODEL;
+      modelSource = 'default';
+    }
+  }
+  const strategy: Strategy = opts.strategy
+    ?? (isStrategy(config.defaultStrategy) ? config.defaultStrategy : 'headroom');
+  const { snapshots, observations } = await collectCandidates({
+    adapters,
+    store,
+    models: [model, ...opts.fallback],
+    probe: false,
+  });
+  const report = explainWhy({
+    model,
+    modelSource,
+    fallback: opts.fallback,
+    session: opts.session,
+    strategy,
+    snapshots,
+    store,
+    observations,
+  });
+  if (opts.json) console.log(JSON.stringify(report, null, 2));
+  else console.log(formatWhyHuman(report));
+  return 0;
 }
 
 function printMigrate(status: ReturnType<Migration['status']>, json: boolean): void {
@@ -1349,6 +1492,49 @@ function printOverride(row: { kind: string; account_id: string; session: string 
   console.log(`${row.kind}  account=${row.account_id}${session}  until=${until}`);
 }
 
+function printAuditOpenError(path: string, err: unknown): void {
+  const msg = err instanceof Error ? err.message : String(err);
+  if (msg.includes('upgrade qlb')) {
+    console.error(msg);
+    return;
+  }
+  if (msg === WAL_SIDECAR_UNREADABLE || isWalSidecarUnreadableError(err)) {
+    console.error(walSidecarUnreadableMessage(dirname(path)));
+    return;
+  }
+  console.error(`qlb audit: cannot open store read-only (${msg})`);
+}
+
+async function runAudit(opts: AuditOpts): Promise<number> {
+  const path = opts.db ?? config.dbPath;
+  let reader;
+  try {
+    reader = openDecisionsReader(path);
+  } catch (err) {
+    printAuditOpenError(path, err);
+    return 1;
+  }
+  if (!reader) {
+    console.log(opts.json ? '[]' : 'no decisions');
+    return 0;
+  }
+  try {
+    const rows = reader.listRoutingDecisions(opts.limit);
+    const decisions = rows.map((row) =>
+      toAuditDecision(row, {
+        accountProvider: row.account_id ? reader.getAccountProvider(row.account_id) : null,
+      }),
+    );
+    console.log(formatAudit(decisions, opts.json));
+    return 0;
+  } catch (err) {
+    printAuditOpenError(path, err);
+    return 1;
+  } finally {
+    reader.close();
+  }
+}
+
 async function runOverride(opts: OverrideOpts): Promise<number> {
   return withStore(opts.db, (store) => {
     if (opts.sub === 'list') {
@@ -1435,6 +1621,58 @@ async function main(): Promise<void> {
     printDoctor(report, opts.json);
     process.exit(report.overall === 'FAIL' ? 1 : 0);
   }
+  if (opts.cmd === 'refresh') {
+    try {
+      if (opts.allowProbe) {
+        const store = getStore();
+        const report = await runRefresh(adapters, { allowProbe: true });
+        for (const result of report.results) {
+          const adapter = adapters.find((a) => a.id === result.provider);
+          const input = {
+            provider: result.provider,
+            persistsSnapshots: adapter?.persistsSnapshots,
+          };
+          const allFailed =
+            result.status === 'error' ||
+            (result.accountsFailed > 0 && result.accountsOk === 0);
+          if (allFailed) {
+            recordObservation(store, input, [], 'refresh', {
+              outcome: 'failed',
+              error:
+                result.error ??
+                (result.errors.length > 0
+                  ? result.errors.map((e) => e.error).join('; ')
+                  : 'probe failed'),
+            });
+            continue;
+          }
+          const snaps = result.snapshots.map((snapshot) => {
+            const listed = result.errors.find((e) => e.accountId === snapshot.accountId);
+            const caf = snapshot.probe?.outcome === 'cached-after-failure';
+            if (!snapshot.error && !caf && !listed) return snapshot;
+            return {
+              ...snapshot,
+              failed: true,
+              error:
+                snapshot.error ??
+                listed?.error ??
+                (caf
+                  ? `probe failed: ${snapshot.probe?.detail ?? 'unknown error'}; cached reading retained`
+                  : 'probe failed'),
+            };
+          });
+          recordObservation(store, input, snaps, 'refresh');
+        }
+        console.log(opts.json ? JSON.stringify(report, null, 2) : formatRefresh(report));
+        process.exit(0);
+      }
+      process.exit(await refreshCommand(adapters, { allowProbe: false, json: opts.json }));
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`qlb refresh: ${msg}`);
+      process.exit(1);
+    }
+  }
   if (opts.cmd === 'setup') {
     const result = setupHarness(opts.harness);
     if (opts.json) {
@@ -1450,6 +1688,16 @@ async function main(): Promise<void> {
   if (opts.cmd === 'status') {
     await runStatus(opts);
     process.exit(0);
+  }
+  if (opts.cmd === 'audit') {
+    try {
+      const code = await runAudit(opts);
+      process.exit(code);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`qlb audit: ${msg}`);
+      process.exit(1);
+    }
   }
   if (opts.cmd === 'migrate') {
     try {
@@ -1507,8 +1755,17 @@ async function main(): Promise<void> {
       process.exit(code);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      console.error(`qlb accounts ${opts.sub}: ${msg}`);
-      process.exit(err instanceof PruneRefusedError ? 2 : 1);
+      if (err instanceof PruneRefusedError) {
+        console.error(`qlb accounts ${opts.sub}: ${msg}`);
+        process.exit(2);
+      }
+      const rec = err && typeof err === 'object' ? (err as { code?: unknown; errcode?: unknown }) : {};
+      const bits: string[] = [];
+      if (rec.code != null) bits.push(`code=${String(rec.code)}`);
+      if (rec.errcode != null) bits.push(`errcode=${String(rec.errcode)}`);
+      const extra = bits.length > 0 ? ` [${bits.join(' ')}]` : '';
+      console.error(`qlb accounts ${opts.sub}: ${msg}${extra}`);
+      process.exit(1);
     }
   }
   if (opts.cmd === 'native-resync') {
@@ -1528,6 +1785,15 @@ async function main(): Promise<void> {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`qlb override: ${msg}`);
+      process.exit(1);
+    }
+  }
+  if (opts.cmd === 'why') {
+    try {
+      process.exit(await runWhy(opts));
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`qlb why: ${msg}`);
       process.exit(1);
     }
   }

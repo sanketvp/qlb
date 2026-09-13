@@ -12,7 +12,12 @@ import {
   selectBackendKind,
   type KeychainBackend,
 } from './keychain';
-import { isStuckMigration } from './migration-health';
+import {
+  decodeJournalEvidence,
+  isStuckMigration,
+  untrustedAdvisoryMessage,
+  validatedAdvisoryMessage,
+} from './migration-health';
 import {
   createNativeCredentialReader,
   inspectOwnedNativeDrift,
@@ -307,6 +312,7 @@ export async function doctorQlb(
   const checks: DoctorCheck[] = [];
   let migrations: Array<{ store: string; state: string; detail_json?: string }> = [];
   let accounts: Array<{ id: string; provider: string; label: string }> = [];
+  let recoveryPending = false;
 
   if (!existsSync(config.dbPath)) {
     checks.push({ name: 'sqlite', level: 'WARN', message: `database does not exist yet: ${config.dbPath}; run qlb status` });
@@ -336,6 +342,11 @@ export async function doctorQlb(
           label: string;
         }>;
       }
+      const cfgTable = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='config'").get();
+      if (cfgTable) {
+        const marker = db.prepare('SELECT value FROM config WHERE key = ?').get('migrations.recovery_pending');
+        recoveryPending = marker != null;
+      }
     } catch (err) {
       checks.push({ name: 'sqlite', level: 'FAIL', message: `database check failed: ${err instanceof Error ? err.message : String(err)}` });
     } finally {
@@ -343,15 +354,35 @@ export async function doctorQlb(
     }
   }
 
-  const stuck = migrations.filter((migration) => isStuckMigration(migration, config));
-  checks.push(stuck.length > 0
-    ? {
-        name: 'migrations',
-        level: 'WARN',
-        message: `MIGRATION NEEDS ATTENTION: ${stuck.map((m) => `${m.store}=${m.state}`).join(', ')}; run qlb migrate resume or qlb migrate rollback`,
-        detail: stuck,
+  const stuck = migrations.filter((migration) => isStuckMigration(migration));
+  if (stuck.length > 0) {
+    const parts = stuck.map((migration) => {
+      const ev = decodeJournalEvidence(migration);
+      if (!ev.trusted) {
+        return untrustedAdvisoryMessage(migration.store, migration.state, ev.reason);
       }
-    : { name: 'migrations', level: 'PASS', message: 'no incomplete migrations detected' });
+      if (ev.state === 'VALIDATED') {
+        return validatedAdvisoryMessage(migration.store, ev.participants.size);
+      }
+      return `${migration.store}=${migration.state} — advisory: in-flight staging; accounts are prune-protected; see qlb migrate status`;
+    });
+    checks.push({
+      name: 'migrations',
+      level: 'WARN',
+      message: `MIGRATION NEEDS ATTENTION: ${parts.join('; ')}`,
+      detail: stuck,
+    });
+  } else {
+    checks.push({ name: 'migrations', level: 'PASS', message: 'no incomplete migrations detected' });
+  }
+
+  if (recoveryPending) {
+    checks.push({
+      name: 'recovery',
+      level: 'WARN',
+      message: 'recovery marker present — destructive maintenance refused until reconciled',
+    });
+  }
 
   checks.push(probeCredentialStore(options.command));
 

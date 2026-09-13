@@ -77,6 +77,21 @@ export interface OverrideRow {
   until: number | null;
 }
 
+export const ROUTING_DECISION_MODES = [
+  'headroom',
+  'all-in',
+  'fallback',
+  'fallback-all-in',
+  'pin',
+  'spread',
+  'round-robin',
+  'failover',
+  'pin_unavailable',
+  'exhausted',
+] as const;
+
+const ROUTING_MODE_SQL = ROUTING_DECISION_MODES.map((mode) => `'${mode}'`).join(', ');
+
 export interface DecisionInput {
   ts?: number;
   session?: string | null;
@@ -88,6 +103,8 @@ export interface DecisionInput {
   mode: string;
   reason: string;
   snapshot_json: string;
+  strategy?: string | null;
+  provider?: string | null;
 }
 
 /** Row shape of `decisions` as stored today (no `outcome` column). */
@@ -103,6 +120,144 @@ export interface DecisionRow {
   mode: string;
   reason: string;
   snapshot_json: string;
+  strategy: string | null;
+  provider: string | null;
+}
+
+export interface DecisionsReader {
+  listRoutingDecisions(limit: number): DecisionRow[];
+  getAccountProvider(accountId: string): string | null;
+  close(): void;
+}
+
+function hasColumn(db: DatabaseSync, table: string, column: string): boolean {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+  return cols.some((c) => c.name === column);
+}
+
+function ensureDecisionColumnsOn(db: DatabaseSync): void {
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    if (!hasColumn(db, 'decisions', 'strategy')) {
+      db.exec('ALTER TABLE decisions ADD COLUMN strategy TEXT');
+      db.exec('ALTER TABLE decisions ADD COLUMN provider TEXT');
+    }
+    db.exec('COMMIT');
+  } catch (err) {
+    try {
+      db.exec('ROLLBACK');
+    } catch {
+      // preserve the original error
+    }
+    throw err;
+  }
+}
+
+const DECISION_SELECT = `id, ts, session, harness, requested_model, effort, served_model,
+                account_id, mode, reason, snapshot_json, strategy, provider`;
+
+/** Thrown by openDecisionsReader when a read-only open cannot create WAL sidecars. */
+export const WAL_SIDECAR_UNREADABLE = 'WAL_SIDECAR_UNREADABLE';
+
+export function isWalSidecarUnreadableError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  const extra =
+    err && typeof err === 'object'
+      ? `${'code' in err ? String((err as { code: unknown }).code) : ''} ${
+          'errstr' in err ? String((err as { errstr: unknown }).errstr) : ''
+        } ${'errcode' in err ? String((err as { errcode: unknown }).errcode) : ''}`
+      : '';
+  const combined = `${msg} ${extra}`.toLowerCase();
+  const errcode =
+    err && typeof err === 'object' && 'errcode' in err
+      ? Number((err as { errcode: unknown }).errcode)
+      : NaN;
+  // SQLITE_PERM=3, SQLITE_READONLY=8, SQLITE_CANTOPEN=14, SQLITE_IOERR=10
+  if (errcode === 3 || errcode === 8 || errcode === 14 || errcode === 10) return true;
+  return (
+    combined.includes('attempt to write a readonly database') ||
+    combined.includes('readonly database') ||
+    combined.includes('unable to open database file') ||
+    combined.includes('cantopen') ||
+    combined.includes('disk i/o error') ||
+    combined.includes('permission denied')
+  );
+}
+
+export function walSidecarUnreadableMessage(dir: string): string {
+  return `qlb audit: store is not readable without write access to ${dir} (WAL sidecar); run from a writable location or vacuum the store`;
+}
+
+function throwIfWalSidecar(err: unknown): never {
+  if (isWalSidecarUnreadableError(err) || (err instanceof Error && err.message === WAL_SIDECAR_UNREADABLE)) {
+    throw new Error(WAL_SIDECAR_UNREADABLE);
+  }
+  throw err;
+}
+
+export function openDecisionsReader(path: string): DecisionsReader | null {
+  if (!existsSync(path)) return null;
+  let db: DatabaseSync;
+  try {
+    db = new DatabaseSync(path, { readOnly: true });
+  } catch (err) {
+    throwIfWalSidecar(err);
+  }
+  try {
+    db.exec('PRAGMA busy_timeout = 5000');
+    const version = readUserVersion(db);
+    if (version > 4) {
+      throw new Error(
+        `qlb.db schema user_version=${version} is newer than this binary (4); upgrade qlb`,
+      );
+    }
+    const strategySelect = hasColumn(db, 'decisions', 'strategy')
+      ? 'strategy, provider'
+      : 'NULL AS strategy, NULL AS provider';
+    const listStmt = db.prepare(`
+      SELECT id, ts, session, harness, requested_model, effort, served_model,
+             account_id, mode, reason, snapshot_json, ${strategySelect}
+      FROM decisions
+      WHERE mode IN (${ROUTING_MODE_SQL})
+      ORDER BY ts DESC, id DESC
+      LIMIT ?
+    `);
+    let accountStmt: ReturnType<DatabaseSync['prepare']> | null = null;
+    try {
+      accountStmt = db.prepare('SELECT provider FROM accounts WHERE id = ?');
+    } catch {
+      accountStmt = null;
+    }
+    return {
+      listRoutingDecisions(limit: number): DecisionRow[] {
+        const n = Number.isFinite(limit) ? Math.max(0, Math.trunc(limit)) : 0;
+        try {
+          return listStmt.all(n) as unknown as DecisionRow[];
+        } catch (err) {
+          throwIfWalSidecar(err);
+        }
+      },
+      getAccountProvider(accountId: string): string | null {
+        if (!accountStmt) return null;
+        try {
+          const row = accountStmt.get(accountId) as { provider: string } | undefined;
+          return row?.provider ?? null;
+        } catch {
+          return null;
+        }
+      },
+      close(): void {
+        db.close();
+      },
+    };
+  } catch (err) {
+    try {
+      db.close();
+    } catch {
+      // preserve the original error
+    }
+    throwIfWalSidecar(err);
+  }
 }
 
 function ensurePrivateDir(dir: string): void {
@@ -189,11 +344,14 @@ export class Store {
     }
 
     this.db = new DatabaseSync(dbPath);
-    if (dbPath !== ':memory:') {
-      this.db.exec('PRAGMA journal_mode = WAL');
-    }
-    this.db.exec('PRAGMA busy_timeout = 5000');
-    this.db.exec('PRAGMA synchronous = NORMAL');
+    try {
+      // Install the busy handler before the first lock-taking SQL operation
+      // after open. Keep this before WAL/schema initialization.
+      this.db.exec('PRAGMA busy_timeout = 5000');
+      if (dbPath !== ':memory:') {
+        this.db.exec('PRAGMA journal_mode = WAL');
+      }
+      this.db.exec('PRAGMA synchronous = NORMAL');
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS accounts (
         id TEXT PRIMARY KEY,
@@ -226,7 +384,9 @@ export class Store {
         account_id TEXT,
         mode TEXT,
         reason TEXT,
-        snapshot_json TEXT
+        snapshot_json TEXT,
+        strategy TEXT,
+        provider TEXT
       );
       CREATE TABLE IF NOT EXISTS overrides (
         kind TEXT,
@@ -279,8 +439,8 @@ export class Store {
     this.insertDecisionStmt = this.db.prepare(`
       INSERT INTO decisions (
         ts, session, harness, requested_model, effort, served_model,
-        account_id, mode, reason, snapshot_json
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        account_id, mode, reason, snapshot_json, strategy, provider
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     this.getOverrideStmt = this.db.prepare(`
       SELECT kind, account_id, session, until FROM overrides
@@ -400,6 +560,14 @@ export class Store {
       'DELETE FROM poll_claims WHERE account_id = ?',
     );
     this.deleteLeaseByNameStmt = this.db.prepare('DELETE FROM leases WHERE name = ?');
+    } catch (err) {
+      try {
+        this.db.close();
+      } catch {
+        // Best-effort cleanup; preserve the original initialization error.
+      }
+      throw err;
+    }
   }
 
   /**
@@ -464,6 +632,7 @@ export class Store {
       `);
       this.db.exec('PRAGMA user_version = 4');
     }
+    ensureDecisionColumnsOn(this.db);
   }
 
   close(): void {
@@ -549,6 +718,8 @@ export class Store {
       input.mode,
       input.reason,
       input.snapshot_json,
+      input.strategy ?? null,
+      input.provider ?? null,
     );
     return Number(result.lastInsertRowid);
   }
@@ -564,8 +735,7 @@ export class Store {
     const since = opts.sinceTs ?? 0;
     const rows = this.db
       .prepare(
-        `SELECT id, ts, session, harness, requested_model, effort, served_model,
-                account_id, mode, reason, snapshot_json
+        `SELECT ${DECISION_SELECT}
          FROM decisions
          WHERE ts >= ?
          ORDER BY ts ASC`,
@@ -574,6 +744,32 @@ export class Store {
     if (!opts.harnesses || opts.harnesses.length === 0) return rows;
     const allowed = new Set(opts.harnesses);
     return rows.filter((r) => r.harness != null && allowed.has(r.harness));
+  }
+
+  /** Newest-first audit read. Tie-break on id DESC. Does not change listDecisions. */
+  listRecentDecisions(limit: number): DecisionRow[] {
+    const n = Number.isFinite(limit) ? Math.max(0, Math.trunc(limit)) : 0;
+    return this.db
+      .prepare(
+        `SELECT ${DECISION_SELECT}
+         FROM decisions
+         ORDER BY ts DESC, id DESC
+         LIMIT ?`,
+      )
+      .all(n) as unknown as DecisionRow[];
+  }
+
+  listRoutingDecisions(limit: number): DecisionRow[] {
+    const n = Number.isFinite(limit) ? Math.max(0, Math.trunc(limit)) : 0;
+    return this.db
+      .prepare(
+        `SELECT ${DECISION_SELECT}
+         FROM decisions
+         WHERE mode IN (${ROUTING_MODE_SQL})
+         ORDER BY ts DESC, id DESC
+         LIMIT ?`,
+      )
+      .all(n) as unknown as DecisionRow[];
   }
 
   getOverride(accountId: string): OverrideRow | null {
@@ -777,10 +973,10 @@ export class Store {
   }
 
   /**
-   * Atomically: read the account, inspect every migrations journal row, and
-   * cascade-delete only if the account is unowned and not in-flight.
-   * One BEGIN IMMEDIATE covers the check and the delete (closes the TOCTOU
-   * between a prior `listMigrations()` and `deleteAccountCascade()`).
+   * Atomically: read the account, recovery marker, decode every journal row,
+   * check provider consistency, and cascade-delete only if the account is
+   * unprotected. One BEGIN IMMEDIATE covers check+delete. No filesystem,
+   * Keychain, or network I/O inside this transaction.
    */
   pruneAccountIfUnowned(accountId: string):
     | {
@@ -797,9 +993,16 @@ export class Store {
     return this.runImmediate(() => {
       const account = this.getAccount(accountId);
       if (!account) {
-        return { deleted: false as const, reason: `no account found with id '${accountId}'` };
+        return { deleted: false as const, reason: 'no_such_account' };
       }
-      const safety = inspectAccountSafety(this.listMigrations(), accountId);
+      if (this.getConfig('migrations.recovery_pending') !== null) {
+        return { deleted: false as const, reason: 'recovery_pending' };
+      }
+      const safety = inspectAccountSafety(this.listMigrations(), accountId, (id) => {
+        const row = this.getAccount(id);
+        if (!row) return { present: false as const };
+        return { present: true as const, provider: row.provider ?? null };
+      });
       if (safety.unsafe) {
         return { deleted: false as const, reason: safetyRefusalMessage(accountId, safety) };
       }
