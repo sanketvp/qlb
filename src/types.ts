@@ -21,6 +21,7 @@ export interface AccountSnapshot {
   label: string;
   buckets: Record<string, BucketReading>;
   error?: string;
+  failed?: boolean;
   probe?: { outcome: FetchOutcome; detail?: string };
 }
 

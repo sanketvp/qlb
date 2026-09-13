@@ -1609,28 +1609,40 @@ async function main(): Promise<void> {
         const report = await runRefresh(adapters, { allowProbe: true });
         for (const result of report.results) {
           const adapter = adapters.find((a) => a.id === result.provider);
-          if (result.snapshots.length === 0) {
-            recordObservation(
-              store,
-              {
-                provider: result.provider,
-                persistsSnapshots: adapter?.persistsSnapshots,
-              },
-              [],
-              'refresh',
-              { outcome: 'failed', error: result.error ?? 'no snapshots returned' },
-            );
+          const input = {
+            provider: result.provider,
+            persistsSnapshots: adapter?.persistsSnapshots,
+          };
+          const allFailed =
+            result.status === 'error' ||
+            (result.accountsFailed > 0 && result.accountsOk === 0);
+          if (allFailed) {
+            recordObservation(store, input, [], 'refresh', {
+              outcome: 'failed',
+              error:
+                result.error ??
+                (result.errors.length > 0
+                  ? result.errors.map((e) => e.error).join('; ')
+                  : 'probe failed'),
+            });
             continue;
           }
-          recordObservation(
-            store,
-            {
-              provider: result.provider,
-              persistsSnapshots: adapter?.persistsSnapshots,
-            },
-            result.snapshots,
-            'refresh',
-          );
+          const snaps = result.snapshots.map((snapshot) => {
+            const listed = result.errors.find((e) => e.accountId === snapshot.accountId);
+            const caf = snapshot.probe?.outcome === 'cached-after-failure';
+            if (!snapshot.error && !caf && !listed) return snapshot;
+            return {
+              ...snapshot,
+              failed: true,
+              error:
+                snapshot.error ??
+                listed?.error ??
+                (caf
+                  ? `probe failed: ${snapshot.probe?.detail ?? 'unknown error'}; cached reading retained`
+                  : 'probe failed'),
+            };
+          });
+          recordObservation(store, input, snaps, 'refresh');
         }
         console.log(opts.json ? JSON.stringify(report, null, 2) : formatRefresh(report));
         process.exit(0);

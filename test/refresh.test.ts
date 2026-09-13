@@ -5,10 +5,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
+import { collectCandidates } from '../src/candidates';
 import { loadPlugins } from '../src/plugins';
 import { formatRefresh, refreshCommand, runRefresh } from '../src/refresh';
 import { openStore } from '../src/store';
 import type { AccountSnapshot, Adapter } from '../src/types';
+import { explainWhy } from '../src/why';
 
 function bucketSnapshot(provider: string, accountId = `${provider}-acct`) {
   return {
@@ -578,5 +580,115 @@ describe('qlb refresh observation recording', () => {
     assert.ok(failed.length > 0);
     assert.match(failed[0]?.detail ?? '', /last observation FAILED at .+ \(gen \d+\):/);
     assert.match(why.stdout, /last observation FAILED at/);
+  });
+
+  it('cached-after-failure refresh is recalled as failed and why cannot select it', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-refresh-caf-'));
+    const pluginsDir = join(root, 'plugins');
+    mkdirSync(pluginsDir);
+    writeFileSync(
+      join(pluginsDir, 'caf-anthropic.js'),
+      `
+        module.exports = {
+          id: 'anthropic',
+          displayName: 'CAF Anthropic',
+          async fetchSnapshots() {
+            return [{
+              accountId: 'acct-caf',
+              provider: 'anthropic',
+              label: 'acct-caf',
+              buckets: {
+                '5h': { usedPct: 10, source: 'poll', confidence: 'authoritative', fetchedAt: 1 },
+                '7d': { usedPct: 10, source: 'poll', confidence: 'authoritative', fetchedAt: 1 },
+              },
+              probe: { outcome: 'cached-after-failure', detail: 'HTTP 503' },
+            }];
+          }
+        };
+      `,
+    );
+    const dbPath = join(root, 'qlb.db');
+    const env = isolatedEnv(root, dbPath, pluginsDir);
+    const result = runCli(['refresh', '--allow-probe', '--json'], env);
+    assert.equal(result.status, 0, result.stderr);
+
+    const store = openStore(dbPath);
+    try {
+      const recalled = await collectCandidates({
+        adapters: [{ id: 'anthropic', displayName: 'A', fetchSnapshots: async () => [] }],
+        store,
+        models: ['claude-sonnet-5'],
+        probe: false,
+      });
+      assert.ok(recalled.observations.some((o) => o.status === 'failed'));
+      assert.equal(recalled.snapshots.length, 0);
+      const why = explainWhy({
+        model: 'claude-sonnet-5',
+        snapshots: recalled.snapshots,
+        observations: recalled.observations,
+        store,
+      });
+      assert.notEqual(why.accountId, 'acct-caf');
+    } finally {
+      store.close();
+    }
+  });
+
+  it('partial refresh keeps the healthy account selectable and labels the failed one', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-refresh-partial-'));
+    const pluginsDir = join(root, 'plugins');
+    mkdirSync(pluginsDir);
+    writeFileSync(
+      join(pluginsDir, 'partial-anthropic.js'),
+      `
+        module.exports = {
+          id: 'anthropic',
+          displayName: 'Partial Anthropic',
+          async fetchSnapshots() {
+            const buckets = {
+              '5h': { usedPct: 10, source: 'poll', confidence: 'authoritative', fetchedAt: 1 },
+              '7d': { usedPct: 10, source: 'poll', confidence: 'authoritative', fetchedAt: 1 },
+            };
+            return [
+              { accountId: 'healthy', provider: 'anthropic', label: 'healthy', buckets },
+              {
+                accountId: 'sick',
+                provider: 'anthropic',
+                label: 'sick',
+                buckets,
+                probe: { outcome: 'cached-after-failure', detail: 'HTTP 503' },
+              },
+            ];
+          }
+        };
+      `,
+    );
+    const dbPath = join(root, 'qlb.db');
+    const env = isolatedEnv(root, dbPath, pluginsDir);
+    const result = runCli(['refresh', '--allow-probe', '--json'], env);
+    assert.equal(result.status, 0, result.stderr);
+
+    const store = openStore(dbPath);
+    try {
+      const recalled = await collectCandidates({
+        adapters: [{ id: 'anthropic', displayName: 'A', fetchSnapshots: async () => [] }],
+        store,
+        models: ['claude-sonnet-5'],
+        probe: false,
+      });
+      const why = explainWhy({
+        model: 'claude-sonnet-5',
+        snapshots: recalled.snapshots,
+        observations: recalled.observations,
+        store,
+      });
+      assert.equal(why.accountId, 'healthy');
+      const sick = why.losers.find((l) => l.accountId === 'sick');
+      assert.ok(sick);
+      assert.equal(sick!.reason, 'unavailable');
+      assert.match(sick!.detail, /HTTP 503|probe failed|failed/);
+    } finally {
+      store.close();
+    }
   });
 });

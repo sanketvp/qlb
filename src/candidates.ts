@@ -72,8 +72,20 @@ function normalizeAccount(snapshot: AccountSnapshot): AccountSnapshot {
     label: snapshot.label,
     buckets: snapshot.buckets ?? {},
   };
-  if (typeof snapshot.error === 'string' && snapshot.error.length > 0) {
-    out.error = snapshot.error;
+  const failed =
+    snapshot.failed === true ||
+    (typeof snapshot.error === 'string' && snapshot.error.length > 0) ||
+    snapshot.probe?.outcome === 'cached-after-failure';
+  if (failed) {
+    out.failed = true;
+    if (typeof snapshot.error === 'string' && snapshot.error.length > 0) {
+      out.error = snapshot.error;
+    } else if (snapshot.probe?.outcome === 'cached-after-failure') {
+      const detail = snapshot.probe.detail ?? 'unknown error';
+      out.error = `probe failed: ${detail}; cached reading retained`;
+    } else {
+      out.error = 'failed';
+    }
   }
   return out;
 }
@@ -149,6 +161,13 @@ function parseAccount(value: unknown, expectedProvider: string): AccountSnapshot
   if (a.error !== undefined) {
     if (typeof a.error !== 'string' || a.error.length === 0) return null;
     snap.error = a.error;
+  }
+  if (a.failed !== undefined) {
+    if (typeof a.failed !== 'boolean') return null;
+    if (a.failed) {
+      snap.failed = true;
+      if (!snap.error) snap.error = 'failed';
+    }
   }
   return snap;
 }

@@ -266,10 +266,10 @@ function formatObserved(observations: ObservationSummary[]): string[] {
   for (const obs of observations) {
     if (obs.status === 'failed') {
       lines.push(`  ${obs.provider}  ${failedObservationLine(obs)}`);
-    } else if (obs.status === 'store-fallback' || !obs.at) {
-      lines.push(`  ${obs.provider}  never probed — store snapshots only`);
     } else if (obs.status === 'unavailable') {
       lines.push(`  ${obs.provider}  ${unavailableObservationLine(obs)}`);
+    } else if (obs.status === 'store-fallback' || !obs.at) {
+      lines.push(`  ${obs.provider}  never probed — store snapshots only`);
     } else {
       const gen = obs.generation != null ? ` gen ${obs.generation}` : '';
       lines.push(`  ${obs.provider}  ${obs.at} via ${obs.source ?? '?'}${gen}`);

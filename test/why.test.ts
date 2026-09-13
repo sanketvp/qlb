@@ -507,4 +507,25 @@ describe('formatWhyHuman unavailable observations', () => {
     assert.match(text, /xai  2026-03-01T13:00:00\.000Z via refresh gen 9 \(unavailable\)/);
     assert.match(text, /run qlb refresh --allow-probe to update/);
   });
+
+  it('multi-provider malformed unavailable is not printed as never-probed', () => {
+    const text = report([
+      {
+        provider: 'anthropic',
+        at: '2026-03-01T12:00:00.000Z',
+        source: 'resolve',
+        generation: 1,
+        status: 'ok',
+      },
+      {
+        provider: 'xai',
+        at: null,
+        source: null,
+        generation: null,
+        status: 'unavailable',
+      },
+    ]);
+    assert.match(text, /xai  \? via \? gen \? \(unavailable\)/);
+    assert.doesNotMatch(text, /xai  never probed — store snapshots only/);
+  });
 });
