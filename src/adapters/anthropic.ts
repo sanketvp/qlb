@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { config } from '../config';
 import { fetchAndCache } from '../single-flight';
 import { getStore } from '../store';
-import type { AccountSnapshot, Adapter, BucketReading } from '../types';
+import type { AccountSnapshot, Adapter, BucketReading, FetchOutcome } from '../types';
 
 const POOL_FILE_PATH = config.anthropicPoolPath;
 const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
@@ -261,6 +261,8 @@ async function fetchOne(account: PoolAccount, index: number): Promise<AccountSna
   try {
     getStore().upsertAccount(accountId, 'anthropic', label);
     let lastError = AUTH_EXPIRED;
+    let probeOutcome: FetchOutcome | undefined;
+    let probeDetail: string | undefined;
     const buckets = await fetchAndCache(accountId, async () => {
       try {
         return await fetchUsageBuckets(account);
@@ -268,9 +270,20 @@ async function fetchOne(account: PoolAccount, index: number): Promise<AccountSna
         lastError = shortReason(err);
         throw err;
       }
+    }, {
+      onOutcome(outcome, detail) {
+        probeOutcome = outcome;
+        probeDetail = detail;
+      },
     });
+    const probe = probeOutcome
+      ? {
+          outcome: probeOutcome,
+          detail: probeOutcome === 'cached-after-failure' ? (lastError ?? probeDetail) : probeDetail,
+        }
+      : undefined;
     if (buckets && Object.keys(buckets).length > 0) {
-      return { accountId, provider: 'anthropic', label, buckets };
+      return { accountId, provider: 'anthropic', label, buckets, ...(probe ? { probe } : {}) };
     }
     return errorSnapshot(account, index, lastError);
   } catch (err) {

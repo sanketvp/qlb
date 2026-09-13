@@ -17,8 +17,16 @@ function isAdapter(value: unknown): value is Adapter {
   );
 }
 
+function warnIfInvalidProbes(value: unknown, fileName: string, warn: PluginWarning): void {
+  if (!value || typeof value !== 'object') return;
+  if (!('probes' in value)) return;
+  const probes = (value as { probes?: unknown }).probes;
+  if (probes === undefined || typeof probes === 'boolean') return;
+  warn(`plugin ${fileName}: probes must be boolean; ignoring`);
+}
+
 function safePluginAdapter(adapter: Adapter, fileName: string, warn: PluginWarning): Adapter {
-  return {
+  const wrapped: Adapter = {
     id: adapter.id,
     displayName: adapter.displayName,
     async fetchSnapshots(): Promise<AccountSnapshot[]> {
@@ -41,6 +49,11 @@ function safePluginAdapter(adapter: Adapter, fileName: string, warn: PluginWarni
       }
     },
   };
+  if (typeof adapter.probes === 'boolean') wrapped.probes = adapter.probes;
+  if (typeof adapter.persistsSnapshots === 'boolean') {
+    wrapped.persistsSnapshots = adapter.persistsSnapshots;
+  }
+  return wrapped;
 }
 
 /** Load CommonJS-compatible .js adapters from the configured plugin directory. */
@@ -73,6 +86,7 @@ export function loadPlugins(
       if (!isAdapter(exported)) {
         throw new Error('default export must provide id, displayName, and fetchSnapshots()');
       }
+      warnIfInvalidProbes(exported, file, warn);
       plugins.push(safePluginAdapter(exported, file, warn));
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);

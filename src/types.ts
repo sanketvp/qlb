@@ -13,12 +13,15 @@ export interface BucketReading {
   detail?: string;             // free-text note, e.g. "advisory: token-bucket, not proven to match in-app meter"
 }
 
+export type FetchOutcome = 'fetched' | 'coalesced' | 'cached-after-failure';
+
 export interface AccountSnapshot {
   accountId: string;
   provider: string;
   label: string;
   buckets: Record<string, BucketReading>;
   error?: string;
+  probe?: { outcome: FetchOutcome; detail?: string };
 }
 
 export interface Adapter {
@@ -26,6 +29,10 @@ export interface Adapter {
   displayName: string;
   /** Read-only: fetch current usage for all accounts this adapter knows about. Must NEVER throw — catch internally and return an AccountSnapshot with `error` set instead. Must NEVER write/mutate any credential or config file (Phase 0 is read-only). */
   fetchSnapshots(): Promise<AccountSnapshot[]>;
+  /** Absent = true. When false, refresh classifies the adapter as no-probe. */
+  probes?: boolean;
+  /** Absent = true. When false, `qlb why` cannot reproduce a pick from this adapter. */
+  persistsSnapshots?: boolean;
 }
 
 /**

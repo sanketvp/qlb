@@ -1,5 +1,7 @@
 import { randomUUID } from 'node:crypto';
-import type { BucketReading } from './types';
+import type { BucketReading, FetchOutcome } from './types';
+
+export type { FetchOutcome };
 import {
   getStore,
   isFresh,
@@ -45,6 +47,19 @@ function nonempty(
 export interface SingleFlightOpts {
   store?: Store;
   pollClaimTtlMs?: number;
+  onOutcome?: (o: FetchOutcome, detail?: string) => void;
+}
+
+function emitOutcome(
+  opts: SingleFlightOpts,
+  outcome: FetchOutcome,
+  detail?: string,
+): void {
+  try {
+    opts.onOutcome?.(outcome, detail);
+  } catch {
+    // Never let a callback fail the fetch path.
+  }
 }
 
 /**
@@ -75,6 +90,7 @@ export async function singleFlightFetch(
     const outcome = store.claimPollOrFresh(accountId, me, ttl, seenFetchedAt);
 
     if (outcome === 'fresh') {
+      emitOutcome(opts, 'coalesced');
       return nonempty(store.getAllSnapshots(accountId));
     }
 
@@ -85,9 +101,12 @@ export async function singleFlightFetch(
         const readings = await withTimeout(doFetch(), timeout);
         store.completePoll(accountId, me, claimedAt, readings);
         const cached = store.getAllSnapshots(accountId);
+        emitOutcome(opts, 'fetched');
         return nonempty(cached) ?? nonempty(readings);
-      } catch {
+      } catch (err) {
         store.releasePollClaim(accountId, me, claimedAt);
+        const detail = err instanceof Error ? err.message : String(err);
+        emitOutcome(opts, 'cached-after-failure', detail);
         return nonempty(store.getAllSnapshots(accountId));
       }
     }
@@ -99,6 +118,7 @@ export async function singleFlightFetch(
       await sleep(50);
       const cached = store.getAllSnapshots(accountId);
       if (isFresh(newestFetchedAt(cached), seenFetchedAt)) {
+        emitOutcome(opts, 'coalesced');
         return nonempty(cached);
       }
       const row = store.getPollClaim(accountId);
@@ -107,11 +127,13 @@ export async function singleFlightFetch(
 
     const cached = store.getAllSnapshots(accountId);
     if (isFresh(newestFetchedAt(cached), seenFetchedAt)) {
+      emitOutcome(opts, 'coalesced');
       return nonempty(cached);
     }
     // claim gone/expired without fresh data → second pass through P2
   }
 
+  emitOutcome(opts, 'cached-after-failure', 'poll wait timed out');
   return nonempty(store.getAllSnapshots(accountId));
 }
 
