@@ -230,29 +230,46 @@ export function explainWhy(req: WhyRequest): WhyReport {
   };
 }
 
+function failedObservationLine(obs: ObservationSummary): string {
+  const ts = obs.at ?? '?';
+  const gen = obs.generation ?? '?';
+  const error = obs.error ?? 'unknown error';
+  return `last observation FAILED at ${ts} (gen ${gen}): ${error}`;
+}
+
+function unavailableObservationLine(obs: ObservationSummary): string {
+  const ts = obs.at ?? '?';
+  const source = obs.source ?? '?';
+  const gen = obs.generation ?? '?';
+  return `${ts} via ${source} gen ${gen} (unavailable)`;
+}
+
 function formatObserved(observations: ObservationSummary[]): string[] {
   if (observations.length === 0) {
     return ['observed:  never probed — store snapshots only'];
   }
   if (observations.length === 1) {
     const obs = observations[0];
-    if (obs.status === 'store-fallback' || !obs.at) {
+    if (obs.status === 'store-fallback' || (!obs.at && obs.status !== 'failed' && obs.status !== 'unavailable')) {
       return ['observed:  never probed — store snapshots only'];
     }
+    if (obs.status === 'failed') {
+      return [`observed:  ${failedObservationLine(obs)}`];
+    }
     if (obs.status === 'unavailable') {
-      return [
-        `observed:  ${obs.at}${obs.source ? ` via ${obs.source}` : ''} (unavailable)`,
-      ];
+      return [`observed:  ${unavailableObservationLine(obs)}`];
     }
     const gen = obs.generation != null ? ` gen ${obs.generation}` : '';
     return [`observed:  ${obs.at} via ${obs.source ?? '?'}${gen}`];
   }
   const lines = ['observed:'];
   for (const obs of observations) {
-    if (obs.status === 'store-fallback' || !obs.at) {
+    if (obs.status === 'failed') {
+      lines.push(`  ${obs.provider}  ${failedObservationLine(obs)}`);
+    } else if (obs.status === 'store-fallback' || !obs.at) {
       lines.push(`  ${obs.provider}  never probed — store snapshots only`);
     } else if (obs.status === 'unavailable') {
-      lines.push(`  ${obs.provider}  observation: unavailable`);
+      lines.push(`  ${obs.provider}  ${unavailableObservationLine(obs)}`);
     } else {
       const gen = obs.generation != null ? ` gen ${obs.generation}` : '';
       lines.push(`  ${obs.provider}  ${obs.at} via ${obs.source ?? '?'}${gen}`);

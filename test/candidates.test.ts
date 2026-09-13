@@ -281,6 +281,54 @@ describe('collectCandidates', () => {
       probe: false,
     });
     assert.equal(result.observations[0]?.status, 'unavailable');
+    assert.equal(result.snapshots.length, 0);
+    store.close();
+  });
+
+  it('string usedPct observation is unavailable and scores nothing', async () => {
+    const store = openStore(':memory:');
+    store.setConfig(
+      'observed:anthropic',
+      JSON.stringify({
+        at: '2026-01-01T00:00:00.000Z',
+        source: 'resolve',
+        generation: 1,
+        persisted: true,
+        outcome: 'ok',
+        accounts: [
+          {
+            accountId: 'A',
+            provider: 'anthropic',
+            label: 'A',
+            buckets: {
+              '5h': {
+                usedPct: '12',
+                source: 'poll',
+                confidence: 'authoritative',
+                fetchedAt: 1,
+              },
+            },
+          },
+        ],
+      }),
+    );
+    const adapters = [adapter('anthropic', () => [])];
+    const result = await collectCandidates({
+      adapters,
+      store,
+      models: ['claude-sonnet-5'],
+      probe: false,
+    });
+    assert.equal(result.observations[0]?.status, 'unavailable');
+    assert.equal(result.snapshots.length, 0);
+    const decision = resolveFromSnapshots({
+      model: 'claude-sonnet-5',
+      snapshots: result.snapshots,
+      persist: false,
+    });
+    assert.equal(decision.ok, false);
+    if (decision.ok) return;
+    assert.equal(decision.error, 'EXHAUSTED');
     store.close();
   });
 });

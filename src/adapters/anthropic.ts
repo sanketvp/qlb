@@ -260,7 +260,7 @@ async function fetchOne(account: PoolAccount, index: number): Promise<AccountSna
   const label = accountLabelOf(account, index);
   try {
     getStore().upsertAccount(accountId, 'anthropic', label);
-    let lastError = AUTH_EXPIRED;
+    let lastError: string | undefined;
     let probeOutcome: FetchOutcome | undefined;
     let probeDetail: string | undefined;
     const buckets = await fetchAndCache(accountId, async () => {
@@ -285,7 +285,10 @@ async function fetchOne(account: PoolAccount, index: number): Promise<AccountSna
     if (buckets && Object.keys(buckets).length > 0) {
       return { accountId, provider: 'anthropic', label, buckets, ...(probe ? { probe } : {}) };
     }
-    return errorSnapshot(account, index, lastError);
+    return {
+      ...errorSnapshot(account, index, lastError ?? probeDetail ?? AUTH_EXPIRED),
+      ...(probe ? { probe } : {}),
+    };
   } catch (err) {
     return errorSnapshot(account, index, shortReason(err));
   }

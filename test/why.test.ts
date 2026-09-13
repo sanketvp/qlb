@@ -9,7 +9,8 @@ import { openStore } from '../src/store';
 import { snapshotsFromStore, resolveFromSnapshots } from '../src/resolve';
 import { failoverConfigKey, roundRobinConfigKey } from '../src/overrides';
 import { DEFAULT_CEILING, scoreAccount } from '../src/scoring';
-import { DEFAULT_WHY_MODEL, explainWhy } from '../src/why';
+import type { ObservationSummary } from '../src/candidates';
+import { DEFAULT_WHY_MODEL, explainWhy, formatWhyHuman } from '../src/why';
 
 function reading(
   usedPct: number,
@@ -452,5 +453,58 @@ describe('qlb why CLI', () => {
     const body = JSON.parse(result.stdout) as { model: string; modelSource: string };
     assert.equal(body.model, DEFAULT_WHY_MODEL);
     assert.equal(body.modelSource, 'default');
+  });
+});
+
+describe('formatWhyHuman unavailable observations', () => {
+  function report(observations: ObservationSummary[]) {
+    return formatWhyHuman({
+      model: 'claude-sonnet-5',
+      modelSource: 'flag',
+      accountId: null,
+      strategy: 'headroom',
+      score: null,
+      error: 'EXHAUSTED',
+      reason: 'EXHAUSTED',
+      losers: [],
+      observations,
+      hint: 'run qlb refresh --allow-probe to update',
+    });
+  }
+
+  it('single-provider unavailable includes timestamp, source, generation, and refresh hint', () => {
+    const text = report([
+      {
+        provider: 'anthropic',
+        at: '2026-03-01T12:00:00.000Z',
+        source: 'resolve',
+        generation: 4,
+        status: 'unavailable',
+      },
+    ]);
+    assert.match(text, /2026-03-01T12:00:00\.000Z via resolve gen 4 \(unavailable\)/);
+    assert.match(text, /run qlb refresh --allow-probe to update/);
+  });
+
+  it('multi-provider unavailable includes timestamp, source, and generation for each', () => {
+    const text = report([
+      {
+        provider: 'anthropic',
+        at: '2026-03-01T12:00:00.000Z',
+        source: 'status',
+        generation: 2,
+        status: 'unavailable',
+      },
+      {
+        provider: 'xai',
+        at: '2026-03-01T13:00:00.000Z',
+        source: 'refresh',
+        generation: 9,
+        status: 'unavailable',
+      },
+    ]);
+    assert.match(text, /anthropic  2026-03-01T12:00:00\.000Z via status gen 2 \(unavailable\)/);
+    assert.match(text, /xai  2026-03-01T13:00:00\.000Z via refresh gen 9 \(unavailable\)/);
+    assert.match(text, /run qlb refresh --allow-probe to update/);
   });
 });

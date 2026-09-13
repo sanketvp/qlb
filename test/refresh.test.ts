@@ -509,16 +509,16 @@ function runCli(
 }
 
 describe('qlb refresh observation recording', () => {
-  it('does not record an observation when the adapter returns no snapshots', () => {
+  it('empty probe records a failed observation so why does not keep the stale winner', () => {
     const root = mkdtempSync(join(tmpdir(), 'qlb-refresh-obs-'));
     const pluginsDir = join(root, 'plugins');
     mkdirSync(pluginsDir);
     writeFileSync(
-      join(pluginsDir, 'thrower.js'),
+      join(pluginsDir, 'empty-anthropic.js'),
       `
         module.exports = {
-          id: 'thrower',
-          displayName: 'Thrower',
+          id: 'anthropic',
+          displayName: 'Empty Anthropic',
           async fetchSnapshots() { return []; }
         };
       `,
@@ -529,10 +529,19 @@ describe('qlb refresh observation recording', () => {
       source: 'resolve',
       generation: 3,
       persisted: true,
-      accounts: [{ accountId: 't', provider: 'thrower', label: 't', buckets: {} }],
+      outcome: 'ok',
+      accounts: [{
+        accountId: 'acct-a',
+        provider: 'anthropic',
+        label: 'acct-a',
+        buckets: {
+          '5h': { usedPct: 10, source: 'poll', confidence: 'authoritative', fetchedAt: 1 },
+          '7d': { usedPct: 10, source: 'poll', confidence: 'authoritative', fetchedAt: 1 },
+        },
+      }],
     });
     const store = openStore(dbPath);
-    store.setConfig('observed:thrower', prior);
+    store.setConfig('observed:anthropic', prior);
     store.close();
 
     const env = isolatedEnv(root, dbPath, pluginsDir);
@@ -540,10 +549,34 @@ describe('qlb refresh observation recording', () => {
     assert.equal(result.status, 0, result.stderr);
 
     const after = openStore(dbPath);
+    let recorded: {
+      generation: number;
+      outcome: string;
+      error?: string;
+      accounts: unknown[];
+    };
     try {
-      assert.equal(after.getConfig('observed:thrower'), prior);
+      const raw = after.getConfig('observed:anthropic');
+      assert.ok(raw);
+      recorded = JSON.parse(raw!) as typeof recorded;
+      assert.ok(recorded.generation > 3, `generation should advance, got ${recorded.generation}`);
+      assert.equal(recorded.outcome, 'failed');
+      assert.ok(typeof recorded.error === 'string' && recorded.error.length > 0);
+      assert.deepEqual(recorded.accounts, []);
     } finally {
       after.close();
     }
+
+    const why = runCli(['why', '--model', 'claude-sonnet-5', '--json'], env);
+    assert.equal(why.status, 0, why.stderr);
+    const body = JSON.parse(why.stdout) as {
+      accountId: string | null;
+      observations: Array<{ status: string; generation: number | null; error?: string; detail?: string }>;
+    };
+    assert.notEqual(body.accountId, 'acct-a');
+    const failed = body.observations.filter((o) => o.status === 'failed');
+    assert.ok(failed.length > 0);
+    assert.match(failed[0]?.detail ?? '', /last observation FAILED at .+ \(gen \d+\):/);
+    assert.match(why.stdout, /last observation FAILED at/);
   });
 });

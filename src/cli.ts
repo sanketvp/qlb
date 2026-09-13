@@ -1608,8 +1608,20 @@ async function main(): Promise<void> {
         const store = getStore();
         const report = await runRefresh(adapters, { allowProbe: true });
         for (const result of report.results) {
-          if (result.snapshots.length === 0) continue;
           const adapter = adapters.find((a) => a.id === result.provider);
+          if (result.snapshots.length === 0) {
+            recordObservation(
+              store,
+              {
+                provider: result.provider,
+                persistsSnapshots: adapter?.persistsSnapshots,
+              },
+              [],
+              'refresh',
+              { outcome: 'failed', error: result.error ?? 'no snapshots returned' },
+            );
+            continue;
+          }
           recordObservation(
             store,
             {

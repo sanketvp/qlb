@@ -193,7 +193,10 @@ export const kimiAdapter: Adapter = {
           },
         ];
       }
-      return [errorSnapshot(lastError ?? 'response missing usage block')];
+      return [{
+        ...errorSnapshot(lastError ?? probeDetail ?? 'response missing usage block'),
+        ...(probe ? { probe } : {}),
+      }];
     } catch (err) {
       return [errorSnapshot(err instanceof Error ? err.message : String(err))];
     }
