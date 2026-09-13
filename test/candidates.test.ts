@@ -331,6 +331,53 @@ describe('collectCandidates', () => {
     assert.equal(decision.error, 'EXHAUSTED');
     store.close();
   });
+
+  async function cafRecall(source: 'resolve' | 'status'): Promise<void> {
+    const store = openStore(':memory:');
+    const A = snap('A', 'anthropic', { '5h': reading(10), '7d': reading(10) }, {
+      probe: { outcome: 'cached-after-failure', detail: 'HTTP 503' },
+    });
+    const B = snap('B', 'anthropic', { '5h': reading(80), '7d': reading(80) });
+    const adapters = [adapter('anthropic', () => [A, B])];
+    const live = await collectCandidates({
+      adapters,
+      store,
+      models: ['claude-sonnet-5'],
+      probe: true,
+      recordAs: source,
+    });
+    const livePick = resolveFromSnapshots({
+      model: 'claude-sonnet-5',
+      snapshots: live.snapshots,
+      persist: false,
+    });
+    assert.equal(livePick.ok, true);
+    if (!livePick.ok) return;
+    assert.equal(livePick.accountId, 'A');
+    const recalled = await collectCandidates({
+      adapters,
+      store,
+      models: ['claude-sonnet-5'],
+      probe: false,
+    });
+    const whyPick = resolveFromSnapshots({
+      model: 'claude-sonnet-5',
+      snapshots: recalled.snapshots,
+      persist: false,
+    });
+    assert.equal(whyPick.ok, true);
+    if (!whyPick.ok) return;
+    assert.equal(whyPick.accountId, livePick.accountId);
+    store.close();
+  }
+
+  it('cached-after-failure recorded via resolve is recalled as the same winner', async () => {
+    await cafRecall('resolve');
+  });
+
+  it('cached-after-failure recorded via status is recalled as the same winner', async () => {
+    await cafRecall('status');
+  });
 });
 
 describe('recordObservation', () => {

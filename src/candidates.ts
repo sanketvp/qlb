@@ -72,20 +72,12 @@ function normalizeAccount(snapshot: AccountSnapshot): AccountSnapshot {
     label: snapshot.label,
     buckets: snapshot.buckets ?? {},
   };
-  const failed =
-    snapshot.failed === true ||
-    (typeof snapshot.error === 'string' && snapshot.error.length > 0) ||
-    snapshot.probe?.outcome === 'cached-after-failure';
-  if (failed) {
+  if (typeof snapshot.error === 'string' && snapshot.error.length > 0) {
+    out.error = snapshot.error;
+  }
+  if (snapshot.failed === true) {
     out.failed = true;
-    if (typeof snapshot.error === 'string' && snapshot.error.length > 0) {
-      out.error = snapshot.error;
-    } else if (snapshot.probe?.outcome === 'cached-after-failure') {
-      const detail = snapshot.probe.detail ?? 'unknown error';
-      out.error = `probe failed: ${detail}; cached reading retained`;
-    } else {
-      out.error = 'failed';
-    }
+    if (!out.error) out.error = 'failed';
   }
   return out;
 }
