@@ -1,3 +1,4 @@
+import type { ObservationSummary } from './candidates';
 import {
   resolveFromSnapshots,
   providerForModel,
@@ -16,8 +17,11 @@ export interface WhyLoser {
   detail: string;
 }
 
+export type WhyModelSource = 'flag' | 'last routing decision' | 'default';
+
 export interface WhyReport {
   model: string;
+  modelSource: WhyModelSource;
   accountId: string | null;
   strategy: Strategy | 'pin';
   score: number | null;
@@ -25,42 +29,37 @@ export interface WhyReport {
   error: 'EXHAUSTED' | 'PINNED_UNAVAILABLE' | null;
   reason: string | null;
   losers: WhyLoser[];
+  observations: ObservationSummary[];
+  hint: string;
 }
 
 export interface WhyRequest {
   model: string;
+  modelSource?: WhyModelSource;
   fallback?: string[];
   session?: string | null;
   strategy?: Strategy;
   snapshots: AccountSnapshot[];
   store?: Store;
+  observations?: ObservationSummary[];
 }
 
-const DEFAULT_WHY_MODEL = 'claude-sonnet-5';
+export const DEFAULT_WHY_MODEL = 'claude-sonnet-5';
 
-/** Pick a model that matches the stored pool when the CLI omits `--model`. */
-export function defaultWhyModel(snapshots: AccountSnapshot[]): string {
-  switch (snapshots[0]?.provider) {
-    case 'openai-codex':
-      return 'gpt-5.4';
-    case 'xai':
-      return 'grok-3';
-    case 'kimi-coding':
-      return 'kimi-k2';
-    case 'openrouter':
-      return 'openrouter/auto';
-    default:
-      return DEFAULT_WHY_MODEL;
-  }
-}
+export const WHY_REFRESH_HINT = 'run qlb refresh --allow-probe to update';
 
-function reservedIds(store: Store | undefined): Set<string> {
+function reservedAndDrainFirst(store: Store | undefined): {
+  reserved: Set<string>;
+  drainFirst: Set<string>;
+} {
   const reserved = new Set<string>();
-  if (!store) return reserved;
+  const drainFirst = new Set<string>();
+  if (!store) return { reserved, drainFirst };
   for (const row of store.listActiveOverrides()) {
     if (row.kind === 'reserve') reserved.add(row.account_id);
+    if (row.kind === 'drain-first') drainFirst.add(row.account_id);
   }
-  return reserved;
+  return { reserved, drainFirst };
 }
 
 function pinnedAccountId(decision: ResolveDecision): string | null {
@@ -76,7 +75,10 @@ function describeLoser(
     winnerScore: number | null;
     ceiling: number;
     reserved: Set<string>;
+    drainFirst: Set<string>;
     pinnedTo: string | null;
+    winnerId: string | null;
+    strategy: Strategy | 'pin';
   },
 ): WhyLoser {
   if (ctx.pinnedTo && snap.accountId !== ctx.pinnedTo) {
@@ -84,6 +86,13 @@ function describeLoser(
       accountId: snap.accountId,
       reason: 'pinned',
       detail: `session pinned to ${ctx.pinnedTo}`,
+    };
+  }
+  if (snap.error === 'observation: unavailable') {
+    return {
+      accountId: snap.accountId,
+      reason: 'unavailable',
+      detail: 'observation: unavailable',
     };
   }
   if (snap.error) {
@@ -115,7 +124,26 @@ function describeLoser(
       detail: 'exhausted',
     };
   }
+  if (ctx.winnerId && ctx.drainFirst.has(ctx.winnerId)) {
+    return {
+      accountId: snap.accountId,
+      reason: 'headroom',
+      detail: `drain-first prefers ${ctx.winnerId}`,
+    };
+  }
   const score = scoreAccount(snap, ctx.model, ctx.ceiling);
+  if (
+    ctx.strategy !== 'headroom' &&
+    ctx.strategy !== 'pin' &&
+    ctx.winnerScore != null &&
+    score >= ctx.winnerScore
+  ) {
+    return {
+      accountId: snap.accountId,
+      reason: 'headroom',
+      detail: `not selected by ${ctx.strategy}`,
+    };
+  }
   if (ctx.winnerScore != null && score < ctx.winnerScore) {
     return {
       accountId: snap.accountId,
@@ -131,13 +159,14 @@ function describeLoser(
 }
 
 /**
- * Explain the account `resolveFromSnapshots` would pick from already-stored
- * snapshots. Read-only: does not persist a decision, advance rotation, or
- * probe the network.
+ * Explain the account `resolveFromSnapshots` would pick from the latest
+ * persisted observation (never probes). Read-only: does not persist a
+ * decision, advance rotation, or touch the network.
  */
 export function explainWhy(req: WhyRequest): WhyReport {
   const strategy: Strategy = req.strategy ?? 'headroom';
   const fallback = req.fallback ?? [];
+  const modelSource: WhyModelSource = req.modelSource ?? 'flag';
 
   const decision: ResolveDecision = resolveFromSnapshots({
     model: req.model,
@@ -149,7 +178,7 @@ export function explainWhy(req: WhyRequest): WhyReport {
     persist: false,
   });
 
-  const reserved = reservedIds(req.store);
+  const { reserved, drainFirst } = reservedAndDrainFirst(req.store);
   const pinnedTo = pinnedAccountId(decision);
   const winnerId = decision.ok
     ? decision.accountId
@@ -179,12 +208,16 @@ export function explainWhy(req: WhyRequest): WhyReport {
         winnerScore,
         ceiling,
         reserved,
+        drainFirst,
         pinnedTo,
+        winnerId,
+        strategy: reportStrategy,
       }),
     );
 
   return {
     model: req.model,
+    modelSource,
     accountId: winnerId,
     strategy: reportStrategy,
     score: winnerScore,
@@ -192,7 +225,40 @@ export function explainWhy(req: WhyRequest): WhyReport {
     error,
     reason,
     losers,
+    observations: req.observations ?? [],
+    hint: WHY_REFRESH_HINT,
   };
+}
+
+function formatObserved(observations: ObservationSummary[]): string[] {
+  if (observations.length === 0) {
+    return ['observed:  never probed — store snapshots only'];
+  }
+  if (observations.length === 1) {
+    const obs = observations[0];
+    if (obs.status === 'store-fallback' || !obs.at) {
+      return ['observed:  never probed — store snapshots only'];
+    }
+    if (obs.status === 'unavailable') {
+      return [
+        `observed:  ${obs.at}${obs.source ? ` via ${obs.source}` : ''} (unavailable)`,
+      ];
+    }
+    const gen = obs.generation != null ? ` gen ${obs.generation}` : '';
+    return [`observed:  ${obs.at} via ${obs.source ?? '?'}${gen}`];
+  }
+  const lines = ['observed:'];
+  for (const obs of observations) {
+    if (obs.status === 'store-fallback' || !obs.at) {
+      lines.push(`  ${obs.provider}  never probed — store snapshots only`);
+    } else if (obs.status === 'unavailable') {
+      lines.push(`  ${obs.provider}  observation: unavailable`);
+    } else {
+      const gen = obs.generation != null ? ` gen ${obs.generation}` : '';
+      lines.push(`  ${obs.provider}  ${obs.at} via ${obs.source ?? '?'}${gen}`);
+    }
+  }
+  return lines;
 }
 
 export function formatWhyHuman(report: WhyReport): string {
@@ -201,8 +267,16 @@ export function formatWhyHuman(report: WhyReport): string {
   lines.push(`account:   ${report.accountId ?? '(none)'}`);
   lines.push(`strategy:  ${report.strategy}`);
   if (report.score != null) lines.push(`score:     ${report.score}`);
-  lines.push(`model:     ${report.model}`);
+  if (report.modelSource === 'last routing decision') {
+    lines.push(`model:     ${report.model} (from last routing decision)`);
+  } else if (report.modelSource === 'default') {
+    lines.push(`model:     ${report.model} (default)`);
+  } else {
+    lines.push(`model:     ${report.model}`);
+  }
   if (report.reason) lines.push(`reason:    ${report.reason}`);
+  lines.push(...formatObserved(report.observations));
+  lines.push(`hint:      ${report.hint}`);
   for (const loser of report.losers) {
     lines.push(`  ${loser.accountId}  ${loser.reason}  ${loser.detail}`);
   }

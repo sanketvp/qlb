@@ -28,7 +28,7 @@ import {
 import { listPolicies, setPolicy } from './policy';
 import { LoopbackProxy } from './proxy';
 import { parseUntil } from './overrides';
-import { resolveFromSnapshots, snapshotsFromStore, providerForModel } from './resolve';
+import { resolveFromSnapshots, providerForModel } from './resolve';
 import { isStrategy, STRATEGIES, type Strategy } from './scoring';
 import {
   checkRetirementEligibility,
@@ -48,11 +48,12 @@ import {
   overrideFromStore,
 } from './dashboard';
 import { isSetupHarness, setupHarness, type SetupHarness } from './setup';
-import { refreshCommand } from './refresh';
-import { DEFAULT_AUDIT_LIMIT, formatAudit, listAuditDecisions } from './audit';
-import { defaultWhyModel, explainWhy, formatWhyHuman } from './why';
-import { getStore, openStore, type Store } from './store';
-import type { AccountSnapshot, Adapter } from './types';
+import { formatRefresh, refreshCommand, runRefresh } from './refresh';
+import { DEFAULT_AUDIT_LIMIT, formatAudit, toAuditDecision } from './audit';
+import { DEFAULT_WHY_MODEL, explainWhy, formatWhyHuman } from './why';
+import { collectCandidates, recordObservation, safeFetch } from './candidates';
+import { getStore, openDecisionsReader, openStore, type Store } from './store';
+import type { AccountSnapshot } from './types';
 
 const USAGE = `Usage:
   qlb init [--json]
@@ -62,7 +63,7 @@ const USAGE = `Usage:
   qlb status [--json] [--dashboard|--flat]
   qlb setup pi|claude-code|codex-cli|generic [--json]
   qlb resolve --model <modelId> [--fallback m1,m2,...] [--session <id>] [--harness pi|claude-code|codex|dispatch] [--effort <lvl>] [--strategy headroom|spread|round-robin|failover] [--json]
-  qlb why [--json]
+  qlb why [--model <modelId>] [--fallback m1,m2,...] [--session <id>] [--strategy headroom|spread|round-robin|failover] [--json]
   qlb override pin --session <id> --account <account-id> [--until <ISO-datetime|2h>] [--db <path>] [--json]
   qlb override reserve --account <account-id> [--until <ISO-datetime|2h>] [--db <path>] [--json]
   qlb override drain-first --account <account-id> [--until <ISO-datetime|2h>] [--db <path>] [--json]
@@ -526,9 +527,8 @@ function parseAuditArgs(argsIn: string[]): AuditOpts {
   const limitIdx = args.indexOf('--limit');
   if (limitIdx !== -1) {
     const raw = args[limitIdx + 1];
-    if (raw == null || !/^[0-9]+$/.test(raw)) {
-      console.error('qlb audit: --limit must be a non-negative integer');
-      console.error(USAGE);
+    if (raw === undefined || !/^[1-9]\d*$/.test(raw) || !Number.isSafeInteger(Number(raw))) {
+      console.error('qlb audit: --limit must be a positive integer');
       process.exit(1);
     }
     args.splice(limitIdx, 2);
@@ -917,23 +917,6 @@ function assertSafeMigratePaths(opts: MigrateOpts): void {
   }
 }
 
-async function safeFetch(adapter: Adapter): Promise<AccountSnapshot[]> {
-  try {
-    return await adapter.fetchSnapshots();
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    return [
-      {
-        accountId: adapter.id,
-        provider: adapter.id,
-        label: adapter.displayName,
-        buckets: {},
-        error: message,
-      },
-    ];
-  }
-}
-
 function pad(value: string, width: number): string {
   return value.length >= width ? value : value + ' '.repeat(width - value.length);
 }
@@ -1048,9 +1031,18 @@ function printDoctor(report: DoctorReport, json: boolean): void {
 }
 
 async function runStatus(opts: StatusOpts): Promise<void> {
-  const nested = await Promise.all(adapters.map((adapter) => safeFetch(adapter)));
-  const accounts = nested.flat();
   const store = getStore();
+  const nested = await Promise.all(adapters.map(async (adapter) => {
+    const snaps = await safeFetch(adapter);
+    recordObservation(
+      store,
+      { provider: adapter.id, persistsSnapshots: adapter.persistsSnapshots },
+      snaps,
+      'status',
+    );
+    return snaps;
+  }));
+  const accounts = nested.flat();
   const enriched = enrichAccounts(accounts, {
     ownershipForProvider: makeOwnershipReader(store),
     overrideForAccount: (id) => overrideFromStore(store, id),
@@ -1064,20 +1056,6 @@ async function runStatus(opts: StatusOpts): Promise<void> {
     return;
   }
   console.log(formatDashboard(enriched));
-}
-
-async function collectSnapshots(models: string[]): Promise<AccountSnapshot[]> {
-  const providers = new Set<Adapter['id']>();
-  for (const m of models) {
-    const p = providerForModel(m);
-    if (p) providers.add(p);
-  }
-  const snaps: AccountSnapshot[] = [];
-  for (const adapter of adapters) {
-    if (!providers.has(adapter.id)) continue;
-    snaps.push(...(await safeFetch(adapter)));
-  }
-  return snaps;
 }
 
 function printResolveHuman(decision: ReturnType<typeof resolveFromSnapshots>): void {
@@ -1172,8 +1150,15 @@ async function runResolve(opts: ResolveOpts): Promise<number> {
     console.error(`qlb resolve: unknown model '${opts.model}' (cannot map to a provider)`);
     return 1;
   }
+  const store = getStore();
   const models = [opts.model, ...opts.fallback];
-  const snapshots = await collectSnapshots(models);
+  const { snapshots } = await collectCandidates({
+    adapters,
+    store,
+    models,
+    probe: true,
+    recordAs: 'resolve',
+  });
   const decision = resolveFromSnapshots({
     model: opts.model,
     fallback: opts.fallback,
@@ -1182,26 +1167,51 @@ async function runResolve(opts: ResolveOpts): Promise<number> {
     effort: opts.effort,
     strategy: opts.strategy,
     snapshots,
-    store: getStore(),
+    store,
   });
   if (opts.json) printResolveJson(decision);
   else printResolveHuman(decision);
   return decision.ok ? 0 : 1;
 }
 
-function runWhy(opts: WhyOpts): number {
+async function runWhy(opts: WhyOpts): Promise<number> {
   const store = getStore();
-  const snapshots = snapshotsFromStore(store);
+  let model: string;
+  let modelSource: 'flag' | 'last routing decision' | 'default';
+  if (opts.model) {
+    if (!providerForModel(opts.model)) {
+      console.error(`qlb why: unknown model '${opts.model}' (cannot map to a provider)`);
+      return 1;
+    }
+    model = opts.model;
+    modelSource = 'flag';
+  } else {
+    const last = store.listRoutingDecisions(1)[0];
+    if (last?.requested_model && providerForModel(last.requested_model)) {
+      model = last.requested_model;
+      modelSource = 'last routing decision';
+    } else {
+      model = DEFAULT_WHY_MODEL;
+      modelSource = 'default';
+    }
+  }
   const strategy: Strategy = opts.strategy
     ?? (isStrategy(config.defaultStrategy) ? config.defaultStrategy : 'headroom');
-  const model = opts.model ?? defaultWhyModel(snapshots);
+  const { snapshots, observations } = await collectCandidates({
+    adapters,
+    store,
+    models: [model, ...opts.fallback],
+    probe: false,
+  });
   const report = explainWhy({
     model,
+    modelSource,
     fallback: opts.fallback,
     session: opts.session,
     strategy,
     snapshots,
     store,
+    observations,
   });
   if (opts.json) console.log(JSON.stringify(report, null, 2));
   else console.log(formatWhyHuman(report));
@@ -1475,11 +1485,35 @@ function printOverride(row: { kind: string; account_id: string; session: string 
 }
 
 async function runAudit(opts: AuditOpts): Promise<number> {
-  return withStore(opts.db, (store) => {
-    const rows = listAuditDecisions(store, opts.limit);
-    console.log(formatAudit(rows, opts.json));
+  const path = opts.db ?? config.dbPath;
+  let reader;
+  try {
+    reader = openDecisionsReader(path);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes('upgrade qlb')) {
+      console.error(msg);
+    } else {
+      console.error(`qlb audit: cannot open store read-only (${msg})`);
+    }
+    return 1;
+  }
+  if (!reader) {
+    console.log(opts.json ? '[]' : 'no decisions');
     return 0;
-  });
+  }
+  try {
+    const rows = reader.listRoutingDecisions(opts.limit);
+    const decisions = rows.map((row) =>
+      toAuditDecision(row, {
+        accountProvider: row.account_id ? reader.getAccountProvider(row.account_id) : null,
+      }),
+    );
+    console.log(formatAudit(decisions, opts.json));
+    return 0;
+  } finally {
+    reader.close();
+  }
 }
 
 async function runOverride(opts: OverrideOpts): Promise<number> {
@@ -1569,7 +1603,31 @@ async function main(): Promise<void> {
     process.exit(report.overall === 'FAIL' ? 1 : 0);
   }
   if (opts.cmd === 'refresh') {
-    process.exit(await refreshCommand(adapters, { allowProbe: opts.allowProbe, json: opts.json }));
+    try {
+      if (opts.allowProbe) {
+        const store = getStore();
+        const report = await runRefresh(adapters, { allowProbe: true });
+        for (const result of report.results) {
+          const adapter = adapters.find((a) => a.id === result.provider);
+          recordObservation(
+            store,
+            {
+              provider: result.provider,
+              persistsSnapshots: adapter?.persistsSnapshots,
+            },
+            result.snapshots,
+            'refresh',
+          );
+        }
+        console.log(opts.json ? JSON.stringify(report, null, 2) : formatRefresh(report));
+        process.exit(0);
+      }
+      process.exit(await refreshCommand(adapters, { allowProbe: false, json: opts.json }));
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`qlb refresh: ${msg}`);
+      process.exit(1);
+    }
   }
   if (opts.cmd === 'setup') {
     const result = setupHarness(opts.harness);
@@ -1687,7 +1745,13 @@ async function main(): Promise<void> {
     }
   }
   if (opts.cmd === 'why') {
-    process.exit(runWhy(opts));
+    try {
+      process.exit(await runWhy(opts));
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`qlb why: ${msg}`);
+      process.exit(1);
+    }
   }
   const code = await runResolve(opts);
   process.exit(code);

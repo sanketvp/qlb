@@ -6,7 +6,9 @@ import {
   type Strategy,
 } from './scoring';
 import { isFullyExhausted, pickAccount } from './strategies';
-import type { Store } from './store';
+import { ROUTING_DECISION_MODES, type Store } from './store';
+
+export { ROUTING_DECISION_MODES };
 
 export interface ResolveRequest {
   model: string;
@@ -153,9 +155,12 @@ function record(store: Store | undefined, req: ResolveRequest, decision: Resolve
       mode: decision.mode,
       reason: decision.reason,
       snapshot_json: snapshotJson(decision),
+      strategy: decision.strategy,
+      provider: decision.provider,
     });
   }
   if (decision.error === 'PINNED_UNAVAILABLE') {
+    const snap = req.snapshots.find((s) => s.accountId === decision.accountId);
     return store.recordDecision({
       session: req.session,
       harness: req.harness,
@@ -166,6 +171,8 @@ function record(store: Store | undefined, req: ResolveRequest, decision: Resolve
       mode: 'pin_unavailable',
       reason: decision.reason,
       snapshot_json: snapshotJson(decision),
+      strategy: 'pin',
+      provider: snap?.provider ?? providerForModel(req.model),
     });
   }
   return store.recordDecision({
@@ -178,6 +185,8 @@ function record(store: Store | undefined, req: ResolveRequest, decision: Resolve
     mode: 'exhausted',
     reason: 'EXHAUSTED',
     snapshot_json: snapshotJson(decision),
+    strategy: req.strategy ?? 'headroom',
+    provider: providerForModel(req.model),
   });
 }
 
