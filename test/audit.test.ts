@@ -476,9 +476,13 @@ describe('audit — read-only contract', () => {
     try {
       const result = runCli(['audit', '--json', '--db', dbPath], env);
       assert.equal(result.status, 1, result.stderr);
-      const lines = result.stderr.trim().split('\n').filter(Boolean);
+      // Node <26 prints an ExperimentalWarning for node:sqlite on stderr; ignore runtime warnings.
+      const lines = result.stderr
+        .trim()
+        .split('\n')
+        .filter((l) => l.trim() && !/^\(node:\d+\) \w*Warning:/.test(l) && !l.startsWith('(Use `node --trace-warnings'));
       assert.equal(lines.length, 1, result.stderr);
-      assert.doesNotMatch(result.stderr, /at /);
+      assert.doesNotMatch(lines.join('\n'), /^\s+at /m);
       assert.match(result.stderr, /WAL sidecar|not readable without write access/);
       assert.match(result.stderr, /qlb audit:/);
     } finally {
