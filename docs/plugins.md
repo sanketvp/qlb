@@ -7,6 +7,8 @@ interface Adapter {
   id: string;
   displayName: string;
   fetchSnapshots(): Promise<AccountSnapshot[]>;
+  probes?: boolean;            // absent = true; false = this provider has no probe (see below)
+  persistsSnapshots?: boolean; // absent = true; false = QLB cannot persist your snapshots (see below)
 }
 
 interface AccountSnapshot {
@@ -59,6 +61,13 @@ Run:
 ```bash
 qlb status --json
 ```
+
+## Optional adapter flags
+
+Both fields are optional in `Adapter` (`src/types.ts`); absent means `true`.
+
+- **`probes?: boolean`** — set to `false` when your adapter has no probe at all (nothing `fetchSnapshots()` can usefully fetch on demand). `qlb refresh --allow-probe` then reports the provider as `no-probe` instead of trying to call it. Codex is the built-in example: it exposes no usage endpoint, so its readings come from proxy header parsing. Without the flag, refresh calls `fetchSnapshots()`; return snapshots without buckets and it reports `no-data` rather than `no-probe`.
+- **`persistsSnapshots?: boolean`** — set to `false` when your plugin cannot persist observations. `qlb why` reproduces a pick from the last persisted per-provider observation; without persisted snapshots it cannot, so the provider is excluded from the parity guarantee and labelled `observation: unavailable`.
 
 The returned `accounts` list will include `provider: "mistral"`. Syntax errors, missing exports, and invalid adapter shapes produce a warning on stderr and are skipped.
 

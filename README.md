@@ -30,7 +30,12 @@ qlb init --json
 qlb doctor
 qlb status --json
 qlb resolve --model claude-sonnet-5 --json
+qlb why                      # explain the pick, no network
+qlb audit                    # recent routing decisions
+qlb refresh --allow-probe    # poll providers now (explicit opt-in)
 ```
+
+See [CLI.md](docs/CLI.md) for all flags.
 
 Or run the idempotent installer (Node.js >= 22, `npm ci`/`npm install`, build, optional global `npm link`, then `qlb init`):
 
@@ -115,6 +120,12 @@ qlb status --json          # additive JSON: existing fields kept; adds ownership
 ```
 
 `--json` does not remove or rename fields, so existing parsers of `qlb status --json` keep working.
+
+### Explaining and auditing decisions
+
+- **`qlb why`** — explains which account the resolver would pick, based on the **last persisted observation** per provider. It never probes the network and never writes a decision row; output includes the observation timestamp/generation (or `never probed — store snapshots only`) and a hint to run `qlb refresh --allow-probe`. Providers whose plugin does not persist snapshots are labelled `observation: unavailable`. ([CLI](docs/CLI.md#qlb-why))
+- **`qlb audit`** — read-only listing of recent routing decisions (default `--limit 20`) with the real strategy/provider used; non-routing proxy rows are filtered. ([CLI](docs/CLI.md#qlb-audit))
+- **`qlb refresh --allow-probe`** — the only way to poll providers, because it makes real requests. Per-provider statuses: `ok`, `partial`, `no-data`, `no-probe` (no probe exists — Codex reads the local auth file), `error`. ([CLI](docs/CLI.md#qlb-refresh))
 
 ## Harness setup (`qlb setup`)
 
