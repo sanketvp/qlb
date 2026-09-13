@@ -1,11 +1,13 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
 import { loadPlugins } from '../src/plugins';
 import { formatRefresh, refreshCommand, runRefresh } from '../src/refresh';
+import { openStore } from '../src/store';
 import type { AccountSnapshot, Adapter } from '../src/types';
 
 function bucketSnapshot(provider: string, accountId = `${provider}-acct`) {
@@ -463,5 +465,85 @@ describe('qlb refresh', () => {
     assert.equal(report.results[0]?.status, 'ok');
     assert.equal(report.results[0]?.ok, true);
     assert.equal(report.results[0]?.snapshots[0]?.probe, undefined);
+  });
+});
+
+const cliPath = join(__dirname, '..', 'src', 'cli.js');
+
+function isolatedEnv(root: string, dbPath: string, pluginsDir: string): NodeJS.ProcessEnv {
+  mkdirSync(join(root, 'migrate'), { recursive: true });
+  return {
+    ...process.env,
+    QLB_PLUGINS_DIR: pluginsDir,
+    QLB_DB_PATH: dbPath,
+    QLB_ANTHROPIC_POOL_PATH: join(root, 'missing-anthropic.json'),
+    QLB_PI_AUTH_JSON_PATH: join(root, 'missing-pi-auth.json'),
+    QLB_CODEX_AUTH_JSON_PATH: join(root, 'missing-codex-auth.json'),
+    QLB_KIMI_CREDENTIALS_FILE: join(root, 'missing-kimi.md'),
+    QLB_OPENROUTER_KEYCHAIN_SERVICE: 'qlb-test-missing-openrouter',
+    QLB_CONFIG_PATH: join(root, 'config.json'),
+    QLB_PROXY_INFO_PATH: join(root, 'proxy.json'),
+    QLB_CLAUDE_CODE_CREDENTIALS_PATH: join(root, 'cc-creds'),
+  };
+}
+
+function runCli(
+  args: string[],
+  env: NodeJS.ProcessEnv,
+): { status: number; stdout: string; stderr: string } {
+  try {
+    const stdout = execFileSync(process.execPath, [cliPath, ...args], {
+      encoding: 'utf8',
+      env,
+      timeout: 60_000,
+    });
+    return { status: 0, stdout, stderr: '' };
+  } catch (err) {
+    const e = err as { status?: number | null; stdout?: string; stderr?: string };
+    return {
+      status: typeof e.status === 'number' ? e.status : 1,
+      stdout: typeof e.stdout === 'string' ? e.stdout : '',
+      stderr: typeof e.stderr === 'string' ? e.stderr : '',
+    };
+  }
+}
+
+describe('qlb refresh observation recording', () => {
+  it('does not record an observation when the adapter returns no snapshots', () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-refresh-obs-'));
+    const pluginsDir = join(root, 'plugins');
+    mkdirSync(pluginsDir);
+    writeFileSync(
+      join(pluginsDir, 'thrower.js'),
+      `
+        module.exports = {
+          id: 'thrower',
+          displayName: 'Thrower',
+          async fetchSnapshots() { return []; }
+        };
+      `,
+    );
+    const dbPath = join(root, 'qlb.db');
+    const prior = JSON.stringify({
+      at: '2026-01-01T00:00:00.000Z',
+      source: 'resolve',
+      generation: 3,
+      persisted: true,
+      accounts: [{ accountId: 't', provider: 'thrower', label: 't', buckets: {} }],
+    });
+    const store = openStore(dbPath);
+    store.setConfig('observed:thrower', prior);
+    store.close();
+
+    const env = isolatedEnv(root, dbPath, pluginsDir);
+    const result = runCli(['refresh', '--allow-probe', '--json'], env);
+    assert.equal(result.status, 0, result.stderr);
+
+    const after = openStore(dbPath);
+    try {
+      assert.equal(after.getConfig('observed:thrower'), prior);
+    } finally {
+      after.close();
+    }
   });
 });

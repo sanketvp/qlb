@@ -157,6 +157,9 @@ export function createOpenRouterAdapter(
               detail: probeOutcome === 'cached-after-failure' ? (lastError ?? probeDetail) : probeDetail,
             }
           : undefined;
+        if (lastError) {
+          return [{ ...errorSnapshot(lastError), ...(probe ? { probe } : {}) }];
+        }
         if (buckets && Object.keys(buckets).length > 0) {
           const credit = buckets.credits;
           const detailedBuckets = credit
