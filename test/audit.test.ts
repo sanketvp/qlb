@@ -18,7 +18,12 @@ import { DatabaseSync } from 'node:sqlite';
 import { after, describe, it } from 'node:test';
 import { DEFAULT_AUDIT_LIMIT, toAuditDecision } from '../src/audit';
 import { snapshotsFromStore, resolveFromSnapshots } from '../src/resolve';
-import { openStore, type Store } from '../src/store';
+import {
+  isWalSidecarUnreadableError,
+  openStore,
+  walSidecarUnreadableMessage,
+  type Store,
+} from '../src/store';
 import type { BucketReading } from '../src/types';
 
 const support = join(__dirname, '..', '..', 'test', 'support');
@@ -430,7 +435,28 @@ describe('audit — read-only contract', () => {
     assert.ok(body.some((d) => d.account === 'wal-row'));
   });
 
-  it('unwritable directory → exit 0 or 1 with single stderr line, no stack, no new entries', () => {
+  it('maps sqlite WAL/readonly errors to the sidecar message', () => {
+    assert.equal(
+      isWalSidecarUnreadableError(new Error('attempt to write a readonly database')),
+      true,
+    );
+    assert.equal(
+      isWalSidecarUnreadableError({
+        message: 'unable to open database file',
+        code: 'ERR_SQLITE_ERROR',
+        errstr: 'unable to open database file',
+        errcode: 14,
+      }),
+      true,
+    );
+    assert.equal(isWalSidecarUnreadableError(new Error('no such table: decisions')), false);
+    assert.match(
+      walSidecarUnreadableMessage('/tmp/qlb-dir'),
+      /write access to \/tmp\/qlb-dir \(WAL sidecar\)/,
+    );
+  });
+
+  it('unwritable directory → exit 1 with single stderr line, no stack, no new entries', () => {
     const dir = tmp();
     const dbPath = join(dir, 'qlb.db');
     const store = openStore(dbPath);
@@ -449,13 +475,12 @@ describe('audit — read-only contract', () => {
     chmodSync(dir, 0o555);
     try {
       const result = runCli(['audit', '--json', '--db', dbPath], env);
-      assert.ok(result.status === 0 || result.status === 1, `status ${result.status}`);
-      if (result.status === 1) {
-        const lines = result.stderr.trim().split('\n').filter(Boolean);
-        assert.equal(lines.length, 1, result.stderr);
-        assert.doesNotMatch(result.stderr, /at /);
-        assert.match(result.stderr, /cannot open store read-only|upgrade qlb/);
-      }
+      assert.equal(result.status, 1, result.stderr);
+      const lines = result.stderr.trim().split('\n').filter(Boolean);
+      assert.equal(lines.length, 1, result.stderr);
+      assert.doesNotMatch(result.stderr, /at /);
+      assert.match(result.stderr, /WAL sidecar|not readable without write access/);
+      assert.match(result.stderr, /qlb audit:/);
     } finally {
       chmodSync(dir, 0o755);
     }

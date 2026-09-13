@@ -156,9 +156,53 @@ function ensureDecisionColumnsOn(db: DatabaseSync): void {
 const DECISION_SELECT = `id, ts, session, harness, requested_model, effort, served_model,
                 account_id, mode, reason, snapshot_json, strategy, provider`;
 
+/** Thrown by openDecisionsReader when a read-only open cannot create WAL sidecars. */
+export const WAL_SIDECAR_UNREADABLE = 'WAL_SIDECAR_UNREADABLE';
+
+export function isWalSidecarUnreadableError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  const extra =
+    err && typeof err === 'object'
+      ? `${'code' in err ? String((err as { code: unknown }).code) : ''} ${
+          'errstr' in err ? String((err as { errstr: unknown }).errstr) : ''
+        } ${'errcode' in err ? String((err as { errcode: unknown }).errcode) : ''}`
+      : '';
+  const combined = `${msg} ${extra}`.toLowerCase();
+  const errcode =
+    err && typeof err === 'object' && 'errcode' in err
+      ? Number((err as { errcode: unknown }).errcode)
+      : NaN;
+  // SQLITE_PERM=3, SQLITE_READONLY=8, SQLITE_CANTOPEN=14, SQLITE_IOERR=10
+  if (errcode === 3 || errcode === 8 || errcode === 14 || errcode === 10) return true;
+  return (
+    combined.includes('attempt to write a readonly database') ||
+    combined.includes('readonly database') ||
+    combined.includes('unable to open database file') ||
+    combined.includes('cantopen') ||
+    combined.includes('disk i/o error') ||
+    combined.includes('permission denied')
+  );
+}
+
+export function walSidecarUnreadableMessage(dir: string): string {
+  return `qlb audit: store is not readable without write access to ${dir} (WAL sidecar); run from a writable location or vacuum the store`;
+}
+
+function throwIfWalSidecar(err: unknown): never {
+  if (isWalSidecarUnreadableError(err) || (err instanceof Error && err.message === WAL_SIDECAR_UNREADABLE)) {
+    throw new Error(WAL_SIDECAR_UNREADABLE);
+  }
+  throw err;
+}
+
 export function openDecisionsReader(path: string): DecisionsReader | null {
   if (!existsSync(path)) return null;
-  const db = new DatabaseSync(path, { readOnly: true });
+  let db: DatabaseSync;
+  try {
+    db = new DatabaseSync(path, { readOnly: true });
+  } catch (err) {
+    throwIfWalSidecar(err);
+  }
   try {
     db.exec('PRAGMA busy_timeout = 5000');
     const version = readUserVersion(db);
@@ -187,7 +231,11 @@ export function openDecisionsReader(path: string): DecisionsReader | null {
     return {
       listRoutingDecisions(limit: number): DecisionRow[] {
         const n = Number.isFinite(limit) ? Math.max(0, Math.trunc(limit)) : 0;
-        return listStmt.all(n) as unknown as DecisionRow[];
+        try {
+          return listStmt.all(n) as unknown as DecisionRow[];
+        } catch (err) {
+          throwIfWalSidecar(err);
+        }
       },
       getAccountProvider(accountId: string): string | null {
         if (!accountStmt) return null;
@@ -208,7 +256,7 @@ export function openDecisionsReader(path: string): DecisionsReader | null {
     } catch {
       // preserve the original error
     }
-    throw err;
+    throwIfWalSidecar(err);
   }
 }
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { adapters } from './adapters';
 import { createDefaultCodexGateDeps, runCodexGate } from './codex-gate';
 import { config, stripConfigArgs } from './config';
@@ -52,7 +52,15 @@ import { formatRefresh, refreshCommand, runRefresh } from './refresh';
 import { DEFAULT_AUDIT_LIMIT, formatAudit, toAuditDecision } from './audit';
 import { DEFAULT_WHY_MODEL, explainWhy, formatWhyHuman } from './why';
 import { collectCandidates, recordObservation, safeFetch } from './candidates';
-import { getStore, openDecisionsReader, openStore, type Store } from './store';
+import {
+  getStore,
+  isWalSidecarUnreadableError,
+  openDecisionsReader,
+  openStore,
+  WAL_SIDECAR_UNREADABLE,
+  walSidecarUnreadableMessage,
+  type Store,
+} from './store';
 import type { AccountSnapshot } from './types';
 
 const USAGE = `Usage:
@@ -1484,18 +1492,26 @@ function printOverride(row: { kind: string; account_id: string; session: string 
   console.log(`${row.kind}  account=${row.account_id}${session}  until=${until}`);
 }
 
+function printAuditOpenError(path: string, err: unknown): void {
+  const msg = err instanceof Error ? err.message : String(err);
+  if (msg.includes('upgrade qlb')) {
+    console.error(msg);
+    return;
+  }
+  if (msg === WAL_SIDECAR_UNREADABLE || isWalSidecarUnreadableError(err)) {
+    console.error(walSidecarUnreadableMessage(dirname(path)));
+    return;
+  }
+  console.error(`qlb audit: cannot open store read-only (${msg})`);
+}
+
 async function runAudit(opts: AuditOpts): Promise<number> {
   const path = opts.db ?? config.dbPath;
   let reader;
   try {
     reader = openDecisionsReader(path);
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    if (msg.includes('upgrade qlb')) {
-      console.error(msg);
-    } else {
-      console.error(`qlb audit: cannot open store read-only (${msg})`);
-    }
+    printAuditOpenError(path, err);
     return 1;
   }
   if (!reader) {
@@ -1511,6 +1527,9 @@ async function runAudit(opts: AuditOpts): Promise<number> {
     );
     console.log(formatAudit(decisions, opts.json));
     return 0;
+  } catch (err) {
+    printAuditOpenError(path, err);
+    return 1;
   } finally {
     reader.close();
   }
