@@ -77,6 +77,21 @@ export interface OverrideRow {
   until: number | null;
 }
 
+export const ROUTING_DECISION_MODES = [
+  'headroom',
+  'all-in',
+  'fallback',
+  'fallback-all-in',
+  'pin',
+  'spread',
+  'round-robin',
+  'failover',
+  'pin_unavailable',
+  'exhausted',
+] as const;
+
+const ROUTING_MODE_SQL = ROUTING_DECISION_MODES.map((mode) => `'${mode}'`).join(', ');
+
 export interface DecisionInput {
   ts?: number;
   session?: string | null;
@@ -88,6 +103,8 @@ export interface DecisionInput {
   mode: string;
   reason: string;
   snapshot_json: string;
+  strategy?: string | null;
+  provider?: string | null;
 }
 
 /** Row shape of `decisions` as stored today (no `outcome` column). */
@@ -103,6 +120,96 @@ export interface DecisionRow {
   mode: string;
   reason: string;
   snapshot_json: string;
+  strategy: string | null;
+  provider: string | null;
+}
+
+export interface DecisionsReader {
+  listRoutingDecisions(limit: number): DecisionRow[];
+  getAccountProvider(accountId: string): string | null;
+  close(): void;
+}
+
+function hasColumn(db: DatabaseSync, table: string, column: string): boolean {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+  return cols.some((c) => c.name === column);
+}
+
+function ensureDecisionColumnsOn(db: DatabaseSync): void {
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    if (!hasColumn(db, 'decisions', 'strategy')) {
+      db.exec('ALTER TABLE decisions ADD COLUMN strategy TEXT');
+      db.exec('ALTER TABLE decisions ADD COLUMN provider TEXT');
+    }
+    db.exec('COMMIT');
+  } catch (err) {
+    try {
+      db.exec('ROLLBACK');
+    } catch {
+      // preserve the original error
+    }
+    throw err;
+  }
+}
+
+const DECISION_SELECT = `id, ts, session, harness, requested_model, effort, served_model,
+                account_id, mode, reason, snapshot_json, strategy, provider`;
+
+export function openDecisionsReader(path: string): DecisionsReader | null {
+  if (!existsSync(path)) return null;
+  const db = new DatabaseSync(path, { readOnly: true });
+  try {
+    db.exec('PRAGMA busy_timeout = 5000');
+    const version = readUserVersion(db);
+    if (version > 4) {
+      throw new Error(
+        `qlb.db schema user_version=${version} is newer than this binary (4); upgrade qlb`,
+      );
+    }
+    const strategySelect = hasColumn(db, 'decisions', 'strategy')
+      ? 'strategy, provider'
+      : 'NULL AS strategy, NULL AS provider';
+    const listStmt = db.prepare(`
+      SELECT id, ts, session, harness, requested_model, effort, served_model,
+             account_id, mode, reason, snapshot_json, ${strategySelect}
+      FROM decisions
+      WHERE mode IN (${ROUTING_MODE_SQL})
+      ORDER BY ts DESC, id DESC
+      LIMIT ?
+    `);
+    let accountStmt: ReturnType<DatabaseSync['prepare']> | null = null;
+    try {
+      accountStmt = db.prepare('SELECT provider FROM accounts WHERE id = ?');
+    } catch {
+      accountStmt = null;
+    }
+    return {
+      listRoutingDecisions(limit: number): DecisionRow[] {
+        const n = Number.isFinite(limit) ? Math.max(0, Math.trunc(limit)) : 0;
+        return listStmt.all(n) as unknown as DecisionRow[];
+      },
+      getAccountProvider(accountId: string): string | null {
+        if (!accountStmt) return null;
+        try {
+          const row = accountStmt.get(accountId) as { provider: string } | undefined;
+          return row?.provider ?? null;
+        } catch {
+          return null;
+        }
+      },
+      close(): void {
+        db.close();
+      },
+    };
+  } catch (err) {
+    try {
+      db.close();
+    } catch {
+      // preserve the original error
+    }
+    throw err;
+  }
 }
 
 function ensurePrivateDir(dir: string): void {
@@ -229,7 +336,9 @@ export class Store {
         account_id TEXT,
         mode TEXT,
         reason TEXT,
-        snapshot_json TEXT
+        snapshot_json TEXT,
+        strategy TEXT,
+        provider TEXT
       );
       CREATE TABLE IF NOT EXISTS overrides (
         kind TEXT,
@@ -282,8 +391,8 @@ export class Store {
     this.insertDecisionStmt = this.db.prepare(`
       INSERT INTO decisions (
         ts, session, harness, requested_model, effort, served_model,
-        account_id, mode, reason, snapshot_json
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        account_id, mode, reason, snapshot_json, strategy, provider
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     this.getOverrideStmt = this.db.prepare(`
       SELECT kind, account_id, session, until FROM overrides
@@ -475,6 +584,7 @@ export class Store {
       `);
       this.db.exec('PRAGMA user_version = 4');
     }
+    ensureDecisionColumnsOn(this.db);
   }
 
   close(): void {
@@ -560,6 +670,8 @@ export class Store {
       input.mode,
       input.reason,
       input.snapshot_json,
+      input.strategy ?? null,
+      input.provider ?? null,
     );
     return Number(result.lastInsertRowid);
   }
@@ -575,8 +687,7 @@ export class Store {
     const since = opts.sinceTs ?? 0;
     const rows = this.db
       .prepare(
-        `SELECT id, ts, session, harness, requested_model, effort, served_model,
-                account_id, mode, reason, snapshot_json
+        `SELECT ${DECISION_SELECT}
          FROM decisions
          WHERE ts >= ?
          ORDER BY ts ASC`,
@@ -592,9 +703,21 @@ export class Store {
     const n = Number.isFinite(limit) ? Math.max(0, Math.trunc(limit)) : 0;
     return this.db
       .prepare(
-        `SELECT id, ts, session, harness, requested_model, effort, served_model,
-                account_id, mode, reason, snapshot_json
+        `SELECT ${DECISION_SELECT}
          FROM decisions
+         ORDER BY ts DESC, id DESC
+         LIMIT ?`,
+      )
+      .all(n) as unknown as DecisionRow[];
+  }
+
+  listRoutingDecisions(limit: number): DecisionRow[] {
+    const n = Number.isFinite(limit) ? Math.max(0, Math.trunc(limit)) : 0;
+    return this.db
+      .prepare(
+        `SELECT ${DECISION_SELECT}
+         FROM decisions
+         WHERE mode IN (${ROUTING_MODE_SQL})
          ORDER BY ts DESC, id DESC
          LIMIT ?`,
       )
