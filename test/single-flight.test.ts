@@ -63,4 +63,105 @@ describe('single-flight poll coalescing', () => {
     assert.ok(results.every((r) => r && r.weekly?.usedPct === 62));
     store.close();
   });
+
+  it('onOutcome fetched on successful acquire', async () => {
+    const store = openStore(':memory:');
+    const outcomes: string[] = [];
+    const result = await singleFlightFetch(
+      'acct-fetch',
+      null,
+      async () => ({ '5h': reading(4) }),
+      {
+        store,
+        onOutcome(o) {
+          outcomes.push(o);
+        },
+      },
+    );
+    assert.equal(result?.['5h']?.usedPct, 4);
+    assert.deepEqual(outcomes, ['fetched']);
+    store.close();
+  });
+
+  it('onOutcome cached-after-failure inside TTL with rejected doFetch returns unchanged cache', async () => {
+    const store = openStore(':memory:');
+    store.upsertAccount('acct-ttl', 'anthropic', 'acct-ttl');
+    const cached = reading(33);
+    store.upsertSnapshot('acct-ttl', '5h', cached);
+    const outcomes: Array<{ o: string; d?: string }> = [];
+    const result = await singleFlightFetch(
+      'acct-ttl',
+      cached.fetchedAt,
+      async () => {
+        throw new Error('probe-down');
+      },
+      {
+        store,
+        pollClaimTtlMs: 10_000,
+        onOutcome(o, d) {
+          outcomes.push({ o, d });
+        },
+      },
+    );
+    assert.equal(result?.['5h']?.usedPct, 33);
+    assert.equal(outcomes.length, 1);
+    assert.equal(outcomes[0]?.o, 'cached-after-failure');
+    assert.match(outcomes[0]?.d ?? '', /probe-down/);
+    store.close();
+  });
+
+  it('onOutcome cached-after-failure outside TTL with rejected doFetch', async () => {
+    const store = openStore(':memory:');
+    store.upsertAccount('acct-old', 'anthropic', 'acct-old');
+    store.upsertSnapshot('acct-old', '5h', {
+      usedPct: 8,
+      source: 'poll',
+      confidence: 'authoritative',
+      fetchedAt: Date.now() - 60_000,
+    });
+    const outcomes: string[] = [];
+    const result = await singleFlightFetch(
+      'acct-old',
+      Date.now() - 60_000,
+      async () => {
+        throw new Error('expired-probe');
+      },
+      {
+        store,
+        pollClaimTtlMs: 50,
+        onOutcome(o) {
+          outcomes.push(o);
+        },
+      },
+    );
+    assert.equal(result?.['5h']?.usedPct, 8);
+    assert.ok(outcomes.includes('cached-after-failure'));
+    store.close();
+  });
+
+  it('onOutcome coalesced when another holder wrote fresh', async () => {
+    const store = openStore(':memory:');
+    const outcomes: string[] = [];
+    let fetches = 0;
+    const doFetch = async (): Promise<Record<string, BucketReading>> => {
+      fetches += 1;
+      await sleep(80);
+      return { weekly: reading(50) };
+    };
+    const opts = {
+      store,
+      pollClaimTtlMs: 10_000,
+      onOutcome(o: 'fetched' | 'coalesced' | 'cached-after-failure') {
+        outcomes.push(o);
+      },
+    };
+    await Promise.all([
+      singleFlightFetch('acct-coal', null, doFetch, opts),
+      singleFlightFetch('acct-coal', null, doFetch, opts),
+    ]);
+    assert.equal(fetches, 1);
+    assert.ok(outcomes.includes('fetched'));
+    assert.ok(outcomes.includes('coalesced'));
+    store.close();
+  });
 });

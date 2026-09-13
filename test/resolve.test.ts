@@ -143,4 +143,65 @@ describe('qlb resolve — store-backed end-to-end', () => {
     assert.ok(typeof decision.decisionId === 'number');
     store.close();
   });
+
+  it('default persist still records strategy and provider', () => {
+    const store = openStore(':memory:');
+    seed(store, 'A', { '5h': reading(70), '7d': reading(20) }, 'account-A');
+    const decision = resolveFromSnapshots({
+      model: 'claude-sonnet-5',
+      snapshots: snapshotsFromStore(store, 'anthropic'),
+      store,
+    });
+    assert.equal(decision.ok, true);
+    const row = store.listRoutingDecisions(1)[0];
+    assert.ok(row);
+    assert.equal(row.strategy, 'headroom');
+    assert.equal(row.provider, 'anthropic');
+    store.close();
+  });
+
+  it('exhausted row records provider and requested strategy', () => {
+    const store = openStore(':memory:');
+    seed(store, 'A', {
+      '5h': reading(100),
+      '7d': reading(100),
+    });
+    const decision = resolveFromSnapshots({
+      model: 'claude-sonnet-5',
+      strategy: 'spread',
+      snapshots: snapshotsFromStore(store, 'anthropic'),
+      store,
+    });
+    assert.equal(decision.ok, false);
+    const row = store.listRoutingDecisions(1)[0];
+    assert.equal(row.mode, 'exhausted');
+    assert.equal(row.strategy, 'spread');
+    assert.equal(row.provider, 'anthropic');
+    store.close();
+  });
+
+  it('pinned-unavailable row records pin and provider', () => {
+    const store = openStore(':memory:');
+    seed(store, 'A', { '5h': reading(10), '7d': reading(10) });
+    store.upsertOverride({
+      kind: 'pin',
+      accountId: 'missing',
+      session: 'pin-sess',
+      until: Date.now() + 60_000,
+    });
+    const decision = resolveFromSnapshots({
+      model: 'claude-sonnet-5',
+      session: 'pin-sess',
+      snapshots: snapshotsFromStore(store, 'anthropic'),
+      store,
+    });
+    assert.equal(decision.ok, false);
+    if (decision.ok) return;
+    assert.equal(decision.error, 'PINNED_UNAVAILABLE');
+    const row = store.listRoutingDecisions(1)[0];
+    assert.equal(row.mode, 'pin_unavailable');
+    assert.equal(row.strategy, 'pin');
+    assert.equal(row.provider, 'anthropic');
+    store.close();
+  });
 });

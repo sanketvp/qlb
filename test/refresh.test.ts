@@ -1,7 +1,12 @@
 import assert from 'node:assert/strict';
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
+import { loadPlugins } from '../src/plugins';
 import { formatRefresh, refreshCommand, runRefresh } from '../src/refresh';
+import type { AccountSnapshot, Adapter } from '../src/types';
 
 function bucketSnapshot(provider: string, accountId = `${provider}-acct`) {
   return {
@@ -134,7 +139,7 @@ describe('qlb refresh', () => {
     const text = formatRefresh(report);
     assert.match(text, /\[OK\]/);
     assert.match(text, /\[FAIL\]/);
-    assert.match(text, /Probed 2 provider\(s\): 1 ok, 0 no-data, 1 failed/);
+    assert.match(text, /Probed 2 provider\(s\): 1 ok, 0 partial, 0 no-data, 0 no-probe, 1 failed/);
     const parsed = JSON.parse(JSON.stringify(report)) as { probed?: unknown; results?: unknown };
     assert.equal(parsed.probed, true);
     assert.ok(Array.isArray(parsed.results));
@@ -202,7 +207,7 @@ describe('qlb refresh', () => {
     assert.match(text, /\[FAIL\]\s+rejecting \(Rejecting\): reject-boom/);
     assert.match(text, /\[FAIL\]\s+sync-throw \(Sync Throw\): sync-boom/);
     assert.match(text, /\[NONE\]\s+nodata \(No Data\): authenticated, no gauge/);
-    assert.match(text, /Probed 5 provider\(s\): 2 ok, 1 no-data, 2 failed/);
+    assert.match(text, /Probed 5 provider\(s\): 2 ok, 0 partial, 1 no-data, 0 no-probe, 2 failed/);
 
     const jsonLines: string[] = [];
     const jsonCode = await refreshCommand(adapters, { allowProbe: true, json: true }, {
@@ -245,5 +250,218 @@ describe('qlb refresh', () => {
     assert.equal(jsonCode, 0);
     assert.equal(counter.n, 0);
     assert.deepEqual(JSON.parse(jsonLines.join('\n')), { probed: false, results: [] });
+  });
+
+  it('mixed ok/error accounts classified partial in text and json', async () => {
+    const adapter: Adapter = {
+      id: 'mixed',
+      displayName: 'Mixed',
+      fetchSnapshots() {
+        return Promise.resolve([
+          bucketSnapshot('mixed', 'ok-acct'),
+          {
+            accountId: 'bad-acct',
+            provider: 'mixed',
+            label: 'bad-acct',
+            buckets: {},
+            error: 'auth failed',
+          },
+        ]);
+      },
+    };
+    const report = await runRefresh([adapter], { allowProbe: true });
+    assert.equal(report.results[0]?.status, 'partial');
+    assert.equal(report.results[0]?.ok, false);
+    assert.equal(report.results[0]?.accountsOk, 1);
+    assert.equal(report.results[0]?.accountsFailed, 1);
+    assert.equal(report.results[0]?.errors[0]?.accountId, 'bad-acct');
+    const text = formatRefresh(report);
+    assert.match(text, /\[PART\]/);
+    assert.match(text, /bad-acct: auth failed/);
+    assert.match(text, /1 partial/);
+    const json = JSON.parse(JSON.stringify(report)) as {
+      results: Array<{ status: string; errors: unknown[] }>;
+    };
+    assert.equal(json.results[0]?.status, 'partial');
+    assert.ok(Array.isArray(json.results[0]?.errors));
+  });
+
+  it('cached-after-failure account counted failed, buckets retained', async () => {
+    const snap: AccountSnapshot = {
+      accountId: 'cached',
+      provider: 'caf',
+      label: 'cached',
+      buckets: {
+        requests: {
+          usedPct: 12,
+          source: 'poll',
+          confidence: 'authoritative',
+          fetchedAt: 1,
+        },
+      },
+      probe: { outcome: 'cached-after-failure', detail: 'HTTP 503' },
+    };
+    const report = await runRefresh(
+      [
+        {
+          id: 'caf',
+          displayName: 'CAF',
+          fetchSnapshots: () => Promise.resolve([snap]),
+        },
+      ],
+      { allowProbe: true },
+    );
+    assert.equal(report.results[0]?.status, 'error');
+    assert.equal(report.results[0]?.accountsFailed, 1);
+    assert.equal(report.results[0]?.snapshots[0]?.buckets.requests?.usedPct, 12);
+    assert.match(report.results[0]?.errors[0]?.error ?? '', /probe failed: HTTP 503; cached reading retained/);
+  });
+
+  it('all accounts cached-after-failure → error', async () => {
+    const report = await runRefresh(
+      [
+        {
+          id: 'all-caf',
+          displayName: 'All CAF',
+          fetchSnapshots: () =>
+            Promise.resolve([
+              {
+                accountId: 'a',
+                provider: 'all-caf',
+                label: 'a',
+                buckets: { requests: { usedPct: 1, source: 'poll' as const, confidence: 'authoritative' as const, fetchedAt: 1 } },
+                probe: { outcome: 'cached-after-failure' as const, detail: 'timeout' },
+              },
+              {
+                accountId: 'b',
+                provider: 'all-caf',
+                label: 'b',
+                buckets: { requests: { usedPct: 2, source: 'poll' as const, confidence: 'authoritative' as const, fetchedAt: 1 } },
+                probe: { outcome: 'cached-after-failure' as const, detail: 'timeout' },
+              },
+            ]),
+        },
+      ],
+      { allowProbe: true },
+    );
+    assert.equal(report.results[0]?.status, 'error');
+    assert.equal(report.results[0]?.ok, false);
+    assert.equal(report.results[0]?.accountsFailed, 2);
+    assert.equal(report.results[0]?.accountsOk, 0);
+  });
+
+  it('codex valid credentials → no-probe not ok', async () => {
+    const report = await runRefresh(
+      [
+        {
+          id: 'openai-codex',
+          displayName: 'Codex',
+          probes: false,
+          fetchSnapshots: () =>
+            Promise.resolve([
+              {
+                accountId: 'codex-default',
+                provider: 'openai-codex',
+                label: 'codex-default',
+                buckets: {},
+              },
+            ]),
+        },
+      ],
+      { allowProbe: true },
+    );
+    assert.equal(report.results[0]?.status, 'no-probe');
+    assert.equal(report.results[0]?.ok, false);
+    assert.match(formatRefresh(report), /no probe available/);
+  });
+
+  it('codex invalid credentials → error, not no-probe', async () => {
+    const report = await runRefresh(
+      [
+        {
+          id: 'openai-codex',
+          displayName: 'Codex',
+          probes: false,
+          fetchSnapshots: () =>
+            Promise.resolve([
+              {
+                accountId: 'codex-default',
+                provider: 'openai-codex',
+                label: 'codex-default',
+                buckets: {},
+                error: 'no valid Codex credentials',
+              },
+            ]),
+        },
+      ],
+      { allowProbe: true },
+    );
+    assert.equal(report.results[0]?.status, 'error');
+    assert.notEqual(report.results[0]?.status, 'no-probe');
+  });
+
+  it('plugin adapter declaring probes:false is reported no-probe', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-plugin-noprobe-'));
+    writeFileSync(
+      join(dir, 'silent.js'),
+      `
+        module.exports = {
+          id: 'silent',
+          displayName: 'Silent',
+          probes: false,
+          async fetchSnapshots() {
+            return [{ accountId: 's', provider: 'silent', label: 's', buckets: {} }];
+          }
+        };
+      `,
+    );
+    const plugins = loadPlugins(dir);
+    assert.equal(plugins[0]?.probes, false);
+    const report = await runRefresh(plugins, { allowProbe: true });
+    assert.equal(report.results[0]?.status, 'no-probe');
+  });
+
+  it('plugin probes non-boolean warns and is treated as probing', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-plugin-badprobes-'));
+    writeFileSync(
+      join(dir, 'weird.js'),
+      `
+        module.exports = {
+          id: 'weird',
+          displayName: 'Weird',
+          probes: 'yes',
+          async fetchSnapshots() {
+            return [{
+              accountId: 'w',
+              provider: 'weird',
+              label: 'w',
+              buckets: { daily: { usedPct: 1, source: 'poll', confidence: 'authoritative', fetchedAt: 1 } }
+            }];
+          }
+        };
+      `,
+    );
+    const warnings: string[] = [];
+    const plugins = loadPlugins(dir, (msg) => warnings.push(msg));
+    assert.match(warnings.join('\n'), /probes must be boolean/);
+    assert.equal(plugins[0]?.probes, undefined);
+    const report = await runRefresh(plugins, { allowProbe: true });
+    assert.equal(report.results[0]?.status, 'ok');
+  });
+
+  it('adapter without probe field treated as fetched', async () => {
+    const report = await runRefresh(
+      [
+        {
+          id: 'plain',
+          displayName: 'Plain',
+          fetchSnapshots: () => Promise.resolve([bucketSnapshot('plain')]),
+        },
+      ],
+      { allowProbe: true },
+    );
+    assert.equal(report.results[0]?.status, 'ok');
+    assert.equal(report.results[0]?.ok, true);
+    assert.equal(report.results[0]?.snapshots[0]?.probe, undefined);
   });
 });
