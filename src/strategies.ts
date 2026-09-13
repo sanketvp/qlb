@@ -27,6 +27,8 @@ export interface StrategyContext {
   session?: string | null;
   store?: Store;
   drainFirstIds?: Set<string>;
+  /** When false, peek rotation/sticky state without writing. Default true. */
+  persist?: boolean;
 }
 
 function notErrored(snapshot: AccountSnapshot): boolean {
@@ -125,17 +127,28 @@ function eligibleForRotation(snapshot: AccountSnapshot, model: string): boolean 
   return !isFullyExhausted(snapshot, model);
 }
 
+function peekRoundRobinIndex(store: Store, key: string, count: number): number {
+  if (count <= 0) return 0;
+  const raw = store.getConfig(key);
+  const last = raw != null && /^-?\d+$/.test(raw) ? Number(raw) : -1;
+  return (last + 1) % count;
+}
+
 function pickRoundRobin(
   snapshots: AccountSnapshot[],
   model: string,
   store: Store | undefined,
+  persist = true,
 ): StrategyPick | null {
   const eligible = snapshots.filter((s) => eligibleForRotation(s, model)).sort(byAccountId);
   if (eligible.length === 0) return null;
   const provider = eligible[0].provider;
   let idx = 0;
   if (store) {
-    idx = store.nextRoundRobinIndex(roundRobinConfigKey(provider), eligible.length);
+    const key = roundRobinConfigKey(provider);
+    idx = persist
+      ? store.nextRoundRobinIndex(key, eligible.length)
+      : peekRoundRobinIndex(store, key, eligible.length);
   }
   const snapshot = eligible[idx] ?? eligible[0];
   const score = scoreAccount(snapshot, model, DEFAULT_CEILING);
@@ -169,6 +182,7 @@ function pickFailover(
   snapshots: AccountSnapshot[],
   model: string,
   store: Store | undefined,
+  persist = true,
 ): StrategyPick | null {
   const eligible = snapshots.filter((s) => hasFailoverHeadroom(s, model)).sort(byAccountId);
   if (eligible.length === 0) return null;
@@ -180,7 +194,7 @@ function pickFailover(
     : null;
   if (!snapshot) {
     snapshot = eligible[0];
-    store?.setConfig(key, snapshot.accountId);
+    if (persist) store?.setConfig(key, snapshot.accountId);
   }
   const score = scoreAccount(snapshot, model, DEFAULT_CEILING);
   const ceiling = score > 0 ? DEFAULT_CEILING : ALL_IN_CEILING;
@@ -203,9 +217,9 @@ function pickWithStrategy(strategy: Strategy, ctx: StrategyContext): StrategyPic
     case 'spread':
       return pickSpread(ctx.snapshots, ctx.model, ctx.session);
     case 'round-robin':
-      return pickRoundRobin(ctx.snapshots, ctx.model, ctx.store);
+      return pickRoundRobin(ctx.snapshots, ctx.model, ctx.store, ctx.persist !== false);
     case 'failover':
-      return pickFailover(ctx.snapshots, ctx.model, ctx.store);
+      return pickFailover(ctx.snapshots, ctx.model, ctx.store, ctx.persist !== false);
   }
 }
 

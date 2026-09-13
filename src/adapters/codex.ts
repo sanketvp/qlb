@@ -45,6 +45,7 @@ function stringClaim(payload: JsonObject | undefined, name: string): string | un
 export const codexAdapter: Adapter = {
   id: 'openai-codex',
   displayName: 'Codex (ChatGPT Pro)',
+  probes: false,
   fetchSnapshots: async () => {
     try {
       const auth = JSON.parse(await readFile(AUTH_PATH, 'utf8')) as unknown;

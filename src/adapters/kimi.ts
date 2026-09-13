@@ -2,7 +2,7 @@ import { readFile } from 'node:fs/promises';
 import { config } from '../config';
 import { fetchAndCache } from '../single-flight';
 import { getStore } from '../store';
-import type { AccountSnapshot, Adapter, BucketReading } from '../types';
+import type { AccountSnapshot, Adapter, BucketReading, FetchOutcome } from '../types';
 
 const KEY_FILE = config.kimiCredentialsFile;
 const USAGES_URL = 'https://api.kimi.com/coding/v1/usages';
@@ -126,6 +126,8 @@ export const kimiAdapter: Adapter = {
     let liveAccountId = claimId;
     let liveLabel = 'Kimi K3';
     let lastError: string | undefined;
+    let probeOutcome: FetchOutcome | undefined;
+    let probeDetail: string | undefined;
 
     try {
       const buckets = await fetchAndCache(claimId, async () => {
@@ -167,8 +169,19 @@ export const kimiAdapter: Adapter = {
         const level = body.user?.membership?.level;
         liveLabel = level ? `Kimi K3 (${level})` : 'Kimi K3';
         return parsed;
+      }, {
+        onOutcome(outcome, detail) {
+          probeOutcome = outcome;
+          probeDetail = detail;
+        },
       });
 
+      const probe = probeOutcome
+        ? {
+            outcome: probeOutcome,
+            detail: probeOutcome === 'cached-after-failure' ? (lastError ?? probeDetail) : probeDetail,
+          }
+        : undefined;
       if (buckets && Object.keys(buckets).length > 0) {
         return [
           {
@@ -176,10 +189,14 @@ export const kimiAdapter: Adapter = {
             provider: 'kimi-coding',
             label: liveLabel,
             buckets,
+            ...(probe ? { probe } : {}),
           },
         ];
       }
-      return [errorSnapshot(lastError ?? 'response missing usage block')];
+      return [{
+        ...errorSnapshot(lastError ?? probeDetail ?? 'response missing usage block'),
+        ...(probe ? { probe } : {}),
+      }];
     } catch (err) {
       return [errorSnapshot(err instanceof Error ? err.message : String(err))];
     }

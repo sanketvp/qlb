@@ -97,6 +97,25 @@ describe('CLI smoke — documented commands', () => {
     assert.match(flat.stdout, /bucket/);
   });
 
+  it('why and why --json exit 0, and --json parses as JSON', () => {
+    const env = isolatedEnv();
+    const human = runCli(['why'], env);
+    assert.equal(human.status, 0, human.stderr);
+
+    const json = runCli(['why', '--json'], env);
+    assert.equal(json.status, 0, json.stderr);
+    const body = parseJson(json.stdout) as {
+      accountId: string | null;
+      strategy: string;
+      score: number | null;
+      losers: unknown;
+    };
+    assert.equal(typeof body.strategy, 'string');
+    assert.ok(body.accountId === null || typeof body.accountId === 'string');
+    assert.ok(body.score === null || typeof body.score === 'number');
+    assert.ok(Array.isArray(body.losers));
+  });
+
   it('resolve --model --json returns valid JSON (0 or EXHAUSTED 1)', () => {
     const result = runCli(['resolve', '--model', 'claude-sonnet-5', '--json']);
     assert.ok(result.status === 0 || result.status === 1, result.stderr);

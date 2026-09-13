@@ -2,7 +2,7 @@ import { readFile } from 'node:fs/promises';
 import { config } from '../config';
 import { fetchAndCache } from '../single-flight';
 import { getStore } from '../store';
-import type { AccountSnapshot, Adapter, BucketReading } from '../types';
+import type { AccountSnapshot, Adapter, BucketReading, FetchOutcome } from '../types';
 
 // Read-only mirror of Pi's OAuth grants (Phase 0: never write/refresh — the
 // native harness owns the refresh flow; if the grant expires we surface an
@@ -74,6 +74,8 @@ export const xaiAdapter: Adapter = {
       //    timeout, no retries — never more than one attempt. Concurrent callers
       //    share that one probe via single-flight (§4.3.3).
       let lastError: string | undefined;
+      let probeOutcome: FetchOutcome | undefined;
+      let probeDetail: string | undefined;
       const buckets = await fetchAndCache(snapshot.accountId, async () => {
         const res = await fetch('https://api.x.ai/v1/chat/completions', {
           method: 'POST',
@@ -115,8 +117,19 @@ export const xaiAdapter: Adapter = {
         }
         lastError = 'no x-ratelimit headers on response';
         throw new Error(lastError);
+      }, {
+        onOutcome(outcome, detail) {
+          probeOutcome = outcome;
+          probeDetail = detail;
+        },
       });
 
+      if (probeOutcome) {
+        snapshot.probe = {
+          outcome: probeOutcome,
+          detail: probeOutcome === 'cached-after-failure' ? (lastError ?? probeDetail) : probeDetail,
+        };
+      }
       if (buckets && Object.keys(buckets).length > 0) {
         snapshot.buckets = buckets;
       } else {
