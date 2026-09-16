@@ -79,7 +79,8 @@ describe('dashboard formatting', () => {
 
     const text = formatDashboard(accounts);
     assert.match(text, /^✓  Work  anthropic  NATIVE  override=none$/m);
-    assert.match(text, /5h  42%  authoritative/);
+    assert.match(text, /5h\s+42% used\s+58% left\s+authoritative/);
+    assert.match(text, /7d\s+not reported by anthropic/);
   });
 
   it('shows an active override kind when the lookups return one', () => {

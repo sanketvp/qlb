@@ -40,8 +40,10 @@ import {
 } from './retire';
 import { pruneAccount, PruneRefusedError } from './accounts-prune';
 import {
+  decorateStatusJson,
   enrichAccounts,
   formatDashboard,
+  formatFlatTable,
   formatRelative,
   formatUsedPct,
   makeOwnershipReader,
@@ -61,7 +63,6 @@ import {
   walSidecarUnreadableMessage,
   type Store,
 } from './store';
-import type { AccountSnapshot } from './types';
 
 const USAGE = `Usage:
   qlb init [--json]
@@ -112,9 +113,10 @@ qlb retire status is read-only. qlb retire execute is refused unless
 7-day soak, 20 clean decisions, live ping). Do NOT run retire execute until
 those production soak criteria are actually met.
 Default qlb status human view is the dashboard (grouped by account with
-health glyph, ownership, overrides). Pass --flat for the original bucket
-table. --json keeps {fetchedAt, accounts} and adds ownership, override,
-health, healthGlyph on each account (additive; existing fields unchanged).
+health glyph, ownership, overrides, remaining capacity, and 5h/7d reset
+times). Pass --flat for the original bucket table. --json keeps
+{fetchedAt, accounts} and adds ownership, override, health, healthGlyph
+on each account (additive; existing fields unchanged).
 qlb setup prints copy-paste snippets only and never edits files outside
 this repo (setup pi writes scripts/hooks/pi-advisory.sh here).
 qlb override pin/reserve/drain-first: --until defaults to 24h from now when
@@ -925,92 +927,6 @@ function assertSafeMigratePaths(opts: MigrateOpts): void {
   }
 }
 
-function pad(value: string, width: number): string {
-  return value.length >= width ? value : value + ' '.repeat(width - value.length);
-}
-
-interface Row {
-  provider: string;
-  label: string;
-  bucket: string;
-  usedPct: string;
-  confidence: string;
-  reset: string;
-}
-
-function toRows(accounts: AccountSnapshot[]): Row[] {
-  const rows: Row[] = [];
-  for (const snap of accounts) {
-    const entries = Object.entries(snap.buckets);
-    if (entries.length === 0 && snap.error) {
-      rows.push({
-        provider: snap.provider,
-        label: snap.label,
-        bucket: '-',
-        usedPct: '-',
-        confidence: 'error',
-        reset: snap.error,
-      });
-      continue;
-    }
-    for (const [bucket, reading] of entries) {
-      rows.push({
-        provider: snap.provider,
-        label: snap.label,
-        bucket,
-        usedPct: formatUsedPct(reading.usedPct),
-        confidence: reading.confidence,
-        reset: formatRelative(reading.resetAt),
-      });
-    }
-  }
-  return rows;
-}
-
-function printTable(accounts: AccountSnapshot[]): void {
-  const rows = toRows(accounts);
-  const widths = {
-    provider: 'provider'.length,
-    label: 'account'.length,
-    bucket: 'bucket'.length,
-    usedPct: 'used'.length,
-    confidence: 'confidence'.length,
-    reset: 'resets'.length,
-  };
-  for (const row of rows) {
-    widths.provider = Math.max(widths.provider, row.provider.length);
-    widths.label = Math.max(widths.label, row.label.length);
-    widths.bucket = Math.max(widths.bucket, row.bucket.length);
-    widths.usedPct = Math.max(widths.usedPct, row.usedPct.length);
-    widths.confidence = Math.max(widths.confidence, row.confidence.length);
-    widths.reset = Math.max(widths.reset, `resets ${row.reset}`.length);
-  }
-
-  const line = (
-    provider: string,
-    label: string,
-    bucket: string,
-    usedPct: string,
-    confidence: string,
-    reset: string,
-  ): string =>
-    [
-      pad(provider, widths.provider),
-      pad(label, widths.label),
-      pad(bucket, widths.bucket),
-      pad(usedPct, widths.usedPct),
-      pad(confidence, widths.confidence),
-      pad(reset, widths.reset),
-    ].join(' | ');
-
-  console.log(line('provider', 'account', 'bucket', 'used', 'confidence', 'resets'));
-  for (const row of rows) {
-    console.log(
-      line(row.provider, row.label, row.bucket, row.usedPct, row.confidence, `resets ${row.reset}`),
-    );
-  }
-}
-
 function printInit(report: InitReport, json: boolean): void {
   if (json) {
     console.log(JSON.stringify(report, null, 2));
@@ -1056,11 +972,11 @@ async function runStatus(opts: StatusOpts): Promise<void> {
     overrideForAccount: (id) => overrideFromStore(store, id),
   });
   if (opts.json) {
-    console.log(JSON.stringify({ fetchedAt: Date.now(), accounts: enriched }, null, 2));
+    console.log(JSON.stringify({ fetchedAt: Date.now(), accounts: decorateStatusJson(enriched) }, null, 2));
     return;
   }
   if (opts.view === 'flat') {
-    printTable(accounts);
+    console.log(formatFlatTable(enriched));
     return;
   }
   console.log(formatDashboard(enriched));
