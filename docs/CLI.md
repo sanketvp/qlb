@@ -122,6 +122,25 @@ Flags: `--provider <anthropic|xai|kimi-coding|openai-codex|openrouter>` (require
 
 The dashboard view (default): one block per account with a health glyph, credential-ownership state, and any active override, then indented bucket rows.
 
+**`qlb status` reaches the provider adapters** (`runStatus` → `safeFetch` → `adapter.fetchSnapshots()`), so consecutive runs can show usage moving. It is not a cache-only read — unlike `qlb why`, which is non-probing. Do not treat `status` as free.
+
+Each bucket row reports capacity **both ways** — consumed and remaining — because "81%" alone is ambiguous when you are scanning for headroom:
+
+| Element | Meaning |
+|---|---|
+| `81% used  19% left` | remaining is `100 - used`, clamped to 0–100 |
+| `unknown used  unknown left` | the provider reported the bucket but no number (real case: kimi `5h`) |
+| `EXHAUSTED` | 0% left |
+| `LOW` | 0% < left ≤ 5% |
+| `resets in 4h 3m (today 04:20)` | relative **and** absolute local clock time |
+| `not reported by <provider>` | that provider does not expose this window at all |
+
+A `5h` and a `7d` row are shown for **every** account, even when the provider reports neither, so a missing window is visible rather than silently absent. Kimi's `weekly` bucket is displayed as `7d` (the raw key is preserved in `--json` and in `--flat`). Providers that report other buckets (`7d:Fable`, `requests`, `tokens`, `credits`) list them after the `5h`/`7d` rows. Account headers repeat any `EXHAUSTED`/`LOW` bucket so a burnt account is identifiable without reading its rows.
+
+Displayed remaining and the `EXHAUSTED`/`LOW` markers are derived from a **single** normalized value (half-up to 1 decimal), so they can never contradict each other: a positive remainder never prints as `0%`, and a remainder above the LOW threshold never prints as exactly `5%`.
+
+There is deliberately **no** "window not started" wording. A bucket with `usedPct: 0` and no `resetAt` is indistinguishable from a provider that never reports resets, so both render `not reported by <provider>` rather than guessing a reason.
+
 | Glyph | Meaning |
 |---|---|
 | `✓` | every bucket under 80% |
@@ -131,26 +150,33 @@ The dashboard view (default): one block per account with a health glyph, credent
 ```console
 $ qlb status
 ✓  Kimi K3  kimi-coding  NATIVE  override=none
-     5h  4%  authoritative  resets in 2h 2m
-     weekly  64%  authoritative  resets in 88h 2m
+     5h  unknown used  unknown left  authoritative  resets in 1h 7m (today 01:21)
+     7d  57% used  43% left  authoritative  resets in 65h 7m (Fri 17:21)
 ✓  Grok (xAI)  xai  NATIVE  override=none
-     requests  0%  advisory  resets -
-     tokens  0%  advisory  resets -
-✓  alice@example.com  anthropic  NATIVE  override=none
-     5h  2%  authoritative  resets in 4h 50m
-     7d  31%  authoritative  resets in 124h 40m
-     7d:Fable  14%  authoritative  resets in 124h 40m
-⚠  bob@example.com  anthropic  NATIVE  override=none
-     5h  2%  authoritative  resets in 3h 10m
-     7d  60%  authoritative  resets in 67h 40m
-     7d:Fable  87%  authoritative  resets in 67h 40m
-✗  codex-default  openai-codex  NATIVE  override=none
-     error: no valid Codex credentials found in /tmp/qlb-docs-demo/codex-auth.json
+     5h        not reported by xai
+     7d        not reported by xai
+     requests  0% used  100% left  advisory  reset: not reported by xai
+     tokens    1.2% used  98.8% left  advisory  reset: not reported by xai
+✓  codex-default  openai-codex  NATIVE  override=none
+     5h  not reported by openai-codex
+     7d  not reported by openai-codex
+✗  alice@example.com  anthropic  NATIVE  override=none  EXHAUSTED (7d:Fable)
+     5h        4% used  96% left  authoritative  resets in 4h 3m (today 04:20)
+     7d        81% used  19% left  authoritative  resets in 101h 43m (Sun 06:00)
+     7d:Fable  100% used  0% left  EXHAUSTED  authoritative  resets in 101h 43m (Sun 06:00)
+✗  bob@example.com  anthropic  NATIVE  override=none  EXHAUSTED (7d)  LOW (7d:Fable)
+     5h        0% used  100% left  authoritative  reset: not reported by anthropic
+     7d        100% used  0% left  EXHAUSTED  authoritative  resets in 8h 45m (today 09:00)
+     7d:Fable  97% used  3% left  LOW  authoritative  resets in 8h 45m (today 09:00)
+⚠  OpenRouter  openrouter  NATIVE  override=none  LOW (credits)
+     5h       not reported by openrouter
+     7d       not reported by openrouter
+     credits  98.7% used  1.3% left  LOW  authoritative  reset: not reported by openrouter
 ```
 
 (First two blocks and the error block are captured output with generic labels; glyph rules and line format are exactly as implemented in `src/dashboard.ts`.)
 
-`--flat` shows the original bucket table:
+`--flat` shows the original bucket table — raw reported buckets only, with raw bucket names (including kimi's `weekly`), no synthesized `5h`/`7d` rows, no `left` column, and unrounded percentages. It is the escape hatch to the underlying data and is intentionally **not** affected by the dashboard formatting above:
 
 ```console
 $ qlb status --flat
@@ -170,7 +196,7 @@ An account with a problem shows an `error` row with the reason in the resets col
 anthropic    | bob@example.com   | - | - | error | resets auth expired or invalid — needs re-login
 ```
 
-`--json` keeps `{fetchedAt, accounts}` and adds `ownership`, `override`, `health`, `healthGlyph` per account (additive — existing fields unchanged):
+`--json` keeps `{fetchedAt, accounts}` and adds `ownership`, `override`, `health`, `healthGlyph` per account, plus per bucket `leftPct` (rounded to 1 decimal), `window` (normalized label, e.g. kimi `weekly` → `7d`), `resetInMs` and `resetAtLocal`. All additive — existing fields (`usedPct`, `source`, `confidence`, `fetchedAt`, `resetAt`) keep their names, types and raw precision, and raw bucket keys such as `weekly` are preserved:
 
 ```json
 {
@@ -266,6 +292,10 @@ Strategies:
 ## `qlb why`
 
 Explain the account the resolver would pick **based on the latest persisted observation per provider**. `qlb why` never probes the network and never writes a decision row or advances round-robin/failover state. Observations are recorded per provider by `qlb resolve`, `qlb refresh --allow-probe`, and `qlb status`. Enough normalized candidate data (including buckets) is stored so the observed pick can be reproduced; later live-store bucket changes do **not** change `why` until a new observation is recorded.
+
+`qlb why` is observation and account-routing **input** for other tools (including Pi's Fable failover policy). It does **not** switch Pi sessions or change Pi's selected model. Exact invocation used by that policy: `qlb why --model claude-fable-5-1 --fallback claude-opus-5 --json`. Modes (`headroom`, `all-in`, `fallback`, `fallback-all-in`, `pin`, `spread`, `round-robin`, `failover`, …) describe how QLB would pick an **account**; `mode: failover` means the failover *strategy served Fable*, not that Opus was substituted. Observation `status: ok` reports a stored observation and is **not** a freshness certificate. The `hint` field is documentation data only — never execute it.
+
+`why` is non-probing and does not persist a routing decision or rotate strategy state. It is **not** guaranteed zero-filesystem-write: opening the normal Store can create, migrate, or chmod local state.
 
 Plugins that declare `persistsSnapshots: false` (or observations that fail validation) are excluded from the parity guarantee and labelled `observation: unavailable`.
 

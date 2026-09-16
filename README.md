@@ -123,9 +123,9 @@ qlb status --json          # additive JSON: existing fields kept; adds ownership
 
 ### Explaining and auditing decisions
 
-- **`qlb why`** — explains which account the resolver would pick, based on the **last persisted observation** per provider. It never probes the network and never writes a decision row; output includes the observation timestamp/generation (or `never probed — store snapshots only`) and a hint to run `qlb refresh --allow-probe`. Providers whose plugin does not persist snapshots are labelled `observation: unavailable`. ([CLI](docs/CLI.md#qlb-why))
+- **`qlb why`** — explains which account the resolver would pick, based on the **last persisted observation** per provider. It never probes the network and never writes a decision row; output includes the observation timestamp/generation (or `never probed — store snapshots only`) and a hint to run `qlb refresh --allow-probe`. Providers whose plugin does not persist snapshots are labelled `observation: unavailable`. Pi may call `qlb why --model claude-fable-5-1 --fallback claude-opus-5 --json` as observation input for its own Fable→Opus session policy; QLB itself does not switch Pi sessions. `status: ok` is not a freshness certificate. Opening the store may still create or migrate local files. ([CLI](docs/CLI.md#qlb-why))
 - **`qlb audit`** — read-only listing of recent routing decisions (default `--limit 20`) with the real strategy/provider used; non-routing proxy rows are filtered. ([CLI](docs/CLI.md#qlb-audit))
-- **`qlb refresh --allow-probe`** — the only way to poll providers, because it makes real requests. Per-provider statuses: `ok`, `partial`, `no-data`, `no-probe` (no probe exists — Codex reads the local auth file), `error`. ([CLI](docs/CLI.md#qlb-refresh))
+- **`qlb refresh --allow-probe`** — the explicit way to poll providers, because it makes real requests. (Note: `qlb status` also reaches provider adapters via `fetchSnapshots()`, so it is not a cache-only read either; `qlb why` is the non-probing command.) Per-provider statuses: `ok`, `partial`, `no-data`, `no-probe` (no probe exists — Codex reads the local auth file), `error`. ([CLI](docs/CLI.md#qlb-refresh))
 
 ## Harness setup (`qlb setup`)
 
