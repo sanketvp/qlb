@@ -79,6 +79,27 @@ export function leftPct(usedPct: number | null | undefined): number | null {
   return Math.min(100, Math.max(0, 100 - usedPct));
 }
 
+/**
+ * Remaining capacity, LOW, and EXHAUSTED all use this 1-decimal remaining
+ * so the printed number and the marker cannot disagree.
+ *
+ * After half-up rounding to 1 decimal:
+ * - a strictly positive remainder that would become 0.0 is raised to 0.1
+ *   (never print "0% left" for a bucket that is not exhausted)
+ * - a remainder strictly above LOW_LEFT_PCT (5) that would become 5.0 is
+ *   raised to 5.1 (never print "5% left" for a bucket that is not LOW)
+ * Markers: EXHAUSTED iff this value is 0; LOW iff 0 < value <= 5.
+ */
+export function normalizeLeftPct(n: number): number {
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  const capped = Math.min(100, n);
+  let rounded = Math.round(capped * 10) / 10;
+  if (Object.is(rounded, -0)) rounded = 0;
+  if (rounded === 0) return 0.1;
+  if (capped > LOW_LEFT_PCT && rounded === LOW_LEFT_PCT) return LOW_LEFT_PCT + 0.1;
+  return rounded;
+}
+
 export function displayWindow(rawKey: string): string {
   return rawKey === 'weekly' ? '7d' : rawKey;
 }
@@ -106,11 +127,11 @@ export function formatCapacity(usedPct: number | null | undefined): {
   if (usedPct == null || !Number.isFinite(usedPct)) {
     return { used: 'unknown', left: 'unknown', leftPct: null };
   }
-  const left = leftPct(usedPct)!;
+  const displayLeft = normalizeLeftPct(leftPct(usedPct)!);
   return {
     used: formatPctNumber(usedPct),
-    left: formatPctNumber(left),
-    leftPct: left,
+    left: formatPctNumber(displayLeft),
+    leftPct: displayLeft,
   };
 }
 
@@ -128,10 +149,6 @@ export function formatResetAtLocal(resetAt: number, now: number = Date.now()): s
   return `${weekday} ${month} ${d.getDate()} ${time}`;
 }
 
-function isRollingWindow(window: string): boolean {
-  return window === '5h' || window === '7d' || window === 'weekly' || window.startsWith('7d:');
-}
-
 export function formatResetClause(opts: {
   provider: string;
   window: string;
@@ -143,9 +160,9 @@ export function formatResetClause(opts: {
   if (opts.resetAt != null && Number.isFinite(opts.resetAt)) {
     return `resets ${formatRelative(opts.resetAt, now)} (${formatResetAtLocal(opts.resetAt, now)})`;
   }
-  if (opts.usedPct === 0 && isRollingWindow(opts.window)) {
-    return 'reset: window not started (no usage yet)';
-  }
+  // No adapter currently exposes a trustworthy "window not started" signal
+  // (usedPct === 0 with a missing resetAt is indistinguishable from "this
+  // provider never reports resets"). Admit ignorance rather than guess.
   return `reset: not reported by ${opts.provider}`;
 }
 
@@ -264,7 +281,7 @@ export function decorateStatusJson<T extends AccountSnapshot>(
         key,
         {
           ...reading,
-          leftPct: leftPct(reading.usedPct),
+          leftPct: formatCapacity(reading.usedPct).leftPct,
           window: displayWindow(key),
           resetInMs:
             reading.resetAt != null && Number.isFinite(reading.resetAt)
@@ -280,82 +297,91 @@ export function decorateStatusJson<T extends AccountSnapshot>(
   }));
 }
 
-function padRight(value: string, width: number): string {
+function pad(value: string, width: number): string {
   return value.length >= width ? value : value + ' '.repeat(width - value.length);
 }
 
+interface FlatRow {
+  provider: string;
+  label: string;
+  bucket: string;
+  usedPct: string;
+  confidence: string;
+  reset: string;
+}
+
+/**
+ * Original `--flat` bucket table: raw reported buckets only, raw names
+ * (including kimi `weekly`), six columns, original used/reset formatting.
+ * Richer remaining-capacity presentation lives on the dashboard view.
+ */
 export function formatFlatTable(
   accounts: AccountSnapshot[],
   now: number = Date.now(),
 ): string {
-  const rows: StatusDisplayRow[] = [];
+  const rows: FlatRow[] = [];
   for (const snap of accounts) {
-    if (snap.error && Object.keys(snap.buckets).length === 0) {
+    const entries = Object.entries(snap.buckets);
+    if (entries.length === 0 && snap.error) {
       rows.push({
         provider: snap.provider,
         label: snap.label,
-        window: 'error',
-        rawKey: null,
-        used: 'error',
-        left: 'error',
+        bucket: '-',
+        usedPct: '-',
         confidence: 'error',
         reset: snap.error,
-        marker: '',
-        reported: false,
-        exhausted: false,
-        low: false,
-        detail: snap.error,
+      });
+      continue;
+    }
+    for (const [bucket, reading] of entries) {
+      rows.push({
+        provider: snap.provider,
+        label: snap.label,
+        bucket,
+        usedPct: formatUsedPct(reading.usedPct),
+        confidence: reading.confidence,
+        reset: formatRelative(reading.resetAt, now),
       });
     }
-    rows.push(...statusRowsForAccount(snap, now));
   }
-  const headers = {
-    provider: 'provider',
-    label: 'account',
-    window: 'bucket',
-    used: 'used',
-    left: 'left',
-    confidence: 'confidence',
-    reset: 'resets',
-  };
   const widths = {
-    provider: headers.provider.length,
-    label: headers.label.length,
-    window: headers.window.length,
-    used: headers.used.length,
-    left: headers.left.length,
-    confidence: headers.confidence.length,
-    reset: headers.reset.length,
+    provider: 'provider'.length,
+    label: 'account'.length,
+    bucket: 'bucket'.length,
+    usedPct: 'used'.length,
+    confidence: 'confidence'.length,
+    reset: 'resets'.length,
   };
   for (const row of rows) {
     widths.provider = Math.max(widths.provider, row.provider.length);
     widths.label = Math.max(widths.label, row.label.length);
-    widths.window = Math.max(widths.window, row.window.length);
-    widths.used = Math.max(widths.used, row.used.length);
-    widths.left = Math.max(widths.left, row.left.length);
+    widths.bucket = Math.max(widths.bucket, row.bucket.length);
+    widths.usedPct = Math.max(widths.usedPct, row.usedPct.length);
     widths.confidence = Math.max(widths.confidence, row.confidence.length);
-    widths.reset = Math.max(widths.reset, row.reset.length);
+    widths.reset = Math.max(widths.reset, `resets ${row.reset}`.length);
   }
-  const line = (row: {
-    provider: string;
-    label: string;
-    window: string;
-    used: string;
-    left: string;
-    confidence: string;
-    reset: string;
-  }): string =>
+  const line = (
+    provider: string,
+    label: string,
+    bucket: string,
+    usedPct: string,
+    confidence: string,
+    reset: string,
+  ): string =>
     [
-      padRight(row.provider, widths.provider),
-      padRight(row.label, widths.label),
-      padRight(row.window, widths.window),
-      padRight(row.used, widths.used),
-      padRight(row.left, widths.left),
-      padRight(row.confidence, widths.confidence),
-      padRight(row.reset, widths.reset),
+      pad(provider, widths.provider),
+      pad(label, widths.label),
+      pad(bucket, widths.bucket),
+      pad(usedPct, widths.usedPct),
+      pad(confidence, widths.confidence),
+      pad(reset, widths.reset),
     ].join(' | ');
-  const out = [line(headers)];
-  for (const row of rows) out.push(line(row));
+  const out = [line('provider', 'account', 'bucket', 'used', 'confidence', 'resets')];
+  for (const row of rows) {
+    out.push(
+      line(row.provider, row.label, row.bucket, row.usedPct, row.confidence, `resets ${row.reset}`),
+    );
+  }
   return out.join('\n');
 }
 

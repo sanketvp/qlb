@@ -12,7 +12,9 @@ import {
   formatResetAtLocal,
   formatResetClause,
   leftPct,
+  normalizeLeftPct,
   statusRowsForAccount,
+  type StatusDisplayRow,
 } from '../src/dashboard';
 import type { AccountSnapshot, BucketReading } from '../src/types';
 
@@ -130,25 +132,28 @@ describe('missing buckets and resetAt', () => {
     assert.match(text, /7d\s+not reported by openai-codex/);
   });
 
-  it('says the window has not started when a rolling bucket exists with usedPct 0 and null resetAt', () => {
+  it('does not guess that a rolling zero-usage bucket with no resetAt has not started', () => {
     const clause = formatResetClause({
-      provider: 'anthropic',
+      provider: 'synthetic',
       window: '5h',
       usedPct: 0,
     });
-    assert.equal(clause, 'reset: window not started (no usage yet)');
+    assert.equal(clause, 'reset: not reported by synthetic');
+    assert.doesNotMatch(clause, /window not started/);
     assert.doesNotMatch(clause, /(^| )-( |$)/);
 
     const account = snap({
       accountId: 'account-4',
-      label: 'sanket1@modustech.com',
+      provider: 'synthetic',
+      label: 'zero-usage-no-reset',
       buckets: {
         '5h': reading({ usedPct: 0 }),
         '7d': reading({ usedPct: 99, resetAt: 50_000 }),
       },
     });
     const text = dashboard([account], 1_000);
-    assert.match(text, /5h\s+0% used\s+100% left\s+authoritative\s+reset: window not started \(no usage yet\)/);
+    assert.match(text, /5h\s+0% used\s+100% left\s+authoritative\s+reset: not reported by synthetic/);
+    assert.doesNotMatch(text, /window not started/);
   });
 
   it('says not reported by the provider when a non-window bucket has no resetAt', () => {
@@ -281,21 +286,128 @@ describe('json decoration is additive', () => {
     assert.equal(decorated.resetInMs, null);
     assert.equal(decorated.resetAtLocal, null);
   });
+
+  it('rounds added leftPct to 1 decimal and leaves usedPct byte-identical', () => {
+    const noisyUsed = 98.70861418600001;
+    const account = snap({
+      accountId: 'a',
+      buckets: { credits: reading({ usedPct: noisyUsed }) },
+    });
+    const decorated = decorateStatusJson([account], 1)[0].buckets.credits as BucketReading & {
+      leftPct: number;
+    };
+    assert.equal(decorated.usedPct, noisyUsed);
+    assert.equal(decorated.leftPct, 1.3);
+    assert.equal(JSON.stringify(decorated.leftPct), '1.3');
+    assert.doesNotMatch(JSON.stringify(decorated.leftPct), /000000/);
+  });
 });
 
-describe('flat table', () => {
-  it('includes used and left columns and never a bare dash for missing windows', () => {
-    const text = formatFlatTable([
-      snap({
-        accountId: 'codex',
-        provider: 'openai-codex',
-        label: 'codex',
-        buckets: {},
-      }),
-    ]);
-    assert.match(text, /provider/);
-    assert.match(text, /left/);
-    assert.match(text, /not reported by openai-codex/);
-    assert.doesNotMatch(text, /resets -/);
+describe('displayed remaining and LOW/EXHAUSTED markers share one value', () => {
+  function rowForLeft(remaining: number): StatusDisplayRow {
+    const account = snap({
+      accountId: 'a',
+      buckets: { '5h': reading({ usedPct: 100 - remaining, resetAt: 2_000 }) },
+    });
+    return statusRowsForAccount(account, 1_000)[0];
+  }
+
+  function assertAgree(
+    remaining: number,
+    expectedLeft: string,
+    expectedMarker: '' | 'LOW' | 'EXHAUSTED',
+  ): void {
+    const row = rowForLeft(remaining);
+    const printedLeft = expectedMarker ? `${expectedLeft} ${expectedMarker}` : expectedLeft;
+    assert.equal(row.left, printedLeft, `left string for remaining=${remaining}`);
+    assert.equal(row.marker, expectedMarker, `marker for remaining=${remaining}`);
+    assert.equal(row.exhausted, expectedMarker === 'EXHAUSTED');
+    assert.equal(row.low, expectedMarker === 'LOW');
+    assert.equal(normalizeLeftPct(remaining), expectedMarker === 'EXHAUSTED' ? 0 : Number.parseFloat(expectedLeft));
+    if (expectedLeft === '0%') assert.equal(expectedMarker, 'EXHAUSTED');
+    if (expectedLeft === '5%') assert.equal(expectedMarker, 'LOW');
+    if (row.exhausted) {
+      assert.match(row.detail, /(^|\s)0% left\s+EXHAUSTED/);
+    } else {
+      assert.doesNotMatch(row.left, /^0%/);
+      assert.doesNotMatch(row.detail, /(^|\s)0% left/);
+    }
+    if (row.low) assert.match(row.detail, /LOW/);
+    else assert.doesNotMatch(row.detail, /\bLOW\b/);
+  }
+
+  it('prints 0% left as EXHAUSTED and never shows 0% without that marker', () => {
+    assertAgree(0, '0%', 'EXHAUSTED');
+  });
+
+  it('does not round a positive remainder down to 0% (0.04 → 0.1% LOW)', () => {
+    assertAgree(0.04, '0.1%', 'LOW');
+  });
+
+  it('keeps 0.1% left as LOW', () => {
+    assertAgree(0.1, '0.1%', 'LOW');
+  });
+
+  it('prints 5% left as LOW', () => {
+    assertAgree(5, '5%', 'LOW');
+  });
+
+  it('does not display a value above LOW as exactly 5% (5.04 → 5.1%, not LOW)', () => {
+    assertAgree(5.04, '5.1%', '');
+  });
+
+  it('prints 100% left with no marker', () => {
+    assertAgree(100, '100%', '');
+  });
+});
+
+describe('flat table is the original raw bucket table', () => {
+  it('keeps raw weekly, original 6 columns, and no synthetic rows', () => {
+    const now = 1_000;
+    const text = formatFlatTable(
+      [
+        snap({
+          accountId: 'kimi-default',
+          provider: 'kimi-coding',
+          label: 'Kimi K3',
+          buckets: {
+            '5h': reading({ usedPct: 10 }),
+            weekly: reading({ usedPct: 57 }),
+          },
+        }),
+        snap({
+          accountId: 'codex',
+          provider: 'openai-codex',
+          label: 'codex',
+          buckets: {},
+        }),
+        snap({
+          accountId: 'broken',
+          provider: 'openai-codex',
+          label: 'broken',
+          buckets: {},
+          error: 'no credentials',
+        }),
+      ],
+      now,
+    );
+    const lines = text.split('\n');
+    const headerCols = lines[0].split(' | ').map((c) => c.trim());
+    assert.deepEqual(headerCols, ['provider', 'account', 'bucket', 'used', 'confidence', 'resets']);
+    assert.equal(headerCols.length, 6);
+    assert.doesNotMatch(lines[0], /left/);
+    assert.equal(
+      text,
+      [
+        'provider     | account | bucket | used | confidence    | resets               ',
+        'kimi-coding  | Kimi K3 | 5h     | 10%  | authoritative | resets -             ',
+        'kimi-coding  | Kimi K3 | weekly | 57%  | authoritative | resets -             ',
+        'openai-codex | broken  | -      | -    | error         | resets no credentials',
+      ].join('\n'),
+    );
+    assert.match(text, /weekly/);
+    assert.doesNotMatch(text, /\| 7d /);
+    assert.doesNotMatch(text, /codex \| 5h/);
+    assert.doesNotMatch(text, /not reported/);
   });
 });
