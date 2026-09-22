@@ -81,7 +81,7 @@ const USAGE = `Usage:
   qlb policy set --harness <h> --virtual-model <name> --real-model <id> --effort <lvl> [--fallback m1,m2] [--session-mode header|anon] [--db <path>] [--json]
   qlb policy list [--harness <h>] [--db <path>] [--json]
   qlb gate codex [--json] [--db <path>]
-  qlb proxy [--info-path <path>] [--idle-ms <n>] [--db <path>]
+  qlb proxy [--info-path <path>] [--idle-ms <n>] [--port <n>] [--db <path>]
   qlb migrate stage    [--provider anthropic|xai|kimi-coding|openai-codex|openrouter] --pool-file <path> --owner-file <path> [--auth-json <path>] [--db <path>] [--target-dir <path>] [--confirm-real-cutover]
   qlb migrate rehearse [--provider anthropic|xai|kimi-coding|openai-codex|openrouter] --pool-file <path> --owner-file <path> [--auth-json <path>] [--db <path>] [--target-dir <path>] [--confirm-real-cutover]
   qlb migrate commit   [--provider anthropic|xai|kimi-coding|openai-codex|openrouter] --pool-file <path> --owner-file <path> [--auth-json <path>] [--db <path>] [--target-dir <path>] [--confirm-real-cutover]
@@ -226,6 +226,7 @@ type ProxyOpts = {
   db?: string;
   infoPath?: string;
   idleMs?: number;
+  port?: number;
 };
 type RetireSub = 'status' | 'execute';
 type RetireOpts = {
@@ -472,6 +473,7 @@ function parseProxyArgs(argsIn: string[]): ProxyOpts {
   const db = takeFlag(args, '--db');
   const infoPath = takeFlag(args, '--info-path');
   const idleRaw = takeFlag(args, '--idle-ms');
+  const portRaw = takeFlag(args, '--port');
   if (args.length > 0) {
     console.error(`qlb proxy: unknown argument ${args[0]}`);
     process.exit(1);
@@ -481,7 +483,12 @@ function parseProxyArgs(argsIn: string[]): ProxyOpts {
     console.error('qlb proxy: --idle-ms must be a positive number');
     process.exit(1);
   }
-  return { cmd: 'proxy', json, db, infoPath, idleMs };
+  const port = portRaw != null ? Number(portRaw) : undefined;
+  if (portRaw != null && (!Number.isInteger(port) || (port ?? 0) < 1 || (port ?? 0) > 65535)) {
+    console.error('qlb proxy: --port must be an integer between 1 and 65535');
+    process.exit(1);
+  }
+  return { cmd: 'proxy', json, db, infoPath, idleMs, port };
 }
 
 function parseAccountsArgs(argsIn: string[]): AccountsOpts {
@@ -1289,6 +1296,7 @@ async function runProxy(opts: ProxyOpts): Promise<number> {
     store,
     infoPath: opts.infoPath,
     idleTimeoutMs: opts.idleMs,
+    port: opts.port,
     getCredentialForAccount: createOwnedCredentialSource({
       store,
       keychain: platformKeychain,

@@ -156,6 +156,29 @@ describe('qlb-proxy — loopback helper §4.9.2 / §4.9.3', () => {
     }
   });
 
+  it('binds a fixed loopback port when `port` is given', async () => {
+    const store = openStore(':memory:');
+    // Reserve then release a free port so the test is deterministic.
+    const probe = http.createServer();
+    await new Promise<void>((resolve) => probe.listen(0, PROXY_BIND_HOST, () => resolve()));
+    const wanted = (probe.address() as AddressInfo).port;
+    await new Promise<void>((resolve) => probe.close(() => resolve()));
+    const proxy = new LoopbackProxy({
+      store,
+      infoPath: join(tmp(), 'proxy.json'),
+      port: wanted,
+      getCredentialForAccount: async () => 'upstream-secret',
+    });
+    try {
+      const info = await proxy.start();
+      assert.equal(info.port, wanted);
+      assert.equal(proxy.address().address, PROXY_BIND_HOST);
+    } finally {
+      await proxy.stop();
+      store.close();
+    }
+  });
+
   it('requests without the bearer token get 401 BEFORE the mock upstream is called', async () => {
     const store = openStore(':memory:');
     seedAnthropic(store);
@@ -240,6 +263,91 @@ describe('qlb-proxy — loopback helper §4.9.2 / §4.9.3', () => {
       assert.ok(seenBody && typeof seenBody === 'object');
       assert.equal((seenBody as { model: string }).model, 'claude-sonnet-5');
       assert.deepEqual(r.json, { type: 'message', id: 'msg_mock' });
+    } finally {
+      await proxy.stop();
+      mock.server.close();
+      store.close();
+    }
+  });
+
+  it('claude-code harness: generic client gets Claude Code OAuth identity injected upstream', async () => {
+    const store = openStore(':memory:');
+    seedAnthropic(store);
+    let seenHeaders: http.IncomingHttpHeaders = {};
+    let seenBody: { system?: unknown } = {};
+    const mock = await listenMock((req, res) => {
+      seenHeaders = req.headers;
+      const chunks: Buffer[] = [];
+      req.on('data', (c: Buffer) => chunks.push(c));
+      req.on('end', () => {
+        seenBody = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end('{}');
+      });
+    });
+    const proxy = await startProxy({ store, mockUrl: mock.url });
+    try {
+      // Generic client: third-party-style headers, plain string system, own betas.
+      const r = await post(
+        proxy.proxyInfo.port,
+        '/v1/messages',
+        { model: 'claude-sonnet-5--qlb-high', messages: [], system: 'You are Hermes.' },
+        proxy.proxyInfo.token,
+        { 'anthropic-beta': 'interleaved-thinking-2025-05-14', 'user-agent': 'python-sdk/1.0' },
+      );
+      assert.equal(r.status, 200);
+      const betas = String(seenHeaders['anthropic-beta']).split(',');
+      assert.ok(betas.includes('interleaved-thinking-2025-05-14'), 'client betas preserved');
+      assert.ok(betas.includes('oauth-2025-04-20'));
+      assert.ok(betas.includes('claude-code-20250219'));
+      assert.match(String(seenHeaders['user-agent']), /^claude-code\/\d+\.\d+\.\d+ \(external, cli\)$/);
+      assert.equal(seenHeaders['x-app'], 'cli');
+      const sys = seenBody.system as Array<{ type: string; text: string }>;
+      assert.ok(Array.isArray(sys));
+      assert.equal(sys[0].text, "You are Claude Code, Anthropic's official CLI for Claude.");
+      assert.equal(sys[1].text, 'You are Hermes.');
+    } finally {
+      await proxy.stop();
+      mock.server.close();
+      store.close();
+    }
+  });
+
+  it('claude-code harness: a client already sending the identity is forwarded unchanged', async () => {
+    const store = openStore(':memory:');
+    seedAnthropic(store);
+    let seenHeaders: http.IncomingHttpHeaders = {};
+    let seenBody: { system?: unknown } = {};
+    const mock = await listenMock((req, res) => {
+      seenHeaders = req.headers;
+      const chunks: Buffer[] = [];
+      req.on('data', (c: Buffer) => chunks.push(c));
+      req.on('end', () => {
+        seenBody = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        res.writeHead(200);
+        res.end('{}');
+      });
+    });
+    const proxy = await startProxy({ store, mockUrl: mock.url });
+    try {
+      const system = [
+        { type: 'text', text: "You are Claude Code, Anthropic's official CLI for Claude." },
+        { type: 'text', text: 'rest' },
+      ];
+      await post(
+        proxy.proxyInfo.port,
+        '/v1/messages',
+        { model: 'claude-sonnet-5--qlb-high', messages: [], system },
+        proxy.proxyInfo.token,
+        {
+          'anthropic-beta': 'oauth-2025-04-20,claude-code-20250219',
+          'user-agent': 'claude-code/2.1.99 (external, cli)',
+          'x-app': 'cli',
+        },
+      );
+      assert.equal(seenHeaders['anthropic-beta'], 'oauth-2025-04-20,claude-code-20250219');
+      assert.equal(seenHeaders['user-agent'], 'claude-code/2.1.99 (external, cli)');
+      assert.deepEqual(seenBody.system, system);
     } finally {
       await proxy.stop();
       mock.server.close();

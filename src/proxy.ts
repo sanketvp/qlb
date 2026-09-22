@@ -21,6 +21,7 @@ import {
 } from './policy';
 import { resolveFromSnapshots, snapshotsFromStore } from './resolve';
 import { config } from './config';
+import { claudeCodeIdentityHeaders, ensureClaudeCodeSystemPrefix } from './claude-code-identity';
 import {
   attemptWithNativeResyncRetry,
   nativeResyncAuditEntry,
@@ -67,6 +68,8 @@ export interface ProxyOptions {
   /** Tests MUST pass a temp path. Default is ~/.qlb/proxy.json. */
   infoPath?: string;
   idleTimeoutMs?: number;
+  /** Fixed loopback port. Default 0 = ephemeral (OS-assigned). */
+  port?: number;
   getCredentialForAccount: GetCredentialForAccount;
   /**
    * Optional. When set, an upstream 401 triggers exactly one native-resync
@@ -358,6 +361,7 @@ export class LoopbackProxy {
   private readonly onIdle?: () => void;
   private readonly token: string;
   private readonly startedAt: number;
+  private readonly requestedPort: number;
   private server: http.Server | null = null;
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
   private inFlight = 0;
@@ -370,6 +374,7 @@ export class LoopbackProxy {
     this.store = opts.store;
     this.infoPath = opts.infoPath ?? DEFAULT_PROXY_INFO_PATH;
     this.idleTimeoutMs = opts.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
+    this.requestedPort = opts.port ?? 0;
     this.getCredential = opts.getCredentialForAccount;
     this.resyncFromNative = opts.resyncFromNative;
     this.upstreams = {
@@ -404,7 +409,7 @@ export class LoopbackProxy {
     await new Promise<void>((resolve, reject) => {
       this.server!.once('error', reject);
       // Hardcoded loopback. Never bind 0.0.0.0 / :: .
-      this.server!.listen(0, PROXY_BIND_HOST, () => resolve());
+      this.server!.listen(this.requestedPort, PROXY_BIND_HOST, () => resolve());
     });
 
     const addr = this.address();
@@ -634,6 +639,9 @@ export class LoopbackProxy {
     let effortRaised = false;
     if (harness === 'codex') {
       effortRaised = applyCodexEffort(rewrite, policy.effort);
+    } else if (pathname === '/v1/messages') {
+      // OAuth bearer + missing Claude Code identity → upstream 429 "Error". Idempotent.
+      ensureClaudeCodeSystemPrefix(rewrite);
     }
     const forwardBody = Buffer.from(JSON.stringify(rewrite));
 
@@ -641,7 +649,7 @@ export class LoopbackProxy {
       authorization: `Bearer ${credential}`,
     };
     if (harness === 'claude-code') {
-      extra['anthropic-beta'] = 'oauth-2025-04-20';
+      Object.assign(extra, claudeCodeIdentityHeaders(req.headers));
     } else {
       extra['chatgpt-account-id'] = decision.accountId;
       extra.originator = 'codex_cli_rs';
