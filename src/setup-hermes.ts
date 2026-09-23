@@ -42,6 +42,8 @@ export interface HermesSetupResult {
   files: HermesSetupFile[];
   launchd?: { label: string; action: 'bootstrapped' | 'restarted' | 'skipped'; detail?: string };
   watch?: { label: string; action: 'bootstrapped' | 'restarted' | 'skipped'; detail?: string };
+  /** Output of qlb-hermes-models (Hermes /model picker synced from QLB policies). */
+  models?: string;
   instructions: string;
 }
 
@@ -87,8 +89,10 @@ export function hermesInstructions(opts: { hermesHome: string; port: number; key
     '  hermes config set updates.parked_branch_strategy update_in_place   # keep local commits across hermes update',
     '',
     'Policies: every model Hermes may request needs a QLB policy, e.g.',
-    '  qlb policy set --harness claude-code --virtual-model claude-opus-5.5 --real-model claude-opus-5-5 --effort high',
+    '  qlb policy set --harness claude-code --virtual-model claude-opus-5-5 --real-model claude-opus-5-5 --effort high',
     '  qlb policy set --harness codex --virtual-model gpt-5.6-sol --real-model gpt-5.6-sol --effort medium',
+    'Then sync the Hermes /model picker from those policies (setup hermes does this too):',
+    `  ${join(opts.hermesHome, 'scripts', 'qlb-hermes-models')}`,
     '',
     'Verify:  qlb doctor --live      (hermes:* checks)   then   hermes chat -q "Reply: OK"',
   ].join('\n');
@@ -112,6 +116,8 @@ export function setupHermes(opts: HermesSetupOptions = {}): HermesSetupResult {
   files.push(writeIfChanged(keyCmd, readFileSync(join(tpl, 'qlb-proxy-token'), 'utf8'), 0o755));
   const watchScript = join(hermesHome, 'scripts', 'qlb-hermes-watch');
   files.push(writeIfChanged(watchScript, readFileSync(join(tpl, 'qlb-hermes-watch'), 'utf8'), 0o755));
+  const modelsScript = join(hermesHome, 'scripts', 'qlb-hermes-models');
+  files.push(writeIfChanged(modelsScript, readFileSync(join(tpl, 'qlb-hermes-models'), 'utf8'), 0o755));
 
   let launchd: HermesSetupResult['launchd'];
   let watch: HermesSetupResult['watch'];
@@ -143,9 +149,20 @@ export function setupHermes(opts: HermesSetupOptions = {}): HermesSetupResult {
     watch = installAgent(HERMES_WATCH_LABEL, 'com.qlb.hermes-watch.plist.template');
   }
 
+  // Sync the Hermes /model picker from QLB policies (skipped when hermes isn't on PATH or in tests).
+  let models: string | undefined;
+  if (!opts.noLaunchd) {
+    try {
+      models = execFileSync('/bin/bash', [modelsScript], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000 }).trim();
+    } catch (err) {
+      models = `models sync skipped: ${err instanceof Error ? err.message.split('\n')[0] : String(err)}`;
+    }
+  }
+
   return {
     harness: 'hermes',
     files,
+    ...(models ? { models } : {}),
     ...(launchd ? { launchd } : {}),
     ...(watch ? { watch } : {}),
     instructions: hermesInstructions({ hermesHome, port, keyCmd }),

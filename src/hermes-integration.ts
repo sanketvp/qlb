@@ -208,6 +208,28 @@ export function hermesIntegrationChecks(options: HermesIntegrationOptions = {}):
 
   checks.push(pluginCheck());
 
+  // 7. Hermes /model picker lists what QLB policies serve (canonical ids, virtual == real).
+  try {
+    const raw = run(process.env.QLB_BIN ?? 'qlb', ['policy', 'list', '--json'], { timeoutMs: 20_000 });
+    const pols = (JSON.parse(raw.slice(raw.indexOf('{'))) as { policies?: Array<{ harness: string; virtualModel: string; realModel: string }> }).policies ?? [];
+    const want: Record<string, Set<string>> = { 'qlb-anthropic': new Set(), 'qlb-codex': new Set() };
+    for (const p of pols) {
+      const prov = p.harness === 'claude-code' ? 'qlb-anthropic' : p.harness === 'codex' ? 'qlb-codex' : null;
+      if (prov && p.virtualModel === p.realModel) want[prov].add(p.virtualModel);
+    }
+    const missing: string[] = [];
+    for (const [prov, models] of Object.entries(want)) {
+      const block = new RegExp(`\\n\\s{2}${prov}:\\n((?:\\s{4}.*\\n)+)`).exec(cfg ?? '')?.[1] ?? '';
+      const modelsBlock = /\n\s{4}models:\n((?:\s{6}.*\n)+)/.exec(block)?.[1] ?? '';
+      for (const m of models) if (!new RegExp(`^\\s{6}${m.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}:`, 'm').test(modelsBlock)) missing.push(`${prov}/${m}`);
+    }
+    checks.push(missing.length === 0
+      ? { name: 'hermes:models', level: 'PASS', message: `Hermes /model picker lists all ${Object.values(want).reduce((n, s) => n + s.size, 0)} QLB-served models` }
+      : { name: 'hermes:models', level: 'WARN', message: `Hermes /model picker is missing QLB models: ${missing.join(', ')}`, detail: { fix: '~/.hermes/scripts/qlb-hermes-models   (or qlb setup hermes)' } });
+  } catch (err) {
+    checks.push({ name: 'hermes:models', level: 'WARN', message: `could not compare picker with policies: ${err instanceof Error ? err.message.split('\n')[0] : String(err)}` });
+  }
+
   // 6. Hermes version marker so a drift report can say "since <sha>".
   try {
     const sha = readText(join(HERMES_CHECKOUT, '.git', gitHead.startsWith('ref: ') ? gitHead.slice(5) : 'HEAD'))?.trim().slice(0, 12);

@@ -1610,6 +1610,7 @@ async function main(): Promise<void> {
         for (const a of [result.launchd, result.watch]) {
           if (a) console.log(`launchd   ${a.label}: ${a.action}${a.detail ? ` (${a.detail})` : ''}`);
         }
+        if (result.models) for (const line of result.models.split('\n')) console.log(`models    ${line}`);
         console.log('');
         console.log(result.instructions);
       }
