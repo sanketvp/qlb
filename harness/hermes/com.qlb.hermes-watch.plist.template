@@ -19,6 +19,7 @@
     <string>__HOME__/.hermes/hermes-agent/.git/HEAD</string>
     <string>__HOME__/.hermes/hermes-agent/.git/refs/heads</string>
     <string>__HOME__/.hermes/hermes-agent/.git/ORIG_HEAD</string>
+    <string>/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/package.json</string>
   </array>
   <!-- ... and once a day regardless. -->
   <key>StartInterval</key><integer>86400</integer>
