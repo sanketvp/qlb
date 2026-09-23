@@ -1,0 +1,27 @@
+#!/bin/bash
+# qlb-proxy-token — key_cmd helper for Hermes.
+# Prints ONLY the current QLB proxy bearer token on stdout (key_cmd contract).
+# Ensures the proxy is up first (launchd keeps it alive; this is a safety net).
+set -euo pipefail
+INFO="${QLB_PROXY_INFO:-$HOME/.qlb/proxy.json}"
+PORT="${QLB_PROXY_PORT:-47391}"
+
+alive() {
+  [ -f "$INFO" ] || return 1
+  local tok
+  tok=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['token'])" "$INFO" 2>/dev/null) || return 1
+  curl -fsS -m 2 -H "Authorization: Bearer $tok" "http://127.0.0.1:$PORT/qlb/health" >/dev/null 2>&1
+}
+
+if ! alive; then
+  launchctl kickstart -k "gui/$(id -u)/${QLB_LAUNCHD_LABEL:-com.sanket.qlb-proxy}" >/dev/null 2>&1 || true
+  for _ in $(seq 1 25); do alive && break; sleep 0.2; done
+fi
+alive || { echo "qlb-proxy-token: proxy not reachable on 127.0.0.1:$PORT" >&2; exit 1; }
+python3 - "$INFO" <<'EOF'
+import json, sys
+info = json.load(open(sys.argv[1]))
+# key_cmd accepts JSON with access_token; no expires_in → Hermes re-mints on a bounded window,
+# so a proxy restart (new token) is picked up without a Hermes restart.
+print(json.dumps({"access_token": info["token"], "expires_in": 300}))
+EOF

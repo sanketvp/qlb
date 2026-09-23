@@ -25,6 +25,7 @@ import {
   type ResyncCredential,
 } from './native-resync';
 import type { AccountSnapshot, Adapter } from './types';
+import { hermesIntegrationChecks } from './hermes-integration';
 
 export type CheckLevel = 'PASS' | 'WARN' | 'FAIL';
 
@@ -411,6 +412,14 @@ export async function doctorQlb(
         detail: { provider: row.provider, matches: row.matches },
       });
     }
+  }
+
+  // Hermes integration (external to the Hermes checkout): config, plugin, local fix, supervisor,
+  // and — with --live — the exact Hermes symbols the plugin patches. Never throws.
+  try {
+    checks.push(...hermesIntegrationChecks({ probeSeams: options.live === true }));
+  } catch (err) {
+    checks.push({ name: 'hermes', level: 'WARN', message: `hermes checks failed: ${err instanceof Error ? err.message : String(err)}` });
   }
 
   const providers = inspectProviders(config, options.command);

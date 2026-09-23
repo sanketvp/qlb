@@ -50,6 +50,7 @@ import {
   overrideFromStore,
 } from './dashboard';
 import { isSetupHarness, setupHarness, type SetupHarness } from './setup';
+import { setupHermes } from './setup-hermes';
 import { formatRefresh, refreshCommand, runRefresh } from './refresh';
 import { DEFAULT_AUDIT_LIMIT, formatAudit, toAuditDecision } from './audit';
 import { DEFAULT_WHY_MODEL, explainWhy, formatWhyHuman } from './why';
@@ -70,7 +71,7 @@ const USAGE = `Usage:
   qlb refresh [--allow-probe] [--json]
   qlb native-resync --provider anthropic|xai|kimi-coding|openai-codex|openrouter --account <id> [--json] [--db <path>]
   qlb status [--json] [--dashboard|--flat]
-  qlb setup pi|claude-code|codex-cli|generic [--json]
+  qlb setup pi|claude-code|codex-cli|generic|hermes [--json]
   qlb resolve --model <modelId> [--fallback m1,m2,...] [--session <id>] [--harness pi|claude-code|codex|dispatch] [--effort <lvl>] [--strategy headroom|spread|round-robin|failover] [--json]
   qlb why [--model <modelId>] [--fallback m1,m2,...] [--session <id>] [--strategy headroom|spread|round-robin|failover] [--json]
   qlb override pin --session <id> --account <account-id> [--until <ISO-datetime|2h>] [--db <path>] [--json]
@@ -118,7 +119,9 @@ times). Pass --flat for the original bucket table. --json keeps
 {fetchedAt, accounts} and adds ownership, override, health, healthGlyph
 on each account (additive; existing fields unchanged).
 qlb setup prints copy-paste snippets only and never edits files outside
-this repo (setup pi writes scripts/hooks/pi-advisory.sh here).
+this repo (setup pi writes scripts/hooks/pi-advisory.sh here), except
+setup hermes, which installs QLB's own files under ~/.hermes/{plugins,scripts}
+and ~/Library/LaunchAgents — never inside the hermes-agent checkout.
 qlb override pin/reserve/drain-first: --until defaults to 24h from now when
 omitted (ISO datetime or duration like 2h/30m/1d). Pin forces that account
 for one session id; reserve excludes an account from automatic selection;
@@ -127,7 +130,7 @@ qlb audit is read-only: last N routing decisions (default 20, newest first).
 Empty store prints "no decisions" or [].`;
 
 type StatusOpts = { cmd: 'status'; json: boolean; view: 'dashboard' | 'flat' };
-type SetupOpts = { cmd: 'setup'; json: boolean; harness: SetupHarness };
+type SetupOpts = { cmd: 'setup'; json: boolean; harness: SetupHarness | 'hermes' };
 type InitOpts = { cmd: 'init'; json: boolean };
 type DoctorOpts = { cmd: 'doctor'; json: boolean; live: boolean };
 type RefreshOpts = { cmd: 'refresh'; json: boolean; allowProbe: boolean };
@@ -623,9 +626,9 @@ function parseSetupArgs(argsIn: string[]): SetupOpts {
     console.error(USAGE);
     process.exit(1);
   }
-  if (!isSetupHarness(harness)) {
+  if (harness !== 'hermes' && !isSetupHarness(harness)) {
     console.error(
-      'qlb setup: harness is required (pi|claude-code|codex-cli|generic)',
+      'qlb setup: harness is required (pi|claude-code|codex-cli|generic|hermes)',
     );
     console.error(USAGE);
     process.exit(1);
@@ -1597,8 +1600,27 @@ async function main(): Promise<void> {
       process.exit(1);
     }
   }
+  if (opts.cmd === 'setup' && opts.harness === 'hermes') {
+    try {
+      const result = setupHermes();
+      if (opts.json) {
+        console.log(JSON.stringify(result, null, 2));
+      } else {
+        for (const f of result.files) console.log(`${f.action.padEnd(9)} ${f.path}`);
+        for (const a of [result.launchd, result.watch]) {
+          if (a) console.log(`launchd   ${a.label}: ${a.action}${a.detail ? ` (${a.detail})` : ''}`);
+        }
+        console.log('');
+        console.log(result.instructions);
+      }
+      process.exit(0);
+    } catch (err) {
+      console.error(`qlb setup hermes: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+  }
   if (opts.cmd === 'setup') {
-    const result = setupHarness(opts.harness);
+    const result = setupHarness(opts.harness as SetupHarness);
     if (opts.json) {
       console.log(JSON.stringify(result, null, 2));
     } else {
