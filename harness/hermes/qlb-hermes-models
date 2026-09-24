@@ -1,0 +1,55 @@
+#!/bin/bash
+# qlb-hermes-models — sync Hermes's `providers.qlb-*.models` from QLB policies so the /model
+# picker lists exactly what QLB will serve. Idempotent; prints a diff summary.
+# Run after `qlb policy set ...` (or `qlb setup hermes` calls it for you).
+set -euo pipefail
+QLB="${QLB_BIN:-$(command -v qlb || echo /opt/homebrew/bin/qlb)}"
+HERMES="${HERMES_BIN:-$(command -v hermes || echo "$HOME/.local/bin/hermes")}"
+
+POLICIES=$("$QLB" policy list --json 2>/dev/null)
+python3 - "$HERMES" "$POLICIES" <<'EOF'
+import json, subprocess, sys
+hermes = sys.argv[1]
+pols = json.loads(sys.argv[2])["policies"]
+
+# QLB harness -> Hermes provider entry. Virtual model = what the user picks; QLB maps it to real.
+HARNESS_TO_PROVIDER = {"claude-code": "qlb-anthropic", "codex": "qlb-codex"}
+# Context windows per real-model family (Hermes uses this for compression thresholds).
+def ctx(real):
+    r = real.lower()
+    if "fable" in r or "opus-5" in r or "sonnet-5" in r: return 1_000_000
+    if "gpt-6" in r or "gpt-5.6" in r or "gpt-5.5" in r: return 400_000
+    return 200_000
+
+wanted = {}
+for p in pols:
+    prov = HARNESS_TO_PROVIDER.get(p["harness"])
+    if not prov: continue
+    v, real = p["virtualModel"], p["realModel"]
+    # Hide pure alias rows (dotted/dashed twins) so the picker isn't cluttered: keep the canonical
+    # id (== realModel) plus any virtual that maps to a *different* real (a genuine alias the user
+    # may still type, e.g. claude-opus-5 -> claude-opus-5-5) only once per real.
+    entry = wanted.setdefault(prov, {})
+    if v == real:
+        entry[v] = {"context_length": ctx(real)}
+    elif not any(m.startswith(real) for m in entry) and real not in entry:
+        entry[v] = {"context_length": ctx(real), "note": f"served as {real}"}
+
+for prov, models in wanted.items():
+    # canonical rows win over aliases mapping to them
+    reals = {m for m, meta in models.items() if "note" not in meta}
+    models = {m: meta for m, meta in models.items() if "note" not in meta or meta["note"].split()[-1] not in reals}
+    cur = subprocess.run([hermes, "config", "get", f"providers.{prov}.models"], capture_output=True, text=True).stdout
+    current = set()
+    for line in cur.splitlines():
+        line = line.strip()
+        if line.endswith(":") and not line.startswith("-") and line[:-1] not in ("context_length", "note"):
+            current.add(line[:-1])
+    if current == set(models):
+        print(f"{prov}: {len(models)} models (unchanged)")
+        continue
+    subprocess.run([hermes, "config", "set", f"providers.{prov}.models", json.dumps(models)], check=True,
+                   capture_output=True, text=True)
+    added, removed = sorted(set(models) - current), sorted(current - set(models))
+    print(f"{prov}: {len(models)} models" + (f"  +{added}" if added else "") + (f"  -{removed}" if removed else ""))
+EOF

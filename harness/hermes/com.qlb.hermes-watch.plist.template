@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>__LABEL__</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>__HOME__/.hermes/scripts/qlb-hermes-watch</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>__HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>HOME</key><string>__HOME__</string>
+  </dict>
+  <!-- Fire when the Hermes checkout's HEAD ref changes (hermes update) ... -->
+  <key>WatchPaths</key>
+  <array>
+    <string>__HOME__/.hermes/hermes-agent/.git/HEAD</string>
+    <string>__HOME__/.hermes/hermes-agent/.git/refs/heads</string>
+    <string>__HOME__/.hermes/hermes-agent/.git/ORIG_HEAD</string>
+    <string>/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/package.json</string>
+  </array>
+  <!-- ... and once a day regardless. -->
+  <key>StartInterval</key><integer>86400</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>__HOME__/.qlb/hermes-watch.log</string>
+  <key>StandardErrorPath</key><string>__HOME__/.qlb/hermes-watch.log</string>
+</dict>
+</plist>

@@ -1,0 +1,4 @@
+kind: model-provider
+name: qlb
+version: 0.1.0
+description: "Treat the local QLB proxy (127.0.0.1:<port from ~/.qlb/proxy.json>) as a Claude Code OAuth route so Hermes applies its OAuth payload identity."
