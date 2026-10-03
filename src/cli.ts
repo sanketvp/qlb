@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { existsSync, mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
+import * as net from 'node:net';
 import { dirname, join } from 'node:path';
 import { adapters } from './adapters';
 import { createDefaultCodexGateDeps, runCodexGate } from './codex-gate';
@@ -6,6 +8,10 @@ import { config, stripConfigArgs } from './config';
 import { doctorQlb, initializeQlb, type DoctorReport, type InitReport } from './diagnostics';
 import { platformKeychain } from './keychain';
 import { createOwnedCredentialSource } from './credentials';
+import {
+  CSWAP_ANTHROPIC_STORE,
+  CONSUME_STATE,
+} from './cswap-consume';
 import {
   bindDetectAndResync,
   createNativeCredentialReader,
@@ -40,14 +46,17 @@ import {
 } from './retire';
 import { pruneAccount, PruneRefusedError } from './accounts-prune';
 import {
+  decorateStatusJson,
   enrichAccounts,
   formatDashboard,
+  formatFlatTable,
   formatRelative,
   formatUsedPct,
   makeOwnershipReader,
   overrideFromStore,
 } from './dashboard';
 import { isSetupHarness, setupHarness, type SetupHarness } from './setup';
+import { setupHermes } from './setup-hermes';
 import { formatRefresh, refreshCommand, runRefresh } from './refresh';
 import { DEFAULT_AUDIT_LIMIT, formatAudit, toAuditDecision } from './audit';
 import { DEFAULT_WHY_MODEL, explainWhy, formatWhyHuman } from './why';
@@ -61,7 +70,6 @@ import {
   walSidecarUnreadableMessage,
   type Store,
 } from './store';
-import type { AccountSnapshot } from './types';
 
 const USAGE = `Usage:
   qlb init [--json]
@@ -69,7 +77,7 @@ const USAGE = `Usage:
   qlb refresh [--allow-probe] [--json]
   qlb native-resync --provider anthropic|xai|kimi-coding|openai-codex|openrouter --account <id> [--json] [--db <path>]
   qlb status [--json] [--dashboard|--flat]
-  qlb setup pi|claude-code|codex-cli|generic [--json]
+  qlb setup pi|claude-code|codex-cli|generic|hermes [--json]
   qlb resolve --model <modelId> [--fallback m1,m2,...] [--session <id>] [--harness pi|claude-code|codex|dispatch] [--effort <lvl>] [--strategy headroom|spread|round-robin|failover] [--json]
   qlb why [--model <modelId>] [--fallback m1,m2,...] [--session <id>] [--strategy headroom|spread|round-robin|failover] [--json]
   qlb override pin --session <id> --account <account-id> [--until <ISO-datetime|2h>] [--db <path>] [--json]
@@ -80,7 +88,8 @@ const USAGE = `Usage:
   qlb policy set --harness <h> --virtual-model <name> --real-model <id> --effort <lvl> [--fallback m1,m2] [--session-mode header|anon] [--db <path>] [--json]
   qlb policy list [--harness <h>] [--db <path>] [--json]
   qlb gate codex [--json] [--db <path>]
-  qlb proxy [--info-path <path>] [--idle-ms <n>] [--db <path>]
+  qlb proxy [--info-path <path>] [--idle-ms <n>] [--no-idle] [--port <n>] [--started-by wrapper|cli] [--db <path>]
+  qlb consume enable|disable|status --provider anthropic [--json] [--db <path>]
   qlb migrate stage    [--provider anthropic|xai|kimi-coding|openai-codex|openrouter] --pool-file <path> --owner-file <path> [--auth-json <path>] [--db <path>] [--target-dir <path>] [--confirm-real-cutover]
   qlb migrate rehearse [--provider anthropic|xai|kimi-coding|openai-codex|openrouter] --pool-file <path> --owner-file <path> [--auth-json <path>] [--db <path>] [--target-dir <path>] [--confirm-real-cutover]
   qlb migrate commit   [--provider anthropic|xai|kimi-coding|openai-codex|openrouter] --pool-file <path> --owner-file <path> [--auth-json <path>] [--db <path>] [--target-dir <path>] [--confirm-real-cutover]
@@ -112,11 +121,14 @@ qlb retire status is read-only. qlb retire execute is refused unless
 7-day soak, 20 clean decisions, live ping). Do NOT run retire execute until
 those production soak criteria are actually met.
 Default qlb status human view is the dashboard (grouped by account with
-health glyph, ownership, overrides). Pass --flat for the original bucket
-table. --json keeps {fetchedAt, accounts} and adds ownership, override,
-health, healthGlyph on each account (additive; existing fields unchanged).
+health glyph, ownership, overrides, remaining capacity, and 5h/7d reset
+times). Pass --flat for the original bucket table. --json keeps
+{fetchedAt, accounts} and adds ownership, override, health, healthGlyph
+on each account (additive; existing fields unchanged).
 qlb setup prints copy-paste snippets only and never edits files outside
-this repo (setup pi writes scripts/hooks/pi-advisory.sh here).
+this repo (setup pi writes scripts/hooks/pi-advisory.sh here), except
+setup hermes, which installs QLB's own files under ~/.hermes/{plugins,scripts}
+and ~/Library/LaunchAgents — never inside the hermes-agent checkout.
 qlb override pin/reserve/drain-first: --until defaults to 24h from now when
 omitted (ISO datetime or duration like 2h/30m/1d). Pin forces that account
 for one session id; reserve excludes an account from automatic selection;
@@ -125,7 +137,7 @@ qlb audit is read-only: last N routing decisions (default 20, newest first).
 Empty store prints "no decisions" or [].`;
 
 type StatusOpts = { cmd: 'status'; json: boolean; view: 'dashboard' | 'flat' };
-type SetupOpts = { cmd: 'setup'; json: boolean; harness: SetupHarness };
+type SetupOpts = { cmd: 'setup'; json: boolean; harness: SetupHarness | 'hermes' };
 type InitOpts = { cmd: 'init'; json: boolean };
 type DoctorOpts = { cmd: 'doctor'; json: boolean; live: boolean };
 type RefreshOpts = { cmd: 'refresh'; json: boolean; allowProbe: boolean };
@@ -224,6 +236,17 @@ type ProxyOpts = {
   db?: string;
   infoPath?: string;
   idleMs?: number;
+  noIdle: boolean;
+  port?: number;
+  startedBy?: string;
+};
+type ConsumeSub = 'enable' | 'disable' | 'status';
+type ConsumeOpts = {
+  cmd: 'consume';
+  sub: ConsumeSub;
+  json: boolean;
+  provider: 'anthropic';
+  db?: string;
 };
 type RetireSub = 'status' | 'execute';
 type RetireOpts = {
@@ -256,7 +279,7 @@ type AuditOpts = {
   limit: number;
   db?: string;
 };
-type Opts = InitOpts | DoctorOpts | RefreshOpts | WhyOpts | StatusOpts | SetupOpts | ResolveOpts | MigrateOpts | PolicyOpts | GateOpts | ProxyOpts | RetireOpts | NativeResyncOpts | OverrideOpts | AccountsOpts | AuditOpts;
+type Opts = InitOpts | DoctorOpts | RefreshOpts | WhyOpts | StatusOpts | SetupOpts | ResolveOpts | MigrateOpts | PolicyOpts | GateOpts | ProxyOpts | ConsumeOpts | RetireOpts | NativeResyncOpts | OverrideOpts | AccountsOpts | AuditOpts;
 
 const MIGRATE_SUBS: readonly MigrateSub[] = [
   'stage',
@@ -461,15 +484,26 @@ function parseGateArgs(argsIn: string[]): GateOpts {
 
 function parseProxyArgs(argsIn: string[]): ProxyOpts {
   const args = [...argsIn];
-  if (args[0] === '-h' || args[0] === '--help') {
+  if (args.includes('-h') || args.includes('--help')) {
     console.log(USAGE);
     process.exit(0);
   }
   const json = args.includes('--json');
   if (json) args.splice(args.indexOf('--json'), 1);
+  const noIdle = args.includes('--no-idle');
+  if (noIdle) args.splice(args.indexOf('--no-idle'), 1);
   const db = takeFlag(args, '--db');
   const infoPath = takeFlag(args, '--info-path');
   const idleRaw = takeFlag(args, '--idle-ms');
+  const portRaw = takeFlag(args, '--port');
+  let startedBy = takeFlag(args, '--started-by');
+  if (!startedBy) {
+    const eq = args.find((a) => a.startsWith('--started-by='));
+    if (eq) {
+      startedBy = eq.slice('--started-by='.length);
+      args.splice(args.indexOf(eq), 1);
+    }
+  }
   if (args.length > 0) {
     console.error(`qlb proxy: unknown argument ${args[0]}`);
     process.exit(1);
@@ -479,7 +513,45 @@ function parseProxyArgs(argsIn: string[]): ProxyOpts {
     console.error('qlb proxy: --idle-ms must be a positive number');
     process.exit(1);
   }
-  return { cmd: 'proxy', json, db, infoPath, idleMs };
+  const port = portRaw != null ? Number(portRaw) : undefined;
+  if (portRaw != null && (!Number.isInteger(port) || (port ?? 0) < 1 || (port ?? 0) > 65535)) {
+    console.error('qlb proxy: --port must be an integer between 1 and 65535');
+    process.exit(1);
+  }
+  if (startedBy != null && startedBy !== 'wrapper' && startedBy !== 'cli') {
+    console.error('qlb proxy: --started-by must be wrapper or cli');
+    process.exit(1);
+  }
+  return { cmd: 'proxy', json, db, infoPath, idleMs, noIdle, port, startedBy };
+}
+
+function parseConsumeArgs(argsIn: string[]): ConsumeOpts {
+  const args = [...argsIn];
+  const sub = args.shift();
+  if (sub === '-h' || sub === '--help' || sub === undefined) {
+    console.log(USAGE);
+    process.exit(0);
+  }
+  if (sub !== 'enable' && sub !== 'disable' && sub !== 'status') {
+    console.error('qlb consume: unknown subcommand. Expected enable|disable|status');
+    console.error(USAGE);
+    process.exit(1);
+  }
+  const json = args.includes('--json');
+  if (json) args.splice(args.indexOf('--json'), 1);
+  const db = takeFlag(args, '--db');
+  const provider = takeFlag(args, '--provider');
+  if (args.length > 0) {
+    console.error(`qlb consume ${sub}: unknown argument ${args[0]}`);
+    console.error(USAGE);
+    process.exit(1);
+  }
+  if (provider !== 'anthropic') {
+    console.error('qlb consume: --provider must be anthropic');
+    console.error(USAGE);
+    process.exit(1);
+  }
+  return { cmd: 'consume', sub, json, provider: 'anthropic', db };
 }
 
 function parseAccountsArgs(argsIn: string[]): AccountsOpts {
@@ -614,9 +686,9 @@ function parseSetupArgs(argsIn: string[]): SetupOpts {
     console.error(USAGE);
     process.exit(1);
   }
-  if (!isSetupHarness(harness)) {
+  if (harness !== 'hermes' && !isSetupHarness(harness)) {
     console.error(
-      'qlb setup: harness is required (pi|claude-code|codex-cli|generic)',
+      'qlb setup: harness is required (pi|claude-code|codex-cli|generic|hermes)',
     );
     console.error(USAGE);
     process.exit(1);
@@ -803,6 +875,9 @@ function parseArgs(argv: string[]): Opts {
   if (raw[0] === 'proxy') {
     return parseProxyArgs(raw.slice(1));
   }
+  if (raw[0] === 'consume') {
+    return parseConsumeArgs(raw.slice(1));
+  }
   if (raw[0] === 'retire') {
     return parseRetireArgs(raw.slice(1));
   }
@@ -925,92 +1000,6 @@ function assertSafeMigratePaths(opts: MigrateOpts): void {
   }
 }
 
-function pad(value: string, width: number): string {
-  return value.length >= width ? value : value + ' '.repeat(width - value.length);
-}
-
-interface Row {
-  provider: string;
-  label: string;
-  bucket: string;
-  usedPct: string;
-  confidence: string;
-  reset: string;
-}
-
-function toRows(accounts: AccountSnapshot[]): Row[] {
-  const rows: Row[] = [];
-  for (const snap of accounts) {
-    const entries = Object.entries(snap.buckets);
-    if (entries.length === 0 && snap.error) {
-      rows.push({
-        provider: snap.provider,
-        label: snap.label,
-        bucket: '-',
-        usedPct: '-',
-        confidence: 'error',
-        reset: snap.error,
-      });
-      continue;
-    }
-    for (const [bucket, reading] of entries) {
-      rows.push({
-        provider: snap.provider,
-        label: snap.label,
-        bucket,
-        usedPct: formatUsedPct(reading.usedPct),
-        confidence: reading.confidence,
-        reset: formatRelative(reading.resetAt),
-      });
-    }
-  }
-  return rows;
-}
-
-function printTable(accounts: AccountSnapshot[]): void {
-  const rows = toRows(accounts);
-  const widths = {
-    provider: 'provider'.length,
-    label: 'account'.length,
-    bucket: 'bucket'.length,
-    usedPct: 'used'.length,
-    confidence: 'confidence'.length,
-    reset: 'resets'.length,
-  };
-  for (const row of rows) {
-    widths.provider = Math.max(widths.provider, row.provider.length);
-    widths.label = Math.max(widths.label, row.label.length);
-    widths.bucket = Math.max(widths.bucket, row.bucket.length);
-    widths.usedPct = Math.max(widths.usedPct, row.usedPct.length);
-    widths.confidence = Math.max(widths.confidence, row.confidence.length);
-    widths.reset = Math.max(widths.reset, `resets ${row.reset}`.length);
-  }
-
-  const line = (
-    provider: string,
-    label: string,
-    bucket: string,
-    usedPct: string,
-    confidence: string,
-    reset: string,
-  ): string =>
-    [
-      pad(provider, widths.provider),
-      pad(label, widths.label),
-      pad(bucket, widths.bucket),
-      pad(usedPct, widths.usedPct),
-      pad(confidence, widths.confidence),
-      pad(reset, widths.reset),
-    ].join(' | ');
-
-  console.log(line('provider', 'account', 'bucket', 'used', 'confidence', 'resets'));
-  for (const row of rows) {
-    console.log(
-      line(row.provider, row.label, row.bucket, row.usedPct, row.confidence, `resets ${row.reset}`),
-    );
-  }
-}
-
 function printInit(report: InitReport, json: boolean): void {
   if (json) {
     console.log(JSON.stringify(report, null, 2));
@@ -1056,11 +1045,11 @@ async function runStatus(opts: StatusOpts): Promise<void> {
     overrideForAccount: (id) => overrideFromStore(store, id),
   });
   if (opts.json) {
-    console.log(JSON.stringify({ fetchedAt: Date.now(), accounts: enriched }, null, 2));
+    console.log(JSON.stringify({ fetchedAt: Date.now(), accounts: decorateStatusJson(enriched) }, null, 2));
     return;
   }
   if (opts.view === 'flat') {
-    printTable(accounts);
+    console.log(formatFlatTable(enriched));
     return;
   }
   console.log(formatDashboard(enriched));
@@ -1366,13 +1355,66 @@ async function runGate(opts: GateOpts): Promise<number> {
   });
 }
 
+function isPortListening(port: number, host = '127.0.0.1'): Promise<boolean> {
+  return new Promise((resolve) => {
+    const sock = net.connect({ port, host });
+    const done = (busy: boolean) => {
+      sock.removeAllListeners();
+      sock.destroy();
+      resolve(busy);
+    };
+    sock.once('connect', () => done(true));
+    sock.once('error', () => done(false));
+  });
+}
+
+function consumeMarkerPath(dbPath: string): string {
+  return join(dirname(dbPath), 'consume-anthropic.json');
+}
+
+async function runConsume(opts: ConsumeOpts): Promise<number> {
+  return withStore(opts.db, async (store) => {
+    const dbPath = opts.db ?? config.dbPath;
+    const marker = consumeMarkerPath(dbPath);
+    if (opts.sub === 'enable') {
+      store.upsertMigration(CSWAP_ANTHROPIC_STORE, CONSUME_STATE, '{}');
+      mkdirSync(dirname(marker), { recursive: true, mode: 0o700 });
+      writeFileSync(marker, `${JSON.stringify({ state: CONSUME_STATE })}\n`, { encoding: 'utf8', mode: 0o600 });
+    } else if (opts.sub === 'disable') {
+      store.upsertMigration(CSWAP_ANTHROPIC_STORE, 'NATIVE', '{}');
+      try {
+        if (existsSync(marker)) unlinkSync(marker);
+      } catch {
+        // best-effort
+      }
+    }
+    const state = store.getMigration(CSWAP_ANTHROPIC_STORE)?.state ?? 'NATIVE';
+    if (opts.json) {
+      console.log(JSON.stringify({ provider: 'anthropic', store: CSWAP_ANTHROPIC_STORE, state }));
+    } else {
+      console.log(`cswap-anthropic: ${state}`);
+    }
+    return 0;
+  });
+}
+
 async function runProxy(opts: ProxyOpts): Promise<number> {
+  if (opts.port != null) {
+    const busy = await isPortListening(opts.port);
+    if (busy) {
+      console.error(`qlb proxy: 127.0.0.1:${opts.port} already in use`);
+      return 1;
+    }
+  }
   const opened = !!opts.db;
   const store = opts.db ? openStore(opts.db) : getStore();
   const proxy = new LoopbackProxy({
     store,
     infoPath: opts.infoPath,
     idleTimeoutMs: opts.idleMs,
+    noIdle: opts.noIdle,
+    port: opts.port,
+    startedBy: opts.startedBy,
     getCredentialForAccount: createOwnedCredentialSource({
       store,
       keychain: platformKeychain,
@@ -1673,8 +1715,28 @@ async function main(): Promise<void> {
       process.exit(1);
     }
   }
+  if (opts.cmd === 'setup' && opts.harness === 'hermes') {
+    try {
+      const result = setupHermes();
+      if (opts.json) {
+        console.log(JSON.stringify(result, null, 2));
+      } else {
+        for (const f of result.files) console.log(`${f.action.padEnd(9)} ${f.path}`);
+        for (const a of [result.launchd, result.watch]) {
+          if (a) console.log(`launchd   ${a.label}: ${a.action}${a.detail ? ` (${a.detail})` : ''}`);
+        }
+        if (result.models) for (const line of result.models.split('\n')) console.log(`models    ${line}`);
+        console.log('');
+        console.log(result.instructions);
+      }
+      process.exit(0);
+    } catch (err) {
+      console.error(`qlb setup hermes: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+  }
   if (opts.cmd === 'setup') {
-    const result = setupHarness(opts.harness);
+    const result = setupHarness(opts.harness as SetupHarness);
     if (opts.json) {
       console.log(JSON.stringify(result, null, 2));
     } else {
@@ -1736,6 +1798,16 @@ async function main(): Promise<void> {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`qlb proxy: ${msg}`);
+      process.exit(1);
+    }
+  }
+  if (opts.cmd === 'consume') {
+    try {
+      const code = await runConsume(opts);
+      process.exit(code);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`qlb consume ${opts.sub}: ${msg}`);
       process.exit(1);
     }
   }

@@ -15,7 +15,24 @@ describe('qlb init', () => {
     mkdirSync(join(home, '.pi', 'agent'), { recursive: true });
     mkdirSync(join(home, '.codex'), { recursive: true });
     mkdirSync(join(home, 'DEV_vault', '04-Security'), { recursive: true });
-    writeFileSync(config.anthropicPoolPath, JSON.stringify({ accounts: [{ credentials: { access: 'fake' } }] }));
+    mkdirSync(join(home, '.claude-swap-backup', 'cache'), { recursive: true });
+    writeFileSync(config.cswapSequencePath, JSON.stringify({
+      sequence: [1],
+      activeAccountNumber: 1,
+      accounts: { '1': { email: 'a@example.com', organizationUuid: 'org-1' } },
+    }));
+    writeFileSync(config.cswapUsagePath, JSON.stringify({
+      schemaVersion: 2,
+      accounts: {
+        '1': {
+          email: 'a@example.com',
+          organizationUuid: 'org-1',
+          fetchedAt: Math.floor(Date.now() / 1000),
+          lastGood: { five_hour: { pct: 10 }, seven_day: { pct: 20 }, scoped: [] },
+          authDeadStrikes: 0,
+        },
+      },
+    }));
     writeFileSync(config.piAuthJsonPath, JSON.stringify({ xai: { access: 'fake' } }));
     writeFileSync(config.codexAuthJsonPath, JSON.stringify({ tokens: { access_token: 'fake' } }));
     writeFileSync(config.kimiCredentialsFile, 'sk-kimi-FAKE123');
@@ -27,7 +44,8 @@ describe('qlb init', () => {
     assert.ok(report.providers.every((provider) => provider.level === 'PASS'));
 
     const starter = JSON.parse(readFileSync(config.configPath, 'utf8')) as Record<string, string>;
-    assert.equal(starter.anthropicPoolPath, config.anthropicPoolPath);
+    assert.equal(starter.cswapSequencePath, config.cswapSequencePath);
+    assert.equal(starter.cswapUsagePath, config.cswapUsagePath);
     assert.equal(starter.openrouterKeychainService, config.openrouterKeychainService);
     assert.equal(starter.dbPath, config.dbPath);
   });

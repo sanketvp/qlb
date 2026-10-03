@@ -22,6 +22,8 @@ function isolatedEnv(): NodeJS.ProcessEnv {
     QLB_CONFIG_PATH: join(root, 'config.json'),
     QLB_PROXY_INFO_PATH: join(root, 'proxy.json'),
     QLB_CLAUDE_CODE_CREDENTIALS_PATH: join(root, 'cc-creds'),
+    QLB_CSWAP_SEQUENCE_PATH: join(root, 'missing-sequence.json'),
+    QLB_CSWAP_USAGE_PATH: join(root, 'missing-usage.json'),
   };
 }
 
@@ -237,6 +239,15 @@ describe('CLI smoke — documented commands', () => {
     assert.match(text, /npm run build/);
     assert.match(text, /npm link/);
     assert.match(text, /qlb init/);
+  });
+
+  it('consume-cli-idle', () => {
+    const env = isolatedEnv();
+    const zero = runCli(['proxy', '--idle-ms', '0'], env);
+    assert.equal(zero.status, 1);
+    assert.match(zero.stderr, /must be a positive number/);
+    const help = runCli(['proxy', '--no-idle', '--help'], env);
+    assert.doesNotMatch(help.stderr + help.stdout, /unknown argument/);
   });
 
   it('install.ps1 encodes the documented Windows installer steps', () => {

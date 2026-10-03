@@ -1,0 +1,72 @@
+#!/usr/bin/python3
+"""Print the current QLB loopback proxy token (stdout only the token).
+
+Reads $QLB_HOME/proxy.json (default ~/.qlb/proxy.json). Exits 1 if the file is
+missing or the recorded {pid,lstart} identity is not live. Appends one ISO
+timestamp line to $QLB_HOME/helper-invocations.log (never the token).
+"""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from datetime import datetime, timezone
+
+
+def qlb_home() -> str:
+    return os.environ.get("QLB_HOME") or os.path.join(os.path.expanduser("~"), ".qlb")
+
+
+def process_lstart(pid: int) -> str:
+    try:
+        out = subprocess.check_output(
+            ["ps", "-p", str(pid), "-o", "lstart="],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+        return out.strip()
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        return ""
+
+
+def identity_live(pid: int, stored: str) -> bool:
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    if not stored:
+        return False
+    return process_lstart(pid) == stored
+
+
+def main() -> int:
+    home = qlb_home()
+    info_path = os.environ.get("QLB_PROXY_INFO_PATH") or os.path.join(home, "proxy.json")
+    log_path = os.path.join(home, "helper-invocations.log")
+    try:
+        os.makedirs(home, mode=0o700, exist_ok=True)
+        with open(log_path, "a", encoding="utf8") as log:
+            log.write(datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") + "\n")
+    except OSError:
+        pass
+    try:
+        with open(info_path, "r", encoding="utf8") as fh:
+            info = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return 1
+    token = info.get("token")
+    pid = info.get("pid")
+    lstart = info.get("lstart") or ""
+    if not isinstance(token, str) or not token:
+        return 1
+    if not isinstance(pid, int) or not identity_live(pid, lstart if isinstance(lstart, str) else ""):
+        return 1
+    sys.stdout.write(token)
+    if not token.endswith("\n"):
+        sys.stdout.write("\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

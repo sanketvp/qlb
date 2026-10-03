@@ -23,32 +23,41 @@ function runAdapterScript(script: string, extraEnv: NodeJS.ProcessEnv = {}): {
 }
 
 describe('adapter empty-cache probe attachment', () => {
-  it('anthropic empty cache + rejected fetch stamps cached-after-failure with accurate detail', () => {
+  it('anthropic cache-only status does not call fetch even when fetch would reject', () => {
     const root = mkdtempSync(join(tmpdir(), 'qlb-anth-probe-'));
     mkdirSync(join(root, 'migrate'), { recursive: true });
-    const pool = join(root, 'pool.json');
+    mkdirSync(join(root, 'cswap', 'cache'), { recursive: true });
+    const sequence = join(root, 'cswap', 'sequence.json');
+    const usage = join(root, 'cswap', 'cache', 'usage.json');
     const db = join(root, 'qlb.db');
-    writeFileSync(
-      pool,
-      JSON.stringify({
-        accounts: [
-          {
-            id: 'acct-1',
-            email: 'a@example.com',
-            credentials: { access: 'tok', expires: Date.now() + 60_000 },
+    const nowS = Math.floor(Date.now() / 1000);
+    writeFileSync(sequence, JSON.stringify({
+      sequence: [1],
+      activeAccountNumber: 1,
+      accounts: { '1': { email: 'a@example.com', organizationUuid: 'org-1' } },
+    }));
+    writeFileSync(usage, JSON.stringify({
+      schemaVersion: 2,
+      accounts: {
+        '1': {
+          email: 'a@example.com',
+          organizationUuid: 'org-1',
+          fetchedAt: nowS,
+          authDeadStrikes: 0,
+          lastGood: {
+            five_hour: { pct: 11 },
+            seven_day: { pct: 22 },
+            scoped: [{ name: 'Fable', pct: 33 }],
           },
-        ],
-      }),
-    );
+        },
+      },
+    }));
     const adapterJs = join(__dirname, '..', 'src', 'adapters', 'anthropic.js');
     const script = `
-      process.env.QLB_ANTHROPIC_POOL_PATH = ${JSON.stringify(pool)};
+      process.env.QLB_CSWAP_SEQUENCE_PATH = ${JSON.stringify(sequence)};
+      process.env.QLB_CSWAP_USAGE_PATH = ${JSON.stringify(usage)};
       process.env.QLB_DB_PATH = ${JSON.stringify(db)};
-      globalThis.fetch = async () => {
-        const err = new Error('network down');
-        err.name = 'TypeError';
-        throw err;
-      };
+      globalThis.fetch = async () => { throw new Error('network down'); };
       const { anthropicAdapter } = require(${JSON.stringify(adapterJs)});
       anthropicAdapter.fetchSnapshots().then((snaps) => {
         process.stdout.write(JSON.stringify(snaps));
@@ -58,20 +67,20 @@ describe('adapter empty-cache probe attachment', () => {
       });
     `;
     const result = runAdapterScript(script, {
-      QLB_ANTHROPIC_POOL_PATH: pool,
+      QLB_CSWAP_SEQUENCE_PATH: sequence,
+      QLB_CSWAP_USAGE_PATH: usage,
       QLB_DB_PATH: db,
     });
     assert.equal(result.status, 0, result.stderr);
     const snaps = JSON.parse(result.stdout) as Array<{
       error?: string;
-      probe?: { outcome: string; detail?: string };
-      buckets: Record<string, unknown>;
+      buckets: Record<string, { usedPct?: number }>;
     }>;
     assert.equal(snaps.length, 1);
-    assert.equal(snaps[0]?.probe?.outcome, 'cached-after-failure');
-    assert.notEqual(snaps[0]?.probe?.detail, 'auth expired or invalid — needs re-login');
-    assert.ok(snaps[0]?.error);
-    assert.match(snaps[0]?.probe?.detail ?? snaps[0]?.error ?? '', /network|timeout|failed/i);
+    assert.equal(snaps[0]?.error, undefined);
+    assert.equal(snaps[0]?.buckets['5h']?.usedPct, 11);
+    assert.equal(snaps[0]?.buckets['7d']?.usedPct, 22);
+    assert.equal(snaps[0]?.buckets['7d:Fable']?.usedPct, 33);
   });
 
   it('kimi empty cache + rejected fetch stamps cached-after-failure with accurate detail', () => {

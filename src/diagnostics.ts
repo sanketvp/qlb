@@ -5,6 +5,7 @@ import { DatabaseSync } from 'node:sqlite';
 
 import { builtInAdapters } from './adapters';
 import { CONFIG_ENV_VARS, type QlbConfig } from './config';
+import { cswapCachePresent } from './cswap-usage';
 import {
   defaultCommandExists,
   platformKeychain,
@@ -25,6 +26,8 @@ import {
   type ResyncCredential,
 } from './native-resync';
 import type { AccountSnapshot, Adapter } from './types';
+import { hermesIntegrationChecks } from './hermes-integration';
+import { piIntegrationChecks } from './pi-integration';
 
 export type CheckLevel = 'PASS' | 'WARN' | 'FAIL';
 
@@ -106,13 +109,9 @@ export function inspectProviders(
   config: QlbConfig,
   command: CommandRunner = runCommand,
 ): ProviderDiagnostic[] {
-  const pool = readJson(config.anthropicPoolPath);
-  const accounts = Array.isArray(pool?.accounts) ? pool.accounts : [];
-  const anthropicOk = accounts.some((account) => {
-    if (!account || typeof account !== 'object') return false;
-    const credentials = (account as { credentials?: unknown }).credentials;
-    return !!credentials && typeof credentials === 'object' &&
-      typeof (credentials as { access?: unknown }).access === 'string';
+  const anthropicOk = cswapCachePresent({
+    sequencePath: config.cswapSequencePath,
+    usagePath: config.cswapUsagePath,
   });
 
   const piAuth = readJson(config.piAuthJsonPath);
@@ -150,8 +149,8 @@ export function inspectProviders(
 
   return [
     anthropicOk
-      ? found('anthropic', config.anthropicPoolPath, CONFIG_ENV_VARS.anthropicPoolPath, `export ${CONFIG_ENV_VARS.anthropicPoolPath}=~/.pi/agent/anthropic-pool.json`)
-      : missing('anthropic', config.anthropicPoolPath, CONFIG_ENV_VARS.anthropicPoolPath, `export ${CONFIG_ENV_VARS.anthropicPoolPath}=~/path/to/anthropic-pool.json`),
+      ? found('anthropic', `${config.cswapSequencePath} + ${config.cswapUsagePath}`, CONFIG_ENV_VARS.cswapSequencePath, `export ${CONFIG_ENV_VARS.cswapSequencePath}=~/.claude-swap-backup/sequence.json`)
+      : missing('anthropic', `${config.cswapSequencePath} + ${config.cswapUsagePath}`, CONFIG_ENV_VARS.cswapSequencePath, `export ${CONFIG_ENV_VARS.cswapSequencePath}=~/.claude-swap-backup/sequence.json`),
     xaiOk
       ? found('xai', `${config.piAuthJsonPath} (xai entry)`, CONFIG_ENV_VARS.piAuthJsonPath, `export ${CONFIG_ENV_VARS.piAuthJsonPath}=~/.pi/agent/auth.json`)
       : missing('xai', `${config.piAuthJsonPath} (xai entry)`, CONFIG_ENV_VARS.piAuthJsonPath, `export ${CONFIG_ENV_VARS.piAuthJsonPath}=~/path/to/pi-auth.json`),
@@ -202,7 +201,10 @@ export function initializeQlb(
   const providers = inspectProviders(config, command);
   const configured: Partial<QlbConfig> = {};
   const byProvider = new Map(providers.map((provider) => [provider.provider, provider]));
-  if (byProvider.get('anthropic')?.level === 'PASS') configured.anthropicPoolPath = config.anthropicPoolPath;
+  if (byProvider.get('anthropic')?.level === 'PASS') {
+    configured.cswapSequencePath = config.cswapSequencePath;
+    configured.cswapUsagePath = config.cswapUsagePath;
+  }
   if (byProvider.get('xai')?.level === 'PASS') configured.piAuthJsonPath = config.piAuthJsonPath;
   if (byProvider.get('openai-codex')?.level === 'PASS') configured.codexAuthJsonPath = config.codexAuthJsonPath;
   if (byProvider.get('kimi-coding')?.level === 'PASS') configured.kimiCredentialsFile = config.kimiCredentialsFile;
@@ -411,6 +413,19 @@ export async function doctorQlb(
         detail: { provider: row.provider, matches: row.matches },
       });
     }
+  }
+
+  // Hermes integration (external to the Hermes checkout): config, plugin, local fix, supervisor,
+  // and — with --live — the exact Hermes symbols the plugin patches. Never throws.
+  try {
+    checks.push(...hermesIntegrationChecks({ probeSeams: options.live === true }));
+  } catch (err) {
+    checks.push({ name: 'hermes', level: 'WARN', message: `hermes checks failed: ${err instanceof Error ? err.message : String(err)}` });
+  }
+  try {
+    checks.push(...piIntegrationChecks({ typecheck: options.live === true }));
+  } catch (err) {
+    checks.push({ name: 'pi', level: 'WARN', message: `pi checks failed: ${err instanceof Error ? err.message : String(err)}` });
   }
 
   const providers = inspectProviders(config, options.command);

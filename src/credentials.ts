@@ -14,6 +14,12 @@ import {
 } from './migration';
 import { parseGrant } from './refresh-lease';
 import type { Store } from './store';
+import {
+  CSWAP_ACTIVE_ID,
+  CSWAP_ANTHROPIC_STORE,
+  consumedAccessString,
+  isConsumedState,
+} from './cswap-consume';
 
 const OWNED_OR_LATER = new Set(['QLB_OWNED', 'RETIRED']);
 
@@ -63,10 +69,19 @@ export function notOwnedError(accountId: string, provider?: string): Error {
 export function createOwnedCredentialSource(opts: {
   store: Store;
   keychain: KeychainBackend;
+  getConsumedAccess?: () => string;
 }): (accountId: string) => Promise<string> {
   return async (accountId: string): Promise<string> => {
+    const consumed = isConsumedState(opts.store.getMigration(CSWAP_ANTHROPIC_STORE)?.state);
+    if (accountId === CSWAP_ACTIVE_ID) {
+      if (!consumed) throw notOwnedError(accountId, 'anthropic');
+      return (opts.getConsumedAccess ?? consumedAccessString)();
+    }
     const acct = opts.store.getAccount(accountId);
     const provider = acct?.provider ?? guessProvider(accountId);
+    if (consumed && provider === 'anthropic') {
+      throw notOwnedError(accountId, provider);
+    }
     const storeName = provider ? migrationStoreNameFor(provider) : undefined;
     const state = storeName ? opts.store.getMigration(storeName)?.state : undefined;
     if (!state || !OWNED_OR_LATER.has(state)) {

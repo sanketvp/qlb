@@ -40,6 +40,8 @@ describe('custom provider plugins', () => {
         QLB_KIMI_CREDENTIALS_FILE: join(root, 'missing-kimi.md'),
         QLB_OPENROUTER_KEYCHAIN_SERVICE: 'qlb-test-missing-openrouter',
         QLB_CONFIG_PATH: join(root, 'missing-config.json'),
+        QLB_CSWAP_SEQUENCE_PATH: join(root, 'missing-sequence.json'),
+        QLB_CSWAP_USAGE_PATH: join(root, 'missing-usage.json'),
       },
     });
 

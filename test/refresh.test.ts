@@ -486,6 +486,8 @@ function isolatedEnv(root: string, dbPath: string, pluginsDir: string): NodeJS.P
     QLB_CONFIG_PATH: join(root, 'config.json'),
     QLB_PROXY_INFO_PATH: join(root, 'proxy.json'),
     QLB_CLAUDE_CODE_CREDENTIALS_PATH: join(root, 'cc-creds'),
+    QLB_CSWAP_SEQUENCE_PATH: join(root, 'missing-sequence.json'),
+    QLB_CSWAP_USAGE_PATH: join(root, 'missing-usage.json'),
   };
 }
 

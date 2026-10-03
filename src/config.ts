@@ -12,6 +12,8 @@ export interface QlbConfig {
   pluginsDir: string;
   proxyInfoPath: string;
   claudeCodeCredentialsPath: string;
+  cswapSequencePath: string;
+  cswapUsagePath: string;
   defaultStrategy: string;
   configPath: string;
 }
@@ -28,6 +30,8 @@ const FIELD_META: Record<ConfigField, { env: string; flag: string }> = {
   pluginsDir: { env: 'QLB_PLUGINS_DIR', flag: '--plugins-dir' },
   proxyInfoPath: { env: 'QLB_PROXY_INFO_PATH', flag: '--proxy-info-path' },
   claudeCodeCredentialsPath: { env: 'QLB_CLAUDE_CODE_CREDENTIALS_PATH', flag: '--claude-code-credentials-path' },
+  cswapSequencePath: { env: 'QLB_CSWAP_SEQUENCE_PATH', flag: '--cswap-sequence-path' },
+  cswapUsagePath: { env: 'QLB_CSWAP_USAGE_PATH', flag: '--cswap-usage-path' },
   defaultStrategy: { env: 'QLB_DEFAULT_STRATEGY', flag: '--default-strategy' },
 };
 
@@ -47,6 +51,8 @@ export function defaultConfig(home: string = homedir()): QlbConfig {
     pluginsDir: join(qlbDir, 'plugins'),
     proxyInfoPath: join(qlbDir, 'proxy.json'),
     claudeCodeCredentialsPath: join(home, '.claude', 'Claude Code-credentials'),
+    cswapSequencePath: join(home, '.claude-swap-backup', 'sequence.json'),
+    cswapUsagePath: join(home, '.claude-swap-backup', 'cache', 'usage.json'),
     defaultStrategy: 'headroom',
     configPath: join(qlbDir, 'config.json'),
   };

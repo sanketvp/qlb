@@ -219,7 +219,9 @@ type StreamSimple = (
 ) => AsyncIterable<unknown>;
 
 async function resolveBuiltinAnthropicStreamSimple(): Promise<StreamSimple> {
-  const namespace = (await import("@earendil-works/pi-ai/compat")) as {
+  // `as unknown as`: Pi's compat types evolve (0.87 narrowed Context → TranscriptContext); we
+  // only rely on the runtime shape, which is verified right below and by `qlb doctor` (pi:typecheck).
+  const namespace = (await import("@earendil-works/pi-ai/compat")) as unknown as {
     anthropicMessagesApi?: () => { streamSimple?: StreamSimple };
   };
   const streamSimple = namespace.anthropicMessagesApi?.()?.streamSimple;
