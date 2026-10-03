@@ -714,7 +714,15 @@ export class LoopbackProxy {
 
     const target = upstreamUrl(harness, pathname, this.upstreams);
     const t0 = Date.now();
-    let lastFp = fingerprintAccess(credential);
+    const sendWithCredential = async (token: string): Promise<IncomingMessage> => {
+      extra.authorization = `Bearer ${token}`;
+      return requestUpstream(
+        target,
+        'POST',
+        forwardHeaders(req.headers, extra, forwardBody.length),
+        forwardBody,
+      );
+    };
     const requestOnce = async (): Promise<IncomingMessage> => {
       extra.authorization = `Bearer ${await this.getCredential(decision.accountId)}`;
       return requestUpstream(
@@ -727,15 +735,16 @@ export class LoopbackProxy {
     let upRes: IncomingMessage;
     try {
       if (decision.accountId === CSWAP_ACTIVE_ID) {
+        // First attempt uses the request-time credential already read above.
+        // A 401 triggers exactly one reread; the retry reuses that value.
+        let sent = credential;
         const wrapped = await attemptWithNativeResyncRetry({
-          attempt: requestOnce,
+          attempt: () => sendWithCredential(sent),
           isAuthFailure: (res) => res.statusCode === 401,
           resync: async () => {
             const next = await this.getCredential(decision.accountId);
-            const nextFp = fingerprintAccess(next);
-            if (nextFp !== lastFp) {
-              lastFp = nextFp;
-              extra.authorization = `Bearer ${next}`;
+            if (fingerprintAccess(next) !== fingerprintAccess(sent)) {
+              sent = next;
               return { resynced: true, reason: 'cswap-active access fingerprint changed' };
             }
             return { resynced: false, reason: 'cswap-active access fingerprint unchanged' };

@@ -21,12 +21,20 @@ const ts = require('typescript/unstable/ast') as {
 const ROOT = join(__dirname, '..', '..');
 const SRC = join(ROOT, 'src');
 
-const CLOSURE_ROOTS = [
+const CONSUME_ROOTS = [
   join(SRC, 'cswap-usage.ts'),
   join(SRC, 'cswap-consume.ts'),
   join(SRC, 'cswap-native-read.ts'),
   join(SRC, 'adapters', 'anthropic.ts'),
 ];
+
+const RUNTIME_ROOTS = [
+  join(SRC, 'proxy.ts'),
+  join(SRC, 'credentials.ts'),
+  join(SRC, 'cli.ts'),
+];
+
+const CLOSURE_ROOTS = [...CONSUME_ROOTS, ...RUNTIME_ROOTS];
 
 const WRITERS = [
   join(SRC, 'refresh.ts'),
@@ -95,8 +103,7 @@ function collect(file: string): ScanResult {
     if (t.kind === kinds.ImportKeyword) {
       const next = tokens[i + 1];
       if (next && next.kind === kinds.OpenParenToken) {
-        const arg = tokens[i + 2];
-        if (isString(arg)) dynamic += 1;
+        dynamic += 1;
         continue;
       }
       // import x = require('…')
@@ -134,7 +141,7 @@ function collect(file: string): ScanResult {
     }
     if (isRequireTok(t)) {
       const next = tokens[i + 1];
-      if (next && next.kind === kinds.OpenParenToken && isString(tokens[i + 2])) {
+      if (next && next.kind === kinds.OpenParenToken) {
         dynamic += 1;
       }
     }
@@ -168,9 +175,9 @@ function closureOf(roots: string[]): { files: Set<string>; dynamic: number } {
 
 describe('consume import-closure walker', () => {
   it('production closure excludes writers and dynamic imports', () => {
-    const { files, dynamic } = closureOf(CLOSURE_ROOTS);
-    const writerHits = [...files].filter((f) => WRITERS.includes(f));
-    const texts = [...files, ...HARNESS].map((f) => ({ f, text: readFileSync(f, 'utf8') }));
+    const consume = closureOf(CONSUME_ROOTS);
+    const writerHits = [...consume.files].filter((f) => WRITERS.includes(f));
+    const texts = [...consume.files, ...HARNESS].map((f) => ({ f, text: readFileSync(f, 'utf8') }));
     let tokenTerms = 0;
     let securityWrites = 0;
     let cswapSpawns = 0;
@@ -179,8 +186,16 @@ describe('consume import-closure walker', () => {
       if (SECURITY_WRITE_RE.test(text)) securityWrites += 1;
       if (SPAWN_CSWAP_RE.test(text) || SPAWN_CURL_RE.test(text)) cswapSpawns += 1;
     }
+    // Runtime roots are in the guarded set for dynamic loading (fail closed on
+    // every import(/require(), any argument). Do not walk their full graph:
+    // cli/proxy legitimately import writers (refresh, native-resync, keychain).
+    let dynamic = consume.dynamic;
+    for (const file of RUNTIME_ROOTS) {
+      assert.ok(existsSync(file), `missing runtime root ${relative(ROOT, file)}`);
+      dynamic += collect(file).dynamic;
+    }
     console.log(
-      `WRITER_IMPORTS=${writerHits.length} TOKEN_TERMS=${tokenTerms} CSWAP_SPAWNS_SRC=${cswapSpawns} SECURITY_WRITE_TERMS=${securityWrites} DYNAMIC_IMPORTS=${dynamic}`,
+      `WRITER_IMPORTS=${writerHits.length} TOKEN_TERMS=${tokenTerms} CSWAP_SPAWNS_SRC=${cswapSpawns} SECURITY_WRITE_TERMS=${securityWrites} DYNAMIC_IMPORTS=${dynamic} RUNTIME_ROOTS=${RUNTIME_ROOTS.length} CLOSURE_ROOTS=${CLOSURE_ROOTS.length}`,
     );
     assert.equal(writerHits.length, 0, `writers in closure: ${writerHits.map((f) => relative(ROOT, f)).join(', ')}`);
     assert.equal(tokenTerms, 0);
@@ -208,8 +223,14 @@ describe('consume import-closure walker', () => {
     const writerDetect = reaches.files.has(writerStub) ? 1 : 0;
     const dynImport = collect(join(dir, 'dynamic-import.ts'));
     const dynRequire = collect(join(dir, 'dynamic-require.ts'));
+    const dynIdent = collect(join(dir, 'dynamic-ident.ts'));
+    const dynConcat = collect(join(dir, 'dynamic-concat.ts'));
+    const dynTemplate = collect(join(dir, 'dynamic-template.ts'));
     assert.ok(dynImport.dynamic > 0, 'dynamic import() must be detected');
     assert.ok(dynRequire.dynamic > 0, 'dynamic require() must be detected');
+    assert.ok(dynIdent.dynamic > 0, 'identifier import()/require() must fail closed');
+    assert.ok(dynConcat.dynamic > 0, 'concatenated import()/require() must fail closed');
+    assert.ok(dynTemplate.dynamic > 0, 'template-expression import()/require() must fail closed');
     console.log(`WALKER_FORMS=${formHits} WALKER_WRITER_DETECT=${writerDetect}`);
     assert.equal(formHits, 4);
     assert.equal(writerDetect, 1);

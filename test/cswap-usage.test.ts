@@ -129,4 +129,39 @@ describe('cswap cache-only usage projection', () => {
     const eligible = snaps.filter((s) => !s.error && Object.keys(s.buckets).length > 0);
     assert.equal(eligible.length, 0);
   });
+
+  it('cache-identity-requires-both-fields', () => {
+    const nowMs = Date.now();
+    const cases: Array<{ name: string; seq: Record<string, unknown>; usage: Record<string, unknown> }> = [
+      {
+        name: 'missing-sequence-email',
+        seq: { organizationUuid: 'org-1' },
+        usage: eligibleLastGood(nowMs / 1000),
+      },
+      {
+        name: 'missing-sequence-orgUuid',
+        seq: { email: 'one@example.com' },
+        usage: eligibleLastGood(nowMs / 1000),
+      },
+      {
+        name: 'missing-usage-email',
+        seq: { email: 'one@example.com', organizationUuid: 'org-1' },
+        usage: { ...eligibleLastGood(nowMs / 1000), email: undefined, organizationUuid: 'org-1' },
+      },
+      {
+        name: 'missing-usage-orgUuid',
+        seq: { email: 'one@example.com', organizationUuid: 'org-1' },
+        usage: { ...eligibleLastGood(nowMs / 1000), email: 'one@example.com', organizationUuid: undefined },
+      },
+    ];
+    for (const row of cases) {
+      const snaps = fixture({
+        nowMs,
+        seqAccounts: { '1': row.seq },
+        usageAccounts: { '1': row.usage },
+      });
+      const eligible = snaps.filter((s) => !s.error && Object.keys(s.buckets).length > 0);
+      assert.equal(eligible.length, 0, row.name);
+    }
+  });
 });

@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { after, describe, it } from 'node:test';
 import type { AddressInfo } from 'node:net';
 
-import { CSWAP_ANTHROPIC_STORE, CONSUME_STATE } from '../src/cswap-consume';
+import { CSWAP_ANTHROPIC_STORE, CONSUME_STATE, fingerprintAccess } from '../src/cswap-consume';
 import { setPolicy } from '../src/policy';
 import { LoopbackProxy } from '../src/proxy';
 import { openStore } from '../src/store';
@@ -71,23 +71,15 @@ function post(
   });
 }
 
-const spies = { tokenPosts: 0, cswapSpawns: 0, securityWrites: 0 };
-
-function installSpies(): void {
-  const origFetch = globalThis.fetch;
-  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-    const url = String(typeof input === 'string' || input instanceof URL ? input : (input as Request).url);
-    const grantNeedle = 'grant' + '_type';
-    if (url.includes('oauth/token') || url.includes(grantNeedle) || (typeof init?.body === 'string' && init.body.includes(grantNeedle))) {
-      spies.tokenPosts += 1;
-    }
-    if (origFetch) return origFetch(input as never, init);
-    throw new Error('no fetch');
-  }) as typeof fetch;
+function authFingerprint(req: http.IncomingMessage): string {
+  const raw = req.headers.authorization;
+  const value = Array.isArray(raw) ? raw[0] : raw;
+  const token = typeof value === 'string' ? value.replace(/^Bearer\s+/i, '') : '';
+  return fingerprintAccess(token);
 }
 
 async function withProxy(
-  access: { current: string },
+  getCredentialForAccount: () => Promise<string>,
   upstream: (req: http.IncomingMessage, res: http.ServerResponse) => void,
 ): Promise<{ proxy: LoopbackProxy; store: ReturnType<typeof openStore>; mock: http.Server }> {
   const store = openStore(':memory:');
@@ -104,39 +96,40 @@ async function withProxy(
     store,
     infoPath: join(dir, 'proxy.json'),
     idleTimeoutMs: 60_000,
-    getCredentialForAccount: async () => access.current,
+    getCredentialForAccount: async () => getCredentialForAccount(),
     upstreams: { anthropicBase: mock.url, codexBase: mock.url },
   });
   await proxy.start();
   return { proxy, store, mock: mock.server };
 }
 
+const BODY = {
+  model: 'claude-sonnet-5--qlb-high',
+  messages: [{ role: 'user', content: 'hi' }],
+};
+
 describe('consume 401 re-GET', () => {
-  it('resync-changed', async () => {
-    installSpies();
-    const access = { current: 'access-a' };
-    let hits = 0;
-    const { proxy, store, mock } = await withProxy(access, (_req, res) => {
-      hits += 1;
-      if (hits === 1) {
-        access.current = 'access-b';
+  it('resync-unchanged', async () => {
+    let reads = 0;
+    const fps: string[] = [];
+    const { proxy, store, mock } = await withProxy(
+      async () => {
+        reads += 1;
+        return 'access-a';
+      },
+      (req, res) => {
+        fps.push(authFingerprint(req));
         res.writeHead(401);
         res.end('{}');
-        return;
-      }
-      res.writeHead(200);
-      res.end('{}');
-    });
+      },
+    );
     try {
-      const result = await post(proxy.proxyInfo.port, proxy.proxyInfo.token, {
-        model: 'claude-sonnet-5--qlb-high',
-        messages: [{ role: 'user', content: 'hi' }],
-      });
-      assert.equal(result.status, 200);
-      const retry = hits >= 2 ? 1 : 0;
-      console.log(`RETRY=${retry} TOKEN_POSTS=${spies.tokenPosts} CSWAP_SPAWNS=${spies.cswapSpawns} SECURITY_WRITES=${spies.securityWrites}`);
-      assert.equal(retry, 1);
-      assert.equal(spies.tokenPosts, 0);
+      const result = await post(proxy.proxyInfo.port, proxy.proxyInfo.token, BODY);
+      assert.equal(result.status, 401);
+      console.log(`READS=${reads} UPSTREAM_FPS=${fps.length} RETRY=0`);
+      assert.equal(reads, 2);
+      assert.equal(fps.length, 1);
+      assert.equal(fps[0], fingerprintAccess('access-a'));
     } finally {
       await proxy.stop();
       mock.close();
@@ -144,25 +137,68 @@ describe('consume 401 re-GET', () => {
     }
   });
 
-  it('resync-unchanged', async () => {
-    installSpies();
-    const access = { current: 'access-a' };
-    let hits = 0;
-    const { proxy, store, mock } = await withProxy(access, (_req, res) => {
-      hits += 1;
-      res.writeHead(401);
-      res.end('{}');
-    });
+  it('resync-changed', async () => {
+    let reads = 0;
+    const tokens = ['access-a', 'access-b'];
+    const fps: string[] = [];
+    const { proxy, store, mock } = await withProxy(
+      async () => {
+        const token = tokens[Math.min(reads, tokens.length - 1)]!;
+        reads += 1;
+        return token;
+      },
+      (req, res) => {
+        fps.push(authFingerprint(req));
+        if (fps.length === 1) {
+          res.writeHead(401);
+          res.end('{}');
+          return;
+        }
+        res.writeHead(200);
+        res.end('{}');
+      },
+    );
     try {
-      const result = await post(proxy.proxyInfo.port, proxy.proxyInfo.token, {
-        model: 'claude-sonnet-5--qlb-high',
-        messages: [{ role: 'user', content: 'hi' }],
-      });
-      assert.equal(result.status, 401);
-      const retry = hits >= 2 ? 1 : 0;
-      console.log(`RETRY=${retry} TOKEN_POSTS=${spies.tokenPosts} CSWAP_SPAWNS=${spies.cswapSpawns} SECURITY_WRITES=${spies.securityWrites}`);
-      assert.equal(retry, 0);
-      assert.equal(spies.tokenPosts, 0);
+      const result = await post(proxy.proxyInfo.port, proxy.proxyInfo.token, BODY);
+      assert.equal(result.status, 200);
+      console.log(`READS=${reads} UPSTREAM_FPS=${fps.length} RETRY=1`);
+      assert.equal(reads, 2);
+      assert.deepEqual(fps, [fingerprintAccess('access-a'), fingerprintAccess('access-b')]);
+    } finally {
+      await proxy.stop();
+      mock.close();
+      store.close();
+    }
+  });
+
+  it('resync-between-read-rotation', async () => {
+    let reads = 0;
+    const tokens = ['access-a', 'access-b', 'access-c'];
+    const fps: string[] = [];
+    const { proxy, store, mock } = await withProxy(
+      async () => {
+        const token = tokens[Math.min(reads, tokens.length - 1)]!;
+        reads += 1;
+        return token;
+      },
+      (req, res) => {
+        fps.push(authFingerprint(req));
+        if (fps.length === 1) {
+          res.writeHead(401);
+          res.end('{}');
+          return;
+        }
+        res.writeHead(200);
+        res.end('{}');
+      },
+    );
+    try {
+      const result = await post(proxy.proxyInfo.port, proxy.proxyInfo.token, BODY);
+      assert.equal(result.status, 200);
+      console.log(`READS=${reads} UPSTREAM_FPS=${fps.length} SENT_SECOND=${fps[1] === fingerprintAccess('access-b') ? 'b' : 'other'}`);
+      assert.equal(reads, 2);
+      assert.deepEqual(fps, [fingerprintAccess('access-a'), fingerprintAccess('access-b')]);
+      assert.notEqual(fps[1], fingerprintAccess('access-c'));
     } finally {
       await proxy.stop();
       mock.close();

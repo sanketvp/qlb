@@ -376,6 +376,20 @@ def maybe_shutdown_proxy(home: str, info_path: str) -> None:
     sigterm_proxy(info, info_path)
 
 
+def final_shutdown() -> int:
+    """Lease unlink + last-lease decision + identity-guarded SIGTERM, under the mutex."""
+    home = qlb_home()
+    info_path = os.environ.get("QLB_PROXY_INFO_PATH") or os.path.join(home, "proxy.json")
+    wrapper_pid = int(os.environ["QLB_WRAPPER_PID"])
+    try:
+        os.unlink(lease_path(home, wrapper_pid))
+    except OSError:
+        pass
+    maybe_shutdown_proxy(home, info_path)
+    close_lock_fd()
+    return 0
+
+
 def intercepted(argv: list[str]) -> int:
     home = qlb_home()
     os.makedirs(home, mode=0o700, exist_ok=True)
@@ -406,12 +420,15 @@ def intercepted(argv: list[str]) -> int:
     if result.returncode != 0:
         return result.returncode or 1
 
+    helper = os.path.join(os.path.dirname(script), "qlb-proxy-token")
     child_env = os.environ.copy()
     child_env["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{port}"
     child_env["ANTHROPIC_CUSTOM_HEADERS"] = json.dumps({"x-qlb-session": session})
+    child_env["CLAUDE_CODE_API_KEY_HELPER"] = helper
+    child_env["QLB_HOME"] = home
+    child_env["QLB_PROXY_INFO_PATH"] = info_path
     child_env.pop("ANTHROPIC_AUTH_TOKEN", None)
     child_env.pop("ANTHROPIC_API_KEY", None)
-    child_env.pop("CLAUDE_CODE_API_KEY_HELPER", None)
     child_env.pop("CLAUDE_CONFIG_DIR", None)
 
     native = native_claude()
@@ -429,11 +446,19 @@ def intercepted(argv: list[str]) -> int:
     signal.signal(signal.SIGINT, handle)
     signal.signal(signal.SIGTERM, handle)
     code = child.wait()
+    shut_env = os.environ.copy()
+    shut_env["QLB_WRAPPER_PID"] = str(wrapper_pid)
+    shut_env["QLB_HOME"] = home
+    shut_env["QLB_PROXY_INFO_PATH"] = info_path
+    shut_env["QLB_PROXY_PORT"] = str(port)
     try:
-        os.unlink(lease_path(home, wrapper_pid))
-    except OSError:
-        pass
-    maybe_shutdown_proxy(home, info_path)
+        subprocess.run(
+            [mutex, lock, "--", sys.executable, script, "--qlb-final-shutdown"],
+            env=shut_env,
+            check=False,
+        )
+    except OSError as err:
+        sys.stderr.write(f"qlb wrapper: final mutex failed: {err}\n")
     if code < 0:
         return 128 + (-code)
     return code
@@ -443,6 +468,8 @@ def main() -> int:
     argv = sys.argv[1:]
     if argv[:1] == ["--qlb-critical-section"]:
         return critical_section()
+    if argv[:1] == ["--qlb-final-shutdown"]:
+        return final_shutdown()
     first = argv[0] if argv else ""
     if first in PASSTHROUGH:
         return passthrough(argv)

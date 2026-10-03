@@ -28,12 +28,110 @@ const WRAPPER = join(ROOT, 'harness', 'claude');
 
 const temps: string[] = [];
 const children: ChildProcess[] = [];
+const ports: number[] = [];
+
+function closePipes(child: ChildProcess): void {
+  try { child.stdout?.destroy(); } catch { /* ignore */ }
+  try { child.stderr?.destroy(); } catch { /* ignore */ }
+  try { child.stdin?.destroy(); } catch { /* ignore */ }
+}
+
+function pidsFromOutput(stdout: string): number[] {
+  return stdout.split('\n').map((line) => Number(line.trim())).filter((n) => Number.isInteger(n) && n > 1);
+}
+
+function pidsOnPort(port: number): number[] {
+  const r = spawnSync('lsof', ['-ti', `tcp:${port}`], { encoding: 'utf8' });
+  return pidsFromOutput(r.stdout || '');
+}
+
+function pidsReferencing(path: string): number[] {
+  const r = spawnSync('lsof', ['-t', path], { encoding: 'utf8' });
+  return pidsFromOutput(r.stdout || '');
+}
+
+function fixtureProxyProcs(dir: string): Array<{ pid: number; cmd: string }> {
+  const r = spawnSync('ps', ['-ax', '-o', 'pid=,command='], { encoding: 'utf8' });
+  const out: Array<{ pid: number; cmd: string }> = [];
+  for (const line of (r.stdout || '').split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const sp = trimmed.indexOf(' ');
+    if (sp <= 0) continue;
+    const pid = Number(trimmed.slice(0, sp));
+    const cmd = trimmed.slice(sp + 1);
+    if (!Number.isInteger(pid) || pid <= 1) continue;
+    if (!cmd.includes(dir)) continue;
+    if (cmd.includes('proxy --') || cmd.includes('cli.js proxy') || cmd.includes('fake-claude')) {
+      out.push({ pid, cmd });
+    }
+  }
+  return out;
+}
+
+function killPid(pid: number): void {
+  try { process.kill(pid, 'SIGKILL'); } catch { /* ignore */ }
+}
+
+function reapDir(dir: string, port?: number): void {
+  if (typeof port === 'number') {
+    for (const pid of pidsOnPort(port)) killPid(pid);
+  }
+  const info = join(dir, 'proxy.json');
+  if (existsSync(info)) {
+    for (const pid of pidsReferencing(info)) killPid(pid);
+  }
+  for (const proc of fixtureProxyProcs(dir)) killPid(proc.pid);
+}
+
+async function portIsClosed(port: number): Promise<boolean> {
+  return await new Promise<boolean>((resolve) => {
+    const sock = net.connect({ host: '127.0.0.1', port });
+    sock.once('connect', () => {
+      sock.destroy();
+      resolve(false);
+    });
+    sock.once('error', () => resolve(true));
+  });
+}
+
+async function assertCaseQuiet(dir: string, port: number): Promise<void> {
+  const info = join(dir, 'proxy.json');
+  const deadline = Date.now() + 4_000;
+  while (Date.now() < deadline) {
+    const listening = !(await portIsClosed(port));
+    const refs = existsSync(info) ? pidsReferencing(info) : [];
+    const procs = fixtureProxyProcs(dir).filter((p) => p.cmd.includes('proxy'));
+    if (!listening && refs.length === 0 && procs.length === 0) return;
+    await delay(50);
+  }
+  reapDir(dir, port);
+  assert.fail(`fixture still live for ${dir} port ${port}`);
+}
+
 after(() => {
   for (const child of children) {
     try { child.kill('SIGKILL'); } catch { /* ignore */ }
+    closePipes(child);
   }
+  const leftover: Array<{ pid: number; cmd: string }> = [];
   for (const dir of temps) {
-    spawnSync('rm', ['-rf', dir]);
+    leftover.push(...fixtureProxyProcs(dir).filter((p) => p.cmd.includes('cli.js proxy') || /\sproxy\s+--/.test(p.cmd)));
+    reapDir(dir);
+  }
+  for (const port of ports) {
+    for (const pid of pidsOnPort(port)) killPid(pid);
+  }
+  try {
+    assert.equal(
+      leftover.length,
+      0,
+      `fixture proxy processes remained: ${leftover.map((p) => `${p.pid} ${p.cmd}`).join('; ')}`,
+    );
+  } finally {
+    for (const dir of temps) {
+      spawnSync('rm', ['-rf', dir]);
+    }
   }
 });
 
@@ -49,7 +147,10 @@ function freePort(): Promise<number> {
     server.once('error', reject);
     server.listen(0, '127.0.0.1', () => {
       const port = (server.address() as AddressInfo).port;
-      server.close(() => resolve(port));
+      server.close(() => {
+        ports.push(port);
+        resolve(port);
+      });
     });
   });
 }
@@ -59,10 +160,11 @@ function writeFakeClaude(dir: string): string {
   writeFileSync(
     path,
     `#!/usr/bin/python3
-import os, signal, sys, time
+import os, signal, subprocess, sys, time, urllib.error, urllib.request
 print("ANTHROPIC_BASE_URL=" + os.environ.get("ANTHROPIC_BASE_URL", ""), flush=True)
 print("HAS_AUTH_TOKEN=" + ("1" if "ANTHROPIC_AUTH_TOKEN" in os.environ else "0"), flush=True)
 print("HAS_API_KEY=" + ("1" if "ANTHROPIC_API_KEY" in os.environ else "0"), flush=True)
+print("HAS_HELPER=" + ("1" if os.environ.get("CLAUDE_CODE_API_KEY_HELPER") else "0"), flush=True)
 if "--exit" in sys.argv:
     sys.exit(int(sys.argv[sys.argv.index("--exit") + 1]))
 if "--wait-signal" in sys.argv:
@@ -72,6 +174,26 @@ if "--wait-signal" in sys.argv:
     signal.signal(signal.SIGTERM, handle)
     time.sleep(60)
     sys.exit(0)
+if "--request-health" in sys.argv:
+    helper = os.environ.get("CLAUDE_CODE_API_KEY_HELPER") or ""
+    base = os.environ.get("ANTHROPIC_BASE_URL") or ""
+    token = ""
+    if helper:
+        token = subprocess.check_output([helper], text=True, env=os.environ).strip()
+    host = base.split("://", 1)[-1]
+    req = urllib.request.Request(
+        base.rstrip("/") + "/qlb/health",
+        headers={"Authorization": "Bearer " + token, "Host": host},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            print("PROXY_STATUS=" + str(getattr(resp, "status", 200)), flush=True)
+            print("HELPER_USED=" + ("1" if helper else "0"), flush=True)
+            sys.exit(0)
+    except (urllib.error.URLError, TimeoutError, OSError):
+        print("PROXY_STATUS=0", flush=True)
+        sys.exit(1)
 sys.exit(0)
 `,
   );
@@ -104,6 +226,7 @@ function envFor(home: string, port: number, fake: string, extra: NodeJS.ProcessE
 function spawnTracked(cmd: string, args: string[], opts: { env?: NodeJS.ProcessEnv; cwd?: string }): ChildProcess {
   const child = spawn(cmd, args, { ...opts, stdio: ['ignore', 'pipe', 'pipe'] });
   children.push(child);
+  child.on('exit', () => closePipes(child));
   return child;
 }
 
@@ -118,15 +241,18 @@ function waitExit(child: ChildProcess, timeoutMs = 15_000): Promise<number> {
   return new Promise((resolve, reject) => {
     const t = setTimeout(() => {
       try { child.kill('SIGKILL'); } catch { /* ignore */ }
+      closePipes(child);
       reject(new Error('timeout waiting for exit'));
     }, timeoutMs);
     child.on('exit', (code, signal) => {
       clearTimeout(t);
+      closePipes(child);
       if (typeof code === 'number') resolve(code);
       else resolve(128);
     });
     child.on('error', (err) => {
       clearTimeout(t);
+      closePipes(child);
       reject(err);
     });
   });
@@ -196,14 +322,6 @@ except BlockingIOError:
     assert.match(blocked.stdout, /EWOULDBLOCK/);
     writeFileSync(fifo, 'x');
     await waitExit(child, 5_000);
-    const acquired = spawnSync('/usr/bin/python3', ['-c', `
-import fcntl, os
-fd = os.open(${JSON.stringify(lock)}, os.O_RDWR)
-fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-print('GOT')
-`], { encoding: 'utf8' });
-    assert.equal(acquired.status, 0, acquired.stderr);
-    console.log('HOLD=1 BLOCKED=1 ACQUIRED=1');
   });
 
   it('mutex-released-while-child-alive', async () => {
@@ -238,6 +356,7 @@ print('SECOND_ACQUIRED')
     assert.match(second.stdout, /SECOND_ACQUIRED/);
     try { process.kill(childPid, 'SIGKILL'); } catch { /* ignore */ }
     try { crit.kill('SIGKILL'); } catch { /* ignore */ }
+    await waitExit(crit, 5_000).catch(() => undefined);
   });
 
   it('direct-second-start', async () => {
@@ -255,10 +374,11 @@ print('SECOND_ACQUIRED')
       timeout: 8_000,
     });
     assert.notEqual(second.status, 0);
-    const after = readFileSync(info);
-    assert.deepEqual(after, before);
+    const afterBytes = readFileSync(info);
+    assert.deepEqual(afterBytes, before);
     first.kill('SIGTERM');
     await waitExit(first, 5_000).catch(() => undefined);
+    await assertCaseQuiet(dir, port);
   });
 
   it('wrapper-attach-sequential', async () => {
@@ -285,6 +405,7 @@ print('SECOND_ACQUIRED')
     await Promise.all([waitExit(w1, 8_000), waitExit(w2, 8_000)]);
     void o1;
     void o2;
+    await assertCaseQuiet(dir, port);
   });
 
   it('wrapper-attach-simultaneous', async () => {
@@ -321,6 +442,7 @@ print('SECOND_ACQUIRED')
       codes.every((c) => c === 143 || c === 0 || c === 130 || c === 1),
       `exit codes ${codes.join(',')}`,
     );
+    await assertCaseQuiet(dir, port);
   });
 
   it('wrapper-normal-exit', async () => {
@@ -338,6 +460,7 @@ print('SECOND_ACQUIRED')
       ? spawnSync('ls', [leases], { encoding: 'utf8' }).stdout.trim()
       : '';
     assert.equal(leftover, '');
+    await assertCaseQuiet(dir, port);
   });
 
   it('wrapper-sigint', async () => {
@@ -355,6 +478,7 @@ print('SECOND_ACQUIRED')
     assert.equal(code, 130);
     console.log(out.stdout.includes('SIGNAL=INT') ? 'SIGNAL=INT' : out.stdout);
     assert.match(out.stdout, /SIGNAL=INT/);
+    await assertCaseQuiet(dir, port);
   });
 
   it('wrapper-sigterm', async () => {
@@ -372,6 +496,7 @@ print('SECOND_ACQUIRED')
     assert.equal(code, 143);
     console.log(out.stdout.includes('SIGNAL=TERM') ? 'SIGNAL=TERM' : out.stdout);
     assert.match(out.stdout, /SIGNAL=TERM/);
+    await assertCaseQuiet(dir, port);
   });
 
   it('wrapper-stale-lease', async () => {
@@ -386,6 +511,7 @@ print('SECOND_ACQUIRED')
     collect(w);
     await waitExit(w, 12_000);
     assert.equal(existsSync(join(leases, '1')), false);
+    await assertCaseQuiet(dir, port);
   });
 
   it('wrapper-pid-reuse', async () => {
@@ -406,6 +532,7 @@ print('SECOND_ACQUIRED')
     await waitExit(w, 12_000);
     console.log(out.stdout.includes('PID_REUSE_REAP=1') ? 'PID_REUSE_REAP=1' : out.stdout);
     assert.match(out.stdout, /PID_REUSE_REAP=1/);
+    await assertCaseQuiet(dir, port);
   });
 
   it('wrapper-death-before-ownership', async () => {
@@ -424,9 +551,7 @@ print('SECOND_ACQUIRED')
     w1.kill('SIGKILL');
     for (const line of kids.stdout.split('\n')) {
       const pid = Number(line.trim());
-      if (pid > 1) {
-        try { process.kill(pid, 'SIGKILL'); } catch { /* ignore */ }
-      }
+      if (pid > 1) killPid(pid);
     }
     await delay(150);
     const w2 = spawnTracked('/usr/bin/python3', [WRAPPER, '--exit', '0'], { env: envFor(dir, port, fake) });
@@ -435,15 +560,10 @@ print('SECOND_ACQUIRED')
     assert.notEqual(code, 0);
     console.log(o2.stdout.includes('ORPHAN_LISTEN=fail-closed') ? 'ORPHAN_LISTEN=fail-closed' : o2.stdout);
     assert.match(o2.stdout, /ORPHAN_LISTEN=fail-closed/);
+    for (const pid of pidsOnPort(port)) killPid(pid);
     try { unlinkSync(marker); } catch { /* ignore */ }
-    const lingering = spawnSync('lsof', ['-ti', `tcp:${port}`], { encoding: 'utf8' });
-    for (const line of lingering.stdout.split('\n')) {
-      const pid = Number(line.trim());
-      if (pid > 1) {
-        try { process.kill(pid, 'SIGKILL'); } catch { /* ignore */ }
-      }
-    }
     await waitExit(w1, 5_000).catch(() => undefined);
+    await assertCaseQuiet(dir, port);
   });
 
   it('wrapper-forced-death', async () => {
@@ -461,6 +581,7 @@ print('SECOND_ACQUIRED')
     collect(w2);
     const code = await waitExit(w2, 12_000);
     assert.equal(code, 0);
+    await assertCaseQuiet(dir, port);
   });
 
   it('wrapper-final-shutdown', async () => {
@@ -474,6 +595,7 @@ print('SECOND_ACQUIRED')
     await waitExit(w, 12_000);
     await delay(400);
     assert.equal(existsSync(join(dir, 'proxy.json')), false);
+    await assertCaseQuiet(dir, port);
   });
 
   it('wrapper-orphan-cleanup', async () => {
@@ -492,6 +614,7 @@ print('SECOND_ACQUIRED')
     await waitExit(w2, 12_000);
     console.log(o2.stdout.includes('ORPHAN_CLEANUP=1') ? 'ORPHAN_CLEANUP=1' : o2.stdout);
     assert.match(o2.stdout, /ORPHAN_CLEANUP=1/);
+    await assertCaseQuiet(dir, port);
   });
 
   it('wrapper-passthrough', async () => {
@@ -503,5 +626,63 @@ print('SECOND_ACQUIRED')
       assert.equal(r.status, 0, r.stderr);
       assert.match(r.stdout, /ANTHROPIC_BASE_URL=$/m);
     }
+  });
+
+  it('wrapper-claude-requests-proxy-with-helper', async () => {
+    const dir = tmp();
+    mkdirSync(join(dir, 'proxy-leases'), { recursive: true });
+    const port = await freePort();
+    const fake = writeFakeClaude(dir);
+    const env = envFor(dir, port, fake);
+    const w = spawnTracked('/usr/bin/python3', [WRAPPER, '--request-health'], { env });
+    const out = collect(w);
+    const code = await waitExit(w, 15_000);
+    assert.equal(code, 0, out.stderr + out.stdout);
+    assert.match(out.stdout, /HAS_AUTH_TOKEN=0/);
+    assert.match(out.stdout, /HAS_HELPER=1/);
+    assert.match(out.stdout, /HELPER_USED=1/);
+    assert.match(out.stdout, /PROXY_STATUS=200/);
+    await assertCaseQuiet(dir, port);
+  });
+
+  it('wrapper-attach-vs-final-shutdown', async () => {
+    const dir = tmp();
+    mkdirSync(join(dir, 'proxy-leases'), { recursive: true });
+    const port = await freePort();
+    const fake = writeFakeClaude(dir);
+    const env = envFor(dir, port, fake);
+    const lock = join(dir, 'proxy.lock');
+    const w1 = spawnTracked('/usr/bin/python3', [WRAPPER, '--wait-signal'], { env });
+    const o1 = collect(w1);
+    await waitForFile(join(dir, 'proxy.json'), 10_000);
+    await waitFor(() => o1.stdout.includes('ANTHROPIC_BASE_URL='), 8_000, 'w1 child');
+
+    const fifo = join(dir, 'hold-final.fifo');
+    spawnSync('mkfifo', [fifo]);
+    const holder = spawnTracked('/usr/bin/python3', [MUTEX, lock, '--', '/bin/sh', '-c', 'echo HELD; exec cat "$1"', 'sh', fifo], {
+      env: process.env,
+    });
+    const holdOut = collect(holder);
+    await waitFor(() => holdOut.stdout.includes('HELD'), 5_000, 'mutex held');
+
+    w1.kill('SIGTERM');
+    await waitFor(() => o1.stdout.includes('SIGNAL=TERM'), 5_000, 'w1 signal');
+    await delay(400);
+
+    const w2 = spawnTracked('/usr/bin/python3', [WRAPPER, '--wait-signal'], { env });
+    const o2 = collect(w2);
+    await delay(400);
+
+    writeFileSync(fifo, 'x');
+    await waitExit(holder, 5_000).catch(() => undefined);
+
+    await waitFor(() => o2.stdout.includes('ANTHROPIC_BASE_URL='), 12_000, 'w2 attached');
+    await waitFor(() => existsSync(join(dir, 'proxy.json')), 8_000, 'proxy.json after race');
+    const info = JSON.parse(readFileSync(join(dir, 'proxy.json'), 'utf8')) as { token: string };
+    const status = await health(port, info.token);
+    assert.equal(status, 200);
+    w2.kill('SIGTERM');
+    await Promise.all([waitExit(w1, 10_000).catch(() => undefined), waitExit(w2, 10_000)]);
+    await assertCaseQuiet(dir, port);
   });
 });

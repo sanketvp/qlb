@@ -49,7 +49,7 @@ function identityOf(entry: Record<string, unknown> | null): {
   const email = typeof entry.email === 'string' ? entry.email : '';
   const organizationUuid =
     typeof entry.organizationUuid === 'string' ? entry.organizationUuid : '';
-  if (!email && !organizationUuid) return null;
+  if (!email || !organizationUuid) return null;
   return { email, organizationUuid };
 }
 
