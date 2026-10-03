@@ -22,7 +22,13 @@ interface SmokeResult {
   events: Array<{ type?: string; error?: { errorMessage?: string } }>;
 }
 
-function load(opts: { owner?: string; states: string; call?: boolean; marker?: boolean }): SmokeResult {
+function load(opts: {
+  owner?: string;
+  states: string;
+  call?: boolean;
+  marker?: boolean;
+  env?: NodeJS.ProcessEnv;
+}): SmokeResult {
   const home = mkdtempSync(join(tmpdir(), 'qlb-pi-smoke-'));
   if (opts.marker) {
     mkdirSync(join(home, '.qlb'), { recursive: true });
@@ -42,6 +48,7 @@ function load(opts: { owner?: string; states: string; call?: boolean; marker?: b
     SMOKE_STATES: opts.states,
     SMOKE_COUNTER: join(home, 'qlb-calls'),
     SMOKE_CALL: opts.call ? '1' : '0',
+    ...opts.env,
   };
   const r = spawnSync(process.execPath, [join(FIXTURES, 'load-extension.mjs')], {
     env,
@@ -98,6 +105,16 @@ describe('qlb-pi production default export (Pi jiti loader)', { skip: piAvailabl
     const mid = load({ states: 'NATIVE', marker: true, call: true });
     assert.equal(mid.poolStillRegistered, false);
     assert.equal(mid.events[0]!.error?.errorMessage, CONSUME_ERRORS.stateInconsistent);
+  });
+
+  it('marker beside a custom QLB_DB_PATH is honored', () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-pi-smoke-db-'));
+    const dbDir = join(home, 'custom-db');
+    mkdirSync(dbDir, { recursive: true });
+    writeFileSync(join(dbDir, 'consume-anthropic.json'), '{"state":"CONSUMED"}\n');
+    const r = load({ states: 'unknown', call: true, env: { QLB_DB_PATH: join(dbDir, 'qlb.db') } });
+    assert.equal(r.poolStillRegistered, false);
+    assert.equal(r.events[0]!.error?.errorMessage, CONSUME_ERRORS.stateUnknown);
   });
 
   it('owned mode still unregisters the existing provider before registering', () => {

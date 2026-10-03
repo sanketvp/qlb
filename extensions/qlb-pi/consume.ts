@@ -8,8 +8,9 @@
 
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
-import { userInfo } from "node:os";
+import { existsSync, readFileSync } from "node:fs";
+import { homedir, userInfo } from "node:os";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 
 export const CSWAP_ACTIVE_ID = "cswap-active";
 export const ACTIVE_CC_SERVICE = "Claude Code-credentials";
@@ -106,6 +107,33 @@ export function readActiveClaudeAccess(opts: {
   return { access, fingerprint: fingerprintAccess(access) };
 }
 
+/**
+ * Where `qlb consume enable` writes its marker: beside the QLB database, resolved
+ * exactly as src/config.ts resolveConfig does from the environment and config
+ * file (QLB_DB_PATH, then config.json `dbPath`, then ~/.qlb/qlb.db). Pi cannot
+ * see per-invocation CLI flags; test/qlb-pi-consume.test.ts pins the parity.
+ */
+export function consumeMarkerPath(env: NodeJS.ProcessEnv = process.env, home: string = homedir()): string {
+  const expand = (value: string): string => {
+    if (value === "~") return home;
+    if (value.startsWith("~/") || value.startsWith("~\\")) return join(home, value.slice(2));
+    return isAbsolute(value) ? value : resolve(value);
+  };
+  const defaultDb = join(home, ".qlb", "qlb.db");
+  const configPath = expand(env.QLB_CONFIG_PATH ?? join(home, ".qlb", "config.json"));
+  let fileDb: unknown;
+  if (existsSync(configPath)) {
+    try {
+      fileDb = asRecord(JSON.parse(readFileSync(configPath, "utf8")))?.dbPath;
+    } catch {
+      fileDb = undefined; // the CLI ignores an invalid config file too
+    }
+  }
+  const raw = env.QLB_DB_PATH ?? fileDb ?? defaultDb;
+  const dbPath = typeof raw === "string" && raw.length > 0 ? expand(raw) : defaultDb;
+  return join(dirname(dbPath), "consume-anthropic.json");
+}
+
 export type OwnerFileState = "absent" | "valid" | "malformed";
 export type ConsumeJournal = "CONSUMED" | "NATIVE" | "unknown";
 export type PiMode = "inert" | "owned" | "consume" | "conflict";
@@ -141,7 +169,7 @@ export interface PiModeInput {
   rehearsal: string | undefined;
   owner: OwnerFileState;
   journal: ConsumeJournal;
-  /** `~/.qlb/consume-anthropic.json` exists (written by `qlb consume enable`). */
+  /** The consume marker (consumeMarkerPath) exists — written by `qlb consume enable`. */
   marker: boolean;
 }
 

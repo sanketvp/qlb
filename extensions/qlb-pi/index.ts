@@ -79,6 +79,7 @@ import { shapeAnthropicOAuthPayload } from "./request-shaping.js";
 import {
   conflictMessage,
   CONSUME_ERRORS,
+  consumeMarkerPath,
   CSWAP_ACTIVE_ID,
   decidePiMode,
   parseConsumeStatus,
@@ -97,8 +98,6 @@ import {
 const OWNER_FILE = join(homedir(), ".pi", "agent", "qlb-owner.json");
 const AUDIT_DIR = join(homedir(), ".qlb");
 const AUDIT_FILE = join(AUDIT_DIR, "outcomes.jsonl");
-// Written by `qlb consume enable`, removed by `disable`: a CLI-independent consume signal.
-const CONSUME_MARKER = join(AUDIT_DIR, "consume-anthropic.json");
 
 function findQlbCli(): { cmd: string; prefix: string[] } {
   if (process.env.QLB_CLI) {
@@ -273,7 +272,8 @@ export default async function (pi: ExtensionAPI): Promise<void> {
           rehearsal,
           owner: readOwnerFileState(OWNER_FILE),
           journal: await qlbConsumeJournal(),
-          marker: existsSync(CONSUME_MARKER),
+          // Written by `qlb consume enable`, removed by `disable`: a CLI-independent signal.
+          marker: existsSync(consumeMarkerPath()),
         };
   const mode = modeInput ? decidePiMode(modeInput) : "inert";
   if (mode === "inert") {

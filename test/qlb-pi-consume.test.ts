@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { describe, it } from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 
+import { resolveConfig } from '../src/config';
 import {
   activeCcSecurityArgs as srcArgs,
   getActiveClaudeCodeAccess,
@@ -14,6 +15,7 @@ import {
   activeCcSecurityArgs,
   conflictMessage,
   consumeAccessSource,
+  consumeMarkerPath,
   CONSUME_ERRORS,
   CSWAP_ACTIVE_ID,
   decidePiMode,
@@ -188,6 +190,45 @@ function sequence(values: string[]): { read: () => ActiveAccess; reads: () => nu
     reads: () => n,
   };
 }
+
+describe('consume marker path parity with the CLI', () => {
+  it('resolves the marker beside the same database the CLI uses', () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-pi-marker-'));
+    const custom = join(home, 'custom.json');
+    writeFileSync(custom, JSON.stringify({ dbPath: '~/elsewhere/q.db' }));
+    const bad = join(home, 'bad.json');
+    writeFileSync(bad, '{not json');
+    const arr = join(home, 'arr.json');
+    writeFileSync(arr, '[]');
+    mkdirSync(join(home, '.qlb'), { recursive: true });
+    const cases: NodeJS.ProcessEnv[] = [
+      {},
+      { QLB_DB_PATH: join(home, 'db', 'q.db') },
+      { QLB_DB_PATH: '~/tilde/q.db' },
+      { QLB_DB_PATH: '' },
+      { QLB_CONFIG_PATH: custom },
+      { QLB_CONFIG_PATH: custom, QLB_DB_PATH: join(home, 'env-wins', 'q.db') },
+      { QLB_CONFIG_PATH: bad },
+      { QLB_CONFIG_PATH: arr },
+      { QLB_CONFIG_PATH: join(home, 'missing.json') },
+    ];
+    for (const env of cases) {
+      const cli = resolveConfig({ argv: [], env, home, warn: () => undefined });
+      assert.equal(
+        consumeMarkerPath(env, home),
+        join(dirname(cli.dbPath), 'consume-anthropic.json'),
+        JSON.stringify(env),
+      );
+    }
+    // Default config file location is honored as well.
+    writeFileSync(join(home, '.qlb', 'config.json'), JSON.stringify({ dbPath: join(home, 'cfg', 'q.db') }));
+    assert.equal(consumeMarkerPath({}, home), join(home, 'cfg', 'consume-anthropic.json'));
+    assert.equal(
+      join(dirname(resolveConfig({ argv: [], env: {}, home, warn: () => undefined }).dbPath), 'consume-anthropic.json'),
+      join(home, 'cfg', 'consume-anthropic.json'),
+    );
+  });
+});
 
 describe('qlb-pi consume 401 reread source', () => {
   it('A→B: one reread, retry sends exactly B', async () => {
