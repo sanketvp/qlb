@@ -21,7 +21,8 @@
     "build": "tsc",
     "start": "node dist/cli.js",
     "dev": "ts-node src/cli.ts",
-    "test": "tsc -p tsconfig.test.json && node --test dist-test/test/*.test.js"
+    "test": "tsc -p tsconfig.test.json && node --test dist-test/test/*.test.js",
+    "typecheck:pi": "tsc && node scripts/typecheck-pi.js"
   },
   "engines": {
     "node": ">=22"

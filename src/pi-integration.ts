@@ -7,14 +7,162 @@
  * and whether the installed extension copy matches the tracked source.
  */
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync, readdirSync, type Dirent } from 'node:fs';
-import { homedir } from 'node:os';
-import { join } from 'node:path';
+import {
+  accessSync,
+  constants as fsConstants,
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+  type Dirent,
+} from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
+import { delimiter, dirname, isAbsolute, join, resolve } from 'node:path';
 import type { DoctorCheck } from './diagnostics';
 import { findQlbRepoRoot } from './setup';
 
-const PI_PKG = '/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent';
-const PI_EXT_DIR = join(homedir(), '.pi', 'agent', 'extensions', 'qlb-pi');
+const PI_PACKAGE_NAME = '@earendil-works/pi-coding-agent';
+const DEFAULT_PI_EXT_DIR = join(homedir(), '.pi', 'agent', 'extensions', 'qlb-pi');
+
+function isPiPackageRoot(dir: string): boolean {
+  try {
+    const pkg = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')) as { name?: unknown };
+    return pkg.name === PI_PACKAGE_NAME;
+  } catch {
+    return false;
+  }
+}
+
+export interface PiLocation {
+  /** Package root of the Pi the user runs, or null. */
+  root: string | null;
+  /** First `pi` launcher found on PATH (the one a shell would run), if any. */
+  launcher?: string;
+  /** A launcher exists but its package could not be located (e.g. a compiled shim). */
+  unresolved?: boolean;
+}
+
+function walkUpToPiRoot(start: string): string | null {
+  let cur = start;
+  for (let i = 0; i < 8 && cur !== dirname(cur); i++, cur = dirname(cur)) {
+    if (isPiPackageRoot(cur)) return cur;
+  }
+  return null;
+}
+
+/** Script shims (npm .cmd/.ps1/sh wrappers) name the package path in their text. */
+function rootFromShimText(launcher: string): string | null {
+  let text: string;
+  try {
+    const buf = readFileSync(launcher);
+    if (buf.length > 64 * 1024 || buf.includes(0)) return null; // binary shim
+    text = buf.toString('utf8');
+  } catch {
+    return null;
+  }
+  const re = /([^\s"'`=]*@earendil-works[\\/]pi-coding-agent)(?=[\\/"'`\s]|$)/g;
+  for (const match of text.matchAll(re)) {
+    const raw = match[1]!
+      .replace(/^(%~dp0|%dp0%|\$basedir|\$\{basedir\}|\$PSScriptRoot)[\\/]?/i, '')
+      .replace(/\\/g, '/');
+    const candidate = isAbsolute(raw) ? raw : join(dirname(launcher), raw);
+    if (isPiPackageRoot(candidate)) return candidate;
+  }
+  return null;
+}
+
+function launcherNames(platform: NodeJS.Platform, env: NodeJS.ProcessEnv): string[] {
+  if (platform !== 'win32') return ['pi'];
+  // PowerShell model (the documented Windows workflow): pi.ps1 first (PowerShell
+  // runs scripts even when .PS1 is not in PATHEXT), then PATHEXT names in order;
+  // an extensionless `pi` (npm's sh shim) is not runnable there.
+  const exts = (env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD').split(';').filter(Boolean).map((e) => e.toLowerCase());
+  return ['pi.ps1', ...exts.filter((e) => e !== '.ps1').map((e) => `pi${e}`)];
+}
+
+/** PATH entries in shell search order. Unset PATH searches nothing. */
+function pathEntries(platform: NodeJS.Platform, env: NodeJS.ProcessEnv): string[] {
+  if (env.PATH === undefined) return [];
+  const parts = env.PATH.split(platform === 'win32' ? ';' : delimiter);
+  // POSIX shells read an empty entry as the current directory; PowerShell ignores it.
+  return platform === 'win32' ? parts.filter(Boolean) : parts.map((d) => d || '.');
+}
+
+/**
+ * Locate the Pi install the user actually runs: QLB_PI_PACKAGE_ROOT if set; else the
+ * package behind the FIRST `pi` launcher on PATH (symlink target, or the path named
+ * in a script shim). If that launcher cannot be traced, report it as unresolved
+ * rather than falling through to a later, possibly stale install. Well-known npm
+ * global prefixes are consulted only when no `pi` is on PATH at all.
+ */
+export function locatePi(
+  env: NodeJS.ProcessEnv = process.env,
+  home: string = homedir(),
+  platform: NodeJS.Platform = process.platform,
+): PiLocation {
+  const override = env.QLB_PI_PACKAGE_ROOT ? resolve(env.QLB_PI_PACKAGE_ROOT) : undefined;
+  if (override) return isPiPackageRoot(override) ? { root: override } : { root: null, unresolved: true };
+  const names = launcherNames(platform, env);
+  for (const dir of pathEntries(platform, env)) {
+    for (const name of names) {
+      const bin = join(dir, name);
+      try {
+        if (!statSync(bin).isFile()) continue; // a shell skips directories named pi
+        accessSync(bin, platform === 'win32' ? fsConstants.F_OK : fsConstants.X_OK);
+      } catch {
+        continue;
+      }
+      let root: string | null = null;
+      try {
+        root = walkUpToPiRoot(dirname(realpathSync(bin)));
+      } catch {
+        root = null;
+      }
+      root ??= rootFromShimText(bin);
+      return root ? { root, launcher: bin } : { root: null, launcher: bin, unresolved: true };
+    }
+  }
+  for (const prefix of [join(home, '.local'), '/opt/homebrew', '/usr/local']) {
+    const candidate = join(prefix, 'lib', 'node_modules', ...PI_PACKAGE_NAME.split('/'));
+    if (isPiPackageRoot(candidate)) return { root: candidate };
+  }
+  return { root: null };
+}
+
+export function resolvePiPackageRoot(
+  env: NodeJS.ProcessEnv = process.env,
+  home: string = homedir(),
+): string | null {
+  return locatePi(env, home).root;
+}
+
+/**
+ * The extension's tsconfig.json pins one machine's Pi paths; doctor typechecks
+ * against the resolved install through a generated config instead.
+ */
+export function piTypecheckConfig(extensionDir: string, piRoot: string): Record<string, unknown> {
+  const base = JSON.parse(readFileSync(join(extensionDir, 'tsconfig.json'), 'utf8')) as {
+    compilerOptions?: Record<string, unknown>;
+  };
+  const piAi = join(piRoot, 'node_modules', '@earendil-works', 'pi-ai', 'dist');
+  return {
+    compilerOptions: {
+      ...base.compilerOptions,
+      typeRoots: [join(piRoot, 'node_modules', '@types')],
+      paths: {
+        '@earendil-works/pi-coding-agent': [join(piRoot, 'dist', 'index.d.ts')],
+        '@earendil-works/pi-ai': [join(piAi, 'index.d.ts')],
+        '@earendil-works/pi-ai/*': [join(piAi, '*.d.ts')],
+        '@earendil-works/pi-tui': [join(piRoot, 'node_modules', '@earendil-works', 'pi-tui', 'dist', 'index.d.ts')],
+      },
+    },
+    include: [join(extensionDir, '*.ts')],
+  };
+}
 /** Pi runtime seams the extension calls; missing → the extension throws at load or first stream. */
 const PI_SEAMS: Array<{ id: string; dir: string; pattern: RegExp; why: string }> = [
   { id: 'anthropicMessagesApi', dir: 'node_modules/@earendil-works/pi-ai/dist', pattern: /\banthropicMessagesApi\b/, why: 'qlb-pi forwards Anthropic streams through anthropicMessagesApi().streamSimple' },
@@ -39,6 +187,10 @@ function dtsFiles(dir: string, out: string[] = [], depth = 0): string[] {
 export interface PiIntegrationOptions {
   /** Run `tsc --noEmit` against the installed Pi types (slow, ~3s). doctor --live turns it on. */
   typecheck?: boolean;
+  /** Pi location; defaults to locatePi(). */
+  pi?: PiLocation;
+  /** Installed extension directory; defaults to ~/.pi/agent/extensions/qlb-pi. */
+  extensionDir?: string;
   run?: (cmd: string, args: string[], opts?: { cwd?: string; timeoutMs?: number }) => string;
 }
 
@@ -51,7 +203,19 @@ export function piIntegrationChecks(options: PiIntegrationOptions = {}): DoctorC
   const run = options.run ?? ((cmd: string, args: string[], o: { cwd?: string; timeoutMs?: number } = {}) =>
     execFileSync(cmd, args, { encoding: 'utf8', cwd: o.cwd, timeout: o.timeoutMs ?? 60_000, stdio: ['ignore', 'pipe', 'pipe'] }));
 
-  if (!existsSync(PI_PKG) || !existsSync(PI_EXT_DIR)) {
+  const PI_EXT_DIR = options.extensionDir ?? DEFAULT_PI_EXT_DIR;
+  const located = options.pi ?? locatePi();
+  if (located.unresolved && existsSync(PI_EXT_DIR)) {
+    checks.push({
+      name: 'pi:extension',
+      level: 'WARN',
+      message: `found ${located.launcher ?? 'QLB_PI_PACKAGE_ROOT'} but could not locate its @earendil-works/pi-coding-agent package; Pi checks skipped`,
+      detail: { fix: 'export QLB_PI_PACKAGE_ROOT=<path to the pi-coding-agent package your pi runs>' },
+    });
+    return checks;
+  }
+  const PI_PKG = located.root;
+  if (!PI_PKG || !existsSync(PI_EXT_DIR)) {
     checks.push({ name: 'pi:extension', level: 'PASS', message: 'Pi or the qlb-pi extension is not installed; skipping Pi checks' });
     return checks;
   }
@@ -65,7 +229,7 @@ export function piIntegrationChecks(options: PiIntegrationOptions = {}): DoctorC
     const drift = readdirSync(src).filter((f) => f.endsWith('.ts') && f !== 'tsconfig.json')
       .filter((f) => readText(join(src, f)) !== readText(join(PI_EXT_DIR, f)));
     checks.push(drift.length === 0
-      ? { name: 'pi:extension', level: 'PASS', message: `~/.pi/agent/extensions/qlb-pi matches ${src} (pi ${piVersion})` }
+      ? { name: 'pi:extension', level: 'PASS', message: `~/.pi/agent/extensions/qlb-pi matches ${src} (pi ${piVersion} at ${PI_PKG})` }
       : { name: 'pi:extension', level: 'WARN', message: `installed qlb-pi differs from source: ${drift.join(', ')}`, detail: { fix: `cp ${src}/*.ts ${PI_EXT_DIR}/` } });
   }
 
@@ -93,8 +257,12 @@ export function piIntegrationChecks(options: PiIntegrationOptions = {}): DoctorC
 
   // 3. Typecheck the extension against the installed Pi types (catches signature drift, not just renames).
   if (options.typecheck && repoRoot) {
+    let tmp: string | undefined;
     try {
-      run('npx', ['tsc', '-p', join(repoRoot, 'extensions', 'qlb-pi', 'tsconfig.json'), '--noEmit'], { cwd: repoRoot, timeoutMs: 120_000 });
+      tmp = mkdtempSync(join(tmpdir(), 'qlb-pi-typecheck-'));
+      const cfg = join(tmp, 'tsconfig.json');
+      writeFileSync(cfg, JSON.stringify(piTypecheckConfig(join(repoRoot, 'extensions', 'qlb-pi'), PI_PKG)));
+      run('npx', ['tsc', '-p', cfg, '--noEmit'], { cwd: repoRoot, timeoutMs: 120_000 });
       checks.push({ name: 'pi:typecheck', level: 'PASS', message: `qlb-pi typechecks against pi ${piVersion}` });
     } catch (err) {
       const out = err instanceof Error && 'stdout' in err ? String((err as { stdout?: unknown }).stdout ?? '') : String(err);
@@ -102,8 +270,14 @@ export function piIntegrationChecks(options: PiIntegrationOptions = {}): DoctorC
       checks.push({
         name: 'pi:typecheck', level: 'WARN',
         message: `qlb-pi no longer typechecks against pi ${piVersion}: ${first.slice(0, 160)}`,
-        detail: { fix: 'cd ~/GIT/qlb && npx tsc -p extensions/qlb-pi/tsconfig.json --noEmit   # then adapt extensions/qlb-pi and re-sync', errors: out.split('\n').filter((l) => /error TS/.test(l)).slice(0, 10) },
+        detail: { fix: `qlb doctor --live   # typechecks extensions/qlb-pi against ${PI_PKG}; then adapt extensions/qlb-pi and re-sync`, errors: out.split('\n').filter((l) => /error TS/.test(l)).slice(0, 10) },
       });
+    } finally {
+      try {
+        if (tmp) rmSync(tmp, { recursive: true, force: true });
+      } catch {
+        // best-effort: a leftover temp dir must not replace the typecheck result
+      }
     }
   }
 
