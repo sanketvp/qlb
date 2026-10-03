@@ -227,29 +227,56 @@ def close_lock_fd() -> None:
     os.environ.pop("QLB_PROXY_LOCK_FD", None)
 
 
-def sigterm_proxy(info: dict[str, Any], info_path: str) -> None:
+def wait_identity_dead(pid: int, stored: str, timeout_s: float) -> bool:
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if not identity_live(pid, stored):
+            return True
+        time.sleep(0.05)
+    return not identity_live(pid, stored)
+
+
+def sigterm_proxy(info: dict[str, Any], info_path: str) -> bool:
+    """Identity-guarded stop. Unlinks ownership metadata only once the proxy is gone.
+
+    Returns False (metadata retained) if the proxy could not be confirmed dead.
+    """
     pid = info.get("pid")
     stored = info.get("lstart") or ""
+    stored = stored if isinstance(stored, str) else ""
     if not isinstance(pid, int):
-        return
-    if not identity_live(pid, stored if isinstance(stored, str) else ""):
-        return
+        return True
+    if not identity_live(pid, stored):
+        return True
     cmd = process_command(pid)
     if "proxy" not in cmd:
-        return
+        return True
     try:
         os.kill(pid, signal.SIGTERM)
     except OSError:
-        return
-    for _ in range(50):
-        if not identity_live(pid, stored if isinstance(stored, str) else ""):
-            break
-        time.sleep(0.05)
+        pass
+    dead = wait_identity_dead(pid, stored, 2.5)
+    if not dead:
+        # SIGTERM awaits server.close(); an in-flight request can hold it open.
+        # Re-check the same identity immediately before escalating.
+        if identity_live(pid, stored) and "proxy" in process_command(pid):
+            print("PROXY_SIGKILL=1", flush=True)
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+        dead = wait_identity_dead(pid, stored, 2.0)
+    if not dead:
+        sys.stderr.write(
+            f"qlb wrapper: proxy pid {pid} still alive after SIGKILL; keeping {info_path}\n"
+        )
+        return False
     try:
         if os.path.exists(info_path):
             os.unlink(info_path)
     except OSError:
         pass
+    return True
 
 
 def wait_for_proxy_json(info_path: str, timeout_s: float = 10.0) -> Optional[dict[str, Any]]:
@@ -278,7 +305,9 @@ def critical_section() -> int:
         stored = info.get("lstart") or ""
         if isinstance(pid, int) and identity_live(pid, stored if isinstance(stored, str) else ""):
             print("ORPHAN_CLEANUP=1", flush=True)
-            sigterm_proxy(info, info_path)
+            if not sigterm_proxy(info, info_path):
+                close_lock_fd()
+                return 1
             info = None
 
     atomic_write(
@@ -363,17 +392,17 @@ def record_terminating_signal(home: str, pid: int, name: str) -> None:
     atomic_write(path, json.dumps(row))
 
 
-def maybe_shutdown_proxy(home: str, info_path: str) -> None:
+def maybe_shutdown_proxy(home: str, info_path: str) -> bool:
     if live_leases(home):
-        return
+        return True
     info = read_json(info_path)
     if not info or info.get("startedBy") != "wrapper":
-        return
+        return True
     pid = info.get("pid")
     stored = info.get("lstart") or ""
     if not isinstance(pid, int) or not identity_live(pid, stored if isinstance(stored, str) else ""):
-        return
-    sigterm_proxy(info, info_path)
+        return True
+    return sigterm_proxy(info, info_path)
 
 
 def final_shutdown() -> int:
@@ -385,9 +414,9 @@ def final_shutdown() -> int:
         os.unlink(lease_path(home, wrapper_pid))
     except OSError:
         pass
-    maybe_shutdown_proxy(home, info_path)
+    ok = maybe_shutdown_proxy(home, info_path)
     close_lock_fd()
-    return 0
+    return 0 if ok else 1
 
 
 def intercepted(argv: list[str]) -> int:
@@ -432,33 +461,46 @@ def intercepted(argv: list[str]) -> int:
     child_env.pop("CLAUDE_CONFIG_DIR", None)
 
     native = native_claude()
-    child = subprocess.Popen([native, *argv], env=child_env)
+    child: Optional[subprocess.Popen[bytes]] = None
 
     def handle(signum: int, _frame: Any) -> None:
         name = "INT" if signum == signal.SIGINT else "TERM" if signum == signal.SIGTERM else str(signum)
         print(f"SIGNAL={name}", flush=True)
         record_terminating_signal(home, wrapper_pid, name)
+        if child is None:
+            return
         try:
             os.kill(child.pid, signum)
         except OSError:
             pass
 
-    signal.signal(signal.SIGINT, handle)
-    signal.signal(signal.SIGTERM, handle)
-    code = child.wait()
-    shut_env = os.environ.copy()
-    shut_env["QLB_WRAPPER_PID"] = str(wrapper_pid)
-    shut_env["QLB_HOME"] = home
-    shut_env["QLB_PROXY_INFO_PATH"] = info_path
-    shut_env["QLB_PROXY_PORT"] = str(port)
+    code = 1
     try:
-        subprocess.run(
-            [mutex, lock, "--", sys.executable, script, "--qlb-final-shutdown"],
-            env=shut_env,
-            check=False,
-        )
-    except OSError as err:
-        sys.stderr.write(f"qlb wrapper: final mutex failed: {err}\n")
+        signal.signal(signal.SIGINT, handle)
+        signal.signal(signal.SIGTERM, handle)
+        try:
+            child = subprocess.Popen([native, *argv], env=child_env)
+        except OSError as err:
+            sys.stderr.write(f"qlb wrapper: cannot launch {native}: {err.strerror or err}\n")
+            code = 126 if isinstance(err, PermissionError) else 127
+        else:
+            code = child.wait()
+    finally:
+        # Always release this wrapper's lease (and the proxy if last), even when
+        # the native launch fails, so no lease or --no-idle proxy is orphaned.
+        shut_env = os.environ.copy()
+        shut_env["QLB_WRAPPER_PID"] = str(wrapper_pid)
+        shut_env["QLB_HOME"] = home
+        shut_env["QLB_PROXY_INFO_PATH"] = info_path
+        shut_env["QLB_PROXY_PORT"] = str(port)
+        try:
+            subprocess.run(
+                [mutex, lock, "--", sys.executable, script, "--qlb-final-shutdown"],
+                env=shut_env,
+                check=False,
+            )
+        except OSError as err:
+            sys.stderr.write(f"qlb wrapper: final mutex failed: {err}\n")
     if code < 0:
         return 128 + (-code)
     return code

@@ -115,8 +115,8 @@ function collect(file: string): ScanResult {
         if (req && str) staticSpecs.push(str.value);
         continue;
       }
-      // import { x } from '…'  /  import '…'
-      for (let j = i + 1; j < Math.min(tokens.length, i + 40); j++) {
+      // import { x } from '…'  /  import '…'  (unbounded: no token cap on the clause)
+      for (let j = i + 1; j < tokens.length; j++) {
         if (tokens[j]!.kind === kinds.FromKeyword && isString(tokens[j + 1])) {
           staticSpecs.push(tokens[j + 1]!.value);
           break;
@@ -130,7 +130,7 @@ function collect(file: string): ScanResult {
       continue;
     }
     if (t.kind === kinds.ExportKeyword) {
-      for (let j = i + 1; j < Math.min(tokens.length, i + 40); j++) {
+      for (let j = i + 1; j < tokens.length; j++) {
         if (tokens[j]!.kind === kinds.FromKeyword && isString(tokens[j + 1])) {
           staticSpecs.push(tokens[j + 1]!.value);
           break;
@@ -186,16 +186,16 @@ describe('consume import-closure walker', () => {
       if (SECURITY_WRITE_RE.test(text)) securityWrites += 1;
       if (SPAWN_CSWAP_RE.test(text) || SPAWN_CURL_RE.test(text)) cswapSpawns += 1;
     }
-    // Runtime roots are in the guarded set for dynamic loading (fail closed on
-    // every import(/require(), any argument). Do not walk their full graph:
-    // cli/proxy legitimately import writers (refresh, native-resync, keychain).
-    let dynamic = consume.dynamic;
+    // Dynamic loading is fail-closed across the full static import closure of
+    // all seven roots. Writer exclusion stays scoped to the consume-only
+    // closure: cli/proxy legitimately import writers (refresh, native-resync, keychain).
     for (const file of RUNTIME_ROOTS) {
       assert.ok(existsSync(file), `missing runtime root ${relative(ROOT, file)}`);
-      dynamic += collect(file).dynamic;
     }
+    const all = closureOf(CLOSURE_ROOTS);
+    const dynamic = all.dynamic;
     console.log(
-      `WRITER_IMPORTS=${writerHits.length} TOKEN_TERMS=${tokenTerms} CSWAP_SPAWNS_SRC=${cswapSpawns} SECURITY_WRITE_TERMS=${securityWrites} DYNAMIC_IMPORTS=${dynamic} RUNTIME_ROOTS=${RUNTIME_ROOTS.length} CLOSURE_ROOTS=${CLOSURE_ROOTS.length}`,
+      `WRITER_IMPORTS=${writerHits.length} TOKEN_TERMS=${tokenTerms} CSWAP_SPAWNS_SRC=${cswapSpawns} SECURITY_WRITE_TERMS=${securityWrites} DYNAMIC_IMPORTS=${dynamic} RUNTIME_ROOTS=${RUNTIME_ROOTS.length} CLOSURE_ROOTS=${CLOSURE_ROOTS.length} CLOSURE_FILES=${all.files.size}`,
     );
     assert.equal(writerHits.length, 0, `writers in closure: ${writerHits.map((f) => relative(ROOT, f)).join(', ')}`);
     assert.equal(tokenTerms, 0);
@@ -231,8 +231,16 @@ describe('consume import-closure walker', () => {
     assert.ok(dynIdent.dynamic > 0, 'identifier import()/require() must fail closed');
     assert.ok(dynConcat.dynamic > 0, 'concatenated import()/require() must fail closed');
     assert.ok(dynTemplate.dynamic > 0, 'template-expression import()/require() must fail closed');
-    console.log(`WALKER_FORMS=${formHits} WALKER_WRITER_DETECT=${writerDetect}`);
+    // Dynamic calls one hop away (behind a static import) must surface through the closure.
+    const transitive = closureOf([join(dir, 'transitive-root.ts')]);
+    assert.ok(transitive.files.has(join(dir, 'transitive-mid.ts')), 'intermediary must be reached');
+    assert.equal(transitive.dynamic, 3, 'identifier/concat/template calls in the intermediary must be counted');
+    // A static import clause longer than any fixed token window must still resolve.
+    const long = closureOf([join(dir, 'long-import.ts')]);
+    const longHit = long.files.has(join(dir, 'long-leaf.ts')) ? 1 : 0;
+    console.log(`WALKER_FORMS=${formHits} WALKER_WRITER_DETECT=${writerDetect} WALKER_TRANSITIVE_DYNAMIC=${transitive.dynamic} WALKER_LONG_IMPORT=${longHit}`);
     assert.equal(formHits, 4);
     assert.equal(writerDetect, 1);
+    assert.equal(longHit, 1);
   });
 });

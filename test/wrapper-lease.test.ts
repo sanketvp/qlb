@@ -645,6 +645,57 @@ print('SECOND_ACQUIRED')
     await assertCaseQuiet(dir, port);
   });
 
+  it('wrapper-native-launch-failure', async () => {
+    for (const variant of ['missing', 'not-executable'] as const) {
+      const dir = tmp();
+      const leases = join(dir, 'proxy-leases');
+      mkdirSync(leases, { recursive: true });
+      const port = await freePort();
+      const native = join(dir, 'no-such-claude');
+      if (variant === 'not-executable') writeFileSync(native, '#!/bin/sh\nexit 0\n', { mode: 0o644 });
+      const env = envFor(dir, port, native);
+      const w = spawnTracked('/usr/bin/python3', [WRAPPER, '--wait-signal'], { env });
+      const out = collect(w);
+      const code = await waitExit(w, 15_000);
+      assert.equal(code, variant === 'missing' ? 127 : 126, out.stderr + out.stdout);
+      assert.match(out.stderr, /cannot launch/);
+      assert.equal(spawnSync('ls', [leases], { encoding: 'utf8' }).stdout.trim(), '');
+      assert.equal(existsSync(join(dir, 'proxy.json')), false);
+      await assertCaseQuiet(dir, port);
+    }
+  });
+
+  it('wrapper-shutdown-stuck-proxy', async () => {
+    const dir = tmp();
+    mkdirSync(join(dir, 'proxy-leases'), { recursive: true });
+    const port = await freePort();
+    const fake = writeFakeClaude(dir);
+    const env = envFor(dir, port, fake);
+    const w = spawnTracked('/usr/bin/python3', [WRAPPER, '--wait-signal'], { env });
+    const out = collect(w);
+    await waitForFile(join(dir, 'proxy.json'), 10_000);
+    await waitFor(() => out.stdout.includes('ANTHROPIC_BASE_URL='), 8_000, 'child');
+    const info = JSON.parse(readFileSync(join(dir, 'proxy.json'), 'utf8')) as { pid: number };
+    // A request whose headers never finish keeps server.close() pending past the grace period.
+    const held = net.connect({ host: '127.0.0.1', port });
+    await new Promise<void>((resolve) => held.once('connect', () => resolve()));
+    held.write(`GET /qlb/health HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\n`);
+    held.on('error', () => undefined);
+    try {
+      w.kill('SIGTERM');
+      const code = await waitExit(w, 15_000);
+      assert.equal(code, 143);
+      assert.match(out.stdout, /PROXY_SIGKILL=1/);
+      let alive = true;
+      try { process.kill(info.pid, 0); } catch { alive = false; }
+      assert.equal(alive, false, 'proxy process must be gone before metadata is removed');
+      assert.equal(existsSync(join(dir, 'proxy.json')), false);
+      await assertCaseQuiet(dir, port);
+    } finally {
+      held.destroy();
+    }
+  });
+
   it('wrapper-attach-vs-final-shutdown', async () => {
     const dir = tmp();
     mkdirSync(join(dir, 'proxy-leases'), { recursive: true });
