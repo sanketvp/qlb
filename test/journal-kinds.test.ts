@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
 import {
+  CSWAP_CONSUME_STORES,
   KNOWN_STATES,
   NATIVE_RETIREMENT_STORES,
   PI_TRANSFER_STORES,
@@ -40,7 +41,8 @@ describe('journal-kinds drift (T-IMPORT-1)', () => {
 
   it('SUPPORTED_SCHEMA_VERSIONS is empty and KNOWN_STATES are closed', () => {
     assert.deepEqual([...SUPPORTED_SCHEMA_VERSIONS], []);
-    assert.deepEqual([...KNOWN_STATES], ['NATIVE', 'MIRRORED', 'VALIDATED', 'QLB_OWNED', 'RETIRED']);
+    assert.deepEqual([...KNOWN_STATES], ['NATIVE', 'MIRRORED', 'VALIDATED', 'QLB_OWNED', 'RETIRED', 'CONSUMED']);
+    assert.deepEqual([...CSWAP_CONSUME_STORES], ['cswap-anthropic']);
   });
 });
 
@@ -140,6 +142,50 @@ describe('decodeJournalEvidence', () => {
       }),
     });
     assert.equal(dup.trusted, true);
+  });
+
+  it('CONSUMED is trusted only on cswap-anthropic; rejected for pi-transfer and native-retirement', () => {
+    const consumed = decodeJournalEvidence({
+      store: 'cswap-anthropic',
+      state: 'CONSUMED',
+      detail_json: '{}',
+    });
+    assert.equal(consumed.trusted, true);
+    if (consumed.trusted) assert.equal(consumed.kind, 'cswap-consume');
+    const nativeOff = decodeJournalEvidence({
+      store: 'cswap-anthropic',
+      state: 'NATIVE',
+      detail_json: '{}',
+    });
+    assert.equal(nativeOff.trusted, true);
+    const pi = decodeJournalEvidence({
+      store: 'pi-pool',
+      state: 'CONSUMED',
+      detail_json: JSON.stringify({ qlbAccountIds: ['a'] }),
+    });
+    assert.equal(pi.trusted, false);
+    if (!pi.trusted) assert.equal(pi.reason, 'state_not_allowed_for_kind');
+    const xai = decodeJournalEvidence({
+      store: 'pi-xai',
+      state: 'CONSUMED',
+      detail_json: '{}',
+    });
+    assert.equal(xai.trusted, false);
+    if (!xai.trusted) assert.equal(xai.reason, 'state_not_allowed_for_kind');
+    const native = decodeJournalEvidence({
+      store: 'claude-code',
+      state: 'CONSUMED',
+      detail_json: '{}',
+    });
+    assert.equal(native.trusted, false);
+    if (!native.trusted) assert.equal(native.reason, 'state_not_allowed_for_kind');
+    const owned = decodeJournalEvidence({
+      store: 'cswap-anthropic',
+      state: 'QLB_OWNED',
+      detail_json: '{}',
+    });
+    assert.equal(owned.trusted, false);
+    if (!owned.trusted) assert.equal(owned.reason, 'state_not_allowed_for_kind');
   });
 
   it('native-retirement RETIRED valid shape is trusted; MIRRORED is not allowed', () => {

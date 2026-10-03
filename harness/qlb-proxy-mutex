@@ -1,0 +1,33 @@
+#!/usr/bin/python3
+"""Exclusive flock then execvp the critical section, inheriting the lock fd.
+
+Usage: qlb-proxy-mutex LOCK -- cmd [args...]
+
+The lock fd is exposed to the child as QLB_PROXY_LOCK_FD and marked inheritable
+so the critical section holds the flock across execvp. The child must launch any
+long-running process (the loopback proxy) with that fd closed / CLOEXEC and
+close its own copy after startup + ownership publication, or later wrappers
+block for the proxy's lifetime.
+"""
+from __future__ import annotations
+
+import fcntl
+import os
+import sys
+
+
+def main() -> None:
+    if len(sys.argv) < 4 or sys.argv[2] != "--":
+        sys.stderr.write("usage: qlb-proxy-mutex LOCK -- cmd [args...]\n")
+        sys.exit(2)
+    lock = sys.argv[1]
+    argv = sys.argv[3:]
+    fd = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    os.set_inheritable(fd, True)
+    os.environ["QLB_PROXY_LOCK_FD"] = str(fd)
+    os.execvp(argv[0], argv)
+
+
+if __name__ == "__main__":
+    main()

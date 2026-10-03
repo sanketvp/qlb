@@ -6,6 +6,8 @@ QLB extends the same account-pooling idea to Grok, Kimi K3, and OpenRouter too â
 
 QLB ships with five built-in provider adapters (Claude/Anthropic, Codex, Grok/xAI, Kimi K3, OpenRouter) and can load additional providers as local JavaScript plugins for anything else you use. It never modifies your existing credentials unless you explicitly opt in to full account ownership (see [Credential Safety](docs/CREDENTIAL-SAFETY.md)), and one unavailable provider or broken plugin never crashes the overall status/routing commands.
 
+**Consume Option B (not enabled by this code PR):** QLB can sit on the local request path as the *cross-provider* selector while **cswap remains the Claude account brain**. Anthropic status is read from cswap's cache only. When consume is later enabled (`qlb consume enable --provider anthropic`), the proxy injects whatever Claude Code credential is active right now as unattributed `cswap-active` â€” it does not pick among Claude slots, does not bind the token to `sequence.json`, and never submits a Claude refresh token. A consume 401 is a re-read of that active item, not QLB-owned auto-resync. Pi is unchanged in v1. Do not PATH-install `harness/claude` or point `settings.json` at the helper until the separate live-change approvals.
+
 ## Requirements
 
 - Node.js 22 or newer on macOS, Linux, or Windows
@@ -164,6 +166,8 @@ Values resolve in this order: command-line flag, environment variable, `~/.qlb/c
 | `pluginsDir` | `QLB_PLUGINS_DIR` | `--plugins-dir` |
 | `proxyInfoPath` | `QLB_PROXY_INFO_PATH` | `--proxy-info-path` |
 | `claudeCodeCredentialsPath` | `QLB_CLAUDE_CODE_CREDENTIALS_PATH` | `--claude-code-credentials-path` |
+| `cswapSequencePath` | `QLB_CSWAP_SEQUENCE_PATH` | `--cswap-sequence-path` |
+| `cswapUsagePath` | `QLB_CSWAP_USAGE_PATH` | `--cswap-usage-path` |
 | `defaultStrategy` | `QLB_DEFAULT_STRATEGY` | `--default-strategy` |
 
 Use `QLB_CONFIG_PATH` or `--config` to select a different JSON config file.

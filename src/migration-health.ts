@@ -2,6 +2,7 @@
 // Dependency leaf: imports ONLY ./journal-kinds. No filesystem, no writers.
 
 import {
+  CSWAP_CONSUME_STORES,
   KNOWN_STATES,
   NATIVE_RETIREMENT_STORES,
   PI_TRANSFER_STORES,
@@ -48,12 +49,14 @@ export type ParseAccountIdsResult =
 
 const PI_SET = new Set<string>(PI_TRANSFER_STORES);
 const NATIVE_SET = new Set<string>(NATIVE_RETIREMENT_STORES);
+const CSWAP_SET = new Set<string>(CSWAP_CONSUME_STORES);
 const STATE_SET = new Set<string>(KNOWN_STATES);
 const HEX64 = /^[0-9a-fA-F]{64}$/;
 
 function kindForStore(store: string): JournalKind | null {
   if (PI_SET.has(store)) return 'pi-transfer';
   if (NATIVE_SET.has(store)) return 'native-retirement';
+  if (CSWAP_SET.has(store)) return 'cswap-consume';
   return null;
 }
 
@@ -76,7 +79,10 @@ function readDetail(
   state: string,
   raw: string | null | undefined,
 ): { ok: true; value: Record<string, unknown> } | { ok: false; reason: UntrustedReason } {
-  if (state === 'NATIVE' && (raw == null || raw === '' || raw === '{}')) {
+  if (
+    (state === 'NATIVE' || state === 'CONSUMED') &&
+    (raw == null || raw === '' || raw === '{}')
+  ) {
     return { ok: true, value: {} };
   }
   if (raw == null || raw === '') {
@@ -228,6 +234,12 @@ export function decodeJournalEvidence(row: {
   if (!STATE_SET.has(row.state)) return untrusted('unknown_state');
   const state = row.state as KnownState;
   if (kind === 'native-retirement' && (state === 'MIRRORED' || state === 'VALIDATED')) {
+    return untrusted('state_not_allowed_for_kind');
+  }
+  if (kind === 'cswap-consume' && state !== 'NATIVE' && state !== 'CONSUMED') {
+    return untrusted('state_not_allowed_for_kind');
+  }
+  if ((kind === 'pi-transfer' || kind === 'native-retirement') && state === 'CONSUMED') {
     return untrusted('state_not_allowed_for_kind');
   }
   const detail = readDetail(state, row.detail_json);

@@ -558,7 +558,23 @@ $ qlb proxy --json
 }
 ```
 
-Flags: `[--info-path <path>]`, `[--idle-ms <n>]` (positive integer), `[--db <path>]`, `[--json]`. Security posture: loopback-only bind (refuses anything else), per-launch random 32-byte token, constant-time token comparison, `Host` header allow-list, path allow-list (`/v1/messages`, `/v1/messages/count_tokens`, `/v1/responses`, `/backend-api/codex/responses`, `/qlb/health`), local auth-failure rate limiting, and credentials injected only for providers whose migration journal says `QLB_OWNED` or `RETIRED`.
+Flags: `[--info-path <path>]`, `[--idle-ms <n>]` (positive integer; `--idle-ms 0` is invalid), `[--no-idle]` (do not arm the idle timer; used by the supervising wrapper), `[--port <n>]`, `[--started-by wrapper|cli]`, `[--db <path>]`, `[--json]`. A second `qlb proxy` on an already-bound `--port` exits 1 and does not rewrite `proxy.json` or mint a token. Security posture: loopback-only bind (refuses anything else), per-launch random 32-byte token minted only after listen in the same `proxy.json` write as `startedBy`/`pid`/`lstart`, constant-time token comparison, `Host` header allow-list, path allow-list (`/v1/messages`, `/v1/messages/count_tokens`, `/v1/responses`, `/backend-api/codex/responses`, `/qlb/health`), local auth-failure rate limiting, and credentials injected only for providers whose migration journal says `QLB_OWNED` or `RETIRED` — except Anthropic consume (see below).
+
+## `qlb consume`
+
+Code-only journal for Consume Option B. Does **not** enable a live proxy, PATH wrapper, or `settings.json` change by itself.
+
+```console
+$ qlb consume enable --provider anthropic
+cswap-anthropic: CONSUMED
+```
+
+```console
+$ qlb consume disable --provider anthropic
+cswap-anthropic: NATIVE
+```
+
+`--provider` must be `anthropic`. Enable upserts journal store `cswap-anthropic=CONSUMED` and writes `~/.qlb/consume-anthropic.json` `{state:"CONSUMED"}` (no tokens). Disable journals `NATIVE` and deletes the marker. `qlb migrate status --provider anthropic` stays on the pi-pool ladder (`NATIVE` until a real migrate) — consume is a different store. Pi is unchanged in v1. cswap remains the Claude account brain; QLB does not attribute Claude credentials to a sequence slot.
 
 ## `/qlb` (Pi in-session command)
 

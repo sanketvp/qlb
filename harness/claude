@@ -1,0 +1,453 @@
+#!/usr/bin/python3
+"""Supervising Claude Code wrapper: shared loopback proxy on 127.0.0.1:47391.
+
+Intercepted invocations hold the proxy mutex only for reap/lease/attach-or-start,
+launch the persistent proxy with the lock fd closed, then spawn native Claude.
+Passthrough subcommands exec the native binary with no QLB env and no lease.
+
+Do not PATH-install this file until live-change approvals land.
+"""
+from __future__ import annotations
+
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+import uuid
+from typing import Any, Optional
+
+PASSTHROUGH = {
+    "plugin",
+    "mcp",
+    "update",
+    "doctor",
+    "auth",
+    "install",
+    "uninstall",
+    "serve",
+    "--version",
+    "-v",
+    "-h",
+    "--help",
+    "help",
+}
+
+DEFAULT_PORT = 47391
+
+
+def qlb_home() -> str:
+    return os.environ.get("QLB_HOME") or os.path.join(os.path.expanduser("~"), ".qlb")
+
+
+def native_claude() -> str:
+    return os.environ.get("QLB_CLAUDE_NATIVE") or os.path.join(
+        os.path.expanduser("~"), ".local", "bin", "claude"
+    )
+
+
+def qlb_argv() -> list[str]:
+    binary = os.environ.get("QLB_BIN") or "qlb"
+    if binary.endswith(".js"):
+        node = os.environ.get("QLB_NODE") or "node"
+        return [node, binary]
+    return [binary]
+
+
+def process_lstart(pid: int) -> str:
+    try:
+        out = subprocess.check_output(
+            ["ps", "-p", str(pid), "-o", "lstart="],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+        return out.strip()
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        return ""
+
+
+def process_command(pid: int) -> str:
+    try:
+        out = subprocess.check_output(
+            ["ps", "-p", str(pid), "-o", "command="],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+        return out.strip()
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        return ""
+
+
+def identity_live(pid: int, stored: str) -> bool:
+    try:
+        os.kill(int(pid), 0)
+    except (OSError, ValueError):
+        return False
+    if not stored:
+        return False
+    return process_lstart(int(pid)) == stored
+
+
+def atomic_write(path: str, contents: str, mode: int = 0o600) -> None:
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+    tmp = f"{path}.tmp.{os.getpid()}"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    try:
+        os.write(fd, contents.encode("utf8"))
+    finally:
+        os.close(fd)
+    os.replace(tmp, path)
+    try:
+        os.chmod(path, mode)
+    except OSError:
+        pass
+
+
+def read_json(path: str) -> Optional[dict[str, Any]]:
+    try:
+        with open(path, "r", encoding="utf8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict):
+            return data
+    except (OSError, json.JSONDecodeError):
+        return None
+    return None
+
+
+def port_listening(port: int, host: str = "127.0.0.1") -> bool:
+    import socket
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(0.25)
+    try:
+        sock.connect((host, port))
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
+def health_ok(port: int, token: str) -> bool:
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/qlb/health",
+        headers={"Authorization": f"Bearer {token}", "Host": f"127.0.0.1:{port}"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            return 200 <= getattr(resp, "status", 200) < 300
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return False
+
+
+def lease_dir(home: str) -> str:
+    path = os.path.join(home, "proxy-leases")
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    return path
+
+
+def lease_path(home: str, pid: int) -> str:
+    return os.path.join(lease_dir(home), str(pid))
+
+
+def reap_leases(home: str) -> bool:
+    """Unlink identity-dead leases. Returns True if a pid-reuse reap happened."""
+    reused = False
+    directory = lease_dir(home)
+    for name in os.listdir(directory):
+        path = os.path.join(directory, name)
+        row = read_json(path)
+        if not row:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            continue
+        pid = row.get("pid")
+        stored = row.get("lstart") or ""
+        if not isinstance(pid, int):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            continue
+        try:
+            os.kill(pid, 0)
+            live_pid = True
+        except OSError:
+            live_pid = False
+        if not live_pid:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            continue
+        if stored and process_lstart(pid) != stored:
+            reused = True
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            print("PID_REUSE_REAP=1", flush=True)
+    return reused
+
+
+def live_leases(home: str) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    directory = lease_dir(home)
+    for name in os.listdir(directory):
+        row = read_json(os.path.join(directory, name))
+        if not row:
+            continue
+        pid = row.get("pid")
+        stored = row.get("lstart") or ""
+        if isinstance(pid, int) and identity_live(pid, stored if isinstance(stored, str) else ""):
+            out.append(row)
+    return out
+
+
+def close_lock_fd() -> None:
+    raw = os.environ.get("QLB_PROXY_LOCK_FD")
+    if not raw:
+        return
+    try:
+        fd = int(raw)
+    except ValueError:
+        return
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+    os.environ.pop("QLB_PROXY_LOCK_FD", None)
+
+
+def sigterm_proxy(info: dict[str, Any], info_path: str) -> None:
+    pid = info.get("pid")
+    stored = info.get("lstart") or ""
+    if not isinstance(pid, int):
+        return
+    if not identity_live(pid, stored if isinstance(stored, str) else ""):
+        return
+    cmd = process_command(pid)
+    if "proxy" not in cmd:
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        return
+    for _ in range(50):
+        if not identity_live(pid, stored if isinstance(stored, str) else ""):
+            break
+        time.sleep(0.05)
+    try:
+        if os.path.exists(info_path):
+            os.unlink(info_path)
+    except OSError:
+        pass
+
+
+def wait_for_proxy_json(info_path: str, timeout_s: float = 10.0) -> Optional[dict[str, Any]]:
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        info = read_json(info_path)
+        if info and isinstance(info.get("token"), str) and info.get("token"):
+            return info
+        time.sleep(0.05)
+    return None
+
+
+def critical_section() -> int:
+    home = qlb_home()
+    port = int(os.environ.get("QLB_PROXY_PORT") or DEFAULT_PORT)
+    info_path = os.environ.get("QLB_PROXY_INFO_PATH") or os.path.join(home, "proxy.json")
+    wrapper_pid = int(os.environ["QLB_WRAPPER_PID"])
+    wrapper_lstart = os.environ["QLB_WRAPPER_LSTART"]
+    session = os.environ.get("QLB_SESSION") or str(uuid.uuid4())
+
+    reap_leases(home)
+    remaining = live_leases(home)
+    info = read_json(info_path)
+    if not remaining and info and info.get("startedBy") == "wrapper":
+        pid = info.get("pid")
+        stored = info.get("lstart") or ""
+        if isinstance(pid, int) and identity_live(pid, stored if isinstance(stored, str) else ""):
+            print("ORPHAN_CLEANUP=1", flush=True)
+            sigterm_proxy(info, info_path)
+            info = None
+
+    atomic_write(
+        lease_path(home, wrapper_pid),
+        json.dumps(
+            {
+                "pid": wrapper_pid,
+                "lstart": wrapper_lstart,
+                "session": session,
+                "startedAt": int(time.time() * 1000),
+            }
+        ),
+    )
+
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        info = read_json(info_path)
+        if info:
+            token = info.get("token")
+            pid = info.get("pid")
+            stored = info.get("lstart") or ""
+            info_port = info.get("port")
+            if (
+                isinstance(token, str)
+                and isinstance(pid, int)
+                and identity_live(pid, stored if isinstance(stored, str) else "")
+                and info_port == port
+                and health_ok(port, token)
+            ):
+                close_lock_fd()
+                return 0
+        if port_listening(port) and not info:
+            break
+        time.sleep(0.05)
+
+    if port_listening(port):
+        print("ORPHAN_LISTEN=fail-closed", flush=True)
+        close_lock_fd()
+        return 1
+
+    cmd = qlb_argv() + [
+        "proxy",
+        "--port",
+        str(port),
+        "--no-idle",
+        "--info-path",
+        info_path,
+        "--started-by",
+        "wrapper",
+    ]
+    db = os.environ.get("QLB_DB_PATH")
+    if db:
+        cmd.extend(["--db", db])
+    child_env = os.environ.copy()
+    child_env.pop("QLB_PROXY_LOCK_FD", None)
+    subprocess.Popen(
+        cmd,
+        close_fds=True,
+        start_new_session=True,
+        env=child_env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    started = wait_for_proxy_json(info_path)
+    if not started:
+        close_lock_fd()
+        return 1
+    close_lock_fd()
+    return 0
+
+
+def passthrough(argv: list[str]) -> int:
+    native = native_claude()
+    os.execv(native, [native, *argv])
+    return 127
+
+
+def record_terminating_signal(home: str, pid: int, name: str) -> None:
+    path = lease_path(home, pid)
+    row = read_json(path) or {}
+    row["terminatingSignal"] = name
+    atomic_write(path, json.dumps(row))
+
+
+def maybe_shutdown_proxy(home: str, info_path: str) -> None:
+    if live_leases(home):
+        return
+    info = read_json(info_path)
+    if not info or info.get("startedBy") != "wrapper":
+        return
+    pid = info.get("pid")
+    stored = info.get("lstart") or ""
+    if not isinstance(pid, int) or not identity_live(pid, stored if isinstance(stored, str) else ""):
+        return
+    sigterm_proxy(info, info_path)
+
+
+def intercepted(argv: list[str]) -> int:
+    home = qlb_home()
+    os.makedirs(home, mode=0o700, exist_ok=True)
+    lock = os.path.join(home, "proxy.lock")
+    info_path = os.environ.get("QLB_PROXY_INFO_PATH") or os.path.join(home, "proxy.json")
+    port = int(os.environ.get("QLB_PROXY_PORT") or DEFAULT_PORT)
+    session = str(uuid.uuid4())
+    wrapper_pid = os.getpid()
+    wrapper_lstart = process_lstart(wrapper_pid)
+    script = os.path.abspath(sys.argv[0])
+    mutex = os.path.join(os.path.dirname(script), "qlb-proxy-mutex")
+    env = os.environ.copy()
+    env["QLB_WRAPPER_PID"] = str(wrapper_pid)
+    env["QLB_WRAPPER_LSTART"] = wrapper_lstart
+    env["QLB_SESSION"] = session
+    env["QLB_HOME"] = home
+    env["QLB_PROXY_PORT"] = str(port)
+    env["QLB_PROXY_INFO_PATH"] = info_path
+    try:
+        result = subprocess.run(
+            [mutex, lock, "--", sys.executable, script, "--qlb-critical-section"],
+            env=env,
+            check=False,
+        )
+    except OSError as err:
+        sys.stderr.write(f"qlb wrapper: mutex failed: {err}\n")
+        return 1
+    if result.returncode != 0:
+        return result.returncode or 1
+
+    child_env = os.environ.copy()
+    child_env["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{port}"
+    child_env["ANTHROPIC_CUSTOM_HEADERS"] = json.dumps({"x-qlb-session": session})
+    child_env.pop("ANTHROPIC_AUTH_TOKEN", None)
+    child_env.pop("ANTHROPIC_API_KEY", None)
+    child_env.pop("CLAUDE_CODE_API_KEY_HELPER", None)
+    child_env.pop("CLAUDE_CONFIG_DIR", None)
+
+    native = native_claude()
+    child = subprocess.Popen([native, *argv], env=child_env)
+
+    def handle(signum: int, _frame: Any) -> None:
+        name = "INT" if signum == signal.SIGINT else "TERM" if signum == signal.SIGTERM else str(signum)
+        print(f"SIGNAL={name}", flush=True)
+        record_terminating_signal(home, wrapper_pid, name)
+        try:
+            os.kill(child.pid, signum)
+        except OSError:
+            pass
+
+    signal.signal(signal.SIGINT, handle)
+    signal.signal(signal.SIGTERM, handle)
+    code = child.wait()
+    try:
+        os.unlink(lease_path(home, wrapper_pid))
+    except OSError:
+        pass
+    maybe_shutdown_proxy(home, info_path)
+    if code < 0:
+        return 128 + (-code)
+    return code
+
+
+def main() -> int:
+    argv = sys.argv[1:]
+    if argv[:1] == ["--qlb-critical-section"]:
+        return critical_section()
+    first = argv[0] if argv else ""
+    if first in PASSTHROUGH:
+        return passthrough(argv)
+    return intercepted(argv)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

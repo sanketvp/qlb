@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import {
   chmodSync,
@@ -12,6 +13,7 @@ import * as https from 'node:https';
 import { dirname } from 'node:path';
 import type { AddressInfo } from 'node:net';
 import type { IncomingHttpHeaders, IncomingMessage, ServerResponse } from 'node:http';
+import { setTimeout as delay } from 'node:timers/promises';
 
 import {
   applyCodexEffort,
@@ -27,6 +29,13 @@ import {
   nativeResyncAuditEntry,
   type ResyncResult,
 } from './native-resync';
+import {
+  CSWAP_ACTIVE_ID,
+  CSWAP_ANTHROPIC_STORE,
+  fingerprintAccess,
+  isConsumedState,
+  prepareConsumeSnapshots,
+} from './cswap-consume';
 import type { Store } from './store';
 import type { BucketReading } from './types';
 
@@ -56,6 +65,19 @@ export interface ProxyInfo {
   token: string;
   pid: number;
   startedAt: number;
+  startedBy?: string;
+  lstart?: string;
+}
+
+export function processLstart(pid: number): string {
+  try {
+    return execFileSync('ps', ['-p', String(pid), '-o', 'lstart='], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+  } catch {
+    return '';
+  }
 }
 
 export type GetCredentialForAccount = (accountId: string) => Promise<string>;
@@ -68,13 +90,18 @@ export interface ProxyOptions {
   /** Tests MUST pass a temp path. Default is ~/.qlb/proxy.json. */
   infoPath?: string;
   idleTimeoutMs?: number;
+  /** When true, do not arm the idle timer (`--no-idle`). */
+  noIdle?: boolean;
   /** Fixed loopback port. Default 0 = ephemeral (OS-assigned). */
   port?: number;
+  /** Ownership publisher: `wrapper` or `cli`. Written in the first post-listen info file. */
+  startedBy?: string;
   getCredentialForAccount: GetCredentialForAccount;
   /**
    * Optional. When set, an upstream 401 triggers exactly one native-resync
    * attempt and, if the credential actually drifted, one retry of the same
    * request. Tests inject a mock; production wires `bindDetectAndResync`.
+   * Never used for `cswap-active` (consume re-GET instead).
    */
   resyncFromNative?: ResyncFromNative;
   upstreams?: {
@@ -82,6 +109,8 @@ export interface ProxyOptions {
     codexBase?: string;
   };
   onIdle?: () => void;
+  /** Test-only: invoked after listen, before minting/writing proxy.json. */
+  pauseAfterListen?: () => Promise<void>;
 }
 
 export function tokensEqual(expected: string, provided: string): boolean {
@@ -359,9 +388,12 @@ export class LoopbackProxy {
   private readonly resyncFromNative?: ResyncFromNative;
   private readonly upstreams: { anthropicBase: string; codexBase: string };
   private readonly onIdle?: () => void;
-  private readonly token: string;
+  private token: string | null = null;
   private readonly startedAt: number;
   private readonly requestedPort: number;
+  private readonly noIdle: boolean;
+  private readonly startedBy: string;
+  private readonly pauseAfterListen?: () => Promise<void>;
   private server: http.Server | null = null;
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
   private inFlight = 0;
@@ -373,8 +405,10 @@ export class LoopbackProxy {
   constructor(opts: ProxyOptions) {
     this.store = opts.store;
     this.infoPath = opts.infoPath ?? DEFAULT_PROXY_INFO_PATH;
-    this.idleTimeoutMs = opts.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
+    this.noIdle = opts.noIdle === true;
+    this.idleTimeoutMs = this.noIdle ? DEFAULT_IDLE_TIMEOUT_MS : (opts.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS);
     this.requestedPort = opts.port ?? 0;
+    this.startedBy = opts.startedBy ?? 'cli';
     this.getCredential = opts.getCredentialForAccount;
     this.resyncFromNative = opts.resyncFromNative;
     this.upstreams = {
@@ -382,7 +416,7 @@ export class LoopbackProxy {
       codexBase: opts.upstreams?.codexBase ?? DEFAULT_UPSTREAMS.codexBase,
     };
     this.onIdle = opts.onIdle;
-    this.token = randomBytes(32).toString('hex');
+    this.pauseAfterListen = opts.pauseAfterListen;
     this.startedAt = Date.now();
   }
 
@@ -418,15 +452,37 @@ export class LoopbackProxy {
       throw new Error(`refusing non-loopback bind: ${addr.address}`);
     }
 
+    await this.maybePauseAfterListen();
+    if (this.stopped) {
+      throw new Error('proxy stopped before ownership publication');
+    }
+
+    this.token = randomBytes(32).toString('hex');
+    const lstart = processLstart(process.pid);
     this.info = {
       port: addr.port,
       token: this.token,
       pid: process.pid,
       startedAt: this.startedAt,
+      startedBy: this.startedBy,
+      lstart,
     };
     atomicWrite0600(this.infoPath, JSON.stringify(this.info));
     this.armIdle();
     return this.info;
+  }
+
+  private async maybePauseAfterListen(): Promise<void> {
+    if (this.pauseAfterListen) {
+      await this.pauseAfterListen();
+      return;
+    }
+    const marker = process.env.QLB_PROXY_PAUSE_AFTER_LISTEN;
+    if (!marker) return;
+    writeFileSync(marker, 'listening\n');
+    while (existsSync(marker) && !this.stopped) {
+      await delay(25);
+    }
   }
 
   async stop(): Promise<void> {
@@ -448,7 +504,7 @@ export class LoopbackProxy {
 
   private armIdle(): void {
     this.clearIdle();
-    if (this.stopped || this.inFlight > 0) return;
+    if (this.noIdle || this.stopped || this.inFlight > 0) return;
     this.idleTimer = setTimeout(() => {
       void this.idleExit();
     }, this.idleTimeoutMs);
@@ -505,7 +561,7 @@ export class LoopbackProxy {
   private async handleInner(req: IncomingMessage, res: ServerResponse): Promise<void> {
     // 1. Auth FIRST — before Host, path, or body.
     const provided = extractClientToken(req);
-    if (!provided || !tokensEqual(this.token, provided)) {
+    if (!this.token || !provided || !tokensEqual(this.token, provided)) {
       const limited = this.noteAuthFail() === 'limited';
       try {
         this.store.recordDecision({
@@ -599,7 +655,8 @@ export class LoopbackProxy {
       console.error('qlb-proxy: session_header_missing; using anon:<harness>:<virtualModel>');
     }
 
-    const snapshots = snapshotsFromStore(this.store);
+    const consumed = isConsumedState(this.store.getMigration(CSWAP_ANTHROPIC_STORE)?.state);
+    const snapshots = prepareConsumeSnapshots(snapshotsFromStore(this.store), consumed);
     const decision = resolveFromSnapshots({
       model: policy.realModel,
       fallback: policy.fallback,
@@ -657,6 +714,7 @@ export class LoopbackProxy {
 
     const target = upstreamUrl(harness, pathname, this.upstreams);
     const t0 = Date.now();
+    let lastFp = fingerprintAccess(credential);
     const requestOnce = async (): Promise<IncomingMessage> => {
       extra.authorization = `Bearer ${await this.getCredential(decision.accountId)}`;
       return requestUpstream(
@@ -668,7 +726,44 @@ export class LoopbackProxy {
     };
     let upRes: IncomingMessage;
     try {
-      if (this.resyncFromNative) {
+      if (decision.accountId === CSWAP_ACTIVE_ID) {
+        const wrapped = await attemptWithNativeResyncRetry({
+          attempt: requestOnce,
+          isAuthFailure: (res) => res.statusCode === 401,
+          resync: async () => {
+            const next = await this.getCredential(decision.accountId);
+            const nextFp = fingerprintAccess(next);
+            if (nextFp !== lastFp) {
+              lastFp = nextFp;
+              extra.authorization = `Bearer ${next}`;
+              return { resynced: true, reason: 'cswap-active access fingerprint changed' };
+            }
+            return { resynced: false, reason: 'cswap-active access fingerprint unchanged' };
+          },
+          onResync: (result) => {
+            try {
+              this.store.recordDecision({
+                session: sid,
+                harness,
+                requested_model: policy.realModel,
+                effort: policy.effort,
+                served_model: decision.servedModel,
+                account_id: decision.accountId,
+                mode: 'consume_resync',
+                reason: result.reason,
+                snapshot_json: JSON.stringify({
+                  kind: 'consume_resync',
+                  resynced: result.resynced,
+                }),
+              });
+            } catch {
+              // store errors must not crash the proxy
+            }
+          },
+          discardFirst: discardIncoming,
+        });
+        upRes = wrapped.result;
+      } else if (this.resyncFromNative) {
         const provider =
           this.store.getAccount(decision.accountId)?.provider ?? 'unknown';
         const wrapped = await attemptWithNativeResyncRetry({
