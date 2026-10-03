@@ -16,16 +16,17 @@ import {
   readdirSync,
   realpathSync,
   rmSync,
+  statSync,
   writeFileSync,
   type Dirent,
 } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { delimiter, dirname, isAbsolute, join } from 'node:path';
+import { delimiter, dirname, isAbsolute, join, resolve } from 'node:path';
 import type { DoctorCheck } from './diagnostics';
 import { findQlbRepoRoot } from './setup';
 
 const PI_PACKAGE_NAME = '@earendil-works/pi-coding-agent';
-const PI_EXT_DIR = join(homedir(), '.pi', 'agent', 'extensions', 'qlb-pi');
+const DEFAULT_PI_EXT_DIR = join(homedir(), '.pi', 'agent', 'extensions', 'qlb-pi');
 
 function isPiPackageRoot(dir: string): boolean {
   try {
@@ -92,13 +93,14 @@ export function locatePi(
   home: string = homedir(),
   platform: NodeJS.Platform = process.platform,
 ): PiLocation {
-  const override = env.QLB_PI_PACKAGE_ROOT;
+  const override = env.QLB_PI_PACKAGE_ROOT ? resolve(env.QLB_PI_PACKAGE_ROOT) : undefined;
   if (override) return isPiPackageRoot(override) ? { root: override } : { root: null, unresolved: true };
   const names = launcherNames(platform, env);
   for (const dir of (env.PATH ?? '').split(delimiter).filter(Boolean)) {
     for (const name of names) {
       const bin = join(dir, name);
       try {
+        if (!statSync(bin).isFile()) continue; // a shell skips directories named pi
         accessSync(bin, platform === 'win32' ? fsConstants.F_OK : fsConstants.X_OK);
       } catch {
         continue;
@@ -176,6 +178,8 @@ export interface PiIntegrationOptions {
   typecheck?: boolean;
   /** Pi location; defaults to locatePi(). */
   pi?: PiLocation;
+  /** Installed extension directory; defaults to ~/.pi/agent/extensions/qlb-pi. */
+  extensionDir?: string;
   run?: (cmd: string, args: string[], opts?: { cwd?: string; timeoutMs?: number }) => string;
 }
 
@@ -188,6 +192,7 @@ export function piIntegrationChecks(options: PiIntegrationOptions = {}): DoctorC
   const run = options.run ?? ((cmd: string, args: string[], o: { cwd?: string; timeoutMs?: number } = {}) =>
     execFileSync(cmd, args, { encoding: 'utf8', cwd: o.cwd, timeout: o.timeoutMs ?? 60_000, stdio: ['ignore', 'pipe', 'pipe'] }));
 
+  const PI_EXT_DIR = options.extensionDir ?? DEFAULT_PI_EXT_DIR;
   const located = options.pi ?? locatePi();
   if (located.unresolved && existsSync(PI_EXT_DIR)) {
     checks.push({
@@ -241,8 +246,9 @@ export function piIntegrationChecks(options: PiIntegrationOptions = {}): DoctorC
 
   // 3. Typecheck the extension against the installed Pi types (catches signature drift, not just renames).
   if (options.typecheck && repoRoot) {
-    const tmp = mkdtempSync(join(tmpdir(), 'qlb-pi-typecheck-'));
+    let tmp: string | undefined;
     try {
+      tmp = mkdtempSync(join(tmpdir(), 'qlb-pi-typecheck-'));
       const cfg = join(tmp, 'tsconfig.json');
       writeFileSync(cfg, JSON.stringify(piTypecheckConfig(join(repoRoot, 'extensions', 'qlb-pi'), PI_PKG)));
       run('npx', ['tsc', '-p', cfg, '--noEmit'], { cwd: repoRoot, timeoutMs: 120_000 });
@@ -257,7 +263,7 @@ export function piIntegrationChecks(options: PiIntegrationOptions = {}): DoctorC
       });
     } finally {
       try {
-        rmSync(tmp, { recursive: true, force: true });
+        if (tmp) rmSync(tmp, { recursive: true, force: true });
       } catch {
         // best-effort: a leftover temp dir must not replace the typecheck result
       }

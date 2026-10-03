@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
 import { after, describe, it } from 'node:test';
 
 import { locatePi, piIntegrationChecks, piTypecheckConfig, resolvePiPackageRoot } from '../src/pi-integration';
@@ -73,6 +73,21 @@ describe('locatePi', () => {
     assert.deepEqual(locatePi(env, base), { root: null, launcher: join(base, 'volta', 'bin', 'pi'), unresolved: true });
   });
 
+  it('skips a directory named pi on PATH, like a shell', () => {
+    const base = tmp('qlb-piroot-');
+    mkdirSync(join(base, 'dirs', 'pi'), { recursive: true });
+    const active = npmSymlinkInstall(join(base, 'local'), '1.0.1');
+    const env = { PATH: [join(base, 'dirs'), join(base, 'local', 'bin')].join(':') };
+    assert.equal(resolvePiPackageRoot(env, base), active);
+  });
+
+  it('resolves a relative QLB_PI_PACKAGE_ROOT to an absolute path', () => {
+    const base = tmp('qlb-piroot-');
+    const root = fakePiPackage(join(base, 'rel'), '1.0.1');
+    const located = locatePi({ QLB_PI_PACKAGE_ROOT: relative(process.cwd(), root), PATH: '' }, base);
+    assert.equal(located.root, root);
+  });
+
   it('honors QLB_PI_PACKAGE_ROOT and flags one that is not Pi', () => {
     const base = tmp('qlb-piroot-');
     const root = fakePiPackage(join(base, 'x'), '1.0.1');
@@ -89,9 +104,9 @@ describe('locatePi', () => {
 
 describe('doctor with an unresolved Pi launcher', () => {
   it('warns instead of reporting a skip as PASS', () => {
-    const checks = piIntegrationChecks({ pi: { root: null, launcher: '/x/pi', unresolved: true } });
-    // Only meaningful where the extension is installed; otherwise Pi checks are skipped.
-    if (checks[0]?.message.includes('not installed')) return;
+    const extensionDir = tmp('qlb-pi-ext-');
+    const checks = piIntegrationChecks({ pi: { root: null, launcher: '/x/pi', unresolved: true }, extensionDir });
+    assert.equal(checks.length, 1);
     assert.equal(checks[0]!.level, 'WARN');
     assert.match(checks[0]!.message, /could not locate/);
   });
