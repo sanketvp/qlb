@@ -864,7 +864,8 @@ print('SECOND_ACQUIRED')
     await assertCaseQuiet(dir, port);
   });
 
-  it('wrapper-group-interrupt-while-final-cleanup-waits-for-mutex', async () => {
+  for (const sig of ['SIGINT', 'SIGTERM'] as const) {
+  it(`wrapper-group-${sig}-while-final-cleanup-waits-for-mutex`, async () => {
     const dir = tmp();
     const leases = join(dir, 'proxy-leases');
     mkdirSync(leases, { recursive: true });
@@ -887,16 +888,18 @@ print('SECOND_ACQUIRED')
     await waitFor(() => holdOut.stdout.includes('HELD'), 5_000, 'mutex held');
     writeFileSync(gate, 'go'); // native exits 0; final cleanup now waits on the mutex
     await delay(600);
-    process.kill(-w.pid!, 'SIGINT');
-    await waitFor(() => out.stdout.includes('SIGNAL=INT'), 5_000, 'wrapper recorded INT');
+    process.kill(-w.pid!, sig);
+    const short = sig === 'SIGINT' ? 'INT' : 'TERM';
+    await waitFor(() => out.stdout.includes(`SIGNAL=${short}`), 5_000, `wrapper recorded ${short}`);
     await delay(300);
     writeFileSync(fifo, 'x');
     await waitExit(holder, 5_000).catch(() => undefined);
     const code = await waitExit(w, 15_000);
-    assert.equal(code, 130, out.stderr + out.stdout);
+    assert.equal(code, sig === 'SIGINT' ? 130 : 143, out.stderr + out.stdout);
     assert.equal(spawnSync('ls', [leases], { encoding: 'utf8' }).stdout.trim(), '', 'final cleanup must still run');
     await assertCaseQuiet(dir, port);
   });
+  }
 
   it('mutex-wait-is-bounded', async () => {
     const dir = tmp();

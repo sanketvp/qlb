@@ -106,7 +106,7 @@ describe('qlb-pi mode decision', () => {
       return journal === 'NATIVE' ? 'owned' : 'conflict';
     }
     if (journal === 'CONSUMED') return 'consume';
-    return journal === 'unknown' && marker ? 'conflict' : 'inert';
+    return marker ? 'conflict' : 'inert';
   };
 
   it('matches the fail-closed table across all 54 inputs', () => {
@@ -136,7 +136,12 @@ describe('qlb-pi mode decision', () => {
     assert.equal(m(undefined, 'absent', 'unknown'), 'inert');
     // consume enabled but status unreadable: never fall back to anthropic-pool
     assert.equal(m(undefined, 'absent', 'unknown', true), 'conflict');
-    assert.equal(m(undefined, 'absent', 'NATIVE', true), 'inert');
+    // mid-enable / mid-disable (or a crashed one): fail closed, not inert
+    assert.equal(m(undefined, 'absent', 'NATIVE', true), 'conflict');
+    assert.equal(
+      conflictMessage({ rehearsal: undefined, owner: 'absent', journal: 'NATIVE', marker: true }),
+      CONSUME_ERRORS.stateInconsistent,
+    );
     assert.equal(m('0', 'valid', 'CONSUMED', true), 'inert');
     assert.equal(
       conflictMessage({ rehearsal: undefined, owner: 'absent', journal: 'unknown', marker: true }),

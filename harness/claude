@@ -561,16 +561,20 @@ def intercepted(argv: list[str]) -> int:
     return code
 
 
+GROUP_SIGNALS = (signal.SIGINT, signal.SIGHUP, signal.SIGTERM)
+
+
 def ignore_terminal_signals() -> None:
-    # Helpers share the wrapper's process group: a terminal Ctrl-C / hangup must
-    # not kill them mid-setup or mid-cleanup. The wrapper records the signal.
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
-    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    # Helpers share the wrapper's process group: a Ctrl-C, hangup, or group
+    # SIGTERM must not kill them mid-setup or mid-cleanup (all their waits are
+    # bounded). The wrapper records the signal; SIGKILL still works.
+    for signum in GROUP_SIGNALS:
+        signal.signal(signum, signal.SIG_IGN)
 
 
 def restore_terminal_signals() -> None:
-    signal.signal(signal.SIGINT, signal.SIG_DFL)
-    signal.signal(signal.SIGHUP, signal.SIG_DFL)
+    for signum in GROUP_SIGNALS:
+        signal.signal(signum, signal.SIG_DFL)
 
 
 def main() -> int:

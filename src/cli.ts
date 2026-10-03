@@ -1417,6 +1417,7 @@ async function runConsume(opts: ConsumeOpts): Promise<number> {
         return 1;
       }
       store.upsertMigration(CSWAP_ANTHROPIC_STORE, CONSUME_STATE, '{}');
+      console.error('qlb consume enable: restart running Pi sessions; Pi picks its Anthropic mode at startup.');
     } else if (opts.sub === 'disable') {
       store.upsertMigration(CSWAP_ANTHROPIC_STORE, 'NATIVE', '{}');
       try {

@@ -29,6 +29,9 @@ export const CONSUME_ERRORS = {
   stateUnknown:
     "QLB could not read its consume state (`qlb consume status` failed or timed out); Anthropic is disabled " +
     "rather than risk the wrong account. Check that `qlb` runs from Pi's environment, then restart Pi.",
+  stateInconsistent:
+    "QLB consume state is mid-change or inconsistent (consume marker present but consume not enabled). " +
+    "Re-run `qlb consume enable --provider anthropic` or `qlb consume disable --provider anthropic`, then restart Pi.",
 } as const;
 
 export type SecurityRunner = (executable: string, args: readonly string[]) => string;
@@ -148,9 +151,10 @@ export interface PiModeInput {
  * - Any claim of QLB ownership (owner file, even malformed, or rehearsal=1)
  *   is `owned` only when the consume journal is provably NATIVE; CONSUMED or an
  *   unreadable journal alongside ownership is `conflict`.
- * - No ownership claim: CONSUMED → `consume`; an unreadable journal while the
- *   consume marker exists → `conflict` (never hand Anthropic back to a pool that
- *   refreshes its own copies); otherwise inert (nothing taken over).
+ * - No ownership claim: CONSUMED → `consume`; the consume marker present with
+ *   any other journal (unreadable, or NATIVE mid-enable/disable) → `conflict`
+ *   (never hand Anthropic back to a pool that refreshes its own copies);
+ *   otherwise inert (nothing taken over).
  */
 export function decidePiMode(input: PiModeInput): PiMode {
   if (input.rehearsal === "0") return "inert";
@@ -160,12 +164,14 @@ export function decidePiMode(input: PiModeInput): PiMode {
     return input.journal === "NATIVE" ? "owned" : "conflict";
   }
   if (input.journal === "CONSUMED") return "consume";
-  return input.journal === "unknown" && input.marker ? "conflict" : "inert";
+  return input.marker ? "conflict" : "inert";
 }
 
 /** User-facing reason for a `conflict` decision. */
 export function conflictMessage(input: PiModeInput): string {
-  return input.journal === "unknown" ? CONSUME_ERRORS.stateUnknown : CONSUME_ERRORS.conflict;
+  if (input.journal === "unknown") return CONSUME_ERRORS.stateUnknown;
+  const claimsOwnership = input.rehearsal === "1" || input.owner !== "absent";
+  return claimsOwnership ? CONSUME_ERRORS.conflict : CONSUME_ERRORS.stateInconsistent;
 }
 
 /**

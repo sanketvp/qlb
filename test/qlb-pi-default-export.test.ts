@@ -94,6 +94,10 @@ describe('qlb-pi production default export (Pi jiti loader)', { skip: piAvailabl
     assert.equal(r.events[0]!.error?.errorMessage, CONSUME_ERRORS.stateUnknown);
     // Without the marker an unreadable status stays inert (consume was never enabled).
     assert.deepEqual(load({ states: 'unknown' }).calls, []);
+    // Loading between the marker write and the journal write (or after a crash) fails closed.
+    const mid = load({ states: 'NATIVE', marker: true, call: true });
+    assert.equal(mid.poolStillRegistered, false);
+    assert.equal(mid.events[0]!.error?.errorMessage, CONSUME_ERRORS.stateInconsistent);
   });
 
   it('owned mode still unregisters the existing provider before registering', () => {
