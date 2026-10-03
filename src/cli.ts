@@ -11,6 +11,7 @@ import { createOwnedCredentialSource } from './credentials';
 import {
   CSWAP_ANTHROPIC_STORE,
   CONSUME_STATE,
+  isConsumedState,
 } from './cswap-consume';
 import {
   bindDetectAndResync,
@@ -28,6 +29,7 @@ import {
   isRealPiAgentPath,
   isSingleGrantProvider,
   isStaticKeyProvider,
+  PI_POOL_STORE,
   readOpenRouterNativeKey,
   type MigrateProvider,
 } from './migration';
@@ -1230,6 +1232,11 @@ function printMigrate(status: ReturnType<Migration['status']>, json: boolean): v
   console.log(`resume:    ${status.resumeAction}`);
 }
 
+/** Refusal code shared by the Pi-ownership vs cswap-consume guards. */
+const DUAL_OWNERSHIP_REFUSED = 'DUAL_OWNERSHIP_REFUSED';
+const PI_POOL_OWNING_STATES = new Set(['MIRRORED', 'VALIDATED', 'QLB_OWNED', 'RETIRED']);
+const FORWARD_MIGRATE_SUBS = new Set(['stage', 'rehearse', 'commit', 'resume']);
+
 async function runMigrate(opts: MigrateOpts): Promise<number> {
   assertSafeMigratePaths(opts);
   let store: Store;
@@ -1241,6 +1248,17 @@ async function runMigrate(opts: MigrateOpts): Promise<number> {
     store = getStore();
   }
   try {
+    if (
+      opts.provider === 'anthropic' &&
+      FORWARD_MIGRATE_SUBS.has(opts.sub) &&
+      isConsumedState(store.getMigration(CSWAP_ANTHROPIC_STORE)?.state)
+    ) {
+      console.error(
+        `qlb migrate ${opts.sub}: ${DUAL_OWNERSHIP_REFUSED} — cswap consume is enabled for Anthropic. ` +
+          'Run `qlb consume disable --provider anthropic` first.',
+      );
+      return 1;
+    }
     const mig = isStaticKeyProvider(opts.provider)
       ? createStaticKeyMigration(
           store,
@@ -1377,6 +1395,15 @@ async function runConsume(opts: ConsumeOpts): Promise<number> {
     const dbPath = opts.db ?? config.dbPath;
     const marker = consumeMarkerPath(dbPath);
     if (opts.sub === 'enable') {
+      const piPool = store.getMigration(PI_POOL_STORE)?.state;
+      if ((piPool && PI_POOL_OWNING_STATES.has(piPool)) || existsSync(defaultOwnerFileFor('anthropic'))) {
+        console.error(
+          `qlb consume enable: ${DUAL_OWNERSHIP_REFUSED} — Pi's Anthropic accounts are QLB-owned ` +
+            `(pi-pool ${piPool ?? 'owner file present'}). Roll back with ` +
+            '`qlb migrate rollback --provider anthropic` first.',
+        );
+        return 1;
+      }
       store.upsertMigration(CSWAP_ANTHROPIC_STORE, CONSUME_STATE, '{}');
       mkdirSync(dirname(marker), { recursive: true, mode: 0o700 });
       writeFileSync(marker, `${JSON.stringify({ state: CONSUME_STATE })}\n`, { encoding: 'utf8', mode: 0o600 });

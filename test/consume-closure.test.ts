@@ -44,6 +44,12 @@ const WRITERS = [
   join(SRC, 'migration.ts'),
 ];
 
+// Pi-side consume code: text-scanned with the same forbidden-term checks.
+const PI_CONSUME = [
+  join(ROOT, 'extensions', 'qlb-pi', 'consume.ts'),
+  join(ROOT, 'extensions', 'qlb-pi', 'consume-provider.ts'),
+];
+
 const HARNESS = [
   join(ROOT, 'harness', 'claude'),
   join(ROOT, 'harness', 'qlb-proxy-token'),
@@ -181,7 +187,7 @@ describe('consume import-closure walker', () => {
   it('production closure excludes writers and dynamic imports', () => {
     const consume = closureOf(CONSUME_ROOTS);
     const writerHits = [...consume.files].filter((f) => WRITERS.includes(f));
-    const texts = [...consume.files, ...HARNESS].map((f) => ({ f, text: readFileSync(f, 'utf8') }));
+    const texts = [...consume.files, ...PI_CONSUME, ...HARNESS].map((f) => ({ f, text: readFileSync(f, 'utf8') }));
     let tokenTerms = 0;
     let securityWrites = 0;
     let cswapSpawns = 0;

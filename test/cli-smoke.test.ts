@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { describe, it } from 'node:test';
+import { openStore } from '../src/store';
 
 const cliPath = join(__dirname, '..', 'src', 'cli.js');
 
@@ -248,6 +249,45 @@ describe('CLI smoke — documented commands', () => {
     assert.match(zero.stderr, /must be a positive number/);
     const help = runCli(['proxy', '--no-idle', '--help'], env);
     assert.doesNotMatch(help.stderr + help.stdout, /unknown argument/);
+  });
+
+  it('consume enable refuses while Pi Anthropic accounts are QLB-owned', () => {
+    const owned = isolatedEnv();
+    const ownerFile = join(dirname(String(owned.QLB_PI_AUTH_JSON_PATH)), 'qlb-owner.json');
+    writeFileSync(ownerFile, '{"accounts":[]}');
+    const byFile = runCli(['consume', 'enable', '--provider', 'anthropic', '--json'], owned);
+    assert.equal(byFile.status, 1);
+    assert.match(byFile.stderr, /DUAL_OWNERSHIP_REFUSED/);
+
+    const journaled = isolatedEnv();
+    const store = openStore(String(journaled.QLB_DB_PATH));
+    store.upsertMigration('pi-pool', 'QLB_OWNED', '{}');
+    store.close();
+    const byJournal = runCli(['consume', 'enable', '--provider', 'anthropic', '--json'], journaled);
+    assert.equal(byJournal.status, 1);
+    assert.match(byJournal.stderr, /DUAL_OWNERSHIP_REFUSED/);
+    const after = runCli(['consume', 'status', '--provider', 'anthropic', '--json'], journaled);
+    assert.equal(JSON.parse(after.stdout).state, 'NATIVE');
+  });
+
+  it('forward anthropic migration refuses while cswap consume is enabled; status still works', () => {
+    const env = isolatedEnv();
+    const enabled = runCli(['consume', 'enable', '--provider', 'anthropic', '--json'], env);
+    assert.equal(enabled.status, 0, enabled.stderr);
+    // Outside the isolated Pi agent dir, so the real-cutover refusal does not fire first.
+    const migrateDir = mkdtempSync(join(tmpdir(), 'qlb-smoke-migrate-'));
+    const paths = [
+      '--pool-file', join(migrateDir, 'pool.json'),
+      '--owner-file', join(migrateDir, 'qlb-owner.json'),
+    ];
+    for (const sub of ['stage', 'commit', 'resume']) {
+      const refused = runCli(['migrate', sub, '--provider', 'anthropic', ...paths, '--json'], env);
+      assert.equal(refused.status, 1, `${sub}: ${refused.stdout}`);
+      assert.match(refused.stderr, /DUAL_OWNERSHIP_REFUSED/);
+    }
+    const status = runCli(['migrate', 'status', '--provider', 'anthropic', ...paths, '--json'], env);
+    assert.equal(status.status, 0, status.stderr);
+    assert.doesNotMatch(status.stderr, /DUAL_OWNERSHIP_REFUSED/);
   });
 
   it('install.ps1 encodes the documented Windows installer steps', () => {
