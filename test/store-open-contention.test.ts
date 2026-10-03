@@ -34,7 +34,9 @@ type RunningChild = {
 };
 
 function spawnNode(script: string, opts: Record<string, unknown>): RunningChild {
-  const child = spawn(process.execPath, [script, JSON.stringify(opts)], {
+  // Node 22 prints an SQLite ExperimentalWarning to stderr; suppress only that
+  // class so assertCleanExit's stderr === '' stays strict for anything else.
+  const child = spawn(process.execPath, ['--disable-warning=ExperimentalWarning', script, JSON.stringify(opts)], {
     stdio: ['ignore', 'pipe', 'pipe'],
     env: process.env,
   });
