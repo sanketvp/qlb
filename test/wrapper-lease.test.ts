@@ -167,6 +167,14 @@ print("HAS_API_KEY=" + ("1" if "ANTHROPIC_API_KEY" in os.environ else "0"), flus
 print("HAS_HELPER=" + ("1" if os.environ.get("CLAUDE_CODE_API_KEY_HELPER") else "0"), flush=True)
 if "--exit" in sys.argv:
     sys.exit(int(sys.argv[sys.argv.index("--exit") + 1]))
+if "--exit0-on-signal" in sys.argv:
+    def handle0(signum, _frame):
+        sys.exit(0)
+    signal.signal(signal.SIGINT, handle0)
+    signal.signal(signal.SIGTERM, handle0)
+    print("READY", flush=True)
+    time.sleep(60)
+    sys.exit(0)
 if "--exit-on-file" in sys.argv:
     gate = sys.argv[sys.argv.index("--exit-on-file") + 1]
     while not os.path.exists(gate):
@@ -797,6 +805,23 @@ print('SECOND_ACQUIRED')
     await waitExit(holder, 5_000).catch(() => undefined);
     const code = await waitExit(w, 12_000);
     assert.equal(code, 143, out.stderr + out.stdout);
+    assert.equal(spawnSync('ls', [leases], { encoding: 'utf8' }).stdout.trim(), '');
+    await assertCaseQuiet(dir, port);
+  });
+
+  it('wrapper-signal-handled-by-native-exit-0', async () => {
+    const dir = tmp();
+    const leases = join(dir, 'proxy-leases');
+    mkdirSync(leases, { recursive: true });
+    const port = await freePort();
+    const fake = writeFakeClaude(dir);
+    const env = envFor(dir, port, fake);
+    const w = spawnTracked('/usr/bin/python3', [WRAPPER, '--exit0-on-signal'], { env });
+    const out = collect(w);
+    await waitFor(() => out.stdout.includes('READY'), 12_000, 'native ready');
+    w.kill('SIGTERM');
+    const code = await waitExit(w, 12_000);
+    assert.equal(code, 143, 'a native that swallows the signal and exits 0 must not hide it');
     assert.equal(spawnSync('ls', [leases], { encoding: 'utf8' }).stdout.trim(), '');
     await assertCaseQuiet(dir, port);
   });

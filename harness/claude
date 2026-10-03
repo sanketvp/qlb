@@ -540,8 +540,9 @@ def intercepted(argv: list[str]) -> int:
         sys.stderr.write("qlb wrapper: proxy cleanup failed; lease/proxy may remain\n")
         if code == 0:
             return 1
-    if len(received) > forwarded[0] and code == 0:
-        # A signal native never received (e.g. during final shutdown) still counts.
+    if received and code == 0:
+        # A terminating signal was requested but native reported success (it
+        # handled the signal, exited first, or never got it): report the signal.
         return 128 + received[-1]
     return code
 
