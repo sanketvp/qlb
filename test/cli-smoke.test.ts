@@ -270,6 +270,17 @@ describe('CLI smoke — documented commands', () => {
     assert.equal(JSON.parse(after.stdout).state, 'NATIVE');
   });
 
+  it('consume enable writes the marker before the journal; a marker failure leaves NATIVE', () => {
+    const env = isolatedEnv();
+    const marker = join(dirname(String(env.QLB_DB_PATH)), 'consume-anthropic.json');
+    mkdirSync(marker); // a directory where the marker file must go -> write fails
+    const failed = runCli(['consume', 'enable', '--provider', 'anthropic', '--json'], env);
+    assert.equal(failed.status, 1);
+    assert.match(failed.stderr, /cannot write/);
+    const status = runCli(['consume', 'status', '--provider', 'anthropic', '--json'], env);
+    assert.equal(JSON.parse(status.stdout).state, 'NATIVE');
+  });
+
   it('forward anthropic migration refuses while cswap consume is enabled; status and rollback do not', () => {
     const env = isolatedEnv();
     const enabled = runCli(['consume', 'enable', '--provider', 'anthropic', '--json'], env);

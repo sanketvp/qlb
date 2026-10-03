@@ -1407,9 +1407,16 @@ async function runConsume(opts: ConsumeOpts): Promise<number> {
         );
         return 1;
       }
+      // Marker before journal: CONSUMED must never exist without the marker qlb-pi
+      // uses to fail closed when `qlb consume status` is unreadable.
+      try {
+        mkdirSync(dirname(marker), { recursive: true, mode: 0o700 });
+        writeFileSync(marker, `${JSON.stringify({ state: CONSUME_STATE })}\n`, { encoding: 'utf8', mode: 0o600 });
+      } catch (err) {
+        console.error(`qlb consume enable: cannot write ${marker}: ${err instanceof Error ? err.message : String(err)}`);
+        return 1;
+      }
       store.upsertMigration(CSWAP_ANTHROPIC_STORE, CONSUME_STATE, '{}');
-      mkdirSync(dirname(marker), { recursive: true, mode: 0o700 });
-      writeFileSync(marker, `${JSON.stringify({ state: CONSUME_STATE })}\n`, { encoding: 'utf8', mode: 0o600 });
     } else if (opts.sub === 'disable') {
       store.upsertMigration(CSWAP_ANTHROPIC_STORE, 'NATIVE', '{}');
       try {

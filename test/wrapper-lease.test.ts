@@ -864,6 +864,110 @@ print('SECOND_ACQUIRED')
     await assertCaseQuiet(dir, port);
   });
 
+  it('wrapper-group-interrupt-while-final-cleanup-waits-for-mutex', async () => {
+    const dir = tmp();
+    const leases = join(dir, 'proxy-leases');
+    mkdirSync(leases, { recursive: true });
+    const port = await freePort();
+    const fake = writeFakeClaude(dir);
+    const env = envFor(dir, port, fake);
+    const gate = join(dir, 'exit-gate');
+    const lock = join(dir, 'proxy.lock');
+    // Own process group, like a terminal foreground job, so the whole group can be signalled.
+    const w = spawn('/usr/bin/python3', [WRAPPER, '--exit-on-file', gate], { env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    children.push(w);
+    const out = collect(w);
+    await waitFor(() => out.stdout.includes('ANTHROPIC_BASE_URL='), 12_000, 'child');
+    const fifo = join(dir, 'hold-final.fifo');
+    spawnSync('mkfifo', [fifo]);
+    const holder = spawnTracked('/usr/bin/python3', [MUTEX, lock, '--', '/bin/sh', '-c', 'echo HELD; exec cat "$1"', 'sh', fifo], {
+      env: process.env,
+    });
+    const holdOut = collect(holder);
+    await waitFor(() => holdOut.stdout.includes('HELD'), 5_000, 'mutex held');
+    writeFileSync(gate, 'go'); // native exits 0; final cleanup now waits on the mutex
+    await delay(600);
+    process.kill(-w.pid!, 'SIGINT');
+    await waitFor(() => out.stdout.includes('SIGNAL=INT'), 5_000, 'wrapper recorded INT');
+    await delay(300);
+    writeFileSync(fifo, 'x');
+    await waitExit(holder, 5_000).catch(() => undefined);
+    const code = await waitExit(w, 15_000);
+    assert.equal(code, 130, out.stderr + out.stdout);
+    assert.equal(spawnSync('ls', [leases], { encoding: 'utf8' }).stdout.trim(), '', 'final cleanup must still run');
+    await assertCaseQuiet(dir, port);
+  });
+
+  it('mutex-wait-is-bounded', async () => {
+    const dir = tmp();
+    const lock = join(dir, 'proxy.lock');
+    const fifo = join(dir, 'hold.fifo');
+    spawnSync('mkfifo', [fifo]);
+    const holder = spawnTracked('/usr/bin/python3', [MUTEX, lock, '--', '/bin/sh', '-c', 'echo HELD; exec cat "$1"', 'sh', fifo], {
+      env: process.env,
+    });
+    const holdOut = collect(holder);
+    await waitFor(() => holdOut.stdout.includes('HELD'), 5_000, 'mutex held');
+    const r = spawnSync('/usr/bin/python3', [MUTEX, lock, '--', '/usr/bin/true'], {
+      env: { ...process.env, QLB_PROXY_LOCK_TIMEOUT_S: '0.5' },
+      encoding: 'utf8',
+      timeout: 10_000,
+    });
+    assert.equal(r.status, 75, r.stderr);
+    assert.match(r.stderr, /timed out/);
+    writeFileSync(fifo, 'x');
+    await waitExit(holder, 5_000).catch(() => undefined);
+  });
+
+  it('wrapper-signal-with-dead-stdout-keeps-helper-alive', async () => {
+    const dir = tmp();
+    const leases = join(dir, 'proxy-leases');
+    mkdirSync(leases, { recursive: true });
+    const port = await freePort();
+    const fake = writeFakeClaude(dir);
+    const marker = join(dir, 'pause-listen');
+    const env = envFor(dir, port, fake, { QLB_PROXY_PAUSE_AFTER_LISTEN: marker });
+    const w = spawnTracked('/usr/bin/python3', [WRAPPER, '--wait-signal'], { env });
+    const errOut = { stderr: '' };
+    w.stderr?.on('data', (c: Buffer) => { errOut.stderr += c.toString('utf8'); });
+    await waitForFile(marker, 10_000);
+    const helpers = pidsFromOutput(spawnSync('pgrep', ['-P', String(w.pid)], { encoding: 'utf8' }).stdout || '');
+    assert.ok(helpers.length > 0, 'setup helper must be running');
+    w.stdout?.destroy(); // like a hung-up terminal: writes to stdout now fail
+    await delay(200);
+    w.kill('SIGHUP');
+    await delay(1_000);
+    for (const pid of helpers) {
+      let alive = true;
+      try { process.kill(pid, 0); } catch { alive = false; }
+      assert.equal(alive, true, 'a failing handler write must not kill the setup helper');
+    }
+    unlinkSync(marker);
+    const code = await waitExit(w, 15_000);
+    assert.equal(code, 129, errOut.stderr);
+    assert.equal(spawnSync('ls', [leases], { encoding: 'utf8' }).stdout.trim(), '');
+    await assertCaseQuiet(dir, port);
+  });
+
+  it('wrapper-respects-nohup', async () => {
+    const dir = tmp();
+    mkdirSync(join(dir, 'proxy-leases'), { recursive: true });
+    const port = await freePort();
+    const fake = writeFakeClaude(dir);
+    const env = envFor(dir, port, fake);
+    const gate = join(dir, 'exit-gate');
+    const w = spawnTracked('/usr/bin/nohup', ['/usr/bin/python3', WRAPPER, '--exit-on-file', gate], { env });
+    const out = collect(w);
+    await waitFor(() => existsSync(join(dir, 'proxy.json')), 12_000, 'proxy up');
+    await delay(500);
+    w.kill('SIGHUP');
+    await delay(500);
+    assert.equal(w.exitCode, null, 'nohup-ignored HUP must not end the session');
+    writeFileSync(gate, 'go');
+    assert.equal(await waitExit(w, 12_000), 0, out.stderr + out.stdout);
+    await assertCaseQuiet(dir, port);
+  });
+
   it('wrapper-sighup-terminal-close', async () => {
     const dir = tmp();
     const leases = join(dir, 'proxy-leases');

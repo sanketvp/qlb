@@ -448,16 +448,28 @@ def intercepted(argv: list[str]) -> int:
     shutting_down = [False]
 
     def handle(signum: int, _frame: Any) -> None:
-        name = {signal.SIGINT: "INT", signal.SIGTERM: "TERM", signal.SIGHUP: "HUP"}.get(signum, str(signum))
-        print(f"SIGNAL={name}", flush=True)
-        if not shutting_down[0]:
-            record_terminating_signal(home, wrapper_pid, name)  # cleanup owns the lease after this
+        # Must never raise: an exception escaping here while subprocess.run waits
+        # makes it SIGKILL the setup/cleanup helper. Record first; report best-effort
+        # (stdout may be a hung-up terminal), unbuffered so exit-time flush cannot fail.
         received.append(signum)
+        name = {signal.SIGINT: "INT", signal.SIGTERM: "TERM", signal.SIGHUP: "HUP"}.get(signum, str(signum))
+        try:
+            if not shutting_down[0]:
+                record_terminating_signal(home, wrapper_pid, name)  # cleanup owns the lease after this
+        except OSError:
+            pass
+        try:
+            os.write(sys.stdout.fileno(), f"SIGNAL={name}\n".encode())
+        except (OSError, ValueError):
+            pass
 
     # Installed before the critical section so a signal during proxy setup is
     # recorded instead of killing the wrapper with a lease/proxy left behind.
-    # HUP too: closing the terminal must still release the lease and proxy.
+    # HUP too: closing the terminal must still release the lease and proxy —
+    # unless HUP was deliberately ignored (e.g. `nohup claude ...`).
     for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        if signum == signal.SIGHUP and signal.getsignal(signum) is signal.SIG_IGN:
+            continue
         signal.signal(signum, handle)
 
     def run_native() -> int:
