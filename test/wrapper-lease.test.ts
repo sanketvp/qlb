@@ -167,6 +167,19 @@ print("HAS_API_KEY=" + ("1" if "ANTHROPIC_API_KEY" in os.environ else "0"), flus
 print("HAS_HELPER=" + ("1" if os.environ.get("CLAUDE_CODE_API_KEY_HELPER") else "0"), flush=True)
 if "--exit" in sys.argv:
     sys.exit(int(sys.argv[sys.argv.index("--exit") + 1]))
+if "--exit0-on-signal" in sys.argv:
+    def handle0(signum, _frame):
+        sys.exit(0)
+    signal.signal(signal.SIGINT, handle0)
+    signal.signal(signal.SIGTERM, handle0)
+    print("READY", flush=True)
+    time.sleep(60)
+    sys.exit(0)
+if "--exit-on-file" in sys.argv:
+    gate = sys.argv[sys.argv.index("--exit-on-file") + 1]
+    while not os.path.exists(gate):
+        time.sleep(0.05)
+    sys.exit(0)
 if "--wait-signal" in sys.argv:
     def handle(signum, _frame):
         sys.exit(128 + signum)
@@ -642,6 +655,377 @@ print('SECOND_ACQUIRED')
     assert.match(out.stdout, /HAS_HELPER=1/);
     assert.match(out.stdout, /HELPER_USED=1/);
     assert.match(out.stdout, /PROXY_STATUS=200/);
+    await assertCaseQuiet(dir, port);
+  });
+
+  it('wrapper-native-launch-failure', async () => {
+    for (const variant of ['missing', 'not-executable'] as const) {
+      const dir = tmp();
+      const leases = join(dir, 'proxy-leases');
+      mkdirSync(leases, { recursive: true });
+      const port = await freePort();
+      const native = join(dir, 'no-such-claude');
+      if (variant === 'not-executable') writeFileSync(native, '#!/bin/sh\nexit 0\n', { mode: 0o644 });
+      const env = envFor(dir, port, native);
+      const w = spawnTracked('/usr/bin/python3', [WRAPPER, '--wait-signal'], { env });
+      const out = collect(w);
+      const code = await waitExit(w, 15_000);
+      assert.equal(code, variant === 'missing' ? 127 : 126, out.stderr + out.stdout);
+      assert.match(out.stderr, /cannot launch/);
+      assert.equal(spawnSync('ls', [leases], { encoding: 'utf8' }).stdout.trim(), '');
+      assert.equal(existsSync(join(dir, 'proxy.json')), false);
+      await assertCaseQuiet(dir, port);
+    }
+  });
+
+  it('wrapper-shutdown-stuck-proxy', async () => {
+    const dir = tmp();
+    mkdirSync(join(dir, 'proxy-leases'), { recursive: true });
+    const port = await freePort();
+    const fake = writeFakeClaude(dir);
+    const env = envFor(dir, port, fake);
+    const w = spawnTracked('/usr/bin/python3', [WRAPPER, '--wait-signal'], { env });
+    const out = collect(w);
+    await waitForFile(join(dir, 'proxy.json'), 10_000);
+    await waitFor(() => out.stdout.includes('ANTHROPIC_BASE_URL='), 8_000, 'child');
+    const info = JSON.parse(readFileSync(join(dir, 'proxy.json'), 'utf8')) as { pid: number };
+    // A request whose headers never finish keeps server.close() pending past the grace period.
+    const held = net.connect({ host: '127.0.0.1', port });
+    await new Promise<void>((resolve) => held.once('connect', () => resolve()));
+    held.write(`GET /qlb/health HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\n`);
+    held.on('error', () => undefined);
+    try {
+      w.kill('SIGTERM');
+      const code = await waitExit(w, 15_000);
+      assert.equal(code, 143);
+      assert.match(out.stdout, /PROXY_SIGKILL=1/);
+      let alive = true;
+      try { process.kill(info.pid, 0); } catch { alive = false; }
+      assert.equal(alive, false, 'proxy process must be gone before metadata is removed');
+      assert.equal(existsSync(join(dir, 'proxy.json')), false);
+      await assertCaseQuiet(dir, port);
+    } finally {
+      held.destroy();
+    }
+  });
+
+  it('wrapper-signal-before-launch', async () => {
+    const dir = tmp();
+    const leases = join(dir, 'proxy-leases');
+    mkdirSync(leases, { recursive: true });
+    const port = await freePort();
+    const fake = writeFakeClaude(dir);
+    const marker = join(dir, 'pause-launch');
+    const env = envFor(dir, port, fake, { QLB_WRAPPER_PAUSE_BEFORE_LAUNCH: marker });
+    const w = spawnTracked('/usr/bin/python3', [WRAPPER, '--wait-signal'], { env });
+    const out = collect(w);
+    await waitForFile(marker, 10_000);
+    w.kill('SIGTERM');
+    const code = await waitExit(w, 10_000);
+    assert.equal(code, 143);
+    assert.match(out.stdout, /SIGNAL=TERM/);
+    assert.doesNotMatch(out.stdout, /ANTHROPIC_BASE_URL=/, 'native must not start after an early signal');
+    assert.equal(spawnSync('ls', [leases], { encoding: 'utf8' }).stdout.trim(), '');
+    await assertCaseQuiet(dir, port);
+  });
+
+  it('wrapper-signal-during-proxy-setup', async () => {
+    const dir = tmp();
+    const leases = join(dir, 'proxy-leases');
+    mkdirSync(leases, { recursive: true });
+    const port = await freePort();
+    const fake = writeFakeClaude(dir);
+    const marker = join(dir, 'pause-listen');
+    const env = envFor(dir, port, fake, { QLB_PROXY_PAUSE_AFTER_LISTEN: marker });
+    const w = spawnTracked('/usr/bin/python3', [WRAPPER, '--wait-signal'], { env });
+    const out = collect(w);
+    // The critical section is now waiting for the paused proxy's ownership record.
+    await waitForFile(marker, 10_000);
+    w.kill('SIGTERM');
+    await waitFor(() => out.stdout.includes('SIGNAL=TERM'), 5_000, 'signal queued');
+    unlinkSync(marker);
+    const code = await waitExit(w, 15_000);
+    assert.equal(code, 143, out.stderr + out.stdout);
+    assert.doesNotMatch(out.stdout, /ANTHROPIC_BASE_URL=/, 'native must not start after a setup-time signal');
+    assert.equal(spawnSync('ls', [leases], { encoding: 'utf8' }).stdout.trim(), '');
+    await assertCaseQuiet(dir, port);
+  });
+
+  it('wrapper-signal-at-spawn-boundary', async () => {
+    for (const variant of ['launches', 'launch-fails'] as const) {
+      const dir = tmp();
+      const leases = join(dir, 'proxy-leases');
+      mkdirSync(leases, { recursive: true });
+      const port = await freePort();
+      const native = variant === 'launches' ? writeFakeClaude(dir) : join(dir, 'no-such-claude');
+      const env = envFor(dir, port, native, { QLB_WRAPPER_SELF_SIGNAL_AT_SPAWN: '1' });
+      const started = Date.now();
+      const w = spawnTracked('/usr/bin/python3', [WRAPPER, '--wait-signal'], { env });
+      const out = collect(w);
+      // The launched fake would otherwise sleep 60s: a prompt 143 proves the
+      // boundary signal was forwarded (it may die before printing anything).
+      const code = await waitExit(w, 15_000);
+      assert.equal(code, 143, `${variant}: ${out.stderr}${out.stdout}`);
+      assert.ok(Date.now() - started < 12_000, 'signal must not wait for the native sleep');
+      assert.match(out.stdout, /SIGNAL=TERM/);
+      if (variant === 'launch-fails') assert.match(out.stderr, /cannot launch/);
+      assert.equal(spawnSync('ls', [leases], { encoding: 'utf8' }).stdout.trim(), '');
+      await assertCaseQuiet(dir, port);
+    }
+  });
+
+  it('wrapper-signal-during-final-shutdown', async () => {
+    const dir = tmp();
+    const leases = join(dir, 'proxy-leases');
+    mkdirSync(leases, { recursive: true });
+    const port = await freePort();
+    const fake = writeFakeClaude(dir);
+    const env = envFor(dir, port, fake);
+    const gate = join(dir, 'exit-gate');
+    const lock = join(dir, 'proxy.lock');
+    const w = spawnTracked('/usr/bin/python3', [WRAPPER, '--exit-on-file', gate], { env });
+    const out = collect(w);
+    await waitFor(() => out.stdout.includes('ANTHROPIC_BASE_URL='), 12_000, 'child');
+    const fifo = join(dir, 'hold-final.fifo');
+    spawnSync('mkfifo', [fifo]);
+    const holder = spawnTracked('/usr/bin/python3', [MUTEX, lock, '--', '/bin/sh', '-c', 'echo HELD; exec cat "$1"', 'sh', fifo], {
+      env: process.env,
+    });
+    const holdOut = collect(holder);
+    await waitFor(() => holdOut.stdout.includes('HELD'), 5_000, 'mutex held');
+    writeFileSync(gate, 'go'); // native exits 0; wrapper now blocks in final shutdown
+    await delay(600);
+    const leaseFile = join(leases, String(w.pid));
+    const before = readFileSync(leaseFile, 'utf8');
+    w.kill('SIGTERM');
+    await waitFor(() => out.stdout.includes('SIGNAL=TERM'), 5_000, 'signal seen');
+    await delay(200);
+    assert.equal(readFileSync(leaseFile, 'utf8'), before, 'cleanup-time signal must not rewrite the lease');
+    writeFileSync(fifo, 'x');
+    await waitExit(holder, 5_000).catch(() => undefined);
+    const code = await waitExit(w, 12_000);
+    assert.equal(code, 143, out.stderr + out.stdout);
+    assert.equal(spawnSync('ls', [leases], { encoding: 'utf8' }).stdout.trim(), '');
+    await assertCaseQuiet(dir, port);
+  });
+
+  it('wrapper-signal-handled-by-native-exit-0', async () => {
+    const dir = tmp();
+    const leases = join(dir, 'proxy-leases');
+    mkdirSync(leases, { recursive: true });
+    const port = await freePort();
+    const fake = writeFakeClaude(dir);
+    const env = envFor(dir, port, fake);
+    const w = spawnTracked('/usr/bin/python3', [WRAPPER, '--exit0-on-signal'], { env });
+    const out = collect(w);
+    await waitFor(() => out.stdout.includes('READY'), 12_000, 'native ready');
+    w.kill('SIGTERM');
+    const code = await waitExit(w, 12_000);
+    assert.equal(code, 143, 'a native that swallows the signal and exits 0 must not hide it');
+    assert.equal(spawnSync('ls', [leases], { encoding: 'utf8' }).stdout.trim(), '');
+    await assertCaseQuiet(dir, port);
+  });
+
+  it('wrapper-terminal-interrupt-hits-setup-helper', async () => {
+    const dir = tmp();
+    const leases = join(dir, 'proxy-leases');
+    mkdirSync(leases, { recursive: true });
+    const port = await freePort();
+    const fake = writeFakeClaude(dir);
+    const marker = join(dir, 'pause-listen');
+    const env = envFor(dir, port, fake, { QLB_PROXY_PAUSE_AFTER_LISTEN: marker });
+    const w = spawnTracked('/usr/bin/python3', [WRAPPER, '--wait-signal'], { env });
+    const out = collect(w);
+    await waitForFile(marker, 10_000);
+    // A terminal Ctrl-C reaches the whole foreground group: wrapper and setup helper.
+    const helpers = pidsFromOutput(spawnSync('pgrep', ['-P', String(w.pid)], { encoding: 'utf8' }).stdout || '');
+    assert.ok(helpers.length > 0, 'setup helper must be running');
+    for (const pid of helpers) process.kill(pid, 'SIGINT');
+    w.kill('SIGINT');
+    await waitFor(() => out.stdout.includes('SIGNAL=INT'), 5_000, 'wrapper recorded INT');
+    await delay(1_500);
+    // The helper must survive the interrupt and finish publishing ownership,
+    // otherwise the listening proxy is stranded with no proxy.json.
+    for (const pid of helpers) {
+      let alive = true;
+      try { process.kill(pid, 0); } catch { alive = false; }
+      assert.equal(alive, true, 'setup helper must ignore the terminal interrupt');
+    }
+    unlinkSync(marker);
+    const code = await waitExit(w, 15_000);
+    assert.equal(code, 130, out.stderr + out.stdout);
+    assert.doesNotMatch(out.stdout, /ANTHROPIC_BASE_URL=/);
+    assert.equal(spawnSync('ls', [leases], { encoding: 'utf8' }).stdout.trim(), '');
+    await assertCaseQuiet(dir, port);
+    // The next run must not be blocked by a stranded listener.
+    const w2 = spawnTracked('/usr/bin/python3', [WRAPPER, '--exit', '0'], { env: envFor(dir, port, fake) });
+    const o2 = collect(w2);
+    assert.equal(await waitExit(w2, 12_000), 0, o2.stdout);
+    await assertCaseQuiet(dir, port);
+  });
+
+  for (const sig of ['SIGINT', 'SIGTERM'] as const) {
+  it(`wrapper-group-${sig}-while-final-cleanup-waits-for-mutex`, async () => {
+    const dir = tmp();
+    const leases = join(dir, 'proxy-leases');
+    mkdirSync(leases, { recursive: true });
+    const port = await freePort();
+    const fake = writeFakeClaude(dir);
+    const env = envFor(dir, port, fake);
+    const gate = join(dir, 'exit-gate');
+    const lock = join(dir, 'proxy.lock');
+    // Own process group, like a terminal foreground job, so the whole group can be signalled.
+    const w = spawn('/usr/bin/python3', [WRAPPER, '--exit-on-file', gate], { env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    children.push(w);
+    const out = collect(w);
+    await waitFor(() => out.stdout.includes('ANTHROPIC_BASE_URL='), 12_000, 'child');
+    const fifo = join(dir, 'hold-final.fifo');
+    spawnSync('mkfifo', [fifo]);
+    const holder = spawnTracked('/usr/bin/python3', [MUTEX, lock, '--', '/bin/sh', '-c', 'echo HELD; exec cat "$1"', 'sh', fifo], {
+      env: process.env,
+    });
+    const holdOut = collect(holder);
+    await waitFor(() => holdOut.stdout.includes('HELD'), 5_000, 'mutex held');
+    writeFileSync(gate, 'go'); // native exits 0; final cleanup now waits on the mutex
+    await delay(600);
+    process.kill(-w.pid!, sig);
+    const short = sig === 'SIGINT' ? 'INT' : 'TERM';
+    await waitFor(() => out.stdout.includes(`SIGNAL=${short}`), 5_000, `wrapper recorded ${short}`);
+    await delay(300);
+    writeFileSync(fifo, 'x');
+    await waitExit(holder, 5_000).catch(() => undefined);
+    const code = await waitExit(w, 15_000);
+    assert.equal(code, sig === 'SIGINT' ? 130 : 143, out.stderr + out.stdout);
+    assert.equal(spawnSync('ls', [leases], { encoding: 'utf8' }).stdout.trim(), '', 'final cleanup must still run');
+    await assertCaseQuiet(dir, port);
+  });
+  }
+
+  it('mutex-wait-is-bounded', async () => {
+    const dir = tmp();
+    const lock = join(dir, 'proxy.lock');
+    const fifo = join(dir, 'hold.fifo');
+    spawnSync('mkfifo', [fifo]);
+    const holder = spawnTracked('/usr/bin/python3', [MUTEX, lock, '--', '/bin/sh', '-c', 'echo HELD; exec cat "$1"', 'sh', fifo], {
+      env: process.env,
+    });
+    const holdOut = collect(holder);
+    await waitFor(() => holdOut.stdout.includes('HELD'), 5_000, 'mutex held');
+    const r = spawnSync('/usr/bin/python3', [MUTEX, lock, '--', '/usr/bin/true'], {
+      env: { ...process.env, QLB_PROXY_LOCK_TIMEOUT_S: '0.5' },
+      encoding: 'utf8',
+      timeout: 10_000,
+    });
+    assert.equal(r.status, 75, r.stderr);
+    assert.match(r.stderr, /timed out/);
+    // Non-finite / non-positive values fall back to the 60s default, never unbounded.
+    for (const bad of ['inf', 'nan', '-1', '0', 'abc']) {
+      // Run the real mutex source with exec replaced by printing the effective bound.
+      const p = spawnSync('/usr/bin/python3', ['-c', `
+import os, sys
+sys.argv = ['qlb-proxy-mutex', ${JSON.stringify(join(dir, 'probe.lock'))}, '--', 'true']
+os.environ['QLB_PROXY_LOCK_TIMEOUT_S'] = ${JSON.stringify(bad)}
+src = open(${JSON.stringify(MUTEX)}).read().replace('os.execvp(argv[0], argv)', 'print(timeout_s)')
+exec(compile(src, 'qlb-proxy-mutex', 'exec'), {'__name__': '__main__'})
+`], { encoding: 'utf8', timeout: 10_000 });
+      assert.equal(p.status, 0, p.stderr);
+      assert.equal(p.stdout.trim(), '60.0', `${bad} -> ${p.stdout}`);
+    }
+    writeFileSync(fifo, 'x');
+    await waitExit(holder, 5_000).catch(() => undefined);
+  });
+
+  it('wrapper-signal-with-dead-stdout-keeps-helper-alive', async () => {
+    const dir = tmp();
+    const leases = join(dir, 'proxy-leases');
+    mkdirSync(leases, { recursive: true });
+    const port = await freePort();
+    const fake = writeFakeClaude(dir);
+    const marker = join(dir, 'pause-listen');
+    const env = envFor(dir, port, fake, { QLB_PROXY_PAUSE_AFTER_LISTEN: marker });
+    const w = spawnTracked('/usr/bin/python3', [WRAPPER, '--wait-signal'], { env });
+    const errOut = { stderr: '' };
+    w.stderr?.on('data', (c: Buffer) => { errOut.stderr += c.toString('utf8'); });
+    await waitForFile(marker, 10_000);
+    const helpers = pidsFromOutput(spawnSync('pgrep', ['-P', String(w.pid)], { encoding: 'utf8' }).stdout || '');
+    assert.ok(helpers.length > 0, 'setup helper must be running');
+    w.stdout?.destroy(); // like a hung-up terminal: writes to stdout now fail
+    await delay(200);
+    w.kill('SIGHUP');
+    await delay(1_000);
+    for (const pid of helpers) {
+      let alive = true;
+      try { process.kill(pid, 0); } catch { alive = false; }
+      assert.equal(alive, true, 'a failing handler write must not kill the setup helper');
+    }
+    unlinkSync(marker);
+    const code = await waitExit(w, 15_000);
+    assert.equal(code, 129, errOut.stderr);
+    assert.equal(spawnSync('ls', [leases], { encoding: 'utf8' }).stdout.trim(), '');
+    await assertCaseQuiet(dir, port);
+  });
+
+  it('wrapper-respects-nohup', async () => {
+    const dir = tmp();
+    mkdirSync(join(dir, 'proxy-leases'), { recursive: true });
+    const port = await freePort();
+    const fake = writeFakeClaude(dir);
+    const env = envFor(dir, port, fake);
+    const gate = join(dir, 'exit-gate');
+    const w = spawnTracked('/usr/bin/nohup', ['/usr/bin/python3', WRAPPER, '--exit-on-file', gate], { env });
+    const out = collect(w);
+    await waitFor(() => existsSync(join(dir, 'proxy.json')), 12_000, 'proxy up');
+    await delay(500);
+    w.kill('SIGHUP');
+    await delay(500);
+    assert.equal(w.exitCode, null, 'nohup-ignored HUP must not end the session');
+    writeFileSync(gate, 'go');
+    assert.equal(await waitExit(w, 12_000), 0, out.stderr + out.stdout);
+    await assertCaseQuiet(dir, port);
+  });
+
+  it('wrapper-sighup-terminal-close', async () => {
+    const dir = tmp();
+    const leases = join(dir, 'proxy-leases');
+    mkdirSync(leases, { recursive: true });
+    const port = await freePort();
+    const fake = writeFakeClaude(dir);
+    const env = envFor(dir, port, fake);
+    const w = spawnTracked('/usr/bin/python3', [WRAPPER, '--wait-signal'], { env });
+    const out = collect(w);
+    await waitFor(() => out.stdout.includes('ANTHROPIC_BASE_URL='), 12_000, 'child');
+    w.kill('SIGHUP');
+    const code = await waitExit(w, 12_000);
+    assert.equal(code, 129, out.stderr + out.stdout);
+    assert.match(out.stdout, /SIGNAL=HUP/);
+    assert.equal(spawnSync('ls', [leases], { encoding: 'utf8' }).stdout.trim(), '');
+    await assertCaseQuiet(dir, port);
+  });
+
+  it('wrapper-cleanup-failure-is-not-masked', async () => {
+    const dir = tmp();
+    mkdirSync(join(dir, 'proxy-leases'), { recursive: true });
+    const port = await freePort();
+    const fake = writeFakeClaude(dir);
+    const env = envFor(dir, port, fake);
+    const gate = join(dir, 'exit-gate');
+    const lock = join(dir, 'proxy.lock');
+    const w = spawnTracked('/usr/bin/python3', [WRAPPER, '--exit-on-file', gate], { env });
+    const out = collect(w);
+    await waitFor(() => out.stdout.includes('ANTHROPIC_BASE_URL='), 12_000, 'child');
+    chmodSync(lock, 0o000); // final mutex cannot open the lock -> cleanup fails
+    try {
+      writeFileSync(gate, 'go');
+      const code = await waitExit(w, 12_000);
+      assert.notEqual(code, 0, 'native exit 0 must not hide a failed cleanup');
+      assert.match(out.stderr, /proxy cleanup failed/);
+    } finally {
+      chmodSync(lock, 0o600);
+    }
+    // A later wrapper reaps the dead lease and stops the orphaned proxy.
+    const w2 = spawnTracked('/usr/bin/python3', [WRAPPER, '--exit', '0'], { env });
+    collect(w2);
+    assert.equal(await waitExit(w2, 12_000), 0);
     await assertCaseQuiet(dir, port);
   });
 

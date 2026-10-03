@@ -7,7 +7,7 @@
  * and whether the installed extension copy matches the tracked source.
  */
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, type Dirent } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { DoctorCheck } from './diagnostics';
@@ -26,7 +26,7 @@ const PI_SEAMS: Array<{ id: string; dir: string; pattern: RegExp; why: string }>
 /** Recursively list .d.ts files (bounded: Pi's dist is a few hundred files). */
 function dtsFiles(dir: string, out: string[] = [], depth = 0): string[] {
   if (depth > 6) return out;
-  let entries: import('node:fs').Dirent[] = [];
+  let entries: Dirent[] = [];
   try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return out; }
   for (const e of entries) {
     const p = join(dir, e.name);
