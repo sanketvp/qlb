@@ -1,46 +1,99 @@
 import assert from 'node:assert/strict';
-import { chmodSync, mkdirSync, mkdtempSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, it } from 'node:test';
+import { after, describe, it } from 'node:test';
 
-import { piTypecheckConfig, resolvePiPackageRoot } from '../src/pi-integration';
+import { locatePi, piIntegrationChecks, piTypecheckConfig, resolvePiPackageRoot } from '../src/pi-integration';
 
-function fakePiInstall(prefix: string, version: string): string {
+const temps: string[] = [];
+after(() => {
+  for (const dir of temps) rmSync(dir, { recursive: true, force: true });
+});
+function tmp(prefix: string): string {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), prefix)));
+  temps.push(dir);
+  return dir;
+}
+
+function fakePiPackage(prefix: string, version: string): string {
   const root = join(prefix, 'lib', 'node_modules', '@earendil-works', 'pi-coding-agent');
   mkdirSync(join(root, 'dist', 'bundle'), { recursive: true });
   writeFileSync(join(root, 'package.json'), JSON.stringify({ name: '@earendil-works/pi-coding-agent', version }));
   const entry = join(root, 'dist', 'bundle', 'cli.js');
   writeFileSync(entry, '#!/usr/bin/env node\n');
   chmodSync(entry, 0o755);
-  mkdirSync(join(prefix, 'bin'), { recursive: true });
-  symlinkSync(entry, join(prefix, 'bin', 'pi'));
-  return realpathSync(root);
+  return root;
 }
 
-describe('resolvePiPackageRoot', () => {
-  it('follows the first pi on PATH to its package, not a stale install elsewhere', () => {
-    const base = mkdtempSync(join(tmpdir(), 'qlb-piroot-'));
-    const active = fakePiInstall(join(base, 'local'), '1.0.1');
-    fakePiInstall(join(base, 'homebrew'), '0.99.2');
+function npmSymlinkInstall(prefix: string, version: string): string {
+  const root = fakePiPackage(prefix, version);
+  mkdirSync(join(prefix, 'bin'), { recursive: true });
+  symlinkSync(join(root, 'dist', 'bundle', 'cli.js'), join(prefix, 'bin', 'pi'));
+  return root;
+}
+
+function executable(path: string, text: string | Buffer): void {
+  writeFileSync(path, text);
+  chmodSync(path, 0o755);
+}
+
+describe('locatePi', () => {
+  it('follows the first pi on PATH to its package, not a stale install later on PATH', () => {
+    const base = tmp('qlb-piroot-');
+    const active = npmSymlinkInstall(join(base, 'local'), '1.0.1');
+    npmSymlinkInstall(join(base, 'homebrew'), '0.99.2');
     const env = { PATH: [join(base, 'nothing'), join(base, 'local', 'bin'), join(base, 'homebrew', 'bin')].join(':') };
-    assert.equal(resolvePiPackageRoot(env, join(base, 'home')), active);
+    assert.deepEqual(locatePi(env, join(base, 'home')), { root: active, launcher: join(base, 'local', 'bin', 'pi') });
   });
 
-  it('honors QLB_PI_PACKAGE_ROOT and rejects a directory that is not Pi', () => {
-    const base = mkdtempSync(join(tmpdir(), 'qlb-piroot-'));
-    const root = fakePiInstall(join(base, 'x'), '1.0.1');
-    assert.equal(resolvePiPackageRoot({ QLB_PI_PACKAGE_ROOT: root, PATH: '' }, base), root);
-    assert.equal(resolvePiPackageRoot({ QLB_PI_PACKAGE_ROOT: base, PATH: '' }, base), null);
+  it('reads the package path out of a wrapper script shim', () => {
+    const base = tmp('qlb-piroot-');
+    const root = fakePiPackage(join(base, 'tool'), '1.0.1');
+    mkdirSync(join(base, 'shims'));
+    executable(join(base, 'shims', 'pi'), `#!/bin/sh\nexec node "${root}/dist/bundle/cli.js" "$@"\n`);
+    assert.equal(resolvePiPackageRoot({ PATH: join(base, 'shims') }, base), root);
   });
 
-  it('falls back to ~/.local when no pi is on PATH', () => {
-    const home = mkdtempSync(join(tmpdir(), 'qlb-piroot-home-'));
-    fakePiInstall(join(home, '.local'), '1.0.1');
-    assert.equal(
-      resolvePiPackageRoot({ PATH: '' }, home),
-      join(home, '.local', 'lib', 'node_modules', '@earendil-works', 'pi-coding-agent'),
-    );
+  it('resolves a Windows npm .cmd shim relative to its directory', () => {
+    const base = tmp('qlb-piroot-');
+    fakePiPackage(join(base, 'npm'), '1.0.1');
+    const bin = join(base, 'npm', 'lib');
+    writeFileSync(join(bin, 'pi.cmd'), '@ECHO off\r\n"%~dp0\\node_modules\\@earendil-works\\pi-coding-agent\\dist\\bundle\\cli.js" %*\r\n');
+    const env = { PATH: bin, PATHEXT: '.CMD' };
+    assert.equal(locatePi(env, base, 'win32').root, join(bin, 'node_modules', '@earendil-works', 'pi-coding-agent'));
+  });
+
+  it('reports an untraceable first launcher instead of falling through to a stale install', () => {
+    const base = tmp('qlb-piroot-');
+    mkdirSync(join(base, 'volta', 'bin'), { recursive: true });
+    executable(join(base, 'volta', 'bin', 'pi'), Buffer.from([0xcf, 0xfa, 0xed, 0xfe, 0, 0, 0, 0])); // compiled shim
+    npmSymlinkInstall(join(base, 'stale'), '0.99.2');
+    const env = { PATH: [join(base, 'volta', 'bin'), join(base, 'stale', 'bin')].join(':') };
+    assert.deepEqual(locatePi(env, base), { root: null, launcher: join(base, 'volta', 'bin', 'pi'), unresolved: true });
+  });
+
+  it('honors QLB_PI_PACKAGE_ROOT and flags one that is not Pi', () => {
+    const base = tmp('qlb-piroot-');
+    const root = fakePiPackage(join(base, 'x'), '1.0.1');
+    assert.deepEqual(locatePi({ QLB_PI_PACKAGE_ROOT: root, PATH: '' }, base), { root });
+    assert.deepEqual(locatePi({ QLB_PI_PACKAGE_ROOT: base, PATH: '' }, base), { root: null, unresolved: true });
+  });
+
+  it('falls back to ~/.local only when no pi is on PATH', () => {
+    const home = tmp('qlb-piroot-home-');
+    const root = fakePiPackage(join(home, '.local'), '1.0.1');
+    assert.equal(resolvePiPackageRoot({ PATH: '' }, home), root);
+  });
+});
+
+describe('doctor with an unresolved Pi launcher', () => {
+  it('warns instead of reporting a skip as PASS', () => {
+    const checks = piIntegrationChecks({ pi: { root: null, launcher: '/x/pi', unresolved: true } });
+    // Only meaningful where the extension is installed; otherwise Pi checks are skipped.
+    if (checks[0]?.message.includes('not installed')) return;
+    assert.equal(checks[0]!.level, 'WARN');
+    assert.match(checks[0]!.message, /could not locate/);
   });
 });
 

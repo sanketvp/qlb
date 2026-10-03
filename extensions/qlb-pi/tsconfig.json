@@ -6,24 +6,9 @@
     "strict": true,
     "skipLibCheck": true,
     "noEmit": true,
-    "esModuleInterop": true,
-    "typeRoots": [
-      "/Users/sanketpatel/.local/lib/node_modules/@earendil-works/pi-coding-agent/node_modules/@types"
-    ],
-    "paths": {
-      "@earendil-works/pi-coding-agent": [
-        "/Users/sanketpatel/.local/lib/node_modules/@earendil-works/pi-coding-agent/dist/index.d.ts"
-      ],
-      "@earendil-works/pi-ai": [
-        "/Users/sanketpatel/.local/lib/node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai/dist/index.d.ts"
-      ],
-      "@earendil-works/pi-ai/*": [
-        "/Users/sanketpatel/.local/lib/node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai/dist/*.d.ts"
-      ],
-      "@earendil-works/pi-tui": [
-        "/Users/sanketpatel/.local/lib/node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-tui/dist/index.d.ts"
-      ]
-    }
+    "esModuleInterop": true
   },
-  "include": ["*.ts"]
+  "include": [
+    "*.ts"
+  ]
 }
