@@ -77,10 +77,11 @@ function rootFromShimText(launcher: string): string | null {
 
 function launcherNames(platform: NodeJS.Platform, env: NodeJS.ProcessEnv): string[] {
   if (platform !== 'win32') return ['pi'];
-  // PowerShell model (the documented Windows workflow): only PATHEXT names, in
-  // PATHEXT order; an extensionless `pi` (npm's sh shim) is not runnable there.
-  const exts = (env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD;.PS1').split(';').filter(Boolean);
-  return exts.map((e) => `pi${e.toLowerCase()}`);
+  // PowerShell model (the documented Windows workflow): pi.ps1 first (PowerShell
+  // runs scripts even when .PS1 is not in PATHEXT), then PATHEXT names in order;
+  // an extensionless `pi` (npm's sh shim) is not runnable there.
+  const exts = (env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD').split(';').filter(Boolean).map((e) => e.toLowerCase());
+  return ['pi.ps1', ...exts.filter((e) => e !== '.ps1').map((e) => `pi${e}`)];
 }
 
 /** PATH entries in shell search order. Unset PATH searches nothing. */

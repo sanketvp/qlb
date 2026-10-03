@@ -88,25 +88,42 @@ describe('locatePi', () => {
 
   it('an unset PATH searches nothing (no implicit current directory)', () => {
     const base = tmp('qlb-piroot-');
-    npmSymlinkInstall(join(base, 'cwd'), '1.0.1');
+    const cwdRoot = npmSymlinkInstall(join(base, 'cwd'), '1.0.1');
     const prev = process.cwd();
     process.chdir(join(base, 'cwd', 'bin'));
     try {
-      assert.deepEqual(locatePi({}, join(base, 'empty-home')), { root: null });
+      const located = locatePi({}, join(base, 'empty-home'));
+      // Only well-known prefixes may answer; never the pi sitting in the cwd.
+      assert.notEqual(located.root, cwdRoot);
+      assert.equal(located.launcher, undefined);
     } finally {
       process.chdir(prev);
     }
   });
 
-  it('on Windows follows PATHEXT order and ignores an extensionless pi', () => {
+  it('on Windows prefers pi.ps1, then PATHEXT order, and ignores an extensionless pi', () => {
     const base = tmp('qlb-piroot-');
-    fakePiPackage(join(base, 'npm'), '1.0.1');
-    const bin = join(base, 'npm', 'lib');
-    writeFileSync(join(bin, 'pi'), '#!/bin/sh\nexec node /stale/pi-coding-agent/cli.js\n');
-    writeFileSync(join(bin, 'pi.cmd'), '@ECHO off\r\n"%~dp0\\node_modules\\@earendil-works\\pi-coding-agent\\dist\\bundle\\cli.js" %*\r\n');
-    const located = locatePi({ PATH: `;${bin}`, PATHEXT: '.EXE;.CMD' }, base, 'win32');
-    assert.equal(located.launcher, join(bin, 'pi.cmd'));
-    assert.equal(located.root, join(bin, 'node_modules', '@earendil-works', 'pi-coding-agent'));
+    // Earlier PATH dir: only a PowerShell script shim (PATHEXT lacks .PS1, as by default).
+    const ps1Root = fakePiPackage(join(base, 'ps'), '1.0.1');
+    const psBin = join(base, 'ps', 'lib');
+    writeFileSync(join(psBin, 'pi.ps1'), '& "$PSScriptRoot/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js" $args\r\n');
+    // Later PATH dir: a stale .cmd install plus an extensionless decoy.
+    fakePiPackage(join(base, 'old'), '0.99.2');
+    const oldBin = join(base, 'old', 'lib');
+    writeFileSync(join(oldBin, 'pi'), '#!/bin/sh\nexec node /stale/pi-coding-agent/cli.js\n');
+    writeFileSync(join(oldBin, 'pi.cmd'), '@ECHO off\r\n"%~dp0\\node_modules\\@earendil-works\\pi-coding-agent\\dist\\bundle\\cli.js" %*\r\n');
+    const env = { PATH: `;${psBin};${oldBin}`, PATHEXT: '.EXE;.CMD' };
+    const located = locatePi(env, base, 'win32');
+    assert.equal(located.launcher, join(psBin, 'pi.ps1'));
+    assert.equal(located.root, ps1Root);
+
+    // Within one directory, PATHEXT order decides: .EXE before .CMD.
+    fakePiPackage(join(base, 'both'), '1.0.1');
+    const bothBin = join(base, 'both', 'lib');
+    writeFileSync(join(bothBin, 'pi.exe'), Buffer.from([0x4d, 0x5a, 0, 0])); // binary: untraceable
+    writeFileSync(join(bothBin, 'pi.cmd'), '@ECHO off\r\n"%~dp0\\node_modules\\@earendil-works\\pi-coding-agent\\dist\\bundle\\cli.js" %*\r\n');
+    const both = locatePi({ PATH: bothBin, PATHEXT: '.EXE;.CMD' }, base, 'win32');
+    assert.deepEqual(both, { root: null, launcher: join(bothBin, 'pi.exe'), unresolved: true });
   });
 
   it('skips a directory named pi on PATH, like a shell', () => {
