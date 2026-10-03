@@ -20,6 +20,7 @@ import {
   parseConsumeStatus,
   readActiveClaudeAccess,
   readOwnerFileState,
+  redactEvent,
   redactSecrets,
   SECURITY_BIN,
   type ActiveAccess,
@@ -384,6 +385,21 @@ describe('qlb-pi consume provider (fake Pi with pre-existing anthropic provider)
 });
 
 describe('redaction helper', () => {
+  it('redacts nested message fields, arrays, and bare string events', () => {
+    const tok = 'tok-nested-9';
+    const fp = fingerprintAccess(tok);
+    const event = {
+      type: 'error',
+      message: { errorMessage: `bad ${tok}`, content: [{ text: `fp ${fp}` }, `raw ${tok}`] },
+      error: { details: { inner: { why: `${tok}/${fp}` } } },
+    };
+    const out = JSON.stringify(redactEvent(event, [tok]));
+    assert.equal(out.includes(tok), false);
+    assert.equal(out.includes(fp), false);
+    assert.equal(redactEvent(`bare ${tok}`, [tok]), 'bare [redacted]');
+    assert.equal(JSON.stringify(event).includes(tok), true, 'input must not be mutated');
+  });
+
   it('removes both the value and its fingerprint', () => {
     const fp = fingerprintAccess('tok-123');
     assert.equal(redactSecrets(`a tok-123 b ${fp} c`, ['tok-123']), 'a [redacted] b [redacted] c');

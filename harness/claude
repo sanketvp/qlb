@@ -387,7 +387,9 @@ def passthrough(argv: list[str]) -> int:
 
 def record_terminating_signal(home: str, pid: int, name: str) -> None:
     path = lease_path(home, pid)
-    row = read_json(path) or {}
+    row = read_json(path)
+    if not row or row.get("pid") != pid:
+        return  # no lease yet (or not ours): never fabricate one
     row["terminatingSignal"] = name
     atomic_write(path, json.dumps(row))
 
@@ -437,78 +439,89 @@ def intercepted(argv: list[str]) -> int:
     env["QLB_HOME"] = home
     env["QLB_PROXY_PORT"] = str(port)
     env["QLB_PROXY_INFO_PATH"] = info_path
-    try:
-        result = subprocess.run(
-            [mutex, lock, "--", sys.executable, script, "--qlb-critical-section"],
-            env=env,
-            check=False,
-        )
-    except OSError as err:
-        sys.stderr.write(f"qlb wrapper: mutex failed: {err}\n")
-        return 1
-    if result.returncode != 0:
-        return result.returncode or 1
-
-    helper = os.path.join(os.path.dirname(script), "qlb-proxy-token")
-    child_env = os.environ.copy()
-    child_env["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{port}"
-    child_env["ANTHROPIC_CUSTOM_HEADERS"] = json.dumps({"x-qlb-session": session})
-    child_env["CLAUDE_CODE_API_KEY_HELPER"] = helper
-    child_env["QLB_HOME"] = home
-    child_env["QLB_PROXY_INFO_PATH"] = info_path
-    child_env.pop("ANTHROPIC_AUTH_TOKEN", None)
-    child_env.pop("ANTHROPIC_API_KEY", None)
-    child_env.pop("CLAUDE_CONFIG_DIR", None)
-
-    native = native_claude()
     child: Optional[subprocess.Popen[bytes]] = None
     pending: list[int] = []
-
-    def forward(signum: int) -> None:
-        if child is None:
-            return
-        try:
-            os.kill(child.pid, signum)
-        except OSError:
-            pass
+    term_signals = {signal.SIGINT, signal.SIGTERM}
 
     def handle(signum: int, _frame: Any) -> None:
         name = "INT" if signum == signal.SIGINT else "TERM" if signum == signal.SIGTERM else str(signum)
         print(f"SIGNAL={name}", flush=True)
         record_terminating_signal(home, wrapper_pid, name)
         if child is None:
-            # Arrived before the native process exists: replay it once launched.
+            # No native process yet: remember it; launch is skipped and cleanup still runs.
             pending.append(signum)
             return
-        forward(signum)
+        try:
+            os.kill(child.pid, signum)
+        except OSError:
+            pass
 
-    code = 1
-    cleanup_rc = 1
-    try:
-        signal.signal(signal.SIGINT, handle)
-        signal.signal(signal.SIGTERM, handle)
+    # Installed before the critical section so a signal during proxy setup is
+    # queued instead of killing the wrapper with a lease/proxy left behind.
+    signal.signal(signal.SIGINT, handle)
+    signal.signal(signal.SIGTERM, handle)
+
+    def run_native() -> int:
+        nonlocal child
+        helper = os.path.join(os.path.dirname(script), "qlb-proxy-token")
+        child_env = os.environ.copy()
+        child_env["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{port}"
+        child_env["ANTHROPIC_CUSTOM_HEADERS"] = json.dumps({"x-qlb-session": session})
+        child_env["CLAUDE_CODE_API_KEY_HELPER"] = helper
+        child_env["QLB_HOME"] = home
+        child_env["QLB_PROXY_INFO_PATH"] = info_path
+        child_env.pop("ANTHROPIC_AUTH_TOKEN", None)
+        child_env.pop("ANTHROPIC_API_KEY", None)
+        child_env.pop("CLAUDE_CONFIG_DIR", None)
+        native = native_claude()
+
         pause = os.environ.get("QLB_WRAPPER_PAUSE_BEFORE_LAUNCH")
         if pause:
             # Test seam: widen the pre-launch window deterministically.
             atomic_write(pause, "paused\n")
             while os.path.exists(pause) and not pending:
                 time.sleep(0.025)
-        if pending:
-            # Interrupted before launch: never start the native process.
-            code = 128 + pending[-1]
-        else:
+
+        # Block INT/TERM across the pending check and spawn: a signal in that
+        # window is delivered on unblock, after `child` is set, and forwarded.
+        signal.pthread_sigmask(signal.SIG_BLOCK, term_signals)
+        try:
+            if pending:
+                return 128 + pending[-1]  # interrupted before launch: never start native
             try:
-                child = subprocess.Popen([native, *argv], env=child_env)
+                child = subprocess.Popen(
+                    [native, *argv],
+                    env=child_env,
+                    preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_UNBLOCK, term_signals),
+                )
             except OSError as err:
                 sys.stderr.write(f"qlb wrapper: cannot launch {native}: {err.strerror or err}\n")
-                code = 126 if isinstance(err, PermissionError) else 127
-            else:
-                for signum in pending:
-                    forward(signum)
-                code = child.wait()
+                return 126 if isinstance(err, PermissionError) else 127
+        finally:
+            signal.pthread_sigmask(signal.SIG_UNBLOCK, term_signals)
+        rc = child.wait()
+        return 128 + (-rc) if rc < 0 else rc
+
+    cleanup_rc = 1
+    try:
+        try:
+            result = subprocess.run(
+                [mutex, lock, "--", sys.executable, script, "--qlb-critical-section"],
+                env=env,
+                check=False,
+            )
+        except OSError as err:
+            sys.stderr.write(f"qlb wrapper: mutex failed: {err}\n")
+            return 1
+        if result.returncode == 0:
+            code = run_native()
+        elif pending:
+            code = 128 + pending[-1]
+        else:
+            code = result.returncode if result.returncode > 0 else 1
     finally:
-        # Always release this wrapper's lease (and the proxy if last), even when
-        # the native launch fails, so no lease or --no-idle proxy is orphaned.
+        # Always run once the critical section was attempted: releases this
+        # wrapper's lease (and the proxy if last) on every exit path.
         shut_env = os.environ.copy()
         shut_env["QLB_WRAPPER_PID"] = str(wrapper_pid)
         shut_env["QLB_HOME"] = home
@@ -522,8 +535,6 @@ def intercepted(argv: list[str]) -> int:
             ).returncode
         except OSError as err:
             sys.stderr.write(f"qlb wrapper: final mutex failed: {err}\n")
-    if code < 0:
-        code = 128 + (-code)
     if cleanup_rc != 0:
         sys.stderr.write("qlb wrapper: proxy cleanup failed; lease/proxy may remain\n")
         if code == 0:

@@ -199,19 +199,19 @@ export function redactSecrets(text: string, secrets: readonly string[]): string 
   return out;
 }
 
-/** Redact string fields of a Pi stream event (top level and its `error` object) in place-safe copy. */
+/** Deep copy of a Pi stream event with every string (any depth, arrays, bare strings) redacted. */
 export function redactEvent(event: unknown, secrets: readonly string[]): unknown {
-  const rec = asRecord(event);
-  if (!rec || secrets.length === 0) return event;
-  const scrub = (obj: Record<string, unknown>): Record<string, unknown> => {
-    const copy: Record<string, unknown> = { ...obj };
-    for (const [key, value] of Object.entries(copy)) {
-      if (typeof value === "string") copy[key] = redactSecrets(value, secrets);
-    }
-    return copy;
+  if (secrets.length === 0) return event;
+  const seen = new WeakSet<object>();
+  const walk = (value: unknown, depth: number): unknown => {
+    if (typeof value === "string") return redactSecrets(value, secrets);
+    if (!value || typeof value !== "object" || depth > 32) return value;
+    if (seen.has(value)) return value;
+    seen.add(value);
+    if (Array.isArray(value)) return value.map((item) => walk(item, depth + 1));
+    const out: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(value)) out[key] = walk(item, depth + 1);
+    return out;
   };
-  const out = scrub(rec);
-  const error = asRecord(rec.error);
-  if (error) out.error = scrub(error);
-  return out;
+  return walk(event, 0);
 }

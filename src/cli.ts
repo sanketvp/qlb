@@ -1238,7 +1238,6 @@ const PI_POOL_OWNING_STATES = new Set(['MIRRORED', 'VALIDATED', 'QLB_OWNED', 'RE
 const FORWARD_MIGRATE_SUBS = new Set(['stage', 'rehearse', 'commit', 'resume']);
 
 async function runMigrate(opts: MigrateOpts): Promise<number> {
-  assertSafeMigratePaths(opts);
   let store: Store;
   let opened = false;
   if (opts.db) {
@@ -1259,6 +1258,9 @@ async function runMigrate(opts: MigrateOpts): Promise<number> {
       );
       return 1;
     }
+    // After the ownership guard so a CONSUMED journal reports DUAL_OWNERSHIP_REFUSED
+    // even on default (live) paths; still before any migration object or I/O.
+    assertSafeMigratePaths(opts);
     const mig = isStaticKeyProvider(opts.provider)
       ? createStaticKeyMigration(
           store,

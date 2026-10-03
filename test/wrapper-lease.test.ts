@@ -721,6 +721,28 @@ print('SECOND_ACQUIRED')
     await assertCaseQuiet(dir, port);
   });
 
+  it('wrapper-signal-during-proxy-setup', async () => {
+    const dir = tmp();
+    const leases = join(dir, 'proxy-leases');
+    mkdirSync(leases, { recursive: true });
+    const port = await freePort();
+    const fake = writeFakeClaude(dir);
+    const marker = join(dir, 'pause-listen');
+    const env = envFor(dir, port, fake, { QLB_PROXY_PAUSE_AFTER_LISTEN: marker });
+    const w = spawnTracked('/usr/bin/python3', [WRAPPER, '--wait-signal'], { env });
+    const out = collect(w);
+    // The critical section is now waiting for the paused proxy's ownership record.
+    await waitForFile(marker, 10_000);
+    w.kill('SIGTERM');
+    await waitFor(() => out.stdout.includes('SIGNAL=TERM'), 5_000, 'signal queued');
+    unlinkSync(marker);
+    const code = await waitExit(w, 15_000);
+    assert.equal(code, 143, out.stderr + out.stdout);
+    assert.doesNotMatch(out.stdout, /ANTHROPIC_BASE_URL=/, 'native must not start after a setup-time signal');
+    assert.equal(spawnSync('ls', [leases], { encoding: 'utf8' }).stdout.trim(), '');
+    await assertCaseQuiet(dir, port);
+  });
+
   it('wrapper-cleanup-failure-is-not-masked', async () => {
     const dir = tmp();
     mkdirSync(join(dir, 'proxy-leases'), { recursive: true });

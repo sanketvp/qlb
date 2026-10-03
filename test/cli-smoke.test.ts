@@ -270,24 +270,26 @@ describe('CLI smoke — documented commands', () => {
     assert.equal(JSON.parse(after.stdout).state, 'NATIVE');
   });
 
-  it('forward anthropic migration refuses while cswap consume is enabled; status still works', () => {
+  it('forward anthropic migration refuses while cswap consume is enabled; status and rollback do not', () => {
     const env = isolatedEnv();
     const enabled = runCli(['consume', 'enable', '--provider', 'anthropic', '--json'], env);
     assert.equal(enabled.status, 0, enabled.stderr);
-    // Outside the isolated Pi agent dir, so the real-cutover refusal does not fire first.
+    // Default paths: the ownership refusal must win over the real-cutover path refusal.
+    for (const sub of ['stage', 'rehearse', 'commit', 'resume']) {
+      const refused = runCli(['migrate', sub, '--provider', 'anthropic', '--json'], env);
+      assert.equal(refused.status, 1, `${sub}: ${refused.stdout}`);
+      assert.match(refused.stderr, /DUAL_OWNERSHIP_REFUSED/);
+    }
+    // Outside the isolated Pi agent dir, so the real-cutover refusal does not fire.
     const migrateDir = mkdtempSync(join(tmpdir(), 'qlb-smoke-migrate-'));
     const paths = [
       '--pool-file', join(migrateDir, 'pool.json'),
       '--owner-file', join(migrateDir, 'qlb-owner.json'),
     ];
-    for (const sub of ['stage', 'commit', 'resume']) {
-      const refused = runCli(['migrate', sub, '--provider', 'anthropic', ...paths, '--json'], env);
-      assert.equal(refused.status, 1, `${sub}: ${refused.stdout}`);
-      assert.match(refused.stderr, /DUAL_OWNERSHIP_REFUSED/);
-    }
     const status = runCli(['migrate', 'status', '--provider', 'anthropic', ...paths, '--json'], env);
     assert.equal(status.status, 0, status.stderr);
-    assert.doesNotMatch(status.stderr, /DUAL_OWNERSHIP_REFUSED/);
+    const rollback = runCli(['migrate', 'rollback', '--provider', 'anthropic', ...paths, '--json'], env);
+    assert.doesNotMatch(rollback.stderr, /DUAL_OWNERSHIP_REFUSED/);
   });
 
   it('install.ps1 encodes the documented Windows installer steps', () => {

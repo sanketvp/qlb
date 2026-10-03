@@ -112,17 +112,21 @@ function collect(file: string): ScanResult {
         dynamic += 1;
         continue;
       }
-      // import x = require('…')  /  import x = A.B  (statement-bounded, no token cap)
-      let end = i + 1;
-      while (end < tokens.length && tokens[end]!.kind !== kinds.SemicolonToken) end++;
-      const stmt = tokens.slice(i + 1, end);
-      const eq = stmt.findIndex((x) => x.kind === kinds.EqualsToken);
-      const fromAt = stmt.findIndex((x) => x.kind === kinds.FromKeyword);
-      if (eq !== -1 && (fromAt === -1 || eq < fromAt)) {
-        const rhs = stmt.slice(eq + 1);
-        const req = rhs.findIndex((x) => isRequireTok(x));
-        const str = rhs.findIndex((x) => isString(x));
-        if (req !== -1 && str > req) staticSpecs.push(rhs[str]!.value);
+      // import [type] x = require('…') — matched by exact grammar position, so no
+      // statement boundary is needed (semicolon-free code cannot merge statements).
+      // `import x = A.B` (namespace alias) has no module edge and is skipped.
+      let k = i + 1;
+      if (tokens[k]?.kind === kinds.TypeKeyword && tokens[k + 1]?.kind === kinds.Identifier) k += 1;
+      if (tokens[k]?.kind === kinds.Identifier && tokens[k + 1]?.kind === kinds.EqualsToken) {
+        if (
+          isRequireTok(tokens[k + 2]) &&
+          tokens[k + 3]?.kind === kinds.OpenParenToken &&
+          isString(tokens[k + 4]) &&
+          tokens[k + 5]?.kind === kinds.CloseParenToken
+        ) {
+          staticSpecs.push(tokens[k + 4]!.value);
+          i = k + 5;
+        }
         continue;
       }
       // import { x } from '…'  /  import '…'  (unbounded: no token cap on the clause)
@@ -252,5 +256,10 @@ describe('consume import-closure walker', () => {
     assert.equal(formHits, 4);
     assert.equal(writerDetect, 1);
     assert.equal(longHit, 1);
+    // Semicolon-free: a namespace alias followed by a later require() must not
+    // be read as one import-equals edge; the require() is a dynamic call.
+    const adjacent = closureOf([join(dir, 'import-equals-adjacent.ts')]);
+    assert.equal(adjacent.files.has(join(dir, 'keychain-stub.ts')), false);
+    assert.equal(adjacent.dynamic, 1);
   });
 });
