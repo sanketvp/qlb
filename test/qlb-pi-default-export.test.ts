@@ -6,13 +6,13 @@ import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
 import { CONSUME_ERRORS } from '../extensions/qlb-pi/consume';
+import { resolvePiPackageRoot } from '../src/pi-integration';
 
 // Loads the production default export of extensions/qlb-pi/index.ts through
-// Pi's own jiti loader and package aliases. Needs a global Pi install, which
-// CI does not have; `qlb doctor` (pi:typecheck) covers the same seam there.
+// Pi's own jiti loader and package aliases, using the Pi install on PATH (the
+// one the user runs). CI has no Pi; `qlb doctor --live` covers the seam there.
 const ROOT = join(__dirname, '..', '..');
-const PI_GLOBAL_ROOT =
-  process.env.QLB_TEST_PI_ROOT ?? '/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent';
+const PI_GLOBAL_ROOT = process.env.QLB_TEST_PI_ROOT ?? resolvePiPackageRoot() ?? '/nonexistent-pi';
 const FIXTURES = join(ROOT, 'test', 'fixtures', 'qlb-pi-smoke');
 const piAvailable = existsSync(join(PI_GLOBAL_ROOT, 'node_modules', 'jiti', 'lib', 'jiti.mjs'));
 

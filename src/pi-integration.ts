@@ -7,14 +7,95 @@
  * and whether the installed extension copy matches the tracked source.
  */
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync, readdirSync, type Dirent } from 'node:fs';
-import { homedir } from 'node:os';
-import { join } from 'node:path';
+import {
+  accessSync,
+  constants as fsConstants,
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+  type Dirent,
+} from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
+import { delimiter, dirname, join } from 'node:path';
 import type { DoctorCheck } from './diagnostics';
 import { findQlbRepoRoot } from './setup';
 
-const PI_PKG = '/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent';
+const PI_PACKAGE_NAME = '@earendil-works/pi-coding-agent';
 const PI_EXT_DIR = join(homedir(), '.pi', 'agent', 'extensions', 'qlb-pi');
+
+function isPiPackageRoot(dir: string): boolean {
+  try {
+    const pkg = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')) as { name?: unknown };
+    return pkg.name === PI_PACKAGE_NAME;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The Pi install the user actually runs: QLB_PI_PACKAGE_ROOT if set, else the package
+ * that the first executable `pi` on PATH resolves into (npm global prefixes differ per
+ * machine — e.g. ~/.local vs /opt/homebrew — and `pi update` installs into its own
+ * prefix), else well-known global prefixes. null when Pi is not installed.
+ */
+export function resolvePiPackageRoot(
+  env: NodeJS.ProcessEnv = process.env,
+  home: string = homedir(),
+): string | null {
+  const override = env.QLB_PI_PACKAGE_ROOT;
+  if (override) return isPiPackageRoot(override) ? override : null;
+  for (const dir of (env.PATH ?? '').split(delimiter).filter(Boolean)) {
+    const bin = join(dir, 'pi');
+    try {
+      accessSync(bin, fsConstants.X_OK);
+    } catch {
+      continue;
+    }
+    let cur: string;
+    try {
+      cur = dirname(realpathSync(bin));
+    } catch {
+      continue;
+    }
+    // Walk up from the resolved entry script to its package root.
+    for (let i = 0; i < 8 && cur !== dirname(cur); i++, cur = dirname(cur)) {
+      if (isPiPackageRoot(cur)) return cur;
+    }
+  }
+  for (const prefix of [join(home, '.local'), '/opt/homebrew', '/usr/local']) {
+    const candidate = join(prefix, 'lib', 'node_modules', ...PI_PACKAGE_NAME.split('/'));
+    if (isPiPackageRoot(candidate)) return candidate;
+  }
+  return null;
+}
+
+/**
+ * The extension's tsconfig.json pins one machine's Pi paths; doctor typechecks
+ * against the resolved install through a generated config instead.
+ */
+export function piTypecheckConfig(extensionDir: string, piRoot: string): Record<string, unknown> {
+  const base = JSON.parse(readFileSync(join(extensionDir, 'tsconfig.json'), 'utf8')) as {
+    compilerOptions?: Record<string, unknown>;
+  };
+  const piAi = join(piRoot, 'node_modules', '@earendil-works', 'pi-ai', 'dist');
+  return {
+    compilerOptions: {
+      ...base.compilerOptions,
+      typeRoots: [join(piRoot, 'node_modules', '@types')],
+      paths: {
+        '@earendil-works/pi-coding-agent': [join(piRoot, 'dist', 'index.d.ts')],
+        '@earendil-works/pi-ai': [join(piAi, 'index.d.ts')],
+        '@earendil-works/pi-ai/*': [join(piAi, '*.d.ts')],
+        '@earendil-works/pi-tui': [join(piRoot, 'node_modules', '@earendil-works', 'pi-tui', 'dist', 'index.d.ts')],
+      },
+    },
+    include: [join(extensionDir, '*.ts')],
+  };
+}
 /** Pi runtime seams the extension calls; missing → the extension throws at load or first stream. */
 const PI_SEAMS: Array<{ id: string; dir: string; pattern: RegExp; why: string }> = [
   { id: 'anthropicMessagesApi', dir: 'node_modules/@earendil-works/pi-ai/dist', pattern: /\banthropicMessagesApi\b/, why: 'qlb-pi forwards Anthropic streams through anthropicMessagesApi().streamSimple' },
@@ -39,6 +120,8 @@ function dtsFiles(dir: string, out: string[] = [], depth = 0): string[] {
 export interface PiIntegrationOptions {
   /** Run `tsc --noEmit` against the installed Pi types (slow, ~3s). doctor --live turns it on. */
   typecheck?: boolean;
+  /** Pi package root; defaults to resolvePiPackageRoot(). */
+  piRoot?: string | null;
   run?: (cmd: string, args: string[], opts?: { cwd?: string; timeoutMs?: number }) => string;
 }
 
@@ -51,7 +134,8 @@ export function piIntegrationChecks(options: PiIntegrationOptions = {}): DoctorC
   const run = options.run ?? ((cmd: string, args: string[], o: { cwd?: string; timeoutMs?: number } = {}) =>
     execFileSync(cmd, args, { encoding: 'utf8', cwd: o.cwd, timeout: o.timeoutMs ?? 60_000, stdio: ['ignore', 'pipe', 'pipe'] }));
 
-  if (!existsSync(PI_PKG) || !existsSync(PI_EXT_DIR)) {
+  const PI_PKG = options.piRoot === undefined ? resolvePiPackageRoot() : options.piRoot;
+  if (!PI_PKG || !existsSync(PI_EXT_DIR)) {
     checks.push({ name: 'pi:extension', level: 'PASS', message: 'Pi or the qlb-pi extension is not installed; skipping Pi checks' });
     return checks;
   }
@@ -65,7 +149,7 @@ export function piIntegrationChecks(options: PiIntegrationOptions = {}): DoctorC
     const drift = readdirSync(src).filter((f) => f.endsWith('.ts') && f !== 'tsconfig.json')
       .filter((f) => readText(join(src, f)) !== readText(join(PI_EXT_DIR, f)));
     checks.push(drift.length === 0
-      ? { name: 'pi:extension', level: 'PASS', message: `~/.pi/agent/extensions/qlb-pi matches ${src} (pi ${piVersion})` }
+      ? { name: 'pi:extension', level: 'PASS', message: `~/.pi/agent/extensions/qlb-pi matches ${src} (pi ${piVersion} at ${PI_PKG})` }
       : { name: 'pi:extension', level: 'WARN', message: `installed qlb-pi differs from source: ${drift.join(', ')}`, detail: { fix: `cp ${src}/*.ts ${PI_EXT_DIR}/` } });
   }
 
@@ -93,8 +177,11 @@ export function piIntegrationChecks(options: PiIntegrationOptions = {}): DoctorC
 
   // 3. Typecheck the extension against the installed Pi types (catches signature drift, not just renames).
   if (options.typecheck && repoRoot) {
+    const tmp = mkdtempSync(join(tmpdir(), 'qlb-pi-typecheck-'));
     try {
-      run('npx', ['tsc', '-p', join(repoRoot, 'extensions', 'qlb-pi', 'tsconfig.json'), '--noEmit'], { cwd: repoRoot, timeoutMs: 120_000 });
+      const cfg = join(tmp, 'tsconfig.json');
+      writeFileSync(cfg, JSON.stringify(piTypecheckConfig(join(repoRoot, 'extensions', 'qlb-pi'), PI_PKG)));
+      run('npx', ['tsc', '-p', cfg, '--noEmit'], { cwd: repoRoot, timeoutMs: 120_000 });
       checks.push({ name: 'pi:typecheck', level: 'PASS', message: `qlb-pi typechecks against pi ${piVersion}` });
     } catch (err) {
       const out = err instanceof Error && 'stdout' in err ? String((err as { stdout?: unknown }).stdout ?? '') : String(err);
@@ -102,8 +189,10 @@ export function piIntegrationChecks(options: PiIntegrationOptions = {}): DoctorC
       checks.push({
         name: 'pi:typecheck', level: 'WARN',
         message: `qlb-pi no longer typechecks against pi ${piVersion}: ${first.slice(0, 160)}`,
-        detail: { fix: 'cd ~/GIT/qlb && npx tsc -p extensions/qlb-pi/tsconfig.json --noEmit   # then adapt extensions/qlb-pi and re-sync', errors: out.split('\n').filter((l) => /error TS/.test(l)).slice(0, 10) },
+        detail: { fix: `qlb doctor --live   # typechecks extensions/qlb-pi against ${PI_PKG}; then adapt extensions/qlb-pi and re-sync`, errors: out.split('\n').filter((l) => /error TS/.test(l)).slice(0, 10) },
       });
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
     }
   }
 
