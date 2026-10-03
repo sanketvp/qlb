@@ -57,28 +57,28 @@ def qlb_argv() -> list[str]:
     return [binary]
 
 
-def process_lstart(pid: int) -> str:
+PS_TIMEOUT_S = 5  # helpers ignore TERM, so every wait they make must be bounded
+
+
+def ps_field(pid: int, field: str) -> str:
     try:
         out = subprocess.check_output(
-            ["ps", "-p", str(pid), "-o", "lstart="],
+            ["ps", "-p", str(pid), "-o", f"{field}="],
             text=True,
             stderr=subprocess.DEVNULL,
+            timeout=PS_TIMEOUT_S,
         )
         return out.strip()
-    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
         return ""
+
+
+def process_lstart(pid: int) -> str:
+    return ps_field(pid, "lstart")
 
 
 def process_command(pid: int) -> str:
-    try:
-        out = subprocess.check_output(
-            ["ps", "-p", str(pid), "-o", "command="],
-            text=True,
-            stderr=subprocess.DEVNULL,
-        )
-        return out.strip()
-    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
-        return ""
+    return ps_field(pid, "command")
 
 
 def identity_live(pid: int, stored: str) -> bool:
@@ -367,7 +367,7 @@ def critical_section() -> int:
         cmd,
         close_fds=True,
         start_new_session=True,
-        preexec_fn=restore_terminal_signals,  # the proxy keeps default INT/HUP handling
+        preexec_fn=restore_terminal_signals,  # the proxy keeps default INT/HUP/TERM handling
         env=child_env,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,

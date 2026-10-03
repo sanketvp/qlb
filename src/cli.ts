@@ -1422,8 +1422,13 @@ async function runConsume(opts: ConsumeOpts): Promise<number> {
       store.upsertMigration(CSWAP_ANTHROPIC_STORE, 'NATIVE', '{}');
       try {
         if (existsSync(marker)) unlinkSync(marker);
-      } catch {
-        // best-effort
+      } catch (err) {
+        // A surviving marker makes Pi refuse Anthropic (fail closed): say exactly what to remove.
+        console.error(
+          `qlb consume disable: journal is NATIVE but ${marker} could not be removed ` +
+            `(${err instanceof Error ? err.message : String(err)}); delete it, then restart Pi.`,
+        );
+        return 1;
       }
     }
     const state = store.getMigration(CSWAP_ANTHROPIC_STORE)?.state ?? 'NATIVE';

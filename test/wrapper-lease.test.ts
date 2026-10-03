@@ -918,6 +918,19 @@ print('SECOND_ACQUIRED')
     });
     assert.equal(r.status, 75, r.stderr);
     assert.match(r.stderr, /timed out/);
+    // Non-finite / non-positive values fall back to the 60s default, never unbounded.
+    for (const bad of ['inf', 'nan', '-1', '0', 'abc']) {
+      // Run the real mutex source with exec replaced by printing the effective bound.
+      const p = spawnSync('/usr/bin/python3', ['-c', `
+import os, sys
+sys.argv = ['qlb-proxy-mutex', ${JSON.stringify(join(dir, 'probe.lock'))}, '--', 'true']
+os.environ['QLB_PROXY_LOCK_TIMEOUT_S'] = ${JSON.stringify(bad)}
+src = open(${JSON.stringify(MUTEX)}).read().replace('os.execvp(argv[0], argv)', 'print(timeout_s)')
+exec(compile(src, 'qlb-proxy-mutex', 'exec'), {'__name__': '__main__'})
+`], { encoding: 'utf8', timeout: 10_000 });
+      assert.equal(p.status, 0, p.stderr);
+      assert.equal(p.stdout.trim(), '60.0', `${bad} -> ${p.stdout}`);
+    }
     writeFileSync(fifo, 'x');
     await waitExit(holder, 5_000).catch(() => undefined);
   });

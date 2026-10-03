@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { describe, it } from 'node:test';
@@ -277,6 +277,20 @@ describe('CLI smoke — documented commands', () => {
     const failed = runCli(['consume', 'enable', '--provider', 'anthropic', '--json'], env);
     assert.equal(failed.status, 1);
     assert.match(failed.stderr, /cannot write/);
+    const status = runCli(['consume', 'status', '--provider', 'anthropic', '--json'], env);
+    assert.equal(JSON.parse(status.stdout).state, 'NATIVE');
+  });
+
+  it('consume disable fails loudly when the marker cannot be removed', () => {
+    const env = isolatedEnv();
+    assert.equal(runCli(['consume', 'enable', '--provider', 'anthropic', '--json'], env).status, 0);
+    const marker = join(dirname(String(env.QLB_DB_PATH)), 'consume-anthropic.json');
+    unlinkSync(marker);
+    mkdirSync(marker); // unlink() cannot remove a directory
+    writeFileSync(join(marker, 'keep'), 'x');
+    const disabled = runCli(['consume', 'disable', '--provider', 'anthropic', '--json'], env);
+    assert.equal(disabled.status, 1);
+    assert.ok(disabled.stderr.includes(marker), disabled.stderr);
     const status = runCli(['consume', 'status', '--provider', 'anthropic', '--json'], env);
     assert.equal(JSON.parse(status.stdout).state, 'NATIVE');
   });
