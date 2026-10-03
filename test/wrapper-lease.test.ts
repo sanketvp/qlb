@@ -743,6 +743,64 @@ print('SECOND_ACQUIRED')
     await assertCaseQuiet(dir, port);
   });
 
+  it('wrapper-signal-at-spawn-boundary', async () => {
+    for (const variant of ['launches', 'launch-fails'] as const) {
+      const dir = tmp();
+      const leases = join(dir, 'proxy-leases');
+      mkdirSync(leases, { recursive: true });
+      const port = await freePort();
+      const native = variant === 'launches' ? writeFakeClaude(dir) : join(dir, 'no-such-claude');
+      const env = envFor(dir, port, native, { QLB_WRAPPER_SELF_SIGNAL_AT_SPAWN: '1' });
+      const started = Date.now();
+      const w = spawnTracked('/usr/bin/python3', [WRAPPER, '--wait-signal'], { env });
+      const out = collect(w);
+      // The launched fake would otherwise sleep 60s: a prompt 143 proves the
+      // boundary signal was forwarded (it may die before printing anything).
+      const code = await waitExit(w, 15_000);
+      assert.equal(code, 143, `${variant}: ${out.stderr}${out.stdout}`);
+      assert.ok(Date.now() - started < 12_000, 'signal must not wait for the native sleep');
+      assert.match(out.stdout, /SIGNAL=TERM/);
+      if (variant === 'launch-fails') assert.match(out.stderr, /cannot launch/);
+      assert.equal(spawnSync('ls', [leases], { encoding: 'utf8' }).stdout.trim(), '');
+      await assertCaseQuiet(dir, port);
+    }
+  });
+
+  it('wrapper-signal-during-final-shutdown', async () => {
+    const dir = tmp();
+    const leases = join(dir, 'proxy-leases');
+    mkdirSync(leases, { recursive: true });
+    const port = await freePort();
+    const fake = writeFakeClaude(dir);
+    const env = envFor(dir, port, fake);
+    const gate = join(dir, 'exit-gate');
+    const lock = join(dir, 'proxy.lock');
+    const w = spawnTracked('/usr/bin/python3', [WRAPPER, '--exit-on-file', gate], { env });
+    const out = collect(w);
+    await waitFor(() => out.stdout.includes('ANTHROPIC_BASE_URL='), 12_000, 'child');
+    const fifo = join(dir, 'hold-final.fifo');
+    spawnSync('mkfifo', [fifo]);
+    const holder = spawnTracked('/usr/bin/python3', [MUTEX, lock, '--', '/bin/sh', '-c', 'echo HELD; exec cat "$1"', 'sh', fifo], {
+      env: process.env,
+    });
+    const holdOut = collect(holder);
+    await waitFor(() => holdOut.stdout.includes('HELD'), 5_000, 'mutex held');
+    writeFileSync(gate, 'go'); // native exits 0; wrapper now blocks in final shutdown
+    await delay(600);
+    const leaseFile = join(leases, String(w.pid));
+    const before = readFileSync(leaseFile, 'utf8');
+    w.kill('SIGTERM');
+    await waitFor(() => out.stdout.includes('SIGNAL=TERM'), 5_000, 'signal seen');
+    await delay(200);
+    assert.equal(readFileSync(leaseFile, 'utf8'), before, 'cleanup-time signal must not rewrite the lease');
+    writeFileSync(fifo, 'x');
+    await waitExit(holder, 5_000).catch(() => undefined);
+    const code = await waitExit(w, 12_000);
+    assert.equal(code, 143, out.stderr + out.stdout);
+    assert.equal(spawnSync('ls', [leases], { encoding: 'utf8' }).stdout.trim(), '');
+    await assertCaseQuiet(dir, port);
+  });
+
   it('wrapper-cleanup-failure-is-not-masked', async () => {
     const dir = tmp();
     mkdirSync(join(dir, 'proxy-leases'), { recursive: true });

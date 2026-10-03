@@ -440,24 +440,21 @@ def intercepted(argv: list[str]) -> int:
     env["QLB_PROXY_PORT"] = str(port)
     env["QLB_PROXY_INFO_PATH"] = info_path
     child: Optional[subprocess.Popen[bytes]] = None
-    pending: list[int] = []
-    term_signals = {signal.SIGINT, signal.SIGTERM}
+    # The handler only records; the main loop forwards to native while it is
+    # alive and unreaped, so a signal can never reach a reused pid.
+    received: list[int] = []
+    forwarded = [0]
+    shutting_down = [False]
 
     def handle(signum: int, _frame: Any) -> None:
         name = "INT" if signum == signal.SIGINT else "TERM" if signum == signal.SIGTERM else str(signum)
         print(f"SIGNAL={name}", flush=True)
-        record_terminating_signal(home, wrapper_pid, name)
-        if child is None:
-            # No native process yet: remember it; launch is skipped and cleanup still runs.
-            pending.append(signum)
-            return
-        try:
-            os.kill(child.pid, signum)
-        except OSError:
-            pass
+        if not shutting_down[0]:
+            record_terminating_signal(home, wrapper_pid, name)  # cleanup owns the lease after this
+        received.append(signum)
 
     # Installed before the critical section so a signal during proxy setup is
-    # queued instead of killing the wrapper with a lease/proxy left behind.
+    # recorded instead of killing the wrapper with a lease/proxy left behind.
     signal.signal(signal.SIGINT, handle)
     signal.signal(signal.SIGTERM, handle)
 
@@ -479,27 +476,30 @@ def intercepted(argv: list[str]) -> int:
         if pause:
             # Test seam: widen the pre-launch window deterministically.
             atomic_write(pause, "paused\n")
-            while os.path.exists(pause) and not pending:
+            while os.path.exists(pause) and not received:
                 time.sleep(0.025)
-
-        # Block INT/TERM across the pending check and spawn: a signal in that
-        # window is delivered on unblock, after `child` is set, and forwarded.
-        signal.pthread_sigmask(signal.SIG_BLOCK, term_signals)
+        if received:
+            return 128 + received[-1]  # interrupted before launch: never start native
+        if os.environ.get("QLB_WRAPPER_SELF_SIGNAL_AT_SPAWN") == "1":
+            # Test seam: a signal between the check above and the spawn below.
+            os.kill(os.getpid(), signal.SIGTERM)
         try:
-            if pending:
-                return 128 + pending[-1]  # interrupted before launch: never start native
-            try:
-                child = subprocess.Popen(
-                    [native, *argv],
-                    env=child_env,
-                    preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_UNBLOCK, term_signals),
-                )
-            except OSError as err:
-                sys.stderr.write(f"qlb wrapper: cannot launch {native}: {err.strerror or err}\n")
-                return 126 if isinstance(err, PermissionError) else 127
-        finally:
-            signal.pthread_sigmask(signal.SIG_UNBLOCK, term_signals)
-        rc = child.wait()
+            child = subprocess.Popen([native, *argv], env=child_env)
+        except OSError as err:
+            sys.stderr.write(f"qlb wrapper: cannot launch {native}: {err.strerror or err}\n")
+            if received:
+                return 128 + received[-1]
+            return 126 if isinstance(err, PermissionError) else 127
+        while child.poll() is None:
+            # Unreaped (even if it just exited), so child.pid cannot be reused yet.
+            while forwarded[0] < len(received):
+                try:
+                    child.send_signal(received[forwarded[0]])
+                except OSError:
+                    pass
+                forwarded[0] += 1
+            time.sleep(0.05)
+        rc = child.returncode
         return 128 + (-rc) if rc < 0 else rc
 
     cleanup_rc = 1
@@ -515,13 +515,14 @@ def intercepted(argv: list[str]) -> int:
             return 1
         if result.returncode == 0:
             code = run_native()
-        elif pending:
-            code = 128 + pending[-1]
+        elif received:
+            code = 128 + received[-1]
         else:
             code = result.returncode if result.returncode > 0 else 1
     finally:
         # Always run once the critical section was attempted: releases this
         # wrapper's lease (and the proxy if last) on every exit path.
+        shutting_down[0] = True
         shut_env = os.environ.copy()
         shut_env["QLB_WRAPPER_PID"] = str(wrapper_pid)
         shut_env["QLB_HOME"] = home
@@ -539,6 +540,9 @@ def intercepted(argv: list[str]) -> int:
         sys.stderr.write("qlb wrapper: proxy cleanup failed; lease/proxy may remain\n")
         if code == 0:
             return 1
+    if len(received) > forwarded[0] and code == 0:
+        # A signal native never received (e.g. during final shutdown) still counts.
+        return 128 + received[-1]
     return code
 
 

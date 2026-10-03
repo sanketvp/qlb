@@ -400,6 +400,28 @@ describe('redaction helper', () => {
     assert.equal(JSON.stringify(event).includes(tok), true, 'input must not be mutated');
   });
 
+  it('fails closed on deep nesting and redacts shared and cyclic references in an independent copy', () => {
+    const tok = 'tok-deep-7';
+    const fp = fingerprintAccess(tok);
+    let deep: Record<string, unknown> = { leak: `${tok} ${fp}` };
+    for (let i = 0; i < 200; i++) deep = { next: deep };
+    assert.equal(JSON.stringify(redactEvent(deep, [tok])).includes(tok), false);
+
+    const shared = { why: `shared ${tok}` };
+    const event: Record<string, unknown> = { a: shared, b: [shared], c: { d: shared } };
+    event.self = event;
+    const out = redactEvent(event, [tok]) as Record<string, unknown>;
+    assert.notEqual(out, event);
+    assert.notEqual(out.a, shared);
+    assert.equal(out.self, out, 'cycles map to the clone, not the original');
+    const { self: _self, ...rest } = out;
+    void _self;
+    const text = JSON.stringify(rest);
+    assert.equal(text.includes(tok), false);
+    assert.equal(text.includes(fp), false);
+    assert.equal(shared.why, `shared ${tok}`, 'input must not be mutated');
+  });
+
   it('removes both the value and its fingerprint', () => {
     const fp = fingerprintAccess('tok-123');
     assert.equal(redactSecrets(`a tok-123 b ${fp} c`, ['tok-123']), 'a [redacted] b [redacted] c');
