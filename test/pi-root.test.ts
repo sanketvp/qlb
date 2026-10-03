@@ -86,6 +86,29 @@ describe('locatePi', () => {
     }
   });
 
+  it('an unset PATH searches nothing (no implicit current directory)', () => {
+    const base = tmp('qlb-piroot-');
+    npmSymlinkInstall(join(base, 'cwd'), '1.0.1');
+    const prev = process.cwd();
+    process.chdir(join(base, 'cwd', 'bin'));
+    try {
+      assert.deepEqual(locatePi({}, join(base, 'empty-home')), { root: null });
+    } finally {
+      process.chdir(prev);
+    }
+  });
+
+  it('on Windows follows PATHEXT order and ignores an extensionless pi', () => {
+    const base = tmp('qlb-piroot-');
+    fakePiPackage(join(base, 'npm'), '1.0.1');
+    const bin = join(base, 'npm', 'lib');
+    writeFileSync(join(bin, 'pi'), '#!/bin/sh\nexec node /stale/pi-coding-agent/cli.js\n');
+    writeFileSync(join(bin, 'pi.cmd'), '@ECHO off\r\n"%~dp0\\node_modules\\@earendil-works\\pi-coding-agent\\dist\\bundle\\cli.js" %*\r\n');
+    const located = locatePi({ PATH: `;${bin}`, PATHEXT: '.EXE;.CMD' }, base, 'win32');
+    assert.equal(located.launcher, join(bin, 'pi.cmd'));
+    assert.equal(located.root, join(bin, 'node_modules', '@earendil-works', 'pi-coding-agent'));
+  });
+
   it('skips a directory named pi on PATH, like a shell', () => {
     const base = tmp('qlb-piroot-');
     mkdirSync(join(base, 'dirs', 'pi'), { recursive: true });
@@ -111,7 +134,7 @@ describe('locatePi', () => {
   it('falls back to ~/.local only when no pi is on PATH', () => {
     const home = tmp('qlb-piroot-home-');
     const root = fakePiPackage(join(home, '.local'), '1.0.1');
-    assert.equal(resolvePiPackageRoot({ PATH: '' }, home), root);
+    assert.equal(resolvePiPackageRoot({}, home), root);
   });
 });
 

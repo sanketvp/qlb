@@ -77,8 +77,18 @@ function rootFromShimText(launcher: string): string | null {
 
 function launcherNames(platform: NodeJS.Platform, env: NodeJS.ProcessEnv): string[] {
   if (platform !== 'win32') return ['pi'];
+  // PowerShell model (the documented Windows workflow): only PATHEXT names, in
+  // PATHEXT order; an extensionless `pi` (npm's sh shim) is not runnable there.
   const exts = (env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD;.PS1').split(';').filter(Boolean);
-  return ['pi', ...exts.map((e) => `pi${e.toLowerCase()}`)];
+  return exts.map((e) => `pi${e.toLowerCase()}`);
+}
+
+/** PATH entries in shell search order. Unset PATH searches nothing. */
+function pathEntries(platform: NodeJS.Platform, env: NodeJS.ProcessEnv): string[] {
+  if (env.PATH === undefined) return [];
+  const parts = env.PATH.split(platform === 'win32' ? ';' : delimiter);
+  // POSIX shells read an empty entry as the current directory; PowerShell ignores it.
+  return platform === 'win32' ? parts.filter(Boolean) : parts.map((d) => d || '.');
 }
 
 /**
@@ -96,8 +106,7 @@ export function locatePi(
   const override = env.QLB_PI_PACKAGE_ROOT ? resolve(env.QLB_PI_PACKAGE_ROOT) : undefined;
   if (override) return isPiPackageRoot(override) ? { root: override } : { root: null, unresolved: true };
   const names = launcherNames(platform, env);
-  // An empty PATH entry means the current directory to a shell, so keep it as '.'.
-  for (const dir of (env.PATH ?? '').split(delimiter).map((d) => d || '.')) {
+  for (const dir of pathEntries(platform, env)) {
     for (const name of names) {
       const bin = join(dir, name);
       try {
