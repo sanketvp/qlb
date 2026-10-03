@@ -462,11 +462,9 @@ def intercepted(argv: list[str]) -> int:
 
     native = native_claude()
     child: Optional[subprocess.Popen[bytes]] = None
+    pending: list[int] = []
 
-    def handle(signum: int, _frame: Any) -> None:
-        name = "INT" if signum == signal.SIGINT else "TERM" if signum == signal.SIGTERM else str(signum)
-        print(f"SIGNAL={name}", flush=True)
-        record_terminating_signal(home, wrapper_pid, name)
+    def forward(signum: int) -> None:
         if child is None:
             return
         try:
@@ -474,17 +472,40 @@ def intercepted(argv: list[str]) -> int:
         except OSError:
             pass
 
+    def handle(signum: int, _frame: Any) -> None:
+        name = "INT" if signum == signal.SIGINT else "TERM" if signum == signal.SIGTERM else str(signum)
+        print(f"SIGNAL={name}", flush=True)
+        record_terminating_signal(home, wrapper_pid, name)
+        if child is None:
+            # Arrived before the native process exists: replay it once launched.
+            pending.append(signum)
+            return
+        forward(signum)
+
     code = 1
+    cleanup_rc = 1
     try:
         signal.signal(signal.SIGINT, handle)
         signal.signal(signal.SIGTERM, handle)
-        try:
-            child = subprocess.Popen([native, *argv], env=child_env)
-        except OSError as err:
-            sys.stderr.write(f"qlb wrapper: cannot launch {native}: {err.strerror or err}\n")
-            code = 126 if isinstance(err, PermissionError) else 127
+        pause = os.environ.get("QLB_WRAPPER_PAUSE_BEFORE_LAUNCH")
+        if pause:
+            # Test seam: widen the pre-launch window deterministically.
+            atomic_write(pause, "paused\n")
+            while os.path.exists(pause) and not pending:
+                time.sleep(0.025)
+        if pending:
+            # Interrupted before launch: never start the native process.
+            code = 128 + pending[-1]
         else:
-            code = child.wait()
+            try:
+                child = subprocess.Popen([native, *argv], env=child_env)
+            except OSError as err:
+                sys.stderr.write(f"qlb wrapper: cannot launch {native}: {err.strerror or err}\n")
+                code = 126 if isinstance(err, PermissionError) else 127
+            else:
+                for signum in pending:
+                    forward(signum)
+                code = child.wait()
     finally:
         # Always release this wrapper's lease (and the proxy if last), even when
         # the native launch fails, so no lease or --no-idle proxy is orphaned.
@@ -494,15 +515,19 @@ def intercepted(argv: list[str]) -> int:
         shut_env["QLB_PROXY_INFO_PATH"] = info_path
         shut_env["QLB_PROXY_PORT"] = str(port)
         try:
-            subprocess.run(
+            cleanup_rc = subprocess.run(
                 [mutex, lock, "--", sys.executable, script, "--qlb-final-shutdown"],
                 env=shut_env,
                 check=False,
-            )
+            ).returncode
         except OSError as err:
             sys.stderr.write(f"qlb wrapper: final mutex failed: {err}\n")
     if code < 0:
-        return 128 + (-code)
+        code = 128 + (-code)
+    if cleanup_rc != 0:
+        sys.stderr.write("qlb wrapper: proxy cleanup failed; lease/proxy may remain\n")
+        if code == 0:
+            return 1
     return code
 
 

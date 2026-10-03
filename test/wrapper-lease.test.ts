@@ -167,6 +167,11 @@ print("HAS_API_KEY=" + ("1" if "ANTHROPIC_API_KEY" in os.environ else "0"), flus
 print("HAS_HELPER=" + ("1" if os.environ.get("CLAUDE_CODE_API_KEY_HELPER") else "0"), flush=True)
 if "--exit" in sys.argv:
     sys.exit(int(sys.argv[sys.argv.index("--exit") + 1]))
+if "--exit-on-file" in sys.argv:
+    gate = sys.argv[sys.argv.index("--exit-on-file") + 1]
+    while not os.path.exists(gate):
+        time.sleep(0.05)
+    sys.exit(0)
 if "--wait-signal" in sys.argv:
     def handle(signum, _frame):
         sys.exit(128 + signum)
@@ -694,6 +699,53 @@ print('SECOND_ACQUIRED')
     } finally {
       held.destroy();
     }
+  });
+
+  it('wrapper-signal-before-launch', async () => {
+    const dir = tmp();
+    const leases = join(dir, 'proxy-leases');
+    mkdirSync(leases, { recursive: true });
+    const port = await freePort();
+    const fake = writeFakeClaude(dir);
+    const marker = join(dir, 'pause-launch');
+    const env = envFor(dir, port, fake, { QLB_WRAPPER_PAUSE_BEFORE_LAUNCH: marker });
+    const w = spawnTracked('/usr/bin/python3', [WRAPPER, '--wait-signal'], { env });
+    const out = collect(w);
+    await waitForFile(marker, 10_000);
+    w.kill('SIGTERM');
+    const code = await waitExit(w, 10_000);
+    assert.equal(code, 143);
+    assert.match(out.stdout, /SIGNAL=TERM/);
+    assert.doesNotMatch(out.stdout, /ANTHROPIC_BASE_URL=/, 'native must not start after an early signal');
+    assert.equal(spawnSync('ls', [leases], { encoding: 'utf8' }).stdout.trim(), '');
+    await assertCaseQuiet(dir, port);
+  });
+
+  it('wrapper-cleanup-failure-is-not-masked', async () => {
+    const dir = tmp();
+    mkdirSync(join(dir, 'proxy-leases'), { recursive: true });
+    const port = await freePort();
+    const fake = writeFakeClaude(dir);
+    const env = envFor(dir, port, fake);
+    const gate = join(dir, 'exit-gate');
+    const lock = join(dir, 'proxy.lock');
+    const w = spawnTracked('/usr/bin/python3', [WRAPPER, '--exit-on-file', gate], { env });
+    const out = collect(w);
+    await waitFor(() => out.stdout.includes('ANTHROPIC_BASE_URL='), 12_000, 'child');
+    chmodSync(lock, 0o000); // final mutex cannot open the lock -> cleanup fails
+    try {
+      writeFileSync(gate, 'go');
+      const code = await waitExit(w, 12_000);
+      assert.notEqual(code, 0, 'native exit 0 must not hide a failed cleanup');
+      assert.match(out.stderr, /proxy cleanup failed/);
+    } finally {
+      chmodSync(lock, 0o600);
+    }
+    // A later wrapper reaps the dead lease and stops the orphaned proxy.
+    const w2 = spawnTracked('/usr/bin/python3', [WRAPPER, '--exit', '0'], { env });
+    collect(w2);
+    assert.equal(await waitExit(w2, 12_000), 0);
+    await assertCaseQuiet(dir, port);
   });
 
   it('wrapper-attach-vs-final-shutdown', async () => {

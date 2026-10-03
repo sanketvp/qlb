@@ -106,13 +106,17 @@ function collect(file: string): ScanResult {
         dynamic += 1;
         continue;
       }
-      // import x = require('…')
-      const eq = tokens.slice(i, i + 8).findIndex((x) => x.kind === kinds.EqualsToken);
-      if (eq !== -1) {
-        const window = tokens.slice(i + eq, i + eq + 6);
-        const req = window.find((x) => isRequireTok(x));
-        const str = window.find((x) => isString(x));
-        if (req && str) staticSpecs.push(str.value);
+      // import x = require('…')  /  import x = A.B  (statement-bounded, no token cap)
+      let end = i + 1;
+      while (end < tokens.length && tokens[end]!.kind !== kinds.SemicolonToken) end++;
+      const stmt = tokens.slice(i + 1, end);
+      const eq = stmt.findIndex((x) => x.kind === kinds.EqualsToken);
+      const fromAt = stmt.findIndex((x) => x.kind === kinds.FromKeyword);
+      if (eq !== -1 && (fromAt === -1 || eq < fromAt)) {
+        const rhs = stmt.slice(eq + 1);
+        const req = rhs.findIndex((x) => isRequireTok(x));
+        const str = rhs.findIndex((x) => isString(x));
+        if (req !== -1 && str > req) staticSpecs.push(rhs[str]!.value);
         continue;
       }
       // import { x } from '…'  /  import '…'  (unbounded: no token cap on the clause)
