@@ -73,6 +73,19 @@ describe('locatePi', () => {
     assert.deepEqual(locatePi(env, base), { root: null, launcher: join(base, 'volta', 'bin', 'pi'), unresolved: true });
   });
 
+  it('treats an empty PATH entry as the current directory, like a shell', () => {
+    const base = tmp('qlb-piroot-');
+    const cwdRoot = npmSymlinkInstall(join(base, 'cwd'), '1.0.1');
+    npmSymlinkInstall(join(base, 'stale'), '0.99.2');
+    const prev = process.cwd();
+    process.chdir(join(base, 'cwd', 'bin'));
+    try {
+      assert.equal(resolvePiPackageRoot({ PATH: `:${join(base, 'stale', 'bin')}` }, base), cwdRoot);
+    } finally {
+      process.chdir(prev);
+    }
+  });
+
   it('skips a directory named pi on PATH, like a shell', () => {
     const base = tmp('qlb-piroot-');
     mkdirSync(join(base, 'dirs', 'pi'), { recursive: true });

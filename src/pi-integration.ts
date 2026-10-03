@@ -96,7 +96,8 @@ export function locatePi(
   const override = env.QLB_PI_PACKAGE_ROOT ? resolve(env.QLB_PI_PACKAGE_ROOT) : undefined;
   if (override) return isPiPackageRoot(override) ? { root: override } : { root: null, unresolved: true };
   const names = launcherNames(platform, env);
-  for (const dir of (env.PATH ?? '').split(delimiter).filter(Boolean)) {
+  // An empty PATH entry means the current directory to a shell, so keep it as '.'.
+  for (const dir of (env.PATH ?? '').split(delimiter).map((d) => d || '.')) {
     for (const name of names) {
       const bin = join(dir, name);
       try {
