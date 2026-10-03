@@ -22,8 +22,12 @@ interface SmokeResult {
   events: Array<{ type?: string; error?: { errorMessage?: string } }>;
 }
 
-function load(opts: { owner?: string; states: string; call?: boolean }): SmokeResult {
+function load(opts: { owner?: string; states: string; call?: boolean; marker?: boolean }): SmokeResult {
   const home = mkdtempSync(join(tmpdir(), 'qlb-pi-smoke-'));
+  if (opts.marker) {
+    mkdirSync(join(home, '.qlb'), { recursive: true });
+    writeFileSync(join(home, '.qlb', 'consume-anthropic.json'), '{"state":"CONSUMED"}\n');
+  }
   if (opts.owner !== undefined) {
     mkdirSync(join(home, '.pi', 'agent'), { recursive: true });
     writeFileSync(join(home, '.pi', 'agent', 'qlb-owner.json'), opts.owner);
@@ -73,11 +77,23 @@ describe('qlb-pi production default export (Pi jiti loader)', { skip: piAvailabl
   });
 
   it('malformed owner file or unreadable journal with an owner file fails closed', () => {
-    for (const [owner, states] of [['{not json', 'NATIVE'], ['{"accounts":[]}', 'unknown']] as const) {
+    for (const [owner, states, message] of [
+      ['{not json', 'NATIVE', CONSUME_ERRORS.conflict],
+      ['{"accounts":[]}', 'unknown', CONSUME_ERRORS.stateUnknown],
+    ] as const) {
       const r = load({ owner, states, call: true });
       assert.equal(r.poolStillRegistered, false, `${owner}/${states}`);
-      assert.equal(r.events[0]!.error?.errorMessage, CONSUME_ERRORS.conflict);
+      assert.equal(r.events[0]!.error?.errorMessage, message);
     }
+  });
+
+  it('consume marker present but status unreadable: never falls back to anthropic-pool', () => {
+    const r = load({ states: 'unknown', marker: true, call: true });
+    assert.deepEqual(r.calls, ['unregister:anthropic', 'register:anthropic']);
+    assert.equal(r.poolStillRegistered, false);
+    assert.equal(r.events[0]!.error?.errorMessage, CONSUME_ERRORS.stateUnknown);
+    // Without the marker an unreadable status stays inert (consume was never enabled).
+    assert.deepEqual(load({ states: 'unknown' }).calls, []);
   });
 
   it('owned mode still unregisters the existing provider before registering', () => {

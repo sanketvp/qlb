@@ -1258,8 +1258,9 @@ async function runMigrate(opts: MigrateOpts): Promise<number> {
       );
       return 1;
     }
-    // After the ownership guard so a CONSUMED journal reports DUAL_OWNERSHIP_REFUSED
-    // even on default (live) paths; still before any migration object or I/O.
+    // After the ownership guard (which needs the store) so a CONSUMED journal
+    // reports DUAL_OWNERSHIP_REFUSED even on default (live) paths; still before
+    // any migration object is built or any native/owner file is touched.
     assertSafeMigratePaths(opts);
     const mig = isStaticKeyProvider(opts.provider)
       ? createStaticKeyMigration(

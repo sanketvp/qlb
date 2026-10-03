@@ -826,6 +826,62 @@ print('SECOND_ACQUIRED')
     await assertCaseQuiet(dir, port);
   });
 
+  it('wrapper-terminal-interrupt-hits-setup-helper', async () => {
+    const dir = tmp();
+    const leases = join(dir, 'proxy-leases');
+    mkdirSync(leases, { recursive: true });
+    const port = await freePort();
+    const fake = writeFakeClaude(dir);
+    const marker = join(dir, 'pause-listen');
+    const env = envFor(dir, port, fake, { QLB_PROXY_PAUSE_AFTER_LISTEN: marker });
+    const w = spawnTracked('/usr/bin/python3', [WRAPPER, '--wait-signal'], { env });
+    const out = collect(w);
+    await waitForFile(marker, 10_000);
+    // A terminal Ctrl-C reaches the whole foreground group: wrapper and setup helper.
+    const helpers = pidsFromOutput(spawnSync('pgrep', ['-P', String(w.pid)], { encoding: 'utf8' }).stdout || '');
+    assert.ok(helpers.length > 0, 'setup helper must be running');
+    for (const pid of helpers) process.kill(pid, 'SIGINT');
+    w.kill('SIGINT');
+    await waitFor(() => out.stdout.includes('SIGNAL=INT'), 5_000, 'wrapper recorded INT');
+    await delay(1_500);
+    // The helper must survive the interrupt and finish publishing ownership,
+    // otherwise the listening proxy is stranded with no proxy.json.
+    for (const pid of helpers) {
+      let alive = true;
+      try { process.kill(pid, 0); } catch { alive = false; }
+      assert.equal(alive, true, 'setup helper must ignore the terminal interrupt');
+    }
+    unlinkSync(marker);
+    const code = await waitExit(w, 15_000);
+    assert.equal(code, 130, out.stderr + out.stdout);
+    assert.doesNotMatch(out.stdout, /ANTHROPIC_BASE_URL=/);
+    assert.equal(spawnSync('ls', [leases], { encoding: 'utf8' }).stdout.trim(), '');
+    await assertCaseQuiet(dir, port);
+    // The next run must not be blocked by a stranded listener.
+    const w2 = spawnTracked('/usr/bin/python3', [WRAPPER, '--exit', '0'], { env: envFor(dir, port, fake) });
+    const o2 = collect(w2);
+    assert.equal(await waitExit(w2, 12_000), 0, o2.stdout);
+    await assertCaseQuiet(dir, port);
+  });
+
+  it('wrapper-sighup-terminal-close', async () => {
+    const dir = tmp();
+    const leases = join(dir, 'proxy-leases');
+    mkdirSync(leases, { recursive: true });
+    const port = await freePort();
+    const fake = writeFakeClaude(dir);
+    const env = envFor(dir, port, fake);
+    const w = spawnTracked('/usr/bin/python3', [WRAPPER, '--wait-signal'], { env });
+    const out = collect(w);
+    await waitFor(() => out.stdout.includes('ANTHROPIC_BASE_URL='), 12_000, 'child');
+    w.kill('SIGHUP');
+    const code = await waitExit(w, 12_000);
+    assert.equal(code, 129, out.stderr + out.stdout);
+    assert.match(out.stdout, /SIGNAL=HUP/);
+    assert.equal(spawnSync('ls', [leases], { encoding: 'utf8' }).stdout.trim(), '');
+    await assertCaseQuiet(dir, port);
+  });
+
   it('wrapper-cleanup-failure-is-not-masked', async () => {
     const dir = tmp();
     mkdirSync(join(dir, 'proxy-leases'), { recursive: true });

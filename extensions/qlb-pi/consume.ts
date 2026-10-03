@@ -26,6 +26,9 @@ export const CONSUME_ERRORS = {
   conflict:
     "QLB ownership conflict: Pi's Anthropic accounts are QLB-owned (or unknown) while cswap consume is enabled. " +
     "Run `qlb consume disable --provider anthropic` or `qlb migrate rollback --provider anthropic`, then restart Pi.",
+  stateUnknown:
+    "QLB could not read its consume state (`qlb consume status` failed or timed out); Anthropic is disabled " +
+    "rather than risk the wrong account. Check that `qlb` runs from Pi's environment, then restart Pi.",
 } as const;
 
 export type SecurityRunner = (executable: string, args: readonly string[]) => string;
@@ -131,27 +134,38 @@ export function parseConsumeStatus(code: number, stdout: string): ConsumeJournal
   return "unknown";
 }
 
+export interface PiModeInput {
+  rehearsal: string | undefined;
+  owner: OwnerFileState;
+  journal: ConsumeJournal;
+  /** `~/.qlb/consume-anthropic.json` exists (written by `qlb consume enable`). */
+  marker: boolean;
+}
+
 /**
  * Choose how qlb-pi registers Anthropic at load. Fail-closed rules:
  * - QLB_PI_REHEARSAL=0 always inert (rollback verification).
  * - Any claim of QLB ownership (owner file, even malformed, or rehearsal=1)
  *   is `owned` only when the consume journal is provably NATIVE; CONSUMED or an
  *   unreadable journal alongside ownership is `conflict`.
- * - No ownership claim: CONSUMED → `consume`; NATIVE/unknown → inert (Pi keeps
- *   its own provider, nothing taken over).
+ * - No ownership claim: CONSUMED → `consume`; an unreadable journal while the
+ *   consume marker exists → `conflict` (never hand Anthropic back to a pool that
+ *   refreshes its own copies); otherwise inert (nothing taken over).
  */
-export function decidePiMode(input: {
-  rehearsal: string | undefined;
-  owner: OwnerFileState;
-  journal: ConsumeJournal;
-}): PiMode {
+export function decidePiMode(input: PiModeInput): PiMode {
   if (input.rehearsal === "0") return "inert";
   const claimsOwnership = input.rehearsal === "1" || input.owner !== "absent";
   if (claimsOwnership) {
     if (input.owner === "malformed") return "conflict";
     return input.journal === "NATIVE" ? "owned" : "conflict";
   }
-  return input.journal === "CONSUMED" ? "consume" : "inert";
+  if (input.journal === "CONSUMED") return "consume";
+  return input.journal === "unknown" && input.marker ? "conflict" : "inert";
+}
+
+/** User-facing reason for a `conflict` decision. */
+export function conflictMessage(input: PiModeInput): string {
+  return input.journal === "unknown" ? CONSUME_ERRORS.stateUnknown : CONSUME_ERRORS.conflict;
 }
 
 /**

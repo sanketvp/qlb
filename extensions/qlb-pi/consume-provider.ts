@@ -119,7 +119,9 @@ export function registerConsumeProvider(pi: ProviderApi, builtin: Builtin, deps:
           // Re-checked on every request: disabling consume or acquiring QLB
           // ownership mid-session stops serving cswap-active immediately.
           if (deps.ownerState() !== "absent") throw new Error(CONSUME_ERRORS.conflict);
-          if ((await deps.consumeJournal()) !== "CONSUMED") throw new Error(CONSUME_ERRORS.disabled);
+          const journal = await deps.consumeJournal();
+          if (journal === "unknown") throw new Error(CONSUME_ERRORS.stateUnknown);
+          if (journal !== "CONSUMED") throw new Error(CONSUME_ERRORS.disabled);
 
           const source = consumeAccessSource(deps.readAccess);
           sent = source.sent;

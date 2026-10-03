@@ -12,6 +12,7 @@ import {
 } from '../src/cswap-native-read';
 import {
   activeCcSecurityArgs,
+  conflictMessage,
   consumeAccessSource,
   CONSUME_ERRORS,
   CSWAP_ACTIVE_ID,
@@ -93,23 +94,31 @@ describe('qlb-pi consume reader parity with src/cswap-native-read', () => {
 });
 
 describe('qlb-pi mode decision', () => {
-  const expected = (rehearsal: string | undefined, owner: OwnerFileState, journal: ConsumeJournal): PiMode => {
+  const expected = (
+    rehearsal: string | undefined,
+    owner: OwnerFileState,
+    journal: ConsumeJournal,
+    marker: boolean,
+  ): PiMode => {
     if (rehearsal === '0') return 'inert';
     if (rehearsal === '1' || owner !== 'absent') {
       if (owner === 'malformed') return 'conflict';
       return journal === 'NATIVE' ? 'owned' : 'conflict';
     }
-    return journal === 'CONSUMED' ? 'consume' : 'inert';
+    if (journal === 'CONSUMED') return 'consume';
+    return journal === 'unknown' && marker ? 'conflict' : 'inert';
   };
 
-  it('matches the fail-closed table across all 27 inputs', () => {
+  it('matches the fail-closed table across all 54 inputs', () => {
     const seen = new Set<PiMode>();
     for (const rehearsal of [undefined, '0', '1']) {
       for (const owner of ['absent', 'valid', 'malformed'] as const) {
         for (const journal of ['CONSUMED', 'NATIVE', 'unknown'] as const) {
-          const mode = decidePiMode({ rehearsal, owner, journal });
-          seen.add(mode);
-          assert.equal(mode, expected(rehearsal, owner, journal), `${rehearsal}/${owner}/${journal}`);
+          for (const marker of [false, true]) {
+            const mode = decidePiMode({ rehearsal, owner, journal, marker });
+            seen.add(mode);
+            assert.equal(mode, expected(rehearsal, owner, journal, marker), `${rehearsal}/${owner}/${journal}/${marker}`);
+          }
         }
       }
     }
@@ -117,13 +126,26 @@ describe('qlb-pi mode decision', () => {
   });
 
   it('pins the security-relevant cells explicitly', () => {
-    assert.equal(decidePiMode({ rehearsal: undefined, owner: 'absent', journal: 'CONSUMED' }), 'consume');
-    assert.equal(decidePiMode({ rehearsal: undefined, owner: 'valid', journal: 'CONSUMED' }), 'conflict');
-    assert.equal(decidePiMode({ rehearsal: undefined, owner: 'valid', journal: 'unknown' }), 'conflict');
-    assert.equal(decidePiMode({ rehearsal: undefined, owner: 'malformed', journal: 'NATIVE' }), 'conflict');
-    assert.equal(decidePiMode({ rehearsal: '1', owner: 'absent', journal: 'CONSUMED' }), 'conflict');
-    assert.equal(decidePiMode({ rehearsal: undefined, owner: 'absent', journal: 'unknown' }), 'inert');
-    assert.equal(decidePiMode({ rehearsal: '0', owner: 'valid', journal: 'CONSUMED' }), 'inert');
+    const m = (rehearsal: string | undefined, owner: OwnerFileState, journal: ConsumeJournal, marker = false) =>
+      decidePiMode({ rehearsal, owner, journal, marker });
+    assert.equal(m(undefined, 'absent', 'CONSUMED'), 'consume');
+    assert.equal(m(undefined, 'valid', 'CONSUMED'), 'conflict');
+    assert.equal(m(undefined, 'valid', 'unknown'), 'conflict');
+    assert.equal(m(undefined, 'malformed', 'NATIVE'), 'conflict');
+    assert.equal(m('1', 'absent', 'CONSUMED'), 'conflict');
+    assert.equal(m(undefined, 'absent', 'unknown'), 'inert');
+    // consume enabled but status unreadable: never fall back to anthropic-pool
+    assert.equal(m(undefined, 'absent', 'unknown', true), 'conflict');
+    assert.equal(m(undefined, 'absent', 'NATIVE', true), 'inert');
+    assert.equal(m('0', 'valid', 'CONSUMED', true), 'inert');
+    assert.equal(
+      conflictMessage({ rehearsal: undefined, owner: 'absent', journal: 'unknown', marker: true }),
+      CONSUME_ERRORS.stateUnknown,
+    );
+    assert.equal(
+      conflictMessage({ rehearsal: undefined, owner: 'valid', journal: 'CONSUMED', marker: false }),
+      CONSUME_ERRORS.conflict,
+    );
   });
 
   it('classifies owner files and consume status output', () => {
@@ -332,7 +354,7 @@ describe('qlb-pi consume provider (fake Pi with pre-existing anthropic provider)
   it('journal no longer CONSUMED or owner file appearing: fixed error, zero reads, zero upstream', async () => {
     for (const [over, message] of [
       [{ consumeJournal: async () => 'NATIVE' as const }, CONSUME_ERRORS.disabled],
-      [{ consumeJournal: async () => 'unknown' as const }, CONSUME_ERRORS.disabled],
+      [{ consumeJournal: async () => 'unknown' as const }, CONSUME_ERRORS.stateUnknown],
       [{ ownerState: () => 'valid' as const }, CONSUME_ERRORS.conflict],
       [{ ownerState: () => 'malformed' as const }, CONSUME_ERRORS.conflict],
     ] as const) {

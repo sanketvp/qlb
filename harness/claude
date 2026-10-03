@@ -367,6 +367,7 @@ def critical_section() -> int:
         cmd,
         close_fds=True,
         start_new_session=True,
+        preexec_fn=restore_terminal_signals,  # the proxy keeps default INT/HUP handling
         env=child_env,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -447,7 +448,7 @@ def intercepted(argv: list[str]) -> int:
     shutting_down = [False]
 
     def handle(signum: int, _frame: Any) -> None:
-        name = "INT" if signum == signal.SIGINT else "TERM" if signum == signal.SIGTERM else str(signum)
+        name = {signal.SIGINT: "INT", signal.SIGTERM: "TERM", signal.SIGHUP: "HUP"}.get(signum, str(signum))
         print(f"SIGNAL={name}", flush=True)
         if not shutting_down[0]:
             record_terminating_signal(home, wrapper_pid, name)  # cleanup owns the lease after this
@@ -455,8 +456,9 @@ def intercepted(argv: list[str]) -> int:
 
     # Installed before the critical section so a signal during proxy setup is
     # recorded instead of killing the wrapper with a lease/proxy left behind.
-    signal.signal(signal.SIGINT, handle)
-    signal.signal(signal.SIGTERM, handle)
+    # HUP too: closing the terminal must still release the lease and proxy.
+    for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(signum, handle)
 
     def run_native() -> int:
         nonlocal child
@@ -538,20 +540,34 @@ def intercepted(argv: list[str]) -> int:
             sys.stderr.write(f"qlb wrapper: final mutex failed: {err}\n")
     if cleanup_rc != 0:
         sys.stderr.write("qlb wrapper: proxy cleanup failed; lease/proxy may remain\n")
-        if code == 0:
-            return 1
     if received and code == 0:
         # A terminating signal was requested but native reported success (it
         # handled the signal, exited first, or never got it): report the signal.
         return 128 + received[-1]
+    if cleanup_rc != 0 and code == 0:
+        return 1
     return code
+
+
+def ignore_terminal_signals() -> None:
+    # Helpers share the wrapper's process group: a terminal Ctrl-C / hangup must
+    # not kill them mid-setup or mid-cleanup. The wrapper records the signal.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+
+
+def restore_terminal_signals() -> None:
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    signal.signal(signal.SIGHUP, signal.SIG_DFL)
 
 
 def main() -> int:
     argv = sys.argv[1:]
     if argv[:1] == ["--qlb-critical-section"]:
+        ignore_terminal_signals()
         return critical_section()
     if argv[:1] == ["--qlb-final-shutdown"]:
+        ignore_terminal_signals()
         return final_shutdown()
     first = argv[0] if argv else ""
     if first in PASSTHROUGH:

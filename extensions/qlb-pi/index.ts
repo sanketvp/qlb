@@ -77,6 +77,7 @@ import {
 import { classifyHttpStatus } from "./outcome.js";
 import { shapeAnthropicOAuthPayload } from "./request-shaping.js";
 import {
+  conflictMessage,
   CONSUME_ERRORS,
   CSWAP_ACTIVE_ID,
   decidePiMode,
@@ -96,6 +97,8 @@ import {
 const OWNER_FILE = join(homedir(), ".pi", "agent", "qlb-owner.json");
 const AUDIT_DIR = join(homedir(), ".qlb");
 const AUDIT_FILE = join(AUDIT_DIR, "outcomes.jsonl");
+// Written by `qlb consume enable`, removed by `disable`: a CLI-independent consume signal.
+const CONSUME_MARKER = join(AUDIT_DIR, "consume-anthropic.json");
 
 function findQlbCli(): { cmd: string; prefix: string[] } {
   if (process.env.QLB_CLI) {
@@ -263,14 +266,16 @@ async function resolveBuiltinAnthropicStreamSimple(): Promise<StreamSimple> {
 
 export default async function (pi: ExtensionAPI): Promise<void> {
   const rehearsal = process.env.QLB_PI_REHEARSAL;
-  const mode =
+  const modeInput =
     rehearsal === "0"
-      ? "inert"
-      : decidePiMode({
+      ? null
+      : {
           rehearsal,
           owner: readOwnerFileState(OWNER_FILE),
           journal: await qlbConsumeJournal(),
-        });
+          marker: existsSync(CONSUME_MARKER),
+        };
+  const mode = modeInput ? decidePiMode(modeInput) : "inert";
   if (mode === "inert") {
     // Inert: QLB does not own Pi and consume is off. anthropic-pool keeps the anthropic provider.
     return;
@@ -278,7 +283,11 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   const providerApi = pi as unknown as ProviderApi;
   if (mode === "conflict") {
     // Fail closed before any credential read: no other provider may serve Anthropic.
-    registerConflictProvider(providerApi, () => createAssistantMessageEventStream() as never);
+    registerConflictProvider(
+      providerApi,
+      () => createAssistantMessageEventStream() as never,
+      conflictMessage(modeInput!),
+    );
     pi.on("session_start", (_event, ctx) => {
       ctx.ui.setStatus("qlb", "qlb-pi CONFLICT");
     });
