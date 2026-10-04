@@ -29,7 +29,11 @@ describe('hermes integration checks', () => {
 
   // The module resolves its paths from HERMES_HOME / the home directory at import time, so each
   // case runs it in a child process against its own fixture home.
-  function checksFor(name: string, build: (home: string, hermesHome: string) => void): DoctorCheck[] {
+  function checksFor(
+    name: string,
+    build: (home: string, hermesHome: string) => void,
+    launchdLabel = 'com.sanket.qlb-proxy',
+  ): DoctorCheck[] {
     const home = join(tmp, name);
     const hermesHome = join(home, '.hermes');
     mkdirSync(join(hermesHome, 'hermes-agent'), { recursive: true });
@@ -46,6 +50,7 @@ describe('hermes integration checks', () => {
           HERMES_HOME: hermesHome,
           QLB_HERMES_PLUGIN_STATUS: join(home, '.qlb', 'hermes-plugin.json'),
           QLB_BIN: join(home, 'no-such-qlb'),
+          QLB_LAUNCHD_LABEL: launchdLabel,
         },
       },
     );
@@ -85,8 +90,44 @@ describe('hermes integration checks', () => {
     assert.equal(checks.find((c) => c.name === 'hermes:plugin')?.level, 'FAIL');
   });
 
-  it('still fails hermes:config when the config file cannot be read', () => {
-    const checks = checksFor('no-config', () => {});
+  it('reports the same WARN for a Hermes checkout that has no config and no QLB artifact', () => {
+    const checks = checksFor('never-run', () => {});
+    assert.deepEqual(checks.map((c) => [c.name, c.level]), [['hermes:integration', 'WARN']]);
+  });
+
+  it('still fails hermes:config when the config is unreadable but the plugin is installed', () => {
+    const checks = checksFor('no-config-plugin', (_home, hermesHome) => installPlugin(hermesHome));
+    assert.equal(checks.some((c) => c.name === 'hermes:integration'), false);
+    const config = checks.find((c) => c.name === 'hermes:config');
+    assert.equal(config?.level, 'FAIL');
+    assert.match(config?.message ?? '', /cannot read/);
+  });
+
+  it('still fails hermes:config for provider entries present in a shape the validator cannot read', () => {
+    const checks = checksFor('inline-entries', (_home, hermesHome) => {
+      writeFileSync(join(hermesHome, 'config.yaml'), 'providers:\n  qlb-anthropic: {}\n  qlb-codex: {}\n');
+    });
+    assert.equal(checks.some((c) => c.name === 'hermes:integration'), false);
+    assert.equal(checks.find((c) => c.name === 'hermes:config')?.level, 'FAIL');
+    assert.equal(checks.find((c) => c.name === 'hermes:plugin')?.level, 'FAIL');
+  });
+
+  it('still fails when only a leftover model.provider route names QLB', () => {
+    const checks = checksFor('leftover-route', (_home, hermesHome) => {
+      writeFileSync(join(hermesHome, 'config.yaml'), 'model:\n  provider: custom:qlb-anthropic\n');
+    });
+    assert.equal(checks.some((c) => c.name === 'hermes:integration'), false);
+    assert.equal(checks.find((c) => c.name === 'hermes:config')?.level, 'FAIL');
+  });
+
+  it('runs the full checks when only the proxy supervisor plist remains, under a custom label', () => {
+    const label = 'com.example.qlb-proxy';
+    const checks = checksFor('custom-label', (home, hermesHome) => {
+      writeFileSync(join(hermesHome, 'config.yaml'), 'model:\n  provider: anthropic\n');
+      const agents = join(home, 'Library', 'LaunchAgents');
+      mkdirSync(agents, { recursive: true });
+      writeFileSync(join(agents, `${label}.plist`), '<plist/>');
+    }, label);
     assert.equal(checks.some((c) => c.name === 'hermes:integration'), false);
     assert.equal(checks.find((c) => c.name === 'hermes:config')?.level, 'FAIL');
   });

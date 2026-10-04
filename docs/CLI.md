@@ -72,15 +72,15 @@ Beyond the core and per-provider lines, doctor adds integration checks when the 
 | Check | Reported when | What it tells you |
 | --- | --- | --- |
 | `consume:marker` | cswap consume is enabled, or a consume marker file exists | `PASS` when the journal says `CONSUMED` and the marker is present. `FAIL` when `CONSUMED` but the marker is missing (new Pi sessions will not use cswap). `WARN` when the marker exists without `CONSUMED` (Pi refuses Anthropic until reconciled). |
-| `pi:extension` | always | `PASS` when the installed `qlb-pi` extension matches this repo's `extensions/qlb-pi`, or when Pi / the extension is not installed. `WARN` when the installed copy has drifted (the fix is a copy command) or the Pi package behind the launcher on `PATH` cannot be located (set `QLB_PI_PACKAGE_ROOT`). |
+| `pi:extension` | always, except when Pi and the extension are installed but the QLB repo root cannot be located | `PASS` when the installed `qlb-pi` extension matches this repo's `extensions/qlb-pi`, or when Pi / the extension is not installed. `WARN` when the installed copy has drifted (the fix is a copy command) or the Pi package behind the launcher on `PATH` cannot be located (set `QLB_PI_PACKAGE_ROOT`). |
 | `pi:seam:<name>` | Pi and the extension are installed | One line per Pi API the extension depends on (`anthropicMessagesApi`, `registerProvider`, `model_select`, `after_provider_response`); flags a Pi upgrade that removed one. |
 | `pi:typecheck` | `--live` only | Typechecks the extension against the Pi you actually run. |
 | `hermes:checkout` | no Hermes checkout at `~/.hermes/hermes-agent` | `PASS`; all other Hermes checks are skipped. |
-| `hermes:integration` | Hermes is installed but QLB is not set up for it | `WARN`; the other Hermes checks are skipped. This is the "off" state: no `qlb-anthropic` / `qlb-codex` provider entries, no QLB plugin, and no proxy supervisor. If any one of those is present, the checks below run instead and `FAIL` on whatever is missing. |
-| `hermes:config` | QLB is (at least partly) set up for Hermes | The `qlb-anthropic` / `qlb-codex` provider entries still carry the fields QLB relies on, and Hermes' primary route is QLB. |
-| `hermes:plugin` | same | The QLB Hermes plugin is installed and its last load succeeded. |
+| `hermes:integration` | Hermes is installed but there is no trace of QLB in it | `WARN`; the other Hermes checks are skipped. This is the "off" state: `~/.hermes/config.yaml` is missing or never names `qlb-anthropic` / `qlb-codex` (as a provider entry of any shape, or as the `model.provider` route), there is no QLB plugin directory, and there is no proxy supervisor plist. If any one of those is present, the checks below run instead and report what is missing. |
+| `hermes:config` | there is some trace of QLB in Hermes | `FAIL` when the config cannot be read, or a `qlb-anthropic` / `qlb-codex` provider entry is absent or lost a field QLB relies on. `WARN` when the entries are intact but Hermes' primary route is no longer QLB. |
+| `hermes:plugin` | same | `FAIL` when the QLB Hermes plugin is missing or its last load could not patch Hermes. `WARN` when it has not reported a load yet. |
 | `hermes:codex-fix`, `hermes:branch` | same | The local Hermes patch for named custom Codex providers is present, and the checkout is not on `main`. |
-| `hermes:proxy-supervisor` | same, macOS | The launchd proxy agent exists and its port matches the Hermes config. |
+| `hermes:proxy-supervisor` | same, macOS | `WARN` when the launchd proxy agent plist (`com.sanket.qlb-proxy`, or the label in `QLB_LAUNCHD_LABEL`) is missing. `FAIL` when its port differs from the Hermes config. |
 | `hermes:models`, `hermes:version` | same | The Hermes `/model` picker lists what QLB policies serve; the Hermes version marker. |
 | `hermes:seam:<name>` | same, `--live` only | The Hermes symbols the plugin patches still exist with the expected signature. |
 
