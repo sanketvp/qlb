@@ -287,7 +287,7 @@ def sigterm_proxy(info: dict[str, Any], info_path: str) -> bool:
         dead = wait_identity_dead(pid, stored, 2.0)
     if not dead:
         sys.stderr.write(
-            f"qlb wrapper: proxy pid {pid} still alive after SIGKILL; keeping {info_path}\n"
+            f"qlb wrapper: could not confirm proxy pid {pid} stopped; keeping {info_path}\n"
         )
         return False
     try:

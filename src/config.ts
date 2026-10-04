@@ -125,7 +125,7 @@ export function resolveConfig(options: ResolveConfigOptions = {}): QlbConfig {
     const isPath = field.endsWith('Path') || field.endsWith('File') || field.endsWith('Dir');
     if (isPath && raw !== '~' && !raw.startsWith('~/') && !raw.startsWith('~\\') && !isAbsolute(raw)) {
       // Resolved against this process's cwd; qlb-pi and other launchers may sit elsewhere.
-      warn(`qlb: ${meta.env}/${field} '${raw}' is relative and resolves to ${resolve(raw)}; use an absolute path`);
+      warn(`qlb: ${meta.env}/${meta.flag}/${field} '${raw}' is relative and resolves to ${resolve(raw)}; use an absolute path`);
     }
     result[field] = isPath ? expandPath(raw, home) : raw;
   }

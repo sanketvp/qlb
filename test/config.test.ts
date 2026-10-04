@@ -93,7 +93,7 @@ describe('relative path settings', () => {
     const warn = (m: string) => { warnings.push(m); };
     const cfg = resolveConfig({ argv: [], env: { QLB_DB_PATH: 'data/qlb.db' }, home, warn });
     assert.equal(warnings.length, 1);
-    assert.match(warnings[0]!, /QLB_DB_PATH\/dbPath 'data\/qlb\.db' is relative/);
+    assert.match(warnings[0]!, /QLB_DB_PATH\/--db-path\/dbPath 'data\/qlb\.db' is relative/);
     assert.equal(cfg.dbPath, join(process.cwd(), 'data', 'qlb.db'));
     warnings.length = 0;
     resolveConfig({ argv: [], env: { QLB_DB_PATH: join(home, 'q.db'), QLB_PLUGINS_DIR: '~/plugins' }, home, warn });
