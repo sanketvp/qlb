@@ -70,11 +70,27 @@ export function hermesIntegrationChecks(options: HermesIntegrationOptions = {}):
 
   // 1. Hermes config still routes through the proxy with the keys QLB relies on.
   const cfg = readText(HERMES_CONFIG);
+  const anthropicBlock = /\n\s{2}qlb-anthropic:\n((?:\s{4}.*\n)+)/.exec(cfg ?? '')?.[1] ?? '';
+  const codexBlock = /\n\s{2}qlb-codex:\n((?:\s{4}.*\n)+)/.exec(cfg ?? '')?.[1] ?? '';
+
+  // Hermes is installed but QLB was never wired into it (or was deliberately unwired): no
+  // provider entries, no plugin, no proxy supervisor. That is "off", not "broken" — the checks
+  // below exist to catch an integration that lost a piece, so any one artifact present still
+  // runs them and FAILs on whatever is missing.
+  const integrationAbsent = cfg != null && !anthropicBlock && !codexBlock
+    && !existsSync(PLUGIN_DIR) && !existsSync(LAUNCHD_PLIST);
+  if (integrationAbsent) {
+    checks.push({
+      name: 'hermes:integration', level: 'WARN',
+      message: 'Hermes is installed but QLB is not set up for it (no qlb-anthropic / qlb-codex entries, plugin or proxy supervisor); skipping Hermes checks',
+      detail: { fix: 'qlb setup hermes   (only if Hermes should route through QLB)' },
+    });
+    return checks;
+  }
+
   if (cfg == null) {
     checks.push({ name: 'hermes:config', level: 'FAIL', message: `cannot read ${HERMES_CONFIG}` });
   } else {
-    const anthropicBlock = /\n\s{2}qlb-anthropic:\n((?:\s{4}.*\n)+)/.exec(cfg)?.[1] ?? '';
-    const codexBlock = /\n\s{2}qlb-codex:\n((?:\s{4}.*\n)+)/.exec(cfg)?.[1] ?? '';
     const missing: string[] = [];
     for (const [label, block] of [['qlb-anthropic', anthropicBlock], ['qlb-codex', codexBlock]] as const) {
       if (!block) { missing.push(`${label} (entry absent)`); continue; }

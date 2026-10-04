@@ -67,6 +67,23 @@ Overall: WARN
 
 Flags: `[--json] [--live]`. Exit `1` when overall is `FAIL`.
 
+Beyond the core and per-provider lines, doctor adds integration checks when the thing they inspect is present:
+
+| Check | Reported when | What it tells you |
+| --- | --- | --- |
+| `consume:marker` | cswap consume is enabled, or a consume marker file exists | `PASS` when the journal says `CONSUMED` and the marker is present. `FAIL` when `CONSUMED` but the marker is missing (new Pi sessions will not use cswap). `WARN` when the marker exists without `CONSUMED` (Pi refuses Anthropic until reconciled). |
+| `pi:extension` | always | `PASS` when the installed `qlb-pi` extension matches this repo's `extensions/qlb-pi`, or when Pi / the extension is not installed. `WARN` when the installed copy has drifted (the fix is a copy command) or the Pi package behind the launcher on `PATH` cannot be located (set `QLB_PI_PACKAGE_ROOT`). |
+| `pi:seam:<name>` | Pi and the extension are installed | One line per Pi API the extension depends on (`anthropicMessagesApi`, `registerProvider`, `model_select`, `after_provider_response`); flags a Pi upgrade that removed one. |
+| `pi:typecheck` | `--live` only | Typechecks the extension against the Pi you actually run. |
+| `hermes:checkout` | no Hermes checkout at `~/.hermes/hermes-agent` | `PASS`; all other Hermes checks are skipped. |
+| `hermes:integration` | Hermes is installed but QLB is not set up for it | `WARN`; the other Hermes checks are skipped. This is the "off" state: no `qlb-anthropic` / `qlb-codex` provider entries, no QLB plugin, and no proxy supervisor. If any one of those is present, the checks below run instead and `FAIL` on whatever is missing. |
+| `hermes:config` | QLB is (at least partly) set up for Hermes | The `qlb-anthropic` / `qlb-codex` provider entries still carry the fields QLB relies on, and Hermes' primary route is QLB. |
+| `hermes:plugin` | same | The QLB Hermes plugin is installed and its last load succeeded. |
+| `hermes:codex-fix`, `hermes:branch` | same | The local Hermes patch for named custom Codex providers is present, and the checkout is not on `main`. |
+| `hermes:proxy-supervisor` | same, macOS | The launchd proxy agent exists and its port matches the Hermes config. |
+| `hermes:models`, `hermes:version` | same | The Hermes `/model` picker lists what QLB policies serve; the Hermes version marker. |
+| `hermes:seam:<name>` | same, `--live` only | The Hermes symbols the plugin patches still exist with the expected signature. |
+
 For QLB-owned accounts, doctor also runs a native-credential drift check (one `[PASS]`/`[WARN]` line per owned account, name `native-sync:<accountId>`) — see [CREDENTIAL-SAFETY.md](CREDENTIAL-SAFETY.md#native-credential-drift-the-shadow-retain-tradeoff).
 
 ## `qlb refresh`
