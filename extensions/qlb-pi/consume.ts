@@ -113,7 +113,7 @@ export function readActiveClaudeAccess(opts: {
  * file (QLB_DB_PATH, then config.json `dbPath`, then ~/.qlb/qlb.db). Pi cannot
  * see per-invocation CLI flags; test/qlb-pi-consume.test.ts pins the parity.
  */
-export function consumeMarkerPath(env: NodeJS.ProcessEnv = process.env, home: string = homedir()): string {
+export function qlbDbPath(env: NodeJS.ProcessEnv = process.env, home: string = homedir()): string {
   const expand = (value: string): string => {
     if (value === "~") return home;
     if (value.startsWith("~/") || value.startsWith("~\\")) return join(home, value.slice(2));
@@ -130,8 +130,12 @@ export function consumeMarkerPath(env: NodeJS.ProcessEnv = process.env, home: st
     }
   }
   const raw = env.QLB_DB_PATH ?? fileDb ?? defaultDb;
-  const dbPath = typeof raw === "string" && raw.length > 0 ? expand(raw) : defaultDb;
-  return join(dirname(dbPath), "consume-anthropic.json");
+  return typeof raw === "string" && raw.length > 0 ? expand(raw) : defaultDb;
+}
+
+/** Marker beside the QLB database (see qlbDbPath). */
+export function consumeMarkerPath(env: NodeJS.ProcessEnv = process.env, home: string = homedir()): string {
+  return join(dirname(qlbDbPath(env, home)), "consume-anthropic.json");
 }
 
 export type OwnerFileState = "absent" | "valid" | "malformed";
@@ -196,13 +200,15 @@ export function decidePiMode(input: PiModeInput): PiMode {
 }
 
 /**
- * Startup fast path: with no rehearsal, no owner file and no consume marker there is
- * nothing QLB could take over (enable writes the marker before CONSUMED; disable
- * removes it after NATIVE), so the `qlb consume status` spawn is skipped.
- * `qlb doctor` (consume:marker) flags a CONSUMED journal whose marker went missing.
+ * Startup fast path for machines where QLB was never used: with no rehearsal, no
+ * owner file, no consume marker AND no QLB database, the journal cannot be CONSUMED
+ * (that state lives in the database), so the `qlb consume status` spawn is skipped.
+ * Whenever the database exists the journal is always consulted, so a missing marker
+ * can never hide a CONSUMED journal.
  */
-export function canSkipJournal(input: Omit<PiModeInput, "journal">): boolean {
-  return input.rehearsal !== "0" && input.rehearsal !== "1" && input.owner === "absent" && !input.marker;
+export function canSkipJournal(input: Omit<PiModeInput, "journal"> & { dbExists: boolean }): boolean {
+  return input.rehearsal !== "0" && input.rehearsal !== "1" && input.owner === "absent"
+    && !input.marker && !input.dbExists;
 }
 
 /** User-facing reason for a `conflict` decision. */

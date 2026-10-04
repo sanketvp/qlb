@@ -86,6 +86,9 @@ export function resolveConfig(options: ResolveConfigOptions = {}): QlbConfig {
   const warn = options.warn ?? ((message: string) => console.error(message));
   const defaults = defaultConfig(home);
   const configPathRaw = cliValue(argv, '--config') ?? env.QLB_CONFIG_PATH ?? defaults.configPath;
+  if (configPathRaw !== '~' && !configPathRaw.startsWith('~/') && !configPathRaw.startsWith('~\\') && !isAbsolute(configPathRaw)) {
+    warn(`qlb: QLB_CONFIG_PATH/--config '${configPathRaw}' is relative and resolves to ${resolve(configPathRaw)}; use an absolute path`);
+  }
   const configPath = expandPath(configPathRaw, home);
 
   let fileConfig: Partial<Record<ConfigField, string>> = {};

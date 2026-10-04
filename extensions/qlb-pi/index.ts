@@ -81,6 +81,7 @@ import {
   conflictMessage,
   CONSUME_ERRORS,
   consumeMarkerPath,
+  qlbDbPath,
   CSWAP_ACTIVE_ID,
   decidePiMode,
   parseConsumeStatus,
@@ -275,9 +276,11 @@ export default async function (pi: ExtensionAPI): Promise<void> {
           // Written by `qlb consume enable`, removed by `disable`: a CLI-independent signal.
           marker: existsSync(consumeMarkerPath()),
         };
-  // Most Pi users never enabled QLB: decide without spawning the CLI.
+  // Pi users who never used QLB (no database) are decided without spawning the CLI.
   const modeInput =
-    base && !canSkipJournal(base) ? { ...base, journal: await qlbConsumeJournal() } : null;
+    base && !canSkipJournal({ ...base, dbExists: existsSync(qlbDbPath()) })
+      ? { ...base, journal: await qlbConsumeJournal() }
+      : null;
   const mode = modeInput ? decidePiMode(modeInput) : "inert";
   if (mode === "inert") {
     // Inert: QLB does not own Pi and consume is off. anthropic-pool keeps the anthropic provider.

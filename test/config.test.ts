@@ -99,5 +99,8 @@ describe('relative path settings', () => {
     resolveConfig({ argv: [], env: { QLB_DB_PATH: join(home, 'q.db'), QLB_PLUGINS_DIR: '~/plugins' }, home, warn });
     resolveConfig({ argv: [], env: {}, home, warn });
     assert.deepEqual(warnings, []);
+    resolveConfig({ argv: [], env: { QLB_CONFIG_PATH: 'cfg/config.json' }, home, warn });
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0]!, /QLB_CONFIG_PATH\/--config 'cfg\/config\.json' is relative/);
   });
 });

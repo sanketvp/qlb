@@ -61,13 +61,25 @@ function load(opts: {
 }
 
 describe('qlb-pi production default export (Pi jiti loader)', { skip: piAvailable ? false : 'global Pi install not found' }, () => {
-  it('inert when consume is off and no owner file: anthropic-pool untouched, no CLI spawn', () => {
-    const home = mkdtempSync(join(tmpdir(), 'qlb-pi-smoke-nospawn-'));
-    const counter = join(home, 'qlb-calls');
-    const r = load({ states: 'NATIVE', env: { SMOKE_COUNTER: counter } });
+  it('inert when consume is off and no owner file: anthropic-pool untouched', () => {
+    const r = load({ states: 'NATIVE' });
     assert.deepEqual(r.calls, []);
     assert.equal(r.poolStillRegistered, true);
-    assert.equal(existsSync(counter), false, 'startup must not spawn qlb when no marker/owner file exists');
+  });
+
+  it('never-used QLB (no database): startup decides without spawning qlb', () => {
+    const counter = join(mkdtempSync(join(tmpdir(), 'qlb-pi-smoke-nospawn-')), 'qlb-calls');
+    const r = load({ states: 'NATIVE', env: { SMOKE_COUNTER: counter, QLB_DB_PATH: join(tmpdir(), 'qlb-no-such-dir', 'qlb.db') } });
+    assert.deepEqual(r.calls, []);
+    assert.equal(existsSync(counter), false, 'no database: no qlb spawn');
+  });
+
+  it('marker deleted while the journal is CONSUMED still takes over (no fall-open)', () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-pi-smoke-db-'));
+    writeFileSync(join(home, 'qlb.db'), ''); // QLB in use: database exists, marker missing
+    const r = load({ states: 'CONSUMED,NATIVE', call: true, env: { QLB_DB_PATH: join(home, 'qlb.db') } });
+    assert.equal(r.poolStillRegistered, false, 'pool must not keep Anthropic when the journal says CONSUMED');
+    assert.deepEqual(r.calls, ['unregister:anthropic', 'register:anthropic']);
   });
 
   it('consume mode replaces the pool and re-checks the journal per request before any credential read', () => {

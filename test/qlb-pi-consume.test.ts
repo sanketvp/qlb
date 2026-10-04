@@ -156,21 +156,23 @@ describe('qlb-pi mode decision', () => {
     );
   });
 
-  it('skips the consume-status spawn only when nothing could be taken over', () => {
+  it('skips the consume-status spawn only when QLB was never used (no database)', () => {
     for (const rehearsal of [undefined, '0', '1']) {
       for (const owner of ['absent', 'valid', 'malformed'] as const) {
         for (const marker of [false, true]) {
-          const skip = canSkipJournal({ rehearsal, owner, marker });
-          assert.equal(skip, rehearsal === undefined && owner === 'absent' && !marker, `${rehearsal}/${owner}/${marker}`);
-          if (skip) {
-            // Whatever the journal says, a skipped spawn must agree with the full decision.
-            for (const journal of ['NATIVE', 'unknown'] as const) {
-              assert.equal(decidePiMode({ rehearsal, owner, journal, marker }), 'inert');
-            }
+          for (const dbExists of [false, true]) {
+            const skip = canSkipJournal({ rehearsal, owner, marker, dbExists });
+            assert.equal(
+              skip,
+              rehearsal === undefined && owner === 'absent' && !marker && !dbExists,
+              `${rehearsal}/${owner}/${marker}/${dbExists}`,
+            );
           }
         }
       }
     }
+    // A deleted marker with an existing database must still consult the journal.
+    assert.equal(canSkipJournal({ rehearsal: undefined, owner: 'absent', marker: false, dbExists: true }), false);
   });
 
   it('a malformed owner file is reported as the owner-file problem', () => {
