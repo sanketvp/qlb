@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { describe, it } from 'node:test';
@@ -279,6 +279,43 @@ describe('CLI smoke — documented commands', () => {
     assert.match(failed.stderr, /cannot write/);
     const status = runCli(['consume', 'status', '--provider', 'anthropic', '--json'], env);
     assert.equal(JSON.parse(status.stdout).state, 'NATIVE');
+  });
+
+  it('doctor flags a CONSUMED journal without its marker, and a stray marker', () => {
+    const env = isolatedEnv();
+    const marker = join(dirname(String(env.QLB_DB_PATH)), 'consume-anthropic.json');
+    assert.equal(runCli(['consume', 'enable', '--provider', 'anthropic', '--json'], env).status, 0);
+    const ok = JSON.parse(runCli(['doctor', '--json'], env).stdout) as { checks: Array<{ name: string; level: string }> };
+    assert.equal(ok.checks.find((c) => c.name === 'consume:marker')?.level, 'PASS');
+    unlinkSync(marker);
+    const missing = JSON.parse(runCli(['doctor', '--json'], env).stdout) as { checks: Array<{ name: string; level: string }> };
+    assert.equal(missing.checks.find((c) => c.name === 'consume:marker')?.level, 'FAIL');
+    assert.equal(runCli(['consume', 'disable', '--provider', 'anthropic', '--json'], env).status, 0);
+    writeFileSync(marker, '{"state":"CONSUMED"}\n');
+    const stray = JSON.parse(runCli(['doctor', '--json'], env).stdout) as { checks: Array<{ name: string; level: string }> };
+    assert.equal(stray.checks.find((c) => c.name === 'consume:marker')?.level, 'WARN');
+  });
+
+  it('consume enable refuses a one-off database Pi cannot discover', () => {
+    const env = isolatedEnv();
+    const other = join(mkdtempSync(join(tmpdir(), 'qlb-smoke-otherdb-')), 'qlb.db');
+    for (const args of [['--db', other], ['--db-path', other]]) {
+      const r = runCli(['consume', 'enable', '--provider', 'anthropic', ...args, '--json'], env);
+      assert.equal(r.status, 1, `${args[0]}: ${r.stdout}`);
+      assert.match(r.stderr, /not the database Pi uses/);
+    }
+    // A relative QLB_DB_PATH is cwd-dependent: refused even though it matches here.
+    const relDir = `qlb-smoke-relative-${process.pid}`;
+    try {
+      const rel = runCli(['consume', 'enable', '--provider', 'anthropic', '--json'], { ...env, QLB_DB_PATH: `${relDir}/qlb.db` });
+      assert.equal(rel.status, 1, rel.stdout);
+      assert.match(rel.stderr, /is relative/);
+      assert.equal(existsSync(relDir), false, 'a refused target must not be created');
+    } finally {
+      rmSync(relDir, { recursive: true, force: true });
+    }
+    // The environment-backed absolute database (what Pi sees) still works.
+    assert.equal(runCli(['consume', 'enable', '--provider', 'anthropic', '--json'], env).status, 0);
   });
 
   it('consume disable fails loudly when the marker cannot be removed', () => {

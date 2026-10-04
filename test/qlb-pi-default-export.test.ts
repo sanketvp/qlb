@@ -67,9 +67,24 @@ describe('qlb-pi production default export (Pi jiti loader)', { skip: piAvailabl
     assert.equal(r.poolStillRegistered, true);
   });
 
+  it('never-used QLB (no database): startup decides without spawning qlb', () => {
+    const counter = join(mkdtempSync(join(tmpdir(), 'qlb-pi-smoke-nospawn-')), 'qlb-calls');
+    const r = load({ states: 'NATIVE', env: { SMOKE_COUNTER: counter, QLB_DB_PATH: join(tmpdir(), 'qlb-no-such-dir', 'qlb.db') } });
+    assert.deepEqual(r.calls, []);
+    assert.equal(existsSync(counter), false, 'no database: no qlb spawn');
+  });
+
+  it('marker deleted while the journal is CONSUMED still takes over (no fall-open)', () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-pi-smoke-db-'));
+    writeFileSync(join(home, 'qlb.db'), ''); // QLB in use: database exists, marker missing
+    const r = load({ states: 'CONSUMED,NATIVE', call: true, env: { QLB_DB_PATH: join(home, 'qlb.db') } });
+    assert.equal(r.poolStillRegistered, false, 'pool must not keep Anthropic when the journal says CONSUMED');
+    assert.deepEqual(r.calls, ['unregister:anthropic', 'register:anthropic']);
+  });
+
   it('consume mode replaces the pool and re-checks the journal per request before any credential read', () => {
     // Load sees CONSUMED; the request sees NATIVE, so it must stop before the Keychain.
-    const r = load({ states: 'CONSUMED,NATIVE', call: true });
+    const r = load({ states: 'CONSUMED,NATIVE', call: true, marker: true }); // enable writes the marker
     assert.deepEqual(r.calls, ['unregister:anthropic', 'register:anthropic']);
     assert.equal(r.poolStillRegistered, false);
     assert.equal(r.events.length, 1);

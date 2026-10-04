@@ -126,6 +126,54 @@ describe('locatePi', () => {
     assert.deepEqual(both, { root: null, launcher: join(bothBin, 'pi.exe'), unresolved: true });
   });
 
+  it('in one directory, pi.ps1 wins over pi.cmd even when they point at different installs', () => {
+    const base = tmp('qlb-piroot-');
+    const bin = join(base, 'one');
+    const psRoot = fakePiPackage(join(base, 'one-ps'), '1.0.1');
+    fakePiPackage(join(base, 'one-cmd'), '0.99.2');
+    mkdirSync(bin, { recursive: true });
+    writeFileSync(join(bin, 'pi.ps1'), `& "${psRoot}/dist/bundle/cli.js" $args\r\n`);
+    writeFileSync(join(bin, 'pi.cmd'), `@"${join(base, 'one-cmd', 'lib', 'node_modules', '@earendil-works', 'pi-coding-agent')}\\dist\\bundle\\cli.js" %*\r\n`);
+    const located = locatePi({ PATH: bin, PATHEXT: '.EXE;.CMD' }, base, 'win32');
+    assert.equal(located.launcher, join(bin, 'pi.ps1'));
+    assert.equal(located.root, psRoot);
+  });
+
+  it('traces the fleet runtime selector through runtimes/current', () => {
+    const home = tmp('qlb-piroot-fleet-');
+    const release = fakePiPackage(join(home, 'release'), '1.0.1');
+    const runtime = join(home, '.pi', 'agent', 'runtimes', 'global');
+    mkdirSync(runtime, { recursive: true });
+    symlinkSync(join(home, 'release', 'lib', 'node_modules'), join(runtime, 'node_modules'));
+    symlinkSync(runtime, join(home, '.pi', 'agent', 'runtimes', 'current'));
+    const binDir = join(home, '.pi', 'agent', 'bin');
+    mkdirSync(binDir, { recursive: true });
+    executable(join(binDir, 'pi'), [
+      '#!/bin/bash',
+      'CURRENT="$HOME/.pi/agent/runtimes/current"',
+      'RUNTIME_ROOT="$(cd -P "$CURRENT" && pwd)"',
+      'CLI="$RUNTIME_ROOT/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js"',
+      'exec node "$CLI" "$@"',
+      '',
+    ].join('\n'));
+    const located = locatePi({ PATH: binDir }, home);
+    assert.equal(located.root, realpathSync(release));
+    assert.equal(located.launcher, join(binDir, 'pi'));
+  });
+
+  it('reports an absolute launcher for a cwd PATH entry', () => {
+    const base = tmp('qlb-piroot-');
+    mkdirSync(join(base, 'cwd'), { recursive: true });
+    executable(join(base, 'cwd', 'pi'), Buffer.from([0xcf, 0xfa, 0xed, 0xfe, 0, 0, 0, 0]));
+    const prev = process.cwd();
+    process.chdir(join(base, 'cwd'));
+    try {
+      assert.equal(locatePi({ PATH: ':' }, base).launcher, join(base, 'cwd', 'pi'));
+    } finally {
+      process.chdir(prev);
+    }
+  });
+
   it('skips a directory named pi on PATH, like a shell', () => {
     const base = tmp('qlb-piroot-');
     mkdirSync(join(base, 'dirs', 'pi'), { recursive: true });

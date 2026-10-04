@@ -1,6 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { consumeMarkerPathFor, CSWAP_ANTHROPIC_STORE } from './cswap-consume';
 import { DatabaseSync } from 'node:sqlite';
 
 import { builtInAdapters } from './adapters';
@@ -421,6 +422,28 @@ export async function doctorQlb(
     checks.push(...hermesIntegrationChecks({ probeSeams: options.live === true }));
   } catch (err) {
     checks.push({ name: 'hermes', level: 'WARN', message: `hermes checks failed: ${err instanceof Error ? err.message : String(err)}` });
+  }
+  // qlb-pi decides its startup mode from the consume marker without spawning the
+  // CLI when no marker/owner file exists, so CONSUMED without a marker must surface.
+  {
+    const consumed = migrations.find((m) => m.store === CSWAP_ANTHROPIC_STORE)?.state === 'CONSUMED';
+    const marker = consumeMarkerPathFor(config.dbPath);
+    const markerExists = existsSync(marker);
+    if (consumed && !markerExists) {
+      checks.push({
+        name: 'consume:marker', level: 'FAIL',
+        message: `cswap-anthropic is CONSUMED but ${marker} is missing; new Pi sessions will not use cswap`,
+        detail: { fix: 'qlb consume enable --provider anthropic   # rewrites the marker; then restart Pi' },
+      });
+    } else if (!consumed && markerExists) {
+      checks.push({
+        name: 'consume:marker', level: 'WARN',
+        message: `${marker} exists but cswap-anthropic is not CONSUMED; Pi refuses Anthropic until this is reconciled`,
+        detail: { fix: 'qlb consume enable --provider anthropic  OR  qlb consume disable --provider anthropic; then restart Pi' },
+      });
+    } else if (consumed) {
+      checks.push({ name: 'consume:marker', level: 'PASS', message: `cswap consume enabled; marker present (${marker})` });
+    }
   }
   try {
     checks.push(...piIntegrationChecks({ typecheck: options.live === true }));

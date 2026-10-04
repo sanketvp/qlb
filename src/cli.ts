@@ -1,16 +1,17 @@
 #!/usr/bin/env node
 import { existsSync, mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import * as net from 'node:net';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { adapters } from './adapters';
 import { createDefaultCodexGateDeps, runCodexGate } from './codex-gate';
-import { config, stripConfigArgs } from './config';
+import { config, resolveConfig, stripConfigArgs } from './config';
 import { doctorQlb, initializeQlb, type DoctorReport, type InitReport } from './diagnostics';
 import { platformKeychain } from './keychain';
 import { createOwnedCredentialSource } from './credentials';
 import {
   CSWAP_ANTHROPIC_STORE,
   CONSUME_STATE,
+  consumeMarkerPathFor,
   isConsumedState,
 } from './cswap-consume';
 import {
@@ -1389,14 +1390,37 @@ function isPortListening(port: number, host = '127.0.0.1'): Promise<boolean> {
   });
 }
 
-function consumeMarkerPath(dbPath: string): string {
-  return join(dirname(dbPath), 'consume-anthropic.json');
+
+/**
+ * qlb-pi finds the database (and the marker beside it) only through the environment
+ * and config.json, resolved in its own working directory. Enabling consume on any
+ * other database — a one-off --db/--db-path/--config, or a relative path — would
+ * leave Pi on anthropic-pool. Returns the refusal reason, or null.
+ */
+function consumeTargetInvisibleToPi(dbPath: string): string | null {
+  const configWarnings: string[] = [];
+  const piVisibleDb = resolve(resolveConfig({ argv: [], warn: (m) => { configWarnings.push(m); } }).dbPath);
+  const relative = configWarnings.find((m) => /\/dbPath '|QLB_CONFIG_PATH\/--config '/.test(m));
+  if (relative) return `${relative.replace(/^qlb: /, '')} (Pi may start from another directory)`;
+  if (resolve(dbPath) !== piVisibleDb) {
+    return `${dbPath} is not the database Pi uses (${piVisibleDb}). ` +
+      'Set QLB_DB_PATH in the environment Pi runs with (or dbPath in ~/.qlb/config.json) instead of a one-off flag.';
+  }
+  return null;
 }
 
 async function runConsume(opts: ConsumeOpts): Promise<number> {
+  if (opts.sub === 'enable') {
+    // Checked before the store is opened, so a refused target is never created.
+    const refusal = consumeTargetInvisibleToPi(opts.db ?? config.dbPath);
+    if (refusal) {
+      console.error(`qlb consume enable: refusing — ${refusal}`);
+      return 1;
+    }
+  }
   return withStore(opts.db, async (store) => {
     const dbPath = opts.db ?? config.dbPath;
-    const marker = consumeMarkerPath(dbPath);
+    const marker = consumeMarkerPathFor(dbPath);
     if (opts.sub === 'enable') {
       const piPool = store.getMigration(PI_POOL_STORE)?.state;
       if ((piPool && PI_POOL_OWNING_STATES.has(piPool)) || existsSync(defaultOwnerFileFor('anthropic'))) {

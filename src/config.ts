@@ -86,6 +86,9 @@ export function resolveConfig(options: ResolveConfigOptions = {}): QlbConfig {
   const warn = options.warn ?? ((message: string) => console.error(message));
   const defaults = defaultConfig(home);
   const configPathRaw = cliValue(argv, '--config') ?? env.QLB_CONFIG_PATH ?? defaults.configPath;
+  if (configPathRaw !== '~' && !configPathRaw.startsWith('~/') && !configPathRaw.startsWith('~\\') && !isAbsolute(configPathRaw)) {
+    warn(`qlb: QLB_CONFIG_PATH/--config '${configPathRaw}' is relative and resolves to ${resolve(configPathRaw)}; use an absolute path`);
+  }
   const configPath = expandPath(configPathRaw, home);
 
   let fileConfig: Partial<Record<ConfigField, string>> = {};
@@ -119,9 +122,12 @@ export function resolveConfig(options: ResolveConfigOptions = {}): QlbConfig {
       result[field] = raw;
       continue;
     }
-    result[field] = field.endsWith('Path') || field.endsWith('File') || field.endsWith('Dir')
-      ? expandPath(raw, home)
-      : raw;
+    const isPath = field.endsWith('Path') || field.endsWith('File') || field.endsWith('Dir');
+    if (isPath && raw !== '~' && !raw.startsWith('~/') && !raw.startsWith('~\\') && !isAbsolute(raw)) {
+      // Resolved against this process's cwd; qlb-pi and other launchers may sit elsewhere.
+      warn(`qlb: ${meta.env}/${meta.flag}/${field} '${raw}' is relative and resolves to ${resolve(raw)}; use an absolute path`);
+    }
+    result[field] = isPath ? expandPath(raw, home) : raw;
   }
   return result;
 }
