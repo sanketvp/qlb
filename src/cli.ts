@@ -11,6 +11,7 @@ import { createOwnedCredentialSource } from './credentials';
 import {
   CSWAP_ANTHROPIC_STORE,
   CONSUME_STATE,
+  consumeMarkerPathFor,
   isConsumedState,
 } from './cswap-consume';
 import {
@@ -1389,14 +1390,11 @@ function isPortListening(port: number, host = '127.0.0.1'): Promise<boolean> {
   });
 }
 
-function consumeMarkerPath(dbPath: string): string {
-  return join(dirname(dbPath), 'consume-anthropic.json');
-}
 
 async function runConsume(opts: ConsumeOpts): Promise<number> {
   return withStore(opts.db, async (store) => {
     const dbPath = opts.db ?? config.dbPath;
-    const marker = consumeMarkerPath(dbPath);
+    const marker = consumeMarkerPathFor(dbPath);
     if (opts.sub === 'enable') {
       const piPool = store.getMigration(PI_POOL_STORE)?.state;
       if ((piPool && PI_POOL_OWNING_STATES.has(piPool)) || existsSync(defaultOwnerFileFor('anthropic'))) {

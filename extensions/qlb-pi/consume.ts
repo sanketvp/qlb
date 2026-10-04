@@ -195,8 +195,19 @@ export function decidePiMode(input: PiModeInput): PiMode {
   return input.marker ? "conflict" : "inert";
 }
 
+/**
+ * Startup fast path: with no rehearsal, no owner file and no consume marker there is
+ * nothing QLB could take over (enable writes the marker before CONSUMED; disable
+ * removes it after NATIVE), so the `qlb consume status` spawn is skipped.
+ * `qlb doctor` (consume:marker) flags a CONSUMED journal whose marker went missing.
+ */
+export function canSkipJournal(input: Omit<PiModeInput, "journal">): boolean {
+  return input.rehearsal !== "0" && input.rehearsal !== "1" && input.owner === "absent" && !input.marker;
+}
+
 /** User-facing reason for a `conflict` decision. */
 export function conflictMessage(input: PiModeInput): string {
+  if (input.owner === "malformed") return CONSUME_ERRORS.conflict; // the owner file is the problem
   if (input.journal === "unknown") return CONSUME_ERRORS.stateUnknown;
   const claimsOwnership = input.rehearsal === "1" || input.owner !== "absent";
   return claimsOwnership ? CONSUME_ERRORS.conflict : CONSUME_ERRORS.stateInconsistent;

@@ -77,6 +77,7 @@ import {
 import { classifyHttpStatus } from "./outcome.js";
 import { shapeAnthropicOAuthPayload } from "./request-shaping.js";
 import {
+  canSkipJournal,
   conflictMessage,
   CONSUME_ERRORS,
   consumeMarkerPath,
@@ -265,16 +266,18 @@ async function resolveBuiltinAnthropicStreamSimple(): Promise<StreamSimple> {
 
 export default async function (pi: ExtensionAPI): Promise<void> {
   const rehearsal = process.env.QLB_PI_REHEARSAL;
-  const modeInput =
+  const base =
     rehearsal === "0"
       ? null
       : {
           rehearsal,
           owner: readOwnerFileState(OWNER_FILE),
-          journal: await qlbConsumeJournal(),
           // Written by `qlb consume enable`, removed by `disable`: a CLI-independent signal.
           marker: existsSync(consumeMarkerPath()),
         };
+  // Most Pi users never enabled QLB: decide without spawning the CLI.
+  const modeInput =
+    base && !canSkipJournal(base) ? { ...base, journal: await qlbConsumeJournal() } : null;
   const mode = modeInput ? decidePiMode(modeInput) : "inert";
   if (mode === "inert") {
     // Inert: QLB does not own Pi and consume is off. anthropic-pool keeps the anthropic provider.

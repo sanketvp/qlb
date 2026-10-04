@@ -2,6 +2,7 @@
 // unattributed `cswap-active`. Cache is status-only. Never binds a sequence slot.
 // Never submits a refresh token. Never writes Keychain.
 
+import { dirname, join } from 'node:path';
 import type { AccountSnapshot } from './types';
 import {
   fingerprintAccess,
@@ -21,6 +22,11 @@ export interface ConsumeReadOpts {
   runner?: SecurityRunner;
   env?: NodeJS.ProcessEnv;
   nowMs?: number;
+}
+
+/** `qlb consume enable` writes this beside the QLB database; qlb-pi mirrors it. */
+export function consumeMarkerPathFor(dbPath: string): string {
+  return join(dirname(dbPath), 'consume-anthropic.json');
 }
 
 export function isConsumedState(state: string | undefined | null): boolean {

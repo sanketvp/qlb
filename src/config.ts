@@ -119,9 +119,12 @@ export function resolveConfig(options: ResolveConfigOptions = {}): QlbConfig {
       result[field] = raw;
       continue;
     }
-    result[field] = field.endsWith('Path') || field.endsWith('File') || field.endsWith('Dir')
-      ? expandPath(raw, home)
-      : raw;
+    const isPath = field.endsWith('Path') || field.endsWith('File') || field.endsWith('Dir');
+    if (isPath && raw !== '~' && !raw.startsWith('~/') && !raw.startsWith('~\\') && !isAbsolute(raw)) {
+      // Resolved against this process's cwd; qlb-pi and other launchers may sit elsewhere.
+      warn(`qlb: ${meta.env}/${field} '${raw}' is relative and resolves to ${resolve(raw)}; use an absolute path`);
+    }
+    result[field] = isPath ? expandPath(raw, home) : raw;
   }
   return result;
 }

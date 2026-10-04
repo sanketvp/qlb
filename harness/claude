@@ -60,35 +60,47 @@ def qlb_argv() -> list[str]:
 PS_TIMEOUT_S = 5  # helpers ignore TERM, so every wait they make must be bounded
 
 
-def ps_field(pid: int, field: str) -> str:
+def ps_field(pid: int, field: str) -> Optional[str]:
+    """"" when ps reports no such process; None when ps itself could not answer."""
     try:
         out = subprocess.check_output(
-            ["ps", "-p", str(pid), "-o", f"{field}="],
+            [os.environ.get("QLB_PS_BIN") or "ps", "-p", str(pid), "-o", f"{field}="],
             text=True,
             stderr=subprocess.DEVNULL,
-            timeout=PS_TIMEOUT_S,
+            timeout=float(os.environ.get("QLB_PS_TIMEOUT_S") or PS_TIMEOUT_S),
         )
         return out.strip()
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+    except subprocess.CalledProcessError:
         return ""
+    except (subprocess.TimeoutExpired, OSError):
+        return None
 
 
-def process_lstart(pid: int) -> str:
+def process_lstart(pid: int) -> Optional[str]:
     return ps_field(pid, "lstart")
 
 
-def process_command(pid: int) -> str:
+def process_command(pid: int) -> Optional[str]:
     return ps_field(pid, "command")
 
 
-def identity_live(pid: int, stored: str) -> bool:
+def identity_state(pid: int, stored: str) -> str:
+    """'live' (same process), 'dead' (gone or pid reused), or 'unknown' (ps could not
+    answer). Callers treat 'unknown' as possibly alive: never reap, signal, or forget it."""
     try:
         os.kill(int(pid), 0)
     except (OSError, ValueError):
-        return False
+        return "dead"
     if not stored:
-        return False
-    return process_lstart(int(pid)) == stored
+        return "dead"
+    current = process_lstart(int(pid))
+    if current is None:
+        return "unknown"
+    return "live" if current == stored else "dead"
+
+
+def identity_live(pid: int, stored: str) -> bool:
+    return identity_state(pid, stored) == "live"
 
 
 def atomic_write(path: str, contents: str, mode: int = 0o600) -> None:
@@ -188,7 +200,10 @@ def reap_leases(home: str) -> bool:
             except OSError:
                 pass
             continue
-        if stored and process_lstart(pid) != stored:
+        current = process_lstart(pid) if stored else ""
+        if current is None:
+            continue  # ps could not answer: keep the lease, it may be live
+        if stored and current != stored:
             reused = True
             try:
                 os.unlink(path)
@@ -207,7 +222,7 @@ def live_leases(home: str) -> list[dict[str, Any]]:
             continue
         pid = row.get("pid")
         stored = row.get("lstart") or ""
-        if isinstance(pid, int) and identity_live(pid, stored if isinstance(stored, str) else ""):
+        if isinstance(pid, int) and identity_state(pid, stored if isinstance(stored, str) else "") != "dead":
             out.append(row)
     return out
 
@@ -230,10 +245,10 @@ def close_lock_fd() -> None:
 def wait_identity_dead(pid: int, stored: str, timeout_s: float) -> bool:
     deadline = time.time() + timeout_s
     while time.time() < deadline:
-        if not identity_live(pid, stored):
+        if identity_state(pid, stored) == "dead":
             return True
         time.sleep(0.05)
-    return not identity_live(pid, stored)
+    return identity_state(pid, stored) == "dead"
 
 
 def sigterm_proxy(info: dict[str, Any], info_path: str) -> bool:
@@ -246,9 +261,13 @@ def sigterm_proxy(info: dict[str, Any], info_path: str) -> bool:
     stored = stored if isinstance(stored, str) else ""
     if not isinstance(pid, int):
         return True
-    if not identity_live(pid, stored):
+    state = identity_state(pid, stored)
+    if state == "dead":
         return True
     cmd = process_command(pid)
+    if state == "unknown" or cmd is None:
+        sys.stderr.write(f"qlb wrapper: cannot confirm proxy pid {pid} identity (ps unavailable); keeping {info_path}\n")
+        return False
     if "proxy" not in cmd:
         return True
     try:
@@ -259,7 +278,7 @@ def sigterm_proxy(info: dict[str, Any], info_path: str) -> bool:
     if not dead:
         # SIGTERM awaits server.close(); an in-flight request can hold it open.
         # Re-check the same identity immediately before escalating.
-        if identity_live(pid, stored) and "proxy" in process_command(pid):
+        if identity_live(pid, stored) and "proxy" in (process_command(pid) or ""):
             print("PROXY_SIGKILL=1", flush=True)
             try:
                 os.kill(pid, signal.SIGKILL)
@@ -403,7 +422,7 @@ def maybe_shutdown_proxy(home: str, info_path: str) -> bool:
         return True
     pid = info.get("pid")
     stored = info.get("lstart") or ""
-    if not isinstance(pid, int) or not identity_live(pid, stored if isinstance(stored, str) else ""):
+    if not isinstance(pid, int):
         return True
     return sigterm_proxy(info, info_path)
 
@@ -430,7 +449,16 @@ def intercepted(argv: list[str]) -> int:
     port = int(os.environ.get("QLB_PROXY_PORT") or DEFAULT_PORT)
     session = str(uuid.uuid4())
     wrapper_pid = os.getpid()
-    wrapper_lstart = process_lstart(wrapper_pid)
+    wrapper_lstart = None
+    for _ in range(3):
+        wrapper_lstart = process_lstart(wrapper_pid)
+        if wrapper_lstart:
+            break
+        time.sleep(0.2)
+    if not wrapper_lstart:
+        # An empty start time would make this lease look dead and get reaped.
+        sys.stderr.write("qlb wrapper: cannot read this process's start time (ps unavailable)\n")
+        return 1
     script = os.path.abspath(sys.argv[0])
     mutex = os.path.join(os.path.dirname(script), "qlb-proxy-mutex")
     env = os.environ.copy()

@@ -13,6 +13,7 @@ import {
 } from '../src/cswap-native-read';
 import {
   activeCcSecurityArgs,
+  canSkipJournal,
   conflictMessage,
   consumeAccessSource,
   consumeMarkerPath,
@@ -151,6 +152,30 @@ describe('qlb-pi mode decision', () => {
     );
     assert.equal(
       conflictMessage({ rehearsal: undefined, owner: 'valid', journal: 'CONSUMED', marker: false }),
+      CONSUME_ERRORS.conflict,
+    );
+  });
+
+  it('skips the consume-status spawn only when nothing could be taken over', () => {
+    for (const rehearsal of [undefined, '0', '1']) {
+      for (const owner of ['absent', 'valid', 'malformed'] as const) {
+        for (const marker of [false, true]) {
+          const skip = canSkipJournal({ rehearsal, owner, marker });
+          assert.equal(skip, rehearsal === undefined && owner === 'absent' && !marker, `${rehearsal}/${owner}/${marker}`);
+          if (skip) {
+            // Whatever the journal says, a skipped spawn must agree with the full decision.
+            for (const journal of ['NATIVE', 'unknown'] as const) {
+              assert.equal(decidePiMode({ rehearsal, owner, journal, marker }), 'inert');
+            }
+          }
+        }
+      }
+    }
+  });
+
+  it('a malformed owner file is reported as the owner-file problem', () => {
+    assert.equal(
+      conflictMessage({ rehearsal: undefined, owner: 'malformed', journal: 'unknown', marker: false }),
       CONSUME_ERRORS.conflict,
     );
   });

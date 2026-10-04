@@ -281,6 +281,21 @@ describe('CLI smoke — documented commands', () => {
     assert.equal(JSON.parse(status.stdout).state, 'NATIVE');
   });
 
+  it('doctor flags a CONSUMED journal without its marker, and a stray marker', () => {
+    const env = isolatedEnv();
+    const marker = join(dirname(String(env.QLB_DB_PATH)), 'consume-anthropic.json');
+    assert.equal(runCli(['consume', 'enable', '--provider', 'anthropic', '--json'], env).status, 0);
+    const ok = JSON.parse(runCli(['doctor', '--json'], env).stdout) as { checks: Array<{ name: string; level: string }> };
+    assert.equal(ok.checks.find((c) => c.name === 'consume:marker')?.level, 'PASS');
+    unlinkSync(marker);
+    const missing = JSON.parse(runCli(['doctor', '--json'], env).stdout) as { checks: Array<{ name: string; level: string }> };
+    assert.equal(missing.checks.find((c) => c.name === 'consume:marker')?.level, 'FAIL');
+    assert.equal(runCli(['consume', 'disable', '--provider', 'anthropic', '--json'], env).status, 0);
+    writeFileSync(marker, '{"state":"CONSUMED"}\n');
+    const stray = JSON.parse(runCli(['doctor', '--json'], env).stdout) as { checks: Array<{ name: string; level: string }> };
+    assert.equal(stray.checks.find((c) => c.name === 'consume:marker')?.level, 'WARN');
+  });
+
   it('consume disable fails loudly when the marker cannot be removed', () => {
     const env = isolatedEnv();
     assert.equal(runCli(['consume', 'enable', '--provider', 'anthropic', '--json'], env).status, 0);

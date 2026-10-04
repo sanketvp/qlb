@@ -85,3 +85,19 @@ describe('configuration precedence', () => {
     assert.equal(win.dbPath, join(home, 'win.db'));
   });
 });
+
+describe('relative path settings', () => {
+  it('warns that a relative QLB_DB_PATH depends on the current directory; absolute and ~ do not warn', () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-config-rel-'));
+    const warnings: string[] = [];
+    const warn = (m: string) => { warnings.push(m); };
+    const cfg = resolveConfig({ argv: [], env: { QLB_DB_PATH: 'data/qlb.db' }, home, warn });
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0]!, /QLB_DB_PATH\/dbPath 'data\/qlb\.db' is relative/);
+    assert.equal(cfg.dbPath, join(process.cwd(), 'data', 'qlb.db'));
+    warnings.length = 0;
+    resolveConfig({ argv: [], env: { QLB_DB_PATH: join(home, 'q.db'), QLB_PLUGINS_DIR: '~/plugins' }, home, warn });
+    resolveConfig({ argv: [], env: {}, home, warn });
+    assert.deepEqual(warnings, []);
+  });
+});

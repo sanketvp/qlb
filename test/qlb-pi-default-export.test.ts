@@ -61,15 +61,18 @@ function load(opts: {
 }
 
 describe('qlb-pi production default export (Pi jiti loader)', { skip: piAvailable ? false : 'global Pi install not found' }, () => {
-  it('inert when consume is off and no owner file: anthropic-pool untouched', () => {
-    const r = load({ states: 'NATIVE' });
+  it('inert when consume is off and no owner file: anthropic-pool untouched, no CLI spawn', () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-pi-smoke-nospawn-'));
+    const counter = join(home, 'qlb-calls');
+    const r = load({ states: 'NATIVE', env: { SMOKE_COUNTER: counter } });
     assert.deepEqual(r.calls, []);
     assert.equal(r.poolStillRegistered, true);
+    assert.equal(existsSync(counter), false, 'startup must not spawn qlb when no marker/owner file exists');
   });
 
   it('consume mode replaces the pool and re-checks the journal per request before any credential read', () => {
     // Load sees CONSUMED; the request sees NATIVE, so it must stop before the Keychain.
-    const r = load({ states: 'CONSUMED,NATIVE', call: true });
+    const r = load({ states: 'CONSUMED,NATIVE', call: true, marker: true }); // enable writes the marker
     assert.deepEqual(r.calls, ['unregister:anthropic', 'register:anthropic']);
     assert.equal(r.poolStillRegistered, false);
     assert.equal(r.events.length, 1);

@@ -75,6 +75,29 @@ function rootFromShimText(launcher: string): string | null {
   return null;
 }
 
+/**
+ * Fleet runtime selector (~/.pi/agent/bin/pi, reached via ~/.pi/agent/runtimes/bin):
+ * it execs "$RUNTIME_ROOT/node_modules/@earendil-works/pi-coding-agent" where
+ * RUNTIME_ROOT is the resolved ~/.pi/agent/runtimes/current. The variable can't be
+ * read from the text, so follow the selector symlink it names.
+ */
+function rootFromRuntimeSelector(launcher: string, home: string): string | null {
+  let text: string;
+  try {
+    text = readFileSync(launcher, 'utf8');
+  } catch {
+    return null;
+  }
+  if (!/runtimes\/current/.test(text) || !/node_modules\/@earendil-works\/pi-coding-agent/.test(text)) return null;
+  const candidate = join(home, '.pi', 'agent', 'runtimes', 'current', 'node_modules', '@earendil-works', 'pi-coding-agent');
+  try {
+    const real = realpathSync(candidate);
+    return isPiPackageRoot(real) ? real : null;
+  } catch {
+    return null;
+  }
+}
+
 function launcherNames(platform: NodeJS.Platform, env: NodeJS.ProcessEnv): string[] {
   if (platform !== 'win32') return ['pi'];
   // PowerShell model (the documented Windows workflow): pi.ps1 first (PowerShell
@@ -109,7 +132,7 @@ export function locatePi(
   const names = launcherNames(platform, env);
   for (const dir of pathEntries(platform, env)) {
     for (const name of names) {
-      const bin = join(dir, name);
+      const bin = resolve(dir, name); // absolute even for a '.' (cwd) PATH entry
       try {
         if (!statSync(bin).isFile()) continue; // a shell skips directories named pi
         accessSync(bin, platform === 'win32' ? fsConstants.F_OK : fsConstants.X_OK);
@@ -122,7 +145,7 @@ export function locatePi(
       } catch {
         root = null;
       }
-      root ??= rootFromShimText(bin);
+      root ??= rootFromShimText(bin) ?? rootFromRuntimeSelector(bin, home);
       return root ? { root, launcher: bin } : { root: null, launcher: bin, unresolved: true };
     }
   }
@@ -229,7 +252,7 @@ export function piIntegrationChecks(options: PiIntegrationOptions = {}): DoctorC
     const drift = readdirSync(src).filter((f) => f.endsWith('.ts') && f !== 'tsconfig.json')
       .filter((f) => readText(join(src, f)) !== readText(join(PI_EXT_DIR, f)));
     checks.push(drift.length === 0
-      ? { name: 'pi:extension', level: 'PASS', message: `~/.pi/agent/extensions/qlb-pi matches ${src} (pi ${piVersion} at ${PI_PKG})` }
+      ? { name: 'pi:extension', level: 'PASS', message: `${PI_EXT_DIR} matches ${src} (pi ${piVersion} at ${PI_PKG})` }
       : { name: 'pi:extension', level: 'WARN', message: `installed qlb-pi differs from source: ${drift.join(', ')}`, detail: { fix: `cp ${src}/*.ts ${PI_EXT_DIR}/` } });
   }
 
@@ -265,6 +288,13 @@ export function piIntegrationChecks(options: PiIntegrationOptions = {}): DoctorC
       run('npx', ['tsc', '-p', cfg, '--noEmit'], { cwd: repoRoot, timeoutMs: 120_000 });
       checks.push({ name: 'pi:typecheck', level: 'PASS', message: `qlb-pi typechecks against pi ${piVersion}` });
     } catch (err) {
+      if (!tmp) {
+        checks.push({
+          name: 'pi:typecheck', level: 'WARN',
+          message: `could not create a temporary directory for the typecheck: ${err instanceof Error ? err.message : String(err)}`,
+        });
+        return checks;
+      }
       const out = err instanceof Error && 'stdout' in err ? String((err as { stdout?: unknown }).stdout ?? '') : String(err);
       const first = out.split('\n').find((l) => /error TS\d+/.test(l)) ?? out.split('\n')[0];
       checks.push({
