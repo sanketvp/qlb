@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { describe, it } from 'node:test';
@@ -304,7 +304,17 @@ describe('CLI smoke — documented commands', () => {
       assert.equal(r.status, 1, `${args[0]}: ${r.stdout}`);
       assert.match(r.stderr, /not the database Pi uses/);
     }
-    // The environment-backed database (what Pi sees) still works.
+    // A relative QLB_DB_PATH is cwd-dependent: refused even though it matches here.
+    const relDir = `qlb-smoke-relative-${process.pid}`;
+    try {
+      const rel = runCli(['consume', 'enable', '--provider', 'anthropic', '--json'], { ...env, QLB_DB_PATH: `${relDir}/qlb.db` });
+      assert.equal(rel.status, 1, rel.stdout);
+      assert.match(rel.stderr, /is relative/);
+      assert.equal(existsSync(relDir), false, 'a refused target must not be created');
+    } finally {
+      rmSync(relDir, { recursive: true, force: true });
+    }
+    // The environment-backed absolute database (what Pi sees) still works.
     assert.equal(runCli(['consume', 'enable', '--provider', 'anthropic', '--json'], env).status, 0);
   });
 

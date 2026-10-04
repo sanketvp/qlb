@@ -1391,22 +1391,37 @@ function isPortListening(port: number, host = '127.0.0.1'): Promise<boolean> {
 }
 
 
+/**
+ * qlb-pi finds the database (and the marker beside it) only through the environment
+ * and config.json, resolved in its own working directory. Enabling consume on any
+ * other database — a one-off --db/--db-path/--config, or a relative path — would
+ * leave Pi on anthropic-pool. Returns the refusal reason, or null.
+ */
+function consumeTargetInvisibleToPi(dbPath: string): string | null {
+  const configWarnings: string[] = [];
+  const piVisibleDb = resolve(resolveConfig({ argv: [], warn: (m) => { configWarnings.push(m); } }).dbPath);
+  const relative = configWarnings.find((m) => /\/dbPath '|QLB_CONFIG_PATH\/--config '/.test(m));
+  if (relative) return `${relative.replace(/^qlb: /, '')} (Pi may start from another directory)`;
+  if (resolve(dbPath) !== piVisibleDb) {
+    return `${dbPath} is not the database Pi uses (${piVisibleDb}). ` +
+      'Set QLB_DB_PATH in the environment Pi runs with (or dbPath in ~/.qlb/config.json) instead of a one-off flag.';
+  }
+  return null;
+}
+
 async function runConsume(opts: ConsumeOpts): Promise<number> {
+  if (opts.sub === 'enable') {
+    // Checked before the store is opened, so a refused target is never created.
+    const refusal = consumeTargetInvisibleToPi(opts.db ?? config.dbPath);
+    if (refusal) {
+      console.error(`qlb consume enable: refusing — ${refusal}`);
+      return 1;
+    }
+  }
   return withStore(opts.db, async (store) => {
     const dbPath = opts.db ?? config.dbPath;
     const marker = consumeMarkerPathFor(dbPath);
     if (opts.sub === 'enable') {
-      // qlb-pi finds the database (and the marker beside it) only through the
-      // environment and config.json; a one-off --db/--db-path/--config is invisible
-      // to it, so enabling there would leave Pi on anthropic-pool.
-      const piVisibleDb = resolve(resolveConfig({ argv: [], warn: () => undefined }).dbPath);
-      if (resolve(dbPath) !== piVisibleDb) {
-        console.error(
-          `qlb consume enable: refusing — ${dbPath} is not the database Pi uses (${piVisibleDb}). ` +
-            'Set QLB_DB_PATH in the environment Pi runs with (or dbPath in ~/.qlb/config.json) instead of a one-off flag.',
-        );
-        return 1;
-      }
       const piPool = store.getMigration(PI_POOL_STORE)?.state;
       if ((piPool && PI_POOL_OWNING_STATES.has(piPool)) || existsSync(defaultOwnerFileFor('anthropic'))) {
         console.error(
