@@ -296,6 +296,18 @@ describe('CLI smoke — documented commands', () => {
     assert.equal(stray.checks.find((c) => c.name === 'consume:marker')?.level, 'WARN');
   });
 
+  it('consume enable refuses a one-off database Pi cannot discover', () => {
+    const env = isolatedEnv();
+    const other = join(mkdtempSync(join(tmpdir(), 'qlb-smoke-otherdb-')), 'qlb.db');
+    for (const args of [['--db', other], ['--db-path', other]]) {
+      const r = runCli(['consume', 'enable', '--provider', 'anthropic', ...args, '--json'], env);
+      assert.equal(r.status, 1, `${args[0]}: ${r.stdout}`);
+      assert.match(r.stderr, /not the database Pi uses/);
+    }
+    // The environment-backed database (what Pi sees) still works.
+    assert.equal(runCli(['consume', 'enable', '--provider', 'anthropic', '--json'], env).status, 0);
+  });
+
   it('consume disable fails loudly when the marker cannot be removed', () => {
     const env = isolatedEnv();
     assert.equal(runCli(['consume', 'enable', '--provider', 'anthropic', '--json'], env).status, 0);

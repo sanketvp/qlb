@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 import { existsSync, mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import * as net from 'node:net';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { adapters } from './adapters';
 import { createDefaultCodexGateDeps, runCodexGate } from './codex-gate';
-import { config, stripConfigArgs } from './config';
+import { config, resolveConfig, stripConfigArgs } from './config';
 import { doctorQlb, initializeQlb, type DoctorReport, type InitReport } from './diagnostics';
 import { platformKeychain } from './keychain';
 import { createOwnedCredentialSource } from './credentials';
@@ -1396,6 +1396,17 @@ async function runConsume(opts: ConsumeOpts): Promise<number> {
     const dbPath = opts.db ?? config.dbPath;
     const marker = consumeMarkerPathFor(dbPath);
     if (opts.sub === 'enable') {
+      // qlb-pi finds the database (and the marker beside it) only through the
+      // environment and config.json; a one-off --db/--db-path/--config is invisible
+      // to it, so enabling there would leave Pi on anthropic-pool.
+      const piVisibleDb = resolve(resolveConfig({ argv: [], warn: () => undefined }).dbPath);
+      if (resolve(dbPath) !== piVisibleDb) {
+        console.error(
+          `qlb consume enable: refusing — ${dbPath} is not the database Pi uses (${piVisibleDb}). ` +
+            'Set QLB_DB_PATH in the environment Pi runs with (or dbPath in ~/.qlb/config.json) instead of a one-off flag.',
+        );
+        return 1;
+      }
       const piPool = store.getMigration(PI_POOL_STORE)?.state;
       if ((piPool && PI_POOL_OWNING_STATES.has(piPool)) || existsSync(defaultOwnerFileFor('anthropic'))) {
         console.error(
