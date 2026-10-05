@@ -120,6 +120,39 @@ describe('hermes integration checks', () => {
     assert.equal(checks.find((c) => c.name === 'hermes:config')?.level, 'FAIL');
   });
 
+  it('still fails hermes:config when config.yaml exists but cannot be read', () => {
+    // A directory at the config path: readFileSync throws EISDIR, as it would for EACCES.
+    const checks = checksFor('unreadable-config', (_home, hermesHome) => {
+      mkdirSync(join(hermesHome, 'config.yaml'));
+    });
+    assert.equal(checks.some((c) => c.name === 'hermes:integration'), false);
+    const config = checks.find((c) => c.name === 'hermes:config');
+    assert.equal(config?.level, 'FAIL');
+    assert.match(config?.message ?? '', /cannot read/);
+  });
+
+  it('treats a config that mentions QLB only in comments as off', () => {
+    const checks = checksFor('comment-only', (_home, hermesHome) => {
+      writeFileSync(
+        join(hermesHome, 'config.yaml'),
+        '# previously routed through qlb-anthropic\nmodel:\n  provider: anthropic  # was custom:qlb-anthropic\n',
+      );
+    });
+    assert.deepEqual(checks.map((c) => [c.name, c.level]), [['hermes:integration', 'WARN']]);
+  });
+
+  it('recognises QLB provider settings but not incidental mentions', () => {
+    const { yamlNamesQlbProvider } = require(MODULE) as { yamlNamesQlbProvider: (yaml: string) => boolean };
+    assert.equal(yamlNamesQlbProvider('providers:\n  qlb-anthropic:\n    api: x\n'), true);
+    assert.equal(yamlNamesQlbProvider('providers:\n  qlb-codex: {}\n'), true);
+    assert.equal(yamlNamesQlbProvider('providers: {qlb-anthropic: {}}\n'), true);
+    assert.equal(yamlNamesQlbProvider('providers:\n  "qlb-codex":\n    api: x\n'), true);
+    assert.equal(yamlNamesQlbProvider('model:\n  provider: custom:qlb-anthropic\n'), true);
+    assert.equal(yamlNamesQlbProvider('# qlb-anthropic: old\nmodel:\n  provider: anthropic\n'), false);
+    assert.equal(yamlNamesQlbProvider('model:\n  provider: anthropic # custom:qlb-codex\n'), false);
+    assert.equal(yamlNamesQlbProvider('notes:\n  last: removed the qlb-anthropic route\n'), false);
+  });
+
   it('runs the full checks when only the proxy supervisor plist remains, under a custom label', () => {
     const label = 'com.example.qlb-proxy';
     const checks = checksFor('custom-label', (home, hermesHome) => {

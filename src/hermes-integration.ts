@@ -61,6 +61,17 @@ function readText(path: string): string | null {
   try { return readFileSync(path, 'utf8'); } catch { return null; }
 }
 
+/**
+ * Whether the Hermes config names a QLB provider as a setting: a `qlb-anthropic:` /
+ * `qlb-codex:` key (block or flow style, any body) or a `provider: custom:qlb-…` route.
+ * Comments and unrelated values that merely contain the name do not count.
+ */
+export function yamlNamesQlbProvider(yaml: string): boolean {
+  const text = yaml.split('\n').map((line) => line.replace(/(^|\s)#.*$/, '')).join('\n');
+  return /(?:^|[\s{,])["']?qlb-(?:anthropic|codex)["']?\s*:/m.test(text)
+    || /^\s*provider:\s*["']?custom:qlb-(?:anthropic|codex)\b/m.test(text);
+}
+
 export function hermesIntegrationChecks(options: HermesIntegrationOptions = {}): DoctorCheck[] {
   const run = options.run ?? defaultRun;
   const checks: DoctorCheck[] = [];
@@ -80,9 +91,10 @@ export function hermesIntegrationChecks(options: HermesIntegrationOptions = {}):
   // "off" means no trace at all: the config (if there is one) never names a QLB provider — not
   // as a providers: entry of any shape, valid or not, and not as a leftover model.provider
   // route — and neither the plugin directory nor the proxy supervisor exists. Any trace keeps
-  // the full checks, which report what is missing.
-  const configNamesQlb = /qlb-(?:anthropic|codex)/.test(cfg ?? '');
-  const integrationAbsent = !configNamesQlb && !existsSync(PLUGIN_DIR) && !existsSync(LAUNCHD_PLIST);
+  // the full checks, which report what is missing. A config that exists but cannot be read is
+  // not "off" either: it falls through to hermes:config FAIL.
+  const configHasQlbTrace = cfg == null ? existsSync(HERMES_CONFIG) : yamlNamesQlbProvider(cfg);
+  const integrationAbsent = !configHasQlbTrace && !existsSync(PLUGIN_DIR) && !existsSync(LAUNCHD_PLIST);
   if (integrationAbsent) {
     checks.push({
       name: 'hermes:integration', level: 'WARN',
