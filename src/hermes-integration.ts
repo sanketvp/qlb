@@ -12,6 +12,7 @@ import { existsSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { DoctorCheck } from './diagnostics';
+import { HERMES_LAUNCHD_LABEL } from './setup-hermes';
 
 const HERMES_HOME = process.env.HERMES_HOME ?? join(homedir(), '.hermes');
 const HERMES_CHECKOUT = join(HERMES_HOME, 'hermes-agent');
@@ -19,7 +20,8 @@ const HERMES_CONFIG = join(HERMES_HOME, 'config.yaml');
 const HERMES_PYTHON = join(HERMES_CHECKOUT, 'venv', 'bin', 'python');
 const PLUGIN_DIR = join(HERMES_HOME, 'plugins', 'model-providers', 'qlb');
 const PLUGIN_STATUS = process.env.QLB_HERMES_PLUGIN_STATUS ?? join(homedir(), '.qlb', 'hermes-plugin.json');
-const LAUNCHD_PLIST = join(homedir(), 'Library', 'LaunchAgents', 'com.sanket.qlb-proxy.plist');
+// Same label `qlb setup hermes` writes the agent under (QLB_LAUNCHD_LABEL overrides it).
+const LAUNCHD_PLIST = join(homedir(), 'Library', 'LaunchAgents', `${HERMES_LAUNCHD_LABEL}.plist`);
 
 /** Hermes seams QLB depends on: (python module, symbol, expected parameter names or null). */
 const HERMES_SEAMS: Array<{ module: string; symbol: string; params: string[] | null; why: string }> = [
@@ -59,6 +61,17 @@ function readText(path: string): string | null {
   try { return readFileSync(path, 'utf8'); } catch { return null; }
 }
 
+/**
+ * Whether the Hermes config names a QLB provider as a setting: a `qlb-anthropic:` /
+ * `qlb-codex:` key (block or flow style, any body) or a `provider: custom:qlb-…` route.
+ * Comments and unrelated values that merely contain the name do not count.
+ */
+export function yamlNamesQlbProvider(yaml: string): boolean {
+  const text = yaml.split('\n').map((line) => line.replace(/(^|\s)#.*$/, '')).join('\n');
+  return /(?:^|[\s{,])["']?qlb-(?:anthropic|codex)["']?\s*:/m.test(text)
+    || /^\s*provider:\s*["']?custom:qlb-(?:anthropic|codex)\b/m.test(text);
+}
+
 export function hermesIntegrationChecks(options: HermesIntegrationOptions = {}): DoctorCheck[] {
   const run = options.run ?? defaultRun;
   const checks: DoctorCheck[] = [];
@@ -73,12 +86,15 @@ export function hermesIntegrationChecks(options: HermesIntegrationOptions = {}):
   const anthropicBlock = /\n\s{2}qlb-anthropic:\n((?:\s{4}.*\n)+)/.exec(cfg ?? '')?.[1] ?? '';
   const codexBlock = /\n\s{2}qlb-codex:\n((?:\s{4}.*\n)+)/.exec(cfg ?? '')?.[1] ?? '';
 
-  // Hermes is installed but QLB was never wired into it (or was deliberately unwired): no
-  // provider entries, no plugin, no proxy supervisor. That is "off", not "broken" — the checks
-  // below exist to catch an integration that lost a piece, so any one artifact present still
-  // runs them and FAILs on whatever is missing.
-  const integrationAbsent = cfg != null && !anthropicBlock && !codexBlock
-    && !existsSync(PLUGIN_DIR) && !existsSync(LAUNCHD_PLIST);
+  // Hermes is installed but QLB was never wired into it (or was deliberately unwired). That is
+  // "off", not "broken". The checks below exist to catch an integration that lost a piece, so
+  // "off" means no trace at all: the config (if there is one) never names a QLB provider — not
+  // as a providers: entry of any shape, valid or not, and not as a leftover model.provider
+  // route — and neither the plugin directory nor the proxy supervisor exists. Any trace keeps
+  // the full checks, which report what is missing. A config that exists but cannot be read is
+  // not "off" either: it falls through to hermes:config FAIL.
+  const configHasQlbTrace = cfg == null ? existsSync(HERMES_CONFIG) : yamlNamesQlbProvider(cfg);
+  const integrationAbsent = !configHasQlbTrace && !existsSync(PLUGIN_DIR) && !existsSync(LAUNCHD_PLIST);
   if (integrationAbsent) {
     checks.push({
       name: 'hermes:integration', level: 'WARN',
