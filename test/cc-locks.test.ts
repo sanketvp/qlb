@@ -1,10 +1,9 @@
 import assert from 'node:assert/strict';
-import { once } from 'node:events';
 import { existsSync } from 'node:fs';
 import { chmod, mkdtemp, mkdir, readdir, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { spawn } from 'node:child_process';
+import { join, resolve } from 'node:path';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { describe, it } from 'node:test';
 import {
   ClaudeCodeLockTimeout,
@@ -14,7 +13,12 @@ import {
   withProperLockfile,
 } from '../src/cc-locks';
 
-const PYTHON = `${process.env.HOME}/.local/share/uv/tools/claude-swap/bin/python`;
+const PYTHON = 'python3';
+const CSWAP_V028_SOURCE = resolve(__dirname, '../../test/oracle/claude-swap-v0.28.0/src');
+const CHILD_TIMEOUT_MS = 10_000;
+
+type ChildOutput = { stdout: string; stderr: string };
+type SpawnedPython = { child: ChildProcess; output: ChildOutput };
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -24,30 +28,140 @@ async function tempHome(): Promise<string> {
   return mkdtemp(join(tmpdir(), 'qlb-cc-locks-'));
 }
 
-async function waitFor(predicate: () => boolean, timeoutMs = 1_000): Promise<void> {
+async function waitFor(predicate: () => boolean, timeoutMs = 1_000, description = 'lock state'): Promise<void> {
   const started = Date.now();
   while (!predicate()) {
-    if (Date.now() - started > timeoutMs) throw new Error('timed out waiting for lock state');
+    if (Date.now() - started > timeoutMs) throw new Error(`timed out waiting for ${description} within ${timeoutMs}ms`);
     await sleep(5);
   }
 }
 
-async function pythonHolder(home: string, seconds: number): Promise<ReturnType<typeof spawn>> {
-  const script = [
-    'import os, sys, time',
+function outputSummary(output: ChildOutput): string {
+  const text = [output.stdout, output.stderr].filter(Boolean).join('\n').trim();
+  return text ? ` Output: ${text.slice(0, 1_000)}` : '';
+}
+
+function captureChildOutput(child: ChildProcess): ChildOutput {
+  if (!child.stdout || !child.stderr) throw new Error('vendored C-swap child must have piped output');
+  const output = { stdout: '', stderr: '' };
+  child.stdout.setEncoding('utf8');
+  child.stderr.setEncoding('utf8');
+  child.stdout.on('data', (data: string) => { output.stdout += data; });
+  child.stderr.on('data', (data: string) => { output.stderr += data; });
+  return output;
+}
+
+function waitForChildExit(
+  child: ChildProcess,
+  output: ChildOutput,
+  description: string,
+): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return Promise.resolve({ code: child.exitCode, signal: child.signalCode });
+  }
+  return new Promise((resolveExit, rejectExit) => {
+    const cleanup = () => {
+      clearTimeout(timeout);
+      child.off('exit', onExit);
+      child.off('error', onError);
+    };
+    const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+      cleanup();
+      resolveExit({ code, signal });
+    };
+    const onError = (error: Error) => {
+      cleanup();
+      rejectExit(new Error(`${description} failed: ${error.message}${outputSummary(output)}`));
+    };
+    const timeout = setTimeout(() => {
+      cleanup();
+      child.kill('SIGKILL');
+      rejectExit(new Error(`${description} did not exit within ${CHILD_TIMEOUT_MS}ms; killed it.${outputSummary(output)}`));
+    }, CHILD_TIMEOUT_MS);
+    child.once('exit', onExit);
+    child.once('error', onError);
+  });
+}
+
+function waitForOutput(child: ChildProcess, output: ChildOutput, marker: string, description: string): Promise<void> {
+  if (output.stdout.includes(marker)) return Promise.resolve();
+  return new Promise((resolveOutput, rejectOutput) => {
+    const cleanup = () => {
+      clearTimeout(timeout);
+      child.stdout?.off('data', onData);
+      child.off('exit', onExit);
+      child.off('error', onError);
+    };
+    const onData = () => {
+      if (!output.stdout.includes(marker)) return;
+      cleanup();
+      resolveOutput();
+    };
+    const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+      cleanup();
+      rejectOutput(new Error(`${description} exited before ${marker} (code ${code}, signal ${signal}).${outputSummary(output)}`));
+    };
+    const onError = (error: Error) => {
+      cleanup();
+      rejectOutput(new Error(`${description} failed before ${marker}: ${error.message}${outputSummary(output)}`));
+    };
+    const timeout = setTimeout(() => {
+      cleanup();
+      child.kill('SIGKILL');
+      rejectOutput(new Error(`${description} did not print ${marker} within ${CHILD_TIMEOUT_MS}ms; killed it.${outputSummary(output)}`));
+    }, CHILD_TIMEOUT_MS);
+    child.stdout?.on('data', onData);
+    child.once('exit', onExit);
+    child.once('error', onError);
+  });
+}
+
+async function terminateChild(child: ChildProcess | undefined, output: ChildOutput | undefined, description: string): Promise<void> {
+  if (!child || child.exitCode !== null || child.signalCode !== null) return;
+  child.kill('SIGKILL');
+  await waitForChildExit(child, output ?? { stdout: '', stderr: '' }, `${description} cleanup`);
+}
+
+function spawnVendoredPython(home: string, body: string): SpawnedPython {
+  const oracleProgram = [
+    'import os, pathlib, sys, tempfile',
     `os.environ["HOME"] = ${JSON.stringify(home)}`,
     `os.environ["CLAUDE_CONFIG_DIR"] = ${JSON.stringify(join(home, '.claude'))}`,
+    `source = ${JSON.stringify(CSWAP_V028_SOURCE)}`,
+    'with tempfile.TemporaryDirectory() as temp:',
+    '    metadata = pathlib.Path(temp) / "claude_swap-0.28.0.dist-info"',
+    '    metadata.mkdir()',
+    '    (metadata / "METADATA").write_text("Metadata-Version: 2.1\\nName: claude-swap\\nVersion: 0.28.0\\n")',
+    '    sys.path[:0] = [source, temp]',
+    ...body.split('\n').map((line) => `    ${line}`),
+  ].join('\n');
+  const program = [
+    'import os, subprocess, sys',
+    'if sys.version_info < (3, 12):',
+    '    found = subprocess.run(["uv", "python", "find", "3.12"], capture_output=True, check=False, text=True).stdout.strip()',
+    '    if not found: raise RuntimeError("vendored claude-swap v0.28.0 requires Python 3.12 or newer")',
+    `    os.execv(found, [found, '-I', '-B', '-c', ${JSON.stringify(oracleProgram)}])`,
+    `exec(${JSON.stringify(oracleProgram)})`,
+  ].join('\n');
+  const child = spawn(PYTHON, ['-I', '-B', '-c', program], { stdio: ['ignore', 'pipe', 'pipe'] });
+  return { child, output: captureChildOutput(child) };
+}
+
+async function pythonHolder(home: string, seconds: number): Promise<SpawnedPython> {
+  const spawned = spawnVendoredPython(home, [
+    'import time',
     'from claude_swap.claude_locks import claude_credentials_lock',
     'with claude_credentials_lock(timeout=2):',
-    ' print("READY", flush=True)',
-    ` time.sleep(${seconds})`,
-  ].join('\n');
-  const child = spawn(PYTHON, ['-I', '-c', script], { stdio: ['ignore', 'pipe', 'pipe'] });
-  let output = '';
-  child.stdout.setEncoding('utf8');
-  child.stdout.on('data', (data: string) => { output += data; });
-  await waitFor(() => output.includes('READY'));
-  return child;
+    '    print("READY", flush=True)',
+    `    time.sleep(${seconds})`,
+  ].join('\n'));
+  try {
+    await waitForOutput(spawned.child, spawned.output, 'READY', 'vendored C-swap holder');
+    return spawned;
+  } catch (error) {
+    await terminateChild(spawned.child, spawned.output, 'vendored C-swap holder');
+    throw error;
+  }
 }
 
 describe('Claude Code proper-lockfile locks', () => {
@@ -320,36 +434,48 @@ describe('Claude Code proper-lockfile locks', () => {
     }
   });
 
-  it('blocks behind C-swap and blocks C-swap in return', { skip: !existsSync(PYTHON) ? 'C-swap Python is not installed' : false }, async () => {
+  it('blocks behind vendored C-swap v0.28.0 and blocks it in return', async () => {
+    assert.equal(existsSync(CSWAP_V028_SOURCE), true, `missing vendored oracle at ${CSWAP_V028_SOURCE}`);
     const home = await tempHome();
+    let holder: SpawnedPython | undefined;
+    let waiter: SpawnedPython | undefined;
+    let release: (() => void) | undefined;
     try {
-      const holder = await pythonHolder(home, 0.25);
+      holder = await pythonHolder(home, 0.25);
       const started = Date.now();
       await withClaudeCredentialLocks({ home, env: {}, timeoutMs: 2_000, retryMinMs: 5, retryJitterMs: 0 }, async () => {});
-      assert.ok(Date.now() - started >= 150, 'QLB waited for the C-swap holder');
-      await once(holder, 'exit');
+      assert.ok(Date.now() - started >= 150, 'QLB waited for the vendored C-swap holder');
+      const holderExit = await waitForChildExit(holder.child, holder.output, 'vendored C-swap holder');
+      assert.equal(holderExit.code, 0, outputSummary(holder.output));
 
-      let release!: () => void;
       const held = new Promise<void>((resolve) => { release = resolve; });
       const qlb = withClaudeCredentialLocks({ home, env: {}, timeoutMs: 2_000 }, async () => { await held; });
-      const child = spawn(PYTHON, ['-I', '-c', [
-        'import os, time',
-        `os.environ["HOME"] = ${JSON.stringify(home)}`,
-        `os.environ["CLAUDE_CONFIG_DIR"] = ${JSON.stringify(join(home, '.claude'))}`,
+      await waitFor(() =>
+        existsSync(join(home, '.claude', '.oauth_refresh.lock')) && existsSync(join(home, '.claude.lock')),
+      );
+      waiter = spawnVendoredPython(home, [
+        'import threading, time',
         'from claude_swap.claude_locks import claude_credentials_lock',
         'started = time.monotonic()',
-        'with claude_credentials_lock(timeout=2): print(time.monotonic() - started, flush=True)',
-      ].join('\n')], { stdio: ['ignore', 'pipe', 'pipe'] });
-      child.stdout.setEncoding('utf8');
-      let out = '';
-      child.stdout.on('data', (data: string) => { out += data; });
-      await sleep(180);
-      release();
+        'acquired = threading.Event()',
+        'def confirm_contention():',
+        '    if not acquired.wait(0.15): print("STILL_WAITING", flush=True)',
+        'threading.Thread(target=confirm_contention, daemon=True).start()',
+        'with claude_credentials_lock(timeout=2):',
+        '    acquired.set()',
+        '    print(f"ACQUIRED {time.monotonic() - started}", flush=True)',
+      ].join('\n'));
+      await waitForOutput(waiter.child, waiter.output, 'STILL_WAITING', 'vendored C-swap waiter to confirm contention');
+      release?.();
       await qlb;
-      const [code] = await once(child, 'exit') as [number | null];
-      assert.equal(code, 0);
-      assert.ok(Number.parseFloat(out) >= 0.15, `C-swap should wait, got ${out}`);
+      const waiterExit = await waitForChildExit(waiter.child, waiter.output, 'vendored C-swap waiter');
+      assert.equal(waiterExit.code, 0, outputSummary(waiter.output));
+      const waited = /^ACQUIRED ([\d.]+)$/m.exec(waiter.output.stdout)?.[1];
+      assert.ok(waited && Number.parseFloat(waited) >= 0.15, `vendored C-swap should wait, got ${waiter.output.stdout}`);
     } finally {
+      release?.();
+      await terminateChild(holder?.child, holder?.output, 'vendored C-swap holder');
+      await terminateChild(waiter?.child, waiter?.output, 'vendored C-swap waiter');
       await rm(home, { recursive: true, force: true });
     }
   });
