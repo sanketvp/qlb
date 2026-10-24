@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { basename, dirname, isAbsolute } from 'node:path';
 import { consumeMarkerPathFor, CSWAP_ANTHROPIC_STORE } from './cswap-consume';
 import { DatabaseSync } from 'node:sqlite';
 
@@ -66,16 +66,22 @@ export interface DoctorReport {
 }
 
 type CommandRunner = (command: string, args: string[]) => string;
+type HostCommandRunner = (
+  command: string,
+  args: string[],
+  options?: { env: NodeJS.ProcessEnv },
+) => string;
 
 const runCommand: CommandRunner = (command, args) =>
   execFileSync(command, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
 
 /** A bounded runner for host probes; never return login-shell environment output. */
-const runHostCommand: CommandRunner = (command, args) =>
+const runHostCommand: HostCommandRunner = (command, args, options) =>
   execFileSync(command, args, {
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'ignore'],
     timeout: 5_000,
+    env: options?.env,
   });
 
 const HOST_ENVIRONMENT_VARIABLES = [
@@ -276,22 +282,58 @@ function probeHostTool(command: CommandRunner, name: 'herdr' | 'orca'): string {
   try {
     const version = command(name, ['--version']).trim();
     return version || 'installed (version unavailable)';
-  } catch {
-    return 'not installed';
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'ENOENT'
+      ? 'not installed'
+      : 'installed (version probe failed)';
   }
+}
+
+function minimalLoginShellEnvironment(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { PATH: '/usr/bin:/bin:/usr/sbin:/sbin' };
+  for (const name of ['HOME', 'USER', 'LOGNAME', 'SHELL', 'TERM', 'TMPDIR'] as const) {
+    if (process.env[name] !== undefined) env[name] = process.env[name];
+  }
+  return env;
+}
+
+function selectLoginShell(shell: string | undefined, shellExists: (path: string) => boolean): string | null {
+  if (shell && isAbsolute(shell) && ['zsh', 'bash', 'sh'].includes(basename(shell)) && shellExists(shell)) {
+    return shell;
+  }
+  return shellExists('/bin/zsh') ? '/bin/zsh' : null;
 }
 
 /**
  * Detect host-level overrides without retaining, displaying, or serializing values.
  * Orca and Herdr inherit this login-shell environment when launching their tools.
  */
-function probeHostEnvironment(command: CommandRunner): DoctorCheck {
+function probeHostEnvironment(
+  command: HostCommandRunner,
+  options: {
+    platform: NodeJS.Platform;
+    shell: string | undefined;
+    shellExists: (path: string) => boolean;
+  },
+): DoctorCheck {
   const detail = {
     herdr: probeHostTool(command, 'herdr'),
     orca: probeHostTool(command, 'orca'),
   };
+  const shell = options.platform === 'win32'
+    ? null
+    : selectLoginShell(options.shell, options.shellExists);
+  if (!shell) {
+    return {
+      name: 'hosts:env',
+      level: 'PASS',
+      message: 'hosts:env skipped: no POSIX login shell',
+      detail,
+    };
+  }
   try {
-    const environment = command('zsh', ['-lic', 'env']);
+    // -i retains the interactive rc-chain used by host-launched tools.
+    const environment = command(shell, ['-lic', 'env'], { env: minimalLoginShellEnvironment() });
     const setVariables = HOST_ENVIRONMENT_VARIABLES.filter((name) =>
       environment.split(/\r?\n/).some((line) => line.startsWith(`${name}=`)),
     );
@@ -375,7 +417,11 @@ export async function doctorQlb(
       accountId: string,
     ) => Promise<ResyncCredential | null>;
     /** Tests inject this bounded host command runner. */
-    hostCommand?: CommandRunner;
+    hostCommand?: HostCommandRunner;
+    /** Tests inject host process properties without mutating the real process. */
+    hostPlatform?: NodeJS.Platform;
+    hostShell?: string;
+    hostShellExists?: (path: string) => boolean;
   } = {},
 ): Promise<DoctorReport> {
   const checks: DoctorCheck[] = [];
@@ -454,7 +500,11 @@ export async function doctorQlb(
   }
 
   checks.push(probeCredentialStore(options.command));
-  checks.push(probeHostEnvironment(options.hostCommand ?? runHostCommand));
+  checks.push(probeHostEnvironment(options.hostCommand ?? runHostCommand, {
+    platform: options.hostPlatform ?? process.platform,
+    shell: options.hostShell ?? process.env.SHELL,
+    shellExists: options.hostShellExists ?? existsSync,
+  }));
 
   const owned = migrations.filter((m) => m.state === 'QLB_OWNED' || m.state === 'RETIRED');
   if (owned.length > 0 && accounts.length > 0) {

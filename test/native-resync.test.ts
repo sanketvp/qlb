@@ -464,6 +464,7 @@ describe('openai-codex JWT credential parsing', () => {
 
     const report = await doctorQlb(cfg, {
       command: () => 'ok',
+      hostCommand: () => '',
       keychain: kc,
       readNativeCredential: async () => parseResyncCredential(cred),
     });
@@ -493,6 +494,7 @@ describe('qlb doctor native-sync checks', () => {
     );
     const report = await doctorQlb(cfg, {
       command: () => 'ok',
+      hostCommand: () => '',
       keychain: kc,
       readNativeCredential: async () => grant('native-copy'),
     });

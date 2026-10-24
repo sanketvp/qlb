@@ -19,6 +19,7 @@ async function doctorReport(
   store.close();
   return doctorQlb(config, {
     command: (_command, args) => args[0] === 'list-keychains' ? 'ok' : '',
+    hostCommand: () => '',
   });
 }
 
@@ -113,7 +114,7 @@ describe('qlb doctor', () => {
     mkdirSync(join(home, '.qlb'), { recursive: true });
     writeFileSync(config.dbPath, 'not sqlite');
 
-    const report = await doctorQlb(config, { command: () => 'ok' });
+    const report = await doctorQlb(config, { command: () => 'ok', hostCommand: () => '' });
     assert.equal(report.overall, 'FAIL');
     assert.equal(report.checks.find((check) => check.name === 'sqlite')?.level, 'FAIL');
   });
