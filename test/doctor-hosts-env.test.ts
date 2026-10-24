@@ -51,6 +51,15 @@ describe('qlb doctor hosts:env', () => {
     assert.doesNotMatch(JSON.stringify(check), new RegExp(secret));
   });
 
+  it('WARNs for ANTHROPIC_AUTH_TOKEN without exposing its value', async () => {
+    const secret = 'must-not-appear-in-doctor-output';
+    const check = await hostsCheck(fakeRunner(`ANTHROPIC_AUTH_TOKEN=${secret}\nPATH=/usr/bin\n`));
+
+    assert.equal(check.level, 'WARN');
+    assert.match(check.message, /ANTHROPIC_AUTH_TOKEN/);
+    assert.doesNotMatch(JSON.stringify(check), new RegExp(secret));
+  });
+
   it('WARNs when the login shell environment cannot be read', async () => {
     const check = await hostsCheck((command, args) => {
       if (command === 'zsh' && args[0] === '-lic' && args[1] === 'env') {
