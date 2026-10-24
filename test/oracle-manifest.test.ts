@@ -100,6 +100,20 @@ describe('claude-swap v0.28.0 oracle provenance', () => {
     assert.match(result.stdout, /^0 missing\n$/);
   });
 
+  it('accepts a header rendered from the canonical ported-module template', () => {
+    const template = readFileSync(join(ROOT, 'docs', 'templates', 'ported-module-header.txt'), 'utf8');
+    const rendered = template.replace(
+      'src/claude_swap/<path>.py:<first>-<last>',
+      'src/claude_swap/fsutil.py:134-246',
+    );
+    assert.ok(readFileSync(join(ROOT, 'src', 'fsutil.ts'), 'utf8').startsWith(rendered));
+
+    const result = spawnSync(process.execPath, [join(ROOT, 'scripts', 'check-ported-headers.mjs')], {
+      encoding: 'utf8',
+    });
+    assert.equal(result.status, 0, result.stderr);
+  });
+
   it('contains parseable JSON goldens only', () => {
     const goldenFiles = filesBelow(GOLDENS).filter((path) => path.endsWith('.json'));
     assert.ok(goldenFiles.length > 0, 'expected committed oracle goldens');

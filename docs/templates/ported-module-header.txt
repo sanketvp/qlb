@@ -1,6 +1,6 @@
 /*
  * Ported from claude-swap 0.28.0.
- * Upstream file(s): src/claude_swap/<path>.py:<first>-<last>
- * License: MIT
+ * Upstream file(s): src/claude_swap/<path>.py:<first>-<last>.
+ * License: MIT.
  * Modified for QLB. See NOTICE.
  */
