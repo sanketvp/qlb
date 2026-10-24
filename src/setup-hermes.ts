@@ -59,6 +59,10 @@ function writeIfChanged(path: string, content: string, mode?: number): HermesSet
   return { path, action: existed ? 'updated' : 'created' };
 }
 
+function escapeXml(value: string): string {
+  return value.replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' })[char]!);
+}
+
 function defaultQlbBin(): string {
   try {
     return execFileSync('/bin/sh', ['-lc', 'command -v qlb'], { encoding: 'utf8' }).trim() || 'qlb';
@@ -129,7 +133,7 @@ export function setupHermes(opts: HermesSetupOptions = {}): HermesSetupResult {
       const plistPath = join(home, 'Library', 'LaunchAgents', `${label}.plist`);
       const plist = mutate(readFileSync(join(tpl, template), 'utf8')
         .replaceAll('__HOME__', home)
-        .replaceAll('__LABEL__', label)
+        .replaceAll('__LABEL__', escapeXml(label))
         .replaceAll('__QLB_BIN__', qlbBin));
       const f = writeIfChanged(plistPath, plist);
       files.push(f);
@@ -146,7 +150,8 @@ export function setupHermes(opts: HermesSetupOptions = {}): HermesSetupResult {
     };
     launchd = installAgent(HERMES_LAUNCHD_LABEL, 'com.qlb.proxy.plist.template', (s) =>
       s.replace(/<string>--port<\/string><string>\d+<\/string>/, `<string>--port</string><string>${port}</string>`));
-    watch = installAgent(HERMES_WATCH_LABEL, 'com.qlb.hermes-watch.plist.template');
+    watch = installAgent(HERMES_WATCH_LABEL, 'com.qlb.hermes-watch.plist.template', (s) =>
+      s.replaceAll('__PROXY_LABEL__', escapeXml(HERMES_LAUNCHD_LABEL)));
   }
 
   // Sync the Hermes /model picker from QLB policies (skipped when hermes isn't on PATH or in tests).

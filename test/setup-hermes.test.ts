@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -6,6 +7,7 @@ import { describe, it, after } from 'node:test';
 import { setupHermes } from '../src/setup-hermes';
 
 const REPO_ROOT = join(__dirname, '..', '..');
+const SETUP_HERMES_MODULE = join(__dirname, '..', 'src', 'setup-hermes.js');
 
 describe('setup hermes', () => {
   const tmp = mkdtempSync(join(tmpdir(), 'qlb-setup-hermes-'));
@@ -37,6 +39,45 @@ describe('setup hermes', () => {
     assert.equal(third.files.find((f) => f.path === keyCmd)?.action, 'updated');
     assert.equal(third.files.filter((f) => f.action !== 'unchanged').length, 1);
     assert.equal(readFileSync(keyCmd, 'utf8'), readFileSync(join(REPO_ROOT, 'harness', 'hermes', 'qlb-proxy-token'), 'utf8'));
+  });
+
+  function watchPlistFor(name: string, env: NodeJS.ProcessEnv = {}): string {
+    const home = join(tmp, name);
+    const hermesHome = join(home, '.hermes');
+    const watchLabel = env.QLB_WATCH_LABEL ?? 'com.sanket.qlb-hermes-watch';
+    return execFileSync(
+      process.execPath,
+      ['-e', `
+        Object.defineProperty(process, 'platform', { value: 'darwin' });
+        const { setupHermes } = require(${JSON.stringify(SETUP_HERMES_MODULE)});
+        setupHermes({
+          home: ${JSON.stringify(home)},
+          hermesHome: ${JSON.stringify(hermesHome)},
+          repoRoot: ${JSON.stringify(REPO_ROOT)},
+          qlbBin: '/no-such-qlb',
+          run: () => '',
+        });
+        process.stdout.write(require('node:fs').readFileSync(${JSON.stringify(join(home, 'Library', 'LaunchAgents', `${watchLabel}.plist`))}, 'utf8'));
+      `],
+      { encoding: 'utf8', env: { ...process.env, ...env, QLB_BIN: '/no-such-qlb' } },
+    );
+  }
+
+  it('writes default proxy and watch labels into the watch agent environment', () => {
+    const plist = watchPlistFor('watch-default-labels');
+    assert.match(plist, /<key>QLB_LAUNCHD_LABEL<\/key><string>com\.sanket\.qlb-proxy<\/string>/);
+    assert.match(plist, /<key>QLB_WATCH_LABEL<\/key><string>com\.sanket\.qlb-hermes-watch<\/string>/);
+  });
+
+  it('writes a custom proxy label into the watch agent environment', () => {
+    const plist = watchPlistFor('watch-custom-proxy-label', { QLB_LAUNCHD_LABEL: 'com.example.proxy' });
+    assert.match(plist, /<key>QLB_LAUNCHD_LABEL<\/key><string>com\.example\.proxy<\/string>/);
+  });
+
+  it('XML-escapes custom watch labels in the watch plist', () => {
+    const plist = watchPlistFor('watch-escaped-label', { QLB_WATCH_LABEL: 'com.example&watch' });
+    assert.match(plist, /<key>Label<\/key><string>com\.example&amp;watch<\/string>/);
+    assert.match(plist, /<key>QLB_WATCH_LABEL<\/key><string>com\.example&amp;watch<\/string>/);
   });
 
   it('template plugin matches the tracked source of truth (harness/hermes)', () => {
