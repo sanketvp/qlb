@@ -246,14 +246,24 @@ export function piIntegrationChecks(options: PiIntegrationOptions = {}): DoctorC
   const piVersion = (() => { try { return (JSON.parse(readText(join(PI_PKG, 'package.json')) ?? '{}') as { version?: string }).version ?? '?'; } catch { return '?'; } })();
 
   // 1. Installed extension == tracked source (a QLB upgrade that touches extensions/qlb-pi must be re-synced).
+  // The copied-extension layout also needs the redactor at ~/.pi/agent/src/redact.ts:
+  // qlb-pi's ../../src/redact.js import resolves there.
   const repoRoot = findQlbRepoRoot();
   if (repoRoot) {
     const src = join(repoRoot, 'extensions', 'qlb-pi');
-    const drift = readdirSync(src).filter((f) => f.endsWith('.ts') && f !== 'tsconfig.json')
-      .filter((f) => readText(join(src, f)) !== readText(join(PI_EXT_DIR, f)));
+    const installedRedact = join(PI_EXT_DIR, '..', '..', 'src', 'redact.ts');
+    const drift = [
+      ...readdirSync(src).filter((f) => f.endsWith('.ts') && f !== 'tsconfig.json')
+        .filter((f) => readText(join(src, f)) !== readText(join(PI_EXT_DIR, f))),
+      ...(readText(join(repoRoot, 'src', 'redact.ts')) === readText(installedRedact) ? [] : ['src/redact.ts']),
+    ];
+    const redactDir = join(PI_EXT_DIR, '..', '..', 'src');
     checks.push(drift.length === 0
       ? { name: 'pi:extension', level: 'PASS', message: `${PI_EXT_DIR} matches ${src} (pi ${piVersion} at ${PI_PKG})` }
-      : { name: 'pi:extension', level: 'WARN', message: `installed qlb-pi differs from source: ${drift.join(', ')}`, detail: { fix: `cp ${src}/*.ts ${PI_EXT_DIR}/` } });
+      : {
+        name: 'pi:extension', level: 'WARN', message: `installed qlb-pi differs from source: ${drift.join(', ')}`,
+        detail: { fix: `cp ${src}/*.ts ${PI_EXT_DIR}/ && mkdir -p ${redactDir} && cp ${join(repoRoot, 'src', 'redact.ts')} ${installedRedact}` },
+      });
   }
 
   // 2. Pi seams still exported anywhere in the package's declarations. A seam that only survives

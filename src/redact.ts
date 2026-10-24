@@ -61,7 +61,17 @@ export function redactSecrets(text: string, secrets: readonly string[]): string 
 
 type RedactedValue = unknown | undefined;
 
-function redactValue(value: unknown, secrets: readonly string[], ancestors: WeakSet<object>): RedactedValue {
+interface RedactOptions {
+  /** Persisted sinks redact sensitive property names; live events preserve their payload shape. */
+  keyRules: boolean;
+}
+
+function redactValue(
+  value: unknown,
+  secrets: readonly string[],
+  ancestors: WeakSet<object>,
+  options: RedactOptions,
+): RedactedValue {
   if (typeof value === 'string') return redactSecrets(value, secrets);
   if (typeof value === 'function' || typeof value === 'symbol' || typeof value === 'undefined') return undefined;
   if (value === null || typeof value !== 'object') return value;
@@ -77,9 +87,11 @@ function redactValue(value: unknown, secrets: readonly string[], ancestors: Weak
         if (!descriptor) {
           out[index] = undefined;
         } else if (!('value' in descriptor)) {
-          out[index] = REDACTED;
+          // Never invoke event accessors. Persisted output marks them redacted;
+          // live events use undefined rather than inventing a string payload.
+          out[index] = options.keyRules ? REDACTED : undefined;
         } else {
-          out[index] = redactValue(descriptor.value, secrets, ancestors);
+          out[index] = redactValue(descriptor.value, secrets, ancestors, options);
         }
       }
       return out;
@@ -88,11 +100,14 @@ function redactValue(value: unknown, secrets: readonly string[], ancestors: Weak
     const out: Record<string, unknown> = {};
     for (const [key, descriptor] of Object.entries(descriptors)) {
       if (!descriptor.enumerable) continue;
-      if (isSensitiveKey(key) || !('value' in descriptor)) {
+      if (options.keyRules && (isSensitiveKey(key) || !('value' in descriptor))) {
         out[key] = REDACTED;
         continue;
       }
-      const redacted = redactValue(descriptor.value, secrets, ancestors);
+      // Accessors are omitted from live events: invoking them could execute
+      // arbitrary code, and a fabricated redaction string corrupts the payload.
+      if (!('value' in descriptor)) continue;
+      const redacted = redactValue(descriptor.value, secrets, ancestors, options);
       if (redacted !== undefined) out[key] = redacted;
     }
     return out;
@@ -107,16 +122,16 @@ function redactValue(value: unknown, secrets: readonly string[], ancestors: Weak
 /** Serializes an arbitrary value without retaining credential values. */
 export function redactJson(value: unknown, secrets: readonly string[]): string {
   try {
-    const json = JSON.stringify(redactValue(value, secrets, new WeakSet<object>()));
+    const json = JSON.stringify(redactValue(value, secrets, new WeakSet<object>(), { keyRules: true }));
     return json === undefined ? 'null' : json;
   } catch {
     return JSON.stringify(REDACTED);
   }
 }
 
-/** Redacts a Pi stream event without mutating it, including value-free token shapes. */
+/** Redacts Pi stream strings without mutating payload keys or primitive value types. */
 export function redactEvent(event: unknown, secrets: readonly string[]): unknown {
-  return redactValue(event, secrets, new WeakSet<object>());
+  return redactValue(event, secrets, new WeakSet<object>(), { keyRules: false });
 }
 
 function escapeControls(value: string): string {

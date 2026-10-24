@@ -3,8 +3,10 @@
 // refreshes, never writes, never binds a QLB account slot.
 //
 // The reader duplicates src/cswap-native-read.ts (same allowlisted argv, same
-// parse and expiry rules) because Pi's jiti loader cannot import from QLB's src/
-// tree. test/qlb-pi-consume.test.ts pins the two copies to identical behavior.
+// parse and expiry rules) so the extension has no dependency on QLB's runtime
+// modules. Its sole shared local dependency is src/redact.ts, which pi:extension
+// verifies and copies for the standalone extension layout. test/qlb-pi-consume.test.ts
+// pins the two readers to identical behavior.
 
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -18,8 +20,9 @@ export const ACTIVE_CC_SERVICE = "Claude Code-credentials";
 export const SECURITY_BIN = "/usr/bin/security";
 const FALLBACK_ACCOUNT = "claude-code-user";
 
-// Shared redaction is intentionally imported from src/: Pi installs this package
-// intact, and the closure test pins this as the extension's sole src dependency.
+// Shared redaction is intentionally imported from src/: in a package install it
+// resolves within QLB, and in a copied install pi:extension supplies agent/src/redact.ts.
+// The closure test pins this as the extension's sole src dependency.
 export { redactEvent, redactSecrets } from "../../src/redact.js";
 
 // Stable, value-free messages for every consume failure sink (audit, Pi error

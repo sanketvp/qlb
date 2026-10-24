@@ -63,6 +63,22 @@ describe('redaction', () => {
     assert.equal(result.includes(sk), false);
   });
 
+  it('preserves live event keys and primitive value types while redacting string values', () => {
+    const raw = 'raw-secret-value';
+    const event = {
+      usage: { tokens: 12, total_tokens: 3, cached: false, empty: null },
+      toolCall: { arguments: { token: 'abc', password: 'p', apiKey: 'k', cookie: 'c' } },
+      raw,
+      content: sk,
+    };
+
+    const result = redactEvent(event, [raw]) as typeof event;
+    assert.deepEqual(result.usage, { tokens: 12, total_tokens: 3, cached: false, empty: null });
+    assert.deepEqual(result.toolCall.arguments, { token: 'abc', password: 'p', apiKey: 'k', cookie: 'c' });
+    assert.equal(result.raw, REDACTED);
+    assert.equal(result.content, REDACTED);
+  });
+
   it('redacts sensitive key variants case-insensitively without invoking accessors or get traps', () => {
     const secret = 'opaque-' + 'value';
     const input = {
@@ -111,6 +127,7 @@ describe('redaction', () => {
       returnedSecret: REDACTED,
     });
     assert.deepEqual(parsed.guarded, { token: REDACTED });
+    assert.equal(redactError({ token: secret }, []), '{"token":"[redacted]"}');
   });
 
   it('drops functions including toJSON and copies shared values while marking true cycles', () => {

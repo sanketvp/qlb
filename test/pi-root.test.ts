@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import { after, describe, it } from 'node:test';
@@ -200,6 +200,37 @@ describe('locatePi', () => {
     const home = tmp('qlb-piroot-home-');
     const root = fakePiPackage(join(home, '.local'), '1.0.1');
     assert.equal(resolvePiPackageRoot({}, home), root);
+  });
+});
+
+describe('pi:extension copied-layout drift check', () => {
+  it('flags missing or different sibling src/redact.ts and prescribes copying it', () => {
+    const base = tmp('qlb-pi-extension-');
+    const extensionDir = join(base, 'agent', 'extensions', 'qlb-pi');
+    mkdirSync(extensionDir, { recursive: true });
+    const sourceDir = join(__dirname, '..', '..', 'extensions', 'qlb-pi');
+    for (const file of readdirSync(sourceDir)) {
+      if (file.endsWith('.ts') && file !== 'tsconfig.json') {
+        writeFileSync(join(extensionDir, file), readFileSync(join(sourceDir, file)));
+      }
+    }
+    const pi = fakePiPackage(join(base, 'pi'), '1.0.1');
+    const extensionCheck = () => piIntegrationChecks({ pi: { root: pi }, extensionDir })
+      .find((check) => check.name === 'pi:extension')!;
+
+    let check = extensionCheck();
+    assert.equal(check.level, 'WARN');
+    assert.match(check.message, /src\/redact\.ts/);
+    const fix = String((check.detail as { fix?: unknown } | undefined)?.fix);
+    assert.match(fix, /mkdir -p .*src/);
+    assert.match(fix, /cp .*src\/redact\.ts/);
+
+    const installedRedact = join(base, 'agent', 'src', 'redact.ts');
+    mkdirSync(join(base, 'agent', 'src'), { recursive: true });
+    writeFileSync(installedRedact, 'different');
+    check = extensionCheck();
+    assert.equal(check.level, 'WARN');
+    assert.match(check.message, /src\/redact\.ts/);
   });
 });
 
