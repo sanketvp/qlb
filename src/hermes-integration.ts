@@ -256,7 +256,10 @@ export function hermesIntegrationChecks(options: HermesIntegrationOptions = {}):
       const anthropic = isMapping(providers) ? providers['qlb-anthropic'] : undefined;
       let cfgPort: string | undefined;
       if (isMapping(anthropic) && typeof anthropic.api === 'string') {
-        try { cfgPort = new URL(anthropic.api).port || undefined; } catch { /* unavailable */ }
+        try {
+          const url = new URL(anthropic.api);
+          cfgPort = url.port || (url.protocol === 'https:' ? '443' : url.protocol === 'http:' ? '80' : '') || undefined;
+        } catch { /* unavailable */ }
       }
       if (port && cfgPort && port !== cfgPort) {
         checks.push({ name: 'hermes:proxy-supervisor', level: 'FAIL', message: `launchd proxy port ${port} != Hermes base_url port ${cfgPort}` });

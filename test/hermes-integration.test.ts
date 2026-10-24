@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it, after } from 'node:test';
@@ -34,6 +34,7 @@ describe('hermes integration checks', () => {
     build: (home: string, hermesHome: string) => void,
     launchdLabel = 'com.sanket.qlb-proxy',
     watchLabel = 'com.sanket.qlb-hermes-watch',
+    qlbBinName = 'no-such-qlb',
   ): DoctorCheck[] {
     const home = join(tmp, name);
     const hermesHome = join(home, '.hermes');
@@ -50,7 +51,7 @@ describe('hermes integration checks', () => {
           USERPROFILE: home,
           HERMES_HOME: hermesHome,
           QLB_HERMES_PLUGIN_STATUS: join(home, '.qlb', 'hermes-plugin.json'),
-          QLB_BIN: join(home, 'no-such-qlb'),
+          QLB_BIN: join(home, qlbBinName),
           QLB_LAUNCHD_LABEL: launchdLabel,
           QLB_WATCH_LABEL: watchLabel,
         },
@@ -316,5 +317,84 @@ describe('hermes integration checks', () => {
     });
     const config = checks.find((c) => c.name === 'hermes:config');
     assert.equal(config?.level, 'PASS', config?.message ?? 'no hermes:config check');
+  });
+
+  const darwinOnly = { skip: process.platform !== 'darwin' };
+
+  function writeProxyPlist(home: string, port: string): void {
+    const agents = join(home, 'Library', 'LaunchAgents');
+    mkdirSync(agents, { recursive: true });
+    writeFileSync(join(agents, 'com.sanket.qlb-proxy.plist'), `<plist><array><string>--port</string><string>${port}</string></array></plist>`);
+  }
+
+  function proxySupervisor(name: string, api: string): DoctorCheck | undefined {
+    return checksFor(name, (home, hermesHome) => {
+      writeFileSync(join(hermesHome, 'config.yaml'),
+        `${QLB_PROVIDERS.replace('api: http://127.0.0.1:47391\n', `api: ${api}\n`)}model:\n  provider: custom:qlb-anthropic\n`);
+      installPlugin(hermesHome);
+      writeProxyPlist(home, '47391');
+    }).find((c) => c.name === 'hermes:proxy-supervisor');
+  }
+
+  it('fails hermes:proxy-supervisor when the launchd port differs from the Hermes api port', darwinOnly, () => {
+    const check = proxySupervisor('proxy-port-mismatch', 'http://127.0.0.1:5000');
+    assert.equal(check?.level, 'FAIL');
+    assert.match(check?.message ?? '', /47391/);
+    assert.match(check?.message ?? '', /5000/);
+  });
+
+  it('passes hermes:proxy-supervisor when the ports match', darwinOnly, () => {
+    assert.equal(proxySupervisor('proxy-port-match', 'http://127.0.0.1:47391')?.level, 'PASS');
+  });
+
+  it('compares the effective port when the api spells out the scheme default port', darwinOnly, () => {
+    const check = proxySupervisor('proxy-port-default', 'http://127.0.0.1:80');
+    assert.equal(check?.level, 'FAIL');
+    assert.match(check?.message ?? '', /47391/);
+    assert.match(check?.message ?? '', /80/);
+  });
+
+  describe('hermes:models', () => {
+    const STUB_POLICIES = '{"policies":[{"harness":"codex","virtualModel":"gpt-5.6","realModel":"gpt-5.6"},{"harness":"claude-code","virtualModel":"claude-opus-5-5","realModel":"claude-opus-5-5"}]}';
+
+    function modelsCheck(name: string, config: string): DoctorCheck | undefined {
+      return checksFor(name, (home, hermesHome) => {
+        writeFileSync(join(hermesHome, 'config.yaml'), config);
+        installPlugin(hermesHome);
+        const stub = join(home, 'qlb-stub');
+        writeFileSync(stub, `#!/bin/sh\ncat <<'EOF'\n${STUB_POLICIES}\nEOF\n`);
+        chmodSync(stub, 0o755);
+      }, undefined, undefined, 'qlb-stub').find((c) => c.name === 'hermes:models');
+    }
+
+    it('warns naming only the QLB models missing from the picker', { skip: process.platform === 'win32' }, () => {
+      const config = QLB_PROVIDERS.replace(
+        '    transport: anthropic_messages\n',
+        '    transport: anthropic_messages\n    models:\n      claude-opus-5-5: {}\n',
+      ) + 'model:\n  provider: custom:qlb-anthropic\n';
+      const check = modelsCheck('models-missing', config);
+      assert.equal(check?.level, 'WARN', check?.message ?? 'no hermes:models check');
+      assert.match(check?.message ?? '', /qlb-codex\/gpt-5\.6/);
+      assert.doesNotMatch(check?.message ?? '', /qlb-anthropic\/claude-opus-5-5/);
+    });
+
+    it('passes when every served model is listed', { skip: process.platform === 'win32' }, () => {
+      const config = QLB_PROVIDERS
+        .replace('    transport: anthropic_messages\n', '    transport: anthropic_messages\n    models:\n      claude-opus-5-5: {}\n')
+        .replace('    transport: codex_responses\n', '    transport: codex_responses\n    models:\n      gpt-5.6: {}\n')
+        + 'model:\n  provider: custom:qlb-anthropic\n';
+      const check = modelsCheck('models-all', config);
+      assert.equal(check?.level, 'PASS', check?.message ?? 'no hermes:models check');
+    });
+  });
+
+  it('warns on hermes:config when QLB entries are intact but the primary route bypasses QLB', () => {
+    const checks = checksFor('route-bypass', (_home, hermesHome) => {
+      writeFileSync(join(hermesHome, 'config.yaml'), `${QLB_PROVIDERS}model:\n  provider: anthropic\n`);
+      installPlugin(hermesHome);
+    });
+    const config = checks.find((c) => c.name === 'hermes:config');
+    assert.equal(config?.level, 'WARN');
+    assert.match(config?.message ?? '', /custom:qlb-anthropic/);
   });
 });
