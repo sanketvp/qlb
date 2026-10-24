@@ -193,7 +193,7 @@
     "test/oracle/claude-swap-v0.28.0/tests/test_worker_gc_freeze.py": "312db809f3be21e5f8ac1c67ffb924c5c5a8ea28",
     "third_party/claude-swap/LICENSE": "47e2d2974d492e7e1f0ef8f0551acd9b1a667e09"
   },
-  "purpose": "Complete claude-swap v0.28.0 source closure and reference material; it is not executed by Node or QLB.",
+  "purpose": "Complete claude-swap v0.28.0 source closure and reference material; the cc-locks interop test executes it via python3 -I -B, never QLB at runtime.",
   "tag": "v0.28.0",
   "test_def_counts": {
     "tests/__init__.py": 0,
