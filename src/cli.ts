@@ -466,15 +466,9 @@ function parsePolicyArgs(argsIn: string[]): PolicyOpts {
 
 function parseGateArgs(argsIn: string[]): GateOpts {
   const args = [...argsIn];
-  const target = args.shift();
-  if (target === '-h' || target === '--help' || target === undefined) {
+  if (args[0] === '-h' || args[0] === '--help') {
     console.log(USAGE);
     process.exit(0);
-  }
-  if (target !== 'codex') {
-    console.error('qlb codex gate: unknown argument');
-    console.error(USAGE);
-    process.exit(1);
   }
   const json = args.includes('--json');
   if (json) args.splice(args.indexOf('--json'), 1);
@@ -824,7 +818,7 @@ function parseWhyArgs(argsIn: string[]): WhyOpts {
   return { cmd: 'why', json, model, fallback, session, strategy };
 }
 
-function parseArgs(argv: string[]): Opts {
+export function parseArgs(argv: string[]): Opts {
   const raw = stripConfigArgs(argv).slice(2);
   if (raw[0] === '-h' || raw[0] === '--help') {
     console.log(USAGE);
@@ -1719,7 +1713,7 @@ async function runNativeResync(opts: NativeResyncOpts): Promise<number> {
   });
 }
 
-function prepareCommandArgv(argv: string[]): string[] {
+export function prepareCommandArgv(argv: string[]): string[] {
   const stripped = stripConfigArgs(argv);
   const raw = stripped.slice(2);
   const match = resolveCommand(raw);
