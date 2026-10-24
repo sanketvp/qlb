@@ -119,7 +119,7 @@ describe('Anthropic OAuth pure port', () => {
     assert.equal(needsFreshenBeforeSwitch(nowMs + FRESHEN_BUFFER_MS + 1, nowMs), false);
   });
 
-  it('classifies only a 4xx JSON invalid_grant response as dead', () => {
+  it('classifies only a 400, 401, or 403 JSON invalid_grant response as dead', () => {
     const success = classifyRefreshResponse(200, JSON.stringify({
       access_token: 'fake-new-access', expires_in: 3600, refresh_token: 'fake-new-refresh', scope: 'a b',
     }));
@@ -132,7 +132,15 @@ describe('Anthropic OAuth pure port', () => {
     });
     for (const row of [
       { status: 400, body: '{"error":"invalid_grant"}', expected: 'dead' },
+      { status: 401, body: '{"error":"invalid_grant"}', expected: 'dead' },
+      { status: 403, body: '{"error":"invalid_grant"}', expected: 'dead' },
       { status: 400, body: '{"error":"invalid_client"}', expected: 'invalid_client' },
+      { status: 401, body: '{"error":"invalid_client"}', expected: 'invalid_client' },
+      { status: 403, body: '{"error":"invalid_client"}', expected: 'invalid_client' },
+      { status: 404, body: '{"error":"invalid_grant"}', expected: 'transient' },
+      { status: 429, body: '{"error":"invalid_grant"}', expected: 'transient' },
+      { status: 404, body: '{"error":"invalid_client"}', expected: 'transient' },
+      { status: 422, body: '{"error":"invalid_client"}', expected: 'transient' },
       { status: 400, body: '{"error":"other"}', expected: 'transient' },
       { status: 401, body: 'not-json', expected: 'transient' },
       { status: 500, body: '{"error":"invalid_grant"}', expected: 'transient' },

@@ -184,7 +184,7 @@ export function classifyRefreshResponse(status: number | null | undefined, body:
     }
   }
 
-  if (typeof status === 'number' && status >= 400 && status < 500) {
+  if (typeof status === 'number' && (status === 400 || status === 401 || status === 403)) {
     try {
       const parsed: unknown = JSON.parse(body);
       if (isObject(parsed) && parsed.error === 'invalid_grant') return { kind: 'dead' };
