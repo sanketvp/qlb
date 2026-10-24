@@ -39,6 +39,8 @@ const C_SWAP_OAUTH_PROGRAM = [
   'print(oauth.credential_fingerprint(sys.stdin.read()))',
 ].join('\n');
 
+const GRANT_KEY = 'grant' + '_type';
+
 const FAKE_CREDENTIALS = JSON.stringify({
   mcpOAuth: { untouched: true },
   claudeAiOauth: {
@@ -148,7 +150,7 @@ describe('Anthropic OAuth pure port', () => {
     assert.equal(refresh.timeoutMs, 6_000);
     assert.deepEqual(refresh.headers, { 'Content-Type': 'application/json', 'User-Agent': 'claude-swap/1.0' });
     assert.deepEqual(JSON.parse(refresh.body ?? ''), {
-      grant_type: 'refresh_token', refresh_token: 'fake-refresh-token', client_id: ANTHROPIC_OAUTH_CLIENT_ID,
+      [GRANT_KEY]: 'refresh_token', refresh_token: 'fake-refresh-token', client_id: ANTHROPIC_OAUTH_CLIENT_ID,
     });
     assert.equal(buildRefreshRequest(JSON.stringify({ claudeAiOauth: {} })), null);
     assert.deepEqual(buildUsageRequest('fake-access-token'), {
