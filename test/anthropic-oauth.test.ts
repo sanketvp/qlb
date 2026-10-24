@@ -4,9 +4,11 @@ import { existsSync } from 'node:fs';
 import { describe, it } from 'node:test';
 
 import {
+  accessTokenFingerprint,
   ANTHROPIC_OAUTH_CLIENT_ID,
   ANTHROPIC_OAUTH_TOKEN_URL,
   ANTHROPIC_USAGE_URL,
+  FIVE_HOUR_LABEL,
   FRESHEN_BUFFER_MS,
   OAUTH_EXPIRY_BUFFER_MS,
   buildRefreshRequest,
@@ -14,6 +16,7 @@ import {
   classifyRefreshResponse,
   credentialFingerprint,
   isExpired,
+  loginExpiresAtIso,
   isOAuthTokenExpired,
   needsFreshenBeforeSwitch,
   parseCredentialBlob,
@@ -21,7 +24,20 @@ import {
   serializeCredentialBlob,
 } from '../src/anthropic-oauth';
 
-const C_SWAP_PYTHON = `${process.env.HOME}/.local/share/uv/tools/claude-swap/bin/python`;
+const C_SWAP_SOURCE = '/private/tmp/claude-501/-Users-sanketpatel-GIT-Personal-sanketvp/3b005b8d-b97c-4bb5-a726-86eaa04c5eb9/scratchpad/cswap-upstream/repo/src';
+const C_SWAP_OAUTH_PROGRAM = [
+  'import importlib.util, sys, types',
+  `source = ${JSON.stringify(C_SWAP_SOURCE)}`,
+  'sys.path.insert(0, source)',
+  'package = types.ModuleType("claude_swap")',
+  'package.__path__ = [source + "/claude_swap"]',
+  'sys.modules["claude_swap"] = package',
+  'spec = importlib.util.spec_from_file_location("claude_swap.oauth", source + "/claude_swap/oauth.py")',
+  'oauth = importlib.util.module_from_spec(spec)',
+  'sys.modules[spec.name] = oauth',
+  'spec.loader.exec_module(oauth)',
+  'print(oauth.credential_fingerprint(sys.stdin.read()))',
+].join('\n');
 
 const FAKE_CREDENTIALS = JSON.stringify({
   mcpOAuth: { untouched: true },
@@ -36,14 +52,14 @@ const FAKE_CREDENTIALS = JSON.stringify({
 });
 
 describe('Anthropic OAuth pure port', () => {
-  it('matches C-swap credential fingerprints when its isolated interpreter is installed', (t) => {
-    if (!existsSync(C_SWAP_PYTHON)) {
-      t.skip('C-swap isolated Python is not installed');
+  it('matches the C-swap v0.28 credential fingerprint from its isolated source', (t) => {
+    if (!existsSync(C_SWAP_SOURCE)) {
+      t.skip('C-swap v0.28 source clone is unavailable');
       return;
     }
     const expected = execFileSync(
-      C_SWAP_PYTHON,
-      ['-I', '-c', 'import sys; from claude_swap.oauth import credential_fingerprint; print(credential_fingerprint(sys.stdin.read()))'],
+      'python3',
+      ['-I', '-c', C_SWAP_OAUTH_PROGRAM],
       { encoding: 'utf8', input: FAKE_CREDENTIALS },
     ).trim();
     assert.equal(credentialFingerprint(FAKE_CREDENTIALS), expected);
@@ -52,6 +68,28 @@ describe('Anthropic OAuth pure port', () => {
   it('uses a refresh-token lineage hash, unlike native access-token hashing', () => {
     assert.match(credentialFingerprint(FAKE_CREDENTIALS) ?? '', /^sha256:[0-9a-f]{64}$/);
     assert.equal(credentialFingerprint(''), null);
+  });
+
+  it('adds the access-token identity and ISO login-expiry helpers from C-swap 0.28', () => {
+    assert.equal(
+      accessTokenFingerprint(FAKE_CREDENTIALS),
+      'sha256-at:0ed67e78396236f068c7f03b5dd972fb64d0bdacfe56bd1102c047bcade79887',
+    );
+    assert.equal(
+      loginExpiresAtIso(JSON.stringify({ claudeAiOauth: { refreshTokenExpiresAt: 1791421596865 } })),
+      '2026-10-08T01:06:36Z',
+    );
+    for (const credentials of [
+      '',
+      'not json',
+      JSON.stringify({ claudeAiOauth: {} }),
+      JSON.stringify({ claudeAiOauth: { refreshTokenExpiresAt: 'soon' } }),
+      JSON.stringify({ claudeAiOauth: { refreshTokenExpiresAt: true } }),
+      JSON.stringify({ claudeAiOauth: { refreshTokenExpiresAt: 0 } }),
+      JSON.stringify({ other: {} }),
+    ]) {
+      assert.equal(loginExpiresAtIso(credentials), null);
+    }
   });
 
   it('round-trips credential blobs without dropping unknown fields or changing key order', () => {
@@ -92,6 +130,7 @@ describe('Anthropic OAuth pure port', () => {
     });
     for (const row of [
       { status: 400, body: '{"error":"invalid_grant"}', expected: 'dead' },
+      { status: 400, body: '{"error":"invalid_client"}', expected: 'invalid_client' },
       { status: 400, body: '{"error":"other"}', expected: 'transient' },
       { status: 401, body: 'not-json', expected: 'transient' },
       { status: 500, body: '{"error":"invalid_grant"}', expected: 'transient' },
@@ -111,6 +150,7 @@ describe('Anthropic OAuth pure port', () => {
     assert.deepEqual(JSON.parse(refresh.body ?? ''), {
       grant_type: 'refresh_token', refresh_token: 'fake-refresh-token', client_id: ANTHROPIC_OAUTH_CLIENT_ID,
     });
+    assert.equal(buildRefreshRequest(JSON.stringify({ claudeAiOauth: {} })), null);
     assert.deepEqual(buildUsageRequest('fake-access-token'), {
       url: ANTHROPIC_USAGE_URL,
       method: 'GET',
@@ -124,6 +164,7 @@ describe('Anthropic OAuth pure port', () => {
   });
 
   it('parses C-swap-shaped 5h, 7d, and per-model 7d usage buckets', () => {
+    assert.equal(FIVE_HOUR_LABEL, '5h');
     const result = parseUsageResponse({
       five_hour: { utilization: 12.5, resets_at: '2099-01-01T00:00:00Z' },
       seven_day: { utilization: 34, resets_at: '2099-01-08T00:00:00Z' },

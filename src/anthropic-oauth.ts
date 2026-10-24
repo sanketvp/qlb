@@ -1,4 +1,4 @@
-// Ported from claude-swap 0.26.0 (MIT, Copyright (c) realiti4) — oauth.py
+// Ported from claude-swap 0.28.0 (MIT, Copyright (c) realiti4) — oauth.py
 // See third_party/claude-swap/LICENSE for the upstream license.
 
 import { createHash } from 'node:crypto';
@@ -9,6 +9,8 @@ export const ANTHROPIC_USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
 export const ANTHROPIC_OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
 export const OAUTH_EXPIRY_BUFFER_MS = 5 * 60 * 1000;
 export const FRESHEN_BUFFER_MS = 10 * 60 * 1000;
+/** C-swap v0.28.0 `oauth.py` lines 538–563: canonical non-weekly window label. */
+export const FIVE_HOUR_LABEL = '5h';
 
 export type JsonObject = Record<string, unknown>;
 
@@ -36,6 +38,7 @@ export type RefreshClassification =
     scopes?: string[];
   }
   | { kind: 'dead' }
+  | { kind: 'invalid_client' }
   | { kind: 'transient' };
 
 export interface UsageBucket {
@@ -85,6 +88,20 @@ export function credentialFingerprint(credentials: string): string | null {
     return `sha256:${createHash('sha256').update(refreshToken, 'utf8').digest('hex')}`;
   }
   return `sha256-full:${createHash('sha256').update(credentials, 'utf8').digest('hex')}`;
+}
+
+/** C-swap v0.28.0 `oauth.py` lines 63–70: identity for a rotating access token. */
+export function accessTokenFingerprint(credentials: string): string | null {
+  const accessToken = parseCredentialBlob(credentials)?.oauth?.accessToken;
+  if (typeof accessToken !== 'string' || !accessToken) return null;
+  return `sha256-at:${createHash('sha256').update(accessToken, 'utf8').digest('hex')}`;
+}
+
+/** C-swap v0.28.0 `oauth.py` lines 73–92: stored-login expiry as second-precision UTC. */
+export function loginExpiresAtIso(credentials: string): string | null {
+  const value = parseCredentialBlob(credentials)?.oauth?.refreshTokenExpiresAt;
+  if (!isFiniteNumber(value) || value <= 0) return null;
+  return new Date(value).toISOString().replace(/\.\d{3}Z$/, 'Z');
 }
 
 function isFiniteNumber(value: unknown): value is number {
@@ -141,8 +158,9 @@ export function buildRefreshRequest(credentials: string): HttpRequestDescription
 }
 
 /**
- * Classify a token-endpoint response. A lineage is dead only when a 4xx response's
- * top-level JSON `error` member is exactly `invalid_grant`; all ambiguity is transient.
+ * Classify a token-endpoint response. C-swap v0.28.0 `oauth.py` lines 154–167 and
+ * 200–225 makes a missing refresh token or `invalid_grant` permanently dead;
+ * `invalid_client` is deterministic but systemic, and all other failures are transient.
  */
 export function classifyRefreshResponse(status: number | null | undefined, body: string): RefreshClassification {
   if (typeof status === 'number' && status >= 200 && status < 300) {
@@ -170,6 +188,7 @@ export function classifyRefreshResponse(status: number | null | undefined, body:
     try {
       const parsed: unknown = JSON.parse(body);
       if (isObject(parsed) && parsed.error === 'invalid_grant') return { kind: 'dead' };
+      if (isObject(parsed) && parsed.error === 'invalid_client') return { kind: 'invalid_client' };
     } catch {
       // An unparseable body is intentionally ambiguous, hence transient.
     }
@@ -210,7 +229,7 @@ export function parseUsageResponse(data: unknown): ParsedUsageResponse {
   const buckets: Record<string, UsageBucket> = {};
   if (!isObject(data)) return { buckets };
 
-  addUsageBucket(buckets, '5h', data.five_hour);
+  addUsageBucket(buckets, FIVE_HOUR_LABEL, data.five_hour);
   addUsageBucket(buckets, '7d', data.seven_day);
 
   if (Array.isArray(data.limits)) {
