@@ -9,7 +9,7 @@ import {
   CSWAP_ACTIVE_ID,
   redactEvent,
   redactSecrets,
-  type ActiveAccess,
+  type CswapActiveAccess,
   type ConsumeJournal,
   type OwnerFileState,
 } from "./consume.js";
@@ -47,7 +47,7 @@ export interface ConsumeDeps {
   /** Per-request journal re-check (`qlb consume status`). */
   consumeJournal: () => Promise<ConsumeJournal>;
   ownerState: () => OwnerFileState;
-  readAccess: () => ActiveAccess;
+  readAccess: () => CswapActiveAccess;
   shapePayload: (payload: unknown) => unknown;
   recordOutcome: (entry: Record<string, unknown>) => void;
   onDecision?: (decision: { accountId: string; provider: string; model: string }) => void;

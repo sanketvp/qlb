@@ -38,7 +38,7 @@ export const CONSUME_ERRORS = {
 
 export type SecurityRunner = (executable: string, args: readonly string[]) => string;
 
-export interface ActiveAccess {
+export interface CswapActiveAccess {
   access: string;
   fingerprint: string;
 }
@@ -79,7 +79,7 @@ export function readActiveClaudeAccess(opts: {
   runner?: SecurityRunner;
   env?: NodeJS.ProcessEnv;
   nowMs?: number;
-} = {}): ActiveAccess {
+} = {}): CswapActiveAccess {
   const runner = opts.runner ?? defaultRunner;
   let raw: string;
   try {
@@ -240,7 +240,7 @@ export interface PiModeInput {
 /**
  * Choose how qlb-pi registers Anthropic at load. Fail-closed rules:
  * - QLB_PI_REHEARSAL=0 always inert (rollback verification).
- * - Any claim of QLB ownership (owner file, even malformed, or rehearsal=1)
+ * - Any claim of QLB ownership (owner file, even malformed, or Anthropic rehearsal=1)
  *   is `owned` only when the consume journal is provably NATIVE; CONSUMED or an
  *   unreadable journal alongside ownership is `conflict`.
  * - No ownership claim: CONSUMED → `consume`; the consume marker present with
@@ -259,7 +259,8 @@ export function decidePiMode(
   const input = typeof providerOrInput === "string" ? maybeInput! : providerOrInput;
   if (input.rehearsal === "0") return "inert";
   if (input.owner === "malformed") return "conflict";
-  const claimsOwnership = input.rehearsal === "1" || input.owner === "valid";
+  // Rehearsal is Anthropic-only until later provider slices opt in.
+  const claimsOwnership = input.owner === "valid" || (provider === "anthropic" && input.rehearsal === "1");
 
   // v2 providers have no cswap consume fallback. A provider omitted from the
   // owner document must leave Pi's own login completely untouched.
@@ -284,6 +285,7 @@ export function canSkipJournal(input: Omit<PiModeInput, "journal"> & { dbExists:
 }
 
 /** User-facing reason for a `conflict` decision. */
+// TODO(P2): make this provider-aware before any v2 provider uses this remediation text.
 export function conflictMessage(input: PiModeInput): string {
   if (input.owner === "malformed") return CONSUME_ERRORS.conflict; // the owner file is the problem
   if ((input.journal ?? "unknown") === "unknown") return CONSUME_ERRORS.stateUnknown;
@@ -296,12 +298,12 @@ export function conflictMessage(input: PiModeInput): string {
  * stream uses read #1; a 401 triggers exactly one reread, and the retry sends
  * exactly that reread value — only if its fingerprint changed.
  */
-export function consumeAccessSource(read: () => ActiveAccess): {
+export function consumeAccessSource(read: () => CswapActiveAccess): {
   readAccess: () => string;
   resync: () => Promise<{ resynced: boolean; reason: string }>;
   sent: () => string[];
 } {
-  let current: ActiveAccess | undefined;
+  let current: CswapActiveAccess | undefined;
   const sent: string[] = [];
   return {
     readAccess: () => {
@@ -310,7 +312,7 @@ export function consumeAccessSource(read: () => ActiveAccess): {
       return current.access;
     },
     resync: async () => {
-      let next: ActiveAccess;
+      let next: CswapActiveAccess;
       try {
         next = read();
       } catch {

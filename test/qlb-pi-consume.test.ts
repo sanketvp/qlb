@@ -27,7 +27,7 @@ import {
   redactEvent,
   redactSecrets,
   SECURITY_BIN,
-  type ActiveAccess,
+  type CswapActiveAccess,
   type ConsumeJournal,
   type OwnerFileState,
   type PiMode,
@@ -72,7 +72,7 @@ describe('qlb-pi consume reader parity with src/cswap-native-read', () => {
     it(`agrees on: ${name}`, () => {
       const runner = () => produce();
       let srcResult: { access: string; fingerprint: string } | Error;
-      let extResult: ActiveAccess | Error;
+      let extResult: CswapActiveAccess | Error;
       try {
         const r = getActiveClaudeCodeAccess({ runner, env: { USER: 'u' } });
         srcResult = { access: r.access, fingerprint: r.fingerprint };
@@ -202,11 +202,11 @@ describe('qlb-pi mode decision', () => {
   });
 });
 
-function access(value: string): ActiveAccess {
+function access(value: string): CswapActiveAccess {
   return { access: value, fingerprint: fingerprintAccess(value) };
 }
 
-function sequence(values: string[]): { read: () => ActiveAccess; reads: () => number } {
+function sequence(values: string[]): { read: () => CswapActiveAccess; reads: () => number } {
   let n = 0;
   return {
     read: () => {
@@ -360,7 +360,7 @@ async function run(pi: ReturnType<typeof fakePi>): Promise<Sink> {
   return stream;
 }
 
-function deps(over: Partial<ConsumeDeps> & { read: () => ActiveAccess }): {
+function deps(over: Partial<ConsumeDeps> & { read: () => CswapActiveAccess }): {
   deps: ConsumeDeps;
   audit: Array<Record<string, unknown>>;
 } {

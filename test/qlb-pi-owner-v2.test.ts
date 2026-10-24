@@ -10,6 +10,7 @@ import {
   ownerStateForProvider,
   parsePiOwnerFile,
   decidePiMode,
+  type CswapActiveAccess,
   type PiOwnerFile,
 } from '../extensions/qlb-pi/consume';
 
@@ -69,6 +70,13 @@ describe('qlb-pi owner file v2', () => {
       'inert',
     );
   });
+
+  it('limits rehearsal ownership to Anthropic until each provider is migrated', () => {
+    const nativeJournal = { rehearsal: '1', owner: 'absent' as const, journal: 'NATIVE' as const, marker: false };
+    assert.equal(decidePiMode('anthropic', nativeJournal), 'owned');
+    assert.equal(decidePiMode('openai-codex', nativeJournal), 'inert');
+    assert.equal(decidePiMode('xai', nativeJournal), 'inert');
+  });
 });
 
 describe('qlb-pi active access scaffold', () => {
@@ -91,5 +99,27 @@ describe('qlb-pi active access scaffold', () => {
     assert.equal(event.error.model, 'gpt-5');
     assert.equal(event.error.errorMessage, 'QLB unavailable for openai-codex — run qlb doctor (store-open-failed)');
     assert.match(qlbUnavailable('xai', 'token value must not appear').error.errorMessage, /unknown/);
+  });
+
+  it('never emits a token-shaped cause value', () => {
+    const tokenShapedCause = 'sk-' + 'ant-' + 'x'.repeat(40);
+    const errorMessage = qlbUnavailable('xai', tokenShapedCause).error.errorMessage;
+    assert.equal(errorMessage, 'QLB unavailable for xai — run qlb doctor (unknown)');
+    assert.doesNotMatch(errorMessage, new RegExp(tokenShapedCause));
+  });
+
+  it('preserves fail-closed lifecycle phase cause codes', () => {
+    for (const state of ['pre-cutover', 'undoing', 'rolled-back', 'aborted']) {
+      assert.equal(
+        qlbUnavailable('anthropic', `phase=${state}`).error.errorMessage,
+        `QLB unavailable for anthropic — run qlb doctor (phase=${state})`,
+      );
+    }
+    assert.match(qlbUnavailable('anthropic', 'phase=cutover').error.errorMessage, /\(unknown\)$/);
+  });
+
+  it('uses a distinct type for legacy cswap access', () => {
+    const access: CswapActiveAccess = { access: 'test-access', fingerprint: 'test-fingerprint' };
+    assert.equal(access.access, 'test-access');
   });
 });

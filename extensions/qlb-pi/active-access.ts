@@ -93,9 +93,27 @@ export interface QlbUnavailableEvent {
   };
 }
 
-/** Cause codes are data, never diagnostics: reject text that could hold a secret. */
+/**
+ * Cause codes are data, never diagnostics. Keep this explicit allowlist small:
+ * adding a new gate cause requires deciding that its value is safe to display.
+ */
+const FIXED_CAUSE_CODES = new Set([
+  "missing-binary",
+  "store-open-failed",
+  "owner-file-malformed",
+  "identity-mismatch",
+  "auth-json-unstable",
+  "refresh-failed",
+  "undo-in-progress",
+  "codex-token-expired-renewer-idle",
+  "provider-not-applicable",
+]);
+const REFUSED_LIFECYCLE_PHASES = new Set(["pre-cutover", "undoing", "rolled-back", "aborted"]);
+
 function safeCause(cause: string): string {
-  return /^[a-z][a-z0-9-]{0,79}$/.test(cause) ? cause : "unknown";
+  if (FIXED_CAUSE_CODES.has(cause)) return cause;
+  const phase = cause.match(/^phase=([a-z-]{1,40})$/)?.[1];
+  return phase && REFUSED_LIFECYCLE_PHASES.has(phase) ? cause : "unknown";
 }
 
 /** A single error event used when a QLB-managed provider cannot be served. */
