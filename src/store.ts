@@ -284,6 +284,87 @@ function ensurePrivateDir(dir: string): void {
 
 type BackupVerifier = (source: DatabaseSync, copy: DatabaseSync) => boolean;
 
+const LIFECYCLE_ONE_OPEN_INDEX_SQL = `CREATE UNIQUE INDEX lifecycle_one_open ON lifecycle ((1))
+  WHERE state IN ('cutting-over','cutover','undoing','rolled-back','retired','aborted')`;
+
+// This is the authoritative v5 shape. Both migration DDL and pre-release-v5
+// completeness checks use it, so a newly added v5 column cannot be omitted
+// from the correction path.
+const V5_SCHEMA_DDL = `
+  CREATE TABLE IF NOT EXISTS decisions (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, session TEXT, harness TEXT, requested_model TEXT, effort TEXT, served_model TEXT, account_id TEXT, mode TEXT, reason TEXT, snapshot_json TEXT, strategy TEXT, provider TEXT);
+  CREATE TABLE IF NOT EXISTS claude_slots (account_id TEXT PRIMARY KEY, slot_num INTEGER UNIQUE, email TEXT, alias TEXT, org_uuid TEXT, config_json TEXT NOT NULL, fingerprint TEXT, prev_fingerprint TEXT, threshold REAL, dead INTEGER NOT NULL DEFAULT 0, dead_reason TEXT, dead_at INTEGER, healed_at INTEGER, added_at INTEGER NOT NULL, last_active_at INTEGER, source TEXT, archived_at INTEGER);
+  CREATE TABLE IF NOT EXISTS codex_slots (account_id TEXT PRIMARY KEY, chatgpt_user_id TEXT NOT NULL, chatgpt_account_id TEXT NOT NULL, email TEXT, alias TEXT, fingerprint TEXT, prev_fingerprint TEXT, threshold REAL, last_refresh TEXT, dead INTEGER NOT NULL DEFAULT 0, dead_reason TEXT, dead_at INTEGER, healed_at INTEGER, pending_adopt INTEGER NOT NULL DEFAULT 0, added_at INTEGER NOT NULL, last_active_at INTEGER, source TEXT, archived_at INTEGER);
+  CREATE TABLE IF NOT EXISTS active_login (provider TEXT PRIMARY KEY, account_id TEXT, since INTEGER NOT NULL, set_by TEXT NOT NULL);
+  CREATE TABLE IF NOT EXISTS switch_log (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, provider TEXT NOT NULL, from_account TEXT, to_account TEXT NOT NULL, trigger TEXT NOT NULL, outcome TEXT NOT NULL, outgoing_kind TEXT, binding_json TEXT, steps_json TEXT, open_sessions_json TEXT, error TEXT, injected INTEGER NOT NULL DEFAULT 0, detail TEXT, published_at INTEGER, committed_at INTEGER);
+  CREATE TABLE IF NOT EXISTS usage_polls (provider TEXT NOT NULL, account_id TEXT NOT NULL, last_fetch_at INTEGER, last_attempt_at INTEGER, next_due_at INTEGER, last_status TEXT, consecutive_failures INTEGER NOT NULL DEFAULT 0, backoff_until INTEGER, last_429_at INTEGER, held_until INTEGER, PRIMARY KEY (provider, account_id));
+  CREATE TABLE IF NOT EXISTS relogin_events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, provider TEXT NOT NULL, account_id TEXT, kind TEXT NOT NULL, detail TEXT, evidence TEXT, user_denied_at INTEGER);
+  CREATE TABLE IF NOT EXISTS health_log (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, phase TEXT NOT NULL, overall TEXT NOT NULL, failing_json TEXT NOT NULL, dead_slots_json TEXT NOT NULL, release_sha TEXT);
+  CREATE TABLE IF NOT EXISTS lineage_log (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, provider TEXT NOT NULL, account_id TEXT NOT NULL, from_fp TEXT, to_fp TEXT NOT NULL, cause TEXT NOT NULL, by TEXT NOT NULL, evidence TEXT);
+  CREATE TABLE IF NOT EXISTS lifecycle (id INTEGER PRIMARY KEY AUTOINCREMENT, state TEXT NOT NULL, began_at INTEGER NOT NULL, cutover_at INTEGER, window_end INTEGER, extended_at INTEGER, undo_began_at INTEGER, rollback_at INTEGER, retired_at INTEGER, closed_at INTEGER, release_sha TEXT, drill_done_at INTEGER, note TEXT, pre_fence_state TEXT);
+  CREATE UNIQUE INDEX IF NOT EXISTS lifecycle_one_open ON lifecycle ((1)) WHERE state IN ('cutting-over','cutover','undoing','rolled-back','retired','aborted');
+  CREATE TABLE IF NOT EXISTS codex_watch (switch_id INTEGER PRIMARY KEY, provider TEXT NOT NULL, outgoing TEXT NOT NULL, target TEXT NOT NULL, next_at INTEGER NOT NULL, until INTEGER NOT NULL);
+  CREATE TABLE IF NOT EXISTS import_runs (run_id TEXT PRIMARY KEY, started_at INTEGER NOT NULL, committed_at INTEGER);
+  CREATE TABLE IF NOT EXISTS pi_export_targets (provider TEXT NOT NULL, target TEXT NOT NULL, slot_account_id TEXT NOT NULL, lineage_fp TEXT NOT NULL, recorded_at INTEGER NOT NULL, PRIMARY KEY (provider, target));
+  CREATE TABLE IF NOT EXISTS codex_live_observations (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, identity TEXT, lineage_fp TEXT, by TEXT NOT NULL);
+`;
+
+interface V5ColumnShape {
+  name: string;
+  type: string;
+  notNull: boolean;
+  defaultValue: string | null;
+  primaryKey: boolean;
+}
+
+interface V5TableShape {
+  columns: V5ColumnShape[];
+  sql: string;
+}
+
+function splitColumnDefinitions(definitions: string): string[] {
+  const parts: string[] = [];
+  let depth = 0;
+  let start = 0;
+  for (let index = 0; index < definitions.length; index += 1) {
+    if (definitions[index] === '(') depth += 1;
+    if (definitions[index] === ')') depth -= 1;
+    if (definitions[index] === ',' && depth === 0) {
+      parts.push(definitions.slice(start, index).trim());
+      start = index + 1;
+    }
+  }
+  parts.push(definitions.slice(start).trim());
+  return parts;
+}
+
+function loadV5TableShapes(): Map<string, V5TableShape> {
+  const tables = new Map<string, V5TableShape>();
+  for (const match of V5_SCHEMA_DDL.matchAll(/CREATE TABLE IF NOT EXISTS (\w+) \(([\s\S]*?)\);/g)) {
+    const [, name, definitions] = match;
+    const columns = splitColumnDefinitions(definitions).flatMap((definition): V5ColumnShape[] => {
+      if (/^(PRIMARY|UNIQUE|CHECK|CONSTRAINT|FOREIGN)\b/i.test(definition)) return [];
+      const column = /^(\w+)\s+(\w+)/.exec(definition);
+      if (!column) return [];
+      const defaultMatch = /\bDEFAULT\s+([^\s,]+)/i.exec(definition);
+      return [{
+        name: column[1],
+        type: column[2],
+        notNull: /\bNOT NULL\b/i.test(definition),
+        defaultValue: defaultMatch?.[1] ?? null,
+        primaryKey: /\bPRIMARY KEY\b/i.test(definition),
+      }];
+    });
+    tables.set(name, { columns, sql: `CREATE TABLE ${name} (${definitions})` });
+  }
+  return tables;
+}
+
+const v5TableShapes = loadV5TableShapes();
+
+function requiredV5TableShapes(): Map<string, V5TableShape> {
+  return v5TableShapes;
+}
+
 function userTableCounts(db: DatabaseSync): Map<string, number> {
   const tables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all() as Array<{ name: string }>;
   const counts = new Map<string, number>();
@@ -313,10 +394,17 @@ function tableContentDigest(db: DatabaseSync, table: string): string {
   ))).digest('hex');
 }
 
+function schemaEntries(db: DatabaseSync): Array<{ type: string; name: string; sql: string | null }> {
+  return db.prepare(`SELECT type, name, sql FROM sqlite_master
+    WHERE type IN ('table', 'index') AND name NOT LIKE 'sqlite_%'
+    ORDER BY type, name`).all() as Array<{ type: string; name: string; sql: string | null }>;
+}
+
 export function verifyBackup(source: DatabaseSync, copy: DatabaseSync): boolean {
   const integrity = copy.prepare('PRAGMA integrity_check').get() as { integrity_check?: string } | string | undefined;
   const result = typeof integrity === 'string' ? integrity : integrity?.integrity_check;
   if (result !== 'ok') return false;
+  if (JSON.stringify(schemaEntries(source)) !== JSON.stringify(schemaEntries(copy))) return false;
   const sourceCounts = userTableCounts(source);
   const copyCounts = userTableCounts(copy);
   if (sourceCounts.size !== copyCounts.size) return false;
@@ -357,31 +445,44 @@ export async function backupBeforeMigrate(
 }
 
 function schemaNeedsV5Correction(db: DatabaseSync): boolean {
-  const required: Record<string, string[]> = {
-    claude_slots: ['archived_at'],
-    codex_slots: ['pending_adopt', 'archived_at'],
-    switch_log: ['injected', 'detail', 'published_at', 'committed_at'],
-    usage_polls: ['provider'],
-    relogin_events: ['evidence', 'user_denied_at'],
-    lineage_log: ['evidence'],
-    lifecycle: ['pre_fence_state'],
-    codex_watch: [], import_runs: [], pi_export_targets: [], codex_live_observations: [],
-  };
-  for (const [table, columns] of Object.entries(required)) {
+  for (const [table, { columns }] of requiredV5TableShapes()) {
     const found = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table);
-    if (!found) return true;
-    if (columns.some((column) => !hasColumn(db, table, column))) return true;
+    if (!found || columns.some(({ name }) => !hasColumn(db, table, name))) return true;
   }
   return !lifecycleOneOpenIndexMatches(db);
+}
+
+function quoteIdentifier(name: string): string {
+  return `"${name.replace(/"/g, '""')}"`;
+}
+
+function repairMissingV5Columns(db: DatabaseSync): void {
+  for (const [table, shape] of requiredV5TableShapes()) {
+    const existing = new Set((db.prepare(`PRAGMA table_info(${quoteIdentifier(table)})`).all() as Array<{ name: string }>).map(({ name }) => name));
+    const missing = shape.columns.filter(({ name }) => !existing.has(name));
+    if (missing.length === 0) continue;
+
+    const temporary = `__qlb_v5_repair_${table}`;
+    const create = shape.sql.replace(/^CREATE TABLE\s+(?:IF NOT EXISTS\s+)?(?:"[^"]+"|\S+)/i, `CREATE TABLE ${quoteIdentifier(temporary)}`);
+    db.exec(`DROP TABLE IF EXISTS ${quoteIdentifier(temporary)}; ${create}`);
+    const names = shape.columns.map(({ name }) => quoteIdentifier(name)).join(', ');
+    const values = shape.columns.map((column) => {
+      if (existing.has(column.name)) return quoteIdentifier(column.name);
+      if (column.defaultValue !== null) return column.defaultValue;
+      if (column.primaryKey) return 'rowid';
+      if (column.notNull && /char|clob|text/i.test(column.type)) return "''";
+      return column.notNull ? '0' : 'NULL';
+    }).join(', ');
+    db.exec(`INSERT INTO ${quoteIdentifier(temporary)} (${names}) SELECT ${values} FROM ${quoteIdentifier(table)};
+      DROP TABLE ${quoteIdentifier(table)};
+      ALTER TABLE ${quoteIdentifier(temporary)} RENAME TO ${quoteIdentifier(table)};`);
+  }
 }
 
 function migrationNeeded(db: DatabaseSync): boolean {
   const version = readUserVersion(db);
   return version < 5 || (version === 5 && schemaNeedsV5Correction(db));
 }
-
-const LIFECYCLE_ONE_OPEN_INDEX_SQL = `CREATE UNIQUE INDEX lifecycle_one_open ON lifecycle ((1))
-  WHERE state IN ('cutting-over','cutover','undoing','rolled-back','retired','aborted')`;
 
 function normalizedSql(sql: string): string {
   return sql.replace(/\s+/g, ' ').trim().toLowerCase();
@@ -746,6 +847,11 @@ export class Store {
       }
       ensureDecisionColumnsOn(this.db);
       this.migrateV5Schema();
+      repairMissingV5Columns(this.db);
+      if (!lifecycleOneOpenIndexMatches(this.db)) {
+        this.db.exec('DROP INDEX IF EXISTS lifecycle_one_open');
+        this.db.exec(`${LIFECYCLE_ONE_OPEN_INDEX_SQL};`);
+      }
       this.db.exec('PRAGMA user_version = 5');
       this.db.exec('COMMIT');
     } catch (err) {
@@ -792,52 +898,7 @@ export class Store {
       }
       this.db.exec('DROP TABLE usage_polls; ALTER TABLE usage_polls_v5 RENAME TO usage_polls');
     }
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS claude_slots (
-        account_id TEXT PRIMARY KEY, slot_num INTEGER UNIQUE, email TEXT, alias TEXT, org_uuid TEXT,
-        config_json TEXT NOT NULL, fingerprint TEXT, prev_fingerprint TEXT, threshold REAL,
-        dead INTEGER NOT NULL DEFAULT 0, dead_reason TEXT, dead_at INTEGER, healed_at INTEGER,
-        added_at INTEGER NOT NULL, last_active_at INTEGER, source TEXT, archived_at INTEGER
-      );
-      CREATE TABLE IF NOT EXISTS codex_slots (
-        account_id TEXT PRIMARY KEY, chatgpt_user_id TEXT NOT NULL, chatgpt_account_id TEXT NOT NULL,
-        email TEXT, alias TEXT, fingerprint TEXT, prev_fingerprint TEXT, threshold REAL, last_refresh TEXT,
-        dead INTEGER NOT NULL DEFAULT 0, dead_reason TEXT, dead_at INTEGER, healed_at INTEGER,
-        pending_adopt INTEGER NOT NULL DEFAULT 0, added_at INTEGER NOT NULL, last_active_at INTEGER, source TEXT, archived_at INTEGER
-      );
-      CREATE TABLE IF NOT EXISTS active_login (provider TEXT PRIMARY KEY, account_id TEXT, since INTEGER NOT NULL, set_by TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS switch_log (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, provider TEXT NOT NULL, from_account TEXT, to_account TEXT NOT NULL,
-        trigger TEXT NOT NULL, outcome TEXT NOT NULL, outgoing_kind TEXT, binding_json TEXT, steps_json TEXT, open_sessions_json TEXT, error TEXT,
-        injected INTEGER NOT NULL DEFAULT 0, detail TEXT, published_at INTEGER, committed_at INTEGER
-      );
-      CREATE TABLE IF NOT EXISTS usage_polls (
-        provider TEXT NOT NULL, account_id TEXT NOT NULL, last_fetch_at INTEGER, last_attempt_at INTEGER, next_due_at INTEGER,
-        last_status TEXT, consecutive_failures INTEGER NOT NULL DEFAULT 0, backoff_until INTEGER, last_429_at INTEGER, held_until INTEGER,
-        PRIMARY KEY (provider, account_id)
-      );
-      CREATE TABLE IF NOT EXISTS relogin_events (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, provider TEXT NOT NULL, account_id TEXT,
-        kind TEXT NOT NULL, detail TEXT, evidence TEXT, user_denied_at INTEGER
-      );
-      CREATE TABLE IF NOT EXISTS health_log (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, phase TEXT NOT NULL, overall TEXT NOT NULL,
-        failing_json TEXT NOT NULL, dead_slots_json TEXT NOT NULL, release_sha TEXT
-      );
-      CREATE TABLE IF NOT EXISTS lineage_log (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, provider TEXT NOT NULL, account_id TEXT NOT NULL,
-        from_fp TEXT, to_fp TEXT NOT NULL, cause TEXT NOT NULL, by TEXT NOT NULL, evidence TEXT
-      );
-      CREATE TABLE IF NOT EXISTS lifecycle (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, state TEXT NOT NULL, began_at INTEGER NOT NULL, cutover_at INTEGER, window_end INTEGER,
-        extended_at INTEGER, undo_began_at INTEGER, rollback_at INTEGER, retired_at INTEGER, closed_at INTEGER,
-        release_sha TEXT, drill_done_at INTEGER, note TEXT, pre_fence_state TEXT
-      );
-      CREATE TABLE IF NOT EXISTS codex_watch (switch_id INTEGER PRIMARY KEY, provider TEXT NOT NULL, outgoing TEXT NOT NULL, target TEXT NOT NULL, next_at INTEGER NOT NULL, until INTEGER NOT NULL);
-      CREATE TABLE IF NOT EXISTS import_runs (run_id TEXT PRIMARY KEY, started_at INTEGER NOT NULL, committed_at INTEGER);
-      CREATE TABLE IF NOT EXISTS pi_export_targets (provider TEXT NOT NULL, target TEXT NOT NULL, slot_account_id TEXT NOT NULL, lineage_fp TEXT NOT NULL, recorded_at INTEGER NOT NULL, PRIMARY KEY (provider, target));
-      CREATE TABLE IF NOT EXISTS codex_live_observations (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, identity TEXT, lineage_fp TEXT, by TEXT NOT NULL);
-    `);
+    this.db.exec(V5_SCHEMA_DDL);
     this.addColumnIfMissing('claude_slots', 'archived_at', 'INTEGER');
     this.addColumnIfMissing('codex_slots', 'pending_adopt', 'INTEGER NOT NULL DEFAULT 0');
     this.addColumnIfMissing('codex_slots', 'archived_at', 'INTEGER');
@@ -1423,7 +1484,10 @@ export class Store {
     const result = this.db.prepare(`INSERT INTO switch_log (ts, provider, from_account, to_account, trigger, outcome, outgoing_kind, binding_json, steps_json, open_sessions_json, error, injected, detail, published_at, committed_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
       row.ts ?? Date.now(), row.provider, row.fromAccount ?? null, row.toAccount, row.trigger, row.outcome,
-      row.outgoingKind ?? null, row.bindingJson ?? null, row.stepsJson ?? null, row.openSessionsJson ?? null,
+      row.outgoingKind ?? null,
+      row.bindingJson == null ? null : redactSecrets(row.bindingJson, []),
+      row.stepsJson == null ? null : redactSecrets(row.stepsJson, []),
+      row.openSessionsJson == null ? null : redactSecrets(row.openSessionsJson, []),
       row.error == null ? null : redactSecrets(row.error, []), row.injected ? 1 : 0,
       row.detail == null ? null : redactSecrets(row.detail, []), row.publishedAt ?? null, row.committedAt ?? null,
     );

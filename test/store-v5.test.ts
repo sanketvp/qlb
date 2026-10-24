@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { describe, it } from 'node:test';
 import { openStore } from '../src/store';
@@ -57,6 +57,48 @@ describe('store v5 schema (AC38)', () => {
       const index = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'lifecycle_one_open'").get() as { sql: string };
       assert.match(index.sql, /aborted/);
     } finally { db.close(); }
+  });
+
+  it('backs up and corrects user_version=5 databases missing a §3.2 table or column', () => {
+    const tablePath = join(mkdtempSync(join(tmpdir(), 'qlb-v5-table-correct-')), 'qlb.db');
+    const columnPath = join(mkdtempSync(join(tmpdir(), 'qlb-v5-column-correct-')), 'qlb.db');
+
+    for (const [path, change] of [
+      [tablePath, 'DROP TABLE active_login'],
+      [columnPath, 'ALTER TABLE decisions DROP COLUMN provider'],
+    ] as const) {
+      const initial = openStore(path);
+      initial.upsertAccount('fixture-account', 'anthropic', 'fixture');
+      initial.close();
+      const db = new DatabaseSync(path);
+      db.exec(change);
+      db.close();
+
+      const backupsDir = join(dirname(path), 'backups');
+      const beforeBackups = new Set(readdirSync(backupsDir));
+      const corrected = openStore(path);
+      corrected.close();
+
+      const newBackups = readdirSync(backupsDir).filter((name) => !beforeBackups.has(name) && name.endsWith('.sqlite'));
+      assert.equal(newBackups.length, 1, 'the correction must take a backup first');
+      const backup = dbAt(join(backupsDir, newBackups[0]));
+      try {
+        assert.equal((backup.prepare('SELECT provider FROM accounts WHERE id = ?').get('fixture-account') as { provider: string }).provider, 'anthropic');
+      } finally { backup.close(); }
+    }
+
+    const tableCheck = dbAt(tablePath);
+    const columnCheck = dbAt(columnPath);
+    try {
+      assert.ok(tableCheck.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'active_login'").get());
+      assert.ok(columns(columnCheck, 'decisions').includes('provider'));
+      for (const db of [tableCheck, columnCheck]) {
+        assert.equal((db.prepare('SELECT provider FROM accounts WHERE id = ?').get('fixture-account') as { provider: string }).provider, 'anthropic');
+      }
+    } finally {
+      tableCheck.close();
+      columnCheck.close();
+    }
   });
 
   it('rebuilds a pre-release lifecycle index whose predicate omits aborted', () => {
@@ -170,6 +212,32 @@ describe('store v5 schema (AC38)', () => {
       assert.equal(settings.intervalSeconds, 15);
       assert.equal(settings.unhealthyTicks, 100);
     } finally { store.close(); }
+  });
+
+  it('redacts token-shaped recordSwitch JSON fields while preserving valid JSON', () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'qlb-v5-switch-redact-')), 'qlb.db');
+    const store = openStore(path);
+    const token = `sk-${'x'.repeat(32)}`;
+    store.recordSwitch({
+      ts: 1,
+      provider: 'anthropic',
+      toAccount: 'id',
+      trigger: 'manual',
+      outcome: 'failed',
+      bindingJson: JSON.stringify({ value: token }),
+      stepsJson: JSON.stringify({ value: token }),
+      openSessionsJson: JSON.stringify({ value: token }),
+    });
+    store.close();
+
+    const db = dbAt(path);
+    try {
+      const row = db.prepare('SELECT binding_json, steps_json, open_sessions_json FROM switch_log').get() as Record<string, string>;
+      for (const value of Object.values(row)) {
+        assert.equal(value.includes(token), false);
+        assert.deepEqual(JSON.parse(value), { value: '[redacted]' });
+      }
+    } finally { db.close(); }
   });
 
   it('redacts token-shaped detail and evidence text without changing ids or fingerprints', () => {
