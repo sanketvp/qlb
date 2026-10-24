@@ -7,12 +7,12 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 // Derived from the module mapping table in spec §3.1 (D1 / AC42).
 const PORTED_MODULES = [
   ['src/fsutil.ts', [['src/claude_swap/fsutil.py', '134-246']]],
-  ['src/cc-locks.ts', [['src/claude_swap/claude_locks.py', '46-70,75-93,94-127,129-197']]],
-  ['src/anthropic-oauth.ts', [['src/claude_swap/oauth.py', '44-70,95-101,105-140,154-167,211-226']]],
+  ['src/cc-locks.ts', [['src/claude_swap/claude_locks.py', '46-70,75-93,94-127,129-197,198-228']]],
+  ['src/anthropic-oauth.ts', [['src/claude_swap/oauth.py', '25-70,95-101,105-140,154-183,200-257']]],
   ['src/lines.ts', [['src/claude_swap/lines.py', '39-64,88-126']]],
   ['src/poll-policy.ts', [
-    ['src/claude_swap/poll_policy.py', '76-262'],
-    ['src/claude_swap/usage_store.py', '439-491'],
+    ['src/claude_swap/poll_policy.py', '76-285'],
+    ['src/claude_swap/usage_store.py', '411-421,439-493'],
     ['src/claude_swap/lines.py', '39-45'],
   ]],
 ];

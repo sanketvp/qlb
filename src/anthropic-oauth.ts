@@ -1,6 +1,6 @@
 /*
  * Ported from claude-swap 0.28.0.
- * Upstream file(s): src/claude_swap/oauth.py:44-70,95-101,105-140,154-167,211-226.
+ * Upstream file(s): src/claude_swap/oauth.py:25-70,95-101,105-140,154-183,200-257.
  * License: MIT.
  * Modified for QLB. See NOTICE.
  */
@@ -210,8 +210,8 @@ export function buildRefreshRequest(
 }
 
 /**
- * Classify a token-endpoint response. C-swap v0.28.0 `oauth.py` lines 154–167 and
- * 200–225 makes a missing refresh token or `invalid_grant` permanently dead;
+ * Classify a token-endpoint response. C-swap v0.28.0 `oauth.py` lines 154–183 and
+ * 200–257 establish a missing refresh token or `invalid_grant` as permanently dead;
  * `invalid_client` is deterministic but systemic, and all other failures are transient.
  */
 export function classifyRefreshResponse(status: number | null | undefined, body: string): RefreshClassification {
