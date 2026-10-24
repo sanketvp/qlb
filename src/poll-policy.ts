@@ -30,6 +30,12 @@ export interface DueCandidateSlot {
   nextDueAt?: number | null;
   pollIntervalS?: number | null;
   backoffUntil?: number | null;
+  /** Persisted `usage_polls.held_until`; a live holder owns the next read. */
+  heldUntil?: number | null;
+  /** Persisted terminal fetch result; `token_dead` is never retried here. */
+  lastStatus?: string | null;
+  /** Collector classification when its dead-token state is not serialized as a status. */
+  deadToken?: boolean;
 }
 
 type RelevantWindow = readonly [label: string, pct: number, resetsAt: unknown];
@@ -297,10 +303,13 @@ export function planOversleepsInterval(
 /**
  * Return the due candidate least recently attempted or measured, or null.
  *
- * A slot remains ineligible until its backoff and planned due time have both
- * elapsed. Among eligible slots, max(lastFetchAt, lastAttemptAt) rotates a
- * slot that repeatedly fails without producing a measurement behind other due
- * slots, matching usage_store.py's starvation protection.
+ * A slot remains ineligible until its backoff, holder lease, and planned due
+ * time have all elapsed; a dead token is permanently quarantined.  These
+ * gates mirror the upstream ordering in `usage_store.py:439-491` (especially
+ * `:455-459`).  QLB persists temporary sentinel outcomes as `heldUntil`, so
+ * they yield for one interval while `token_dead` stays excluded.  Among
+ * eligible slots, max(lastFetchAt, lastAttemptAt) rotates a slot that
+ * repeatedly fails without producing a measurement behind other due slots.
  */
 export function dueCandidate(
   candidates: readonly string[],
@@ -314,7 +323,13 @@ export function dueCandidate(
       due.push([0, slot]);
       continue;
     }
+    if (entry.lastStatus === 'token_dead' || entry.deadToken === true) {
+      continue;
+    }
     if (entry.backoffUntil !== null && entry.backoffUntil !== undefined && now < entry.backoffUntil) {
+      continue;
+    }
+    if (entry.heldUntil !== null && entry.heldUntil !== undefined && now < entry.heldUntil) {
       continue;
     }
     if (
