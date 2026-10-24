@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync, rmSync } from 'node:fs';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync, rmSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { delimiter, join } from 'node:path';
 import { describe, it, after } from 'node:test';
 import { setupHermes } from '../src/setup-hermes';
 
@@ -44,6 +44,14 @@ describe('setup hermes', () => {
   function watchPlistFor(name: string, env: NodeJS.ProcessEnv = {}): string {
     const home = join(tmp, name);
     const hermesHome = join(home, '.hermes');
+    // Isolation: the models script setupHermes runs must never reach a real hermes/~/.hermes.
+    // The script honours QLB_BIN and HERMES_BIN (not HERMES_HOME); we pin all of them plus a PATH stub.
+    const binDir = join(home, 'bin');
+    mkdirSync(binDir, { recursive: true });
+    const stubLog = join(home, 'hermes-stub.log');
+    const stub = join(binDir, 'hermes');
+    writeFileSync(stub, `#!/bin/sh\necho "$@" >> ${JSON.stringify(stubLog)}\nexit 1\n`);
+    chmodSync(stub, 0o755);
     const watchLabel = env.QLB_WATCH_LABEL ?? 'com.sanket.qlb-hermes-watch';
     return execFileSync(
       process.execPath,
@@ -59,19 +67,49 @@ describe('setup hermes', () => {
         });
         process.stdout.write(require('node:fs').readFileSync(${JSON.stringify(join(home, 'Library', 'LaunchAgents', `${watchLabel}.plist`))}, 'utf8'));
       `],
-      { encoding: 'utf8', env: { ...process.env, ...env, QLB_BIN: '/no-such-qlb' } },
+      {
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          ...env,
+          QLB_BIN: '/no-such-qlb',
+          HERMES_HOME: hermesHome,
+          HERMES_BIN: '/no-such-hermes',
+          PATH: `${binDir}${delimiter}${process.env.PATH ?? ''}`,
+        },
+      },
     );
+  }
+
+  function stubLogFor(name: string): string {
+    const log = join(tmp, name, 'hermes-stub.log');
+    return existsSync(log) ? readFileSync(log, 'utf8') : '';
   }
 
   it('writes default proxy and watch labels into the watch agent environment', () => {
     const plist = watchPlistFor('watch-default-labels');
     assert.match(plist, /<key>QLB_LAUNCHD_LABEL<\/key><string>com\.sanket\.qlb-proxy<\/string>/);
     assert.match(plist, /<key>QLB_WATCH_LABEL<\/key><string>com\.sanket\.qlb-hermes-watch<\/string>/);
+    assert.doesNotMatch(stubLogFor('watch-default-labels'), /config set/);
   });
 
   it('writes a custom proxy label into the watch agent environment', () => {
     const plist = watchPlistFor('watch-custom-proxy-label', { QLB_LAUNCHD_LABEL: 'com.example.proxy' });
     assert.match(plist, /<key>QLB_LAUNCHD_LABEL<\/key><string>com\.example\.proxy<\/string>/);
+  });
+
+  it('XML-escapes a custom proxy label in the watch plist and keeps it well-formed', () => {
+    const name = 'watch-escaped-proxy-label';
+    const plist = watchPlistFor(name, { QLB_LAUNCHD_LABEL: 'com.example&proxy<x' });
+    assert.match(plist, /<key>QLB_LAUNCHD_LABEL<\/key><string>com\.example&amp;proxy&lt;x<\/string>/);
+    assert.doesNotMatch(plist, /com\.example&proxy<x/);
+    assert.doesNotMatch(stubLogFor(name), /config set/);
+    if (process.platform === 'darwin') {
+      const file = join(tmp, name, 'watch.plist');
+      writeFileSync(file, plist);
+      const lint = spawnSync('plutil', ['-lint', file], { encoding: 'utf8' });
+      assert.equal(lint.status, 0, lint.stdout + lint.stderr);
+    }
   });
 
   it('XML-escapes custom watch labels in the watch plist', () => {
