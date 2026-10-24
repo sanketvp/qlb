@@ -4,6 +4,7 @@
 import { existsSync, statSync } from 'node:fs';
 import { mkdir, rmdir, stat, utimes } from 'node:fs/promises';
 import { homedir } from 'node:os';
+import { performance } from 'node:perf_hooks';
 import { basename, join } from 'node:path';
 
 /** Claude Code's `proper-lockfile` stale interval for OAuth-refresh locks. */
@@ -50,8 +51,8 @@ export interface ClaudeLockPaths {
   configLockDir: string;
 }
 
-function resolvedEnv(options: ClaudeLockOptions): NodeJS.ProcessEnv {
-  return options.env ?? process.env;
+function resolvedEnv({ env = process.env }: ClaudeLockOptions): NodeJS.ProcessEnv {
+  return env;
 }
 
 function resolvedHome(options: ClaudeLockOptions): string {
@@ -93,40 +94,34 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-interface LockDirectoryIdentity {
-  dev: number;
-  ino: number;
-}
-
-async function lockDirectoryIdentity(lockDir: string): Promise<LockDirectoryIdentity | undefined> {
-  try {
-    const held = await stat(lockDir);
-    return { dev: held.dev, ino: held.ino };
-  } catch {
-    return undefined;
-  }
-}
-
-async function stillOwnsLock(lockDir: string, identity: LockDirectoryIdentity | undefined): Promise<boolean> {
-  if (!identity) return false;
-  const current = await lockDirectoryIdentity(lockDir);
-  return current?.dev === identity.dev && current.ino === identity.ino;
-}
-
 async function bestEffortRelease(lockDir: string): Promise<void> {
   try {
     await rmdir(lockDir);
-  } catch (error) {
-    // C-swap logs these cases, but cleanup must never replace the caller's result.
-    // ENOENT means a stale-lock contender already removed it; other failures are similarly
-    // non-fatal here because a subsequent contender will apply the stale-lock protocol.
-    void error;
+  } catch {
+    // Match the ignored cleanup failure in claude_locks.py:121-125.
+  }
+}
+
+async function releaseHeldLock(lockDir: string): Promise<void> {
+  try {
+    await rmdir(lockDir);
+  } catch (error: unknown) {
+    // Match claude_locks.py:188-195: release failures must not replace the callback result.
+    if (error && typeof error === 'object' && (error as NodeJS.ErrnoException).code === 'ENOENT') {
+      console.warn(`Lock ${lockDir} vanished while held (taken over as stale?)`);
+    } else {
+      console.warn(`Failed to release lock ${lockDir}: ${String(error)}`);
+    }
   }
 }
 
 /**
  * Remove a stale lock only while holding its sibling takeover directory. The re-check prevents
  * a second stale contender from removing a first contender's freshly recreated lock.
+ *
+ * Like upstream claude_locks.py:94-125, this sidecar coordinates only ported/C-swap contenders;
+ * Claude Code's native proper-lockfile does not consult it, so the native-lock takeover race
+ * remains an intentional upstream limitation.
  */
 async function removeIfStillStale(lockDir: string, stalenessMs: number): Promise<boolean> {
   const takeoverDir = `${lockDir}${TAKEOVER_SUFFIX}`;
@@ -172,7 +167,7 @@ export async function withProperLockfile<T>(
   const touchIntervalMs = options.touchIntervalMs ?? TOUCH_INTERVAL_MS;
   const retryMinMs = options.retryMinMs ?? RETRY_MIN_MS;
   const retryJitterMs = options.retryJitterMs ?? RETRY_JITTER_MS;
-  const started = Date.now();
+  const started = performance.now();
 
   await mkdir(join(lockDir, '..'), { recursive: true });
   for (;;) {
@@ -185,7 +180,7 @@ export async function withProperLockfile<T>(
       }
     }
 
-    if (Date.now() - started > timeoutMs) throw new ClaudeCodeLockTimeout(lockDir);
+    if (performance.now() - started > timeoutMs) throw new ClaudeCodeLockTimeout(lockDir);
 
     try {
       const held = await stat(lockDir);
@@ -205,19 +200,12 @@ export async function withProperLockfile<T>(
     await sleep(retryMinMs + Math.random() * retryJitterMs);
   }
 
-  const identity = await lockDirectoryIdentity(lockDir);
   let touchInFlight: Promise<void> | undefined;
   const timer = setInterval(() => {
     if (touchInFlight) return;
-    touchInFlight = (async () => {
-      // This narrows the race versus blind path operations, but stat and the mutation are not atomic.
-      if (!await stillOwnsLock(lockDir, identity)) {
-        clearInterval(timer);
-        return;
-      }
-      await utimes(lockDir, new Date(), new Date());
-    })().catch(() => {
-      // The lock was removed or stolen; there is nothing left to refresh.
+    touchInFlight = utimes(lockDir, new Date(), new Date()).catch(() => {
+      // Match claude_locks.py:174-179: a removed/stolen lock ends this touch loop permanently.
+      clearInterval(timer);
     }).finally(() => { touchInFlight = undefined; });
   }, touchIntervalMs);
   timer.unref();
@@ -226,9 +214,9 @@ export async function withProperLockfile<T>(
     return await fn();
   } finally {
     clearInterval(timer);
-    // Like C-swap's thread join, never let a prior holder touch a newly acquired directory.
+    // Like claude_locks.py:186-195, wait for the toucher then release by pathname.
     await touchInFlight;
-    if (await stillOwnsLock(lockDir, identity)) await bestEffortRelease(lockDir);
+    await releaseHeldLock(lockDir);
   }
 }
 

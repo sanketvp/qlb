@@ -263,7 +263,7 @@ describe('Claude Code proper-lockfile locks', () => {
     }
   });
 
-  it('does not touch or remove a replacement holder after losing its lease', async () => {
+  it('touches and releases a replacement lock by pathname, matching upstream', async () => {
     const home = await tempHome();
     const lock = join(home, 'replacement.lock');
     try {
@@ -275,9 +275,9 @@ describe('Claude Code proper-lockfile locks', () => {
         await utimes(lock, old, old);
         const replacementMtime = (await stat(lock)).mtimeMs;
         await sleep(80);
-        assert.equal((await stat(lock)).mtimeMs, replacementMtime, 'former holder must not refresh replacement');
+        assert.ok((await stat(lock)).mtimeMs > replacementMtime, 'upstream toucher refreshes by pathname');
       });
-      assert.equal(existsSync(lock), true, 'former holder must not remove replacement');
+      assert.equal(existsSync(lock), false, 'upstream release removes by pathname');
     } finally {
       await rm(home, { recursive: true, force: true });
     }
