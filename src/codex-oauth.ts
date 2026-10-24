@@ -14,6 +14,37 @@ export interface RequestDescription {
   body?: string;
 }
 
+export type RefreshReason =
+  | 'proactive_expiry'
+  | 'scheduled'
+  | 'unauthorized_recovery'
+  | 'forced';
+
+/** Refresh causes owned by QLB's Codex consume and explicit-refresh paths. */
+export type RefreshTrigger =
+  | 'proactive-expiry'
+  | 'scheduled'
+  | 'unauthorized'
+  | 'force';
+
+/**
+ * Maps QLB's refresh triggers to Codex's wire values. Codex declares the four
+ * spellings in oauth/client.rs:47-61 and includes the chosen value only when
+ * constructing a refresh grant (oauth/client.rs:97-112).
+ */
+export function refreshReasonFor(trigger: RefreshTrigger): RefreshReason {
+  switch (trigger) {
+    case 'proactive-expiry':
+      return 'proactive_expiry';
+    case 'scheduled':
+      return 'scheduled';
+    case 'unauthorized':
+      return 'unauthorized_recovery';
+    case 'force':
+      return 'forced';
+  }
+}
+
 export interface CodexTokens {
   id_token?: string;
   access_token?: string;
@@ -70,12 +101,14 @@ function isObject(value: unknown): value is JsonObject {
 }
 
 /**
- * Describes the forced refresh request QLB makes for a Codex slot.
- * Codex 0.164.0 serializes its refresh grant as JSON, not form data. Its
- * manager always supplies a refresh_reason; QLB's explicit consume action is
- * the corresponding `forced` reason.
+ * Describes a Codex refresh request without sending it. Codex 0.164.0
+ * serializes refresh grants as JSON, not form data, and sends refresh_reason
+ * when one is supplied (oauth/client.rs:97-112).
  */
-export function buildRefreshRequest(refreshToken: string): RequestDescription {
+export function buildRefreshRequest(
+  refreshToken: string,
+  reason: RefreshReason,
+): RequestDescription {
   // OAuthClient collects parameters in a BTreeMap before JSON serialization,
   // hence the intentionally stable key order here (oauth/client.rs:110-128).
   return withRedactedJson({
@@ -85,7 +118,7 @@ export function buildRefreshRequest(refreshToken: string): RequestDescription {
     body: JSON.stringify({
       client_id: CODEX_CLIENT_ID,
       grant_type: 'refresh_token',
-      refresh_reason: 'forced',
+      refresh_reason: reason,
       refresh_token: refreshToken,
     }),
   });
