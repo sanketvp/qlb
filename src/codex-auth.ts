@@ -1,5 +1,6 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { open, readFile as readFileFromDisk, rename, unlink } from 'node:fs/promises';
+import { dirname } from 'node:path';
 
 const ACCESS_EXPIRY_BUFFER_MS = 5 * 60 * 1_000;
 const REFRESH_AGE_MS = 8 * 24 * 60 * 60 * 1_000;
@@ -35,6 +36,8 @@ export type CodexIdentity = {
 export type CodexAuthStableResult =
   | { status: 'ok'; doc: CodexAuthDocument }
   | { status: 'wiped'; error: Exclude<CodexAuthParseError, { error: 'unparseable' }> }
+  | { status: 'missing' }
+  | { status: 'unreadable'; code: string }
   | { status: 'unstable' };
 
 export interface ReadCodexAuthStableOptions {
@@ -83,10 +86,11 @@ export function parseCodexAuth(text: string): CodexAuthParseResult {
     return { ok: false, error: 'tokens-empty', status: 'wiped' };
   }
 
+  const { last_refresh: _lastRefresh, ...documentFields } = parsed;
   return {
     ok: true,
     doc: {
-      ...parsed,
+      ...documentFields,
       tokens: rawTokens as CodexTokens,
       ...(typeof parsed.last_refresh === 'string' ? { last_refresh: parsed.last_refresh } : {}),
     },
@@ -116,7 +120,7 @@ export function accessExpiry(doc: CodexAuthDocument): number | null {
 /** Codex refreshes at five minutes to expiry or after eight days without a refresh. */
 export function needsRefresh(doc: CodexAuthDocument, now: number): boolean {
   const expiry = accessExpiry(doc);
-  if (expiry !== null && expiry <= now + ACCESS_EXPIRY_BUFFER_MS) return true;
+  if (expiry === null || expiry <= now + ACCESS_EXPIRY_BUFFER_MS) return true;
 
   if (typeof doc.last_refresh !== 'string') return false;
   const lastRefresh = Date.parse(doc.last_refresh);
@@ -129,8 +133,38 @@ export function codexFingerprint(doc: CodexAuthDocument): string {
 }
 
 /**
+ * The document was atomically published, but its directory entry could not be
+ * fsynced; callers must not treat this as a failed publish or roll it back.
+ */
+export class PublishedNotDurableError extends Error {
+  constructor(path: string, cause: unknown) {
+    super(`Codex auth document was published but is not durable: ${path}`, { cause });
+    this.name = 'PublishedNotDurableError';
+  }
+}
+
+function errorCode(error: unknown): string | undefined {
+  if (typeof error !== 'object' || error === null || !('code' in error)) return undefined;
+  const { code } = error as { code?: unknown };
+  return typeof code === 'string' ? code : undefined;
+}
+
+async function syncContainingDirectory(path: string): Promise<void> {
+  const directoryHandle = await open(dirname(path), 'r');
+  try {
+    await directoryHandle.sync();
+  } catch (error) {
+    const code = errorCode(error);
+    if (code !== 'EISDIR' && code !== 'EINVAL') throw error;
+  } finally {
+    await directoryHandle.close();
+  }
+}
+
+/**
  * Writes an auth document using a same-directory, mode-0600 temporary file and
  * atomic rename. It never logs the document or any token it contains.
+ * Symlink write-through is handled by the C1b fsutil migration.
  */
 export async function writeCodexAuthAtomic(path: string, doc: CodexAuthDocument): Promise<void> {
   const temporaryPath = `${path}.qlb-tmp-${randomBytes(8).toString('hex')}`;
@@ -151,28 +185,43 @@ export async function writeCodexAuthAtomic(path: string, doc: CodexAuthDocument)
     if (temporaryFileCreated) await unlink(temporaryPath).catch(() => undefined);
     throw error;
   }
+
+  try {
+    await syncContainingDirectory(path);
+  } catch (error) {
+    throw new PublishedNotDurableError(path, error);
+  }
 }
 
 function defaultSleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+type ReadCodexAuthOnceResult =
+  | { status: 'read'; text: string; parsed: CodexAuthParseResult }
+  | { status: 'missing' }
+  | { status: 'unreadable'; code: string };
+
 async function readOnce(
   path: string,
   read: NonNullable<ReadCodexAuthStableOptions['readFile']>,
-): Promise<{ text: string; parsed: CodexAuthParseResult } | null> {
+): Promise<ReadCodexAuthOnceResult> {
   try {
     const text = await read(path, 'utf8');
-    return { text, parsed: parseCodexAuth(text) };
-  } catch {
-    return null;
+    return { status: 'read', text, parsed: parseCodexAuth(text) };
+  } catch (error) {
+    const code = errorCode(error);
+    return code === 'ENOENT'
+      ? { status: 'missing' }
+      : { status: 'unreadable', code: code ?? 'UNKNOWN' };
   }
 }
 
 /**
- * Reads auth.json only after two identical reads separated by an interval.
- * Codex writes in-place, so an unstable document is failed closed rather than
- * returned to a caller. `retries` is the number of two-read attempts.
+ * Reads auth.json only after two identical successful reads separated by an
+ * interval. `unstable` means Codex may be writing; `missing` and `unreadable`
+ * instead report an absent document or a read failure. `retries` is the number
+ * of two-read attempts.
  */
 export async function readCodexAuthStable(
   path: string,
@@ -186,9 +235,14 @@ export async function readCodexAuthStable(
 
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     const first = await readOnce(path, read);
+    if (first.status === 'missing') return first;
+    if (first.status === 'unreadable') return first;
+
     await sleep(intervalMs);
     const second = await readOnce(path, read);
-    if (!first || !second || first.text !== second.text) continue;
+    if (second.status === 'missing') return second;
+    if (second.status === 'unreadable') return second;
+    if (first.text !== second.text) continue;
 
     if (!first.parsed.ok) {
       if (first.parsed.error === 'unparseable') continue;

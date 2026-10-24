@@ -1,18 +1,21 @@
 import assert from 'node:assert/strict';
 import { mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { basename, join } from 'node:path';
-import { describe, it } from 'node:test';
+import { basename, dirname, join } from 'node:path';
+import { describe, it, mock } from 'node:test';
 import { isDeepStrictEqual } from 'node:util';
 import {
   accessExpiry,
   codexFingerprint,
   codexIdentity,
   needsRefresh,
+  PublishedNotDurableError,
   parseCodexAuth,
   readCodexAuthStable,
   writeCodexAuthAtomic,
 } from '../src/codex-auth';
+
+const fsPromises: typeof import('node:fs/promises') = require('node:fs/promises');
 
 function jwt(payload: Record<string, unknown>): string {
   return `eyJhbGciOiJub25lIn0.${Buffer.from(JSON.stringify(payload)).toString('base64url')}.sig`;
@@ -64,6 +67,12 @@ describe('codex auth.json helpers', () => {
     assert.deepEqual(wiped, { ok: false, error: 'tokens-empty', status: 'wiped' });
   });
 
+  it('drops a non-string last_refresh while preserving other unknown fields', () => {
+    const doc = parseValid({ last_refresh: 12_345, unknown_top_level: true });
+    assert.equal(doc.last_refresh, undefined);
+    assert.equal(doc.unknown_top_level, true);
+  });
+
   it('extracts identity only from the namespaced claim and gives stored account ID precedence', () => {
     const doc = parseValid();
     assert.deepEqual(codexIdentity(doc), {
@@ -113,6 +122,25 @@ describe('codex auth.json helpers', () => {
     assert.equal(needsRefresh(staleRefresh, now), true);
   });
 
+  it('fails closed when the access-token expiry cannot be decoded', () => {
+    const now = 1_700_000_000_000;
+    const recentRefresh = new Date(now - 60_000).toISOString();
+    for (const accessToken of ['not-a-jwt', jwt({})]) {
+      for (const lastRefresh of [undefined, recentRefresh]) {
+        const doc = parseValid({
+          tokens: {
+            id_token: jwt({}),
+            access_token: accessToken,
+            refresh_token: 'test-refresh-token',
+            account_id: 'stored-account',
+          },
+          last_refresh: lastRefresh,
+        });
+        assert.equal(needsRefresh(doc, now), true);
+      }
+    }
+  });
+
   it('fingerprints only the refresh token with the sha256 prefix', () => {
     const fingerprint = codexFingerprint(parseValid());
     assert.match(fingerprint, /^sha256:[a-f0-9]{64}$/);
@@ -129,6 +157,57 @@ describe('codex auth.json helpers', () => {
       assert.equal((await stat(path)).mode & 0o777, 0o600);
       await assert.rejects(stat(`${path}.qlb-tmp`));
     } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('reports directory-fsync failures as published but not durable', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'qlb-codex-auth-'));
+    const path = join(dir, 'auth.json');
+    const originalOpen = fsPromises.open;
+    const directoryHandle = {
+      sync: async () => {
+        throw Object.assign(new Error('directory sync failed'), { code: 'EIO' });
+      },
+      close: async () => {},
+    };
+    const openMock = mock.method(fsPromises, 'open', async (...args: Parameters<typeof fsPromises.open>) => {
+      const [file, flags] = args;
+      if (file === dirname(path) && flags === 'r') return directoryHandle as never;
+      return originalOpen(...args);
+    });
+    try {
+      await assert.rejects(
+        writeCodexAuthAtomic(path, parseValid()),
+        (error: unknown) => error instanceof PublishedNotDurableError,
+      );
+      assert.deepEqual(JSON.parse(await readFile(path, 'utf8')), parseValid());
+    } finally {
+      openMock.mock.restore();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('ignores platform directory-fsync EINVAL failures', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'qlb-codex-auth-'));
+    const path = join(dir, 'auth.json');
+    const originalOpen = fsPromises.open;
+    const directoryHandle = {
+      sync: async () => {
+        throw Object.assign(new Error('directory sync unsupported'), { code: 'EINVAL' });
+      },
+      close: async () => {},
+    };
+    const openMock = mock.method(fsPromises, 'open', async (...args: Parameters<typeof fsPromises.open>) => {
+      const [file, flags] = args;
+      if (file === dirname(path) && flags === 'r') return directoryHandle as never;
+      return originalOpen(...args);
+    });
+    try {
+      await writeCodexAuthAtomic(path, parseValid());
+      assert.deepEqual(JSON.parse(await readFile(path, 'utf8')), parseValid());
+    } finally {
+      openMock.mock.restore();
       await rm(dir, { recursive: true, force: true });
     }
   });
@@ -167,6 +246,36 @@ describe('codex auth.json helpers', () => {
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
+  });
+
+  it('returns missing and unreadable reads immediately rather than reporting Codex is writing', async () => {
+    let missingReads = 0;
+    let missingSleeps = 0;
+    const missing = await readCodexAuthStable('/fake/auth.json', {
+      intervalMs: 0,
+      retries: 5,
+      sleep: async () => { missingSleeps += 1; },
+      readFile: async () => {
+        missingReads += 1;
+        throw Object.assign(new Error('not found'), { code: 'ENOENT' });
+      },
+    });
+    assert.deepEqual(missing, { status: 'missing' });
+    assert.equal(missingReads, 1);
+    assert.equal(missingSleeps, 0);
+
+    let unreadableReads = 0;
+    const unreadable = await readCodexAuthStable('/fake/auth.json', {
+      intervalMs: 0,
+      retries: 5,
+      sleep: async () => { throw new Error('should not sleep'); },
+      readFile: async () => {
+        unreadableReads += 1;
+        throw Object.assign(new Error('permission denied'), { code: 'EACCES' });
+      },
+    });
+    assert.deepEqual(unreadable, { status: 'unreadable', code: 'EACCES' });
+    assert.equal(unreadableReads, 1);
   });
 
   it('reports wiped stable documents and retries truncated reads five times before unstable', async () => {
