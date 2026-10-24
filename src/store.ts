@@ -361,7 +361,7 @@ function schemaNeedsV5Correction(db: DatabaseSync): boolean {
     claude_slots: ['archived_at'],
     codex_slots: ['pending_adopt', 'archived_at'],
     switch_log: ['injected', 'detail', 'published_at', 'committed_at'],
-    usage_polls: ['provider'],
+    usage_polls: ['provider', 'poll_interval_s'],
     relogin_events: ['evidence', 'user_denied_at'],
     lineage_log: ['evidence'],
     lifecycle: ['pre_fence_state'],
@@ -778,7 +778,7 @@ export class Store {
       this.db.exec(`
         CREATE TABLE usage_polls_v5 (
           provider TEXT NOT NULL, account_id TEXT NOT NULL,
-          last_fetch_at INTEGER, last_attempt_at INTEGER, next_due_at INTEGER,
+          last_fetch_at INTEGER, last_attempt_at INTEGER, next_due_at INTEGER, poll_interval_s REAL,
           last_status TEXT, consecutive_failures INTEGER NOT NULL DEFAULT 0,
           backoff_until INTEGER, last_429_at INTEGER, held_until INTEGER,
           PRIMARY KEY (provider, account_id)
@@ -812,7 +812,7 @@ export class Store {
         injected INTEGER NOT NULL DEFAULT 0, detail TEXT, published_at INTEGER, committed_at INTEGER
       );
       CREATE TABLE IF NOT EXISTS usage_polls (
-        provider TEXT NOT NULL, account_id TEXT NOT NULL, last_fetch_at INTEGER, last_attempt_at INTEGER, next_due_at INTEGER,
+        provider TEXT NOT NULL, account_id TEXT NOT NULL, last_fetch_at INTEGER, last_attempt_at INTEGER, next_due_at INTEGER, poll_interval_s REAL,
         last_status TEXT, consecutive_failures INTEGER NOT NULL DEFAULT 0, backoff_until INTEGER, last_429_at INTEGER, held_until INTEGER,
         PRIMARY KEY (provider, account_id)
       );
@@ -838,6 +838,7 @@ export class Store {
       CREATE TABLE IF NOT EXISTS pi_export_targets (provider TEXT NOT NULL, target TEXT NOT NULL, slot_account_id TEXT NOT NULL, lineage_fp TEXT NOT NULL, recorded_at INTEGER NOT NULL, PRIMARY KEY (provider, target));
       CREATE TABLE IF NOT EXISTS codex_live_observations (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, identity TEXT, lineage_fp TEXT, by TEXT NOT NULL);
     `);
+    this.addColumnIfMissing('usage_polls', 'poll_interval_s', 'REAL');
     this.addColumnIfMissing('claude_slots', 'archived_at', 'INTEGER');
     this.addColumnIfMissing('codex_slots', 'pending_adopt', 'INTEGER NOT NULL DEFAULT 0');
     this.addColumnIfMissing('codex_slots', 'archived_at', 'INTEGER');
@@ -1066,6 +1067,31 @@ export class Store {
       this.db.exec('ROLLBACK');
       throw err;
     }
+  }
+
+  /**
+   * Persist next-poll plans as one short write transaction.  This deliberately
+   * does not alter fetch, attempt, hold, or failure state, so the policy can
+   * re-spread a wake-from-sleep cohort without claiming or polling it.
+   */
+  writeUsagePollPlans(
+    provider: string,
+    plans: Readonly<Record<string, { nextDueAt: number; pollIntervalS: number }>>,
+  ): void {
+    const rows = Object.entries(plans);
+    if (rows.length === 0) return;
+    this.runImmediate(() => {
+      const write = this.db.prepare(`
+        INSERT INTO usage_polls (provider, account_id, next_due_at, poll_interval_s)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(provider, account_id) DO UPDATE SET
+          next_due_at = excluded.next_due_at,
+          poll_interval_s = excluded.poll_interval_s
+      `);
+      for (const [accountId, plan] of rows) {
+        write.run(provider, accountId, plan.nextDueAt, plan.pollIntervalS);
+      }
+    });
   }
 
   /**
