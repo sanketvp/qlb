@@ -12,6 +12,7 @@
 import { execFileSync } from 'node:child_process';
 
 import {
+  KeychainAccessDeniedError,
   assertKeychainAccess,
   isAllowedKeychainService,
   type KeychainAllowlistOptions,
@@ -167,8 +168,9 @@ export async function keychainDelete(
 }
 
 /**
- * READ-ONLY lookup of a native (non-`qlb:`) secret. Used for OpenRouter's
- * `pi-openrouter` item. Never writes. On macOS this is a service-only
+ * READ-ONLY lookup of the native OpenRouter secret. The fixed allowlist is
+ * enforced before any backend call: only the `pi-openrouter` service is
+ * accepted. On macOS this is a service-only
  * `security find-generic-password -s <service> -w` lookup — the same argv
  * QLB has always used, so existing Keychain items keep working. On
  * Linux/Windows it reads account `qlb` from the platform store.
@@ -182,7 +184,20 @@ export function openRouterMissingKeyMessage(service: string): string {
     : `OpenRouter key not found in credential store (service ${service})`;
 }
 
+/** Enforce the native OpenRouter reader's narrower service capability. */
+export function assertNativeOpenRouterService(service: string): void {
+  assertKeychainAccess(service, NATIVE_SECRET_ACCOUNT, 'read');
+  if (service !== 'pi-openrouter') {
+    throw new KeychainAccessDeniedError(
+      service,
+      'read',
+      'only pi-openrouter is a valid native OpenRouter source',
+    );
+  }
+}
+
 export function readNativeOpenRouterKey(service: string): string {
+  assertNativeOpenRouterService(service);
   if (process.platform === 'darwin') {
     try {
       const stdout = execFileSync(

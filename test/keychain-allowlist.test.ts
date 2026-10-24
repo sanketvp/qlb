@@ -5,6 +5,7 @@ import {
   KeychainAccessDeniedError,
   MacosKeychainBackend,
   assertKeychainAccess,
+  assertNativeOpenRouterService,
   withServiceGuard,
   type ExecFileSyncFn,
 } from '../src/keychain';
@@ -60,6 +61,16 @@ describe('Keychain access allowlist', () => {
       KeychainAccessDeniedError,
     );
     assert.equal(calls.length, 1);
+  });
+
+  it('allows only pi-openrouter for native OpenRouter reads before backend access', () => {
+    assert.doesNotThrow(() => assertNativeOpenRouterService('pi-openrouter'));
+    for (const service of ['some-other-app', 'qlb:openrouter:x', 'claude-swap']) {
+      assert.throws(
+        () => assertNativeOpenRouterService(service),
+        KeychainAccessDeniedError,
+      );
+    }
   });
 
   for (const service of CLAUDE_SERVICES) {
