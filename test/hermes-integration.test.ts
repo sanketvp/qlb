@@ -287,4 +287,34 @@ describe('hermes integration checks', () => {
     const config = checks.find((c) => c.name === 'hermes:config');
     assert.equal(config?.level, 'PASS', config?.message ?? 'no hermes:config check');
   });
+
+  it('fails a qlb-codex api that is not a URL ending in /v1, including non-string values', () => {
+    for (const [name, api] of [['codex-api-number', '1'], ['codex-api-bool', 'true'], ['codex-api-slash', 'http://127.0.0.1:47391/v1/']]) {
+      const checks = checksFor(name, (_home, hermesHome) => {
+        writeFileSync(join(hermesHome, 'config.yaml'),
+          `${QLB_PROVIDERS.replace('api: http://127.0.0.1:47391/v1', `api: ${api}`)}model:\n  provider: custom:qlb-anthropic\n`);
+        installPlugin(hermesHome);
+      });
+      const config = checks.find((c) => c.name === 'hermes:config');
+      assert.equal(config?.level, 'FAIL', `${name}: ${config?.message}`);
+      assert.match(config?.message ?? '', /qlb-codex\.api must end in \/v1/);
+    }
+  });
+
+  it('resolves YAML merge keys the way Hermes (PyYAML) does', () => {
+    const checks = checksFor('merge-keys', (_home, hermesHome) => {
+      writeFileSync(join(hermesHome, 'config.yaml'), [
+        'qlb-providers: &qlb-providers',
+        '  qlb-anthropic: {api: http://127.0.0.1:47391, transport: anthropic_messages, key_cmd: token, session_affinity_header: x-qlb-session}',
+        '  qlb-codex: {api: http://127.0.0.1:47391/v1, transport: codex_responses, key_cmd: token, session_affinity_header: x-qlb-session}',
+        'providers:',
+        '  <<: *qlb-providers',
+        'model: {provider: custom:qlb-anthropic}',
+        '',
+      ].join('\n'));
+      installPlugin(hermesHome);
+    });
+    const config = checks.find((c) => c.name === 'hermes:config');
+    assert.equal(config?.level, 'PASS', config?.message ?? 'no hermes:config check');
+  });
 });

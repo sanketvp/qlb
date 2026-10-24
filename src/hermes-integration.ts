@@ -68,8 +68,9 @@ type ParsedYaml = { value: unknown } | { error: string };
 
 function parseYaml(text: string): ParsedYaml {
   try {
-    // Hermes reads this file with PyYAML, which keeps the last of repeated keys; do the same.
-    const doc = parseDocument(text, { uniqueKeys: false });
+    // Hermes reads this file with PyYAML, which keeps the last of repeated keys and resolves
+    // `<<` merge keys; do the same.
+    const doc = parseDocument(text, { uniqueKeys: false, merge: true });
     if (doc.errors.length > 0) return { error: doc.errors[0].message.split(/\r?\n/, 1)[0] };
     return { value: doc.toJS() };
   } catch (error) {
@@ -171,8 +172,8 @@ export function hermesIntegrationChecks(options: HermesIntegrationOptions = {}):
         }
       }
       const codex = providers['qlb-codex'];
-      if (isMapping(codex) && typeof codex.api === 'string'
-        && !/^https?:\/\/\S+\/v1\/?$/.test(codex.api.trim())) {
+      if (isMapping(codex) && hasNonEmptyScalar(codex.api)
+        && !(typeof codex.api === 'string' && /^https?:\/\/\S+\/v1$/.test(codex.api.trim()))) {
         missing.push('qlb-codex.api must end in /v1 (Codex Responses posts to <api>/responses)');
       }
     }
