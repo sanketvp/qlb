@@ -7,7 +7,12 @@ import { describe, it } from 'node:test';
 
 import { loadProviderStub } from '../src/provider-loader';
 import { builtInAdapters } from '../src/adapters';
-import { KNOWN_PROVIDER_NAMES, discoverChecks } from '../src/registry';
+import {
+  KNOWN_PROVIDER_NAMES,
+  discoverChecks,
+  discoverCommands,
+} from '../src/registry';
+import { createCommandContext, dispatchCommand, listCommandNames, prepareCommandArgv } from '../src/cli';
 
 describe('registries', () => {
   it('loads source modules when discovery is explicitly given the ts-node extension', () => {
@@ -59,6 +64,39 @@ describe('registries', () => {
       scripts: { test: string };
     };
     assert.match(packageJson.scripts.test, /clean-registry-output\.cjs dist-test\/src/);
+  });
+
+  it('discovers and dispatches executing fragments by their longest command prefix', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'qlb-registry-command-'));
+    writeFileSync(
+      join(directory, 'short.js'),
+      "module.exports = { default: { name: 'fixture', execute(args, ctx) { ctx.stdout(`short:${args.join(',')}`); return 11; } } };\n",
+    );
+    writeFileSync(
+      join(directory, 'long.js'),
+      "module.exports = { default: { name: 'fixture deploy', execute(args, ctx) { ctx.stdout(`long:${args.join(',')}`); return args[0] === '--help' ? 0 : 37; } } };\n",
+    );
+    const commands = discoverCommands(directory, ['.js']);
+    const output: string[] = [];
+    const context = { ...createCommandContext(), stdout: (line: string) => output.push(line) };
+
+    assert.deepEqual(JSON.parse(JSON.stringify(listCommandNames(commands))), ['fixture', 'fixture deploy']);
+    assert.equal(
+      await dispatchCommand(['node', 'qlb', 'fixture', 'deploy', '--target', 'temporary'], commands, context),
+      37,
+    );
+    assert.deepEqual(output, ['long:--target,temporary']);
+    assert.equal(await dispatchCommand(['node', 'qlb', 'fixture', 'deploy', '--help'], commands, context), 0);
+    assert.deepEqual(output, ['long:--target,temporary', 'long:--help']);
+  });
+
+  it('keeps legacy argv-rewrite fragments unchanged', () => {
+    assert.deepEqual(
+      prepareCommandArgv(['node', 'qlb', 'legacy', 'fragment', '--json'], [
+        { name: 'legacy fragment', run: (args) => ['legacy', '--flag', ...args] },
+      ]),
+      ['node', 'qlb', 'legacy', '--flag', '--json'],
+    );
   });
 
   it('removes stale registry output before a build', () => {

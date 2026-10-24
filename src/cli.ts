@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 import { existsSync, mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import * as net from 'node:net';
 import { dirname, join, resolve } from 'node:path';
 import { adapters } from './adapters';
 import { createDefaultCodexGateDeps, runCodexGate } from './codex-gate';
 import { config, resolveConfig, stripConfigArgs } from './config';
-import { discoverCommands, resolveCommand } from './registry';
+import { discoverCommands, resolveCommand, type CommandContext, type CommandDefinition } from './registry';
+import { redactError } from './redact';
 import { doctorQlb, initializeQlb, listCheckNames, type DoctorReport, type InitReport } from './diagnostics';
 import { platformKeychain } from './keychain';
 import { createOwnedCredentialSource } from './credentials';
@@ -1713,11 +1715,42 @@ async function runNativeResync(opts: NativeResyncOpts): Promise<number> {
   });
 }
 
-export function prepareCommandArgv(argv: string[]): string[] {
+export function prepareCommandArgv(
+  argv: string[],
+  commands: CommandDefinition[] = discoverCommands(),
+): string[] {
   const stripped = stripConfigArgs(argv);
-  const raw = stripped.slice(2);
-  const match = resolveCommand(raw);
-  return match ? [...stripped.slice(0, 2), ...match.command.run(match.args)] : stripped;
+  const match = resolveCommand(stripped.slice(2), commands);
+  return match?.command.run
+    ? [...stripped.slice(0, 2), ...match.command.run(match.args)]
+    : stripped;
+}
+
+export function listCommandNames(commands: CommandDefinition[] = discoverCommands()): string[] {
+  return commands.map((command) => command.name);
+}
+
+export function createCommandContext(): CommandContext {
+  return {
+    stdout: (message) => console.log(message),
+    stderr: (message) => console.error(message),
+    env: process.env,
+    config,
+    loadConfig: resolveConfig,
+    home: homedir(),
+  };
+}
+
+/** Runs an executing registry fragment, or returns null for a legacy fragment. */
+export async function dispatchCommand(
+  argv: string[],
+  commands: CommandDefinition[] = discoverCommands(),
+  context: CommandContext = createCommandContext(),
+): Promise<number | null> {
+  const match = resolveCommand(stripConfigArgs(argv).slice(2), commands);
+  return match?.command.execute
+    ? await match.command.execute(match.args, context)
+    : null;
 }
 
 function isExactListRequest(args: string[], flag: string): boolean {
@@ -1725,17 +1758,27 @@ function isExactListRequest(args: string[], flag: string): boolean {
 }
 
 async function main(): Promise<void> {
-  const argv = prepareCommandArgv(process.argv);
-  const raw = argv.slice(2);
+  const commands = discoverCommands();
+  const stripped = stripConfigArgs(process.argv);
+  const raw = stripped.slice(2);
   if (isExactListRequest(raw, '--list-commands')) {
-    console.log(JSON.stringify(discoverCommands().map((command) => command.name)));
+    console.log(JSON.stringify(listCommandNames(commands)));
     return;
   }
   if (raw[0] === 'doctor' && isExactListRequest(raw.slice(1), '--list-checks')) {
     console.log(JSON.stringify(listCheckNames()));
     return;
   }
-  const opts = parseArgs(argv);
+  const command = resolveCommand(raw, commands);
+  if (command?.command.execute) {
+    try {
+      process.exit(await command.command.execute(command.args, createCommandContext()));
+    } catch (err) {
+      console.error(`qlb ${command.command.name}: ${redactError(err, [])}`);
+      process.exit(1);
+    }
+  }
+  const opts = parseArgs(prepareCommandArgv(process.argv, commands));
   if (opts.cmd === 'init') {
     const report = initializeQlb(config);
     printInit(report, opts.json);

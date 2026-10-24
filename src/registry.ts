@@ -1,9 +1,22 @@
 import { readdirSync } from 'node:fs';
 import { extname, join } from 'node:path';
+import type { QlbConfig, ResolveConfigOptions } from './config';
+
+export interface CommandContext {
+  stdout(message: string): void;
+  stderr(message: string): void;
+  env: NodeJS.ProcessEnv;
+  config: QlbConfig;
+  loadConfig(options?: ResolveConfigOptions): QlbConfig;
+  home: string;
+}
 
 export interface CommandDefinition {
   name: string;
-  run(args: string[]): string[];
+  /** Rewrites argv for a command still handled by cli.ts's legacy parser. */
+  run?: (args: string[]) => string[];
+  /** Runs a self-contained command fragment and returns its process exit code. */
+  execute?: (args: string[], ctx: CommandContext) => Promise<number> | number;
 }
 
 export interface CheckDefinition {
@@ -54,7 +67,13 @@ export function discoverCommands(
   extensions?: string[],
   loadModule?: ModuleLoader,
 ): CommandDefinition[] {
-  return loadDefinitions<CommandDefinition>(directory, extensions, loadModule);
+  const commands = loadDefinitions<CommandDefinition>(directory, extensions, loadModule);
+  for (const command of commands) {
+    if (typeof command.run !== 'function' && typeof command.execute !== 'function') {
+      throw new Error(`command registry entry ${command.name} must provide run or execute`);
+    }
+  }
+  return commands;
 }
 
 export function discoverChecks(
