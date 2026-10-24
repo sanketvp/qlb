@@ -4,8 +4,8 @@
 // (libsecret / GNOME Keyring) and falls back to an AES-256-GCM file.
 // Windows stores DPAPI-encrypted blobs via PowerShell.
 //
-// These classes do NOT enforce the `qlb:` / `qlb-test-` service-name guard;
-// the facade in `keychain.ts` does. Callers that need unscoped native reads
+// These classes do NOT enforce the service-name allowlist; the facade in
+// `keychain.ts` does. Callers that need unscoped native reads
 // (OpenRouter's `pi-openrouter` item) go through that facade, not these
 // classes directly.
 
@@ -169,11 +169,14 @@ export class MacosKeychainBackend extends SyncCredentialBackend {
 
   setSync(service: string, account: string, jsonValue: string): void {
     try {
-      this.exec(
-        'security',
-        ['add-generic-password', '-a', account, '-s', service, '-w', jsonValue, '-U'],
-        { encoding: 'utf8' },
-      );
+      // `security -i` parses this stdin line. `-X` keeps arbitrary JSON safe
+      // for that parser while ensuring secret material is never present in argv.
+      const quote = (value: string) => `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+      const command = [
+        'add-generic-password', '-U', '-a', quote(account), '-s', quote(service),
+        '-X', Buffer.from(jsonValue, 'utf8').toString('hex'),
+      ].join(' ') + '\n';
+      this.exec('security', ['-i'], { encoding: 'utf8', input: command });
     } catch (err) {
       throw wrapCredentialError('set', service, account, err);
     }

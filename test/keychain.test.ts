@@ -11,15 +11,16 @@ import {
 } from '../src/keychain';
 
 describe('keychain service-name safety', () => {
-  it('accepts qlb: and qlb-test- prefixes only', () => {
+  it('recognizes only fixed allowlisted service names', () => {
     assert.equal(isSafeKeychainService('qlb:anthropic:acct-1'), true);
-    assert.equal(isSafeKeychainService('qlb-test-roundtrip'), true);
-    assert.equal(isSafeKeychainService('Claude Code-credentials'), false);
+    assert.equal(isSafeKeychainService('claude-swap'), true);
+    assert.equal(isSafeKeychainService('Claude Code-credentials'), true);
+    assert.equal(isSafeKeychainService('qlb-test-roundtrip'), false);
     assert.equal(isSafeKeychainService(''), false);
     assert.equal(isSafeKeychainService('generic'), false);
     assert.throws(
-      () => assertSafeKeychainService('Claude Code-credentials'),
-      /must start with 'qlb:' or 'qlb-test-'/,
+      () => assertSafeKeychainService('generic'),
+      /service is not allowlisted/,
     );
   });
 
@@ -29,16 +30,16 @@ describe('keychain service-name safety', () => {
 
   it('real keychainSet/Get/Delete refuse unsafe service names before calling security', async () => {
     await assert.rejects(
-      () => keychainSet('Claude Code-credentials', 'x', '{"access":"nope"}'),
-      /must start with 'qlb:' or 'qlb-test-'/,
+      () => keychainSet('claude-swap', 'x', '{"access":"nope"}'),
+      /claude-swap is read-only/,
     );
     await assert.rejects(
       () => keychainGet('~/.pi/agent/auth.json', 'x'),
-      /must start with 'qlb:' or 'qlb-test-'/,
+      /service is not allowlisted/,
     );
     await assert.rejects(
       () => keychainDelete('codex-auth', 'x'),
-      /must start with 'qlb:' or 'qlb-test-'/,
+      /service is not allowlisted/,
     );
   });
 });

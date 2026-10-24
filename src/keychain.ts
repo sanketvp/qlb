@@ -1,16 +1,22 @@
 // Platform-dispatching credential store for QLB (§4.8.1).
 //
-// SAFETY: this module never hardcodes real credential file paths and refuses
-// Keychain / credential-store service names that do not start with `qlb:` or
-// `qlb-test-`. Phase 2a does not import, move, or delete any live credentials.
+// SAFETY: this module never hardcodes real credential file paths. Its fixed
+// allowlist permits QLB-owned `qlb:` items, a read-only C-swap import item, and
+// narrowly scoped Claude Code credential items. Phase 2a does not import, move,
+// or delete any live credentials.
 // Real OAuth grants are Phase 2b, via an explicit user-triggered command.
 //
 // All subprocess invocations use `execFile`/`execFileSync` with an argv array
 // (never `exec` + string interpolation) to avoid shell injection. Secrets are
-// never passed as command-line arguments on Linux/Windows (stdin only).
+// never passed as command-line arguments (stdin only).
 
 import { execFileSync } from 'node:child_process';
 
+import {
+  assertKeychainAccess,
+  isAllowedKeychainService,
+  type KeychainAllowlistOptions,
+} from './keychain-allowlist';
 import {
   createRawCredentialBackend,
   defaultCredentialBackendHost,
@@ -23,6 +29,13 @@ export type {
   CredentialBackendKind,
   ExecFileSyncFn,
 } from './credential-backends';
+export {
+  KeychainAccessDeniedError,
+  assertKeychainAccess,
+  isAllowedKeychainService,
+  macosKeychainAccountName,
+} from './keychain-allowlist';
+export type { KeychainAllowlistOptions, KeychainOperation } from './keychain-allowlist';
 export {
   MacosKeychainBackend,
   LinuxLibsecretBackend,
@@ -44,20 +57,18 @@ export {
 /** Existing name used by migration / refresh-lease / credentials. */
 export type KeychainBackend = CredentialBackend;
 
-const SAFE_SERVICE_PREFIXES = ['qlb:', 'qlb-test-'] as const;
-
 /** Account used when looking up unscoped native secrets (OpenRouter). */
 export const NATIVE_SECRET_ACCOUNT = 'qlb';
 
+/** @deprecated Use assertKeychainAccess when an operation and account are known. */
 export function isSafeKeychainService(service: string): boolean {
-  return SAFE_SERVICE_PREFIXES.some((p) => service.startsWith(p));
+  return isAllowedKeychainService(service);
 }
 
+/** @deprecated Use assertKeychainAccess when an operation and account are known. */
 export function assertSafeKeychainService(service: string): void {
   if (!isSafeKeychainService(service)) {
-    throw new Error(
-      `refusing Keychain operation for service '${service}': service name must start with 'qlb:' or 'qlb-test-'`,
-    );
+    assertKeychainAccess(service, '', 'read');
   }
 }
 
@@ -66,31 +77,34 @@ export function qlbKeychainService(provider: string, accountId: string): string 
   return `qlb:${provider}:${accountId}`;
 }
 
-export function withServiceGuard(backend: CredentialBackend): CredentialBackend {
+export function withServiceGuard(
+  backend: CredentialBackend,
+  allowlistOptions: KeychainAllowlistOptions = {},
+): CredentialBackend {
   return {
     kind: backend.kind,
     set(service, account, jsonValue) {
-      assertSafeKeychainService(service);
+      assertKeychainAccess(service, account, 'write', allowlistOptions);
       return backend.set(service, account, jsonValue);
     },
     get(service, account) {
-      assertSafeKeychainService(service);
+      assertKeychainAccess(service, account, 'read', allowlistOptions);
       return backend.get(service, account);
     },
     delete(service, account) {
-      assertSafeKeychainService(service);
+      assertKeychainAccess(service, account, 'write', allowlistOptions);
       return backend.delete(service, account);
     },
     setSync(service, account, jsonValue) {
-      assertSafeKeychainService(service);
+      assertKeychainAccess(service, account, 'write', allowlistOptions);
       backend.setSync(service, account, jsonValue);
     },
     getSync(service, account) {
-      assertSafeKeychainService(service);
+      assertKeychainAccess(service, account, 'read', allowlistOptions);
       return backend.getSync(service, account);
     },
     deleteSync(service, account) {
-      assertSafeKeychainService(service);
+      assertKeychainAccess(service, account, 'write', allowlistOptions);
       backend.deleteSync(service, account);
     },
   };
