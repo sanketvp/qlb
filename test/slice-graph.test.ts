@@ -133,6 +133,60 @@ test("rejects paths absent from an explicit specification", () => {
   assert.match(result.stderr, /spec: src\/not-in-spec\.ts/i);
 });
 
+test("rejects path and basename substrings in the supplied specification", () => {
+  const result = check(
+    {
+      schemaVersion: 1,
+      slices: [
+        { id: "R0", start: [], files: ["src/commands/x.ts"] },
+        { id: "X4", start: ["R0"], files: ["test/nope/graph.mjs"] },
+      ],
+    },
+    "The entry point is `src/index.ts`; the checker lives in scripts/check-slice-graph.mjs."
+  );
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /spec: src\/commands\/x\.ts/i);
+  assert.match(result.stderr, /spec: test\/nope\/graph\.mjs/i);
+});
+
+test("rejects a path with the same basename as a listed path", () => {
+  const result = check(
+    { schemaVersion: 1, slices: [{ id: "X4", start: [], files: ["src/totally/made-up/index.ts"] }] },
+    "Allowed files: `src/index.ts`."
+  );
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /spec: src\/totally\/made-up\/index\.ts/i);
+});
+
+test("accepts brace-expanded paths from the supplied specification", () => {
+  const result = check(
+    {
+      schemaVersion: 1,
+      slices: [
+        { id: "R0", start: [], files: ["src/commands/thing.ts"] },
+        { id: "X4", start: ["R0"], files: ["src/checks/thing.ts"] },
+      ],
+    },
+    "Allowed files: `src/{commands,checks}/thing.ts`."
+  );
+  assert.equal(result.status, 0, result.stderr);
+});
+
+test("accepts bare filenames only as complete marked-up tokens", () => {
+  const accepted = check(
+    { schemaVersion: 1, slices: [{ id: "X4", start: [], files: ["src/cc-locks.ts"] }] },
+    "| **A1 — cc-locks.ts** |"
+  );
+  assert.equal(accepted.status, 0, accepted.stderr);
+
+  const rejected = check(
+    { schemaVersion: 1, slices: [{ id: "X4", start: [], files: ["src/cc-locks.ts"] }] },
+    "| **A1 — cc-locks.tsx** |"
+  );
+  assert.equal(rejected.status, 1);
+  assert.match(rejected.stderr, /spec: src\/cc-locks\.ts/i);
+});
+
 test("rejects a dependency cycle", () => {
   const result = check({
     schemaVersion: 1,

@@ -34,6 +34,26 @@ function expandSpecPath(path) {
   return choices.split(",").flatMap((choice) => expandSpecPath(`${prefix}${choice}${suffix}`));
 }
 
+function addBareNames(source, names) {
+  for (const token of source.matchAll(/`([^`\n]+)`|\*\*([^*\n]+)\*\*/g)) {
+    const content = token[1] ?? token[2];
+    if (/^[\w.-]+$/.test(content)) names.add(content);
+    for (const match of content.matchAll(/(?:^|[^\w./-])([\w-]*\.[\w-]+)(?=$|[^\w./-])/g)) {
+      names.add(match[1]);
+    }
+  }
+}
+
+function addSpecPath(files, path) {
+  const candidate = path.endsWith("/") ? path.slice(0, -1) : path;
+  if (isCanonicalRepoPath(candidate)) files.add(candidate);
+}
+
+function hasExactSpecToken(source, token) {
+  const escaped = token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(?:^|[^\\w./-])${escaped}(?=$|[^\\w./-])`).test(source);
+}
+
 function loadSpecFiles(path, violations) {
   let source;
   try {
@@ -44,27 +64,25 @@ function loadSpecFiles(path, violations) {
   }
 
   const files = new Set();
-  for (const match of source.matchAll(/`([^`]+)`/g)) {
-    for (const candidate of expandSpecPath(match[1])) {
-      if (isCanonicalRepoPath(candidate)) files.add(candidate);
-    }
+  const bareNames = new Set();
+  addBareNames(source, bareNames);
+  for (const match of source.matchAll(/`([^`\n]+)`/g)) {
+    for (const candidate of expandSpecPath(match[1])) addSpecPath(files, candidate);
   }
   for (const match of source.matchAll(/(?:src|test|docs|scripts|extensions|native|claude-config)\/[\w./{},*-]+/g)) {
     const rawPath = match[0].replace(/[.,]+$/, "");
-    for (const candidate of expandSpecPath(rawPath)) {
-      if (isCanonicalRepoPath(candidate)) files.add(candidate);
-    }
+    for (const candidate of expandSpecPath(rawPath)) addSpecPath(files, candidate);
   }
-  return { files, source };
+  return { files, bareNames, source };
 }
 
 function isListedInSpec(file, spec) {
-  if (spec.files.has(file) || spec.source.includes(file)) return true;
+  if (spec.files.has(file)) return true;
   const name = file.slice(file.lastIndexOf("/") + 1);
-  if (spec.source.includes(name)) return true;
+  if (spec.bareNames.has(name)) return true;
   return file.startsWith("test/")
     && name.endsWith(".ts")
-    && spec.source.includes(`dist-test/test/${name.slice(0, -3)}js`);
+    && hasExactSpecToken(spec.source, `dist-test/test/${name.slice(0, -3)}js`);
 }
 
 function validate(document, specFiles) {
