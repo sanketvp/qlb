@@ -67,6 +67,28 @@ describe('codex auth.json helpers', () => {
     assert.deepEqual(wiped, { ok: false, error: 'tokens-empty', status: 'wiped' });
   });
 
+  it('accepts token documents without an account ID as valid rather than wiped', async () => {
+    for (const accountId of [null, undefined]) {
+      const document = validDocument();
+      const tokens = document.tokens as Record<string, unknown>;
+      if (accountId === undefined) delete tokens.account_id;
+      else tokens.account_id = accountId;
+      const text = JSON.stringify(document);
+
+      const parsed = parseCodexAuth(text);
+      assert.equal(parsed.ok, true);
+      if (!parsed.ok) throw new Error('expected valid fake fixture');
+      assert.equal(parsed.doc.tokens.account_id, accountId);
+
+      const stable = await readCodexAuthStable('/fake/auth.json', {
+        intervalMs: 0,
+        sleep: async () => {},
+        readFile: async () => text,
+      });
+      assert.equal(stable.status, 'ok');
+    }
+  });
+
   it('drops a non-string last_refresh while preserving other unknown fields', () => {
     const doc = parseValid({ last_refresh: 12_345, unknown_top_level: true });
     assert.equal(doc.last_refresh, undefined);
@@ -122,6 +144,23 @@ describe('codex auth.json helpers', () => {
     assert.equal(needsRefresh(staleRefresh, now), true);
   });
 
+  it('fails closed when refresh metadata is missing, malformed, or future dated', () => {
+    const now = 1_700_000_000_000;
+    const freshAccessToken = jwt({ exp: Math.floor((now + 60 * 60 * 1_000) / 1_000) });
+    for (const lastRefresh of [undefined, new Date(now - 60_000).toUTCString(), new Date(now + 60_000).toISOString()]) {
+      const doc = parseValid({
+        tokens: {
+          id_token: jwt({}),
+          access_token: freshAccessToken,
+          refresh_token: 'test-refresh-token',
+          account_id: 'stored-account',
+        },
+        last_refresh: lastRefresh,
+      });
+      assert.equal(needsRefresh(doc, now), true);
+    }
+  });
+
   it('fails closed when the access-token expiry cannot be decoded', () => {
     const now = 1_700_000_000_000;
     const recentRefresh = new Date(now - 60_000).toISOString();
@@ -138,6 +177,24 @@ describe('codex auth.json helpers', () => {
         });
         assert.equal(needsRefresh(doc, now), true);
       }
+    }
+  });
+
+  it('fails closed for unsafe or overflowing JWT expiry values', () => {
+    const now = 1_700_000_000_000;
+    const recentRefresh = new Date(now - 60_000).toISOString();
+    for (const exp of [Number.MAX_SAFE_INTEGER + 1, Math.floor(Number.MAX_SAFE_INTEGER / 1_000) + 1, 1e308]) {
+      const doc = parseValid({
+        tokens: {
+          id_token: jwt({}),
+          access_token: jwt({ exp }),
+          refresh_token: 'test-refresh-token',
+          account_id: 'stored-account',
+        },
+        last_refresh: recentRefresh,
+      });
+      assert.equal(accessExpiry(doc), null);
+      assert.equal(needsRefresh(doc, now), true);
     }
   });
 
@@ -181,6 +238,26 @@ describe('codex auth.json helpers', () => {
         writeCodexAuthAtomic(path, parseValid()),
         (error: unknown) => error instanceof PublishedNotDurableError,
       );
+      assert.deepEqual(JSON.parse(await readFile(path, 'utf8')), parseValid());
+    } finally {
+      openMock.mock.restore();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('ignores platform EINVAL failures opening the directory for fsync', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'qlb-codex-auth-'));
+    const path = join(dir, 'auth.json');
+    const originalOpen = fsPromises.open;
+    const openMock = mock.method(fsPromises, 'open', async (...args: Parameters<typeof fsPromises.open>) => {
+      const [file, flags] = args;
+      if (file === dirname(path) && flags === 'r') {
+        throw Object.assign(new Error('directory open unsupported'), { code: 'EINVAL' });
+      }
+      return originalOpen(...args);
+    });
+    try {
+      await writeCodexAuthAtomic(path, parseValid());
       assert.deepEqual(JSON.parse(await readFile(path, 'utf8')), parseValid());
     } finally {
       openMock.mock.restore();
