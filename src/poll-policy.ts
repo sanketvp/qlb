@@ -28,6 +28,7 @@ export interface DueCandidateSlot {
   lastFetchAt?: number | null;
   lastAttemptAt?: number | null;
   nextDueAt?: number | null;
+  pollIntervalS?: number | null;
   backoffUntil?: number | null;
 }
 
@@ -82,11 +83,85 @@ export function bindingPct(usage: Usage | null | undefined, models: readonly str
   return headroom === null ? null : 100.0 - headroom;
 }
 
-/** Parse an API reset timestamp to epoch seconds, like poll_policy.parse_reset_ts(). */
+/**
+ * Parse an API reset timestamp to epoch seconds, like poll_policy.parse_reset_ts().
+ *
+ * This intentionally recognizes the datetime.fromisoformat() grammar rather
+ * than Date.parse(): the latter accepts non-ISO text and truncates fractional
+ * seconds to milliseconds.  The fractional component below is retained as
+ * microseconds, so reset ordering keeps Python's precision without relying on
+ * JavaScript Date's millisecond representation.
+ */
 export function parseResetTs(resetsAt: unknown): number | null {
   if (!resetsAt) return null;
-  const timestamp = Date.parse(String(resetsAt).replaceAll('Z', '+00:00'));
-  return Number.isNaN(timestamp) ? null : timestamp / 1000;
+  let value = String(resetsAt).replaceAll('Z', '+00:00');
+  const basicWeek = /^(\d{4})W(\d{2})(\d)?([\s\S].*)?$/u.exec(value);
+  if (basicWeek) {
+    // Do not let an incomplete basic time (W28-6) become an extended weekday.
+    if (!basicWeek[3] && /^-\d(?!\d)/u.test(basicWeek[4] ?? '')) return null;
+    value = `${basicWeek[1]}-W${basicWeek[2]}${basicWeek[3] ? `-${basicWeek[3]}` : ''}${basicWeek[4] ?? ''}`;
+  }
+  const match = /^(?:(\d{4})-(\d{2})-(\d{2})|(\d{4})(\d{2})(\d{2})|(\d{4})-W(\d{2})(?:-(\d))?)(?:[\s\S](\d{2})(?::?(\d{2}))?(?::?(\d{2}))?([.,]\d+)?(?:(?<offset>[+-])(\d{2})(?::?(\d{2}))?(?::?(\d{2}))?([.,]\d+)?)?)?$/u.exec(value);
+  if (!match) return null;
+
+  let year: number;
+  let month: number;
+  let day: number;
+  if (match[1] !== undefined) {
+    year = Number(match[1]);
+    month = Number(match[2]);
+    day = Number(match[3]);
+  } else if (match[4] !== undefined) {
+    year = Number(match[4]);
+    month = Number(match[5]);
+    day = Number(match[6]);
+  } else {
+    year = Number(match[7]);
+    const week = Number(match[8]);
+    const weekDay = Number(match[9] ?? 1);
+    if (week < 1 || week > 53 || weekDay < 1 || weekDay > 7) return null;
+    const jan4 = new Date(0);
+    jan4.setUTCFullYear(year, 0, 4);
+    const weekStart = jan4.getTime() - ((jan4.getUTCDay() + 6) % 7) * 86_400_000;
+    const date = new Date(weekStart + ((week - 1) * 7 + weekDay - 1) * 86_400_000);
+    const thursday = new Date(weekStart + ((week - 1) * 7 + 3) * 86_400_000);
+    if (thursday.getUTCFullYear() !== year) return null;
+    month = date.getUTCMonth() + 1;
+    day = date.getUTCDate();
+  }
+
+  const hour = Number(match[10] ?? 0);
+  const minute = Number(match[11] ?? 0);
+  const second = Number(match[12] ?? 0);
+  const fraction = Number(`0.${(match[13] ?? '').slice(1, 7).padEnd(6, '0')}`);
+  const offsetSign = match.groups?.offset;
+  const offsetHour = Number(match[15] ?? 0);
+  const offsetMinute = Number(match[16] ?? 0);
+  const offsetSecond = Number(match[17] ?? 0);
+  const offsetFraction = Number(`0.${(match[18] ?? '').slice(1, 7).padEnd(6, '0')}`);
+  if (
+    year < 1 || month < 1 || month > 12 || day < 1 || hour > 23 || minute > 59 || second > 59
+    || offsetHour > 23 || offsetMinute > 59 || offsetSecond > 59
+  ) return null;
+
+  const utc = new Date(0);
+  utc.setUTCFullYear(year, month - 1, day);
+  utc.setUTCHours(hour, minute, second, 0);
+  if (
+    utc.getUTCFullYear() !== year || utc.getUTCMonth() !== month - 1 || utc.getUTCDate() !== day
+  ) return null;
+  const timestamp = utc.getTime() / 1000 + fraction;
+  if (offsetSign === undefined) {
+    const local = new Date(0);
+    local.setFullYear(year, month - 1, day);
+    local.setHours(hour, minute, second, 0);
+    if (local.getFullYear() !== year || local.getMonth() !== month - 1 || local.getDate() !== day) return null;
+    return local.getTime() / 1000 + fraction;
+  }
+  // datetime.timezone normalizes a fractional zero offset to UTC.
+  const offset = offsetHour * 3600 + offsetMinute * 60 + offsetSecond;
+  const offsetWithFraction = offset === 0 ? 0 : offset + offsetFraction;
+  return timestamp + (offsetSign === '+' ? -offsetWithFraction : offsetWithFraction);
 }
 
 /** Epoch when the last exhausted relevant window resets. */
@@ -202,6 +277,18 @@ export function planAfterFetch({
   return [nextPoll, interval];
 }
 
+/** C-swap usage_store._plan_oversleeps_interval(), exposed for parity. */
+export function planOversleepsInterval(
+  nextPollAt: number | null | undefined,
+  pollIntervalS: number | null | undefined,
+  now: number,
+): boolean {
+  if (nextPollAt === null || nextPollAt === undefined) return false;
+  const interval = Math.max(pollIntervalS || EXHAUSTED_INTERVAL_S, EXHAUSTED_INTERVAL_S);
+  const latestNormalPoll = now + interval * (1.0 + JITTER_FRAC) + RESET_SLACK_S;
+  return nextPollAt > latestNormalPoll;
+}
+
 /**
  * Return the due candidate least recently attempted or measured, or null.
  *
@@ -225,7 +312,12 @@ export function dueCandidate(
     if (entry.backoffUntil !== null && entry.backoffUntil !== undefined && now < entry.backoffUntil) {
       continue;
     }
-    if (entry.nextDueAt !== null && entry.nextDueAt !== undefined && now < entry.nextDueAt) {
+    if (
+      entry.nextDueAt !== null
+      && entry.nextDueAt !== undefined
+      && now < entry.nextDueAt
+      && !planOversleepsInterval(entry.nextDueAt, entry.pollIntervalS, now)
+    ) {
       continue;
     }
     due.push([Math.max(entry.lastFetchAt || 0, entry.lastAttemptAt || 0), slot]);
@@ -244,4 +336,5 @@ export const binding_pct = bindingPct;
 export const parse_reset_ts = parseResetTs;
 export const limiting_reset_ts = limitingResetTs;
 export const earliest_future_reset_ts = earliestFutureResetTs;
+export const plan_oversleeps_interval = planOversleepsInterval;
 export const plan_after_fetch = planAfterFetch;

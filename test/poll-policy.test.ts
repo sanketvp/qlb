@@ -3,6 +3,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { describe, it } from 'node:test';
 import {
   ACTIVE_MAX_INTERVAL_S,
@@ -17,12 +18,14 @@ import {
   URGENT_INTERVAL_S,
   bindingPct,
   dueCandidate,
+  limitingResetTs,
   type DueCandidateSlot,
+  parseResetTs,
   planAfterFetch,
 } from '../src/poll-policy';
 
-const PYTHON = `${process.env.HOME}/.local/share/uv/tools/claude-swap/bin/python`;
-const CSWAP_V028_SOURCE = '/private/tmp/claude-501/-Users-sanketpatel-GIT-Personal-sanketvp/3b005b8d-b97c-4bb5-a726-86eaa04c5eb9/scratchpad/cswap-upstream/repo/src';
+const PYTHON = 'python3';
+const CSWAP_V028_SOURCE = resolve(__dirname, '../../test/oracle/claude-swap-v0.28.0/src');
 const NOW = 1_700_000_000;
 
 type Usage = Record<string, unknown>;
@@ -52,28 +55,38 @@ function usage7(pct5: number, pct7: number): Usage {
 }
 
 function pythonPlans(cases: OracleCase[]): Array<[number, number]> {
-  const program = [
-    'import json, sys',
-    `sys.path.insert(0, ${JSON.stringify(CSWAP_V028_SOURCE)})`,
-    'from claude_swap.poll_policy import plan_after_fetch',
-    'rows = json.load(sys.stdin)',
-    'out = []',
-    'for row in rows:',
-    '    out.append(plan_after_fetch(prev_interval_s=row["prevIntervalS"], prev_usage=row["prevUsage"], new_usage=row["newUsage"], is_active=row["isActive"], threshold=row["threshold"], weekly_threshold=row.get("weeklyThreshold"), models=tuple(row["models"]), recent_429=row["recent429"], now=row["now"], rng=lambda row=row: row["rng"]))',
-    'print(json.dumps(out))',
+  const oracleProgram = [
+    'import json, pathlib, sys, tempfile',
+    `source = ${JSON.stringify(CSWAP_V028_SOURCE)}`,
+    'with tempfile.TemporaryDirectory() as temp:',
+    '    metadata = pathlib.Path(temp) / "claude_swap-0.28.0.dist-info"',
+    '    metadata.mkdir()',
+    '    (metadata / "METADATA").write_text("Metadata-Version: 2.1\\nName: claude-swap\\nVersion: 0.28.0\\n")',
+    '    sys.path[:0] = [source, temp]',
+    '    from claude_swap.poll_policy import plan_after_fetch',
+    '    rows = json.load(sys.stdin)',
+    '    out = []',
+    '    for row in rows:',
+    '        out.append(plan_after_fetch(prev_interval_s=row["prevIntervalS"], prev_usage=row["prevUsage"], new_usage=row["newUsage"], is_active=row["isActive"], threshold=row["threshold"], weekly_threshold=row.get("weeklyThreshold"), models=tuple(row["models"]), recent_429=row["recent429"], now=row["now"], rng=lambda row=row: row["rng"]))',
+    '    print(json.dumps(out))',
   ].join('\n');
-  return JSON.parse(execFileSync(PYTHON, ['-I', '-c', program], {
+  const program = [
+    'import os, subprocess, sys',
+    'if sys.version_info < (3, 12):',
+    '    found = subprocess.run(["uv", "python", "find", "3.12"], capture_output=True, check=False, text=True).stdout.strip()',
+    '    if not found: raise RuntimeError("vendored claude-swap v0.28.0 requires Python 3.12 or newer")',
+    `    os.execv(found, [found, '-I', '-B', '-c', ${JSON.stringify(oracleProgram)}])`,
+    `exec(${JSON.stringify(oracleProgram)})`,
+  ].join('\n');
+  return JSON.parse(execFileSync(PYTHON, ['-I', '-B', '-c', program], {
     encoding: 'utf8',
     input: JSON.stringify(cases),
   })) as Array<[number, number]>;
 }
 
 describe('claude-swap poll policy port', () => {
-  it('matches the C-swap v0.28.0 golden grid', (t) => {
-    if (!existsSync(CSWAP_V028_SOURCE)) {
-      t.skip(`C-swap v0.28.0 source is unavailable at ${CSWAP_V028_SOURCE}`);
-      return;
-    }
+  it('matches the C-swap v0.28.0 golden grid', () => {
+    assert.equal(existsSync(CSWAP_V028_SOURCE), true, `missing vendored oracle at ${CSWAP_V028_SOURCE}`);
     const cases: OracleCase[] = [
       { prevIntervalS: null, prevUsage: null, newUsage: usage(20), isActive: true, threshold: 80, models: [], recent429: false, now: NOW, rng: 0.25 },
       { prevIntervalS: 180, prevUsage: usage(10), newUsage: usage(12), isActive: true, threshold: 80, models: [], recent429: false, now: NOW, rng: 0.5 },
@@ -94,6 +107,16 @@ describe('claude-swap poll policy port', () => {
     const expected = pythonPlans(cases);
     const actual = cases.map((row) => planAfterFetch({ ...row, rng: () => row.rng }));
     assert.deepEqual(actual, expected);
+  });
+
+  it('keeps Python fromisoformat microseconds and rejects non-ISO reset text', () => {
+    assert.equal(parseResetTs('2023-11-14T22:13:20.000123+00:00'), NOW + 0.000123);
+    assert.equal(parseResetTs('14 November 2023 22:13:20 UTC'), null);
+    assert.equal(parseResetTs('2023-02-29T22:13:20+00:00'), null);
+    assert.equal(limitingResetTs({
+      five_hour: { pct: 100, resets_at: '2023-11-14T22:13:20.000123+00:00' },
+      seven_day: { pct: 100, resets_at: '2023-11-14T22:13:20.000456+00:00' },
+    }), NOW + 0.000456);
   });
 
   it('uses the exact 180-second floor boundary', () => {
@@ -272,6 +295,18 @@ describe('claude-swap due-candidate port', () => {
     for (const row of grid) {
       assert.equal(dueCandidate(row.candidates, row.entries, row.now ?? now), row.expected);
     }
+  });
+
+  it('repairs an obsolete reset-parked plan that oversleeps its interval', () => {
+    const entries: Record<string, DueCandidateSlot> = {
+      parked: {
+        lastFetchAt: now - 1_000,
+        nextDueAt: now + 86_400,
+        pollIntervalS: 600,
+      },
+      recent: { lastFetchAt: now - 10 },
+    };
+    assert.equal(dueCandidate(['parked', 'recent'], entries, now), 'parked');
   });
 
   it('does not let a repeatedly failing slot starve another due slot', () => {
