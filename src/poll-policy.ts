@@ -1,6 +1,6 @@
 /*
  * Ported from claude-swap 0.28.0.
- * Upstream file(s): src/claude_swap/poll_policy.py:76-285, src/claude_swap/usage_store.py:411-421,439-493, src/claude_swap/lines.py:39-45.
+ * Upstream file(s): src/claude_swap/poll_policy.py:76-285, src/claude_swap/usage_store.py:411-421,439-493, src/claude_swap/lines.py:39-45, src/claude_swap/oauth.py:545-601.
  * License: MIT.
  * Modified for QLB. See NOTICE.
  */

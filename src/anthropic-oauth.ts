@@ -1,6 +1,6 @@
 /*
  * Ported from claude-swap 0.28.0.
- * Upstream file(s): src/claude_swap/oauth.py:25-70,95-101,105-140,154-183,200-257.
+ * Upstream file(s): src/claude_swap/oauth.py:17-20,25-70,73-101,105-140,154-183,200-257,265-324,397-407,464-542.
  * License: MIT.
  * Modified for QLB. See NOTICE.
  */
@@ -14,7 +14,7 @@ export const ANTHROPIC_OAUTH_PROFILE_URL = 'https://api.anthropic.com/api/oauth/
 export const ANTHROPIC_OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
 export const OAUTH_EXPIRY_BUFFER_MS = 5 * 60 * 1000;
 export const FRESHEN_BUFFER_MS = 10 * 60 * 1000;
-/** C-swap v0.28.0 `oauth.py` lines 538–563: canonical non-weekly window label. */
+/** C-swap v0.28.0 `oauth.py` lines 538–542: canonical non-weekly window label. */
 export const FIVE_HOUR_LABEL = '5h';
 
 export type JsonObject = Record<string, unknown>;

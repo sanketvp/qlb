@@ -7,8 +7,7 @@ port.
 
 The ports preserve the behavior identified in the module mapping table in
 spec §3.1, including Claude lock coordination, OAuth handling, line
-calculation, polling policy, atomic file publication, Keychain reads, and the
-auto-switch loop.
+calculation, polling policy, and atomic file publication.
 
 QLB deliberately differs where the specification says it must: its
 transaction and credential-safety boundaries are defined in §§4.1–4.2, its

@@ -1,6 +1,6 @@
 /*
  * Ported from claude-swap 0.28.0.
- * Upstream file(s): src/claude_swap/fsutil.py:134-246.
+ * Upstream file(s): src/claude_swap/fsutil.py:106-131,134-246.
  * License: MIT.
  * Modified for QLB. See NOTICE.
  */

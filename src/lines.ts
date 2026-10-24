@@ -1,6 +1,6 @@
 /*
  * Ported from claude-swap 0.28.0.
- * Upstream file(s): src/claude_swap/lines.py:39-64,88-126.
+ * Upstream file(s): src/claude_swap/lines.py:39-126.
  * License: MIT.
  * Modified for QLB. See NOTICE.
  */

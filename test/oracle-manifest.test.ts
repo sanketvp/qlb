@@ -104,7 +104,7 @@ describe('claude-swap v0.28.0 oracle provenance', () => {
     const template = readFileSync(join(ROOT, 'docs', 'templates', 'ported-module-header.txt'), 'utf8');
     const rendered = template.replace(
       'src/claude_swap/<path>.py:<first>-<last>',
-      'src/claude_swap/fsutil.py:134-246',
+      'src/claude_swap/fsutil.py:106-131,134-246',
     );
     assert.ok(readFileSync(join(ROOT, 'src', 'fsutil.ts'), 'utf8').startsWith(rendered));
 
