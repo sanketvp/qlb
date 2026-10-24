@@ -2,8 +2,10 @@
 """Generate a deterministic, offline behavior oracle for claude-swap 0.28.0.
 
 Normal checks import only the vendored upstream modules after replacing HOME
-with an empty temporary directory. Regeneration is deliberately explicit and
-requires a separately supplied upstream Git repository. This invokes no
+with an empty temporary directory. Regeneration is deliberately explicit:
+`--regen` requires a separately supplied upstream Git repository, while
+`--write-vendored` rewrites the checked-in goldens from the pinned vendored
+source. This invokes no
 network, Keychain, credential store, or CLI APIs; every input below is synthetic.
 """
 
@@ -91,11 +93,20 @@ def _credential(refresh: str | None, access: str = "fake-access") -> str:
     return json.dumps({"claudeAiOauth": oauth}, sort_keys=True, separators=(",", ":"))
 
 
-def _usage(pct: float, *, reset: str | None = None, scoped: float | None = None) -> dict:
+def _usage(
+    pct: float,
+    *,
+    seven_day_pct: float | None = None,
+    reset: str | None = None,
+    scoped: float | None = None,
+) -> dict:
     window: dict[str, object] = {"pct": pct}
     if reset is not None:
         window["resets_at"] = reset
-    usage: dict[str, object] = {"five_hour": dict(window), "seven_day": dict(window)}
+    usage: dict[str, object] = {
+        "five_hour": dict(window),
+        "seven_day": {**window, "pct": pct if seven_day_pct is None else seven_day_pct},
+    }
     if scoped is not None:
         usage["scoped"] = [{"name": "Fable", "pct": scoped}]
     return usage
@@ -189,6 +200,7 @@ def main() -> int:
     modes = parser.add_mutually_exclusive_group(required=True)
     modes.add_argument("--check", action="store_true", help="fail if committed goldens differ")
     modes.add_argument("--regen", action="store_true", help="rewrite goldens from the pinned upstream source")
+    modes.add_argument("--write-vendored", action="store_true", help="rewrite goldens from the pinned vendored source")
     parser.add_argument("--from-git", metavar="URL_OR_PATH", help="upstream Git repository for --regen")
     args = parser.parse_args()
     if not sys.flags.isolated:
@@ -274,6 +286,8 @@ def main() -> int:
             ("recent_429", dict(prev_interval_s=600.0, prev_usage=_usage(40), new_usage=_usage(50), is_active=True, threshold=90.0, models=(), recent_429=True, now=1000.0, rng=lambda: 0.5)),
             ("exhausted_reset_cap", dict(prev_interval_s=180.0, prev_usage=_usage(99), new_usage=_usage(100, reset="1970-01-01T00:18:00+00:00"), is_active=False, threshold=90.0, models=(), recent_429=False, now=1000.0, rng=lambda: 0.5)),
             ("scoped_model_binds", dict(prev_interval_s=300.0, prev_usage=_usage(30, scoped=60), new_usage=_usage(30, scoped=80), is_active=True, threshold=90.0, models=("Fable",), recent_429=False, now=1000.0, rng=lambda: 0.0)),
+            ("weekly_threshold_urgent", dict(prev_interval_s=300.0, prev_usage=_usage(20, seven_day_pct=55), new_usage=_usage(25, seven_day_pct=65), is_active=True, threshold=90.0, weekly_threshold=60.0, models=(), recent_429=False, now=1000.0, rng=lambda: 0.5)),
+            ("weekly_threshold_defers", dict(prev_interval_s=300.0, prev_usage=_usage(10, seven_day_pct=75), new_usage=_usage(15, seven_day_pct=80), is_active=True, threshold=50.0, weekly_threshold=99.0, models=(), recent_429=False, now=1000.0, rng=lambda: 0.5)),
         ]
         plans = {name: _round_plan(poll_policy.plan_after_fetch(**kwargs)) for name, kwargs in grid}
 

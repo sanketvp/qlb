@@ -53,6 +53,14 @@
     "urgent_active": {
       "interval_s": 60.0,
       "next_poll_at": 1060.0
+    },
+    "weekly_threshold_defers": {
+      "interval_s": 180.0,
+      "next_poll_at": 1180.0
+    },
+    "weekly_threshold_urgent": {
+      "interval_s": 60.0,
+      "next_poll_at": 1060.0
     }
   }
 }

@@ -6,6 +6,18 @@ is vendored alongside them, so every `claude_swap.*` import has pinned source
 material available. `pending` means the behavior is in scope for a future QLB
 port. The explicit non-goals below are not port targets.
 
+## Provenance verification
+
+`npm test` checks that the committed manifest and goldens match the vendored
+bytes; it does not contact or inspect an upstream repository. To verify those
+bytes against the pinned upstream Git tree, explicitly run:
+
+```sh
+python3 -I -B scripts/oracle-manifest.py --verify-upstream /path/to/claude-swap-clone
+```
+
+The supplied clone is read only through Git commands; do not run its code.
+
 ## Golden difference from v0.26.0
 
 Only `settings_defaults.json` changed: `autoswitch.weekly_threshold` is now

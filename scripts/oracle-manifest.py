@@ -11,6 +11,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -29,7 +30,15 @@ def _python312_or_newer() -> Path | None:
         candidates.append(python312)
     for candidate in candidates:
         path = Path(candidate)
-        if path.is_file() and os.access(path, os.X_OK):
+        if not (path.is_file() and os.access(path, os.X_OK)):
+            continue
+        result = subprocess.run(
+            [str(path), "-I", "-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        if result.returncode == 0 and tuple(map(int, result.stdout.strip().split("."))) >= (3, 12):
             return path
     return None
 
@@ -56,15 +65,74 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _git_blob_id(path: Path) -> str:
+    content = path.read_bytes()
+    return hashlib.sha1(f"blob {len(content)}\0".encode("ascii") + content).hexdigest()
+
+
 def _files_below(root: Path) -> list[Path]:
+    paths = list(root.rglob("*"))
+    symlinks = sorted(path for path in paths if path.is_symlink())
+    if symlinks:
+        raise RuntimeError(f"symlink in vendored tree: {symlinks[0].relative_to(root).as_posix()}")
     return sorted(
         (
             path
-            for path in root.rglob("*")
+            for path in paths
             if path.is_file() and "__pycache__" not in path.parts and path.suffix != ".pyc"
         ),
         key=lambda path: path.as_posix(),
     )
+
+
+def _upstream_path(path: Path) -> str:
+    if path == LICENSE:
+        return "LICENSE"
+    relative = path.relative_to(ORACLE).as_posix()
+    if relative.startswith(("src/", "tests/")):
+        return relative
+    raise RuntimeError(f"vendored file has no upstream path: {path.relative_to(ROOT).as_posix()}")
+
+
+def _git_tree_lines(repository: str) -> list[str]:
+    if repository.startswith("-"):
+        raise RuntimeError("--verify-upstream must not begin with '-'")
+
+    def ls_tree(repo: Path) -> list[str]:
+        result = subprocess.run(
+            [
+                "git", "-c", "core.fsmonitor=", "-c", "core.sshCommand=", "-C", str(repo),
+                "ls-tree", "-r", PINNED_COMMIT, "--",
+            ],
+            capture_output=True,
+            check=True,
+            text=True,
+        )
+        return result.stdout.splitlines()
+
+    local = Path(repository)
+    if local.is_dir():
+        return ls_tree(local)
+    with tempfile.TemporaryDirectory(prefix="qlb-oracle-upstream-") as staging:
+        repo = Path(staging) / "upstream"
+        subprocess.run(
+            [
+                "git", "-c", "core.fsmonitor=", "-c", "core.sshCommand=", "clone", "--no-checkout",
+                "--", repository, str(repo),
+            ],
+            check=True,
+        )
+        return ls_tree(repo)
+
+
+def _verify_upstream(repository: str, manifest: dict[str, object]) -> None:
+    expected = manifest["upstream_tree"]
+    if not isinstance(expected, list) or not all(isinstance(line, str) for line in expected):
+        raise RuntimeError("manifest upstream_tree is invalid")
+    expected_paths = {line.partition("\t")[2] for line in expected}
+    actual = [line for line in _git_tree_lines(repository) if line.partition("\t")[2] in expected_paths]
+    if actual != expected:
+        raise RuntimeError("upstream Git tree differs from manifest blob listing")
 
 
 def _files_aggregate_sha256(files: dict[str, str]) -> str:
@@ -91,6 +159,14 @@ def _manifest() -> dict[str, object]:
         filename=str(test_root / "test_switcher.py"),
     )
     file_hashes = {path.relative_to(ROOT).as_posix(): _sha256(path) for path in sorted(files)}
+    git_blob_ids = {path.relative_to(ROOT).as_posix(): _git_blob_id(path) for path in sorted(files)}
+    upstream_tree = sorted(
+        (
+            f"100644 blob {git_blob_ids[path.relative_to(ROOT).as_posix()]}\t{_upstream_path(path)}"
+            for path in files
+        ),
+        key=lambda line: line.partition("\t")[2],
+    )
     files_aggregate_sha256 = _files_aggregate_sha256(file_hashes)
     if files_aggregate_sha256 != PINNED_FILES_AGGREGATE_SHA256:
         raise RuntimeError("vendored files differ from the pinned provenance aggregate")
@@ -98,6 +174,7 @@ def _manifest() -> dict[str, object]:
         "commit": PINNED_COMMIT,
         "files": file_hashes,
         "files_aggregate_sha256": files_aggregate_sha256,
+        "git_blob_ids": git_blob_ids,
         "purpose": "Complete claude-swap v0.28.0 source closure and reference material; it is not executed by Node or QLB.",
         "tag": "v0.28.0",
         "test_def_counts": {
@@ -109,18 +186,21 @@ def _manifest() -> dict[str, object]:
             if isinstance(node, ast.ClassDef) and node.name.startswith("Test")
         ],
         "upstream": "https://github.com/realiti4/claude-swap",
+        "upstream_tree": upstream_tree,
     }
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--check", action="store_true", help="fail if MANIFEST.json differs from the vendored tree")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--check", action="store_true", help="fail if MANIFEST.json differs from the vendored tree")
+    modes.add_argument("--verify-upstream", metavar="URL_OR_PATH", help="verify manifest blobs against the pinned upstream Git tree")
     args = parser.parse_args()
     if not sys.flags.isolated:
         parser.error("run this script with Python -I")
 
     expected = json.dumps(_manifest(), indent=2, sort_keys=True) + "\n"
-    if args.check:
+    if args.check or args.verify_upstream:
         try:
             actual = MANIFEST.read_text(encoding="utf-8")
         except FileNotFoundError:
@@ -128,6 +208,10 @@ def main() -> int:
         if actual != expected:
             print("oracle manifest differs; run python3 -I scripts/oracle-manifest.py", file=sys.stderr)
             return 1
+        if args.verify_upstream:
+            _verify_upstream(args.verify_upstream, json.loads(actual))
+            print("oracle upstream matches")
+            return 0
         print("oracle manifest matches")
         return 0
     MANIFEST.write_text(expected, encoding="utf-8")
