@@ -30,6 +30,7 @@ export function redactSecrets(text: string, secrets: readonly string[] = []): st
 
 function redactValue(value: unknown, secrets: readonly string[], seen: WeakSet<object>): unknown {
   if (typeof value === 'string') return redactSecrets(value, secrets);
+  if (typeof value === 'function' || typeof value === 'symbol') return REDACTED;
   if (value === null || typeof value !== 'object') return value;
   if (seen.has(value)) return REDACTED;
   seen.add(value);

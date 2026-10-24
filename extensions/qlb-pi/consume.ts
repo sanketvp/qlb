@@ -18,6 +18,14 @@ export const ACTIVE_CC_SERVICE = "Claude Code-credentials";
 export const SECURITY_BIN = "/usr/bin/security";
 const FALLBACK_ACCOUNT = "claude-code-user";
 
+// src/redact.ts is canonical; this Pi-loader-local copy is pinned by the
+// qlb-pi redactSecrets parity test because jiti cannot import QLB's src/ tree.
+const TOKEN_PATTERNS: readonly RegExp[] = [
+  /\bsk-[A-Za-z0-9_-]{16,}\b/g,
+  /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g,
+  /\bBearer\s+[A-Za-z0-9._~-]{16,}\b/gi,
+];
+
 // Stable, value-free messages for every consume failure sink (audit, Pi error
 // event, console). Raw diagnostics never cross these boundaries.
 export const CONSUME_ERRORS = {
@@ -329,12 +337,13 @@ export function consumeAccessSource(read: () => CswapActiveAccess): {
 }
 
 /** Replace every known access value and its fingerprint with a placeholder. */
-export function redactSecrets(text: string, secrets: readonly string[]): string {
+export function redactSecrets(text: string, secrets: readonly string[] = []): string {
   let out = text;
   for (const secret of secrets) {
     if (!secret) continue;
     out = out.split(secret).join("[redacted]").split(fingerprintAccess(secret)).join("[redacted]");
   }
+  for (const pattern of TOKEN_PATTERNS) out = out.replace(pattern, "[redacted]");
   return out;
 }
 

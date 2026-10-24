@@ -31,6 +31,53 @@ describe('redaction', () => {
     assert.equal((result.match(/\[redacted\]/g) ?? []).length, 3);
   });
 
+  it('does not retain an own enumerable toJSON that returns a secret', () => {
+    const secret = 'fixture-secret-value';
+    const input = {
+      toJSON() {
+        return secret;
+      },
+    };
+
+    const result = redactJson(input, [secret]);
+
+    assert.equal(result.includes(secret), false);
+    assert.deepEqual(JSON.parse(result), { toJSON: REDACTED });
+  });
+
+  it('does not invoke or leak a nested function-valued property', () => {
+    const secret = 'fixture-secret-value';
+    let invoked = false;
+    const input = {
+      nested: {
+        callback() {
+          invoked = true;
+          return secret;
+        },
+      },
+    };
+
+    const result = redactJson(input, [secret]);
+
+    assert.equal(invoked, false);
+    assert.equal(result.includes(secret), false);
+    assert.deepEqual(JSON.parse(result), { nested: { callback: REDACTED } });
+  });
+
+  it('does not copy a class prototype toJSON that returns a secret', () => {
+    const secret = 'fixture-secret-value';
+    class SecretCarrier {
+      toJSON() {
+        return secret;
+      }
+    }
+
+    const result = redactJson(new SecretCarrier(), [secret]);
+
+    assert.equal(result.includes(secret), false);
+    assert.deepEqual(JSON.parse(result), {});
+  });
+
   it('redacts Error messages and nested JSON without mutating the input', () => {
     const secret = 'sk-ant-ort-fixture-secret-0123456789';
     const input = {
