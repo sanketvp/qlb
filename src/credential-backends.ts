@@ -178,12 +178,15 @@ function assertSecurityInteractiveField(value: string): void {
   }
 }
 
-function isSecurityTimeout(err: unknown): boolean {
+export function isSecurityTimeout(err: unknown): boolean {
   return !!err && typeof err === 'object' && (err as { code?: unknown }).code === 'ETIMEDOUT';
 }
 
-function securityTimeoutError(command: string): Error {
-  return new Error(`security ${command} timed out after ${MACOS_SECURITY_TIMEOUT_MS / 1_000}s`);
+export function securityTimeoutError(command: string): Error {
+  return Object.assign(
+    new Error(`security ${command} timed out after ${MACOS_SECURITY_TIMEOUT_MS / 1_000}s`),
+    { code: 'ETIMEDOUT' },
+  );
 }
 
 export class MacosKeychainBackend extends SyncCredentialBackend {

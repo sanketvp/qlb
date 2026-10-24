@@ -100,7 +100,7 @@ describe('Keychain access allowlist', () => {
       () => readNativeOpenRouterKey('pi-openrouter', (_file, _args, options) => {
         timeoutMs = options?.timeout;
         throw timeout;
-      }),
+      }, 'darwin'),
       /security find-generic-password timed out after 5s/,
     );
     assert.equal(timeoutMs, MACOS_SECURITY_TIMEOUT_MS);

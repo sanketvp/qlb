@@ -9,12 +9,14 @@ import { CONFIG_ENV_VARS, OPENROUTER_KEYCHAIN_SERVICE, type QlbConfig } from './
 import { cswapCachePresent } from './cswap-usage';
 import {
   execFileUtf8,
+  isSecurityTimeout,
+  MACOS_SECURITY_TIMEOUT_MS,
+  securityTimeoutError,
   type ExecFileSyncFn,
 } from './credential-backends';
 import {
   defaultCommandExists,
   MACOS_SECURITY_BIN,
-  MACOS_SECURITY_TIMEOUT_MS,
   platformKeychain,
   readNativeOpenRouterKey,
   selectBackendKind,
@@ -151,14 +153,6 @@ export function createCommandRunner(exec: ExecFileSyncFn = execFileUtf8): Comman
 
 const runCommand = createCommandRunner();
 
-function isSecurityTimeout(err: unknown): boolean {
-  return !!err && typeof err === 'object' && (err as { code?: unknown }).code === 'ETIMEDOUT';
-}
-
-function securityTimeoutMessage(command: string): string {
-  return `security ${command} timed out after ${MACOS_SECURITY_TIMEOUT_MS / 1_000}s`;
-}
-
 /** A bounded runner for host probes; never return login-shell environment output. */
 const runHostCommand: HostCommandRunner = (command, args, options) =>
   execFileSync(command, args, {
@@ -232,6 +226,7 @@ export function inspectProviders(
 
   const openrouterSupported = config.openrouterKeychainService === OPENROUTER_KEYCHAIN_SERVICE;
   let openrouterOk = false;
+  let openrouterTimedOut = false;
   if (openrouterSupported) {
     try {
       if (command === runCommand) {
@@ -241,8 +236,8 @@ export function inspectProviders(
           'find-generic-password', '-s', config.openrouterKeychainService, '-w',
         ]).trim().length > 0;
       }
-    } catch {
-      openrouterOk = false;
+    } catch (err) {
+      openrouterTimedOut = isSecurityTimeout(err);
     }
   }
 
@@ -266,7 +261,9 @@ export function inspectProviders(
       ? unsupportedOpenRouterService(config.openrouterKeychainService)
       : openrouterOk
         ? found('openrouter', openrouterSource, CONFIG_ENV_VARS.openrouterKeychainService, `export ${CONFIG_ENV_VARS.openrouterKeychainService}=pi-openrouter`)
-        : missingFixedOpenRouter(openrouterSource, openrouterExample),
+        : openrouterTimedOut
+          ? timedOutFixedOpenRouter(openrouterSource)
+          : missingFixedOpenRouter(openrouterSource, openrouterExample),
   ];
 }
 
@@ -279,6 +276,17 @@ function openRouterSourceLabel(service: string): string {
   });
   if (kind === 'linux-libsecret') return `libsecret service ${service}`;
   return `encrypted credential file service ${service}`;
+}
+
+function timedOutFixedOpenRouter(source: string): ProviderDiagnostic {
+  return {
+    provider: 'openrouter',
+    level: 'WARN',
+    source,
+    envVar: CONFIG_ENV_VARS.openrouterKeychainService,
+    example: '',
+    message: securityTimeoutError('find-generic-password').message,
+  };
 }
 
 function missingFixedOpenRouter(source: string, example: string): ProviderDiagnostic {
@@ -389,7 +397,7 @@ function probeCredentialStore(command?: CommandRunner): DoctorCheck {
       return { name: 'keychain', level: 'PASS', message: 'macOS Keychain command is reachable' };
     } catch (err) {
       return isSecurityTimeout(err)
-        ? { name: 'keychain', level: 'WARN', message: securityTimeoutMessage('list-keychains') }
+        ? { name: 'keychain', level: 'WARN', message: securityTimeoutError('list-keychains').message }
         : { name: 'keychain', level: 'WARN', message: 'macOS Keychain command is unavailable or unreachable' };
     }
   }
@@ -399,7 +407,7 @@ function probeCredentialStore(command?: CommandRunner): DoctorCheck {
       return { name: 'keychain', level: 'PASS', message: 'macOS Keychain command is reachable' };
     } catch (err) {
       return isSecurityTimeout(err)
-        ? { name: 'keychain', level: 'WARN', message: securityTimeoutMessage('list-keychains') }
+        ? { name: 'keychain', level: 'WARN', message: securityTimeoutError('list-keychains').message }
         : { name: 'keychain', level: 'WARN', message: 'macOS Keychain command is unavailable or unreachable' };
     }
   }

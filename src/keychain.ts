@@ -20,8 +20,10 @@ import {
   createRawCredentialBackend,
   defaultCredentialBackendHost,
   execFileUtf8,
+  isSecurityTimeout,
   MACOS_SECURITY_BIN,
   MACOS_SECURITY_TIMEOUT_MS,
+  securityTimeoutError,
   type CredentialBackend,
   type ExecFileSyncFn,
 } from './credential-backends';
@@ -201,22 +203,13 @@ export function assertNativeOpenRouterService(service: string): void {
   }
 }
 
-function isSecurityTimeout(err: unknown): boolean {
-  return !!err && typeof err === 'object' && (err as { code?: unknown }).code === 'ETIMEDOUT';
-}
-
-function nativeOpenRouterTimeoutError(): Error {
-  return new Error(
-    `security find-generic-password timed out after ${MACOS_SECURITY_TIMEOUT_MS / 1_000}s`,
-  );
-}
-
 export function readNativeOpenRouterKey(
   service: string,
   exec: ExecFileSyncFn = execFileUtf8,
+  platform: NodeJS.Platform = process.platform,
 ): string {
   assertNativeOpenRouterService(service);
-  if (process.platform === 'darwin') {
+  if (platform === 'darwin') {
     try {
       const stdout = exec(
         MACOS_SECURITY_BIN,
@@ -230,7 +223,7 @@ export function readNativeOpenRouterKey(
       const key = String(stdout).replace(/\n$/, '').trim();
       if (key.length > 0) return key;
     } catch (err) {
-      if (isSecurityTimeout(err)) throw nativeOpenRouterTimeoutError();
+      if (isSecurityTimeout(err)) throw securityTimeoutError('find-generic-password');
       // Normalize Keychain lookup failures without exposing command output.
     }
     throw new Error(openRouterMissingKeyMessage(service));

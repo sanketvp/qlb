@@ -129,9 +129,14 @@ describe('qlb doctor', () => {
       command: () => { throw timeout; },
     });
     const keychain = report.checks.find((check) => check.name === 'keychain');
+    const openrouter = report.providers.find((provider) => provider.provider === 'openrouter');
 
     assert.equal(keychain?.level, 'WARN');
     assert.match(keychain?.message ?? '', /timed out after 5s/);
+    assert.equal(openrouter?.level, 'WARN');
+    assert.equal(openrouter?.message, 'security find-generic-password timed out after 5s');
+    assert.doesNotMatch(openrouter?.message ?? '', /credential source not found/);
+    assert.doesNotMatch(openrouter?.example ?? '', /security add-generic-password/);
   });
 
   it('reports the fixed pi-openrouter source and pinned security binary', () => {
