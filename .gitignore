@@ -2,4 +2,6 @@ node_modules/
 dist/
 dist-test/
 *.log
+__pycache__/
+*.pyc
 /.qlb/

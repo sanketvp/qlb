@@ -1,8 +1,10 @@
 # Claude-swap v0.28.0 coverage map
 
 This map tracks the v0.28.0 upstream tests vendored at
-`claude-swap-v0.28.0/tests/`. `pending` means the behavior is in scope for a
-future QLB port. The explicit non-goals below are not port targets.
+`claude-swap-v0.28.0/tests/`. The complete upstream `src/claude_swap/` package
+is vendored alongside them, so every `claude_swap.*` import has pinned source
+material available. `pending` means the behavior is in scope for a future QLB
+port. The explicit non-goals below are not port targets.
 
 ## Golden difference from v0.26.0
 

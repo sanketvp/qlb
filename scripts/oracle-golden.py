@@ -10,6 +10,7 @@ network, Keychain, credential store, or CLI APIs; every input below is synthetic
 from __future__ import annotations
 
 import argparse
+import ast
 import dataclasses
 import json
 import os
@@ -64,11 +65,14 @@ GOLDENS = ROOT / "test" / "oracle" / "goldens"
 VENDORED_SRC = ROOT / "test" / "oracle" / "claude-swap-v0.28.0" / "src"
 PINNED_COMMIT = "2b2d71c7aeb49e6bd25393509ceb05dbca7b0e10"
 SOURCE_FILES = (
-    "__init__.py", "claude_locks.py", "credentials.py", "exceptions.py", "fsutil.py",
-    "json_output.py", "lines.py", "locking.py", "logging_config.py", "macos_keychain.py",
-    "models.py", "oauth.py", "pace.py", "paths.py",
-    "poll_policy.py", "printer.py", "process_detection.py", "session.py", "settings.py",
-    "switcher.py", "usage_store.py",
+    "__init__.py", "__main__.py", "app_bundle.py", "appearance.py", "autoswitch.py",
+    "cache.py", "claude_locks.py", "cli.py", "credentials.py", "exceptions.py", "fsutil.py",
+    "json_output.py", "launch_agent.py", "lines.py", "locking.py", "logging_config.py",
+    "macos_keychain.py", "mappings.py", "menubar.py", "migrations.py", "models.py", "oauth.py",
+    "pace.py", "paths.py", "poll_policy.py", "printer.py", "process_detection.py", "session.py",
+    "settings.py", "snapshot_source.py", "switcher.py", "transfer.py", "tui/__init__.py",
+    "tui/app.py", "tui/autoview.py", "tui/cswap.tcss", "tui/dashboard.py", "tui/data.py",
+    "tui/modals.py", "tui/theme.py", "tui/widgets.py", "update_check.py", "usage_store.py",
 )
 
 
@@ -102,24 +106,26 @@ def _round_plan(plan: tuple[float, float]) -> dict[str, float]:
 
 
 def _source_from_git(repository: str, staging: Path) -> Path:
-    """Materialize the exact imported source closure from a maintainer-supplied repo."""
-    supplied = Path(repository).expanduser()
-    if supplied.is_dir() and (supplied / ".git").exists():
-        repo = supplied.resolve()
-    else:
-        repo = staging / "upstream"
-        subprocess.run(
-            ["git", "clone", "--depth", "1", "--branch", "v0.28.0", repository, str(repo)],
-            check=True,
-        )
-    commit = subprocess.run(
-        ["git", "-C", str(repo), "rev-parse", f"{PINNED_COMMIT}^{{commit}}"],
+    """Materialize the complete pinned package from a maintainer-supplied repo."""
+    if repository.startswith("-"):
+        raise RuntimeError("--from-git must not begin with '-'")
+    # Always clone into staging so subsequent Git reads do not use a supplied
+    # local repository's configuration.
+    repo = staging / "upstream"
+    subprocess.run(
+        ["git", "clone", "--depth", "1", "--branch", "v0.28.0", "--", repository, str(repo)],
+        check=True,
+    )
+    tag_commit = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "v0.28.0^{commit}"],
         capture_output=True,
         check=True,
         text=True,
     ).stdout.strip()
-    if commit != PINNED_COMMIT:
-        raise RuntimeError("claude-swap v0.28.0 tag does not match the pinned commit")
+    if tag_commit != PINNED_COMMIT:
+        raise RuntimeError(
+            f"claude-swap tag v0.28.0 resolves to {tag_commit}, not pinned commit {PINNED_COMMIT}"
+        )
 
     source_root = staging / "src"
     package = source_root / "claude_swap"
@@ -130,14 +136,49 @@ def _source_from_git(repository: str, staging: Path) -> Path:
             capture_output=True,
             check=True,
         ).stdout
-        (package / name).write_bytes(content)
+        destination = package / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(content)
     return source_root
 
 
+def _module_exists(source_root: Path, module: str) -> bool:
+    relative = Path(*module.split("."))
+    return (source_root / relative).with_suffix(".py").is_file() or (source_root / relative / "__init__.py").is_file()
+
+
 def _validate_source_root(source_root: Path) -> None:
-    missing = [name for name in SOURCE_FILES if not (source_root / "claude_swap" / name).is_file()]
+    package = source_root / "claude_swap"
+    missing = [name for name in SOURCE_FILES if not (package / name).is_file()]
     if missing:
         raise RuntimeError(f"vendored claude-swap v0.28.0 source is incomplete: {', '.join(missing)}")
+    unexpected = sorted(
+        path.relative_to(package).as_posix()
+        for path in package.rglob("*")
+        if path.is_file() and path.relative_to(package).as_posix() not in SOURCE_FILES
+    )
+    if unexpected:
+        raise RuntimeError(f"vendored claude-swap v0.28.0 source has unexpected files: {', '.join(unexpected)}")
+
+    unresolved: list[str] = []
+    for path in package.rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            modules: list[str] = []
+            if isinstance(node, ast.Import):
+                modules = [alias.name for alias in node.names if alias.name.startswith("claude_swap.")]
+            elif isinstance(node, ast.ImportFrom) and node.module and node.module.startswith("claude_swap"):
+                modules = [node.module]
+                modules.extend(
+                    candidate
+                    for alias in node.names
+                    if _module_exists(source_root, candidate := f"{node.module}.{alias.name}")
+                )
+            for module in modules:
+                if not _module_exists(source_root, module):
+                    unresolved.append(f"{path.relative_to(source_root)} imports {module}")
+    if unresolved:
+        raise RuntimeError("vendored claude-swap imports are unresolved: " + "; ".join(sorted(unresolved)))
 
 
 def main() -> int:
@@ -167,7 +208,7 @@ def main() -> int:
         metadata = home / "metadata" / "claude_swap-0.28.0.dist-info"
         metadata.mkdir(parents=True)
         (metadata / "METADATA").write_text(
-            "Metadata-Version: 2.1\\nName: claude-swap\\nVersion: 0.28.0\\n",
+            "Metadata-Version: 2.1\nName: claude-swap\nVersion: 0.28.0\n",
             encoding="utf-8",
         )
         sys.path.insert(1, str(metadata.parent))
@@ -184,7 +225,9 @@ def main() -> int:
 
         # Imports occur only after process isolation. The functions called below
         # are deterministic transformations/path derivations with fake inputs.
-        from claude_swap import claude_locks, macos_keychain, oauth, poll_policy, settings
+        from claude_swap import __version__, claude_locks, macos_keychain, oauth, poll_policy, settings
+        if __version__ != "0.28.0":
+            raise RuntimeError(f"vendored claude-swap version is {__version__!r}, expected '0.28.0'")
         from claude_swap.session import keychain_service_name
 
         if not Path(claude_locks.__file__).resolve().is_relative_to(upstream_src.resolve()):
