@@ -48,7 +48,7 @@ added the optional `autoswitch.weeklyThreshold` setting and CLI flag.
 | `test_colour_cache_isolation.py` | pending |
 | `test_config_cli.py` | pending |
 | `test_credentials.py` | pending |
-| `test_fsutil.py` | pending |
+| `test_fsutil.py` | ported: `fsutil.py:134-246` → `src/fsutil.ts`, `test/fsutil.test.ts` |
 | `test_json_output.py` | pending |
 | `test_launch_agent.py` | pending |
 | `test_lines.py` | pending |
