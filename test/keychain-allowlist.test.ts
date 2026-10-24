@@ -6,6 +6,8 @@ import {
   MacosKeychainBackend,
   assertKeychainAccess,
   assertNativeOpenRouterService,
+  MACOS_SECURITY_TIMEOUT_MS,
+  readNativeOpenRouterKey,
   withServiceGuard,
   type ExecFileSyncFn,
 } from '../src/keychain';
@@ -88,6 +90,20 @@ describe('Keychain access allowlist', () => {
         KeychainAccessDeniedError,
       );
     }
+  });
+
+  it('bounds native OpenRouter reads and surfaces a timeout distinctly from a miss', () => {
+    let timeoutMs: number | undefined;
+    const timeout = Object.assign(new Error('fake security timed out'), { code: 'ETIMEDOUT' });
+
+    assert.throws(
+      () => readNativeOpenRouterKey('pi-openrouter', (_file, _args, options) => {
+        timeoutMs = options?.timeout;
+        throw timeout;
+      }),
+      /security find-generic-password timed out after 5s/,
+    );
+    assert.equal(timeoutMs, MACOS_SECURITY_TIMEOUT_MS);
   });
 
   for (const service of CLAUDE_SERVICES) {

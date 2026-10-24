@@ -183,7 +183,7 @@ function isSecurityTimeout(err: unknown): boolean {
 }
 
 function securityTimeoutError(command: string): Error {
-  return new Error(`security ${command} timed out after 5s`);
+  return new Error(`security ${command} timed out after ${MACOS_SECURITY_TIMEOUT_MS / 1_000}s`);
 }
 
 export class MacosKeychainBackend extends SyncCredentialBackend {

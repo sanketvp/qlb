@@ -3,6 +3,8 @@
 
 import { userInfo } from 'node:os';
 
+import { OPENROUTER_KEYCHAIN_SERVICE } from './config';
+
 export type KeychainOperation = 'read' | 'write';
 
 export const MACOS_KEYCHAIN_ACCOUNT_FALLBACK = 'claude-code-user';
@@ -51,7 +53,7 @@ export function isAllowedKeychainService(service: string): boolean {
   return service.startsWith('qlb:')
     || service.startsWith('qlb-test-')
     || service === 'claude-swap'
-    || service === 'pi-openrouter'
+    || service === OPENROUTER_KEYCHAIN_SERVICE
     || isClaudeCodeCredentialsService(service);
 }
 
@@ -68,7 +70,7 @@ export function assertKeychainAccess(
 ): void {
   if (service.startsWith('qlb:') || service.startsWith('qlb-test-')) return;
 
-  if (service === 'claude-swap' || service === 'pi-openrouter') {
+  if (service === 'claude-swap' || service === OPENROUTER_KEYCHAIN_SERVICE) {
     if (operation === 'read') return;
     throw new KeychainAccessDeniedError(service, operation, `${service} is read-only`);
   }

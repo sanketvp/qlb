@@ -1,15 +1,19 @@
-import { execFileSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { consumeMarkerPathFor, CSWAP_ANTHROPIC_STORE } from './cswap-consume';
 import { DatabaseSync } from 'node:sqlite';
 
 import { builtInAdapters } from './adapters';
-import { CONFIG_ENV_VARS, type QlbConfig } from './config';
+import { CONFIG_ENV_VARS, OPENROUTER_KEYCHAIN_SERVICE, type QlbConfig } from './config';
 import { cswapCachePresent } from './cswap-usage';
+import {
+  execFileUtf8,
+  type ExecFileSyncFn,
+} from './credential-backends';
 import {
   defaultCommandExists,
   MACOS_SECURITY_BIN,
+  MACOS_SECURITY_TIMEOUT_MS,
   platformKeychain,
   readNativeOpenRouterKey,
   selectBackendKind,
@@ -136,8 +140,23 @@ export function registeredDoctorChecks(
   return [...report, ...unregistered];
 }
 
-const runCommand: CommandRunner = (command, args) =>
-  execFileSync(command, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+export function createCommandRunner(exec: ExecFileSyncFn = execFileUtf8): CommandRunner {
+  return (command, args) => exec(command, args, {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'ignore'],
+    timeout: MACOS_SECURITY_TIMEOUT_MS,
+  });
+}
+
+const runCommand = createCommandRunner();
+
+function isSecurityTimeout(err: unknown): boolean {
+  return !!err && typeof err === 'object' && (err as { code?: unknown }).code === 'ETIMEDOUT';
+}
+
+function securityTimeoutMessage(command: string): string {
+  return `security ${command} timed out after ${MACOS_SECURITY_TIMEOUT_MS / 1_000}s`;
+}
 
 /** A bounded runner for host probes; never return login-shell environment output. */
 const runHostCommand: HostCommandRunner = (command, args, options) =>
@@ -210,7 +229,7 @@ export function inspectProviders(
     kimiOk = false;
   }
 
-  const openrouterSupported = config.openrouterKeychainService === 'pi-openrouter';
+  const openrouterSupported = config.openrouterKeychainService === OPENROUTER_KEYCHAIN_SERVICE;
   let openrouterOk = false;
   if (openrouterSupported) {
     try {
@@ -284,7 +303,7 @@ function unsupportedOpenRouterService(service: string): ProviderDiagnostic {
 }
 
 function openRouterSetupExample(): string {
-  const service = 'pi-openrouter';
+  const service = OPENROUTER_KEYCHAIN_SERVICE;
   if (process.platform === 'darwin') {
     return `security add-generic-password -s ${service} -a qlb -w '<key>'`;
   }
@@ -367,16 +386,20 @@ function probeCredentialStore(command?: CommandRunner): DoctorCheck {
     try {
       command(MACOS_SECURITY_BIN, ['list-keychains', '-d', 'user']);
       return { name: 'keychain', level: 'PASS', message: 'macOS Keychain command is reachable' };
-    } catch {
-      return { name: 'keychain', level: 'WARN', message: 'macOS Keychain command is unavailable or unreachable' };
+    } catch (err) {
+      return isSecurityTimeout(err)
+        ? { name: 'keychain', level: 'WARN', message: securityTimeoutMessage('list-keychains') }
+        : { name: 'keychain', level: 'WARN', message: 'macOS Keychain command is unavailable or unreachable' };
     }
   }
   if (process.platform === 'darwin') {
     try {
       runCommand(MACOS_SECURITY_BIN, ['list-keychains', '-d', 'user']);
       return { name: 'keychain', level: 'PASS', message: 'macOS Keychain command is reachable' };
-    } catch {
-      return { name: 'keychain', level: 'WARN', message: 'macOS Keychain command is unavailable or unreachable' };
+    } catch (err) {
+      return isSecurityTimeout(err)
+        ? { name: 'keychain', level: 'WARN', message: securityTimeoutMessage('list-keychains') }
+        : { name: 'keychain', level: 'WARN', message: 'macOS Keychain command is unavailable or unreachable' };
     }
   }
   if (process.platform === 'win32') {

@@ -9,8 +9,7 @@
 // All subprocess invocations use `execFile`/`execFileSync` with an argv array
 // (never `exec` + string interpolation) to avoid shell injection.
 
-import { execFileSync } from 'node:child_process';
-
+import { OPENROUTER_KEYCHAIN_SERVICE } from './config';
 import {
   KeychainAccessDeniedError,
   assertKeychainAccess,
@@ -20,8 +19,11 @@ import {
 import {
   createRawCredentialBackend,
   defaultCredentialBackendHost,
+  execFileUtf8,
   MACOS_SECURITY_BIN,
+  MACOS_SECURITY_TIMEOUT_MS,
   type CredentialBackend,
+  type ExecFileSyncFn,
 } from './credential-backends';
 
 export type {
@@ -190,7 +192,7 @@ export function openRouterMissingKeyMessage(service: string): string {
 /** Enforce the native OpenRouter reader's narrower service capability. */
 export function assertNativeOpenRouterService(service: string): void {
   assertKeychainAccess(service, NATIVE_SECRET_ACCOUNT, 'read');
-  if (service !== 'pi-openrouter') {
+  if (service !== OPENROUTER_KEYCHAIN_SERVICE) {
     throw new KeychainAccessDeniedError(
       service,
       'read',
@@ -199,18 +201,36 @@ export function assertNativeOpenRouterService(service: string): void {
   }
 }
 
-export function readNativeOpenRouterKey(service: string): string {
+function isSecurityTimeout(err: unknown): boolean {
+  return !!err && typeof err === 'object' && (err as { code?: unknown }).code === 'ETIMEDOUT';
+}
+
+function nativeOpenRouterTimeoutError(): Error {
+  return new Error(
+    `security find-generic-password timed out after ${MACOS_SECURITY_TIMEOUT_MS / 1_000}s`,
+  );
+}
+
+export function readNativeOpenRouterKey(
+  service: string,
+  exec: ExecFileSyncFn = execFileUtf8,
+): string {
   assertNativeOpenRouterService(service);
   if (process.platform === 'darwin') {
     try {
-      const stdout = execFileSync(
+      const stdout = exec(
         MACOS_SECURITY_BIN,
         ['find-generic-password', '-s', service, '-w'],
-        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] },
+        {
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'ignore'],
+          timeout: MACOS_SECURITY_TIMEOUT_MS,
+        },
       );
       const key = String(stdout).replace(/\n$/, '').trim();
       if (key.length > 0) return key;
-    } catch {
+    } catch (err) {
+      if (isSecurityTimeout(err)) throw nativeOpenRouterTimeoutError();
       // Normalize Keychain lookup failures without exposing command output.
     }
     throw new Error(openRouterMissingKeyMessage(service));
