@@ -1,0 +1,11 @@
+{
+  "account_name_with_fake_user": "oracle-user",
+  "service_names": {
+    "/oracle-home/./.claude": "Claude Code-credentials-3207fce3",
+    "/oracle-home/.claude": "Claude Code-credentials-2665a5d3",
+    "/oracle-home/.claude/": "Claude Code-credentials-3700efea",
+    "/tmp/cafe\u0301": "Claude Code-credentials-0873cca0",
+    "/tmp/caf\u00e9": "Claude Code-credentials-0873cca0",
+    "relative/config": "Claude Code-credentials-708fed8f"
+  }
+}

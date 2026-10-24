@@ -1,0 +1,28 @@
+{
+  "commit": "0d2176df74fcf3241c7c2ff952d56261ec7c6cfc",
+  "files": {
+    "test/oracle/claude-swap-v0.26.0/tests/__init__.py": "d9d64b6d39d73083274e0e6f308a9a24c640b845b162d8cb977b0aa3cc53d088",
+    "test/oracle/claude-swap-v0.26.0/tests/conftest.py": "e9cf9eb8982e9256f38771656cf868e348d938f42e5bb6f441cdec1a787d8918",
+    "test/oracle/claude-swap-v0.26.0/tests/fixtures/sample_config.json": "0df26bb3e334cc79580fc009d438d966fe765f7d29f365ae79aaee4c9225d01b",
+    "test/oracle/claude-swap-v0.26.0/tests/test_add_account_identity.py": "28846482a83709733f351fd9cc63e7165f7fe736de6e0bcb85ac35977e14c612",
+    "test/oracle/claude-swap-v0.26.0/tests/test_autoswitch.py": "60349e7685c88084ae0b2e66aec39acf7b25d89808d0329e73fd174e9c3a223b",
+    "test/oracle/claude-swap-v0.26.0/tests/test_claude_locks.py": "13dc8566090dc9fd5145b8d05f2c23b9b581f71715bec33dacf9e1e87167b9c9",
+    "test/oracle/claude-swap-v0.26.0/tests/test_credentials.py": "480beffe73bcf6f365552dc5877a701d23b1afa59936ba2403c1cdeb189db2ae",
+    "test/oracle/claude-swap-v0.26.0/tests/test_locking.py": "10b419b15f4170d4a4f5628e46f3ba00ffd1bbfb13de01fa9c5b3ed8b373a5c7",
+    "test/oracle/claude-swap-v0.26.0/tests/test_macos_keychain.py": "eb5a8a9f3cbe863a64ebf55c1a2d3c3b4e46ef6d2a4287b12bb652f975f4bfe0",
+    "test/oracle/claude-swap-v0.26.0/tests/test_macos_keychain_contract.py": "95b24bc51f2ef5a7be8609893df180c2bf0b2fef2bfd1b1cfc136193e18a12ac",
+    "test/oracle/claude-swap-v0.26.0/tests/test_migrations.py": "41693e0ddfc62e40cee8d58abe1d44b01bf5ca06a896bae0f82d0d40636a0c51",
+    "test/oracle/claude-swap-v0.26.0/tests/test_oauth.py": "1cc6700f56669a6509e89880d060778285be92fd8af37ee62edc62cc263369bc",
+    "test/oracle/claude-swap-v0.26.0/tests/test_pace.py": "e046e3bfd696a679ca65f0b89ba173a2504485fa4986d75a068e1a242199f4a8",
+    "test/oracle/claude-swap-v0.26.0/tests/test_poll_policy.py": "ef9e934ec76fffa6948f66e1a3a5c5e4eeb8ba0754b77df42aaa8bea60240b26",
+    "test/oracle/claude-swap-v0.26.0/tests/test_real_store_guard.py": "77f735f7d9996be16b734bcd197752daa3f7edd55ac9793b93c380d3910a718b",
+    "test/oracle/claude-swap-v0.26.0/tests/test_session.py": "9507e5d6700046894e3f054bab3f66c042a97e897b83d1523a0ef036d07a54bf",
+    "test/oracle/claude-swap-v0.26.0/tests/test_settings.py": "1e3a363c506dbc58e04165915790681719cafa060967f803547c70b24a9fd424",
+    "test/oracle/claude-swap-v0.26.0/tests/test_switcher.py": "a5c211981f97fb55a0f90ab2f6658e54d3a688f3de0e967620cd6f44545e0743",
+    "test/oracle/claude-swap-v0.26.0/tests/test_usage_store.py": "7c1a9d55fdc02ad5d4fe275d31b2a6fdf8e664498b7106ca1c627bdc2ffc5d26",
+    "third_party/claude-swap/LICENSE": "a6860f35f08a77af9268bcd10fbb57d34a1c0b3e0715ac013ce12f795d453e8b"
+  },
+  "purpose": "Vendored reference material only; it is not executed by Node or QLB.",
+  "tag": "v0.26.0",
+  "upstream": "https://github.com/realiti4/claude-swap"
+}
