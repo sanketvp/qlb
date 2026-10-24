@@ -67,7 +67,7 @@ Overall: WARN
 
 Flags: `[--json] [--live]`. Exit `1` when overall is `FAIL`.
 
-Beyond the core and per-provider lines, doctor adds integration checks when the thing they inspect is present:
+Beyond the core and per-provider lines, doctor adds integration checks when the thing they inspect is present. QLB reads the Hermes config with the `yaml` package and never writes it:
 
 | Check | Reported when | What it tells you |
 | --- | --- | --- |
@@ -76,11 +76,11 @@ Beyond the core and per-provider lines, doctor adds integration checks when the 
 | `pi:seam:<name>` | Pi and the extension are installed | One line per Pi API the extension depends on (`anthropicMessagesApi`, `registerProvider`, `model_select`, `after_provider_response`); flags a Pi upgrade that removed one. |
 | `pi:typecheck` | `--live` only | Typechecks the extension against the Pi you actually run. |
 | `hermes:checkout` | no Hermes checkout at `~/.hermes/hermes-agent` | `PASS`; all other Hermes checks are skipped. |
-| `hermes:integration` | Hermes is installed but there is no trace of QLB in it | `WARN`; the other Hermes checks are skipped. This is the "off" state: `~/.hermes/config.yaml` does not exist (a file that exists but cannot be read is a `hermes:config` `FAIL`) or never sets `qlb-anthropic` / `qlb-codex` (as a provider entry of any shape, or as the `model.provider` route; mentions in comments do not count), there is no QLB plugin directory, and there is no proxy supervisor plist. If any one of those is present, the checks below run instead and report what is missing. |
-| `hermes:config` | there is some trace of QLB in Hermes | `FAIL` when the config cannot be read, or a `qlb-anthropic` / `qlb-codex` provider entry is absent or lost a field QLB relies on. `WARN` when the entries are intact but Hermes' primary route is no longer QLB. |
+| `hermes:integration` | Hermes is installed but there is no trace of QLB in it | `WARN`; the other Hermes checks are skipped. This is the "off" state: the config is absent or, when parsed as YAML, has no `qlb-anthropic` / `qlb-codex` key and no `provider: custom:qlb-anthropic` / `custom:qlb-codex` value (including block, flow, and quoted YAML; comments and strings do not count); no QLB plugin directory or `qlb-proxy-token`, `qlb-hermes-watch`, or `qlb-hermes-models` script; and no proxy (`com.sanket.qlb-proxy` / `QLB_LAUNCHD_LABEL`) or watch (`com.sanket.qlb-hermes-watch` / `QLB_WATCH_LABEL`) plist. An unreadable or invalid config is not off. |
+| `hermes:config` | there is some trace of QLB in Hermes | `FAIL` when the config cannot be read or parsed as YAML; `providers` is not a mapping; either QLB provider entry is absent or is not a mapping; either is missing `api`, `transport`, `key_cmd`, or `session_affinity_header`; or `qlb-codex.api` is not a URL ending in `/v1`. Repeated keys keep the last value and `<<` merge keys are resolved, as in Hermes' own YAML reader. `WARN` when the entries are intact but `model.provider` is not `custom:qlb-anthropic`. |
 | `hermes:plugin` | same | `FAIL` when the QLB Hermes plugin is missing or its last load could not patch Hermes. `WARN` when it has not reported a load yet. |
 | `hermes:codex-fix`, `hermes:branch` | same | The local Hermes patch for named custom Codex providers is present, and the checkout is not on `main`. |
-| `hermes:proxy-supervisor` | same, macOS | `WARN` when the launchd proxy agent plist (`com.sanket.qlb-proxy`, or the label in `QLB_LAUNCHD_LABEL`) is missing. `FAIL` when its port differs from the Hermes config. |
+| `hermes:proxy-supervisor` | same, macOS | `WARN` when the launchd proxy agent plist (`com.sanket.qlb-proxy`, or the label in `QLB_LAUNCHD_LABEL`) is missing. `qlb setup hermes` passes `QLB_LAUNCHD_LABEL` and `QLB_WATCH_LABEL` to the scheduled watch job, so custom labels are checked there too. `FAIL` when its port differs from the Hermes config. |
 | `hermes:models`, `hermes:version` | same | The Hermes `/model` picker lists what QLB policies serve; the Hermes version marker. |
 | `hermes:seam:<name>` | same, `--live` only | The Hermes symbols the plugin patches still exist with the expected signature. |
 

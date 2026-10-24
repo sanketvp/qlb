@@ -12,6 +12,8 @@
   <dict>
     <key>PATH</key><string>__HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
     <key>HOME</key><string>__HOME__</string>
+    <key>QLB_LAUNCHD_LABEL</key><string>__PROXY_LABEL__</string>
+    <key>QLB_WATCH_LABEL</key><string>__LABEL__</string>
   </dict>
   <!-- Fire when the Hermes checkout's HEAD ref changes (hermes update) ... -->
   <key>WatchPaths</key>

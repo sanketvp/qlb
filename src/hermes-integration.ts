@@ -11,8 +11,9 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { parseDocument } from 'yaml';
 import type { DoctorCheck } from './diagnostics';
-import { HERMES_LAUNCHD_LABEL } from './setup-hermes';
+import { HERMES_LAUNCHD_LABEL, HERMES_WATCH_LABEL } from './setup-hermes';
 
 const HERMES_HOME = process.env.HERMES_HOME ?? join(homedir(), '.hermes');
 const HERMES_CHECKOUT = join(HERMES_HOME, 'hermes-agent');
@@ -22,6 +23,8 @@ const PLUGIN_DIR = join(HERMES_HOME, 'plugins', 'model-providers', 'qlb');
 const PLUGIN_STATUS = process.env.QLB_HERMES_PLUGIN_STATUS ?? join(homedir(), '.qlb', 'hermes-plugin.json');
 // Same label `qlb setup hermes` writes the agent under (QLB_LAUNCHD_LABEL overrides it).
 const LAUNCHD_PLIST = join(homedir(), 'Library', 'LaunchAgents', `${HERMES_LAUNCHD_LABEL}.plist`);
+const WATCH_LAUNCHD_PLIST = join(homedir(), 'Library', 'LaunchAgents', `${HERMES_WATCH_LABEL}.plist`);
+const HERMES_SCRIPTS = ['qlb-proxy-token', 'qlb-hermes-watch', 'qlb-hermes-models'].map((name) => join(HERMES_HOME, 'scripts', name));
 
 /** Hermes seams QLB depends on: (python module, symbol, expected parameter names or null). */
 const HERMES_SEAMS: Array<{ module: string; symbol: string; params: string[] | null; why: string }> = [
@@ -61,15 +64,57 @@ function readText(path: string): string | null {
   try { return readFileSync(path, 'utf8'); } catch { return null; }
 }
 
+type ParsedYaml = { value: unknown } | { error: string };
+
+function parseYaml(text: string): ParsedYaml {
+  try {
+    // Hermes reads this file with PyYAML, which keeps the last of repeated keys and resolves
+    // `<<` merge keys; do the same.
+    const doc = parseDocument(text, { uniqueKeys: false, merge: true });
+    if (doc.errors.length > 0) return { error: doc.errors[0].message.split(/\r?\n/, 1)[0] };
+    return { value: doc.toJS() };
+  } catch (error) {
+    return { error: error instanceof Error ? error.message.split(/\r?\n/, 1)[0] : String(error) };
+  }
+}
+
+function isMapping(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function hasNonEmptyScalar(value: unknown): boolean {
+  return value !== undefined && value !== null && typeof value !== 'object'
+    && (typeof value !== 'string' || value.trim().length > 0);
+}
+
 /**
- * Whether the Hermes config names a QLB provider as a setting: a `qlb-anthropic:` /
- * `qlb-codex:` key (block or flow style, any body) or a `provider: custom:qlb-…` route.
- * Comments and unrelated values that merely contain the name do not count.
+ * Whether the Hermes config names a QLB provider as a setting: a `qlb-anthropic` /
+ * `qlb-codex` mapping key (any value) or a `provider: custom:qlb-…` route.
  */
+function parsedValueNamesQlbProvider(value: unknown): boolean {
+  const pending: unknown[] = [value];
+  const visited = new Set<object>();
+  while (pending.length > 0) {
+    const value = pending.pop();
+    if (typeof value !== 'object' || value === null || visited.has(value)) continue;
+    visited.add(value);
+    if (Array.isArray(value)) {
+      pending.push(...value);
+      continue;
+    }
+    for (const [key, child] of Object.entries(value)) {
+      if (key === 'qlb-anthropic' || key === 'qlb-codex') return true;
+      if (key === 'provider' && typeof child === 'string'
+        && (child.trim() === 'custom:qlb-anthropic' || child.trim() === 'custom:qlb-codex')) return true;
+      pending.push(child);
+    }
+  }
+  return false;
+}
+
 export function yamlNamesQlbProvider(yaml: string): boolean {
-  const text = yaml.split('\n').map((line) => line.replace(/(^|\s)#.*$/, '')).join('\n');
-  return /(?:^|[\s{,])["']?qlb-(?:anthropic|codex)["']?\s*:/m.test(text)
-    || /^\s*provider:\s*["']?custom:qlb-(?:anthropic|codex)\b/m.test(text);
+  const parsed = parseYaml(yaml);
+  return 'error' in parsed || parsedValueNamesQlbProvider(parsed.value);
 }
 
 export function hermesIntegrationChecks(options: HermesIntegrationOptions = {}): DoctorCheck[] {
@@ -83,22 +128,23 @@ export function hermesIntegrationChecks(options: HermesIntegrationOptions = {}):
 
   // 1. Hermes config still routes through the proxy with the keys QLB relies on.
   const cfg = readText(HERMES_CONFIG);
-  const anthropicBlock = /\n\s{2}qlb-anthropic:\n((?:\s{4}.*\n)+)/.exec(cfg ?? '')?.[1] ?? '';
-  const codexBlock = /\n\s{2}qlb-codex:\n((?:\s{4}.*\n)+)/.exec(cfg ?? '')?.[1] ?? '';
+  const parsedConfig = cfg == null ? null : parseYaml(cfg);
+  const configValue = parsedConfig != null && 'value' in parsedConfig ? parsedConfig.value : undefined;
 
   // Hermes is installed but QLB was never wired into it (or was deliberately unwired). That is
-  // "off", not "broken". The checks below exist to catch an integration that lost a piece, so
-  // "off" means no trace at all: the config (if there is one) never names a QLB provider — not
-  // as a providers: entry of any shape, valid or not, and not as a leftover model.provider
-  // route — and neither the plugin directory nor the proxy supervisor exists. Any trace keeps
-  // the full checks, which report what is missing. A config that exists but cannot be read is
-  // not "off" either: it falls through to hermes:config FAIL.
-  const configHasQlbTrace = cfg == null ? existsSync(HERMES_CONFIG) : yamlNamesQlbProvider(cfg);
-  const integrationAbsent = !configHasQlbTrace && !existsSync(PLUGIN_DIR) && !existsSync(LAUNCHD_PLIST);
+  // "off", not "broken": no config trace, plugin, scripts, or either launchd agent. A config
+  // that cannot be read or parsed is not off because we cannot prove it has no QLB trace.
+  const configHasQlbTrace = cfg == null ? existsSync(HERMES_CONFIG)
+    : parsedConfig != null && 'error' in parsedConfig ? true : parsedValueNamesQlbProvider(configValue);
+  const integrationAbsent = !configHasQlbTrace
+    && !existsSync(PLUGIN_DIR)
+    && !existsSync(LAUNCHD_PLIST)
+    && !existsSync(WATCH_LAUNCHD_PLIST)
+    && !HERMES_SCRIPTS.some(existsSync);
   if (integrationAbsent) {
     checks.push({
       name: 'hermes:integration', level: 'WARN',
-      message: 'Hermes is installed but QLB is not set up for it (no qlb-anthropic / qlb-codex entries, plugin or proxy supervisor); skipping Hermes checks',
+      message: 'Hermes is installed but QLB is not set up for it (no QLB provider entries, plugin, scripts or launchd agents); skipping Hermes checks',
       detail: { fix: 'qlb setup hermes   (only if Hermes should route through QLB)' },
     });
     return checks;
@@ -106,18 +152,34 @@ export function hermesIntegrationChecks(options: HermesIntegrationOptions = {}):
 
   if (cfg == null) {
     checks.push({ name: 'hermes:config', level: 'FAIL', message: `cannot read ${HERMES_CONFIG}` });
+  } else if (parsedConfig != null && 'error' in parsedConfig) {
+    checks.push({ name: 'hermes:config', level: 'FAIL', message: `cannot parse ${HERMES_CONFIG}: ${parsedConfig.error}` });
   } else {
     const missing: string[] = [];
-    for (const [label, block] of [['qlb-anthropic', anthropicBlock], ['qlb-codex', codexBlock]] as const) {
-      if (!block) { missing.push(`${label} (entry absent)`); continue; }
-      for (const key of REQUIRED_PROVIDER_KEYS) {
-        if (!new RegExp(`^\\s{4}${key}:`, 'm').test(block)) missing.push(`${label}.${key}`);
+    const root = configValue;
+    const rawProviders = isMapping(root) ? root.providers : undefined;
+    // No providers: section at all means both QLB entries are absent, not a broken section.
+    const providers = rawProviders ?? {};
+    if (!isMapping(providers)) {
+      missing.push('providers (is not a mapping)');
+    } else {
+      for (const label of ['qlb-anthropic', 'qlb-codex'] as const) {
+        if (!Object.hasOwn(providers, label)) { missing.push(`${label} (entry absent)`); continue; }
+        const provider = providers[label];
+        if (!isMapping(provider)) { missing.push(`${label} (entry is not a mapping)`); continue; }
+        for (const key of REQUIRED_PROVIDER_KEYS) {
+          if (!hasNonEmptyScalar(provider[key])) missing.push(`${label}.${key}`);
+        }
+      }
+      const codex = providers['qlb-codex'];
+      if (isMapping(codex) && hasNonEmptyScalar(codex.api)
+        && !(typeof codex.api === 'string' && /^https?:\/\/\S+\/v1$/.test(codex.api.trim()))) {
+        missing.push('qlb-codex.api must end in /v1 (Codex Responses posts to <api>/responses)');
       }
     }
-    if (codexBlock && !/api:\s*https?:\/\/[^\s]+\/v1\s*$/m.test(codexBlock)) {
-      missing.push('qlb-codex.api must end in /v1 (Codex Responses posts to <api>/responses)');
-    }
-    const primaryIsQlb = /^model:\n(?:.*\n)*?\s{2}provider:\s*custom:qlb-anthropic/m.test(cfg);
+    const model = isMapping(root) ? root.model : undefined;
+    const primaryIsQlb = isMapping(model) && typeof model.provider === 'string'
+      && model.provider.trim() === 'custom:qlb-anthropic';
     if (missing.length > 0) {
       checks.push({
         name: 'hermes:config', level: 'FAIL',
@@ -190,7 +252,15 @@ export function hermesIntegrationChecks(options: HermesIntegrationOptions = {}):
     } else {
       const plist = readText(LAUNCHD_PLIST) ?? '';
       const port = /--port<\/string>\s*<string>(\d+)/.exec(plist)?.[1];
-      const cfgPort = /qlb-anthropic:\n(?:\s{4}.*\n)*?\s{4}api:\s*https?:\/\/[^:]+:(\d+)/.exec(cfg ?? '')?.[1];
+      const providers = isMapping(configValue) ? configValue.providers : undefined;
+      const anthropic = isMapping(providers) ? providers['qlb-anthropic'] : undefined;
+      let cfgPort: string | undefined;
+      if (isMapping(anthropic) && typeof anthropic.api === 'string') {
+        try {
+          const url = new URL(anthropic.api);
+          cfgPort = url.port || (url.protocol === 'https:' ? '443' : url.protocol === 'http:' ? '80' : '') || undefined;
+        } catch { /* unavailable */ }
+      }
       if (port && cfgPort && port !== cfgPort) {
         checks.push({ name: 'hermes:proxy-supervisor', level: 'FAIL', message: `launchd proxy port ${port} != Hermes base_url port ${cfgPort}` });
       } else {
@@ -250,10 +320,11 @@ export function hermesIntegrationChecks(options: HermesIntegrationOptions = {}):
       if (prov && p.virtualModel === p.realModel) want[prov].add(p.virtualModel);
     }
     const missing: string[] = [];
+    const providers = isMapping(configValue) ? configValue.providers : undefined;
     for (const [prov, models] of Object.entries(want)) {
-      const block = new RegExp(`\\n\\s{2}${prov}:\\n((?:\\s{4}.*\\n)+)`).exec(cfg ?? '')?.[1] ?? '';
-      const modelsBlock = /\n\s{4}models:\n((?:\s{6}.*\n)+)/.exec(block)?.[1] ?? '';
-      for (const m of models) if (!new RegExp(`^\\s{6}${m.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}:`, 'm').test(modelsBlock)) missing.push(`${prov}/${m}`);
+      const provider = isMapping(providers) ? providers[prov] : undefined;
+      const configuredModels = isMapping(provider) && isMapping(provider.models) ? provider.models : undefined;
+      for (const m of models) if (!configuredModels || !Object.hasOwn(configuredModels, m)) missing.push(`${prov}/${m}`);
     }
     checks.push(missing.length === 0
       ? { name: 'hermes:models', level: 'PASS', message: `Hermes /model picker lists all ${Object.values(want).reduce((n, s) => n + s.size, 0)} QLB-served models` }
