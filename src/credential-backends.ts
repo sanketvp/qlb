@@ -158,7 +158,9 @@ abstract class SyncCredentialBackend implements CredentialBackend {
 
 // --- macOS Keychain (`security` CLI) ---------------------------------------
 
-const MACOS_SECURITY_BIN = '/usr/bin/security';
+export const MACOS_SECURITY_BIN = '/usr/bin/security';
+/** Bound every macOS Keychain spawn so a locked Keychain cannot hang the CLI. */
+export const MACOS_SECURITY_TIMEOUT_MS = 5_000;
 // `security -i` reads each command with a 4096-byte line buffer. Keep the
 // upstream 64-byte margin for line-ending accounting differences.
 const SECURITY_STDIN_LINE_LIMIT = 4096 - 64;
@@ -174,6 +176,14 @@ function assertSecurityInteractiveField(value: string): void {
   if (/[\r\n\0]/.test(value)) {
     throw new Error('keychain set refused: service and account must not contain CR, LF, or NUL');
   }
+}
+
+function isSecurityTimeout(err: unknown): boolean {
+  return !!err && typeof err === 'object' && (err as { code?: unknown }).code === 'ETIMEDOUT';
+}
+
+function securityTimeoutError(command: string): Error {
+  return new Error(`security ${command} timed out after 5s`);
 }
 
 export class MacosKeychainBackend extends SyncCredentialBackend {
@@ -198,15 +208,18 @@ export class MacosKeychainBackend extends SyncCredentialBackend {
         + `-s ${quoteSecurityInteractive(service)} -X ${hexValue}\n`
       );
       if (Buffer.byteLength(command, 'utf8') <= SECURITY_STDIN_LINE_LIMIT) {
-        this.exec(MACOS_SECURITY_BIN, ['-i'], { encoding: 'utf8', input: command });
+        this.exec(MACOS_SECURITY_BIN, ['-i'], {
+          encoding: 'utf8', input: command, timeout: MACOS_SECURITY_TIMEOUT_MS,
+        });
       } else {
         this.exec(
           MACOS_SECURITY_BIN,
           ['add-generic-password', '-U', '-a', account, '-s', service, '-X', hexValue],
-          { encoding: 'utf8' },
+          { encoding: 'utf8', timeout: MACOS_SECURITY_TIMEOUT_MS },
         );
       }
-    } catch {
+    } catch (err) {
+      if (isSecurityTimeout(err)) throw securityTimeoutError('add-generic-password');
       // Child-process errors can include stdin or argv (including hex secret
       // material), so never preserve their message.
       throw new Error(`keychain set failed for service=${service} account=${account}`);
@@ -218,10 +231,13 @@ export class MacosKeychainBackend extends SyncCredentialBackend {
       const stdout = this.exec(
         MACOS_SECURITY_BIN,
         ['find-generic-password', '-a', account, '-w', '-s', service],
-        { encoding: 'utf8' },
+        { encoding: 'utf8', timeout: MACOS_SECURITY_TIMEOUT_MS },
       );
       return stdout.replace(/\n$/, '');
     } catch (err) {
+      if (isSecurityTimeout(err)) {
+        throw wrapCredentialError('get', service, account, securityTimeoutError('find-generic-password'));
+      }
       throw wrapCredentialError('get', service, account, err);
     }
   }
@@ -231,9 +247,12 @@ export class MacosKeychainBackend extends SyncCredentialBackend {
       this.exec(
         MACOS_SECURITY_BIN,
         ['delete-generic-password', '-a', account, '-s', service],
-        { encoding: 'utf8' },
+        { encoding: 'utf8', timeout: MACOS_SECURITY_TIMEOUT_MS },
       );
     } catch (err) {
+      if (isSecurityTimeout(err)) {
+        throw wrapCredentialError('delete', service, account, securityTimeoutError('delete-generic-password'));
+      }
       throw wrapCredentialError('delete', service, account, err);
     }
   }

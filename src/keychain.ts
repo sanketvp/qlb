@@ -20,6 +20,7 @@ import {
 import {
   createRawCredentialBackend,
   defaultCredentialBackendHost,
+  MACOS_SECURITY_BIN,
   type CredentialBackend,
 } from './credential-backends';
 
@@ -52,6 +53,8 @@ export {
   WINDOWS_POWERSHELL_BASE_ARGS,
   defaultCommandExists,
   defaultCredentialBackendHost,
+  MACOS_SECURITY_BIN,
+  MACOS_SECURITY_TIMEOUT_MS,
 } from './credential-backends';
 
 /** Existing name used by migration / refresh-lease / credentials. */
@@ -63,8 +66,8 @@ export const NATIVE_SECRET_ACCOUNT = 'qlb';
 /** @deprecated Use assertKeychainAccess when an operation and account are known. */
 export function isSafeKeychainService(service: string): boolean {
   // The deprecated, operation-free API promises that every operation is safe.
-  // Only QLB-owned services meet that promise.
-  return service.startsWith('qlb:');
+  // QLB-owned and disposable test services meet that promise.
+  return service.startsWith('qlb:') || service.startsWith('qlb-test-');
 }
 
 /** @deprecated Use assertKeychainAccess when an operation and account are known. */
@@ -201,7 +204,7 @@ export function readNativeOpenRouterKey(service: string): string {
   if (process.platform === 'darwin') {
     try {
       const stdout = execFileSync(
-        'security',
+        MACOS_SECURITY_BIN,
         ['find-generic-password', '-s', service, '-w'],
         { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] },
       );

@@ -16,10 +16,11 @@ describe('keychain service-name safety', () => {
     assert.equal(isSafeKeychainService('claude-swap'), false);
     assert.equal(isSafeKeychainService('Claude Code-credentials'), false);
     assert.equal(isSafeKeychainService('pi-openrouter'), false);
-    assert.equal(isSafeKeychainService('qlb-test-roundtrip'), false);
+    assert.equal(isSafeKeychainService('qlb-test-roundtrip'), true);
     assert.equal(isSafeKeychainService(''), false);
     assert.equal(isSafeKeychainService('generic'), false);
     assert.doesNotThrow(() => assertSafeKeychainService('qlb:anthropic:acct-1'));
+    assert.doesNotThrow(() => assertSafeKeychainService('qlb-test-roundtrip'));
     for (const service of ['claude-swap', 'Claude Code-credentials', 'pi-openrouter', 'generic']) {
       assert.throws(() => assertSafeKeychainService(service));
     }

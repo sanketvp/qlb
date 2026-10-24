@@ -9,6 +9,7 @@ import { CONFIG_ENV_VARS, type QlbConfig } from './config';
 import { cswapCachePresent } from './cswap-usage';
 import {
   defaultCommandExists,
+  MACOS_SECURITY_BIN,
   platformKeychain,
   readNativeOpenRouterKey,
   selectBackendKind,
@@ -209,21 +210,24 @@ export function inspectProviders(
     kimiOk = false;
   }
 
+  const openrouterSupported = config.openrouterKeychainService === 'pi-openrouter';
   let openrouterOk = false;
-  try {
-    if (command === runCommand) {
-      openrouterOk = readNativeOpenRouterKey(config.openrouterKeychainService).trim().length > 0;
-    } else {
-      openrouterOk = command('security', [
-        'find-generic-password', '-s', config.openrouterKeychainService, '-w',
-      ]).trim().length > 0;
+  if (openrouterSupported) {
+    try {
+      if (command === runCommand) {
+        openrouterOk = readNativeOpenRouterKey(config.openrouterKeychainService).trim().length > 0;
+      } else {
+        openrouterOk = command(MACOS_SECURITY_BIN, [
+          'find-generic-password', '-s', config.openrouterKeychainService, '-w',
+        ]).trim().length > 0;
+      }
+    } catch {
+      openrouterOk = false;
     }
-  } catch {
-    openrouterOk = false;
   }
 
   const openrouterSource = openRouterSourceLabel(config.openrouterKeychainService);
-  const openrouterExample = openRouterSetupExample(config.openrouterKeychainService);
+  const openrouterExample = openRouterSetupExample();
 
   return [
     anthropicOk
@@ -238,9 +242,11 @@ export function inspectProviders(
     kimiOk
       ? found('kimi-coding', config.kimiCredentialsFile, CONFIG_ENV_VARS.kimiCredentialsFile, `export ${CONFIG_ENV_VARS.kimiCredentialsFile}=~/path/to/kimi-credentials.md`)
       : missing('kimi-coding', config.kimiCredentialsFile, CONFIG_ENV_VARS.kimiCredentialsFile, `export ${CONFIG_ENV_VARS.kimiCredentialsFile}=~/path/to/file-containing-sk-kimi-key`),
-    openrouterOk
-      ? found('openrouter', openrouterSource, CONFIG_ENV_VARS.openrouterKeychainService, `export ${CONFIG_ENV_VARS.openrouterKeychainService}=pi-openrouter`)
-      : missing('openrouter', openrouterSource, CONFIG_ENV_VARS.openrouterKeychainService, openrouterExample),
+    !openrouterSupported
+      ? unsupportedOpenRouterService(config.openrouterKeychainService)
+      : openrouterOk
+        ? found('openrouter', openrouterSource, CONFIG_ENV_VARS.openrouterKeychainService, `export ${CONFIG_ENV_VARS.openrouterKeychainService}=pi-openrouter`)
+        : missingFixedOpenRouter(openrouterSource, openrouterExample),
   ];
 }
 
@@ -255,7 +261,30 @@ function openRouterSourceLabel(service: string): string {
   return `encrypted credential file service ${service}`;
 }
 
-function openRouterSetupExample(service: string): string {
+function missingFixedOpenRouter(source: string, example: string): ProviderDiagnostic {
+  return {
+    provider: 'openrouter',
+    level: 'WARN',
+    source,
+    envVar: CONFIG_ENV_VARS.openrouterKeychainService,
+    example,
+    message: `credential source not found in fixed pi-openrouter service. Example: ${example}`,
+  };
+}
+
+function unsupportedOpenRouterService(service: string): ProviderDiagnostic {
+  return {
+    provider: 'openrouter',
+    level: 'WARN',
+    source: openRouterSourceLabel(service),
+    envVar: CONFIG_ENV_VARS.openrouterKeychainService,
+    example: `remove the override or set ${CONFIG_ENV_VARS.openrouterKeychainService}=pi-openrouter`,
+    message: `unsupported OpenRouter Keychain service '${service}'; only pi-openrouter is supported`,
+  };
+}
+
+function openRouterSetupExample(): string {
+  const service = 'pi-openrouter';
   if (process.platform === 'darwin') {
     return `security add-generic-password -s ${service} -a qlb -w '<key>'`;
   }
@@ -336,7 +365,7 @@ function probeCredentialStore(command?: CommandRunner): DoctorCheck {
   // Tests inject a command runner and still speak the macOS `security` CLI.
   if (command) {
     try {
-      command('security', ['list-keychains', '-d', 'user']);
+      command(MACOS_SECURITY_BIN, ['list-keychains', '-d', 'user']);
       return { name: 'keychain', level: 'PASS', message: 'macOS Keychain command is reachable' };
     } catch {
       return { name: 'keychain', level: 'WARN', message: 'macOS Keychain command is unavailable or unreachable' };
@@ -344,7 +373,7 @@ function probeCredentialStore(command?: CommandRunner): DoctorCheck {
   }
   if (process.platform === 'darwin') {
     try {
-      runCommand('security', ['list-keychains', '-d', 'user']);
+      runCommand(MACOS_SECURITY_BIN, ['list-keychains', '-d', 'user']);
       return { name: 'keychain', level: 'PASS', message: 'macOS Keychain command is reachable' };
     } catch {
       return { name: 'keychain', level: 'WARN', message: 'macOS Keychain command is unavailable or unreachable' };

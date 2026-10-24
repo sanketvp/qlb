@@ -43,6 +43,23 @@ describe('Keychain access allowlist', () => {
     assert.equal(calls.length, 2);
   });
 
+  it('allows qlb-test-* services for reads, writes, and deletes only', () => {
+    const { backend, calls } = guardedFakeSecurity();
+    backend.setSync('qlb-test-roundtrip', 'any-account', 'secret');
+    assert.equal(backend.getSync('qlb-test-roundtrip', 'any-account'), 'saved-value');
+    backend.deleteSync('qlb-test-roundtrip', 'any-account');
+    assert.equal(calls.length, 3);
+
+    for (const service of ['qlbtest-roundtrip', 'qlb-tes-roundtrip']) {
+      for (const operation of ['read', 'write'] as const) {
+        assert.throws(
+          () => assertKeychainAccess(service, 'any-account', operation),
+          KeychainAccessDeniedError,
+        );
+      }
+    }
+  });
+
   it('allows claude-swap reads only', () => {
     const { backend, calls } = guardedFakeSecurity();
     assert.equal(backend.getSync('claude-swap', 'legacy-account'), 'saved-value');
@@ -180,6 +197,30 @@ describe('Keychain access allowlist', () => {
       /must not contain CR, LF, or NUL/,
     );
     assert.equal(calls.length, 1);
+  });
+
+  it('bounds every macOS security operation and reports timeouts without command output', () => {
+    const calls: Array<{ args: string[]; timeout?: number }> = [];
+    const timeout = Object.assign(new Error('fake runner timed out'), { code: 'ETIMEDOUT' });
+    const exec: ExecFileSyncFn = (_file, args, options) => {
+      calls.push({ args: [...args], timeout: options?.timeout });
+      throw timeout;
+    };
+    const backend = new MacosKeychainBackend({ execFileSync: exec });
+
+    assert.throws(
+      () => backend.setSync('qlb:timeout', 'account', 'secret'),
+      /security add-generic-password timed out after 5s/,
+    );
+    assert.throws(
+      () => backend.getSync('qlb:timeout', 'account'),
+      /security find-generic-password timed out after 5s/,
+    );
+    assert.throws(
+      () => backend.deleteSync('qlb:timeout', 'account'),
+      /security delete-generic-password timed out after 5s/,
+    );
+    assert.deepEqual(calls.map((call) => call.timeout), [5000, 5000, 5000]);
   });
 
   it('redacts both plaintext and hex payloads from write failures', () => {

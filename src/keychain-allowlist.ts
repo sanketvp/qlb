@@ -49,6 +49,7 @@ function isClaudeCodeCredentialsService(service: string): boolean {
 /** Whether a service is recognized by the fixed capability allowlist. */
 export function isAllowedKeychainService(service: string): boolean {
   return service.startsWith('qlb:')
+    || service.startsWith('qlb-test-')
     || service === 'claude-swap'
     || service === 'pi-openrouter'
     || isClaudeCodeCredentialsService(service);
@@ -65,7 +66,7 @@ export function assertKeychainAccess(
   operation: KeychainOperation,
   options: KeychainAllowlistOptions = {},
 ): void {
-  if (service.startsWith('qlb:')) return;
+  if (service.startsWith('qlb:') || service.startsWith('qlb-test-')) return;
 
   if (service === 'claude-swap' || service === 'pi-openrouter') {
     if (operation === 'read') return;
