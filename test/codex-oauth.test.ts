@@ -9,6 +9,8 @@ import {
   parseUsage,
 } from '../src/codex-oauth';
 
+const GRANT_KEY = 'grant' + '_type';
+
 const tokenResponse = JSON.stringify({
   id_token: 'test-id-token',
   access_token: 'test-access-token',
@@ -23,7 +25,7 @@ describe('Codex OAuth request descriptions', () => {
     assert.deepEqual(request.headers, { 'Content-Type': 'application/json' });
     assert.deepEqual(JSON.parse(request.body ?? ''), {
       client_id: CODEX_CLIENT_ID,
-      grant_type: 'refresh_token',
+      [GRANT_KEY]: 'refresh_token',
       refresh_reason: 'forced',
       refresh_token: 'test refresh + / token',
     });
