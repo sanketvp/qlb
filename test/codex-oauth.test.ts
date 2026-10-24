@@ -5,6 +5,7 @@ import {
   applyRefresh,
   buildRefreshRequest,
   buildUsageRequest,
+  refreshReasonFor,
   classifyRefreshResponse,
   parseUsage,
 } from '../src/codex-oauth';
@@ -19,7 +20,7 @@ const tokenResponse = JSON.stringify({
 
 describe('Codex OAuth request descriptions', () => {
   it('describes the JSON refresh request used by Codex 0.164.0', () => {
-    const request = buildRefreshRequest('test refresh + / token');
+    const request = buildRefreshRequest('test refresh + / token', 'forced');
     assert.equal(request.url, 'https://auth.openai.com/oauth/token');
     assert.equal(request.method, 'POST');
     assert.deepEqual(request.headers, { 'Content-Type': 'application/json' });
@@ -29,6 +30,27 @@ describe('Codex OAuth request descriptions', () => {
       refresh_reason: 'forced',
       refresh_token: 'test refresh + / token',
     });
+  });
+
+  it('maps all refresh triggers to Codex refresh reasons', () => {
+    const cases = [
+      ['proactive-expiry', 'proactive_expiry'],
+      ['scheduled', 'scheduled'],
+      ['unauthorized', 'unauthorized_recovery'],
+      ['force', 'forced'],
+    ] as const;
+
+    for (const [trigger, reason] of cases) {
+      assert.equal(refreshReasonFor(trigger), reason);
+      assert.equal(
+        JSON.parse(buildRefreshRequest('test refresh + / token', refreshReasonFor(trigger)).body ?? '')
+          .refresh_reason,
+        reason,
+      );
+    }
+    assert.notEqual(refreshReasonFor('proactive-expiry'), 'forced');
+    assert.notEqual(refreshReasonFor('scheduled'), 'forced');
+    assert.notEqual(refreshReasonFor('unauthorized'), 'forced');
   });
 
   it('describes the usage request without sending it', () => {
