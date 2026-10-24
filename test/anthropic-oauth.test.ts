@@ -339,6 +339,30 @@ describe('Anthropic OAuth pure port', () => {
     ]);
   });
 
+  it('keeps the binding scoped window when duplicate display names collide', () => {
+    const firstBinding = {
+      limits: [
+        { percent: 95, resets_at: '2099-01-08T00:00:00+00:00', scope: { surface: 'chat', model: { display_name: 'Fable' } } },
+        { percent: 20, resets_at: '2099-01-09T00:00:00+00:00', scope: { surface: 'code', model: { display_name: 'Fable' } } },
+      ],
+    };
+    assert.deepEqual(parseUsageResponse(firstBinding), {
+      buckets: { '7d:Fable': { usedPct: 95, resetsAt: '2099-01-08T00:00:00+00:00' } },
+    });
+  });
+
+  it('keeps the binding scoped window when duplicate display names arrive in reverse order', () => {
+    const lastBinding = {
+      limits: [
+        { percent: 20, resets_at: '2099-01-09T00:00:00+00:00', scope: { surface: 'code', model: { display_name: 'Fable' } } },
+        { percent: 95, resets_at: '2099-01-08T00:00:00+00:00', scope: { surface: 'chat', model: { display_name: 'Fable' } } },
+      ],
+    };
+    assert.deepEqual(parseUsageResponse(lastBinding), {
+      buckets: { '7d:Fable': { usedPct: 95, resetsAt: '2099-01-08T00:00:00+00:00' } },
+    });
+  });
+
   it('keeps valid usage windows when another oracle window has non-numeric utilization', () => {
     for (const utilization of [null, '12']) {
       const input = { five_hour: { utilization }, seven_day: { utilization: 34 } };

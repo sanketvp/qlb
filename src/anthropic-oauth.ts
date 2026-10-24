@@ -376,9 +376,11 @@ export function parseUsageResponse(data: unknown): ParsedUsageResponse {
       const bucket: UsageBucket = { usedPct };
       const resetsAt = validatedResetAt(limit.resets_at);
       if (resetsAt !== undefined) bucket.resetsAt = resetsAt;
-      // build_usage_result preserves the API display name verbatim and does
-      // not merge similarly normalized names or discard either reset time.
-      buckets[`7d:${name}`] = bucket;
+      // Preserve display names verbatim. Duplicate names cannot both be keys,
+      // so retain the binding (highest-use) window and its corresponding reset.
+      const key = `7d:${name}`;
+      const existing = buckets[key];
+      if (!existing || bucket.usedPct > existing.usedPct) buckets[key] = bucket;
     }
   }
   return { buckets };
