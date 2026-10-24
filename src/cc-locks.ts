@@ -1,7 +1,7 @@
 // Ported from claude-swap 0.28.0 (MIT, Copyright (c) realiti4) — claude_locks.py (lines 46–70, 75–228).
 // See third_party/claude-swap/LICENSE for the upstream license.
 
-import { existsSync } from 'node:fs';
+import { existsSync, statSync } from 'node:fs';
 import { mkdir, rmdir, stat, utimes } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
@@ -50,38 +50,67 @@ export interface ClaudeLockPaths {
   configLockDir: string;
 }
 
+function resolvedEnv(options: ClaudeLockOptions): NodeJS.ProcessEnv {
+  return options.env ?? process.env;
+}
+
 function resolvedHome(options: ClaudeLockOptions): string {
-  const fromEnv = options.env?.HOME;
+  const fromEnv = resolvedEnv(options).HOME;
   return options.home ?? (typeof fromEnv === 'string' && fromEnv.length > 0 ? fromEnv : homedir());
 }
 
 function resolvedConfigHome(options: ClaudeLockOptions): string {
-  const fromEnv = options.env?.CLAUDE_CONFIG_DIR;
+  const fromEnv = resolvedEnv(options).CLAUDE_CONFIG_DIR;
   return options.configDir ?? (typeof fromEnv === 'string' && fromEnv.length > 0 ? fromEnv : join(resolvedHome(options), '.claude'));
 }
 
 /**
- * Resolve C-swap/Claude Code lock paths, including CLAUDE_CONFIG_DIR and the legacy
- * `<config-home>/.config.json` global-config location.
+ * Resolve C-swap/Claude Code lock paths, choosing legacy `<config-home>/.config.json`
+ * only when Claude Code's `_pick_global_config` rule would select it.
  */
 export function claudeLockPaths(options: ClaudeLockOptions = {}): ClaudeLockPaths {
   const configHome = resolvedConfigHome(options);
   const legacyGlobalConfig = join(configHome, '.config.json');
-  // Claude Code uses the legacy in-profile config when it exists. Otherwise its global
-  // config is beside CLAUDE_CONFIG_DIR, or beside HOME for the default profile.
-  const globalConfig = existsSync(legacyGlobalConfig)
-    ? legacyGlobalConfig
-    : join((options.configDir ?? options.env?.CLAUDE_CONFIG_DIR) || resolvedHome(options), '.claude.json');
+  const globalConfig = join((options.configDir ?? resolvedEnv(options).CLAUDE_CONFIG_DIR) || resolvedHome(options), '.claude.json');
+  let pickedGlobalConfig = globalConfig;
+  try {
+    const legacy = statSync(legacyGlobalConfig);
+    if (legacy.isFile() && (legacy.size > 0 || ((legacy.mode & 0o222) !== 0 && !existsSync(globalConfig)))) {
+      pickedGlobalConfig = legacyGlobalConfig;
+    }
+  } catch {
+    // A missing, inaccessible, or otherwise invalid legacy path makes the global file win.
+  }
   return {
     configHome,
     oauthRefreshLockDir: join(configHome, '.oauth_refresh.lock'),
     credentialsLockDir: join(configHome, '..', `${basename(configHome)}.lock`),
-    configLockDir: `${globalConfig}.lock`,
+    configLockDir: `${pickedGlobalConfig}.lock`,
   };
 }
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+interface LockDirectoryIdentity {
+  dev: number;
+  ino: number;
+}
+
+async function lockDirectoryIdentity(lockDir: string): Promise<LockDirectoryIdentity | undefined> {
+  try {
+    const held = await stat(lockDir);
+    return { dev: held.dev, ino: held.ino };
+  } catch {
+    return undefined;
+  }
+}
+
+async function stillOwnsLock(lockDir: string, identity: LockDirectoryIdentity | undefined): Promise<boolean> {
+  if (!identity) return false;
+  const current = await lockDirectoryIdentity(lockDir);
+  return current?.dev === identity.dev && current.ino === identity.ino;
 }
 
 async function bestEffortRelease(lockDir: string): Promise<void> {
@@ -176,10 +205,18 @@ export async function withProperLockfile<T>(
     await sleep(retryMinMs + Math.random() * retryJitterMs);
   }
 
+  const identity = await lockDirectoryIdentity(lockDir);
   let touchInFlight: Promise<void> | undefined;
   const timer = setInterval(() => {
     if (touchInFlight) return;
-    touchInFlight = utimes(lockDir, new Date(), new Date()).catch(() => {
+    touchInFlight = (async () => {
+      // This narrows the race versus blind path operations, but stat and the mutation are not atomic.
+      if (!await stillOwnsLock(lockDir, identity)) {
+        clearInterval(timer);
+        return;
+      }
+      await utimes(lockDir, new Date(), new Date());
+    })().catch(() => {
       // The lock was removed or stolen; there is nothing left to refresh.
     }).finally(() => { touchInFlight = undefined; });
   }, touchIntervalMs);
@@ -191,7 +228,7 @@ export async function withProperLockfile<T>(
     clearInterval(timer);
     // Like C-swap's thread join, never let a prior holder touch a newly acquired directory.
     await touchInFlight;
-    await bestEffortRelease(lockDir);
+    if (await stillOwnsLock(lockDir, identity)) await bestEffortRelease(lockDir);
   }
 }
 

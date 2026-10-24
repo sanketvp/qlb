@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { existsSync } from 'node:fs';
-import { mkdtemp, mkdir, readdir, rm, stat, utimes } from 'node:fs/promises';
+import { chmod, mkdtemp, mkdir, readdir, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
@@ -54,14 +54,14 @@ describe('Claude Code proper-lockfile locks', () => {
   it('uses Claude Code paths, acquires in order, and releases credential locks', async () => {
     const home = await tempHome();
     try {
-      const paths = claudeLockPaths({ home });
+      const paths = claudeLockPaths({ home, env: {} });
       assert.equal(paths.oauthRefreshLockDir, join(home, '.claude', '.oauth_refresh.lock'));
       assert.equal(paths.credentialsLockDir, join(home, '.claude.lock'));
       assert.equal(paths.configLockDir, join(home, '.claude.json.lock'));
 
       await mkdir(paths.credentialsLockDir, { recursive: true });
       const held = withClaudeCredentialLocks(
-        { home, timeoutMs: 500, retryMinMs: 5, retryJitterMs: 0 },
+        { home, env: {}, timeoutMs: 500, retryMinMs: 5, retryJitterMs: 0 },
         async () => {
           assert.equal(existsSync(paths.oauthRefreshLockDir), true, 'primary is acquired before legacy');
           assert.equal(existsSync(paths.credentialsLockDir), true);
@@ -77,21 +77,56 @@ describe('Claude Code proper-lockfile locks', () => {
     }
   });
 
-  it('honors CLAUDE_CONFIG_DIR and the legacy global config location', async () => {
+  it('honors CLAUDE_CONFIG_DIR and Claude Code legacy global-config selection', async () => {
     const home = await tempHome();
     const configDir = join(home, 'profile');
+    const legacy = join(configDir, '.config.json');
+    const globalConfig = join(configDir, '.claude.json');
     try {
       const paths = claudeLockPaths({ home, env: { CLAUDE_CONFIG_DIR: configDir } });
       assert.equal(paths.oauthRefreshLockDir, join(configDir, '.oauth_refresh.lock'));
       assert.equal(paths.credentialsLockDir, `${configDir}.lock`);
-      assert.equal(paths.configLockDir, join(configDir, '.claude.json.lock'));
+      assert.equal(paths.configLockDir, `${globalConfig}.lock`);
       await mkdir(configDir, { recursive: true });
-      await mkdir(join(configDir, '.config.json'), { recursive: true });
-      assert.equal(
-        claudeLockPaths({ home, configDir }).configLockDir,
-        join(configDir, '.config.json.lock'),
-      );
+
+      assert.equal(claudeLockPaths({ home, configDir, env: {} }).configLockDir, `${globalConfig}.lock`);
+      await writeFile(legacy, 'legacy');
+      assert.equal(claudeLockPaths({ home, configDir, env: {} }).configLockDir, `${legacy}.lock`);
+      await writeFile(legacy, '');
+      assert.equal(claudeLockPaths({ home, configDir, env: {} }).configLockDir, `${legacy}.lock`);
+      await writeFile(globalConfig, '{}');
+      assert.equal(claudeLockPaths({ home, configDir, env: {} }).configLockDir, `${globalConfig}.lock`);
+      await rm(globalConfig);
+      await chmod(legacy, 0o444);
+      assert.equal(claudeLockPaths({ home, configDir, env: {} }).configLockDir, `${globalConfig}.lock`);
+      await chmod(legacy, 0o644);
+      await rm(legacy);
+      await mkdir(legacy);
+      assert.equal(claudeLockPaths({ home, configDir, env: {} }).configLockDir, `${globalConfig}.lock`);
     } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it('uses process CLAUDE_CONFIG_DIR when no environment is injected', async () => {
+    const home = await tempHome();
+    const configDir = join(home, 'process-profile');
+    const previous = process.env.CLAUDE_CONFIG_DIR;
+    try {
+      process.env.CLAUDE_CONFIG_DIR = configDir;
+      const paths = claudeLockPaths({ home });
+      assert.equal(paths.configHome, configDir);
+      assert.equal(paths.oauthRefreshLockDir, join(configDir, '.oauth_refresh.lock'));
+      assert.equal(paths.credentialsLockDir, `${configDir}.lock`);
+      assert.equal(paths.configLockDir, join(configDir, '.claude.json.lock'));
+      await withClaudeCredentialLocks({ home, timeoutMs: 200 }, async () => {
+        assert.equal(existsSync(paths.oauthRefreshLockDir), true);
+        assert.equal(existsSync(paths.credentialsLockDir), true);
+      });
+      assert.equal(existsSync(join(home, '.claude', '.oauth_refresh.lock')), false);
+    } finally {
+      if (previous === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = previous;
       await rm(home, { recursive: true, force: true });
     }
   });
@@ -228,6 +263,26 @@ describe('Claude Code proper-lockfile locks', () => {
     }
   });
 
+  it('does not touch or remove a replacement holder after losing its lease', async () => {
+    const home = await tempHome();
+    const lock = join(home, 'replacement.lock');
+    try {
+      await withProperLockfile(lock, { touchIntervalMs: 10 }, async () => {
+        await rm(lock, { recursive: true });
+        await mkdir(join(home, 'spacer'));
+        await mkdir(lock);
+        const old = new Date(Date.now() - 60_000);
+        await utimes(lock, old, old);
+        const replacementMtime = (await stat(lock)).mtimeMs;
+        await sleep(80);
+        assert.equal((await stat(lock)).mtimeMs, replacementMtime, 'former holder must not refresh replacement');
+      });
+      assert.equal(existsSync(lock), true, 'former holder must not remove replacement');
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
   it('touches held locks and releases them when the callback throws', async () => {
     const home = await tempHome();
     const lock = join(home, 'touch.lock');
@@ -250,8 +305,8 @@ describe('Claude Code proper-lockfile locks', () => {
   it('releases the config lock after exceptions', async () => {
     const home = await tempHome();
     try {
-      const paths = claudeLockPaths({ home });
-      await assert.rejects(withClaudeConfigLock({ home }, async () => { throw new Error('stop'); }), /stop/);
+      const paths = claudeLockPaths({ home, env: {} });
+      await assert.rejects(withClaudeConfigLock({ home, env: {} }, async () => { throw new Error('stop'); }), /stop/);
       assert.equal(existsSync(paths.configLockDir), false);
     } finally {
       await rm(home, { recursive: true, force: true });
@@ -263,13 +318,13 @@ describe('Claude Code proper-lockfile locks', () => {
     try {
       const holder = await pythonHolder(home, 0.25);
       const started = Date.now();
-      await withClaudeCredentialLocks({ home, timeoutMs: 2_000, retryMinMs: 5, retryJitterMs: 0 }, async () => {});
+      await withClaudeCredentialLocks({ home, env: {}, timeoutMs: 2_000, retryMinMs: 5, retryJitterMs: 0 }, async () => {});
       assert.ok(Date.now() - started >= 150, 'QLB waited for the C-swap holder');
       await once(holder, 'exit');
 
       let release!: () => void;
       const held = new Promise<void>((resolve) => { release = resolve; });
-      const qlb = withClaudeCredentialLocks({ home, timeoutMs: 2_000 }, async () => { await held; });
+      const qlb = withClaudeCredentialLocks({ home, env: {}, timeoutMs: 2_000 }, async () => { await held; });
       const child = spawn(PYTHON, ['-I', '-c', [
         'import os, time',
         `os.environ["HOME"] = ${JSON.stringify(home)}`,
