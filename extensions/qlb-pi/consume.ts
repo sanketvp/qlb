@@ -11,6 +11,7 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
+import { isPiProvider, type PiProvider } from "./active-access.js";
 
 export const CSWAP_ACTIVE_ID = "cswap-active";
 export const ACTIVE_CC_SERVICE = "Claude Code-credentials";
@@ -37,7 +38,7 @@ export const CONSUME_ERRORS = {
 
 export type SecurityRunner = (executable: string, args: readonly string[]) => string;
 
-export interface ActiveAccess {
+export interface CswapActiveAccess {
   access: string;
   fingerprint: string;
 }
@@ -78,7 +79,7 @@ export function readActiveClaudeAccess(opts: {
   runner?: SecurityRunner;
   env?: NodeJS.ProcessEnv;
   nowMs?: number;
-} = {}): ActiveAccess {
+} = {}): CswapActiveAccess {
   const runner = opts.runner ?? defaultRunner;
   let raw: string;
   try {
@@ -142,18 +143,76 @@ export type OwnerFileState = "absent" | "valid" | "malformed";
 export type ConsumeJournal = "CONSUMED" | "NATIVE" | "unknown";
 export type PiMode = "inert" | "owned" | "consume" | "conflict";
 
-export function readOwnerFileState(path: string): OwnerFileState {
-  let text: string;
-  try {
-    text = readFileSync(path, "utf8");
-  } catch (err) {
-    return (err as NodeJS.ErrnoException)?.code === "ENOENT" ? "absent" : "malformed";
+export interface PiOwnerProvider {
+  mode: "qlb";
+  since: number;
+}
+
+/**
+ * v1 was a single Anthropic owner document. v2 scopes ownership to named
+ * providers so an unmigrated Pi provider always remains untouched.
+ */
+export type PiOwnerFile =
+  | { kind: "absent" }
+  | { kind: "malformed" }
+  | { kind: "v1" }
+  | { kind: "v2"; providers: Partial<Record<PiProvider, PiOwnerProvider>> };
+
+function parsePiOwnerRecord(value: unknown): PiOwnerFile {
+  const record = asRecord(value);
+  if (!record) return { kind: "malformed" };
+  if (!("providers" in record)) return { kind: "v1" };
+  const rawProviders = asRecord(record.providers);
+  if (!rawProviders) return { kind: "malformed" };
+  const providers: Partial<Record<PiProvider, PiOwnerProvider>> = {};
+  for (const [name, entry] of Object.entries(rawProviders)) {
+    if (!isPiProvider(name)) return { kind: "malformed" };
+    const config = asRecord(entry);
+    if (
+      !config ||
+      config.mode !== "qlb" ||
+      typeof config.since !== "number" ||
+      !Number.isFinite(config.since) ||
+      config.since < 0
+    ) {
+      return { kind: "malformed" };
+    }
+    providers[name] = { mode: "qlb", since: config.since };
   }
+  return { kind: "v2", providers };
+}
+
+/** Parse a v1/v2 owner document without exposing its raw contents to callers. */
+export function parsePiOwnerFile(text: string): PiOwnerFile {
   try {
-    return asRecord(JSON.parse(text)) ? "valid" : "malformed";
+    return parsePiOwnerRecord(JSON.parse(text));
   } catch {
-    return "malformed";
+    return { kind: "malformed" };
   }
+}
+
+/** Read an owner document; ENOENT is the sole non-error absence state. */
+export function readPiOwnerFile(path: string): PiOwnerFile {
+  try {
+    return parsePiOwnerFile(readFileSync(path, "utf8"));
+  } catch (err) {
+    return (err as NodeJS.ErrnoException)?.code === "ENOENT"
+      ? { kind: "absent" }
+      : { kind: "malformed" };
+  }
+}
+
+/** Return the ownership state for exactly one provider. */
+export function ownerStateForProvider(owner: PiOwnerFile, provider: PiProvider): OwnerFileState {
+  if (owner.kind === "absent") return "absent";
+  if (owner.kind === "malformed") return "malformed";
+  if (owner.kind === "v1") return provider === "anthropic" ? "valid" : "absent";
+  return owner.providers[provider] ? "valid" : "absent";
+}
+
+/** Legacy Anthropic helper retained for the existing consume path. */
+export function readOwnerFileState(path: string): OwnerFileState {
+  return ownerStateForProvider(readPiOwnerFile(path), "anthropic");
 }
 
 /** Parse `qlb consume status --provider anthropic --json`. Anything unexpected is `unknown`. */
@@ -172,15 +231,16 @@ export function parseConsumeStatus(code: number, stdout: string): ConsumeJournal
 export interface PiModeInput {
   rehearsal: string | undefined;
   owner: OwnerFileState;
-  journal: ConsumeJournal;
+  /** Only Anthropic's legacy cswap consume mode needs this journal. */
+  journal?: ConsumeJournal;
   /** The consume marker (consumeMarkerPath) exists — written by `qlb consume enable`. */
-  marker: boolean;
+  marker?: boolean;
 }
 
 /**
  * Choose how qlb-pi registers Anthropic at load. Fail-closed rules:
  * - QLB_PI_REHEARSAL=0 always inert (rollback verification).
- * - Any claim of QLB ownership (owner file, even malformed, or rehearsal=1)
+ * - Any claim of QLB ownership (owner file, even malformed, or Anthropic rehearsal=1)
  *   is `owned` only when the consume journal is provably NATIVE; CONSUMED or an
  *   unreadable journal alongside ownership is `conflict`.
  * - No ownership claim: CONSUMED → `consume`; the consume marker present with
@@ -188,14 +248,27 @@ export interface PiModeInput {
  *   (never hand Anthropic back to a pool that refreshes its own copies);
  *   otherwise inert (nothing taken over).
  */
-export function decidePiMode(input: PiModeInput): PiMode {
+export function decidePiMode(input: PiModeInput): PiMode;
+export function decidePiMode(provider: PiProvider, input: PiModeInput): PiMode;
+export function decidePiMode(
+  providerOrInput: PiProvider | PiModeInput,
+  maybeInput?: PiModeInput,
+): PiMode {
+  // The one-argument form preserves the original Anthropic consume boundary.
+  const provider = typeof providerOrInput === "string" ? providerOrInput : "anthropic";
+  const input = typeof providerOrInput === "string" ? maybeInput! : providerOrInput;
   if (input.rehearsal === "0") return "inert";
-  const claimsOwnership = input.rehearsal === "1" || input.owner !== "absent";
-  if (claimsOwnership) {
-    if (input.owner === "malformed") return "conflict";
-    return input.journal === "NATIVE" ? "owned" : "conflict";
-  }
-  if (input.journal === "CONSUMED") return "consume";
+  if (input.owner === "malformed") return "conflict";
+  // Rehearsal is Anthropic-only until later provider slices opt in.
+  const claimsOwnership = input.owner === "valid" || (provider === "anthropic" && input.rehearsal === "1");
+
+  // v2 providers have no cswap consume fallback. A provider omitted from the
+  // owner document must leave Pi's own login completely untouched.
+  if (provider !== "anthropic") return claimsOwnership ? "owned" : "inert";
+
+  const journal = input.journal ?? "unknown";
+  if (claimsOwnership) return journal === "NATIVE" ? "owned" : "conflict";
+  if (journal === "CONSUMED") return "consume";
   return input.marker ? "conflict" : "inert";
 }
 
@@ -212,9 +285,10 @@ export function canSkipJournal(input: Omit<PiModeInput, "journal"> & { dbExists:
 }
 
 /** User-facing reason for a `conflict` decision. */
+// TODO(P2): make this provider-aware before any v2 provider uses this remediation text.
 export function conflictMessage(input: PiModeInput): string {
   if (input.owner === "malformed") return CONSUME_ERRORS.conflict; // the owner file is the problem
-  if (input.journal === "unknown") return CONSUME_ERRORS.stateUnknown;
+  if ((input.journal ?? "unknown") === "unknown") return CONSUME_ERRORS.stateUnknown;
   const claimsOwnership = input.rehearsal === "1" || input.owner !== "absent";
   return claimsOwnership ? CONSUME_ERRORS.conflict : CONSUME_ERRORS.stateInconsistent;
 }
@@ -224,12 +298,12 @@ export function conflictMessage(input: PiModeInput): string {
  * stream uses read #1; a 401 triggers exactly one reread, and the retry sends
  * exactly that reread value — only if its fingerprint changed.
  */
-export function consumeAccessSource(read: () => ActiveAccess): {
+export function consumeAccessSource(read: () => CswapActiveAccess): {
   readAccess: () => string;
   resync: () => Promise<{ resynced: boolean; reason: string }>;
   sent: () => string[];
 } {
-  let current: ActiveAccess | undefined;
+  let current: CswapActiveAccess | undefined;
   const sent: string[] = [];
   return {
     readAccess: () => {
@@ -238,7 +312,7 @@ export function consumeAccessSource(read: () => ActiveAccess): {
       return current.access;
     },
     resync: async () => {
-      let next: ActiveAccess;
+      let next: CswapActiveAccess;
       try {
         next = read();
       } catch {
