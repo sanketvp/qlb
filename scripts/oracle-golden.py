@@ -155,7 +155,10 @@ def _validate_source_root(source_root: Path) -> None:
     unexpected = sorted(
         path.relative_to(package).as_posix()
         for path in package.rglob("*")
-        if path.is_file() and path.relative_to(package).as_posix() not in SOURCE_FILES
+        if path.is_file()
+        and "__pycache__" not in path.parts
+        and path.suffix != ".pyc"
+        and path.relative_to(package).as_posix() not in SOURCE_FILES
     )
     if unexpected:
         raise RuntimeError(f"vendored claude-swap v0.28.0 source has unexpected files: {', '.join(unexpected)}")
