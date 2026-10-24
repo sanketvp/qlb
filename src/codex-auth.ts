@@ -33,6 +33,14 @@ export type CodexIdentity = {
   account_id: string;
 };
 
+/**
+ * Canonical persisted identity form used by Codex slots and session holders.
+ * The field order is fixed so every caller derives the S29 composite key alike.
+ */
+export function codexIdentityKey(identity: CodexIdentity): string {
+  return `${identity.chatgpt_user_id}:${identity.account_id}`;
+}
+
 export type CodexAuthStableResult =
   | { status: 'ok'; doc: CodexAuthDocument }
   | { status: 'wiped'; error: Exclude<CodexAuthParseError, { error: 'unparseable' }> }
