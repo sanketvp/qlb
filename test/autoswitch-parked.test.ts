@@ -1,3 +1,5 @@
+// Ported from claude-swap 0.28.0 (MIT, Copyright (c) realiti4) — autoswitch.py
+
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
@@ -116,6 +118,23 @@ describe('autoswitch parked state — spec §4.3 AC9', () => {
     });
     assert.deepEqual(result, {
       kind: 'switch', targetId: '2', reason: 'parked', unhealthyTicks: 0, parkedUntilMs: otherReset,
+    });
+  });
+
+  it('uses added time when equally-ranked parked accounts have no slot number', () => {
+    const reset = NOW + 10 * 60 * 1000;
+    const result = decideAutoswitch({
+      nowMs: NOW,
+      activeAccountId: '1',
+      accounts: [
+        exhausted('1', NOW + 30 * 60 * 1000),
+        { ...exhausted('2', reset), slotNum: undefined, addedAtMs: 200 },
+        { ...exhausted('3', reset), slotNum: undefined, addedAtMs: 100 },
+      ],
+    });
+    assert.deepEqual(result, {
+      kind: 'switch', targetId: '3', reason: 'parked', unhealthyTicks: 0,
+      parkedUntilMs: reset + 86_400_000,
     });
   });
 

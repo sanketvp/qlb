@@ -1,4 +1,4 @@
-// Ported from claude-swap 0.26.0 (MIT, Copyright (c) realiti4) — tests/test_autoswitch.py
+// Ported from claude-swap 0.28.0 (MIT, Copyright (c) realiti4) — tests/test_autoswitch.py
 
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
@@ -92,6 +92,32 @@ describe('autoswitch decision engine — upstream decision table', () => {
     })), '2', 'at-limit');
   });
 
+  it('treats a provider hard-limit as at-limit even when active usage is unknown', () => {
+    assertSwitch(decideAutoswitch(input({
+      providerReportedLimit: true,
+      accounts: [account('1', null), account('2', 80)],
+    })), '2', 'at-limit');
+  });
+
+  it('parks after a provider hard-limit when every alternate is exhausted', () => {
+    const reset = NOW + 10 * 60 * 1000;
+    const result = decideAutoswitch(input({
+      providerReportedLimit: true,
+      accounts: [account('1', null), account('2', 100, {
+        buckets: { '5h': { usedPct: 100, resetAt: reset } },
+      })],
+    }));
+    assert.deepEqual(result, {
+      kind: 'switch', targetId: '2', reason: 'parked', unhealthyTicks: 0, parkedUntilMs: reset,
+    });
+  });
+
+  it('fails over from a known-dead active account without unhealthy grace', () => {
+    assertSwitch(decideAutoswitch(input({
+      accounts: [account('1', null, { dead: true }), account('2', 80)],
+    })), '2', 'failover');
+  });
+
   it('counts unknown active usage, then fails over without cooldown', () => {
     const unknown = input({
       lastSwitchAtMs: NOW - 10_000,
@@ -100,6 +126,31 @@ describe('autoswitch decision engine — upstream decision table', () => {
     assert.deepEqual(decideAutoswitch(unknown), { kind: 'stay', reason: 'unknown', unhealthyTicks: 1 });
     assert.deepEqual(decideAutoswitch({ ...unknown, unhealthyTicks: 1 }), { kind: 'stay', reason: 'unknown', unhealthyTicks: 2 });
     assertSwitch(decideAutoswitch({ ...unknown, unhealthyTicks: 2 }), '2', 'failover');
+  });
+
+  it('uses defaults when settings values are undefined or non-finite', () => {
+    for (const settings of [{ threshold: undefined }, { threshold: Number.NaN }]) {
+      assertSwitch(decideAutoswitch(input({
+        settings: settings as Partial<AutoswitchInput['settings']>,
+        accounts: [account('1', 95), account('2', 20)],
+      })), '2', 'proactive');
+    }
+    for (const settings of [{ unhealthyTicks: undefined }, { unhealthyTicks: Number.POSITIVE_INFINITY }]) {
+      assert.deepEqual(decideAutoswitch(input({
+        settings: settings as Partial<AutoswitchInput['settings']>,
+        accounts: [account('1', null), account('2', 20)],
+      })), { kind: 'stay', reason: 'unknown', unhealthyTicks: 1 });
+    }
+  });
+
+  it('uses added time when equally-ranked accounts have no slot number', () => {
+    assertSwitch(decideAutoswitch(input({
+      accounts: [
+        account('1', 95),
+        account('2', 20, { slotNum: undefined, addedAtMs: 200 }),
+        account('3', 20, { slotNum: undefined, addedAtMs: 100 }),
+      ],
+    })), '3', 'proactive');
   });
 
   it('resets unhealthy counting when the active account becomes known', () => {

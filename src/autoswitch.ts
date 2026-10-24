@@ -1,4 +1,4 @@
-// Ported from claude-swap 0.26.0 (MIT, Copyright (c) realiti4) — autoswitch.py
+// Ported from claude-swap 0.28.0 (MIT, Copyright (c) realiti4) — autoswitch.py
 
 /** A decision-only projection of an account usage window. */
 export interface AutoswitchBucket {
@@ -109,22 +109,42 @@ export function bindingPct(account: AutoswitchAccount): number | null {
   return binding;
 }
 
+function settingOrDefault(value: number | undefined, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+}
+
 function settingsFor(input: AutoswitchInput): AutoswitchSettings {
-  return { ...DEFAULT_AUTOSWITCH_SETTINGS, ...input.settings };
+  // v0.28 settings._clamped defaults absent/bad values, including NaN/Infinity
+  // (settings.py:201-240, 257-271), rather than letting them disable a policy gate.
+  const requested = input.settings;
+  return {
+    threshold: settingOrDefault(requested?.threshold, DEFAULT_AUTOSWITCH_SETTINGS.threshold),
+    hysteresisPct: settingOrDefault(requested?.hysteresisPct, DEFAULT_AUTOSWITCH_SETTINGS.hysteresisPct),
+    cooldownSeconds: settingOrDefault(requested?.cooldownSeconds, DEFAULT_AUTOSWITCH_SETTINGS.cooldownSeconds),
+    unhealthyTicks: settingOrDefault(requested?.unhealthyTicks, DEFAULT_AUTOSWITCH_SETTINGS.unhealthyTicks),
+  };
+}
+
+function optionalNumberOrder(a: number | undefined, b: number | undefined): number {
+  if (a === undefined) return b === undefined ? 0 : 1;
+  if (b === undefined) return -1;
+  return a - b;
 }
 
 function sortedByBest(accounts: RankedAccount[]): RankedAccount[] {
   return [...accounts].sort((a, b) => {
     const headroomOrder = a.binding - b.binding;
     if (headroomOrder !== 0) return headroomOrder;
-    const slotOrder = (a.account.slotNum ?? Infinity) - (b.account.slotNum ?? Infinity);
+    const slotOrder = optionalNumberOrder(a.account.slotNum, b.account.slotNum);
     if (slotOrder !== 0) return slotOrder;
-    const addedOrder = (a.account.addedAtMs ?? Infinity) - (b.account.addedAtMs ?? Infinity);
+    const addedOrder = optionalNumberOrder(a.account.addedAtMs, b.account.addedAtMs);
     if (addedOrder !== 0) return addedOrder;
     return a.index - b.index;
   });
 }
 
+// v0.28's all-exhausted path uses _earliest_recovery -> _limiting_reset_ts
+// (autoswitch.py:2631-2665; poll_policy.py:162-174), not _binding_recovery_ts.
 function limitingFutureReset(account: AutoswitchAccount, nowMs: number): number | undefined {
   let latest: number | undefined;
   for (const bucket of Object.values(account.buckets)) {
@@ -144,11 +164,11 @@ function parkedDecision(
   const ranked = accounts
     .map((account, index) => ({ account, index, resetAtMs: limitingFutureReset(account, input.nowMs) }))
     .sort((a, b) => {
-      const resetOrder = (a.resetAtMs ?? Infinity) - (b.resetAtMs ?? Infinity);
+      const resetOrder = optionalNumberOrder(a.resetAtMs, b.resetAtMs);
       if (resetOrder !== 0) return resetOrder;
-      const slotOrder = (a.account.slotNum ?? Infinity) - (b.account.slotNum ?? Infinity);
+      const slotOrder = optionalNumberOrder(a.account.slotNum, b.account.slotNum);
       if (slotOrder !== 0) return slotOrder;
-      const addedOrder = (a.account.addedAtMs ?? Infinity) - (b.account.addedAtMs ?? Infinity);
+      const addedOrder = optionalNumberOrder(a.account.addedAtMs, b.account.addedAtMs);
       if (addedOrder !== 0) return addedOrder;
       return a.index - b.index;
     });
@@ -204,7 +224,17 @@ export function decideAutoswitch(input: AutoswitchInput): AutoswitchDecision {
   const activeBinding = active.dead ? null : bindingPct(active);
   let unhealthyTicks = input.unhealthyTicks ?? 0;
   let trigger: Trigger;
-  if (activeBinding === null) {
+  if (active.dead) {
+    // A QLB dead mark is a known-unusable active, so take the v0.28 failover
+    // escape now (autoswitch.py:1314, 2220-2222), not the unreadable grace.
+    unhealthyTicks = 0;
+    trigger = 'failover';
+  } else if (input.providerReportedLimit === true) {
+    // QLB's provider signal is the equivalent of v0.28's physical hard-limit
+    // classification (autoswitch.py:1266-1267), even if cached usage is stale.
+    unhealthyTicks = 0;
+    trigger = 'at-limit';
+  } else if (activeBinding === null) {
     unhealthyTicks += 1;
     if (unhealthyTicks < settings.unhealthyTicks) {
       return { kind: 'stay', reason: 'unknown', unhealthyTicks };
@@ -212,7 +242,7 @@ export function decideAutoswitch(input: AutoswitchInput): AutoswitchDecision {
     trigger = 'failover';
   } else {
     unhealthyTicks = 0;
-    if (input.providerReportedLimit === true || activeBinding >= 100) trigger = 'at-limit';
+    if (activeBinding >= 100) trigger = 'at-limit';
     else if (activeBinding >= settings.threshold) trigger = 'proactive';
     else return { kind: 'stay', reason: 'below-threshold', unhealthyTicks };
   }
@@ -257,6 +287,9 @@ export function decideAutoswitch(input: AutoswitchInput): AutoswitchDecision {
   // all-exhausted proof and reset calculation: autoswitch.py:1295-1334,
   // 2226-2260).
   const allExhausted = available.length > 0 && available.every((account) => {
+    // A provider hard-limit supplies the active account's missing physical
+    // exhaustion fact; v0.28 then takes its all-exhausted path (autoswitch.py:1538-1565).
+    if (account.accountId === active.accountId && input.providerReportedLimit === true) return true;
     const binding = bindingPct(account);
     return binding !== null && binding >= 100;
   });
