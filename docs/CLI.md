@@ -448,12 +448,12 @@ or pass --confirm-real-cutover if you truly intend to cut over live Pi.
 
 Each provider has a different native strategy, shown as `strategy:`: Anthropic's dedicated pool file is `rename` (moved to `.pre-qlb` on commit); the shared multi-provider `auth.json` entries (xai, kimi-coding, openai-codex) are `shadow-retain` (QLB never deletes or renames the shared file); OpenRouter's static Keychain key is `keychain-retain` (read-only, QLB never writes that Keychain service).
 
-## `qlb retire`
+## `qlb retire native`
 
 Phase-4 gate for moving a native harness credential store aside after QLB ownership has been proven in production.
 
 ```console
-$ qlb retire status --harness claude-code
+$ qlb retire native status --harness claude-code
 harness:    claude-code
 eligible:   no
 state:      (none)
@@ -468,13 +468,13 @@ reasons:
 (exit 1)
 ```
 
-`retire execute` requires **all** eligibility gates to pass (state `QLB_OWNED`, 7-day soak, 20 clean decisions, live ping through the new path) **and** an explicit confirmation flag:
+`retire native execute` requires **all** eligibility gates to pass (state `QLB_OWNED`, 7-day soak, 20 clean decisions, live ping through the new path) **and** an explicit confirmation flag:
 
 ```console
-$ qlb retire execute --harness claude-code
-REFUSED: qlb retire execute requires --confirm-real-retirement.
+$ qlb retire native execute --harness claude-code
+REFUSED: qlb retire native execute requires --confirm-real-retirement.
 This would retire a native Claude Code / Codex CLI credential store.
-Run `qlb retire status --harness <h>` (read-only) first.
+Run `qlb retire native status --harness <h>` (read-only) first.
 (exit 2)
 ```
 
@@ -536,14 +536,14 @@ export ANTHROPIC_API_KEY="$TOKEN"
 
 Harnesses: `pi` (additionally writes a sourceable `scripts/hooks/pi-advisory.sh` inside this repo and reports the path), `claude-code`, `codex-cli` (prints the `~/.codex/config.toml` `[model_providers.qlb]` block), `generic` (a `qlb resolve --json` + `jq` snippet for cron/CI/any shell runner). Flags: `[--json]` → `{ harness, instructions, snippetWritten? }`.
 
-## `qlb gate codex`
+## `qlb codex gate`
 
 The Codex CLI compatibility gate (G0–G4 from the design spec): verifies that Codex CLI requests actually work through the proxy against the real Codex backend with QLB-supplied credentials, and records a `GO` / `NO-GO` verdict. Makes a handful of real quota-consuming requests (uses `~/.codex/auth.json` read-only) — **never run casually**; automated tests never take this path.
 
 Human output shape:
 
 ```console
-$ qlb gate codex
+$ qlb codex gate
 verdict:  GO
 version:  0.42.0
 time:     2026-09-08T12:00:00.000Z

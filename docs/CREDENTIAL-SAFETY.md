@@ -96,7 +96,7 @@ The loopback proxy injects a credential per request — but only for providers w
 
 ## Retiring a native store comes last
 
-Even after QLB owns your credentials, the original native stores for harnesses like Claude Code or Codex CLI are left in place until a production soak gate passes: `qlb retire status` checks for `QLB_OWNED` state, at least 7 days since commit, and at least 20 clean decisions with zero auth errors — and `qlb retire execute` additionally demands `--confirm-real-retirement`. Until then, "turn QLB off" is just "stop pointing the harness at it," and the native credentials work exactly as before.
+Even after QLB owns your credentials, the original native stores for harnesses like Claude Code or Codex CLI are left in place until a production soak gate passes: `qlb retire native status` checks for `QLB_OWNED` state, at least 7 days since commit, and at least 20 clean decisions with zero auth errors — and `qlb retire native execute` additionally demands `--confirm-real-retirement`. Until then, "turn QLB off" is just "stop pointing the harness at it," and the native credentials work exactly as before.
 
 ## Summary
 

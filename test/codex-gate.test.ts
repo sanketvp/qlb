@@ -12,7 +12,7 @@ import { openStore } from '../src/store';
 /**
  * Automated tests mock the HTTP call layer and never fire real requests to
  * Anthropic / OpenAI / ChatGPT / Codex backends. The REAL gate must be run
- * manually via `qlb gate codex` when actually needed (it consumes a handful
+ * manually via `qlb codex gate` when actually needed (it consumes a handful
  * of Codex quota by design).
  */
 

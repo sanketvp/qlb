@@ -29,6 +29,7 @@ import {
 import type { AccountSnapshot, Adapter } from './types';
 import { hermesIntegrationChecks } from './hermes-integration';
 import { piIntegrationChecks } from './pi-integration';
+import { discoverChecks } from './registry';
 
 export type CheckLevel = 'PASS' | 'WARN' | 'FAIL';
 
@@ -71,6 +72,11 @@ type HostCommandRunner = (
   args: string[],
   options?: { env: NodeJS.ProcessEnv },
 ) => string;
+
+/** The diagnostic registry is separate from the runtime report so checks can be added independently. */
+export function listCheckNames(): string[] {
+  return discoverChecks().map((check) => check.name);
+}
 
 const runCommand: CommandRunner = (command, args) =>
   execFileSync(command, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });

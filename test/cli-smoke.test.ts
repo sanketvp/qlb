@@ -188,11 +188,11 @@ describe('CLI smoke — documented commands', () => {
     assert.ok(Array.isArray(body.policies));
   });
 
-  it('retire status --json is a known non-zero refusal when nothing is eligible', () => {
+  it('retire native status --json is a known non-zero refusal when nothing is eligible', () => {
     const env = isolatedEnv();
     for (const harness of ['claude-code', 'codex-cli']) {
       const result = runCli(
-        ['retire', 'status', '--harness', harness, '--json', '--db', env.QLB_DB_PATH!],
+        ['retire', 'native', 'status', '--harness', harness, '--json', '--db', env.QLB_DB_PATH!],
         env,
       );
       assert.equal(result.status, 1, `${harness}: ${result.stderr}\n${result.stdout}`);

@@ -5,7 +5,8 @@ import { dirname, join, resolve } from 'node:path';
 import { adapters } from './adapters';
 import { createDefaultCodexGateDeps, runCodexGate } from './codex-gate';
 import { config, resolveConfig, stripConfigArgs } from './config';
-import { doctorQlb, initializeQlb, type DoctorReport, type InitReport } from './diagnostics';
+import { discoverCommands, resolveCommand } from './registry';
+import { doctorQlb, initializeQlb, listCheckNames, type DoctorReport, type InitReport } from './diagnostics';
 import { platformKeychain } from './keychain';
 import { createOwnedCredentialSource } from './credentials';
 import {
@@ -90,7 +91,7 @@ const USAGE = `Usage:
   qlb override list [--db <path>] [--json]
   qlb policy set --harness <h> --virtual-model <name> --real-model <id> --effort <lvl> [--fallback m1,m2] [--session-mode header|anon] [--db <path>] [--json]
   qlb policy list [--harness <h>] [--db <path>] [--json]
-  qlb gate codex [--json] [--db <path>]
+  qlb codex gate [--json] [--db <path>]
   qlb proxy [--info-path <path>] [--idle-ms <n>] [--no-idle] [--port <n>] [--started-by wrapper|cli] [--db <path>]
   qlb consume enable|disable|status --provider anthropic [--json] [--db <path>]
   qlb migrate stage    [--provider anthropic|xai|kimi-coding|openai-codex|openrouter] --pool-file <path> --owner-file <path> [--auth-json <path>] [--db <path>] [--target-dir <path>] [--confirm-real-cutover]
@@ -99,8 +100,8 @@ const USAGE = `Usage:
   qlb migrate rollback [--provider anthropic|xai|kimi-coding|openai-codex|openrouter] --pool-file <path> --owner-file <path> [--auth-json <path>] [--db <path>] [--target-dir <path>] [--confirm-real-cutover]
   qlb migrate resume   [--provider anthropic|xai|kimi-coding|openai-codex|openrouter] --pool-file <path> --owner-file <path> [--auth-json <path>] [--db <path>] [--target-dir <path>] [--confirm-real-cutover]
   qlb migrate status   [--provider anthropic|xai|kimi-coding|openai-codex|openrouter] [--pool-file <path>] [--owner-file <path>] [--auth-json <path>] [--db <path>] [--target-dir <path>] [--json]
-  qlb retire status  --harness claude-code|codex-cli [--json] [--db <path>]
-  qlb retire execute --harness claude-code|codex-cli --confirm-real-retirement [--db <path>]
+  qlb retire native status  --harness claude-code|codex-cli [--json] [--db <path>]
+  qlb retire native execute --harness claude-code|codex-cli --confirm-real-retirement [--db <path>]
   qlb accounts prune --account <id> --confirm [--json] [--db <path>]
   qlb audit [--limit N] [--json] [--db <path>]
 
@@ -117,9 +118,9 @@ native auth.json entry — QLB never deletes or renames that shared file.
 OpenRouter is a static API key in Keychain service pi-openrouter (read-only;
 QLB never writes that service). Ownership is qlb-owner-openrouter.json +
 journal pi-openrouter; the QLB copy lives at qlb:openrouter:openrouter-default.
-qlb gate codex makes a handful of real Codex backend requests (read-only
+qlb codex gate makes a handful of real Codex backend requests (read-only
 use of ~/.codex/auth.json). Automated tests never take this path.
-qlb retire status is read-only. qlb retire execute is refused unless
+qlb retire native status is read-only. qlb retire native execute is refused unless
 --confirm-real-retirement is passed AND eligibility gates pass (QLB_OWNED,
 7-day soak, 20 clean decisions, live ping). Do NOT run retire execute until
 those production soak criteria are actually met.
@@ -471,7 +472,7 @@ function parseGateArgs(argsIn: string[]): GateOpts {
     process.exit(0);
   }
   if (target !== 'codex') {
-    console.error('qlb gate: unknown target. Expected: qlb gate codex');
+    console.error('qlb codex gate: unknown argument');
     console.error(USAGE);
     process.exit(1);
   }
@@ -659,9 +660,9 @@ function parseRetireArgs(argsIn: string[]): RetireOpts {
   }
   if (sub === 'execute' && !confirmRealRetirement) {
     console.error(
-      'REFUSED: qlb retire execute requires --confirm-real-retirement.\n' +
+      'REFUSED: qlb retire native execute requires --confirm-real-retirement.\n' +
         'This would retire a native Claude Code / Codex CLI credential store.\n' +
-        'Run `qlb retire status --harness <h>` (read-only) first.',
+        'Run `qlb retire native status --harness <h>` (read-only) first.',
     );
     process.exit(2);
   }
@@ -872,8 +873,8 @@ function parseArgs(argv: string[]): Opts {
   if (raw[0] === 'policy') {
     return parsePolicyArgs(raw.slice(1));
   }
-  if (raw[0] === 'gate') {
-    return parseGateArgs(raw.slice(1));
+  if (raw[0] === 'gate' && raw[1] === '--codex') {
+    return parseGateArgs(raw.slice(2));
   }
   if (raw[0] === 'proxy') {
     return parseProxyArgs(raw.slice(1));
@@ -881,8 +882,8 @@ function parseArgs(argv: string[]): Opts {
   if (raw[0] === 'consume') {
     return parseConsumeArgs(raw.slice(1));
   }
-  if (raw[0] === 'retire') {
-    return parseRetireArgs(raw.slice(1));
+  if (raw[0] === 'retire' && raw[1] === '--native') {
+    return parseRetireArgs(raw.slice(2));
   }
   if (raw[0] === 'native-resync') {
     return parseNativeResyncArgs(raw.slice(1));
@@ -1718,8 +1719,29 @@ async function runNativeResync(opts: NativeResyncOpts): Promise<number> {
   });
 }
 
+function prepareCommandArgv(argv: string[]): string[] {
+  const stripped = stripConfigArgs(argv);
+  const raw = stripped.slice(2);
+  const match = resolveCommand(raw);
+  return match ? [...stripped.slice(0, 2), ...match.command.run(match.args)] : stripped;
+}
+
+function isExactListRequest(args: string[], flag: string): boolean {
+  return args.length === 2 && args.includes(flag) && args.includes('--json');
+}
+
 async function main(): Promise<void> {
-  const opts = parseArgs(process.argv);
+  const argv = prepareCommandArgv(process.argv);
+  const raw = argv.slice(2);
+  if (isExactListRequest(raw, '--list-commands')) {
+    console.log(JSON.stringify(discoverCommands().map((command) => command.name)));
+    return;
+  }
+  if (raw[0] === 'doctor' && isExactListRequest(raw.slice(1), '--list-checks')) {
+    console.log(JSON.stringify(listCheckNames()));
+    return;
+  }
+  const opts = parseArgs(argv);
   if (opts.cmd === 'init') {
     const report = initializeQlb(config);
     printInit(report, opts.json);
@@ -1940,4 +1962,6 @@ async function main(): Promise<void> {
   process.exit(code);
 }
 
-void main();
+if (require.main === module) {
+  void main();
+}
