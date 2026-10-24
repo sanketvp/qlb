@@ -219,15 +219,83 @@ describe('Codex session process list and holder eras', () => {
     assert.deepEqual(renewers(identityB, processes, rows).map(({ pid }) => pid), [302, 303, 304]);
   });
 
+  it('widens an ok row without published_at around its attempted-at boundary', () => {
+    const rows = [row(1, A, B, 'ok', null, T0)];
+    const processes: CodexProcess[] = [
+      { pid: 401, lstart: 'Fri Oct 24 11:59:59 2026', host: 'codex' },
+      { pid: 402, lstart: 'Fri Oct 24 12:00:00 2026', host: 'codex' },
+      { pid: 403, lstart: 'Fri Oct 24 12:00:01 2026', host: 'codex' },
+    ];
+
+    assert.deepEqual(renewers(identityA, processes, rows).map(({ pid }) => pid), [401, 402]);
+  });
+
+  it('does not add observation drift ambiguity when an ok switch explains the transition', () => {
+    const rows = [row(1, A, B, 'ok', T0)];
+    const observations = [
+      { ts: T0 - 60_000, identity: A, lineageFp: 'a', by: 'tool' },
+      { ts: T0 + 5_000, identity: B, lineageFp: 'b', by: 'tool' },
+    ];
+    const processes: CodexProcess[] = [
+      { pid: 411, lstart: 'Fri Oct 24 11:59:58 2026', host: 'codex' },
+      { pid: 412, lstart: 'Fri Oct 24 12:00:00 2026', host: 'codex' },
+      { pid: 413, lstart: 'Fri Oct 24 12:00:03 2026', host: 'codex' },
+      { pid: 414, lstart: 'Fri Oct 24 12:00:07 2026', host: 'codex' },
+    ];
+    const sets = holderSets(rows, observations);
+
+    assert.deepEqual(processes.map((process) => sets.find((set) => {
+      const startedAt = Date.parse(`${process.lstart} UTC`);
+      return (set.startsAt === null || startedAt >= set.startsAt)
+        && (set.endsAt === null || startedAt < set.endsAt);
+    })?.identities), [[A], [A, B], [B], [B]]);
+  });
+
+  it('widens observation boundaries for whole-second process starts', () => {
+    const observations = [
+      { ts: T0 + 500, identity: A, lineageFp: 'a', by: 'tool' },
+      { ts: T0 + 1_000, identity: B, lineageFp: 'b', by: 'tool' },
+    ];
+    const process = [{ pid: 421, lstart: 'Fri Oct 24 12:00:00 2026', host: 'codex' }];
+
+    assert.deepEqual(renewers(identityB, process, [], observations).map(({ pid }) => pid), [421]);
+  });
+
+  it('keeps same-timestamp observation identities possible independent of input order', () => {
+    const first = [
+      { ts: T0, identity: A, lineageFp: 'a', by: 'tool' },
+      { ts: T0, identity: B, lineageFp: 'b', by: 'tool' },
+    ];
+    const second = [...first].reverse();
+    const atBoundary = (sets: ReturnType<typeof holderSets>) => sets.find((set) =>
+      (set.startsAt === null || T0 >= set.startsAt) && (set.endsAt === null || T0 < set.endsAt),
+    )?.identities;
+
+    assert.deepEqual(holderSets([], first), holderSets([], second));
+    assert.deepEqual(atBoundary(holderSets([], first)), [A, B]);
+  });
+
+  it('lets later observations close a stale open switch-log holder era', () => {
+    const rows = [row(1, A, B, 'ok', T0)];
+    const observations = [
+      { ts: T0 + 10_000, identity: B, lineageFp: 'b', by: 'tool' },
+      { ts: T0 + 20_000, identity: C, lineageFp: 'c', by: 'tool' },
+    ];
+    const process = [{ pid: 431, lstart: 'Fri Oct 24 12:00:22 2026', host: 'codex' }];
+
+    assert.deepEqual(renewers(identityB, process, rows, observations), []);
+    assert.deepEqual(renewers(identityC, process, rows, observations).map(({ pid }) => pid), [431]);
+  });
+
   it('uses observations to bound drift ambiguity and persists observations without credential values', () => {
     const observations = [
       { ts: T0, identity: A, lineageFp: 'a-fingerprint', by: 'tool' as const },
       { ts: T0 + 10_000, identity: B, lineageFp: 'b-fingerprint', by: 'tool' as const },
     ];
     assert.deepEqual(holderSets([], observations), [
-      { identities: [A], startsAt: null, endsAt: T0, prehistory: true },
-      { identities: [A, B], startsAt: T0, endsAt: T0 + 10_000, prehistory: false },
-      { identities: [B], startsAt: T0 + 10_000, endsAt: null, prehistory: false },
+      { identities: [A], startsAt: null, endsAt: T0 - 1_000, prehistory: true },
+      { identities: [A, B], startsAt: T0 - 1_000, endsAt: T0 + 11_000, prehistory: false },
+      { identities: [B], startsAt: T0 + 11_000, endsAt: null, prehistory: false },
     ]);
 
     const dir = mkdtempSync('/tmp/qlb-codex-observation-');

@@ -263,17 +263,18 @@ export function holderSets(
   const switchEras: MutableHolderEra[] = holderEras(switchLogRows).map((era) => ({ ...era }));
   const rows = [...switchLogRows].sort(compareRows);
 
-  // `published_at`, not `committed_at` or the row timestamp, is the publish
-  // boundary. Intervals are half-open, so T + 1 s is conclusively the target.
+  // `published_at`, when present, is the publish boundary; migrated v4 rows
+  // use their attempted-at fallback. Intervals are half-open, so T + 1 s is
+  // conclusively the target even though `ps lstart` has only second precision.
   for (const row of rows) {
-    if (row.outcome !== 'ok' || row.publishedAt === null) continue;
-    const publishedAt = row.publishedAt;
+    if (row.outcome !== 'ok') continue;
+    const boundary = rowTime(row);
     for (const era of switchEras) {
-      if (era.identity === row.fromAccountId && era.endsAt === publishedAt) {
-        era.endsAt = publishedAt + 1_000;
+      if (era.identity === row.fromAccountId && era.endsAt === boundary) {
+        era.endsAt = boundary + 1_000;
       }
-      if (era.identity === row.toAccountId && era.startsAt === publishedAt) {
-        era.startsAt = publishedAt - 1_000;
+      if (era.identity === row.toAccountId && era.startsAt === boundary) {
+        era.startsAt = boundary - 1_000;
       }
     }
   }
@@ -295,25 +296,75 @@ export function holderSets(
     }
   }
 
-  const sortedObservations = [...observations].sort((a, b) => a.ts - b.ts);
+  const sortedObservations = [...observations].sort((a, b) => a.ts - b.ts
+    || (a.identity ?? '').localeCompare(b.identity ?? '')
+    || (a.lineageFp ?? '').localeCompare(b.lineageFp ?? '')
+    || a.by.localeCompare(b.by));
   for (const observation of sortedObservations) {
     if (!Number.isFinite(observation.ts)) throw new Error('Invalid Codex live observation time');
     if (observation.identity !== null && observation.identity.length === 0) {
       throw new Error('Invalid Codex live observation identity');
     }
   }
-  // With observations A@T0 then B@T1, a process before T0 is A/prehistory;
-  // T0..T1 could have read either document; from T1 onward it is B.
-  for (let index = 0; index < sortedObservations.length; index += 1) {
-    const observation = sortedObservations[index];
+
+  const observationGroups: Array<{ ts: number; identities: string[] }> = [];
+  for (const observation of sortedObservations) {
     if (observation.identity === null) continue;
-    const previous = sortedObservations[index - 1];
-    const next = sortedObservations[index + 1];
-    switchEras.push({
-      identity: observation.identity,
-      startsAt: index === 0 ? null : previous.ts,
-      endsAt: next?.ts ?? null,
-    });
+    const group = observationGroups.at(-1);
+    if (group?.ts === observation.ts) {
+      if (!group.identities.includes(observation.identity)) group.identities.push(observation.identity);
+    } else {
+      observationGroups.push({ ts: observation.ts, identities: [observation.identity] });
+    }
+  }
+  for (const group of observationGroups) group.identities.sort();
+
+  const explainingSwitch = (
+    from: readonly string[],
+    to: readonly string[],
+    startsAt: number,
+    endsAt: number,
+  ): CodexSwitchLogRow | undefined => rows.find((row) => row.outcome === 'ok'
+    && row.fromAccountId !== null
+    && from.includes(row.fromAccountId)
+    && to.includes(row.toAccountId)
+    && rowTime(row) >= startsAt
+    && rowTime(row) <= endsAt);
+  const latestSwitchBoundary = (before: number): number | null => {
+    const prior = rows.filter((row) => isWritingRow(row.outcome) && rowTime(row) <= before).at(-1);
+    return prior === undefined ? null : rowTime(prior) - 1_000;
+  };
+
+  // Only transitions QLB did not create are drift intervals. A QLB `ok` row
+  // already contributes its precise publish interval, so observations merely
+  // confirm it instead of extending both holders to the observation times.
+  for (let index = 0; index < observationGroups.length; index += 1) {
+    const group = observationGroups[index];
+    const previous = observationGroups[index - 1];
+    const next = observationGroups[index + 1];
+    const incoming = previous === undefined
+      ? undefined
+      : explainingSwitch(previous.identities, group.identities, previous.ts, group.ts);
+    const outgoing = next === undefined
+      ? undefined
+      : explainingSwitch(group.identities, next.identities, group.ts, next.ts);
+    const startsAt = previous === undefined
+      ? latestSwitchBoundary(group.ts)
+      : (incoming === undefined ? previous.ts - 1_000 : rowTime(incoming) - 1_000);
+    const endsAt = next === undefined
+      ? null
+      : (outgoing === undefined ? next.ts + 1_000 : rowTime(outgoing) + 1_000);
+    for (const identity of group.identities) {
+      switchEras.push({ identity, startsAt, endsAt });
+    }
+
+    // A later observed identity bounds an otherwise open switch-log era. Keep
+    // one lstart second after the observation ambiguous, never indefinitely.
+    for (const era of switchEras) {
+      if (era.endsAt === null && !group.identities.includes(era.identity)) {
+        era.endsAt = group.ts + 1_000;
+      }
+    }
   }
 
   const boundaries = [...new Set(switchEras.flatMap((era) => [era.startsAt, era.endsAt]).filter((time): time is number => time !== null))]
