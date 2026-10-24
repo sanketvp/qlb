@@ -1,6 +1,6 @@
 import { DatabaseSync } from 'node:sqlite';
 
-import { check } from './_check';
+import { check, guardCheck } from './_check';
 import type { HealthCheck } from './claude-slots';
 
 export default check('claude:oauth-client');
@@ -10,21 +10,23 @@ export default check('claude:oauth-client');
  * it is a systemic OAuth-client failure, never evidence that a slot is dead.
  */
 export function claudeOauthClientCheck(dbPath: string): HealthCheck {
-  const db = new DatabaseSync(dbPath, { readOnly: true });
-  try {
-    const rows = db.prepare(`
-      SELECT account_id AS accountId FROM usage_polls
-      WHERE provider = 'anthropic' AND last_status = 'invalid_client' ORDER BY account_id
-    `).all() as Array<{ accountId: string }>;
-    return rows.length === 0
-      ? { name: 'claude:oauth-client', level: 'PASS', message: 'Claude OAuth client is healthy' }
-      : {
-        name: 'claude:oauth-client',
-        level: 'WARN',
-        message: 'Claude OAuth client was rejected; this is systemic, not a dead-slot verdict',
-        detail: rows,
-      };
-  } finally {
-    db.close();
-  }
+  return guardCheck('claude:oauth-client', () => {
+    const db = new DatabaseSync(dbPath, { readOnly: true });
+    try {
+      const rows = db.prepare(`
+        SELECT account_id AS accountId FROM usage_polls
+        WHERE provider = 'anthropic' AND last_status = 'invalid_client' ORDER BY account_id
+      `).all() as Array<{ accountId: string }>;
+      return rows.length === 0
+        ? { name: 'claude:oauth-client', level: 'PASS', message: 'Claude OAuth client is healthy' }
+        : {
+          name: 'claude:oauth-client',
+          level: 'WARN',
+          message: 'Claude OAuth client was rejected; this is systemic, not a dead-slot verdict',
+          detail: rows,
+        };
+    } finally {
+      db.close();
+    }
+  });
 }

@@ -54,6 +54,35 @@ describe('A7 doctor health primitives', () => {
     assert.equal(relogin7dCheck(dbPath, 'pre-cutover').level, 'N/A');
   });
 
+  it('converts missing database failures into FAIL rows for every health primitive', () => {
+    const dbPath = join(mkdtempSync(join(tmpdir(), 'qlb-doctor-missing-')), 'missing.db');
+    assert.doesNotThrow(() => {
+      const results = [
+        claudeSlotsCheck(dbPath, 'cutover'),
+        codexSlotsCheck(dbPath, 'cutover'),
+        claudeOauthClientCheck(dbPath),
+        autoBreakerCheck(dbPath, 'anthropic'),
+        lifecyclePhaseCheck(dbPath),
+        relogin7dCheck(dbPath, 'cutover'),
+      ];
+      assert.deepEqual(results.map((result) => result.level), ['FAIL', 'FAIL', 'FAIL', 'FAIL', 'FAIL', 'FAIL']);
+    });
+  });
+
+  it('converts absent v5 tables and invalid relogin windows into FAIL rows', () => {
+    const dbPath = join(mkdtempSync(join(tmpdir(), 'qlb-doctor-old-schema-')), 'qlb.db');
+    const db = new DatabaseSync(dbPath);
+    db.close();
+
+    assert.doesNotThrow(() => assert.equal(claudeSlotsCheck(dbPath, 'cutover').level, 'FAIL'));
+    assert.doesNotThrow(() => assert.equal(lifecyclePhaseCheck(dbPath).level, 'FAIL'));
+    assert.doesNotThrow(() => assert.deepEqual(relogin7dCheck(dbPath, 'cutover', Number.NaN), {
+      name: 'relogin:7d',
+      level: 'FAIL',
+      message: 'check failed: invalid relogin window',
+    }));
+  });
+
   it('records, windows, and redacts relogin events', () => {
     const dbPath = fixture();
     const store = openStore(dbPath);
@@ -72,6 +101,18 @@ describe('A7 doctor health primitives', () => {
     const active = relogin7dCheck(dbPath, 'cutover', 1_500, 1_000);
     assert.equal(active.level, 'FAIL');
     assert.doesNotMatch(JSON.stringify(listReloginEvents(dbPath)), /abcdefghijklmnopqrstuvwxyz123456/);
+  });
+
+  it('treats a healed relogin inside the window as unhealthy', () => {
+    const dbPath = fixture();
+    const store = openStore(dbPath);
+    recordRelogin(store, { ts: 1_000, provider: 'anthropic', accountId: 'claude-dead', kind: 'dead' });
+    recordRelogin(store, { ts: 3_000, provider: 'anthropic', accountId: 'claude-dead', kind: 'healed' });
+    store.close();
+
+    const result = relogin7dCheck(dbPath, 'cutover', 3_500, 1_000);
+    assert.equal(result.level, 'FAIL');
+    assert.deepEqual(result.detail, [{ id: 2, ts: 3_000, provider: 'anthropic', accountId: 'claude-dead', kind: 'healed' }]);
   });
 
   it('reports an open breaker and systemic OAuth client failure without dead-slot verdicts', () => {

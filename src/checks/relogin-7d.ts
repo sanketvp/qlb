@@ -1,4 +1,4 @@
-import { check } from './_check';
+import { check, guardCheck } from './_check';
 import { reloginsInWindow } from '../relogin';
 import type { HealthCheck } from './claude-slots';
 
@@ -14,17 +14,22 @@ export function relogin7dCheck(
   now: number = Date.now(),
   windowMs: number = SEVEN_DAYS_MS,
 ): HealthCheck {
-  if (!APPLICABLE_PHASES.has(phase)) {
-    return { name: 'relogin:7d', level: 'N/A', message: `not applicable in phase=${phase}` };
+  if (!Number.isFinite(now) || !Number.isFinite(windowMs) || windowMs <= 0) {
+    return { name: 'relogin:7d', level: 'FAIL', message: 'check failed: invalid relogin window' };
   }
-  const events = reloginsInWindow(dbPath, { start: now - windowMs, end: now })
-    .filter((event) => event.userDeniedAt == null && event.kind !== 'healed');
-  return events.length === 0
-    ? { name: 'relogin:7d', level: 'PASS', message: 'no relogin events in the last 7 days' }
-    : {
-      name: 'relogin:7d',
-      level: 'FAIL',
-      message: `${events.length} relogin event(s) in the last 7 days`,
-      detail: events.map(({ id, ts, provider, accountId, kind }) => ({ id, ts, provider, accountId, kind })),
-    };
+  return guardCheck('relogin:7d', () => {
+    if (!APPLICABLE_PHASES.has(phase)) {
+      return { name: 'relogin:7d', level: 'N/A', message: `not applicable in phase=${phase}` };
+    }
+    const events = reloginsInWindow(dbPath, { start: now - windowMs, end: now })
+      .filter((event) => event.userDeniedAt == null);
+    return events.length === 0
+      ? { name: 'relogin:7d', level: 'PASS', message: 'no relogin events in the last 7 days' }
+      : {
+        name: 'relogin:7d',
+        level: 'FAIL',
+        message: `${events.length} relogin event(s) in the last 7 days`,
+        detail: events.map(({ id, ts, provider, accountId, kind }) => ({ id, ts, provider, accountId, kind })),
+      };
+  });
 }

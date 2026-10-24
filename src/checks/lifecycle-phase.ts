@@ -1,6 +1,6 @@
 import { DatabaseSync } from 'node:sqlite';
 
-import { check } from './_check';
+import { check, guardCheck } from './_check';
 import type { HealthCheck } from './claude-slots';
 
 export default check('lifecycle:phase');
@@ -19,14 +19,16 @@ export function lifecyclePhase(dbPath: string): string {
 
 /** `--phase` is an assertion, never a phase override (S26/S43). */
 export function lifecyclePhaseCheck(dbPath: string, expected?: string): HealthCheck {
-  const phase = lifecyclePhase(dbPath);
-  if (expected != null && expected !== phase) {
-    return {
-      name: 'lifecycle:phase',
-      level: 'FAIL',
-      message: `phase assertion failed: expected ${expected}, actual ${phase}`,
-      detail: { expected, actual: phase },
-    };
-  }
-  return { name: 'lifecycle:phase', level: 'PASS', message: `phase=${phase}`, detail: { phase } };
+  return guardCheck('lifecycle:phase', () => {
+    const phase = lifecyclePhase(dbPath);
+    if (expected != null && expected !== phase) {
+      return {
+        name: 'lifecycle:phase',
+        level: 'FAIL',
+        message: `phase assertion failed: expected ${expected}, actual ${phase}`,
+        detail: { expected, actual: phase },
+      };
+    }
+    return { name: 'lifecycle:phase', level: 'PASS', message: `phase=${phase}`, detail: { phase } };
+  });
 }
