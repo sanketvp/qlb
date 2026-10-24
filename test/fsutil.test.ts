@@ -4,7 +4,7 @@ import {
   fchmodSync,
   fstatSync,
   fsyncSync,
-  openSync,
+  lstatSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
@@ -13,6 +13,7 @@ import {
   rmSync,
   statSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -32,7 +33,8 @@ const mutableFs = require('node:fs') as {
   renameSync: typeof renameSync;
   fchmodSync: typeof fchmodSync;
   fsyncSync: typeof fsyncSync;
-  openSync: typeof openSync;
+  fstatSync: typeof fstatSync;
+  statSync: typeof statSync;
 };
 
 function fixture(): string {
@@ -49,108 +51,39 @@ function withFixture(run: (dir: string) => void): void {
 }
 
 describe('fsutil atomic publish primitives', () => {
-  it('publishes by rename, returns the new inode, and leaves no temp', () => withFixture((dir) => {
+  it('publishes by rename, returns its fd inode, and has no fallible path stat after rename', () => withFixture((dir) => {
     const target = join(dir, '.claude.json');
     writeFileSync(target, 'old');
     const before = statSync(target).ino;
-
-    const inode = fsutil.atomicWriteText(target, 'new');
-
-    assert.equal(readFileSync(target, 'utf8'), 'new');
-    assert.equal(inode, statSync(target).ino);
-    assert.notEqual(inode, before);
-    assert.deepEqual(readdirSync(dir), ['.claude.json']);
-  }));
-
-  it('fsyncs the target parent after rename', () => withFixture((dir) => {
-    const target = join(dir, 'config.json');
     const originalRename = mutableFs.renameSync;
-    const originalOpen = mutableFs.openSync;
-    const originalFsync = mutableFs.fsyncSync;
+    const originalFstat = mutableFs.fstatSync;
+    const originalStat = mutableFs.statSync;
     const calls: string[] = [];
-    let directoryFd = -1;
+    let inode: number;
+    mutableFs.fstatSync = ((fd: number) => {
+      calls.push('fstat');
+      return originalFstat(fd);
+    }) as typeof fstatSync;
     mutableFs.renameSync = ((...args: Parameters<typeof renameSync>) => {
       calls.push('rename');
       return originalRename(...args);
     }) as typeof renameSync;
-    mutableFs.openSync = ((...args: Parameters<typeof openSync>) => {
-      const fd = originalOpen(...args);
-      if (args[0] === dir) {
-        calls.push('directory-open');
-        directoryFd = fd;
-      }
-      return fd;
-    }) as typeof openSync;
-    mutableFs.fsyncSync = ((fd: number) => {
-      if (fd === directoryFd) calls.push('directory-fsync');
-      return originalFsync(fd);
-    }) as typeof fsyncSync;
+    mutableFs.statSync = (() => {
+      throw new Error('post-rename stat must not run');
+    }) as typeof statSync;
     try {
-      fsutil.atomicWriteText(target, 'new');
+      inode = fsutil.atomicWriteText(target, 'new');
     } finally {
+      mutableFs.fstatSync = originalFstat;
       mutableFs.renameSync = originalRename;
-      mutableFs.openSync = originalOpen;
-      mutableFs.fsyncSync = originalFsync;
+      mutableFs.statSync = originalStat;
     }
-    assert.deepEqual(calls, ['rename', 'directory-open', 'directory-fsync']);
-  }));
 
-  it('fsyncs the resolved target parent when writing through a symlink', () => withFixture((dir) => {
-    const resolvedParent = join(dir, 'resolved');
-    require('node:fs').mkdirSync(resolvedParent);
-    const target = join(resolvedParent, 'config.json');
-    const link = join(dir, '.claude.json');
-    symlinkSync(target, link);
-    const originalOpen = mutableFs.openSync;
-    const opened: unknown[] = [];
-    mutableFs.openSync = ((...args: Parameters<typeof openSync>) => {
-      opened.push(args[0]);
-      return originalOpen(...args);
-    }) as typeof openSync;
-    try {
-      fsutil.atomicWriteText(link, 'new');
-    } finally {
-      mutableFs.openSync = originalOpen;
-    }
-    assert.equal(opened.at(-1), realpathSync.native(resolvedParent));
-  }));
-
-  it('tolerates unsupported directory fsync errors but surfaces real ones after publish', () => withFixture((dir) => {
-    const target = join(dir, 'config.json');
-    const originalFsync = mutableFs.fsyncSync;
-    let calls = 0;
-    mutableFs.fsyncSync = ((fd: number) => {
-      calls += 1;
-      if (calls === 2) {
-        const error = new Error('unsupported') as NodeJS.ErrnoException;
-        error.code = 'EINVAL';
-        throw error;
-      }
-      return originalFsync(fd);
-    }) as typeof fsyncSync;
-    try {
-      fsutil.atomicWriteText(target, 'new');
-    } finally {
-      mutableFs.fsyncSync = originalFsync;
-    }
+    assert.deepEqual(calls, ['fstat', 'rename']);
     assert.equal(readFileSync(target, 'utf8'), 'new');
-
-    calls = 0;
-    mutableFs.fsyncSync = ((fd: number) => {
-      calls += 1;
-      if (calls === 2) {
-        const error = new Error('io failure') as NodeJS.ErrnoException;
-        error.code = 'EIO';
-        throw error;
-      }
-      return originalFsync(fd);
-    }) as typeof fsyncSync;
-    try {
-      assert.throws(() => fsutil.atomicWriteText(target, 'newer'), { code: 'EIO' });
-    } finally {
-      mutableFs.fsyncSync = originalFsync;
-    }
-    assert.equal(readFileSync(target, 'utf8'), 'newer');
+    assert.equal(inode!, statSync(target).ino);
+    assert.notEqual(inode!, before);
+    assert.deepEqual(readdirSync(dir), ['.claude.json']);
   }));
 
   it('leaves the destination untouched and removes its temp when rename fails', () => withFixture((dir) => {
@@ -186,6 +119,24 @@ describe('fsutil atomic publish primitives', () => {
     }
     assert.equal(creationMode, 0o600);
     assert.equal(statSync(target).mode & 0o777, 0o640);
+  }));
+
+  it('aborts before publishing when setting the final mode fails', () => withFixture((dir) => {
+    const target = join(dir, 'secret.json');
+    writeFileSync(target, 'old');
+    const original = mutableFs.fchmodSync;
+    mutableFs.fchmodSync = () => {
+      const error = new Error('fchmod denied') as NodeJS.ErrnoException;
+      error.code = 'EPERM';
+      throw error;
+    };
+    try {
+      assert.throws(() => fsutil.atomicWriteText(target, 'new'), { code: 'EPERM' });
+    } finally {
+      mutableFs.fchmodSync = original;
+    }
+    assert.equal(readFileSync(target, 'utf8'), 'old');
+    assert.deepEqual(readdirSync(dir), ['secret.json']);
   }));
 
   it('cleans up after an interrupted fsync', () => withFixture((dir) => {
@@ -297,6 +248,20 @@ describe('fsutil atomic publish primitives', () => {
     assert.equal(readFileSync(target, 'utf8'), 'untouched');
   }));
 
+  it('refuses a symlink loop hidden behind dotdot without creating a temp', () => withFixture((dir) => {
+    const victim = join(dir, 'victim.json');
+    const loop = join(dir, 'loop');
+    const config = join(dir, 'config.json');
+    writeFileSync(victim, 'victim');
+    symlinkSync('loop', loop);
+    symlinkSync('loop/../victim.json', config);
+
+    assert.throws(() => fsutil.atomicWriteText(config, '{}'), { code: 'ELOOP' });
+
+    assert.equal(readFileSync(victim, 'utf8'), 'victim');
+    assert.deepEqual(readdirSync(dir).sort(), ['config.json', 'loop', 'victim.json']);
+  }));
+
   it('refuses a symlink loop without creating a temp', () => withFixture((dir) => {
     const loop = join(dir, 'loop.json');
     symlinkSync('loop.json', loop);
@@ -304,6 +269,13 @@ describe('fsutil atomic publish primitives', () => {
     assert.throws(() => fsutil.atomicWriteText(loop, '{}'), { code: 'ELOOP' });
 
     assert.deepEqual(readdirSync(dir), ['loop.json']);
+  }));
+
+  it('returns a plain path unchanged from publishTarget', () => withFixture((dir) => {
+    const target = join(dir, 'plain.json');
+    assert.equal(fsutil.publishTarget(target), target);
+    writeFileSync(target, 'x');
+    assert.equal(fsutil.publishTarget(target), target);
   }));
 
   it('keeps temporary names bounded for destinations near NAME_MAX', () => withFixture((dir) => {
@@ -314,13 +286,21 @@ describe('fsutil atomic publish primitives', () => {
     assert.deepEqual(readdirSync(dir), [`${'x'.repeat(245)}.cswap`]);
   }));
 
-  it('sweeps only stale qlb temporary files', () => withFixture((dir) => {
-    writeFileSync(join(dir, '.qlb-config.json.a.tmp'), 'orphan');
-    writeFileSync(join(dir, '.qlb-other.b.tmp'), 'orphan');
-    writeFileSync(join(dir, 'ordinary.tmp'), 'keep');
-    writeFileSync(join(dir, '.qlb-not-a-temp'), 'keep');
+  it('sweeps only old qlb temporary files and never follows symlinks', () => withFixture((dir) => {
+    const oldTemp = join(dir, '.qlb-config.json.a.tmp');
+    const freshTemp = join(dir, '.qlb-other.b.tmp');
+    const protectedTarget = join(dir, 'protected.json');
+    const tempSymlink = join(dir, '.qlb-link.c.tmp');
+    writeFileSync(oldTemp, 'orphan');
+    writeFileSync(freshTemp, 'live writer');
+    writeFileSync(protectedTarget, 'keep');
+    symlinkSync(protectedTarget, tempSymlink);
+    const old = new Date(Date.now() - 61_000);
+    utimesSync(oldTemp, old, old);
 
-    assert.equal(fsutil.sweepStrayTemps(dir), 2);
-    assert.deepEqual(readdirSync(dir).sort(), ['.qlb-not-a-temp', 'ordinary.tmp']);
+    assert.equal(fsutil.sweepStrayTemps(dir), 1);
+    assert.deepEqual(readdirSync(dir).sort(), ['.qlb-link.c.tmp', '.qlb-other.b.tmp', 'protected.json']);
+    assert.equal(lstatSync(tempSymlink).isSymbolicLink(), true);
+    assert.equal(readFileSync(protectedTarget, 'utf8'), 'keep');
   }));
 });

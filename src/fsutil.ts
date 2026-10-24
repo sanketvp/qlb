@@ -5,6 +5,7 @@ import {
   closeSync,
   constants,
   fchmodSync,
+  fstatSync,
   fsyncSync,
   lstatSync,
   openSync,
@@ -12,7 +13,6 @@ import {
   readdirSync,
   realpathSync,
   renameSync,
-  statSync,
   unlinkSync,
   writeSync,
 } from 'node:fs';
@@ -22,6 +22,8 @@ const FSYNC_UNSUPPORTED = new Set(['EINVAL', 'ENOTSUP', 'EOPNOTSUPP', 'ENOSYS'])
 const TEMP_PREFIX_CHARS = 40;
 const MAX_SYMLINKS = 40;
 const STRAY_TEMP = /^\.qlb-.+\.tmp$/;
+// QLB addition: retain recent temps so a concurrent writer can finish.
+const STRAY_TEMP_MIN_AGE_MS = 60_000;
 
 export type AtomicWriteOptions = {
   mode?: number;
@@ -131,19 +133,6 @@ function createTemp(target: string): { fd: number; path: string } {
   throw new Error(`could not allocate unique temporary file beside '${target}'`);
 }
 
-function fsyncDirectory(path: string): void {
-  const fd = openSync(path, constants.O_RDONLY | (constants.O_DIRECTORY ?? 0));
-  try {
-    try {
-      fsyncSync(fd);
-    } catch (error) {
-      if (!FSYNC_UNSUPPORTED.has(errno(error) ?? '')) throw error;
-    }
-  } finally {
-    closeSync(fd);
-  }
-}
-
 function writeAll(fd: number, data: Uint8Array): void {
   let offset = 0;
   while (offset < data.byteLength) {
@@ -160,7 +149,9 @@ function writeAll(fd: number, data: Uint8Array): void {
 /**
  * Atomically publish bytes beside `path` and return the inode of the published
  * file. Failures before rename leave the destination untouched and remove the
- * private temporary file.
+ * private temporary file. No ordinary fallible operation follows rename: the
+ * content is fsynced before publish, but durability of the rename itself is
+ * the directory's business and is not promised.
  */
 export function atomicWriteBytes(path: string, data: Uint8Array, options: AtomicWriteOptions = {}): number {
   const { mode = 0o600, followSymlinks = true } = options;
@@ -176,11 +167,11 @@ export function atomicWriteBytes(path: string, data: Uint8Array, options: Atomic
     } catch (error) {
       if (!FSYNC_UNSUPPORTED.has(errno(error) ?? '')) throw error;
     }
+    const inode = fstatSync(fd).ino;
     closeSync(fd);
     fd = -1;
     renameSync(temp.path, target);
-    fsyncDirectory(dirname(target));
-    return statSync(target).ino;
+    return inode;
   } catch (error) {
     if (fd >= 0) {
       try {
@@ -202,13 +193,27 @@ export function atomicWriteText(path: string, text: string, options: AtomicWrite
   return atomicWriteBytes(path, Buffer.from(text, 'utf8'), options);
 }
 
-/** Remove abandoned QLB atomic-write temps immediately below `dir`. */
+/**
+ * Remove QLB atomic-write temps older than 60 seconds immediately below `dir`.
+ * This is a QLB addition (the upstream helper has no sweep); lstat avoids
+ * following symlinks and the age grace period protects live concurrent writes.
+ */
 export function sweepStrayTemps(dir: string): number {
   let removed = 0;
+  const oldestAllowed = Date.now() - STRAY_TEMP_MIN_AGE_MS;
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
-    if (!STRAY_TEMP.test(entry.name) || (!entry.isFile() && !entry.isSymbolicLink())) continue;
+    if (!STRAY_TEMP.test(entry.name)) continue;
+    const path = join(dir, entry.name);
+    let metadata;
     try {
-      unlinkSync(join(dir, entry.name));
+      metadata = lstatSync(path);
+    } catch (error) {
+      if (errno(error) === 'ENOENT') continue;
+      throw error;
+    }
+    if (!metadata.isFile() || metadata.mtimeMs > oldestAllowed) continue;
+    try {
+      unlinkSync(path);
       removed += 1;
     } catch (error) {
       if (errno(error) !== 'ENOENT') throw error;
