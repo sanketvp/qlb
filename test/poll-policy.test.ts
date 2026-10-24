@@ -2,7 +2,7 @@
 
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, it } from 'node:test';
 import {
@@ -54,6 +54,21 @@ function usage7(pct5: number, pct7: number): Usage {
   return { five_hour: { pct: pct5 }, seven_day: { pct: pct7 } };
 }
 
+function pythonProgram(program: string, input: unknown): unknown {
+  const wrapper = [
+    'import os, subprocess, sys',
+    'if sys.version_info < (3, 12):',
+    '    found = subprocess.run(["uv", "python", "find", "3.12"], capture_output=True, check=False, text=True).stdout.strip()',
+    '    if not found: raise RuntimeError("vendored claude-swap v0.28.0 requires Python 3.12 or newer")',
+    `    os.execv(found, [found, '-I', '-B', '-c', ${JSON.stringify(program)}])`,
+    `exec(${JSON.stringify(program)})`,
+  ].join('\n');
+  return JSON.parse(execFileSync(PYTHON, ['-I', '-B', '-c', wrapper], {
+    encoding: 'utf8',
+    input: JSON.stringify(input),
+  }));
+}
+
 function pythonPlans(cases: OracleCase[]): Array<[number, number]> {
   const oracleProgram = [
     'import json, pathlib, sys, tempfile',
@@ -70,18 +85,22 @@ function pythonPlans(cases: OracleCase[]): Array<[number, number]> {
     '        out.append(plan_after_fetch(prev_interval_s=row["prevIntervalS"], prev_usage=row["prevUsage"], new_usage=row["newUsage"], is_active=row["isActive"], threshold=row["threshold"], weekly_threshold=row.get("weeklyThreshold"), models=tuple(row["models"]), recent_429=row["recent429"], now=row["now"], rng=lambda row=row: row["rng"]))',
     '    print(json.dumps(out))',
   ].join('\n');
+  return pythonProgram(oracleProgram, cases) as Array<[number, number]>;
+}
+
+function pythonResetTimestamps(values: readonly string[]): Array<number | null> {
   const program = [
-    'import os, subprocess, sys',
-    'if sys.version_info < (3, 12):',
-    '    found = subprocess.run(["uv", "python", "find", "3.12"], capture_output=True, check=False, text=True).stdout.strip()',
-    '    if not found: raise RuntimeError("vendored claude-swap v0.28.0 requires Python 3.12 or newer")',
-    `    os.execv(found, [found, '-I', '-B', '-c', ${JSON.stringify(oracleProgram)}])`,
-    `exec(${JSON.stringify(oracleProgram)})`,
+    'import json, sys',
+    'from datetime import datetime',
+    'out = []',
+    'for value in json.load(sys.stdin):',
+    '    try:',
+    '        out.append(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())',
+    '    except ValueError:',
+    '        out.append(None)',
+    'print(json.dumps(out))',
   ].join('\n');
-  return JSON.parse(execFileSync(PYTHON, ['-I', '-B', '-c', program], {
-    encoding: 'utf8',
-    input: JSON.stringify(cases),
-  })) as Array<[number, number]>;
+  return pythonProgram(program, values) as Array<number | null>;
 }
 
 describe('claude-swap poll policy port', () => {
@@ -109,14 +128,57 @@ describe('claude-swap poll policy port', () => {
     assert.deepEqual(actual, expected);
   });
 
-  it('keeps Python fromisoformat microseconds and rejects non-ISO reset text', () => {
-    assert.equal(parseResetTs('2023-11-14T22:13:20.000123+00:00'), NOW + 0.000123);
-    assert.equal(parseResetTs('14 November 2023 22:13:20 UTC'), null);
-    assert.equal(parseResetTs('2023-02-29T22:13:20+00:00'), null);
+  it('matches Python fromisoformat reset timestamps, including year-boundary ISO weeks', () => {
+    const cases = [
+      '2023-11-14T22:13:20.000123+00:00',
+      '2026-W53-5',
+      '2027-W01-1',
+      '2026-W53-5T00:00:00Z',
+      '2027-W01-1T00:00:00Z',
+      '2023-11-14T22:1320+00:00',
+      '2023-11-14T2213:20+00:00',
+      '2023-11-14T22:13:20+00:60',
+      '2023-11-14T22:13:20+0060',
+      '2023-11-14T22:13:20.Z',
+      '2023-11-14T22:13:20.+00:00',
+      '2023-11-14T22:13:20 +00:00',
+      '2023-11-14T22:13:20+00:0000',
+      '2023-11-14T22:13:20.',
+      '14 November 2023 22:13:20 UTC',
+      '2023-02-29T22:13:20+00:00',
+    ];
+    const expected = pythonResetTimestamps(cases);
+    for (const [index, value] of cases.entries()) {
+      assert.equal(parseResetTs(value), expected[index], value);
+    }
     assert.equal(limitingResetTs({
       five_hour: { pct: 100, resets_at: '2023-11-14T22:13:20.000123+00:00' },
       seven_day: { pct: 100, resets_at: '2023-11-14T22:13:20.000456+00:00' },
     }), NOW + 0.000456);
+  });
+
+  it('matches every committed poll-policy golden plan', () => {
+    const golden = JSON.parse(readFileSync(resolve(__dirname, '../../test/oracle/goldens/poll_policy.json'), 'utf8')) as {
+      plans: Record<string, { next_poll_at: number; interval_s: number }>;
+    };
+    const cases: Record<string, OracleCase> = {
+      unknown_active: { prevIntervalS: null, prevUsage: null, newUsage: null, isActive: true, threshold: 90, models: [], recent429: false, now: 1000, rng: 0.5 },
+      unknown_candidate: { prevIntervalS: null, prevUsage: null, newUsage: null, isActive: false, threshold: 90, models: [], recent429: false, now: 1000, rng: 0.5 },
+      stable_active: { prevIntervalS: 180, prevUsage: usage(40), newUsage: usage(40), isActive: true, threshold: 90, models: [], recent429: false, now: 1000, rng: 0.5 },
+      stable_candidate: { prevIntervalS: 300, prevUsage: usage(40), newUsage: usage(40), isActive: false, threshold: 90, models: [], recent429: false, now: 1000, rng: 0.5 },
+      moving_active: { prevIntervalS: 300, prevUsage: usage(40), newUsage: usage(50), isActive: true, threshold: 90, models: [], recent429: false, now: 1000, rng: 0.5 },
+      urgent_active: { prevIntervalS: 300, prevUsage: usage(70), newUsage: usage(80), isActive: true, threshold: 90, models: [], recent429: false, now: 1000, rng: 0.5 },
+      recent_429: { prevIntervalS: 600, prevUsage: usage(40), newUsage: usage(50), isActive: true, threshold: 90, models: [], recent429: true, now: 1000, rng: 0.5 },
+      exhausted_reset_cap: { prevIntervalS: 180, prevUsage: usage(99), newUsage: usage(100, '1970-01-01T00:18:00+00:00'), isActive: false, threshold: 90, models: [], recent429: false, now: 1000, rng: 0.5 },
+      scoped_model_binds: { prevIntervalS: 300, prevUsage: { five_hour: { pct: 30 }, seven_day: { pct: 10 }, scoped: [{ name: 'Fable', pct: 60 }] }, newUsage: { five_hour: { pct: 30 }, seven_day: { pct: 10 }, scoped: [{ name: 'Fable', pct: 80 }] }, isActive: true, threshold: 90, models: ['Fable'], recent429: false, now: 1000, rng: 0 },
+      weekly_threshold_urgent: { prevIntervalS: 300, prevUsage: usage7(20, 55), newUsage: usage7(25, 65), isActive: true, threshold: 90, weeklyThreshold: 60, models: [], recent429: false, now: 1000, rng: 0.5 },
+      weekly_threshold_defers: { prevIntervalS: 300, prevUsage: usage7(10, 75), newUsage: usage7(15, 80), isActive: true, threshold: 50, weeklyThreshold: 99, models: [], recent429: false, now: 1000, rng: 0.5 },
+    };
+    assert.deepEqual(Object.keys(cases).sort(), Object.keys(golden.plans).sort());
+    for (const [name, row] of Object.entries(cases)) {
+      const expected = golden.plans[name];
+      assert.deepEqual(planAfterFetch({ ...row, rng: () => row.rng }), [expected.next_poll_at, expected.interval_s], name);
+    }
   });
 
   it('uses the exact 180-second floor boundary', () => {
