@@ -5,6 +5,7 @@
 // dependency. If `node:sqlite` is ever unavailable, switch to `better-sqlite3`.
 import { chmodSync, existsSync, mkdirSync, rmSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { backup, DatabaseSync, type StatementSync } from 'node:sqlite';
 import { inspectAccountSafety, safetyRefusalMessage } from './accounts-prune';
@@ -294,7 +295,25 @@ function userTableCounts(db: DatabaseSync): Map<string, number> {
   return counts;
 }
 
-function verifyBackup(source: DatabaseSync, copy: DatabaseSync): boolean {
+function tableContentDigest(db: DatabaseSync, table: string): string {
+  // Table names are read from sqlite_master. rowid gives a deterministic order
+  // for the rowid tables used by this store; the column-order fallback supports
+  // callers of the exported backup helper with WITHOUT ROWID tables.
+  const quoted = `"${table.replace(/"/g, '""')}"`;
+  let rows: unknown[];
+  try {
+    rows = db.prepare(`SELECT * FROM ${quoted} ORDER BY rowid`).all();
+  } catch {
+    const columns = db.prepare(`PRAGMA table_info(${quoted})`).all() as Array<{ name: string }>;
+    const order = columns.map(({ name }) => `"${name.replace(/"/g, '""')}"`).join(', ');
+    rows = db.prepare(`SELECT * FROM ${quoted}${order ? ` ORDER BY ${order}` : ''}`).all();
+  }
+  return createHash('sha256').update(JSON.stringify(rows, (_key, value) => (
+    value instanceof Uint8Array ? Buffer.from(value).toString('base64') : value
+  ))).digest('hex');
+}
+
+export function verifyBackup(source: DatabaseSync, copy: DatabaseSync): boolean {
   const integrity = copy.prepare('PRAGMA integrity_check').get() as { integrity_check?: string } | string | undefined;
   const result = typeof integrity === 'string' ? integrity : integrity?.integrity_check;
   if (result !== 'ok') return false;
@@ -302,7 +321,7 @@ function verifyBackup(source: DatabaseSync, copy: DatabaseSync): boolean {
   const copyCounts = userTableCounts(copy);
   if (sourceCounts.size !== copyCounts.size) return false;
   for (const [table, count] of sourceCounts) {
-    if (copyCounts.get(table) !== count) return false;
+    if (copyCounts.get(table) !== count || tableContentDigest(source, table) !== tableContentDigest(copy, table)) return false;
   }
   return true;
 }
@@ -353,8 +372,7 @@ function schemaNeedsV5Correction(db: DatabaseSync): boolean {
     if (!found) return true;
     if (columns.some((column) => !hasColumn(db, table, column))) return true;
   }
-  const index = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'lifecycle_one_open'").get();
-  return !index;
+  return !lifecycleOneOpenIndexMatches(db);
 }
 
 function migrationNeeded(db: DatabaseSync): boolean {
@@ -362,8 +380,20 @@ function migrationNeeded(db: DatabaseSync): boolean {
   return version < 5 || (version === 5 && schemaNeedsV5Correction(db));
 }
 
-/** Synchronous bridge for Store's established synchronous constructor. */
-function backupBeforeMigrateSync(dbPath: string): void {
+const LIFECYCLE_ONE_OPEN_INDEX_SQL = `CREATE UNIQUE INDEX lifecycle_one_open ON lifecycle ((1))
+  WHERE state IN ('cutting-over','cutover','undoing','rolled-back','retired','aborted')`;
+
+function normalizedSql(sql: string): string {
+  return sql.replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+function lifecycleOneOpenIndexMatches(db: DatabaseSync): boolean {
+  const index = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'lifecycle_one_open'").get() as { sql?: string } | undefined;
+  return Boolean(index?.sql && normalizedSql(index.sql) === normalizedSql(LIFECYCLE_ONE_OPEN_INDEX_SQL));
+}
+
+/** Synchronous bridge for Store's established synchronous constructor. Caller holds BEGIN IMMEDIATE. */
+function backupBeforeMigrateSync(dbPath: string, source: DatabaseSync): void {
   const backupPath = join(dirname(dbPath), 'backups', `db-${Date.now()}-${process.pid}.sqlite`);
   mkdirSync(dirname(backupPath), { recursive: true, mode: 0o700 });
   const script = `
@@ -376,7 +406,6 @@ function backupBeforeMigrateSync(dbPath: string): void {
     try { rmSync(backupPath, { force: true }); } catch { /* preserve failure */ }
     throw new Error(`database backup failed; migration aborted: ${result.stderr.trim() || result.error?.message || 'unknown error'}`);
   }
-  const source = new DatabaseSync(dbPath, { readOnly: true });
   const copy = new DatabaseSync(backupPath, { readOnly: true });
   try {
     if (!verifyBackup(source, copy)) throw new Error('backup verification failed; migration aborted');
@@ -385,7 +414,6 @@ function backupBeforeMigrateSync(dbPath: string): void {
     throw err;
   } finally {
     copy.close();
-    source.close();
   }
   try { chmodSync(backupPath, 0o600); } catch { /* best effort */ }
 }
@@ -467,13 +495,11 @@ export class Store {
       // Install the busy handler before the first lock-taking SQL operation
       // after open. Keep this before WAL/schema initialization.
       this.db.exec('PRAGMA busy_timeout = 5000');
-      if (dbPath !== ':memory:') {
-        this.db.exec('PRAGMA journal_mode = WAL');
-        // `backup()` runs after the non-mutating connection setup but before
-        // any schema DDL. The constructor remains synchronous for callers.
-        if (migrationNeeded(this.db)) backupBeforeMigrateSync(dbPath);
-      }
+      if (dbPath !== ':memory:') this.db.exec('PRAGMA journal_mode = WAL');
       this.db.exec('PRAGMA synchronous = NORMAL');
+      // migrateIfNeeded takes the write lock and, when needed, backs up before
+      // any constructor schema DDL is allowed to run.
+      this.migrateIfNeeded();
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS accounts (
         id TEXT PRIMARY KEY,
@@ -527,7 +553,6 @@ export class Store {
         value TEXT
       );
     `);
-    this.migrateIfNeeded();
 
     if (dbPath !== ':memory:') {
       try {
@@ -701,6 +726,14 @@ export class Store {
     }
     this.db.exec('BEGIN IMMEDIATE');
     try {
+      if (!migrationNeeded(this.db)) {
+        this.db.exec('COMMIT');
+        return;
+      }
+      // This is deliberately inside the migration lock, after the backup.
+      // It also lets a brand-new database migrate without constructor DDL.
+      if (this.dbPath !== ':memory:') backupBeforeMigrateSync(this.dbPath, this.db);
+      this.createCoreSchema();
       if (version < 2) {
         if (!hasColumn(this.db, 'accounts', 'grant_generation')) this.db.exec('ALTER TABLE accounts ADD COLUMN grant_generation INTEGER DEFAULT 0');
         this.db.exec('CREATE TABLE IF NOT EXISTS leases (name TEXT PRIMARY KEY, holder_pid INTEGER, holder_id TEXT, until INTEGER, generation INTEGER)');
@@ -719,6 +752,17 @@ export class Store {
       try { this.db.exec('ROLLBACK'); } catch { /* preserve original error */ }
       throw err;
     }
+  }
+
+  private createCoreSchema(): void {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS accounts (id TEXT PRIMARY KEY, provider TEXT, label TEXT, status TEXT, created_at INTEGER);
+      CREATE TABLE IF NOT EXISTS snapshots (account_id TEXT, bucket TEXT, used_pct REAL, used REAL, limit_val REAL, remaining REAL, reset_at INTEGER, fetched_at INTEGER, source TEXT, confidence TEXT, PRIMARY KEY (account_id, bucket));
+      CREATE TABLE IF NOT EXISTS decisions (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, session TEXT, harness TEXT, requested_model TEXT, effort TEXT, served_model TEXT, account_id TEXT, mode TEXT, reason TEXT, snapshot_json TEXT, strategy TEXT, provider TEXT);
+      CREATE TABLE IF NOT EXISTS overrides (kind TEXT, account_id TEXT, session TEXT, until INTEGER);
+      CREATE TABLE IF NOT EXISTS poll_claims (account_id TEXT PRIMARY KEY, holder_id TEXT, claimed_at INTEGER, until INTEGER);
+      CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT);
+    `);
   }
 
   private migrateV5Schema(): void {
@@ -789,8 +833,6 @@ export class Store {
         extended_at INTEGER, undo_began_at INTEGER, rollback_at INTEGER, retired_at INTEGER, closed_at INTEGER,
         release_sha TEXT, drill_done_at INTEGER, note TEXT, pre_fence_state TEXT
       );
-      CREATE UNIQUE INDEX IF NOT EXISTS lifecycle_one_open ON lifecycle ((1))
-        WHERE state IN ('cutting-over','cutover','undoing','rolled-back','retired','aborted');
       CREATE TABLE IF NOT EXISTS codex_watch (switch_id INTEGER PRIMARY KEY, provider TEXT NOT NULL, outgoing TEXT NOT NULL, target TEXT NOT NULL, next_at INTEGER NOT NULL, until INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS import_runs (run_id TEXT PRIMARY KEY, started_at INTEGER NOT NULL, committed_at INTEGER);
       CREATE TABLE IF NOT EXISTS pi_export_targets (provider TEXT NOT NULL, target TEXT NOT NULL, slot_account_id TEXT NOT NULL, lineage_fp TEXT NOT NULL, recorded_at INTEGER NOT NULL, PRIMARY KEY (provider, target));
@@ -807,6 +849,10 @@ export class Store {
     this.addColumnIfMissing('relogin_events', 'user_denied_at', 'INTEGER');
     this.addColumnIfMissing('lineage_log', 'evidence', 'TEXT');
     this.addColumnIfMissing('lifecycle', 'pre_fence_state', 'TEXT');
+    if (!lifecycleOneOpenIndexMatches(this.db)) {
+      this.db.exec('DROP INDEX IF EXISTS lifecycle_one_open');
+      this.db.exec(`${LIFECYCLE_ONE_OPEN_INDEX_SQL};`);
+    }
   }
 
   private tableExists(table: string): boolean {

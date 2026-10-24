@@ -59,6 +59,25 @@ describe('store v5 schema (AC38)', () => {
     } finally { db.close(); }
   });
 
+  it('rebuilds a pre-release lifecycle index whose predicate omits aborted', () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'qlb-v5-index-correct-')), 'qlb.db');
+    const initial = openStore(path);
+    initial.close();
+    const db = new DatabaseSync(path);
+    db.exec(`DROP INDEX lifecycle_one_open;
+      CREATE UNIQUE INDEX lifecycle_one_open ON lifecycle ((1))
+      WHERE state IN ('cutting-over','cutover','undoing','rolled-back','retired')`);
+    db.close();
+
+    const corrected = openStore(path);
+    corrected.close();
+    const check = dbAt(path);
+    try {
+      const index = check.prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'lifecycle_one_open'").get() as { sql: string };
+      assert.equal(index.sql.replace(/\s+/g, ' ').toLowerCase(), "create unique index lifecycle_one_open on lifecycle ((1)) where state in ('cutting-over','cutover','undoing','rolled-back','retired','aborted')");
+    } finally { check.close(); }
+  });
+
   it('corrects a pre-release v5 usage_polls shape in place and preserves unambiguous rows', () => {
     const path = join(mkdtempSync(join(tmpdir(), 'qlb-v5-correct-')), 'qlb.db');
     const db = new DatabaseSync(path);

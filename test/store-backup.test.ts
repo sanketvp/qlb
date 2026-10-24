@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { describe, it } from 'node:test';
-import { backupBeforeMigrate } from '../src/store';
+import { backupBeforeMigrate, verifyBackup } from '../src/store';
 
 describe('store backup before migration (AC45)', () => {
   it('backs up committed WAL rows and the copy has equal table row counts', async () => {
@@ -19,6 +19,17 @@ describe('store backup before migration (AC45)', () => {
     try {
       assert.equal((restored.prepare('SELECT count(*) AS n FROM rows').get() as { n: number }).n, 2);
     } finally { restored.close(); source.close(); }
+  });
+
+  it('rejects equal-count copies whose row content differs', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-backup-content-'));
+    const source = new DatabaseSync(join(dir, 'source.db'));
+    const copy = new DatabaseSync(join(dir, 'copy.db'));
+    try {
+      source.exec("CREATE TABLE rows (id INTEGER PRIMARY KEY, value TEXT); INSERT INTO rows VALUES (1, 'before')");
+      copy.exec("CREATE TABLE rows (id INTEGER PRIMARY KEY, value TEXT); INSERT INTO rows VALUES (1, 'after')");
+      assert.equal(verifyBackup(source, copy), false);
+    } finally { copy.close(); source.close(); }
   });
 
   it('aborts on backup verification failure and leaves the source untouched', async () => {
