@@ -101,7 +101,7 @@ export function parseResetTs(resetsAt: unknown): number | null {
     if (!basicWeek[3] && /^-\d(?!\d)/u.test(basicWeek[4] ?? '')) return null;
     value = `${basicWeek[1]}-W${basicWeek[2]}${basicWeek[3] ? `-${basicWeek[3]}` : ''}${basicWeek[4] ?? ''}`;
   }
-  const match = /^(?:(\d{4})-(\d{2})-(\d{2})|(\d{4})(\d{2})(\d{2})|(\d{4})-W(\d{2})(?:-(\d))?)(?:[\s\S](\d{2})(?::?(\d{2}))?(?::?(\d{2}))?([.,]\d+)?(?:(?<offset>[+-])(\d{2})(?::?(\d{2}))?(?::?(\d{2}))?([.,]\d+)?)?)?$/u.exec(value);
+  const match = /^(?:(\d{4})-(\d{2})-(\d{2})|(\d{4})(\d{2})(\d{2})|(\d{4})-W(\d{2})(?:-(\d))?)(?:[\s\S](\d{2})(?:(:)?(\d{2}))?(?:(:)?(\d{2}))?([.,]\d*)?(?:[\s\S]?(?<offset>[+-])(\d{2})(?:(:)?(\d{2}))?(?:(:)?(\d{2}))?([.,]\d+)?)?)?$/u.exec(value);
   if (!match) return null;
 
   let year: number;
@@ -126,22 +126,28 @@ export function parseResetTs(resetsAt: unknown): number | null {
     const date = new Date(weekStart + ((week - 1) * 7 + weekDay - 1) * 86_400_000);
     const thursday = new Date(weekStart + ((week - 1) * 7 + 3) * 86_400_000);
     if (thursday.getUTCFullYear() !== year) return null;
+    year = date.getUTCFullYear();
     month = date.getUTCMonth() + 1;
     day = date.getUTCDate();
   }
 
   const hour = Number(match[10] ?? 0);
-  const minute = Number(match[11] ?? 0);
-  const second = Number(match[12] ?? 0);
-  const fraction = Number(`0.${(match[13] ?? '').slice(1, 7).padEnd(6, '0')}`);
+  const minute = Number(match[12] ?? 0);
+  const second = Number(match[14] ?? 0);
+  const fractionText = match[15] ?? '';
+  const fraction = Number(`0.${fractionText.slice(1, 7).padEnd(6, '0')}`);
   const offsetSign = match.groups?.offset;
-  const offsetHour = Number(match[15] ?? 0);
-  const offsetMinute = Number(match[16] ?? 0);
-  const offsetSecond = Number(match[17] ?? 0);
-  const offsetFraction = Number(`0.${(match[18] ?? '').slice(1, 7).padEnd(6, '0')}`);
+  const offsetHour = Number(match[17] ?? 0);
+  const offsetMinute = Number(match[19] ?? 0);
+  const offsetSecond = Number(match[21] ?? 0);
+  const offsetFraction = Number(`0.${(match[22] ?? '').slice(1, 7).padEnd(6, '0')}`);
+  const offset = offsetHour * 3600 + offsetMinute * 60 + offsetSecond;
   if (
-    year < 1 || month < 1 || month > 12 || day < 1 || hour > 23 || minute > 59 || second > 59
-    || offsetHour > 23 || offsetMinute > 59 || offsetSecond > 59
+    (match[14] !== undefined && ((match[11] === undefined) !== (match[13] === undefined)))
+    || (match[21] !== undefined && ((match[18] === undefined) !== (match[20] === undefined)))
+    || (fractionText.length === 1 && offsetSign === undefined)
+    || year < 1 || month < 1 || month > 12 || day < 1 || hour > 23 || minute > 59 || second > 59
+    || offset >= 86_400
   ) return null;
 
   const utc = new Date(0);
@@ -159,7 +165,6 @@ export function parseResetTs(resetsAt: unknown): number | null {
     return local.getTime() / 1000 + fraction;
   }
   // datetime.timezone normalizes a fractional zero offset to UTC.
-  const offset = offsetHour * 3600 + offsetMinute * 60 + offsetSecond;
   const offsetWithFraction = offset === 0 ? 0 : offset + offsetFraction;
   return timestamp + (offsetSign === '+' ? -offsetWithFraction : offsetWithFraction);
 }
