@@ -4,6 +4,7 @@ import {
   fchmodSync,
   fstatSync,
   fsyncSync,
+  openSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
@@ -31,6 +32,7 @@ const mutableFs = require('node:fs') as {
   renameSync: typeof renameSync;
   fchmodSync: typeof fchmodSync;
   fsyncSync: typeof fsyncSync;
+  openSync: typeof openSync;
 };
 
 function fixture(): string {
@@ -58,6 +60,97 @@ describe('fsutil atomic publish primitives', () => {
     assert.equal(inode, statSync(target).ino);
     assert.notEqual(inode, before);
     assert.deepEqual(readdirSync(dir), ['.claude.json']);
+  }));
+
+  it('fsyncs the target parent after rename', () => withFixture((dir) => {
+    const target = join(dir, 'config.json');
+    const originalRename = mutableFs.renameSync;
+    const originalOpen = mutableFs.openSync;
+    const originalFsync = mutableFs.fsyncSync;
+    const calls: string[] = [];
+    let directoryFd = -1;
+    mutableFs.renameSync = ((...args: Parameters<typeof renameSync>) => {
+      calls.push('rename');
+      return originalRename(...args);
+    }) as typeof renameSync;
+    mutableFs.openSync = ((...args: Parameters<typeof openSync>) => {
+      const fd = originalOpen(...args);
+      if (args[0] === dir) {
+        calls.push('directory-open');
+        directoryFd = fd;
+      }
+      return fd;
+    }) as typeof openSync;
+    mutableFs.fsyncSync = ((fd: number) => {
+      if (fd === directoryFd) calls.push('directory-fsync');
+      return originalFsync(fd);
+    }) as typeof fsyncSync;
+    try {
+      fsutil.atomicWriteText(target, 'new');
+    } finally {
+      mutableFs.renameSync = originalRename;
+      mutableFs.openSync = originalOpen;
+      mutableFs.fsyncSync = originalFsync;
+    }
+    assert.deepEqual(calls, ['rename', 'directory-open', 'directory-fsync']);
+  }));
+
+  it('fsyncs the resolved target parent when writing through a symlink', () => withFixture((dir) => {
+    const resolvedParent = join(dir, 'resolved');
+    require('node:fs').mkdirSync(resolvedParent);
+    const target = join(resolvedParent, 'config.json');
+    const link = join(dir, '.claude.json');
+    symlinkSync(target, link);
+    const originalOpen = mutableFs.openSync;
+    const opened: unknown[] = [];
+    mutableFs.openSync = ((...args: Parameters<typeof openSync>) => {
+      opened.push(args[0]);
+      return originalOpen(...args);
+    }) as typeof openSync;
+    try {
+      fsutil.atomicWriteText(link, 'new');
+    } finally {
+      mutableFs.openSync = originalOpen;
+    }
+    assert.equal(opened.at(-1), realpathSync.native(resolvedParent));
+  }));
+
+  it('tolerates unsupported directory fsync errors but surfaces real ones after publish', () => withFixture((dir) => {
+    const target = join(dir, 'config.json');
+    const originalFsync = mutableFs.fsyncSync;
+    let calls = 0;
+    mutableFs.fsyncSync = ((fd: number) => {
+      calls += 1;
+      if (calls === 2) {
+        const error = new Error('unsupported') as NodeJS.ErrnoException;
+        error.code = 'EINVAL';
+        throw error;
+      }
+      return originalFsync(fd);
+    }) as typeof fsyncSync;
+    try {
+      fsutil.atomicWriteText(target, 'new');
+    } finally {
+      mutableFs.fsyncSync = originalFsync;
+    }
+    assert.equal(readFileSync(target, 'utf8'), 'new');
+
+    calls = 0;
+    mutableFs.fsyncSync = ((fd: number) => {
+      calls += 1;
+      if (calls === 2) {
+        const error = new Error('io failure') as NodeJS.ErrnoException;
+        error.code = 'EIO';
+        throw error;
+      }
+      return originalFsync(fd);
+    }) as typeof fsyncSync;
+    try {
+      assert.throws(() => fsutil.atomicWriteText(target, 'newer'), { code: 'EIO' });
+    } finally {
+      mutableFs.fsyncSync = originalFsync;
+    }
+    assert.equal(readFileSync(target, 'utf8'), 'newer');
   }));
 
   it('leaves the destination untouched and removes its temp when rename fails', () => withFixture((dir) => {

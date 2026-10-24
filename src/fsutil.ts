@@ -131,6 +131,19 @@ function createTemp(target: string): { fd: number; path: string } {
   throw new Error(`could not allocate unique temporary file beside '${target}'`);
 }
 
+function fsyncDirectory(path: string): void {
+  const fd = openSync(path, constants.O_RDONLY | (constants.O_DIRECTORY ?? 0));
+  try {
+    try {
+      fsyncSync(fd);
+    } catch (error) {
+      if (!FSYNC_UNSUPPORTED.has(errno(error) ?? '')) throw error;
+    }
+  } finally {
+    closeSync(fd);
+  }
+}
+
 function writeAll(fd: number, data: Uint8Array): void {
   let offset = 0;
   while (offset < data.byteLength) {
@@ -166,6 +179,7 @@ export function atomicWriteBytes(path: string, data: Uint8Array, options: Atomic
     closeSync(fd);
     fd = -1;
     renameSync(temp.path, target);
+    fsyncDirectory(dirname(target));
     return statSync(target).ino;
   } catch (error) {
     if (fd >= 0) {
