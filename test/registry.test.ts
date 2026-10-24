@@ -12,7 +12,13 @@ import {
   discoverChecks,
   discoverCommands,
 } from '../src/registry';
-import { createCommandContext, dispatchCommand, listCommandNames, prepareCommandArgv } from '../src/cli';
+import {
+  createCommandContext,
+  dispatchCommand,
+  listCommandNames,
+  prepareCommandArgv,
+  runExecutingCommand,
+} from '../src/cli';
 
 describe('registries', () => {
   it('loads source modules when discovery is explicitly given the ts-node extension', () => {
@@ -88,6 +94,59 @@ describe('registries', () => {
     assert.deepEqual(output, ['long:--target,temporary']);
     assert.equal(await dispatchCommand(['node', 'qlb', 'fixture', 'deploy', '--help'], commands, context), 0);
     assert.deepEqual(output, ['long:--target,temporary', 'long:--help']);
+  });
+
+  it('redacts credential-like environment values at executing-command error boundaries', async () => {
+    const secret = 'opaque-refresh-abc123XYZ';
+    const output: string[] = [];
+    const context = createCommandContext();
+    context.env = { QLB_TEST_REFRESH_TOKEN: secret };
+    context.stderr = (line: string) => output.push(line);
+
+    assert.equal(await runExecutingCommand({
+      command: { name: 'fixture', execute: () => { throw new Error(`failed: ${secret}`); } },
+      args: [],
+    }, context), 1);
+    assert.match(output[0], /\[redacted\]/);
+    assert.doesNotMatch(output[0], new RegExp(secret));
+  });
+
+  it('redacts secrets registered by executing handlers at their error boundary', async () => {
+    const secret = 'opaque-runtime-abc123XYZ';
+    const output: string[] = [];
+    const context = createCommandContext();
+    context.env = {};
+    context.stderr = (line: string) => output.push(line);
+
+    assert.equal(await runExecutingCommand({
+      command: {
+        name: 'fixture',
+        execute: (_args, ctx) => {
+          ctx.registerSecret(secret);
+          throw new Error(`failed: ${secret}`);
+        },
+      },
+      args: [],
+    }, context), 1);
+    assert.match(output[0], /\[redacted\]/);
+    assert.doesNotMatch(output[0], new RegExp(secret));
+  });
+
+  it('does not treat short or non-credential environment values as executing-command secrets', async () => {
+    const shortSecret = 'short';
+    const nonCredentialValue = 'opaque-home-abc123XYZ';
+    const output: string[] = [];
+    const context = createCommandContext();
+    context.env = { QLB_TEST_TOKEN: shortSecret, HOME: nonCredentialValue };
+    context.stderr = (line: string) => output.push(line);
+
+    assert.equal(await runExecutingCommand({
+      command: { name: 'fixture', execute: () => { throw new Error(`failed: ${shortSecret}, ${nonCredentialValue}`); } },
+      args: [],
+    }, context), 1);
+    assert.match(output[0], new RegExp(shortSecret));
+    assert.match(output[0], new RegExp(nonCredentialValue));
+    assert.doesNotMatch(output[0], /\[redacted\]/);
   });
 
   it('keeps legacy argv-rewrite fragments unchanged', () => {

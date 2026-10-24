@@ -9,6 +9,7 @@ export interface CommandContext {
   config: QlbConfig;
   loadConfig(options?: ResolveConfigOptions): QlbConfig;
   home: string;
+  registerSecret(value: string): void;
 }
 
 export interface CommandDefinition {

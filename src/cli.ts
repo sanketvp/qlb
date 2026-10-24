@@ -1730,15 +1730,33 @@ export function listCommandNames(commands: CommandDefinition[] = discoverCommand
   return commands.map((command) => command.name);
 }
 
+const commandContextSecrets = new WeakMap<CommandContext, Set<string>>();
+
 export function createCommandContext(): CommandContext {
-  return {
+  const secrets = new Set<string>();
+  const context: CommandContext = {
     stdout: (message) => console.log(message),
     stderr: (message) => console.error(message),
     env: process.env,
     config,
     loadConfig: resolveConfig,
     home: homedir(),
+    registerSecret: (value) => {
+      if (value) secrets.add(value);
+    },
   };
+  commandContextSecrets.set(context, secrets);
+  return context;
+}
+
+function knownCommandSecrets(context: CommandContext): string[] {
+  const secrets = new Set(commandContextSecrets.get(context));
+  for (const [key, value] of Object.entries(context.env)) {
+    if (/TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|API_KEY|APIKEY|PRIVATE_KEY|CREDENTIAL|COOKIE|AUTH/i.test(key) && value && value.length >= 8) {
+      secrets.add(value);
+    }
+  }
+  return [...secrets];
 }
 
 /** Runs an executing registry fragment, or returns null for a legacy fragment. */
@@ -1751,6 +1769,18 @@ export async function dispatchCommand(
   return match?.command.execute
     ? await match.command.execute(match.args, context)
     : null;
+}
+
+export async function runExecutingCommand(
+  match: { command: CommandDefinition; args: string[] },
+  context: CommandContext,
+): Promise<number> {
+  try {
+    return await match.command.execute!(match.args, context);
+  } catch (err) {
+    context.stderr(`qlb ${match.command.name}: ${redactError(err, knownCommandSecrets(context))}`);
+    return 1;
+  }
 }
 
 function isExactListRequest(args: string[], flag: string): boolean {
@@ -1771,12 +1801,8 @@ async function main(): Promise<void> {
   }
   const command = resolveCommand(raw, commands);
   if (command?.command.execute) {
-    try {
-      process.exit(await command.command.execute(command.args, createCommandContext()));
-    } catch (err) {
-      console.error(`qlb ${command.command.name}: ${redactError(err, [])}`);
-      process.exit(1);
-    }
+    const context = createCommandContext();
+    process.exit(await runExecutingCommand(command, context));
   }
   const opts = parseArgs(prepareCommandArgv(process.argv, commands));
   if (opts.cmd === 'init') {
