@@ -1,6 +1,6 @@
 /*
- * Ported from claude-swap v0.28.0.
- * Upstream file(s): src/claude_swap/autoswitch.py, src/claude_swap/launch_agent.py.
+ * Ported from claude-swap 0.28.0.
+ * Upstream file(s): src/claude_swap/autoswitch.py:98-158,161-200,1120-1620,2080-2324, src/claude_swap/launch_agent.py:140-145.
  * License: MIT.
  * Modified for QLB. See NOTICE.
  */

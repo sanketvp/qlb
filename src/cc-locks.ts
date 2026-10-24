@@ -1,6 +1,6 @@
 /*
- * Ported from claude-swap v0.28.0.
- * Upstream file(s): src/claude_swap/claude_locks.py.
+ * Ported from claude-swap 0.28.0.
+ * Upstream file(s): src/claude_swap/claude_locks.py:46-70,75-93,94-127,129-197.
  * License: MIT.
  * Modified for QLB. See NOTICE.
  */

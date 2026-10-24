@@ -1,6 +1,6 @@
 /*
- * Ported from claude-swap v0.28.0.
- * Upstream file(s): src/claude_swap/oauth.py.
+ * Ported from claude-swap 0.28.0.
+ * Upstream file(s): src/claude_swap/oauth.py:44-70,95-101,105-140,154-167,211-226.
  * License: MIT.
  * Modified for QLB. See NOTICE.
  */
