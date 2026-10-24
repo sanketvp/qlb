@@ -40,6 +40,18 @@ export interface LeaseRow {
   generation: number;
 }
 
+/** Immutable lineage edge retained for successor proofs (S46). */
+export interface LineageTransitionRow {
+  from_fp: string | null;
+  to_fp: string;
+}
+
+/** Current slot lineage and its immediate predecessor, when this provider has slots. */
+export interface SlotLineageRow {
+  fingerprint: string | null;
+  prev_fingerprint: string | null;
+}
+
 /** Credential-migration journal (§4.8.3). One row per native store. */
 export interface MigrationRow {
   store: string;
@@ -1438,6 +1450,25 @@ export class Store {
       row.evidence == null ? null : redactSecrets(row.evidence, []),
     );
     return Number(result.lastInsertRowid);
+  }
+
+  /** Read the immutable per-slot graph used by lineage-log.ts to prove successor order (S46). */
+  listLineageTransitions(provider: string, accountId: string): LineageTransitionRow[] {
+    return this.db.prepare(
+      'SELECT from_fp, to_fp FROM lineage_log WHERE provider = ? AND account_id = ? ORDER BY id ASC',
+    ).all(provider, accountId) as unknown as LineageTransitionRow[];
+  }
+
+  /** Return the slot's persisted `:prev` edge; unknown providers have no slot table. */
+  getSlotLineage(provider: string, accountId: string): SlotLineageRow | null {
+    const table = provider === 'anthropic'
+      ? 'claude_slots'
+      : provider === 'openai-codex'
+        ? 'codex_slots'
+        : null;
+    if (!table) return null;
+    const row = this.db.prepare(`SELECT fingerprint, prev_fingerprint FROM ${table} WHERE account_id = ?`).get(accountId);
+    return (row as SlotLineageRow | undefined) ?? null;
   }
 
   recordRelogin(row: { ts?: number; provider: string; accountId?: string | null; kind: string; detail?: string | null; evidence?: string | null; userDeniedAt?: number | null }): number {
