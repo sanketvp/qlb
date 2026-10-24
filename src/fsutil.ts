@@ -21,7 +21,9 @@ import { basename, dirname, isAbsolute, join, parse, resolve, sep } from 'node:p
 const FSYNC_UNSUPPORTED = new Set(['EINVAL', 'ENOTSUP', 'EOPNOTSUPP', 'ENOSYS']);
 const TEMP_PREFIX_CHARS = 40;
 const MAX_SYMLINKS = 40;
-const STRAY_TEMP = /^\.qlb-.+\.tmp$/;
+// This exactly mirrors createTemp(): a basename prefix (at most 40 code units),
+// then the decimal owner PID and a 16-character lowercase-hex random suffix.
+const STRAY_TEMP = /^\.qlb-([\s\S]{0,40})\.([1-9]\d*)\.([a-f0-9]{16})\.tmp$/;
 // QLB addition: retain recent temps so a concurrent writer can finish.
 const STRAY_TEMP_MIN_AGE_MS = 60_000;
 
@@ -118,7 +120,7 @@ function createTemp(target: string): { fd: number; path: string } {
   const stem = basename(target).slice(0, TEMP_PREFIX_CHARS);
 
   for (let attempt = 0; attempt < 100; attempt += 1) {
-    const path = join(parent, `.qlb-${stem}.${randomBytes(8).toString('hex')}.tmp`);
+    const path = join(parent, `.qlb-${stem}.${process.pid}.${randomBytes(8).toString('hex')}.tmp`);
     try {
       // The temp is private from creation, before fchmod applies the requested
       // final mode. O_EXCL also prevents a pre-existing path from being reused.
@@ -193,16 +195,37 @@ export function atomicWriteText(path: string, text: string, options: AtomicWrite
   return atomicWriteBytes(path, Buffer.from(text, 'utf8'), options);
 }
 
+export type SweepStrayTempsOptions = {
+  /** Injectable for tests; false means that the owner PID is known to be dead. */
+  isProcessAlive?: (pid: number) => boolean;
+};
+
+function processIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // EPERM and unexpected errors are conservatively treated as live; only
+    // ESRCH establishes that an old temp's owner is gone.
+    return errno(error) !== 'ESRCH';
+  }
+}
+
 /**
  * Remove QLB atomic-write temps older than 60 seconds immediately below `dir`.
  * This is a QLB addition (the upstream helper has no sweep); lstat avoids
- * following symlinks and the age grace period protects live concurrent writes.
+ * following symlinks. The owner PID is checked instead of extending the grace
+ * period so an indefinitely stalled live writer is never swept.
  */
-export function sweepStrayTemps(dir: string): number {
+export function sweepStrayTemps(dir: string, options: SweepStrayTempsOptions = {}): number {
+  const isProcessAlive = options.isProcessAlive ?? processIsAlive;
   let removed = 0;
   const oldestAllowed = Date.now() - STRAY_TEMP_MIN_AGE_MS;
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
-    if (!STRAY_TEMP.test(entry.name)) continue;
+    const match = STRAY_TEMP.exec(entry.name);
+    if (match === null) continue;
+    const ownerPid = Number(match[2]);
+    if (!Number.isSafeInteger(ownerPid)) continue;
     const path = join(dir, entry.name);
     let metadata;
     try {
@@ -212,6 +235,14 @@ export function sweepStrayTemps(dir: string): number {
       throw error;
     }
     if (!metadata.isFile() || metadata.mtimeMs > oldestAllowed) continue;
+    let ownerIsAlive: boolean;
+    try {
+      ownerIsAlive = isProcessAlive(ownerPid);
+    } catch {
+      // A failed custom probe cannot prove the owner dead.
+      ownerIsAlive = true;
+    }
+    if (ownerIsAlive) continue;
     try {
       unlinkSync(path);
       removed += 1;
