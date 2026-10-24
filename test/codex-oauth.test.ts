@@ -55,6 +55,43 @@ describe('Codex refresh classification — AC12 / L10', () => {
     });
   });
 
+  it('accepts partial successful token responses', () => {
+    assert.deepEqual(classifyRefreshResponse(200, JSON.stringify({
+      access_token: 'test-access-token',
+      refresh_token: 'test-rotated-refresh-token',
+    })), {
+      kind: 'ok',
+      tokens: {
+        access_token: 'test-access-token',
+        refresh_token: 'test-rotated-refresh-token',
+      },
+    });
+    assert.deepEqual(classifyRefreshResponse(200, JSON.stringify({
+      id_token: 'test-id-token',
+      access_token: 'test-access-token',
+    })), {
+      kind: 'ok',
+      tokens: {
+        id_token: 'test-id-token',
+        access_token: 'test-access-token',
+      },
+    });
+  });
+
+  it('rejects successful responses with no non-empty token fields', () => {
+    for (const body of [
+      JSON.stringify({ id_token: '', access_token: '', refresh_token: '' }),
+      JSON.stringify([]),
+      JSON.stringify('x'),
+      JSON.stringify({}),
+    ]) {
+      assert.deepEqual(classifyRefreshResponse(200, body), {
+        kind: 'transient',
+        reason: 'invalid_success_response',
+      });
+    }
+  });
+
   for (const reason of [
     'refresh_token_expired',
     'refresh_token_reused',
@@ -122,6 +159,55 @@ describe('applyRefresh', () => {
       unknown_field: { preserved: true },
     });
     assert.equal(doc.tokens.refresh_token, 'old-refresh');
+  });
+
+  it('applies partial rotations without mutating the input document', () => {
+    const doc = {
+      tokens: {
+        id_token: 'old-id',
+        access_token: 'old-access',
+        refresh_token: 'old-refresh',
+        account_id: 'account-1',
+      },
+      last_refresh: '2000-01-01T00:00:00.000Z',
+    };
+    const tokens = {
+      access_token: 'new-access',
+      refresh_token: 'new-refresh',
+    };
+    const result = applyRefresh(doc, tokens, new Date('2026-10-24T12:34:56.000Z'));
+
+    assert.deepEqual(result, {
+      tokens: {
+        id_token: 'old-id',
+        access_token: 'new-access',
+        refresh_token: 'new-refresh',
+        account_id: 'account-1',
+      },
+      last_refresh: '2026-10-24T12:34:56.000Z',
+    });
+    assert.deepEqual(doc, {
+      tokens: {
+        id_token: 'old-id',
+        access_token: 'old-access',
+        refresh_token: 'old-refresh',
+        account_id: 'account-1',
+      },
+      last_refresh: '2000-01-01T00:00:00.000Z',
+    });
+  });
+
+  it('does not overwrite a stored token with an undefined own property', () => {
+    const result = applyRefresh({
+      tokens: { refresh_token: 'old-refresh' },
+    }, {
+      refresh_token: undefined,
+    }, new Date('2026-10-24T12:34:56.000Z'));
+
+    assert.deepEqual(result, {
+      tokens: { refresh_token: 'old-refresh' },
+      last_refresh: '2026-10-24T12:34:56.000Z',
+    });
   });
 });
 

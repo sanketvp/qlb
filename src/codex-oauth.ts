@@ -15,9 +15,9 @@ export interface RequestDescription {
 }
 
 export interface CodexTokens {
-  id_token: string;
-  access_token: string;
-  refresh_token: string;
+  id_token?: string;
+  access_token?: string;
+  refresh_token?: string;
 }
 
 export interface CodexAuthDocument {
@@ -94,15 +94,14 @@ function oauthErrorCode(body: unknown): string | undefined {
 
 function successTokens(body: unknown): CodexTokens | undefined {
   if (!isObject(body)) return undefined;
+  const tokens: CodexTokens = {};
   const idToken = nonEmptyString(body.id_token);
   const accessToken = nonEmptyString(body.access_token);
   const refreshToken = nonEmptyString(body.refresh_token);
-  if (!idToken || !accessToken || !refreshToken) return undefined;
-  return {
-    id_token: idToken,
-    access_token: accessToken,
-    refresh_token: refreshToken,
-  };
+  if (idToken) tokens.id_token = idToken;
+  if (accessToken) tokens.access_token = accessToken;
+  if (refreshToken) tokens.refresh_token = refreshToken;
+  return Object.keys(tokens).length > 0 ? tokens : undefined;
 }
 
 /**
@@ -145,9 +144,16 @@ export function applyRefresh(
   tokens: CodexTokens,
   now: Date | number,
 ): CodexAuthDocument {
+  const refreshedTokens = { ...doc.tokens };
+  for (const key of ['id_token', 'access_token', 'refresh_token'] as const) {
+    const value = tokens[key];
+    if (Object.hasOwn(tokens, key) && nonEmptyString(value)) {
+      refreshedTokens[key] = value;
+    }
+  }
   return {
     ...doc,
-    tokens: { ...doc.tokens, ...tokens },
+    tokens: refreshedTokens,
     last_refresh: new Date(now).toISOString(),
   };
 }
