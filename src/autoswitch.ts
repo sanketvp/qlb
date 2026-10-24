@@ -54,7 +54,8 @@ type StayReason =
   | 'no-active-account'
   | 'no-candidates'
   | 'no-comparison'
-  | 'no-qualifying-candidate';
+  | 'no-qualifying-candidate'
+  | 'reset-unknown';
 
 export interface AutoswitchStayDecision {
   kind: 'stay';
@@ -74,8 +75,8 @@ export interface AutoswitchSwitchDecision {
 export interface AutoswitchParkedDecision {
   kind: 'parked';
   accountId: string;
-  /** Undefined when usage reported no usable future reset. */
-  resetAtMs?: number;
+  /** Future reset that makes the exhausted account usable. */
+  resetAtMs: number;
   unhealthyTicks: number;
   parkedUntilMs?: number;
 }
@@ -124,14 +125,15 @@ function sortedByBest(accounts: RankedAccount[]): RankedAccount[] {
   });
 }
 
-function earliestFutureReset(account: AutoswitchAccount, nowMs: number): number | undefined {
-  let earliest: number | undefined;
+function limitingFutureReset(account: AutoswitchAccount, nowMs: number): number | undefined {
+  let latest: number | undefined;
   for (const bucket of Object.values(account.buckets)) {
+    if (typeof bucket.usedPct !== 'number' || !Number.isFinite(bucket.usedPct) || bucket.usedPct < 100) continue;
     const reset = bucket.resetAt;
     if (typeof reset !== 'number' || !Number.isFinite(reset) || reset <= nowMs) continue;
-    if (earliest === undefined || reset < earliest) earliest = reset;
+    if (latest === undefined || reset > latest) latest = reset;
   }
-  return earliest;
+  return latest;
 }
 
 function parkedDecision(
@@ -140,7 +142,7 @@ function parkedDecision(
   unhealthyTicks: number,
 ): AutoswitchDecision {
   const ranked = accounts
-    .map((account, index) => ({ account, index, resetAtMs: earliestFutureReset(account, input.nowMs) }))
+    .map((account, index) => ({ account, index, resetAtMs: limitingFutureReset(account, input.nowMs) }))
     .sort((a, b) => {
       const resetOrder = (a.resetAtMs ?? Infinity) - (b.resetAtMs ?? Infinity);
       if (resetOrder !== 0) return resetOrder;
@@ -154,17 +156,22 @@ function parkedDecision(
   // This function is called only for a non-empty non-dead account set.
   if (!target) return { kind: 'stay', reason: 'no-candidates', unhealthyTicks };
 
+  if (target.resetAtMs === undefined) {
+    return { kind: 'stay', reason: 'reset-unknown', unhealthyTicks };
+  }
+
   const parked = {
     kind: 'parked' as const,
     accountId: target.account.accountId,
-    ...(target.resetAtMs === undefined ? {} : { resetAtMs: target.resetAtMs, parkedUntilMs: target.resetAtMs }),
+    resetAtMs: target.resetAtMs,
     unhealthyTicks,
+    parkedUntilMs: target.resetAtMs,
   };
   // §4.3 permits at most one parked switch for one reset. Retain/report the
   // parked condition rather than issuing a duplicate switch command.
   if (
     target.account.accountId === input.activeAccountId ||
-    (target.resetAtMs !== undefined && target.resetAtMs === input.parkedUntilMs)
+    target.resetAtMs === input.parkedUntilMs
   ) {
     return parked;
   }
@@ -172,7 +179,7 @@ function parkedDecision(
     kind: 'switch',
     targetId: target.account.accountId,
     reason: 'parked',
-    ...(target.resetAtMs === undefined ? {} : { parkedUntilMs: target.resetAtMs }),
+    parkedUntilMs: target.resetAtMs,
     unhealthyTicks,
   };
 }
