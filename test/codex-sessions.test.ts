@@ -1,7 +1,12 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
+import { DatabaseSync } from 'node:sqlite';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
 import {
+  appendObservation,
   holderEras,
+  holderSets,
   list,
   renewers,
   stillTheSameProcess,
@@ -190,5 +195,52 @@ describe('Codex session process list and holder eras', () => {
         .map(({ pid }) => pid),
       [207],
     );
+  });
+
+  it('uses the published-at transition interval for conservative holder sets (AC56)', () => {
+    const rows = [row(1, A, B, 'ok', T0, T0 + 5_000)];
+    const processes: CodexProcess[] = [
+      { pid: 301, lstart: 'Fri Oct 24 11:59:58 2026', host: 'codex' },
+      { pid: 302, lstart: 'Fri Oct 24 12:00:00 2026', host: 'codex' },
+      { pid: 303, lstart: 'Fri Oct 24 12:00:03 2026', host: 'codex' },
+      { pid: 304, lstart: 'Fri Oct 24 12:00:07 2026', host: 'codex' },
+    ];
+
+    assert.deepEqual(holderSets(rows, []).map(({ identities }) => identities), [
+      [A], [A, B], [B],
+    ]);
+    assert.deepEqual(
+      processes.map((process) => holderSets(rows, []).find((set) =>
+        (set.startsAt === null || Date.parse(`${process.lstart} UTC`) >= set.startsAt)
+        && (set.endsAt === null || Date.parse(`${process.lstart} UTC`) < set.endsAt),
+      )?.identities),
+      [[A], [A, B], [B], [B]],
+    );
+    assert.deepEqual(renewers(identityB, processes, rows).map(({ pid }) => pid), [302, 303, 304]);
+  });
+
+  it('uses observations to bound drift ambiguity and persists observations without credential values', () => {
+    const observations = [
+      { ts: T0, identity: A, lineageFp: 'a-fingerprint', by: 'tool' as const },
+      { ts: T0 + 10_000, identity: B, lineageFp: 'b-fingerprint', by: 'tool' as const },
+    ];
+    assert.deepEqual(holderSets([], observations), [
+      { identities: [A], startsAt: null, endsAt: T0, prehistory: true },
+      { identities: [A, B], startsAt: T0, endsAt: T0 + 10_000, prehistory: false },
+      { identities: [B], startsAt: T0 + 10_000, endsAt: null, prehistory: false },
+    ]);
+
+    const dir = mkdtempSync('/tmp/qlb-codex-observation-');
+    const db = new DatabaseSync(join(dir, 'qlb.db'));
+    try {
+      db.exec('CREATE TABLE codex_live_observations (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, identity TEXT, lineage_fp TEXT, by TEXT NOT NULL)');
+      appendObservation(db, observations[0]);
+      assert.deepEqual({ ...db.prepare('SELECT ts, identity, lineage_fp, by FROM codex_live_observations').get() as object }, {
+        ts: T0, identity: A, lineage_fp: 'a-fingerprint', by: 'tool',
+      });
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

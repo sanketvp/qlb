@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import type { DatabaseSync } from 'node:sqlite';
 import { basename } from 'node:path';
 import { promisify } from 'node:util';
 import { codexIdentityKey, type CodexIdentity } from './codex-auth';
@@ -41,6 +42,23 @@ export interface HolderEra {
   identity: string;
   startsAt: number | null;
   endsAt: number | null;
+}
+
+/** A time interval during which each listed identity may be held by a Codex process. */
+export interface HolderSet {
+  identities: string[];
+  startsAt: number | null;
+  endsAt: number | null;
+  /** True only for time before the first persisted live observation. */
+  prehistory: boolean;
+}
+
+/** A credential-free observation of the identity Codex had live at a moment. */
+export interface CodexLiveObservation {
+  ts: number;
+  identity: string | null;
+  lineageFp: string | null;
+  by: string;
 }
 
 export interface PsOptions {
@@ -213,8 +231,130 @@ export function holderEras(switchLogRows: readonly CodexSwitchLogRow[]): HolderE
 }
 
 function processStartedAt(process: CodexProcess): number | null {
+  // Match the upstream process-start source and its UTC `lstart` contract;
+  // its parser establishes the five-field format at process_detection.py:128-155.
   const parsed = Date.parse(`${process.lstart} UTC`);
   return Number.isFinite(parsed) ? parsed : null;
+}
+
+interface MutableHolderEra extends HolderEra {}
+
+function isInInterval(era: HolderEra, time: number): boolean {
+  return (era.startsAt === null || time >= era.startsAt)
+    && (era.endsAt === null || time < era.endsAt);
+}
+
+function sameIdentities(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((identity, index) => identity === right[index]);
+}
+
+/**
+ * Reconstructs S12's conservative holder sets. A successful atomic publish is
+ * ambiguous for one `ps lstart` second on either side of `published_at`; a
+ * drift with only two live observations remains ambiguous for the interval
+ * bounded by those observations. This policy is QLB-specific: the upstream
+ * oracle only supplies the process-start reading above, not Codex identity
+ * transitions.
+ */
+export function holderSets(
+  switchLogRows: readonly CodexSwitchLogRow[],
+  observations: readonly CodexLiveObservation[],
+): HolderSet[] {
+  const switchEras: MutableHolderEra[] = holderEras(switchLogRows).map((era) => ({ ...era }));
+  const rows = [...switchLogRows].sort(compareRows);
+
+  // `published_at`, not `committed_at` or the row timestamp, is the publish
+  // boundary. Intervals are half-open, so T + 1 s is conclusively the target.
+  for (const row of rows) {
+    if (row.outcome !== 'ok' || row.publishedAt === null) continue;
+    const publishedAt = row.publishedAt;
+    for (const era of switchEras) {
+      if (era.identity === row.fromAccountId && era.endsAt === publishedAt) {
+        era.endsAt = publishedAt + 1_000;
+      }
+      if (era.identity === row.toAccountId && era.startsAt === publishedAt) {
+        era.startsAt = publishedAt - 1_000;
+      }
+    }
+  }
+
+  // A later switch whose source is not the prior successful target proves a
+  // missing/drifted transition. Retain both possibilities between the rows;
+  // this keeps the C5 conservative behaviour without widening normal eras.
+  let priorTarget: string | null = null;
+  let priorTime: number | null = null;
+  for (const row of rows) {
+    if (!isWritingRow(row.outcome)) continue;
+    const time = rowTime(row);
+    if (priorTime !== null && row.fromAccountId !== null && row.fromAccountId !== priorTarget) {
+      switchEras.push({ identity: row.fromAccountId, startsAt: priorTime, endsAt: time + 1_000 });
+    }
+    if (row.outcome === 'ok') {
+      priorTarget = row.toAccountId;
+      priorTime = time;
+    }
+  }
+
+  const sortedObservations = [...observations].sort((a, b) => a.ts - b.ts);
+  for (const observation of sortedObservations) {
+    if (!Number.isFinite(observation.ts)) throw new Error('Invalid Codex live observation time');
+    if (observation.identity !== null && observation.identity.length === 0) {
+      throw new Error('Invalid Codex live observation identity');
+    }
+  }
+  // With observations A@T0 then B@T1, a process before T0 is A/prehistory;
+  // T0..T1 could have read either document; from T1 onward it is B.
+  for (let index = 0; index < sortedObservations.length; index += 1) {
+    const observation = sortedObservations[index];
+    if (observation.identity === null) continue;
+    const previous = sortedObservations[index - 1];
+    const next = sortedObservations[index + 1];
+    switchEras.push({
+      identity: observation.identity,
+      startsAt: index === 0 ? null : previous.ts,
+      endsAt: next?.ts ?? null,
+    });
+  }
+
+  const boundaries = [...new Set(switchEras.flatMap((era) => [era.startsAt, era.endsAt]).filter((time): time is number => time !== null))]
+    .sort((left, right) => left - right);
+  const starts = [null, ...boundaries];
+  const ends = [...boundaries, null];
+  const sets: HolderSet[] = [];
+  for (let index = 0; index < starts.length; index += 1) {
+    const startsAt = starts[index];
+    const endsAt = ends[index];
+    const probe = startsAt ?? Number.NEGATIVE_INFINITY;
+    const identities = [...new Set(switchEras
+      .filter((era) => isInInterval(era, probe))
+      .map((era) => era.identity))].sort();
+    if (identities.length === 0) continue;
+    const prehistory = startsAt === null && sortedObservations.length > 0;
+    const prior = sets.at(-1);
+    if (prior && prior.endsAt === startsAt && prior.prehistory === prehistory && sameIdentities(prior.identities, identities)) {
+      prior.endsAt = endsAt;
+    } else {
+      sets.push({ identities, startsAt, endsAt, prehistory });
+    }
+  }
+  return sets;
+}
+
+/** Appends a credential-free live-identity observation to the v5 store. */
+export function appendObservation(
+  db: Pick<DatabaseSync, 'prepare'>,
+  observation: CodexLiveObservation,
+): number {
+  if (!Number.isFinite(observation.ts) || observation.by.trim() === '') {
+    throw new Error('Invalid Codex live observation');
+  }
+  if (observation.identity !== null && observation.identity.length === 0) {
+    throw new Error('Invalid Codex live observation identity');
+  }
+  const result = db.prepare(
+    'INSERT INTO codex_live_observations (ts, identity, lineage_fp, by) VALUES (?, ?, ?, ?)',
+  ).run(observation.ts, observation.identity, observation.lineageFp, observation.by);
+  return Number(result.lastInsertRowid);
 }
 
 /** Returns currently listed processes that may renew the supplied identity. */
@@ -222,22 +362,18 @@ export function renewers(
   identity: CodexIdentity,
   processes: readonly CodexProcess[],
   switchLogRows: readonly CodexSwitchLogRow[],
+  observations: readonly CodexLiveObservation[] = [],
 ): CodexProcess[] {
   const identityKey = codexIdentityKey(identity);
-  const identityEras = holderEras(switchLogRows)
-    .filter((era) => era.identity === identityKey)
-    .sort((a, b) => (a.startsAt ?? Number.NEGATIVE_INFINITY) - (b.startsAt ?? Number.NEGATIVE_INFINITY));
-  const lastEra = identityEras.at(-1);
+  const sets = holderSets(switchLogRows, observations);
 
   return processes.filter((process) => {
     const startedAt = processStartedAt(process);
     // An unparseable lstart is ambiguous. Count it as a holder for every
     // queried identity rather than risking a refresh-token rotation.
     if (startedAt === null) return true;
-    if (lastEra === undefined) return false;
-    // `ps lstart` has one-second resolution, so a start on the second after a
-    // definite replacement remains ambiguous. The only safe exclusion is at
-    // or after that one-second boundary.
-    return lastEra.endsAt === null || startedAt < lastEra.endsAt + 1_000;
+    return sets.some((set) => set.identities.includes(identityKey)
+      && (set.startsAt === null || startedAt >= set.startsAt)
+      && (set.endsAt === null || startedAt < set.endsAt));
   });
 }
