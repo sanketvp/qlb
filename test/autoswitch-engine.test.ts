@@ -92,30 +92,39 @@ describe('autoswitch decision engine — upstream decision table', () => {
     })), '2', 'at-limit');
   });
 
-  it('treats a provider hard-limit as at-limit even when active usage is unknown', () => {
-    assertSwitch(decideAutoswitch(input({
+  it('keeps unknown-usage grace despite a provider hard-limit until usage is known (S38)', () => {
+    const base = input({
       providerReportedLimit: true,
       accounts: [account('1', null), account('2', 80)],
-    })), '2', 'at-limit');
+    });
+    assert.deepEqual(decideAutoswitch(base), { kind: 'stay', reason: 'unknown', unhealthyTicks: 1 });
+    assertSwitch(decideAutoswitch({ ...base, unhealthyTicks: 2 }), '2', 'failover');
   });
 
-  it('parks after a provider hard-limit when every alternate is exhausted', () => {
+  it('uses provider hard-limit only with known usage for exhausted parking', () => {
     const reset = NOW + 10 * 60 * 1000;
     const result = decideAutoswitch(input({
       providerReportedLimit: true,
-      accounts: [account('1', null), account('2', 100, {
+      accounts: [account('1', 80), account('2', 100, {
         buckets: { '5h': { usedPct: 100, resetAt: reset } },
       })],
     }));
     assert.deepEqual(result, {
       kind: 'switch', targetId: '2', reason: 'parked', unhealthyTicks: 0, parkedUntilMs: reset,
+      leftHeadroom: 20, leftRecoveryAtMs: NOW + 60 * 60 * 1000, leftTrigger: 'parked',
     });
   });
 
-  it('fails over from a known-dead active account without unhealthy grace', () => {
-    assertSwitch(decideAutoswitch(input({
-      accounts: [account('1', null, { dead: true }), account('2', 80)],
-    })), '2', 'failover');
+  it('applies unknown grace to a dead active because upstream has no immediate-dead escape', () => {
+    const base = input({ accounts: [account('1', null, { dead: true }), account('2', 80)] });
+    assert.deepEqual(decideAutoswitch(base), { kind: 'stay', reason: 'unknown', unhealthyTicks: 1 });
+    assertSwitch(decideAutoswitch({ ...base, unhealthyTicks: 2 }), '2', 'failover');
+  });
+
+  it('holds an expired active credential idle for at most 30 minutes without counting it unhealthy', () => {
+    const base = input({ activeCredentialExpired: true, accounts: [account('1', null), account('2', 20)] });
+    assert.deepEqual(decideAutoswitch(base), { kind: 'stay', reason: 'active-idle', unhealthyTicks: 0, idleHoldSinceMs: NOW });
+    assert.deepEqual(decideAutoswitch({ ...base, idleHoldSinceMs: NOW - 30 * 60 * 1000 }), { kind: 'stay', reason: 'unknown', unhealthyTicks: 1 });
   });
 
   it('counts unknown active usage, then fails over without cooldown', () => {
@@ -126,6 +135,18 @@ describe('autoswitch decision engine — upstream decision table', () => {
     assert.deepEqual(decideAutoswitch(unknown), { kind: 'stay', reason: 'unknown', unhealthyTicks: 1 });
     assert.deepEqual(decideAutoswitch({ ...unknown, unhealthyTicks: 1 }), { kind: 'stay', reason: 'unknown', unhealthyTicks: 2 });
     assertSwitch(decideAutoswitch({ ...unknown, unhealthyTicks: 2 }), '2', 'failover');
+  });
+
+  it('clamps settings exactly like settings._clamped', () => {
+    assertSwitch(decideAutoswitch(input({
+      settings: { threshold: 30, hysteresisPct: -2, cooldownSeconds: -1, unhealthyTicks: 2.9 },
+      accounts: [account('1', 50), account('2', 20)],
+    })), '2', 'proactive');
+    assertSwitch(decideAutoswitch(input({
+      settings: { unhealthyTicks: 2.9 },
+      accounts: [account('1', null), account('2', 20)],
+      unhealthyTicks: 1,
+    })), '2', 'failover');
   });
 
   it('uses defaults when settings values are undefined or non-finite', () => {
@@ -166,6 +187,42 @@ describe('autoswitch decision engine — upstream decision table', () => {
       accounts: [account('1', 100), account('2', 1, { dead: true }), account('3', null)],
     }));
     assert.deepEqual(result, { kind: 'stay', reason: 'no-comparison', unhealthyTicks: 0 });
+  });
+});
+
+describe('autoswitch recovery and no-return policy — spec §4.3 / S45', () => {
+  it('keeps the no-return bar until the left account recovers, settling the [1,2,1,2] flap in one move', () => {
+    const first = decideAutoswitch(input({
+      accounts: [
+        account('1', 96, { buckets: { '5h': { usedPct: 96, resetAt: NOW + 500 * 60 * 60 * 1000 } } }),
+        account('2', 92, { buckets: { '5h': { usedPct: 92, resetAt: NOW + 400 * 60 * 60 * 1000 } } }),
+      ],
+    }));
+    assertSwitch(first, '2', 'proactive');
+    if (first.kind !== 'switch') return;
+    const secondInput = input({
+      activeAccountId: '2',
+      accounts: [
+        account('1', 96, { buckets: { '5h': { usedPct: 96, resetAt: NOW + 500 * 60 * 60 * 1000 } } }),
+        account('2', 98, { buckets: { '5h': { usedPct: 98, resetAt: NOW + 400 * 60 * 60 * 1000 } } }),
+      ],
+    });
+    assertSwitch(decideAutoswitch(secondInput), '1', 'proactive');
+    const held = decideAutoswitch({
+      ...secondInput,
+      lastSwitchFrom: '1', lastSwitchTo: '2', leftHeadroom: first.leftHeadroom,
+      leftRecoveryAtMs: first.leftRecoveryAtMs, leftTrigger: first.leftTrigger,
+    });
+    assert.equal(held.kind, 'stay');
+  });
+
+  it('uses either active or candidate recovery horizon for all-above ranking', () => {
+    assertSwitch(decideAutoswitch(input({
+      accounts: [
+        account('1', 96, { buckets: { '5h': { usedPct: 96, resetAt: NOW + 20 * 60 * 60 * 1000 } } }),
+        account('2', 95, { buckets: { '5h': { usedPct: 95, resetAt: NOW + 2 * 60 * 60 * 1000 } } }),
+      ],
+    })), '2', 'proactive');
   });
 });
 
