@@ -41,6 +41,20 @@ describe('Codex OAuth request descriptions', () => {
       },
     });
   });
+
+  it('redacts credentials when a request descriptor is JSON serialized', () => {
+    const refresh = buildRefreshRequest('fake-refresh-secret');
+    const usage = buildUsageRequest('fake-access-secret', 'test-account-id');
+
+    assert.equal(JSON.stringify(refresh).includes('fake-refresh-secret'), false);
+    assert.equal(JSON.stringify(usage).includes('fake-access-secret'), false);
+    assert.match(JSON.stringify(refresh), /\[redacted\]/);
+    assert.match(JSON.stringify(usage), /Bearer \[redacted\]/);
+  });
+
+  it('rejects the store sentinel instead of using it as tokens.account_id', () => {
+    assert.throws(() => buildUsageRequest('test-access-token', 'codex-default'));
+  });
 });
 
 describe('Codex refresh classification — AC12 / L10', () => {
@@ -76,6 +90,12 @@ describe('Codex refresh classification — AC12 / L10', () => {
         access_token: 'test-access-token',
       },
     });
+    assert.deepEqual(classifyRefreshResponse(200, JSON.stringify({
+      refresh_token: 'test-rotated-refresh-token',
+    })), {
+      kind: 'ok',
+      tokens: { refresh_token: 'test-rotated-refresh-token' },
+    });
   });
 
   it('rejects successful responses with no non-empty token fields', () => {
@@ -105,7 +125,20 @@ describe('Codex refresh classification — AC12 / L10', () => {
     });
   }
 
-  it('marks HTTP 401 and HTTP 400 invalid_grant dead', () => {
+  it('keeps a provider reason from a 401 response', () => {
+    assert.deepEqual(classifyRefreshResponse(401, JSON.stringify({
+      error: { code: 'refresh_token_reused' },
+    })), {
+      kind: 'dead',
+      reason: 'refresh_token_reused',
+    });
+    assert.deepEqual(classifyRefreshResponse(401, JSON.stringify({ code: 'invalid_grant' })), {
+      kind: 'dead',
+      reason: 'invalid_grant',
+    });
+  });
+
+  it('marks bare HTTP 401 and HTTP 400 invalid_grant dead', () => {
     assert.deepEqual(classifyRefreshResponse(401, 'not JSON'), {
       kind: 'dead',
       reason: 'http_401',
@@ -197,6 +230,22 @@ describe('applyRefresh', () => {
     });
   });
 
+  it('applies a refresh-token-only successful rotation without losing other tokens', () => {
+    const result = applyRefresh({
+      tokens: {
+        id_token: 'old-id',
+        access_token: 'old-access',
+        refresh_token: 'old-refresh',
+      },
+    }, { refresh_token: 'new-refresh' }, new Date('2026-10-24T12:34:56.000Z'));
+
+    assert.deepEqual(result.tokens, {
+      id_token: 'old-id',
+      access_token: 'old-access',
+      refresh_token: 'new-refresh',
+    });
+  });
+
   it('does not overwrite a stored token with an undefined own property', () => {
     const result = applyRefresh({
       tokens: { refresh_token: 'old-refresh' },
@@ -243,6 +292,51 @@ describe('Codex usage parsing', () => {
     assert.deepEqual(parseUsage(429, JSON.stringify({ retry_after: 30 })), {
       kind: 'rate-limited',
       retryAfter: 30,
+    });
+  });
+
+  it('does not parse windows from non-success statuses', () => {
+    const body = JSON.stringify({ rate_limits: { primary: { used_percent: 10 } } });
+    assert.deepEqual(parseUsage(403, body), { kind: 'http_error', status: 403 });
+    assert.deepEqual(parseUsage(500, body), { kind: 'http_error', status: 500 });
+  });
+
+  it('uses a numeric Retry-After header when the 429 body has none and bounds it', () => {
+    assert.deepEqual(parseUsage(429, '{}', { 'Retry-After': '30' }), {
+      kind: 'rate-limited',
+      retryAfter: 30,
+    });
+    assert.deepEqual(parseUsage(429, JSON.stringify({ retry_after: -1 })), {
+      kind: 'rate-limited',
+      retryAfter: 0,
+    });
+    assert.deepEqual(parseUsage(429, '{}', { 'retry-after': '999999' }), {
+      kind: 'rate-limited',
+      retryAfter: 86_400,
+    });
+  });
+
+  it('clamps used percentage and retains window minutes', () => {
+    assert.deepEqual(parseUsage(200, JSON.stringify({
+      primary: { used_percent: 101, window_minutes: 15 },
+      secondary: { used_percent: -1 },
+    })), [
+      { bucket: 'primary', usedPct: 100, clamped: true, windowMin: 15 },
+      { bucket: 'secondary', usedPct: 0, clamped: true },
+    ]);
+  });
+
+  it('bounds metadata for unknown usage shapes', () => {
+    const body = Object.fromEntries(Array.from({ length: 21 }, (_, index) => [
+      `${String(index).padStart(2, '0')}-${'x'.repeat(70)}`,
+      index,
+    ]));
+    const result = parseUsage(200, JSON.stringify(body));
+    assert.equal(Array.isArray(result), false);
+    assert.deepEqual(result, {
+      kind: 'unknown',
+      status: 200,
+      topLevelKeys: Object.keys(body).slice(0, 20).map((key) => key.slice(0, 64)),
     });
   });
 });

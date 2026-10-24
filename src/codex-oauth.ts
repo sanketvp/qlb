@@ -26,22 +26,42 @@ export interface CodexAuthDocument {
   [key: string]: unknown;
 }
 
+export type DeadReason =
+  | 'refresh_token_expired'
+  | 'refresh_token_reused'
+  | 'refresh_token_invalidated'
+  | 'invalid_grant'
+  | 'http_401';
+
+export type TransientReason =
+  | 'invalid_success_response'
+  | 'unparseable_response'
+  | 'http_error';
+
 export type RefreshClassification =
   | { kind: 'ok'; tokens: CodexTokens }
-  | { kind: 'dead'; reason: string }
-  | { kind: 'transient'; reason: string };
+  | { kind: 'dead'; reason: DeadReason }
+  | { kind: 'transient'; reason: TransientReason };
 
 export interface UsageWindow {
   bucket: 'primary' | 'secondary';
   usedPct: number;
+  /** True when a server-provided percentage was outside the valid [0, 100] range. */
+  clamped?: true;
   resetAt?: number;
+  windowMin?: number;
 }
 
 export type UsageParseResult =
   | UsageWindow[]
   | { kind: 'unknown'; status: number; topLevelKeys: string[] }
   | { kind: 'unauthorized' }
-  | { kind: 'rate-limited'; retryAfter: number | undefined };
+  | { kind: 'rate-limited'; retryAfter: number | undefined }
+  | { kind: 'http_error'; status: number };
+
+export type UsageResponseHeaders =
+  | { get(name: string): string | null }
+  | Record<string, string | string[] | undefined>;
 
 type JsonObject = Record<string, unknown>;
 
@@ -58,7 +78,7 @@ function isObject(value: unknown): value is JsonObject {
 export function buildRefreshRequest(refreshToken: string): RequestDescription {
   // OAuthClient collects parameters in a BTreeMap before JSON serialization,
   // hence the intentionally stable key order here (oauth/client.rs:110-128).
-  return {
+  return withRedactedJson({
     url: CODEX_REFRESH_URL,
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -68,7 +88,29 @@ export function buildRefreshRequest(refreshToken: string): RequestDescription {
       refresh_reason: 'forced',
       refresh_token: refreshToken,
     }),
-  };
+  });
+}
+
+/** Adds a non-enumerable JSON view so descriptor logging cannot leak credentials. */
+function withRedactedJson(request: RequestDescription): RequestDescription {
+  Object.defineProperty(request, 'toJSON', {
+    enumerable: false,
+    value: () => {
+      const headers = { ...request.headers };
+      if (headers.Authorization?.startsWith('Bearer ')) {
+        headers.Authorization = 'Bearer [redacted]';
+      }
+
+      let body = request.body;
+      const parsedBody = body === undefined ? undefined : parseJson(body);
+      if (isObject(parsedBody) && Object.hasOwn(parsedBody, 'refresh_token')) {
+        body = JSON.stringify({ ...parsedBody, refresh_token: '[redacted]' });
+      }
+
+      return body === undefined ? { ...request, headers } : { ...request, headers, body };
+    },
+  });
+  return request;
 }
 
 function parseJson(bodyText: string): unknown {
@@ -106,8 +148,8 @@ function successTokens(body: unknown): CodexTokens | undefined {
 
 /**
  * Classifies a completed refresh response without retaining its raw body.
- * Codex manager.rs:1728-1741 treats the three provider codes, any 401, and
- * 400 invalid_grant as permanent; all other failures are retryable.
+ * Codex manager.rs:1728-1741 reads the provider code before its 401 fallback.
+ * Preserve every recognized 4xx code so the consumer can apply its holder rule.
  */
 export function classifyRefreshResponse(status: number, bodyText: string): RefreshClassification {
   const body = parseJson(bodyText);
@@ -118,23 +160,21 @@ export function classifyRefreshResponse(status: number, bodyText: string): Refre
       : { kind: 'transient', reason: 'invalid_success_response' };
   }
 
-  if (status === 401) return { kind: 'dead', reason: 'http_401' };
-
   const code = oauthErrorCode(body)?.toLowerCase();
   if (
-    code === 'refresh_token_expired' ||
-    code === 'refresh_token_reused' ||
-    code === 'refresh_token_invalidated'
+    status >= 400 && status < 500 &&
+    (code === 'refresh_token_expired' ||
+      code === 'refresh_token_reused' ||
+      code === 'refresh_token_invalidated' ||
+      code === 'invalid_grant')
   ) {
     return { kind: 'dead', reason: code };
   }
-  if (status === 400 && code === 'invalid_grant') {
-    return { kind: 'dead', reason: 'invalid_grant' };
-  }
+  if (status === 401) return { kind: 'dead', reason: 'http_401' };
 
   return {
     kind: 'transient',
-    reason: body === undefined ? 'unparseable_response' : `http_${status}`,
+    reason: body === undefined ? 'unparseable_response' : 'http_error',
   };
 }
 
@@ -158,16 +198,19 @@ export function applyRefresh(
   };
 }
 
-/** Describes, but does not execute, the Codex usage request. */
+/** Describes, but does not execute, the Codex usage request for `tokens.account_id`. */
 export function buildUsageRequest(accessToken: string, accountId: string): RequestDescription {
-  return {
+  if (accountId === 'codex-default') {
+    throw new Error('Codex usage requests require tokens.account_id, not codex-default');
+  }
+  return withRedactedJson({
     url: CODEX_USAGE_URL,
     method: 'GET',
     headers: {
       Authorization: `Bearer ${accessToken}`,
       'ChatGPT-Account-Id': accountId,
     },
-  };
+  });
 }
 
 function asFiniteNumber(value: unknown): number | undefined {
@@ -205,33 +248,63 @@ function rateLimitRoots(body: JsonObject): JsonObject[] {
 function parseWindow(root: JsonObject, bucket: UsageWindow['bucket']): UsageWindow | undefined {
   const raw = root[bucket];
   if (!isObject(raw)) return undefined;
-  const usedPct = asFiniteNumber(raw.used_percent) ??
+  const rawUsedPct = asFiniteNumber(raw.used_percent) ??
     asFiniteNumber(raw.usedPercent) ??
     asFiniteNumber(raw.used_pct);
-  if (usedPct === undefined) return undefined;
+  if (rawUsedPct === undefined) return undefined;
+  const usedPct = Math.min(100, Math.max(0, rawUsedPct));
   const resetAt = parseResetAt(raw.reset_at) ??
     parseResetAt(raw.resets_at) ??
     parseResetAt(raw.resetAt) ??
     parseResetAt(raw.resetsAt);
-  return resetAt === undefined ? { bucket, usedPct } : { bucket, usedPct, resetAt };
+  const windowMin = asFiniteNumber(raw.window_minutes) ?? asFiniteNumber(raw.windowMinutes);
+  return {
+    bucket,
+    usedPct,
+    ...(usedPct !== rawUsedPct ? { clamped: true as const } : {}),
+    ...(resetAt === undefined ? {} : { resetAt }),
+    ...(windowMin === undefined ? {} : { windowMin }),
+  };
 }
 
-function retryAfter(body: unknown): number | undefined {
-  if (!isObject(body)) return undefined;
-  return asFiniteNumber(body.retry_after) ?? asFiniteNumber(body.retryAfter);
+function headerValue(headers: UsageResponseHeaders | undefined, name: string): string | undefined {
+  if (!headers) return undefined;
+  if ('get' in headers && typeof headers.get === 'function') return headers.get(name) ?? undefined;
+  const wanted = name.toLowerCase();
+  for (const [key, value] of Object.entries(headers)) {
+    if (key.toLowerCase() === wanted) return Array.isArray(value) ? value[0] : value;
+  }
+  return undefined;
+}
+
+function retryAfter(body: unknown, headers: UsageResponseHeaders | undefined): number | undefined {
+  const value = isObject(body)
+    ? asFiniteNumber(body.retry_after) ?? asFiniteNumber(body.retryAfter)
+    : undefined;
+  const seconds = value ?? asFiniteNumber(headerValue(headers, 'Retry-After'));
+  return seconds === undefined ? undefined : Math.min(86_400, Math.max(0, seconds));
+}
+
+function safeTopLevelKeys(body: JsonObject): string[] {
+  return Object.keys(body).slice(0, 20).map((key) => key.slice(0, 64));
 }
 
 /**
  * Parses only recognized usage gauges. The WHAM endpoint's body shape is L14
  * UNVERIFIED, so an unfamiliar response returns metadata only, never body text.
  */
-export function parseUsage(status: number, bodyText: string): UsageParseResult {
+export function parseUsage(
+  status: number,
+  bodyText: string,
+  headers?: UsageResponseHeaders,
+): UsageParseResult {
   if (status === 401) return { kind: 'unauthorized' };
 
   const body = parseJson(bodyText);
-  if (status === 429) return { kind: 'rate-limited', retryAfter: retryAfter(body) };
+  if (status === 429) return { kind: 'rate-limited', retryAfter: retryAfter(body, headers) };
+  if (status < 200 || status >= 300) return { kind: 'http_error', status };
 
-  const topLevelKeys = isObject(body) ? Object.keys(body) : [];
+  const topLevelKeys = isObject(body) ? safeTopLevelKeys(body) : [];
   if (!isObject(body)) return { kind: 'unknown', status, topLevelKeys };
 
   const windows: UsageWindow[] = [];
