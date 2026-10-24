@@ -3,11 +3,14 @@
 // better-sqlite3 for the same synchronous BEGIN IMMEDIATE style; node:sqlite
 // provides that without a native addon, so we use it instead of adding a
 // dependency. If `node:sqlite` is ever unavailable, switch to `better-sqlite3`.
-import { chmodSync, existsSync, mkdirSync } from 'node:fs';
-import { dirname } from 'node:path';
-import { DatabaseSync, type StatementSync } from 'node:sqlite';
+import { chmodSync, existsSync, mkdirSync, rmSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { dirname, join } from 'node:path';
+import { backup, DatabaseSync, type StatementSync } from 'node:sqlite';
 import { inspectAccountSafety, safetyRefusalMessage } from './accounts-prune';
 import { config } from './config';
+import { redactSecrets } from './redact';
 import type { BucketReading, Confidence } from './types';
 
 export const DEFAULT_DB_PATH = config.dbPath;
@@ -58,6 +61,23 @@ export interface PolicyRow {
 
 export function refreshLeaseName(accountId: string): string {
   return `refresh:${accountId}`;
+}
+
+export interface AutoswitchSettings {
+  threshold: number;
+  weeklyThreshold: number | null;
+  intervalSeconds: number;
+  cooldownSeconds: number;
+  hysteresisPct: number;
+  unhealthyTicks: number;
+  strategy: 'best' | 'consume-first';
+}
+
+function clampedConfigNumber(raw: string | null, fallback: number, minimum: number, maximum: number, integer = false): number {
+  const parsed = raw == null || raw.trim() === '' ? NaN : Number(raw);
+  const value = Number.isFinite(parsed) ? parsed : fallback;
+  const bounded = Math.min(maximum, Math.max(minimum, value));
+  return integer ? Math.trunc(bounded) : bounded;
 }
 
 function readUserVersion(db: DatabaseSync): number {
@@ -136,20 +156,11 @@ function hasColumn(db: DatabaseSync, table: string, column: string): boolean {
 }
 
 function ensureDecisionColumnsOn(db: DatabaseSync): void {
-  db.exec('BEGIN IMMEDIATE');
-  try {
-    if (!hasColumn(db, 'decisions', 'strategy')) {
-      db.exec('ALTER TABLE decisions ADD COLUMN strategy TEXT');
-      db.exec('ALTER TABLE decisions ADD COLUMN provider TEXT');
-    }
-    db.exec('COMMIT');
-  } catch (err) {
-    try {
-      db.exec('ROLLBACK');
-    } catch {
-      // preserve the original error
-    }
-    throw err;
+  if (!hasColumn(db, 'decisions', 'strategy')) {
+    db.exec('ALTER TABLE decisions ADD COLUMN strategy TEXT');
+  }
+  if (!hasColumn(db, 'decisions', 'provider')) {
+    db.exec('ALTER TABLE decisions ADD COLUMN provider TEXT');
   }
 }
 
@@ -206,9 +217,9 @@ export function openDecisionsReader(path: string): DecisionsReader | null {
   try {
     db.exec('PRAGMA busy_timeout = 5000');
     const version = readUserVersion(db);
-    if (version > 4) {
+    if (version > 5) {
       throw new Error(
-        `qlb.db schema user_version=${version} is newer than this binary (4); upgrade qlb`,
+        `qlb.db schema user_version=${version} is newer than this binary (5); upgrade qlb`,
       );
     }
     const strategySelect = hasColumn(db, 'decisions', 'strategy')
@@ -269,6 +280,142 @@ function ensurePrivateDir(dir: string): void {
   } catch {
     // best-effort; non-fatal on some filesystems
   }
+}
+
+type BackupVerifier = (source: DatabaseSync, copy: DatabaseSync) => boolean;
+
+function userTableCounts(db: DatabaseSync): Map<string, number> {
+  const tables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all() as Array<{ name: string }>;
+  const counts = new Map<string, number>();
+  for (const { name } of tables) {
+    // Names originate in sqlite_master, not caller input.
+    const row = db.prepare(`SELECT count(*) AS count FROM "${name.replace(/"/g, '""')}"`).get() as { count: number };
+    counts.set(name, row.count);
+  }
+  return counts;
+}
+
+function tableContentDigest(db: DatabaseSync, table: string): string {
+  // Table names are read from sqlite_master. rowid gives a deterministic order
+  // for the rowid tables used by this store; the column-order fallback supports
+  // callers of the exported backup helper with WITHOUT ROWID tables.
+  const quoted = `"${table.replace(/"/g, '""')}"`;
+  let rows: unknown[];
+  try {
+    rows = db.prepare(`SELECT * FROM ${quoted} ORDER BY rowid`).all();
+  } catch {
+    const columns = db.prepare(`PRAGMA table_info(${quoted})`).all() as Array<{ name: string }>;
+    const order = columns.map(({ name }) => `"${name.replace(/"/g, '""')}"`).join(', ');
+    rows = db.prepare(`SELECT * FROM ${quoted}${order ? ` ORDER BY ${order}` : ''}`).all();
+  }
+  return createHash('sha256').update(JSON.stringify(rows, (_key, value) => (
+    value instanceof Uint8Array ? Buffer.from(value).toString('base64') : value
+  ))).digest('hex');
+}
+
+export function verifyBackup(source: DatabaseSync, copy: DatabaseSync): boolean {
+  const integrity = copy.prepare('PRAGMA integrity_check').get() as { integrity_check?: string } | string | undefined;
+  const result = typeof integrity === 'string' ? integrity : integrity?.integrity_check;
+  if (result !== 'ok') return false;
+  const sourceCounts = userTableCounts(source);
+  const copyCounts = userTableCounts(copy);
+  if (sourceCounts.size !== copyCounts.size) return false;
+  for (const [table, count] of sourceCounts) {
+    if (copyCounts.get(table) !== count || tableContentDigest(source, table) !== tableContentDigest(copy, table)) return false;
+  }
+  return true;
+}
+
+/**
+ * Creates an online SQLite backup before migration and verifies the copy before
+ * the caller changes the source. `verify` exists solely to make the abort path
+ * testable without corrupting a fixture.
+ */
+export async function backupBeforeMigrate(
+  dbPath: string,
+  backupPath: string = join(dirname(dbPath), 'backups', `db-${Date.now()}.sqlite`),
+  verify: BackupVerifier = verifyBackup,
+): Promise<string> {
+  mkdirSync(dirname(backupPath), { recursive: true, mode: 0o700 });
+  const source = new DatabaseSync(dbPath);
+  try {
+    await backup(source, backupPath);
+    const copy = new DatabaseSync(backupPath, { readOnly: true });
+    try {
+      if (!verify(source, copy)) throw new Error('backup verification failed; migration aborted');
+    } finally {
+      copy.close();
+    }
+    try { chmodSync(backupPath, 0o600); } catch { /* best effort */ }
+    return backupPath;
+  } catch (err) {
+    try { rmSync(backupPath, { force: true }); } catch { /* preserve original error */ }
+    throw err;
+  } finally {
+    source.close();
+  }
+}
+
+function schemaNeedsV5Correction(db: DatabaseSync): boolean {
+  const required: Record<string, string[]> = {
+    claude_slots: ['archived_at'],
+    codex_slots: ['pending_adopt', 'archived_at'],
+    switch_log: ['injected', 'detail', 'published_at', 'committed_at'],
+    usage_polls: ['provider'],
+    relogin_events: ['evidence', 'user_denied_at'],
+    lineage_log: ['evidence'],
+    lifecycle: ['pre_fence_state'],
+    codex_watch: [], import_runs: [], pi_export_targets: [], codex_live_observations: [],
+  };
+  for (const [table, columns] of Object.entries(required)) {
+    const found = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table);
+    if (!found) return true;
+    if (columns.some((column) => !hasColumn(db, table, column))) return true;
+  }
+  return !lifecycleOneOpenIndexMatches(db);
+}
+
+function migrationNeeded(db: DatabaseSync): boolean {
+  const version = readUserVersion(db);
+  return version < 5 || (version === 5 && schemaNeedsV5Correction(db));
+}
+
+const LIFECYCLE_ONE_OPEN_INDEX_SQL = `CREATE UNIQUE INDEX lifecycle_one_open ON lifecycle ((1))
+  WHERE state IN ('cutting-over','cutover','undoing','rolled-back','retired','aborted')`;
+
+function normalizedSql(sql: string): string {
+  return sql.replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+function lifecycleOneOpenIndexMatches(db: DatabaseSync): boolean {
+  const index = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'lifecycle_one_open'").get() as { sql?: string } | undefined;
+  return Boolean(index?.sql && normalizedSql(index.sql) === normalizedSql(LIFECYCLE_ONE_OPEN_INDEX_SQL));
+}
+
+/** Synchronous bridge for Store's established synchronous constructor. Caller holds BEGIN IMMEDIATE. */
+function backupBeforeMigrateSync(dbPath: string, source: DatabaseSync): void {
+  const backupPath = join(dirname(dbPath), 'backups', `db-${Date.now()}-${process.pid}.sqlite`);
+  mkdirSync(dirname(backupPath), { recursive: true, mode: 0o700 });
+  const script = `
+    const { backup, DatabaseSync } = process.getBuiltinModule('node:sqlite');
+    (async () => { const source = new DatabaseSync(process.argv[1]); try { await backup(source, process.argv[2]); } finally { source.close(); } })()
+      .catch((error) => { console.error(error.message); process.exitCode = 1; });
+  `;
+  const result = spawnSync(process.execPath, ['-e', script, dbPath, backupPath], { encoding: 'utf8' });
+  if (result.status !== 0) {
+    try { rmSync(backupPath, { force: true }); } catch { /* preserve failure */ }
+    throw new Error(`database backup failed; migration aborted: ${result.stderr.trim() || result.error?.message || 'unknown error'}`);
+  }
+  const copy = new DatabaseSync(backupPath, { readOnly: true });
+  try {
+    if (!verifyBackup(source, copy)) throw new Error('backup verification failed; migration aborted');
+  } catch (err) {
+    try { rmSync(backupPath, { force: true }); } catch { /* preserve failure */ }
+    throw err;
+  } finally {
+    copy.close();
+  }
+  try { chmodSync(backupPath, 0o600); } catch { /* best effort */ }
 }
 
 function toReading(row: {
@@ -348,10 +495,11 @@ export class Store {
       // Install the busy handler before the first lock-taking SQL operation
       // after open. Keep this before WAL/schema initialization.
       this.db.exec('PRAGMA busy_timeout = 5000');
-      if (dbPath !== ':memory:') {
-        this.db.exec('PRAGMA journal_mode = WAL');
-      }
+      if (dbPath !== ':memory:') this.db.exec('PRAGMA journal_mode = WAL');
       this.db.exec('PRAGMA synchronous = NORMAL');
+      // migrateIfNeeded takes the write lock and, when needed, backs up before
+      // any constructor schema DDL is allowed to run.
+      this.migrateIfNeeded();
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS accounts (
         id TEXT PRIMARY KEY,
@@ -405,7 +553,6 @@ export class Store {
         value TEXT
       );
     `);
-    this.migrateIfNeeded();
 
     if (dbPath !== ':memory:') {
       try {
@@ -570,69 +717,150 @@ export class Store {
     }
   }
 
-  /**
-   * Additive schema:
-   *   v1 → v2: `accounts.grant_generation` + `leases` table (§4.7 / §4.8.2).
-   *   v2 → v3: `migrations` journal (§4.8.3).
-   *   v3 → v4: `policies` table (§4.9.2b).
-   * Generation lives on `accounts` (not a side table) so the fenced CAS in
-   * §4.8.2 step 5 is a single-row UPDATE on the account itself.
-   */
+  /** Additive migration through the §3.2 v5 schema (including pre-release v5 correction). */
   private migrateIfNeeded(): void {
-    const SCHEMA_VERSION = 4;
+    const SCHEMA_VERSION = 5;
     const version = readUserVersion(this.db);
     if (version > SCHEMA_VERSION) {
-      throw new Error(
-        `qlb.db schema user_version=${version} is newer than this binary (${SCHEMA_VERSION}); upgrade qlb`,
-      );
+      throw new Error(`qlb.db schema user_version=${version} is newer than this binary (${SCHEMA_VERSION}); upgrade qlb`);
     }
-    if (version < 2) {
-      const cols = this.db.prepare('PRAGMA table_info(accounts)').all() as Array<{
-        name: string;
-      }>;
-      if (!cols.some((c) => c.name === 'grant_generation')) {
-        this.db.exec(
-          'ALTER TABLE accounts ADD COLUMN grant_generation INTEGER DEFAULT 0',
-        );
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      if (!migrationNeeded(this.db)) {
+        this.db.exec('COMMIT');
+        return;
+      }
+      // This is deliberately inside the migration lock, after the backup.
+      // It also lets a brand-new database migrate without constructor DDL.
+      if (this.dbPath !== ':memory:') backupBeforeMigrateSync(this.dbPath, this.db);
+      this.createCoreSchema();
+      if (version < 2) {
+        if (!hasColumn(this.db, 'accounts', 'grant_generation')) this.db.exec('ALTER TABLE accounts ADD COLUMN grant_generation INTEGER DEFAULT 0');
+        this.db.exec('CREATE TABLE IF NOT EXISTS leases (name TEXT PRIMARY KEY, holder_pid INTEGER, holder_id TEXT, until INTEGER, generation INTEGER)');
+      }
+      if (version < 3) {
+        this.db.exec('CREATE TABLE IF NOT EXISTS migrations (store TEXT PRIMARY KEY, state TEXT NOT NULL, updated_at INTEGER NOT NULL, detail_json TEXT)');
+      }
+      if (version < 4) {
+        this.db.exec('CREATE TABLE IF NOT EXISTS policies (harness TEXT, virtual_model TEXT, real_model TEXT, effort TEXT, fallback_json TEXT, session_mode TEXT, created_at INTEGER, PRIMARY KEY (harness, virtual_model))');
+      }
+      ensureDecisionColumnsOn(this.db);
+      this.migrateV5Schema();
+      this.db.exec('PRAGMA user_version = 5');
+      this.db.exec('COMMIT');
+    } catch (err) {
+      try { this.db.exec('ROLLBACK'); } catch { /* preserve original error */ }
+      throw err;
+    }
+  }
+
+  private createCoreSchema(): void {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS accounts (id TEXT PRIMARY KEY, provider TEXT, label TEXT, status TEXT, created_at INTEGER);
+      CREATE TABLE IF NOT EXISTS snapshots (account_id TEXT, bucket TEXT, used_pct REAL, used REAL, limit_val REAL, remaining REAL, reset_at INTEGER, fetched_at INTEGER, source TEXT, confidence TEXT, PRIMARY KEY (account_id, bucket));
+      CREATE TABLE IF NOT EXISTS decisions (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, session TEXT, harness TEXT, requested_model TEXT, effort TEXT, served_model TEXT, account_id TEXT, mode TEXT, reason TEXT, snapshot_json TEXT, strategy TEXT, provider TEXT);
+      CREATE TABLE IF NOT EXISTS overrides (kind TEXT, account_id TEXT, session TEXT, until INTEGER);
+      CREATE TABLE IF NOT EXISTS poll_claims (account_id TEXT PRIMARY KEY, holder_id TEXT, claimed_at INTEGER, until INTEGER);
+      CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT);
+    `);
+  }
+
+  private migrateV5Schema(): void {
+    if (this.tableExists('usage_polls') && !hasColumn(this.db, 'usage_polls', 'provider')) {
+      const rows = this.db.prepare('SELECT account_id FROM usage_polls').all() as Array<{ account_id: string }>;
+      const providerFor = this.db.prepare('SELECT provider FROM accounts WHERE id = ?');
+      for (const row of rows) {
+        const providers = providerFor.all(row.account_id) as Array<{ provider: string | null }>;
+        if (providers.length !== 1 || !providers[0]?.provider) {
+          throw new Error(`cannot correct pre-release v5 usage_polls: account_id '${row.account_id}' is ambiguous`);
+        }
       }
       this.db.exec(`
-        CREATE TABLE IF NOT EXISTS leases (
-          name TEXT PRIMARY KEY,
-          holder_pid INTEGER,
-          holder_id TEXT,
-          until INTEGER,
-          generation INTEGER
-        );
+        CREATE TABLE usage_polls_v5 (
+          provider TEXT NOT NULL, account_id TEXT NOT NULL,
+          last_fetch_at INTEGER, last_attempt_at INTEGER, next_due_at INTEGER,
+          last_status TEXT, consecutive_failures INTEGER NOT NULL DEFAULT 0,
+          backoff_until INTEGER, last_429_at INTEGER, held_until INTEGER,
+          PRIMARY KEY (provider, account_id)
+        )
       `);
-      this.db.exec('PRAGMA user_version = 2');
+      const copy = this.db.prepare(`INSERT INTO usage_polls_v5 (provider, account_id, last_fetch_at, last_attempt_at, next_due_at, last_status, consecutive_failures, backoff_until, last_429_at, held_until)
+        SELECT ?, account_id, last_fetch_at, last_attempt_at, next_due_at, last_status, consecutive_failures, backoff_until, last_429_at, held_until FROM usage_polls WHERE account_id = ?`);
+      for (const row of rows) {
+        const provider = (providerFor.get(row.account_id) as { provider: string }).provider;
+        copy.run(provider, row.account_id);
+      }
+      this.db.exec('DROP TABLE usage_polls; ALTER TABLE usage_polls_v5 RENAME TO usage_polls');
     }
-    if (version < 3) {
-      this.db.exec(`
-        CREATE TABLE IF NOT EXISTS migrations (
-          store TEXT PRIMARY KEY,
-          state TEXT NOT NULL,
-          updated_at INTEGER NOT NULL,
-          detail_json TEXT
-        );
-      `);
-      this.db.exec('PRAGMA user_version = 3');
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS claude_slots (
+        account_id TEXT PRIMARY KEY, slot_num INTEGER UNIQUE, email TEXT, alias TEXT, org_uuid TEXT,
+        config_json TEXT NOT NULL, fingerprint TEXT, prev_fingerprint TEXT, threshold REAL,
+        dead INTEGER NOT NULL DEFAULT 0, dead_reason TEXT, dead_at INTEGER, healed_at INTEGER,
+        added_at INTEGER NOT NULL, last_active_at INTEGER, source TEXT, archived_at INTEGER
+      );
+      CREATE TABLE IF NOT EXISTS codex_slots (
+        account_id TEXT PRIMARY KEY, chatgpt_user_id TEXT NOT NULL, chatgpt_account_id TEXT NOT NULL,
+        email TEXT, alias TEXT, fingerprint TEXT, prev_fingerprint TEXT, threshold REAL, last_refresh TEXT,
+        dead INTEGER NOT NULL DEFAULT 0, dead_reason TEXT, dead_at INTEGER, healed_at INTEGER,
+        pending_adopt INTEGER NOT NULL DEFAULT 0, added_at INTEGER NOT NULL, last_active_at INTEGER, source TEXT, archived_at INTEGER
+      );
+      CREATE TABLE IF NOT EXISTS active_login (provider TEXT PRIMARY KEY, account_id TEXT, since INTEGER NOT NULL, set_by TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS switch_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, provider TEXT NOT NULL, from_account TEXT, to_account TEXT NOT NULL,
+        trigger TEXT NOT NULL, outcome TEXT NOT NULL, outgoing_kind TEXT, binding_json TEXT, steps_json TEXT, open_sessions_json TEXT, error TEXT,
+        injected INTEGER NOT NULL DEFAULT 0, detail TEXT, published_at INTEGER, committed_at INTEGER
+      );
+      CREATE TABLE IF NOT EXISTS usage_polls (
+        provider TEXT NOT NULL, account_id TEXT NOT NULL, last_fetch_at INTEGER, last_attempt_at INTEGER, next_due_at INTEGER,
+        last_status TEXT, consecutive_failures INTEGER NOT NULL DEFAULT 0, backoff_until INTEGER, last_429_at INTEGER, held_until INTEGER,
+        PRIMARY KEY (provider, account_id)
+      );
+      CREATE TABLE IF NOT EXISTS relogin_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, provider TEXT NOT NULL, account_id TEXT,
+        kind TEXT NOT NULL, detail TEXT, evidence TEXT, user_denied_at INTEGER
+      );
+      CREATE TABLE IF NOT EXISTS health_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, phase TEXT NOT NULL, overall TEXT NOT NULL,
+        failing_json TEXT NOT NULL, dead_slots_json TEXT NOT NULL, release_sha TEXT
+      );
+      CREATE TABLE IF NOT EXISTS lineage_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, provider TEXT NOT NULL, account_id TEXT NOT NULL,
+        from_fp TEXT, to_fp TEXT NOT NULL, cause TEXT NOT NULL, by TEXT NOT NULL, evidence TEXT
+      );
+      CREATE TABLE IF NOT EXISTS lifecycle (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, state TEXT NOT NULL, began_at INTEGER NOT NULL, cutover_at INTEGER, window_end INTEGER,
+        extended_at INTEGER, undo_began_at INTEGER, rollback_at INTEGER, retired_at INTEGER, closed_at INTEGER,
+        release_sha TEXT, drill_done_at INTEGER, note TEXT, pre_fence_state TEXT
+      );
+      CREATE TABLE IF NOT EXISTS codex_watch (switch_id INTEGER PRIMARY KEY, provider TEXT NOT NULL, outgoing TEXT NOT NULL, target TEXT NOT NULL, next_at INTEGER NOT NULL, until INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS import_runs (run_id TEXT PRIMARY KEY, started_at INTEGER NOT NULL, committed_at INTEGER);
+      CREATE TABLE IF NOT EXISTS pi_export_targets (provider TEXT NOT NULL, target TEXT NOT NULL, slot_account_id TEXT NOT NULL, lineage_fp TEXT NOT NULL, recorded_at INTEGER NOT NULL, PRIMARY KEY (provider, target));
+      CREATE TABLE IF NOT EXISTS codex_live_observations (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, identity TEXT, lineage_fp TEXT, by TEXT NOT NULL);
+    `);
+    this.addColumnIfMissing('claude_slots', 'archived_at', 'INTEGER');
+    this.addColumnIfMissing('codex_slots', 'pending_adopt', 'INTEGER NOT NULL DEFAULT 0');
+    this.addColumnIfMissing('codex_slots', 'archived_at', 'INTEGER');
+    this.addColumnIfMissing('switch_log', 'injected', 'INTEGER NOT NULL DEFAULT 0');
+    this.addColumnIfMissing('switch_log', 'detail', 'TEXT');
+    this.addColumnIfMissing('switch_log', 'published_at', 'INTEGER');
+    this.addColumnIfMissing('switch_log', 'committed_at', 'INTEGER');
+    this.addColumnIfMissing('relogin_events', 'evidence', 'TEXT');
+    this.addColumnIfMissing('relogin_events', 'user_denied_at', 'INTEGER');
+    this.addColumnIfMissing('lineage_log', 'evidence', 'TEXT');
+    this.addColumnIfMissing('lifecycle', 'pre_fence_state', 'TEXT');
+    if (!lifecycleOneOpenIndexMatches(this.db)) {
+      this.db.exec('DROP INDEX IF EXISTS lifecycle_one_open');
+      this.db.exec(`${LIFECYCLE_ONE_OPEN_INDEX_SQL};`);
     }
-    if (version < 4) {
-      this.db.exec(`
-        CREATE TABLE IF NOT EXISTS policies (
-          harness TEXT,
-          virtual_model TEXT,
-          real_model TEXT,
-          effort TEXT,
-          fallback_json TEXT,
-          session_mode TEXT,
-          created_at INTEGER,
-          PRIMARY KEY (harness, virtual_model)
-        );
-      `);
-      this.db.exec('PRAGMA user_version = 4');
-    }
-    ensureDecisionColumnsOn(this.db);
+  }
+
+  private tableExists(table: string): boolean {
+    return Boolean(this.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table));
+  }
+
+  private addColumnIfMissing(table: string, column: string, definition: string): void {
+    if (this.tableExists(table) && !hasColumn(this.db, table, column)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
   }
 
   close(): void {
@@ -1160,6 +1388,64 @@ export class Store {
 
   setConfig(key: string, value: string): void {
     this.setConfigStmt.run(key, value);
+  }
+
+  /** Settings.py:128-170 bounds; out-of-range persisted strings clamp, not reject. */
+  getAutoswitchSettings(): AutoswitchSettings {
+    // settings.py:128-134: threshold and weeklyThreshold are 50..99.9.
+    const threshold = clampedConfigNumber(this.getConfig('autoswitch.threshold'), 90, 50, 99.9);
+    const weeklyRaw = this.getConfig('autoswitch.weeklyThreshold');
+    // settings.py:137-139: intervalSeconds is 15..3600 seconds.
+    const intervalSeconds = clampedConfigNumber(this.getConfig('autoswitch.intervalSeconds'), 60, 15, 3600);
+    // settings.py:141-143: cooldownSeconds is 0..86400 seconds.
+    const cooldownSeconds = clampedConfigNumber(this.getConfig('autoswitch.cooldownSeconds'), 300, 0, 86400);
+    // settings.py:145-147: hysteresisPct is 0..50.
+    const hysteresisPct = clampedConfigNumber(this.getConfig('autoswitch.hysteresisPct'), 10, 0, 50);
+    // settings.py:158-160: unhealthyTicks is an integer from 1..100.
+    const unhealthyTicks = clampedConfigNumber(this.getConfig('autoswitch.unhealthyTicks'), 3, 1, 100, true);
+    const strategyRaw = this.getConfig('autoswitch.strategy');
+    return {
+      threshold,
+      weeklyThreshold: weeklyRaw == null || weeklyRaw.trim() === '' ? null : clampedConfigNumber(weeklyRaw, threshold, 50, 99.9),
+      intervalSeconds,
+      cooldownSeconds,
+      hysteresisPct,
+      unhealthyTicks,
+      strategy: strategyRaw === 'consume-first' ? 'consume-first' : 'best',
+    };
+  }
+
+  recordSwitch(row: {
+    ts?: number; provider: string; fromAccount?: string | null; toAccount: string; trigger: string; outcome: string;
+    outgoingKind?: string | null; bindingJson?: string | null; stepsJson?: string | null; openSessionsJson?: string | null;
+    error?: string | null; injected?: boolean; detail?: string | null; publishedAt?: number | null; committedAt?: number | null;
+  }): number {
+    const result = this.db.prepare(`INSERT INTO switch_log (ts, provider, from_account, to_account, trigger, outcome, outgoing_kind, binding_json, steps_json, open_sessions_json, error, injected, detail, published_at, committed_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      row.ts ?? Date.now(), row.provider, row.fromAccount ?? null, row.toAccount, row.trigger, row.outcome,
+      row.outgoingKind ?? null, row.bindingJson ?? null, row.stepsJson ?? null, row.openSessionsJson ?? null,
+      row.error == null ? null : redactSecrets(row.error, []), row.injected ? 1 : 0,
+      row.detail == null ? null : redactSecrets(row.detail, []), row.publishedAt ?? null, row.committedAt ?? null,
+    );
+    return Number(result.lastInsertRowid);
+  }
+
+  recordLineage(row: {
+    ts?: number; provider: string; accountId: string; fromFp?: string | null; toFp: string; cause: string; by: string; evidence?: string | null;
+  }): number {
+    const result = this.db.prepare('INSERT INTO lineage_log (ts, provider, account_id, from_fp, to_fp, cause, by, evidence) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(
+      row.ts ?? Date.now(), row.provider, row.accountId, row.fromFp ?? null, row.toFp, row.cause, row.by,
+      row.evidence == null ? null : redactSecrets(row.evidence, []),
+    );
+    return Number(result.lastInsertRowid);
+  }
+
+  recordRelogin(row: { ts?: number; provider: string; accountId?: string | null; kind: string; detail?: string | null; evidence?: string | null; userDeniedAt?: number | null }): number {
+    const result = this.db.prepare('INSERT INTO relogin_events (ts, provider, account_id, kind, detail, evidence, user_denied_at) VALUES (?, ?, ?, ?, ?, ?, ?)').run(
+      row.ts ?? Date.now(), row.provider, row.accountId ?? null, row.kind,
+      row.detail == null ? null : redactSecrets(row.detail, []), row.evidence == null ? null : redactSecrets(row.evidence, []), row.userDeniedAt ?? null,
+    );
+    return Number(result.lastInsertRowid);
   }
 
   getPinOverride(session: string, now: number = Date.now()): OverrideRow | null {
