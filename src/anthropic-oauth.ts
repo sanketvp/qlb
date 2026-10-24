@@ -3,9 +3,12 @@
 
 import { createHash } from 'node:crypto';
 
+import { normalizeModelLabel } from './cswap-usage';
+
 export const ANTHROPIC_OAUTH_BETA_HEADER = 'oauth-2025-04-20';
 export const ANTHROPIC_OAUTH_TOKEN_URL = 'https://platform.claude.com/v1/oauth/token';
 export const ANTHROPIC_USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
+export const ANTHROPIC_OAUTH_PROFILE_URL = 'https://api.anthropic.com/api/oauth/profile';
 export const ANTHROPIC_OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
 export const OAUTH_EXPIRY_BUFFER_MS = 5 * 60 * 1000;
 export const FRESHEN_BUFFER_MS = 10 * 60 * 1000;
@@ -29,6 +32,12 @@ export interface HttpRequestDescription {
   body?: string;
 }
 
+export interface OAuthAccount {
+  uuid: string;
+  email: string | null;
+  organizationUuid: string | null;
+}
+
 export type RefreshClassification =
   | {
     kind: 'success';
@@ -36,6 +45,7 @@ export type RefreshClassification =
     refreshToken?: string;
     expiresInMs: number;
     scopes?: string[];
+    tokenAccount?: OAuthAccount;
   }
   | { kind: 'dead' }
   | { kind: 'invalid_client' }
@@ -101,7 +111,14 @@ export function accessTokenFingerprint(credentials: string): string | null {
 export function loginExpiresAtIso(credentials: string): string | null {
   const value = parseCredentialBlob(credentials)?.oauth?.refreshTokenExpiresAt;
   if (!isFiniteNumber(value) || value <= 0) return null;
-  return new Date(value).toISOString().replace(/\.\d{3}Z$/, 'Z');
+  const date = new Date(value);
+  // Python's datetime.fromtimestamp rejects years above 9999 rather than
+  // returning None. Keep that failure boundary instead of emitting JS's
+  // extended-year ISO form.
+  if (Number.isNaN(date.getTime()) || date.getUTCFullYear() > 9999) {
+    throw new RangeError('refreshTokenExpiresAt is outside the supported date range');
+  }
+  return date.toISOString().replace(/\.\d{3}Z$/, 'Z');
 }
 
 function isFiniteNumber(value: unknown): value is number {
@@ -138,7 +155,10 @@ export function needsFreshenBeforeSwitch(expiresAt: unknown, nowMs = Date.now())
 }
 
 /** Describe C-swap's refresh-token POST. This function deliberately performs no I/O. */
-export function buildRefreshRequest(credentials: string): HttpRequestDescription | null {
+export function buildRefreshRequest(
+  credentials: string,
+  timeoutMs = 10_000,
+): HttpRequestDescription | null {
   const refreshToken = parseCredentialBlob(credentials)?.oauth?.refreshToken;
   if (typeof refreshToken !== 'string' || !refreshToken) return null;
   return {
@@ -153,7 +173,7 @@ export function buildRefreshRequest(credentials: string): HttpRequestDescription
       refresh_token: refreshToken,
       client_id: ANTHROPIC_OAUTH_CLIENT_ID,
     }),
-    timeoutMs: 6_000,
+    timeoutMs,
   };
 }
 
@@ -177,7 +197,9 @@ export function classifyRefreshResponse(status: number | null | undefined, body:
         expiresInMs: parsed.expires_in * 1000,
       };
       if (parsed.refresh_token) result.refreshToken = parsed.refresh_token;
-      if (parsed.scope) result.scopes = parsed.scope.split(' ');
+      if (parsed.scope) result.scopes = parsed.scope.split(/\s+/).filter(Boolean);
+      const tokenAccount = parseTokenAccount(parsed);
+      if (tokenAccount) result.tokenAccount = tokenAccount;
       return result;
     } catch {
       return { kind: 'transient' };
@@ -196,6 +218,45 @@ export function classifyRefreshResponse(status: number | null | undefined, body:
   return { kind: 'transient' };
 }
 
+function parseAccount(
+  data: unknown,
+  emailField: 'email' | 'email_address',
+): OAuthAccount | null {
+  if (!isObject(data)) return null;
+  const account = data.account;
+  if (!isObject(account) || typeof account.uuid !== 'string' || !account.uuid.trim()) return null;
+  const organization = isObject(data.organization) ? data.organization : null;
+  return {
+    uuid: account.uuid.trim(),
+    email: typeof account[emailField] === 'string' ? account[emailField] : null,
+    organizationUuid: organization && typeof organization.uuid === 'string' ? organization.uuid : null,
+  };
+}
+
+/** Parse the optional account identity included in a successful token response. */
+export function parseTokenAccount(data: unknown): OAuthAccount | null {
+  return parseAccount(data, 'email_address');
+}
+
+/** Describe the profile GET. This function deliberately performs no I/O. */
+export function buildProfileRequest(accessToken: string): HttpRequestDescription {
+  return {
+    url: ANTHROPIC_OAUTH_PROFILE_URL,
+    method: 'GET',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'Content-Type': 'application/json',
+      'User-Agent': 'claude-swap/1.0',
+    },
+    timeoutMs: 5_000,
+  };
+}
+
+/** Parse a profile response, resolving only a non-empty account UUID. */
+export function parseProfileResponse(data: unknown): OAuthAccount | null {
+  return parseAccount(data, 'email');
+}
+
 /** Describe the OAuth usage GET. This function deliberately performs no I/O. */
 export function buildUsageRequest(accessToken: string): HttpRequestDescription {
   return {
@@ -210,12 +271,23 @@ export function buildUsageRequest(accessToken: string): HttpRequestDescription {
   };
 }
 
+function isPythonFalsy(value: unknown): boolean {
+  return value == null || value === false || value === 0 || value === ''
+    || (Array.isArray(value) && value.length === 0)
+    || (isObject(value) && Object.keys(value).length === 0);
+}
+
 function addUsageBucket(
   buckets: Record<string, UsageBucket>,
   key: string,
   value: unknown,
 ): void {
-  if (!isObject(value) || !isFiniteNumber(value.utilization)) return;
+  // build_usage_result only skips Python-falsy windows; a truthy malformed
+  // window raises, allowing its caller to record a bad-response outcome.
+  if (isPythonFalsy(value)) return;
+  if (!isObject(value) || !isFiniteNumber(value.utilization)) {
+    throw new TypeError(`${key} usage window lacks numeric utilization`);
+  }
   const bucket: UsageBucket = { usedPct: value.utilization };
   if (typeof value.resets_at === 'string' && value.resets_at) bucket.resetsAt = value.resets_at;
   buckets[key] = bucket;
@@ -224,10 +296,11 @@ function addUsageBucket(
 /**
  * Normalize C-swap's usage endpoint shape into QLB's 5h / 7d / 7d:<model> buckets.
  * Older responses simply omit `limits`; malformed individual entries are ignored.
+ * As upstream does, a non-object response or malformed present base window throws.
  */
 export function parseUsageResponse(data: unknown): ParsedUsageResponse {
+  if (!isObject(data)) throw new TypeError('usage response must be an object');
   const buckets: Record<string, UsageBucket> = {};
-  if (!isObject(data)) return { buckets };
 
   addUsageBucket(buckets, FIVE_HOUR_LABEL, data.five_hour);
   addUsageBucket(buckets, '7d', data.seven_day);
@@ -241,7 +314,9 @@ export function parseUsageResponse(data: unknown): ParsedUsageResponse {
       if (typeof name !== 'string' || !name) continue;
       const bucket: UsageBucket = { usedPct: limit.percent };
       if (typeof limit.resets_at === 'string' && limit.resets_at) bucket.resetsAt = limit.resets_at;
-      buckets[`7d:${name}`] = bucket;
+      const key = `7d:${normalizeModelLabel(name)}`;
+      const existing = buckets[key];
+      if (!existing || bucket.usedPct > existing.usedPct) buckets[key] = bucket;
     }
   }
   return { buckets };

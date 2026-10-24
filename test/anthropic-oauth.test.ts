@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { describe, it } from 'node:test';
 
 import {
@@ -11,6 +12,7 @@ import {
   FIVE_HOUR_LABEL,
   FRESHEN_BUFFER_MS,
   OAUTH_EXPIRY_BUFFER_MS,
+  buildProfileRequest,
   buildRefreshRequest,
   buildUsageRequest,
   classifyRefreshResponse,
@@ -20,11 +22,13 @@ import {
   isOAuthTokenExpired,
   needsFreshenBeforeSwitch,
   parseCredentialBlob,
+  parseProfileResponse,
+  parseTokenAccount,
   parseUsageResponse,
   serializeCredentialBlob,
 } from '../src/anthropic-oauth';
 
-const C_SWAP_SOURCE = '/private/tmp/claude-501/-Users-sanketpatel-GIT-Personal-sanketvp/3b005b8d-b97c-4bb5-a726-86eaa04c5eb9/scratchpad/cswap-upstream/repo/src';
+const C_SWAP_SOURCE = resolve(__dirname, '../../test/oracle/claude-swap-v0.28.0/src');
 const C_SWAP_OAUTH_PROGRAM = [
   'import importlib.util, sys, types',
   `source = ${JSON.stringify(C_SWAP_SOURCE)}`,
@@ -54,15 +58,12 @@ const FAKE_CREDENTIALS = JSON.stringify({
 });
 
 describe('Anthropic OAuth pure port', () => {
-  it('matches the C-swap v0.28 credential fingerprint from its isolated source', (t) => {
-    if (!existsSync(C_SWAP_SOURCE)) {
-      t.skip('C-swap v0.28 source clone is unavailable');
-      return;
-    }
+  it('matches the C-swap v0.28 credential fingerprint from the vendored oracle', () => {
+    assert.equal(existsSync(C_SWAP_SOURCE), true, `vendored oracle missing: ${C_SWAP_SOURCE}`);
     const expected = execFileSync(
       'python3',
-      ['-I', '-c', C_SWAP_OAUTH_PROGRAM],
-      { encoding: 'utf8', input: FAKE_CREDENTIALS },
+      ['-I', '-B', '-c', C_SWAP_OAUTH_PROGRAM],
+      { encoding: 'utf8', input: FAKE_CREDENTIALS, env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1' } },
     ).trim();
     assert.equal(credentialFingerprint(FAKE_CREDENTIALS), expected);
   });
@@ -91,6 +92,10 @@ describe('Anthropic OAuth pure port', () => {
       JSON.stringify({ other: {} }),
     ]) {
       assert.equal(loginExpiresAtIso(credentials), null);
+    }
+    // oauth.py raises ValueError, rather than returning None, for these dates.
+    for (const value of [3e14, 1e16]) {
+      assert.throws(() => loginExpiresAtIso(JSON.stringify({ claudeAiOauth: { refreshTokenExpiresAt: value } })));
     }
   });
 
@@ -121,15 +126,27 @@ describe('Anthropic OAuth pure port', () => {
 
   it('classifies only a 400, 401, or 403 JSON invalid_grant response as dead', () => {
     const success = classifyRefreshResponse(200, JSON.stringify({
-      access_token: 'fake-new-access', expires_in: 3600, refresh_token: 'fake-new-refresh', scope: 'a b',
+      access_token: 'fake-new-access', expires_in: 3600, refresh_token: 'fake-new-refresh', scope: 'a  b\tc ',
     }));
     assert.deepEqual(success, {
       kind: 'success',
       accessToken: 'fake-new-access',
       refreshToken: 'fake-new-refresh',
       expiresInMs: 3_600_000,
-      scopes: ['a', 'b'],
+      scopes: ['a', 'b', 'c'],
     });
+    // oauth.py accepts an empty token, non-positive durations, and a duration
+    // whose millisecond conversion overflows; only a missing key is transient.
+    assert.deepEqual(classifyRefreshResponse(200, '{"access_token":"","expires_in":0}'), {
+      kind: 'success', accessToken: '', expiresInMs: 0,
+    });
+    assert.deepEqual(classifyRefreshResponse(200, '{"access_token":"fake","expires_in":-1}'), {
+      kind: 'success', accessToken: 'fake', expiresInMs: -1_000,
+    });
+    const hugeExpiry = classifyRefreshResponse(200, '{"access_token":"fake","expires_in":1e308}');
+    assert.equal(hugeExpiry.kind, 'success');
+    if (hugeExpiry.kind === 'success') assert.equal(hugeExpiry.expiresInMs, Infinity);
+    assert.equal(classifyRefreshResponse(200, '{"access_token":"fake"}').kind, 'transient');
     for (const row of [
       { status: 400, body: '{"error":"invalid_grant"}', expected: 'dead' },
       { status: 401, body: '{"error":"invalid_grant"}', expected: 'dead' },
@@ -155,12 +172,13 @@ describe('Anthropic OAuth pure port', () => {
     if (!refresh) throw new Error('fake credential must produce a refresh request');
     assert.equal(refresh.url, ANTHROPIC_OAUTH_TOKEN_URL);
     assert.equal(refresh.method, 'POST');
-    assert.equal(refresh.timeoutMs, 6_000);
+    assert.equal(refresh.timeoutMs, 10_000);
     assert.deepEqual(refresh.headers, { 'Content-Type': 'application/json', 'User-Agent': 'claude-swap/1.0' });
     assert.deepEqual(JSON.parse(refresh.body ?? ''), {
       [GRANT_KEY]: 'refresh_token', refresh_token: 'fake-refresh-token', client_id: ANTHROPIC_OAUTH_CLIENT_ID,
     });
     assert.equal(buildRefreshRequest(JSON.stringify({ claudeAiOauth: {} })), null);
+    assert.equal(buildRefreshRequest(FAKE_CREDENTIALS, 6_000)?.timeoutMs, 6_000);
     assert.deepEqual(buildUsageRequest('fake-access-token'), {
       url: ANTHROPIC_USAGE_URL,
       method: 'GET',
@@ -173,13 +191,41 @@ describe('Anthropic OAuth pure port', () => {
     });
   });
 
+  it('describes and parses OAuth profile lookups without network I/O', () => {
+    assert.deepEqual(buildProfileRequest('fake-access-token'), {
+      url: 'https://api.anthropic.com/api/oauth/profile',
+      method: 'GET',
+      timeoutMs: 5_000,
+      headers: {
+        Authorization: 'Bearer fake-access-token',
+        'Content-Type': 'application/json',
+        'User-Agent': 'claude-swap/1.0',
+      },
+    });
+    assert.deepEqual(parseProfileResponse({
+      account: { uuid: ' account-uuid ', email: 'fake@example.test' },
+      organization: { uuid: 'org-uuid' },
+    }), { uuid: 'account-uuid', email: 'fake@example.test', organizationUuid: 'org-uuid' });
+    for (const response of [null, {}, { account: {} }, { account: { uuid: '  ' } }]) {
+      assert.equal(parseProfileResponse(response), null);
+    }
+    assert.deepEqual(parseProfileResponse({ account: { uuid: 'id', email: 1 }, organization: { uuid: 2 } }), {
+      uuid: 'id', email: null, organizationUuid: null,
+    });
+    assert.deepEqual(parseTokenAccount({
+      account: { uuid: 'id', email_address: 'token@example.test' },
+      organization: { uuid: 'org-id' },
+    }), { uuid: 'id', email: 'token@example.test', organizationUuid: 'org-id' });
+  });
+
   it('parses C-swap-shaped 5h, 7d, and per-model 7d usage buckets', () => {
     assert.equal(FIVE_HOUR_LABEL, '5h');
     const result = parseUsageResponse({
       five_hour: { utilization: 12.5, resets_at: '2099-01-01T00:00:00Z' },
       seven_day: { utilization: 34, resets_at: '2099-01-08T00:00:00Z' },
       limits: [
-        { percent: 56, resets_at: '2099-01-08T00:00:00Z', scope: { model: { display_name: 'Fable' } } },
+        { percent: 56, resets_at: '2099-01-08T00:00:00Z', scope: { model: { display_name: 'seven_day_fable' } } },
+        { percent: 70, scope: { model: { display_name: 'fable' } } },
         { percent: 'ignored', scope: { model: { display_name: 'Invalid' } } },
       ],
     });
@@ -187,8 +233,12 @@ describe('Anthropic OAuth pure port', () => {
       buckets: {
         '5h': { usedPct: 12.5, resetsAt: '2099-01-01T00:00:00Z' },
         '7d': { usedPct: 34, resetsAt: '2099-01-08T00:00:00Z' },
-        '7d:Fable': { usedPct: 56, resetsAt: '2099-01-08T00:00:00Z' },
+        '7d:Fable': { usedPct: 70 },
       },
     });
+    // build_usage_result raises for a non-dict response or a present window
+    // without utilization; neither is equivalent to a valid empty response.
+    assert.throws(() => parseUsageResponse([1]));
+    assert.throws(() => parseUsageResponse({ five_hour: { resets_at: 'later' } }));
   });
 });
