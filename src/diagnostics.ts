@@ -30,7 +30,7 @@ import type { AccountSnapshot, Adapter } from './types';
 import { hermesIntegrationChecks } from './hermes-integration';
 import { piIntegrationChecks } from './pi-integration';
 import { probeHostEnvironment, type HostCommandRunner } from './checks/hosts-env';
-import { discoverChecks } from './registry';
+import { discoverChecks, type CheckDefinition } from './registry';
 
 export type CheckLevel = 'PASS' | 'WARN' | 'FAIL';
 
@@ -79,8 +79,20 @@ export function listCheckNames(): string[] {
  * into an exception path. Dynamic prefix checks remain individual report rows;
  * registry mistakes stay visible through doctor:registry.
  */
-export function registeredDoctorChecks(checks: DoctorCheck[]): DoctorCheck[] {
-  const definitions = discoverChecks();
+export function registeredDoctorChecks(
+  checks: DoctorCheck[],
+  loadChecks: () => CheckDefinition[] = discoverChecks,
+): DoctorCheck[] {
+  let definitions: CheckDefinition[];
+  try {
+    definitions = loadChecks();
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    return [
+      ...checks,
+      { name: 'doctor:registry', level: 'FAIL', message: `registry load failed: ${reason}` },
+    ];
+  }
   const emitted = new Map<string, DoctorCheck[]>();
   const unregistered: DoctorCheck[] = [];
   const seen = new Set<string>();
@@ -392,7 +404,7 @@ export async function doctorQlb(
     checks.push({ name: 'sqlite', level: 'WARN', message: `database does not exist yet: ${config.dbPath}; run qlb status` });
   } else {
     let db: DatabaseSync | undefined;
-    let sqliteCheck: DoctorCheck;
+    let sqliteCheck: DoctorCheck | undefined;
     try {
       db = new DatabaseSync(config.dbPath, { readOnly: true });
       const integrity = db.prepare('PRAGMA integrity_check').get() as { integrity_check?: string } | undefined;
@@ -421,7 +433,16 @@ export async function doctorQlb(
         recoveryPending = marker != null;
       }
     } catch (err) {
-      sqliteCheck = { name: 'sqlite', level: 'FAIL', message: `database check failed: ${err instanceof Error ? err.message : String(err)}` };
+      const reason = err instanceof Error ? err.message : String(err);
+      if (sqliteCheck?.level === 'FAIL') {
+        sqliteCheck = {
+          ...sqliteCheck,
+          message: `${sqliteCheck.message}; database query failed: ${reason}`,
+          detail: { integrity: sqliteCheck.detail, queryError: reason },
+        };
+      } else {
+        sqliteCheck = { name: 'sqlite', level: 'FAIL', message: `database check failed: ${reason}` };
+      }
     } finally {
       try { db?.close(); } catch { /* already unusable */ }
     }

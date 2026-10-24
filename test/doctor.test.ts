@@ -7,6 +7,7 @@ import { describe, it } from 'node:test';
 
 import { defaultConfig } from '../src/config';
 import { doctorQlb, registeredDoctorChecks } from '../src/diagnostics';
+import { discoverChecks } from '../src/registry';
 import { validatedAdvisoryMessage } from '../src/migration-health';
 import { openStore } from '../src/store';
 
@@ -133,6 +134,53 @@ describe('qlb doctor', () => {
     assert.equal(sqlite.length, 1);
     assert.equal(sqlite[0]?.level, 'FAIL');
     assert.match(sqlite[0]?.message ?? '', /detail_json/);
+  });
+
+  it('keeps a failed integrity result when a later schema query fails', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-integrity-schema-'));
+    const config = defaultConfig(home);
+    mkdirSync(join(home, '.qlb'), { recursive: true });
+    new DatabaseSync(config.dbPath).close();
+    const sqlite = require('node:sqlite') as { DatabaseSync: typeof DatabaseSync };
+    const OriginalDatabaseSync = sqlite.DatabaseSync;
+    sqlite.DatabaseSync = class IntegrityFailingDatabase extends OriginalDatabaseSync {
+      override prepare(sql: string) {
+        if (sql === 'PRAGMA integrity_check') {
+          return { get: () => ({ integrity_check: 'fixture corruption' }) } as unknown as ReturnType<DatabaseSync['prepare']>;
+        }
+        if (sql.includes("sqlite_master WHERE type='table' AND name='migrations'")) {
+          return { get: () => ({ name: 'migrations' }) } as unknown as ReturnType<DatabaseSync['prepare']>;
+        }
+        if (sql === 'SELECT store, state, detail_json FROM migrations') {
+          throw new Error('fixture schema query failed');
+        }
+        return super.prepare(sql);
+      }
+    } as typeof DatabaseSync;
+    try {
+      const report = await doctorQlb(config, { command: () => 'ok', hostCommand: () => '' });
+      const sqliteCheck = report.checks.find((check) => check.name === 'sqlite');
+      assert.equal(sqliteCheck?.level, 'FAIL');
+      assert.equal(sqliteCheck?.message, 'PRAGMA integrity_check failed; database query failed: fixture schema query failed');
+      assert.deepEqual(sqliteCheck?.detail, {
+        integrity: { integrity_check: 'fixture corruption' },
+        queryError: 'fixture schema query failed',
+      });
+    } finally {
+      sqlite.DatabaseSync = OriginalDatabaseSync;
+    }
+  });
+
+  it('returns runtime checks and a registry FAIL when discovery cannot load', () => {
+    const runtime = [{ name: 'sqlite', level: 'PASS' as const, message: 'fixture runtime check' }];
+    const missing = join(mkdtempSync(join(tmpdir(), 'qlb-doctor-missing-checks-')), 'checks');
+    const report = registeredDoctorChecks(runtime, () => discoverChecks(missing));
+
+    assert.deepEqual(report.slice(0, -1), runtime);
+    const registry = report.at(-1);
+    assert.equal(registry?.name, 'doctor:registry');
+    assert.equal(registry?.level, 'FAIL');
+    assert.match(registry?.message ?? '', /ENOENT/);
   });
 
   it('returns a report with a registry WARN for unregistered and duplicate check names', () => {

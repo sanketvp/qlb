@@ -1,18 +1,52 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { readdirSync } from 'node:fs';
+import { mkdtempSync, readdirSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
+
+import { defaultConfig } from '../src/config';
+import { doctorQlb } from '../src/diagnostics';
+import { MockKeychain, qlbKeychainService } from '../src/keychain';
+import { discoverChecks } from '../src/registry';
+import { openStore } from '../src/store';
 
 const cliPath = join(__dirname, '..', 'src', 'cli.js');
 const commandsDir = join(__dirname, '..', '..', 'test', 'wiring', 'commands.d');
 const checksDir = join(__dirname, '..', '..', 'test', 'wiring', 'checks.d');
 
-function run(args: string[]): { status: number; stdout: string; stderr: string } {
+function isolatedEnv(home: string): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  for (const key of Object.keys(env)) {
+    if (key.startsWith('QLB_') || key.startsWith('HERMES_') || key.startsWith('PI_')) delete env[key];
+  }
+  return {
+    ...env,
+    HOME: home,
+    QLB_HOME: home,
+    HERMES_HOME: join(home, '.hermes'),
+    QLB_ANTHROPIC_POOL_PATH: join(home, 'missing-anthropic-pool.json'),
+    QLB_PI_AUTH_JSON_PATH: join(home, 'missing-pi-auth.json'),
+    QLB_CODEX_AUTH_JSON_PATH: join(home, 'missing-codex-auth.json'),
+    QLB_KIMI_CREDENTIALS_FILE: join(home, 'missing-kimi-credentials.md'),
+    QLB_OPENROUTER_KEYCHAIN_SERVICE: 'qlb-test-wiring-missing-openrouter',
+    QLB_DB_PATH: join(home, '.qlb', 'qlb.db'),
+    QLB_PLUGINS_DIR: join(home, '.qlb', 'plugins'),
+    QLB_PROXY_INFO_PATH: join(home, '.qlb', 'proxy.json'),
+    QLB_CLAUDE_CODE_CREDENTIALS_PATH: join(home, '.claude', 'missing-credentials'),
+    QLB_CSWAP_SEQUENCE_PATH: join(home, '.claude-swap-backup', 'missing-sequence.json'),
+    QLB_CSWAP_USAGE_PATH: join(home, '.claude-swap-backup', 'cache', 'missing-usage.json'),
+    QLB_CONFIG_PATH: join(home, '.qlb', 'config.json'),
+    QLB_HERMES_PLUGIN_STATUS: join(home, '.qlb', 'hermes-plugin.json'),
+    QLB_PI_PACKAGE_ROOT: join(home, 'missing-pi-package'),
+  };
+}
+
+function run(args: string[], env = isolatedEnv(mkdtempSync(join(tmpdir(), 'qlb-wiring-home-')))): { status: number; stdout: string; stderr: string } {
   try {
     return {
       status: 0,
-      stdout: execFileSync(process.execPath, [cliPath, ...args], { encoding: 'utf8' }),
+      stdout: execFileSync(process.execPath, [cliPath, ...args], { encoding: 'utf8', env }),
       stderr: '',
     };
   } catch (error) {
@@ -43,11 +77,51 @@ describe('command and diagnostic wiring', () => {
   });
 
   it('runs exactly the registered diagnostics', () => {
-    const listed = run(['doctor', '--list-checks', '--json']);
-    const report = run(['doctor', '--json']);
+    const home = mkdtempSync(join(tmpdir(), 'qlb-wiring-home-'));
+    const env = isolatedEnv(home);
+    const listed = run(['doctor', '--list-checks', '--json'], env);
+    const report = run(['doctor', '--json'], env);
     assert.ok(report.status === 0 || report.status === 1, report.stderr);
+    const registered = discoverChecks();
     const checks = (JSON.parse(report.stdout) as { checks: Array<{ name: string }> }).checks;
-    assert.deepEqual(checks.map((check) => check.name), JSON.parse(listed.stdout));
+    const emitted = checks.map(({ name }) => {
+      const definition = registered.find((check) =>
+        check.name === name || (check.prefix != null && name.startsWith(`${check.prefix}:`)),
+      );
+      assert.ok(definition, `unregistered diagnostic emitted: ${name}`);
+      return definition.name;
+    });
+    assert.deepEqual(emitted, JSON.parse(listed.stdout));
+  });
+
+  it('keeps a QLB-owned account mapped to the native-sync prefix diagnostic', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-wiring-owned-home-'));
+    const config = defaultConfig(home);
+    const store = openStore(config.dbPath);
+    store.upsertAccount('xai-default', 'xai', 'fixture xAI account');
+    store.upsertMigration('pi-xai', 'QLB_OWNED');
+    store.close();
+    const keychain = new MockKeychain();
+    keychain.setSync(
+      qlbKeychainService('xai', 'xai-default'),
+      'fixture xAI account',
+      JSON.stringify({ access: 'fixture-access', refresh: 'fixture-refresh', expires: 0, generation: 0 }),
+    );
+
+    const report = await doctorQlb(config, {
+      command: () => '',
+      hostCommand: () => '',
+      keychain,
+      readNativeCredential: async () => ({
+        access: 'fixture-access', refresh: 'fixture-refresh', expires: 0, generation: 0,
+      }),
+    });
+    const nativeSync = report.checks.find((check) => check.name === 'native-sync:xai-default');
+    assert.equal(nativeSync?.level, 'PASS');
+    const definition = discoverChecks().find((check) =>
+      check.prefix != null && nativeSync?.name.startsWith(`${check.prefix}:`),
+    );
+    assert.equal(definition?.name, 'native-sync');
   });
 
   it('dispatches multi-word commands by their longest prefix', () => {
