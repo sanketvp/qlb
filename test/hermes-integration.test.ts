@@ -35,6 +35,7 @@ describe('hermes integration checks', () => {
     launchdLabel = 'com.sanket.qlb-proxy',
     watchLabel = 'com.sanket.qlb-hermes-watch',
     qlbBinName = 'no-such-qlb',
+    probeSeams = false,
   ): DoctorCheck[] {
     const home = join(tmp, name);
     const hermesHome = join(home, '.hermes');
@@ -42,7 +43,7 @@ describe('hermes integration checks', () => {
     build(home, hermesHome);
     const out = execFileSync(
       process.execPath,
-      ['-e', `process.stdout.write(JSON.stringify(require(${JSON.stringify(MODULE)}).hermesIntegrationChecks()))`],
+      ['-e', `process.stdout.write(JSON.stringify(require(${JSON.stringify(MODULE)}).hermesIntegrationChecks({ probeSeams: ${probeSeams} })))`],
       {
         encoding: 'utf8',
         env: {
@@ -65,6 +66,21 @@ describe('hermes integration checks', () => {
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, '__init__.py'), '');
   }
+
+  it('uses the registered hermes:seam fallback when a live seam probe throws', { skip: process.platform === 'win32' }, () => {
+    const checks = checksFor('seam-probe-throws', (_home, hermesHome) => {
+      writeFileSync(join(hermesHome, 'config.yaml'), QLB_PROVIDERS);
+      installPlugin(hermesHome);
+      const python = join(hermesHome, 'hermes-agent', 'venv', 'bin', 'python');
+      mkdirSync(join(hermesHome, 'hermes-agent', 'venv', 'bin'), { recursive: true });
+      writeFileSync(python, '#!/bin/sh\nexit 1\n');
+      chmodSync(python, 0o755);
+    }, undefined, undefined, 'no-such-qlb', true);
+    const seam = checks.find((check) => check.name === 'hermes:seam');
+    assert.equal(seam?.level, 'WARN');
+    assert.match(seam?.message ?? '', /seam probe failed/);
+    assert.equal(checks.some((check) => check.name === 'hermes:seam:anthropicMessagesApi'), false);
+  });
 
   it('reports one WARN, not a failure, when Hermes exists but QLB was never set up for it', () => {
     const checks = checksFor('absent', (_home, hermesHome) => {

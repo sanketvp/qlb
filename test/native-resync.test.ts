@@ -472,8 +472,9 @@ describe('openai-codex JWT credential parsing', () => {
     assert.ok(check, JSON.stringify(report.checks));
     assert.notEqual(check.level, 'WARN');
     assert.equal(check.level, 'PASS');
-    assert.equal((check.detail as { matches?: boolean } | undefined)?.matches, true);
-    assert.doesNotMatch(check.message, /unreadable/);
+    const detail = check.detail as { provider: string; matches?: boolean };
+    assert.equal(detail.matches, true);
+    assert.doesNotMatch(JSON.stringify(check), /unreadable/);
   });
 });
 

@@ -7,12 +7,13 @@ import {
   type CodexGateHttpResponse,
   type G0Capture,
 } from '../src/codex-gate';
+import { parseArgs, prepareCommandArgv } from '../src/cli';
 import { openStore } from '../src/store';
 
 /**
  * Automated tests mock the HTTP call layer and never fire real requests to
  * Anthropic / OpenAI / ChatGPT / Codex backends. The REAL gate must be run
- * manually via `qlb gate codex` when actually needed (it consumes a handful
+ * manually via `qlb codex gate` when actually needed (it consumes a handful
  * of Codex quota by design).
  */
 
@@ -57,6 +58,25 @@ function deps(overrides: Partial<CodexGateDeps> = {}): CodexGateDeps {
     ...overrides,
   };
 }
+
+describe('codex gate CLI parsing', () => {
+  it('routes codex gate with and without --json to the Codex gate', () => {
+    const parse = (args: string[]) => parseArgs(prepareCommandArgv(['node', 'qlb', ...args]));
+
+    assert.deepEqual(parse(['codex', 'gate', '--json']), {
+      cmd: 'gate',
+      target: 'codex',
+      json: true,
+      db: undefined,
+    });
+    assert.deepEqual(parse(['codex', 'gate']), {
+      cmd: 'gate',
+      target: 'codex',
+      json: false,
+      db: undefined,
+    });
+  });
+});
 
 describe('codex gate state machine — §4.9.2a (mocked HTTP)', () => {
   it('records GO when G1 is 3/3 successful and persists to config', async () => {

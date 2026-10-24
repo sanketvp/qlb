@@ -21,6 +21,7 @@ QLB ships with five built-in provider adapters (Claude/Anthropic, Codex, Grok/xA
 ```bash
 npm install
 npm run build
+# Build clears dist/commands and dist/checks first, so stale registry modules are never discovered.
 node dist/cli.js init
 node dist/cli.js status
 ```
