@@ -42,6 +42,14 @@ describe('command and diagnostic wiring', () => {
     assert.deepEqual(JSON.parse(result.stdout), entries(checksDir));
   });
 
+  it('runs exactly the registered diagnostics', () => {
+    const listed = run(['doctor', '--list-checks', '--json']);
+    const report = run(['doctor', '--json']);
+    assert.ok(report.status === 0 || report.status === 1, report.stderr);
+    const checks = (JSON.parse(report.stdout) as { checks: Array<{ name: string }> }).checks;
+    assert.deepEqual(checks.map((check) => check.name), JSON.parse(listed.stdout));
+  });
+
   it('dispatches multi-word commands by their longest prefix', () => {
     const result = run(['codex', 'gate', '--help']);
     assert.equal(result.status, 0, result.stderr);

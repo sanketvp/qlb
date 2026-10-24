@@ -468,12 +468,13 @@ describe('openai-codex JWT credential parsing', () => {
       keychain: kc,
       readNativeCredential: async () => parseResyncCredential(cred),
     });
-    const check = report.checks.find((c) => c.name === `native-sync:${accountId}`);
+    const check = report.checks.find((c) => c.name === 'native-sync');
     assert.ok(check, JSON.stringify(report.checks));
     assert.notEqual(check.level, 'WARN');
     assert.equal(check.level, 'PASS');
-    assert.equal((check.detail as { matches?: boolean } | undefined)?.matches, true);
-    assert.doesNotMatch(check.message, /unreadable/);
+    const detail = check.detail as Array<{ accountId: string; matches?: boolean }>;
+    assert.equal(detail.find((row) => row.accountId === accountId)?.matches, true);
+    assert.doesNotMatch(JSON.stringify(check), /unreadable/);
   });
 });
 
@@ -498,10 +499,11 @@ describe('qlb doctor native-sync checks', () => {
       keychain: kc,
       readNativeCredential: async () => grant('native-copy'),
     });
-    const check = report.checks.find((c) => c.name === 'native-sync:xai-default');
+    const check = report.checks.find((c) => c.name === 'native-sync');
     assert.ok(check);
     assert.equal(check.level, 'WARN');
-    assert.match(check.message, /DIFFERS from native/);
+    const detail = check.detail as Array<{ accountId: string; message: string }>;
+    assert.match(detail.find((row) => row.accountId === 'xai-default')?.message ?? '', /DIFFERS from native/);
     const still = parseResyncCredential(
       kc.getSync(qlbKeychainService('xai', 'xai-default'), 'Grok (xAI)'),
     );

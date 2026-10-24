@@ -1,5 +1,7 @@
 import { join } from 'node:path';
 
+import { loadProviderStub } from './provider-loader';
+
 export function loadTokenResolver(provider: string): unknown {
-  return require(join(__dirname, 'token', provider));
+  return loadProviderStub(provider, join(__dirname, 'token'));
 }

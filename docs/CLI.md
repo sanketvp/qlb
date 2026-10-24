@@ -65,7 +65,7 @@ $ qlb doctor
 Overall: WARN
 ```
 
-Flags: `[--json] [--live]`. Exit `1` when overall is `FAIL`.
+Flags: `[--json] [--live]`. Exit `1` when overall is `FAIL`. `qlb doctor --list-checks --json` lists the exact registered check names emitted by `qlb doctor --json`; checks not applicable on this host report as passing skips.
 
 Beyond the core and per-provider lines, doctor adds integration checks when the thing they inspect is present. QLB reads the Hermes config with the `yaml` package and never writes it:
 
@@ -84,7 +84,7 @@ Beyond the core and per-provider lines, doctor adds integration checks when the 
 | `hermes:models`, `hermes:version` | same | The Hermes `/model` picker lists what QLB policies serve; the Hermes version marker. |
 | `hermes:seam:<name>` | same, `--live` only | The Hermes symbols the plugin patches still exist with the expected signature. |
 
-For QLB-owned accounts, doctor also runs a native-credential drift check (one `[PASS]`/`[WARN]` line per owned account, name `native-sync:<accountId>`) — see [CREDENTIAL-SAFETY.md](CREDENTIAL-SAFETY.md#native-credential-drift-the-shadow-retain-tradeoff).
+For QLB-owned accounts, doctor also runs the `native-sync` credential-drift check, with per-account results in its detail — see [CREDENTIAL-SAFETY.md](CREDENTIAL-SAFETY.md#native-credential-drift-the-shadow-retain-tradeoff).
 
 ## `qlb refresh`
 

@@ -18,7 +18,7 @@
     "qlb": "./dist/cli.js"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "node scripts/clean-registry-output.cjs && tsc",
     "start": "node dist/cli.js",
     "dev": "ts-node src/cli.ts",
     "test": "tsc -p tsconfig.test.json && node --test dist-test/test/*.test.js",

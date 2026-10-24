@@ -1,5 +1,5 @@
 import { readdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { extname, join } from 'node:path';
 
 export interface CommandDefinition {
   name: string;
@@ -10,16 +10,34 @@ export interface CheckDefinition {
   name: string;
 }
 
+/** Provider identifiers accepted by the legacy provider-module loaders. */
+export const KNOWN_PROVIDER_NAMES = [
+  'anthropic',
+  'xai',
+  'openai-codex',
+  'kimi-coding',
+  'openrouter',
+] as const;
+
+type ModuleLoader = (id: string) => unknown;
+
 function isNamed(value: unknown): value is { name: string } {
   return !!value && typeof value === 'object' && typeof (value as { name?: unknown }).name === 'string';
 }
 
-function loadDefinitions<T extends { name: string }>(directory: string): T[] {
+function runtimeExtensions(): string[] {
+  // ts-node preserves this module's .ts filename; compiled CLIs load .js only.
+  return [__filename.endsWith('.ts') ? '.ts' : '.js'];
+}
+
+function loadDefinitions<T extends { name: string }>(
+  directory: string,
+  extensions = runtimeExtensions(),
+  loadModule: ModuleLoader = module.require.bind(module),
+): T[] {
   return readdirSync(directory, { withFileTypes: true })
-    .filter((entry) => entry.isFile() && /\.js$/.test(entry.name) && !entry.name.startsWith('_'))
+    .filter((entry) => entry.isFile() && extensions.includes(extname(entry.name)) && !entry.name.startsWith('_'))
     .map((entry) => {
-      // Node resolves discovered CommonJS files; binding preserves the caller module's resolution.
-      const loadModule: (id: string) => unknown = module.require.bind(module);
       const loaded = loadModule(join(directory, entry.name)) as { default?: unknown };
       if (!isNamed(loaded.default)) {
         throw new Error(`registry entry ${entry.name} must default-export a named definition`);
@@ -29,12 +47,20 @@ function loadDefinitions<T extends { name: string }>(directory: string): T[] {
     .sort((a, b) => a.name.localeCompare(b.name));
 }
 
-export function discoverCommands(directory = join(__dirname, 'commands')): CommandDefinition[] {
-  return loadDefinitions<CommandDefinition>(directory);
+export function discoverCommands(
+  directory = join(__dirname, 'commands'),
+  extensions?: string[],
+  loadModule?: ModuleLoader,
+): CommandDefinition[] {
+  return loadDefinitions<CommandDefinition>(directory, extensions, loadModule);
 }
 
-export function discoverChecks(directory = join(__dirname, 'checks')): CheckDefinition[] {
-  return loadDefinitions<CheckDefinition>(directory);
+export function discoverChecks(
+  directory = join(__dirname, 'checks'),
+  extensions?: string[],
+  loadModule?: ModuleLoader,
+): CheckDefinition[] {
+  return loadDefinitions<CheckDefinition>(directory, extensions, loadModule);
 }
 
 export function resolveCommand(argv: string[], commands = discoverCommands()): {

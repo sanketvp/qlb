@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { basename, dirname, isAbsolute } from 'node:path';
+import { dirname } from 'node:path';
 import { consumeMarkerPathFor, CSWAP_ANTHROPIC_STORE } from './cswap-consume';
 import { DatabaseSync } from 'node:sqlite';
 
@@ -29,6 +29,7 @@ import {
 import type { AccountSnapshot, Adapter } from './types';
 import { hermesIntegrationChecks } from './hermes-integration';
 import { piIntegrationChecks } from './pi-integration';
+import { probeHostEnvironment, type HostCommandRunner } from './checks/hosts-env';
 import { discoverChecks } from './registry';
 
 export type CheckLevel = 'PASS' | 'WARN' | 'FAIL';
@@ -67,15 +68,27 @@ export interface DoctorReport {
 }
 
 type CommandRunner = (command: string, args: string[]) => string;
-type HostCommandRunner = (
-  command: string,
-  args: string[],
-  options?: { env: NodeJS.ProcessEnv },
-) => string;
 
 /** The diagnostic registry is separate from the runtime report so checks can be added independently. */
 export function listCheckNames(): string[] {
   return discoverChecks().map((check) => check.name);
+}
+
+/** The registry is the doctor contract: emit each registered check once, in registry order. */
+function registeredDoctorChecks(checks: DoctorCheck[]): DoctorCheck[] {
+  const names = listCheckNames();
+  const registered = new Set(names);
+  const byName = new Map<string, DoctorCheck>();
+  for (const check of checks) {
+    if (!registered.has(check.name)) throw new Error(`doctor emitted unregistered check: ${check.name}`);
+    if (byName.has(check.name)) throw new Error(`doctor emitted duplicate check: ${check.name}`);
+    byName.set(check.name, check);
+  }
+  return names.map((name) => byName.get(name) ?? {
+    name,
+    level: 'PASS',
+    message: 'not applicable on this host',
+  });
 }
 
 const runCommand: CommandRunner = (command, args) =>
@@ -89,15 +102,6 @@ const runHostCommand: HostCommandRunner = (command, args, options) =>
     timeout: 5_000,
     env: options?.env,
   });
-
-const HOST_ENVIRONMENT_VARIABLES = [
-  'CODEX_HOME',
-  'CLAUDE_CONFIG_DIR',
-  'ANTHROPIC_API_KEY',
-  'ANTHROPIC_AUTH_TOKEN',
-  'OPENAI_API_KEY',
-  'ANTHROPIC_BASE_URL',
-] as const;
 
 function readJson(path: string): Record<string, unknown> | null {
   try {
@@ -284,98 +288,6 @@ function combineOverall(checks: Array<{ level: CheckLevel }>): CheckLevel {
   return 'PASS';
 }
 
-function probeHostTool(command: CommandRunner, name: 'herdr' | 'orca'): string {
-  try {
-    const version = command(name, ['--version']).trim();
-    return version || 'installed (version unavailable)';
-  } catch (err) {
-    return (err as NodeJS.ErrnoException).code === 'ENOENT'
-      ? 'not installed'
-      : 'installed (version probe failed)';
-  }
-}
-
-function minimalLoginShellEnvironment(): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { PATH: '/usr/bin:/bin:/usr/sbin:/sbin' };
-  for (const name of ['HOME', 'USER', 'LOGNAME', 'SHELL', 'TERM', 'TMPDIR'] as const) {
-    if (process.env[name] !== undefined) env[name] = process.env[name];
-  }
-  return env;
-}
-
-function selectLoginShell(
-  shell: string | undefined,
-  shellExists: (path: string) => boolean,
-): { path: string | null; unsupportedShell: string | null } {
-  if (!shell) {
-    return { path: shellExists('/bin/zsh') ? '/bin/zsh' : null, unsupportedShell: null };
-  }
-  if (!isAbsolute(shell)) return { path: null, unsupportedShell: null };
-  if (!['zsh', 'bash', 'sh'].includes(basename(shell))) {
-    return { path: null, unsupportedShell: basename(shell) };
-  }
-  return { path: shellExists(shell) ? shell : null, unsupportedShell: null };
-}
-
-/**
- * Detect host-level overrides without retaining, displaying, or serializing values.
- * Orca and Herdr inherit this login-shell environment when launching their tools.
- */
-function probeHostEnvironment(
-  command: HostCommandRunner,
-  options: {
-    platform: NodeJS.Platform;
-    shell: string | undefined;
-    shellExists: (path: string) => boolean;
-  },
-): DoctorCheck {
-  const detail = {
-    herdr: probeHostTool(command, 'herdr'),
-    orca: probeHostTool(command, 'orca'),
-  };
-  const shell = options.platform === 'win32'
-    ? { path: null, unsupportedShell: null }
-    : selectLoginShell(options.shell, options.shellExists);
-  if (!shell.path) {
-    return {
-      name: 'hosts:env',
-      level: 'PASS',
-      message: shell.unsupportedShell
-        ? `hosts:env skipped: unsupported login shell ${shell.unsupportedShell}`
-        : 'hosts:env skipped: no POSIX login shell',
-      detail,
-    };
-  }
-  try {
-    // -i retains the interactive rc-chain used by host-launched tools.
-    const environment = command(shell.path, ['-lic', 'env'], { env: minimalLoginShellEnvironment() });
-    const setVariables = HOST_ENVIRONMENT_VARIABLES.filter((name) =>
-      environment.split(/\r?\n/).some((line) => line.startsWith(`${name}=`)),
-    );
-    if (setVariables.length > 0) {
-      return {
-        name: 'hosts:env',
-        level: 'WARN',
-        message: `login shell sets ${setVariables.join(', ')}; Orca/Herdr-launched tools may bypass QLB-managed logins`,
-        detail,
-      };
-    }
-    return {
-      name: 'hosts:env',
-      level: 'PASS',
-      message: 'no QLB-bypassing variables are set in the login shell environment',
-      detail,
-    };
-  } catch {
-    return {
-      name: 'hosts:env',
-      level: 'WARN',
-      message: 'could not read login shell environment',
-      detail,
-    };
-  }
-}
-
 function probeCredentialStore(command?: CommandRunner): DoctorCheck {
   // Tests inject a command runner and still speak the macOS `security` CLI.
   if (command) {
@@ -539,12 +451,18 @@ export async function doctorQlb(
       readOwnedCredential: async (provider, accountId, label) =>
         readOwnedCredentialFromKeychain(keychain, provider, accountId, label),
     });
-    for (const row of drift) {
+    if (drift.length > 0) {
       checks.push({
-        name: `native-sync:${row.accountId}`,
-        level: row.level,
-        message: row.message,
-        detail: { provider: row.provider, matches: row.matches },
+        name: 'native-sync',
+        level: combineOverall(drift),
+        message: `${drift.length} QLB-owned credential${drift.length === 1 ? '' : 's'} checked`,
+        detail: drift.map((row) => ({
+          accountId: row.accountId,
+          provider: row.provider,
+          level: row.level,
+          message: row.message,
+          matches: row.matches,
+        })),
       });
     }
   }
@@ -599,10 +517,11 @@ export async function doctorQlb(
     }));
   }
 
+  const registeredChecks = registeredDoctorChecks(checks);
   return {
     command: 'doctor',
-    overall: combineOverall([...checks, ...providers]),
-    checks,
+    overall: combineOverall([...registeredChecks, ...providers]),
+    checks: registeredChecks,
     providers,
   };
 }
