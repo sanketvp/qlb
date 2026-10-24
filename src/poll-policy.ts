@@ -1,4 +1,9 @@
-// Ported from claude-swap 0.28.0 (MIT, Copyright (c) realiti4) — poll_policy.py lines 73–284; lines.py lines 39–45; usage_store.py lines 439–491.
+/*
+ * Ported from claude-swap v0.28.0.
+ * Upstream file(s): src/claude_swap/poll_policy.py, src/claude_swap/usage_store.py.
+ * License: MIT.
+ * Modified for QLB. See NOTICE.
+ */
 
 /** Freshness floor shared by every collector. */
 export const SERVE_TTL_S = 180.0;

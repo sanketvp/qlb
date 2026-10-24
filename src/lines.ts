@@ -1,4 +1,9 @@
-// Ported from claude-swap 0.28.0 (MIT, Copyright (c) realiti4) — lines.py
+/*
+ * Ported from claude-swap v0.28.0.
+ * Upstream file(s): src/claude_swap/lines.py.
+ * License: MIT.
+ * Modified for QLB. See NOTICE.
+ */
 
 /** One relevant usage window: label, used percentage, and optional reset time. */
 export type UsageWindow = readonly [label: string, pct: number, resetsAt: string | null | undefined];

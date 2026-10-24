@@ -1,3 +1,10 @@
+/*
+ * Ported from claude-swap v0.28.0.
+ * Upstream file(s): src/claude_swap/macos_keychain.py.
+ * License: MIT.
+ * Modified for QLB. See NOTICE.
+ */
+
 // Platform-dispatching credential store for QLB (§4.8.1).
 //
 // SAFETY: this module never hardcodes real credential file paths and refuses

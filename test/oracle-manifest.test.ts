@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, relative, sep } from 'node:path';
 import { describe, it } from 'node:test';
@@ -89,6 +90,14 @@ describe('claude-swap v0.28.0 oracle provenance', () => {
       assert.match(blobId, /^[a-f0-9]{40}$/);
     }
     assert.equal(manifest.upstream_tree.length, Object.keys(manifest.files).length);
+  });
+
+  it('carries attribution headers on every mapped port', () => {
+    const result = spawnSync(process.execPath, [join(ROOT, 'scripts', 'check-ported-headers.mjs')], {
+      encoding: 'utf8',
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /^0 missing\n$/);
   });
 
   it('contains parseable JSON goldens only', () => {

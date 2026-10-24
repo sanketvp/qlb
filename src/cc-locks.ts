@@ -1,5 +1,9 @@
-// Ported from claude-swap 0.28.0 (MIT, Copyright (c) realiti4) — claude_locks.py (lines 46–70, 75–228).
-// See third_party/claude-swap/LICENSE for the upstream license.
+/*
+ * Ported from claude-swap v0.28.0.
+ * Upstream file(s): src/claude_swap/claude_locks.py.
+ * License: MIT.
+ * Modified for QLB. See NOTICE.
+ */
 
 import { existsSync, statSync } from 'node:fs';
 import { mkdir, rmdir, stat, utimes } from 'node:fs/promises';

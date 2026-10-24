@@ -1,4 +1,9 @@
-// Ported from claude-swap 0.28.0 (MIT, Copyright (c) realiti4) — fsutil.py
+/*
+ * Ported from claude-swap v0.28.0.
+ * Upstream file(s): src/claude_swap/fsutil.py.
+ * License: MIT.
+ * Modified for QLB. See NOTICE.
+ */
 
 import { randomBytes } from 'node:crypto';
 import {

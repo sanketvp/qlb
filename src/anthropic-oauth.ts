@@ -1,5 +1,9 @@
-// Ported from claude-swap 0.28.0 (MIT, Copyright (c) realiti4) — oauth.py
-// See third_party/claude-swap/LICENSE for the upstream license.
+/*
+ * Ported from claude-swap v0.28.0.
+ * Upstream file(s): src/claude_swap/oauth.py.
+ * License: MIT.
+ * Modified for QLB. See NOTICE.
+ */
 
 import { createHash } from 'node:crypto';
 
