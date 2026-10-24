@@ -7,10 +7,13 @@ import { externalLoginCheck, LineageLog, type ExternalLoginInput } from '../src/
 import { openStore } from '../src/store';
 
 describe('external-login evidence (AC18 fixture part)', () => {
-  it('records hard Claude evidence only for an unrelated oracle-owned lineage with a moved login expiry', () => {
+  it('records hard Claude evidence only for an unrelated oracle-owned lineage with verified L41 and a moved login expiry', () => {
+    assert.equal(externalLoginCheck({
+      provider: 'anthropic', successor: false, oracleOwnAccount: true, l41Verified: true, loginExpiryMoved: true,
+    }), 'hard');
     assert.equal(externalLoginCheck({
       provider: 'anthropic', successor: false, oracleOwnAccount: true, loginExpiryMoved: true,
-    }), 'hard');
+    }), 'soft');
     assert.equal(externalLoginCheck({
       provider: 'anthropic', successor: false, loginExpiryMoved: true,
     }), 'soft');
@@ -19,19 +22,29 @@ describe('external-login evidence (AC18 fixture part)', () => {
     }), 'none');
   });
 
-  it('does not count a normal Claude Code rotation with an injected holder observation or a QLB POST', () => {
+  it('attributes transitions to an injected live holder or a QLB POST', () => {
     assert.equal(externalLoginCheck({
       provider: 'anthropic',
       successor: false,
       holderObservation: { aliveBefore: true, aliveAfter: false },
     }), 'none');
     assert.equal(externalLoginCheck({
-      provider: 'anthropic', successor: false, oracleOwnAccount: true,
+      provider: 'anthropic',
+      successor: false,
+      oracleOwnAccount: true,
+      l41Verified: true,
+      loginExpiryMoved: true,
+      holderObservation: { aliveBefore: false, aliveAfter: true },
     }), 'none');
     assert.equal(externalLoginCheck({ provider: 'anthropic', successor: false, qlbPost: true }), 'none');
   });
 
   it('returns soft only for an unattributed, holder-free, non-QLB rotation', () => {
+    assert.equal(externalLoginCheck({
+      provider: 'anthropic',
+      successor: false,
+      oracleOwnAccount: true,
+    }), 'soft');
     assert.equal(externalLoginCheck({
       provider: 'anthropic',
       successor: false,
@@ -67,7 +80,9 @@ describe('external-login evidence (AC18 fixture part)', () => {
         observedFingerprint: 'C',
       });
 
-      assert.equal(check({ provider: 'anthropic', oracleOwnAccount: true, loginExpiryMoved: true }), 'hard');
+      assert.equal(check({
+        provider: 'anthropic', oracleOwnAccount: true, l41Verified: true, loginExpiryMoved: true,
+      }), 'hard');
       assert.equal(check({
         provider: 'anthropic', holderObservation: { aliveBefore: true, aliveAfter: false },
       }), 'none');

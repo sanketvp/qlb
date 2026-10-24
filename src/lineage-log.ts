@@ -43,6 +43,8 @@ export interface ExternalLoginInput {
   qlbPost?: boolean;
   /** Oracle established that the observed Claude credential is the managed account. */
   oracleOwnAccount?: boolean;
+  /** L41 login-expiry evidence is only usable when the caller has verified it; default false/undefined means no hard Claude evidence. */
+  l41Verified?: boolean;
   /** Injected process-holder facts from the observations surrounding the change. */
   holderObservation?: HolderObservation;
   loginExpiryMoved?: boolean;
@@ -56,17 +58,21 @@ export interface ExternalLoginInput {
 export function externalLoginCheck(input: ExternalLoginInput): ExternalLoginClassification {
   if (input.successor || input.qlbPost) return 'none';
 
-  // L41 is hard only when the oracle says this is our Claude account and its
-  // login expiry advanced. claude-swap has no external-login rule; its
-  // oauth.py:73-92 defines the login-expiry field that A3d verifies.
-  if (input.provider === 'anthropic' && input.oracleOwnAccount && input.loginExpiryMoved) return 'hard';
-  if (input.provider === 'openai-codex' && input.authTimeChanged) return 'hard';
-
   // S65: a holder at either surrounding observation attributes the transition.
-  // In its absence, an oracle-owned Claude rotation is also attributable.
   const holderAlive = input.holderObservation?.aliveBefore === true
     || input.holderObservation?.aliveAfter === true;
-  if (input.oracleOwnAccount || holderAlive) return 'none';
+  if (holderAlive) return 'none';
+
+  // L41 is hard only when the oracle says this is our Claude account, the
+  // caller verified L41, and its login expiry advanced. claude-swap has no
+  // external-login rule; its oauth.py:73-92 defines the login-expiry field
+  // that A3d verifies.
+  if (input.provider === 'anthropic'
+    && input.oracleOwnAccount
+    && input.l41Verified === true
+    && input.loginExpiryMoved) return 'hard';
+  if (input.provider === 'openai-codex' && input.authTimeChanged) return 'hard';
+
   return 'soft';
 }
 
