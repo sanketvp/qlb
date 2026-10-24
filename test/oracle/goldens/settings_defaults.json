@@ -7,7 +7,8 @@
     "model": null,
     "strategy": "best",
     "threshold": 90.0,
-    "unhealthy_ticks": 3
+    "unhealthy_ticks": 3,
+    "weekly_threshold": null
   },
   "filename": "settings.json",
   "schema_version": 1,

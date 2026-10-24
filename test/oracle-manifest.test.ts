@@ -5,7 +5,7 @@ import { join, relative } from 'node:path';
 import { describe, it } from 'node:test';
 
 const ROOT = join(__dirname, '..', '..');
-const ORACLE = join(ROOT, 'test', 'oracle', 'claude-swap-v0.26.0');
+const ORACLE = join(ROOT, 'test', 'oracle', 'claude-swap-v0.28.0');
 const MANIFEST_PATH = join(ORACLE, 'MANIFEST.json');
 const LICENSE = join(ROOT, 'third_party', 'claude-swap', 'LICENSE');
 const GOLDENS = join(ROOT, 'test', 'oracle', 'goldens');
@@ -15,6 +15,8 @@ type Manifest = {
   tag: string;
   commit: string;
   files: Record<string, string>;
+  test_def_counts: Record<string, number>;
+  test_switcher_top_level_test_classes: string[];
 };
 
 function sha256(path: string): string {
@@ -31,12 +33,21 @@ function filesBelow(dir: string): string[] {
   return files;
 }
 
-describe('claude-swap v0.26.0 oracle provenance', () => {
+describe('claude-swap v0.28.0 oracle provenance', () => {
   it('matches every vendored file to its pinned manifest hash', () => {
     const manifest = JSON.parse(readFileSync(MANIFEST_PATH, 'utf8')) as Manifest;
     assert.equal(manifest.upstream, 'https://github.com/realiti4/claude-swap');
-    assert.equal(manifest.tag, 'v0.26.0');
-    assert.match(manifest.commit, /^[a-f0-9]{40}$/);
+    assert.equal(manifest.tag, 'v0.28.0');
+    assert.equal(manifest.commit, '2b2d71c7aeb49e6bd25393509ceb05dbca7b0e10');
+    assert.equal(Object.keys(manifest.files).length, 51);
+    assert.equal(Object.keys(manifest.test_def_counts).length, 50);
+    assert.equal(manifest.test_def_counts['tests/test_switcher.py'], 502);
+    assert.deepEqual(
+      manifest.test_switcher_top_level_test_classes,
+      [
+        'TestEmailValidation', 'TestFindAccountSlot', 'TestPlatformDetection', 'TestJsonOperations', 'TestGetCurrentAccount', 'TestGetClaudeConfigPathUtf8', 'TestAccountExists', 'TestResolveAccountIdentifier', 'TestAliasValidation', 'TestResolveByAlias', 'TestAliasCommand', 'TestDirectorySetup', 'TestAddAccountRefresh', 'TestGetNextAccountNumber', 'TestStatus', 'TestStatusCache', 'TestFetchAccountUsageSessionProfile', 'TestAdoptSessionCredential', 'TestLiveSessionGuardOnAnUnreadableRecord', 'TestListAccountsUsage', 'TestUsageFetchStamps', 'TestActiveAccountRefresh', 'TestPerformSwitchPostDisplay', 'TestSwitchToSelfSlotAndForce', 'TestAccountInfoOrgFields', 'TestAccountExistsCompositeKey', 'TestGetCurrentAccountOrgSupport', 'TestDeadTokenQuarantine', 'TestAddAccountOrgFields', 'TestResolveIdentifierAmbiguity', 'TestListAccountsOrgDisplay', 'TestBackwardCompatibility', 'TestUpgradeMigration', 'TestAddAccountSlot', 'TestPurgeLegacyCleanup', 'TestAddAccountFromToken', 'TestPurge', 'TestSwitchSkipsBrokenSlots', 'TestUsageAwareSwitch', 'TestClaudeCodeLockCooperation', 'TestMacosKeychainFallback', 'TestFormatUsageLines', 'TestProvenanceGuard', 'TestSelfSwitchProvenance', 'TestDuplicateAccountDetection', 'TestLockstepUsageDetection', 'TestStashAndRetentionStore', 'TestActiveRefreshProvenance', 'TestDirectActivationPreservation', 'TestSharedOAuthCredentialPreservation', 'TestUuidConflictClassification', 'TestStashStorageHardening', 'TestStashManifestConcurrentMutation', 'TestRemoveAccountPrunesMappings', 'TestSwitchRemoveGatesAcceptAlias', 'TestAddAccountAlias', 'TestDisableEnableAccount', 'TestDegradedReadProvenance', 'TestBackupReadTriState', 'TestEncPermissionDeniedIsUnreadable', 'TestBackupUnreadableDisplay', 'TestSwitchUnreadableBackup', 'TestConsumeGate', 'TestInactiveRefreshRoutesThroughGate', 'TestStrikeUnbindsInCollector', 'TestStoreResolutionParity', 'TestConsumeGateLockFailures', 'TestPermanentlyUnreadableStashRow', 'TestHealedStrikeUnblocksFetching', 'TestGateUltraReviewFixes', 'TestActiveSlotStrikeParity', 'TestUltraReviewCoverageGaps', 'TestUnreadableBackupIsNotAbsent', 'TestStashReaderUnreadableVsAbsent', 'TestSessionShellGuardCoversEveryMutator', 'TestPollPolicyInputsCarryTheWeeklyLine', 'TestSwitchTransactionRollback', 'TestSalvageCopyMode',
+      ],
+    );
 
     const actualFiles = [
       LICENSE,

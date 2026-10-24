@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Generate a deterministic, offline behavior oracle for claude-swap 0.26.0.
+"""Generate a deterministic, offline behavior oracle for claude-swap 0.28.0.
 
-This script imports the installed claude-swap package only after replacing HOME
+This script imports only the pinned v0.28.0 source clone after replacing HOME
 with an empty temporary directory. It invokes no network, Keychain, credential
 store, or CLI APIs; every input below is synthetic.
 """
@@ -10,16 +10,38 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import io
 import json
 import os
 import socket
+import subprocess
 import sys
+import tarfile
 import tempfile
 from pathlib import Path
 from typing import Any
 
+# claude-swap 0.28.0 requires Python 3.12. macOS supplies Python 3.9 as
+# `python3`, so retain the documented `python3 -I ...` entry point while
+# re-executing in the isolated 3.12 interpreter already installed for
+# claude-swap. This invokes no claude-swap CLI or package installation.
+if sys.version_info < (3, 12):
+    PYTHON312 = Path.home() / ".local/share/uv/tools/claude-swap/bin/python"
+    if not PYTHON312.is_file():
+        raise RuntimeError("claude-swap 0.28.0 golden generation requires Python 3.12")
+    os.execv(str(PYTHON312), [str(PYTHON312), "-I", str(Path(__file__).resolve()), *sys.argv[1:]])
+
 ROOT = Path(__file__).resolve().parent.parent
 GOLDENS = ROOT / "test" / "oracle" / "goldens"
+# This is the read-only clone supplied for the v0.28.0 oracle refresh.
+UPSTREAM_REPO = Path(
+    os.environ.get(
+        "CLAUDE_SWAP_V028_REPO",
+        "/private/tmp/claude-501/-Users-sanketpatel-GIT-Personal-sanketvp/"
+        "3b005b8d-b97c-4bb5-a726-86eaa04c5eb9/scratchpad/cswap-upstream/repo",
+    )
+)
+PINNED_COMMIT = "2b2d71c7aeb49e6bd25393509ceb05dbca7b0e10"
 
 
 def _blocked_socket(*_args: Any, **_kwargs: Any) -> None:
@@ -58,8 +80,54 @@ def main() -> int:
     if not sys.flags.isolated:
         parser.error("run this script with Python -I")
 
+    if not (UPSTREAM_REPO / ".git").exists():
+        parser.error(f"pinned claude-swap v0.28.0 clone is unavailable: {UPSTREAM_REPO}")
+
     with tempfile.TemporaryDirectory(prefix="qlb-oracle-home-") as temp_home:
         home = Path(temp_home)
+        commit = subprocess.run(
+            ["git", "-C", str(UPSTREAM_REPO), "rev-parse", f"{PINNED_COMMIT}^{{commit}}"],
+            capture_output=True,
+            check=True,
+            text=True,
+        ).stdout.strip()
+        if commit != PINNED_COMMIT:
+            raise RuntimeError("claude-swap v0.28.0 tag does not match the pinned commit")
+        archive = subprocess.run(
+            ["git", "-C", str(UPSTREAM_REPO), "archive", "--format=tar", PINNED_COMMIT, "src"],
+            capture_output=True,
+            check=True,
+        ).stdout
+        source_root = home / "pinned-source"
+        with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
+            for member in tar.getmembers():
+                destination = source_root / member.name
+                if not destination.resolve().is_relative_to(source_root.resolve()):
+                    raise RuntimeError("refusing an unsafe path in the claude-swap source archive")
+                if member.isdir():
+                    destination.mkdir(parents=True, exist_ok=True)
+                elif member.isfile():
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    source = tar.extractfile(member)
+                    if source is None:
+                        raise RuntimeError(f"could not read source archive member: {member.name}")
+                    destination.write_bytes(source.read())
+                else:
+                    raise RuntimeError(f"unexpected source archive member: {member.name}")
+        upstream_src = source_root / "src"
+        # Python -I omits user and environment import paths. Insert this exact
+        # tag's source explicitly so this can never use installed claude-swap.
+        sys.path.insert(0, str(upstream_src))
+        # The source tree is intentionally not installed. Supply only the
+        # package metadata needed by claude_swap.__init__ without exposing any
+        # installed package to the isolated interpreter.
+        metadata = home / "metadata" / "claude_swap-0.28.0.dist-info"
+        metadata.mkdir(parents=True)
+        (metadata / "METADATA").write_text(
+            "Metadata-Version: 2.1\\nName: claude-swap\\nVersion: 0.28.0\\n",
+            encoding="utf-8",
+        )
+        sys.path.insert(1, str(metadata.parent))
         os.environ.update(
             {
                 "HOME": str(home),
@@ -75,6 +143,9 @@ def main() -> int:
         # are deterministic transformations/path derivations with fake inputs.
         from claude_swap import claude_locks, macos_keychain, oauth, poll_policy, settings
         from claude_swap.session import keychain_service_name
+
+        if not Path(claude_locks.__file__).resolve().is_relative_to(upstream_src.resolve()):
+            raise RuntimeError("oracle imported claude-swap outside the pinned v0.28.0 source")
         from claude_swap.switcher import ClaudeAccountSwitcher
 
         # Imports load urllib/ssl, so install the network refusal only after
