@@ -17,7 +17,7 @@
     {"id":"C2","start":["A0"],"files":["src/codex-oauth.ts","test/codex-oauth.test.ts"]},
     {"id":"H1","start":["A0"],"files":[]},
 
-    {"id":"R0","start":["A0"],"files":["src/cli.ts","src/diagnostics.ts","src/token.ts","src/gate.ts","src/usage.ts","src/auto.ts","src/bootstrap.ts","test/wiring.test.ts"]},
+    {"id":"R0","start":["A0"],"files":["src/cli.ts","src/diagnostics.ts","src/token.ts","src/gate.ts","src/usage.ts","src/auto.ts","src/bootstrap.ts","src/commands/codex-gate.ts","src/commands/retire-native.ts","test/wiring.test.ts"]},
     {"id":"A12","start":["A0"],"files":["src/redact.ts","test/redaction.test.ts"]},
     {"id":"A8","start":["A0"],"files":["src/fsutil.ts","test/fsutil.test.ts"]},
     {"id":"A9","start":["A0"],"files":["src/lines.ts","test/lines.test.ts"]},
@@ -94,7 +94,7 @@
     {"id":"K5b","start":["K9","A2c"],"files":["src/cc-switch.ts","src/commands/keychain.ts","test/cc-switch-republish.test.ts"]},
     {"id":"C8","start":["K7","C4-live","C6b","C10"],"files":["src/auto/openai-codex.ts","test/autoswitch-codex.test.ts"]},
     {"id":"H2","start":["K7","A11","K13","R0"],"files":["src/commands/auto.ts","src/checks/auto-agent.ts","src/checks/cswap-agent.ts","src/checks/cswap-processes.ts","src/checks/auto-parked.ts","scripts/launchagents/com.modus.qlb-auto.plist","test/auto-once.test.ts","test/fault-injection.test.ts"]},
-    {"id":"H3","start":["A7","C5","K7","C8","A5","K13","P9","P12","A12","R0"],"files":["src/dashboard.ts","src/commands/status.ts","src/commands/report-cutover.ts","src/commands/doctor.ts","test/status-switches.test.ts","test/report-cutover.test.ts","test/status-json-fields.test.ts","test/doctor-phases.test.ts","test/doctor-sentinel.test.ts","test/redaction.test.ts"]},
+    {"id":"H3","start":["A7","C5","K7","C8","A5","K13","P9","P12","A12","R0"],"files":["src/dashboard.ts","src/commands/status.ts","src/commands/report-cutover.ts","src/commands/doctor.ts","src/checks/claude-active.ts","src/checks/claude-login-expiry.ts","src/checks/codex-active.ts","src/checks/codex-sessions.ts","src/checks/version-drift.ts","src/checks/fs-stray-temps.ts","src/checks/fs-plaintext-backups.ts","src/checks/fs-stale-codex-add.ts","src/checks/claude-unclaimed.ts","src/checks/claude-unpersisted-token.ts","src/checks/codex-active-refresh-race.ts","test/status-switches.test.ts","test/report-cutover.test.ts","test/status-json-fields.test.ts","test/doctor-phases.test.ts","test/doctor-sentinel.test.ts","test/redaction.test.ts"]},
     {"id":"D2","start":["H2","H3","K11","K12"],"files":["docs/CLI.md","docs/PROVIDERS.md","README.md"]},
 
     {"id":"C4-live","start":["C4","P3","A11"],"files":[]},
