@@ -111,18 +111,29 @@ export function accessTokenFingerprint(credentials: string): string | null {
   return `sha256-at:${createHash('sha256').update(accessToken, 'utf8').digest('hex')}`;
 }
 
-/** C-swap v0.28.0 `oauth.py` lines 73–92: stored-login expiry as second-precision UTC. */
-export function loginExpiresAtIso(credentials: string): string | null {
-  const value = parseCredentialBlob(credentials)?.oauth?.refreshTokenExpiresAt;
-  if (!isFiniteNumber(value) || value <= 0) return null;
+export interface LoginExpiryField {
+  field: 'refreshTokenExpiresAt';
+  iso: string | null;
+}
+
+/** C-swap v0.28.0 `oauth.py` lines 73–92: the stored-login expiry field and its UTC ISO value. */
+export function loginExpiryField(blob: CredentialBlob | null): LoginExpiryField {
+  const field = 'refreshTokenExpiresAt' as const;
+  const value = blob?.oauth?.[field];
+  if (!isFiniteNumber(value) || value <= 0) return { field, iso: null };
   const date = new Date(value);
   // Python's datetime.fromtimestamp rejects years above 9999 rather than
   // returning None. Keep that failure boundary instead of emitting JS's
   // extended-year ISO form.
   if (Number.isNaN(date.getTime()) || date.getUTCFullYear() > 9999) {
-    throw new RangeError('refreshTokenExpiresAt is outside the supported date range');
+    throw new RangeError(`${field} is outside the supported date range`);
   }
-  return date.toISOString().replace(/\.\d{3}Z$/, 'Z');
+  return { field, iso: date.toISOString().replace(/\.\d{3}Z$/, 'Z') };
+}
+
+/** C-swap v0.28.0 `oauth.py` lines 73–92: stored-login expiry as second-precision UTC. */
+export function loginExpiresAtIso(credentials: string): string | null {
+  return loginExpiryField(parseCredentialBlob(credentials)).iso;
 }
 
 function isFiniteNumber(value: unknown): value is number {
