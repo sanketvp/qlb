@@ -65,7 +65,7 @@ describe('Codex OAuth request descriptions', () => {
   });
 
   it('redacts credentials when a request descriptor is JSON serialized', () => {
-    const refresh = buildRefreshRequest('fake-refresh-secret');
+    const refresh = buildRefreshRequest('fake-refresh-secret', 'forced');
     const usage = buildUsageRequest('fake-access-secret', 'test-account-id');
 
     assert.equal(JSON.stringify(refresh).includes('fake-refresh-secret'), false);
