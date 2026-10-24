@@ -10,7 +10,7 @@ export interface CodexTokens extends Record<string, unknown> {
   id_token: string;
   access_token: string;
   refresh_token: string;
-  account_id: string;
+  account_id?: string | null;
 }
 
 /** The complete auth.json shape, including fields Codex may add in the future. */
@@ -81,7 +81,7 @@ export function parseCodexAuth(text: string): CodexAuthParseResult {
   const rawTokens = parsed.tokens;
   if (!isObject(rawTokens)) return { ok: false, error: 'tokens-absent' };
 
-  const required = ['id_token', 'access_token', 'refresh_token', 'account_id'] as const;
+  const required = ['id_token', 'access_token', 'refresh_token'] as const;
   if (required.some((key) => !nonEmptyString(rawTokens[key]))) {
     return { ok: false, error: 'tokens-empty', status: 'wiped' };
   }
@@ -113,8 +113,9 @@ export function codexIdentity(doc: CodexAuthDocument): CodexIdentity | null {
 export function accessExpiry(doc: CodexAuthDocument): number | null {
   const payload = decodeJwtPayload(doc.tokens.access_token);
   const exp = payload?.exp;
-  if (typeof exp !== 'number' || !Number.isFinite(exp)) return null;
-  return exp * 1_000;
+  if (typeof exp !== 'number' || !Number.isSafeInteger(exp)) return null;
+  const expiry = exp * 1_000;
+  return Number.isSafeInteger(expiry) ? expiry : null;
 }
 
 /** Codex refreshes at five minutes to expiry or after eight days without a refresh. */
@@ -122,9 +123,11 @@ export function needsRefresh(doc: CodexAuthDocument, now: number): boolean {
   const expiry = accessExpiry(doc);
   if (expiry === null || expiry <= now + ACCESS_EXPIRY_BUFFER_MS) return true;
 
-  if (typeof doc.last_refresh !== 'string') return false;
+  if (typeof doc.last_refresh !== 'string') return true;
+  const isIsoTimestamp = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
+  if (!isIsoTimestamp.test(doc.last_refresh)) return true;
   const lastRefresh = Date.parse(doc.last_refresh);
-  return Number.isFinite(lastRefresh) && lastRefresh <= now - REFRESH_AGE_MS;
+  return !Number.isFinite(lastRefresh) || lastRefresh > now || lastRefresh <= now - REFRESH_AGE_MS;
 }
 
 /** A non-reversible identifier suitable for equality checks and persisted metadata. */
@@ -150,14 +153,15 @@ function errorCode(error: unknown): string | undefined {
 }
 
 async function syncContainingDirectory(path: string): Promise<void> {
-  const directoryHandle = await open(dirname(path), 'r');
+  let directoryHandle: Awaited<ReturnType<typeof open>> | undefined;
   try {
+    directoryHandle = await open(dirname(path), 'r');
     await directoryHandle.sync();
   } catch (error) {
     const code = errorCode(error);
     if (code !== 'EISDIR' && code !== 'EINVAL') throw error;
   } finally {
-    await directoryHandle.close();
+    if (directoryHandle) await directoryHandle.close();
   }
 }
 
