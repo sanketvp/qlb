@@ -1,9 +1,8 @@
 // Ported from claude-swap 0.28.0 (MIT, Copyright (c) realiti4) — claude_locks.py (lines 46–70, 75–228).
 // See third_party/claude-swap/LICENSE for the upstream license.
 
-import { randomUUID } from 'node:crypto';
 import { existsSync, statSync } from 'node:fs';
-import { mkdir, rename, rmdir, stat, utimes } from 'node:fs/promises';
+import { mkdir, rmdir, stat, utimes } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { performance } from 'node:perf_hooks';
 import { basename, join } from 'node:path';
@@ -22,6 +21,8 @@ const RETRY_JITTER_MS = 250;
 export const TAKEOVER_SUFFIX = '.takeover';
 /** A stale takeover directory is abandoned after this long. */
 export const TAKEOVER_STALENESS_MS = 5_000;
+/** Sibling suffix used to serialize reclamation of stale takeover directories. */
+export const RECLAIM_SUFFIX = '.reclaim';
 
 export class ClaudeCodeLockTimeout extends Error {
   constructor(lockDir: string) {
@@ -120,33 +121,48 @@ async function releaseHeldLock(lockDir: string): Promise<void> {
  * Remove a stale lock only while holding its sibling takeover directory. The re-check prevents
  * a second stale contender from removing a first contender's freshly recreated lock.
  *
- * Like upstream claude_locks.py:94-125, this sidecar coordinates only ported/C-swap contenders;
- * Claude Code's native proper-lockfile does not consult it, so the native-lock takeover race
- * remains an intentional upstream limitation.
+ * The reclaim guard serializes reclamation only among ported contenders. Upstream C-swap
+ * contenders and a slow-but-alive holder beyond `TAKEOVER_STALENESS_MS` can still race: this is
+ * the upstream-shared, time-bound assumption also used for lock staleness. Native Claude Code
+ * ignores both directories.
  */
 async function removeIfStillStale(lockDir: string, stalenessMs: number): Promise<boolean> {
   const takeoverDir = `${lockDir}${TAKEOVER_SUFFIX}`;
+  const reclaimDir = `${takeoverDir}${RECLAIM_SUFFIX}`;
   try {
     await mkdir(takeoverDir);
   } catch (error: unknown) {
     if (!error || typeof error !== 'object' || (error as NodeJS.ErrnoException).code !== 'EEXIST') return false;
     try {
       const heldTakeover = await stat(takeoverDir);
-      if (Date.now() - heldTakeover.mtimeMs > TAKEOVER_STALENESS_MS) {
-        const staleTakeover = `${takeoverDir}.${randomUUID()}`;
-        await rename(takeoverDir, staleTakeover);
-        const renamedTakeover = await stat(staleTakeover);
-        if (Date.now() - renamedTakeover.mtimeMs > TAKEOVER_STALENESS_MS) {
-          await rmdir(staleTakeover);
-        } else {
-          // A contender recreated it between stat and rename; put its fresh sidecar back.
-          await rename(staleTakeover, takeoverDir);
-        }
-      }
+      if (Date.now() - heldTakeover.mtimeMs <= TAKEOVER_STALENESS_MS) return false;
     } catch {
-      // Another contender released or retook the takeover directory; retry the lock protocol.
+      return false;
     }
-    return false;
+
+    try {
+      await mkdir(reclaimDir);
+    } catch {
+      try {
+        const heldReclaim = await stat(reclaimDir);
+        if (Date.now() - heldReclaim.mtimeMs > TAKEOVER_STALENESS_MS) await rmdir(reclaimDir);
+      } catch {
+        // Another contender released or retook the reclaim directory; retry the lock protocol.
+      }
+      return false;
+    }
+
+    try {
+      try {
+        const heldTakeover = await stat(takeoverDir);
+        if (Date.now() - heldTakeover.mtimeMs > TAKEOVER_STALENESS_MS) await rmdir(takeoverDir);
+      } catch {
+        // Another contender released or retook the takeover directory; retry the lock protocol.
+      }
+      return false;
+    } finally {
+      await bestEffortRelease(reclaimDir);
+    }
   }
 
   try {
@@ -165,8 +181,10 @@ async function removeIfStillStale(lockDir: string, stalenessMs: number): Promise
  * Acquire a proper-lockfile-compatible directory lock, execute `fn`, then release it.
  *
  * `mkdir` is the atomic acquisition operation. Existing locks are taken over only when their
- * mtime is older than `stalenessMs`; live holders touch mtime periodically. Do not put network
- * awaits in `fn`: the Claude Code critical sections this mirrors are deliberately short.
+ * mtime is older than `stalenessMs`; live holders touch mtime periodically. Its toucher runs on
+ * the Node event loop (`setInterval`), unlike upstream's daemon thread, so a blocked holder can
+ * let its lock go stale. Do not put network awaits in `fn`: the Claude Code critical sections
+ * this mirrors are deliberately short.
  */
 export async function withProperLockfile<T>(
   lockDir: string,
