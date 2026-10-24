@@ -22,6 +22,10 @@ Two optional `Adapter` fields (`src/types.ts`) tailor refresh behavior; absent m
 - **Confidence:** `authoritative` — this is the provider's own gauge, fetched fresh at decision time.
 - **Caveats:** an expired or invalid access token surfaces as `auth expired or invalid — needs re-login` on that account only. Phase-0 adapters never refresh tokens themselves; expired accounts need the native harness to log in once.
 
+### Claude login expiry (L41)
+
+`loginExpiryField()` names the field used by `loginExpiresAtIso`: `refreshTokenExpiresAt`, an epoch-millisecond timestamp rendered as UTC ISO-8601. **L41: verified for a claude-swap/QLB refresh only** — its in-place OAuth update never writes this field (`test/oracle/claude-swap-v0.28.0/src/claude_swap/oauth.py:188-196`). No upstream test exercises the field across a refresh: the refresh fixture omits it (`test/oracle/claude-swap-v0.28.0/tests/test_oauth.py:424-434`), so the refresh test only asserts access- and refresh-token rotation (`test_oauth.py:474-492`). Claude Code's native refresh is not established by the oracle and remains to be confirmed from the X1/X2 field recordings before `login-expiry-jump` rows are treated as hard. The login-expiry test identifies and renders `refreshTokenExpiresAt` (`test_oauth.py:1507-1524`).
+
 ## OpenAI Codex (`openai-codex`)
 
 - **Credential source:** Codex CLI's own `~/.codex/auth.json` (`tokens.access_token`; account id and label parsed from the `id_token` JWT claims). Configurable via `QLB_CODEX_AUTH_JSON_PATH`.
