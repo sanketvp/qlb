@@ -240,6 +240,26 @@ describe('Anthropic OAuth pure port', () => {
     }
   });
 
+  // S18 disambiguates the upstream preflight at oauth.py:154–167: only a
+  // structurally valid OAuth object with a non-empty string token may request.
+  it('treats an empty credential object as unreadable', () => {
+    assert.equal(buildRefreshRequest('{}').kind, 'transient');
+  });
+
+  it('treats a null Claude OAuth object as unreadable', () => {
+    assert.equal(buildRefreshRequest(JSON.stringify({ claudeAiOauth: null })).kind, 'transient');
+  });
+
+  it('treats a whitespace-only refresh token as permanently absent', () => {
+    assert.equal(buildRefreshRequest(JSON.stringify({ claudeAiOauth: { refreshToken: ' \t\n ' } })).kind, 'no_refresh_token');
+  });
+
+  it('treats non-string refresh tokens as unreadable', () => {
+    for (const refreshToken of [1, {}]) {
+      assert.equal(buildRefreshRequest(JSON.stringify({ claudeAiOauth: { refreshToken } })).kind, 'transient');
+    }
+  });
+
   it('describes refresh and usage requests without performing network I/O', () => {
     const refreshResult = buildRefreshRequest(FAKE_CREDENTIALS);
     assert.equal(refreshResult.kind, 'request');
@@ -261,13 +281,8 @@ describe('Anthropic OAuth pure port', () => {
     assert.equal(buildRefreshRequest('not json').kind, 'transient');
     assert.equal(refreshOracleError('[]'), 'transient');
     assert.equal(buildRefreshRequest('[]').kind, 'transient');
-    // Python's truthiness accepts non-string but truthy JSON values for the
-    // request body; preserve that shape rather than silently calling it absent.
-    const nonStringToken = buildRefreshRequest(JSON.stringify({ claudeAiOauth: { refreshToken: true } }));
-    assert.equal(nonStringToken.kind, 'request');
-    if (nonStringToken.kind === 'request') {
-      assert.equal(JSON.parse(nonStringToken.request.body ?? '').refresh_token, true);
-    }
+    // S18 classifies non-string tokens as unreadable rather than POSTing them.
+    assert.equal(buildRefreshRequest(JSON.stringify({ claudeAiOauth: { refreshToken: true } })).kind, 'transient');
     const timedRequest = buildRefreshRequest(FAKE_CREDENTIALS, 6_000);
     assert.equal(timedRequest.kind, 'request');
     if (timedRequest.kind === 'request') assert.equal(timedRequest.request.timeoutMs, 6_000);

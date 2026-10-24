@@ -170,8 +170,8 @@ export function buildRefreshRequest(
   credentials: string,
   timeoutMs = 10_000,
 ): RefreshRequestClassification {
-  // A malformed root can be a torn read, whereas a complete root with no
-  // usable token is the permanent `no_refresh_token` outcome.
+  // S18 narrows the permanent outcome to a complete OAuth object with an
+  // absent refresh token; malformed credential shapes can be torn reads.
   let data: unknown;
   try {
     data = JSON.parse(credentials);
@@ -180,9 +180,12 @@ export function buildRefreshRequest(
   }
   if (!isObject(data)) return { kind: 'transient' };
   const oauth = data.claudeAiOauth;
-  if (!isObject(oauth) || isPythonFalsy(oauth.refreshToken)) {
+  if (!isObject(oauth)) return { kind: 'transient' };
+  const refreshToken = oauth.refreshToken;
+  if (refreshToken == null || (typeof refreshToken === 'string' && !refreshToken.trim())) {
     return { kind: 'no_refresh_token' };
   }
+  if (typeof refreshToken !== 'string') return { kind: 'transient' };
   return {
     kind: 'request',
     request: {
