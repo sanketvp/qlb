@@ -1,0 +1,18 @@
+{
+  "autoswitch": {
+    "cooldown_seconds": 300.0,
+    "hysteresis_pct": 10.0,
+    "include_api_key_accounts": false,
+    "interval_seconds": 60.0,
+    "model": null,
+    "strategy": "best",
+    "threshold": 90.0,
+    "unhealthy_ticks": 3,
+    "weekly_threshold": null
+  },
+  "filename": "settings.json",
+  "schema_version": 1,
+  "ui": {
+    "theme": "auto"
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "constants": {
+    "config_staleness_s": 10.0,
+    "contention_wait_s": {
+      "maximum": 0.5,
+      "minimum": 0.25
+    },
+    "credentials_staleness_s": 60.0,
+    "default_timeout_s": 9.0,
+    "touch_interval_s": 3.0
+  },
+  "credential_acquisition_order": [
+    "oauth_refresh",
+    "legacy_credentials"
+  ],
+  "paths": {
+    "global_config": "$HOME/.claude.json.lock",
+    "legacy_credentials": "$HOME/.claude.lock",
+    "oauth_refresh": "$HOME/.claude/.oauth_refresh.lock"
+  }
+}

@@ -1,0 +1,66 @@
+{
+  "constants": {
+    "ACTIVE_MAX_INTERVAL_S": 300.0,
+    "CANDIDATE_DEFAULT_INTERVAL_S": 300.0,
+    "CANDIDATE_MAX_INTERVAL_S": 600.0,
+    "EDGE_BACKOFF_S": 300.0,
+    "ESCALATION_MARGIN_PCT": 15.0,
+    "EXHAUSTED_INTERVAL_S": 600.0,
+    "JITTER_FRAC": 0.1,
+    "MIN_INTERVAL_S": 180.0,
+    "MOVEMENT_DELTA_PCT": 1.0,
+    "POST_429_BACKOFF_MULT": 1.5,
+    "POST_429_MAX_INTERVAL_S": 1800.0,
+    "POST_429_MIN_INTERVAL_S": 360.0,
+    "RECENT_429_WINDOW_S": 3600.0,
+    "RESET_SLACK_S": 60.0,
+    "SERVE_TTL_S": 180.0,
+    "URGENT_INTERVAL_S": 60.0
+  },
+  "plans": {
+    "exhausted_reset_cap": {
+      "interval_s": 600.0,
+      "next_poll_at": 1140.0
+    },
+    "moving_active": {
+      "interval_s": 180.0,
+      "next_poll_at": 1180.0
+    },
+    "recent_429": {
+      "interval_s": 900.0,
+      "next_poll_at": 1900.0
+    },
+    "scoped_model_binds": {
+      "interval_s": 60.0,
+      "next_poll_at": 1054.0
+    },
+    "stable_active": {
+      "interval_s": 270.0,
+      "next_poll_at": 1270.0
+    },
+    "stable_candidate": {
+      "interval_s": 450.0,
+      "next_poll_at": 1450.0
+    },
+    "unknown_active": {
+      "interval_s": 180.0,
+      "next_poll_at": 1180.0
+    },
+    "unknown_candidate": {
+      "interval_s": 300.0,
+      "next_poll_at": 1300.0
+    },
+    "urgent_active": {
+      "interval_s": 60.0,
+      "next_poll_at": 1060.0
+    },
+    "weekly_threshold_defers": {
+      "interval_s": 180.0,
+      "next_poll_at": 1180.0
+    },
+    "weekly_threshold_urgent": {
+      "interval_s": 60.0,
+      "next_poll_at": 1060.0
+    }
+  }
+}
