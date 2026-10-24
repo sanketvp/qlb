@@ -27,7 +27,47 @@ function load(path, violations) {
   }
 }
 
-function validate(document) {
+function expandSpecPath(path) {
+  const match = /^(.*)\{([^{}]+)\}(.*)$/.exec(path);
+  if (!match) return [path];
+  const [, prefix, choices, suffix] = match;
+  return choices.split(",").flatMap((choice) => expandSpecPath(`${prefix}${choice}${suffix}`));
+}
+
+function loadSpecFiles(path, violations) {
+  let source;
+  try {
+    source = readFileSync(path, "utf8");
+  } catch (error) {
+    fail(violations, `cannot read spec ${path}: ${error instanceof Error ? error.message : String(error)}`);
+    return undefined;
+  }
+
+  const files = new Set();
+  for (const match of source.matchAll(/`([^`]+)`/g)) {
+    for (const candidate of expandSpecPath(match[1])) {
+      if (isCanonicalRepoPath(candidate)) files.add(candidate);
+    }
+  }
+  for (const match of source.matchAll(/(?:src|test|docs|scripts|extensions|native|claude-config)\/[\w./{},*-]+/g)) {
+    const rawPath = match[0].replace(/[.,]+$/, "");
+    for (const candidate of expandSpecPath(rawPath)) {
+      if (isCanonicalRepoPath(candidate)) files.add(candidate);
+    }
+  }
+  return { files, source };
+}
+
+function isListedInSpec(file, spec) {
+  if (spec.files.has(file) || spec.source.includes(file)) return true;
+  const name = file.slice(file.lastIndexOf("/") + 1);
+  if (spec.source.includes(name)) return true;
+  return file.startsWith("test/")
+    && name.endsWith(".ts")
+    && spec.source.includes(`dist-test/test/${name.slice(0, -3)}js`);
+}
+
+function validate(document, specFiles) {
   const violations = [];
   if (!document || typeof document !== "object" || !Array.isArray(document.slices)) {
     return ["document must contain a slices array"];
@@ -91,6 +131,23 @@ function validate(document) {
   for (const id of byId.keys()) visit(id);
   if (violations.some((message) => message.startsWith("dependency cycle:"))) return violations;
 
+  if (byId.has("X4")) {
+    const reachesX4 = new Set(["X4"]);
+    const pending = ["X4"];
+    while (pending.length > 0) {
+      const id = pending.pop();
+      for (const prerequisite of byId.get(id)?.start ?? []) {
+        if (!reachesX4.has(prerequisite)) {
+          reachesX4.add(prerequisite);
+          pending.push(prerequisite);
+        }
+      }
+    }
+    for (const id of byId.keys()) {
+      if (!reachesX4.has(id)) fail(violations, `${id}: is not reachable from the final cutover slice X4`);
+    }
+  }
+
   const closures = new Map();
   function closure(id) {
     const cached = closures.get(id);
@@ -110,6 +167,14 @@ function validate(document) {
     for (const file of slice.files ?? []) {
       if (id !== "R0" && registrySource.test(file) && !closure(id).has("R0")) {
         fail(violations, `${id}: ${file} requires R0 in its start-state closure`);
+      }
+    }
+  }
+
+  if (specFiles) {
+    for (const [id, slice] of byId) {
+      for (const file of slice.files ?? []) {
+        if (!isListedInSpec(file, specFiles)) fail(violations, `${id}: file path is absent from the supplied spec: ${file}`);
       }
     }
   }
@@ -137,14 +202,17 @@ function validate(document) {
   return violations;
 }
 
-const [path] = process.argv.slice(2);
-if (!path || process.argv.length !== 3) {
-  console.error("usage: node scripts/check-slice-graph.mjs <slices.json>");
+const args = process.argv.slice(2);
+const [path, ...options] = args;
+const hasSpec = options[0] === "--spec" && typeof options[1] === "string" && options.length === 2;
+if (!path || (options.length !== 0 && !hasSpec)) {
+  console.error("usage: node scripts/check-slice-graph.mjs <slices.json> [--spec <spec.md>]");
   process.exitCode = 2;
 } else {
   const loadViolations = [];
   const document = load(path, loadViolations);
-  const violations = [...loadViolations, ...validate(document)];
+  const specFiles = hasSpec ? loadSpecFiles(options[1], loadViolations) : undefined;
+  const violations = [...loadViolations, ...validate(document, specFiles)];
   if (violations.length > 0) {
     for (const violation of violations) console.error(`violation: ${violation}`);
     console.error(`${violations.length} violation${violations.length === 1 ? "" : "s"}`);
