@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { chmod, open, readFile as readFileFromDisk, rename, unlink } from 'node:fs/promises';
+import { open, readFile as readFileFromDisk, rename, unlink } from 'node:fs/promises';
 
 const ACCESS_EXPIRY_BUFFER_MS = 5 * 60 * 1_000;
 const REFRESH_AGE_MS = 8 * 24 * 60 * 60 * 1_000;
@@ -146,9 +146,6 @@ export async function writeCodexAuthAtomic(path: string, doc: CodexAuthDocument)
     await handle.close();
     handle = undefined;
     await rename(temporaryPath, path);
-    // A pre-existing path cannot affect the mode after rename, but explicitly
-    // enforce it so this remains true on filesystems with unusual defaults.
-    await chmod(path, 0o600);
   } catch (error) {
     if (handle) await handle.close().catch(() => undefined);
     if (temporaryFileCreated) await unlink(temporaryPath).catch(() => undefined);
