@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { chmod, open, readFile as readFileFromDisk, rename, unlink } from 'node:fs/promises';
 
 const ACCESS_EXPIRY_BUFFER_MS = 5 * 60 * 1_000;
@@ -133,11 +133,13 @@ export function codexFingerprint(doc: CodexAuthDocument): string {
  * atomic rename. It never logs the document or any token it contains.
  */
 export async function writeCodexAuthAtomic(path: string, doc: CodexAuthDocument): Promise<void> {
-  const temporaryPath = `${path}.qlb-tmp`;
+  const temporaryPath = `${path}.qlb-tmp-${randomBytes(8).toString('hex')}`;
   const contents = `${JSON.stringify(doc, null, 2)}\n`;
   let handle: Awaited<ReturnType<typeof open>> | undefined;
+  let temporaryFileCreated = false;
   try {
-    handle = await open(temporaryPath, 'w', 0o600);
+    handle = await open(temporaryPath, 'wx', 0o600);
+    temporaryFileCreated = true;
     await handle.chmod(0o600);
     await handle.writeFile(contents, 'utf8');
     await handle.sync();
@@ -149,7 +151,7 @@ export async function writeCodexAuthAtomic(path: string, doc: CodexAuthDocument)
     await chmod(path, 0o600);
   } catch (error) {
     if (handle) await handle.close().catch(() => undefined);
-    await unlink(temporaryPath).catch(() => undefined);
+    if (temporaryFileCreated) await unlink(temporaryPath).catch(() => undefined);
     throw error;
   }
 }

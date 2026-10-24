@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm, stat } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { describe, it } from 'node:test';
+import { isDeepStrictEqual } from 'node:util';
 import {
   accessExpiry,
   codexFingerprint,
@@ -127,6 +128,42 @@ describe('codex auth.json helpers', () => {
       assert.deepEqual(written.unknown_top_level, { retained: true });
       assert.equal((await stat(path)).mode & 0o777, 0o600);
       await assert.rejects(stat(`${path}.qlb-tmp`));
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('writes concurrently without leaving temporary files', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'qlb-codex-auth-'));
+    const path = join(dir, 'auth.json');
+    const docs = Array.from({ length: 8 }, (_, index) => parseValid({
+      unknown_top_level: { writer: index },
+      last_refresh: `2026-01-0${index + 1}T00:00:00.000Z`,
+    }));
+    try {
+      await Promise.all(docs.map((doc) => writeCodexAuthAtomic(path, doc)));
+      const written = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
+      assert.ok(docs.some((doc) => isDeepStrictEqual(written, doc)));
+      const temporaryFiles = (await readdir(dir)).filter((name) =>
+        name.startsWith(`${basename(path)}.qlb-tmp-`),
+      );
+      assert.deepEqual(temporaryFiles, []);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not follow a symlink at the old predictable temporary path', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'qlb-codex-auth-'));
+    const path = join(dir, 'auth.json');
+    const victim = join(dir, 'victim');
+    try {
+      await writeFile(victim, 'unchanged', 'utf8');
+      await symlink(victim, `${path}.qlb-tmp`);
+      const doc = parseValid();
+      await writeCodexAuthAtomic(path, doc);
+      assert.equal(await readFile(victim, 'utf8'), 'unchanged');
+      assert.deepEqual(JSON.parse(await readFile(path, 'utf8')), doc);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
