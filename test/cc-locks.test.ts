@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { existsSync } from 'node:fs';
-import { mkdtemp, mkdir, rm, stat, utimes } from 'node:fs/promises';
+import { mkdtemp, mkdir, readdir, rm, stat, utimes } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
@@ -130,6 +130,99 @@ describe('Claude Code proper-lockfile locks', () => {
         withProperLockfile(young, { stalenessMs: 1_000, timeoutMs: 40, retryMinMs: 5, retryJitterMs: 0 }, async () => {}),
         ClaudeCodeLockTimeout,
       );
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it('serializes two waiters taking over one stale lock', async () => {
+    const home = await tempHome();
+    const lock = join(home, 'race.lock');
+    const fsPromises = require('node:fs/promises') as Record<string, (...args: any[]) => Promise<any>>;
+    const originalMkdir = fsPromises.mkdir;
+    const originalRmdir = fsPromises.rmdir;
+    const originalStat = fsPromises.stat;
+    let releaseBothStaleStats!: () => void;
+    const bothStaleStats = new Promise<void>((resolve) => { releaseBothStaleStats = resolve; });
+    let releaseRetaken!: () => void;
+    const retaken = new Promise<void>((resolve) => { releaseRetaken = resolve; });
+    let staleStats = 0;
+    let lockRemovals = 0;
+    let inside = 0;
+    let mostInside = 0;
+    try {
+      await mkdir(lock, { recursive: true });
+      const old = new Date(Date.now() - 200);
+      await utimes(lock, old, old);
+
+      // Force #420's interleaving: both waiters see the dead directory, then the
+      // second pre-fix rmdir waits until the first has recreated it.
+      fsPromises.stat = async (...args: any[]) => {
+        const result = await originalStat(...args);
+        if (String(args[0]) === lock && staleStats < 2) {
+          staleStats += 1;
+          if (staleStats === 2) releaseBothStaleStats();
+          await bothStaleStats;
+        }
+        return result;
+      };
+      fsPromises.mkdir = async (...args: any[]) => {
+        const result = await originalMkdir(...args);
+        if (String(args[0]) === lock) releaseRetaken();
+        return result;
+      };
+      fsPromises.rmdir = async (...args: any[]) => {
+        if (String(args[0]) === lock && ++lockRemovals === 2) await retaken;
+        return originalRmdir(...args);
+      };
+
+      await Promise.all([0, 1].map(() => withProperLockfile(
+        lock,
+        { stalenessMs: 100, timeoutMs: 2_000, retryMinMs: 5, retryJitterMs: 0 },
+        async () => {
+          inside += 1;
+          mostInside = Math.max(mostInside, inside);
+          await sleep(100);
+          inside -= 1;
+        },
+      )));
+      assert.equal(mostInside, 1, 'only one waiter may hold a taken-over lock at once');
+    } finally {
+      fsPromises.mkdir = originalMkdir;
+      fsPromises.rmdir = originalRmdir;
+      fsPromises.stat = originalStat;
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it('leaves no takeover directory after stale-lock takeover', async () => {
+    const home = await tempHome();
+    const lock = join(home, 'stale.lock');
+    try {
+      await mkdir(lock, { recursive: true });
+      const old = new Date(Date.now() - 200);
+      await utimes(lock, old, old);
+      await withProperLockfile(lock, { stalenessMs: 100, timeoutMs: 100 }, async () => {});
+      assert.deepEqual((await readdir(home)).sort(), []);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it('clears a stale takeover directory before taking over a lock', async () => {
+    const home = await tempHome();
+    const lock = join(home, 'stale.lock');
+    const takeover = `${lock}.takeover`;
+    try {
+      await mkdir(lock, { recursive: true });
+      await mkdir(takeover, { recursive: true });
+      const old = new Date(Date.now() - 6_000);
+      await utimes(lock, old, old);
+      await utimes(takeover, old, old);
+      await withProperLockfile(lock, { stalenessMs: 100, timeoutMs: 500, retryMinMs: 5, retryJitterMs: 0 }, async () => {
+        assert.equal(existsSync(lock), true);
+      });
+      assert.equal(existsSync(takeover), false);
     } finally {
       await rm(home, { recursive: true, force: true });
     }

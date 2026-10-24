@@ -1,4 +1,4 @@
-// Ported from claude-swap 0.26.0 (MIT, Copyright (c) realiti4) — claude_locks.py
+// Ported from claude-swap 0.28.0 (MIT, Copyright (c) realiti4) — claude_locks.py (lines 46–70, 75–228).
 // See third_party/claude-swap/LICENSE for the upstream license.
 
 import { existsSync } from 'node:fs';
@@ -16,6 +16,10 @@ export const TOUCH_INTERVAL_MS = 3_000;
 export const DEFAULT_TIMEOUT_MS = 9_000;
 const RETRY_MIN_MS = 250;
 const RETRY_JITTER_MS = 250;
+/** Sibling directory suffix used to serialize stale-lock takeovers. */
+export const TAKEOVER_SUFFIX = '.takeover';
+/** A stale takeover directory is abandoned after this long. */
+export const TAKEOVER_STALENESS_MS = 5_000;
 
 export class ClaudeCodeLockTimeout extends Error {
   constructor(lockDir: string) {
@@ -92,6 +96,37 @@ async function bestEffortRelease(lockDir: string): Promise<void> {
 }
 
 /**
+ * Remove a stale lock only while holding its sibling takeover directory. The re-check prevents
+ * a second stale contender from removing a first contender's freshly recreated lock.
+ */
+async function removeIfStillStale(lockDir: string, stalenessMs: number): Promise<boolean> {
+  const takeoverDir = `${lockDir}${TAKEOVER_SUFFIX}`;
+  try {
+    await mkdir(takeoverDir);
+  } catch (error: unknown) {
+    if (!error || typeof error !== 'object' || (error as NodeJS.ErrnoException).code !== 'EEXIST') return false;
+    try {
+      const heldTakeover = await stat(takeoverDir);
+      if (Date.now() - heldTakeover.mtimeMs > TAKEOVER_STALENESS_MS) await rmdir(takeoverDir);
+    } catch {
+      // Another contender released or retook the takeover directory; retry the lock protocol.
+    }
+    return false;
+  }
+
+  try {
+    const held = await stat(lockDir);
+    if (Date.now() - held.mtimeMs <= stalenessMs) return false;
+    await rmdir(lockDir);
+    return true;
+  } catch {
+    return false;
+  } finally {
+    await bestEffortRelease(takeoverDir);
+  }
+}
+
+/**
  * Acquire a proper-lockfile-compatible directory lock, execute `fn`, then release it.
  *
  * `mkdir` is the atomic acquisition operation. Existing locks are taken over only when their
@@ -126,10 +161,8 @@ export async function withProperLockfile<T>(
     try {
       const held = await stat(lockDir);
       if (Date.now() - held.mtimeMs > stalenessMs) {
-        try {
-          await rmdir(lockDir);
-        } catch {
-          // Match C-swap's tiny backoff after a failed stale-lock removal.
+        if (!await removeIfStillStale(lockDir, stalenessMs)) {
+          // Match C-swap's tiny backoff after a failed stale-lock removal/takeover.
           await sleep(50);
         }
         continue;
