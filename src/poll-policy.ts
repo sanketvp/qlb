@@ -1,10 +1,10 @@
-// Ported from claude-swap 0.26.0 (MIT, Copyright (c) realiti4) — poll_policy.py
+// Ported from claude-swap 0.28.0 (MIT, Copyright (c) realiti4) — poll_policy.py lines 73–284; lines.py lines 39–45.
 
 /** Freshness floor shared by every collector. */
 export const SERVE_TTL_S = 180.0;
 /** Normal cadence floor. */
 export const MIN_INTERVAL_S = 180.0;
-/** Active, near-threshold, moving accounts only. */
+/** Active accounts with a relevant window rising into its own switch-line band. */
 export const URGENT_INTERVAL_S = 60.0;
 export const ACTIVE_MAX_INTERVAL_S = 300.0;
 export const CANDIDATE_DEFAULT_INTERVAL_S = 300.0;
@@ -114,10 +114,18 @@ export interface PollPlanInput {
   newUsage: Usage | null | undefined;
   isActive: boolean;
   threshold: number;
+  weeklyThreshold?: number | null;
   models: readonly string[];
   recent429: boolean;
   now: number;
   rng?: RandomSource;
+}
+
+/** C-swap lines.window_line(): weekly line for all but the 5h window. */
+function windowLine(label: string, threshold: number, weeklyThreshold: number | null | undefined): number {
+  return weeklyThreshold === null || weeklyThreshold === undefined || label === '5h'
+    ? threshold
+    : weeklyThreshold;
 }
 
 /**
@@ -132,6 +140,7 @@ export function planAfterFetch({
   newUsage,
   isActive,
   threshold,
+  weeklyThreshold = null,
   models,
   recent429,
   now,
@@ -154,13 +163,16 @@ export function planAfterFetch({
     moving = false;
     interval = Math.min(ceiling, Math.max(MIN_INTERVAL_S, base * 1.5));
   }
-  if (
-    isActive
-    && moving
-    && !recent429
-    && newPct !== null
-    && newPct >= threshold - ESCALATION_MARGIN_PCT
-  ) {
+  // Match C-swap per label, rising only: urgency is independent from the
+  // raw-max movement calculation above.
+  const previousPcts = new Map(relevantWindows(prevUsage, models).map(([label, pct]) => [label, pct]));
+  const risingInBand = relevantWindows(newUsage, models).some(([label, pct]) => {
+    const previousPct = previousPcts.get(label);
+    return previousPct !== undefined
+      && pct - previousPct >= MOVEMENT_DELTA_PCT
+      && pct >= windowLine(label, threshold, weeklyThreshold) - ESCALATION_MARGIN_PCT;
+  });
+  if (isActive && risingInBand && !recent429) {
     interval = URGENT_INTERVAL_S;
   }
   if (recent429) {
