@@ -3,7 +3,7 @@ import { existsSync } from 'node:fs';
 import { chmod, mkdtemp, mkdir, readdir, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { spawn, type ChildProcess } from 'node:child_process';
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { describe, it } from 'node:test';
 import {
   ClaudeCodeLockTimeout,
@@ -14,6 +14,7 @@ import {
 } from '../src/cc-locks';
 
 const PYTHON = 'python3';
+const PYTHON_REQUIREMENT = 'vendored claude-swap v0.28.0 requires Python 3.12 or newer';
 const CSWAP_V028_SOURCE = resolve(__dirname, '../../test/oracle/claude-swap-v0.28.0/src');
 const CHILD_TIMEOUT_MS = 10_000;
 
@@ -122,7 +123,27 @@ async function terminateChild(child: ChildProcess | undefined, output: ChildOutp
   await waitForChildExit(child, output ?? { stdout: '', stderr: '' }, `${description} cleanup`);
 }
 
-function spawnVendoredPython(home: string, body: string): SpawnedPython {
+function findVendoredPython(path = process.env.PATH): string | undefined {
+  const env = { ...process.env, PATH: path };
+  const isCompatible = (python: string): boolean => {
+    const result = spawnSync(
+      python,
+      ['-I', '-B', '-c', 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")'],
+      { encoding: 'utf8', env },
+    );
+    if (result.error || result.status !== 0) return false;
+    const [major, minor] = result.stdout.trim().split('.').map(Number);
+    return major > 3 || (major === 3 && minor >= 12);
+  };
+
+  if (isCompatible(PYTHON)) return PYTHON;
+  const uv = spawnSync('uv', ['python', 'find', '3.12'], { encoding: 'utf8', env });
+  if (uv.error || uv.status !== 0) return undefined;
+  const candidate = uv.stdout.trim();
+  return candidate && isCompatible(candidate) ? candidate : undefined;
+}
+
+function spawnVendoredPython(python: string, home: string, body: string): SpawnedPython {
   const oracleProgram = [
     'import os, pathlib, sys, tempfile',
     `os.environ["HOME"] = ${JSON.stringify(home)}`,
@@ -135,20 +156,21 @@ function spawnVendoredPython(home: string, body: string): SpawnedPython {
     '    sys.path[:0] = [source, temp]',
     ...body.split('\n').map((line) => `    ${line}`),
   ].join('\n');
-  const program = [
-    'import os, subprocess, sys',
-    'if sys.version_info < (3, 12):',
-    '    found = subprocess.run(["uv", "python", "find", "3.12"], capture_output=True, check=False, text=True).stdout.strip()',
-    '    if not found: raise RuntimeError("vendored claude-swap v0.28.0 requires Python 3.12 or newer")',
-    `    os.execv(found, [found, '-I', '-B', '-c', ${JSON.stringify(oracleProgram)}])`,
-    `exec(${JSON.stringify(oracleProgram)})`,
-  ].join('\n');
-  const child = spawn(PYTHON, ['-I', '-B', '-c', program], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const child = spawn(python, ['-I', '-B', '-c', oracleProgram], { stdio: ['ignore', 'pipe', 'pipe'] });
   return { child, output: captureChildOutput(child) };
 }
 
-async function pythonHolder(home: string, seconds: number): Promise<SpawnedPython> {
-  const spawned = spawnVendoredPython(home, [
+it('detects missing Python and uv through an injected PATH without throwing', async () => {
+  const noCommands = await mkdtemp(join(tmpdir(), 'qlb-no-python-or-uv-'));
+  try {
+    assert.equal(findVendoredPython(noCommands), undefined);
+  } finally {
+    await rm(noCommands, { recursive: true, force: true });
+  }
+});
+
+async function pythonHolder(python: string, home: string, seconds: number): Promise<SpawnedPython> {
+  const spawned = spawnVendoredPython(python, home, [
     'import time',
     'from claude_swap.claude_locks import claude_credentials_lock',
     'with claude_credentials_lock(timeout=2):',
@@ -434,14 +456,19 @@ describe('Claude Code proper-lockfile locks', () => {
     }
   });
 
-  it('blocks behind vendored C-swap v0.28.0 and blocks it in return', async () => {
+  it('blocks behind vendored C-swap v0.28.0 and blocks it in return', async (t) => {
+    const python = findVendoredPython();
+    if (!python) {
+      t.skip(PYTHON_REQUIREMENT);
+      return;
+    }
     assert.equal(existsSync(CSWAP_V028_SOURCE), true, `missing vendored oracle at ${CSWAP_V028_SOURCE}`);
     const home = await tempHome();
     let holder: SpawnedPython | undefined;
     let waiter: SpawnedPython | undefined;
     let release: (() => void) | undefined;
     try {
-      holder = await pythonHolder(home, 0.25);
+      holder = await pythonHolder(python, home, 0.25);
       const started = Date.now();
       await withClaudeCredentialLocks({ home, env: {}, timeoutMs: 2_000, retryMinMs: 5, retryJitterMs: 0 }, async () => {});
       assert.ok(Date.now() - started >= 150, 'QLB waited for the vendored C-swap holder');
@@ -453,7 +480,7 @@ describe('Claude Code proper-lockfile locks', () => {
       await waitFor(() =>
         existsSync(join(home, '.claude', '.oauth_refresh.lock')) && existsSync(join(home, '.claude.lock')),
       );
-      waiter = spawnVendoredPython(home, [
+      waiter = spawnVendoredPython(python, home, [
         'import threading, time',
         'from claude_swap.claude_locks import claude_credentials_lock',
         'started = time.monotonic()',

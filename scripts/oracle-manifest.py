@@ -175,7 +175,7 @@ def _manifest() -> dict[str, object]:
         "files": file_hashes,
         "files_aggregate_sha256": files_aggregate_sha256,
         "git_blob_ids": git_blob_ids,
-        "purpose": "Complete claude-swap v0.28.0 source closure and reference material; it is not executed by Node or QLB.",
+        "purpose": "Complete claude-swap v0.28.0 source closure and reference material; the cc-locks interop test executes it via python3 -I -B, never QLB at runtime.",
         "tag": "v0.28.0",
         "test_def_counts": {
             path.relative_to(ORACLE).as_posix(): _test_def_count(path) for path in _files_below(test_root)
