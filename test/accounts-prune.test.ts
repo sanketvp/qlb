@@ -1170,7 +1170,7 @@ describe('T-KIND native-retirement writer',
       assert.equal(result.ok, true);
       const cfg = defaultConfig(dir);
       cfg.dbPath = store.dbPath;
-      const report = await doctorQlb(cfg, { command: () => 'ok' });
+      const report = await doctorQlb(cfg, { command: () => 'ok', hostCommand: () => '' });
       const migration = report.checks.find((c) => c.name === 'migrations');
       assert.equal(migration?.level, 'PASS');
       store.close();
