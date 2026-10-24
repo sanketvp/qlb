@@ -265,7 +265,7 @@ describe('codex auth.json helpers', () => {
             refresh_token: 'test-refresh-token',
           },
         })), 'utf8');
-        const result = spawnSync(process.execPath, [join(__dirname, '..', 'src', 'cli.js'), 'codex', 'probe-claims', '--json'], {
+        const result = spawnSync(process.execPath, ['--disable-warning=ExperimentalWarning', join(__dirname, '..', 'src', 'cli.js'), 'codex', 'probe-claims', '--json'], {
           encoding: 'utf8',
           env: { ...process.env, CODEX_HOME: codexHome, HOME: codexHome },
         });
