@@ -46,7 +46,7 @@
     {"id":"P0","start":["A5","R0","A12","A10","K13"],"files":["src/pi-gate.ts","src/commands/gate.ts","src/checks/pi-evidence-gap.ts","test/gate-guard.test.ts","test/gate-concurrency.test.ts"]},
     {"id":"P6","start":["A5","R0","A12","A10"],"files":["src/token/xai.ts","src/token/kimi-coding.ts","src/token/openrouter.ts","src/commands/token.ts","test/token-guard.test.ts"]},
     {"id":"C4","start":["C2b","A5","R0"],"files":["src/usage/openai-codex.ts","src/commands/usage-probe.ts","src/checks/codex-usage-shape.ts","test/adapter-codex-usage.test.ts","test/usage-probe.test.ts"]},
-    {"id":"K13","start":["A5","R0"],"files":["src/lifecycle.ts","src/commands/cutover.ts","src/commands/lifecycle.ts","src/checks/lifecycle-window.ts","src/checks/lifecycle-drill.ts","src/cswap-agent.ts","test/lifecycle.test.ts"]},
+    {"id":"K13","start":["A5","R0","A10"],"files":["src/lifecycle.ts","src/commands/cutover.ts","src/commands/lifecycle.ts","src/checks/lifecycle-window.ts","src/checks/lifecycle-drill.ts","src/cswap-agent.ts","src/bootstrap.ts","test/lifecycle.test.ts"]},
     {"id":"A10b","start":["A10","R0"],"files":["test/cli-subprocess-guard.test.ts"]},
     {"id":"C5b","start":["C5","A5"],"files":["src/codex-sessions.ts","test/codex-sessions.test.ts"]},
 
@@ -99,7 +99,7 @@
 
     {"id":"C4-live","start":["C4","P3","A11"],"files":[]},
     {"id":"P5-live","start":["P5","A11"],"files":[]},
-    {"id":"X1","start":["H3","D2"],"files":[]},
+    {"id":"X1","start":["A0b","A0c","H1","R0","A12","A8","A9","K0","D1","D3","P1","C2b","C5","A14","A3c","A3d","A5","A10","C1b","C1c","A13","A2b","A2d","A4d","A7","A11","A6b","P0","P6","C4","K13","A10b","C5b","K1","K2","C3","P2","P3","P4","P5","P5b","P6b","P12","P13","A2c","C3b","K13b","P7a","K3","K4","C10","C7","K11","P10","P11","P7","P8","K5","K6","K10","C6","K8","C6b","P9","K12","K9","K14","X4a","K7","K5b","C8","H2","H3","D2"],"files":[]},
     {"id":"X2","start":["X1"],"files":[]},
     {"id":"C9","start":["X2"],"files":[]},
     {"id":"X3","start":["X2","C9"],"files":[]},

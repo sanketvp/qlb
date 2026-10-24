@@ -2,7 +2,17 @@
 
 import { readFileSync } from "node:fs";
 
+const schemaVersion = 1;
 const registrySource = /^src\/(?:commands|checks|token|gate|auto|usage)\//;
+
+function isCanonicalRepoPath(path) {
+  return typeof path === "string"
+    && path.length > 0
+    && !path.startsWith("/")
+    && !path.includes("\\")
+    && !path.includes("//")
+    && !path.split("/").some((segment) => segment === "" || segment === "." || segment === "..");
+}
 
 function fail(violations, message) {
   violations.push(message);
@@ -22,6 +32,9 @@ function validate(document) {
   if (!document || typeof document !== "object" || !Array.isArray(document.slices)) {
     return ["document must contain a slices array"];
   }
+  if (document.schemaVersion !== schemaVersion) {
+    fail(violations, `schemaVersion must be ${schemaVersion}`);
+  }
 
   const byId = new Map();
   for (const slice of document.slices) {
@@ -34,14 +47,23 @@ function validate(document) {
       fail(violations, "slice has no id");
       continue;
     }
+    const malformedStart = !Array.isArray(start) || !start.every((entry) => typeof entry === "string");
+    const malformedFiles = !Array.isArray(files) || !files.every((entry) => typeof entry === "string" && entry.length > 0);
+    if (malformedStart) fail(violations, `${id}: start must be a string array`);
+    if (malformedFiles) fail(violations, `${id}: files must be a non-empty-string array`);
+    if (malformedStart || malformedFiles) continue;
+
+    let hasNonCanonicalFile = false;
+    for (const file of files) {
+      if (!isCanonicalRepoPath(file)) {
+        fail(violations, `${id}: file path must be a canonical repo-relative POSIX path: ${file}`);
+        hasNonCanonicalFile = true;
+      }
+    }
+    if (hasNonCanonicalFile) continue;
+
     if (byId.has(id)) fail(violations, `duplicate slice id: ${id}`);
     else byId.set(id, slice);
-    if (!Array.isArray(start) || !start.every((entry) => typeof entry === "string")) {
-      fail(violations, `${id}: start must be a string array`);
-    }
-    if (!Array.isArray(files) || !files.every((entry) => typeof entry === "string" && entry.length > 0)) {
-      fail(violations, `${id}: files must be a non-empty-string array`);
-    }
   }
 
   for (const [id, slice] of byId) {
