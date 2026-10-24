@@ -1,6 +1,6 @@
-import { createHash, randomBytes } from 'node:crypto';
-import { open, readFile as readFileFromDisk, rename, unlink } from 'node:fs/promises';
-import { dirname } from 'node:path';
+import { createHash } from 'node:crypto';
+import { readFile as readFileFromDisk } from 'node:fs/promises';
+import { atomicWriteText } from './fsutil';
 
 const ACCESS_EXPIRY_BUFFER_MS = 5 * 60 * 1_000;
 const REFRESH_AGE_MS = 8 * 24 * 60 * 60 * 1_000;
@@ -105,8 +105,8 @@ export function parseCodexAuth(text: string): CodexAuthParseResult {
   };
 }
 
-/** Returns the stable Codex identity key; email is deliberately not an identity field. */
-export function codexIdentity(doc: CodexAuthDocument): CodexIdentity | null {
+/** Returns the S29 composite Codex identity key; email is deliberately not an identity field. */
+export function codexIdentity(doc: CodexAuthDocument): string | null {
   const payload = decodeJwtPayload(doc.tokens.id_token);
   const authClaims = payload ? payload[OPENAI_AUTH_CLAIM] : undefined;
   if (!isObject(authClaims)) return null;
@@ -114,7 +114,7 @@ export function codexIdentity(doc: CodexAuthDocument): CodexIdentity | null {
   const chatgptUserId = authClaims.chatgpt_user_id;
   const accountId = doc.tokens.account_id || authClaims.chatgpt_account_id;
   if (!nonEmptyString(chatgptUserId) || !nonEmptyString(accountId)) return null;
-  return { chatgpt_user_id: chatgptUserId, account_id: accountId };
+  return codexIdentityKey({ chatgpt_user_id: chatgptUserId, account_id: accountId });
 }
 
 /** Returns the access-token JWT expiry in milliseconds, or null for an invalid JWT. */
@@ -143,66 +143,19 @@ export function codexFingerprint(doc: CodexAuthDocument): string {
   return `sha256:${createHash('sha256').update(doc.tokens.refresh_token, 'utf8').digest('hex')}`;
 }
 
-/**
- * The document was atomically published, but its directory entry could not be
- * fsynced; callers must not treat this as a failed publish or roll it back.
- */
-export class PublishedNotDurableError extends Error {
-  constructor(path: string, cause: unknown) {
-    super(`Codex auth document was published but is not durable: ${path}`, { cause });
-    this.name = 'PublishedNotDurableError';
-  }
-}
-
 function errorCode(error: unknown): string | undefined {
   if (typeof error !== 'object' || error === null || !('code' in error)) return undefined;
   const { code } = error as { code?: unknown };
   return typeof code === 'string' ? code : undefined;
 }
 
-async function syncContainingDirectory(path: string): Promise<void> {
-  let directoryHandle: Awaited<ReturnType<typeof open>> | undefined;
-  try {
-    directoryHandle = await open(dirname(path), 'r');
-    await directoryHandle.sync();
-  } catch (error) {
-    const code = errorCode(error);
-    if (code !== 'EISDIR' && code !== 'EINVAL') throw error;
-  } finally {
-    if (directoryHandle) await directoryHandle.close();
-  }
-}
-
 /**
- * Writes an auth document using a same-directory, mode-0600 temporary file and
- * atomic rename. It never logs the document or any token it contains.
- * Symlink write-through is handled by the C1b fsutil migration.
+ * Atomically publishes an auth document through fsutil and returns its inode.
+ * The shared writer creates a private mode-0600 temporary file, fsyncs it, and
+ * writes through a final-path symlink rather than replacing that symlink.
  */
-export async function writeCodexAuthAtomic(path: string, doc: CodexAuthDocument): Promise<void> {
-  const temporaryPath = `${path}.qlb-tmp-${randomBytes(8).toString('hex')}`;
-  const contents = `${JSON.stringify(doc, null, 2)}\n`;
-  let handle: Awaited<ReturnType<typeof open>> | undefined;
-  let temporaryFileCreated = false;
-  try {
-    handle = await open(temporaryPath, 'wx', 0o600);
-    temporaryFileCreated = true;
-    await handle.chmod(0o600);
-    await handle.writeFile(contents, 'utf8');
-    await handle.sync();
-    await handle.close();
-    handle = undefined;
-    await rename(temporaryPath, path);
-  } catch (error) {
-    if (handle) await handle.close().catch(() => undefined);
-    if (temporaryFileCreated) await unlink(temporaryPath).catch(() => undefined);
-    throw error;
-  }
-
-  try {
-    await syncContainingDirectory(path);
-  } catch (error) {
-    throw new PublishedNotDurableError(path, error);
-  }
+export async function writeCodexAuthAtomic(path: string, doc: CodexAuthDocument): Promise<number> {
+  return atomicWriteText(path, `${JSON.stringify(doc, null, 2)}\n`, { mode: 0o600 });
 }
 
 function defaultSleep(ms: number): Promise<void> {

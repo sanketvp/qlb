@@ -1,21 +1,20 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { lstat, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { basename, dirname, join } from 'node:path';
-import { describe, it, mock } from 'node:test';
+import { basename, join } from 'node:path';
+import { describe, it } from 'node:test';
 import { isDeepStrictEqual } from 'node:util';
 import {
   accessExpiry,
   codexFingerprint,
   codexIdentity,
   needsRefresh,
-  PublishedNotDurableError,
   parseCodexAuth,
   readCodexAuthStable,
   writeCodexAuthAtomic,
 } from '../src/codex-auth';
 
-const fsPromises: typeof import('node:fs/promises') = require('node:fs/promises');
+const fs: typeof import('node:fs') = require('node:fs');
 
 function jwt(payload: Record<string, unknown>): string {
   return `eyJhbGciOiJub25lIn0.${Buffer.from(JSON.stringify(payload)).toString('base64url')}.sig`;
@@ -95,12 +94,9 @@ describe('codex auth.json helpers', () => {
     assert.equal(doc.unknown_top_level, true);
   });
 
-  it('extracts identity only from the namespaced claim and gives stored account ID precedence', () => {
+  it('returns the S29 composite identity only from the namespaced claim and gives stored account ID precedence', () => {
     const doc = parseValid();
-    assert.deepEqual(codexIdentity(doc), {
-      chatgpt_user_id: 'user-1',
-      account_id: 'stored-account',
-    });
+    assert.equal(codexIdentity(doc), 'user-1:stored-account');
 
     const noClaims = parseValid({
       tokens: {
@@ -203,88 +199,36 @@ describe('codex auth.json helpers', () => {
     assert.match(fingerprint, /^sha256:[a-f0-9]{64}$/);
   });
 
-  it('writes atomically at mode 0600 with no temporary file and preserves unknown fields', async () => {
+  it('writes through fsutil, returning its inode after fstat observes mode 0600 before rename', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'qlb-codex-auth-'));
     const path = join(dir, 'auth.json');
+    const originalFstat = fs.fstatSync;
+    const originalRename = fs.renameSync;
+    const calls: string[] = [];
+    let observedMode: number | undefined;
+    fs.fstatSync = ((fd: number) => {
+      calls.push('fstat');
+      const metadata = originalFstat(fd);
+      observedMode = metadata.mode & 0o777;
+      return metadata;
+    }) as typeof fs.fstatSync;
+    fs.renameSync = ((...args: Parameters<typeof fs.renameSync>) => {
+      calls.push('rename');
+      assert.equal(observedMode, 0o600);
+      return originalRename(...args);
+    }) as typeof fs.renameSync;
     try {
       const doc = parseValid({ unknown_top_level: { retained: true } });
-      await writeCodexAuthAtomic(path, doc);
+      const inode = await writeCodexAuthAtomic(path, doc);
       const written = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
       assert.deepEqual(written.unknown_top_level, { retained: true });
       assert.equal((await stat(path)).mode & 0o777, 0o600);
-      await assert.rejects(stat(`${path}.qlb-tmp`));
+      assert.equal(inode, (await stat(path)).ino);
+      assert.deepEqual(calls, ['fstat', 'rename']);
+      assert.deepEqual(await readdir(dir), ['auth.json']);
     } finally {
-      await rm(dir, { recursive: true, force: true });
-    }
-  });
-
-  it('reports directory-fsync failures as published but not durable', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'qlb-codex-auth-'));
-    const path = join(dir, 'auth.json');
-    const originalOpen = fsPromises.open;
-    const directoryHandle = {
-      sync: async () => {
-        throw Object.assign(new Error('directory sync failed'), { code: 'EIO' });
-      },
-      close: async () => {},
-    };
-    const openMock = mock.method(fsPromises, 'open', async (...args: Parameters<typeof fsPromises.open>) => {
-      const [file, flags] = args;
-      if (file === dirname(path) && flags === 'r') return directoryHandle as never;
-      return originalOpen(...args);
-    });
-    try {
-      await assert.rejects(
-        writeCodexAuthAtomic(path, parseValid()),
-        (error: unknown) => error instanceof PublishedNotDurableError,
-      );
-      assert.deepEqual(JSON.parse(await readFile(path, 'utf8')), parseValid());
-    } finally {
-      openMock.mock.restore();
-      await rm(dir, { recursive: true, force: true });
-    }
-  });
-
-  it('ignores platform EINVAL failures opening the directory for fsync', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'qlb-codex-auth-'));
-    const path = join(dir, 'auth.json');
-    const originalOpen = fsPromises.open;
-    const openMock = mock.method(fsPromises, 'open', async (...args: Parameters<typeof fsPromises.open>) => {
-      const [file, flags] = args;
-      if (file === dirname(path) && flags === 'r') {
-        throw Object.assign(new Error('directory open unsupported'), { code: 'EINVAL' });
-      }
-      return originalOpen(...args);
-    });
-    try {
-      await writeCodexAuthAtomic(path, parseValid());
-      assert.deepEqual(JSON.parse(await readFile(path, 'utf8')), parseValid());
-    } finally {
-      openMock.mock.restore();
-      await rm(dir, { recursive: true, force: true });
-    }
-  });
-
-  it('ignores platform directory-fsync EINVAL failures', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'qlb-codex-auth-'));
-    const path = join(dir, 'auth.json');
-    const originalOpen = fsPromises.open;
-    const directoryHandle = {
-      sync: async () => {
-        throw Object.assign(new Error('directory sync unsupported'), { code: 'EINVAL' });
-      },
-      close: async () => {},
-    };
-    const openMock = mock.method(fsPromises, 'open', async (...args: Parameters<typeof fsPromises.open>) => {
-      const [file, flags] = args;
-      if (file === dirname(path) && flags === 'r') return directoryHandle as never;
-      return originalOpen(...args);
-    });
-    try {
-      await writeCodexAuthAtomic(path, parseValid());
-      assert.deepEqual(JSON.parse(await readFile(path, 'utf8')), parseValid());
-    } finally {
-      openMock.mock.restore();
+      fs.fstatSync = originalFstat;
+      fs.renameSync = originalRename;
       await rm(dir, { recursive: true, force: true });
     }
   });
@@ -309,17 +253,18 @@ describe('codex auth.json helpers', () => {
     }
   });
 
-  it('does not follow a symlink at the old predictable temporary path', async () => {
+  it('writes through a symlinked auth.json without replacing the link', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'qlb-codex-auth-'));
     const path = join(dir, 'auth.json');
-    const victim = join(dir, 'victim');
+    const target = join(dir, 'actual-auth.json');
     try {
-      await writeFile(victim, 'unchanged', 'utf8');
-      await symlink(victim, `${path}.qlb-tmp`);
+      await writeFile(target, 'old', 'utf8');
+      await symlink(target, path);
       const doc = parseValid();
       await writeCodexAuthAtomic(path, doc);
-      assert.equal(await readFile(victim, 'utf8'), 'unchanged');
-      assert.deepEqual(JSON.parse(await readFile(path, 'utf8')), doc);
+      assert.deepEqual(JSON.parse(await readFile(target, 'utf8')), doc);
+      assert.equal((await stat(path)).ino, (await stat(target)).ino);
+      assert.equal((await lstat(path)).isSymbolicLink(), true);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
