@@ -70,6 +70,22 @@ type CommandRunner = (command: string, args: string[]) => string;
 const runCommand: CommandRunner = (command, args) =>
   execFileSync(command, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
 
+/** A bounded runner for host probes; never return login-shell environment output. */
+const runHostCommand: CommandRunner = (command, args) =>
+  execFileSync(command, args, {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'ignore'],
+    timeout: 5_000,
+  });
+
+const HOST_ENVIRONMENT_VARIABLES = [
+  'CODEX_HOME',
+  'CLAUDE_CONFIG_DIR',
+  'ANTHROPIC_API_KEY',
+  'OPENAI_API_KEY',
+  'ANTHROPIC_BASE_URL',
+] as const;
+
 function readJson(path: string): Record<string, unknown> | null {
   try {
     const parsed = JSON.parse(readFileSync(path, 'utf8')) as unknown;
@@ -255,6 +271,53 @@ function combineOverall(checks: Array<{ level: CheckLevel }>): CheckLevel {
   return 'PASS';
 }
 
+function probeHostTool(command: CommandRunner, name: 'herdr' | 'orca'): string {
+  try {
+    const version = command(name, ['--version']).trim();
+    return version || 'installed (version unavailable)';
+  } catch {
+    return 'not installed';
+  }
+}
+
+/**
+ * Detect host-level overrides without retaining, displaying, or serializing values.
+ * Orca and Herdr inherit this login-shell environment when launching their tools.
+ */
+function probeHostEnvironment(command: CommandRunner): DoctorCheck {
+  const detail = {
+    herdr: probeHostTool(command, 'herdr'),
+    orca: probeHostTool(command, 'orca'),
+  };
+  try {
+    const environment = command('zsh', ['-lic', 'env']);
+    const setVariables = HOST_ENVIRONMENT_VARIABLES.filter((name) =>
+      environment.split(/\r?\n/).some((line) => line.startsWith(`${name}=`)),
+    );
+    if (setVariables.length > 0) {
+      return {
+        name: 'hosts:env',
+        level: 'WARN',
+        message: `login shell sets ${setVariables.join(', ')}; Orca/Herdr-launched tools may bypass QLB-managed logins`,
+        detail,
+      };
+    }
+    return {
+      name: 'hosts:env',
+      level: 'PASS',
+      message: 'no QLB-bypassing variables are set in the login shell environment',
+      detail,
+    };
+  } catch {
+    return {
+      name: 'hosts:env',
+      level: 'WARN',
+      message: 'could not read login shell environment',
+      detail,
+    };
+  }
+}
+
 function probeCredentialStore(command?: CommandRunner): DoctorCheck {
   // Tests inject a command runner and still speak the macOS `security` CLI.
   if (command) {
@@ -310,6 +373,8 @@ export async function doctorQlb(
       provider: string,
       accountId: string,
     ) => Promise<ResyncCredential | null>;
+    /** Tests inject this bounded host command runner. */
+    hostCommand?: CommandRunner;
   } = {},
 ): Promise<DoctorReport> {
   const checks: DoctorCheck[] = [];
@@ -388,6 +453,7 @@ export async function doctorQlb(
   }
 
   checks.push(probeCredentialStore(options.command));
+  checks.push(probeHostEnvironment(options.hostCommand ?? runHostCommand));
 
   const owned = migrations.filter((m) => m.state === 'QLB_OWNED' || m.state === 'RETIRED');
   if (owned.length > 0 && accounts.length > 0) {
