@@ -1,47 +1,75 @@
 #!/usr/bin/env python3
 """Generate a deterministic, offline behavior oracle for claude-swap 0.28.0.
 
-This script imports only the pinned v0.28.0 source clone after replacing HOME
-with an empty temporary directory. It invokes no network, Keychain, credential
-store, or CLI APIs; every input below is synthetic.
+Normal checks import only the vendored upstream modules after replacing HOME
+with an empty temporary directory. Regeneration is deliberately explicit and
+requires a separately supplied upstream Git repository. This invokes no
+network, Keychain, credential store, or CLI APIs; every input below is synthetic.
 """
 
 from __future__ import annotations
 
 import argparse
 import dataclasses
-import io
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
-import tarfile
 import tempfile
 from pathlib import Path
 from typing import Any
 
-# claude-swap 0.28.0 requires Python 3.12. macOS supplies Python 3.9 as
-# `python3`, so retain the documented `python3 -I ...` entry point while
-# re-executing in the isolated 3.12 interpreter already installed for
-# claude-swap. This invokes no claude-swap CLI or package installation.
+def _python312_or_newer() -> Path | None:
+    candidates: list[str] = []
+    try:
+        found = subprocess.run(
+            ["uv", "python", "find", "3.12"], capture_output=True, check=False, text=True
+        ).stdout.strip()
+        if found:
+            candidates.append(found)
+    except FileNotFoundError:
+        pass
+    python312 = shutil.which("python3.12")
+    if python312:
+        candidates.append(python312)
+    for candidate in candidates:
+        path = Path(candidate)
+        if not (path.is_file() and os.access(path, os.X_OK)):
+            continue
+        result = subprocess.run(
+            [str(path), "-I", "-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        if result.returncode == 0 and tuple(map(int, result.stdout.strip().split("."))) >= (3, 12):
+            return path
+    return None
+
+
+# claude-swap 0.28.0 requires Python 3.12. Keep the documented `python3 -I`
+# entry point while finding a general-purpose interpreter rather than relying
+# on an installed claude-swap tool environment.
 if sys.version_info < (3, 12):
-    PYTHON312 = Path.home() / ".local/share/uv/tools/claude-swap/bin/python"
-    if not PYTHON312.is_file():
-        raise RuntimeError("claude-swap 0.28.0 golden generation requires Python 3.12")
-    os.execv(str(PYTHON312), [str(PYTHON312), "-I", str(Path(__file__).resolve()), *sys.argv[1:]])
+    python312 = _python312_or_newer()
+    if python312 is None:
+        print("claude-swap 0.28.0 golden generation requires Python 3.12 or newer", file=sys.stderr)
+        raise SystemExit(2)
+    os.execv(str(python312), [str(python312), "-I", str(Path(__file__).resolve()), *sys.argv[1:]])
 
 ROOT = Path(__file__).resolve().parent.parent
 GOLDENS = ROOT / "test" / "oracle" / "goldens"
-# This is the read-only clone supplied for the v0.28.0 oracle refresh.
-UPSTREAM_REPO = Path(
-    os.environ.get(
-        "CLAUDE_SWAP_V028_REPO",
-        "/private/tmp/claude-501/-Users-sanketpatel-GIT-Personal-sanketvp/"
-        "3b005b8d-b97c-4bb5-a726-86eaa04c5eb9/scratchpad/cswap-upstream/repo",
-    )
-)
+VENDORED_SRC = ROOT / "test" / "oracle" / "claude-swap-v0.28.0" / "src"
 PINNED_COMMIT = "2b2d71c7aeb49e6bd25393509ceb05dbca7b0e10"
+SOURCE_FILES = (
+    "__init__.py", "claude_locks.py", "credentials.py", "exceptions.py", "fsutil.py",
+    "json_output.py", "lines.py", "locking.py", "logging_config.py", "macos_keychain.py",
+    "models.py", "oauth.py", "pace.py", "paths.py",
+    "poll_policy.py", "printer.py", "process_detection.py", "session.py", "settings.py",
+    "switcher.py", "usage_store.py",
+)
 
 
 def _blocked_socket(*_args: Any, **_kwargs: Any) -> None:
@@ -73,50 +101,65 @@ def _round_plan(plan: tuple[float, float]) -> dict[str, float]:
     return {"next_poll_at": round(plan[0], 6), "interval_s": round(plan[1], 6)}
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--check", action="store_true", help="fail if committed goldens differ")
-    args = parser.parse_args()
-    if not sys.flags.isolated:
-        parser.error("run this script with Python -I")
-
-    if not (UPSTREAM_REPO / ".git").exists():
-        parser.error(f"pinned claude-swap v0.28.0 clone is unavailable: {UPSTREAM_REPO}")
-
-    with tempfile.TemporaryDirectory(prefix="qlb-oracle-home-") as temp_home:
-        home = Path(temp_home)
-        commit = subprocess.run(
-            ["git", "-C", str(UPSTREAM_REPO), "rev-parse", f"{PINNED_COMMIT}^{{commit}}"],
-            capture_output=True,
+def _source_from_git(repository: str, staging: Path) -> Path:
+    """Materialize the exact imported source closure from a maintainer-supplied repo."""
+    supplied = Path(repository).expanduser()
+    if supplied.is_dir() and (supplied / ".git").exists():
+        repo = supplied.resolve()
+    else:
+        repo = staging / "upstream"
+        subprocess.run(
+            ["git", "clone", "--depth", "1", "--branch", "v0.28.0", repository, str(repo)],
             check=True,
-            text=True,
-        ).stdout.strip()
-        if commit != PINNED_COMMIT:
-            raise RuntimeError("claude-swap v0.28.0 tag does not match the pinned commit")
-        archive = subprocess.run(
-            ["git", "-C", str(UPSTREAM_REPO), "archive", "--format=tar", PINNED_COMMIT, "src"],
+        )
+    commit = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", f"{PINNED_COMMIT}^{{commit}}"],
+        capture_output=True,
+        check=True,
+        text=True,
+    ).stdout.strip()
+    if commit != PINNED_COMMIT:
+        raise RuntimeError("claude-swap v0.28.0 tag does not match the pinned commit")
+
+    source_root = staging / "src"
+    package = source_root / "claude_swap"
+    package.mkdir(parents=True)
+    for name in SOURCE_FILES:
+        content = subprocess.run(
+            ["git", "-C", str(repo), "show", f"{PINNED_COMMIT}:src/claude_swap/{name}"],
             capture_output=True,
             check=True,
         ).stdout
-        source_root = home / "pinned-source"
-        with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
-            for member in tar.getmembers():
-                destination = source_root / member.name
-                if not destination.resolve().is_relative_to(source_root.resolve()):
-                    raise RuntimeError("refusing an unsafe path in the claude-swap source archive")
-                if member.isdir():
-                    destination.mkdir(parents=True, exist_ok=True)
-                elif member.isfile():
-                    destination.parent.mkdir(parents=True, exist_ok=True)
-                    source = tar.extractfile(member)
-                    if source is None:
-                        raise RuntimeError(f"could not read source archive member: {member.name}")
-                    destination.write_bytes(source.read())
-                else:
-                    raise RuntimeError(f"unexpected source archive member: {member.name}")
-        upstream_src = source_root / "src"
+        (package / name).write_bytes(content)
+    return source_root
+
+
+def _validate_source_root(source_root: Path) -> None:
+    missing = [name for name in SOURCE_FILES if not (source_root / "claude_swap" / name).is_file()]
+    if missing:
+        raise RuntimeError(f"vendored claude-swap v0.28.0 source is incomplete: {', '.join(missing)}")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    modes = parser.add_mutually_exclusive_group(required=True)
+    modes.add_argument("--check", action="store_true", help="fail if committed goldens differ")
+    modes.add_argument("--regen", action="store_true", help="rewrite goldens from the pinned upstream source")
+    parser.add_argument("--from-git", metavar="URL_OR_PATH", help="upstream Git repository for --regen")
+    args = parser.parse_args()
+    if not sys.flags.isolated:
+        parser.error("run this script with Python -I")
+    # Vendored oracle inputs are immutable; do not create machine-specific bytecode beside them.
+    sys.dont_write_bytecode = True
+    if args.regen != bool(args.from_git):
+        parser.error("--regen requires --from-git URL_OR_PATH, and --from-git requires --regen")
+
+    with tempfile.TemporaryDirectory(prefix="qlb-oracle-home-") as temp_home:
+        home = Path(temp_home)
+        upstream_src = _source_from_git(args.from_git, home) if args.regen else VENDORED_SRC
+        _validate_source_root(upstream_src)
         # Python -I omits user and environment import paths. Insert this exact
-        # tag's source explicitly so this can never use installed claude-swap.
+        # tag's source explicitly so this can never use an installed claude-swap.
         sys.path.insert(0, str(upstream_src))
         # The source tree is intentionally not installed. Supply only the
         # package metadata needed by claude_swap.__init__ without exposing any

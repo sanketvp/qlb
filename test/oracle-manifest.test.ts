@@ -39,7 +39,19 @@ describe('claude-swap v0.28.0 oracle provenance', () => {
     assert.equal(manifest.upstream, 'https://github.com/realiti4/claude-swap');
     assert.equal(manifest.tag, 'v0.28.0');
     assert.equal(manifest.commit, '2b2d71c7aeb49e6bd25393509ceb05dbca7b0e10');
-    assert.equal(Object.keys(manifest.files).length, 51);
+    assert.equal(Object.keys(manifest.files).length, 72);
+    assert.deepEqual(
+      Object.keys(manifest.files)
+        .filter((path) => path.startsWith('test/oracle/claude-swap-v0.28.0/src/'))
+        .sort(),
+      [
+        '__init__.py', 'claude_locks.py', 'credentials.py', 'exceptions.py', 'fsutil.py',
+        'json_output.py', 'lines.py', 'locking.py', 'logging_config.py', 'macos_keychain.py',
+        'models.py', 'oauth.py', 'pace.py', 'paths.py',
+        'poll_policy.py', 'printer.py', 'process_detection.py', 'session.py', 'settings.py',
+        'switcher.py', 'usage_store.py',
+      ].map((name) => `test/oracle/claude-swap-v0.28.0/src/claude_swap/${name}`),
+    );
     assert.equal(Object.keys(manifest.test_def_counts).length, 50);
     assert.equal(manifest.test_def_counts['tests/test_switcher.py'], 502);
     assert.deepEqual(
