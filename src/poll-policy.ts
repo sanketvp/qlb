@@ -1,4 +1,4 @@
-// Ported from claude-swap 0.28.0 (MIT, Copyright (c) realiti4) — poll_policy.py lines 73–284; lines.py lines 39–45.
+// Ported from claude-swap 0.28.0 (MIT, Copyright (c) realiti4) — poll_policy.py lines 73–284; lines.py lines 39–45; usage_store.py lines 439–491.
 
 /** Freshness floor shared by every collector. */
 export const SERVE_TTL_S = 180.0;
@@ -22,6 +22,14 @@ export const RESET_SLACK_S = 60.0;
 
 export type Usage = Record<string, unknown>;
 export type RandomSource = () => number;
+
+/** Scheduling state needed to decide which candidate slot is due next. */
+export interface DueCandidateSlot {
+  lastFetchAt?: number | null;
+  lastAttemptAt?: number | null;
+  nextDueAt?: number | null;
+  backoffUntil?: number | null;
+}
 
 type RelevantWindow = readonly [label: string, pct: number, resetsAt: unknown];
 
@@ -192,6 +200,41 @@ export function planAfterFetch({
     if (resetTs !== null) nextPoll = Math.min(nextPoll, resetTs + RESET_SLACK_S);
   }
   return [nextPoll, interval];
+}
+
+/**
+ * Return the due candidate least recently attempted or measured, or null.
+ *
+ * A slot remains ineligible until its backoff and planned due time have both
+ * elapsed. Among eligible slots, max(lastFetchAt, lastAttemptAt) rotates a
+ * slot that repeatedly fails without producing a measurement behind other due
+ * slots, matching usage_store.py's starvation protection.
+ */
+export function dueCandidate(
+  candidates: readonly string[],
+  entries: Readonly<Record<string, DueCandidateSlot>>,
+  now: number,
+): string | null {
+  const due: Array<[lastTouchedAt: number, slot: string]> = [];
+  for (const slot of candidates) {
+    const entry = entries[slot];
+    if (entry === undefined) {
+      due.push([0, slot]);
+      continue;
+    }
+    if (entry.backoffUntil !== null && entry.backoffUntil !== undefined && now < entry.backoffUntil) {
+      continue;
+    }
+    if (entry.nextDueAt !== null && entry.nextDueAt !== undefined && now < entry.nextDueAt) {
+      continue;
+    }
+    due.push([Math.max(entry.lastFetchAt || 0, entry.lastAttemptAt || 0), slot]);
+  }
+  due.sort(([leftTouchedAt, leftSlot], [rightTouchedAt, rightSlot]) => {
+    if (leftTouchedAt !== rightTouchedAt) return leftTouchedAt - rightTouchedAt;
+    return leftSlot < rightSlot ? -1 : leftSlot > rightSlot ? 1 : 0;
+  });
+  return due[0]?.[1] ?? null;
 }
 
 // Python-name aliases make port provenance and cross-language comparisons explicit.

@@ -1,3 +1,5 @@
+// Ported from claude-swap 0.28.0 (MIT, Copyright (c) realiti4) — test_usage_store.py TestDueCandidate.
+
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
@@ -14,6 +16,8 @@ import {
   SERVE_TTL_S,
   URGENT_INTERVAL_S,
   bindingPct,
+  dueCandidate,
+  type DueCandidateSlot,
   planAfterFetch,
 } from '../src/poll-policy';
 
@@ -197,5 +201,92 @@ describe('claude-swap poll policy port', () => {
       POST_429_MAX_INTERVAL_S: 1800, EXHAUSTED_INTERVAL_S: 600, JITTER_FRAC: 0.1,
     });
     assert.equal(bindingPct({ five_hour: { pct: 80 }, seven_day: { pct: 20 } }), 80);
+  });
+});
+
+describe('claude-swap due-candidate port', () => {
+  const now = 1_000_000;
+
+  it('matches the v0.28.0 TestDueCandidate golden grid', () => {
+    // Direct transcription of usage_store.py v0.28.0 TestDueCandidate cases
+    // that concern the pure fields exposed by this TypeScript port.
+    const grid: Array<{
+      candidates: string[];
+      entries: Record<string, DueCandidateSlot>;
+      now?: number;
+      expected: string | null;
+    }> = [
+      { candidates: ['2', '3'], entries: { '3': { lastFetchAt: now - 60 } }, expected: '2' },
+      {
+        candidates: ['2', '3'],
+        entries: { '2': { lastFetchAt: now - 999 }, '3': {} },
+        expected: '3',
+      },
+      {
+        candidates: ['2', '3'],
+        entries: { '2': { lastFetchAt: now - 60 }, '3': { lastFetchAt: now - 300 } },
+        expected: '3',
+      },
+      { candidates: ['2'], entries: { '2': { backoffUntil: now + 10 } }, expected: null },
+      {
+        candidates: ['2'],
+        entries: { '2': { backoffUntil: now + 10 } },
+        now: now + 11,
+        expected: '2',
+      },
+      {
+        candidates: ['2', '3'],
+        entries: {
+          '2': { lastFetchAt: now - 300, nextDueAt: now + 60 },
+          '3': { lastFetchAt: now - 60 },
+        },
+        expected: '3',
+      },
+      {
+        candidates: ['2', '3'],
+        entries: {
+          '2': { lastFetchAt: now - 400, lastAttemptAt: now - 400 },
+          '3': { lastAttemptAt: now - 60 },
+        },
+        expected: '2',
+      },
+      {
+        candidates: ['2', '3'],
+        entries: {
+          '2': { lastFetchAt: now - 30, lastAttemptAt: now - 30 },
+          '3': { lastAttemptAt: now - 60 },
+        },
+        expected: '3',
+      },
+      {
+        candidates: ['2', '3'],
+        entries: {
+          '2': { lastFetchAt: now - 30, lastAttemptAt: now - 900 },
+          '3': { lastFetchAt: now - 600, lastAttemptAt: now - 600 },
+        },
+        expected: '3',
+      },
+      { candidates: [], entries: {}, expected: null },
+    ];
+
+    for (const row of grid) {
+      assert.equal(dueCandidate(row.candidates, row.entries, row.now ?? now), row.expected);
+    }
+  });
+
+  it('does not let a repeatedly failing slot starve another due slot', () => {
+    // The failed slot has no new measurement but was attempted on the latest
+    // tick. C-swap keys on max(fetchedAt, lastAttemptAt), so the older healthy
+    // slot must be nominated next.
+    const entries: Record<string, DueCandidateSlot> = {
+      failed: { lastFetchAt: now - 1_000, lastAttemptAt: now - 5 },
+      other: { lastFetchAt: now - 100, lastAttemptAt: now - 100 },
+    };
+    assert.equal(dueCandidate(['failed', 'other'], entries, now), 'other');
+
+    // Once the other slot was polled, the previously failing slot gets its
+    // turn again rather than being suppressed permanently.
+    entries.other.lastAttemptAt = now;
+    assert.equal(dueCandidate(['failed', 'other'], entries, now), 'failed');
   });
 });
