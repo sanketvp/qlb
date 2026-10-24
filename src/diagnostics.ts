@@ -297,11 +297,18 @@ function minimalLoginShellEnvironment(): NodeJS.ProcessEnv {
   return env;
 }
 
-function selectLoginShell(shell: string | undefined, shellExists: (path: string) => boolean): string | null {
-  if (shell && isAbsolute(shell) && ['zsh', 'bash', 'sh'].includes(basename(shell)) && shellExists(shell)) {
-    return shell;
+function selectLoginShell(
+  shell: string | undefined,
+  shellExists: (path: string) => boolean,
+): { path: string | null; unsupportedShell: string | null } {
+  if (!shell) {
+    return { path: shellExists('/bin/zsh') ? '/bin/zsh' : null, unsupportedShell: null };
   }
-  return shellExists('/bin/zsh') ? '/bin/zsh' : null;
+  if (!isAbsolute(shell)) return { path: null, unsupportedShell: null };
+  if (!['zsh', 'bash', 'sh'].includes(basename(shell))) {
+    return { path: null, unsupportedShell: basename(shell) };
+  }
+  return { path: shellExists(shell) ? shell : null, unsupportedShell: null };
 }
 
 /**
@@ -321,19 +328,21 @@ function probeHostEnvironment(
     orca: probeHostTool(command, 'orca'),
   };
   const shell = options.platform === 'win32'
-    ? null
+    ? { path: null, unsupportedShell: null }
     : selectLoginShell(options.shell, options.shellExists);
-  if (!shell) {
+  if (!shell.path) {
     return {
       name: 'hosts:env',
       level: 'PASS',
-      message: 'hosts:env skipped: no POSIX login shell',
+      message: shell.unsupportedShell
+        ? `hosts:env skipped: unsupported login shell ${shell.unsupportedShell}`
+        : 'hosts:env skipped: no POSIX login shell',
       detail,
     };
   }
   try {
     // -i retains the interactive rc-chain used by host-launched tools.
-    const environment = command(shell, ['-lic', 'env'], { env: minimalLoginShellEnvironment() });
+    const environment = command(shell.path, ['-lic', 'env'], { env: minimalLoginShellEnvironment() });
     const setVariables = HOST_ENVIRONMENT_VARIABLES.filter((name) =>
       environment.split(/\r?\n/).some((line) => line.startsWith(`${name}=`)),
     );

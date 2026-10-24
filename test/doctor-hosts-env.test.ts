@@ -129,9 +129,36 @@ describe('qlb doctor hosts:env', () => {
     assert.equal(check.message, 'hosts:env skipped: no POSIX login shell');
   });
 
+  it('skips unsupported fish and tcsh login shells', async () => {
+    for (const [hostShell, name] of [
+      ['/opt/homebrew/bin/fish', 'fish'],
+      ['/bin/tcsh', 'tcsh'],
+    ]) {
+      const check = await hostsCheck(fakeRunner('PATH=/usr/bin\n'), {
+        hostShell,
+        hostShellExists: (path) => path === '/bin/zsh',
+      });
+      assert.equal(check.level, 'PASS');
+      assert.equal(check.message, `hosts:env skipped: unsupported login shell ${name}`);
+    }
+  });
+
+  it('falls back to zsh when SHELL is unset', async () => {
+    let shell: string | undefined;
+    await hostsCheck((command, args) => {
+      if (args[0] === '--version') throw missingCommand(command);
+      shell = command;
+      return 'PATH=/usr/bin\n';
+    }, {
+      hostShell: undefined,
+      hostShellExists: (path) => path === '/bin/zsh',
+    });
+    assert.equal(shell, '/bin/zsh');
+  });
+
   it('skips when no usable POSIX shell exists', async () => {
     const check = await hostsCheck(fakeRunner('PATH=/usr/bin\n'), {
-      hostShell: '/not/a/shell',
+      hostShell: '/not/a/bash',
       hostShellExists: () => false,
     });
     assert.equal(check.level, 'PASS');
