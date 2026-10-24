@@ -151,7 +151,8 @@ function compareRows(a: CodexSwitchLogRow, b: CodexSwitchLogRow): number {
  * interim conservative rule; replaced by S12 holder sets in slice C5b; may
  * over-count holders (safe), never under-count. Every input row must be for
  * `openai-codex`. A writing row (anything except `refused` or `noop`) makes
- * both sides possibly live until an `ok` row definitely replaces its source.
+ * both sides possibly live from its row time; an `ok` row then definitely
+ * replaces its source at that same instant.
  */
 export function holderEras(switchLogRows: readonly CodexSwitchLogRow[]): HolderEra[] {
   if (switchLogRows.length === 0) return [];
@@ -190,8 +191,9 @@ export function holderEras(switchLogRows: readonly CodexSwitchLogRow[]): HolderE
     if (!isWritingRow(row.outcome)) continue;
     const time = rowTime(row);
     if (row.outcome === 'ok') {
-      // An `ok` source is definitely replaced at this instant. The target is
-      // possibly live from it; later non-ok rows can re-open the source.
+      // Every writing row makes both sides possibly live. Re-starting the
+      // source before its definite replacement records even a zero-length era.
+      start(row.fromAccountId, time);
       end(row.fromAccountId, time);
       start(row.toAccountId, time);
     } else {

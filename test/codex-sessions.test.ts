@@ -137,6 +137,26 @@ describe('Codex session process list and holder eras', () => {
     assert.deepEqual(renewers(identityA, before, rows).map(({ pid }) => pid), [205]);
   });
 
+  it('retains an ok source reintroduced by a later ok row as a possible holder', () => {
+    const rows = [
+      row(1, A, B, 'ok', T0),
+      row(2, A, C, 'ok', T0 + 60_000),
+    ];
+    const process = [{ pid: 208, lstart: 'Fri Oct 24 12:00:30 2026', host: 'codex' }];
+
+    assert.deepEqual(renewers(identityA, process, rows).map(({ pid }) => pid), [208]);
+  });
+
+  it('retains an ok source absent from prior rows as a possible holder', () => {
+    const rows = [
+      row(1, A, B, 'ok', T0),
+      row(2, C, 'account-d', 'ok', T0 + 60_000),
+    ];
+    const process = [{ pid: 209, lstart: 'Fri Oct 24 12:00:30 2026', host: 'codex' }];
+
+    assert.deepEqual(renewers(identityC, process, rows).map(({ pid }) => pid), [209]);
+  });
+
   it('excludes a process starting at the one-second safe boundary after definite replacement', () => {
     const rows = [row(1, A, B, 'ok', T0)];
     const process = [{ pid: 206, lstart: 'Fri Oct 24 12:00:01 2026', host: 'codex' }];
