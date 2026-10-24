@@ -105,16 +105,36 @@ describe('Keychain access allowlist', () => {
     }
   });
 
-  it('passes macOS secret material only through security -i stdin', () => {
-    const secret = 'secret-that-must-not-be-in-argv';
-    const { backend, calls } = guardedFakeSecurity();
-    backend.setSync('Claude Code-credentials', MACOS_USER, secret);
-    const call = calls[0];
-    assert.equal(call?.file, 'security');
-    assert.deepEqual(call?.args, ['-i']);
-    assert.match(call?.input ?? '', /^add-generic-password -U /);
-    assert.match(call?.input ?? '', / -X [0-9a-f]+\n$/);
-    assert.equal(call?.input?.includes(secret), false);
-    assert.equal(call?.args.some((arg) => arg.includes(secret)), false);
+  it('writes large macOS payloads through argv and redacts child errors', () => {
+    const secret = JSON.stringify({ grant: `UNIQUE_SECRET_${'x'.repeat(4 * 1024)}` });
+    const calls: Array<{ file: string; args: string[]; input?: string }> = [];
+    const exec: ExecFileSyncFn = (file, args, options) => {
+      calls.push({
+        file,
+        args: [...args],
+        input: typeof options?.input === 'string' ? options.input : undefined,
+      });
+      throw new Error(`security rejected ${secret}`);
+    };
+    const backend = withServiceGuard(new MacosKeychainBackend({ execFileSync: exec }), {
+      macosUserName: () => MACOS_USER,
+    });
+
+    assert.ok(Buffer.byteLength(secret, 'utf8') > 4095);
+    assert.throws(
+      () => backend.setSync('Claude Code-credentials', MACOS_USER, secret),
+      (err: Error) => {
+        assert.equal(err.message.includes(secret), false);
+        assert.equal(err.message, `keychain set failed for service=Claude Code-credentials account=${MACOS_USER}`);
+        return true;
+      },
+    );
+    assert.deepEqual(calls, [{
+      file: 'security',
+      args: [
+        'add-generic-password', '-a', MACOS_USER, '-s', 'Claude Code-credentials', '-w', secret, '-U',
+      ],
+      input: undefined,
+    }]);
   });
 });

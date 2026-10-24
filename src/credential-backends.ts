@@ -169,16 +169,17 @@ export class MacosKeychainBackend extends SyncCredentialBackend {
 
   setSync(service: string, account: string, jsonValue: string): void {
     try {
-      // `security -i` parses this stdin line. `-X` keeps arbitrary JSON safe
-      // for that parser while ensuring secret material is never present in argv.
-      const quote = (value: string) => `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
-      const command = [
-        'add-generic-password', '-U', '-a', quote(account), '-s', quote(service),
-        '-X', Buffer.from(jsonValue, 'utf8').toString('hex'),
-      ].join(' ') + '\n';
-      this.exec('security', ['-i'], { encoding: 'utf8', input: command });
-    } catch (err) {
-      throw wrapCredentialError('set', service, account, err);
+      // Keep the legacy argv transport until the dedicated Swift stdin helper
+      // is available. `security -i` has a 4096-byte line limit that truncates
+      // real credential payloads.
+      this.exec(
+        'security',
+        ['add-generic-password', '-a', account, '-s', service, '-w', jsonValue, '-U'],
+        { encoding: 'utf8' },
+      );
+    } catch {
+      // execFileSync may include argv (and therefore jsonValue) in its error.
+      throw new Error(`keychain set failed for service=${service} account=${account}`);
     }
   }
 

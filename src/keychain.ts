@@ -7,8 +7,7 @@
 // Real OAuth grants are Phase 2b, via an explicit user-triggered command.
 //
 // All subprocess invocations use `execFile`/`execFileSync` with an argv array
-// (never `exec` + string interpolation) to avoid shell injection. Secrets are
-// never passed as command-line arguments (stdin only).
+// (never `exec` + string interpolation) to avoid shell injection.
 
 import { execFileSync } from 'node:child_process';
 
