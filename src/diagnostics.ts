@@ -511,7 +511,8 @@ export async function doctorQlb(
   checks.push(probeCredentialStore(options.command));
   checks.push(probeHostEnvironment(options.hostCommand ?? runHostCommand, {
     platform: options.hostPlatform ?? process.platform,
-    shell: options.hostShell ?? process.env.SHELL,
+    // An explicit hostShell key (even undefined) overrides the real SHELL, so tests are host-independent.
+    shell: 'hostShell' in options ? options.hostShell : process.env.SHELL,
     shellExists: options.hostShellExists ?? existsSync,
   }));
 
