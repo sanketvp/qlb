@@ -3,12 +3,11 @@
 // supplies Pi's real event stream, builtin transport, CLI runner and Keychain reader.
 
 import { streamWithAuthRetry } from "./auth-retry.js";
+import { redactEvent, redactSecrets } from "../../src/redact.js";
 import {
   consumeAccessSource,
   CONSUME_ERRORS,
   CSWAP_ACTIVE_ID,
-  redactEvent,
-  redactSecrets,
   type CswapActiveAccess,
   type ConsumeJournal,
   type OwnerFileState,

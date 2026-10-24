@@ -3,8 +3,10 @@
 // refreshes, never writes, never binds a QLB account slot.
 //
 // The reader duplicates src/cswap-native-read.ts (same allowlisted argv, same
-// parse and expiry rules) because Pi's jiti loader cannot import from QLB's src/
-// tree. test/qlb-pi-consume.test.ts pins the two copies to identical behavior.
+// parse and expiry rules) so the extension has no dependency on QLB's runtime
+// modules. Its sole shared local dependency is src/redact.ts, which pi:extension
+// verifies and copies for the standalone extension layout. test/qlb-pi-consume.test.ts
+// pins the two readers to identical behavior.
 
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -17,6 +19,11 @@ export const CSWAP_ACTIVE_ID = "cswap-active";
 export const ACTIVE_CC_SERVICE = "Claude Code-credentials";
 export const SECURITY_BIN = "/usr/bin/security";
 const FALLBACK_ACCOUNT = "claude-code-user";
+
+// Shared redaction is intentionally imported from src/: in a package install it
+// resolves within QLB, and in a copied install pi:extension supplies agent/src/redact.ts.
+// The closure test pins this as the extension's sole src dependency.
+export { redactEvent, redactSecrets } from "../../src/redact.js";
 
 // Stable, value-free messages for every consume failure sink (audit, Pi error
 // event, console). Raw diagnostics never cross these boundaries.
@@ -326,43 +333,4 @@ export function consumeAccessSource(read: () => CswapActiveAccess): {
     },
     sent: () => [...sent],
   };
-}
-
-/** Replace every known access value and its fingerprint with a placeholder. */
-export function redactSecrets(text: string, secrets: readonly string[]): string {
-  let out = text;
-  for (const secret of secrets) {
-    if (!secret) continue;
-    out = out.split(secret).join("[redacted]").split(fingerprintAccess(secret)).join("[redacted]");
-  }
-  return out;
-}
-
-/**
- * Independent deep copy of a Pi stream event with every string redacted (any
- * shape: arrays, message.*, bare strings, shared or cyclic references).
- * Fails closed: anything nested beyond MAX_REDACT_DEPTH becomes "[redacted]".
- */
-const MAX_REDACT_DEPTH = 64;
-export function redactEvent(event: unknown, secrets: readonly string[]): unknown {
-  if (secrets.length === 0) return event;
-  const clones = new WeakMap<object, unknown>();
-  const walk = (value: unknown, depth: number): unknown => {
-    if (typeof value === "string") return redactSecrets(value, secrets);
-    if (!value || typeof value !== "object") return value;
-    if (depth > MAX_REDACT_DEPTH) return "[redacted]";
-    const existing = clones.get(value);
-    if (existing !== undefined) return existing;
-    if (Array.isArray(value)) {
-      const out: unknown[] = [];
-      clones.set(value, out);
-      for (const item of value) out.push(walk(item, depth + 1));
-      return out;
-    }
-    const out: Record<string, unknown> = {};
-    clones.set(value, out);
-    for (const [key, item] of Object.entries(value)) out[key] = walk(item, depth + 1);
-    return out;
-  };
-  return walk(event, 0);
 }

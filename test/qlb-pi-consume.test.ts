@@ -6,6 +6,7 @@ import { describe, it } from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 
 import { resolveConfig } from '../src/config';
+import { redactEvent, redactSecrets } from '../src/redact';
 import {
   activeCcSecurityArgs as srcArgs,
   getActiveClaudeCodeAccess,
@@ -24,8 +25,6 @@ import {
   parseConsumeStatus,
   readActiveClaudeAccess,
   readOwnerFileState,
-  redactEvent,
-  redactSecrets,
   SECURITY_BIN,
   type CswapActiveAccess,
   type ConsumeJournal,
@@ -508,7 +507,7 @@ describe('redaction helper', () => {
     const out = redactEvent(event, [tok]) as Record<string, unknown>;
     assert.notEqual(out, event);
     assert.notEqual(out.a, shared);
-    assert.equal(out.self, out, 'cycles map to the clone, not the original');
+    assert.equal(out.self, '[circular]', 'true cycles become a stable marker');
     const { self: _self, ...rest } = out;
     void _self;
     const text = JSON.stringify(rest);
