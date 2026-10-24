@@ -45,12 +45,16 @@ test('finds Python-launched cswap scripts and claude_swap modules', () => {
       ' 438 /usr/bin/python3 --check-hash-based-pycs=always cswap auto',
       ' 439 /usr/bin/python3 -mclaude_swap auto',
       ' 440 /usr/bin/python3 -mclaude_swap.cli auto',
+      ' 441 /usr/bin/python3 -um claude_swap.cli auto',
+      ' 442 /usr/bin/python3 -Em claude_swap auto',
+      ' 443 /usr/bin/python3 -Imclaude_swap auto',
     ].join('\n'),
   });
 
   assert.deepEqual(processes, [
     { pid: 432 }, { pid: 433 }, { pid: 434 }, { pid: 435 }, { pid: 436 },
-    { pid: 437 }, { pid: 438 }, { pid: 439 }, { pid: 440 },
+    { pid: 437 }, { pid: 438 }, { pid: 439 }, { pid: 440 }, { pid: 441 },
+    { pid: 442 }, { pid: 443 },
   ]);
 });
 
@@ -66,6 +70,9 @@ test('ignores unrelated processes', () => {
       ' 808 python -W cswap /path/other-script',
       ' 909 python -m other_module cswap',
       ' 1001 node -m claude_swap.cli list',
+      ' 1002 python3 -um json.tool',
+      ' 1003 python3 -Wm claude_swap',
+      ' 1004 python3 -Xm claude_swap',
     ].join('\n'),
   });
 

@@ -39,6 +39,25 @@ function pythonArguments(args: string): string | undefined {
   return args.slice(interpreter.index + interpreter[0].length).trimStart();
 }
 
+function isCswapModuleOption(args: string): boolean {
+  const moduleOption = /^-([A-Za-z]*)m\s*claude_swap(\.|\s|$)/.exec(args);
+  if (moduleOption === null) return false;
+
+  // CPython's interface options make -W and -X consume the rest of their
+  // cluster as their value, so neither can precede -m here.
+  // https://docs.python.org/3/using/cmdline.html#interface-options
+  return !/[WX]/.test(moduleOption[1]);
+}
+
+function hasClusteredCswapModule(args: string): boolean {
+  const moduleOption = /(^|\s)-([A-Za-z]+)m\s*claude_swap(\.|\s|$)/g;
+  let match: RegExpExecArray | null;
+  while ((match = moduleOption.exec(args)) !== null) {
+    if (!/[WX]/.test(match[2])) return true;
+  }
+  return false;
+}
+
 function firstPythonScriptIsCswap(args: string): boolean {
   let remaining = pythonArguments(args);
   if (remaining === undefined) return false;
@@ -47,7 +66,7 @@ function firstPythonScriptIsCswap(args: string): boolean {
   // option skip; the listed value-taking options consume their value.
   let option: RegExpExecArray | null;
   while (true) {
-    if (/^-m\s*claude_swap(\.|\s|$)/.test(remaining)) return true;
+    if (isCswapModuleOption(remaining)) return true;
     option = /^(?:(?:-W|-X|-Q)\s+\S+|--check-hash-based-pycs(?:=\S+|\s+\S+)|-\S+)\s+/.exec(remaining);
     if (option === null) break;
     remaining = remaining.slice(option[0].length);
@@ -64,7 +83,8 @@ function isCswapCommand(args: string): boolean {
   if (/(^|\/)(cswap|claude-swap)(\s|$)/.test(args)) return true;
 
   const hasPythonInterpreter = pythonArguments(args) !== undefined;
-  const hasCswapModule = /(^|\s)-m\s*claude_swap(\.|\s|$)/.test(args);
+  const hasCswapModule = /(^|\s)-m\s*claude_swap(\.|\s|$)/.test(args)
+    || hasClusteredCswapModule(args);
   return firstPythonScriptIsCswap(args) || (hasPythonInterpreter && hasCswapModule);
 }
 
