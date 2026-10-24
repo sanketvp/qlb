@@ -7,6 +7,7 @@ export interface QlbConfig {
   piAuthJsonPath: string;
   codexAuthJsonPath: string;
   kimiCredentialsFile: string;
+  /** Always `pi-openrouter`; retained only to diagnose deprecated overrides. */
   openrouterKeychainService: string;
   dbPath: string;
   pluginsDir: string;
@@ -19,6 +20,9 @@ export interface QlbConfig {
 }
 
 type ConfigField = Exclude<keyof QlbConfig, 'configPath'>;
+
+/** Fixed native source: no arbitrary Keychain service is ever read for OpenRouter. */
+export const OPENROUTER_KEYCHAIN_SERVICE = 'pi-openrouter';
 
 const FIELD_META: Record<ConfigField, { env: string; flag: string }> = {
   anthropicPoolPath: { env: 'QLB_ANTHROPIC_POOL_PATH', flag: '--anthropic-pool-path' },
@@ -46,7 +50,7 @@ export function defaultConfig(home: string = homedir()): QlbConfig {
     piAuthJsonPath: join(home, '.pi', 'agent', 'auth.json'),
     codexAuthJsonPath: join(home, '.codex', 'auth.json'),
     kimiCredentialsFile: join(home, 'DEV_vault', '04-Security', 'kimi-code-credentials.md'),
-    openrouterKeychainService: 'pi-openrouter',
+    openrouterKeychainService: OPENROUTER_KEYCHAIN_SERVICE,
     dbPath: join(qlbDir, 'qlb.db'),
     pluginsDir: join(qlbDir, 'plugins'),
     proxyInfoPath: join(qlbDir, 'proxy.json'),

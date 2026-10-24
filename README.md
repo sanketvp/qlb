@@ -164,7 +164,7 @@ Values resolve in this order: command-line flag, environment variable, `~/.qlb/c
 | `piAuthJsonPath` | `QLB_PI_AUTH_JSON_PATH` | `--pi-auth-json-path` |
 | `codexAuthJsonPath` | `QLB_CODEX_AUTH_JSON_PATH` | `--codex-auth-json-path` |
 | `kimiCredentialsFile` | `QLB_KIMI_CREDENTIALS_FILE` | `--kimi-credentials-file` |
-| `openrouterKeychainService` | `QLB_OPENROUTER_KEYCHAIN_SERVICE` | `--openrouter-keychain-service` |
+| `openrouterKeychainService` (fixed `pi-openrouter`; overrides are refused) | `QLB_OPENROUTER_KEYCHAIN_SERVICE` | `--openrouter-keychain-service` |
 | `dbPath` | `QLB_DB_PATH` | `--db-path` |
 | `pluginsDir` | `QLB_PLUGINS_DIR` | `--plugins-dir` |
 | `proxyInfoPath` | `QLB_PROXY_INFO_PATH` | `--proxy-info-path` |
@@ -172,6 +172,8 @@ Values resolve in this order: command-line flag, environment variable, `~/.qlb/c
 | `cswapSequencePath` | `QLB_CSWAP_SEQUENCE_PATH` | `--cswap-sequence-path` |
 | `cswapUsagePath` | `QLB_CSWAP_USAGE_PATH` | `--cswap-usage-path` |
 | `defaultStrategy` | `QLB_DEFAULT_STRATEGY` | `--default-strategy` |
+
+`openrouterKeychainService` is fixed to `pi-openrouter`: QLB never reads an arbitrary native Keychain service. The legacy environment variable and flag are accepted only so `qlb doctor` can identify and explain a stale override; any value other than `pi-openrouter` is refused.
 
 Use `QLB_CONFIG_PATH` or `--config` to select a different JSON config file.
 

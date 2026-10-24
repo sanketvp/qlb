@@ -48,7 +48,7 @@ Two optional `Adapter` fields (`src/types.ts`) tailor refresh behavior; absent m
 
 ## OpenRouter (`openrouter`)
 
-- **Credential source:** a static API key in the platform credential store (service `pi-openrouter`, configurable via `QLB_OPENROUTER_KEYCHAIN_SERVICE`). On macOS this is a Keychain item read via `security find-generic-password`; on Linux, `secret-tool` or the encrypted-file fallback; on Windows, a DPAPI blob. QLB never writes or rotates that native item.
+- **Credential source:** a static API key in the platform credential store at the fixed service `pi-openrouter`. QLB refuses overrides so it never reads an arbitrary native credential service. On macOS this is a Keychain item read via `security find-generic-password`; on Linux, `secret-tool` or the encrypted-file fallback; on Windows, a DPAPI blob. QLB never writes or rotates that native item.
 - **Usage signal:** real GET — `https://openrouter.ai/api/v1/credits` with `Authorization: Bearer <key>`.
 - **Buckets:** a single `credits` bucket: `total_usage` / `total_credits` as used percentage, with absolute `used`/`limit`/`remaining` attached.
 - **Confidence:** `authoritative` for what it measures — but the reading carries an explicit `detail` note: it is an **account-wide credit balance, not a rolling rate-limit window**. There is no reset time (`resets` shows `-`), and the bucket is classified as a balance rather than a window for scoring purposes.
