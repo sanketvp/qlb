@@ -1,4 +1,4 @@
-// QLB's C-swap process detection; rule defined by spec S24.
+// QLB's C-swap process detection; process-table failures fail closed per spec S24.
 
 import { execFileSync } from 'node:child_process';
 
@@ -19,11 +19,17 @@ export class CswapProcessCheckError extends Error {
   }
 }
 
-function defaultRunPs(): string {
-  return execFileSync('/bin/ps', ['-ax', '-o', 'pid=,args='], {
+const PROCESS_TABLE_MAX_BUFFER = 64 * 1024 * 1024;
+
+function defaultRunPs(platform: NodeJS.Platform): string {
+  const args = platform === 'linux'
+    ? ['-ww', '-ax', '-o', 'pid=,args=']
+    : ['-ax', '-o', 'pid=,args='];
+  return execFileSync('/bin/ps', args, {
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'ignore'],
     timeout: 5_000,
+    maxBuffer: PROCESS_TABLE_MAX_BUFFER,
   });
 }
 
@@ -37,10 +43,13 @@ function firstPythonScriptIsCswap(args: string): boolean {
   let remaining = pythonArguments(args);
   if (remaining === undefined) return false;
 
-  // Avoid tokenizing paths containing spaces. These options consume their
-  // following value; the remaining short options do not.
+  // Avoid tokenizing paths containing spaces. Check -m before the generic
+  // option skip; the listed value-taking options consume their value.
   let option: RegExpExecArray | null;
-  while ((option = /^(?:(?:-W|-X|-Q)\s+\S+|--check-hash-based-pycs|-\S+)\s+/.exec(remaining)) !== null) {
+  while (true) {
+    if (/^-m\s*claude_swap(\.|\s|$)/.test(remaining)) return true;
+    option = /^(?:(?:-W|-X|-Q)\s+\S+|--check-hash-based-pycs(?:=\S+|\s+\S+)|-\S+)\s+/.exec(remaining);
+    if (option === null) break;
     remaining = remaining.slice(option[0].length);
   }
   return /^(cswap|claude-swap)(\s|$)/.test(remaining)
@@ -55,7 +64,7 @@ function isCswapCommand(args: string): boolean {
   if (/(^|\/)(cswap|claude-swap)(\s|$)/.test(args)) return true;
 
   const hasPythonInterpreter = pythonArguments(args) !== undefined;
-  const hasCswapModule = /(^|\s)-m\s+claude_swap(\.|\s|$)/.test(args);
+  const hasCswapModule = /(^|\s)-m\s*claude_swap(\.|\s|$)/.test(args);
   return firstPythonScriptIsCswap(args) || (hasPythonInterpreter && hasCswapModule);
 }
 
@@ -72,7 +81,7 @@ export function listCswapProcesses(opts: CswapProcessOptions = {}): CswapProcess
 
   let output: string;
   try {
-    output = (opts.runPs ?? defaultRunPs)();
+    output = opts.runPs ? opts.runPs() : defaultRunPs(platform);
   } catch {
     throw new CswapProcessCheckError('failed to inspect the process table');
   }
