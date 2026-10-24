@@ -244,6 +244,87 @@ describe('Claude Code proper-lockfile locks', () => {
     }
   });
 
+  it('restores a fresh takeover sidecar after a delayed stale reclaimer moves it', async () => {
+    const home = await tempHome();
+    const lock = join(home, 'race.lock');
+    const takeover = `${lock}.takeover`;
+    const fsPromises = require('node:fs/promises') as Record<string, (...args: any[]) => Promise<any>>;
+    const originalMkdir = fsPromises.mkdir;
+    const originalRename = fsPromises.rename;
+    const originalRmdir = fsPromises.rmdir;
+    const originalStat = fsPromises.stat;
+    let releaseStaleStats!: () => void;
+    const staleStatsReady = new Promise<void>((resolve) => { releaseStaleStats = resolve; });
+    let releaseSecondRename!: () => void;
+    const secondRenameReady = new Promise<void>((resolve) => { releaseSecondRename = resolve; });
+    let releaseFreshLockRemoval!: () => void;
+    const freshLockRemovalReady = new Promise<void>((resolve) => { releaseFreshLockRemoval = resolve; });
+    let freshSidecarCreated!: () => void;
+    const freshSidecarReady = new Promise<void>((resolve) => { freshSidecarCreated = resolve; });
+    let staleStats = 0;
+    let renameCalls = 0;
+    let restores = 0;
+    try {
+      await mkdir(lock, { recursive: true });
+      await mkdir(takeover);
+      const old = new Date(Date.now() - 6_000);
+      await utimes(lock, old, old);
+      await utimes(takeover, old, old);
+
+      fsPromises.stat = async (...args: any[]) => {
+        const result = await originalStat(...args);
+        if (String(args[0]) === takeover && staleStats < 2) {
+          staleStats += 1;
+          if (staleStats === 2) releaseStaleStats();
+          await staleStatsReady;
+        }
+        return result;
+      };
+      fsPromises.rename = async (...args: any[]) => {
+        const source = String(args[0]);
+        const destination = String(args[1]);
+        if (source === takeover && ++renameCalls === 2) await secondRenameReady;
+        const result = await originalRename(...args);
+        if (destination === takeover && source.startsWith(`${takeover}.`)) restores += 1;
+        return result;
+      };
+      fsPromises.mkdir = async (...args: any[]) => {
+        const result = await originalMkdir(...args);
+        if (String(args[0]) === takeover) freshSidecarCreated();
+        return result;
+      };
+      fsPromises.rmdir = async (...args: any[]) => {
+        if (String(args[0]) === lock) await freshLockRemovalReady;
+        return originalRmdir(...args);
+      };
+
+      const waiters = [0, 1].map(() => withProperLockfile(
+        lock,
+        { stalenessMs: 100, timeoutMs: 2_000, retryMinMs: 5, retryJitterMs: 0 },
+        async () => {},
+      ));
+      await waitFor(() => staleStats === 2);
+      releaseStaleStats();
+      await waitFor(() => renameCalls === 2);
+      await freshSidecarReady;
+      assert.equal(existsSync(takeover), true, 'first reclaimer holds a newly created sidecar');
+      releaseSecondRename();
+      await waitFor(() => restores === 1);
+      assert.equal(existsSync(takeover), true, 'delayed reclaimer must restore the fresh sidecar');
+      releaseFreshLockRemoval();
+      await Promise.all(waiters);
+    } finally {
+      releaseStaleStats?.();
+      releaseSecondRename?.();
+      releaseFreshLockRemoval?.();
+      fsPromises.mkdir = originalMkdir;
+      fsPromises.rename = originalRename;
+      fsPromises.rmdir = originalRmdir;
+      fsPromises.stat = originalStat;
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
   it('clears a stale takeover directory before taking over a lock', async () => {
     const home = await tempHome();
     const lock = join(home, 'stale.lock');

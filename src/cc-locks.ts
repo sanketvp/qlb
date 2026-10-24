@@ -1,8 +1,9 @@
 // Ported from claude-swap 0.28.0 (MIT, Copyright (c) realiti4) — claude_locks.py (lines 46–70, 75–228).
 // See third_party/claude-swap/LICENSE for the upstream license.
 
+import { randomUUID } from 'node:crypto';
 import { existsSync, statSync } from 'node:fs';
-import { mkdir, rmdir, stat, utimes } from 'node:fs/promises';
+import { mkdir, rename, rmdir, stat, utimes } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { performance } from 'node:perf_hooks';
 import { basename, join } from 'node:path';
@@ -131,7 +132,17 @@ async function removeIfStillStale(lockDir: string, stalenessMs: number): Promise
     if (!error || typeof error !== 'object' || (error as NodeJS.ErrnoException).code !== 'EEXIST') return false;
     try {
       const heldTakeover = await stat(takeoverDir);
-      if (Date.now() - heldTakeover.mtimeMs > TAKEOVER_STALENESS_MS) await rmdir(takeoverDir);
+      if (Date.now() - heldTakeover.mtimeMs > TAKEOVER_STALENESS_MS) {
+        const staleTakeover = `${takeoverDir}.${randomUUID()}`;
+        await rename(takeoverDir, staleTakeover);
+        const renamedTakeover = await stat(staleTakeover);
+        if (Date.now() - renamedTakeover.mtimeMs > TAKEOVER_STALENESS_MS) {
+          await rmdir(staleTakeover);
+        } else {
+          // A contender recreated it between stat and rename; put its fresh sidecar back.
+          await rename(staleTakeover, takeoverDir);
+        }
+      }
     } catch {
       // Another contender released or retook the takeover directory; retry the lock protocol.
     }
