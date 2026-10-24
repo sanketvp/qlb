@@ -6,12 +6,30 @@ import { DatabaseSync } from 'node:sqlite';
 import { describe, it } from 'node:test';
 import { openStore } from '../src/store';
 
+const support = join(__dirname, '..', '..', 'test', 'support');
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const { buildV4Store } = require(join(support, 'v4-fixture.cjs')) as {
+  buildV4Store: (path: string, rows?: Array<Record<string, unknown>>) => string;
+};
+
 function dbAt(path: string): DatabaseSync {
   return new DatabaseSync(path, { readOnly: true });
 }
 
 function columns(db: DatabaseSync, table: string): string[] {
   return (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((row) => row.name);
+}
+
+function v4Snapshot(path: string): { tables: string[]; columns: Record<string, string[]>; rows: Record<string, unknown[]> } {
+  const db = dbAt(path);
+  try {
+    const tables = (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all() as Array<{ name: string }>).map((row) => row.name);
+    return {
+      tables,
+      columns: Object.fromEntries(tables.map((table) => [table, columns(db, table)])),
+      rows: Object.fromEntries(tables.map((table) => [table, db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()])),
+    };
+  } finally { db.close(); }
 }
 
 describe('store v5 schema (AC38)', () => {
@@ -62,6 +80,63 @@ describe('store v5 schema (AC38)', () => {
       assert.equal(row.provider, 'anthropic');
       assert.equal(row.account_id, 'a');
       assert.equal(row.last_fetch_at, 9);
+    } finally { check.close(); }
+  });
+
+  it('a v4→v5 migration that fails partway rolls back completely', () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'qlb-v5-rollback-')), 'qlb.db');
+    buildV4Store(path, [{
+      ts: 7,
+      requested_model: 'claude-sonnet-5',
+      account_id: 'fixture-account',
+      account_provider: 'anthropic',
+      mode: 'headroom',
+      reason: 'fixture-row',
+      snapshot_json: '{"fixture":true}',
+    }]);
+    const db = new DatabaseSync(path);
+    // This view conflicts with a later v5 CREATE TABLE, after decision-column DDL ran.
+    db.exec(`
+      CREATE TABLE usage_polls (account_id TEXT PRIMARY KEY, last_fetch_at INTEGER);
+      INSERT INTO usage_polls VALUES ('fixture-account', 7);
+      CREATE VIEW usage_polls_v5 AS SELECT 1 AS fixture_usage_poll;
+    `);
+    db.close();
+    const before = v4Snapshot(path);
+    const beforeUsagePollColumns = (() => {
+      const check = dbAt(path);
+      try { return columns(check, 'usage_polls'); } finally { check.close(); }
+    })();
+
+    // The constructor closes its connection after a failed open, which would
+    // otherwise implicitly roll back an uncommitted transaction. Commit there
+    // only in this fixture so this assertion proves migrateIfNeeded rolled back.
+    const close = DatabaseSync.prototype.close;
+    DatabaseSync.prototype.close = function (this: DatabaseSync): void {
+      try { this.exec('COMMIT'); } catch { /* an explicit rollback leaves nothing to commit */ }
+      close.call(this);
+    };
+    try {
+      assert.throws(() => openStore(path));
+    } finally {
+      DatabaseSync.prototype.close = close;
+    }
+
+    const check = dbAt(path);
+    try {
+      assert.equal((check.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 4);
+      assert.deepEqual(v4Snapshot(path), before);
+      assert.deepEqual(columns(check, 'usage_polls'), beforeUsagePollColumns);
+      assert.equal((check.prepare('PRAGMA integrity_check').get() as { integrity_check: string }).integrity_check, 'ok');
+      const rows = check.prepare('SELECT account_id, reason, snapshot_json FROM decisions').all() as Array<{
+        account_id: string;
+        reason: string;
+        snapshot_json: string;
+      }>;
+      assert.deepEqual(
+        rows.map(({ account_id, reason, snapshot_json }) => ({ account_id, reason, snapshot_json })),
+        [{ account_id: 'fixture-account', reason: 'fixture-row', snapshot_json: '{"fixture":true}' }],
+      );
     } finally { check.close(); }
   });
 
