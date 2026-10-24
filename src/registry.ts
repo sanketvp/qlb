@@ -8,6 +8,8 @@ export interface CommandDefinition {
 
 export interface CheckDefinition {
   name: string;
+  /** Also accepts dynamic doctor result names under this colon-delimited prefix. */
+  prefix?: string;
 }
 
 /** Provider identifiers accepted by the legacy provider-module loaders. */

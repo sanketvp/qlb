@@ -1,12 +1,13 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
 import { loadProviderStub } from '../src/provider-loader';
-import { discoverChecks } from '../src/registry';
+import { builtInAdapters } from '../src/adapters';
+import { KNOWN_PROVIDER_NAMES, discoverChecks } from '../src/registry';
 
 describe('registries', () => {
   it('loads source modules when discovery is explicitly given the ts-node extension', () => {
@@ -44,6 +45,20 @@ describe('registries', () => {
     });
     assert.deepEqual(loaded, { path: '/provider-modules/anthropic' });
     assert.throws(() => loadProviderStub('unknown', '/provider-modules'), /unknown provider/);
+  });
+
+  it('keeps provider stub names aligned with built-in adapter ids', () => {
+    assert.deepEqual(
+      [...KNOWN_PROVIDER_NAMES].sort(),
+      builtInAdapters.map((adapter) => adapter.id).sort(),
+    );
+  });
+
+  it('cleans dist-test registry output before compiling tests', () => {
+    const packageJson = JSON.parse(readFileSync(join(__dirname, '..', '..', 'package.json'), 'utf8')) as {
+      scripts: { test: string };
+    };
+    assert.match(packageJson.scripts.test, /clean-registry-output\.cjs dist-test\/src/);
   });
 
   it('removes stale registry output before a build', () => {

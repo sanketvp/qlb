@@ -1,5 +1,12 @@
 import assert from 'node:assert/strict';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, it } from 'node:test';
+
+import { defaultConfig } from '../src/config';
+import { doctorQlb } from '../src/diagnostics';
+import { openStore } from '../src/store';
 
 import {
   classifyHttpStatus,
@@ -121,6 +128,33 @@ describe('qlb-pi OAuth request shaping (parity with anthropic-pool)', () => {
 });
 
 describe('qlb-pi footer helpers', () => {
+  it('parses a drifted account from real doctorQlb output as a visible WARN', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-pi-doctor-drift-'));
+    const config = defaultConfig(home);
+    const store = openStore(config.dbPath);
+    store.upsertAccount('xai-default', 'xai', 'Grok (xAI)');
+    store.upsertMigration('pi-xai', 'QLB_OWNED');
+    store.close();
+    const owned = JSON.stringify({ access: 'qlb-copy', refresh: '', expires: 0, generation: 0 });
+    const keychain = {
+      set: async () => {}, get: async () => owned, delete: async () => {},
+      setSync: () => {}, getSync: () => owned, deleteSync: () => {},
+    };
+
+    const report = await doctorQlb(config, {
+      command: () => 'ok',
+      hostCommand: () => '',
+      keychain,
+      readNativeCredential: async () => ({ access: 'native-copy', refresh: '', expires: 0, generation: 0 }),
+    });
+    const parsed = parseDoctorJson(JSON.stringify(report));
+
+    assert.equal(parsed.nativeSyncWarn, 1);
+    assert.equal(parsed.nativeSyncFail, 0);
+    assert.equal(parsed.overall, 'WARN');
+    assert.match(parsed.driftMessage ?? '', /DIFFERS from native/);
+  });
+
   it('colors anthropic account-N by stable slot index', () => {
     assert.equal(accountColorIndex('account-1'), 0);
     assert.equal(accountColorIndex('account-4'), 3);

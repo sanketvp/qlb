@@ -74,21 +74,53 @@ export function listCheckNames(): string[] {
   return discoverChecks().map((check) => check.name);
 }
 
-/** The registry is the doctor contract: emit each registered check once, in registry order. */
-function registeredDoctorChecks(checks: DoctorCheck[]): DoctorCheck[] {
-  const names = listCheckNames();
-  const registered = new Set(names);
-  const byName = new Map<string, DoctorCheck>();
+/**
+ * Reconcile runtime output with the registry without ever turning diagnostics
+ * into an exception path. Dynamic prefix checks remain individual report rows;
+ * registry mistakes stay visible through doctor:registry.
+ */
+export function registeredDoctorChecks(checks: DoctorCheck[]): DoctorCheck[] {
+  const definitions = discoverChecks();
+  const emitted = new Map<string, DoctorCheck[]>();
+  const unregistered: DoctorCheck[] = [];
+  const seen = new Set<string>();
+  const mismatches: string[] = [];
+
   for (const check of checks) {
-    if (!registered.has(check.name)) throw new Error(`doctor emitted unregistered check: ${check.name}`);
-    if (byName.has(check.name)) throw new Error(`doctor emitted duplicate check: ${check.name}`);
-    byName.set(check.name, check);
+    const duplicate = seen.has(check.name);
+    seen.add(check.name);
+    const definition = definitions.find((candidate) =>
+      candidate.name === check.name ||
+      (candidate.prefix != null && check.name.startsWith(`${candidate.prefix}:`)),
+    );
+    if (!definition) {
+      unregistered.push(check);
+      mismatches.push(`unregistered ${check.name}`);
+      if (duplicate) mismatches.push(`duplicate ${check.name}`);
+      continue;
+    }
+    if (duplicate) mismatches.push(`duplicate ${check.name}`);
+    const rows = emitted.get(definition.name) ?? [];
+    rows.push(check);
+    emitted.set(definition.name, rows);
   }
-  return names.map((name) => byName.get(name) ?? {
-    name,
-    level: 'PASS',
-    message: 'not applicable on this host',
-  });
+
+  const report: DoctorCheck[] = [];
+  for (const definition of definitions) {
+    if (definition.name === 'doctor:registry') {
+      report.push(mismatches.length > 0
+        ? { name: definition.name, level: 'WARN', message: `registry mismatch: ${mismatches.join('; ')}` }
+        : { name: definition.name, level: 'PASS', message: 'all emitted checks match the registry' });
+      continue;
+    }
+    const rows = emitted.get(definition.name);
+    if (rows && rows.length > 0) {
+      report.push(...rows);
+    } else {
+      report.push({ name: definition.name, level: 'PASS', message: 'not applicable on this host' });
+    }
+  }
+  return [...report, ...unregistered];
 }
 
 const runCommand: CommandRunner = (command, args) =>
@@ -360,14 +392,13 @@ export async function doctorQlb(
     checks.push({ name: 'sqlite', level: 'WARN', message: `database does not exist yet: ${config.dbPath}; run qlb status` });
   } else {
     let db: DatabaseSync | undefined;
+    let sqliteCheck: DoctorCheck;
     try {
       db = new DatabaseSync(config.dbPath, { readOnly: true });
       const integrity = db.prepare('PRAGMA integrity_check').get() as { integrity_check?: string } | undefined;
-      if (integrity?.integrity_check !== 'ok') {
-        checks.push({ name: 'sqlite', level: 'FAIL', message: 'PRAGMA integrity_check failed', detail: integrity });
-      } else {
-        checks.push({ name: 'sqlite', level: 'PASS', message: `database opens and integrity_check passes: ${config.dbPath}` });
-      }
+      sqliteCheck = integrity?.integrity_check !== 'ok'
+        ? { name: 'sqlite', level: 'FAIL', message: 'PRAGMA integrity_check failed', detail: integrity }
+        : { name: 'sqlite', level: 'PASS', message: `database opens and integrity_check passes: ${config.dbPath}` };
       const table = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='migrations'").get();
       if (table) {
         migrations = db.prepare('SELECT store, state, detail_json FROM migrations').all() as Array<{
@@ -390,10 +421,11 @@ export async function doctorQlb(
         recoveryPending = marker != null;
       }
     } catch (err) {
-      checks.push({ name: 'sqlite', level: 'FAIL', message: `database check failed: ${err instanceof Error ? err.message : String(err)}` });
+      sqliteCheck = { name: 'sqlite', level: 'FAIL', message: `database check failed: ${err instanceof Error ? err.message : String(err)}` };
     } finally {
       try { db?.close(); } catch { /* already unusable */ }
     }
+    checks.push(sqliteCheck);
   }
 
   const stuck = migrations.filter((migration) => isStuckMigration(migration));
@@ -451,18 +483,12 @@ export async function doctorQlb(
       readOwnedCredential: async (provider, accountId, label) =>
         readOwnedCredentialFromKeychain(keychain, provider, accountId, label),
     });
-    if (drift.length > 0) {
+    for (const row of drift) {
       checks.push({
-        name: 'native-sync',
-        level: combineOverall(drift),
-        message: `${drift.length} QLB-owned credential${drift.length === 1 ? '' : 's'} checked`,
-        detail: drift.map((row) => ({
-          accountId: row.accountId,
-          provider: row.provider,
-          level: row.level,
-          message: row.message,
-          matches: row.matches,
-        })),
+        name: `native-sync:${row.accountId}`,
+        level: row.level,
+        message: row.message,
+        detail: { provider: row.provider, matches: row.matches },
       });
     }
   }

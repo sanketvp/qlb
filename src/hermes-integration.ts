@@ -304,7 +304,7 @@ export function hermesIntegrationChecks(options: HermesIntegrationOptions = {}):
         });
       }
     } catch (err) {
-      checks.push({ name: 'hermes:seam:anthropicMessagesApi', level: 'WARN', message: `seam probe failed: ${err instanceof Error ? err.message.split('\n')[0] : String(err)}` });
+      checks.push({ name: 'hermes:seam', level: 'WARN', message: `seam probe failed: ${err instanceof Error ? err.message.split('\n')[0] : String(err)}` });
     }
   }
 
