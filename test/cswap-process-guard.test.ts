@@ -1,34 +1,43 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { listCswapProcesses } from '../src/cswap-processes';
+import { CswapProcessCheckError, listCswapProcesses } from '../src/cswap-processes';
 
 test('finds a process running from a claude-swap directory', () => {
   const processes = listCswapProcesses({
-    runPs: () => ' 101 /opt/tools/claude-swap/bin/python auto.py\n',
-  });
-
-  assert.deepEqual(processes, [{ pid: 101 }]);
-});
-
-test('finds a process whose argv0 basename is cswap', () => {
-  const processes = listCswapProcesses({
-    runPs: () => ' 202 /usr/local/bin/cswap auto\n',
-  });
-
-  assert.deepEqual(processes, [{ pid: 202 }]);
-});
-
-test('finds cswap scripts launched by Python interpreters', () => {
-  const processes = listCswapProcesses({
     runPs: () => [
-      ' 432 /usr/bin/python3 /usr/local/bin/cswap auto',
-      ' 433 python3 -u /path/cswap status',
-      ' 434 python -m claude_swap auto',
+      ' 101 /opt/tools/claude-swap/bin/python auto.py',
+      ' 102 /Users/example/.local/share/uv/tools/claude-swap/bin/python /Users/example/.local/bin/cswap auto',
     ].join('\n'),
   });
 
-  assert.deepEqual(processes, [{ pid: 432 }, { pid: 433 }, { pid: 434 }]);
+  assert.deepEqual(processes, [{ pid: 101 }, { pid: 102 }]);
+});
+
+test('finds cswap and claude-swap executable paths, including paths with spaces', () => {
+  const processes = listCswapProcesses({
+    runPs: () => [
+      ' 202 /usr/local/bin/cswap auto',
+      ' 203 /usr/local/bin/claude-swap auto',
+      ' 204 /Applications/Claude Swap/claude-swap auto',
+    ].join('\n'),
+  });
+
+  assert.deepEqual(processes, [{ pid: 202 }, { pid: 203 }, { pid: 204 }]);
+});
+
+test('finds Python-launched cswap scripts and claude_swap modules', () => {
+  const processes = listCswapProcesses({
+    runPs: () => [
+      ' 432 /usr/bin/python3 /usr/local/bin/cswap auto',
+      ' 433 python3 -u cswap status',
+      ' 434 /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python /usr/local/bin/cswap auto',
+      ' 435 python3 -m claude_swap.cli list',
+      ' 436 /Applications/Python Framework/Python -m claude_swap.cli list',
+    ].join('\n'),
+  });
+
+  assert.deepEqual(processes, [{ pid: 432 }, { pid: 433 }, { pid: 434 }, { pid: 435 }, { pid: 436 }]);
 });
 
 test('ignores unrelated processes', () => {
@@ -37,12 +46,46 @@ test('ignores unrelated processes', () => {
       ' 303 /usr/local/bin/qlb auto',
       ' 404 node /opt/claude-swapper/index.js',
       ' 505 /usr/local/bin/not-cswap auto',
-      ' 606 vim cswap.txt',
+      ' 606 vim notes-about-cswap.txt',
       ' 707 grep cswap',
       ' 808 python -W cswap /path/other-script',
       ' 909 python -m other_module cswap',
+      ' 1001 node -m claude_swap.cli list',
     ].join('\n'),
   });
 
   assert.deepEqual(processes, []);
+});
+
+test('throws CswapProcessCheckError when ps fails', () => {
+  assert.throws(
+    () => listCswapProcesses({ runPs: () => { throw new Error('ps failed'); } }),
+    CswapProcessCheckError,
+  );
+});
+
+test('throws CswapProcessCheckError when ps times out', () => {
+  assert.throws(
+    () => listCswapProcesses({
+      runPs: () => { throw Object.assign(new Error('ps timed out'), { code: 'ETIMEDOUT' }); },
+    }),
+    CswapProcessCheckError,
+  );
+});
+
+test('throws CswapProcessCheckError when ps returns an empty table', () => {
+  assert.throws(
+    () => listCswapProcesses({ runPs: () => '' }),
+    CswapProcessCheckError,
+  );
+});
+
+test('throws CswapProcessCheckError on unsupported platforms', () => {
+  assert.throws(
+    () => listCswapProcesses({
+      platform: 'win32',
+      runPs: () => { throw new Error('runPs should not be called'); },
+    }),
+    CswapProcessCheckError,
+  );
 });
