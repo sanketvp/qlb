@@ -8,7 +8,6 @@ import { spawn } from 'node:child_process';
 import { describe, it } from 'node:test';
 import {
   ClaudeCodeLockTimeout,
-  RECLAIM_SUFFIX,
   claudeLockPaths,
   withClaudeConfigLock,
   withClaudeCredentialLocks,
@@ -245,162 +244,27 @@ describe('Claude Code proper-lockfile locks', () => {
     }
   });
 
-  it('does not let a delayed stale reclaimer disturb a fresh third contender sidecar', async () => {
-    const home = await tempHome();
-    const lock = join(home, 'race.lock');
-    const takeover = `${lock}.takeover`;
-    const reclaim = `${takeover}${RECLAIM_SUFFIX}`;
-    const fsPromises = require('node:fs/promises') as Record<string, (...args: any[]) => Promise<any>>;
-    const originalMkdir = fsPromises.mkdir;
-    const originalRename = fsPromises.rename;
-    const originalRmdir = fsPromises.rmdir;
-    const originalStat = fsPromises.stat;
-    let releaseInitialStats!: () => void;
-    const initialStatsReady = new Promise<void>((resolve) => { releaseInitialStats = resolve; });
-    let releaseBRetry!: () => void;
-    const bRetryReady = new Promise<void>((resolve) => { releaseBRetry = resolve; });
-    let releaseDelayedA!: () => void;
-    const delayedAReady = new Promise<void>((resolve) => { releaseDelayedA = resolve; });
-    let releaseCLockRemoval!: () => void;
-    const cLockRemovalReady = new Promise<void>((resolve) => { releaseCLockRemoval = resolve; });
-    let staleTakeoverCleared!: () => void;
-    const staleTakeoverClearedReady = new Promise<void>((resolve) => { staleTakeoverCleared = resolve; });
-    let freshSidecarCreated!: () => void;
-    const freshSidecarReady = new Promise<void>((resolve) => { freshSidecarCreated = resolve; });
-    let delayedAReclaimFailed!: () => void;
-    const delayedAReclaimFailedReady = new Promise<void>((resolve) => { delayedAReclaimFailed = resolve; });
-    let initialStats = 0;
-    let reclaimMkdirs = 0;
-    let takeoverRemovals = 0;
-    let takeoverHolders = 1;
-    let mostTakeoverHolders = 1;
-    let freshSidecarClaimFailures = 0;
-    let renameCalls = 0;
-    try {
-      await mkdir(lock, { recursive: true });
-      await mkdir(takeover);
-      const old = new Date(Date.now() - 6_000);
-      await utimes(lock, old, old);
-      await utimes(takeover, old, old);
-
-      fsPromises.stat = async (...args: any[]) => {
-        const result = await originalStat(...args);
-        if (String(args[0]) === takeover && initialStats < 2) {
-          initialStats += 1;
-          if (initialStats === 2) releaseInitialStats();
-          await initialStatsReady;
-        }
-        return result;
-      };
-      fsPromises.mkdir = async (...args: any[]) => {
-        const path = String(args[0]);
-        const delayedA = path === reclaim && ++reclaimMkdirs === 2;
-        if (delayedA) await delayedAReady;
-        let result;
-        try {
-          result = await originalMkdir(...args);
-        } catch (error) {
-          if (delayedA) delayedAReclaimFailed();
-          if (path === takeover && takeoverHolders === 1) freshSidecarClaimFailures += 1;
-          throw error;
-        }
-        if (path === takeover) {
-          takeoverHolders += 1;
-          mostTakeoverHolders = Math.max(mostTakeoverHolders, takeoverHolders);
-          freshSidecarCreated();
-        }
-        return result;
-      };
-      fsPromises.rmdir = async (...args: any[]) => {
-        const path = String(args[0]);
-        const result = await originalRmdir(...args);
-        if (path === takeover) {
-          takeoverHolders -= 1;
-          if (++takeoverRemovals === 1) {
-            staleTakeoverCleared();
-            await bRetryReady;
-          }
-        }
-        if (path === lock && existsSync(takeover)) await cLockRemovalReady;
-        return result;
-      };
-      fsPromises.rename = async (...args: any[]) => {
-        renameCalls += 1;
-        return originalRename(...args);
-      };
-
-      const [a, b] = [0, 1].map(() => withProperLockfile(
-        lock,
-        { stalenessMs: 100, timeoutMs: 2_000, retryMinMs: 5, retryJitterMs: 0 },
-        async () => {},
-      ));
-      await waitFor(() => initialStats === 2);
-      releaseInitialStats();
-      await staleTakeoverClearedReady;
-      freshSidecarClaimFailures = 0;
-
-      const c = withProperLockfile(lock, { stalenessMs: 100, timeoutMs: 2_000, retryMinMs: 5, retryJitterMs: 0 }, async () => {});
-      await freshSidecarReady;
-      assert.equal(existsSync(takeover), true, 'C holds the freshly recreated sidecar');
-      releaseDelayedA();
-      await delayedAReclaimFailedReady;
-      assert.equal(takeoverRemovals, 1, 'A must not remove C\'s fresh sidecar');
-      assert.equal(renameCalls, 0, 'A must not rename C\'s fresh sidecar');
-      assert.equal(mostTakeoverHolders, 1, 'no two contenders may hold the sidecar at once');
-
-      await assert.rejects(fsPromises.mkdir(takeover), /EEXIST/);
-      assert.ok(freshSidecarClaimFailures > 0, 'another contender cannot mkdir C\'s held sidecar');
-      releaseBRetry();
-      releaseCLockRemoval();
-      await Promise.all([a, b, c]);
-    } finally {
-      releaseInitialStats?.();
-      releaseBRetry?.();
-      releaseDelayedA?.();
-      releaseCLockRemoval?.();
-      fsPromises.mkdir = originalMkdir;
-      fsPromises.rename = originalRename;
-      fsPromises.rmdir = originalRmdir;
-      fsPromises.stat = originalStat;
-      await rm(home, { recursive: true, force: true });
-    }
-  });
-
-  it('clears a stale abandoned reclaim directory before taking over a lock', async () => {
-    const home = await tempHome();
-    const lock = join(home, 'stale.lock');
-    const takeover = `${lock}.takeover`;
-    const reclaim = `${takeover}${RECLAIM_SUFFIX}`;
-    try {
-      await mkdir(lock, { recursive: true });
-      await mkdir(takeover);
-      await mkdir(reclaim);
-      const old = new Date(Date.now() - 6_000);
-      await utimes(lock, old, old);
-      await utimes(takeover, old, old);
-      await utimes(reclaim, old, old);
-      await withProperLockfile(lock, { stalenessMs: 100, timeoutMs: 500, retryMinMs: 5, retryJitterMs: 0 }, async () => {});
-      assert.equal(existsSync(reclaim), false);
-      assert.equal(existsSync(takeover), false);
-    } finally {
-      await rm(home, { recursive: true, force: true });
-    }
-  });
-
-  it('clears a stale takeover directory before taking over a lock', async () => {
+  it('matches upstream stale takeover-sidecar handling', async () => {
     const home = await tempHome();
     const lock = join(home, 'stale.lock');
     const takeover = `${lock}.takeover`;
     try {
       await mkdir(lock, { recursive: true });
-      await mkdir(takeover, { recursive: true });
+      await mkdir(takeover);
       const old = new Date(Date.now() - 6_000);
       await utimes(lock, old, old);
+
+      await assert.rejects(
+        withProperLockfile(lock, { stalenessMs: 100, timeoutMs: 60, retryMinMs: 5, retryJitterMs: 0 }, async () => {}),
+        ClaudeCodeLockTimeout,
+      );
+      assert.equal(existsSync(takeover), true, 'a fresh sidecar is respected');
+
       await utimes(takeover, old, old);
       await withProperLockfile(lock, { stalenessMs: 100, timeoutMs: 500, retryMinMs: 5, retryJitterMs: 0 }, async () => {
         assert.equal(existsSync(lock), true);
       });
-      assert.equal(existsSync(takeover), false);
+      assert.equal(existsSync(takeover), false, 'an abandoned sidecar is removed before retrying');
     } finally {
       await rm(home, { recursive: true, force: true });
     }
