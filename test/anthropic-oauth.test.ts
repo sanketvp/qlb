@@ -43,6 +43,75 @@ const C_SWAP_OAUTH_PROGRAM = [
   'print(oauth.credential_fingerprint(sys.stdin.read()))',
 ].join('\n');
 
+const C_SWAP_USAGE_PROGRAM = [
+  'import importlib.util, json, sys, types',
+  `source = ${JSON.stringify(C_SWAP_SOURCE)}`,
+  'sys.path.insert(0, source)',
+  'package = types.ModuleType("claude_swap")',
+  'package.__path__ = [source + "/claude_swap"]',
+  'sys.modules["claude_swap"] = package',
+  'spec = importlib.util.spec_from_file_location("claude_swap.oauth", source + "/claude_swap/oauth.py")',
+  'oauth = importlib.util.module_from_spec(spec)',
+  'sys.modules[spec.name] = oauth',
+  'spec.loader.exec_module(oauth)',
+  'try:',
+  '  print(json.dumps({"result": oauth.build_usage_result(json.loads(sys.stdin.read()))}))',
+  'except Exception as exc:',
+  '  print(json.dumps({"error": type(exc).__name__}))',
+].join('\n');
+
+function runUsageOracle(input: unknown): { result?: Record<string, unknown>; error?: string } {
+  return JSON.parse(execFileSync(
+    'python3',
+    ['-I', '-B', '-c', C_SWAP_USAGE_PROGRAM],
+    { encoding: 'utf8', input: JSON.stringify(input) },
+  )) as { result?: Record<string, unknown>; error?: string };
+}
+
+const C_SWAP_REFRESH_PROGRAM = [
+  'import importlib.util, json, sys, types',
+  `source = ${JSON.stringify(C_SWAP_SOURCE)}`,
+  'sys.path.insert(0, source)',
+  'package = types.ModuleType("claude_swap")',
+  'package.__path__ = [source + "/claude_swap"]',
+  'sys.modules["claude_swap"] = package',
+  'spec = importlib.util.spec_from_file_location("claude_swap.oauth", source + "/claude_swap/oauth.py")',
+  'oauth = importlib.util.module_from_spec(spec)',
+  'sys.modules[spec.name] = oauth',
+  'spec.loader.exec_module(oauth)',
+  'print(json.dumps({"error": oauth.try_refresh_oauth_credentials(sys.stdin.read()).error}))',
+].join('\n');
+
+function refreshOracleError(credentials: string): string | null {
+  return (JSON.parse(execFileSync(
+    'python3',
+    ['-I', '-B', '-c', C_SWAP_REFRESH_PROGRAM],
+    { encoding: 'utf8', input: credentials },
+  )) as { error: string | null }).error;
+}
+
+const C_SWAP_EXPIRY_PROGRAM = [
+  'import importlib.util, json, sys, types',
+  `source = ${JSON.stringify(C_SWAP_SOURCE)}`,
+  'sys.path.insert(0, source)',
+  'package = types.ModuleType("claude_swap")',
+  'package.__path__ = [source + "/claude_swap"]',
+  'sys.modules["claude_swap"] = package',
+  'spec = importlib.util.spec_from_file_location("claude_swap.oauth", source + "/claude_swap/oauth.py")',
+  'oauth = importlib.util.module_from_spec(spec)',
+  'sys.modules[spec.name] = oauth',
+  'spec.loader.exec_module(oauth)',
+  'print(json.dumps({"expired": oauth.is_oauth_token_expired(True)}))',
+].join('\n');
+
+function oracleTreatsTrueAsExpired(): boolean {
+  return (JSON.parse(execFileSync(
+    'python3',
+    ['-I', '-B', '-c', C_SWAP_EXPIRY_PROGRAM],
+    { encoding: 'utf8' },
+  )) as { expired: boolean }).expired;
+}
+
 const GRANT_KEY = 'grant' + '_type';
 
 const FAKE_CREDENTIALS = JSON.stringify({
@@ -122,6 +191,10 @@ describe('Anthropic OAuth pure port', () => {
     assert.equal(isExpired(nowMs + 1, nowMs), false);
     assert.equal(needsFreshenBeforeSwitch(nowMs + FRESHEN_BUFFER_MS, nowMs), true);
     assert.equal(needsFreshenBeforeSwitch(nowMs + FRESHEN_BUFFER_MS + 1, nowMs), false);
+    // Python bool is an int subclass, so the oracle treats true as epoch 1.
+    assert.equal(oracleTreatsTrueAsExpired(), true);
+    assert.equal(isOAuthTokenExpired(true, nowMs), true);
+    assert.equal(needsFreshenBeforeSwitch(true, nowMs), true);
   });
 
   it('classifies only a 400, 401, or 403 JSON invalid_grant response as dead', () => {
@@ -135,17 +208,17 @@ describe('Anthropic OAuth pure port', () => {
       expiresInMs: 3_600_000,
       scopes: ['a', 'b', 'c'],
     });
-    // oauth.py accepts an empty token, non-positive durations, and a duration
-    // whose millisecond conversion overflows; only a missing key is transient.
+    // oauth.py accepts an empty token and non-positive durations; an expiry
+    // that cannot remain finite in JavaScript is a malformed response here.
     assert.deepEqual(classifyRefreshResponse(200, '{"access_token":"","expires_in":0}'), {
       kind: 'success', accessToken: '', expiresInMs: 0,
     });
     assert.deepEqual(classifyRefreshResponse(200, '{"access_token":"fake","expires_in":-1}'), {
       kind: 'success', accessToken: 'fake', expiresInMs: -1_000,
     });
-    const hugeExpiry = classifyRefreshResponse(200, '{"access_token":"fake","expires_in":1e308}');
-    assert.equal(hugeExpiry.kind, 'success');
-    if (hugeExpiry.kind === 'success') assert.equal(hugeExpiry.expiresInMs, Infinity);
+    assert.deepEqual(classifyRefreshResponse(200, '{"access_token":"fake","expires_in":1e308}'), {
+      kind: 'transient',
+    });
     assert.equal(classifyRefreshResponse(200, '{"access_token":"fake"}').kind, 'transient');
     for (const row of [
       { status: 400, body: '{"error":"invalid_grant"}', expected: 'dead' },
@@ -168,8 +241,10 @@ describe('Anthropic OAuth pure port', () => {
   });
 
   it('describes refresh and usage requests without performing network I/O', () => {
-    const refresh = buildRefreshRequest(FAKE_CREDENTIALS);
-    if (!refresh) throw new Error('fake credential must produce a refresh request');
+    const refreshResult = buildRefreshRequest(FAKE_CREDENTIALS);
+    assert.equal(refreshResult.kind, 'request');
+    if (refreshResult.kind !== 'request') throw new Error('fake credential must produce a refresh request');
+    const refresh = refreshResult.request;
     assert.equal(refresh.url, ANTHROPIC_OAUTH_TOKEN_URL);
     assert.equal(refresh.method, 'POST');
     assert.equal(refresh.timeoutMs, 10_000);
@@ -177,8 +252,25 @@ describe('Anthropic OAuth pure port', () => {
     assert.deepEqual(JSON.parse(refresh.body ?? ''), {
       [GRANT_KEY]: 'refresh_token', refresh_token: 'fake-refresh-token', client_id: ANTHROPIC_OAUTH_CLIENT_ID,
     });
-    assert.equal(buildRefreshRequest(JSON.stringify({ claudeAiOauth: {} })), null);
-    assert.equal(buildRefreshRequest(FAKE_CREDENTIALS, 6_000)?.timeoutMs, 6_000);
+    // try_refresh_oauth_credentials treats a complete credential missing the
+    // token as permanent, but a malformed/non-object blob as a torn read.
+    const noToken = JSON.stringify({ claudeAiOauth: {} });
+    assert.equal(refreshOracleError(noToken), 'no_refresh_token');
+    assert.equal(buildRefreshRequest(noToken).kind, 'no_refresh_token');
+    assert.equal(refreshOracleError('not json'), 'transient');
+    assert.equal(buildRefreshRequest('not json').kind, 'transient');
+    assert.equal(refreshOracleError('[]'), 'transient');
+    assert.equal(buildRefreshRequest('[]').kind, 'transient');
+    // Python's truthiness accepts non-string but truthy JSON values for the
+    // request body; preserve that shape rather than silently calling it absent.
+    const nonStringToken = buildRefreshRequest(JSON.stringify({ claudeAiOauth: { refreshToken: true } }));
+    assert.equal(nonStringToken.kind, 'request');
+    if (nonStringToken.kind === 'request') {
+      assert.equal(JSON.parse(nonStringToken.request.body ?? '').refresh_token, true);
+    }
+    const timedRequest = buildRefreshRequest(FAKE_CREDENTIALS, 6_000);
+    assert.equal(timedRequest.kind, 'request');
+    if (timedRequest.kind === 'request') assert.equal(timedRequest.request.timeoutMs, 6_000);
     assert.deepEqual(buildUsageRequest('fake-access-token'), {
       url: ANTHROPIC_USAGE_URL,
       method: 'GET',
@@ -220,25 +312,79 @@ describe('Anthropic OAuth pure port', () => {
 
   it('parses C-swap-shaped 5h, 7d, and per-model 7d usage buckets', () => {
     assert.equal(FIVE_HOUR_LABEL, '5h');
-    const result = parseUsageResponse({
-      five_hour: { utilization: 12.5, resets_at: '2099-01-01T00:00:00Z' },
-      seven_day: { utilization: 34, resets_at: '2099-01-08T00:00:00Z' },
+    const input = {
+      five_hour: { utilization: 12.5, resets_at: '2099-01-01T00:00:00+00:00' },
+      seven_day: { utilization: 34, resets_at: '2099-01-08T00:00:00+00:00' },
       limits: [
-        { percent: 56, resets_at: '2099-01-08T00:00:00Z', scope: { model: { display_name: 'seven_day_fable' } } },
-        { percent: 70, scope: { model: { display_name: 'fable' } } },
+        { percent: 56, resets_at: '2099-01-08T00:00:00+00:00', scope: { model: { display_name: 'seven_day_fable' } } },
+        { percent: 70, resets_at: '2099-01-09T00:00:00+00:00', scope: { model: { display_name: 'fable' } } },
         { percent: 'ignored', scope: { model: { display_name: 'Invalid' } } },
       ],
-    });
-    assert.deepEqual(result, {
+    };
+    const oracle = runUsageOracle(input);
+    assert.equal(oracle.error, undefined);
+    assert.deepEqual(parseUsageResponse(input), {
       buckets: {
-        '5h': { usedPct: 12.5, resetsAt: '2099-01-01T00:00:00Z' },
-        '7d': { usedPct: 34, resetsAt: '2099-01-08T00:00:00Z' },
-        '7d:Fable': { usedPct: 70 },
+        '5h': { usedPct: 12.5, resetsAt: '2099-01-01T00:00:00+00:00' },
+        '7d': { usedPct: 34, resetsAt: '2099-01-08T00:00:00+00:00' },
+        // C-swap retains both distinct display names and their own resets.
+        '7d:seven_day_fable': { usedPct: 56, resetsAt: '2099-01-08T00:00:00+00:00' },
+        '7d:fable': { usedPct: 70, resetsAt: '2099-01-09T00:00:00+00:00' },
       },
     });
-    // build_usage_result raises for a non-dict response or a present window
-    // without utilization; neither is equivalent to a valid empty response.
-    assert.throws(() => parseUsageResponse([1]));
-    assert.throws(() => parseUsageResponse({ five_hour: { resets_at: 'later' } }));
+    const scoped = oracle.result?.scoped as Array<Record<string, unknown>>;
+    assert.deepEqual(scoped.map(({ name, resets_at }) => ({ name, resets_at })), [
+      { name: 'seven_day_fable', resets_at: '2099-01-08T00:00:00+00:00' },
+      { name: 'fable', resets_at: '2099-01-09T00:00:00+00:00' },
+    ]);
+  });
+
+  it('keeps the binding scoped window when duplicate display names collide', () => {
+    const firstBinding = {
+      limits: [
+        { percent: 95, resets_at: '2099-01-08T00:00:00+00:00', scope: { surface: 'chat', model: { display_name: 'Fable' } } },
+        { percent: 20, resets_at: '2099-01-09T00:00:00+00:00', scope: { surface: 'code', model: { display_name: 'Fable' } } },
+      ],
+    };
+    assert.deepEqual(parseUsageResponse(firstBinding), {
+      buckets: { '7d:Fable': { usedPct: 95, resetsAt: '2099-01-08T00:00:00+00:00' } },
+    });
+  });
+
+  it('keeps the binding scoped window when duplicate display names arrive in reverse order', () => {
+    const lastBinding = {
+      limits: [
+        { percent: 20, resets_at: '2099-01-09T00:00:00+00:00', scope: { surface: 'code', model: { display_name: 'Fable' } } },
+        { percent: 95, resets_at: '2099-01-08T00:00:00+00:00', scope: { surface: 'chat', model: { display_name: 'Fable' } } },
+      ],
+    };
+    assert.deepEqual(parseUsageResponse(lastBinding), {
+      buckets: { '7d:Fable': { usedPct: 95, resetsAt: '2099-01-08T00:00:00+00:00' } },
+    });
+  });
+
+  it('keeps valid usage windows when another oracle window has non-numeric utilization', () => {
+    for (const utilization of [null, '12']) {
+      const input = { five_hour: { utilization }, seven_day: { utilization: 34 } };
+      const oracle = runUsageOracle(input);
+      assert.equal((oracle.result?.five_hour as Record<string, unknown>).pct, utilization);
+      assert.equal((oracle.result?.seven_day as Record<string, unknown>).pct, 34);
+      assert.deepEqual(parseUsageResponse(input), { buckets: { '7d': { usedPct: 34 } } });
+    }
+  });
+
+  it('rejects reset timestamps whenever the oracle format_reset rejects the response', () => {
+    for (const input of [
+      { five_hour: { utilization: 1, resets_at: 'later' } },
+      { five_hour: { utilization: 1, resets_at: '2099-01-01' } },
+      { seven_day: { utilization: 1, resets_at: 1 } },
+      { limits: [{ percent: 1, resets_at: 'later', scope: { model: { display_name: 'Fable' } } }] },
+    ]) {
+      const oracle = runUsageOracle(input);
+      assert.ok(oracle.error, `oracle should reject ${JSON.stringify(input)}`);
+      assert.throws(() => parseUsageResponse(input));
+    }
+    // A missing utilization is still structurally malformed, like h5["utilization"].
+    assert.throws(() => parseUsageResponse({ five_hour: { resets_at: '2099-01-01T00:00:00Z' } }));
   });
 });

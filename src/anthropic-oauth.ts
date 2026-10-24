@@ -3,8 +3,6 @@
 
 import { createHash } from 'node:crypto';
 
-import { normalizeModelLabel } from './cswap-usage';
-
 export const ANTHROPIC_OAUTH_BETA_HEADER = 'oauth-2025-04-20';
 export const ANTHROPIC_OAUTH_TOKEN_URL = 'https://platform.claude.com/v1/oauth/token';
 export const ANTHROPIC_USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
@@ -31,6 +29,12 @@ export interface HttpRequestDescription {
   timeoutMs: number;
   body?: string;
 }
+
+/** The pre-request outcomes from C-swap's `try_refresh_oauth_credentials`. */
+export type RefreshRequestClassification =
+  | { kind: 'request'; request: HttpRequestDescription }
+  | { kind: 'no_refresh_token' }
+  | { kind: 'transient' };
 
 export interface OAuthAccount {
   uuid: string;
@@ -125,10 +129,15 @@ function isFiniteNumber(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value);
 }
 
+function isPythonExpiryNumber(value: unknown): value is number | boolean {
+  // `bool` is an `int` subclass in Python, so true is the epoch millisecond 1.
+  return typeof value === 'boolean' || isFiniteNumber(value);
+}
+
 function expiresWithin(expiresAt: unknown, bufferMs: number, nowMs: number): boolean {
-  if (!isFiniteNumber(expiresAt)) return false;
+  if (!isPythonExpiryNumber(expiresAt)) return false;
   // Python's int(expires_at) truncates toward zero before comparing.
-  return nowMs + bufferMs >= Math.trunc(expiresAt);
+  return nowMs + bufferMs >= Math.trunc(Number(expiresAt));
 }
 
 /** Whether the token is already expired, without C-swap's proactive refresh buffer. */
@@ -151,29 +160,45 @@ export function isWithinRefreshWindow(expiresAt: unknown, nowMs = Date.now()): b
 
 /** C-swap autoswitch's ten-minute freshen-before-activation predicate. */
 export function needsFreshenBeforeSwitch(expiresAt: unknown, nowMs = Date.now()): boolean {
-  return expiresWithin(expiresAt, FRESHEN_BUFFER_MS, nowMs);
+  if (!isPythonExpiryNumber(expiresAt)) return false;
+  // autoswitch.py compares this one directly, without int() truncation.
+  return nowMs + FRESHEN_BUFFER_MS >= Number(expiresAt);
 }
 
 /** Describe C-swap's refresh-token POST. This function deliberately performs no I/O. */
 export function buildRefreshRequest(
   credentials: string,
   timeoutMs = 10_000,
-): HttpRequestDescription | null {
-  const refreshToken = parseCredentialBlob(credentials)?.oauth?.refreshToken;
-  if (typeof refreshToken !== 'string' || !refreshToken) return null;
+): RefreshRequestClassification {
+  // A malformed root can be a torn read, whereas a complete root with no
+  // usable token is the permanent `no_refresh_token` outcome.
+  let data: unknown;
+  try {
+    data = JSON.parse(credentials);
+  } catch {
+    return { kind: 'transient' };
+  }
+  if (!isObject(data)) return { kind: 'transient' };
+  const oauth = data.claudeAiOauth;
+  if (!isObject(oauth) || isPythonFalsy(oauth.refreshToken)) {
+    return { kind: 'no_refresh_token' };
+  }
   return {
-    url: ANTHROPIC_OAUTH_TOKEN_URL,
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'User-Agent': 'claude-swap/1.0',
+    kind: 'request',
+    request: {
+      url: ANTHROPIC_OAUTH_TOKEN_URL,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'User-Agent': 'claude-swap/1.0',
+      },
+      body: JSON.stringify({
+        grant_type: 'refresh_token',
+        refresh_token: oauth.refreshToken,
+        client_id: ANTHROPIC_OAUTH_CLIENT_ID,
+      }),
+      timeoutMs,
     },
-    body: JSON.stringify({
-      grant_type: 'refresh_token',
-      refresh_token: refreshToken,
-      client_id: ANTHROPIC_OAUTH_CLIENT_ID,
-    }),
-    timeoutMs,
   };
 }
 
@@ -191,10 +216,12 @@ export function classifyRefreshResponse(status: number | null | undefined, body:
       }
       if (parsed.scope != null && typeof parsed.scope !== 'string') return { kind: 'transient' };
       if (parsed.refresh_token != null && typeof parsed.refresh_token !== 'string') return { kind: 'transient' };
+      const expiresInMs = parsed.expires_in * 1000;
+      if (!Number.isFinite(expiresInMs)) return { kind: 'transient' };
       const result: Extract<RefreshClassification, { kind: 'success' }> = {
         kind: 'success',
         accessToken: parsed.access_token,
-        expiresInMs: parsed.expires_in * 1000,
+        expiresInMs,
       };
       if (parsed.refresh_token) result.refreshToken = parsed.refresh_token;
       if (parsed.scope) result.scopes = parsed.scope.split(/\s+/).filter(Boolean);
@@ -277,26 +304,59 @@ function isPythonFalsy(value: unknown): boolean {
     || (isObject(value) && Object.keys(value).length === 0);
 }
 
+function usableUsagePct(value: unknown): number | undefined {
+  // Python's isinstance(..., (int, float)) includes bool; normalize that
+  // numeric value because this port's buckets are explicitly numeric.
+  if (typeof value === 'boolean') return Number(value);
+  return isFiniteNumber(value) ? value : undefined;
+}
+
+function validatedResetAt(value: unknown): string | undefined {
+  if (isPythonFalsy(value)) return undefined;
+  if (typeof value !== 'string') throw new TypeError('resets_at must be a string');
+  // format_reset parses an ISO datetime and then subtracts an aware UTC now;
+  // a timezone-less/date-only string therefore fails there too.
+  const match = /^(\d{4})-(\d{2})-(\d{2})[Tt ](\d{2}):(\d{2})(?::(\d{2})(?:[.,]\d+)?)?(?:Z|[+-]\d{2}(?::?\d{2})?)$/i.exec(value);
+  if (!match || !Number.isFinite(Date.parse(value))) {
+    throw new RangeError('resets_at is not a parseable ISO-8601 timestamp');
+  }
+  const [year, month, day, hour, minute, second] = match.slice(1, 7).map(Number);
+  const calendarDate = new Date(Date.UTC(year, month - 1, day));
+  if (
+    year < 1 || year > 9999 || month < 1 || month > 12 || day < 1
+    || calendarDate.getUTCFullYear() !== year || calendarDate.getUTCMonth() !== month - 1
+    || calendarDate.getUTCDate() !== day || hour > 23 || minute > 59 || (second !== 0 && second > 59)
+  ) {
+    throw new RangeError('resets_at is not a parseable ISO-8601 timestamp');
+  }
+  return value;
+}
+
 function addUsageBucket(
   buckets: Record<string, UsageBucket>,
   key: string,
   value: unknown,
 ): void {
   // build_usage_result only skips Python-falsy windows; a truthy malformed
-  // window raises, allowing its caller to record a bad-response outcome.
+  // window raises. A present non-numeric utilization is retained upstream but
+  // filtered later by relevant_windows, so omit only that unusable bucket here.
   if (isPythonFalsy(value)) return;
-  if (!isObject(value) || !isFiniteNumber(value.utilization)) {
-    throw new TypeError(`${key} usage window lacks numeric utilization`);
+  if (!isObject(value) || !Object.hasOwn(value, 'utilization')) {
+    throw new TypeError(`${key} usage window lacks utilization`);
   }
-  const bucket: UsageBucket = { usedPct: value.utilization };
-  if (typeof value.resets_at === 'string' && value.resets_at) bucket.resetsAt = value.resets_at;
+  const resetsAt = validatedResetAt(value.resets_at);
+  const usedPct = usableUsagePct(value.utilization);
+  if (usedPct === undefined) return;
+  const bucket: UsageBucket = { usedPct };
+  if (resetsAt !== undefined) bucket.resetsAt = resetsAt;
   buckets[key] = bucket;
 }
 
 /**
  * Normalize C-swap's usage endpoint shape into QLB's 5h / 7d / 7d:<model> buckets.
  * Older responses simply omit `limits`; malformed individual entries are ignored.
- * As upstream does, a non-object response or malformed present base window throws.
+ * As upstream does, a non-object response, malformed present base window, or invalid
+ * truthy reset timestamp throws.
  */
 export function parseUsageResponse(data: unknown): ParsedUsageResponse {
   if (!isObject(data)) throw new TypeError('usage response must be an object');
@@ -307,14 +367,18 @@ export function parseUsageResponse(data: unknown): ParsedUsageResponse {
 
   if (Array.isArray(data.limits)) {
     for (const limit of data.limits) {
-      if (!isObject(limit) || !isFiniteNumber(limit.percent)) continue;
+      if (!isObject(limit)) continue;
       const scope = isObject(limit.scope) ? limit.scope : null;
       const model = scope && isObject(scope.model) ? scope.model : null;
       const name = model?.display_name;
-      if (typeof name !== 'string' || !name) continue;
-      const bucket: UsageBucket = { usedPct: limit.percent };
-      if (typeof limit.resets_at === 'string' && limit.resets_at) bucket.resetsAt = limit.resets_at;
-      const key = `7d:${normalizeModelLabel(name)}`;
+      const usedPct = usableUsagePct(limit.percent);
+      if (typeof name !== 'string' || !name || usedPct === undefined) continue;
+      const bucket: UsageBucket = { usedPct };
+      const resetsAt = validatedResetAt(limit.resets_at);
+      if (resetsAt !== undefined) bucket.resetsAt = resetsAt;
+      // Preserve display names verbatim. Duplicate names cannot both be keys,
+      // so retain the binding (highest-use) window and its corresponding reset.
+      const key = `7d:${name}`;
       const existing = buckets[key];
       if (!existing || bucket.usedPct > existing.usedPct) buckets[key] = bucket;
     }
