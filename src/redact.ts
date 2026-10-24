@@ -1,55 +1,111 @@
 import { createHash } from 'node:crypto';
 
 export const REDACTED = '[redacted]';
+const CIRCULAR = '[circular]';
 
-// These patterns catch credentials in error bodies before their concrete values are known.
+// Explicit token-character lookarounds avoid the \b false-negative when a
+// credential ends in punctuation such as -, ~, +, /, or =.
 const TOKEN_PATTERNS: readonly RegExp[] = [
-  /\bsk-[A-Za-z0-9_-]{16,}\b/g,
-  /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g,
-  /\bBearer\s+[A-Za-z0-9._~-]{16,}\b/gi,
+  /(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{16,}(?![A-Za-z0-9_-])/g,
+  /(?<![A-Za-z0-9])xai-[A-Za-z0-9]{32,}(?![A-Za-z0-9])/g,
+  /(?<![A-Za-z0-9])eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?![A-Za-z0-9_-])/g,
+  /(?<![A-Za-z0-9\-._~+/=])Bearer[ \t]+[A-Za-z0-9\-._~+/]{16,}={0,}(?![A-Za-z0-9\-._~+/=])/gi,
 ];
-const SENSITIVE_KEY = /^(?:access|refresh|id)?[_-]?token(?:s)?$|^(?:api[_-]?key|authorization|credential|password|secret)$|(?:^|[_-])(?:api[_-]?key|authorization|credential|password|secret)$/i;
+
+const SENSITIVE_KEY = new Set([
+  'token',
+  'tokens',
+  'accesstoken',
+  'refreshtoken',
+  'idtoken',
+  'sessiontoken',
+  'apikey',
+  'xapikey',
+  'secret',
+  'clientsecret',
+  'consumersecret',
+  'apisecret',
+  'secretkey',
+  'privatekey',
+  'password',
+  'authorization',
+  'credential',
+  'credentials',
+  'cookie',
+  'setcookie',
+]);
 
 function fingerprint(secret: string): string {
   return createHash('sha256').update(secret, 'utf8').digest('hex');
+}
+
+function isSensitiveKey(key: string): boolean {
+  return SENSITIVE_KEY.has(key.replace(/[_-]/g, '').toLowerCase());
 }
 
 /**
  * Replaces supplied credentials (and their fingerprints) plus recognisable
  * credential shapes. This is deliberately safe to use on arbitrary error text.
  */
-export function redactSecrets(text: string, secrets: readonly string[] = []): string {
+export function redactSecrets(text: string, secrets: readonly string[]): string {
   let out = text;
-  for (const secret of secrets) {
-    if (!secret) continue;
-    out = out.split(secret).join(REDACTED).split(fingerprint(secret)).join(REDACTED);
-  }
+  const values = [...new Set(secrets.filter(Boolean))].sort((a, b) => b.length - a.length);
+
+  // Fingerprints must be handled before their raw value: a short raw value can
+  // occur inside its hexadecimal fingerprint and otherwise corrupt that match.
+  for (const secret of values) out = out.split(fingerprint(secret)).join(REDACTED);
+  for (const secret of values) out = out.split(secret).join(REDACTED);
   for (const pattern of TOKEN_PATTERNS) out = out.replace(pattern, REDACTED);
   return out;
 }
 
-function redactValue(value: unknown, secrets: readonly string[], seen: WeakSet<object>): unknown {
+type RedactedValue = unknown | undefined;
+
+function redactValue(value: unknown, secrets: readonly string[], ancestors: WeakSet<object>): RedactedValue {
   if (typeof value === 'string') return redactSecrets(value, secrets);
-  if (typeof value === 'function' || typeof value === 'symbol') return REDACTED;
+  if (typeof value === 'function' || typeof value === 'symbol' || typeof value === 'undefined') return undefined;
   if (value === null || typeof value !== 'object') return value;
-  if (seen.has(value)) return REDACTED;
-  seen.add(value);
+  if (ancestors.has(value)) return CIRCULAR;
 
-  if (Array.isArray(value)) return value.map((entry) => redactValue(entry, secrets, seen));
-
-  const out: Record<string, unknown> = {};
+  ancestors.add(value);
   try {
-    for (const [key, entry] of Object.entries(value)) {
-      out[key] = SENSITIVE_KEY.test(key) ? REDACTED : redactValue(entry, secrets, seen);
+    const descriptors = Object.getOwnPropertyDescriptors(value);
+    if (Array.isArray(value)) {
+      const out: unknown[] = [];
+      for (let index = 0; index < value.length; index += 1) {
+        const descriptor = descriptors[String(index)];
+        if (!descriptor) {
+          out[index] = undefined;
+        } else if (!('value' in descriptor)) {
+          out[index] = REDACTED;
+        } else {
+          out[index] = redactValue(descriptor.value, secrets, ancestors);
+        }
+      }
+      return out;
     }
+
+    const out: Record<string, unknown> = {};
+    for (const [key, descriptor] of Object.entries(descriptors)) {
+      if (!descriptor.enumerable) continue;
+      if (isSensitiveKey(key) || !('value' in descriptor)) {
+        out[key] = REDACTED;
+        continue;
+      }
+      const redacted = redactValue(descriptor.value, secrets, ancestors);
+      if (redacted !== undefined) out[key] = redacted;
+    }
+    return out;
   } catch {
+    // A proxy may reject descriptor inspection. Do not fall back to property reads.
     return REDACTED;
+  } finally {
+    ancestors.delete(value);
   }
-  return out;
 }
 
 /** Serializes an arbitrary value without retaining credential values. */
-export function redactJson(value: unknown, secrets: readonly string[] = []): string {
+export function redactJson(value: unknown, secrets: readonly string[]): string {
   try {
     const json = JSON.stringify(redactValue(value, secrets, new WeakSet<object>()));
     return json === undefined ? 'null' : json;
@@ -58,9 +114,28 @@ export function redactJson(value: unknown, secrets: readonly string[] = []): str
   }
 }
 
+/** Redacts a Pi stream event without mutating it, including value-free token shapes. */
+export function redactEvent(event: unknown, secrets: readonly string[]): unknown {
+  return redactValue(event, secrets, new WeakSet<object>());
+}
+
+function escapeControls(value: string): string {
+  return value.replace(/[\u0000-\u001f\u007f-\u009f]/g, (character) => {
+    switch (character) {
+      case '\n': return '\\n';
+      case '\r': return '\\r';
+      case '\t': return '\\t';
+      default: return `\\u${character.codePointAt(0)!.toString(16).padStart(4, '0')}`;
+    }
+  });
+}
+
 /** Returns a safe, single-line error description for persisted error columns and stderr. */
-export function redactError(error: unknown, secrets: readonly string[] = []): string {
-  if (error instanceof Error) return redactSecrets(error.message || error.name, secrets);
-  if (typeof error === 'string') return redactSecrets(error, secrets);
-  return redactJson(error, secrets);
+export function redactError(error: unknown, secrets: readonly string[]): string {
+  const value = error instanceof Error
+    ? redactSecrets(error.message || error.name, secrets)
+    : typeof error === 'string'
+      ? redactSecrets(error, secrets)
+      : redactJson(error, secrets);
+  return escapeControls(value);
 }

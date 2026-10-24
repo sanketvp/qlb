@@ -49,6 +49,8 @@ const PI_CONSUME = [
   join(ROOT, 'extensions', 'qlb-pi', 'consume.ts'),
   join(ROOT, 'extensions', 'qlb-pi', 'consume-provider.ts'),
 ];
+// qlb-pi uses this dependency-free helper so every sink shares one redactor.
+const PI_ALLOWED_LOCAL_IMPORTS = [join(SRC, 'redact.ts')];
 
 const HARNESS = [
   join(ROOT, 'harness', 'claude'),
@@ -65,7 +67,9 @@ const SPAWN_CURL_RE = /\b(?:execFile|execFileSync|spawn|spawnSync|execvp|Popen)\
 function resolveLocal(fromFile: string, spec: string): string | null {
   if (!spec.startsWith('.')) return null;
   const base = resolvePath(dirname(fromFile), spec);
-  for (const candidate of [base, `${base}.ts`, join(base, 'index.ts')]) {
+  // NodeNext-style source imports use .js, while this static walker reads .ts.
+  const sourceBase = spec.endsWith('.js') ? base.slice(0, -3) : base;
+  for (const candidate of [base, `${base}.ts`, `${sourceBase}.ts`, join(base, 'index.ts')]) {
     if (existsSync(candidate) && statSync(candidate).isFile()) return candidate;
   }
   return null;
@@ -191,6 +195,8 @@ describe('consume import-closure walker', () => {
   it('production closure excludes writers and dynamic imports', () => {
     const consume = closureOf(CONSUME_ROOTS);
     const writerHits = [...consume.files].filter((f) => WRITERS.includes(f));
+    const piConsume = closureOf(PI_CONSUME);
+    const piLocalImports = [...piConsume.files].filter((f) => !f.startsWith(join(ROOT, 'extensions', 'qlb-pi')));
     const texts = [...consume.files, ...PI_CONSUME, ...HARNESS].map((f) => ({ f, text: readFileSync(f, 'utf8') }));
     let tokenTerms = 0;
     let securityWrites = 0;
@@ -212,6 +218,7 @@ describe('consume import-closure walker', () => {
       `WRITER_IMPORTS=${writerHits.length} TOKEN_TERMS=${tokenTerms} CSWAP_SPAWNS_SRC=${cswapSpawns} SECURITY_WRITE_TERMS=${securityWrites} DYNAMIC_IMPORTS=${dynamic} RUNTIME_ROOTS=${RUNTIME_ROOTS.length} CLOSURE_ROOTS=${CLOSURE_ROOTS.length} CLOSURE_FILES=${all.files.size}`,
     );
     assert.equal(writerHits.length, 0, `writers in closure: ${writerHits.map((f) => relative(ROOT, f)).join(', ')}`);
+    assert.deepEqual(piLocalImports, PI_ALLOWED_LOCAL_IMPORTS, `unexpected Pi local imports: ${piLocalImports.map((f) => relative(ROOT, f)).join(', ')}`);
     assert.equal(tokenTerms, 0);
     assert.equal(cswapSpawns, 0);
     assert.equal(securityWrites, 0);

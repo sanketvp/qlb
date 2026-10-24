@@ -6,7 +6,7 @@ import { describe, it } from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 
 import { resolveConfig } from '../src/config';
-import { redactSecrets as redactSrcSecrets } from '../src/redact';
+import { redactEvent, redactSecrets } from '../src/redact';
 import {
   activeCcSecurityArgs as srcArgs,
   getActiveClaudeCodeAccess,
@@ -25,8 +25,6 @@ import {
   parseConsumeStatus,
   readActiveClaudeAccess,
   readOwnerFileState,
-  redactEvent,
-  redactSecrets,
   SECURITY_BIN,
   type CswapActiveAccess,
   type ConsumeJournal,
@@ -95,47 +93,6 @@ describe('qlb-pi consume reader parity with src/cswap-native-read', () => {
       }
     });
   }
-});
-
-describe('qlb-pi redactSecrets parity with src/redact', () => {
-  const suppliedSecret = 'fixture-secret-value';
-  const suppliedFingerprint = fingerprintAccess(suppliedSecret);
-  const skToken = 'sk-abcdefghijklmnopqrstuvwxyz0123456789';
-  const anthropicToken = 'sk-ant-oat-abcdefghijklmnopqrstuvwxyz0123456789';
-  const openrouterToken = 'sk-or-v1-abcdefghijklmnopqrstuvwxyz0123456789';
-  const jwt = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJmaXh0dXJlIn0.fixture-signature';
-  const bearer = 'Bearer abcdefghijklmnopqrstuvwxyz0123456789';
-  const bodyTokens = [anthropicToken, openrouterToken, jwt];
-  const body = `${'x'.repeat(1800)} ${bodyTokens.join(' ')} ${'y'.repeat(180)}`;
-
-  const cases: Array<[string, string, readonly string[]]> = [
-    ['supplied secret', `value=${suppliedSecret}`, [suppliedSecret]],
-    ['supplied secret fingerprint', `fingerprint=${suppliedFingerprint}`, [suppliedSecret]],
-    ['sk token', skToken, []],
-    ['sk-ant token', anthropicToken, []],
-    ['sk-or token', openrouterToken, []],
-    ['JWT', jwt, []],
-    ['Bearer token', bearer, []],
-    ['empty secret entries', `value=${suppliedSecret}`, ['', suppliedSecret, '']],
-    ['clean string', 'nothing sensitive here', []],
-  ];
-
-  for (const [name, input, secrets] of cases) {
-    it(`matches src/redact for ${name}`, () => {
-      assert.equal(redactSecrets(input, secrets), redactSrcSecrets(input, secrets));
-    });
-  }
-
-  it('redacts all token-shaped values from a 2 KB body in both copies', () => {
-    assert.ok(Buffer.byteLength(body) >= 2048);
-    const extensionResult = redactSecrets(body, []);
-    const srcResult = redactSrcSecrets(body, []);
-    assert.equal(extensionResult, srcResult);
-    for (const token of bodyTokens) {
-      assert.equal(extensionResult.includes(token), false);
-      assert.equal(srcResult.includes(token), false);
-    }
-  });
 });
 
 describe('qlb-pi mode decision', () => {
@@ -550,7 +507,7 @@ describe('redaction helper', () => {
     const out = redactEvent(event, [tok]) as Record<string, unknown>;
     assert.notEqual(out, event);
     assert.notEqual(out.a, shared);
-    assert.equal(out.self, out, 'cycles map to the clone, not the original');
+    assert.equal(out.self, '[circular]', 'true cycles become a stable marker');
     const { self: _self, ...rest } = out;
     void _self;
     const text = JSON.stringify(rest);

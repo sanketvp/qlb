@@ -18,13 +18,9 @@ export const ACTIVE_CC_SERVICE = "Claude Code-credentials";
 export const SECURITY_BIN = "/usr/bin/security";
 const FALLBACK_ACCOUNT = "claude-code-user";
 
-// src/redact.ts is canonical; this Pi-loader-local copy is pinned by the
-// qlb-pi redactSecrets parity test because jiti cannot import QLB's src/ tree.
-const TOKEN_PATTERNS: readonly RegExp[] = [
-  /\bsk-[A-Za-z0-9_-]{16,}\b/g,
-  /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g,
-  /\bBearer\s+[A-Za-z0-9._~-]{16,}\b/gi,
-];
+// Shared redaction is intentionally imported from src/: Pi installs this package
+// intact, and the closure test pins this as the extension's sole src dependency.
+export { redactEvent, redactSecrets } from "../../src/redact.js";
 
 // Stable, value-free messages for every consume failure sink (audit, Pi error
 // event, console). Raw diagnostics never cross these boundaries.
@@ -334,44 +330,4 @@ export function consumeAccessSource(read: () => CswapActiveAccess): {
     },
     sent: () => [...sent],
   };
-}
-
-/** Replace every known access value and its fingerprint with a placeholder. */
-export function redactSecrets(text: string, secrets: readonly string[] = []): string {
-  let out = text;
-  for (const secret of secrets) {
-    if (!secret) continue;
-    out = out.split(secret).join("[redacted]").split(fingerprintAccess(secret)).join("[redacted]");
-  }
-  for (const pattern of TOKEN_PATTERNS) out = out.replace(pattern, "[redacted]");
-  return out;
-}
-
-/**
- * Independent deep copy of a Pi stream event with every string redacted (any
- * shape: arrays, message.*, bare strings, shared or cyclic references).
- * Fails closed: anything nested beyond MAX_REDACT_DEPTH becomes "[redacted]".
- */
-const MAX_REDACT_DEPTH = 64;
-export function redactEvent(event: unknown, secrets: readonly string[]): unknown {
-  if (secrets.length === 0) return event;
-  const clones = new WeakMap<object, unknown>();
-  const walk = (value: unknown, depth: number): unknown => {
-    if (typeof value === "string") return redactSecrets(value, secrets);
-    if (!value || typeof value !== "object") return value;
-    if (depth > MAX_REDACT_DEPTH) return "[redacted]";
-    const existing = clones.get(value);
-    if (existing !== undefined) return existing;
-    if (Array.isArray(value)) {
-      const out: unknown[] = [];
-      clones.set(value, out);
-      for (const item of value) out.push(walk(item, depth + 1));
-      return out;
-    }
-    const out: Record<string, unknown> = {};
-    clones.set(value, out);
-    for (const [key, item] of Object.entries(value)) out[key] = walk(item, depth + 1);
-    return out;
-  };
-  return walk(event, 0);
 }
