@@ -18,10 +18,33 @@ function defaultRunPs(): string {
   });
 }
 
+function isPythonInterpreter(command: string): boolean {
+  return /^python(?:\d+(?:\.\d+)*)?$/.test(basename(command));
+}
+
 function isCswapCommand(command: string): boolean {
   if (command.includes('/claude-swap/')) return true;
-  const argv0 = command.trim().split(/\s+/, 1)[0];
-  return argv0 !== undefined && basename(argv0) === 'cswap';
+
+  const argv = command.trim().split(/\s+/);
+  const argv0 = argv[0];
+  if (argv0 === undefined) return false;
+  if (basename(argv0) === 'cswap') return true;
+  if (!isPythonInterpreter(argv0)) return false;
+
+  for (let index = 1; index < argv.length; index += 1) {
+    const argument = argv[index];
+    if (argument === undefined) return false;
+    if (argument === '-c') return false;
+    if (argument === '-m') return argv[index + 1] === 'claude_swap';
+    if (argument === '-W' || argument === '-X' || argument === '-Q' || argument === '--check-hash-based-pycs') {
+      index += 1;
+      continue;
+    }
+    if (argument.startsWith('-')) continue;
+    return basename(argument) === 'cswap';
+  }
+
+  return false;
 }
 
 /** List running C-swap processes without retaining their command lines. */
