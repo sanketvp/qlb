@@ -25,6 +25,11 @@ export type CodexSwitchOutcome =
 export interface CodexSwitchLogRow {
   /** Stable `switch_log.id`, used to order publications with the same millisecond. */
   id: number;
+  /**
+   * The attempted switch source. For `reverted-by-codex`, `fromAccountId` and
+   * `toAccountId` remain the attempted A→B switch, and the live file holds
+   * `fromAccountId` afterwards.
+   */
   fromAccountId: string | null;
   toAccountId: string;
   outcome: CodexSwitchOutcome;
@@ -135,10 +140,13 @@ function comparePublishedRows(a: CodexSwitchLogRow, b: CodexSwitchLogRow): numbe
 
 /**
  * Reconstructs the C5 point-in-time holder eras. Only `ok` and
- * `reverted-by-codex` rows changed the live auth file; failed, rolled-back,
- * refused, and noop rows deliberately create no era. C5b deliberately replaces
- * these instants with transition intervals; do not use this as a boundary
- * ambiguity policy.
+ * `reverted-by-codex` rows changed the live auth file; an `ok` row leaves
+ * `toAccountId` in the file, while a `reverted-by-codex` row leaves
+ * `fromAccountId` there. Failed, rolled-back, refused, and noop rows create no
+ * transition era. If a history contains only those non-effective rows, its
+ * earliest known `fromAccountId` remains the open-ended holder. C5b deliberately
+ * replaces these instants with transition intervals; do not use this as a
+ * boundary ambiguity policy.
  */
 export function holderEras(switchLogRows: readonly CodexSwitchLogRow[]): HolderEra[] {
   const rows = switchLogRows.filter((row) => advancesHolderEra(row.outcome));
@@ -147,7 +155,14 @@ export function holderEras(switchLogRows: readonly CodexSwitchLogRow[]): HolderE
       throw new Error('Invalid effective Codex switch-log publication row');
     }
   }
-  if (rows.length === 0) return [];
+  if (rows.length === 0) {
+    const firstKnownHolder = switchLogRows
+      .filter((row) => row.fromAccountId !== null)
+      .sort((a, b) => a.id - b.id)[0];
+    return firstKnownHolder === undefined
+      ? []
+      : [{ identity: firstKnownHolder.fromAccountId!, startsAt: null, endsAt: null }];
+  }
 
   rows.sort(comparePublishedRows);
   const first = rows[0];
@@ -157,7 +172,9 @@ export function holderEras(switchLogRows: readonly CodexSwitchLogRow[]): HolderE
 
   for (const row of rows) {
     if (identity !== null) eras.push({ identity, startsAt, endsAt: row.publishedAt });
-    identity = row.toAccountId;
+    identity = row.outcome === 'reverted-by-codex'
+      ? row.fromAccountId ?? identity
+      : row.toAccountId;
     startsAt = row.publishedAt;
   }
   if (identity !== null) eras.push({ identity, startsAt, endsAt: null });

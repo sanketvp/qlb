@@ -112,6 +112,53 @@ describe('Codex session process list and holder eras', () => {
     assert.deepEqual(renewers(identityA, processes, switchRows).map(({ pid }) => pid), [101, 103]);
   });
 
+  it('returns to the attempted source when Codex reverts a switch', () => {
+    const rows = [
+      { id: 1, fromAccountId: A, toAccountId: B, outcome: 'reverted-by-codex' as const, publishedAt: T0 },
+    ];
+    assert.deepEqual(holderEras(rows), [
+      { identity: A, startsAt: null, endsAt: T0 },
+      { identity: A, startsAt: T0, endsAt: null },
+    ]);
+
+    const process = [{ pid: 105, lstart: lstarts.c, host: 'codex' }];
+    assert.deepEqual(renewers(identityA, process, rows).map(({ pid }) => pid), [105]);
+    assert.deepEqual(renewers(identityB, process, rows), []);
+  });
+
+  it('returns to A after an ok A-to-B switch is reverted by Codex', () => {
+    const revertedAt = T0 + 15_000;
+    const rows = [
+      { id: 1, fromAccountId: A, toAccountId: B, outcome: 'ok' as const, publishedAt: T0 },
+      { id: 2, fromAccountId: A, toAccountId: B, outcome: 'reverted-by-codex' as const, publishedAt: revertedAt },
+    ];
+    assert.deepEqual(holderEras(rows), [
+      { identity: A, startsAt: null, endsAt: T0 },
+      { identity: B, startsAt: T0, endsAt: revertedAt },
+      { identity: A, startsAt: revertedAt, endsAt: null },
+    ]);
+
+    const processes = [
+      { pid: 106, lstart: lstarts.b, host: 'codex' },
+      { pid: 107, lstart: lstarts.c, host: 'codex' },
+    ];
+    assert.deepEqual(renewers(identityB, processes, rows).map(({ pid }) => pid), [106]);
+    assert.deepEqual(renewers(identityA, processes, rows).map(({ pid }) => pid), [107]);
+  });
+
+  it('keeps the first known holder when all switch rows are non-effective', () => {
+    for (const [outcome, toAccountId] of [['failed', B], ['noop', A]] as const) {
+      const rows = [
+        { id: 1, fromAccountId: A, toAccountId, outcome, publishedAt: null },
+      ];
+      assert.deepEqual(holderEras(rows), [{ identity: A, startsAt: null, endsAt: null }]);
+
+      const process = [{ pid: 108, lstart: lstarts.b, host: 'codex' }];
+      assert.deepEqual(renewers(identityA, process, rows).map(({ pid }) => pid), [108]);
+      assert.deepEqual(renewers(identityB, process, rows), []);
+    }
+  });
+
   it('creates eras only for outcomes that changed the live file', () => {
     const rows = [
       { id: 1, fromAccountId: A, toAccountId: B, outcome: 'ok' as const, publishedAt: T0 },
