@@ -275,6 +275,34 @@ describe('Codex session process list and holder eras', () => {
     assert.deepEqual(atBoundary(holderSets([], first)), [A, B]);
   });
 
+  it('does not close a later switch-log era from an earlier observation', () => {
+    const rows = [row(1, A, B, 'ok', T0)];
+    const observations = [{ ts: T0 - 60_000, identity: A, lineageFp: 'a', by: 'tool' }];
+    const processes: CodexProcess[] = [
+      { pid: 441, lstart: 'Fri Oct 24 12:00:07 2026', host: 'codex' },
+      { pid: 442, lstart: 'Fri Oct 24 12:30:00 2026', host: 'codex' },
+    ];
+
+    assert.ok(holderSets(rows, observations).some((set) =>
+      set.identities.includes(B) && set.startsAt === T0 - 1_000 && set.endsAt === null,
+    ));
+    assert.deepEqual(renewers(identityB, processes, rows, observations).map(({ pid }) => pid), [441, 442]);
+  });
+
+  it('does not close a later target era from an observation between ok switches', () => {
+    const rows = [
+      row(1, A, B, 'ok', T0),
+      row(2, B, C, 'ok', T0 + 20_000),
+    ];
+    const observations = [{ ts: T0 + 10_000, identity: B, lineageFp: 'b', by: 'tool' }];
+    const process = [{ pid: 451, lstart: 'Fri Oct 24 12:00:25 2026', host: 'codex' }];
+
+    assert.ok(holderSets(rows, observations).some((set) =>
+      set.identities.includes(C) && set.startsAt === T0 + 19_000 && set.endsAt === null,
+    ));
+    assert.deepEqual(renewers(identityC, process, rows, observations).map(({ pid }) => pid), [451]);
+  });
+
   it('lets later observations close a stale open switch-log holder era', () => {
     const rows = [row(1, A, B, 'ok', T0)];
     const observations = [

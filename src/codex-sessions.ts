@@ -360,8 +360,12 @@ export function holderSets(
 
     // A later observed identity bounds an otherwise open switch-log era. Keep
     // one lstart second after the observation ambiguous, never indefinitely.
+    // An era that starts within the observation's ambiguity window may instead
+    // be the later switch target, so it must remain open.
     for (const era of switchEras) {
-      if (era.endsAt === null && !group.identities.includes(era.identity)) {
+      if (era.endsAt === null
+        && (era.startsAt === null || era.startsAt + 1_000 < group.ts)
+        && !group.identities.includes(era.identity)) {
         era.endsAt = group.ts + 1_000;
       }
     }
