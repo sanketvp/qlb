@@ -7,6 +7,7 @@ import {
   assertKeychainAccess,
   assertNativeOpenRouterService,
   MACOS_SECURITY_TIMEOUT_MS,
+  markFakeExecutor,
   readNativeOpenRouterKey,
   withServiceGuard,
   type ExecFileSyncFn,
@@ -26,7 +27,7 @@ function guardedFakeSecurity() {
   };
   return {
     calls,
-    backend: withServiceGuard(new MacosKeychainBackend({ execFileSync: exec }), {
+    backend: withServiceGuard(new MacosKeychainBackend({ execFileSync: markFakeExecutor(exec) }), {
       macosUserName: () => MACOS_USER,
       env: {},
     }),
@@ -98,10 +99,10 @@ describe('Keychain access allowlist', () => {
     const timeout = Object.assign(new Error('fake security timed out'), { code: 'ETIMEDOUT' });
 
     assert.throws(
-      () => readNativeOpenRouterKey('pi-openrouter', (_file, _args, options) => {
+      () => readNativeOpenRouterKey('pi-openrouter', markFakeExecutor((_file, _args, options) => {
         timeoutMs = options?.timeout;
         throw timeout;
-      }, 'darwin'),
+      }), 'darwin'),
       /security find-generic-password timed out after 5s/,
     );
     assert.equal(timeoutMs, MACOS_SECURITY_TIMEOUT_MS);
@@ -172,7 +173,7 @@ describe('Keychain access allowlist', () => {
       });
       return '';
     };
-    const backend = withServiceGuard(new MacosKeychainBackend({ execFileSync: exec }), {
+    const backend = withServiceGuard(new MacosKeychainBackend({ execFileSync: markFakeExecutor(exec) }), {
       macosUserName: () => MACOS_USER,
       env: {},
     });
@@ -224,7 +225,7 @@ describe('Keychain access allowlist', () => {
       calls.push({ args: [...args], timeout: options?.timeout });
       throw timeout;
     };
-    const backend = new MacosKeychainBackend({ execFileSync: exec });
+    const backend = new MacosKeychainBackend({ execFileSync: markFakeExecutor(exec) });
 
     assert.throws(
       () => backend.setSync('qlb:timeout', 'account', 'secret'),
@@ -247,7 +248,7 @@ describe('Keychain access allowlist', () => {
     const exec: ExecFileSyncFn = () => {
       throw new Error(`security rejected ${secret} (${hex})`);
     };
-    const backend = withServiceGuard(new MacosKeychainBackend({ execFileSync: exec }), {
+    const backend = withServiceGuard(new MacosKeychainBackend({ execFileSync: markFakeExecutor(exec) }), {
       macosUserName: () => MACOS_USER,
       env: {},
     });

@@ -23,8 +23,8 @@ import {
   renameSync,
   writeFileSync,
 } from 'node:fs';
-import { homedir as osHomedir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { qlbHomeDir } from './home';
 
 export interface CredentialBackend {
   readonly kind?: CredentialBackendKind;
@@ -72,6 +72,20 @@ export type ExecFileSyncFn = (
   options?: ExecFileSyncOptions,
 ) => string;
 
+const FAKE_EXECUTOR = Symbol('qlbFakeExecutor');
+
+type FakeExecutor = ExecFileSyncFn & { [FAKE_EXECUTOR]?: true };
+
+/** Brand an injected executor as a test double permitted in QLB test mode. */
+export function markFakeExecutor<T extends ExecFileSyncFn>(exec: T): T {
+  Object.defineProperty(exec, FAKE_EXECUTOR, { value: true });
+  return exec;
+}
+
+export function isFakeExecutor(exec: ExecFileSyncFn): boolean {
+  return (exec as FakeExecutor)[FAKE_EXECUTOR] === true;
+}
+
 export interface CredentialBackendHost {
   platform: NodeJS.Platform;
   homedir: () => string;
@@ -104,7 +118,7 @@ export function defaultCommandExists(
 export function defaultCredentialBackendHost(): CredentialBackendHost {
   return {
     platform: process.platform,
-    homedir: osHomedir,
+    homedir: qlbHomeDir,
     execFileSync: execFileUtf8,
     commandExists: (name) => defaultCommandExists(name, execFileUtf8),
   };
@@ -207,13 +221,13 @@ export function securityTimeoutError(command: string): Error {
 export class MacosKeychainBackend extends SyncCredentialBackend {
   readonly kind = 'macos-keychain' as const;
   private readonly exec: ExecFileSyncFn;
-  private readonly usesNativeExec: boolean;
+  private readonly fakeExecutor: boolean;
 
   constructor(opts: { execFileSync?: ExecFileSyncFn } = {}) {
     super();
-    this.usesNativeExec = opts.execFileSync === undefined;
-    if (this.usesNativeExec && isQlbTestMode()) throw new NativeKeychainDisabled();
     this.exec = opts.execFileSync ?? execFileUtf8;
+    this.fakeExecutor = isFakeExecutor(this.exec);
+    if (isQlbTestMode() && !this.fakeExecutor) throw new NativeKeychainDisabled();
   }
 
   setSync(service: string, account: string, jsonValue: string): void {
@@ -282,7 +296,7 @@ export class MacosKeychainBackend extends SyncCredentialBackend {
   }
 
   private assertNativeAccessEnabled(): void {
-    if (this.usesNativeExec && isQlbTestMode()) throw new NativeKeychainDisabled();
+    if (isQlbTestMode() && !this.fakeExecutor) throw new NativeKeychainDisabled();
   }
 }
 

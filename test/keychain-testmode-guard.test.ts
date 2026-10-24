@@ -6,8 +6,11 @@ import {
   MacosKeychainBackend,
   NativeKeychainDisabled,
   createRawCredentialBackend,
+  markFakeExecutor,
+  readNativeOpenRouterKey,
   type ExecFileSyncFn,
 } from '../src/keychain';
+import { execFileUtf8 } from '../src/credential-backends';
 import { KeychainAccessDeniedError, assertKeychainAccess } from '../src/keychain-allowlist';
 
 function withEnv<T>(updates: Record<string, string | undefined>, run: () => T): T {
@@ -51,6 +54,25 @@ describe('test-mode Keychain guard', () => {
         () => assertKeychainAccess('qlb:anthropic:test', 'test', 'read'),
         KeychainAccessDeniedError,
       );
+    });
+  });
+
+  it('blocks unbranded executors before they can access the native Keychain', () => {
+    withEnv({ QLB_TEST_MODE: '1' }, () => {
+      let calls = 0;
+      const wrapper: ExecFileSyncFn = (...args) => {
+        calls += 1;
+        return execFileUtf8(...args);
+      };
+      assert.throws(() => new MacosKeychainBackend({ execFileSync: execFileUtf8 }), NativeKeychainDisabled);
+      assert.throws(() => new MacosKeychainBackend({ execFileSync: wrapper }), NativeKeychainDisabled);
+      assert.throws(() => readNativeOpenRouterKey('pi-openrouter', wrapper, 'darwin'), NativeKeychainDisabled);
+      assert.equal(calls, 0);
+
+      const fake = markFakeExecutor((file: string, args: readonly string[]) =>
+        args[0] === 'find-generic-password' ? 'fake-key\n' : '');
+      assert.doesNotThrow(() => new MacosKeychainBackend({ execFileSync: fake }));
+      assert.equal(readNativeOpenRouterKey('pi-openrouter', fake, 'darwin'), 'fake-key');
     });
   });
 

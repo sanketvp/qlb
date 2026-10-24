@@ -20,7 +20,10 @@ import {
   createRawCredentialBackend,
   defaultCredentialBackendHost,
   execFileUtf8,
+  isFakeExecutor,
+  isQlbTestMode,
   isSecurityTimeout,
+  NativeKeychainDisabled,
   MACOS_SECURITY_BIN,
   MACOS_SECURITY_TIMEOUT_MS,
   securityTimeoutError,
@@ -45,6 +48,7 @@ export {
   MacosKeychainBackend,
   InMemoryCredentialBackend,
   NativeKeychainDisabled,
+  markFakeExecutor,
   LinuxLibsecretBackend,
   LinuxEncryptedFileBackend,
   WindowsDpapiBackend,
@@ -218,7 +222,8 @@ export function readNativeOpenRouterKey(
   exec: ExecFileSyncFn = execFileUtf8,
   platform: NodeJS.Platform = process.platform,
 ): string {
-  assertNativeOpenRouterService(service, exec === execFileUtf8 ? {} : { env: {} });
+  if (isQlbTestMode() && !isFakeExecutor(exec)) throw new NativeKeychainDisabled();
+  assertNativeOpenRouterService(service, isFakeExecutor(exec) ? { env: {} } : {});
   if (platform === 'darwin') {
     try {
       const stdout = exec(

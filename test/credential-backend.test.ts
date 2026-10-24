@@ -18,6 +18,7 @@ import {
   linuxSecretToolClearArgs,
   linuxSecretToolLookupArgs,
   linuxSecretToolStoreArgs,
+  markFakeExecutor,
   selectBackendKind,
   type ExecFileSyncFn,
 } from '../src/keychain';
@@ -35,7 +36,7 @@ describe('CredentialBackend dispatch', () => {
     const backend = createRawCredentialBackend({
       platform: 'darwin',
       homedir: () => '/tmp',
-      execFileSync: () => '',
+      execFileSync: markFakeExecutor(() => ''),
       commandExists: () => true,
     }, { env: {} });
     assert.equal(backend.kind, 'macos-keychain');
