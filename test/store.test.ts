@@ -35,7 +35,7 @@ function columns(path: string, table: string): string[] {
 }
 
 describe('store decision columns', () => {
-  it('v4 fixture gains strategy/provider columns, user_version stays 4, rows readable', () => {
+  it('v4 fixture migrates to v5, gains strategy/provider columns, rows readable', () => {
     const dir = mkdtempSync(join(tmpdir(), 'qlb-store-v4-'));
     const path = join(dir, 'qlb.db');
     buildV4Store(path, [
@@ -53,7 +53,7 @@ describe('store decision columns', () => {
 
     const store = openStore(path);
     try {
-      assert.equal(userVersion(path), 4);
+      assert.equal(userVersion(path), 5);
       const cols = columns(path, 'decisions');
       assert.ok(cols.includes('strategy'));
       assert.ok(cols.includes('provider'));
@@ -74,7 +74,7 @@ describe('store decision columns', () => {
     a.close();
     const b = openStore(path);
     try {
-      assert.equal(userVersion(path), 4);
+      assert.equal(userVersion(path), 5);
       const cols = columns(path, 'decisions');
       assert.equal(cols.filter((c) => c === 'strategy').length, 1);
       assert.equal(cols.filter((c) => c === 'provider').length, 1);
@@ -136,7 +136,7 @@ describe('store decision columns', () => {
     }
   });
 
-  it('atomic rollback: fixture with pre-existing provider column → second ALTER fails, strategy column absent afterwards, DB intact', () => {
+  it('v4 fixture with a pre-existing provider column completes the additive v5 migration', () => {
     const dir = mkdtempSync(join(tmpdir(), 'qlb-store-rollback-'));
     const path = join(dir, 'qlb.db');
     buildV4Store(path, [
@@ -153,10 +153,11 @@ describe('store decision columns', () => {
     db.exec('ALTER TABLE decisions ADD COLUMN provider TEXT');
     db.close();
 
-    assert.throws(() => openStore(path));
-    assert.equal(userVersion(path), 4);
+    const migrated = openStore(path);
+    migrated.close();
+    assert.equal(userVersion(path), 5);
     const cols = columns(path, 'decisions');
-    assert.ok(!cols.includes('strategy'), `strategy should be absent, got ${cols.join(',')}`);
+    assert.ok(cols.includes('strategy'));
     assert.ok(cols.includes('provider'));
     const check = new DatabaseSync(path, { readOnly: true });
     try {
