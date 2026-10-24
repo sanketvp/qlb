@@ -197,7 +197,7 @@ describe('consume import-closure walker', () => {
     const writerHits = [...consume.files].filter((f) => WRITERS.includes(f));
     const piConsume = closureOf(PI_CONSUME);
     const piLocalImports = [...piConsume.files].filter((f) => !f.startsWith(join(ROOT, 'extensions', 'qlb-pi')));
-    const texts = [...consume.files, ...PI_CONSUME, ...HARNESS].map((f) => ({ f, text: readFileSync(f, 'utf8') }));
+    const texts = [...consume.files, ...PI_CONSUME, ...PI_ALLOWED_LOCAL_IMPORTS, ...HARNESS].map((f) => ({ f, text: readFileSync(f, 'utf8') }));
     let tokenTerms = 0;
     let securityWrites = 0;
     let cswapSpawns = 0;
@@ -213,7 +213,7 @@ describe('consume import-closure walker', () => {
       assert.ok(existsSync(file), `missing runtime root ${relative(ROOT, file)}`);
     }
     const all = closureOf(CLOSURE_ROOTS);
-    const dynamic = all.dynamic;
+    const dynamic = all.dynamic + piConsume.dynamic;
     console.log(
       `WRITER_IMPORTS=${writerHits.length} TOKEN_TERMS=${tokenTerms} CSWAP_SPAWNS_SRC=${cswapSpawns} SECURITY_WRITE_TERMS=${securityWrites} DYNAMIC_IMPORTS=${dynamic} RUNTIME_ROOTS=${RUNTIME_ROOTS.length} CLOSURE_ROOTS=${CLOSURE_ROOTS.length} CLOSURE_FILES=${all.files.size}`,
     );

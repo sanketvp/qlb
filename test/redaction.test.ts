@@ -11,6 +11,7 @@ function fingerprint(value: string): string {
 
 const sk = 'sk-' + 'ant-' + 'a'.repeat(40);
 const jwt = 'eyJ' + 'a'.repeat(12) + '.' + 'b'.repeat(24) + '.' + 'c'.repeat(24);
+const unsignedJwt = 'eyJ' + 'a'.repeat(12) + '.' + 'b'.repeat(24) + '.';
 
 function bearer(last: string): string {
   return 'Bearer ' + 'a'.repeat(24) + last;
@@ -47,6 +48,13 @@ describe('redaction', () => {
     assert.equal((result.match(/\[redacted\]/g) ?? []).length, 3);
   });
 
+  it('redacts unsigned JWTs with an empty signature segment', () => {
+    const result = redactSecrets(`token=${unsignedJwt}`, []);
+
+    assert.equal(result.includes(unsignedJwt), false);
+    assert.equal(result, `token=${REDACTED}`);
+  });
+
   it('redacts xAI keys and tokens ending in every supported punctuation character', () => {
     const xai = 'xai-' + 'A'.repeat(40);
     const values = [sk + '-', 'key_' + sk + '-', jwt + '-', ...['~', '-', '.', '+', '/', '='].map(bearer), xai];
@@ -77,6 +85,27 @@ describe('redaction', () => {
     assert.deepEqual(result.toolCall.arguments, { token: 'abc', password: 'p', apiKey: 'k', cookie: 'c' });
     assert.equal(result.raw, REDACTED);
     assert.equal(result.content, REDACTED);
+  });
+
+  it('redacts persisted property names and preserves collisions without dropping values', () => {
+    const secret = 'fixture-' + 'secret-key';
+    const tokenKey = 'sk-' + 'key-' + 'k'.repeat(40);
+    const result = redactJson({ [secret]: 1, [tokenKey]: 2 }, [secret]);
+    const parsed = JSON.parse(result) as Record<string, number>;
+
+    assert.equal(result.includes(secret), false);
+    assert.equal(result.includes(tokenKey), false);
+    assert.deepEqual(parsed, { [REDACTED]: 1, [`${REDACTED}#2`]: 2 });
+  });
+
+  it('preserves own __proto__ fields without changing the clone prototype', () => {
+    const input = JSON.parse('{"__proto__":{"type":"error"},"type":"ok"}') as Record<string, unknown>;
+    const parsed = JSON.parse(redactJson(input, [])) as Record<string, unknown>;
+
+    assert.equal(Object.hasOwn(parsed, '__proto__'), true);
+    assert.deepEqual(parsed.__proto__, { type: 'error' });
+    assert.equal(parsed.type, 'ok');
+    assert.equal(Object.getPrototypeOf(parsed), Object.prototype);
   });
 
   it('redacts sensitive key variants case-insensitively without invoking accessors or get traps', () => {
@@ -130,6 +159,20 @@ describe('redaction', () => {
     assert.equal(redactError({ token: secret }, []), '{"token":"[redacted]"}');
   });
 
+  it('memoizes shared DAG clones while marking true cycles', () => {
+    let node: Record<string, unknown> = { value: 'leaf' };
+    for (let index = 0; index < 40; index += 1) node = { a: node, b: node };
+
+    const started = Date.now();
+    const clone = redactEvent(node, []) as Record<string, unknown>;
+    assert.ok(Date.now() - started < 1_000, '40-level DAG must not expand per path');
+    let cursor = clone;
+    for (let index = 0; index < 40; index += 1) {
+      assert.strictEqual(cursor.a, cursor.b, `level ${index} must reuse its shared clone`);
+      cursor = cursor.a as Record<string, unknown>;
+    }
+  });
+
   it('drops functions including toJSON and copies shared values while marking true cycles', () => {
     const secret = 'fixture-' + 'secret-value';
     const shared = { value: `safe ${secret}` };
@@ -153,6 +196,16 @@ describe('redaction', () => {
     assert.equal(parsed.self, '[circular]');
     assert.equal('callback' in parsed, false);
     assert.equal('toJSON' in parsed, false);
+  });
+
+  it('handles unreadable and primitive Error message descriptors without throwing', () => {
+    const unreadable = new Error('ignored');
+    Object.defineProperty(unreadable, 'message', { get() { throw new Error('must not run'); } });
+    const numeric = new Error('ignored');
+    Object.defineProperty(numeric, 'message', { value: 42 });
+
+    assert.equal(redactError(unreadable, []), '[unreadable]');
+    assert.equal(redactError(numeric, []), '42');
   });
 
   it('redacts Error messages and emits a single escaped line', () => {

@@ -231,6 +231,10 @@ describe('pi:extension copied-layout drift check', () => {
     check = extensionCheck();
     assert.equal(check.level, 'WARN');
     assert.match(check.message, /src\/redact\.ts/);
+
+    writeFileSync(installedRedact, readFileSync(join(__dirname, '..', '..', 'src', 'redact.ts')));
+    check = extensionCheck();
+    assert.equal(check.level, 'PASS');
   });
 });
 

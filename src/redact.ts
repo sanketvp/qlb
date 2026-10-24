@@ -8,7 +8,7 @@ const CIRCULAR = '[circular]';
 const TOKEN_PATTERNS: readonly RegExp[] = [
   /(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{16,}(?![A-Za-z0-9_-])/g,
   /(?<![A-Za-z0-9])xai-[A-Za-z0-9]{32,}(?![A-Za-z0-9])/g,
-  /(?<![A-Za-z0-9])eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?![A-Za-z0-9_-])/g,
+  /(?<![A-Za-z0-9])eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*(?![A-Za-z0-9_-])/g,
   /(?<![A-Za-z0-9\-._~+/=])Bearer[ \t]+[A-Za-z0-9\-._~+/]{16,}={0,}(?![A-Za-z0-9\-._~+/=])/gi,
 ];
 
@@ -66,23 +66,54 @@ interface RedactOptions {
   keyRules: boolean;
 }
 
+function arrayLength(descriptors: PropertyDescriptorMap): number {
+  const length = descriptors.length;
+  if (!length || !('value' in length) || typeof length.value !== 'number' || !Number.isSafeInteger(length.value) || length.value < 0) {
+    throw new Error('unreadable array length');
+  }
+  return length.value;
+}
+
+function uniqueKey(key: string, used: Set<string>): string {
+  if (!used.has(key)) {
+    used.add(key);
+    return key;
+  }
+  let suffix = 2;
+  while (used.has(`${key}#${suffix}`)) suffix += 1;
+  const unique = `${key}#${suffix}`;
+  used.add(unique);
+  return unique;
+}
+
+function defineOwn(out: Record<string, unknown>, key: string, value: unknown): void {
+  // Assignment to __proto__ invokes Object.prototype's legacy setter.
+  Object.defineProperty(out, key, { value, enumerable: true, writable: true, configurable: true });
+}
+
 function redactValue(
   value: unknown,
   secrets: readonly string[],
   ancestors: WeakSet<object>,
+  memo: WeakMap<object, object>,
   options: RedactOptions,
 ): RedactedValue {
   if (typeof value === 'string') return redactSecrets(value, secrets);
   if (typeof value === 'function' || typeof value === 'symbol' || typeof value === 'undefined') return undefined;
   if (value === null || typeof value !== 'object') return value;
   if (ancestors.has(value)) return CIRCULAR;
+  const prior = memo.get(value);
+  if (prior) return prior;
 
   ancestors.add(value);
   try {
     const descriptors = Object.getOwnPropertyDescriptors(value);
     if (Array.isArray(value)) {
       const out: unknown[] = [];
-      for (let index = 0; index < value.length; index += 1) {
+      memo.set(value, out);
+      const length = arrayLength(descriptors);
+      out.length = length;
+      for (let index = 0; index < length; index += 1) {
         const descriptor = descriptors[String(index)];
         if (!descriptor) {
           out[index] = undefined;
@@ -91,24 +122,27 @@ function redactValue(
           // live events use undefined rather than inventing a string payload.
           out[index] = options.keyRules ? REDACTED : undefined;
         } else {
-          out[index] = redactValue(descriptor.value, secrets, ancestors, options);
+          out[index] = redactValue(descriptor.value, secrets, ancestors, memo, options);
         }
       }
       return out;
     }
 
     const out: Record<string, unknown> = {};
+    memo.set(value, out);
+    const used = new Set<string>();
     for (const [key, descriptor] of Object.entries(descriptors)) {
       if (!descriptor.enumerable) continue;
+      const redactedKey = options.keyRules ? redactSecrets(key, secrets) : key;
       if (options.keyRules && (isSensitiveKey(key) || !('value' in descriptor))) {
-        out[key] = REDACTED;
+        defineOwn(out, uniqueKey(redactedKey, used), REDACTED);
         continue;
       }
       // Accessors are omitted from live events: invoking them could execute
       // arbitrary code, and a fabricated redaction string corrupts the payload.
       if (!('value' in descriptor)) continue;
-      const redacted = redactValue(descriptor.value, secrets, ancestors, options);
-      if (redacted !== undefined) out[key] = redacted;
+      const redacted = redactValue(descriptor.value, secrets, ancestors, memo, options);
+      if (redacted !== undefined) defineOwn(out, uniqueKey(redactedKey, used), redacted);
     }
     return out;
   } catch {
@@ -122,7 +156,7 @@ function redactValue(
 /** Serializes an arbitrary value without retaining credential values. */
 export function redactJson(value: unknown, secrets: readonly string[]): string {
   try {
-    const json = JSON.stringify(redactValue(value, secrets, new WeakSet<object>(), { keyRules: true }));
+    const json = JSON.stringify(redactValue(value, secrets, new WeakSet<object>(), new WeakMap<object, object>(), { keyRules: true }));
     return json === undefined ? 'null' : json;
   } catch {
     return JSON.stringify(REDACTED);
@@ -131,7 +165,7 @@ export function redactJson(value: unknown, secrets: readonly string[]): string {
 
 /** Redacts Pi stream strings without mutating payload keys or primitive value types. */
 export function redactEvent(event: unknown, secrets: readonly string[]): unknown {
-  return redactValue(event, secrets, new WeakSet<object>(), { keyRules: false });
+  return redactValue(event, secrets, new WeakSet<object>(), new WeakMap<object, object>(), { keyRules: false });
 }
 
 function escapeControls(value: string): string {
@@ -145,12 +179,40 @@ function escapeControls(value: string): string {
   });
 }
 
+function errorProperty(error: Error, key: 'message' | 'name'): string {
+  try {
+    let target: object | null = error;
+    while (target !== null) {
+      const descriptor = Object.getOwnPropertyDescriptor(target, key);
+      if (descriptor) {
+        if (!('value' in descriptor)) return '[unreadable]';
+        const { value } = descriptor;
+        if (typeof value === 'string') return value;
+        if (value === null || (typeof value !== 'object' && typeof value !== 'function')) return String(value);
+        return '[unreadable]';
+      }
+      target = Object.getPrototypeOf(target);
+    }
+  } catch {
+    // Proxies can reject descriptor or prototype inspection.
+  }
+  return '[unreadable]';
+}
+
 /** Returns a safe, single-line error description for persisted error columns and stderr. */
 export function redactError(error: unknown, secrets: readonly string[]): string {
-  const value = error instanceof Error
-    ? redactSecrets(error.message || error.name, secrets)
-    : typeof error === 'string'
-      ? redactSecrets(error, secrets)
-      : redactJson(error, secrets);
-  return escapeControls(value);
+  try {
+    const value = error instanceof Error
+      ? (() => {
+          const message = errorProperty(error, 'message');
+          const name = errorProperty(error, 'name');
+          return redactSecrets(message || name, secrets);
+        })()
+      : typeof error === 'string'
+        ? redactSecrets(error, secrets)
+        : redactJson(error, secrets);
+    return escapeControls(value);
+  } catch {
+    return '[unreadable]';
+  }
 }
