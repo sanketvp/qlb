@@ -39,7 +39,7 @@ if sys.version_info < (3, 12):
     if python312 is None:
         print("oracle manifest generation requires Python 3.12 or newer", file=sys.stderr)
         raise SystemExit(2)
-    os.execv(str(python312), [str(python312), "-I", str(Path(__file__).resolve()), *sys.argv[1:]])
+    os.execv(str(python312), [str(python312), "-B", "-I", str(Path(__file__).resolve()), *sys.argv[1:]])
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -47,6 +47,9 @@ ORACLE = ROOT / "test" / "oracle" / "claude-swap-v0.28.0"
 MANIFEST = ORACLE / "MANIFEST.json"
 LICENSE = ROOT / "third_party" / "claude-swap" / "LICENSE"
 PINNED_COMMIT = "2b2d71c7aeb49e6bd25393509ceb05dbca7b0e10"
+# This anchor is intentionally duplicated in the Node test. Updating a manifest
+# alone cannot bless altered vendored bytes.
+PINNED_FILES_AGGREGATE_SHA256 = "ca95ba205a093a2a96a52537f7f7a39f365842764cae6fb3e3e9c6895d182b58"
 
 
 def _sha256(path: Path) -> str:
@@ -62,6 +65,11 @@ def _files_below(root: Path) -> list[Path]:
         ),
         key=lambda path: path.as_posix(),
     )
+
+
+def _files_aggregate_sha256(files: dict[str, str]) -> str:
+    listing = "".join(f"{path} {digest}\n" for path, digest in sorted(files.items()))
+    return hashlib.sha256(listing.encode("utf-8")).hexdigest()
 
 
 def _test_def_count(path: Path) -> int:
@@ -82,9 +90,14 @@ def _manifest() -> dict[str, object]:
         (test_root / "test_switcher.py").read_text(encoding="utf-8"),
         filename=str(test_root / "test_switcher.py"),
     )
+    file_hashes = {path.relative_to(ROOT).as_posix(): _sha256(path) for path in sorted(files)}
+    files_aggregate_sha256 = _files_aggregate_sha256(file_hashes)
+    if files_aggregate_sha256 != PINNED_FILES_AGGREGATE_SHA256:
+        raise RuntimeError("vendored files differ from the pinned provenance aggregate")
     return {
         "commit": PINNED_COMMIT,
-        "files": {path.relative_to(ROOT).as_posix(): _sha256(path) for path in sorted(files)},
+        "files": file_hashes,
+        "files_aggregate_sha256": files_aggregate_sha256,
         "purpose": "Complete claude-swap v0.28.0 source closure and reference material; it is not executed by Node or QLB.",
         "tag": "v0.28.0",
         "test_def_counts": {

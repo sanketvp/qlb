@@ -96,6 +96,7 @@
     "test/oracle/claude-swap-v0.28.0/tests/test_worker_gc_freeze.py": "6bac80406937ad5886f59db223d85fac38971bd3ca80a86965ff107092d400a2",
     "third_party/claude-swap/LICENSE": "a6860f35f08a77af9268bcd10fbb57d34a1c0b3e0715ac013ce12f795d453e8b"
   },
+  "files_aggregate_sha256": "ca95ba205a093a2a96a52537f7f7a39f365842764cae6fb3e3e9c6895d182b58",
   "purpose": "Complete claude-swap v0.28.0 source closure and reference material; it is not executed by Node or QLB.",
   "tag": "v0.28.0",
   "test_def_counts": {

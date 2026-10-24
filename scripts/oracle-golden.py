@@ -58,7 +58,7 @@ if sys.version_info < (3, 12):
     if python312 is None:
         print("claude-swap 0.28.0 golden generation requires Python 3.12 or newer", file=sys.stderr)
         raise SystemExit(2)
-    os.execv(str(python312), [str(python312), "-I", str(Path(__file__).resolve()), *sys.argv[1:]])
+    os.execv(str(python312), [str(python312), "-B", "-I", str(Path(__file__).resolve()), *sys.argv[1:]])
 
 ROOT = Path(__file__).resolve().parent.parent
 GOLDENS = ROOT / "test" / "oracle" / "goldens"

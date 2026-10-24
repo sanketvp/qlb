@@ -3,24 +3,35 @@ import { createHash } from 'node:crypto';
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { describe, it } from 'node:test';
+import { spawnSync } from 'node:child_process';
 
 const ROOT = join(__dirname, '..', '..');
 const ORACLE = join(ROOT, 'test', 'oracle', 'claude-swap-v0.28.0');
 const MANIFEST_PATH = join(ORACLE, 'MANIFEST.json');
 const LICENSE = join(ROOT, 'third_party', 'claude-swap', 'LICENSE');
 const GOLDENS = join(ROOT, 'test', 'oracle', 'goldens');
+const PINNED_FILES_AGGREGATE_SHA256 = 'ca95ba205a093a2a96a52537f7f7a39f365842764cae6fb3e3e9c6895d182b58';
 
 type Manifest = {
   upstream: string;
   tag: string;
   commit: string;
   files: Record<string, string>;
+  files_aggregate_sha256: string;
   test_def_counts: Record<string, number>;
   test_switcher_top_level_test_classes: string[];
 };
 
 function sha256(path: string): string {
   return createHash('sha256').update(readFileSync(path)).digest('hex');
+}
+
+function filesAggregateSha256(files: Record<string, string>): string {
+  const listing = Object.entries(files)
+    .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+    .map(([path, digest]) => `${path} ${digest}\n`)
+    .join('');
+  return createHash('sha256').update(listing).digest('hex');
 }
 
 function filesBelow(dir: string): string[] {
@@ -46,6 +57,7 @@ describe('claude-swap v0.28.0 oracle provenance', () => {
     assert.equal(manifest.tag, 'v0.28.0');
     assert.equal(manifest.commit, '2b2d71c7aeb49e6bd25393509ceb05dbca7b0e10');
     assert.equal(Object.keys(manifest.files).length, 94);
+    assert.equal(manifest.files_aggregate_sha256, PINNED_FILES_AGGREGATE_SHA256);
     assert.deepEqual(
       Object.keys(manifest.files)
         .filter((path) => path.startsWith('test/oracle/claude-swap-v0.28.0/src/'))
@@ -72,12 +84,24 @@ describe('claude-swap v0.28.0 oracle provenance', () => {
     ].map((path) => relative(ROOT, path)).sort();
     assert.deepEqual(Object.keys(manifest.files).sort(), actualFiles);
 
+    const actualHashes: Record<string, string> = {};
     for (const [repoRelativePath, expectedHash] of Object.entries(manifest.files)) {
       assert.match(expectedHash, /^[a-f0-9]{64}$/);
       const path = join(ROOT, repoRelativePath);
       assert.ok(existsSync(path), `vendored file is missing: ${repoRelativePath}`);
-      assert.equal(sha256(path), expectedHash, `sha256 mismatch: ${repoRelativePath}`);
+      actualHashes[repoRelativePath] = sha256(path);
+      assert.equal(actualHashes[repoRelativePath], expectedHash, `sha256 mismatch: ${repoRelativePath}`);
     }
+    assert.equal(filesAggregateSha256(actualHashes), PINNED_FILES_AGGREGATE_SHA256);
+  });
+
+  it('matches committed goldens to the generator', () => {
+    const result = spawnSync('python3', ['-B', '-I', 'scripts/oracle-golden.py', '--check'], {
+      cwd: ROOT,
+      encoding: 'utf8',
+      env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1' },
+    });
+    assert.equal(result.status, 0, result.error?.message ?? (result.stderr || result.stdout));
   });
 
   it('contains parseable JSON goldens only', () => {
