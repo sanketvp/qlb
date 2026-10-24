@@ -1,6 +1,7 @@
 import { execFile } from 'node:child_process';
 import { basename } from 'node:path';
 import { promisify } from 'node:util';
+import { codexIdentityKey, type CodexIdentity } from './codex-auth';
 
 const execFileAsync = promisify(execFile);
 
@@ -12,10 +13,23 @@ export interface CodexProcess {
   host: string;
 }
 
+/** The `switch_log.outcome` values defined by the Codex switch protocol. */
+export type CodexSwitchOutcome =
+  | 'ok'
+  | 'rolled-back'
+  | 'failed'
+  | 'refused'
+  | 'noop'
+  | 'reverted-by-codex';
+
 export interface CodexSwitchLogRow {
+  /** Stable `switch_log.id`, used to order publications with the same millisecond. */
+  id: number;
   fromAccountId: string | null;
   toAccountId: string;
-  publishedAt: number;
+  outcome: CodexSwitchOutcome;
+  /** `switch_log.published_at`; only a successful publication may advance an era. */
+  publishedAt: number | null;
 }
 
 export interface HolderEra {
@@ -99,20 +113,43 @@ export async function stillTheSameProcess(
     });
     const currentLstart = output.trim().replace(/\s+/g, ' ');
     return currentLstart.length > 0 && currentLstart === recorded.lstart.replace(/\s+/g, ' ');
-  } catch {
-    return false;
+  } catch (error) {
+    // `ps -p <pid>` exits 1 exactly when that PID is absent. Permission,
+    // spawn, and other failures leave liveness unknown and must reach callers.
+    if (typeof error === 'object' && error !== null && 'code' in error && error.code === 1) {
+      return false;
+    }
+    throw error;
   }
 }
 
+function advancesHolderEra(outcome: CodexSwitchOutcome): boolean {
+  return outcome === 'ok' || outcome === 'reverted-by-codex';
+}
+
+function comparePublishedRows(a: CodexSwitchLogRow, b: CodexSwitchLogRow): number {
+  // Both timestamps are validated before this comparator is used. `id` is the
+  // stable database sequence, so same-millisecond rows never depend on input order.
+  return a.publishedAt! - b.publishedAt! || a.id - b.id;
+}
+
 /**
- * Reconstructs the C5 point-in-time holder eras. C5b deliberately replaces
+ * Reconstructs the C5 point-in-time holder eras. Only `ok` and
+ * `reverted-by-codex` rows changed the live auth file; failed, rolled-back,
+ * refused, and noop rows deliberately create no era. C5b deliberately replaces
  * these instants with transition intervals; do not use this as a boundary
  * ambiguity policy.
  */
 export function holderEras(switchLogRows: readonly CodexSwitchLogRow[]): HolderEra[] {
-  if (switchLogRows.length === 0) return [];
+  const rows = switchLogRows.filter((row) => advancesHolderEra(row.outcome));
+  for (const row of rows) {
+    if (!Number.isFinite(row.publishedAt) || !Number.isSafeInteger(row.id)) {
+      throw new Error('Invalid effective Codex switch-log publication row');
+    }
+  }
+  if (rows.length === 0) return [];
 
-  const rows = [...switchLogRows].sort((a, b) => a.publishedAt - b.publishedAt);
+  rows.sort(comparePublishedRows);
   const first = rows[0];
   const eras: HolderEra[] = [];
   let identity = first.fromAccountId;
@@ -134,17 +171,20 @@ function processStartedAt(process: CodexProcess): number | null {
 
 /** Returns currently listed processes that may renew the supplied identity. */
 export function renewers(
-  identity: string,
+  identity: CodexIdentity,
   processes: readonly CodexProcess[],
   switchLogRows: readonly CodexSwitchLogRow[],
 ): CodexProcess[] {
+  const identityKey = codexIdentityKey(identity);
   const eras = holderEras(switchLogRows);
   return processes.filter((process) => {
     const startedAt = processStartedAt(process);
-    if (startedAt === null) return false;
+    // An unparseable lstart is ambiguous. Count it as a holder for every
+    // queried identity rather than risking a refresh-token rotation.
+    if (startedAt === null) return true;
     return eras.some(
       (era) =>
-        era.identity === identity &&
+        era.identity === identityKey &&
         (era.startsAt === null || startedAt >= era.startsAt) &&
         (era.endsAt === null || startedAt < era.endsAt),
     );
