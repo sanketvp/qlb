@@ -43,6 +43,8 @@ export {
 export type { KeychainAllowlistOptions, KeychainOperation } from './keychain-allowlist';
 export {
   MacosKeychainBackend,
+  InMemoryCredentialBackend,
+  NativeKeychainDisabled,
   LinuxLibsecretBackend,
   LinuxEncryptedFileBackend,
   WindowsDpapiBackend,
@@ -92,30 +94,35 @@ export function withServiceGuard(
   backend: CredentialBackend,
   allowlistOptions: KeychainAllowlistOptions = {},
 ): CredentialBackend {
+  // The test-mode backend is entirely in memory. Retain the production
+  // capability matrix while allowing QLB tests to exercise fake credentials.
+  const effectiveAllowlistOptions = backend.kind === 'test-memory'
+    ? { ...allowlistOptions, env: {} }
+    : allowlistOptions;
   return {
     kind: backend.kind,
     set(service, account, jsonValue) {
-      assertKeychainAccess(service, account, 'write', allowlistOptions);
+      assertKeychainAccess(service, account, 'write', effectiveAllowlistOptions);
       return backend.set(service, account, jsonValue);
     },
     get(service, account) {
-      assertKeychainAccess(service, account, 'read', allowlistOptions);
+      assertKeychainAccess(service, account, 'read', effectiveAllowlistOptions);
       return backend.get(service, account);
     },
     delete(service, account) {
-      assertKeychainAccess(service, account, 'write', allowlistOptions);
+      assertKeychainAccess(service, account, 'write', effectiveAllowlistOptions);
       return backend.delete(service, account);
     },
     setSync(service, account, jsonValue) {
-      assertKeychainAccess(service, account, 'write', allowlistOptions);
+      assertKeychainAccess(service, account, 'write', effectiveAllowlistOptions);
       backend.setSync(service, account, jsonValue);
     },
     getSync(service, account) {
-      assertKeychainAccess(service, account, 'read', allowlistOptions);
+      assertKeychainAccess(service, account, 'read', effectiveAllowlistOptions);
       return backend.getSync(service, account);
     },
     deleteSync(service, account) {
-      assertKeychainAccess(service, account, 'write', allowlistOptions);
+      assertKeychainAccess(service, account, 'write', effectiveAllowlistOptions);
       backend.deleteSync(service, account);
     },
   };
@@ -192,8 +199,11 @@ export function openRouterMissingKeyMessage(service: string): string {
 }
 
 /** Enforce the native OpenRouter reader's narrower service capability. */
-export function assertNativeOpenRouterService(service: string): void {
-  assertKeychainAccess(service, NATIVE_SECRET_ACCOUNT, 'read');
+export function assertNativeOpenRouterService(
+  service: string,
+  allowlistOptions: KeychainAllowlistOptions = {},
+): void {
+  assertKeychainAccess(service, NATIVE_SECRET_ACCOUNT, 'read', allowlistOptions);
   if (service !== OPENROUTER_KEYCHAIN_SERVICE) {
     throw new KeychainAccessDeniedError(
       service,
@@ -208,7 +218,7 @@ export function readNativeOpenRouterKey(
   exec: ExecFileSyncFn = execFileUtf8,
   platform: NodeJS.Platform = process.platform,
 ): string {
-  assertNativeOpenRouterService(service);
+  assertNativeOpenRouterService(service, exec === execFileUtf8 ? {} : { env: {} });
   if (platform === 'darwin') {
     try {
       const stdout = exec(

@@ -90,6 +90,9 @@ export function getActiveClaudeCodeAccess(opts: {
     // injected runner or the native security process can be reached.
     assertKeychainAccess(ACTIVE_CC_SERVICE, account, 'read', {
       macosUserName: () => account,
+      // An injected runner is a test double; the default runner always sees
+      // process.env and is denied before it can start security in test mode.
+      env: opts.runner === undefined ? process.env : (opts.env ?? process.env),
     });
     stdout = runner(SECURITY_BIN, args);
   } catch {

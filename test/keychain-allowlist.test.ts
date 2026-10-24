@@ -28,6 +28,7 @@ function guardedFakeSecurity() {
     calls,
     backend: withServiceGuard(new MacosKeychainBackend({ execFileSync: exec }), {
       macosUserName: () => MACOS_USER,
+      env: {},
     }),
   };
 }
@@ -83,7 +84,7 @@ describe('Keychain access allowlist', () => {
   });
 
   it('allows only pi-openrouter for native OpenRouter reads before backend access', () => {
-    assert.doesNotThrow(() => assertNativeOpenRouterService('pi-openrouter'));
+    assert.doesNotThrow(() => assertNativeOpenRouterService('pi-openrouter', { env: {} }));
     for (const service of ['some-other-app', 'qlb:openrouter:x', 'claude-swap']) {
       assert.throws(
         () => assertNativeOpenRouterService(service),
@@ -144,7 +145,7 @@ describe('Keychain access allowlist', () => {
   it('accepts exactly eight lowercase hexadecimal suffix characters', () => {
     assert.doesNotThrow(() => assertKeychainAccess(
       'Claude Code-credentials-0123abcd', MACOS_USER, 'read',
-      { macosUserName: () => MACOS_USER },
+      { macosUserName: () => MACOS_USER, env: {} },
     ));
     for (const suffix of ['1234abc', '1234abcde', '1234ABCD', '1234abcd!', 'not-hex!']) {
       for (const operation of ['read', 'write'] as const) {
@@ -173,6 +174,7 @@ describe('Keychain access allowlist', () => {
     };
     const backend = withServiceGuard(new MacosKeychainBackend({ execFileSync: exec }), {
       macosUserName: () => MACOS_USER,
+      env: {},
     });
     const commandBytes = (value: string) => Buffer.byteLength(
       `add-generic-password -U -a "${account}" -s "${service}" -X ${Buffer.from(value).toString('hex')}\n`,
@@ -247,6 +249,7 @@ describe('Keychain access allowlist', () => {
     };
     const backend = withServiceGuard(new MacosKeychainBackend({ execFileSync: exec }), {
       macosUserName: () => MACOS_USER,
+      env: {},
     });
 
     assert.throws(
