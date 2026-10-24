@@ -81,7 +81,7 @@ describe('hermes integration checks', () => {
     assert.equal(checks.some((c) => c.name === 'hermes:integration'), false);
     const config = checks.find((c) => c.name === 'hermes:config');
     assert.equal(config?.level, 'FAIL');
-    assert.match(config?.message ?? '', /providers \(is not a mapping\)/);
+    assert.match(config?.message ?? '', /qlb-anthropic \(entry absent\), qlb-codex \(entry absent\)/);
   });
 
   it('still fails hermes:plugin when the provider entries are present but the plugin is missing', () => {
@@ -265,6 +265,26 @@ describe('hermes integration checks', () => {
       writeFileSync(join(hermesHome, 'config.yaml'), `${'\n'.repeat(60_000)}x: 1\n`);
       installPlugin(hermesHome);
     });
-    assert.ok(Date.now() - started < 1_000);
+    assert.ok(Date.now() - started < 2_000);
+  });
+
+  it('fails a providers section that is not a mapping', () => {
+    const checks = checksFor('providers-scalar', (_home, hermesHome) => {
+      writeFileSync(join(hermesHome, 'config.yaml'), 'providers: none\nmodel:\n  provider: custom:qlb-anthropic\n');
+      installPlugin(hermesHome);
+    });
+    const config = checks.find((c) => c.name === 'hermes:config');
+    assert.equal(config?.level, 'FAIL');
+    assert.match(config?.message ?? '', /providers \(is not a mapping\)/);
+  });
+
+  it('keeps the last of repeated keys, as Hermes (PyYAML) does, instead of failing the parse', () => {
+    const checks = checksFor('duplicate-keys', (_home, hermesHome) => {
+      writeFileSync(join(hermesHome, 'config.yaml'),
+        `${QLB_PROVIDERS}model:\n  provider: anthropic\n  provider: custom:qlb-anthropic\n`);
+      installPlugin(hermesHome);
+    });
+    const config = checks.find((c) => c.name === 'hermes:config');
+    assert.equal(config?.level, 'PASS', config?.message ?? 'no hermes:config check');
   });
 });

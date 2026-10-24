@@ -68,7 +68,8 @@ type ParsedYaml = { value: unknown } | { error: string };
 
 function parseYaml(text: string): ParsedYaml {
   try {
-    const doc = parseDocument(text);
+    // Hermes reads this file with PyYAML, which keeps the last of repeated keys; do the same.
+    const doc = parseDocument(text, { uniqueKeys: false });
     if (doc.errors.length > 0) return { error: doc.errors[0].message.split(/\r?\n/, 1)[0] };
     return { value: doc.toJS() };
   } catch (error) {
@@ -155,7 +156,9 @@ export function hermesIntegrationChecks(options: HermesIntegrationOptions = {}):
   } else {
     const missing: string[] = [];
     const root = configValue;
-    const providers = isMapping(root) ? root.providers : undefined;
+    const rawProviders = isMapping(root) ? root.providers : undefined;
+    // No providers: section at all means both QLB entries are absent, not a broken section.
+    const providers = rawProviders ?? {};
     if (!isMapping(providers)) {
       missing.push('providers (is not a mapping)');
     } else {
