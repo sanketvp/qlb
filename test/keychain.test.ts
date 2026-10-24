@@ -11,17 +11,18 @@ import {
 } from '../src/keychain';
 
 describe('keychain service-name safety', () => {
-  it('recognizes only fixed allowlisted service names', () => {
+  it('marks only services with every operation allowed as safe', () => {
     assert.equal(isSafeKeychainService('qlb:anthropic:acct-1'), true);
-    assert.equal(isSafeKeychainService('claude-swap'), true);
-    assert.equal(isSafeKeychainService('Claude Code-credentials'), true);
+    assert.equal(isSafeKeychainService('claude-swap'), false);
+    assert.equal(isSafeKeychainService('Claude Code-credentials'), false);
+    assert.equal(isSafeKeychainService('pi-openrouter'), false);
     assert.equal(isSafeKeychainService('qlb-test-roundtrip'), false);
     assert.equal(isSafeKeychainService(''), false);
     assert.equal(isSafeKeychainService('generic'), false);
-    assert.throws(
-      () => assertSafeKeychainService('generic'),
-      /service is not allowlisted/,
-    );
+    assert.doesNotThrow(() => assertSafeKeychainService('qlb:anthropic:acct-1'));
+    for (const service of ['claude-swap', 'Claude Code-credentials', 'pi-openrouter', 'generic']) {
+      assert.throws(() => assertSafeKeychainService(service));
+    }
   });
 
   it('qlbKeychainService uses qlb:<provider>:<accountId>', () => {

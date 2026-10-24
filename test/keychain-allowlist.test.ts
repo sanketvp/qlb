@@ -52,6 +52,16 @@ describe('Keychain access allowlist', () => {
     assert.equal(calls.length, 1);
   });
 
+  it('allows pi-openrouter reads only', () => {
+    const { backend, calls } = guardedFakeSecurity();
+    assert.equal(backend.getSync('pi-openrouter', 'any-account'), 'saved-value');
+    assert.throws(
+      () => backend.setSync('pi-openrouter', 'any-account', 'secret'),
+      KeychainAccessDeniedError,
+    );
+    assert.equal(calls.length, 1);
+  });
+
   for (const service of CLAUDE_SERVICES) {
     it(`allows ${service} reads and writes for the macOS user`, () => {
       const { backend, calls } = guardedFakeSecurity();
@@ -105,8 +115,9 @@ describe('Keychain access allowlist', () => {
     }
   });
 
-  it('writes large macOS payloads through argv and redacts child errors', () => {
-    const secret = JSON.stringify({ grant: `UNIQUE_SECRET_${'x'.repeat(4 * 1024)}` });
+  it('uses security -i below its line-buffer guard and argv -X above it', () => {
+    const service = 'qlb:anthropic:acct-1';
+    const account = 'account';
     const calls: Array<{ file: string; args: string[]; input?: string }> = [];
     const exec: ExecFileSyncFn = (file, args, options) => {
       calls.push({
@@ -114,27 +125,70 @@ describe('Keychain access allowlist', () => {
         args: [...args],
         input: typeof options?.input === 'string' ? options.input : undefined,
       });
-      throw new Error(`security rejected ${secret}`);
+      return '';
+    };
+    const backend = withServiceGuard(new MacosKeychainBackend({ execFileSync: exec }), {
+      macosUserName: () => MACOS_USER,
+    });
+    const commandBytes = (value: string) => Buffer.byteLength(
+      `add-generic-password -U -a "${account}" -s "${service}" -X ${Buffer.from(value).toString('hex')}\n`,
+      'utf8',
+    );
+    const under = 'x'.repeat(Math.floor((4032 - commandBytes('')) / 2));
+    const over = `${under}x`;
+
+    assert.ok(commandBytes(under) <= 4032);
+    assert.ok(commandBytes(over) > 4032);
+    backend.setSync(service, account, under);
+    backend.setSync(service, account, over);
+
+    assert.deepEqual(calls[0], {
+      file: '/usr/bin/security',
+      args: ['-i'],
+      input: `add-generic-password -U -a "${account}" -s "${service}" -X ${Buffer.from(under).toString('hex')}\n`,
+    });
+    assert.deepEqual(calls[1], {
+      file: '/usr/bin/security',
+      args: [
+        'add-generic-password', '-U', '-a', account, '-s', service, '-X', Buffer.from(over).toString('hex'),
+      ],
+      input: undefined,
+    });
+  });
+
+  it('quotes security -i fields and rejects line separators before writing', () => {
+    const { backend, calls } = guardedFakeSecurity();
+    backend.setSync('qlb:service\\"name', 'account\\"name', 'safe-value');
+    assert.deepEqual(calls[0], {
+      file: '/usr/bin/security',
+      args: ['-i'],
+      input: 'add-generic-password -U -a "account\\\\\\"name" -s "qlb:service\\\\\\"name" -X 736166652d76616c7565\n',
+    });
+    assert.throws(
+      () => backend.setSync('qlb:service', 'account\ninjected-command', 'safe-value'),
+      /must not contain CR, LF, or NUL/,
+    );
+    assert.equal(calls.length, 1);
+  });
+
+  it('redacts both plaintext and hex payloads from write failures', () => {
+    const secret = 'UNIQUE_SYNTHETIC_SECRET';
+    const hex = Buffer.from(secret).toString('hex');
+    const exec: ExecFileSyncFn = () => {
+      throw new Error(`security rejected ${secret} (${hex})`);
     };
     const backend = withServiceGuard(new MacosKeychainBackend({ execFileSync: exec }), {
       macosUserName: () => MACOS_USER,
     });
 
-    assert.ok(Buffer.byteLength(secret, 'utf8') > 4095);
     assert.throws(
       () => backend.setSync('Claude Code-credentials', MACOS_USER, secret),
       (err: Error) => {
         assert.equal(err.message.includes(secret), false);
+        assert.equal(err.message.includes(hex), false);
         assert.equal(err.message, `keychain set failed for service=Claude Code-credentials account=${MACOS_USER}`);
         return true;
       },
     );
-    assert.deepEqual(calls, [{
-      file: 'security',
-      args: [
-        'add-generic-password', '-a', MACOS_USER, '-s', 'Claude Code-credentials', '-w', secret, '-U',
-      ],
-      input: undefined,
-    }]);
   });
 });

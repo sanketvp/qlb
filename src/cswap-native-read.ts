@@ -3,11 +3,15 @@
 
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { userInfo } from 'node:os';
+
+import {
+  assertKeychainAccess,
+  macosKeychainAccountName,
+} from './keychain-allowlist';
 
 export const ACTIVE_CC_SERVICE = 'Claude Code-credentials';
 export const SECURITY_BIN = '/usr/bin/security';
-export const FALLBACK_ACCOUNT = 'claude-code-user';
+export { MACOS_KEYCHAIN_ACCOUNT_FALLBACK as FALLBACK_ACCOUNT } from './keychain-allowlist';
 
 export interface SecurityRunner {
   (executable: string, args: readonly string[]): string;
@@ -22,15 +26,7 @@ export interface ConsumedAccess {
 export function activeKeychainAccount(
   env: NodeJS.ProcessEnv = process.env,
 ): string {
-  const fromEnv = env.USER;
-  if (typeof fromEnv === 'string' && fromEnv.length > 0) return fromEnv;
-  try {
-    const name = userInfo().username;
-    if (typeof name === 'string' && name.length > 0) return name;
-  } catch {
-    // fall through
-  }
-  return FALLBACK_ACCOUNT;
+  return macosKeychainAccountName(env);
 }
 
 export function activeCcSecurityArgs(account: string): string[] {
@@ -90,6 +86,11 @@ export function getActiveClaudeCodeAccess(opts: {
   const runner = opts.runner ?? defaultRunner;
   let stdout: string;
   try {
+    // Route the native reader through the shared capability facade before the
+    // injected runner or the native security process can be reached.
+    assertKeychainAccess(ACTIVE_CC_SERVICE, account, 'read', {
+      macosUserName: () => account,
+    });
     stdout = runner(SECURITY_BIN, args);
   } catch {
     throw new Error('active Claude Code credential unreadable');

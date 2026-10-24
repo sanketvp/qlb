@@ -61,13 +61,17 @@ export const NATIVE_SECRET_ACCOUNT = 'qlb';
 
 /** @deprecated Use assertKeychainAccess when an operation and account are known. */
 export function isSafeKeychainService(service: string): boolean {
-  return isAllowedKeychainService(service);
+  // The deprecated, operation-free API promises that every operation is safe.
+  // Only QLB-owned services meet that promise.
+  return service.startsWith('qlb:');
 }
 
 /** @deprecated Use assertKeychainAccess when an operation and account are known. */
 export function assertSafeKeychainService(service: string): void {
   if (!isSafeKeychainService(service)) {
-    assertKeychainAccess(service, '', 'read');
+    // Deliberately test write: partial read-only or account-gated allowances
+    // must not be represented as universally safe by this legacy API.
+    assertKeychainAccess(service, '', 'write');
   }
 }
 

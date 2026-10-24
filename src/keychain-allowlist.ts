@@ -5,6 +5,8 @@ import { userInfo } from 'node:os';
 
 export type KeychainOperation = 'read' | 'write';
 
+export const MACOS_KEYCHAIN_ACCOUNT_FALLBACK = 'claude-code-user';
+
 export interface KeychainAllowlistOptions {
   /** Injectable only for tests; production uses Claude Code's username rule. */
   macosUserName?: () => string;
@@ -31,12 +33,12 @@ const CLAUDE_CODE_CREDENTIALS_RE = /^Claude Code-credentials-[0-9a-f]{8}$/;
  * Claude Code's macOS Keychain account convention, mirrored from C-swap:
  * `$USER`, then the operating-system account name, then a stable fallback.
  */
-export function macosKeychainAccountName(): string {
-  if (process.env.USER) return process.env.USER;
+export function macosKeychainAccountName(env: NodeJS.ProcessEnv = process.env): string {
+  if (env.USER) return env.USER;
   try {
     return userInfo().username;
   } catch {
-    return 'claude-code-user';
+    return MACOS_KEYCHAIN_ACCOUNT_FALLBACK;
   }
 }
 
@@ -48,6 +50,7 @@ function isClaudeCodeCredentialsService(service: string): boolean {
 export function isAllowedKeychainService(service: string): boolean {
   return service.startsWith('qlb:')
     || service === 'claude-swap'
+    || service === 'pi-openrouter'
     || isClaudeCodeCredentialsService(service);
 }
 
@@ -64,9 +67,9 @@ export function assertKeychainAccess(
 ): void {
   if (service.startsWith('qlb:')) return;
 
-  if (service === 'claude-swap') {
+  if (service === 'claude-swap' || service === 'pi-openrouter') {
     if (operation === 'read') return;
-    throw new KeychainAccessDeniedError(service, operation, 'claude-swap is read-only');
+    throw new KeychainAccessDeniedError(service, operation, `${service} is read-only`);
   }
 
   if (isClaudeCodeCredentialsService(service)) {

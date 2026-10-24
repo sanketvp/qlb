@@ -158,6 +158,24 @@ abstract class SyncCredentialBackend implements CredentialBackend {
 
 // --- macOS Keychain (`security` CLI) ---------------------------------------
 
+const MACOS_SECURITY_BIN = '/usr/bin/security';
+// `security -i` reads each command with a 4096-byte line buffer. Keep the
+// upstream 64-byte margin for line-ending accounting differences.
+const SECURITY_STDIN_LINE_LIMIT = 4096 - 64;
+
+function quoteSecurityInteractive(value: string): string {
+  const escaped = value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  return `"${escaped}"`;
+}
+
+function assertSecurityInteractiveField(value: string): void {
+  // `security -i` splits lines before it parses quotes, and NUL cannot be
+  // represented safely in its stdin command language.
+  if (/[\r\n\0]/.test(value)) {
+    throw new Error('keychain set refused: service and account must not contain CR, LF, or NUL');
+  }
+}
+
 export class MacosKeychainBackend extends SyncCredentialBackend {
   readonly kind = 'macos-keychain' as const;
   private readonly exec: ExecFileSyncFn;
@@ -168,17 +186,29 @@ export class MacosKeychainBackend extends SyncCredentialBackend {
   }
 
   setSync(service: string, account: string, jsonValue: string): void {
+    assertSecurityInteractiveField(service);
+    assertSecurityInteractiveField(account);
     try {
-      // Keep the legacy argv transport until the dedicated Swift stdin helper
-      // is available. `security -i` has a 4096-byte line limit that truncates
-      // real credential payloads.
-      this.exec(
-        'security',
-        ['add-generic-password', '-a', account, '-s', service, '-w', jsonValue, '-U'],
-        { encoding: 'utf8' },
+      // Ported from claude-swap's macos_keychain.set_password. `-X` makes the
+      // secret safe for security's stdin parser without placing plaintext in
+      // argv. Its 4096-byte line buffer requires the upstream argv fallback.
+      const hexValue = Buffer.from(jsonValue, 'utf8').toString('hex');
+      const command = (
+        `add-generic-password -U -a ${quoteSecurityInteractive(account)} `
+        + `-s ${quoteSecurityInteractive(service)} -X ${hexValue}\n`
       );
+      if (Buffer.byteLength(command, 'utf8') <= SECURITY_STDIN_LINE_LIMIT) {
+        this.exec(MACOS_SECURITY_BIN, ['-i'], { encoding: 'utf8', input: command });
+      } else {
+        this.exec(
+          MACOS_SECURITY_BIN,
+          ['add-generic-password', '-U', '-a', account, '-s', service, '-X', hexValue],
+          { encoding: 'utf8' },
+        );
+      }
     } catch {
-      // execFileSync may include argv (and therefore jsonValue) in its error.
+      // Child-process errors can include stdin or argv (including hex secret
+      // material), so never preserve their message.
       throw new Error(`keychain set failed for service=${service} account=${account}`);
     }
   }
@@ -186,8 +216,8 @@ export class MacosKeychainBackend extends SyncCredentialBackend {
   getSync(service: string, account: string): string {
     try {
       const stdout = this.exec(
-        'security',
-        ['find-generic-password', '-a', account, '-s', service, '-w'],
+        MACOS_SECURITY_BIN,
+        ['find-generic-password', '-a', account, '-w', '-s', service],
         { encoding: 'utf8' },
       );
       return stdout.replace(/\n$/, '');
@@ -199,7 +229,7 @@ export class MacosKeychainBackend extends SyncCredentialBackend {
   deleteSync(service: string, account: string): void {
     try {
       this.exec(
-        'security',
+        MACOS_SECURITY_BIN,
         ['delete-generic-password', '-a', account, '-s', service],
         { encoding: 'utf8' },
       );
