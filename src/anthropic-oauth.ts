@@ -1,5 +1,9 @@
-// Ported from claude-swap 0.28.0 (MIT, Copyright (c) realiti4) — oauth.py
-// See third_party/claude-swap/LICENSE for the upstream license.
+/*
+ * Ported from claude-swap 0.28.0.
+ * Upstream file(s): src/claude_swap/oauth.py:17-20,25-70,73-101,105-140,154-183,200-257,265-324,397-407,464-542, src/claude_swap/autoswitch.py:95-98,887-892.
+ * License: MIT.
+ * Modified for QLB. See NOTICE.
+ */
 
 import { createHash } from 'node:crypto';
 
@@ -10,7 +14,7 @@ export const ANTHROPIC_OAUTH_PROFILE_URL = 'https://api.anthropic.com/api/oauth/
 export const ANTHROPIC_OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
 export const OAUTH_EXPIRY_BUFFER_MS = 5 * 60 * 1000;
 export const FRESHEN_BUFFER_MS = 10 * 60 * 1000;
-/** C-swap v0.28.0 `oauth.py` lines 538–563: canonical non-weekly window label. */
+/** C-swap v0.28.0 `oauth.py` lines 538–542: canonical non-weekly window label. */
 export const FIVE_HOUR_LABEL = '5h';
 
 export type JsonObject = Record<string, unknown>;
@@ -111,18 +115,29 @@ export function accessTokenFingerprint(credentials: string): string | null {
   return `sha256-at:${createHash('sha256').update(accessToken, 'utf8').digest('hex')}`;
 }
 
-/** C-swap v0.28.0 `oauth.py` lines 73–92: stored-login expiry as second-precision UTC. */
-export function loginExpiresAtIso(credentials: string): string | null {
-  const value = parseCredentialBlob(credentials)?.oauth?.refreshTokenExpiresAt;
-  if (!isFiniteNumber(value) || value <= 0) return null;
+export interface LoginExpiryField {
+  field: 'refreshTokenExpiresAt';
+  iso: string | null;
+}
+
+/** C-swap v0.28.0 `oauth.py` lines 73–92: the stored-login expiry field and its UTC ISO value. */
+export function loginExpiryField(blob: CredentialBlob | null): LoginExpiryField {
+  const field = 'refreshTokenExpiresAt' as const;
+  const value = blob?.oauth?.[field];
+  if (!isFiniteNumber(value) || value <= 0) return { field, iso: null };
   const date = new Date(value);
   // Python's datetime.fromtimestamp rejects years above 9999 rather than
   // returning None. Keep that failure boundary instead of emitting JS's
   // extended-year ISO form.
   if (Number.isNaN(date.getTime()) || date.getUTCFullYear() > 9999) {
-    throw new RangeError('refreshTokenExpiresAt is outside the supported date range');
+    throw new RangeError(`${field} is outside the supported date range`);
   }
-  return date.toISOString().replace(/\.\d{3}Z$/, 'Z');
+  return { field, iso: date.toISOString().replace(/\.\d{3}Z$/, 'Z') };
+}
+
+/** C-swap v0.28.0 `oauth.py` lines 73–92: stored-login expiry as second-precision UTC. */
+export function loginExpiresAtIso(credentials: string): string | null {
+  return loginExpiryField(parseCredentialBlob(credentials)).iso;
 }
 
 function isFiniteNumber(value: unknown): value is number {
@@ -206,8 +221,8 @@ export function buildRefreshRequest(
 }
 
 /**
- * Classify a token-endpoint response. C-swap v0.28.0 `oauth.py` lines 154–167 and
- * 200–225 makes a missing refresh token or `invalid_grant` permanently dead;
+ * Classify a token-endpoint response. C-swap v0.28.0 `oauth.py` lines 154–183 and
+ * 200–257 establish a missing refresh token or `invalid_grant` as permanently dead;
  * `invalid_client` is deterministic but systemic, and all other failures are transient.
  */
 export function classifyRefreshResponse(status: number | null | undefined, body: string): RefreshClassification {
