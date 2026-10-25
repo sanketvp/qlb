@@ -456,6 +456,37 @@ describe('claude-swap due-candidate port', () => {
     }
   });
 
+  it('leaves a never-planned overdue row unchanged while repairing saved plans', () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'qlb-overdue-null-interval-')), 'qlb.db');
+    const provider = 'anthropic';
+    const entries: Record<string, DueCandidateSlot> = {
+      selected: { lastFetchAt: now - 1_300, nextDueAt: now - 601, pollIntervalS: 600 },
+      saved: { lastFetchAt: now - 1_200, nextDueAt: now - 601, pollIntervalS: 600 },
+      neverPlanned: { lastFetchAt: now - 1_100, nextDueAt: now - 601, pollIntervalS: null },
+    };
+    const store = openStore(path);
+    try {
+      store.writeUsagePollPlans(provider, {
+        selected: { nextDueAt: now - 601, pollIntervalS: 600 },
+        saved: { nextDueAt: now - 601, pollIntervalS: 600 },
+      });
+      const db = new DatabaseSync(path);
+      try {
+        db.prepare('INSERT INTO usage_polls (provider, account_id, next_due_at, poll_interval_s) VALUES (?, ?, ?, NULL)')
+          .run(provider, 'neverPlanned', now - 601);
+      } finally { db.close(); }
+      assert.equal(repairOverduePlans({ provider, candidates: Object.keys(entries), entries, now, rng: () => 0.5, writer: store }), 'selected');
+    } finally { store.close(); }
+    const db = new DatabaseSync(path, { readOnly: true });
+    try {
+      assert.deepEqual((db.prepare('SELECT account_id, next_due_at, poll_interval_s FROM usage_polls WHERE provider = ? ORDER BY account_id').all(provider) as Array<Record<string, unknown>>).map((row) => ({ ...row })), [
+        { account_id: 'neverPlanned', next_due_at: now - 601, poll_interval_s: null },
+        { account_id: 'saved', next_due_at: now + 600, poll_interval_s: 600 },
+        { account_id: 'selected', next_due_at: now - 601, poll_interval_s: 600 },
+      ]);
+    } finally { db.close(); }
+  });
+
   it('does not overwrite a concurrent fetch plan while repairing other overdue rows', () => {
     const path = join(mkdtempSync(join(tmpdir(), 'qlb-overdue-cas-plan-')), 'qlb.db');
     const provider = 'anthropic';

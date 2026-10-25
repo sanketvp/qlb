@@ -398,6 +398,7 @@ export function repairOverduePlans({
     if (entry === undefined || excludedFromPoll(entry, now)) continue;
     const nextDueAt = entry.nextDueAt;
     if (nextDueAt === null || nextDueAt === undefined) continue;
+    if (entry.pollIntervalS === null || entry.pollIntervalS === undefined) continue;
     const interval = entry.pollIntervalS || EXHAUSTED_INTERVAL_S;
     if (now <= nextDueAt + interval) continue;
     repairs[slot] = {
