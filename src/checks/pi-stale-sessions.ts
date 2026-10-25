@@ -56,6 +56,12 @@ function parseProcesses(output: string): { processes: PiProcess[]; malformed: bo
   return { processes, malformed };
 }
 
+/** pi deploy stores epoch seconds; pi migrate stores epoch milliseconds. */
+function toEpochMs(value: number): number {
+  return value >= 1e11 ? value : value * 1_000;
+}
+
+/** Latest deployment or Anthropic migration time, in epoch milliseconds. */
 function deploymentThreshold(dbPath: string): number | null {
   if (!existsSync(dbPath)) return null;
   try {
@@ -69,7 +75,8 @@ function deploymentThreshold(dbPath: string): number | null {
         .map(read)
         .filter((value): value is string => value != null)
         .map(Number)
-        .filter((value) => Number.isFinite(value) && value > 0);
+        .filter((value) => Number.isFinite(value) && value > 0)
+        .map(toEpochMs);
       return values.length > 0 ? Math.max(...values) : null;
     } finally {
       db.close();
@@ -96,7 +103,7 @@ export function piStaleSessionsCheck(options: PiStaleSessionsOptions): DoctorChe
     return { name: 'pi:stale-sessions', level: 'WARN', message: 'unknown: process list contained unparseable data' };
   }
 
-  const stale = parsed.processes.filter((process) => process.startedAtMs < threshold * 1_000);
+  const stale = parsed.processes.filter((process) => process.startedAtMs < threshold);
   if (stale.length === 0) {
     return { name: 'pi:stale-sessions', level: 'PASS', message: 'no stale Pi sessions found' };
   }

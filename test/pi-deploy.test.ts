@@ -220,6 +220,19 @@ describe('qlb pi deploy (P12)', () => {
     ]);
     assert.doesNotMatch(check.message, /cli\.js|ordinary-app/);
 
+    const msStore = openStore(f.dbPath);
+    msStore.setConfig('pi.anthropic.migratedAt', String(Date.parse('Sat Oct 25 12:00:00 2025')));
+    msStore.close();
+    const msCheck = piStaleSessionsCheck({
+      dbPath: f.dbPath,
+      list: () => [
+        '  201 Sat Oct 25 13:00:00 2025 pi',
+        '  202 Sat Oct 25 11:59:00 2025 pi',
+      ].join('\n'),
+    });
+    assert.equal(msCheck.level, 'WARN');
+    assert.deepEqual(msCheck.detail, [{ pid: 202, startedAt: 'Sat Oct 25 11:59:00 2025' }]);
+
     const malformed = piStaleSessionsCheck({ dbPath: f.dbPath, list: () => 'not a ps record' });
     assert.equal(malformed.level, 'WARN');
     assert.match(malformed.message, /unknown/);
