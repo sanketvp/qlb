@@ -44,6 +44,9 @@ import { lifecyclePhase, lifecyclePhaseCheck, type LifecyclePhaseResult } from '
 import { relogin7dCheck } from './checks/relogin-7d';
 import { openStoreConnection } from './store';
 import { discoverChecks, type CheckDefinition } from './registry';
+import { lifecycleWindowCheck } from './checks/lifecycle-window';
+import { lifecycleDrillCheck } from './checks/lifecycle-drill';
+import { openStore } from './store';
 
 export type CheckLevel = 'PASS' | 'WARN' | 'FAIL' | 'INFO' | 'N/A';
 
@@ -515,6 +518,21 @@ export async function doctorQlb(
       try { db?.close(); } catch { /* already unusable */ }
     }
     checks.push(sqliteCheck);
+  }
+
+  if (existsSync(config.dbPath)) {
+    try {
+      const lifecycleStore = openStore(config.dbPath);
+      try {
+        checks.push(lifecycleWindowCheck(lifecycleStore), lifecycleDrillCheck(lifecycleStore));
+      } finally { lifecycleStore.close(); }
+    } catch (err) {
+      checks.push({
+        name: 'lifecycle:window', level: 'WARN',
+        message: `lifecycle checks unavailable: ${err instanceof Error ? err.message : String(err)}`,
+      });
+      checks.push({ name: 'lifecycle:drill', level: 'WARN', message: 'lifecycle checks unavailable' });
+    }
   }
 
   const stuck = migrations.filter((migration) => isStuckMigration(migration));

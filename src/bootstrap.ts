@@ -8,6 +8,7 @@ export class TestHomeRequiresTestModeError extends Error {
 }
 
 export interface BootstrapHooks {
+  /** K13 admission runs before any reconciliation (S43/S59). */
   assertAdmitted?: () => void | Promise<void>;
   reconcileJournals?: () => void | Promise<void>;
 }

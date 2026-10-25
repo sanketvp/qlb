@@ -86,13 +86,13 @@ export function bucketClass(bucket: string, windowMin?: number): BucketClass {
   if (windowMin === 300) return '5h';
   if (windowMin === 10_080 || windowMin === 7 * 24 * 60) return 'weekly';
   if (bucket === 'credits') return 'balance';
-  if (bucket === '5h' || bucket === 'secondary' || bucket.endsWith(':secondary')) return '5h';
+  if (bucket === '5h' || bucket === 'primary' || bucket.endsWith(':primary')) return '5h';
   if (
     bucket === '7d' ||
     bucket.startsWith('7d:') ||
-    bucket === 'primary' ||
+    bucket === 'secondary' ||
     bucket === 'weekly' ||
-    bucket.endsWith(':primary')
+    bucket.endsWith(':secondary')
   ) {
     return 'weekly';
   }

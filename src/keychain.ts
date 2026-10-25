@@ -20,6 +20,7 @@ import {
   createRawCredentialBackend,
   defaultCredentialBackendHost,
   execFileUtf8,
+  isCredentialNotFound,
   isFakeExecutor,
   isQlbTestMode,
   isSecurityTimeout,
@@ -70,8 +71,11 @@ export {
 /** Existing name used by migration / refresh-lease / credentials. */
 export type KeychainBackend = CredentialBackend;
 
+/** Spec Keychain table: account attribute for every QLB-owned `qlb:*` item. */
+export const QLB_KEYCHAIN_ACCOUNT = 'qlb';
+
 /** Account used when looking up unscoped native secrets (OpenRouter). */
-export const NATIVE_SECRET_ACCOUNT = 'qlb';
+export const NATIVE_SECRET_ACCOUNT = QLB_KEYCHAIN_ACCOUNT;
 
 /** @deprecated Use assertKeychainAccess when an operation and account are known. */
 export function isSafeKeychainService(service: string): boolean {
@@ -202,6 +206,18 @@ export function openRouterMissingKeyMessage(service: string): string {
     : `OpenRouter key not found in credential store (service ${service})`;
 }
 
+/** The only native OpenRouter lookup failure that means "not applicable". */
+export class NativeOpenRouterKeyNotFoundError extends Error {
+  constructor(service: string) {
+    super(openRouterMissingKeyMessage(service));
+    this.name = 'NativeOpenRouterKeyNotFoundError';
+  }
+}
+
+export function isNativeOpenRouterKeyNotFound(error: unknown): boolean {
+  return error instanceof NativeOpenRouterKeyNotFoundError;
+}
+
 /** Enforce the native OpenRouter reader's narrower service capability. */
 export function assertNativeOpenRouterService(
   service: string,
@@ -239,17 +255,22 @@ export function readNativeOpenRouterKey(
       if (key.length > 0) return key;
     } catch (err) {
       if (isSecurityTimeout(err)) throw securityTimeoutError('find-generic-password');
-      // Normalize Keychain lookup failures without exposing command output.
+      // `security` uses errSecItemNotFound (44) for a missing item. stderr is
+      // intentionally discarded here, so its stable wording is only a
+      // secondary signal; a denial or other failure must remain operational.
+      if (!isCredentialNotFound(err)) throw err;
     }
-    throw new Error(openRouterMissingKeyMessage(service));
+    throw new NativeOpenRouterKeyNotFoundError(service);
   }
   try {
     const key = rawPlatform.getSync(service, NATIVE_SECRET_ACCOUNT).trim();
     if (key.length > 0) return key;
-  } catch {
-    // Normalize lookup failures without exposing command output.
+  } catch (error) {
+    // Other failures (timeouts, denial, disabled native access) are
+    // operational errors and must remain visible to callers.
+    if (!isCredentialNotFound(error)) throw error;
   }
-  throw new Error(openRouterMissingKeyMessage(service));
+  throw new NativeOpenRouterKeyNotFoundError(service);
 }
 
 /**
