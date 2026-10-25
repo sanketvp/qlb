@@ -9,21 +9,21 @@
  */
 import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync, statSync } from 'node:fs';
-import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { qlbHomeDir } from './home';
 import { parseDocument } from 'yaml';
 import type { DoctorCheck } from './diagnostics';
 import { HERMES_LAUNCHD_LABEL, HERMES_WATCH_LABEL } from './setup-hermes';
 
-const HERMES_HOME = process.env.HERMES_HOME ?? join(homedir(), '.hermes');
+const HERMES_HOME = process.env.HERMES_HOME ?? join(qlbHomeDir(), '.hermes');
 const HERMES_CHECKOUT = join(HERMES_HOME, 'hermes-agent');
 const HERMES_CONFIG = join(HERMES_HOME, 'config.yaml');
 const HERMES_PYTHON = join(HERMES_CHECKOUT, 'venv', 'bin', 'python');
 const PLUGIN_DIR = join(HERMES_HOME, 'plugins', 'model-providers', 'qlb');
-const PLUGIN_STATUS = process.env.QLB_HERMES_PLUGIN_STATUS ?? join(homedir(), '.qlb', 'hermes-plugin.json');
+const PLUGIN_STATUS = process.env.QLB_HERMES_PLUGIN_STATUS ?? join(qlbHomeDir(), '.qlb', 'hermes-plugin.json');
 // Same label `qlb setup hermes` writes the agent under (QLB_LAUNCHD_LABEL overrides it).
-const LAUNCHD_PLIST = join(homedir(), 'Library', 'LaunchAgents', `${HERMES_LAUNCHD_LABEL}.plist`);
-const WATCH_LAUNCHD_PLIST = join(homedir(), 'Library', 'LaunchAgents', `${HERMES_WATCH_LABEL}.plist`);
+const LAUNCHD_PLIST = join(qlbHomeDir(), 'Library', 'LaunchAgents', `${HERMES_LAUNCHD_LABEL}.plist`);
+const WATCH_LAUNCHD_PLIST = join(qlbHomeDir(), 'Library', 'LaunchAgents', `${HERMES_WATCH_LABEL}.plist`);
 const HERMES_SCRIPTS = ['qlb-proxy-token', 'qlb-hermes-watch', 'qlb-hermes-models'].map((name) => join(HERMES_HOME, 'scripts', name));
 
 /** Hermes seams QLB depends on: (python module, symbol, expected parameter names or null). */
