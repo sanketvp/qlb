@@ -75,7 +75,8 @@ function sweepStaging(stagingRoot: string, extensionParent: string): void {
   for (const dir of [stagingRoot, extensionParent]) {
     try {
       for (const entry of readdirSync(dir, { withFileTypes: true })) {
-        if (entry.name.startsWith('.qlb-pi-') || entry.name.startsWith('.redact-')) {
+        // Redactor temp files only ever live in stagingRoot; never sweep that prefix from Pi's extensions dir.
+        if (entry.name.startsWith('.qlb-pi-') || (dir === stagingRoot && entry.name.startsWith('.redact-'))) {
           rmSync(join(dir, entry.name), { recursive: true, force: true });
         }
       }

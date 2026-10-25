@@ -186,9 +186,12 @@ describe('qlb pi deploy (P12)', () => {
     mkdirSync(join(f.home, '.pi', 'agent', '.qlb-pi-staging'), { recursive: true });
     writeFileSync(join(legacy, 'index.ts'), 'old\n');
     writeFileSync(legacyRedact, 'old\n');
+    const foreign = join(f.home, '.pi', 'agent', 'extensions', '.redact-custom');
+    writeFileSync(foreign, 'not ours\n');
     deployPiExtension({ home: f.home, appDir: f.appDir, dbPath: f.dbPath });
     assert.equal(existsSync(legacy), false);
     assert.equal(existsSync(legacyRedact), false);
+    assert.equal(readFileSync(foreign, 'utf8'), 'not ours\n');
   });
 
   it('lists only Pi sessions that predate deployment and WARNs on malformed ps output', () => {
