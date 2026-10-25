@@ -209,7 +209,14 @@ describe('store v5 schema (AC38)', () => {
         name: 'an extra generated column',
         extra: 'forward_compatible TEXT GENERATED ALWAYS AS (upper(alias)) VIRTUAL',
         dependent: '',
-        reason: /column forward_compatible is not in the canonical definition/,
+        reason: /column forward_compatible is generated or hidden and cannot be reproduced/,
+      },
+      {
+        name: 'a generated canonical column',
+        alias: 'alias TEXT GENERATED ALWAYS AS (email) STORED',
+        extra: '',
+        dependent: '',
+        reason: /column alias is generated or hidden and cannot be reproduced/,
       },
       {
         name: 'an extra PRIMARY KEY column',
@@ -258,6 +265,19 @@ describe('store v5 schema (AC38)', () => {
         reason: /COLLATE differs from the canonical definition/,
       },
       {
+        name: 'a conflict clause on a canonical column',
+        configJson: 'config_json TEXT NOT NULL ON CONFLICT REPLACE',
+        extra: '',
+        dependent: '',
+        reason: /CONFLICT differs from the canonical definition/,
+      },
+      {
+        name: 'a descending unique constraint',
+        extra: 'UNIQUE(alias DESC)',
+        dependent: '',
+        reason: /DESC differs from the canonical definition/,
+      },
+      {
         name: 'a STRICT table option',
         extra: '',
         tableOptions: 'STRICT',
@@ -300,6 +320,14 @@ describe('store v5 schema (AC38)', () => {
         reason: /view claude_slots_view references claude_slots/,
       },
       {
+        name: 'a view reference after apostrophes in comments',
+        extra: '',
+        dependent: `CREATE VIEW claude_slots_comment_view AS SELECT account_id -- don't
+          FROM claude_slots -- isn't
+          WHERE 1`,
+        reason: /view claude_slots_comment_view references claude_slots/,
+      },
+      {
         name: 'a trigger on another table that references the table',
         extra: '',
         dependent: `CREATE TABLE slot_audit (id INTEGER PRIMARY KEY);
@@ -317,7 +345,7 @@ describe('store v5 schema (AC38)', () => {
       const db = new DatabaseSync(path);
       db.exec(`DROP TABLE claude_slots;
         CREATE TABLE claude_slots (
-          ${fixture.accountId ?? 'account_id TEXT PRIMARY KEY'}, email TEXT, ${fixture.alias ?? 'alias TEXT'}, org_uuid TEXT, config_json TEXT NOT NULL,
+          ${fixture.accountId ?? 'account_id TEXT PRIMARY KEY'}, email TEXT, ${fixture.alias ?? 'alias TEXT'}, org_uuid TEXT, ${fixture.configJson ?? 'config_json TEXT NOT NULL'},
           fingerprint TEXT, prev_fingerprint TEXT, threshold REAL, dead INTEGER NOT NULL DEFAULT 0,
           dead_reason TEXT, dead_at INTEGER, healed_at INTEGER, added_at INTEGER NOT NULL,
           last_active_at INTEGER, source TEXT, archived_at INTEGER${fixture.extra ? `, ${fixture.extra}` : ''}
@@ -342,6 +370,51 @@ describe('store v5 schema (AC38)', () => {
         } finally { check.close(); }
       }
     }
+  });
+
+  it('refuses an AUTOINCREMENT mismatch before rebuilding codex_watch', () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'qlb-v5-autoincrement-rebuild-')), 'qlb.db');
+    const initial = openStore(path);
+    initial.close();
+    const db = new DatabaseSync(path);
+    db.exec(`DROP TABLE codex_watch;
+      CREATE TABLE codex_watch (
+        switch_id INTEGER PRIMARY KEY AUTOINCREMENT, provider TEXT NOT NULL, outgoing TEXT NOT NULL,
+        target TEXT NOT NULL, next_at INTEGER NOT NULL, until INTEGER
+      )`);
+    db.close();
+    const before = readFileSync(path);
+
+    assert.throws(
+      () => openStore(path),
+      (error: unknown) => error instanceof Error
+        && error.message.includes('cannot correct pre-release v5 codex_watch')
+        && error.message.includes('verified backup:')
+        && /AUTOINCREMENT differs from the canonical definition/.test(error.message),
+    );
+    assert.deepEqual(readFileSync(path), before, 'AUTOINCREMENT mismatch must leave the database byte-for-byte unchanged');
+  });
+
+  it('rebuilds a canonical column whose spelling differs only by case', () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'qlb-v5-case-rebuild-')), 'qlb.db');
+    const initial = openStore(path);
+    initial.close();
+    const db = new DatabaseSync(path);
+    db.exec(`DROP TABLE claude_slots;
+      CREATE TABLE claude_slots (
+        account_id TEXT PRIMARY KEY, Slot_Num INTEGER, email TEXT, alias TEXT, org_uuid TEXT, config_json TEXT NOT NULL,
+        fingerprint TEXT, prev_fingerprint TEXT, threshold REAL, dead INTEGER NOT NULL DEFAULT 0,
+        dead_reason TEXT, dead_at INTEGER, healed_at INTEGER, added_at INTEGER NOT NULL,
+        last_active_at INTEGER, source TEXT, archived_at INTEGER
+      )`);
+    db.close();
+
+    const corrected = openStore(path);
+    corrected.close();
+    const check = dbAt(path);
+    try {
+      assert.ok(columns(check, 'claude_slots').includes('slot_num'));
+    } finally { check.close(); }
   });
 
   it('repairs a lifecycle table missing state before creating its partial index', () => {

@@ -328,6 +328,7 @@ interface TableColumn {
   notnull: number;
   dflt_value: string | null;
   pk: number;
+  hidden?: number;
 }
 
 function splitColumnDefinitions(definitions: string): string[] {
@@ -547,11 +548,7 @@ function sqlWithoutLiteralsOrComments(sql: string): string {
 
 function sqlReferencesTableIdentifier(sql: string, table: string): boolean {
   const escaped = table.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const withoutStringsOrComments = sql
-    .replace(/'(?:''|[^'])*'/g, "''")
-    .replace(/--[^\n]*/g, '')
-    .replace(/\/\*[\s\S]*?\*\//g, '');
-  return new RegExp(`(?:^|[^A-Za-z0-9_$])(?:${escaped}|"${escaped}"|\\[${escaped}\\]|\\x60${escaped}\\x60)(?=$|[^A-Za-z0-9_$])`, 'i').test(withoutStringsOrComments);
+  return new RegExp(`(?:^|[^A-Za-z0-9_$])(?:${escaped}|"${escaped}"|\\[${escaped}\\]|\\x60${escaped}\\x60)(?=$|[^A-Za-z0-9_$])`, 'i').test(sqlWithoutLiteralsOrComments(sql));
 }
 
 function refuseInexactV5Rebuild(table: string, reason: string, verifiedBackupPath: string): never {
@@ -592,7 +589,7 @@ function canonicalV5TableFacts(shape: V5TableShape, table: string): V5TableFacts
   }
 }
 
-function containsSqlKeyword(sql: string, keyword: 'CHECK' | 'COLLATE'): boolean {
+function containsSqlKeyword(sql: string, keyword: 'CHECK' | 'COLLATE' | 'CONFLICT' | 'DESC' | 'ASC' | 'AUTOINCREMENT'): boolean {
   return new RegExp(`\\b${keyword}\\b`, 'i').test(sqlWithoutLiteralsOrComments(sql));
 }
 
@@ -603,8 +600,13 @@ function assertV5RebuildCanBeExact(db: DatabaseSync, table: string, shape: V5Tab
     refuseInexactV5Rebuild(table, 'table options differ from the canonical definition', verifiedBackupPath);
   }
 
-  const canonical = new Set(shape.columns.map(({ name }) => name));
-  const extra = actual.xinfo.find(({ name }) => !canonical.has(name));
+  const hidden = actual.xinfo.find((column) => column.hidden !== undefined && column.hidden !== 0);
+  if (hidden) {
+    refuseInexactV5Rebuild(table, `column ${hidden.name} is generated or hidden and cannot be reproduced`, verifiedBackupPath);
+  }
+
+  const canonical = new Set(shape.columns.map(({ name }) => name.toLowerCase()));
+  const extra = actual.xinfo.find(({ name }) => !canonical.has(name.toLowerCase()));
   if (extra) {
     refuseInexactV5Rebuild(table, `column ${extra.name} is not in the canonical definition and cannot be reproduced`, verifiedBackupPath);
   }
@@ -638,6 +640,15 @@ function assertV5RebuildCanBeExact(db: DatabaseSync, table: string, shape: V5Tab
     refuseInexactV5Rebuild(table, 'primary-key columns differ from the canonical definition', verifiedBackupPath);
   }
 
+  for (const keyword of ['CHECK', 'COLLATE', 'CONFLICT', 'DESC', 'ASC'] as const) {
+    if (containsSqlKeyword(actual.sql, keyword) && !containsSqlKeyword(expected.sql, keyword)) {
+      refuseInexactV5Rebuild(table, `${keyword} differs from the canonical definition`, verifiedBackupPath);
+    }
+  }
+  if (containsSqlKeyword(actual.sql, 'AUTOINCREMENT') !== containsSqlKeyword(expected.sql, 'AUTOINCREMENT')) {
+    refuseInexactV5Rebuild(table, 'AUTOINCREMENT differs from the canonical definition', verifiedBackupPath);
+  }
+
   const expectedIndexCounts = new Map<string, number>();
   for (const index of expected.constraintIndexes) expectedIndexCounts.set(index, (expectedIndexCounts.get(index) ?? 0) + 1);
   for (const index of actual.constraintIndexes) {
@@ -646,12 +657,6 @@ function assertV5RebuildCanBeExact(db: DatabaseSync, table: string, shape: V5Tab
       refuseInexactV5Rebuild(table, 'unique index differs from the canonical definition', verifiedBackupPath);
     }
     expectedIndexCounts.set(index, remaining - 1);
-  }
-
-  for (const keyword of ['CHECK', 'COLLATE'] as const) {
-    if (containsSqlKeyword(actual.sql, keyword) && !containsSqlKeyword(expected.sql, keyword)) {
-      refuseInexactV5Rebuild(table, `${keyword} differs from the canonical definition`, verifiedBackupPath);
-    }
   }
 
   const ownForeignKeys = db.prepare(`PRAGMA foreign_key_list(${quoteIdentifier(table)})`).all();
