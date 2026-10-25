@@ -15,6 +15,10 @@ export type LifecycleOperation =
 const DAY_MS = 24 * 60 * 60 * 1000;
 const OPEN_STATES = ['cutting-over', 'cutover', 'undoing', 'rolled-back', 'retired', 'aborted'];
 const PI_PROVIDERS = ['anthropic', 'openai-codex', 'xai', 'kimi-coding', 'openrouter'] as const;
+export const CUTOVER_BEGIN_IN_PROGRESS = 'cutover-begin-in-progress';
+export const PI_STALE_SESSION_COUNT_KEY = 'pi.staleSessionCount';
+export const PI_STALE_SESSIONS_KEY = 'pi.staleSessions';
+export const PI_STALE_SESSION_COUNT_CLEAR = '0';
 
 export interface LifecycleRow {
   id: number;
@@ -156,10 +160,10 @@ export function transition(store: Store, to: LifecycleState, now: number = Date.
   return { ok: true, row: phase(store) };
 }
 
-export function beginCutover(store: Store, now: number = Date.now()): LifecycleRow {
+export function beginCutover(store: Store, now: number = Date.now(), note: string | null = null): LifecycleRow {
   try {
     return withDb(store, (db) => {
-      const result = db.prepare('INSERT INTO lifecycle (state, began_at) VALUES (?, ?)').run('cutting-over', now);
+      const result = db.prepare('INSERT INTO lifecycle (state, began_at, note) VALUES (?, ?, ?)').run('cutting-over', now, note);
       const row = db.prepare('SELECT * FROM lifecycle WHERE id = ?').get(Number(result.lastInsertRowid)) as Record<string, unknown>;
       return rowFromSql(row);
     });
@@ -170,6 +174,22 @@ export function beginCutover(store: Store, now: number = Date.now()): LifecycleR
     (constraint as Error & { code?: string }).code = 'SQLITE_CONSTRAINT';
     throw constraint;
   }
+}
+
+export function completeCutoverBegin(store: Store, id: number): LifecycleResult {
+  const changed = withDb(store, (db) => db.prepare(
+    "UPDATE lifecycle SET note = NULL WHERE id = ? AND state = 'cutting-over' AND note = ?",
+  ).run(id, CUTOVER_BEGIN_IN_PROGRESS).changes);
+  if (changed !== 1) return { ok: false, code: 'cutover-begin-state-lost', row: phase(store) };
+  return { ok: true, row: phase(store) };
+}
+
+export function abortCutoverBegin(store: Store, id: number, failureCode: string, now: number = Date.now()): LifecycleResult {
+  const changed = withDb(store, (db) => db.prepare(
+    "UPDATE lifecycle SET state = 'aborted', rollback_at = ?, pre_fence_state = 'cutting-over', note = ? WHERE id = ? AND state = 'cutting-over' AND note = ?",
+  ).run(now, `cutover begin failed: ${failureCode}`, id, CUTOVER_BEGIN_IN_PROGRESS).changes);
+  if (changed !== 1) return { ok: false, code: 'transition=cutting-over->aborted', row: phase(store) };
+  return { ok: true, row: phase(store) };
 }
 
 function hasImportedClaudeSlot(db: DatabaseSync): boolean {
@@ -194,11 +214,18 @@ function hasSharedAnthropicTarget(db: DatabaseSync): boolean {
 }
 
 function stalePiSessions(db: DatabaseSync): 'stale' | 'clear' | 'unknown' {
-  // K13 has no process detector yet. Until the S61 producer exists, an absent
-  // result is deliberately ambiguous rather than silently treated as clear.
-  const raw = configValue(db, 'pi.staleSessionCount') ?? configValue(db, 'pi.staleSessions');
-  if (raw == null) return 'unknown';
-  return (/^[1-9]\d*$/.test(raw) || raw === 'true') ? 'stale' : 'clear';
+  // S61's producer writes a canonical decimal count; only its exact zero is
+  // evidence that no stale Pi session remains. The legacy boolean key is
+  // accepted only in its two exact producer spellings.
+  const count = configValue(db, PI_STALE_SESSION_COUNT_KEY);
+  if (count != null) {
+    if (count === PI_STALE_SESSION_COUNT_CLEAR) return 'clear';
+    return /^[1-9]\d*$/.test(count) ? 'stale' : 'unknown';
+  }
+  const legacy = configValue(db, PI_STALE_SESSIONS_KEY);
+  if (legacy === 'false') return 'clear';
+  if (legacy === 'true') return 'stale';
+  return 'unknown';
 }
 
 /** Commit gates from S50, S61, and S63. */
@@ -206,6 +233,8 @@ export function commitCutover(store: Store, opts: { now?: number; releaseSha?: s
   const admission = assertAdmitted(store, 'cutover-commit');
   if (!admission.ok) return admission;
   return withDb(store, (db) => {
+    const current = db.prepare('SELECT note FROM lifecycle WHERE id = ? AND state = ?').get(admission.row!.id, 'cutting-over') as { note?: string | null } | undefined;
+    if (current?.note === CUTOVER_BEGIN_IN_PROGRESS) return { ok: false, code: CUTOVER_BEGIN_IN_PROGRESS };
     if (!hasImportedClaudeSlot(db)) return { ok: false, code: 'import-not-complete' };
     if (!manualRoundTripDone(db)) return { ok: false, code: 'manual-round-trip-required' };
     if (configValue(db, 'keychain.liveItemsAuthorizedAt') == null) return { ok: false, code: 'keychain-live-items-not-authorized' };

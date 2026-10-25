@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync } from 'node:fs';
+import { existsSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -22,10 +22,20 @@ import { cutoverBegin } from '../src/commands/cutover';
 import { openStore } from '../src/store';
 import { defaultConfig } from '../src/config';
 import { doctorQlb } from '../src/diagnostics';
-import { runExecutingCommand } from '../src/cli';
+import { gateLifecycleAdmissionCode, runExecutingCommand } from '../src/cli';
 
 function fixtureStore() {
   return openStore(join(mkdtempSync(join(tmpdir(), 'qlb-lifecycle-')), 'qlb.db'));
+}
+
+function prepareCommit(store: ReturnType<typeof openStore>): void {
+  insertClaudeImport(store);
+  store.recordSwitch({ provider: 'anthropic', fromAccount: 'claude-a', toAccount: 'claude-b', trigger: 'manual', outcome: 'ok' });
+  store.recordSwitch({ provider: 'anthropic', fromAccount: 'claude-b', toAccount: 'claude-a', trigger: 'manual', outcome: 'ok' });
+  store.setConfig('keychain.liveItemsAuthorizedAt', '1');
+  for (const provider of ['anthropic', 'openai-codex', 'xai', 'kimi-coding', 'openrouter']) {
+    store.setConfig(`pi.${provider}.state`, 'migrated');
+  }
 }
 
 function insertClaudeImport(store: ReturnType<typeof openStore>): void {
@@ -69,6 +79,23 @@ describe('lifecycle (AC49)', () => {
       assert.equal(failed.state, 'cutting-over');
       assert.equal(failed.code, 'cswap-restore-failed');
     } finally { failedStore.close(); }
+  });
+
+  it('evaluates legacy gate admission against --db without creating the default database', () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-gate-admission-'));
+    const defaultDb = join(root, 'default.db');
+    const targetDb = join(root, 'target.db');
+    const target = openStore(targetDb);
+    try { beginCutover(target); } finally { target.close(); }
+
+    assert.equal(gateLifecycleAdmissionCode(targetDb, defaultDb), null);
+    assert.equal(existsSync(defaultDb), false);
+
+    const defaultStore = openStore(defaultDb);
+    try { beginCutover(defaultStore); } finally { defaultStore.close(); }
+    const preCutoverDb = join(root, 'pre-cutover.db');
+    assert.equal(gateLifecycleAdmissionCode(preCutoverDb, defaultDb), 'phase=pre-cutover');
+    assert.equal(existsSync(preCutoverDb), true);
   });
 
   it('uses the §4.15 table for admission, including normal operation after retirement', () => {
@@ -153,6 +180,10 @@ describe('lifecycle (AC49)', () => {
       try { db.prepare('INSERT INTO pi_export_targets (provider, target, slot_account_id, lineage_fp, recorded_at) VALUES (?, ?, ?, ?, ?)')
         .run('anthropic', 'pool', 'a', 'fp', 1); } finally { db.close(); }
       assert.equal(commitCutover(store).code, 'pi-stale-sessions-unknown');
+      for (const malformed of ['', 'abc', '-1', '01', 'tru']) {
+        store.setConfig('pi.staleSessionCount', malformed);
+        assert.equal(commitCutover(store).code, 'pi-stale-sessions-unknown', malformed);
+      }
       store.setConfig('pi.staleSessionCount', '1');
       assert.equal(commitCutover(store).code, 'pi-stale-sessions-shared');
       store.setConfig('pi.staleSessionCount', '0');
@@ -188,6 +219,38 @@ describe('lifecycle (AC49)', () => {
       assert.equal(phase(store).state, 'pre-cutover');
       assert.equal(beginCutover(store, 50).state, 'cutting-over');
     } finally { store.close(); }
+  });
+
+  it('refuses commit while begin is paused and aborts a failed begin after restoring the plist', async () => {
+    const store = fixtureStore();
+    try {
+      prepareCommit(store);
+      let releaseBootout!: () => void;
+      const bootoutReleased = new Promise<void>((resolve) => { releaseBootout = resolve; });
+      let startedBootout!: () => void;
+      const bootoutStarted = new Promise<void>((resolve) => { startedBootout = resolve; });
+      const begin = cutoverBegin(store.dbPath, {
+        bootout: async () => { startedBootout(); await bootoutReleased; return { ok: true }; },
+        disable: () => ({ ok: true }), movePlist: () => ({ ok: true }), restorePlist: () => ({ ok: true }),
+      });
+      await bootoutStarted;
+      assert.equal(commitCutover(store).code, 'cutover-begin-in-progress');
+      releaseBootout();
+      assert.deepEqual(await begin, { ok: true, state: 'cutting-over' });
+    } finally { store.close(); }
+
+    const failedStore = fixtureStore();
+    try {
+      let restored = false;
+      const result = await cutoverBegin(failedStore.dbPath, {
+        bootout: () => ({ ok: false, code: 'bootout-failed' }),
+        disable: () => ({ ok: true }), movePlist: () => ({ ok: true }),
+        restorePlist: () => { restored = true; return { ok: true }; },
+      });
+      assert.equal(restored, true);
+      assert.deepEqual(result, { ok: false, code: 'bootout-failed', state: 'aborted' });
+      assert.equal(phase(failedStore).state, 'aborted');
+    } finally { failedStore.close(); }
   });
 
   it('uses compare-and-set transitions so a competing transition is refused', () => {

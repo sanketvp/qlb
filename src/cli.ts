@@ -1790,6 +1790,12 @@ function lifecycleAdmissionCode(dbPath: string, operation: LifecycleOperation): 
   } finally { store.close(); }
 }
 
+// The legacy gate path must select its lifecycle store before opening it, or
+// --db would both admit against and create the wrong database.
+export function gateLifecycleAdmissionCode(gateDbPath: string | undefined, defaultDbPath: string): string | null {
+  return lifecycleAdmissionCode(gateDbPath ?? defaultDbPath, 'gate');
+}
+
 function lifecycleOperationFor(command: string, args: string[]): LifecycleOperation | null {
   if (command === 'doctor') return 'doctor';
   if (command === 'status') return 'status';
@@ -1982,7 +1988,7 @@ async function main(): Promise<void> {
     process.exit(await runCodexProbeClaims(opts.args));
   }
   if (opts.cmd === 'gate') {
-    const refusal = lifecycleAdmissionCode(config.dbPath, 'gate');
+    const refusal = gateLifecycleAdmissionCode(opts.db, config.dbPath);
     if (refusal != null) {
       console.error(`qlb gate: refused: ${refusal}`);
       process.exit(3);

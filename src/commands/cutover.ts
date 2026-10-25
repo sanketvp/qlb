@@ -1,7 +1,13 @@
-import { DatabaseSync } from 'node:sqlite';
-
 import { unavailableCswapAgent, type CswapAgent } from '../cswap-agent';
-import { assertAdmitted, beginCutover, commitCutover, phase } from '../lifecycle';
+import {
+  abortCutoverBegin,
+  assertAdmitted,
+  beginCutover,
+  completeCutoverBegin,
+  commitCutover,
+  CUTOVER_BEGIN_IN_PROGRESS,
+  phase,
+} from '../lifecycle';
 import { openStore } from '../store';
 import type { CommandContext, CommandDefinition } from '../registry';
 
@@ -28,7 +34,7 @@ export async function cutoverBegin(storePath: string, agent: CswapAgent = unavai
 
     let row;
     try {
-      row = beginCutover(store);
+      row = beginCutover(store, Date.now(), CUTOVER_BEGIN_IN_PROGRESS);
     } catch (err) {
       // The partial unique index is the cross-process backstop after admission.
       const message = err instanceof Error ? err.message : String(err);
@@ -48,24 +54,25 @@ export async function cutoverBegin(storePath: string, agent: CswapAgent = unavai
     } catch (err) {
       failureCode = err instanceof Error ? err.message : String(err);
     }
-    if (failureCode == null) return { ok: true, state: row.state };
+    if (failureCode == null) {
+      const completed = completeCutoverBegin(store, row.id);
+      return completed.ok
+        ? { ok: true, state: completed.row!.state }
+        : { ok: false, code: completed.code, state: completed.row!.state };
+    }
 
     // restorePlist is the compensation for every successful preceding step and
-    // also covers a move that threw after its rename.
+    // also covers a move that threw after its rename. The in-progress marker
+    // remains if restoration fails, so commit cannot claim a possibly restored
+    // external state.
     let restored = false;
     try { restored = (await agent.restorePlist()).ok; } catch { /* recorded below */ }
-    const db = new DatabaseSync(store.dbPath);
-    try {
-      if (restored) {
-        const changed = db.prepare("UPDATE lifecycle SET state = 'aborted', rollback_at = ?, pre_fence_state = 'cutting-over', note = ? WHERE id = ? AND state = 'cutting-over'")
-          .run(Date.now(), `cutover begin failed: ${failureCode}`, row.id).changes;
-        if (changed === 1) return { ok: false, code: failureCode, state: 'aborted' };
-      } else {
-        db.prepare("UPDATE lifecycle SET note = ? WHERE id = ? AND state = 'cutting-over'")
-          .run(`cutover begin failed; restoration failed: ${failureCode}`, row.id);
-      }
-    } finally { db.close(); }
-    return { ok: false, code: restored ? 'transition=cutting-over->aborted' : 'cswap-restore-failed', state: phase(store).state };
+    if (restored) {
+      const aborted = abortCutoverBegin(store, row.id, failureCode);
+      if (aborted.ok) return { ok: false, code: failureCode, state: 'aborted' };
+      return { ok: false, code: aborted.code, state: aborted.row!.state };
+    }
+    return { ok: false, code: 'cswap-restore-failed', state: phase(store).state };
   } finally { store.close(); }
 }
 
