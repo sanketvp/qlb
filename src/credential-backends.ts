@@ -690,7 +690,8 @@ export function createRawCredentialBackend(
     platform: host.platform,
     commandExists: host.commandExists,
   });
-  const qlbDir = join(host.homedir(), '.qlb');
+  const { homedir: homeDir } = host;
+  const qlbDir = join(homeDir(), '.qlb');
   switch (kind) {
     case 'test-memory':
       return new InMemoryCredentialBackend();

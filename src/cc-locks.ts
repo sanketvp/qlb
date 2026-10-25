@@ -7,9 +7,9 @@
 
 import { existsSync, statSync } from 'node:fs';
 import { mkdir, rmdir, stat, utimes } from 'node:fs/promises';
-import { homedir } from 'node:os';
 import { performance } from 'node:perf_hooks';
 import { basename, join } from 'node:path';
+import { qlbHomeDir } from './home';
 
 /** Claude Code's `proper-lockfile` stale interval for OAuth-refresh locks. */
 export const CREDENTIALS_STALENESS_MS = 60_000;
@@ -60,8 +60,11 @@ function resolvedEnv({ env = process.env }: ClaudeLockOptions): NodeJS.ProcessEn
 }
 
 function resolvedHome(options: ClaudeLockOptions): string {
-  const fromEnv = resolvedEnv(options).HOME;
-  return options.home ?? (typeof fromEnv === 'string' && fromEnv.length > 0 ? fromEnv : homedir());
+  if (options.home) return options.home;
+  const env = resolvedEnv(options);
+  if (env.QLB_TEST_MODE === '1') return qlbHomeDir(env);
+  const fromEnv = env.HOME;
+  return typeof fromEnv === 'string' && fromEnv.length > 0 ? fromEnv : qlbHomeDir(env);
 }
 
 function resolvedConfigHome(options: ClaudeLockOptions): string {
