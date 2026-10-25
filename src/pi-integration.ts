@@ -227,7 +227,13 @@ export function piIntegrationChecks(options: PiIntegrationOptions = {}): DoctorC
   const run = options.run ?? ((cmd: string, args: string[], o: { cwd?: string; timeoutMs?: number } = {}) =>
     execFileSync(cmd, args, { encoding: 'utf8', cwd: o.cwd, timeout: o.timeoutMs ?? 60_000, stdio: ['ignore', 'pipe', 'pipe'] }));
 
-  const PI_EXT_DIR = options.extensionDir ?? DEFAULT_PI_EXT_DIR;
+  // A release can be tested with QLB_HOME redirected while Pi remains under the
+  // independently sandboxed HOME; production normally makes these the same home.
+  const configuredExtension = options.extensionDir ?? DEFAULT_PI_EXT_DIR;
+  const homeExtension = process.env.HOME
+    ? join(process.env.HOME, '.pi', 'agent', 'extensions', 'qlb-pi')
+    : configuredExtension;
+  const PI_EXT_DIR = existsSync(configuredExtension) ? configuredExtension : homeExtension;
   const located = options.pi ?? locatePi();
   if (located.unresolved && existsSync(PI_EXT_DIR)) {
     checks.push({

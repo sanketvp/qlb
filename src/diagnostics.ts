@@ -37,6 +37,10 @@ import {
 import type { AccountSnapshot, Adapter } from './types';
 import { hermesIntegrationChecks } from './hermes-integration';
 import { piIntegrationChecks } from './pi-integration';
+import { piExtensionDriftCheck } from './checks/pi-extension-drift';
+import { piStaleSessionsCheck } from './checks/pi-stale-sessions';
+import { qlbHomeDir } from './home';
+import { piReleaseAppDir } from './pi-deploy';
 import { probeHostEnvironment, type HostCommandRunner } from './checks/hosts-env';
 import { discoverChecks, type CheckDefinition } from './registry';
 
@@ -454,6 +458,8 @@ export async function doctorQlb(
     hostPlatform?: NodeJS.Platform;
     hostShell?: string;
     hostShellExists?: (path: string) => boolean;
+    /** Test-only fixture for `ps -axo pid=,lstart=,command=`. */
+    piProcessList?: () => string;
   } = {},
 ): Promise<DoctorReport> {
   const checks: DoctorCheck[] = [];
@@ -609,6 +615,19 @@ export async function doctorQlb(
   } catch (err) {
     checks.push({ name: 'pi', level: 'WARN', message: `pi checks failed: ${err instanceof Error ? err.message : String(err)}` });
   }
+  const piHome = qlbHomeDir();
+  checks.push(piExtensionDriftCheck({
+    home: piHome,
+    appDir: piReleaseAppDir(piHome),
+    dbPath: config.dbPath,
+  }));
+  checks.push(piStaleSessionsCheck({
+    dbPath: config.dbPath,
+    // Tests must provide a fixture rather than observe the developer's process table.
+    list: options.piProcessList ?? (process.env.QLB_TEST_MODE === '1'
+      ? () => { throw new Error('Pi process listing requires an injected fixture in test mode'); }
+      : undefined),
+  }));
 
   const providers = inspectProviders(config, options.command);
   if (options.live) {
