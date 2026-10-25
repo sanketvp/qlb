@@ -14,6 +14,11 @@ function childEnv(home: string, testMode: boolean): NodeJS.ProcessEnv {
   }
   env.HOME = home;
   env.QLB_HOME = home;
+  env.CODEX_HOME = join(home, 'codex');
+  env.CLAUDE_CONFIG_DIR = join(home, 'claude');
+  env.XDG_CONFIG_HOME = join(home, 'xdg-config');
+  env.XDG_DATA_HOME = join(home, 'xdg-data');
+  env.XDG_CACHE_HOME = join(home, 'xdg-cache');
   if (testMode) env.QLB_TEST_MODE = '1';
   return env;
 }
@@ -21,10 +26,14 @@ function childEnv(home: string, testMode: boolean): NodeJS.ProcessEnv {
 function runChild(args: string[], testMode: boolean): { status: number | null; stdout: string; stderr: string } {
   const home = mkdtempSync(join(tmpdir(), 'qlb-cli-subprocess-'));
   try {
-    const result = spawnSync(process.execPath, [cliPath, ...args], {
-      encoding: 'utf8',
-      env: childEnv(home, testMode),
-    });
+    const result = spawnSync(
+      process.execPath,
+      [cliPath, ...args.map((arg) => arg.replaceAll('<temp-home>', home))],
+      {
+        encoding: 'utf8',
+        env: childEnv(home, testMode),
+      },
+    );
     return { status: result.status, stdout: result.stdout, stderr: result.stderr };
   } finally {
     rmSync(home, { recursive: true, force: true });
@@ -38,10 +47,13 @@ describe('compiled CLI test-mode subprocess guard', () => {
     assert.ok(Array.isArray(JSON.parse(result.stdout)));
   });
 
-  it('keeps the switch command child inside test mode', () => {
-    const result = runChild(['switch', 'anthropic', 'x', '--json'], true);
+  it('reports the native Keychain test-mode violation from migrate stage', () => {
+    const result = runChild([
+      'migrate', 'stage', '--provider', 'openrouter', '--owner-file',
+      '<temp-home>/owner', '--json',
+    ], true);
     assert.equal(result.status, 1, result.stderr);
-    assert.match(result.stderr, /Usage:/);
+    assert.match(result.stderr, /native macOS Keychain access is disabled while QLB_TEST_MODE=1/);
   });
 
   it('refuses an isolated QLB_HOME when test mode is absent before command dispatch', () => {
