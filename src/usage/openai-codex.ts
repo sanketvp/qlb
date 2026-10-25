@@ -1,6 +1,7 @@
 // Codex usage is not covered by claude-swap v0.28.0; probe order follows
 // QLB spec §4.4.4. L14 and L34 deliberately remain unverified until C4-live.
-import { lstat, readdir, readFile, stat } from 'node:fs/promises';
+import { createReadStream } from 'node:fs';
+import { lstat, readdir, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { config } from '../config';
 import { readCodexAuthStable, type CodexAuthDocument } from '../codex-auth';
@@ -8,6 +9,9 @@ import { buildUsageRequest, parseUsage, type UsageParseResult, type UsageWindow 
 
 export const CODEX_USAGE_WHAM_URL = 'https://chatgpt.com/backend-api/wham/usage';
 export const CODEX_USAGE_FALLBACK_URL = 'https://chatgpt.com/backend-api/api/codex/usage';
+/** Bound passive fallback work when Codex has accumulated a large session history. */
+export const MAX_ROLLOUT_FILES = 50;
+const MAX_ROLLOUT_LINE_BYTES = 1024 * 1024;
 
 export type CodexUsageSource = 'wham' | 'codex-api' | 'codex-rollout' | 'unknown';
 
@@ -30,7 +34,8 @@ export interface CodexUsageProbeDeps {
   auth?: CodexAuthDocument;
   authPath?: string;
   fetchFn?: FetchFn;
-  readRollout?: () => Promise<RolloutSnapshot[]>;
+  /** Returns active-account snapshots ordered newest first. */
+  readRollout?: (activeAccountId: string) => Promise<RolloutSnapshot[]>;
 }
 
 interface Attempt {
@@ -83,17 +88,6 @@ async function attemptUsage(
   }
 }
 
-function nestedAccountId(value: unknown, depth = 0): string | undefined {
-  if (depth > 4 || !value || typeof value !== 'object' || Array.isArray(value)) return undefined;
-  const object = value as Record<string, unknown>;
-  if (typeof object.account_id === 'string') return object.account_id;
-  for (const child of Object.values(object)) {
-    const found = nestedAccountId(child, depth + 1);
-    if (found) return found;
-  }
-  return undefined;
-}
-
 function nestedRateLimits(value: unknown, depth = 0): Record<string, unknown> | undefined {
   if (depth > 4 || !value || typeof value !== 'object' || Array.isArray(value)) return undefined;
   const object = value as Record<string, unknown>;
@@ -108,12 +102,61 @@ function nestedRateLimits(value: unknown, depth = 0): Record<string, unknown> | 
   return undefined;
 }
 
+/** Streams bounded JSONL lines without retaining a rollout file in memory. */
+async function streamRolloutLines(
+  path: string,
+  onLine: (line: string | undefined) => boolean,
+): Promise<void> {
+  let line = '';
+  let tooLong = false;
+  const stream = createReadStream(path, { encoding: 'utf8', highWaterMark: 64 * 1024 });
+  for await (const chunk of stream) {
+    for (const character of chunk) {
+      if (character === '\n') {
+        const value = tooLong ? undefined : line.endsWith('\r') ? line.slice(0, -1) : line;
+        line = '';
+        tooLong = false;
+        if (!onLine(value)) return;
+      } else if (!tooLong) {
+        if (line.length >= MAX_ROLLOUT_LINE_BYTES) {
+          line = '';
+          tooLong = true;
+        } else {
+          line += character;
+        }
+      }
+    }
+  }
+  if (line.length > 0 || tooLong) onLine(tooLong ? undefined : line);
+}
+
+async function firstRolloutLine(path: string): Promise<string | undefined> {
+  let first: string | undefined;
+  await streamRolloutLines(path, (line) => {
+    first = line;
+    return false;
+  });
+  return first;
+}
+
+function creatorAccountId(firstLine: string | undefined): string | undefined {
+  if (!firstLine) return undefined;
+  try {
+    const event = JSON.parse(firstLine) as { payload?: Record<string, unknown> };
+    const payload = event?.payload;
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return undefined;
+    const account = payload.creator_account_id ?? payload.account_id;
+    return typeof account === 'string' && account !== '' ? account : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /**
- * Reads recent Codex rollout JSONL snapshots without logging their contents.
- * Files without an account marker are tied to the active auth document because
- * this command never probes an inactive account; marked foreign events are ignored.
+ * Reads recent active-account Codex rollout snapshots without logging their contents.
+ * The returned list is newest-first; each file retains only its final rate_limits event.
  */
-async function readRolloutSnapshots(authPath: string): Promise<RolloutSnapshot[]> {
+async function readRolloutSnapshots(authPath: string, activeAccountId: string): Promise<RolloutSnapshot[]> {
   const sessions = join(join(authPath, '..'), 'sessions');
   const files: Array<{ path: string; mtimeMs: number }> = [];
   const visit = async (directory: string, depth: number): Promise<void> => {
@@ -130,8 +173,7 @@ async function readRolloutSnapshots(authPath: string): Promise<RolloutSnapshot[]
         await visit(path, depth + 1);
       } else if (entry.isFile() && entry.name.startsWith('rollout-') && entry.name.endsWith('.jsonl')) {
         try {
-          const info = await stat(path);
-          files.push({ path, mtimeMs: info.mtimeMs });
+          files.push({ path, mtimeMs: (await stat(path)).mtimeMs });
         } catch {
           // A concurrently removed snapshot is simply unavailable.
         }
@@ -139,28 +181,32 @@ async function readRolloutSnapshots(authPath: string): Promise<RolloutSnapshot[]
     }
   };
   await visit(sessions, 0);
-  const snapshots: RolloutSnapshot[] = [];
-  for (const file of files.sort((a, b) => a.mtimeMs - b.mtimeMs)) {
+
+  for (const file of files.sort((a, b) => b.mtimeMs - a.mtimeMs).slice(0, MAX_ROLLOUT_FILES)) {
     try {
       // Do not follow a newly swapped path; rollout data is advisory only.
       if (!(await lstat(file.path)).isFile()) continue;
-      const lines = (await readFile(file.path, 'utf8')).split('\n');
-      for (const line of lines) {
-        if (line.length === 0) continue;
+      if (creatorAccountId(await firstRolloutLine(file.path)) !== activeAccountId) continue;
+
+      let latestRateLimits: Record<string, unknown> | undefined;
+      await streamRolloutLines(file.path, (line) => {
+        if (!line || (!line.includes('rate_limits') && !line.includes('rateLimits'))) return true;
         try {
-          const body = JSON.parse(line) as unknown;
-          if (body && typeof body === 'object' && !Array.isArray(body)) {
-            snapshots.push({ accountId: nestedAccountId(body), body });
-          }
+          latestRateLimits = nestedRateLimits(JSON.parse(line));
         } catch {
           // Codex may be in the middle of appending a line.
         }
-      }
+        return true;
+      });
+      if (!latestRateLimits) continue;
+      const snapshot = { accountId: activeAccountId, body: { rate_limits: latestRateLimits } };
+      // Skip an invalid newer event and continue to an older bounded snapshot.
+      if (rolloutWindows(snapshot)) return [snapshot];
     } catch {
       // A failed passive fallback must not make the usage probe throw.
     }
   }
-  return snapshots;
+  return [];
 }
 
 function rolloutWindows(snapshot: RolloutSnapshot): UsageWindow[] | undefined {
@@ -201,9 +247,9 @@ export async function probeCodexUsage(deps: CodexUsageProbeDeps = {}): Promise<C
     last = fallback;
   }
 
-  const rollouts = await (deps.readRollout ?? (() => readRolloutSnapshots(authPath)))();
+  const rollouts = await (deps.readRollout ?? ((id: string) => readRolloutSnapshots(authPath, id)))(activeAccountId);
   for (const snapshot of rollouts) {
-    if (snapshot.accountId !== undefined && snapshot.accountId !== activeAccountId) continue;
+    if (snapshot.accountId !== activeAccountId) continue;
     const windows = rolloutWindows(snapshot);
     if (windows) return { status: last.status, source: 'codex-rollout', keys: ['rate_limits'], windows };
   }
