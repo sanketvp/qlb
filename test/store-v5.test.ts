@@ -628,4 +628,30 @@ describe('store v5 schema (AC38)', () => {
       assert.equal(row.evidence, '[redacted]');
     } finally { db.close(); }
   });
+
+  it('corrects a v5 database missing poll_interval_s after a verified backup, once', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-v5-poll-interval-correct-'));
+    const path = join(dir, 'qlb.db');
+    const initial = openStore(path);
+    initial.close();
+    const backupsBefore = readdirSync(join(dir, 'backups')).filter((file) => file.endsWith('.sqlite'));
+    const db = new DatabaseSync(path);
+    db.exec('ALTER TABLE usage_polls DROP COLUMN poll_interval_s');
+    db.close();
+
+    const corrected = openStore(path);
+    corrected.close();
+    const backups = readdirSync(join(dir, 'backups')).filter((file) => file.endsWith('.sqlite'));
+    assert.equal(backups.length, backupsBefore.length + 1);
+    const correctionBackup = backups.find((file) => !backupsBefore.includes(file));
+    assert.ok(correctionBackup);
+    const backup = dbAt(join(dir, 'backups', correctionBackup));
+    try { assert.ok(!columns(backup, 'usage_polls').includes('poll_interval_s')); } finally { backup.close(); }
+    const check = dbAt(path);
+    try { assert.ok(columns(check, 'usage_polls').includes('poll_interval_s')); } finally { check.close(); }
+
+    const reopened = openStore(path);
+    reopened.close();
+    assert.equal(readdirSync(join(dir, 'backups')).filter((file) => file.endsWith('.sqlite')).length, backups.length);
+  });
 });

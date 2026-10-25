@@ -40,6 +40,18 @@ export interface LeaseRow {
   generation: number;
 }
 
+/** Immutable lineage edge retained for successor proofs (S46). */
+export interface LineageTransitionRow {
+  from_fp: string | null;
+  to_fp: string;
+}
+
+/** Current slot lineage and its immediate predecessor, when this provider has slots. */
+export interface SlotLineageRow {
+  fingerprint: string | null;
+  prev_fingerprint: string | null;
+}
+
 /** Credential-migration journal (§4.8.3). One row per native store. */
 export interface MigrationRow {
   store: string;
@@ -296,7 +308,7 @@ const V5_SCHEMA_DDL = `
   CREATE TABLE IF NOT EXISTS codex_slots (account_id TEXT PRIMARY KEY, chatgpt_user_id TEXT NOT NULL, chatgpt_account_id TEXT NOT NULL, email TEXT, alias TEXT, fingerprint TEXT, prev_fingerprint TEXT, threshold REAL, last_refresh TEXT, dead INTEGER NOT NULL DEFAULT 0, dead_reason TEXT, dead_at INTEGER, healed_at INTEGER, pending_adopt INTEGER NOT NULL DEFAULT 0, added_at INTEGER NOT NULL, last_active_at INTEGER, source TEXT, archived_at INTEGER);
   CREATE TABLE IF NOT EXISTS active_login (provider TEXT PRIMARY KEY, account_id TEXT, since INTEGER NOT NULL, set_by TEXT NOT NULL);
   CREATE TABLE IF NOT EXISTS switch_log (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, provider TEXT NOT NULL, from_account TEXT, to_account TEXT NOT NULL, trigger TEXT NOT NULL, outcome TEXT NOT NULL, outgoing_kind TEXT, binding_json TEXT, steps_json TEXT, open_sessions_json TEXT, error TEXT, injected INTEGER NOT NULL DEFAULT 0, detail TEXT, published_at INTEGER, committed_at INTEGER);
-  CREATE TABLE IF NOT EXISTS usage_polls (provider TEXT NOT NULL, account_id TEXT NOT NULL, last_fetch_at INTEGER, last_attempt_at INTEGER, next_due_at INTEGER, last_status TEXT, consecutive_failures INTEGER NOT NULL DEFAULT 0, backoff_until INTEGER, last_429_at INTEGER, held_until INTEGER, PRIMARY KEY (provider, account_id));
+  CREATE TABLE IF NOT EXISTS usage_polls (provider TEXT NOT NULL, account_id TEXT NOT NULL, last_fetch_at INTEGER, last_attempt_at INTEGER, next_due_at INTEGER, poll_interval_s REAL, last_status TEXT, consecutive_failures INTEGER NOT NULL DEFAULT 0, backoff_until INTEGER, last_429_at INTEGER, held_until INTEGER, PRIMARY KEY (provider, account_id));
   CREATE TABLE IF NOT EXISTS relogin_events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, provider TEXT NOT NULL, account_id TEXT, kind TEXT NOT NULL, detail TEXT, evidence TEXT, user_denied_at INTEGER);
   CREATE TABLE IF NOT EXISTS health_log (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, phase TEXT NOT NULL, overall TEXT NOT NULL, failing_json TEXT NOT NULL, dead_slots_json TEXT NOT NULL, release_sha TEXT);
   CREATE TABLE IF NOT EXISTS lineage_log (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, provider TEXT NOT NULL, account_id TEXT NOT NULL, from_fp TEXT, to_fp TEXT NOT NULL, cause TEXT NOT NULL, by TEXT NOT NULL, evidence TEXT);
@@ -1162,7 +1174,8 @@ export class Store {
       this.db.exec(`
         CREATE TABLE usage_polls_v5 (
           provider TEXT NOT NULL, account_id TEXT NOT NULL,
-          last_fetch_at INTEGER, last_attempt_at INTEGER, next_due_at INTEGER,
+          -- Spec §3.2 usage_polls.poll_interval_s (D-B11).
+          last_fetch_at INTEGER, last_attempt_at INTEGER, next_due_at INTEGER, poll_interval_s REAL,
           last_status TEXT, consecutive_failures INTEGER NOT NULL DEFAULT 0,
           backoff_until INTEGER, last_429_at INTEGER, held_until INTEGER,
           PRIMARY KEY (provider, account_id)
@@ -1179,6 +1192,8 @@ export class Store {
     // Tables must exist before repair, but the lifecycle partial index refers to
     // state and is deliberately created only after every table has been repaired.
     this.db.exec(V5_SCHEMA_DDL);
+    // Spec §3.2 `usage_polls.poll_interval_s` (D-B11).
+    this.addColumnIfMissing('usage_polls', 'poll_interval_s', 'REAL');
     this.addColumnIfMissing('claude_slots', 'archived_at', 'INTEGER');
     this.addColumnIfMissing('codex_slots', 'pending_adopt', 'INTEGER NOT NULL DEFAULT 0');
     this.addColumnIfMissing('codex_slots', 'archived_at', 'INTEGER');
@@ -1403,6 +1418,53 @@ export class Store {
       this.db.exec('ROLLBACK');
       throw err;
     }
+  }
+
+  /**
+   * Persist next-poll plans as one short write transaction.  This deliberately
+   * does not alter fetch, attempt, hold, or failure state, so the policy can
+   * re-spread a wake-from-sleep cohort without claiming or polling it.
+   */
+  writeUsagePollPlans(
+    provider: string,
+    plans: Readonly<Record<string, {
+      nextDueAt: number;
+      pollIntervalS: number;
+      expectedNextDueAt?: number | null;
+      expectedPollIntervalS?: number | null;
+    }>>,
+    now?: number,
+  ): number {
+    const rows = Object.entries(plans);
+    if (rows.length === 0) return 0;
+    let written = 0;
+    this.runImmediate(() => {
+      const upsert = this.db.prepare(`
+        INSERT INTO usage_polls (provider, account_id, next_due_at, poll_interval_s)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(provider, account_id) DO UPDATE SET
+          next_due_at = excluded.next_due_at,
+          poll_interval_s = excluded.poll_interval_s
+      `);
+      const repair = this.db.prepare(`
+        UPDATE usage_polls SET next_due_at = ?, poll_interval_s = ?
+        WHERE provider = ? AND account_id = ?
+          AND next_due_at IS ? AND poll_interval_s IS ?
+          AND last_status IS NOT 'token_dead'
+          AND (backoff_until IS NULL OR backoff_until <= ?)
+          AND (held_until IS NULL OR held_until <= ?)
+      `);
+      for (const [accountId, plan] of rows) {
+        const isRepair = now !== undefined
+          && Object.hasOwn(plan, 'expectedNextDueAt')
+          && Object.hasOwn(plan, 'expectedPollIntervalS');
+        const result = isRepair
+          ? repair.run(plan.nextDueAt, plan.pollIntervalS, provider, accountId, plan.expectedNextDueAt ?? null, plan.expectedPollIntervalS ?? null, now, now)
+          : upsert.run(provider, accountId, plan.nextDueAt, plan.pollIntervalS);
+        written += Number(result.changes);
+      }
+    });
+    return written;
   }
 
   /**
@@ -1778,6 +1840,25 @@ export class Store {
       row.evidence == null ? null : redactSecrets(row.evidence, []),
     );
     return Number(result.lastInsertRowid);
+  }
+
+  /** Read the immutable per-slot graph used by lineage-log.ts to prove successor order (S46). */
+  listLineageTransitions(provider: string, accountId: string): LineageTransitionRow[] {
+    return this.db.prepare(
+      'SELECT from_fp, to_fp FROM lineage_log WHERE provider = ? AND account_id = ? ORDER BY id ASC',
+    ).all(provider, accountId) as unknown as LineageTransitionRow[];
+  }
+
+  /** Return the slot's persisted `:prev` edge; unknown providers have no slot table. */
+  getSlotLineage(provider: string, accountId: string): SlotLineageRow | null {
+    const table = provider === 'anthropic'
+      ? 'claude_slots'
+      : provider === 'openai-codex'
+        ? 'codex_slots'
+        : null;
+    if (!table) return null;
+    const row = this.db.prepare(`SELECT fingerprint, prev_fingerprint FROM ${table} WHERE account_id = ?`).get(accountId);
+    return (row as SlotLineageRow | undefined) ?? null;
   }
 
   recordRelogin(row: { ts?: number; provider: string; accountId?: string | null; kind: string; detail?: string | null; evidence?: string | null; userDeniedAt?: number | null }): number {

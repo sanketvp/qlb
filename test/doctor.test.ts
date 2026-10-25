@@ -6,8 +6,9 @@ import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
 import { defaultConfig } from '../src/config';
-import { doctorQlb, registeredDoctorChecks } from '../src/diagnostics';
+import { createCommandRunner, doctorQlb, inspectProviders, registeredDoctorChecks } from '../src/diagnostics';
 import { discoverChecks } from '../src/registry';
+import { MACOS_SECURITY_TIMEOUT_MS } from '../src/keychain';
 import { validatedAdvisoryMessage } from '../src/migration-health';
 import { openStore } from '../src/store';
 
@@ -108,6 +109,66 @@ describe('qlb doctor', () => {
       recovery?.message,
       'recovery marker present — destructive maintenance refused until reconciled',
     );
+  });
+
+  it('bounds the production security command runner', () => {
+    let timeoutMs: number | undefined;
+    const run = createCommandRunner((_file, _args, options) => {
+      timeoutMs = options?.timeout;
+      return '';
+    });
+
+    assert.equal(run('/fake/security', ['list-keychains']), '');
+    assert.equal(timeoutMs, MACOS_SECURITY_TIMEOUT_MS);
+  });
+
+  it('reports a timed out Keychain probe as WARN, never PASS', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-keychain-timeout-'));
+    const timeout = Object.assign(new Error('fake security timed out'), { code: 'ETIMEDOUT' });
+    const report = await doctorQlb(defaultConfig(home), {
+      command: () => { throw timeout; },
+    });
+    const keychain = report.checks.find((check) => check.name === 'keychain');
+    const openrouter = report.providers.find((provider) => provider.provider === 'openrouter');
+
+    assert.equal(keychain?.level, 'WARN');
+    assert.match(keychain?.message ?? '', /timed out after 5s/);
+    assert.equal(openrouter?.level, 'WARN');
+    assert.equal(openrouter?.message, 'security find-generic-password timed out after 5s');
+    assert.doesNotMatch(openrouter?.message ?? '', /credential source not found/);
+    assert.doesNotMatch(openrouter?.example ?? '', /security add-generic-password/);
+  });
+
+  it('reports the fixed pi-openrouter source and pinned security binary', () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-openrouter-default-'));
+    const config = defaultConfig(home);
+    const calls: Array<{ command: string; args: string[] }> = [];
+    const providers = inspectProviders(config, (command, args) => {
+      calls.push({ command, args });
+      return args[0] === 'find-generic-password' ? 'test-key' : 'ok';
+    });
+    const openrouter = providers.find((provider) => provider.provider === 'openrouter');
+
+    assert.equal(openrouter?.level, 'PASS');
+    assert.equal(openrouter?.source.includes('pi-openrouter'), true);
+    assert.deepEqual(calls[0], {
+      command: '/usr/bin/security',
+      args: ['find-generic-password', '-s', 'pi-openrouter', '-w'],
+    });
+  });
+
+  it('reports a non-default OpenRouter Keychain service as unsupported without a setup hint', () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-openrouter-unsupported-'));
+    const config = { ...defaultConfig(home), openrouterKeychainService: 'other-service' };
+    const providers = inspectProviders(config, () => {
+      throw new Error('unsupported service must not be probed');
+    });
+    const openrouter = providers.find((provider) => provider.provider === 'openrouter');
+
+    assert.equal(openrouter?.level, 'WARN');
+    assert.match(openrouter?.message ?? '', /only pi-openrouter is supported/);
+    assert.doesNotMatch(openrouter?.message ?? '', /credential source not found|security add-generic-password/);
+    assert.doesNotMatch(openrouter?.example ?? '', /security add-generic-password/);
   });
 
   it('returns FAIL for a corrupt SQLite store', async () => {

@@ -76,6 +76,20 @@ function decodeJwtPayload(token: string): JsonObject | null {
   }
 }
 
+/** Returns sorted ID-token claim names without retaining their values. */
+export function idTokenClaimNames(doc: CodexAuthDocument): string[] {
+  const idToken = doc?.tokens?.id_token;
+  const payload = typeof idToken === 'string' ? decodeJwtPayload(idToken) : null;
+  return payload ? Object.keys(payload).sort() : [];
+}
+
+/** Returns the numeric ID-token auth_time claim, if the token is well-formed. */
+export function authTime(doc: CodexAuthDocument): number | undefined {
+  const idToken = doc?.tokens?.id_token;
+  const payload = typeof idToken === 'string' ? decodeJwtPayload(idToken) : null;
+  return typeof payload?.auth_time === 'number' ? payload.auth_time : undefined;
+}
+
 /** Parses an auth.json without exposing any credential value in errors. */
 export function parseCodexAuth(text: string): CodexAuthParseResult {
   let parsed: unknown;

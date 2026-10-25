@@ -2,8 +2,10 @@
 
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { describe, it } from 'node:test';
 import {
   ACTIVE_MAX_INTERVAL_S,
@@ -22,7 +24,9 @@ import {
   type DueCandidateSlot,
   parseResetTs,
   planAfterFetch,
+  repairOverduePlans,
 } from '../src/poll-policy';
+import { openStore } from '../src/store';
 
 const PYTHON = 'python3';
 const CSWAP_V028_SOURCE = resolve(__dirname, '../../test/oracle/claude-swap-v0.28.0/src');
@@ -369,6 +373,251 @@ describe('claude-swap due-candidate port', () => {
       recent: { lastFetchAt: now - 10 },
     };
     assert.equal(dueCandidate(['parked', 'recent'], entries, now), 'parked');
+  });
+
+  it('yields a held row to an unheld row and quarantines dead tokens', () => {
+    // QLB §4.6 / AC46: a held Codex slot must not consume the one alternate
+    // poll, and a known-dead refresh token remains quarantined after backoff.
+    const entries: Record<string, DueCandidateSlot> = {
+      held: { lastFetchAt: now - 900, heldUntil: now + 1 },
+      dead: { lastFetchAt: now - 800, lastStatus: 'token_dead' },
+      available: { lastFetchAt: now - 60 },
+    };
+    assert.equal(dueCandidate(['held', 'dead', 'available'], entries, now), 'available');
+  });
+
+  it('limits an overdue cohort to one alternate poll', () => {
+    // The one-alternate policy repairs the selected stale plan through its
+    // normal post-fetch plan; it must not nominate all six at once.
+    const entries = Object.fromEntries(
+      Array.from({ length: 6 }, (_, index) => [`slot-${index}`, {
+        lastFetchAt: now - 1_200 - index,
+        nextDueAt: now - 601 - index,
+        pollIntervalS: 600,
+      }]),
+    ) as Record<string, DueCandidateSlot>;
+    assert.equal(dueCandidate(Object.keys(entries), entries, now), 'slot-5');
+  });
+
+  it('repairs an overdue cohort into one poll now and five persisted jittered plans', () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'qlb-overdue-repair-')), 'qlb.db');
+    const provider = 'anthropic';
+    const entries = Object.fromEntries(
+      Array.from({ length: 6 }, (_, index) => [`slot-${index}`, {
+        lastFetchAt: now - 1_200 - index,
+        nextDueAt: now - 601 - index,
+        pollIntervalS: 600,
+      }]),
+    ) as Record<string, DueCandidateSlot>;
+    const store = openStore(path);
+    try {
+      store.writeUsagePollPlans(provider, Object.fromEntries(Object.entries(entries).map(([accountId, entry]) => [accountId, {
+        nextDueAt: entry.nextDueAt!,
+        pollIntervalS: entry.pollIntervalS!,
+      }])));
+      const randomValues = [0, 0.25, 0.5, 0.75, 1];
+      let randomIndex = 0;
+      const chosen = repairOverduePlans({
+        provider,
+        candidates: Object.keys(entries),
+        entries,
+        now,
+        rng: () => randomValues[randomIndex++]!,
+        writer: store,
+      });
+      assert.equal(chosen, 'slot-5');
+      assert.equal(randomIndex, 5);
+    } finally {
+      store.close();
+    }
+
+    const db = new DatabaseSync(path, { readOnly: true });
+    try {
+      const rows = (db.prepare(`SELECT account_id, next_due_at, poll_interval_s
+        FROM usage_polls WHERE provider = ? ORDER BY account_id`).all(provider) as Array<{
+          account_id: string; next_due_at: number; poll_interval_s: number;
+        }>).map((row) => ({ ...row }));
+      assert.deepEqual(rows, [
+        { account_id: 'slot-0', next_due_at: now + 540, poll_interval_s: 600 },
+        { account_id: 'slot-1', next_due_at: now + 570, poll_interval_s: 600 },
+        { account_id: 'slot-2', next_due_at: now + 600, poll_interval_s: 600 },
+        { account_id: 'slot-3', next_due_at: now + 630, poll_interval_s: 600 },
+        { account_id: 'slot-4', next_due_at: now + 660, poll_interval_s: 600 },
+        { account_id: 'slot-5', next_due_at: now - 606, poll_interval_s: 600 },
+      ]);
+      const repairedEntries = Object.fromEntries(rows.map((row) => [row.account_id, {
+        ...entries[row.account_id]!,
+        nextDueAt: row.next_due_at,
+        pollIntervalS: row.poll_interval_s,
+      }]));
+      assert.equal(dueCandidate(Object.keys(repairedEntries), repairedEntries, now), 'slot-5');
+    } finally {
+      db.close();
+    }
+  });
+
+  it('leaves a never-planned overdue row unchanged while repairing saved plans', () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'qlb-overdue-null-interval-')), 'qlb.db');
+    const provider = 'anthropic';
+    const entries: Record<string, DueCandidateSlot> = {
+      selected: { lastFetchAt: now - 1_300, nextDueAt: now - 601, pollIntervalS: 600 },
+      saved: { lastFetchAt: now - 1_200, nextDueAt: now - 601, pollIntervalS: 600 },
+      neverPlanned: { lastFetchAt: now - 1_100, nextDueAt: now - 601, pollIntervalS: null },
+    };
+    const store = openStore(path);
+    try {
+      store.writeUsagePollPlans(provider, {
+        selected: { nextDueAt: now - 601, pollIntervalS: 600 },
+        saved: { nextDueAt: now - 601, pollIntervalS: 600 },
+      });
+      const db = new DatabaseSync(path);
+      try {
+        db.prepare('INSERT INTO usage_polls (provider, account_id, next_due_at, poll_interval_s) VALUES (?, ?, ?, NULL)')
+          .run(provider, 'neverPlanned', now - 601);
+      } finally { db.close(); }
+      assert.equal(repairOverduePlans({ provider, candidates: Object.keys(entries), entries, now, rng: () => 0.5, writer: store }), 'selected');
+    } finally { store.close(); }
+    const db = new DatabaseSync(path, { readOnly: true });
+    try {
+      assert.deepEqual((db.prepare('SELECT account_id, next_due_at, poll_interval_s FROM usage_polls WHERE provider = ? ORDER BY account_id').all(provider) as Array<Record<string, unknown>>).map((row) => ({ ...row })), [
+        { account_id: 'neverPlanned', next_due_at: now - 601, poll_interval_s: null },
+        { account_id: 'saved', next_due_at: now + 600, poll_interval_s: 600 },
+        { account_id: 'selected', next_due_at: now - 601, poll_interval_s: 600 },
+      ]);
+    } finally { db.close(); }
+  });
+
+  it('does not overwrite a concurrent fetch plan while repairing other overdue rows', () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'qlb-overdue-cas-plan-')), 'qlb.db');
+    const provider = 'anthropic';
+    const entries: Record<string, DueCandidateSlot> = {
+      selected: { lastFetchAt: now - 1_300, nextDueAt: now - 601, pollIntervalS: 600 },
+      stale: { lastFetchAt: now - 1_200, nextDueAt: now - 601, pollIntervalS: 600 },
+      other: { lastFetchAt: now - 1_100, nextDueAt: now - 601, pollIntervalS: 600 },
+    };
+    const store = openStore(path);
+    try {
+      assert.equal(store.writeUsagePollPlans(provider, Object.fromEntries(Object.entries(entries).map(([accountId, entry]) => [accountId, {
+        nextDueAt: entry.nextDueAt!, pollIntervalS: entry.pollIntervalS!,
+      }]))), 3);
+      assert.equal(store.writeUsagePollPlans(provider, { stale: { nextDueAt: now + 900, pollIntervalS: 900 } }), 1);
+      assert.equal(repairOverduePlans({ provider, candidates: Object.keys(entries), entries, now, rng: () => 0.5, writer: store }), 'selected');
+    } finally { store.close(); }
+    const db = new DatabaseSync(path, { readOnly: true });
+    try {
+      assert.deepEqual((db.prepare('SELECT account_id, next_due_at, poll_interval_s FROM usage_polls WHERE provider = ? ORDER BY account_id').all(provider) as Array<Record<string, unknown>>).map((row) => ({ ...row })), [
+        { account_id: 'other', next_due_at: now + 600, poll_interval_s: 600 },
+        { account_id: 'selected', next_due_at: now - 601, poll_interval_s: 600 },
+        { account_id: 'stale', next_due_at: now + 900, poll_interval_s: 900 },
+      ]);
+    } finally { db.close(); }
+  });
+
+  it('does not repair a row placed on hold after its snapshot', () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'qlb-overdue-cas-hold-')), 'qlb.db');
+    const provider = 'anthropic';
+    const entries: Record<string, DueCandidateSlot> = {
+      selected: { lastFetchAt: now - 1_300, nextDueAt: now - 601, pollIntervalS: 600 },
+      held: { lastFetchAt: now - 1_200, nextDueAt: now - 601, pollIntervalS: 600 },
+    };
+    const store = openStore(path);
+    try {
+      store.writeUsagePollPlans(provider, Object.fromEntries(Object.entries(entries).map(([accountId, entry]) => [accountId, { nextDueAt: entry.nextDueAt!, pollIntervalS: entry.pollIntervalS! }])));
+      const db = new DatabaseSync(path);
+      try { db.prepare('UPDATE usage_polls SET held_until = ? WHERE provider = ? AND account_id = ?').run(now + 1, provider, 'held'); } finally { db.close(); }
+      assert.equal(repairOverduePlans({ provider, candidates: Object.keys(entries), entries, now, rng: () => 0.5, writer: store }), 'selected');
+    } finally { store.close(); }
+    const db = new DatabaseSync(path, { readOnly: true });
+    try { assert.equal((db.prepare('SELECT next_due_at FROM usage_polls WHERE account_id = ?').get('held') as { next_due_at: number }).next_due_at, now - 601); } finally { db.close(); }
+  });
+
+  it('does not repair rows backed off or marked token-dead after their snapshot', () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'qlb-overdue-cas-excluded-')), 'qlb.db');
+    const provider = 'anthropic';
+    const entries: Record<string, DueCandidateSlot> = {
+      selected: { lastFetchAt: now - 1_400, nextDueAt: now - 601, pollIntervalS: 600 },
+      backedOff: { lastFetchAt: now - 1_300, nextDueAt: now - 601, pollIntervalS: 600 },
+      dead: { lastFetchAt: now - 1_200, nextDueAt: now - 601, pollIntervalS: 600 },
+    };
+    const store = openStore(path);
+    try {
+      store.writeUsagePollPlans(provider, Object.fromEntries(Object.entries(entries).map(([accountId, entry]) => [accountId, { nextDueAt: entry.nextDueAt!, pollIntervalS: entry.pollIntervalS! }])));
+      const db = new DatabaseSync(path);
+      try {
+        db.prepare('UPDATE usage_polls SET backoff_until = ? WHERE provider = ? AND account_id = ?').run(now + 1, provider, 'backedOff');
+        db.prepare("UPDATE usage_polls SET last_status = 'token_dead' WHERE provider = ? AND account_id = ?").run(provider, 'dead');
+      } finally { db.close(); }
+      assert.equal(repairOverduePlans({ provider, candidates: Object.keys(entries), entries, now, rng: () => 0.5, writer: store }), 'selected');
+    } finally { store.close(); }
+    const db = new DatabaseSync(path, { readOnly: true });
+    try {
+      assert.deepEqual((db.prepare("SELECT account_id, next_due_at FROM usage_polls WHERE account_id IN ('backedOff', 'dead') ORDER BY account_id").all() as Array<Record<string, unknown>>).map((row) => ({ ...row })), [
+        { account_id: 'backedOff', next_due_at: now - 601 },
+        { account_id: 'dead', next_due_at: now - 601 },
+      ]);
+    } finally { db.close(); }
+  });
+
+  it('does not repair held or dead overdue plans', () => {
+    const plans: Array<{ accountId: string; nextDueAt: number; pollIntervalS: number }> = [];
+    const entries: Record<string, DueCandidateSlot> = {
+      held: { lastFetchAt: now - 1_500, nextDueAt: now - 601, pollIntervalS: 600, heldUntil: now + 1 },
+      dead: { lastFetchAt: now - 1_400, nextDueAt: now - 601, pollIntervalS: 600, deadToken: true },
+      selected: { lastFetchAt: now - 1_300, nextDueAt: now - 601, pollIntervalS: 600 },
+      repaired: { lastFetchAt: now - 1_200, nextDueAt: now - 601, pollIntervalS: 600 },
+    };
+    const chosen = repairOverduePlans({
+      provider: 'anthropic',
+      candidates: Object.keys(entries),
+      entries,
+      now,
+      rng: () => 0.5,
+      writer: { writeUsagePollPlans: (_provider, rows) => plans.push(...Object.entries(rows).map(([accountId, plan]) => ({ accountId, ...plan }))) },
+    });
+    assert.equal(chosen, 'selected');
+    assert.deepEqual(plans, [{
+      accountId: 'repaired',
+      nextDueAt: now + 600,
+      pollIntervalS: 600,
+      expectedNextDueAt: now - 601,
+      expectedPollIntervalS: 600,
+    }]);
+  });
+
+  it('matches the C-swap plan-after-fetch oracle for repaired jitter', () => {
+    const entries: Record<string, DueCandidateSlot> = {
+      selected: { lastFetchAt: now - 1_300, nextDueAt: now - 601, pollIntervalS: 600 },
+      low: { lastFetchAt: now - 1_200, nextDueAt: now - 601, pollIntervalS: 600 },
+      middle: { lastFetchAt: now - 1_100, nextDueAt: now - 601, pollIntervalS: 600 },
+      high: { lastFetchAt: now - 1_000, nextDueAt: now - 601, pollIntervalS: 600 },
+    };
+    const randomValues = [0, 0.5, 1];
+    let randomIndex = 0;
+    let actual: Record<string, { nextDueAt: number; pollIntervalS: number }> = {};
+    repairOverduePlans({
+      provider: 'anthropic',
+      candidates: Object.keys(entries),
+      entries,
+      now,
+      rng: () => randomValues[randomIndex++]!,
+      writer: { writeUsagePollPlans: (_provider, plans) => { actual = plans; return 0; } },
+    });
+    const expected = pythonPlans(randomValues.map((rng) => ({
+      prevIntervalS: 600,
+      prevUsage: usage(20),
+      newUsage: usage(20),
+      isActive: false,
+      threshold: 80,
+      models: [],
+      recent429: false,
+      now,
+      rng,
+    })));
+    assert.deepEqual(actual, {
+      low: { nextDueAt: expected[0]![0], pollIntervalS: expected[0]![1], expectedNextDueAt: now - 601, expectedPollIntervalS: 600 },
+      middle: { nextDueAt: expected[1]![0], pollIntervalS: expected[1]![1], expectedNextDueAt: now - 601, expectedPollIntervalS: 600 },
+      high: { nextDueAt: expected[2]![0], pollIntervalS: expected[2]![1], expectedNextDueAt: now - 601, expectedPollIntervalS: 600 },
+    });
   });
 
   it('does not let a repeatedly failing slot starve another due slot', () => {

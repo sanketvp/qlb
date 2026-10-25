@@ -22,11 +22,15 @@ Two optional `Adapter` fields (`src/types.ts`) tailor refresh behavior; absent m
 - **Confidence:** `authoritative` — this is the provider's own gauge, fetched fresh at decision time.
 - **Caveats:** an expired or invalid access token surfaces as `auth expired or invalid — needs re-login` on that account only. Phase-0 adapters never refresh tokens themselves; expired accounts need the native harness to log in once.
 
+### Claude login expiry (L41)
+
+`loginExpiryField()` names the field used by `loginExpiresAtIso`: `refreshTokenExpiresAt`, an epoch-millisecond timestamp rendered as UTC ISO-8601. **L41: verified for a claude-swap/QLB refresh only** — its in-place OAuth update never writes this field (`test/oracle/claude-swap-v0.28.0/src/claude_swap/oauth.py:188-196`). No upstream test exercises the field across a refresh: the refresh fixture omits it (`test/oracle/claude-swap-v0.28.0/tests/test_oauth.py:424-434`), so the refresh test only asserts access- and refresh-token rotation (`test_oauth.py:474-492`). Claude Code's native refresh is not established by the oracle and remains to be confirmed from the X1/X2 field recordings before `login-expiry-jump` rows are treated as hard. The login-expiry test identifies and renders `refreshTokenExpiresAt` (`test_oauth.py:1507-1524`).
+
 ## OpenAI Codex (`openai-codex`)
 
 - **Credential source:** Codex CLI's own `~/.codex/auth.json` (`tokens.access_token`; account id and label parsed from the `id_token` JWT claims). Configurable via `QLB_CODEX_AUTH_JSON_PATH`.
-- **Usage signal:** response headers only. Codex exposes no standalone usage GET; `x-codex-primary-used-percent` (weekly), `x-codex-secondary-used-percent` (5-hour), and related reset/pool headers arrive on real requests to the Codex backend. The adapter itself therefore reports an authenticated account with **no buckets** — numbers populate when real traffic flows through `qlb proxy` (whose `parseUsageHeaders` writes header-derived readings into the same snapshot cache).
-- **Buckets:** `primary` (weekly), `secondary` (5-hour).
+- **Usage signal:** response headers only. Codex exposes no standalone usage GET; `x-codex-primary-used-percent` (5-hour), `x-codex-secondary-used-percent` (weekly), and related reset/pool headers arrive on real requests to the Codex backend. The adapter itself therefore reports an authenticated account with **no buckets** — numbers populate when real traffic flows through `qlb proxy` (whose `parseUsageHeaders` writes header-derived readings into the same snapshot cache).
+- **Buckets:** `primary` (5-hour), `secondary` (weekly).
 - **Confidence:** `authoritative` once a header-derived reading exists; `unknown` before that (which makes the account a cold-start candidate only, never excluded by a missing number).
 - **Caveats:** because every reading requires a real request, Codex data is exactly as fresh as the last request that went through. There is no free refresh, and QLB does not send probe requests on its own in the CLI path.
 
@@ -48,7 +52,7 @@ Two optional `Adapter` fields (`src/types.ts`) tailor refresh behavior; absent m
 
 ## OpenRouter (`openrouter`)
 
-- **Credential source:** a static API key in the platform credential store (service `pi-openrouter`, configurable via `QLB_OPENROUTER_KEYCHAIN_SERVICE`). On macOS this is a Keychain item read via `security find-generic-password`; on Linux, `secret-tool` or the encrypted-file fallback; on Windows, a DPAPI blob. QLB never writes or rotates that native item.
+- **Credential source:** a static API key in the platform credential store at the fixed service `pi-openrouter`. QLB refuses overrides so it never reads an arbitrary native credential service. On macOS this is a Keychain item read via `security find-generic-password`; on Linux, `secret-tool` or the encrypted-file fallback; on Windows, a DPAPI blob. QLB never writes or rotates that native item.
 - **Usage signal:** real GET — `https://openrouter.ai/api/v1/credits` with `Authorization: Bearer <key>`.
 - **Buckets:** a single `credits` bucket: `total_usage` / `total_credits` as used percentage, with absolute `used`/`limit`/`remaining` attached.
 - **Confidence:** `authoritative` for what it measures — but the reading carries an explicit `detail` note: it is an **account-wide credit balance, not a rolling rate-limit window**. There is no reset time (`resets` shows `-`), and the bucket is classified as a balance rather than a window for scoring purposes.

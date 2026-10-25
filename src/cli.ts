@@ -3,9 +3,14 @@ import { existsSync, mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import * as net from 'node:net';
 import { dirname, join, resolve } from 'node:path';
 import { adapters } from './adapters';
+import { assertTestHomeIsIsolated } from './bootstrap';
+import { assertAdmitted, type LifecycleOperation } from './lifecycle';
 import { createDefaultCodexGateDeps, runCodexGate } from './codex-gate';
 import { config, resolveConfig, stripConfigArgs } from './config';
-import { discoverCommands, resolveCommand } from './registry';
+import { qlbHomeDir } from './home';
+import { discoverCommands, resolveCommand, type CommandContext, type CommandDefinition } from './registry';
+import { runCodexProbeClaims } from './commands/codex-probe-claims';
+import { redactError } from './redact';
 import { doctorQlb, initializeQlb, listCheckNames, type DoctorReport, type InitReport } from './diagnostics';
 import { platformKeychain } from './keychain';
 import { createOwnedCredentialSource } from './credentials';
@@ -92,6 +97,7 @@ const USAGE = `Usage:
   qlb policy set --harness <h> --virtual-model <name> --real-model <id> --effort <lvl> [--fallback m1,m2] [--session-mode header|anon] [--db <path>] [--json]
   qlb policy list [--harness <h>] [--db <path>] [--json]
   qlb codex gate [--json] [--db <path>]
+  qlb codex probe-claims --json
   qlb proxy [--info-path <path>] [--idle-ms <n>] [--no-idle] [--port <n>] [--started-by wrapper|cli] [--db <path>]
   qlb consume enable|disable|status --provider anthropic [--json] [--db <path>]
   qlb migrate stage    [--provider anthropic|xai|kimi-coding|openai-codex|openrouter] --pool-file <path> --owner-file <path> [--auth-json <path>] [--db <path>] [--target-dir <path>] [--confirm-real-cutover]
@@ -228,6 +234,10 @@ type PolicyListOpts = {
   harness?: string;
 };
 type PolicyOpts = PolicySetOpts | PolicyListOpts;
+type CodexProbeClaimsOpts = {
+  cmd: 'codex-probe-claims';
+  args: string[];
+};
 type GateOpts = {
   cmd: 'gate';
   target: 'codex';
@@ -283,7 +293,7 @@ type AuditOpts = {
   limit: number;
   db?: string;
 };
-type Opts = InitOpts | DoctorOpts | RefreshOpts | WhyOpts | StatusOpts | SetupOpts | ResolveOpts | MigrateOpts | PolicyOpts | GateOpts | ProxyOpts | ConsumeOpts | RetireOpts | NativeResyncOpts | OverrideOpts | AccountsOpts | AuditOpts;
+type Opts = InitOpts | DoctorOpts | RefreshOpts | WhyOpts | StatusOpts | SetupOpts | ResolveOpts | MigrateOpts | PolicyOpts | CodexProbeClaimsOpts | GateOpts | ProxyOpts | ConsumeOpts | RetireOpts | NativeResyncOpts | OverrideOpts | AccountsOpts | AuditOpts;
 
 const MIGRATE_SUBS: readonly MigrateSub[] = [
   'stage',
@@ -866,6 +876,9 @@ export function parseArgs(argv: string[]): Opts {
   }
   if (raw[0] === 'policy') {
     return parsePolicyArgs(raw.slice(1));
+  }
+  if (raw[0] === 'codex-probe-claims') {
+    return { cmd: 'codex-probe-claims', args: raw.slice(1) };
   }
   if (raw[0] === 'gate' && raw[1] === '--codex') {
     return parseGateArgs(raw.slice(2));
@@ -1713,11 +1726,111 @@ async function runNativeResync(opts: NativeResyncOpts): Promise<number> {
   });
 }
 
-export function prepareCommandArgv(argv: string[]): string[] {
+export function prepareCommandArgv(
+  argv: string[],
+  commands: CommandDefinition[] = discoverCommands(),
+): string[] {
   const stripped = stripConfigArgs(argv);
-  const raw = stripped.slice(2);
-  const match = resolveCommand(raw);
-  return match ? [...stripped.slice(0, 2), ...match.command.run(match.args)] : stripped;
+  const match = resolveCommand(stripped.slice(2), commands);
+  return match?.command.run
+    ? [...stripped.slice(0, 2), ...match.command.run(match.args)]
+    : stripped;
+}
+
+export function listCommandNames(commands: CommandDefinition[] = discoverCommands()): string[] {
+  return commands.map((command) => command.name);
+}
+
+const commandContextSecrets = new WeakMap<CommandContext, Set<string>>();
+
+export function createCommandContext(): CommandContext {
+  const secrets = new Set<string>();
+  const context: CommandContext = {
+    stdout: (message) => console.log(message),
+    stderr: (message) => console.error(message),
+    env: process.env,
+    config,
+    loadConfig: resolveConfig,
+    home: qlbHomeDir(),
+    registerSecret: (value) => {
+      if (value) secrets.add(value);
+    },
+  };
+  commandContextSecrets.set(context, secrets);
+  return context;
+}
+
+function knownCommandSecrets(context: CommandContext): string[] {
+  const secrets = new Set(commandContextSecrets.get(context));
+  for (const [key, value] of Object.entries(context.env)) {
+    if (/TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|API_KEY|APIKEY|PRIVATE_KEY|CREDENTIAL|COOKIE|AUTH/i.test(key) && value && value.length >= 8) {
+      secrets.add(value);
+    }
+  }
+  return [...secrets];
+}
+
+/** Runs an executing registry fragment, or returns null for a legacy fragment. */
+export async function dispatchCommand(
+  argv: string[],
+  commands: CommandDefinition[] = discoverCommands(),
+  context: CommandContext = createCommandContext(),
+): Promise<number | null> {
+  const match = resolveCommand(stripConfigArgs(argv).slice(2), commands);
+  return match?.command.execute
+    ? await match.command.execute(match.args, context)
+    : null;
+}
+
+function lifecycleAdmissionCode(dbPath: string, operation: LifecycleOperation): string | null {
+  const store = openStore(dbPath);
+  try {
+    const result = assertAdmitted(store, operation);
+    return result.ok ? null : result.code ?? 'lifecycle-refused';
+  } finally { store.close(); }
+}
+
+// The legacy gate path must select its lifecycle store before opening it, or
+// --db would both admit against and create the wrong database.
+export function gateLifecycleAdmissionCode(gateDbPath: string | undefined, defaultDbPath: string): string | null {
+  return lifecycleAdmissionCode(gateDbPath ?? defaultDbPath, 'gate');
+}
+
+function lifecycleOperationFor(command: string, args: string[]): LifecycleOperation | null {
+  if (command === 'doctor') return 'doctor';
+  if (command === 'status') return 'status';
+  if (command === 'gate') return 'gate';
+  if (command === 'cutover') {
+    if (args[0] === 'begin') return args.includes('--dry-run') ? 'cutover-begin:dry-run' : 'cutover-begin';
+    if (args[0] === 'commit') return 'cutover-commit';
+    if (args[0] === 'abort') return 'cutover-abort';
+  }
+  if (command === 'lifecycle') {
+    if (args[0] === 'drill-done') return 'lifecycle-drill-done';
+    if (args[0] === 'close') return 'lifecycle-close';
+    if (args[0] === 'status') return 'status';
+  }
+  return null;
+}
+
+export async function runExecutingCommand(
+  match: { command: CommandDefinition; args: string[] },
+  context: CommandContext,
+): Promise<number> {
+  try {
+    const operation = lifecycleOperationFor(match.command.name, match.args);
+    if (operation != null) {
+      const refusal = lifecycleAdmissionCode(context.config.dbPath, operation);
+      if (refusal != null) {
+        context.stderr(`qlb ${match.command.name}: refused: ${refusal}`);
+        return 3;
+      }
+    }
+    return await match.command.execute!(match.args, context);
+  } catch (err) {
+    context.stderr(`qlb ${match.command.name}: ${redactError(err, knownCommandSecrets(context))}`);
+    return 1;
+  }
 }
 
 function isExactListRequest(args: string[], flag: string): boolean {
@@ -1725,17 +1838,24 @@ function isExactListRequest(args: string[], flag: string): boolean {
 }
 
 async function main(): Promise<void> {
-  const argv = prepareCommandArgv(process.argv);
-  const raw = argv.slice(2);
+  assertTestHomeIsIsolated();
+  const commands = discoverCommands();
+  const stripped = stripConfigArgs(process.argv);
+  const raw = stripped.slice(2);
   if (isExactListRequest(raw, '--list-commands')) {
-    console.log(JSON.stringify(discoverCommands().map((command) => command.name)));
+    console.log(JSON.stringify(listCommandNames(commands)));
     return;
   }
   if (raw[0] === 'doctor' && isExactListRequest(raw.slice(1), '--list-checks')) {
     console.log(JSON.stringify(listCheckNames()));
     return;
   }
-  const opts = parseArgs(argv);
+  const command = resolveCommand(raw, commands);
+  if (command?.command.execute) {
+    const context = createCommandContext();
+    process.exit(await runExecutingCommand(command, context));
+  }
+  const opts = parseArgs(prepareCommandArgv(process.argv, commands));
   if (opts.cmd === 'init') {
     const report = initializeQlb(config);
     printInit(report, opts.json);
@@ -1864,7 +1984,15 @@ async function main(): Promise<void> {
       process.exit(1);
     }
   }
+  if (opts.cmd === 'codex-probe-claims') {
+    process.exit(await runCodexProbeClaims(opts.args));
+  }
   if (opts.cmd === 'gate') {
+    const refusal = gateLifecycleAdmissionCode(opts.db, config.dbPath);
+    if (refusal != null) {
+      console.error(`qlb gate: refused: ${refusal}`);
+      process.exit(3);
+    }
     try {
       const code = await runGate(opts);
       process.exit(code);
@@ -1957,5 +2085,9 @@ async function main(): Promise<void> {
 }
 
 if (require.main === module) {
-  void main();
+  void main().catch((err: unknown) => {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`qlb: ${message}`);
+    process.exitCode = 2;
+  });
 }
