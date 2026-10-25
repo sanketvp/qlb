@@ -1761,10 +1761,10 @@ function knownCommandSecrets(context: CommandContext): string[] {
   const secrets = new Set(context.knownSecrets());
   for (const [key, value] of Object.entries(context.env)) {
     if (
-      /(^|_)(TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|API_KEY|APIKEY|PRIVATE_KEY|CREDENTIAL|COOKIE|AUTH)(_|$)/i.test(key)
+      /TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|API_KEY|APIKEY|PRIVATE_KEY|CREDENTIAL|COOKIE|AUTH/i.test(key)
       && value
       && value.length >= 8
-      && !/^(true|false|\d+)$/i.test(value)
+      && !/^(true|false|yes|no|on|off|\d+)$/i.test(value)
     ) {
       secrets.add(value);
     }

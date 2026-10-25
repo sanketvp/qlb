@@ -159,16 +159,28 @@ describe('registries', () => {
     assert.match(output[0], new RegExp(nonCredentialValue));
   });
 
-  it('preserves structured stdout for short, numeric, and non-credential environment values', async () => {
+  it('preserves structured stdout for benign short, numeric, and boolean-like environment values', async () => {
     const stdout: string[] = [];
     const stderr: string[] = [];
     const longToken = 'opaque-github-token-abc123XYZ';
-    const message = JSON.stringify({ dead: false, expiresAt: 1761320001234, count: 10 });
+    const message = JSON.stringify({
+      author: 'Ada',
+      booleans: ['true', 'false', 'yes', 'no', 'on', 'off'],
+      dead: false,
+      expiresAt: 1761320001234,
+      count: 10,
+      ttl: 3600,
+    });
     const context = createCommandContext();
     context.env = {
-      CLAUDE_CODE_MAX_OUTPUT_TOKENS: '32000',
-      TOKENIZERS_PARALLELISM: 'false',
-      QLB_AUTH_DEBUG: '1',
+      GIT_AUTHOR_NAME: 'Ada',
+      AUTH_TRUE: 'true',
+      AUTH_FALSE: 'false',
+      AUTH_YES: 'yes',
+      AUTH_NO: 'no',
+      AUTH_ON: 'on',
+      AUTH_OFF: 'off',
+      TOKEN_TTL: '3600',
       GITHUB_TOKEN: longToken,
     };
     context.stdout = (line: string) => stdout.push(line);
@@ -189,6 +201,68 @@ describe('registries', () => {
     assert.doesNotThrow(() => JSON.parse(stdout[0]));
     assert.match(stderr[0], /\[redacted\]/);
     assert.doesNotMatch(stderr[0], new RegExp(longToken));
+  });
+
+  it('redacts substring-matched credential environment values on stdout, stderr, and JSON', async () => {
+    const values = {
+      pgpassword: 'fixture-pgpassword-abc123',
+      npmAuthToken: 'fixture-npm-authtoken-abc123',
+      authorization: 'Basic dXNlcjpwYXNzd29yZA==',
+      httpAuthorization: 'Basic Zml4dHVyZTpwdw==',
+    };
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const context = createCommandContext();
+    context.env = {
+      PGPASSWORD: values.pgpassword,
+      NPM_CONFIG__AUTHTOKEN: values.npmAuthToken,
+      AUTHORIZATION: values.authorization,
+      HTTP_AUTHORIZATION: values.httpAuthorization,
+    };
+    context.stdout = (line: string) => stdout.push(line);
+    context.stderr = (line: string) => stderr.push(line);
+
+    assert.equal(await runExecutingCommand({
+      command: {
+        name: 'fixture',
+        execute: (_args, ctx) => {
+          ctx.stdout(`values: ${Object.values(values).join(', ')}`);
+          ctx.stdout(JSON.stringify(values));
+          ctx.stderr(`values: ${Object.values(values).join(', ')}`);
+          return 0;
+        },
+      },
+      args: [],
+    }, context), 0);
+
+    for (const value of Object.values(values)) {
+      assert.ok(stdout.every((line) => !line.includes(value)));
+      assert.ok(stderr.every((line) => !line.includes(value)));
+    }
+    assert.equal(stdout[0], `values: ${Object.values(values).map(() => '[redacted]').join(', ')}`);
+    assert.deepEqual(JSON.parse(stdout[1]), Object.fromEntries(Object.keys(values).map((key) => [key, '[redacted]'])));
+    assert.equal(stderr[0], stdout[0]);
+  });
+
+  it('keeps the redaction marker intact for registered marker-substring secrets', async () => {
+    const secret = 'fixture-runtime-secret-abc123';
+    const stdout: string[] = [];
+    const context = { ...createCommandContext(), env: {}, stdout: (line: string) => stdout.push(line) };
+
+    assert.equal(await runExecutingCommand({
+      command: {
+        name: 'fixture',
+        execute: (_args, ctx) => {
+          ctx.registerSecret('red');
+          ctx.registerSecret(secret);
+          ctx.stdout(JSON.stringify({ secret, status: 'red' }));
+          return 0;
+        },
+      },
+      args: [],
+    }, context), 0);
+    assert.equal(stdout[0], '{"secret":"[redacted]","status":"[redacted]"}');
+    assert.doesNotThrow(() => JSON.parse(stdout[0]));
   });
 
   it('redacts executing-command output and errors through dispatchCommand', async () => {
