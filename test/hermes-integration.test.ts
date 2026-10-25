@@ -50,6 +50,7 @@ describe('hermes integration checks', () => {
           ...process.env,
           HOME: home,
           USERPROFILE: home,
+          QLB_HOME: home,
           HERMES_HOME: hermesHome,
           QLB_HERMES_PLUGIN_STATUS: join(home, '.qlb', 'hermes-plugin.json'),
           QLB_BIN: join(home, qlbBinName),
