@@ -654,4 +654,37 @@ describe('store v5 schema (AC38)', () => {
     reopened.close();
     assert.equal(readdirSync(join(dir, 'backups')).filter((file) => file.endsWith('.sqlite')).length, backups.length);
   });
+
+  it('scrubs existing relogin rows once without a schema-version change', () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'qlb-v5-relogin-scrub-')), 'qlb.db');
+    const initial = openStore(path);
+    initial.close();
+    const seeded = new DatabaseSync(path);
+    seeded.prepare("DELETE FROM config WHERE key = 'relogin.scrubbedAt'").run();
+    seeded.prepare('INSERT INTO relogin_events (ts, provider, kind, detail, evidence) VALUES (?, ?, ?, ?, ?)').run(
+      1, 'anthropic', 'external-login', 'client_secret=abc123', 'junk',
+    );
+    seeded.close();
+
+    const scrubbed = openStore(path);
+    scrubbed.close();
+    const first = dbAt(path);
+    let row: { detail: string | null; evidence: string | null };
+    let scrubbedAt: string | null;
+    try {
+      row = first.prepare('SELECT detail, evidence FROM relogin_events').get() as { detail: string | null; evidence: string | null };
+      scrubbedAt = (first.prepare("SELECT value FROM config WHERE key = 'relogin.scrubbedAt'").get() as { value: string } | undefined)?.value ?? null;
+    } finally { first.close(); }
+    assert.match(row.detail ?? '', /^sha256:[0-9a-f]{16}$/);
+    assert.equal(row.evidence, null);
+    assert.ok(scrubbedAt);
+
+    const reopened = openStore(path);
+    reopened.close();
+    const second = dbAt(path);
+    try {
+      assert.deepEqual(second.prepare('SELECT detail, evidence FROM relogin_events').get(), row);
+      assert.equal((second.prepare("SELECT value FROM config WHERE key = 'relogin.scrubbedAt'").get() as { value: string }).value, scrubbedAt);
+    } finally { second.close(); }
+  });
 });

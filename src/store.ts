@@ -6,6 +6,7 @@
 import { chmodSync, existsSync, mkdirSync, rmSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { assertStoredReloginFields, isReloginEvidenceClass, reloginDetailFingerprint, reloginDetailValue } from './relogin-fields';
 import { dirname, join } from 'node:path';
 import { backup, DatabaseSync, type StatementSync } from 'node:sqlite';
 import { inspectAccountSafety, safetyRefusalMessage } from './accounts-prune';
@@ -280,6 +281,20 @@ export function openDecisionsReader(path: string): DecisionsReader | null {
       // preserve the original error
     }
     throwIfWalSidecar(err);
+  }
+}
+
+/** Opens a short-lived store connection with the same lock contract as Store. */
+export function openStoreConnection(dbPath: string, readOnly = false): DatabaseSync {
+  const db = new DatabaseSync(dbPath, { readOnly });
+  try {
+    // Match Store: install the busy handler before a lock-taking WAL request.
+    db.exec('PRAGMA busy_timeout = 5000');
+    if (!readOnly && dbPath !== ':memory:') db.exec('PRAGMA journal_mode = WAL');
+    return db;
+  } catch (error) {
+    try { db.close(); } catch { /* preserve the open error */ }
+    throw error;
   }
 }
 
@@ -879,12 +894,8 @@ export class Store {
       }
     }
 
-    this.db = new DatabaseSync(dbPath);
+    this.db = openStoreConnection(dbPath);
     try {
-      // Install the busy handler before the first lock-taking SQL operation
-      // after open. Keep this before WAL/schema initialization.
-      this.db.exec('PRAGMA busy_timeout = 5000');
-      if (dbPath !== ':memory:') this.db.exec('PRAGMA journal_mode = WAL');
       this.db.exec('PRAGMA synchronous = NORMAL');
       // migrateIfNeeded takes the write lock and, when needed, backs up before
       // any constructor schema DDL is allowed to run.
@@ -1115,39 +1126,60 @@ export class Store {
     }
     this.db.exec('BEGIN IMMEDIATE');
     try {
-      if (!migrationNeeded(this.db)) {
-        this.db.exec('COMMIT');
-        return;
+      if (migrationNeeded(this.db)) {
+        // This is deliberately inside the migration lock, after the backup.
+        // It also lets a brand-new database migrate without constructor DDL.
+        const verifiedBackupPath = this.dbPath !== ':memory:'
+          ? backupBeforeMigrateSync(this.dbPath, this.db)
+          : ':memory:';
+        this.createCoreSchema();
+        if (version < 2) {
+          if (!hasColumn(this.db, 'accounts', 'grant_generation')) this.db.exec('ALTER TABLE accounts ADD COLUMN grant_generation INTEGER DEFAULT 0');
+          this.db.exec('CREATE TABLE IF NOT EXISTS leases (name TEXT PRIMARY KEY, holder_pid INTEGER, holder_id TEXT, until INTEGER, generation INTEGER)');
+        }
+        if (version < 3) {
+          this.db.exec('CREATE TABLE IF NOT EXISTS migrations (store TEXT PRIMARY KEY, state TEXT NOT NULL, updated_at INTEGER NOT NULL, detail_json TEXT)');
+        }
+        if (version < 4) {
+          this.db.exec('CREATE TABLE IF NOT EXISTS policies (harness TEXT, virtual_model TEXT, real_model TEXT, effort TEXT, fallback_json TEXT, session_mode TEXT, created_at INTEGER, PRIMARY KEY (harness, virtual_model))');
+        }
+        ensureDecisionColumnsOn(this.db);
+        this.migrateV5Schema();
+        repairMissingV5Columns(this.db, verifiedBackupPath);
+        if (!lifecycleOneOpenIndexMatches(this.db)) {
+          this.db.exec('DROP INDEX IF EXISTS lifecycle_one_open');
+          this.db.exec(`${LIFECYCLE_ONE_OPEN_INDEX_SQL};`);
+        }
+        this.db.exec('PRAGMA user_version = 5');
       }
-      // This is deliberately inside the migration lock, after the backup.
-      // It also lets a brand-new database migrate without constructor DDL.
-      const verifiedBackupPath = this.dbPath !== ':memory:'
-        ? backupBeforeMigrateSync(this.dbPath, this.db)
-        : ':memory:';
-      this.createCoreSchema();
-      if (version < 2) {
-        if (!hasColumn(this.db, 'accounts', 'grant_generation')) this.db.exec('ALTER TABLE accounts ADD COLUMN grant_generation INTEGER DEFAULT 0');
-        this.db.exec('CREATE TABLE IF NOT EXISTS leases (name TEXT PRIMARY KEY, holder_pid INTEGER, holder_id TEXT, until INTEGER, generation INTEGER)');
-      }
-      if (version < 3) {
-        this.db.exec('CREATE TABLE IF NOT EXISTS migrations (store TEXT PRIMARY KEY, state TEXT NOT NULL, updated_at INTEGER NOT NULL, detail_json TEXT)');
-      }
-      if (version < 4) {
-        this.db.exec('CREATE TABLE IF NOT EXISTS policies (harness TEXT, virtual_model TEXT, real_model TEXT, effort TEXT, fallback_json TEXT, session_mode TEXT, created_at INTEGER, PRIMARY KEY (harness, virtual_model))');
-      }
-      ensureDecisionColumnsOn(this.db);
-      this.migrateV5Schema();
-      repairMissingV5Columns(this.db, verifiedBackupPath);
-      if (!lifecycleOneOpenIndexMatches(this.db)) {
-        this.db.exec('DROP INDEX IF EXISTS lifecycle_one_open');
-        this.db.exec(`${LIFECYCLE_ONE_OPEN_INDEX_SQL};`);
-      }
-      this.db.exec('PRAGMA user_version = 5');
+      this.scrubReloginEvents();
       this.db.exec('COMMIT');
     } catch (err) {
       try { this.db.exec('ROLLBACK'); } catch { /* preserve original error */ }
       throw err;
     }
+  }
+
+  /** One-time D-B23 scrub of rows predating the relogin field boundary. */
+  private scrubReloginEvents(): void {
+    const alreadyScrubbed = this.db.prepare("SELECT 1 FROM config WHERE key = 'relogin.scrubbedAt'").get();
+    if (alreadyScrubbed) return;
+    const rows = this.db.prepare('SELECT id, detail, evidence FROM relogin_events').all() as Array<{
+      id: number;
+      detail: unknown;
+      evidence: unknown;
+    }>;
+    const update = this.db.prepare('UPDATE relogin_events SET detail = ?, evidence = ? WHERE id = ?');
+    for (const row of rows) {
+      const detail = row.detail == null
+        ? null
+        : typeof row.detail === 'string'
+          ? reloginDetailValue(row.detail)
+          : reloginDetailFingerprint(String(row.detail));
+      const evidence = isReloginEvidenceClass(row.evidence) ? row.evidence : null;
+      if (detail !== row.detail || evidence !== row.evidence) update.run(detail, evidence, row.id);
+    }
+    this.db.prepare("INSERT INTO config (key, value) VALUES ('relogin.scrubbedAt', ?)").run(String(Date.now()));
   }
 
   private createCoreSchema(): void {
@@ -1862,9 +1894,12 @@ export class Store {
   }
 
   recordRelogin(row: { ts?: number; provider: string; accountId?: string | null; kind: string; detail?: string | null; evidence?: string | null; userDeniedAt?: number | null }): number {
+    const detail = row.detail ?? null;
+    const evidence = row.evidence ?? null;
+    assertStoredReloginFields(detail, evidence);
     const result = this.db.prepare('INSERT INTO relogin_events (ts, provider, account_id, kind, detail, evidence, user_denied_at) VALUES (?, ?, ?, ?, ?, ?, ?)').run(
       row.ts ?? Date.now(), row.provider, row.accountId ?? null, row.kind,
-      row.detail == null ? null : redactSecrets(row.detail, []), row.evidence == null ? null : redactSecrets(row.evidence, []), row.userDeniedAt ?? null,
+      detail, evidence, row.userDeniedAt ?? null,
     );
     return Number(result.lastInsertRowid);
   }

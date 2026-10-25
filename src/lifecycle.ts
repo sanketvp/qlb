@@ -69,7 +69,7 @@ export const PHASE_RULES: Record<LifecycleState, Set<LifecycleOperation>> = {
   aborted: rules('doctor', 'status', 'report-cutover', 'undo-cswap:resume', 'pi-rollback', 'lifecycle-close'),
 };
 
-function withDb<T>(store: Store, fn: (db: DatabaseSync) => T): T {
+function withDb<T>(store: Pick<Store, 'dbPath'>, fn: (db: DatabaseSync) => T): T {
   // A separate connection cannot see another connection's `:memory:` database.
   // Store intentionally owns its connection; use it only for this test-friendly
   // special case, while file-backed stores keep the normal short-lived handle.
@@ -105,7 +105,7 @@ function stringOrNull(value: unknown): string | null {
   return typeof value === 'string' ? value : null;
 }
 
-export function phase(store: Store): LifecycleRow {
+export function phase(store: Pick<Store, 'dbPath'>): LifecycleRow {
   return withDb(store, (db) => {
     const row = db.prepare(`SELECT * FROM lifecycle WHERE state IN (${OPEN_STATES.map(() => '?').join(', ')})
       ORDER BY id DESC LIMIT 1`).get(...OPEN_STATES) as Record<string, unknown> | undefined;
@@ -289,7 +289,7 @@ export function closeLifecycle(store: Store, id: number, note: string, now: numb
   return { ok: true, row: phase(store) };
 }
 
-export function lifecycleCheck(store: Store, kind: 'window' | 'drill', now: number = Date.now()): { level: 'PASS' | 'WARN' | 'FAIL'; message: string } {
+export function lifecycleCheck(store: Pick<Store, 'dbPath'>, kind: 'window' | 'drill', now: number = Date.now()): { level: 'PASS' | 'WARN' | 'FAIL'; message: string } {
   const current = phase(store);
   if (current.state !== 'cutover') return { level: 'PASS', message: `not applicable in ${current.state}` };
   if (kind === 'window') {
