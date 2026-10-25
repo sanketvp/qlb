@@ -63,6 +63,26 @@ export function redactSecrets(text: string, secrets: readonly string[]): string 
   return out;
 }
 
+/** Redacts credentials in diagnostic key/value text that is not valid JSON. */
+export function redactKeyValueText(text: string, secrets: readonly string[]): string {
+  let out = redactSecrets(text, secrets);
+  // Quoted JSON-like pairs are common in truncated diagnostic payloads.
+  out = out.replace(/((["'])([A-Za-z][A-Za-z0-9_-]*)\2\s*:\s*)(["'])((?:\\.|(?!\4)[^\\\r\n])*)\4/g,
+    (match, prefix: string, _keyQuote: string, key: string, valueQuote: string) => (
+      isSensitiveKey(key) ? `${prefix}${valueQuote}${REDACTED}${valueQuote}` : match
+    ));
+  // Authorization values commonly contain a scheme and spaces, so redact the
+  // whole header remainder rather than only its first word.
+  out = out.replace(/(^|[^A-Za-z0-9_-])(authorization)(\s*(?:=|:)\s*)([^\r\n]*)/gi,
+    (match, boundary: string, key: string, separator: string) => (
+      isSensitiveKey(key) ? `${boundary}${key}${separator}${REDACTED}` : match
+    ));
+  return out.replace(/(^|[^A-Za-z0-9_-])([A-Za-z][A-Za-z0-9_-]*)(\s*(?:=|:)\s*)([^\s,;\r\n]+)/g,
+    (match, boundary: string, key: string, separator: string) => (
+      isSensitiveKey(key) ? `${boundary}${key}${separator}${REDACTED}` : match
+    ));
+}
+
 type RedactedValue = unknown | undefined;
 
 interface RedactOptions {

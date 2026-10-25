@@ -492,9 +492,9 @@ describe('store v5 schema (AC38)', () => {
       CREATE TABLE leases (name TEXT PRIMARY KEY, holder_pid INTEGER, holder_id TEXT, until INTEGER, generation INTEGER);
       CREATE TABLE migrations (store TEXT PRIMARY KEY, state TEXT NOT NULL, updated_at INTEGER NOT NULL, detail_json TEXT);
       CREATE TABLE policies (harness TEXT, virtual_model TEXT, real_model TEXT, effort TEXT, fallback_json TEXT, session_mode TEXT, created_at INTEGER, PRIMARY KEY (harness, virtual_model));
-      CREATE TABLE usage_polls (account_id TEXT PRIMARY KEY, last_fetch_at INTEGER, last_attempt_at INTEGER, next_due_at INTEGER, last_status TEXT, consecutive_failures INTEGER NOT NULL DEFAULT 0, backoff_until INTEGER, last_429_at INTEGER, held_until INTEGER);
+      CREATE TABLE usage_polls (account_id TEXT PRIMARY KEY, last_fetch_at INTEGER, last_attempt_at INTEGER, next_due_at INTEGER, poll_interval_s REAL, last_status TEXT, consecutive_failures INTEGER NOT NULL DEFAULT 0, backoff_until INTEGER, last_429_at INTEGER, held_until INTEGER);
       INSERT INTO accounts VALUES ('a', 'anthropic', 'a', 'active', 1, 0);
-      INSERT INTO usage_polls (account_id, last_fetch_at) VALUES ('a', 9);
+      INSERT INTO usage_polls (account_id, last_fetch_at, poll_interval_s) VALUES ('a', 9, 42.5);
       PRAGMA user_version = 5`);
     db.close();
     const store = openStore(path);
@@ -502,10 +502,32 @@ describe('store v5 schema (AC38)', () => {
     const check = dbAt(path);
     try {
       assert.deepEqual(columns(check, 'usage_polls').slice(0, 2), ['provider', 'account_id']);
-      const row = check.prepare('SELECT provider, account_id, last_fetch_at FROM usage_polls').get() as { provider: string; account_id: string; last_fetch_at: number };
+      const row = check.prepare('SELECT provider, account_id, last_fetch_at, poll_interval_s FROM usage_polls').get() as { provider: string; account_id: string; last_fetch_at: number; poll_interval_s: number };
       assert.equal(row.provider, 'anthropic');
       assert.equal(row.account_id, 'a');
       assert.equal(row.last_fetch_at, 9);
+      assert.equal(row.poll_interval_s, 42.5);
+    } finally { check.close(); }
+  });
+
+  it('refuses a provider-less usage_polls table with unknown columns without changing it', () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'qlb-v5-usage-polls-unknown-')), 'qlb.db');
+    const db = new DatabaseSync(path);
+    db.exec(`CREATE TABLE accounts (id TEXT PRIMARY KEY, provider TEXT, label TEXT, status TEXT, created_at INTEGER, grant_generation INTEGER DEFAULT 0);
+      CREATE TABLE usage_polls (account_id TEXT PRIMARY KEY, last_fetch_at INTEGER, unexpected TEXT);
+      INSERT INTO accounts VALUES ('a', 'anthropic', 'a', 'active', 1, 0);
+      INSERT INTO usage_polls VALUES ('a', 9, 'keep');
+      PRAGMA user_version = 5`);
+    db.close();
+
+    assert.throws(
+      () => openStore(path),
+      /cannot correct pre-release v5 usage_polls: column unexpected is not in the canonical definition and cannot be reproduced; verified backup:/,
+    );
+    const check = dbAt(path);
+    try {
+      assert.deepEqual(columns(check, 'usage_polls'), ['account_id', 'last_fetch_at', 'unexpected']);
+      assert.equal((check.prepare('SELECT unexpected FROM usage_polls').get() as { unexpected: string }).unexpected, 'keep');
     } finally { check.close(); }
   });
 
@@ -613,6 +635,36 @@ describe('store v5 schema (AC38)', () => {
     } finally { db.close(); }
   });
 
+  it('redacts key-value secrets in non-JSON switch text and preserves safe JSON audit bytes', () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'qlb-v5-switch-text-redact-')), 'qlb.db');
+    const store = openStore(path);
+    const validAuditJson = '{"count":9007199254740993,"duplicate":"first","duplicate":"last"}';
+    const nonJson = 'password=hunter2\nAuthorization: Basic abc123\ncookie=session=xyz\npasswordless=keep token_count=5';
+    const truncatedJson = '{"password":"hunter2",';
+    store.recordSwitch({
+      ts: 1,
+      provider: 'anthropic',
+      toAccount: 'id',
+      trigger: 'manual',
+      outcome: 'failed',
+      bindingJson: nonJson,
+      stepsJson: truncatedJson,
+      openSessionsJson: validAuditJson,
+    });
+    store.close();
+
+    const db = dbAt(path);
+    try {
+      const row = db.prepare('SELECT binding_json, steps_json, open_sessions_json FROM switch_log').get() as Record<string, string>;
+      for (const value of [row.binding_json, row.steps_json]) {
+        for (const secret of ['hunter2', 'Basic abc123', 'session=xyz']) assert.equal(value.includes(secret), false);
+      }
+      assert.match(row.binding_json, /passwordless=keep/);
+      assert.match(row.binding_json, /token_count=5/);
+      assert.equal(row.open_sessions_json, validAuditJson);
+    } finally { db.close(); }
+  });
+
   it('redacts token-shaped detail and evidence text without changing ids or fingerprints', () => {
     const path = join(mkdtempSync(join(tmpdir(), 'qlb-v5-redact-')), 'qlb.db');
     const store = openStore(path);
@@ -653,6 +705,30 @@ describe('store v5 schema (AC38)', () => {
     const reopened = openStore(path);
     reopened.close();
     assert.equal(readdirSync(join(dir, 'backups')).filter((file) => file.endsWith('.sqlite')).length, backups.length);
+  });
+
+  it('does not create another backup when an exact v5 repair is permanently refused', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-v5-refused-backup-'));
+    const path = join(dir, 'qlb.db');
+    const initial = openStore(path);
+    initial.close();
+    const db = new DatabaseSync(path);
+    db.exec(`DROP TABLE codex_watch;
+      CREATE TABLE codex_watch (
+        switch_id INTEGER PRIMARY KEY, provider TEXT, outgoing TEXT NOT NULL,
+        target TEXT NOT NULL, next_at INTEGER NOT NULL, until INTEGER NOT NULL, unexpected TEXT
+      )`);
+    db.close();
+    const backupsDir = join(dir, 'backups');
+    const before = readdirSync(backupsDir).filter((file) => file.endsWith('.sqlite'));
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      assert.throws(() => openStore(path), /cannot correct pre-release v5 codex_watch: column unexpected is not in the canonical definition/);
+    }
+
+    const after = readdirSync(backupsDir).filter((file) => file.endsWith('.sqlite'));
+    assert.deepEqual(after.sort(), before.sort());
+    assert.ok(after.length <= 1);
   });
 
   it('scrubs existing relogin rows once without a schema-version change', () => {

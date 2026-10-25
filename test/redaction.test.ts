@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { describe, it } from 'node:test';
-import { redactError, redactEvent, redactJson, redactSecrets } from '../src/redact';
+import { redactError, redactEvent, redactJson, redactKeyValueText, redactSecrets } from '../src/redact';
 
 const REDACTED = '[redacted]';
 
@@ -18,6 +18,14 @@ function bearer(last: string): string {
 }
 
 describe('redaction', () => {
+  it('redacts key-value diagnostic text without treating safe key prefixes as credentials', () => {
+    const result = redactKeyValueText(`PASSWORD=hunter2\nAuthorization: Basic abc123\ncookie=session=xyz\n"refresh-token":"value"\n'client_secret': 'value'\npasswordless=keep token_count=5`, []);
+
+    for (const secret of ['hunter2', 'Basic abc123', 'session=xyz', 'value']) assert.equal(result.includes(secret), false);
+    assert.match(result, /passwordless=keep/);
+    assert.match(result, /token_count=5/);
+  });
+
   it('redacts supplied secrets and their SHA-256 fingerprints', () => {
     const secret = 'fixture-' + 'secret-value';
     const result = redactSecrets(`token=${secret} fingerprint=${fingerprint(secret)}`, [secret]);

@@ -3,7 +3,7 @@
 // better-sqlite3 for the same synchronous BEGIN IMMEDIATE style; node:sqlite
 // provides that without a native addon, so we use it instead of adding a
 // dependency. If `node:sqlite` is ever unavailable, switch to `better-sqlite3`.
-import { chmodSync, existsSync, mkdirSync, rmSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readdirSync, rmSync, statSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { assertStoredReloginFields, isReloginEvidenceClass, reloginDetailFingerprint, reloginDetailValue } from './relogin-fields';
@@ -11,7 +11,7 @@ import { dirname, join } from 'node:path';
 import { backup, DatabaseSync, type StatementSync } from 'node:sqlite';
 import { inspectAccountSafety, safetyRefusalMessage } from './accounts-prune';
 import { config } from './config';
-import { redactJson, redactSecrets } from './redact';
+import { redactJson, redactKeyValueText, redactSecrets } from './redact';
 import type { BucketReading, Confidence } from './types';
 
 export const DEFAULT_DB_PATH = config.dbPath;
@@ -718,7 +718,7 @@ function assertV5RebuildCanBeExact(db: DatabaseSync, table: string, shape: V5Tab
 
 function rebuildV5Table(db: DatabaseSync, table: string, shape: V5TableShape, existing: TableColumn[], verifiedBackupPath: string): void {
   const newTable = `${table}__v5new`;
-  if (db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(newTable)) {
+  if (db.prepare("SELECT 1 FROM sqlite_master WHERE name = ?").get(newTable)) {
     throw new Error(`cannot correct pre-release v5 ${table}: temporary table ${newTable} already exists`);
   }
   assertV5RebuildCanBeExact(db, table, shape, verifiedBackupPath);
@@ -745,39 +745,104 @@ function rebuildV5Table(db: DatabaseSync, table: string, shape: V5TableShape, ex
   for (const { sql } of preservedObjects) db.exec(sql);
 }
 
+interface V5RepairPlan {
+  existing: TableColumn[];
+  missing: V5ColumnShape[];
+  requiresRebuild: boolean;
+  impossible: V5ColumnShape[];
+  populated: boolean;
+}
+
+function v5RepairPlan(db: DatabaseSync, table: string, shape: V5TableShape): V5RepairPlan {
+  const existing = tableColumns(db, table);
+  const found = new Set(existing.map(({ name }) => name));
+  const missing = shape.columns.filter(({ name }) => !found.has(name));
+  const requiresRebuild = existing.some((actual) => {
+    const expected = shape.columns.find(({ name }) => name === actual.name);
+    return expected !== undefined && (
+      actual.type.trim().toLowerCase() !== expected.type.trim().toLowerCase()
+      || Boolean(actual.notnull) !== expected.notNull
+      || normalizedDefault(actual.dflt_value) !== normalizedDefault(expected.defaultValue)
+      || actual.pk !== expected.primaryKeyOrder
+      || (expected.unique && !hasUniqueConstraint(db, table, [expected.name]))
+    );
+  }) || missing.some((column) => column.primaryKeyOrder > 0 || column.unique || (column.notNull && column.defaultValue === null));
+  const impossible = missing.filter((column) => column.primaryKeyOrder > 0 || (column.notNull && column.defaultValue === null));
+  return {
+    existing,
+    missing,
+    requiresRebuild,
+    impossible,
+    populated: Boolean(db.prepare(`SELECT 1 FROM ${quoteIdentifier(table)} LIMIT 1`).get()),
+  };
+}
+
+const PROVIDERLESS_USAGE_POLLS_COLUMNS = new Set([
+  'account_id', 'last_fetch_at', 'last_attempt_at', 'next_due_at', 'poll_interval_s',
+  'last_status', 'consecutive_failures', 'backoff_until', 'last_429_at', 'held_until',
+]);
+
+function assertProviderlessUsagePollsCanBeMigrated(db: DatabaseSync, verifiedBackupPath: string): void {
+  if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'usage_polls'").get()
+    || hasColumn(db, 'usage_polls', 'provider')) return;
+  const unexpected = tableColumns(db, 'usage_polls').find(({ name }) => !PROVIDERLESS_USAGE_POLLS_COLUMNS.has(name));
+  if (unexpected) {
+    refuseInexactV5Rebuild('usage_polls', `column ${unexpected.name} is not in the canonical definition and cannot be reproduced`, verifiedBackupPath);
+  }
+  const rows = db.prepare('SELECT account_id FROM usage_polls').all() as Array<{ account_id: string }>;
+  const providerFor = db.prepare('SELECT provider FROM accounts WHERE id = ?');
+  for (const row of rows) {
+    const providers = providerFor.all(row.account_id) as Array<{ provider: string | null }>;
+    if (providers.length !== 1 || !providers[0]?.provider) {
+      refuseInexactV5Rebuild('usage_polls', `account_id '${row.account_id}' is ambiguous`, verifiedBackupPath);
+    }
+  }
+}
+
+/** Refusals detectable without writing must not create another backup on every open. */
+function preflightV5Correction(db: DatabaseSync, verifiedBackupPath: string): void {
+  assertProviderlessUsagePollsCanBeMigrated(db, verifiedBackupPath);
+  for (const [table, shape] of requiredV5TableShapes()) {
+    if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table)
+      || tableMatchesV5Shape(db, table, shape)
+      // This pre-release shape is handled by the preserving provider migration above.
+      || (table === 'usage_polls' && !hasColumn(db, table, 'provider'))) continue;
+    const plan = v5RepairPlan(db, table, shape);
+    if (plan.populated && plan.impossible.length) {
+      refuseInexactV5Rebuild(table, `populated table is missing required column(s) ${plan.impossible.map(({ name }) => name).join(', ')}`, verifiedBackupPath);
+    }
+    if (plan.requiresRebuild) {
+      const newTable = `${table}__v5new`;
+      if (db.prepare("SELECT 1 FROM sqlite_master WHERE name = ?").get(newTable)) {
+        refuseInexactV5Rebuild(table, `temporary table ${newTable} already exists`, verifiedBackupPath);
+      }
+      assertV5RebuildCanBeExact(db, table, shape, verifiedBackupPath);
+    }
+  }
+}
+
 function repairMissingV5Columns(db: DatabaseSync, verifiedBackupPath: string): void {
   for (const [table, shape] of requiredV5TableShapes()) {
     if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table)) continue;
-    const existing = tableColumns(db, table);
     if (tableMatchesV5Shape(db, table, shape)) continue;
-    const found = new Set(existing.map(({ name }) => name));
-    const missing = shape.columns.filter(({ name }) => !found.has(name));
-    const requiresRebuild = existing.some((actual) => {
-      const expected = shape.columns.find(({ name }) => name === actual.name);
-      return expected !== undefined && (
-        actual.type.trim().toLowerCase() !== expected.type.trim().toLowerCase()
-        || Boolean(actual.notnull) !== expected.notNull
-        || normalizedDefault(actual.dflt_value) !== normalizedDefault(expected.defaultValue)
-        || actual.pk !== expected.primaryKeyOrder
-        || (expected.unique && !hasUniqueConstraint(db, table, [expected.name]))
-      );
-    }) || missing.some((column) => column.primaryKeyOrder > 0 || column.unique || (column.notNull && column.defaultValue === null));
-    const populated = Boolean(db.prepare(`SELECT 1 FROM ${quoteIdentifier(table)} LIMIT 1`).get());
-    const impossible = missing.filter((column) => column.primaryKeyOrder > 0 || (column.notNull && column.defaultValue === null));
-    if (populated && impossible.length) {
-      throw new Error(`cannot correct pre-release v5 ${table}: populated table is missing required column(s) ${impossible.map(({ name }) => name).join(', ')}`);
+    const plan = v5RepairPlan(db, table, shape);
+    if (plan.populated && plan.impossible.length) {
+      refuseInexactV5Rebuild(table, `populated table is missing required column(s) ${plan.impossible.map(({ name }) => name).join(', ')}`, verifiedBackupPath);
     }
-    if (requiresRebuild) rebuildV5Table(db, table, shape, existing, verifiedBackupPath);
-    else for (const column of missing) db.exec(`ALTER TABLE ${quoteIdentifier(table)} ADD COLUMN ${column.definition}`);
+    if (plan.requiresRebuild) rebuildV5Table(db, table, shape, plan.existing, verifiedBackupPath);
+    else for (const column of plan.missing) db.exec(`ALTER TABLE ${quoteIdentifier(table)} ADD COLUMN ${column.definition}`);
   }
 }
 
 function redactJsonText(value: string): string {
   try {
-    return redactJson(JSON.parse(value), []);
+    const parsed = JSON.parse(value);
+    const redacted = redactJson(parsed, []);
+    // Preserve audit JSON byte-for-byte unless redaction actually changed it:
+    // JSON.parse would otherwise round large numbers and collapse duplicate keys.
+    return redacted === JSON.stringify(parsed) ? value : redacted;
   } catch {
-    // Keep existing behavior for callers that supplied non-JSON diagnostic text.
-    return redactSecrets(value, []);
+    return redactKeyValueText(value, []);
   }
 }
 
@@ -796,6 +861,23 @@ function lifecycleOneOpenIndexMatches(db: DatabaseSync): boolean {
 }
 
 /** Synchronous bridge for Store's established synchronous constructor. Caller holds BEGIN IMMEDIATE. */
+function latestExistingBackupPath(dbPath: string): string {
+  if (dbPath === ':memory:') return 'none taken';
+  const backupsDir = join(dirname(dbPath), 'backups');
+  if (!existsSync(backupsDir)) return 'none taken';
+  const candidates = readdirSync(backupsDir)
+    .filter((name) => name.endsWith('.sqlite'))
+    .flatMap((name) => {
+      const path = join(backupsDir, name);
+      try {
+        const stats = statSync(path);
+        return stats.isFile() ? [{ path, mtimeMs: stats.mtimeMs }] : [];
+      } catch { return []; }
+    })
+    .sort((left, right) => right.mtimeMs - left.mtimeMs || right.path.localeCompare(left.path));
+  return candidates[0]?.path ?? 'none taken';
+}
+
 function backupBeforeMigrateSync(dbPath: string, source: DatabaseSync): string {
   const backupPath = join(dirname(dbPath), 'backups', `db-${Date.now()}-${process.pid}.sqlite`);
   mkdirSync(dirname(backupPath), { recursive: true, mode: 0o700 });
@@ -1127,8 +1209,11 @@ export class Store {
     this.db.exec('BEGIN IMMEDIATE');
     try {
       if (migrationNeeded(this.db)) {
-        // This is deliberately inside the migration lock, after the backup.
-        // It also lets a brand-new database migrate without constructor DDL.
+        // Refuse exactness failures before making a new backup: a permanently
+        // uncorrectable store must not accumulate one copy per open attempt.
+        preflightV5Correction(this.db, latestExistingBackupPath(this.dbPath));
+        // This is deliberately inside the migration lock. It also lets a
+        // brand-new database migrate without constructor DDL.
         const verifiedBackupPath = this.dbPath !== ':memory:'
           ? backupBeforeMigrateSync(this.dbPath, this.db)
           : ':memory:';
@@ -1144,7 +1229,7 @@ export class Store {
           this.db.exec('CREATE TABLE IF NOT EXISTS policies (harness TEXT, virtual_model TEXT, real_model TEXT, effort TEXT, fallback_json TEXT, session_mode TEXT, created_at INTEGER, PRIMARY KEY (harness, virtual_model))');
         }
         ensureDecisionColumnsOn(this.db);
-        this.migrateV5Schema();
+        this.migrateV5Schema(verifiedBackupPath);
         repairMissingV5Columns(this.db, verifiedBackupPath);
         if (!lifecycleOneOpenIndexMatches(this.db)) {
           this.db.exec('DROP INDEX IF EXISTS lifecycle_one_open');
@@ -1193,16 +1278,14 @@ export class Store {
     `);
   }
 
-  private migrateV5Schema(): void {
+  private migrateV5Schema(verifiedBackupPath: string): void {
     if (this.tableExists('usage_polls') && !hasColumn(this.db, 'usage_polls', 'provider')) {
+      // Checked before the backup too, so this remains a defensive assertion
+      // for future callers that invoke this migration path directly.
+      assertProviderlessUsagePollsCanBeMigrated(this.db, verifiedBackupPath);
       const rows = this.db.prepare('SELECT account_id FROM usage_polls').all() as Array<{ account_id: string }>;
       const providerFor = this.db.prepare('SELECT provider FROM accounts WHERE id = ?');
-      for (const row of rows) {
-        const providers = providerFor.all(row.account_id) as Array<{ provider: string | null }>;
-        if (providers.length !== 1 || !providers[0]?.provider) {
-          throw new Error(`cannot correct pre-release v5 usage_polls: account_id '${row.account_id}' is ambiguous`);
-        }
-      }
+      const pollIntervalValue = hasColumn(this.db, 'usage_polls', 'poll_interval_s') ? 'poll_interval_s' : 'NULL';
       this.db.exec(`
         CREATE TABLE usage_polls_v5 (
           provider TEXT NOT NULL, account_id TEXT NOT NULL,
@@ -1213,8 +1296,8 @@ export class Store {
           PRIMARY KEY (provider, account_id)
         )
       `);
-      const copy = this.db.prepare(`INSERT INTO usage_polls_v5 (provider, account_id, last_fetch_at, last_attempt_at, next_due_at, last_status, consecutive_failures, backoff_until, last_429_at, held_until)
-        SELECT ?, account_id, last_fetch_at, last_attempt_at, next_due_at, last_status, consecutive_failures, backoff_until, last_429_at, held_until FROM usage_polls WHERE account_id = ?`);
+      const copy = this.db.prepare(`INSERT INTO usage_polls_v5 (provider, account_id, last_fetch_at, last_attempt_at, next_due_at, poll_interval_s, last_status, consecutive_failures, backoff_until, last_429_at, held_until)
+        SELECT ?, account_id, last_fetch_at, last_attempt_at, next_due_at, ${pollIntervalValue}, last_status, consecutive_failures, backoff_until, last_429_at, held_until FROM usage_polls WHERE account_id = ?`);
       for (const row of rows) {
         const provider = (providerFor.get(row.account_id) as { provider: string }).provider;
         copy.run(provider, row.account_id);
