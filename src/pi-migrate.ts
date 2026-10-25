@@ -187,9 +187,12 @@ function ownerFor(provider: PiSingleProvider, previous: JsonObject): JsonObject 
 
 function baselineValue(provider: PiSingleProvider, auth: JsonObject, deps: PiMigrateDeps): unknown {
   if (provider === 'openrouter') {
-    const key = deps.readNativeOpenRouterKey?.();
-    if (!key) throw new Error('no-pi-credential');
-    return { type: 'api-key', access: key };
+    try {
+      const key = deps.readNativeOpenRouterKey?.();
+      return key ? { type: 'api-key', access: key } : undefined;
+    } catch {
+      return undefined;
+    }
   }
   return auth[provider];
 }
@@ -212,11 +215,7 @@ function currentValueForRollback(provider: PiSingleProvider, deps: PiMigrateDeps
   }
 }
 
-/**
- * P7a migration. The initial red-first implementation intentionally publishes
- * the placeholder before saving the managed copy; commit two reverses those
- * two writes to establish S58's credential-first invariant.
- */
+/** P7a migration with S58's credential-first publication order. */
 export function migratePiSingleProvider(
   provider: PiSingleProvider,
   paths: PiMigratePaths = defaultPiMigratePaths(),
@@ -237,9 +236,19 @@ export function migratePiSingleProvider(
   let journal = existing ?? { provider, phase: 'started' as JournalPhase, ownerPid: process.pid, updatedAt: Date.now() };
   if (!existing) updatePhase(paths, provider, 'started');
   let migrated = false;
+  let notApplicable = false;
 
   lock(paths.authJsonPath, () => {
     const auth = readAuth(paths.authJsonPath);
+    const currentOwner = readOwner(paths.ownerPath);
+    // A completed migration has no journal. Its placeholder/owner pair is the
+    // durable idempotence proof; never treat the placeholder as source bytes.
+    if (!existing && (provider === 'openrouter' || isPlaceholder(auth[provider]))
+      && (currentOwner.providers as JsonObject)[provider]) {
+      migrated = true;
+      return;
+    }
+
     let baseline: unknown;
     const baselineFile = baselinePath(paths, provider);
     if (phaseAtLeast(journal.phase, 'baseline') && existsSync(baselineFile)) {
@@ -247,8 +256,7 @@ export function migratePiSingleProvider(
     } else {
       baseline = baselineValue(provider, auth, deps);
       if (baseline === undefined) {
-        updatePhase(paths, provider, 'committed');
-        deps.store?.setConfig(`pi.${provider}.state`, 'not-applicable');
+        notApplicable = true;
         return;
       }
       writeJson(baselineFile, baseline);
@@ -261,32 +269,48 @@ export function migratePiSingleProvider(
       throw new Error(`Pi ${provider} entry changed after publication`);
     }
 
-    // REV4 ORDER (red-first): publishing this marker before Keychain save is
-    // intentionally unsafe and the barrier test below proves it.
-    if (provider !== 'openrouter' && !phaseAtLeast(journal.phase, 'published')) {
-      auth[provider] = piPlaceholder();
-      writeJson(paths.authJsonPath, auth);
-      deps.afterWrite?.('placeholder');
-    }
-
-    if (!phaseAtLeast(journal.phase, 'credential-saved')) {
-      const source = provider === 'openrouter' ? baseline : auth[provider] && !isPlaceholder(auth[provider]) ? auth[provider] : baseline;
+    // S58: the managed Keychain item is saved and freshly verified BEFORE a
+    // placeholder can be published. Before publication a changed Pi entry is
+    // re-imported, including a refreshed baseline, before proceeding.
+    if (!phaseAtLeast(journal.phase, 'published')) {
+      const source = provider === 'openrouter'
+        ? baseline
+        : isPlaceholder(auth[provider]) ? baseline : auth[provider];
+      if (provider !== 'openrouter' && source !== baseline) {
+        writeJson(baselineFile, source);
+        baseline = source;
+      }
       const payload = keychainPayload(provider, source);
       deps.keychain.setSync(managedService(provider), QLB_KEYCHAIN_ACCOUNT, payload);
       const verified = deps.keychain.getSync(managedService(provider), QLB_KEYCHAIN_ACCOUNT);
       if (verified !== payload) throw new Error('managed credential verification failed');
-      updatePhase(paths, provider, 'credential-saved');
-      journal = { ...journal, phase: 'credential-saved' };
-      deps.afterWrite?.('credential-saved');
+      if (!phaseAtLeast(journal.phase, 'credential-saved')) {
+        updatePhase(paths, provider, 'credential-saved');
+        journal = { ...journal, phase: 'credential-saved' };
+        deps.afterWrite?.('credential-saved');
+      }
+
+      if (provider !== 'openrouter') {
+        auth[provider] = piPlaceholder();
+        writeJson(paths.authJsonPath, auth);
+        deps.afterWrite?.('placeholder');
+      }
     }
 
-    const owner = ownerFor(provider, readOwner(paths.ownerPath));
+    const owner = ownerFor(provider, currentOwner);
     writeJson(paths.ownerPath, owner);
     deps.afterWrite?.('owner-entry');
     updatePhase(paths, provider, 'published');
     journal = { ...journal, phase: 'published' };
     migrated = true;
   });
+
+  if (notApplicable) {
+    deps.store?.setConfig(`pi.${provider}.state`, 'not-applicable');
+    updatePhase(paths, provider, 'committed');
+    rmSync(journalPath(paths, provider), { force: true });
+    return { provider, state: 'not-applicable', resumed: existing !== null, wouldWrite };
+  }
 
   if (!migrated) return { provider, state: 'not-applicable', resumed: existing !== null, wouldWrite };
   const managed = deps.keychain.getSync(managedService(provider), QLB_KEYCHAIN_ACCOUNT);
