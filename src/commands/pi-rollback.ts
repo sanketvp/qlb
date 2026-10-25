@@ -1,4 +1,5 @@
 import { platformKeychain } from '../keychain';
+import { qlbHomeDir } from '../home';
 import { defaultPiMigratePaths, rollbackPiSingleProvider, type PiSingleProvider } from '../pi-migrate';
 import { openStore } from '../store';
 import type { CommandContext, CommandDefinition } from '../registry';
@@ -16,9 +17,15 @@ async function execute(args: string[], ctx: CommandContext): Promise<number> {
   }
   const store = openStore(ctx.config.dbPath);
   try {
-    rollbackPiSingleProvider(selected, defaultPiMigratePaths(ctx.home), { keychain: platformKeychain, store });
+    rollbackPiSingleProvider(selected, defaultPiMigratePaths(qlbHomeDir(), ctx.config.piAuthJsonPath), { keychain: platformKeychain, store });
     ctx.stdout(`${selected}: rolled back`);
     return 0;
+  } catch (error) {
+    if ((error as { code?: unknown }).code === 'pi-auth-locked') {
+      ctx.stderr('pi-auth-locked');
+      return 3;
+    }
+    throw error;
   } finally {
     store.close();
   }

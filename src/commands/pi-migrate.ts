@@ -1,4 +1,5 @@
-import { platformKeychain } from '../keychain';
+import { platformKeychain, readNativeOpenRouterKey } from '../keychain';
+import { qlbHomeDir } from '../home';
 import { defaultPiMigratePaths, migratePiSingleProvider, type PiSingleProvider } from '../pi-migrate';
 import { openStore } from '../store';
 import type { CommandContext, CommandDefinition } from '../registry';
@@ -16,13 +17,23 @@ async function execute(args: string[], ctx: CommandContext): Promise<number> {
     ctx.stderr('usage: qlb pi migrate xai|kimi-coding|openrouter [--dry-run] [--json]');
     return 2;
   }
-  const paths = defaultPiMigratePaths(ctx.home);
+  const paths = defaultPiMigratePaths(qlbHomeDir(), ctx.config.piAuthJsonPath);
   const store = openStore(ctx.config.dbPath);
   try {
-    const result = migratePiSingleProvider(opts.provider, paths, { keychain: platformKeychain, store }, { dryRun: opts.dryRun });
+    const result = migratePiSingleProvider(opts.provider, paths, {
+      keychain: platformKeychain,
+      store,
+      readNativeOpenRouterKey: () => readNativeOpenRouterKey(ctx.config.openrouterKeychainService),
+    }, { dryRun: opts.dryRun });
     if (opts.json) ctx.stdout(JSON.stringify(result));
     else ctx.stdout(`${result.provider}: ${result.state}`);
     return 0;
+  } catch (error) {
+    if ((error as { code?: unknown }).code === 'pi-auth-locked') {
+      ctx.stderr('pi-auth-locked');
+      return 3;
+    }
+    throw error;
   } finally {
     store.close();
   }
