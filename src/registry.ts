@@ -9,7 +9,12 @@ export interface CommandContext {
   config: QlbConfig;
   loadConfig(options?: ResolveConfigOptions): QlbConfig;
   home: string;
+  /** Register any runtime credential before it can appear in command output or an error. */
   registerSecret(value: string): void;
+  /** Deliver a credential through the single S30-authorized output channel. */
+  deliverSecret(value: string): void;
+  /** Registered runtime credentials, retained across copied or wrapped contexts. */
+  knownSecrets(): readonly string[];
 }
 
 export interface CommandDefinition {
@@ -50,17 +55,18 @@ function loadDefinitions<T extends { name: string }>(
   directory: string,
   extensions = runtimeExtensions(),
   loadModule: ModuleLoader = module.require.bind(module),
-): T[] {
+): Array<{ definition: T; moduleName: string }> {
   return readdirSync(directory, { withFileTypes: true })
     .filter((entry) => entry.isFile() && extensions.includes(extname(entry.name)) && !entry.name.startsWith('_'))
+    .sort((a, b) => a.name.localeCompare(b.name))
     .map((entry) => {
       const loaded = loadModule(join(directory, entry.name)) as { default?: unknown };
       if (!isNamed(loaded.default)) {
         throw new Error(`registry entry ${entry.name} must default-export a named definition`);
       }
-      return loaded.default as T;
+      return { definition: loaded.default as T, moduleName: entry.name };
     })
-    .sort((a, b) => a.name.localeCompare(b.name));
+    .sort((a, b) => a.definition.name.localeCompare(b.definition.name));
 }
 
 export function discoverCommands(
@@ -68,13 +74,19 @@ export function discoverCommands(
   extensions?: string[],
   loadModule?: ModuleLoader,
 ): CommandDefinition[] {
-  const commands = loadDefinitions<CommandDefinition>(directory, extensions, loadModule);
-  for (const command of commands) {
+  const entries = loadDefinitions<CommandDefinition>(directory, extensions, loadModule);
+  const modulesByName = new Map<string, string>();
+  for (const { definition: command, moduleName } of entries) {
     if (typeof command.run !== 'function' && typeof command.execute !== 'function') {
       throw new Error(`command registry entry ${command.name} must provide run or execute`);
     }
+    const firstModule = modulesByName.get(command.name);
+    if (firstModule) {
+      throw new Error(`duplicate command name "${command.name}" in ${firstModule} and ${moduleName}`);
+    }
+    modulesByName.set(command.name, moduleName);
   }
-  return commands;
+  return entries.map(({ definition }) => definition);
 }
 
 export function discoverChecks(
@@ -82,7 +94,8 @@ export function discoverChecks(
   extensions?: string[],
   loadModule?: ModuleLoader,
 ): CheckDefinition[] {
-  return loadDefinitions<CheckDefinition>(directory, extensions, loadModule);
+  return loadDefinitions<CheckDefinition>(directory, extensions, loadModule)
+    .map(({ definition }) => definition);
 }
 
 export function resolveCommand(argv: string[], commands = discoverCommands()): {

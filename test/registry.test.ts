@@ -111,12 +111,14 @@ describe('registries', () => {
     assert.doesNotMatch(output[0], new RegExp(secret));
   });
 
-  it('redacts secrets registered by executing handlers at their error boundary', async () => {
-    const secret = 'opaque-runtime-abc123XYZ';
+  it('redacts short secrets registered by handlers on copied contexts', async () => {
+    const secret = 'short';
     const output: string[] = [];
-    const context = createCommandContext();
-    context.env = {};
-    context.stderr = (line: string) => output.push(line);
+    const context = {
+      ...createCommandContext(),
+      env: {},
+      stderr: (line: string) => output.push(line),
+    };
 
     assert.equal(await runExecutingCommand({
       command: {
@@ -132,21 +134,185 @@ describe('registries', () => {
     assert.doesNotMatch(output[0], new RegExp(secret));
   });
 
-  it('does not treat short or non-credential environment values as executing-command secrets', async () => {
-    const shortSecret = 'short';
+  it('redacts registered short secrets but not short credential-like environment values', async () => {
+    const registeredSecret = 'tiny';
+    const envValue = 'short';
     const nonCredentialValue = 'opaque-home-abc123XYZ';
     const output: string[] = [];
     const context = createCommandContext();
-    context.env = { QLB_TEST_TOKEN: shortSecret, HOME: nonCredentialValue };
+    context.env = { QLB_TEST_TOKEN: envValue, HOME: nonCredentialValue };
     context.stderr = (line: string) => output.push(line);
 
     assert.equal(await runExecutingCommand({
-      command: { name: 'fixture', execute: () => { throw new Error(`failed: ${shortSecret}, ${nonCredentialValue}`); } },
+      command: {
+        name: 'fixture',
+        execute: (_args, ctx) => {
+          ctx.registerSecret(registeredSecret);
+          throw new Error(`failed: ${registeredSecret}, ${envValue}, ${nonCredentialValue}`);
+        },
+      },
       args: [],
     }, context), 1);
-    assert.match(output[0], new RegExp(shortSecret));
+    assert.match(output[0], /\[redacted\]/);
+    assert.doesNotMatch(output[0], new RegExp(registeredSecret));
+    assert.match(output[0], new RegExp(envValue));
     assert.match(output[0], new RegExp(nonCredentialValue));
-    assert.doesNotMatch(output[0], /\[redacted\]/);
+  });
+
+  it('preserves structured stdout for benign short, numeric, and boolean-like environment values', async () => {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const longToken = 'opaque-github-token-abc123XYZ';
+    const message = JSON.stringify({
+      author: 'Ada',
+      booleans: ['true', 'false', 'yes', 'no', 'on', 'off'],
+      dead: false,
+      expiresAt: 1761320001234,
+      count: 10,
+      ttl: 3600,
+    });
+    const context = createCommandContext();
+    context.env = {
+      GIT_AUTHOR_NAME: 'Ada',
+      AUTH_TRUE: 'true',
+      AUTH_FALSE: 'false',
+      AUTH_YES: 'yes',
+      AUTH_NO: 'no',
+      AUTH_ON: 'on',
+      AUTH_OFF: 'off',
+      TOKEN_TTL: '3600',
+      GITHUB_TOKEN: longToken,
+    };
+    context.stdout = (line: string) => stdout.push(line);
+    context.stderr = (line: string) => stderr.push(line);
+
+    assert.equal(await runExecutingCommand({
+      command: {
+        name: 'fixture',
+        execute: (_args, ctx) => {
+          ctx.stdout(message);
+          ctx.stderr(`token: ${longToken}`);
+          return 0;
+        },
+      },
+      args: [],
+    }, context), 0);
+    assert.deepEqual(stdout, [message]);
+    assert.doesNotThrow(() => JSON.parse(stdout[0]));
+    assert.match(stderr[0], /\[redacted\]/);
+    assert.doesNotMatch(stderr[0], new RegExp(longToken));
+  });
+
+  it('redacts substring-matched credential environment values on stdout, stderr, and JSON', async () => {
+    const values = {
+      pgpassword: 'fixture-pgpassword-abc123',
+      npmAuthToken: 'fixture-npm-authtoken-abc123',
+      authorization: 'Basic dXNlcjpwYXNzd29yZA==',
+      httpAuthorization: 'Basic Zml4dHVyZTpwdw==',
+    };
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const context = createCommandContext();
+    context.env = {
+      PGPASSWORD: values.pgpassword,
+      NPM_CONFIG__AUTHTOKEN: values.npmAuthToken,
+      AUTHORIZATION: values.authorization,
+      HTTP_AUTHORIZATION: values.httpAuthorization,
+    };
+    context.stdout = (line: string) => stdout.push(line);
+    context.stderr = (line: string) => stderr.push(line);
+
+    assert.equal(await runExecutingCommand({
+      command: {
+        name: 'fixture',
+        execute: (_args, ctx) => {
+          ctx.stdout(`values: ${Object.values(values).join(', ')}`);
+          ctx.stdout(JSON.stringify(values));
+          ctx.stderr(`values: ${Object.values(values).join(', ')}`);
+          return 0;
+        },
+      },
+      args: [],
+    }, context), 0);
+
+    for (const value of Object.values(values)) {
+      assert.ok(stdout.every((line) => !line.includes(value)));
+      assert.ok(stderr.every((line) => !line.includes(value)));
+    }
+    assert.equal(stdout[0], `values: ${Object.values(values).map(() => '[redacted]').join(', ')}`);
+    assert.deepEqual(JSON.parse(stdout[1]), Object.fromEntries(Object.keys(values).map((key) => [key, '[redacted]'])));
+    assert.equal(stderr[0], stdout[0]);
+  });
+
+  it('keeps the redaction marker intact for registered marker-substring secrets', async () => {
+    const secret = 'fixture-runtime-secret-abc123';
+    const stdout: string[] = [];
+    const context = { ...createCommandContext(), env: {}, stdout: (line: string) => stdout.push(line) };
+
+    assert.equal(await runExecutingCommand({
+      command: {
+        name: 'fixture',
+        execute: (_args, ctx) => {
+          ctx.registerSecret('red');
+          ctx.registerSecret(secret);
+          ctx.stdout(JSON.stringify({ secret, status: 'red' }));
+          return 0;
+        },
+      },
+      args: [],
+    }, context), 0);
+    assert.equal(stdout[0], '{"secret":"[redacted]","status":"[redacted]"}');
+    assert.doesNotThrow(() => JSON.parse(stdout[0]));
+  });
+
+  it('redacts executing-command output and errors through dispatchCommand', async () => {
+    const secret = 'opaque-runtime-abc123XYZ';
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const context = {
+      ...createCommandContext(),
+      env: {},
+      stdout: (line: string) => stdout.push(line),
+      stderr: (line: string) => stderr.push(line),
+    };
+
+    assert.equal(await dispatchCommand(['node', 'qlb', 'fixture'], [{
+      name: 'fixture',
+      execute: (_args, ctx) => {
+        ctx.registerSecret(secret);
+        ctx.stdout(`output: ${secret}`);
+        throw new Error(`failed: ${secret}`);
+      },
+    }], context), 1);
+    assert.match(stdout[0], /\[redacted\]/);
+    assert.doesNotMatch(stdout[0], new RegExp(secret));
+    assert.match(stderr[0], /\[redacted\]/);
+    assert.doesNotMatch(stderr[0], new RegExp(secret));
+  });
+
+  it('rejects duplicate command names and names both modules', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'qlb-registry-duplicate-'));
+    writeFileSync(join(directory, 'first.js'), "module.exports = { default: { name: 'fixture', run(args) { return args; } } };\n");
+    writeFileSync(join(directory, 'second.js'), "module.exports = { default: { name: 'fixture', run(args) { return args; } } };\n");
+
+    assert.throws(
+      () => discoverCommands(directory, ['.js']),
+      /duplicate command name "fixture" in first\.js and second\.js/,
+    );
+  });
+
+  it('converts invalid executing-command exit codes to the documented error exit', async () => {
+    const output: string[] = [];
+    for (const value of [undefined, -1, 1.5, 256, Number.NaN, '1']) {
+      const context = createCommandContext();
+      context.stderr = (line: string) => output.push(line);
+      assert.equal(await runExecutingCommand({
+        command: { name: 'fixture', execute: () => value as number },
+        args: [],
+      }, context), 1);
+    }
+    assert.equal(output.length, 6);
+    assert.ok(output.every((line) => line.includes('invalid exit code (expected integer 0-255)')));
   });
 
   it('keeps legacy argv-rewrite fragments unchanged', () => {
