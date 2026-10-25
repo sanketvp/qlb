@@ -160,6 +160,103 @@ describe('store v5 schema (AC38)', () => {
     } finally { empty.close(); }
   });
 
+  it('rebuilds incompatible v5 tables without losing extra columns, indexes, triggers, or sequence state', () => {
+    for (const populated of [false, true]) {
+      const path = join(mkdtempSync(join(tmpdir(), `qlb-v5-rebuild-${populated ? 'populated' : 'empty'}-`)), 'qlb.db');
+      const initial = openStore(path);
+      initial.close();
+      const db = new DatabaseSync(path);
+      db.exec(`DROP TABLE claude_slots;
+        CREATE TABLE claude_slots (
+          account_id TEXT PRIMARY KEY, email TEXT, alias TEXT, org_uuid TEXT, config_json TEXT NOT NULL,
+          fingerprint TEXT, prev_fingerprint TEXT, threshold REAL, dead INTEGER NOT NULL DEFAULT 0,
+          dead_reason TEXT, dead_at INTEGER, healed_at INTEGER, added_at INTEGER NOT NULL,
+          last_active_at INTEGER, source TEXT, archived_at INTEGER, forward_compatible TEXT
+        );
+        CREATE INDEX claude_slots_forward_compatible ON claude_slots(forward_compatible);
+        CREATE TABLE claude_slot_audit (value TEXT);
+        CREATE TRIGGER claude_slots_audit AFTER INSERT ON claude_slots BEGIN
+          INSERT INTO claude_slot_audit VALUES (NEW.forward_compatible);
+        END;`);
+      if (populated) {
+        db.exec("INSERT INTO claude_slots (account_id, config_json, added_at, forward_compatible) VALUES ('fixture', '{}', 1, 'retain-me')");
+      }
+      db.close();
+
+      const corrected = openStore(path);
+      corrected.close();
+      const check = dbAt(path);
+      try {
+        assert.ok(columns(check, 'claude_slots').includes('slot_num'));
+        assert.ok(columns(check, 'claude_slots').includes('forward_compatible'));
+        assert.ok(check.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'claude_slots_forward_compatible'").get());
+        assert.ok(check.prepare("SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = 'claude_slots_audit'").get());
+        const uniqueIndexes = check.prepare('PRAGMA index_list(claude_slots)').all() as Array<{ name: string; unique: number }>;
+        assert.ok(uniqueIndexes.some((index) => index.unique === 1 && (check.prepare(`PRAGMA index_info(${index.name})`).all() as Array<{ name: string }>).some((column) => column.name === 'slot_num')));
+        if (populated) assert.equal((check.prepare('SELECT forward_compatible FROM claude_slots').get() as { forward_compatible: string }).forward_compatible, 'retain-me');
+      } finally { check.close(); }
+    }
+  });
+
+  it('repairs a lifecycle table missing state before creating its partial index', () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'qlb-v5-lifecycle-state-')), 'qlb.db');
+    const initial = openStore(path);
+    initial.close();
+    const db = new DatabaseSync(path);
+    db.exec("INSERT INTO lifecycle (id, state, began_at) VALUES (5, 'closed', 1); DELETE FROM lifecycle; DROP INDEX lifecycle_one_open; ALTER TABLE lifecycle DROP COLUMN state; DELETE FROM sqlite_sequence WHERE name = 'lifecycle'; INSERT INTO sqlite_sequence (name, seq) VALUES ('lifecycle', 5)");
+    db.close();
+    const corrected = openStore(path);
+    corrected.close();
+    const check = new DatabaseSync(path);
+    try {
+      assert.ok(columns(check, 'lifecycle').includes('state'));
+      assert.ok(check.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'lifecycle_one_open'").get());
+      check.exec("INSERT INTO lifecycle (state, began_at) VALUES ('closed', 2)");
+      assert.equal((check.prepare('SELECT id FROM lifecycle').get() as { id: number }).id, 6);
+    } finally { check.close(); }
+  });
+
+  it('corrects mismatched v5 column constraints and refuses duplicate values that violate new uniqueness', () => {
+    const repairedPath = join(mkdtempSync(join(tmpdir(), 'qlb-v5-shape-repair-')), 'qlb.db');
+    const duplicatePath = join(mkdtempSync(join(tmpdir(), 'qlb-v5-duplicate-refusal-')), 'qlb.db');
+    for (const [path, duplicate] of [[repairedPath, false], [duplicatePath, true]] as const) {
+      const initial = openStore(path);
+      initial.close();
+      const db = new DatabaseSync(path);
+      db.exec('DROP TABLE claude_slots');
+      db.exec(`CREATE TABLE claude_slots (
+        account_id TEXT PRIMARY KEY, slot_num INTEGER, email TEXT, alias TEXT, org_uuid TEXT,
+        config_json TEXT${duplicate ? ' NOT NULL' : ''}, fingerprint TEXT, prev_fingerprint TEXT, threshold REAL,
+        dead INTEGER NOT NULL DEFAULT 0, dead_reason TEXT, dead_at INTEGER, healed_at INTEGER,
+        added_at INTEGER NOT NULL, last_active_at INTEGER, source TEXT, archived_at INTEGER
+      )`);
+      if (duplicate) {
+        db.exec("INSERT INTO claude_slots (account_id, slot_num, config_json, added_at) VALUES ('one', 1, '{}', 1), ('two', 1, '{}', 2)");
+      } else {
+        db.exec("INSERT INTO claude_slots (account_id, config_json, added_at) VALUES ('fixture', '{}', 1)");
+      }
+      db.close();
+    }
+
+    const repaired = openStore(repairedPath);
+    repaired.close();
+    const repairedCheck = dbAt(repairedPath);
+    try {
+      const config = repairedCheck.prepare('PRAGMA table_info(claude_slots)').all() as Array<{ name: string; notnull: number }>;
+      assert.equal(config.find((column) => column.name === 'config_json')?.notnull, 1);
+      const uniqueIndexes = repairedCheck.prepare('PRAGMA index_list(claude_slots)').all() as Array<{ name: string; unique: number }>;
+      assert.equal(uniqueIndexes.some((index) => index.unique === 1 && (repairedCheck.prepare(`PRAGMA index_info(${index.name})`).all() as Array<{ name: string }>).some((column) => column.name === 'slot_num')), true);
+    } finally { repairedCheck.close(); }
+
+    assert.throws(() => openStore(duplicatePath), /cannot correct pre-release v5 claude_slots: copied rows violate new constraints/);
+    const duplicateCheck = dbAt(duplicatePath);
+    try {
+      assert.equal((duplicateCheck.prepare('SELECT count(*) AS count FROM claude_slots WHERE slot_num = 1').get() as { count: number }).count, 2);
+      const uniqueIndexes = duplicateCheck.prepare('PRAGMA index_list(claude_slots)').all() as Array<{ name: string; unique: number }>;
+      assert.equal(uniqueIndexes.some((index) => index.unique === 1 && (duplicateCheck.prepare(`PRAGMA index_info(${index.name})`).all() as Array<{ name: string }>).some((column) => column.name === 'slot_num')), false, 'slot_num remains non-unique after rollback');
+    } finally { duplicateCheck.close(); }
+  });
+
   it('rebuilds a pre-release lifecycle index whose predicate omits aborted', () => {
     const path = join(mkdtempSync(join(tmpdir(), 'qlb-v5-index-correct-')), 'qlb.db');
     const initial = openStore(path);

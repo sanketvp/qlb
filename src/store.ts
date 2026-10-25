@@ -301,7 +301,6 @@ const V5_SCHEMA_DDL = `
   CREATE TABLE IF NOT EXISTS health_log (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, phase TEXT NOT NULL, overall TEXT NOT NULL, failing_json TEXT NOT NULL, dead_slots_json TEXT NOT NULL, release_sha TEXT);
   CREATE TABLE IF NOT EXISTS lineage_log (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, provider TEXT NOT NULL, account_id TEXT NOT NULL, from_fp TEXT, to_fp TEXT NOT NULL, cause TEXT NOT NULL, by TEXT NOT NULL, evidence TEXT);
   CREATE TABLE IF NOT EXISTS lifecycle (id INTEGER PRIMARY KEY AUTOINCREMENT, state TEXT NOT NULL, began_at INTEGER NOT NULL, cutover_at INTEGER, window_end INTEGER, extended_at INTEGER, undo_began_at INTEGER, rollback_at INTEGER, retired_at INTEGER, closed_at INTEGER, release_sha TEXT, drill_done_at INTEGER, note TEXT, pre_fence_state TEXT);
-  CREATE UNIQUE INDEX IF NOT EXISTS lifecycle_one_open ON lifecycle ((1)) WHERE state IN ('cutting-over','cutover','undoing','rolled-back','retired','aborted');
   CREATE TABLE IF NOT EXISTS codex_watch (switch_id INTEGER PRIMARY KEY, provider TEXT NOT NULL, outgoing TEXT NOT NULL, target TEXT NOT NULL, next_at INTEGER NOT NULL, until INTEGER NOT NULL);
   CREATE TABLE IF NOT EXISTS import_runs (run_id TEXT PRIMARY KEY, started_at INTEGER NOT NULL, committed_at INTEGER);
   CREATE TABLE IF NOT EXISTS pi_export_targets (provider TEXT NOT NULL, target TEXT NOT NULL, slot_account_id TEXT NOT NULL, lineage_fp TEXT NOT NULL, recorded_at INTEGER NOT NULL, PRIMARY KEY (provider, target));
@@ -314,12 +313,21 @@ interface V5ColumnShape {
   type: string;
   notNull: boolean;
   defaultValue: string | null;
-  primaryKey: boolean;
+  primaryKeyOrder: number;
+  unique: boolean;
 }
 
 interface V5TableShape {
   columns: V5ColumnShape[];
   sql: string;
+}
+
+interface TableColumn {
+  name: string;
+  type: string;
+  notnull: number;
+  dflt_value: string | null;
+  pk: number;
 }
 
 function splitColumnDefinitions(definitions: string): string[] {
@@ -342,18 +350,25 @@ function loadV5TableShapes(): Map<string, V5TableShape> {
   const tables = new Map<string, V5TableShape>();
   for (const match of V5_SCHEMA_DDL.matchAll(/CREATE TABLE IF NOT EXISTS (\w+) \(([\s\S]*?)\);/g)) {
     const [, name, definitions] = match;
-    const columns = splitColumnDefinitions(definitions).flatMap((definition): V5ColumnShape[] => {
+    const parts = splitColumnDefinitions(definitions);
+    const tablePrimaryKey = parts.find((definition) => /^PRIMARY KEY\s*\(/i.test(definition));
+    const primaryKeyNames = tablePrimaryKey
+      ? (tablePrimaryKey.match(/\(([^)]+)\)/)?.[1].split(',').map((column) => column.trim().replace(/^"|"$/g, '')) ?? [])
+      : [];
+    const columns = parts.flatMap((definition): V5ColumnShape[] => {
       if (/^(PRIMARY|UNIQUE|CHECK|CONSTRAINT|FOREIGN)\b/i.test(definition)) return [];
       const column = /^(\w+)\s+(\w+)/.exec(definition);
       if (!column) return [];
       const defaultMatch = /\bDEFAULT\s+([^\s,]+)/i.exec(definition);
+      const tablePrimaryKeyOrder = primaryKeyNames.indexOf(column[1]) + 1;
       return [{
         name: column[1],
         definition,
         type: column[2],
         notNull: /\bNOT NULL\b/i.test(definition),
         defaultValue: defaultMatch?.[1] ?? null,
-        primaryKey: /\bPRIMARY KEY\b/i.test(definition),
+        primaryKeyOrder: /\bPRIMARY KEY\b/i.test(definition) ? 1 : tablePrimaryKeyOrder,
+        unique: /\bUNIQUE\b/i.test(definition),
       }];
     });
     tables.set(name, { columns, sql: `CREATE TABLE ${name} (${definitions})` });
@@ -398,7 +413,7 @@ function tableContentDigest(db: DatabaseSync, table: string): string {
 
 function schemaEntries(db: DatabaseSync): Array<{ type: string; name: string; sql: string | null }> {
   return db.prepare(`SELECT type, name, sql FROM sqlite_master
-    WHERE type IN ('table', 'index') AND name NOT LIKE 'sqlite_%'
+    WHERE name NOT LIKE 'sqlite_%'
     ORDER BY type, name`).all() as Array<{ type: string; name: string; sql: string | null }>;
 }
 
@@ -446,43 +461,107 @@ export async function backupBeforeMigrate(
   }
 }
 
-function schemaNeedsV5Correction(db: DatabaseSync): boolean {
-  for (const [table, { columns }] of requiredV5TableShapes()) {
-    const found = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table);
-    if (!found || columns.some(({ name }) => !hasColumn(db, table, name))) return true;
-  }
-  return !lifecycleOneOpenIndexMatches(db);
-}
-
 function quoteIdentifier(name: string): string {
   return `"${name.replace(/"/g, '""')}"`;
 }
 
+function tableColumns(db: DatabaseSync, table: string): TableColumn[] {
+  return db.prepare(`PRAGMA table_info(${quoteIdentifier(table)})`).all() as unknown as TableColumn[];
+}
+
+function normalizedDefault(value: string | null): string | null {
+  return value === null ? null : value.replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+function hasUniqueConstraint(db: DatabaseSync, table: string, columns: string[]): boolean {
+  const indexes = db.prepare(`PRAGMA index_list(${quoteIdentifier(table)})`).all() as Array<{ name: string; unique: number; partial: number }>;
+  return indexes.some((index) => index.unique === 1 && index.partial === 0 && (
+    db.prepare(`PRAGMA index_info(${quoteIdentifier(index.name)})`).all() as Array<{ name: string }>
+  ).map(({ name }) => name).join('\0') === columns.join('\0'));
+}
+
+function tableMatchesV5Shape(db: DatabaseSync, table: string, shape: V5TableShape): boolean {
+  const existing = new Map(tableColumns(db, table).map((column) => [column.name, column]));
+  return shape.columns.every((expected) => {
+    const actual = existing.get(expected.name);
+    return actual !== undefined
+      && actual.type.trim().toLowerCase() === expected.type.trim().toLowerCase()
+      && Boolean(actual.notnull) === expected.notNull
+      && normalizedDefault(actual.dflt_value) === normalizedDefault(expected.defaultValue)
+      && actual.pk === expected.primaryKeyOrder
+      && (!expected.unique || hasUniqueConstraint(db, table, [expected.name]));
+  });
+}
+
+function schemaNeedsV5Correction(db: DatabaseSync): boolean {
+  for (const [table, shape] of requiredV5TableShapes()) {
+    const found = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table);
+    if (!found || !tableMatchesV5Shape(db, table, shape)) return true;
+  }
+  return !lifecycleOneOpenIndexMatches(db);
+}
+
+function extraColumnDefinition(column: TableColumn): string {
+  let definition = `${quoteIdentifier(column.name)}${column.type ? ` ${column.type}` : ''}`;
+  if (column.notnull) definition += ' NOT NULL';
+  if (column.dflt_value !== null) definition += ` DEFAULT ${column.dflt_value}`;
+  return definition;
+}
+
+function rebuildV5Table(db: DatabaseSync, table: string, shape: V5TableShape, existing: TableColumn[]): void {
+  const newTable = `${table}__v5new`;
+  if (db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(newTable)) {
+    throw new Error(`cannot correct pre-release v5 ${table}: temporary table ${newTable} already exists`);
+  }
+  const canonical = new Set(shape.columns.map(({ name }) => name));
+  const extras = existing.filter(({ name }) => !canonical.has(name));
+  const definitions = shape.sql.slice(shape.sql.indexOf('(') + 1, -1);
+  const createSql = `CREATE TABLE ${quoteIdentifier(newTable)} (${definitions}${extras.length ? `, ${extras.map(extraColumnDefinition).join(', ')}` : ''})`;
+  const preservedObjects = db.prepare(`SELECT type, name, sql FROM sqlite_master
+    WHERE tbl_name = ? AND type IN ('index', 'trigger') AND sql IS NOT NULL AND name <> 'lifecycle_one_open'
+    ORDER BY type, name`).all(table) as Array<{ sql: string }>;
+  const sequenceExists = Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_sequence'").get());
+  const sequence = sequenceExists ? db.prepare('SELECT seq FROM sqlite_sequence WHERE name = ?').get(table) as { seq: number } | undefined : undefined;
+  db.exec(createSql);
+  const names = existing.map(({ name }) => quoteIdentifier(name)).join(', ');
+  try {
+    if (names) db.exec(`INSERT INTO ${quoteIdentifier(newTable)} (${names}) SELECT ${names} FROM ${quoteIdentifier(table)}`);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    throw new Error(`cannot correct pre-release v5 ${table}: copied rows violate new constraints (${message})`);
+  }
+  db.exec(`DROP TABLE ${quoteIdentifier(table)}; ALTER TABLE ${quoteIdentifier(newTable)} RENAME TO ${quoteIdentifier(table)}`);
+  if (sequence) {
+    db.prepare('DELETE FROM sqlite_sequence WHERE name = ?').run(table);
+    db.prepare('INSERT INTO sqlite_sequence (name, seq) VALUES (?, ?)').run(table, sequence.seq);
+  }
+  for (const { sql } of preservedObjects) db.exec(sql);
+}
+
 function repairMissingV5Columns(db: DatabaseSync): void {
-  const repairs: Array<{ table: string; shape: V5TableShape; missing: V5ColumnShape[]; empty: boolean }> = [];
   for (const [table, shape] of requiredV5TableShapes()) {
     if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table)) continue;
-    const existing = new Set((db.prepare(`PRAGMA table_info(${quoteIdentifier(table)})`).all() as Array<{ name: string }>).map(({ name }) => name));
-    const missing = shape.columns.filter(({ name }) => !existing.has(name));
-    if (missing.length === 0) continue;
-    const empty = !(db.prepare(`SELECT 1 FROM ${quoteIdentifier(table)} LIMIT 1`).get());
-    // SQLite can only add nullable columns or NOT NULL columns with a constant
-    // default. Anything else would require inventing values for existing rows.
-    if (!empty && missing.some((column) => column.primaryKey || (column.notNull && column.defaultValue === null))) {
-      const names = missing.filter((column) => column.primaryKey || (column.notNull && column.defaultValue === null)).map(({ name }) => name).join(', ');
-      throw new Error(`cannot correct pre-release v5 ${table}: populated table is missing required column(s) ${names}`);
+    const existing = tableColumns(db, table);
+    if (tableMatchesV5Shape(db, table, shape)) continue;
+    const found = new Set(existing.map(({ name }) => name));
+    const missing = shape.columns.filter(({ name }) => !found.has(name));
+    const requiresRebuild = existing.some((actual) => {
+      const expected = shape.columns.find(({ name }) => name === actual.name);
+      return expected !== undefined && (
+        actual.type.trim().toLowerCase() !== expected.type.trim().toLowerCase()
+        || Boolean(actual.notnull) !== expected.notNull
+        || normalizedDefault(actual.dflt_value) !== normalizedDefault(expected.defaultValue)
+        || actual.pk !== expected.primaryKeyOrder
+        || (expected.unique && !hasUniqueConstraint(db, table, [expected.name]))
+      );
+    }) || missing.some((column) => column.primaryKeyOrder > 0 || column.unique || (column.notNull && column.defaultValue === null));
+    const populated = Boolean(db.prepare(`SELECT 1 FROM ${quoteIdentifier(table)} LIMIT 1`).get());
+    const impossible = missing.filter((column) => column.primaryKeyOrder > 0 || (column.notNull && column.defaultValue === null));
+    if (populated && impossible.length) {
+      throw new Error(`cannot correct pre-release v5 ${table}: populated table is missing required column(s) ${impossible.map(({ name }) => name).join(', ')}`);
     }
-    repairs.push({ table, shape, missing, empty });
-  }
-
-  for (const { table, shape, missing, empty } of repairs) {
-    if (empty && missing.some((column) => column.primaryKey || (column.notNull && column.defaultValue === null))) {
-      // Empty tables have no values or rows to lose; recreate only when ALTER
-      // TABLE cannot express the v5 column definition.
-      db.exec(`DROP TABLE ${quoteIdentifier(table)}; ${shape.sql}`);
-      continue;
-    }
-    for (const column of missing) db.exec(`ALTER TABLE ${quoteIdentifier(table)} ADD COLUMN ${column.definition}`);
+    if (requiresRebuild) rebuildV5Table(db, table, shape, existing);
+    else for (const column of missing) db.exec(`ALTER TABLE ${quoteIdentifier(table)} ADD COLUMN ${column.definition}`);
   }
 }
 
@@ -914,6 +993,8 @@ export class Store {
       }
       this.db.exec('DROP TABLE usage_polls; ALTER TABLE usage_polls_v5 RENAME TO usage_polls');
     }
+    // Tables must exist before repair, but the lifecycle partial index refers to
+    // state and is deliberately created only after every table has been repaired.
     this.db.exec(V5_SCHEMA_DDL);
     this.addColumnIfMissing('claude_slots', 'archived_at', 'INTEGER');
     this.addColumnIfMissing('codex_slots', 'pending_adopt', 'INTEGER NOT NULL DEFAULT 0');
@@ -926,10 +1007,6 @@ export class Store {
     this.addColumnIfMissing('relogin_events', 'user_denied_at', 'INTEGER');
     this.addColumnIfMissing('lineage_log', 'evidence', 'TEXT');
     this.addColumnIfMissing('lifecycle', 'pre_fence_state', 'TEXT');
-    if (!lifecycleOneOpenIndexMatches(this.db)) {
-      this.db.exec('DROP INDEX IF EXISTS lifecycle_one_open');
-      this.db.exec(`${LIFECYCLE_ONE_OPEN_INDEX_SQL};`);
-    }
   }
 
   private tableExists(table: string): boolean {

@@ -43,6 +43,21 @@ describe('store backup before migration (AC45)', () => {
     } finally { copy.close(); source.close(); }
   });
 
+  it('rejects equal-row copies missing a persistent trigger or view', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-backup-objects-'));
+    const source = new DatabaseSync(join(dir, 'source.db'));
+    const copy = new DatabaseSync(join(dir, 'copy.db'));
+    try {
+      source.exec(`CREATE TABLE rows (id INTEGER PRIMARY KEY, value TEXT);
+        CREATE TABLE audit (value TEXT);
+        INSERT INTO rows VALUES (1, 'same');
+        CREATE TRIGGER rows_audit AFTER INSERT ON rows BEGIN INSERT INTO audit VALUES (NEW.value); END;
+        CREATE VIEW row_values AS SELECT value FROM rows`);
+      copy.exec("CREATE TABLE rows (id INTEGER PRIMARY KEY, value TEXT); CREATE TABLE audit (value TEXT); INSERT INTO rows VALUES (1, 'same')");
+      assert.equal(verifyBackup(source, copy), false);
+    } finally { copy.close(); source.close(); }
+  });
+
   it('aborts on backup verification failure and leaves the source untouched', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'qlb-backup-fail-'));
     const path = join(dir, 'qlb.db');
