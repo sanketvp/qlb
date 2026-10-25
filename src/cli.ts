@@ -1,12 +1,13 @@
 #!/usr/bin/env node
 import { existsSync, mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
 import * as net from 'node:net';
 import { dirname, join, resolve } from 'node:path';
 import { adapters } from './adapters';
 import { assertTestHomeIsIsolated } from './bootstrap';
+import { assertAdmitted, type LifecycleOperation } from './lifecycle';
 import { createDefaultCodexGateDeps, runCodexGate } from './codex-gate';
 import { config, resolveConfig, stripConfigArgs } from './config';
+import { qlbHomeDir } from './home';
 import { discoverCommands, resolveCommand, type CommandContext, type CommandDefinition } from './registry';
 import { runCodexProbeClaims } from './commands/codex-probe-claims';
 import { redactError } from './redact';
@@ -1750,7 +1751,7 @@ export function createCommandContext(): CommandContext {
     env: process.env,
     config,
     loadConfig: resolveConfig,
-    home: homedir(),
+    home: qlbHomeDir(),
     registerSecret: (value) => {
       if (value) secrets.add(value);
     },
@@ -1785,11 +1786,50 @@ export function exitCodeForError(err: unknown): number {
   return typeof err === 'object' && err !== null && (err as { exitCode?: unknown }).exitCode === 3 ? 3 : 1;
 }
 
+function lifecycleAdmissionCode(dbPath: string, operation: LifecycleOperation): string | null {
+  const store = openStore(dbPath);
+  try {
+    const result = assertAdmitted(store, operation);
+    return result.ok ? null : result.code ?? 'lifecycle-refused';
+  } finally { store.close(); }
+}
+
+// The legacy gate path must select its lifecycle store before opening it, or
+// --db would both admit against and create the wrong database.
+export function gateLifecycleAdmissionCode(gateDbPath: string | undefined, defaultDbPath: string): string | null {
+  return lifecycleAdmissionCode(gateDbPath ?? defaultDbPath, 'gate');
+}
+
+function lifecycleOperationFor(command: string, args: string[]): LifecycleOperation | null {
+  if (command === 'doctor') return 'doctor';
+  if (command === 'status') return 'status';
+  if (command === 'gate') return 'gate';
+  if (command === 'cutover') {
+    if (args[0] === 'begin') return args.includes('--dry-run') ? 'cutover-begin:dry-run' : 'cutover-begin';
+    if (args[0] === 'commit') return 'cutover-commit';
+    if (args[0] === 'abort') return 'cutover-abort';
+  }
+  if (command === 'lifecycle') {
+    if (args[0] === 'drill-done') return 'lifecycle-drill-done';
+    if (args[0] === 'close') return 'lifecycle-close';
+    if (args[0] === 'status') return 'status';
+  }
+  return null;
+}
+
 export async function runExecutingCommand(
   match: { command: CommandDefinition; args: string[] },
   context: CommandContext,
 ): Promise<number> {
   try {
+    const operation = lifecycleOperationFor(match.command.name, match.args);
+    if (operation != null) {
+      const refusal = lifecycleAdmissionCode(context.config.dbPath, operation);
+      if (refusal != null) {
+        context.stderr(`qlb ${match.command.name}: refused: ${refusal}`);
+        return 3;
+      }
+    }
     return await match.command.execute!(match.args, context);
   } catch (err) {
     context.stderr(`qlb ${match.command.name}: ${redactError(err, knownCommandSecrets(context))}`);
@@ -1952,6 +1992,11 @@ async function main(): Promise<void> {
     process.exit(await runCodexProbeClaims(opts.args));
   }
   if (opts.cmd === 'gate') {
+    const refusal = gateLifecycleAdmissionCode(opts.db, config.dbPath);
+    if (refusal != null) {
+      console.error(`qlb gate: refused: ${refusal}`);
+      process.exit(3);
+    }
     try {
       const code = await runGate(opts);
       process.exit(code);
