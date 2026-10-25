@@ -34,6 +34,25 @@ describe('autoswitch Codex gate — S15 / AC28 engine inputs', () => {
     });
   }
 
+  it('uses Codex secondary as the consume-first weekly reset', () => {
+    const result = decideAutoswitch({
+      nowMs: NOW,
+      provider: 'openai-codex',
+      codexL13VerifiedAtMs: NOW - 1,
+      activeAccountId: '1',
+      settings: { strategy: 'consume-first' },
+      accounts: [
+        { accountId: '1', buckets: { primary: { usedPct: 20 }, secondary: { usedPct: 20, resetAt: NOW + 2 * 60 * 60 * 1000 } } },
+        { accountId: '2', buckets: { primary: { usedPct: 10 }, secondary: { usedPct: 10, resetAt: NOW + 60 * 60 * 1000 } } },
+      ],
+    });
+    assert.equal(result.kind, 'switch');
+    if (result.kind === 'switch') {
+      assert.equal(result.targetId, '2');
+      assert.equal(result.reason, 'consume-first');
+    }
+  });
+
   it('allows automatic Codex switching after the L13 receipt', () => {
     const result = decideAutoswitch({
       nowMs: NOW,

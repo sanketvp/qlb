@@ -222,10 +222,14 @@ function exhaustedRecovery(account: AutoswitchAccount, nowMs: number): number | 
   return resets.length > 0 ? Math.max(...resets) : undefined;
 }
 
-function census(accounts: readonly AutoswitchAccount[], settings: AutoswitchSettings, nowMs: number, activeId: string, providerLimit: boolean): CensusAccount[] {
+function census(accounts: readonly AutoswitchAccount[], settings: AutoswitchSettings, nowMs: number, activeId: string, providerLimit: boolean, activeUsageUnknown = false): CensusAccount[] {
   return accounts.filter((account) => !account.dead).map((account, index) => {
-    const rawPct = bindingPct(account);
-    const binding = bindingFor(account, settings);
+    // §4.3 step 1: after an expired credential's idle hold, its cached
+    // buckets are not a reading. Do not let stale known/exhausted state into
+    // the S38 fleet proof.
+    const unknownActive = activeUsageUnknown && account.accountId === activeId;
+    const rawPct = unknownActive ? null : bindingPct(account);
+    const binding = unknownActive ? undefined : bindingFor(account, settings);
     const known = rawPct !== null;
     const limited = account.accountId === activeId && providerLimit;
     return {
@@ -252,7 +256,7 @@ function noReturnRecovered(input: AutoswitchInput, left: CensusAccount | undefin
   if (!left) return false;
   const leftTrigger = input.leftTrigger;
   const failoverSnapshot = leftTrigger === 'failover'
-    || (leftTrigger === undefined && input.leftHeadroom === null && input.leftRecoveryAtMs === null);
+    || (leftTrigger == null && input.leftHeadroom === null && input.leftRecoveryAtMs === null);
   if (failoverSnapshot) {
     if (left.binding && !left.binding.over) return true;
     const activeRecovery = active.recoveryAtMs ?? Number.POSITIVE_INFINITY;
@@ -285,7 +289,7 @@ function noReturnAccount(input: AutoswitchInput, trigger: Trigger, all: CensusAc
 interface RankResult { ordered: CensusAccount[]; anyKnown: boolean; }
 
 function weeklyReset(account: AutoswitchAccount, nowMs: number): number | undefined {
-  const reset = account.buckets['7d']?.resetAt ?? account.buckets.weekly?.resetAt;
+  const reset = account.buckets['7d']?.resetAt ?? account.buckets.weekly?.resetAt ?? account.buckets.secondary?.resetAt;
   return finite(reset) && reset > nowMs ? reset : undefined;
 }
 
@@ -333,8 +337,14 @@ function rankCandidates(all: CensusAccount[], active: CensusAccount, trigger: Tr
   const sortable = qualified.length > 0 ? qualified : fallback;
   sortable.sort((a, b) => {
     for (let i = 0; i < Math.max(a.key.length, b.key.length); i += 1) {
-      const delta = (a.key[i] ?? 0) - (b.key[i] ?? 0);
-      if (delta !== 0) return delta;
+      const left = a.key[i] ?? 0;
+      const right = b.key[i] ?? 0;
+      // Python tuple ordering treats equal infinities as a tie and compares
+      // the next field. Subtraction makes Infinity - Infinity NaN, which JS
+      // sort treats as equality before accountOrder is reached.
+      if (left === right) continue;
+      const delta = left - right;
+      if (!Number.isNaN(delta) && delta !== 0) return delta;
     }
     return accountOrder(a.item, b.item);
   });
@@ -415,7 +425,14 @@ export function decideAutoswitch(input: AutoswitchInput): AutoswitchDecision {
     return { kind: 'stay', reason: 'cooldown', unhealthyTicks };
   }
 
-  const all = census(input.accounts, settings, input.nowMs, activeAccount.accountId, input.providerReportedLimit === true && rawActive !== null);
+  const all = census(
+    input.accounts,
+    settings,
+    input.nowMs,
+    activeAccount.accountId,
+    input.providerReportedLimit === true && rawActive !== null,
+    expiredPastIdleHold,
+  );
   const active = all.find((item) => item.account.accountId === activeAccount.accountId);
   if (!active) {
     // A dead active is intentionally excluded from census but remains a valid
