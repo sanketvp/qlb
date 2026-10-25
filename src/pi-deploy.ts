@@ -75,7 +75,9 @@ function sweepStaging(stagingRoot: string, extensionParent: string): void {
   for (const dir of [stagingRoot, extensionParent]) {
     try {
       for (const entry of readdirSync(dir, { withFileTypes: true })) {
-        if (entry.name.startsWith('.qlb-pi-')) rmSync(join(dir, entry.name), { recursive: true, force: true });
+        if (entry.name.startsWith('.qlb-pi-') || entry.name.startsWith('.redact-')) {
+          rmSync(join(dir, entry.name), { recursive: true, force: true });
+        }
       }
     } catch {
       // A missing directory has no stale staging entries to remove.
@@ -98,6 +100,8 @@ function replaceDeployment(source: string, redactSource: string, target: string,
   const previousRedact = join(stagingRoot, `.redact-${nonce}.previous`);
   let movedPrevious = false;
   let movedPreviousRedact = false;
+  let publishedExtension = false;
+  let publishedRedact = false;
   let published = false;
   try {
     mkdirSync(extensionParent, { recursive: true, mode: 0o755 });
@@ -109,15 +113,21 @@ function replaceDeployment(source: string, redactSource: string, target: string,
     if (existsSync(target)) { rename(target, previous); movedPrevious = true; }
     if (existsSync(redactTarget)) { rename(redactTarget, previousRedact); movedPreviousRedact = true; }
     rename(staging, target);
+    publishedExtension = true;
     rename(stagedRedact, redactTarget);
+    publishedRedact = true;
     published = true;
   } catch (err) {
-    if (movedPrevious && !existsSync(target) && existsSync(previous)) {
-      try { rename(previous, target); } catch { /* Preserve the original error. */ }
-    }
-    if (movedPreviousRedact && !existsSync(redactTarget) && existsSync(previousRedact)) {
-      try { rename(previousRedact, redactTarget); } catch { /* Preserve the original error. */ }
-    }
+    // Restore the extension before the redactor so a second publish failure
+    // cannot leave the new extension paired with the prior redactor.
+    try {
+      if (publishedExtension && existsSync(target)) rmSync(target, { recursive: true, force: true });
+      if (movedPrevious && existsSync(previous)) rename(previous, target);
+    } catch { /* Preserve the original error. */ }
+    try {
+      if (publishedRedact && existsSync(redactTarget)) rmSync(redactTarget, { recursive: true, force: true });
+      if (movedPreviousRedact && existsSync(previousRedact)) rename(previousRedact, redactTarget);
+    } catch { /* Preserve the original error. */ }
     throw err;
   } finally {
     for (const path of [staging, stagedRedact]) if (existsSync(path)) rmSync(path, { recursive: true, force: true });

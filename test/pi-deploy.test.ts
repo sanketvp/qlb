@@ -122,14 +122,73 @@ describe('qlb pi deploy (P12)', () => {
     assert.equal(readFileSync(redact, 'utf8'), 'export const redact = 1;\n');
   });
 
-  it('sweeps legacy extension staging siblings before deploying', () => {
+  it('restores both previous files and preserves the record when redactor publication fails', () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-pi-redact-restore-'));
+    const f = fixture(root);
+    const first = deployPiExtension({ home: f.home, appDir: f.appDir, dbPath: f.dbPath, now: () => 1_700_000_000_000 });
+    const target = join(f.home, '.pi', 'agent', 'extensions', 'qlb-pi');
+    const redact = join(f.home, '.pi', 'agent', 'src', 'redact.ts');
+    writeFileSync(join(f.extension, 'index.ts'), 'export const version = 2;\n');
+    writeFileSync(join(f.appDir, 'release-fixture', 'src', 'redact.ts'), 'export const redact = 2;\n');
+    const output: string[] = [];
+
+    const code = runPiDeployCommand([], context(f.home, f.dbPath, output), {
+      deploy: (options) => deployPiExtension({
+        ...options,
+        rename: (from, to) => {
+          if (to === redact && String(from).includes('.redact-') && String(from).includes('.tmp')) {
+            throw new Error('simulated redact publish failure');
+          }
+          renameSync(from, to);
+        },
+      }),
+      appDirFor: () => f.appDir,
+    });
+
+    assert.equal(code, 1);
+    assert.equal(readFileSync(join(target, 'index.ts'), 'utf8'), 'export const version = 1;\n');
+    assert.equal(readFileSync(redact, 'utf8'), 'export const redact = 1;\n');
+    const store = openStore(f.dbPath);
+    assert.equal(store.getConfig('pi.deployedAt'), '1700000000');
+    assert.equal(store.getConfig('pi.extensionHash'), first.hash);
+    store.close();
+  });
+
+  it('removes both new files when redactor publication fails on a first deploy', () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-pi-redact-first-'));
+    const f = fixture(root);
+    const target = join(f.home, '.pi', 'agent', 'extensions', 'qlb-pi');
+    const redact = join(f.home, '.pi', 'agent', 'src', 'redact.ts');
+
+    assert.throws(() => deployPiExtension({
+      home: f.home,
+      appDir: f.appDir,
+      dbPath: f.dbPath,
+      rename: (from, to) => {
+        if (to === redact && String(from).includes('.redact-') && String(from).includes('.tmp')) {
+          throw new Error('simulated redact publish failure');
+        }
+        renameSync(from, to);
+      },
+    }), /simulated redact publish failure/);
+
+    assert.equal(existsSync(target), false);
+    assert.equal(existsSync(redact), false);
+    assert.equal(existsSync(f.dbPath), false);
+  });
+
+  it('sweeps legacy extension and redactor staging siblings before deploying', () => {
     const root = mkdtempSync(join(tmpdir(), 'qlb-pi-sweep-'));
     const f = fixture(root);
     const legacy = join(f.home, '.pi', 'agent', 'extensions', '.qlb-pi-old.previous');
+    const legacyRedact = join(f.home, '.pi', 'agent', '.qlb-pi-staging', '.redact-x.tmp');
     mkdirSync(legacy, { recursive: true });
+    mkdirSync(join(f.home, '.pi', 'agent', '.qlb-pi-staging'), { recursive: true });
     writeFileSync(join(legacy, 'index.ts'), 'old\n');
+    writeFileSync(legacyRedact, 'old\n');
     deployPiExtension({ home: f.home, appDir: f.appDir, dbPath: f.dbPath });
     assert.equal(existsSync(legacy), false);
+    assert.equal(existsSync(legacyRedact), false);
   });
 
   it('lists only Pi sessions that predate deployment and WARNs on malformed ps output', () => {
