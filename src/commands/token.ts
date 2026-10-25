@@ -34,10 +34,7 @@ function parentProcess(): ParentProcess | null {
 }
 
 function packageRoot(env: NodeJS.ProcessEnv = process.env): string | null {
-  const piEnv = env.QLB_TEST_MODE === '1'
-    ? env
-    : { ...env, QLB_PI_PACKAGE_ROOT: undefined };
-  return locatePi(piEnv).root;
+  return locatePi(env).root;
 }
 
 function commandWords(command: string): string[] {
@@ -48,6 +45,15 @@ const NODE_OPTIONS_WITH_SEPARATE_VALUE = new Set([
   '-r', '--require', '--import', '--loader', '--experimental-loader', '-e', '--eval',
   '-p', '--print', '--input-type', '--conditions', '-C',
 ]);
+const CODE_INJECTING_LONG_OPTIONS = [
+  '--require', '--eval', '--print', '--import', '--loader', '--experimental-loader',
+];
+
+function isCodeInjectingNodeOption(arg: string): boolean {
+  return arg === '-i' || arg === '--interactive'
+    || ['-r', '-e', '-p'].some((option) => arg === option || arg.startsWith(option))
+    || CODE_INJECTING_LONG_OPTIONS.some((option) => arg === option || arg.startsWith(`${option}=`));
+}
 
 function scriptIsInsidePiDist(command: string, root: string): boolean {
   const [executable, ...args] = commandWords(command);
@@ -56,7 +62,7 @@ function scriptIsInsidePiDist(command: string, root: string): boolean {
   let scriptWord: string | undefined;
   for (const arg of args) {
     if (arg.startsWith('-')) {
-      if (NODE_OPTIONS_WITH_SEPARATE_VALUE.has(arg)) return false;
+      if (isCodeInjectingNodeOption(arg) || NODE_OPTIONS_WITH_SEPARATE_VALUE.has(arg)) return false;
       continue;
     }
     scriptWord = arg;
@@ -84,10 +90,7 @@ export function tokenCallAllowed(
   if ((deps.isTty ?? (() => process.stdin.isTTY === true || process.stdout.isTTY === true))()) return false;
   const parent = (deps.parent ?? parentProcess)();
   if (!parent || !/^node(?:js)?$/i.test(basename(parent.comm))) return false;
-  const piEnv = env.QLB_TEST_MODE === '1'
-    ? env
-    : { ...env, QLB_PI_PACKAGE_ROOT: undefined };
-  const root = deps.piPackageRoot ? deps.piPackageRoot(piEnv) : packageRoot(piEnv);
+  const root = deps.piPackageRoot ? deps.piPackageRoot(env) : packageRoot(env);
   return typeof root === 'string' && scriptIsInsidePiDist(parent.command, root);
 }
 

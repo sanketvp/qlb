@@ -64,9 +64,39 @@ describe('qlb token', () => {
     assert.equal(tokenCallAllowed({ QLB_PI_TOKEN_CALL: '1' }, { ...base, parent: () => ({ comm: 'python3', command: `python3 ${script}` }) }), false);
     assert.equal(tokenCallAllowed({ QLB_PI_TOKEN_CALL: '1' }, { ...base, isTty: () => true }), false);
 
-    assert.equal(tokenCallAllowed({ QLB_PI_TOKEN_CALL: '1', QLB_PI_PACKAGE_ROOT: '/tmp/untrusted-root' }, {
+    assert.equal(tokenCallAllowed({ QLB_PI_TOKEN_CALL: '1', QLB_PI_PACKAGE_ROOT: root }, {
+      parent,
+      isTty: () => false,
+    }), true);
+  });
+
+  it('refuses every code-injecting or preload Node option form', () => {
+    const { root, script } = fakePiScript();
+    const base = {
+      parent: (command: string) => () => ({ comm: 'node', command: `node ${command}` }),
+      piPackageRoot: () => root,
+      isTty: () => false,
+    };
+    const refusedForms = [
+      '-r /tmp/preload.js', '-r/tmp/preload.js', '--require /tmp/preload.js', '--require=/tmp/preload.js',
+      '-e process.exit(0)', '-eprocess.exit(0)', '--eval process.exit(0)', '--eval=process.exit(0)',
+      '-p process.version', '-pprocess.version', '--print process.version', '--print=process.version',
+      '--import /tmp/preload.mjs', '--import=/tmp/preload.mjs',
+      '--loader /tmp/loader.mjs', '--loader=/tmp/loader.mjs',
+      '--experimental-loader /tmp/loader.mjs', '--experimental-loader=/tmp/loader.mjs',
+      '-i', '--interactive',
+    ];
+
+    for (const form of refusedForms) {
+      assert.equal(tokenCallAllowed({ QLB_PI_TOKEN_CALL: '1' }, {
+        ...base,
+        parent: base.parent(`${form} ${script}`),
+      }), false, form);
+    }
+
+    assert.equal(tokenCallAllowed({ QLB_PI_TOKEN_CALL: '1' }, {
       ...base,
-      piPackageRoot: (env) => env.QLB_PI_PACKAGE_ROOT ?? root,
+      parent: base.parent(`--max-old-space-size=64 --inspect=127.0.0.1:0 ${script}`),
     }), true);
   });
 
