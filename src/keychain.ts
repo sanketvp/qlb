@@ -20,6 +20,7 @@ import {
   createRawCredentialBackend,
   defaultCredentialBackendHost,
   execFileUtf8,
+  isCredentialNotFound,
   isFakeExecutor,
   isQlbTestMode,
   isSecurityTimeout,
@@ -257,9 +258,7 @@ export function readNativeOpenRouterKey(
       // `security` uses errSecItemNotFound (44) for a missing item. stderr is
       // intentionally discarded here, so its stable wording is only a
       // secondary signal; a denial or other failure must remain operational.
-      const status = typeof err === 'object' && err !== null ? (err as { status?: unknown }).status : undefined;
-      const message = typeof err === 'object' && err !== null ? (err as { message?: unknown }).message : undefined;
-      if (status !== 44 && !(typeof message === 'string' && /(could not be found|item not found)/i.test(message))) throw err;
+      if (!isCredentialNotFound(err)) throw err;
     }
     throw new NativeOpenRouterKeyNotFoundError(service);
   }
@@ -267,10 +266,9 @@ export function readNativeOpenRouterKey(
     const key = rawPlatform.getSync(service, NATIVE_SECRET_ACCOUNT).trim();
     if (key.length > 0) return key;
   } catch (error) {
-    // The platform backends use this stable wording for an absent item. Other
-    // failures (timeouts, denial, disabled native access) are operational
-    // errors and must remain visible to callers.
-    if (!(error instanceof Error) || !/item not found$/i.test(error.message)) throw error;
+    // Other failures (timeouts, denial, disabled native access) are
+    // operational errors and must remain visible to callers.
+    if (!isCredentialNotFound(error)) throw error;
   }
   throw new NativeOpenRouterKeyNotFoundError(service);
 }

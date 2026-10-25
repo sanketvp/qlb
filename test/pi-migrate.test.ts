@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
-import { markFakeExecutor, MockKeychain, NativeOpenRouterKeyNotFoundError, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, readNativeOpenRouterKey, type ExecFileSyncFn } from '../src/keychain';
+import { MacosKeychainBackend, markFakeExecutor, MockKeychain, NativeOpenRouterKeyNotFoundError, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, readNativeOpenRouterKey, type ExecFileSyncFn } from '../src/keychain';
 import {
   defaultPiMigratePaths,
   migratePiSingleProvider,
@@ -195,6 +195,43 @@ describe('Pi migration S58 credential-first barrier', () => {
     } finally { h.cleanup(); }
   });
 
+  it('atomically admits only one racing stale-lock taker', async () => {
+    const h = setup();
+    try {
+      const lock = `${h.paths.authJsonPath}.lock`; const owner = join(lock, 'qlb-lock-owner.json');
+      mkdirSync(lock); writeFileSync(owner, JSON.stringify({ pid: 999_999, nonce: 'dead' }));
+      utimesSync(lock, new Date(Date.now() - 2_000), new Date(Date.now() - 2_000));
+      const modulePath = join(process.cwd(), 'dist-test', 'src', 'pi-migrate.js');
+      const startAt = Date.now() + 200;
+      const child = () => new Promise<{ code: number | null; output: string }>((resolveChild, rejectChild) => {
+        const proc = spawn(process.execPath, ['-e', `
+          const { migratePiSingleProvider } = require(process.env.PI_MIGRATE_MODULE);
+          const paths = JSON.parse(process.env.PI_MIGRATE_PATHS);
+          const until = Number(process.env.PI_MIGRATE_START);
+          while (Date.now() < until) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1);
+          let value = '';
+          const keychain = { setSync(_s, _a, v) { value = v; }, getSync() { return value; }, deleteSync() {} };
+          try {
+            migratePiSingleProvider('xai', paths, { keychain, authLockTiming: { staleMs: 10, retries: 0, retryMs: 1 }, afterWrite(point) {
+              if (point === 'owner-entry') { process.stdout.write('entered\\n'); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100); }
+            } });
+            process.exitCode = 0;
+          } catch (error) { process.stdout.write(String(error.code || error.message)); process.exitCode = 1; }
+        `], {
+          env: { ...process.env, PI_MIGRATE_MODULE: modulePath, PI_MIGRATE_PATHS: JSON.stringify(h.paths), PI_MIGRATE_START: String(startAt) },
+          stdio: ['ignore', 'pipe', 'inherit'],
+        });
+        let output = '';
+        proc.stdout.on('data', (chunk) => { output += String(chunk); });
+        proc.once('error', rejectChild);
+        proc.once('close', (code) => resolveChild({ code, output }));
+      });
+      const results = await Promise.all([child(), child()]);
+      assert.equal(results.filter(({ output }) => output.includes('entered')).length, 1);
+      assert.equal(results.filter(({ code }) => code === 0).length, 1);
+    } finally { h.cleanup(); }
+  });
+
   it('takes over only stale locks whose recorded owner is dead and never releases a foreign lock', () => {
     const h = setup();
     try {
@@ -297,6 +334,56 @@ describe('Pi migration S58 credential-first barrier', () => {
     } finally { h.cleanup(); }
   });
 
+  it('recognizes the real macOS status-44 delete miss but rethrows a denial', () => {
+    const h = setup();
+    try {
+      migratePiSingleProvider('xai', h.paths, { keychain: h.keychain });
+      let status = 44;
+      const keychain = new MacosKeychainBackend({
+        execFileSync: markFakeExecutor(((_file, args) => {
+          if (args[0] === 'find-generic-password') return h.keychain.getSync(qlbKeychainService('xai', 'default'), QLB_KEYCHAIN_ACCOUNT);
+          throw Object.assign(new Error(status === 44
+            ? 'Command failed: /usr/bin/security delete-generic-password -a qlb -s qlb:xai:default\nsecurity: SecKeychainSearchCopyNext: The specified item could not be found in the keychain.\n'
+            : 'Command failed: /usr/bin/security delete-generic-password -a qlb -s qlb:xai:default\nsecurity: User interaction is not allowed.\n'), { status });
+        }) as ExecFileSyncFn),
+      });
+      assert.doesNotThrow(() => rollbackPiSingleProvider('xai', h.paths, { keychain }));
+      migratePiSingleProvider('xai', h.paths, { keychain: h.keychain });
+      status = 1;
+      assert.throws(() => rollbackPiSingleProvider('xai', h.paths, { keychain }), (error: unknown) => (error as { status?: number }).status === 1);
+    } finally { h.cleanup(); }
+  });
+
+  it('keeps rollback state and journal until a failed managed deletion can be retried', () => {
+    const h = setup();
+    try {
+      const config = new Map<string, string>();
+      const store = { setConfig(key: string, value: string) { config.set(key, value); }, recordLineage() { return 0; }, upsertAccount() {} };
+      migratePiSingleProvider('xai', h.paths, { keychain: h.keychain, store });
+      const journal = join(h.paths.journalPath, 'pi-migrate-xai.json');
+      mkdirSync(h.paths.journalPath, { recursive: true });
+      writeFileSync(journal, JSON.stringify({ provider: 'xai', phase: 'committed', ownerPid: process.pid, updatedAt: Date.now() }));
+      let denied = true;
+      const keychain = {
+        getSync: h.keychain.getSync.bind(h.keychain),
+        setSync: h.keychain.setSync.bind(h.keychain),
+        deleteSync(service: string, account: string) {
+          if (denied) throw Object.assign(new Error('keychain delete denied'), { status: 1 });
+          h.keychain.deleteSync(service, account);
+        },
+      };
+      assert.throws(() => rollbackPiSingleProvider('xai', h.paths, { keychain, store }), /denied/);
+      assert.equal(config.get('pi.xai.state'), 'migrated');
+      assert.equal(existsSync(journal), true);
+      assert.equal(hasManaged(h.keychain, 'xai'), true);
+      denied = false;
+      rollbackPiSingleProvider('xai', h.paths, { keychain, store });
+      assert.equal(hasManaged(h.keychain, 'xai'), false);
+      assert.equal(config.get('pi.xai.state'), '');
+      assert.equal(existsSync(journal), false);
+    } finally { h.cleanup(); }
+  });
+
   it('does not overwrite a new native credential on a repeated rollback', () => {
     const h = setup();
     try {
@@ -306,6 +393,7 @@ describe('Pi migration S58 credential-first barrier', () => {
       writeFileSync(h.paths.authJsonPath, JSON.stringify({ xai: reauthed }));
       rollbackPiSingleProvider('xai', h.paths, { keychain: h.keychain });
       assert.deepEqual(JSON.parse(readFileSync(h.paths.authJsonPath, 'utf8')).xai, reauthed);
+      assert.equal(hasManaged(h.keychain, 'xai'), false);
     } finally { h.cleanup(); }
   });
 

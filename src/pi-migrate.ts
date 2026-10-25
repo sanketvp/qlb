@@ -2,11 +2,12 @@
 // Credential bytes live only in the Keychain and the 0600 baseline file.
 
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { execFileSync } from 'node:child_process';
 
 import { atomicWriteText } from './fsutil';
+import { isCredentialNotFound } from './credential-backends';
 import { isNativeOpenRouterKeyNotFound, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, type KeychainBackend } from './keychain';
 import { qlbHomeDir } from './home';
 import type { Store } from './store';
@@ -75,12 +76,33 @@ function ownerMatches(lock: string, owner: AuthLockOwner): boolean {
 function ownerIsDead(owner: AuthLockOwner): boolean {
   try { process.kill(owner.pid, 0); return false; } catch (error) { return (error as NodeJS.ErrnoException).code === 'ESRCH'; }
 }
-function canTakeOverStaleLock(lock: string, staleMs: number): boolean {
+function staleLockOwner(lock: string, staleMs: number): AuthLockOwner | null | undefined {
   try {
-    if (Date.now() - statSync(lock).mtimeMs <= staleMs) return false;
+    if (Date.now() - statSync(lock).mtimeMs <= staleMs) return undefined;
     const owner = readLockOwner(lock);
-    return owner === null || ownerIsDead(owner);
-  } catch { return false; }
+    return owner === null || ownerIsDead(owner) ? owner : undefined;
+  } catch { return undefined; }
+}
+function sameOwner(left: AuthLockOwner | null, right: AuthLockOwner | null): boolean {
+  return left === null ? right === null : right?.pid === left.pid && right.nonce === left.nonce;
+}
+/** Atomically move a stale lock aside; only the rename winner may remove it. */
+function takeOverStaleLock(lock: string, staleMs: number, nonce: string): boolean {
+  const expected = staleLockOwner(lock, staleMs);
+  if (expected === undefined) return false;
+  const stalePath = `${lock}.stale-${nonce}`;
+  try { renameSync(lock, stalePath); } catch { return false; }
+  const confirmed = staleLockOwner(stalePath, staleMs);
+  if (confirmed !== undefined && sameOwner(expected, confirmed)) {
+    rmSync(stalePath, { recursive: true, force: true });
+    return true;
+  }
+  // A live owner raced in after our initial check. Restore its lock only if
+  // nobody acquired the canonical path while it was moved aside.
+  if (!existsSync(lock)) {
+    try { renameSync(stalePath, lock); } catch { /* another taker acquired it */ }
+  }
+  return false;
 }
 function defaultAuthLock<T>(authPath: string, fn: (refresh: () => void) => T, timing: AuthLockTiming = {}): T {
   const lock = `${authPath}.lock`; const staleMs = timing.staleMs ?? 10_000; const retries = timing.retries ?? 20; const retryMs = timing.retryMs ?? 250;
@@ -94,7 +116,7 @@ function defaultAuthLock<T>(authPath: string, fn: (refresh: () => void) => T, ti
       break;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-      if (canTakeOverStaleLock(lock, staleMs)) { rmSync(lock, { recursive: true, force: true }); attempt -= 1; continue; }
+      if (takeOverStaleLock(lock, staleMs, owner.nonce)) { attempt -= 1; continue; }
       if (attempt === retries) throw lockedError();
       sleepSync(retryMs);
     }
@@ -199,17 +221,16 @@ export function rollbackPiSingleProvider(provider: PiSingleProvider, paths: PiMi
     }
     const owner = readOwner(paths.ownerPath); const providers = { ...(owner.providers as JsonObject) }; delete providers[provider];
     refresh(); writeJson(paths.ownerPath, { providers }); refresh(); deps.afterWrite?.('owner-entry');
-    let managedRestored = false;
     if (needsRestore && auth) {
       auth[provider] = restore; refresh(); writeJson(paths.authJsonPath, auth); refresh();
       if (JSON.stringify(readAuth(paths.authJsonPath)[provider]) !== JSON.stringify(restore)) throw new Error('Pi credential rollback verification failed');
-      managedRestored = restore === managed;
     }
-    if (provider === 'openrouter' || managedRestored) {
-      refresh();
-      try { deps.keychain.deleteSync(managedService(provider), QLB_KEYCHAIN_ACCOUNT); } catch (error) {
-        if (!(error instanceof Error) || !/item not found$/i.test(error.message)) throw error;
-      }
+    // Always release QLB's managed item once Pi has either retained its own
+    // non-placeholder credential or verified a restored one. This makes a
+    // retry converge after a prior delete failure.
+    refresh();
+    try { deps.keychain.deleteSync(managedService(provider), QLB_KEYCHAIN_ACCOUNT); } catch (error) {
+      if (!isCredentialNotFound(error)) throw error;
     }
     refresh(); deps.store?.setConfig(`pi.${provider}.state`, ''); refresh(); deps.store?.setConfig(`pi.${provider}.migratedAt`, '');
     refresh(); rmSync(journalPath(paths, provider), { force: true });
