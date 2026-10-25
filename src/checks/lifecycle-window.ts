@@ -4,6 +4,6 @@ import { check } from './_check';
 
 export default check('lifecycle:window');
 
-export function lifecycleWindowCheck(store: Store, now?: number) {
+export function lifecycleWindowCheck(store: Pick<Store, 'dbPath'>, now?: number) {
   return { name: 'lifecycle:window', ...lifecycleCheck(store, 'window', now) };
 }
