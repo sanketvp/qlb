@@ -1,7 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
 
 import { unavailableCswapAgent, type CswapAgent } from '../cswap-agent';
-import { beginCutover, commitCutover, phase } from '../lifecycle';
+import { assertAdmitted, beginCutover, commitCutover, phase } from '../lifecycle';
 import { openStore } from '../store';
 import type { CommandContext, CommandDefinition } from '../registry';
 
@@ -23,21 +23,49 @@ function parseJson(args: string[]): boolean {
 export async function cutoverBegin(storePath: string, agent: CswapAgent = unavailableCswapAgent): Promise<{ ok: boolean; code?: string; state: string }> {
   const store = openStore(storePath);
   try {
-    const row = beginCutover(store);
-    for (const operation of [agent.bootout, agent.disable, agent.movePlist]) {
-      const result = await operation.call(agent);
-      if (result.ok) continue;
-      // Idempotent restoration covers a move that failed after its rename.
-      await agent.restorePlist();
-      // The K13 stub must not leave an apparently-safe cutting-over state.
-      const db = new DatabaseSync(store.dbPath);
-      try {
-        db.prepare("UPDATE lifecycle SET state = 'aborted', rollback_at = ?, pre_fence_state = 'cutting-over' WHERE id = ?")
-          .run(Date.now(), row.id);
-      } finally { db.close(); }
-      return { ok: false, code: result.code ?? 'cswap-agent-failed', state: 'aborted' };
+    const admission = assertAdmitted(store, 'cutover-begin');
+    if (!admission.ok) return { ok: false, code: admission.code, state: admission.row!.state };
+
+    let row;
+    try {
+      row = beginCutover(store);
+    } catch (err) {
+      // The partial unique index is the cross-process backstop after admission.
+      const message = err instanceof Error ? err.message : String(err);
+      if (!message.includes('SQLITE_CONSTRAINT')) throw err;
+      const current = phase(store);
+      return { ok: false, code: `phase=${current.state}`, state: current.state };
     }
-    return { ok: true, state: row.state };
+
+    let failureCode: string | undefined;
+    try {
+      for (const operation of [agent.bootout, agent.disable, agent.movePlist]) {
+        const result = await operation.call(agent);
+        if (result.ok) continue;
+        failureCode = result.code ?? 'cswap-agent-failed';
+        break;
+      }
+    } catch (err) {
+      failureCode = err instanceof Error ? err.message : String(err);
+    }
+    if (failureCode == null) return { ok: true, state: row.state };
+
+    // restorePlist is the compensation for every successful preceding step and
+    // also covers a move that threw after its rename.
+    let restored = false;
+    try { restored = (await agent.restorePlist()).ok; } catch { /* recorded below */ }
+    const db = new DatabaseSync(store.dbPath);
+    try {
+      if (restored) {
+        const changed = db.prepare("UPDATE lifecycle SET state = 'aborted', rollback_at = ?, pre_fence_state = 'cutting-over', note = ? WHERE id = ? AND state = 'cutting-over'")
+          .run(Date.now(), `cutover begin failed: ${failureCode}`, row.id).changes;
+        if (changed === 1) return { ok: false, code: failureCode, state: 'aborted' };
+      } else {
+        db.prepare("UPDATE lifecycle SET note = ? WHERE id = ? AND state = 'cutting-over'")
+          .run(`cutover begin failed; restoration failed: ${failureCode}`, row.id);
+      }
+    } finally { db.close(); }
+    return { ok: false, code: restored ? 'transition=cutting-over->aborted' : 'cswap-restore-failed', state: phase(store).state };
   } finally { store.close(); }
 }
 

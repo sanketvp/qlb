@@ -5,6 +5,7 @@ import * as net from 'node:net';
 import { dirname, join, resolve } from 'node:path';
 import { adapters } from './adapters';
 import { assertTestHomeIsIsolated } from './bootstrap';
+import { assertAdmitted, type LifecycleOperation } from './lifecycle';
 import { createDefaultCodexGateDeps, runCodexGate } from './codex-gate';
 import { config, resolveConfig, stripConfigArgs } from './config';
 import { discoverCommands, resolveCommand, type CommandContext, type CommandDefinition } from './registry';
@@ -1781,11 +1782,44 @@ export async function dispatchCommand(
     : null;
 }
 
+function lifecycleAdmissionCode(dbPath: string, operation: LifecycleOperation): string | null {
+  const store = openStore(dbPath);
+  try {
+    const result = assertAdmitted(store, operation);
+    return result.ok ? null : result.code ?? 'lifecycle-refused';
+  } finally { store.close(); }
+}
+
+function lifecycleOperationFor(command: string, args: string[]): LifecycleOperation | null {
+  if (command === 'doctor') return 'doctor';
+  if (command === 'status') return 'status';
+  if (command === 'gate') return 'gate';
+  if (command === 'cutover') {
+    if (args[0] === 'begin') return args.includes('--dry-run') ? 'cutover-begin:dry-run' : 'cutover-begin';
+    if (args[0] === 'commit') return 'cutover-commit';
+    if (args[0] === 'abort') return 'cutover-abort';
+  }
+  if (command === 'lifecycle') {
+    if (args[0] === 'drill-done') return 'lifecycle-drill-done';
+    if (args[0] === 'close') return 'lifecycle-close';
+    if (args[0] === 'status') return 'status';
+  }
+  return null;
+}
+
 export async function runExecutingCommand(
   match: { command: CommandDefinition; args: string[] },
   context: CommandContext,
 ): Promise<number> {
   try {
+    const operation = lifecycleOperationFor(match.command.name, match.args);
+    if (operation != null) {
+      const refusal = lifecycleAdmissionCode(context.config.dbPath, operation);
+      if (refusal != null) {
+        context.stderr(`qlb ${match.command.name}: refused: ${refusal}`);
+        return 3;
+      }
+    }
     return await match.command.execute!(match.args, context);
   } catch (err) {
     context.stderr(`qlb ${match.command.name}: ${redactError(err, knownCommandSecrets(context))}`);
@@ -1948,6 +1982,11 @@ async function main(): Promise<void> {
     process.exit(await runCodexProbeClaims(opts.args));
   }
   if (opts.cmd === 'gate') {
+    const refusal = lifecycleAdmissionCode(config.dbPath, 'gate');
+    if (refusal != null) {
+      console.error(`qlb gate: refused: ${refusal}`);
+      process.exit(3);
+    }
     try {
       const code = await runGate(opts);
       process.exit(code);

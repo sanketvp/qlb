@@ -45,7 +45,7 @@ function rules(...operations: LifecycleOperation[]): Set<LifecycleOperation> {
 
 /** §4.15's admission table; this is deliberately the sole policy authority. */
 export const PHASE_RULES: Record<LifecycleState, Set<LifecycleOperation>> = {
-  'pre-cutover': rules('doctor', 'status'),
+  'pre-cutover': rules('doctor', 'status', 'cutover-begin'),
   'cutting-over': rules(
     'doctor', 'status', 'import-cswap', 'codex-import-active', 'codex-add', 'claude-add',
     'pi-migrate', 'pi-rollback', 'switch:manual', 'gate', 'auto:dry-run', 'cutover-commit',
@@ -148,8 +148,11 @@ export function transition(store: Store, to: LifecycleState, now: number = Date.
     fields.push('retired_at = ?');
     values.push(now);
   }
-  values.push(current.id);
-  withDb(store, (db) => db.prepare(`UPDATE lifecycle SET ${fields.join(', ')} WHERE id = ?`).run(...values));
+  values.push(current.id, current.state);
+  const changed = withDb(store, (db) => db.prepare(
+    `UPDATE lifecycle SET ${fields.join(', ')} WHERE id = ? AND state = ?`,
+  ).run(...values).changes);
+  if (changed !== 1) return { ok: false, code: `transition=${current.state}->${to}`, row: phase(store) };
   return { ok: true, row: phase(store) };
 }
 
@@ -190,9 +193,12 @@ function hasSharedAnthropicTarget(db: DatabaseSync): boolean {
   return Boolean(db.prepare("SELECT 1 FROM pi_export_targets WHERE provider = 'anthropic' LIMIT 1").get());
 }
 
-function stalePiSessions(db: DatabaseSync): boolean {
+function stalePiSessions(db: DatabaseSync): 'stale' | 'clear' | 'unknown' {
+  // K13 has no process detector yet. Until the S61 producer exists, an absent
+  // result is deliberately ambiguous rather than silently treated as clear.
   const raw = configValue(db, 'pi.staleSessionCount') ?? configValue(db, 'pi.staleSessions');
-  return raw != null && (/^[1-9]\d*$/.test(raw) || raw === 'true');
+  if (raw == null) return 'unknown';
+  return (/^[1-9]\d*$/.test(raw) || raw === 'true') ? 'stale' : 'clear';
 }
 
 /** Commit gates from S50, S61, and S63. */
@@ -207,10 +213,16 @@ export function commitCutover(store: Store, opts: { now?: number; releaseSha?: s
       const state = configValue(db, `pi.${provider}.state`);
       if (state !== 'migrated' && state !== 'not-applicable') return { ok: false, code: `pi-state-missing:${provider}` };
     }
-    if (hasSharedAnthropicTarget(db) && stalePiSessions(db)) return { ok: false, code: 'pi-stale-sessions' };
+    if (hasSharedAnthropicTarget(db)) {
+      const sessions = stalePiSessions(db);
+      if (sessions === 'stale') return { ok: false, code: 'pi-stale-sessions-shared' };
+      if (sessions === 'unknown') return { ok: false, code: 'pi-stale-sessions-unknown' };
+    }
     const now = opts.now ?? Date.now();
-    db.prepare(`UPDATE lifecycle SET state = 'cutover', cutover_at = ?, window_end = ?, release_sha = ? WHERE id = ?`)
-      .run(now, now + 7 * DAY_MS, opts.releaseSha ?? null, admission.row!.id);
+    const changed = db.prepare(`UPDATE lifecycle SET state = 'cutover', cutover_at = ?, window_end = ?, release_sha = ?
+      WHERE id = ? AND state = 'cutting-over'`)
+      .run(now, now + 7 * DAY_MS, opts.releaseSha ?? null, admission.row!.id).changes;
+    if (changed !== 1) return { ok: false, code: 'transition=cutting-over->cutover' };
     return { ok: true, row: phase(store) };
   });
 }

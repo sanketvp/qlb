@@ -20,6 +20,9 @@ import {
 } from '../src/lifecycle';
 import { cutoverBegin } from '../src/commands/cutover';
 import { openStore } from '../src/store';
+import { defaultConfig } from '../src/config';
+import { doctorQlb } from '../src/diagnostics';
+import { runExecutingCommand } from '../src/cli';
 
 function fixtureStore() {
   return openStore(join(mkdtempSync(join(tmpdir(), 'qlb-lifecycle-')), 'qlb.db'));
@@ -62,7 +65,9 @@ describe('lifecycle (AC49)', () => {
     try {
       const failed = await cutoverBegin(failedStore.dbPath);
       assert.equal(failed.ok, false);
-      assert.equal(failed.state, 'aborted');
+      // The fail-closed stub cannot restore a possibly changed external state.
+      assert.equal(failed.state, 'cutting-over');
+      assert.equal(failed.code, 'cswap-restore-failed');
     } finally { failedStore.close(); }
   });
 
@@ -70,6 +75,7 @@ describe('lifecycle (AC49)', () => {
     const store = fixtureStore();
     try {
       assert.equal(assertAdmitted(store, 'gate').code, 'phase=pre-cutover');
+      assert.equal(assertAdmitted(store, 'cutover-begin').ok, true);
       beginCutover(store);
       assert.equal(assertAdmitted(store, 'switch:manual').ok, true);
       assert.equal(assertAdmitted(store, 'auto').code, 'phase=cutting-over');
@@ -82,6 +88,33 @@ describe('lifecycle (AC49)', () => {
       assert.equal(assertAdmitted(store, 'auto').ok, true);
       assert.equal(assertAdmitted(store, 'pi-migrate').code, 'phase=retired');
       assert.ok(PHASE_RULES.retired.has('gate'));
+    } finally { store.close(); }
+  });
+
+  it('refuses a disallowed operation through the executing CLI dispatch path', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-lifecycle-cli-'));
+    const config = defaultConfig(home);
+    const stderr: string[] = [];
+    let executed = false;
+    const code = await runExecutingCommand({ command: { name: 'gate', execute: async () => { executed = true; return 0; } }, args: ['anthropic'] }, {
+      config, env: {}, home, stdout: () => {}, stderr: (message) => stderr.push(message),
+      loadConfig: () => config, registerSecret: () => {},
+    });
+    assert.equal(code, 3);
+    assert.equal(executed, false);
+    assert.match(stderr[0]!, /phase=pre-cutover/);
+  });
+
+  it('refuses a second begin with an open row as a lifecycle refusal', async () => {
+    const store = fixtureStore();
+    try {
+      const agent = {
+        bootout: () => ({ ok: true }), disable: () => ({ ok: true }), movePlist: () => ({ ok: true }),
+        restorePlist: () => ({ ok: true }),
+      };
+      assert.equal((await cutoverBegin(store.dbPath, agent)).ok, true);
+      const second = await cutoverBegin(store.dbPath, agent);
+      assert.deepEqual(second, { ok: false, code: 'phase=cutting-over', state: 'cutting-over' });
     } finally { store.close(); }
   });
 
@@ -107,6 +140,42 @@ describe('lifecycle (AC49)', () => {
     } finally { store.close(); }
   });
 
+  it('fails closed for missing or stale Pi session evidence only when a shared target exists', () => {
+    const store = fixtureStore();
+    try {
+      beginCutover(store, 10);
+      insertClaudeImport(store);
+      store.recordSwitch({ provider: 'anthropic', fromAccount: 'a', toAccount: 'b', trigger: 'manual', outcome: 'ok' });
+      store.recordSwitch({ provider: 'anthropic', fromAccount: 'b', toAccount: 'a', trigger: 'manual', outcome: 'ok' });
+      store.setConfig('keychain.liveItemsAuthorizedAt', '1');
+      for (const provider of ['anthropic', 'openai-codex', 'xai', 'kimi-coding', 'openrouter']) store.setConfig(`pi.${provider}.state`, 'migrated');
+      const db = new DatabaseSync(store.dbPath);
+      try { db.prepare('INSERT INTO pi_export_targets (provider, target, slot_account_id, lineage_fp, recorded_at) VALUES (?, ?, ?, ?, ?)')
+        .run('anthropic', 'pool', 'a', 'fp', 1); } finally { db.close(); }
+      assert.equal(commitCutover(store).code, 'pi-stale-sessions-unknown');
+      store.setConfig('pi.staleSessionCount', '1');
+      assert.equal(commitCutover(store).code, 'pi-stale-sessions-shared');
+      store.setConfig('pi.staleSessionCount', '0');
+      assert.equal(commitCutover(store).ok, true);
+    } finally { store.close(); }
+  });
+
+  it('emits lifecycle window and drill WARNs through qlb doctor', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-lifecycle-doctor-'));
+    const config = defaultConfig(home);
+    const store = openStore(config.dbPath);
+    try {
+      beginCutover(store, 1);
+      const db = new DatabaseSync(store.dbPath);
+      try { db.prepare("UPDATE lifecycle SET state = 'cutover', window_end = ?").run(1); } finally { db.close(); }
+    } finally { store.close(); }
+    const report = await doctorQlb(config, { command: () => '', hostCommand: () => '' });
+    assert.deepEqual(report.checks.find((check) => check.name === 'lifecycle:window'),
+      { name: 'lifecycle:window', level: 'WARN', message: 'cutover window has ended; run report cutover' });
+    assert.deepEqual(report.checks.find((check) => check.name === 'lifecycle:drill'),
+      { name: 'lifecycle:drill', level: 'WARN', message: 'cutover fire drill is not recorded' });
+  });
+
   it('persists the undo and retirement transition timestamps and only reopens after lifecycle close', () => {
     const store = fixtureStore();
     try {
@@ -118,6 +187,19 @@ describe('lifecycle (AC49)', () => {
       assert.equal(closeLifecycle(store, aborted.id, 'fixture', 40).ok, true);
       assert.equal(phase(store).state, 'pre-cutover');
       assert.equal(beginCutover(store, 50).state, 'cutting-over');
+    } finally { store.close(); }
+  });
+
+  it('uses compare-and-set transitions so a competing transition is refused', () => {
+    const store = fixtureStore();
+    try {
+      beginCutover(store, 10);
+      const db = new DatabaseSync(store.dbPath);
+      try { db.prepare("UPDATE lifecycle SET state = 'cutover'").run(); } finally { db.close(); }
+      // The first contender wins; the second cannot overwrite its result.
+      assert.equal(transition(store, 'retired', 20).ok, true);
+      assert.equal(transition(store, 'undoing', 21).ok, false);
+      assert.equal(phase(store).state, 'retired');
     } finally { store.close(); }
   });
 
