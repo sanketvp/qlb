@@ -7,7 +7,7 @@ import { openStore } from '../store';
 import type { CommandDefinition, CommandContext } from '../registry';
 
 export type HelperMatrixCase = 'pass' | 'fail' | 'not-applicable';
-type HelperMatrixCaseName = 'securityCreated' | 'previousHelper' | 'helperCreated';
+type HelperMatrixCaseName = 'securityCreated' | 'securityUntrusted' | 'previousHelper' | 'helperCreated';
 export interface HelperMatrixResult {
   cases: Record<HelperMatrixCaseName, HelperMatrixCase>;
   /** S50 prompt evidence retained separately for each disposable case. */
@@ -49,7 +49,7 @@ export function parseHelperMatrixResult(text: string): HelperMatrixResult {
     prompted?: unknown;
   };
   const { cases, casePrompted, caseReasons } = value;
-  const keys = ['securityCreated', 'previousHelper', 'helperCreated'] as const;
+  const keys = ['securityCreated', 'securityUntrusted', 'previousHelper', 'helperCreated'] as const;
   if (!cases || !casePrompted || !caseReasons || typeof cases !== 'object' || typeof casePrompted !== 'object' || typeof caseReasons !== 'object' || typeof value.prompted !== 'boolean') throw new Error('invalid helper matrix receipt');
   for (const key of keys) {
     const outcome = cases[key];
@@ -71,6 +71,7 @@ export function parseHelperMatrixResult(text: string): HelperMatrixResult {
 export function helperMatrixIsOk(result: HelperMatrixResult): boolean {
   return !result.prompted &&
     result.cases.securityCreated === 'pass' &&
+    result.cases.securityUntrusted === 'pass' &&
     result.cases.helperCreated === 'pass' &&
     (result.cases.previousHelper === 'pass' || result.cases.previousHelper === 'not-applicable');
 }
@@ -94,7 +95,7 @@ function executeMatrix(path: string, args: string[]): string {
   }
 }
 
-/** Executes only the disposable three-case helper matrix; no credential bytes are accepted here. */
+/** Executes only the disposable four-case helper matrix; no credential bytes are accepted here. */
 export function runHelperMatrix(path: string = helperPath(), runner: MatrixRunner = executeMatrix): HelperMatrixResult {
   assertHelperReady(path);
   return parseHelperMatrixResult(runner(path, ['matrix', 'qlb-test-matrix-', join(process.env.HOME ?? '', '.qlb/helper-prev/qlb-keychain-helper')]));
@@ -104,7 +105,7 @@ function xml(value: string): string {
   return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
-/** Runs the disposable three-case helper matrix in a temporary one-shot LaunchAgent. */
+/** Runs the disposable four-case helper matrix in a temporary one-shot LaunchAgent. */
 export function runHelperMatrixUnderLaunchd(path: string = helperPath()): HelperMatrixResult {
   assertHelperReady(path);
   const uid = process.getuid?.();

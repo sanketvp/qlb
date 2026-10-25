@@ -93,6 +93,14 @@ private func set(_ service: String, _ account: String, _ data: Data) {
     guard addStatus == errSecSuccess else { fail("add failed", addStatus) }
 }
 
+private func read(_ service: String, _ account: String) -> (status: OSStatus, data: Data?) {
+    var lookup = query(service, account)
+    lookup[kSecReturnData] = true
+    var result: CFTypeRef?
+    let status = SecItemCopyMatching(lookup as CFDictionary, &result)
+    return (status, result as? Data)
+}
+
 private func delete(_ service: String, _ account: String) {
     let status = SecItemDelete(query(service, account) as CFDictionary)
     guard status == errSecSuccess || status == errSecItemNotFound else { fail("delete failed", status) }
@@ -104,12 +112,9 @@ private func selftest(_ service: String) {
     let payload = Data(UUID().uuidString.utf8)
     defer { delete(service, account) }
     set(service, account, payload)
-    var lookup = query(service, account)
-    lookup[kSecReturnData] = true
-    var result: CFTypeRef?
-    let status = SecItemCopyMatching(lookup as CFDictionary, &result)
-    guard status == errSecSuccess, let roundTrip = result as? Data, roundTrip == payload else {
-        fail("selftest readback failed", status)
+    let readback = read(service, account)
+    guard readback.status == errSecSuccess, let roundTrip = readback.data, roundTrip == payload else {
+        fail("selftest readback failed", readback.status)
     }
 }
 
@@ -148,8 +153,12 @@ private func run(_ executable: String, _ arguments: [String], input: Data? = nil
     return CommandResult(status: timedOut ? 1 : process.terminationStatus, output: text, timedOut: timedOut)
 }
 
+private func promptStatus(_ status: OSStatus) -> Bool {
+    status == errSecAuthFailed || status == errSecInteractionNotAllowed || status == errSecUserCanceled
+}
+
 private func promptFailure(_ result: CommandResult) -> Bool {
-    result.timedOut || result.output.contains("-25293") || result.output.contains("-25308")
+    result.timedOut || result.output.contains("errSecAuthFailed") || result.output.contains("errSecInteractionNotAllowed") || result.output.contains("errSecUserCanceled")
 }
 
 private func matrix(_ prefix: String, previousHelper: String? = nil) {
@@ -157,33 +166,42 @@ private func matrix(_ prefix: String, previousHelper: String? = nil) {
     let account = "qlb"
     let marker = Data("matrix-\(UUID().uuidString)".utf8)
     let suffix = UUID().uuidString.lowercased()
-    let services = ["\(prefix)security-\(suffix)", "\(prefix)previous-\(suffix)", "\(prefix)helper-\(suffix)"]
-    var cases: [String: MatrixCase] = ["securityCreated": "fail", "previousHelper": "fail", "helperCreated": "fail"]
-    var casePrompted: [String: Bool] = ["securityCreated": false, "previousHelper": false, "helperCreated": false]
-    var caseReasons: [String: Any] = ["securityCreated": NSNull(), "previousHelper": NSNull(), "helperCreated": NSNull()]
+    let services = ["\(prefix)security-\(suffix)", "\(prefix)untrusted-\(suffix)", "\(prefix)previous-\(suffix)", "\(prefix)helper-\(suffix)"]
+    var cases: [String: MatrixCase] = ["securityCreated": "fail", "securityUntrusted": "fail", "previousHelper": "fail", "helperCreated": "fail"]
+    var casePrompted: [String: Bool] = ["securityCreated": false, "securityUntrusted": false, "previousHelper": false, "helperCreated": false]
+    var caseReasons: [String: Any] = ["securityCreated": NSNull(), "securityUntrusted": NSNull(), "previousHelper": NSNull(), "helperCreated": NSNull()]
     var prompted = false
     defer { for service in services { _ = run("/usr/bin/security", ["delete-generic-password", "-a", account, "-s", service]) } }
 
-    let securityCreated = run("/usr/bin/security", ["add-generic-password", "-a", account, "-s", services[0], "-w", String(data: marker, encoding: .utf8)!])
+    let securityCreated = run("/usr/bin/security", ["add-generic-password", "-a", account, "-s", services[0], "-w", String(data: marker, encoding: .utf8)!, "-T", helperExecutablePath()])
     let securityUpdate = securityCreated.status == 0 ? run(helperExecutablePath(), ["set", services[0], account], input: marker) : securityCreated
     casePrompted["securityCreated"] = promptFailure(securityCreated) || promptFailure(securityUpdate)
     prompted = casePrompted["securityCreated"]!
     if securityCreated.status == 0 && securityUpdate.status == 0 { cases["securityCreated"] = "pass" }
+
+    let securityUntrusted = run("/usr/bin/security", ["add-generic-password", "-a", account, "-s", services[1], "-w", String(data: marker, encoding: .utf8)!])
+    let untrustedUpdate = securityUntrusted.status == 0 ? run(helperExecutablePath(), ["set", services[1], account], input: Data("matrix-update-\(UUID().uuidString)".utf8)) : securityUntrusted
+    let untrustedRead = securityUntrusted.status == 0 ? read(services[1], account) : (status: errSecItemNotFound, data: nil)
+    casePrompted["securityUntrusted"] = promptFailure(securityUntrusted) || promptFailure(untrustedUpdate) || promptStatus(untrustedRead.status)
+    prompted = prompted || casePrompted["securityUntrusted"]!
+    if securityUntrusted.status == 0 && untrustedUpdate.status != 0 && untrustedUpdate.output.contains("errSec") && untrustedRead.status == errSecSuccess && untrustedRead.data == marker {
+        cases["securityUntrusted"] = "pass"
+    }
 
     let previous = previousHelper ?? (NSHomeDirectory() as NSString).appendingPathComponent(".qlb/helper-prev/qlb-keychain-helper")
     if !FileManager.default.isExecutableFile(atPath: previous) {
         cases["previousHelper"] = notApplicable
         caseReasons["previousHelper"] = "no previous helper"
     } else {
-        let previousCreate = run(previous, ["set", services[1], account], input: marker)
-        let currentUpdate = previousCreate.status == 0 ? run(helperExecutablePath(), ["set", services[1], account], input: marker) : previousCreate
+        let previousCreate = run(previous, ["set", services[2], account], input: marker)
+        let currentUpdate = previousCreate.status == 0 ? run(helperExecutablePath(), ["set", services[2], account], input: marker) : previousCreate
         casePrompted["previousHelper"] = promptFailure(previousCreate) || promptFailure(currentUpdate)
         prompted = prompted || casePrompted["previousHelper"]!
         if previousCreate.status == 0 && currentUpdate.status == 0 { cases["previousHelper"] = "pass" }
     }
 
-    let helperCreate = run(helperExecutablePath(), ["set", services[2], account], input: marker)
-    let securityRead = helperCreate.status == 0 ? run("/usr/bin/security", ["find-generic-password", "-a", account, "-s", services[2], "-w"]) : helperCreate
+    let helperCreate = run(helperExecutablePath(), ["set", services[3], account], input: marker)
+    let securityRead = helperCreate.status == 0 ? run("/usr/bin/security", ["find-generic-password", "-a", account, "-s", services[3], "-w"]) : helperCreate
     casePrompted["helperCreated"] = promptFailure(helperCreate) || promptFailure(securityRead)
     prompted = prompted || casePrompted["helperCreated"]!
     if helperCreate.status == 0 && securityRead.status == 0 && Data(securityRead.output.trimmingCharacters(in: .newlines).utf8) == marker {
