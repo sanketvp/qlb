@@ -12,6 +12,7 @@ import {
   withServiceGuard,
   type ExecFileSyncFn,
 } from '../src/keychain';
+import { withUndoCapability } from '../src/keychain-allowlist';
 
 const MACOS_USER = 'test-macos-user';
 
@@ -64,14 +65,46 @@ describe('Keychain access allowlist', () => {
     }
   });
 
-  it('allows claude-swap reads only', () => {
+  it('allows claude-swap reads only outside the undo capability', () => {
     const { backend, calls } = guardedFakeSecurity();
     assert.equal(backend.getSync('claude-swap', 'legacy-account'), 'saved-value');
     assert.throws(
       () => backend.setSync('claude-swap', 'legacy-account', 'secret'),
       KeychainAccessDeniedError,
     );
+    assert.throws(
+      () => backend.deleteSync('claude-swap', 'legacy-account'),
+      KeychainAccessDeniedError,
+    );
     assert.equal(calls.length, 1);
+  });
+
+  it('grants claude-swap writes and deletes only while the undo capability is held', () => {
+    const { backend, calls } = guardedFakeSecurity();
+
+    assert.throws(
+      () => backend.setSync('claude-swap', 'legacy-account', 'secret'),
+      KeychainAccessDeniedError,
+    );
+    assert.throws(
+      () => backend.deleteSync('claude-swap', 'legacy-account'),
+      KeychainAccessDeniedError,
+    );
+
+    withUndoCapability(() => {
+      backend.setSync('claude-swap', 'legacy-account', 'secret');
+      backend.deleteSync('claude-swap', 'legacy-account');
+      assert.throws(
+        () => backend.setSync('pi-openrouter', 'legacy-account', 'secret'),
+        KeychainAccessDeniedError,
+      );
+    });
+
+    assert.throws(
+      () => backend.setSync('claude-swap', 'legacy-account', 'secret'),
+      KeychainAccessDeniedError,
+    );
+    assert.equal(calls.length, 2);
   });
 
   it('allows pi-openrouter reads only', () => {
