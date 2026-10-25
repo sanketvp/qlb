@@ -9,7 +9,7 @@ import {
   tokenCallAllowed,
   type TokenCommandDeps,
 } from '../src/commands/token';
-import { MockKeychain, qlbKeychainService } from '../src/keychain';
+import { MockKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from '../src/keychain';
 import { resolve as resolveKimi } from '../src/token/kimi-coding';
 import { resolve as resolveOpenRouter } from '../src/token/openrouter';
 import { resolve as resolveXai } from '../src/token/xai';
@@ -38,13 +38,17 @@ function allowedDeps(script: string, root: string): TokenCommandDeps {
 describe('qlb token', () => {
   it('resolves only the QLB-owned default credential for each supported provider', () => {
     const keychain = new MockKeychain();
-    keychain.setSync(qlbKeychainService('xai', 'default'), 'default', JSON.stringify({ access: 'fake-xai-access', refresh: 'fake-xai-refresh', expires: 123 }));
-    keychain.setSync(qlbKeychainService('kimi-coding', 'default'), 'default', JSON.stringify({ access: 'fake-kimi-access', refresh: 'fake-kimi-refresh', expires: 456 }));
-    keychain.setSync(qlbKeychainService('openrouter', 'default'), 'default', JSON.stringify({ type: 'api-key', access: 'fake-openrouter-key' }));
+    keychain.setSync(qlbKeychainService('xai', 'default'), QLB_KEYCHAIN_ACCOUNT, JSON.stringify({ access: 'fake-xai-access', refresh: 'fake-xai-refresh', expires: 123 }));
+    keychain.setSync(qlbKeychainService('kimi-coding', 'default'), QLB_KEYCHAIN_ACCOUNT, JSON.stringify({ access: 'fake-kimi-access', refresh: 'fake-kimi-refresh', expires: 456 }));
+    keychain.setSync(qlbKeychainService('openrouter', 'default'), QLB_KEYCHAIN_ACCOUNT, JSON.stringify({ type: 'api-key', access: 'fake-openrouter-key' }));
 
     assert.deepEqual(resolveXai({ keychain }), { token: 'fake-xai-access', accountId: 'default', expiresAt: 123, source: 'keychain' });
     assert.deepEqual(resolveKimi({ keychain }), { token: 'fake-kimi-access', accountId: 'default', expiresAt: 456, source: 'keychain' });
     assert.deepEqual(resolveOpenRouter({ keychain }), { token: 'fake-openrouter-key', accountId: 'default', source: 'keychain' });
+
+    const wrongAccount = new MockKeychain();
+    wrongAccount.setSync(qlbKeychainService('xai', 'default'), 'default', JSON.stringify({ access: 'fake-wrong-account' }));
+    assert.throws(() => resolveXai({ keychain: wrongAccount }), /credential unavailable/);
   });
 
   it('requires the Pi marker, Node direct parent, Pi dist script, and a non-TTY', () => {
@@ -55,8 +59,15 @@ describe('qlb token', () => {
     assert.equal(tokenCallAllowed({ QLB_PI_TOKEN_CALL: '1' }, base), true);
     assert.equal(tokenCallAllowed({}, base), false);
     assert.equal(tokenCallAllowed({ QLB_PI_TOKEN_CALL: '1' }, { ...base, parent: () => ({ comm: 'node', command: 'node /tmp/not-pi.js' }) }), false);
+    assert.equal(tokenCallAllowed({ QLB_PI_TOKEN_CALL: '1' }, { ...base, parent: () => ({ comm: 'node', command: `node /tmp/other.js ${script}` }) }), false);
+    assert.equal(tokenCallAllowed({ QLB_PI_TOKEN_CALL: '1' }, { ...base, parent: () => ({ comm: 'node', command: `node -r ${script} /tmp/x.js` }) }), false);
     assert.equal(tokenCallAllowed({ QLB_PI_TOKEN_CALL: '1' }, { ...base, parent: () => ({ comm: 'python3', command: `python3 ${script}` }) }), false);
     assert.equal(tokenCallAllowed({ QLB_PI_TOKEN_CALL: '1' }, { ...base, isTty: () => true }), false);
+
+    assert.equal(tokenCallAllowed({ QLB_PI_TOKEN_CALL: '1', QLB_PI_PACKAGE_ROOT: '/tmp/untrusted-root' }, {
+      ...base,
+      piPackageRoot: (env) => env.QLB_PI_PACKAGE_ROOT ?? root,
+    }), true);
   });
 
   it('writes a credential only after S30 passes and refuses all other providers silently', async () => {
@@ -79,6 +90,7 @@ describe('qlb token', () => {
 
     assert.equal(await executeToken(['xai'], ctx, deps), 0);
     assert.deepEqual(output, ['fake-command-access']);
+    assert.equal(await executeToken(['xai'], ctx, { ...deps, guard: () => false }), 3);
     assert.equal(await executeToken(['anthropic'], ctx, deps), 3);
     assert.deepEqual(errors, []);
     assert.deepEqual(output, ['fake-command-access']);

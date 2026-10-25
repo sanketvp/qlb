@@ -14,7 +14,7 @@ type Resolver = { resolve(): TokenResolution };
 
 export interface TokenCallGuardDeps {
   parent?: () => ParentProcess | null;
-  piPackageRoot?: () => string | null;
+  piPackageRoot?: (env: NodeJS.ProcessEnv) => string | null;
   isTty?: () => boolean;
 }
 
@@ -34,32 +34,45 @@ function parentProcess(): ParentProcess | null {
 }
 
 function packageRoot(env: NodeJS.ProcessEnv = process.env): string | null {
-  return locatePi(env).root;
+  const piEnv = env.QLB_TEST_MODE === '1'
+    ? env
+    : { ...env, QLB_PI_PACKAGE_ROOT: undefined };
+  return locatePi(piEnv).root;
 }
 
 function commandWords(command: string): string[] {
   return command.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g)?.map((word) => word.replace(/^(?:"|')|(?:"|')$/g, '')) ?? [];
 }
 
+const NODE_OPTIONS_WITH_SEPARATE_VALUE = new Set([
+  '-r', '--require', '--import', '--loader', '--experimental-loader', '-e', '--eval',
+  '-p', '--print', '--input-type', '--conditions', '-C',
+]);
+
 function scriptIsInsidePiDist(command: string, root: string): boolean {
+  const [executable, ...args] = commandWords(command);
+  if (!executable || !/^node(?:js)?$/i.test(basename(executable))) return false;
+
+  let scriptWord: string | undefined;
+  for (const arg of args) {
+    if (arg.startsWith('-')) {
+      if (NODE_OPTIONS_WITH_SEPARATE_VALUE.has(arg)) return false;
+      continue;
+    }
+    scriptWord = arg;
+    break;
+  }
+  if (!scriptWord || !scriptWord.startsWith('/')) return false;
+
   let packageRoot: string;
   try {
     packageRoot = realpathSync(root);
+    const script = realpathSync(scriptWord);
+    const pathFromDist = relative(join(packageRoot, 'dist'), script);
+    return Boolean(pathFromDist) && !pathFromDist.startsWith('..') && !pathFromDist.includes('../');
   } catch {
     return false;
   }
-  const dist = join(packageRoot, 'dist');
-  for (const word of commandWords(command)) {
-    if (!word.startsWith('/')) continue;
-    try {
-      const script = realpathSync(word);
-      const pathFromDist = relative(dist, script);
-      if (pathFromDist && !pathFromDist.startsWith('..') && !pathFromDist.includes('../')) return true;
-    } catch {
-      // A non-path argument is not the Pi extension host script.
-    }
-  }
-  return false;
 }
 
 /** S30's accidental-secret-disclosure guard. Any uncertainty is a refusal. */
@@ -71,7 +84,10 @@ export function tokenCallAllowed(
   if ((deps.isTty ?? (() => process.stdin.isTTY === true || process.stdout.isTTY === true))()) return false;
   const parent = (deps.parent ?? parentProcess)();
   if (!parent || !/^node(?:js)?$/i.test(basename(parent.comm))) return false;
-  const root = deps.piPackageRoot ? deps.piPackageRoot() : packageRoot(env);
+  const piEnv = env.QLB_TEST_MODE === '1'
+    ? env
+    : { ...env, QLB_PI_PACKAGE_ROOT: undefined };
+  const root = deps.piPackageRoot ? deps.piPackageRoot(piEnv) : packageRoot(piEnv);
   return typeof root === 'string' && scriptIsInsidePiDist(parent.command, root);
 }
 

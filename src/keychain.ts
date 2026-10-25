@@ -70,8 +70,11 @@ export {
 /** Existing name used by migration / refresh-lease / credentials. */
 export type KeychainBackend = CredentialBackend;
 
+/** Spec Keychain table: account attribute for every QLB-owned `qlb:*` item. */
+export const QLB_KEYCHAIN_ACCOUNT = 'qlb';
+
 /** Account used when looking up unscoped native secrets (OpenRouter). */
-export const NATIVE_SECRET_ACCOUNT = 'qlb';
+export const NATIVE_SECRET_ACCOUNT = QLB_KEYCHAIN_ACCOUNT;
 
 /** @deprecated Use assertKeychainAccess when an operation and account are known. */
 export function isSafeKeychainService(service: string): boolean {

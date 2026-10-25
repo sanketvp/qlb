@@ -1,4 +1,4 @@
-import { platformKeychain, qlbKeychainService, type KeychainBackend } from '../keychain';
+import { platformKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, type KeychainBackend } from '../keychain';
 
 export interface TokenResolution {
   token: string;
@@ -19,7 +19,7 @@ function credentialUnavailable(): Error {
 export function resolve({ keychain = platformKeychain }: TokenResolverDeps = {}): TokenResolution {
   let parsed: unknown;
   try {
-    parsed = JSON.parse(keychain.getSync(qlbKeychainService('xai', 'default'), 'default'));
+    parsed = JSON.parse(keychain.getSync(qlbKeychainService('xai', 'default'), QLB_KEYCHAIN_ACCOUNT));
   } catch {
     throw credentialUnavailable();
   }
