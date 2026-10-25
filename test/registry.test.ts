@@ -7,7 +7,18 @@ import { describe, it } from 'node:test';
 
 import { loadProviderStub } from '../src/provider-loader';
 import { builtInAdapters } from '../src/adapters';
-import { KNOWN_PROVIDER_NAMES, discoverChecks } from '../src/registry';
+import {
+  KNOWN_PROVIDER_NAMES,
+  discoverChecks,
+  discoverCommands,
+} from '../src/registry';
+import {
+  createCommandContext,
+  dispatchCommand,
+  listCommandNames,
+  prepareCommandArgv,
+  runExecutingCommand,
+} from '../src/cli';
 
 describe('registries', () => {
   it('loads source modules when discovery is explicitly given the ts-node extension', () => {
@@ -59,6 +70,92 @@ describe('registries', () => {
       scripts: { test: string };
     };
     assert.match(packageJson.scripts.test, /clean-registry-output\.cjs dist-test\/src/);
+  });
+
+  it('discovers and dispatches executing fragments by their longest command prefix', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'qlb-registry-command-'));
+    writeFileSync(
+      join(directory, 'short.js'),
+      "module.exports = { default: { name: 'fixture', execute(args, ctx) { ctx.stdout(`short:${args.join(',')}`); return 11; } } };\n",
+    );
+    writeFileSync(
+      join(directory, 'long.js'),
+      "module.exports = { default: { name: 'fixture deploy', execute(args, ctx) { ctx.stdout(`long:${args.join(',')}`); return args[0] === '--help' ? 0 : 37; } } };\n",
+    );
+    const commands = discoverCommands(directory, ['.js']);
+    const output: string[] = [];
+    const context = { ...createCommandContext(), stdout: (line: string) => output.push(line) };
+
+    assert.deepEqual(JSON.parse(JSON.stringify(listCommandNames(commands))), ['fixture', 'fixture deploy']);
+    assert.equal(
+      await dispatchCommand(['node', 'qlb', 'fixture', 'deploy', '--target', 'temporary'], commands, context),
+      37,
+    );
+    assert.deepEqual(output, ['long:--target,temporary']);
+    assert.equal(await dispatchCommand(['node', 'qlb', 'fixture', 'deploy', '--help'], commands, context), 0);
+    assert.deepEqual(output, ['long:--target,temporary', 'long:--help']);
+  });
+
+  it('redacts credential-like environment values at executing-command error boundaries', async () => {
+    const secret = 'opaque-refresh-abc123XYZ';
+    const output: string[] = [];
+    const context = createCommandContext();
+    context.env = { QLB_TEST_REFRESH_TOKEN: secret };
+    context.stderr = (line: string) => output.push(line);
+
+    assert.equal(await runExecutingCommand({
+      command: { name: 'fixture', execute: () => { throw new Error(`failed: ${secret}`); } },
+      args: [],
+    }, context), 1);
+    assert.match(output[0], /\[redacted\]/);
+    assert.doesNotMatch(output[0], new RegExp(secret));
+  });
+
+  it('redacts secrets registered by executing handlers at their error boundary', async () => {
+    const secret = 'opaque-runtime-abc123XYZ';
+    const output: string[] = [];
+    const context = createCommandContext();
+    context.env = {};
+    context.stderr = (line: string) => output.push(line);
+
+    assert.equal(await runExecutingCommand({
+      command: {
+        name: 'fixture',
+        execute: (_args, ctx) => {
+          ctx.registerSecret(secret);
+          throw new Error(`failed: ${secret}`);
+        },
+      },
+      args: [],
+    }, context), 1);
+    assert.match(output[0], /\[redacted\]/);
+    assert.doesNotMatch(output[0], new RegExp(secret));
+  });
+
+  it('does not treat short or non-credential environment values as executing-command secrets', async () => {
+    const shortSecret = 'short';
+    const nonCredentialValue = 'opaque-home-abc123XYZ';
+    const output: string[] = [];
+    const context = createCommandContext();
+    context.env = { QLB_TEST_TOKEN: shortSecret, HOME: nonCredentialValue };
+    context.stderr = (line: string) => output.push(line);
+
+    assert.equal(await runExecutingCommand({
+      command: { name: 'fixture', execute: () => { throw new Error(`failed: ${shortSecret}, ${nonCredentialValue}`); } },
+      args: [],
+    }, context), 1);
+    assert.match(output[0], new RegExp(shortSecret));
+    assert.match(output[0], new RegExp(nonCredentialValue));
+    assert.doesNotMatch(output[0], /\[redacted\]/);
+  });
+
+  it('keeps legacy argv-rewrite fragments unchanged', () => {
+    assert.deepEqual(
+      prepareCommandArgv(['node', 'qlb', 'legacy', 'fragment', '--json'], [
+        { name: 'legacy fragment', run: (args) => ['legacy', '--flag', ...args] },
+      ]),
+      ['node', 'qlb', 'legacy', '--flag', '--json'],
+    );
   });
 
   it('removes stale registry output before a build', () => {
