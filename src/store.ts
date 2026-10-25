@@ -508,30 +508,125 @@ function schemaNeedsV5Correction(db: DatabaseSync): boolean {
 }
 
 function sqlWithoutLiteralsOrComments(sql: string): string {
-  return sql
-    .replace(/'(?:''|[^'])*'/g, "''")
-    .replace(/--[^\n]*/g, '')
-    .replace(/\/\*[\s\S]*?\*\//g, '');
+  let result = '';
+  for (let index = 0; index < sql.length;) {
+    const character = sql[index];
+    const next = sql[index + 1];
+    if (character === '-' && next === '-') {
+      index = sql.indexOf('\n', index + 2);
+      if (index === -1) break;
+      result += '\n';
+      index += 1;
+    } else if (character === '/' && next === '*') {
+      const end = sql.indexOf('*/', index + 2);
+      index = end === -1 ? sql.length : end + 2;
+      result += ' ';
+    } else if (character === '\'' || character === '"' || character === '`' || character === '[') {
+      const terminator = character === '[' ? ']' : character;
+      index += 1;
+      while (index < sql.length) {
+        if (sql[index] !== terminator) {
+          index += 1;
+          continue;
+        }
+        if (terminator !== ']' && sql[index + 1] === terminator) {
+          index += 2;
+          continue;
+        }
+        index += 1;
+        break;
+      }
+      result += ' ';
+    } else {
+      result += character;
+      index += 1;
+    }
+  }
+  return result;
 }
 
 function sqlReferencesTableIdentifier(sql: string, table: string): boolean {
   const escaped = table.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  return new RegExp(`(?:^|[^A-Za-z0-9_$])(?:${escaped}|"${escaped}"|\\[${escaped}\\]|\\x60${escaped}\\x60)(?=$|[^A-Za-z0-9_$])`, 'i').test(sqlWithoutLiteralsOrComments(sql));
+  const withoutStringsOrComments = sql
+    .replace(/'(?:''|[^'])*'/g, "''")
+    .replace(/--[^\n]*/g, '')
+    .replace(/\/\*[\s\S]*?\*\//g, '');
+  return new RegExp(`(?:^|[^A-Za-z0-9_$])(?:${escaped}|"${escaped}"|\\[${escaped}\\]|\\x60${escaped}\\x60)(?=$|[^A-Za-z0-9_$])`, 'i').test(withoutStringsOrComments);
 }
 
 function refuseInexactV5Rebuild(table: string, reason: string, verifiedBackupPath: string): never {
   throw new Error(`cannot correct pre-release v5 ${table}: ${reason}; verified backup: ${verifiedBackupPath}`);
 }
 
+interface V5TableFacts {
+  xinfo: TableColumn[];
+  constraintIndexes: string[];
+  strict: number;
+  withoutRowid: number;
+  sql: string;
+}
+
+function v5TableFacts(db: DatabaseSync, table: string): V5TableFacts {
+  const xinfo = db.prepare(`PRAGMA table_xinfo(${quoteIdentifier(table)})`).all() as unknown as TableColumn[];
+  const indexes = db.prepare(`PRAGMA index_list(${quoteIdentifier(table)})`).all() as Array<{ name: string; origin: string }>;
+  const constraintIndexes = indexes
+    .filter(({ origin }) => origin === 'u' || origin === 'pk')
+    .map(({ name, origin }) => {
+      const columns = db.prepare(`PRAGMA index_info(${quoteIdentifier(name)})`).all() as Array<{ name: string }>;
+      return `${origin}:${columns.map(({ name: column }) => column).join('\0')}`;
+    });
+  const tableList = db.prepare('PRAGMA table_list').all() as Array<{ name: string; strict: number; wr: number }>;
+  const options = tableList.find(({ name }) => name === table);
+  const master = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?").get(table) as { sql: string } | undefined;
+  if (!options || !master?.sql) throw new Error(`cannot inspect pre-release v5 ${table} table definition`);
+  return { xinfo, constraintIndexes, strict: Number(options.strict), withoutRowid: Number(options.wr), sql: master.sql };
+}
+
+function canonicalV5TableFacts(shape: V5TableShape, table: string): V5TableFacts {
+  const scratch = new DatabaseSync(':memory:');
+  try {
+    scratch.exec(shape.sql);
+    return v5TableFacts(scratch, table);
+  } finally {
+    scratch.close();
+  }
+}
+
+function containsSqlKeyword(sql: string, keyword: 'CHECK' | 'COLLATE'): boolean {
+  return new RegExp(`\\b${keyword}\\b`, 'i').test(sqlWithoutLiteralsOrComments(sql));
+}
+
 function assertV5RebuildCanBeExact(db: DatabaseSync, table: string, shape: V5TableShape, verifiedBackupPath: string): void {
-  const xinfo = db.prepare(`PRAGMA table_xinfo(${quoteIdentifier(table)})`).all() as unknown as Array<TableColumn & { hidden: number }>;
+  const actual = v5TableFacts(db, table);
+  const expected = canonicalV5TableFacts(shape, table);
+  if (actual.strict !== expected.strict || actual.withoutRowid !== expected.withoutRowid) {
+    refuseInexactV5Rebuild(table, 'table options differ from the canonical definition', verifiedBackupPath);
+  }
+
   const canonical = new Set(shape.columns.map(({ name }) => name));
-  const extra = xinfo.find(({ name }) => !canonical.has(name));
+  const extra = actual.xinfo.find(({ name }) => !canonical.has(name));
   if (extra) {
     refuseInexactV5Rebuild(table, `column ${extra.name} is not in the canonical definition and cannot be reproduced`, verifiedBackupPath);
   }
 
-  const actualPrimaryKey = xinfo
+  const expectedColumns = new Map(expected.xinfo.map((column) => [column.name, column]));
+  for (const column of actual.xinfo) {
+    const canonicalColumn = expectedColumns.get(column.name);
+    if (!canonicalColumn) continue;
+    if (column.type.trim().toLowerCase() !== canonicalColumn.type.trim().toLowerCase()) {
+      refuseInexactV5Rebuild(table, `column ${column.name} type differs from the canonical definition`, verifiedBackupPath);
+    }
+    if (Boolean(column.notnull) && !Boolean(canonicalColumn.notnull)) {
+      refuseInexactV5Rebuild(table, `column ${column.name} not-null constraint differs from the canonical definition`, verifiedBackupPath);
+    }
+    const actualDefault = normalizedDefault(column.dflt_value);
+    const canonicalDefault = normalizedDefault(canonicalColumn.dflt_value);
+    if (actualDefault !== canonicalDefault && actualDefault !== null) {
+      refuseInexactV5Rebuild(table, `column ${column.name} default differs from the canonical definition`, verifiedBackupPath);
+    }
+  }
+
+  const actualPrimaryKey = actual.xinfo
     .filter(({ pk }) => pk > 0)
     .sort((left, right) => left.pk - right.pk)
     .map(({ name, pk }) => `${pk}:${name.toLowerCase()}`);
@@ -541,6 +636,22 @@ function assertV5RebuildCanBeExact(db: DatabaseSync, table: string, shape: V5Tab
     .map(({ name, primaryKeyOrder }) => `${primaryKeyOrder}:${name.toLowerCase()}`);
   if (actualPrimaryKey.join('\0') !== canonicalPrimaryKey.join('\0')) {
     refuseInexactV5Rebuild(table, 'primary-key columns differ from the canonical definition', verifiedBackupPath);
+  }
+
+  const expectedIndexCounts = new Map<string, number>();
+  for (const index of expected.constraintIndexes) expectedIndexCounts.set(index, (expectedIndexCounts.get(index) ?? 0) + 1);
+  for (const index of actual.constraintIndexes) {
+    const remaining = expectedIndexCounts.get(index) ?? 0;
+    if (remaining === 0) {
+      refuseInexactV5Rebuild(table, 'unique index differs from the canonical definition', verifiedBackupPath);
+    }
+    expectedIndexCounts.set(index, remaining - 1);
+  }
+
+  for (const keyword of ['CHECK', 'COLLATE'] as const) {
+    if (containsSqlKeyword(actual.sql, keyword) && !containsSqlKeyword(expected.sql, keyword)) {
+      refuseInexactV5Rebuild(table, `${keyword} differs from the canonical definition`, verifiedBackupPath);
+    }
   }
 
   const ownForeignKeys = db.prepare(`PRAGMA foreign_key_list(${quoteIdentifier(table)})`).all();

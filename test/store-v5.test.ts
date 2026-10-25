@@ -232,6 +232,53 @@ describe('store v5 schema (AC38)', () => {
         reason: /primary-key columns differ from the canonical definition/,
       },
       {
+        name: 'a non-canonical UNIQUE constraint on a canonical column',
+        alias: 'alias TEXT UNIQUE',
+        extra: '',
+        dependent: '',
+        reason: /unique index differs from the canonical definition/,
+      },
+      {
+        name: 'a table-level UNIQUE constraint on a canonical column',
+        extra: 'UNIQUE(alias)',
+        dependent: '',
+        reason: /unique index differs from the canonical definition/,
+      },
+      {
+        name: 'a CHECK constraint on a canonical column',
+        extra: 'CHECK (dead IN (0, 1))',
+        dependent: '',
+        reason: /CHECK differs from the canonical definition/,
+      },
+      {
+        name: 'a COLLATE constraint on a canonical column',
+        alias: 'alias TEXT COLLATE NOCASE',
+        extra: '',
+        dependent: '',
+        reason: /COLLATE differs from the canonical definition/,
+      },
+      {
+        name: 'a STRICT table option',
+        extra: '',
+        tableOptions: 'STRICT',
+        dependent: '',
+        reason: /table options differ from the canonical definition/,
+      },
+      {
+        name: 'a WITHOUT ROWID table option',
+        extra: '',
+        tableOptions: 'WITHOUT ROWID',
+        dependent: '',
+        reason: /table options differ from the canonical definition/,
+      },
+      {
+        name: 'a CHECK-looking string literal default',
+        alias: "alias TEXT DEFAULT 'CHECK (x)'",
+        extra: '',
+        dependent: '',
+        reason: /default differs from the canonical definition/,
+      },
+      {
         name: 'a foreign key declared by the table',
         extra: 'FOREIGN KEY (account_id) REFERENCES accounts(id)',
         dependent: '',
@@ -270,11 +317,11 @@ describe('store v5 schema (AC38)', () => {
       const db = new DatabaseSync(path);
       db.exec(`DROP TABLE claude_slots;
         CREATE TABLE claude_slots (
-          ${fixture.accountId ?? 'account_id TEXT PRIMARY KEY'}, email TEXT, alias TEXT, org_uuid TEXT, config_json TEXT NOT NULL,
+          ${fixture.accountId ?? 'account_id TEXT PRIMARY KEY'}, email TEXT, ${fixture.alias ?? 'alias TEXT'}, org_uuid TEXT, config_json TEXT NOT NULL,
           fingerprint TEXT, prev_fingerprint TEXT, threshold REAL, dead INTEGER NOT NULL DEFAULT 0,
           dead_reason TEXT, dead_at INTEGER, healed_at INTEGER, added_at INTEGER NOT NULL,
           last_active_at INTEGER, source TEXT, archived_at INTEGER${fixture.extra ? `, ${fixture.extra}` : ''}
-        );
+        )${fixture.tableOptions ? ` ${fixture.tableOptions}` : ''};
         ${fixture.dependent}`);
       db.close();
       const before = readFileSync(path);
