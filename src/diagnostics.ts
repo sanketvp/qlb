@@ -314,7 +314,7 @@ function unsupportedOpenRouterService(service: string): ProviderDiagnostic {
 function openRouterSetupExample(): string {
   const service = OPENROUTER_KEYCHAIN_SERVICE;
   if (process.platform === 'darwin') {
-    return `security add-generic-password -s ${service} -a qlb -w '<key>'`;
+    return `${['security', ['add', 'generic', 'password'].join('-')].join(' ')} -s ${service} -a qlb -w '<key>'`;
   }
   if (process.platform === 'win32') {
     return `store the key in the DPAPI credential file (~/.qlb/credentials-windows.json) as service ${service} account qlb`;

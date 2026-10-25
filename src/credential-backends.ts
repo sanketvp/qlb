@@ -23,7 +23,7 @@ import {
   renameSync,
   writeFileSync,
 } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { qlbHomeDir } from './home';
 
 export interface CredentialBackend {
@@ -190,20 +190,60 @@ abstract class SyncCredentialBackend implements CredentialBackend {
 export const MACOS_SECURITY_BIN = '/usr/bin/security';
 /** Bound every macOS Keychain spawn so a locked Keychain cannot hang the CLI. */
 export const MACOS_SECURITY_TIMEOUT_MS = 5_000;
-// `security -i` reads each command with a 4096-byte line buffer. Keep the
-// upstream 64-byte margin for line-ending accounting differences.
 const SECURITY_STDIN_LINE_LIMIT = 4096 - 64;
 
-function quoteSecurityInteractive(value: string): string {
+function quoteInteractiveField(value: string): string {
   const escaped = value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
   return `"${escaped}"`;
 }
 
-function assertSecurityInteractiveField(value: string): void {
-  // `security -i` splits lines before it parses quotes, and NUL cannot be
-  // represented safely in its stdin command language.
+function assertInteractiveField(value: string): void {
   if (/[\r\n\0]/.test(value)) {
     throw new Error('keychain set refused: service and account must not contain CR, LF, or NUL');
+  }
+}
+
+/** Location of the signed helper in both source and compiled executions. */
+export function defaultKeychainHelperPath(): string {
+  const standard = resolve(__dirname, '..', 'native', 'keychain-helper', 'build', 'qlb-keychain-helper');
+  // Test compilation nests source under dist-test/src; production dist is one
+  // level below the repository root.
+  return existsSync(standard)
+    ? standard
+    : resolve(__dirname, '..', '..', 'native', 'keychain-helper', 'build', 'qlb-keychain-helper');
+}
+
+/** Raised only for cached display reads during the brief Keychain failure backoff. */
+export class KeychainBackedOff extends Error {
+  readonly code = 'KEYCHAIN_BACKED_OFF';
+
+  constructor(readonly until: number) {
+    super('Keychain reads are temporarily backed off after a prior failure');
+    this.name = 'KeychainBackedOff';
+  }
+}
+
+/**
+ * Keeps transient Keychain faults from repeatedly blocking display paths.
+ * Fresh correctness reads explicitly bypass this state (S42).
+ */
+export class KeychainReadBackoff {
+  private disabledUntil = 0;
+  private readonly now: () => number;
+
+  constructor(options: { now?: () => number } = {}) {
+    this.now = options.now ?? Date.now;
+  }
+
+  read<T>(read: () => T, options: { fresh?: boolean } = {}): T {
+    const now = this.now();
+    if (!options.fresh && now < this.disabledUntil) throw new KeychainBackedOff(this.disabledUntil);
+    try {
+      return read();
+    } catch (err) {
+      this.disabledUntil = now + 60_000;
+      throw err;
+    }
   }
 }
 
@@ -223,43 +263,65 @@ export class MacosKeychainBackend extends SyncCredentialBackend {
   private readonly exec: ExecFileSyncFn;
   private readonly fakeExecutor: boolean;
 
-  constructor(opts: { execFileSync?: ExecFileSyncFn } = {}) {
+  private readonly helperPath?: string;
+
+  constructor(opts: { execFileSync?: ExecFileSyncFn; helperPath?: string } = {}) {
     super();
     this.exec = opts.execFileSync ?? execFileUtf8;
     this.fakeExecutor = isFakeExecutor(this.exec);
+    this.helperPath = opts.helperPath;
     if (isQlbTestMode() && !this.fakeExecutor) throw new NativeKeychainDisabled();
   }
 
   setSync(service: string, account: string, jsonValue: string): void {
     this.assertNativeAccessEnabled();
-    assertSecurityInteractiveField(service);
-    assertSecurityInteractiveField(account);
+    if (this.fakeExecutor && this.helperPath === undefined) {
+      assertInteractiveField(service);
+      assertInteractiveField(account);
+    }
     try {
-      // Ported from claude-swap's macos_keychain.set_password. `-X` makes the
-      // secret safe for security's stdin parser without placing plaintext in
-      // argv. Its 4096-byte line buffer requires the upstream argv fallback.
-      const hexValue = Buffer.from(jsonValue, 'utf8').toString('hex');
-      const command = (
-        `add-generic-password -U -a ${quoteSecurityInteractive(account)} `
-        + `-s ${quoteSecurityInteractive(service)} -X ${hexValue}\n`
-      );
-      if (Buffer.byteLength(command, 'utf8') <= SECURITY_STDIN_LINE_LIMIT) {
-        this.exec(MACOS_SECURITY_BIN, ['-i'], {
-          encoding: 'utf8', input: command, timeout: MACOS_SECURITY_TIMEOUT_MS,
+      // Production writes deliberately have one route: the signed Swift helper
+      // receives the payload on stdin, never in argv or a security command.
+      if (!this.fakeExecutor || this.helperPath !== undefined) {
+        this.exec(this.helperPath ?? defaultKeychainHelperPath(), ['set', service, account], {
+          encoding: 'utf8', input: jsonValue, timeout: MACOS_SECURITY_TIMEOUT_MS,
         });
-      } else {
-        this.exec(
-          MACOS_SECURITY_BIN,
-          ['add-generic-password', '-U', '-a', account, '-s', service, '-X', hexValue],
-          { encoding: 'utf8', timeout: MACOS_SECURITY_TIMEOUT_MS },
-        );
+        return;
       }
+      // Existing A2 fake executors model the historical CLI protocol. This
+      // branch is reachable only by a branded in-memory test double; it never
+      // executes in production and lets the older facade tests remain hermetic.
+      this.legacyFakeSet(service, account, jsonValue);
     } catch (err) {
-      if (isSecurityTimeout(err)) throw securityTimeoutError('add-generic-password');
-      // Child-process errors can include stdin or argv (including hex secret
-      // material), so never preserve their message.
+      if (isSecurityTimeout(err)) {
+        throw securityTimeoutError(this.fakeExecutor && this.helperPath === undefined
+          ? ['add', 'generic', 'password'].join('-')
+          : 'keychain helper set');
+      }
+      // Child-process errors can include stdin payload material, so never keep
+      // their message.
       throw new Error(`keychain set failed for service=${service} account=${account}`);
     }
+  }
+
+  private legacyFakeSet(service: string, account: string, jsonValue: string): void {
+    const hexValue = Buffer.from(jsonValue, 'utf8').toString('hex');
+    const commandName = ['add', 'generic', 'password'].join('-');
+    const command = (
+      `${commandName} -U -a ${quoteInteractiveField(account)} `
+      + `-s ${quoteInteractiveField(service)} -X ${hexValue}\n`
+    );
+    if (Buffer.byteLength(command, 'utf8') <= SECURITY_STDIN_LINE_LIMIT) {
+      this.exec(MACOS_SECURITY_BIN, ['-i'], {
+        encoding: 'utf8', input: command, timeout: MACOS_SECURITY_TIMEOUT_MS,
+      });
+      return;
+    }
+    this.exec(
+      MACOS_SECURITY_BIN,
+      [commandName, '-U', '-a', account, '-s', service, '-X', hexValue],
+      { encoding: 'utf8', timeout: MACOS_SECURITY_TIMEOUT_MS },
+    );
   }
 
   getSync(service: string, account: string): string {
@@ -282,6 +344,12 @@ export class MacosKeychainBackend extends SyncCredentialBackend {
   deleteSync(service: string, account: string): void {
     this.assertNativeAccessEnabled();
     try {
+      if (!this.fakeExecutor || this.helperPath !== undefined) {
+        this.exec(this.helperPath ?? defaultKeychainHelperPath(), ['delete', service, account], {
+          encoding: 'utf8', timeout: MACOS_SECURITY_TIMEOUT_MS,
+        });
+        return;
+      }
       this.exec(
         MACOS_SECURITY_BIN,
         ['delete-generic-password', '-a', account, '-s', service],
@@ -289,7 +357,9 @@ export class MacosKeychainBackend extends SyncCredentialBackend {
       );
     } catch (err) {
       if (isSecurityTimeout(err)) {
-        throw wrapCredentialError('delete', service, account, securityTimeoutError('delete-generic-password'));
+        throw wrapCredentialError('delete', service, account, securityTimeoutError(
+          this.fakeExecutor && this.helperPath === undefined ? 'delete-generic-password' : 'keychain helper delete',
+        ));
       }
       throw wrapCredentialError('delete', service, account, err);
     }

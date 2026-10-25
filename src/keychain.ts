@@ -19,6 +19,9 @@ import {
 import {
   createRawCredentialBackend,
   defaultCredentialBackendHost,
+  defaultKeychainHelperPath,
+  KeychainBackedOff,
+  KeychainReadBackoff,
   execFileUtf8,
   isFakeExecutor,
   isQlbTestMode,
@@ -63,6 +66,9 @@ export {
   WINDOWS_POWERSHELL_BASE_ARGS,
   defaultCommandExists,
   defaultCredentialBackendHost,
+  defaultKeychainHelperPath,
+  KeychainBackedOff,
+  KeychainReadBackoff,
   MACOS_SECURITY_BIN,
   MACOS_SECURITY_TIMEOUT_MS,
 } from './credential-backends';
