@@ -163,7 +163,7 @@ describe('release install (AC45)', () => {
       stdout: (line) => output.push(line), stderr: (line) => output.push(`ERR:${line}`),
       env: { QLB_TEST_MODE: '1', QLB_HOME: join(root, 'qlb-home') },
       config: { dbPath: configuredDbPath } as CommandContext['config'],
-      loadConfig: () => { throw new Error('not used'); }, home: join(root, 'other-home'), registerSecret: () => {},
+      loadConfig: () => { throw new Error('not used'); }, home: join(root, 'other-home'), registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
     };
 
     const code = await runReleaseCommand(['install', '--sha', 'command-sha'], ctx, {
@@ -207,7 +207,7 @@ describe('release install (AC45)', () => {
     const ctx: CommandContext = {
       stdout: () => {}, stderr: (line) => errors.push(line), env: { QLB_TEST_MODE: '1', QLB_HOME: join(root, 'home') },
       config: { dbPath: join(root, 'db') } as CommandContext['config'],
-      loadConfig: () => { throw new Error('not used'); }, home: root, registerSecret: () => {},
+      loadConfig: () => { throw new Error('not used'); }, home: root, registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
     };
     writeFileSync(join(sourceDir, 'dist', '.build-sha'), buildStamp('clean-sha', true, shippedBuildDigest(sourceDir)));
     assert.equal(await runReleaseCommand(['install', '--sha', 'clean-sha'], ctx, {
@@ -242,7 +242,7 @@ describe('release install (AC45)', () => {
     const ctx: CommandContext = {
       stdout: () => {}, stderr: (line) => errors.push(line), env: { QLB_TEST_MODE: '1', QLB_HOME: root },
       config: { dbPath: join(root, 'db') } as CommandContext['config'],
-      loadConfig: () => { throw new Error('not used'); }, home: root, registerSecret: () => {},
+      loadConfig: () => { throw new Error('not used'); }, home: root, registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
     };
     assert.equal(await runReleaseCommand(['install', '--sha', 'changed-sha'], ctx, {
       sourceDir: changedSource, install: installRelease, shaForSource: () => 'changed-sha',
