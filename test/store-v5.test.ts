@@ -160,7 +160,7 @@ describe('store v5 schema (AC38)', () => {
     } finally { empty.close(); }
   });
 
-  it('rebuilds incompatible v5 tables without losing extra columns, indexes, triggers, or sequence state', () => {
+  it('rebuilds a canonical pre-release table missing slot_num UNIQUE and preserves data, indexes, and triggers', () => {
     for (const populated of [false, true]) {
       const path = join(mkdtempSync(join(tmpdir(), `qlb-v5-rebuild-${populated ? 'populated' : 'empty'}-`)), 'qlb.db');
       const initial = openStore(path);
@@ -168,18 +168,18 @@ describe('store v5 schema (AC38)', () => {
       const db = new DatabaseSync(path);
       db.exec(`DROP TABLE claude_slots;
         CREATE TABLE claude_slots (
-          account_id TEXT PRIMARY KEY, email TEXT, alias TEXT, org_uuid TEXT, config_json TEXT NOT NULL,
+          account_id TEXT PRIMARY KEY, slot_num INTEGER, email TEXT, alias TEXT, org_uuid TEXT, config_json TEXT NOT NULL,
           fingerprint TEXT, prev_fingerprint TEXT, threshold REAL, dead INTEGER NOT NULL DEFAULT 0,
           dead_reason TEXT, dead_at INTEGER, healed_at INTEGER, added_at INTEGER NOT NULL,
-          last_active_at INTEGER, source TEXT, archived_at INTEGER, forward_compatible TEXT
+          last_active_at INTEGER, source TEXT, archived_at INTEGER
         );
-        CREATE INDEX claude_slots_forward_compatible ON claude_slots(forward_compatible);
+        CREATE INDEX claude_slots_alias ON claude_slots(alias);
         CREATE TABLE claude_slot_audit (value TEXT);
         CREATE TRIGGER claude_slots_audit AFTER INSERT ON claude_slots BEGIN
-          INSERT INTO claude_slot_audit VALUES (NEW.forward_compatible);
+          INSERT INTO claude_slot_audit VALUES (NEW.alias);
         END;`);
       if (populated) {
-        db.exec("INSERT INTO claude_slots (account_id, config_json, added_at, forward_compatible) VALUES ('fixture', '{}', 1, 'retain-me')");
+        db.exec("INSERT INTO claude_slots (account_id, slot_num, alias, config_json, added_at) VALUES ('fixture', 1, 'retain-me', '{}', 1)");
       }
       db.close();
 
@@ -188,12 +188,11 @@ describe('store v5 schema (AC38)', () => {
       const check = dbAt(path);
       try {
         assert.ok(columns(check, 'claude_slots').includes('slot_num'));
-        assert.ok(columns(check, 'claude_slots').includes('forward_compatible'));
-        assert.ok(check.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'claude_slots_forward_compatible'").get());
+        assert.ok(check.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'claude_slots_alias'").get());
         assert.ok(check.prepare("SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = 'claude_slots_audit'").get());
         const uniqueIndexes = check.prepare('PRAGMA index_list(claude_slots)').all() as Array<{ name: string; unique: number }>;
         assert.ok(uniqueIndexes.some((index) => index.unique === 1 && (check.prepare(`PRAGMA index_info(${index.name})`).all() as Array<{ name: string }>).some((column) => column.name === 'slot_num')));
-        if (populated) assert.equal((check.prepare('SELECT forward_compatible FROM claude_slots').get() as { forward_compatible: string }).forward_compatible, 'retain-me');
+        if (populated) assert.equal((check.prepare('SELECT alias FROM claude_slots').get() as { alias: string }).alias, 'retain-me');
       } finally { check.close(); }
     }
   });
@@ -201,26 +200,61 @@ describe('store v5 schema (AC38)', () => {
   it('refuses inexact rebuilds after verifying a backup and keeps the database unchanged', () => {
     const cases = [
       {
-        name: 'an extra UNIQUE column',
-        extra: 'forward_compatible TEXT UNIQUE',
+        name: 'a plain extra column',
+        extra: 'forward_compatible TEXT',
         dependent: '',
-        reason: /UNIQUE constraint on extra column forward_compatible/,
+        reason: /column forward_compatible is not in the canonical definition/,
       },
       {
         name: 'an extra generated column',
         extra: 'forward_compatible TEXT GENERATED ALWAYS AS (upper(alias)) VIRTUAL',
         dependent: '',
-        reason: /generated or hidden extra column forward_compatible/,
+        reason: /column forward_compatible is not in the canonical definition/,
+      },
+      {
+        name: 'an extra PRIMARY KEY column',
+        accountId: 'account_id TEXT',
+        extra: 'forward_compatible INTEGER PRIMARY KEY',
+        dependent: '',
+        reason: /column forward_compatible is not in the canonical definition/,
+      },
+      {
+        name: 'an extra column with a comma-bearing default and CHECK',
+        extra: "forward_compatible TEXT DEFAULT 'a,b' CHECK (forward_compatible <> 'x')",
+        dependent: '',
+        reason: /column forward_compatible is not in the canonical definition/,
+      },
+      {
+        name: 'different primary-key columns',
+        accountId: 'account_id TEXT',
+        extra: '',
+        dependent: '',
+        reason: /primary-key columns differ from the canonical definition/,
+      },
+      {
+        name: 'a foreign key declared by the table',
+        extra: 'FOREIGN KEY (account_id) REFERENCES accounts(id)',
+        dependent: '',
+        reason: /foreign-key definition differs from the canonical definition/,
+      },
+      {
+        name: 'a foreign key on another table that references it',
+        extra: '',
+        dependent: `CREATE TABLE claude_slot_children (account_id TEXT REFERENCES claude_slots(account_id) ON DELETE CASCADE);
+          INSERT INTO claude_slots (account_id, config_json, added_at) VALUES ('fixture', '{}', 1);
+          INSERT INTO claude_slot_children VALUES ('fixture')`,
+        reason: /foreign key on claude_slot_children references claude_slots/,
+        childRows: true,
       },
       {
         name: 'a view that references the table',
-        extra: 'forward_compatible TEXT',
+        extra: '',
         dependent: 'CREATE VIEW claude_slots_view AS SELECT account_id FROM claude_slots',
         reason: /view claude_slots_view references claude_slots/,
       },
       {
         name: 'a trigger on another table that references the table',
-        extra: 'forward_compatible TEXT',
+        extra: '',
         dependent: `CREATE TABLE slot_audit (id INTEGER PRIMARY KEY);
           CREATE TRIGGER slot_audit_touch AFTER INSERT ON slot_audit BEGIN
             SELECT account_id FROM claude_slots;
@@ -236,10 +270,10 @@ describe('store v5 schema (AC38)', () => {
       const db = new DatabaseSync(path);
       db.exec(`DROP TABLE claude_slots;
         CREATE TABLE claude_slots (
-          account_id TEXT PRIMARY KEY, email TEXT, alias TEXT, org_uuid TEXT, config_json TEXT NOT NULL,
+          ${fixture.accountId ?? 'account_id TEXT PRIMARY KEY'}, email TEXT, alias TEXT, org_uuid TEXT, config_json TEXT NOT NULL,
           fingerprint TEXT, prev_fingerprint TEXT, threshold REAL, dead INTEGER NOT NULL DEFAULT 0,
           dead_reason TEXT, dead_at INTEGER, healed_at INTEGER, added_at INTEGER NOT NULL,
-          last_active_at INTEGER, source TEXT, archived_at INTEGER, ${fixture.extra}
+          last_active_at INTEGER, source TEXT, archived_at INTEGER${fixture.extra ? `, ${fixture.extra}` : ''}
         );
         ${fixture.dependent}`);
       db.close();
@@ -254,31 +288,13 @@ describe('store v5 schema (AC38)', () => {
         fixture.name,
       );
       assert.deepEqual(readFileSync(path), before, `${fixture.name} must leave the database byte-for-byte unchanged`);
+      if (fixture.childRows) {
+        const check = dbAt(path);
+        try {
+          assert.equal((check.prepare('SELECT count(*) AS count FROM claude_slot_children').get() as { count: number }).count, 1);
+        } finally { check.close(); }
+      }
     }
-  });
-
-  it('preserves plain extra columns when rebuilding a v5 table', () => {
-    const path = join(mkdtempSync(join(tmpdir(), 'qlb-v5-plain-extra-rebuild-')), 'qlb.db');
-    const initial = openStore(path);
-    initial.close();
-    const db = new DatabaseSync(path);
-    db.exec(`DROP TABLE claude_slots;
-      CREATE TABLE claude_slots (
-        account_id TEXT PRIMARY KEY, email TEXT, alias TEXT, org_uuid TEXT, config_json TEXT NOT NULL,
-        fingerprint TEXT, prev_fingerprint TEXT, threshold REAL, dead INTEGER NOT NULL DEFAULT 0,
-        dead_reason TEXT, dead_at INTEGER, healed_at INTEGER, added_at INTEGER NOT NULL,
-        last_active_at INTEGER, source TEXT, archived_at INTEGER, forward_compatible TEXT
-      );
-      INSERT INTO claude_slots (account_id, config_json, added_at, forward_compatible)
-        VALUES ('fixture', '{}', 1, 'retain-me')`);
-    db.close();
-
-    const corrected = openStore(path);
-    corrected.close();
-    const check = dbAt(path);
-    try {
-      assert.equal((check.prepare('SELECT forward_compatible FROM claude_slots').get() as { forward_compatible: string }).forward_compatible, 'retain-me');
-    } finally { check.close(); }
   });
 
   it('repairs a lifecycle table missing state before creating its partial index', () => {

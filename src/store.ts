@@ -507,38 +507,11 @@ function schemaNeedsV5Correction(db: DatabaseSync): boolean {
   return !lifecycleOneOpenIndexMatches(db);
 }
 
-function extraColumnDefinition(column: TableColumn): string {
-  let definition = `${quoteIdentifier(column.name)}${column.type ? ` ${column.type}` : ''}`;
-  if (column.notnull) definition += ' NOT NULL';
-  if (column.dflt_value !== null) definition += ` DEFAULT ${column.dflt_value}`;
-  return definition;
-}
-
-function columnNameFromDefinition(definition: string): string | undefined {
-  const match = /^\s*(?:"((?:""|[^"])*)"|`([^`]*)`|\[([^\]]*)\]|([A-Za-z_][A-Za-z0-9_$]*))/.exec(definition);
-  return match?.[1]?.replace(/""/g, '"') ?? match?.[2] ?? match?.[3] ?? match?.[4];
-}
-
-function tableDefinitionColumn(db: DatabaseSync, table: string, column: string): string | undefined {
-  const tableSql = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?").get(table) as { sql?: string } | undefined;
-  if (!tableSql?.sql) return undefined;
-  const open = tableSql.sql.indexOf('(');
-  const close = tableSql.sql.lastIndexOf(')');
-  if (open === -1 || close <= open) return undefined;
-  return splitColumnDefinitions(tableSql.sql.slice(open + 1, close)).find((definition) => columnNameFromDefinition(definition) === column);
-}
-
 function sqlWithoutLiteralsOrComments(sql: string): string {
   return sql
     .replace(/'(?:''|[^'])*'/g, "''")
     .replace(/--[^\n]*/g, '')
     .replace(/\/\*[\s\S]*?\*\//g, '');
-}
-
-function unsupportedExtraColumnFeature(definition: string): string | undefined {
-  const withoutName = sqlWithoutLiteralsOrComments(definition)
-    .replace(/^\s*(?:"(?:""|[^"])*"|`[^`]*`|\[[^\]]*\]|[A-Za-z_][A-Za-z0-9_$]*)/, '');
-  return /\b(UNIQUE|CHECK|COLLATE|REFERENCES)\b/i.exec(withoutName)?.[1].toUpperCase();
 }
 
 function sqlReferencesTableIdentifier(sql: string, table: string): boolean {
@@ -550,29 +523,39 @@ function refuseInexactV5Rebuild(table: string, reason: string, verifiedBackupPat
   throw new Error(`cannot correct pre-release v5 ${table}: ${reason}; verified backup: ${verifiedBackupPath}`);
 }
 
-function assertV5RebuildCanBeExact(db: DatabaseSync, table: string, canonical: Set<string>, verifiedBackupPath: string): void {
+function assertV5RebuildCanBeExact(db: DatabaseSync, table: string, shape: V5TableShape, verifiedBackupPath: string): void {
   const xinfo = db.prepare(`PRAGMA table_xinfo(${quoteIdentifier(table)})`).all() as unknown as Array<TableColumn & { hidden: number }>;
-  const extras = new Set(xinfo.filter(({ name }) => !canonical.has(name)).map(({ name }) => name));
-  for (const column of xinfo) {
-    if (extras.has(column.name) && Number(column.hidden) !== 0) {
-      refuseInexactV5Rebuild(table, `generated or hidden extra column ${column.name} cannot be reproduced`, verifiedBackupPath);
+  const canonical = new Set(shape.columns.map(({ name }) => name));
+  const extra = xinfo.find(({ name }) => !canonical.has(name));
+  if (extra) {
+    refuseInexactV5Rebuild(table, `column ${extra.name} is not in the canonical definition and cannot be reproduced`, verifiedBackupPath);
+  }
+
+  const actualPrimaryKey = xinfo
+    .filter(({ pk }) => pk > 0)
+    .sort((left, right) => left.pk - right.pk)
+    .map(({ name, pk }) => `${pk}:${name.toLowerCase()}`);
+  const canonicalPrimaryKey = shape.columns
+    .filter(({ primaryKeyOrder }) => primaryKeyOrder > 0)
+    .sort((left, right) => left.primaryKeyOrder - right.primaryKeyOrder)
+    .map(({ name, primaryKeyOrder }) => `${primaryKeyOrder}:${name.toLowerCase()}`);
+  if (actualPrimaryKey.join('\0') !== canonicalPrimaryKey.join('\0')) {
+    refuseInexactV5Rebuild(table, 'primary-key columns differ from the canonical definition', verifiedBackupPath);
+  }
+
+  const ownForeignKeys = db.prepare(`PRAGMA foreign_key_list(${quoteIdentifier(table)})`).all();
+  if (ownForeignKeys.length !== 0) {
+    refuseInexactV5Rebuild(table, 'foreign-key definition differs from the canonical definition', verifiedBackupPath);
+  }
+
+  const otherTables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND lower(name) <> lower(?) ORDER BY name").all(table) as Array<{ name: string }>;
+  for (const { name } of otherTables) {
+    const foreignKeys = db.prepare(`PRAGMA foreign_key_list(${quoteIdentifier(name)})`).all() as Array<{ table: string }>;
+    if (foreignKeys.some((foreignKey) => foreignKey.table.toLowerCase() === table.toLowerCase())) {
+      refuseInexactV5Rebuild(table, `foreign key on ${name} references ${table} and prevents an exact rebuild`, verifiedBackupPath);
     }
   }
-  for (const column of extras) {
-    const definition = tableDefinitionColumn(db, table, column);
-    const feature = definition && unsupportedExtraColumnFeature(definition);
-    if (feature) {
-      const reason = feature === 'UNIQUE' ? 'UNIQUE constraint' : `${feature} clause`;
-      refuseInexactV5Rebuild(table, `${reason} on extra column ${column} cannot be reproduced`, verifiedBackupPath);
-    }
-  }
-  const indexes = db.prepare(`PRAGMA index_list(${quoteIdentifier(table)})`).all() as Array<{ name: string; origin?: string }>;
-  for (const index of indexes) {
-    if (index.origin !== 'u') continue;
-    const columns = db.prepare(`PRAGMA index_info(${quoteIdentifier(index.name)})`).all() as Array<{ name: string | null }>;
-    const extra = columns.find(({ name }) => name !== null && extras.has(name));
-    if (extra?.name) refuseInexactV5Rebuild(table, `UNIQUE constraint on extra column ${extra.name} cannot be reproduced`, verifiedBackupPath);
-  }
+
   const dependents = db.prepare(`SELECT type, name, tbl_name, sql FROM sqlite_master
     WHERE type IN ('view', 'trigger') AND sql IS NOT NULL AND (type = 'view' OR tbl_name <> ?)
     ORDER BY type, name`).all(table) as Array<{ type: 'view' | 'trigger'; name: string; sql: string }>;
@@ -590,11 +573,9 @@ function rebuildV5Table(db: DatabaseSync, table: string, shape: V5TableShape, ex
   if (db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(newTable)) {
     throw new Error(`cannot correct pre-release v5 ${table}: temporary table ${newTable} already exists`);
   }
-  const canonical = new Set(shape.columns.map(({ name }) => name));
-  assertV5RebuildCanBeExact(db, table, canonical, verifiedBackupPath);
-  const extras = existing.filter(({ name }) => !canonical.has(name));
+  assertV5RebuildCanBeExact(db, table, shape, verifiedBackupPath);
   const definitions = shape.sql.slice(shape.sql.indexOf('(') + 1, -1);
-  const createSql = `CREATE TABLE ${quoteIdentifier(newTable)} (${definitions}${extras.length ? `, ${extras.map(extraColumnDefinition).join(', ')}` : ''})`;
+  const createSql = `CREATE TABLE ${quoteIdentifier(newTable)} (${definitions})`;
   const preservedObjects = db.prepare(`SELECT type, name, sql FROM sqlite_master
     WHERE tbl_name = ? AND type IN ('index', 'trigger') AND sql IS NOT NULL AND name <> 'lifecycle_one_open'
     ORDER BY type, name`).all(table) as Array<{ sql: string }>;
