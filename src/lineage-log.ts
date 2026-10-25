@@ -45,6 +45,8 @@ export interface ExternalLoginInput {
   oracleOwnAccount?: boolean;
   /** L41 login-expiry evidence is only usable when the caller has verified it; default false/undefined means no hard Claude evidence. */
   l41Verified?: boolean;
+  /** L40 auth_time evidence is only usable when the caller has verified it; default false/undefined means no hard Codex evidence. */
+  l40Verified?: boolean;
   /** Injected process-holder facts from the observations surrounding the change. */
   holderObservation?: HolderObservation;
   loginExpiryMoved?: boolean;
@@ -71,7 +73,7 @@ export function externalLoginCheck(input: ExternalLoginInput): ExternalLoginClas
     && input.oracleOwnAccount
     && input.l41Verified === true
     && input.loginExpiryMoved) return 'hard';
-  if (input.provider === 'openai-codex' && input.authTimeChanged) return 'hard';
+  if (input.provider === 'openai-codex' && input.l40Verified === true && input.authTimeChanged) return 'hard';
 
   return 'soft';
 }
@@ -82,8 +84,9 @@ export function recordTransition(store: Store, transition: LineageTransition): n
 }
 
 /**
- * Prove a strict successor relation from persisted S46 edges. Equality is not
- * a successor; callers that admit equality must test it explicitly (S40).
+ * Prove a strict successor relation from persisted S46 edges plus the current
+ * slot's implicit :prev edge. Equality is not a successor; callers that admit
+ * equality must test it explicitly (S40).
  */
 export function isSuccessor(
   store: Store,
@@ -94,17 +97,21 @@ export function isSuccessor(
 ): boolean {
   if (!ancestor || !descendant || ancestor === descendant) return false;
 
-  // S46 permits exactly one implicit edge: the current slot's :prev value.
-  const slot = store.getSlotLineage(provider, accountId);
-  if (slot?.fingerprint === descendant && slot.prev_fingerprint === ancestor) return true;
-
   const edges = new Map<string, string[]>();
+  const addEdge = (from: string | null, to: string | null): void => {
+    if (!from || !to || from === to) return;
+    const targets = edges.get(from);
+    if (targets) targets.push(to);
+    else edges.set(from, [to]);
+  };
   for (const row of store.listLineageTransitions(provider, accountId)) {
-    if (!row.from_fp || row.from_fp === row.to_fp) continue;
-    const targets = edges.get(row.from_fp);
-    if (targets) targets.push(row.to_fp);
-    else edges.set(row.from_fp, [row.to_fp]);
+    addEdge(row.from_fp, row.to_fp);
   }
+
+  // S46 permits exactly one implicit edge: the current slot's :prev value.
+  // It participates in traversal so persisted and current-slot edges compose.
+  const slot = store.getSlotLineage(provider, accountId);
+  addEdge(slot?.prev_fingerprint ?? null, slot?.fingerprint ?? null);
 
   const pending = [ancestor];
   const visited = new Set<string>();

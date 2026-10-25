@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { describe, it } from 'node:test';
 import { externalLoginCheck, LineageLog, type ExternalLoginInput } from '../src/lineage-log';
 import { openStore } from '../src/store';
@@ -58,8 +59,34 @@ describe('external-login evidence (AC18 fixture part)', () => {
     assert.equal(externalLoginCheck({ provider: 'openai-codex', successor: false }), 'soft');
   });
 
-  it('records changed Codex auth_time as hard evidence', () => {
-    assert.equal(externalLoginCheck({ provider: 'openai-codex', successor: false, authTimeChanged: true }), 'hard');
+  it('gates changed Codex auth_time hard evidence on verified L40', () => {
+    assert.equal(externalLoginCheck({ provider: 'openai-codex', successor: false, authTimeChanged: true }), 'soft');
+    assert.equal(externalLoginCheck({
+      provider: 'openai-codex', successor: false, l40Verified: true, authTimeChanged: true,
+    }), 'hard');
+  });
+
+  it('classifies a persisted-to-slot lineage chain as a managed rotation', () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'qlb-external-login-composed-prev-')), 'qlb.db');
+    const initial = openStore(path);
+    new LineageLog(initial).recordTransition({
+      provider: 'anthropic', accountId: 'account-a', fromFp: 'A', toFp: 'B', cause: 'post', by: 'qlb', evidence: 'post',
+    });
+    initial.close();
+
+    const db = new DatabaseSync(path);
+    db.prepare("INSERT INTO claude_slots (account_id, config_json, fingerprint, prev_fingerprint, dead, added_at) VALUES (?, '{}', ?, ?, 0, 1)").run('account-a', 'C', 'B');
+    db.close();
+
+    const store = openStore(path);
+    try {
+      const lineage = new LineageLog(store);
+      assert.equal(lineage.externalLoginCheck({
+        provider: 'anthropic', accountId: 'account-a', previousFingerprint: 'A', observedFingerprint: 'C',
+      }), 'none');
+    } finally {
+      store.close();
+    }
   });
 
   it('retains external-login classifications after a process restart using only lineage_log state', () => {

@@ -44,6 +44,25 @@ describe('lineage log (AC50)', () => {
     }
   });
 
+  it('composes the current slot prev edge with persisted lineage transitions', () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'qlb-lineage-composed-prev-')), 'qlb.db');
+    const initial = openStore(path);
+    new LineageLog(initial).recordTransition({
+      provider: 'anthropic', accountId: 'account-a', fromFp: 'A', toFp: 'B', cause: 'post', by: 'qlb', evidence: 'post',
+    });
+    initial.close();
+    const db = new DatabaseSync(path);
+    db.prepare("INSERT INTO claude_slots (account_id, config_json, fingerprint, prev_fingerprint, dead, added_at) VALUES (?, '{}', ?, ?, 0, 1)").run('account-a', 'C', 'B');
+    db.close();
+
+    const store = openStore(path);
+    try {
+      assert.equal(new LineageLog(store).isSuccessor('anthropic', 'account-a', 'A', 'C'), true);
+    } finally {
+      store.close();
+    }
+  });
+
   it('keeps the graph across a store restart', () => {
     const path = join(mkdtempSync(join(tmpdir(), 'qlb-lineage-')), 'qlb.db');
     const first = openStore(path);
