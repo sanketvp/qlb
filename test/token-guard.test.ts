@@ -1,14 +1,15 @@
 import assert from 'node:assert/strict';
-import { chmodSync, mkdirSync, mkdtempSync, realpathSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
-import {
+import tokenCommand, {
   executeToken,
   tokenCallAllowed,
   type TokenCommandDeps,
 } from '../src/commands/token';
+import { createCommandContext, runExecutingCommand } from '../src/cli';
 import { MockKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from '../src/keychain';
 import { resolve as resolveKimi } from '../src/token/kimi-coding';
 import { resolve as resolveOpenRouter } from '../src/token/openrouter';
@@ -113,6 +114,7 @@ describe('qlb token', () => {
       home: '/tmp/qlb-token-test',
       registerSecret: () => undefined,
       knownSecrets: () => [],
+      deliverSecret: (line: string) => output.push(line),
     };
     const deps: TokenCommandDeps = {
       ...allowedDeps(script, root),
@@ -125,5 +127,50 @@ describe('qlb token', () => {
     assert.equal(await executeToken(['anthropic'], ctx, deps), 3);
     assert.deepEqual(errors, []);
     assert.deepEqual(output, ['fake-command-access']);
+  });
+
+  it('delivers the S30 credential unredacted but redacts later ordinary stdout', async () => {
+    const token = 'xai-test-0123456789abcdef';
+    const output: string[] = [];
+    const errors: string[] = [];
+    const context = {
+      ...createCommandContext(),
+      env: { QLB_PI_TOKEN_CALL: '1' },
+      stdout: (line: string) => output.push(line),
+      stderr: (line: string) => errors.push(line),
+    };
+    const command = {
+      ...tokenCommand,
+      execute: (args: string[], ctx: Parameters<NonNullable<typeof tokenCommand.execute>>[1]) => executeToken(args, ctx, {
+        guard: () => true,
+        resolve: () => ({ token, accountId: 'default', source: 'keychain' }),
+      }),
+    };
+
+    assert.equal(await runExecutingCommand({ command, args: ['xai'] }, context), 0);
+    assert.deepEqual(output, [token]);
+    assert.deepEqual(errors, []);
+
+    assert.equal(await runExecutingCommand({
+      command: {
+        name: 'fixture',
+        execute: (_args, ctx) => {
+          ctx.deliverSecret(token);
+          ctx.stdout(token);
+          return 0;
+        },
+      },
+      args: [],
+    }, context), 0);
+    assert.deepEqual(output, [token, token, '[redacted]']);
+    assert.deepEqual(errors, []);
+  });
+
+  it('limits the unredacted delivery channel to the token command', () => {
+    const commandsDir = join(process.cwd(), 'src', 'commands');
+    const users = readdirSync(commandsDir)
+      .filter((file) => file.endsWith('.ts'))
+      .filter((file) => /\bdeliverSecret\(/.test(readFileSync(join(commandsDir, file), 'utf8')));
+    assert.deepEqual(users, ['token.ts']);
   });
 });

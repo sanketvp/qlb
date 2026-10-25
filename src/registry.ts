@@ -11,6 +11,8 @@ export interface CommandContext {
   home: string;
   /** Register any runtime credential before it can appear in command output or an error. */
   registerSecret(value: string): void;
+  /** Deliver a credential through the single S30-authorized output channel. */
+  deliverSecret(value: string): void;
   /** Registered runtime credentials, retained across copied or wrapped contexts. */
   knownSecrets(): readonly string[];
 }

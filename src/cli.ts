@@ -1755,6 +1755,7 @@ export function createCommandContext(): CommandContext {
     registerSecret: (value) => {
       if (value) secrets.add(value);
     },
+    deliverSecret: (value) => console.log(value),
     knownSecrets: () => [...secrets],
   };
 }
@@ -1837,6 +1838,10 @@ export async function runExecutingCommand(
     ...context,
     stdout: (message) => context.stdout(redactOutput(message)),
     stderr: (message) => context.stderr(redactOutput(message)),
+    deliverSecret: (value) => {
+      context.registerSecret(value);
+      context.stdout(value);
+    },
   };
   try {
     const operation = lifecycleOperationFor(match.command.name, match.args);

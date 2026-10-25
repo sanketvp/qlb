@@ -126,11 +126,12 @@ describe('lifecycle (AC49)', () => {
     let executed = false;
     const code = await runExecutingCommand({ command: { name: 'gate', execute: async () => { executed = true; return 0; } }, args: ['anthropic'] }, {
       config, env: {}, home, stdout: () => {}, stderr: (message) => stderr.push(message),
-      loadConfig: () => config, registerSecret: () => {}, knownSecrets: () => [],
+      loadConfig: () => config, registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => ['phase=pre-cutover'],
     });
     assert.equal(code, 3);
     assert.equal(executed, false);
-    assert.match(stderr[0]!, /phase=pre-cutover/);
+    assert.match(stderr[0]!, /\[redacted\]/);
+    assert.doesNotMatch(stderr[0]!, /phase=pre-cutover/);
   });
 
   it('refuses a second begin with an open row as a lifecycle refusal', async () => {
