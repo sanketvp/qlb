@@ -39,6 +39,10 @@ function fingerprint(secret: string): string {
   return createHash('sha256').update(secret, 'utf8').digest('hex');
 }
 
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 function isSensitiveKey(key: string): boolean {
   return SENSITIVE_KEY.has(key.replace(/[_-]/g, '').toLowerCase());
 }
@@ -48,13 +52,13 @@ function isSensitiveKey(key: string): boolean {
  * credential shapes. This is deliberately safe to use on arbitrary error text.
  */
 export function redactSecrets(text: string, secrets: readonly string[]): string {
-  let out = text;
-  const values = [...new Set(secrets.filter(Boolean))].sort((a, b) => b.length - a.length);
+  const values = [...new Set(secrets.filter(Boolean))];
+  const replacements = [...new Set(values.flatMap((secret) => [fingerprint(secret), secret]))]
+    .sort((a, b) => b.length - a.length);
+  let out = replacements.length > 0
+    ? text.replace(new RegExp(replacements.map(escapeRegExp).join('|'), 'g'), REDACTED)
+    : text;
 
-  // Fingerprints must be handled before their raw value: a short raw value can
-  // occur inside its hexadecimal fingerprint and otherwise corrupt that match.
-  for (const secret of values) out = out.split(fingerprint(secret)).join(REDACTED);
-  for (const secret of values) out = out.split(secret).join(REDACTED);
   for (const pattern of TOKEN_PATTERNS) out = out.replace(pattern, REDACTED);
   return out;
 }

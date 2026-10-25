@@ -84,7 +84,7 @@ describe('Swift Keychain helper write path', () => {
     const errors: string[] = [];
     const exit = await runKeychainCommand(['matrix'], {
       config, env: {}, home, stdout: (message) => output.push(message), stderr: (message) => errors.push(message),
-      loadConfig: () => config, registerSecret: () => {},
+      loadConfig: () => config, registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
     }, {
       runMatrix: () => ({
         cases: { securityCreated: 'fail', securityUntrusted: 'pass', previousHelper: 'fail', helperCreated: 'pass' },
@@ -109,7 +109,7 @@ describe('Swift Keychain helper write path', () => {
     const errors: string[] = [];
     const exit = await runKeychainCommand(['matrix'], {
       config, env: {}, home, stdout: () => {}, stderr: (message) => errors.push(message),
-      loadConfig: () => config, registerSecret: () => {},
+      loadConfig: () => config, registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
     }, {
       runMatrix: () => { throw new KeychainHelperMissingError('/tmp/missing-helper'); },
     });
