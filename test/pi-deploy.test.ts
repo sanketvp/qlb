@@ -34,6 +34,8 @@ function context(home: string, dbPath: string, output: string[]): CommandContext
     loadConfig: () => { throw new Error('not used'); },
     home: join(home, 'wrong-home'),
     registerSecret: () => {},
+    deliverSecret: () => {},
+    knownSecrets: () => [],
   };
 }
 
