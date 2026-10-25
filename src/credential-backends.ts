@@ -23,8 +23,8 @@ import {
   renameSync,
   writeFileSync,
 } from 'node:fs';
-import { homedir as osHomedir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { qlbHomeDir } from './home';
 
 export interface CredentialBackend {
   readonly kind?: CredentialBackendKind;
@@ -41,7 +41,22 @@ export type CredentialBackendKind =
   | 'macos-keychain'
   | 'linux-libsecret'
   | 'linux-file'
-  | 'windows-dpapi';
+  | 'windows-dpapi'
+  | 'test-memory';
+
+/** Raised before test mode can construct or invoke the real macOS backend. */
+export class NativeKeychainDisabled extends Error {
+  readonly code = 'NATIVE_KEYCHAIN_DISABLED';
+
+  constructor() {
+    super('native macOS Keychain access is disabled while QLB_TEST_MODE=1');
+    this.name = 'NativeKeychainDisabled';
+  }
+}
+
+export function isQlbTestMode(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.QLB_TEST_MODE === '1';
+}
 
 export function execFileUtf8(
   file: string,
@@ -56,6 +71,20 @@ export type ExecFileSyncFn = (
   args: readonly string[],
   options?: ExecFileSyncOptions,
 ) => string;
+
+const FAKE_EXECUTOR = Symbol('qlbFakeExecutor');
+
+type FakeExecutor = ExecFileSyncFn & { [FAKE_EXECUTOR]?: true };
+
+/** Brand an injected executor as a test double permitted in QLB test mode. */
+export function markFakeExecutor<T extends ExecFileSyncFn>(exec: T): T {
+  Object.defineProperty(exec, FAKE_EXECUTOR, { value: true });
+  return exec;
+}
+
+export function isFakeExecutor(exec: ExecFileSyncFn): boolean {
+  return (exec as FakeExecutor)[FAKE_EXECUTOR] === true;
+}
 
 export interface CredentialBackendHost {
   platform: NodeJS.Platform;
@@ -89,7 +118,7 @@ export function defaultCommandExists(
 export function defaultCredentialBackendHost(): CredentialBackendHost {
   return {
     platform: process.platform,
-    homedir: osHomedir,
+    homedir: qlbHomeDir,
     execFileSync: execFileUtf8,
     commandExists: (name) => defaultCommandExists(name, execFileUtf8),
   };
@@ -192,13 +221,17 @@ export function securityTimeoutError(command: string): Error {
 export class MacosKeychainBackend extends SyncCredentialBackend {
   readonly kind = 'macos-keychain' as const;
   private readonly exec: ExecFileSyncFn;
+  private readonly fakeExecutor: boolean;
 
   constructor(opts: { execFileSync?: ExecFileSyncFn } = {}) {
     super();
     this.exec = opts.execFileSync ?? execFileUtf8;
+    this.fakeExecutor = isFakeExecutor(this.exec);
+    if (isQlbTestMode() && !this.fakeExecutor) throw new NativeKeychainDisabled();
   }
 
   setSync(service: string, account: string, jsonValue: string): void {
+    this.assertNativeAccessEnabled();
     assertSecurityInteractiveField(service);
     assertSecurityInteractiveField(account);
     try {
@@ -230,6 +263,7 @@ export class MacosKeychainBackend extends SyncCredentialBackend {
   }
 
   getSync(service: string, account: string): string {
+    this.assertNativeAccessEnabled();
     try {
       const stdout = this.exec(
         MACOS_SECURITY_BIN,
@@ -246,6 +280,7 @@ export class MacosKeychainBackend extends SyncCredentialBackend {
   }
 
   deleteSync(service: string, account: string): void {
+    this.assertNativeAccessEnabled();
     try {
       this.exec(
         MACOS_SECURITY_BIN,
@@ -257,6 +292,35 @@ export class MacosKeychainBackend extends SyncCredentialBackend {
         throw wrapCredentialError('delete', service, account, securityTimeoutError('delete-generic-password'));
       }
       throw wrapCredentialError('delete', service, account, err);
+    }
+  }
+
+  private assertNativeAccessEnabled(): void {
+    if (isQlbTestMode() && !this.fakeExecutor) throw new NativeKeychainDisabled();
+  }
+}
+
+/** Ephemeral credential backend used whenever QLB_TEST_MODE=1. */
+export class InMemoryCredentialBackend extends SyncCredentialBackend {
+  readonly kind = 'test-memory' as const;
+  private readonly items = new Map<string, string>();
+
+  setSync(service: string, account: string, jsonValue: string): void {
+    this.items.set(credentialItemKey(service, account), jsonValue);
+  }
+
+  getSync(service: string, account: string): string {
+    const value = this.items.get(credentialItemKey(service, account));
+    if (value === undefined) {
+      throw new Error(`keychain get failed for service=${service} account=${account}: item not found`);
+    }
+    return value;
+  }
+
+  deleteSync(service: string, account: string): void {
+    const key = credentialItemKey(service, account);
+    if (!this.items.delete(key)) {
+      throw new Error(`keychain delete failed for service=${service} account=${account}: item not found`);
     }
   }
 }
@@ -612,15 +676,25 @@ export function selectBackendKind(opts: {
   }
 }
 
+export interface CreateCredentialBackendOptions {
+  /** Injectable only for backend-dispatch tests; production uses process.env. */
+  env?: NodeJS.ProcessEnv;
+}
+
 export function createRawCredentialBackend(
   host: CredentialBackendHost = defaultCredentialBackendHost(),
+  options: CreateCredentialBackendOptions = {},
 ): CredentialBackend {
+  if (isQlbTestMode(options.env)) return new InMemoryCredentialBackend();
   const kind = selectBackendKind({
     platform: host.platform,
     commandExists: host.commandExists,
   });
-  const qlbDir = join(host.homedir(), '.qlb');
+  const { homedir: homeDir } = host;
+  const qlbDir = join(homeDir(), '.qlb');
   switch (kind) {
+    case 'test-memory':
+      return new InMemoryCredentialBackend();
     case 'macos-keychain':
       return new MacosKeychainBackend({ execFileSync: host.execFileSync });
     case 'linux-libsecret':

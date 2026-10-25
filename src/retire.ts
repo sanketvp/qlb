@@ -14,13 +14,13 @@
 import { createHash } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { existsSync, readFileSync, renameSync, statSync } from 'node:fs';
-import { homedir } from 'node:os';
 import { dirname, join, parse, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
 
 import { CODEX_GATE_CONFIG_KEY } from './codex-gate';
 import { config } from './config';
 import { atomicWriteFile, preQlbPath, sidecarPath } from './migration';
+import { qlbHomeDir } from './home';
 import type { DecisionRow, MigrationRow, Store } from './store';
 
 const execFileAsync = promisify(execFile);
@@ -252,7 +252,8 @@ function assertSafeFilePath(nativePath: string): string {
   }
   const resolved = resolve(nativePath);
   const root = parse(resolved).root;
-  if (resolved === root || resolved === homedir() || resolved === dirname(homedir())) {
+  const home = qlbHomeDir();
+  if (resolved === root || resolved === home || resolved === dirname(home)) {
     refuse(`REFUSED: nativePathToRemove is not a credential file: ${resolved}`);
   }
   if (resolved.endsWith(sep)) {

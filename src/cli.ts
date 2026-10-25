@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 import { existsSync, mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
 import * as net from 'node:net';
 import { dirname, join, resolve } from 'node:path';
 import { adapters } from './adapters';
+import { assertTestHomeIsIsolated } from './bootstrap';
+import { assertAdmitted, type LifecycleOperation } from './lifecycle';
 import { createDefaultCodexGateDeps, runCodexGate } from './codex-gate';
 import { config, resolveConfig, stripConfigArgs } from './config';
+import { qlbHomeDir } from './home';
 import { discoverCommands, resolveCommand, type CommandContext, type CommandDefinition } from './registry';
 import { runCodexProbeClaims } from './commands/codex-probe-claims';
 import { redactError, redactSecrets } from './redact';
@@ -1749,7 +1751,7 @@ export function createCommandContext(): CommandContext {
     env: process.env,
     config,
     loadConfig: resolveConfig,
-    home: homedir(),
+    home: qlbHomeDir(),
     registerSecret: (value) => {
       if (value) secrets.add(value);
     },
@@ -1784,6 +1786,37 @@ export async function dispatchCommand(
     : null;
 }
 
+function lifecycleAdmissionCode(dbPath: string, operation: LifecycleOperation): string | null {
+  const store = openStore(dbPath);
+  try {
+    const result = assertAdmitted(store, operation);
+    return result.ok ? null : result.code ?? 'lifecycle-refused';
+  } finally { store.close(); }
+}
+
+// The legacy gate path must select its lifecycle store before opening it, or
+// --db would both admit against and create the wrong database.
+export function gateLifecycleAdmissionCode(gateDbPath: string | undefined, defaultDbPath: string): string | null {
+  return lifecycleAdmissionCode(gateDbPath ?? defaultDbPath, 'gate');
+}
+
+function lifecycleOperationFor(command: string, args: string[]): LifecycleOperation | null {
+  if (command === 'doctor') return 'doctor';
+  if (command === 'status') return 'status';
+  if (command === 'gate') return 'gate';
+  if (command === 'cutover') {
+    if (args[0] === 'begin') return args.includes('--dry-run') ? 'cutover-begin:dry-run' : 'cutover-begin';
+    if (args[0] === 'commit') return 'cutover-commit';
+    if (args[0] === 'abort') return 'cutover-abort';
+  }
+  if (command === 'lifecycle') {
+    if (args[0] === 'drill-done') return 'lifecycle-drill-done';
+    if (args[0] === 'close') return 'lifecycle-close';
+    if (args[0] === 'status') return 'status';
+  }
+  return null;
+}
+
 const INVALID_EXECUTING_COMMAND_EXIT_CODE = 1;
 
 function isValidExecutingCommandExitCode(value: unknown): value is number {
@@ -1806,6 +1839,14 @@ export async function runExecutingCommand(
     stderr: (message) => context.stderr(redactOutput(message)),
   };
   try {
+    const operation = lifecycleOperationFor(match.command.name, match.args);
+    if (operation != null) {
+      const refusal = lifecycleAdmissionCode(context.config.dbPath, operation);
+      if (refusal != null) {
+        redactingContext.stderr(`qlb ${match.command.name}: refused: ${refusal}`);
+        return 3;
+      }
+    }
     const code = await match.command.execute!(match.args, redactingContext);
     if (!isValidExecutingCommandExitCode(code)) {
       redactingContext.stderr(`qlb ${match.command.name}: invalid exit code (expected integer 0-255)`);
@@ -1823,6 +1864,7 @@ function isExactListRequest(args: string[], flag: string): boolean {
 }
 
 async function main(): Promise<void> {
+  assertTestHomeIsIsolated();
   const commands = discoverCommands();
   const stripped = stripConfigArgs(process.argv);
   const raw = stripped.slice(2);
@@ -1972,6 +2014,11 @@ async function main(): Promise<void> {
     process.exit(await runCodexProbeClaims(opts.args));
   }
   if (opts.cmd === 'gate') {
+    const refusal = gateLifecycleAdmissionCode(opts.db, config.dbPath);
+    if (refusal != null) {
+      console.error(`qlb gate: refused: ${refusal}`);
+      process.exit(3);
+    }
     try {
       const code = await runGate(opts);
       process.exit(code);
@@ -2064,5 +2111,9 @@ async function main(): Promise<void> {
 }
 
 if (require.main === module) {
-  void main();
+  void main().catch((err: unknown) => {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`qlb: ${message}`);
+    process.exitCode = 2;
+  });
 }
