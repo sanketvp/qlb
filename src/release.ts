@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import {
+  chmodSync,
   copyFileSync,
   existsSync,
   lstatSync,
@@ -237,6 +238,12 @@ function copyReleaseContents(sourceDir: string, stagingDir: string): void {
   }
   if (existsSync(join(sourceDir, 'src', 'redact.ts'))) {
     copyContained(join(sourceDir, 'src', 'redact.ts'), join(stagingDir, 'src', 'redact.ts'), checkoutRoot);
+  }
+  const helper = join(sourceDir, 'native', 'keychain-helper', 'build', 'qlb-keychain-helper');
+  if (existsSync(helper)) {
+    const installedHelper = join(stagingDir, 'native', 'keychain-helper', 'build', 'qlb-keychain-helper');
+    copyContained(helper, installedHelper, checkoutRoot);
+    chmodSync(installedHelper, 0o755);
   }
   copyRuntimeDependencies(sourceDir, stagingDir);
 }

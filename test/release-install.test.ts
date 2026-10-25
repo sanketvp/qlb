@@ -11,6 +11,7 @@ import {
   readFileSync,
   readlinkSync,
   readdirSync,
+  statSync,
   symlinkSync,
   unlinkSync,
   writeFileSync,
@@ -103,6 +104,45 @@ describe('release install (AC45)', () => {
     } finally {
       restored.close();
     }
+  });
+
+  it('ships a present Keychain helper byte-for-byte, executable, and attested', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-release-helper-'));
+    const sourceDir = sourceBuild(root, 'helper-sha');
+    const sourceHelper = join(sourceDir, 'native', 'keychain-helper', 'build', 'qlb-keychain-helper');
+    mkdirSync(join(sourceDir, 'native', 'keychain-helper', 'build'), { recursive: true });
+    writeFileSync(sourceHelper, 'plain fake helper bytes\n');
+
+    const installed = await installRelease({ sourceDir, appDir: join(root, 'app-with-helper'), sha: 'helper-sha', dbPath: join(root, 'db') });
+    const installedHelper = join(installed.releaseDir, 'native', 'keychain-helper', 'build', 'qlb-keychain-helper');
+    assert.deepEqual(readFileSync(installedHelper), readFileSync(sourceHelper));
+    assert.equal(statSync(installedHelper).mode & 0o777, 0o755);
+    const helperDigest = readReleaseManifest(installed.releaseDir)!.digest;
+
+    unlinkSync(sourceHelper);
+    const withoutHelper = await installRelease({ sourceDir, appDir: join(root, 'app-without-helper'), sha: 'helper-sha', dbPath: join(root, 'db') });
+    assert.equal(existsSync(join(withoutHelper.releaseDir, 'native', 'keychain-helper', 'build', 'qlb-keychain-helper')), false);
+    assert.notEqual(readReleaseManifest(withoutHelper.releaseDir)!.digest, helperDigest);
+  });
+
+  it('detects an altered installed Keychain helper through the release digest', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-release-helper-altered-'));
+    const sourceDir = sourceBuild(root, 'helper-altered-sha');
+    const sourceHelper = join(sourceDir, 'native', 'keychain-helper', 'build', 'qlb-keychain-helper');
+    mkdirSync(join(sourceDir, 'native', 'keychain-helper', 'build'), { recursive: true });
+    writeFileSync(sourceHelper, 'plain fake helper bytes\n');
+    const appDir = join(root, 'app');
+    const installed = await installRelease({ sourceDir, appDir, sha: 'helper-altered-sha', dbPath: join(root, 'db') });
+    writeFileSync(join(installed.releaseDir, 'native', 'keychain-helper', 'build', 'qlb-keychain-helper'), 'altered fake helper bytes\n');
+
+    const result = releaseCurrentCheck({ appDir, lifecycleReleaseSha: 'helper-altered-sha' });
+    assert.equal(result.level, 'WARN');
+    assert.match(result.message, /bytes/);
+  });
+
+  it('ignores Keychain helper build output', () => {
+    const ignore = readFileSync(join(__dirname, '..', '..', '.gitignore'), 'utf8');
+    assert.match(ignore, /^native\/keychain-helper\/build\/$/m);
   });
 
   it('copies production dependencies so an installed CLI starts without the checkout node_modules', async () => {
