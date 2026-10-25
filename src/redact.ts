@@ -63,24 +63,20 @@ export function redactSecrets(text: string, secrets: readonly string[]): string 
   return out;
 }
 
+const SENSITIVE_KEY_NAME = [...SENSITIVE_KEY]
+  .sort((left, right) => right.length - left.length)
+  .map((key) => key.split('').map(escapeRegExp).join('[_-]*'))
+  .join('|');
+const SENSITIVE_KEY_VALUE_TO_EOL = new RegExp(
+  `((?<![A-Za-z0-9])(?:${SENSITIVE_KEY_NAME})(?:["']?[ \\t]*[=:][ \\t]*))[^\\r\\n]*`,
+  'gi',
+);
+
 /** Redacts credentials in diagnostic key/value text that is not valid JSON. */
 export function redactKeyValueText(text: string, secrets: readonly string[]): string {
-  let out = redactSecrets(text, secrets);
-  // Quoted JSON-like pairs are common in truncated diagnostic payloads.
-  out = out.replace(/((["'])([A-Za-z][A-Za-z0-9_-]*)\2\s*:\s*)(["'])((?:\\.|(?!\4)[^\\\r\n])*)\4/g,
-    (match, prefix: string, _keyQuote: string, key: string, valueQuote: string) => (
-      isSensitiveKey(key) ? `${prefix}${valueQuote}${REDACTED}${valueQuote}` : match
-    ));
-  // Authorization values commonly contain a scheme and spaces, so redact the
-  // whole header remainder rather than only its first word.
-  out = out.replace(/(^|[^A-Za-z0-9_-])(authorization)(\s*(?:=|:)\s*)([^\r\n]*)/gi,
-    (match, boundary: string, key: string, separator: string) => (
-      isSensitiveKey(key) ? `${boundary}${key}${separator}${REDACTED}` : match
-    ));
-  return out.replace(/(^|[^A-Za-z0-9_-])([A-Za-z][A-Za-z0-9_-]*)(\s*(?:=|:)\s*)([^\s,;\r\n]+)/g,
-    (match, boundary: string, key: string, separator: string) => (
-      isSensitiveKey(key) ? `${boundary}${key}${separator}${REDACTED}` : match
-    ));
+  // Once a sensitive key has introduced a value, prefer losing the remainder
+  // of that diagnostic line to retaining an unrecognised credential fragment.
+  return redactSecrets(text, secrets).replace(SENSITIVE_KEY_VALUE_TO_EOL, `$1${REDACTED}`);
 }
 
 type RedactedValue = unknown | undefined;

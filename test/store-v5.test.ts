@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, readdirSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -665,6 +665,35 @@ describe('store v5 schema (AC38)', () => {
     } finally { db.close(); }
   });
 
+  it('fails closed through each sensitive non-JSON switch-text line', () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'qlb-v5-switch-fail-closed-')), 'qlb.db');
+    const cases = [
+      ['stderr: password=hunter2 rest', 'stderr: password=[redacted]'],
+      ['Cookie: session=abc; csrf=def', 'Cookie: [redacted]'],
+      ['msg: api_key=abc; ok', 'msg: api_key=[redacted]'],
+      ['password="hunter 2"', 'password=[redacted]'],
+    ] as const;
+    const store = openStore(path);
+    for (const [index, [bindingJson]] of cases.entries()) {
+      store.recordSwitch({
+        ts: index + 1,
+        provider: 'anthropic',
+        toAccount: 'id',
+        trigger: 'manual',
+        outcome: 'failed',
+        bindingJson,
+      });
+    }
+    store.close();
+
+    const db = dbAt(path);
+    try {
+      const stored = (db.prepare('SELECT binding_json FROM switch_log ORDER BY id').all() as Array<{ binding_json: string }>)
+        .map(({ binding_json }) => binding_json);
+      assert.deepEqual(stored, cases.map(([, expected]) => expected));
+    } finally { db.close(); }
+  });
+
   it('redacts token-shaped detail and evidence text without changing ids or fingerprints', () => {
     const path = join(mkdtempSync(join(tmpdir(), 'qlb-v5-redact-')), 'qlb.db');
     const store = openStore(path);
@@ -729,6 +758,87 @@ describe('store v5 schema (AC38)', () => {
     const after = readdirSync(backupsDir).filter((file) => file.endsWith('.sqlite'));
     assert.deepEqual(after.sort(), before.sort());
     assert.ok(after.length <= 1);
+  });
+
+  it('refuses provider-less usage_polls schema objects and constraints before any backup', () => {
+    const cases = [
+      {
+        name: 'index',
+        objectSql: 'CREATE INDEX usage_polls_extra_index ON usage_polls(last_fetch_at);',
+        check: undefined,
+        reason: /index usage_polls_extra_index cannot be reproduced/,
+      },
+      {
+        name: 'trigger',
+        objectSql: `CREATE TABLE usage_polls_audit (account_id TEXT);
+          CREATE TRIGGER usage_polls_extra_trigger AFTER INSERT ON usage_polls BEGIN
+            INSERT INTO usage_polls_audit VALUES (NEW.account_id);
+          END;`,
+        check: undefined,
+        reason: /trigger usage_polls_extra_trigger cannot be reproduced/,
+      },
+      {
+        name: 'CHECK constraint',
+        objectSql: '',
+        check: 'CHECK (last_fetch_at IS NULL OR last_fetch_at >= 0)',
+        reason: /CHECK differs from the canonical definition/,
+      },
+    ] as const;
+
+    for (const fixture of cases) {
+      const dir = mkdtempSync(join(tmpdir(), 'qlb-v5-providerless-object-'));
+      const path = join(dir, 'qlb.db');
+      const db = new DatabaseSync(path);
+      db.exec(`CREATE TABLE accounts (id TEXT PRIMARY KEY, provider TEXT, label TEXT, status TEXT, created_at INTEGER, grant_generation INTEGER DEFAULT 0);
+        CREATE TABLE usage_polls (
+          account_id TEXT PRIMARY KEY, last_fetch_at INTEGER, last_attempt_at INTEGER, next_due_at INTEGER,
+          poll_interval_s REAL, last_status TEXT, consecutive_failures INTEGER NOT NULL DEFAULT 0,
+          backoff_until INTEGER, last_429_at INTEGER, held_until INTEGER${fixture.check ? `, ${fixture.check}` : ''}
+        );
+        INSERT INTO accounts VALUES ('a', 'anthropic', 'a', 'active', 1, 0);
+        INSERT INTO usage_polls (account_id) VALUES ('a');
+        ${fixture.objectSql}
+        PRAGMA user_version = 5`);
+      db.close();
+      const before = dbAt(path);
+      const beforeSchema = before.prepare("SELECT type, name, tbl_name, sql FROM sqlite_master WHERE tbl_name = 'usage_polls' OR name = 'usage_polls' ORDER BY type, name").all();
+      const beforeRows = before.prepare('SELECT * FROM usage_polls ORDER BY rowid').all();
+      before.close();
+
+      assert.throws(() => openStore(path), fixture.reason, fixture.name);
+      const after = dbAt(path);
+      try {
+        assert.deepEqual(after.prepare("SELECT type, name, tbl_name, sql FROM sqlite_master WHERE tbl_name = 'usage_polls' OR name = 'usage_polls' ORDER BY type, name").all(), beforeSchema, `${fixture.name} must retain its table schema objects`);
+        assert.deepEqual(after.prepare('SELECT * FROM usage_polls ORDER BY rowid').all(), beforeRows, `${fixture.name} must retain its table rows`);
+      } finally { after.close(); }
+      assert.deepEqual(existsSync(join(dir, 'backups')) ? readdirSync(join(dir, 'backups')).filter((file) => file.endsWith('.sqlite')) : [], []);
+    }
+  });
+
+  it('refuses nullable data for a canonical NOT NULL column before any backup', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-v5-null-not-null-'));
+    const path = join(dir, 'qlb.db');
+    const db = new DatabaseSync(path);
+    db.exec(`CREATE TABLE codex_watch (
+      switch_id INTEGER PRIMARY KEY, provider TEXT, outgoing TEXT NOT NULL,
+      target TEXT NOT NULL, next_at INTEGER NOT NULL, until INTEGER NOT NULL
+    );
+    INSERT INTO codex_watch VALUES (1, NULL, 'outgoing', 'target', 1, 2);
+    PRAGMA user_version = 5`);
+    db.close();
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      assert.throws(
+        () => openStore(path),
+        /cannot correct pre-release v5 codex_watch: copied rows violate new constraints \(NOT NULL constraint failed: codex_watch__v5new\.provider\)/,
+      );
+    }
+
+    assert.deepEqual(existsSync(join(dir, 'backups')) ? readdirSync(join(dir, 'backups')).filter((file) => file.endsWith('.sqlite')) : [], []);
+    const check = dbAt(path);
+    try {
+      assert.equal((check.prepare('SELECT provider FROM codex_watch').get() as { provider: string | null }).provider, null);
+    } finally { check.close(); }
   });
 
   it('scrubs existing relogin rows once without a schema-version change', () => {

@@ -789,6 +789,30 @@ function assertProviderlessUsagePollsCanBeMigrated(db: DatabaseSync, verifiedBac
   if (unexpected) {
     refuseInexactV5Rebuild('usage_polls', `column ${unexpected.name} is not in the canonical definition and cannot be reproduced`, verifiedBackupPath);
   }
+  const schemaObjects = db.prepare(`SELECT type, name FROM sqlite_master
+    WHERE tbl_name = ? AND type IN ('index', 'trigger')
+      AND (type = 'trigger' OR name NOT LIKE 'sqlite_autoindex_%')
+    ORDER BY type, name`).all('usage_polls') as Array<{ type: 'index' | 'trigger'; name: string }>;
+  const schemaObject = schemaObjects[0];
+  if (schemaObject) {
+    refuseInexactV5Rebuild('usage_polls', `${schemaObject.type} ${schemaObject.name} cannot be reproduced`, verifiedBackupPath);
+  }
+  const actualSql = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'usage_polls'").get() as { sql: string };
+  const canonicalSql = requiredV5TableShapes().get('usage_polls')!.sql;
+  const normalizedActual = normalizedSql(sqlWithoutLiteralsOrComments(actualSql.sql));
+  const normalizedCanonical = normalizedSql(sqlWithoutLiteralsOrComments(canonicalSql));
+  for (const [name, pattern] of [
+    ['CHECK', /\bcheck\b/],
+    ['UNIQUE', /\bunique\b/],
+    ['FOREIGN KEY', /\bforeign\s+key\b/],
+    ['GENERATED', /\bgenerated\b/],
+    ['STRICT', /\bstrict\b/],
+    ['WITHOUT ROWID', /\bwithout\s+rowid\b/],
+  ] as const) {
+    if (pattern.test(normalizedActual) && !pattern.test(normalizedCanonical)) {
+      refuseInexactV5Rebuild('usage_polls', `${name} differs from the canonical definition and cannot be reproduced`, verifiedBackupPath);
+    }
+  }
   const rows = db.prepare('SELECT account_id FROM usage_polls').all() as Array<{ account_id: string }>;
   const providerFor = db.prepare('SELECT provider FROM accounts WHERE id = ?');
   for (const row of rows) {
@@ -812,6 +836,18 @@ function preflightV5Correction(db: DatabaseSync, verifiedBackupPath: string): vo
       refuseInexactV5Rebuild(table, `populated table is missing required column(s) ${plan.impossible.map(({ name }) => name).join(', ')}`, verifiedBackupPath);
     }
     if (plan.requiresRebuild) {
+      for (const canonicalColumn of shape.columns) {
+        const existingColumn = plan.existing.find(({ name }) => name === canonicalColumn.name);
+        if (!existingColumn || !canonicalColumn.notNull || canonicalColumn.defaultValue !== null || existingColumn.notnull) continue;
+        const nullRow = db.prepare(`SELECT 1 FROM ${quoteIdentifier(table)} WHERE ${quoteIdentifier(canonicalColumn.name)} IS NULL LIMIT 1`).get();
+        if (nullRow) {
+          refuseInexactV5Rebuild(
+            table,
+            `copied rows violate new constraints (NOT NULL constraint failed: ${table}__v5new.${canonicalColumn.name})`,
+            verifiedBackupPath,
+          );
+        }
+      }
       const newTable = `${table}__v5new`;
       if (db.prepare("SELECT 1 FROM sqlite_master WHERE name = ?").get(newTable)) {
         refuseInexactV5Rebuild(table, `temporary table ${newTable} already exists`, verifiedBackupPath);

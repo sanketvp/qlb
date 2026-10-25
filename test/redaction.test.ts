@@ -26,6 +26,19 @@ describe('redaction', () => {
     assert.match(result, /token_count=5/);
   });
 
+  it('fails closed from a sensitive key through the end of its diagnostic line', () => {
+    const cases = [
+      ['stderr: password=hunter2 rest', 'stderr: password=[redacted]'],
+      ['Cookie: session=abc; csrf=def', 'Cookie: [redacted]'],
+      ['msg: api_key=abc; ok', 'msg: api_key=[redacted]'],
+      ['password="hunter 2"', 'password=[redacted]'],
+      ['token_count=5', 'token_count=5'],
+      ['passwordless login', 'passwordless login'],
+    ] as const;
+
+    for (const [input, expected] of cases) assert.equal(redactKeyValueText(input, []), expected);
+  });
+
   it('redacts supplied secrets and their SHA-256 fingerprints', () => {
     const secret = 'fixture-' + 'secret-value';
     const result = redactSecrets(`token=${secret} fingerprint=${fingerprint(secret)}`, [secret]);
