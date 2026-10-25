@@ -778,6 +778,7 @@ export class Store {
       this.db.exec(`
         CREATE TABLE usage_polls_v5 (
           provider TEXT NOT NULL, account_id TEXT NOT NULL,
+          -- Added by A4g for upstream parity (usage_store.py:1246-1253); absent from spec 3.2 as of 2026-10-24; spec amendment pending.
           last_fetch_at INTEGER, last_attempt_at INTEGER, next_due_at INTEGER, poll_interval_s REAL,
           last_status TEXT, consecutive_failures INTEGER NOT NULL DEFAULT 0,
           backoff_until INTEGER, last_429_at INTEGER, held_until INTEGER,
@@ -812,6 +813,7 @@ export class Store {
         injected INTEGER NOT NULL DEFAULT 0, detail TEXT, published_at INTEGER, committed_at INTEGER
       );
       CREATE TABLE IF NOT EXISTS usage_polls (
+        -- Added by A4g for upstream parity (usage_store.py:1246-1253); absent from spec 3.2 as of 2026-10-24; spec amendment pending.
         provider TEXT NOT NULL, account_id TEXT NOT NULL, last_fetch_at INTEGER, last_attempt_at INTEGER, next_due_at INTEGER, poll_interval_s REAL,
         last_status TEXT, consecutive_failures INTEGER NOT NULL DEFAULT 0, backoff_until INTEGER, last_429_at INTEGER, held_until INTEGER,
         PRIMARY KEY (provider, account_id)
@@ -838,6 +840,7 @@ export class Store {
       CREATE TABLE IF NOT EXISTS pi_export_targets (provider TEXT NOT NULL, target TEXT NOT NULL, slot_account_id TEXT NOT NULL, lineage_fp TEXT NOT NULL, recorded_at INTEGER NOT NULL, PRIMARY KEY (provider, target));
       CREATE TABLE IF NOT EXISTS codex_live_observations (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, identity TEXT, lineage_fp TEXT, by TEXT NOT NULL);
     `);
+    // Added by A4g for upstream parity (usage_store.py:1246-1253); absent from spec 3.2 as of 2026-10-24; spec amendment pending.
     this.addColumnIfMissing('usage_polls', 'poll_interval_s', 'REAL');
     this.addColumnIfMissing('claude_slots', 'archived_at', 'INTEGER');
     this.addColumnIfMissing('codex_slots', 'pending_adopt', 'INTEGER NOT NULL DEFAULT 0');
@@ -1076,22 +1079,44 @@ export class Store {
    */
   writeUsagePollPlans(
     provider: string,
-    plans: Readonly<Record<string, { nextDueAt: number; pollIntervalS: number }>>,
-  ): void {
+    plans: Readonly<Record<string, {
+      nextDueAt: number;
+      pollIntervalS: number;
+      expectedNextDueAt?: number | null;
+      expectedPollIntervalS?: number | null;
+    }>>,
+    now?: number,
+  ): number {
     const rows = Object.entries(plans);
-    if (rows.length === 0) return;
+    if (rows.length === 0) return 0;
+    let written = 0;
     this.runImmediate(() => {
-      const write = this.db.prepare(`
+      const upsert = this.db.prepare(`
         INSERT INTO usage_polls (provider, account_id, next_due_at, poll_interval_s)
         VALUES (?, ?, ?, ?)
         ON CONFLICT(provider, account_id) DO UPDATE SET
           next_due_at = excluded.next_due_at,
           poll_interval_s = excluded.poll_interval_s
       `);
+      const repair = this.db.prepare(`
+        UPDATE usage_polls SET next_due_at = ?, poll_interval_s = ?
+        WHERE provider = ? AND account_id = ?
+          AND next_due_at IS ? AND poll_interval_s IS ?
+          AND last_status IS NOT 'token_dead'
+          AND (backoff_until IS NULL OR backoff_until <= ?)
+          AND (held_until IS NULL OR held_until <= ?)
+      `);
       for (const [accountId, plan] of rows) {
-        write.run(provider, accountId, plan.nextDueAt, plan.pollIntervalS);
+        const isRepair = now !== undefined
+          && Object.hasOwn(plan, 'expectedNextDueAt')
+          && Object.hasOwn(plan, 'expectedPollIntervalS');
+        const result = isRepair
+          ? repair.run(plan.nextDueAt, plan.pollIntervalS, provider, accountId, plan.expectedNextDueAt ?? null, plan.expectedPollIntervalS ?? null, now, now)
+          : upsert.run(provider, accountId, plan.nextDueAt, plan.pollIntervalS);
+        written += Number(result.changes);
       }
     });
+    return written;
   }
 
   /**

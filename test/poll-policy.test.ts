@@ -456,6 +456,77 @@ describe('claude-swap due-candidate port', () => {
     }
   });
 
+  it('does not overwrite a concurrent fetch plan while repairing other overdue rows', () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'qlb-overdue-cas-plan-')), 'qlb.db');
+    const provider = 'anthropic';
+    const entries: Record<string, DueCandidateSlot> = {
+      selected: { lastFetchAt: now - 1_300, nextDueAt: now - 601, pollIntervalS: 600 },
+      stale: { lastFetchAt: now - 1_200, nextDueAt: now - 601, pollIntervalS: 600 },
+      other: { lastFetchAt: now - 1_100, nextDueAt: now - 601, pollIntervalS: 600 },
+    };
+    const store = openStore(path);
+    try {
+      assert.equal(store.writeUsagePollPlans(provider, Object.fromEntries(Object.entries(entries).map(([accountId, entry]) => [accountId, {
+        nextDueAt: entry.nextDueAt!, pollIntervalS: entry.pollIntervalS!,
+      }]))), 3);
+      assert.equal(store.writeUsagePollPlans(provider, { stale: { nextDueAt: now + 900, pollIntervalS: 900 } }), 1);
+      assert.equal(repairOverduePlans({ provider, candidates: Object.keys(entries), entries, now, rng: () => 0.5, writer: store }), 'selected');
+    } finally { store.close(); }
+    const db = new DatabaseSync(path, { readOnly: true });
+    try {
+      assert.deepEqual((db.prepare('SELECT account_id, next_due_at, poll_interval_s FROM usage_polls WHERE provider = ? ORDER BY account_id').all(provider) as Array<Record<string, unknown>>).map((row) => ({ ...row })), [
+        { account_id: 'other', next_due_at: now + 600, poll_interval_s: 600 },
+        { account_id: 'selected', next_due_at: now - 601, poll_interval_s: 600 },
+        { account_id: 'stale', next_due_at: now + 900, poll_interval_s: 900 },
+      ]);
+    } finally { db.close(); }
+  });
+
+  it('does not repair a row placed on hold after its snapshot', () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'qlb-overdue-cas-hold-')), 'qlb.db');
+    const provider = 'anthropic';
+    const entries: Record<string, DueCandidateSlot> = {
+      selected: { lastFetchAt: now - 1_300, nextDueAt: now - 601, pollIntervalS: 600 },
+      held: { lastFetchAt: now - 1_200, nextDueAt: now - 601, pollIntervalS: 600 },
+    };
+    const store = openStore(path);
+    try {
+      store.writeUsagePollPlans(provider, Object.fromEntries(Object.entries(entries).map(([accountId, entry]) => [accountId, { nextDueAt: entry.nextDueAt!, pollIntervalS: entry.pollIntervalS! }])));
+      const db = new DatabaseSync(path);
+      try { db.prepare('UPDATE usage_polls SET held_until = ? WHERE provider = ? AND account_id = ?').run(now + 1, provider, 'held'); } finally { db.close(); }
+      assert.equal(repairOverduePlans({ provider, candidates: Object.keys(entries), entries, now, rng: () => 0.5, writer: store }), 'selected');
+    } finally { store.close(); }
+    const db = new DatabaseSync(path, { readOnly: true });
+    try { assert.equal((db.prepare('SELECT next_due_at FROM usage_polls WHERE account_id = ?').get('held') as { next_due_at: number }).next_due_at, now - 601); } finally { db.close(); }
+  });
+
+  it('does not repair rows backed off or marked token-dead after their snapshot', () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'qlb-overdue-cas-excluded-')), 'qlb.db');
+    const provider = 'anthropic';
+    const entries: Record<string, DueCandidateSlot> = {
+      selected: { lastFetchAt: now - 1_400, nextDueAt: now - 601, pollIntervalS: 600 },
+      backedOff: { lastFetchAt: now - 1_300, nextDueAt: now - 601, pollIntervalS: 600 },
+      dead: { lastFetchAt: now - 1_200, nextDueAt: now - 601, pollIntervalS: 600 },
+    };
+    const store = openStore(path);
+    try {
+      store.writeUsagePollPlans(provider, Object.fromEntries(Object.entries(entries).map(([accountId, entry]) => [accountId, { nextDueAt: entry.nextDueAt!, pollIntervalS: entry.pollIntervalS! }])));
+      const db = new DatabaseSync(path);
+      try {
+        db.prepare('UPDATE usage_polls SET backoff_until = ? WHERE provider = ? AND account_id = ?').run(now + 1, provider, 'backedOff');
+        db.prepare("UPDATE usage_polls SET last_status = 'token_dead' WHERE provider = ? AND account_id = ?").run(provider, 'dead');
+      } finally { db.close(); }
+      assert.equal(repairOverduePlans({ provider, candidates: Object.keys(entries), entries, now, rng: () => 0.5, writer: store }), 'selected');
+    } finally { store.close(); }
+    const db = new DatabaseSync(path, { readOnly: true });
+    try {
+      assert.deepEqual((db.prepare("SELECT account_id, next_due_at FROM usage_polls WHERE account_id IN ('backedOff', 'dead') ORDER BY account_id").all() as Array<Record<string, unknown>>).map((row) => ({ ...row })), [
+        { account_id: 'backedOff', next_due_at: now - 601 },
+        { account_id: 'dead', next_due_at: now - 601 },
+      ]);
+    } finally { db.close(); }
+  });
+
   it('does not repair held or dead overdue plans', () => {
     const plans: Array<{ accountId: string; nextDueAt: number; pollIntervalS: number }> = [];
     const entries: Record<string, DueCandidateSlot> = {
@@ -473,7 +544,13 @@ describe('claude-swap due-candidate port', () => {
       writer: { writeUsagePollPlans: (_provider, rows) => plans.push(...Object.entries(rows).map(([accountId, plan]) => ({ accountId, ...plan }))) },
     });
     assert.equal(chosen, 'selected');
-    assert.deepEqual(plans, [{ accountId: 'repaired', nextDueAt: now + 600, pollIntervalS: 600 }]);
+    assert.deepEqual(plans, [{
+      accountId: 'repaired',
+      nextDueAt: now + 600,
+      pollIntervalS: 600,
+      expectedNextDueAt: now - 601,
+      expectedPollIntervalS: 600,
+    }]);
   });
 
   it('matches the C-swap plan-after-fetch oracle for repaired jitter', () => {
@@ -492,7 +569,7 @@ describe('claude-swap due-candidate port', () => {
       entries,
       now,
       rng: () => randomValues[randomIndex++]!,
-      writer: { writeUsagePollPlans: (_provider, plans) => { actual = plans; } },
+      writer: { writeUsagePollPlans: (_provider, plans) => { actual = plans; return 0; } },
     });
     const expected = pythonPlans(randomValues.map((rng) => ({
       prevIntervalS: 600,
@@ -506,9 +583,9 @@ describe('claude-swap due-candidate port', () => {
       rng,
     })));
     assert.deepEqual(actual, {
-      low: { nextDueAt: expected[0]![0], pollIntervalS: expected[0]![1] },
-      middle: { nextDueAt: expected[1]![0], pollIntervalS: expected[1]![1] },
-      high: { nextDueAt: expected[2]![0], pollIntervalS: expected[2]![1] },
+      low: { nextDueAt: expected[0]![0], pollIntervalS: expected[0]![1], expectedNextDueAt: now - 601, expectedPollIntervalS: 600 },
+      middle: { nextDueAt: expected[1]![0], pollIntervalS: expected[1]![1], expectedNextDueAt: now - 601, expectedPollIntervalS: 600 },
+      high: { nextDueAt: expected[2]![0], pollIntervalS: expected[2]![1], expectedNextDueAt: now - 601, expectedPollIntervalS: 600 },
     });
   });
 

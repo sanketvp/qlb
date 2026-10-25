@@ -42,11 +42,14 @@ export interface DueCandidateSlot {
 export interface UsagePollPlan {
   nextDueAt: number;
   pollIntervalS: number;
+  /** Snapshot values required for a repair compare-and-set. */
+  expectedNextDueAt?: number | null;
+  expectedPollIntervalS?: number | null;
 }
 
 /** Narrow store dependency so overdue-plan repair remains clock/RNG testable. */
 export interface UsagePollPlanWriter {
-  writeUsagePollPlans(provider: string, plans: Readonly<Record<string, UsagePollPlan>>): void;
+  writeUsagePollPlans(provider: string, plans: Readonly<Record<string, UsagePollPlan>>, now?: number): number;
 }
 
 export interface OverduePlanRepairInput {
@@ -400,9 +403,11 @@ export function repairOverduePlans({
     repairs[slot] = {
       nextDueAt: now + interval * (1.0 + JITTER_FRAC * (2.0 * rng() - 1.0)),
       pollIntervalS: interval,
+      expectedNextDueAt: nextDueAt,
+      expectedPollIntervalS: entry.pollIntervalS ?? null,
     };
   }
-  if (Object.keys(repairs).length > 0) writer.writeUsagePollPlans(provider, repairs);
+  if (Object.keys(repairs).length > 0) writer.writeUsagePollPlans(provider, repairs, now);
   return selected;
 }
 
