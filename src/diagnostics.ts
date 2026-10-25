@@ -94,14 +94,25 @@ export interface HelperSigningState {
   identityHash: string;
 }
 
+/** Injectable only to parse captured `codesign` output in hermetic tests. */
+export type CodesignSpawn = (
+  command: string,
+  args: string[],
+  options: { encoding: 'utf8' },
+) => { status: number | null; stdout?: string | Buffer; stderr?: string | Buffer };
+
 /** Validates the code signature and reads its metadata; no Keychain values are read. */
-export function inspectHelperSigning(path = defaultKeychainHelperPath()): HelperSigningState | null {
+export function inspectHelperSigning(
+  path = defaultKeychainHelperPath(),
+  spawn: CodesignSpawn = spawnSync,
+): HelperSigningState | null {
   if (!existsSync(path)) return null;
-  const verification = spawnSync('/usr/bin/codesign', ['--verify', '--strict', path], { encoding: 'utf8' });
+  const verification = spawn('/usr/bin/codesign', ['--verify', '--strict', path], { encoding: 'utf8' });
   if (verification.status !== 0) return null;
-  const result = spawnSync('/usr/bin/codesign', ['-d', '-v', '-r-', path], { encoding: 'utf8' });
+  // Authority needs -vv and CDHash needs -vvv on current macOS codesign output.
+  const result = spawn('/usr/bin/codesign', ['-d', '-vvv', '-r-', path], { encoding: 'utf8' });
   if (result.status !== 0) return null;
-  const details = `${result.stdout ?? ''}\n${result.stderr ?? ''}`;
+  const details = `${result.stdout?.toString() ?? ''}\n${result.stderr?.toString() ?? ''}`;
   const authority = /^Authority=(.+)$/m.exec(details)?.[1]?.trim();
   const binaryHash = /^CDHash=([0-9a-fA-F]+)$/m.exec(details)?.[1]?.toLowerCase();
   const identityHash = /certificate leaf = H"([0-9a-fA-F]{40})"/.exec(details)?.[1]?.toLowerCase();

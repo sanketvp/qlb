@@ -21,7 +21,7 @@ import { dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { describe, it } from 'node:test';
 
-import { installRelease, readReleaseManifest, releaseDigest } from '../src/release';
+import { installRelease as installReleaseForPlatform, readReleaseManifest, releaseDigest } from '../src/release';
 import { runReleaseCommand } from '../src/commands/release';
 import { releaseCurrentCheck } from '../src/checks/release-current';
 import type { CommandContext } from '../src/registry';
@@ -30,6 +30,10 @@ const QLB_HELPER_SIGNING = {
   authority: 'QLB Keychain Helper', binaryHash: 'a'.repeat(40), identityHash: 'b'.repeat(40),
 };
 const validHelperVerifier = { verifyHelperSigning: () => QLB_HELPER_SIGNING };
+
+// Fixture releases do not model macOS packaging unless a test opts in explicitly.
+const installRelease = (options: Parameters<typeof installReleaseForPlatform>[0]) =>
+  installReleaseForPlatform({ platform: 'linux', ...options });
 
 function shippedBuildDigest(source: string): string {
   const paths: string[] = [];
@@ -128,10 +132,22 @@ describe('release install (AC45)', () => {
 
     unlinkSync(sourceHelper);
     const withoutHelper = await installRelease({
-      sourceDir, appDir: join(root, 'app-without-helper'), sha: 'helper-sha', dbPath: join(root, 'db'), ...validHelperVerifier,
+      sourceDir, appDir: join(root, 'app-without-helper'), sha: 'helper-sha', dbPath: join(root, 'db'), platform: 'linux', ...validHelperVerifier,
     });
     assert.equal(existsSync(join(withoutHelper.releaseDir, 'native', 'keychain-helper', 'build', 'qlb-keychain-helper')), false);
     assert.notEqual(readReleaseManifest(withoutHelper.releaseDir)!.digest, helperDigest);
+  });
+
+  it('refuses a missing Keychain helper on darwin before publishing a release', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-release-helper-missing-'));
+    const sourceDir = sourceBuild(root, 'missing-helper-sha');
+    const appDir = join(root, 'app');
+
+    await assert.rejects(
+      installRelease({ sourceDir, appDir, sha: 'missing-helper-sha', dbPath: join(root, 'db'), platform: 'darwin' }),
+      /helper missing; run npm run build:helper/,
+    );
+    assert.equal(existsSync(join(appDir, 'missing-helper-sha')), false);
   });
 
   it('refuses an unsigned present Keychain helper before publishing a release', async () => {

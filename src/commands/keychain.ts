@@ -151,7 +151,7 @@ export function helperMatrixConfig(
 ): Record<string, string> {
   const config: Record<string, string> = {
     'keychain.helperCheckAt': String(Date.now()),
-    'keychain.helperCheckResult': result && helperMatrixIsOk(result) ? 'ok' : 'failed',
+    'keychain.helperCheckResult': result && helperMatrixIsOk(result) && signing?.authority === 'QLB Keychain Helper' ? 'ok' : 'failed',
     'keychain.helperCheckPrompted': String(result?.prompted === true),
     'keychain.helperCheckCasePrompted': JSON.stringify(result?.casePrompted ?? {}),
   };
@@ -162,10 +162,15 @@ export function helperMatrixConfig(
   return config;
 }
 
-function writeMatrixConfig(dbPath: string, result: HelperMatrixResult | null, path: string): void {
+function writeMatrixConfig(
+  dbPath: string,
+  result: HelperMatrixResult | null,
+  path: string,
+  signing: HelperSigningState | null = helperSigningState(path),
+): void {
   const store = openStore(dbPath);
   try {
-    for (const [key, value] of Object.entries(helperMatrixConfig(result, helperSigningState(path)))) store.setConfig(key, value);
+    for (const [key, value] of Object.entries(helperMatrixConfig(result, signing))) store.setConfig(key, value);
   } finally {
     store.close();
   }
@@ -174,6 +179,8 @@ function writeMatrixConfig(dbPath: string, result: HelperMatrixResult | null, pa
 export interface KeychainCommandDependencies {
   runMatrix?: () => HelperMatrixResult;
   runLaunchdMatrix?: () => HelperMatrixResult;
+  /** Injectable so receipt handling can be tested without codesign. */
+  helperSigning?: (path: string) => HelperSigningState | null;
 }
 
 export async function runKeychainCommand(
@@ -189,12 +196,17 @@ export async function runKeychainCommand(
   }
 
   let result: HelperMatrixResult | null = null;
+  const path = helperPath();
+  let signing: HelperSigningState | null = null;
   try {
     result = options.subcommand === 'check-launchd'
       ? (dependencies.runLaunchdMatrix ?? runHelperMatrixUnderLaunchd)()
       : (dependencies.runMatrix ?? runHelperMatrix)();
-    if (!helperMatrixIsOk(result)) throw new MatrixReceiptError(result);
-    writeMatrixConfig(ctx.config.dbPath, result, helperPath());
+    signing = (dependencies.helperSigning ?? helperSigningState)(path);
+    if (!helperMatrixIsOk(result) || !signing || signing.authority !== 'QLB Keychain Helper') {
+      throw new MatrixReceiptError(result);
+    }
+    writeMatrixConfig(ctx.config.dbPath, result, path, signing);
     const body = {
       command: options.subcommand, helperCheckResult: 'ok', prompted: result.prompted,
       casePrompted: result.casePrompted, cases: result.cases,
@@ -209,7 +221,7 @@ export async function runKeychainCommand(
     }
     // Native command errors can contain implementation details. Do not relay stderr
     // because this boundary must never carry Keychain values.
-    writeMatrixConfig(ctx.config.dbPath, result, helperPath());
+    writeMatrixConfig(ctx.config.dbPath, result, path, signing);
     ctx.stderr('qlb keychain: helper matrix failed');
     return 1;
   }

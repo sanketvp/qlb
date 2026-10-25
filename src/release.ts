@@ -33,6 +33,8 @@ export interface ReleaseInstallOptions {
   backup?: typeof backupBeforeMigrate;
   /** Verifies the native helper before it can enter an immutable release. */
   verifyHelperSigning?: (path: string) => HelperSigningState | null;
+  /** Injectable only for hermetic platform-specific release tests. */
+  platform?: NodeJS.Platform;
 }
 
 export interface ReleaseInstallResult {
@@ -233,6 +235,7 @@ function copyReleaseContents(
   sourceDir: string,
   stagingDir: string,
   verifyHelperSigning: (path: string) => HelperSigningState | null = inspectHelperSigning,
+  platform: NodeJS.Platform = process.platform,
 ): void {
   const checkoutRoot = realpathSync(sourceDir);
   copyContained(join(sourceDir, 'dist'), join(stagingDir, 'dist'), checkoutRoot);
@@ -247,6 +250,9 @@ function copyReleaseContents(
     copyContained(join(sourceDir, 'src', 'redact.ts'), join(stagingDir, 'src', 'redact.ts'), checkoutRoot);
   }
   const helper = join(sourceDir, 'native', 'keychain-helper', 'build', 'qlb-keychain-helper');
+  if (!existsSync(helper) && platform === 'darwin') {
+    throw new ReleaseIntegrityError('helper missing; run npm run build:helper');
+  }
   if (existsSync(helper)) {
     // Checking the resolved file catches a symlink at any ancestor, not merely at the leaf.
     const resolvedHelper = realpathSync(helper);
@@ -367,7 +373,7 @@ export async function installRelease(options: ReleaseInstallOptions): Promise<Re
   let staged = true;
   try {
     mkdirSync(stagingDir, { mode: 0o755 });
-    copyReleaseContents(options.sourceDir, stagingDir, options.verifyHelperSigning);
+    copyReleaseContents(options.sourceDir, stagingDir, options.verifyHelperSigning, options.platform);
     const stagedBuildDigest = buildOutputDigest(stagingDir);
     if (stagedBuildDigest !== stamp.buildDigest) {
       throw new ReleaseIntegrityError('compiled build output digest differs from its stamp; rebuild from a clean tree');

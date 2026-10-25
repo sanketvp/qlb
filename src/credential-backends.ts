@@ -21,10 +21,12 @@ import {
   mkdirSync,
   readFileSync,
   renameSync,
+  statSync,
   writeFileSync,
 } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { qlbHomeDir } from './home';
+import type { HelperSigningState } from './diagnostics';
 
 export interface CredentialBackend {
   readonly kind?: CredentialBackendKind;
@@ -234,6 +236,45 @@ function assertHelperPresent(path: string): void {
   if (!existsSync(path)) throw new KeychainHelperMissingError(path);
 }
 
+/** Raised before credentials can reach a helper whose current signature is not trusted. */
+export class KeychainHelperUntrustedError extends Error {
+  readonly code = 'HELPER_UNTRUSTED';
+  readonly exitCode = 3;
+
+  constructor(reason: string) {
+    super(`helper-untrusted: ${reason}; run npm run build:helper`);
+    this.name = 'KeychainHelperUntrustedError';
+  }
+}
+
+type HelperVerifier = (path: string) => HelperSigningState | null;
+
+function defaultHelperVerifier(path: string): HelperSigningState | null {
+  // Lazy loading avoids making diagnostics' credential diagnostics a module-init cycle.
+  const { inspectHelperSigning } = require('./diagnostics') as { inspectHelperSigning: HelperVerifier };
+  return inspectHelperSigning(path);
+}
+
+// A process-wide cache avoids a codesign invocation for every credential operation.
+const helperTrustCache = new Map<string, HelperSigningState | null>();
+
+function assertTrustedHelper(path: string, verifier: HelperVerifier): void {
+  assertHelperPresent(path);
+  const stat = statSync(path);
+  const cacheKey = `${path}\0${stat.mtimeMs}\0${stat.size}`;
+  let signing: HelperSigningState | null;
+  if (helperTrustCache.has(cacheKey)) {
+    signing = helperTrustCache.get(cacheKey)!;
+  } else {
+    signing = verifier(path);
+    helperTrustCache.set(cacheKey, signing);
+  }
+  if (!signing) throw new KeychainHelperUntrustedError('not signed');
+  if (signing.authority !== 'QLB Keychain Helper') {
+    throw new KeychainHelperUntrustedError(`signed by ${signing.authority}, expected QLB Keychain Helper`);
+  }
+}
+
 /** Raised only for cached display reads during the brief Keychain failure backoff. */
 export class KeychainBackedOff extends Error {
   readonly code = 'KEYCHAIN_BACKED_OFF';
@@ -285,19 +326,21 @@ export class MacosKeychainBackend extends SyncCredentialBackend {
   private readonly fakeExecutor: boolean;
 
   private readonly helperPath?: string;
+  private readonly helperVerifier?: HelperVerifier;
 
-  constructor(opts: { execFileSync?: ExecFileSyncFn; helperPath?: string } = {}) {
+  constructor(opts: { execFileSync?: ExecFileSyncFn; helperPath?: string; helperVerifier?: HelperVerifier } = {}) {
     super();
     this.exec = opts.execFileSync ?? execFileUtf8;
     this.fakeExecutor = isFakeExecutor(this.exec);
     this.helperPath = opts.helperPath;
+    this.helperVerifier = opts.helperVerifier;
     if (isQlbTestMode() && !this.fakeExecutor) throw new NativeKeychainDisabled();
   }
 
   setSync(service: string, account: string, jsonValue: string): void {
     this.assertNativeAccessEnabled();
     const helper = this.helperPath ?? defaultKeychainHelperPath();
-    if (!this.fakeExecutor) assertHelperPresent(helper);
+    this.assertTrustedHelper(helper);
     try {
       // Every write, including test doubles, follows the helper's stdin protocol.
       this.exec(helper, ['set', service, account], {
@@ -332,7 +375,7 @@ export class MacosKeychainBackend extends SyncCredentialBackend {
   deleteSync(service: string, account: string): void {
     this.assertNativeAccessEnabled();
     const helper = this.helperPath ?? defaultKeychainHelperPath();
-    if (!this.fakeExecutor) assertHelperPresent(helper);
+    this.assertTrustedHelper(helper);
     try {
       this.exec(helper, ['delete', service, account], {
         encoding: 'utf8', timeout: MACOS_SECURITY_TIMEOUT_MS,
@@ -344,6 +387,12 @@ export class MacosKeychainBackend extends SyncCredentialBackend {
       }
       throw wrapCredentialError('delete', service, account, err);
     }
+  }
+
+  private assertTrustedHelper(path: string): void {
+    // Fake executors never run a helper. An explicitly injected verifier opts a
+    // test into the same boundary used by production without invoking codesign.
+    if (!this.fakeExecutor || this.helperVerifier) assertTrustedHelper(path, this.helperVerifier ?? defaultHelperVerifier);
   }
 
   private assertNativeAccessEnabled(): void {
