@@ -192,7 +192,8 @@ async function readRolloutSnapshots(authPath: string, activeAccountId: string): 
       await streamRolloutLines(file.path, (line) => {
         if (!line || (!line.includes('rate_limits') && !line.includes('rateLimits'))) return true;
         try {
-          latestRateLimits = nestedRateLimits(JSON.parse(line));
+          const found = nestedRateLimits(JSON.parse(line));
+          if (found) latestRateLimits = found;
         } catch {
           // Codex may be in the middle of appending a line.
         }

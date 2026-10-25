@@ -150,6 +150,46 @@ describe('Codex usage adapter', () => {
     });
   });
 
+  it('retains a usable snapshot when a later token_count has null rate_limits', async () => {
+    await withRolloutDir(async (authPath, writeRollout) => {
+      await writeRollout('latest', [
+        rolloutMeta(accountId),
+        rolloutLimits(73),
+        { type: 'token_count', info: null, rate_limits: null },
+      ], 2_000);
+      const result = await probeCodexUsage({ auth, authPath, fetchFn: unknownFetch });
+      assert.equal(result.source, 'codex-rollout');
+      assert.deepEqual(result.windows, [{ bucket: 'primary', usedPct: 73 }]);
+    });
+  });
+
+  it('retains a usable snapshot when a later response_item message merely mentions rate_limits', async () => {
+    await withRolloutDir(async (authPath, writeRollout) => {
+      await writeRollout('latest', [
+        rolloutMeta(accountId),
+        rolloutLimits(73),
+        { type: 'response_item', payload: { type: 'message', text: 'inspect rate_limits before continuing' } },
+      ], 2_000);
+      const result = await probeCodexUsage({ auth, authPath, fetchFn: unknownFetch });
+      assert.equal(result.source, 'codex-rollout');
+      assert.deepEqual(result.windows, [{ bucket: 'primary', usedPct: 73 }]);
+    });
+  });
+
+  it('keeps the newest usable snapshot when an older file is also available', async () => {
+    await withRolloutDir(async (authPath, writeRollout) => {
+      await writeRollout('older', [rolloutMeta(accountId), rolloutLimits(10)], 1_000);
+      await writeRollout('latest', [
+        rolloutMeta(accountId),
+        rolloutLimits(73),
+        { type: 'token_count', info: null, rate_limits: null },
+      ], 2_000);
+      const result = await probeCodexUsage({ auth, authPath, fetchFn: unknownFetch });
+      assert.equal(result.source, 'codex-rollout');
+      assert.deepEqual(result.windows, [{ bucket: 'primary', usedPct: 73 }]);
+    });
+  });
+
   it('bounds rollout files while streaming large non-rate-limit content', async () => {
     await withRolloutDir(async (authPath, writeRollout) => {
       await writeRollout('old-usable', [rolloutMeta(accountId), rolloutLimits(42)], 1_000);
