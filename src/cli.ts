@@ -7,6 +7,7 @@ import { adapters } from './adapters';
 import { createDefaultCodexGateDeps, runCodexGate } from './codex-gate';
 import { config, resolveConfig, stripConfigArgs } from './config';
 import { discoverCommands, resolveCommand, type CommandContext, type CommandDefinition } from './registry';
+import { runCodexProbeClaims } from './commands/codex-probe-claims';
 import { redactError } from './redact';
 import { doctorQlb, initializeQlb, listCheckNames, type DoctorReport, type InitReport } from './diagnostics';
 import { platformKeychain } from './keychain';
@@ -94,6 +95,7 @@ const USAGE = `Usage:
   qlb policy set --harness <h> --virtual-model <name> --real-model <id> --effort <lvl> [--fallback m1,m2] [--session-mode header|anon] [--db <path>] [--json]
   qlb policy list [--harness <h>] [--db <path>] [--json]
   qlb codex gate [--json] [--db <path>]
+  qlb codex probe-claims --json
   qlb proxy [--info-path <path>] [--idle-ms <n>] [--no-idle] [--port <n>] [--started-by wrapper|cli] [--db <path>]
   qlb consume enable|disable|status --provider anthropic [--json] [--db <path>]
   qlb migrate stage    [--provider anthropic|xai|kimi-coding|openai-codex|openrouter] --pool-file <path> --owner-file <path> [--auth-json <path>] [--db <path>] [--target-dir <path>] [--confirm-real-cutover]
@@ -230,6 +232,10 @@ type PolicyListOpts = {
   harness?: string;
 };
 type PolicyOpts = PolicySetOpts | PolicyListOpts;
+type CodexProbeClaimsOpts = {
+  cmd: 'codex-probe-claims';
+  args: string[];
+};
 type GateOpts = {
   cmd: 'gate';
   target: 'codex';
@@ -285,7 +291,7 @@ type AuditOpts = {
   limit: number;
   db?: string;
 };
-type Opts = InitOpts | DoctorOpts | RefreshOpts | WhyOpts | StatusOpts | SetupOpts | ResolveOpts | MigrateOpts | PolicyOpts | GateOpts | ProxyOpts | ConsumeOpts | RetireOpts | NativeResyncOpts | OverrideOpts | AccountsOpts | AuditOpts;
+type Opts = InitOpts | DoctorOpts | RefreshOpts | WhyOpts | StatusOpts | SetupOpts | ResolveOpts | MigrateOpts | PolicyOpts | CodexProbeClaimsOpts | GateOpts | ProxyOpts | ConsumeOpts | RetireOpts | NativeResyncOpts | OverrideOpts | AccountsOpts | AuditOpts;
 
 const MIGRATE_SUBS: readonly MigrateSub[] = [
   'stage',
@@ -868,6 +874,9 @@ export function parseArgs(argv: string[]): Opts {
   }
   if (raw[0] === 'policy') {
     return parsePolicyArgs(raw.slice(1));
+  }
+  if (raw[0] === 'codex-probe-claims') {
+    return { cmd: 'codex-probe-claims', args: raw.slice(1) };
   }
   if (raw[0] === 'gate' && raw[1] === '--codex') {
     return parseGateArgs(raw.slice(2));
@@ -1932,6 +1941,9 @@ async function main(): Promise<void> {
       console.error(`qlb policy ${opts.sub}: ${msg}`);
       process.exit(1);
     }
+  }
+  if (opts.cmd === 'codex-probe-claims') {
+    process.exit(await runCodexProbeClaims(opts.args));
   }
   if (opts.cmd === 'gate') {
     try {

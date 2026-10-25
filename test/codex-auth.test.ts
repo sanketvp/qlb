@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { lstat, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { describe, it } from 'node:test';
@@ -8,11 +9,14 @@ import {
   accessExpiry,
   codexFingerprint,
   codexIdentity,
+  idTokenClaimNames,
+  authTime,
   needsRefresh,
   parseCodexAuth,
   readCodexAuthStable,
   writeCodexAuthAtomic,
 } from '../src/codex-auth';
+import { redactSecrets } from '../src/redact';
 
 const fs: typeof import('node:fs') = require('node:fs');
 
@@ -197,6 +201,87 @@ describe('codex auth.json helpers', () => {
   it('fingerprints only the refresh token with the sha256 prefix', () => {
     const fingerprint = codexFingerprint(parseValid());
     assert.match(fingerprint, /^sha256:[a-f0-9]{64}$/);
+  });
+
+  it('returns sorted ID-token claim names and auth_time without exposing claim values', () => {
+    const doc = parseValid({
+      tokens: {
+        id_token: jwt({
+          auth_time: 1_710_000_000,
+          email: 'fixture-operator@example.test',
+          token_like: 'eyJhbGciOiJub25lIn0.fixture-payload.fixture-signature',
+        }),
+        access_token: jwt({ exp: 2_000_000_000 }),
+        refresh_token: 'test-refresh-token',
+      },
+    });
+    assert.deepEqual(idTokenClaimNames(doc), ['auth_time', 'email', 'token_like']);
+    assert.equal(authTime(doc), 1_710_000_000);
+  });
+
+  it('returns no ID-token claims or auth_time for malformed tokens and non-numeric auth_time', () => {
+    for (const payload of [
+      undefined,
+      { auth_time: '1_710_000_000' },
+      { auth_time: null },
+    ]) {
+      const doc = parseValid({
+        tokens: {
+          id_token: payload === undefined ? 'not-a-jwt' : jwt(payload),
+          access_token: jwt({ exp: 2_000_000_000 }),
+          refresh_token: 'test-refresh-token',
+        },
+      });
+      assert.deepEqual(idTokenClaimNames(doc), payload === undefined ? [] : ['auth_time']);
+      assert.equal(authTime(doc), undefined);
+    }
+  });
+
+  it('prints only claim names and auth_time presence from a temporary CODEX_HOME fixture', async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), 'qlb-codex-home-'));
+    const authTimeValue = 1_710_000_000;
+    const emailValue = 'fixture-operator@example.test';
+    const tokenLikeValue = 'eyJhbGciOiJub25lIn0.fixture-payload.fixture-signature';
+    const fixtures = [
+      {
+        idToken: jwt({ auth_time: authTimeValue, email: emailValue, token_like: tokenLikeValue }),
+        expected: '{"claimNames":["auth_time","email","token_like"],"hasAuthTime":true}\n',
+      },
+      {
+        idToken: jwt({ email: emailValue }),
+        expected: '{"claimNames":["email"],"hasAuthTime":false}\n',
+      },
+      {
+        idToken: 'not-a-jwt',
+        expected: '{"claimNames":[],"hasAuthTime":false}\n',
+      },
+    ];
+    try {
+      for (const fixture of fixtures) {
+        await writeFile(join(codexHome, 'auth.json'), JSON.stringify(validDocument({
+          tokens: {
+            id_token: fixture.idToken,
+            access_token: jwt({ exp: 2_000_000_000 }),
+            refresh_token: 'test-refresh-token',
+          },
+        })), 'utf8');
+        const result = spawnSync(process.execPath, ['--disable-warning=ExperimentalWarning', join(__dirname, '..', 'src', 'cli.js'), 'codex', 'probe-claims', '--json'], {
+          encoding: 'utf8',
+          env: { ...process.env, CODEX_HOME: codexHome, HOME: codexHome },
+        });
+        assert.equal(result.error, undefined);
+        assert.equal(result.status, 0, result.stderr);
+        assert.equal(result.stdout, fixture.expected);
+        assert.equal(result.stderr, '');
+        const fullOutput = `${result.stdout}${result.stderr}`;
+        assert.equal(redactSecrets(fullOutput, []), fullOutput, 'output contains a token-shaped value');
+        for (const value of [String(authTimeValue), emailValue, tokenLikeValue]) {
+          assert.equal(fullOutput.includes(value), false, `output exposed fixture claim value: ${value}`);
+        }
+      }
+    } finally {
+      await rm(codexHome, { recursive: true, force: true });
+    }
   });
 
   it('writes through fsutil, returning its inode after fstat observes mode 0600 before rename', async () => {
