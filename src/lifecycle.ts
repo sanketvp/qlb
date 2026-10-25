@@ -125,6 +125,11 @@ export function isOperational(state: LifecycleState): boolean {
 export function assertAdmitted(store: Store, operation: LifecycleOperation): LifecycleResult {
   const current = phase(store);
   if (current.state !== 'undoing' && operation.endsWith(':dry-run')) return { ok: true, row: current };
+  // cutoverBegin's compensation uses its durable primitives directly. Every
+  // separately admitted mutation must wait until that transaction clears this marker.
+  if (current.note === CUTOVER_BEGIN_IN_PROGRESS && operation !== 'doctor' && operation !== 'status') {
+    return { ok: false, code: CUTOVER_BEGIN_IN_PROGRESS, row: current };
+  }
   if (PHASE_RULES[current.state].has(operation)) return { ok: true, row: current };
   return { ok: false, code: current.state === 'undoing' ? 'undo-in-progress' : `phase=${current.state}`, row: current };
 }

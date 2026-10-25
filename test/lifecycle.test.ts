@@ -6,6 +6,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { describe, it } from 'node:test';
 
 import {
+  CUTOVER_BEGIN_IN_PROGRESS,
   PHASE_RULES,
   assertAdmitted,
   beginCutover,
@@ -234,9 +235,18 @@ describe('lifecycle (AC49)', () => {
         disable: () => ({ ok: true }), movePlist: () => ({ ok: true }), restorePlist: () => ({ ok: true }),
       });
       await bootoutStarted;
+      for (const operation of ['import-cswap', 'pi-migrate', 'pi-rollback', 'switch:manual', 'gate', 'cutover-commit', 'cutover-abort'] as const) {
+        assert.equal(assertAdmitted(store, operation).code, 'cutover-begin-in-progress', operation);
+      }
+      assert.equal(gateLifecycleAdmissionCode(store.dbPath, store.dbPath), 'cutover-begin-in-progress');
       assert.equal(commitCutover(store).code, 'cutover-begin-in-progress');
+      assert.equal(assertAdmitted(store, 'status').ok, true);
+      assert.equal(assertAdmitted(store, 'doctor').ok, true);
       releaseBootout();
       assert.deepEqual(await begin, { ok: true, state: 'cutting-over' });
+      for (const operation of ['import-cswap', 'pi-migrate', 'pi-rollback', 'switch:manual', 'gate'] as const) {
+        assert.equal(assertAdmitted(store, operation).ok, true, operation);
+      }
     } finally { store.close(); }
 
     const failedStore = fixtureStore();
@@ -250,6 +260,7 @@ describe('lifecycle (AC49)', () => {
       assert.equal(restored, true);
       assert.deepEqual(result, { ok: false, code: 'bootout-failed', state: 'aborted' });
       assert.equal(phase(failedStore).state, 'aborted');
+      assert.notEqual(phase(failedStore).note, CUTOVER_BEGIN_IN_PROGRESS);
     } finally { failedStore.close(); }
   });
 
