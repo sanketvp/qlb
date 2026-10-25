@@ -40,13 +40,13 @@ import { autoBreakerCheck } from './checks/auto-breaker';
 import { claudeOauthClientCheck } from './checks/claude-oauth-client';
 import { claudeSlotsCheck } from './checks/claude-slots';
 import { codexSlotsCheck } from './checks/codex-slots';
+import { guardCheck } from './checks/_check';
 import { lifecyclePhase, lifecyclePhaseCheck, type LifecyclePhaseResult } from './checks/lifecycle-phase';
 import { relogin7dCheck } from './checks/relogin-7d';
 import { openStoreConnection } from './store';
 import { discoverChecks, type CheckDefinition } from './registry';
 import { lifecycleWindowCheck } from './checks/lifecycle-window';
 import { lifecycleDrillCheck } from './checks/lifecycle-drill';
-import { openStore } from './store';
 
 export type CheckLevel = 'PASS' | 'WARN' | 'FAIL' | 'INFO' | 'N/A';
 
@@ -562,20 +562,19 @@ export async function doctorQlb(
   // An unavailable lifecycle phase deliberately makes phase-aware checks WARN.
   const lifecycle = (options.readLifecyclePhase ?? lifecyclePhase)(config.dbPath);
 
-  // Doctor never migrates: openStore would upgrade a missing or pre-v5 store, so the
-  // lifecycle window/drill rows run only once the read-only phase read succeeds.
+  // Doctor never migrates or scrubs: the window/drill rows read the lifecycle table
+  // directly by path instead of constructing a Store (whose open path writes).
   if (lifecycle.available) {
-    try {
-      const lifecycleStore = openStore(config.dbPath);
-      try {
-        checks.push(lifecycleWindowCheck(lifecycleStore), lifecycleDrillCheck(lifecycleStore));
-      } finally { lifecycleStore.close(); }
-    } catch (err) {
-      checks.push({
-        name: 'lifecycle:window', level: 'WARN',
-        message: `lifecycle checks unavailable: ${err instanceof Error ? err.message : String(err)}`,
-      });
-      checks.push({ name: 'lifecycle:drill', level: 'WARN', message: 'lifecycle checks unavailable' });
+    const lifecycleDb = { dbPath: config.dbPath };
+    for (const [name, run] of [
+      ['lifecycle:window', () => lifecycleWindowCheck(lifecycleDb)],
+      ['lifecycle:drill', () => lifecycleDrillCheck(lifecycleDb)],
+    ] as const) {
+      checks.push(guardCheck(name, run));
+    }
+  } else {
+    for (const name of ['lifecycle:window', 'lifecycle:drill']) {
+      checks.push({ name, level: 'WARN', message: 'store not initialised / not yet v5; lifecycle cannot be evaluated' });
     }
   }
 

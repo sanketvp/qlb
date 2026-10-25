@@ -185,6 +185,35 @@ describe('A7 doctor health primitives', () => {
     );
   });
 
+  it('never writes to the store: no relogin scrub, no migration, lifecycle rows WARN when unavailable', async () => {
+    const config = defaultConfig(mkdtempSync(join(tmpdir(), 'qlb-doctor-a7-readonly-')));
+    const store = openStore(config.dbPath);
+    store.close();
+    write(config.dbPath, "INSERT INTO relogin_events (ts, provider, kind, detail, evidence) VALUES (?, 'anthropic', 'external-login', 'raw note', 'junk')", Date.now());
+    write(config.dbPath, "DELETE FROM config WHERE key = 'relogin.scrubbedAt'");
+    const read = () => {
+      const db = new DatabaseSync(config.dbPath, { readOnly: true });
+      try {
+        return {
+          rows: db.prepare('SELECT detail, evidence FROM relogin_events').all().map((row) => ({ ...row })),
+          scrubbed: db.prepare("SELECT value FROM config WHERE key = 'relogin.scrubbedAt'").get() ?? null,
+        };
+      } finally { db.close(); }
+    };
+    const before = read();
+
+    await doctorQlb(config, { command: () => '', hostCommand: () => '' });
+
+    assert.deepEqual(read(), before);
+    assert.deepEqual(before.rows, [{ detail: 'raw note', evidence: 'junk' }]);
+
+    const missing = await doctorQlb(defaultConfig(mkdtempSync(join(tmpdir(), 'qlb-doctor-a7-readonly-missing-'))),
+      { command: () => '', hostCommand: () => '' });
+    for (const name of ['lifecycle:window', 'lifecycle:drill']) {
+      assert.equal(missing.checks.find((row) => row.name === name)?.level, 'WARN');
+    }
+  });
+
   it('reports all A7 checks as WARN when the store is missing or real v4', async () => {
     const a7Names = ['auto:anthropic:breaker', 'claude:oauth-client', 'claude:slots', 'codex:slots', 'lifecycle:phase', 'relogin:7d'];
     for (const makeConfig of [
