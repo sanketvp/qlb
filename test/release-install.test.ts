@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import {
   copyFileSync,
   cpSync,
@@ -9,6 +10,7 @@ import {
   mkdirSync,
   readFileSync,
   readlinkSync,
+  readdirSync,
   symlinkSync,
   unlinkSync,
   writeFileSync,
@@ -23,16 +25,41 @@ import { runReleaseCommand } from '../src/commands/release';
 import { releaseCurrentCheck } from '../src/checks/release-current';
 import type { CommandContext } from '../src/registry';
 
-function buildStamp(sha: string, dirty = false): string {
-  return `${JSON.stringify({ sha, dirty })}\n`;
+function shippedBuildDigest(source: string): string {
+  const paths: string[] = [];
+  const visit = (dir: string): void => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const absolute = join(dir, entry.name);
+      const path = absolute.slice(source.length + 1);
+      if (path === join('dist', '.build-sha')) continue;
+      paths.push(path);
+      if (entry.isDirectory()) visit(absolute);
+    }
+  };
+  for (const output of ['dist', 'extensions']) {
+    const absolute = join(source, output);
+    if (existsSync(absolute)) visit(absolute);
+  }
+  const hash = createHash('sha256');
+  for (const path of paths.sort()) {
+    const stat = lstatSync(join(source, path));
+    hash.update(`${path}\0${stat.isDirectory() ? 'd' : 'f'}\0`);
+    if (!stat.isDirectory()) hash.update(readFileSync(join(source, path)));
+    hash.update('\0');
+  }
+  return hash.digest('hex');
+}
+
+function buildStamp(sha: string, dirty = false, buildDigest?: string): string {
+  return `${JSON.stringify({ sha, dirty, ...(buildDigest ? { buildDigest } : {}) })}\n`;
 }
 
 function sourceBuild(dir: string, sha = 'test-sha', dependencies: Record<string, string> = {}): string {
   const source = join(dir, 'source');
   mkdirSync(join(source, 'dist'), { recursive: true });
   writeFileSync(join(source, 'dist', 'cli.js'), 'console.log("fixture build")\n');
-  writeFileSync(join(source, 'dist', '.build-sha'), buildStamp(sha));
   writeFileSync(join(source, 'package.json'), `${JSON.stringify({ name: 'fixture', dependencies })}\n`);
+  writeFileSync(join(source, 'dist', '.build-sha'), buildStamp(sha, false, shippedBuildDigest(source)));
   return source;
 }
 
@@ -45,7 +72,7 @@ function compiledSource(dir: string, sha: string): string {
   mkdirSync(join(source, 'src'), { recursive: true });
   cpSync(join(repo, 'src', 'redact.ts'), join(source, 'src', 'redact.ts'));
   cpSync(join(repo, 'node_modules', 'yaml'), join(source, 'node_modules', 'yaml'), { recursive: true });
-  writeFileSync(join(source, 'dist', '.build-sha'), buildStamp(sha));
+  writeFileSync(join(source, 'dist', '.build-sha'), buildStamp(sha, false, shippedBuildDigest(source)));
   return source;
 }
 
@@ -103,10 +130,10 @@ describe('release install (AC45)', () => {
     unlinkSync(join(sourceDir, 'dist', '.build-sha'));
     await assert.rejects(installRelease({ sourceDir, appDir, sha: 'new-sha', dbPath: join(root, 'qlb.db') }), /stamp/);
     assert.equal(readlinkSync(join(appDir, 'current')), 'previous');
-    writeFileSync(join(sourceDir, 'dist', '.build-sha'), buildStamp('old-sha'));
+    writeFileSync(join(sourceDir, 'dist', '.build-sha'), buildStamp('old-sha', false, shippedBuildDigest(sourceDir)));
     await assert.rejects(installRelease({ sourceDir, appDir, sha: 'new-sha', dbPath: join(root, 'qlb.db') }), /stamp/);
     assert.equal(readlinkSync(join(appDir, 'current')), 'previous');
-    writeFileSync(join(sourceDir, 'dist', '.build-sha'), buildStamp('new-sha'));
+    writeFileSync(join(sourceDir, 'dist', '.build-sha'), buildStamp('new-sha', false, shippedBuildDigest(sourceDir)));
     await installRelease({ sourceDir, appDir, sha: 'new-sha', dbPath: join(root, 'qlb.db') });
     assert.equal(readlinkSync(join(appDir, 'current')), 'new-sha');
   });
@@ -164,7 +191,9 @@ describe('release install (AC45)', () => {
 
     execFileSync(process.execPath, [join(root, 'scripts', 'write-build-stamp.cjs')]);
     assert.deepEqual(JSON.parse(readFileSync(join(root, 'dist', '.build-sha'), 'utf8')), {
-      sha: execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim(), dirty: false,
+      sha: execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim(),
+      dirty: false,
+      buildDigest: shippedBuildDigest(root),
     });
     writeFileSync(join(root, 'tracked.txt'), 'dirty\n');
     execFileSync(process.execPath, [join(root, 'scripts', 'write-build-stamp.cjs')]);
@@ -180,12 +209,12 @@ describe('release install (AC45)', () => {
       config: { dbPath: join(root, 'db') } as CommandContext['config'],
       loadConfig: () => { throw new Error('not used'); }, home: root, registerSecret: () => {},
     };
-    writeFileSync(join(sourceDir, 'dist', '.build-sha'), `${JSON.stringify({ sha: 'clean-sha', dirty: true })}\n`);
+    writeFileSync(join(sourceDir, 'dist', '.build-sha'), buildStamp('clean-sha', true, shippedBuildDigest(sourceDir)));
     assert.equal(await runReleaseCommand(['install', '--sha', 'clean-sha'], ctx, {
       sourceDir, install: installRelease, shaForSource: () => 'clean-sha',
     }), 3);
     assert.match(errors.pop()!, /dirty source tree/);
-    writeFileSync(join(sourceDir, 'dist', '.build-sha'), `${JSON.stringify({ sha: 'other-sha', dirty: false })}\n`);
+    writeFileSync(join(sourceDir, 'dist', '.build-sha'), buildStamp('other-sha', false, shippedBuildDigest(sourceDir)));
     assert.equal(await runReleaseCommand(['install', '--sha', 'clean-sha'], ctx, {
       sourceDir, install: installRelease, shaForSource: () => 'clean-sha',
     }), 3);
@@ -198,7 +227,60 @@ describe('release install (AC45)', () => {
     const appDir = join(root, 'app');
     await installRelease({ sourceDir, appDir, sha: 'same-sha', dbPath: join(root, 'db') });
     writeFileSync(join(sourceDir, 'dist', 'cli.js'), 'console.log("different build")\n');
-    await assert.rejects(installRelease({ sourceDir, appDir, sha: 'same-sha', dbPath: join(root, 'db') }), /different build bytes/);
+    await assert.rejects(installRelease({ sourceDir, appDir, sha: 'same-sha', dbPath: join(root, 'db') }), /build output digest/);
+  });
+
+  it('refuses a build output changed after it was stamped, while an untouched build installs', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-release-output-digest-'));
+    const sourceDir = sourceBuild(root, 'digest-sha');
+    const appDir = join(root, 'app');
+    await installRelease({ sourceDir, appDir, sha: 'digest-sha', dbPath: join(root, 'db') });
+
+    const changedSource = sourceBuild(root, 'changed-sha');
+    writeFileSync(join(changedSource, 'dist', 'cli.js'), 'console.log("changed after stamp")\n');
+    const errors: string[] = [];
+    const ctx: CommandContext = {
+      stdout: () => {}, stderr: (line) => errors.push(line), env: { QLB_TEST_MODE: '1', QLB_HOME: root },
+      config: { dbPath: join(root, 'db') } as CommandContext['config'],
+      loadConfig: () => { throw new Error('not used'); }, home: root, registerSecret: () => {},
+    };
+    assert.equal(await runReleaseCommand(['install', '--sha', 'changed-sha'], ctx, {
+      sourceDir: changedSource, install: installRelease, shaForSource: () => 'changed-sha',
+    }), 3);
+    assert.match(errors.pop()!, /build output digest.*differs/);
+    assert.equal(existsSync(join(appDir, 'changed-sha')), false);
+  });
+
+  it('refuses symlinks that leave a shipped source root or package directory, and detects cycles', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-release-unsafe-symlink-'));
+    const outside = join(root, 'outside');
+    mkdirSync(outside);
+    writeFileSync(join(outside, 'secret.js'), 'outside\n');
+
+    const sourceWithExternalFile = sourceBuild(join(root, 'external-file'), 'external-file-sha');
+    symlinkSync(join(outside, 'secret.js'), join(sourceWithExternalFile, 'dist', 'outside.js'));
+    await assert.rejects(
+      installRelease({ sourceDir: sourceWithExternalFile, appDir: join(root, 'app-file'), sha: 'external-file-sha', dbPath: join(root, 'db-file') }),
+      /outside\.js.*secret\.js/,
+    );
+
+    const sourceWithExternalPackage = sourceBuild(join(root, 'external-package'), 'external-package-sha', { linked: '1.0.0' });
+    const externalPackage = join(outside, 'linked');
+    mkdirSync(externalPackage);
+    writeFileSync(join(externalPackage, 'package.json'), JSON.stringify({ name: 'linked', version: '1.0.0' }));
+    mkdirSync(join(sourceWithExternalPackage, 'node_modules'), { recursive: true });
+    symlinkSync(externalPackage, join(sourceWithExternalPackage, 'node_modules', 'linked'));
+    await assert.rejects(
+      installRelease({ sourceDir: sourceWithExternalPackage, appDir: join(root, 'app-package'), sha: 'external-package-sha', dbPath: join(root, 'db-package') }),
+      /node_modules.*linked.*outside/,
+    );
+
+    const sourceWithCycle = sourceBuild(join(root, 'cycle'), 'cycle-sha');
+    symlinkSync('.', join(sourceWithCycle, 'dist', 'cycle'));
+    await assert.rejects(
+      installRelease({ sourceDir: sourceWithCycle, appDir: join(root, 'app-cycle'), sha: 'cycle-sha', dbPath: join(root, 'db-cycle') }),
+      /cyclic directory symlink.*cycle/,
+    );
   });
 
   it('ships Pi check sources so doctor from an installed release emits Pi check rows', async () => {
@@ -228,6 +310,7 @@ describe('release install (AC45)', () => {
     writeFileSync(join(pkg, 'package.json'), JSON.stringify({ name: 'linked', version: '1.0.0' }));
     writeFileSync(join(pkg, 'real.js'), 'linked bytes\n');
     symlinkSync('real.js', join(pkg, 'alias.js'));
+    writeFileSync(join(sourceDir, 'dist', '.build-sha'), buildStamp('link-sha', false, shippedBuildDigest(sourceDir)));
 
     const installed = await installRelease({ sourceDir, appDir: join(root, 'app'), sha: 'link-sha', dbPath: join(root, 'db') });
     const alias = join(installed.releaseDir, 'node_modules', 'linked', 'alias.js');
@@ -253,6 +336,7 @@ describe('release install (AC45)', () => {
       writeFileSync(join(nested, name, 'package.json'), JSON.stringify({ name, version: '1.0.0' }));
       writeFileSync(join(nested, name, 'index.js'), contents);
     }
+    writeFileSync(join(sourceDir, 'dist', '.build-sha'), buildStamp('nested-sha', false, shippedBuildDigest(sourceDir)));
 
     const installed = await installRelease({ sourceDir, appDir: join(root, 'app'), sha: 'nested-sha', dbPath: join(root, 'db') });
     assert.equal(readFileSync(join(installed.releaseDir, 'node_modules', 'parent', 'node_modules', 'child', 'index.js'), 'utf8'), 'nested child');
