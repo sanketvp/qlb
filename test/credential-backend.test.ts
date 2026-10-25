@@ -18,6 +18,7 @@ import {
   linuxSecretToolClearArgs,
   linuxSecretToolLookupArgs,
   linuxSecretToolStoreArgs,
+  markFakeExecutor,
   selectBackendKind,
   type ExecFileSyncFn,
 } from '../src/keychain';
@@ -35,9 +36,9 @@ describe('CredentialBackend dispatch', () => {
     const backend = createRawCredentialBackend({
       platform: 'darwin',
       homedir: () => '/tmp',
-      execFileSync: () => '',
+      execFileSync: markFakeExecutor(() => ''),
       commandExists: () => true,
-    });
+    }, { env: {} });
     assert.equal(backend.kind, 'macos-keychain');
     assert.ok(backend instanceof MacosKeychainBackend);
   });
@@ -55,7 +56,7 @@ describe('CredentialBackend dispatch', () => {
       homedir: () => '/tmp',
       execFileSync: () => '',
       commandExists: (name) => name === 'secret-tool',
-    });
+    }, { env: {} });
     assert.equal(backend.kind, 'linux-libsecret');
     assert.ok(backend instanceof LinuxLibsecretBackend);
   });
@@ -73,7 +74,7 @@ describe('CredentialBackend dispatch', () => {
         throw new Error('exec should not run for the file backend');
       },
       commandExists: () => false,
-    });
+    }, { env: {} });
     assert.equal(backend.kind, 'linux-file');
     assert.ok(backend instanceof LinuxEncryptedFileBackend);
   });
@@ -89,7 +90,7 @@ describe('CredentialBackend dispatch', () => {
       homedir: () => dir,
       execFileSync: () => '',
       commandExists: () => false,
-    });
+    }, { env: {} });
     assert.equal(backend.kind, 'windows-dpapi');
     assert.ok(backend instanceof WindowsDpapiBackend);
   });
