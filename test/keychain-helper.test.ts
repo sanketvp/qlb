@@ -46,7 +46,7 @@ describe('Swift Keychain helper write path', () => {
   });
 
   it('requires a clean refusal for the untrusted security-created matrix item', () => {
-    const receipt = '{"cases":{"securityCreated":"pass","securityUntrusted":"pass","previousHelper":"pass","helperCreated":"pass"},"casePrompted":{"securityCreated":false,"securityUntrusted":false,"previousHelper":false,"helperCreated":false},"caseReasons":{"securityCreated":null,"securityUntrusted":null,"previousHelper":null,"helperCreated":null},"prompted":false}';
+    const receipt = '{"cases":{"securityCreated":"pass","securityUntrusted":"pass","previousHelper":"pass","helperCreated":"pass"},"casePrompted":{"securityCreated":false,"securityUntrusted":true,"previousHelper":false,"helperCreated":false},"caseReasons":{"securityCreated":null,"securityUntrusted":null,"previousHelper":null,"helperCreated":null},"prompted":false}';
     const green = parseHelperMatrixResult(receipt);
     assert.equal(helperMatrixIsOk(green), true);
     assert.equal(helperMatrixConfig(green)['keychain.helperCheckResult'], 'ok');
@@ -70,7 +70,11 @@ describe('Swift Keychain helper write path', () => {
   it('models post-Always-Allow and user-cancelled matrix behavior in the helper source', () => {
     const source = readFileSync('native/keychain-helper/main.swift', 'utf8');
     assert.match(source, /add-generic-password", "-a", account, "-s", services\[0\], "-w",[^\n]+"-T", helperExecutablePath\(\)/);
-    assert.match(source, /promptFailure[\s\S]*errSecUserCanceled/);
+    assert.match(source, /promptFailure[\s\S]*errSecUserCanceled[\s\S]*status -25293[\s\S]*status -25308[\s\S]*status -128/);
+    assert.match(source, /private func modificationDate[\s\S]*find-generic-password", "-a", account, "-s", service\]\)/);
+    assert.match(source, /untrustedMdatBefore[\s\S]*untrustedMdatAfter[\s\S]*untrustedUpdate\.status != 0[\s\S]*untrustedMdatBefore\.value == untrustedMdatAfter\.value/);
+    assert.doesNotMatch(source, /let untrustedRead =/);
+    assert.doesNotMatch(source, /prompted = prompted \|\| casePrompted\["securityUntrusted"\]!/);
   });
 
   it('stores an injected failing matrix receipt and returns a non-zero exit', async () => {

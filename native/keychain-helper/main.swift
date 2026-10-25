@@ -153,12 +153,21 @@ private func run(_ executable: String, _ arguments: [String], input: Data? = nil
     return CommandResult(status: timedOut ? 1 : process.terminationStatus, output: text, timedOut: timedOut)
 }
 
+private func modificationDate(_ service: String, _ account: String) -> (result: CommandResult, value: String?) {
+    let result = run("/usr/bin/security", ["find-generic-password", "-a", account, "-s", service])
+    let value = result.output.split(separator: "\n").first { $0.contains("\"mdat\"") }.map(String.init)
+    return (result, value)
+}
+
 private func promptStatus(_ status: OSStatus) -> Bool {
-    status == errSecAuthFailed || status == errSecInteractionNotAllowed || status == errSecUserCanceled
+    status == errSecAuthFailed || status == errSecInteractionNotAllowed || status == errSecUserCanceled ||
+        status == -25293 || status == -25308 || status == -128
 }
 
 private func promptFailure(_ result: CommandResult) -> Bool {
-    result.timedOut || result.output.contains("errSecAuthFailed") || result.output.contains("errSecInteractionNotAllowed") || result.output.contains("errSecUserCanceled")
+    result.timedOut || result.output.contains("errSecAuthFailed") || result.output.contains("errSecInteractionNotAllowed") ||
+        result.output.contains("errSecUserCanceled") || result.output.contains("status -25293") ||
+        result.output.contains("status -25308") || result.output.contains("status -128")
 }
 
 private func matrix(_ prefix: String, previousHelper: String? = nil) {
@@ -180,12 +189,26 @@ private func matrix(_ prefix: String, previousHelper: String? = nil) {
     if securityCreated.status == 0 && securityUpdate.status == 0 { cases["securityCreated"] = "pass" }
 
     let securityUntrusted = run("/usr/bin/security", ["add-generic-password", "-a", account, "-s", services[1], "-w", String(data: marker, encoding: .utf8)!])
+    let untrustedMdatBefore = securityUntrusted.status == 0 ? modificationDate(services[1], account) : (result: securityUntrusted, value: nil)
     let untrustedUpdate = securityUntrusted.status == 0 ? run(helperExecutablePath(), ["set", services[1], account], input: Data("matrix-update-\(UUID().uuidString)".utf8)) : securityUntrusted
-    let untrustedRead = securityUntrusted.status == 0 ? read(services[1], account) : (status: errSecItemNotFound, data: nil)
-    casePrompted["securityUntrusted"] = promptFailure(securityUntrusted) || promptFailure(untrustedUpdate) || promptStatus(untrustedRead.status)
-    prompted = prompted || casePrompted["securityUntrusted"]!
-    if securityUntrusted.status == 0 && untrustedUpdate.status != 0 && untrustedUpdate.output.contains("errSec") && untrustedRead.status == errSecSuccess && untrustedRead.data == marker {
-        cases["securityUntrusted"] = "pass"
+    let untrustedMdatAfter = securityUntrusted.status == 0 ? modificationDate(services[1], account) : (result: securityUntrusted, value: nil)
+    casePrompted["securityUntrusted"] = promptFailure(securityUntrusted) || promptFailure(untrustedUpdate)
+    if securityUntrusted.status == 0 {
+        if untrustedMdatBefore.result.status != 0 {
+            caseReasons["securityUntrusted"] = "could not read mdat before update"
+        } else if untrustedMdatAfter.result.status != 0 {
+            caseReasons["securityUntrusted"] = "could not read mdat after update"
+        } else if untrustedMdatBefore.value == nil {
+            caseReasons["securityUntrusted"] = "missing mdat before update"
+        } else if untrustedMdatAfter.value == nil {
+            caseReasons["securityUntrusted"] = "missing mdat after update"
+        } else if untrustedUpdate.status == 0 {
+            caseReasons["securityUntrusted"] = "untrusted update unexpectedly succeeded"
+        } else if untrustedUpdate.status != 0 && untrustedMdatBefore.value == untrustedMdatAfter.value {
+            cases["securityUntrusted"] = "pass"
+        } else {
+            caseReasons["securityUntrusted"] = "item modified during refused update"
+        }
     }
 
     let previous = previousHelper ?? (NSHomeDirectory() as NSString).appendingPathComponent(".qlb/helper-prev/qlb-keychain-helper")
