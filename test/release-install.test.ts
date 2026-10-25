@@ -295,7 +295,7 @@ describe('release install (AC45)', () => {
     mkdirSync(piRoot, { recursive: true });
     writeFileSync(join(piRoot, 'package.json'), JSON.stringify({ name: '@earendil-works/pi-coding-agent', version: 'fixture' }));
     const result = spawnSync(process.execPath, [join(installed.releaseDir, 'dist', 'cli.js'), 'doctor', '--json'], {
-      env: { ...process.env, HOME: home, QLB_TEST_MODE: '1', QLB_HOME: join(root, 'qlb-home'), QLB_PI_PACKAGE_ROOT: piRoot }, encoding: 'utf8',
+      env: { ...process.env, HOME: home, QLB_TEST_MODE: '1', QLB_HOME: home, QLB_PI_PACKAGE_ROOT: piRoot }, encoding: 'utf8',
     });
     const report = JSON.parse(result.stdout) as { checks: Array<{ name: string; message: string }> };
     assert.ok(report.checks.some((check) => check.name === 'pi:extension' && !/skipping Pi checks/.test(check.message)));

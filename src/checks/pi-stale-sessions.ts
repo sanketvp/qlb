@@ -28,7 +28,9 @@ function listProcesses(): string {
 }
 
 function isPiCommand(command: string): boolean {
-  return /(?:^|[\\/])node_modules[\\/]@earendil-works[\\/]pi-coding-agent(?:[\\/]|$)|(?:^|[\\/\s])@earendil-works[\\/]pi-coding-agent(?:[\\/\s]|$)/.test(command);
+  const argv0 = command.trim().split(/\s+/, 1)[0]?.split(/[\\/]/).pop();
+  return argv0 === 'pi' || argv0 === 'pi-rpc'
+    || /(?:^|[\\/])node_modules[\\/]@earendil-works[\\/]pi-coding-agent(?:[\\/]|$)|(?:^|[\\/\s])@earendil-works[\\/]pi-coding-agent(?:[\\/\s]|$)/.test(command);
 }
 
 function parseProcesses(output: string): { processes: PiProcess[]; malformed: boolean } {

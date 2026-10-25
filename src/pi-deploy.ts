@@ -1,4 +1,5 @@
-import { cpSync, existsSync, lstatSync, mkdirSync, renameSync, rmSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { cpSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
 import { qlbHomeDir } from './home';
@@ -17,6 +18,8 @@ export interface PiDeployOptions {
   dbPath: string;
   dryRun?: boolean;
   now?: () => number;
+  /** Injectable filesystem rename for failure-path tests. */
+  rename?: typeof renameSync;
 }
 
 export interface PiDeployResult extends PiDeployPlan {
@@ -35,6 +38,18 @@ export function piExtensionTarget(home: string): string {
   return join(home, '.pi', 'agent', 'extensions', 'qlb-pi');
 }
 
+export function piRedactTarget(home: string): string {
+  return join(home, '.pi', 'agent', 'src', 'redact.ts');
+}
+
+export function piDeploymentDigest(extension: string, redact: string): string {
+  return createHash('sha256')
+    .update(releaseDigest(extension))
+    .update('\0src/redact.ts\0')
+    .update(readFileSync(redact))
+    .digest('hex');
+}
+
 /** Locates and hashes the extension built into the release selected by `current`. */
 export function piDeployPlan(options: Pick<PiDeployOptions, 'home' | 'appDir'> = {}): PiDeployPlan {
   const home = options.home ?? qlbHomeDir();
@@ -47,38 +62,68 @@ export function piDeployPlan(options: Pick<PiDeployOptions, 'home' | 'appDir'> =
   } catch {
     throw new Error(`current release does not contain qlb-pi at ${source}`);
   }
-  return { source, target: piExtensionTarget(home), hash: releaseDigest(source) };
+  const redact = join(appDir, sha, 'src', 'redact.ts');
+  try {
+    if (!lstatSync(redact).isFile()) throw new Error('not a file');
+  } catch {
+    throw new Error(`current release does not contain redact.ts at ${redact}`);
+  }
+  return { source, target: piExtensionTarget(home), hash: piDeploymentDigest(source, redact) };
+}
+
+function sweepStaging(stagingRoot: string, extensionParent: string): void {
+  for (const dir of [stagingRoot, extensionParent]) {
+    try {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        if (entry.name.startsWith('.qlb-pi-')) rmSync(join(dir, entry.name), { recursive: true, force: true });
+      }
+    } catch {
+      // A missing directory has no stale staging entries to remove.
+    }
+  }
 }
 
 /**
- * Publishes a fully copied sibling staging directory by rename. POSIX cannot replace
- * a non-empty directory with one rename, so a previous complete tree is moved aside
- * and restored if publishing the complete staged tree fails; no partial tree is exposed.
+ * Publishes the extension and its sibling redactor from staging outside extensions/.
+ * Existing complete targets are restored if either publish rename fails.
  */
-function replaceDirectory(source: string, target: string): void {
-  const parent = dirname(target);
+function replaceDeployment(source: string, redactSource: string, target: string, redactTarget: string, rename: typeof renameSync): void {
+  const agentDir = dirname(dirname(target));
+  const extensionParent = dirname(target);
+  const stagingRoot = join(agentDir, '.qlb-pi-staging');
   const nonce = `${process.pid}-${Date.now()}`;
-  const staging = join(parent, `.qlb-pi-${nonce}.tmp`);
-  const previous = join(parent, `.qlb-pi-${nonce}.previous`);
+  const staging = join(stagingRoot, `.qlb-pi-${nonce}.tmp`);
+  const stagedRedact = join(stagingRoot, `.redact-${nonce}.tmp`);
+  const previous = join(stagingRoot, `.qlb-pi-${nonce}.previous`);
+  const previousRedact = join(stagingRoot, `.redact-${nonce}.previous`);
   let movedPrevious = false;
+  let movedPreviousRedact = false;
   let published = false;
   try {
-    mkdirSync(parent, { recursive: true, mode: 0o755 });
-    cpSync(source, staging, { recursive: true, dereference: true, errorOnExist: true });
-    if (existsSync(target)) {
-      renameSync(target, previous);
-      movedPrevious = true;
-    }
-    renameSync(staging, target);
+    mkdirSync(extensionParent, { recursive: true, mode: 0o755 });
+    mkdirSync(dirname(redactTarget), { recursive: true, mode: 0o755 });
+    mkdirSync(stagingRoot, { recursive: true, mode: 0o755 });
+    sweepStaging(stagingRoot, extensionParent);
+    cpSync(source, staging, { recursive: true, dereference: true, errorOnExist: true, force: false });
+    cpSync(redactSource, stagedRedact, { dereference: true, errorOnExist: true, force: false });
+    if (existsSync(target)) { rename(target, previous); movedPrevious = true; }
+    if (existsSync(redactTarget)) { rename(redactTarget, previousRedact); movedPreviousRedact = true; }
+    rename(staging, target);
+    rename(stagedRedact, redactTarget);
     published = true;
   } catch (err) {
     if (movedPrevious && !existsSync(target) && existsSync(previous)) {
-      try { renameSync(previous, target); } catch { /* Preserve the original error. */ }
+      try { rename(previous, target); } catch { /* Preserve the original error. */ }
+    }
+    if (movedPreviousRedact && !existsSync(redactTarget) && existsSync(previousRedact)) {
+      try { rename(previousRedact, redactTarget); } catch { /* Preserve the original error. */ }
     }
     throw err;
   } finally {
-    if (existsSync(staging)) rmSync(staging, { recursive: true, force: true });
-    if (published && existsSync(previous)) rmSync(previous, { recursive: true, force: true });
+    for (const path of [staging, stagedRedact]) if (existsSync(path)) rmSync(path, { recursive: true, force: true });
+    if (published) {
+      for (const path of [previous, previousRedact]) if (existsSync(path)) rmSync(path, { recursive: true, force: true });
+    }
   }
 }
 
@@ -87,7 +132,8 @@ export function deployPiExtension(options: PiDeployOptions): PiDeployResult {
   const plan = piDeployPlan(options);
   if (options.dryRun) return { ...plan, dryRun: true };
 
-  replaceDirectory(plan.source, plan.target);
+  const redactSource = join(dirname(dirname(plan.source)), 'src', 'redact.ts');
+  replaceDeployment(plan.source, redactSource, plan.target, piRedactTarget(options.home ?? qlbHomeDir()), options.rename ?? renameSync);
   const deployedAt = Math.floor((options.now ?? Date.now)() / 1000);
   const store = openStore(options.dbPath);
   try {
