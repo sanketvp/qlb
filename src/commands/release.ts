@@ -1,7 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 
-import { installRelease, releaseSourceDir } from '../release';
+import { installRelease, ReleaseIntegrityError, releaseSourceDir } from '../release';
 import type { CommandContext, CommandDefinition } from '../registry';
 
 export interface ReleaseCommandDeps {
@@ -62,14 +62,22 @@ export async function runReleaseCommand(
     ctx.stderr('qlb release: expected install [--sha <sha>]');
     return 2;
   }
-  const result = await deps.install({
-    sourceDir: deps.sourceDir,
-    appDir: releaseAppDir(ctx),
-    sha,
-    dbPath: releaseDbPath(ctx),
-  });
-  ctx.stdout(`installed ${sha} at ${result.releaseDir}`);
-  return 0;
+  try {
+    const result = await deps.install({
+      sourceDir: deps.sourceDir,
+      appDir: releaseAppDir(ctx),
+      sha,
+      dbPath: releaseDbPath(ctx),
+    });
+    ctx.stdout(`installed ${sha} at ${result.releaseDir}`);
+    return 0;
+  } catch (err) {
+    if (err instanceof ReleaseIntegrityError) {
+      ctx.stderr(`qlb release: ${err.message}`);
+      return 3;
+    }
+    throw err;
+  }
 }
 
 const command: CommandDefinition = {

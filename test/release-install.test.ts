@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import {
+  copyFileSync,
+  cpSync,
   existsSync,
   lstatSync,
   mkdtempSync,
@@ -16,17 +18,34 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { describe, it } from 'node:test';
 
-import { installRelease, readReleaseManifest } from '../src/release';
+import { installRelease, readReleaseManifest, releaseDigest } from '../src/release';
 import { runReleaseCommand } from '../src/commands/release';
 import { releaseCurrentCheck } from '../src/checks/release-current';
 import type { CommandContext } from '../src/registry';
+
+function buildStamp(sha: string, dirty = false): string {
+  return `${JSON.stringify({ sha, dirty })}\n`;
+}
 
 function sourceBuild(dir: string, sha = 'test-sha', dependencies: Record<string, string> = {}): string {
   const source = join(dir, 'source');
   mkdirSync(join(source, 'dist'), { recursive: true });
   writeFileSync(join(source, 'dist', 'cli.js'), 'console.log("fixture build")\n');
-  writeFileSync(join(source, 'dist', '.build-sha'), `${sha}\n`);
+  writeFileSync(join(source, 'dist', '.build-sha'), buildStamp(sha));
   writeFileSync(join(source, 'package.json'), `${JSON.stringify({ name: 'fixture', dependencies })}\n`);
+  return source;
+}
+
+function compiledSource(dir: string, sha: string): string {
+  const repo = join(__dirname, '..', '..');
+  const source = join(dir, 'source');
+  cpSync(join(repo, 'dist'), join(source, 'dist'), { recursive: true });
+  cpSync(join(repo, 'package.json'), join(source, 'package.json'));
+  cpSync(join(repo, 'extensions'), join(source, 'extensions'), { recursive: true });
+  mkdirSync(join(source, 'src'), { recursive: true });
+  cpSync(join(repo, 'src', 'redact.ts'), join(source, 'src', 'redact.ts'));
+  cpSync(join(repo, 'node_modules', 'yaml'), join(source, 'node_modules', 'yaml'), { recursive: true });
+  writeFileSync(join(source, 'dist', '.build-sha'), buildStamp(sha));
   return source;
 }
 
@@ -61,8 +80,8 @@ describe('release install (AC45)', () => {
 
   it('copies production dependencies so an installed CLI starts without the checkout node_modules', async () => {
     const root = mkdtempSync(join(tmpdir(), 'qlb-release-cli-'));
-    const sourceDir = join(__dirname, '..', '..');
-    const sha = readFileSync(join(sourceDir, 'dist', '.build-sha'), 'utf8').trim();
+    const sha = 'cli-fixture-sha';
+    const sourceDir = compiledSource(root, sha);
     const appDir = join(root, 'qlb-home', 'app');
     const installed = await installRelease({ sourceDir, appDir, sha, dbPath: join(root, 'qlb-home', 'qlb.db') });
 
@@ -84,10 +103,10 @@ describe('release install (AC45)', () => {
     unlinkSync(join(sourceDir, 'dist', '.build-sha'));
     await assert.rejects(installRelease({ sourceDir, appDir, sha: 'new-sha', dbPath: join(root, 'qlb.db') }), /stamp/);
     assert.equal(readlinkSync(join(appDir, 'current')), 'previous');
-    writeFileSync(join(sourceDir, 'dist', '.build-sha'), 'old-sha\n');
+    writeFileSync(join(sourceDir, 'dist', '.build-sha'), buildStamp('old-sha'));
     await assert.rejects(installRelease({ sourceDir, appDir, sha: 'new-sha', dbPath: join(root, 'qlb.db') }), /stamp/);
     assert.equal(readlinkSync(join(appDir, 'current')), 'previous');
-    writeFileSync(join(sourceDir, 'dist', '.build-sha'), 'new-sha\n');
+    writeFileSync(join(sourceDir, 'dist', '.build-sha'), buildStamp('new-sha'));
     await installRelease({ sourceDir, appDir, sha: 'new-sha', dbPath: join(root, 'qlb.db') });
     assert.equal(readlinkSync(join(appDir, 'current')), 'new-sha');
   });
@@ -129,6 +148,124 @@ describe('release install (AC45)', () => {
     assert.equal(existsSync(join(root, 'other-home', '.qlb', 'app', 'command-sha')), false);
     assert.equal(existsSync(join(root, 'other-home', 'backups')), false);
     assert.match(output[0], /command-sha/);
+  });
+
+  it('records whether the build tree was dirty when it was stamped', () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-build-stamp-'));
+    mkdirSync(join(root, 'scripts'), { recursive: true });
+    mkdirSync(join(root, 'dist'), { recursive: true });
+    copyFileSync(join(__dirname, '..', '..', 'scripts', 'write-build-stamp.cjs'), join(root, 'scripts', 'write-build-stamp.cjs'));
+    execFileSync('git', ['init'], { cwd: root, stdio: 'ignore' });
+    execFileSync('git', ['config', 'user.email', 'fixture@example.invalid'], { cwd: root });
+    execFileSync('git', ['config', 'user.name', 'fixture'], { cwd: root });
+    writeFileSync(join(root, 'tracked.txt'), 'clean\n');
+    execFileSync('git', ['add', '.'], { cwd: root });
+    execFileSync('git', ['commit', '-m', 'fixture'], { cwd: root, stdio: 'ignore' });
+
+    execFileSync(process.execPath, [join(root, 'scripts', 'write-build-stamp.cjs')]);
+    assert.deepEqual(JSON.parse(readFileSync(join(root, 'dist', '.build-sha'), 'utf8')), {
+      sha: execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim(), dirty: false,
+    });
+    writeFileSync(join(root, 'tracked.txt'), 'dirty\n');
+    execFileSync(process.execPath, [join(root, 'scripts', 'write-build-stamp.cjs')]);
+    assert.equal(JSON.parse(readFileSync(join(root, 'dist', '.build-sha'), 'utf8')).dirty, true);
+  });
+
+  it('refuses dirty or SHA-mismatched build stamps with exit 3, including explicit --sha', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-release-integrity-'));
+    const sourceDir = sourceBuild(root, 'clean-sha');
+    const errors: string[] = [];
+    const ctx: CommandContext = {
+      stdout: () => {}, stderr: (line) => errors.push(line), env: { QLB_TEST_MODE: '1', QLB_HOME: join(root, 'home') },
+      config: { dbPath: join(root, 'db') } as CommandContext['config'],
+      loadConfig: () => { throw new Error('not used'); }, home: root, registerSecret: () => {},
+    };
+    writeFileSync(join(sourceDir, 'dist', '.build-sha'), `${JSON.stringify({ sha: 'clean-sha', dirty: true })}\n`);
+    assert.equal(await runReleaseCommand(['install', '--sha', 'clean-sha'], ctx, {
+      sourceDir, install: installRelease, shaForSource: () => 'clean-sha',
+    }), 3);
+    assert.match(errors.pop()!, /dirty source tree/);
+    writeFileSync(join(sourceDir, 'dist', '.build-sha'), `${JSON.stringify({ sha: 'other-sha', dirty: false })}\n`);
+    assert.equal(await runReleaseCommand(['install', '--sha', 'clean-sha'], ctx, {
+      sourceDir, install: installRelease, shaForSource: () => 'clean-sha',
+    }), 3);
+    assert.match(errors.pop()!, /does not match requested release SHA/);
+  });
+
+  it('refuses to reuse a release SHA when its bytes differ from the build being installed', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-release-reuse-'));
+    const sourceDir = sourceBuild(root, 'same-sha');
+    const appDir = join(root, 'app');
+    await installRelease({ sourceDir, appDir, sha: 'same-sha', dbPath: join(root, 'db') });
+    writeFileSync(join(sourceDir, 'dist', 'cli.js'), 'console.log("different build")\n');
+    await assert.rejects(installRelease({ sourceDir, appDir, sha: 'same-sha', dbPath: join(root, 'db') }), /different build bytes/);
+  });
+
+  it('ships Pi check sources so doctor from an installed release emits Pi check rows', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-release-doctor-'));
+    const sha = 'doctor-fixture-sha';
+    const sourceDir = compiledSource(root, sha);
+    const appDir = join(root, 'qlb-home', 'app');
+    const installed = await installRelease({ sourceDir, appDir, sha, dbPath: join(root, 'qlb-home', 'qlb.db') });
+    const home = join(root, 'home');
+    cpSync(join(installed.releaseDir, 'extensions', 'qlb-pi'), join(home, '.pi', 'agent', 'extensions', 'qlb-pi'), { recursive: true });
+    const piRoot = join(root, 'pi');
+    mkdirSync(piRoot, { recursive: true });
+    writeFileSync(join(piRoot, 'package.json'), JSON.stringify({ name: '@earendil-works/pi-coding-agent', version: 'fixture' }));
+    const result = spawnSync(process.execPath, [join(installed.releaseDir, 'dist', 'cli.js'), 'doctor', '--json'], {
+      env: { ...process.env, HOME: home, QLB_TEST_MODE: '1', QLB_HOME: join(root, 'qlb-home'), QLB_PI_PACKAGE_ROOT: piRoot }, encoding: 'utf8',
+    });
+    const report = JSON.parse(result.stdout) as { checks: Array<{ name: string; message: string }> };
+    assert.ok(report.checks.some((check) => check.name === 'pi:extension' && !/skipping Pi checks/.test(check.message)));
+    assert.ok(report.checks.some((check) => check.name.startsWith('pi:seam:')));
+  });
+
+  it('dereferences package symlinks and includes their file bytes in the release', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-release-symlink-'));
+    const sourceDir = sourceBuild(root, 'link-sha', { linked: '1.0.0' });
+    const pkg = join(sourceDir, 'node_modules', 'linked');
+    mkdirSync(pkg, { recursive: true });
+    writeFileSync(join(pkg, 'package.json'), JSON.stringify({ name: 'linked', version: '1.0.0' }));
+    writeFileSync(join(pkg, 'real.js'), 'linked bytes\n');
+    symlinkSync('real.js', join(pkg, 'alias.js'));
+
+    const installed = await installRelease({ sourceDir, appDir: join(root, 'app'), sha: 'link-sha', dbPath: join(root, 'db') });
+    const alias = join(installed.releaseDir, 'node_modules', 'linked', 'alias.js');
+    assert.equal(lstatSync(alias).isSymbolicLink(), false);
+    assert.equal(readFileSync(alias, 'utf8'), 'linked bytes\n');
+    const manifest = readReleaseManifest(installed.releaseDir)!;
+    assert.equal(manifest.digest, releaseDigest(installed.releaseDir));
+    writeFileSync(alias, 'altered linked bytes\n');
+    assert.notEqual(manifest.digest, releaseDigest(installed.releaseDir));
+  });
+
+  it('resolves nested and present optional dependencies from their requiring package', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-release-nested-'));
+    const sourceDir = sourceBuild(root, 'nested-sha', { parent: '1.0.0' });
+    const parent = join(sourceDir, 'node_modules', 'parent');
+    const nested = join(parent, 'node_modules');
+    mkdirSync(nested, { recursive: true });
+    writeFileSync(join(parent, 'package.json'), JSON.stringify({
+      name: 'parent', version: '1.0.0', dependencies: { child: '1.0.0' }, optionalDependencies: { optional: '1.0.0' },
+    }));
+    for (const [name, contents] of [['child', 'nested child'], ['optional', 'optional child']] as const) {
+      mkdirSync(join(nested, name), { recursive: true });
+      writeFileSync(join(nested, name, 'package.json'), JSON.stringify({ name, version: '1.0.0' }));
+      writeFileSync(join(nested, name, 'index.js'), contents);
+    }
+
+    const installed = await installRelease({ sourceDir, appDir: join(root, 'app'), sha: 'nested-sha', dbPath: join(root, 'db') });
+    assert.equal(readFileSync(join(installed.releaseDir, 'node_modules', 'parent', 'node_modules', 'child', 'index.js'), 'utf8'), 'nested child');
+    assert.equal(readFileSync(join(installed.releaseDir, 'node_modules', 'parent', 'node_modules', 'optional', 'index.js'), 'utf8'), 'optional child');
+  });
+
+  it('rejects dependency names that can escape node_modules', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-release-dependency-name-'));
+    const sourceDir = sourceBuild(root, 'name-sha', { '../outside': '1.0.0' });
+    await assert.rejects(
+      installRelease({ sourceDir, appDir: join(root, 'app'), sha: 'name-sha', dbPath: join(root, 'db') }),
+      /dependency name.*invalid/,
+    );
   });
 
   it('warns when the installed release digest is altered', async () => {

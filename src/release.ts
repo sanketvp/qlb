@@ -12,12 +12,13 @@ import {
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
-import { basename, dirname, join, relative } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative } from 'node:path';
 
 import { backupBeforeMigrate } from './store';
 
 const BUILD_STAMP = '.build-sha';
 const RELEASE_MANIFEST = 'release.json';
+const DEPENDENCY_NAME = /^(?:@[a-z0-9][a-z0-9._~-]*\/)?[a-z0-9][a-z0-9._~-]*$/;
 
 export interface ReleaseInstallOptions {
   /** Repository root containing the compiled `dist/` build. */
@@ -40,10 +41,30 @@ export interface ReleaseManifest {
   digest: string;
 }
 
+interface BuildStamp {
+  sha: string;
+  dirty: boolean;
+}
+
+/** A build/release integrity failure is a deliberate, operator-actionable refusal (exit 3). */
+export class ReleaseIntegrityError extends Error {}
+
 function assertReleaseSha(sha: string): void {
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(sha)) {
     throw new Error('release SHA must contain only letters, digits, dot, underscore, or hyphen');
   }
+}
+
+function readBuildStamp(path: string): BuildStamp {
+  try {
+    const parsed = JSON.parse(readFileSync(path, 'utf8')) as Partial<BuildStamp>;
+    if (typeof parsed.sha === 'string' && typeof parsed.dirty === 'boolean') {
+      return { sha: parsed.sha, dirty: parsed.dirty };
+    }
+  } catch {
+    // The clear refusal below tells the operator to rebuild with the current stamp writer.
+  }
+  throw new ReleaseIntegrityError('compiled build stamp is invalid; run npm run build from a clean tree');
 }
 
 function ensureReleaseTree(sourceDir: string, sha: string): void {
@@ -52,34 +73,112 @@ function ensureReleaseTree(sourceDir: string, sha: string): void {
     throw new Error(`compiled build not found at ${build}; run npm run build first`);
   }
   const stampPath = join(build, BUILD_STAMP);
-  if (!existsSync(stampPath) || readFileSync(stampPath, 'utf8').trim() !== sha) {
-    throw new Error(`compiled build stamp does not match release SHA ${sha}; run npm run build for that commit`);
+  if (!existsSync(stampPath)) {
+    throw new ReleaseIntegrityError('compiled build stamp is missing; run npm run build from a clean tree');
+  }
+  const stamp = readBuildStamp(stampPath);
+  if (stamp.dirty) {
+    throw new ReleaseIntegrityError('compiled build was produced from a dirty source tree; rebuild from a clean tree');
+  }
+  if (stamp.sha !== sha) {
+    throw new ReleaseIntegrityError(`compiled build stamp SHA ${stamp.sha} does not match requested release SHA ${sha}; rebuild or pass the stamped SHA`);
   }
 }
 
-function packageDependencies(sourceDir: string): string[] {
-  const packagePath = join(sourceDir, 'package.json');
-  if (!existsSync(packagePath)) return [];
-  const parsed = JSON.parse(readFileSync(packagePath, 'utf8')) as { dependencies?: Record<string, string> };
-  return Object.keys(parsed.dependencies ?? {});
+interface PackageManifest {
+  dependencies?: Record<string, string>;
+  optionalDependencies?: Record<string, string>;
 }
 
-/** Copies only runtime dependency packages, recursively following their production dependencies. */
+function readPackageManifest(path: string): PackageManifest {
+  return JSON.parse(readFileSync(path, 'utf8')) as PackageManifest;
+}
+
+function assertDependencyName(name: string): void {
+  if (isAbsolute(name) || name.includes('..') || !DEPENDENCY_NAME.test(name)) {
+    throw new ReleaseIntegrityError(`runtime dependency name ${JSON.stringify(name)} is invalid`);
+  }
+}
+
+function packageDependencyNames(manifest: PackageManifest): Array<{ name: string; optional: boolean }> {
+  // npm treats optionalDependencies as an override when a name appears in both maps.
+  const optionalNames = new Set(Object.keys(manifest.optionalDependencies ?? {}));
+  const required = Object.keys(manifest.dependencies ?? {}).filter((name) => !optionalNames.has(name));
+  return [
+    ...required.map((name) => ({ name, optional: false })),
+    ...[...optionalNames].map((name) => ({ name, optional: true })),
+  ];
+}
+
+/** Resolves a package exactly as Node does from the directory containing its requiring package. */
+function resolveRuntimeDependency(sourceDir: string, requiringDir: string, name: string): string | null {
+  assertDependencyName(name);
+  const parts = name.split('/');
+  let current = requiringDir;
+  while (true) {
+    // Node skips a duplicate node_modules component while walking upward.
+    if (basename(current) !== 'node_modules') {
+      const candidate = join(current, 'node_modules', ...parts);
+      const fromSource = relative(sourceDir, candidate);
+      if (fromSource && !fromSource.startsWith('..') && !isAbsolute(fromSource)
+        && existsSync(join(candidate, 'package.json'))) return candidate;
+    }
+    if (current === sourceDir) break;
+    const parent = dirname(current);
+    const fromSource = relative(sourceDir, parent);
+    if (fromSource.startsWith('..') || isAbsolute(fromSource)) break;
+    current = parent;
+  }
+  return null;
+}
+
+/** Copies only runtime packages, preserving Node's nested dependency resolution layout. */
 function copyRuntimeDependencies(sourceDir: string, destinationDir: string): void {
   const copied = new Set<string>();
-  const copyPackage = (name: string): void => {
-    if (copied.has(name)) return;
-    const sourcePackage = join(sourceDir, 'node_modules', ...name.split('/'));
-    const manifestPath = join(sourcePackage, 'package.json');
-    if (!existsSync(manifestPath)) throw new Error(`runtime dependency ${name} is not installed`);
-    copied.add(name);
-    const targetPackage = join(destinationDir, 'node_modules', ...name.split('/'));
+  const copyPackage = (name: string, requiringDir: string, optional: boolean): void => {
+    const sourcePackage = resolveRuntimeDependency(sourceDir, requiringDir, name);
+    if (!sourcePackage) {
+      if (optional) return;
+      throw new Error(`runtime dependency ${name} is not installed`);
+    }
+    if (copied.has(sourcePackage)) return;
+    const sourceRelative = relative(sourceDir, sourcePackage);
+    if (!sourceRelative || sourceRelative.startsWith('..') || isAbsolute(sourceRelative)) {
+      throw new ReleaseIntegrityError(`runtime dependency ${name} resolves outside the source tree`);
+    }
+    copied.add(sourcePackage);
+    const targetPackage = join(destinationDir, sourceRelative);
     mkdirSync(dirname(targetPackage), { recursive: true, mode: 0o755 });
-    cpSync(sourcePackage, targetPackage, { recursive: true });
-    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as { dependencies?: Record<string, string> };
-    for (const dependency of Object.keys(manifest.dependencies ?? {})) copyPackage(dependency);
+    // A release must not retain a link back to the mutable checkout. This also makes the
+    // release digest cover the actual bytes Node will load.
+    cpSync(sourcePackage, targetPackage, { recursive: true, dereference: true });
+    const manifest = readPackageManifest(join(sourcePackage, 'package.json'));
+    for (const dependency of packageDependencyNames(manifest)) {
+      copyPackage(dependency.name, sourcePackage, dependency.optional);
+    }
   };
-  for (const dependency of packageDependencies(sourceDir)) copyPackage(dependency);
+
+  const packagePath = join(sourceDir, 'package.json');
+  if (!existsSync(packagePath)) return;
+  for (const dependency of packageDependencyNames(readPackageManifest(packagePath))) {
+    copyPackage(dependency.name, sourceDir, dependency.optional);
+  }
+}
+
+function copyReleaseContents(sourceDir: string, stagingDir: string): void {
+  cpSync(join(sourceDir, 'dist'), join(stagingDir, 'dist'), { recursive: true, dereference: true });
+  if (existsSync(join(sourceDir, 'package.json'))) {
+    cpSync(join(sourceDir, 'package.json'), join(stagingDir, 'package.json'), { dereference: true });
+  }
+  // `doctor` resolves its repo root from package.json and reads both of these paths for Pi rows.
+  if (existsSync(join(sourceDir, 'extensions'))) {
+    cpSync(join(sourceDir, 'extensions'), join(stagingDir, 'extensions'), { recursive: true, dereference: true });
+  }
+  if (existsSync(join(sourceDir, 'src', 'redact.ts'))) {
+    mkdirSync(join(stagingDir, 'src'), { recursive: true, mode: 0o755 });
+    cpSync(join(sourceDir, 'src', 'redact.ts'), join(stagingDir, 'src', 'redact.ts'), { dereference: true });
+  }
+  copyRuntimeDependencies(sourceDir, stagingDir);
 }
 
 function digestTree(root: string, paths: string[]): string {
@@ -87,9 +186,14 @@ function digestTree(root: string, paths: string[]): string {
   for (const path of paths.sort()) {
     const absolute = join(root, path);
     const stat = lstatSync(absolute);
-    hash.update(`${path}\0${stat.isDirectory() ? 'd' : stat.isSymbolicLink() ? 'l' : 'f'}\0`);
-    if (stat.isDirectory()) continue;
-    hash.update(stat.isSymbolicLink() ? readlinkSync(absolute) : readFileSync(absolute));
+    if (stat.isSymbolicLink()) {
+      throw new ReleaseIntegrityError(`release contains a symlink at ${path}; refusing to hash mutable link targets`);
+    }
+    if (!stat.isDirectory() && !stat.isFile()) {
+      throw new ReleaseIntegrityError(`release contains an unsupported file at ${path}`);
+    }
+    hash.update(`${path}\0${stat.isDirectory() ? 'd' : 'f'}\0`);
+    if (!stat.isDirectory()) hash.update(readFileSync(absolute));
     hash.update('\0');
   }
   return hash.digest('hex');
@@ -122,6 +226,17 @@ export function readReleaseManifest(releaseDir: string): ReleaseManifest | null 
   }
 }
 
+function assertExistingRelease(releaseDir: string, sha: string, sourceDigest: string): void {
+  const manifest = readReleaseManifest(releaseDir);
+  if (!lstatSync(releaseDir).isDirectory() || !existsSync(join(releaseDir, 'dist', 'cli.js'))
+    || !manifest || manifest.sha !== sha || manifest.digest !== releaseDigest(releaseDir)) {
+    throw new ReleaseIntegrityError(`existing release ${sha} is incomplete or altered; refusing to overwrite it`);
+  }
+  if (manifest.digest !== sourceDigest) {
+    throw new ReleaseIntegrityError(`existing release ${sha} has different build bytes; refusing to reuse it`);
+  }
+}
+
 function publishCurrent(appDir: string, sha: string): string {
   const currentPath = join(appDir, 'current');
   const temporaryPath = join(appDir, `.current-${process.pid}-${Date.now()}.tmp`);
@@ -137,41 +252,36 @@ function publishCurrent(appDir: string, sha: string): string {
 /**
  * Installs the compiled build in an immutable SHA-named directory and then
  * atomically swaps the relative `current` symlink. A pre-existing release is
- * never overwritten; this makes repeated installs of the same SHA safe.
+ * reused only when its manifest attests to exactly the bytes just prepared.
  */
 export async function installRelease(options: ReleaseInstallOptions): Promise<ReleaseInstallResult> {
   assertReleaseSha(options.sha);
   ensureReleaseTree(options.sourceDir, options.sha);
   mkdirSync(options.appDir, { recursive: true, mode: 0o755 });
 
-  let backupPath: string | undefined;
-  if (existsSync(options.dbPath)) {
-    backupPath = await (options.backup ?? backupBeforeMigrate)(options.dbPath);
-  }
-
   const releaseDir = join(options.appDir, options.sha);
-  if (existsSync(releaseDir)) {
-    const manifest = readReleaseManifest(releaseDir);
-    if (!lstatSync(releaseDir).isDirectory() || !existsSync(join(releaseDir, 'dist', 'cli.js'))
-      || !manifest || manifest.sha !== options.sha || manifest.digest !== releaseDigest(releaseDir)) {
-      throw new Error(`existing release ${options.sha} is incomplete or altered; refusing to overwrite it`);
-    }
-  } else {
-    const stagingDir = join(options.appDir, `.${options.sha}-${process.pid}-${Date.now()}.tmp`);
-    try {
-      mkdirSync(stagingDir, { mode: 0o755 });
-      cpSync(join(options.sourceDir, 'dist'), join(stagingDir, 'dist'), { recursive: true });
-      if (existsSync(join(options.sourceDir, 'package.json'))) cpSync(join(options.sourceDir, 'package.json'), join(stagingDir, 'package.json'));
-      copyRuntimeDependencies(options.sourceDir, stagingDir);
-      writeFileSync(join(stagingDir, RELEASE_MANIFEST), `${JSON.stringify({ sha: options.sha, digest: releaseDigest(stagingDir) })}\n`, { mode: 0o644 });
-      renameSync(stagingDir, releaseDir);
-    } catch (err) {
-      rmSync(stagingDir, { recursive: true, force: true });
-      throw err;
-    }
-  }
+  const stagingDir = join(options.appDir, `.${options.sha}-${process.pid}-${Date.now()}.tmp`);
+  let staged = true;
+  try {
+    mkdirSync(stagingDir, { mode: 0o755 });
+    copyReleaseContents(options.sourceDir, stagingDir);
+    const sourceDigest = releaseDigest(stagingDir);
+    if (existsSync(releaseDir)) assertExistingRelease(releaseDir, options.sha, sourceDigest);
 
-  return { releaseDir, currentPath: publishCurrent(options.appDir, options.sha), backupPath };
+    let backupPath: string | undefined;
+    if (existsSync(options.dbPath)) {
+      backupPath = await (options.backup ?? backupBeforeMigrate)(options.dbPath);
+    }
+
+    if (!existsSync(releaseDir)) {
+      writeFileSync(join(stagingDir, RELEASE_MANIFEST), `${JSON.stringify({ sha: options.sha, digest: sourceDigest })}\n`, { mode: 0o644 });
+      renameSync(stagingDir, releaseDir);
+      staged = false;
+    }
+    return { releaseDir, currentPath: publishCurrent(options.appDir, options.sha), backupPath };
+  } finally {
+    if (staged && existsSync(stagingDir)) rmSync(stagingDir, { recursive: true, force: true });
+  }
 }
 
 /** Extracts the installed release name without resolving outside `app/`. */
