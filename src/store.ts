@@ -508,7 +508,7 @@ function schemaNeedsV5Correction(db: DatabaseSync): boolean {
   return !lifecycleOneOpenIndexMatches(db);
 }
 
-function sqlWithoutLiteralsOrComments(sql: string): string {
+function sqlWithoutLiteralsOrComments(sql: string, keepQuotedIdentifiers = false): string {
   let result = '';
   for (let index = 0; index < sql.length;) {
     const character = sql[index];
@@ -524,6 +524,7 @@ function sqlWithoutLiteralsOrComments(sql: string): string {
       result += ' ';
     } else if (character === '\'' || character === '"' || character === '`' || character === '[') {
       const terminator = character === '[' ? ']' : character;
+      const start = index;
       index += 1;
       while (index < sql.length) {
         if (sql[index] !== terminator) {
@@ -537,7 +538,7 @@ function sqlWithoutLiteralsOrComments(sql: string): string {
         index += 1;
         break;
       }
-      result += ' ';
+      result += keepQuotedIdentifiers && character !== '\'' ? sql.slice(start, index) : ' ';
     } else {
       result += character;
       index += 1;
@@ -548,7 +549,7 @@ function sqlWithoutLiteralsOrComments(sql: string): string {
 
 function sqlReferencesTableIdentifier(sql: string, table: string): boolean {
   const escaped = table.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  return new RegExp(`(?:^|[^A-Za-z0-9_$])(?:${escaped}|"${escaped}"|\\[${escaped}\\]|\\x60${escaped}\\x60)(?=$|[^A-Za-z0-9_$])`, 'i').test(sqlWithoutLiteralsOrComments(sql));
+  return new RegExp(`(?:^|[^A-Za-z0-9_$])(?:${escaped}|"${escaped}"|\\[${escaped}\\]|\\x60${escaped}\\x60)(?=$|[^A-Za-z0-9_$])`, 'i').test(sqlWithoutLiteralsOrComments(sql, true));
 }
 
 function refuseInexactV5Rebuild(table: string, reason: string, verifiedBackupPath: string): never {
@@ -605,10 +606,14 @@ function assertV5RebuildCanBeExact(db: DatabaseSync, table: string, shape: V5Tab
     refuseInexactV5Rebuild(table, `column ${hidden.name} is generated or hidden and cannot be reproduced`, verifiedBackupPath);
   }
 
-  const canonical = new Set(shape.columns.map(({ name }) => name.toLowerCase()));
-  const extra = actual.xinfo.find(({ name }) => !canonical.has(name.toLowerCase()));
+  // Exact spelling only: a case-variant column would skip the per-column checks below.
+  const canonical = new Set(shape.columns.map(({ name }) => name));
+  const extra = actual.xinfo.find(({ name }) => !canonical.has(name));
   if (extra) {
-    refuseInexactV5Rebuild(table, `column ${extra.name} is not in the canonical definition and cannot be reproduced`, verifiedBackupPath);
+    const respelled = shape.columns.find(({ name }) => name.toLowerCase() === extra.name.toLowerCase());
+    refuseInexactV5Rebuild(table, respelled
+      ? `column ${extra.name} differs in case from the canonical ${respelled.name} and cannot be reproduced`
+      : `column ${extra.name} is not in the canonical definition and cannot be reproduced`, verifiedBackupPath);
   }
 
   const expectedColumns = new Map(expected.xinfo.map((column) => [column.name, column]));

@@ -320,6 +320,18 @@ describe('store v5 schema (AC38)', () => {
         reason: /view claude_slots_view references claude_slots/,
       },
       {
+        name: 'a canonical column spelled with different case',
+        extra: "Slot_Num TEXT NOT NULL DEFAULT 'zzz'",
+        dependent: '',
+        reason: /column Slot_Num differs in case from the canonical slot_num/,
+      },
+      {
+        name: 'a view that references the table by a quoted name',
+        extra: '',
+        dependent: 'CREATE VIEW claude_slots_quoted_view AS SELECT account_id FROM "claude_slots"',
+        reason: /view claude_slots_quoted_view references claude_slots/,
+      },
+      {
         name: 'a view reference after apostrophes in comments',
         extra: '',
         dependent: `CREATE VIEW claude_slots_comment_view AS SELECT account_id -- don't
@@ -393,28 +405,6 @@ describe('store v5 schema (AC38)', () => {
         && /AUTOINCREMENT differs from the canonical definition/.test(error.message),
     );
     assert.deepEqual(readFileSync(path), before, 'AUTOINCREMENT mismatch must leave the database byte-for-byte unchanged');
-  });
-
-  it('rebuilds a canonical column whose spelling differs only by case', () => {
-    const path = join(mkdtempSync(join(tmpdir(), 'qlb-v5-case-rebuild-')), 'qlb.db');
-    const initial = openStore(path);
-    initial.close();
-    const db = new DatabaseSync(path);
-    db.exec(`DROP TABLE claude_slots;
-      CREATE TABLE claude_slots (
-        account_id TEXT PRIMARY KEY, Slot_Num INTEGER, email TEXT, alias TEXT, org_uuid TEXT, config_json TEXT NOT NULL,
-        fingerprint TEXT, prev_fingerprint TEXT, threshold REAL, dead INTEGER NOT NULL DEFAULT 0,
-        dead_reason TEXT, dead_at INTEGER, healed_at INTEGER, added_at INTEGER NOT NULL,
-        last_active_at INTEGER, source TEXT, archived_at INTEGER
-      )`);
-    db.close();
-
-    const corrected = openStore(path);
-    corrected.close();
-    const check = dbAt(path);
-    try {
-      assert.ok(columns(check, 'claude_slots').includes('slot_num'));
-    } finally { check.close(); }
   });
 
   it('repairs a lifecycle table missing state before creating its partial index', () => {
