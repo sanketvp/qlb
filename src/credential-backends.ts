@@ -132,10 +132,28 @@ export function wrapCredentialError(
 ): Error {
   const msg = err instanceof Error ? err.message : String(err);
   const prefix = `keychain ${op} failed for service=${service} account=${account}: `;
-  if (msg.startsWith(prefix)) {
-    return err instanceof Error ? err : new Error(msg);
+  if (msg.startsWith(prefix) && err instanceof Error) return err;
+  const wrapped = new Error(msg.startsWith(prefix) ? msg : `${prefix}${msg}`);
+  if (err && typeof err === 'object') {
+    const status = (err as { status?: unknown }).status;
+    if (status !== undefined) Object.assign(wrapped, { status });
+    Object.assign(wrapped, { cause: err });
   }
-  return new Error(`${prefix}${msg}`);
+  return wrapped;
+}
+
+/** Whether a credential backend error definitively reports an absent item. */
+export function isCredentialNotFound(err: unknown): boolean {
+  const seen = new Set<unknown>();
+  let current: unknown = err;
+  while (current && typeof current === 'object' && !seen.has(current)) {
+    seen.add(current);
+    const { status, message, cause } = current as { status?: unknown; message?: unknown; cause?: unknown };
+    if (status === 44) return true;
+    if (typeof message === 'string' && (/could not be found/i.test(message) || /item not found\s*$/i.test(message))) return true;
+    current = cause;
+  }
+  return false;
 }
 
 export function credentialItemKey(service: string, account: string): string {
