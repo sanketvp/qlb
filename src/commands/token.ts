@@ -115,8 +115,7 @@ export async function executeToken(
   } catch {
     return 1;
   }
-  ctx.registerSecret(resolved.token);
-  ctx.stdout(resolved.token);
+  ctx.deliverSecret(resolved.token);
   return 0;
 }
 
