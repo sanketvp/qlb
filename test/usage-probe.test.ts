@@ -3,11 +3,19 @@ import { describe, it } from 'node:test';
 import usageProbeCommand, { runUsageProbe } from '../src/commands/usage-probe';
 
 describe('usage probe command', () => {
-  it('is a multi-word registry command', () => {
+  it('is a multi-word executing registry command', async () => {
     assert.equal(usageProbeCommand.name, 'usage probe');
-    assert.deepEqual(usageProbeCommand.run(['openai-codex', '--json']), [
-      'usage-probe', 'openai-codex', '--json',
-    ]);
+    assert.equal(usageProbeCommand.run, undefined);
+    assert.equal(typeof usageProbeCommand.execute, 'function');
+
+    const errors: string[] = [];
+    const code = await usageProbeCommand.execute!(
+      ['kimi-coding', '--json'],
+      { stdout: () => {}, stderr: (line: string) => errors.push(line) } as never,
+    );
+
+    assert.equal(code, 1);
+    assert.deepEqual(errors, ['qlb usage probe: expected openai-codex --json']);
   });
 
   it('prints status, source, and top-level keys only', async () => {

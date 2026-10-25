@@ -1,5 +1,5 @@
+import type { CommandDefinition } from '../registry';
 import { probeCodexUsage, type CodexUsageProbeResult } from '../usage/openai-codex';
-import { legacyCommand } from './_legacy';
 
 export interface UsageProbeCommandDeps {
   probe?: () => Promise<CodexUsageProbeResult>;
@@ -27,4 +27,9 @@ export async function runUsageProbe(args: string[], deps: UsageProbeCommandDeps 
   }
 }
 
-export default legacyCommand('usage probe', ['usage-probe']);
+const usageProbeCommand: CommandDefinition = {
+  name: 'usage probe',
+  execute: (args, ctx) => runUsageProbe(args, { write: ctx.stdout, error: ctx.stderr }),
+};
+
+export default usageProbeCommand;

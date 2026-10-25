@@ -11,16 +11,19 @@ import {
 } from '../src/keychain';
 
 describe('keychain service-name safety', () => {
-  it('accepts qlb: and qlb-test- prefixes only', () => {
+  it('marks only services with every operation allowed as safe', () => {
     assert.equal(isSafeKeychainService('qlb:anthropic:acct-1'), true);
-    assert.equal(isSafeKeychainService('qlb-test-roundtrip'), true);
+    assert.equal(isSafeKeychainService('claude-swap'), false);
     assert.equal(isSafeKeychainService('Claude Code-credentials'), false);
+    assert.equal(isSafeKeychainService('pi-openrouter'), false);
+    assert.equal(isSafeKeychainService('qlb-test-roundtrip'), true);
     assert.equal(isSafeKeychainService(''), false);
     assert.equal(isSafeKeychainService('generic'), false);
-    assert.throws(
-      () => assertSafeKeychainService('Claude Code-credentials'),
-      /must start with 'qlb:' or 'qlb-test-'/,
-    );
+    assert.doesNotThrow(() => assertSafeKeychainService('qlb:anthropic:acct-1'));
+    assert.doesNotThrow(() => assertSafeKeychainService('qlb-test-roundtrip'));
+    for (const service of ['claude-swap', 'Claude Code-credentials', 'pi-openrouter', 'generic']) {
+      assert.throws(() => assertSafeKeychainService(service));
+    }
   });
 
   it('qlbKeychainService uses qlb:<provider>:<accountId>', () => {
@@ -29,16 +32,16 @@ describe('keychain service-name safety', () => {
 
   it('real keychainSet/Get/Delete refuse unsafe service names before calling security', async () => {
     await assert.rejects(
-      () => keychainSet('Claude Code-credentials', 'x', '{"access":"nope"}'),
-      /must start with 'qlb:' or 'qlb-test-'/,
+      () => keychainSet('claude-swap', 'x', '{"access":"nope"}'),
+      /claude-swap is read-only/,
     );
     await assert.rejects(
       () => keychainGet('~/.pi/agent/auth.json', 'x'),
-      /must start with 'qlb:' or 'qlb-test-'/,
+      /service is not allowlisted/,
     );
     await assert.rejects(
       () => keychainDelete('codex-auth', 'x'),
-      /must start with 'qlb:' or 'qlb-test-'/,
+      /service is not allowlisted/,
     );
   });
 });

@@ -1,20 +1,31 @@
 // Platform-dispatching credential store for QLB (§4.8.1).
 //
-// SAFETY: this module never hardcodes real credential file paths and refuses
-// Keychain / credential-store service names that do not start with `qlb:` or
-// `qlb-test-`. Phase 2a does not import, move, or delete any live credentials.
+// SAFETY: this module never hardcodes real credential file paths. Its fixed
+// allowlist permits QLB-owned `qlb:` items, a read-only C-swap import item, and
+// narrowly scoped Claude Code credential items. Phase 2a does not import, move,
+// or delete any live credentials.
 // Real OAuth grants are Phase 2b, via an explicit user-triggered command.
 //
 // All subprocess invocations use `execFile`/`execFileSync` with an argv array
-// (never `exec` + string interpolation) to avoid shell injection. Secrets are
-// never passed as command-line arguments on Linux/Windows (stdin only).
+// (never `exec` + string interpolation) to avoid shell injection.
 
-import { execFileSync } from 'node:child_process';
-
+import { OPENROUTER_KEYCHAIN_SERVICE } from './config';
+import {
+  KeychainAccessDeniedError,
+  assertKeychainAccess,
+  isAllowedKeychainService,
+  type KeychainAllowlistOptions,
+} from './keychain-allowlist';
 import {
   createRawCredentialBackend,
   defaultCredentialBackendHost,
+  execFileUtf8,
+  isSecurityTimeout,
+  MACOS_SECURITY_BIN,
+  MACOS_SECURITY_TIMEOUT_MS,
+  securityTimeoutError,
   type CredentialBackend,
+  type ExecFileSyncFn,
 } from './credential-backends';
 
 export type {
@@ -23,6 +34,13 @@ export type {
   CredentialBackendKind,
   ExecFileSyncFn,
 } from './credential-backends';
+export {
+  KeychainAccessDeniedError,
+  assertKeychainAccess,
+  isAllowedKeychainService,
+  macosKeychainAccountName,
+} from './keychain-allowlist';
+export type { KeychainAllowlistOptions, KeychainOperation } from './keychain-allowlist';
 export {
   MacosKeychainBackend,
   LinuxLibsecretBackend,
@@ -39,25 +57,29 @@ export {
   WINDOWS_POWERSHELL_BASE_ARGS,
   defaultCommandExists,
   defaultCredentialBackendHost,
+  MACOS_SECURITY_BIN,
+  MACOS_SECURITY_TIMEOUT_MS,
 } from './credential-backends';
 
 /** Existing name used by migration / refresh-lease / credentials. */
 export type KeychainBackend = CredentialBackend;
 
-const SAFE_SERVICE_PREFIXES = ['qlb:', 'qlb-test-'] as const;
-
 /** Account used when looking up unscoped native secrets (OpenRouter). */
 export const NATIVE_SECRET_ACCOUNT = 'qlb';
 
+/** @deprecated Use assertKeychainAccess when an operation and account are known. */
 export function isSafeKeychainService(service: string): boolean {
-  return SAFE_SERVICE_PREFIXES.some((p) => service.startsWith(p));
+  // The deprecated, operation-free API promises that every operation is safe.
+  // QLB-owned and disposable test services meet that promise.
+  return service.startsWith('qlb:') || service.startsWith('qlb-test-');
 }
 
+/** @deprecated Use assertKeychainAccess when an operation and account are known. */
 export function assertSafeKeychainService(service: string): void {
   if (!isSafeKeychainService(service)) {
-    throw new Error(
-      `refusing Keychain operation for service '${service}': service name must start with 'qlb:' or 'qlb-test-'`,
-    );
+    // Deliberately test write: partial read-only or account-gated allowances
+    // must not be represented as universally safe by this legacy API.
+    assertKeychainAccess(service, '', 'write');
   }
 }
 
@@ -66,31 +88,34 @@ export function qlbKeychainService(provider: string, accountId: string): string 
   return `qlb:${provider}:${accountId}`;
 }
 
-export function withServiceGuard(backend: CredentialBackend): CredentialBackend {
+export function withServiceGuard(
+  backend: CredentialBackend,
+  allowlistOptions: KeychainAllowlistOptions = {},
+): CredentialBackend {
   return {
     kind: backend.kind,
     set(service, account, jsonValue) {
-      assertSafeKeychainService(service);
+      assertKeychainAccess(service, account, 'write', allowlistOptions);
       return backend.set(service, account, jsonValue);
     },
     get(service, account) {
-      assertSafeKeychainService(service);
+      assertKeychainAccess(service, account, 'read', allowlistOptions);
       return backend.get(service, account);
     },
     delete(service, account) {
-      assertSafeKeychainService(service);
+      assertKeychainAccess(service, account, 'write', allowlistOptions);
       return backend.delete(service, account);
     },
     setSync(service, account, jsonValue) {
-      assertSafeKeychainService(service);
+      assertKeychainAccess(service, account, 'write', allowlistOptions);
       backend.setSync(service, account, jsonValue);
     },
     getSync(service, account) {
-      assertSafeKeychainService(service);
+      assertKeychainAccess(service, account, 'read', allowlistOptions);
       return backend.getSync(service, account);
     },
     deleteSync(service, account) {
-      assertSafeKeychainService(service);
+      assertKeychainAccess(service, account, 'write', allowlistOptions);
       backend.deleteSync(service, account);
     },
   };
@@ -150,8 +175,9 @@ export async function keychainDelete(
 }
 
 /**
- * READ-ONLY lookup of a native (non-`qlb:`) secret. Used for OpenRouter's
- * `pi-openrouter` item. Never writes. On macOS this is a service-only
+ * READ-ONLY lookup of the native OpenRouter secret. The fixed allowlist is
+ * enforced before any backend call: only the `pi-openrouter` service is
+ * accepted. On macOS this is a service-only
  * `security find-generic-password -s <service> -w` lookup — the same argv
  * QLB has always used, so existing Keychain items keep working. On
  * Linux/Windows it reads account `qlb` from the platform store.
@@ -165,17 +191,39 @@ export function openRouterMissingKeyMessage(service: string): string {
     : `OpenRouter key not found in credential store (service ${service})`;
 }
 
-export function readNativeOpenRouterKey(service: string): string {
-  if (process.platform === 'darwin') {
+/** Enforce the native OpenRouter reader's narrower service capability. */
+export function assertNativeOpenRouterService(service: string): void {
+  assertKeychainAccess(service, NATIVE_SECRET_ACCOUNT, 'read');
+  if (service !== OPENROUTER_KEYCHAIN_SERVICE) {
+    throw new KeychainAccessDeniedError(
+      service,
+      'read',
+      'only pi-openrouter is a valid native OpenRouter source',
+    );
+  }
+}
+
+export function readNativeOpenRouterKey(
+  service: string,
+  exec: ExecFileSyncFn = execFileUtf8,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  assertNativeOpenRouterService(service);
+  if (platform === 'darwin') {
     try {
-      const stdout = execFileSync(
-        'security',
+      const stdout = exec(
+        MACOS_SECURITY_BIN,
         ['find-generic-password', '-s', service, '-w'],
-        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] },
+        {
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'ignore'],
+          timeout: MACOS_SECURITY_TIMEOUT_MS,
+        },
       );
       const key = String(stdout).replace(/\n$/, '').trim();
       if (key.length > 0) return key;
-    } catch {
+    } catch (err) {
+      if (isSecurityTimeout(err)) throw securityTimeoutError('find-generic-password');
       // Normalize Keychain lookup failures without exposing command output.
     }
     throw new Error(openRouterMissingKeyMessage(service));

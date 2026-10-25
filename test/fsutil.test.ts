@@ -24,7 +24,7 @@ type Fsutil = {
   atomicWriteBytes(path: string, data: Uint8Array, options?: { mode?: number; followSymlinks?: boolean }): number;
   atomicWriteText(path: string, text: string, options?: { mode?: number; followSymlinks?: boolean }): number;
   publishTarget(path: string): string;
-  sweepStrayTemps(dir: string): number;
+  sweepStrayTemps(dir: string, options?: { isProcessAlive?: (pid: number) => boolean }): number;
 };
 
 // Kept as require so this red-first test compiles before src/fsutil.ts exists.
@@ -286,11 +286,11 @@ describe('fsutil atomic publish primitives', () => {
     assert.deepEqual(readdirSync(dir), [`${'x'.repeat(245)}.cswap`]);
   }));
 
-  it('sweeps only old qlb temporary files and never follows symlinks', () => withFixture((dir) => {
-    const oldTemp = join(dir, '.qlb-config.json.a.tmp');
-    const freshTemp = join(dir, '.qlb-other.b.tmp');
+  it('sweeps only exact old createTemp names and never follows symlinks', () => withFixture((dir) => {
+    const oldTemp = join(dir, '.qlb-config.json.31415.aaaaaaaaaaaaaaaa.tmp');
+    const freshTemp = join(dir, '.qlb-other.31415.bbbbbbbbbbbbbbbb.tmp');
     const protectedTarget = join(dir, 'protected.json');
-    const tempSymlink = join(dir, '.qlb-link.c.tmp');
+    const tempSymlink = join(dir, '.qlb-link.31415.cccccccccccccccc.tmp');
     writeFileSync(oldTemp, 'orphan');
     writeFileSync(freshTemp, 'live writer');
     writeFileSync(protectedTarget, 'keep');
@@ -299,8 +299,55 @@ describe('fsutil atomic publish primitives', () => {
     utimesSync(oldTemp, old, old);
 
     assert.equal(fsutil.sweepStrayTemps(dir), 1);
-    assert.deepEqual(readdirSync(dir).sort(), ['.qlb-link.c.tmp', '.qlb-other.b.tmp', 'protected.json']);
+    assert.deepEqual(readdirSync(dir).sort(), ['.qlb-link.31415.cccccccccccccccc.tmp', '.qlb-other.31415.bbbbbbbbbbbbbbbb.tmp', 'protected.json']);
     assert.equal(lstatSync(tempSymlink).isSymbolicLink(), true);
     assert.equal(readFileSync(protectedTarget, 'utf8'), 'keep');
+  }));
+
+  it('leaves unrelated old look-alike names untouched', () => withFixture((dir) => {
+    const lookAlikes = [
+      '.qlb-notes.tmp',
+      '.qlb-config.json.31415.short.tmp',
+      '.qlb-config.json.031415.aaaaaaaaaaaaaaaa.tmp',
+      '.qlb-config.json.31415.AAAAAAAAAAAAAAAA.tmp',
+      '.qlb-config.json.31415.aaaaaaaaaaaaaaaa.tmp.bak',
+      '.qlb-config.json.31415.aaaaaaaaaaaaaaaa.tmp-extra',
+    ];
+    const old = new Date(Date.now() - 61_000);
+    for (const name of lookAlikes) {
+      const path = join(dir, name);
+      writeFileSync(path, 'keep');
+      utimesSync(path, old, old);
+    }
+
+    assert.equal(fsutil.sweepStrayTemps(dir), 0);
+    assert.deepEqual(readdirSync(dir).sort(), lookAlikes.sort());
+  }));
+
+  it('keeps an old temp whose owner pid is live beyond the grace period', () => withFixture((dir) => {
+    const temp = join(dir, '.qlb-config.json.31415.aaaaaaaaaaaaaaaa.tmp');
+    writeFileSync(temp, 'live writer');
+    const old = new Date(Date.now() - 61_000);
+    utimesSync(temp, old, old);
+    const probed: number[] = [];
+
+    assert.equal(fsutil.sweepStrayTemps(dir, {
+      isProcessAlive: (pid) => {
+        probed.push(pid);
+        return pid === 31415;
+      },
+    }), 0);
+    assert.deepEqual(probed, [31415]);
+    assert.equal(readFileSync(temp, 'utf8'), 'live writer');
+  }));
+
+  it('removes an old temp whose owner pid is dead', () => withFixture((dir) => {
+    const temp = join(dir, '.qlb-config.json.31415.aaaaaaaaaaaaaaaa.tmp');
+    writeFileSync(temp, 'orphan');
+    const old = new Date(Date.now() - 61_000);
+    utimesSync(temp, old, old);
+
+    assert.equal(fsutil.sweepStrayTemps(dir, { isProcessAlive: () => false }), 1);
+    assert.deepEqual(readdirSync(dir), []);
   }));
 });

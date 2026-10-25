@@ -59,7 +59,11 @@ describe('qlb init', () => {
     const report = initializeQlb(config, () => { throw new Error('not found'); });
     assert.equal(report.overall, 'WARN');
     assert.equal(report.configWritten, false);
-    assert.ok(report.providers.every((provider) => provider.message.includes('set QLB_')));
+    assert.ok(report.providers
+      .filter((provider) => provider.provider !== 'openrouter')
+      .every((provider) => provider.message.includes('set QLB_')));
+    const openrouter = report.providers.find((provider) => provider.provider === 'openrouter');
+    assert.match(openrouter?.message ?? '', /fixed pi-openrouter service/);
     assert.equal(readFileSync(config.configPath, 'utf8'), '{"keep":true}\n');
   });
 });

@@ -61,7 +61,7 @@ $ qlb doctor
 [WARN] xai: credential source not found; set QLB_PI_AUTH_JSON_PATH. Example: export QLB_PI_AUTH_JSON_PATH=~/path/to/pi-auth.json
 [WARN] openai-codex: credential source not found; set QLB_CODEX_AUTH_JSON_PATH. Example: export QLB_CODEX_AUTH_JSON_PATH=~/path/to/codex-auth.json
 [WARN] kimi-coding: credential source not found; set QLB_KIMI_CREDENTIALS_FILE. Example: export QLB_KIMI_CREDENTIALS_FILE=~/path/to/file-containing-sk-kimi-key
-[WARN] openrouter: credential source not found; set QLB_OPENROUTER_KEYCHAIN_SERVICE. Example: security add-generic-password -s <service> -a qlb -w '<key>'
+[WARN] openrouter: credential source not found in fixed pi-openrouter service. Example: security add-generic-password -s pi-openrouter -a qlb -w '<key>'
 Overall: WARN
 ```
 

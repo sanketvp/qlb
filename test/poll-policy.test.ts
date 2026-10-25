@@ -371,6 +371,30 @@ describe('claude-swap due-candidate port', () => {
     assert.equal(dueCandidate(['parked', 'recent'], entries, now), 'parked');
   });
 
+  it('yields a held row to an unheld row and quarantines dead tokens', () => {
+    // QLB §4.6 / AC46: a held Codex slot must not consume the one alternate
+    // poll, and a known-dead refresh token remains quarantined after backoff.
+    const entries: Record<string, DueCandidateSlot> = {
+      held: { lastFetchAt: now - 900, heldUntil: now + 1 },
+      dead: { lastFetchAt: now - 800, lastStatus: 'token_dead' },
+      available: { lastFetchAt: now - 60 },
+    };
+    assert.equal(dueCandidate(['held', 'dead', 'available'], entries, now), 'available');
+  });
+
+  it('limits an overdue cohort to one alternate poll', () => {
+    // The one-alternate policy repairs the selected stale plan through its
+    // normal post-fetch plan; it must not nominate all six at once.
+    const entries = Object.fromEntries(
+      Array.from({ length: 6 }, (_, index) => [`slot-${index}`, {
+        lastFetchAt: now - 1_200 - index,
+        nextDueAt: now - 601 - index,
+        pollIntervalS: 600,
+      }]),
+    ) as Record<string, DueCandidateSlot>;
+    assert.equal(dueCandidate(Object.keys(entries), entries, now), 'slot-5');
+  });
+
   it('does not let a repeatedly failing slot starve another due slot', () => {
     // The failed slot has no new measurement but was attempted on the latest
     // tick. C-swap keys on max(fetchedAt, lastAttemptAt), so the older healthy
