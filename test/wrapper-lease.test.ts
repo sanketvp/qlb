@@ -310,6 +310,35 @@ function health(port: number, token: string): Promise<number> {
 }
 
 describe('wrapper / mutex / proxy lifecycle', () => {
+  it('does not pass the wrapper QLB_HOME to its qlb proxy child', () => {
+    const dir = tmp();
+    const received = join(dir, 'proxy-env.json');
+    const fakeQlb = join(dir, 'fake-qlb');
+    writeFileSync(fakeQlb, `#!/usr/bin/python3
+import json, os, sys
+with open(${JSON.stringify(received)}, 'w') as f: json.dump(dict(os.environ), f)
+info = sys.argv[sys.argv.index('--info-path') + 1]
+with open(info, 'w') as f: json.dump({'token': 'fake-token', 'pid': os.getpid(), 'lstart': '', 'startedBy': 'wrapper'}, f)
+`, { mode: 0o755 });
+    const result = spawnSync('/usr/bin/python3', [WRAPPER, '--qlb-critical-section'], {
+      env: {
+        ...process.env,
+        QLB_HOME: dir,
+        QLB_BIN: fakeQlb,
+        QLB_PROXY_INFO_PATH: join(dir, 'proxy.json'),
+        QLB_PROXY_PORT: '47391',
+        QLB_WRAPPER_PID: String(process.pid),
+        QLB_WRAPPER_LSTART: 'test',
+        QLB_SESSION: 'test',
+      },
+      encoding: 'utf8',
+      timeout: 15_000,
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const proxyEnv = JSON.parse(readFileSync(received, 'utf8')) as NodeJS.ProcessEnv;
+    assert.equal(proxyEnv.QLB_HOME, undefined);
+  });
+
   it('mutex-inherited-lock', async () => {
     const dir = tmp();
     const lock = join(dir, 'proxy.lock');

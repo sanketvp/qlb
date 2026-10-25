@@ -12,6 +12,8 @@ export const MACOS_KEYCHAIN_ACCOUNT_FALLBACK = 'claude-code-user';
 export interface KeychainAllowlistOptions {
   /** Injectable only for tests; production uses Claude Code's username rule. */
   macosUserName?: () => string;
+  /** Injectable only for fake-backend policy tests; production uses process.env. */
+  env?: NodeJS.ProcessEnv;
 }
 
 /** Raised before a forbidden Keychain subprocess can be invoked. */
@@ -26,6 +28,10 @@ export class KeychainAccessDeniedError extends Error {
     this.service = service;
     this.operation = operation;
   }
+}
+
+function isQlbTestMode(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.QLB_TEST_MODE === '1';
 }
 
 const CLAUDE_CODE_CREDENTIALS = 'Claude Code-credentials';
@@ -50,6 +56,7 @@ function isClaudeCodeCredentialsService(service: string): boolean {
 
 /** Whether a service is recognized by the fixed capability allowlist. */
 export function isAllowedKeychainService(service: string): boolean {
+  if (isQlbTestMode()) return false;
   return service.startsWith('qlb:')
     || service.startsWith('qlb-test-')
     || service === 'claude-swap'
@@ -68,6 +75,9 @@ export function assertKeychainAccess(
   operation: KeychainOperation,
   options: KeychainAllowlistOptions = {},
 ): void {
+  if (isQlbTestMode(options.env)) {
+    throw new KeychainAccessDeniedError(service, operation, 'native Keychain access is disabled in test mode');
+  }
   if (service.startsWith('qlb:') || service.startsWith('qlb-test-')) return;
 
   if (service === 'claude-swap' || service === OPENROUTER_KEYCHAIN_SERVICE) {

@@ -20,13 +20,14 @@ import {
   writeFileSync,
   type Dirent,
 } from 'node:fs';
-import { homedir, tmpdir } from 'node:os';
+import { tmpdir } from 'node:os';
 import { delimiter, dirname, isAbsolute, join, resolve } from 'node:path';
 import type { DoctorCheck } from './diagnostics';
+import { qlbHomeDir } from './home';
 import { findQlbRepoRoot } from './setup';
 
 const PI_PACKAGE_NAME = '@earendil-works/pi-coding-agent';
-const DEFAULT_PI_EXT_DIR = join(homedir(), '.pi', 'agent', 'extensions', 'qlb-pi');
+const DEFAULT_PI_EXT_DIR = join(qlbHomeDir(), '.pi', 'agent', 'extensions', 'qlb-pi');
 
 function isPiPackageRoot(dir: string): boolean {
   try {
@@ -124,7 +125,7 @@ function pathEntries(platform: NodeJS.Platform, env: NodeJS.ProcessEnv): string[
  */
 export function locatePi(
   env: NodeJS.ProcessEnv = process.env,
-  home: string = homedir(),
+  home: string = qlbHomeDir(env),
   platform: NodeJS.Platform = process.platform,
 ): PiLocation {
   const override = env.QLB_PI_PACKAGE_ROOT ? resolve(env.QLB_PI_PACKAGE_ROOT) : undefined;
@@ -158,7 +159,7 @@ export function locatePi(
 
 export function resolvePiPackageRoot(
   env: NodeJS.ProcessEnv = process.env,
-  home: string = homedir(),
+  home: string = qlbHomeDir(env),
 ): string | null {
   return locatePi(env, home).root;
 }
