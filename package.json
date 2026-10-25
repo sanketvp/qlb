@@ -18,10 +18,10 @@
     "qlb": "./dist/cli.js"
   },
   "scripts": {
-    "build": "node scripts/clean-registry-output.cjs && tsc",
+    "build": "node scripts/clean-registry-output.cjs && tsc && node scripts/write-build-stamp.cjs",
     "start": "node dist/cli.js",
     "dev": "ts-node src/cli.ts",
-    "test": "node scripts/clean-registry-output.cjs dist-test/src && tsc -p tsconfig.test.json && node --test dist-test/test/*.test.js",
+    "test": "npm run build && node scripts/clean-registry-output.cjs dist-test/src && tsc -p tsconfig.test.json && node --test dist-test/test/*.test.js",
     "typecheck:pi": "tsc && node scripts/typecheck-pi.js"
   },
   "engines": {

@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
+
+import { resolveCommand, discoverCommands } from '../src/registry';
 
 const plistPath = join(__dirname, '..', '..', 'scripts', 'launchagents', 'com.modus.qlb-auto.plist');
 
@@ -13,5 +15,13 @@ describe('QLB auto LaunchAgent template (AC45)', () => {
     assert.equal(plist.includes('~'), false);
     assert.equal(plist.includes('QLB_TEST_MODE'), false);
     assert.match(plist, /<string>\/[^<]+<\/string>/);
+  });
+
+  it('runs a registered command and has no unconditional restart policy', () => {
+    const plist = readFileSync(plistPath, 'utf8');
+    const argumentsBlock = plist.match(/<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/)?.[1] ?? '';
+    const values = [...argumentsBlock.matchAll(/<string>([^<]+)<\/string>/g)].map((match) => match[1]);
+    assert.ok(resolveCommand(values.slice(2), discoverCommands()), 'plist command must be registered');
+    assert.doesNotMatch(plist, /<key>KeepAlive<\/key>\s*<true\/>/);
   });
 });

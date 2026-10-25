@@ -12,12 +12,19 @@ export interface ReleaseCommandDeps {
 
 function defaultShaForSource(sourceDir: string): string {
   try {
+    const dirty = execFileSync('git', ['status', '--porcelain'], {
+      cwd: sourceDir,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    if (dirty.trim()) throw new Error('source tree is dirty');
     return execFileSync('git', ['rev-parse', '--verify', 'HEAD'], {
       cwd: sourceDir,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
     }).trim();
-  } catch {
+  } catch (err) {
+    if (err instanceof Error && err.message === 'source tree is dirty') throw err;
     throw new Error('cannot determine release SHA; pass --sha <sha>');
   }
 }
