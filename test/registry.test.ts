@@ -134,21 +134,61 @@ describe('registries', () => {
     assert.doesNotMatch(output[0], new RegExp(secret));
   });
 
-  it('redacts short credential-like environment values but not unrelated ones', async () => {
-    const shortSecret = 'short';
+  it('redacts registered short secrets but not short credential-like environment values', async () => {
+    const registeredSecret = 'tiny';
+    const envValue = 'short';
     const nonCredentialValue = 'opaque-home-abc123XYZ';
     const output: string[] = [];
     const context = createCommandContext();
-    context.env = { QLB_TEST_TOKEN: shortSecret, HOME: nonCredentialValue };
+    context.env = { QLB_TEST_TOKEN: envValue, HOME: nonCredentialValue };
     context.stderr = (line: string) => output.push(line);
 
     assert.equal(await runExecutingCommand({
-      command: { name: 'fixture', execute: () => { throw new Error(`failed: ${shortSecret}, ${nonCredentialValue}`); } },
+      command: {
+        name: 'fixture',
+        execute: (_args, ctx) => {
+          ctx.registerSecret(registeredSecret);
+          throw new Error(`failed: ${registeredSecret}, ${envValue}, ${nonCredentialValue}`);
+        },
+      },
       args: [],
     }, context), 1);
     assert.match(output[0], /\[redacted\]/);
+    assert.doesNotMatch(output[0], new RegExp(registeredSecret));
+    assert.match(output[0], new RegExp(envValue));
     assert.match(output[0], new RegExp(nonCredentialValue));
-    assert.doesNotMatch(output[0], new RegExp(shortSecret));
+  });
+
+  it('preserves structured stdout for short, numeric, and non-credential environment values', async () => {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const longToken = 'opaque-github-token-abc123XYZ';
+    const message = JSON.stringify({ dead: false, expiresAt: 1761320001234, count: 10 });
+    const context = createCommandContext();
+    context.env = {
+      CLAUDE_CODE_MAX_OUTPUT_TOKENS: '32000',
+      TOKENIZERS_PARALLELISM: 'false',
+      QLB_AUTH_DEBUG: '1',
+      GITHUB_TOKEN: longToken,
+    };
+    context.stdout = (line: string) => stdout.push(line);
+    context.stderr = (line: string) => stderr.push(line);
+
+    assert.equal(await runExecutingCommand({
+      command: {
+        name: 'fixture',
+        execute: (_args, ctx) => {
+          ctx.stdout(message);
+          ctx.stderr(`token: ${longToken}`);
+          return 0;
+        },
+      },
+      args: [],
+    }, context), 0);
+    assert.deepEqual(stdout, [message]);
+    assert.doesNotThrow(() => JSON.parse(stdout[0]));
+    assert.match(stderr[0], /\[redacted\]/);
+    assert.doesNotMatch(stderr[0], new RegExp(longToken));
   });
 
   it('redacts executing-command output and errors through dispatchCommand', async () => {

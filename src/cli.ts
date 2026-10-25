@@ -1760,7 +1760,12 @@ export function createCommandContext(): CommandContext {
 function knownCommandSecrets(context: CommandContext): string[] {
   const secrets = new Set(context.knownSecrets());
   for (const [key, value] of Object.entries(context.env)) {
-    if (/TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|API_KEY|APIKEY|PRIVATE_KEY|CREDENTIAL|COOKIE|AUTH/i.test(key) && value) {
+    if (
+      /(^|_)(TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|API_KEY|APIKEY|PRIVATE_KEY|CREDENTIAL|COOKIE|AUTH)(_|$)/i.test(key)
+      && value
+      && value.length >= 8
+      && !/^(true|false|\d+)$/i.test(value)
+    ) {
       secrets.add(value);
     }
   }
