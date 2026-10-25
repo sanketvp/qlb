@@ -151,9 +151,9 @@ function copyRuntimeDependencies(sourceDir: string, destinationDir: string): voi
     }
     const realPackage = realpathSync(sourcePackage);
     assertPathInside(sourceDir, realPackage, sourcePackage);
-    if (copied.has(realPackage)) return;
-    copied.add(realPackage);
     const targetPackage = join(destinationDir, sourceRelative);
+    if (copied.has(targetPackage)) return;
+    copied.add(targetPackage);
     // A release must not retain a link back to the mutable checkout. This also makes the
     // release digest cover the actual bytes Node will load.
     copyContained(sourcePackage, targetPackage, realPackage);
@@ -206,9 +206,13 @@ function copyContained(source: string, destination: string, allowedRoot: string)
         throw new ReleaseIntegrityError(`cyclic directory symlink at ${input} resolves to ${realDirectory}`);
       }
       visitedDirectories.add(realDirectory);
-      mkdirSync(output, { recursive: true, mode: 0o755 });
-      for (const entry of readdirSync(sourcePath, { withFileTypes: true })) {
-        visit(join(sourcePath, entry.name), join(output, entry.name));
+      try {
+        mkdirSync(output, { recursive: true, mode: 0o755 });
+        for (const entry of readdirSync(sourcePath, { withFileTypes: true })) {
+          visit(join(sourcePath, entry.name), join(output, entry.name));
+        }
+      } finally {
+        visitedDirectories.delete(realDirectory);
       }
       return;
     }
