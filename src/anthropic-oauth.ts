@@ -1,6 +1,6 @@
 /*
  * Ported from claude-swap 0.28.0.
- * Upstream file(s): src/claude_swap/oauth.py:17-20,25-70,73-101,105-140,154-183,200-257,265-324,397-407,464-542.
+ * Upstream file(s): src/claude_swap/oauth.py:17-20,25-70,73-101,105-140,154-183,200-257,265-324,397-407,464-542, src/claude_swap/autoswitch.py:95-98,887-892.
  * License: MIT.
  * Modified for QLB. See NOTICE.
  */
