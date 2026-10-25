@@ -111,6 +111,28 @@ describe('qlb doctor', () => {
     );
   });
 
+  it('emits recorded Keychain matrix and live-item authorization results on darwin', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-keychain-recorded-'));
+    const values = new Map<string, string>([
+      ['keychain.helperCheckResult', 'ok'],
+      ['keychain.helperCheckPrompted', 'false'],
+      ['keychain.liveItemsReadAuthorizedAt', '123'],
+    ]);
+    const green = await doctorQlb(defaultConfig(home), {
+      command: () => 'ok', hostCommand: () => '', hostPlatform: 'darwin', configReader: (key) => values.get(key) ?? null,
+    });
+    assert.equal(green.checks.find((check) => check.name === 'keychain:helper')?.level, 'PASS');
+    assert.equal(green.checks.find((check) => check.name === 'keychain:live-items-authorized')?.level, 'PASS');
+
+    values.set('keychain.helperCheckPrompted', 'true');
+    values.delete('keychain.liveItemsReadAuthorizedAt');
+    const blocked = await doctorQlb(defaultConfig(home), {
+      command: () => 'ok', hostCommand: () => '', hostPlatform: 'darwin', configReader: (key) => values.get(key) ?? null,
+    });
+    assert.equal(blocked.checks.find((check) => check.name === 'keychain:helper')?.level, 'FAIL');
+    assert.equal(blocked.checks.find((check) => check.name === 'keychain:live-items-authorized')?.level, 'FAIL');
+  });
+
   it('bounds the production security command runner', () => {
     let timeoutMs: number | undefined;
     const run = createCommandRunner((_file, _args, options) => {

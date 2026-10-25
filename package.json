@@ -23,7 +23,7 @@
     "dev": "ts-node src/cli.ts",
     "test": "export QLB_TEST_MODE=1 QLB_HOME=\"$(mktemp -d)\"; node scripts/clean-registry-output.cjs dist-test/src && tsc -p tsconfig.test.json && node --test dist-test/test/*.test.js",
     "typecheck:pi": "tsc && node scripts/typecheck-pi.js",
-    "build:helper": "bash -ceu 'out=native/keychain-helper/build/qlb-keychain-helper; src=native/keychain-helper/main.swift; identity=\"QLB Keychain Helper\"; keychain=\"$HOME/Library/Keychains/login.keychain-db\"; mkdir -p \"$(dirname \"$out\")\" \"$HOME/.qlb/helper-prev\"; if [ -x \"$out\" ]; then cp \"$out\" \"$HOME/.qlb/helper-prev/qlb-keychain-helper\"; fi; if ! security find-identity -v -p codesigning \"$keychain\" 2>/dev/null | grep -Fq \"$identity\"; then tmp=$(mktemp -d); openssl req -x509 -newkey rsa:2048 -nodes -keyout \"$tmp/key.pem\" -out \"$tmp/cert.pem\" -subj \"/CN=$identity/\" -addext \"extendedKeyUsage=codeSigning\" -days 3650; openssl pkcs12 -export -out \"$tmp/identity.p12\" -inkey \"$tmp/key.pem\" -in \"$tmp/cert.pem\" -passout pass:; security import \"$tmp/identity.p12\" -k \"$keychain\" -P \"\" -T /usr/bin/codesign; rm -rf \"$tmp\"; fi; swiftc \"$src\" -o \"$out\"; codesign --force --sign \"$identity\" --timestamp=none \"$out\"'"
+    "build:helper": "bash scripts/build-keychain-helper.sh"
   },
   "engines": {
     "node": ">=22"

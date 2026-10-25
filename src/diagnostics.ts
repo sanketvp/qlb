@@ -454,12 +454,15 @@ export async function doctorQlb(
     hostPlatform?: NodeJS.Platform;
     hostShell?: string;
     hostShellExists?: (path: string) => boolean;
+    /** Tests may inject recorded Keychain matrix/authorization state without a real store. */
+    configReader?: (key: string) => string | null;
   } = {},
 ): Promise<DoctorReport> {
   const checks: DoctorCheck[] = [];
   let migrations: Array<{ store: string; state: string; detail_json?: string }> = [];
   let accounts: Array<{ id: string; provider: string; label: string }> = [];
   let recoveryPending = false;
+  const recordedConfig = new Map<string, string>();
 
   if (!existsSync(config.dbPath)) {
     checks.push({ name: 'sqlite', level: 'WARN', message: `database does not exist yet: ${config.dbPath}; run qlb status` });
@@ -490,8 +493,14 @@ export async function doctorQlb(
       }
       const cfgTable = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='config'").get();
       if (cfgTable) {
-        const marker = db.prepare('SELECT value FROM config WHERE key = ?').get('migrations.recovery_pending');
-        recoveryPending = marker != null;
+        const rows = db.prepare('SELECT key, value FROM config WHERE key IN (?, ?, ?, ?)').all(
+          'migrations.recovery_pending',
+          'keychain.helperCheckResult',
+          'keychain.helperCheckPrompted',
+          'keychain.liveItemsReadAuthorizedAt',
+        ) as Array<{ key: string; value: string }>;
+        for (const row of rows) recordedConfig.set(row.key, row.value);
+        recoveryPending = recordedConfig.has('migrations.recovery_pending');
       }
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
@@ -541,8 +550,26 @@ export async function doctorQlb(
   }
 
   checks.push(probeCredentialStore(options.command));
+  const hostPlatform = options.hostPlatform ?? process.platform;
+  if (hostPlatform === 'darwin') {
+    const configValue = options.configReader ?? ((key: string) => recordedConfig.get(key) ?? null);
+    const helperResult = configValue('keychain.helperCheckResult');
+    const helperPrompted = configValue('keychain.helperCheckPrompted') === 'true';
+    if (helperResult === null) {
+      checks.push({ name: 'keychain:helper', level: 'WARN', message: 'no recorded disposable helper matrix result; run qlb keychain check-launchd' });
+    } else if (helperResult !== 'ok' || helperPrompted) {
+      checks.push({ name: 'keychain:helper', level: 'FAIL', message: helperPrompted ? 'helper matrix recorded a Keychain prompt' : 'recorded helper matrix did not pass' });
+    } else {
+      checks.push({ name: 'keychain:helper', level: 'PASS', message: 'recorded disposable helper matrix passed without a prompt' });
+    }
+    if (configValue('keychain.liveItemsReadAuthorizedAt') === null) {
+      checks.push({ name: 'keychain:live-items-authorized', level: 'FAIL', message: 'live Keychain items have not been read-authorized; run qlb keychain authorize' });
+    } else {
+      checks.push({ name: 'keychain:live-items-authorized', level: 'PASS', message: 'live Keychain item read authorization is recorded' });
+    }
+  }
   checks.push(probeHostEnvironment(options.hostCommand ?? runHostCommand, {
-    platform: options.hostPlatform ?? process.platform,
+    platform: hostPlatform,
     // An explicit hostShell key (even undefined) overrides the real SHELL, so tests are host-independent.
     shell: 'hostShell' in options ? options.hostShell : process.env.SHELL,
     shellExists: options.hostShellExists ?? existsSync,
