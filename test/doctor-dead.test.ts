@@ -232,40 +232,41 @@ describe('A7 doctor health primitives', () => {
     assert.equal(listHealthLog(dbPath).length, 1);
   });
 
-  it('records relogin reason codes and evidence fingerprints without raw text', () => {
+  it('stores S65 classes in evidence and codes or fingerprints in detail without raw text', () => {
     const dbPath = fixture();
     const store = openStore(dbPath);
-    recordRelogin(store, {
+    store.recordRelogin({
       ts: 1_000,
       provider: 'anthropic',
       accountId: 'claude-dead',
-      kind: 'dead',
+      kind: 'external-login',
       detail: 'dead',
-      evidence: 'client_secret=abc123xyz&refresh_token=r-xyz',
+      evidence: 'unattributed-rotation',
     });
     recordRelogin(store, {
       ts: 2_000,
       provider: 'anthropic',
       accountId: 'claude-dead',
       kind: 'healed',
-      detail: 'untrusted free text',
+      detail: 'refresh_token=r-xyz',
     });
     assert.throws(
-      () => store.recordRelogin({ provider: 'anthropic', kind: 'dead', detail: 'raw detail', evidence: 'raw evidence' }),
-      /invalid relogin detail code/,
+      () => store.recordRelogin({ provider: 'anthropic', kind: 'dead', evidence: 'client_secret=abc' }),
+      /invalid relogin evidence class/,
     );
     assert.throws(
-      () => store.recordRelogin({ provider: 'anthropic', kind: 'dead', detail: 'dead', evidence: 'raw evidence' }),
-      /invalid relogin evidence fingerprint/,
+      () => store.recordRelogin({ provider: 'anthropic', kind: 'dead', detail: 'raw detail' }),
+      /invalid relogin detail/,
     );
     store.close();
 
     const events = listReloginEvents(dbPath);
     assert.equal(events.length, 2);
     assert.equal(events[0]?.detail, 'dead');
-    assert.match(events[0]?.evidence ?? '', /^sha256:[0-9a-f]{16}$/);
-    assert.equal(events[1]?.detail, 'other');
-    assert.doesNotMatch(JSON.stringify(events), /client_secret=abc123xyz|refresh_token=r-xyz/);
+    assert.equal(events[0]?.evidence, 'unattributed-rotation');
+    assert.match(events[1]?.detail ?? '', /^sha256:[0-9a-f]{16}$/);
+    assert.equal(events[1]?.evidence, null);
+    assert.doesNotMatch(JSON.stringify(events), /refresh_token=r-xyz/);
     assert.deepEqual(reloginsInWindow(dbPath, { start: 1_500, end: 2_500 }).map((event) => event.kind), ['healed']);
     const active = relogin7dCheck(dbPath, 'cutover', 1_500, 1_000);
     assert.equal(active.level, 'FAIL');

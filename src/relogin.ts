@@ -1,4 +1,4 @@
-import { reloginEvidenceFingerprint, reloginReasonCode } from './relogin-fields';
+import { assertStoredReloginFields, reloginDetailValue } from './relogin-fields';
 import { openStoreConnection } from './store';
 
 export const RELOGIN_KINDS = ['dead', 'healed', 'wiped', 'identity-replaced', 'external-login'] as const;
@@ -32,7 +32,7 @@ export interface ReloginWindow {
   end: number;
 }
 
-/** Records only durable reason codes and evidence fingerprints from S26/S65. */
+/** Records only durable detail codes/fingerprints and S65 evidence classes. */
 export function recordRelogin(
   store: ReloginStore,
   event: Omit<ReloginEvent, 'id' | 'detail' | 'evidence' | 'userDeniedAt'> & {
@@ -44,13 +44,16 @@ export function recordRelogin(
   if (!(RELOGIN_KINDS as readonly string[]).includes(event.kind)) {
     throw new Error(`unsupported relogin event kind: ${event.kind}`);
   }
+  const detail = reloginDetailValue(event.detail);
+  const evidence = event.evidence ?? null;
+  assertStoredReloginFields(detail, evidence);
   return store.recordRelogin({
     ts: event.ts,
     provider: event.provider,
     accountId: event.accountId,
     kind: event.kind,
-    detail: reloginReasonCode(event.detail),
-    evidence: reloginEvidenceFingerprint(event.evidence),
+    detail,
+    evidence,
     userDeniedAt: event.userDeniedAt,
   });
 }
