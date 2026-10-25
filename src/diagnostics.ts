@@ -94,9 +94,11 @@ export interface HelperSigningState {
   identityHash: string;
 }
 
-/** `codesign -dv` metadata only: no Keychain values are read. */
+/** Validates the code signature and reads its metadata; no Keychain values are read. */
 export function inspectHelperSigning(path = defaultKeychainHelperPath()): HelperSigningState | null {
   if (!existsSync(path)) return null;
+  const verification = spawnSync('/usr/bin/codesign', ['--verify', '--strict', path], { encoding: 'utf8' });
+  if (verification.status !== 0) return null;
   const result = spawnSync('/usr/bin/codesign', ['-d', '-v', '-r-', path], { encoding: 'utf8' });
   if (result.status !== 0) return null;
   const details = `${result.stdout ?? ''}\n${result.stderr ?? ''}`;

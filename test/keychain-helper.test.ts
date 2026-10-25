@@ -13,8 +13,12 @@ import {
   markFakeExecutor,
   type ExecFileSyncFn,
 } from '../src/keychain';
-import { helperMatrixConfig, helperMatrixIsOk, parseHelperMatrixResult, runKeychainCommand } from '../src/commands/keychain';
-import { exitCodeForError } from '../src/cli';
+import {
+  helperMatrixConfig, helperMatrixIsOk, helperSigningState, parseHelperMatrixResult, runKeychainCommand,
+} from '../src/commands/keychain';
+import { exitCodeForError, runExecutingCommand } from '../src/cli';
+import { inspectHelperSigning } from '../src/diagnostics';
+import type { CommandContext } from '../src/registry';
 import { defaultConfig } from '../src/config';
 import { openStore } from '../src/store';
 
@@ -116,6 +120,30 @@ describe('Swift Keychain helper write path', () => {
     assert.equal(exit, 3);
     assert.deepEqual(errors, ['helper-missing: /tmp/missing-helper; run npm run build:helper']);
     assert.equal(exitCodeForError(new KeychainHelperMissingError('/tmp/missing-helper')), 3);
+  });
+
+  it('uses the diagnostics signing inspector as the keychain signing inspector', () => {
+    assert.equal(helperSigningState, inspectHelperSigning);
+  });
+
+  it('returns exit 3 and the helper-missing error through the redacting command boundary', async () => {
+    const errors: string[] = [];
+    const context: CommandContext = {
+      config: defaultConfig(mkdtempSync(join(tmpdir(), 'qlb-keychain-boundary-'))), env: {}, home: '/tmp',
+      stdout: () => {}, stderr: (message) => errors.push(message), loadConfig: () => { throw new Error('not used'); },
+      registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
+    };
+
+    const exit = await runExecutingCommand({
+      command: {
+        name: 'fixture',
+        execute: async () => { throw new KeychainHelperMissingError('/tmp/missing-helper'); },
+      },
+      args: [],
+    }, context);
+
+    assert.equal(exit, 3);
+    assert.deepEqual(errors, ['qlb fixture: helper-missing: /tmp/missing-helper; run npm run build:helper']);
   });
 
   it('compiles the helper and self-tests only a disposable Keychain', {

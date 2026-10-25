@@ -16,6 +16,7 @@ import {
 } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative } from 'node:path';
 
+import { inspectHelperSigning, type HelperSigningState } from './diagnostics';
 import { backupBeforeMigrate } from './store';
 
 const BUILD_STAMP = '.build-sha';
@@ -30,6 +31,8 @@ export interface ReleaseInstallOptions {
   sha: string;
   dbPath: string;
   backup?: typeof backupBeforeMigrate;
+  /** Verifies the native helper before it can enter an immutable release. */
+  verifyHelperSigning?: (path: string) => HelperSigningState | null;
 }
 
 export interface ReleaseInstallResult {
@@ -226,7 +229,11 @@ function copyContained(source: string, destination: string, allowedRoot: string)
   visit(source, destination);
 }
 
-function copyReleaseContents(sourceDir: string, stagingDir: string): void {
+function copyReleaseContents(
+  sourceDir: string,
+  stagingDir: string,
+  verifyHelperSigning: (path: string) => HelperSigningState | null = inspectHelperSigning,
+): void {
   const checkoutRoot = realpathSync(sourceDir);
   copyContained(join(sourceDir, 'dist'), join(stagingDir, 'dist'), checkoutRoot);
   if (existsSync(join(sourceDir, 'package.json'))) {
@@ -241,8 +248,18 @@ function copyReleaseContents(sourceDir: string, stagingDir: string): void {
   }
   const helper = join(sourceDir, 'native', 'keychain-helper', 'build', 'qlb-keychain-helper');
   if (existsSync(helper)) {
+    // Checking the resolved file catches a symlink at any ancestor, not merely at the leaf.
+    const resolvedHelper = realpathSync(helper);
+    assertPathInside(checkoutRoot, resolvedHelper, helper);
+    const signing = verifyHelperSigning(resolvedHelper);
+    if (!signing) {
+      throw new ReleaseIntegrityError('helper not signed; run npm run build:helper');
+    }
+    if (signing.authority !== 'QLB Keychain Helper') {
+      throw new ReleaseIntegrityError(`helper signed by ${signing.authority}, expected QLB Keychain Helper; run npm run build:helper`);
+    }
     const installedHelper = join(stagingDir, 'native', 'keychain-helper', 'build', 'qlb-keychain-helper');
-    copyContained(helper, installedHelper, checkoutRoot);
+    copyContained(resolvedHelper, installedHelper, checkoutRoot);
     chmodSync(installedHelper, 0o755);
   }
   copyRuntimeDependencies(sourceDir, stagingDir);
@@ -350,7 +367,7 @@ export async function installRelease(options: ReleaseInstallOptions): Promise<Re
   let staged = true;
   try {
     mkdirSync(stagingDir, { mode: 0o755 });
-    copyReleaseContents(options.sourceDir, stagingDir);
+    copyReleaseContents(options.sourceDir, stagingDir, options.verifyHelperSigning);
     const stagedBuildDigest = buildOutputDigest(stagingDir);
     if (stagedBuildDigest !== stamp.buildDigest) {
       throw new ReleaseIntegrityError('compiled build output digest differs from its stamp; rebuild from a clean tree');

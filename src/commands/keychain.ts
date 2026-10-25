@@ -1,8 +1,9 @@
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { defaultKeychainHelperPath, KeychainHelperMissingError, MACOS_SECURITY_TIMEOUT_MS } from '../keychain';
+import { inspectHelperSigning, type HelperSigningState } from '../diagnostics';
 import { openStore } from '../store';
 import type { CommandDefinition, CommandContext } from '../registry';
 
@@ -140,22 +141,9 @@ export function runHelperMatrixUnderLaunchd(path: string = helperPath()): Helper
   }
 }
 
-export interface HelperSigningState {
-  authority: string;
-  binaryHash: string;
-  identityHash: string;
-}
-
-/** Reads only signing metadata; no Keychain item or credential data is opened. */
-export function helperSigningState(path: string): HelperSigningState | null {
-  const result = spawnSync('/usr/bin/codesign', ['-d', '-v', '-r-', path], { encoding: 'utf8' });
-  if (result.status !== 0) return null;
-  const details = `${result.stdout ?? ''}\n${result.stderr ?? ''}`;
-  const authority = /^Authority=(.+)$/m.exec(details)?.[1]?.trim();
-  const binaryHash = /^CDHash=([0-9a-fA-F]+)$/m.exec(details)?.[1]?.toLowerCase();
-  const identityHash = /certificate leaf = H"([0-9a-fA-F]{40})"/.exec(details)?.[1]?.toLowerCase();
-  return authority && binaryHash && identityHash ? { authority, binaryHash, identityHash } : null;
-}
+/** Re-export the sole signing inspector used by diagnostics and release installation. */
+export type { HelperSigningState };
+export const helperSigningState = inspectHelperSigning;
 
 export function helperMatrixConfig(
   result: HelperMatrixResult | null,
