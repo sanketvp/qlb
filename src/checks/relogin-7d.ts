@@ -18,6 +18,9 @@ export function relogin7dCheck(
     return { name: 'relogin:7d', level: 'FAIL', message: 'check failed: invalid relogin window' };
   }
   return guardCheck('relogin:7d', () => {
+    if (phase === 'unknown') {
+      return { name: 'relogin:7d', level: 'WARN', message: 'lifecycle phase unavailable; relogin window cannot be evaluated' };
+    }
     if (!APPLICABLE_PHASES.has(phase)) {
       return { name: 'relogin:7d', level: 'N/A', message: `not applicable in phase=${phase}` };
     }

@@ -271,6 +271,20 @@ export function openDecisionsReader(path: string): DecisionsReader | null {
   }
 }
 
+/** Opens a short-lived store connection with the same lock contract as Store. */
+export function openStoreConnection(dbPath: string, readOnly = false): DatabaseSync {
+  const db = new DatabaseSync(dbPath, { readOnly });
+  try {
+    // Match Store: install the busy handler before a lock-taking WAL request.
+    db.exec('PRAGMA busy_timeout = 5000');
+    if (!readOnly && dbPath !== ':memory:') db.exec('PRAGMA journal_mode = WAL');
+    return db;
+  } catch (error) {
+    try { db.close(); } catch { /* preserve the open error */ }
+    throw error;
+  }
+}
+
 function ensurePrivateDir(dir: string): void {
   if (!existsSync(dir)) {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -490,12 +504,8 @@ export class Store {
       }
     }
 
-    this.db = new DatabaseSync(dbPath);
+    this.db = openStoreConnection(dbPath);
     try {
-      // Install the busy handler before the first lock-taking SQL operation
-      // after open. Keep this before WAL/schema initialization.
-      this.db.exec('PRAGMA busy_timeout = 5000');
-      if (dbPath !== ':memory:') this.db.exec('PRAGMA journal_mode = WAL');
       this.db.exec('PRAGMA synchronous = NORMAL');
       // migrateIfNeeded takes the write lock and, when needed, backs up before
       // any constructor schema DDL is allowed to run.

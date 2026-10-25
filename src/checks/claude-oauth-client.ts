@@ -1,5 +1,4 @@
-import { DatabaseSync } from 'node:sqlite';
-
+import { openStoreConnection } from '../store';
 import { check, guardCheck } from './_check';
 import type { HealthCheck } from './claude-slots';
 
@@ -11,7 +10,7 @@ export default check('claude:oauth-client');
  */
 export function claudeOauthClientCheck(dbPath: string): HealthCheck {
   return guardCheck('claude:oauth-client', () => {
-    const db = new DatabaseSync(dbPath, { readOnly: true });
+    const db = openStoreConnection(dbPath, true);
     try {
       const rows = db.prepare(`
         SELECT account_id AS accountId FROM usage_polls

@@ -1,6 +1,5 @@
-import { DatabaseSync } from 'node:sqlite';
-
 import { redactSecrets } from './redact';
+import { openStoreConnection } from './store';
 
 export const RELOGIN_KINDS = ['dead', 'healed', 'wiped', 'identity-replaced', 'external-login'] as const;
 export type ReloginKind = (typeof RELOGIN_KINDS)[number];
@@ -61,7 +60,7 @@ export function reloginsInWindow(dbPath: string, window: ReloginWindow): Relogin
   if (!Number.isFinite(window.start) || !Number.isFinite(window.end) || window.end < window.start) {
     throw new Error('invalid relogin window');
   }
-  const db = new DatabaseSync(dbPath, { readOnly: true });
+  const db = openStoreConnection(dbPath, true);
   try {
     return db.prepare(`
       SELECT id, ts, provider, account_id AS accountId, kind, detail, evidence, user_denied_at AS userDeniedAt

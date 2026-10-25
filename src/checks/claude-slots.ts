@@ -1,5 +1,4 @@
-import { DatabaseSync } from 'node:sqlite';
-
+import { openStoreConnection } from '../store';
 import { check, guardCheck } from './_check';
 
 export default check('claude:slots');
@@ -16,10 +15,13 @@ const SLOT_APPLICABLE_PHASES = new Set(['cutting-over', 'cutover', 'retired']);
 
 export function claudeSlotsCheck(dbPath: string, phase: string): HealthCheck {
   return guardCheck('claude:slots', () => {
+    if (phase === 'unknown') {
+      return { name: 'claude:slots', level: 'WARN', message: 'lifecycle phase unavailable; Claude slots cannot be evaluated' };
+    }
     if (!SLOT_APPLICABLE_PHASES.has(phase)) {
       return { name: 'claude:slots', level: 'N/A', message: `not applicable in phase=${phase}` };
     }
-    const db = new DatabaseSync(dbPath, { readOnly: true });
+    const db = openStoreConnection(dbPath, true);
     try {
       const dead = (db.prepare(`
         SELECT account_id AS accountId, dead_reason AS reason

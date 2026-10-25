@@ -1,10 +1,13 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync } from 'node:fs';
+import { mkdirSync, mkdtempSync } from 'node:fs';
+import { spawn } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { describe, it } from 'node:test';
 
+import { defaultConfig } from '../src/config';
+import { doctorQlb } from '../src/diagnostics';
 import { appendHealthLog, listHealthLog } from '../src/health-log';
 import { listReloginEvents, recordRelogin, reloginsInWindow } from '../src/relogin';
 import { autoBreakerCheck } from '../src/checks/auto-breaker';
@@ -65,7 +68,7 @@ describe('A7 doctor health primitives', () => {
         lifecyclePhaseCheck(dbPath),
         relogin7dCheck(dbPath, 'cutover'),
       ];
-      assert.deepEqual(results.map((result) => result.level), ['FAIL', 'FAIL', 'FAIL', 'FAIL', 'FAIL', 'FAIL']);
+      assert.deepEqual(results.map((result) => result.level), ['FAIL', 'FAIL', 'FAIL', 'FAIL', 'WARN', 'FAIL']);
     });
   });
 
@@ -75,12 +78,84 @@ describe('A7 doctor health primitives', () => {
     db.close();
 
     assert.doesNotThrow(() => assert.equal(claudeSlotsCheck(dbPath, 'cutover').level, 'FAIL'));
-    assert.doesNotThrow(() => assert.equal(lifecyclePhaseCheck(dbPath).level, 'FAIL'));
+    assert.doesNotThrow(() => assert.equal(lifecyclePhaseCheck(dbPath).level, 'WARN'));
     assert.doesNotThrow(() => assert.deepEqual(relogin7dCheck(dbPath, 'cutover', Number.NaN), {
       name: 'relogin:7d',
       level: 'FAIL',
       message: 'check failed: invalid relogin window',
     }));
+  });
+
+  it('runs every A7 check in doctor rather than synthesizing a host placeholder', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-a7-runtime-'));
+    const config = defaultConfig(home);
+    const store = openStore(config.dbPath);
+    store.setConfig('auto.anthropic.suspendedUntil', String(Date.now() + 60_000));
+    recordRelogin(store, { ts: Date.now(), provider: 'anthropic', accountId: 'claude-dead', kind: 'healed' });
+    store.close();
+    write(config.dbPath, "INSERT INTO lifecycle (state, began_at) VALUES ('cutover', ?)", Date.now());
+    write(config.dbPath, "INSERT INTO claude_slots (account_id, config_json, dead, dead_reason, added_at) VALUES (?, '{}', 1, 'invalid_grant', ?)", 'claude-dead', Date.now());
+
+    const report = await doctorQlb(config, { command: () => '', hostCommand: () => '' });
+    const a7Rows = ['auto:anthropic:breaker', 'claude:oauth-client', 'claude:slots', 'codex:slots', 'lifecycle:phase', 'relogin:7d']
+      .map((name) => report.checks.find((check) => check.name === name));
+    assert.ok(a7Rows.every((check) => check != null));
+    assert.ok(a7Rows.every((check) => check?.message !== 'not applicable on this host'));
+    assert.equal(report.checks.find((check) => check.name === 'auto:anthropic:breaker')?.level, 'FAIL');
+    assert.equal(report.checks.find((check) => check.name === 'claude:slots')?.level, 'FAIL');
+    assert.equal(report.checks.find((check) => check.name === 'relogin:7d')?.level, 'FAIL');
+
+    const healthyHome = mkdtempSync(join(tmpdir(), 'qlb-doctor-a7-healthy-'));
+    const healthyConfig = defaultConfig(healthyHome);
+    const healthyStore = openStore(healthyConfig.dbPath);
+    healthyStore.close();
+    write(healthyConfig.dbPath, "INSERT INTO lifecycle (state, began_at) VALUES ('cutover', ?)", Date.now());
+    const healthy = await doctorQlb(healthyConfig, { command: () => '', hostCommand: () => '' });
+    for (const name of ['auto:anthropic:breaker', 'claude:oauth-client', 'claude:slots', 'codex:slots', 'lifecycle:phase', 'relogin:7d']) {
+      const check = healthy.checks.find((row) => row.name === name);
+      assert.equal(check?.level, 'PASS');
+      assert.notEqual(check?.message, 'not applicable on this host');
+    }
+  });
+
+  it('reports all A7 checks without PASS when the store is missing or pre-v5', async () => {
+    for (const makeConfig of [
+      () => defaultConfig(mkdtempSync(join(tmpdir(), 'qlb-doctor-a7-missing-'))),
+      () => {
+        const config = defaultConfig(mkdtempSync(join(tmpdir(), 'qlb-doctor-a7-old-')));
+        mkdirSync(dirname(config.dbPath), { recursive: true });
+        const db = new DatabaseSync(config.dbPath);
+        db.close();
+        return config;
+      },
+    ]) {
+      const report = await doctorQlb(makeConfig(), { command: () => '', hostCommand: () => '' });
+      for (const name of ['auto:anthropic:breaker', 'claude:oauth-client', 'claude:slots', 'codex:slots', 'lifecycle:phase', 'relogin:7d']) {
+        const check = report.checks.find((row) => row.name === name);
+        assert.ok(check, `${name} missing from report`);
+        assert.notEqual(check.level, 'PASS', `${name} must not pass without a v5 store`);
+      }
+    }
+  });
+
+  it('waits for a brief writer lock before appending the health snapshot', { timeout: 10_000 }, async () => {
+    const dbPath = fixture();
+    const holder = spawn(process.execPath, ['--disable-warning=ExperimentalWarning', '-e', `
+      const { DatabaseSync } = require('node:sqlite');
+      const db = new DatabaseSync(process.argv[1]);
+      db.exec('PRAGMA busy_timeout = 5000');
+      db.exec('BEGIN IMMEDIATE');
+      process.stdout.write('ready\\n');
+      setTimeout(() => { db.exec('COMMIT'); db.close(); }, 150);
+    `, dbPath], { stdio: ['ignore', 'pipe', 'pipe'] });
+    await new Promise<void>((resolve, reject) => {
+      holder.stdout.once('data', () => resolve());
+      holder.once('error', reject);
+      holder.once('exit', (code) => reject(new Error(`lock holder exited early: ${code}`)));
+    });
+    appendHealthLog(dbPath, { phase: 'cutover', overall: 'PASS', failing: [], deadSlots: [] });
+    await new Promise<void>((resolve, reject) => holder.once('exit', (code) => code === 0 ? resolve() : reject(new Error(`lock holder exit: ${code}`))));
+    assert.equal(listHealthLog(dbPath).length, 1);
   });
 
   it('records, windows, and redacts relogin events', () => {

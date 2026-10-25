@@ -1,5 +1,4 @@
-import { DatabaseSync } from 'node:sqlite';
-
+import { openStoreConnection } from '../store';
 import { check, guardCheck } from './_check';
 import type { HealthCheck } from './claude-slots';
 
@@ -8,7 +7,7 @@ export default check('auto', 'auto');
 /** S14: an unexpired suspension is a doctor failure and is never extended by doctor. */
 export function autoBreakerCheck(dbPath: string, provider: string, now: number = Date.now()): HealthCheck {
   return guardCheck(`auto:${provider}:breaker`, () => {
-    const db = new DatabaseSync(dbPath, { readOnly: true });
+    const db = openStoreConnection(dbPath, true);
     try {
       const row = db.prepare('SELECT value FROM config WHERE key = ?').get(`auto.${provider}.suspendedUntil`) as
         | { value: string }

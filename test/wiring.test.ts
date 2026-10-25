@@ -92,6 +92,15 @@ describe('command and diagnostic wiring', () => {
       return definition.name;
     });
     assert.deepEqual(emitted, JSON.parse(listed.stdout));
+    // A7 definitions must be backed by doctor execution, not reconciliation's
+    // generic synthetic PASS row when this fixture has no store.
+    for (const name of ['auto:anthropic:breaker', 'claude:oauth-client', 'claude:slots', 'codex:slots', 'lifecycle:phase', 'relogin:7d']) {
+      const check = (JSON.parse(report.stdout) as { checks: Array<{ name: string; level: string; message: string }> }).checks
+        .find((row) => row.name === name);
+      assert.ok(check, `missing executed A7 diagnostic: ${name}`);
+      assert.notEqual(check.message, 'not applicable on this host');
+      assert.notEqual(check.level, 'PASS');
+    }
   });
 
   it('keeps a QLB-owned account mapped to the native-sync prefix diagnostic', async () => {
