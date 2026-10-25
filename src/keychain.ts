@@ -254,9 +254,12 @@ export function readNativeOpenRouterKey(
       if (key.length > 0) return key;
     } catch (err) {
       if (isSecurityTimeout(err)) throw securityTimeoutError('find-generic-password');
-      // `security` reports an absent generic-password item with this stable
-      // wording. A denial or other operational failure is not a miss.
-      if (!(err instanceof Error) || !/(could not be found|item not found)/i.test(err.message)) throw err;
+      // `security` uses errSecItemNotFound (44) for a missing item. stderr is
+      // intentionally discarded here, so its stable wording is only a
+      // secondary signal; a denial or other failure must remain operational.
+      const status = typeof err === 'object' && err !== null ? (err as { status?: unknown }).status : undefined;
+      const message = typeof err === 'object' && err !== null ? (err as { message?: unknown }).message : undefined;
+      if (status !== 44 && !(typeof message === 'string' && /(could not be found|item not found)/i.test(message))) throw err;
     }
     throw new NativeOpenRouterKeyNotFoundError(service);
   }

@@ -1,8 +1,8 @@
 // Pi single-provider credential migration (S28, S49, S58, S63).
 // Credential bytes live only in the Keychain and the 0600 baseline file.
 
-import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, utimesSync } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
+import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { execFileSync } from 'node:child_process';
 
@@ -44,7 +44,7 @@ function asObject(value: unknown, message: string): JsonObject { if (!value || t
 function readAuth(path: string): JsonObject { return existsSync(path) ? asObject(JSON.parse(readFileSync(path, 'utf8')), 'Pi auth.json is not an object') : {}; }
 function readOwner(path: string): JsonObject { if (!existsSync(path)) return { providers: {} }; const owner = asObject(JSON.parse(readFileSync(path, 'utf8')), 'Pi owner file is not an object'); if (!owner.providers || typeof owner.providers !== 'object' || Array.isArray(owner.providers)) throw new Error('Pi owner file is malformed'); return owner; }
 function writeJson(path: string, value: unknown): void { mkdirSync(dirname(path), { recursive: true, mode: 0o700 }); atomicWriteText(path, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 }); }
-function writeJournal(path: string, journal: Journal, refresh?: () => void): void { mkdirSync(dirname(path), { recursive: true, mode: 0o700 }); atomicWriteText(path, `${JSON.stringify(journal)}\n`, { mode: 0o600 }); refresh?.(); }
+function writeJournal(path: string, journal: Journal, refresh?: () => void): void { refresh?.(); mkdirSync(dirname(path), { recursive: true, mode: 0o700 }); atomicWriteText(path, `${JSON.stringify(journal)}\n`, { mode: 0o600 }); }
 function journalPath(paths: PiMigratePaths, provider: PiSingleProvider): string { return join(paths.journalPath, `pi-migrate-${provider}.json`); }
 function baselinePath(paths: PiMigratePaths, provider: PiSingleProvider): string { return join(paths.baselineDir, `${provider}.json`); }
 function readJournal(paths: PiMigratePaths, provider: PiSingleProvider): Journal | null { const path = journalPath(paths, provider); if (!existsSync(path)) return null; const parsed = asObject(JSON.parse(readFileSync(path, 'utf8')), 'Pi migration journal is malformed'); const phases: JournalPhase[] = ['started', 'baseline', 'credential-saved', 'published', 'committed']; if (parsed.provider !== provider || typeof parsed.phase !== 'string' || !phases.includes(parsed.phase as JournalPhase)) throw new Error('Pi migration journal is malformed'); return { provider, phase: parsed.phase as JournalPhase, ownerPid: Number(parsed.ownerPid) || 0, updatedAt: Number(parsed.updatedAt) || 0 }; }
@@ -57,24 +57,54 @@ export function isPiPlaceholder(entry: unknown): boolean { return !!entry && typ
 
 function sleepSync(ms: number): void { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); }
 function lockedError(): Error { return Object.assign(new Error('pi-auth-locked'), { code: 'pi-auth-locked', name: 'PiAuthLockedError' }); }
+function lockLostError(): Error { return Object.assign(new Error('lock-lost'), { code: 'pi-auth-lock-lost', name: 'PiAuthLockLostError' }); }
+interface AuthLockOwner { pid: number; nonce: string; }
+function lockOwnerPath(lock: string): string { return join(lock, 'qlb-lock-owner.json'); }
+function readLockOwner(lock: string): AuthLockOwner | null {
+  try {
+    const parsed = JSON.parse(readFileSync(lockOwnerPath(lock), 'utf8')) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+    const { pid, nonce } = parsed as { pid?: unknown; nonce?: unknown };
+    return typeof pid === 'number' && Number.isInteger(pid) && pid > 0 && typeof nonce === 'string' && nonce.length > 0 ? { pid, nonce } : null;
+  } catch { return null; }
+}
+function ownerMatches(lock: string, owner: AuthLockOwner): boolean {
+  const actual = readLockOwner(lock);
+  return actual?.pid === owner.pid && actual.nonce === owner.nonce;
+}
+function ownerIsDead(owner: AuthLockOwner): boolean {
+  try { process.kill(owner.pid, 0); return false; } catch (error) { return (error as NodeJS.ErrnoException).code === 'ESRCH'; }
+}
+function canTakeOverStaleLock(lock: string, staleMs: number): boolean {
+  try {
+    if (Date.now() - statSync(lock).mtimeMs <= staleMs) return false;
+    const owner = readLockOwner(lock);
+    return owner === null || ownerIsDead(owner);
+  } catch { return false; }
+}
 function defaultAuthLock<T>(authPath: string, fn: (refresh: () => void) => T, timing: AuthLockTiming = {}): T {
   const lock = `${authPath}.lock`; const staleMs = timing.staleMs ?? 10_000; const retries = timing.retries ?? 20; const retryMs = timing.retryMs ?? 250;
+  const owner: AuthLockOwner = { pid: process.pid, nonce: randomUUID() };
   let acquired = false;
   for (let attempt = 0; attempt <= retries; attempt += 1) {
-    try { mkdirSync(lock, { recursive: false, mode: 0o700 }); acquired = true; break; } catch (error) {
+    try {
+      mkdirSync(lock, { recursive: false, mode: 0o700 });
+      writeFileSync(lockOwnerPath(lock), `${JSON.stringify(owner)}\n`, { mode: 0o600 });
+      acquired = true;
+      break;
+    } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-      try {
-        if (Date.now() - statSync(lock).mtimeMs > staleMs) {
-          rmSync(lock, { recursive: true, force: true });
-          try { mkdirSync(lock, { recursive: false, mode: 0o700 }); acquired = true; break; } catch { continue; }
-        }
-      } catch { continue; }
-      if (attempt === retries) throw lockedError(); sleepSync(retryMs);
+      if (canTakeOverStaleLock(lock, staleMs)) { rmSync(lock, { recursive: true, force: true }); attempt -= 1; continue; }
+      if (attempt === retries) throw lockedError();
+      sleepSync(retryMs);
     }
   }
   if (!acquired) throw lockedError();
-  const refresh = () => utimesSync(lock, new Date(), new Date());
-  try { refresh(); return fn(refresh); } finally { rmSync(lock, { recursive: true, force: true }); }
+  const refresh = () => {
+    if (!ownerMatches(lock, owner)) throw lockLostError();
+    utimesSync(lock, new Date(), new Date());
+  };
+  try { refresh(); return fn(refresh); } finally { if (ownerMatches(lock, owner)) rmSync(lock, { recursive: true, force: true }); }
 }
 
 /** Resolve symlinks even for a not-yet-created leaf, then probe its real parent. */
@@ -107,32 +137,48 @@ export function migratePiSingleProvider(provider: PiSingleProvider, paths: PiMig
   if (options.dryRun) return { provider, state: 'migrated', resumed: existing !== null, wouldWrite };
   checkPaths(paths, deps);
   const lock = deps.withAuthLock ?? ((path, fn) => defaultAuthLock(path, fn, deps.authLockTiming));
-  let journal = existing ?? { provider, phase: 'started' as JournalPhase, ownerPid: process.pid, updatedAt: Date.now() }; let migrated = false; let notApplicable = false;
+  let journal = existing ?? { provider, phase: 'started' as JournalPhase, ownerPid: process.pid, updatedAt: Date.now() };
+  let state: PiMigrateResult['state'] = 'not-applicable';
   lock(paths.authJsonPath, (refresh) => {
     if (!existing) updatePhase(paths, provider, 'started', refresh);
     const auth = readAuth(paths.authJsonPath); const currentOwner = readOwner(paths.ownerPath);
-    if (!existing && (provider === 'openrouter' || isPiPlaceholder(auth[provider])) && (currentOwner.providers as JsonObject)[provider]) { migrated = true; return; }
-    let baseline: unknown; const baselineFile = baselinePath(paths, provider);
-    if (phaseAtLeast(journal.phase, 'baseline') && existsSync(baselineFile)) baseline = JSON.parse(readFileSync(baselineFile, 'utf8'));
-    else { baseline = baselineValue(provider, auth, deps); if (baseline === undefined) { notApplicable = true; return; } writeJson(baselineFile, baseline); updatePhase(paths, provider, 'baseline', refresh); journal = { ...journal, phase: 'baseline' }; deps.afterWrite?.('baseline'); }
-    if (provider !== 'openrouter' && phaseAtLeast(journal.phase, 'published') && !isPiPlaceholder(auth[provider])) throw new Error(`Pi ${provider} entry changed after publication`);
-    if (!phaseAtLeast(journal.phase, 'published')) {
-      let source: unknown = provider === 'openrouter' ? baseline : (isPiPlaceholder(auth[provider]) || auth[provider] === undefined ? baseline : auth[provider]);
-      if (provider !== 'openrouter' && source !== baseline) { try { keychainPayload(provider, source); } catch { source = baseline; } }
-      // Validate before refreshing a pre-publication baseline: malformed or absent Pi data must never clobber it.
-      const payload = keychainPayload(provider, source);
-      if (provider !== 'openrouter' && source !== baseline) { writeJson(baselineFile, source); baseline = source; }
-      refresh(); deps.keychain.setSync(managedService(provider), QLB_KEYCHAIN_ACCOUNT, payload); refresh();
-      const verified = deps.keychain.getSync(managedService(provider), QLB_KEYCHAIN_ACCOUNT); if (verified !== payload) throw new Error('managed credential verification failed');
-      if (!phaseAtLeast(journal.phase, 'credential-saved')) { updatePhase(paths, provider, 'credential-saved', refresh); journal = { ...journal, phase: 'credential-saved' }; deps.afterWrite?.('credential-saved'); }
-      if (provider !== 'openrouter') { auth[provider] = piPlaceholder(); writeJson(paths.authJsonPath, auth); refresh(); deps.afterWrite?.('placeholder'); }
+    if (!existing && (provider === 'openrouter' || isPiPlaceholder(auth[provider])) && (currentOwner.providers as JsonObject)[provider]) {
+      state = 'migrated';
+    } else {
+      let baseline: unknown; const baselineFile = baselinePath(paths, provider);
+      if (phaseAtLeast(journal.phase, 'baseline') && existsSync(baselineFile)) baseline = JSON.parse(readFileSync(baselineFile, 'utf8'));
+      else {
+        baseline = baselineValue(provider, auth, deps);
+        if (baseline === undefined) {
+          refresh(); deps.store?.setConfig(`pi.${provider}.state`, 'not-applicable');
+          updatePhase(paths, provider, 'committed', refresh); refresh(); rmSync(journalPath(paths, provider), { force: true });
+          return;
+        }
+        refresh(); writeJson(baselineFile, baseline); updatePhase(paths, provider, 'baseline', refresh); journal = { ...journal, phase: 'baseline' }; deps.afterWrite?.('baseline');
+      }
+      if (provider !== 'openrouter' && phaseAtLeast(journal.phase, 'published') && !isPiPlaceholder(auth[provider])) throw new Error(`Pi ${provider} entry changed after publication`);
+      if (!phaseAtLeast(journal.phase, 'published')) {
+        let source: unknown = provider === 'openrouter' ? baseline : (isPiPlaceholder(auth[provider]) || auth[provider] === undefined ? baseline : auth[provider]);
+        if (provider !== 'openrouter' && source !== baseline) { try { keychainPayload(provider, source); } catch { source = baseline; } }
+        const payload = keychainPayload(provider, source);
+        if (provider !== 'openrouter' && source !== baseline) { refresh(); writeJson(baselineFile, source); baseline = source; }
+        refresh(); deps.keychain.setSync(managedService(provider), QLB_KEYCHAIN_ACCOUNT, payload); refresh();
+        const verified = deps.keychain.getSync(managedService(provider), QLB_KEYCHAIN_ACCOUNT); if (verified !== payload) throw new Error('managed credential verification failed');
+        if (!phaseAtLeast(journal.phase, 'credential-saved')) { updatePhase(paths, provider, 'credential-saved', refresh); journal = { ...journal, phase: 'credential-saved' }; deps.afterWrite?.('credential-saved'); }
+        if (provider !== 'openrouter') { auth[provider] = piPlaceholder(); refresh(); writeJson(paths.authJsonPath, auth); refresh(); deps.afterWrite?.('placeholder'); }
+      }
+      refresh(); writeJson(paths.ownerPath, ownerFor(provider, currentOwner)); refresh(); deps.afterWrite?.('owner-entry'); updatePhase(paths, provider, 'published', refresh); journal = { ...journal, phase: 'published' }; state = 'migrated';
     }
-    writeJson(paths.ownerPath, ownerFor(provider, currentOwner)); refresh(); deps.afterWrite?.('owner-entry'); updatePhase(paths, provider, 'published', refresh); journal = { ...journal, phase: 'published' }; migrated = true;
+    if (state !== 'migrated') return;
+    const managed = deps.keychain.getSync(managedService(provider), QLB_KEYCHAIN_ACCOUNT); const parsed = JSON.parse(managed) as { refresh?: string; access?: string }; const lineage = fingerprint(typeof parsed.refresh === 'string' && parsed.refresh ? parsed.refresh : String(parsed.access ?? ''));
+    refresh(); deps.store?.upsertAccount(`${provider}-default`, provider, provider, 'active');
+    refresh(); deps.store?.recordLineage({ provider, accountId: 'default', toFp: lineage, cause: 'import', by: 'qlb-cli', evidence: 'import' });
+    refresh(); deps.store?.setConfig(`single.${provider}.activeId`, 'default');
+    refresh(); deps.store?.setConfig(`pi.${provider}.state`, 'migrated');
+    refresh(); deps.store?.setConfig(`pi.${provider}.migratedAt`, String(Date.now()));
+    deps.afterWrite?.('before-committed'); updatePhase(paths, provider, 'committed', refresh); refresh(); rmSync(journalPath(paths, provider), { force: true });
   });
-  if (notApplicable) { deps.store?.setConfig(`pi.${provider}.state`, 'not-applicable'); updatePhase(paths, provider, 'committed'); rmSync(journalPath(paths, provider), { force: true }); return { provider, state: 'not-applicable', resumed: existing !== null, wouldWrite }; }
-  if (!migrated) return { provider, state: 'not-applicable', resumed: existing !== null, wouldWrite };
-  const managed = deps.keychain.getSync(managedService(provider), QLB_KEYCHAIN_ACCOUNT); const parsed = JSON.parse(managed) as { refresh?: string; access?: string }; const lineage = fingerprint(typeof parsed.refresh === 'string' && parsed.refresh ? parsed.refresh : String(parsed.access ?? ''));
-  deps.store?.upsertAccount(`${provider}-default`, provider, provider, 'active'); deps.store?.recordLineage({ provider, accountId: 'default', toFp: lineage, cause: 'import', by: 'qlb-cli', evidence: 'import' }); deps.store?.setConfig(`single.${provider}.activeId`, 'default'); deps.store?.setConfig(`pi.${provider}.state`, 'migrated'); deps.store?.setConfig(`pi.${provider}.migratedAt`, String(Date.now())); deps.afterWrite?.('before-committed'); updatePhase(paths, provider, 'committed'); rmSync(journalPath(paths, provider), { force: true }); return { provider, state: 'migrated', resumed: existing !== null, wouldWrite };
+  return { provider, state, resumed: existing !== null, wouldWrite };
 }
 
 /** S49 rollback for P7a's xai/kimi/openrouter subset. */
@@ -140,19 +186,33 @@ export function rollbackPiSingleProvider(provider: PiSingleProvider, paths: PiMi
   assertPiSingleProvider(provider); checkPaths(paths, deps);
   const lock = deps.withAuthLock ?? ((path, fn) => defaultAuthLock(path, fn, deps.authLockTiming));
   lock(paths.authJsonPath, (refresh) => {
-    const owner = readOwner(paths.ownerPath); const providers = { ...(owner.providers as JsonObject) }; delete providers[provider]; writeJson(paths.ownerPath, { providers }); refresh(); deps.afterWrite?.('owner-entry'); // S49 first, within the same lock.
     const baselineFile = baselinePath(paths, provider); const baseline = existsSync(baselineFile) ? JSON.parse(readFileSync(baselineFile, 'utf8')) : undefined;
-    const journal = readJournal(paths, provider); const managed = provider === 'openrouter' ? undefined : managedValue(provider, deps);
-    if (provider !== 'openrouter') {
-      const auth = readAuth(paths.authJsonPath); const current = auth[provider];
-      // Never replace a credential Pi has freshly acquired after the migration.
-      if ((current === undefined || isPiPlaceholder(current)) && (baseline !== undefined || managed !== undefined)) {
-        const saved = (journal && phaseAtLeast(journal.phase, 'credential-saved')) || (isPiPlaceholder(current) && managed !== undefined);
-        auth[provider] = saved && managed !== undefined ? managed : baseline;
-        writeJson(paths.authJsonPath, auth); refresh();
+    const managed = provider === 'openrouter' ? undefined : managedValue(provider, deps);
+    const auth = provider === 'openrouter' ? undefined : readAuth(paths.authJsonPath);
+    const current = auth?.[provider]; const needsRestore = provider !== 'openrouter' && (current === undefined || isPiPlaceholder(current));
+    let restore: unknown;
+    if (needsRestore) {
+      const usableManaged = managed !== undefined && (() => { try { keychainPayload(provider, managed); return true; } catch { return false; } })();
+      const usableBaseline = baseline !== undefined && (() => { try { keychainPayload(provider, baseline); return true; } catch { return false; } })();
+      restore = usableManaged ? managed : usableBaseline ? baseline : undefined;
+      if (restore === undefined) throw new Error(`no managed or baseline ${provider} credential available for rollback`);
+    }
+    const owner = readOwner(paths.ownerPath); const providers = { ...(owner.providers as JsonObject) }; delete providers[provider];
+    refresh(); writeJson(paths.ownerPath, { providers }); refresh(); deps.afterWrite?.('owner-entry');
+    let managedRestored = false;
+    if (needsRestore && auth) {
+      auth[provider] = restore; refresh(); writeJson(paths.authJsonPath, auth); refresh();
+      if (JSON.stringify(readAuth(paths.authJsonPath)[provider]) !== JSON.stringify(restore)) throw new Error('Pi credential rollback verification failed');
+      managedRestored = restore === managed;
+    }
+    if (provider === 'openrouter' || managedRestored) {
+      refresh();
+      try { deps.keychain.deleteSync(managedService(provider), QLB_KEYCHAIN_ACCOUNT); } catch (error) {
+        if (!(error instanceof Error) || !/item not found$/i.test(error.message)) throw error;
       }
     }
-    try { refresh(); deps.keychain.deleteSync(managedService(provider), QLB_KEYCHAIN_ACCOUNT); } catch { /* absent is already rolled back */ }
+    refresh(); deps.store?.setConfig(`pi.${provider}.state`, ''); refresh(); deps.store?.setConfig(`pi.${provider}.migratedAt`, '');
+    refresh(); rmSync(journalPath(paths, provider), { force: true });
   });
-  deps.store?.setConfig(`pi.${provider}.state`, ''); deps.store?.setConfig(`pi.${provider}.migratedAt`, ''); rmSync(journalPath(paths, provider), { force: true }); return { provider, state: 'migrated', resumed: false, wouldWrite: [] };
+  return { provider, state: 'migrated', resumed: false, wouldWrite: [] };
 }

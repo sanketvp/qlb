@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
-import { MockKeychain, NativeOpenRouterKeyNotFoundError, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from '../src/keychain';
+import { markFakeExecutor, MockKeychain, NativeOpenRouterKeyNotFoundError, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, readNativeOpenRouterKey, type ExecFileSyncFn } from '../src/keychain';
 import {
   defaultPiMigratePaths,
   migratePiSingleProvider,
@@ -166,16 +166,59 @@ describe('Pi migration S58 credential-first barrier', () => {
     } finally { h.cleanup(); }
   });
 
-  it('recovers stale auth locks and rejects fresh ones for migrate and rollback', () => {
+  it('classifies only a darwin security status 44 native miss as not-applicable', () => {
     const h = setup();
     try {
-      const lock = `${h.paths.authJsonPath}.lock`;
-      mkdirSync(lock); utimesSync(lock, new Date(Date.now() - 2_000), new Date(Date.now() - 2_000));
-      assert.equal(migratePiSingleProvider('xai', h.paths, { keychain: h.keychain, authLockTiming: { staleMs: 10, retries: 0, retryMs: 1 } }).state, 'migrated');
-      mkdirSync(lock); assert.throws(() => rollbackPiSingleProvider('xai', h.paths, { keychain: h.keychain, authLockTiming: { staleMs: 60_000, retries: 0, retryMs: 1 } }), (error: unknown) => (error as { code?: string }).code === 'pi-auth-locked');
+      const config = new Map<string, string>();
+      const store = { setConfig(key: string, value: string) { config.set(key, value); }, recordLineage() { return 0; }, upsertAccount() {} };
+      const missingExec: ExecFileSyncFn = markFakeExecutor((() => {
+        throw { message: 'Command failed: /usr/bin/security find-generic-password -s pi-openrouter -w', status: 44, stderr: null };
+      }) as ExecFileSyncFn);
+      const result = migratePiSingleProvider('openrouter', h.paths, {
+        keychain: h.keychain,
+        store,
+        readNativeOpenRouterKey: () => readNativeOpenRouterKey('pi-openrouter', missingExec, 'darwin'),
+      });
+      assert.equal(result.state, 'not-applicable');
+      assert.equal(config.get('pi.openrouter.state'), 'not-applicable');
+
+      const failureExec: ExecFileSyncFn = markFakeExecutor((() => {
+        throw { message: 'Command failed: /usr/bin/security find-generic-password -s pi-openrouter -w', status: 1, stderr: null };
+      }) as ExecFileSyncFn);
+      config.clear();
+      assert.throws(() => migratePiSingleProvider('openrouter', h.paths, {
+        keychain: h.keychain,
+        store,
+        readNativeOpenRouterKey: () => readNativeOpenRouterKey('pi-openrouter', failureExec, 'darwin'),
+      }), (error: unknown) => (error as { status?: number }).status === 1);
+      assert.equal(config.size, 0);
+    } finally { h.cleanup(); }
+  });
+
+  it('takes over only stale locks whose recorded owner is dead and never releases a foreign lock', () => {
+    const h = setup();
+    try {
+      const lock = `${h.paths.authJsonPath}.lock`; const owner = join(lock, 'qlb-lock-owner.json');
+      mkdirSync(lock); writeFileSync(owner, JSON.stringify({ pid: process.pid, nonce: 'alive' }));
+      utimesSync(lock, new Date(Date.now() - 2_000), new Date(Date.now() - 2_000));
+      assert.throws(() => migratePiSingleProvider('xai', h.paths, { keychain: h.keychain, authLockTiming: { staleMs: 10, retries: 0, retryMs: 1 } }), (error: unknown) => (error as { code?: string }).code === 'pi-auth-locked');
       rmSync(lock, { recursive: true });
-      mkdirSync(lock); utimesSync(lock, new Date(Date.now() - 2_000), new Date(Date.now() - 2_000));
-      assert.doesNotThrow(() => rollbackPiSingleProvider('xai', h.paths, { keychain: h.keychain, authLockTiming: { staleMs: 10, retries: 0, retryMs: 1 } }));
+
+      mkdirSync(lock); writeFileSync(owner, JSON.stringify({ pid: 999_999, nonce: 'dead' }));
+      utimesSync(lock, new Date(Date.now() - 2_000), new Date(Date.now() - 2_000));
+      assert.equal(migratePiSingleProvider('xai', h.paths, {
+        keychain: h.keychain,
+        authLockTiming: { staleMs: 10, retries: 0, retryMs: 1 },
+      }).state, 'migrated');
+
+      assert.throws(() => rollbackPiSingleProvider('xai', h.paths, {
+        keychain: h.keychain,
+        afterWrite: (point) => {
+          if (point === 'owner-entry') writeFileSync(owner, JSON.stringify({ pid: process.pid, nonce: 'foreign' }));
+        },
+      }), /lock-lost/);
+      assert.equal(existsSync(lock), true, 'a superseded holder must leave the new owner lock intact');
+      assert.deepEqual(JSON.parse(readFileSync(owner, 'utf8')), { pid: process.pid, nonce: 'foreign' });
     } finally { h.cleanup(); }
   });
 
@@ -188,6 +231,69 @@ describe('Pi migration S58 credential-first barrier', () => {
       migratePiSingleProvider('xai', h.paths, { keychain: h.keychain });
       assert.equal(readFileSync(baseline).equals(before), true);
       assert.equal(placeholderPresent(h.paths, 'xai'), true);
+    } finally { h.cleanup(); }
+  });
+
+  it('restores the current managed credential when Pi entry is absent after a committed migration', () => {
+    const h = setup();
+    try {
+      migratePiSingleProvider('xai', h.paths, { keychain: h.keychain });
+      const rotated = oauth('managed-new');
+      h.keychain.setSync(qlbKeychainService('xai', 'default'), QLB_KEYCHAIN_ACCOUNT, JSON.stringify(rotated));
+      writeFileSync(h.paths.authJsonPath, '{}');
+      rollbackPiSingleProvider('xai', h.paths, { keychain: h.keychain });
+      assert.deepEqual(JSON.parse(readFileSync(h.paths.authJsonPath, 'utf8')).xai, rotated);
+      assert.equal(hasManaged(h.keychain, 'xai'), false);
+    } finally { h.cleanup(); }
+  });
+
+  it('falls back to the baseline only when the managed credential is absent', () => {
+    const h = setup();
+    try {
+      const baseline = JSON.parse(readFileSync(h.paths.authJsonPath, 'utf8')).xai;
+      migratePiSingleProvider('xai', h.paths, { keychain: h.keychain });
+      h.keychain.deleteSync(qlbKeychainService('xai', 'default'), QLB_KEYCHAIN_ACCOUNT);
+      writeFileSync(h.paths.authJsonPath, '{}');
+      rollbackPiSingleProvider('xai', h.paths, { keychain: h.keychain });
+      assert.deepEqual(JSON.parse(readFileSync(h.paths.authJsonPath, 'utf8')).xai, baseline);
+    } finally { h.cleanup(); }
+  });
+
+  it('refuses rollback without deleting anything when neither credential source is usable', () => {
+    const h = setup();
+    try {
+      migratePiSingleProvider('xai', h.paths, { keychain: h.keychain });
+      h.keychain.setSync(qlbKeychainService('xai', 'default'), QLB_KEYCHAIN_ACCOUNT, '{}');
+      writeFileSync(join(h.paths.baselineDir, 'xai.json'), '{}');
+      assert.throws(() => rollbackPiSingleProvider('xai', h.paths, { keychain: h.keychain }), /no managed or baseline/);
+      assert.equal(hasManaged(h.keychain, 'xai'), true);
+      const owner = JSON.parse(readFileSync(h.paths.ownerPath, 'utf8')) as { providers: Record<string, unknown> };
+      assert.ok(owner.providers.xai);
+    } finally { h.cleanup(); }
+  });
+
+  it('keeps migration finalization inside the auth lock against rollback', () => {
+    const h = setup();
+    try {
+      const config = new Map<string, string>();
+      const store = { setConfig(key: string, value: string) { config.set(key, value); }, recordLineage() { return 0; }, upsertAccount() {} };
+      migratePiSingleProvider('xai', h.paths, {
+        keychain: h.keychain,
+        store,
+        authLockTiming: { retries: 0, retryMs: 1 },
+        afterWrite: (point) => {
+          if (point === 'before-committed') {
+            assert.throws(() => rollbackPiSingleProvider('xai', h.paths, {
+              keychain: h.keychain,
+              store,
+              authLockTiming: { retries: 0, retryMs: 1 },
+            }), (error: unknown) => (error as { code?: string }).code === 'pi-auth-locked');
+          }
+        },
+      });
+      assert.equal(placeholderPresent(h.paths, 'xai'), true);
+      assert.equal(config.get('pi.xai.state'), 'migrated');
+      assert.equal(hasManaged(h.keychain, 'xai'), true);
     } finally { h.cleanup(); }
   });
 
