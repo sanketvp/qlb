@@ -14,7 +14,7 @@ import { autoBreakerCheck } from '../src/checks/auto-breaker';
 import { claudeOauthClientCheck } from '../src/checks/claude-oauth-client';
 import { claudeSlotsCheck } from '../src/checks/claude-slots';
 import { codexSlotsCheck } from '../src/checks/codex-slots';
-import { lifecyclePhase, lifecyclePhaseCheck } from '../src/checks/lifecycle-phase';
+import { LIFECYCLE_STATES, lifecyclePhase, lifecyclePhaseCheck } from '../src/checks/lifecycle-phase';
 import { relogin7dCheck } from '../src/checks/relogin-7d';
 import { openStore } from '../src/store';
 
@@ -61,6 +61,42 @@ describe('A7 doctor health primitives', () => {
 
     assert.equal(claudeSlotsCheck(dbPath, 'pre-cutover').level, 'N/A');
     assert.equal(relogin7dCheck(dbPath, 'pre-cutover').level, 'N/A');
+  });
+
+  it('fails closed for unknown lifecycle states and preserves valid-state behavior', () => {
+    const unknownDbPath = fixture();
+    write(unknownDbPath, "INSERT INTO lifecycle (state, began_at) VALUES ('cutvoer', ?)", Date.now());
+    const unknownPhase = lifecyclePhase(unknownDbPath);
+    assert.deepEqual(lifecyclePhaseCheck(unknownPhase), {
+      name: 'lifecycle:phase',
+      level: 'FAIL',
+      message: 'unknown lifecycle state: cutvoer',
+    });
+    assert.deepEqual(
+      [claudeSlotsCheck(unknownDbPath, unknownPhase.phase), relogin7dCheck(unknownDbPath, unknownPhase.phase)].map((check) => check),
+      [
+        { name: 'claude:slots', level: 'WARN', message: 'cannot evaluate: unknown lifecycle state' },
+        { name: 'relogin:7d', level: 'WARN', message: 'cannot evaluate: unknown lifecycle state' },
+      ],
+    );
+
+    const unprintableDbPath = fixture();
+    write(unprintableDbPath, "INSERT INTO lifecycle (state, began_at) VALUES (?, ?)", 'not printable!', Date.now());
+    assert.deepEqual(lifecyclePhaseCheck(lifecyclePhase(unprintableDbPath)), {
+      name: 'lifecycle:phase',
+      level: 'FAIL',
+      message: 'unknown lifecycle state: <unprintable>',
+    });
+
+    for (const state of LIFECYCLE_STATES) {
+      const dbPath = fixture();
+      write(dbPath, 'INSERT INTO lifecycle (state, began_at) VALUES (?, ?)', state, Date.now());
+      const phase = lifecyclePhase(dbPath);
+      assert.equal(lifecyclePhaseCheck(phase).level, 'PASS');
+      const dependentLevel = ['cutting-over', 'cutover', 'retired'].includes(state) ? 'PASS' : 'N/A';
+      assert.equal(claudeSlotsCheck(dbPath, phase.phase).level, dependentLevel, state);
+      assert.equal(relogin7dCheck(dbPath, phase.phase).level, dependentLevel, state);
+    }
   });
 
   it('converts missing database failures into safe health rows', () => {
@@ -196,7 +232,7 @@ describe('A7 doctor health primitives', () => {
     assert.equal(listHealthLog(dbPath).length, 1);
   });
 
-  it('records, windows, and redacts relogin events', () => {
+  it('records relogin reason codes and evidence fingerprints without raw text', () => {
     const dbPath = fixture();
     const store = openStore(dbPath);
     recordRelogin(store, {
@@ -204,16 +240,35 @@ describe('A7 doctor health primitives', () => {
       provider: 'anthropic',
       accountId: 'claude-dead',
       kind: 'dead',
-      detail: 'Bearer abcdefghijklmnopqrstuvwxyz123456',
+      detail: 'dead',
+      evidence: 'client_secret=abc123xyz&refresh_token=r-xyz',
     });
-    recordRelogin(store, { ts: 2_000, provider: 'anthropic', accountId: 'claude-dead', kind: 'healed' });
+    recordRelogin(store, {
+      ts: 2_000,
+      provider: 'anthropic',
+      accountId: 'claude-dead',
+      kind: 'healed',
+      detail: 'untrusted free text',
+    });
+    assert.throws(
+      () => store.recordRelogin({ provider: 'anthropic', kind: 'dead', detail: 'raw detail', evidence: 'raw evidence' }),
+      /invalid relogin detail code/,
+    );
+    assert.throws(
+      () => store.recordRelogin({ provider: 'anthropic', kind: 'dead', detail: 'dead', evidence: 'raw evidence' }),
+      /invalid relogin evidence fingerprint/,
+    );
     store.close();
 
-    assert.equal(listReloginEvents(dbPath).length, 2);
+    const events = listReloginEvents(dbPath);
+    assert.equal(events.length, 2);
+    assert.equal(events[0]?.detail, 'dead');
+    assert.match(events[0]?.evidence ?? '', /^sha256:[0-9a-f]{16}$/);
+    assert.equal(events[1]?.detail, 'other');
+    assert.doesNotMatch(JSON.stringify(events), /client_secret=abc123xyz|refresh_token=r-xyz/);
     assert.deepEqual(reloginsInWindow(dbPath, { start: 1_500, end: 2_500 }).map((event) => event.kind), ['healed']);
     const active = relogin7dCheck(dbPath, 'cutover', 1_500, 1_000);
     assert.equal(active.level, 'FAIL');
-    assert.doesNotMatch(JSON.stringify(listReloginEvents(dbPath)), /abcdefghijklmnopqrstuvwxyz123456/);
   });
 
   it('treats a healed relogin inside the window as unhealthy', () => {

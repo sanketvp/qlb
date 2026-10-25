@@ -1,10 +1,13 @@
 import { check, guardCheck } from './_check';
 import { reloginsInWindow } from '../relogin';
 import type { HealthCheck } from './claude-slots';
+import { isLifecycleState, LIFECYCLE_STATES } from './lifecycle-phase';
 
 export default check('relogin:7d');
 
-const APPLICABLE_PHASES = new Set(['cutting-over', 'cutover', 'retired']);
+const APPLICABLE_PHASES = new Set<string>(LIFECYCLE_STATES.filter((phase) => (
+  phase === 'cutting-over' || phase === 'cutover' || phase === 'retired'
+)));
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
 
 /** S26/AC17: any non-denied relogin in the current seven-day window is unhealthy. */
@@ -20,6 +23,9 @@ export function relogin7dCheck(
   return guardCheck('relogin:7d', () => {
     if (phase === 'unknown') {
       return { name: 'relogin:7d', level: 'WARN', message: 'lifecycle phase unavailable; relogin window cannot be evaluated' };
+    }
+    if (!isLifecycleState(phase)) {
+      return { name: 'relogin:7d', level: 'WARN', message: 'cannot evaluate: unknown lifecycle state' };
     }
     if (!APPLICABLE_PHASES.has(phase)) {
       return { name: 'relogin:7d', level: 'N/A', message: `not applicable in phase=${phase}` };

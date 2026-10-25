@@ -1,4 +1,5 @@
 import { openStoreConnection } from '../store';
+import { isLifecycleState, LIFECYCLE_STATES } from './lifecycle-phase';
 import { check, guardCheck } from './_check';
 
 export default check('claude:slots');
@@ -11,12 +12,17 @@ export interface HealthCheck {
   detail?: unknown;
 }
 
-const SLOT_APPLICABLE_PHASES = new Set(['cutting-over', 'cutover', 'retired']);
+const SLOT_APPLICABLE_PHASES = new Set<string>(LIFECYCLE_STATES.filter((phase) => (
+  phase === 'cutting-over' || phase === 'cutover' || phase === 'retired'
+)));
 
 export function claudeSlotsCheck(dbPath: string, phase: string): HealthCheck {
   return guardCheck('claude:slots', () => {
     if (phase === 'unknown') {
       return { name: 'claude:slots', level: 'WARN', message: 'lifecycle phase unavailable; Claude slots cannot be evaluated' };
+    }
+    if (!isLifecycleState(phase)) {
+      return { name: 'claude:slots', level: 'WARN', message: 'cannot evaluate: unknown lifecycle state' };
     }
     if (!SLOT_APPLICABLE_PHASES.has(phase)) {
       return { name: 'claude:slots', level: 'N/A', message: `not applicable in phase=${phase}` };

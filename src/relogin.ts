@@ -1,4 +1,4 @@
-import { redactSecrets } from './redact';
+import { reloginEvidenceFingerprint, reloginReasonCode } from './relogin-fields';
 import { openStoreConnection } from './store';
 
 export const RELOGIN_KINDS = ['dead', 'healed', 'wiped', 'identity-replaced', 'external-login'] as const;
@@ -32,7 +32,7 @@ export interface ReloginWindow {
   end: number;
 }
 
-/** Records only the durable, redacted relogin event taxonomy from S26. */
+/** Records only durable reason codes and evidence fingerprints from S26/S65. */
 export function recordRelogin(
   store: ReloginStore,
   event: Omit<ReloginEvent, 'id' | 'detail' | 'evidence' | 'userDeniedAt'> & {
@@ -49,8 +49,8 @@ export function recordRelogin(
     provider: event.provider,
     accountId: event.accountId,
     kind: event.kind,
-    detail: event.detail == null ? null : redactSecrets(event.detail, []),
-    evidence: event.evidence == null ? null : redactSecrets(event.evidence, []),
+    detail: reloginReasonCode(event.detail),
+    evidence: reloginEvidenceFingerprint(event.evidence),
     userDeniedAt: event.userDeniedAt,
   });
 }

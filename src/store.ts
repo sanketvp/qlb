@@ -6,6 +6,7 @@
 import { chmodSync, existsSync, mkdirSync, rmSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { assertStoredReloginFields } from './relogin-fields';
 import { dirname, join } from 'node:path';
 import { backup, DatabaseSync, type StatementSync } from 'node:sqlite';
 import { inspectAccountSafety, safetyRefusalMessage } from './accounts-prune';
@@ -1533,9 +1534,12 @@ export class Store {
   }
 
   recordRelogin(row: { ts?: number; provider: string; accountId?: string | null; kind: string; detail?: string | null; evidence?: string | null; userDeniedAt?: number | null }): number {
+    const detail = row.detail ?? null;
+    const evidence = row.evidence ?? null;
+    assertStoredReloginFields(detail, evidence);
     const result = this.db.prepare('INSERT INTO relogin_events (ts, provider, account_id, kind, detail, evidence, user_denied_at) VALUES (?, ?, ?, ?, ?, ?, ?)').run(
       row.ts ?? Date.now(), row.provider, row.accountId ?? null, row.kind,
-      row.detail == null ? null : redactSecrets(row.detail, []), row.evidence == null ? null : redactSecrets(row.evidence, []), row.userDeniedAt ?? null,
+      detail, evidence, row.userDeniedAt ?? null,
     );
     return Number(result.lastInsertRowid);
   }
