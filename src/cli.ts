@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import * as net from 'node:net';
 import { dirname, join, resolve } from 'node:path';
 import { adapters } from './adapters';
+import { assertTestHomeIsIsolated } from './bootstrap';
 import { createDefaultCodexGateDeps, runCodexGate } from './codex-gate';
 import { config, resolveConfig, stripConfigArgs } from './config';
 import { discoverCommands, resolveCommand } from './registry';
@@ -1734,6 +1735,7 @@ function isExactListRequest(args: string[], flag: string): boolean {
 }
 
 async function main(): Promise<void> {
+  assertTestHomeIsIsolated();
   const argv = prepareCommandArgv(process.argv);
   const raw = argv.slice(2);
   if (isExactListRequest(raw, '--list-commands')) {
@@ -1969,5 +1971,9 @@ async function main(): Promise<void> {
 }
 
 if (require.main === module) {
-  void main();
+  void main().catch((err: unknown) => {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`qlb: ${message}`);
+    process.exitCode = 2;
+  });
 }

@@ -382,6 +382,8 @@ def critical_section() -> int:
         cmd.extend(["--db", db])
     child_env = os.environ.copy()
     child_env.pop("QLB_PROXY_LOCK_FD", None)
+    # QLB_HOME belongs to this wrapper; the qlb CLI rejects it outside test mode.
+    child_env.pop("QLB_HOME", None)
     subprocess.Popen(
         cmd,
         close_fds=True,
