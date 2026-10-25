@@ -10,7 +10,7 @@ import { dirname, join } from 'node:path';
 import { backup, DatabaseSync, type StatementSync } from 'node:sqlite';
 import { inspectAccountSafety, safetyRefusalMessage } from './accounts-prune';
 import { config } from './config';
-import { redactSecrets } from './redact';
+import { redactJson, redactSecrets } from './redact';
 import type { BucketReading, Confidence } from './types';
 
 export const DEFAULT_DB_PATH = config.dbPath;
@@ -310,6 +310,7 @@ const V5_SCHEMA_DDL = `
 
 interface V5ColumnShape {
   name: string;
+  definition: string;
   type: string;
   notNull: boolean;
   defaultValue: string | null;
@@ -348,6 +349,7 @@ function loadV5TableShapes(): Map<string, V5TableShape> {
       const defaultMatch = /\bDEFAULT\s+([^\s,]+)/i.exec(definition);
       return [{
         name: column[1],
+        definition,
         type: column[2],
         notNull: /\bNOT NULL\b/i.test(definition),
         defaultValue: defaultMatch?.[1] ?? null,
@@ -457,25 +459,39 @@ function quoteIdentifier(name: string): string {
 }
 
 function repairMissingV5Columns(db: DatabaseSync): void {
+  const repairs: Array<{ table: string; shape: V5TableShape; missing: V5ColumnShape[]; empty: boolean }> = [];
   for (const [table, shape] of requiredV5TableShapes()) {
+    if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table)) continue;
     const existing = new Set((db.prepare(`PRAGMA table_info(${quoteIdentifier(table)})`).all() as Array<{ name: string }>).map(({ name }) => name));
     const missing = shape.columns.filter(({ name }) => !existing.has(name));
     if (missing.length === 0) continue;
+    const empty = !(db.prepare(`SELECT 1 FROM ${quoteIdentifier(table)} LIMIT 1`).get());
+    // SQLite can only add nullable columns or NOT NULL columns with a constant
+    // default. Anything else would require inventing values for existing rows.
+    if (!empty && missing.some((column) => column.primaryKey || (column.notNull && column.defaultValue === null))) {
+      const names = missing.filter((column) => column.primaryKey || (column.notNull && column.defaultValue === null)).map(({ name }) => name).join(', ');
+      throw new Error(`cannot correct pre-release v5 ${table}: populated table is missing required column(s) ${names}`);
+    }
+    repairs.push({ table, shape, missing, empty });
+  }
 
-    const temporary = `__qlb_v5_repair_${table}`;
-    const create = shape.sql.replace(/^CREATE TABLE\s+(?:IF NOT EXISTS\s+)?(?:"[^"]+"|\S+)/i, `CREATE TABLE ${quoteIdentifier(temporary)}`);
-    db.exec(`DROP TABLE IF EXISTS ${quoteIdentifier(temporary)}; ${create}`);
-    const names = shape.columns.map(({ name }) => quoteIdentifier(name)).join(', ');
-    const values = shape.columns.map((column) => {
-      if (existing.has(column.name)) return quoteIdentifier(column.name);
-      if (column.defaultValue !== null) return column.defaultValue;
-      if (column.primaryKey) return 'rowid';
-      if (column.notNull && /char|clob|text/i.test(column.type)) return "''";
-      return column.notNull ? '0' : 'NULL';
-    }).join(', ');
-    db.exec(`INSERT INTO ${quoteIdentifier(temporary)} (${names}) SELECT ${values} FROM ${quoteIdentifier(table)};
-      DROP TABLE ${quoteIdentifier(table)};
-      ALTER TABLE ${quoteIdentifier(temporary)} RENAME TO ${quoteIdentifier(table)};`);
+  for (const { table, shape, missing, empty } of repairs) {
+    if (empty && missing.some((column) => column.primaryKey || (column.notNull && column.defaultValue === null))) {
+      // Empty tables have no values or rows to lose; recreate only when ALTER
+      // TABLE cannot express the v5 column definition.
+      db.exec(`DROP TABLE ${quoteIdentifier(table)}; ${shape.sql}`);
+      continue;
+    }
+    for (const column of missing) db.exec(`ALTER TABLE ${quoteIdentifier(table)} ADD COLUMN ${column.definition}`);
+  }
+}
+
+function redactJsonText(value: string): string {
+  try {
+    return redactJson(JSON.parse(value), []);
+  } catch {
+    // Keep existing behavior for callers that supplied non-JSON diagnostic text.
+    return redactSecrets(value, []);
   }
 }
 
@@ -1485,9 +1501,9 @@ export class Store {
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
       row.ts ?? Date.now(), row.provider, row.fromAccount ?? null, row.toAccount, row.trigger, row.outcome,
       row.outgoingKind ?? null,
-      row.bindingJson == null ? null : redactSecrets(row.bindingJson, []),
-      row.stepsJson == null ? null : redactSecrets(row.stepsJson, []),
-      row.openSessionsJson == null ? null : redactSecrets(row.openSessionsJson, []),
+      row.bindingJson == null ? null : redactJsonText(row.bindingJson),
+      row.stepsJson == null ? null : redactJsonText(row.stepsJson),
+      row.openSessionsJson == null ? null : redactJsonText(row.openSessionsJson),
       row.error == null ? null : redactSecrets(row.error, []), row.injected ? 1 : 0,
       row.detail == null ? null : redactSecrets(row.detail, []), row.publishedAt ?? null, row.committedAt ?? null,
     );

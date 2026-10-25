@@ -101,6 +101,65 @@ describe('store v5 schema (AC38)', () => {
     }
   });
 
+  it('adds repairable missing columns without losing extra columns, indexes, or triggers', () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'qlb-v5-safe-repair-')), 'qlb.db');
+    const initial = openStore(path);
+    initial.close();
+    const db = new DatabaseSync(path);
+    db.exec(`ALTER TABLE decisions DROP COLUMN provider;
+      ALTER TABLE decisions ADD COLUMN forward_compatible TEXT;
+      CREATE INDEX decisions_forward_compatible ON decisions(forward_compatible);
+      CREATE TABLE decision_audit (value TEXT);
+      CREATE TRIGGER decisions_audit AFTER INSERT ON decisions BEGIN
+        INSERT INTO decision_audit VALUES (NEW.forward_compatible);
+      END;
+      INSERT INTO decisions (ts, requested_model, mode, reason, snapshot_json, forward_compatible)
+        VALUES (1, 'model', 'headroom', 'fixture', '{}', 'retain-me')`);
+    db.close();
+
+    const corrected = openStore(path);
+    corrected.close();
+    const check = dbAt(path);
+    try {
+      assert.deepEqual(
+        (check.prepare('SELECT forward_compatible FROM decisions').all() as Array<{ forward_compatible: string }>).map((row) => ({ ...row })),
+        [{ forward_compatible: 'retain-me' }],
+      );
+      assert.ok(check.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'decisions_forward_compatible'").get());
+      assert.ok(check.prepare("SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = 'decisions_audit'").get());
+    } finally { check.close(); }
+  });
+
+  it('refuses populated tables missing required v5 columns but repairs empty ones', () => {
+    const populatedPath = join(mkdtempSync(join(tmpdir(), 'qlb-v5-required-populated-')), 'qlb.db');
+    const emptyPath = join(mkdtempSync(join(tmpdir(), 'qlb-v5-required-empty-')), 'qlb.db');
+    for (const [path, populated] of [[populatedPath, true], [emptyPath, false]] as const) {
+      const initial = openStore(path);
+      initial.close();
+      const db = new DatabaseSync(path);
+      db.exec('ALTER TABLE claude_slots DROP COLUMN config_json');
+      if (populated) db.exec("INSERT INTO claude_slots (account_id, added_at) VALUES ('fixture', 1)");
+      db.close();
+    }
+
+    assert.throws(() => openStore(populatedPath), /populated table is missing required column\(s\) config_json/);
+    const populated = dbAt(populatedPath);
+    try {
+      assert.equal(columns(populated, 'claude_slots').includes('config_json'), false);
+      assert.deepEqual(
+        (populated.prepare('SELECT account_id, added_at FROM claude_slots').all() as Array<{ account_id: string; added_at: number }>).map((row) => ({ ...row })),
+        [{ account_id: 'fixture', added_at: 1 }],
+      );
+    } finally { populated.close(); }
+
+    const repaired = openStore(emptyPath);
+    repaired.close();
+    const empty = dbAt(emptyPath);
+    try {
+      assert.ok(columns(empty, 'claude_slots').includes('config_json'));
+    } finally { empty.close(); }
+  });
+
   it('rebuilds a pre-release lifecycle index whose predicate omits aborted', () => {
     const path = join(mkdtempSync(join(tmpdir(), 'qlb-v5-index-correct-')), 'qlb.db');
     const initial = openStore(path);
@@ -214,19 +273,23 @@ describe('store v5 schema (AC38)', () => {
     } finally { store.close(); }
   });
 
-  it('redacts token-shaped recordSwitch JSON fields while preserving valid JSON', () => {
+  it('redacts sensitive recordSwitch JSON keys at every depth while preserving valid JSON', () => {
     const path = join(mkdtempSync(join(tmpdir(), 'qlb-v5-switch-redact-')), 'qlb.db');
     const store = openStore(path);
-    const token = `sk-${'x'.repeat(32)}`;
+    const payload = {
+      password: 'hunter2',
+      nested: [{ authorization: 'Basic abc', cookie: 'session=value' }],
+      credentials: { refresh_token: 'refresh-value', access_token: 'access-value' },
+    };
     store.recordSwitch({
       ts: 1,
       provider: 'anthropic',
       toAccount: 'id',
       trigger: 'manual',
       outcome: 'failed',
-      bindingJson: JSON.stringify({ value: token }),
-      stepsJson: JSON.stringify({ value: token }),
-      openSessionsJson: JSON.stringify({ value: token }),
+      bindingJson: JSON.stringify(payload),
+      stepsJson: JSON.stringify(payload),
+      openSessionsJson: JSON.stringify(payload),
     });
     store.close();
 
@@ -234,8 +297,12 @@ describe('store v5 schema (AC38)', () => {
     try {
       const row = db.prepare('SELECT binding_json, steps_json, open_sessions_json FROM switch_log').get() as Record<string, string>;
       for (const value of Object.values(row)) {
-        assert.equal(value.includes(token), false);
-        assert.deepEqual(JSON.parse(value), { value: '[redacted]' });
+        for (const secret of ['hunter2', 'Basic abc', 'session=value', 'refresh-value', 'access-value']) assert.equal(value.includes(secret), false);
+        assert.deepEqual(JSON.parse(value), {
+          password: '[redacted]',
+          nested: [{ authorization: '[redacted]', cookie: '[redacted]' }],
+          credentials: '[redacted]',
+        });
       }
     } finally { db.close(); }
   });
