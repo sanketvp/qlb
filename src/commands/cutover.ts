@@ -51,6 +51,13 @@ export async function cutoverBegin(storePath: string, agent: CswapAgent = unavai
         failureCode = result.code ?? 'cswap-agent-failed';
         break;
       }
+      // K13's existing injection fakes predate S57. The production stub has a
+      // drain and fails closed; the optional call keeps those narrow unit fakes
+      // focused on their launch-agent seam.
+      if (failureCode == null && agent.drain != null) {
+        const result = await agent.drain();
+        if (!result.ok) failureCode = result.code ?? 'cswap-agent-failed';
+      }
     } catch (err) {
       failureCode = err instanceof Error ? err.message : String(err);
     }
