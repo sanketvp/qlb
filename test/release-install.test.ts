@@ -290,7 +290,8 @@ describe('release install (AC45)', () => {
     const appDir = join(root, 'qlb-home', 'app');
     const installed = await installRelease({ sourceDir, appDir, sha, dbPath: join(root, 'qlb-home', 'qlb.db') });
     const home = join(root, 'home');
-    cpSync(join(installed.releaseDir, 'extensions', 'qlb-pi'), join(home, '.pi', 'agent', 'extensions', 'qlb-pi'), { recursive: true });
+    // In test mode QLB resolves Pi paths under QLB_HOME (R0e), not HOME.
+    cpSync(join(installed.releaseDir, 'extensions', 'qlb-pi'), join(root, 'qlb-home', '.pi', 'agent', 'extensions', 'qlb-pi'), { recursive: true });
     const piRoot = join(root, 'pi');
     mkdirSync(piRoot, { recursive: true });
     writeFileSync(join(piRoot, 'package.json'), JSON.stringify({ name: '@earendil-works/pi-coding-agent', version: 'fixture' }));
