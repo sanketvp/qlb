@@ -7,17 +7,29 @@ import { dirname, join, resolve } from 'node:path';
 
 const identityName = 'QLB Keychain Helper';
 const source = resolve('native/keychain-helper/main.swift');
-const output = resolve('native/keychain-helper/build/qlb-keychain-helper');
+const defaultOutput = resolve('native/keychain-helper/build/qlb-keychain-helper');
 
 function usage() {
-  console.error('usage: node scripts/build-helper.mjs [--keychain <path>]');
+  console.error('usage: node scripts/build-helper.mjs [--keychain <path>] [--out <path>] [--no-trust]');
   process.exit(2);
 }
 
 function parseArgs(argv) {
-  if (argv.length === 0) return join(homedir(), 'Library/Keychains/login.keychain-db');
-  if (argv.length === 2 && argv[0] === '--keychain' && argv[1]) return resolve(argv[1]);
-  usage();
+  let keychain = join(homedir(), 'Library/Keychains/login.keychain-db');
+  let output = defaultOutput;
+  let noTrust = false;
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === '--keychain' && argv[i + 1]) {
+      keychain = resolve(argv[++i]);
+    } else if (argv[i] === '--out' && argv[i + 1]) {
+      output = resolve(argv[++i]);
+    } else if (argv[i] === '--no-trust') {
+      noTrust = true;
+    } else {
+      usage();
+    }
+  }
+  return { keychain, output, noTrust };
 }
 
 function run(file, args, options = {}) {
@@ -62,7 +74,7 @@ function existingIdentity(keychain) {
   }
 }
 
-function createIdentity(keychain, directory) {
+function createIdentity(keychain, directory, noTrust) {
   const key = join(directory, 'identity-key.pem');
   const cert = join(directory, 'identity-cert.pem');
   const p12 = join(directory, 'identity.p12');
@@ -77,20 +89,21 @@ function createIdentity(keychain, directory) {
   if (openssl.legacy) p12Args.push('-legacy');
   run(openssl.executable, p12Args);
   run('/usr/bin/security', ['import', p12, '-k', keychain, '-P', passphrase, '-T', '/usr/bin/codesign']);
-  // Self-signed certificates must be trusted for code signing before codesign
-  // can select them. This modifies only the explicitly selected keychain.
-  run('/usr/bin/security', ['add-trusted-cert', '-r', 'trustRoot', '-p', 'codeSign', '-k', keychain, cert]);
+  // Only the operator's default build may change per-user trust settings.
+  if (!noTrust) {
+    run('/usr/bin/security', ['add-trusted-cert', '-r', 'trustRoot', '-p', 'codeSign', '-k', keychain, cert]);
+  }
   const hash = existingIdentity(keychain);
   if (!hash) throw new Error('imported Keychain Helper certificate has no matching private key');
   return hash;
 }
 
 function main() {
-  const keychain = parseArgs(process.argv.slice(2));
+  const { keychain, output, noTrust } = parseArgs(process.argv.slice(2));
   const temp = mkdtempSync(join(tmpdir(), 'qlb-build-helper-'));
   try {
     mkdirSync(dirname(output), { recursive: true });
-    const signingHash = existingIdentity(keychain) ?? createIdentity(keychain, temp);
+    const signingHash = existingIdentity(keychain) ?? createIdentity(keychain, temp, noTrust);
     const candidate = join(temp, 'qlb-keychain-helper');
     run('/usr/bin/swiftc', [source, '-o', candidate]);
     run('/usr/bin/codesign', ['--force', '--sign', signingHash, '--keychain', keychain, '--timestamp=none', candidate]);

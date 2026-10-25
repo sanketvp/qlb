@@ -9,10 +9,12 @@ import { describe, it } from 'node:test';
 import {
   MacosKeychainBackend,
   defaultKeychainHelperPath,
+  KeychainHelperMissingError,
   markFakeExecutor,
   type ExecFileSyncFn,
 } from '../src/keychain';
 import { helperMatrixConfig, helperMatrixIsOk, parseHelperMatrixResult, runKeychainCommand } from '../src/commands/keychain';
+import { exitCodeForError } from '../src/cli';
 import { defaultConfig } from '../src/config';
 import { openStore } from '../src/store';
 
@@ -44,11 +46,17 @@ describe('Swift Keychain helper write path', () => {
   });
 
   it('parses matrix receipts and records a failing prompted result', () => {
-    const green = parseHelperMatrixResult('{"cases":{"securityCreated":"pass","previousHelper":"pass","helperCreated":"pass"},"casePrompted":{"securityCreated":false,"previousHelper":false,"helperCreated":false},"prompted":false}');
+    const green = parseHelperMatrixResult('{"cases":{"securityCreated":"pass","previousHelper":"pass","helperCreated":"pass"},"casePrompted":{"securityCreated":false,"previousHelper":false,"helperCreated":false},"caseReasons":{"securityCreated":null,"previousHelper":null,"helperCreated":null},"prompted":false}');
     assert.equal(helperMatrixIsOk(green), true);
     assert.equal(helperMatrixConfig(green)['keychain.helperCheckResult'], 'ok');
     const prompted = { ...green, prompted: true };
     assert.equal(helperMatrixIsOk(prompted), false);
+    const firstInstall = {
+      ...green,
+      cases: { ...green.cases, previousHelper: 'not-applicable' as const },
+      caseReasons: { ...green.caseReasons, previousHelper: 'no previous helper' },
+    };
+    assert.equal(helperMatrixIsOk(firstInstall), true);
     const recorded = helperMatrixConfig(prompted);
     assert.equal(recorded['keychain.helperCheckResult'], 'failed');
     assert.equal(recorded['keychain.helperCheckPrompted'], 'true');
@@ -66,6 +74,7 @@ describe('Swift Keychain helper write path', () => {
       runMatrix: () => ({
         cases: { securityCreated: 'fail', previousHelper: 'fail', helperCreated: 'pass' },
         casePrompted: { securityCreated: true, previousHelper: false, helperCreated: false },
+        caseReasons: { securityCreated: null, previousHelper: null, helperCreated: null },
         prompted: true,
       }),
     });
@@ -77,6 +86,21 @@ describe('Swift Keychain helper write path', () => {
       assert.equal(store.getConfig('keychain.helperCheckResult'), 'failed');
       assert.equal(store.getConfig('keychain.helperCheckPrompted'), 'true');
     } finally { store.close(); }
+  });
+
+  it('returns exit 3 with the helper-missing message for a missing native helper command', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-keychain-command-missing-'));
+    const config = defaultConfig(home);
+    const errors: string[] = [];
+    const exit = await runKeychainCommand(['matrix'], {
+      config, env: {}, home, stdout: () => {}, stderr: (message) => errors.push(message),
+      loadConfig: () => config, registerSecret: () => {},
+    }, {
+      runMatrix: () => { throw new KeychainHelperMissingError('/tmp/missing-helper'); },
+    });
+    assert.equal(exit, 3);
+    assert.deepEqual(errors, ['helper-missing: /tmp/missing-helper; run npm run build:helper']);
+    assert.equal(exitCodeForError(new KeychainHelperMissingError('/tmp/missing-helper')), 3);
   });
 
   it('compiles the helper and self-tests only a disposable Keychain', {
@@ -100,10 +124,11 @@ describe('Swift Keychain helper write path', () => {
   });
 
   it('builds twice with one stable identity in a disposable Keychain', {
-    skip: !existsSync('/usr/bin/swiftc'),
+    skip: process.env.QLB_REAL_KEYCHAIN_TESTS !== '1' || !existsSync('/usr/bin/swiftc'),
   }, () => {
     const dir = mkdtempSync(join(tmpdir(), 'qlb-keychain-helper-build-'));
     const keychain = join(dir, 't.keychain-db');
+    const output = join(dir, 'qlb-keychain-helper');
     const password = randomBytes(24).toString('hex');
     const previous = join(dir, 'helper-prev');
     const env = { ...process.env, QLB_HELPER_PREVIOUS_DIR: previous };
@@ -113,12 +138,12 @@ describe('Swift Keychain helper write path', () => {
     try {
       runFile('/usr/bin/security', ['create-keychain', '-p', password, keychain], { stdio: 'ignore' });
       runFile('/usr/bin/security', ['unlock-keychain', '-p', password, keychain], { stdio: 'ignore' });
-      runFile(process.execPath, ['scripts/build-helper.mjs', '--keychain', keychain], { env, stdio: 'ignore', timeout: 30_000 });
+      runFile(process.execPath, ['scripts/build-helper.mjs', '--keychain', keychain, '--no-trust', '--out', output], { env, stdio: 'ignore', timeout: 30_000 });
       const first = hashes();
-      runFile(process.execPath, ['scripts/build-helper.mjs', '--keychain', keychain], { env, stdio: 'ignore', timeout: 30_000 });
+      runFile(process.execPath, ['scripts/build-helper.mjs', '--keychain', keychain, '--no-trust', '--out', output], { env, stdio: 'ignore', timeout: 30_000 });
       assert.equal(hashes(), first);
       assert.ok(first);
-      const details = spawnSync('/usr/bin/codesign', ['-d', '-r-', defaultKeychainHelperPath()], { encoding: 'utf8' });
+      const details = spawnSync('/usr/bin/codesign', ['-d', '-r-', output], { encoding: 'utf8' });
       assert.equal(details.status, 0);
       assert.match(`${details.stdout}\n${details.stderr}`, new RegExp(first!, 'i'));
     } finally {

@@ -2,15 +2,18 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { defaultKeychainHelperPath, MACOS_SECURITY_TIMEOUT_MS } from '../keychain';
+import { defaultKeychainHelperPath, KeychainHelperMissingError, MACOS_SECURITY_TIMEOUT_MS } from '../keychain';
 import { openStore } from '../store';
 import type { CommandDefinition, CommandContext } from '../registry';
 
-export type HelperMatrixCase = 'pass' | 'fail';
+export type HelperMatrixCase = 'pass' | 'fail' | 'not-applicable';
+type HelperMatrixCaseName = 'securityCreated' | 'previousHelper' | 'helperCreated';
 export interface HelperMatrixResult {
-  cases: Record<'securityCreated' | 'previousHelper' | 'helperCreated', HelperMatrixCase>;
+  cases: Record<HelperMatrixCaseName, HelperMatrixCase>;
   /** S50 prompt evidence retained separately for each disposable case. */
-  casePrompted: Record<'securityCreated' | 'previousHelper' | 'helperCreated', boolean>;
+  casePrompted: Record<HelperMatrixCaseName, boolean>;
+  /** A first install has no previous helper, so that one case is not applicable. */
+  caseReasons: Record<HelperMatrixCaseName, string | null>;
   prompted: boolean;
 }
 
@@ -39,30 +42,42 @@ function parse(args: string[]): { subcommand: 'matrix' | 'check-launchd'; json: 
 
 /** Parses the native helper's deliberately payload-free matrix receipt. */
 export function parseHelperMatrixResult(text: string): HelperMatrixResult {
-  const value = JSON.parse(text) as { cases?: Record<string, unknown>; casePrompted?: Record<string, unknown>; prompted?: unknown };
-  const cases = value.cases;
-  const casePrompted = value.casePrompted;
+  const value = JSON.parse(text) as {
+    cases?: Record<string, unknown>;
+    casePrompted?: Record<string, unknown>;
+    caseReasons?: Record<string, unknown>;
+    prompted?: unknown;
+  };
+  const { cases, casePrompted, caseReasons } = value;
   const keys = ['securityCreated', 'previousHelper', 'helperCreated'] as const;
-  if (!cases || !casePrompted || typeof cases !== 'object' || typeof casePrompted !== 'object' || typeof value.prompted !== 'boolean') throw new Error('invalid helper matrix receipt');
+  if (!cases || !casePrompted || !caseReasons || typeof cases !== 'object' || typeof casePrompted !== 'object' || typeof caseReasons !== 'object' || typeof value.prompted !== 'boolean') throw new Error('invalid helper matrix receipt');
   for (const key of keys) {
-    if ((cases[key] !== 'pass' && cases[key] !== 'fail') || typeof casePrompted[key] !== 'boolean') {
+    const outcome = cases[key];
+    if ((outcome !== 'pass' && outcome !== 'fail' && outcome !== 'not-applicable') || typeof casePrompted[key] !== 'boolean' || (caseReasons[key] !== null && typeof caseReasons[key] !== 'string')) {
+      throw new Error('invalid helper matrix receipt');
+    }
+    if (outcome === 'not-applicable' && (key !== 'previousHelper' || caseReasons[key] !== 'no previous helper')) {
       throw new Error('invalid helper matrix receipt');
     }
   }
   return {
     cases: cases as HelperMatrixResult['cases'],
     casePrompted: casePrompted as HelperMatrixResult['casePrompted'],
+    caseReasons: caseReasons as HelperMatrixResult['caseReasons'],
     prompted: value.prompted,
   };
 }
 
 export function helperMatrixIsOk(result: HelperMatrixResult): boolean {
-  return !result.prompted && Object.values(result.cases).every((outcome) => outcome === 'pass');
+  return !result.prompted &&
+    result.cases.securityCreated === 'pass' &&
+    result.cases.helperCreated === 'pass' &&
+    (result.cases.previousHelper === 'pass' || result.cases.previousHelper === 'not-applicable');
 }
 
 function assertHelperReady(path: string): void {
   if (process.platform !== 'darwin') throw new Error('Keychain helper matrix is available only on macOS');
-  if (!existsSync(path)) throw new Error(`Keychain helper is not built: ${path}; run npm run build:helper`);
+  if (!existsSync(path)) throw new KeychainHelperMissingError(path);
 }
 
 function executeMatrix(path: string, args: string[]): string {
@@ -199,6 +214,10 @@ export async function runKeychainCommand(
     return 0;
   } catch (err) {
     if (err instanceof MatrixReceiptError) result = err.result;
+    if (err instanceof KeychainHelperMissingError) {
+      ctx.stderr(err.message);
+      return err.exitCode;
+    }
     // Native command errors can contain implementation details. Do not relay stderr
     // because this boundary must never carry Keychain values.
     writeMatrixConfig(ctx.config.dbPath, result, helperPath());

@@ -4,9 +4,20 @@ import Security
 private let maxPayloadBytes = 64 * 1024
 private let operationTimeout: TimeInterval = 5
 
+private func statusName(_ status: OSStatus) -> String {
+    switch status {
+    case errSecAuthFailed: return "errSecAuthFailed"
+    case errSecInteractionNotAllowed: return "errSecInteractionNotAllowed"
+    case errSecUserCanceled: return "errSecUserCanceled"
+    case errSecItemNotFound: return "errSecItemNotFound"
+    case errSecDuplicateItem: return "errSecDuplicateItem"
+    default: return "OSStatus"
+    }
+}
+
 private func fail(_ message: String, _ status: OSStatus? = nil) -> Never {
     if let status {
-        FileHandle.standardError.write(Data("qlb-keychain-helper: \(message) (status \(status))\n".utf8))
+        FileHandle.standardError.write(Data("qlb-keychain-helper: \(message) (\(statusName(status)), status \(status))\n".utf8))
     } else {
         FileHandle.standardError.write(Data("qlb-keychain-helper: \(message)\n".utf8))
     }
@@ -63,29 +74,12 @@ private func create(_ itemQuery: [CFString: Any], _ service: String, _ data: Dat
     return SecItemAdd(attributes as CFDictionary, nil)
 }
 
-private func mayReplaceExistingItem(_ service: String) -> Bool {
-    service.hasPrefix("qlb-test-") || service.hasPrefix("qlb:")
-}
-
 private func set(_ service: String, _ account: String, _ data: Data) {
     let itemQuery = query(service, account)
     let status = SecItemCopyMatching(itemQuery as CFDictionary, nil)
     if status == errSecSuccess {
         let updateStatus = SecItemUpdate(itemQuery as CFDictionary, [kSecValueData: data] as CFDictionary)
-        if updateStatus == errSecSuccess { return }
-        // Items made by `security` can carry an ACL that excludes the helper.
-        // Only disposable or QLB-owned services may be migrated to the stable
-        // helper/security ACL; any other failed update remains fail-closed.
-        guard mayReplaceExistingItem(service),
-              updateStatus == errSecAuthFailed || updateStatus == errSecInteractionNotAllowed else {
-            fail("update failed", updateStatus)
-        }
-        let deleteStatus = SecItemDelete(itemQuery as CFDictionary)
-        guard deleteStatus == errSecSuccess || deleteStatus == errSecItemNotFound else {
-            fail("update migration delete failed", deleteStatus)
-        }
-        let addStatus = create(itemQuery, service, data)
-        guard addStatus == errSecSuccess else { fail("update migration add failed", addStatus) }
+        guard updateStatus == errSecSuccess else { fail("update failed", updateStatus) }
         return
     }
     guard status == errSecItemNotFound else { fail("lookup failed", status) }
@@ -125,6 +119,9 @@ private struct CommandResult {
     let timedOut: Bool
 }
 
+private typealias MatrixCase = String
+private let notApplicable = "not-applicable"
+
 private func run(_ executable: String, _ arguments: [String], input: Data? = nil) -> CommandResult {
     let process = Process()
     process.executableURL = URL(fileURLWithPath: executable)
@@ -161,8 +158,9 @@ private func matrix(_ prefix: String, previousHelper: String? = nil) {
     let marker = Data("matrix-\(UUID().uuidString)".utf8)
     let suffix = UUID().uuidString.lowercased()
     let services = ["\(prefix)security-\(suffix)", "\(prefix)previous-\(suffix)", "\(prefix)helper-\(suffix)"]
-    var cases: [String: String] = ["securityCreated": "fail", "previousHelper": "fail", "helperCreated": "fail"]
+    var cases: [String: MatrixCase] = ["securityCreated": "fail", "previousHelper": "fail", "helperCreated": "fail"]
     var casePrompted: [String: Bool] = ["securityCreated": false, "previousHelper": false, "helperCreated": false]
+    var caseReasons: [String: Any] = ["securityCreated": NSNull(), "previousHelper": NSNull(), "helperCreated": NSNull()]
     var prompted = false
     defer { for service in services { _ = run("/usr/bin/security", ["delete-generic-password", "-a", account, "-s", service]) } }
 
@@ -173,13 +171,16 @@ private func matrix(_ prefix: String, previousHelper: String? = nil) {
     if securityCreated.status == 0 && securityUpdate.status == 0 { cases["securityCreated"] = "pass" }
 
     let previous = previousHelper ?? (NSHomeDirectory() as NSString).appendingPathComponent(".qlb/helper-prev/qlb-keychain-helper")
-    let previousCreate = FileManager.default.isExecutableFile(atPath: previous)
-        ? run(previous, ["set", services[1], account], input: marker)
-        : CommandResult(status: 1, output: "previous helper missing", timedOut: false)
-    let currentUpdate = previousCreate.status == 0 ? run(helperExecutablePath(), ["set", services[1], account], input: marker) : previousCreate
-    casePrompted["previousHelper"] = promptFailure(previousCreate) || promptFailure(currentUpdate)
-    prompted = prompted || casePrompted["previousHelper"]!
-    if previousCreate.status == 0 && currentUpdate.status == 0 { cases["previousHelper"] = "pass" }
+    if !FileManager.default.isExecutableFile(atPath: previous) {
+        cases["previousHelper"] = notApplicable
+        caseReasons["previousHelper"] = "no previous helper"
+    } else {
+        let previousCreate = run(previous, ["set", services[1], account], input: marker)
+        let currentUpdate = previousCreate.status == 0 ? run(helperExecutablePath(), ["set", services[1], account], input: marker) : previousCreate
+        casePrompted["previousHelper"] = promptFailure(previousCreate) || promptFailure(currentUpdate)
+        prompted = prompted || casePrompted["previousHelper"]!
+        if previousCreate.status == 0 && currentUpdate.status == 0 { cases["previousHelper"] = "pass" }
+    }
 
     let helperCreate = run(helperExecutablePath(), ["set", services[2], account], input: marker)
     let securityRead = helperCreate.status == 0 ? run("/usr/bin/security", ["find-generic-password", "-a", account, "-s", services[2], "-w"]) : helperCreate
@@ -189,7 +190,7 @@ private func matrix(_ prefix: String, previousHelper: String? = nil) {
         cases["helperCreated"] = "pass"
     }
 
-    let result: [String: Any] = ["cases": cases, "casePrompted": casePrompted, "prompted": prompted]
+    let result: [String: Any] = ["cases": cases, "casePrompted": casePrompted, "caseReasons": caseReasons, "prompted": prompted]
     let json = try! JSONSerialization.data(withJSONObject: result, options: [.sortedKeys])
     FileHandle.standardOutput.write(json)
     FileHandle.standardOutput.write(Data("\n".utf8))
