@@ -111,12 +111,14 @@ describe('registries', () => {
     assert.doesNotMatch(output[0], new RegExp(secret));
   });
 
-  it('redacts secrets registered by executing handlers at their error boundary', async () => {
-    const secret = 'opaque-runtime-abc123XYZ';
+  it('redacts short secrets registered by handlers on copied contexts', async () => {
+    const secret = 'short';
     const output: string[] = [];
-    const context = createCommandContext();
-    context.env = {};
-    context.stderr = (line: string) => output.push(line);
+    const context = {
+      ...createCommandContext(),
+      env: {},
+      stderr: (line: string) => output.push(line),
+    };
 
     assert.equal(await runExecutingCommand({
       command: {
@@ -132,7 +134,7 @@ describe('registries', () => {
     assert.doesNotMatch(output[0], new RegExp(secret));
   });
 
-  it('does not treat short or non-credential environment values as executing-command secrets', async () => {
+  it('redacts short credential-like environment values but not unrelated ones', async () => {
     const shortSecret = 'short';
     const nonCredentialValue = 'opaque-home-abc123XYZ';
     const output: string[] = [];
@@ -144,9 +146,59 @@ describe('registries', () => {
       command: { name: 'fixture', execute: () => { throw new Error(`failed: ${shortSecret}, ${nonCredentialValue}`); } },
       args: [],
     }, context), 1);
-    assert.match(output[0], new RegExp(shortSecret));
+    assert.match(output[0], /\[redacted\]/);
     assert.match(output[0], new RegExp(nonCredentialValue));
-    assert.doesNotMatch(output[0], /\[redacted\]/);
+    assert.doesNotMatch(output[0], new RegExp(shortSecret));
+  });
+
+  it('redacts executing-command output and errors through dispatchCommand', async () => {
+    const secret = 'opaque-runtime-abc123XYZ';
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const context = {
+      ...createCommandContext(),
+      env: {},
+      stdout: (line: string) => stdout.push(line),
+      stderr: (line: string) => stderr.push(line),
+    };
+
+    assert.equal(await dispatchCommand(['node', 'qlb', 'fixture'], [{
+      name: 'fixture',
+      execute: (_args, ctx) => {
+        ctx.registerSecret(secret);
+        ctx.stdout(`output: ${secret}`);
+        throw new Error(`failed: ${secret}`);
+      },
+    }], context), 1);
+    assert.match(stdout[0], /\[redacted\]/);
+    assert.doesNotMatch(stdout[0], new RegExp(secret));
+    assert.match(stderr[0], /\[redacted\]/);
+    assert.doesNotMatch(stderr[0], new RegExp(secret));
+  });
+
+  it('rejects duplicate command names and names both modules', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'qlb-registry-duplicate-'));
+    writeFileSync(join(directory, 'first.js'), "module.exports = { default: { name: 'fixture', run(args) { return args; } } };\n");
+    writeFileSync(join(directory, 'second.js'), "module.exports = { default: { name: 'fixture', run(args) { return args; } } };\n");
+
+    assert.throws(
+      () => discoverCommands(directory, ['.js']),
+      /duplicate command name "fixture" in first\.js and second\.js/,
+    );
+  });
+
+  it('converts invalid executing-command exit codes to the documented error exit', async () => {
+    const output: string[] = [];
+    for (const value of [undefined, -1, 1.5, 256, Number.NaN, '1']) {
+      const context = createCommandContext();
+      context.stderr = (line: string) => output.push(line);
+      assert.equal(await runExecutingCommand({
+        command: { name: 'fixture', execute: () => value as number },
+        args: [],
+      }, context), 1);
+    }
+    assert.equal(output.length, 6);
+    assert.ok(output.every((line) => line.includes('invalid exit code (expected integer 0-255)')));
   });
 
   it('keeps legacy argv-rewrite fragments unchanged', () => {

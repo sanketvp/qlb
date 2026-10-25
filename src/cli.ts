@@ -8,7 +8,7 @@ import { createDefaultCodexGateDeps, runCodexGate } from './codex-gate';
 import { config, resolveConfig, stripConfigArgs } from './config';
 import { discoverCommands, resolveCommand, type CommandContext, type CommandDefinition } from './registry';
 import { runCodexProbeClaims } from './commands/codex-probe-claims';
-import { redactError } from './redact';
+import { redactError, redactSecrets } from './redact';
 import { doctorQlb, initializeQlb, listCheckNames, type DoctorReport, type InitReport } from './diagnostics';
 import { platformKeychain } from './keychain';
 import { createOwnedCredentialSource } from './credentials';
@@ -1739,11 +1739,11 @@ export function listCommandNames(commands: CommandDefinition[] = discoverCommand
   return commands.map((command) => command.name);
 }
 
-const commandContextSecrets = new WeakMap<CommandContext, Set<string>>();
-
 export function createCommandContext(): CommandContext {
+  // Keep the state behind copied methods rather than an object-identity map:
+  // commands commonly decorate a context with `{ ...context, stdout }`.
   const secrets = new Set<string>();
-  const context: CommandContext = {
+  return {
     stdout: (message) => console.log(message),
     stderr: (message) => console.error(message),
     env: process.env,
@@ -1753,15 +1753,14 @@ export function createCommandContext(): CommandContext {
     registerSecret: (value) => {
       if (value) secrets.add(value);
     },
+    knownSecrets: () => [...secrets],
   };
-  commandContextSecrets.set(context, secrets);
-  return context;
 }
 
 function knownCommandSecrets(context: CommandContext): string[] {
-  const secrets = new Set(commandContextSecrets.get(context));
+  const secrets = new Set(context.knownSecrets());
   for (const [key, value] of Object.entries(context.env)) {
-    if (/TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|API_KEY|APIKEY|PRIVATE_KEY|CREDENTIAL|COOKIE|AUTH/i.test(key) && value && value.length >= 8) {
+    if (/TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|API_KEY|APIKEY|PRIVATE_KEY|CREDENTIAL|COOKIE|AUTH/i.test(key) && value) {
       secrets.add(value);
     }
   }
@@ -1776,18 +1775,40 @@ export async function dispatchCommand(
 ): Promise<number | null> {
   const match = resolveCommand(stripConfigArgs(argv).slice(2), commands);
   return match?.command.execute
-    ? await match.command.execute(match.args, context)
+    ? runExecutingCommand(match, context)
     : null;
 }
 
+const INVALID_EXECUTING_COMMAND_EXIT_CODE = 1;
+
+function isValidExecutingCommandExitCode(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 255;
+}
+
+/**
+ * Runs an executing registry fragment behind the redacting output/error boundary.
+ * Fragments must return an integer exit code in [0, 255]; invalid values return 1.
+ */
 export async function runExecutingCommand(
   match: { command: CommandDefinition; args: string[] },
   context: CommandContext,
 ): Promise<number> {
+  let redactingContext: CommandContext;
+  const redactOutput = (message: string): string => redactSecrets(message, knownCommandSecrets(redactingContext));
+  redactingContext = {
+    ...context,
+    stdout: (message) => context.stdout(redactOutput(message)),
+    stderr: (message) => context.stderr(redactOutput(message)),
+  };
   try {
-    return await match.command.execute!(match.args, context);
+    const code = await match.command.execute!(match.args, redactingContext);
+    if (!isValidExecutingCommandExitCode(code)) {
+      redactingContext.stderr(`qlb ${match.command.name}: invalid exit code (expected integer 0-255)`);
+      return INVALID_EXECUTING_COMMAND_EXIT_CODE;
+    }
+    return code;
   } catch (err) {
-    context.stderr(`qlb ${match.command.name}: ${redactError(err, knownCommandSecrets(context))}`);
+    redactingContext.stderr(`qlb ${match.command.name}: ${redactError(err, knownCommandSecrets(redactingContext))}`);
     return 1;
   }
 }
