@@ -30,19 +30,20 @@ describe('autoswitch parked state — spec §4.3 AC9', () => {
       nowMs: NOW, activeAccountId: '1',
       accounts: [exhausted('1', NOW + 30 * 60 * 1000), exhausted('2', firstUsable), exhausted('3', NOW + 20 * 60 * 1000, true)],
     });
-    assert.deepEqual(legacy(result), { kind: 'switch', targetId: '2', reason: 'parked', unhealthyTicks: 0, parkedUntilMs: firstUsable });
+    assert.deepEqual(legacy(result), { kind: 'switch', targetId: '2', reason: 'parked', unhealthyTicks: 0, parkedUntilMs: firstUsable + 86_400_000 });
   });
 
   it('reports parked rather than switching when the active account frees first', () => {
     const reset = NOW + 10 * 60 * 1000;
     const result = decideAutoswitch({ nowMs: NOW, activeAccountId: '1', accounts: [exhausted('1', reset), exhausted('2', NOW + 20 * 60 * 1000)] });
-    assert.deepEqual(result, { kind: 'parked', accountId: '1', resetAtMs: reset, unhealthyTicks: 0, parkedUntilMs: reset });
+    assert.deepEqual(result, { kind: 'parked', accountId: '1', resetAtMs: reset + 86_400_000, unhealthyTicks: 0, parkedUntilMs: reset + 86_400_000 });
   });
 
   it('does not repeat an already-recorded parked switch for the same reset', () => {
     const reset = NOW + 10 * 60 * 1000;
-    const result = decideAutoswitch({ nowMs: NOW, activeAccountId: '1', parkedUntilMs: reset, accounts: [exhausted('1', NOW + 30 * 60 * 1000), exhausted('2', reset)] });
-    assert.deepEqual(result, { kind: 'parked', accountId: '2', resetAtMs: reset, unhealthyTicks: 0, parkedUntilMs: reset });
+    const parkedUntilMs = reset + 86_400_000;
+    const result = decideAutoswitch({ nowMs: NOW, activeAccountId: '1', parkedUntilMs, accounts: [exhausted('1', NOW + 30 * 60 * 1000), exhausted('2', reset)] });
+    assert.deepEqual(result, { kind: 'parked', accountId: '2', resetAtMs: parkedUntilMs, unhealthyTicks: 0, parkedUntilMs });
   });
 
   it('stays when all exhausted accounts have unknown resets, regardless of active account', () => {
@@ -81,10 +82,10 @@ describe('autoswitch parked state — spec §4.3 AC9', () => {
   it('uses added time when equally-ranked parked accounts have no slot number', () => {
     const reset = NOW + 10 * 60 * 1000;
     const result = decideAutoswitch({ nowMs: NOW, activeAccountId: '1', accounts: [exhausted('1', NOW + 30 * 60 * 1000), { ...exhausted('2', reset), slotNum: undefined, addedAtMs: 200 }, { ...exhausted('3', reset), slotNum: undefined, addedAtMs: 100 }] });
-    assert.deepEqual(legacy(result), { kind: 'switch', targetId: '3', reason: 'parked', unhealthyTicks: 0, parkedUntilMs: reset });
+    assert.deepEqual(legacy(result), { kind: 'switch', targetId: '3', reason: 'parked', unhealthyTicks: 0, parkedUntilMs: reset + 86_400_000 });
   });
 
-  it('uses the binding-window reset when exhausted windows are tied', () => {
+  it('parks until every exhausted window on the earliest account can recover', () => {
     const result = decideAutoswitch({
       nowMs: NOW, activeAccountId: '1',
       accounts: [
@@ -92,7 +93,7 @@ describe('autoswitch parked state — spec §4.3 AC9', () => {
         { accountId: '2', slotNum: 2, buckets: { '5h': { usedPct: 100, resetAt: NOW + 20 * 60 * 1000 }, '7d': { usedPct: 100, resetAt: NOW + 30 * 60 * 1000 } } },
       ],
     });
-    assert.deepEqual(result, { kind: 'parked', accountId: '1', resetAtMs: NOW + 10 * 60 * 1000, unhealthyTicks: 0, parkedUntilMs: NOW + 10 * 60 * 1000 });
+    assert.deepEqual(legacy(result), { kind: 'switch', targetId: '2', reason: 'parked', unhealthyTicks: 0, parkedUntilMs: NOW + 30 * 60 * 1000 });
   });
 
   it('does not claim all-exhausted while a non-dead account is unknown', () => {

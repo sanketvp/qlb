@@ -122,9 +122,15 @@ describe('autoswitch decision engine — upstream decision table', () => {
   });
 
   it('holds an expired active credential idle for at most 30 minutes without counting it unhealthy', () => {
-    const base = input({ activeCredentialExpired: true, accounts: [account('1', null), account('2', 20)] });
+    const base = input({ activeCredentialExpired: true, unhealthyTicks: 2, accounts: [account('1', null), account('2', 20)] });
     assert.deepEqual(decideAutoswitch(base), { kind: 'stay', reason: 'active-idle', unhealthyTicks: 0, idleHoldSinceMs: NOW });
-    assert.deepEqual(decideAutoswitch({ ...base, idleHoldSinceMs: NOW - 30 * 60 * 1000 }), { kind: 'stay', reason: 'unknown', unhealthyTicks: 1 });
+    assert.deepEqual(decideAutoswitch({ ...base, unhealthyTicks: 0, idleHoldSinceMs: NOW - 30 * 60 * 1000 }), { kind: 'stay', reason: 'unknown', unhealthyTicks: 1 });
+  });
+
+  it('treats an expired credential as unknown after the idle hold even with cached usage', () => {
+    const base = input({ activeCredentialExpired: true, idleHoldSinceMs: NOW - 30 * 60 * 1000, accounts: [account('1', 20), account('2', 20)] });
+    assert.deepEqual(decideAutoswitch(base), { kind: 'stay', reason: 'unknown', unhealthyTicks: 1 });
+    assertSwitch(decideAutoswitch({ ...base, unhealthyTicks: 2 }), '2', 'failover');
   });
 
   it('counts unknown active usage, then fails over without cooldown', () => {
@@ -221,6 +227,34 @@ describe('autoswitch recovery and no-return policy — spec §4.3 / S45', () => 
       accounts: [
         account('1', 96, { buckets: { '5h': { usedPct: 96, resetAt: NOW + 20 * 60 * 60 * 1000 } } }),
         account('2', 95, { buckets: { '5h': { usedPct: 95, resetAt: NOW + 2 * 60 * 60 * 1000 } } }),
+      ],
+    })), '2', 'proactive');
+  });
+
+  it('keeps the no-return bar when neither recovery timestamp is known', () => {
+    const withoutReset = (id: string, usedPct: number): AutoswitchAccount => ({ accountId: id, slotNum: Number(id), buckets: { '5h': { usedPct } } });
+    assert.deepEqual(decideAutoswitch(input({
+      activeAccountId: '2',
+      accounts: [withoutReset('1', 96), withoutReset('2', 98)],
+      lastSwitchFrom: '1', lastSwitchTo: '2', leftHeadroom: 4, leftRecoveryAtMs: null, leftTrigger: 'proactive',
+    })), { kind: 'stay', reason: 'no-qualifying-candidate', unhealthyTicks: 0 });
+  });
+
+  it('uses consume-first from settings and only moves to an earlier weekly reset', () => {
+    const accounts = [
+      account('1', 20, { buckets: { '5h': { usedPct: 20 }, '7d': { usedPct: 20, resetAt: NOW + 10 * 60 * 60 * 1000 } } }),
+      account('2', 10, { buckets: { '5h': { usedPct: 10 }, '7d': { usedPct: 10, resetAt: NOW + 20 * 60 * 60 * 1000 } } }),
+    ];
+    assert.deepEqual(decideAutoswitch(input({ settings: { strategy: 'consume-first' }, accounts })), { kind: 'stay', reason: 'no-qualifying-candidate', unhealthyTicks: 0 });
+  });
+
+  it('consume-first chooses the soonest weekly reset over greater headroom', () => {
+    assertSwitch(decideAutoswitch(input({
+      settings: { strategy: 'consume-first' },
+      accounts: [
+        account('1', 95, { buckets: { '5h': { usedPct: 95 }, '7d': { usedPct: 20, resetAt: NOW + 20 * 60 * 60 * 1000 } } }),
+        account('2', 50, { buckets: { '5h': { usedPct: 50 }, '7d': { usedPct: 40, resetAt: NOW + 2 * 60 * 60 * 1000 } } }),
+        account('3', 10, { buckets: { '5h': { usedPct: 10 }, '7d': { usedPct: 10, resetAt: NOW + 30 * 60 * 60 * 1000 } } }),
       ],
     })), '2', 'proactive');
   });

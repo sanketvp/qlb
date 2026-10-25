@@ -211,6 +211,17 @@ function bindingRecovery(account: AutoswitchAccount, binding: BindingWindow | un
   return finite(reset) && reset > nowMs ? reset : undefined;
 }
 
+/** The last exhausted window to recover determines when an account is usable. */
+function exhaustedRecovery(account: AutoswitchAccount, nowMs: number): number | undefined {
+  const resets: number[] = [];
+  for (const bucket of Object.values(account.buckets)) {
+    if (!finite(bucket.usedPct) || bucket.usedPct < 100) continue;
+    if (!finite(bucket.resetAt) || bucket.resetAt <= nowMs) return undefined;
+    resets.push(bucket.resetAt);
+  }
+  return resets.length > 0 ? Math.max(...resets) : undefined;
+}
+
 function census(accounts: readonly AutoswitchAccount[], settings: AutoswitchSettings, nowMs: number, activeId: string, providerLimit: boolean): CensusAccount[] {
   return accounts.filter((account) => !account.dead).map((account, index) => {
     const rawPct = bindingPct(account);
@@ -252,10 +263,10 @@ function noReturnRecovered(input: AutoswitchInput, left: CensusAccount | undefin
   const h = left.rawHeadroom;
   const activeH = active.rawHeadroom;
   if (h !== null && activeH !== null && h > activeH * HORIZON_HEADROOM_RATIO + SPENT_HEADROOM_PCT) return true;
-  if (finite(input.leftHeadroom) && h !== null && h >= input.leftHeadroom + SPENT_HEADROOM_PCT) return true;
+  if (finite(input.leftHeadroom) && h !== null && h >= Math.min(input.leftHeadroom + SPENT_HEADROOM_PCT, 100)) return true;
   const prior = finite(input.leftRecoveryAtMs) ? input.leftRecoveryAtMs : Number.POSITIVE_INFINITY;
   const recovery = left.recoveryAtMs ?? Number.POSITIVE_INFINITY;
-  return recovery <= prior - RECOVERY_HYSTERESIS_MS;
+  return recovery < prior - RECOVERY_HYSTERESIS_MS;
 }
 
 function noReturnAccount(input: AutoswitchInput, trigger: Trigger, all: CensusAccount[], active: CensusAccount, nowMs: number): { barred?: string; recovered: boolean } {
@@ -273,11 +284,18 @@ function noReturnAccount(input: AutoswitchInput, trigger: Trigger, all: CensusAc
 
 interface RankResult { ordered: CensusAccount[]; anyKnown: boolean; }
 
+function weeklyReset(account: AutoswitchAccount, nowMs: number): number | undefined {
+  const reset = account.buckets['7d']?.resetAt ?? account.buckets.weekly?.resetAt;
+  return finite(reset) && reset > nowMs ? reset : undefined;
+}
+
 function rankCandidates(all: CensusAccount[], active: CensusAccount, trigger: Trigger, barred: string | undefined, settings: AutoswitchSettings, nowMs: number): RankResult {
   const candidates = all.filter((item) => item.account.accountId !== active.account.accountId);
   const measured = candidates.filter((item) => item.rawHeadroom !== null);
   const allAbove = active.binding?.over === true && measured.length > 0 && measured.every((item) => item.binding?.over === true);
   const bestCandidateHeadroom = Math.max(0, ...measured.map((item) => item.rawHeadroom ?? 0));
+  const consumeFirst = settings.strategy === 'consume-first';
+  const activeWeeklyReset = consumeFirst ? weeklyReset(active.account, nowMs) : undefined;
   const qualified: Array<{ item: CensusAccount; key: readonly number[] }> = [];
   const fallback: Array<{ item: CensusAccount; key: readonly number[] }> = [];
   for (const item of measured) {
@@ -299,9 +317,18 @@ function rankCandidates(all: CensusAccount[], active: CensusAccount, trigger: Tr
         }
         continue;
       }
+      if (consumeFirst) {
+        const reset = weeklyReset(item.account, nowMs);
+        // Below the line, only burn quota that expires before the active's.
+        if (trigger === 'consume-first' && (reset === undefined || activeWeeklyReset === undefined || reset >= activeWeeklyReset)) continue;
+        qualified.push({ item, key: [reset ?? Number.POSITIVE_INFINITY, -(item.binding?.lineHeadroom ?? h)] });
+        continue;
+      }
       if (trigger === 'proactive' && active.binding && item.binding && item.binding.lineHeadroom - active.binding.lineHeadroom < settings.hysteresisPct) continue;
     }
-    qualified.push({ item, key: allAbove ? [1, -h, item.recoveryAtMs ?? Number.POSITIVE_INFINITY] : [-(item.binding?.lineHeadroom ?? h)] });
+    qualified.push({ item, key: consumeFirst
+      ? [weeklyReset(item.account, nowMs) ?? Number.POSITIVE_INFINITY, -(item.binding?.lineHeadroom ?? h)]
+      : allAbove ? [1, -h, item.recoveryAtMs ?? Number.POSITIVE_INFINITY] : [-(item.binding?.lineHeadroom ?? h)] });
   }
   const sortable = qualified.length > 0 ? qualified : fallback;
   sortable.sort((a, b) => {
@@ -315,11 +342,12 @@ function rankCandidates(all: CensusAccount[], active: CensusAccount, trigger: Tr
 }
 
 function parkedDecision(all: CensusAccount[], active: CensusAccount, input: AutoswitchInput, unhealthyTicks: number): AutoswitchDecision {
-  const withReset = all.filter((item) => item.recoveryAtMs !== undefined);
+  const withReset = all.map((item) => ({ item, recoveryAtMs: exhaustedRecovery(item.account, input.nowMs) }))
+    .filter((item): item is { item: CensusAccount; recoveryAtMs: number } => item.recoveryAtMs !== undefined);
   if (withReset.length === 0) return { kind: 'stay', reason: 'reset-unknown', unhealthyTicks };
-  withReset.sort((a, b) => (a.recoveryAtMs as number) - (b.recoveryAtMs as number) || accountOrder(a, b));
-  const target = withReset[0];
-  const reset = target.recoveryAtMs as number;
+  withReset.sort((a, b) => a.recoveryAtMs - b.recoveryAtMs || accountOrder(a.item, b.item));
+  const target = withReset[0].item;
+  const reset = withReset[0].recoveryAtMs;
   if (target.account.accountId === active.account.accountId || reset === input.parkedUntilMs) {
     return { kind: 'parked', accountId: target.account.accountId, resetAtMs: reset, unhealthyTicks, parkedUntilMs: reset };
   }
@@ -355,15 +383,17 @@ export function decideAutoswitch(input: AutoswitchInput): AutoswitchDecision {
   const activeAccount = input.activeAccountId == null ? undefined : input.accounts.find((account) => account.accountId === input.activeAccountId);
   if (!activeAccount) return { kind: 'stay', reason: 'no-active-account', unhealthyTicks: 0 };
 
+  const expiredPastIdleHold = input.activeCredentialExpired === true
+    && finite(input.idleHoldSinceMs) && input.nowMs - input.idleHoldSinceMs >= IDLE_HOLD_MAX_MS;
   if (input.activeCredentialExpired) {
     const since = finite(input.idleHoldSinceMs) ? input.idleHoldSinceMs : input.nowMs;
-    if (input.nowMs - since < IDLE_HOLD_MAX_MS) return { kind: 'stay', reason: 'active-idle', unhealthyTicks: input.unhealthyTicks ?? 0, idleHoldSinceMs: since };
+    if (input.nowMs - since < IDLE_HOLD_MAX_MS) return { kind: 'stay', reason: 'active-idle', unhealthyTicks: 0, idleHoldSinceMs: since };
   }
 
   // S38 and §4.3 step 1 require known usage before provider-limit can change
   // the verdict or the fleet-exhausted proof. A dead active also follows the
   // ordinary unknown grace: upstream has no immediate-dead-active escape.
-  const rawActive = activeAccount.dead ? null : bindingPct(activeAccount);
+  const rawActive = activeAccount.dead || expiredPastIdleHold ? null : bindingPct(activeAccount);
   let unhealthyTicks = input.unhealthyTicks ?? 0;
   let trigger: Trigger;
   if (rawActive === null) {
@@ -375,7 +405,7 @@ export function decideAutoswitch(input: AutoswitchInput): AutoswitchDecision {
     if (input.providerReportedLimit === true || rawActive >= 100) trigger = 'at-limit';
     else {
       const activeBinding = bindingFor(activeAccount, settings);
-      if (input.requestedTrigger === 'consume-first') trigger = 'consume-first';
+      if ((settings.strategy === 'consume-first' || input.requestedTrigger === 'consume-first') && !activeBinding?.over) trigger = 'consume-first';
       else if (activeBinding?.over) trigger = 'proactive';
       else return { kind: 'stay', reason: 'below-threshold', unhealthyTicks };
     }
