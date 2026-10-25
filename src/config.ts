@@ -1,12 +1,13 @@
 import { existsSync, readFileSync } from 'node:fs';
-import { homedir } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
+import { qlbHomeDir } from './home';
 
 export interface QlbConfig {
   anthropicPoolPath: string;
   piAuthJsonPath: string;
   codexAuthJsonPath: string;
   kimiCredentialsFile: string;
+  /** Always `pi-openrouter`; retained only to diagnose deprecated overrides. */
   openrouterKeychainService: string;
   dbPath: string;
   pluginsDir: string;
@@ -19,6 +20,9 @@ export interface QlbConfig {
 }
 
 type ConfigField = Exclude<keyof QlbConfig, 'configPath'>;
+
+/** Fixed native source: no arbitrary Keychain service is ever read for OpenRouter. */
+export const OPENROUTER_KEYCHAIN_SERVICE = 'pi-openrouter';
 
 const FIELD_META: Record<ConfigField, { env: string; flag: string }> = {
   anthropicPoolPath: { env: 'QLB_ANTHROPIC_POOL_PATH', flag: '--anthropic-pool-path' },
@@ -39,14 +43,14 @@ export const CONFIG_ENV_VARS = Object.fromEntries(
   Object.entries(FIELD_META).map(([field, meta]) => [field, meta.env]),
 ) as Record<ConfigField, string>;
 
-export function defaultConfig(home: string = homedir()): QlbConfig {
+export function defaultConfig(home: string = qlbHomeDir()): QlbConfig {
   const qlbDir = join(home, '.qlb');
   return {
     anthropicPoolPath: join(home, '.pi', 'agent', 'anthropic-pool.json'),
     piAuthJsonPath: join(home, '.pi', 'agent', 'auth.json'),
     codexAuthJsonPath: join(home, '.codex', 'auth.json'),
     kimiCredentialsFile: join(home, 'DEV_vault', '04-Security', 'kimi-code-credentials.md'),
-    openrouterKeychainService: 'pi-openrouter',
+    openrouterKeychainService: OPENROUTER_KEYCHAIN_SERVICE,
     dbPath: join(qlbDir, 'qlb.db'),
     pluginsDir: join(qlbDir, 'plugins'),
     proxyInfoPath: join(qlbDir, 'proxy.json'),
@@ -82,7 +86,7 @@ export interface ResolveConfigOptions {
 export function resolveConfig(options: ResolveConfigOptions = {}): QlbConfig {
   const argv = options.argv ?? process.argv.slice(2);
   const env = options.env ?? process.env;
-  const home = options.home ?? homedir();
+  const home = options.home ?? qlbHomeDir(env);
   const warn = options.warn ?? ((message: string) => console.error(message));
   const defaults = defaultConfig(home);
   const configPathRaw = cliValue(argv, '--config') ?? env.QLB_CONFIG_PATH ?? defaults.configPath;

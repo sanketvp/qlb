@@ -24,6 +24,7 @@ function isolatedEnv(home: string): NodeJS.ProcessEnv {
     ...env,
     HOME: home,
     QLB_HOME: home,
+    QLB_TEST_MODE: '1',
     HERMES_HOME: join(home, '.hermes'),
     QLB_ANTHROPIC_POOL_PATH: join(home, 'missing-anthropic-pool.json'),
     QLB_PI_AUTH_JSON_PATH: join(home, 'missing-pi-auth.json'),

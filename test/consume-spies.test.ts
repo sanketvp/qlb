@@ -49,6 +49,13 @@ function nextSecFind(): string {
   return secFindQueue.length > 1 ? secFindQueue.shift()! : secFindQueue[0]!;
 }
 
+function fakeConsumedAccess(): string {
+  return consumedAccessString({
+    env: { USER: 'fixture-user' },
+    runner: () => nextSecFind(),
+  });
+}
+
 function argvOf(file: unknown, args: unknown): string[] {
   const head = typeof file === 'string' ? file : String(file ?? '');
   const rest = Array.isArray(args) ? args.map((a) => String(a)) : [];
@@ -245,7 +252,7 @@ async function runConsumeThroughProxy(
     getCredentialForAccount: createOwnedCredentialSource({
       store,
       keychain: refusingKeychain,
-      ...(getConsumedAccess ? { getConsumedAccess } : {}),
+      getConsumedAccess: getConsumedAccess ?? fakeConsumedAccess,
     }),
     upstreams: { anthropicBase: mock.url, codexBase: mock.url },
   });
@@ -335,7 +342,7 @@ describe('consume injected spies', () => {
     const snaps = loadCswapUsageSnapshots({ sequencePath, usagePath, nowMs });
     assert.ok(Array.isArray(snaps));
 
-    const access = consumedAccessString({ env: { USER: 'fixture-user' } });
+    const access = fakeConsumedAccess();
     assert.equal(typeof access, 'string');
     assert.ok(access.length > 0);
 
@@ -384,7 +391,7 @@ describe('consume injected spies', () => {
       resetSpies();
       const run = await runConsumeThroughProxy([ccBlob('access-a'), ccBlob('access-b')], () => {
         forbidden();
-        return consumedAccessString();
+        return fakeConsumedAccess();
       });
       console.log(`MUTATION ${counter}=${spies[counter]} SECURITY_FINDS=${spies.securityFinds}`);
       assert.equal(run.status, 200);

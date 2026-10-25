@@ -18,6 +18,7 @@ import {
   classifyRefreshResponse,
   credentialFingerprint,
   isExpired,
+  loginExpiryField,
   loginExpiresAtIso,
   isOAuthTokenExpired,
   needsFreshenBeforeSwitch,
@@ -166,6 +167,32 @@ describe('Anthropic OAuth pure port', () => {
     for (const value of [3e14, 1e16]) {
       assert.throws(() => loginExpiresAtIso(JSON.stringify({ claudeAiOauth: { refreshTokenExpiresAt: value } })));
     }
+  });
+
+  it('keeps the login-expiry field across a refresh and moves it on an interactive login', () => {
+    const beforeRefresh = JSON.stringify({ claudeAiOauth: {
+      accessToken: 'fake-before-access', refreshToken: 'fake-before-refresh', expiresAt: 1,
+      refreshTokenExpiresAt: 1_791_421_596_865,
+    } });
+    // C-swap oauth.py:188–196 updates the refresh response fields in-place.
+    const afterRefresh = JSON.stringify({ claudeAiOauth: {
+      accessToken: 'fake-refreshed-access', refreshToken: 'fake-refreshed-refresh', expiresAt: 2,
+      refreshTokenExpiresAt: 1_791_421_596_865,
+    } });
+    // A fresh interactive login supplies a later login-expiry value.
+    const afterInteractiveLogin = JSON.stringify({ claudeAiOauth: {
+      accessToken: 'fake-login-access', refreshToken: 'fake-login-refresh', expiresAt: 3,
+      refreshTokenExpiresAt: 1_794_877_596_865,
+    } });
+
+    const before = loginExpiryField(parseCredentialBlob(beforeRefresh));
+    const refreshed = loginExpiryField(parseCredentialBlob(afterRefresh));
+    const loggedIn = loginExpiryField(parseCredentialBlob(afterInteractiveLogin));
+    assert.deepEqual(before, { field: 'refreshTokenExpiresAt', iso: '2026-10-08T01:06:36Z' });
+    assert.deepEqual(refreshed, before);
+    assert.deepEqual(loggedIn, { field: 'refreshTokenExpiresAt', iso: '2026-11-17T01:06:36Z' });
+    assert.equal(loginExpiresAtIso(afterRefresh), refreshed.iso);
+    assert.notEqual(loggedIn.iso, refreshed.iso);
   });
 
   it('round-trips credential blobs without dropping unknown fields or changing key order', () => {
