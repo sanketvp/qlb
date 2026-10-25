@@ -1,3 +1,4 @@
+import { redactError } from '../redact';
 import { openStoreConnection } from '../store';
 import { check, guardCheck } from './_check';
 import type { HealthCheck } from './claude-slots';
@@ -21,7 +22,7 @@ export function lifecyclePhase(dbPath: string): LifecyclePhaseResult {
     return {
       available: false,
       phase: 'unknown',
-      reason: error instanceof Error ? error.message : String(error),
+      reason: redactError(error, []),
     };
   } finally {
     try { db?.close(); } catch { /* unavailable connection has no close path */ }
@@ -29,9 +30,8 @@ export function lifecyclePhase(dbPath: string): LifecyclePhaseResult {
 }
 
 /** `--phase` is an assertion, never a phase override (S26/S43). */
-export function lifecyclePhaseCheck(dbPath: string, expected?: string): HealthCheck {
+export function lifecyclePhaseCheck(result: LifecyclePhaseResult, expected?: string): HealthCheck {
   return guardCheck('lifecycle:phase', () => {
-    const result = lifecyclePhase(dbPath);
     if (!result.available) {
       return {
         name: 'lifecycle:phase',

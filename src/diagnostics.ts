@@ -32,7 +32,7 @@ import { autoBreakerCheck } from './checks/auto-breaker';
 import { claudeOauthClientCheck } from './checks/claude-oauth-client';
 import { claudeSlotsCheck } from './checks/claude-slots';
 import { codexSlotsCheck } from './checks/codex-slots';
-import { lifecyclePhase, lifecyclePhaseCheck } from './checks/lifecycle-phase';
+import { lifecyclePhase, lifecyclePhaseCheck, type LifecyclePhaseResult } from './checks/lifecycle-phase';
 import { relogin7dCheck } from './checks/relogin-7d';
 import { openStoreConnection } from './store';
 import { discoverChecks, type CheckDefinition } from './registry';
@@ -398,6 +398,8 @@ export async function doctorQlb(
     hostPlatform?: NodeJS.Platform;
     hostShell?: string;
     hostShellExists?: (path: string) => boolean;
+    /** Tests inject a stable read; production reads lifecycle once per report. */
+    readLifecyclePhase?: (dbPath: string) => LifecyclePhaseResult;
   } = {},
 ): Promise<DoctorReport> {
   const checks: DoctorCheck[] = [];
@@ -494,14 +496,14 @@ export async function doctorQlb(
 
   // A7 checks are real doctor rows, never registry reconciliation placeholders.
   // An unavailable lifecycle phase deliberately makes phase-aware checks WARN.
-  const lifecycle = lifecyclePhase(config.dbPath);
+  const lifecycle = (options.readLifecyclePhase ?? lifecyclePhase)(config.dbPath);
   const phase = lifecycle.phase;
   checks.push(
-    autoBreakerCheck(config.dbPath, 'anthropic'),
-    claudeOauthClientCheck(config.dbPath),
+    autoBreakerCheck(config.dbPath, 'anthropic', lifecycle),
+    claudeOauthClientCheck(config.dbPath, lifecycle),
     claudeSlotsCheck(config.dbPath, phase),
     codexSlotsCheck(config.dbPath, phase),
-    lifecyclePhaseCheck(config.dbPath),
+    lifecyclePhaseCheck(lifecycle),
     relogin7dCheck(config.dbPath, phase),
   );
 

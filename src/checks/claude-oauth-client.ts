@@ -1,6 +1,7 @@
 import { openStoreConnection } from '../store';
 import { check, guardCheck } from './_check';
 import type { HealthCheck } from './claude-slots';
+import { lifecyclePhase, type LifecyclePhaseResult } from './lifecycle-phase';
 
 export default check('claude:oauth-client');
 
@@ -8,7 +9,14 @@ export default check('claude:oauth-client');
  * C-swap v0.28.0 oauth.py:219-225 separates invalid_client from invalid_grant:
  * it is a systemic OAuth-client failure, never evidence that a slot is dead.
  */
-export function claudeOauthClientCheck(dbPath: string): HealthCheck {
+export function claudeOauthClientCheck(dbPath: string, lifecycle?: LifecyclePhaseResult): HealthCheck {
+  const unavailable = (): HealthCheck => ({
+    name: 'claude:oauth-client',
+    level: 'WARN',
+    message: 'store not initialised / not yet v5; Claude OAuth client cannot be evaluated',
+  });
+  if (!(lifecycle ??= lifecyclePhase(dbPath)).available) return unavailable();
+
   return guardCheck('claude:oauth-client', () => {
     const db = openStoreConnection(dbPath, true);
     try {
@@ -27,5 +35,5 @@ export function claudeOauthClientCheck(dbPath: string): HealthCheck {
     } finally {
       db.close();
     }
-  });
+  }, (error) => error instanceof Error && /no such table: usage_polls\b/i.test(error.message) ? unavailable() : undefined);
 }

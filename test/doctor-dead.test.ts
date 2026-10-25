@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync } from 'node:fs';
+import { mkdtempSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
 import { defaultConfig } from '../src/config';
@@ -14,9 +14,15 @@ import { autoBreakerCheck } from '../src/checks/auto-breaker';
 import { claudeOauthClientCheck } from '../src/checks/claude-oauth-client';
 import { claudeSlotsCheck } from '../src/checks/claude-slots';
 import { codexSlotsCheck } from '../src/checks/codex-slots';
-import { lifecyclePhaseCheck } from '../src/checks/lifecycle-phase';
+import { lifecyclePhase, lifecyclePhaseCheck } from '../src/checks/lifecycle-phase';
 import { relogin7dCheck } from '../src/checks/relogin-7d';
 import { openStore } from '../src/store';
+
+const support = join(__dirname, '..', '..', 'test', 'support');
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const { buildV4Store } = require(join(support, 'v4-fixture.cjs')) as {
+  buildV4Store: (path: string) => string;
+};
 
 function fixture() {
   const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-dead-'));
@@ -57,7 +63,7 @@ describe('A7 doctor health primitives', () => {
     assert.equal(relogin7dCheck(dbPath, 'pre-cutover').level, 'N/A');
   });
 
-  it('converts missing database failures into FAIL rows for every health primitive', () => {
+  it('converts missing database failures into safe health rows', () => {
     const dbPath = join(mkdtempSync(join(tmpdir(), 'qlb-doctor-missing-')), 'missing.db');
     assert.doesNotThrow(() => {
       const results = [
@@ -65,10 +71,10 @@ describe('A7 doctor health primitives', () => {
         codexSlotsCheck(dbPath, 'cutover'),
         claudeOauthClientCheck(dbPath),
         autoBreakerCheck(dbPath, 'anthropic'),
-        lifecyclePhaseCheck(dbPath),
+        lifecyclePhaseCheck(lifecyclePhase(dbPath)),
         relogin7dCheck(dbPath, 'cutover'),
       ];
-      assert.deepEqual(results.map((result) => result.level), ['FAIL', 'FAIL', 'FAIL', 'FAIL', 'WARN', 'FAIL']);
+      assert.deepEqual(results.map((result) => result.level), ['FAIL', 'FAIL', 'WARN', 'WARN', 'WARN', 'FAIL']);
     });
   });
 
@@ -78,7 +84,7 @@ describe('A7 doctor health primitives', () => {
     db.close();
 
     assert.doesNotThrow(() => assert.equal(claudeSlotsCheck(dbPath, 'cutover').level, 'FAIL'));
-    assert.doesNotThrow(() => assert.equal(lifecyclePhaseCheck(dbPath).level, 'WARN'));
+    assert.doesNotThrow(() => assert.equal(lifecyclePhaseCheck(lifecyclePhase(dbPath)).level, 'WARN'));
     assert.doesNotThrow(() => assert.deepEqual(relogin7dCheck(dbPath, 'cutover', Number.NaN), {
       name: 'relogin:7d',
       level: 'FAIL',
@@ -118,23 +124,55 @@ describe('A7 doctor health primitives', () => {
     }
   });
 
-  it('reports all A7 checks without PASS when the store is missing or pre-v5', async () => {
+  it('uses one lifecycle read so every A7 row has a consistent phase', async () => {
+    const config = defaultConfig(mkdtempSync(join(tmpdir(), 'qlb-doctor-a7-one-phase-read-')));
+    const store = openStore(config.dbPath);
+    store.close();
+    let reads = 0;
+
+    const report = await doctorQlb(config, {
+      command: () => '',
+      hostCommand: () => '',
+      readLifecyclePhase: () => {
+        reads += 1;
+        return reads === 1
+          ? { available: true, phase: 'pre-cutover' as const }
+          : { available: true, phase: 'cutover' as const };
+      },
+    });
+
+    assert.equal(reads, 1);
+    assert.equal(report.checks.find((row) => row.name === 'lifecycle:phase')?.message, 'phase=pre-cutover');
+    assert.deepEqual(
+      ['claude:slots', 'codex:slots', 'relogin:7d'].map((name) => report.checks.find((row) => row.name === name)?.level),
+      ['N/A', 'N/A', 'N/A'],
+    );
+  });
+
+  it('reports all A7 checks as WARN when the store is missing or real v4', async () => {
+    const a7Names = ['auto:anthropic:breaker', 'claude:oauth-client', 'claude:slots', 'codex:slots', 'lifecycle:phase', 'relogin:7d'];
     for (const makeConfig of [
       () => defaultConfig(mkdtempSync(join(tmpdir(), 'qlb-doctor-a7-missing-'))),
       () => {
-        const config = defaultConfig(mkdtempSync(join(tmpdir(), 'qlb-doctor-a7-old-')));
-        mkdirSync(dirname(config.dbPath), { recursive: true });
-        const db = new DatabaseSync(config.dbPath);
-        db.close();
+        const config = defaultConfig(mkdtempSync(join(tmpdir(), 'qlb-doctor-a7-v4-')));
+        buildV4Store(config.dbPath);
         return config;
       },
     ]) {
       const report = await doctorQlb(makeConfig(), { command: () => '', hostCommand: () => '' });
-      for (const name of ['auto:anthropic:breaker', 'claude:oauth-client', 'claude:slots', 'codex:slots', 'lifecycle:phase', 'relogin:7d']) {
-        const check = report.checks.find((row) => row.name === name);
-        assert.ok(check, `${name} missing from report`);
-        assert.notEqual(check.level, 'PASS', `${name} must not pass without a v5 store`);
-      }
+      assert.equal(report.overall, 'WARN');
+      assert.equal(
+        report.checks.find((row) => row.name === 'auto:anthropic:breaker')?.message,
+        'store not initialised / not yet v5; automatic anthropic breaker cannot be evaluated',
+      );
+      assert.equal(
+        report.checks.find((row) => row.name === 'claude:oauth-client')?.message,
+        'store not initialised / not yet v5; Claude OAuth client cannot be evaluated',
+      );
+      assert.deepEqual(
+        a7Names.map((name) => report.checks.find((row) => row.name === name)?.level),
+        ['WARN', 'WARN', 'WARN', 'WARN', 'WARN', 'WARN'],
+      );
     }
   });
 
@@ -207,8 +245,8 @@ describe('A7 doctor health primitives', () => {
     const dbPath = fixture();
     write(dbPath, "INSERT INTO lifecycle (state, began_at) VALUES ('cutover', ?)", 1_000);
 
-    assert.equal(lifecyclePhaseCheck(dbPath, 'cutover').level, 'PASS');
-    assert.equal(lifecyclePhaseCheck(dbPath, 'retired').level, 'FAIL');
+    assert.equal(lifecyclePhaseCheck(lifecyclePhase(dbPath), 'cutover').level, 'PASS');
+    assert.equal(lifecyclePhaseCheck(lifecyclePhase(dbPath), 'retired').level, 'FAIL');
     appendHealthLog(dbPath, {
       ts: 2_000,
       phase: 'cutover',

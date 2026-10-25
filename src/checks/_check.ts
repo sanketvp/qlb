@@ -7,10 +7,14 @@ export function check(name: string, prefix?: string): CheckDefinition {
 }
 
 /** Converts unexpected diagnostic failures into a safe FAIL result. */
-export function guardCheck(name: string, run: () => HealthCheck): HealthCheck {
+export function guardCheck(
+  name: string,
+  run: () => HealthCheck,
+  recover?: (error: unknown) => HealthCheck | undefined,
+): HealthCheck {
   try {
     return run();
   } catch (error) {
-    return { name, level: 'FAIL', message: `check failed: ${redactError(error, [])}` };
+    return recover?.(error) ?? { name, level: 'FAIL', message: `check failed: ${redactError(error, [])}` };
   }
 }
