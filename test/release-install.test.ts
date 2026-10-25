@@ -290,12 +290,13 @@ describe('release install (AC45)', () => {
     const appDir = join(root, 'qlb-home', 'app');
     const installed = await installRelease({ sourceDir, appDir, sha, dbPath: join(root, 'qlb-home', 'qlb.db') });
     const home = join(root, 'home');
-    cpSync(join(installed.releaseDir, 'extensions', 'qlb-pi'), join(home, '.pi', 'agent', 'extensions', 'qlb-pi'), { recursive: true });
+    // In test mode QLB resolves Pi paths under QLB_HOME (R0e), not HOME.
+    cpSync(join(installed.releaseDir, 'extensions', 'qlb-pi'), join(root, 'qlb-home', '.pi', 'agent', 'extensions', 'qlb-pi'), { recursive: true });
     const piRoot = join(root, 'pi');
     mkdirSync(piRoot, { recursive: true });
     writeFileSync(join(piRoot, 'package.json'), JSON.stringify({ name: '@earendil-works/pi-coding-agent', version: 'fixture' }));
     const result = spawnSync(process.execPath, [join(installed.releaseDir, 'dist', 'cli.js'), 'doctor', '--json'], {
-      env: { ...process.env, HOME: home, QLB_TEST_MODE: '1', QLB_HOME: home, QLB_PI_PACKAGE_ROOT: piRoot }, encoding: 'utf8',
+      env: { ...process.env, HOME: home, QLB_TEST_MODE: '1', QLB_HOME: join(root, 'qlb-home'), QLB_PI_PACKAGE_ROOT: piRoot }, encoding: 'utf8',
     });
     const report = JSON.parse(result.stdout) as { checks: Array<{ name: string; message: string }> };
     assert.ok(report.checks.some((check) => check.name === 'pi:extension' && !/skipping Pi checks/.test(check.message)));
@@ -341,6 +342,31 @@ describe('release install (AC45)', () => {
     const installed = await installRelease({ sourceDir, appDir: join(root, 'app'), sha: 'nested-sha', dbPath: join(root, 'db') });
     assert.equal(readFileSync(join(installed.releaseDir, 'node_modules', 'parent', 'node_modules', 'child', 'index.js'), 'utf8'), 'nested child');
     assert.equal(readFileSync(join(installed.releaseDir, 'node_modules', 'parent', 'node_modules', 'optional', 'index.js'), 'utf8'), 'optional child');
+  });
+
+  it('copies aliased runtime packages to each Node resolution location', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-release-aliased-dependency-'));
+    const sourceDir = sourceBuild(root, 'aliased-sha', { a: '1.0.0', x: '1.0.0' });
+    const nestedX = join(sourceDir, 'node_modules', 'a', 'node_modules', 'x');
+    mkdirSync(nestedX, { recursive: true });
+    writeFileSync(join(sourceDir, 'node_modules', 'a', 'package.json'), JSON.stringify({
+      name: 'a', version: '1.0.0', dependencies: { x: '1.0.0' },
+    }));
+    writeFileSync(join(nestedX, 'package.json'), JSON.stringify({ name: 'x', version: '1.0.0' }));
+    writeFileSync(join(nestedX, 'index.js'), 'module.exports = "nested x";\n');
+    symlinkSync(join('a', 'node_modules', 'x'), join(sourceDir, 'node_modules', 'x'));
+    writeFileSync(join(sourceDir, 'dist', 'cli.js'), 'console.log(require("x"));\n');
+    writeFileSync(join(sourceDir, 'dist', '.build-sha'), buildStamp('aliased-sha', false, shippedBuildDigest(sourceDir)));
+
+    const installed = await installRelease({ sourceDir, appDir: join(root, 'app'), sha: 'aliased-sha', dbPath: join(root, 'db') });
+    assert.ok(existsSync(join(installed.releaseDir, 'node_modules', 'x', 'index.js')));
+    assert.ok(existsSync(join(installed.releaseDir, 'node_modules', 'a', 'node_modules', 'x', 'index.js')));
+    const output = execFileSync(process.execPath, [join(installed.releaseDir, 'dist', 'cli.js')], {
+      cwd: installed.releaseDir,
+      env: { ...process.env, HOME: join(root, 'home'), QLB_TEST_MODE: '1', QLB_HOME: join(root, 'qlb-home') },
+      encoding: 'utf8',
+    });
+    assert.equal(output, 'nested x\n');
   });
 
   it('rejects dependency names that can escape node_modules', async () => {

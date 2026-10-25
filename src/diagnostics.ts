@@ -2,8 +2,6 @@ import { execFileSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { consumeMarkerPathFor, CSWAP_ANTHROPIC_STORE } from './cswap-consume';
-import { DatabaseSync } from 'node:sqlite';
-
 import { builtInAdapters } from './adapters';
 import { CONFIG_ENV_VARS, OPENROUTER_KEYCHAIN_SERVICE, type QlbConfig } from './config';
 import { cswapCachePresent } from './cswap-usage';
@@ -42,9 +40,19 @@ import { piStaleSessionsCheck } from './checks/pi-stale-sessions';
 import { qlbHomeDir } from './home';
 import { piReleaseAppDir } from './pi-deploy';
 import { probeHostEnvironment, type HostCommandRunner } from './checks/hosts-env';
+import { autoBreakerCheck } from './checks/auto-breaker';
+import { claudeOauthClientCheck } from './checks/claude-oauth-client';
+import { claudeSlotsCheck } from './checks/claude-slots';
+import { codexSlotsCheck } from './checks/codex-slots';
+import { guardCheck } from './checks/_check';
+import { lifecyclePhase, lifecyclePhaseCheck, type LifecyclePhaseResult } from './checks/lifecycle-phase';
+import { relogin7dCheck } from './checks/relogin-7d';
+import { openStoreConnection } from './store';
 import { discoverChecks, type CheckDefinition } from './registry';
+import { lifecycleWindowCheck } from './checks/lifecycle-window';
+import { lifecycleDrillCheck } from './checks/lifecycle-drill';
 
-export type CheckLevel = 'PASS' | 'WARN' | 'FAIL';
+export type CheckLevel = 'PASS' | 'WARN' | 'FAIL' | 'INFO' | 'N/A';
 
 export interface ProviderDiagnostic {
   provider: string;
@@ -460,6 +468,8 @@ export async function doctorQlb(
     hostShellExists?: (path: string) => boolean;
     /** Test-only fixture for `ps -axo pid=,lstart=,command=`. */
     piProcessList?: () => string;
+    /** Tests inject a stable read; production reads lifecycle once per report. */
+    readLifecyclePhase?: (dbPath: string) => LifecyclePhaseResult;
   } = {},
 ): Promise<DoctorReport> {
   const checks: DoctorCheck[] = [];
@@ -470,10 +480,10 @@ export async function doctorQlb(
   if (!existsSync(config.dbPath)) {
     checks.push({ name: 'sqlite', level: 'WARN', message: `database does not exist yet: ${config.dbPath}; run qlb status` });
   } else {
-    let db: DatabaseSync | undefined;
+    let db: ReturnType<typeof openStoreConnection> | undefined;
     let sqliteCheck: DoctorCheck | undefined;
     try {
-      db = new DatabaseSync(config.dbPath, { readOnly: true });
+      db = openStoreConnection(config.dbPath, true);
       const integrity = db.prepare('PRAGMA integrity_check').get() as { integrity_check?: string } | undefined;
       sqliteCheck = integrity?.integrity_check !== 'ok'
         ? { name: 'sqlite', level: 'FAIL', message: 'PRAGMA integrity_check failed', detail: integrity }
@@ -553,6 +563,36 @@ export async function doctorQlb(
     shell: 'hostShell' in options ? options.hostShell : process.env.SHELL,
     shellExists: options.hostShellExists ?? existsSync,
   }));
+
+  // A7 checks are real doctor rows, never registry reconciliation placeholders.
+  // An unavailable lifecycle phase deliberately makes phase-aware checks WARN.
+  const lifecycle = (options.readLifecyclePhase ?? lifecyclePhase)(config.dbPath);
+
+  // Doctor never migrates or scrubs: the window/drill rows read the lifecycle table
+  // directly by path instead of constructing a Store (whose open path writes).
+  if (lifecycle.available) {
+    const lifecycleDb = { dbPath: config.dbPath };
+    for (const [name, run] of [
+      ['lifecycle:window', () => lifecycleWindowCheck(lifecycleDb)],
+      ['lifecycle:drill', () => lifecycleDrillCheck(lifecycleDb)],
+    ] as const) {
+      checks.push(guardCheck(name, run));
+    }
+  } else {
+    for (const name of ['lifecycle:window', 'lifecycle:drill']) {
+      checks.push({ name, level: 'WARN', message: 'store not initialised / not yet v5; lifecycle cannot be evaluated' });
+    }
+  }
+
+  const phase = lifecycle.phase;
+  checks.push(
+    autoBreakerCheck(config.dbPath, 'anthropic', lifecycle),
+    claudeOauthClientCheck(config.dbPath, lifecycle),
+    claudeSlotsCheck(config.dbPath, phase),
+    codexSlotsCheck(config.dbPath, phase),
+    lifecyclePhaseCheck(lifecycle),
+    relogin7dCheck(config.dbPath, phase),
+  );
 
   const owned = migrations.filter((m) => m.state === 'QLB_OWNED' || m.state === 'RETIRED');
   if (owned.length > 0 && accounts.length > 0) {
