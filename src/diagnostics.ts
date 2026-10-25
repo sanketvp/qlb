@@ -520,21 +520,6 @@ export async function doctorQlb(
     checks.push(sqliteCheck);
   }
 
-  if (existsSync(config.dbPath)) {
-    try {
-      const lifecycleStore = openStore(config.dbPath);
-      try {
-        checks.push(lifecycleWindowCheck(lifecycleStore), lifecycleDrillCheck(lifecycleStore));
-      } finally { lifecycleStore.close(); }
-    } catch (err) {
-      checks.push({
-        name: 'lifecycle:window', level: 'WARN',
-        message: `lifecycle checks unavailable: ${err instanceof Error ? err.message : String(err)}`,
-      });
-      checks.push({ name: 'lifecycle:drill', level: 'WARN', message: 'lifecycle checks unavailable' });
-    }
-  }
-
   const stuck = migrations.filter((migration) => isStuckMigration(migration));
   if (stuck.length > 0) {
     const parts = stuck.map((migration) => {
@@ -576,6 +561,24 @@ export async function doctorQlb(
   // A7 checks are real doctor rows, never registry reconciliation placeholders.
   // An unavailable lifecycle phase deliberately makes phase-aware checks WARN.
   const lifecycle = (options.readLifecyclePhase ?? lifecyclePhase)(config.dbPath);
+
+  // Doctor never migrates: openStore would upgrade a missing or pre-v5 store, so the
+  // lifecycle window/drill rows run only once the read-only phase read succeeds.
+  if (lifecycle.available) {
+    try {
+      const lifecycleStore = openStore(config.dbPath);
+      try {
+        checks.push(lifecycleWindowCheck(lifecycleStore), lifecycleDrillCheck(lifecycleStore));
+      } finally { lifecycleStore.close(); }
+    } catch (err) {
+      checks.push({
+        name: 'lifecycle:window', level: 'WARN',
+        message: `lifecycle checks unavailable: ${err instanceof Error ? err.message : String(err)}`,
+      });
+      checks.push({ name: 'lifecycle:drill', level: 'WARN', message: 'lifecycle checks unavailable' });
+    }
+  }
+
   const phase = lifecycle.phase;
   checks.push(
     autoBreakerCheck(config.dbPath, 'anthropic', lifecycle),
