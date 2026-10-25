@@ -1789,7 +1789,7 @@ export async function runExecutingCommand(
     return await match.command.execute!(match.args, context);
   } catch (err) {
     context.stderr(`qlb ${match.command.name}: ${redactError(err, knownCommandSecrets(context))}`);
-    return 1;
+    return typeof err === 'object' && err !== null && (err as { exitCode?: unknown }).exitCode === 3 ? 3 : 1;
   }
 }
 

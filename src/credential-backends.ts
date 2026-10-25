@@ -23,7 +23,7 @@ import {
   renameSync,
   writeFileSync,
 } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { qlbHomeDir } from './home';
 
 export interface CredentialBackend {
@@ -190,27 +190,30 @@ abstract class SyncCredentialBackend implements CredentialBackend {
 export const MACOS_SECURITY_BIN = '/usr/bin/security';
 /** Bound every macOS Keychain spawn so a locked Keychain cannot hang the CLI. */
 export const MACOS_SECURITY_TIMEOUT_MS = 5_000;
-const SECURITY_STDIN_LINE_LIMIT = 4096 - 64;
-
-function quoteInteractiveField(value: string): string {
-  const escaped = value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-  return `"${escaped}"`;
+/** Location of the signed helper in both source and compiled executions. */
+export function defaultKeychainHelperPath(): string {
+  // dist/ is directly under the repository root; test compilation uses
+  // dist-test/src/. Select by layout rather than whether a binary happens to
+  // exist, so a missing build cannot accidentally resolve to a sibling checkout.
+  const repositoryRoot = basename(dirname(__dirname)) === 'dist-test'
+    ? resolve(__dirname, '..', '..')
+    : resolve(__dirname, '..');
+  return join(repositoryRoot, 'native', 'keychain-helper', 'build', 'qlb-keychain-helper');
 }
 
-function assertInteractiveField(value: string): void {
-  if (/[\r\n\0]/.test(value)) {
-    throw new Error('keychain set refused: service and account must not contain CR, LF, or NUL');
+/** A missing helper is an operator-actionable failure, not a generic Keychain error. */
+export class KeychainHelperMissingError extends Error {
+  readonly code = 'HELPER_MISSING';
+  readonly exitCode = 3;
+
+  constructor(readonly path: string) {
+    super(`helper-missing: ${path}; run npm run build:helper`);
+    this.name = 'KeychainHelperMissingError';
   }
 }
 
-/** Location of the signed helper in both source and compiled executions. */
-export function defaultKeychainHelperPath(): string {
-  const standard = resolve(__dirname, '..', 'native', 'keychain-helper', 'build', 'qlb-keychain-helper');
-  // Test compilation nests source under dist-test/src; production dist is one
-  // level below the repository root.
-  return existsSync(standard)
-    ? standard
-    : resolve(__dirname, '..', '..', 'native', 'keychain-helper', 'build', 'qlb-keychain-helper');
+function assertHelperPresent(path: string): void {
+  if (!existsSync(path)) throw new KeychainHelperMissingError(path);
 }
 
 /** Raised only for cached display reads during the brief Keychain failure backoff. */
@@ -275,53 +278,20 @@ export class MacosKeychainBackend extends SyncCredentialBackend {
 
   setSync(service: string, account: string, jsonValue: string): void {
     this.assertNativeAccessEnabled();
-    if (this.fakeExecutor && this.helperPath === undefined) {
-      assertInteractiveField(service);
-      assertInteractiveField(account);
-    }
+    const helper = this.helperPath ?? defaultKeychainHelperPath();
+    if (!this.fakeExecutor) assertHelperPresent(helper);
     try {
-      // Production writes deliberately have one route: the signed Swift helper
-      // receives the payload on stdin, never in argv or a security command.
-      if (!this.fakeExecutor || this.helperPath !== undefined) {
-        this.exec(this.helperPath ?? defaultKeychainHelperPath(), ['set', service, account], {
-          encoding: 'utf8', input: jsonValue, timeout: MACOS_SECURITY_TIMEOUT_MS,
-        });
-        return;
-      }
-      // Existing A2 fake executors model the historical CLI protocol. This
-      // branch is reachable only by a branded in-memory test double; it never
-      // executes in production and lets the older facade tests remain hermetic.
-      this.legacyFakeSet(service, account, jsonValue);
+      // Every write, including test doubles, follows the helper's stdin protocol.
+      this.exec(helper, ['set', service, account], {
+        encoding: 'utf8', input: jsonValue, timeout: MACOS_SECURITY_TIMEOUT_MS,
+      });
     } catch (err) {
-      if (isSecurityTimeout(err)) {
-        throw securityTimeoutError(this.fakeExecutor && this.helperPath === undefined
-          ? ['add', 'generic', 'password'].join('-')
-          : 'keychain helper set');
-      }
+      if (err instanceof KeychainHelperMissingError) throw err;
+      if (isSecurityTimeout(err)) throw securityTimeoutError('keychain helper set');
       // Child-process errors can include stdin payload material, so never keep
       // their message.
       throw new Error(`keychain set failed for service=${service} account=${account}`);
     }
-  }
-
-  private legacyFakeSet(service: string, account: string, jsonValue: string): void {
-    const hexValue = Buffer.from(jsonValue, 'utf8').toString('hex');
-    const commandName = ['add', 'generic', 'password'].join('-');
-    const command = (
-      `${commandName} -U -a ${quoteInteractiveField(account)} `
-      + `-s ${quoteInteractiveField(service)} -X ${hexValue}\n`
-    );
-    if (Buffer.byteLength(command, 'utf8') <= SECURITY_STDIN_LINE_LIMIT) {
-      this.exec(MACOS_SECURITY_BIN, ['-i'], {
-        encoding: 'utf8', input: command, timeout: MACOS_SECURITY_TIMEOUT_MS,
-      });
-      return;
-    }
-    this.exec(
-      MACOS_SECURITY_BIN,
-      [commandName, '-U', '-a', account, '-s', service, '-X', hexValue],
-      { encoding: 'utf8', timeout: MACOS_SECURITY_TIMEOUT_MS },
-    );
   }
 
   getSync(service: string, account: string): string {
@@ -343,23 +313,16 @@ export class MacosKeychainBackend extends SyncCredentialBackend {
 
   deleteSync(service: string, account: string): void {
     this.assertNativeAccessEnabled();
+    const helper = this.helperPath ?? defaultKeychainHelperPath();
+    if (!this.fakeExecutor) assertHelperPresent(helper);
     try {
-      if (!this.fakeExecutor || this.helperPath !== undefined) {
-        this.exec(this.helperPath ?? defaultKeychainHelperPath(), ['delete', service, account], {
-          encoding: 'utf8', timeout: MACOS_SECURITY_TIMEOUT_MS,
-        });
-        return;
-      }
-      this.exec(
-        MACOS_SECURITY_BIN,
-        ['delete-generic-password', '-a', account, '-s', service],
-        { encoding: 'utf8', timeout: MACOS_SECURITY_TIMEOUT_MS },
-      );
+      this.exec(helper, ['delete', service, account], {
+        encoding: 'utf8', timeout: MACOS_SECURITY_TIMEOUT_MS,
+      });
     } catch (err) {
+      if (err instanceof KeychainHelperMissingError) throw err;
       if (isSecurityTimeout(err)) {
-        throw wrapCredentialError('delete', service, account, securityTimeoutError(
-          this.fakeExecutor && this.helperPath === undefined ? 'delete-generic-password' : 'keychain helper delete',
-        ));
+        throw wrapCredentialError('delete', service, account, securityTimeoutError('keychain helper delete'));
       }
       throw wrapCredentialError('delete', service, account, err);
     }

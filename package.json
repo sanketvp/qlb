@@ -23,7 +23,7 @@
     "dev": "ts-node src/cli.ts",
     "test": "export QLB_TEST_MODE=1 QLB_HOME=\"$(mktemp -d)\"; node scripts/clean-registry-output.cjs dist-test/src && tsc -p tsconfig.test.json && node --test dist-test/test/*.test.js",
     "typecheck:pi": "tsc && node scripts/typecheck-pi.js",
-    "build:helper": "bash scripts/build-keychain-helper.sh"
+    "build:helper": "node scripts/build-helper.mjs"
   },
   "engines": {
     "node": ">=22"

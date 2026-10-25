@@ -1,4 +1,4 @@
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { consumeMarkerPathFor, CSWAP_ANTHROPIC_STORE } from './cswap-consume';
@@ -16,6 +16,7 @@ import {
 } from './credential-backends';
 import {
   defaultCommandExists,
+  defaultKeychainHelperPath,
   MACOS_SECURITY_BIN,
   platformKeychain,
   readNativeOpenRouterKey,
@@ -76,6 +77,26 @@ export interface DoctorReport {
 }
 
 type CommandRunner = (command: string, args: string[]) => string;
+
+const HELPER_CHECK_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
+
+export interface HelperSigningState {
+  authority: string;
+  binaryHash: string;
+  identityHash: string;
+}
+
+/** `codesign -dv` metadata only: no Keychain values are read. */
+export function inspectHelperSigning(path = defaultKeychainHelperPath()): HelperSigningState | null {
+  if (!existsSync(path)) return null;
+  const result = spawnSync('/usr/bin/codesign', ['-d', '-v', '-r-', path], { encoding: 'utf8' });
+  if (result.status !== 0) return null;
+  const details = `${result.stdout ?? ''}\n${result.stderr ?? ''}`;
+  const authority = /^Authority=(.+)$/m.exec(details)?.[1]?.trim();
+  const binaryHash = /^CDHash=([0-9a-fA-F]+)$/m.exec(details)?.[1]?.toLowerCase();
+  const identityHash = /certificate leaf = H"([0-9a-fA-F]{40})"/.exec(details)?.[1]?.toLowerCase();
+  return authority && binaryHash && identityHash ? { authority, binaryHash, identityHash } : null;
+}
 
 /** The diagnostic registry is separate from the runtime report so checks can be added independently. */
 export function listCheckNames(): string[] {
@@ -314,7 +335,7 @@ function unsupportedOpenRouterService(service: string): ProviderDiagnostic {
 function openRouterSetupExample(): string {
   const service = OPENROUTER_KEYCHAIN_SERVICE;
   if (process.platform === 'darwin') {
-    return `${['security', ['add', 'generic', 'password'].join('-')].join(' ')} -s ${service} -a qlb -w '<key>'`;
+    return `store the key in Keychain Access as service ${service} account qlb`;
   }
   if (process.platform === 'win32') {
     return `store the key in the DPAPI credential file (~/.qlb/credentials-windows.json) as service ${service} account qlb`;
@@ -456,6 +477,10 @@ export async function doctorQlb(
     hostShellExists?: (path: string) => boolean;
     /** Tests may inject recorded Keychain matrix/authorization state without a real store. */
     configReader?: (key: string) => string | null;
+    /** Tests inject signing metadata rather than requiring a locally built helper. */
+    helperSigning?: () => HelperSigningState | null;
+    /** Tests control matrix receipt age without changing the system clock. */
+    now?: () => number;
   } = {},
 ): Promise<DoctorReport> {
   const checks: DoctorCheck[] = [];
@@ -493,11 +518,17 @@ export async function doctorQlb(
       }
       const cfgTable = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='config'").get();
       if (cfgTable) {
-        const rows = db.prepare('SELECT key, value FROM config WHERE key IN (?, ?, ?, ?)').all(
+        const rows = db.prepare('SELECT key, value FROM config WHERE key IN (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').all(
           'migrations.recovery_pending',
           'keychain.helperCheckResult',
           'keychain.helperCheckPrompted',
+          'keychain.helperCheckAt',
+          'keychain.helperCheckBinaryHash',
+          'keychain.helperCheckIdentityHash',
           'keychain.liveItemsReadAuthorizedAt',
+          'keychain.liveItemsReadAuthorizedIdentityHash',
+          'keychain.liveItemsAuthorizedAt',
+          'keychain.liveItemsAuthorizedIdentityHash',
         ) as Array<{ key: string; value: string }>;
         for (const row of rows) recordedConfig.set(row.key, row.value);
         recoveryPending = recordedConfig.has('migrations.recovery_pending');
@@ -553,19 +584,35 @@ export async function doctorQlb(
   const hostPlatform = options.hostPlatform ?? process.platform;
   if (hostPlatform === 'darwin') {
     const configValue = options.configReader ?? ((key: string) => recordedConfig.get(key) ?? null);
+    const signing = (options.helperSigning ?? inspectHelperSigning)();
     const helperResult = configValue('keychain.helperCheckResult');
     const helperPrompted = configValue('keychain.helperCheckPrompted') === 'true';
-    if (helperResult === null) {
-      checks.push({ name: 'keychain:helper', level: 'WARN', message: 'no recorded disposable helper matrix result; run qlb keychain check-launchd' });
-    } else if (helperResult !== 'ok' || helperPrompted) {
-      checks.push({ name: 'keychain:helper', level: 'FAIL', message: helperPrompted ? 'helper matrix recorded a Keychain prompt' : 'recorded helper matrix did not pass' });
+    const helperAt = Number(configValue('keychain.helperCheckAt'));
+    const helperHash = configValue('keychain.helperCheckBinaryHash');
+    const helperIdentityHash = configValue('keychain.helperCheckIdentityHash');
+    const recent = Number.isFinite(helperAt) && helperAt > 0 && (options.now ?? Date.now)() - helperAt <= HELPER_CHECK_MAX_AGE_MS;
+    if (!signing || signing.authority !== 'QLB Keychain Helper') {
+      checks.push({ name: 'keychain:helper', level: 'FAIL', message: 'signed QLB Keychain Helper binary is missing or its identity does not match' });
+    } else if (helperResult === null || !Number.isFinite(helperAt)) {
+      checks.push({ name: 'keychain:helper', level: 'WARN', message: 'helper matrix has not been evaluated; run qlb keychain check-launchd' });
+    } else if (helperResult !== 'ok' || helperPrompted || helperHash !== signing.binaryHash || helperIdentityHash !== signing.identityHash) {
+      checks.push({ name: 'keychain:helper', level: 'FAIL', message: helperPrompted ? 'helper matrix recorded a Keychain prompt' : 'helper matrix does not match the current signed helper' });
+    } else if (!recent) {
+      checks.push({ name: 'keychain:helper', level: 'WARN', message: 'helper matrix result is stale; run qlb keychain check-launchd' });
     } else {
-      checks.push({ name: 'keychain:helper', level: 'PASS', message: 'recorded disposable helper matrix passed without a prompt' });
+      checks.push({ name: 'keychain:helper', level: 'PASS', message: 'current signed helper matrix passed without a prompt' });
     }
-    if (configValue('keychain.liveItemsReadAuthorizedAt') === null) {
-      checks.push({ name: 'keychain:live-items-authorized', level: 'FAIL', message: 'live Keychain items have not been read-authorized; run qlb keychain authorize' });
+
+    const readAuthorizedAt = configValue('keychain.liveItemsReadAuthorizedAt');
+    const readHash = configValue('keychain.liveItemsReadAuthorizedIdentityHash');
+    const liveAuthorizedAt = configValue('keychain.liveItemsAuthorizedAt');
+    const liveHash = configValue('keychain.liveItemsAuthorizedIdentityHash');
+    if (readAuthorizedAt === null || readHash === null) {
+      checks.push({ name: 'keychain:live-items-authorized', level: 'WARN', message: 'unknown: live Keychain item authorization has not been evaluated' });
+    } else if (!signing || readHash !== signing.identityHash || (liveAuthorizedAt !== null && liveHash !== signing.identityHash)) {
+      checks.push({ name: 'keychain:live-items-authorized', level: 'FAIL', message: 'live Keychain authorization was recorded for a different helper identity' });
     } else {
-      checks.push({ name: 'keychain:live-items-authorized', level: 'PASS', message: 'live Keychain item read authorization is recorded' });
+      checks.push({ name: 'keychain:live-items-authorized', level: 'PASS', message: 'recorded live Keychain authorization matches the signed helper' });
     }
   }
   checks.push(probeHostEnvironment(options.hostCommand ?? runHostCommand, {

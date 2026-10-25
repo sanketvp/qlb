@@ -19,19 +19,29 @@ private func readPayload() -> Data {
     return value
 }
 
+private var selectedKeychain: SecKeychain?
+
 private func query(_ service: String, _ account: String) -> [CFString: Any] {
-    [
+    var attributes: [CFString: Any] = [
         kSecClass: kSecClassGenericPassword,
         kSecAttrService: service,
         kSecAttrAccount: account,
     ]
+    if let selectedKeychain {
+        attributes[kSecMatchSearchList] = [selectedKeychain] as CFArray
+    }
+    return attributes
+}
+
+private func helperExecutablePath() -> String {
+    Bundle.main.executablePath ?? CommandLine.arguments[0]
 }
 
 private func trustedAccess(_ service: String) -> SecAccess {
     var securityApplication: SecTrustedApplication?
     var helperApplication: SecTrustedApplication?
     guard SecTrustedApplicationCreateFromPath("/usr/bin/security", &securityApplication) == errSecSuccess,
-          SecTrustedApplicationCreateFromPath(CommandLine.arguments[0], &helperApplication) == errSecSuccess,
+          SecTrustedApplicationCreateFromPath(helperExecutablePath(), &helperApplication) == errSecSuccess,
           let securityApplication,
           let helperApplication else {
         fail("could not create trusted applications")
@@ -44,20 +54,48 @@ private func trustedAccess(_ service: String) -> SecAccess {
     return access
 }
 
+private func create(_ itemQuery: [CFString: Any], _ service: String, _ data: Data) -> OSStatus {
+    var attributes = itemQuery
+    attributes.removeValue(forKey: kSecMatchSearchList)
+    if let selectedKeychain { attributes[kSecUseKeychain] = selectedKeychain }
+    attributes[kSecValueData] = data
+    attributes[kSecAttrAccess] = trustedAccess(service)
+    return SecItemAdd(attributes as CFDictionary, nil)
+}
+
+private func mayReplaceExistingItem(_ service: String) -> Bool {
+    service.hasPrefix("qlb-test-") || service.hasPrefix("qlb:")
+}
+
 private func set(_ service: String, _ account: String, _ data: Data) {
     let itemQuery = query(service, account)
     let status = SecItemCopyMatching(itemQuery as CFDictionary, nil)
     if status == errSecSuccess {
         let updateStatus = SecItemUpdate(itemQuery as CFDictionary, [kSecValueData: data] as CFDictionary)
-        guard updateStatus == errSecSuccess else { fail("update failed", updateStatus) }
+        if updateStatus == errSecSuccess { return }
+        // Items made by `security` can carry an ACL that excludes the helper.
+        // Only disposable or QLB-owned services may be migrated to the stable
+        // helper/security ACL; any other failed update remains fail-closed.
+        guard mayReplaceExistingItem(service),
+              updateStatus == errSecAuthFailed || updateStatus == errSecInteractionNotAllowed else {
+            fail("update failed", updateStatus)
+        }
+        let deleteStatus = SecItemDelete(itemQuery as CFDictionary)
+        guard deleteStatus == errSecSuccess || deleteStatus == errSecItemNotFound else {
+            fail("update migration delete failed", deleteStatus)
+        }
+        let addStatus = create(itemQuery, service, data)
+        guard addStatus == errSecSuccess else { fail("update migration add failed", addStatus) }
         return
     }
     guard status == errSecItemNotFound else { fail("lookup failed", status) }
 
-    var attributes = itemQuery
-    attributes[kSecValueData] = data
-    attributes[kSecAttrAccess] = trustedAccess(service)
-    let addStatus = SecItemAdd(attributes as CFDictionary, nil)
+    let addStatus = create(itemQuery, service, data)
+    if addStatus == errSecDuplicateItem {
+        let retryStatus = SecItemUpdate(itemQuery as CFDictionary, [kSecValueData: data] as CFDictionary)
+        guard retryStatus == errSecSuccess else { fail("racing update failed", retryStatus) }
+        return
+    }
     guard addStatus == errSecSuccess else { fail("add failed", addStatus) }
 }
 
@@ -123,38 +161,52 @@ private func matrix(_ prefix: String, previousHelper: String? = nil) {
     let marker = Data("matrix-\(UUID().uuidString)".utf8)
     let suffix = UUID().uuidString.lowercased()
     let services = ["\(prefix)security-\(suffix)", "\(prefix)previous-\(suffix)", "\(prefix)helper-\(suffix)"]
-    var cases: [String: String] = ["securityCreated": "fail", "previousHelper": "skipped", "helperCreated": "fail"]
+    var cases: [String: String] = ["securityCreated": "fail", "previousHelper": "fail", "helperCreated": "fail"]
+    var casePrompted: [String: Bool] = ["securityCreated": false, "previousHelper": false, "helperCreated": false]
     var prompted = false
     defer { for service in services { _ = run("/usr/bin/security", ["delete-generic-password", "-a", account, "-s", service]) } }
 
     let securityCreated = run("/usr/bin/security", ["add-generic-password", "-a", account, "-s", services[0], "-w", String(data: marker, encoding: .utf8)!])
-    let securityUpdate = securityCreated.status == 0 ? run(CommandLine.arguments[0], ["set", services[0], account], input: marker) : securityCreated
-    prompted = promptFailure(securityCreated) || promptFailure(securityUpdate)
+    let securityUpdate = securityCreated.status == 0 ? run(helperExecutablePath(), ["set", services[0], account], input: marker) : securityCreated
+    casePrompted["securityCreated"] = promptFailure(securityCreated) || promptFailure(securityUpdate)
+    prompted = casePrompted["securityCreated"]!
     if securityCreated.status == 0 && securityUpdate.status == 0 { cases["securityCreated"] = "pass" }
 
     let previous = previousHelper ?? (NSHomeDirectory() as NSString).appendingPathComponent(".qlb/helper-prev/qlb-keychain-helper")
-    if FileManager.default.isExecutableFile(atPath: previous) {
-        let previousCreate = run(previous, ["set", services[1], account], input: marker)
-        let currentUpdate = previousCreate.status == 0 ? run(CommandLine.arguments[0], ["set", services[1], account], input: marker) : previousCreate
-        prompted = prompted || promptFailure(previousCreate) || promptFailure(currentUpdate)
-        cases["previousHelper"] = previousCreate.status == 0 && currentUpdate.status == 0 ? "pass" : "fail"
-    }
+    let previousCreate = FileManager.default.isExecutableFile(atPath: previous)
+        ? run(previous, ["set", services[1], account], input: marker)
+        : CommandResult(status: 1, output: "previous helper missing", timedOut: false)
+    let currentUpdate = previousCreate.status == 0 ? run(helperExecutablePath(), ["set", services[1], account], input: marker) : previousCreate
+    casePrompted["previousHelper"] = promptFailure(previousCreate) || promptFailure(currentUpdate)
+    prompted = prompted || casePrompted["previousHelper"]!
+    if previousCreate.status == 0 && currentUpdate.status == 0 { cases["previousHelper"] = "pass" }
 
-    let helperCreate = run(CommandLine.arguments[0], ["set", services[2], account], input: marker)
+    let helperCreate = run(helperExecutablePath(), ["set", services[2], account], input: marker)
     let securityRead = helperCreate.status == 0 ? run("/usr/bin/security", ["find-generic-password", "-a", account, "-s", services[2], "-w"]) : helperCreate
-    prompted = prompted || promptFailure(helperCreate) || promptFailure(securityRead)
+    casePrompted["helperCreated"] = promptFailure(helperCreate) || promptFailure(securityRead)
+    prompted = prompted || casePrompted["helperCreated"]!
     if helperCreate.status == 0 && securityRead.status == 0 && Data(securityRead.output.trimmingCharacters(in: .newlines).utf8) == marker {
         cases["helperCreated"] = "pass"
     }
 
-    let result: [String: Any] = ["cases": cases, "prompted": prompted]
+    let result: [String: Any] = ["cases": cases, "casePrompted": casePrompted, "prompted": prompted]
     let json = try! JSONSerialization.data(withJSONObject: result, options: [.sortedKeys])
     FileHandle.standardOutput.write(json)
     FileHandle.standardOutput.write(Data("\n".utf8))
     if prompted || cases.values.contains("fail") { exit(1) }
 }
 
-let args = Array(CommandLine.arguments.dropFirst())
+var args = Array(CommandLine.arguments.dropFirst())
+if args.first == "--keychain" {
+    guard args.count >= 3 else { fail("--keychain requires a path") }
+    var keychain: SecKeychain?
+    guard SecKeychainOpen(args[1], &keychain) == errSecSuccess, let keychain else {
+        fail("could not open requested keychain")
+    }
+    selectedKeychain = keychain
+    args.removeFirst(2)
+}
+
 switch (args.count, args.first) {
 case (3, "set"):
     var payload = readPayload()
@@ -169,6 +221,6 @@ case (2, "matrix"):
 case (3, "matrix"):
     matrix(args[1], previousHelper: args[2])
 default:
-    FileHandle.standardError.write(Data("usage: qlb-keychain-helper set|delete <service> <account> | selftest <qlb-test-service> | matrix <qlb-test-prefix> [previous-helper]\n".utf8))
+    FileHandle.standardError.write(Data("usage: qlb-keychain-helper [--keychain <path>] set|delete <service> <account> | selftest <qlb-test-service> | matrix <qlb-test-prefix> [previous-helper]\n".utf8))
     exit(2)
 }

@@ -6,6 +6,7 @@ import {
   MacosKeychainBackend,
   assertKeychainAccess,
   assertNativeOpenRouterService,
+  defaultKeychainHelperPath,
   MACOS_SECURITY_TIMEOUT_MS,
   markFakeExecutor,
   readNativeOpenRouterKey,
@@ -194,61 +195,30 @@ describe('Keychain access allowlist', () => {
     }
   });
 
-  it('uses security -i below its line-buffer guard and argv -X above it', () => {
+  it('sends every write through the helper stdin protocol', () => {
     const service = 'qlb:anthropic:acct-1';
     const account = 'account';
     const calls: Array<{ file: string; args: string[]; input?: string }> = [];
     const exec: ExecFileSyncFn = (file, args, options) => {
-      calls.push({
-        file,
-        args: [...args],
-        input: typeof options?.input === 'string' ? options.input : undefined,
-      });
+      calls.push({ file, args: [...args], input: typeof options?.input === 'string' ? options.input : undefined });
       return '';
     };
     const backend = withServiceGuard(new MacosKeychainBackend({ execFileSync: markFakeExecutor(exec) }), {
-      macosUserName: () => MACOS_USER,
-      env: {},
+      macosUserName: () => MACOS_USER, env: {},
     });
-    const commandBytes = (value: string) => Buffer.byteLength(
-      `add-generic-password -U -a "${account}" -s "${service}" -X ${Buffer.from(value).toString('hex')}\n`,
-      'utf8',
-    );
-    const under = 'x'.repeat(Math.floor((4032 - commandBytes('')) / 2));
-    const over = `${under}x`;
-
-    assert.ok(commandBytes(under) <= 4032);
-    assert.ok(commandBytes(over) > 4032);
-    backend.setSync(service, account, under);
-    backend.setSync(service, account, over);
-
-    assert.deepEqual(calls[0], {
-      file: '/usr/bin/security',
-      args: ['-i'],
-      input: `add-generic-password -U -a "${account}" -s "${service}" -X ${Buffer.from(under).toString('hex')}\n`,
-    });
-    assert.deepEqual(calls[1], {
-      file: '/usr/bin/security',
-      args: [
-        'add-generic-password', '-U', '-a', account, '-s', service, '-X', Buffer.from(over).toString('hex'),
-      ],
-      input: undefined,
-    });
+    const payload = 'x'.repeat(16 * 1024);
+    backend.setSync(service, account, payload);
+    assert.deepEqual(calls, [{
+      file: defaultKeychainHelperPath(), args: ['set', service, account], input: payload,
+    }]);
   });
 
-  it('quotes security -i fields and rejects line separators before writing', () => {
+  it('passes unusual fields as helper argv values without constructing an interactive command', () => {
     const { backend, calls } = guardedFakeSecurity();
     backend.setSync('qlb:service\\"name', 'account\\"name', 'safe-value');
     assert.deepEqual(calls[0], {
-      file: '/usr/bin/security',
-      args: ['-i'],
-      input: 'add-generic-password -U -a "account\\\\\\"name" -s "qlb:service\\\\\\"name" -X 736166652d76616c7565\n',
+      file: defaultKeychainHelperPath(), args: ['set', 'qlb:service\\"name', 'account\\"name'], input: 'safe-value',
     });
-    assert.throws(
-      () => backend.setSync('qlb:service', 'account\ninjected-command', 'safe-value'),
-      /must not contain CR, LF, or NUL/,
-    );
-    assert.equal(calls.length, 1);
   });
 
   it('bounds every macOS security operation and reports timeouts without command output', () => {
@@ -262,7 +232,7 @@ describe('Keychain access allowlist', () => {
 
     assert.throws(
       () => backend.setSync('qlb:timeout', 'account', 'secret'),
-      /security add-generic-password timed out after 5s/,
+      /security keychain helper set timed out after 5s/
     );
     assert.throws(
       () => backend.getSync('qlb:timeout', 'account'),
@@ -270,7 +240,7 @@ describe('Keychain access allowlist', () => {
     );
     assert.throws(
       () => backend.deleteSync('qlb:timeout', 'account'),
-      /security delete-generic-password timed out after 5s/,
+      /security keychain helper delete timed out after 5s/
     );
     assert.deepEqual(calls.map((call) => call.timeout), [5000, 5000, 5000]);
   });

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
-import { execFileSync, execFileSync as runFile } from 'node:child_process';
+import { execFileSync, execFileSync as runFile, spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { existsSync, mkdtempSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
@@ -44,7 +44,7 @@ describe('Swift Keychain helper write path', () => {
   });
 
   it('parses matrix receipts and records a failing prompted result', () => {
-    const green = parseHelperMatrixResult('{"cases":{"securityCreated":"pass","previousHelper":"skipped","helperCreated":"pass"},"prompted":false}');
+    const green = parseHelperMatrixResult('{"cases":{"securityCreated":"pass","previousHelper":"pass","helperCreated":"pass"},"casePrompted":{"securityCreated":false,"previousHelper":false,"helperCreated":false},"prompted":false}');
     assert.equal(helperMatrixIsOk(green), true);
     assert.equal(helperMatrixConfig(green)['keychain.helperCheckResult'], 'ok');
     const prompted = { ...green, prompted: true };
@@ -63,7 +63,11 @@ describe('Swift Keychain helper write path', () => {
       config, env: {}, home, stdout: (message) => output.push(message), stderr: (message) => errors.push(message),
       loadConfig: () => config, registerSecret: () => {},
     }, {
-      runMatrix: () => ({ cases: { securityCreated: 'fail', previousHelper: 'skipped', helperCreated: 'pass' }, prompted: true }),
+      runMatrix: () => ({
+        cases: { securityCreated: 'fail', previousHelper: 'fail', helperCreated: 'pass' },
+        casePrompted: { securityCreated: true, previousHelper: false, helperCreated: false },
+        prompted: true,
+      }),
     });
     assert.equal(exit, 1);
     assert.deepEqual(output, []);
@@ -75,11 +79,52 @@ describe('Swift Keychain helper write path', () => {
     } finally { store.close(); }
   });
 
-  it('syntax-checks the helper build script and typechecks Swift when available', {
-    skip: process.platform !== 'darwin' || !existsSync('/usr/bin/swiftc'),
+  it('compiles the helper and self-tests only a disposable Keychain', {
+    skip: !existsSync('/usr/bin/swiftc'),
   }, () => {
-    assert.doesNotThrow(() => runFile('/bin/bash', ['-n', 'scripts/build-keychain-helper.sh'], { stdio: 'ignore' }));
-    assert.doesNotThrow(() => runFile('/usr/bin/swiftc', ['-typecheck', 'native/keychain-helper/main.swift'], { stdio: 'ignore' }));
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-keychain-helper-selftest-'));
+    const keychain = join(dir, 't.keychain-db');
+    const binary = join(dir, 'qlb-keychain-helper');
+    const password = randomBytes(24).toString('hex');
+    try {
+      runFile('/usr/bin/security', ['create-keychain', '-p', password, keychain], { stdio: 'ignore' });
+      runFile('/usr/bin/security', ['unlock-keychain', '-p', password, keychain], { stdio: 'ignore' });
+      runFile('/usr/bin/swiftc', ['-o', binary, 'native/keychain-helper/main.swift'], { stdio: 'ignore' });
+      runFile(binary, ['--keychain', keychain, 'selftest', `qlb-test-a2b-${randomBytes(8).toString('hex')}`], {
+        stdio: 'ignore', timeout: 5_000,
+      });
+    } finally {
+      try { runFile('/usr/bin/security', ['delete-keychain', keychain], { stdio: 'ignore' }); } catch { /* cleanup */ }
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('builds twice with one stable identity in a disposable Keychain', {
+    skip: !existsSync('/usr/bin/swiftc'),
+  }, () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-keychain-helper-build-'));
+    const keychain = join(dir, 't.keychain-db');
+    const password = randomBytes(24).toString('hex');
+    const previous = join(dir, 'helper-prev');
+    const env = { ...process.env, QLB_HELPER_PREVIOUS_DIR: previous };
+    const hashes = () => runFile('/usr/bin/security', [
+      'find-certificate', '-c', 'QLB Keychain Helper', '-a', '-Z', keychain,
+    ], { encoding: 'utf8' }).match(/SHA-1 hash:\s*([0-9A-Fa-f]{40})/)?.[1];
+    try {
+      runFile('/usr/bin/security', ['create-keychain', '-p', password, keychain], { stdio: 'ignore' });
+      runFile('/usr/bin/security', ['unlock-keychain', '-p', password, keychain], { stdio: 'ignore' });
+      runFile(process.execPath, ['scripts/build-helper.mjs', '--keychain', keychain], { env, stdio: 'ignore', timeout: 30_000 });
+      const first = hashes();
+      runFile(process.execPath, ['scripts/build-helper.mjs', '--keychain', keychain], { env, stdio: 'ignore', timeout: 30_000 });
+      assert.equal(hashes(), first);
+      assert.ok(first);
+      const details = spawnSync('/usr/bin/codesign', ['-d', '-r-', defaultKeychainHelperPath()], { encoding: 'utf8' });
+      assert.equal(details.status, 0);
+      assert.match(`${details.stdout}\n${details.stderr}`, new RegExp(first!, 'i'));
+    } finally {
+      try { runFile('/usr/bin/security', ['delete-keychain', keychain], { stdio: 'ignore' }); } catch { /* cleanup */ }
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('round-trips a 16 KiB disposable value through the real Keychain', {

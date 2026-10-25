@@ -116,10 +116,15 @@ describe('qlb doctor', () => {
     const values = new Map<string, string>([
       ['keychain.helperCheckResult', 'ok'],
       ['keychain.helperCheckPrompted', 'false'],
+      ['keychain.helperCheckAt', '123'],
+      ['keychain.helperCheckBinaryHash', 'binary-hash'],
+      ['keychain.helperCheckIdentityHash', 'identity-hash'],
       ['keychain.liveItemsReadAuthorizedAt', '123'],
+      ['keychain.liveItemsReadAuthorizedIdentityHash', 'identity-hash'],
     ]);
     const green = await doctorQlb(defaultConfig(home), {
       command: () => 'ok', hostCommand: () => '', hostPlatform: 'darwin', configReader: (key) => values.get(key) ?? null,
+      helperSigning: () => ({ authority: 'QLB Keychain Helper', binaryHash: 'binary-hash', identityHash: 'identity-hash' }), now: () => 124,
     });
     assert.equal(green.checks.find((check) => check.name === 'keychain:helper')?.level, 'PASS');
     assert.equal(green.checks.find((check) => check.name === 'keychain:live-items-authorized')?.level, 'PASS');
@@ -128,9 +133,10 @@ describe('qlb doctor', () => {
     values.delete('keychain.liveItemsReadAuthorizedAt');
     const blocked = await doctorQlb(defaultConfig(home), {
       command: () => 'ok', hostCommand: () => '', hostPlatform: 'darwin', configReader: (key) => values.get(key) ?? null,
+      helperSigning: () => ({ authority: 'QLB Keychain Helper', binaryHash: 'binary-hash', identityHash: 'identity-hash' }), now: () => 124,
     });
     assert.equal(blocked.checks.find((check) => check.name === 'keychain:helper')?.level, 'FAIL');
-    assert.equal(blocked.checks.find((check) => check.name === 'keychain:live-items-authorized')?.level, 'FAIL');
+    assert.equal(blocked.checks.find((check) => check.name === 'keychain:live-items-authorized')?.level, 'WARN');
   });
 
   it('bounds the production security command runner', () => {

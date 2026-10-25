@@ -1,4 +1,4 @@
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -6,9 +6,11 @@ import { defaultKeychainHelperPath, MACOS_SECURITY_TIMEOUT_MS } from '../keychai
 import { openStore } from '../store';
 import type { CommandDefinition, CommandContext } from '../registry';
 
-export type HelperMatrixCase = 'pass' | 'fail' | 'skipped';
+export type HelperMatrixCase = 'pass' | 'fail';
 export interface HelperMatrixResult {
   cases: Record<'securityCreated' | 'previousHelper' | 'helperCreated', HelperMatrixCase>;
+  /** S50 prompt evidence retained separately for each disposable case. */
+  casePrompted: Record<'securityCreated' | 'previousHelper' | 'helperCreated', boolean>;
   prompted: boolean;
 }
 
@@ -37,20 +39,25 @@ function parse(args: string[]): { subcommand: 'matrix' | 'check-launchd'; json: 
 
 /** Parses the native helper's deliberately payload-free matrix receipt. */
 export function parseHelperMatrixResult(text: string): HelperMatrixResult {
-  const value = JSON.parse(text) as { cases?: Record<string, unknown>; prompted?: unknown };
+  const value = JSON.parse(text) as { cases?: Record<string, unknown>; casePrompted?: Record<string, unknown>; prompted?: unknown };
   const cases = value.cases;
+  const casePrompted = value.casePrompted;
   const keys = ['securityCreated', 'previousHelper', 'helperCreated'] as const;
-  if (!cases || typeof cases !== 'object' || typeof value.prompted !== 'boolean') throw new Error('invalid helper matrix receipt');
+  if (!cases || !casePrompted || typeof cases !== 'object' || typeof casePrompted !== 'object' || typeof value.prompted !== 'boolean') throw new Error('invalid helper matrix receipt');
   for (const key of keys) {
-    if (cases[key] !== 'pass' && cases[key] !== 'fail' && cases[key] !== 'skipped') {
+    if ((cases[key] !== 'pass' && cases[key] !== 'fail') || typeof casePrompted[key] !== 'boolean') {
       throw new Error('invalid helper matrix receipt');
     }
   }
-  return { cases: cases as HelperMatrixResult['cases'], prompted: value.prompted };
+  return {
+    cases: cases as HelperMatrixResult['cases'],
+    casePrompted: casePrompted as HelperMatrixResult['casePrompted'],
+    prompted: value.prompted,
+  };
 }
 
 export function helperMatrixIsOk(result: HelperMatrixResult): boolean {
-  return !result.prompted && Object.values(result.cases).every((outcome) => outcome === 'pass' || outcome === 'skipped');
+  return !result.prompted && Object.values(result.cases).every((outcome) => outcome === 'pass');
 }
 
 function assertHelperReady(path: string): void {
@@ -94,7 +101,8 @@ export function runHelperMatrixUnderLaunchd(path: string = helperPath()): Helper
   const receipt = join(dir, 'receipt.json');
   const domain = `gui/${uid}`;
   const previous = join(process.env.HOME ?? '', '.qlb/helper-prev/qlb-keychain-helper');
-  const shell = '"$1" matrix "$2" "$3" > "$4"; rc=$?; printf "%s" "$rc" > "$5"';
+  // Publish status atomically so the polling side never observes an empty file.
+  const shell = '"$1" matrix "$2" "$3" > "$4"; rc=$?; printf "%s" "$rc" > "$5.tmp" && mv "$5.tmp" "$5"';
   const args = ['/bin/sh', '-c', shell, '--', path, 'qlb-test-matrix-', previous, receipt, status];
   const values = args.map((arg) => `      <string>${xml(arg)}</string>`).join('\n');
   writeFileSync(plist, `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>\n  <key>Label</key><string>${label}</string>\n  <key>ProgramArguments</key><array>\n${values}\n  </array>\n  <key>RunAtLoad</key><true/>\n</dict></plist>\n`, { mode: 0o600 });
@@ -116,18 +124,44 @@ export function runHelperMatrixUnderLaunchd(path: string = helperPath()): Helper
   }
 }
 
-export function helperMatrixConfig(result: HelperMatrixResult | null): Record<string, string> {
-  return {
+export interface HelperSigningState {
+  authority: string;
+  binaryHash: string;
+  identityHash: string;
+}
+
+/** Reads only signing metadata; no Keychain item or credential data is opened. */
+export function helperSigningState(path: string): HelperSigningState | null {
+  const result = spawnSync('/usr/bin/codesign', ['-d', '-v', '-r-', path], { encoding: 'utf8' });
+  if (result.status !== 0) return null;
+  const details = `${result.stdout ?? ''}\n${result.stderr ?? ''}`;
+  const authority = /^Authority=(.+)$/m.exec(details)?.[1]?.trim();
+  const binaryHash = /^CDHash=([0-9a-fA-F]+)$/m.exec(details)?.[1]?.toLowerCase();
+  const identityHash = /certificate leaf = H"([0-9a-fA-F]{40})"/.exec(details)?.[1]?.toLowerCase();
+  return authority && binaryHash && identityHash ? { authority, binaryHash, identityHash } : null;
+}
+
+export function helperMatrixConfig(
+  result: HelperMatrixResult | null,
+  signing: HelperSigningState | null = null,
+): Record<string, string> {
+  const config: Record<string, string> = {
     'keychain.helperCheckAt': String(Date.now()),
     'keychain.helperCheckResult': result && helperMatrixIsOk(result) ? 'ok' : 'failed',
     'keychain.helperCheckPrompted': String(result?.prompted === true),
+    'keychain.helperCheckCasePrompted': JSON.stringify(result?.casePrompted ?? {}),
   };
+  if (signing) {
+    config['keychain.helperCheckBinaryHash'] = signing.binaryHash;
+    config['keychain.helperCheckIdentityHash'] = signing.identityHash;
+  }
+  return config;
 }
 
-function writeMatrixConfig(dbPath: string, result: HelperMatrixResult | null): void {
+function writeMatrixConfig(dbPath: string, result: HelperMatrixResult | null, path: string): void {
   const store = openStore(dbPath);
   try {
-    for (const [key, value] of Object.entries(helperMatrixConfig(result))) store.setConfig(key, value);
+    for (const [key, value] of Object.entries(helperMatrixConfig(result, helperSigningState(path)))) store.setConfig(key, value);
   } finally {
     store.close();
   }
@@ -156,15 +190,18 @@ export async function runKeychainCommand(
       ? (dependencies.runLaunchdMatrix ?? runHelperMatrixUnderLaunchd)()
       : (dependencies.runMatrix ?? runHelperMatrix)();
     if (!helperMatrixIsOk(result)) throw new MatrixReceiptError(result);
-    writeMatrixConfig(ctx.config.dbPath, result);
-    const body = { command: options.subcommand, helperCheckResult: 'ok', prompted: result.prompted, cases: result.cases };
+    writeMatrixConfig(ctx.config.dbPath, result, helperPath());
+    const body = {
+      command: options.subcommand, helperCheckResult: 'ok', prompted: result.prompted,
+      casePrompted: result.casePrompted, cases: result.cases,
+    };
     ctx.stdout(options.json ? JSON.stringify(body) : 'Keychain helper matrix passed');
     return 0;
   } catch (err) {
     if (err instanceof MatrixReceiptError) result = err.result;
     // Native command errors can contain implementation details. Do not relay stderr
     // because this boundary must never carry Keychain values.
-    writeMatrixConfig(ctx.config.dbPath, result);
+    writeMatrixConfig(ctx.config.dbPath, result, helperPath());
     ctx.stderr('qlb keychain: helper matrix failed');
     return 1;
   }
