@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 import { existsSync, mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
 import * as net from 'node:net';
 import { dirname, join, resolve } from 'node:path';
 import { adapters } from './adapters';
@@ -8,6 +7,7 @@ import { assertTestHomeIsIsolated } from './bootstrap';
 import { assertAdmitted, type LifecycleOperation } from './lifecycle';
 import { createDefaultCodexGateDeps, runCodexGate } from './codex-gate';
 import { config, resolveConfig, stripConfigArgs } from './config';
+import { qlbHomeDir } from './home';
 import { discoverCommands, resolveCommand, type CommandContext, type CommandDefinition } from './registry';
 import { runCodexProbeClaims } from './commands/codex-probe-claims';
 import { redactError } from './redact';
@@ -1751,7 +1751,7 @@ export function createCommandContext(): CommandContext {
     env: process.env,
     config,
     loadConfig: resolveConfig,
-    home: homedir(),
+    home: qlbHomeDir(),
     registerSecret: (value) => {
       if (value) secrets.add(value);
     },
