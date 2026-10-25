@@ -417,11 +417,17 @@ function schemaEntries(db: DatabaseSync): Array<{ type: string; name: string; sq
     ORDER BY type, name`).all() as Array<{ type: string; name: string; sql: string | null }>;
 }
 
+function sqliteSequenceRows(db: DatabaseSync): Array<{ name: string; seq: number }> {
+  if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_sequence'").get()) return [];
+  return db.prepare('SELECT name, seq FROM sqlite_sequence ORDER BY name').all() as Array<{ name: string; seq: number }>;
+}
+
 export function verifyBackup(source: DatabaseSync, copy: DatabaseSync): boolean {
   const integrity = copy.prepare('PRAGMA integrity_check').get() as { integrity_check?: string } | string | undefined;
   const result = typeof integrity === 'string' ? integrity : integrity?.integrity_check;
   if (result !== 'ok') return false;
   if (JSON.stringify(schemaEntries(source)) !== JSON.stringify(schemaEntries(copy))) return false;
+  if (JSON.stringify(sqliteSequenceRows(source)) !== JSON.stringify(sqliteSequenceRows(copy))) return false;
   const sourceCounts = userTableCounts(source);
   const copyCounts = userTableCounts(copy);
   if (sourceCounts.size !== copyCounts.size) return false;
@@ -508,12 +514,84 @@ function extraColumnDefinition(column: TableColumn): string {
   return definition;
 }
 
-function rebuildV5Table(db: DatabaseSync, table: string, shape: V5TableShape, existing: TableColumn[]): void {
+function columnNameFromDefinition(definition: string): string | undefined {
+  const match = /^\s*(?:"((?:""|[^"])*)"|`([^`]*)`|\[([^\]]*)\]|([A-Za-z_][A-Za-z0-9_$]*))/.exec(definition);
+  return match?.[1]?.replace(/""/g, '"') ?? match?.[2] ?? match?.[3] ?? match?.[4];
+}
+
+function tableDefinitionColumn(db: DatabaseSync, table: string, column: string): string | undefined {
+  const tableSql = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?").get(table) as { sql?: string } | undefined;
+  if (!tableSql?.sql) return undefined;
+  const open = tableSql.sql.indexOf('(');
+  const close = tableSql.sql.lastIndexOf(')');
+  if (open === -1 || close <= open) return undefined;
+  return splitColumnDefinitions(tableSql.sql.slice(open + 1, close)).find((definition) => columnNameFromDefinition(definition) === column);
+}
+
+function sqlWithoutLiteralsOrComments(sql: string): string {
+  return sql
+    .replace(/'(?:''|[^'])*'/g, "''")
+    .replace(/--[^\n]*/g, '')
+    .replace(/\/\*[\s\S]*?\*\//g, '');
+}
+
+function unsupportedExtraColumnFeature(definition: string): string | undefined {
+  const withoutName = sqlWithoutLiteralsOrComments(definition)
+    .replace(/^\s*(?:"(?:""|[^"])*"|`[^`]*`|\[[^\]]*\]|[A-Za-z_][A-Za-z0-9_$]*)/, '');
+  return /\b(UNIQUE|CHECK|COLLATE|REFERENCES)\b/i.exec(withoutName)?.[1].toUpperCase();
+}
+
+function sqlReferencesTableIdentifier(sql: string, table: string): boolean {
+  const escaped = table.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(?:^|[^A-Za-z0-9_$])(?:${escaped}|"${escaped}"|\\[${escaped}\\]|\\x60${escaped}\\x60)(?=$|[^A-Za-z0-9_$])`, 'i').test(sqlWithoutLiteralsOrComments(sql));
+}
+
+function refuseInexactV5Rebuild(table: string, reason: string, verifiedBackupPath: string): never {
+  throw new Error(`cannot correct pre-release v5 ${table}: ${reason}; verified backup: ${verifiedBackupPath}`);
+}
+
+function assertV5RebuildCanBeExact(db: DatabaseSync, table: string, canonical: Set<string>, verifiedBackupPath: string): void {
+  const xinfo = db.prepare(`PRAGMA table_xinfo(${quoteIdentifier(table)})`).all() as unknown as Array<TableColumn & { hidden: number }>;
+  const extras = new Set(xinfo.filter(({ name }) => !canonical.has(name)).map(({ name }) => name));
+  for (const column of xinfo) {
+    if (extras.has(column.name) && Number(column.hidden) !== 0) {
+      refuseInexactV5Rebuild(table, `generated or hidden extra column ${column.name} cannot be reproduced`, verifiedBackupPath);
+    }
+  }
+  for (const column of extras) {
+    const definition = tableDefinitionColumn(db, table, column);
+    const feature = definition && unsupportedExtraColumnFeature(definition);
+    if (feature) {
+      const reason = feature === 'UNIQUE' ? 'UNIQUE constraint' : `${feature} clause`;
+      refuseInexactV5Rebuild(table, `${reason} on extra column ${column} cannot be reproduced`, verifiedBackupPath);
+    }
+  }
+  const indexes = db.prepare(`PRAGMA index_list(${quoteIdentifier(table)})`).all() as Array<{ name: string; origin?: string }>;
+  for (const index of indexes) {
+    if (index.origin !== 'u') continue;
+    const columns = db.prepare(`PRAGMA index_info(${quoteIdentifier(index.name)})`).all() as Array<{ name: string | null }>;
+    const extra = columns.find(({ name }) => name !== null && extras.has(name));
+    if (extra?.name) refuseInexactV5Rebuild(table, `UNIQUE constraint on extra column ${extra.name} cannot be reproduced`, verifiedBackupPath);
+  }
+  const dependents = db.prepare(`SELECT type, name, tbl_name, sql FROM sqlite_master
+    WHERE type IN ('view', 'trigger') AND sql IS NOT NULL AND (type = 'view' OR tbl_name <> ?)
+    ORDER BY type, name`).all(table) as Array<{ type: 'view' | 'trigger'; name: string; sql: string }>;
+  const dependent = dependents.find(({ sql }) => sqlReferencesTableIdentifier(sql, table));
+  if (dependent) {
+    const subject = dependent.type === 'view'
+      ? `view ${dependent.name} references ${table}`
+      : `trigger ${dependent.name} on another table references ${table}`;
+    refuseInexactV5Rebuild(table, `${subject} and prevents an exact rebuild`, verifiedBackupPath);
+  }
+}
+
+function rebuildV5Table(db: DatabaseSync, table: string, shape: V5TableShape, existing: TableColumn[], verifiedBackupPath: string): void {
   const newTable = `${table}__v5new`;
   if (db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(newTable)) {
     throw new Error(`cannot correct pre-release v5 ${table}: temporary table ${newTable} already exists`);
   }
   const canonical = new Set(shape.columns.map(({ name }) => name));
+  assertV5RebuildCanBeExact(db, table, canonical, verifiedBackupPath);
   const extras = existing.filter(({ name }) => !canonical.has(name));
   const definitions = shape.sql.slice(shape.sql.indexOf('(') + 1, -1);
   const createSql = `CREATE TABLE ${quoteIdentifier(newTable)} (${definitions}${extras.length ? `, ${extras.map(extraColumnDefinition).join(', ')}` : ''})`;
@@ -538,7 +616,7 @@ function rebuildV5Table(db: DatabaseSync, table: string, shape: V5TableShape, ex
   for (const { sql } of preservedObjects) db.exec(sql);
 }
 
-function repairMissingV5Columns(db: DatabaseSync): void {
+function repairMissingV5Columns(db: DatabaseSync, verifiedBackupPath: string): void {
   for (const [table, shape] of requiredV5TableShapes()) {
     if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table)) continue;
     const existing = tableColumns(db, table);
@@ -560,7 +638,7 @@ function repairMissingV5Columns(db: DatabaseSync): void {
     if (populated && impossible.length) {
       throw new Error(`cannot correct pre-release v5 ${table}: populated table is missing required column(s) ${impossible.map(({ name }) => name).join(', ')}`);
     }
-    if (requiresRebuild) rebuildV5Table(db, table, shape, existing);
+    if (requiresRebuild) rebuildV5Table(db, table, shape, existing, verifiedBackupPath);
     else for (const column of missing) db.exec(`ALTER TABLE ${quoteIdentifier(table)} ADD COLUMN ${column.definition}`);
   }
 }
@@ -589,7 +667,7 @@ function lifecycleOneOpenIndexMatches(db: DatabaseSync): boolean {
 }
 
 /** Synchronous bridge for Store's established synchronous constructor. Caller holds BEGIN IMMEDIATE. */
-function backupBeforeMigrateSync(dbPath: string, source: DatabaseSync): void {
+function backupBeforeMigrateSync(dbPath: string, source: DatabaseSync): string {
   const backupPath = join(dirname(dbPath), 'backups', `db-${Date.now()}-${process.pid}.sqlite`);
   mkdirSync(dirname(backupPath), { recursive: true, mode: 0o700 });
   const script = `
@@ -612,6 +690,7 @@ function backupBeforeMigrateSync(dbPath: string, source: DatabaseSync): void {
     copy.close();
   }
   try { chmodSync(backupPath, 0o600); } catch { /* best effort */ }
+  return backupPath;
 }
 
 function toReading(row: {
@@ -928,7 +1007,9 @@ export class Store {
       }
       // This is deliberately inside the migration lock, after the backup.
       // It also lets a brand-new database migrate without constructor DDL.
-      if (this.dbPath !== ':memory:') backupBeforeMigrateSync(this.dbPath, this.db);
+      const verifiedBackupPath = this.dbPath !== ':memory:'
+        ? backupBeforeMigrateSync(this.dbPath, this.db)
+        : ':memory:';
       this.createCoreSchema();
       if (version < 2) {
         if (!hasColumn(this.db, 'accounts', 'grant_generation')) this.db.exec('ALTER TABLE accounts ADD COLUMN grant_generation INTEGER DEFAULT 0');
@@ -942,7 +1023,7 @@ export class Store {
       }
       ensureDecisionColumnsOn(this.db);
       this.migrateV5Schema();
-      repairMissingV5Columns(this.db);
+      repairMissingV5Columns(this.db, verifiedBackupPath);
       if (!lifecycleOneOpenIndexMatches(this.db)) {
         this.db.exec('DROP INDEX IF EXISTS lifecycle_one_open');
         this.db.exec(`${LIFECYCLE_ONE_OPEN_INDEX_SQL};`);

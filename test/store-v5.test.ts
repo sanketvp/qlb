@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readdirSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -196,6 +196,89 @@ describe('store v5 schema (AC38)', () => {
         if (populated) assert.equal((check.prepare('SELECT forward_compatible FROM claude_slots').get() as { forward_compatible: string }).forward_compatible, 'retain-me');
       } finally { check.close(); }
     }
+  });
+
+  it('refuses inexact rebuilds after verifying a backup and keeps the database unchanged', () => {
+    const cases = [
+      {
+        name: 'an extra UNIQUE column',
+        extra: 'forward_compatible TEXT UNIQUE',
+        dependent: '',
+        reason: /UNIQUE constraint on extra column forward_compatible/,
+      },
+      {
+        name: 'an extra generated column',
+        extra: 'forward_compatible TEXT GENERATED ALWAYS AS (upper(alias)) VIRTUAL',
+        dependent: '',
+        reason: /generated or hidden extra column forward_compatible/,
+      },
+      {
+        name: 'a view that references the table',
+        extra: 'forward_compatible TEXT',
+        dependent: 'CREATE VIEW claude_slots_view AS SELECT account_id FROM claude_slots',
+        reason: /view claude_slots_view references claude_slots/,
+      },
+      {
+        name: 'a trigger on another table that references the table',
+        extra: 'forward_compatible TEXT',
+        dependent: `CREATE TABLE slot_audit (id INTEGER PRIMARY KEY);
+          CREATE TRIGGER slot_audit_touch AFTER INSERT ON slot_audit BEGIN
+            SELECT account_id FROM claude_slots;
+          END`,
+        reason: /trigger slot_audit_touch on another table references claude_slots/,
+      },
+    ];
+
+    for (const fixture of cases) {
+      const path = join(mkdtempSync(join(tmpdir(), 'qlb-v5-inexact-rebuild-')), 'qlb.db');
+      const initial = openStore(path);
+      initial.close();
+      const db = new DatabaseSync(path);
+      db.exec(`DROP TABLE claude_slots;
+        CREATE TABLE claude_slots (
+          account_id TEXT PRIMARY KEY, email TEXT, alias TEXT, org_uuid TEXT, config_json TEXT NOT NULL,
+          fingerprint TEXT, prev_fingerprint TEXT, threshold REAL, dead INTEGER NOT NULL DEFAULT 0,
+          dead_reason TEXT, dead_at INTEGER, healed_at INTEGER, added_at INTEGER NOT NULL,
+          last_active_at INTEGER, source TEXT, archived_at INTEGER, ${fixture.extra}
+        );
+        ${fixture.dependent}`);
+      db.close();
+      const before = readFileSync(path);
+
+      assert.throws(
+        () => openStore(path),
+        (error: unknown) => error instanceof Error
+          && error.message.includes('cannot correct pre-release v5 claude_slots')
+          && error.message.includes('verified backup:')
+          && fixture.reason.test(error.message),
+        fixture.name,
+      );
+      assert.deepEqual(readFileSync(path), before, `${fixture.name} must leave the database byte-for-byte unchanged`);
+    }
+  });
+
+  it('preserves plain extra columns when rebuilding a v5 table', () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'qlb-v5-plain-extra-rebuild-')), 'qlb.db');
+    const initial = openStore(path);
+    initial.close();
+    const db = new DatabaseSync(path);
+    db.exec(`DROP TABLE claude_slots;
+      CREATE TABLE claude_slots (
+        account_id TEXT PRIMARY KEY, email TEXT, alias TEXT, org_uuid TEXT, config_json TEXT NOT NULL,
+        fingerprint TEXT, prev_fingerprint TEXT, threshold REAL, dead INTEGER NOT NULL DEFAULT 0,
+        dead_reason TEXT, dead_at INTEGER, healed_at INTEGER, added_at INTEGER NOT NULL,
+        last_active_at INTEGER, source TEXT, archived_at INTEGER, forward_compatible TEXT
+      );
+      INSERT INTO claude_slots (account_id, config_json, added_at, forward_compatible)
+        VALUES ('fixture', '{}', 1, 'retain-me')`);
+    db.close();
+
+    const corrected = openStore(path);
+    corrected.close();
+    const check = dbAt(path);
+    try {
+      assert.equal((check.prepare('SELECT forward_compatible FROM claude_slots').get() as { forward_compatible: string }).forward_compatible, 'retain-me');
+    } finally { check.close(); }
   });
 
   it('repairs a lifecycle table missing state before creating its partial index', () => {

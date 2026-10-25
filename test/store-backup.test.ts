@@ -58,6 +58,20 @@ describe('store backup before migration (AC45)', () => {
     } finally { copy.close(); source.close(); }
   });
 
+  it('rejects copies whose sqlite_sequence rows differ', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-backup-sequence-'));
+    const source = new DatabaseSync(join(dir, 'source.db'));
+    const copy = new DatabaseSync(join(dir, 'copy.db'));
+    try {
+      source.exec(`CREATE TABLE rows (id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT);
+        INSERT INTO rows (value) VALUES ('same'), ('deleted');
+        DELETE FROM rows WHERE id = 2`);
+      copy.exec(`CREATE TABLE rows (id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT);
+        INSERT INTO rows (value) VALUES ('same')`);
+      assert.equal(verifyBackup(source, copy), false);
+    } finally { copy.close(); source.close(); }
+  });
+
   it('aborts on backup verification failure and leaves the source untouched', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'qlb-backup-fail-'));
     const path = join(dir, 'qlb.db');
