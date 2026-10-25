@@ -29,8 +29,8 @@ Two optional `Adapter` fields (`src/types.ts`) tailor refresh behavior; absent m
 ## OpenAI Codex (`openai-codex`)
 
 - **Credential source:** Codex CLI's own `~/.codex/auth.json` (`tokens.access_token`; account id and label parsed from the `id_token` JWT claims). Configurable via `QLB_CODEX_AUTH_JSON_PATH`.
-- **Usage signal:** response headers only. Codex exposes no standalone usage GET; `x-codex-primary-used-percent` (weekly), `x-codex-secondary-used-percent` (5-hour), and related reset/pool headers arrive on real requests to the Codex backend. The adapter itself therefore reports an authenticated account with **no buckets** — numbers populate when real traffic flows through `qlb proxy` (whose `parseUsageHeaders` writes header-derived readings into the same snapshot cache).
-- **Buckets:** `primary` (weekly), `secondary` (5-hour).
+- **Usage signal:** response headers only. Codex exposes no standalone usage GET; `x-codex-primary-used-percent` (5-hour), `x-codex-secondary-used-percent` (weekly), and related reset/pool headers arrive on real requests to the Codex backend. The adapter itself therefore reports an authenticated account with **no buckets** — numbers populate when real traffic flows through `qlb proxy` (whose `parseUsageHeaders` writes header-derived readings into the same snapshot cache).
+- **Buckets:** `primary` (5-hour), `secondary` (weekly).
 - **Confidence:** `authoritative` once a header-derived reading exists; `unknown` before that (which makes the account a cold-start candidate only, never excluded by a missing number).
 - **Caveats:** because every reading requires a real request, Codex data is exactly as fresh as the last request that went through. There is no free refresh, and QLB does not send probe requests on its own in the CLI path.
 

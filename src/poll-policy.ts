@@ -1,4 +1,9 @@
-// Ported from claude-swap 0.28.0 (MIT, Copyright (c) realiti4) — poll_policy.py lines 73–284; lines.py lines 39–45; usage_store.py lines 439–491.
+/*
+ * Ported from claude-swap 0.28.0.
+ * Upstream file(s): src/claude_swap/poll_policy.py:76-285, src/claude_swap/usage_store.py:411-421,439-491, src/claude_swap/lines.py:39-45, src/claude_swap/oauth.py:545-601.
+ * License: MIT.
+ * Modified for QLB. See NOTICE.
+ */
 
 /** Freshness floor shared by every collector. */
 export const SERVE_TTL_S = 180.0;
@@ -36,6 +41,29 @@ export interface DueCandidateSlot {
   lastStatus?: string | null;
   /** Collector classification when its dead-token state is not serialized as a status. */
   deadToken?: boolean;
+}
+
+/** Persisted next-poll plan, keyed by provider and account in the v5 store. */
+export interface UsagePollPlan {
+  nextDueAt: number;
+  pollIntervalS: number;
+  /** Snapshot values required for a repair compare-and-set. */
+  expectedNextDueAt?: number | null;
+  expectedPollIntervalS?: number | null;
+}
+
+/** Narrow store dependency so overdue-plan repair remains clock/RNG testable. */
+export interface UsagePollPlanWriter {
+  writeUsagePollPlans(provider: string, plans: Readonly<Record<string, UsagePollPlan>>, now?: number): number;
+}
+
+export interface OverduePlanRepairInput {
+  provider: string;
+  candidates: readonly string[];
+  entries: Readonly<Record<string, DueCandidateSlot>>;
+  now: number;
+  rng?: RandomSource;
+  writer: UsagePollPlanWriter;
 }
 
 type RelevantWindow = readonly [label: string, pct: number, resetsAt: unknown];
@@ -300,6 +328,13 @@ export function planOversleepsInterval(
   return nextPollAt > latestNormalPoll;
 }
 
+/** Shared eligibility gates from upstream `usage_store.py:455-462`. */
+function excludedFromPoll(entry: DueCandidateSlot, now: number): boolean {
+  if (entry.lastStatus === 'token_dead' || entry.deadToken === true) return true;
+  if (entry.backoffUntil !== null && entry.backoffUntil !== undefined && now < entry.backoffUntil) return true;
+  return entry.heldUntil !== null && entry.heldUntil !== undefined && now < entry.heldUntil;
+}
+
 /**
  * Return the due candidate least recently attempted or measured, or null.
  *
@@ -323,15 +358,7 @@ export function dueCandidate(
       due.push([0, slot]);
       continue;
     }
-    if (entry.lastStatus === 'token_dead' || entry.deadToken === true) {
-      continue;
-    }
-    if (entry.backoffUntil !== null && entry.backoffUntil !== undefined && now < entry.backoffUntil) {
-      continue;
-    }
-    if (entry.heldUntil !== null && entry.heldUntil !== undefined && now < entry.heldUntil) {
-      continue;
-    }
+    if (excludedFromPoll(entry, now)) continue;
     if (
       entry.nextDueAt !== null
       && entry.nextDueAt !== undefined
@@ -347,6 +374,47 @@ export function dueCandidate(
     return leftSlot < rightSlot ? -1 : leftSlot > rightSlot ? 1 : 0;
   });
   return due[0]?.[1] ?? null;
+}
+
+/**
+ * Pick the one due alternate now and persist jittered plans for the rest of
+ * an overdue cohort.  A plan more than one of its own intervals in the past
+ * is sleep/wake debt, not permission for a burst.  The selected oldest slot
+ * remains due; every other eligible overdue slot moves to its own
+ * `now + interval * (0.9 + 0.2 * rng())` deadline, matching C-swap's
+ * `plan_after_fetch` jitter bounds.  The caller injects time, RNG, and the
+ * narrow writer dependency so this policy has no ambient side effects.
+ */
+export function repairOverduePlans({
+  provider,
+  candidates,
+  entries,
+  now,
+  rng = Math.random,
+  writer,
+}: OverduePlanRepairInput): string | null {
+  const selected = dueCandidate(candidates, entries, now);
+  const repairs: Record<string, UsagePollPlan> = {};
+  const seen = new Set<string>();
+  for (const slot of candidates) {
+    if (seen.has(slot) || slot === selected) continue;
+    seen.add(slot);
+    const entry = entries[slot];
+    if (entry === undefined || excludedFromPoll(entry, now)) continue;
+    const nextDueAt = entry.nextDueAt;
+    if (nextDueAt === null || nextDueAt === undefined) continue;
+    if (entry.pollIntervalS === null || entry.pollIntervalS === undefined) continue;
+    const interval = entry.pollIntervalS || EXHAUSTED_INTERVAL_S;
+    if (now <= nextDueAt + interval) continue;
+    repairs[slot] = {
+      nextDueAt: now + interval * (1.0 + JITTER_FRAC * (2.0 * rng() - 1.0)),
+      pollIntervalS: interval,
+      expectedNextDueAt: nextDueAt,
+      expectedPollIntervalS: entry.pollIntervalS ?? null,
+    };
+  }
+  if (Object.keys(repairs).length > 0) writer.writeUsagePollPlans(provider, repairs, now);
+  return selected;
 }
 
 // Python-name aliases make port provenance and cross-language comparisons explicit.

@@ -13,8 +13,8 @@
  */
 import { execFileSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { qlbHomeDir } from './home';
 import { findQlbRepoRoot } from './setup';
 
 export const HERMES_DEFAULT_PORT = 47391;
@@ -103,7 +103,7 @@ export function hermesInstructions(opts: { hermesHome: string; port: number; key
 }
 
 export function setupHermes(opts: HermesSetupOptions = {}): HermesSetupResult {
-  const home = opts.home ?? homedir();
+  const home = opts.home ?? qlbHomeDir();
   const hermesHome = opts.hermesHome ?? process.env.HERMES_HOME ?? join(home, '.hermes');
   const repoRoot = opts.repoRoot === undefined ? findQlbRepoRoot() : opts.repoRoot;
   if (!repoRoot) throw new Error('qlb setup hermes: cannot locate the qlb repo root (harness/hermes templates)');

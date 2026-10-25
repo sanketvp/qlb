@@ -7,10 +7,12 @@ import {
   assertKeychainAccess,
   assertNativeOpenRouterService,
   MACOS_SECURITY_TIMEOUT_MS,
+  markFakeExecutor,
   readNativeOpenRouterKey,
   withServiceGuard,
   type ExecFileSyncFn,
 } from '../src/keychain';
+import { withUndoCapability } from '../src/keychain-allowlist';
 
 const MACOS_USER = 'test-macos-user';
 
@@ -26,8 +28,9 @@ function guardedFakeSecurity() {
   };
   return {
     calls,
-    backend: withServiceGuard(new MacosKeychainBackend({ execFileSync: exec }), {
+    backend: withServiceGuard(new MacosKeychainBackend({ execFileSync: markFakeExecutor(exec) }), {
       macosUserName: () => MACOS_USER,
+      env: {},
     }),
   };
 }
@@ -62,14 +65,46 @@ describe('Keychain access allowlist', () => {
     }
   });
 
-  it('allows claude-swap reads only', () => {
+  it('allows claude-swap reads only outside the undo capability', () => {
     const { backend, calls } = guardedFakeSecurity();
     assert.equal(backend.getSync('claude-swap', 'legacy-account'), 'saved-value');
     assert.throws(
       () => backend.setSync('claude-swap', 'legacy-account', 'secret'),
       KeychainAccessDeniedError,
     );
+    assert.throws(
+      () => backend.deleteSync('claude-swap', 'legacy-account'),
+      KeychainAccessDeniedError,
+    );
     assert.equal(calls.length, 1);
+  });
+
+  it('grants claude-swap writes and deletes only while the undo capability is held', () => {
+    const { backend, calls } = guardedFakeSecurity();
+
+    assert.throws(
+      () => backend.setSync('claude-swap', 'legacy-account', 'secret'),
+      KeychainAccessDeniedError,
+    );
+    assert.throws(
+      () => backend.deleteSync('claude-swap', 'legacy-account'),
+      KeychainAccessDeniedError,
+    );
+
+    withUndoCapability(() => {
+      backend.setSync('claude-swap', 'legacy-account', 'secret');
+      backend.deleteSync('claude-swap', 'legacy-account');
+      assert.throws(
+        () => backend.setSync('pi-openrouter', 'legacy-account', 'secret'),
+        KeychainAccessDeniedError,
+      );
+    });
+
+    assert.throws(
+      () => backend.setSync('claude-swap', 'legacy-account', 'secret'),
+      KeychainAccessDeniedError,
+    );
+    assert.equal(calls.length, 2);
   });
 
   it('allows pi-openrouter reads only', () => {
@@ -83,7 +118,7 @@ describe('Keychain access allowlist', () => {
   });
 
   it('allows only pi-openrouter for native OpenRouter reads before backend access', () => {
-    assert.doesNotThrow(() => assertNativeOpenRouterService('pi-openrouter'));
+    assert.doesNotThrow(() => assertNativeOpenRouterService('pi-openrouter', { env: {} }));
     for (const service of ['some-other-app', 'qlb:openrouter:x', 'claude-swap']) {
       assert.throws(
         () => assertNativeOpenRouterService(service),
@@ -97,10 +132,10 @@ describe('Keychain access allowlist', () => {
     const timeout = Object.assign(new Error('fake security timed out'), { code: 'ETIMEDOUT' });
 
     assert.throws(
-      () => readNativeOpenRouterKey('pi-openrouter', (_file, _args, options) => {
+      () => readNativeOpenRouterKey('pi-openrouter', markFakeExecutor((_file, _args, options) => {
         timeoutMs = options?.timeout;
         throw timeout;
-      }, 'darwin'),
+      }), 'darwin'),
       /security find-generic-password timed out after 5s/,
     );
     assert.equal(timeoutMs, MACOS_SECURITY_TIMEOUT_MS);
@@ -144,7 +179,7 @@ describe('Keychain access allowlist', () => {
   it('accepts exactly eight lowercase hexadecimal suffix characters', () => {
     assert.doesNotThrow(() => assertKeychainAccess(
       'Claude Code-credentials-0123abcd', MACOS_USER, 'read',
-      { macosUserName: () => MACOS_USER },
+      { macosUserName: () => MACOS_USER, env: {} },
     ));
     for (const suffix of ['1234abc', '1234abcde', '1234ABCD', '1234abcd!', 'not-hex!']) {
       for (const operation of ['read', 'write'] as const) {
@@ -171,8 +206,9 @@ describe('Keychain access allowlist', () => {
       });
       return '';
     };
-    const backend = withServiceGuard(new MacosKeychainBackend({ execFileSync: exec }), {
+    const backend = withServiceGuard(new MacosKeychainBackend({ execFileSync: markFakeExecutor(exec) }), {
       macosUserName: () => MACOS_USER,
+      env: {},
     });
     const commandBytes = (value: string) => Buffer.byteLength(
       `add-generic-password -U -a "${account}" -s "${service}" -X ${Buffer.from(value).toString('hex')}\n`,
@@ -222,7 +258,7 @@ describe('Keychain access allowlist', () => {
       calls.push({ args: [...args], timeout: options?.timeout });
       throw timeout;
     };
-    const backend = new MacosKeychainBackend({ execFileSync: exec });
+    const backend = new MacosKeychainBackend({ execFileSync: markFakeExecutor(exec) });
 
     assert.throws(
       () => backend.setSync('qlb:timeout', 'account', 'secret'),
@@ -245,8 +281,9 @@ describe('Keychain access allowlist', () => {
     const exec: ExecFileSyncFn = () => {
       throw new Error(`security rejected ${secret} (${hex})`);
     };
-    const backend = withServiceGuard(new MacosKeychainBackend({ execFileSync: exec }), {
+    const backend = withServiceGuard(new MacosKeychainBackend({ execFileSync: markFakeExecutor(exec) }), {
       macosUserName: () => MACOS_USER,
+      env: {},
     });
 
     assert.throws(

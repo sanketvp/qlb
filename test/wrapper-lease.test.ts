@@ -160,11 +160,14 @@ function writeFakeClaude(dir: string): string {
   writeFileSync(
     path,
     `#!/usr/bin/python3
-import os, signal, subprocess, sys, time, urllib.error, urllib.request
+import json, os, signal, subprocess, sys, time, urllib.error, urllib.request
 print("ANTHROPIC_BASE_URL=" + os.environ.get("ANTHROPIC_BASE_URL", ""), flush=True)
 print("HAS_AUTH_TOKEN=" + ("1" if "ANTHROPIC_AUTH_TOKEN" in os.environ else "0"), flush=True)
 print("HAS_API_KEY=" + ("1" if "ANTHROPIC_API_KEY" in os.environ else "0"), flush=True)
 print("HAS_HELPER=" + ("1" if os.environ.get("CLAUDE_CODE_API_KEY_HELPER") else "0"), flush=True)
+if "--write-env" in sys.argv:
+    with open(sys.argv[sys.argv.index("--write-env") + 1], "w") as f: json.dump(dict(os.environ), f)
+    sys.exit(0)
 if "--exit" in sys.argv:
     sys.exit(int(sys.argv[sys.argv.index("--exit") + 1]))
 if "--exit0-on-signal" in sys.argv:
@@ -310,6 +313,91 @@ function health(port: number, token: string): Promise<number> {
 }
 
 describe('wrapper / mutex / proxy lifecycle', () => {
+  it('does not pass the wrapper QLB_HOME to its qlb proxy child', () => {
+    const dir = tmp();
+    const received = join(dir, 'proxy-env.json');
+    const fakeQlb = join(dir, 'fake-qlb');
+    writeFileSync(fakeQlb, `#!/usr/bin/python3
+import json, os, sys
+with open(${JSON.stringify(received)}, 'w') as f: json.dump(dict(os.environ), f)
+info = sys.argv[sys.argv.index('--info-path') + 1]
+with open(info, 'w') as f: json.dump({'token': 'fake-token', 'pid': os.getpid(), 'lstart': '', 'startedBy': 'wrapper'}, f)
+`, { mode: 0o755 });
+    const result = spawnSync('/usr/bin/python3', [WRAPPER, '--qlb-critical-section'], {
+      env: {
+        ...process.env,
+        QLB_TEST_MODE: undefined,
+        QLB_HOME: dir,
+        QLB_BIN: fakeQlb,
+        QLB_PROXY_INFO_PATH: join(dir, 'proxy.json'),
+        QLB_PROXY_PORT: '47391',
+        QLB_WRAPPER_PID: String(process.pid),
+        QLB_WRAPPER_LSTART: 'test',
+        QLB_SESSION: 'test',
+      },
+      encoding: 'utf8',
+      timeout: 15_000,
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const proxyEnv = JSON.parse(readFileSync(received, 'utf8')) as NodeJS.ProcessEnv;
+    assert.equal(proxyEnv.QLB_HOME, undefined);
+  });
+
+  it('passes the wrapper QLB_HOME to its qlb proxy child in test mode', () => {
+    const dir = tmp();
+    const received = join(dir, 'proxy-env.json');
+    const fakeQlb = join(dir, 'fake-qlb');
+    writeFileSync(fakeQlb, `#!/usr/bin/python3
+import json, os, sys
+with open(${JSON.stringify(received)}, 'w') as f: json.dump(dict(os.environ), f)
+info = sys.argv[sys.argv.index('--info-path') + 1]
+with open(info, 'w') as f: json.dump({'token': 'fake-token', 'pid': os.getpid(), 'lstart': '', 'startedBy': 'wrapper'}, f)
+`, { mode: 0o755 });
+    const result = spawnSync('/usr/bin/python3', [WRAPPER, '--qlb-critical-section'], {
+      env: {
+        ...process.env,
+        QLB_TEST_MODE: '1',
+        QLB_HOME: dir,
+        QLB_BIN: fakeQlb,
+        QLB_PROXY_INFO_PATH: join(dir, 'proxy.json'),
+        QLB_PROXY_PORT: '47391',
+        QLB_WRAPPER_PID: String(process.pid),
+        QLB_WRAPPER_LSTART: 'test',
+        QLB_SESSION: 'test',
+      },
+      encoding: 'utf8',
+      timeout: 15_000,
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const proxyEnv = JSON.parse(readFileSync(received, 'utf8')) as NodeJS.ProcessEnv;
+    assert.equal(proxyEnv.QLB_HOME, dir);
+  });
+
+  it('passes QLB_HOME to the native child only in test mode', () => {
+    for (const testMode of [undefined, '1']) {
+      const dir = tmp();
+      const port = testMode === '1' ? 47393 : 47392;
+      const received = join(dir, 'native-env.json');
+      const fakeQlb = join(dir, 'fake-qlb');
+      writeFileSync(fakeQlb, `#!/usr/bin/python3
+import json, os, sys
+info = sys.argv[sys.argv.index('--info-path') + 1]
+with open(info, 'w') as f: json.dump({'token': 'fake-token', 'pid': os.getpid(), 'lstart': '', 'startedBy': 'wrapper'}, f)
+`, { mode: 0o755 });
+      const result = spawnSync('/usr/bin/python3', [WRAPPER, '--write-env', received], {
+        env: envFor(dir, port, writeFakeClaude(dir), {
+          QLB_TEST_MODE: testMode,
+          QLB_BIN: fakeQlb,
+        }),
+        encoding: 'utf8',
+        timeout: 15_000,
+      });
+      assert.equal(result.status, 0, result.stderr);
+      const nativeEnv = JSON.parse(readFileSync(received, 'utf8')) as NodeJS.ProcessEnv;
+      assert.equal(nativeEnv.QLB_HOME, testMode === '1' ? dir : undefined);
+    }
+  });
+
   it('mutex-inherited-lock', async () => {
     const dir = tmp();
     const lock = join(dir, 'proxy.lock');
