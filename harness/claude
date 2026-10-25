@@ -43,6 +43,14 @@ def qlb_home() -> str:
     return os.environ.get("QLB_HOME") or os.path.join(os.path.expanduser("~"), ".qlb")
 
 
+def set_qlb_home_for_cli(env: dict[str, str], home: str) -> None:
+    """Pass the wrapper home only to qlb-facing children in test mode."""
+    if env.get("QLB_TEST_MODE") == "1":
+        env["QLB_HOME"] = home
+    else:
+        env.pop("QLB_HOME", None)
+
+
 def native_claude() -> str:
     return os.environ.get("QLB_CLAUDE_NATIVE") or os.path.join(
         os.path.expanduser("~"), ".local", "bin", "claude"
@@ -382,8 +390,7 @@ def critical_section() -> int:
         cmd.extend(["--db", db])
     child_env = os.environ.copy()
     child_env.pop("QLB_PROXY_LOCK_FD", None)
-    # QLB_HOME belongs to this wrapper; the qlb CLI rejects it outside test mode.
-    child_env.pop("QLB_HOME", None)
+    set_qlb_home_for_cli(child_env, home)
     subprocess.Popen(
         cmd,
         close_fds=True,
@@ -509,7 +516,7 @@ def intercepted(argv: list[str]) -> int:
         child_env["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{port}"
         child_env["ANTHROPIC_CUSTOM_HEADERS"] = json.dumps({"x-qlb-session": session})
         child_env["CLAUDE_CODE_API_KEY_HELPER"] = helper
-        child_env["QLB_HOME"] = home
+        set_qlb_home_for_cli(child_env, home)
         child_env["QLB_PROXY_INFO_PATH"] = info_path
         child_env.pop("ANTHROPIC_AUTH_TOKEN", None)
         child_env.pop("ANTHROPIC_API_KEY", None)
