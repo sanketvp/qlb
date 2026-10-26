@@ -1,13 +1,13 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { describe, it } from 'node:test';
 
 import { addCodexAccount, CodexAddError, type CodexAddDeps } from '../src/codex-add';
-import { parseCodexAuth } from '../src/codex-auth';
+import { codexFingerprint, parseCodexAuth } from '../src/codex-auth';
 import { MockKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from '../src/keychain';
 import { openStore } from '../src/store';
 
@@ -204,6 +204,59 @@ describe('codex add', () => {
     } finally { f.store.close(); }
   });
 
+  it('does not restore over a newer replacement committed after its rollback', async () => {
+    const f = fixture(document('original'));
+    try {
+      await addCodexAccount({ home: '/fixture-home', nativeAuthPath: '/native-auth' }, f.deps);
+      f.deps.readAuth = async () => ({ status: 'ok', doc: document('current') });
+      await addCodexAccount({ home: '/fixture-home', nativeAuthPath: '/native-auth', replace: 'fixture-user:fixture-account' }, f.deps);
+      const service = qlbKeychainService('openai-codex', 'fixture-user:fixture-account');
+      const newer = document('newer');
+      const newerJson = JSON.stringify(newer);
+      const db = (f.store as unknown as { db: DatabaseSync }).db;
+      const originalWithDb = f.deps.withDb;
+      f.deps.withDb = ((store, fn) => originalWithDb(store, (database) => {
+        const failingDatabase = new Proxy(database, {
+          get(target, property) {
+            if (property === 'prepare') return (sql: string) => {
+              const statement = target.prepare(sql);
+              if (!sql.includes('INSERT INTO accounts')) return statement;
+              return new Proxy(statement, { get(statementTarget, statementProperty) {
+                if (statementProperty === 'run') return () => { throw new Error('injected database write'); };
+                const value = Reflect.get(statementTarget, statementProperty);
+                return typeof value === 'function' ? value.bind(statementTarget) : value;
+              } });
+            };
+            if (property === 'exec') return (sql: string) => {
+              const result = target.exec(sql);
+              if (sql === 'ROLLBACK') {
+                // This hook models the next writer acquiring the lock immediately
+                // after A releases it and committing a newer replacement.
+                f.keychain.setSync(`${service}:prev`, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(document('a-attempt')));
+                f.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, newerJson);
+                target.prepare('UPDATE codex_slots SET fingerprint = ? WHERE account_id = ?')
+                  .run(codexFingerprint(newer), 'fixture-user:fixture-account');
+              }
+              return result;
+            };
+            const value = Reflect.get(target, property);
+            return typeof value === 'function' ? value.bind(target) : value;
+          },
+        });
+        return fn(failingDatabase);
+      })) as typeof f.deps.withDb;
+      f.deps.readAuth = async () => ({ status: 'ok', doc: document('a-attempt') });
+
+      await assert.rejects(
+        addCodexAccount({ home: '/fixture-home', nativeAuthPath: '/native-auth', replace: 'fixture-user:fixture-account' }, f.deps),
+        /injected database write/,
+      );
+      assert.equal(f.keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT), newerJson);
+      assert.equal(f.keychain.getSync(`${service}:prev`, QLB_KEYCHAIN_ACCOUNT), JSON.stringify(document('a-attempt')));
+      assert.equal(rows(f.store).slot?.fingerprint, codexFingerprint(newer));
+    } finally { f.store.close(); }
+  });
+
   it('stops the login child before removing its temp home on SIGTERM', async () => {
     const root = mkdtempSync(join(tmpdir(), 'qlb-codex-add-signal-'));
     const fakeBin = join(root, 'bin');
@@ -261,6 +314,86 @@ addCodexAccount({ home: process.env.HOME, nativeAuthPath: native }, productionCo
       assert.equal(result.signal, 'SIGTERM');
       assert.equal(existsSync(childInfo.home), false);
       assert.throws(() => process.kill(childInfo.pid, 0), { code: 'ESRCH' });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('fails a missing codex spawn without hanging, including signal cleanup', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-codex-add-spawn-'));
+    const fakeBin = join(root, 'bin');
+    const nativeDir = join(root, '.codex');
+    const cli = join(process.cwd(), 'dist', 'cli.js');
+    const run = (args: string[], extraEnv: NodeJS.ProcessEnv = {}) => spawn(process.execPath, args, {
+      env: { QLB_TEST_MODE: '1', QLB_HOME: root, HOME: root, PATH: fakeBin, ...extraEnv },
+      stdio: 'ignore',
+    });
+    const waitForExit = async (child: ReturnType<typeof spawn>) => {
+      let timeout: NodeJS.Timeout | undefined;
+      const result = await Promise.race([
+        new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+          child.once('close', (code, signal) => resolve({ code, signal }));
+        }),
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(() => {
+            child.kill('SIGKILL');
+            reject(new Error('missing codex spawn did not settle within 8 seconds'));
+          }, 8_000);
+        }),
+      ]);
+      if (timeout) clearTimeout(timeout);
+      return result;
+    };
+    try {
+      mkdirSync(fakeBin);
+      mkdirSync(nativeDir);
+      writeFileSync(join(nativeDir, 'auth.json'), '{}');
+      const cliStore = openStore(join(root, '.qlb', 'qlb.db'));
+      try {
+        const db = (cliStore as unknown as { db: DatabaseSync }).db;
+        db.prepare("INSERT INTO lifecycle (state, began_at) VALUES ('cutting-over', 1)").run();
+      } finally { cliStore.close(); }
+      const normal = await waitForExit(run([cli, 'codex', 'add']));
+      assert.notEqual(normal.code, 0);
+      assert.equal(normal.signal, null);
+      assert.deepEqual(existsSync(join(root, '.qlb', 'tmp')) ? readdirSync(join(root, '.qlb', 'tmp')) : [], []);
+
+      const helper = join(root, 'signal-spawn-failure.cjs');
+      const ready = join(root, 'spawn-failed');
+      writeFileSync(helper, `
+const { spawn } = require('node:child_process');
+const { openStore } = require(${JSON.stringify(require.resolve('../src/store'))});
+const { MockKeychain } = require(${JSON.stringify(require.resolve('../src/keychain'))});
+const { addCodexAccount, productionCodexAddDeps } = require(${JSON.stringify(require.resolve('../src/codex-add'))});
+const fs = require('node:fs');
+const path = require('node:path');
+const native = path.join(process.env.HOME, '.codex', 'auth.json');
+const store = openStore(':memory:');
+const deps = productionCodexAddDeps(store, new MockKeychain(), process.env);
+deps.login = (options) => new Promise((resolve, reject) => {
+  const child = spawn(options.command, options.args, { cwd: options.cwd, env: options.env, stdio: 'ignore' });
+  options.onSpawn(child);
+  fs.writeFileSync(process.env.READY, 'spawned');
+  child.once('error', (error) => setTimeout(() => reject(error), 1_000));
+  child.once('exit', (code) => resolve(code ?? 1));
+});
+addCodexAccount({ home: process.env.HOME, nativeAuthPath: native }, deps)
+  .finally(() => store.close());
+`);
+      const signalled = run([helper], { READY: ready });
+      await new Promise<void>((resolve, reject) => {
+        const deadline = Date.now() + 2_000;
+        const check = (): void => {
+          if (existsSync(ready)) { resolve(); return; }
+          if (Date.now() >= deadline) { reject(new Error('failed-spawn helper did not start')); return; }
+          setTimeout(check, 10);
+        };
+        check();
+      });
+      signalled.kill('SIGTERM');
+      const signalledResult = await waitForExit(signalled);
+      assert.equal(signalledResult.signal, 'SIGTERM');
+      assert.deepEqual(existsSync(join(root, '.qlb', 'tmp')) ? readdirSync(join(root, '.qlb', 'tmp')) : [], []);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

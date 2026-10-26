@@ -100,13 +100,15 @@ function persist(doc: CodexAuthDocument, input: CodexAddInput, deps: CodexAddDep
   const fingerprint = codexFingerprint(doc);
   const service = qlbKeychainService(PROVIDER, identity.slotId);
   const withDb = deps.withDb;
-  let wroteCredential = false;
   let priorCredential: string | undefined;
   let priorPrevious: string | undefined;
+  let writtenCredential: string | undefined;
+  let writtenPrevious: string | undefined;
+  let wroteCredential = false;
+  let wrotePrevious = false;
   let exists = false;
 
-  try {
-    return withDb(deps.store, (db) => {
+  return withDb(deps.store, (db) => {
       db.exec('BEGIN IMMEDIATE');
       try {
         const existing = db.prepare('SELECT fingerprint FROM codex_slots WHERE account_id = ?')
@@ -138,11 +140,14 @@ function persist(doc: CodexAuthDocument, input: CodexAddInput, deps: CodexAddDep
 
         // Set this before every write: a backend can throw after modifying an
         // item, and compensation must cover that ambiguous outcome too.
-        wroteCredential = true;
         if (existing?.fingerprint) {
-          deps.keychain.setSync(`${service}:prev`, QLB_KEYCHAIN_ACCOUNT, priorCredential!);
+          writtenPrevious = priorCredential!;
+          wrotePrevious = true;
+          deps.keychain.setSync(`${service}:prev`, QLB_KEYCHAIN_ACCOUNT, writtenPrevious);
         }
-        deps.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(doc));
+        writtenCredential = JSON.stringify(doc);
+        wroteCredential = true;
+        deps.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, writtenCredential);
 
         const now = deps.now();
         db.prepare(`INSERT INTO codex_slots (
@@ -174,26 +179,38 @@ function persist(doc: CodexAuthDocument, input: CodexAddInput, deps: CodexAddDep
         db.exec('COMMIT');
         return { slotId: identity.slotId, added: !exists };
       } catch (error) {
+        // Compensate before ROLLBACK releases BEGIN IMMEDIATE. Each write is
+        // conditional so an ambiguous write failure cannot overwrite a value
+        // that was not written by this attempt.
+        if (wroteCredential) {
+          restoreCredentialIfUnchanged(deps.keychain, service, priorCredential, writtenCredential!);
+        }
+        if (wrotePrevious) {
+          restoreCredentialIfUnchanged(deps.keychain, `${service}:prev`, priorPrevious, writtenPrevious!);
+        }
         try { db.exec('ROLLBACK'); } catch { /* retain the original failure */ }
         throw error;
       }
     });
-  } catch (error) {
-    // A failed transaction (or either Keychain write) must restore both the
-    // current credential and its predecessor. Restore each independently so a
-    // failure restoring one does not skip the other.
-    if (wroteCredential) {
-      try {
-        if (priorCredential !== undefined) deps.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, priorCredential);
-        else deps.keychain.deleteSync(service, QLB_KEYCHAIN_ACCOUNT);
-      } catch { /* retain the primary persistence error */ }
-      try {
-        if (priorPrevious !== undefined) deps.keychain.setSync(`${service}:prev`, QLB_KEYCHAIN_ACCOUNT, priorPrevious);
-        else deps.keychain.deleteSync(`${service}:prev`, QLB_KEYCHAIN_ACCOUNT);
-      } catch { /* retain the primary persistence error */ }
+}
+
+function restoreCredentialIfUnchanged(
+  keychain: AddKeychain,
+  service: string,
+  priorValue: string | undefined,
+  writtenValue: string,
+): void {
+  try {
+    let currentValue: string | undefined;
+    try {
+      currentValue = keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT);
+    } catch (error) {
+      if (!isCredentialNotFound(error)) throw error;
     }
-    throw error;
-  }
+    if (currentValue !== writtenValue) return;
+    if (priorValue === undefined) keychain.deleteSync(service, QLB_KEYCHAIN_ACCOUNT);
+    else keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, priorValue);
+  } catch { /* retain the primary persistence error */ }
 }
 
 /**
@@ -269,17 +286,36 @@ function hashNativeAuth(path: string): string {
 }
 
 function stopLoginChild(child: ChildProcess): Promise<void> {
-  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+  if (child.exitCode !== null || child.signalCode !== null || child.pid === undefined || !child.spawnfile) {
+    return Promise.resolve();
+  }
   return new Promise((resolve) => {
     let timer: NodeJS.Timeout | undefined;
-    const exited = (): void => {
+    let settled = false;
+    const settle = (): void => {
+      if (settled) return;
+      settled = true;
       if (timer) clearTimeout(timer);
+      child.removeListener('exit', settle);
+      child.removeListener('close', settle);
+      child.removeListener('error', settle);
       resolve();
     };
-    child.once('exit', exited);
-    child.kill('SIGTERM');
+    child.once('exit', settle);
+    child.once('close', settle);
+    child.once('error', settle);
+    try {
+      child.kill('SIGTERM');
+    } catch {
+      settle();
+      return;
+    }
+    if (settled) return;
     timer = setTimeout(() => {
-      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+      try {
+        if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+      } catch { /* settle below even if SIGKILL cannot be sent */ }
+      settle();
     }, 5_000);
   });
 }
