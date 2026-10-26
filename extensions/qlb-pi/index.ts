@@ -63,6 +63,12 @@ import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { streamWithAuthRetry } from "./auth-retry.js";
 import {
+  registerXaiProvider,
+  type XaiBuiltin,
+  type XaiEventSink,
+  type XaiProviderApi,
+} from "./providers/xai.js";
+import {
   accountFg,
   buildExpandPanelLines,
   buildFooterLines,
@@ -84,9 +90,11 @@ import {
   qlbDbPath,
   CSWAP_ACTIVE_ID,
   decidePiMode,
+  ownerStateForProvider,
   parseConsumeStatus,
   readActiveClaudeAccess,
   readOwnerFileState,
+  readPiOwnerFile,
   type ConsumeJournal,
 } from "./consume.js";
 import { registerKimiCodingProvider } from "./providers/kimi-coding.js";
@@ -266,6 +274,27 @@ async function resolveBuiltinAnthropicStreamSimple(): Promise<StreamSimple> {
   return streamSimple;
 }
 
+/** Install xAI only after its owner entry exists; a compat failure still replaces native auth. */
+async function registerOwnedXaiProvider(pi: ExtensionAPI): Promise<void> {
+  const deps = { createStream: () => createAssistantMessageEventStream() as unknown as XaiEventSink };
+  try {
+    const namespace = (await import("@earendil-works/pi-ai/compat")) as unknown as {
+      openAIResponsesApi?: () => { streamSimple?: XaiBuiltin };
+    };
+    const builtin = namespace.openAIResponsesApi?.()?.streamSimple;
+    if (typeof builtin !== "function") throw new Error("missing openAIResponsesApi streamSimple");
+    registerXaiProvider(pi as unknown as XaiProviderApi, builtin, deps);
+  } catch (err) {
+    // Never leave Pi's native xAI provider active when QLB owns it.
+    console.error("[qlb-pi] could not resolve builtin xAI transport:", err);
+    const unavailableTransport: XaiBuiltin = () => { throw new Error("xai transport unavailable"); };
+    registerXaiProvider(pi as unknown as XaiProviderApi, unavailableTransport, {
+      ...deps,
+      gate: async () => { throw new Error("xai gate unavailable"); },
+    });
+  }
+}
+
 export default async function (pi: ExtensionAPI): Promise<void> {
   registerKimiCodingProvider(pi as unknown as ProviderApi, {
     createStream: () => createAssistantMessageEventStream() as unknown as { push(event: unknown): void; end(): void },
@@ -286,8 +315,16 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       ? { ...base, journal: await qlbConsumeJournal() }
       : null;
   const mode = modeInput ? decidePiMode(modeInput) : "inert";
+  const xaiOwner = base && (() => {
+    const owner = readPiOwnerFile(OWNER_FILE);
+    return decidePiMode("xai", {
+      rehearsal,
+      owner: ownerStateForProvider(owner, "xai"),
+    }) !== "inert";
+  })();
+  if (xaiOwner) await registerOwnedXaiProvider(pi);
   if (mode === "inert") {
-    // Inert: QLB does not own Pi and consume is off. anthropic-pool keeps the anthropic provider.
+    // Inert for Anthropic: QLB does not own it and consume is off. Its pool remains registered.
     return;
   }
   const providerApi = pi as unknown as ProviderApi;

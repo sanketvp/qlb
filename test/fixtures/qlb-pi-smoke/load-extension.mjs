@@ -22,7 +22,8 @@ const factory = await jiti.import(EXT, { default: true });
 
 const calls = [];
 const POOL = { pool: true, api: 'anthropic-messages', streamSimple: () => { throw new Error('pool used'); } };
-const providers = new Map([['anthropic', POOL]]);
+const XAI = { native: true, api: 'openai-responses', streamSimple: () => { throw new Error('native xAI used'); } };
+const providers = new Map([['anthropic', POOL], ['xai', XAI]]);
 const pi = {
   unregisterProvider: (name) => { calls.push(`unregister:${name}`); providers.delete(name); },
   registerProvider: (name, config) => { calls.push(`register:${name}`); providers.set(name, config); },
@@ -42,5 +43,10 @@ if (process.env.SMOKE_CALL === '1' && provider && !provider.pool) {
   );
   for await (const event of stream) events.push(event);
 }
-console.log(JSON.stringify({ calls, poolStillRegistered: provider === POOL, events }));
+console.log(JSON.stringify({
+  calls,
+  poolStillRegistered: provider === POOL,
+  xaiStillRegistered: providers.get('xai') === XAI,
+  events,
+}));
 process.exit(0);
