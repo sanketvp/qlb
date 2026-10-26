@@ -4,9 +4,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
-import { appendEvidenceGap, runPiGate } from '../src/pi-gate';
+import { appendEvidenceGap, GateFailure, runPiGate } from '../src/pi-gate';
 import { piEvidenceGapCheck } from '../src/checks/pi-evidence-gap';
-import { openStore } from '../src/store';
+import { defaultPiMigratePaths, migratePiSingleProvider } from '../src/pi-migrate';
+import { Migration } from '../src/migration';
+import { MockKeychain } from '../src/keychain';
+import { redactSecrets } from '../src/redact';
+import { openStore, openStoreConnection } from '../src/store';
 
 function fixtureDb(): string {
   const path = join(mkdtempSync(join(tmpdir(), 'qlb-gate-guard-')), 'qlb.db');
@@ -52,7 +56,7 @@ describe('qlb gate core (S30/S54)', () => {
     assert.equal(check.detail && (check.detail as { gaps: number }).gaps, 1);
   });
 
-  it('resolves outside the evidence transaction and delivers JSON only through the supplied channel', async () => {
+  it('resolves outside the evidence transaction and delivers only the allowlisted JSON shape', async () => {
     const dbPath = fixtureDb();
     const { root, script } = fakePiScript();
     const trace: string[] = [];
@@ -67,7 +71,10 @@ describe('qlb gate core (S30/S54)', () => {
       provider: {
         read: () => {
           trace.push('resolve');
-          return { token: 'fixture-secret', accountId: 'xai-default', source: `fixture:${root}:${script}`, expiresAt: 123 };
+          return {
+            token: 'fixture-secret', accountId: 'xai-default', source: `fixture:${root}:${script}`, expiresAt: 123,
+            refresh: 'must-not-deliver', grant: { refresh: 'must-not-deliver' },
+          } as never;
         },
       },
       sqlTrace: (sql) => trace.push(sql),
@@ -79,5 +86,96 @@ describe('qlb gate core (S30/S54)', () => {
     assert.deepEqual(JSON.parse(output[0]!), {
       token: 'fixture-secret', accountId: 'xai-default', source: `fixture:${root}:${script}`, expiresAt: 123,
     });
+  });
+
+  it('accepts owner/auth files written by the real Anthropic and xai migration writers', async () => {
+    const anthropicRoot = mkdtempSync(join(tmpdir(), 'qlb-gate-anthropic-'));
+    const anthropicAgent = join(anthropicRoot, '.pi', 'agent');
+    mkdirSync(anthropicAgent, { recursive: true, mode: 0o700 });
+    const anthropicStore = openStore(join(anthropicRoot, 'qlb.db'));
+    try {
+      const migration = new Migration(
+        anthropicStore,
+        new MockKeychain(),
+        join(anthropicAgent, 'anthropic-pool.json'),
+        join(anthropicAgent, 'qlb-owner.json'),
+      );
+      writeFileSync(join(anthropicAgent, 'anthropic-pool.json'), JSON.stringify({
+        accounts: [{ id: 'anthropic-a', name: 'Anthropic A', credentials: {
+          type: 'oauth', access: 'anthropic-access', refresh: 'anthropic-refresh', expires: Date.now() + 60_000,
+        } }],
+      }));
+      migration.stage();
+      await migration.rehearse(async () => ({ ok: true }));
+      migration.commit();
+    } finally {
+      anthropicStore.close();
+    }
+    const xaiRoot = mkdtempSync(join(tmpdir(), 'qlb-gate-xai-'));
+    const xaiPaths = defaultPiMigratePaths(xaiRoot);
+    mkdirSync(join(xaiRoot, '.pi', 'agent'), { recursive: true, mode: 0o700 });
+    writeFileSync(xaiPaths.authJsonPath, JSON.stringify({ xai: {
+      type: 'oauth', access: 'xai-access', refresh: 'xai-refresh', expires: Date.now() + 60_000,
+    } }));
+    migratePiSingleProvider('xai', xaiPaths, { keychain: new MockKeychain() });
+
+    for (const [provider, agentDir] of ([['anthropic', anthropicAgent], ['xai', join(xaiRoot, '.pi', 'agent')]] as const)) {
+      const output: string[] = [];
+      const result = await runPiGate(provider, {
+        dbPath: fixtureDb(), env: { QLB_PI_TOKEN_CALL: '1' }, deliver: (value) => output.push(value),
+        guard: () => true, admitted: () => ({ ok: true }), piAgentDir: agentDir,
+        provider: { read: () => ({ token: `${provider}-token`, accountId: `${provider}-default`, source: 'fixture' }) },
+      });
+      assert.equal(result, 0, provider);
+      assert.equal(output.length, 1, provider);
+    }
+  });
+
+  it('fails a non-migrated provider with its prerequisite cause', async () => {
+    const stderr: string[] = [];
+    const result = await runPiGate('xai', {
+      dbPath: fixtureDb(), env: { QLB_PI_TOKEN_CALL: '1' }, deliver: () => undefined, stderr: (line) => stderr.push(line),
+      guard: () => true, admitted: () => ({ ok: true }), piAgentDir: mkdtempSync(join(tmpdir(), 'qlb-gate-unmigrated-')),
+      provider: { read: () => ({ token: 'never', accountId: 'never', source: 'fixture' }) },
+    });
+    assert.equal(result, 1);
+    assert.deepEqual(stderr, ['owner-entry-missing']);
+  });
+
+  it('reports an absent provider module as missing-provider-gate without stdout', async () => {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const result = await runPiGate('xai', {
+      dbPath: fixtureDb(), env: { QLB_PI_TOKEN_CALL: '1' }, deliver: (value) => stdout.push(value), stderr: (line) => stderr.push(line),
+      guard: () => true, admitted: () => ({ ok: true }), prerequisites: () => undefined,
+    });
+    assert.equal(result, 3);
+    assert.deepEqual(stdout, []);
+    assert.deepEqual(stderr, ['missing-provider-gate']);
+  });
+
+  it('preserves explicit provider causes, registers the bare token, and opens one gate connection', async () => {
+    const dbPath = fixtureDb();
+    const registered: string[] = [];
+    let opened = 0;
+    const result = await runPiGate('xai', {
+      dbPath, env: { QLB_PI_TOKEN_CALL: '1' }, deliver: () => undefined, registerSecret: (value) => registered.push(value),
+      guard: () => true, prerequisites: () => undefined,
+      open: (path) => { opened += 1; return openStoreConnection(path); },
+      provider: { read: () => ({ token: 'bare-fixture-token', accountId: 'xai-default', source: 'fixture' }) },
+    });
+    assert.equal(result, 0);
+    assert.equal(opened, 1);
+    assert.deepEqual(registered, ['bare-fixture-token']);
+    assert.equal(redactSecrets('later stderr bare-fixture-token', registered), 'later stderr [redacted]');
+
+    const stderr: string[] = [];
+    const refused = await runPiGate('xai', {
+      dbPath, env: { QLB_PI_TOKEN_CALL: '1' }, deliver: () => undefined, stderr: (line) => stderr.push(line),
+      guard: () => true, prerequisites: () => undefined, admitted: () => ({ ok: true }),
+      provider: { read: () => { throw new GateFailure('codex-token-expired-renewer-idle'); } },
+    });
+    assert.equal(refused, 1);
+    assert.deepEqual(stderr, ['codex-token-expired-renewer-idle']);
   });
 });

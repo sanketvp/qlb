@@ -4,9 +4,9 @@ import { dirname, join } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 
 import { tokenCallAllowed } from './commands/token';
-import { assertAdmitted } from './lifecycle';
 import { loadGate } from './gate';
-import { openStore, openStoreConnection } from './store';
+import { isPiPlaceholder, isPiQlbOwnerEntry } from './pi-migrate';
+import { openStoreConnection } from './store';
 
 export const PI_GATE_PROVIDERS = ['anthropic', 'openai-codex', 'xai', 'kimi-coding', 'openrouter'] as const;
 export type PiGateProvider = (typeof PI_GATE_PROVIDERS)[number];
@@ -26,13 +26,23 @@ export interface ProviderGate {
   refresh?: () => GateCredential | Promise<GateCredential>;
 }
 
+/** A stable, value-free failure cause surfaced by a provider gate module. */
+export class GateFailure extends Error {
+  constructor(readonly code: string) {
+    super(code);
+    this.name = 'GateFailure';
+  }
+}
+
 export interface PiGateDeps {
   dbPath: string;
   env: NodeJS.ProcessEnv;
   deliver(value: string): void;
+  /** Registers a bare credential before the JSON envelope reaches stdout. */
+  registerSecret?(value: string): void;
   stderr?(message: string): void;
   guard?: (env: NodeJS.ProcessEnv) => boolean;
-  /** Test seam; production opens a short-lived Store solely for lifecycle admission. */
+  /** Test seam; command dispatch performs production lifecycle admission. */
   admitted?: () => { ok: boolean; code?: string };
   provider?: ProviderGate;
   prerequisites?: (provider: PiGateProvider, db: DatabaseSync) => void | Promise<void>;
@@ -51,16 +61,6 @@ function fingerprint(value: string): string {
   return `sha256:${createHash('sha256').update(value, 'utf8').digest('hex')}`;
 }
 
-function defaultAdmission(dbPath: string): { ok: boolean; code?: string } {
-  const store = openStore(dbPath);
-  try {
-    const result = assertAdmitted(store, 'gate');
-    return { ok: result.ok, code: result.code };
-  } finally {
-    store.close();
-  }
-}
-
 function parsedObject(path: string, code: string): Record<string, unknown> {
   try {
     const value: unknown = JSON.parse(readFileSync(path, 'utf8'));
@@ -71,31 +71,39 @@ function parsedObject(path: string, code: string): Record<string, unknown> {
   }
 }
 
+function legacyAnthropicOwner(owner: Record<string, unknown>): boolean {
+  if (owner.owner !== 'qlb' || !Array.isArray(owner.accounts)) return false;
+  return owner.accounts.some((account) => !!account && typeof account === 'object' && !Array.isArray(account)
+    && (account as Record<string, unknown>).provider === 'anthropic');
+}
+
 function defaultPrerequisites(provider: PiGateProvider, db: DatabaseSync, dbPath: string, piAgentDir?: string): void {
   const state = db.prepare('SELECT value FROM config WHERE key = ?').get(`pi.${provider}.state`) as { value?: unknown } | undefined;
-  if (state?.value === 'not-applicable') throw new Error('provider-not-applicable');
+  if (state?.value === 'not-applicable') throw new GateFailure('provider-not-applicable');
 
   const agentDir = piAgentDir ?? join(dirname(dbPath), '..', '.pi', 'agent');
   const ownerPath = join(agentDir, 'qlb-owner.json');
-  if (!existsSync(ownerPath)) throw new Error('owner-entry-missing');
+  if (!existsSync(ownerPath)) throw new GateFailure('owner-entry-missing');
   const owner = parsedObject(ownerPath, 'owner-file-malformed');
-  const providers = owner.providers;
-  if (!providers || typeof providers !== 'object' || Array.isArray(providers)) throw new Error('owner-file-malformed');
-  const entry = (providers as Record<string, unknown>)[provider];
-  if (!entry || typeof entry !== 'object' || Array.isArray(entry) ||
-      (entry as Record<string, unknown>).mode !== 'qlb') throw new Error('owner-entry-missing');
-
-  if (provider === 'openrouter') return;
-  const authPath = join(agentDir, 'auth.json');
-  const auth = parsedObject(authPath, 'placeholder-missing');
-  const placeholder = auth[provider];
-  if (!placeholder || typeof placeholder !== 'object' || Array.isArray(placeholder) ||
-      (placeholder as Record<string, unknown>).type !== 'oauth' ||
-      (placeholder as Record<string, unknown>).access !== 'qlb-managed' ||
-      (placeholder as Record<string, unknown>).refresh !== '') throw new Error('placeholder-missing');
-  if (provider === 'anthropic' && existsSync(join(agentDir, 'extensions', 'anthropic-pool'))) {
-    throw new Error('anthropic-pool-present');
+  if (provider === 'anthropic') {
+    // The current Anthropic writer is Migration's legacy OwnerFile. Its
+    // account metadata is the provider ownership record; it writes no Pi
+    // auth.json placeholder, unlike the P7a single-provider writer.
+    if (!legacyAnthropicOwner(owner)) throw new GateFailure('owner-entry-missing');
+    if (existsSync(join(agentDir, 'extensions', 'anthropic-pool'))) {
+      throw new GateFailure('anthropic-pool-present');
+    }
+    return;
   }
+
+  const providers = owner.providers;
+  if (!providers || typeof providers !== 'object' || Array.isArray(providers)) throw new GateFailure('owner-file-malformed');
+  if (!isPiQlbOwnerEntry((providers as Record<string, unknown>)[provider])) {
+    throw new GateFailure('owner-entry-missing');
+  }
+  if (provider === 'openrouter') return;
+  const auth = parsedObject(join(agentDir, 'auth.json'), 'placeholder-missing');
+  if (!isPiPlaceholder(auth[provider])) throw new GateFailure('placeholder-missing');
 }
 
 const SAFE_FAILURE_CODES = new Set([
@@ -104,6 +112,7 @@ const SAFE_FAILURE_CODES = new Set([
 ]);
 
 function failureCode(error: unknown): string {
+  if (error instanceof GateFailure && /^[a-z][a-z0-9-]*$/.test(error.code)) return error.code;
   const value = error instanceof Error ? error.message : '';
   return SAFE_FAILURE_CODES.has(value) || /^phase=(?:pre-cutover|undoing|rolled-back|aborted)$/.test(value)
     ? value
@@ -111,9 +120,17 @@ function failureCode(error: unknown): string {
 }
 
 function loadedProvider(provider: PiGateProvider): ProviderGate {
-  const loaded = loadGate(provider) as { default?: unknown } | unknown;
+  let loaded: unknown;
+  try {
+    loaded = loadGate(provider);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException | undefined)?.code === 'MODULE_NOT_FOUND') {
+      throw new GateFailure('missing-provider-gate');
+    }
+    throw error;
+  }
   const gate = (loaded && typeof loaded === 'object' && 'default' in loaded ? loaded.default : loaded) as Partial<ProviderGate>;
-  if (!gate || typeof gate.read !== 'function') throw new Error('missing-provider-gate');
+  if (!gate || typeof gate.read !== 'function') throw new GateFailure('missing-provider-gate');
   return gate as ProviderGate;
 }
 
@@ -158,7 +175,9 @@ export async function runPiGate(providerName: string, deps: PiGateDeps): Promise
     return 1;
   }
   try {
-    const admission = (deps.admitted ?? (() => defaultAdmission(deps.dbPath)))();
+    // runExecutingCommand has already admitted production calls. Keeping this
+    // seam preserves direct-core tests without opening another Store.
+    const admission = (deps.admitted ?? (() => ({ ok: true })))();
     if (!admission.ok) {
       deps.stderr?.(admission.code ?? 'lifecycle-refused');
       return 3;
@@ -168,24 +187,37 @@ export async function runPiGate(providerName: string, deps: PiGateDeps): Promise
     const gate = deps.provider ?? loadedProvider(providerName);
     await gate.prerequisites?.();
     const credential = await gate.read();
-    if (!credential || typeof credential.token !== 'string' || !credential.token || typeof credential.accountId !== 'string' || !credential.accountId) {
+    if (!credential || typeof credential.token !== 'string' || !credential.token ||
+        typeof credential.accountId !== 'string' || !credential.accountId ||
+        typeof credential.source !== 'string' || !credential.source) {
       deps.stderr?.('credential-unavailable');
       return 1;
     }
+    // This is the complete S30-authorized output shape. Provider modules may
+    // retain grants or refresh metadata internally, but none crosses stdout.
+    const delivered: GateCredential = {
+      token: credential.token,
+      accountId: credential.accountId,
+      source: credential.source,
+    };
+    if (typeof credential.chatgptAccountId === 'string') delivered.chatgptAccountId = credential.chatgptAccountId;
+    if (typeof credential.expiresAt === 'number' && Number.isFinite(credential.expiresAt)) delivered.expiresAt = credential.expiresAt;
 
     try {
-      recordEvidence(db, providerName, credential, deps.sqlTrace);
+      recordEvidence(db, providerName, delivered, deps.sqlTrace);
     } catch (error) {
       (deps.evidenceGap ?? ((name) => appendEvidenceGap(deps.dbPath, name)))(providerName, error);
       deps.stderr?.(`qlb gate ${providerName}: pi:evidence-gap`);
     }
     // The complete response shares the only unredacted channel. No ordinary
     // stdout/error path receives credential material.
-    deps.deliver(JSON.stringify(credential));
+    deps.registerSecret?.(delivered.token);
+    deps.deliver(JSON.stringify(delivered));
     return 0;
   } catch (error) {
-    deps.stderr?.(failureCode(error));
-    return 1;
+    const code = failureCode(error);
+    deps.stderr?.(code);
+    return code === 'missing-provider-gate' ? 3 : 1;
   } finally {
     db.close();
   }

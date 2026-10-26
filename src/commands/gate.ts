@@ -21,6 +21,7 @@ async function execute(args: string[], ctx: CommandContext): Promise<number> {
     dbPath: ctx.config.dbPath,
     env: ctx.env,
     deliver: (value) => ctx.deliverSecret(value),
+    registerSecret: ctx.registerSecret,
     stderr: ctx.stderr,
     // The core's default derives from the usual ~/.qlb location; command
     // dispatch has the authoritative configured Pi path.
