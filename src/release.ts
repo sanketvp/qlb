@@ -329,6 +329,8 @@ function recordHelperIdentityHash(dbPath: string, identityHash: string): void {
   try {
     mkdirSync(dirname(dbPath), { recursive: true, mode: 0o700 });
     db = new DatabaseSync(dbPath);
+    db.exec('PRAGMA busy_timeout = 5000');
+    db.exec('BEGIN IMMEDIATE');
     const versionRow = db.prepare('PRAGMA user_version').get() as { user_version?: unknown } | number | undefined;
     const version = typeof versionRow === 'number'
       ? versionRow
@@ -338,17 +340,16 @@ function recordHelperIdentityHash(dbPath: string, identityHash: string): void {
         `qlb.db schema user_version=${version} is newer than this binary (${SUPPORTED_SCHEMA_VERSION}); upgrade qlb`,
       );
     }
-    db.exec(`
-      PRAGMA busy_timeout = 5000;
-      CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT);
-    `);
+    db.exec('CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)');
     db.prepare(`
       INSERT INTO config (key, value) VALUES (?, ?)
       ON CONFLICT(key) DO NOTHING
     `).run(HELPER_IDENTITY_CONFIG_KEY, identityHash);
     const row = db.prepare('SELECT value FROM config WHERE key = ?').get(HELPER_IDENTITY_CONFIG_KEY) as { value?: unknown } | undefined;
     if (row?.value !== identityHash) throw new ReleaseIntegrityError('helper-identity-changed');
+    db.exec('COMMIT');
   } catch (error) {
+    try { db?.exec('ROLLBACK'); } catch { /* preserve the install failure */ }
     if (error instanceof ReleaseIntegrityError) throw error;
     throw new ReleaseIntegrityError('could not record helper identity pin');
   } finally {

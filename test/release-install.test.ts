@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
   copyFileSync,
@@ -359,6 +359,76 @@ describe('release install (AC45)', () => {
       assert.equal(after.prepare('SELECT value FROM config WHERE key = ?').get('keychain.helperCheckIdentityHash'), undefined);
     } finally { after.close(); }
     assert.equal(readlinkSync(join(appDir, 'current')), 'previous');
+  });
+
+  it('refuses a newer schema committed after the former version check and before pinning', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-release-helper-pin-racing-schema-'));
+    const sourceDir = sourceBuild(root, 'pin-racing-schema-sha');
+    const helper = join(sourceDir, 'native', 'keychain-helper', 'build', 'qlb-keychain-helper');
+    const appDir = join(root, 'app');
+    const dbPath = join(root, 'qlb.db');
+    const readyPath = join(root, 'migrator-ready');
+    const releasePath = join(root, 'release-migrator');
+    mkdirSync(dirname(helper), { recursive: true });
+    writeFileSync(helper, 'fake helper bytes\n');
+    const seeded = new DatabaseSync(dbPath);
+    seeded.exec('CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT); PRAGMA user_version = 5');
+    seeded.close();
+
+    const migrator = spawn(process.execPath, ['-e', `
+      const { existsSync, writeFileSync } = require('node:fs');
+      const { DatabaseSync } = require('node:sqlite');
+      const [dbPath, readyPath, releasePath] = process.argv.slice(1);
+      const db = new DatabaseSync(dbPath);
+      db.exec('BEGIN IMMEDIATE');
+      writeFileSync(readyPath, 'ready');
+      const timer = setInterval(() => {
+        if (!existsSync(releasePath)) return;
+        clearInterval(timer);
+        db.exec('PRAGMA user_version = 6; COMMIT');
+        db.close();
+      }, 5);
+    `, dbPath, readyPath, releasePath], {
+      env: { ...process.env, QLB_TEST_MODE: '1', QLB_HOME: join(root, 'qlb-home'), HOME: join(root, 'home') },
+    });
+    const migratorExit = new Promise<void>((resolve, reject) => {
+      migrator.once('error', reject);
+      migrator.once('exit', (code) => code === 0 ? resolve() : reject(new Error(`migrator exited ${code}`)));
+    });
+    for (let attempts = 0; !existsSync(readyPath); attempts += 1) {
+      assert.ok(attempts < 500, 'migrator did not acquire its write lock');
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+
+    const originalExec = DatabaseSync.prototype.exec;
+    let releasedMigrator = false;
+    DatabaseSync.prototype.exec = function releaseMigratorBeforePin(sql: string): void {
+      // Before the fix, CREATE TABLE is the first write after the version read.
+      // After it, BEGIN IMMEDIATE is first, so the migrator commits before the
+      // guarded read. Both schedules deterministically exercise the old gap.
+      if (!releasedMigrator && (sql.includes('BEGIN IMMEDIATE') || sql.includes('CREATE TABLE IF NOT EXISTS config'))) {
+        releasedMigrator = true;
+        writeFileSync(releasePath, 'go');
+      }
+      originalExec.call(this, sql);
+    };
+    try {
+      await assert.rejects(
+        installRelease({ sourceDir, appDir, sha: 'pin-racing-schema-sha', dbPath, ...validHelperVerifier }),
+        /qlb\.db schema user_version=6 is newer than this binary \(5\); upgrade qlb/,
+      );
+    } finally {
+      DatabaseSync.prototype.exec = originalExec;
+    }
+    await migratorExit;
+
+    assert.equal(releasedMigrator, true);
+    const after = new DatabaseSync(dbPath, { readOnly: true });
+    try {
+      assert.equal((after.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 6);
+      assert.equal(after.prepare('SELECT value FROM config WHERE key = ?').get('keychain.helperCheckIdentityHash'), undefined);
+    } finally { after.close(); }
+    assert.equal(existsSync(join(appDir, 'current')), false);
   });
 
   it('keeps a newly recorded pin when publishing current fails', async () => {
