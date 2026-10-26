@@ -59,11 +59,18 @@ describe('external-login evidence (AC18 fixture part)', () => {
     assert.equal(externalLoginCheck({ provider: 'openai-codex', successor: false }), 'soft');
   });
 
-  it('gates changed Codex auth_time hard evidence on verified L40', () => {
+  it('classifies Codex auth_time evidence as hard only under verified L40, otherwise retaining the S65 soft/attributed distinctions', () => {
     assert.equal(externalLoginCheck({ provider: 'openai-codex', successor: false, authTimeChanged: true }), 'soft');
     assert.equal(externalLoginCheck({
       provider: 'openai-codex', successor: false, l40Verified: true, authTimeChanged: true,
     }), 'hard');
+    assert.equal(externalLoginCheck({
+      provider: 'openai-codex', successor: true, l40Verified: true, authTimeChanged: true,
+    }), 'none');
+    assert.equal(externalLoginCheck({
+      provider: 'openai-codex', successor: false, l40Verified: true, authTimeChanged: true,
+      holderObservation: { aliveBefore: false, aliveAfter: true },
+    }), 'none');
   });
 
   it('classifies a persisted-to-slot lineage chain as a managed rotation', () => {
