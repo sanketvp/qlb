@@ -1,10 +1,11 @@
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
 import { codexFingerprint, readCodexAuthStable, type CodexAuthDocument, type CodexAuthStableResult } from './codex-auth';
+import { isCredentialNotFound } from './credential-backends';
 import { planImportActiveCodex } from './codex-slots';
 import { QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, type KeychainBackend } from './keychain';
 import type { Store } from './store';
@@ -35,6 +36,8 @@ export interface CodexLoginOptions {
   args: string[];
   env: NodeJS.ProcessEnv;
   cwd: string;
+  /** Receives the login child so cleanup can stop it before removing CODEX_HOME. */
+  onSpawn?: (child: ChildProcess) => void;
 }
 
 type SqlStore = Pick<Store, 'dbPath'>;
@@ -53,7 +56,7 @@ export interface CodexAddDeps {
   login: (options: CodexLoginOptions) => Promise<number>;
   readAuth: (path: string) => Promise<CodexAuthStableResult>;
   /** Installs process-exit and signal cleanup; returns an unregister function. */
-  installCleanup: (cleanup: () => void) => () => void;
+  installCleanup: (cleanup: () => Promise<void>) => () => void;
   /** Test seam for the short SQLite transaction. */
   withDb: <T>(store: SqlStore, fn: (db: DatabaseSync) => T) => T;
 }
@@ -99,6 +102,7 @@ function persist(doc: CodexAuthDocument, input: CodexAddInput, deps: CodexAddDep
   const withDb = deps.withDb;
   let wroteCredential = false;
   let priorCredential: string | undefined;
+  let priorPrevious: string | undefined;
   let exists = false;
 
   try {
@@ -115,12 +119,30 @@ function persist(doc: CodexAuthDocument, input: CodexAddInput, deps: CodexAddDep
           throw new CodexAddError('Codex replacement identity differs; add as a new account and delete the old slot', 3);
         }
 
-        if (existing?.fingerprint) {
+        // Snapshot both values before the first write. A failed replacement must
+        // leave the current/predecessor pair exactly as it found it.
+        try {
           priorCredential = deps.keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT);
-          deps.keychain.setSync(`${service}:prev`, QLB_KEYCHAIN_ACCOUNT, priorCredential);
+        } catch (error) {
+          // An existing slot must have its current credential; preserve the
+          // prior fail-closed behavior for that inconsistent state.
+          if (existing?.fingerprint || !isCredentialNotFound(error)) throw error;
+          priorCredential = undefined;
+        }
+        try {
+          priorPrevious = deps.keychain.getSync(`${service}:prev`, QLB_KEYCHAIN_ACCOUNT);
+        } catch (error) {
+          if (!isCredentialNotFound(error)) throw error;
+          priorPrevious = undefined;
+        }
+
+        // Set this before every write: a backend can throw after modifying an
+        // item, and compensation must cover that ambiguous outcome too.
+        wroteCredential = true;
+        if (existing?.fingerprint) {
+          deps.keychain.setSync(`${service}:prev`, QLB_KEYCHAIN_ACCOUNT, priorCredential!);
         }
         deps.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(doc));
-        wroteCredential = true;
 
         const now = deps.now();
         db.prepare(`INSERT INTO codex_slots (
@@ -157,11 +179,17 @@ function persist(doc: CodexAuthDocument, input: CodexAddInput, deps: CodexAddDep
       }
     });
   } catch (error) {
-    // A database failure must not leave an orphaned credential from this add.
+    // A failed transaction (or either Keychain write) must restore both the
+    // current credential and its predecessor. Restore each independently so a
+    // failure restoring one does not skip the other.
     if (wroteCredential) {
       try {
         if (priorCredential !== undefined) deps.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, priorCredential);
         else deps.keychain.deleteSync(service, QLB_KEYCHAIN_ACCOUNT);
+      } catch { /* retain the primary persistence error */ }
+      try {
+        if (priorPrevious !== undefined) deps.keychain.setSync(`${service}:prev`, QLB_KEYCHAIN_ACCOUNT, priorPrevious);
+        else deps.keychain.deleteSync(`${service}:prev`, QLB_KEYCHAIN_ACCOUNT);
       } catch { /* retain the primary persistence error */ }
     }
     throw error;
@@ -175,11 +203,26 @@ function persist(doc: CodexAuthDocument, input: CodexAddInput, deps: CodexAddDep
 export async function addCodexAccount(input: CodexAddInput, deps: CodexAddDeps): Promise<CodexAddResult> {
   const before = deps.hashFile(input.nativeAuthPath);
   const temporaryHome = deps.createTemp(input.home);
+  let loginChild: ChildProcess | undefined;
   let cleaned = false;
-  const cleanup = (): void => {
+  let cleaning: Promise<void> | undefined;
+  const cleanup = async (): Promise<void> => {
     if (cleaned) return;
-    cleaned = true;
-    deps.removeTemp(temporaryHome);
+    if (cleaning) return cleaning;
+    cleaning = (async () => {
+      if (loginChild && loginChild.exitCode === null && loginChild.signalCode === null) {
+        await stopLoginChild(loginChild);
+      }
+      // Do not declare cleanup complete until the child cannot recreate its
+      // isolated credential directory and removal has actually happened.
+      deps.removeTemp(temporaryHome);
+      cleaned = true;
+    })();
+    try {
+      await cleaning;
+    } finally {
+      if (!cleaned) cleaning = undefined;
+    }
   };
   const unregister = deps.installCleanup(cleanup);
 
@@ -187,21 +230,24 @@ export async function addCodexAccount(input: CodexAddInput, deps: CodexAddDeps):
     deps.writeConfig(join(temporaryHome, 'config.toml'), CODEX_FILE_CREDENTIAL_STORE_CONFIG);
     const status = await deps.login({
       command: 'codex', args: ['login'], cwd: temporaryHome, env: { ...deps.env, CODEX_HOME: temporaryHome },
+      onSpawn: (child) => { loginChild = child; },
     });
+    if (cleaning) throw new CodexAddError('codex login interrupted');
     if (status !== 0) throw new CodexAddError('codex login failed');
 
     const doc = stableDocument(await deps.readAuth(join(temporaryHome, 'auth.json')));
     if (deps.hashFile(input.nativeAuthPath) !== before) {
       throw new CodexAddError('native Codex auth.json changed during isolated login', 3);
     }
-    const result = persist(doc, input, deps);
+    // Both native-file checks precede irreversible Keychain/SQLite changes.
     if (deps.hashFile(input.nativeAuthPath) !== before) {
       throw new CodexAddError('native Codex auth.json changed during isolated login', 3);
     }
-    return result;
+    if (cleaning) throw new CodexAddError('codex login interrupted');
+    return persist(doc, input, deps);
   } finally {
     unregister();
-    cleanup();
+    await cleanup();
   }
 }
 
@@ -222,24 +268,53 @@ function hashNativeAuth(path: string): string {
   return createHash('sha256').update(readFileSync(path)).digest('hex');
 }
 
+function stopLoginChild(child: ChildProcess): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+  return new Promise((resolve) => {
+    let timer: NodeJS.Timeout | undefined;
+    const exited = (): void => {
+      if (timer) clearTimeout(timer);
+      resolve();
+    };
+    child.once('exit', exited);
+    child.kill('SIGTERM');
+    timer = setTimeout(() => {
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+    }, 5_000);
+  });
+}
+
 function runCodexLogin(options: CodexLoginOptions): Promise<number> {
   return new Promise((resolve, reject) => {
     const child = spawn(options.command, options.args, { cwd: options.cwd, env: options.env, stdio: 'inherit' });
+    options.onSpawn?.(child);
     child.once('error', reject);
     child.once('exit', (code) => resolve(code ?? 1));
   });
 }
 
-function installProcessCleanup(cleanup: () => void): () => void {
-  const safeCleanup = (): void => { try { cleanup(); } catch { /* exit cleanup is best effort */ } };
-  process.once('SIGINT', safeCleanup);
-  process.once('SIGTERM', safeCleanup);
-  process.once('exit', safeCleanup);
-  return () => {
-    process.removeListener('SIGINT', safeCleanup);
-    process.removeListener('SIGTERM', safeCleanup);
-    process.removeListener('exit', safeCleanup);
+function installProcessCleanup(cleanup: () => Promise<void>): () => void {
+  let handlingSignal = false;
+  const onExit = (): void => { void cleanup().catch(() => undefined); };
+  const unregister = (): void => {
+    process.removeListener('SIGINT', onSigint);
+    process.removeListener('SIGTERM', onSigterm);
+    process.removeListener('exit', onExit);
   };
+  const onSignal = (signal: NodeJS.Signals): void => {
+    if (handlingSignal) return;
+    handlingSignal = true;
+    // Removing our listeners restores Node's default signal disposition before
+    // re-raising it, after the child has stopped and CODEX_HOME is gone.
+    unregister();
+    void cleanup().finally(() => { process.kill(process.pid, signal); });
+  };
+  const onSigint = (): void => onSignal('SIGINT');
+  const onSigterm = (): void => onSignal('SIGTERM');
+  process.once('SIGINT', onSigint);
+  process.once('SIGTERM', onSigterm);
+  process.once('exit', onExit);
+  return unregister;
 }
 
 /** Production effects for the executing command; unit tests provide all seams. */

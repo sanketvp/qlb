@@ -1,4 +1,8 @@
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { describe, it } from 'node:test';
 
@@ -109,15 +113,157 @@ describe('codex add', () => {
     } finally { f.store.close(); }
   });
 
-  it('fails closed when the native auth file changes during the isolated login', async () => {
+  it('checks native auth twice before persisting, so a change between checks leaves nothing committed', async () => {
     const f = fixture();
     let count = 0;
-    f.setHash(() => (++count === 1 ? 'before' : 'after'));
+    f.setHash(() => ['before', 'before', 'after'][count++]!);
     try {
       await assert.rejects(addCodexAccount({ home: '/fixture-home', nativeAuthPath: '/native-auth' }, f.deps), /native Codex auth\.json changed/);
       assert.equal(rows(f.store).slot, undefined);
+      assert.throws(() => f.keychain.getSync(qlbKeychainService('openai-codex', 'fixture-user:fixture-account'), QLB_KEYCHAIN_ACCOUNT));
       assert.ok(f.calls.includes('remove:/tmp/codex-add-fixture'));
     } finally { f.store.close(); }
+  });
+
+  it('restores current and :prev exactly when a replace fails after either credential write', async () => {
+    for (const failingWrite of [1, 2]) {
+      const f = fixture(document('original'));
+      try {
+        await addCodexAccount({ home: '/fixture-home', nativeAuthPath: '/native-auth' }, f.deps);
+        f.deps.readAuth = async () => ({ status: 'ok', doc: document('current') });
+        await addCodexAccount({ home: '/fixture-home', nativeAuthPath: '/native-auth', replace: 'fixture-user:fixture-account' }, f.deps);
+        const service = qlbKeychainService('openai-codex', 'fixture-user:fixture-account');
+        const beforeCurrent = f.keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT);
+        const beforePrevious = f.keychain.getSync(`${service}:prev`, QLB_KEYCHAIN_ACCOUNT);
+        const db = (f.store as unknown as { db: DatabaseSync }).db;
+        const beforeSlot = db.prepare('SELECT prev_fingerprint FROM codex_slots WHERE account_id = ?').get('fixture-user:fixture-account') as { prev_fingerprint: string | null } | undefined;
+        let writes = 0;
+        f.deps.keychain = {
+          getSync: f.keychain.getSync.bind(f.keychain),
+          deleteSync: f.keychain.deleteSync.bind(f.keychain),
+          setSync: (target, account, value) => {
+            writes += 1;
+            if (writes === failingWrite) throw new Error(`injected credential write ${failingWrite}`);
+            f.keychain.setSync(target, account, value);
+          },
+        };
+        f.deps.readAuth = async () => ({ status: 'ok', doc: document('replacement') });
+
+        await assert.rejects(
+          addCodexAccount({ home: '/fixture-home', nativeAuthPath: '/native-auth', replace: 'fixture-user:fixture-account' }, f.deps),
+          /injected credential write/,
+        );
+        assert.equal(f.keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT), beforeCurrent);
+        assert.equal(f.keychain.getSync(`${service}:prev`, QLB_KEYCHAIN_ACCOUNT), beforePrevious);
+        const slot = db.prepare('SELECT prev_fingerprint FROM codex_slots WHERE account_id = ?').get('fixture-user:fixture-account') as { prev_fingerprint: string | null } | undefined;
+        assert.equal(slot?.prev_fingerprint, beforeSlot?.prev_fingerprint);
+      } finally { f.store.close(); }
+    }
+  });
+
+  it('restores current and :prev exactly when a database write fails during replace', async () => {
+    const f = fixture(document('original'));
+    try {
+      await addCodexAccount({ home: '/fixture-home', nativeAuthPath: '/native-auth' }, f.deps);
+      f.deps.readAuth = async () => ({ status: 'ok', doc: document('current') });
+      await addCodexAccount({ home: '/fixture-home', nativeAuthPath: '/native-auth', replace: 'fixture-user:fixture-account' }, f.deps);
+      const service = qlbKeychainService('openai-codex', 'fixture-user:fixture-account');
+      const beforeCurrent = f.keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT);
+      const beforePrevious = f.keychain.getSync(`${service}:prev`, QLB_KEYCHAIN_ACCOUNT);
+      const db = (f.store as unknown as { db: DatabaseSync }).db;
+      const beforeSlot = db.prepare('SELECT prev_fingerprint FROM codex_slots WHERE account_id = ?').get('fixture-user:fixture-account') as { prev_fingerprint: string | null } | undefined;
+      const originalWithDb = f.deps.withDb;
+      f.deps.withDb = ((store, fn) => originalWithDb(store, (database) => {
+        const failingDatabase = new Proxy(database, {
+          get(target, property) {
+            if (property === 'prepare') return (sql: string) => {
+              const statement = target.prepare(sql);
+              if (!sql.includes('INSERT INTO accounts')) return statement;
+              return new Proxy(statement, { get(statementTarget, statementProperty) {
+                if (statementProperty === 'run') return () => { throw new Error('injected database write'); };
+                const value = Reflect.get(statementTarget, statementProperty);
+                return typeof value === 'function' ? value.bind(statementTarget) : value;
+              } });
+            };
+            const value = Reflect.get(target, property);
+            return typeof value === 'function' ? value.bind(target) : value;
+          },
+        });
+        return fn(failingDatabase);
+      })) as typeof f.deps.withDb;
+      f.deps.readAuth = async () => ({ status: 'ok', doc: document('replacement') });
+
+      await assert.rejects(
+        addCodexAccount({ home: '/fixture-home', nativeAuthPath: '/native-auth', replace: 'fixture-user:fixture-account' }, f.deps),
+        /injected database write/,
+      );
+      assert.equal(f.keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT), beforeCurrent);
+      assert.equal(f.keychain.getSync(`${service}:prev`, QLB_KEYCHAIN_ACCOUNT), beforePrevious);
+      const slot = db.prepare('SELECT prev_fingerprint FROM codex_slots WHERE account_id = ?').get('fixture-user:fixture-account') as { prev_fingerprint: string | null } | undefined;
+      assert.equal(slot?.prev_fingerprint, beforeSlot?.prev_fingerprint);
+    } finally { f.store.close(); }
+  });
+
+  it('stops the login child before removing its temp home on SIGTERM', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-codex-add-signal-'));
+    const fakeBin = join(root, 'bin');
+    const marker = join(root, 'child.json');
+    const helper = join(root, 'helper.cjs');
+    try {
+      mkdirSync(fakeBin);
+      const fakeCodex = join(fakeBin, 'codex');
+      writeFileSync(fakeCodex, `#!/usr/bin/env node
+const fs = require('node:fs');
+fs.writeFileSync(process.env.MARKER, JSON.stringify({ home: process.env.CODEX_HOME, pid: process.pid }));
+process.on('SIGTERM', () => {});
+setTimeout(() => {
+  fs.mkdirSync(process.env.CODEX_HOME, { recursive: true });
+  fs.writeFileSync(require('node:path').join(process.env.CODEX_HOME, 'auth.json'), '{}');
+  process.exit(0);
+}, 150);
+`);
+      chmodSync(fakeCodex, 0o700);
+      writeFileSync(helper, `
+const fs = require('node:fs');
+const { openStore } = require(${JSON.stringify(require.resolve('../src/store'))});
+const { MockKeychain } = require(${JSON.stringify(require.resolve('../src/keychain'))});
+const { addCodexAccount, productionCodexAddDeps } = require(${JSON.stringify(require.resolve('../src/codex-add'))});
+const native = require('node:path').join(process.env.HOME, 'native-auth.json');
+fs.writeFileSync(native, '{}');
+const store = openStore(':memory:');
+addCodexAccount({ home: process.env.HOME, nativeAuthPath: native }, productionCodexAddDeps(store, new MockKeychain(), process.env))
+  .then(() => { store.close(); process.exitCode = 0; })
+  .catch(() => { store.close(); process.exitCode = 1; });
+`);
+      const child = spawn(process.execPath, [helper], {
+        env: {
+          ...process.env,
+          QLB_TEST_MODE: '1', QLB_HOME: root, HOME: root,
+          PATH: `${fakeBin}:${process.env.PATH ?? ''}`, MARKER: marker,
+        },
+        stdio: 'ignore',
+      });
+      const markerText = await new Promise<string>((resolve, reject) => {
+        const deadline = Date.now() + 2_000;
+        const check = (): void => {
+          if (existsSync(marker)) { resolve(readFileSync(marker, 'utf8')); return; }
+          if (Date.now() >= deadline) { reject(new Error('fake codex did not start')); return; }
+          setTimeout(check, 10);
+        };
+        check();
+      });
+      const childInfo = JSON.parse(markerText) as { home: string; pid: number };
+      child.kill('SIGTERM');
+      const result = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+        child.once('close', (code, signal) => resolve({ code, signal }));
+      });
+      assert.notEqual(result.code, 0);
+      assert.equal(result.signal, 'SIGTERM');
+      assert.equal(existsSync(childInfo.home), false);
+      assert.throws(() => process.kill(childInfo.pid, 0), { code: 'ESRCH' });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it('cleans the temporary directory on login failure and through the injected signal cleanup', async () => {
