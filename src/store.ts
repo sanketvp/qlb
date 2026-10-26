@@ -1386,6 +1386,21 @@ export class Store {
     return rows as unknown as AccountRow[];
   }
 
+  /** Current provider-owned login, if an adoption or switch has recorded one. */
+  getActiveLogin(provider: string): { provider: string; accountId: string | null; since: number; setBy: string } | null {
+    const row = this.db.prepare('SELECT provider, account_id, since, set_by FROM active_login WHERE provider = ?').get(provider) as
+      | { provider: string; account_id: string | null; since: number; set_by: string }
+      | undefined;
+    return row ? { provider: row.provider, accountId: row.account_id, since: row.since, setBy: row.set_by } : null;
+  }
+
+  /** Additive active-login upsert used by provider-specific adoption paths. */
+  setActiveLogin(provider: string, accountId: string | null, setBy: string): void {
+    this.db.prepare(`INSERT INTO active_login (provider, account_id, since, set_by) VALUES (?, ?, ?, ?)
+      ON CONFLICT(provider) DO UPDATE SET account_id = excluded.account_id, since = excluded.since, set_by = excluded.set_by`)
+      .run(provider, accountId, Date.now(), setBy);
+  }
+
   upsertSnapshot(accountId: string, bucket: string, reading: BucketReading): void {
     this.upsertSnapStmt.run(
       accountId,
