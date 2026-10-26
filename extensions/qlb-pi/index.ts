@@ -62,6 +62,7 @@ import type { Api, Context, Model, SimpleStreamOptions } from "@earendil-works/p
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { streamWithAuthRetry } from "./auth-retry.js";
+import { registerOpenRouterSource } from "./providers/openrouter.js";
 import {
   accountFg,
   buildExpandPanelLines,
@@ -266,6 +267,10 @@ async function resolveBuiltinAnthropicStreamSimple(): Promise<StreamSimple> {
 }
 
 export default async function (pi: ExtensionAPI): Promise<void> {
+  // Each v2 provider decides ownership independently; OpenRouter must be
+  // registered even when Anthropic remains inert.
+  registerOpenRouterSource(pi);
+
   const rehearsal = process.env.QLB_PI_REHEARSAL;
   const base =
     rehearsal === "0"
