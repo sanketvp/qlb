@@ -80,6 +80,12 @@ import {
   type XaiProviderApi,
 } from "./providers/xai.js";
 import {
+  registerOpenAICodexProvider,
+  type OpenAICodexBuiltin,
+  type OpenAICodexEventSink,
+  type OpenAICodexProviderApi,
+} from "./providers/openai-codex.js";
+import {
   accountFg,
   buildExpandPanelLines,
   buildFooterLines,
@@ -342,6 +348,27 @@ async function registerOwnedXaiProvider(pi: ExtensionAPI): Promise<void> {
   }
 }
 
+/** Install Codex only after its v2 owner entry exists; compat failures stay fail-closed. */
+async function registerOwnedOpenAICodexProvider(pi: ExtensionAPI): Promise<void> {
+  const deps = { createStream: () => createAssistantMessageEventStream() as unknown as OpenAICodexEventSink };
+  try {
+    const namespace = (await import("@earendil-works/pi-ai/compat")) as unknown as {
+      openAICodexResponsesApi?: () => { streamSimple?: OpenAICodexBuiltin };
+    };
+    const builtin = namespace.openAICodexResponsesApi?.()?.streamSimple;
+    if (typeof builtin !== "function") throw new Error("missing openAICodexResponsesApi streamSimple");
+    registerOpenAICodexProvider(pi as unknown as OpenAICodexProviderApi, builtin, deps);
+  } catch (err) {
+    // Never leave Pi's native Codex provider active when QLB owns it.
+    console.error("[qlb-pi] could not resolve builtin OpenAI Codex transport:", err);
+    const unavailableTransport: OpenAICodexBuiltin = () => { throw new Error("openai-codex transport unavailable"); };
+    registerOpenAICodexProvider(pi as unknown as OpenAICodexProviderApi, unavailableTransport, {
+      ...deps,
+      runGate: async () => { throw new Error("openai-codex gate unavailable"); },
+    });
+  }
+}
+
 export default async function (pi: ExtensionAPI): Promise<void> {
   registerKimiCodingProvider(pi as unknown as ProviderApi, {
     createStream: () => createAssistantMessageEventStream() as unknown as { push(event: unknown): void; end(): void },
@@ -390,6 +417,14 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     }) !== "inert";
   })();
   if (xaiOwner) await registerOwnedXaiProvider(pi);
+  const openAICodexOwner = base && (() => {
+    const owner = readPiOwnerFile(OWNER_FILE);
+    return decidePiMode("openai-codex", {
+      rehearsal,
+      owner: ownerStateForProvider(owner, "openai-codex"),
+    }) !== "inert";
+  })();
+  if (openAICodexOwner) await registerOwnedOpenAICodexProvider(pi);
   if (mode === "inert") {
     // Inert for Anthropic: QLB does not own it and consume is off. Its pool remains registered.
     return;

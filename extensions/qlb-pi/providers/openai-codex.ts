@@ -1,8 +1,13 @@
 // QLB-backed OpenAI Codex access source (§4.7.2).
 //
-// The caller supplies the gate runner: this module never shells out, logs a
-// credential, or falls back to Pi's persisted OAuth entry.
+// The source reader accepts an injected gate runner; the registration adapter
+// invokes the QLB gate per request and never falls back to Pi's persisted OAuth entry.
 
+import { spawn } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
+
+import { qlbUnavailable } from '../active-access.js';
 import type { ActiveAccess, ActiveAccessSource } from '../active-access.js';
 
 export interface GateResult {
@@ -83,4 +88,111 @@ export function openAICodexHeaders(access: ActiveAccess): Record<'Authorization'
     Authorization: `Bearer ${access.token}`,
     'ChatGPT-Account-Id': access.chatgptAccountId,
   };
+}
+
+export interface OpenAICodexModel {
+  id: string;
+  api?: unknown;
+  provider?: unknown;
+}
+
+export interface OpenAICodexEventSink {
+  push(event: unknown): void;
+  end(): void;
+}
+
+export interface OpenAICodexProviderApi {
+  unregisterProvider(name: string): void;
+  registerProvider(name: string, config: {
+    api: 'openai-codex-responses';
+    streamSimple: (model: OpenAICodexModel, context: unknown, options?: Record<string, unknown>) => unknown;
+  }): void;
+}
+
+export type OpenAICodexBuiltin = (
+  model: OpenAICodexModel,
+  context: unknown,
+  options: Record<string, unknown>,
+) => AsyncIterable<unknown>;
+
+export interface RegisterOpenAICodexProviderDeps {
+  createStream(): OpenAICodexEventSink;
+  /** Injectable only for tests; production invokes `qlb gate openai-codex`. */
+  runGate?: GateRunner;
+}
+
+function findQlbCli(): { command: string; prefix: string[] } {
+  if (process.env.QLB_CLI) return { command: process.execPath, prefix: [process.env.QLB_CLI] };
+  const repoCli = join(__dirname, '..', '..', '..', 'dist', 'cli.js');
+  return existsSync(repoCli) ? { command: process.execPath, prefix: [repoCli] } : { command: 'qlb', prefix: [] };
+}
+
+/** Process boundary for the production per-request gate. */
+function runOpenAICodexGate(_provider: 'openai-codex'): Promise<GateResult> {
+  const { command, prefix } = findQlbCli();
+  return new Promise((resolve) => {
+    const child = spawn(command, [...prefix, 'gate', 'openai-codex', '--json'], {
+      stdio: ['ignore', 'pipe', 'ignore'],
+      env: { ...process.env, QLB_PI_TOKEN_CALL: '1' },
+    });
+    let stdout = '';
+    let settled = false;
+    const finish = (result: GateResult) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      resolve(result);
+    };
+    const timeout = setTimeout(() => {
+      try { child.kill('SIGTERM'); } catch { /* child already exited */ }
+      finish({ code: 1, stdout: '' });
+    }, 15_000);
+    child.stdout?.on('data', (chunk: Buffer) => { stdout += chunk.toString('utf8'); });
+    child.once('error', () => finish({ code: 1, stdout: '' }));
+    child.once('close', (code) => finish({ code: code ?? 1, stdout }));
+  });
+}
+
+function withQlbAccess(options: Record<string, unknown>, access: ActiveAccess): Record<string, unknown> {
+  const headers = options.headers;
+  const inherited = headers && typeof headers === 'object' && !Array.isArray(headers)
+    ? Object.fromEntries(Object.entries(headers).filter(([name]) => {
+      const normalized = name.toLowerCase();
+      return normalized !== 'authorization' && normalized !== 'chatgpt-account-id';
+    }))
+    : {};
+  return { ...options, apiKey: access.token, headers: { ...inherited, ...openAICodexHeaders(access) } };
+}
+
+/**
+ * Replaces Pi's native Codex source after QLB owns it. Every request reads a
+ * fresh gate result; a failed gate emits one fixed event and never invokes the
+ * built-in transport (or Pi's persisted OAuth credential).
+ */
+export function registerOpenAICodexProvider(
+  pi: OpenAICodexProviderApi,
+  builtin: OpenAICodexBuiltin,
+  deps: RegisterOpenAICodexProviderDeps,
+): void {
+  const source = createOpenAICodexSource({ runGate: deps.runGate ?? runOpenAICodexGate });
+  pi.unregisterProvider('openai-codex');
+  pi.registerProvider('openai-codex', {
+    api: 'openai-codex-responses',
+    streamSimple: (model, context, options = {}) => {
+      const output = deps.createStream();
+      void (async () => {
+        try {
+          const access = await source.read();
+          for await (const event of builtin(model, context, withQlbAccess(options, access))) {
+            output.push(event);
+          }
+        } catch {
+          output.push(qlbUnavailable('openai-codex', 'unknown', model));
+        } finally {
+          output.end();
+        }
+      })();
+      return output;
+    },
+  });
 }
