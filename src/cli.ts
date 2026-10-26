@@ -8,6 +8,7 @@ import { assertAdmitted, type LifecycleOperation } from './lifecycle';
 import { createDefaultCodexGateDeps, runCodexGate } from './codex-gate';
 import { config, resolveConfig, stripConfigArgs } from './config';
 import { qlbHomeDir } from './home';
+import { hasLegacyPiOwnerEntry, readPiOwnerProviders } from './pi-migrate';
 import { discoverCommands, resolveCommand, type CommandContext, type CommandDefinition } from './registry';
 import { runCodexProbeClaims } from './commands/codex-probe-claims';
 import { redactError, redactSecrets } from './redact';
@@ -1244,6 +1245,18 @@ function printMigrate(status: ReturnType<Migration['status']>, json: boolean): v
 /** Refusal code shared by the Pi-ownership vs cswap-consume guards. */
 const DUAL_OWNERSHIP_REFUSED = 'DUAL_OWNERSHIP_REFUSED';
 const PI_POOL_OWNING_STATES = new Set(['MIRRORED', 'VALIDATED', 'QLB_OWNED', 'RETIRED']);
+
+function piOwnerClaimsAnthropic(path: string): boolean {
+  try {
+    if (hasLegacyPiOwnerEntry(path, 'anthropic')) return true;
+    const entry = readPiOwnerProviders(path).anthropic;
+    return !!entry && typeof entry === 'object' && !Array.isArray(entry)
+      && (entry as Record<string, unknown>).mode === 'qlb';
+  } catch {
+    // Ambiguous ownership must keep consume enable safely refused.
+    return true;
+  }
+}
 const FORWARD_MIGRATE_SUBS = new Set(['stage', 'rehearse', 'commit', 'resume']);
 
 async function runMigrate(opts: MigrateOpts): Promise<number> {
@@ -1431,7 +1444,7 @@ async function runConsume(opts: ConsumeOpts): Promise<number> {
     const marker = consumeMarkerPathFor(dbPath);
     if (opts.sub === 'enable') {
       const piPool = store.getMigration(PI_POOL_STORE)?.state;
-      if ((piPool && PI_POOL_OWNING_STATES.has(piPool)) || existsSync(defaultOwnerFileFor('anthropic'))) {
+      if ((piPool && PI_POOL_OWNING_STATES.has(piPool)) || piOwnerClaimsAnthropic(defaultOwnerFileFor('anthropic'))) {
         console.error(
           `qlb consume enable: ${DUAL_OWNERSHIP_REFUSED} — Pi's Anthropic accounts are QLB-owned ` +
             `(pi-pool ${piPool ?? 'owner file present'}). Roll back with ` +

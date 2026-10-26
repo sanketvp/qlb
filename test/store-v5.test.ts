@@ -457,7 +457,7 @@ describe('store v5 schema (AC38)', () => {
       assert.equal(uniqueIndexes.some((index) => index.unique === 1 && (repairedCheck.prepare(`PRAGMA index_info(${index.name})`).all() as Array<{ name: string }>).some((column) => column.name === 'slot_num')), true);
     } finally { repairedCheck.close(); }
 
-    assert.throws(() => openStore(duplicatePath), /cannot correct pre-release v5 claude_slots: copied rows violate new constraints/);
+    assert.throws(() => openStore(duplicatePath), /cannot correct pre-release v5 claude_slots: duplicate values violate canonical UNIQUE constraint on slot_num/);
     const duplicateCheck = dbAt(duplicatePath);
     try {
       assert.equal((duplicateCheck.prepare('SELECT count(*) AS count FROM claude_slots WHERE slot_num = 1').get() as { count: number }).count, 2);
@@ -761,7 +761,7 @@ describe('store v5 schema (AC38)', () => {
   });
 
   it('refuses provider-less usage_polls schema objects and constraints before any backup', () => {
-    const cases = [
+    const cases: Array<{ name: string; objectSql: string; accountId?: string; check?: string; reason: RegExp }> = [
       {
         name: 'index',
         objectSql: 'CREATE INDEX usage_polls_extra_index ON usage_polls(last_fetch_at);',
@@ -783,7 +783,42 @@ describe('store v5 schema (AC38)', () => {
         check: 'CHECK (last_fetch_at IS NULL OR last_fetch_at >= 0)',
         reason: /CHECK differs from the canonical definition/,
       },
-    ] as const;
+      {
+        name: 'column-level REFERENCES',
+        objectSql: '',
+        accountId: 'account_id TEXT PRIMARY KEY REFERENCES accounts(id)',
+        check: undefined,
+        reason: /foreign-key definition differs from the canonical definition/,
+      },
+      {
+        name: 'shorthand generated column',
+        objectSql: '',
+        check: 'fetch_age INTEGER AS (last_fetch_at - last_attempt_at) VIRTUAL',
+        reason: /column fetch_age is generated or hidden and cannot be reproduced/,
+      },
+      {
+        name: 'primary-key COLLATE',
+        objectSql: '',
+        accountId: 'account_id TEXT PRIMARY KEY COLLATE NOCASE',
+        check: undefined,
+        reason: /constraint index differs from the canonical definition/,
+      },
+      {
+        name: 'view referencing usage_polls',
+        objectSql: 'CREATE VIEW usage_polls_view AS SELECT account_id FROM usage_polls;',
+        check: undefined,
+        reason: /view usage_polls_view references usage_polls and prevents an exact rebuild/,
+      },
+      {
+        name: 'trigger on another table referencing usage_polls',
+        objectSql: `CREATE TABLE usage_polls_audit (account_id TEXT);
+          CREATE TRIGGER usage_polls_other_trigger AFTER INSERT ON usage_polls_audit BEGIN
+            INSERT INTO usage_polls_audit SELECT account_id FROM usage_polls;
+          END;`,
+        check: undefined,
+        reason: /trigger usage_polls_other_trigger on another table references usage_polls and prevents an exact rebuild/,
+      },
+    ];
 
     for (const fixture of cases) {
       const dir = mkdtempSync(join(tmpdir(), 'qlb-v5-providerless-object-'));
@@ -791,7 +826,7 @@ describe('store v5 schema (AC38)', () => {
       const db = new DatabaseSync(path);
       db.exec(`CREATE TABLE accounts (id TEXT PRIMARY KEY, provider TEXT, label TEXT, status TEXT, created_at INTEGER, grant_generation INTEGER DEFAULT 0);
         CREATE TABLE usage_polls (
-          account_id TEXT PRIMARY KEY, last_fetch_at INTEGER, last_attempt_at INTEGER, next_due_at INTEGER,
+          ${fixture.accountId ?? 'account_id TEXT PRIMARY KEY'}, last_fetch_at INTEGER, last_attempt_at INTEGER, next_due_at INTEGER,
           poll_interval_s REAL, last_status TEXT, consecutive_failures INTEGER NOT NULL DEFAULT 0,
           backoff_until INTEGER, last_429_at INTEGER, held_until INTEGER${fixture.check ? `, ${fixture.check}` : ''}
         );
@@ -815,30 +850,70 @@ describe('store v5 schema (AC38)', () => {
     }
   });
 
-  it('refuses nullable data for a canonical NOT NULL column before any backup', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'qlb-v5-null-not-null-'));
+  it('refuses nullable data for a canonical NOT NULL DEFAULT column before any backup', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-v5-null-not-null-default-'));
     const path = join(dir, 'qlb.db');
     const db = new DatabaseSync(path);
-    db.exec(`CREATE TABLE codex_watch (
-      switch_id INTEGER PRIMARY KEY, provider TEXT, outgoing TEXT NOT NULL,
-      target TEXT NOT NULL, next_at INTEGER NOT NULL, until INTEGER NOT NULL
+    db.exec(`CREATE TABLE switch_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, provider TEXT NOT NULL,
+      from_account TEXT, to_account TEXT NOT NULL, trigger TEXT NOT NULL, outcome TEXT NOT NULL,
+      outgoing_kind TEXT, binding_json TEXT, steps_json TEXT, open_sessions_json TEXT, error TEXT,
+      injected INTEGER, detail TEXT, published_at INTEGER, committed_at INTEGER
     );
-    INSERT INTO codex_watch VALUES (1, NULL, 'outgoing', 'target', 1, 2);
+    INSERT INTO switch_log (ts, provider, to_account, trigger, outcome, injected)
+      VALUES (1, 'anthropic', 'fixture', 'manual', 'ok', NULL);
     PRAGMA user_version = 5`);
     db.close();
 
     for (let attempt = 0; attempt < 3; attempt += 1) {
       assert.throws(
         () => openStore(path),
-        /cannot correct pre-release v5 codex_watch: copied rows violate new constraints \(NOT NULL constraint failed: codex_watch__v5new\.provider\)/,
+        /cannot correct pre-release v5 switch_log: copied rows violate new constraints \(NOT NULL constraint failed: switch_log__v5new\.injected\)/,
       );
     }
 
     assert.deepEqual(existsSync(join(dir, 'backups')) ? readdirSync(join(dir, 'backups')).filter((file) => file.endsWith('.sqlite')) : [], []);
     const check = dbAt(path);
     try {
-      assert.equal((check.prepare('SELECT provider FROM codex_watch').get() as { provider: string | null }).provider, null);
+      assert.equal((check.prepare('SELECT injected FROM switch_log').get() as { injected: number | null }).injected, null);
     } finally { check.close(); }
+  });
+
+  it('refuses duplicate values for canonical UNIQUE and PRIMARY KEY constraints before any backup', () => {
+    const cases = [
+      {
+        table: 'claude_slots',
+        ddl: `CREATE TABLE claude_slots (
+          account_id TEXT PRIMARY KEY, slot_num INTEGER, email TEXT, alias TEXT, org_uuid TEXT, config_json TEXT NOT NULL,
+          fingerprint TEXT, prev_fingerprint TEXT, threshold REAL, dead INTEGER NOT NULL DEFAULT 0,
+          dead_reason TEXT, dead_at INTEGER, healed_at INTEGER, added_at INTEGER NOT NULL,
+          last_active_at INTEGER, source TEXT, archived_at INTEGER
+        );
+        INSERT INTO claude_slots (account_id, slot_num, config_json, added_at) VALUES
+          ('first', 1, '{}', 1), ('second', 1, '{}', 2);`,
+        reason: /duplicate values violate canonical UNIQUE constraint on slot_num/,
+      },
+      {
+        table: 'codex_watch',
+        ddl: `CREATE TABLE codex_watch (
+          switch_id INTEGER, provider TEXT NOT NULL, outgoing TEXT NOT NULL,
+          target TEXT NOT NULL, next_at INTEGER NOT NULL, until INTEGER NOT NULL
+        );
+        INSERT INTO codex_watch VALUES
+          (1, 'openai-codex', 'a', 'b', 1, 2), (1, 'openai-codex', 'b', 'a', 2, 3);`,
+        reason: /duplicate values violate canonical PRIMARY KEY constraint on switch_id/,
+      },
+    ] as const;
+
+    for (const fixture of cases) {
+      const dir = mkdtempSync(join(tmpdir(), 'qlb-v5-duplicate-constraints-'));
+      const path = join(dir, 'qlb.db');
+      const db = new DatabaseSync(path);
+      db.exec(`${fixture.ddl} PRAGMA user_version = 5`);
+      db.close();
+      assert.throws(() => openStore(path), new RegExp(`cannot correct pre-release v5 ${fixture.table}: ${fixture.reason.source}`));
+      assert.deepEqual(existsSync(join(dir, 'backups')) ? readdirSync(join(dir, 'backups')).filter((file) => file.endsWith('.sqlite')) : [], []);
+    }
   });
 
   it('scrubs existing relogin rows once without a schema-version change', () => {
