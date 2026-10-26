@@ -134,6 +134,64 @@ describe('Codex consume gate — AC34', () => {
     assert.equal(posts, 0);
   });
 
+  it('returns a typed unpersisted-successor outcome when every post-POST persistence path fails', async () => {
+    const fixture = slots(document());
+    fixture.slots.writeSlot = () => { throw new Error('fixture keychain unavailable'); };
+    (fixture.slots as unknown as { stashUnclaimed: () => never }).stashUnclaimed = () => { throw new Error('fixture stash unavailable'); };
+
+    const result = await consumeCodexSlot({
+      accountId: 'user-a:account-a', snapshot: fixture.current(), trigger: 'force', force: true,
+      slots: fixture.slots, holders: async () => [], now: () => 1,
+      transport: async () => ({ status: 200, body: JSON.stringify({ refresh_token: 'refresh-b', access_token: 'access-b' }) }),
+    });
+
+    assert.equal(result.status, 'successor-unpersisted');
+    assert.equal(result.successorFailure?.kind, 'successor-unpersisted');
+  });
+
+  it('adopts a matching stashed successor before it can POST the spent predecessor', async () => {
+    const fixture = slots(document());
+    let posts = 0;
+    (fixture.slots as typeof fixture.slots & { adoptStashedSuccessor: (accountId: string, restore: (next: CodexAuthDocument) => void) => Promise<boolean> }).adoptStashedSuccessor = async (_accountId: string, restore: (next: CodexAuthDocument) => void) => {
+      restore(document('refresh-b', 'access-b'));
+      return true;
+    };
+
+    const result = await consumeCodexSlot({
+      accountId: 'user-a:account-a', snapshot: fixture.current(), trigger: 'scheduled',
+      slots: fixture.slots, holders: async () => [], now: () => 1,
+      transport: async () => { posts += 1; return { status: 500, body: '{}' }; },
+    });
+
+    assert.equal(result.status, 'fresh');
+    assert.equal(posts, 0);
+  });
+
+  it('treats a C9 reuse response as dead evidence even while a holder exists', async () => {
+    const fixture = slots(document());
+    const result = await consumeCodexSlot({
+      accountId: 'user-a:account-a', snapshot: fixture.current(), trigger: 'force', force: true, allowHeld: true,
+      slots: fixture.slots, holders: async () => [holder], now: () => 1,
+      transport: async () => ({ status: 400, body: JSON.stringify({ error: 'refresh_token_reused' }) }),
+    });
+    assert.equal(result.status, 'dead');
+  });
+
+  it('refuses a forced refresh of the active Codex slot', async () => {
+    let called = 0;
+    const errors: string[] = [];
+    const code = await runCodexRefreshCommand(['user-a:account-a', '--force'], {
+      getConfig: () => null,
+      isActive: () => true,
+      consume: async () => { called += 1; return { status: 'refreshed' }; },
+      write: () => assert.fail('must not report success'),
+      error: (line) => errors.push(line),
+    });
+    assert.equal(code, 3);
+    assert.equal(called, 0);
+    assert.match(errors[0] ?? '', /active-slot/);
+  });
+
   it('allows --c9 only for an unverified recorded A JWT and only then bypasses holders', async () => {
     const fixture = slots(document());
     let posts = 0;

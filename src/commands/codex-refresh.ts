@@ -26,11 +26,14 @@ interface CommandConsumeInput {
   accountId: string;
   force: boolean;
   allowHeld: boolean;
+  c9: boolean;
 }
 
 export interface CodexRefreshCommandDeps {
   getConfig: (key: string) => string | null;
   consume: (input: CommandConsumeInput) => Promise<CodexConsumeResult>;
+  /** Test seam for the active-login guard; production reads it under the locks. */
+  isActive?: (accountId: string) => boolean;
   write?: (line: string) => void;
   error?: (line: string) => void;
 }
@@ -58,6 +61,10 @@ export async function runCodexRefreshCommand(args: string[], deps: CodexRefreshC
     error('usage: qlb codex refresh <slot-id> --force [--c9] [--json]');
     return 2;
   }
+  if (deps.isActive?.(parsed.accountId)) {
+    error('codex refresh refused: active-slot');
+    return 3;
+  }
   if (parsed.c9 && !c9Allowed(deps.getConfig)) {
     error('codex refresh refused: c9-unavailable');
     return 3;
@@ -67,10 +74,16 @@ export async function runCodexRefreshCommand(args: string[], deps: CodexRefreshC
     accountId: parsed.accountId,
     force: parsed.force,
     allowHeld: parsed.c9,
+    c9: parsed.c9,
   });
   const output = { accountId: parsed.accountId, status: result.status };
   write(parsed.json ? JSON.stringify(output) : `${parsed.accountId}: ${result.status}`);
-  return result.status === 'dead' || result.status === 'transient' || result.status === 'slot-removed' ? 1 : 0;
+  if (result.stashId) error(`codex refresh successor stash: ${result.stashId}`);
+  if (result.status === 'successor-unpersisted') {
+    error('codex refresh failed: successor-unpersisted');
+  }
+  return result.status === 'refreshed' || result.status === 'fresh' || result.status === 'codex-won-inactive' ? 0
+    : result.status === 'c9-unavailable' ? 3 : 1;
 }
 
 function withHistory<T>(store: Pick<Store, 'dbPath'>, fn: (db: DatabaseSync) => T): T {
@@ -114,6 +127,13 @@ async function sendRefresh(request: { url: string; method: 'GET' | 'POST'; heade
   return { status: response.status, body: await response.text() };
 }
 
+function activeCodexSlot(store: Store): string | null {
+  return withHistory(store, (db) => {
+    const row = db.prepare("SELECT account_id FROM active_login WHERE provider = 'openai-codex'").get() as { account_id?: string | null } | undefined;
+    return typeof row?.account_id === 'string' ? row.account_id : null;
+  });
+}
+
 async function execute(args: string[], ctx: CommandContext): Promise<number> {
   const parsed = parse(args);
   if (!parsed) return runCodexRefreshCommand(args, {
@@ -128,36 +148,41 @@ async function execute(args: string[], ctx: CommandContext): Promise<number> {
     const slots = new CodexSlots({ keychain: platformKeychain });
     return runCodexRefreshCommand(args, {
       getConfig: store.getConfig.bind(store),
+      isActive: (accountId) => activeCodexSlot(store) === accountId,
       write: ctx.stdout,
       error: ctx.stderr,
-      consume: async ({ accountId, force, allowHeld }) => {
-        // The consume lock spans the POST (the sanctioned inactive-slot path),
-        // while C6 owns the separate brief switch-lock/CAS protocol.
-        const lockName = `consume-openai-codex-${encodeURIComponent(accountId)}.lock`;
-        return withProperLockfile(join(dirname(store.dbPath), 'locks', lockName), { timeoutMs: 10_000 }, async () => {
-          const snapshot = slots.readSlot(accountId, { fresh: true }).document;
-          if (!hasCodexSlotIdentity(snapshot, accountId)) return { status: 'slot-removed' };
-          return consumeCodexSlot({
-            accountId,
-            snapshot,
-            trigger: 'force',
-            force,
-            allowHeld,
-            slots,
-            store,
-            transport: sendRefresh,
-            holders: async (document) => {
-              const identity = codexIdentity(document);
-              if (!identity) throw new Error('Codex slot identity is invalid');
-              const separator = identity.indexOf(':');
-              const prior = history(store);
-              return renewers(
-                { chatgpt_user_id: identity.slice(0, separator), account_id: identity.slice(separator + 1) },
-                await list(), prior.rows, prior.observations,
-              );
-            },
-          });
-        });
+      consume: async ({ accountId, force, allowHeld, c9 }) => {
+        // C6 and C10 share this provider lock for every read/CAS/write. The
+        // consume lock additionally ensures only one process can spend a slot.
+        const locks = join(dirname(store.dbPath), 'locks');
+        const consumeLock = join(locks, `consume-openai-codex-${accountId}.lock`);
+        const switchLock = join(locks, 'switch-openai-codex.lock');
+        try {
+          return await withProperLockfile(consumeLock, { timeoutMs: 10_000 }, async () =>
+            withProperLockfile(switchLock, { timeoutMs: 10_000 }, async () => {
+              // Re-check every mutable receipt and active state after lock acquisition.
+              if (activeCodexSlot(store) === accountId) return { status: 'active-slot' as const };
+              if (c9 && !c9Allowed(store.getConfig.bind(store))) return { status: 'c9-unavailable' as const };
+              let snapshot;
+              try { snapshot = slots.readSlot(accountId, { fresh: true }).document; } catch { return { status: 'slot-removed' as const }; }
+              if (!hasCodexSlotIdentity(snapshot, accountId)) return { status: 'slot-removed' as const };
+              return consumeCodexSlot({
+                accountId, snapshot, trigger: 'force', force, allowHeld, slots, store, transport: sendRefresh,
+                holders: async (document) => {
+                  const identity = codexIdentity(document);
+                  if (!identity) throw new Error('Codex slot identity is invalid');
+                  const separator = identity.indexOf(':');
+                  const prior = history(store);
+                  return renewers(
+                    { chatgpt_user_id: identity.slice(0, separator), account_id: identity.slice(separator + 1) },
+                    await list(), prior.rows, prior.observations,
+                  );
+                },
+              });
+            }));
+        } catch {
+          return { status: 'busy' };
+        }
       },
     });
   } finally {
