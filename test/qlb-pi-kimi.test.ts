@@ -92,7 +92,7 @@ describe('qlb-pi Kimi Coding source', () => {
     }, {
       owned: () => owned,
       createStream: () => {
-        const output = { events: [], ended: false, push(event: unknown) { this.events.push(event); }, end() { this.ended = true; } };
+        const output = { events: [] as unknown[], ended: false, push(event: unknown) { this.events.push(event); }, end() { this.ended = true; } };
         outputs.push(output);
         return output;
       },
