@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
   copyFileSync,
@@ -25,6 +25,7 @@ import { installRelease as installReleaseForPlatform, readReleaseManifest, relea
 import { runReleaseCommand } from '../src/commands/release';
 import { releaseCurrentCheck } from '../src/checks/release-current';
 import type { CommandContext } from '../src/registry';
+import { openStore } from '../src/store';
 
 const QLB_HELPER_SIGNING = {
   authority: 'QLB Keychain Helper', binaryHash: 'a'.repeat(40), identityHash: 'b'.repeat(40),
@@ -192,19 +193,304 @@ describe('release install (AC45)', () => {
     mkdirSync(dirname(helper), { recursive: true });
     writeFileSync(helper, 'foreign fake helper bytes\n');
     const appDir = join(root, 'app');
-    let published = false;
+    let inspected = false;
 
     await assert.rejects(
       installRelease({
         sourceDir, appDir, sha: 'pinned-helper-sha', dbPath: join(root, 'db'),
-        helperConfigReader: () => 'c'.repeat(40),
+        helperConfigReader: () => QLB_HELPER_SIGNING.identityHash,
         verifyHelperIdentity: () => ({ trusted: false, reason: 'pinned leaf certificate did not verify' }),
-        verifyHelperSigning: () => { published = true; return QLB_HELPER_SIGNING; },
+        verifyHelperSigning: () => { inspected = true; return QLB_HELPER_SIGNING; },
       }),
       /helper pinned leaf certificate did not verify; run npm run build:helper or qlb keychain check-launchd/,
     );
-    assert.equal(published, false);
+    assert.equal(inspected, true);
     assert.equal(existsSync(join(appDir, 'pinned-helper-sha')), false);
+  });
+
+  it('records the verified helper leaf pin on a fresh release install', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-release-helper-pin-fresh-'));
+    const sourceDir = sourceBuild(root, 'pin-fresh-sha');
+    const helper = join(sourceDir, 'native', 'keychain-helper', 'build', 'qlb-keychain-helper');
+    const dbPath = join(root, 'qlb.db');
+    mkdirSync(dirname(helper), { recursive: true });
+    writeFileSync(helper, 'fake helper bytes\n');
+
+    await installRelease({
+      sourceDir, appDir: join(root, 'app'), sha: 'pin-fresh-sha', dbPath, ...validHelperVerifier,
+    });
+
+    const store = openStore(dbPath);
+    try {
+      assert.equal(store.getConfig('keychain.helperCheckIdentityHash'), QLB_HELPER_SIGNING.identityHash);
+    } finally { store.close(); }
+  });
+
+  it('keeps an equal recorded helper pin unchanged', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-release-helper-pin-equal-'));
+    const sourceDir = sourceBuild(root, 'pin-equal-sha');
+    const helper = join(sourceDir, 'native', 'keychain-helper', 'build', 'qlb-keychain-helper');
+    const dbPath = join(root, 'qlb.db');
+    mkdirSync(dirname(helper), { recursive: true });
+    writeFileSync(helper, 'fake helper bytes\n');
+    const before = openStore(dbPath);
+    before.setConfig('keychain.helperCheckIdentityHash', QLB_HELPER_SIGNING.identityHash);
+    before.close();
+
+    await installRelease({
+      sourceDir, appDir: join(root, 'app'), sha: 'pin-equal-sha', dbPath,
+      ...validHelperVerifier, verifyHelperIdentity: () => ({ trusted: true }),
+    });
+
+    const after = openStore(dbPath);
+    try {
+      assert.equal(after.getConfig('keychain.helperCheckIdentityHash'), QLB_HELPER_SIGNING.identityHash);
+    } finally { after.close(); }
+  });
+
+  it('refuses a different recorded helper pin with exit 3 and leaves it unchanged', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-release-helper-pin-changed-'));
+    const sourceDir = sourceBuild(root, 'pin-changed-sha');
+    const helper = join(sourceDir, 'native', 'keychain-helper', 'build', 'qlb-keychain-helper');
+    const dbPath = join(root, 'qlb.db');
+    const recordedPin = 'c'.repeat(40);
+    mkdirSync(dirname(helper), { recursive: true });
+    writeFileSync(helper, 'fake helper bytes\n');
+    const before = openStore(dbPath);
+    before.setConfig('keychain.helperCheckIdentityHash', recordedPin);
+    before.close();
+    const errors: string[] = [];
+    const ctx: CommandContext = {
+      stdout: () => {}, stderr: (line) => errors.push(line), env: { QLB_TEST_MODE: '1', QLB_HOME: root },
+      config: { dbPath } as CommandContext['config'], loadConfig: () => { throw new Error('not used'); }, home: root,
+      registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
+    };
+
+    const code = await runReleaseCommand(['install', '--sha', 'pin-changed-sha'], ctx, {
+      sourceDir,
+      install: (options) => installRelease({ ...options, ...validHelperVerifier }),
+      shaForSource: () => 'pin-changed-sha',
+    });
+
+    assert.equal(code, 3);
+    assert.deepEqual(errors, ['qlb release: helper-identity-changed']);
+    const after = openStore(dbPath);
+    try {
+      assert.equal(after.getConfig('keychain.helperCheckIdentityHash'), recordedPin);
+    } finally { after.close(); }
+    assert.equal(existsSync(join(root, 'app', 'pin-changed-sha')), false);
+  });
+
+  it('refuses an unreadable helper leaf hash without recording a pin', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-release-helper-pin-unreadable-'));
+    const sourceDir = sourceBuild(root, 'pin-unreadable-sha');
+    const helper = join(sourceDir, 'native', 'keychain-helper', 'build', 'qlb-keychain-helper');
+    const dbPath = join(root, 'qlb.db');
+    mkdirSync(dirname(helper), { recursive: true });
+    writeFileSync(helper, 'fake helper bytes\n');
+    const store = openStore(dbPath);
+    store.close();
+
+    await assert.rejects(
+      installRelease({
+        sourceDir, appDir: join(root, 'app'), sha: 'pin-unreadable-sha', dbPath,
+        verifyHelperSigning: () => ({ ...QLB_HELPER_SIGNING, identityHash: '' }),
+      }),
+      /helper identity hash is unavailable/,
+    );
+
+    const after = openStore(dbPath);
+    try {
+      assert.equal(after.getConfig('keychain.helperCheckIdentityHash'), null);
+    } finally { after.close(); }
+    assert.equal(existsSync(join(root, 'app', 'pin-unreadable-sha')), false);
+  });
+
+  it('records the pin without migrating a pre-existing database', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-release-helper-pin-no-migrate-'));
+    const sourceDir = sourceBuild(root, 'pin-no-migrate-sha');
+    const helper = join(sourceDir, 'native', 'keychain-helper', 'build', 'qlb-keychain-helper');
+    const dbPath = join(root, 'qlb.db');
+    mkdirSync(dirname(helper), { recursive: true });
+    writeFileSync(helper, 'fake helper bytes\n');
+    const before = new DatabaseSync(dbPath);
+    before.exec(`
+      CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT);
+      CREATE TABLE relogin_events (id INTEGER PRIMARY KEY, detail TEXT, evidence TEXT);
+      PRAGMA user_version = 4;
+    `);
+    before.close();
+
+    await installRelease({
+      sourceDir, appDir: join(root, 'app'), sha: 'pin-no-migrate-sha', dbPath, ...validHelperVerifier,
+    });
+
+    const after = new DatabaseSync(dbPath, { readOnly: true });
+    try {
+      assert.equal((after.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 4);
+      assert.equal(
+        (after.prepare('SELECT value FROM config WHERE key = ?').get('keychain.helperCheckIdentityHash') as { value: string }).value,
+        QLB_HELPER_SIGNING.identityHash,
+      );
+    } finally { after.close(); }
+  });
+
+  it('refuses a database from a newer binary without pinning or switching current', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-release-helper-pin-newer-schema-'));
+    const sourceDir = sourceBuild(root, 'pin-newer-schema-sha');
+    const helper = join(sourceDir, 'native', 'keychain-helper', 'build', 'qlb-keychain-helper');
+    const appDir = join(root, 'app');
+    const dbPath = join(root, 'qlb.db');
+    mkdirSync(dirname(helper), { recursive: true });
+    writeFileSync(helper, 'fake helper bytes\n');
+    mkdirSync(join(appDir, 'previous'), { recursive: true });
+    symlinkSync('previous', join(appDir, 'current'));
+    const before = new DatabaseSync(dbPath);
+    before.exec('CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT); PRAGMA user_version = 6');
+    before.close();
+
+    await assert.rejects(
+      installRelease({ sourceDir, appDir, sha: 'pin-newer-schema-sha', dbPath, ...validHelperVerifier }),
+      /qlb\.db schema user_version=6 is newer than this binary \(5\); upgrade qlb/,
+    );
+
+    const after = new DatabaseSync(dbPath, { readOnly: true });
+    try {
+      assert.equal(after.prepare('SELECT value FROM config WHERE key = ?').get('keychain.helperCheckIdentityHash'), undefined);
+    } finally { after.close(); }
+    assert.equal(readlinkSync(join(appDir, 'current')), 'previous');
+  });
+
+  it('refuses a newer schema committed after the former version check and before pinning', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-release-helper-pin-racing-schema-'));
+    const sourceDir = sourceBuild(root, 'pin-racing-schema-sha');
+    const helper = join(sourceDir, 'native', 'keychain-helper', 'build', 'qlb-keychain-helper');
+    const appDir = join(root, 'app');
+    const dbPath = join(root, 'qlb.db');
+    const readyPath = join(root, 'migrator-ready');
+    const releasePath = join(root, 'release-migrator');
+    mkdirSync(dirname(helper), { recursive: true });
+    writeFileSync(helper, 'fake helper bytes\n');
+    const seeded = new DatabaseSync(dbPath);
+    seeded.exec('CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT); PRAGMA user_version = 5');
+    seeded.close();
+
+    const migrator = spawn(process.execPath, ['-e', `
+      const { existsSync, writeFileSync } = require('node:fs');
+      const { DatabaseSync } = require('node:sqlite');
+      const [dbPath, readyPath, releasePath] = process.argv.slice(1);
+      const db = new DatabaseSync(dbPath);
+      db.exec('BEGIN IMMEDIATE');
+      writeFileSync(readyPath, 'ready');
+      const timer = setInterval(() => {
+        if (!existsSync(releasePath)) return;
+        clearInterval(timer);
+        db.exec('PRAGMA user_version = 6; COMMIT');
+        db.close();
+      }, 5);
+    `, dbPath, readyPath, releasePath], {
+      env: { ...process.env, QLB_TEST_MODE: '1', QLB_HOME: join(root, 'qlb-home'), HOME: join(root, 'home') },
+    });
+    const migratorExit = new Promise<void>((resolve, reject) => {
+      migrator.once('error', reject);
+      migrator.once('exit', (code) => code === 0 ? resolve() : reject(new Error(`migrator exited ${code}`)));
+    });
+    for (let attempts = 0; !existsSync(readyPath); attempts += 1) {
+      assert.ok(attempts < 500, 'migrator did not acquire its write lock');
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+
+    const originalExec = DatabaseSync.prototype.exec;
+    let releasedMigrator = false;
+    DatabaseSync.prototype.exec = function releaseMigratorBeforePin(sql: string): void {
+      // Before the fix, CREATE TABLE is the first write after the version read.
+      // After it, BEGIN IMMEDIATE is first, so the migrator commits before the
+      // guarded read. Both schedules deterministically exercise the old gap.
+      if (!releasedMigrator && (sql.includes('BEGIN IMMEDIATE') || sql.includes('CREATE TABLE IF NOT EXISTS config'))) {
+        releasedMigrator = true;
+        writeFileSync(releasePath, 'go');
+      }
+      originalExec.call(this, sql);
+    };
+    try {
+      await assert.rejects(
+        installRelease({ sourceDir, appDir, sha: 'pin-racing-schema-sha', dbPath, ...validHelperVerifier }),
+        /qlb\.db schema user_version=6 is newer than this binary \(5\); upgrade qlb/,
+      );
+    } finally {
+      DatabaseSync.prototype.exec = originalExec;
+    }
+    await migratorExit;
+
+    assert.equal(releasedMigrator, true);
+    const after = new DatabaseSync(dbPath, { readOnly: true });
+    try {
+      assert.equal((after.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 6);
+      assert.equal(after.prepare('SELECT value FROM config WHERE key = ?').get('keychain.helperCheckIdentityHash'), undefined);
+    } finally { after.close(); }
+    assert.equal(existsSync(join(appDir, 'current')), false);
+  });
+
+  it('keeps a newly recorded pin when publishing current fails', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-release-helper-pin-rollback-'));
+    const sourceDir = sourceBuild(root, 'pin-rollback-sha');
+    const helper = join(sourceDir, 'native', 'keychain-helper', 'build', 'qlb-keychain-helper');
+    const appDir = join(root, 'app');
+    const dbPath = join(root, 'qlb.db');
+    mkdirSync(dirname(helper), { recursive: true });
+    writeFileSync(helper, 'fake helper bytes\n');
+    mkdirSync(join(appDir, 'current'), { recursive: true });
+
+    await assert.rejects(
+      installRelease({ sourceDir, appDir, sha: 'pin-rollback-sha', dbPath, ...validHelperVerifier }),
+      /EISDIR|EEXIST|ENOTDIR/,
+    );
+
+    const after = new DatabaseSync(dbPath, { readOnly: true });
+    try {
+      assert.equal(
+        (after.prepare('SELECT value FROM config WHERE key = ?').get('keychain.helperCheckIdentityHash') as { value: string }).value,
+        QLB_HELPER_SIGNING.identityHash,
+      );
+    } finally { after.close(); }
+    assert.ok(lstatSync(join(appDir, 'current')).isDirectory());
+  });
+
+  it('does not remove a shared pin after another installer uses it before this publication fails', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-release-helper-pin-shared-'));
+    const sourceDir = sourceBuild(root, 'pin-shared-sha');
+    const helper = join(sourceDir, 'native', 'keychain-helper', 'build', 'qlb-keychain-helper');
+    const firstAppDir = join(root, 'first-app');
+    const secondAppDir = join(root, 'second-app');
+    const dbPath = join(root, 'qlb.db');
+    let secondInstalled = false;
+    mkdirSync(dirname(helper), { recursive: true });
+    writeFileSync(helper, 'fake helper bytes\n');
+    mkdirSync(join(firstAppDir, 'current'), { recursive: true });
+
+    await assert.rejects(
+      installRelease({
+        sourceDir, appDir: firstAppDir, sha: 'pin-shared-sha', dbPath, ...validHelperVerifier,
+        beforePublishCurrent: async () => {
+          await installRelease({
+            sourceDir, appDir: secondAppDir, sha: 'pin-shared-sha', dbPath, ...validHelperVerifier,
+            verifyHelperIdentity: () => ({ trusted: true }),
+          });
+          secondInstalled = true;
+        },
+      }),
+      /EISDIR|EEXIST|ENOTDIR/,
+    );
+
+    assert.equal(secondInstalled, true);
+    const after = new DatabaseSync(dbPath, { readOnly: true });
+    try {
+      assert.equal(
+        (after.prepare('SELECT value FROM config WHERE key = ?').get('keychain.helperCheckIdentityHash') as { value: string }).value,
+        QLB_HELPER_SIGNING.identityHash,
+      );
+    } finally { after.close(); }
+    assert.equal(readlinkSync(join(secondAppDir, 'current')), 'pin-shared-sha');
   });
 
   it('refuses a helper reached through a symlinked ancestor outside the checkout', async () => {

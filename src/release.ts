@@ -45,6 +45,8 @@ export interface ReleaseInstallOptions {
   verifyHelperIdentity?: (path: string, pin: string) => HelperIdentityVerification;
   /** Injectable only for hermetic platform-specific release tests. */
   platform?: NodeJS.Platform;
+  /** Injectable only for hermetic concurrent-publication tests. */
+  beforePublishCurrent?: () => void | Promise<void>;
 }
 
 export interface ReleaseInstallResult {
@@ -262,7 +264,8 @@ function copyReleaseContents(
   helperConfigReader: (key: string) => string | null = () => null,
   verifyPinnedHelperIdentity: (path: string, pin: string) => HelperIdentityVerification = verifyHelperIdentity,
   platform: NodeJS.Platform = process.platform,
-): void {
+): HelperSigningState | null {
+  let helperSigning: HelperSigningState | null = null;
   const checkoutRoot = realpathSync(sourceDir);
   copyContained(join(sourceDir, 'dist'), join(stagingDir, 'dist'), checkoutRoot);
   if (existsSync(join(sourceDir, 'package.json'))) {
@@ -283,26 +286,75 @@ function copyReleaseContents(
     // Checking the resolved file catches a symlink at any ancestor, not merely at the leaf.
     const resolvedHelper = realpathSync(helper);
     assertPathInside(checkoutRoot, resolvedHelper, helper);
+    const signing = verifyHelperSigning(resolvedHelper);
+    if (!signing) {
+      throw new ReleaseIntegrityError('helper not signed; run npm run build:helper');
+    }
+    if (signing.authority !== 'QLB Keychain Helper') {
+      throw new ReleaseIntegrityError(`helper signed by ${signing.authority}, expected QLB Keychain Helper; run npm run build:helper`);
+    }
+    // This is the same leaf hash the green helper matrix records. Do not create
+    // a pin unless codesign supplied the complete SHA-1 leaf identity.
+    if (!/^[0-9a-f]{40}$/.test(signing.identityHash)) {
+      throw new ReleaseIntegrityError('helper identity hash is unavailable; run npm run build:helper');
+    }
     const pin = helperConfigReader('keychain.helperCheckIdentityHash');
     if (pin) {
+      if (pin !== signing.identityHash) throw new ReleaseIntegrityError('helper-identity-changed');
       const verification = verifyPinnedHelperIdentity(resolvedHelper, pin);
       if (!verification.trusted) {
         throw new ReleaseIntegrityError(`helper ${verification.reason}; run npm run build:helper or qlb keychain check-launchd`);
       }
-    } else {
-      const signing = verifyHelperSigning(resolvedHelper);
-      if (!signing) {
-        throw new ReleaseIntegrityError('helper not signed; run npm run build:helper');
-      }
-      if (signing.authority !== 'QLB Keychain Helper') {
-        throw new ReleaseIntegrityError(`helper signed by ${signing.authority}, expected QLB Keychain Helper; run npm run build:helper`);
-      }
     }
+    helperSigning = signing;
     const installedHelper = join(stagingDir, 'native', 'keychain-helper', 'build', 'qlb-keychain-helper');
     copyContained(resolvedHelper, installedHelper, checkoutRoot);
     chmodSync(installedHelper, 0o755);
   }
   copyRuntimeDependencies(sourceDir, stagingDir);
+  return helperSigning;
+}
+
+const HELPER_IDENTITY_CONFIG_KEY = 'keychain.helperCheckIdentityHash';
+// Keep this refusal in step with Store.migrateIfNeeded(). Pinning must not
+// permit an older release to write to a database created by a newer binary.
+const SUPPORTED_SCHEMA_VERSION = 5;
+
+/**
+ * Establishes the release-verified leaf pin without running Store's migrations
+ * or allowing a concurrent installer to rotate an already-established pin.
+ */
+function recordHelperIdentityHash(dbPath: string, identityHash: string): void {
+  let db: DatabaseSync | undefined;
+  try {
+    mkdirSync(dirname(dbPath), { recursive: true, mode: 0o700 });
+    db = new DatabaseSync(dbPath);
+    db.exec('PRAGMA busy_timeout = 5000');
+    db.exec('BEGIN IMMEDIATE');
+    const versionRow = db.prepare('PRAGMA user_version').get() as { user_version?: unknown } | number | undefined;
+    const version = typeof versionRow === 'number'
+      ? versionRow
+      : typeof versionRow?.user_version === 'number' ? versionRow.user_version : 0;
+    if (version > SUPPORTED_SCHEMA_VERSION) {
+      throw new ReleaseIntegrityError(
+        `qlb.db schema user_version=${version} is newer than this binary (${SUPPORTED_SCHEMA_VERSION}); upgrade qlb`,
+      );
+    }
+    db.exec('CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)');
+    db.prepare(`
+      INSERT INTO config (key, value) VALUES (?, ?)
+      ON CONFLICT(key) DO NOTHING
+    `).run(HELPER_IDENTITY_CONFIG_KEY, identityHash);
+    const row = db.prepare('SELECT value FROM config WHERE key = ?').get(HELPER_IDENTITY_CONFIG_KEY) as { value?: unknown } | undefined;
+    if (row?.value !== identityHash) throw new ReleaseIntegrityError('helper-identity-changed');
+    db.exec('COMMIT');
+  } catch (error) {
+    try { db?.exec('ROLLBACK'); } catch { /* preserve the install failure */ }
+    if (error instanceof ReleaseIntegrityError) throw error;
+    throw new ReleaseIntegrityError('could not record helper identity pin');
+  } finally {
+    try { db?.close(); } catch { /* preserve the install failure */ }
+  }
 }
 
 function digestTree(root: string, paths: string[]): string {
@@ -407,7 +459,7 @@ export async function installRelease(options: ReleaseInstallOptions): Promise<Re
   let staged = true;
   try {
     mkdirSync(stagingDir, { mode: 0o755 });
-    copyReleaseContents(
+    const helperSigning = copyReleaseContents(
       options.sourceDir,
       stagingDir,
       options.verifyHelperSigning,
@@ -426,12 +478,18 @@ export async function installRelease(options: ReleaseInstallOptions): Promise<Re
     if (existsSync(options.dbPath)) {
       backupPath = await (options.backup ?? backupBeforeMigrate)(options.dbPath);
     }
-
     if (!existsSync(releaseDir)) {
       writeFileSync(join(stagingDir, RELEASE_MANIFEST), `${JSON.stringify({ sha: options.sha, digest: sourceDigest })}\n`, { mode: 0o644 });
       renameSync(stagingDir, releaseDir);
       staged = false;
     }
+
+    // Pin before exposing the helper through current. Do not roll this back if
+    // publication fails: another installer can observe and rely on the same
+    // pin before this one reaches its symlink swap. A retained pin only anchors
+    // the helper identity; it cannot activate this failed release.
+    if (helperSigning) recordHelperIdentityHash(options.dbPath, helperSigning.identityHash);
+    await options.beforePublishCurrent?.();
     return { releaseDir, currentPath: publishCurrent(options.appDir, options.sha), backupPath };
   } finally {
     if (staged && existsSync(stagingDir)) rmSync(stagingDir, { recursive: true, force: true });
