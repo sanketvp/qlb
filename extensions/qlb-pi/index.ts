@@ -89,6 +89,7 @@ import {
   readOwnerFileState,
   type ConsumeJournal,
 } from "./consume.js";
+import { registerKimiCodingProvider } from "./providers/kimi-coding.js";
 import {
   errorEvent,
   registerConflictProvider,
@@ -266,6 +267,9 @@ async function resolveBuiltinAnthropicStreamSimple(): Promise<StreamSimple> {
 }
 
 export default async function (pi: ExtensionAPI): Promise<void> {
+  registerKimiCodingProvider(pi as unknown as ProviderApi, {
+    createStream: () => createAssistantMessageEventStream() as unknown as { push(event: unknown): void; end(): void },
+  });
   const rehearsal = process.env.QLB_PI_REHEARSAL;
   const base =
     rehearsal === "0"
