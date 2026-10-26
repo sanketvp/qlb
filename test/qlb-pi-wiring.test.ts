@@ -26,23 +26,50 @@ const jiti = createJiti(import.meta.url, { moduleCache: false, alias: {
 } });
 const factory = await jiti.import(process.env.QLB_PI_EXTENSION, { default: true });
 const names = ['xai', 'kimi-coding', 'openrouter', 'openai-codex'];
-const native = new Map(names.map((name) => [name, { native: true, api: name, streamSimple: () => { throw new Error('native used'); } }]));
+const oauth = { resolve: 0, refresh: 0 };
+const authJson = { reads: 0, writes: 0 };
+const native = new Map(names.map((name) => [name, {
+  native: true, api: name, streamSimple: () => { throw new Error('native used'); },
+  ...(name === 'openai-codex' ? { auth: { oauth: {
+    toAuth() { oauth.resolve += 1; return { apiKey: 'native' }; },
+    refresh() { oauth.refresh += 1; return {}; },
+  } } } : {}),
+}]));
 const providers = new Map(native);
 const calls = [];
+const listeners = new Map();
+const runtimeApiKeys = {};
 const pi = {
   unregisterProvider(name) { calls.push('unregister:' + name); providers.delete(name); },
-  registerProvider(name, config) { calls.push('register:' + name); providers.set(name, config); },
-  on() {}, registerCommand() {}, registerShortcut() {},
+  registerProvider(name, config) {
+    const id = typeof name === 'string' ? name : name.id;
+    // Pi's name/config registration merges omitted fields from the built-in;
+    // a native Provider object replaces it wholesale.
+    const provider = typeof name === 'string' ? { ...native.get(id), ...config } : name;
+    calls.push('register:' + id); providers.set(id, provider);
+  },
+  on(event, handler) { listeners.set(event, handler); }, registerCommand() {}, registerShortcut() {},
 };
 await factory(pi);
+await listeners.get('session_start')?.({}, { modelRegistry: { runtime: {
+  setRuntimeApiKey(provider, key) { runtimeApiKeys[provider] = key; return Promise.resolve(); },
+} } });
 const events = [];
 if (process.env.CALL_CODEX === '1') {
-  const stream = providers.get('openai-codex').streamSimple(
+  const codex = providers.get('openai-codex');
+  if (codex.auth?.oauth) {
+    // A merged native OAuth provider resolves the shadow-retained auth.json
+    // before the extension stream can invoke the QLB gate.
+    authJson.reads += 1;
+    codex.auth.oauth.toAuth();
+    codex.auth.oauth.refresh(); authJson.writes += 1;
+  }
+  const stream = codex.streamSimple(
     { id: 'gpt-5', api: 'openai-codex-responses', provider: 'openai-codex' }, { messages: [] }, {},
   );
   for await (const event of stream) events.push(event);
 }
-console.log(JSON.stringify({ calls, replaced: Object.fromEntries(names.map((name) => [name, providers.get(name) !== native.get(name)])), events }));
+console.log(JSON.stringify({ calls, replaced: Object.fromEntries(names.map((name) => [name, providers.get(name) !== native.get(name)])), oauth, authJson, runtimeApiKeys, events }));
 `;
 
 const fakeQlb = String.raw`
@@ -55,15 +82,19 @@ if (process.env.GATE_FAIL === '1') {
 process.stdout.write(JSON.stringify({ token: 'fixture-codex-access', accountId: 'user:slot', chatgptAccountId: 'bare-account', source: 'fixture' }));
 `;
 
-function load(owner?: string, gateFail = false, callCodex = false): {
+function load(owner?: string, gateFail = false, callCodex = false, perProviderOwner?: string): {
   calls: string[];
   replaced: Record<string, boolean>;
+  oauth: { resolve: number; refresh: number };
+  authJson: { reads: number; writes: number };
+  runtimeApiKeys: Record<string, string>;
   events: Array<{ error?: { errorMessage?: string } }>;
 } {
   const home = mkdtempSync(join(tmpdir(), 'qlb-pi-wiring-'));
   const agent = join(home, '.pi', 'agent');
   mkdirSync(agent, { recursive: true });
   if (owner !== undefined) writeFileSync(join(agent, 'qlb-owner.json'), owner);
+  if (perProviderOwner !== undefined) writeFileSync(join(agent, 'qlb-owner-openai-codex.json'), perProviderOwner);
   const runner = join(home, 'fake-qlb.cjs');
   const entry = join(home, 'load.mjs');
   writeFileSync(runner, fakeQlb);
@@ -101,6 +132,27 @@ describe('qlb-pi provider wiring', { skip: piAvailable ? false : 'global Pi inst
     assert.deepEqual(inert.replaced, { xai: false, 'kimi-coding': false, openrouter: false, 'openai-codex': false });
   });
 
+  it('registers Codex from the shadow-retaining per-provider owner artifact migration writes', () => {
+    const migrationOwner = JSON.stringify({
+      owner: 'qlb', stagedAt: 1, committedAt: 2, exportSeq: 0,
+      qlbAccountIds: ['codex-default'], stores: ['pi-openai-codex'],
+      accounts: [{ id: 'codex-default', provider: 'openai-codex', label: 'fixture', fingerprint: 'sha256:fixture' }],
+      nativeStrategy: 'shadow-retain', authJsonKey: 'openai-codex',
+    });
+    const owned = load(undefined, false, false, migrationOwner);
+    assert.equal(owned.replaced['openai-codex'], true);
+  });
+
+  it('does not merge Pi OAuth or touch shadow-retained auth.json after QLB takes Codex', () => {
+    const result = load(undefined, false, true, JSON.stringify({
+      owner: 'qlb', accounts: [{ provider: 'openai-codex' }],
+    }));
+    assert.equal(result.oauth.resolve, 0);
+    assert.equal(result.oauth.refresh, 0);
+    assert.deepEqual(result.authJson, { reads: 0, writes: 0 });
+    assert.deepEqual(result.runtimeApiKeys, { 'openai-codex': 'qlb-managed' });
+  });
+
   it('fails closed once for an unavailable Codex gate without reaching a transport', () => {
     const result = load(JSON.stringify({ providers: { 'openai-codex': { mode: 'qlb', since: 1 } } }), true, true);
     assert.equal(result.events.length, 1);
@@ -114,7 +166,7 @@ describe('OpenAI Codex registration adapter', () => {
     const events: unknown[] = [];
     const pi = {
       unregisterProvider() {},
-      registerProvider(_name: string, config: { streamSimple: (model: { id: string }, context: unknown, options?: Record<string, unknown>) => unknown }) {
+      registerProvider(config: { streamSimple: (model: { id: string }, context: unknown, options?: Record<string, unknown>) => unknown }) {
         const stream = config.streamSimple({ id: 'gpt-5' }, {}, { headers: { Authorization: 'native', 'ChatGPT-Account-Id': 'composite' } });
         assert.equal(stream, sink);
       },
@@ -140,7 +192,7 @@ describe('OpenAI Codex registration adapter', () => {
     let registered: { streamSimple: (model: { id: string }, context: unknown, options?: Record<string, unknown>) => unknown } | undefined;
     const pi = {
       unregisterProvider() {},
-      registerProvider(_name: string, config: typeof registered) { registered = config; },
+      registerProvider(config: typeof registered) { registered = config; },
     };
     const sink = { push(event: unknown) { events.push(event); }, end() {} };
     registerOpenAICodexProvider(pi, () => {

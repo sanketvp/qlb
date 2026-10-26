@@ -101,12 +101,27 @@ export interface OpenAICodexEventSink {
   end(): void;
 }
 
+export const QLB_RUNTIME_AUTH_SENTINEL = 'qlb-managed';
+
+export interface OpenAICodexNativeProvider {
+  id: 'openai-codex';
+  name: string;
+  baseUrl?: string;
+  auth: {
+    apiKey: {
+      name: string;
+      check(): Promise<{ type: 'api_key'; source: string }>;
+      resolve(): Promise<{ auth: { apiKey: string }; source: string }>;
+    };
+  };
+  getModels(): readonly OpenAICodexModel[];
+  stream: (model: OpenAICodexModel, context: unknown, options?: Record<string, unknown>) => unknown;
+  streamSimple: (model: OpenAICodexModel, context: unknown, options?: Record<string, unknown>) => unknown;
+}
+
 export interface OpenAICodexProviderApi {
   unregisterProvider(name: string): void;
-  registerProvider(name: string, config: {
-    api: 'openai-codex-responses';
-    streamSimple: (model: OpenAICodexModel, context: unknown, options?: Record<string, unknown>) => unknown;
-  }): void;
+  registerProvider(provider: OpenAICodexNativeProvider): void;
 }
 
 export type OpenAICodexBuiltin = (
@@ -117,6 +132,9 @@ export type OpenAICodexBuiltin = (
 
 export interface RegisterOpenAICodexProviderDeps {
   createStream(): OpenAICodexEventSink;
+  /** Built-in catalog metadata is safe to retain; built-in auth is never retained. */
+  models?: readonly OpenAICodexModel[];
+  baseUrl?: string;
   /** Injectable only for tests; production invokes `qlb gate openai-codex`. */
   runGate?: GateRunner;
 }
@@ -175,24 +193,41 @@ export function registerOpenAICodexProvider(
   deps: RegisterOpenAICodexProviderDeps,
 ): void {
   const source = createOpenAICodexSource({ runGate: deps.runGate ?? runOpenAICodexGate });
-  pi.unregisterProvider('openai-codex');
-  pi.registerProvider('openai-codex', {
-    api: 'openai-codex-responses',
-    streamSimple: (model, context, options = {}) => {
-      const output = deps.createStream();
-      void (async () => {
-        try {
-          const access = await source.read();
-          for await (const event of builtin(model, context, withQlbAccess(options, access))) {
-            output.push(event);
-          }
-        } catch {
-          output.push(qlbUnavailable('openai-codex', 'unknown', model));
-        } finally {
-          output.end();
+  const streamSimple = (model: OpenAICodexModel, context: unknown, options: Record<string, unknown> = {}) => {
+    const output = deps.createStream();
+    void (async () => {
+      try {
+        const access = await source.read();
+        for await (const event of builtin(model, context, withQlbAccess(options, access))) {
+          output.push(event);
         }
-      })();
-      return output;
+      } catch {
+        output.push(qlbUnavailable('openai-codex', 'unknown', model));
+      } finally {
+        output.end();
+      }
+    })();
+    return output;
+  };
+  pi.unregisterProvider('openai-codex');
+  // Pi 1.4.0 ModelRuntime merges an omitted extension oauth field with the
+  // built-in one (dist/core/provider-composer.js:312-325), and OAuth resolution
+  // reads then refreshes the stored entry (pi-ai/dist/auth/resolve.js:24-27,
+  // 62-83). Register a complete native provider instead, with no OAuth hooks.
+  pi.registerProvider({
+    id: 'openai-codex',
+    name: 'OpenAI Codex (QLB)',
+    ...(deps.baseUrl ? { baseUrl: deps.baseUrl } : {}),
+    auth: {
+      apiKey: {
+        name: 'QLB gate',
+        // This check lets Pi list the QLB provider without reading auth.json.
+        async check() { return { type: 'api_key', source: 'QLB gate' }; },
+        async resolve() { return { auth: { apiKey: QLB_RUNTIME_AUTH_SENTINEL }, source: 'QLB gate' }; },
+      },
     },
+    getModels: () => deps.models ?? [],
+    stream: streamSimple,
+    streamSimple,
   });
 }
