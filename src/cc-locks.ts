@@ -8,7 +8,7 @@
 import { existsSync, statSync } from 'node:fs';
 import { mkdir, rmdir, stat, utimes } from 'node:fs/promises';
 import { performance } from 'node:perf_hooks';
-import { basename, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { qlbHomeDir } from './home';
 
 /** Claude Code's `proper-lockfile` stale interval for OAuth-refresh locks. */
@@ -325,6 +325,34 @@ export async function withClaudeCredentialLocks<T>(
     }));
 }
 
+/**
+ * Hold the proper-lockfile for an already resolved Claude global-config path.
+ *
+ * Callers that read a path chosen by claudePaths() must use this overload rather
+ * than resolving again: legacy `.config.json` selection is filesystem-dependent.
+ */
+export async function withClaudeConfigPathLock<T>(
+  configPath: string,
+  options: ClaudeLockOptions = {},
+  fn: (held: HeldClaudeConfigLock) => Promise<T> | T,
+): Promise<T> {
+  const paths = { ...claudeLockPaths(options), configLockDir: `${configPath}.lock` };
+  return withProperLockfile(paths.configLockDir, {
+    ...options,
+    stalenessMs: CONFIG_STALENESS_MS,
+  }, async () => {
+    const held = { [configLockHandle]: true } as HeldClaudeConfigLock;
+    activeConfigLockHandles.add(held);
+    activeConfigLockPaths.set(held, paths);
+    try {
+      return await fn(held);
+    } finally {
+      activeConfigLockHandles.delete(held);
+      activeConfigLockPaths.delete(held);
+    }
+  });
+}
+
 /** Hold Claude Code's global-config proper-lockfile directory for a local read-modify-write. */
 export async function withClaudeConfigLock<T>(
   options: ClaudeLockOptions = {},
@@ -345,4 +373,58 @@ export async function withClaudeConfigLock<T>(
       activeConfigLockPaths.delete(held);
     }
   });
+}
+
+/** A concurrent C-swap import must fail closed instead of racing Keychain/SQLite effects. */
+export class CswapImportInProgress extends Error {
+  constructor() {
+    super('C-swap import already in progress');
+    this.name = 'CswapImportInProgress';
+  }
+}
+
+/**
+ * A non-waiting, process-wide import lock. Unlike Claude Code's refresh locks,
+ * a second importer is an operator refusal, not work that may safely queue.
+ */
+export async function withCswapImportLock<T>(lockDir: string, fn: () => Promise<T> | T): Promise<T> {
+  await mkdir(dirname(lockDir), { recursive: true });
+  try {
+    await mkdir(lockDir);
+  } catch (error: unknown) {
+    if (!error || typeof error !== 'object' || (error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    // A live peer is refused immediately. A crashed peer leaves a directory,
+    // which follows the same guarded stale-takeover protocol as Claude locks.
+    let removed = false;
+    try {
+      const held = await stat(lockDir);
+      if (Date.now() - held.mtimeMs > CREDENTIALS_STALENESS_MS) {
+        removed = await removeIfStillStale(lockDir, CREDENTIALS_STALENESS_MS);
+      }
+    } catch { /* a racing release is still an in-progress refusal */ }
+    if (!removed) throw new CswapImportInProgress();
+    try {
+      await mkdir(lockDir);
+    } catch (retryError: unknown) {
+      if (retryError && typeof retryError === 'object' && (retryError as NodeJS.ErrnoException).code === 'EEXIST') {
+        throw new CswapImportInProgress();
+      }
+      throw retryError;
+    }
+  }
+  let touchInFlight: Promise<void> | undefined;
+  const timer = setInterval(() => {
+    if (touchInFlight) return;
+    touchInFlight = utimes(lockDir, new Date(), new Date()).catch(() => {
+      clearInterval(timer);
+    }).finally(() => { touchInFlight = undefined; });
+  }, TOUCH_INTERVAL_MS);
+  timer.unref();
+  try {
+    return await fn();
+  } finally {
+    clearInterval(timer);
+    await touchInFlight;
+    await bestEffortRelease(lockDir);
+  }
 }
