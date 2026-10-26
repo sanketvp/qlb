@@ -1,8 +1,12 @@
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { defaultKeychainHelperPath, KeychainHelperMissingError, MACOS_SECURITY_TIMEOUT_MS } from '../keychain';
+import { assertKeychainAccess, macosKeychainAccountName } from '../keychain-allowlist';
+import { listCswapProcesses } from '../cswap-processes';
+import { assertAdmitted } from '../lifecycle';
 import {
   inspectHelperSigning,
   verifyHelperIdentity,
@@ -35,15 +39,25 @@ function helperPath(): string {
   return defaultKeychainHelperPath();
 }
 
+type KeychainSubcommand = 'matrix' | 'check-launchd' | 'authorize';
+
 function usage(ctx: CommandContext): number {
-  ctx.stderr('usage: qlb keychain matrix|check-launchd [--json]');
+  ctx.stderr('usage: qlb keychain matrix|check-launchd [--json] | authorize [cswap] [--json]');
   return 2;
 }
 
-function parse(args: string[]): { subcommand: 'matrix' | 'check-launchd'; json: boolean } | null {
+function parse(args: string[]): { subcommand: KeychainSubcommand; json: boolean; cswap: boolean } | null {
   const [subcommand, ...flags] = args;
-  if ((subcommand !== 'matrix' && subcommand !== 'check-launchd') || flags.some((flag) => flag !== '--json')) return null;
-  return { subcommand, json: flags.includes('--json') };
+  if (subcommand === 'matrix' || subcommand === 'check-launchd') {
+    if (flags.some((flag) => flag !== '--json')) return null;
+    return { subcommand, json: flags.includes('--json'), cswap: false };
+  }
+  if (subcommand === 'authorize') {
+    const cswap = flags.filter((flag) => flag === 'cswap').length === 1;
+    if (flags.some((flag) => flag !== '--json' && flag !== 'cswap') || flags.filter((flag) => flag === '--json').length > 1 || flags.filter((flag) => flag === 'cswap').length > 1) return null;
+    return { subcommand, json: flags.includes('--json'), cswap };
+  }
+  return null;
 }
 
 /** Parses the native helper's deliberately payload-free matrix receipt. */
@@ -182,6 +196,9 @@ function writeMatrixConfig(
   }
 }
 
+type HelperRunner = (path: string, args: string[], input?: Buffer) => void;
+type CswapItemReader = (service: string, account: string) => Buffer;
+
 export interface KeychainCommandDependencies {
   runMatrix?: () => HelperMatrixResult;
   runLaunchdMatrix?: () => HelperMatrixResult;
@@ -191,6 +208,140 @@ export interface KeychainCommandDependencies {
   helperConfigReader?: (key: string) => string | null;
   /** Injectable so pinned identity checks remain hermetic in tests. */
   helperIdentityVerifier?: (path: string, pin: string) => HelperIdentityVerification;
+  /** Test seam: no test invokes a compiled helper. */
+  helperPath?: () => string;
+  /** Test seam: records helper forms without handling credential bytes. */
+  helperRunner?: HelperRunner;
+  /** Test seam: reads a disposable C-swap item without invoking security. */
+  readCswapItem?: CswapItemReader;
+  /** Test seam for S24 immediately before each CAS write. */
+  listCswapProcesses?: () => Array<{ pid: number }>;
+  now?: () => number;
+}
+
+function activeClaudeCodeServices(env: NodeJS.ProcessEnv, home: string): string[] {
+  const base = 'Claude Code-credentials';
+  const secureDirectory = env.CLAUDE_SECURESTORAGE_CONFIG_DIR;
+  const configDirectory = secureDirectory === undefined ? env.CLAUDE_CONFIG_DIR : secureDirectory;
+  if (!configDirectory) return [base];
+  const digest = createHash('sha256').update(configDirectory.normalize('NFC'), 'utf8').digest('hex').slice(0, 8);
+  const services = [`${base}-${digest}`];
+  if (secureDirectory === undefined && resolve(configDirectory) === resolve(home, '.claude')) services.push(base);
+  return services;
+}
+
+function cswapItems(sequencePath: string): Array<{ service: 'claude-swap'; account: string }> {
+  const parsed = JSON.parse(readFileSync(sequencePath, 'utf8')) as { sequence?: unknown; accounts?: unknown };
+  if (!Array.isArray(parsed.sequence) || !parsed.accounts || typeof parsed.accounts !== 'object') throw new Error('C-swap account registry is unreadable');
+  const accounts = parsed.accounts as Record<string, unknown>;
+  const items: Array<{ service: 'claude-swap'; account: string }> = [];
+  for (const number of parsed.sequence) {
+    if ((typeof number !== 'number' && typeof number !== 'string') || String(number).length === 0) throw new Error('C-swap account registry is unreadable');
+    const entry = accounts[String(number)];
+    if (!entry || typeof entry !== 'object' || typeof (entry as { email?: unknown }).email !== 'string' || !(entry as { email: string }).email) {
+      throw new Error('C-swap account registry is unreadable');
+    }
+    items.push({ service: 'claude-swap', account: `account-${number}-${(entry as { email: string }).email}` });
+  }
+  return items;
+}
+
+function defaultHelperRunner(path: string, args: string[], input?: Buffer): void {
+  try {
+    execFileSync(path, args, { input, stdio: ['pipe', 'ignore', 'ignore'], timeout: MACOS_SECURITY_TIMEOUT_MS });
+  } catch (err) {
+    if ((err as { status?: unknown }).status === 3) throw Object.assign(new Error('keychain item changed'), { exitCode: 3 });
+    throw new Error('keychain helper failed');
+  }
+}
+
+function defaultCswapItemReader(service: string, account: string, env: NodeJS.ProcessEnv): Buffer {
+  assertKeychainAccess(service, account, 'read', { env });
+  let output: Buffer;
+  try {
+    output = execFileSync('/usr/bin/security', ['find-generic-password', '-a', account, '-w', '-s', service], {
+      encoding: 'buffer', stdio: ['ignore', 'pipe', 'ignore'], timeout: MACOS_SECURITY_TIMEOUT_MS,
+    }) as Buffer;
+  } catch {
+    throw new Error('C-swap item could not be read');
+  }
+  try {
+    const end = output[output.length - 1] === 0x0a ? output.length - 1 : output.length;
+    return Buffer.from(output.subarray(0, end));
+  } finally { output.fill(0); }
+}
+
+function writeAuthorizationConfig(dbPath: string, key: string, now: number): void {
+  const store = openStore(dbPath);
+  try { store.setConfig(key, String(now)); } finally { store.close(); }
+}
+
+/** Production probes and CAS writes use the same pinned helper trust boundary as normal writes. */
+function assertAuthorizationHelper(path: string, dbPath: string, dependencies: KeychainCommandDependencies): void {
+  // Injected runners cannot execute a real helper; they are test doubles only.
+  if (dependencies.helperRunner) return;
+  const signing = (dependencies.helperSigning ?? helperSigningState)(path);
+  if (!signing || signing.authority !== 'QLB Keychain Helper') throw new Error('helper identity is not trusted');
+  const configReader = dependencies.helperConfigReader ?? ((key: string) => {
+    const store = openStore(dbPath);
+    try { return store.getConfig(key); } finally { store.close(); }
+  });
+  const pin = configReader('keychain.helperCheckIdentityHash');
+  if (pin && !(dependencies.helperIdentityVerifier ?? verifyHelperIdentity)(path, pin).trusted) {
+    throw new Error('helper identity is not trusted');
+  }
+}
+
+async function authorize(options: { cswap: boolean; json: boolean }, ctx: CommandContext, dependencies: KeychainCommandDependencies): Promise<number> {
+  const helper = dependencies.helperPath?.() ?? helperPath();
+  const runner = dependencies.helperRunner ?? defaultHelperRunner;
+  const now = dependencies.now ?? Date.now;
+  try {
+    assertAuthorizationHelper(helper, ctx.config.dbPath, dependencies);
+    if (!options.cswap) {
+      const account = macosKeychainAccountName(ctx.env);
+      const items = [
+        ...activeClaudeCodeServices(ctx.env, ctx.home).map((service) => ({ service, account })),
+        ...cswapItems(ctx.config.cswapSequencePath),
+      ];
+      for (const item of items) runner(helper, ['probe-read', item.service, item.account]);
+      writeAuthorizationConfig(ctx.config.dbPath, 'keychain.liveItemsReadAuthorizedAt', now());
+      ctx.stdout(options.json ? JSON.stringify({ command: 'authorize', authorized: items.length }) : 'Keychain live items read-authorized');
+      return 0;
+    }
+
+    const store = openStore(ctx.config.dbPath);
+    try {
+      const admission = assertAdmitted(store, 'keychain-authorize-cswap');
+      if (!admission.ok) {
+        ctx.stderr(`qlb keychain: refused: ${admission.code}`);
+        return 3;
+      }
+    } finally { store.close(); }
+
+    const reader = dependencies.readCswapItem ?? ((service: string, account: string) => defaultCswapItemReader(service, account, ctx.env));
+    const processList = dependencies.listCswapProcesses ?? listCswapProcesses;
+    const items = cswapItems(ctx.config.cswapSequencePath);
+    for (const item of items) {
+      const payload = reader(item.service, item.account);
+      try {
+        const digest = createHash('sha256').update(payload).digest('hex');
+        // S24 is deliberately rechecked immediately before every write.
+        if (processList().length > 0) {
+          ctx.stderr('qlb keychain: refused: C-swap process is alive');
+          return 3;
+        }
+        runner(helper, ['set', '--if-sha256', digest, item.service, item.account], payload);
+      } finally { payload.fill(0); }
+    }
+    writeAuthorizationConfig(ctx.config.dbPath, 'keychain.cswapItemsAuthorizedAt', now());
+    ctx.stdout(options.json ? JSON.stringify({ command: 'authorize cswap', authorized: items.length }) : 'C-swap items CAS-authorized');
+    return 0;
+  } catch (err) {
+    const changed = (err as { exitCode?: unknown }).exitCode === 3;
+    ctx.stderr(changed ? 'qlb keychain: authorization changed; nothing was written' : 'qlb keychain: authorization failed');
+    return changed ? 3 : 1;
+  }
 }
 
 export async function runKeychainCommand(
@@ -204,6 +355,7 @@ export async function runKeychainCommand(
     ctx.stderr('qlb keychain: native helper commands are disabled in test mode');
     return 2;
   }
+  if (options.subcommand === 'authorize') return authorize(options, ctx, dependencies);
 
   let result: HelperMatrixResult | null = null;
   const path = helperPath();

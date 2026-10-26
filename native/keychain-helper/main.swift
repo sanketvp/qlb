@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import Security
 
@@ -15,13 +16,13 @@ private func statusName(_ status: OSStatus) -> String {
     }
 }
 
-private func fail(_ message: String, _ status: OSStatus? = nil) -> Never {
+private func fail(_ message: String, _ status: OSStatus? = nil, code: Int32 = 1) -> Never {
     if let status {
         FileHandle.standardError.write(Data("qlb-keychain-helper: \(message) (\(statusName(status)), status \(status))\n".utf8))
     } else {
         FileHandle.standardError.write(Data("qlb-keychain-helper: \(message)\n".utf8))
     }
-    exit(1)
+    exit(code)
 }
 
 private func readPayload() -> Data {
@@ -91,6 +92,40 @@ private func set(_ service: String, _ account: String, _ data: Data) {
         return
     }
     guard addStatus == errSecSuccess else { fail("add failed", addStatus) }
+}
+
+private func setIfSha256(_ service: String, _ account: String, _ expectedSha256: String, _ data: Data) {
+    guard expectedSha256.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil else {
+        fail("--if-sha256 requires a lowercase SHA-256 hex digest")
+    }
+    var lookup = query(service, account)
+    lookup[kSecReturnData] = true
+    var result: CFTypeRef?
+    let status = SecItemCopyMatching(lookup as CFDictionary, &result)
+    guard status == errSecSuccess, var stored = result as? Data else {
+        // A missing or unreadable item cannot be proven unchanged.
+        fail("compare-and-swap lookup failed", status, code: 3)
+    }
+    defer { stored.resetBytes(in: 0..<stored.count) }
+    let actualSha256 = SHA256.hash(data: stored).map { String(format: "%02x", $0) }.joined()
+    guard actualSha256 == expectedSha256 else { fail("changed", code: 3) }
+    // Include the observed bytes in the update query: if another writer wins
+    // after SecItemCopyMatching, this update matches nothing and cannot replace it.
+    var compareQuery = query(service, account)
+    compareQuery[kSecValueData] = stored
+    let updateStatus = SecItemUpdate(compareQuery as CFDictionary, [kSecValueData: data] as CFDictionary)
+    if updateStatus == errSecItemNotFound { fail("changed", code: 3) }
+    guard updateStatus == errSecSuccess else { fail("compare-and-swap update failed", updateStatus) }
+}
+
+/** Reads a protected item solely to authorize this helper. It never prints or writes its data. */
+private func probeRead(_ service: String, _ account: String) {
+    var lookup = query(service, account)
+    lookup[kSecReturnData] = true
+    var result: CFTypeRef?
+    let status = SecItemCopyMatching(lookup as CFDictionary, &result)
+    guard status == errSecSuccess, var payload = result as? Data else { fail("probe read failed", status) }
+    defer { payload.resetBytes(in: 0..<payload.count) }
 }
 
 private func read(_ service: String, _ account: String) -> (status: OSStatus, data: Data?) {
@@ -254,6 +289,12 @@ case (3, "set"):
     var payload = readPayload()
     defer { payload.resetBytes(in: 0..<payload.count) }
     set(args[1], args[2], payload)
+case (5, "set") where args[1] == "--if-sha256":
+    var payload = readPayload()
+    defer { payload.resetBytes(in: 0..<payload.count) }
+    setIfSha256(args[3], args[4], args[2], payload)
+case (3, "probe-read"):
+    probeRead(args[1], args[2])
 case (3, "delete"):
     delete(args[1], args[2])
 case (2, "selftest"):
@@ -263,6 +304,6 @@ case (2, "matrix"):
 case (3, "matrix"):
     matrix(args[1], previousHelper: args[2])
 default:
-    FileHandle.standardError.write(Data("usage: qlb-keychain-helper [--keychain <path>] set|delete <service> <account> | selftest <qlb-test-service> | matrix <qlb-test-prefix> [previous-helper]\n".utf8))
+    FileHandle.standardError.write(Data("usage: qlb-keychain-helper [--keychain <path>] set [--if-sha256 <hex>] <service> <account> | probe-read|delete <service> <account> | selftest <qlb-test-service> | matrix <qlb-test-prefix> [previous-helper]\n".utf8))
     exit(2)
 }
