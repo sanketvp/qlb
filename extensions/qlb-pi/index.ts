@@ -311,13 +311,13 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       ? { ...base, journal: await qlbConsumeJournal() }
       : null;
   const mode = modeInput ? decidePiMode(modeInput) : "inert";
-  const xaiOwner = base && (
-    rehearsal === "1" ||
-    (() => {
-      const owner = readPiOwnerFile(OWNER_FILE);
-      return owner.kind === "malformed" || ownerStateForProvider(owner, "xai") === "valid";
-    })()
-  );
+  const xaiOwner = base && (() => {
+    const owner = readPiOwnerFile(OWNER_FILE);
+    return decidePiMode("xai", {
+      rehearsal,
+      owner: ownerStateForProvider(owner, "xai"),
+    }) !== "inert";
+  })();
   if (xaiOwner) await registerOwnedXaiProvider(pi);
   if (mode === "inert") {
     // Inert for Anthropic: QLB does not own it and consume is off. Its pool remains registered.

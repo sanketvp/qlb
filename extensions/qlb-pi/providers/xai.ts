@@ -56,12 +56,38 @@ function xaiGateFailure(causeCode = 'unknown'): XaiGateFailure {
 }
 
 function gateCause(stderr: string | undefined): string {
-  const lastLine = stderr?.trim().split(/\r?\n/).at(-1)?.trim();
-  return lastLine && /^[a-z][a-z0-9=-]*$/.test(lastLine) ? lastLine : 'unknown';
+  const value = stderr?.trim().replace(/^qlb gate: refused: /, '') ?? '';
+  return /^[a-z][a-z0-9-]*$/.test(value) || /^phase=[a-z-]+$/.test(value) ? value : 'unknown';
 }
 
 function failureCause(error: unknown): string {
   return error instanceof XaiGateFailure ? error.causeCode : 'unknown';
+}
+
+/** A fixed terminal event: never label a transport failure as a gate failure. */
+function xaiRequestError(model: XaiModel, reason: 'error' | 'aborted'): Record<string, unknown> {
+  return {
+    type: 'error',
+    reason,
+    error: {
+      role: 'assistant',
+      content: [],
+      api: model.api,
+      provider: model.provider,
+      model: model.id,
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 0,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+      stopReason: reason,
+      errorMessage: reason === 'aborted' ? 'Request aborted' : 'xAI request failed',
+      timestamp: Date.now(),
+    },
+  };
 }
 
 function narrowAccess(value: unknown): ActiveAccess {
@@ -197,11 +223,14 @@ export function registerXaiProvider(
     streamSimple: (model, context, options = {}) => {
       const output = deps.createStream();
       void (async () => {
+        const signal = options.signal as AbortSignal | undefined;
         let access: ActiveAccess;
         try {
-          access = await source.readWithSignal(options.signal as AbortSignal | undefined);
+          access = await source.readWithSignal(signal);
         } catch (error) {
-          output.push(qlbUnavailable('xai', failureCause(error), model));
+          output.push(signal?.aborted
+            ? xaiRequestError(model, 'aborted')
+            : qlbUnavailable('xai', failureCause(error), model));
           output.end();
           return;
         }
@@ -211,6 +240,7 @@ export function registerXaiProvider(
           }
         } catch {
           // The gate succeeded. Do not misrepresent a provider transport failure as QLB unavailable.
+          output.push(xaiRequestError(model, signal?.aborted ? 'aborted' : 'error'));
         } finally {
           output.end();
         }

@@ -133,7 +133,7 @@ describe('qlb-pi xai provider source', () => {
     const gate = createXaiGate(async () => ({
       code: 3,
       stdout: '',
-      stderr: 'provider-not-applicable\n',
+      stderr: 'qlb gate: refused: phase=undoing\n',
     } as never));
 
     registerXaiProvider(pi, () => (async function* () {})(), {
@@ -144,11 +144,11 @@ describe('qlb-pi xai provider source', () => {
     await flush();
 
     assert.equal((output.events[0] as { error: { errorMessage: string } }).error.errorMessage,
-      'QLB unavailable for xai — run qlb doctor (provider-not-applicable)');
+      'QLB unavailable for xai — run qlb doctor (phase=undoing)');
     assert.equal(output.ended, true);
   });
 
-  it('passes Pi cancellation to the gate and fails closed on cancellation', async () => {
+  it('passes Pi cancellation to the gate as an aborted request', async () => {
     const pi = fakePi();
     const output = sink();
     const controller = new AbortController();
@@ -167,7 +167,7 @@ describe('qlb-pi xai provider source', () => {
       },
     });
     pi.providers.get('xai')!.streamSimple(
-      { id: 'grok-4.6', api: 'openai-responses' },
+      { id: 'grok-4.6', api: 'openai-responses', provider: 'xai' },
       {},
       { signal: controller.signal },
     );
@@ -176,10 +176,21 @@ describe('qlb-pi xai provider source', () => {
 
     assert.equal(received, controller.signal);
     assert.equal(builtinCalled, false);
+    assert.equal(output.events.length, 1);
+    const aborted = output.events[0] as {
+      type: string;
+      reason: string;
+      error: { stopReason: string; errorMessage: string; timestamp: number };
+    };
+    assert.equal(aborted.type, 'error');
+    assert.equal(aborted.reason, 'aborted');
+    assert.equal(aborted.error.stopReason, 'aborted');
+    assert.equal(aborted.error.errorMessage, 'Request aborted');
+    assert.equal(typeof aborted.error.timestamp, 'number');
     assert.equal(output.ended, true);
   });
 
-  it('does not relabel a transport exception as a QLB gate failure', async () => {
+  it('ends a transport exception with a non-QLB terminal error', async () => {
     const pi = fakePi();
     const output = sink();
     registerXaiProvider(pi, () => (async function* () {
@@ -189,10 +200,21 @@ describe('qlb-pi xai provider source', () => {
       createStream: () => output,
       gate: async () => ({ token: 'fixture-xai-access', accountId: 'default', source: 'keychain' }),
     });
-    pi.providers.get('xai')!.streamSimple({ id: 'grok-4.6', api: 'openai-responses' }, {}, {});
+    pi.providers.get('xai')!.streamSimple({ id: 'grok-4.6', api: 'openai-responses', provider: 'xai' }, {}, {});
     await flush();
 
-    assert.deepEqual(output.events, [{ type: 'text_delta', delta: 'before-error' }]);
+    assert.deepEqual(output.events[0], { type: 'text_delta', delta: 'before-error' });
+    assert.equal(output.events.length, 2);
+    const failure = output.events[1] as {
+      type: string;
+      reason: string;
+      error: { stopReason: string; errorMessage: string; timestamp: number };
+    };
+    assert.equal(failure.type, 'error');
+    assert.equal(failure.reason, 'error');
+    assert.equal(failure.error.stopReason, 'error');
+    assert.equal(failure.error.errorMessage, 'xAI request failed');
+    assert.equal(typeof failure.error.timestamp, 'number');
     assert.equal(output.ended, true);
   });
 });
