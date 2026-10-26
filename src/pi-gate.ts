@@ -35,6 +35,14 @@ export class GateFailure extends Error {
   }
 }
 
+/** A lifecycle refusal; never downgraded to an evidence gap. */
+export class GateAdmissionRefused extends GateFailure {
+  constructor(code: string) {
+    super(code);
+    this.name = 'GateAdmissionRefused';
+  }
+}
+
 export interface PiGateDeps {
   dbPath: string;
   env: NodeJS.ProcessEnv;
@@ -171,18 +179,34 @@ function loadedProvider(provider: PiGateProvider, load: (provider: PiGateProvide
   return gate as ProviderGate;
 }
 
-function recordEvidence(db: DatabaseSync, provider: PiGateProvider, credential: GateCredential, trace?: (sql: string) => void): void {
+function assertGateAdmitted(db: DatabaseSync): void {
+  let admission;
+  try {
+    admission = assertAdmittedInConnection(db, 'gate');
+  } catch {
+    throw new GateAdmissionRefused('lifecycle-unreadable');
+  }
+  if (!admission.ok) throw new GateAdmissionRefused(admission.code ?? 'lifecycle-refused');
+}
+
+/**
+ * Admission check, evidence write and delivery all happen under one write
+ * lock, so no lifecycle transition can commit between the check and delivery.
+ */
+function recordEvidenceAndDeliver(
+  db: DatabaseSync, provider: PiGateProvider, credential: GateCredential, deliver: () => void, trace?: (sql: string) => void,
+): void {
   trace?.('BEGIN IMMEDIATE');
   db.exec('BEGIN IMMEDIATE');
   try {
-    const admission = assertAdmittedInConnection(db, 'gate');
-    if (!admission.ok) throw new GateFailure(admission.code ?? 'lifecycle-refused');
+    assertGateAdmitted(db);
     const now = String(Date.now());
     const write = db.prepare(`INSERT INTO config (key, value) VALUES (?, ?)
       ON CONFLICT(key) DO UPDATE SET value = excluded.value`);
     write.run(`pi.${provider}.lastServedFingerprint`, fingerprint(credential.token));
     write.run(`pi.${provider}.lastServedAt`, now);
     if (provider === 'anthropic') write.run('pi.anthropic.lastServedBy', 'qlb-pi');
+    deliver();
     trace?.('COMMIT');
     db.exec('COMMIT');
   } catch (error) {
@@ -242,23 +266,31 @@ export async function runPiGate(providerName: string, deps: PiGateDeps): Promise
     if (typeof credential.chatgptAccountId === 'string') delivered.chatgptAccountId = credential.chatgptAccountId;
     if (typeof credential.expiresAt === 'number' && Number.isFinite(credential.expiresAt)) delivered.expiresAt = credential.expiresAt;
 
-    try {
-      recordEvidence(db, providerName, delivered, deps.sqlTrace);
-    } catch (error) {
-      const code = failureCode(error);
-      if (isLifecycleRefusal(code)) throw error;
-      (deps.evidenceGap ?? ((name) => appendEvidenceGap(deps.dbPath, name)))(providerName, error);
-      deps.stderr?.(`qlb gate ${providerName}: pi:evidence-gap`);
-    }
     // The complete response shares the only unredacted channel. No ordinary
     // stdout/error path receives credential material.
-    deps.registerSecret?.(delivered.token);
-    deps.deliver(JSON.stringify(delivered));
+    let sent = false;
+    const deliverOnce = (): void => {
+      if (sent) return;
+      deps.registerSecret?.(delivered.token);
+      deps.deliver(JSON.stringify(delivered));
+      sent = true;
+    };
+    try {
+      recordEvidenceAndDeliver(db, providerName, delivered, deliverOnce, deps.sqlTrace);
+    } catch (error) {
+      if (error instanceof GateAdmissionRefused) throw error;
+      // Evidence is fail-open (S54); admission is not. Without the write lock,
+      // re-check the phase with a plain read (WAL) before delivering.
+      if (!sent) assertGateAdmitted(db);
+      (deps.evidenceGap ?? ((name) => appendEvidenceGap(deps.dbPath, name)))(providerName, error);
+      deps.stderr?.(`qlb gate ${providerName}: pi:evidence-gap`);
+      deliverOnce();
+    }
     return 0;
   } catch (error) {
     const code = failureCode(error);
     deps.stderr?.(code);
-    return code === 'missing-provider-gate' || isLifecycleRefusal(code) ? 3 : 1;
+    return error instanceof GateAdmissionRefused || code === 'missing-provider-gate' || isLifecycleRefusal(code) ? 3 : 1;
   } finally {
     db.close();
   }

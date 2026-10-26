@@ -237,6 +237,72 @@ describe('qlb gate core (S30/S54)', () => {
     } finally { db.close(); }
   });
 
+  it('delivers while still holding the evidence write lock, so no transition can land in between', async () => {
+    const dbPath = fixtureDb();
+    let lockedDuringDelivery: boolean | undefined;
+    const result = await runPiGate('xai', {
+      dbPath, env: { QLB_PI_TOKEN_CALL: '1' }, guard: () => true, admitted: () => ({ ok: true }), prerequisites: () => undefined,
+      provider: { read: () => ({ token: 'xai-token', accountId: 'xai-default', source: 'fixture' }) },
+      deliver: () => {
+        const other = openStoreConnection(dbPath);
+        try {
+          other.exec('PRAGMA busy_timeout = 0');
+          try { other.exec('BEGIN IMMEDIATE'); other.exec('ROLLBACK'); lockedDuringDelivery = false; } catch { lockedDuringDelivery = true; }
+        } finally { other.close(); }
+      },
+    });
+    assert.equal(result, 0);
+    assert.equal(lockedDuringDelivery, true);
+  });
+
+  it('when the write lock cannot be taken, re-reads the phase and refuses during undo', async () => {
+    const dbPath = fixtureDb();
+    const setup = openStoreConnection(dbPath);
+    try { setup.prepare("UPDATE lifecycle SET state = 'undoing'").run(); } finally { setup.close(); }
+    const holder = openStoreConnection(dbPath);
+    holder.exec('BEGIN IMMEDIATE');
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    let gaps = 0;
+    try {
+      const result = await runPiGate('xai', {
+        dbPath, env: { QLB_PI_TOKEN_CALL: '1' }, deliver: (value) => stdout.push(value), stderr: (line) => stderr.push(line),
+        guard: () => true, admitted: () => ({ ok: true }), prerequisites: () => undefined, evidenceGap: () => { gaps += 1; },
+        open: (path) => { const db = openStoreConnection(path); db.exec('PRAGMA busy_timeout = 20'); return db; },
+        provider: { read: () => ({ token: 'xai-token', accountId: 'xai-default', source: 'fixture' }) },
+      });
+      assert.equal(result, 3);
+      assert.deepEqual(stdout, []);
+      assert.deepEqual(stderr, ['undo-in-progress']);
+      assert.equal(gaps, 0);
+    } finally {
+      holder.exec('ROLLBACK');
+      holder.close();
+    }
+  });
+
+  it('when the write lock cannot be taken in an admitted phase, records an evidence gap and still serves', async () => {
+    const dbPath = fixtureDb();
+    const holder = openStoreConnection(dbPath);
+    holder.exec('BEGIN IMMEDIATE');
+    const stdout: string[] = [];
+    let gaps = 0;
+    try {
+      const result = await runPiGate('xai', {
+        dbPath, env: { QLB_PI_TOKEN_CALL: '1' }, deliver: (value) => stdout.push(value),
+        guard: () => true, admitted: () => ({ ok: true }), prerequisites: () => undefined, evidenceGap: () => { gaps += 1; },
+        open: (path) => { const db = openStoreConnection(path); db.exec('PRAGMA busy_timeout = 20'); return db; },
+        provider: { read: () => ({ token: 'xai-token', accountId: 'xai-default', source: 'fixture' }) },
+      });
+      assert.equal(result, 0);
+      assert.equal(stdout.length, 1);
+      assert.equal(gaps, 1);
+    } finally {
+      holder.exec('ROLLBACK');
+      holder.close();
+    }
+  });
+
   it('fails a non-migrated provider with its prerequisite cause', async () => {
     const stderr: string[] = [];
     const result = await runPiGate('xai', {
