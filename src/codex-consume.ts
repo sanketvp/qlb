@@ -287,6 +287,14 @@ function compensateSlot(options: CodexConsumeOptions, predecessor: CodexAuthDocu
   } catch { /* a racing or unavailable Keychain is never overwritten blindly */ }
 }
 
+/** Preserve an issued successor if durable stash recovery itself has failed. */
+function retainSuccessorInSlot(options: CodexConsumeOptions, predecessor: CodexAuthDocument, successor: CodexAuthDocument): void {
+  try {
+    const latest = options.slots.readSlot(options.accountId, { fresh: true });
+    if (holdsAttempt(latest, predecessor)) options.slots.writeSlot(options.accountId, successor, predecessor);
+  } catch { /* an unavailable or raced slot cannot be overwritten blindly */ }
+}
+
 type PersistResult = 'committed' | 'cas-lost' | 'stashed' | 'successor-unpersisted';
 
 /**
@@ -318,10 +326,11 @@ async function persistTransition(
     }
   }
 
-  const connection = openDatabase(options.store);
-  const { db } = connection;
+  let connection: { db: DatabaseSync; close: boolean } | undefined;
   let wroteSlot = false;
   try {
+    connection = openDatabase(options.store);
+    const { db } = connection;
     db.exec('BEGIN IMMEDIATE');
     const row = db.prepare('SELECT fingerprint FROM codex_slots WHERE account_id = ?').get(options.accountId) as { fingerprint: string | null } | undefined;
     if (!row || row.fingerprint !== current.fingerprint) {
@@ -359,13 +368,16 @@ async function persistTransition(
       ? { status: 'stashed' as const }
       : await persistStash(options, successor, current.fingerprint, now);
     if (stashed.status === 'stashed' && wroteSlot) compensateSlot(options, current.document, successor);
-    try { db.exec('ROLLBACK'); } catch { /* preserve the typed recovery result */ }
+    if (stashed.status === 'successor-unpersisted' && !wroteSlot) {
+      retainSuccessorInSlot(options, current.document, successor);
+    }
+    try { connection?.db.exec('ROLLBACK'); } catch { /* preserve the typed recovery result */ }
     if (stashed.status === 'stashed' && !successorAlreadyStashed) {
       reportStash(options, current.fingerprint, successorFp, now, 'consume-gate-persist-failed');
     }
     return stashed.status === 'successor-unpersisted' ? 'successor-unpersisted' : 'stashed';
   } finally {
-    closeDatabase(connection);
+    try { if (connection) closeDatabase(connection); } catch { /* preserve the typed recovery result */ }
   }
 }
 

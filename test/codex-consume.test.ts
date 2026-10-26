@@ -289,12 +289,45 @@ describe('Codex consume gate — AC34', () => {
     }
   });
 
-  it('leaves the issued successor in the managed slot when its recovery stash fails', async () => {
+  it('stashes a successor when opening the transition database fails after its POST, then adopts it', async () => {
     const h = managedFixture();
     try {
-      (h.store as unknown as { db: DatabaseSync }).db.exec(`CREATE TRIGGER reject_post
-        BEFORE UPDATE OF fingerprint ON codex_slots WHEN NEW.fingerprint != OLD.fingerprint
-        BEGIN SELECT RAISE(FAIL, 'fixture metadata failure'); END;`);
+      let dbPath = h.store.dbPath;
+      const store = { get dbPath(): string { return dbPath; } };
+      let posts = 0;
+      const result = await consumeCodexSlot({
+        accountId: h.plan.slotId, snapshot: h.initial, trigger: 'force', force: true,
+        slots: h.slots, store, holders: async () => [], now: () => 2,
+        transport: async () => {
+          posts += 1;
+          dbPath = join(h.home, 'missing', 'qlb.db');
+          return { status: 200, body: JSON.stringify({ refresh_token: 'refresh-b', access_token: 'access-b' }) };
+        },
+      });
+      assert.equal(result.status, 'stashed');
+      assert.equal(posts, 1);
+      assert.equal((await listStashes(join(h.home, 'unclaimed'), 'openai-codex', h.plan.slotId)).length, 1);
+
+      dbPath = h.store.dbPath;
+      const adopted = await consumeCodexSlot({
+        accountId: h.plan.slotId, snapshot: h.initial, trigger: 'scheduled',
+        slots: h.slots, store, holders: async () => [], now: () => 3,
+        transport: async () => { assert.fail('must adopt the stashed successor before POSTing'); },
+      });
+      assert.equal(adopted.status, 'fresh');
+      assert.equal(codexFingerprint(h.slots.readSlot(h.plan.slotId, { fresh: true }).document), codexFingerprint(document('refresh-b', 'access-b')));
+      assert.equal((await listStashes(join(h.home, 'unclaimed'), 'openai-codex', h.plan.slotId)).length, 0);
+    } finally {
+      h.store.close();
+      rmSync(h.home, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps the issued successor in the managed slot when transition DB open and stash recovery both fail', async () => {
+    const h = managedFixture();
+    try {
+      let dbPath = h.store.dbPath;
+      const store = { get dbPath(): string { return dbPath; } };
       const failingSlots = {
         readSlot: h.slots.readSlot.bind(h.slots),
         writeSlot: h.slots.writeSlot.bind(h.slots),
@@ -303,8 +336,11 @@ describe('Codex consume gate — AC34', () => {
       };
       const result = await consumeCodexSlot({
         accountId: h.plan.slotId, snapshot: h.initial, trigger: 'force', force: true,
-        slots: failingSlots, store: h.store, holders: async () => [], now: () => 2,
-        transport: async () => ({ status: 200, body: JSON.stringify({ refresh_token: 'refresh-b', access_token: 'access-b' }) }),
+        slots: failingSlots, store, holders: async () => [], now: () => 2,
+        transport: async () => {
+          dbPath = join(h.home, 'missing', 'qlb.db');
+          return { status: 200, body: JSON.stringify({ refresh_token: 'refresh-b', access_token: 'access-b' }) };
+        },
       });
       assert.equal(result.status, 'successor-unpersisted');
       assert.equal(codexFingerprint(h.slots.readSlot(h.plan.slotId, { fresh: true }).document), codexFingerprint(document('refresh-b', 'access-b')));
