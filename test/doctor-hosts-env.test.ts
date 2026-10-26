@@ -189,3 +189,13 @@ describe('qlb doctor hosts:env', () => {
     });
   });
 });
+
+describe('qlb doctor hosts:env default runner', () => {
+  it('runs host commands in their own session so an interactive login shell cannot take over the caller terminal', async () => {
+    const { runHostCommand } = await import('../src/diagnostics');
+    // A detached child leads its own process group; an attached one shares the caller's.
+    const out = runHostCommand('/bin/sh', ['-c', 'echo "$$ $(ps -o pgid= -p $$)"']).trim().split(/\s+/);
+    assert.equal(out.length, 2);
+    assert.equal(out[1], out[0], 'host command must run as its own process-group leader');
+  });
+});

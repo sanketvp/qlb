@@ -1,4 +1,4 @@
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync, spawnSync, type ExecFileSyncOptionsWithStringEncoding } from 'node:child_process';
 import {
   inspectHelperSigning as inspectHelperSigningAt,
   verifyHelperIdentity,
@@ -192,13 +192,20 @@ export function createCommandRunner(exec: ExecFileSyncFn = execFileUtf8): Comman
 const runCommand = createCommandRunner();
 
 /** A bounded runner for host probes; never return login-shell environment output. */
-const runHostCommand: HostCommandRunner = (command, args, options) =>
-  execFileSync(command, args, {
+// detached: hosts:env runs `<shell> -lic env`. An interactive shell attached to the caller's
+// terminal makes itself the terminal's foreground group and never hands it back, so a Pi session
+// that ran doctor could no longer restore its terminal and exited 129 on quit. Node's sync spawn
+// honours `detached` (src/spawn_sync.cc) but its typings omit it; the hosts-env test pins it.
+export const runHostCommand: HostCommandRunner = (command, args, options) => {
+  const spawnOptions: ExecFileSyncOptionsWithStringEncoding & { detached: boolean } = {
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'ignore'],
     timeout: 5_000,
     env: options?.env,
-  });
+    detached: true,
+  };
+  return execFileSync(command, args, spawnOptions);
+};
 
 function readJson(path: string): Record<string, unknown> | null {
   try {
