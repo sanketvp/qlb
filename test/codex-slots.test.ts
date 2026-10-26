@@ -7,6 +7,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { describe, it } from 'node:test';
 
 import { codexFingerprint, parseCodexAuth } from '../src/codex-auth';
+import { createCodexAdapter } from '../src/adapters/codex';
 import {
   KeychainBackedOff,
   KeychainReadBackoff,
@@ -41,6 +42,19 @@ function document(refresh = 'fixture-refresh-token') {
 
 function parsedDocument(refresh?: string) {
   const parsed = parseCodexAuth(JSON.stringify(document(refresh)));
+  assert.equal(parsed.ok, true);
+  if (!parsed.ok) throw new Error('fixture must parse');
+  return parsed.doc;
+}
+
+function parsedDocumentWithAccountIds(tokensAccountId: string | undefined, claimAccountId: string | undefined) {
+  const claims: Record<string, string> = { chatgpt_user_id: 'fixture-user' };
+  if (claimAccountId !== undefined) claims.chatgpt_account_id = claimAccountId;
+  const doc: { auth_mode: string; tokens: Record<string, unknown> } = document();
+  doc.tokens.id_token = jwt({ 'https://api.openai.com/auth': claims });
+  if (tokensAccountId === undefined) delete doc.tokens.account_id;
+  else doc.tokens.account_id = tokensAccountId;
+  const parsed = parseCodexAuth(JSON.stringify(doc));
   assert.equal(parsed.ok, true);
   if (!parsed.ok) throw new Error('fixture must parse');
   return parsed.doc;
@@ -128,6 +142,71 @@ describe('Codex slots and import-active', () => {
       } finally {
         db.close();
       }
+    } finally {
+      h.store.close();
+      rmSync(h.home, { recursive: true, force: true });
+    }
+  });
+
+  it('uses the token account id for import-active and adapter upserts without recreating codex-default', async () => {
+    const h = fixture();
+    try {
+      const doc = parsedDocumentWithAccountIds('token-account', undefined);
+      const plan = importActiveCodexSlot(doc, { store: h.store, keychain: h.keychain });
+      const adapter = createCodexAdapter({
+        authPath: join(h.home, 'auth.json'),
+        readAuth: async () => JSON.stringify(doc),
+        upsertAccount: h.store.upsertAccount.bind(h.store),
+      });
+
+      const [snapshot] = await adapter.fetchSnapshots();
+      assert.equal(plan.accountId, 'token-account');
+      assert.equal(snapshot?.accountId, plan.accountId);
+      const db = new DatabaseSync(h.store.dbPath, { readOnly: true });
+      try {
+        assert.deepEqual(
+          (db.prepare("SELECT id FROM accounts WHERE provider = 'openai-codex' ORDER BY id").all() as Array<{ id: string }>).map((row) => row.id),
+          ['token-account'],
+        );
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.store.close();
+      rmSync(h.home, { recursive: true, force: true });
+    }
+  });
+
+  it('prefers the token account id over a differing id-token claim in both paths', async () => {
+    const h = fixture();
+    try {
+      const doc = parsedDocumentWithAccountIds('token-account', 'claim-account');
+      const adapter = createCodexAdapter({
+        authPath: join(h.home, 'auth.json'),
+        readAuth: async () => JSON.stringify(doc),
+        upsertAccount: h.store.upsertAccount.bind(h.store),
+      });
+
+      assert.equal(planImportActiveCodex(doc).accountId, 'token-account');
+      assert.equal((await adapter.fetchSnapshots())[0]?.accountId, 'token-account');
+    } finally {
+      h.store.close();
+      rmSync(h.home, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps the id-token account claim fallback when tokens.account_id is absent', async () => {
+    const h = fixture();
+    try {
+      const doc = parsedDocumentWithAccountIds(undefined, 'claim-account');
+      const adapter = createCodexAdapter({
+        authPath: join(h.home, 'auth.json'),
+        readAuth: async () => JSON.stringify(doc),
+        upsertAccount: h.store.upsertAccount.bind(h.store),
+      });
+
+      assert.equal(planImportActiveCodex(doc).accountId, 'claim-account');
+      assert.equal((await adapter.fetchSnapshots())[0]?.accountId, 'claim-account');
     } finally {
       h.store.close();
       rmSync(h.home, { recursive: true, force: true });

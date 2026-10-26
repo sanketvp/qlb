@@ -205,8 +205,11 @@ function nonEmpty(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;
 }
 
-function idTokenAuthClaims(doc: CodexAuthDocument): JsonObject | null {
+type CodexAccountTokens = { id_token?: unknown; account_id?: unknown };
+
+function idTokenAuthClaims(doc: { tokens: CodexAccountTokens }): JsonObject | null {
   try {
+    if (typeof doc.tokens.id_token !== 'string') return null;
     const payload = doc.tokens.id_token.split('.')[1];
     if (!payload) return null;
     const decoded = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as unknown;
@@ -217,11 +220,19 @@ function idTokenAuthClaims(doc: CodexAuthDocument): JsonObject | null {
   }
 }
 
+/** Bare account row identity shared by the Codex adapter and import-active. */
+export function codexBareAccountId(doc: { tokens: CodexAccountTokens }): string | undefined {
+  const accountId = doc.tokens.account_id;
+  if (typeof accountId === 'string' && accountId.length > 0) return accountId;
+  const claim = idTokenAuthClaims(doc)?.chatgpt_account_id;
+  return typeof claim === 'string' && claim.length > 0 ? claim : undefined;
+}
+
 /** Extracts the S29 identity fields without retaining any token values. */
 export function planImportActiveCodex(doc: CodexAuthDocument): CodexImportPlan {
   const claims = idTokenAuthClaims(doc);
   const chatgptUserId = claims?.chatgpt_user_id;
-  const accountId = doc.tokens.account_id || claims?.chatgpt_account_id;
+  const accountId = codexBareAccountId(doc);
   const slotId = codexIdentity(doc);
   if (!nonEmpty(chatgptUserId) || !nonEmpty(accountId) || !slotId) {
     throw new Error('Codex auth.json has no S29 identity');
