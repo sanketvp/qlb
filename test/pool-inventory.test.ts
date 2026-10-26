@@ -1,9 +1,15 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import {
   classify,
   inventoryPool,
+  readPoolInventoryEntries,
+  slotInventoryLineages,
+  PoolInventoryError,
   type PoolInventoryEntry,
   type PoolInventoryStore,
   type SourceLineage,
@@ -71,6 +77,13 @@ describe('anthropic-pool inventory (P11, AC52)', () => {
     ], NOW), /ambiguous source lineage/);
   });
 
+  it('rejects two independent source lineages that name one slot', () => {
+    assert.throws(() => classify(entries, [
+      { slotAccountId: 'slot-a', lineageFp: FP_A },
+      { slotAccountId: 'slot-a', lineageFp: FP_B },
+    ], NOW), (error: unknown) => error instanceof PoolInventoryError && error.code === 'duplicate-slot-account-id');
+  });
+
   it('replaces only anthropic export targets after classification', () => {
     const store = openStore(':memory:');
     try {
@@ -85,14 +98,93 @@ describe('anthropic-pool inventory (P11, AC52)', () => {
     }
   });
 
+  it('invents no partial pool view and includes all strict .lkg lineages', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-pool-inventory-'));
+    const poolPath = join(dir, 'anthropic-pool.json');
+    const lkgPath = join(dir, 'anthropic-pool.lkg.json');
+    writeFileSync(poolPath, JSON.stringify({ accounts: [{
+      id: 'pool-a', credentials: { access: 'access-a', refresh: 'refresh-a', expires: NOW + 1 },
+    }] }));
+    writeFileSync(lkgPath, JSON.stringify({ accounts: {
+      'pool-a': {
+        credential: { type: 'oauth', access: 'access-b', refresh: 'refresh-b', expires: NOW + 1 },
+        expectedPredecessor: 'refresh-c', poolGeneration: 1, txId: 'tx', acceptedAt: NOW, source: 'refresher',
+        conflict: { kind: 'concurrent_acceptance', status: 'unresolved', preferredTxId: 'tx', candidates: [{
+          credential: { type: 'oauth', access: 'access-d', refresh: 'refresh-d', expires: NOW + 1 },
+          expectedPredecessor: 'refresh-e', poolGeneration: 1, txId: 'tx-2', acceptedAt: NOW, source: 'refresher',
+        }] },
+      },
+      'legacy-pool': { refresh: 'refresh-f' },
+    } }));
+
+    const loaded = readPoolInventoryEntries(poolPath);
+    assert.equal(loaded.filter((entry) => entry.target === 'pool-a').length, 5);
+    assert.equal(loaded.find((entry) => entry.target === 'legacy-pool') !== undefined, true);
+    assert.throws(() => readPoolInventoryEntries(poolPath, () => JSON.stringify({ accounts: [{
+      id: 'pool-a', credentials: { refresh: 'refresh-a' },
+    }] })), (error: unknown) => error instanceof PoolInventoryError && error.code === 'pool-account-invalid');
+  });
+
+  it('treats malformed .lkg input as unavailable rather than omitting it', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-pool-inventory-'));
+    const poolPath = join(dir, 'anthropic-pool.json');
+    writeFileSync(poolPath, JSON.stringify({ accounts: [{
+      id: 'pool-a', credentials: { access: 'access-a', refresh: 'refresh-a' },
+    }] }));
+    writeFileSync(join(dir, 'anthropic-pool.lkg.json'), '{');
+    assert.throws(() => readPoolInventoryEntries(poolPath), (error: unknown) => error instanceof PoolInventoryError && error.code === 'pool-lkg-invalid');
+  });
+
+  it('expands every active slot lineage chain and omits inactive source forms', () => {
+    assert.deepEqual(slotInventoryLineages({ listAnthropicSlotLineageChains: () => [{
+      accountId: 'slot-a', lineages: [FP_A, FP_B],
+    }, {
+      accountId: 'slot-ignored', lineages: [`sha256-full:${'d'.repeat(64)}`],
+    }] }), [
+      { slotAccountId: 'slot-a', lineageFp: FP_A, lineageChain: true },
+      { slotAccountId: 'slot-a', lineageFp: FP_B, lineageChain: true },
+    ]);
+  });
+
+  it('keeps cswap and report-only slots inventory read-only, and records slots only once when admitted', () => {
+    const output: string[] = [];
+    const replacements: unknown[] = [];
+    const store = {
+      replacePiExportTargets: (_provider: string, targets: unknown[]) => replacements.push(targets),
+      listPiExportTargets: () => [], close: () => {},
+      listAnthropicSlotLineages: () => [],
+      listAnthropicSlotLineageChains: () => [],
+    };
+    const deps = {
+      openStore: () => store,
+      loadEntries: () => entries,
+      loadCswapLineages: () => sources,
+      loadSlotLineages: () => [{ slotAccountId: 'slot-b', lineageFp: FP_B }],
+      admitRecord: () => ({ ok: true }),
+      now: () => NOW,
+    };
+    assert.equal(runPiPoolInventoryCommand(['--against', 'cswap'], context(output), { ...deps, openStore: () => { throw new Error('must not open'); } }), 0);
+    assert.equal(runPiPoolInventoryCommand(['--against', 'slots'], context(output), deps), 0);
+    assert.equal(replacements.length, 0);
+    assert.equal(runPiPoolInventoryCommand(['--against', 'slots', '--record'], context(output), deps), 0);
+    assert.equal(replacements.length, 1);
+    const existing = { ...deps, openStore: () => ({ ...store, listPiExportTargets: () => [{ provider: 'anthropic' as const, target: 'old', slotAccountId: 'old', lineageFp: FP_A, recordedAt: NOW }] }) };
+    assert.equal(runPiPoolInventoryCommand(['--against', 'slots', '--record'], context(output), existing), 1);
+    assert.equal(replacements.length, 1);
+  });
+
   it('supports cswap and imported-slot sources through the command without printing a credential value', () => {
     const output: string[] = [];
     const store: PoolInventoryStore = { replacePiExportTargets: () => {} };
     const deps = {
-      openStore: () => ({ ...store, close: () => {}, listAnthropicSlotLineages: () => [] }),
+      openStore: () => ({
+        ...store, close: () => {}, listPiExportTargets: () => [],
+        listAnthropicSlotLineageChains: () => [],
+      }),
       loadEntries: () => entries,
       loadCswapLineages: () => sources,
       loadSlotLineages: () => [{ slotAccountId: 'slot-b', lineageFp: FP_B }],
+      admitRecord: () => ({ ok: true }),
       now: () => NOW,
     };
 
