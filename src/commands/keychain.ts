@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { defaultKeychainHelperPath, KeychainHelperMissingError, MACOS_SECURITY_TIMEOUT_MS } from '../keychain';
@@ -226,7 +226,9 @@ function activeClaudeCodeServices(env: NodeJS.ProcessEnv, home: string): string[
   if (!configDirectory) return [base];
   const digest = createHash('sha256').update(configDirectory.normalize('NFC'), 'utf8').digest('hex').slice(0, 8);
   const services = [`${base}-${digest}`];
-  if (secureDirectory === undefined && resolve(configDirectory) === resolve(home, '.claude')) services.push(base);
+  try {
+    if (secureDirectory === undefined && realpathSync(configDirectory) === realpathSync(resolve(home, '.claude'))) services.push(base);
+  } catch { /* An unresolved profile must not be mistaken for the default profile. */ }
   return services;
 }
 
@@ -250,7 +252,9 @@ function defaultHelperRunner(path: string, args: string[], input?: Buffer): void
   try {
     execFileSync(path, args, { input, stdio: ['pipe', 'ignore', 'ignore'], timeout: MACOS_SECURITY_TIMEOUT_MS });
   } catch (err) {
-    if ((err as { status?: unknown }).status === 3) throw Object.assign(new Error('keychain item changed'), { exitCode: 3 });
+    const status = (err as { status?: unknown }).status;
+    if (status === 3) throw Object.assign(new Error('keychain item changed'), { exitCode: 3 });
+    if (status === 4) throw Object.assign(new Error('keychain item not found'), { exitCode: 4 });
     throw new Error('keychain helper failed');
   }
 }
@@ -271,15 +275,15 @@ function defaultCswapItemReader(service: string, account: string, env: NodeJS.Pr
   } finally { output.fill(0); }
 }
 
-function writeAuthorizationConfig(dbPath: string, key: string, now: number): void {
+function writeAuthorizationConfig(dbPath: string, key: string, value: string | number): void {
   const store = openStore(dbPath);
-  try { store.setConfig(key, String(now)); } finally { store.close(); }
+  try { store.setConfig(key, String(value)); } finally { store.close(); }
 }
 
 /** Production probes and CAS writes use the same pinned helper trust boundary as normal writes. */
-function assertAuthorizationHelper(path: string, dbPath: string, dependencies: KeychainCommandDependencies): void {
-  // Injected runners cannot execute a real helper; they are test doubles only.
-  if (dependencies.helperRunner) return;
+function assertAuthorizationHelper(path: string, dbPath: string, dependencies: KeychainCommandDependencies): HelperSigningState | null {
+  // A runner-only injection cannot inspect a real helper; it is a hermetic test double.
+  if (dependencies.helperRunner && !dependencies.helperSigning && !dependencies.helperIdentityVerifier && !dependencies.helperConfigReader) return null;
   const signing = (dependencies.helperSigning ?? helperSigningState)(path);
   if (!signing || signing.authority !== 'QLB Keychain Helper') throw new Error('helper identity is not trusted');
   const configReader = dependencies.helperConfigReader ?? ((key: string) => {
@@ -290,6 +294,30 @@ function assertAuthorizationHelper(path: string, dbPath: string, dependencies: K
   if (pin && !(dependencies.helperIdentityVerifier ?? verifyHelperIdentity)(path, pin).trusted) {
     throw new Error('helper identity is not trusted');
   }
+  return signing;
+}
+
+/**
+ * Execute a verified private copy, not the pathname inspected earlier. This prevents
+ * replacing or retargeting the release helper from redirecting a later stdin payload.
+ * The private copy is verified after it is made and removed immediately after use.
+ */
+function withAuthorizedHelper<T>(
+  path: string,
+  dbPath: string,
+  dependencies: KeychainCommandDependencies,
+  action: (authorizedPath: string, signing: HelperSigningState | null) => T,
+): T {
+  if (dependencies.helperRunner) return action(path, assertAuthorizationHelper(path, dbPath, dependencies));
+  const directory = mkdtempSync(join(tmpdir(), 'qlb-authorized-helper-'));
+  const staged = join(directory, 'qlb-keychain-helper');
+  try {
+    copyFileSync(path, staged);
+    chmodSync(staged, 0o500);
+    return action(staged, assertAuthorizationHelper(staged, dbPath, dependencies));
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 }
 
 async function authorize(options: { cswap: boolean; json: boolean }, ctx: CommandContext, dependencies: KeychainCommandDependencies): Promise<number> {
@@ -297,16 +325,35 @@ async function authorize(options: { cswap: boolean; json: boolean }, ctx: Comman
   const runner = dependencies.helperRunner ?? defaultHelperRunner;
   const now = dependencies.now ?? Date.now;
   try {
-    assertAuthorizationHelper(helper, ctx.config.dbPath, dependencies);
     if (!options.cswap) {
       const account = macosKeychainAccountName(ctx.env);
-      const items = [
-        ...activeClaudeCodeServices(ctx.env, ctx.home).map((service) => ({ service, account })),
-        ...cswapItems(ctx.config.cswapSequencePath),
-      ];
-      for (const item of items) runner(helper, ['probe-read', item.service, item.account]);
+      const claudeCodeServices = activeClaudeCodeServices(ctx.env, ctx.home);
+      const cswap = cswapItems(ctx.config.cswapSequencePath);
+      let authorized = 0;
+      const signing = withAuthorizedHelper(helper, ctx.config.dbPath, dependencies, (authorizedHelper, helperSigning) => {
+        // Claude Code gives these services in try-order. Only the first existing
+        // active-profile item is required; an absent fallback is not a failure.
+        let claudeCodeAuthorized = false;
+        for (const service of claudeCodeServices) {
+          try {
+            runner(authorizedHelper, ['probe-read', service, account]);
+            claudeCodeAuthorized = true;
+            authorized += 1;
+            break;
+          } catch (err) {
+            if ((err as { exitCode?: unknown }).exitCode !== 4) throw err;
+          }
+        }
+        if (!claudeCodeAuthorized) throw new Error('Claude Code item could not be read');
+        for (const item of cswap) {
+          runner(authorizedHelper, ['probe-read', item.service, item.account]);
+          authorized += 1;
+        }
+        return helperSigning;
+      });
       writeAuthorizationConfig(ctx.config.dbPath, 'keychain.liveItemsReadAuthorizedAt', now());
-      ctx.stdout(options.json ? JSON.stringify({ command: 'authorize', authorized: items.length }) : 'Keychain live items read-authorized');
+      if (signing) writeAuthorizationConfig(ctx.config.dbPath, 'keychain.liveItemsReadAuthorizedIdentityHash', signing.identityHash);
+      ctx.stdout(options.json ? JSON.stringify({ command: 'authorize', authorized }) : 'Keychain live items read-authorized');
       return 0;
     }
 
@@ -331,7 +378,9 @@ async function authorize(options: { cswap: boolean; json: boolean }, ctx: Comman
           ctx.stderr('qlb keychain: refused: C-swap process is alive');
           return 3;
         }
-        runner(helper, ['set', '--if-sha256', digest, item.service, item.account], payload);
+        withAuthorizedHelper(helper, ctx.config.dbPath, dependencies, (authorizedHelper) => {
+          runner(authorizedHelper, ['set', '--if-sha256', digest, item.service, item.account], payload);
+        });
       } finally { payload.fill(0); }
     }
     writeAuthorizationConfig(ctx.config.dbPath, 'keychain.cswapItemsAuthorizedAt', now());

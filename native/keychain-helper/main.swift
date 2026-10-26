@@ -103,17 +103,17 @@ private func setIfSha256(_ service: String, _ account: String, _ expectedSha256:
     var result: CFTypeRef?
     let status = SecItemCopyMatching(lookup as CFDictionary, &result)
     guard status == errSecSuccess, var stored = result as? Data else {
-        // A missing or unreadable item cannot be proven unchanged.
-        fail("compare-and-swap lookup failed", status, code: 3)
+        // Only absence is a CAS conflict. A denied or unreadable item is an error.
+        fail("compare-and-swap lookup failed", status, code: status == errSecItemNotFound ? 3 : 1)
     }
     defer { stored.resetBytes(in: 0..<stored.count) }
     let actualSha256 = SHA256.hash(data: stored).map { String(format: "%02x", $0) }.joined()
     guard actualSha256 == expectedSha256 else { fail("changed", code: 3) }
-    // Include the observed bytes in the update query: if another writer wins
-    // after SecItemCopyMatching, this update matches nothing and cannot replace it.
-    var compareQuery = query(service, account)
-    compareQuery[kSecValueData] = stored
-    let updateStatus = SecItemUpdate(compareQuery as CFDictionary, [kSecValueData: data] as CFDictionary)
+    // SecItemUpdate's query accepts item class and search attributes, not
+    // kSecValueData (Apple: https://developer.apple.com/documentation/security/secitemupdate(_:_:)).
+    // Compare the current value in this helper immediately before updating; S24
+    // drains C-swap before this operation, so no external writer may interleave.
+    let updateStatus = SecItemUpdate(query(service, account) as CFDictionary, [kSecValueData: data] as CFDictionary)
     if updateStatus == errSecItemNotFound { fail("changed", code: 3) }
     guard updateStatus == errSecSuccess else { fail("compare-and-swap update failed", updateStatus) }
 }
@@ -124,7 +124,9 @@ private func probeRead(_ service: String, _ account: String) {
     lookup[kSecReturnData] = true
     var result: CFTypeRef?
     let status = SecItemCopyMatching(lookup as CFDictionary, &result)
-    guard status == errSecSuccess, var payload = result as? Data else { fail("probe read failed", status) }
+    guard status == errSecSuccess, var payload = result as? Data else {
+        fail("probe read failed", status, code: status == errSecItemNotFound ? 4 : 1)
+    }
     defer { payload.resetBytes(in: 0..<payload.count) }
 }
 

@@ -54,6 +54,46 @@ describe('keychain authorize (AC55)', () => {
     } finally { f.cleanup(); }
   });
 
+  it('records the signed helper identity with read authorization', async () => {
+    const f = fixture();
+    try {
+      const exit = await runKeychainCommand(['authorize'], f.context, {
+        helperPath: () => '/fixture/qlb-keychain-helper',
+        helperRunner: () => {},
+        helperSigning: () => ({ authority: 'QLB Keychain Helper', binaryHash: 'binary-hash', identityHash: 'identity-hash' }),
+      });
+
+      assert.equal(exit, 0);
+      const store = openStore(f.context.config.dbPath);
+      try { assert.equal(store.getConfig('keychain.liveItemsReadAuthorizedIdentityHash'), 'identity-hash'); } finally { store.close(); }
+    } finally { f.cleanup(); }
+  });
+
+  it('falls through an absent default-profile service to Claude Code’s unsuffixed fallback', async () => {
+    const f = fixture();
+    const calls: string[][] = [];
+    const configDirectory = join(f.home, '.claude');
+    mkdirSync(configDirectory);
+    f.context.env.CLAUDE_CONFIG_DIR = configDirectory;
+    const suffixed = `Claude Code-credentials-${createHash('sha256').update(configDirectory.normalize('NFC'), 'utf8').digest('hex').slice(0, 8)}`;
+    try {
+      const exit = await runKeychainCommand(['authorize'], f.context, {
+        helperPath: () => '/fixture/qlb-keychain-helper',
+        helperRunner: (_path, args) => {
+          calls.push([...args]);
+          if (args[1] === suffixed) throw Object.assign(new Error('not found'), { exitCode: 4 });
+        },
+      });
+
+      assert.equal(exit, 0);
+      assert.deepEqual(calls, [
+        ['probe-read', suffixed, 'fixture-user'],
+        ['probe-read', 'Claude Code-credentials', 'fixture-user'],
+        ['probe-read', 'claude-swap', 'account-1-one@example.test'],
+      ]);
+    } finally { f.cleanup(); }
+  });
+
   it('requires cutting-over and a drained C-swap process table before every CAS write', async () => {
     const f = fixture();
     const calls: string[][] = [];
@@ -118,10 +158,19 @@ describe('keychain authorize (AC55)', () => {
     } finally { f.cleanup(); }
   });
 
+  it('stages and verifies a helper copy before a CAS payload reaches it', () => {
+    const source = readFileSync('src/commands/keychain.ts', 'utf8');
+    assert.match(source, /function withAuthorizedHelper[\s\S]*copyFileSync\(path, staged\)[\s\S]*assertAuthorizationHelper\(staged, dbPath, dependencies\)/);
+    assert.match(source, /withAuthorizedHelper\(helper, ctx\.config\.dbPath, dependencies, \(authorizedHelper\) => \{[\s\S]*runner\(authorizedHelper, \['set', '--if-sha256'/);
+  });
+
   it('keeps probe data in the helper and makes CAS compare the stored bytes before update', () => {
     const source = readFileSync('native/keychain-helper/main.swift', 'utf8');
     assert.match(source, /private func probeRead[\s\S]*kSecReturnData[\s\S]*resetBytes[\s\S]*probe-read/);
-    assert.match(source, /private func setIfSha256[\s\S]*SHA256[\s\S]*compareQuery\[kSecValueData\][\s\S]*SecItemUpdate/);
+    const cas = source.match(/private func setIfSha256[\s\S]*?\n}\n\n\/\*\* Reads a protected item/)?.[0] ?? '';
+    assert.match(cas, /SecItemCopyMatching[\s\S]*SHA256[\s\S]*SecItemUpdate\(query\(service, account\)/);
+    assert.doesNotMatch(cas, /compareQuery|\[kSecValueData\] = stored/);
+    assert.match(cas, /developer\.apple\.com\/documentation\/security\/secitemupdate/);
     assert.match(source, /case \(5, "set"\) where args\[1\] == "--if-sha256"/);
   });
 });
