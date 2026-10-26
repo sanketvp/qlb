@@ -127,6 +127,47 @@ async function builtinKimiCoding(): Promise<Builtin> {
   return transport;
 }
 
+function abortedRequest(model: ModelLike): {
+  type: 'error';
+  reason: 'aborted';
+  error: {
+    role: 'assistant';
+    content: [];
+    api: unknown;
+    provider: typeof PROVIDER;
+    model: string;
+    usage: { input: number; output: number; cacheRead: number; cacheWrite: number; totalTokens: number; cost: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number } };
+    stopReason: 'aborted';
+    errorMessage: string;
+    timestamp: number;
+  };
+} {
+  // Match Pi's native provider convention: an aborted request is an error event
+  // with reason and stopReason both set to "aborted", not a provider outage.
+  return {
+    type: 'error',
+    reason: 'aborted',
+    error: {
+      role: 'assistant',
+      content: [],
+      api: model.api,
+      provider: PROVIDER,
+      model: model.id,
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 0,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+      stopReason: 'aborted',
+      errorMessage: 'Request was aborted',
+      timestamp: Date.now(),
+    },
+  };
+}
+
 function fallbackStream(): Stream {
   const queue: unknown[] = [];
   let closed = false;
@@ -205,17 +246,25 @@ export function registerKimiCodingProvider(
     streamSimple: (model, context, options) => {
       const output = createStream();
       void (async () => {
+        const signal = options?.signal instanceof AbortSignal ? options.signal : undefined;
         try {
           // Re-read ownership on every request. A rollback must never fall through
           // to Pi's native OAuth grant while this source remains registered.
           if (!owned()) throw new Error('owner-entry-missing');
-          const signal = options?.signal;
-          const access = await source.read(signal instanceof AbortSignal ? signal : undefined);
+          const access = await source.read(signal);
+          if (signal?.aborted) {
+            output.push(abortedRequest(model));
+            return;
+          }
           const transport = builtin ?? await builtinKimiCoding();
           for await (const event of transport(model, context, qlbRequestOptions(options, access.token))) output.push(event);
         } catch (error) {
-          const cause = error instanceof Error ? error.message : 'unknown';
-          output.push(qlbUnavailable(PROVIDER, cause, model));
+          if (signal?.aborted) {
+            output.push(abortedRequest(model));
+          } else {
+            const cause = error instanceof Error ? error.message : 'unknown';
+            output.push(qlbUnavailable(PROVIDER, cause, model));
+          }
         } finally {
           output.end();
         }

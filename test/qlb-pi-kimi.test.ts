@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
 import {
@@ -117,6 +120,61 @@ describe('qlb-pi Kimi Coding source', () => {
     assert.equal(transportCalls, 1);
     assert.equal((outputs[1]!.events[0] as { error?: { errorMessage?: string } }).error?.errorMessage, 'QLB unavailable for kimi-coding — run qlb doctor (unknown)');
     assert.equal(outputs[1]!.ended, true);
+  });
+
+  it('ends an aborted pending gate request as aborted and terminates its gate process', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-kimi-abort-'));
+    const fixture = join(dir, 'gate.js');
+    const started = join(dir, 'started');
+    const terminated = join(dir, 'terminated');
+    writeFileSync(fixture, `
+      const { writeFileSync } = require('node:fs');
+      writeFileSync(${JSON.stringify(started)}, '');
+      process.on('SIGTERM', () => {
+        writeFileSync(${JSON.stringify(terminated)}, '');
+        process.exit(0);
+      });
+      setInterval(() => {}, 1_000);
+    `);
+    const previousCli = process.env.QLB_CLI;
+    process.env.QLB_CLI = fixture;
+    try {
+      let registered: { streamSimple: (model: { id: string }, context: unknown, options?: Record<string, unknown>) => unknown } | undefined;
+      let output: { events: unknown[]; ended: boolean; push(event: unknown): void; end(): void } | undefined;
+      registerKimiCodingProvider({
+        unregisterProvider: () => undefined,
+        registerProvider: (_name, config) => { registered = config as never; },
+      }, {
+        owned: () => true,
+        createStream: () => {
+          output = { events: [] as unknown[], ended: false, push(event: unknown) { this.events.push(event); }, end() { this.ended = true; } };
+          return output;
+        },
+      });
+      assert.ok(registered);
+
+      const controller = new AbortController();
+      registered.streamSimple({ id: 'k3' }, {}, { signal: controller.signal });
+      for (let tries = 0; !existsSync(started) && tries < 50; tries += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      assert.equal(existsSync(started), true);
+      controller.abort();
+      for (let tries = 0; !existsSync(terminated) && tries < 50; tries += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+
+      assert.equal(existsSync(terminated), true);
+      assert.equal(output?.ended, true);
+      assert.equal((output?.events[0] as { reason?: string }).reason, 'aborted');
+      assert.equal((output?.events[0] as { error?: { stopReason?: string; errorMessage?: string } }).error?.stopReason, 'aborted');
+      assert.equal((output?.events[0] as { error?: { errorMessage?: string } }).error?.errorMessage, 'Request was aborted');
+      assert.equal(output?.events.some((event) => (event as { error?: { errorMessage?: string } }).error?.errorMessage?.includes('QLB unavailable')), false);
+    } finally {
+      if (previousCli === undefined) delete process.env.QLB_CLI;
+      else process.env.QLB_CLI = previousCli;
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('passes the request abort signal to the QLB gate', async () => {
