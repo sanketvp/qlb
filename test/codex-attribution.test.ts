@@ -406,6 +406,84 @@ describe('Codex live-document attribution (AC57)', () => {
     }
   });
 
+  it('does not overwrite a newer adoption committed after the caller read the split slot', async () => {
+    const h = fixture();
+    try {
+      const old = document('split-race-old');
+      const stale = document('split-race-stale');
+      const newer = document('split-race-newer');
+      const plan = importActiveCodexSlot(old, { store: h.store, keychain: h.keychain, now: () => 1 });
+      const service = qlbKeychainService('openai-codex', plan.slotId);
+      h.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(stale));
+      const raw = (h.store as unknown as { db: DatabaseSync }).db;
+      let injectNewerAdoption = true;
+      (h.store as unknown as { db: DatabaseSync }).db = new Proxy(raw, {
+        get(target, property, receiver) {
+          if (property === 'exec') return (sql: string) => {
+            if (sql === 'BEGIN IMMEDIATE' && injectNewerAdoption) {
+              injectNewerAdoption = false;
+              target.prepare('UPDATE codex_slots SET fingerprint = ?, prev_fingerprint = ? WHERE account_id = ?')
+                .run(codexFingerprint(newer), codexFingerprint(old), plan.slotId);
+              h.keychain.setSync(`${service}:prev`, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(old));
+              h.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(newer));
+            }
+            return target.exec(sql);
+          };
+          const value = Reflect.get(target, property, receiver);
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      });
+
+      const result = await attributeLiveDocument({
+        store: h.store, keychain: h.keychain,
+        slot: { accountId: plan.slotId, document: stale, fingerprint: codexFingerprint(old) }, live: old, now: () => 2,
+      });
+
+      assert.equal(result.action, 'slot-split');
+      assert.equal(h.store.getCodexSlot(plan.slotId)?.fingerprint, codexFingerprint(newer));
+      assert.equal(codexFingerprint(JSON.parse(h.keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT))), codexFingerprint(newer));
+    } finally {
+      h.store.close();
+      rmSync(h.home, { recursive: true, force: true });
+    }
+  });
+
+  it('restores a split repair when its database verification fails after the Keychain write', async () => {
+    const h = fixture();
+    try {
+      const old = document('split-repair-old');
+      const stale = document('split-repair-stale');
+      const plan = importActiveCodexSlot(old, { store: h.store, keychain: h.keychain, now: () => 1 });
+      const service = qlbKeychainService('openai-codex', plan.slotId);
+      h.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(stale));
+      const raw = (h.store as unknown as { db: DatabaseSync }).db;
+      let fingerprintReads = 0;
+      (h.store as unknown as { db: DatabaseSync }).db = new Proxy(raw, {
+        get(target, property, receiver) {
+          if (property === 'prepare') return (sql: string) => {
+            if (sql === 'SELECT fingerprint FROM codex_slots WHERE account_id = ?') {
+              fingerprintReads += 1;
+              if (fingerprintReads === 3) throw new Error('fixture repair database failure after Keychain write');
+            }
+            return target.prepare(sql);
+          };
+          const value = Reflect.get(target, property, receiver);
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      });
+
+      await assert.rejects(attributeLiveDocument({
+        store: h.store, keychain: h.keychain,
+        slot: { accountId: plan.slotId, document: stale, fingerprint: codexFingerprint(old) }, live: old, now: () => 2,
+      }), /fixture repair database failure after Keychain write/);
+      assert.equal(h.store.getCodexSlot(plan.slotId)?.fingerprint, codexFingerprint(old));
+      assert.equal(codexFingerprint(JSON.parse(h.keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT))), codexFingerprint(stale));
+    } finally {
+      h.store.close();
+      rmSync(h.home, { recursive: true, force: true });
+    }
+  });
+
   it('republishes the managed slot, without copying the older live document back, when the slot is newer', async () => {
     const h = fixture();
     try {

@@ -1695,6 +1695,78 @@ export class Store {
     }
   }
 
+  /**
+   * Reconcile a Keychain document with the fingerprint authority in
+   * `codex_slots`. The write lock spans every Keychain read, the conditional
+   * write, and the post-write DB verification. If either that verification or
+   * COMMIT fails, compensation runs before ROLLBACK and only restores the
+   * exact bytes written by this repair.
+   */
+  repairCodexSlotKeychain<T>(input: {
+    accountId: string;
+    prepare: (fingerprint: string) => { current: string; replacement: string; value: T } | undefined;
+    writeIfUnchanged: (repair: { current: string; replacement: string; value: T }) => boolean;
+    restore: (repair: { current: string; replacement: string; value: T }) => void;
+  }): { fingerprint: string | null; repaired: boolean; value?: T } {
+    this.db.exec('BEGIN IMMEDIATE');
+    let repair: { current: string; replacement: string; value: T } | undefined;
+    let wrote = false;
+    try {
+      const row = this.db.prepare('SELECT fingerprint FROM codex_slots WHERE account_id = ?')
+        .get(input.accountId) as { fingerprint: string | null } | undefined;
+      if (!row?.fingerprint) {
+        this.db.exec('COMMIT');
+        return { fingerprint: null, repaired: false };
+      }
+      const fingerprint = row.fingerprint;
+      repair = input.prepare(fingerprint);
+      if (!repair) {
+        this.db.exec('COMMIT');
+        return { fingerprint, repaired: false };
+      }
+
+      // Re-check the exact row after choosing the replacement and before its
+      // Keychain write. BEGIN IMMEDIATE prevents a cooperating adopter from
+      // changing it between these reads.
+      const beforeWrite = this.db.prepare('SELECT fingerprint FROM codex_slots WHERE account_id = ?')
+        .get(input.accountId) as { fingerprint: string | null } | undefined;
+      if (beforeWrite?.fingerprint !== fingerprint) {
+        this.db.exec('COMMIT');
+        return { fingerprint: beforeWrite?.fingerprint ?? null, repaired: false };
+      }
+
+      wrote = input.writeIfUnchanged(repair);
+      if (!wrote) {
+        this.db.exec('COMMIT');
+        return { fingerprint, repaired: false };
+      }
+
+      // This also makes a DB/commit failure after the Keychain mutation pass
+      // through the compensating path below.
+      const afterWrite = this.db.prepare('SELECT fingerprint FROM codex_slots WHERE account_id = ?')
+        .get(input.accountId) as { fingerprint: string | null } | undefined;
+      if (afterWrite?.fingerprint !== fingerprint) {
+        throw new Error('Codex slot changed during split repair');
+      }
+      this.db.exec('COMMIT');
+      return { fingerprint, repaired: true, value: repair.value };
+    } catch (error) {
+      if (wrote && repair) {
+        try {
+          input.restore(repair);
+        } catch (restoreError) {
+          if (error && typeof error === 'object') Object.assign(error, { restoreError });
+        }
+      }
+      try {
+        this.db.exec('ROLLBACK');
+      } catch {
+        // BEGIN may have failed, or SQLite already rolled back.
+      }
+      throw error;
+    }
+  }
+
   getAccount(id: string): AccountRow | null {
     const row = this.getAccountStmt.get(id) as AccountRow | undefined;
     if (!row) return null;

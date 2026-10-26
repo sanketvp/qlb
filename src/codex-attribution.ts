@@ -97,17 +97,48 @@ async function attributeSameSlot(input: AttributeLiveDocumentInput): Promise<Cod
   // both actions otherwise claim authority for bytes that are not in the slot.
   if (codexFingerprint(input.slot.document) !== slotFp) {
     const liveFp = codexFingerprint(live);
-    let recorded: CodexAuthDocument | undefined = liveFp === slotFp ? live : undefined;
-    if (!recorded) {
-      const previous = optionalKeychainValue(input.keychain, `${service}:prev`);
-      if (previous !== undefined) {
-        const parsed = parseCodexAuth(previous);
-        if (parsed.ok && codexFingerprint(parsed.doc) === slotFp) recorded = parsed.doc;
-      }
+    const repair = input.store.repairCodexSlotKeychain({
+      accountId: input.slot.accountId,
+      // Choose the replacement only after BEGIN IMMEDIATE has re-read the
+      // fingerprint that authorizes it and the Keychain document it replaces.
+      prepare: (lockedFingerprint) => {
+        let recorded: CodexAuthDocument | undefined = liveFp === lockedFingerprint ? live : undefined;
+        if (!recorded) {
+          const previous = optionalKeychainValue(input.keychain, `${service}:prev`);
+          if (previous !== undefined) {
+            const parsed = parseCodexAuth(previous);
+            if (parsed.ok && codexFingerprint(parsed.doc) === lockedFingerprint) recorded = parsed.doc;
+          }
+        }
+        if (!recorded) return undefined;
+        return {
+          current: input.keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT),
+          replacement: JSON.stringify(recorded),
+          value: recorded,
+        };
+      },
+      // A Keychain backend has no atomic CAS, so make the final possible
+      // compare-before-write while the DB write lock excludes QLB adopters.
+      writeIfUnchanged: (candidate) => {
+        if (input.keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT) !== candidate.current) return false;
+        input.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, candidate.replacement);
+        return true;
+      },
+      restore: (candidate) => {
+        if (input.keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT) === candidate.replacement) {
+          input.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, candidate.current);
+        }
+      },
+    });
+    if (!repair.repaired || !repair.value || !repair.fingerprint) {
+      return { action: 'slot-split', accountId: input.slot.accountId };
     }
-    if (!recorded) return { action: 'slot-split', accountId: input.slot.accountId };
-    input.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(recorded));
-    return attributeSameSlot({ ...input, slot: { ...input.slot, document: recorded } });
+    // Use the fingerprint re-read under the transaction, not the caller's
+    // pre-lock snapshot, for the follow-up attribution decision.
+    return attributeSameSlot({
+      ...input,
+      slot: { ...input.slot, document: repair.value, fingerprint: repair.fingerprint },
+    });
   }
 
   const now = (input.now ?? Date.now)();
