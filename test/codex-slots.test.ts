@@ -15,6 +15,7 @@ import {
   qlbKeychainService,
 } from '../src/keychain';
 import { CodexSlots, importActiveCodexSlot, planImportActiveCodex } from '../src/codex-slots';
+import { snapshotsFromStore } from '../src/resolve';
 import { openStore } from '../src/store';
 
 function jwt(payload: Record<string, unknown>): string {
@@ -71,7 +72,7 @@ function dbRows(path: string): { slot: Record<string, unknown> | undefined; acco
   try {
     return {
       slot: plain(db.prepare('SELECT account_id, chatgpt_user_id, chatgpt_account_id, source FROM codex_slots').get() as Record<string, unknown> | undefined),
-      account: plain(db.prepare("SELECT id, provider, status FROM accounts WHERE id = 'fixture-user:fixture-account'").get() as Record<string, unknown> | undefined),
+      account: plain(db.prepare("SELECT id, provider, status FROM accounts WHERE id = 'fixture-account'").get() as Record<string, unknown> | undefined),
       active: plain(db.prepare("SELECT provider, account_id, set_by FROM active_login WHERE provider = 'openai-codex'").get() as Record<string, unknown> | undefined),
       lineage: plain(db.prepare("SELECT provider, account_id, cause, by, evidence FROM lineage_log WHERE provider = 'openai-codex'").get() as Record<string, unknown> | undefined),
       baseline: (db.prepare("SELECT value FROM config WHERE key = 'pi.openai-codex.baselineConsumedBy'").get() as { value?: string } | undefined)?.value,
@@ -102,7 +103,9 @@ describe('Codex slots and import-active', () => {
   it('imports the whole document, account rows, active identity, lineage, and a matching Pi baseline', () => {
     const h = fixture();
     try {
-      h.store.upsertAccount('codex-default', 'openai-codex', 'legacy synthetic account', 'active');
+      // This is the adapter's existing bare-id row. Import must link the S29
+      // slot to it, not create a composite accounts row that resolve can pick.
+      h.store.upsertAccount('fixture-account', 'openai-codex', 'adapter-owned label', 'active');
       const result = importActiveCodexSlot(parsedDocument(), {
         store: h.store,
         keychain: h.keychain,
@@ -113,14 +116,15 @@ describe('Codex slots and import-active', () => {
       assert.doesNotThrow(() => h.keychain.getSync(qlbKeychainService('openai-codex', result.slotId), QLB_KEYCHAIN_ACCOUNT));
       assert.deepEqual(dbRows(h.store.dbPath), {
         slot: { account_id: 'fixture-user:fixture-account', chatgpt_user_id: 'fixture-user', chatgpt_account_id: 'fixture-account', source: 'import-active' },
-        account: { id: 'fixture-user:fixture-account', provider: 'openai-codex', status: 'active' },
+        account: { id: 'fixture-account', provider: 'openai-codex', status: 'active' },
         active: { provider: 'openai-codex', account_id: 'fixture-user:fixture-account', set_by: 'import' },
         lineage: { provider: 'openai-codex', account_id: 'fixture-user:fixture-account', cause: 'import', by: 'qlb-cli', evidence: 'import' },
         baseline: 'fixture-user:fixture-account',
       });
       const db = new DatabaseSync(h.store.dbPath, { readOnly: true });
       try {
-        assert.equal(db.prepare("SELECT 1 FROM accounts WHERE id = 'codex-default'").get(), undefined);
+        assert.equal((db.prepare("SELECT count(*) AS count FROM accounts WHERE provider = 'openai-codex'").get() as { count: number }).count, 1);
+        assert.deepEqual(snapshotsFromStore(h.store, 'openai-codex').map((snapshot) => snapshot.accountId), ['fixture-account']);
       } finally {
         db.close();
       }
@@ -182,6 +186,27 @@ describe('Codex slots and import-active', () => {
     assert.equal(keychain.gets, 4);
   });
 
+  it('does not arm the shared read backoff when an optional predecessor is absent', () => {
+    const keychain = new CountingKeychain();
+    const plan = planImportActiveCodex(parsedDocument());
+    keychain.setSync(qlbKeychainService('openai-codex', plan.slotId), QLB_KEYCHAIN_ACCOUNT, JSON.stringify(parsedDocument()));
+    const slots = new CodexSlots({ keychain });
+
+    assert.throws(() => slots.readPrevious(plan.slotId), /item not found/);
+    assert.doesNotThrow(() => slots.readSlot(plan.slotId));
+  });
+
+  it('does not expose its cache-fill document for caller mutation', () => {
+    const keychain = new MockKeychain();
+    const plan = planImportActiveCodex(parsedDocument());
+    keychain.setSync(qlbKeychainService('openai-codex', plan.slotId), QLB_KEYCHAIN_ACCOUNT, JSON.stringify(parsedDocument('original-refresh')));
+    const slots = new CodexSlots({ keychain });
+
+    const first = slots.readSlot(plan.slotId);
+    first.document.tokens.refresh_token = 'mutated-fixture-refresh';
+    assert.equal(slots.readSlot(plan.slotId).document.tokens.refresh_token, 'original-refresh');
+  });
+
   it('stores unclaimed native documents and restores the saved predecessor', () => {
     const keychain = new MockKeychain();
     const plan = planImportActiveCodex(parsedDocument());
@@ -193,13 +218,26 @@ describe('Codex slots and import-active', () => {
     keychain.setSync(`${service}:prev`, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(first));
     const slots = new CodexSlots({ keychain });
 
-    assert.equal(slots.readUnclaimed(slots.stashUnclaimed('fixture-time', unclaimed)).fingerprint, codexFingerprint(unclaimed));
-    const restored = slots.restoreUnclaimed('fixture-time', (document) => {
+    assert.equal(slots.readUnclaimed(slots.stashUnclaimed('fixture-time', unclaimed, codexFingerprint(second))).fingerprint, codexFingerprint(unclaimed));
+    const restored = slots.restoreUnclaimed('fixture-time', codexFingerprint(second), (document) => {
       keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(document));
     });
     assert.equal(restored.fingerprint, slots.readSlot(plan.slotId, { fresh: true }).fingerprint);
     assert.throws(() => slots.readUnclaimed('fixture-time', { fresh: true }), /item not found/);
     assert.equal(slots.readPrevious(plan.slotId, { fresh: true }).fingerprint, codexFingerprint(first));
+  });
+
+  it('refuses an unclaimed restore when its consumed lineage is absent or mismatched', () => {
+    const keychain = new MockKeychain();
+    const slots = new CodexSlots({ keychain });
+    const current = parsedDocument('current-refresh');
+    const unclaimed = parsedDocument('unclaimed-refresh');
+
+    keychain.setSync(qlbKeychainService('openai-codex', 'unclaimed:legacy'), QLB_KEYCHAIN_ACCOUNT, JSON.stringify(unclaimed));
+    assert.throws(() => slots.restoreUnclaimed('legacy', codexFingerprint(current), () => {}), /unclaimed lineage mismatch/);
+
+    slots.stashUnclaimed('mismatched', unclaimed, codexFingerprint(parsedDocument('other-refresh')));
+    assert.throws(() => slots.restoreUnclaimed('mismatched', codexFingerprint(current), () => {}), /unclaimed lineage mismatch/);
   });
 
   it('unarchives an active re-import while preserving same-lineage death evidence and slot source', () => {

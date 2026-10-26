@@ -1,6 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
 
 import { codexFingerprint, codexIdentity, parseCodexAuth, type CodexAuthDocument } from './codex-auth';
+import { isCredentialNotFound } from './credential-backends';
 import {
   KeychainReadBackoff,
   QLB_KEYCHAIN_ACCOUNT,
@@ -22,6 +23,15 @@ const DISPLAY_CACHE_TTL_MS = 60_000;
 export interface ReadCodexSlot {
   document: CodexAuthDocument;
   fingerprint: string;
+}
+
+export interface ReadUnclaimedCodexSlot extends ReadCodexSlot {
+  consumedFp?: string;
+}
+
+interface UnclaimedRecord {
+  credential: CodexAuthDocument;
+  consumedFp?: string;
 }
 
 export interface ReadCodexSlotOptions {
@@ -58,7 +68,11 @@ export class CodexSlots {
     if (!fresh && cached && cached.expiresAt > now) return this.copy(cached);
 
     const result = this.readService(this.slotService(accountId), fresh);
-    if (!fresh) this.cache.set(accountId, { ...result, expiresAt: now + DISPLAY_CACHE_TTL_MS });
+    if (!fresh) {
+      const cachedResult = this.copy(result);
+      this.cache.set(accountId, { ...cachedResult, expiresAt: now + DISPLAY_CACHE_TTL_MS });
+      return this.copy(cachedResult);
+    }
     return result;
   }
 
@@ -68,22 +82,34 @@ export class CodexSlots {
   }
 
   /** S36-shaped safety copy for a native document that cannot be attributed to a managed slot. */
-  stashUnclaimed(timestamp: string, document: CodexAuthDocument): string {
-    this.options.keychain.setSync(this.unclaimedService(timestamp), QLB_KEYCHAIN_ACCOUNT, JSON.stringify(document));
+  stashUnclaimed(timestamp: string, document: CodexAuthDocument, consumedFp: string): string {
+    if (!consumedFp) throw new Error('unclaimed consumed lineage is required');
+    this.options.keychain.setSync(
+      this.unclaimedService(timestamp),
+      QLB_KEYCHAIN_ACCOUNT,
+      JSON.stringify({ credential: document, consumedFp }),
+    );
     return timestamp;
   }
 
-  readUnclaimed(timestamp: string, options: ReadCodexSlotOptions = {}): ReadCodexSlot {
-    return this.readService(this.unclaimedService(timestamp), options.fresh === true);
+  readUnclaimed(timestamp: string, options: ReadCodexSlotOptions = {}): ReadUnclaimedCodexSlot {
+    const record = parseUnclaimed(this.readText(this.unclaimedService(timestamp), options.fresh === true));
+    return { document: record.credential, fingerprint: codexFingerprint(record.credential), consumedFp: record.consumedFp };
   }
 
   /**
-   * Restores an unclaimed document only through the caller's slot transaction,
-   * then deletes the stash. This prevents a Keychain-only restoration from
-   * diverging from `codex_slots` metadata.
+   * Restores an S36 stash only through the caller's slot transaction and only
+   * if it was consumed from that slot's current lineage.
    */
-  restoreUnclaimed(timestamp: string, restore: (document: CodexAuthDocument) => void): ReadCodexSlot {
+  restoreUnclaimed(
+    timestamp: string,
+    currentFingerprint: string,
+    restore: (document: CodexAuthDocument) => void,
+  ): ReadUnclaimedCodexSlot {
     const unclaimed = this.readUnclaimed(timestamp, { fresh: true });
+    if (!unclaimed.consumedFp || unclaimed.consumedFp !== currentFingerprint) {
+      throw new Error('unclaimed lineage mismatch');
+    }
     restore(unclaimed.document);
     this.options.keychain.deleteSync(this.unclaimedService(timestamp), QLB_KEYCHAIN_ACCOUNT);
     this.cache.clear();
@@ -91,13 +117,23 @@ export class CodexSlots {
   }
 
   private readService(service: string, fresh: boolean): ReadCodexSlot {
-    const text = this.backoff.read(
-      () => this.options.keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT),
-      { fresh },
-    );
+    const text = this.readText(service, fresh);
     const parsed = parseCodexAuth(text);
     if (!parsed.ok) throw new Error('stored Codex document is malformed');
     return { document: parsed.doc, fingerprint: codexFingerprint(parsed.doc) };
+  }
+
+  private readText(service: string, fresh: boolean): string {
+    this.backoff.read(() => undefined, { fresh });
+    try {
+      return this.options.keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT);
+    } catch (error) {
+      // A missing optional :prev/stash is an ordinary absence, not a Keychain outage.
+      if (!isCredentialNotFound(error)) {
+        try { this.backoff.read(() => { throw error; }, { fresh: true }); } catch { /* rethrow original below */ }
+      }
+      throw error;
+    }
   }
 
   private copy(slot: ReadCodexSlot): ReadCodexSlot {
@@ -138,6 +174,27 @@ export interface ImportActiveCodexDeps {
 interface ExistingSlot {
   fingerprint: string | null;
   prev_fingerprint: string | null;
+}
+
+function parseUnclaimed(text: string): UnclaimedRecord {
+  let value: unknown;
+  try { value = JSON.parse(text); } catch { throw new Error('unclaimed stash is malformed'); }
+  const record = object(value);
+  // Pre-S36 stashes were the document itself. They remain readable only so
+  // restoreUnclaimed can reject them for their absent lineage rather than
+  // mistaking an upgrade for Keychain corruption.
+  const credential = record?.credential ?? value;
+  if (!credential || typeof credential !== 'object' || Array.isArray(credential)) {
+    throw new Error('unclaimed stash is malformed');
+  }
+  const parsed = parseCodexAuth(JSON.stringify(credential));
+  if (!parsed.ok) throw new Error('unclaimed stash is malformed');
+  if (record?.consumedFp != null && typeof record.consumedFp !== 'string') {
+    throw new Error('unclaimed stash is malformed');
+  }
+  return record?.consumedFp
+    ? { credential: parsed.doc, consumedFp: record.consumedFp }
+    : { credential: parsed.doc };
 }
 
 function object(value: unknown): JsonObject | null {
@@ -256,8 +313,8 @@ export function importActiveCodexSlot(doc: CodexAuthDocument, deps: ImportActive
       );
       db.prepare(`INSERT INTO accounts (id, provider, label, status, created_at)
         VALUES (?, ?, ?, 'active', ?)
-        ON CONFLICT(id) DO UPDATE SET provider = excluded.provider, label = excluded.label, status = excluded.status`)
-        .run(plan.slotId, PROVIDER, plan.slotId, timestamp);
+        ON CONFLICT(id) DO UPDATE SET provider = excluded.provider`)
+        .run(plan.accountId, PROVIDER, plan.accountId, timestamp);
       db.prepare(`INSERT INTO active_login (provider, account_id, since, set_by) VALUES (?, ?, ?, 'import')
         ON CONFLICT(provider) DO UPDATE SET account_id = excluded.account_id, since = excluded.since, set_by = excluded.set_by`)
         .run(PROVIDER, plan.slotId, timestamp);
