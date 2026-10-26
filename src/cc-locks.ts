@@ -325,13 +325,14 @@ export async function withClaudeConfigLock<T>(
   options: ClaudeLockOptions = {},
   fn: (held: HeldClaudeConfigLock) => Promise<T> | T,
 ): Promise<T> {
-  return withProperLockfile(claudeLockPaths(options).configLockDir, {
+  const paths = claudeLockPaths(options);
+  return withProperLockfile(paths.configLockDir, {
     ...options,
     stalenessMs: CONFIG_STALENESS_MS,
   }, async () => {
     const held = { [configLockHandle]: true } as HeldClaudeConfigLock;
     activeConfigLockHandles.add(held);
-    activeConfigLockPaths.set(held, claudeLockPaths(options));
+    activeConfigLockPaths.set(held, paths);
     try {
       return await fn(held);
     } finally {

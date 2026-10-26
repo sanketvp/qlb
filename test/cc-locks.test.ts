@@ -1,17 +1,20 @@
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
-import { chmod, mkdtemp, mkdir, readdir, rm, stat, utimes, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, mkdir, readFile, readdir, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { describe, it } from 'node:test';
 import {
+  assertClaudeConfigLockHeld,
   ClaudeCodeLockTimeout,
+  ClaudeConfigLockRequired,
   claudeLockPaths,
   withClaudeConfigLock,
   withClaudeCredentialLocks,
   withProperLockfile,
 } from '../src/cc-locks';
+import { spliceOauthAccount } from '../src/cc-credentials';
 
 const PYTHON = 'python3';
 const PYTHON_REQUIREMENT = 'vendored claude-swap v0.28.0 requires Python 3.12 or newer';
@@ -451,6 +454,42 @@ describe('Claude Code proper-lockfile locks', () => {
       const paths = claudeLockPaths({ home, env: {} });
       await assert.rejects(withClaudeConfigLock({ home, env: {} }, async () => { throw new Error('stop'); }), /stop/);
       assert.equal(existsSync(paths.configLockDir), false);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it('records the config lock actually acquired when the layout flips while waiting', async () => {
+    const home = await tempHome();
+    const configDir = join(home, 'profile');
+    const globalConfig = join(configDir, '.claude.json');
+    const legacyConfig = join(configDir, '.config.json');
+    const globalLock = `${globalConfig}.lock`;
+    const originalConfig = '{"preserved":true}\n';
+    try {
+      await mkdir(configDir, { recursive: true });
+      await writeFile(globalConfig, originalConfig);
+      await mkdir(globalLock);
+
+      const waiter = withClaudeConfigLock(
+        { configDir, env: {}, timeoutMs: 1_000, retryMinMs: 5, retryJitterMs: 0 },
+        async (held) => {
+          assert.equal(existsSync(globalLock), true, 'the waiter holds the global lock selected before waiting');
+          assert.equal(existsSync(`${legacyConfig}.lock`), false, 'the legacy lock was never acquired');
+          await assert.rejects(
+            spliceOauthAccount(globalConfig, { replacement: true }, held),
+            ClaudeConfigLockRequired,
+          );
+          assert.equal(await readFile(globalConfig, 'utf8'), originalConfig, 'a differently guarded config is not written');
+
+          await rm(legacyConfig);
+          assert.doesNotThrow(() => assertClaudeConfigLockHeld(held, { configDir, env: {} }));
+        },
+      );
+
+      await writeFile(legacyConfig, '{"legacy":true}\n');
+      await rm(globalLock, { recursive: true });
+      await waiter;
     } finally {
       await rm(home, { recursive: true, force: true });
     }
