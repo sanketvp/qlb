@@ -121,21 +121,26 @@ export function classify(
 
   const reports: PoolInventoryEntryReport[] = [];
   const targets: PiExportTarget[] = [];
+  const slotTargets = new Map<string, string>();
   for (const [target, value] of targetEntries) {
-    const source = value.shared[0];
-    if (source && value.shared.some((candidate) => (
-      candidate.slotAccountId !== source.slotAccountId || candidate.lineageFp !== source.lineageFp
-    ))) {
-      // A target can be restored only once. This includes two members of one
-      // slot chain: recording either would erase evidence of the other.
-      fail('duplicate-slot-account-id');
+    // A pool target can hold several generations of one slot's chain (its
+    // current grant plus LKG predecessors). That is one unambiguous undo
+    // target. Different slot identities remain a fail-closed conflict.
+    const matchesBySlot = new Map<string, SourceLineage>();
+    for (const source of value.shared) {
+      if (!matchesBySlot.has(source.slotAccountId)) matchesBySlot.set(source.slotAccountId, source);
     }
+    if (matchesBySlot.size > 1) fail('duplicate-slot-account-id');
+    const source = matchesBySlot.values().next().value as SourceLineage | undefined;
     reports.push({
       target,
       lineageShared: source !== undefined,
       expiresInMs: value.expiresAt == null ? null : Math.max(0, value.expiresAt - now),
     });
     if (source) {
+      const priorTarget = slotTargets.get(source.slotAccountId);
+      if (priorTarget !== undefined && priorTarget !== target) fail('slot-maps-to-multiple-targets');
+      slotTargets.set(source.slotAccountId, target);
       targets.push({
         provider: 'anthropic', target, slotAccountId: source.slotAccountId,
         lineageFp: source.lineageFp, recordedAt: now,

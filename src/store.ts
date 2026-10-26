@@ -74,6 +74,12 @@ export interface PiExportTargetRow {
   recordedAt: number;
 }
 
+/** Atomic admission/insert result for the add-only Pi export inventory write. */
+export interface PiExportTargetRecordResult {
+  ok: boolean;
+  code?: string;
+}
+
 /** Credential-migration journal (§4.8.3). One row per native store. */
 export interface MigrationRow {
   store: string;
@@ -2087,6 +2093,32 @@ export class Store {
         if (target.provider !== provider) throw new Error('pi export target provider mismatch');
         insert.run(target.provider, target.target, target.slotAccountId, target.lineageFp, target.recordedAt);
       }
+    });
+  }
+
+  /**
+   * Add an observed target set only when no provider rows exist. The caller's
+   * lifecycle admission runs on this transaction's connection, so neither it
+   * nor the empty-table check can race the durable insert.
+   */
+  recordPiExportTargetsIfEmpty(
+    provider: string,
+    targets: PiExportTargetRow[],
+    admit: (db: DatabaseSync) => PiExportTargetRecordResult,
+  ): PiExportTargetRecordResult {
+    return this.runImmediate(() => {
+      const admission = admit(this.db);
+      if (!admission.ok) return admission;
+      if (this.db.prepare('SELECT 1 FROM pi_export_targets WHERE provider = ? LIMIT 1').get(provider)) {
+        return { ok: false, code: 'pi-export-targets-exist' };
+      }
+      const insert = this.db.prepare(`INSERT INTO pi_export_targets
+        (provider, target, slot_account_id, lineage_fp, recorded_at) VALUES (?, ?, ?, ?, ?)`);
+      for (const target of targets) {
+        if (target.provider !== provider) throw new Error('pi export target provider mismatch');
+        insert.run(target.provider, target.target, target.slotAccountId, target.lineageFp, target.recordedAt);
+      }
+      return { ok: true };
     });
   }
 

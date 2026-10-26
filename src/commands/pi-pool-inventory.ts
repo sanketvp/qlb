@@ -1,16 +1,17 @@
 import { readFileSync } from 'node:fs';
+import type { DatabaseSync } from 'node:sqlite';
 import { platformKeychain } from '../keychain';
 import {
   classify,
   readCswapInventoryLineages,
   readPoolInventoryEntries,
-  recordPoolInventoryForPiMigrate,
   slotInventoryLineages,
   type PoolInventoryEntry,
+  type PiExportTarget,
   type PoolInventoryStore,
   type SourceLineage,
 } from '../pool-inventory';
-import { assertAdmitted } from '../lifecycle';
+import { assertAdmittedInConnection } from '../lifecycle';
 import { openStore, type PiExportTargetRow, type Store } from '../store';
 import type { CommandContext, CommandDefinition } from '../registry';
 
@@ -18,6 +19,11 @@ export interface PoolInventoryCommandStore extends PoolInventoryStore {
   close(): void;
   listPiExportTargets(provider: string): PiExportTargetRow[];
   listAnthropicSlotLineageChains(): Array<{ accountId: string; lineages: string[] }>;
+  recordPiExportTargetsIfEmpty(
+    provider: string,
+    targets: PiExportTarget[],
+    admit: (db: DatabaseSync) => { ok: boolean; code?: string },
+  ): { ok: boolean; code?: string };
 }
 
 export interface PiPoolInventoryCommandDeps {
@@ -25,8 +31,8 @@ export interface PiPoolInventoryCommandDeps {
   loadEntries(path: string): PoolInventoryEntry[];
   loadCswapLineages(sequencePath: string): SourceLineage[];
   loadSlotLineages(store: PoolInventoryCommandStore): SourceLineage[];
-  /** Writing uses pi-migrate's lifecycle admission until it is called in-process by migration. */
-  admitRecord(store: PoolInventoryCommandStore): { ok: boolean; code?: string };
+  /** Writing uses pi-migrate's lifecycle admission on the writer transaction. */
+  admitRecord(db: DatabaseSync): { ok: boolean; code?: string };
   now(): number;
 }
 
@@ -35,7 +41,7 @@ const defaultDeps: PiPoolInventoryCommandDeps = {
   loadEntries: (path) => readPoolInventoryEntries(path, readFileSync),
   loadCswapLineages: (path) => readCswapInventoryLineages(path, platformKeychain, readFileSync),
   loadSlotLineages: (store) => slotInventoryLineages(store as Pick<Store, 'listAnthropicSlotLineageChains'>),
-  admitRecord: (store) => assertAdmitted(store as unknown as Store, 'pi-migrate'),
+  admitRecord: (db) => assertAdmittedInConnection(db, 'pi-migrate'),
   now: Date.now,
 };
 
@@ -99,18 +105,14 @@ export function runPiPoolInventoryCommand(
     const lineages = deps.loadSlotLineages(store);
     const result = classify(entries, lineages, deps.now());
     if (options.record) {
-      const admission = deps.admitRecord(store);
-      if (!admission.ok) {
-        ctx.stderr(`qlb pi pool-inventory: refused: ${admission.code ?? 'lifecycle-refused'}`);
+      // Admission, the no-overwrite guard, and insertion are one BEGIN
+      // IMMEDIATE transaction. This path is add-only and never replaces a
+      // migration's durable inventory fact.
+      const recorded = store.recordPiExportTargetsIfEmpty('anthropic', result.targets, deps.admitRecord);
+      if (!recorded.ok) {
+        ctx.stderr(`qlb pi pool-inventory: refused: ${recorded.code ?? 'inventory-record-refused'}`);
         return 3;
       }
-      // An operator-facing command never overwrites migrate's durable fact.
-      // The dedicated migration helper above is the only replacement path.
-      if (store.listPiExportTargets('anthropic').length !== 0) {
-        ctx.stderr('qlb pi pool-inventory: inventory unavailable');
-        return 1;
-      }
-      recordPoolInventoryForPiMigrate({ entries, lineages, store, now: deps.now });
     }
     const output = { against: options.against, entries: result.entries };
     if (options.json) ctx.stdout(JSON.stringify(output));
