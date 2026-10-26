@@ -1,5 +1,4 @@
 import { readFile } from 'node:fs/promises';
-import { codexIdentity, type CodexAuthDocument } from '../codex-auth';
 import { config } from '../config';
 import { getStore } from '../store';
 import type { Adapter } from '../types';
@@ -74,23 +73,12 @@ export const codexAdapter: Adapter = {
       const idToken = auth.tokens.id_token;
       const payload = typeof idToken === 'string' ? parseJwtPayload(idToken) : undefined;
 
-      // Keep the adapter's row keyed by the same S29 composite identity as
-      // codex_slots, rather than the legacy bare ChatGPT account id.
-      const accountId = codexIdentity(auth as CodexAuthDocument) ?? 'codex-default';
-      const legacyAccountId = stringClaim(payload, 'chatgpt_account_id');
+      const accountId = stringClaim(payload, 'chatgpt_account_id') ?? 'codex-default';
       const label = stringClaim(payload, 'email') ?? 'codex-default';
       // Phase 0/1: no free usage GET and probes are off. Persist the account
       // row so resolve can see it; buckets stay empty (unknown) until organic
       // headers or an explicit probe land in a later phase.
-      const store = getStore();
-      store.upsertAccount(accountId, 'openai-codex', label);
-      // Rows from the pre-S29 adapter used the bare ChatGPT account id. Once
-      // the composite identity is established, retire only that Codex row so
-      // repeated adapter upserts cannot shadow the managed slot.
-      if (accountId !== 'codex-default' && legacyAccountId && legacyAccountId !== accountId
-        && store.getAccount(legacyAccountId)?.provider === 'openai-codex') {
-        store.deleteAccountCascade(legacyAccountId);
-      }
+      getStore().upsertAccount(accountId, 'openai-codex', label);
       return [{
         accountId,
         provider: 'openai-codex',
