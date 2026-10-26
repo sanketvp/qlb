@@ -254,6 +254,7 @@ describe('qlb gate core (S30/S54)', () => {
     const result = await runPiGate('xai', {
       dbPath: fixtureDb(), env: { QLB_PI_TOKEN_CALL: '1' }, deliver: (value) => stdout.push(value), stderr: (line) => stderr.push(line),
       guard: () => true, admitted: () => ({ ok: true }), prerequisites: () => undefined,
+      loadGate: () => { throw Object.assign(new Error('Cannot find module'), { code: 'MODULE_NOT_FOUND' }); },
     });
     assert.equal(result, 3);
     assert.deepEqual(stdout, []);

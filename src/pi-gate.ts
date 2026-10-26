@@ -46,6 +46,8 @@ export interface PiGateDeps {
   /** Test seam; command dispatch performs production lifecycle admission. */
   admitted?: () => { ok: boolean; code?: string };
   provider?: ProviderGate;
+  /** Test seam for module discovery; defaults to `loadGate`. */
+  loadGate?: (provider: PiGateProvider) => unknown;
   prerequisites?: (provider: PiGateProvider, db: DatabaseSync) => void | Promise<void>;
   open?: (dbPath: string) => DatabaseSync;
   sqlTrace?: (sql: string) => void;
@@ -154,10 +156,10 @@ function isLifecycleRefusal(code: string): boolean {
     || /^phase=(?:pre-cutover|undoing|rolled-back|aborted)$/.test(code);
 }
 
-function loadedProvider(provider: PiGateProvider): ProviderGate {
+function loadedProvider(provider: PiGateProvider, load: (provider: PiGateProvider) => unknown = loadGate): ProviderGate {
   let loaded: unknown;
   try {
-    loaded = loadGate(provider);
+    loaded = load(provider);
   } catch (error) {
     if ((error as NodeJS.ErrnoException | undefined)?.code === 'MODULE_NOT_FOUND') {
       throw new GateFailure('missing-provider-gate');
@@ -221,7 +223,7 @@ export async function runPiGate(providerName: string, deps: PiGateDeps): Promise
     }
 
     await (deps.prerequisites ?? ((name, connection) => defaultPrerequisites(name, connection, deps.dbPath, deps.piAgentDir)))(providerName, db);
-    const gate = deps.provider ?? loadedProvider(providerName);
+    const gate = deps.provider ?? loadedProvider(providerName, deps.loadGate);
     await gate.prerequisites?.();
     const credential = await gate.read();
     if (!credential || typeof credential.token !== 'string' || !credential.token ||
