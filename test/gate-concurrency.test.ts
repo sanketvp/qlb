@@ -5,12 +5,14 @@ import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
 import { runPiGate } from '../src/pi-gate';
+import { beginCutover } from '../src/lifecycle';
 import { openStore, openStoreConnection } from '../src/store';
 
 describe('qlb gate evidence concurrency (S54)', () => {
   it('uses the store busy timeout and records both concurrent calls without SQLITE_BUSY', async () => {
     const dbPath = join(mkdtempSync(join(tmpdir(), 'qlb-gate-concurrency-')), 'qlb.db');
     const store = openStore(dbPath);
+    beginCutover(store);
     store.close();
     const gate = (provider: 'xai' | 'kimi-coding') => runPiGate(provider, {
       dbPath,

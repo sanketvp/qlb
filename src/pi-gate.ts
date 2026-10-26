@@ -5,6 +5,7 @@ import type { DatabaseSync } from 'node:sqlite';
 
 import { tokenCallAllowed } from './commands/token';
 import { loadGate } from './gate';
+import { assertAdmittedInConnection } from './lifecycle';
 import { isPiPlaceholder, isPiQlbOwnerEntry } from './pi-migrate';
 import { openStoreConnection } from './store';
 
@@ -71,39 +72,68 @@ function parsedObject(path: string, code: string): Record<string, unknown> {
   }
 }
 
-function legacyAnthropicOwner(owner: Record<string, unknown>): boolean {
+type OwnerFormat = 'v1' | 'v2';
+
+function legacyOwnerEntry(owner: Record<string, unknown>, provider: PiGateProvider): boolean {
   if (owner.owner !== 'qlb' || !Array.isArray(owner.accounts)) return false;
   return owner.accounts.some((account) => !!account && typeof account === 'object' && !Array.isArray(account)
-    && (account as Record<string, unknown>).provider === 'anthropic');
+    && (account as Record<string, unknown>).provider === provider);
+}
+
+/** Returns every writer format in this file that claims this provider. */
+function ownerFormats(path: string, provider: PiGateProvider): OwnerFormat[] {
+  const owner = parsedObject(path, 'owner-file-malformed');
+  const formats: OwnerFormat[] = [];
+  let recognized = false;
+  if ('providers' in owner) {
+    recognized = true;
+    const providers = owner.providers;
+    if (!providers || typeof providers !== 'object' || Array.isArray(providers)) {
+      throw new GateFailure('owner-file-malformed');
+    }
+    if (isPiQlbOwnerEntry((providers as Record<string, unknown>)[provider])) formats.push('v2');
+  }
+  if ('owner' in owner || 'accounts' in owner) {
+    recognized = true;
+    if (typeof owner.owner !== 'string' || !Array.isArray(owner.accounts)) {
+      throw new GateFailure('owner-file-malformed');
+    }
+    if (legacyOwnerEntry(owner, provider)) formats.push('v1');
+  }
+  if (!recognized) throw new GateFailure('owner-file-malformed');
+  return formats;
+}
+
+function isShadowRetainedEntry(entry: unknown): boolean {
+  return !!entry && typeof entry === 'object' && !Array.isArray(entry)
+    && typeof (entry as Record<string, unknown>).access === 'string'
+    && typeof (entry as Record<string, unknown>).refresh === 'string';
 }
 
 function defaultPrerequisites(provider: PiGateProvider, db: DatabaseSync, dbPath: string, piAgentDir?: string): void {
-  const state = db.prepare('SELECT value FROM config WHERE key = ?').get(`pi.${provider}.state`) as { value?: unknown } | undefined;
-  if (state?.value === 'not-applicable') throw new GateFailure('provider-not-applicable');
-
   const agentDir = piAgentDir ?? join(dirname(dbPath), '..', '.pi', 'agent');
-  const ownerPath = join(agentDir, 'qlb-owner.json');
-  if (!existsSync(ownerPath)) throw new GateFailure('owner-entry-missing');
-  const owner = parsedObject(ownerPath, 'owner-file-malformed');
-  if (provider === 'anthropic') {
-    // The current Anthropic writer is Migration's legacy OwnerFile. Its
-    // account metadata is the provider ownership record; it writes no Pi
-    // auth.json placeholder, unlike the P7a single-provider writer.
-    if (!legacyAnthropicOwner(owner)) throw new GateFailure('owner-entry-missing');
-    if (existsSync(join(agentDir, 'extensions', 'anthropic-pool'))) {
-      throw new GateFailure('anthropic-pool-present');
-    }
-    return;
-  }
-
-  const providers = owner.providers;
-  if (!providers || typeof providers !== 'object' || Array.isArray(providers)) throw new GateFailure('owner-file-malformed');
-  if (!isPiQlbOwnerEntry((providers as Record<string, unknown>)[provider])) {
+  const ownerPaths = [
+    join(agentDir, 'qlb-owner.json'),
+    join(agentDir, `qlb-owner-${provider}.json`),
+  ];
+  const formats = ownerPaths.flatMap((path) => existsSync(path) ? ownerFormats(path, provider) : []);
+  const state = db.prepare('SELECT value FROM config WHERE key = ?').get(`pi.${provider}.state`) as { value?: unknown } | undefined;
+  if (formats.length === 0) {
+    if (state?.value === 'not-applicable') throw new GateFailure('provider-not-applicable');
     throw new GateFailure('owner-entry-missing');
   }
-  if (provider === 'openrouter') return;
+
+  if (provider === 'anthropic' && existsSync(join(agentDir, 'extensions', 'anthropic-pool'))) {
+    throw new GateFailure('anthropic-pool-present');
+  }
+  // Migration's v1 Anthropic writer owns the pool only; it has no auth.json
+  // entry to replace. Static-key OpenRouter has no auth.json entry either.
+  if (provider === 'openrouter' || (provider === 'anthropic' && formats.includes('v1'))) return;
+
   const auth = parsedObject(join(agentDir, 'auth.json'), 'placeholder-missing');
-  if (!isPiPlaceholder(auth[provider])) throw new GateFailure('placeholder-missing');
+  if (formats.includes('v2') && isPiPlaceholder(auth[provider])) return;
+  if (formats.includes('v1') && isShadowRetainedEntry(auth[provider])) return;
+  throw new GateFailure('placeholder-missing');
 }
 
 const SAFE_FAILURE_CODES = new Set([
@@ -117,6 +147,11 @@ function failureCode(error: unknown): string {
   return SAFE_FAILURE_CODES.has(value) || /^phase=(?:pre-cutover|undoing|rolled-back|aborted)$/.test(value)
     ? value
     : 'credential-unavailable';
+}
+
+function isLifecycleRefusal(code: string): boolean {
+  return code === 'undo-in-progress' || code === 'cutover-begin-in-progress'
+    || /^phase=(?:pre-cutover|undoing|rolled-back|aborted)$/.test(code);
 }
 
 function loadedProvider(provider: PiGateProvider): ProviderGate {
@@ -138,6 +173,8 @@ function recordEvidence(db: DatabaseSync, provider: PiGateProvider, credential: 
   trace?.('BEGIN IMMEDIATE');
   db.exec('BEGIN IMMEDIATE');
   try {
+    const admission = assertAdmittedInConnection(db, 'gate');
+    if (!admission.ok) throw new GateFailure(admission.code ?? 'lifecycle-refused');
     const now = String(Date.now());
     const write = db.prepare(`INSERT INTO config (key, value) VALUES (?, ?)
       ON CONFLICT(key) DO UPDATE SET value = excluded.value`);
@@ -206,6 +243,8 @@ export async function runPiGate(providerName: string, deps: PiGateDeps): Promise
     try {
       recordEvidence(db, providerName, delivered, deps.sqlTrace);
     } catch (error) {
+      const code = failureCode(error);
+      if (isLifecycleRefusal(code)) throw error;
       (deps.evidenceGap ?? ((name) => appendEvidenceGap(deps.dbPath, name)))(providerName, error);
       deps.stderr?.(`qlb gate ${providerName}: pi:evidence-gap`);
     }
@@ -217,7 +256,7 @@ export async function runPiGate(providerName: string, deps: PiGateDeps): Promise
   } catch (error) {
     const code = failureCode(error);
     deps.stderr?.(code);
-    return code === 'missing-provider-gate' ? 3 : 1;
+    return code === 'missing-provider-gate' || isLifecycleRefusal(code) ? 3 : 1;
   } finally {
     db.close();
   }

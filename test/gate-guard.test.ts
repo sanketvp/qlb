@@ -7,14 +7,16 @@ import { describe, it } from 'node:test';
 import { appendEvidenceGap, GateFailure, runPiGate } from '../src/pi-gate';
 import { piEvidenceGapCheck } from '../src/checks/pi-evidence-gap';
 import { defaultPiMigratePaths, migratePiSingleProvider } from '../src/pi-migrate';
-import { Migration } from '../src/migration';
+import { createSingleGrantMigration, Migration } from '../src/migration';
 import { MockKeychain } from '../src/keychain';
 import { redactSecrets } from '../src/redact';
+import { beginCutover } from '../src/lifecycle';
 import { openStore, openStoreConnection } from '../src/store';
 
 function fixtureDb(): string {
   const path = join(mkdtempSync(join(tmpdir(), 'qlb-gate-guard-')), 'qlb.db');
   const store = openStore(path);
+  beginCutover(store);
   store.close();
   return path;
 }
@@ -129,6 +131,110 @@ describe('qlb gate core (S30/S54)', () => {
       assert.equal(result, 0, provider);
       assert.equal(output.length, 1, provider);
     }
+  });
+
+  it('accepts legacy per-provider ownership alongside a P7a owner map', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-gate-mixed-'));
+    const paths = defaultPiMigratePaths(root);
+    const agentDir = join(root, '.pi', 'agent');
+    mkdirSync(agentDir, { recursive: true, mode: 0o700 });
+    writeFileSync(paths.authJsonPath, JSON.stringify({
+      xai: { type: 'oauth', access: 'xai-access', refresh: 'xai-refresh', expires: Date.now() + 60_000 },
+      'openai-codex': { type: 'oauth', access: 'codex-access', refresh: 'codex-refresh', expires: Date.now() + 60_000 },
+    }));
+    const store = openStore(join(root, 'qlb.db'));
+    try {
+      const legacy = createSingleGrantMigration(
+        store, new MockKeychain(), 'openai-codex', paths.authJsonPath,
+        join(agentDir, 'qlb-owner-openai-codex.json'),
+      );
+      legacy.stage();
+      await legacy.rehearse(async () => ({ ok: true }));
+      legacy.commit();
+      migratePiSingleProvider('xai', paths, { keychain: new MockKeychain() });
+    } finally {
+      store.close();
+    }
+
+    for (const provider of ['xai', 'openai-codex'] as const) {
+      const output: string[] = [];
+      const result = await runPiGate(provider, {
+        dbPath: fixtureDb(), env: { QLB_PI_TOKEN_CALL: '1' }, deliver: (value) => output.push(value),
+        guard: () => true, admitted: () => ({ ok: true }), piAgentDir: agentDir,
+        provider: { read: () => ({ token: `${provider}-token`, accountId: `${provider}-default`, source: 'fixture' }) },
+      });
+      assert.equal(result, 0, provider);
+      assert.equal(output.length, 1, provider);
+    }
+  });
+
+  it('refuses a malformed per-provider owner file without crashing', async () => {
+    const agentDir = mkdtempSync(join(tmpdir(), 'qlb-gate-owner-malformed-'));
+    writeFileSync(join(agentDir, 'qlb-owner-xai.json'), '{not-json');
+    const stderr: string[] = [];
+    const result = await runPiGate('xai', {
+      dbPath: fixtureDb(), env: { QLB_PI_TOKEN_CALL: '1' }, deliver: () => undefined, stderr: (line) => stderr.push(line),
+      guard: () => true, admitted: () => ({ ok: true }), piAgentDir: agentDir,
+      provider: { read: () => ({ token: 'never', accountId: 'never', source: 'fixture' }) },
+    });
+    assert.equal(result, 1);
+    assert.deepEqual(stderr, ['owner-file-malformed']);
+  });
+
+  it('lets an owner entry supersede stale not-applicable state but refuses without one', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-gate-not-applicable-'));
+    const paths = defaultPiMigratePaths(root);
+    mkdirSync(join(root, '.pi', 'agent'), { recursive: true, mode: 0o700 });
+    writeFileSync(paths.authJsonPath, JSON.stringify({ xai: {
+      type: 'oauth', access: 'xai-access', refresh: 'xai-refresh', expires: Date.now() + 60_000,
+    } }));
+    migratePiSingleProvider('xai', paths, { keychain: new MockKeychain() });
+    const dbPath = join(root, 'qlb.db');
+    const store = openStore(dbPath);
+    try {
+      beginCutover(store);
+      store.setConfig('pi.xai.state', 'not-applicable');
+    } finally { store.close(); }
+
+    const served: string[] = [];
+    const result = await runPiGate('xai', {
+      dbPath, env: { QLB_PI_TOKEN_CALL: '1' }, deliver: (value) => served.push(value),
+      guard: () => true, admitted: () => ({ ok: true }), piAgentDir: join(root, '.pi', 'agent'),
+      provider: { read: () => ({ token: 'xai-token', accountId: 'xai-default', source: 'fixture' }) },
+    });
+    assert.equal(result, 0);
+    assert.equal(served.length, 1);
+
+    const missingStderr: string[] = [];
+    const missing = await runPiGate('xai', {
+      dbPath, env: { QLB_PI_TOKEN_CALL: '1' }, deliver: () => undefined, stderr: (line) => missingStderr.push(line),
+      guard: () => true, admitted: () => ({ ok: true }), piAgentDir: mkdtempSync(join(tmpdir(), 'qlb-gate-no-owner-')),
+      provider: { read: () => ({ token: 'never', accountId: 'never', source: 'fixture' }) },
+    });
+    assert.equal(missing, 1);
+    assert.deepEqual(missingStderr, ['provider-not-applicable']);
+  });
+
+  it('re-checks lifecycle admission inside evidence before delivery', async () => {
+    const dbPath = fixtureDb();
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const result = await runPiGate('xai', {
+      dbPath, env: { QLB_PI_TOKEN_CALL: '1' }, deliver: (value) => stdout.push(value), stderr: (line) => stderr.push(line),
+      guard: () => true, admitted: () => ({ ok: true }), prerequisites: () => undefined,
+      provider: { read: () => {
+        const db = openStoreConnection(dbPath);
+        try { db.prepare("UPDATE lifecycle SET state = 'undoing'").run(); } finally { db.close(); }
+        return { token: 'xai-token', accountId: 'xai-default', source: 'fixture' };
+      } },
+    });
+    assert.equal(result, 3);
+    assert.deepEqual(stdout, []);
+    assert.deepEqual(stderr, ['undo-in-progress']);
+    const db = openStoreConnection(dbPath, true);
+    try {
+      assert.equal(db.prepare("SELECT 1 FROM config WHERE key = 'pi.xai.lastServedAt'").get(), undefined);
+    } finally { db.close(); }
   });
 
   it('fails a non-migrated provider with its prerequisite cause', async () => {
