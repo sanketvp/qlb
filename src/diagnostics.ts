@@ -60,6 +60,9 @@ import { openStoreConnection } from './store';
 import { discoverChecks, type CheckDefinition } from './registry';
 import { lifecycleWindowCheck } from './checks/lifecycle-window';
 import { lifecycleDrillCheck } from './checks/lifecycle-drill';
+import { claudeConfigPathCheck } from './checks/claude-config-path';
+import { claudeConfigFileCheck } from './checks/claude-config-file';
+import { claudeLocksCheck } from './checks/claude-locks';
 
 export type CheckLevel = 'PASS' | 'WARN' | 'FAIL' | 'INFO' | 'N/A';
 
@@ -681,6 +684,9 @@ export async function doctorQlb(
 
   const phase = lifecycle.phase;
   checks.push(
+    claudeConfigPathCheck(),
+    claudeConfigFileCheck(),
+    claudeLocksCheck(),
     autoBreakerCheck(config.dbPath, 'anthropic', lifecycle),
     claudeOauthClientCheck(config.dbPath, lifecycle),
     claudeSlotsCheck(config.dbPath, phase),
