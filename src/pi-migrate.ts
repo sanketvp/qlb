@@ -2,7 +2,7 @@
 // Credential bytes live only in the Keychain and the 0600 baseline file.
 
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, linkSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { execFileSync } from 'node:child_process';
 
@@ -88,13 +88,21 @@ function lockedError(): Error { return Object.assign(new Error('pi-auth-locked')
 function lockLostError(): Error { return Object.assign(new Error('lock-lost'), { code: 'pi-auth-lock-lost', name: 'PiAuthLockLostError' }); }
 interface AuthLockOwner { pid: number; nonce: string; }
 function lockOwnerPath(lock: string): string { return join(lock, 'qlb-lock-owner.json'); }
+/** Read either the legacy directory owner record or the atomic file lock record. */
 function readLockOwner(lock: string): AuthLockOwner | null {
   try {
-    const parsed = JSON.parse(readFileSync(lockOwnerPath(lock), 'utf8')) as unknown;
+    const record = statSync(lock).isDirectory() ? lockOwnerPath(lock) : lock;
+    const parsed = JSON.parse(readFileSync(record, 'utf8')) as unknown;
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
     const { pid, nonce } = parsed as { pid?: unknown; nonce?: unknown };
     return typeof pid === 'number' && Number.isInteger(pid) && pid > 0 && typeof nonce === 'string' && nonce.length > 0 ? { pid, nonce } : null;
   } catch { return null; }
+}
+/** Link a complete owner record into place, so a contender never observes a new ownerless lock. */
+function createAuthLock(lock: string, owner: AuthLockOwner): void {
+  const pending = `${lock}.pending-${owner.nonce}`;
+  writeFileSync(pending, `${JSON.stringify(owner)}\n`, { mode: 0o600, flag: 'wx' });
+  try { linkSync(pending, lock); } finally { rmSync(pending, { force: true }); }
 }
 function ownerMatches(lock: string, owner: AuthLockOwner): boolean {
   const actual = readLockOwner(lock);
@@ -137,8 +145,7 @@ export function withPiAuthLock<T>(authPath: string, fn: (refresh: () => void) =>
   let acquired = false;
   for (let attempt = 0; attempt <= retries; attempt += 1) {
     try {
-      mkdirSync(lock, { recursive: false, mode: 0o700 });
-      writeFileSync(lockOwnerPath(lock), `${JSON.stringify(owner)}\n`, { mode: 0o600 });
+      createAuthLock(lock, owner);
       acquired = true;
       break;
     } catch (error) {

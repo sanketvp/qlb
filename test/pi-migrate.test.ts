@@ -54,6 +54,45 @@ function hasManaged(keychain: MockKeychain, provider: PiSingleProvider): boolean
   }
 }
 
+async function raceStaleLockTakers(paths: PiMigratePaths, home: string, racers: number): Promise<{ code: number | null; output: string }[]> {
+  const modulePath = join(process.cwd(), 'dist-test', 'src', 'pi-migrate.js');
+  const children = Array.from({ length: racers }, () => {
+    let resolveReady!: () => void;
+    let rejectReady!: (error: Error) => void;
+    const ready = new Promise<void>((resolve, reject) => { resolveReady = resolve; rejectReady = reject; });
+    let resolveResult!: (result: { code: number | null; output: string }) => void;
+    let rejectResult!: (error: Error) => void;
+    const result = new Promise<{ code: number | null; output: string }>((resolve, reject) => { resolveResult = resolve; rejectResult = reject; });
+    const proc = spawn(process.execPath, ['-e', `
+      const { migratePiSingleProvider } = require(process.env.PI_MIGRATE_MODULE);
+      const paths = JSON.parse(process.env.PI_MIGRATE_PATHS);
+      process.send?.('ready');
+      process.once('message', () => {
+        let value = '';
+        try {
+          migratePiSingleProvider('xai', paths, { keychain: { setSync(_s, _a, v) { value = v; }, getSync() { return value; }, deleteSync() {} }, authLockTiming: { staleMs: 10, retries: 0, retryMs: 1 }, afterWrite(point) {
+            if (point === 'owner-entry') { process.stdout.write('entered\\n'); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 750); }
+          } });
+          process.exitCode = 0;
+        } catch (error) { process.stdout.write(String(error.code || error.message)); process.exitCode = 1; }
+        finally { if (process.connected) process.disconnect(); }
+      });
+    `], {
+      env: { ...process.env, QLB_TEST_MODE: '1', QLB_HOME: home, HOME: home, PI_MIGRATE_MODULE: modulePath, PI_MIGRATE_PATHS: JSON.stringify(paths) },
+      stdio: ['ignore', 'pipe', 'inherit', 'ipc'],
+    });
+    let output = '';
+    proc.stdout!.on('data', (chunk) => { output += String(chunk); });
+    proc.once('message', (message) => { if (message === 'ready') resolveReady(); else rejectReady(new Error('racer did not become ready')); });
+    proc.once('error', (error) => { rejectReady(error); rejectResult(error); });
+    proc.once('close', (code) => { resolveResult({ code, output }); });
+    return { proc, ready, result };
+  });
+  await Promise.all(children.map(({ ready }) => ready));
+  for (const { proc } of children) proc.send('start');
+  return Promise.all(children.map(({ result }) => result));
+}
+
 describe('Pi migration S58 credential-first barrier', () => {
   it('never leaves a placeholder without a managed item after a crash', () => {
     const h = setup();
@@ -231,42 +270,20 @@ describe('Pi migration S58 credential-first barrier', () => {
     } finally { h.cleanup(); }
   });
 
-  it('atomically admits only one racing stale-lock taker', async () => {
-    const h = setup();
-    try {
-      const lock = `${h.paths.authJsonPath}.lock`; const owner = join(lock, 'qlb-lock-owner.json');
-      mkdirSync(lock); writeFileSync(owner, JSON.stringify({ pid: 999_999, nonce: 'dead' }));
-      utimesSync(lock, new Date(Date.now() - 2_000), new Date(Date.now() - 2_000));
-      const modulePath = join(process.cwd(), 'dist-test', 'src', 'pi-migrate.js');
-      const startAt = Date.now() + 200;
-      const child = () => new Promise<{ code: number | null; output: string }>((resolveChild, rejectChild) => {
-        const proc = spawn(process.execPath, ['-e', `
-          const { migratePiSingleProvider } = require(process.env.PI_MIGRATE_MODULE);
-          const paths = JSON.parse(process.env.PI_MIGRATE_PATHS);
-          const until = Number(process.env.PI_MIGRATE_START);
-          while (Date.now() < until) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1);
-          let value = '';
-          const keychain = { setSync(_s, _a, v) { value = v; }, getSync() { return value; }, deleteSync() {} };
-          try {
-            migratePiSingleProvider('xai', paths, { keychain, authLockTiming: { staleMs: 10, retries: 0, retryMs: 1 }, afterWrite(point) {
-              if (point === 'owner-entry') { process.stdout.write('entered\\n'); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100); }
-            } });
-            process.exitCode = 0;
-          } catch (error) { process.stdout.write(String(error.code || error.message)); process.exitCode = 1; }
-        `], {
-          env: { ...process.env, PI_MIGRATE_MODULE: modulePath, PI_MIGRATE_PATHS: JSON.stringify(h.paths), PI_MIGRATE_START: String(startAt) },
-          stdio: ['ignore', 'pipe', 'inherit'],
-        });
-        let output = '';
-        proc.stdout.on('data', (chunk) => { output += String(chunk); });
-        proc.once('error', rejectChild);
-        proc.once('close', (code) => resolveChild({ code, output }));
-      });
-      const results = await Promise.all([child(), child()]);
-      assert.equal(results.filter(({ output }) => output.includes('entered')).length, 1);
-      assert.equal(results.filter(({ code }) => code === 0).length, 1);
-    } finally { h.cleanup(); }
-  });
+  for (const racers of [2, 4]) {
+    it(racers === 2 ? 'atomically admits only one racing stale-lock taker' : 'atomically admits only one of 4 racing stale-lock takers', async () => {
+      const h = setup();
+      try {
+        const lock = `${h.paths.authJsonPath}.lock`; const owner = join(lock, 'qlb-lock-owner.json');
+        mkdirSync(lock); writeFileSync(owner, JSON.stringify({ pid: 999_999, nonce: 'dead' }));
+        utimesSync(lock, new Date(Date.now() - 2_000), new Date(Date.now() - 2_000));
+        const results = await raceStaleLockTakers(h.paths, h.dir, racers);
+        const detail = JSON.stringify(results);
+        assert.equal(results.filter(({ output }) => output.includes('entered')).length, 1, detail);
+        assert.equal(results.filter(({ code }) => code === 0).length, 1, detail);
+      } finally { h.cleanup(); }
+    });
+  }
 
   it('takes over only stale locks whose recorded owner is dead and never releases a foreign lock', () => {
     const h = setup();
@@ -287,11 +304,11 @@ describe('Pi migration S58 credential-first barrier', () => {
       assert.throws(() => rollbackPiSingleProvider('xai', h.paths, {
         keychain: h.keychain,
         afterWrite: (point) => {
-          if (point === 'owner-entry') writeFileSync(owner, JSON.stringify({ pid: process.pid, nonce: 'foreign' }));
+          if (point === 'owner-entry') writeFileSync(lock, JSON.stringify({ pid: process.pid, nonce: 'foreign' }));
         },
       }), /lock-lost/);
       assert.equal(existsSync(lock), true, 'a superseded holder must leave the new owner lock intact');
-      assert.deepEqual(JSON.parse(readFileSync(owner, 'utf8')), { pid: process.pid, nonce: 'foreign' });
+      assert.deepEqual(JSON.parse(readFileSync(lock, 'utf8')), { pid: process.pid, nonce: 'foreign' });
     } finally { h.cleanup(); }
   });
 
