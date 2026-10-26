@@ -91,6 +91,45 @@ describe('redaction', () => {
     assert.equal(redactKeyValueText(input, []), 'token: [redacted]\nkind: safe');
   });
 
+  it('redacts block scalars for sensitive prefixed and dotted keys', () => {
+    const cases = [
+      ['db_password: |\n  fixture-secret\nkind: safe', 'db_password: [redacted]\nkind: safe'],
+      ['spring.datasource.password: >\n  fixture-secret\nkind: safe', 'spring.datasource.password: [redacted]\nkind: safe'],
+      ['"password": |\n  fixture-secret\nkind: safe', '"password": [redacted]\nkind: safe'],
+    ] as const;
+
+    for (const [input, expected] of cases) {
+      const result = redactKeyValueText(input, []);
+      assert.equal(result.includes('fixture-secret'), false);
+      assert.equal(fingerprint(result), fingerprint(expected));
+    }
+  });
+
+  it('redacts block scalars for sensitive YAML sequence-item keys', () => {
+    const input = '- password: |\n    fixture-secret\n- kind: safe';
+    const expected = '- password: [redacted]\n- kind: safe';
+    const result = redactKeyValueText(input, []);
+
+    assert.equal(result.includes('fixture-secret'), false);
+    assert.equal(fingerprint(result), fingerprint(expected));
+  });
+
+  it('redacts indented continuation lines for sensitive YAML sequence-item keys', () => {
+    const input = '- password:\n    first-fixture\n    second-fixture\n- kind: safe';
+    const expected = '- password:\n    [redacted]\n- kind: safe';
+    const result = redactKeyValueText(input, []);
+
+    assert.equal(result.includes('first-fixture'), false);
+    assert.equal(result.includes('second-fixture'), false);
+    assert.equal(fingerprint(result), fingerprint(expected));
+  });
+
+  it('leaves non-sensitive YAML blocks unchanged', () => {
+    const input = 'kind: |\n  safe block\nnext: safe';
+
+    assert.equal(fingerprint(redactKeyValueText(input, [])), fingerprint(input));
+  });
+
   it('redacts supplied secrets and their SHA-256 fingerprints', () => {
     const secret = 'fixture-' + 'secret-value';
     const result = redactSecrets(`token=${secret} fingerprint=${fingerprint(secret)}`, [secret]);
