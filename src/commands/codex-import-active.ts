@@ -59,7 +59,11 @@ async function execute(args: string[], ctx: CommandContext): Promise<number> {
       return 3;
     }
     const plan = planImportActiveCodex(active.doc);
-    const existing = store.getCodexSlot(plan.slotId);
+    // Attribute against the slot active_login names, not merely the live
+    // identity, so S56 can move ownership when native Codex drifted.
+    const activeSlotId = store.getCodexActiveLogin();
+    const existing = (activeSlotId == null ? null : store.getCodexSlot(activeSlotId))
+      ?? store.getCodexSlot(plan.slotId);
     if (!existing) {
       const result = importActiveCodexSlot(active.doc, {
         store,
@@ -80,7 +84,7 @@ async function execute(args: string[], ctx: CommandContext): Promise<number> {
     const attribution = await attributeLiveDocument({
       store,
       keychain: platformKeychain,
-      slot: { accountId: existing.accountId, document: stored.doc },
+      slot: { accountId: existing.accountId, document: stored.doc, fingerprint: existing.fingerprint ?? undefined },
       live: active.doc,
       republish: (document) => writeCodexAuthAtomic(codexAuthPath(ctx), document).then(() => undefined),
     });

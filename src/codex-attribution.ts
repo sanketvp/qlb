@@ -8,7 +8,7 @@ import type { Store } from './store';
 
 const PROVIDER = 'openai-codex';
 
-type Keychain = Pick<KeychainBackend, 'getSync' | 'setSync'>;
+type Keychain = Pick<KeychainBackend, 'getSync' | 'setSync' | 'deleteSync'>;
 
 export type CodexAttributionAction = 'noop' | 'republish-slot' | 'adopt' | 'drift' | 'unclaimed' | 'wiped';
 
@@ -16,6 +16,8 @@ export interface ManagedCodexDocument {
   /** S29 composite identity of the managed slot. */
   accountId: string;
   document: CodexAuthDocument;
+  /** Persisted row fingerprint; it is the adoption CAS/noop authority. */
+  fingerprint?: string;
 }
 
 export interface AttributeLiveDocumentInput {
@@ -64,34 +66,75 @@ function reloginEvidence(
       : null;
 }
 
+function optionalKeychainValue(keychain: Keychain, service: string): string | undefined {
+  try {
+    return keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT);
+  } catch (error) {
+    if (error instanceof Error && /item not found/.test(error.message)) return undefined;
+    throw error;
+  }
+}
+
+function fingerprintOfStoredDocument(value: string): string | null {
+  const parsed = parseCodexAuth(value);
+  return parsed.ok ? codexFingerprint(parsed.doc) : null;
+}
+
 async function attributeSameSlot(input: AttributeLiveDocumentInput): Promise<CodexAttributionResult & {
   action: Exclude<CodexAttributionAction, 'drift'>;
 }> {
-  const slotFp = codexFingerprint(input.slot.document);
+  // The database, rather than a possibly half-written Keychain item, defines
+  // both noop and the predecessor required by the CAS.
+  const slotFp = input.slot.fingerprint ?? codexFingerprint(input.slot.document);
   const live = input.live;
   if (!live) return { action: 'wiped', accountId: input.slot.accountId };
 
+  const now = (input.now ?? Date.now)();
   const liveFp = codexFingerprint(live);
-  if (slotFp === liveFp) return { action: 'noop', accountId: input.slot.accountId };
+  if (slotFp === liveFp) {
+    input.store.markCodexSlotImportedActive(input.slot.accountId, now);
+    return { action: 'noop', accountId: input.slot.accountId };
+  }
 
   // The only leave-equivalent: QLB saved the successor but failed before the
   // auth.json rename, so the managed slot must be published back to Codex.
   if (isSuccessor(input.store, PROVIDER, input.slot.accountId, liveFp, slotFp)) {
     await input.republish?.(input.slot.document);
+    input.store.markCodexSlotImportedActive(input.slot.accountId, now);
     return { action: 'republish-slot', accountId: input.slot.accountId };
   }
 
   const service = qlbKeychainService(PROVIDER, input.slot.accountId);
-  input.keychain.setSync(`${service}:prev`, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(input.slot.document));
-  input.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(live));
-  input.store.adoptCodexSlot({
+  const currentBefore = input.keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT);
+  const previousService = `${service}:prev`;
+  const previousBefore = optionalKeychainValue(input.keychain, previousService);
+  let wroteCurrent = false;
+  let wrotePrevious = false;
+  input.store.adoptCodexSlotWithKeychain({
     accountId: input.slot.accountId,
     previousFingerprint: slotFp,
     fingerprint: liveFp,
     lastRefresh: live.last_refresh ?? null,
-    ts: (input.now ?? Date.now)(),
+    ts: now,
     evidence: evidenceFor(input.holderObservation),
     reloginEvidence: reloginEvidence(slotFp, live, input),
+    writeKeychain: () => {
+      // On a crash-retry the Keychain can already contain the live document.
+      // Do not overwrite a real predecessor with that successor.
+      if (fingerprintOfStoredDocument(currentBefore) === slotFp) {
+        input.keychain.setSync(previousService, QLB_KEYCHAIN_ACCOUNT, currentBefore);
+        wrotePrevious = true;
+      }
+      input.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(live));
+      wroteCurrent = true;
+    },
+    restoreKeychain: () => {
+      if (wroteCurrent) input.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, currentBefore);
+      if (wrotePrevious) {
+        if (previousBefore === undefined) input.keychain.deleteSync(previousService, QLB_KEYCHAIN_ACCOUNT);
+        else input.keychain.setSync(previousService, QLB_KEYCHAIN_ACCOUNT, previousBefore);
+      }
+    },
   });
   return { action: 'adopt', accountId: input.slot.accountId };
 }
@@ -117,8 +160,10 @@ export async function attributeLiveDocument(input: AttributeLiveDocumentInput): 
   );
   const parsed = parseCodexAuth(text);
   if (!parsed.ok) throw new Error('stored Codex slot is malformed');
-  const sameInput: AttributeLiveDocumentInput = { ...input, slot: { accountId: driftSlot.accountId, document: parsed.doc } };
+  const sameInput: AttributeLiveDocumentInput = {
+    ...input,
+    slot: { accountId: driftSlot.accountId, document: parsed.doc, fingerprint: driftSlot.fingerprint ?? undefined },
+  };
   const disposition = await attributeSameSlot(sameInput);
-  input.store.setCodexActiveLogin(driftSlot.accountId, (input.now ?? Date.now)());
   return { action: 'drift', accountId: driftSlot.accountId, disposition: disposition.action };
 }

@@ -2050,6 +2050,65 @@ export class Store {
     });
   }
 
+  /**
+   * S56 adoption with the Keychain write held between the metadata CAS and
+   * commit. The caller restores only items it changed if any later step fails.
+   */
+  adoptCodexSlotWithKeychain(input: {
+    accountId: string; fingerprint: string; previousFingerprint: string; lastRefresh?: string | null;
+    ts?: number; evidence: 'holder' | 'identity'; reloginEvidence?: 'auth-time' | 'unattributed-rotation' | null;
+    writeKeychain: () => void; restoreKeychain: () => void;
+  }): void {
+    const ts = input.ts ?? Date.now();
+    let keychainWriteStarted = false;
+    try {
+      this.runImmediate(() => {
+        const updated = this.db.prepare(`UPDATE codex_slots SET fingerprint = ?, prev_fingerprint = ?, last_refresh = ?,
+          dead = 0, dead_reason = NULL, dead_at = NULL, healed_at = CASE WHEN dead != 0 THEN ? ELSE healed_at END,
+          pending_adopt = 0, archived_at = NULL, last_active_at = ?
+          WHERE account_id = ? AND fingerprint = ?`).run(
+          input.fingerprint, input.previousFingerprint, input.lastRefresh ?? null, ts, ts, input.accountId, input.previousFingerprint,
+        );
+        if (updated.changes !== 1) throw new Error('Codex slot changed before adoption');
+        keychainWriteStarted = true;
+        input.writeKeychain();
+        this.db.prepare(`INSERT INTO lineage_log (ts, provider, account_id, from_fp, to_fp, cause, by, evidence)
+          VALUES (?, 'openai-codex', ?, ?, ?, 'adopt', 'tool', ?)`).run(
+          ts, input.accountId, input.previousFingerprint, input.fingerprint, input.evidence,
+        );
+        this.db.prepare(`INSERT INTO active_login (provider, account_id, since, set_by) VALUES ('openai-codex', ?, ?, 'import')
+          ON CONFLICT(provider) DO UPDATE SET account_id = excluded.account_id, since = excluded.since, set_by = excluded.set_by`)
+          .run(input.accountId, ts);
+        if (input.reloginEvidence != null) {
+          assertStoredReloginFields(input.reloginEvidence, input.reloginEvidence);
+          this.db.prepare(`INSERT INTO relogin_events (ts, provider, account_id, kind, detail, evidence, user_denied_at)
+            VALUES (?, 'openai-codex', ?, 'external-login', ?, ?, NULL)`)
+            .run(ts, input.accountId, input.reloginEvidence, input.reloginEvidence);
+        }
+      });
+    } catch (error) {
+      if (keychainWriteStarted) input.restoreKeychain();
+      throw error;
+    }
+  }
+
+  /** Mark every successful import-active observation as the live Codex slot. */
+  markCodexSlotImportedActive(accountId: string, ts: number = Date.now()): void {
+    this.runImmediate(() => {
+      this.db.prepare(`UPDATE codex_slots SET pending_adopt = 0, archived_at = NULL, last_active_at = ?
+        WHERE account_id = ?`).run(ts, accountId);
+      this.db.prepare(`INSERT INTO active_login (provider, account_id, since, set_by) VALUES ('openai-codex', ?, ?, 'import')
+        ON CONFLICT(provider) DO UPDATE SET account_id = excluded.account_id, since = excluded.since, set_by = excluded.set_by`)
+        .run(accountId, ts);
+    });
+  }
+
+  /** Return the current Codex slot named by active_login, if there is one. */
+  getCodexActiveLogin(): string | null {
+    const row = this.db.prepare("SELECT account_id FROM active_login WHERE provider = 'openai-codex'").get() as { account_id: string | null } | undefined;
+    return row?.account_id ?? null;
+  }
+
   /** S56 drift adopts another known identity as the active Codex slot. */
   setCodexActiveLogin(accountId: string, ts: number = Date.now()): void {
     this.db.prepare(`INSERT INTO active_login (provider, account_id, since, set_by) VALUES ('openai-codex', ?, ?, 'adopt')
