@@ -53,6 +53,38 @@ export interface SlotLineageRow {
   prev_fingerprint: string | null;
 }
 
+/** Read-only anthropic slot view used by the Pi pool inventory. */
+export interface AnthropicSlotLineageRow {
+  accountId: string;
+  fingerprint: string | null;
+}
+
+/** Read-only full lineage component for one active Anthropic slot (S46/S61). */
+export interface AnthropicSlotLineageChainRow {
+  accountId: string;
+  lineages: string[];
+}
+
+/** S61's durable undo-export mapping for an anthropic-pool entry. */
+export interface PiExportTargetRow {
+  provider: string;
+  target: string;
+  slotAccountId: string;
+  lineageFp: string;
+  recordedAt: number;
+}
+
+/** Atomic admission/insert result for the add-only Pi export inventory write. */
+export interface PiExportTargetRecordResult {
+  ok: boolean;
+  code?: string;
+}
+
+/** Result of classifying and add-only recording on one immediate transaction. */
+export type PiExportTargetClassifiedRecordResult<T> =
+  | { ok: true; result: T }
+  | { ok: false; code?: string };
+
 /** Credential-migration journal (§4.8.3). One row per native store. */
 export interface MigrationRow {
   store: string;
@@ -2104,6 +2136,122 @@ export class Store {
     if (!table) return null;
     const row = this.db.prepare(`SELECT fingerprint, prev_fingerprint FROM ${table} WHERE account_id = ?`).get(accountId);
     return (row as SlotLineageRow | undefined) ?? null;
+  }
+
+  // --- P11 pool-inventory additions (S61) ---------------------------------
+
+  listAnthropicSlotLineages(): AnthropicSlotLineageRow[] {
+    return this.db.prepare('SELECT account_id AS accountId, fingerprint FROM claude_slots ORDER BY account_id')
+      .all() as unknown as AnthropicSlotLineageRow[];
+  }
+
+  /**
+   * Return each active slot's connected lineage component.  The graph is
+   * deliberately traversed by recorded edges rather than by hash ordering:
+   * either end may be the persisted current or `:prev` value after adoption.
+   */
+  listAnthropicSlotLineageChains(): AnthropicSlotLineageChainRow[] {
+    const slots = this.db.prepare(`SELECT account_id AS accountId, fingerprint, prev_fingerprint AS prevFingerprint
+      FROM claude_slots WHERE archived_at IS NULL AND dead = 0 ORDER BY account_id`).all() as Array<{
+      accountId: string; fingerprint: string | null; prevFingerprint: string | null;
+    }>;
+    const transitions = this.db.prepare(`SELECT account_id AS accountId, from_fp AS fromFp, to_fp AS toFp
+      FROM lineage_log WHERE provider = 'anthropic' ORDER BY id`).all() as Array<{
+      accountId: string; fromFp: string | null; toFp: string;
+    }>;
+    return slots.map((slot) => {
+      const lineages = new Set<string>();
+      if (slot.fingerprint) lineages.add(slot.fingerprint);
+      if (slot.prevFingerprint) lineages.add(slot.prevFingerprint);
+      let changed = true;
+      while (changed) {
+        changed = false;
+        for (const edge of transitions) {
+          if (edge.accountId !== slot.accountId) continue;
+          if (edge.fromFp && lineages.has(edge.fromFp) && !lineages.has(edge.toFp)) {
+            lineages.add(edge.toFp);
+            changed = true;
+          }
+          if (edge.fromFp && lineages.has(edge.toFp) && !lineages.has(edge.fromFp)) {
+            lineages.add(edge.fromFp);
+            changed = true;
+          }
+        }
+      }
+      return { accountId: slot.accountId, lineages: [...lineages] };
+    });
+  }
+
+  /** Replace one provider's observed export targets as a single write transaction. */
+  replacePiExportTargets(provider: string, targets: PiExportTargetRow[]): void {
+    this.runImmediate(() => {
+      this.db.prepare('DELETE FROM pi_export_targets WHERE provider = ?').run(provider);
+      const insert = this.db.prepare(`INSERT INTO pi_export_targets
+        (provider, target, slot_account_id, lineage_fp, recorded_at) VALUES (?, ?, ?, ?, ?)`);
+      for (const target of targets) {
+        if (target.provider !== provider) throw new Error('pi export target provider mismatch');
+        insert.run(target.provider, target.target, target.slotAccountId, target.lineageFp, target.recordedAt);
+      }
+    });
+  }
+
+  /**
+   * Add an observed target set only when no provider rows exist. The caller's
+   * lifecycle admission runs on this transaction's connection, so neither it
+   * nor the empty-table check can race the durable insert.
+   */
+  recordPiExportTargetsIfEmpty(
+    provider: string,
+    targets: PiExportTargetRow[],
+    admit: (db: DatabaseSync) => PiExportTargetRecordResult,
+  ): PiExportTargetRecordResult {
+    return this.runImmediate(() => {
+      const admission = admit(this.db);
+      if (!admission.ok) return admission;
+      if (this.db.prepare('SELECT 1 FROM pi_export_targets WHERE provider = ? LIMIT 1').get(provider)) {
+        return { ok: false, code: 'pi-export-targets-exist' };
+      }
+      const insert = this.db.prepare(`INSERT INTO pi_export_targets
+        (provider, target, slot_account_id, lineage_fp, recorded_at) VALUES (?, ?, ?, ?, ?)`);
+      for (const target of targets) {
+        if (target.provider !== provider) throw new Error('pi export target provider mismatch');
+        insert.run(target.provider, target.target, target.slotAccountId, target.lineageFp, target.recordedAt);
+      }
+      return { ok: true };
+    });
+  }
+
+  /**
+   * Classify and add observed targets under one immediate transaction. The
+   * classifier may read store state, which is therefore protected from a slot
+   * writer until either this insert commits or classification rolls back.
+   */
+  recordPiExportTargetsIfEmptyClassified<T extends { targets: PiExportTargetRow[] }>(
+    provider: string,
+    classifyInTransaction: () => T,
+    admit: (db: DatabaseSync) => PiExportTargetRecordResult,
+  ): PiExportTargetClassifiedRecordResult<T> {
+    return this.runImmediate(() => {
+      const classified = classifyInTransaction();
+      const admission = admit(this.db);
+      if (!admission.ok) return { ok: false, code: admission.code };
+      if (this.db.prepare('SELECT 1 FROM pi_export_targets WHERE provider = ? LIMIT 1').get(provider)) {
+        return { ok: false, code: 'pi-export-targets-exist' };
+      }
+      const insert = this.db.prepare(`INSERT INTO pi_export_targets
+        (provider, target, slot_account_id, lineage_fp, recorded_at) VALUES (?, ?, ?, ?, ?)`);
+      for (const target of classified.targets) {
+        if (target.provider !== provider) throw new Error('pi export target provider mismatch');
+        insert.run(target.provider, target.target, target.slotAccountId, target.lineageFp, target.recordedAt);
+      }
+      return { ok: true, result: classified };
+    });
+  }
+
+  listPiExportTargets(provider: string): PiExportTargetRow[] {
+    return this.db.prepare(`SELECT provider, target, slot_account_id AS slotAccountId,
+      lineage_fp AS lineageFp, recorded_at AS recordedAt FROM pi_export_targets
+      WHERE provider = ? ORDER BY target`).all(provider) as unknown as PiExportTargetRow[];
   }
 
   recordRelogin(row: { ts?: number; provider: string; accountId?: string | null; kind: string; detail?: string | null; evidence?: string | null; userDeniedAt?: number | null }): number {
