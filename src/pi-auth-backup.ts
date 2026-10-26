@@ -4,6 +4,7 @@ import { dirname, join, resolve } from 'node:path';
 
 import { atomicWriteText } from './fsutil';
 import { qlbHomeDir } from './home';
+import { withPiAuthLock } from './pi-migrate';
 
 export interface PiAuthBackup {
   version: 1;
@@ -100,15 +101,26 @@ export function readPiAuthBackup(authPath: string, key: string): PiAuthBackup | 
   return null;
 }
 
-/** Restore exactly this key and return its value after the restoration is re-read. */
-export function restorePiAuthEntry(authPath: string, key: string, record: PiAuthBackup): unknown {
+/** Restore exactly this key while the caller holds the auth.json lock. */
+export function restorePiAuthEntryLocked(authPath: string, key: string, record: PiAuthBackup): unknown {
   const backup = backupFrom(record, authPath, key);
   const auth = readAuth(authPath);
   if (backup.entryPresent) auth[key] = backup.entry;
   else delete auth[key];
-  if (!backup.filePresent && Object.keys(auth).length === 0) rmSync(authPath, { force: true });
-  else writeJson(authPath, auth);
+  if (!backup.filePresent && Object.keys(auth).length === 0) {
+    const current = readAuth(authPath);
+    if (Object.keys(current).length === 0) rmSync(authPath, { force: true });
+    else {
+      delete current[key];
+      writeJson(authPath, current);
+    }
+  } else writeJson(authPath, auth);
   return readAuth(authPath)[key];
+}
+
+/** Restore exactly this key and return its value after the restoration is re-read. */
+export function restorePiAuthEntry(authPath: string, key: string, record: PiAuthBackup): unknown {
+  return withPiAuthLock(authPath, () => restorePiAuthEntryLocked(authPath, key, record));
 }
 
 export function removePiAuthBackup(authPath: string, key: string): void {

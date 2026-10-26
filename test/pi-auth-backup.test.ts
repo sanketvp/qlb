@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import { ChildProcess, spawn } from 'node:child_process';
+import { once } from 'node:events';
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -30,6 +32,37 @@ function writeAuth(path: string, value: Record<string, unknown>): void {
 
 function readAuth(path: string): Record<string, unknown> {
   return JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
+}
+
+async function lockedOtherProviderWriter(path: string, provider: string, value: unknown): Promise<ChildProcess> {
+  const piMigrate = join(process.cwd(), 'dist-test', 'src', 'pi-migrate.js');
+  const script = [
+    "const { withPiAuthLock } = require(process.argv[1]);",
+    "const { existsSync, readFileSync, writeFileSync } = require('node:fs');",
+    'const [path, provider, value] = process.argv.slice(2);',
+    'withPiAuthLock(path, () => {',
+    "  const auth = existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : {};",
+    '  auth[provider] = JSON.parse(value);',
+    "  writeFileSync(path, `${JSON.stringify(auth)}\\n`, { mode: 0o600 });",
+    "  process.send?.('written');",
+    '  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 500);',
+    '});',
+  ].join('\n');
+  const child = spawn(process.execPath, ['-e', script, piMigrate, path, provider, JSON.stringify(value)], {
+    env: { ...process.env, QLB_TEST_MODE: '1', QLB_HOME: testHome, HOME: testHome },
+    stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
+  });
+  await new Promise<void>((resolve, reject) => {
+    child.once('message', () => resolve());
+    child.once('error', reject);
+    child.once('exit', (code) => reject(new Error(`locked writer exited before writing (${code})`)));
+  });
+  return child;
+}
+
+async function assertChildSucceeded(child: ChildProcess): Promise<void> {
+  const [code] = await once(child, 'exit') as [number | null];
+  assert.equal(code, 0);
 }
 
 describe('per-auth.json Pi backups', () => {
@@ -103,6 +136,47 @@ describe('per-auth.json Pi backups', () => {
 
       restorePiAuthEntry(path, 'xai', readPiAuthBackup(path, 'xai')!);
       assert.deepEqual(readAuth(path), { kimi: { refresh: 'keep' } });
+    } finally {
+      rmSync(dirname(path), { recursive: true, force: true });
+    }
+  });
+
+  it('restore waits for a locked writer and preserves its other-provider update', async () => {
+    const path = authPath('restore-lock');
+    try {
+      writeAuth(path, { xai: { refresh: 'backup' } });
+      const backup = writePiAuthBackup(path, 'xai', 'cycle');
+      writeAuth(path, { xai: { refresh: 'managed' } });
+      const writer = await lockedOtherProviderWriter(path, 'kimi', { refresh: 'updated' });
+
+      const started = Date.now();
+      const restored = restorePiAuthEntry(path, 'xai', backup);
+      const elapsed = Date.now() - started;
+      await assertChildSucceeded(writer);
+
+      assert.ok(elapsed >= 300, `restore did not wait for the auth lock (${elapsed}ms)`);
+      assert.deepEqual(restored, { refresh: 'backup' });
+      assert.deepEqual(readAuth(path), { xai: { refresh: 'backup' }, kimi: { refresh: 'updated' } });
+    } finally {
+      rmSync(dirname(path), { recursive: true, force: true });
+    }
+  });
+
+  it('restore does not delete an auth.json created by a locked writer', async () => {
+    const path = authPath('restore-delete-lock');
+    try {
+      const backup = writePiAuthBackup(path, 'xai', 'cycle');
+      const writer = await lockedOtherProviderWriter(path, 'kimi', { refresh: 'created' });
+
+      const started = Date.now();
+      const restored = restorePiAuthEntry(path, 'xai', backup);
+      const elapsed = Date.now() - started;
+      await assertChildSucceeded(writer);
+
+      assert.ok(elapsed >= 300, `restore did not wait for the auth lock (${elapsed}ms)`);
+      assert.equal(restored, undefined);
+      assert.equal(existsSync(path), true);
+      assert.deepEqual(readAuth(path), { kimi: { refresh: 'created' } });
     } finally {
       rmSync(dirname(path), { recursive: true, force: true });
     }
