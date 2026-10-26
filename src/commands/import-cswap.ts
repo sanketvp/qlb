@@ -1,7 +1,7 @@
 import { dirname, join } from 'node:path';
 
 import { claudePaths } from '../cc-paths';
-import { withClaudeConfigLock, withClaudeCredentialLocks } from '../cc-locks';
+import { withClaudeConfigPathLock, withClaudeCredentialLocks } from '../cc-locks';
 import { SqliteClaudeSlotRepository } from '../cc-slots';
 import { CswapImportRefusalError, importCswap, planCswapImport } from '../cswap-import';
 import { readClaudeConfig, readLiveClaudeCredentials } from '../cc-credentials';
@@ -71,15 +71,18 @@ async function execute(args: string[], ctx: CommandContext): Promise<number> {
       print(ctx, { ...plan, dryRun: true }, opts.json);
       return 0;
     }
+    // Resolve once: Claude's legacy/global selection is filesystem-dependent,
+    // so every lock and read below must use this exact path.
     const paths = claudePaths({ home: ctx.home, env: ctx.env });
-    const readLiveSnapshot = () => withClaudeCredentialLocks({ home: ctx.home, env: ctx.env }, () =>
-      withClaudeConfigLock({ home: ctx.home, env: ctx.env }, async () => ({
-        credential: await readLiveClaudeCredentials({ backend: platformKeychain, paths, env: ctx.env }),
-        // Claude's Keychain OAuth blob intentionally has no account UUID. The
-        // config identity and credential are therefore read as one lock-bound snapshot.
-        accountId: configuredOauthAccountId(paths.globalConfigPath),
-      })));
-    const result = await importCswap({ ...base, liveSnapshot: readLiveSnapshot });
+    const withLiveStateLocks = <T,>(fn: () => Promise<T> | T) => withClaudeCredentialLocks({ home: ctx.home, env: ctx.env }, () =>
+      withClaudeConfigPathLock(paths.globalConfigPath, { home: ctx.home, env: ctx.env }, fn));
+    const readLiveSnapshot = async () => ({
+      credential: await readLiveClaudeCredentials({ backend: platformKeychain, paths, env: ctx.env }),
+      // Claude's Keychain OAuth blob intentionally has no account UUID. The
+      // config identity and credential are read under the enclosing lock hold.
+      accountId: configuredOauthAccountId(paths.globalConfigPath),
+    });
+    const result = await importCswap({ ...base, liveSnapshot: readLiveSnapshot, withLiveStateLocks });
     print(ctx, { ...result.plan, runId: result.runId, phase: result.phase }, opts.json);
     return 0;
   } catch (error) {

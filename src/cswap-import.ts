@@ -91,8 +91,12 @@ export interface CswapImportOptions {
   liveAccountId?: () => Promise<string | null>;
   /** Production reads the credential and config identity while holding Claude's switch locks. */
   liveSnapshot?: () => Promise<{ credential: string; accountId: string | null }>;
+  /** Holds Claude's credential then config locks around an individual live-state transaction. */
+  withLiveStateLocks?: <T>(fn: () => Promise<T> | T) => Promise<T>;
   /** Test seam after the first live snapshot and before the required pre-commit re-read. */
   afterLiveSnapshot?: () => Promise<void> | void;
+  /** Test seam after the final locked re-check and before the SQLite commit. */
+  afterLiveRecheck?: () => Promise<void> | void;
   /** Test seam called only after recovery has acquired the shared import lock. */
   beforeRecovery?: () => Promise<void> | void;
   now?: () => number;
@@ -486,6 +490,10 @@ async function rollbackEffects(
 
 type LiveSnapshot = { credential: string; accountId: string | null };
 
+async function withLiveStateLocks<T>(options: CswapImportOptions, fn: () => Promise<T> | T): Promise<T> {
+  return options.withLiveStateLocks ? options.withLiveStateLocks(fn) : fn();
+}
+
 async function readLiveSnapshot(options: CswapImportOptions): Promise<LiveSnapshot> {
   if (options.liveSnapshot) return options.liveSnapshot();
   if (!options.liveCredential || !options.liveAccountId) {
@@ -561,7 +569,8 @@ async function importCswapLocked(options: CswapImportOptions): Promise<{ runId: 
       if (oauthFingerprint(actual, source.slotNum) !== source.fingerprint) throw new Error(`C-swap import verification failed for slot ${source.slotNum}`);
     }
 
-    const { effective, snapshot: firstLiveSnapshot } = await liveEffectiveCredentials(options, sourceSlots);
+    const { effective, snapshot: firstLiveSnapshot } = await withLiveStateLocks(options, () =>
+      liveEffectiveCredentials(options, sourceSlots));
     journal.phase = 'promoting';
     for (let index = 0; index < effective.length; index += 1) {
       journal.slots[index].promotedFingerprint = oauthFingerprint(effective[index].effectiveCredential, effective[index].slotNum);
@@ -617,30 +626,33 @@ async function importCswapLocked(options: CswapImportOptions): Promise<{ runId: 
       }
     }
 
-    // Re-read the credential/config pair under the same Claude locks before the
-    // SQLite authority commits. A native account switch cannot mix identities.
-    if (firstLiveSnapshot) {
-      await options.afterLiveSnapshot?.();
-      const secondLiveSnapshot = await readLiveSnapshot(options);
-      if (secondLiveSnapshot.credential !== firstLiveSnapshot.credential || secondLiveSnapshot.accountId !== firstLiveSnapshot.accountId) {
-        throw new CswapImportRefusalError('live-changed', 'C-swap import refused: live state changed during import');
+    // The final live read and SQLite authority commit share one lock hold. A
+    // native Claude switch therefore cannot interleave after the comparison.
+    if (firstLiveSnapshot) await options.afterLiveSnapshot?.();
+    let committedAt = 0;
+    await withLiveStateLocks(options, async () => {
+      if (firstLiveSnapshot) {
+        const secondLiveSnapshot = await readLiveSnapshot(options);
+        if (secondLiveSnapshot.credential !== firstLiveSnapshot.credential || secondLiveSnapshot.accountId !== firstLiveSnapshot.accountId) {
+          throw new CswapImportRefusalError('live-changed', 'C-swap import refused: live state changed during import');
+        }
       }
-    }
-
-    const committedAt = now();
-    options.repository.commitCswapImport({
-      runId, startedAt, committedAt,
-      slots: effective.map((source) => ({
-        slot: {
-          accountId: source.accountId, slotNum: source.slotNum, email: source.email, alias: source.alias,
-          orgUuid: source.orgUuid, configJson: source.configJson, fingerprint: credentialFingerprint(source.effectiveCredential),
-          prevFingerprint: source.effectivePrevious ? credentialFingerprint(source.effectivePrevious) : source.previousFingerprint,
-          threshold: source.threshold, dead: false, addedAt: committedAt, lastActiveAt: source.active ? committedAt : null,
-          source: 'cswap-import', archivedAt: null,
-        }, lineageFrom: source.effectiveFrom,
-      })),
-      activeAccountId: effective.find((slot) => slot.active)?.accountId ?? null,
-      snapshots: importedSnapshots(options, sourceSlots), config: importedSettings(options),
+      await options.afterLiveRecheck?.();
+      committedAt = now();
+      options.repository.commitCswapImport({
+        runId, startedAt, committedAt,
+        slots: effective.map((source) => ({
+          slot: {
+            accountId: source.accountId, slotNum: source.slotNum, email: source.email, alias: source.alias,
+            orgUuid: source.orgUuid, configJson: source.configJson, fingerprint: credentialFingerprint(source.effectiveCredential),
+            prevFingerprint: source.effectivePrevious ? credentialFingerprint(source.effectivePrevious) : source.previousFingerprint,
+            threshold: source.threshold, dead: false, addedAt: committedAt, lastActiveAt: source.active ? committedAt : null,
+            source: 'cswap-import', archivedAt: null,
+          }, lineageFrom: source.effectiveFrom,
+        })),
+        activeAccountId: effective.find((slot) => slot.active)?.accountId ?? null,
+        snapshots: importedSnapshots(options, sourceSlots), config: importedSettings(options),
+      });
     });
     journal.phase = 'committed';
     writeJournal(options, journal);

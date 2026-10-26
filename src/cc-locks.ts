@@ -320,6 +320,34 @@ export async function withClaudeCredentialLocks<T>(
     }));
 }
 
+/**
+ * Hold the proper-lockfile for an already resolved Claude global-config path.
+ *
+ * Callers that read a path chosen by claudePaths() must use this overload rather
+ * than resolving again: legacy `.config.json` selection is filesystem-dependent.
+ */
+export async function withClaudeConfigPathLock<T>(
+  configPath: string,
+  options: ClaudeLockOptions = {},
+  fn: (held: HeldClaudeConfigLock) => Promise<T> | T,
+): Promise<T> {
+  const paths = { ...claudeLockPaths(options), configLockDir: `${configPath}.lock` };
+  return withProperLockfile(paths.configLockDir, {
+    ...options,
+    stalenessMs: CONFIG_STALENESS_MS,
+  }, async () => {
+    const held = { [configLockHandle]: true } as HeldClaudeConfigLock;
+    activeConfigLockHandles.add(held);
+    activeConfigLockPaths.set(held, paths);
+    try {
+      return await fn(held);
+    } finally {
+      activeConfigLockHandles.delete(held);
+      activeConfigLockPaths.delete(held);
+    }
+  });
+}
+
 /** Hold Claude Code's global-config proper-lockfile directory for a local read-modify-write. */
 export async function withClaudeConfigLock<T>(
   options: ClaudeLockOptions = {},

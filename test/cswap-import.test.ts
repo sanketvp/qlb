@@ -1,11 +1,14 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
 import { credentialFingerprint } from '../src/anthropic-oauth';
 import { InMemoryClaudeSlotRepository, SqliteClaudeSlotRepository } from '../src/cc-slots';
+import { withClaudeConfigPathLock, withClaudeCredentialLocks } from '../src/cc-locks';
+import { claudePaths } from '../src/cc-paths';
+import { readClaudeConfig } from '../src/cc-credentials';
 import { MockKeychain, QLB_KEYCHAIN_ACCOUNT } from '../src/keychain';
 import { openStore } from '../src/store';
 import {
@@ -270,6 +273,75 @@ describe('C-swap import (K10 / AC16)', () => {
     }), (error: unknown) => error instanceof CswapImportRefusalError && error.code === 'live-changed');
     assert.equal(h.repo.listSlots().length, 0);
     await assert.rejects(h.keychain.get('qlb:anthropic:account-a', QLB_KEYCHAIN_ACCOUNT), /item not found/);
+  });
+
+  it('keeps one resolved config path locked and read when a legacy config appears after staging', async () => {
+    const h = fixture();
+    const home = join(h.root, 'home');
+    const env = { QLB_TEST_MODE: '1', QLB_HOME: join(h.root, 'qlb-home'), HOME: home };
+    const paths = claudePaths({ home, env });
+    mkdirSync(paths.configHome, { recursive: true });
+    writeFileSync(paths.globalConfigPath, JSON.stringify({ oauthAccount: { accountUuid: 'account-a' } }));
+    const withLiveStateLocks = <T>(fn: () => Promise<T> | T) => withClaudeCredentialLocks({ home, env }, () =>
+      withClaudeConfigPathLock(paths.globalConfigPath, { home, env }, fn));
+    let legacyAppeared = false;
+    const keychain = {
+      get: h.keychain.get.bind(h.keychain), delete: h.keychain.delete.bind(h.keychain),
+      set: async (service: string, account: string, value: string) => {
+        if (!legacyAppeared && service.includes(':staging:')) {
+          legacyAppeared = true;
+          writeFileSync(join(paths.configHome, '.config.json'), JSON.stringify({ oauthAccount: { accountUuid: 'account-b' } }));
+        }
+        await h.keychain.set(service, account, value);
+      },
+    };
+    await assert.doesNotReject(importCswap({
+      backupDir: h.backup, journalDir: join(h.root, 'journals'), keychain, repository: h.repo,
+      runId: 'fixed-config-path', withLiveStateLocks,
+      liveSnapshot: async () => {
+        assert.equal(existsSync(`${paths.globalConfigPath}.lock`), true, 'the resolved global config is locked');
+        assert.equal(existsSync(join(paths.configHome, '.config.json.lock')), false, 'the later legacy config is not locked');
+        const oauth = readClaudeConfig(paths.globalConfigPath).oauthAccount as { accountUuid?: unknown };
+        return { credential: credential('account-a', 'live-successor'), accountId: typeof oauth.accountUuid === 'string' ? oauth.accountUuid : null };
+      },
+    }));
+    assert.equal(legacyAppeared, true);
+    assert.equal(h.repo.getSlot('account-a')?.fingerprint, credentialFingerprint(credential('account-a', 'live-successor')));
+  });
+
+  it('holds the live-state locks from the final re-check through the SQLite commit', async () => {
+    const h = fixture();
+    const home = join(h.root, 'home');
+    const env = { QLB_TEST_MODE: '1', QLB_HOME: join(h.root, 'qlb-home'), HOME: home };
+    const paths = claudePaths({ home, env });
+    mkdirSync(paths.configHome, { recursive: true });
+    writeFileSync(paths.globalConfigPath, JSON.stringify({ oauthAccount: { accountUuid: 'account-a' } }));
+    const withLiveStateLocks = <T>(fn: () => Promise<T> | T) => withClaudeCredentialLocks({ home, env }, () =>
+      withClaudeConfigPathLock(paths.globalConfigPath, { home, env }, fn));
+    let liveAccount = 'account-a';
+    let nativeFinished = false;
+    let nativeSwitch: Promise<void> | undefined;
+    const originalCommit = h.repo.commitCswapImport.bind(h.repo);
+    h.repo.commitCswapImport = (input) => {
+      assert.equal(liveAccount, 'account-a', 'the live account remains unchanged at commit time');
+      assert.equal(input.activeAccountId, liveAccount, 'the committed active login matches the live account at commit time');
+      assert.equal(nativeFinished, false, 'a native switch is still blocked by the held locks');
+      originalCommit(input);
+    };
+    await assert.doesNotReject(importCswap({
+      backupDir: h.backup, journalDir: join(h.root, 'journals'), keychain: h.keychain, repository: h.repo,
+      runId: 'commit-under-live-locks', withLiveStateLocks,
+      liveSnapshot: async () => ({ credential: credential('account-a', 'live-successor'), accountId: liveAccount }),
+      afterLiveRecheck: () => {
+        nativeSwitch = withLiveStateLocks(async () => {
+          liveAccount = 'account-b';
+          nativeFinished = true;
+        });
+      },
+    }));
+    assert.ok(nativeSwitch, 'the simulated native switch was started');
+    await nativeSwitch;
+    assert.equal(nativeFinished, true, 'the native switch completes after the SQLite commit');
   });
 
   it('fails closed on unreadable commit authority, then recovery resolves both committed and absent runs', async () => {
