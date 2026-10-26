@@ -24,10 +24,20 @@ import { openStore } from '../src/store';
 import { defaultConfig } from '../src/config';
 import { doctorQlb } from '../src/diagnostics';
 import { gateLifecycleAdmissionCode, runExecutingCommand } from '../src/cli';
+import type { CswapAgent } from '../src/cswap-agent';
 
 function fixtureStore() {
   return openStore(join(mkdtempSync(join(tmpdir(), 'qlb-lifecycle-')), 'qlb.db'));
 }
+
+// @ts-expect-error S57 requires every CswapAgent to implement drain.
+const agentMissingDrain: CswapAgent = {
+  bootout: () => ({ ok: true }),
+  disable: () => ({ ok: true }),
+  movePlist: () => ({ ok: true }),
+  restorePlist: () => ({ ok: true }),
+};
+void agentMissingDrain;
 
 function prepareCommit(store: ReturnType<typeof openStore>): void {
   insertClaudeImport(store);
@@ -67,8 +77,9 @@ describe('lifecycle (AC49)', () => {
         disable: () => { calls.push('disable'); return { ok: true }; },
         movePlist: () => { calls.push('move'); return { ok: true }; },
         restorePlist: () => { calls.push('restore'); return { ok: true }; },
+        drain: () => { calls.push('drain'); return { ok: true }; },
       });
-      assert.deepEqual(calls, ['bootout', 'disable', 'move']);
+      assert.deepEqual(calls, ['bootout', 'disable', 'move', 'drain']);
       assert.deepEqual(success, { ok: true, state: 'cutting-over' });
     } finally { store.close(); }
 
@@ -140,6 +151,7 @@ describe('lifecycle (AC49)', () => {
       const agent = {
         bootout: () => ({ ok: true }), disable: () => ({ ok: true }), movePlist: () => ({ ok: true }),
         restorePlist: () => ({ ok: true }),
+        drain: () => ({ ok: true }),
       };
       assert.equal((await cutoverBegin(store.dbPath, agent)).ok, true);
       const second = await cutoverBegin(store.dbPath, agent);
@@ -234,6 +246,7 @@ describe('lifecycle (AC49)', () => {
       const begin = cutoverBegin(store.dbPath, {
         bootout: async () => { startedBootout(); await bootoutReleased; return { ok: true }; },
         disable: () => ({ ok: true }), movePlist: () => ({ ok: true }), restorePlist: () => ({ ok: true }),
+        drain: () => ({ ok: true }),
       });
       await bootoutStarted;
       for (const operation of ['import-cswap', 'pi-migrate', 'pi-rollback', 'switch:manual', 'gate', 'cutover-commit', 'cutover-abort'] as const) {
@@ -257,6 +270,7 @@ describe('lifecycle (AC49)', () => {
         bootout: () => ({ ok: false, code: 'bootout-failed' }),
         disable: () => ({ ok: true }), movePlist: () => ({ ok: true }),
         restorePlist: () => { restored = true; return { ok: true }; },
+        drain: () => ({ ok: true }),
       });
       assert.equal(restored, true);
       assert.deepEqual(result, { ok: false, code: 'bootout-failed', state: 'aborted' });

@@ -51,6 +51,10 @@ export async function cutoverBegin(storePath: string, agent: CswapAgent = unavai
         failureCode = result.code ?? 'cswap-agent-failed';
         break;
       }
+      if (failureCode == null) {
+        const result = await agent.drain();
+        if (!result.ok) failureCode = result.code ?? 'cswap-agent-failed';
+      }
     } catch (err) {
       failureCode = err instanceof Error ? err.message : String(err);
     }
