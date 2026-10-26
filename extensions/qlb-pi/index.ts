@@ -63,7 +63,9 @@ import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { streamWithAuthRetry } from "./auth-retry.js";
 import {
+  composeOpenRouterModels,
   openRouterSourceMode,
+  readOpenRouterModelsJson,
   registerOpenRouterSource,
   registerOpenRouterUnavailableSource,
   type OpenRouterSourceDeps,
@@ -265,15 +267,21 @@ async function resolveOpenRouterSourceDeps(): Promise<OpenRouterSourceDeps> {
     openAICompletionsApi?: () => { streamSimple?: OpenRouterSourceDeps["transport"] };
     anthropicMessagesApi?: () => { streamSimple?: OpenRouterSourceDeps["transport"] };
   };
-  const models = namespace.getModels?.("openrouter");
+  const builtinModels = namespace.getModels?.("openrouter");
   const openai = namespace.openAICompletionsApi?.().streamSimple;
   const anthropic = namespace.anthropicMessagesApi?.().streamSimple;
-  if (!models || typeof openai !== "function" || typeof anthropic !== "function") {
+  if (!builtinModels || typeof openai !== "function" || typeof anthropic !== "function") {
     throw new Error("qlb-pi: Pi compat has no OpenRouter model catalog or transport");
   }
+  // ExtensionAPI exposes no ModelRuntime/composed catalog. Mirror Pi's models.json
+  // JSONC parsing and composition here so registering models does not discard an
+  // operator's OpenRouter additions, metadata, or provider baseUrl.
+  const config = readOpenRouterModelsJson(join(homedir(), ".pi", "agent", "models.json"));
+  const models = composeOpenRouterModels(builtinModels, config);
   const anthropicModelIds = new Set(models.filter((model) => model.api === "anthropic-messages").map((model) => model.id));
   return {
     models,
+    ...(config?.baseUrl ? { baseUrl: config.baseUrl } : {}),
     createStream: () => createAssistantMessageEventStream() as never,
     transport: (model, context, options) => {
       const api = anthropicModelIds.has(model.id) ? "anthropic-messages" : "openai-completions";
@@ -304,9 +312,9 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   if (openRouterSourceMode() !== "inert") {
     const openRouterProviderApi = pi as unknown as OpenRouterProviderApi;
     try {
-      registerOpenRouterSource(openRouterProviderApi, await resolveOpenRouterSourceDeps());
+      await registerOpenRouterSource(openRouterProviderApi, await resolveOpenRouterSourceDeps());
     } catch {
-      registerOpenRouterUnavailableSource(openRouterProviderApi, () => createAssistantMessageEventStream() as never);
+      await registerOpenRouterUnavailableSource(openRouterProviderApi, () => createAssistantMessageEventStream() as never);
     }
   }
 

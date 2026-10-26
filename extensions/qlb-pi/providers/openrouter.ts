@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -15,7 +15,14 @@ const OWNER_FILE = join(homedir(), '.pi', 'agent', 'qlb-owner.json');
 const STREAM_API = 'openai-completions' as const;
 const AUTH_HEADERS = new Set(['authorization', 'x-api-key', 'cf-aig-authorization']);
 
-type ModelLike = { id: string; api?: unknown; provider?: unknown; [key: string]: unknown };
+type ModelLike = { id: string; api?: unknown; provider?: unknown; baseUrl?: unknown; [key: string]: unknown };
+type OpenRouterModelsConfig = {
+  baseUrl?: string;
+  api?: string;
+  compat?: Record<string, unknown>;
+  models?: ModelLike[];
+  modelOverrides?: Record<string, ModelLike>;
+};
 type EventSink = AsyncIterable<unknown> & { push(value: unknown): void; end(): void };
 export type OpenRouterTransport = (
   model: ModelLike,
@@ -36,17 +43,20 @@ export interface OpenRouterSourceDeps {
   createStream?: () => EventSink;
   /** Pi's built-in OpenRouter chat catalog, supplied by index.ts's compat import. */
   models?: ModelLike[];
+  /** Pi's models.json OpenRouter provider baseUrl, if configured. */
+  baseUrl?: string;
 }
 
 interface OpenRouterProviderConfig {
   api: typeof STREAM_API;
+  baseUrl?: string;
   streamSimple: (model: ModelLike, context: unknown, options?: Record<string, unknown>) => EventSink;
   models: ModelLike[];
 }
 
 export interface ProviderApi {
-  unregisterProvider(name: string): void;
-  registerProvider(name: string, config: OpenRouterProviderConfig): void;
+  unregisterProvider(name: string): void | Promise<void>;
+  registerProvider(name: string, config: OpenRouterProviderConfig): void | Promise<void>;
 }
 
 function findQlbCli(): { command: string; prefix: string[] } {
@@ -114,6 +124,98 @@ function normalizedModels(models: ModelLike[] | undefined): ModelLike[] {
   return (models ?? []).map((model) => ({ ...model, api: STREAM_API }));
 }
 
+/** Pi's JSONC normalizer: comments and trailing commas are accepted by models.json. */
+function stripJsonComments(input: string): string {
+  return input
+    .replace(/"(?:\\.|[^"\\])*"|\/\/[^\n]*/g, (match) => (match[0] === '"' ? match : ''))
+    .replace(/"(?:\\.|[^"\\])*"|,(\s*[}\]])/g, (match, tail) => tail ?? (match[0] === '"' ? match : ''));
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Read the OpenRouter part of models.json with Pi's JSONC normalization. Pi does
+ * not expose its composed catalog through ExtensionAPI, so this preserves the
+ * same provider layer before the gated extension replaces that catalog.
+ */
+export function readOpenRouterModelsJson(path: string): OpenRouterModelsConfig | undefined {
+  try {
+    const parsed: unknown = JSON.parse(stripJsonComments(readFileSync(path, 'utf8').replace(/^\uFEFF/, '')));
+    if (!isObject(parsed) || !isObject(parsed.providers) || !isObject(parsed.providers.openrouter)) return undefined;
+    const config = parsed.providers.openrouter;
+    if ((config.baseUrl !== undefined && typeof config.baseUrl !== 'string') ||
+        (config.api !== undefined && typeof config.api !== 'string') ||
+        (config.models !== undefined && !Array.isArray(config.models)) ||
+        (config.modelOverrides !== undefined && !isObject(config.modelOverrides))) return undefined;
+    if (config.models?.some((model) => !isObject(model) || typeof model.id !== 'string' || model.id.length === 0)) return undefined;
+    return config as OpenRouterModelsConfig;
+  } catch {
+    // ModelConfig treats unreadable or invalid files as an empty provider map.
+    return undefined;
+  }
+}
+
+function mergeModelOverride(model: ModelLike, override: ModelLike | undefined): ModelLike {
+  if (!override) return model;
+  const baseCompat = isObject(model.compat) ? model.compat : undefined;
+  const overrideCompat = isObject(override.compat) ? override.compat : undefined;
+  return {
+    ...model,
+    ...override,
+    id: model.id,
+    api: model.api,
+    provider: model.provider,
+    baseUrl: model.baseUrl,
+    compat: overrideCompat ? { ...baseCompat, ...overrideCompat } : model.compat,
+  };
+}
+
+/** Mirrors Pi's applyModelsJson upsert/baseUrl/override order for OpenRouter chat models. */
+export function composeOpenRouterModels(baseModels: ModelLike[], config?: OpenRouterModelsConfig): ModelLike[] {
+  const models: ModelLike[] = baseModels.map((model) => ({
+    ...model,
+    baseUrl: config?.baseUrl ?? model.baseUrl,
+    compat: config?.compat && isObject(model.compat) ? { ...model.compat, ...config.compat } : model.compat,
+  }));
+  for (const definition of config?.models ?? []) {
+    const existingIndex = models.findIndex((model) => model.id === definition.id);
+    const defaults = existingIndex >= 0
+      ? models[existingIndex]
+      : models.find((model) => model.api === definition.api)
+        ?? models.find((model) => model.api === config?.api)
+        ?? models.find((model) => model.api === STREAM_API)
+        ?? models[0];
+    const api = definition.api ?? config?.api ?? defaults?.api;
+    const baseUrl = definition.baseUrl ?? config?.baseUrl ?? defaults?.baseUrl;
+    if (typeof api !== 'string' || typeof baseUrl !== 'string' || baseUrl.length === 0) {
+      throw new Error(`qlb-pi: OpenRouter model ${definition.id} has no API or baseUrl`);
+    }
+    const model: ModelLike = {
+      id: definition.id,
+      name: definition.name ?? definition.id,
+      api,
+      provider: 'openrouter',
+      baseUrl,
+      reasoning: definition.reasoning ?? false,
+      thinkingLevelMap: definition.thinkingLevelMap,
+      input: definition.input ?? ['text'],
+      inputLimits: definition.inputLimits,
+      cost: definition.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      promptCache: definition.promptCache,
+      contextWindow: definition.contextWindow ?? 128000,
+      maxTokens: definition.maxTokens ?? 16384,
+      samplingParams: definition.samplingParams,
+      samplingParamsByThinkingLevel: definition.samplingParamsByThinkingLevel,
+      compat: definition.compat ?? (config?.compat && isObject(defaults?.compat) ? { ...defaults.compat, ...config.compat } : undefined),
+    };
+    if (existingIndex >= 0) models[existingIndex] = model;
+    else models.push(model);
+  }
+  return models.map((model) => mergeModelOverride(model, config?.modelOverrides?.[model.id]));
+}
+
 /**
  * Per-request OpenRouter source. The QLB gate is the sole credential source;
  * a failed gate produces one fail-closed event and never calls transport.
@@ -174,11 +276,11 @@ function failClosedStream(createStream: () => EventSink, cause: string) {
 }
 
 /** Registers a fail-closed replacement if Pi compat cannot be loaded. */
-export function registerOpenRouterUnavailableSource(pi: ProviderApi, createStream: () => EventSink): void {
-  pi.unregisterProvider('openrouter');
+export async function registerOpenRouterUnavailableSource(pi: ProviderApi, createStream: () => EventSink): Promise<void> {
+  await pi.unregisterProvider('openrouter');
   // An empty catalog prevents built-in chat, image and classifier models from
   // falling through while the replacement source cannot be initialized.
-  pi.registerProvider('openrouter', {
+  await pi.registerProvider('openrouter', {
     api: STREAM_API,
     models: [],
     streamSimple: failClosedStream(createStream, 'unknown'),
@@ -194,16 +296,34 @@ export function openRouterSourceMode(deps: OpenRouterSourceDeps = {}): 'inert' |
 }
 
 /** Registers only the OpenRouter provider when its v2 owner entry is present. */
-export function registerOpenRouterSource(pi: ProviderApi, deps: OpenRouterSourceDeps = {}): boolean {
+export async function registerOpenRouterSource(pi: ProviderApi, deps: OpenRouterSourceDeps = {}): Promise<boolean> {
   const mode = openRouterSourceMode(deps);
   if (mode === 'inert') return false;
 
   const createStream = deps.createStream;
   if (!createStream) throw new Error('qlb-pi: OpenRouter event stream is unavailable');
-  pi.unregisterProvider('openrouter');
   const models = normalizedModels(deps.models);
-  pi.registerProvider('openrouter', mode === 'owned'
-    ? { api: STREAM_API, models, streamSimple: createOpenRouterStream(deps) }
-    : { api: STREAM_API, models, streamSimple: failClosedStream(createStream, 'owner-file-malformed') });
+  const unavailable: OpenRouterProviderConfig = {
+    api: STREAM_API,
+    models: [],
+    streamSimple: failClosedStream(createStream, mode === 'owned' ? 'unknown' : 'owner-file-malformed'),
+  };
+  await pi.unregisterProvider('openrouter');
+  // Extension-load registrations are queued by Pi. Queue a valid empty source
+  // first: if Pi later rejects the real source, it leaves this replacement
+  // registered instead of restoring the native credential-backed provider.
+  await pi.registerProvider('openrouter', unavailable);
+  if (mode !== 'owned') return true;
+  try {
+    await pi.registerProvider('openrouter', {
+      api: STREAM_API,
+      ...(deps.baseUrl ? { baseUrl: deps.baseUrl } : {}),
+      models,
+      streamSimple: createOpenRouterStream(deps),
+    });
+  } catch {
+    // The already-registered empty source remains active. This also covers
+    // direct (post-load) registrations whose validation rejects asynchronously.
+  }
   return true;
 }

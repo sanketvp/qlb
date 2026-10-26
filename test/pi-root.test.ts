@@ -204,7 +204,7 @@ describe('locatePi', () => {
 });
 
 describe('pi:extension copied-layout drift check', () => {
-  it('flags missing or different sibling src/redact.ts and prescribes copying it', () => {
+  it('flags missing or different sibling src/redact.ts and prescribes deployment', () => {
     const base = tmp('qlb-pi-extension-');
     const extensionDir = join(base, 'agent', 'extensions', 'qlb-pi');
     mkdirSync(extensionDir, { recursive: true });
@@ -218,8 +218,7 @@ describe('pi:extension copied-layout drift check', () => {
     assert.equal(check.level, 'WARN');
     assert.match(check.message, /src\/redact\.ts/);
     const fix = String((check.detail as { fix?: unknown } | undefined)?.fix);
-    assert.match(fix, /mkdir -p .*src/);
-    assert.match(fix, /cp .*src\/redact\.ts/);
+    assert.equal(fix, 'qlb pi deploy');
 
     const installedRedact = join(base, 'agent', 'src', 'redact.ts');
     mkdirSync(join(base, 'agent', 'src'), { recursive: true });

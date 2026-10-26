@@ -5,7 +5,9 @@ import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
 import {
+  composeOpenRouterModels,
   createOpenRouterStream,
+  readOpenRouterModelsJson,
   registerOpenRouterSource,
   type GateRun,
   type OpenRouterTransport,
@@ -93,11 +95,57 @@ describe('qlb-pi OpenRouter source', () => {
     }
   });
 
+  it('keeps models.json OpenRouter models, overrides, and provider baseUrl in the gated catalog', () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-openrouter-models-'));
+    const modelsJson = join(root, 'models.json');
+    writeFileSync(modelsJson, `{
+      // Pi accepts JSONC models.json files.
+      "providers": { "openrouter": {
+        "baseUrl": "https://regional.openrouter.example/api/v1",
+        "models": [{ "id": "custom", "name": "Custom", "contextWindow": 1000, "maxTokens": 100, }],
+        "modelOverrides": { "builtin": { "name": "Overridden", "contextWindow": 200 } },
+      } },
+    }`);
+    const models = composeOpenRouterModels([
+      {
+        id: 'builtin', name: 'Builtin', api: 'openai-completions', provider: 'openrouter',
+        baseUrl: 'https://openrouter.ai/api/v1', reasoning: false, input: ['text'],
+        cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100, maxTokens: 10,
+      },
+    ], readOpenRouterModelsJson(modelsJson));
+
+    assert.deepEqual(models.map((entry) => ({
+      id: entry.id, name: entry.name, baseUrl: entry.baseUrl, contextWindow: entry.contextWindow, api: entry.api,
+    })), [
+      { id: 'builtin', name: 'Overridden', baseUrl: 'https://regional.openrouter.example/api/v1', contextWindow: 200, api: 'openai-completions' },
+      { id: 'custom', name: 'Custom', baseUrl: 'https://regional.openrouter.example/api/v1', contextWindow: 1000, api: 'openai-completions' },
+    ]);
+  });
+
+  it('keeps the fail-closed registration when a provider registration rejects asynchronously', async () => {
+    const configs: Array<{ models: unknown[] }> = [];
+    const pi = {
+      unregisterProvider: () => {},
+      registerProvider: (_name: string, config: any) => {
+        configs.push(config);
+        return configs.length === 1 ? Promise.resolve() : Promise.reject(new Error('deferred validation failed'));
+      },
+    };
+    const registered = await registerOpenRouterSource(pi, {
+      ownerPath: '/fixture/qlb-owner.json', readOwner: () => ownedOwner(),
+      models: [{ id: 'valid', api: 'openai-completions', provider: 'openrouter', baseUrl: 'https://openrouter.ai/api/v1' }],
+      transport: () => new Events(), createStream: () => new Events(),
+    });
+
+    assert.equal(registered, true);
+    assert.deepEqual(configs.map((config) => config.models), [[], [{ id: 'valid', api: 'openai-completions', provider: 'openrouter', baseUrl: 'https://openrouter.ai/api/v1' }]]);
+  });
+
   it('registers an owned provider for the OpenAI API family and normalizes every chat model through the gate', async () => {
     const calls: string[] = [];
     let config: any;
     const pi = {
-      unregisterProvider: (name: string) => calls.push(`unregister:${name}`),
+      unregisterProvider: (name: string) => { calls.push(`unregister:${name}`); },
       registerProvider: (name: string, next: { streamSimple: ReturnType<typeof createOpenRouterStream> }) => {
         calls.push(`register:${name}`);
         config = next;
@@ -119,8 +167,8 @@ describe('qlb-pi OpenRouter source', () => {
       createStream: () => new Events(),
     };
 
-    assert.equal(registerOpenRouterSource(pi, deps), true);
-    assert.deepEqual(calls, ['unregister:openrouter', 'register:openrouter']);
+    assert.equal(await registerOpenRouterSource(pi, deps), true);
+    assert.deepEqual(calls, ['unregister:openrouter', 'register:openrouter', 'register:openrouter']);
     assert.ok(config);
     assert.equal(config.api, 'openai-completions');
     assert.deepEqual(config.models.map((entry: { api: string }) => entry.api), ['openai-completions', 'openai-completions']);
@@ -129,10 +177,10 @@ describe('qlb-pi OpenRouter source', () => {
     assert.equal(gateCalls, 1);
 
     calls.length = 0;
-    assert.equal(registerOpenRouterSource(pi, { ...deps, readOwner: () => undefined }), false);
+    assert.equal(await registerOpenRouterSource(pi, { ...deps, readOwner: () => undefined }), false);
     assert.deepEqual(calls, []);
 
-    assert.equal(registerOpenRouterSource(pi, { ...deps, readOwner: () => '{' }), true);
+    assert.equal(await registerOpenRouterSource(pi, { ...deps, readOwner: () => '{' }), true);
     assert.deepEqual(calls, ['unregister:openrouter', 'register:openrouter']);
     const output = config!.streamSimple(model(), { messages: [] });
     await new Promise((resolve) => setImmediate(resolve));
@@ -171,6 +219,7 @@ describe('Pi deployed extension drift', () => {
     cpSync(join(process.cwd(), 'extensions', 'qlb-pi'), extensionDir, { recursive: true });
     cpSync(join(process.cwd(), 'src', 'redact.ts'), join(redactDir, 'redact.ts'));
     writeFileSync(join(extensionDir, 'providers', 'openrouter.ts'), 'changed\n');
+    writeFileSync(join(extensionDir, 'providers', 'stale.ts'), 'stale\n');
 
     const checks = piIntegrationChecks({
       extensionDir,
@@ -179,6 +228,8 @@ describe('Pi deployed extension drift', () => {
     const extension = checks.find((check) => check.name === 'pi:extension');
     assert.equal(extension?.level, 'WARN');
     assert.match(extension?.message ?? '', /providers\/openrouter\.ts/);
+    assert.match(extension?.message ?? '', /providers\/stale\.ts/);
+    assert.equal((extension?.detail as { fix?: string } | undefined)?.fix, 'qlb pi deploy');
   });
 });
 

@@ -274,12 +274,13 @@ export function piIntegrationChecks(options: PiIntegrationOptions = {}): DoctorC
       ...(readText(join(repoRoot, 'src', 'redact.ts')) === readText(installedRedact) ? [] : ['src/redact.ts']),
     ];
 
-    const redactDir = join(PI_EXT_DIR, '..', '..', 'src');
     checks.push(drift.length === 0
       ? { name: 'pi:extension', level: 'PASS', message: `${PI_EXT_DIR} matches ${src} (pi ${piVersion} at ${PI_PKG})` }
       : {
         name: 'pi:extension', level: 'WARN', message: `installed qlb-pi differs from source: ${drift.join(', ')}`,
-        detail: { fix: `cp -R ${src}/. ${PI_EXT_DIR}/ && mkdir -p ${redactDir} && cp ${join(repoRoot, 'src', 'redact.ts')} ${installedRedact}` },
+        // `qlb pi deploy` publishes a staged whole-directory replacement, so it
+        // removes stale nested files as well as copying the current extension.
+        detail: { fix: 'qlb pi deploy' },
       });
   }
 
