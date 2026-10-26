@@ -3,7 +3,7 @@
 // better-sqlite3 for the same synchronous BEGIN IMMEDIATE style; node:sqlite
 // provides that without a native addon, so we use it instead of adding a
 // dependency. If `node:sqlite` is ever unavailable, switch to `better-sqlite3`.
-import { chmodSync, existsSync, mkdirSync, rmSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readdirSync, rmSync, statSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { assertStoredReloginFields, isReloginEvidenceClass, reloginDetailFingerprint, reloginDetailValue } from './relogin-fields';
@@ -11,7 +11,7 @@ import { dirname, join } from 'node:path';
 import { backup, DatabaseSync, type StatementSync } from 'node:sqlite';
 import { inspectAccountSafety, safetyRefusalMessage } from './accounts-prune';
 import { config } from './config';
-import { redactSecrets } from './redact';
+import { redactJson, redactKeyValueText, redactSecrets } from './redact';
 import type { BucketReading, Confidence } from './types';
 
 export const DEFAULT_DB_PATH = config.dbPath;
@@ -311,6 +311,105 @@ function ensurePrivateDir(dir: string): void {
 
 type BackupVerifier = (source: DatabaseSync, copy: DatabaseSync) => boolean;
 
+const LIFECYCLE_ONE_OPEN_INDEX_SQL = `CREATE UNIQUE INDEX lifecycle_one_open ON lifecycle ((1))
+  WHERE state IN ('cutting-over','cutover','undoing','rolled-back','retired','aborted')`;
+
+// This is the authoritative v5 shape. Both migration DDL and pre-release-v5
+// completeness checks use it, so a newly added v5 column cannot be omitted
+// from the correction path.
+const V5_SCHEMA_DDL = `
+  CREATE TABLE IF NOT EXISTS decisions (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, session TEXT, harness TEXT, requested_model TEXT, effort TEXT, served_model TEXT, account_id TEXT, mode TEXT, reason TEXT, snapshot_json TEXT, strategy TEXT, provider TEXT);
+  CREATE TABLE IF NOT EXISTS claude_slots (account_id TEXT PRIMARY KEY, slot_num INTEGER UNIQUE, email TEXT, alias TEXT, org_uuid TEXT, config_json TEXT NOT NULL, fingerprint TEXT, prev_fingerprint TEXT, threshold REAL, dead INTEGER NOT NULL DEFAULT 0, dead_reason TEXT, dead_at INTEGER, healed_at INTEGER, added_at INTEGER NOT NULL, last_active_at INTEGER, source TEXT, archived_at INTEGER);
+  CREATE TABLE IF NOT EXISTS codex_slots (account_id TEXT PRIMARY KEY, chatgpt_user_id TEXT NOT NULL, chatgpt_account_id TEXT NOT NULL, email TEXT, alias TEXT, fingerprint TEXT, prev_fingerprint TEXT, threshold REAL, last_refresh TEXT, dead INTEGER NOT NULL DEFAULT 0, dead_reason TEXT, dead_at INTEGER, healed_at INTEGER, pending_adopt INTEGER NOT NULL DEFAULT 0, added_at INTEGER NOT NULL, last_active_at INTEGER, source TEXT, archived_at INTEGER);
+  CREATE TABLE IF NOT EXISTS active_login (provider TEXT PRIMARY KEY, account_id TEXT, since INTEGER NOT NULL, set_by TEXT NOT NULL);
+  CREATE TABLE IF NOT EXISTS switch_log (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, provider TEXT NOT NULL, from_account TEXT, to_account TEXT NOT NULL, trigger TEXT NOT NULL, outcome TEXT NOT NULL, outgoing_kind TEXT, binding_json TEXT, steps_json TEXT, open_sessions_json TEXT, error TEXT, injected INTEGER NOT NULL DEFAULT 0, detail TEXT, published_at INTEGER, committed_at INTEGER);
+  CREATE TABLE IF NOT EXISTS usage_polls (provider TEXT NOT NULL, account_id TEXT NOT NULL, last_fetch_at INTEGER, last_attempt_at INTEGER, next_due_at INTEGER, poll_interval_s REAL, last_status TEXT, consecutive_failures INTEGER NOT NULL DEFAULT 0, backoff_until INTEGER, last_429_at INTEGER, held_until INTEGER, PRIMARY KEY (provider, account_id));
+  CREATE TABLE IF NOT EXISTS relogin_events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, provider TEXT NOT NULL, account_id TEXT, kind TEXT NOT NULL, detail TEXT, evidence TEXT, user_denied_at INTEGER);
+  CREATE TABLE IF NOT EXISTS health_log (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, phase TEXT NOT NULL, overall TEXT NOT NULL, failing_json TEXT NOT NULL, dead_slots_json TEXT NOT NULL, release_sha TEXT);
+  CREATE TABLE IF NOT EXISTS lineage_log (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, provider TEXT NOT NULL, account_id TEXT NOT NULL, from_fp TEXT, to_fp TEXT NOT NULL, cause TEXT NOT NULL, by TEXT NOT NULL, evidence TEXT);
+  CREATE TABLE IF NOT EXISTS lifecycle (id INTEGER PRIMARY KEY AUTOINCREMENT, state TEXT NOT NULL, began_at INTEGER NOT NULL, cutover_at INTEGER, window_end INTEGER, extended_at INTEGER, undo_began_at INTEGER, rollback_at INTEGER, retired_at INTEGER, closed_at INTEGER, release_sha TEXT, drill_done_at INTEGER, note TEXT, pre_fence_state TEXT);
+  CREATE TABLE IF NOT EXISTS codex_watch (switch_id INTEGER PRIMARY KEY, provider TEXT NOT NULL, outgoing TEXT NOT NULL, target TEXT NOT NULL, next_at INTEGER NOT NULL, until INTEGER NOT NULL);
+  CREATE TABLE IF NOT EXISTS import_runs (run_id TEXT PRIMARY KEY, started_at INTEGER NOT NULL, committed_at INTEGER);
+  CREATE TABLE IF NOT EXISTS pi_export_targets (provider TEXT NOT NULL, target TEXT NOT NULL, slot_account_id TEXT NOT NULL, lineage_fp TEXT NOT NULL, recorded_at INTEGER NOT NULL, PRIMARY KEY (provider, target));
+  CREATE TABLE IF NOT EXISTS codex_live_observations (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, identity TEXT, lineage_fp TEXT, by TEXT NOT NULL);
+`;
+
+interface V5ColumnShape {
+  name: string;
+  definition: string;
+  type: string;
+  notNull: boolean;
+  defaultValue: string | null;
+  primaryKeyOrder: number;
+  unique: boolean;
+}
+
+interface V5TableShape {
+  columns: V5ColumnShape[];
+  sql: string;
+}
+
+interface TableColumn {
+  name: string;
+  type: string;
+  notnull: number;
+  dflt_value: string | null;
+  pk: number;
+  hidden?: number;
+}
+
+function splitColumnDefinitions(definitions: string): string[] {
+  const parts: string[] = [];
+  let depth = 0;
+  let start = 0;
+  for (let index = 0; index < definitions.length; index += 1) {
+    if (definitions[index] === '(') depth += 1;
+    if (definitions[index] === ')') depth -= 1;
+    if (definitions[index] === ',' && depth === 0) {
+      parts.push(definitions.slice(start, index).trim());
+      start = index + 1;
+    }
+  }
+  parts.push(definitions.slice(start).trim());
+  return parts;
+}
+
+function loadV5TableShapes(): Map<string, V5TableShape> {
+  const tables = new Map<string, V5TableShape>();
+  for (const match of V5_SCHEMA_DDL.matchAll(/CREATE TABLE IF NOT EXISTS (\w+) \(([\s\S]*?)\);/g)) {
+    const [, name, definitions] = match;
+    const parts = splitColumnDefinitions(definitions);
+    const tablePrimaryKey = parts.find((definition) => /^PRIMARY KEY\s*\(/i.test(definition));
+    const primaryKeyNames = tablePrimaryKey
+      ? (tablePrimaryKey.match(/\(([^)]+)\)/)?.[1].split(',').map((column) => column.trim().replace(/^"|"$/g, '')) ?? [])
+      : [];
+    const columns = parts.flatMap((definition): V5ColumnShape[] => {
+      if (/^(PRIMARY|UNIQUE|CHECK|CONSTRAINT|FOREIGN)\b/i.test(definition)) return [];
+      const column = /^(\w+)\s+(\w+)/.exec(definition);
+      if (!column) return [];
+      const defaultMatch = /\bDEFAULT\s+([^\s,]+)/i.exec(definition);
+      const tablePrimaryKeyOrder = primaryKeyNames.indexOf(column[1]) + 1;
+      return [{
+        name: column[1],
+        definition,
+        type: column[2],
+        notNull: /\bNOT NULL\b/i.test(definition),
+        defaultValue: defaultMatch?.[1] ?? null,
+        primaryKeyOrder: /\bPRIMARY KEY\b/i.test(definition) ? 1 : tablePrimaryKeyOrder,
+        unique: /\bUNIQUE\b/i.test(definition),
+      }];
+    });
+    tables.set(name, { columns, sql: `CREATE TABLE ${name} (${definitions})` });
+  }
+  return tables;
+}
+
+const v5TableShapes = loadV5TableShapes();
+
+function requiredV5TableShapes(): Map<string, V5TableShape> {
+  return v5TableShapes;
+}
+
 function userTableCounts(db: DatabaseSync): Map<string, number> {
   const tables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all() as Array<{ name: string }>;
   const counts = new Map<string, number>();
@@ -340,10 +439,23 @@ function tableContentDigest(db: DatabaseSync, table: string): string {
   ))).digest('hex');
 }
 
+function schemaEntries(db: DatabaseSync): Array<{ type: string; name: string; sql: string | null }> {
+  return db.prepare(`SELECT type, name, sql FROM sqlite_master
+    WHERE name NOT LIKE 'sqlite_%'
+    ORDER BY type, name`).all() as Array<{ type: string; name: string; sql: string | null }>;
+}
+
+function sqliteSequenceRows(db: DatabaseSync): Array<{ name: string; seq: number }> {
+  if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_sequence'").get()) return [];
+  return db.prepare('SELECT name, seq FROM sqlite_sequence ORDER BY name').all() as Array<{ name: string; seq: number }>;
+}
+
 export function verifyBackup(source: DatabaseSync, copy: DatabaseSync): boolean {
   const integrity = copy.prepare('PRAGMA integrity_check').get() as { integrity_check?: string } | string | undefined;
   const result = typeof integrity === 'string' ? integrity : integrity?.integrity_check;
   if (result !== 'ok') return false;
+  if (JSON.stringify(schemaEntries(source)) !== JSON.stringify(schemaEntries(copy))) return false;
+  if (JSON.stringify(sqliteSequenceRows(source)) !== JSON.stringify(sqliteSequenceRows(copy))) return false;
   const sourceCounts = userTableCounts(source);
   const copyCounts = userTableCounts(copy);
   if (sourceCounts.size !== copyCounts.size) return false;
@@ -383,32 +495,397 @@ export async function backupBeforeMigrate(
   }
 }
 
+function quoteIdentifier(name: string): string {
+  return `"${name.replace(/"/g, '""')}"`;
+}
+
+function tableColumns(db: DatabaseSync, table: string): TableColumn[] {
+  return db.prepare(`PRAGMA table_info(${quoteIdentifier(table)})`).all() as unknown as TableColumn[];
+}
+
+function normalizedDefault(value: string | null): string | null {
+  return value === null ? null : value.replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+function hasUniqueConstraint(db: DatabaseSync, table: string, columns: string[]): boolean {
+  const indexes = db.prepare(`PRAGMA index_list(${quoteIdentifier(table)})`).all() as Array<{ name: string; unique: number; partial: number }>;
+  return indexes.some((index) => index.unique === 1 && index.partial === 0 && (
+    db.prepare(`PRAGMA index_info(${quoteIdentifier(index.name)})`).all() as Array<{ name: string }>
+  ).map(({ name }) => name).join('\0') === columns.join('\0'));
+}
+
+function tableMatchesV5Shape(db: DatabaseSync, table: string, shape: V5TableShape): boolean {
+  const existing = new Map(tableColumns(db, table).map((column) => [column.name, column]));
+  return shape.columns.every((expected) => {
+    const actual = existing.get(expected.name);
+    return actual !== undefined
+      && actual.type.trim().toLowerCase() === expected.type.trim().toLowerCase()
+      && Boolean(actual.notnull) === expected.notNull
+      && normalizedDefault(actual.dflt_value) === normalizedDefault(expected.defaultValue)
+      && actual.pk === expected.primaryKeyOrder
+      && (!expected.unique || hasUniqueConstraint(db, table, [expected.name]));
+  });
+}
+
 function schemaNeedsV5Correction(db: DatabaseSync): boolean {
-  const required: Record<string, string[]> = {
-    claude_slots: ['archived_at'],
-    codex_slots: ['pending_adopt', 'archived_at'],
-    switch_log: ['injected', 'detail', 'published_at', 'committed_at'],
-    usage_polls: ['provider', 'poll_interval_s'],
-    relogin_events: ['evidence', 'user_denied_at'],
-    lineage_log: ['evidence'],
-    lifecycle: ['pre_fence_state'],
-    codex_watch: [], import_runs: [], pi_export_targets: [], codex_live_observations: [],
-  };
-  for (const [table, columns] of Object.entries(required)) {
+  for (const [table, shape] of requiredV5TableShapes()) {
     const found = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table);
-    if (!found) return true;
-    if (columns.some((column) => !hasColumn(db, table, column))) return true;
+    if (!found || !tableMatchesV5Shape(db, table, shape)) return true;
   }
   return !lifecycleOneOpenIndexMatches(db);
+}
+
+function sqlWithoutLiteralsOrComments(sql: string, keepQuotedIdentifiers = false): string {
+  let result = '';
+  for (let index = 0; index < sql.length;) {
+    const character = sql[index];
+    const next = sql[index + 1];
+    if (character === '-' && next === '-') {
+      index = sql.indexOf('\n', index + 2);
+      if (index === -1) break;
+      result += '\n';
+      index += 1;
+    } else if (character === '/' && next === '*') {
+      const end = sql.indexOf('*/', index + 2);
+      index = end === -1 ? sql.length : end + 2;
+      result += ' ';
+    } else if (character === '\'' || character === '"' || character === '`' || character === '[') {
+      const terminator = character === '[' ? ']' : character;
+      const start = index;
+      index += 1;
+      while (index < sql.length) {
+        if (sql[index] !== terminator) {
+          index += 1;
+          continue;
+        }
+        if (terminator !== ']' && sql[index + 1] === terminator) {
+          index += 2;
+          continue;
+        }
+        index += 1;
+        break;
+      }
+      result += keepQuotedIdentifiers && character !== '\'' ? sql.slice(start, index) : ' ';
+    } else {
+      result += character;
+      index += 1;
+    }
+  }
+  return result;
+}
+
+function sqlReferencesTableIdentifier(sql: string, table: string): boolean {
+  const escaped = table.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(?:^|[^A-Za-z0-9_$])(?:${escaped}|"${escaped}"|\\[${escaped}\\]|\\x60${escaped}\\x60)(?=$|[^A-Za-z0-9_$])`, 'i').test(sqlWithoutLiteralsOrComments(sql, true));
+}
+
+function refuseInexactV5Rebuild(table: string, reason: string, verifiedBackupPath: string): never {
+  throw new Error(`cannot correct pre-release v5 ${table}: ${reason}; verified backup: ${verifiedBackupPath}`);
+}
+
+interface V5TableFacts {
+  xinfo: TableColumn[];
+  constraintIndexes: string[];
+  strict: number;
+  withoutRowid: number;
+  sql: string;
+}
+
+function v5TableFacts(db: DatabaseSync, table: string): V5TableFacts {
+  const xinfo = db.prepare(`PRAGMA table_xinfo(${quoteIdentifier(table)})`).all() as unknown as TableColumn[];
+  const indexes = db.prepare(`PRAGMA index_list(${quoteIdentifier(table)})`).all() as Array<{ name: string; origin: string }>;
+  const constraintIndexes = indexes
+    .filter(({ origin }) => origin === 'u' || origin === 'pk')
+    .map(({ name, origin }) => {
+      const columns = db.prepare(`PRAGMA index_info(${quoteIdentifier(name)})`).all() as Array<{ name: string }>;
+      return `${origin}:${columns.map(({ name: column }) => column).join('\0')}`;
+    });
+  const tableList = db.prepare('PRAGMA table_list').all() as Array<{ name: string; strict: number; wr: number }>;
+  const options = tableList.find(({ name }) => name === table);
+  const master = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?").get(table) as { sql: string } | undefined;
+  if (!options || !master?.sql) throw new Error(`cannot inspect pre-release v5 ${table} table definition`);
+  return { xinfo, constraintIndexes, strict: Number(options.strict), withoutRowid: Number(options.wr), sql: master.sql };
+}
+
+function canonicalV5TableFacts(shape: V5TableShape, table: string): V5TableFacts {
+  const scratch = new DatabaseSync(':memory:');
+  try {
+    scratch.exec(shape.sql);
+    return v5TableFacts(scratch, table);
+  } finally {
+    scratch.close();
+  }
+}
+
+function containsSqlKeyword(sql: string, keyword: 'CHECK' | 'COLLATE' | 'CONFLICT' | 'DESC' | 'ASC' | 'AUTOINCREMENT'): boolean {
+  return new RegExp(`\\b${keyword}\\b`, 'i').test(sqlWithoutLiteralsOrComments(sql));
+}
+
+function assertV5RebuildCanBeExact(db: DatabaseSync, table: string, shape: V5TableShape, verifiedBackupPath: string): void {
+  const actual = v5TableFacts(db, table);
+  const expected = canonicalV5TableFacts(shape, table);
+  if (actual.strict !== expected.strict || actual.withoutRowid !== expected.withoutRowid) {
+    refuseInexactV5Rebuild(table, 'table options differ from the canonical definition', verifiedBackupPath);
+  }
+
+  const hidden = actual.xinfo.find((column) => column.hidden !== undefined && column.hidden !== 0);
+  if (hidden) {
+    refuseInexactV5Rebuild(table, `column ${hidden.name} is generated or hidden and cannot be reproduced`, verifiedBackupPath);
+  }
+
+  // Exact spelling only: a case-variant column would skip the per-column checks below.
+  const canonical = new Set(shape.columns.map(({ name }) => name));
+  const extra = actual.xinfo.find(({ name }) => !canonical.has(name));
+  if (extra) {
+    const respelled = shape.columns.find(({ name }) => name.toLowerCase() === extra.name.toLowerCase());
+    refuseInexactV5Rebuild(table, respelled
+      ? `column ${extra.name} differs in case from the canonical ${respelled.name} and cannot be reproduced`
+      : `column ${extra.name} is not in the canonical definition and cannot be reproduced`, verifiedBackupPath);
+  }
+
+  const expectedColumns = new Map(expected.xinfo.map((column) => [column.name, column]));
+  for (const column of actual.xinfo) {
+    const canonicalColumn = expectedColumns.get(column.name);
+    if (!canonicalColumn) continue;
+    if (column.type.trim().toLowerCase() !== canonicalColumn.type.trim().toLowerCase()) {
+      refuseInexactV5Rebuild(table, `column ${column.name} type differs from the canonical definition`, verifiedBackupPath);
+    }
+    if (Boolean(column.notnull) && !Boolean(canonicalColumn.notnull)) {
+      refuseInexactV5Rebuild(table, `column ${column.name} not-null constraint differs from the canonical definition`, verifiedBackupPath);
+    }
+    const actualDefault = normalizedDefault(column.dflt_value);
+    const canonicalDefault = normalizedDefault(canonicalColumn.dflt_value);
+    if (actualDefault !== canonicalDefault && actualDefault !== null) {
+      refuseInexactV5Rebuild(table, `column ${column.name} default differs from the canonical definition`, verifiedBackupPath);
+    }
+  }
+
+  const actualPrimaryKey = actual.xinfo
+    .filter(({ pk }) => pk > 0)
+    .sort((left, right) => left.pk - right.pk)
+    .map(({ name, pk }) => `${pk}:${name.toLowerCase()}`);
+  const canonicalPrimaryKey = shape.columns
+    .filter(({ primaryKeyOrder }) => primaryKeyOrder > 0)
+    .sort((left, right) => left.primaryKeyOrder - right.primaryKeyOrder)
+    .map(({ name, primaryKeyOrder }) => `${primaryKeyOrder}:${name.toLowerCase()}`);
+  if (actualPrimaryKey.join('\0') !== canonicalPrimaryKey.join('\0')) {
+    refuseInexactV5Rebuild(table, 'primary-key columns differ from the canonical definition', verifiedBackupPath);
+  }
+
+  for (const keyword of ['CHECK', 'COLLATE', 'CONFLICT', 'DESC', 'ASC'] as const) {
+    if (containsSqlKeyword(actual.sql, keyword) && !containsSqlKeyword(expected.sql, keyword)) {
+      refuseInexactV5Rebuild(table, `${keyword} differs from the canonical definition`, verifiedBackupPath);
+    }
+  }
+  if (containsSqlKeyword(actual.sql, 'AUTOINCREMENT') !== containsSqlKeyword(expected.sql, 'AUTOINCREMENT')) {
+    refuseInexactV5Rebuild(table, 'AUTOINCREMENT differs from the canonical definition', verifiedBackupPath);
+  }
+
+  const expectedIndexCounts = new Map<string, number>();
+  for (const index of expected.constraintIndexes) expectedIndexCounts.set(index, (expectedIndexCounts.get(index) ?? 0) + 1);
+  for (const index of actual.constraintIndexes) {
+    const remaining = expectedIndexCounts.get(index) ?? 0;
+    if (remaining === 0) {
+      refuseInexactV5Rebuild(table, 'unique index differs from the canonical definition', verifiedBackupPath);
+    }
+    expectedIndexCounts.set(index, remaining - 1);
+  }
+
+  const ownForeignKeys = db.prepare(`PRAGMA foreign_key_list(${quoteIdentifier(table)})`).all();
+  if (ownForeignKeys.length !== 0) {
+    refuseInexactV5Rebuild(table, 'foreign-key definition differs from the canonical definition', verifiedBackupPath);
+  }
+
+  const otherTables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND lower(name) <> lower(?) ORDER BY name").all(table) as Array<{ name: string }>;
+  for (const { name } of otherTables) {
+    const foreignKeys = db.prepare(`PRAGMA foreign_key_list(${quoteIdentifier(name)})`).all() as Array<{ table: string }>;
+    if (foreignKeys.some((foreignKey) => foreignKey.table.toLowerCase() === table.toLowerCase())) {
+      refuseInexactV5Rebuild(table, `foreign key on ${name} references ${table} and prevents an exact rebuild`, verifiedBackupPath);
+    }
+  }
+
+  const dependents = db.prepare(`SELECT type, name, tbl_name, sql FROM sqlite_master
+    WHERE type IN ('view', 'trigger') AND sql IS NOT NULL AND (type = 'view' OR tbl_name <> ?)
+    ORDER BY type, name`).all(table) as Array<{ type: 'view' | 'trigger'; name: string; sql: string }>;
+  const dependent = dependents.find(({ sql }) => sqlReferencesTableIdentifier(sql, table));
+  if (dependent) {
+    const subject = dependent.type === 'view'
+      ? `view ${dependent.name} references ${table}`
+      : `trigger ${dependent.name} on another table references ${table}`;
+    refuseInexactV5Rebuild(table, `${subject} and prevents an exact rebuild`, verifiedBackupPath);
+  }
+}
+
+function rebuildV5Table(db: DatabaseSync, table: string, shape: V5TableShape, existing: TableColumn[], verifiedBackupPath: string): void {
+  const newTable = `${table}__v5new`;
+  if (db.prepare("SELECT 1 FROM sqlite_master WHERE name = ?").get(newTable)) {
+    throw new Error(`cannot correct pre-release v5 ${table}: temporary table ${newTable} already exists`);
+  }
+  assertV5RebuildCanBeExact(db, table, shape, verifiedBackupPath);
+  const definitions = shape.sql.slice(shape.sql.indexOf('(') + 1, -1);
+  const createSql = `CREATE TABLE ${quoteIdentifier(newTable)} (${definitions})`;
+  const preservedObjects = db.prepare(`SELECT type, name, sql FROM sqlite_master
+    WHERE tbl_name = ? AND type IN ('index', 'trigger') AND sql IS NOT NULL AND name <> 'lifecycle_one_open'
+    ORDER BY type, name`).all(table) as Array<{ sql: string }>;
+  const sequenceExists = Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_sequence'").get());
+  const sequence = sequenceExists ? db.prepare('SELECT seq FROM sqlite_sequence WHERE name = ?').get(table) as { seq: number } | undefined : undefined;
+  db.exec(createSql);
+  const names = existing.map(({ name }) => quoteIdentifier(name)).join(', ');
+  try {
+    if (names) db.exec(`INSERT INTO ${quoteIdentifier(newTable)} (${names}) SELECT ${names} FROM ${quoteIdentifier(table)}`);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    throw new Error(`cannot correct pre-release v5 ${table}: copied rows violate new constraints (${message})`);
+  }
+  db.exec(`DROP TABLE ${quoteIdentifier(table)}; ALTER TABLE ${quoteIdentifier(newTable)} RENAME TO ${quoteIdentifier(table)}`);
+  if (sequence) {
+    db.prepare('DELETE FROM sqlite_sequence WHERE name = ?').run(table);
+    db.prepare('INSERT INTO sqlite_sequence (name, seq) VALUES (?, ?)').run(table, sequence.seq);
+  }
+  for (const { sql } of preservedObjects) db.exec(sql);
+}
+
+interface V5RepairPlan {
+  existing: TableColumn[];
+  missing: V5ColumnShape[];
+  requiresRebuild: boolean;
+  impossible: V5ColumnShape[];
+  populated: boolean;
+}
+
+function v5RepairPlan(db: DatabaseSync, table: string, shape: V5TableShape): V5RepairPlan {
+  const existing = tableColumns(db, table);
+  const found = new Set(existing.map(({ name }) => name));
+  const missing = shape.columns.filter(({ name }) => !found.has(name));
+  const requiresRebuild = existing.some((actual) => {
+    const expected = shape.columns.find(({ name }) => name === actual.name);
+    return expected !== undefined && (
+      actual.type.trim().toLowerCase() !== expected.type.trim().toLowerCase()
+      || Boolean(actual.notnull) !== expected.notNull
+      || normalizedDefault(actual.dflt_value) !== normalizedDefault(expected.defaultValue)
+      || actual.pk !== expected.primaryKeyOrder
+      || (expected.unique && !hasUniqueConstraint(db, table, [expected.name]))
+    );
+  }) || missing.some((column) => column.primaryKeyOrder > 0 || column.unique || (column.notNull && column.defaultValue === null));
+  const impossible = missing.filter((column) => column.primaryKeyOrder > 0 || (column.notNull && column.defaultValue === null));
+  return {
+    existing,
+    missing,
+    requiresRebuild,
+    impossible,
+    populated: Boolean(db.prepare(`SELECT 1 FROM ${quoteIdentifier(table)} LIMIT 1`).get()),
+  };
+}
+
+const PROVIDERLESS_USAGE_POLLS_COLUMNS = new Set([
+  'account_id', 'last_fetch_at', 'last_attempt_at', 'next_due_at', 'poll_interval_s',
+  'last_status', 'consecutive_failures', 'backoff_until', 'last_429_at', 'held_until',
+]);
+
+function assertProviderlessUsagePollsCanBeMigrated(db: DatabaseSync, verifiedBackupPath: string): void {
+  if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'usage_polls'").get()
+    || hasColumn(db, 'usage_polls', 'provider')) return;
+  const unexpected = tableColumns(db, 'usage_polls').find(({ name }) => !PROVIDERLESS_USAGE_POLLS_COLUMNS.has(name));
+  if (unexpected) {
+    refuseInexactV5Rebuild('usage_polls', `column ${unexpected.name} is not in the canonical definition and cannot be reproduced`, verifiedBackupPath);
+  }
+  const schemaObjects = db.prepare(`SELECT type, name FROM sqlite_master
+    WHERE tbl_name = ? AND type IN ('index', 'trigger')
+      AND (type = 'trigger' OR name NOT LIKE 'sqlite_autoindex_%')
+    ORDER BY type, name`).all('usage_polls') as Array<{ type: 'index' | 'trigger'; name: string }>;
+  const schemaObject = schemaObjects[0];
+  if (schemaObject) {
+    refuseInexactV5Rebuild('usage_polls', `${schemaObject.type} ${schemaObject.name} cannot be reproduced`, verifiedBackupPath);
+  }
+  const actualSql = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'usage_polls'").get() as { sql: string };
+  const canonicalSql = requiredV5TableShapes().get('usage_polls')!.sql;
+  const normalizedActual = normalizedSql(sqlWithoutLiteralsOrComments(actualSql.sql));
+  const normalizedCanonical = normalizedSql(sqlWithoutLiteralsOrComments(canonicalSql));
+  for (const [name, pattern] of [
+    ['CHECK', /\bcheck\b/],
+    ['UNIQUE', /\bunique\b/],
+    ['FOREIGN KEY', /\bforeign\s+key\b/],
+    ['GENERATED', /\bgenerated\b/],
+    ['STRICT', /\bstrict\b/],
+    ['WITHOUT ROWID', /\bwithout\s+rowid\b/],
+  ] as const) {
+    if (pattern.test(normalizedActual) && !pattern.test(normalizedCanonical)) {
+      refuseInexactV5Rebuild('usage_polls', `${name} differs from the canonical definition and cannot be reproduced`, verifiedBackupPath);
+    }
+  }
+  const rows = db.prepare('SELECT account_id FROM usage_polls').all() as Array<{ account_id: string }>;
+  const providerFor = db.prepare('SELECT provider FROM accounts WHERE id = ?');
+  for (const row of rows) {
+    const providers = providerFor.all(row.account_id) as Array<{ provider: string | null }>;
+    if (providers.length !== 1 || !providers[0]?.provider) {
+      refuseInexactV5Rebuild('usage_polls', `account_id '${row.account_id}' is ambiguous`, verifiedBackupPath);
+    }
+  }
+}
+
+/** Refusals detectable without writing must not create another backup on every open. */
+function preflightV5Correction(db: DatabaseSync, verifiedBackupPath: string): void {
+  assertProviderlessUsagePollsCanBeMigrated(db, verifiedBackupPath);
+  for (const [table, shape] of requiredV5TableShapes()) {
+    if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table)
+      || tableMatchesV5Shape(db, table, shape)
+      // This pre-release shape is handled by the preserving provider migration above.
+      || (table === 'usage_polls' && !hasColumn(db, table, 'provider'))) continue;
+    const plan = v5RepairPlan(db, table, shape);
+    if (plan.populated && plan.impossible.length) {
+      refuseInexactV5Rebuild(table, `populated table is missing required column(s) ${plan.impossible.map(({ name }) => name).join(', ')}`, verifiedBackupPath);
+    }
+    if (plan.requiresRebuild) {
+      for (const canonicalColumn of shape.columns) {
+        const existingColumn = plan.existing.find(({ name }) => name === canonicalColumn.name);
+        if (!existingColumn || !canonicalColumn.notNull || canonicalColumn.defaultValue !== null || existingColumn.notnull) continue;
+        const nullRow = db.prepare(`SELECT 1 FROM ${quoteIdentifier(table)} WHERE ${quoteIdentifier(canonicalColumn.name)} IS NULL LIMIT 1`).get();
+        if (nullRow) {
+          refuseInexactV5Rebuild(
+            table,
+            `copied rows violate new constraints (NOT NULL constraint failed: ${table}__v5new.${canonicalColumn.name})`,
+            verifiedBackupPath,
+          );
+        }
+      }
+      const newTable = `${table}__v5new`;
+      if (db.prepare("SELECT 1 FROM sqlite_master WHERE name = ?").get(newTable)) {
+        refuseInexactV5Rebuild(table, `temporary table ${newTable} already exists`, verifiedBackupPath);
+      }
+      assertV5RebuildCanBeExact(db, table, shape, verifiedBackupPath);
+    }
+  }
+}
+
+function repairMissingV5Columns(db: DatabaseSync, verifiedBackupPath: string): void {
+  for (const [table, shape] of requiredV5TableShapes()) {
+    if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table)) continue;
+    if (tableMatchesV5Shape(db, table, shape)) continue;
+    const plan = v5RepairPlan(db, table, shape);
+    if (plan.populated && plan.impossible.length) {
+      refuseInexactV5Rebuild(table, `populated table is missing required column(s) ${plan.impossible.map(({ name }) => name).join(', ')}`, verifiedBackupPath);
+    }
+    if (plan.requiresRebuild) rebuildV5Table(db, table, shape, plan.existing, verifiedBackupPath);
+    else for (const column of plan.missing) db.exec(`ALTER TABLE ${quoteIdentifier(table)} ADD COLUMN ${column.definition}`);
+  }
+}
+
+function redactJsonText(value: string): string {
+  try {
+    const parsed = JSON.parse(value);
+    const redacted = redactJson(parsed, []);
+    // Preserve audit JSON byte-for-byte unless redaction actually changed it:
+    // JSON.parse would otherwise round large numbers and collapse duplicate keys.
+    return redacted === JSON.stringify(parsed) ? value : redacted;
+  } catch {
+    return redactKeyValueText(value, []);
+  }
 }
 
 function migrationNeeded(db: DatabaseSync): boolean {
   const version = readUserVersion(db);
   return version < 5 || (version === 5 && schemaNeedsV5Correction(db));
 }
-
-const LIFECYCLE_ONE_OPEN_INDEX_SQL = `CREATE UNIQUE INDEX lifecycle_one_open ON lifecycle ((1))
-  WHERE state IN ('cutting-over','cutover','undoing','rolled-back','retired','aborted')`;
 
 function normalizedSql(sql: string): string {
   return sql.replace(/\s+/g, ' ').trim().toLowerCase();
@@ -420,7 +897,24 @@ function lifecycleOneOpenIndexMatches(db: DatabaseSync): boolean {
 }
 
 /** Synchronous bridge for Store's established synchronous constructor. Caller holds BEGIN IMMEDIATE. */
-function backupBeforeMigrateSync(dbPath: string, source: DatabaseSync): void {
+function latestExistingBackupPath(dbPath: string): string {
+  if (dbPath === ':memory:') return 'none taken';
+  const backupsDir = join(dirname(dbPath), 'backups');
+  if (!existsSync(backupsDir)) return 'none taken';
+  const candidates = readdirSync(backupsDir)
+    .filter((name) => name.endsWith('.sqlite'))
+    .flatMap((name) => {
+      const path = join(backupsDir, name);
+      try {
+        const stats = statSync(path);
+        return stats.isFile() ? [{ path, mtimeMs: stats.mtimeMs }] : [];
+      } catch { return []; }
+    })
+    .sort((left, right) => right.mtimeMs - left.mtimeMs || right.path.localeCompare(left.path));
+  return candidates[0]?.path ?? 'none taken';
+}
+
+function backupBeforeMigrateSync(dbPath: string, source: DatabaseSync): string {
   const backupPath = join(dirname(dbPath), 'backups', `db-${Date.now()}-${process.pid}.sqlite`);
   mkdirSync(dirname(backupPath), { recursive: true, mode: 0o700 });
   const script = `
@@ -443,6 +937,7 @@ function backupBeforeMigrateSync(dbPath: string, source: DatabaseSync): void {
     copy.close();
   }
   try { chmodSync(backupPath, 0o600); } catch { /* best effort */ }
+  return backupPath;
 }
 
 function toReading(row: {
@@ -750,9 +1245,14 @@ export class Store {
     this.db.exec('BEGIN IMMEDIATE');
     try {
       if (migrationNeeded(this.db)) {
-        // This is deliberately inside the migration lock, after the backup.
-        // It also lets a brand-new database migrate without constructor DDL.
-        if (this.dbPath !== ':memory:') backupBeforeMigrateSync(this.dbPath, this.db);
+        // Refuse exactness failures before making a new backup: a permanently
+        // uncorrectable store must not accumulate one copy per open attempt.
+        preflightV5Correction(this.db, latestExistingBackupPath(this.dbPath));
+        // This is deliberately inside the migration lock. It also lets a
+        // brand-new database migrate without constructor DDL.
+        const verifiedBackupPath = this.dbPath !== ':memory:'
+          ? backupBeforeMigrateSync(this.dbPath, this.db)
+          : ':memory:';
         this.createCoreSchema();
         if (version < 2) {
           if (!hasColumn(this.db, 'accounts', 'grant_generation')) this.db.exec('ALTER TABLE accounts ADD COLUMN grant_generation INTEGER DEFAULT 0');
@@ -765,7 +1265,12 @@ export class Store {
           this.db.exec('CREATE TABLE IF NOT EXISTS policies (harness TEXT, virtual_model TEXT, real_model TEXT, effort TEXT, fallback_json TEXT, session_mode TEXT, created_at INTEGER, PRIMARY KEY (harness, virtual_model))');
         }
         ensureDecisionColumnsOn(this.db);
-        this.migrateV5Schema();
+        this.migrateV5Schema(verifiedBackupPath);
+        repairMissingV5Columns(this.db, verifiedBackupPath);
+        if (!lifecycleOneOpenIndexMatches(this.db)) {
+          this.db.exec('DROP INDEX IF EXISTS lifecycle_one_open');
+          this.db.exec(`${LIFECYCLE_ONE_OPEN_INDEX_SQL};`);
+        }
         this.db.exec('PRAGMA user_version = 5');
       }
       this.scrubReloginEvents();
@@ -809,16 +1314,14 @@ export class Store {
     `);
   }
 
-  private migrateV5Schema(): void {
+  private migrateV5Schema(verifiedBackupPath: string): void {
     if (this.tableExists('usage_polls') && !hasColumn(this.db, 'usage_polls', 'provider')) {
+      // Checked before the backup too, so this remains a defensive assertion
+      // for future callers that invoke this migration path directly.
+      assertProviderlessUsagePollsCanBeMigrated(this.db, verifiedBackupPath);
       const rows = this.db.prepare('SELECT account_id FROM usage_polls').all() as Array<{ account_id: string }>;
       const providerFor = this.db.prepare('SELECT provider FROM accounts WHERE id = ?');
-      for (const row of rows) {
-        const providers = providerFor.all(row.account_id) as Array<{ provider: string | null }>;
-        if (providers.length !== 1 || !providers[0]?.provider) {
-          throw new Error(`cannot correct pre-release v5 usage_polls: account_id '${row.account_id}' is ambiguous`);
-        }
-      }
+      const pollIntervalValue = hasColumn(this.db, 'usage_polls', 'poll_interval_s') ? 'poll_interval_s' : 'NULL';
       this.db.exec(`
         CREATE TABLE usage_polls_v5 (
           provider TEXT NOT NULL, account_id TEXT NOT NULL,
@@ -829,61 +1332,17 @@ export class Store {
           PRIMARY KEY (provider, account_id)
         )
       `);
-      const copy = this.db.prepare(`INSERT INTO usage_polls_v5 (provider, account_id, last_fetch_at, last_attempt_at, next_due_at, last_status, consecutive_failures, backoff_until, last_429_at, held_until)
-        SELECT ?, account_id, last_fetch_at, last_attempt_at, next_due_at, last_status, consecutive_failures, backoff_until, last_429_at, held_until FROM usage_polls WHERE account_id = ?`);
+      const copy = this.db.prepare(`INSERT INTO usage_polls_v5 (provider, account_id, last_fetch_at, last_attempt_at, next_due_at, poll_interval_s, last_status, consecutive_failures, backoff_until, last_429_at, held_until)
+        SELECT ?, account_id, last_fetch_at, last_attempt_at, next_due_at, ${pollIntervalValue}, last_status, consecutive_failures, backoff_until, last_429_at, held_until FROM usage_polls WHERE account_id = ?`);
       for (const row of rows) {
         const provider = (providerFor.get(row.account_id) as { provider: string }).provider;
         copy.run(provider, row.account_id);
       }
       this.db.exec('DROP TABLE usage_polls; ALTER TABLE usage_polls_v5 RENAME TO usage_polls');
     }
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS claude_slots (
-        account_id TEXT PRIMARY KEY, slot_num INTEGER UNIQUE, email TEXT, alias TEXT, org_uuid TEXT,
-        config_json TEXT NOT NULL, fingerprint TEXT, prev_fingerprint TEXT, threshold REAL,
-        dead INTEGER NOT NULL DEFAULT 0, dead_reason TEXT, dead_at INTEGER, healed_at INTEGER,
-        added_at INTEGER NOT NULL, last_active_at INTEGER, source TEXT, archived_at INTEGER
-      );
-      CREATE TABLE IF NOT EXISTS codex_slots (
-        account_id TEXT PRIMARY KEY, chatgpt_user_id TEXT NOT NULL, chatgpt_account_id TEXT NOT NULL,
-        email TEXT, alias TEXT, fingerprint TEXT, prev_fingerprint TEXT, threshold REAL, last_refresh TEXT,
-        dead INTEGER NOT NULL DEFAULT 0, dead_reason TEXT, dead_at INTEGER, healed_at INTEGER,
-        pending_adopt INTEGER NOT NULL DEFAULT 0, added_at INTEGER NOT NULL, last_active_at INTEGER, source TEXT, archived_at INTEGER
-      );
-      CREATE TABLE IF NOT EXISTS active_login (provider TEXT PRIMARY KEY, account_id TEXT, since INTEGER NOT NULL, set_by TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS switch_log (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, provider TEXT NOT NULL, from_account TEXT, to_account TEXT NOT NULL,
-        trigger TEXT NOT NULL, outcome TEXT NOT NULL, outgoing_kind TEXT, binding_json TEXT, steps_json TEXT, open_sessions_json TEXT, error TEXT,
-        injected INTEGER NOT NULL DEFAULT 0, detail TEXT, published_at INTEGER, committed_at INTEGER
-      );
-      CREATE TABLE IF NOT EXISTS usage_polls (
-        -- Spec §3.2 usage_polls.poll_interval_s (D-B11).
-        provider TEXT NOT NULL, account_id TEXT NOT NULL, last_fetch_at INTEGER, last_attempt_at INTEGER, next_due_at INTEGER, poll_interval_s REAL,
-        last_status TEXT, consecutive_failures INTEGER NOT NULL DEFAULT 0, backoff_until INTEGER, last_429_at INTEGER, held_until INTEGER,
-        PRIMARY KEY (provider, account_id)
-      );
-      CREATE TABLE IF NOT EXISTS relogin_events (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, provider TEXT NOT NULL, account_id TEXT,
-        kind TEXT NOT NULL, detail TEXT, evidence TEXT, user_denied_at INTEGER
-      );
-      CREATE TABLE IF NOT EXISTS health_log (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, phase TEXT NOT NULL, overall TEXT NOT NULL,
-        failing_json TEXT NOT NULL, dead_slots_json TEXT NOT NULL, release_sha TEXT
-      );
-      CREATE TABLE IF NOT EXISTS lineage_log (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, provider TEXT NOT NULL, account_id TEXT NOT NULL,
-        from_fp TEXT, to_fp TEXT NOT NULL, cause TEXT NOT NULL, by TEXT NOT NULL, evidence TEXT
-      );
-      CREATE TABLE IF NOT EXISTS lifecycle (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, state TEXT NOT NULL, began_at INTEGER NOT NULL, cutover_at INTEGER, window_end INTEGER,
-        extended_at INTEGER, undo_began_at INTEGER, rollback_at INTEGER, retired_at INTEGER, closed_at INTEGER,
-        release_sha TEXT, drill_done_at INTEGER, note TEXT, pre_fence_state TEXT
-      );
-      CREATE TABLE IF NOT EXISTS codex_watch (switch_id INTEGER PRIMARY KEY, provider TEXT NOT NULL, outgoing TEXT NOT NULL, target TEXT NOT NULL, next_at INTEGER NOT NULL, until INTEGER NOT NULL);
-      CREATE TABLE IF NOT EXISTS import_runs (run_id TEXT PRIMARY KEY, started_at INTEGER NOT NULL, committed_at INTEGER);
-      CREATE TABLE IF NOT EXISTS pi_export_targets (provider TEXT NOT NULL, target TEXT NOT NULL, slot_account_id TEXT NOT NULL, lineage_fp TEXT NOT NULL, recorded_at INTEGER NOT NULL, PRIMARY KEY (provider, target));
-      CREATE TABLE IF NOT EXISTS codex_live_observations (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, identity TEXT, lineage_fp TEXT, by TEXT NOT NULL);
-    `);
+    // Tables must exist before repair, but the lifecycle partial index refers to
+    // state and is deliberately created only after every table has been repaired.
+    this.db.exec(V5_SCHEMA_DDL);
     // Spec §3.2 `usage_polls.poll_interval_s` (D-B11).
     this.addColumnIfMissing('usage_polls', 'poll_interval_s', 'REAL');
     this.addColumnIfMissing('claude_slots', 'archived_at', 'INTEGER');
@@ -897,10 +1356,6 @@ export class Store {
     this.addColumnIfMissing('relogin_events', 'user_denied_at', 'INTEGER');
     this.addColumnIfMissing('lineage_log', 'evidence', 'TEXT');
     this.addColumnIfMissing('lifecycle', 'pre_fence_state', 'TEXT');
-    if (!lifecycleOneOpenIndexMatches(this.db)) {
-      this.db.exec('DROP INDEX IF EXISTS lifecycle_one_open');
-      this.db.exec(`${LIFECYCLE_ONE_OPEN_INDEX_SQL};`);
-    }
   }
 
   private tableExists(table: string): boolean {
@@ -1518,7 +1973,10 @@ export class Store {
     const result = this.db.prepare(`INSERT INTO switch_log (ts, provider, from_account, to_account, trigger, outcome, outgoing_kind, binding_json, steps_json, open_sessions_json, error, injected, detail, published_at, committed_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
       row.ts ?? Date.now(), row.provider, row.fromAccount ?? null, row.toAccount, row.trigger, row.outcome,
-      row.outgoingKind ?? null, row.bindingJson ?? null, row.stepsJson ?? null, row.openSessionsJson ?? null,
+      row.outgoingKind ?? null,
+      row.bindingJson == null ? null : redactJsonText(row.bindingJson),
+      row.stepsJson == null ? null : redactJsonText(row.stepsJson),
+      row.openSessionsJson == null ? null : redactJsonText(row.openSessionsJson),
       row.error == null ? null : redactSecrets(row.error, []), row.injected ? 1 : 0,
       row.detail == null ? null : redactSecrets(row.detail, []), row.publishedAt ?? null, row.committedAt ?? null,
     );
