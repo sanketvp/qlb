@@ -10,6 +10,7 @@
 // classes directly.
 
 import { execFileSync, type ExecFileSyncOptions } from 'node:child_process';
+import { DatabaseSync } from 'node:sqlite';
 import {
   createCipheriv,
   createDecipheriv,
@@ -21,12 +22,15 @@ import {
   mkdirSync,
   readFileSync,
   renameSync,
-  statSync,
   writeFileSync,
 } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { qlbHomeDir } from './home';
-import type { HelperSigningState } from './diagnostics';
+import { defaultConfig } from './config';
+import {
+  verifyHelperIdentity,
+  type HelperIdentityVerification,
+} from './diagnostics';
 
 export interface CredentialBackend {
   readonly kind?: CredentialBackendKind;
@@ -241,38 +245,41 @@ export class KeychainHelperUntrustedError extends Error {
   readonly code = 'HELPER_UNTRUSTED';
   readonly exitCode = 3;
 
-  constructor(reason: string) {
-    super(`helper-untrusted: ${reason}; run npm run build:helper`);
+  constructor(reason: string, remedy = 'npm run build:helper or qlb keychain check-launchd') {
+    super(`helper-untrusted: ${reason}; run ${remedy}`);
     this.name = 'KeychainHelperUntrustedError';
   }
 }
 
-type HelperVerifier = (path: string) => HelperSigningState | null;
+export type HelperConfigReader = (key: string) => string | null;
+type HelperIdentityVerifier = (path: string, pin: string) => HelperIdentityVerification;
 
-function defaultHelperVerifier(path: string): HelperSigningState | null {
-  // Lazy loading avoids making diagnostics' credential diagnostics a module-init cycle.
-  const { inspectHelperSigning } = require('./diagnostics') as { inspectHelperSigning: HelperVerifier };
-  return inspectHelperSigning(path);
+function defaultHelperConfigReader(key: string): string | null {
+  try {
+    const db = new DatabaseSync(defaultConfig().dbPath, { readOnly: true });
+    try {
+      const row = db.prepare('SELECT value FROM config WHERE key = ?').get(key) as { value?: unknown } | undefined;
+      return typeof row?.value === 'string' ? row.value : null;
+    } finally {
+      db.close();
+    }
+  } catch {
+    return null;
+  }
 }
 
-// A process-wide cache avoids a codesign invocation for every credential operation.
-const helperTrustCache = new Map<string, HelperSigningState | null>();
-
-function assertTrustedHelper(path: string, verifier: HelperVerifier): void {
+function assertTrustedHelper(
+  path: string,
+  configReader: HelperConfigReader,
+  verifier: HelperIdentityVerifier,
+): void {
   assertHelperPresent(path);
-  const stat = statSync(path);
-  const cacheKey = `${path}\0${stat.mtimeMs}\0${stat.size}`;
-  let signing: HelperSigningState | null;
-  if (helperTrustCache.has(cacheKey)) {
-    signing = helperTrustCache.get(cacheKey)!;
-  } else {
-    signing = verifier(path);
-    helperTrustCache.set(cacheKey, signing);
+  const pin = configReader('keychain.helperCheckIdentityHash');
+  if (!pin) {
+    throw new KeychainHelperUntrustedError('no pinned helper identity', 'qlb keychain check-launchd');
   }
-  if (!signing) throw new KeychainHelperUntrustedError('not signed');
-  if (signing.authority !== 'QLB Keychain Helper') {
-    throw new KeychainHelperUntrustedError(`signed by ${signing.authority}, expected QLB Keychain Helper`);
-  }
+  const verification = verifier(path, pin);
+  if (!verification.trusted) throw new KeychainHelperUntrustedError(verification.reason);
 }
 
 /** Raised only for cached display reads during the brief Keychain failure backoff. */
@@ -326,14 +333,23 @@ export class MacosKeychainBackend extends SyncCredentialBackend {
   private readonly fakeExecutor: boolean;
 
   private readonly helperPath?: string;
-  private readonly helperVerifier?: HelperVerifier;
+  private readonly helperConfigReader?: HelperConfigReader;
+  private readonly helperIdentityVerifier?: HelperIdentityVerifier;
 
-  constructor(opts: { execFileSync?: ExecFileSyncFn; helperPath?: string; helperVerifier?: HelperVerifier } = {}) {
+  constructor(opts: {
+    execFileSync?: ExecFileSyncFn;
+    helperPath?: string;
+    /** Injectable config lookup for the matrix-recorded leaf certificate pin. */
+    helperConfigReader?: HelperConfigReader;
+    /** Injectable only for hermetic codesign verification tests. */
+    helperIdentityVerifier?: HelperIdentityVerifier;
+  } = {}) {
     super();
     this.exec = opts.execFileSync ?? execFileUtf8;
     this.fakeExecutor = isFakeExecutor(this.exec);
     this.helperPath = opts.helperPath;
-    this.helperVerifier = opts.helperVerifier;
+    this.helperConfigReader = opts.helperConfigReader;
+    this.helperIdentityVerifier = opts.helperIdentityVerifier;
     if (isQlbTestMode() && !this.fakeExecutor) throw new NativeKeychainDisabled();
   }
 
@@ -390,9 +406,16 @@ export class MacosKeychainBackend extends SyncCredentialBackend {
   }
 
   private assertTrustedHelper(path: string): void {
-    // Fake executors never run a helper. An explicitly injected verifier opts a
-    // test into the same boundary used by production without invoking codesign.
-    if (!this.fakeExecutor || this.helperVerifier) assertTrustedHelper(path, this.helperVerifier ?? defaultHelperVerifier);
+    // A plain fake executor cannot invoke a real helper. Tests opt into this
+    // gate explicitly with either injected dependency, so production always
+    // reads and verifies the pin immediately before the helper spawn.
+    if (!this.fakeExecutor || this.helperConfigReader || this.helperIdentityVerifier) {
+      assertTrustedHelper(
+        path,
+        this.helperConfigReader ?? defaultHelperConfigReader,
+        this.helperIdentityVerifier ?? verifyHelperIdentity,
+      );
+    }
   }
 
   private assertNativeAccessEnabled(): void {

@@ -18,7 +18,7 @@ import {
 } from '../src/commands/keychain';
 import { exitCodeForError, runExecutingCommand } from '../src/cli';
 import { KeychainHelperUntrustedError } from '../src/credential-backends';
-import { inspectHelperSigning } from '../src/diagnostics';
+import { inspectHelperSigning, verifyHelperIdentity } from '../src/diagnostics';
 import type { CommandContext } from '../src/registry';
 import { defaultConfig } from '../src/config';
 import { openStore } from '../src/store';
@@ -98,6 +98,7 @@ describe('Swift Keychain helper write path', () => {
         caseReasons: { securityCreated: null, securityUntrusted: null, previousHelper: null, helperCreated: null },
         prompted: true,
       }),
+      helperSigning: () => ({ authority: 'QLB Keychain Helper', binaryHash: 'a'.repeat(40), identityHash: 'b'.repeat(40) }),
     });
     assert.equal(exit, 1);
     assert.deepEqual(output, []);
@@ -118,6 +119,7 @@ describe('Swift Keychain helper write path', () => {
       loadConfig: () => config, registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
     }, {
       runMatrix: () => { throw new KeychainHelperMissingError('/tmp/missing-helper'); },
+      helperSigning: () => ({ authority: 'QLB Keychain Helper', binaryHash: 'a'.repeat(40), identityHash: 'b'.repeat(40) }),
     });
     assert.equal(exit, 3);
     assert.deepEqual(errors, ['helper-missing: /tmp/missing-helper; run npm run build:helper']);
@@ -164,7 +166,8 @@ describe('Swift Keychain helper write path', () => {
     const backend = new MacosKeychainBackend({
       helperPath: helper,
       execFileSync: markFakeExecutor(() => { helperCalls += 1; return ''; }),
-      helperVerifier: () => null,
+      helperConfigReader: () => 'b'.repeat(40),
+      helperIdentityVerifier: () => ({ trusted: false, reason: 'pinned leaf certificate did not verify' }),
     });
     try {
       assert.throws(() => backend.setSync('qlb-test-helper', 'qlb', 'credential'), KeychainHelperUntrustedError);
@@ -173,7 +176,7 @@ describe('Swift Keychain helper write path', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
-  it('caches a trusted helper verifier across credential writes', () => {
+  it('verifies a trusted helper immediately before every credential write', () => {
     const dir = mkdtempSync(join(tmpdir(), 'qlb-helper-trusted-'));
     const helper = join(dir, 'qlb-keychain-helper');
     writeFileSync(helper, 'fixture helper');
@@ -182,16 +185,76 @@ describe('Swift Keychain helper write path', () => {
     const backend = new MacosKeychainBackend({
       helperPath: helper,
       execFileSync: markFakeExecutor(() => { helperCalls += 1; return ''; }),
-      helperVerifier: () => {
+      helperConfigReader: () => 'b'.repeat(40),
+      helperIdentityVerifier: () => {
         verifierCalls += 1;
-        return { authority: 'QLB Keychain Helper', binaryHash: 'a'.repeat(40), identityHash: 'b'.repeat(40) };
+        return { trusted: true };
       },
     });
     try {
       backend.setSync('qlb-test-helper', 'qlb', 'credential-one');
       backend.setSync('qlb-test-helper', 'qlb', 'credential-two');
-      assert.equal(verifierCalls, 1);
+      assert.equal(verifierCalls, 2);
       assert.equal(helperCalls, 2);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('refuses a helper with a matching authority but a leaf that differs from the pin', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-helper-wrong-leaf-'));
+    const helper = join(dir, 'qlb-keychain-helper');
+    writeFileSync(helper, 'fixture helper');
+    let helperCalls = 0;
+    let verifiedPin: string | undefined;
+    const backend = new MacosKeychainBackend({
+      helperPath: helper,
+      execFileSync: markFakeExecutor(() => { helperCalls += 1; return ''; }),
+      helperConfigReader: () => 'a'.repeat(40),
+      helperIdentityVerifier: (_path, pin) => {
+        verifiedPin = pin;
+        return { trusted: false, reason: 'pinned leaf certificate did not verify' };
+      },
+    });
+    try {
+      assert.throws(() => backend.setSync('qlb-test-helper', 'qlb', 'credential'), KeychainHelperUntrustedError);
+      assert.equal(verifiedPin, 'a'.repeat(40));
+      assert.equal(helperCalls, 0);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('refuses without a recorded helper pin before spawning the helper', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-helper-no-pin-'));
+    const helper = join(dir, 'qlb-keychain-helper');
+    writeFileSync(helper, 'fixture helper');
+    let helperCalls = 0;
+    const backend = new MacosKeychainBackend({
+      helperPath: helper,
+      execFileSync: markFakeExecutor(() => { helperCalls += 1; return ''; }),
+      helperConfigReader: () => null,
+      helperIdentityVerifier: () => ({ trusted: true }),
+    });
+    try {
+      assert.throws(
+        () => backend.setSync('qlb-test-helper', 'qlb', 'credential'),
+        /helper-untrusted: no pinned helper identity; run qlb keychain check-launchd/,
+      );
+      assert.equal(helperCalls, 0);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('passes the exact designated requirement to codesign for a pinned leaf', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-helper-pin-requirement-'));
+    const helper = join(dir, 'qlb-keychain-helper');
+    writeFileSync(helper, 'fixture helper');
+    const pin = 'c'.repeat(40);
+    const calls: string[][] = [];
+    try {
+      assert.deepEqual(verifyHelperIdentity(helper, pin, (_command, args) => {
+        calls.push(args);
+        return { status: 0 };
+      }), { trusted: true });
+      assert.deepEqual(calls, [[
+        '--verify', '--strict', '-R', `certificate leaf = H"${pin}"`, helper,
+      ]]);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
@@ -219,6 +282,50 @@ describe('Swift Keychain helper write path', () => {
     assert.deepEqual(errors, ['qlb keychain: helper matrix failed']);
     const store = openStore(config.dbPath);
     try { assert.equal(store.getConfig('keychain.helperCheckResult'), 'failed'); } finally { store.close(); }
+  });
+
+  it('does not run the matrix when its pre-check fails', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-keychain-precheck-'));
+    const config = defaultConfig(home);
+    let matrixCalls = 0;
+    const exit = await runKeychainCommand(['matrix'], {
+      config, env: {}, home, stdout: () => {}, stderr: () => {},
+      loadConfig: () => config, registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
+    }, {
+      runMatrix: () => { matrixCalls += 1; throw new Error('must not run'); },
+      helperSigning: () => null,
+    });
+    assert.equal(exit, 1);
+    assert.equal(matrixCalls, 0);
+  });
+
+  it('fails the matrix and does not record a pin when the helper CDHash changes during it', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-keychain-cdhash-change-'));
+    const config = defaultConfig(home);
+    let inspections = 0;
+    let matrixCalls = 0;
+    const green = {
+      cases: { securityCreated: 'pass' as const, securityUntrusted: 'pass' as const, previousHelper: 'pass' as const, helperCreated: 'pass' as const },
+      casePrompted: { securityCreated: false, securityUntrusted: false, previousHelper: false, helperCreated: false },
+      caseReasons: { securityCreated: null, securityUntrusted: null, previousHelper: null, helperCreated: null },
+      prompted: false,
+    };
+    const exit = await runKeychainCommand(['matrix'], {
+      config, env: {}, home, stdout: () => {}, stderr: () => {},
+      loadConfig: () => config, registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
+    }, {
+      runMatrix: () => { matrixCalls += 1; return green; },
+      helperSigning: () => ({
+        authority: 'QLB Keychain Helper', binaryHash: (inspections++ === 0 ? 'a' : 'b').repeat(40), identityHash: 'c'.repeat(40),
+      }),
+    });
+    assert.equal(exit, 1);
+    assert.equal(matrixCalls, 1);
+    const store = openStore(config.dbPath);
+    try {
+      assert.equal(store.getConfig('keychain.helperCheckResult'), 'failed');
+      assert.equal(store.getConfig('keychain.helperCheckIdentityHash'), null);
+    } finally { store.close(); }
   });
 
   it('returns exit 3 and the helper-missing error through the redacting command boundary', async () => {

@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { DatabaseSync } from 'node:sqlite';
 import {
   chmodSync,
   copyFileSync,
@@ -16,7 +17,12 @@ import {
 } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative } from 'node:path';
 
-import { inspectHelperSigning, type HelperSigningState } from './diagnostics';
+import {
+  inspectHelperSigning,
+  verifyHelperIdentity,
+  type HelperIdentityVerification,
+  type HelperSigningState,
+} from './diagnostics';
 import { backupBeforeMigrate } from './store';
 
 const BUILD_STAMP = '.build-sha';
@@ -33,6 +39,10 @@ export interface ReleaseInstallOptions {
   backup?: typeof backupBeforeMigrate;
   /** Verifies the native helper before it can enter an immutable release. */
   verifyHelperSigning?: (path: string) => HelperSigningState | null;
+  /** Reads the leaf identity pin recorded by a passing helper matrix. */
+  helperConfigReader?: (key: string) => string | null;
+  /** Injectable only for hermetic pinned-identity verification tests. */
+  verifyHelperIdentity?: (path: string, pin: string) => HelperIdentityVerification;
   /** Injectable only for hermetic platform-specific release tests. */
   platform?: NodeJS.Platform;
 }
@@ -56,6 +66,20 @@ interface BuildStamp {
 
 /** A build/release integrity failure is a deliberate, operator-actionable refusal (exit 3). */
 export class ReleaseIntegrityError extends Error {}
+
+function readRecordedConfig(dbPath: string, key: string): string | null {
+  try {
+    const db = new DatabaseSync(dbPath, { readOnly: true });
+    try {
+      const row = db.prepare('SELECT value FROM config WHERE key = ?').get(key) as { value?: unknown } | undefined;
+      return typeof row?.value === 'string' ? row.value : null;
+    } finally {
+      db.close();
+    }
+  } catch {
+    return null;
+  }
+}
 
 function assertReleaseSha(sha: string): void {
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(sha)) {
@@ -235,6 +259,8 @@ function copyReleaseContents(
   sourceDir: string,
   stagingDir: string,
   verifyHelperSigning: (path: string) => HelperSigningState | null = inspectHelperSigning,
+  helperConfigReader: (key: string) => string | null = () => null,
+  verifyPinnedHelperIdentity: (path: string, pin: string) => HelperIdentityVerification = verifyHelperIdentity,
   platform: NodeJS.Platform = process.platform,
 ): void {
   const checkoutRoot = realpathSync(sourceDir);
@@ -257,12 +283,20 @@ function copyReleaseContents(
     // Checking the resolved file catches a symlink at any ancestor, not merely at the leaf.
     const resolvedHelper = realpathSync(helper);
     assertPathInside(checkoutRoot, resolvedHelper, helper);
-    const signing = verifyHelperSigning(resolvedHelper);
-    if (!signing) {
-      throw new ReleaseIntegrityError('helper not signed; run npm run build:helper');
-    }
-    if (signing.authority !== 'QLB Keychain Helper') {
-      throw new ReleaseIntegrityError(`helper signed by ${signing.authority}, expected QLB Keychain Helper; run npm run build:helper`);
+    const pin = helperConfigReader('keychain.helperCheckIdentityHash');
+    if (pin) {
+      const verification = verifyPinnedHelperIdentity(resolvedHelper, pin);
+      if (!verification.trusted) {
+        throw new ReleaseIntegrityError(`helper ${verification.reason}; run npm run build:helper or qlb keychain check-launchd`);
+      }
+    } else {
+      const signing = verifyHelperSigning(resolvedHelper);
+      if (!signing) {
+        throw new ReleaseIntegrityError('helper not signed; run npm run build:helper');
+      }
+      if (signing.authority !== 'QLB Keychain Helper') {
+        throw new ReleaseIntegrityError(`helper signed by ${signing.authority}, expected QLB Keychain Helper; run npm run build:helper`);
+      }
     }
     const installedHelper = join(stagingDir, 'native', 'keychain-helper', 'build', 'qlb-keychain-helper');
     copyContained(resolvedHelper, installedHelper, checkoutRoot);
@@ -373,7 +407,14 @@ export async function installRelease(options: ReleaseInstallOptions): Promise<Re
   let staged = true;
   try {
     mkdirSync(stagingDir, { mode: 0o755 });
-    copyReleaseContents(options.sourceDir, stagingDir, options.verifyHelperSigning, options.platform);
+    copyReleaseContents(
+      options.sourceDir,
+      stagingDir,
+      options.verifyHelperSigning,
+      options.helperConfigReader ?? ((key) => readRecordedConfig(options.dbPath, key)),
+      options.verifyHelperIdentity,
+      options.platform,
+    );
     const stagedBuildDigest = buildOutputDigest(stagingDir);
     if (stagedBuildDigest !== stamp.buildDigest) {
       throw new ReleaseIntegrityError('compiled build output digest differs from its stamp; rebuild from a clean tree');

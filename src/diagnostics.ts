@@ -123,6 +123,32 @@ export function inspectHelperSigning(
   return authority && binaryHash && identityHash ? { authority, binaryHash, identityHash } : null;
 }
 
+export type HelperIdentityVerification =
+  | { trusted: true }
+  | { trusted: false; reason: string };
+
+/** Verifies the helper's exact pinned leaf identity using codesign's requirement evaluator. */
+export function verifyHelperIdentity(
+  path: string,
+  pin: string,
+  spawn: CodesignSpawn = spawnSync,
+): HelperIdentityVerification {
+  if (!/^[0-9a-fA-F]{40}$/.test(pin)) {
+    return { trusted: false, reason: 'pinned helper identity is invalid' };
+  }
+  if (!existsSync(path)) return { trusted: false, reason: 'helper is missing' };
+  try {
+    const verification = spawn('/usr/bin/codesign', [
+      '--verify', '--strict', '-R', `certificate leaf = H"${pin}"`, path,
+    ], { encoding: 'utf8' });
+    return verification.status === 0
+      ? { trusted: true }
+      : { trusted: false, reason: 'pinned leaf certificate did not verify' };
+  } catch {
+    return { trusted: false, reason: 'pinned leaf certificate did not verify' };
+  }
+}
+
 /** The diagnostic registry is separate from the runtime report so checks can be added independently. */
 export function listCheckNames(): string[] {
   return discoverChecks().map((check) => check.name);
@@ -504,6 +530,8 @@ export async function doctorQlb(
     configReader?: (key: string) => string | null;
     /** Tests inject signing metadata rather than requiring a locally built helper. */
     helperSigning?: () => HelperSigningState | null;
+    /** Tests inject the pinned-identity verifier rather than invoking codesign. */
+    helperIdentityVerifier?: (path: string, pin: string) => HelperIdentityVerification;
     /** Tests control matrix receipt age without changing the system clock. */
     now?: () => number;
     /** Test-only fixture for `ps -axo pid=,lstart=,command=`. */
@@ -619,12 +647,19 @@ export async function doctorQlb(
     const helperAt = Number(configValue('keychain.helperCheckAt'));
     const helperHash = configValue('keychain.helperCheckBinaryHash');
     const helperIdentityHash = configValue('keychain.helperCheckIdentityHash');
+    const identityVerification = helperIdentityHash === null
+      ? null
+      : (options.helperIdentityVerifier ?? verifyHelperIdentity)(defaultKeychainHelperPath(), helperIdentityHash);
     const recent = Number.isFinite(helperAt) && helperAt > 0 && (options.now ?? Date.now)() - helperAt <= HELPER_CHECK_MAX_AGE_MS;
-    if (!signing || signing.authority !== 'QLB Keychain Helper') {
+    if (helperIdentityHash !== null && !identityVerification!.trusted) {
+      checks.push({ name: 'keychain:helper', level: 'FAIL', message: `pinned helper identity does not verify: ${identityVerification!.reason}` });
+    } else if (helperIdentityHash === null && (!signing || signing.authority !== 'QLB Keychain Helper')) {
       checks.push({ name: 'keychain:helper', level: 'FAIL', message: 'signed QLB Keychain Helper binary is missing or its identity does not match' });
+    } else if (!signing) {
+      checks.push({ name: 'keychain:helper', level: 'FAIL', message: 'signed helper metadata is unavailable' });
     } else if (helperResult === null || !Number.isFinite(helperAt)) {
       checks.push({ name: 'keychain:helper', level: 'WARN', message: 'helper matrix has not been evaluated; run qlb keychain check-launchd' });
-    } else if (helperResult !== 'ok' || helperPrompted || helperHash !== signing.binaryHash || helperIdentityHash !== signing.identityHash) {
+    } else if (helperResult !== 'ok' || helperPrompted || helperHash !== signing.binaryHash) {
       checks.push({ name: 'keychain:helper', level: 'FAIL', message: helperPrompted ? 'helper matrix recorded a Keychain prompt' : 'helper matrix does not match the current signed helper' });
     } else if (!recent) {
       checks.push({ name: 'keychain:helper', level: 'WARN', message: 'helper matrix result is stale; run qlb keychain check-launchd' });

@@ -185,6 +185,28 @@ describe('release install (AC45)', () => {
     assert.equal(existsSync(join(appDir, 'foreign-helper-sha')), false);
   });
 
+  it('refuses a helper that does not match a recorded leaf pin before publishing', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-release-helper-pin-'));
+    const sourceDir = sourceBuild(root, 'pinned-helper-sha');
+    const helper = join(sourceDir, 'native', 'keychain-helper', 'build', 'qlb-keychain-helper');
+    mkdirSync(dirname(helper), { recursive: true });
+    writeFileSync(helper, 'foreign fake helper bytes\n');
+    const appDir = join(root, 'app');
+    let published = false;
+
+    await assert.rejects(
+      installRelease({
+        sourceDir, appDir, sha: 'pinned-helper-sha', dbPath: join(root, 'db'),
+        helperConfigReader: () => 'c'.repeat(40),
+        verifyHelperIdentity: () => ({ trusted: false, reason: 'pinned leaf certificate did not verify' }),
+        verifyHelperSigning: () => { published = true; return QLB_HELPER_SIGNING; },
+      }),
+      /helper pinned leaf certificate did not verify; run npm run build:helper or qlb keychain check-launchd/,
+    );
+    assert.equal(published, false);
+    assert.equal(existsSync(join(appDir, 'pinned-helper-sha')), false);
+  });
+
   it('refuses a helper reached through a symlinked ancestor outside the checkout', async () => {
     const root = mkdtempSync(join(tmpdir(), 'qlb-release-helper-symlink-'));
     const sourceDir = sourceBuild(root, 'symlink-helper-sha');

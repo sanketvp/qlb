@@ -3,7 +3,12 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'no
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { defaultKeychainHelperPath, KeychainHelperMissingError, MACOS_SECURITY_TIMEOUT_MS } from '../keychain';
-import { inspectHelperSigning, type HelperSigningState } from '../diagnostics';
+import {
+  inspectHelperSigning,
+  verifyHelperIdentity,
+  type HelperIdentityVerification,
+  type HelperSigningState,
+} from '../diagnostics';
 import { openStore } from '../store';
 import type { CommandDefinition, CommandContext } from '../registry';
 
@@ -21,7 +26,7 @@ export interface HelperMatrixResult {
 type MatrixRunner = (path: string, args: string[]) => string;
 
 class MatrixReceiptError extends Error {
-  constructor(readonly result: HelperMatrixResult) {
+  constructor(readonly result: HelperMatrixResult | null) {
     super('helper matrix receipt is not green');
   }
 }
@@ -149,13 +154,15 @@ export function helperMatrixConfig(
   result: HelperMatrixResult | null,
   signing: HelperSigningState | null = null,
 ): Record<string, string> {
+  const passed = !!result && helperMatrixIsOk(result) && signing?.authority === 'QLB Keychain Helper';
   const config: Record<string, string> = {
     'keychain.helperCheckAt': String(Date.now()),
-    'keychain.helperCheckResult': result && helperMatrixIsOk(result) && signing?.authority === 'QLB Keychain Helper' ? 'ok' : 'failed',
+    'keychain.helperCheckResult': passed ? 'ok' : 'failed',
     'keychain.helperCheckPrompted': String(result?.prompted === true),
     'keychain.helperCheckCasePrompted': JSON.stringify(result?.casePrompted ?? {}),
   };
-  if (signing) {
+  // A failed matrix must never establish a pin for a helper that did not run.
+  if (passed && signing) {
     config['keychain.helperCheckBinaryHash'] = signing.binaryHash;
     config['keychain.helperCheckIdentityHash'] = signing.identityHash;
   }
@@ -165,8 +172,7 @@ export function helperMatrixConfig(
 function writeMatrixConfig(
   dbPath: string,
   result: HelperMatrixResult | null,
-  path: string,
-  signing: HelperSigningState | null = helperSigningState(path),
+  signing: HelperSigningState | null,
 ): void {
   const store = openStore(dbPath);
   try {
@@ -181,6 +187,10 @@ export interface KeychainCommandDependencies {
   runLaunchdMatrix?: () => HelperMatrixResult;
   /** Injectable so receipt handling can be tested without codesign. */
   helperSigning?: (path: string) => HelperSigningState | null;
+  /** Injectable config lookup for the matrix-recorded leaf certificate pin. */
+  helperConfigReader?: (key: string) => string | null;
+  /** Injectable so pinned identity checks remain hermetic in tests. */
+  helperIdentityVerifier?: (path: string, pin: string) => HelperIdentityVerification;
 }
 
 export async function runKeychainCommand(
@@ -199,14 +209,27 @@ export async function runKeychainCommand(
   const path = helperPath();
   let signing: HelperSigningState | null = null;
   try {
+    const inspect = dependencies.helperSigning ?? helperSigningState;
+    const configReader = dependencies.helperConfigReader ?? (() => {
+      const store = openStore(ctx.config.dbPath);
+      try { return store.getConfig('keychain.helperCheckIdentityHash'); } finally { store.close(); }
+    });
+    const pin = configReader('keychain.helperCheckIdentityHash');
+    const verify = dependencies.helperIdentityVerifier ?? verifyHelperIdentity;
+    signing = inspect(path);
+    if (!signing || signing.authority !== 'QLB Keychain Helper') throw new MatrixReceiptError(null);
+    if (pin && !verify(path, pin).trusted) throw new MatrixReceiptError(null);
+
     result = options.subcommand === 'check-launchd'
       ? (dependencies.runLaunchdMatrix ?? runHelperMatrixUnderLaunchd)()
       : (dependencies.runMatrix ?? runHelperMatrix)();
-    signing = (dependencies.helperSigning ?? helperSigningState)(path);
-    if (!helperMatrixIsOk(result) || !signing || signing.authority !== 'QLB Keychain Helper') {
+    const after = inspect(path);
+    if (!helperMatrixIsOk(result) || !after || after.authority !== 'QLB Keychain Helper'
+      || after.binaryHash !== signing.binaryHash) {
       throw new MatrixReceiptError(result);
     }
-    writeMatrixConfig(ctx.config.dbPath, result, path, signing);
+    // Only a green matrix on an unchanged helper may establish or replace the pin.
+    writeMatrixConfig(ctx.config.dbPath, result, after);
     const body = {
       command: options.subcommand, helperCheckResult: 'ok', prompted: result.prompted,
       casePrompted: result.casePrompted, cases: result.cases,
@@ -220,8 +243,9 @@ export async function runKeychainCommand(
       return err.exitCode;
     }
     // Native command errors can contain implementation details. Do not relay stderr
-    // because this boundary must never carry Keychain values.
-    writeMatrixConfig(ctx.config.dbPath, result, path, signing);
+    // because this boundary must never carry Keychain values. Do not record a new
+    // identity unless the matrix passed and its post-run CDHash matched the pre-run one.
+    writeMatrixConfig(ctx.config.dbPath, result, null);
     ctx.stderr('qlb keychain: helper matrix failed');
     return 1;
   }
