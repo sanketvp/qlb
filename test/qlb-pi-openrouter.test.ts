@@ -1,12 +1,14 @@
 import assert from 'node:assert/strict';
 import { cpSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { describe, it } from 'node:test';
 
 import {
   composeOpenRouterModels,
   createOpenRouterStream,
+  openRouterModelsJsonRegistrationError,
   readOpenRouterModelsJson,
   registerOpenRouterSource,
   type GateRun,
@@ -15,7 +17,7 @@ import {
 import openRouterGate, { read as readOpenRouterGate } from '../src/gate/openrouter';
 import { MockKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from '../src/keychain';
 import { OPENROUTER_CREDITS_URL, probeOpenRouterUsage } from '../src/usage/openrouter';
-import { piIntegrationChecks } from '../src/pi-integration';
+import { locatePi, piAgentDir, piIntegrationChecks } from '../src/pi-integration';
 
 class Events implements AsyncIterable<unknown> {
   readonly values: unknown[] = [];
@@ -40,6 +42,13 @@ function readAll(stream: AsyncIterable<unknown>): Promise<unknown[]> {
     for await (const value of stream) values.push(value);
     return values;
   })();
+}
+
+function readOpenRouterModelsJsonFromText(text: string) {
+  const root = mkdtempSync(join(tmpdir(), 'qlb-openrouter-invalid-models-'));
+  const path = join(root, 'models.json');
+  writeFileSync(path, text);
+  return readOpenRouterModelsJson(path);
 }
 
 describe('qlb-pi OpenRouter source', () => {
@@ -93,6 +102,59 @@ describe('qlb-pi OpenRouter source', () => {
       assert.equal(event?.error?.errorMessage, `QLB unavailable for openrouter — run qlb doctor (${cause})`);
       assert.equal(JSON.stringify(event).includes('fixture-openrouter-key'), false);
     }
+  });
+
+  it('uses Pi getAgentDir() when PI_CODING_AGENT_DIR supplies models.json and retains its baseUrl', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-openrouter-agent-dir-'));
+    const location = locatePi(process.env, homedir());
+    assert.ok(location.root, 'Pi package is required for this contract test');
+    const importModule = new Function('path', 'return import(path)') as (path: string) => Promise<{ getAgentDir(): string }>;
+    const { getAgentDir } = await importModule(pathToFileURL(join(location.root!, 'dist', 'index.js')).href);
+    const previous = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = root;
+    try {
+      const modelsJson = join(getAgentDir(), 'models.json');
+      writeFileSync(modelsJson, JSON.stringify({ providers: { openrouter: {
+        baseUrl: 'https://regional.openrouter.example/api/v1',
+        models: [{ id: 'custom', api: 'openai-completions', contextWindow: 1000, maxTokens: 100 }],
+      } } }));
+      const config = readOpenRouterModelsJson(modelsJson);
+      assert.equal(openRouterModelsJsonRegistrationError(config), undefined);
+      const models = composeOpenRouterModels([{
+        id: 'builtin', api: 'openai-completions', provider: 'openrouter', baseUrl: 'https://openrouter.ai/api/v1',
+      }], config);
+      let registered: { baseUrl?: string; models: Array<{ baseUrl?: unknown }> } | undefined;
+      const pi = {
+        unregisterProvider: () => {},
+        registerProvider: (_name: string, next: any) => { registered = next; },
+      };
+      await registerOpenRouterSource(pi, {
+        ownerPath: '/fixture/qlb-owner.json', readOwner: () => ownedOwner(), models,
+        baseUrl: config?.baseUrl, transport: () => new Events(), createStream: () => new Events(),
+      });
+      assert.equal(registered?.baseUrl, 'https://regional.openrouter.example/api/v1');
+      assert.deepEqual(registered?.models.map((model) => model.baseUrl), [
+        'https://regional.openrouter.example/api/v1',
+        'https://regional.openrouter.example/api/v1',
+      ]);
+    } finally {
+      if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previous;
+    }
+  });
+
+  it('keeps malformed-but-schema-valid OpenRouter provider blocks fail closed before Pi can retain native auth', async () => {
+    const config = readOpenRouterModelsJsonFromText('{"providers":{"openrouter":{"name":"OR"}}}');
+    const error = 'Provider openrouter: must specify "baseUrl", "headers", "compat", "modelOverrides", or "models".';
+    assert.equal(openRouterModelsJsonRegistrationError(config), error);
+    const calls: string[] = [];
+    await assert.rejects(registerOpenRouterSource({
+      unregisterProvider: () => { calls.push('unregister'); },
+      registerProvider: () => { calls.push('register'); },
+    }, {
+      ownerPath: '/fixture/qlb-owner.json', readOwner: () => ownedOwner(), modelsJson: config,
+    }), { message: error });
+    assert.deepEqual(calls, []);
   });
 
   it('keeps models.json OpenRouter models, overrides, and provider baseUrl in the gated catalog', () => {
@@ -206,6 +268,73 @@ describe('qlb-pi OpenRouter source', () => {
     await new Promise((resolve) => setImmediate(resolve));
     assert.equal(sent?.apiKey, 'fixture-openrouter-key');
     assert.deepEqual(sent?.headers, { keep: 'yes' });
+  });
+});
+
+describe('Pi models.json ownership safety', () => {
+  it('uses PI_CODING_AGENT_DIR for the same agent directory Pi selects', () => {
+    const agentDir = mkdtempSync(join(tmpdir(), 'qlb-pi-agent-dir-'));
+    const previous = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    try {
+      assert.equal(piAgentDir(), agentDir);
+    } finally {
+      if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previous;
+    }
+  });
+
+  it('reports a doctor FAIL instead of allowing Pi to reject QLB and retain native OpenRouter auth', () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-pi-models-doctor-'));
+    const agentDir = join(root, 'agent');
+    const extensionDir = join(agentDir, 'extensions', 'qlb-pi');
+    const piRoot = join(root, 'pi');
+    mkdirSync(extensionDir, { recursive: true });
+    mkdirSync(join(piRoot, 'dist'), { recursive: true });
+    writeFileSync(join(piRoot, 'package.json'), JSON.stringify({ name: '@earendil-works/pi-coding-agent', version: '1.4.0' }));
+    writeFileSync(join(agentDir, 'qlb-owner.json'), ownedOwner());
+    writeFileSync(join(agentDir, 'models.json'), '{"providers":{"openrouter":{"name":"OR"}}}');
+
+    const checks = piIntegrationChecks({ agentDir, extensionDir, pi: { root: piRoot } });
+    assert.deepEqual(checks.find((check) => check.name === 'pi:models-json-openrouter'), {
+      name: 'pi:models-json-openrouter', level: 'FAIL',
+      message: 'models.json openrouter block prevents QLB from managing OpenRouter — fix or remove it',
+    });
+  });
+
+  it('matches the installed ModelRuntime: invalid blocks reject QLB registration while valid blocks retain models', async () => {
+    const location = locatePi(process.env, homedir());
+    assert.ok(location.root, 'Pi package is required for this contract test');
+    const importModule = new Function('path', 'return import(path)') as (path: string) => Promise<{
+      ModelRuntime: { create(options: Record<string, unknown>): Promise<any> };
+    }>;
+    const { ModelRuntime } = await importModule(pathToFileURL(join(location.root!, 'dist', 'index.js')).href);
+    const root = mkdtempSync(join(tmpdir(), 'qlb-pi-real-runtime-'));
+    const invalidModelsPath = join(root, 'invalid-models.json');
+    writeFileSync(invalidModelsPath, '{"providers":{"openrouter":{"name":"OR"}}}');
+    const invalidRuntime = await ModelRuntime.create({
+      authPath: join(root, 'auth.json'), modelsPath: invalidModelsPath,
+      allowModelNetwork: false, refreshOnCreate: false,
+    });
+    assert.throws(() => invalidRuntime.registerProvider('openrouter', {
+      api: 'openai-completions', models: [], streamSimple: () => new Events(),
+    }), /must specify "baseUrl", "headers", "compat", "modelOverrides", or "models"/);
+
+    const validModelsPath = join(root, 'valid-models.json');
+    writeFileSync(validModelsPath, JSON.stringify({ providers: { openrouter: {
+      baseUrl: 'https://regional.openrouter.example/api/v1',
+      models: [{ id: 'custom', api: 'openai-completions', contextWindow: 1000, maxTokens: 100 }],
+    } } }));
+    const validRuntime = await ModelRuntime.create({
+      authPath: join(root, 'auth.json'), modelsPath: validModelsPath,
+      allowModelNetwork: false, refreshOnCreate: false,
+    });
+    validRuntime.registerProvider('openrouter', {
+      api: 'openai-completions',
+      models: [{ id: 'custom', api: 'openai-completions', baseUrl: 'https://regional.openrouter.example/api/v1' }],
+      streamSimple: () => new Events(),
+    });
+    assert.equal(validRuntime.getModel('openrouter', 'custom')?.baseUrl, 'https://regional.openrouter.example/api/v1');
   });
 });
 

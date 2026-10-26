@@ -16,9 +16,13 @@ const STREAM_API = 'openai-completions' as const;
 const AUTH_HEADERS = new Set(['authorization', 'x-api-key', 'cf-aig-authorization']);
 
 type ModelLike = { id: string; api?: unknown; provider?: unknown; baseUrl?: unknown; [key: string]: unknown };
-type OpenRouterModelsConfig = {
+export type OpenRouterModelsConfig = {
   baseUrl?: string;
   api?: string;
+  apiKey?: string;
+  oauth?: string;
+  authHeader?: boolean;
+  headers?: Record<string, string>;
   compat?: Record<string, unknown>;
   models?: ModelLike[];
   modelOverrides?: Record<string, ModelLike>;
@@ -43,6 +47,8 @@ export interface OpenRouterSourceDeps {
   createStream?: () => EventSink;
   /** Pi's built-in OpenRouter chat catalog, supplied by index.ts's compat import. */
   models?: ModelLike[];
+  /** Pi's models.json OpenRouter provider config, if configured. */
+  modelsJson?: OpenRouterModelsConfig;
   /** Pi's models.json OpenRouter provider baseUrl, if configured. */
   baseUrl?: string;
 }
@@ -147,6 +153,10 @@ export function readOpenRouterModelsJson(path: string): OpenRouterModelsConfig |
     const config = parsed.providers.openrouter;
     if ((config.baseUrl !== undefined && typeof config.baseUrl !== 'string') ||
         (config.api !== undefined && typeof config.api !== 'string') ||
+        (config.apiKey !== undefined && typeof config.apiKey !== 'string') ||
+        (config.oauth !== undefined && typeof config.oauth !== 'string') ||
+        (config.authHeader !== undefined && typeof config.authHeader !== 'boolean') ||
+        (config.headers !== undefined && !isObject(config.headers)) ||
         (config.models !== undefined && !Array.isArray(config.models)) ||
         (config.modelOverrides !== undefined && !isObject(config.modelOverrides))) return undefined;
     if (config.models?.some((model) => !isObject(model) || typeof model.id !== 'string' || model.id.length === 0)) return undefined;
@@ -155,6 +165,27 @@ export function readOpenRouterModelsJson(path: string): OpenRouterModelsConfig |
     // ModelConfig treats unreadable or invalid files as an empty provider map.
     return undefined;
   }
+}
+
+/**
+ * Pi 1.4.0 provider-composer.js applyModelsJson() rejects a provider config
+ * before it applies an extension registration. Keep this exact precondition in
+ * front of the queued registration: otherwise Pi catches the rejection and
+ * restores its native, credential-backed OpenRouter provider.
+ */
+export class OpenRouterModelsJsonBlockedError extends Error {}
+
+export function openRouterModelsJsonRegistrationError(config?: OpenRouterModelsConfig): string | undefined {
+  if (!config) return undefined;
+  if (config.oauth && !config.baseUrl) {
+    return 'Provider openrouter: "baseUrl" is required when "oauth" is set.';
+  }
+  const hasOverrides = !!config.modelOverrides && Object.keys(config.modelOverrides).length > 0;
+  if (!config.models?.length && !config.baseUrl && !config.headers && !config.compat &&
+      !hasOverrides && !config.apiKey && !config.oauth && config.authHeader === undefined) {
+    return 'Provider openrouter: must specify "baseUrl", "headers", "compat", "modelOverrides", or "models".';
+  }
+  return undefined;
 }
 
 function mergeModelOverride(model: ModelLike, override: ModelLike | undefined): ModelLike {
@@ -299,6 +330,8 @@ export function openRouterSourceMode(deps: OpenRouterSourceDeps = {}): 'inert' |
 export async function registerOpenRouterSource(pi: ProviderApi, deps: OpenRouterSourceDeps = {}): Promise<boolean> {
   const mode = openRouterSourceMode(deps);
   if (mode === 'inert') return false;
+  const modelsJsonError = openRouterModelsJsonRegistrationError(deps.modelsJson);
+  if (modelsJsonError) throw new OpenRouterModelsJsonBlockedError(modelsJsonError);
 
   const createStream = deps.createStream;
   if (!createStream) throw new Error('qlb-pi: OpenRouter event stream is unavailable');

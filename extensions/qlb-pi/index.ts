@@ -58,12 +58,14 @@ import type {
   ExtensionCommandContext,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { Api, Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { streamWithAuthRetry } from "./auth-retry.js";
 import {
   composeOpenRouterModels,
+  OpenRouterModelsJsonBlockedError,
   openRouterSourceMode,
   readOpenRouterModelsJson,
   registerOpenRouterSource,
@@ -276,11 +278,16 @@ async function resolveOpenRouterSourceDeps(): Promise<OpenRouterSourceDeps> {
   // ExtensionAPI exposes no ModelRuntime/composed catalog. Mirror Pi's models.json
   // JSONC parsing and composition here so registering models does not discard an
   // operator's OpenRouter additions, metadata, or provider baseUrl.
-  const config = readOpenRouterModelsJson(join(homedir(), ".pi", "agent", "models.json"));
+  // Pi exports getAgentDir(), which is also the resolver used by its regular
+  // runtime (PI_CODING_AGENT_DIR first, then ~/.pi/agent). Its ExtensionAPI
+  // deliberately has no SDK agentDir field, so the extension uses that same
+  // public resolver rather than rebuilding a home-directory path.
+  const config = readOpenRouterModelsJson(join(getAgentDir(), "models.json"));
   const models = composeOpenRouterModels(builtinModels, config);
   const anthropicModelIds = new Set(models.filter((model) => model.api === "anthropic-messages").map((model) => model.id));
   return {
     models,
+    ...(config ? { modelsJson: config } : {}),
     ...(config?.baseUrl ? { baseUrl: config.baseUrl } : {}),
     createStream: () => createAssistantMessageEventStream() as never,
     transport: (model, context, options) => {
@@ -313,8 +320,16 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     const openRouterProviderApi = pi as unknown as OpenRouterProviderApi;
     try {
       await registerOpenRouterSource(openRouterProviderApi, await resolveOpenRouterSourceDeps());
-    } catch {
-      await registerOpenRouterUnavailableSource(openRouterProviderApi, () => createAssistantMessageEventStream() as never);
+    } catch (error) {
+      if (error instanceof OpenRouterModelsJsonBlockedError) {
+        // Pi 1.4.0 exposes no request hook with a provider/model identity:
+        // before_provider_request only carries payload (types.d.ts:692-696),
+        // and before_provider_headers only carries headers (698-703). Do not
+        // pretend that either can intercept the native OpenRouter request.
+        console.error('[qlb-pi] models.json openrouter block prevents QLB from managing OpenRouter — fix or remove it');
+      } else {
+        await registerOpenRouterUnavailableSource(openRouterProviderApi, () => createAssistantMessageEventStream() as never);
+      }
     }
   }
 

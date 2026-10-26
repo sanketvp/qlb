@@ -27,7 +27,7 @@ import { qlbHomeDir } from './home';
 import { findQlbRepoRoot } from './setup';
 
 const PI_PACKAGE_NAME = '@earendil-works/pi-coding-agent';
-const DEFAULT_PI_EXT_DIR = join(qlbHomeDir(), '.pi', 'agent', 'extensions', 'qlb-pi');
+const OPENROUTER_MODELS_JSON_BLOCKED = 'models.json openrouter block prevents QLB from managing OpenRouter — fix or remove it';
 
 function isPiPackageRoot(dir: string): boolean {
   try {
@@ -209,6 +209,8 @@ function dtsFiles(dir: string, out: string[] = [], depth = 0): string[] {
 }
 
 export interface PiIntegrationOptions {
+  /** Pi agent directory; tests inject a temporary directory. */
+  agentDir?: string;
   /** Run `tsc --noEmit` against the installed Pi types (slow, ~3s). doctor --live turns it on. */
   typecheck?: boolean;
   /** Pi location; defaults to locatePi(). */
@@ -220,6 +222,69 @@ export interface PiIntegrationOptions {
 
 function readText(path: string): string | null {
   try { return readFileSync(path, 'utf8'); } catch { return null; }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** Pi config.ts getAgentDir(): PI_CODING_AGENT_DIR, then ~/.pi/agent. */
+export function piAgentDir(env: NodeJS.ProcessEnv = process.env, home: string = qlbHomeDir(env)): string {
+  const configured = env.PI_CODING_AGENT_DIR;
+  if (!configured) return join(home, '.pi', 'agent');
+  if (configured === '~') return home;
+  if (configured.startsWith('~/') || configured.startsWith('~\\')) return join(home, configured.slice(2));
+  return configured;
+}
+
+function stripJsonComments(input: string): string {
+  return input
+    .replace(/"(?:\\.|[^"\\])*"|\/\/[^\n]*/g, (match) => (match[0] === '"' ? match : ''))
+    .replace(/"(?:\\.|[^"\\])*"|,(\s*[}\]])/g, (match, tail) => tail ?? (match[0] === '"' ? match : ''));
+}
+
+/**
+ * Exact provider-level rejection rule from Pi 1.4.0
+ * dist/core/provider-composer.js applyModelsJson(). ModelConfig discards an
+ * invalid whole file, so malformed files intentionally produce no block here.
+ */
+export function openRouterModelsJsonRegistrationError(path: string): string | undefined {
+  let parsed: unknown;
+  try { parsed = JSON.parse(stripJsonComments(readFileSync(path, 'utf8').replace(/^\uFEFF/, ''))); } catch { return undefined; }
+  const config = isRecord(parsed) && isRecord(parsed.providers) && isRecord(parsed.providers.openrouter)
+    ? parsed.providers.openrouter
+    : undefined;
+  if (!config) return undefined;
+  // Keep malformed provider fields out of this check: Pi's ModelConfig schema
+  // makes the entire models.json map empty before applyModelsJson can run.
+  if ((config.baseUrl !== undefined && typeof config.baseUrl !== 'string') ||
+      (config.apiKey !== undefined && typeof config.apiKey !== 'string') ||
+      (config.oauth !== undefined && config.oauth !== 'radius') ||
+      (config.authHeader !== undefined && typeof config.authHeader !== 'boolean') ||
+      (config.headers !== undefined && (!isRecord(config.headers) || Object.values(config.headers).some((v) => typeof v !== 'string'))) ||
+      (config.compat !== undefined && !isRecord(config.compat)) ||
+      (config.models !== undefined && !Array.isArray(config.models)) ||
+      (config.modelOverrides !== undefined && !isRecord(config.modelOverrides))) return undefined;
+  if (config.oauth && !config.baseUrl) return 'Provider openrouter: "baseUrl" is required when "oauth" is set.';
+  const hasOverrides = isRecord(config.modelOverrides) && Object.keys(config.modelOverrides).length > 0;
+  if (!Array.isArray(config.models) || config.models.length === 0) {
+    if (!config.baseUrl && !config.headers && !config.compat && !hasOverrides &&
+        !config.apiKey && !config.oauth && config.authHeader === undefined) {
+      return 'Provider openrouter: must specify "baseUrl", "headers", "compat", "modelOverrides", or "models".';
+    }
+  }
+  return undefined;
+}
+
+function qlbOwnsOpenRouter(agentDir: string): boolean {
+  try {
+    const owner = JSON.parse(readFileSync(join(agentDir, 'qlb-owner.json'), 'utf8')) as unknown;
+    const openrouter = isRecord(owner) && isRecord(owner.providers) ? owner.providers.openrouter : undefined;
+    return isRecord(openrouter) && openrouter.mode === 'qlb' &&
+      typeof openrouter.since === 'number' && Number.isFinite(openrouter.since) && openrouter.since >= 0;
+  } catch {
+    return false;
+  }
 }
 
 /** Source-relative TypeScript files, including provider modules below qlb-pi/. */
@@ -240,7 +305,8 @@ export function piIntegrationChecks(options: PiIntegrationOptions = {}): DoctorC
   const run = options.run ?? ((cmd: string, args: string[], o: { cwd?: string; timeoutMs?: number } = {}) =>
     execFileSync(cmd, args, { encoding: 'utf8', cwd: o.cwd, timeout: o.timeoutMs ?? 60_000, stdio: ['ignore', 'pipe', 'pipe'] }));
 
-  const PI_EXT_DIR = options.extensionDir ?? DEFAULT_PI_EXT_DIR;
+  const agentDir = options.agentDir ?? piAgentDir();
+  const PI_EXT_DIR = options.extensionDir ?? join(agentDir, 'extensions', 'qlb-pi');
   const located = options.pi ?? locatePi();
   if (located.unresolved && existsSync(PI_EXT_DIR)) {
     checks.push({
@@ -258,6 +324,12 @@ export function piIntegrationChecks(options: PiIntegrationOptions = {}): DoctorC
   }
 
   const piVersion = (() => { try { return (JSON.parse(readText(join(PI_PKG, 'package.json')) ?? '{}') as { version?: string }).version ?? '?'; } catch { return '?'; } })();
+
+  // Pi rejects this models.json block before it can apply QLB's replacement.
+  // Do not let the native provider silently retain its configured API key.
+  if (qlbOwnsOpenRouter(agentDir) && openRouterModelsJsonRegistrationError(join(agentDir, 'models.json'))) {
+    checks.push({ name: 'pi:models-json-openrouter', level: 'FAIL', message: OPENROUTER_MODELS_JSON_BLOCKED });
+  }
 
   // 1. Installed extension == tracked source (a QLB upgrade that touches extensions/qlb-pi must be re-synced).
   // The copied-extension layout also needs the redactor at ~/.pi/agent/src/redact.ts:
