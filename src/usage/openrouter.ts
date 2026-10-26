@@ -51,6 +51,7 @@ export async function probeOpenRouterUsage(
     const response = await (deps.fetchFn ?? fetch)(OPENROUTER_CREDITS_URL, {
       method: 'GET',
       headers: { Authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(10_000),
     });
     const bodyText = await response.text();
     let body: unknown;

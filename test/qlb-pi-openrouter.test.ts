@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import { cpSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
 import {
@@ -10,6 +13,7 @@ import {
 import openRouterGate, { read as readOpenRouterGate } from '../src/gate/openrouter';
 import { MockKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from '../src/keychain';
 import { OPENROUTER_CREDITS_URL, probeOpenRouterUsage } from '../src/usage/openrouter';
+import { piIntegrationChecks } from '../src/pi-integration';
 
 class Events implements AsyncIterable<unknown> {
   readonly values: unknown[] = [];
@@ -70,7 +74,7 @@ describe('qlb-pi OpenRouter source', () => {
 
   it('fails closed when qlb gate fails or returns a malformed envelope', async () => {
     for (const result of [
-      { code: 1, stdout: '', stderr: 'credential-unavailable' },
+      { code: 1, stdout: '', stderr: 'store-open-failed' },
       { code: 0, stdout: JSON.stringify({ token: '', accountId: 'default', source: 'keychain' }), stderr: '' },
     ]) {
       let transports = 0;
@@ -83,14 +87,15 @@ describe('qlb-pi OpenRouter source', () => {
       await new Promise((resolve) => setImmediate(resolve));
       const [event] = await readAll(output) as Array<{ error?: { errorMessage?: string } }>;
       assert.equal(transports, 0);
-      assert.equal(event?.error?.errorMessage, 'QLB unavailable for openrouter — run qlb doctor (unknown)');
+      const cause = result.code === 0 ? 'unknown' : 'store-open-failed';
+      assert.equal(event?.error?.errorMessage, `QLB unavailable for openrouter — run qlb doctor (${cause})`);
       assert.equal(JSON.stringify(event).includes('fixture-openrouter-key'), false);
     }
   });
 
-  it('registers only an owned provider and replaces a malformed owner with a fail-closed source', async () => {
+  it('registers an owned provider for the OpenAI API family and normalizes every chat model through the gate', async () => {
     const calls: string[] = [];
-    let config: { streamSimple: ReturnType<typeof createOpenRouterStream> } | undefined;
+    let config: any;
     const pi = {
       unregisterProvider: (name: string) => calls.push(`unregister:${name}`),
       registerProvider: (name: string, next: { streamSimple: ReturnType<typeof createOpenRouterStream> }) => {
@@ -98,10 +103,18 @@ describe('qlb-pi OpenRouter source', () => {
         config = next;
       },
     };
+    let gateCalls = 0;
     const deps = {
       ownerPath: '/fixture/qlb-owner.json',
+      models: [
+        { id: 'openai-model', api: 'openai-completions', provider: 'openrouter' },
+        { id: 'anthropic-model', api: 'anthropic-messages', provider: 'openrouter' },
+      ],
       readOwner: () => ownedOwner(),
-      run: async () => ({ code: 0, stdout: JSON.stringify({ token: 'fixture-openrouter-key', accountId: 'default', source: 'keychain' }), stderr: '' }),
+      run: async () => {
+        gateCalls += 1;
+        return { code: 0, stdout: JSON.stringify({ token: 'fixture-openrouter-key', accountId: 'default', source: 'keychain' }), stderr: '' };
+      },
       transport: () => new Events(),
       createStream: () => new Events(),
     };
@@ -109,6 +122,11 @@ describe('qlb-pi OpenRouter source', () => {
     assert.equal(registerOpenRouterSource(pi, deps), true);
     assert.deepEqual(calls, ['unregister:openrouter', 'register:openrouter']);
     assert.ok(config);
+    assert.equal(config.api, 'openai-completions');
+    assert.deepEqual(config.models.map((entry: { api: string }) => entry.api), ['openai-completions', 'openai-completions']);
+    config.streamSimple(config.models[1], { messages: [] });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(gateCalls, 1);
 
     calls.length = 0;
     assert.equal(registerOpenRouterSource(pi, { ...deps, readOwner: () => undefined }), false);
@@ -120,6 +138,47 @@ describe('qlb-pi OpenRouter source', () => {
     await new Promise((resolve) => setImmediate(resolve));
     const [event] = await readAll(output) as Array<{ error?: { errorMessage?: string } }>;
     assert.equal(event?.error?.errorMessage, 'QLB unavailable for openrouter — run qlb doctor (owner-file-malformed)');
+    assert.equal(config.api, 'openai-completions');
+  });
+
+  it('removes caller authorization headers before applying the QLB gate credential', async () => {
+    let sent: Record<string, unknown> | undefined;
+    const stream = createOpenRouterStream({
+      run: async () => ({ code: 0, stdout: JSON.stringify({ token: 'fixture-openrouter-key', accountId: 'default', source: 'keychain' }), stderr: '' }),
+      transport: (_model, _context, options) => {
+        sent = options;
+        const output = new Events();
+        output.end();
+        return output;
+      },
+      createStream: () => new Events(),
+    });
+
+    stream(model(), {}, { headers: { Authorization: 'stored-native-key', 'x-api-key': 'stored-native-key', keep: 'yes' } });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(sent?.apiKey, 'fixture-openrouter-key');
+    assert.deepEqual(sent?.headers, { keep: 'yes' });
+  });
+});
+
+describe('Pi deployed extension drift', () => {
+  it('reports a changed nested provider module', () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-pi-provider-drift-'));
+    const extensionDir = join(root, 'agent', 'extensions', 'qlb-pi');
+    const redactDir = join(root, 'agent', 'src');
+    mkdirSync(join(root, 'agent', 'extensions'), { recursive: true });
+    mkdirSync(redactDir, { recursive: true });
+    cpSync(join(process.cwd(), 'extensions', 'qlb-pi'), extensionDir, { recursive: true });
+    cpSync(join(process.cwd(), 'src', 'redact.ts'), join(redactDir, 'redact.ts'));
+    writeFileSync(join(extensionDir, 'providers', 'openrouter.ts'), 'changed\n');
+
+    const checks = piIntegrationChecks({
+      extensionDir,
+      pi: { root: join(root, 'pi-package'), unresolved: false },
+    });
+    const extension = checks.find((check) => check.name === 'pi:extension');
+    assert.equal(extension?.level, 'WARN');
+    assert.match(extension?.message ?? '', /providers\/openrouter\.ts/);
   });
 });
 
@@ -146,6 +205,7 @@ describe('OpenRouter gate and usage', () => {
     const result = await probeOpenRouterUsage({
       resolve: () => ({ token: 'fixture-openrouter-key', accountId: 'default', source: 'keychain' }),
       fetchFn: async (input, init) => {
+        assert.ok(init?.signal);
         requests.push({ input, authorization: new Headers(init?.headers).get('authorization') });
         return new Response(JSON.stringify({ data: { total_credits: 100, total_usage: 25 } }), { status: 200 });
       },

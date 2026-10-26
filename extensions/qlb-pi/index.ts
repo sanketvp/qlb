@@ -62,7 +62,13 @@ import type { Api, Context, Model, SimpleStreamOptions } from "@earendil-works/p
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { streamWithAuthRetry } from "./auth-retry.js";
-import { registerOpenRouterSource } from "./providers/openrouter.js";
+import {
+  openRouterSourceMode,
+  registerOpenRouterSource,
+  registerOpenRouterUnavailableSource,
+  type OpenRouterSourceDeps,
+  type ProviderApi as OpenRouterProviderApi,
+} from "./providers/openrouter.js";
 import {
   accountFg,
   buildExpandPanelLines,
@@ -251,6 +257,31 @@ type StreamSimple = (
   options?: SimpleStreamOptions,
 ) => AsyncIterable<unknown>;
 
+async function resolveOpenRouterSourceDeps(): Promise<OpenRouterSourceDeps> {
+  // The extension loader resolves this import through Pi's Jiti aliases. Do
+  // not use module.require(): pi-ai exposes ./compat to ESM imports only.
+  const namespace = (await import("@earendil-works/pi-ai/compat")) as unknown as {
+    getModels?: (provider: string) => Array<{ id: string; api?: unknown; provider?: unknown }>;
+    openAICompletionsApi?: () => { streamSimple?: OpenRouterSourceDeps["transport"] };
+    anthropicMessagesApi?: () => { streamSimple?: OpenRouterSourceDeps["transport"] };
+  };
+  const models = namespace.getModels?.("openrouter");
+  const openai = namespace.openAICompletionsApi?.().streamSimple;
+  const anthropic = namespace.anthropicMessagesApi?.().streamSimple;
+  if (!models || typeof openai !== "function" || typeof anthropic !== "function") {
+    throw new Error("qlb-pi: Pi compat has no OpenRouter model catalog or transport");
+  }
+  const anthropicModelIds = new Set(models.filter((model) => model.api === "anthropic-messages").map((model) => model.id));
+  return {
+    models,
+    createStream: () => createAssistantMessageEventStream() as never,
+    transport: (model, context, options) => {
+      const api = anthropicModelIds.has(model.id) ? "anthropic-messages" : "openai-completions";
+      return (api === "anthropic-messages" ? anthropic : openai)({ ...model, api }, context, options);
+    },
+  };
+}
+
 async function resolveBuiltinAnthropicStreamSimple(): Promise<StreamSimple> {
   // `as unknown as`: Pi's compat types evolve (0.87 narrowed Context → TranscriptContext); we
   // only rely on the runtime shape, which is verified right below and by `qlb doctor` (pi:typecheck).
@@ -268,8 +299,16 @@ async function resolveBuiltinAnthropicStreamSimple(): Promise<StreamSimple> {
 
 export default async function (pi: ExtensionAPI): Promise<void> {
   // Each v2 provider decides ownership independently; OpenRouter must be
-  // registered even when Anthropic remains inert.
-  registerOpenRouterSource(pi);
+  // registered even when Anthropic remains inert. A missing Pi compat surface
+  // replaces its catalog with a fail-closed source rather than native auth.
+  if (openRouterSourceMode() !== "inert") {
+    const openRouterProviderApi = pi as unknown as OpenRouterProviderApi;
+    try {
+      registerOpenRouterSource(openRouterProviderApi, await resolveOpenRouterSourceDeps());
+    } catch {
+      registerOpenRouterUnavailableSource(openRouterProviderApi, () => createAssistantMessageEventStream() as never);
+    }
+  }
 
   const rehearsal = process.env.QLB_PI_REHEARSAL;
   const base =

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, cpSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import { after, describe, it } from 'node:test';
@@ -209,11 +209,7 @@ describe('pi:extension copied-layout drift check', () => {
     const extensionDir = join(base, 'agent', 'extensions', 'qlb-pi');
     mkdirSync(extensionDir, { recursive: true });
     const sourceDir = join(__dirname, '..', '..', 'extensions', 'qlb-pi');
-    for (const file of readdirSync(sourceDir)) {
-      if (file.endsWith('.ts') && file !== 'tsconfig.json') {
-        writeFileSync(join(extensionDir, file), readFileSync(join(sourceDir, file)));
-      }
-    }
+    cpSync(sourceDir, extensionDir, { recursive: true });
     const pi = fakePiPackage(join(base, 'pi'), '1.0.1');
     const extensionCheck = () => piIntegrationChecks({ pi: { root: pi }, extensionDir })
       .find((check) => check.name === 'pi:extension')!;

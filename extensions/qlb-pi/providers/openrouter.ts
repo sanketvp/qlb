@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -11,8 +12,10 @@ import {
 } from '../consume.js';
 
 const OWNER_FILE = join(homedir(), '.pi', 'agent', 'qlb-owner.json');
+const STREAM_API = 'openai-completions' as const;
+const AUTH_HEADERS = new Set(['authorization', 'x-api-key', 'cf-aig-authorization']);
 
-type ModelLike = { id: string; api?: unknown; provider?: unknown };
+type ModelLike = { id: string; api?: unknown; provider?: unknown; [key: string]: unknown };
 type EventSink = AsyncIterable<unknown> & { push(value: unknown): void; end(): void };
 export type OpenRouterTransport = (
   model: ModelLike,
@@ -31,19 +34,26 @@ export interface OpenRouterSourceDeps {
   run?: GateRun;
   transport?: OpenRouterTransport;
   createStream?: () => EventSink;
+  /** Pi's built-in OpenRouter chat catalog, supplied by index.ts's compat import. */
+  models?: ModelLike[];
+}
+
+interface OpenRouterProviderConfig {
+  api: typeof STREAM_API;
+  streamSimple: (model: ModelLike, context: unknown, options?: Record<string, unknown>) => EventSink;
+  models: ModelLike[];
 }
 
 export interface ProviderApi {
   unregisterProvider(name: string): void;
-  // Pi's ExtensionAPI has an overloaded registration signature. The source
-  // deliberately needs only this narrow call surface.
-  registerProvider(name: string, config: any): void;
+  registerProvider(name: string, config: OpenRouterProviderConfig): void;
 }
 
 function findQlbCli(): { command: string; prefix: string[] } {
   if (process.env.QLB_CLI) return { command: process.execPath, prefix: [process.env.QLB_CLI] };
   const repoCli = join(__dirname, '..', '..', '..', 'dist', 'cli.js');
-  return { command: process.execPath, prefix: [repoCli] };
+  if (existsSync(repoCli)) return { command: process.execPath, prefix: [repoCli] };
+  return { command: 'qlb', prefix: [] };
 }
 
 /** Runs only the gate command; stderr and malformed output never reach Pi's event sink. */
@@ -83,21 +93,25 @@ function parseAccess(stdout: string): ActiveAccess {
   return { token: record.token, accountId: record.accountId, source: record.source };
 }
 
-function defaultRuntime(): Pick<Required<OpenRouterSourceDeps>, 'transport' | 'createStream'> {
-  // Loaded only in Pi. Keeping this out of the module top-level lets unit tests
-  // exercise every credential boundary without a Pi installation.
-  const runtime = module.require('@earendil-works/pi-ai/compat') as {
-    createAssistantMessageEventStream(): EventSink;
-    openAICompletionsApi(): { streamSimple: OpenRouterTransport };
-    anthropicMessagesApi(): { streamSimple: OpenRouterTransport };
-  };
-  const openai = runtime.openAICompletionsApi().streamSimple;
-  const anthropic = runtime.anthropicMessagesApi().streamSimple;
-  return {
-    createStream: () => runtime.createAssistantMessageEventStream(),
-    transport: (model, context, options) =>
-      (model.api === 'anthropic-messages' ? anthropic : openai)(model, context, options),
-  };
+function safeGateCause(result: { code: number; stderr: string }): string {
+  return result.code === 0 ? 'unknown' : result.stderr.trim() || 'unknown';
+}
+
+/** Pi lets caller headers win over adapter defaults, so never pass stored auth through. */
+function withoutStoredAuth(options?: Record<string, unknown>): Record<string, unknown> | undefined {
+  if (!options?.headers || typeof options.headers !== 'object' || Array.isArray(options.headers)) return options;
+  const headers = Object.fromEntries(
+    Object.entries(options.headers as Record<string, unknown>)
+      .filter(([name]) => !AUTH_HEADERS.has(name.toLowerCase())),
+  );
+  return { ...options, headers };
+}
+
+function normalizedModels(models: ModelLike[] | undefined): ModelLike[] {
+  // Pi dispatches streamSimple only when model.api equals provider.api. Replacing
+  // the chat catalog with a single API family keeps both native OpenRouter chat
+  // dialects inside this gate; index.ts's transport restores the original API.
+  return (models ?? []).map((model) => ({ ...model, api: STREAM_API }));
 }
 
 /**
@@ -105,9 +119,11 @@ function defaultRuntime(): Pick<Required<OpenRouterSourceDeps>, 'transport' | 'c
  * a failed gate produces one fail-closed event and never calls transport.
  */
 export function createOpenRouterStream(deps: OpenRouterSourceDeps = {}) {
-  const runtime = deps.transport && deps.createStream ? undefined : defaultRuntime();
-  const transport = deps.transport ?? runtime!.transport;
-  const createStream = deps.createStream ?? runtime!.createStream;
+  if (!deps.transport || !deps.createStream) {
+    throw new Error('qlb-pi: OpenRouter runtime is unavailable');
+  }
+  const transport = deps.transport;
+  const createStream = deps.createStream;
   const run = deps.run ?? runGate;
 
   return (model: ModelLike, context: unknown, options?: Record<string, unknown>): EventSink => {
@@ -118,9 +134,13 @@ export function createOpenRouterStream(deps: OpenRouterSourceDeps = {}) {
           ['gate', 'openrouter', '--json'],
           { ...process.env, QLB_PI_TOKEN_CALL: '1' },
         );
-        if (result.code !== 0) throw new Error('gate failed');
+        if (result.code !== 0) {
+          output.push(qlbUnavailable('openrouter', safeGateCause(result), model));
+          return;
+        }
         const access = parseAccess(result.stdout);
-        for await (const event of transport(model, context, { ...options, apiKey: access.token })) {
+        const safeOptions = withoutStoredAuth(options);
+        for await (const event of transport(model, context, { ...safeOptions, apiKey: access.token })) {
           output.push(event);
         }
       } catch {
@@ -144,29 +164,46 @@ function ownerState(deps: OpenRouterSourceDeps): ReturnType<typeof ownerStateFor
   }
 }
 
-/** Registers only the OpenRouter provider when its v2 owner entry is present. */
-export function registerOpenRouterSource(pi: ProviderApi, deps: OpenRouterSourceDeps = {}): boolean {
-  const mode = decidePiMode('openrouter', {
+function failClosedStream(createStream: () => EventSink, cause: string) {
+  return (model: ModelLike): EventSink => {
+    const output = createStream();
+    output.push(qlbUnavailable('openrouter', cause, model));
+    output.end();
+    return output;
+  };
+}
+
+/** Registers a fail-closed replacement if Pi compat cannot be loaded. */
+export function registerOpenRouterUnavailableSource(pi: ProviderApi, createStream: () => EventSink): void {
+  pi.unregisterProvider('openrouter');
+  // An empty catalog prevents built-in chat, image and classifier models from
+  // falling through while the replacement source cannot be initialized.
+  pi.registerProvider('openrouter', {
+    api: STREAM_API,
+    models: [],
+    streamSimple: failClosedStream(createStream, 'unknown'),
+  });
+}
+
+export function openRouterSourceMode(deps: OpenRouterSourceDeps = {}): 'inert' | 'owned' | 'conflict' {
+  return decidePiMode('openrouter', {
     rehearsal: process.env.QLB_PI_REHEARSAL,
     owner: ownerState(deps),
     marker: false,
-  });
+  }) as 'inert' | 'owned' | 'conflict';
+}
+
+/** Registers only the OpenRouter provider when its v2 owner entry is present. */
+export function registerOpenRouterSource(pi: ProviderApi, deps: OpenRouterSourceDeps = {}): boolean {
+  const mode = openRouterSourceMode(deps);
   if (mode === 'inert') return false;
 
+  const createStream = deps.createStream;
+  if (!createStream) throw new Error('qlb-pi: OpenRouter event stream is unavailable');
   pi.unregisterProvider('openrouter');
-  if (mode === 'owned') {
-    pi.registerProvider('openrouter', { streamSimple: createOpenRouterStream(deps) });
-  } else {
-    const runtime = deps.createStream ? undefined : defaultRuntime();
-    const createStream = deps.createStream ?? runtime!.createStream;
-    pi.registerProvider('openrouter', {
-      streamSimple: (model: ModelLike) => {
-        const output = createStream();
-        output.push(qlbUnavailable('openrouter', 'owner-file-malformed', model));
-        output.end();
-        return output;
-      },
-    });
-  }
+  const models = normalizedModels(deps.models);
+  pi.registerProvider('openrouter', mode === 'owned'
+    ? { api: STREAM_API, models, streamSimple: createOpenRouterStream(deps) }
+    : { api: STREAM_API, models, streamSimple: failClosedStream(createStream, 'owner-file-malformed') });
   return true;
 }

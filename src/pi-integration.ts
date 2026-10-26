@@ -222,6 +222,19 @@ function readText(path: string): string | null {
   try { return readFileSync(path, 'utf8'); } catch { return null; }
 }
 
+/** Source-relative TypeScript files, including provider modules below qlb-pi/. */
+function extensionTypeScriptFiles(dir: string, prefix = ''): string[] {
+  try {
+    return readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+      const relative = prefix ? join(prefix, entry.name) : entry.name;
+      if (entry.isDirectory()) return extensionTypeScriptFiles(join(dir, entry.name), relative);
+      return entry.isFile() && entry.name.endsWith('.ts') && entry.name !== 'tsconfig.json' ? [relative] : [];
+    });
+  } catch {
+    return [];
+  }
+}
+
 export function piIntegrationChecks(options: PiIntegrationOptions = {}): DoctorCheck[] {
   const checks: DoctorCheck[] = [];
   const run = options.run ?? ((cmd: string, args: string[], o: { cwd?: string; timeoutMs?: number } = {}) =>
@@ -253,17 +266,20 @@ export function piIntegrationChecks(options: PiIntegrationOptions = {}): DoctorC
   if (repoRoot) {
     const src = join(repoRoot, 'extensions', 'qlb-pi');
     const installedRedact = join(PI_EXT_DIR, '..', '..', 'src', 'redact.ts');
+    const sourceFiles = extensionTypeScriptFiles(src);
+    const installedFiles = extensionTypeScriptFiles(PI_EXT_DIR);
     const drift = [
-      ...readdirSync(src).filter((f) => f.endsWith('.ts') && f !== 'tsconfig.json')
-        .filter((f) => readText(join(src, f)) !== readText(join(PI_EXT_DIR, f))),
+      ...sourceFiles.filter((file) => readText(join(src, file)) !== readText(join(PI_EXT_DIR, file))),
+      ...installedFiles.filter((file) => !sourceFiles.includes(file)),
       ...(readText(join(repoRoot, 'src', 'redact.ts')) === readText(installedRedact) ? [] : ['src/redact.ts']),
     ];
+
     const redactDir = join(PI_EXT_DIR, '..', '..', 'src');
     checks.push(drift.length === 0
       ? { name: 'pi:extension', level: 'PASS', message: `${PI_EXT_DIR} matches ${src} (pi ${piVersion} at ${PI_PKG})` }
       : {
         name: 'pi:extension', level: 'WARN', message: `installed qlb-pi differs from source: ${drift.join(', ')}`,
-        detail: { fix: `cp ${src}/*.ts ${PI_EXT_DIR}/ && mkdir -p ${redactDir} && cp ${join(repoRoot, 'src', 'redact.ts')} ${installedRedact}` },
+        detail: { fix: `cp -R ${src}/. ${PI_EXT_DIR}/ && mkdir -p ${redactDir} && cp ${join(repoRoot, 'src', 'redact.ts')} ${installedRedact}` },
       });
   }
 
