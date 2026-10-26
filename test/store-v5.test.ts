@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readdirSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { describe, it } from 'node:test';
 import { openStore } from '../src/store';
@@ -59,63 +59,411 @@ describe('store v5 schema (AC38)', () => {
     } finally { db.close(); }
   });
 
-  it('scrubs existing relogin rows once without a schema-version change', () => {
-    const path = join(mkdtempSync(join(tmpdir(), 'qlb-v5-relogin-scrub-')), 'qlb.db');
-    const initial = openStore(path);
-    initial.close();
-    const seeded = new DatabaseSync(path);
-    seeded.prepare("DELETE FROM config WHERE key = 'relogin.scrubbedAt'").run();
-    seeded.prepare('INSERT INTO relogin_events (ts, provider, kind, detail, evidence) VALUES (?, ?, ?, ?, ?)').run(
-      1, 'anthropic', 'external-login', 'client_secret=abc123', 'junk',
-    );
-    seeded.close();
+  it('backs up and corrects user_version=5 databases missing a §3.2 table or column', () => {
+    const tablePath = join(mkdtempSync(join(tmpdir(), 'qlb-v5-table-correct-')), 'qlb.db');
+    const columnPath = join(mkdtempSync(join(tmpdir(), 'qlb-v5-column-correct-')), 'qlb.db');
 
-    const scrubbed = openStore(path);
-    scrubbed.close();
-    const first = dbAt(path);
-    let row: { detail: string | null; evidence: string | null };
-    let scrubbedAt: string | null;
-    try {
-      row = first.prepare('SELECT detail, evidence FROM relogin_events').get() as { detail: string | null; evidence: string | null };
-      scrubbedAt = (first.prepare("SELECT value FROM config WHERE key = 'relogin.scrubbedAt'").get() as { value: string } | undefined)?.value ?? null;
-    } finally { first.close(); }
-    assert.match(row.detail ?? '', /^sha256:[0-9a-f]{16}$/);
-    assert.equal(row.evidence, null);
-    assert.ok(scrubbedAt);
+    for (const [path, change] of [
+      [tablePath, 'DROP TABLE active_login'],
+      [columnPath, 'ALTER TABLE decisions DROP COLUMN provider'],
+    ] as const) {
+      const initial = openStore(path);
+      initial.upsertAccount('fixture-account', 'anthropic', 'fixture');
+      initial.close();
+      const db = new DatabaseSync(path);
+      db.exec(change);
+      db.close();
 
-    const reopened = openStore(path);
-    reopened.close();
-    const second = dbAt(path);
+      const backupsDir = join(dirname(path), 'backups');
+      const beforeBackups = new Set(readdirSync(backupsDir));
+      const corrected = openStore(path);
+      corrected.close();
+
+      const newBackups = readdirSync(backupsDir).filter((name) => !beforeBackups.has(name) && name.endsWith('.sqlite'));
+      assert.equal(newBackups.length, 1, 'the correction must take a backup first');
+      const backup = dbAt(join(backupsDir, newBackups[0]));
+      try {
+        assert.equal((backup.prepare('SELECT provider FROM accounts WHERE id = ?').get('fixture-account') as { provider: string }).provider, 'anthropic');
+      } finally { backup.close(); }
+    }
+
+    const tableCheck = dbAt(tablePath);
+    const columnCheck = dbAt(columnPath);
     try {
-      assert.deepEqual(second.prepare('SELECT detail, evidence FROM relogin_events').get(), row);
-      assert.equal((second.prepare("SELECT value FROM config WHERE key = 'relogin.scrubbedAt'").get() as { value: string }).value, scrubbedAt);
-    } finally { second.close(); }
+      assert.ok(tableCheck.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'active_login'").get());
+      assert.ok(columns(columnCheck, 'decisions').includes('provider'));
+      for (const db of [tableCheck, columnCheck]) {
+        assert.equal((db.prepare('SELECT provider FROM accounts WHERE id = ?').get('fixture-account') as { provider: string }).provider, 'anthropic');
+      }
+    } finally {
+      tableCheck.close();
+      columnCheck.close();
+    }
   });
 
-  it('corrects a v5 database missing poll_interval_s after a verified backup, once', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'qlb-v5-poll-interval-correct-'));
-    const path = join(dir, 'qlb.db');
+  it('adds repairable missing columns without losing extra columns, indexes, or triggers', () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'qlb-v5-safe-repair-')), 'qlb.db');
     const initial = openStore(path);
     initial.close();
-    const backupsBefore = readdirSync(join(dir, 'backups')).filter((file) => file.endsWith('.sqlite'));
     const db = new DatabaseSync(path);
-    db.exec('ALTER TABLE usage_polls DROP COLUMN poll_interval_s');
+    db.exec(`ALTER TABLE decisions DROP COLUMN provider;
+      ALTER TABLE decisions ADD COLUMN forward_compatible TEXT;
+      CREATE INDEX decisions_forward_compatible ON decisions(forward_compatible);
+      CREATE TABLE decision_audit (value TEXT);
+      CREATE TRIGGER decisions_audit AFTER INSERT ON decisions BEGIN
+        INSERT INTO decision_audit VALUES (NEW.forward_compatible);
+      END;
+      INSERT INTO decisions (ts, requested_model, mode, reason, snapshot_json, forward_compatible)
+        VALUES (1, 'model', 'headroom', 'fixture', '{}', 'retain-me')`);
     db.close();
 
     const corrected = openStore(path);
     corrected.close();
-    const backups = readdirSync(join(dir, 'backups')).filter((file) => file.endsWith('.sqlite'));
-    assert.equal(backups.length, backupsBefore.length + 1);
-    const correctionBackup = backups.find((file) => !backupsBefore.includes(file));
-    assert.ok(correctionBackup);
-    const backup = dbAt(join(dir, 'backups', correctionBackup));
-    try { assert.ok(!columns(backup, 'usage_polls').includes('poll_interval_s')); } finally { backup.close(); }
     const check = dbAt(path);
-    try { assert.ok(columns(check, 'usage_polls').includes('poll_interval_s')); } finally { check.close(); }
+    try {
+      assert.deepEqual(
+        (check.prepare('SELECT forward_compatible FROM decisions').all() as Array<{ forward_compatible: string }>).map((row) => ({ ...row })),
+        [{ forward_compatible: 'retain-me' }],
+      );
+      assert.ok(check.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'decisions_forward_compatible'").get());
+      assert.ok(check.prepare("SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = 'decisions_audit'").get());
+    } finally { check.close(); }
+  });
 
-    const reopened = openStore(path);
-    reopened.close();
-    assert.equal(readdirSync(join(dir, 'backups')).filter((file) => file.endsWith('.sqlite')).length, backups.length);
+  it('refuses populated tables missing required v5 columns but repairs empty ones', () => {
+    const populatedPath = join(mkdtempSync(join(tmpdir(), 'qlb-v5-required-populated-')), 'qlb.db');
+    const emptyPath = join(mkdtempSync(join(tmpdir(), 'qlb-v5-required-empty-')), 'qlb.db');
+    for (const [path, populated] of [[populatedPath, true], [emptyPath, false]] as const) {
+      const initial = openStore(path);
+      initial.close();
+      const db = new DatabaseSync(path);
+      db.exec('ALTER TABLE claude_slots DROP COLUMN config_json');
+      if (populated) db.exec("INSERT INTO claude_slots (account_id, added_at) VALUES ('fixture', 1)");
+      db.close();
+    }
+
+    assert.throws(() => openStore(populatedPath), /populated table is missing required column\(s\) config_json/);
+    const populated = dbAt(populatedPath);
+    try {
+      assert.equal(columns(populated, 'claude_slots').includes('config_json'), false);
+      assert.deepEqual(
+        (populated.prepare('SELECT account_id, added_at FROM claude_slots').all() as Array<{ account_id: string; added_at: number }>).map((row) => ({ ...row })),
+        [{ account_id: 'fixture', added_at: 1 }],
+      );
+    } finally { populated.close(); }
+
+    const repaired = openStore(emptyPath);
+    repaired.close();
+    const empty = dbAt(emptyPath);
+    try {
+      assert.ok(columns(empty, 'claude_slots').includes('config_json'));
+    } finally { empty.close(); }
+  });
+
+  it('rebuilds a canonical pre-release table missing slot_num UNIQUE and preserves data, indexes, and triggers', () => {
+    for (const populated of [false, true]) {
+      const path = join(mkdtempSync(join(tmpdir(), `qlb-v5-rebuild-${populated ? 'populated' : 'empty'}-`)), 'qlb.db');
+      const initial = openStore(path);
+      initial.close();
+      const db = new DatabaseSync(path);
+      db.exec(`DROP TABLE claude_slots;
+        CREATE TABLE claude_slots (
+          account_id TEXT PRIMARY KEY, slot_num INTEGER, email TEXT, alias TEXT, org_uuid TEXT, config_json TEXT NOT NULL,
+          fingerprint TEXT, prev_fingerprint TEXT, threshold REAL, dead INTEGER NOT NULL DEFAULT 0,
+          dead_reason TEXT, dead_at INTEGER, healed_at INTEGER, added_at INTEGER NOT NULL,
+          last_active_at INTEGER, source TEXT, archived_at INTEGER
+        );
+        CREATE INDEX claude_slots_alias ON claude_slots(alias);
+        CREATE TABLE claude_slot_audit (value TEXT);
+        CREATE TRIGGER claude_slots_audit AFTER INSERT ON claude_slots BEGIN
+          INSERT INTO claude_slot_audit VALUES (NEW.alias);
+        END;`);
+      if (populated) {
+        db.exec("INSERT INTO claude_slots (account_id, slot_num, alias, config_json, added_at) VALUES ('fixture', 1, 'retain-me', '{}', 1)");
+      }
+      db.close();
+
+      const corrected = openStore(path);
+      corrected.close();
+      const check = dbAt(path);
+      try {
+        assert.ok(columns(check, 'claude_slots').includes('slot_num'));
+        assert.ok(check.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'claude_slots_alias'").get());
+        assert.ok(check.prepare("SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = 'claude_slots_audit'").get());
+        const uniqueIndexes = check.prepare('PRAGMA index_list(claude_slots)').all() as Array<{ name: string; unique: number }>;
+        assert.ok(uniqueIndexes.some((index) => index.unique === 1 && (check.prepare(`PRAGMA index_info(${index.name})`).all() as Array<{ name: string }>).some((column) => column.name === 'slot_num')));
+        if (populated) assert.equal((check.prepare('SELECT alias FROM claude_slots').get() as { alias: string }).alias, 'retain-me');
+      } finally { check.close(); }
+    }
+  });
+
+  it('refuses inexact rebuilds after verifying a backup and keeps the database unchanged', () => {
+    const cases = [
+      {
+        name: 'a plain extra column',
+        extra: 'forward_compatible TEXT',
+        dependent: '',
+        reason: /column forward_compatible is not in the canonical definition/,
+      },
+      {
+        name: 'an extra generated column',
+        extra: 'forward_compatible TEXT GENERATED ALWAYS AS (upper(alias)) VIRTUAL',
+        dependent: '',
+        reason: /column forward_compatible is generated or hidden and cannot be reproduced/,
+      },
+      {
+        name: 'a generated canonical column',
+        alias: 'alias TEXT GENERATED ALWAYS AS (email) STORED',
+        extra: '',
+        dependent: '',
+        reason: /column alias is generated or hidden and cannot be reproduced/,
+      },
+      {
+        name: 'an extra PRIMARY KEY column',
+        accountId: 'account_id TEXT',
+        extra: 'forward_compatible INTEGER PRIMARY KEY',
+        dependent: '',
+        reason: /column forward_compatible is not in the canonical definition/,
+      },
+      {
+        name: 'an extra column with a comma-bearing default and CHECK',
+        extra: "forward_compatible TEXT DEFAULT 'a,b' CHECK (forward_compatible <> 'x')",
+        dependent: '',
+        reason: /column forward_compatible is not in the canonical definition/,
+      },
+      {
+        name: 'different primary-key columns',
+        accountId: 'account_id TEXT',
+        extra: '',
+        dependent: '',
+        reason: /primary-key columns differ from the canonical definition/,
+      },
+      {
+        name: 'a non-canonical UNIQUE constraint on a canonical column',
+        alias: 'alias TEXT UNIQUE',
+        extra: '',
+        dependent: '',
+        reason: /unique index differs from the canonical definition/,
+      },
+      {
+        name: 'a table-level UNIQUE constraint on a canonical column',
+        extra: 'UNIQUE(alias)',
+        dependent: '',
+        reason: /unique index differs from the canonical definition/,
+      },
+      {
+        name: 'a CHECK constraint on a canonical column',
+        extra: 'CHECK (dead IN (0, 1))',
+        dependent: '',
+        reason: /CHECK differs from the canonical definition/,
+      },
+      {
+        name: 'a COLLATE constraint on a canonical column',
+        alias: 'alias TEXT COLLATE NOCASE',
+        extra: '',
+        dependent: '',
+        reason: /COLLATE differs from the canonical definition/,
+      },
+      {
+        name: 'a conflict clause on a canonical column',
+        configJson: 'config_json TEXT NOT NULL ON CONFLICT REPLACE',
+        extra: '',
+        dependent: '',
+        reason: /CONFLICT differs from the canonical definition/,
+      },
+      {
+        name: 'a descending unique constraint',
+        extra: 'UNIQUE(alias DESC)',
+        dependent: '',
+        reason: /DESC differs from the canonical definition/,
+      },
+      {
+        name: 'a STRICT table option',
+        extra: '',
+        tableOptions: 'STRICT',
+        dependent: '',
+        reason: /table options differ from the canonical definition/,
+      },
+      {
+        name: 'a WITHOUT ROWID table option',
+        extra: '',
+        tableOptions: 'WITHOUT ROWID',
+        dependent: '',
+        reason: /table options differ from the canonical definition/,
+      },
+      {
+        name: 'a CHECK-looking string literal default',
+        alias: "alias TEXT DEFAULT 'CHECK (x)'",
+        extra: '',
+        dependent: '',
+        reason: /default differs from the canonical definition/,
+      },
+      {
+        name: 'a foreign key declared by the table',
+        extra: 'FOREIGN KEY (account_id) REFERENCES accounts(id)',
+        dependent: '',
+        reason: /foreign-key definition differs from the canonical definition/,
+      },
+      {
+        name: 'a foreign key on another table that references it',
+        extra: '',
+        dependent: `CREATE TABLE claude_slot_children (account_id TEXT REFERENCES claude_slots(account_id) ON DELETE CASCADE);
+          INSERT INTO claude_slots (account_id, config_json, added_at) VALUES ('fixture', '{}', 1);
+          INSERT INTO claude_slot_children VALUES ('fixture')`,
+        reason: /foreign key on claude_slot_children references claude_slots/,
+        childRows: true,
+      },
+      {
+        name: 'a view that references the table',
+        extra: '',
+        dependent: 'CREATE VIEW claude_slots_view AS SELECT account_id FROM claude_slots',
+        reason: /view claude_slots_view references claude_slots/,
+      },
+      {
+        name: 'a canonical column spelled with different case',
+        extra: "Slot_Num TEXT NOT NULL DEFAULT 'zzz'",
+        dependent: '',
+        reason: /column Slot_Num differs in case from the canonical slot_num/,
+      },
+      {
+        name: 'a view that references the table by a quoted name',
+        extra: '',
+        dependent: 'CREATE VIEW claude_slots_quoted_view AS SELECT account_id FROM "claude_slots"',
+        reason: /view claude_slots_quoted_view references claude_slots/,
+      },
+      {
+        name: 'a view reference after apostrophes in comments',
+        extra: '',
+        dependent: `CREATE VIEW claude_slots_comment_view AS SELECT account_id -- don't
+          FROM claude_slots -- isn't
+          WHERE 1`,
+        reason: /view claude_slots_comment_view references claude_slots/,
+      },
+      {
+        name: 'a trigger on another table that references the table',
+        extra: '',
+        dependent: `CREATE TABLE slot_audit (id INTEGER PRIMARY KEY);
+          CREATE TRIGGER slot_audit_touch AFTER INSERT ON slot_audit BEGIN
+            SELECT account_id FROM claude_slots;
+          END`,
+        reason: /trigger slot_audit_touch on another table references claude_slots/,
+      },
+    ];
+
+    for (const fixture of cases) {
+      const path = join(mkdtempSync(join(tmpdir(), 'qlb-v5-inexact-rebuild-')), 'qlb.db');
+      const initial = openStore(path);
+      initial.close();
+      const db = new DatabaseSync(path);
+      db.exec(`DROP TABLE claude_slots;
+        CREATE TABLE claude_slots (
+          ${fixture.accountId ?? 'account_id TEXT PRIMARY KEY'}, email TEXT, ${fixture.alias ?? 'alias TEXT'}, org_uuid TEXT, ${fixture.configJson ?? 'config_json TEXT NOT NULL'},
+          fingerprint TEXT, prev_fingerprint TEXT, threshold REAL, dead INTEGER NOT NULL DEFAULT 0,
+          dead_reason TEXT, dead_at INTEGER, healed_at INTEGER, added_at INTEGER NOT NULL,
+          last_active_at INTEGER, source TEXT, archived_at INTEGER${fixture.extra ? `, ${fixture.extra}` : ''}
+        )${fixture.tableOptions ? ` ${fixture.tableOptions}` : ''};
+        ${fixture.dependent}`);
+      db.close();
+      const before = readFileSync(path);
+
+      assert.throws(
+        () => openStore(path),
+        (error: unknown) => error instanceof Error
+          && error.message.includes('cannot correct pre-release v5 claude_slots')
+          && error.message.includes('verified backup:')
+          && fixture.reason.test(error.message),
+        fixture.name,
+      );
+      assert.deepEqual(readFileSync(path), before, `${fixture.name} must leave the database byte-for-byte unchanged`);
+      if (fixture.childRows) {
+        const check = dbAt(path);
+        try {
+          assert.equal((check.prepare('SELECT count(*) AS count FROM claude_slot_children').get() as { count: number }).count, 1);
+        } finally { check.close(); }
+      }
+    }
+  });
+
+  it('refuses an AUTOINCREMENT mismatch before rebuilding codex_watch', () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'qlb-v5-autoincrement-rebuild-')), 'qlb.db');
+    const initial = openStore(path);
+    initial.close();
+    const db = new DatabaseSync(path);
+    db.exec(`DROP TABLE codex_watch;
+      CREATE TABLE codex_watch (
+        switch_id INTEGER PRIMARY KEY AUTOINCREMENT, provider TEXT NOT NULL, outgoing TEXT NOT NULL,
+        target TEXT NOT NULL, next_at INTEGER NOT NULL, until INTEGER
+      )`);
+    db.close();
+    const before = readFileSync(path);
+
+    assert.throws(
+      () => openStore(path),
+      (error: unknown) => error instanceof Error
+        && error.message.includes('cannot correct pre-release v5 codex_watch')
+        && error.message.includes('verified backup:')
+        && /AUTOINCREMENT differs from the canonical definition/.test(error.message),
+    );
+    assert.deepEqual(readFileSync(path), before, 'AUTOINCREMENT mismatch must leave the database byte-for-byte unchanged');
+  });
+
+  it('repairs a lifecycle table missing state before creating its partial index', () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'qlb-v5-lifecycle-state-')), 'qlb.db');
+    const initial = openStore(path);
+    initial.close();
+    const db = new DatabaseSync(path);
+    db.exec("INSERT INTO lifecycle (id, state, began_at) VALUES (5, 'closed', 1); DELETE FROM lifecycle; DROP INDEX lifecycle_one_open; ALTER TABLE lifecycle DROP COLUMN state; DELETE FROM sqlite_sequence WHERE name = 'lifecycle'; INSERT INTO sqlite_sequence (name, seq) VALUES ('lifecycle', 5)");
+    db.close();
+    const corrected = openStore(path);
+    corrected.close();
+    const check = new DatabaseSync(path);
+    try {
+      assert.ok(columns(check, 'lifecycle').includes('state'));
+      assert.ok(check.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'lifecycle_one_open'").get());
+      check.exec("INSERT INTO lifecycle (state, began_at) VALUES ('closed', 2)");
+      assert.equal((check.prepare('SELECT id FROM lifecycle').get() as { id: number }).id, 6);
+    } finally { check.close(); }
+  });
+
+  it('corrects mismatched v5 column constraints and refuses duplicate values that violate new uniqueness', () => {
+    const repairedPath = join(mkdtempSync(join(tmpdir(), 'qlb-v5-shape-repair-')), 'qlb.db');
+    const duplicatePath = join(mkdtempSync(join(tmpdir(), 'qlb-v5-duplicate-refusal-')), 'qlb.db');
+    for (const [path, duplicate] of [[repairedPath, false], [duplicatePath, true]] as const) {
+      const initial = openStore(path);
+      initial.close();
+      const db = new DatabaseSync(path);
+      db.exec('DROP TABLE claude_slots');
+      db.exec(`CREATE TABLE claude_slots (
+        account_id TEXT PRIMARY KEY, slot_num INTEGER, email TEXT, alias TEXT, org_uuid TEXT,
+        config_json TEXT${duplicate ? ' NOT NULL' : ''}, fingerprint TEXT, prev_fingerprint TEXT, threshold REAL,
+        dead INTEGER NOT NULL DEFAULT 0, dead_reason TEXT, dead_at INTEGER, healed_at INTEGER,
+        added_at INTEGER NOT NULL, last_active_at INTEGER, source TEXT, archived_at INTEGER
+      )`);
+      if (duplicate) {
+        db.exec("INSERT INTO claude_slots (account_id, slot_num, config_json, added_at) VALUES ('one', 1, '{}', 1), ('two', 1, '{}', 2)");
+      } else {
+        db.exec("INSERT INTO claude_slots (account_id, config_json, added_at) VALUES ('fixture', '{}', 1)");
+      }
+      db.close();
+    }
+
+    const repaired = openStore(repairedPath);
+    repaired.close();
+    const repairedCheck = dbAt(repairedPath);
+    try {
+      const config = repairedCheck.prepare('PRAGMA table_info(claude_slots)').all() as Array<{ name: string; notnull: number }>;
+      assert.equal(config.find((column) => column.name === 'config_json')?.notnull, 1);
+      const uniqueIndexes = repairedCheck.prepare('PRAGMA index_list(claude_slots)').all() as Array<{ name: string; unique: number }>;
+      assert.equal(uniqueIndexes.some((index) => index.unique === 1 && (repairedCheck.prepare(`PRAGMA index_info(${index.name})`).all() as Array<{ name: string }>).some((column) => column.name === 'slot_num')), true);
+    } finally { repairedCheck.close(); }
+
+    assert.throws(() => openStore(duplicatePath), /cannot correct pre-release v5 claude_slots: copied rows violate new constraints/);
+    const duplicateCheck = dbAt(duplicatePath);
+    try {
+      assert.equal((duplicateCheck.prepare('SELECT count(*) AS count FROM claude_slots WHERE slot_num = 1').get() as { count: number }).count, 2);
+      const uniqueIndexes = duplicateCheck.prepare('PRAGMA index_list(claude_slots)').all() as Array<{ name: string; unique: number }>;
+      assert.equal(uniqueIndexes.some((index) => index.unique === 1 && (duplicateCheck.prepare(`PRAGMA index_info(${index.name})`).all() as Array<{ name: string }>).some((column) => column.name === 'slot_num')), false, 'slot_num remains non-unique after rollback');
+    } finally { duplicateCheck.close(); }
   });
 
   it('rebuilds a pre-release lifecycle index whose predicate omits aborted', () => {
@@ -144,9 +492,9 @@ describe('store v5 schema (AC38)', () => {
       CREATE TABLE leases (name TEXT PRIMARY KEY, holder_pid INTEGER, holder_id TEXT, until INTEGER, generation INTEGER);
       CREATE TABLE migrations (store TEXT PRIMARY KEY, state TEXT NOT NULL, updated_at INTEGER NOT NULL, detail_json TEXT);
       CREATE TABLE policies (harness TEXT, virtual_model TEXT, real_model TEXT, effort TEXT, fallback_json TEXT, session_mode TEXT, created_at INTEGER, PRIMARY KEY (harness, virtual_model));
-      CREATE TABLE usage_polls (account_id TEXT PRIMARY KEY, last_fetch_at INTEGER, last_attempt_at INTEGER, next_due_at INTEGER, last_status TEXT, consecutive_failures INTEGER NOT NULL DEFAULT 0, backoff_until INTEGER, last_429_at INTEGER, held_until INTEGER);
+      CREATE TABLE usage_polls (account_id TEXT PRIMARY KEY, last_fetch_at INTEGER, last_attempt_at INTEGER, next_due_at INTEGER, poll_interval_s REAL, last_status TEXT, consecutive_failures INTEGER NOT NULL DEFAULT 0, backoff_until INTEGER, last_429_at INTEGER, held_until INTEGER);
       INSERT INTO accounts VALUES ('a', 'anthropic', 'a', 'active', 1, 0);
-      INSERT INTO usage_polls (account_id, last_fetch_at) VALUES ('a', 9);
+      INSERT INTO usage_polls (account_id, last_fetch_at, poll_interval_s) VALUES ('a', 9, 42.5);
       PRAGMA user_version = 5`);
     db.close();
     const store = openStore(path);
@@ -154,10 +502,32 @@ describe('store v5 schema (AC38)', () => {
     const check = dbAt(path);
     try {
       assert.deepEqual(columns(check, 'usage_polls').slice(0, 2), ['provider', 'account_id']);
-      const row = check.prepare('SELECT provider, account_id, last_fetch_at FROM usage_polls').get() as { provider: string; account_id: string; last_fetch_at: number };
+      const row = check.prepare('SELECT provider, account_id, last_fetch_at, poll_interval_s FROM usage_polls').get() as { provider: string; account_id: string; last_fetch_at: number; poll_interval_s: number };
       assert.equal(row.provider, 'anthropic');
       assert.equal(row.account_id, 'a');
       assert.equal(row.last_fetch_at, 9);
+      assert.equal(row.poll_interval_s, 42.5);
+    } finally { check.close(); }
+  });
+
+  it('refuses a provider-less usage_polls table with unknown columns without changing it', () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'qlb-v5-usage-polls-unknown-')), 'qlb.db');
+    const db = new DatabaseSync(path);
+    db.exec(`CREATE TABLE accounts (id TEXT PRIMARY KEY, provider TEXT, label TEXT, status TEXT, created_at INTEGER, grant_generation INTEGER DEFAULT 0);
+      CREATE TABLE usage_polls (account_id TEXT PRIMARY KEY, last_fetch_at INTEGER, unexpected TEXT);
+      INSERT INTO accounts VALUES ('a', 'anthropic', 'a', 'active', 1, 0);
+      INSERT INTO usage_polls VALUES ('a', 9, 'keep');
+      PRAGMA user_version = 5`);
+    db.close();
+
+    assert.throws(
+      () => openStore(path),
+      /cannot correct pre-release v5 usage_polls: column unexpected is not in the canonical definition and cannot be reproduced; verified backup:/,
+    );
+    const check = dbAt(path);
+    try {
+      assert.deepEqual(columns(check, 'usage_polls'), ['account_id', 'last_fetch_at', 'unexpected']);
+      assert.equal((check.prepare('SELECT unexpected FROM usage_polls').get() as { unexpected: string }).unexpected, 'keep');
     } finally { check.close(); }
   });
 
@@ -231,6 +601,99 @@ describe('store v5 schema (AC38)', () => {
     } finally { store.close(); }
   });
 
+  it('redacts sensitive recordSwitch JSON keys at every depth while preserving valid JSON', () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'qlb-v5-switch-redact-')), 'qlb.db');
+    const store = openStore(path);
+    const payload = {
+      password: 'hunter2',
+      nested: [{ authorization: 'Basic abc', cookie: 'session=value' }],
+      credentials: { refresh_token: 'refresh-value', access_token: 'access-value' },
+    };
+    store.recordSwitch({
+      ts: 1,
+      provider: 'anthropic',
+      toAccount: 'id',
+      trigger: 'manual',
+      outcome: 'failed',
+      bindingJson: JSON.stringify(payload),
+      stepsJson: JSON.stringify(payload),
+      openSessionsJson: JSON.stringify(payload),
+    });
+    store.close();
+
+    const db = dbAt(path);
+    try {
+      const row = db.prepare('SELECT binding_json, steps_json, open_sessions_json FROM switch_log').get() as Record<string, string>;
+      for (const value of Object.values(row)) {
+        for (const secret of ['hunter2', 'Basic abc', 'session=value', 'refresh-value', 'access-value']) assert.equal(value.includes(secret), false);
+        assert.deepEqual(JSON.parse(value), {
+          password: '[redacted]',
+          nested: [{ authorization: '[redacted]', cookie: '[redacted]' }],
+          credentials: '[redacted]',
+        });
+      }
+    } finally { db.close(); }
+  });
+
+  it('redacts key-value secrets in non-JSON switch text and preserves safe JSON audit bytes', () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'qlb-v5-switch-text-redact-')), 'qlb.db');
+    const store = openStore(path);
+    const validAuditJson = '{"count":9007199254740993,"duplicate":"first","duplicate":"last"}';
+    const nonJson = 'password=hunter2\nAuthorization: Basic abc123\ncookie=session=xyz\npasswordless=keep token_count=5';
+    const truncatedJson = '{"password":"hunter2",';
+    store.recordSwitch({
+      ts: 1,
+      provider: 'anthropic',
+      toAccount: 'id',
+      trigger: 'manual',
+      outcome: 'failed',
+      bindingJson: nonJson,
+      stepsJson: truncatedJson,
+      openSessionsJson: validAuditJson,
+    });
+    store.close();
+
+    const db = dbAt(path);
+    try {
+      const row = db.prepare('SELECT binding_json, steps_json, open_sessions_json FROM switch_log').get() as Record<string, string>;
+      for (const value of [row.binding_json, row.steps_json]) {
+        for (const secret of ['hunter2', 'Basic abc123', 'session=xyz']) assert.equal(value.includes(secret), false);
+      }
+      assert.match(row.binding_json, /passwordless=keep/);
+      assert.match(row.binding_json, /token_count=5/);
+      assert.equal(row.open_sessions_json, validAuditJson);
+    } finally { db.close(); }
+  });
+
+  it('fails closed through each sensitive non-JSON switch-text line', () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'qlb-v5-switch-fail-closed-')), 'qlb.db');
+    const cases = [
+      ['stderr: password=hunter2 rest', 'stderr: password=[redacted]'],
+      ['Cookie: session=abc; csrf=def', 'Cookie: [redacted]'],
+      ['msg: api_key=abc; ok', 'msg: api_key=[redacted]'],
+      ['password="hunter 2"', 'password=[redacted]'],
+    ] as const;
+    const store = openStore(path);
+    for (const [index, [bindingJson]] of cases.entries()) {
+      store.recordSwitch({
+        ts: index + 1,
+        provider: 'anthropic',
+        toAccount: 'id',
+        trigger: 'manual',
+        outcome: 'failed',
+        bindingJson,
+      });
+    }
+    store.close();
+
+    const db = dbAt(path);
+    try {
+      const stored = (db.prepare('SELECT binding_json FROM switch_log ORDER BY id').all() as Array<{ binding_json: string }>)
+        .map(({ binding_json }) => binding_json);
+      assert.deepEqual(stored, cases.map(([, expected]) => expected));
+    } finally { db.close(); }
+  });
+
   it('redacts token-shaped detail and evidence text without changing ids or fingerprints', () => {
     const path = join(mkdtempSync(join(tmpdir(), 'qlb-v5-redact-')), 'qlb.db');
     const store = openStore(path);
@@ -245,5 +708,169 @@ describe('store v5 schema (AC38)', () => {
       assert.equal(row.to_fp, 'fp-sk-abcdefghijklmnop');
       assert.equal(row.evidence, '[redacted]');
     } finally { db.close(); }
+  });
+
+  it('corrects a v5 database missing poll_interval_s after a verified backup, once', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-v5-poll-interval-correct-'));
+    const path = join(dir, 'qlb.db');
+    const initial = openStore(path);
+    initial.close();
+    const backupsBefore = readdirSync(join(dir, 'backups')).filter((file) => file.endsWith('.sqlite'));
+    const db = new DatabaseSync(path);
+    db.exec('ALTER TABLE usage_polls DROP COLUMN poll_interval_s');
+    db.close();
+
+    const corrected = openStore(path);
+    corrected.close();
+    const backups = readdirSync(join(dir, 'backups')).filter((file) => file.endsWith('.sqlite'));
+    assert.equal(backups.length, backupsBefore.length + 1);
+    const correctionBackup = backups.find((file) => !backupsBefore.includes(file));
+    assert.ok(correctionBackup);
+    const backup = dbAt(join(dir, 'backups', correctionBackup));
+    try { assert.ok(!columns(backup, 'usage_polls').includes('poll_interval_s')); } finally { backup.close(); }
+    const check = dbAt(path);
+    try { assert.ok(columns(check, 'usage_polls').includes('poll_interval_s')); } finally { check.close(); }
+
+    const reopened = openStore(path);
+    reopened.close();
+    assert.equal(readdirSync(join(dir, 'backups')).filter((file) => file.endsWith('.sqlite')).length, backups.length);
+  });
+
+  it('does not create another backup when an exact v5 repair is permanently refused', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-v5-refused-backup-'));
+    const path = join(dir, 'qlb.db');
+    const initial = openStore(path);
+    initial.close();
+    const db = new DatabaseSync(path);
+    db.exec(`DROP TABLE codex_watch;
+      CREATE TABLE codex_watch (
+        switch_id INTEGER PRIMARY KEY, provider TEXT, outgoing TEXT NOT NULL,
+        target TEXT NOT NULL, next_at INTEGER NOT NULL, until INTEGER NOT NULL, unexpected TEXT
+      )`);
+    db.close();
+    const backupsDir = join(dir, 'backups');
+    const before = readdirSync(backupsDir).filter((file) => file.endsWith('.sqlite'));
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      assert.throws(() => openStore(path), /cannot correct pre-release v5 codex_watch: column unexpected is not in the canonical definition/);
+    }
+
+    const after = readdirSync(backupsDir).filter((file) => file.endsWith('.sqlite'));
+    assert.deepEqual(after.sort(), before.sort());
+    assert.ok(after.length <= 1);
+  });
+
+  it('refuses provider-less usage_polls schema objects and constraints before any backup', () => {
+    const cases = [
+      {
+        name: 'index',
+        objectSql: 'CREATE INDEX usage_polls_extra_index ON usage_polls(last_fetch_at);',
+        check: undefined,
+        reason: /index usage_polls_extra_index cannot be reproduced/,
+      },
+      {
+        name: 'trigger',
+        objectSql: `CREATE TABLE usage_polls_audit (account_id TEXT);
+          CREATE TRIGGER usage_polls_extra_trigger AFTER INSERT ON usage_polls BEGIN
+            INSERT INTO usage_polls_audit VALUES (NEW.account_id);
+          END;`,
+        check: undefined,
+        reason: /trigger usage_polls_extra_trigger cannot be reproduced/,
+      },
+      {
+        name: 'CHECK constraint',
+        objectSql: '',
+        check: 'CHECK (last_fetch_at IS NULL OR last_fetch_at >= 0)',
+        reason: /CHECK differs from the canonical definition/,
+      },
+    ] as const;
+
+    for (const fixture of cases) {
+      const dir = mkdtempSync(join(tmpdir(), 'qlb-v5-providerless-object-'));
+      const path = join(dir, 'qlb.db');
+      const db = new DatabaseSync(path);
+      db.exec(`CREATE TABLE accounts (id TEXT PRIMARY KEY, provider TEXT, label TEXT, status TEXT, created_at INTEGER, grant_generation INTEGER DEFAULT 0);
+        CREATE TABLE usage_polls (
+          account_id TEXT PRIMARY KEY, last_fetch_at INTEGER, last_attempt_at INTEGER, next_due_at INTEGER,
+          poll_interval_s REAL, last_status TEXT, consecutive_failures INTEGER NOT NULL DEFAULT 0,
+          backoff_until INTEGER, last_429_at INTEGER, held_until INTEGER${fixture.check ? `, ${fixture.check}` : ''}
+        );
+        INSERT INTO accounts VALUES ('a', 'anthropic', 'a', 'active', 1, 0);
+        INSERT INTO usage_polls (account_id) VALUES ('a');
+        ${fixture.objectSql}
+        PRAGMA user_version = 5`);
+      db.close();
+      const before = dbAt(path);
+      const beforeSchema = before.prepare("SELECT type, name, tbl_name, sql FROM sqlite_master WHERE tbl_name = 'usage_polls' OR name = 'usage_polls' ORDER BY type, name").all();
+      const beforeRows = before.prepare('SELECT * FROM usage_polls ORDER BY rowid').all();
+      before.close();
+
+      assert.throws(() => openStore(path), fixture.reason, fixture.name);
+      const after = dbAt(path);
+      try {
+        assert.deepEqual(after.prepare("SELECT type, name, tbl_name, sql FROM sqlite_master WHERE tbl_name = 'usage_polls' OR name = 'usage_polls' ORDER BY type, name").all(), beforeSchema, `${fixture.name} must retain its table schema objects`);
+        assert.deepEqual(after.prepare('SELECT * FROM usage_polls ORDER BY rowid').all(), beforeRows, `${fixture.name} must retain its table rows`);
+      } finally { after.close(); }
+      assert.deepEqual(existsSync(join(dir, 'backups')) ? readdirSync(join(dir, 'backups')).filter((file) => file.endsWith('.sqlite')) : [], []);
+    }
+  });
+
+  it('refuses nullable data for a canonical NOT NULL column before any backup', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-v5-null-not-null-'));
+    const path = join(dir, 'qlb.db');
+    const db = new DatabaseSync(path);
+    db.exec(`CREATE TABLE codex_watch (
+      switch_id INTEGER PRIMARY KEY, provider TEXT, outgoing TEXT NOT NULL,
+      target TEXT NOT NULL, next_at INTEGER NOT NULL, until INTEGER NOT NULL
+    );
+    INSERT INTO codex_watch VALUES (1, NULL, 'outgoing', 'target', 1, 2);
+    PRAGMA user_version = 5`);
+    db.close();
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      assert.throws(
+        () => openStore(path),
+        /cannot correct pre-release v5 codex_watch: copied rows violate new constraints \(NOT NULL constraint failed: codex_watch__v5new\.provider\)/,
+      );
+    }
+
+    assert.deepEqual(existsSync(join(dir, 'backups')) ? readdirSync(join(dir, 'backups')).filter((file) => file.endsWith('.sqlite')) : [], []);
+    const check = dbAt(path);
+    try {
+      assert.equal((check.prepare('SELECT provider FROM codex_watch').get() as { provider: string | null }).provider, null);
+    } finally { check.close(); }
+  });
+
+  it('scrubs existing relogin rows once without a schema-version change', () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'qlb-v5-relogin-scrub-')), 'qlb.db');
+    const initial = openStore(path);
+    initial.close();
+    const seeded = new DatabaseSync(path);
+    seeded.prepare("DELETE FROM config WHERE key = 'relogin.scrubbedAt'").run();
+    seeded.prepare('INSERT INTO relogin_events (ts, provider, kind, detail, evidence) VALUES (?, ?, ?, ?, ?)').run(
+      1, 'anthropic', 'external-login', 'client_secret=abc123', 'junk',
+    );
+    seeded.close();
+
+    const scrubbed = openStore(path);
+    scrubbed.close();
+    const first = dbAt(path);
+    let row: { detail: string | null; evidence: string | null };
+    let scrubbedAt: string | null;
+    try {
+      row = first.prepare('SELECT detail, evidence FROM relogin_events').get() as { detail: string | null; evidence: string | null };
+      scrubbedAt = (first.prepare("SELECT value FROM config WHERE key = 'relogin.scrubbedAt'").get() as { value: string } | undefined)?.value ?? null;
+    } finally { first.close(); }
+    assert.match(row.detail ?? '', /^sha256:[0-9a-f]{16}$/);
+    assert.equal(row.evidence, null);
+    assert.ok(scrubbedAt);
+
+    const reopened = openStore(path);
+    reopened.close();
+    const second = dbAt(path);
+    try {
+      assert.deepEqual(second.prepare('SELECT detail, evidence FROM relogin_events').get(), row);
+      assert.equal((second.prepare("SELECT value FROM config WHERE key = 'relogin.scrubbedAt'").get() as { value: string }).value, scrubbedAt);
+    } finally { second.close(); }
   });
 });
