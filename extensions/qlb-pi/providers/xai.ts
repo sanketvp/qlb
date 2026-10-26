@@ -29,19 +29,39 @@ export type XaiBuiltin = (
   options: Record<string, unknown>,
 ) => AsyncIterable<unknown>;
 
-export type XaiGate = () => Promise<unknown>;
+export type XaiGate = (signal?: AbortSignal) => Promise<unknown>;
 
 interface GateProcessResult {
   stdout: string;
+  stderr?: string;
   code: number;
 }
 
-export type XaiGateProcess = (args: string[]) => Promise<GateProcessResult>;
+export type XaiGateProcess = (args: string[], signal?: AbortSignal) => Promise<GateProcessResult>;
 
-function xaiGateFailure(): Error {
+const GATE_TIMEOUT_MS = 75_000;
+const MAX_GATE_STDOUT_BYTES = 64 * 1024;
+const MAX_GATE_STDERR_BYTES = 4 * 1024;
+
+class XaiGateFailure extends Error {
+  constructor(readonly causeCode = 'unknown') {
+    super('xai-gate-unavailable');
+  }
+}
+
+function xaiGateFailure(causeCode = 'unknown'): XaiGateFailure {
   // Do not expose a child-process error or a gate response: either can contain
   // sensitive material. The stream boundary turns this into a fixed error event.
-  return new Error('xai-gate-unavailable');
+  return new XaiGateFailure(causeCode);
+}
+
+function gateCause(stderr: string | undefined): string {
+  const lastLine = stderr?.trim().split(/\r?\n/).at(-1)?.trim();
+  return lastLine && /^[a-z][a-z0-9=-]*$/.test(lastLine) ? lastLine : 'unknown';
+}
+
+function failureCause(error: unknown): string {
+  return error instanceof XaiGateFailure ? error.causeCode : 'unknown';
 }
 
 function narrowAccess(value: unknown): ActiveAccess {
@@ -63,32 +83,63 @@ function narrowAccess(value: unknown): ActiveAccess {
   return result;
 }
 
-function defaultGateProcess(args: string[]): Promise<GateProcessResult> {
+function defaultGateProcess(args: string[], signal?: AbortSignal): Promise<GateProcessResult> {
   const repoCli = join(__dirname, '..', '..', '..', 'dist', 'cli.js');
   const command = existsSync(repoCli) ? process.execPath : 'qlb';
   const commandArgs = existsSync(repoCli) ? [repoCli, ...args] : args;
   return new Promise((resolve, reject) => {
     const child = spawn(command, commandArgs, {
-      stdio: ['ignore', 'pipe', 'ignore'],
+      stdio: ['ignore', 'pipe', 'pipe'],
       env: { ...process.env, QLB_PI_TOKEN_CALL: '1' },
     });
     let stdout = '';
-    child.stdout?.on('data', (chunk: Buffer) => { stdout += chunk.toString('utf8'); });
-    child.once('error', reject);
-    child.once('close', (code) => resolve({ stdout, code: code ?? 1 }));
+    let stderr = '';
+    let stdoutBytes = 0;
+    let settled = false;
+    const cleanup = () => {
+      clearTimeout(timeout);
+      signal?.removeEventListener('abort', onAbort);
+    };
+    const settle = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      callback();
+    };
+    const fail = (cause: string) => {
+      try { child.kill('SIGTERM'); } catch { /* child already exited */ }
+      settle(() => reject(xaiGateFailure(cause)));
+    };
+    const onAbort = () => fail('gate-aborted');
+    const timeout = setTimeout(() => fail('gate-timeout'), GATE_TIMEOUT_MS);
+    child.stdout?.on('data', (chunk: Buffer) => {
+      stdoutBytes += chunk.length;
+      if (stdoutBytes > MAX_GATE_STDOUT_BYTES) {
+        fail('gate-output-too-large');
+      } else {
+        stdout += chunk.toString('utf8');
+      }
+    });
+    child.stderr?.on('data', (chunk: Buffer) => {
+      stderr = (stderr + chunk.toString('utf8')).slice(-MAX_GATE_STDERR_BYTES);
+    });
+    child.once('error', () => fail('missing-binary'));
+    child.once('close', (code) => settle(() => resolve({ stdout, stderr, code: code ?? 1 })));
+    signal?.addEventListener('abort', onAbort, { once: true });
+    if (signal?.aborted) onAbort();
   });
 }
 
 /** Build a one-request gate adapter; process execution is injectable for tests. */
 export function createXaiGate(process: XaiGateProcess = defaultGateProcess): XaiGate {
-  return async () => {
+  return async (signal?: AbortSignal) => {
     let result: GateProcessResult;
     try {
-      result = await process(['gate', 'xai', '--json']);
-    } catch {
-      throw xaiGateFailure();
+      result = await process(['gate', 'xai', '--json'], signal);
+    } catch (error) {
+      throw xaiGateFailure(failureCause(error));
     }
-    if (result.code !== 0) throw xaiGateFailure();
+    if (result.code !== 0) throw xaiGateFailure(gateCause(result.stderr));
     try {
       return narrowAccess(JSON.parse(result.stdout));
     } catch {
@@ -97,18 +148,31 @@ export function createXaiGate(process: XaiGateProcess = defaultGateProcess): Xai
   };
 }
 
+interface XaiAccessSource extends ActiveAccessSource {
+  readWithSignal(signal?: AbortSignal): Promise<ActiveAccess>;
+}
+
 /** Source used by the extension registry; it requests a new gate result per Pi request. */
-export function createXaiAccessSource(gate: XaiGate = createXaiGate()): ActiveAccessSource {
-  return {
-    provider: 'xai',
-    async read(): Promise<ActiveAccess> {
-      try {
-        return narrowAccess(await gate());
-      } catch {
-        throw xaiGateFailure();
-      }
-    },
+export function createXaiAccessSource(gate: XaiGate = createXaiGate()): XaiAccessSource {
+  const read = async (signal?: AbortSignal): Promise<ActiveAccess> => {
+    try {
+      return narrowAccess(await gate(signal));
+    } catch (error) {
+      throw xaiGateFailure(failureCause(error));
+    }
   };
+  return { provider: 'xai', read: () => read(), readWithSignal: read };
+}
+
+function withQlbAccess(options: Record<string, unknown>, apiKey: string): Record<string, unknown> {
+  const headers = options.headers;
+  if (!headers || typeof headers !== 'object' || Array.isArray(headers)) {
+    return { ...options, apiKey };
+  }
+  const safeHeaders = Object.fromEntries(
+    Object.entries(headers).filter(([name]) => name.toLowerCase() !== 'authorization'),
+  );
+  return { ...options, apiKey, headers: safeHeaders };
 }
 
 export interface RegisterXaiProviderDeps {
@@ -129,17 +193,24 @@ export function registerXaiProvider(
   const source = createXaiAccessSource(deps.gate);
   pi.unregisterProvider('xai');
   pi.registerProvider('xai', {
-    api: 'openai-completions',
+    api: 'openai-responses',
     streamSimple: (model, context, options = {}) => {
       const output = deps.createStream();
       void (async () => {
+        let access: ActiveAccess;
         try {
-          const access = await source.read();
-          for await (const event of builtin(model, context, { ...options, apiKey: access.token })) {
+          access = await source.readWithSignal(options.signal as AbortSignal | undefined);
+        } catch (error) {
+          output.push(qlbUnavailable('xai', failureCause(error), model));
+          output.end();
+          return;
+        }
+        try {
+          for await (const event of builtin(model, context, withQlbAccess(options, access.token))) {
             output.push(event);
           }
         } catch {
-          output.push(qlbUnavailable('xai', 'unknown', model));
+          // The gate succeeded. Do not misrepresent a provider transport failure as QLB unavailable.
         } finally {
           output.end();
         }
