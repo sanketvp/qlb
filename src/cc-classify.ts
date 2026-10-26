@@ -54,7 +54,7 @@ export interface ClassifyOutgoingCredentialInput {
   outgoing: ClassifyClaudeSlot;
   /** Includes the outgoing slot and every other managed Claude slot. */
   slots: readonly ClassifyClaudeSlot[];
-  /** The Phase-B fresh live read. Empty values must be refused before this call. */
+  /** The Phase-B fresh live read. This classifier refuses empty values. */
   liveCredential: string;
   provenance: PrefetchedLiveIdentity;
   /** A definitive, same-lineage collect-pass oracle verdict, if one exists. */
@@ -98,7 +98,7 @@ function resolvedSlot(
   const email = resolved.email ?? '';
   const orgUuid = normalizedOrg(resolved.organizationUuid);
 
-  let slot = resolved.email === null
+  let slot = !resolved.email
     ? undefined
     : slots.find((candidate) => candidate.email === email && normalizedOrg(candidate.orgUuid) === orgUuid);
 
@@ -150,6 +150,7 @@ export function classifyOutgoingCredential(
   input: ClassifyOutgoingCredentialInput,
 ): ClassifiedOutgoingCredential {
   const { outgoing, liveCredential, provenance } = input;
+  if (!liveCredential) throw new TypeError('live credential must be non-empty');
   if (outgoing.credential === liveCredential) return { kind: 'own-bytes', foreignSlotId: null };
   if (sameLineage(outgoing.credential, liveCredential)) return { kind: 'own-family', foreignSlotId: null };
   if (isWipedOauthBlob(liveCredential)) return { kind: 'wiped', foreignSlotId: null };
@@ -178,7 +179,7 @@ export function classifyOutgoingCredential(
   if (slot === null) {
     // A positive alien requires the complete email+organization pair. Partial
     // profile shapes are schema drift and must retain the fail-open path.
-    return resolved.email !== null && resolved.organizationUuid !== null
+    return resolved.email && resolved.organizationUuid !== null
       ? { kind: 'alien', foreignSlotId: null }
       : { kind: 'unresolved', foreignSlotId: null };
   }
@@ -205,7 +206,9 @@ export function decideSelfSwitchAction(input: {
   if (!input.liveCredential || input.outgoing.credential === input.liveCredential || sameLineage(input.outgoing.credential, input.liveCredential)) {
     return 'noop';
   }
-  return input.provenance.resolved === null ? 'noop-diverged' : 'reconcile';
+  return input.provenance.resolved === null || input.provenance.liveCredential !== input.liveCredential
+    ? 'noop-diverged'
+    : 'reconcile';
 }
 
 /** Degraded Keychain-fallback bytes may be served/adopted, never consumed. */

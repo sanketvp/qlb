@@ -85,6 +85,30 @@ describe('Claude outgoing credential classification (K4 / AC5)', () => {
     assert.deepEqual(classify(live, prefetch(live, null)), { kind: 'unresolved', foreignSlotId: null });
   });
 
+  it('discards a Phase-A profile answer when the live bytes changed before Phase B', () => {
+    const phaseALive = credential('phase-a');
+    const phaseBLive = credential('phase-b');
+    assert.deepEqual(
+      classify(phaseBLive, prefetch(phaseALive, { uuid: 'uuid-b', email: 'b@example.test', organizationUuid: 'org-b' })),
+      { kind: 'unresolved', foreignSlotId: null },
+    );
+  });
+
+  it('treats a blank profile email as a partial identity', () => {
+    const live = credential('blank-email');
+    assert.deepEqual(
+      classify(live, prefetch(live, { uuid: 'uuid-nobody', email: '', organizationUuid: 'org-nobody' })),
+      { kind: 'unresolved', foreignSlotId: null },
+    );
+  });
+
+  it('refuses an empty live credential', () => {
+    assert.throws(
+      () => classify('', prefetch('', null)),
+      { name: 'TypeError', message: 'live credential must be non-empty' },
+    );
+  });
+
   it('treats an email/org match with a conflicting uuid as alien rather than its slot', () => {
     const live = credential('recycled-email');
     assert.deepEqual(classify(live, prefetch(live, { uuid: 'uuid-recycled', email: 'a@example.test', organizationUuid: 'org-a' })), { kind: 'alien', foreignSlotId: null });
@@ -102,6 +126,19 @@ describe('Claude outgoing credential classification (K4 / AC5)', () => {
   it('keeps a diverged self-switch a no-op when the identity is unresolved', () => {
     const live = credential('diverged');
     assert.equal(decideSelfSwitchAction({ outgoing: accountA, liveCredential: live, provenance: prefetch(live, null) }), 'noop-diverged');
+  });
+
+  it('keeps a self-switch a no-op when Phase-B bytes differ from the resolved Phase-A bytes', () => {
+    const phaseALive = credential('self-phase-a');
+    const phaseBLive = credential('self-phase-b');
+    assert.equal(
+      decideSelfSwitchAction({
+        outgoing: accountA,
+        liveCredential: phaseBLive,
+        provenance: prefetch(phaseALive, { uuid: 'uuid-a', email: 'a@example.test', organizationUuid: 'org-a' }),
+      }),
+      'noop-diverged',
+    );
   });
 
   it('never permits a degraded read to spend a refresh token', () => {
