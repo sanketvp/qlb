@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, statSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
@@ -7,6 +7,7 @@ import { describe, it } from 'node:test';
 import { ClaudeSlots, InMemoryClaudeSlotRepository, SqliteClaudeSlotRepository, type ClaudeSlotBackend } from '../src/cc-slots';
 import { runClaudeRestoreUnclaimedCommand } from '../src/commands/claude-restore-unclaimed';
 import { MockKeychain } from '../src/keychain';
+import { listStashes } from '../src/unclaimed-index';
 import { openStore } from '../src/store';
 import type { CommandContext } from '../src/registry';
 
@@ -32,8 +33,12 @@ class StashFailingBackend implements ClaudeSlotBackend {
   readonly inner = new MockKeychain();
   failUnclaimedWrites = false;
   failUnclaimedDeletes = false;
+  unclaimedGets = 0;
 
-  async get(service: string, account: string): Promise<string> { return this.inner.get(service, account); }
+  async get(service: string, account: string): Promise<string> {
+    if (service.includes(':unclaimed:')) this.unclaimedGets += 1;
+    return this.inner.get(service, account);
+  }
   async set(service: string, account: string, value: string): Promise<void> {
     if (this.failUnclaimedWrites && service.includes(':unclaimed:')) throw new Error('fixture keychain write failed');
     return this.inner.set(service, account, value);
@@ -81,6 +86,62 @@ describe('Claude unclaimed stash and restore (K2 / AC48)', () => {
     assert.deepEqual(await slots.sweepUnclaimed(), { swept: 1, retained: 0 });
     const swept = JSON.parse(await backend.get('qlb:anthropic:unclaimed:2026-10-25T12:00:00Z', 'qlb')) as { consumedFp: string };
     assert.equal(swept.consumedFp, 'sha256:consumed');
+  });
+
+  it('falls back after a locked Keychain read and a failed write', async () => {
+    const { slots, backend, stashDir } = fixture();
+    const originalGet = backend.get.bind(backend);
+    backend.get = async (service, account) => {
+      if (service.includes(':unclaimed:')) {
+        backend.unclaimedGets += 1;
+        throw new Error('fixture keychain locked');
+      }
+      return originalGet(service, account);
+    };
+    backend.failUnclaimedWrites = true;
+
+    const stored = await slots.stashUnclaimed('locked-stash', credential('issued'), 'sha256:consumed', 'account-a');
+    assert.equal(stored.location, 'file');
+    assert.ok(backend.unclaimedGets > 0);
+    assert.equal(statSync(join(stashDir, 'locked-stash.json')).mode & 0o777, 0o600);
+  });
+
+  it('uses a file fallback when the index cannot be updated', async () => {
+    const { slots, backend, stashDir } = fixture();
+    mkdirSync(stashDir, { recursive: true, mode: 0o700 });
+    writeFileSync(join(stashDir, 'index'), 'blocked');
+    backend.failUnclaimedWrites = true;
+
+    const stored = await slots.stashUnclaimed('index-failure', credential('issued'), 'sha256:consumed', 'account-a');
+    assert.equal(stored.location, 'file');
+    assert.equal(statSync(stored.path!).mode & 0o777, 0o600);
+  });
+
+  it('keeps the durable account id when a fresh instance sweeps a fallback file', async () => {
+    const { slots, backend, stashDir } = fixture();
+    backend.failUnclaimedWrites = true;
+    await slots.stashUnclaimed('sweep-restart', credential('issued'), 'sha256:consumed', 'account-a');
+    backend.failUnclaimedWrites = false;
+
+    const sweeper = new ClaudeSlots({ backend, repository: new InMemoryClaudeSlotRepository(), stashDir, now: () => 2_000 });
+    assert.deepEqual(await sweeper.sweepUnclaimed(), { swept: 1, retained: 0 });
+    assert.deepEqual(await listStashes(stashDir, 'anthropic'), [{
+      provider: 'anthropic', accountId: 'account-a', stashId: 'sweep-restart', consumedFp: 'sha256:consumed',
+      location: 'keychain', createdAt: 1_000,
+    }]);
+  });
+
+  it('refuses to replace an existing fallback file for a reused stash id', async () => {
+    const { slots, backend, stashDir } = fixture();
+    mkdirSync(stashDir, { recursive: true, mode: 0o700 });
+    const path = join(stashDir, 'reused-id.json');
+    const original = JSON.stringify({ credential: credential('original') });
+    writeFileSync(path, original, { mode: 0o600 });
+    backend.failUnclaimedWrites = true;
+
+    await assert.rejects(slots.stashUnclaimed('reused-id', credential('replacement')), /already exists/);
+    assert.equal(readFileSync(path, 'utf8'), original);
+    assert.deepEqual(readdirSync(stashDir).filter((name) => name.includes('.tmp.')), []);
   });
 
   it('restores only when the stash consumed lineage matches the current slot', async () => {

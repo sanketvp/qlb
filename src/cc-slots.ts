@@ -9,13 +9,14 @@
 // Credential bytes are accepted only through injected backends and are never
 // included in errors, return metadata, or filesystem names.
 
-import { chmod, mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, link, mkdir, open, readdir, readFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { openStoreConnection } from './store';
 import { assertAdmittedInConnection } from './lifecycle';
 import { credentialFingerprint } from './anthropic-oauth';
 import { isCredentialNotFound } from './credential-backends';
 import { KeychainReadBackoff, platformKeychain, qlbKeychainService, QLB_KEYCHAIN_ACCOUNT } from './keychain';
+import { listStashes, recordStash, type UnclaimedIndexEntry } from './unclaimed-index';
 
 const DISPLAY_CACHE_TTL_MS = 60_000;
 const ANTHROPIC_PROVIDER = 'anthropic';
@@ -474,6 +475,7 @@ export class SqliteClaudeSlotRepository implements ClaudeSlotRepository {
 export interface UnclaimedRecord {
   credential: string;
   consumedFp?: string;
+  accountId?: string;
 }
 
 export interface RestoreUnclaimedResult {
@@ -483,14 +485,19 @@ export interface RestoreUnclaimedResult {
 export interface ClaudeSlotFileOps {
   mkdir(path: string, options: { recursive: true; mode: number }): Promise<string | undefined>;
   chmod(path: string, mode: number): Promise<void>;
-  writeFile(path: string, data: string, options: { encoding: 'utf8'; mode: number; flag: 'wx' }): Promise<void>;
+  open(path: string, flags: string, mode?: number): Promise<{
+    writeFile(data: string, encoding: 'utf8'): Promise<void>;
+    sync(): Promise<void>;
+    close(): Promise<void>;
+  }>;
+  link(existingPath: string, newPath: string): Promise<void>;
   readFile(path: string, encoding: 'utf8'): Promise<string>;
   readdir(path: string): Promise<string[]>;
   rm(path: string, options: { force: boolean }): Promise<void>;
 }
 
 const defaultFileOps: ClaudeSlotFileOps = {
-  mkdir, chmod, writeFile, readFile, readdir, rm,
+  mkdir, chmod, open, link, readFile, readdir, rm,
 };
 
 export interface ClaudeSlotsOptions {
@@ -536,7 +543,12 @@ function parseUnclaimed(text: string): UnclaimedRecord {
   const record = value as Record<string, unknown>;
   if (typeof record.credential !== 'string' || !record.credential) throw new Error('unclaimed stash is malformed');
   if (record.consumedFp != null && typeof record.consumedFp !== 'string') throw new Error('unclaimed stash is malformed');
-  return record.consumedFp ? { credential: record.credential, consumedFp: record.consumedFp } : { credential: record.credential };
+  if (record.accountId != null && (typeof record.accountId !== 'string' || /[\0/\\:]/.test(record.accountId))) throw new Error('unclaimed stash is malformed');
+  return {
+    credential: record.credential,
+    ...(record.consumedFp ? { consumedFp: record.consumedFp } : {}),
+    ...(record.accountId ? { accountId: record.accountId } : {}),
+  };
 }
 
 /**
@@ -716,27 +728,70 @@ export class ClaudeSlots {
     }));
   }
 
-  /** S36: Keychain first; a private file is retained only if that write fails. */
-  async stashUnclaimed(timestamp: string, credential: string, consumedFp?: string): Promise<{ location: 'keychain' | 'file'; path?: string }> {
+  /**
+   * S36: reserve a durable, non-secret index row before Keychain first, then
+   * retain a private file only when the Keychain write fails. The reservation
+   * is create-only, so no process can overwrite another stash id.
+   */
+  async stashUnclaimed(
+    timestamp: string,
+    credential: string,
+    consumedFp?: string,
+    accountId?: string,
+  ): Promise<{ location: 'keychain' | 'file'; path?: string }> {
     this.assertTimestamp(timestamp);
-    const record = JSON.stringify({ credential, ...(consumedFp ? { consumedFp } : {}) });
+    if (accountId != null) assertSlotId(accountId);
+    const record = JSON.stringify({
+      credential, ...(consumedFp ? { consumedFp } : {}), ...(accountId ? { accountId } : {}),
+    });
+    const index: UnclaimedIndexEntry = {
+      provider: ANTHROPIC_PROVIDER, accountId: accountId ?? null, stashId: timestamp, consumedFp: consumedFp ?? '',
+      location: 'keychain', createdAt: this.now(),
+    };
+    let indexWritable = true;
     try {
-      await this.backend.set(this.unclaimedService(timestamp), QLB_KEYCHAIN_ACCOUNT, record);
-      return { location: 'keychain' };
-    } catch {
-      const path = this.filePath(timestamp);
-      await this.files.mkdir(this.options.stashDir, { recursive: true, mode: 0o700 });
-      await this.files.chmod(this.options.stashDir, 0o700);
-      try {
-        await this.files.writeFile(path, record, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
-      } catch (error) {
-        // Retrying a stash for the same timestamp may only replace an existing
-        // value through Keychain; never overwrite a file that might be newer.
-        throw new Error('unable to persist unclaimed credential');
+      await recordStash(this.indexRoot(), index);
+    } catch (error: unknown) {
+      if (error && typeof error === 'object' && (error as NodeJS.ErrnoException).code === 'EEXIST') {
+        throw new Error('unclaimed credential already exists');
       }
-      await this.files.chmod(path, 0o600);
-      return { location: 'file', path };
+      indexWritable = false;
     }
+    let keychainUsable = indexWritable;
+    if (keychainUsable) {
+      try {
+        await this.assertUnclaimedAbsent(timestamp);
+      } catch (error) {
+        if (error instanceof Error && /already exists/.test(error.message)) throw error;
+        keychainUsable = false;
+      }
+    }
+    if (keychainUsable) {
+      try {
+        await this.backend.set(this.unclaimedService(timestamp), QLB_KEYCHAIN_ACCOUNT, record);
+        return { location: 'keychain' };
+      } catch {
+        // The private file is the durable fallback for every Keychain write error.
+      }
+    }
+    const path = this.filePath(timestamp);
+    try {
+      await this.writeUnclaimedFile(path, record);
+    } catch (error: unknown) {
+      if (error && typeof error === 'object' && (error as NodeJS.ErrnoException).code === 'EEXIST') {
+        throw new Error('unclaimed credential already exists');
+      }
+      // Leave any index reservation behind as non-secret crash evidence.
+      throw new Error('unable to persist unclaimed credential');
+    }
+    // Discovery is best effort only after the fallback is durable. A legacy
+    // file remains discoverable by the pre-adoption scan if this update fails.
+    if (indexWritable) {
+      try { await recordStash(this.indexRoot(), { ...index, location: 'file' }, { replace: true }); } catch { /* file scan recovers it */ }
+    } else {
+      try { await recordStash(this.indexRoot(), { ...index, location: 'file' }); } catch { /* file scan recovers it */ }
+    }
+    return { location: 'file', path };
   }
 
   /** Moves any surviving S36 fallback files into Keychain without exposing their contents. */
@@ -751,8 +806,15 @@ export class ClaudeSlots {
       try {
         this.assertTimestamp(timestamp);
         const text = await this.files.readFile(join(this.options.stashDir, name), 'utf8');
-        parseUnclaimed(text);
+        const parsed = parseUnclaimed(text);
+        await this.assertUnclaimedAbsent(timestamp);
         await this.backend.set(this.unclaimedService(timestamp), QLB_KEYCHAIN_ACCOUNT, text);
+        const existing = (await listStashes(this.indexRoot(), ANTHROPIC_PROVIDER)).find((entry) => entry.stashId === timestamp);
+        await recordStash(this.indexRoot(), {
+          provider: ANTHROPIC_PROVIDER, accountId: existing?.accountId ?? parsed.accountId ?? null,
+          stashId: timestamp, consumedFp: parsed.consumedFp ?? '', location: 'keychain',
+          createdAt: existing?.createdAt ?? this.now(),
+        }, { replace: existing != null });
         await this.files.rm(join(this.options.stashDir, name), { force: true });
         swept += 1;
       } catch {
@@ -783,6 +845,45 @@ export class ClaudeSlots {
         return { cleanupPending: true };
       }
     });
+  }
+
+  private async writeUnclaimedFile(path: string, record: string): Promise<void> {
+    await this.files.mkdir(this.options.stashDir, { recursive: true, mode: 0o700 });
+    await this.files.chmod(this.options.stashDir, 0o700);
+    const temporary = `${path}.tmp.${process.pid}.${Math.random().toString(16).slice(2)}`;
+    try {
+      const handle = await this.files.open(temporary, 'wx', 0o600);
+      try {
+        await handle.writeFile(record, 'utf8');
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+      await this.files.link(temporary, path);
+      await this.files.chmod(path, 0o600);
+      await this.fsyncStashDirectory();
+    } finally {
+      await this.files.rm(temporary, { force: true });
+    }
+  }
+
+  private async fsyncStashDirectory(): Promise<void> {
+    const handle = await this.files.open(this.options.stashDir, 'r');
+    try { await handle.sync(); } finally { await handle.close(); }
+  }
+
+  private async assertUnclaimedAbsent(timestamp: string): Promise<void> {
+    try {
+      await this.backend.get(this.unclaimedService(timestamp), QLB_KEYCHAIN_ACCOUNT);
+    } catch (error) {
+      if (missingItem(error)) return;
+      throw new Error('unable to check unclaimed credential');
+    }
+    throw new Error('unclaimed credential already exists');
+  }
+
+  private indexRoot(): string {
+    return this.options.stashDir;
   }
 
   private async readExistingCredential(accountId: string): Promise<string | null> {
