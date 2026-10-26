@@ -25,6 +25,7 @@ import { installRelease as installReleaseForPlatform, readReleaseManifest, relea
 import { runReleaseCommand } from '../src/commands/release';
 import { releaseCurrentCheck } from '../src/checks/release-current';
 import type { CommandContext } from '../src/registry';
+import { openStore } from '../src/store';
 
 const QLB_HELPER_SIGNING = {
   authority: 'QLB Keychain Helper', binaryHash: 'a'.repeat(40), identityHash: 'b'.repeat(40),
@@ -192,19 +193,117 @@ describe('release install (AC45)', () => {
     mkdirSync(dirname(helper), { recursive: true });
     writeFileSync(helper, 'foreign fake helper bytes\n');
     const appDir = join(root, 'app');
-    let published = false;
+    let inspected = false;
 
     await assert.rejects(
       installRelease({
         sourceDir, appDir, sha: 'pinned-helper-sha', dbPath: join(root, 'db'),
-        helperConfigReader: () => 'c'.repeat(40),
+        helperConfigReader: () => QLB_HELPER_SIGNING.identityHash,
         verifyHelperIdentity: () => ({ trusted: false, reason: 'pinned leaf certificate did not verify' }),
-        verifyHelperSigning: () => { published = true; return QLB_HELPER_SIGNING; },
+        verifyHelperSigning: () => { inspected = true; return QLB_HELPER_SIGNING; },
       }),
       /helper pinned leaf certificate did not verify; run npm run build:helper or qlb keychain check-launchd/,
     );
-    assert.equal(published, false);
+    assert.equal(inspected, true);
     assert.equal(existsSync(join(appDir, 'pinned-helper-sha')), false);
+  });
+
+  it('records the verified helper leaf pin on a fresh release install', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-release-helper-pin-fresh-'));
+    const sourceDir = sourceBuild(root, 'pin-fresh-sha');
+    const helper = join(sourceDir, 'native', 'keychain-helper', 'build', 'qlb-keychain-helper');
+    const dbPath = join(root, 'qlb.db');
+    mkdirSync(dirname(helper), { recursive: true });
+    writeFileSync(helper, 'fake helper bytes\n');
+
+    await installRelease({
+      sourceDir, appDir: join(root, 'app'), sha: 'pin-fresh-sha', dbPath, ...validHelperVerifier,
+    });
+
+    const store = openStore(dbPath);
+    try {
+      assert.equal(store.getConfig('keychain.helperCheckIdentityHash'), QLB_HELPER_SIGNING.identityHash);
+    } finally { store.close(); }
+  });
+
+  it('keeps an equal recorded helper pin unchanged', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-release-helper-pin-equal-'));
+    const sourceDir = sourceBuild(root, 'pin-equal-sha');
+    const helper = join(sourceDir, 'native', 'keychain-helper', 'build', 'qlb-keychain-helper');
+    const dbPath = join(root, 'qlb.db');
+    mkdirSync(dirname(helper), { recursive: true });
+    writeFileSync(helper, 'fake helper bytes\n');
+    const before = openStore(dbPath);
+    before.setConfig('keychain.helperCheckIdentityHash', QLB_HELPER_SIGNING.identityHash);
+    before.close();
+
+    await installRelease({
+      sourceDir, appDir: join(root, 'app'), sha: 'pin-equal-sha', dbPath,
+      ...validHelperVerifier, verifyHelperIdentity: () => ({ trusted: true }),
+    });
+
+    const after = openStore(dbPath);
+    try {
+      assert.equal(after.getConfig('keychain.helperCheckIdentityHash'), QLB_HELPER_SIGNING.identityHash);
+    } finally { after.close(); }
+  });
+
+  it('refuses a different recorded helper pin with exit 3 and leaves it unchanged', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-release-helper-pin-changed-'));
+    const sourceDir = sourceBuild(root, 'pin-changed-sha');
+    const helper = join(sourceDir, 'native', 'keychain-helper', 'build', 'qlb-keychain-helper');
+    const dbPath = join(root, 'qlb.db');
+    const recordedPin = 'c'.repeat(40);
+    mkdirSync(dirname(helper), { recursive: true });
+    writeFileSync(helper, 'fake helper bytes\n');
+    const before = openStore(dbPath);
+    before.setConfig('keychain.helperCheckIdentityHash', recordedPin);
+    before.close();
+    const errors: string[] = [];
+    const ctx: CommandContext = {
+      stdout: () => {}, stderr: (line) => errors.push(line), env: { QLB_TEST_MODE: '1', QLB_HOME: root },
+      config: { dbPath } as CommandContext['config'], loadConfig: () => { throw new Error('not used'); }, home: root,
+      registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
+    };
+
+    const code = await runReleaseCommand(['install', '--sha', 'pin-changed-sha'], ctx, {
+      sourceDir,
+      install: (options) => installRelease({ ...options, ...validHelperVerifier }),
+      shaForSource: () => 'pin-changed-sha',
+    });
+
+    assert.equal(code, 3);
+    assert.deepEqual(errors, ['qlb release: helper-identity-changed']);
+    const after = openStore(dbPath);
+    try {
+      assert.equal(after.getConfig('keychain.helperCheckIdentityHash'), recordedPin);
+    } finally { after.close(); }
+    assert.equal(existsSync(join(root, 'app', 'pin-changed-sha')), false);
+  });
+
+  it('refuses an unreadable helper leaf hash without recording a pin', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-release-helper-pin-unreadable-'));
+    const sourceDir = sourceBuild(root, 'pin-unreadable-sha');
+    const helper = join(sourceDir, 'native', 'keychain-helper', 'build', 'qlb-keychain-helper');
+    const dbPath = join(root, 'qlb.db');
+    mkdirSync(dirname(helper), { recursive: true });
+    writeFileSync(helper, 'fake helper bytes\n');
+    const store = openStore(dbPath);
+    store.close();
+
+    await assert.rejects(
+      installRelease({
+        sourceDir, appDir: join(root, 'app'), sha: 'pin-unreadable-sha', dbPath,
+        verifyHelperSigning: () => ({ ...QLB_HELPER_SIGNING, identityHash: '' }),
+      }),
+      /helper identity hash is unavailable/,
+    );
+
+    const after = openStore(dbPath);
+    try {
+      assert.equal(after.getConfig('keychain.helperCheckIdentityHash'), null);
+    } finally { after.close(); }
+    assert.equal(existsSync(join(root, 'app', 'pin-unreadable-sha')), false);
   });
 
   it('refuses a helper reached through a symlinked ancestor outside the checkout', async () => {

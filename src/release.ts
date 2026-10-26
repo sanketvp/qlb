@@ -23,7 +23,7 @@ import {
   type HelperIdentityVerification,
   type HelperSigningState,
 } from './diagnostics';
-import { backupBeforeMigrate } from './store';
+import { backupBeforeMigrate, openStore } from './store';
 
 const BUILD_STAMP = '.build-sha';
 const RELEASE_MANIFEST = 'release.json';
@@ -262,7 +262,8 @@ function copyReleaseContents(
   helperConfigReader: (key: string) => string | null = () => null,
   verifyPinnedHelperIdentity: (path: string, pin: string) => HelperIdentityVerification = verifyHelperIdentity,
   platform: NodeJS.Platform = process.platform,
-): void {
+): HelperSigningState | null {
+  let helperSigning: HelperSigningState | null = null;
   const checkoutRoot = realpathSync(sourceDir);
   copyContained(join(sourceDir, 'dist'), join(stagingDir, 'dist'), checkoutRoot);
   if (existsSync(join(sourceDir, 'package.json'))) {
@@ -283,26 +284,45 @@ function copyReleaseContents(
     // Checking the resolved file catches a symlink at any ancestor, not merely at the leaf.
     const resolvedHelper = realpathSync(helper);
     assertPathInside(checkoutRoot, resolvedHelper, helper);
+    const signing = verifyHelperSigning(resolvedHelper);
+    if (!signing) {
+      throw new ReleaseIntegrityError('helper not signed; run npm run build:helper');
+    }
+    if (signing.authority !== 'QLB Keychain Helper') {
+      throw new ReleaseIntegrityError(`helper signed by ${signing.authority}, expected QLB Keychain Helper; run npm run build:helper`);
+    }
+    // This is the same leaf hash the green helper matrix records. Do not create
+    // a pin unless codesign supplied the complete SHA-1 leaf identity.
+    if (!/^[0-9a-f]{40}$/.test(signing.identityHash)) {
+      throw new ReleaseIntegrityError('helper identity hash is unavailable; run npm run build:helper');
+    }
     const pin = helperConfigReader('keychain.helperCheckIdentityHash');
     if (pin) {
+      if (pin !== signing.identityHash) throw new ReleaseIntegrityError('helper-identity-changed');
       const verification = verifyPinnedHelperIdentity(resolvedHelper, pin);
       if (!verification.trusted) {
         throw new ReleaseIntegrityError(`helper ${verification.reason}; run npm run build:helper or qlb keychain check-launchd`);
       }
-    } else {
-      const signing = verifyHelperSigning(resolvedHelper);
-      if (!signing) {
-        throw new ReleaseIntegrityError('helper not signed; run npm run build:helper');
-      }
-      if (signing.authority !== 'QLB Keychain Helper') {
-        throw new ReleaseIntegrityError(`helper signed by ${signing.authority}, expected QLB Keychain Helper; run npm run build:helper`);
-      }
     }
+    helperSigning = signing;
     const installedHelper = join(stagingDir, 'native', 'keychain-helper', 'build', 'qlb-keychain-helper');
     copyContained(resolvedHelper, installedHelper, checkoutRoot);
     chmodSync(installedHelper, 0o755);
   }
   copyRuntimeDependencies(sourceDir, stagingDir);
+  return helperSigning;
+}
+
+/** Establishes the release-verified leaf pin without silently rotating an existing pin. */
+function recordHelperIdentityHash(dbPath: string, identityHash: string): void {
+  const store = openStore(dbPath);
+  try {
+    const recorded = store.getConfig('keychain.helperCheckIdentityHash');
+    if (recorded && recorded !== identityHash) throw new ReleaseIntegrityError('helper-identity-changed');
+    if (!recorded) store.setConfig('keychain.helperCheckIdentityHash', identityHash);
+  } finally {
+    store.close();
+  }
 }
 
 function digestTree(root: string, paths: string[]): string {
@@ -407,7 +427,7 @@ export async function installRelease(options: ReleaseInstallOptions): Promise<Re
   let staged = true;
   try {
     mkdirSync(stagingDir, { mode: 0o755 });
-    copyReleaseContents(
+    const helperSigning = copyReleaseContents(
       options.sourceDir,
       stagingDir,
       options.verifyHelperSigning,
@@ -426,6 +446,7 @@ export async function installRelease(options: ReleaseInstallOptions): Promise<Re
     if (existsSync(options.dbPath)) {
       backupPath = await (options.backup ?? backupBeforeMigrate)(options.dbPath);
     }
+    if (helperSigning) recordHelperIdentityHash(options.dbPath, helperSigning.identityHash);
 
     if (!existsSync(releaseDir)) {
       writeFileSync(join(stagingDir, RELEASE_MANIFEST), `${JSON.stringify({ sha: options.sha, digest: sourceDigest })}\n`, { mode: 0o644 });
