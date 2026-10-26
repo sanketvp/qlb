@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
-import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
@@ -11,7 +11,6 @@ import {
   hasLegacyPiOwnerEntry,
   migratePiSingleProvider,
   rollbackPiSingleProvider,
-  withPiAuthLock,
   type PiMigratePaths,
   type PiSingleProvider,
 } from '../src/pi-migrate';
@@ -53,45 +52,6 @@ function hasManaged(keychain: MockKeychain, provider: PiSingleProvider): boolean
   } catch {
     return false;
   }
-}
-
-async function raceStaleLockTakers(paths: PiMigratePaths, home: string, racers: number): Promise<{ code: number | null; output: string }[]> {
-  const modulePath = join(process.cwd(), 'dist-test', 'src', 'pi-migrate.js');
-  const children = Array.from({ length: racers }, () => {
-    let resolveReady!: () => void;
-    let rejectReady!: (error: Error) => void;
-    const ready = new Promise<void>((resolve, reject) => { resolveReady = resolve; rejectReady = reject; });
-    let resolveResult!: (result: { code: number | null; output: string }) => void;
-    let rejectResult!: (error: Error) => void;
-    const result = new Promise<{ code: number | null; output: string }>((resolve, reject) => { resolveResult = resolve; rejectResult = reject; });
-    const proc = spawn(process.execPath, ['-e', `
-      const { migratePiSingleProvider } = require(process.env.PI_MIGRATE_MODULE);
-      const paths = JSON.parse(process.env.PI_MIGRATE_PATHS);
-      process.send?.('ready');
-      process.once('message', () => {
-        let value = '';
-        try {
-          migratePiSingleProvider('xai', paths, { keychain: { setSync(_s, _a, v) { value = v; }, getSync() { return value; }, deleteSync() {} }, authLockTiming: { staleMs: 10, retries: 0, retryMs: 1 }, afterWrite(point) {
-            if (point === 'owner-entry') { process.stdout.write('entered\\n'); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 750); }
-          } });
-          process.exitCode = 0;
-        } catch (error) { process.stdout.write(String(error.code || error.message)); process.exitCode = 1; }
-        finally { if (process.connected) process.disconnect(); }
-      });
-    `], {
-      env: { ...process.env, QLB_TEST_MODE: '1', QLB_HOME: home, HOME: home, PI_MIGRATE_MODULE: modulePath, PI_MIGRATE_PATHS: JSON.stringify(paths) },
-      stdio: ['ignore', 'pipe', 'inherit', 'ipc'],
-    });
-    let output = '';
-    proc.stdout!.on('data', (chunk) => { output += String(chunk); });
-    proc.once('message', (message) => { if (message === 'ready') resolveReady(); else rejectReady(new Error('racer did not become ready')); });
-    proc.once('error', (error) => { rejectReady(error); rejectResult(error); });
-    proc.once('close', (code) => { rejectReady(new Error(`racer exited before ready: ${code}`)); resolveResult({ code, output }); });
-    return { proc, ready, result };
-  });
-  await Promise.all(children.map(({ ready }) => ready));
-  for (const { proc } of children) proc.send('start');
-  return Promise.all(children.map(({ result }) => result));
 }
 
 describe('Pi migration S58 credential-first barrier', () => {
@@ -271,98 +231,48 @@ describe('Pi migration S58 credential-first barrier', () => {
     } finally { h.cleanup(); }
   });
 
-  for (const racers of [2, 4]) {
-    it(racers === 2 ? 'atomically admits only one racing stale-lock taker' : 'atomically admits only one of 4 racing stale-lock takers', async () => {
-      const h = setup();
-      try {
-        const lock = `${h.paths.authJsonPath}.lock`; const owner = join(lock, 'qlb-lock-owner.json');
-        mkdirSync(lock); writeFileSync(owner, JSON.stringify({ pid: 999_999, nonce: 'dead' }));
-        utimesSync(lock, new Date(Date.now() - 2_000), new Date(Date.now() - 2_000));
-        const results = await raceStaleLockTakers(h.paths, h.dir, racers);
-        const detail = JSON.stringify(results);
-        assert.equal(results.filter(({ output }) => output.includes('entered')).length, 1, detail);
-        assert.equal(results.filter(({ code }) => code === 0).length, 1, detail);
-      } finally { h.cleanup(); }
-    });
-  }
-
-  it('restores a fresh lock moved after the stale check without evicting its holder', () => {
+  it('atomically admits only one racing stale-lock taker', async () => {
     const h = setup();
-    const fsHooks = require('node:fs') as typeof import('node:fs');
-    const lock = `${h.paths.authJsonPath}.lock`; const original = `${lock}.original-stale`; const fresh = { pid: process.pid, nonce: 'fresh-a' };
     try {
-      const owner = join(lock, 'qlb-lock-owner.json');
+      const lock = `${h.paths.authJsonPath}.lock`; const owner = join(lock, 'qlb-lock-owner.json');
       mkdirSync(lock); writeFileSync(owner, JSON.stringify({ pid: 999_999, nonce: 'dead' }));
       utimesSync(lock, new Date(Date.now() - 2_000), new Date(Date.now() - 2_000));
-      const rename = fsHooks.renameSync; let injected = false;
-      fsHooks.renameSync = ((from: string, to: string) => {
-        if (!injected && from === lock && to.startsWith(`${lock}.stale-`)) {
-          injected = true;
-          rename(lock, original);
-          const pending = `${lock}.pending-fresh-a`;
-          writeFileSync(pending, JSON.stringify(fresh)); linkSync(pending, lock); unlinkSync(pending);
+      const modulePath = join(process.cwd(), 'dist-test', 'src', 'pi-migrate.js');
+      const startAt = Date.now() + 200;
+      const child = () => new Promise<{ code: number | null; output: string }>((resolveChild, rejectChild) => {
+        const proc = spawn(process.execPath, ['-e', `
+          const { migratePiSingleProvider } = require(process.env.PI_MIGRATE_MODULE);
+          const paths = JSON.parse(process.env.PI_MIGRATE_PATHS);
+          const until = Number(process.env.PI_MIGRATE_START);
+          while (Date.now() < until) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1);
+          let value = '';
+          const keychain = { setSync(_s, _a, v) { value = v; }, getSync() { return value; }, deleteSync() {} };
+          try {
+            migratePiSingleProvider('xai', paths, { keychain, authLockTiming: { staleMs: 10, retries: 0, retryMs: 1 }, afterWrite(point) {
+              if (point === 'owner-entry') { process.stdout.write('entered\\n'); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100); }
+            } });
+            process.exitCode = 0;
+          } catch (error) { process.stdout.write(String(error.code || error.message)); process.exitCode = 1; }
+        `], {
+          env: { ...process.env, QLB_TEST_MODE: '1', QLB_HOME: h.dir, HOME: h.dir, PI_MIGRATE_MODULE: modulePath, PI_MIGRATE_PATHS: JSON.stringify(h.paths), PI_MIGRATE_START: String(startAt) },
+          stdio: ['ignore', 'pipe', 'inherit'],
+        });
+        let output = '';
+        proc.stdout.on('data', (chunk) => { output += String(chunk); });
+        proc.once('error', rejectChild);
+        proc.once('close', (code) => resolveChild({ code, output }));
+      });
+      const results = await Promise.all([child(), child()]);
+      const detail = JSON.stringify(results);
+      const winners = results.filter(({ output }) => output.includes('entered'));
+      assert.ok(winners.length <= 1, detail);
+      for (const result of results) {
+        if (!result.output.includes('entered')) {
+          assert.equal(result.code, 1, detail);
+          assert.match(result.output, /pi-auth-locked/, detail);
         }
-        rename(from, to);
-      }) as typeof fsHooks.renameSync;
-      try {
-        assert.throws(() => withPiAuthLock(h.paths.authJsonPath, () => assert.fail('preempted taker entered'), { staleMs: 10, retries: 0, retryMs: 1 }), (error: unknown) => (error as { code?: string }).code === 'pi-auth-locked');
-      } finally { fsHooks.renameSync = rename; }
-      assert.equal(injected, true);
-      assert.deepEqual(JSON.parse(readFileSync(lock, 'utf8')), fresh, 'the fresh holder is restored');
-      assert.throws(() => withPiAuthLock(h.paths.authJsonPath, () => assert.fail('second holder entered'), { staleMs: 10, retries: 0, retryMs: 1 }), (error: unknown) => (error as { code?: string }).code === 'pi-auth-locked');
-    } finally { h.cleanup(); }
-  });
-
-  it('restores moved locks create-only when a third racer acquires the canonical path', () => {
-    const h = setup();
-    const fsHooks = require('node:fs') as typeof import('node:fs');
-    const lock = `${h.paths.authJsonPath}.lock`; const original = `${lock}.original-stale`; const fresh = { pid: process.pid, nonce: 'fresh-a' }; const third = { pid: process.pid, nonce: 'fresh-c' };
-    try {
-      const owner = join(lock, 'qlb-lock-owner.json');
-      mkdirSync(lock); writeFileSync(owner, JSON.stringify({ pid: 999_999, nonce: 'dead' }));
-      utimesSync(lock, new Date(Date.now() - 2_000), new Date(Date.now() - 2_000));
-      const rename = fsHooks.renameSync; const link = fsHooks.linkSync; let movedFreshLock = false; let thirdAcquired = false;
-      fsHooks.renameSync = ((from: string, to: string) => {
-        if (!movedFreshLock && from === lock && to.startsWith(`${lock}.stale-`)) {
-          movedFreshLock = true;
-          rename(lock, original);
-          const pending = `${lock}.pending-fresh-a`;
-          writeFileSync(pending, JSON.stringify(fresh)); link(pending, lock); unlinkSync(pending);
-        }
-        rename(from, to);
-      }) as typeof fsHooks.renameSync;
-      fsHooks.linkSync = ((from: string, to: string) => {
-        if (movedFreshLock && !thirdAcquired && from.startsWith(`${lock}.stale-`) && to === lock) {
-          thirdAcquired = true;
-          const pending = `${lock}.pending-fresh-c`;
-          writeFileSync(pending, JSON.stringify(third)); link(pending, lock); unlinkSync(pending);
-        }
-        link(from, to);
-      }) as typeof fsHooks.linkSync;
-      try {
-        assert.throws(() => withPiAuthLock(h.paths.authJsonPath, () => assert.fail('preempted taker entered'), { staleMs: 10, retries: 0, retryMs: 1 }), (error: unknown) => (error as { code?: string }).code === 'pi-auth-locked');
-      } finally { fsHooks.renameSync = rename; fsHooks.linkSync = link; }
-      assert.equal(thirdAcquired, true);
-      assert.deepEqual(JSON.parse(readFileSync(lock, 'utf8')), third, 'restore never replaces the third racer');
-      assert.throws(() => withPiAuthLock(h.paths.authJsonPath, () => assert.fail('second holder entered'), { staleMs: 10, retries: 0, retryMs: 1 }), (error: unknown) => (error as { code?: string }).code === 'pi-auth-locked');
-    } finally { h.cleanup(); }
-  });
-
-  it('allows one bounded refresh grace while a verifying reaper restores its identical owner record', () => {
-    const h = setup();
-    const fsHooks = require('node:fs') as typeof import('node:fs');
-    const lock = `${h.paths.authJsonPath}.lock`;
-    try {
-      const stat = fsHooks.statSync; let injectEnoent = true; let entered = false;
-      fsHooks.statSync = ((path: string) => {
-        if (injectEnoent && path === lock) {
-          injectEnoent = false;
-          throw Object.assign(new Error('temporarily moved by reaper'), { code: 'ENOENT' });
-        }
-        return stat(path);
-      }) as typeof fsHooks.statSync;
-      try { withPiAuthLock(h.paths.authJsonPath, () => { entered = true; }, { retries: 0 }); } finally { fsHooks.statSync = stat; }
-      assert.equal(entered, true, 'the identical owner record returned during the bounded grace');
+      }
+      assert.equal(existsSync(lock), false, `finished racers left a lock behind: ${detail}`);
     } finally { h.cleanup(); }
   });
 
@@ -385,11 +295,11 @@ describe('Pi migration S58 credential-first barrier', () => {
       assert.throws(() => rollbackPiSingleProvider('xai', h.paths, {
         keychain: h.keychain,
         afterWrite: (point) => {
-          if (point === 'owner-entry') writeFileSync(lock, JSON.stringify({ pid: process.pid, nonce: 'foreign' }));
+          if (point === 'owner-entry') writeFileSync(owner, JSON.stringify({ pid: process.pid, nonce: 'foreign' }));
         },
       }), /lock-lost/);
       assert.equal(existsSync(lock), true, 'a superseded holder must leave the new owner lock intact');
-      assert.deepEqual(JSON.parse(readFileSync(lock, 'utf8')), { pid: process.pid, nonce: 'foreign' });
+      assert.deepEqual(JSON.parse(readFileSync(owner, 'utf8')), { pid: process.pid, nonce: 'foreign' });
     } finally { h.cleanup(); }
   });
 

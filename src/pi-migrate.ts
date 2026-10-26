@@ -2,7 +2,7 @@
 // Credential bytes live only in the Keychain and the 0600 baseline file.
 
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, linkSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { execFileSync } from 'node:child_process';
 
@@ -87,29 +87,14 @@ function sleepSync(ms: number): void { Atomics.wait(new Int32Array(new SharedArr
 function lockedError(): Error { return Object.assign(new Error('pi-auth-locked'), { code: 'pi-auth-locked', name: 'PiAuthLockedError' }); }
 function lockLostError(): Error { return Object.assign(new Error('lock-lost'), { code: 'pi-auth-lock-lost', name: 'PiAuthLockLostError' }); }
 interface AuthLockOwner { pid: number; nonce: string; }
-interface AuthLockSnapshot { owner: AuthLockOwner | null; dev: number; ino: number; }
 function lockOwnerPath(lock: string): string { return join(lock, 'qlb-lock-owner.json'); }
-/** Read the owner record and its stable identity (the file itself for new-format locks). */
-function readLockSnapshot(lock: string): AuthLockSnapshot | null {
+function readLockOwner(lock: string): AuthLockOwner | null {
   try {
-    const record = statSync(lock).isDirectory() ? lockOwnerPath(lock) : lock;
-    const before = statSync(record);
-    const parsed = JSON.parse(readFileSync(record, 'utf8')) as unknown;
-    const after = statSync(record);
-    if (before.dev !== after.dev || before.ino !== after.ino) return null;
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { owner: null, dev: before.dev, ino: before.ino };
+    const parsed = JSON.parse(readFileSync(lockOwnerPath(lock), 'utf8')) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
     const { pid, nonce } = parsed as { pid?: unknown; nonce?: unknown };
-    const owner = typeof pid === 'number' && Number.isInteger(pid) && pid > 0 && typeof nonce === 'string' && nonce.length > 0 ? { pid, nonce } : null;
-    return { owner, dev: before.dev, ino: before.ino };
+    return typeof pid === 'number' && Number.isInteger(pid) && pid > 0 && typeof nonce === 'string' && nonce.length > 0 ? { pid, nonce } : null;
   } catch { return null; }
-}
-/** Read either the legacy directory owner record or the atomic file lock record. */
-function readLockOwner(lock: string): AuthLockOwner | null { return readLockSnapshot(lock)?.owner ?? null; }
-/** Link a complete owner record into place, so a contender never observes a new ownerless lock. */
-function createAuthLock(lock: string, owner: AuthLockOwner): void {
-  const pending = `${lock}.pending-${owner.nonce}`;
-  writeFileSync(pending, `${JSON.stringify(owner)}\n`, { mode: 0o600, flag: 'wx' });
-  try { linkSync(pending, lock); } finally { rmSync(pending, { force: true }); }
 }
 function ownerMatches(lock: string, owner: AuthLockOwner): boolean {
   const actual = readLockOwner(lock);
@@ -118,29 +103,15 @@ function ownerMatches(lock: string, owner: AuthLockOwner): boolean {
 function ownerIsDead(owner: AuthLockOwner): boolean {
   try { process.kill(owner.pid, 0); return false; } catch (error) { return (error as NodeJS.ErrnoException).code === 'ESRCH'; }
 }
-function staleLockOwner(lock: string, staleMs: number): AuthLockSnapshot | undefined {
+function staleLockOwner(lock: string, staleMs: number): AuthLockOwner | null | undefined {
   try {
     if (Date.now() - statSync(lock).mtimeMs <= staleMs) return undefined;
-    const snapshot = readLockSnapshot(lock);
-    return snapshot && (snapshot.owner === null || ownerIsDead(snapshot.owner)) ? snapshot : undefined;
+    const owner = readLockOwner(lock);
+    return owner === null || ownerIsDead(owner) ? owner : undefined;
   } catch { return undefined; }
 }
 function sameOwner(left: AuthLockOwner | null, right: AuthLockOwner | null): boolean {
   return left === null ? right === null : right?.pid === left.pid && right.nonce === left.nonce;
-}
-function sameLockSnapshot(left: AuthLockSnapshot, right: AuthLockSnapshot | null): boolean {
-  return !!right && left.dev === right.dev && left.ino === right.ino && sameOwner(left.owner, right.owner);
-}
-/** Restore only through a no-replace link: never overwrite a racer at lock. */
-function restoreMovedFileLock(stalePath: string, lock: string): void {
-  try { linkSync(stalePath, lock); } catch (error) {
-    // EEXIST means a third racer won the canonical path; discard our moved
-    // record rather than replacing that racer. Other failures retain it for
-    // diagnosis rather than deleting an un-restored record.
-    if ((error as NodeJS.ErrnoException).code === 'EEXIST') try { unlinkSync(stalePath); } catch { /* best effort */ }
-    return;
-  }
-  try { unlinkSync(stalePath); } catch { /* a successful link keeps the owner record safe */ }
 }
 /** Atomically move a stale lock aside; only the rename winner may remove it. */
 function takeOverStaleLock(lock: string, staleMs: number, nonce: string): boolean {
@@ -148,18 +119,16 @@ function takeOverStaleLock(lock: string, staleMs: number, nonce: string): boolea
   if (expected === undefined) return false;
   const stalePath = `${lock}.stale-${nonce}`;
   try { renameSync(lock, stalePath); } catch { return false; }
-  // rename is not conditional, so prove that we moved the exact record that
-  // was judged stale. A mismatch is a fresh racer's lock and must be restored.
-  if (!sameLockSnapshot(expected, readLockSnapshot(stalePath))) {
-    restoreMovedFileLock(stalePath, lock);
-    return false;
-  }
   const confirmed = staleLockOwner(stalePath, staleMs);
-  if (confirmed !== undefined && sameLockSnapshot(expected, confirmed)) {
+  if (confirmed !== undefined && sameOwner(expected, confirmed)) {
     rmSync(stalePath, { recursive: true, force: true });
     return true;
   }
-  restoreMovedFileLock(stalePath, lock);
+  // A live owner raced in after our initial check. Restore its lock only if
+  // nobody acquired the canonical path while it was moved aside.
+  if (!existsSync(lock)) {
+    try { renameSync(stalePath, lock); } catch { /* another taker acquired it */ }
+  }
   return false;
 }
 export function withPiAuthLock<T>(authPath: string, fn: (refresh: () => void) => T, timing: AuthLockTiming = {}): T {
@@ -168,7 +137,8 @@ export function withPiAuthLock<T>(authPath: string, fn: (refresh: () => void) =>
   let acquired = false;
   for (let attempt = 0; attempt <= retries; attempt += 1) {
     try {
-      createAuthLock(lock, owner);
+      mkdirSync(lock, { recursive: false, mode: 0o700 });
+      writeFileSync(lockOwnerPath(lock), `${JSON.stringify(owner)}\n`, { mode: 0o600 });
       acquired = true;
       break;
     } catch (error) {
@@ -180,13 +150,7 @@ export function withPiAuthLock<T>(authPath: string, fn: (refresh: () => void) =>
   }
   if (!acquired) throw lockedError();
   const refresh = () => {
-    if (!ownerMatches(lock, owner)) {
-      // A verifying reaper can temporarily move our identical file record.
-      // Wait at most 5 ms and re-read once; any remaining foreign/missing
-      // record is still a lost lock.
-      sleepSync(5);
-      if (!ownerMatches(lock, owner)) throw lockLostError();
-    }
+    if (!ownerMatches(lock, owner)) throw lockLostError();
     utimesSync(lock, new Date(), new Date());
   };
   try { refresh(); return fn(refresh); } finally { if (ownerMatches(lock, owner)) rmSync(lock, { recursive: true, force: true }); }
