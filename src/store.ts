@@ -2060,9 +2060,9 @@ export class Store {
     writeKeychain: () => void; restoreKeychain: () => void;
   }): void {
     const ts = input.ts ?? Date.now();
-    let keychainWriteStarted = false;
-    try {
-      this.runImmediate(() => {
+    this.runImmediate(() => {
+      let keychainWriteStarted = false;
+      try {
         const updated = this.db.prepare(`UPDATE codex_slots SET fingerprint = ?, prev_fingerprint = ?, last_refresh = ?,
           dead = 0, dead_reason = NULL, dead_at = NULL, healed_at = CASE WHEN dead != 0 THEN ? ELSE healed_at END,
           pending_adopt = 0, archived_at = NULL, last_active_at = ?
@@ -2085,11 +2085,19 @@ export class Store {
             VALUES (?, 'openai-codex', ?, 'external-login', ?, ?, NULL)`)
             .run(ts, input.accountId, input.reloginEvidence, input.reloginEvidence);
         }
-      });
-    } catch (error) {
-      if (keychainWriteStarted) input.restoreKeychain();
-      throw error;
-    }
+      } catch (error) {
+        if (keychainWriteStarted) {
+          try {
+            // Keep the SQLite write lock until the compensating write has
+            // either restored our bytes or observed a newer adopter's bytes.
+            input.restoreKeychain();
+          } catch (restoreError) {
+            if (error && typeof error === 'object') Object.assign(error, { restoreError });
+          }
+        }
+        throw error;
+      }
+    });
   }
 
   /** Mark every successful import-active observation as the live Codex slot. */

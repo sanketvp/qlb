@@ -59,12 +59,11 @@ async function execute(args: string[], ctx: CommandContext): Promise<number> {
       return 3;
     }
     const plan = planImportActiveCodex(active.doc);
-    // Attribute against the slot active_login names, not merely the live
-    // identity, so S56 can move ownership when native Codex drifted.
-    const activeSlotId = store.getCodexActiveLogin();
-    const existing = (activeSlotId == null ? null : store.getCodexSlot(activeSlotId))
-      ?? store.getCodexSlot(plan.slotId);
-    if (!existing) {
+    // The live document's identity decides whether this is a new import. An
+    // existing active_login names a different account during ordinary drift;
+    // it must not prevent a newly logged-in account from becoming a slot.
+    const ownSlot = store.getCodexSlot(plan.slotId);
+    if (!ownSlot) {
       const result = importActiveCodexSlot(active.doc, {
         store,
         keychain: platformKeychain,
@@ -74,8 +73,9 @@ async function execute(args: string[], ctx: CommandContext): Promise<number> {
       return 0;
     }
 
+    const activeSlotId = store.getCodexActiveLogin();
     const stored = parseCodexAuth(platformKeychain.getSync(
-      qlbKeychainService('openai-codex', existing.accountId), QLB_KEYCHAIN_ACCOUNT,
+      qlbKeychainService('openai-codex', ownSlot.accountId), QLB_KEYCHAIN_ACCOUNT,
     ));
     if (!stored.ok) {
       ctx.stderr('codex import-active refused: stored managed slot is malformed');
@@ -84,10 +84,15 @@ async function execute(args: string[], ctx: CommandContext): Promise<number> {
     const attribution = await attributeLiveDocument({
       store,
       keychain: platformKeychain,
-      slot: { accountId: existing.accountId, document: stored.doc, fingerprint: existing.fingerprint ?? undefined },
+      slot: { accountId: ownSlot.accountId, document: stored.doc, fingerprint: ownSlot.fingerprint ?? undefined },
+      activeSlotId: activeSlotId != null && store.getCodexSlot(activeSlotId) ? activeSlotId : undefined,
       live: active.doc,
       republish: (document) => writeCodexAuthAtomic(codexAuthPath(ctx), document).then(() => undefined),
     });
+    if (attribution.action === 'slot-split' || attribution.disposition === 'slot-split') {
+      ctx.stderr('codex import-active refused: slot-split');
+      return 3;
+    }
     const result = { ...plan, action: attribution.action };
     ctx.stdout(opts.json ? JSON.stringify(result) : `${attribution.action} ${plan.slotId}`);
     return 0;

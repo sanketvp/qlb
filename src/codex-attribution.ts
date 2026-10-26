@@ -2,6 +2,7 @@
 // observations extend the lineage graph rather than rejecting ordinary rotations.
 
 import { authTime, codexFingerprint, codexIdentity, parseCodexAuth, type CodexAuthDocument } from './codex-auth';
+import { isCredentialNotFound } from './credential-backends';
 import { QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, type KeychainBackend } from './keychain';
 import { externalLoginCheck, isSuccessor, type HolderObservation } from './lineage-log';
 import type { Store } from './store';
@@ -10,7 +11,7 @@ const PROVIDER = 'openai-codex';
 
 type Keychain = Pick<KeychainBackend, 'getSync' | 'setSync' | 'deleteSync'>;
 
-export type CodexAttributionAction = 'noop' | 'republish-slot' | 'adopt' | 'drift' | 'unclaimed' | 'wiped';
+export type CodexAttributionAction = 'noop' | 'republish-slot' | 'adopt' | 'drift' | 'unclaimed' | 'wiped' | 'slot-split';
 
 export interface ManagedCodexDocument {
   /** S29 composite identity of the managed slot. */
@@ -24,6 +25,8 @@ export interface AttributeLiveDocumentInput {
   store: Store;
   keychain: Keychain;
   slot: ManagedCodexDocument;
+  /** The active_login identity when it differs from the live identity's known slot. */
+  activeSlotId?: string;
   /** `null` is the stable-reader's tokens-empty/wiped result. */
   live: CodexAuthDocument | null;
   /** Holder facts around the two observations, injected by the session watcher. */
@@ -70,7 +73,7 @@ function optionalKeychainValue(keychain: Keychain, service: string): string | un
   try {
     return keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT);
   } catch (error) {
-    if (error instanceof Error && /item not found/.test(error.message)) return undefined;
+    if (isCredentialNotFound(error)) return undefined;
     throw error;
   }
 }
@@ -89,6 +92,24 @@ async function attributeSameSlot(input: AttributeLiveDocumentInput): Promise<Cod
   const live = input.live;
   if (!live) return { action: 'wiped', accountId: input.slot.accountId };
 
+  const service = qlbKeychainService(PROVIDER, input.slot.accountId);
+  // A DB/Keychain split must be resolved before either nooping or republishing:
+  // both actions otherwise claim authority for bytes that are not in the slot.
+  if (codexFingerprint(input.slot.document) !== slotFp) {
+    const liveFp = codexFingerprint(live);
+    let recorded: CodexAuthDocument | undefined = liveFp === slotFp ? live : undefined;
+    if (!recorded) {
+      const previous = optionalKeychainValue(input.keychain, `${service}:prev`);
+      if (previous !== undefined) {
+        const parsed = parseCodexAuth(previous);
+        if (parsed.ok && codexFingerprint(parsed.doc) === slotFp) recorded = parsed.doc;
+      }
+    }
+    if (!recorded) return { action: 'slot-split', accountId: input.slot.accountId };
+    input.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(recorded));
+    return attributeSameSlot({ ...input, slot: { ...input.slot, document: recorded } });
+  }
+
   const now = (input.now ?? Date.now)();
   const liveFp = codexFingerprint(live);
   if (slotFp === liveFp) {
@@ -104,10 +125,10 @@ async function attributeSameSlot(input: AttributeLiveDocumentInput): Promise<Cod
     return { action: 'republish-slot', accountId: input.slot.accountId };
   }
 
-  const service = qlbKeychainService(PROVIDER, input.slot.accountId);
   const currentBefore = input.keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT);
   const previousService = `${service}:prev`;
   const previousBefore = optionalKeychainValue(input.keychain, previousService);
+  const currentWritten = JSON.stringify(live);
   let wroteCurrent = false;
   let wrotePrevious = false;
   input.store.adoptCodexSlotWithKeychain({
@@ -125,12 +146,16 @@ async function attributeSameSlot(input: AttributeLiveDocumentInput): Promise<Cod
         input.keychain.setSync(previousService, QLB_KEYCHAIN_ACCOUNT, currentBefore);
         wrotePrevious = true;
       }
-      input.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(live));
+      input.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, currentWritten);
       wroteCurrent = true;
     },
     restoreKeychain: () => {
-      if (wroteCurrent) input.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, currentBefore);
-      if (wrotePrevious) {
+      // A later adopter may have committed after our write. Never replace its
+      // current or predecessor document while compensating this failed attempt.
+      if (wroteCurrent && input.keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT) === currentWritten) {
+        input.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, currentBefore);
+      }
+      if (wrotePrevious && optionalKeychainValue(input.keychain, previousService) === currentBefore) {
         if (previousBefore === undefined) input.keychain.deleteSync(previousService, QLB_KEYCHAIN_ACCOUNT);
         else input.keychain.setSync(previousService, QLB_KEYCHAIN_ACCOUNT, previousBefore);
       }
@@ -149,7 +174,13 @@ export async function attributeLiveDocument(input: AttributeLiveDocumentInput): 
   const identity = codexIdentity(input.live);
   if (!identity) return { action: 'unclaimed' };
 
-  if (identity === input.slot.accountId) return attributeSameSlot(input);
+  if (identity === input.slot.accountId) {
+    const disposition = await attributeSameSlot(input);
+    if (input.activeSlotId && input.activeSlotId !== input.slot.accountId) {
+      return { action: 'drift', accountId: input.slot.accountId, disposition: disposition.action };
+    }
+    return disposition;
+  }
 
   const driftSlot = input.store.getCodexSlotByIdentity(identity);
   if (!driftSlot) return { action: 'unclaimed' };

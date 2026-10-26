@@ -1,15 +1,19 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { describe, it } from 'node:test';
 
+import importActiveCommand from '../src/commands/codex-import-active';
 import { attributeLiveDocument } from '../src/codex-attribution';
 import { codexFingerprint, parseCodexAuth } from '../src/codex-auth';
 import { importActiveCodexSlot } from '../src/codex-slots';
+import * as keychainModule from '../src/keychain';
 import { MockKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from '../src/keychain';
 import { openStore } from '../src/store';
+import { beginCutover } from '../src/lifecycle';
+import type { CommandContext } from '../src/registry';
 
 function jwt(payload: Record<string, unknown>): string {
   return `eyJhbGciOiJub25lIn0.${Buffer.from(JSON.stringify(payload)).toString('base64url')}.sig`;
@@ -33,6 +37,25 @@ function document(refresh: string, accountId = 'fixture-account') {
 function fixture() {
   const home = mkdtempSync(join(tmpdir(), 'qlb-codex-attribution-'));
   return { home, store: openStore(join(home, 'qlb.db')), keychain: new MockKeychain() };
+}
+
+function commandContext(home: string, codexHome: string, output: string[]): CommandContext {
+  return {
+    stdout: (line) => output.push(line), stderr: (line) => output.push(`stderr:${line}`),
+    env: { QLB_TEST_MODE: '1', QLB_HOME: home, HOME: home, CODEX_HOME: codexHome },
+    config: { dbPath: join(home, 'qlb.db'), piAuthJsonPath: join(home, 'pi-auth.json') } as CommandContext['config'],
+    loadConfig: () => { throw new Error('not used'); }, home,
+    registerSecret: () => undefined, deliverSecret: () => undefined, knownSecrets: () => [],
+  };
+}
+
+class PreviousReadErrorKeychain extends MockKeychain {
+  constructor(private readonly previousError: Error) { super(); }
+
+  override getSync(service: string, account: string): string {
+    if (service.endsWith(':prev')) throw this.previousError;
+    return super.getSync(service, account);
+  }
 }
 
 /** Frozen rev4 mistake: it only adopted a live document already proven as a successor. */
@@ -129,6 +152,7 @@ describe('Codex live-document attribution (AC57)', () => {
       const live = document('split-live');
       const plan = importActiveCodexSlot(old, { store: h.store, keychain: h.keychain, now: () => 1 });
       const service = qlbKeychainService('openai-codex', plan.slotId);
+      h.keychain.setSync(`${service}:prev`, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(old));
       h.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(live));
 
       const result = await attributeLiveDocument({
@@ -218,6 +242,163 @@ describe('Codex live-document attribution (AC57)', () => {
         now: () => 3,
       }), /Codex slot changed before adoption/);
       assert.equal(codexFingerprint(JSON.parse(h.keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT))), codexFingerprint(first));
+      assert.equal(codexFingerprint(JSON.parse(h.keychain.getSync(`${service}:prev`, QLB_KEYCHAIN_ACCOUNT))), codexFingerprint(old));
+    } finally {
+      h.store.close();
+      rmSync(h.home, { recursive: true, force: true });
+    }
+  });
+
+  it('imports a new live identity even when active_login names another slot, then returns to the known slot as drift', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-codex-import-command-'));
+    const codexHome = mkdtempSync(join(tmpdir(), 'qlb-codex-import-command-auth-'));
+    const originalPlatformKeychain = keychainModule.platformKeychain;
+    try {
+      (keychainModule as unknown as { platformKeychain: MockKeychain }).platformKeychain = new MockKeychain();
+      const output: string[] = [];
+      const ctx = commandContext(home, codexHome, output);
+      const admitted = openStore(join(home, 'qlb.db'));
+      beginCutover(admitted, 1);
+      admitted.close();
+      const a = document('command-a', 'account-a');
+      const b = document('command-b', 'account-b');
+      writeFileSync(join(codexHome, 'auth.json'), JSON.stringify(a), { mode: 0o600 });
+      assert.equal(await importActiveCommand.execute!([], ctx), 0);
+      writeFileSync(join(codexHome, 'auth.json'), JSON.stringify(b), { mode: 0o600 });
+      assert.equal(await importActiveCommand.execute!([], ctx), 0);
+      writeFileSync(join(codexHome, 'auth.json'), JSON.stringify(a), { mode: 0o600 });
+      assert.equal(await importActiveCommand.execute!([], ctx), 0);
+
+      const store = openStore(join(home, 'qlb.db'));
+      try {
+        assert.ok(store.getCodexSlot('fixture-user:account-b'));
+        assert.equal(store.getCodexActiveLogin(), 'fixture-user:account-a');
+      } finally {
+        store.close();
+      }
+      assert.deepEqual(output, [
+        'imported fixture-user:account-a', 'imported fixture-user:account-b', 'drift fixture-user:account-a',
+      ]);
+    } finally {
+      (keychainModule as unknown as { platformKeychain: typeof originalPlatformKeychain }).platformKeychain = originalPlatformKeychain;
+      rmSync(home, { recursive: true, force: true });
+      rmSync(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  it('treats a platform not-found :prev error as absent but fails closed for another backend error', async () => {
+    for (const error of [
+      new Error('item could not be found in the keychain'),
+      new Error('fixture backend unavailable'),
+    ]) {
+      const home = mkdtempSync(join(tmpdir(), 'qlb-codex-prev-error-'));
+      const store = openStore(join(home, 'qlb.db'));
+      const keychain = new PreviousReadErrorKeychain(error);
+      try {
+        const old = document('prev-old');
+        const live = document('prev-live');
+        const plan = importActiveCodexSlot(old, { store, keychain, now: () => 1 });
+        const adoption = attributeLiveDocument({
+          store, keychain, slot: { accountId: plan.slotId, document: old, fingerprint: codexFingerprint(old) }, live, now: () => 2,
+        });
+        if (/could not be found/.test(error.message)) {
+          assert.equal((await adoption).action, 'adopt');
+        } else {
+          await assert.rejects(adoption, /fixture backend unavailable/);
+        }
+      } finally {
+        store.close();
+        rmSync(home, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it('repairs a stale Keychain document from a matching native successor before reporting noop', async () => {
+    const h = fixture();
+    try {
+      const old = document('repair-old');
+      const live = document('repair-live');
+      const plan = importActiveCodexSlot(old, { store: h.store, keychain: h.keychain, now: () => 1 });
+      h.store.adoptCodexSlot({
+        accountId: plan.slotId, previousFingerprint: codexFingerprint(old), fingerprint: codexFingerprint(live), ts: 2, evidence: 'identity',
+      });
+      const service = qlbKeychainService('openai-codex', plan.slotId);
+      const result = await attributeLiveDocument({
+        store: h.store, keychain: h.keychain,
+        slot: { accountId: plan.slotId, document: old, fingerprint: codexFingerprint(live) }, live, now: () => 3,
+      });
+      assert.equal(result.action, 'noop');
+      assert.equal(codexFingerprint(JSON.parse(h.keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT))), codexFingerprint(live));
+    } finally {
+      h.store.close();
+      rmSync(h.home, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses a DB/Keychain split when native is the predecessor and no DB-matching document is available', async () => {
+    const h = fixture();
+    try {
+      const old = document('split-refuse-old');
+      const successor = document('split-refuse-successor');
+      const plan = importActiveCodexSlot(old, { store: h.store, keychain: h.keychain, now: () => 1 });
+      h.store.adoptCodexSlot({
+        accountId: plan.slotId, previousFingerprint: codexFingerprint(old), fingerprint: codexFingerprint(successor), ts: 2, evidence: 'identity',
+      });
+      const published: string[] = [];
+      const result = await attributeLiveDocument({
+        store: h.store, keychain: h.keychain,
+        slot: { accountId: plan.slotId, document: old, fingerprint: codexFingerprint(successor) }, live: old,
+        republish: (doc) => { published.push(codexFingerprint(doc)); },
+      });
+      assert.equal(result.action, 'slot-split');
+      assert.deepEqual(published, []);
+    } finally {
+      h.store.close();
+      rmSync(h.home, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps a newer adoption when a failed attempt restores while holding the database write lock', async () => {
+    const h = fixture();
+    try {
+      const old = document('restore-old');
+      const failed = document('restore-failed');
+      const newer = document('restore-newer');
+      const plan = importActiveCodexSlot(old, { store: h.store, keychain: h.keychain, now: () => 1 });
+      const service = qlbKeychainService('openai-codex', plan.slotId);
+      const raw = (h.store as unknown as { db: DatabaseSync }).db;
+      let failOnce = true;
+      let newerCommitted = false;
+      (h.store as unknown as { db: DatabaseSync }).db = new Proxy(raw, {
+        get(target, property, receiver) {
+          if (property === 'prepare') return (sql: string) => {
+            if (failOnce && sql.includes('INSERT INTO lineage_log')) {
+              failOnce = false;
+              throw new Error('fixture failure after Keychain write');
+            }
+            return target.prepare(sql);
+          };
+          if (property === 'exec') return (sql: string) => {
+            const result = target.exec(sql);
+            if (sql === 'ROLLBACK' && !newerCommitted) {
+              newerCommitted = true;
+              target.prepare('UPDATE codex_slots SET fingerprint = ?, prev_fingerprint = ? WHERE account_id = ?')
+                .run(codexFingerprint(newer), codexFingerprint(old), plan.slotId);
+              h.keychain.setSync(`${service}:prev`, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(old));
+              h.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(newer));
+            }
+            return result;
+          };
+          const value = Reflect.get(target, property, receiver);
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      });
+
+      await assert.rejects(attributeLiveDocument({
+        store: h.store, keychain: h.keychain,
+        slot: { accountId: plan.slotId, document: old, fingerprint: codexFingerprint(old) }, live: failed, now: () => 2,
+      }), /fixture failure after Keychain write/);
+      assert.equal(codexFingerprint(JSON.parse(h.keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT))), codexFingerprint(newer));
       assert.equal(codexFingerprint(JSON.parse(h.keychain.getSync(`${service}:prev`, QLB_KEYCHAIN_ACCOUNT))), codexFingerprint(old));
     } finally {
       h.store.close();
