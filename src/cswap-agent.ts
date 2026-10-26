@@ -18,7 +18,8 @@ export interface CswapDrainOptions {
   listProcesses(): CswapProcess[] | Promise<CswapProcess[]>;
   lockPaths(): string[] | Promise<string[]>;
   tryAcquireLock(path: string): CswapLockRelease | null | Promise<CswapLockRelease | null>;
-  kill(pid: number, signal: NodeJS.Signals): void | Promise<void>;
+  /** Sends only SIGTERM; ESRCH means the target already exited. */
+  kill(pid: number, signal: 'SIGTERM'): void | Promise<void>;
   now(): number;
   sleep(ms: number): Promise<void>;
   cooperativeWaitMs?: number;
@@ -32,8 +33,8 @@ export interface CswapAgent {
   disable(): CswapAgentResult | Promise<CswapAgentResult>;
   movePlist(): CswapAgentResult | Promise<CswapAgentResult>;
   restorePlist(): CswapAgentResult | Promise<CswapAgentResult>;
-  /** Optional only while the K13 injection seam remains compatible with its existing fakes. */
-  drain?(): CswapAgentResult | Promise<CswapAgentResult>;
+  /** S57 drain required before cutover can complete. */
+  drain(): CswapAgentResult | Promise<CswapAgentResult>;
 }
 
 const COOPERATIVE_WAIT_MS = 60_000;
@@ -42,7 +43,20 @@ const TERM_WAIT_MS = 10_000;
 const POLL_MS = 100;
 
 function survivorCode(processes: CswapProcess[]): string {
-  return `cswap-survivor pid=${processes[0]?.pid ?? 'unknown'}`;
+  const pids = processes.map(({ pid }) => pid).join(' ');
+  return `cswap-survivor ${pids || 'unknown'}`;
+}
+
+function errorCode(error: unknown): string | undefined {
+  if (typeof error !== 'object' || error == null || !('code' in error)) return undefined;
+  const code = (error as { code?: unknown }).code;
+  return typeof code === 'string' ? code : undefined;
+}
+
+function drainErrorCode(error: unknown): string {
+  const code = errorCode(error);
+  const message = error instanceof Error ? error.message : String(error);
+  return `cswap-drain-error ${code ? `${code}: ` : ''}${message}`;
 }
 
 async function releaseAll(locks: CswapLockRelease[]): Promise<void> {
@@ -99,19 +113,30 @@ export async function cooperativeDrain(options: CswapDrainOptions): Promise<Cswa
       // Re-read under every lock so we never signal a process that already left.
       survivors = await options.listProcesses();
       if (survivors.length === 0) return { ok: true };
-      for (const process of survivors) await options.kill(process.pid, 'SIGTERM');
+      const exited = new Set<number>();
+      for (const process of survivors) {
+        try {
+          await options.kill(process.pid, 'SIGTERM');
+        } catch (error) {
+          if (errorCode(error) === 'ESRCH') {
+            exited.add(process.pid);
+            continue;
+          }
+          return { ok: false, code: drainErrorCode(error) };
+        }
+      }
       const termDeadline = options.now() + termWaitMs;
       while (survivors.length > 0 && options.now() < termDeadline) {
         await options.sleep(pollMs);
-        survivors = await options.listProcesses();
+        survivors = (await options.listProcesses()).filter(({ pid }) => !exited.has(pid));
       }
       return survivors.length === 0 ? { ok: true } : { ok: false, code: survivorCode(survivors) };
     } finally {
       await releaseAll(acquired);
     }
-  } catch {
+  } catch (error) {
     // The caller compensates with restorePlist; no uncertain process may be ignored.
-    return { ok: false, code: survivorCode(survivors ?? []) };
+    return { ok: false, code: drainErrorCode(error) };
   }
 }
 

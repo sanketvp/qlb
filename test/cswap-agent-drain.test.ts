@@ -13,7 +13,7 @@ function fixtureStore() {
   return openStore(join(mkdtempSync(join(tmpdir(), 'qlb-cswap-drain-')), 'qlb.db'));
 }
 
-function drainingAgent(drain: NonNullable<CswapAgent['drain']>): { agent: CswapAgent; calls: string[] } {
+function drainingAgent(drain: CswapAgent['drain']): { agent: CswapAgent; calls: string[] } {
   const calls: string[] = [];
   return {
     calls,
@@ -22,30 +22,33 @@ function drainingAgent(drain: NonNullable<CswapAgent['drain']>): { agent: CswapA
       disable: () => { calls.push('disable'); return { ok: true }; },
       movePlist: () => { calls.push('move'); return { ok: true }; },
       restorePlist: () => { calls.push('restore'); return { ok: true }; },
-      drain,
+      drain: async () => { calls.push('drain'); return drain(); },
     },
   };
 }
 
+function assertNoSignalBeforeConsumeLock(killsWhenConsumeLockBecameAvailable: number | undefined): void {
+  assert.equal(killsWhenConsumeLockBecameAvailable, 0, 'QLB must not signal while the fixture consume lock is held');
+}
+
 test('waits for a held C-swap consume lock before signaling, then drains cooperatively', async () => {
   let now = 0;
-  let lockHeld = true;
+  let consumeLockHeld = true;
+  let killsWhenConsumeLockBecameAvailable: number | undefined;
   let terminated = false;
-  const kills: Array<{ pid: number; signal: NodeJS.Signals }> = [];
+  const kills: Array<{ pid: number; signal: 'SIGTERM' }> = [];
   const releases: string[] = [];
   const { agent, calls } = drainingAgent(() => cooperativeDrain({
     listProcesses: () => terminated ? [] : [{ pid: 42 }],
     lockPaths: () => ['backup/.lock', 'backup/credentials/.consume-2.lock'],
     tryAcquireLock: (path) => {
-      if (lockHeld) {
-        assert.equal(kills.length, 0, 'QLB must not signal while the fixture consume lock is held');
-        return null;
-      }
+      if (path.endsWith('.consume-2.lock') && consumeLockHeld) return null;
+      if (path.endsWith('.consume-2.lock')) killsWhenConsumeLockBecameAvailable = kills.length;
       return () => { releases.push(path); };
     },
     kill: (pid, signal) => { kills.push({ pid, signal }); terminated = true; },
     now: () => now,
-    sleep: async () => { now += 1; if (now === 5) lockHeld = false; },
+    sleep: async () => { now += 1; if (now === 5) consumeLockHeld = false; },
     cooperativeWaitMs: 3,
     lockWaitMs: 5,
     termWaitMs: 2,
@@ -55,17 +58,42 @@ test('waits for a held C-swap consume lock before signaling, then drains coopera
   try {
     const result = await cutoverBegin(store.dbPath, agent);
     assert.deepEqual(result, { ok: true, state: 'cutting-over' });
-    assert.deepEqual(calls, ['bootout', 'disable', 'move']);
+    assert.deepEqual(calls, ['bootout', 'disable', 'move', 'drain']);
+    assertNoSignalBeforeConsumeLock(killsWhenConsumeLockBecameAvailable);
     assert.deepEqual(kills, [{ pid: 42, signal: 'SIGTERM' }]);
-    assert.deepEqual(releases.sort(), ['backup/.lock', 'backup/credentials/.consume-2.lock']);
+    assert.deepEqual(releases, [
+      'backup/.lock',
+      'backup/.lock',
+      'backup/credentials/.consume-2.lock',
+      'backup/.lock',
+    ]);
   } finally {
     store.close();
   }
 });
 
+test('AC58 barrier assertion rejects a fake drain that signals before the consume lock is available', async () => {
+  const kills: Array<{ pid: number; signal: 'SIGTERM' }> = [];
+  let consumeLockHeld = true;
+  const earlySignalDrain: CswapAgent['drain'] = () => {
+    if (consumeLockHeld) kills.push({ pid: 42, signal: 'SIGTERM' });
+    return { ok: true };
+  };
+
+  await earlySignalDrain();
+  const killsWhenConsumeLockBecameAvailable = kills.length;
+  consumeLockHeld = false;
+
+  assert.throws(
+    () => assertNoSignalBeforeConsumeLock(killsWhenConsumeLockBecameAvailable),
+    /QLB must not signal while the fixture consume lock is held/,
+  );
+  assert.equal(consumeLockHeld, false);
+});
+
 test('refuses a C-swap whose consume lock stays held, without sending any signal', async () => {
   let now = 0;
-  const kills: Array<{ pid: number; signal: NodeJS.Signals }> = [];
+  const kills: Array<{ pid: number; signal: 'SIGTERM' }> = [];
   const { agent, calls } = drainingAgent(() => cooperativeDrain({
     listProcesses: () => [{ pid: 77 }],
     lockPaths: () => ['backup/.lock', 'backup/credentials/.consume-2.lock'],
@@ -82,10 +110,10 @@ test('refuses a C-swap whose consume lock stays held, without sending any signal
   try {
     const result = await cutoverBegin(store.dbPath, agent);
     assert.equal(result.ok, false);
-    assert.match(result.code ?? '', /^cswap-survivor pid=77$/);
+    assert.match(result.code ?? '', /^cswap-survivor 77$/);
     assert.equal(result.state, 'aborted');
     assert.deepEqual(kills, []);
-    assert.deepEqual(calls, ['bootout', 'disable', 'move', 'restore']);
+    assert.deepEqual(calls, ['bootout', 'disable', 'move', 'drain', 'restore']);
     assert.equal(phase(store).state, 'aborted');
   } finally {
     store.close();
@@ -94,7 +122,7 @@ test('refuses a C-swap whose consume lock stays held, without sending any signal
 
 test('refuses a SIGTERM-surviving C-swap, restores its plist, and never sends SIGKILL', async () => {
   let now = 0;
-  const kills: Array<{ pid: number; signal: NodeJS.Signals }> = [];
+  const kills: Array<{ pid: number; signal: 'SIGTERM' }> = [];
   const { agent, calls } = drainingAgent(() => cooperativeDrain({
     listProcesses: () => [{ pid: 99 }],
     lockPaths: () => ['backup/.lock', 'backup/credentials/.consume-2.lock'],
@@ -111,13 +139,71 @@ test('refuses a SIGTERM-surviving C-swap, restores its plist, and never sends SI
   try {
     const result = await cutoverBegin(store.dbPath, agent);
     assert.equal(result.ok, false);
-    assert.match(result.code ?? '', /^cswap-survivor pid=99$/);
+    assert.match(result.code ?? '', /^cswap-survivor 99$/);
     assert.equal(result.state, 'aborted');
-    assert.deepEqual(calls, ['bootout', 'disable', 'move', 'restore']);
+    assert.deepEqual(calls, ['bootout', 'disable', 'move', 'drain', 'restore']);
     assert.deepEqual(kills, [{ pid: 99, signal: 'SIGTERM' }]);
-    assert.equal(kills.some(({ signal }) => signal === 'SIGKILL'), false);
+    assert.equal(kills.every(({ signal }) => signal === 'SIGTERM'), true);
     assert.equal(phase(store).state, 'aborted');
   } finally {
     store.close();
   }
+});
+
+test('names every SIGTERM survivor in the S57 refusal code', async () => {
+  let now = 0;
+  const result = await cooperativeDrain({
+    listProcesses: () => [{ pid: 101 }, { pid: 102 }],
+    lockPaths: () => ['backup/.lock'],
+    tryAcquireLock: () => () => {},
+    kill: () => {},
+    now: () => now,
+    sleep: async () => { now += 1; },
+    cooperativeWaitMs: 1,
+    lockWaitMs: 1,
+    termWaitMs: 1,
+    pollMs: 1,
+  });
+
+  assert.deepEqual(result, { ok: false, code: 'cswap-survivor 101 102' });
+});
+
+test('treats ESRCH from SIGTERM as an already-exited process', async () => {
+  let now = 0;
+  let listed = true;
+  const result = await cooperativeDrain({
+    listProcesses: () => listed ? [{ pid: 123 }] : [],
+    lockPaths: () => ['backup/.lock'],
+    tryAcquireLock: () => () => {},
+    kill: () => {
+      listed = false;
+      throw Object.assign(new Error('gone'), { code: 'ESRCH' });
+    },
+    now: () => now,
+    sleep: async () => { now += 1; },
+    cooperativeWaitMs: 1,
+    lockWaitMs: 1,
+    termWaitMs: 1,
+    pollMs: 1,
+  });
+
+  assert.deepEqual(result, { ok: true });
+});
+
+test('fails closed with the named error when SIGTERM fails for another reason', async () => {
+  let now = 0;
+  const result = await cooperativeDrain({
+    listProcesses: () => [{ pid: 124 }],
+    lockPaths: () => ['backup/.lock'],
+    tryAcquireLock: () => () => {},
+    kill: () => { throw Object.assign(new Error('not permitted'), { code: 'EPERM' }); },
+    now: () => now,
+    sleep: async () => { now += 1; },
+    cooperativeWaitMs: 1,
+    lockWaitMs: 1,
+    termWaitMs: 1,
+    pollMs: 1,
+  });
+
+  assert.deepEqual(result, { ok: false, code: 'cswap-drain-error EPERM: not permitted' });
 });
