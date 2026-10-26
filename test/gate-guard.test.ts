@@ -133,6 +133,23 @@ describe('qlb gate core (S30/S54)', () => {
     }
   });
 
+  it('serves openrouter from a v2 entry', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-gate-openrouter-map-'));
+    const agentDir = join(root, '.pi', 'agent');
+    mkdirSync(agentDir, { recursive: true, mode: 0o700 });
+    writeFileSync(join(agentDir, 'qlb-owner.json'), JSON.stringify({ providers: {
+      openrouter: { mode: 'qlb', since: 1 },
+    } }) + '\n');
+    const output: string[] = [];
+    const result = await runPiGate('openrouter', {
+      dbPath: fixtureDb(), env: { QLB_PI_TOKEN_CALL: '1' }, deliver: (value) => output.push(value),
+      guard: () => true, admitted: () => ({ ok: true }), piAgentDir: agentDir,
+      provider: { read: () => ({ token: 'openrouter-token', accountId: 'openrouter-default', source: 'fixture' }) },
+    });
+    assert.equal(result, 0);
+    assert.equal(output.length, 1);
+  });
+
   it('accepts legacy per-provider ownership alongside a P7a owner map', async () => {
     const root = mkdtempSync(join(tmpdir(), 'qlb-gate-mixed-'));
     const paths = defaultPiMigratePaths(root);

@@ -120,6 +120,7 @@ import { config } from './config';
 import type { KeychainBackend } from './keychain';
 import { openRouterMissingKeyMessage, qlbKeychainService, readNativeOpenRouterKey } from './keychain';
 import { parseGrant } from './refresh-lease';
+import { readPiOwnerProviders, writePiOwnerEntry } from './pi-migrate';
 import type { Store } from './store';
 import type { Grant } from './types';
 
@@ -218,7 +219,7 @@ export function migrationStoreNameFor(provider: string): string {
 }
 
 export function defaultOwnerFileFor(provider: MigrateProvider): string {
-  if (provider === 'anthropic') return DEFAULT_OWNER_FILE;
+  if (provider === 'anthropic' || provider === 'openrouter') return DEFAULT_OWNER_FILE;
   return join(dirname(config.piAuthJsonPath), `qlb-owner-${provider}.json`);
 }
 
@@ -406,8 +407,8 @@ export function readOpenRouterNativeKey(): string {
   return readNativeOpenRouterKey(NATIVE_OPENROUTER_KEYCHAIN_SERVICE);
 }
 
-export function stagingOwnerPath(ownerFilePath: string): string {
-  return `${ownerFilePath}.staging`;
+export function stagingOwnerPath(ownerFilePath: string, provider?: string): string {
+  return provider ? `${ownerFilePath}.${provider}.staging` : `${ownerFilePath}.staging`;
 }
 
 export function preQlbPath(poolFilePath: string): string {
@@ -715,6 +716,7 @@ export class Migration {
   private readonly keychain: KeychainBackend;
   private readonly poolFilePath: string;
   private readonly ownerFilePath: string;
+  private readonly ownerMapPath: string;
   readonly storeName: string;
   readonly kind: MigrationKind;
   readonly provider: string | undefined;
@@ -733,11 +735,54 @@ export class Migration {
     this.keychain = keychain;
     this.poolFilePath = poolFilePath;
     this.ownerFilePath = ownerFilePath;
+    this.ownerMapPath = join(dirname(ownerFilePath), 'qlb-owner.json');
     this.storeName = storeName;
     this.kind = config.kind ?? 'pool';
     this.provider = config.provider;
     this.authJsonKey = config.authJsonKey ?? config.provider;
     this.readNativeKey = config.readNativeKey;
+  }
+
+  private ownerProvider(): MigrateProvider {
+    return (this.provider as MigrateProvider | undefined) ?? 'anthropic';
+  }
+
+  private stagingPath(): string {
+    return stagingOwnerPath(this.ownerMapPath, this.kind === 'pool' ? undefined : this.ownerProvider());
+  }
+
+  private legacySidecarPath(): string | null {
+    return this.kind === 'pool'
+      ? null
+      : join(dirname(this.ownerMapPath), `qlb-owner-${this.ownerProvider()}.json`);
+  }
+
+  private ownerEntryPresentAt(path: string): boolean {
+    try {
+      const entry = readPiOwnerProviders(path)[this.ownerProvider()];
+      return !!entry && typeof entry === 'object' && !Array.isArray(entry)
+        && (entry as Record<string, unknown>).mode === 'qlb';
+    } catch {
+      return false;
+    }
+  }
+
+  private legacySidecarOwned(): boolean {
+    const path = this.legacySidecarPath();
+    if (!path || !existsSync(path)) return false;
+    try {
+      const owner: unknown = JSON.parse(readFileSync(path, 'utf8'));
+      return !!owner && typeof owner === 'object' && !Array.isArray(owner)
+        && (owner as Record<string, unknown>).owner === 'qlb';
+    } catch {
+      return false;
+    }
+  }
+
+  private ownerEntryPresent(): boolean {
+    // Pool migration continues to read its pre-P7b v1 document until P7b8.
+    if (this.kind === 'pool') return existsSync(this.ownerFilePath);
+    return this.ownerEntryPresentAt(this.ownerMapPath) || this.legacySidecarOwned();
   }
 
   /** True when commit must not rename/delete the native store. */
@@ -755,8 +800,8 @@ export class Migration {
     const row = this.store.getMigration(this.storeName);
     const state = asState(row?.state);
     const detail = parseDetail(row?.detail_json);
-    const ownerPresent = existsSync(this.ownerFilePath);
-    const ownerStaging = existsSync(stagingOwnerPath(this.ownerFilePath));
+    const ownerPresent = this.ownerEntryPresent();
+    const ownerStaging = existsSync(this.stagingPath());
     const nativePresent =
       this.kind === 'static-key' ? true : existsSync(this.poolFilePath);
     const prePresent =
@@ -840,6 +885,9 @@ export class Migration {
    * Static-key (OpenRouter): 1 API key from native Keychain (read-only).
    */
   stage(): MigrationStatus {
+    // OpenRouter publishes into the v2 map, so reject a v1 Anthropic
+    // document before creating any staged Keychain or filesystem state.
+    if (this.kind === 'static-key') readPiOwnerProviders(this.ownerMapPath);
     const current = this.status();
     if (current.ownerFile === 'present' || current.state === 'QLB_OWNED' || current.state === 'RETIRED') {
       throw new Error(
@@ -891,7 +939,7 @@ export class Migration {
       this.store.upsertAccount(acct.id, acct.provider, acct.label, 'imported-unvalidated');
     }
 
-    atomicWriteFile(stagingOwnerPath(this.ownerFilePath), JSON.stringify(owner, null, 2) + '\n');
+    atomicWriteFile(this.stagingPath(), JSON.stringify(owner, null, 2) + '\n');
     return this.status();
   }
 
@@ -943,10 +991,13 @@ export class Migration {
    * rename is hygiene afterwards.
    */
   commit(): MigrationStatus {
-    if (existsSync(this.ownerFilePath)) {
+    // OpenRouter must fail closed rather than add providers to a v1 Anthropic
+    // document. Read before checking or mutating any migration artifact.
+    if (this.kind === 'static-key') readPiOwnerProviders(this.ownerMapPath);
+    if (this.ownerEntryPresent()) {
       return this.finishHygiene();
     }
-    const staging = stagingOwnerPath(this.ownerFilePath);
+    const staging = this.stagingPath();
     if (!existsSync(staging)) {
       throw new Error(`cannot commit: missing ${staging}`);
     }
@@ -955,6 +1006,12 @@ export class Migration {
       throw new Error(
         `cannot commit from state ${current.state} (rehearse must succeed first)`,
       );
+    }
+
+    if (this.kind === 'static-key') {
+      writePiOwnerEntry(this.ownerMapPath, this.ownerProvider(), true);
+      unlinkIfExists(staging);
+      return this.finishHygiene();
     }
 
     // C — THE ONLY COMMIT POINT (atomic rename on APFS/POSIX).
@@ -968,7 +1025,7 @@ export class Migration {
   }
 
   rollback(): MigrationStatus {
-    if (existsSync(this.ownerFilePath) || this.journalState() === 'QLB_OWNED') {
+    if (this.ownerEntryPresent() || this.journalState() === 'QLB_OWNED') {
       return this.postCommitRollback();
     }
     return this.preCommitRollback();
@@ -989,20 +1046,20 @@ export class Migration {
     if (intent) {
       return this.continueRollback();
     }
-    if (existsSync(this.ownerFilePath)) {
+    if (this.ownerEntryPresent()) {
       return this.finishHygiene();
     }
     if (
       current.state === 'QLB_OWNED' &&
-      !existsSync(this.ownerFilePath) &&
+      !this.ownerEntryPresent() &&
       (this.kind === 'static-key' || existsSync(this.poolFilePath))
     ) {
       return this.finishRollbackJournal();
     }
-    if (current.state === 'VALIDATED' && existsSync(stagingOwnerPath(this.ownerFilePath))) {
+    if (current.state === 'VALIDATED' && existsSync(this.stagingPath())) {
       return this.commit();
     }
-    if (current.state === 'MIRRORED' || existsSync(stagingOwnerPath(this.ownerFilePath))) {
+    if (current.state === 'MIRRORED' || existsSync(this.stagingPath())) {
       return this.preCommitRollback();
     }
     return current;
@@ -1062,7 +1119,7 @@ export class Migration {
 
     this.keychain.setSync(service, account, JSON.stringify(payload));
     this.store.upsertAccount(id, this.provider, label, 'imported-unvalidated');
-    atomicWriteFile(stagingOwnerPath(this.ownerFilePath), JSON.stringify(owner, null, 2) + '\n');
+    atomicWriteFile(this.stagingPath(), JSON.stringify(owner, null, 2) + '\n');
     return this.status();
   }
 
@@ -1122,7 +1179,7 @@ export class Migration {
 
     this.keychain.setSync(service, account, JSON.stringify(grant));
     this.store.upsertAccount(id, this.provider, label, 'imported-unvalidated');
-    atomicWriteFile(stagingOwnerPath(this.ownerFilePath), JSON.stringify(owner, null, 2) + '\n');
+    atomicWriteFile(this.stagingPath(), JSON.stringify(owner, null, 2) + '\n');
     return this.status();
   }
 
@@ -1140,7 +1197,7 @@ export class Migration {
   }
 
   private readOwnerPayload(): OwnerFile | null {
-    const candidates = [this.ownerFilePath, stagingOwnerPath(this.ownerFilePath)];
+    const candidates = [this.stagingPath()];
     for (const p of candidates) {
       if (!existsSync(p)) continue;
       try {
@@ -1193,19 +1250,6 @@ export class Migration {
   /** H1 + H2. Idempotent. Called after C and by resume() when owner is present. */
   private finishHygiene(): MigrationStatus {
     const now = Date.now();
-    if (existsSync(this.ownerFilePath)) {
-      try {
-        const raw = readFileSync(this.ownerFilePath, 'utf8');
-        const owner = JSON.parse(raw) as OwnerFile;
-        if (owner && owner.committedAt == null) {
-          owner.committedAt = now;
-          atomicWriteFile(this.ownerFilePath, JSON.stringify(owner, null, 2) + '\n');
-        }
-      } catch {
-        // owner file present but unreadable — still journal; doctor will flag
-      }
-    }
-
     this.journal('QLB_OWNED', { committedAt: now, intent: undefined });
 
     if (this.retainsNative()) {
@@ -1258,7 +1302,7 @@ export class Migration {
   private preCommitRollback(): MigrationStatus {
     const owner = this.readOwnerPayload();
     this.deleteStagedKeychain(owner?.accounts);
-    unlinkIfExists(stagingOwnerPath(this.ownerFilePath));
+    unlinkIfExists(this.stagingPath());
     this.journal('NATIVE', { intent: undefined, rolledBackAt: Date.now(), rolledBackFrom: 'pre-commit' });
     return this.status();
   }
@@ -1273,8 +1317,14 @@ export class Migration {
   private continueRollback(): MigrationStatus {
     if (this.retainsNative()) {
       // Native was never moved (auth.json shadow-retained, or Keychain retained).
-      unlinkIfExists(this.ownerFilePath);
-      unlinkIfExists(stagingOwnerPath(this.ownerFilePath));
+      if (this.kind === 'static-key') {
+        writePiOwnerEntry(this.ownerMapPath, this.ownerProvider(), false);
+        const legacy = this.legacySidecarPath();
+        if (legacy) unlinkIfExists(legacy);
+      } else {
+        unlinkIfExists(this.ownerFilePath);
+      }
+      unlinkIfExists(this.stagingPath());
       return this.finishRollbackJournal();
     }
 
@@ -1289,7 +1339,7 @@ export class Migration {
     // RC — unlink owner only after native is present again.
     if (existsSync(native)) {
       unlinkIfExists(this.ownerFilePath);
-      unlinkIfExists(stagingOwnerPath(this.ownerFilePath));
+      unlinkIfExists(this.stagingPath());
     } else {
       // Cannot yet drop the owner file — native is not restored. Leave it.
       return this.status();
