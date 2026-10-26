@@ -98,6 +98,19 @@ export class CodexSlots {
   }
 
   /**
+   * Persists a new managed lineage before the caller records its metadata.
+   * The predecessor copy is deliberately written first so a returned refresh
+   * successor is never the only recoverable copy after a later DB failure.
+   */
+  writeSlot(accountId: string, document: CodexAuthDocument, previous?: CodexAuthDocument): void {
+    const service = this.slotService(accountId);
+    const prior = previous ?? this.readSlot(accountId, { fresh: true }).document;
+    this.options.keychain.setSync(`${service}:prev`, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(prior));
+    this.options.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(document));
+    this.cache.delete(accountId);
+  }
+
+  /**
    * Restores an S36 stash only through the caller's slot transaction and only
    * if it was consumed from that slot's current lineage.
    */
