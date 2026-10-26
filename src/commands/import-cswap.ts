@@ -2,8 +2,8 @@ import { dirname, join } from 'node:path';
 
 import { claudePaths } from '../cc-paths';
 import { SqliteClaudeSlotRepository } from '../cc-slots';
-import { importCswap, planCswapImport } from '../cswap-import';
-import { readLiveClaudeCredentials } from '../cc-credentials';
+import { CswapImportRefusalError, importCswap, planCswapImport } from '../cswap-import';
+import { readClaudeConfig, readLiveClaudeCredentials } from '../cc-credentials';
 import { assertAdmitted } from '../lifecycle';
 import { isSuccessor } from '../lineage-log';
 import { platformKeychain } from '../keychain';
@@ -14,6 +14,14 @@ function parse(args: string[]): { dryRun: boolean; replace: boolean; json: boole
   const allowed = new Set(['--dry-run', '--replace', '--json']);
   if (args.some((arg) => !allowed.has(arg)) || new Set(args).size !== args.length) return null;
   return { dryRun: args.includes('--dry-run'), replace: args.includes('--replace'), json: args.includes('--json') };
+}
+
+function configuredOauthAccountId(path: string): string | null {
+  const oauth = readClaudeConfig(path).oauthAccount;
+  if (!oauth || typeof oauth !== 'object' || Array.isArray(oauth)) return null;
+  const record = oauth as Record<string, unknown>;
+  const accountId = record.accountUuid ?? record.account_id;
+  return typeof accountId === 'string' && accountId ? accountId : null;
 }
 
 function print(ctx: CommandContext, value: unknown, json: boolean): void {
@@ -66,12 +74,19 @@ async function execute(args: string[], ctx: CommandContext): Promise<number> {
     const result = await importCswap({
       ...base,
       liveCredential: () => readLiveClaudeCredentials({ backend: platformKeychain, paths, env: ctx.env }),
+      // Claude's Keychain OAuth blob intentionally has no account UUID. The
+      // global config is the live identity authority for §4.9's active check.
+      liveAccountId: async () => configuredOauthAccountId(paths.globalConfigPath),
     });
     print(ctx, { ...result.plan, runId: result.runId, phase: result.phase }, opts.json);
     return 0;
   } catch (error) {
     // Credential values are never reflected in the importer's errors. Do not
     // render arbitrary backend errors, which may contain sensitive bytes.
+    if (error instanceof CswapImportRefusalError) {
+      ctx.stderr(`import cswap refused: ${error.code}`);
+      return 3;
+    }
     ctx.stderr('import cswap failed');
     return 1;
   } finally {

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
@@ -8,10 +8,10 @@ import { credentialFingerprint } from '../src/anthropic-oauth';
 import { InMemoryClaudeSlotRepository, SqliteClaudeSlotRepository } from '../src/cc-slots';
 import { MockKeychain, QLB_KEYCHAIN_ACCOUNT } from '../src/keychain';
 import { openStore } from '../src/store';
-import { importCswap, planCswapImport } from '../src/cswap-import';
+import { CswapImportInjectedCrash, importCswap, planCswapImport, recoverUncommittedCswapImport } from '../src/cswap-import';
 
 function credential(id: string, refresh: string): string {
-  return JSON.stringify({ claudeAiOauth: { accountUuid: id, accessToken: `access-${id}`, refreshToken: refresh } });
+  return JSON.stringify({ claudeAiOauth: { accessToken: `access-${id}`, refreshToken: refresh, expiresAt: 1_800_000_000_000, scopes: ['user:inference'], subscriptionType: 'max' } });
 }
 
 function fixture(): { root: string; backup: string; keychain: MockKeychain; repo: InMemoryClaudeSlotRepository } {
@@ -29,7 +29,7 @@ function fixture(): { root: string; backup: string; keychain: MockKeychain; repo
       2: { email: 'b@example.test', uuid: 'account-b' },
     },
   }));
-  writeFileSync(join(backup, 'configs', '.claude-config-1-a@example.test.json'), JSON.stringify({ oauthAccount: { accountUuid: 'account-a' } }));
+  writeFileSync(join(backup, 'configs', '.claude-config-1-a@example.test.json'), JSON.stringify({ oauthAccount: { accountUuid: 'account-a' }, mcpServers: { fixture: { env: { TOKEN: 'fixture-token-shape' } } } }));
   writeFileSync(join(backup, 'configs', '.claude-config-2-b@example.test.json'), JSON.stringify({ oauthAccount: { accountUuid: 'account-b' } }));
   writeFileSync(join(backup, 'credentials', '.creds-1-a@example.test.enc'), Buffer.from(first).toString('base64'));
   const keychain = new MockKeychain();
@@ -47,6 +47,7 @@ describe('C-swap import (K10 / AC16)', () => {
     assert.equal(plan.apiKeySlots, 0);
     assert.equal(plan.sessionProfiles, 0);
     assert.equal(h.repo.listSlots().length, 0);
+    assert.ok(!JSON.stringify(await planCswapImport({ backupDir: h.backup, keychain: h.keychain, repository: h.repo })).includes('fixture-token-shape'));
   });
 
   it('stages, adopts an active live successor, promotes, and commits one destination record', async () => {
@@ -54,7 +55,7 @@ describe('C-swap import (K10 / AC16)', () => {
     const live = credential('account-a', 'refresh-a-rotated');
     const result = await importCswap({
       backupDir: h.backup, journalDir: join(h.root, 'journals'), keychain: h.keychain, repository: h.repo,
-      liveCredential: async () => live, now: () => 1_700_000_000_000, runId: 'fixture-run',
+      liveCredential: async () => live, liveAccountId: async () => 'account-a', now: () => 1_700_000_000_000, runId: 'fixture-run',
     });
     assert.equal(result.phase, 'cleaned');
     assert.equal(h.repo.listSlots().length, 2);
@@ -102,11 +103,11 @@ describe('C-swap import (K10 / AC16)', () => {
     const plan = await planCswapImport({ backupDir: h.backup, keychain: h.keychain, repository: h.repo });
     const source = plan.slots[0];
     h.repo.createSlot({
-      accountId: source.accountId, slotNum: source.slotNum, email: source.email, configJson: source.configJson,
+      accountId: source.accountId, slotNum: source.slotNum, email: source.email, configJson: '{}',
       fingerprint: source.fingerprint, prevFingerprint: null, addedAt: 1, source: 'fixture',
     });
     await h.keychain.set('qlb:anthropic:account-a', QLB_KEYCHAIN_ACCOUNT, credential('account-a', 'refresh-a'));
-    await assert.rejects(importCswap({ backupDir: h.backup, keychain: h.keychain, repository: h.repo }), /non-empty/);
+    await assert.rejects(importCswap({ backupDir: h.backup, journalDir: join(h.root, 'journals'), keychain: h.keychain, repository: h.repo }), /non-empty/);
     await assert.doesNotReject(importCswap({
       backupDir: h.backup, journalDir: join(h.root, 'journals'), keychain: h.keychain, repository: h.repo,
       replace: true, runId: 'equal-replace',
@@ -116,10 +117,123 @@ describe('C-swap import (K10 / AC16)', () => {
   it('refuses API-key and session-profile sources before staging', async () => {
     const h = fixture();
     writeFileSync(join(h.backup, 'credentials', '.creds-1-a@example.test.enc'), Buffer.from('sk-ant-fixture').toString('base64'));
-    await assert.rejects(importCswap({ backupDir: h.backup, keychain: h.keychain, repository: h.repo }), /API-key/);
+    await assert.rejects(importCswap({ backupDir: h.backup, journalDir: join(h.root, 'journals'), keychain: h.keychain, repository: h.repo }), /API-key/);
     assert.equal(h.repo.listSlots().length, 0);
     const sessions = fixture();
     mkdirSync(join(sessions.backup, 'sessions', 'present'), { recursive: true });
-    await assert.rejects(importCswap({ backupDir: sessions.backup, keychain: sessions.keychain, repository: sessions.repo }), /session profiles/);
+    await assert.rejects(importCswap({ backupDir: sessions.backup, journalDir: join(sessions.root, 'journals'), keychain: sessions.keychain, repository: sessions.repo }), /session profiles/);
+  });
+
+  it('refuses malformed source credentials before any Keychain write', async () => {
+    const h = fixture();
+    writeFileSync(join(h.backup, 'credentials', '.creds-1-a@example.test.enc'), Buffer.from(JSON.stringify({ claudeAiOauth: { refreshToken: 7 } })).toString('base64'));
+    await assert.rejects(importCswap({
+      backupDir: h.backup, journalDir: join(h.root, 'journals'), keychain: h.keychain, repository: h.repo,
+    }), /OAuth credential is invalid/);
+    assert.equal(h.repo.listSlots().length, 0);
+    await assert.rejects(h.keychain.get('qlb:anthropic:account-a', QLB_KEYCHAIN_ACCOUNT), /item not found/);
+  });
+
+  it('rolls back a new destination when its first final write fails', async () => {
+    const h = fixture();
+    const backend = {
+      get: h.keychain.get.bind(h.keychain),
+      delete: h.keychain.delete.bind(h.keychain),
+      set: async (service: string, account: string, value: string) => {
+        if (service === 'qlb:anthropic:account-a') throw new Error('injected destination write failure');
+        await h.keychain.set(service, account, value);
+      },
+    };
+    await assert.rejects(importCswap({
+      backupDir: h.backup, journalDir: join(h.root, 'journals'), keychain: backend, repository: h.repo, runId: 'destination-failure',
+    }), /destination write failure/);
+    assert.equal(h.repo.listSlots().length, 0);
+    await assert.rejects(h.keychain.get('qlb:anthropic:account-a', QLB_KEYCHAIN_ACCOUNT), /item not found/);
+    await assert.rejects(h.keychain.get('qlb:anthropic:account-b', QLB_KEYCHAIN_ACCOUNT), /item not found/);
+    for (const service of [
+      'qlb:anthropic:staging:destination-failure:account-a',
+      'qlb:anthropic:import-prev:destination-failure:account-a',
+      'qlb:anthropic:import-prev-prev:destination-failure:account-a',
+    ]) await assert.rejects(h.keychain.get(service, QLB_KEYCHAIN_ACCOUNT), /item not found/);
+  });
+
+  it('records preimages before promotion and restores byte-exact --replace values when :prev fails', async () => {
+    const h = fixture();
+    const plan = await planCswapImport({ backupDir: h.backup, keychain: h.keychain, repository: h.repo });
+    const source = plan.slots[0];
+    const prior = credential('account-a', 'refresh-a');
+    const priorPrevious = credential('account-a', 'prior-previous');
+    h.repo.createSlot({ accountId: source.accountId, slotNum: source.slotNum, email: source.email, configJson: '{}', fingerprint: source.fingerprint, prevFingerprint: null, addedAt: 1, source: 'fixture' });
+    await h.keychain.set('qlb:anthropic:account-a', QLB_KEYCHAIN_ACCOUNT, prior);
+    await h.keychain.set('qlb:anthropic:account-a:prev', QLB_KEYCHAIN_ACCOUNT, priorPrevious);
+    let failed = false;
+    const backend = {
+      get: h.keychain.get.bind(h.keychain),
+      delete: h.keychain.delete.bind(h.keychain),
+      set: async (service: string, account: string, value: string) => {
+        if (service === 'qlb:anthropic:account-a:prev' && !failed) {
+          failed = true;
+          throw new Error('injected prev write failure');
+        }
+        await h.keychain.set(service, account, value);
+      },
+    };
+    await assert.rejects(importCswap({
+      backupDir: h.backup, journalDir: join(h.root, 'journals'), keychain: backend, repository: h.repo,
+      replace: true, runId: 'prev-failure', liveCredential: async () => credential('account-a', 'live-successor'), liveAccountId: async () => 'account-a',
+    }), /prev write failure/);
+    assert.equal(await h.keychain.get('qlb:anthropic:account-a', QLB_KEYCHAIN_ACCOUNT), prior);
+    assert.equal(await h.keychain.get('qlb:anthropic:account-a:prev', QLB_KEYCHAIN_ACCOUNT), priorPrevious);
+    const journal = JSON.parse(readFileSync(join(h.root, 'journals', 'cswap-import-prev-failure', 'journal.json'), 'utf8')) as { slots: Array<Record<string, unknown>> };
+    assert.deepEqual(journal.slots[0].destinationExisted, true);
+    assert.equal(journal.slots[0].prevSaved, true);
+    assert.equal(journal.slots[0].previousSaved, true);
+    assert.equal(journal.slots[0].reached, 'previous');
+    assert.equal(journal.slots[0].promotedFingerprint, credentialFingerprint(credential('account-a', 'live-successor')));
+    for (const service of [
+      'qlb:anthropic:staging:prev-failure:account-a',
+      'qlb:anthropic:import-prev:prev-failure:account-a',
+      'qlb:anthropic:import-prev-prev:prev-failure:account-a',
+    ]) await assert.rejects(h.keychain.get(service, QLB_KEYCHAIN_ACCOUNT), /item not found/);
+  });
+
+  it('recovers every crash point after a final write without touching unreached destinations', async () => {
+    for (const crashAfter of [1, 2, 3]) {
+      const h = fixture();
+      const runId = `crash-${crashAfter}`;
+      let writes = 0;
+      const options = {
+        backupDir: h.backup, journalDir: join(h.root, 'journals'), keychain: h.keychain, repository: h.repo, runId,
+        liveAccountId: async () => 'account-a', liveCredential: async () => credential('account-a', 'live-successor'),
+        afterPromotionWrite: () => { if (++writes === crashAfter) throw new CswapImportInjectedCrash(); },
+      };
+      await assert.rejects(importCswap(options), CswapImportInjectedCrash);
+      const before = JSON.parse(readFileSync(join(h.root, 'journals', `cswap-import-${runId}`, 'journal.json'), 'utf8')) as { phase: string; slots: Array<{ reached: string }> };
+      assert.equal(before.phase, 'promoting');
+      await assert.doesNotReject(recoverUncommittedCswapImport(options, runId));
+      assert.equal(h.repo.listSlots().length, 0);
+      await assert.rejects(h.keychain.get('qlb:anthropic:account-a', QLB_KEYCHAIN_ACCOUNT), /item not found/);
+      await assert.rejects(h.keychain.get('qlb:anthropic:account-b', QLB_KEYCHAIN_ACCOUNT), /item not found/);
+      await assert.rejects(h.keychain.get('qlb:anthropic:account-a:prev', QLB_KEYCHAIN_ACCOUNT), /item not found/);
+    }
+  });
+
+  it('refuses a second process-wide import while a first import holds the lock', async () => {
+    const h = fixture();
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    let entered!: () => void;
+    const enteredLiveRead = new Promise<void>((resolve) => { entered = resolve; });
+    const first = importCswap({
+      backupDir: h.backup, journalDir: join(h.root, 'journals'), keychain: h.keychain, repository: h.repo,
+      liveAccountId: async () => 'account-a',
+      liveCredential: async () => { entered(); await held; return credential('account-a', 'live-successor'); },
+    });
+    await enteredLiveRead;
+    await assert.rejects(importCswap({
+      backupDir: h.backup, journalDir: join(h.root, 'journals'), keychain: h.keychain, repository: h.repo,
+    }), (error: unknown) => (error as { code?: string }).code === 'import-in-progress');
+    release();
+    await first;
   });
 });

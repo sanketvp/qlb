@@ -10,15 +10,40 @@
 import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { credentialFingerprint } from './anthropic-oauth';
-import { looksLikeApiKey } from './cc-credentials';
+import { credentialFingerprint, parseCredentialBlob } from './anthropic-oauth';
 import type { ClaudeSlot, ClaudeSlotBackend, ClaudeSlotRepository } from './cc-slots';
+import { CswapImportInProgress, withCswapImportLock } from './cc-locks';
+import { looksLikeApiKey } from './cc-credentials';
 import { isCredentialNotFound } from './credential-backends';
 import { QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from './keychain';
 
 const PROVIDER = 'anthropic';
 
 export type CswapCredentialBackend = 'enc' | 'keychain';
+export type CswapImportRefusalCode =
+  | 'destination-non-empty'
+  | 'destination-lineage-unrelated'
+  | 'import-in-progress'
+  | 'live-active-identity-mismatch'
+  | 'live-identity-unresolvable'
+  | 'api-key-source'
+  | 'session-profiles';
+
+/** A credential-free, operator-actionable refusal (command exit 3). */
+export class CswapImportRefusalError extends Error {
+  constructor(readonly code: CswapImportRefusalCode, message: string) {
+    super(message);
+    this.name = 'CswapImportRefusalError';
+  }
+}
+
+/** Test seam: models a process dying after a durable Keychain write. */
+export class CswapImportInjectedCrash extends Error {
+  constructor() {
+    super('injected C-swap import crash');
+    this.name = 'CswapImportInjectedCrash';
+  }
+}
 
 export interface CswapImportSlotPlan {
   slotNum: number;
@@ -27,7 +52,6 @@ export interface CswapImportSlotPlan {
   alias: string | null;
   orgUuid: string | null;
   threshold: number | null;
-  configJson: string;
   fingerprint: string;
   previousFingerprint: string | null;
   backend: CswapCredentialBackend;
@@ -48,16 +72,21 @@ export interface CswapImportPlan {
 export interface CswapImportOptions {
   /** The fixture or configured C-swap backup root; never defaults to a real home here. */
   backupDir: string;
+  /** QLB-owned journal root. This is required so an import never writes the source tree. */
   journalDir?: string;
   keychain: ClaudeSlotBackend;
   repository: ClaudeSlotRepository;
   /** Read only; supplied by the command for the live Claude Code item. */
   liveCredential?: () => Promise<string>;
+  /** Identity comes from Claude's global config oauthAccount, never the credential blob. */
+  liveAccountId?: () => Promise<string | null>;
   now?: () => number;
   runId?: string;
   replace?: boolean;
   /** S46 proof injected by the Store-bound lineage service. */
   isSuccessor?: (accountId: string, ancestor: string, descendant: string) => boolean;
+  /** Test-only crash point, called after each final Keychain write. */
+  afterPromotionWrite?: (point: 'destination-written' | 'previous-written', accountId: string) => void;
   files?: CswapImportFileOps;
 }
 
@@ -78,20 +107,36 @@ const files: CswapImportFileOps = {
 };
 
 interface SourceSlot extends CswapImportSlotPlan {
+  configJson: string;
   credential: string;
   previousCredential: string | null;
   /** Inventory count only; never returned with a credential value. */
   keychainItems: number;
 }
 
+type ReachedPhase = 'unreached' | 'destination' | 'previous';
+
+/**
+ * Deliberately credential-free S62 recovery record. Every preimage has its own
+ * QLB-owned backup service; the journal can therefore restore both final keys.
+ */
 interface JournalSlot {
   accountId: string;
   staging: string;
   destination: string;
   importPrevious: string;
+  importPreviousPrevious: string;
   fingerprint: string;
   previousFingerprint: string | null;
+  promotedFingerprint: string | null;
+  destinationExisted: boolean | null;
+  priorDestinationFingerprint: string | null;
+  priorDestinationLineage: string | null;
+  previousDestinationExisted: boolean | null;
+  priorPreviousFingerprint: string | null;
   prevSaved: boolean;
+  previousSaved: boolean;
+  reached: ReachedPhase;
 }
 
 interface Journal {
@@ -101,8 +146,14 @@ interface Journal {
   slots: JournalSlot[];
 }
 
+interface PromotionEffect {
+  entry: JournalSlot;
+  prior: string | null;
+  priorPrevious: string | null;
+}
+
 function safeSegment(value: string, label: string): string {
-  if (!value || /[\\/\0]/.test(value)) throw new Error(`invalid C-swap ${label}`);
+  if (!value || /[\\/\0:]/.test(value)) throw new Error(`invalid C-swap ${label}`);
   return value;
 }
 
@@ -124,14 +175,14 @@ function nullableNumber(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
 
-function credentialAccountId(credential: string): string | null {
-  try {
-    const root = object(JSON.parse(credential), 'invalid credential');
-    const oauth = object(root.claudeAiOauth, 'invalid credential');
-    return nullableString(oauth.accountUuid) ?? nullableString(oauth.account_id);
-  } catch {
-    return null;
+/** A C-swap source is accepted only as a real Claude Code OAuth document. */
+function oauthFingerprint(credential: string, slotNum: number): string {
+  const oauth = parseCredentialBlob(credential)?.oauth;
+  if (!oauth || typeof oauth.refreshToken !== 'string' || !oauth.refreshToken) {
+    throw new Error(`C-swap OAuth credential is invalid for slot ${slotNum}`);
   }
+  // refreshToken was checked above, so this cannot be the sha256-full fallback.
+  return credentialFingerprint(credential)!;
 }
 
 function configAccountId(config: string): string {
@@ -151,7 +202,7 @@ function base64Credential(text: string): string | null {
   }
 }
 
-function service(runId: string, accountId: string, kind: 'staging' | 'import-prev'): string {
+function service(runId: string, accountId: string, kind: 'staging' | 'import-prev' | 'import-prev-prev'): string {
   return qlbKeychainService(PROVIDER, `${kind}:${safeSegment(runId, 'run id')}:${safeSegment(accountId, 'account identity')}`);
 }
 
@@ -172,7 +223,7 @@ async function optionalGet(keychain: ClaudeSlotBackend, target: string, account 
 
 /** A valid .enc wins even while its stale Keychain fallback is unreadable. */
 async function probeCswapItem(keychain: ClaudeSlotBackend, account: string): Promise<string | null> {
-  try { return await keychain.get('claude-swap', account); } catch { return null; }
+  return optionalGet(keychain, 'claude-swap', account);
 }
 
 function countSessions(root: string, io: CswapImportFileOps): number {
@@ -192,6 +243,7 @@ async function readSourceSlots(options: CswapImportOptions): Promise<{ slots: So
   const accounts = object(sequence.accounts, 'C-swap sequence has no accounts');
   const activeNumber = sequence.activeAccountNumber == null ? null : String(sequence.activeAccountNumber);
   const slots: SourceSlot[] = [];
+  const identities = new Set<string>();
   for (const [number, rawRecord] of Object.entries(accounts)) {
     const record = object(rawRecord, 'C-swap account record is malformed');
     const slotNum = Number(number);
@@ -201,14 +253,14 @@ async function readSourceSlots(options: CswapImportOptions): Promise<{ slots: So
     let configJson: string;
     try { configJson = io.readText(configPath); } catch { throw new Error(`C-swap config is unreadable for slot ${number}`); }
     const accountId = safeSegment(configAccountId(configJson), 'account identity');
+    if (identities.has(accountId)) throw new Error(`C-swap duplicate account identity for slot ${number}`);
+    identities.add(accountId);
     const encPath = join(options.backupDir, 'credentials', `.creds-${number}-${email}.enc`);
     const encPresent = io.exists(encPath);
     let credential: string | null = null;
     if (encPresent) {
       try { credential = base64Credential(io.readText(encPath)); } catch { /* corrupt/unreadable .enc falls through */ }
     }
-    // Inventory probes both C-swap generations even when a valid .enc shadows
-    // the current item; reader precedence still decides the imported bytes.
     const keychainCurrent = await probeCswapItem(options.keychain, `account-${number}-${email}`);
     let backend: CswapCredentialBackend = 'enc';
     if (credential == null) {
@@ -217,17 +269,16 @@ async function readSourceSlots(options: CswapImportOptions): Promise<{ slots: So
       credential = keychainCurrent;
     }
     if (looksLikeApiKey(credential)) {
-      throw new Error(`C-swap API-key slot refused: ${number}`);
+      throw new CswapImportRefusalError('api-key-source', `C-swap API-key slot refused: ${number}`);
     }
-    const fingerprint = credentialFingerprint(credential);
-    if (!fingerprint) throw new Error(`C-swap credential is invalid for slot ${number}`);
+    const fingerprint = oauthFingerprint(credential, slotNum);
     let previousFromEnc: string | null = null;
     if (io.exists(`${encPath}.prev`)) {
       try { previousFromEnc = base64Credential(io.readText(`${encPath}.prev`)); } catch { /* Keychain prev remains a fallback */ }
     }
     const keychainPrevious = await probeCswapItem(options.keychain, `account-${number}-${email}.prev`);
     const previousText = previousFromEnc ?? keychainPrevious;
-    const previousFingerprint = previousText ? credentialFingerprint(previousText) : null;
+    const previousFingerprint = previousText ? oauthFingerprint(previousText, slotNum) : null;
     slots.push({
       slotNum, email, accountId, alias: nullableString(record.alias),
       orgUuid: nullableString(record.organizationUuid) ?? nullableString(record.orgUuid),
@@ -262,8 +313,6 @@ function importedSettings(options: CswapImportOptions): Record<string, string> {
     }
     return out;
   } catch {
-    // Imported credentials remain valid when C-swap's optional preferences
-    // cache is stale or malformed; it is not an authorization source.
     return {};
   }
 }
@@ -287,10 +336,10 @@ function importedSnapshots(options: CswapImportOptions, slots: SourceSlot[]): Ar
       for (const [field, bucket] of [['fiveHour', 'five_hour'], ['five_hour', 'five_hour'], ['sevenDay', 'seven_day'], ['seven_day', 'seven_day']] as const) {
         const reading = (lastGood as Record<string, unknown>)[field];
         const value = reading && typeof reading === 'object' && !Array.isArray(reading)
-          ? nullableNumber((reading as Record<string, unknown>).utilization ?? (reading as Record<string, unknown>).usedPct)
+          ? nullableNumber((reading as Record<string, unknown>).pct ?? (reading as Record<string, unknown>).utilization ?? (reading as Record<string, unknown>).usedPct)
           : nullableNumber(reading);
         if (value == null || value < 0 || value > 100 || result.some((item) => item.accountId === slot.accountId && item.bucket === bucket)) continue;
-        result.push({ accountId: slot.accountId, bucket, usedPct: value, fetchedAt: fetched });
+        result.push({ accountId: slot.accountId, bucket, usedPct: value, fetchedAt: fetched < 100_000_000_000 ? fetched * 1000 : fetched });
       }
     }
     return result;
@@ -299,7 +348,8 @@ function importedSnapshots(options: CswapImportOptions, slots: SourceSlot[]): Ar
 
 function planFrom(slots: SourceSlot[], sessionProfiles: number, replaceRequired: boolean): CswapImportPlan {
   return {
-    slots: slots.map(({ credential: _credential, previousCredential: _previousCredential, keychainItems: _keychainItems, ...slot }) => slot),
+    slots: slots.map(({ slotNum, email, accountId, alias, orgUuid, threshold, fingerprint, previousFingerprint, backend, encPresent, active }) =>
+      ({ slotNum, email, accountId, alias, orgUuid, threshold, fingerprint, previousFingerprint, backend, encPresent, active })),
     keychainItems: slots.reduce((count, slot) => count + slot.keychainItems, 0),
     apiKeySlots: 0, sessionProfiles, encFiles: slots.filter((slot) => slot.encPresent).length,
     activeAccountId: slots.find((slot) => slot.active)?.accountId ?? null,
@@ -310,8 +360,13 @@ function planFrom(slots: SourceSlot[], sessionProfiles: number, replaceRequired:
 /** Read-only inventory. It deliberately never probes the live Claude credential. */
 export async function planCswapImport(options: CswapImportOptions): Promise<CswapImportPlan> {
   const { slots, sessionProfiles } = await readSourceSlots(options);
-  const replaceRequired = options.repository.listSlots().length > 0 || await Promise.all(slots.map((slot) => optionalGet(options.keychain, destination(slot.accountId))))
-    .then((items) => items.some((item) => item !== null));
+  const replaceRequired = options.repository.listSlots().length > 0 || await Promise.all(slots.map(async (slot) => {
+    const [current, previous] = await Promise.all([
+      optionalGet(options.keychain, destination(slot.accountId)),
+      optionalGet(options.keychain, previousDestination(slot.accountId)),
+    ]);
+    return current !== null || previous !== null;
+  })).then((items) => items.some(Boolean));
   return planFrom(slots, sessionProfiles, replaceRequired);
 }
 
@@ -323,25 +378,34 @@ function admittedReplace(existing: ClaudeSlot, source: SourceSlot, successor: Cs
 
 async function assertDestination(options: CswapImportOptions, slots: SourceSlot[]): Promise<void> {
   const existingSlots = options.repository.listSlots();
-  const hasSlot = existingSlots.length > 0;
   const sourceIds = new Set(slots.map((slot) => slot.accountId));
   const unrelated = existingSlots.find((slot) => !sourceIds.has(slot.accountId));
-  if (unrelated) throw new Error(`C-swap import refused: destination has unrelated slot ${unrelated.accountId}`);
+  if (unrelated) throw new CswapImportRefusalError('destination-non-empty', `C-swap import refused: destination has unrelated slot ${unrelated.accountId}`);
   for (const source of slots) {
     const dbSlot = options.repository.getSlot(source.accountId);
-    const item = await optionalGet(options.keychain, destination(source.accountId));
-    if (!dbSlot && !item) continue;
-    if (!options.replace) throw new Error(`C-swap import refused: destination is non-empty for slot ${source.slotNum}`);
-    if (!dbSlot || !admittedReplace(dbSlot, source, options.isSuccessor)) {
-      throw new Error(`C-swap import refused: destination lineage is unrelated for slot ${source.slotNum}`);
+    const [item, previous] = await Promise.all([
+      optionalGet(options.keychain, destination(source.accountId)),
+      optionalGet(options.keychain, previousDestination(source.accountId)),
+    ]);
+    if (!dbSlot && !item && !previous) continue;
+    if (!options.replace) throw new CswapImportRefusalError('destination-non-empty', `C-swap import refused: destination is non-empty for slot ${source.slotNum}`);
+    if (!dbSlot || !item || !admittedReplace(dbSlot, source, options.isSuccessor)) {
+      throw new CswapImportRefusalError('destination-lineage-unrelated', `C-swap import refused: destination lineage is unrelated for slot ${source.slotNum}`);
+    }
+    // The actual bytes must agree with the metadata used for S46 admission.
+    if (credentialFingerprint(item) !== dbSlot.fingerprint) {
+      throw new CswapImportRefusalError('destination-lineage-unrelated', `C-swap import refused: destination lineage is unrelated for slot ${source.slotNum}`);
     }
   }
-  if (hasSlot && !options.replace) throw new Error('C-swap import refused: destination is non-empty');
+}
+
+function journalRoot(options: CswapImportOptions): string {
+  if (!options.journalDir) throw new Error('C-swap import requires a QLB journal directory');
+  return options.journalDir;
 }
 
 function journalPath(options: CswapImportOptions, runId: string): string {
-  const root = options.journalDir ?? join(options.backupDir, '.qlb-import-journal');
-  return join(root, `cswap-import-${safeSegment(runId, 'run id')}`, 'journal.json');
+  return join(journalRoot(options), `cswap-import-${safeSegment(runId, 'run id')}`, 'journal.json');
 }
 
 function writeJournal(options: CswapImportOptions, journal: Journal): void {
@@ -351,20 +415,84 @@ function writeJournal(options: CswapImportOptions, journal: Journal): void {
   io.writeText(path, JSON.stringify(journal));
 }
 
+async function deleteIfPresent(keychain: ClaudeSlotBackend, target: string): Promise<void> {
+  try { await keychain.delete(target, QLB_KEYCHAIN_ACCOUNT); } catch (error) { if (!isCredentialNotFound(error)) throw error; }
+}
+
 async function cleanup(keychain: ClaudeSlotBackend, journal: Journal): Promise<void> {
   for (const entry of journal.slots) {
-    try { await keychain.delete(entry.staging, QLB_KEYCHAIN_ACCOUNT); } catch (error) { if (!isCredentialNotFound(error)) throw error; }
-    try { await keychain.delete(entry.importPrevious, QLB_KEYCHAIN_ACCOUNT); } catch (error) { if (!isCredentialNotFound(error)) throw error; }
+    await deleteIfPresent(keychain, entry.staging);
+    await deleteIfPresent(keychain, entry.importPrevious);
+    await deleteIfPresent(keychain, entry.importPreviousPrevious);
   }
 }
 
-/**
- * Executes §4.9 staging/promotion. K14 owns cross-process journal discovery;
- * this function records all phases and exposes S62's import-run authority.
- */
+function readJournal(options: CswapImportOptions, runId: string): Journal {
+  const io = options.files ?? files;
+  try {
+    const parsed = JSON.parse(io.readText(journalPath(options, runId))) as Partial<Journal>;
+    if (!parsed || typeof parsed !== 'object' || parsed.runId !== runId || !Array.isArray(parsed.slots)) throw new Error('invalid');
+    return parsed as Journal;
+  } catch {
+    throw new Error('C-swap import journal is unreadable');
+  }
+}
+
+async function rollbackEffects(keychain: ClaudeSlotBackend, effects: PromotionEffect[]): Promise<unknown[]> {
+  const failures: unknown[] = [];
+  for (const effect of [...effects].reverse()) {
+    try {
+      if (effect.prior == null) await deleteIfPresent(keychain, effect.entry.destination);
+      else await keychain.set(effect.entry.destination, QLB_KEYCHAIN_ACCOUNT, effect.prior);
+    } catch (error) { failures.push(error); }
+    try {
+      const previous = previousDestination(effect.entry.accountId);
+      if (effect.priorPrevious == null) await deleteIfPresent(keychain, previous);
+      else await keychain.set(previous, QLB_KEYCHAIN_ACCOUNT, effect.priorPrevious);
+    } catch (error) { failures.push(error); }
+  }
+  return failures;
+}
+
+async function liveEffectiveCredentials(options: CswapImportOptions, sourceSlots: SourceSlot[]): Promise<Array<SourceSlot & {
+  effectiveCredential: string; effectivePrevious: string | null; effectiveFrom: string | null;
+}>> {
+  const effective = sourceSlots.map((slot) => ({ ...slot, effectiveCredential: slot.credential, effectivePrevious: slot.previousCredential, effectiveFrom: null as string | null }));
+  const activeIndex = effective.findIndex((slot) => slot.active);
+  if (activeIndex < 0 || !options.liveCredential) return effective;
+  if (!options.liveAccountId) {
+    throw new CswapImportRefusalError('live-identity-unresolvable', 'C-swap import refused: live active identity is unresolvable');
+  }
+  const [live, identity] = await Promise.all([options.liveCredential(), options.liveAccountId()]);
+  if (!identity) throw new CswapImportRefusalError('live-identity-unresolvable', 'C-swap import refused: live active identity is unresolvable');
+  if (identity !== effective[activeIndex].accountId) {
+    throw new CswapImportRefusalError('live-active-identity-mismatch', 'C-swap import refused: live active identity mismatch');
+  }
+  const liveFingerprint = oauthFingerprint(live, effective[activeIndex].slotNum);
+  if (live !== effective[activeIndex].credential) {
+    effective[activeIndex].effectiveCredential = live;
+    effective[activeIndex].effectivePrevious = effective[activeIndex].credential;
+    effective[activeIndex].effectiveFrom = liveFingerprint === effective[activeIndex].fingerprint ? null : effective[activeIndex].fingerprint;
+  }
+  return effective;
+}
+
+/** Executes §4.9 staging/promotion. K14 consumes this credential-free S62 journal. */
 export async function importCswap(options: CswapImportOptions): Promise<{ runId: string; phase: 'cleaned'; plan: CswapImportPlan }> {
+  const lock = join(journalRoot(options), 'cswap-import.lock');
+  try {
+    return await withCswapImportLock(lock, () => importCswapLocked(options));
+  } catch (error) {
+    if (error instanceof CswapImportInProgress) {
+      throw new CswapImportRefusalError('import-in-progress', 'C-swap import refused: import already in progress');
+    }
+    throw error;
+  }
+}
+
+async function importCswapLocked(options: CswapImportOptions): Promise<{ runId: string; phase: 'cleaned'; plan: CswapImportPlan }> {
   const { slots: sourceSlots, sessionProfiles } = await readSourceSlots(options);
-  if (sessionProfiles > 0) throw new Error(`C-swap import refused: ${sessionProfiles} session profiles present`);
+  if (sessionProfiles > 0) throw new CswapImportRefusalError('session-profiles', `C-swap import refused: ${sessionProfiles} session profiles present`);
   await assertDestination(options, sourceSlots);
   const plan = planFrom(sourceSlots, sessionProfiles, options.repository.listSlots().length > 0);
   const now = options.now ?? Date.now;
@@ -372,58 +500,78 @@ export async function importCswap(options: CswapImportOptions): Promise<{ runId:
   const runId = options.runId ?? `${startedAt}-${randomUUID()}`;
   const journal: Journal = {
     runId, phase: 'staged', startedAt,
-    slots: sourceSlots.map((slot) => ({ accountId: slot.accountId, staging: service(runId, slot.accountId, 'staging'),
+    slots: sourceSlots.map((slot) => ({
+      accountId: slot.accountId, staging: service(runId, slot.accountId, 'staging'),
       destination: destination(slot.accountId), importPrevious: service(runId, slot.accountId, 'import-prev'),
-      fingerprint: slot.fingerprint, previousFingerprint: slot.previousFingerprint, prevSaved: false })),
+      importPreviousPrevious: service(runId, slot.accountId, 'import-prev-prev'),
+      fingerprint: slot.fingerprint, previousFingerprint: slot.previousFingerprint, promotedFingerprint: null,
+      destinationExisted: null, priorDestinationFingerprint: null, priorDestinationLineage: null,
+      previousDestinationExisted: null, priorPreviousFingerprint: null,
+      prevSaved: false, previousSaved: false, reached: 'unreached',
+    })),
   };
   writeJournal(options, journal);
-  const finals: Array<{ target: string; prior: string | null; previousTarget: string; priorPrevious: string | null; replaced: boolean }> = [];
+  const effects: PromotionEffect[] = [];
   try {
     for (let index = 0; index < sourceSlots.length; index += 1) {
       const source = sourceSlots[index];
       await options.keychain.set(journal.slots[index].staging, QLB_KEYCHAIN_ACCOUNT, source.credential);
       const actual = await options.keychain.get(journal.slots[index].staging, QLB_KEYCHAIN_ACCOUNT);
-      if (credentialFingerprint(actual) !== source.fingerprint) throw new Error(`C-swap import verification failed for slot ${source.slotNum}`);
+      if (oauthFingerprint(actual, source.slotNum) !== source.fingerprint) throw new Error(`C-swap import verification failed for slot ${source.slotNum}`);
     }
 
-    // The live value only supersedes the C-swap backup for its matching active identity.
-    const effective = sourceSlots.map((slot) => ({ ...slot, effectiveCredential: slot.credential, effectivePrevious: slot.previousCredential, effectiveFrom: null as string | null }));
-    const activeIndex = effective.findIndex((slot) => slot.active);
-    if (activeIndex >= 0 && options.liveCredential) {
-      const live = await options.liveCredential();
-      if (credentialAccountId(live) !== effective[activeIndex].accountId) throw new Error('C-swap import refused: live active identity mismatch');
-      const liveFingerprint = credentialFingerprint(live);
-      if (!liveFingerprint) throw new Error('C-swap import refused: live active credential is invalid');
-      if (live !== effective[activeIndex].credential) {
-        effective[activeIndex].effectiveCredential = live;
-        effective[activeIndex].effectivePrevious = effective[activeIndex].credential;
-        // Same-lineage refreshes have no S46 graph edge; a different refresh
-        // lineage records the C-swap copy as its explicit ancestor.
-        effective[activeIndex].effectiveFrom = liveFingerprint === effective[activeIndex].fingerprint
-          ? null : effective[activeIndex].fingerprint;
-      }
-    }
-
+    const effective = await liveEffectiveCredentials(options, sourceSlots);
     journal.phase = 'promoting';
+    for (let index = 0; index < effective.length; index += 1) {
+      journal.slots[index].promotedFingerprint = oauthFingerprint(effective[index].effectiveCredential, effective[index].slotNum);
+    }
     writeJournal(options, journal);
+
     for (let index = 0; index < effective.length; index += 1) {
       const slot = effective[index];
       const entry = journal.slots[index];
-      const prior = await optionalGet(options.keychain, entry.destination);
       const previousTarget = previousDestination(slot.accountId);
-      const priorPrevious = await optionalGet(options.keychain, previousTarget);
+      const [prior, priorPrevious] = await Promise.all([
+        optionalGet(options.keychain, entry.destination),
+        optionalGet(options.keychain, previousTarget),
+      ]);
+      // Register every preimage before the first write, including a write of a
+      // backup service. A failure at either final service can now be undone.
+      effects.push({ entry, prior, priorPrevious });
+      const dbSlot = options.repository.getSlot(slot.accountId);
+      entry.destinationExisted = prior !== null;
+      entry.priorDestinationFingerprint = prior ? credentialFingerprint(prior) : null;
+      entry.priorDestinationLineage = dbSlot?.prevFingerprint ?? null;
+      entry.previousDestinationExisted = priorPrevious !== null;
+      entry.priorPreviousFingerprint = priorPrevious ? credentialFingerprint(priorPrevious) : null;
+      writeJournal(options, journal);
       if (prior != null) {
         await options.keychain.set(entry.importPrevious, QLB_KEYCHAIN_ACCOUNT, prior);
         entry.prevSaved = true;
         writeJournal(options, journal);
       }
+      if (priorPrevious != null) {
+        await options.keychain.set(entry.importPreviousPrevious, QLB_KEYCHAIN_ACCOUNT, priorPrevious);
+        entry.previousSaved = true;
+        writeJournal(options, journal);
+      }
+      // Persist the recovery intent before each non-idempotent final write. If
+      // a process dies between this journal write and the Keychain call, restore
+      // is still safe because the durable preimage represents the same bytes.
+      entry.reached = 'destination';
+      writeJournal(options, journal);
       await options.keychain.set(entry.destination, QLB_KEYCHAIN_ACCOUNT, slot.effectiveCredential);
-      if (slot.effectivePrevious) await options.keychain.set(previousTarget, QLB_KEYCHAIN_ACCOUNT, slot.effectivePrevious);
-      finals.push({ target: entry.destination, prior, previousTarget, priorPrevious, replaced: prior !== null });
+      options.afterPromotionWrite?.('destination-written', slot.accountId);
+      if (slot.effectivePrevious) {
+        entry.reached = 'previous';
+        writeJournal(options, journal);
+        await options.keychain.set(previousTarget, QLB_KEYCHAIN_ACCOUNT, slot.effectivePrevious);
+        options.afterPromotionWrite?.('previous-written', slot.accountId);
+      }
     }
     for (let index = 0; index < effective.length; index += 1) {
       const actual = await options.keychain.get(journal.slots[index].destination, QLB_KEYCHAIN_ACCOUNT);
-      if (credentialFingerprint(actual) !== credentialFingerprint(effective[index].effectiveCredential)) {
+      if (oauthFingerprint(actual, effective[index].slotNum) !== journal.slots[index].promotedFingerprint) {
         throw new Error(`C-swap import final verification failed for slot ${effective[index].slotNum}`);
       }
     }
@@ -441,8 +589,7 @@ export async function importCswap(options: CswapImportOptions): Promise<{ runId:
         }, lineageFrom: source.effectiveFrom,
       })),
       activeAccountId: effective.find((slot) => slot.active)?.accountId ?? null,
-      snapshots: importedSnapshots(options, sourceSlots),
-      config: importedSettings(options),
+      snapshots: importedSnapshots(options, sourceSlots), config: importedSettings(options),
     });
     journal.phase = 'committed';
     writeJournal(options, journal);
@@ -451,28 +598,76 @@ export async function importCswap(options: CswapImportOptions): Promise<{ runId:
     writeJournal(options, journal);
     return { runId, phase: 'cleaned', plan };
   } catch (error) {
-    // Before the durable DB commit, restore a replaced destination and remove
-    // new destinations. This is the same data recorded for K14's crash path.
-    const committed = options.repository.getImportRun(runId)?.committedAt != null;
+    // An injected crash deliberately bypasses compensation so S62 recovery is
+    // exercised against exactly the durable state a killed process leaves.
+    if (error instanceof CswapImportInjectedCrash) throw error;
+    let committed = false;
+    try { committed = options.repository.getImportRun(runId)?.committedAt != null; } catch { /* compensate even if SQLite is unavailable */ }
     if (committed) {
-      // S62: a durable row wins over a failed cleanup/write of the journal.
-      // K14 will finish cleanup; never mislabel this committed promotion aborted.
       journal.phase = 'committed';
       try { writeJournal(options, journal); } catch { /* original failure remains authoritative */ }
       throw error;
     }
-    for (let index = finals.length - 1; index >= 0; index -= 1) {
-      const effect = finals[index];
-      const entry = journal.slots.find((slot) => slot.destination === effect.target)!;
-      try {
-        if (effect.replaced && effect.prior != null) await options.keychain.set(effect.target, QLB_KEYCHAIN_ACCOUNT, effect.prior);
-        else await options.keychain.delete(effect.target, QLB_KEYCHAIN_ACCOUNT);
-        if (effect.priorPrevious != null) await options.keychain.set(effect.previousTarget, QLB_KEYCHAIN_ACCOUNT, effect.priorPrevious);
-        else await options.keychain.delete(effect.previousTarget, QLB_KEYCHAIN_ACCOUNT);
-      } catch { /* original failure remains authoritative */ }
+    const restoreFailures = await rollbackEffects(options.keychain, effects);
+    let cleanupFailure: unknown | null = null;
+    try { await cleanup(options.keychain, journal); } catch (failure) { cleanupFailure = failure; }
+    if (restoreFailures.length > 0 || cleanupFailure) {
+      // Do not falsely mark a journal terminal when an operator/K14 must recover it.
+      try { writeJournal(options, journal); } catch { /* preserve original error */ }
+      throw new Error(`C-swap import recovery required: ${journalPath(options, runId)}`);
     }
     journal.phase = 'aborted';
     try { writeJournal(options, journal); } catch { /* original failure remains authoritative */ }
     throw error;
   }
+}
+
+/**
+ * S62 recovery primitive for K14: the SQLite import_runs row decides whether a
+ * promoting journal committed. Unreached slots are deliberately untouched.
+ */
+export async function recoverUncommittedCswapImport(options: CswapImportOptions, runId: string): Promise<'cleaned' | 'aborted'> {
+  const journal = readJournal(options, runId);
+  if (options.repository.getImportRun(runId)?.committedAt != null) {
+    await cleanup(options.keychain, journal);
+    journal.phase = 'cleaned';
+    writeJournal(options, journal);
+    return 'cleaned';
+  }
+  if (journal.phase === 'promoting') {
+    for (const entry of [...journal.slots].reverse()) {
+      if (entry.reached === 'unreached') continue;
+      if (entry.destinationExisted) {
+        if (!entry.prevSaved || !entry.priorDestinationFingerprint) {
+          throw new Error(`C-swap import recovery required: ${journalPath(options, runId)}`);
+        }
+        const backup = await options.keychain.get(entry.importPrevious, QLB_KEYCHAIN_ACCOUNT);
+        if (credentialFingerprint(backup) !== entry.priorDestinationFingerprint) {
+          throw new Error(`C-swap import recovery required: ${journalPath(options, runId)}`);
+        }
+        await options.keychain.set(entry.destination, QLB_KEYCHAIN_ACCOUNT, backup);
+      } else {
+        await deleteIfPresent(options.keychain, entry.destination);
+      }
+      if (entry.reached === 'previous') {
+        const previous = previousDestination(entry.accountId);
+        if (entry.previousDestinationExisted) {
+          if (!entry.previousSaved || !entry.priorPreviousFingerprint) {
+            throw new Error(`C-swap import recovery required: ${journalPath(options, runId)}`);
+          }
+          const backup = await options.keychain.get(entry.importPreviousPrevious, QLB_KEYCHAIN_ACCOUNT);
+          if (credentialFingerprint(backup) !== entry.priorPreviousFingerprint) {
+            throw new Error(`C-swap import recovery required: ${journalPath(options, runId)}`);
+          }
+          await options.keychain.set(previous, QLB_KEYCHAIN_ACCOUNT, backup);
+        } else {
+          await deleteIfPresent(options.keychain, previous);
+        }
+      }
+    }
+  }
+  await cleanup(options.keychain, journal);
+  journal.phase = 'aborted';
+  writeJournal(options, journal);
+  return 'aborted';
 }
