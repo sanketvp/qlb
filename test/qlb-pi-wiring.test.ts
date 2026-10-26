@@ -13,16 +13,44 @@ const PI_GLOBAL_ROOT = process.env.QLB_TEST_PI_ROOT ?? resolvePiPackageRoot() ??
 const piAvailable = existsSync(join(PI_GLOBAL_ROOT, 'node_modules', 'jiti', 'lib', 'jiti.mjs'));
 
 const loader = String.raw`
+import { createRequire } from 'node:module';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 const root = process.env.PI_GLOBAL_ROOT;
 const { createJiti } = await import(pathToFileURL(join(root, 'node_modules', 'jiti', 'lib', 'jiti.mjs')).href);
-const compat = join(root, 'node_modules', '@earendil-works', 'pi-ai', 'dist', 'compat.js');
+const piRequire = createRequire(join(root, 'package.json'));
+const piAi = join(root, 'node_modules', '@earendil-works', 'pi-ai', 'dist');
+const piAgentCore = join(root, 'node_modules', '@earendil-works', 'pi-agent-core', 'dist', 'index.js');
+const piTui = join(root, 'node_modules', '@earendil-works', 'pi-tui', 'dist', 'index.js');
+const piCodingAgent = join(root, 'dist', 'index.js');
+const typebox = piRequire.resolve('typebox');
+const typeboxCompile = piRequire.resolve('typebox/compile');
+const typeboxValue = piRequire.resolve('typebox/value');
+// Exact Pi 1.4.0 extension alias table: dist/core/extensions/loader.js:63-81.
+// Pi exposes only these pi-ai entrypoints; provider-specific subpaths are not aliases.
 const jiti = createJiti(import.meta.url, { moduleCache: false, alias: {
-  '@earendil-works/pi-ai/compat': compat,
-  '@earendil-works/pi-ai': compat,
-  '@earendil-works/pi-tui': join(root, 'node_modules', '@earendil-works', 'pi-tui', 'dist', 'index.js'),
-  '@earendil-works/pi-coding-agent': join(root, 'dist', 'index.js'),
+  '@earendil-works/pi-coding-agent': piCodingAgent,
+  '@earendil-works/pi-agent-core': piAgentCore,
+  '@earendil-works/pi-tui': piTui,
+  '@earendil-works/pi-ai/providers/all': join(piAi, 'providers', 'all.js'),
+  '@earendil-works/pi-ai/compat': join(piAi, 'compat.js'),
+  '@earendil-works/pi-ai/models': join(piAi, 'models.js'),
+  '@earendil-works/pi-ai/oauth': join(piAi, 'oauth.js'),
+  '@earendil-works/pi-ai': join(piAi, 'compat.js'),
+  '@mariozechner/pi-coding-agent': piCodingAgent,
+  '@mariozechner/pi-agent-core': piAgentCore,
+  '@mariozechner/pi-tui': piTui,
+  '@mariozechner/pi-ai/providers/all': join(piAi, 'providers', 'all.js'),
+  '@mariozechner/pi-ai/compat': join(piAi, 'compat.js'),
+  '@mariozechner/pi-ai/models': join(piAi, 'models.js'),
+  '@mariozechner/pi-ai/oauth': join(piAi, 'oauth.js'),
+  '@mariozechner/pi-ai': join(piAi, 'compat.js'),
+  typebox,
+  'typebox/compile': typeboxCompile,
+  'typebox/value': typeboxValue,
+  '@sinclair/typebox': typebox,
+  '@sinclair/typebox/compile': typeboxCompile,
+  '@sinclair/typebox/value': typeboxValue,
 } });
 const factory = await jiti.import(process.env.QLB_PI_EXTENSION, { default: true });
 const names = ['xai', 'kimi-coding', 'openrouter', 'openai-codex'];
@@ -51,7 +79,7 @@ const pi = {
   on(event, handler) { listeners.set(event, handler); }, registerCommand() {}, registerShortcut() {},
 };
 await factory(pi);
-await listeners.get('session_start')?.({}, { modelRegistry: { runtime: {
+await listeners.get('session_start')?.({}, { ui: { setStatus() {} }, modelRegistry: { runtime: {
   setRuntimeApiKey(provider, key) { runtimeApiKeys[provider] = key; return Promise.resolve(); },
 } } });
 const events = [];
@@ -69,7 +97,7 @@ if (process.env.CALL_CODEX === '1') {
   );
   for await (const event of stream) events.push(event);
 }
-console.log(JSON.stringify({ calls, replaced: Object.fromEntries(names.map((name) => [name, providers.get(name) !== native.get(name)])), oauth, authJson, runtimeApiKeys, events }));
+console.log(JSON.stringify({ calls, replaced: Object.fromEntries(names.map((name) => [name, providers.get(name) !== native.get(name)])), codexModelCount: providers.get('openai-codex')?.getModels?.().length ?? 0, oauth, authJson, runtimeApiKeys, events }));
 `;
 
 const fakeQlb = String.raw`
@@ -88,6 +116,7 @@ function load(owner?: string, gateFail = false, callCodex = false, perProviderOw
   oauth: { resolve: number; refresh: number };
   authJson: { reads: number; writes: number };
   runtimeApiKeys: Record<string, string>;
+  codexModelCount: number;
   events: Array<{ error?: { errorMessage?: string } }>;
 } {
   const home = mkdtempSync(join(tmpdir(), 'qlb-pi-wiring-'));
@@ -128,8 +157,18 @@ describe('qlb-pi provider wiring', { skip: piAvailable ? false : 'global Pi inst
     const owned = load(owner);
     assert.deepEqual(owned.replaced, { xai: true, 'kimi-coding': true, openrouter: true, 'openai-codex': true });
 
+    assert.ok(owned.codexModelCount > 0, 'an owned Codex provider keeps Pi\'s catalog');
+
     const inert = load();
     assert.deepEqual(inert.replaced, { xai: false, 'kimi-coding': false, openrouter: false, 'openai-codex': false });
+  });
+
+  it('does not infer a Codex owner from a shared Anthropic-only v2 document or legacy v1 document', () => {
+    const sharedAnthropicOnly = load(JSON.stringify({ providers: { anthropic: { mode: 'qlb', since: 1 } } }));
+    assert.equal(sharedAnthropicOnly.replaced['openai-codex'], false);
+
+    const legacyV1 = load(JSON.stringify({ owner: 'qlb', accounts: [] }));
+    assert.equal(legacyV1.replaced['openai-codex'], false);
   });
 
   it('registers Codex from the shadow-retaining per-provider owner artifact migration writes', () => {
@@ -161,26 +200,31 @@ describe('qlb-pi provider wiring', { skip: piAvailable ? false : 'global Pi inst
 });
 
 describe('OpenAI Codex registration adapter', () => {
-  it('forwards the gate credential and bare ChatGPT account id, never caller credentials', async () => {
+  it('retains a non-empty owned catalog and forwards one request to the injected transport', async () => {
     let options: Record<string, unknown> | undefined;
+    let transportCalls = 0;
     const events: unknown[] = [];
     const pi = {
       unregisterProvider() {},
-      registerProvider(config: { streamSimple: (model: { id: string }, context: unknown, options?: Record<string, unknown>) => unknown }) {
+      registerProvider(config: { getModels(): readonly { id: string }[]; streamSimple: (model: { id: string }, context: unknown, options?: Record<string, unknown>) => unknown }) {
+        assert.ok(config.getModels().length > 0);
         const stream = config.streamSimple({ id: 'gpt-5' }, {}, { headers: { Authorization: 'native', 'ChatGPT-Account-Id': 'composite' } });
         assert.equal(stream, sink);
       },
     };
     const sink = { push(event: unknown) { events.push(event); }, end() {} };
     const builtin: OpenAICodexBuiltin = async function* (_model, _context, next) {
+      transportCalls += 1;
       options = next;
       yield { type: 'done' };
     };
     registerOpenAICodexProvider(pi, builtin, {
       createStream: () => sink,
+      models: [{ id: 'gpt-5' }],
       runGate: async () => ({ code: 0, stdout: JSON.stringify({ token: 'fixture-codex-access', accountId: 'user:slot', chatgptAccountId: 'bare-account', source: 'fixture' }) }),
     });
     await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(transportCalls, 1);
     assert.equal(options?.apiKey, 'fixture-codex-access');
     assert.deepEqual(options?.headers, { Authorization: 'Bearer fixture-codex-access', 'ChatGPT-Account-Id': 'bare-account' });
     assert.deepEqual(events, [{ type: 'done' }]);

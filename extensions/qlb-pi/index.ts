@@ -130,40 +130,40 @@ const AUDIT_DIR = join(homedir(), ".qlb");
 const AUDIT_FILE = join(AUDIT_DIR, "outcomes.jsonl");
 
 /**
- * Mirrors pi-gate.ts ownerFormats(): migration's shadow-retained single-grant
- * documents are legacy owner/account records in qlb-owner-<provider>.json,
- * while the newer shared file is a providers map. A malformed extant owner
- * file is intercepted so the gate can fail closed instead of Pi using native
- * auth. Keep this in lockstep with src/pi-gate.ts:91-119.
+ * Codex ownership is explicit: the shared v2 document must name Codex, while
+ * the shadow-retaining migration artifact is itself Codex-specific. A legacy
+ * shared v1 document remains Anthropic-only (see ownerStateForProvider()).
  */
 function qlbOwnsProvider(provider: "openai-codex"): boolean {
-  const paths = [OWNER_FILE, join(dirname(OWNER_FILE), `qlb-owner-${provider}.json`)];
-  for (const path of paths) {
-    if (!existsSync(path)) continue;
-    let owner: Record<string, unknown>;
+  if (existsSync(OWNER_FILE)) {
     try {
-      const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
-      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return true;
-      owner = parsed as Record<string, unknown>;
+      const parsed: unknown = JSON.parse(readFileSync(OWNER_FILE, "utf8"));
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        const providers = (parsed as Record<string, unknown>).providers;
+        if (providers && typeof providers === "object" && !Array.isArray(providers)) {
+          const entry = (providers as Record<string, unknown>)[provider];
+          if (entry && typeof entry === "object" && !Array.isArray(entry)
+            && (entry as Record<string, unknown>).mode === "qlb") return true;
+        }
+      }
     } catch {
-      return true;
+      // A malformed shared document is an Anthropic conflict, not Codex ownership.
     }
-    let recognized = false;
-    if ("providers" in owner) {
-      recognized = true;
-      if (!owner.providers || typeof owner.providers !== "object" || Array.isArray(owner.providers)) return true;
-      const entry = (owner.providers as Record<string, unknown>)[provider];
-      if (entry && typeof entry === "object" && !Array.isArray(entry) && (entry as Record<string, unknown>).mode === "qlb") return true;
-    }
-    if ("owner" in owner || "accounts" in owner) {
-      recognized = true;
-      if (typeof owner.owner !== "string" || !Array.isArray(owner.accounts)) return true;
-      if (owner.owner === "qlb" && owner.accounts.some((account) => !!account && typeof account === "object"
-        && !Array.isArray(account) && (account as Record<string, unknown>).provider === provider)) return true;
-    }
-    if (!recognized) return true;
   }
-  return false;
+
+  const providerOwnerFile = join(dirname(OWNER_FILE), `qlb-owner-${provider}.json`);
+  if (!existsSync(providerOwnerFile)) return false;
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(providerOwnerFile, "utf8"));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return true;
+    const owner = parsed as Record<string, unknown>;
+    // A malformed provider-specific artifact must still replace native OAuth.
+    if (typeof owner.owner !== "string" || !Array.isArray(owner.accounts)) return true;
+    return owner.owner === "qlb" && owner.accounts.some((account) => !!account && typeof account === "object"
+      && !Array.isArray(account) && (account as Record<string, unknown>).provider === provider);
+  } catch {
+    return true;
+  }
 }
 
 function findQlbCli(): { cmd: string; prefix: string[] } {
@@ -394,12 +394,16 @@ async function registerOwnedOpenAICodexProvider(pi: ExtensionAPI): Promise<void>
     const namespace = (await import("@earendil-works/pi-ai/compat")) as unknown as {
       openAICodexResponsesApi?: () => { streamSimple?: OpenAICodexBuiltin };
     };
-    const providerModule = (await import("@earendil-works/pi-ai/providers/openai-codex")) as unknown as {
-      openaiCodexProvider?: () => { baseUrl?: string; getModels(): readonly OpenAICodexModel[] };
+    // Pi exposes only root, /compat, /models, /oauth, and /providers/all to
+    // extensions (Pi 1.4.0 dist/core/extensions/loader.js:63-81;
+    // dist/core/extensions/virtual-modules.js:14-38). Do not import a
+    // provider-specific subpath: bundled Pi cannot resolve it.
+    const providers = (await import("@earendil-works/pi-ai/providers/all")) as unknown as {
+      builtinProviders?: () => Array<{ id?: unknown; baseUrl?: string; getModels?: () => readonly OpenAICodexModel[] }>;
     };
     const builtin = namespace.openAICodexResponsesApi?.()?.streamSimple;
-    const catalog = providerModule.openaiCodexProvider?.();
-    if (typeof builtin !== "function" || !catalog) throw new Error("missing OpenAI Codex Pi transport/catalog");
+    const catalog = providers.builtinProviders?.().find((candidate) => candidate.id === "openai-codex");
+    if (typeof builtin !== "function" || !catalog?.getModels) throw new Error("missing OpenAI Codex Pi transport/catalog");
     registerOpenAICodexProvider(pi as unknown as OpenAICodexProviderApi, builtin, {
       ...deps, models: catalog.getModels(), baseUrl: catalog.baseUrl,
     });
@@ -462,7 +466,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     }) !== "inert";
   })();
   if (xaiOwner) await registerOwnedXaiProvider(pi);
-  const openAICodexOwner = base && (rehearsal === "1" || qlbOwnsProvider("openai-codex"));
+  const openAICodexOwner = base && qlbOwnsProvider("openai-codex");
   if (openAICodexOwner) {
     // RuntimeCredentials returns this in-memory non-secret sentinel before it
     // consults auth.json (Pi 1.4.0 dist/core/runtime-credentials.js:17-19).
