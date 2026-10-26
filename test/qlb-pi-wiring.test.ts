@@ -174,17 +174,21 @@ describe('qlb-pi provider wiring', { skip: piAvailable ? false : 'global Pi inst
     assert.equal(legacyV1.replaced['openai-codex'], false);
   });
 
-  it('fails closed for malformed, non-object, or unreadable shared Codex owner documents', () => {
-    for (const owner of ['{not json', '[]', '1']) {
+  it('fails closed for schema-invalid or unreadable shared Codex owner documents', () => {
+    const malformedOwners = [
+      JSON.stringify({ providers: { 'openai-codex': null } }),
+      JSON.stringify({ providers: { 'openai-codex': { mode: 'qlb' } } }),
+      JSON.stringify({ providers: { anthropic: { mode: 'bad' } } }),
+    ];
+    for (const owner of malformedOwners) {
       const result = load(owner);
       assert.equal(result.replaced['openai-codex'], true, owner);
-      assert.match(result.stderr, /qlb-owner\.json/);
-      assert.doesNotMatch(result.stderr, new RegExp(owner.replace(/[{}[\]]/g, '\\$&')));
+      assert.match(result.stderr, /^\[qlb-pi\] refusing native openai-codex fallback: malformed shared owner file .+\.pi\/agent\/qlb-owner\.json\n$/);
     }
 
     const unreadable = load(undefined, false, false, undefined, true);
     assert.equal(unreadable.replaced['openai-codex'], true);
-    assert.match(unreadable.stderr, /qlb-owner\.json/);
+    assert.match(unreadable.stderr, /^\[qlb-pi\] refusing native openai-codex fallback: malformed shared owner file .+\.pi\/agent\/qlb-owner\.json\n$/);
   });
 
   it('registers Codex from the shadow-retaining per-provider owner artifact migration writes', () => {
