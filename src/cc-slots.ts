@@ -9,12 +9,14 @@
 // Credential bytes are accepted only through injected backends and are never
 // included in errors, return metadata, or filesystem names.
 
+import { createHash } from 'node:crypto';
 import { chmod, mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { openStoreConnection } from './store';
 import { credentialFingerprint } from './anthropic-oauth';
 import { isCredentialNotFound } from './credential-backends';
 import { KeychainReadBackoff, platformKeychain, qlbKeychainService, QLB_KEYCHAIN_ACCOUNT } from './keychain';
+import { listStashes, recordStash, removeStash, type UnclaimedIndexEntry } from './unclaimed-index';
 
 const DISPLAY_CACHE_TTL_MS = 60_000;
 const ANTHROPIC_PROVIDER = 'anthropic';
@@ -308,6 +310,7 @@ export class SqliteClaudeSlotRepository implements ClaudeSlotRepository {
 export interface UnclaimedRecord {
   credential: string;
   consumedFp?: string;
+  consumedCredentialHash?: string;
 }
 
 export interface RestoreUnclaimedResult {
@@ -345,7 +348,10 @@ export interface ReadSlotOptions {
 
 export interface ReadClaudeSlot {
   credential: string;
+  /** Refresh-token lineage identity; never use this as a byte-level CAS. */
   fingerprint: string;
+  /** SHA-256 over the complete stored credential bytes, for CAS only. */
+  contentFingerprint: string;
 }
 
 type CachedSlot = ReadClaudeSlot & { expiresAt: number; generation: number };
@@ -370,7 +376,20 @@ function parseUnclaimed(text: string): UnclaimedRecord {
   const record = value as Record<string, unknown>;
   if (typeof record.credential !== 'string' || !record.credential) throw new Error('unclaimed stash is malformed');
   if (record.consumedFp != null && typeof record.consumedFp !== 'string') throw new Error('unclaimed stash is malformed');
-  return record.consumedFp ? { credential: record.credential, consumedFp: record.consumedFp } : { credential: record.credential };
+  if (record.consumedCredentialHash != null && typeof record.consumedCredentialHash !== 'string') throw new Error('unclaimed stash is malformed');
+  return {
+    credential: record.credential,
+    ...(record.consumedFp ? { consumedFp: record.consumedFp } : {}),
+    ...(record.consumedCredentialHash ? { consumedCredentialHash: record.consumedCredentialHash } : {}),
+  };
+}
+
+function credentialContentFingerprint(credential: string): string {
+  return `sha256-full:${createHash('sha256').update(credential, 'utf8').digest('hex')}`;
+}
+
+function missingFile(error: unknown): boolean {
+  return !!error && typeof error === 'object' && (error as NodeJS.ErrnoException).code === 'ENOENT';
 }
 
 /**
@@ -384,8 +403,8 @@ export class ClaudeSlots {
   private readonly files: ClaudeSlotFileOps;
   private readonly cache = new Map<string, CachedSlot>();
   private readonly slotWrites = new Map<string, Promise<void>>();
-  /** Stashes created or swept by this coordinator; fallback files are also scanned. */
-  private readonly knownUnclaimedTimestamps = new Set<string>();
+  /** Compatibility cache; durable cross-process discovery uses unclaimed-index. */
+  private readonly knownUnclaimedAccounts = new Map<string, string>();
   private cacheEpoch = 0;
 
   constructor(private readonly options: ClaudeSlotsOptions) {
@@ -436,7 +455,7 @@ export class ClaudeSlots {
     const generation = this.options.repository.currentGeneration();
     const cached = this.cache.get(accountId);
     if (cachedRead && cached && cached.expiresAt > now && cached.generation === generation) {
-      return { credential: cached.credential, fingerprint: cached.fingerprint };
+      return { credential: cached.credential, fingerprint: cached.fingerprint, contentFingerprint: cached.contentFingerprint };
     }
 
     const epoch = this.cacheEpoch;
@@ -444,7 +463,9 @@ export class ClaudeSlots {
       () => this.backend.get(this.slotService(accountId), QLB_KEYCHAIN_ACCOUNT),
       !cachedRead,
     );
-    const result: ReadClaudeSlot = { credential, fingerprint: this.fingerprint(credential) };
+    const result: ReadClaudeSlot = {
+      credential, fingerprint: this.fingerprint(credential), contentFingerprint: credentialContentFingerprint(credential),
+    };
     if (cachedRead && epoch === this.cacheEpoch && generation === this.options.repository.currentGeneration()) {
       this.cache.set(accountId, { ...result, expiresAt: now + DISPLAY_CACHE_TTL_MS, generation });
     }
@@ -505,27 +526,58 @@ export class ClaudeSlots {
     }));
   }
 
-  /** S36: Keychain first; a private file is retained only if that write fails. */
-  async stashUnclaimed(timestamp: string, credential: string, consumedFp?: string): Promise<{ location: 'keychain' | 'file'; path?: string }> {
+  /**
+   * S36: reserve a durable, non-secret index row before Keychain first, then
+   * retain a private file only when the Keychain write fails. The reservation
+   * is create-only, so no process can overwrite another stash id.
+   */
+  async stashUnclaimed(
+    timestamp: string,
+    credential: string,
+    consumedFp?: string,
+    accountId = '',
+    consumedCredentialHash?: string,
+  ): Promise<{ location: 'keychain' | 'file'; path?: string }> {
     this.assertTimestamp(timestamp);
-    const record = JSON.stringify({ credential, ...(consumedFp ? { consumedFp } : {}) });
+    if (accountId) assertSlotId(accountId);
+    const record = JSON.stringify({
+      credential, ...(consumedFp ? { consumedFp } : {}),
+      ...(consumedCredentialHash ? { consumedCredentialHash } : {}),
+    });
+    const index: UnclaimedIndexEntry = {
+      provider: ANTHROPIC_PROVIDER, accountId, stashId: timestamp, consumedFp: consumedFp ?? '',
+      location: 'keychain', createdAt: this.now(),
+    };
+    try {
+      await recordStash(this.indexRoot(), index);
+    } catch (error: unknown) {
+      // Never overwrite a pre-existing stash reservation; the caller can issue
+      // a new collision-free id and retry without endangering the old successor.
+      if (error && typeof error === 'object' && (error as NodeJS.ErrnoException).code === 'EEXIST') {
+        throw new Error('unclaimed credential already exists');
+      }
+      throw new Error('unable to record unclaimed credential');
+    }
+    // A present item is a collision, not a reason to replace it with a file.
+    await this.assertUnclaimedAbsent(timestamp);
     try {
       await this.backend.set(this.unclaimedService(timestamp), QLB_KEYCHAIN_ACCOUNT, record);
-      this.knownUnclaimedTimestamps.add(timestamp);
+      this.knownUnclaimedAccounts.set(timestamp, accountId);
       return { location: 'keychain' };
     } catch {
       const path = this.filePath(timestamp);
-      await this.files.mkdir(this.options.stashDir, { recursive: true, mode: 0o700 });
-      await this.files.chmod(this.options.stashDir, 0o700);
       try {
+        await recordStash(this.indexRoot(), { ...index, location: 'file' }, { replace: true });
+        await this.files.mkdir(this.options.stashDir, { recursive: true, mode: 0o700 });
+        await this.files.chmod(this.options.stashDir, 0o700);
         await this.files.writeFile(path, record, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
-      } catch (error) {
-        // Retrying a stash for the same timestamp may only replace an existing
-        // value through Keychain; never overwrite a file that might be newer.
+        await this.files.chmod(path, 0o600);
+      } catch {
+        // Leave the index reservation behind: it is non-secret evidence of a
+        // failed stash, never a hidden issued successor.
         throw new Error('unable to persist unclaimed credential');
       }
-      await this.files.chmod(path, 0o600);
-      this.knownUnclaimedTimestamps.add(timestamp);
+      this.knownUnclaimedAccounts.set(timestamp, accountId);
       return { location: 'file', path };
     }
   }
@@ -543,9 +595,17 @@ export class ClaudeSlots {
         this.assertTimestamp(timestamp);
         const text = await this.files.readFile(join(this.options.stashDir, name), 'utf8');
         parseUnclaimed(text);
+        await this.assertUnclaimedAbsent(timestamp);
         await this.backend.set(this.unclaimedService(timestamp), QLB_KEYCHAIN_ACCOUNT, text);
         await this.files.rm(join(this.options.stashDir, name), { force: true });
-        this.knownUnclaimedTimestamps.add(timestamp);
+        const accountId = this.knownUnclaimedAccounts.get(timestamp) ?? '';
+        const parsed = parseUnclaimed(text);
+        if (parsed.consumedFp) {
+          await recordStash(this.indexRoot(), {
+            provider: ANTHROPIC_PROVIDER, accountId, stashId: timestamp, consumedFp: parsed.consumedFp,
+            location: 'keychain', createdAt: this.now(),
+          }, { replace: true });
+        }
         swept += 1;
       } catch {
         retained += 1;
@@ -555,43 +615,52 @@ export class ClaudeSlots {
   }
 
   /**
-   * Adopt a known S36 successor for the slot's current lineage. This is the
-   * consume gate's automatic counterpart to the timestamp-addressed restore
-   * command. A missing stash is ignored; an unreadable one is surfaced so a
-   * caller never spends the predecessor while its successor may be stranded.
+   * Adopt an S36 successor for this slot only. The durable index filters by
+   * account before a stash body is read, so an unreadable stash for account A
+   * cannot defer account B. A body that exists but is malformed or unreadable
+   * fails closed rather than allowing a second POST of its predecessor.
    */
   async adoptStashedSuccessor(accountId: string): Promise<ReadClaudeSlot | null> {
     assertSlotId(accountId);
     return this.withSlotWrite(accountId, async () => {
       let adopted: ReadClaudeSlot | null = null;
-      let adoptedTimestamp: string | null = null;
+      let adoptedEntry: UnclaimedIndexEntry | null = null;
       await this.options.repository.withWriteTransaction(async (onRollback) => {
         if (!this.options.repository.getSlot(accountId)) return;
         const current = await this.readExistingCredential(accountId);
         if (current == null) return;
         const currentFingerprint = this.fingerprint(current);
-        for (const timestamp of await this.unclaimedTimestamps()) {
+        const currentContentFingerprint = credentialContentFingerprint(current);
+        for (const entry of await this.unclaimedEntries(accountId)) {
           let record: UnclaimedRecord;
           try {
-            record = await this.readUnclaimed(timestamp);
+            record = await this.readUnclaimed(entry.stashId);
           } catch (error) {
             if (error instanceof Error && /not found/.test(error.message)) {
-              this.knownUnclaimedTimestamps.delete(timestamp);
+              try { await removeStash(this.indexRoot(), entry); } catch { /* retry later */ }
+              this.knownUnclaimedAccounts.delete(entry.stashId);
               continue;
             }
             throw new Error('unclaimed credential unavailable');
           }
-          if (record.consumedFp !== currentFingerprint) continue;
+          if (record.consumedFp !== currentFingerprint ||
+            (record.consumedCredentialHash != null && record.consumedCredentialHash !== currentContentFingerprint)) continue;
           await this.writeSlotUnlocked(accountId, record.credential, { cause: 'stash-adopt', evidence: 'lineage' }, onRollback);
-          adopted = { credential: record.credential, fingerprint: this.fingerprint(record.credential) };
-          adoptedTimestamp = timestamp;
+          adopted = {
+            credential: record.credential,
+            fingerprint: this.fingerprint(record.credential),
+            contentFingerprint: credentialContentFingerprint(record.credential),
+          };
+          adoptedEntry = entry;
           break;
         }
       });
-      if (adoptedTimestamp) {
+      const cleanupEntry = adoptedEntry as UnclaimedIndexEntry | null;
+      if (cleanupEntry) {
         try {
-          await this.deleteUnclaimed(adoptedTimestamp);
-          this.knownUnclaimedTimestamps.delete(adoptedTimestamp);
+          await this.deleteUnclaimed(cleanupEntry.stashId);
+          await removeStash(this.indexRoot(), cleanupEntry);
+          this.knownUnclaimedAccounts.delete(cleanupEntry.stashId);
         } catch {
           // The durable slot write won; retain the safety copy for a later sweep.
         }
@@ -609,12 +678,17 @@ export class ClaudeSlots {
         const record = await this.readUnclaimed(timestamp);
         const slot = this.options.repository.getSlot(accountId);
         if (!slot) throw new Error('Claude slot not found');
-        if (!record.consumedFp || record.consumedFp !== slot.fingerprint) throw new Error('unclaimed lineage mismatch');
+        if (!record.consumedFp || record.consumedFp !== slot.fingerprint ||
+          (record.consumedCredentialHash != null && record.consumedCredentialHash !== credentialContentFingerprint(await this.readExistingCredential(accountId) ?? ''))) {
+          throw new Error('unclaimed lineage mismatch');
+        }
         await this.writeSlotUnlocked(accountId, record.credential, { cause: 'stash-adopt', evidence: 'lineage' }, onRollback);
       });
       try {
         // The safety copy is only disposable after its slot metadata commit.
         await this.deleteUnclaimed(timestamp);
+        await removeStash(this.indexRoot(), { provider: ANTHROPIC_PROVIDER, stashId: timestamp });
+        this.knownUnclaimedAccounts.delete(timestamp);
         return { cleanupPending: false };
       } catch {
         // The restore is durable, but callers must disclose the retained copy.
@@ -623,18 +697,27 @@ export class ClaudeSlots {
     });
   }
 
-  private async unclaimedTimestamps(): Promise<string[]> {
-    const timestamps = new Set(this.knownUnclaimedTimestamps);
+  private async unclaimedEntries(accountId: string): Promise<UnclaimedIndexEntry[]> {
+    const entries = new Map<string, UnclaimedIndexEntry>();
     try {
-      for (const name of await this.files.readdir(this.options.stashDir)) {
-        if (!name.endsWith('.json')) continue;
-        const timestamp = name.slice(0, -'.json'.length);
-        try { this.assertTimestamp(timestamp); timestamps.add(timestamp); } catch { /* ignore unrelated files */ }
+      for (const entry of await listStashes(this.indexRoot(), ANTHROPIC_PROVIDER, accountId)) {
+        entries.set(entry.stashId, entry);
       }
     } catch {
-      // A missing fallback directory is normal; keychain-created timestamps are still known.
+      throw new Error('unclaimed credential unavailable');
     }
-    return [...timestamps].sort();
+    // Direct callers from before the account-scoped API stay retryable in this
+    // instance; new consume-gate stashes always carry their account id.
+    for (const [stashId, knownAccount] of this.knownUnclaimedAccounts) {
+      if (knownAccount !== '' && knownAccount !== accountId) continue;
+      if (!entries.has(stashId)) {
+        entries.set(stashId, {
+          provider: ANTHROPIC_PROVIDER, accountId: knownAccount, stashId, consumedFp: '',
+          location: 'keychain', createdAt: 0,
+        });
+      }
+    }
+    return [...entries.values()].sort((a, b) => a.createdAt - b.createdAt || a.stashId.localeCompare(b.stashId));
   }
 
   private async readExistingCredential(accountId: string): Promise<string | null> {
@@ -657,15 +740,20 @@ export class ClaudeSlots {
   }
 
   private async readUnclaimed(timestamp: string): Promise<UnclaimedRecord> {
+    let keychainError: unknown;
     try {
       return parseUnclaimed(await this.backend.get(this.unclaimedService(timestamp), QLB_KEYCHAIN_ACCOUNT));
-    } catch (keychainError) {
-      try {
-        return parseUnclaimed(await this.files.readFile(this.filePath(timestamp), 'utf8'));
-      } catch {
-        if (missingItem(keychainError)) throw new Error('unclaimed credential not found');
-        throw new Error('unclaimed credential unavailable');
-      }
+    } catch (error) {
+      keychainError = error;
+    }
+    try {
+      return parseUnclaimed(await this.files.readFile(this.filePath(timestamp), 'utf8'));
+    } catch (fileError) {
+      // Both locations definitively absent is the only skippable outcome. A
+      // malformed file, an ACL error, or a Keychain failure means the issued
+      // successor may exist and must defer this account's consume gate.
+      if (missingItem(keychainError) && missingFile(fileError)) throw new Error('unclaimed credential not found');
+      throw new Error('unclaimed credential unavailable');
     }
   }
 
@@ -760,6 +848,20 @@ export class ClaudeSlots {
 
   private unclaimedService(timestamp: string): string {
     return qlbKeychainService(ANTHROPIC_PROVIDER, `unclaimed:${timestamp}`);
+  }
+
+  private indexRoot(): string {
+    return this.options.stashDir;
+  }
+
+  private async assertUnclaimedAbsent(timestamp: string): Promise<void> {
+    try {
+      await this.backend.get(this.unclaimedService(timestamp), QLB_KEYCHAIN_ACCOUNT);
+    } catch (error) {
+      if (missingItem(error)) return;
+      throw new Error('unable to check unclaimed credential');
+    }
+    throw new Error('unclaimed credential already exists');
   }
 
   private filePath(timestamp: string): string {

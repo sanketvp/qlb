@@ -8,6 +8,7 @@
 // The inactive-Claude refresh consume gate (§4.2.2, N8). Network, locks,
 // clock, warning sink, and credential storage are injected at the boundary.
 
+import { randomBytes } from 'node:crypto';
 import {
   buildRefreshRequest,
   classifyRefreshResponse,
@@ -43,6 +44,8 @@ export interface ConsumeGateResult {
   credential?: string;
   consumedFp?: string;
   stashed?: boolean;
+  /** A non-secret typed explanation when an issued successor could not be stashed. */
+  successorFailure?: { kind: 'successor-unpersisted'; stashFailure: string };
 }
 
 type GateLock = <T>(fn: () => Promise<T>) => Promise<T>;
@@ -81,13 +84,9 @@ function refreshedCredential(current: string, response: Extract<ReturnType<typeo
   return serializeCredentialBlob(blob);
 }
 
-let nextStashSequence = 0;
-
-function defaultStashTimestamp(now: number): string {
-  // Different slots can consume concurrently, so timestamps must not collide.
-  // The suffix remains a non-secret, manually-addressable S36 identifier.
-  nextStashSequence += 1;
-  return `${new Date(now).toISOString()}-${nextStashSequence}`;
+/** Collision-free across processes while remaining a non-secret S36 identifier. */
+export function defaultStashTimestamp(now: number): string {
+  return `${new Date(now).toISOString()}-${process.pid}-${randomBytes(12).toString('hex')}`;
 }
 
 /**
@@ -134,6 +133,9 @@ export async function consumeClaudeSlot(deps: ConsumeGateDeps, input: ConsumeCla
       }
 
       const consumedFp = credentialFingerprint(reread.credential) ?? reread.fingerprint;
+      // Lineage remains refresh-token based, but the CAS must guard all bytes:
+      // a concurrent access-token/expiry update may retain the refresh token.
+      const consumedContentFingerprint = reread.contentFingerprint;
       const request = buildRefreshRequest(reread.credential);
       if (request.kind === 'no_refresh_token') return { kind: 'dead', consumedFp };
       if (request.kind !== 'request') return { kind: 'transient', consumedFp };
@@ -148,14 +150,32 @@ export async function consumeClaudeSlot(deps: ConsumeGateDeps, input: ConsumeCla
       if (!issued) return { kind: 'transient', consumedFp };
 
       const stash = async (reason: string): Promise<ConsumeGateResult> => {
-        try {
-          await deps.slots.stashUnclaimed(deps.stashTimestamp?.() ?? defaultStashTimestamp(now()), issued, consumedFp);
-          deps.warn?.(`Claude refresh successor stashed after ${reason}`);
-          return { kind: reason === 'consume-gate-cas-conflict' ? 'current' : 'transient', credential: issued, consumedFp, stashed: true };
-        } catch {
-          deps.warn?.('Claude refresh successor could not be persisted or stashed');
-          return { kind: 'consume-gate-unpersisted', credential: issued, consumedFp, stashed: false };
+        let stashId = deps.stashTimestamp?.() ?? defaultStashTimestamp(now());
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          try {
+            await deps.slots.stashUnclaimed(stashId, issued, consumedFp, input.accountId, consumedContentFingerprint);
+            deps.warn?.(`Claude refresh successor stashed after ${reason}`);
+            return { kind: reason === 'consume-gate-cas-conflict' ? 'current' : 'transient', credential: issued, consumedFp, stashed: true };
+          } catch (error) {
+            // A collision reservation is never overwritten. Host-supplied ids
+            // are intentional and should surface their failure; generated ids
+            // get a fresh cross-process-safe retry.
+            if (!deps.stashTimestamp && error instanceof Error && /already exists/.test(error.message) && attempt < 2) {
+              stashId = defaultStashTimestamp(now());
+              continue;
+            }
+            const stashFailure = error instanceof Error ? error.message : 'unable to persist unclaimed credential';
+            deps.warn?.(`Claude refresh successor could not be persisted or stashed: ${stashFailure}`);
+            return {
+              kind: 'consume-gate-unpersisted', credential: issued, consumedFp, stashed: false,
+              successorFailure: { kind: 'successor-unpersisted', stashFailure },
+            };
+          }
         }
+        return {
+          kind: 'consume-gate-unpersisted', credential: issued, consumedFp, stashed: false,
+          successorFailure: { kind: 'successor-unpersisted', stashFailure: 'unclaimed stash id collision' },
+        };
       };
 
       try {
@@ -164,9 +184,12 @@ export async function consumeClaudeSlot(deps: ConsumeGateDeps, input: ConsumeCla
           try { current = await deps.slots.readSlot(input.accountId, { fresh: true }); } catch (error) {
             return slotMissing(error) ? stash('consume-gate-slot-removed') : stash('consume-gate-store-unreadable');
           }
-          if (current.fingerprint !== consumedFp) {
+          if (current.contentFingerprint !== consumedContentFingerprint) {
             const stashed = await stash('consume-gate-cas-conflict');
-            return { ...stashed, credential: current.credential, kind: 'current' };
+            // A failed stash leaves the issued successor only in this result;
+            // never relabel it as current or replace it with the racer's bytes.
+            if (!stashed.stashed) return stashed;
+            return { kind: 'current', credential: current.credential, consumedFp, stashed: true };
           }
           try {
             await deps.slots.writeSlot(input.accountId, issued, { cause: 'post', evidence: 'post' });
