@@ -51,6 +51,10 @@ function readOpenRouterModelsJsonFromText(text: string) {
   return readOpenRouterModelsJson(path);
 }
 
+
+// Contract tests against the installed Pi package; CI runners have no Pi install.
+const PI_CONTRACT_SKIP = locatePi(process.env, homedir()).root ? false : 'Pi package not installed on this machine';
+
 describe('qlb-pi OpenRouter source', () => {
   it('obtains one ephemeral key through qlb gate and delegates only to the built-in transport', async () => {
     const outputs: Events[] = [];
@@ -104,7 +108,7 @@ describe('qlb-pi OpenRouter source', () => {
     }
   });
 
-  it('uses Pi getAgentDir() when PI_CODING_AGENT_DIR supplies models.json and retains its baseUrl', async () => {
+  it('uses Pi getAgentDir() when PI_CODING_AGENT_DIR supplies models.json and retains its baseUrl', { skip: PI_CONTRACT_SKIP }, async () => {
     const root = mkdtempSync(join(tmpdir(), 'qlb-openrouter-agent-dir-'));
     const location = locatePi(process.env, homedir());
     assert.ok(location.root, 'Pi package is required for this contract test');
@@ -302,7 +306,7 @@ describe('Pi models.json ownership safety', () => {
     });
   });
 
-  it('matches the installed ModelRuntime: invalid blocks reject QLB registration while valid blocks retain models', async () => {
+  it('matches the installed ModelRuntime: invalid blocks reject QLB registration while valid blocks retain models', { skip: PI_CONTRACT_SKIP }, async () => {
     const location = locatePi(process.env, homedir());
     assert.ok(location.root, 'Pi package is required for this contract test');
     const importModule = new Function('path', 'return import(path)') as (path: string) => Promise<{
