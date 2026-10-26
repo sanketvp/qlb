@@ -1787,6 +1787,10 @@ export async function dispatchCommand(
     : null;
 }
 
+export function exitCodeForError(err: unknown): number {
+  return typeof err === 'object' && err !== null && (err as { exitCode?: unknown }).exitCode === 3 ? 3 : 1;
+}
+
 function lifecycleAdmissionCode(dbPath: string, operation: LifecycleOperation): string | null {
   const store = openStore(dbPath);
   try {
@@ -1860,7 +1864,7 @@ export async function runExecutingCommand(
     return code;
   } catch (err) {
     redactingContext.stderr(`qlb ${match.command.name}: ${redactError(err, knownCommandSecrets(redactingContext))}`);
-    return 1;
+    return exitCodeForError(err);
   }
 }
 
@@ -1946,7 +1950,7 @@ async function main(): Promise<void> {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`qlb refresh: ${msg}`);
-      process.exit(1);
+      process.exit(exitCodeForError(err));
     }
   }
   if (opts.cmd === 'setup' && opts.harness === 'hermes') {
@@ -2002,7 +2006,7 @@ async function main(): Promise<void> {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`qlb migrate ${opts.sub}: ${msg}`);
-      process.exit(1);
+      process.exit(exitCodeForError(err));
     }
   }
   if (opts.cmd === 'policy') {
@@ -2079,7 +2083,7 @@ async function main(): Promise<void> {
       if (rec.errcode != null) bits.push(`errcode=${String(rec.errcode)}`);
       const extra = bits.length > 0 ? ` [${bits.join(' ')}]` : '';
       console.error(`qlb accounts ${opts.sub}: ${msg}${extra}`);
-      process.exit(1);
+      process.exit(exitCodeForError(err));
     }
   }
   if (opts.cmd === 'native-resync') {
@@ -2089,7 +2093,7 @@ async function main(): Promise<void> {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`qlb native-resync: ${msg}`);
-      process.exit(1);
+      process.exit(exitCodeForError(err));
     }
   }
   if (opts.cmd === 'override') {

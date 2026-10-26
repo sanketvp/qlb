@@ -10,6 +10,7 @@
 // classes directly.
 
 import { execFileSync, type ExecFileSyncOptions } from 'node:child_process';
+import { DatabaseSync } from 'node:sqlite';
 import {
   createCipheriv,
   createDecipheriv,
@@ -23,8 +24,15 @@ import {
   renameSync,
   writeFileSync,
 } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { qlbHomeDir } from './home';
+import { resolveConfig } from './config';
+import {
+  inspectHelperSigning,
+  verifyHelperIdentity,
+  type HelperIdentityVerification,
+  type HelperSigningState,
+} from './helper-signing';
 
 export interface CredentialBackend {
   readonly kind?: CredentialBackendKind;
@@ -35,6 +43,8 @@ export interface CredentialBackend {
   setSync(service: string, account: string, jsonValue: string): void;
   getSync(service: string, account: string): string;
   deleteSync(service: string, account: string): void;
+  /** Refuses an unusable Keychain helper without sending credential bytes. */
+  assertHelperUsable?(): void;
 }
 
 export type CredentialBackendKind =
@@ -208,20 +218,124 @@ abstract class SyncCredentialBackend implements CredentialBackend {
 export const MACOS_SECURITY_BIN = '/usr/bin/security';
 /** Bound every macOS Keychain spawn so a locked Keychain cannot hang the CLI. */
 export const MACOS_SECURITY_TIMEOUT_MS = 5_000;
-// `security -i` reads each command with a 4096-byte line buffer. Keep the
-// upstream 64-byte margin for line-ending accounting differences.
-const SECURITY_STDIN_LINE_LIMIT = 4096 - 64;
-
-function quoteSecurityInteractive(value: string): string {
-  const escaped = value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-  return `"${escaped}"`;
+/** Location of the signed helper in both source and compiled executions. */
+export function defaultKeychainHelperPath(): string {
+  // dist/ is directly under the repository root; test compilation uses
+  // dist-test/src/. Select by layout rather than whether a binary happens to
+  // exist, so a missing build cannot accidentally resolve to a sibling checkout.
+  const repositoryRoot = basename(dirname(__dirname)) === 'dist-test'
+    ? resolve(__dirname, '..', '..')
+    : resolve(__dirname, '..');
+  return join(repositoryRoot, 'native', 'keychain-helper', 'build', 'qlb-keychain-helper');
 }
 
-function assertSecurityInteractiveField(value: string): void {
-  // `security -i` splits lines before it parses quotes, and NUL cannot be
-  // represented safely in its stdin command language.
-  if (/[\r\n\0]/.test(value)) {
-    throw new Error('keychain set refused: service and account must not contain CR, LF, or NUL');
+/** A missing helper is an operator-actionable failure, not a generic Keychain error. */
+export class KeychainHelperMissingError extends Error {
+  readonly code = 'HELPER_MISSING';
+  readonly exitCode = 3;
+
+  constructor(readonly path: string) {
+    super(`helper-missing: ${path}; run npm run build:helper`);
+    this.name = 'KeychainHelperMissingError';
+  }
+}
+
+function assertHelperPresent(path: string): void {
+  if (!existsSync(path)) throw new KeychainHelperMissingError(path);
+}
+
+/** Raised before credentials can reach a helper whose current signature is not trusted. */
+export class KeychainHelperUntrustedError extends Error {
+  readonly code = 'HELPER_UNTRUSTED';
+  readonly exitCode = 3;
+
+  constructor(reason: string, remedy = 'npm run build:helper or qlb keychain check-launchd') {
+    super(`helper-untrusted: ${reason}; run ${remedy}`);
+    this.name = 'KeychainHelperUntrustedError';
+  }
+}
+
+export type HelperConfigReader = (key: string) => string | null;
+type HelperIdentityVerifier = (path: string, pin: string) => HelperIdentityVerification;
+type HelperSigningInspector = (path: string) => HelperSigningState | null;
+
+/**
+ * Returns null only when no pin can have been recorded (no database yet, or no
+ * config table). Any other read failure refuses, so a damaged or unreadable
+ * database never downgrades a pinned host to the pinless check.
+ */
+export function defaultHelperConfigReader(key: string): string | null {
+  const dbPath = resolveConfig().dbPath;
+  if (!existsSync(dbPath)) return null;
+  try {
+    const db = new DatabaseSync(dbPath, { readOnly: true });
+    try {
+      const row = db.prepare('SELECT value FROM config WHERE key = ?').get(key) as { value?: unknown } | undefined;
+      return typeof row?.value === 'string' ? row.value : null;
+    } finally {
+      db.close();
+    }
+  } catch (error) {
+    if (/no such table: config\b/.test((error as Error | undefined)?.message ?? '')) return null;
+    throw new KeychainHelperUntrustedError('could not read the recorded helper pin from the QLB database');
+  }
+}
+
+function assertTrustedHelper(
+  path: string,
+  configReader: HelperConfigReader,
+  verifier: HelperIdentityVerifier,
+  inspect: HelperSigningInspector,
+): void {
+  assertHelperPresent(path);
+  const pin = configReader('keychain.helperCheckIdentityHash');
+  if (!pin) {
+    // First-run hosts have no matrix pin yet. Match release installation's
+    // pinless gate: codesign --verify --strict plus the exact helper authority.
+    const signing = inspect(path);
+    if (!signing) throw new KeychainHelperUntrustedError('helper signature did not verify');
+    if (signing.authority !== 'QLB Keychain Helper') {
+      throw new KeychainHelperUntrustedError(
+        `helper signed by ${signing.authority}, expected QLB Keychain Helper`,
+      );
+    }
+    return;
+  }
+  const verification = verifier(path, pin);
+  if (!verification.trusted) throw new KeychainHelperUntrustedError(verification.reason);
+}
+
+/** Raised only for cached display reads during the brief Keychain failure backoff. */
+export class KeychainBackedOff extends Error {
+  readonly code = 'KEYCHAIN_BACKED_OFF';
+
+  constructor(readonly until: number) {
+    super('Keychain reads are temporarily backed off after a prior failure');
+    this.name = 'KeychainBackedOff';
+  }
+}
+
+/**
+ * Keeps transient Keychain faults from repeatedly blocking display paths.
+ * Fresh correctness reads explicitly bypass this state (S42).
+ */
+export class KeychainReadBackoff {
+  private disabledUntil = 0;
+  private readonly now: () => number;
+
+  constructor(options: { now?: () => number } = {}) {
+    this.now = options.now ?? Date.now;
+  }
+
+  read<T>(read: () => T, options: { fresh?: boolean } = {}): T {
+    const now = this.now();
+    if (!options.fresh && now < this.disabledUntil) throw new KeychainBackedOff(this.disabledUntil);
+    try {
+      return read();
+    } catch (err) {
+      this.disabledUntil = now + 60_000;
+      throw err;
+    }
   }
 }
 
@@ -241,41 +355,45 @@ export class MacosKeychainBackend extends SyncCredentialBackend {
   private readonly exec: ExecFileSyncFn;
   private readonly fakeExecutor: boolean;
 
-  constructor(opts: { execFileSync?: ExecFileSyncFn } = {}) {
+  private readonly helperPath?: string;
+  private readonly helperConfigReader?: HelperConfigReader;
+  private readonly helperIdentityVerifier?: HelperIdentityVerifier;
+  private readonly helperSigningInspector?: HelperSigningInspector;
+
+  constructor(opts: {
+    execFileSync?: ExecFileSyncFn;
+    helperPath?: string;
+    /** Injectable config lookup for the matrix-recorded leaf certificate pin. */
+    helperConfigReader?: HelperConfigReader;
+    /** Injectable only for hermetic codesign verification tests. */
+    helperIdentityVerifier?: HelperIdentityVerifier;
+    /** Injectable only for hermetic pinless helper-signing tests. */
+    helperSigningInspector?: HelperSigningInspector;
+  } = {}) {
     super();
     this.exec = opts.execFileSync ?? execFileUtf8;
     this.fakeExecutor = isFakeExecutor(this.exec);
+    this.helperPath = opts.helperPath;
+    this.helperConfigReader = opts.helperConfigReader;
+    this.helperIdentityVerifier = opts.helperIdentityVerifier;
+    this.helperSigningInspector = opts.helperSigningInspector;
     if (isQlbTestMode() && !this.fakeExecutor) throw new NativeKeychainDisabled();
   }
 
   setSync(service: string, account: string, jsonValue: string): void {
     this.assertNativeAccessEnabled();
-    assertSecurityInteractiveField(service);
-    assertSecurityInteractiveField(account);
+    const helper = this.helperPath ?? defaultKeychainHelperPath();
+    this.assertHelperUsable();
     try {
-      // Ported from claude-swap's macos_keychain.set_password. `-X` makes the
-      // secret safe for security's stdin parser without placing plaintext in
-      // argv. Its 4096-byte line buffer requires the upstream argv fallback.
-      const hexValue = Buffer.from(jsonValue, 'utf8').toString('hex');
-      const command = (
-        `add-generic-password -U -a ${quoteSecurityInteractive(account)} `
-        + `-s ${quoteSecurityInteractive(service)} -X ${hexValue}\n`
-      );
-      if (Buffer.byteLength(command, 'utf8') <= SECURITY_STDIN_LINE_LIMIT) {
-        this.exec(MACOS_SECURITY_BIN, ['-i'], {
-          encoding: 'utf8', input: command, timeout: MACOS_SECURITY_TIMEOUT_MS,
-        });
-      } else {
-        this.exec(
-          MACOS_SECURITY_BIN,
-          ['add-generic-password', '-U', '-a', account, '-s', service, '-X', hexValue],
-          { encoding: 'utf8', timeout: MACOS_SECURITY_TIMEOUT_MS },
-        );
-      }
+      // Every write, including test doubles, follows the helper's stdin protocol.
+      this.exec(helper, ['set', service, account], {
+        encoding: 'utf8', input: jsonValue, timeout: MACOS_SECURITY_TIMEOUT_MS,
+      });
     } catch (err) {
-      if (isSecurityTimeout(err)) throw securityTimeoutError('add-generic-password');
-      // Child-process errors can include stdin or argv (including hex secret
-      // material), so never preserve their message.
+      if (err instanceof KeychainHelperMissingError) throw err;
+      if (isSecurityTimeout(err)) throw securityTimeoutError('keychain helper set');
+      // Child-process errors can include stdin payload material, so never keep
+      // their message.
       throw new Error(`keychain set failed for service=${service} account=${account}`);
     }
   }
@@ -299,17 +417,35 @@ export class MacosKeychainBackend extends SyncCredentialBackend {
 
   deleteSync(service: string, account: string): void {
     this.assertNativeAccessEnabled();
+    const helper = this.helperPath ?? defaultKeychainHelperPath();
+    this.assertHelperUsable();
     try {
-      this.exec(
-        MACOS_SECURITY_BIN,
-        ['delete-generic-password', '-a', account, '-s', service],
-        { encoding: 'utf8', timeout: MACOS_SECURITY_TIMEOUT_MS },
-      );
+      this.exec(helper, ['delete', service, account], {
+        encoding: 'utf8', timeout: MACOS_SECURITY_TIMEOUT_MS,
+      });
     } catch (err) {
+      if (err instanceof KeychainHelperMissingError) throw err;
       if (isSecurityTimeout(err)) {
-        throw wrapCredentialError('delete', service, account, securityTimeoutError('delete-generic-password'));
+        throw wrapCredentialError('delete', service, account, securityTimeoutError('keychain helper delete'));
       }
       throw wrapCredentialError('delete', service, account, err);
+    }
+  }
+
+  /** Verifies helper trust without sending any credential bytes to it. */
+  assertHelperUsable(): void {
+    this.assertNativeAccessEnabled();
+    const helper = this.helperPath ?? defaultKeychainHelperPath();
+    // A plain fake executor cannot invoke a real helper. Tests opt into this
+    // gate explicitly with either injected dependency, so production always
+    // reads and verifies the pin immediately before the helper spawn.
+    if (!this.fakeExecutor || this.helperConfigReader || this.helperIdentityVerifier || this.helperSigningInspector) {
+      assertTrustedHelper(
+        helper,
+        this.helperConfigReader ?? defaultHelperConfigReader,
+        this.helperIdentityVerifier ?? verifyHelperIdentity,
+        this.helperSigningInspector ?? inspectHelperSigning,
+      );
     }
   }
 

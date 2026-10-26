@@ -11,19 +11,29 @@ import {
   readFileSync,
   readlinkSync,
   readdirSync,
+  statSync,
   symlinkSync,
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { describe, it } from 'node:test';
 
-import { installRelease, readReleaseManifest, releaseDigest } from '../src/release';
+import { installRelease as installReleaseForPlatform, readReleaseManifest, releaseDigest } from '../src/release';
 import { runReleaseCommand } from '../src/commands/release';
 import { releaseCurrentCheck } from '../src/checks/release-current';
 import type { CommandContext } from '../src/registry';
+
+const QLB_HELPER_SIGNING = {
+  authority: 'QLB Keychain Helper', binaryHash: 'a'.repeat(40), identityHash: 'b'.repeat(40),
+};
+const validHelperVerifier = { verifyHelperSigning: () => QLB_HELPER_SIGNING };
+
+// Fixture releases do not model macOS packaging unless a test opts in explicitly.
+const installRelease = (options: Parameters<typeof installReleaseForPlatform>[0]) =>
+  installReleaseForPlatform({ platform: 'linux', ...options });
 
 function shippedBuildDigest(source: string): string {
   const paths: string[] = [];
@@ -103,6 +113,137 @@ describe('release install (AC45)', () => {
     } finally {
       restored.close();
     }
+  });
+
+  it('ships a present Keychain helper byte-for-byte, executable, and attested', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-release-helper-'));
+    const sourceDir = sourceBuild(root, 'helper-sha');
+    const sourceHelper = join(sourceDir, 'native', 'keychain-helper', 'build', 'qlb-keychain-helper');
+    mkdirSync(join(sourceDir, 'native', 'keychain-helper', 'build'), { recursive: true });
+    writeFileSync(sourceHelper, 'plain fake helper bytes\n');
+
+    const installed = await installRelease({
+      sourceDir, appDir: join(root, 'app-with-helper'), sha: 'helper-sha', dbPath: join(root, 'db'), ...validHelperVerifier,
+    });
+    const installedHelper = join(installed.releaseDir, 'native', 'keychain-helper', 'build', 'qlb-keychain-helper');
+    assert.deepEqual(readFileSync(installedHelper), readFileSync(sourceHelper));
+    assert.equal(statSync(installedHelper).mode & 0o777, 0o755);
+    const helperDigest = readReleaseManifest(installed.releaseDir)!.digest;
+
+    unlinkSync(sourceHelper);
+    const withoutHelper = await installRelease({
+      sourceDir, appDir: join(root, 'app-without-helper'), sha: 'helper-sha', dbPath: join(root, 'db'), platform: 'linux', ...validHelperVerifier,
+    });
+    assert.equal(existsSync(join(withoutHelper.releaseDir, 'native', 'keychain-helper', 'build', 'qlb-keychain-helper')), false);
+    assert.notEqual(readReleaseManifest(withoutHelper.releaseDir)!.digest, helperDigest);
+  });
+
+  it('refuses a missing Keychain helper on darwin before publishing a release', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-release-helper-missing-'));
+    const sourceDir = sourceBuild(root, 'missing-helper-sha');
+    const appDir = join(root, 'app');
+
+    await assert.rejects(
+      installRelease({ sourceDir, appDir, sha: 'missing-helper-sha', dbPath: join(root, 'db'), platform: 'darwin' }),
+      /helper missing; run npm run build:helper/,
+    );
+    assert.equal(existsSync(join(appDir, 'missing-helper-sha')), false);
+  });
+
+  it('refuses an unsigned present Keychain helper before publishing a release', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-release-helper-unsigned-'));
+    const sourceDir = sourceBuild(root, 'unsigned-helper-sha');
+    const helper = join(sourceDir, 'native', 'keychain-helper', 'build', 'qlb-keychain-helper');
+    mkdirSync(dirname(helper), { recursive: true });
+    writeFileSync(helper, 'unsigned fake helper bytes\n');
+    const appDir = join(root, 'app');
+
+    await assert.rejects(
+      installRelease({ sourceDir, appDir, sha: 'unsigned-helper-sha', dbPath: join(root, 'db') }),
+      /helper not signed; run npm run build:helper/,
+    );
+    assert.equal(existsSync(join(appDir, 'unsigned-helper-sha')), false);
+  });
+
+  it('refuses a present helper signed by another authority before publishing a release', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-release-helper-authority-'));
+    const sourceDir = sourceBuild(root, 'foreign-helper-sha');
+    const helper = join(sourceDir, 'native', 'keychain-helper', 'build', 'qlb-keychain-helper');
+    mkdirSync(dirname(helper), { recursive: true });
+    writeFileSync(helper, 'foreign fake helper bytes\n');
+    const appDir = join(root, 'app');
+    const foreignHelperVerifier = {
+      verifyHelperSigning: () => ({ ...QLB_HELPER_SIGNING, authority: 'Other Signing Identity' }),
+    };
+
+    await assert.rejects(
+      installRelease({
+        sourceDir, appDir, sha: 'foreign-helper-sha', dbPath: join(root, 'db'), ...foreignHelperVerifier,
+      }),
+      /helper signed by Other Signing Identity, expected QLB Keychain Helper; run npm run build:helper/,
+    );
+    assert.equal(existsSync(join(appDir, 'foreign-helper-sha')), false);
+  });
+
+  it('refuses a helper that does not match a recorded leaf pin before publishing', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-release-helper-pin-'));
+    const sourceDir = sourceBuild(root, 'pinned-helper-sha');
+    const helper = join(sourceDir, 'native', 'keychain-helper', 'build', 'qlb-keychain-helper');
+    mkdirSync(dirname(helper), { recursive: true });
+    writeFileSync(helper, 'foreign fake helper bytes\n');
+    const appDir = join(root, 'app');
+    let published = false;
+
+    await assert.rejects(
+      installRelease({
+        sourceDir, appDir, sha: 'pinned-helper-sha', dbPath: join(root, 'db'),
+        helperConfigReader: () => 'c'.repeat(40),
+        verifyHelperIdentity: () => ({ trusted: false, reason: 'pinned leaf certificate did not verify' }),
+        verifyHelperSigning: () => { published = true; return QLB_HELPER_SIGNING; },
+      }),
+      /helper pinned leaf certificate did not verify; run npm run build:helper or qlb keychain check-launchd/,
+    );
+    assert.equal(published, false);
+    assert.equal(existsSync(join(appDir, 'pinned-helper-sha')), false);
+  });
+
+  it('refuses a helper reached through a symlinked ancestor outside the checkout', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-release-helper-symlink-'));
+    const sourceDir = sourceBuild(root, 'symlink-helper-sha');
+    const outside = join(root, 'outside');
+    mkdirSync(outside);
+    writeFileSync(join(outside, 'qlb-keychain-helper'), 'outside fake helper bytes\n');
+    mkdirSync(join(sourceDir, 'native', 'keychain-helper'), { recursive: true });
+    symlinkSync(outside, join(sourceDir, 'native', 'keychain-helper', 'build'));
+    const appDir = join(root, 'app');
+
+    await assert.rejects(
+      installRelease({ sourceDir, appDir, sha: 'symlink-helper-sha', dbPath: join(root, 'db'), ...validHelperVerifier }),
+      /symlink .*native\/keychain-helper\/build\/qlb-keychain-helper resolves to .*outside/,
+    );
+    assert.equal(existsSync(join(appDir, 'symlink-helper-sha')), false);
+  });
+
+  it('detects an altered installed Keychain helper through the release digest', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-release-helper-altered-'));
+    const sourceDir = sourceBuild(root, 'helper-altered-sha');
+    const sourceHelper = join(sourceDir, 'native', 'keychain-helper', 'build', 'qlb-keychain-helper');
+    mkdirSync(join(sourceDir, 'native', 'keychain-helper', 'build'), { recursive: true });
+    writeFileSync(sourceHelper, 'plain fake helper bytes\n');
+    const appDir = join(root, 'app');
+    const installed = await installRelease({
+      sourceDir, appDir, sha: 'helper-altered-sha', dbPath: join(root, 'db'), ...validHelperVerifier,
+    });
+    writeFileSync(join(installed.releaseDir, 'native', 'keychain-helper', 'build', 'qlb-keychain-helper'), 'altered fake helper bytes\n');
+
+    const result = releaseCurrentCheck({ appDir, lifecycleReleaseSha: 'helper-altered-sha' });
+    assert.equal(result.level, 'WARN');
+    assert.match(result.message, /bytes/);
+  });
+
+  it('ignores Keychain helper build output', () => {
+    const ignore = readFileSync(join(__dirname, '..', '..', '.gitignore'), 'utf8');
+    assert.match(ignore, /^native\/keychain-helper\/build\/$/m);
   });
 
   it('copies production dependencies so an installed CLI starts without the checkout node_modules', async () => {

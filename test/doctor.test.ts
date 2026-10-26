@@ -111,6 +111,59 @@ describe('qlb doctor', () => {
     );
   });
 
+  it('emits recorded Keychain matrix and live-item authorization results on darwin', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-keychain-recorded-'));
+    const values = new Map<string, string>([
+      ['keychain.helperCheckResult', 'ok'],
+      ['keychain.helperCheckPrompted', 'false'],
+      ['keychain.helperCheckAt', '123'],
+      ['keychain.helperCheckBinaryHash', 'binary-hash'],
+      ['keychain.helperCheckIdentityHash', 'identity-hash'],
+      ['keychain.liveItemsReadAuthorizedAt', '123'],
+      ['keychain.liveItemsReadAuthorizedIdentityHash', 'identity-hash'],
+    ]);
+    const green = await doctorQlb(defaultConfig(home), {
+      command: () => 'ok', hostCommand: () => '', hostPlatform: 'darwin', configReader: (key) => values.get(key) ?? null,
+      helperSigning: () => ({ authority: 'QLB Keychain Helper', binaryHash: 'binary-hash', identityHash: 'identity-hash' }),
+      helperIdentityVerifier: () => ({ trusted: true }), now: () => 124,
+    });
+    assert.equal(green.checks.find((check) => check.name === 'keychain:helper')?.level, 'PASS');
+    assert.equal(green.checks.find((check) => check.name === 'keychain:live-items-authorized')?.level, 'PASS');
+
+    values.set('keychain.helperCheckPrompted', 'true');
+    values.delete('keychain.liveItemsReadAuthorizedAt');
+    const blocked = await doctorQlb(defaultConfig(home), {
+      command: () => 'ok', hostCommand: () => '', hostPlatform: 'darwin', configReader: (key) => values.get(key) ?? null,
+      helperSigning: () => ({ authority: 'QLB Keychain Helper', binaryHash: 'binary-hash', identityHash: 'identity-hash' }),
+      helperIdentityVerifier: () => ({ trusted: true }), now: () => 124,
+    });
+    assert.equal(blocked.checks.find((check) => check.name === 'keychain:helper')?.level, 'FAIL');
+    assert.equal(blocked.checks.find((check) => check.name === 'keychain:live-items-authorized')?.level, 'WARN');
+  });
+
+  it('fails the helper doctor row when the recorded pin does not verify', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-keychain-pin-'));
+    const values = new Map<string, string>([
+      ['keychain.helperCheckResult', 'ok'],
+      ['keychain.helperCheckPrompted', 'false'],
+      ['keychain.helperCheckAt', '123'],
+      ['keychain.helperCheckBinaryHash', 'binary-hash'],
+      ['keychain.helperCheckIdentityHash', 'identity-hash'],
+    ]);
+    let pin: string | undefined;
+    const report = await doctorQlb(defaultConfig(home), {
+      command: () => 'ok', hostCommand: () => '', hostPlatform: 'darwin', configReader: (key) => values.get(key) ?? null,
+      helperSigning: () => ({ authority: 'QLB Keychain Helper', binaryHash: 'binary-hash', identityHash: 'identity-hash' }),
+      helperIdentityVerifier: (_path, candidate) => {
+        pin = candidate;
+        return { trusted: false, reason: 'pinned leaf certificate did not verify' };
+      },
+      now: () => 124,
+    });
+    assert.equal(pin, 'identity-hash');
+    assert.equal(report.checks.find((check) => check.name === 'keychain:helper')?.level, 'FAIL');
+  });
+
   it('bounds the production security command runner', () => {
     let timeoutMs: number | undefined;
     const run = createCommandRunner((_file, _args, options) => {

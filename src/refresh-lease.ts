@@ -204,6 +204,15 @@ export class RefreshLease {
         continue;
       }
 
+      // Preflight the helper before a provider can consume a single-use refresh
+      // token. It is a no-write trust check; a refusal leaves the lease clean.
+      try {
+        this.keychain.assertHelperUsable?.();
+      } catch (err) {
+        this.store.releaseRefreshLease(accountId, me);
+        throw err;
+      }
+
       // Step 4 — HTTP outside any txn, heartbeat + hard timeout abort.
       const ac = new AbortController();
       const hbTimer = setInterval(() => {
