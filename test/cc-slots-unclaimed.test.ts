@@ -93,6 +93,16 @@ describe('Claude unclaimed stash and restore (K2 / AC48)', () => {
     assert.equal((await slots.readSlot('account-a', { fresh: true })).credential, credential('issued'));
   });
 
+  it('adopts a matching stashed successor for the consume gate', async () => {
+    const { slots } = fixture();
+    await slots.createSlot({ accountId: 'account-a', credential: credential('one'), source: 'cswap-import' });
+    const current = (await slots.readSlot('account-a', { fresh: true })).fingerprint;
+    await slots.stashUnclaimed('2026-10-25T12:01:15Z', credential('issued'), current);
+
+    assert.equal((await slots.adoptStashedSuccessor('account-a'))?.credential, credential('issued'));
+    assert.equal((await slots.readSlot('account-a', { fresh: true })).credential, credential('issued'));
+  });
+
   it('reports when a restored stash could not be deleted', async () => {
     const { slots, backend } = fixture();
     await slots.createSlot({ accountId: 'account-a', credential: credential('one'), source: 'cswap-import' });

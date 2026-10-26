@@ -384,6 +384,8 @@ export class ClaudeSlots {
   private readonly files: ClaudeSlotFileOps;
   private readonly cache = new Map<string, CachedSlot>();
   private readonly slotWrites = new Map<string, Promise<void>>();
+  /** Stashes created or swept by this coordinator; fallback files are also scanned. */
+  private readonly knownUnclaimedTimestamps = new Set<string>();
   private cacheEpoch = 0;
 
   constructor(private readonly options: ClaudeSlotsOptions) {
@@ -509,6 +511,7 @@ export class ClaudeSlots {
     const record = JSON.stringify({ credential, ...(consumedFp ? { consumedFp } : {}) });
     try {
       await this.backend.set(this.unclaimedService(timestamp), QLB_KEYCHAIN_ACCOUNT, record);
+      this.knownUnclaimedTimestamps.add(timestamp);
       return { location: 'keychain' };
     } catch {
       const path = this.filePath(timestamp);
@@ -522,6 +525,7 @@ export class ClaudeSlots {
         throw new Error('unable to persist unclaimed credential');
       }
       await this.files.chmod(path, 0o600);
+      this.knownUnclaimedTimestamps.add(timestamp);
       return { location: 'file', path };
     }
   }
@@ -541,12 +545,59 @@ export class ClaudeSlots {
         parseUnclaimed(text);
         await this.backend.set(this.unclaimedService(timestamp), QLB_KEYCHAIN_ACCOUNT, text);
         await this.files.rm(join(this.options.stashDir, name), { force: true });
+        this.knownUnclaimedTimestamps.add(timestamp);
         swept += 1;
       } catch {
         retained += 1;
       }
     }
     return { swept, retained };
+  }
+
+  /**
+   * Adopt a known S36 successor for the slot's current lineage. This is the
+   * consume gate's automatic counterpart to the timestamp-addressed restore
+   * command. A missing stash is ignored; an unreadable one is surfaced so a
+   * caller never spends the predecessor while its successor may be stranded.
+   */
+  async adoptStashedSuccessor(accountId: string): Promise<ReadClaudeSlot | null> {
+    assertSlotId(accountId);
+    return this.withSlotWrite(accountId, async () => {
+      let adopted: ReadClaudeSlot | null = null;
+      let adoptedTimestamp: string | null = null;
+      await this.options.repository.withWriteTransaction(async (onRollback) => {
+        if (!this.options.repository.getSlot(accountId)) return;
+        const current = await this.readExistingCredential(accountId);
+        if (current == null) return;
+        const currentFingerprint = this.fingerprint(current);
+        for (const timestamp of await this.unclaimedTimestamps()) {
+          let record: UnclaimedRecord;
+          try {
+            record = await this.readUnclaimed(timestamp);
+          } catch (error) {
+            if (error instanceof Error && /not found/.test(error.message)) {
+              this.knownUnclaimedTimestamps.delete(timestamp);
+              continue;
+            }
+            throw new Error('unclaimed credential unavailable');
+          }
+          if (record.consumedFp !== currentFingerprint) continue;
+          await this.writeSlotUnlocked(accountId, record.credential, { cause: 'stash-adopt', evidence: 'lineage' }, onRollback);
+          adopted = { credential: record.credential, fingerprint: this.fingerprint(record.credential) };
+          adoptedTimestamp = timestamp;
+          break;
+        }
+      });
+      if (adoptedTimestamp) {
+        try {
+          await this.deleteUnclaimed(adoptedTimestamp);
+          this.knownUnclaimedTimestamps.delete(adoptedTimestamp);
+        } catch {
+          // The durable slot write won; retain the safety copy for a later sweep.
+        }
+      }
+      return adopted;
+    });
   }
 
   /** Restores an S36 record only when it was issued from the slot's current lineage. */
@@ -570,6 +621,20 @@ export class ClaudeSlots {
         return { cleanupPending: true };
       }
     });
+  }
+
+  private async unclaimedTimestamps(): Promise<string[]> {
+    const timestamps = new Set(this.knownUnclaimedTimestamps);
+    try {
+      for (const name of await this.files.readdir(this.options.stashDir)) {
+        if (!name.endsWith('.json')) continue;
+        const timestamp = name.slice(0, -'.json'.length);
+        try { this.assertTimestamp(timestamp); timestamps.add(timestamp); } catch { /* ignore unrelated files */ }
+      }
+    } catch {
+      // A missing fallback directory is normal; keychain-created timestamps are still known.
+    }
+    return [...timestamps].sort();
   }
 
   private async readExistingCredential(accountId: string): Promise<string | null> {

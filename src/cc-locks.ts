@@ -112,6 +112,54 @@ export interface ClaudeLockPaths {
   configLockDir: string;
 }
 
+/** QLB's provider-level locks; independent from Claude Code's own lock paths. */
+export interface ClaudeGateLockOptions {
+  home?: string;
+  env?: NodeJS.ProcessEnv;
+  timeoutMs?: number;
+  stalenessMs?: number;
+}
+
+function gateLockHome(options: ClaudeGateLockOptions): string {
+  if (options.home) return options.home;
+  return qlbHomeDir(options.env ?? process.env);
+}
+
+function assertGateLockAccountId(accountId: string): void {
+  if (!accountId || /[\0/\\/:]/.test(accountId)) throw new Error('invalid Claude consume-lock account id');
+}
+
+/**
+ * Serialize refresh-token consumption for one QLB Claude slot.
+ *
+ * The directory-lock primitive is intentionally the same injected-safe mechanism
+ * as QLB's other locks; callers inject this boundary in unit tests.
+ */
+export async function withClaudeConsumeLock<T>(
+  accountId: string,
+  fn: () => Promise<T> | T,
+  options: ClaudeGateLockOptions = {},
+): Promise<T> {
+  assertGateLockAccountId(accountId);
+  return withProperLockfile(join(gateLockHome(options), '.qlb', 'locks', `consume-anthropic-${accountId}.lock`), {
+    ...options,
+    timeoutMs: options.timeoutMs ?? 10_000,
+    stalenessMs: options.stalenessMs ?? CREDENTIALS_STALENESS_MS,
+  }, fn);
+}
+
+/** Briefly serialize slot CAS/adoption with Claude switch operations. */
+export async function withClaudeSwitchLock<T>(
+  fn: () => Promise<T> | T,
+  options: ClaudeGateLockOptions = {},
+): Promise<T> {
+  return withProperLockfile(join(gateLockHome(options), '.qlb', 'locks', 'switch-anthropic.lock'), {
+    ...options,
+    timeoutMs: options.timeoutMs ?? 10_000,
+    stalenessMs: options.stalenessMs ?? CREDENTIALS_STALENESS_MS,
+  }, fn);
+}
+
 function resolvedEnv({ env = process.env }: ClaudeLockOptions): NodeJS.ProcessEnv {
   return env;
 }
