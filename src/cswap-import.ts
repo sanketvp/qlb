@@ -26,6 +26,7 @@ export type CswapImportRefusalCode =
   | 'import-in-progress'
   | 'live-active-identity-mismatch'
   | 'live-identity-unresolvable'
+  | 'live-changed'
   | 'api-key-source'
   | 'session-profiles';
 
@@ -42,6 +43,14 @@ export class CswapImportInjectedCrash extends Error {
   constructor() {
     super('injected C-swap import crash');
     this.name = 'CswapImportInjectedCrash';
+  }
+}
+
+/** The SQLite import_runs authority could not be read; leave effects for S62 recovery. */
+export class CswapImportCommitUnknown extends Error {
+  constructor(readonly journalPath: string) {
+    super(`C-swap import commit state is unknown; recovery required: ${journalPath}`);
+    this.name = 'CswapImportCommitUnknown';
   }
 }
 
@@ -80,6 +89,12 @@ export interface CswapImportOptions {
   liveCredential?: () => Promise<string>;
   /** Identity comes from Claude's global config oauthAccount, never the credential blob. */
   liveAccountId?: () => Promise<string | null>;
+  /** Production reads the credential and config identity while holding Claude's switch locks. */
+  liveSnapshot?: () => Promise<{ credential: string; accountId: string | null }>;
+  /** Test seam after the first live snapshot and before the required pre-commit re-read. */
+  afterLiveSnapshot?: () => Promise<void> | void;
+  /** Test seam called only after recovery has acquired the shared import lock. */
+  beforeRecovery?: () => Promise<void> | void;
   now?: () => number;
   runId?: string;
   replace?: boolean;
@@ -137,11 +152,13 @@ interface JournalSlot {
   prevSaved: boolean;
   previousSaved: boolean;
   reached: ReachedPhase;
+  /** Written before cleanup so a crash after a partial cleanup does not re-restore it. */
+  restored: boolean;
 }
 
 interface Journal {
   runId: string;
-  phase: 'staged' | 'promoting' | 'committed' | 'cleaned' | 'aborted';
+  phase: 'staged' | 'promoting' | 'committed' | 'commit-unknown' | 'cleaned' | 'aborted';
   startedAt: number;
   slots: JournalSlot[];
 }
@@ -419,11 +436,15 @@ async function deleteIfPresent(keychain: ClaudeSlotBackend, target: string): Pro
   try { await keychain.delete(target, QLB_KEYCHAIN_ACCOUNT); } catch (error) { if (!isCredentialNotFound(error)) throw error; }
 }
 
-async function cleanup(keychain: ClaudeSlotBackend, journal: Journal): Promise<void> {
+async function cleanup(keychain: ClaudeSlotBackend, journal: Journal, restoredOnly = false): Promise<void> {
   for (const entry of journal.slots) {
     await deleteIfPresent(keychain, entry.staging);
-    await deleteIfPresent(keychain, entry.importPrevious);
-    await deleteIfPresent(keychain, entry.importPreviousPrevious);
+    // Recovery preimages are deleted only after their corresponding restore is
+    // durably recorded. A failed restore retains every preimage for S62.
+    if (!restoredOnly || entry.restored) {
+      await deleteIfPresent(keychain, entry.importPrevious);
+      await deleteIfPresent(keychain, entry.importPreviousPrevious);
+    }
   }
 }
 
@@ -438,43 +459,63 @@ function readJournal(options: CswapImportOptions, runId: string): Journal {
   }
 }
 
-async function rollbackEffects(keychain: ClaudeSlotBackend, effects: PromotionEffect[]): Promise<unknown[]> {
+async function rollbackEffects(
+  keychain: ClaudeSlotBackend,
+  effects: PromotionEffect[],
+  onRestored: (entry: JournalSlot) => void,
+): Promise<unknown[]> {
   const failures: unknown[] = [];
   for (const effect of [...effects].reverse()) {
+    let restored = true;
     try {
       if (effect.prior == null) await deleteIfPresent(keychain, effect.entry.destination);
       else await keychain.set(effect.entry.destination, QLB_KEYCHAIN_ACCOUNT, effect.prior);
-    } catch (error) { failures.push(error); }
+    } catch (error) { failures.push(error); restored = false; }
     try {
       const previous = previousDestination(effect.entry.accountId);
       if (effect.priorPrevious == null) await deleteIfPresent(keychain, previous);
       else await keychain.set(previous, QLB_KEYCHAIN_ACCOUNT, effect.priorPrevious);
-    } catch (error) { failures.push(error); }
+    } catch (error) { failures.push(error); restored = false; }
+    if (restored) {
+      effect.entry.restored = true;
+      onRestored(effect.entry);
+    }
   }
   return failures;
 }
 
-async function liveEffectiveCredentials(options: CswapImportOptions, sourceSlots: SourceSlot[]): Promise<Array<SourceSlot & {
-  effectiveCredential: string; effectivePrevious: string | null; effectiveFrom: string | null;
-}>> {
-  const effective = sourceSlots.map((slot) => ({ ...slot, effectiveCredential: slot.credential, effectivePrevious: slot.previousCredential, effectiveFrom: null as string | null }));
-  const activeIndex = effective.findIndex((slot) => slot.active);
-  if (activeIndex < 0 || !options.liveCredential) return effective;
-  if (!options.liveAccountId) {
+type LiveSnapshot = { credential: string; accountId: string | null };
+
+async function readLiveSnapshot(options: CswapImportOptions): Promise<LiveSnapshot> {
+  if (options.liveSnapshot) return options.liveSnapshot();
+  if (!options.liveCredential || !options.liveAccountId) {
     throw new CswapImportRefusalError('live-identity-unresolvable', 'C-swap import refused: live active identity is unresolvable');
   }
-  const [live, identity] = await Promise.all([options.liveCredential(), options.liveAccountId()]);
-  if (!identity) throw new CswapImportRefusalError('live-identity-unresolvable', 'C-swap import refused: live active identity is unresolvable');
-  if (identity !== effective[activeIndex].accountId) {
+  const [credential, accountId] = await Promise.all([options.liveCredential(), options.liveAccountId()]);
+  return { credential, accountId };
+}
+
+async function liveEffectiveCredentials(options: CswapImportOptions, sourceSlots: SourceSlot[]): Promise<{
+  effective: Array<SourceSlot & { effectiveCredential: string; effectivePrevious: string | null; effectiveFrom: string | null }>;
+  snapshot: LiveSnapshot | null;
+}> {
+  const effective = sourceSlots.map((slot) => ({ ...slot, effectiveCredential: slot.credential, effectivePrevious: slot.previousCredential, effectiveFrom: null as string | null }));
+  const activeIndex = effective.findIndex((slot) => slot.active);
+  if (activeIndex < 0 || (!options.liveCredential && !options.liveSnapshot)) return { effective, snapshot: null };
+  const snapshot = await readLiveSnapshot(options);
+  if (!snapshot.accountId) throw new CswapImportRefusalError('live-identity-unresolvable', 'C-swap import refused: live active identity is unresolvable');
+  if (snapshot.accountId !== effective[activeIndex].accountId) {
     throw new CswapImportRefusalError('live-active-identity-mismatch', 'C-swap import refused: live active identity mismatch');
   }
-  const liveFingerprint = oauthFingerprint(live, effective[activeIndex].slotNum);
-  if (live !== effective[activeIndex].credential) {
-    effective[activeIndex].effectiveCredential = live;
-    effective[activeIndex].effectivePrevious = effective[activeIndex].credential;
+  const liveFingerprint = oauthFingerprint(snapshot.credential, effective[activeIndex].slotNum);
+  if (snapshot.credential !== effective[activeIndex].credential) {
+    effective[activeIndex].effectiveCredential = snapshot.credential;
+    // A same-lineage live refresh updates access data, not the source's prior lineage.
+    effective[activeIndex].effectivePrevious = liveFingerprint === effective[activeIndex].fingerprint
+      ? effective[activeIndex].previousCredential : effective[activeIndex].credential;
     effective[activeIndex].effectiveFrom = liveFingerprint === effective[activeIndex].fingerprint ? null : effective[activeIndex].fingerprint;
   }
-  return effective;
+  return { effective, snapshot };
 }
 
 /** Executes §4.9 staging/promotion. K14 consumes this credential-free S62 journal. */
@@ -507,7 +548,7 @@ async function importCswapLocked(options: CswapImportOptions): Promise<{ runId: 
       fingerprint: slot.fingerprint, previousFingerprint: slot.previousFingerprint, promotedFingerprint: null,
       destinationExisted: null, priorDestinationFingerprint: null, priorDestinationLineage: null,
       previousDestinationExisted: null, priorPreviousFingerprint: null,
-      prevSaved: false, previousSaved: false, reached: 'unreached',
+      prevSaved: false, previousSaved: false, reached: 'unreached', restored: false,
     })),
   };
   writeJournal(options, journal);
@@ -520,7 +561,7 @@ async function importCswapLocked(options: CswapImportOptions): Promise<{ runId: 
       if (oauthFingerprint(actual, source.slotNum) !== source.fingerprint) throw new Error(`C-swap import verification failed for slot ${source.slotNum}`);
     }
 
-    const effective = await liveEffectiveCredentials(options, sourceSlots);
+    const { effective, snapshot: firstLiveSnapshot } = await liveEffectiveCredentials(options, sourceSlots);
     journal.phase = 'promoting';
     for (let index = 0; index < effective.length; index += 1) {
       journal.slots[index].promotedFingerprint = oauthFingerprint(effective[index].effectiveCredential, effective[index].slotNum);
@@ -576,6 +617,16 @@ async function importCswapLocked(options: CswapImportOptions): Promise<{ runId: 
       }
     }
 
+    // Re-read the credential/config pair under the same Claude locks before the
+    // SQLite authority commits. A native account switch cannot mix identities.
+    if (firstLiveSnapshot) {
+      await options.afterLiveSnapshot?.();
+      const secondLiveSnapshot = await readLiveSnapshot(options);
+      if (secondLiveSnapshot.credential !== firstLiveSnapshot.credential || secondLiveSnapshot.accountId !== firstLiveSnapshot.accountId) {
+        throw new CswapImportRefusalError('live-changed', 'C-swap import refused: live state changed during import');
+      }
+    }
+
     const committedAt = now();
     options.repository.commitCswapImport({
       runId, startedAt, committedAt,
@@ -601,18 +652,32 @@ async function importCswapLocked(options: CswapImportOptions): Promise<{ runId: 
     // An injected crash deliberately bypasses compensation so S62 recovery is
     // exercised against exactly the durable state a killed process leaves.
     if (error instanceof CswapImportInjectedCrash) throw error;
-    let committed = false;
-    try { committed = options.repository.getImportRun(runId)?.committedAt != null; } catch { /* compensate even if SQLite is unavailable */ }
+    let committed: boolean;
+    try {
+      committed = options.repository.getImportRun(runId)?.committedAt != null;
+    } catch {
+      // The import_runs row is S62's authority. Unknown is never evidence that
+      // compensation is safe: retain all effects and let recovery decide later.
+      journal.phase = 'commit-unknown';
+      try { writeJournal(options, journal); } catch { /* preserve the authority failure */ }
+      throw new CswapImportCommitUnknown(journalPath(options, runId));
+    }
     if (committed) {
       journal.phase = 'committed';
       try { writeJournal(options, journal); } catch { /* original failure remains authoritative */ }
       throw error;
     }
-    const restoreFailures = await rollbackEffects(options.keychain, effects);
+    const restoreFailures = await rollbackEffects(options.keychain, effects, () => writeJournal(options, journal));
+    if (restoreFailures.length > 0) {
+      // Keep all preimages: one failed restore means recovery still needs a
+      // coherent set of backups, including entries restored before the failure.
+      try { writeJournal(options, journal); } catch { /* preserve original error */ }
+      throw new Error(`C-swap import recovery required: ${journalPath(options, runId)}`);
+    }
     let cleanupFailure: unknown | null = null;
-    try { await cleanup(options.keychain, journal); } catch (failure) { cleanupFailure = failure; }
-    if (restoreFailures.length > 0 || cleanupFailure) {
-      // Do not falsely mark a journal terminal when an operator/K14 must recover it.
+    try { await cleanup(options.keychain, journal, true); } catch (failure) { cleanupFailure = failure; }
+    if (cleanupFailure) {
+      // restored is journaled before cleanup, making a partial cleanup idempotent.
       try { writeJournal(options, journal); } catch { /* preserve original error */ }
       throw new Error(`C-swap import recovery required: ${journalPath(options, runId)}`);
     }
@@ -627,16 +692,39 @@ async function importCswapLocked(options: CswapImportOptions): Promise<{ runId: 
  * promoting journal committed. Unreached slots are deliberately untouched.
  */
 export async function recoverUncommittedCswapImport(options: CswapImportOptions, runId: string): Promise<'cleaned' | 'aborted'> {
+  const lock = join(journalRoot(options), 'cswap-import.lock');
+  try {
+    return await withCswapImportLock(lock, async () => {
+      await options.beforeRecovery?.();
+      return recoverUncommittedCswapImportLocked(options, runId);
+    });
+  } catch (error) {
+    if (error instanceof CswapImportInProgress) {
+      throw new CswapImportRefusalError('import-in-progress', 'C-swap import refused: import already in progress');
+    }
+    throw error;
+  }
+}
+
+async function recoverUncommittedCswapImportLocked(options: CswapImportOptions, runId: string): Promise<'cleaned' | 'aborted'> {
   const journal = readJournal(options, runId);
-  if (options.repository.getImportRun(runId)?.committedAt != null) {
+  let committed: boolean;
+  try {
+    committed = options.repository.getImportRun(runId)?.committedAt != null;
+  } catch {
+    journal.phase = 'commit-unknown';
+    try { writeJournal(options, journal); } catch { /* retain the original authority failure */ }
+    throw new CswapImportCommitUnknown(journalPath(options, runId));
+  }
+  if (committed) {
     await cleanup(options.keychain, journal);
     journal.phase = 'cleaned';
     writeJournal(options, journal);
     return 'cleaned';
   }
-  if (journal.phase === 'promoting') {
+  if (journal.phase === 'promoting' || journal.phase === 'commit-unknown') {
     for (const entry of [...journal.slots].reverse()) {
-      if (entry.reached === 'unreached') continue;
+      if (entry.reached === 'unreached' || entry.restored) continue;
       if (entry.destinationExisted) {
         if (!entry.prevSaved || !entry.priorDestinationFingerprint) {
           throw new Error(`C-swap import recovery required: ${journalPath(options, runId)}`);
@@ -664,6 +752,8 @@ export async function recoverUncommittedCswapImport(options: CswapImportOptions,
           await deleteIfPresent(options.keychain, previous);
         }
       }
+      entry.restored = true;
+      writeJournal(options, journal);
     }
   }
   await cleanup(options.keychain, journal);

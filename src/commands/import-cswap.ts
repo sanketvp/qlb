@@ -1,6 +1,7 @@
 import { dirname, join } from 'node:path';
 
 import { claudePaths } from '../cc-paths';
+import { withClaudeConfigLock, withClaudeCredentialLocks } from '../cc-locks';
 import { SqliteClaudeSlotRepository } from '../cc-slots';
 import { CswapImportRefusalError, importCswap, planCswapImport } from '../cswap-import';
 import { readClaudeConfig, readLiveClaudeCredentials } from '../cc-credentials';
@@ -71,13 +72,14 @@ async function execute(args: string[], ctx: CommandContext): Promise<number> {
       return 0;
     }
     const paths = claudePaths({ home: ctx.home, env: ctx.env });
-    const result = await importCswap({
-      ...base,
-      liveCredential: () => readLiveClaudeCredentials({ backend: platformKeychain, paths, env: ctx.env }),
-      // Claude's Keychain OAuth blob intentionally has no account UUID. The
-      // global config is the live identity authority for §4.9's active check.
-      liveAccountId: async () => configuredOauthAccountId(paths.globalConfigPath),
-    });
+    const readLiveSnapshot = () => withClaudeCredentialLocks({ home: ctx.home, env: ctx.env }, () =>
+      withClaudeConfigLock({ home: ctx.home, env: ctx.env }, async () => ({
+        credential: await readLiveClaudeCredentials({ backend: platformKeychain, paths, env: ctx.env }),
+        // Claude's Keychain OAuth blob intentionally has no account UUID. The
+        // config identity and credential are therefore read as one lock-bound snapshot.
+        accountId: configuredOauthAccountId(paths.globalConfigPath),
+      })));
+    const result = await importCswap({ ...base, liveSnapshot: readLiveSnapshot });
     print(ctx, { ...result.plan, runId: result.runId, phase: result.phase }, opts.json);
     return 0;
   } catch (error) {

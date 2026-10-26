@@ -8,7 +8,10 @@ import { credentialFingerprint } from '../src/anthropic-oauth';
 import { InMemoryClaudeSlotRepository, SqliteClaudeSlotRepository } from '../src/cc-slots';
 import { MockKeychain, QLB_KEYCHAIN_ACCOUNT } from '../src/keychain';
 import { openStore } from '../src/store';
-import { CswapImportInjectedCrash, importCswap, planCswapImport, recoverUncommittedCswapImport } from '../src/cswap-import';
+import {
+  CswapImportCommitUnknown, CswapImportInjectedCrash, CswapImportRefusalError,
+  importCswap, planCswapImport, recoverUncommittedCswapImport,
+} from '../src/cswap-import';
 
 function credential(id: string, refresh: string): string {
   return JSON.stringify({ claudeAiOauth: { accessToken: `access-${id}`, refreshToken: refresh, expiresAt: 1_800_000_000_000, scopes: ['user:inference'], subscriptionType: 'max' } });
@@ -218,6 +221,111 @@ describe('C-swap import (K10 / AC16)', () => {
     }
   });
 
+  it('keeps --replace backups when an in-process restore fails, then recovery restores byte-exact preimages', async () => {
+    const h = fixture();
+    const source = (await planCswapImport({ backupDir: h.backup, keychain: h.keychain, repository: h.repo })).slots[0];
+    const prior = credential('account-a', 'refresh-a');
+    const priorPrevious = credential('account-a', 'prior-previous');
+    h.repo.createSlot({ accountId: source.accountId, slotNum: source.slotNum, email: source.email, configJson: '{}', fingerprint: source.fingerprint, prevFingerprint: null, addedAt: 1, source: 'fixture' });
+    await h.keychain.set('qlb:anthropic:account-a', QLB_KEYCHAIN_ACCOUNT, prior);
+    await h.keychain.set('qlb:anthropic:account-a:prev', QLB_KEYCHAIN_ACCOUNT, priorPrevious);
+    const originalCommit = h.repo.commitCswapImport.bind(h.repo);
+    h.repo.commitCswapImport = () => { throw new Error('injected commit failure'); };
+    let failRestore = true;
+    const backend = {
+      get: h.keychain.get.bind(h.keychain), delete: h.keychain.delete.bind(h.keychain),
+      set: async (service: string, account: string, value: string) => {
+        if (service === 'qlb:anthropic:account-a' && failRestore) {
+          failRestore = false;
+          await h.keychain.set(service, account, value);
+          return;
+        }
+        if (service === 'qlb:anthropic:account-a' && !failRestore) {
+          failRestore = true;
+          throw new Error('injected restore failure');
+        }
+        await h.keychain.set(service, account, value);
+      },
+    };
+    const options = {
+      backupDir: h.backup, journalDir: join(h.root, 'journals'), keychain: backend, repository: h.repo, replace: true, runId: 'restore-failure',
+      liveSnapshot: async () => ({ credential: credential('account-a', 'live-successor'), accountId: 'account-a' }),
+    };
+    await assert.rejects(importCswap(options), /recovery required/);
+    assert.equal(await h.keychain.get('qlb:anthropic:import-prev:restore-failure:account-a', QLB_KEYCHAIN_ACCOUNT), prior);
+    h.repo.commitCswapImport = originalCommit;
+    await assert.equal(await recoverUncommittedCswapImport(options, 'restore-failure'), 'aborted');
+    assert.equal(await h.keychain.get('qlb:anthropic:account-a', QLB_KEYCHAIN_ACCOUNT), prior);
+    assert.equal(await h.keychain.get('qlb:anthropic:account-a:prev', QLB_KEYCHAIN_ACCOUNT), priorPrevious);
+    await assert.rejects(h.keychain.get('qlb:anthropic:import-prev:restore-failure:account-a', QLB_KEYCHAIN_ACCOUNT), /item not found/);
+  });
+
+  it('refuses a live snapshot that changes before commit and rolls back promotion', async () => {
+    const h = fixture();
+    let live = credential('account-a', 'live-one');
+    await assert.rejects(importCswap({
+      backupDir: h.backup, journalDir: join(h.root, 'journals'), keychain: h.keychain, repository: h.repo, runId: 'live-changed',
+      liveSnapshot: async () => ({ credential: live, accountId: 'account-a' }),
+      afterLiveSnapshot: () => { live = credential('account-a', 'live-two'); },
+    }), (error: unknown) => error instanceof CswapImportRefusalError && error.code === 'live-changed');
+    assert.equal(h.repo.listSlots().length, 0);
+    await assert.rejects(h.keychain.get('qlb:anthropic:account-a', QLB_KEYCHAIN_ACCOUNT), /item not found/);
+  });
+
+  it('fails closed on unreadable commit authority, then recovery resolves both committed and absent runs', async () => {
+    for (const committed of [true, false]) {
+      const h = fixture();
+      const originalCommit = h.repo.commitCswapImport.bind(h.repo);
+      const originalGet = h.repo.getImportRun.bind(h.repo);
+      if (!committed) h.repo.commitCswapImport = () => { throw new Error('injected commit failure'); };
+      h.repo.getImportRun = () => { throw new Error('injected authority read failure'); };
+      const backend = {
+        get: h.keychain.get.bind(h.keychain), set: h.keychain.set.bind(h.keychain),
+        delete: async (service: string, account: string) => {
+          if (service.includes(':staging:')) throw new Error('injected cleanup failure');
+          await h.keychain.delete(service, account);
+        },
+      };
+      const runId = `commit-unknown-${committed}`;
+      const options = { backupDir: h.backup, journalDir: join(h.root, 'journals'), keychain: backend, repository: h.repo, runId };
+      await assert.rejects(importCswap(options), CswapImportCommitUnknown);
+      const journal = JSON.parse(readFileSync(join(h.root, 'journals', `cswap-import-${runId}`, 'journal.json'), 'utf8')) as { phase: string };
+      assert.equal(journal.phase, 'commit-unknown');
+      assert.ok(committed ? await h.keychain.get('qlb:anthropic:account-a', QLB_KEYCHAIN_ACCOUNT) : await h.keychain.get('qlb:anthropic:account-a', QLB_KEYCHAIN_ACCOUNT));
+      h.repo.commitCswapImport = originalCommit;
+      h.repo.getImportRun = originalGet;
+      const resolutionBackend = { get: h.keychain.get.bind(h.keychain), set: h.keychain.set.bind(h.keychain), delete: h.keychain.delete.bind(h.keychain) };
+      assert.equal(await recoverUncommittedCswapImport({ ...options, keychain: resolutionBackend }, runId), committed ? 'cleaned' : 'aborted');
+      if (committed) assert.equal(h.repo.listSlots().length, 2);
+      else {
+        assert.equal(h.repo.listSlots().length, 0);
+        await assert.rejects(h.keychain.get('qlb:anthropic:account-a', QLB_KEYCHAIN_ACCOUNT), /item not found/);
+      }
+    }
+  });
+
+  it('serializes recovery with imports in both directions', async () => {
+    const h = fixture();
+    const runId = 'recovery-lock';
+    await assert.rejects(importCswap({
+      backupDir: h.backup, journalDir: join(h.root, 'journals'), keychain: h.keychain, repository: h.repo, runId,
+      afterPromotionWrite: () => { throw new CswapImportInjectedCrash(); },
+    }), CswapImportInjectedCrash);
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    let entered!: () => void;
+    const enteredRecovery = new Promise<void>((resolve) => { entered = resolve; });
+    const recovery = recoverUncommittedCswapImport({
+      backupDir: h.backup, journalDir: join(h.root, 'journals'), keychain: h.keychain, repository: h.repo,
+      beforeRecovery: async () => { entered(); await held; },
+    }, runId);
+    await enteredRecovery;
+    await assert.rejects(importCswap({ backupDir: h.backup, journalDir: join(h.root, 'journals'), keychain: h.keychain, repository: h.repo }),
+      (error: unknown) => error instanceof CswapImportRefusalError && error.code === 'import-in-progress');
+    release();
+    await recovery;
+  });
+
   it('refuses a second process-wide import while a first import holds the lock', async () => {
     const h = fixture();
     let release!: () => void;
@@ -233,6 +341,9 @@ describe('C-swap import (K10 / AC16)', () => {
     await assert.rejects(importCswap({
       backupDir: h.backup, journalDir: join(h.root, 'journals'), keychain: h.keychain, repository: h.repo,
     }), (error: unknown) => (error as { code?: string }).code === 'import-in-progress');
+    await assert.rejects(recoverUncommittedCswapImport({
+      backupDir: h.backup, journalDir: join(h.root, 'journals'), keychain: h.keychain, repository: h.repo,
+    }, 'no-journal-needed-while-locked'), (error: unknown) => (error as { code?: string }).code === 'import-in-progress');
     release();
     await first;
   });
