@@ -1,7 +1,12 @@
 import { DatabaseSync } from 'node:sqlite';
 
-import { codexFingerprint, codexIdentity, type CodexAuthDocument } from './codex-auth';
-import { QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, type KeychainBackend } from './keychain';
+import { codexFingerprint, codexIdentity, parseCodexAuth, type CodexAuthDocument } from './codex-auth';
+import {
+  KeychainReadBackoff,
+  QLB_KEYCHAIN_ACCOUNT,
+  qlbKeychainService,
+  type KeychainBackend,
+} from './keychain';
 import type { Store } from './store';
 
 const PROVIDER = 'openai-codex';
@@ -9,7 +14,110 @@ const BASELINE_CONSUMED_BY_KEY = 'pi.openai-codex.baselineConsumedBy';
 
 type SqlStore = Pick<Store, 'dbPath'>;
 type Keychain = Pick<KeychainBackend, 'getSync' | 'setSync'>;
+type SlotKeychain = Keychain & Pick<KeychainBackend, 'deleteSync'>;
 type JsonObject = Record<string, unknown>;
+
+const DISPLAY_CACHE_TTL_MS = 60_000;
+
+export interface ReadCodexSlot {
+  document: CodexAuthDocument;
+  fingerprint: string;
+}
+
+export interface ReadCodexSlotOptions {
+  /** Correctness reads (consume/switch/resync/import/add/undo) bypass cache and backoff. */
+  fresh?: boolean;
+}
+
+export interface CodexSlotsOptions {
+  keychain: SlotKeychain;
+  now?: () => number;
+  readBackoff?: KeychainReadBackoff;
+}
+
+type CachedSlot = ReadCodexSlot & { expiresAt: number };
+
+/**
+ * Keychain boundary for native Codex documents. Cached reads are exclusively
+ * for display paths; every correctness boundary must use `{ fresh: true }`.
+ */
+export class CodexSlots {
+  private readonly now: () => number;
+  private readonly backoff: KeychainReadBackoff;
+  private readonly cache = new Map<string, CachedSlot>();
+
+  constructor(private readonly options: CodexSlotsOptions) {
+    this.now = options.now ?? Date.now;
+    this.backoff = options.readBackoff ?? new KeychainReadBackoff({ now: this.now });
+  }
+
+  readSlot(accountId: string, options: ReadCodexSlotOptions = {}): ReadCodexSlot {
+    const fresh = options.fresh === true;
+    const cached = this.cache.get(accountId);
+    const now = this.now();
+    if (!fresh && cached && cached.expiresAt > now) return this.copy(cached);
+
+    const result = this.readService(this.slotService(accountId), fresh);
+    if (!fresh) this.cache.set(accountId, { ...result, expiresAt: now + DISPLAY_CACHE_TTL_MS });
+    return result;
+  }
+
+  /** Reads the explicit S46 predecessor without changing the current slot. */
+  readPrevious(accountId: string, options: ReadCodexSlotOptions = {}): ReadCodexSlot {
+    return this.readService(this.previousService(accountId), options.fresh === true);
+  }
+
+  /** S36-shaped safety copy for a native document that cannot be attributed to a managed slot. */
+  stashUnclaimed(timestamp: string, document: CodexAuthDocument): string {
+    this.options.keychain.setSync(this.unclaimedService(timestamp), QLB_KEYCHAIN_ACCOUNT, JSON.stringify(document));
+    return timestamp;
+  }
+
+  readUnclaimed(timestamp: string, options: ReadCodexSlotOptions = {}): ReadCodexSlot {
+    return this.readService(this.unclaimedService(timestamp), options.fresh === true);
+  }
+
+  /**
+   * Restores an unclaimed document only through the caller's slot transaction,
+   * then deletes the stash. This prevents a Keychain-only restoration from
+   * diverging from `codex_slots` metadata.
+   */
+  restoreUnclaimed(timestamp: string, restore: (document: CodexAuthDocument) => void): ReadCodexSlot {
+    const unclaimed = this.readUnclaimed(timestamp, { fresh: true });
+    restore(unclaimed.document);
+    this.options.keychain.deleteSync(this.unclaimedService(timestamp), QLB_KEYCHAIN_ACCOUNT);
+    this.cache.clear();
+    return unclaimed;
+  }
+
+  private readService(service: string, fresh: boolean): ReadCodexSlot {
+    const text = this.backoff.read(
+      () => this.options.keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT),
+      { fresh },
+    );
+    const parsed = parseCodexAuth(text);
+    if (!parsed.ok) throw new Error('stored Codex document is malformed');
+    return { document: parsed.doc, fingerprint: codexFingerprint(parsed.doc) };
+  }
+
+  private copy(slot: ReadCodexSlot): ReadCodexSlot {
+    // The returned document may be inspected by callers; never hand out the
+    // mutable object held in the display cache.
+    return { document: JSON.parse(JSON.stringify(slot.document)) as CodexAuthDocument, fingerprint: slot.fingerprint };
+  }
+
+  private slotService(accountId: string): string {
+    return qlbKeychainService(PROVIDER, accountId);
+  }
+
+  private previousService(accountId: string): string {
+    return `${this.slotService(accountId)}:prev`;
+  }
+
+  private unclaimedService(timestamp: string): string {
+    return qlbKeychainService(PROVIDER, `unclaimed:${timestamp}`);
+  }
+}
 
 export interface CodexImportPlan {
   chatgptUserId: string;
@@ -89,34 +197,44 @@ function existingSlot(db: DatabaseSync, slotId: string): ExistingSlot | undefine
     .get(slotId) as ExistingSlot | undefined;
 }
 
+function currentDocumentMatches(document: string, fingerprint: string): boolean {
+  const parsed = parseCodexAuth(document);
+  return parsed.ok && codexFingerprint(parsed.doc) === fingerprint;
+}
+
 /**
- * S29/S46 import primitive. It stores the complete native auth document in
- * the injected credential backend, then commits the slot, status account,
- * active identity, and lineage graph in one SQLite transaction.
+ * S29/S46 import primitive. The database write lock spans both Keychain
+ * writes and metadata, so concurrent imports cannot interleave credentials
+ * and lineage. A failed commit is made retry-safe by copying `:prev` only
+ * when the current item still matches the recorded predecessor fingerprint.
  */
 export function importActiveCodexSlot(doc: CodexAuthDocument, deps: ImportActiveCodexDeps): CodexImportPlan {
   const plan = planImportActiveCodex(doc);
   const now = deps.now ?? Date.now;
   const fingerprint = codexFingerprint(doc);
   const storeDb = deps.withDb ?? withDatabase;
-  const previous = storeDb(deps.store, (db) => existingSlot(db, plan.slotId));
   const service = qlbKeychainService(PROVIDER, plan.slotId);
 
-  // A prior managed slot gets an explicit predecessor copy before its current
-  // document changes. A new import never probes unrelated Keychain items.
-  if (previous?.fingerprint && previous.fingerprint !== fingerprint) {
-    const oldDocument = deps.keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT);
-    deps.keychain.setSync(`${service}:prev`, QLB_KEYCHAIN_ACCOUNT, oldDocument);
-  }
-  deps.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(doc));
-
   storeDb(deps.store, (db) => {
-    const timestamp = now();
-    const previousFingerprint = previous?.fingerprint && previous.fingerprint !== fingerprint
-      ? previous.fingerprint
-      : previous?.prev_fingerprint ?? null;
     db.exec('BEGIN IMMEDIATE');
     try {
+      const previous = existingSlot(db, plan.slotId);
+      const previousFingerprint = previous?.fingerprint && previous.fingerprint !== fingerprint
+        ? previous.fingerprint
+        : previous?.prev_fingerprint ?? null;
+
+      // A prior managed slot gets an explicit predecessor copy before its
+      // current document changes. After an uncommitted attempt, the current
+      // item is already the successor, so never overwrite the real :prev.
+      if (previous?.fingerprint && previous.fingerprint !== fingerprint) {
+        const oldDocument = deps.keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT);
+        if (currentDocumentMatches(oldDocument, previous.fingerprint)) {
+          deps.keychain.setSync(`${service}:prev`, QLB_KEYCHAIN_ACCOUNT, oldDocument);
+        }
+      }
+      deps.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(doc));
+
+      const timestamp = now();
       db.prepare(`INSERT INTO codex_slots (
         account_id, chatgpt_user_id, chatgpt_account_id, fingerprint, prev_fingerprint,
         last_refresh, dead, pending_adopt, added_at, last_active_at, source
@@ -127,9 +245,12 @@ export function importActiveCodexSlot(doc: CodexAuthDocument, deps: ImportActive
         fingerprint = excluded.fingerprint,
         prev_fingerprint = excluded.prev_fingerprint,
         last_refresh = excluded.last_refresh,
-        dead = 0, dead_reason = NULL, dead_at = NULL, healed_at = NULL,
-        pending_adopt = 0, last_active_at = excluded.last_active_at,
-        source = excluded.source`).run(
+        dead = CASE WHEN codex_slots.fingerprint IS NOT excluded.fingerprint THEN 0 ELSE codex_slots.dead END,
+        dead_reason = CASE WHEN codex_slots.fingerprint IS NOT excluded.fingerprint THEN NULL ELSE codex_slots.dead_reason END,
+        dead_at = CASE WHEN codex_slots.fingerprint IS NOT excluded.fingerprint THEN NULL ELSE codex_slots.dead_at END,
+        healed_at = CASE WHEN codex_slots.fingerprint IS NOT excluded.fingerprint THEN NULL ELSE codex_slots.healed_at END,
+        pending_adopt = 0, archived_at = NULL, last_active_at = excluded.last_active_at,
+        source = COALESCE(codex_slots.source, excluded.source)`).run(
         plan.slotId, plan.chatgptUserId, plan.accountId, fingerprint, previousFingerprint,
         doc.last_refresh ?? null, timestamp, timestamp,
       );

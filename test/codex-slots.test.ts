@@ -6,9 +6,15 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { describe, it } from 'node:test';
 
-import { parseCodexAuth } from '../src/codex-auth';
-import { MockKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from '../src/keychain';
-import { importActiveCodexSlot, planImportActiveCodex } from '../src/codex-slots';
+import { codexFingerprint, parseCodexAuth } from '../src/codex-auth';
+import {
+  KeychainBackedOff,
+  KeychainReadBackoff,
+  MockKeychain,
+  QLB_KEYCHAIN_ACCOUNT,
+  qlbKeychainService,
+} from '../src/keychain';
+import { CodexSlots, importActiveCodexSlot, planImportActiveCodex } from '../src/codex-slots';
 import { openStore } from '../src/store';
 
 function jwt(payload: Record<string, unknown>): string {
@@ -43,6 +49,17 @@ function fixture() {
   const home = mkdtempSync(join(tmpdir(), 'qlb-codex-slots-'));
   const store = openStore(join(home, 'qlb.db'));
   return { home, store, keychain: new MockKeychain() };
+}
+
+class CountingKeychain extends MockKeychain {
+  gets = 0;
+  unavailable = false;
+
+  override getSync(service: string, account: string): string {
+    this.gets += 1;
+    if (this.unavailable) throw new Error('fixture unavailable');
+    return super.getSync(service, account);
+  }
 }
 
 function plain(row: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
@@ -132,6 +149,115 @@ describe('Codex slots and import-active', () => {
       } finally {
         db.close();
       }
+    } finally {
+      h.store.close();
+      rmSync(h.home, { recursive: true, force: true });
+    }
+  });
+
+  it('uses a sixty-second display cache, backs off failures, and lets fresh Codex reads bypass it', () => {
+    let now = 1_000;
+    const keychain = new CountingKeychain();
+    const plan = planImportActiveCodex(parsedDocument());
+    const service = qlbKeychainService('openai-codex', plan.slotId);
+    keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(parsedDocument()));
+    const slots = new CodexSlots({
+      keychain,
+      now: () => now,
+      readBackoff: new KeychainReadBackoff({ now: () => now }),
+    });
+
+    assert.equal(slots.readSlot(plan.slotId).fingerprint, slots.readSlot(plan.slotId).fingerprint);
+    assert.equal(keychain.gets, 1);
+    now += 60_001;
+    slots.readSlot(plan.slotId);
+    assert.equal(keychain.gets, 2);
+
+    keychain.unavailable = true;
+    now += 60_001;
+    assert.throws(() => slots.readSlot(plan.slotId), /fixture unavailable/);
+    assert.throws(() => slots.readSlot(plan.slotId), KeychainBackedOff);
+    keychain.unavailable = false;
+    assert.equal(slots.readSlot(plan.slotId, { fresh: true }).fingerprint.length > 0, true);
+    assert.equal(keychain.gets, 4);
+  });
+
+  it('stores unclaimed native documents and restores the saved predecessor', () => {
+    const keychain = new MockKeychain();
+    const plan = planImportActiveCodex(parsedDocument());
+    const service = qlbKeychainService('openai-codex', plan.slotId);
+    const first = parsedDocument('first-refresh');
+    const second = parsedDocument('second-refresh');
+    const unclaimed = parsedDocument('unclaimed-refresh');
+    keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(second));
+    keychain.setSync(`${service}:prev`, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(first));
+    const slots = new CodexSlots({ keychain });
+
+    assert.equal(slots.readUnclaimed(slots.stashUnclaimed('fixture-time', unclaimed)).fingerprint, codexFingerprint(unclaimed));
+    const restored = slots.restoreUnclaimed('fixture-time', (document) => {
+      keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(document));
+    });
+    assert.equal(restored.fingerprint, slots.readSlot(plan.slotId, { fresh: true }).fingerprint);
+    assert.throws(() => slots.readUnclaimed('fixture-time', { fresh: true }), /item not found/);
+    assert.equal(slots.readPrevious(plan.slotId, { fresh: true }).fingerprint, codexFingerprint(first));
+  });
+
+  it('unarchives an active re-import while preserving same-lineage death evidence and slot source', () => {
+    const h = fixture();
+    try {
+      const first = parsedDocument('first-refresh');
+      const next = parsedDocument('next-refresh');
+      const plan = importActiveCodexSlot(first, { store: h.store, keychain: h.keychain });
+      (h.store as unknown as { db: DatabaseSync }).db.prepare(`UPDATE codex_slots
+        SET archived_at = 1, dead = 1, dead_reason = 'fixture-dead', dead_at = 2, healed_at = 3, source = 'qlb-add'
+        WHERE account_id = ?`).run(plan.slotId);
+
+      importActiveCodexSlot(first, { store: h.store, keychain: h.keychain });
+      const sameLineage = { ...((h.store as unknown as { db: DatabaseSync }).db.prepare(`SELECT archived_at, dead, source
+        FROM codex_slots WHERE account_id = ?`).get(plan.slotId) as { archived_at: number | null; dead: number; source: string }) };
+      assert.deepEqual(sameLineage, { archived_at: null, dead: 1, source: 'qlb-add' });
+
+      importActiveCodexSlot(next, { store: h.store, keychain: h.keychain });
+      const successor = { ...((h.store as unknown as { db: DatabaseSync }).db.prepare(`SELECT dead, dead_reason, dead_at, healed_at, source
+        FROM codex_slots WHERE account_id = ?`).get(plan.slotId) as { dead: number; dead_reason: string | null; dead_at: number | null; healed_at: number | null; source: string }) };
+      assert.deepEqual(successor, { dead: 0, dead_reason: null, dead_at: null, healed_at: null, source: 'qlb-add' });
+    } finally {
+      h.store.close();
+      rmSync(h.home, { recursive: true, force: true });
+    }
+  });
+
+  it('does not overwrite the predecessor after a failed database commit is retried', () => {
+    const h = fixture();
+    try {
+      const first = parsedDocument('first-refresh');
+      const second = parsedDocument('second-refresh');
+      const plan = importActiveCodexSlot(first, { store: h.store, keychain: h.keychain });
+      let rejectCommit = true;
+      const withFailingCommit = <T>(_store: unknown, fn: (db: DatabaseSync) => T): T => {
+        const db = (h.store as unknown as { db: DatabaseSync }).db;
+        const proxy = new Proxy(db, {
+          get(target, property, receiver) {
+            if (property === 'exec') return (sql: string) => {
+              if (sql === 'COMMIT' && rejectCommit) {
+                rejectCommit = false;
+                throw new Error('fixture commit failure');
+              }
+              return target.exec(sql);
+            };
+            const value = Reflect.get(target, property, receiver);
+            return typeof value === 'function' ? value.bind(target) : value;
+          },
+        });
+        return fn(proxy);
+      };
+      assert.throws(() => importActiveCodexSlot(second, { store: h.store, keychain: h.keychain, withDb: withFailingCommit }), /fixture commit failure/);
+      importActiveCodexSlot(second, { store: h.store, keychain: h.keychain });
+
+      const service = qlbKeychainService('openai-codex', plan.slotId);
+      const slots = new CodexSlots({ keychain: h.keychain });
+      assert.equal(slots.readPrevious(plan.slotId).fingerprint, codexFingerprint(first));
+      assert.equal(slots.readSlot(plan.slotId, { fresh: true }).fingerprint, codexFingerprint(second));
     } finally {
       h.store.close();
       rmSync(h.home, { recursive: true, force: true });
