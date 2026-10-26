@@ -45,6 +45,8 @@ export interface ReleaseInstallOptions {
   verifyHelperIdentity?: (path: string, pin: string) => HelperIdentityVerification;
   /** Injectable only for hermetic platform-specific release tests. */
   platform?: NodeJS.Platform;
+  /** Injectable only for hermetic concurrent-publication tests. */
+  beforePublishCurrent?: () => void | Promise<void>;
 }
 
 export interface ReleaseInstallResult {
@@ -314,48 +316,41 @@ function copyReleaseContents(
 }
 
 const HELPER_IDENTITY_CONFIG_KEY = 'keychain.helperCheckIdentityHash';
+// Keep this refusal in step with Store.migrateIfNeeded(). Pinning must not
+// permit an older release to write to a database created by a newer binary.
+const SUPPORTED_SCHEMA_VERSION = 5;
 
 /**
  * Establishes the release-verified leaf pin without running Store's migrations
  * or allowing a concurrent installer to rotate an already-established pin.
- * Returns whether this call created the row, for publication rollback.
  */
-function recordHelperIdentityHash(dbPath: string, identityHash: string): boolean {
+function recordHelperIdentityHash(dbPath: string, identityHash: string): void {
   let db: DatabaseSync | undefined;
   try {
     mkdirSync(dirname(dbPath), { recursive: true, mode: 0o700 });
     db = new DatabaseSync(dbPath);
+    const versionRow = db.prepare('PRAGMA user_version').get() as { user_version?: unknown } | number | undefined;
+    const version = typeof versionRow === 'number'
+      ? versionRow
+      : typeof versionRow?.user_version === 'number' ? versionRow.user_version : 0;
+    if (version > SUPPORTED_SCHEMA_VERSION) {
+      throw new ReleaseIntegrityError(
+        `qlb.db schema user_version=${version} is newer than this binary (${SUPPORTED_SCHEMA_VERSION}); upgrade qlb`,
+      );
+    }
     db.exec(`
       PRAGMA busy_timeout = 5000;
       CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT);
     `);
-    const inserted = db.prepare(`
+    db.prepare(`
       INSERT INTO config (key, value) VALUES (?, ?)
       ON CONFLICT(key) DO NOTHING
-    `).run(HELPER_IDENTITY_CONFIG_KEY, identityHash).changes === 1;
+    `).run(HELPER_IDENTITY_CONFIG_KEY, identityHash);
     const row = db.prepare('SELECT value FROM config WHERE key = ?').get(HELPER_IDENTITY_CONFIG_KEY) as { value?: unknown } | undefined;
     if (row?.value !== identityHash) throw new ReleaseIntegrityError('helper-identity-changed');
-    return inserted;
   } catch (error) {
     if (error instanceof ReleaseIntegrityError) throw error;
     throw new ReleaseIntegrityError('could not record helper identity pin');
-  } finally {
-    try { db?.close(); } catch { /* preserve the install failure */ }
-  }
-}
-
-/** Removes only the row this install created when publishing current fails. */
-function rollbackHelperIdentityHash(dbPath: string, identityHash: string): void {
-  let db: DatabaseSync | undefined;
-  try {
-    db = new DatabaseSync(dbPath);
-    db.exec('PRAGMA busy_timeout = 5000');
-    const deleted = db.prepare('DELETE FROM config WHERE key = ? AND value = ?')
-      .run(HELPER_IDENTITY_CONFIG_KEY, identityHash).changes;
-    if (deleted !== 1) throw new ReleaseIntegrityError('could not roll back helper identity pin after release publication failed');
-  } catch (error) {
-    if (error instanceof ReleaseIntegrityError) throw error;
-    throw new ReleaseIntegrityError('could not roll back helper identity pin after release publication failed');
   } finally {
     try { db?.close(); } catch { /* preserve the install failure */ }
   }
@@ -488,15 +483,13 @@ export async function installRelease(options: ReleaseInstallOptions): Promise<Re
       staged = false;
     }
 
-    // Pin before exposing the helper through current, then remove only a pin
-    // created by this attempt if the symlink swap cannot be published.
-    const pinCreated = helperSigning && recordHelperIdentityHash(options.dbPath, helperSigning.identityHash);
-    try {
-      return { releaseDir, currentPath: publishCurrent(options.appDir, options.sha), backupPath };
-    } catch (error) {
-      if (pinCreated && helperSigning) rollbackHelperIdentityHash(options.dbPath, helperSigning.identityHash);
-      throw error;
-    }
+    // Pin before exposing the helper through current. Do not roll this back if
+    // publication fails: another installer can observe and rely on the same
+    // pin before this one reaches its symlink swap. A retained pin only anchors
+    // the helper identity; it cannot activate this failed release.
+    if (helperSigning) recordHelperIdentityHash(options.dbPath, helperSigning.identityHash);
+    await options.beforePublishCurrent?.();
+    return { releaseDir, currentPath: publishCurrent(options.appDir, options.sha), backupPath };
   } finally {
     if (staged && existsSync(stagingDir)) rmSync(stagingDir, { recursive: true, force: true });
   }

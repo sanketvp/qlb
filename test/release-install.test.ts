@@ -335,7 +335,33 @@ describe('release install (AC45)', () => {
     } finally { after.close(); }
   });
 
-  it('rolls back a newly recorded pin when publishing current fails', async () => {
+  it('refuses a database from a newer binary without pinning or switching current', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-release-helper-pin-newer-schema-'));
+    const sourceDir = sourceBuild(root, 'pin-newer-schema-sha');
+    const helper = join(sourceDir, 'native', 'keychain-helper', 'build', 'qlb-keychain-helper');
+    const appDir = join(root, 'app');
+    const dbPath = join(root, 'qlb.db');
+    mkdirSync(dirname(helper), { recursive: true });
+    writeFileSync(helper, 'fake helper bytes\n');
+    mkdirSync(join(appDir, 'previous'), { recursive: true });
+    symlinkSync('previous', join(appDir, 'current'));
+    const before = new DatabaseSync(dbPath);
+    before.exec('CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT); PRAGMA user_version = 6');
+    before.close();
+
+    await assert.rejects(
+      installRelease({ sourceDir, appDir, sha: 'pin-newer-schema-sha', dbPath, ...validHelperVerifier }),
+      /qlb\.db schema user_version=6 is newer than this binary \(5\); upgrade qlb/,
+    );
+
+    const after = new DatabaseSync(dbPath, { readOnly: true });
+    try {
+      assert.equal(after.prepare('SELECT value FROM config WHERE key = ?').get('keychain.helperCheckIdentityHash'), undefined);
+    } finally { after.close(); }
+    assert.equal(readlinkSync(join(appDir, 'current')), 'previous');
+  });
+
+  it('keeps a newly recorded pin when publishing current fails', async () => {
     const root = mkdtempSync(join(tmpdir(), 'qlb-release-helper-pin-rollback-'));
     const sourceDir = sourceBuild(root, 'pin-rollback-sha');
     const helper = join(sourceDir, 'native', 'keychain-helper', 'build', 'qlb-keychain-helper');
@@ -352,9 +378,49 @@ describe('release install (AC45)', () => {
 
     const after = new DatabaseSync(dbPath, { readOnly: true });
     try {
-      assert.equal(after.prepare('SELECT value FROM config WHERE key = ?').get('keychain.helperCheckIdentityHash'), undefined);
+      assert.equal(
+        (after.prepare('SELECT value FROM config WHERE key = ?').get('keychain.helperCheckIdentityHash') as { value: string }).value,
+        QLB_HELPER_SIGNING.identityHash,
+      );
     } finally { after.close(); }
     assert.ok(lstatSync(join(appDir, 'current')).isDirectory());
+  });
+
+  it('does not remove a shared pin after another installer uses it before this publication fails', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-release-helper-pin-shared-'));
+    const sourceDir = sourceBuild(root, 'pin-shared-sha');
+    const helper = join(sourceDir, 'native', 'keychain-helper', 'build', 'qlb-keychain-helper');
+    const firstAppDir = join(root, 'first-app');
+    const secondAppDir = join(root, 'second-app');
+    const dbPath = join(root, 'qlb.db');
+    let secondInstalled = false;
+    mkdirSync(dirname(helper), { recursive: true });
+    writeFileSync(helper, 'fake helper bytes\n');
+    mkdirSync(join(firstAppDir, 'current'), { recursive: true });
+
+    await assert.rejects(
+      installRelease({
+        sourceDir, appDir: firstAppDir, sha: 'pin-shared-sha', dbPath, ...validHelperVerifier,
+        beforePublishCurrent: async () => {
+          await installRelease({
+            sourceDir, appDir: secondAppDir, sha: 'pin-shared-sha', dbPath, ...validHelperVerifier,
+            verifyHelperIdentity: () => ({ trusted: true }),
+          });
+          secondInstalled = true;
+        },
+      }),
+      /EISDIR|EEXIST|ENOTDIR/,
+    );
+
+    assert.equal(secondInstalled, true);
+    const after = new DatabaseSync(dbPath, { readOnly: true });
+    try {
+      assert.equal(
+        (after.prepare('SELECT value FROM config WHERE key = ?').get('keychain.helperCheckIdentityHash') as { value: string }).value,
+        QLB_HELPER_SIGNING.identityHash,
+      );
+    } finally { after.close(); }
+    assert.equal(readlinkSync(join(secondAppDir, 'current')), 'pin-shared-sha');
   });
 
   it('refuses a helper reached through a symlinked ancestor outside the checkout', async () => {
