@@ -108,10 +108,14 @@ function passesS64(
   return passesReceiptHealth(store, now);
 }
 
-function itemMapsToPassedSlot(store: Store, item: CswapRetireItem, slots: RetireSlot[]): boolean {
-  return slots.some((slot) => slot.source !== 'qlb-add' && slot.sourceFingerprint !== null
-    && (slot.sourceFingerprint === item.fingerprint
-      || isSuccessor(store, 'anthropic', slot.accountId, slot.sourceFingerprint, item.fingerprint)));
+function itemMapsToPassedSlot(
+  store: Store,
+  item: CswapRetireItem,
+  slots: Array<{ slot: RetireSlot; freshFingerprint: string }>,
+): boolean {
+  return slots.some(({ slot, freshFingerprint }) => slot.source !== 'qlb-add'
+    && (item.fingerprint === freshFingerprint
+      || isSuccessor(store, 'anthropic', slot.accountId, item.fingerprint, freshFingerprint)));
 }
 
 /**
@@ -154,6 +158,7 @@ export async function evaluateRetirementGates(
     return refusal('claude-slots-unavailable');
   }
   if (slots.length === 0) return refusal('claude-slots-empty');
+  const passedSlots: Array<{ slot: RetireSlot; freshFingerprint: string }> = [];
   for (const slot of slots) {
     let freshFingerprint: string;
     try {
@@ -168,6 +173,7 @@ export async function evaluateRetirementGates(
       && !isSuccessor(store, 'anthropic', slot.accountId, slot.sourceFingerprint, freshFingerprint)))) {
       return refusal(`slot-lineage-unprovable:${slot.accountId}`);
     }
+    passedSlots.push({ slot, freshFingerprint });
   }
 
   let items: CswapRetireItem[];
@@ -176,7 +182,7 @@ export async function evaluateRetirementGates(
   } catch {
     return refusal('cswap-items-unavailable');
   }
-  const unmatched = items.find((item) => !itemMapsToPassedSlot(store, item, slots));
+  const unmatched = items.find((item) => !itemMapsToPassedSlot(store, item, passedSlots));
   if (unmatched) return refusal(`cswap-item-unmapped:${unmatched.id}`);
 
   // The final time read is adjacent to approval, so receipt age and the

@@ -115,6 +115,24 @@ describe('qlb retire cswap (AC22 retire)', () => {
     await refusal('receipt stale', (f) => f.store.setConfig('report.receiptAt', String(NOW - 10 * 60 * 1000 - 1)), 'report-receipt-stale');
   });
 
+  it('maps C-swap items only when the fresh QLB slot represents them', async () => {
+    const f = fixture();
+    try {
+      f.store.recordLineage({ provider: 'anthropic', accountId: 'slot-a', fromFp: 'source-a', toFp: 'cswap-sibling', cause: 'post', by: 'cswap' });
+      f.deps.cswapItems = () => [{ id: 'cswap-sibling', fingerprint: 'cswap-sibling' }];
+      assert.deepEqual(await evaluateRetirementGates(f.store, f.deps), {
+        ok: false,
+        code: 'cswap-item-unmapped:cswap-sibling',
+      });
+
+      f.deps.cswapItems = () => [{ id: 'cswap-current', fingerprint: 'current-a' }];
+      assert.equal((await evaluateRetirementGates(f.store, f.deps)).ok, true);
+
+      f.deps.cswapItems = () => [{ id: 'cswap-ancestor', fingerprint: 'source-a' }];
+      assert.equal((await evaluateRetirementGates(f.store, f.deps)).ok, true);
+    } finally { f.cleanup(); }
+  });
+
   it('allows qlb-add slots but never maps a C-swap item to one', async () => {
     const f = fixture();
     try {
