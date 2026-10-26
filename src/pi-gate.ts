@@ -6,11 +6,16 @@ import type { DatabaseSync } from 'node:sqlite';
 import { tokenCallAllowed } from './commands/token';
 import { loadGate } from './gate';
 import { assertAdmittedInConnection } from './lifecycle';
-import { isPiPlaceholder, isPiQlbOwnerEntry } from './pi-migrate';
+import { isPiPlaceholder } from './pi-migrate';
+import {
+  isPiQlbOwnerEntry,
+  PI_GATE_PROVIDERS,
+  type PiGateProvider,
+  validatePiOwnerDocument as validateOwnerDocument,
+} from './pi-owner-document';
 import { openStoreConnection } from './store';
 
-export const PI_GATE_PROVIDERS = ['anthropic', 'openai-codex', 'xai', 'kimi-coding', 'openrouter'] as const;
-export type PiGateProvider = (typeof PI_GATE_PROVIDERS)[number];
+export { PI_GATE_PROVIDERS, type PiGateProvider } from './pi-owner-document';
 
 export interface GateCredential {
   token: string;
@@ -84,38 +89,13 @@ function parsedObject(path: string, code: string): Record<string, unknown> {
 
 type OwnerFormat = 'v1' | 'v2';
 
-/** Validates every shared owner-file shape accepted by the Pi gate. */
+/** Converts the extension's dependency-free schema refusal to a gate failure. */
 export function validatePiOwnerDocument(document: unknown): Record<string, unknown> {
-  if (!document || typeof document !== 'object' || Array.isArray(document)) {
+  try {
+    return validateOwnerDocument(document);
+  } catch {
     throw new GateFailure('owner-file-malformed');
   }
-  const owner = document as Record<string, unknown>;
-  let recognized = false;
-  if ('providers' in owner) {
-    recognized = true;
-    const providers = owner.providers;
-    if (!providers || typeof providers !== 'object' || Array.isArray(providers)) {
-      throw new GateFailure('owner-file-malformed');
-    }
-    for (const entry of Object.values(providers as Record<string, unknown>)) {
-      const config = entry as Record<string, unknown>;
-      const since = config.since;
-      if (!isPiQlbOwnerEntry(entry)
-        || typeof since !== 'number'
-        || !Number.isFinite(since)
-        || since < 0) {
-        throw new GateFailure('owner-file-malformed');
-      }
-    }
-  }
-  if ('owner' in owner || 'accounts' in owner) {
-    recognized = true;
-    if (typeof owner.owner !== 'string' || !Array.isArray(owner.accounts)) {
-      throw new GateFailure('owner-file-malformed');
-    }
-  }
-  if (!recognized) throw new GateFailure('owner-file-malformed');
-  return owner;
 }
 
 function legacyOwnerEntry(owner: Record<string, unknown>, provider: PiGateProvider): boolean {

@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { describe, it } from 'node:test';
 
 import { registerOpenAICodexProvider, type OpenAICodexBuiltin } from '../extensions/qlb-pi/providers/openai-codex';
+import { GateFailure, validatePiOwnerDocument } from '../src/pi-gate';
 import { resolvePiPackageRoot } from '../src/pi-integration';
 
 const ROOT = join(__dirname, '..', '..');
@@ -110,7 +111,7 @@ if (process.env.GATE_FAIL === '1') {
 process.stdout.write(JSON.stringify({ token: 'fixture-codex-access', accountId: 'user:slot', chatgptAccountId: 'bare-account', source: 'fixture' }));
 `;
 
-function load(owner?: string, gateFail = false, callCodex = false, perProviderOwner?: string, ownerIsDirectory = false): {
+function load(owner?: string, gateFail = false, callCodex = false, perProviderOwner?: string, ownerIsDirectory = false, deployedLayout = false): {
   calls: string[];
   replaced: Record<string, boolean>;
   oauth: { resolve: number; refresh: number };
@@ -127,6 +128,16 @@ function load(owner?: string, gateFail = false, callCodex = false, perProviderOw
   if (ownerIsDirectory) mkdirSync(ownerPath);
   else if (owner !== undefined) writeFileSync(ownerPath, owner);
   if (perProviderOwner !== undefined) writeFileSync(join(agent, 'qlb-owner-openai-codex.json'), perProviderOwner);
+  const extension = deployedLayout
+    ? join(agent, 'extensions', 'qlb-pi', 'index.ts')
+    : join(ROOT, 'extensions', 'qlb-pi', 'index.ts');
+  if (deployedLayout) {
+    // This is exactly the standalone layout `qlb pi deploy` publishes.
+    cpSync(join(ROOT, 'extensions', 'qlb-pi'), dirname(extension), { recursive: true });
+    mkdirSync(join(agent, 'src'), { recursive: true });
+    cpSync(join(ROOT, 'src', 'redact.ts'), join(agent, 'src', 'redact.ts'));
+    cpSync(join(ROOT, 'src', 'pi-owner-document.ts'), join(agent, 'src', 'pi-owner-document.ts'));
+  }
   const runner = join(home, 'fake-qlb.cjs');
   const entry = join(home, 'load.mjs');
   writeFileSync(runner, fakeQlb);
@@ -139,7 +150,7 @@ function load(owner?: string, gateFail = false, callCodex = false, perProviderOw
       HOME: home,
       USER: 'qlb-test',
       PI_GLOBAL_ROOT,
-      QLB_PI_EXTENSION: join(ROOT, 'extensions', 'qlb-pi', 'index.ts'),
+      QLB_PI_EXTENSION: extension,
       QLB_CLI: runner,
       ...(gateFail ? { GATE_FAIL: '1' } : {}),
       ...(callCodex ? { CALL_CODEX: '1' } : {}),
@@ -184,6 +195,7 @@ describe('qlb-pi provider wiring', { skip: piAvailable ? false : 'global Pi inst
       JSON.stringify({ providers: { 'openai-codex': null } }),
       JSON.stringify({ providers: { 'openai-codex': { mode: 'qlb' } } }),
       JSON.stringify({ providers: { anthropic: { mode: 'bad' } } }),
+      JSON.stringify({ providers: { openai_codxe: { mode: 'qlb', since: 1 } } }),
       JSON.stringify({ providers: {}, owner: 5 }),
       '{not json',
       '[]',
@@ -198,6 +210,56 @@ describe('qlb-pi provider wiring', { skip: piAvailable ? false : 'global Pi inst
     const unreadable = load(undefined, false, false, undefined, true);
     assert.equal(unreadable.replaced['openai-codex'], true);
     assert.match(unreadable.stderr, /^\[qlb-pi\] refusing native openai-codex fallback: malformed shared owner file .+\.pi\/agent\/qlb-owner\.json\n$/);
+  });
+
+  it('loads from a qlb pi deploy-shaped layout and replaces owned Codex', () => {
+    const result = load(JSON.stringify({ providers: {
+      'openai-codex': { mode: 'qlb', since: 1 },
+    } }), false, false, undefined, false, true);
+    assert.equal(result.replaced['openai-codex'], true);
+  });
+
+  it('keeps the deployed extension import closure inside the deployed layout', () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-pi-closure-'));
+    const agent = join(home, '.pi', 'agent');
+    const extensionRoot = join(agent, 'extensions', 'qlb-pi');
+    const redactor = join(agent, 'src', 'redact.ts');
+    const ownerDocument = join(agent, 'src', 'pi-owner-document.ts');
+    cpSync(join(ROOT, 'extensions', 'qlb-pi'), extensionRoot, { recursive: true });
+    mkdirSync(dirname(redactor), { recursive: true });
+    cpSync(join(ROOT, 'src', 'redact.ts'), redactor);
+    cpSync(join(ROOT, 'src', 'pi-owner-document.ts'), ownerDocument);
+
+    const seen = new Set<string>();
+    const visit = (path: string): void => {
+      if (seen.has(path)) return;
+      seen.add(path);
+      const source = readFileSync(path, 'utf8');
+      const imports = source.matchAll(/^\s*(?:import|export)\s+(?:type\s+)?(?:[^'"]*?\s+from\s+)?["']([^"']+)["']/gm);
+      for (const match of imports) {
+        const specifier = match[1]!;
+        if (!specifier.startsWith('.')) continue;
+        if (specifier.startsWith('../../src/')) {
+          assert.ok(['../../src/redact.js', '../../src/pi-owner-document.js'].includes(specifier));
+        }
+        const jsPath = resolve(dirname(path), specifier);
+        const resolved = existsSync(jsPath) ? jsPath : jsPath.replace(/\.js$/, '.ts');
+        assert.equal(existsSync(resolved), true, `${path} imports missing ${specifier}`);
+        assert.ok(resolved.startsWith(`${extensionRoot}/`) || resolved === redactor || resolved === ownerDocument,
+          `${path} imports outside deployed layout: ${specifier}`);
+        visit(resolved);
+      }
+    };
+    visit(join(extensionRoot, 'index.ts'));
+  });
+
+  it('rejects unknown owner provider keys for the gate and fails closed for Codex', () => {
+    const unknownProvider = { providers: { openai_codxe: { mode: 'qlb', since: 1 } } };
+    assert.throws(() => validatePiOwnerDocument(unknownProvider), (error: unknown) =>
+      error instanceof GateFailure && error.code === 'owner-file-malformed');
+    const result = load(JSON.stringify(unknownProvider));
+    assert.equal(result.replaced['openai-codex'], true);
+    assert.match(result.stderr, /malformed shared owner file/);
   });
 
   it('registers Codex from the shadow-retaining per-provider owner artifact migration writes', () => {

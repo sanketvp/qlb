@@ -19,6 +19,7 @@ function fixture(root: string): { home: string; appDir: string; dbPath: string; 
   mkdirSync(extension, { recursive: true });
   mkdirSync(join(release, 'src'), { recursive: true });
   writeFileSync(join(release, 'src', 'redact.ts'), 'export const redact = 1;\n');
+  writeFileSync(join(release, 'src', 'pi-owner-document.ts'), 'export const ownerDocument = 1;\n');
   writeFileSync(join(extension, 'index.ts'), 'export const version = 1;\n');
   writeFileSync(join(extension, 'manifest.json'), '{"fixture":true}\n');
   symlinkSync('release-fixture', join(appDir, 'current'));
@@ -50,6 +51,8 @@ describe('qlb pi deploy (P12)', () => {
     assert.equal(readFileSync(join(target, 'index.ts'), 'utf8'), 'export const version = 1;\n');
     const redact = join(f.home, '.pi', 'agent', 'src', 'redact.ts');
     assert.equal(readFileSync(redact, 'utf8'), 'export const redact = 1;\n');
+    const ownerDocument = join(f.home, '.pi', 'agent', 'src', 'pi-owner-document.ts');
+    assert.equal(readFileSync(ownerDocument, 'utf8'), 'export const ownerDocument = 1;\n');
     assert.equal(existsSync(join(target, '..', '..', 'src', 'redact.ts')), true);
     const store = openStore(f.dbPath);
     assert.equal(store.getConfig('pi.deployedAt'), '1700000000');
@@ -94,6 +97,10 @@ describe('qlb pi deploy (P12)', () => {
     deployPiExtension({ home: f.home, appDir: f.appDir, dbPath: f.dbPath });
     const redact = join(f.home, '.pi', 'agent', 'src', 'redact.ts');
     writeFileSync(redact, 'stale\n');
+    assert.equal(piExtensionDriftCheck({ home: f.home, appDir: f.appDir, dbPath: f.dbPath }).level, 'FAIL');
+    deployPiExtension({ home: f.home, appDir: f.appDir, dbPath: f.dbPath });
+    const ownerDocument = join(f.home, '.pi', 'agent', 'src', 'pi-owner-document.ts');
+    writeFileSync(ownerDocument, 'stale\n');
     assert.equal(piExtensionDriftCheck({ home: f.home, appDir: f.appDir, dbPath: f.dbPath }).level, 'FAIL');
     deployPiExtension({ home: f.home, appDir: f.appDir, dbPath: f.dbPath });
     rmSync(redact);

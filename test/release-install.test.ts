@@ -82,6 +82,7 @@ function compiledSource(dir: string, sha: string): string {
   cpSync(join(repo, 'extensions'), join(source, 'extensions'), { recursive: true });
   mkdirSync(join(source, 'src'), { recursive: true });
   cpSync(join(repo, 'src', 'redact.ts'), join(source, 'src', 'redact.ts'));
+  cpSync(join(repo, 'src', 'pi-owner-document.ts'), join(source, 'src', 'pi-owner-document.ts'));
   cpSync(join(repo, 'node_modules', 'yaml'), join(source, 'node_modules', 'yaml'), { recursive: true });
   writeFileSync(join(source, 'dist', '.build-sha'), buildStamp(sha, false, shippedBuildDigest(source)));
   return source;
@@ -719,6 +720,7 @@ describe('release install (AC45)', () => {
     const home = join(root, 'home');
     // In test mode QLB resolves Pi paths under QLB_HOME (R0e), not HOME.
     cpSync(join(installed.releaseDir, 'extensions', 'qlb-pi'), join(root, 'qlb-home', '.pi', 'agent', 'extensions', 'qlb-pi'), { recursive: true });
+    cpSync(join(installed.releaseDir, 'src'), join(root, 'qlb-home', '.pi', 'agent', 'src'), { recursive: true });
     const piRoot = join(root, 'pi');
     mkdirSync(piRoot, { recursive: true });
     writeFileSync(join(piRoot, 'package.json'), JSON.stringify({ name: '@earendil-works/pi-coding-agent', version: 'fixture' }));

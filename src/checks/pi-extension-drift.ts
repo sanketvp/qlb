@@ -4,7 +4,7 @@ import { dirname } from 'node:path';
 
 import type { DoctorCheck } from '../diagnostics';
 import { qlbHomeDir } from '../home';
-import { piDeployPlan, piDeploymentDigest, piExtensionTarget, piRedactTarget, piReleaseAppDir } from '../pi-deploy';
+import { piDeployPlan, piDeploymentDigest, piExtensionTarget, piOwnerDocumentTarget, piRedactTarget, piReleaseAppDir } from '../pi-deploy';
 import { check } from './_check';
 
 export default check('pi:extension-drift');
@@ -46,9 +46,11 @@ export function piExtensionDriftCheck(options: PiExtensionDriftOptions): DoctorC
   }
   const target = piExtensionTarget(home);
   const redactTarget = piRedactTarget(home);
+  const ownerDocumentTarget = piOwnerDocumentTarget(home);
   try {
     if (!lstatSync(target).isDirectory()) throw new Error('installed extension is not a directory');
     if (!lstatSync(redactTarget).isFile()) throw new Error('installed redact.ts is not a file');
+    if (!lstatSync(ownerDocumentTarget).isFile()) throw new Error('installed pi-owner-document.ts is not a file');
     const legacyEntries = readdirSync(dirname(target), { withFileTypes: true })
       .filter((entry) => entry.name.startsWith('.qlb-pi-'));
     if (legacyEntries.length > 0) {
@@ -58,7 +60,7 @@ export function piExtensionDriftCheck(options: PiExtensionDriftOptions): DoctorC
         detail: { entries: legacyEntries.map((entry) => entry.name) },
       };
     }
-    const installedHash = piDeploymentDigest(target, redactTarget);
+    const installedHash = piDeploymentDigest(target, redactTarget, ownerDocumentTarget);
     if (installedHash !== plan.hash || recordedHash !== plan.hash) {
       return {
         name: 'pi:extension-drift', level: 'FAIL',

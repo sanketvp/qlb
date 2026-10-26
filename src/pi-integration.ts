@@ -332,18 +332,20 @@ export function piIntegrationChecks(options: PiIntegrationOptions = {}): DoctorC
   }
 
   // 1. Installed extension == tracked source (a QLB upgrade that touches extensions/qlb-pi must be re-synced).
-  // The copied-extension layout also needs the redactor at ~/.pi/agent/src/redact.ts:
-  // qlb-pi's ../../src/redact.js import resolves there.
+  // The copied-extension layout also needs its dependency-free shared files at
+  // ~/.pi/agent/src/: qlb-pi resolves both sibling imports from there.
   const repoRoot = findQlbRepoRoot();
   if (repoRoot) {
     const src = join(repoRoot, 'extensions', 'qlb-pi');
     const installedRedact = join(PI_EXT_DIR, '..', '..', 'src', 'redact.ts');
+    const installedOwnerDocument = join(PI_EXT_DIR, '..', '..', 'src', 'pi-owner-document.ts');
     const sourceFiles = extensionTypeScriptFiles(src);
     const installedFiles = extensionTypeScriptFiles(PI_EXT_DIR);
     const drift = [
       ...sourceFiles.filter((file) => readText(join(src, file)) !== readText(join(PI_EXT_DIR, file))),
       ...installedFiles.filter((file) => !sourceFiles.includes(file)),
       ...(readText(join(repoRoot, 'src', 'redact.ts')) === readText(installedRedact) ? [] : ['src/redact.ts']),
+      ...(readText(join(repoRoot, 'src', 'pi-owner-document.ts')) === readText(installedOwnerDocument) ? [] : ['src/pi-owner-document.ts']),
     ];
 
     checks.push(drift.length === 0

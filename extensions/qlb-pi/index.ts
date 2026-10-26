@@ -62,7 +62,7 @@ import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { Api, Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { validatePiOwnerDocument } from "../../src/pi-gate.js";
+import { validatePiOwnerDocument } from "../../src/pi-owner-document.js";
 import { streamWithAuthRetry } from "./auth-retry.js";
 import {
   composeOpenRouterModels,

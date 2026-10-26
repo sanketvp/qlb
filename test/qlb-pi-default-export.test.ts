@@ -93,7 +93,7 @@ describe('qlb-pi production default export (Pi jiti loader)', { skip: piAvailabl
   });
 
   it('owner file + CONSUMED is a conflict: pool replaced by an error-only stub', () => {
-    const r = load({ owner: '{"accounts":[]}', states: 'CONSUMED', call: true });
+    const r = load({ owner: '{"owner":"qlb","accounts":[]}', states: 'CONSUMED', call: true });
     assert.deepEqual(r.calls, ['unregister:anthropic', 'register:anthropic']);
     assert.equal(r.poolStillRegistered, false);
     assert.equal(r.events[0]!.error?.errorMessage, CONSUME_ERRORS.conflict);
@@ -134,7 +134,7 @@ describe('qlb-pi production default export (Pi jiti loader)', { skip: piAvailabl
   });
 
   it('owned mode still unregisters the existing provider before registering', () => {
-    const r = load({ owner: '{"accounts":[]}', states: 'NATIVE' });
+    const r = load({ owner: '{"owner":"qlb","accounts":[]}', states: 'NATIVE' });
     assert.deepEqual(r.calls, ['unregister:anthropic', 'register:anthropic']);
     assert.equal(r.poolStillRegistered, false);
   });
