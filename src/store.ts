@@ -53,6 +53,16 @@ export interface SlotLineageRow {
   prev_fingerprint: string | null;
 }
 
+/** Public S56 view of a managed Codex slot; credential bytes stay in Keychain. */
+export interface CodexSlotRecord {
+  accountId: string;
+  chatgptUserId: string;
+  chatgptAccountId: string;
+  fingerprint: string | null;
+  prevFingerprint: string | null;
+  dead: boolean;
+}
+
 /** Read-only anthropic slot view used by the Pi pool inventory. */
 export interface AnthropicSlotLineageRow {
   accountId: string;
@@ -1811,6 +1821,78 @@ export class Store {
     }
   }
 
+  /**
+   * Reconcile a Keychain document with the fingerprint authority in
+   * `codex_slots`. The write lock spans every Keychain read, the conditional
+   * write, and the post-write DB verification. If either that verification or
+   * COMMIT fails, compensation runs before ROLLBACK and only restores the
+   * exact bytes written by this repair.
+   */
+  repairCodexSlotKeychain<T>(input: {
+    accountId: string;
+    prepare: (fingerprint: string) => { current: string; replacement: string; value: T } | undefined;
+    writeIfUnchanged: (repair: { current: string; replacement: string; value: T }) => boolean;
+    restore: (repair: { current: string; replacement: string; value: T }) => void;
+  }): { fingerprint: string | null; repaired: boolean; value?: T } {
+    this.db.exec('BEGIN IMMEDIATE');
+    let repair: { current: string; replacement: string; value: T } | undefined;
+    let wrote = false;
+    try {
+      const row = this.db.prepare('SELECT fingerprint FROM codex_slots WHERE account_id = ?')
+        .get(input.accountId) as { fingerprint: string | null } | undefined;
+      if (!row?.fingerprint) {
+        this.db.exec('COMMIT');
+        return { fingerprint: null, repaired: false };
+      }
+      const fingerprint = row.fingerprint;
+      repair = input.prepare(fingerprint);
+      if (!repair) {
+        this.db.exec('COMMIT');
+        return { fingerprint, repaired: false };
+      }
+
+      // Re-check the exact row after choosing the replacement and before its
+      // Keychain write. BEGIN IMMEDIATE prevents a cooperating adopter from
+      // changing it between these reads.
+      const beforeWrite = this.db.prepare('SELECT fingerprint FROM codex_slots WHERE account_id = ?')
+        .get(input.accountId) as { fingerprint: string | null } | undefined;
+      if (beforeWrite?.fingerprint !== fingerprint) {
+        this.db.exec('COMMIT');
+        return { fingerprint: beforeWrite?.fingerprint ?? null, repaired: false };
+      }
+
+      wrote = input.writeIfUnchanged(repair);
+      if (!wrote) {
+        this.db.exec('COMMIT');
+        return { fingerprint, repaired: false };
+      }
+
+      // This also makes a DB/commit failure after the Keychain mutation pass
+      // through the compensating path below.
+      const afterWrite = this.db.prepare('SELECT fingerprint FROM codex_slots WHERE account_id = ?')
+        .get(input.accountId) as { fingerprint: string | null } | undefined;
+      if (afterWrite?.fingerprint !== fingerprint) {
+        throw new Error('Codex slot changed during split repair');
+      }
+      this.db.exec('COMMIT');
+      return { fingerprint, repaired: true, value: repair.value };
+    } catch (error) {
+      if (wrote && repair) {
+        try {
+          input.restore(repair);
+        } catch (restoreError) {
+          if (error && typeof error === 'object') Object.assign(error, { restoreError });
+        }
+      }
+      try {
+        this.db.exec('ROLLBACK');
+      } catch {
+        // BEGIN may have failed, or SQLite already rolled back.
+      }
+      throw error;
+    }
+  }
+
   getAccount(id: string): AccountRow | null {
     const row = this.getAccountStmt.get(id) as AccountRow | undefined;
     if (!row) return null;
@@ -2107,6 +2189,137 @@ export class Store {
       row.detail == null ? null : redactSecrets(row.detail, []), row.publishedAt ?? null, row.committedAt ?? null,
     );
     return Number(result.lastInsertRowid);
+  }
+
+  /** S56 lookup by the composite identity; never exposes a credential document. */
+  getCodexSlot(accountId: string): CodexSlotRecord | null {
+    const row = this.db.prepare(`SELECT account_id, chatgpt_user_id, chatgpt_account_id, fingerprint, prev_fingerprint, dead
+      FROM codex_slots WHERE account_id = ?`).get(accountId) as {
+      account_id: string; chatgpt_user_id: string; chatgpt_account_id: string;
+      fingerprint: string | null; prev_fingerprint: string | null; dead: number;
+    } | undefined;
+    if (!row) return null;
+    return {
+      accountId: row.account_id,
+      chatgptUserId: row.chatgpt_user_id,
+      chatgptAccountId: row.chatgpt_account_id,
+      fingerprint: row.fingerprint,
+      prevFingerprint: row.prev_fingerprint,
+      dead: row.dead !== 0,
+    };
+  }
+
+  /** S56 lookup for a live document whose identity belongs to another managed slot. */
+  getCodexSlotByIdentity(accountId: string): CodexSlotRecord | null {
+    return this.getCodexSlot(accountId);
+  }
+
+  /**
+   * Persist an adopted native Codex successor plus its S46/S65 evidence in
+   * one SQLite transaction. The Keychain caller writes `:prev` before this
+   * method so the durable slot metadata never points beyond the saved copy.
+   */
+  adoptCodexSlot(input: {
+    accountId: string; fingerprint: string; previousFingerprint: string; lastRefresh?: string | null;
+    ts?: number; evidence: 'holder' | 'identity'; reloginEvidence?: 'auth-time' | 'unattributed-rotation' | null;
+  }): void {
+    const ts = input.ts ?? Date.now();
+    this.runImmediate(() => {
+      const updated = this.db.prepare(`UPDATE codex_slots SET fingerprint = ?, prev_fingerprint = ?, last_refresh = ?,
+        dead = 0, dead_reason = NULL, dead_at = NULL, healed_at = CASE WHEN dead != 0 THEN ? ELSE healed_at END,
+        pending_adopt = 0, archived_at = NULL, last_active_at = ?
+        WHERE account_id = ? AND fingerprint = ?`).run(
+        input.fingerprint, input.previousFingerprint, input.lastRefresh ?? null, ts, ts, input.accountId, input.previousFingerprint,
+      );
+      if (updated.changes !== 1) throw new Error('Codex slot changed before adoption');
+      this.db.prepare(`INSERT INTO lineage_log (ts, provider, account_id, from_fp, to_fp, cause, by, evidence)
+        VALUES (?, 'openai-codex', ?, ?, ?, 'adopt', 'tool', ?)`).run(
+        ts, input.accountId, input.previousFingerprint, input.fingerprint, input.evidence,
+      );
+      this.db.prepare(`INSERT INTO active_login (provider, account_id, since, set_by) VALUES ('openai-codex', ?, ?, 'adopt')
+        ON CONFLICT(provider) DO UPDATE SET account_id = excluded.account_id, since = excluded.since, set_by = excluded.set_by`)
+        .run(input.accountId, ts);
+      if (input.reloginEvidence != null) {
+        assertStoredReloginFields(input.reloginEvidence, input.reloginEvidence);
+        this.db.prepare(`INSERT INTO relogin_events (ts, provider, account_id, kind, detail, evidence, user_denied_at)
+          VALUES (?, 'openai-codex', ?, 'external-login', ?, ?, NULL)`)
+          .run(ts, input.accountId, input.reloginEvidence, input.reloginEvidence);
+      }
+    });
+  }
+
+  /**
+   * S56 adoption with the Keychain write held between the metadata CAS and
+   * commit. The caller restores only items it changed if any later step fails.
+   */
+  adoptCodexSlotWithKeychain(input: {
+    accountId: string; fingerprint: string; previousFingerprint: string; lastRefresh?: string | null;
+    ts?: number; evidence: 'holder' | 'identity'; reloginEvidence?: 'auth-time' | 'unattributed-rotation' | null;
+    writeKeychain: () => void; restoreKeychain: () => void;
+  }): void {
+    const ts = input.ts ?? Date.now();
+    this.runImmediate(() => {
+      let keychainWriteStarted = false;
+      try {
+        const updated = this.db.prepare(`UPDATE codex_slots SET fingerprint = ?, prev_fingerprint = ?, last_refresh = ?,
+          dead = 0, dead_reason = NULL, dead_at = NULL, healed_at = CASE WHEN dead != 0 THEN ? ELSE healed_at END,
+          pending_adopt = 0, archived_at = NULL, last_active_at = ?
+          WHERE account_id = ? AND fingerprint = ?`).run(
+          input.fingerprint, input.previousFingerprint, input.lastRefresh ?? null, ts, ts, input.accountId, input.previousFingerprint,
+        );
+        if (updated.changes !== 1) throw new Error('Codex slot changed before adoption');
+        keychainWriteStarted = true;
+        input.writeKeychain();
+        this.db.prepare(`INSERT INTO lineage_log (ts, provider, account_id, from_fp, to_fp, cause, by, evidence)
+          VALUES (?, 'openai-codex', ?, ?, ?, 'adopt', 'tool', ?)`).run(
+          ts, input.accountId, input.previousFingerprint, input.fingerprint, input.evidence,
+        );
+        this.db.prepare(`INSERT INTO active_login (provider, account_id, since, set_by) VALUES ('openai-codex', ?, ?, 'import')
+          ON CONFLICT(provider) DO UPDATE SET account_id = excluded.account_id, since = excluded.since, set_by = excluded.set_by`)
+          .run(input.accountId, ts);
+        if (input.reloginEvidence != null) {
+          assertStoredReloginFields(input.reloginEvidence, input.reloginEvidence);
+          this.db.prepare(`INSERT INTO relogin_events (ts, provider, account_id, kind, detail, evidence, user_denied_at)
+            VALUES (?, 'openai-codex', ?, 'external-login', ?, ?, NULL)`)
+            .run(ts, input.accountId, input.reloginEvidence, input.reloginEvidence);
+        }
+      } catch (error) {
+        if (keychainWriteStarted) {
+          try {
+            // Keep the SQLite write lock until the compensating write has
+            // either restored our bytes or observed a newer adopter's bytes.
+            input.restoreKeychain();
+          } catch (restoreError) {
+            if (error && typeof error === 'object') Object.assign(error, { restoreError });
+          }
+        }
+        throw error;
+      }
+    });
+  }
+
+  /** Mark every successful import-active observation as the live Codex slot. */
+  markCodexSlotImportedActive(accountId: string, ts: number = Date.now()): void {
+    this.runImmediate(() => {
+      this.db.prepare(`UPDATE codex_slots SET pending_adopt = 0, archived_at = NULL, last_active_at = ?
+        WHERE account_id = ?`).run(ts, accountId);
+      this.db.prepare(`INSERT INTO active_login (provider, account_id, since, set_by) VALUES ('openai-codex', ?, ?, 'import')
+        ON CONFLICT(provider) DO UPDATE SET account_id = excluded.account_id, since = excluded.since, set_by = excluded.set_by`)
+        .run(accountId, ts);
+    });
+  }
+
+  /** Return the current Codex slot named by active_login, if there is one. */
+  getCodexActiveLogin(): string | null {
+    const row = this.db.prepare("SELECT account_id FROM active_login WHERE provider = 'openai-codex'").get() as { account_id: string | null } | undefined;
+    return row?.account_id ?? null;
+  }
+
+  /** S56 drift adopts another known identity as the active Codex slot. */
+  setCodexActiveLogin(accountId: string, ts: number = Date.now()): void {
+    this.db.prepare(`INSERT INTO active_login (provider, account_id, since, set_by) VALUES ('openai-codex', ?, ?, 'adopt')
+      ON CONFLICT(provider) DO UPDATE SET account_id = excluded.account_id, since = excluded.since, set_by = excluded.set_by`)
+      .run(accountId, ts);
   }
 
   recordLineage(row: {
