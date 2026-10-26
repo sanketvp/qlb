@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
@@ -173,6 +173,23 @@ describe('migration state machine — §4.8.3 / §4.8.3a', () => {
       assert.deepEqual(retired, h.originalBytes, '.pre-qlb is byte-identical to original');
       const owner = JSON.parse(readFileSync(h.ownerPath, 'utf8')) as { owner: string };
       assert.equal(owner.owner, 'qlb');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('treats a v2 map without an Anthropic claim as absent and preserves it through resume and rollback', () => {
+    const h = setup();
+    try {
+      const map = JSON.stringify({ providers: { openrouter: { mode: 'qlb', since: 1 } } }, null, 2) + '\n';
+      writeFileSync(h.ownerPath, map, { mode: 0o600 });
+      h.store.upsertMigration('pi-pool', 'NATIVE', '{}');
+
+      assert.equal(h.mig.status().ownerFile, 'absent');
+      h.mig.resume();
+      assert.equal(existsSync(h.poolPath), true, 'resume must not retire the native Anthropic pool');
+      h.mig.rollback();
+      assert.deepEqual(readFileSync(h.ownerPath), Buffer.from(map), 'rollback must not rewrite another provider\'s map');
     } finally {
       h.cleanup();
     }

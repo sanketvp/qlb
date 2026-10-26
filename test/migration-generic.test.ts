@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 import { createOwnedCredentialSource } from '../src/credentials';
-import { MockKeychain, qlbKeychainService } from '../src/keychain';
+import { MockKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from '../src/keychain';
+import { OPENROUTER_GATE_KEYCHAIN_SERVICE } from '../src/token/openrouter';
 import {
   ADAPTER_ACCOUNT_IDS,
   ADAPTER_ACCOUNT_LABELS,
@@ -297,13 +299,48 @@ function mockOpenRouterRehearse(calls: StagedAccount[]): RehearseFn {
 function openrouterKeychainHas(kc: MockKeychain): boolean {
   try {
     const raw = kc.getSync(
-      qlbKeychainService('openrouter', OPENROUTER_ID),
-      OPENROUTER_LABEL,
+      OPENROUTER_GATE_KEYCHAIN_SERVICE,
+      QLB_KEYCHAIN_ACCOUNT,
     );
     return parseApiKeyPayload(raw).access === FAKE_OPENROUTER_KEY;
   } catch {
     return false;
   }
+}
+
+function runMapWriterChild(root: string, dir: string, provider: 'openrouter' | 'xai'): Promise<void> {
+  const script = `
+    const path = require('node:path');
+    const src = process.argv[1];
+    const dir = process.argv[2];
+    const provider = process.argv[3];
+    const { openStore } = require(path.join(src, 'store.js'));
+    const { MockKeychain } = require(path.join(src, 'keychain.js'));
+    if (provider === 'openrouter') {
+      const { createStaticKeyMigration } = require(path.join(src, 'migration.js'));
+      const store = openStore(path.join(dir, 'openrouter.db'));
+      const migration = createStaticKeyMigration(store, new MockKeychain(), 'openrouter', path.join(dir, '.pi', 'agent', 'qlb-owner.json'), () => 'test-openrouter-key');
+      migration.stage();
+      migration.rehearse(async () => ({ ok: true })).then(() => migration.commit()).then(() => store.close());
+    } else {
+      const { migratePiSingleProvider } = require(path.join(src, 'pi-migrate.js'));
+      const agent = path.join(dir, '.pi', 'agent');
+      migratePiSingleProvider('xai', {
+        authJsonPath: path.join(agent, 'auth.json'),
+        ownerPath: path.join(agent, 'qlb-owner.json'),
+        journalPath: path.join(dir, '.qlb', 'journal'),
+        baselineDir: path.join(dir, '.qlb', 'backups', 'pi-auth'),
+      }, { keychain: new MockKeychain() });
+    }
+  `;
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ['-e', script, root, dir, provider], {
+      env: { ...process.env, QLB_TEST_MODE: '1', QLB_HOME: dir, HOME: dir },
+      stdio: 'ignore',
+    });
+    child.once('error', reject);
+    child.once('exit', (code) => code === 0 ? resolve() : reject(new Error(`writer child exited ${code}`)));
+  });
 }
 
 function setupOpenRouter(): {
@@ -369,8 +406,8 @@ describe('static-key migration — openrouter (single API key, no OAuth)', () =>
       assert.equal(h.store.getAccount(OPENROUTER_ID)?.provider, 'openrouter');
 
       const rawPayload = h.kc.getSync(
-        qlbKeychainService('openrouter', OPENROUTER_ID),
-        OPENROUTER_LABEL,
+        OPENROUTER_GATE_KEYCHAIN_SERVICE,
+        QLB_KEYCHAIN_ACCOUNT,
       );
       const payload: ApiKeyPayload = parseApiKeyPayload(rawPayload);
       assert.equal(payload.type, 'api-key');
@@ -427,13 +464,13 @@ describe('static-key migration — openrouter (single API key, no OAuth)', () =>
       const documentBefore = readFileSync(h.ownerPath);
       const stagingPath = stagingOwnerPath(h.ownerPath, 'openrouter');
       const stagingBefore = readFileSync(stagingPath);
-      const managedBefore = h.kc.getSync(qlbKeychainService('openrouter', OPENROUTER_ID), OPENROUTER_LABEL);
+      const managedBefore = h.kc.getSync(OPENROUTER_GATE_KEYCHAIN_SERVICE, QLB_KEYCHAIN_ACCOUNT);
 
       assert.throws(() => h.mig.commit(), /owner-file-legacy-v1/);
 
       assert.deepEqual(readFileSync(h.ownerPath), documentBefore);
       assert.deepEqual(readFileSync(stagingPath), stagingBefore);
-      assert.equal(h.kc.getSync(qlbKeychainService('openrouter', OPENROUTER_ID), OPENROUTER_LABEL), managedBefore);
+      assert.equal(h.kc.getSync(OPENROUTER_GATE_KEYCHAIN_SERVICE, QLB_KEYCHAIN_ACCOUNT), managedBefore);
     } finally {
       h.cleanup();
     }
@@ -475,6 +512,26 @@ describe('static-key migration — openrouter (single API key, no OAuth)', () =>
     }
   });
 
+  it('serializes concurrent openrouter and xai map writers so both entries survive', async () => {
+    const h = setupOpenRouter();
+    try {
+      const agentDir = join(h.dir, '.pi', 'agent');
+      const ownerPath = join(agentDir, 'qlb-owner.json');
+      mkdirSync(agentDir, { recursive: true, mode: 0o700 });
+      writeFileSync(join(agentDir, 'auth.json'), JSON.stringify({ xai: FAKE_GRANTS.xai }) + '\n', { mode: 0o600 });
+      await Promise.all([
+        runMapWriterChild(join(process.cwd(), 'dist-test', 'src'), h.dir, 'openrouter'),
+        runMapWriterChild(join(process.cwd(), 'dist-test', 'src'), h.dir, 'xai'),
+      ]);
+
+      const owner = JSON.parse(readFileSync(ownerPath, 'utf8')) as { providers: Record<string, { mode?: string }> };
+      assert.equal(owner.providers.openrouter?.mode, 'qlb');
+      assert.equal(owner.providers.xai?.mode, 'qlb');
+    } finally {
+      h.cleanup();
+    }
+  });
+
   it('stage refuses while a legacy sidecar claims the provider', () => {
     const h = setupOpenRouter();
     try {
@@ -506,22 +563,6 @@ describe('static-key migration — openrouter (single API key, no OAuth)', () =>
         false,
         'staging Keychain deleted on rollback',
       );
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  it('createOwnedCredentialSource returns the staged API key when QLB_OWNED', async () => {
-    const h = setupOpenRouter();
-    try {
-      h.mig.stage();
-      await h.mig.rehearse(mockOpenRouterRehearse([]));
-      h.mig.commit();
-      assert.equal(h.mig.status().state, 'QLB_OWNED');
-
-      const getCred = createOwnedCredentialSource({ store: h.store, keychain: h.kc });
-      const token = await getCred(OPENROUTER_ID);
-      assert.equal(token, FAKE_OPENROUTER_KEY);
     } finally {
       h.cleanup();
     }

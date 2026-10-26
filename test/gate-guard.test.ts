@@ -7,8 +7,8 @@ import { describe, it } from 'node:test';
 import { appendEvidenceGap, GateFailure, runPiGate } from '../src/pi-gate';
 import { piEvidenceGapCheck } from '../src/checks/pi-evidence-gap';
 import { defaultPiMigratePaths, migratePiSingleProvider } from '../src/pi-migrate';
-import { createSingleGrantMigration, Migration } from '../src/migration';
-import { MockKeychain } from '../src/keychain';
+import { createSingleGrantMigration, createStaticKeyMigration, Migration } from '../src/migration';
+import { MockKeychain, platformKeychain } from '../src/keychain';
 import { redactSecrets } from '../src/redact';
 import { beginCutover } from '../src/lifecycle';
 import { openStore, openStoreConnection } from '../src/store';
@@ -148,6 +148,36 @@ describe('qlb gate core (S30/S54)', () => {
     });
     assert.equal(result, 0);
     assert.equal(output.length, 1);
+  });
+
+  it('serves an OpenRouter credential staged by Migration through the real gate resolver', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-gate-openrouter-migration-'));
+    const agentDir = join(root, '.pi', 'agent');
+    const ownerPath = join(agentDir, 'qlb-owner.json');
+    mkdirSync(agentDir, { recursive: true, mode: 0o700 });
+    const store = openStore(join(root, 'qlb.db'));
+    try {
+      const migration = createStaticKeyMigration(
+        store,
+        platformKeychain,
+        'openrouter',
+        ownerPath,
+        () => 'openrouter-test-key',
+      );
+      migration.stage();
+      await migration.rehearse(async () => ({ ok: true }));
+      migration.commit();
+
+      const output: string[] = [];
+      const result = await runPiGate('openrouter', {
+        dbPath: fixtureDb(), env: { QLB_PI_TOKEN_CALL: '1' }, deliver: (value) => output.push(value),
+        guard: () => true, admitted: () => ({ ok: true }), piAgentDir: agentDir,
+      });
+      assert.equal(result, 0);
+      assert.equal(output.length, 1);
+    } finally {
+      store.close();
+    }
   });
 
   it('accepts legacy per-provider ownership alongside a P7a owner map', async () => {

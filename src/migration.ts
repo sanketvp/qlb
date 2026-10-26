@@ -118,9 +118,10 @@ import {
 import { dirname, join, resolve, sep } from 'node:path';
 import { config } from './config';
 import type { KeychainBackend } from './keychain';
-import { openRouterMissingKeyMessage, qlbKeychainService, readNativeOpenRouterKey } from './keychain';
+import { openRouterMissingKeyMessage, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, readNativeOpenRouterKey } from './keychain';
 import { parseGrant } from './refresh-lease';
-import { readPiOwnerProviders, writePiOwnerEntry } from './pi-migrate';
+import { hasLegacyPiOwnerEntry, readPiOwnerProviders, withPiAuthLock, writePiOwnerEntry } from './pi-migrate';
+import { OPENROUTER_GATE_KEYCHAIN_SERVICE } from './token/openrouter';
 import type { Store } from './store';
 import type { Grant } from './types';
 
@@ -423,6 +424,9 @@ function keychainCoords(provider: string, id: string, label: string): {
   service: string;
   account: string;
 } {
+  if (provider === 'openrouter') {
+    return { service: OPENROUTER_GATE_KEYCHAIN_SERVICE, account: QLB_KEYCHAIN_ACCOUNT };
+  }
   return {
     service: qlbKeychainService(provider, id),
     account: label || id,
@@ -781,8 +785,24 @@ export class Migration {
 
   private ownerEntryPresent(): boolean {
     // Pool migration continues to read its pre-P7b v1 document until P7b8.
-    if (this.kind === 'pool') return existsSync(this.ownerFilePath);
+    // A shared v2 map is not an Anthropic claim unless it names Anthropic.
+    if (this.kind === 'pool') {
+      return hasLegacyPiOwnerEntry(this.ownerFilePath, 'anthropic')
+        || this.ownerEntryPresentAt(this.ownerMapPath);
+    }
     return this.ownerEntryPresentAt(this.ownerMapPath) || this.legacySidecarOwned();
+  }
+
+  private withOwnerMapLock<T>(fn: () => T): T {
+    return withPiAuthLock(join(dirname(this.ownerMapPath), 'auth.json'), () => fn());
+  }
+
+  private removePoolOwnerEntry(): void {
+    if (hasLegacyPiOwnerEntry(this.ownerFilePath, 'anthropic')) {
+      unlinkIfExists(this.ownerFilePath);
+    } else if (this.ownerEntryPresentAt(this.ownerMapPath)) {
+      this.withOwnerMapLock(() => writePiOwnerEntry(this.ownerMapPath, 'anthropic', false));
+    }
   }
 
   /** True when commit must not rename/delete the native store. */
@@ -1009,7 +1029,7 @@ export class Migration {
     }
 
     if (this.kind === 'static-key') {
-      writePiOwnerEntry(this.ownerMapPath, this.ownerProvider(), true);
+      this.withOwnerMapLock(() => writePiOwnerEntry(this.ownerMapPath, this.ownerProvider(), true));
       unlinkIfExists(staging);
       return this.finishHygiene();
     }
@@ -1318,7 +1338,9 @@ export class Migration {
     if (this.retainsNative()) {
       // Native was never moved (auth.json shadow-retained, or Keychain retained).
       if (this.kind === 'static-key') {
-        writePiOwnerEntry(this.ownerMapPath, this.ownerProvider(), false);
+        if (this.ownerEntryPresentAt(this.ownerMapPath)) {
+          this.withOwnerMapLock(() => writePiOwnerEntry(this.ownerMapPath, this.ownerProvider(), false));
+        }
         const legacy = this.legacySidecarPath();
         if (legacy) unlinkIfExists(legacy);
       } else {
@@ -1338,7 +1360,7 @@ export class Migration {
 
     // RC — unlink owner only after native is present again.
     if (existsSync(native)) {
-      unlinkIfExists(this.ownerFilePath);
+      this.removePoolOwnerEntry();
       unlinkIfExists(this.stagingPath());
     } else {
       // Cannot yet drop the owner file — native is not restored. Leave it.
