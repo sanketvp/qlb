@@ -99,6 +99,10 @@ private func setIfSha256(_ service: String, _ account: String, _ expectedSha256:
         fail("--if-sha256 requires a lowercase SHA-256 hex digest")
     }
     var lookup = query(service, account)
+    // Hash-checked write, not a true compare-and-swap: Keychain has no unique item version,
+    // and kSecAttrModificationDate can repeat at its resolution. Concurrent writers are
+    // excluded by the C-swap drain and the S24 check; a same-instant non-C-swap writer is a
+    // recorded residual risk (D-B38).
     // Ask for the bytes to hash and the record identity/version used by the update
     // query. Apple documents these return attributes for SecItemCopyMatching:
     // https://developer.apple.com/documentation/security/secitemcopymatching(_:_:)

@@ -354,10 +354,13 @@ function assertAuthorizationHelper(path: string, dbPath: string, dependencies: K
 }
 
 /**
+ * Residual risk (D-B38): the post-spawn check inspects the pathname, so a same-user process
+ * that swaps the file before exec and restores it before 'spawn' is not detected. Such a
+ * process can already read these items through /usr/bin/security, so this gives it no new access.
  * Verify the opened staged inode, then spawn by path and compare that pathname's
  * inode before the child receives stdin. Node emits `spawn` only after creating the
- * child (https://nodejs.org/api/child_process.html#event-spawn), so a replacement is
- * detected before any secret bytes are written to the replacement process.
+ * child (https://nodejs.org/api/child_process.html#event-spawn), so a one-way replacement
+ * is detected before any secret bytes are written to the replacement process.
  */
 async function withAuthorizedHelper<T>(
   path: string,
