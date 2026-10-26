@@ -1,4 +1,4 @@
-import { dirname, join } from 'node:path';
+import { join } from 'node:path';
 
 import { addClaudeLogin, type ClaudeAddInput, type ClaudeAddResult } from '../cc-add';
 import { ClaudeSlots, SqliteClaudeSlotRepository } from '../cc-slots';
@@ -47,7 +47,7 @@ export async function readClaudeLiveStateAtomically(input: {
   readConfig: () => unknown;
 }): Promise<Pick<ClaudeAddInput, 'credential' | 'config'>> {
   return withClaudeCredentialLocks({ configDir: input.configHome, env: {} }, () =>
-    withClaudeConfigLock({ configDir: dirname(input.globalConfigPath), env: {} }, async () => {
+    withClaudeConfigLock({ configDir: input.configHome, configPath: input.globalConfigPath, env: {} }, async () => {
       const credential = await input.readCredential();
       const config = input.readConfig();
       const verifiedCredential = await input.readCredential();

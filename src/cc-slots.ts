@@ -376,11 +376,11 @@ export class SqliteClaudeSlotRepository implements ClaudeSlotRepository {
         'SELECT COALESCE(MAX(slot_num), 0) + 1 AS slot_num FROM claude_slots',
       ).get() as { slot_num: number }).slot_num);
       if (existing) {
-        this.db.prepare(`UPDATE claude_slots SET email = ?, alias = ?, org_uuid = ?, config_json = ?,
+        this.db.prepare(`UPDATE claude_slots SET slot_num = ?, email = ?, alias = ?, org_uuid = ?, config_json = ?,
           fingerprint = ?, prev_fingerprint = NULL, dead = 0, dead_reason = NULL, dead_at = NULL,
           healed_at = NULL, added_at = ?, last_active_at = NULL, source = 'qlb-add', archived_at = NULL
           WHERE account_id = ?`).run(
-          input.email, input.alias, input.orgUuid, input.configJson, input.fingerprint, input.now, input.accountId,
+          slotNum, input.email, input.alias, input.orgUuid, input.configJson, input.fingerprint, input.now, input.accountId,
         );
       } else {
         this.createSlot({
@@ -673,19 +673,22 @@ export class ClaudeSlots {
       }
       const fingerprint = this.fingerprint(input.credential);
       const oldCurrent = await this.readExistingCredential(input.accountId);
-      // Add must preserve createSlot's crash-window orphan guard. An archived
-      // row is not an orphan and may be deliberately reactivated.
-      if (!input.replace && !existing && oldCurrent != null) throw new Error('Claude slot credential already exists');
+      // Add must preserve createSlot's crash-window orphan guard, including
+      // when an archived row is being reactivated.
+      if (!input.replace && oldCurrent != null) throw new Error('Claude slot credential already exists');
       const oldPrevious = await this.readPreviousCredential(input.accountId);
       const savePrevious = input.replace && oldCurrent != null && oldCurrent !== input.credential;
+      const clearArchivedPrevious = !input.replace && existing?.archivedAt != null && oldPrevious != null;
       const credentialUnchanged = input.replace && existing?.fingerprint === fingerprint && oldCurrent === input.credential;
       const advancePrevious = Boolean(existing && (savePrevious || existing.fingerprint !== fingerprint));
       if (!credentialUnchanged) {
         this.invalidateCache();
         onRollback(() => this.restoreCredentialPair(
-          input.accountId, oldCurrent, oldPrevious, input.credential, savePrevious ? oldCurrent : oldPrevious,
+          input.accountId, oldCurrent, oldPrevious, input.credential,
+          savePrevious ? oldCurrent : clearArchivedPrevious ? null : oldPrevious,
         ));
         if (savePrevious) await this.backend.set(this.previousService(input.accountId), QLB_KEYCHAIN_ACCOUNT, oldCurrent!);
+        else if (clearArchivedPrevious) await this.deleteIfPresent(this.previousService(input.accountId));
         await this.backend.set(this.slotService(input.accountId), QLB_KEYCHAIN_ACCOUNT, input.credential);
       }
       const result = this.options.repository.applyAddEffects({

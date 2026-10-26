@@ -93,10 +93,13 @@ export function assertClaudeConfigLockHeld(
 /**
  * Location inputs deliberately make all lock operations testable without using a real home.
  * `configDir` takes precedence over `env.CLAUDE_CONFIG_DIR`, as an explicit test/caller input.
+ * `configPath` pins the config lock to an already-resolved config file, without
+ * re-running the legacy selection heuristic.
  */
 export interface ClaudeLockOptions {
   home?: string;
   configDir?: string;
+  configPath?: string;
   env?: NodeJS.ProcessEnv;
   timeoutMs?: number;
   stalenessMs?: number;
@@ -136,15 +139,17 @@ function resolvedConfigHome(options: ClaudeLockOptions): string {
 export function claudeLockPaths(options: ClaudeLockOptions = {}): ClaudeLockPaths {
   const configHome = resolvedConfigHome(options);
   const legacyGlobalConfig = join(configHome, '.config.json');
-  const globalConfig = join((options.configDir ?? resolvedEnv(options).CLAUDE_CONFIG_DIR) || resolvedHome(options), '.claude.json');
+  const globalConfig = options.configPath ?? join((options.configDir ?? resolvedEnv(options).CLAUDE_CONFIG_DIR) || resolvedHome(options), '.claude.json');
   let pickedGlobalConfig = globalConfig;
-  try {
-    const legacy = statSync(legacyGlobalConfig);
-    if (legacy.isFile() && (legacy.size > 0 || ((legacy.mode & 0o222) !== 0 && !existsSync(globalConfig)))) {
-      pickedGlobalConfig = legacyGlobalConfig;
+  if (!options.configPath) {
+    try {
+      const legacy = statSync(legacyGlobalConfig);
+      if (legacy.isFile() && (legacy.size > 0 || ((legacy.mode & 0o222) !== 0 && !existsSync(globalConfig)))) {
+        pickedGlobalConfig = legacyGlobalConfig;
+      }
+    } catch {
+      // A missing, inaccessible, or otherwise invalid legacy path makes the global file win.
     }
-  } catch {
-    // A missing, inaccessible, or otherwise invalid legacy path makes the global file win.
   }
   return {
     configHome,

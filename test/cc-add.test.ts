@@ -1,6 +1,6 @@
 // Ported from claude-swap 0.28.0 (MIT) — TestAddAccount*, TestDuplicateAccountDetection, test_add_account_identity.py
 import assert from 'node:assert/strict';
-import { mkdtempSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
@@ -183,6 +183,45 @@ describe('qlb claude add (K11 / AC32)', () => {
     assert.equal(repository.getSlot('account-a')?.archivedAt, null);
   });
 
+  it('refuses archived reactivation when its orphan credential still exists and clears a stale predecessor', async () => {
+    const { slots, repository, backend } = fixture();
+    await slots.createSlot({ accountId: 'account-a', credential: credential('old'), source: 'cswap-import' });
+    const rows = (repository as unknown as { slots: Map<string, { archivedAt: number | null }> }).slots;
+    rows.get('account-a')!.archivedAt = 1;
+
+    await assert.rejects(addClaudeLogin({ credential: credential('new'), config: config('account-a'), slots }), /credential already exists/);
+    assert.equal(await backend.get('qlb:anthropic:account-a', 'qlb'), credential('old'));
+
+    await backend.delete('qlb:anthropic:account-a', 'qlb');
+    await backend.set('qlb:anthropic:account-a:prev', 'qlb', credential('stale'));
+    await addClaudeLogin({ credential: credential('new'), config: config('account-a'), slots });
+    await assert.rejects(backend.get('qlb:anthropic:account-a:prev', 'qlb'));
+  });
+
+  it('refuses an archived identity with a different --replace target at exit 3', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-cc-add-archived-replace-'));
+    const dbPath = join(root, 'qlb.db');
+    const store = openStore(dbPath);
+    beginCutover(store);
+    store.close();
+    const { slots, repository, backend } = fixture();
+    await slots.createSlot({ accountId: 'account-a', credential: credential('old'), source: 'cswap-import' });
+    const rows = (repository as unknown as { slots: Map<string, { archivedAt: number | null }> }).slots;
+    rows.get('account-a')!.archivedAt = 1;
+    await backend.delete('qlb:anthropic:account-a', 'qlb');
+    const output: string[] = [];
+
+    const code = await runClaudeAddCommand(['--replace', 'account-b'], context(dbPath, output), {
+      readLive: async () => ({ credential: credential('new'), config: config('account-a') }),
+      add: async (input) => addClaudeLogin({ ...input, slots }),
+    });
+
+    assert.equal(code, 3);
+    assert.match(output[0]!, /different identity/);
+    assert.equal(repository.getSlot('account-a')?.archivedAt, 1);
+    await assert.rejects(backend.get('qlb:anthropic:account-a', 'qlb'));
+  });
+
   it('is refused in pre-cutover and does not read the live credential', async () => {
     const root = mkdtempSync(join(tmpdir(), 'qlb-cc-add-command-'));
     const dbPath = join(root, 'qlb.db');
@@ -195,6 +234,27 @@ describe('qlb claude add (K11 / AC32)', () => {
     assert.equal(code, 3);
     assert.equal(reads, 0);
     assert.match(output[0]!, /phase=pre-cutover/);
+  });
+
+  it('locks the exact normal and legacy config file that it reads', async () => {
+    for (const layout of ['normal', 'legacy'] as const) {
+      const root = mkdtempSync(join(tmpdir(), `qlb-cc-add-${layout}-`));
+      const configHome = join(root, '.claude');
+      mkdirSync(configHome);
+      const globalConfigPath = layout === 'normal' ? join(root, '.claude.json') : join(configHome, '.config.json');
+      writeFileSync(globalConfigPath, '{}');
+      if (layout === 'normal') writeFileSync(join(root, '.config.json'), 'unrelated');
+      const expectedLock = `${globalConfigPath}.lock`;
+
+      await readClaudeLiveStateAtomically({
+        configHome, globalConfigPath,
+        readCredential: async () => credential(layout),
+        readConfig: () => {
+          assert.equal(existsSync(expectedLock), true, `${layout} config lock is held`);
+          return config(`account-${layout}`);
+        },
+      });
+    }
   });
 
   it('reads the live credential and identity atomically, refusing a state change between reads', async () => {

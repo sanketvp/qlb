@@ -74,8 +74,10 @@ export async function addClaudeLogin(input: ClaudeAddInput): Promise<ClaudeAddRe
   const matching = input.slots.listSlots().find((slot) => slot.accountId === identity.accountId) ?? null;
   const existing = matching?.archivedAt == null ? matching : null;
 
-  if (existing && input.replace !== identity.accountId) {
-    if (input.replace) throw new Error('replace target belongs to a different identity');
+  if (input.replace && input.replace !== identity.accountId) {
+    throw new Error('replace target belongs to a different identity');
+  }
+  if (existing && !input.replace) {
     throw new Error(`Claude slot already exists for ${identity.accountId}`);
   }
   if (!matching && input.replace) {
