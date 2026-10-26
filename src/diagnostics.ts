@@ -1,4 +1,11 @@
 import { execFileSync, spawnSync } from 'node:child_process';
+import {
+  inspectHelperSigning as inspectHelperSigningAt,
+  verifyHelperIdentity,
+  type CodesignSpawn,
+  type HelperIdentityVerification,
+  type HelperSigningState,
+} from './helper-signing';
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { consumeMarkerPathFor, CSWAP_ANTHROPIC_STORE } from './cswap-consume';
@@ -92,61 +99,19 @@ type CommandRunner = (command: string, args: string[]) => string;
 
 const HELPER_CHECK_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
 
-export interface HelperSigningState {
-  authority: string;
-  binaryHash: string;
-  identityHash: string;
-}
+export {
+  verifyHelperIdentity,
+  type CodesignSpawn,
+  type HelperIdentityVerification,
+  type HelperSigningState,
+} from './helper-signing';
 
-/** Injectable only to parse captured `codesign` output in hermetic tests. */
-export type CodesignSpawn = (
-  command: string,
-  args: string[],
-  options: { encoding: 'utf8' },
-) => { status: number | null; stdout?: string | Buffer; stderr?: string | Buffer };
-
-/** Validates the code signature and reads its metadata; no Keychain values are read. */
+/** Validates the code signature and reads its metadata; defaults to the installed helper path. */
 export function inspectHelperSigning(
   path = defaultKeychainHelperPath(),
   spawn: CodesignSpawn = spawnSync,
 ): HelperSigningState | null {
-  if (!existsSync(path)) return null;
-  const verification = spawn('/usr/bin/codesign', ['--verify', '--strict', path], { encoding: 'utf8' });
-  if (verification.status !== 0) return null;
-  // Authority needs -vv and CDHash needs -vvv on current macOS codesign output.
-  const result = spawn('/usr/bin/codesign', ['-d', '-vvv', '-r-', path], { encoding: 'utf8' });
-  if (result.status !== 0) return null;
-  const details = `${result.stdout?.toString() ?? ''}\n${result.stderr?.toString() ?? ''}`;
-  const authority = /^Authority=(.+)$/m.exec(details)?.[1]?.trim();
-  const binaryHash = /^CDHash=([0-9a-fA-F]+)$/m.exec(details)?.[1]?.toLowerCase();
-  const identityHash = /certificate leaf = H"([0-9a-fA-F]{40})"/.exec(details)?.[1]?.toLowerCase();
-  return authority && binaryHash && identityHash ? { authority, binaryHash, identityHash } : null;
-}
-
-export type HelperIdentityVerification =
-  | { trusted: true }
-  | { trusted: false; reason: string };
-
-/** Verifies the helper's exact pinned leaf identity using codesign's requirement evaluator. */
-export function verifyHelperIdentity(
-  path: string,
-  pin: string,
-  spawn: CodesignSpawn = spawnSync,
-): HelperIdentityVerification {
-  if (!/^[0-9a-fA-F]{40}$/.test(pin)) {
-    return { trusted: false, reason: 'pinned helper identity is invalid' };
-  }
-  if (!existsSync(path)) return { trusted: false, reason: 'helper is missing' };
-  try {
-    const verification = spawn('/usr/bin/codesign', [
-      '--verify', '--strict', '-R', `certificate leaf = H"${pin}"`, path,
-    ], { encoding: 'utf8' });
-    return verification.status === 0
-      ? { trusted: true }
-      : { trusted: false, reason: 'pinned leaf certificate did not verify' };
-  } catch {
-    return { trusted: false, reason: 'pinned leaf certificate did not verify' };
-  }
+  return inspectHelperSigningAt(path, spawn);
 }
 
 /** The diagnostic registry is separate from the runtime report so checks can be added independently. */

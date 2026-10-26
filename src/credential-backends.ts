@@ -30,7 +30,7 @@ import { defaultConfig } from './config';
 import {
   verifyHelperIdentity,
   type HelperIdentityVerification,
-} from './diagnostics';
+} from './helper-signing';
 
 export interface CredentialBackend {
   readonly kind?: CredentialBackendKind;
