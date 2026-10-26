@@ -69,6 +69,23 @@ export interface LineageAppend {
   evidence?: 'post' | 'oracle' | 'lineage' | 'holder' | 'auth-time' | 'identity' | 'import' | 'undo' | null;
 }
 
+/** The one-transaction §4.13 metadata effect after the slot credential is durable. */
+export interface ClaudeAddEffectsInput {
+  accountId: string;
+  fingerprint: string;
+  email: string | null;
+  alias: string | null;
+  orgUuid: string | null;
+  configJson: string;
+  now: number;
+  mode: 'add' | 'replace';
+}
+
+export interface ClaudeAddEffectsResult {
+  kind: 'added' | 'replaced';
+  slotNum: number;
+}
+
 /** Persistence boundary: tests use the in-memory implementation; production uses SQLite. */
 type RollbackHook = () => Promise<void> | void;
 type RegisterRollback = (hook: RollbackHook) => void;
@@ -83,6 +100,8 @@ export interface ClaudeSlotRepository {
   createSlotWithLineage(slot: ClaudeSlot, lineage: LineageAppend): void;
   updateCredentialWithLineage(accountId: string, expectedFingerprint: string | null, fingerprint: string, prevFingerprint: string | null, lineage: LineageAppend | null): void;
   removeSlotWithGeneration(accountId: string): void;
+  /** Must run inside `withWriteTransaction`; writes slots, lineage, account, active login, and relogin atomically. */
+  applyAddEffects(input: ClaudeAddEffectsInput): ClaudeAddEffectsResult;
   currentGeneration(): number;
 }
 
@@ -94,6 +113,9 @@ function cloneSlot(slot: ClaudeSlot): ClaudeSlot {
 export class InMemoryClaudeSlotRepository implements ClaudeSlotRepository {
   private readonly slots = new Map<string, ClaudeSlot>();
   readonly transitions: LineageAppend[] = [];
+  readonly accounts: Array<{ id: string; provider: string; label: string; status: string }> = [];
+  readonly relogins: Array<{ provider: string; accountId: string; kind: string }> = [];
+  activeLogin: { provider: string; accountId: string; setBy: string } | null = null;
   generation = 0;
 
   getSlot(accountId: string): ClaudeSlot | null {
@@ -146,6 +168,65 @@ export class InMemoryClaudeSlotRepository implements ClaudeSlotRepository {
   removeSlotWithGeneration(accountId: string): void {
     this.slots.delete(accountId);
     this.generation += 1;
+  }
+
+  applyAddEffects(input: ClaudeAddEffectsInput): ClaudeAddEffectsResult {
+    const existing = this.slots.get(input.accountId);
+    if (input.mode === 'add') {
+      if (existing) throw new Error('Claude slot already exists');
+      const slotNum = Math.max(0, ...[...this.slots.values()].map((slot) => slot.slotNum ?? 0)) + 1;
+      this.slots.set(input.accountId, {
+        accountId: input.accountId, slotNum, email: input.email, alias: input.alias,
+        orgUuid: input.orgUuid, configJson: input.configJson, fingerprint: input.fingerprint,
+        prevFingerprint: null, dead: false, addedAt: input.now, lastActiveAt: null,
+        source: 'qlb-add', archivedAt: null,
+      });
+      this.transitions.push({ ts: input.now, provider: ANTHROPIC_PROVIDER, accountId: input.accountId,
+        fromFp: null, toFp: input.fingerprint, cause: 'add', by: 'qlb-cli', evidence: 'identity' });
+      this.upsertAddAccount(input.accountId, input.email);
+      if (!this.activeLogin || this.activeLogin.accountId !== input.accountId) {
+        this.activeLogin = { provider: ANTHROPIC_PROVIDER, accountId: input.accountId, setBy: 'adopt' };
+      }
+      this.generation += 1;
+      return { kind: 'added', slotNum };
+    }
+    if (!existing) throw new Error('Claude replace slot not found');
+    const previousFingerprint = existing.fingerprint;
+    existing.email = input.email;
+    existing.alias = input.alias ?? existing.alias ?? null;
+    existing.orgUuid = input.orgUuid;
+    existing.configJson = input.configJson;
+    existing.prevFingerprint = previousFingerprint;
+    existing.fingerprint = input.fingerprint;
+    existing.dead = false;
+    existing.deadReason = null;
+    existing.deadAt = null;
+    existing.healedAt = input.now;
+    this.transitions.push({ ts: input.now, provider: ANTHROPIC_PROVIDER, accountId: input.accountId,
+      fromFp: previousFingerprint, toFp: input.fingerprint, cause: 'replace', by: 'qlb-cli', evidence: 'identity' });
+    this.upsertAddAccount(input.accountId, input.email);
+    if (!this.activeLogin || this.activeLogin.accountId !== input.accountId) {
+      this.activeLogin = { provider: ANTHROPIC_PROVIDER, accountId: input.accountId, setBy: 'adopt' };
+    }
+    this.relogins.push({ provider: ANTHROPIC_PROVIDER, accountId: input.accountId, kind: 'identity-replaced' });
+    this.generation += 1;
+    return { kind: 'replaced', slotNum: existing.slotNum ?? 0 };
+  }
+
+  /** Test-only setup for an A7 dead-slot fixture. */
+  markDead(accountId: string): void {
+    const slot = this.slots.get(accountId);
+    if (!slot) throw new Error('Claude slot not found');
+    slot.dead = true;
+    slot.deadReason = 'fixture';
+    slot.deadAt = 1;
+  }
+
+  private upsertAddAccount(id: string, email: string | null): void {
+    const existing = this.accounts.find((account) => account.id === id);
+    const row = { id, provider: ANTHROPIC_PROVIDER, label: email ?? id, status: 'active' };
+    if (existing) Object.assign(existing, row);
+    else this.accounts.push(row);
   }
 
   currentGeneration(): number {
@@ -254,6 +335,50 @@ export class SqliteClaudeSlotRepository implements ClaudeSlotRepository {
       this.db.prepare('DELETE FROM claude_slots WHERE account_id = ?').run(accountId);
       this.bumpGenerationInTransaction();
     });
+  }
+
+  applyAddEffects(input: ClaudeAddEffectsInput): ClaudeAddEffectsResult {
+    if (!this.writeTransactionActive) throw new Error('Claude add effects require a write transaction');
+    const existing = this.getSlot(input.accountId);
+    let result: ClaudeAddEffectsResult;
+    if (input.mode === 'add') {
+      if (existing) throw new Error('Claude slot already exists');
+      const row = this.db.prepare('SELECT COALESCE(MAX(slot_num), 0) + 1 AS slot_num FROM claude_slots').get() as { slot_num: number };
+      const slotNum = Number(row.slot_num);
+      this.createSlot({
+        accountId: input.accountId, slotNum, email: input.email, alias: input.alias, orgUuid: input.orgUuid,
+        configJson: input.configJson, fingerprint: input.fingerprint, prevFingerprint: null, dead: false,
+        addedAt: input.now, lastActiveAt: null, source: 'qlb-add', archivedAt: null,
+      });
+      this.appendLineage({ ts: input.now, provider: ANTHROPIC_PROVIDER, accountId: input.accountId,
+        fromFp: null, toFp: input.fingerprint, cause: 'add', by: 'qlb-cli', evidence: 'identity' });
+      result = { kind: 'added', slotNum };
+    } else {
+      if (!existing) throw new Error('Claude replace slot not found');
+      this.db.prepare(`UPDATE claude_slots SET email = ?, alias = COALESCE(?, alias), org_uuid = ?, config_json = ?,
+        fingerprint = ?, prev_fingerprint = ?, dead = 0, dead_reason = NULL, dead_at = NULL, healed_at = ?
+        WHERE account_id = ?`).run(
+        input.email, input.alias, input.orgUuid, input.configJson, input.fingerprint, existing.fingerprint,
+        input.now, input.accountId,
+      );
+      this.appendLineage({ ts: input.now, provider: ANTHROPIC_PROVIDER, accountId: input.accountId,
+        fromFp: existing.fingerprint, toFp: input.fingerprint, cause: 'replace', by: 'qlb-cli', evidence: 'identity' });
+      this.db.prepare(`INSERT INTO relogin_events (ts, provider, account_id, kind, detail, evidence, user_denied_at)
+        VALUES (?, ?, ?, 'identity-replaced', NULL, 'identity', NULL)`).run(input.now, ANTHROPIC_PROVIDER, input.accountId);
+      result = { kind: 'replaced', slotNum: existing.slotNum ?? 0 };
+    }
+    this.db.prepare(`INSERT INTO accounts (id, provider, label, status, created_at) VALUES (?, ?, ?, 'active', ?)
+      ON CONFLICT(id) DO UPDATE SET provider = excluded.provider, label = excluded.label`).run(
+      input.accountId, ANTHROPIC_PROVIDER, input.email ?? input.accountId, input.now,
+    );
+    const active = this.db.prepare('SELECT account_id FROM active_login WHERE provider = ?').get(ANTHROPIC_PROVIDER) as { account_id?: string } | undefined;
+    if (!active || active.account_id !== input.accountId) {
+      this.db.prepare(`INSERT INTO active_login (provider, account_id, since, set_by) VALUES (?, ?, ?, 'adopt')
+        ON CONFLICT(provider) DO UPDATE SET account_id = excluded.account_id, since = excluded.since, set_by = excluded.set_by`)
+        .run(ANTHROPIC_PROVIDER, input.accountId, input.now);
+    }
+    this.bumpGenerationInTransaction();
+    return result;
   }
 
   currentGeneration(): number {
@@ -486,6 +611,41 @@ export class ClaudeSlots {
     // display readers in other processes via slots.generation.
     this.options.repository.updateCredentialWithLineage(accountId, slot.fingerprint, nextFingerprint, prevFingerprint, lineage);
     this.invalidateCache();
+  }
+
+  /** §4.13: persist a current Claude login without touching the live store. */
+  async applyAdd(input: {
+    accountId: string;
+    credential: string;
+    email: string | null;
+    alias: string | null;
+    orgUuid: string | null;
+    configJson: string;
+    replace: boolean;
+  }): Promise<ClaudeAddEffectsResult> {
+    assertSlotId(input.accountId);
+    return this.withSlotWrite(input.accountId, () => this.options.repository.withWriteTransaction(async (onRollback) => {
+      const existing = this.options.repository.getSlot(input.accountId);
+      if (input.replace ? !existing : Boolean(existing)) {
+        throw new Error(input.replace ? 'Claude replace slot not found' : 'Claude slot already exists');
+      }
+      const fingerprint = this.fingerprint(input.credential);
+      const oldCurrent = await this.readExistingCredential(input.accountId);
+      const oldPrevious = await this.readPreviousCredential(input.accountId);
+      const savePrevious = input.replace && oldCurrent != null && oldCurrent !== input.credential;
+      this.invalidateCache();
+      onRollback(() => this.restoreCredentialPair(
+        input.accountId, oldCurrent, oldPrevious, input.credential, savePrevious ? oldCurrent : oldPrevious,
+      ));
+      if (savePrevious) await this.backend.set(this.previousService(input.accountId), QLB_KEYCHAIN_ACCOUNT, oldCurrent!);
+      await this.backend.set(this.slotService(input.accountId), QLB_KEYCHAIN_ACCOUNT, input.credential);
+      const result = this.options.repository.applyAddEffects({
+        accountId: input.accountId, fingerprint, email: input.email, alias: input.alias, orgUuid: input.orgUuid,
+        configJson: input.configJson, now: this.now(), mode: input.replace ? 'replace' : 'add',
+      });
+      this.invalidateCache();
+      return result;
+    }));
   }
 
   async deleteSlot(accountId: string): Promise<void> {
