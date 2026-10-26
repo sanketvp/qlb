@@ -81,6 +81,23 @@ function normalizedOrg(orgUuid: string | null): string {
   return orgUuid ?? '';
 }
 
+function normalizeIdentityField(value: string | null): string | null {
+  const normalized = value?.trim();
+  return normalized || null;
+}
+
+function normalizeResolvedIdentity(resolved: OAuthAccount): OAuthAccount {
+  return {
+    uuid: resolved.uuid.trim(),
+    email: normalizeIdentityField(resolved.email),
+    organizationUuid: normalizeIdentityField(resolved.organizationUuid),
+  };
+}
+
+function hasCompleteIdentity(resolved: OAuthAccount): boolean {
+  return Boolean(resolved.uuid && resolved.email && resolved.organizationUuid);
+}
+
 function sameOrgWhenKnown(left: string | null, right: string | null): boolean {
   return !left || !right || left === right;
 }
@@ -164,8 +181,10 @@ export function classifyOutgoingCredential(
       : { kind: 'unresolved', foreignSlotId: null };
   }
 
-  const resolved = provenance.resolved;
-  const resolvedUuid = resolved.uuid.trim();
+  // Normalize the one profile result before any identity match or completeness
+  // decision: blank and whitespace-only fields are missing identity.
+  const resolved = normalizeResolvedIdentity(provenance.resolved);
+  const resolvedUuid = resolved.uuid;
   if (
     resolvedUuid
     && outgoing.accountId.trim() === resolvedUuid
@@ -177,9 +196,9 @@ export function classifyOutgoingCredential(
   const slot = resolvedSlot(input.slots, resolved);
   if (slot?.accountId === outgoing.accountId) return { kind: 'own-rotated', foreignSlotId: null };
   if (slot === null) {
-    // A positive alien requires the complete email+organization pair. Partial
-    // profile shapes are schema drift and must retain the fail-open path.
-    return resolved.email && resolved.organizationUuid !== null
+    // A positive alien requires a complete identity. Partial profile shapes
+    // are schema drift and must retain the fail-open path.
+    return hasCompleteIdentity(resolved)
       ? { kind: 'alien', foreignSlotId: null }
       : { kind: 'unresolved', foreignSlotId: null };
   }
@@ -187,7 +206,9 @@ export function classifyOutgoingCredential(
   // A cross-slot attribution is UUID-positive. `resolvedSlot` can only return
   // this slot after its nonempty UUID matched the profile UUID.
   if (!resolvedUuid || slot.accountId.trim() !== resolvedUuid) {
-    return { kind: 'alien', foreignSlotId: null };
+    return hasCompleteIdentity(resolved)
+      ? { kind: 'alien', foreignSlotId: null }
+      : { kind: 'unresolved', foreignSlotId: null };
   }
   if (slot.credential === liveCredential || sameLineage(slot.credential, liveCredential)) {
     return { kind: 'foreign-synced', foreignSlotId: slot.accountId };
@@ -195,7 +216,11 @@ export function classifyOutgoingCredential(
   return { kind: 'foreign', foreignSlotId: slot.accountId };
 }
 
-/** The self-switch short-circuit is safe only for locally matching bytes. */
+/**
+ * Deliberately stricter than the oracle: a resolved Phase-A profile result
+ * reconciles only when its bytes equal the Phase-B live read. Callers must
+ * pass those fresh Phase-B bytes as `liveCredential`, not the Phase-A bytes.
+ */
 export function decideSelfSwitchAction(input: {
   outgoing: ClassifyClaudeSlot;
   liveCredential: string | null;

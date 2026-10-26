@@ -102,6 +102,30 @@ describe('Claude outgoing credential classification (K4 / AC5)', () => {
     );
   });
 
+  it('treats a blank profile organization UUID as a partial identity', () => {
+    const live = credential('blank-org');
+    assert.deepEqual(
+      classify(live, prefetch(live, { uuid: 'uuid-nobody', email: 'nobody@example.test', organizationUuid: '' })),
+      { kind: 'unresolved', foreignSlotId: null },
+    );
+  });
+
+  it('treats whitespace-only profile email as a partial identity', () => {
+    const live = credential('whitespace-email');
+    assert.deepEqual(
+      classify(live, prefetch(live, { uuid: 'uuid-nobody', email: ' \t ', organizationUuid: 'org-nobody' })),
+      { kind: 'unresolved', foreignSlotId: null },
+    );
+  });
+
+  it('treats whitespace-only profile organization UUID as a partial identity', () => {
+    const live = credential('whitespace-org');
+    assert.deepEqual(
+      classify(live, prefetch(live, { uuid: 'uuid-nobody', email: 'nobody@example.test', organizationUuid: ' \n ' })),
+      { kind: 'unresolved', foreignSlotId: null },
+    );
+  });
+
   it('refuses an empty live credential', () => {
     assert.throws(
       () => classify('', prefetch('', null)),
