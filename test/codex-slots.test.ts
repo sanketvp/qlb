@@ -51,6 +51,21 @@ function fixture() {
   return { home, store, keychain: new MockKeychain() };
 }
 
+function runCodexAdapter(home: string, dbPath: string, authPath: string) {
+  const adapterPath = join(__dirname, '..', 'src', 'adapters', 'codex.js');
+  return spawnSync(process.execPath, ['-e', `require(${JSON.stringify(adapterPath)}).codexAdapter.fetchSnapshots().then((snapshots) => process.stdout.write(snapshots[0].accountId))`], {
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      QLB_TEST_MODE: '1',
+      QLB_HOME: home,
+      HOME: home,
+      QLB_DB_PATH: dbPath,
+      QLB_CODEX_AUTH_JSON_PATH: authPath,
+    },
+  });
+}
+
 class CountingKeychain extends MockKeychain {
   gets = 0;
   unavailable = false;
@@ -126,6 +141,37 @@ describe('Codex slots and import-active', () => {
       }
     } finally {
       h.store.close();
+      rmSync(h.home, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps one S29 account row when the Codex adapter upserts after import-active', () => {
+    const h = fixture();
+    let storeClosed = false;
+    try {
+      const doc = parsedDocument();
+      importActiveCodexSlot(doc, { store: h.store, keychain: h.keychain });
+      // Simulate the bare id that the pre-S29 adapter had persisted.
+      h.store.upsertAccount('fixture-account', 'openai-codex', 'legacy bare account');
+      const authPath = join(h.home, 'auth.json');
+      writeFileSync(authPath, JSON.stringify(doc), { mode: 0o600 });
+      h.store.close();
+      storeClosed = true;
+
+      const result = runCodexAdapter(h.home, h.store.dbPath, authPath);
+      assert.equal(result.status, 0, result.stderr);
+      assert.equal(result.stdout, 'fixture-user:fixture-account');
+
+      const db = new DatabaseSync(h.store.dbPath, { readOnly: true });
+      try {
+        const rows = db.prepare("SELECT id FROM accounts WHERE provider = 'openai-codex' ORDER BY id")
+          .all() as Array<Record<string, unknown>>;
+        assert.deepEqual(rows.map((row) => ({ ...row })), [{ id: 'fixture-user:fixture-account' }]);
+      } finally {
+        db.close();
+      }
+    } finally {
+      if (!storeClosed) h.store.close();
       rmSync(h.home, { recursive: true, force: true });
     }
   });
