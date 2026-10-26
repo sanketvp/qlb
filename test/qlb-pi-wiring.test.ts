@@ -176,9 +176,18 @@ describe('qlb-pi provider wiring', { skip: piAvailable ? false : 'global Pi inst
 
   it('fails closed for schema-invalid or unreadable shared Codex owner documents', () => {
     const malformedOwners = [
+      '{}',
+      JSON.stringify({ foo: 1 }),
+      JSON.stringify({ owner: 5 }),
+      JSON.stringify({ accounts: 'x' }),
+      JSON.stringify({ owner: 'qlb' }),
       JSON.stringify({ providers: { 'openai-codex': null } }),
       JSON.stringify({ providers: { 'openai-codex': { mode: 'qlb' } } }),
       JSON.stringify({ providers: { anthropic: { mode: 'bad' } } }),
+      JSON.stringify({ providers: {}, owner: 5 }),
+      '{not json',
+      '[]',
+      '1',
     ];
     for (const owner of malformedOwners) {
       const result = load(owner);

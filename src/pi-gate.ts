@@ -84,6 +84,40 @@ function parsedObject(path: string, code: string): Record<string, unknown> {
 
 type OwnerFormat = 'v1' | 'v2';
 
+/** Validates every shared owner-file shape accepted by the Pi gate. */
+export function validatePiOwnerDocument(document: unknown): Record<string, unknown> {
+  if (!document || typeof document !== 'object' || Array.isArray(document)) {
+    throw new GateFailure('owner-file-malformed');
+  }
+  const owner = document as Record<string, unknown>;
+  let recognized = false;
+  if ('providers' in owner) {
+    recognized = true;
+    const providers = owner.providers;
+    if (!providers || typeof providers !== 'object' || Array.isArray(providers)) {
+      throw new GateFailure('owner-file-malformed');
+    }
+    for (const entry of Object.values(providers as Record<string, unknown>)) {
+      const config = entry as Record<string, unknown>;
+      const since = config.since;
+      if (!isPiQlbOwnerEntry(entry)
+        || typeof since !== 'number'
+        || !Number.isFinite(since)
+        || since < 0) {
+        throw new GateFailure('owner-file-malformed');
+      }
+    }
+  }
+  if ('owner' in owner || 'accounts' in owner) {
+    recognized = true;
+    if (typeof owner.owner !== 'string' || !Array.isArray(owner.accounts)) {
+      throw new GateFailure('owner-file-malformed');
+    }
+  }
+  if (!recognized) throw new GateFailure('owner-file-malformed');
+  return owner;
+}
+
 function legacyOwnerEntry(owner: Record<string, unknown>, provider: PiGateProvider): boolean {
   if (owner.owner !== 'qlb' || !Array.isArray(owner.accounts)) return false;
   return owner.accounts.some((account) => !!account && typeof account === 'object' && !Array.isArray(account)
@@ -92,25 +126,12 @@ function legacyOwnerEntry(owner: Record<string, unknown>, provider: PiGateProvid
 
 /** Returns every writer format in this file that claims this provider. */
 function ownerFormats(path: string, provider: PiGateProvider): OwnerFormat[] {
-  const owner = parsedObject(path, 'owner-file-malformed');
+  const owner = validatePiOwnerDocument(parsedObject(path, 'owner-file-malformed'));
   const formats: OwnerFormat[] = [];
-  let recognized = false;
-  if ('providers' in owner) {
-    recognized = true;
-    const providers = owner.providers;
-    if (!providers || typeof providers !== 'object' || Array.isArray(providers)) {
-      throw new GateFailure('owner-file-malformed');
-    }
-    if (isPiQlbOwnerEntry((providers as Record<string, unknown>)[provider])) formats.push('v2');
+  if ('providers' in owner && isPiQlbOwnerEntry((owner.providers as Record<string, unknown>)[provider])) {
+    formats.push('v2');
   }
-  if ('owner' in owner || 'accounts' in owner) {
-    recognized = true;
-    if (typeof owner.owner !== 'string' || !Array.isArray(owner.accounts)) {
-      throw new GateFailure('owner-file-malformed');
-    }
-    if (legacyOwnerEntry(owner, provider)) formats.push('v1');
-  }
-  if (!recognized) throw new GateFailure('owner-file-malformed');
+  if (('owner' in owner || 'accounts' in owner) && legacyOwnerEntry(owner, provider)) formats.push('v1');
   return formats;
 }
 

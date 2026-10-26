@@ -62,6 +62,7 @@ import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { Api, Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { validatePiOwnerDocument } from "../../src/pi-gate.js";
 import { streamWithAuthRetry } from "./auth-retry.js";
 import {
   composeOpenRouterModels,
@@ -135,15 +136,15 @@ const AUDIT_FILE = join(AUDIT_DIR, "outcomes.jsonl");
  * shared v1 document remains Anthropic-only (see ownerStateForProvider()).
  */
 function qlbOwnsProvider(provider: "openai-codex"): boolean {
-  // This is the shared owner-file parser used by the other Pi provider paths.
-  // It validates every v2 entry, so a damaged claim for another provider cannot
-  // leave Pi's native Codex OAuth enabled.
-  const sharedOwner = readPiOwnerFile(OWNER_FILE);
-  if (sharedOwner.kind === "malformed") {
-    console.error(`[qlb-pi] refusing native openai-codex fallback: malformed shared owner file ${OWNER_FILE}`);
-    return true;
+  try {
+    const owner = validatePiOwnerDocument(JSON.parse(readFileSync(OWNER_FILE, "utf8")) as unknown);
+    if ("providers" in owner && (owner.providers as Record<string, unknown>)[provider]) return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      console.error(`[qlb-pi] refusing native openai-codex fallback: malformed shared owner file ${OWNER_FILE}`);
+      return true;
+    }
   }
-  if (sharedOwner.kind === "v2" && sharedOwner.providers[provider]) return true;
 
   const providerOwnerFile = join(dirname(OWNER_FILE), `qlb-owner-${provider}.json`);
   if (!existsSync(providerOwnerFile)) return false;
