@@ -155,12 +155,15 @@ describe('qlb-pi Kimi Coding source', () => {
 
       const controller = new AbortController();
       registered.streamSimple({ id: 'k3' }, {}, { signal: controller.signal });
-      for (let tries = 0; !existsSync(started) && tries < 50; tries += 1) {
+      // A loaded CI runner can take well over 500ms to start a node child; wait up to 10s.
+      for (let tries = 0; !existsSync(started) && tries < 1_000; tries += 1) {
         await new Promise((resolve) => setTimeout(resolve, 10));
       }
       assert.equal(existsSync(started), true);
       controller.abort();
-      for (let tries = 0; !existsSync(terminated) && tries < 50; tries += 1) {
+      // The stream ends on the gate child's close event, which can land after the child
+      // writes its terminated marker, so wait for both.
+      for (let tries = 0; !(existsSync(terminated) && output?.ended) && tries < 1_000; tries += 1) {
         await new Promise((resolve) => setTimeout(resolve, 10));
       }
 
