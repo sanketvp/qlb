@@ -14,8 +14,17 @@ export interface UnclaimedIndexEntry {
   createdAt: number;
 }
 
+export class InvalidUnclaimedIndexComponentError extends Error {
+  constructor(name: string) {
+    super(`invalid unclaimed index ${name}`);
+    this.name = 'InvalidUnclaimedIndexComponentError';
+  }
+}
+
 function assertComponent(value: string, name: string): void {
-  if (!value || /[\0/\\/]/.test(value)) throw new Error(`invalid unclaimed index ${name}`);
+  if (!value || /[\x00-\x1F\x7F\\/:*?"<>|]|[. ]$/.test(value)) {
+    throw new InvalidUnclaimedIndexComponentError(name);
+  }
 }
 
 function indexDir(root: string, provider: string): string {
@@ -56,7 +65,19 @@ async function privateDirectory(path: string): Promise<void> {
   await chmod(path, 0o700);
 }
 
-async function fsyncDirectory(path: string): Promise<void> {
+export interface UnclaimedIndexWriteOptions {
+  replace?: boolean;
+  /** Injectable for Windows behavior tests; defaults to the host platform. */
+  platform?: NodeJS.Platform;
+  /** Injectable directory sync for tests; failures are preserved off Windows. */
+  directorySync?: (path: string) => Promise<void>;
+}
+
+async function fsyncDirectory(path: string, options: UnclaimedIndexWriteOptions): Promise<void> {
+  // Node cannot fsync a directory handle on Windows. Its durability contract
+  // is unavailable there, while other platforms must still surface failures.
+  if ((options.platform ?? process.platform) === 'win32') return;
+  if (options.directorySync) return options.directorySync(path);
   const handle = await open(path, 'r');
   try { await handle.sync(); } finally { await handle.close(); }
 }
@@ -66,7 +87,7 @@ async function fsyncDirectory(path: string): Promise<void> {
  * contender cannot overwrite another process's stash reservation; updates use
  * rename only after the original row has reserved that stash id.
  */
-async function writeEntry(path: string, contents: string, replace: boolean): Promise<void> {
+async function writeEntry(path: string, contents: string, options: UnclaimedIndexWriteOptions): Promise<void> {
   const dir = join(path, '..');
   await privateDirectory(dir);
   const temporary = `${path}.tmp.${process.pid}.${Math.random().toString(16).slice(2)}`;
@@ -78,10 +99,10 @@ async function writeEntry(path: string, contents: string, replace: boolean): Pro
     await handle.close();
   }
   try {
-    if (replace) await rename(temporary, path);
+    if (options.replace) await rename(temporary, path);
     else await link(temporary, path);
     await chmod(path, 0o600);
-    await fsyncDirectory(dir);
+    await fsyncDirectory(dir, options);
   } finally {
     await rm(temporary, { force: true });
   }
@@ -95,12 +116,12 @@ async function writeEntry(path: string, contents: string, replace: boolean): Pro
 export async function recordStash(
   root: string,
   entry: UnclaimedIndexEntry,
-  options: { replace?: boolean } = {},
+  options: UnclaimedIndexWriteOptions = {},
 ): Promise<string> {
   assertComponent(entry.provider, 'provider');
   assertComponent(entry.stashId, 'stash id');
   const path = indexPath(root, entry);
-  await writeEntry(path, `${JSON.stringify(entry)}\n`, options.replace === true);
+  await writeEntry(path, `${JSON.stringify(entry)}\n`, options);
   return path;
 }
 
@@ -128,11 +149,15 @@ export async function listStashes(root: string, provider: string, accountId?: st
 }
 
 /** Remove a stash reservation only after its credential bytes have been removed. */
-export async function removeStash(root: string, entry: Pick<UnclaimedIndexEntry, 'provider' | 'stashId'>): Promise<void> {
+export async function removeStash(
+  root: string,
+  entry: Pick<UnclaimedIndexEntry, 'provider' | 'stashId'>,
+  options: UnclaimedIndexWriteOptions = {},
+): Promise<void> {
   const path = indexPath(root, entry as UnclaimedIndexEntry);
   try {
     await rm(path);
-    await fsyncDirectory(indexDir(root, entry.provider));
+    await fsyncDirectory(indexDir(root, entry.provider), options);
   } catch (error: unknown) {
     if (error && typeof error === 'object' && (error as NodeJS.ErrnoException).code === 'ENOENT') return;
     throw new Error('unable to remove unclaimed index entry');

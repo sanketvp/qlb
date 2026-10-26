@@ -7,6 +7,25 @@ import { describe, it } from 'node:test';
 import { listStashes, recordStash, removeStash } from '../src/unclaimed-index';
 
 describe('unclaimed stash index', () => {
+  it('rejects a stash id containing a colon', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-unclaimed-index-'));
+    await assert.rejects(recordStash(root, {
+      provider: 'anthropic', accountId: 'account-a', stashId: 'invalid:stash', consumedFp: 'sha256:lineage-a',
+      location: 'keychain', createdAt: 1_000,
+    }), /invalid unclaimed index stash id/);
+  });
+
+  it('skips directory fsync on win32', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-unclaimed-index-'));
+    await recordStash(root, {
+      provider: 'anthropic', accountId: 'account-a', stashId: 'win32-stash', consumedFp: 'sha256:lineage-a',
+      location: 'keychain', createdAt: 1_000,
+    }, {
+      platform: 'win32',
+      directorySync: async () => { throw new Error('directory fsync must not run on Windows'); },
+    });
+  });
+
   it('atomically records, lists by account, and removes non-secret stash metadata', async () => {
     const root = mkdtempSync(join(tmpdir(), 'qlb-unclaimed-index-'));
     const entry = {

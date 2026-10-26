@@ -49,11 +49,18 @@ class StashFailingBackend implements ClaudeSlotBackend {
   }
 }
 
-function fixture(): { slots: ClaudeSlots; backend: StashFailingBackend; stashDir: string } {
+function fixture(options: {
+  platform?: NodeJS.Platform;
+  directorySync?: (path: string) => Promise<void>;
+  warn?: (message: string) => void;
+} = {}): { slots: ClaudeSlots; backend: StashFailingBackend; stashDir: string } {
   const stashDir = join(mkdtempSync(join(tmpdir(), 'qlb-unclaimed-')), 'unclaimed');
   const backend = new StashFailingBackend();
   return {
-    slots: new ClaudeSlots({ backend, repository: new InMemoryClaudeSlotRepository(), stashDir, now: () => 1_000 }),
+    slots: new ClaudeSlots({
+      backend, repository: new InMemoryClaudeSlotRepository(), stashDir, now: () => 1_000,
+      ...options,
+    }),
     backend,
     stashDir,
   };
@@ -74,17 +81,30 @@ function context(output: string[]): CommandContext {
 }
 
 describe('Claude unclaimed stash and restore (K2 / AC48)', () => {
+  it('rejects a stash id containing a colon', async () => {
+    const { slots } = fixture();
+    await assert.rejects(slots.stashUnclaimed('invalid:stash', credential('issued')), /invalid unclaimed timestamp/);
+  });
+
+  it('skips directory fsync on win32 and still stashes to the Keychain', async () => {
+    const { slots } = fixture({
+      platform: 'win32',
+      directorySync: async () => { throw new Error('directory fsync must not run on Windows'); },
+    });
+    assert.deepEqual(await slots.stashUnclaimed('win32-stash', credential('issued')), { location: 'keychain' });
+  });
+
   it('falls back to a private file, then sweeps it into Keychain', async () => {
     const { slots, backend, stashDir } = fixture();
     backend.failUnclaimedWrites = true;
-    const stored = await slots.stashUnclaimed('2026-10-25T12:00:00Z', credential('issued'), 'sha256:consumed');
+    const stored = await slots.stashUnclaimed('2026-10-25T12-00-00Z', credential('issued'), 'sha256:consumed');
     assert.equal(stored.location, 'file');
     assert.equal(statSync(stashDir).mode & 0o777, 0o700);
     assert.equal(statSync(stored.path!).mode & 0o777, 0o600);
 
     backend.failUnclaimedWrites = false;
     assert.deepEqual(await slots.sweepUnclaimed(), { swept: 1, retained: 0 });
-    const swept = JSON.parse(await backend.get('qlb:anthropic:unclaimed:2026-10-25T12:00:00Z', 'qlb')) as { consumedFp: string };
+    const swept = JSON.parse(await backend.get('qlb:anthropic:unclaimed:2026-10-25T12-00-00Z', 'qlb')) as { consumedFp: string };
     assert.equal(swept.consumedFp, 'sha256:consumed');
   });
 
@@ -131,6 +151,19 @@ describe('Claude unclaimed stash and restore (K2 / AC48)', () => {
     }]);
   });
 
+  it('refuses a reused stash id when a row-less fallback file already exists and the Keychain is healthy', async () => {
+    const { slots, backend, stashDir } = fixture();
+    mkdirSync(stashDir, { recursive: true, mode: 0o700 });
+    const path = join(stashDir, 'row-less-id.json');
+    const original = JSON.stringify({ credential: credential('original') });
+    writeFileSync(path, original, { mode: 0o600 });
+
+    await assert.rejects(slots.stashUnclaimed('row-less-id', credential('replacement')), /already exists/);
+    assert.equal(readFileSync(path, 'utf8'), original);
+    await assert.rejects(backend.get('qlb:anthropic:unclaimed:row-less-id', 'qlb'));
+    assert.deepEqual(await listStashes(stashDir, 'anthropic'), []);
+  });
+
   it('refuses to replace an existing fallback file for a reused stash id', async () => {
     const { slots, backend, stashDir } = fixture();
     mkdirSync(stashDir, { recursive: true, mode: 0o700 });
@@ -144,13 +177,52 @@ describe('Claude unclaimed stash and restore (K2 / AC48)', () => {
     assert.deepEqual(readdirSync(stashDir).filter((name) => name.includes('.tmp.')), []);
   });
 
+  it('finishes a sweep that copied to the Keychain but failed the index on the next sweep', async () => {
+    let failDirectorySync = false;
+    const { slots, backend, stashDir } = fixture({
+      directorySync: async () => {
+        if (failDirectorySync) throw new Error('fixture index sync failed');
+      },
+    });
+    backend.failUnclaimedWrites = true;
+    await slots.stashUnclaimed('retry-sweep', credential('issued'), 'sha256:consumed', 'account-a');
+    backend.failUnclaimedWrites = false;
+    failDirectorySync = true;
+
+    assert.deepEqual(await slots.sweepUnclaimed(), { swept: 0, retained: 1 });
+    assert.equal(readFileSync(join(stashDir, 'retry-sweep.json'), 'utf8').length > 0, true);
+    assert.equal((await backend.get('qlb:anthropic:unclaimed:retry-sweep', 'qlb')).length > 0, true);
+
+    failDirectorySync = false;
+    assert.deepEqual(await slots.sweepUnclaimed(), { swept: 1, retained: 0 });
+    assert.deepEqual(await listStashes(stashDir, 'anthropic'), [{
+      provider: 'anthropic', accountId: 'account-a', stashId: 'retry-sweep', consumedFp: 'sha256:consumed',
+      location: 'keychain', createdAt: 1_000,
+    }]);
+    assert.throws(() => statSync(join(stashDir, 'retry-sweep.json')));
+  });
+
+  it('leaves both copies when the Keychain holds a different credential for the same id', async () => {
+    const warnings: string[] = [];
+    const { slots, backend, stashDir } = fixture({ warn: (message) => warnings.push(message) });
+    backend.failUnclaimedWrites = true;
+    await slots.stashUnclaimed('different-copy', credential('file'), 'sha256:consumed', 'account-a');
+    backend.failUnclaimedWrites = false;
+    await backend.set('qlb:anthropic:unclaimed:different-copy', 'qlb', JSON.stringify({ credential: credential('keychain') }));
+
+    assert.deepEqual(await slots.sweepUnclaimed(), { swept: 0, retained: 1 });
+    assert.equal(readFileSync(join(stashDir, 'different-copy.json'), 'utf8').length > 0, true);
+    assert.equal((await backend.get('qlb:anthropic:unclaimed:different-copy', 'qlb')).length > 0, true);
+    assert.deepEqual(warnings, ['unclaimed fallback conflicts with Keychain entry for different-copy']);
+  });
+
   it('restores only when the stash consumed lineage matches the current slot', async () => {
     const { slots } = fixture();
     await slots.createSlot({ accountId: 'account-a', credential: credential('one'), source: 'cswap-import' });
     const current = (await slots.readSlot('account-a', { fresh: true })).fingerprint;
-    await slots.stashUnclaimed('2026-10-25T12:01:00Z', credential('issued'), current);
+    await slots.stashUnclaimed('2026-10-25T12-01-00Z', credential('issued'), current);
 
-    await slots.restoreUnclaimed('2026-10-25T12:01:00Z', 'account-a');
+    await slots.restoreUnclaimed('2026-10-25T12-01-00Z', 'account-a');
     assert.equal((await slots.readSlot('account-a', { fresh: true })).credential, credential('issued'));
   });
 
@@ -158,10 +230,10 @@ describe('Claude unclaimed stash and restore (K2 / AC48)', () => {
     const { slots, backend } = fixture();
     await slots.createSlot({ accountId: 'account-a', credential: credential('one'), source: 'cswap-import' });
     const current = (await slots.readSlot('account-a', { fresh: true })).fingerprint;
-    await slots.stashUnclaimed('2026-10-25T12:01:30Z', credential('issued'), current);
+    await slots.stashUnclaimed('2026-10-25T12-01-30Z', credential('issued'), current);
     backend.failUnclaimedDeletes = true;
 
-    assert.deepEqual(await slots.restoreUnclaimed('2026-10-25T12:01:30Z', 'account-a'), { cleanupPending: true });
+    assert.deepEqual(await slots.restoreUnclaimed('2026-10-25T12-01-30Z', 'account-a'), { cleanupPending: true });
   });
 
   it('keeps the stash retryable when the outer SQLite commit fails', async () => {
@@ -174,28 +246,28 @@ describe('Claude unclaimed stash and restore (K2 / AC48)', () => {
     const slots = new ClaudeSlots({ backend, repository, stashDir: join(root, 'unclaimed'), now: () => 1_000 });
     await slots.createSlot({ accountId: 'account-a', credential: credential('one'), source: 'cswap-import' });
     const current = (await slots.readSlot('account-a', { fresh: true })).fingerprint;
-    await slots.stashUnclaimed('2026-10-25T12:01:45Z', credential('issued'), current);
+    await slots.stashUnclaimed('2026-10-25T12-01-45Z', credential('issued'), current);
     failNextCommit(repository);
 
-    await assert.rejects(slots.restoreUnclaimed('2026-10-25T12:01:45Z', 'account-a'), /fixture commit failed/);
-    assert.notEqual(await backend.get('qlb:anthropic:unclaimed:2026-10-25T12:01:45Z', 'qlb'), '');
-    assert.deepEqual(await slots.restoreUnclaimed('2026-10-25T12:01:45Z', 'account-a'), { cleanupPending: false });
-    await assert.rejects(backend.get('qlb:anthropic:unclaimed:2026-10-25T12:01:45Z', 'qlb'));
+    await assert.rejects(slots.restoreUnclaimed('2026-10-25T12-01-45Z', 'account-a'), /fixture commit failed/);
+    assert.notEqual(await backend.get('qlb:anthropic:unclaimed:2026-10-25T12-01-45Z', 'qlb'), '');
+    assert.deepEqual(await slots.restoreUnclaimed('2026-10-25T12-01-45Z', 'account-a'), { cleanupPending: false });
+    await assert.rejects(backend.get('qlb:anthropic:unclaimed:2026-10-25T12-01-45Z', 'qlb'));
     repository.close();
   });
 
   it('refuses a restore whose consumed lineage no longer matches', async () => {
     const { slots } = fixture();
     await slots.createSlot({ accountId: 'account-a', credential: credential('one'), source: 'cswap-import' });
-    await slots.stashUnclaimed('2026-10-25T12:02:00Z', credential('issued'), 'sha256:other');
-    await assert.rejects(slots.restoreUnclaimed('2026-10-25T12:02:00Z', 'account-a'), /lineage mismatch/);
+    await slots.stashUnclaimed('2026-10-25T12-02-00Z', credential('issued'), 'sha256:other');
+    await assert.rejects(slots.restoreUnclaimed('2026-10-25T12-02-00Z', 'account-a'), /lineage mismatch/);
   });
 
   it('refuses a foreign safety stash without a consumed lineage', async () => {
     const { slots } = fixture();
     await slots.createSlot({ accountId: 'account-a', credential: credential('one'), source: 'cswap-import' });
-    await slots.stashUnclaimed('2026-10-25T12:02:30Z', credential('foreign'));
-    await assert.rejects(slots.restoreUnclaimed('2026-10-25T12:02:30Z', 'account-a'), /lineage mismatch/);
+    await slots.stashUnclaimed('2026-10-25T12-02-30Z', credential('foreign'));
+    await assert.rejects(slots.restoreUnclaimed('2026-10-25T12-02-30Z', 'account-a'), /lineage mismatch/);
     assert.equal((await slots.readSlot('account-a')).credential, credential('one'));
   });
 
@@ -203,17 +275,17 @@ describe('Claude unclaimed stash and restore (K2 / AC48)', () => {
     const output: string[] = [];
     const seen: Array<[string, string]> = [];
     const restore = async (timestamp: string, slot: string) => { seen.push([timestamp, slot]); };
-    assert.equal(await runClaudeRestoreUnclaimedCommand(['2026-10-25T12:03:00Z', 'account-a'], context(output), { restore }), 0);
-    assert.deepEqual(seen, [['2026-10-25T12:03:00Z', 'account-a']]);
+    assert.equal(await runClaudeRestoreUnclaimedCommand(['2026-10-25T12-03-00Z', 'account-a'], context(output), { restore }), 0);
+    assert.deepEqual(seen, [['2026-10-25T12-03-00Z', 'account-a']]);
     assert.deepEqual(output, ['restored unclaimed credential to account-a']);
     assert.equal(await runClaudeRestoreUnclaimedCommand([], context(output), { restore }), 2);
-    assert.equal(await runClaudeRestoreUnclaimedCommand(['2026-10-25T12:03:00Z', 'a:prev'], context(output), { restore }), 2);
+    assert.equal(await runClaudeRestoreUnclaimedCommand(['2026-10-25T12-03-00Z', 'a:prev'], context(output), { restore }), 2);
   });
 
   it('prints a warning when command-level stash cleanup is pending', async () => {
     const output: string[] = [];
     const restore = async () => ({ cleanupPending: true });
-    assert.equal(await runClaudeRestoreUnclaimedCommand(['2026-10-25T12:04:00Z', 'account-a'], context(output), { restore }), 0);
+    assert.equal(await runClaudeRestoreUnclaimedCommand(['2026-10-25T12-04-00Z', 'account-a'], context(output), { restore }), 0);
     assert.deepEqual(output, [
       'restored unclaimed credential to account-a',
       'ERR:qlb claude restore-unclaimed: warning: stash cleanup pending',

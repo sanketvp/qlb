@@ -9,14 +9,14 @@
 // Credential bytes are accepted only through injected backends and are never
 // included in errors, return metadata, or filesystem names.
 
-import { chmod, link, mkdir, open, readdir, readFile, rm } from 'node:fs/promises';
+import { chmod, link, lstat, mkdir, open, readdir, readFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { openStoreConnection } from './store';
 import { assertAdmittedInConnection } from './lifecycle';
 import { credentialFingerprint } from './anthropic-oauth';
 import { isCredentialNotFound } from './credential-backends';
 import { KeychainReadBackoff, platformKeychain, qlbKeychainService, QLB_KEYCHAIN_ACCOUNT } from './keychain';
-import { listStashes, recordStash, type UnclaimedIndexEntry } from './unclaimed-index';
+import { listStashes, recordStash, removeStash, type UnclaimedIndexEntry, type UnclaimedIndexWriteOptions } from './unclaimed-index';
 
 const DISPLAY_CACHE_TTL_MS = 60_000;
 const ANTHROPIC_PROVIDER = 'anthropic';
@@ -491,13 +491,14 @@ export interface ClaudeSlotFileOps {
     close(): Promise<void>;
   }>;
   link(existingPath: string, newPath: string): Promise<void>;
+  lstat(path: string): Promise<unknown>;
   readFile(path: string, encoding: 'utf8'): Promise<string>;
   readdir(path: string): Promise<string[]>;
   rm(path: string, options: { force: boolean }): Promise<void>;
 }
 
 const defaultFileOps: ClaudeSlotFileOps = {
-  mkdir, chmod, open, link, readFile, readdir, rm,
+  mkdir, chmod, open, link, lstat, readFile, readdir, rm,
 };
 
 export interface ClaudeSlotsOptions {
@@ -507,6 +508,12 @@ export interface ClaudeSlotsOptions {
   now?: () => number;
   readBackoff?: KeychainReadBackoff;
   files?: ClaudeSlotFileOps;
+  /** Injectable for Windows directory-sync behavior tests. */
+  platform?: NodeJS.Platform;
+  /** Injectable directory sync; non-Windows failures are preserved. */
+  directorySync?: (path: string) => Promise<void>;
+  /** Non-secret warning sink for retained conflicting fallback files. */
+  warn?: (message: string) => void;
 }
 
 export interface ReadSlotOptions {
@@ -527,8 +534,17 @@ function missingItem(error: unknown): boolean {
   return isCredentialNotFound(error);
 }
 
+export class InvalidUnclaimedStashIdError extends Error {
+  constructor(kind: string) {
+    super(`invalid ${kind}`);
+    this.name = 'InvalidUnclaimedStashIdError';
+  }
+}
+
 function assertId(value: string, kind: string): void {
-  if (!value || /[\0/\\]/.test(value)) throw new Error(`invalid ${kind}`);
+  if (!value || /[\x00-\x1F\x7F\\/:*?"<>|]|[. ]$/.test(value)) {
+    throw new InvalidUnclaimedStashIdError(kind);
+  }
 }
 
 function assertSlotId(value: string): void {
@@ -560,6 +576,9 @@ export class ClaudeSlots {
   private readonly now: () => number;
   private readonly backoff: KeychainReadBackoff;
   private readonly files: ClaudeSlotFileOps;
+  private readonly platform: NodeJS.Platform;
+  private readonly directorySync: ((path: string) => Promise<void>) | undefined;
+  private readonly warn: (message: string) => void;
   private readonly cache = new Map<string, CachedSlot>();
   private readonly slotWrites = new Map<string, Promise<void>>();
   private cacheEpoch = 0;
@@ -569,6 +588,9 @@ export class ClaudeSlots {
     this.now = options.now ?? Date.now;
     this.backoff = options.readBackoff ?? new KeychainReadBackoff({ now: this.now });
     this.files = options.files ?? defaultFileOps;
+    this.platform = options.platform ?? process.platform;
+    this.directorySync = options.directorySync;
+    this.warn = options.warn ?? console.warn;
   }
 
   listSlots(): ClaudeSlot[] {
@@ -749,13 +771,23 @@ export class ClaudeSlots {
       location: 'keychain', createdAt: this.now(),
     };
     let indexWritable = true;
+    let reservationCreated = false;
     try {
-      await recordStash(this.indexRoot(), index);
+      await recordStash(this.indexRoot(), index, this.indexOptions());
+      reservationCreated = true;
     } catch (error: unknown) {
       if (error && typeof error === 'object' && (error as NodeJS.ErrnoException).code === 'EEXIST') {
         throw new Error('unclaimed credential already exists');
       }
       indexWritable = false;
+    }
+    if (reservationCreated) {
+      try {
+        await this.assertUnclaimedFileAbsent(timestamp);
+      } catch {
+        await removeStash(this.indexRoot(), index, this.indexOptions());
+        throw new Error('unclaimed credential already exists');
+      }
     }
     let keychainUsable = indexWritable;
     if (keychainUsable) {
@@ -787,9 +819,9 @@ export class ClaudeSlots {
     // Discovery is best effort only after the fallback is durable. A legacy
     // file remains discoverable by the pre-adoption scan if this update fails.
     if (indexWritable) {
-      try { await recordStash(this.indexRoot(), { ...index, location: 'file' }, { replace: true }); } catch { /* file scan recovers it */ }
+      try { await recordStash(this.indexRoot(), { ...index, location: 'file' }, this.indexOptions(true)); } catch { /* file scan recovers it */ }
     } else {
-      try { await recordStash(this.indexRoot(), { ...index, location: 'file' }); } catch { /* file scan recovers it */ }
+      try { await recordStash(this.indexRoot(), { ...index, location: 'file' }, this.indexOptions()); } catch { /* file scan recovers it */ }
     }
     return { location: 'file', path };
   }
@@ -807,14 +839,25 @@ export class ClaudeSlots {
         this.assertTimestamp(timestamp);
         const text = await this.files.readFile(join(this.options.stashDir, name), 'utf8');
         const parsed = parseUnclaimed(text);
-        await this.assertUnclaimedAbsent(timestamp);
-        await this.backend.set(this.unclaimedService(timestamp), QLB_KEYCHAIN_ACCOUNT, text);
+        // Validate index availability before making a second durable copy.
         const existing = (await listStashes(this.indexRoot(), ANTHROPIC_PROVIDER)).find((entry) => entry.stashId === timestamp);
+        let keychainText: string | null = null;
+        try {
+          keychainText = await this.backend.get(this.unclaimedService(timestamp), QLB_KEYCHAIN_ACCOUNT);
+        } catch (error) {
+          if (!missingItem(error)) throw new Error('unable to check unclaimed credential');
+        }
+        if (keychainText != null && keychainText !== text) {
+          this.warn(`unclaimed fallback conflicts with Keychain entry for ${timestamp}`);
+          retained += 1;
+          continue;
+        }
+        if (keychainText == null) await this.backend.set(this.unclaimedService(timestamp), QLB_KEYCHAIN_ACCOUNT, text);
         await recordStash(this.indexRoot(), {
           provider: ANTHROPIC_PROVIDER, accountId: existing?.accountId ?? parsed.accountId ?? null,
           stashId: timestamp, consumedFp: parsed.consumedFp ?? '', location: 'keychain',
           createdAt: existing?.createdAt ?? this.now(),
-        }, { replace: existing != null });
+        }, this.indexOptions(existing != null));
         await this.files.rm(join(this.options.stashDir, name), { force: true });
         swept += 1;
       } catch {
@@ -868,8 +911,22 @@ export class ClaudeSlots {
   }
 
   private async fsyncStashDirectory(): Promise<void> {
+    // Node cannot fsync a directory handle on Windows. Do not weaken the
+    // non-Windows durability contract by swallowing failures there.
+    if (this.platform === 'win32') return;
+    if (this.directorySync) return this.directorySync(this.options.stashDir);
     const handle = await this.files.open(this.options.stashDir, 'r');
     try { await handle.sync(); } finally { await handle.close(); }
+  }
+
+  private async assertUnclaimedFileAbsent(timestamp: string): Promise<void> {
+    try {
+      await this.files.lstat(this.filePath(timestamp));
+    } catch (error: unknown) {
+      if (error && typeof error === 'object' && (error as NodeJS.ErrnoException).code === 'ENOENT') return;
+      throw new Error('unclaimed credential already exists');
+    }
+    throw new Error('unclaimed credential already exists');
   }
 
   private async assertUnclaimedAbsent(timestamp: string): Promise<void> {
@@ -884,6 +941,10 @@ export class ClaudeSlots {
 
   private indexRoot(): string {
     return this.options.stashDir;
+  }
+
+  private indexOptions(replace = false): UnclaimedIndexWriteOptions {
+    return { replace, platform: this.platform, directorySync: this.directorySync };
   }
 
   private async readExistingCredential(accountId: string): Promise<string | null> {
