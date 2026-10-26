@@ -99,21 +99,35 @@ private func setIfSha256(_ service: String, _ account: String, _ expectedSha256:
         fail("--if-sha256 requires a lowercase SHA-256 hex digest")
     }
     var lookup = query(service, account)
+    // Ask for the bytes to hash and the record identity/version used by the update
+    // query. Apple documents these return attributes for SecItemCopyMatching:
+    // https://developer.apple.com/documentation/security/secitemcopymatching(_:_:)
     lookup[kSecReturnData] = true
+    lookup[kSecReturnAttributes] = true
+    lookup[kSecReturnPersistentRef] = true
     var result: CFTypeRef?
     let status = SecItemCopyMatching(lookup as CFDictionary, &result)
-    guard status == errSecSuccess, var stored = result as? Data else {
+    guard status == errSecSuccess,
+          let attributes = result as? [String: Any],
+          var stored = attributes[kSecValueData as String] as? Data,
+          let modificationDate = attributes[kSecAttrModificationDate as String],
+          let persistentRef = attributes[kSecValuePersistentRef as String] else {
         // Only absence is a CAS conflict. A denied or unreadable item is an error.
         fail("compare-and-swap lookup failed", status, code: status == errSecItemNotFound ? 3 : 1)
     }
     defer { stored.resetBytes(in: 0..<stored.count) }
     let actualSha256 = SHA256.hash(data: stored).map { String(format: "%02x", $0) }.joined()
     guard actualSha256 == expectedSha256 else { fail("changed", code: 3) }
-    // SecItemUpdate's query accepts item class and search attributes, not
-    // kSecValueData (Apple: https://developer.apple.com/documentation/security/secitemupdate(_:_:)).
-    // Compare the current value in this helper immediately before updating; S24
-    // drains C-swap before this operation, so no external writer may interleave.
-    let updateStatus = SecItemUpdate(query(service, account) as CFDictionary, [kSecValueData: data] as CFDictionary)
+    // Match both the exact record and its observed version. SecItemUpdate matches
+    // its query (Apple: https://developer.apple.com/documentation/security/secitemupdate(_:_:));
+    // modification date is a Keychain item attribute (Apple:
+    // https://developer.apple.com/documentation/security/ksecattrmodificationdate).
+    // Therefore a writer that changes the record between copy and update makes the
+    // query miss, so the helper reports a conflict without overwriting it.
+    var casQuery = query(service, account)
+    casQuery[kSecAttrModificationDate] = modificationDate
+    casQuery[kSecValuePersistentRef] = persistentRef
+    let updateStatus = SecItemUpdate(casQuery as CFDictionary, [kSecValueData: data] as CFDictionary)
     if updateStatus == errSecItemNotFound { fail("changed", code: 3) }
     guard updateStatus == errSecSuccess else { fail("compare-and-swap update failed", updateStatus) }
 }

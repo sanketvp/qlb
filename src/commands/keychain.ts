@@ -1,6 +1,6 @@
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, copyFileSync, existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, closeSync, copyFileSync, existsSync, fstatSync, mkdtempSync, openSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { defaultKeychainHelperPath, KeychainHelperMissingError, MACOS_SECURITY_TIMEOUT_MS } from '../keychain';
@@ -196,7 +196,11 @@ function writeMatrixConfig(
   }
 }
 
-type HelperRunner = (path: string, args: string[], input?: Buffer) => void;
+/**
+ * `verifiedFd` identifies the staged inode observed before verification; the default
+ * runner compares it with the spawned path before opening stdin for input.
+ */
+type HelperRunner = (path: string, args: string[], input?: Buffer, verifiedFd?: number, expectedSigning?: HelperSigningState | null) => void | Promise<void>;
 type CswapItemReader = (service: string, account: string) => Buffer;
 
 export interface KeychainCommandDependencies {
@@ -212,6 +216,10 @@ export interface KeychainCommandDependencies {
   helperPath?: () => string;
   /** Test seam: records helper forms without handling credential bytes. */
   helperRunner?: HelperRunner;
+  /** Test seam: exercise staged-helper verification even with an injected runner. */
+  stageAuthorizedHelper?: boolean;
+  /** Test seam: simulates a same-user pathname replacement after verification. */
+  afterAuthorizedHelperVerified?: (stagedPath: string) => void;
   /** Test seam: reads a disposable C-swap item without invoking security. */
   readCswapItem?: CswapItemReader;
   /** Test seam for S24 immediately before each CAS write. */
@@ -248,15 +256,63 @@ function cswapItems(sequencePath: string): Array<{ service: 'claude-swap'; accou
   return items;
 }
 
-function defaultHelperRunner(path: string, args: string[], input?: Buffer): void {
-  try {
-    execFileSync(path, args, { input, stdio: ['pipe', 'ignore', 'ignore'], timeout: MACOS_SECURITY_TIMEOUT_MS });
-  } catch (err) {
-    const status = (err as { status?: unknown }).status;
-    if (status === 3) throw Object.assign(new Error('keychain item changed'), { exitCode: 3 });
-    if (status === 4) throw Object.assign(new Error('keychain item not found'), { exitCode: 4 });
-    throw new Error('keychain helper failed');
-  }
+async function defaultHelperRunner(
+  path: string,
+  args: string[],
+  input?: Buffer,
+  verifiedFd?: number,
+  expectedSigning?: HelperSigningState | null,
+): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const child = spawn(path, args, { stdio: ['pipe', 'ignore', 'ignore'] });
+    const fail = (error: Error): void => {
+      if (settled) return;
+      settled = true;
+      if (timeout) clearTimeout(timeout);
+      child.stdin?.end();
+      child.kill();
+      reject(error);
+    };
+    timeout = setTimeout(() => fail(new Error('keychain helper failed')), MACOS_SECURITY_TIMEOUT_MS);
+    child.once('error', () => fail(new Error('keychain helper failed')));
+    child.once('spawn', () => {
+      try {
+        if (verifiedFd !== undefined) {
+          const verified = fstatSync(verifiedFd);
+          const executed = statSync(path);
+          // The child is spawned before this check; Node documents `spawn` as the
+          // successful child-process creation event. Its executable cannot change
+          // afterwards, and stdin remains unopened until this inode check passes.
+          // https://nodejs.org/api/child_process.html#event-spawn
+          if (verified.dev !== executed.dev || verified.ino !== executed.ino) {
+            fail(new Error('keychain helper changed after verification'));
+            return;
+          }
+        }
+        if (expectedSigning) {
+          const after = helperSigningState(path);
+          if (!after || after.binaryHash !== expectedSigning.binaryHash || after.identityHash !== expectedSigning.identityHash) {
+            fail(new Error('keychain helper changed after verification'));
+            return;
+          }
+        }
+        child.stdin?.end(input);
+      } catch {
+        fail(new Error('keychain helper changed after verification'));
+      }
+    });
+    child.once('close', (status) => {
+      if (settled) return;
+      settled = true;
+      if (timeout) clearTimeout(timeout);
+      if (status === 0) resolve();
+      else if (status === 3) reject(Object.assign(new Error('keychain item changed'), { exitCode: 3 }));
+      else if (status === 4) reject(Object.assign(new Error('keychain item not found'), { exitCode: 4 }));
+      else reject(new Error('keychain helper failed'));
+    });
+  });
 }
 
 function defaultCswapItemReader(service: string, account: string, env: NodeJS.ProcessEnv): Buffer {
@@ -298,24 +354,33 @@ function assertAuthorizationHelper(path: string, dbPath: string, dependencies: K
 }
 
 /**
- * Execute a verified private copy, not the pathname inspected earlier. This prevents
- * replacing or retargeting the release helper from redirecting a later stdin payload.
- * The private copy is verified after it is made and removed immediately after use.
+ * Verify the opened staged inode, then spawn by path and compare that pathname's
+ * inode before the child receives stdin. Node emits `spawn` only after creating the
+ * child (https://nodejs.org/api/child_process.html#event-spawn), so a replacement is
+ * detected before any secret bytes are written to the replacement process.
  */
-function withAuthorizedHelper<T>(
+async function withAuthorizedHelper<T>(
   path: string,
   dbPath: string,
   dependencies: KeychainCommandDependencies,
-  action: (authorizedPath: string, signing: HelperSigningState | null) => T,
-): T {
-  if (dependencies.helperRunner) return action(path, assertAuthorizationHelper(path, dbPath, dependencies));
+  action: (authorizedPath: string, signing: HelperSigningState | null, verifiedFd?: number) => T | Promise<T>,
+): Promise<T> {
+  if (dependencies.helperRunner && !dependencies.stageAuthorizedHelper) {
+    return action(path, assertAuthorizationHelper(path, dbPath, dependencies));
+  }
   const directory = mkdtempSync(join(tmpdir(), 'qlb-authorized-helper-'));
   const staged = join(directory, 'qlb-keychain-helper');
+  let fd: number | undefined;
   try {
     copyFileSync(path, staged);
     chmodSync(staged, 0o500);
-    return action(staged, assertAuthorizationHelper(staged, dbPath, dependencies));
+    fd = openSync(staged, 'r');
+    // Keep the pre-verification inode open; it is compared after spawn before stdin.
+    const signing = assertAuthorizationHelper(staged, dbPath, dependencies);
+    dependencies.afterAuthorizedHelperVerified?.(staged);
+    return await action(staged, signing, fd);
   } finally {
+    if (fd !== undefined) closeSync(fd);
     rmSync(directory, { recursive: true, force: true });
   }
 }
@@ -330,13 +395,13 @@ async function authorize(options: { cswap: boolean; json: boolean }, ctx: Comman
       const claudeCodeServices = activeClaudeCodeServices(ctx.env, ctx.home);
       const cswap = cswapItems(ctx.config.cswapSequencePath);
       let authorized = 0;
-      const signing = withAuthorizedHelper(helper, ctx.config.dbPath, dependencies, (authorizedHelper, helperSigning) => {
+      const signing = await withAuthorizedHelper(helper, ctx.config.dbPath, dependencies, async (authorizedHelper, helperSigning, inheritedFd) => {
         // Claude Code gives these services in try-order. Only the first existing
         // active-profile item is required; an absent fallback is not a failure.
         let claudeCodeAuthorized = false;
         for (const service of claudeCodeServices) {
           try {
-            runner(authorizedHelper, ['probe-read', service, account]);
+            await runner(authorizedHelper, ['probe-read', service, account], undefined, inheritedFd, helperSigning);
             claudeCodeAuthorized = true;
             authorized += 1;
             break;
@@ -346,7 +411,7 @@ async function authorize(options: { cswap: boolean; json: boolean }, ctx: Comman
         }
         if (!claudeCodeAuthorized) throw new Error('Claude Code item could not be read');
         for (const item of cswap) {
-          runner(authorizedHelper, ['probe-read', item.service, item.account]);
+          await runner(authorizedHelper, ['probe-read', item.service, item.account], undefined, inheritedFd, helperSigning);
           authorized += 1;
         }
         return helperSigning;
@@ -378,8 +443,8 @@ async function authorize(options: { cswap: boolean; json: boolean }, ctx: Comman
           ctx.stderr('qlb keychain: refused: C-swap process is alive');
           return 3;
         }
-        withAuthorizedHelper(helper, ctx.config.dbPath, dependencies, (authorizedHelper) => {
-          runner(authorizedHelper, ['set', '--if-sha256', digest, item.service, item.account], payload);
+        await withAuthorizedHelper(helper, ctx.config.dbPath, dependencies, async (authorizedHelper, _signing, inheritedFd) => {
+          await runner(authorizedHelper, ['set', '--if-sha256', digest, item.service, item.account], payload, inheritedFd, _signing);
         });
       } finally { payload.fill(0); }
     }
