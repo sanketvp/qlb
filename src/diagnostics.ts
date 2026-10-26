@@ -45,6 +45,7 @@ import { hermesIntegrationChecks } from './hermes-integration';
 import { piIntegrationChecks } from './pi-integration';
 import { piExtensionDriftCheck } from './checks/pi-extension-drift';
 import { piStaleSessionsCheck } from './checks/pi-stale-sessions';
+import { piEvidenceGapCheck } from './checks/pi-evidence-gap';
 import { qlbHomeDir } from './home';
 import { piReleaseAppDir } from './pi-deploy';
 import { probeHostEnvironment, type HostCommandRunner } from './checks/hosts-env';
@@ -755,6 +756,7 @@ export async function doctorQlb(
       ? () => { throw new Error('Pi process listing requires an injected fixture in test mode'); }
       : undefined),
   }));
+  checks.push(piEvidenceGapCheck(config.dbPath));
 
   const providers = inspectProviders(config, options.command);
   if (options.live) {

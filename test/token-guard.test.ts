@@ -166,11 +166,11 @@ describe('qlb token', () => {
     assert.deepEqual(errors, []);
   });
 
-  it('limits the unredacted delivery channel to the token command', () => {
+  it('limits the unredacted delivery channel to verified Pi credential commands', () => {
     const commandsDir = join(process.cwd(), 'src', 'commands');
     const users = readdirSync(commandsDir)
       .filter((file) => file.endsWith('.ts'))
       .filter((file) => /\bdeliverSecret\(/.test(readFileSync(join(commandsDir, file), 'utf8')));
-    assert.deepEqual(users, ['token.ts']);
+    assert.deepEqual(users, ['gate.ts', 'token.ts']);
   });
 });
