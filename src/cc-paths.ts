@@ -78,7 +78,9 @@ export function globalConfigPath(options: ClaudePathOptions = {}): string {
 export function keychainServiceName(options: ClaudePathOptions = {}): string {
   const configDir = environment(options).CLAUDE_CONFIG_DIR;
   if (!configDir) return CLAUDE_CODE_CREDENTIALS_SERVICE;
-  const suffix = createHash('sha256').update(configDir, 'utf8').digest('hex').slice(0, 8);
+  // Claude Code hashes the raw exported spelling after NFC normalization; do
+  // not resolve it, because symlink/trailing-slash spellings remain significant.
+  const suffix = createHash('sha256').update(configDir.normalize('NFC'), 'utf8').digest('hex').slice(0, 8);
   return `${CLAUDE_CODE_CREDENTIALS_SERVICE}-${suffix}`;
 }
 

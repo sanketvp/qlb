@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
@@ -33,6 +34,16 @@ describe('Claude Code paths', () => {
     assert.equal(paths.credentialsPath, join(profile, '.credentials.json'));
     assert.equal(paths.globalConfigPath, join(profile, '.claude.json'));
     assert.match(paths.keychainService, /^Claude Code-credentials-[0-9a-f]{8}$/);
+  });
+
+  it('NFC-normalizes the configured profile only for its Keychain service hash', () => {
+    const home = fixtureHome();
+    const nfdProfile = join(home, 'cafe\u0301');
+    const nfcProfile = nfdProfile.normalize('NFC');
+    const expectedSuffix = createHash('sha256').update(nfcProfile, 'utf8').digest('hex').slice(0, 8);
+
+    assert.equal(keychainServiceName({ env: { CLAUDE_CONFIG_DIR: nfdProfile } }), `Claude Code-credentials-${expectedSuffix}`);
+    assert.equal(claudeConfigHome({ env: { CLAUDE_CONFIG_DIR: nfdProfile } }), nfdProfile);
   });
 
   it('matches Claude Code 2.1.299 legacy-global selection', () => {

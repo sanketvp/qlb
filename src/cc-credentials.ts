@@ -6,6 +6,8 @@
  */
 
 import { existsSync, readFileSync } from 'node:fs';
+import { dirname } from 'node:path';
+import { withClaudeConfigLock, withClaudeCredentialLocks } from './cc-locks';
 import { atomicWriteText } from './fsutil';
 import { macosKeychainAccountName } from './keychain';
 import { type CredentialBackend } from './credential-backends';
@@ -99,8 +101,10 @@ export function readClaudeConfig(path: string, readText: (path: string) => strin
   let text: string;
   try {
     text = readText(path);
-  } catch (error) {
-    throw new ClaudeConfigFileError(path, error instanceof Error ? error.message : String(error));
+  } catch {
+    // Do not surface a filesystem error's text: an injected reader or platform
+    // error can include a path/content fragment that doctor would print verbatim.
+    throw new ClaudeConfigFileError(path, 'could not read file');
   }
   try {
     const parsed: unknown = JSON.parse(text);
@@ -109,20 +113,27 @@ export function readClaudeConfig(path: string, readText: (path: string) => strin
     }
     return parsed as JsonObject;
   } catch (error) {
-    throw new ClaudeConfigFileError(path, error instanceof Error ? error.message : String(error));
+    // V8's SyntaxError message may quote source text. Config files can contain
+    // credentials, so doctor and callers must receive a content-free reason.
+    const reason = error instanceof SyntaxError ? 'invalid JSON' : 'top level must be a JSON object';
+    throw new ClaudeConfigFileError(path, reason);
   }
 }
 
 /** Replace exactly oauthAccount, preserving every other config field. */
-export function spliceOauthAccount(
+export async function spliceOauthAccount(
   path: string,
   oauthAccount: JsonObject,
   options: Pick<ClaudeCredentialsOptions, 'readText' | 'writeText'> = {},
-): void {
-  const config = readClaudeConfig(path, options.readText ?? defaultRead);
-  config.oauthAccount = oauthAccount;
-  const text = `${JSON.stringify(config, null, 2)}\n`;
-  (options.writeText ?? ((target, value) => { atomicWriteText(target, value, { mode: 0o600 }); }))(path, text);
+): Promise<void> {
+  // `configDir` makes the A1 lock module select precisely `path.lock`, for
+  // either global `.claude.json` or qualifying legacy `.config.json` paths.
+  await withClaudeConfigLock({ configDir: dirname(path), env: {} }, () => {
+    const config = readClaudeConfig(path, options.readText ?? defaultRead);
+    config.oauthAccount = oauthAccount;
+    const text = `${JSON.stringify(config, null, 2)}\n`;
+    (options.writeText ?? ((target, value) => { atomicWriteText(target, value, { mode: 0o600 }); }))(path, text);
+  });
 }
 
 /**
@@ -164,12 +175,17 @@ export async function writeLiveClaudeCredentials(
   options: ClaudeCredentialsOptions,
 ): Promise<{ credentialsFileRefreshed: boolean }> {
   const paths = resolvedPaths(options);
-  await options.backend.set(paths.keychainService, resolvedAccount(options), credentials);
-  try {
-    return {
-      credentialsFileRefreshed: rewriteCredentialsFileIfPresent(paths.credentialsPath, credentials, options),
-    };
-  } catch {
-    return { credentialsFileRefreshed: false };
-  }
+  // Use A1's two credential locks for the full local publication. This keeps
+  // Claude's Keychain generation and its optional plaintext notification from
+  // interleaving with a Claude Code refresh or account switch.
+  return withClaudeCredentialLocks({ configDir: paths.configHome, env: {} }, async () => {
+    await options.backend.set(paths.keychainService, resolvedAccount(options), credentials);
+    try {
+      return {
+        credentialsFileRefreshed: rewriteCredentialsFileIfPresent(paths.credentialsPath, credentials, options),
+      };
+    } catch {
+      return { credentialsFileRefreshed: false };
+    }
+  });
 }
