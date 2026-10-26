@@ -287,6 +287,15 @@ export interface MigrationStatus {
   provider?: string;
 }
 
+export class OwnerMapPresentError extends Error {
+  readonly code = 'owner-map-present';
+
+  constructor() {
+    super('owner-map-present: anthropic pool migration waits for P7b8');
+    this.name = 'OwnerMapPresentError';
+  }
+}
+
 export interface MigrationConfig {
   kind?: MigrationKind;
   provider?: string;
@@ -793,6 +802,49 @@ export class Migration {
     return this.ownerEntryPresentAt(this.ownerMapPath) || this.legacySidecarOwned();
   }
 
+  /** P7b8 alone may convert the pool's v1 document into the shared v2 map. */
+  private refusePoolOwnerMap(): void {
+    if (this.kind !== 'pool' || !existsSync(this.ownerMapPath)) return;
+    try {
+      const owner: unknown = JSON.parse(readFileSync(this.ownerMapPath, 'utf8'));
+      if (isObjectRecord(owner) && Object.prototype.hasOwnProperty.call(owner, 'providers')) {
+        throw new OwnerMapPresentError();
+      }
+    } catch (error) {
+      if (error instanceof OwnerMapPresentError) throw error;
+      // Preserve the pool path's existing v1/malformed-file behavior. Only a
+      // parseable document declaring `providers` is the P7b8-only v2 map.
+    }
+  }
+
+  /** Gate coordinates supersede the pre-P7b4 OpenRouter Keychain location. */
+  private staticKeychainCoords(): { service: string; account: string } | null {
+    if (this.kind !== 'static-key' || this.ownerProvider() !== 'openrouter') return null;
+    const gate = keychainCoords('openrouter', ADAPTER_ACCOUNT_IDS.openrouter, ADAPTER_ACCOUNT_LABELS.openrouter);
+    const legacy = {
+      service: qlbKeychainService('openrouter', ADAPTER_ACCOUNT_IDS.openrouter),
+      account: ADAPTER_ACCOUNT_LABELS.openrouter,
+    };
+    for (const coords of [gate, legacy]) {
+      try {
+        this.keychain.getSync(coords.service, coords.account);
+        return coords;
+      } catch {
+        // Try the pre-P7b4 coordinates after the gate location.
+      }
+    }
+    return null;
+  }
+
+  private deleteStaticKeychain(coords: { service: string; account: string } | null): void {
+    if (!coords) return;
+    try {
+      this.keychain.deleteSync(coords.service, coords.account);
+    } catch {
+      // Already gone or concurrently removed; rollback remains idempotent.
+    }
+  }
+
   private withOwnerMapLock<T>(fn: () => T): T {
     return withPiAuthLock(join(dirname(this.ownerMapPath), 'auth.json'), () => fn());
   }
@@ -827,6 +879,7 @@ export class Migration {
     const prePresent =
       this.kind === 'static-key' ? false : existsSync(preQlbPath(this.poolFilePath));
     const intent = detail.intent === 'rollback';
+    const staticCredential = this.staticKeychainCoords();
 
     let ownerFile: MigrationStatus['ownerFile'] = 'absent';
     if (ownerPresent) ownerFile = 'present';
@@ -841,7 +894,7 @@ export class Migration {
     else if (prePresent) nativeStore = 'pre-qlb';
 
     let piAtNextLaunch: MigrationStatus['piAtNextLaunch'] = 'unknown';
-    if (ownerPresent) piAtNextLaunch = 'QLB works';
+    if (ownerPresent && (this.kind !== 'static-key' || staticCredential)) piAtNextLaunch = 'QLB works';
     else if (nativePresent) piAtNextLaunch = 'native works';
 
     const retains = this.retainsNative();
@@ -905,6 +958,9 @@ export class Migration {
    * Static-key (OpenRouter): 1 API key from native Keychain (read-only).
    */
   stage(): MigrationStatus {
+    // P7b8 alone may convert the pool's v1 owner document into the shared
+    // v2 map. Refuse before creating staging, Keychain, or journal state.
+    this.refusePoolOwnerMap();
     // OpenRouter publishes into the v2 map, so reject a v1 Anthropic
     // document before creating any staged Keychain or filesystem state.
     if (this.kind === 'static-key') readPiOwnerProviders(this.ownerMapPath);
@@ -1011,6 +1067,9 @@ export class Migration {
    * rename is hygiene afterwards.
    */
   commit(): MigrationStatus {
+    // P7b8 alone may convert the pool's v1 owner document into the shared
+    // v2 map. Refuse before any journal or native-pool write.
+    this.refusePoolOwnerMap();
     // OpenRouter must fail closed rather than add providers to a v1 Anthropic
     // document. Read before checking or mutating any migration artifact.
     if (this.kind === 'static-key') readPiOwnerProviders(this.ownerMapPath);
@@ -1033,6 +1092,10 @@ export class Migration {
       unlinkIfExists(staging);
       return this.finishHygiene();
     }
+
+    // The map can have appeared after stage(), so make the P7b8 boundary
+    // check immediately before the pool's destructive v1 rename.
+    this.refusePoolOwnerMap();
 
     // C — THE ONLY COMMIT POINT (atomic rename on APFS/POSIX).
     renameSync(staging, this.ownerFilePath);
@@ -1310,6 +1373,10 @@ export class Migration {
   private deleteStagedKeychain(accounts: OwnerFile['accounts'] | undefined): void {
     if (!accounts) return;
     for (const meta of accounts) {
+      if (meta.provider === 'openrouter') {
+        this.deleteStaticKeychain(this.staticKeychainCoords());
+        continue;
+      }
       const { service, account } = keychainCoords(meta.provider, meta.id, meta.label);
       try {
         this.keychain.deleteSync(service, account);
@@ -1338,11 +1405,13 @@ export class Migration {
     if (this.retainsNative()) {
       // Native was never moved (auth.json shadow-retained, or Keychain retained).
       if (this.kind === 'static-key') {
+        const staticCredential = this.staticKeychainCoords();
         if (this.ownerEntryPresentAt(this.ownerMapPath)) {
           this.withOwnerMapLock(() => writePiOwnerEntry(this.ownerMapPath, this.ownerProvider(), false));
         }
         const legacy = this.legacySidecarPath();
         if (legacy) unlinkIfExists(legacy);
+        this.deleteStaticKeychain(staticCredential);
       } else {
         unlinkIfExists(this.ownerFilePath);
       }

@@ -6,6 +6,7 @@ import { describe, it } from 'node:test';
 import { MockKeychain, qlbKeychainService } from '../src/keychain';
 import {
   Migration,
+  createStaticKeyMigration,
   preQlbPath,
   sidecarPath,
   stagingOwnerPath,
@@ -173,6 +174,58 @@ describe('migration state machine — §4.8.3 / §4.8.3a', () => {
       assert.deepEqual(retired, h.originalBytes, '.pre-qlb is byte-identical to original');
       const owner = JSON.parse(readFileSync(h.ownerPath, 'utf8')) as { owner: string };
       assert.equal(owner.owner, 'qlb');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('refuses pool stage when OpenRouter has committed a v2 owner map, leaving it byte-identical', async () => {
+    const h = setup();
+    try {
+      const openrouter = createStaticKeyMigration(
+        h.store,
+        h.kc,
+        'openrouter',
+        h.ownerPath,
+        () => 'test-openrouter-key',
+      );
+      openrouter.stage();
+      await openrouter.rehearse(async () => ({ ok: true }));
+      openrouter.commit();
+      const before = readFileSync(h.ownerPath);
+
+      assert.throws(() => h.mig.stage(), /owner-map-present: anthropic pool migration waits for P7b8/);
+
+      assert.deepEqual(readFileSync(h.ownerPath), before);
+      assert.equal(existsSync(stagingOwnerPath(h.ownerPath)), false, 'stage must not create staging');
+      assert.equal(qlbWorks(h.kc), false, 'stage must not write Keychain credentials');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('refuses pool commit when a v2 owner map appears after stage, leaving the map and staging intact', async () => {
+    const h = setup();
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      const openrouter = createStaticKeyMigration(
+        h.store,
+        h.kc,
+        'openrouter',
+        h.ownerPath,
+        () => 'test-openrouter-key',
+      );
+      openrouter.stage();
+      await openrouter.rehearse(async () => ({ ok: true }));
+      openrouter.commit();
+      const before = readFileSync(h.ownerPath);
+
+      assert.throws(() => h.mig.commit(), /owner-map-present: anthropic pool migration waits for P7b8/);
+
+      assert.deepEqual(readFileSync(h.ownerPath), before);
+      assert.equal(existsSync(stagingOwnerPath(h.ownerPath)), true, 'commit must leave staging for rollback');
+      assert.equal(existsSync(h.poolPath), true, 'commit must not retire the native pool');
     } finally {
       h.cleanup();
     }

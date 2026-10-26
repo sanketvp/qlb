@@ -476,18 +476,27 @@ describe('static-key migration — openrouter (single API key, no OAuth)', () =>
     }
   });
 
-  it('rollback of a legacy sidecar-owned openrouter unlinks the sidecar and journals VALIDATED', () => {
+  it('rolls back a legacy-coordinate OpenRouter credential without leaving either Keychain item', () => {
     const h = setupOpenRouter();
     try {
       const legacyPath = join(h.dir, 'qlb-owner-openrouter.json');
+      const legacyService = qlbKeychainService('openrouter', OPENROUTER_ID);
       writeFileSync(legacyPath, JSON.stringify({ owner: 'qlb', accounts: [{ provider: 'openrouter' }] }) + '\n');
+      h.kc.setSync(
+        legacyService,
+        OPENROUTER_LABEL,
+        JSON.stringify({ type: 'api-key', access: FAKE_OPENROUTER_KEY }),
+      );
       h.store.upsertMigration('pi-openrouter', 'QLB_OWNED', '{}');
 
+      assert.equal(h.mig.status().piAtNextLaunch, 'QLB works', 'status recognizes the legacy credential');
       const rolled = h.mig.rollback();
 
       assert.equal(rolled.state, 'VALIDATED');
       assert.equal(rolled.ownerFile, 'absent');
       assert.equal(existsSync(legacyPath), false);
+      assert.equal(openrouterKeychainHas(h.kc), false, 'gate coordinates remain absent');
+      assert.throws(() => h.kc.getSync(legacyService, OPENROUTER_LABEL), /not found/i);
     } finally {
       h.cleanup();
     }
