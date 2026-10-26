@@ -189,32 +189,63 @@ export class CodexSlots {
     }
   }
 
-  /** Adopt only an indexed successor whose consumed lineage is still current. */
-  async adoptStashedSuccessor(
+  /**
+   * Finds, but deliberately does not delete, a successor whose predecessor is
+   * the supplied current lineage. The C10 metadata transaction owns the slot
+   * write; only its successful commit may make this recovery body disposable.
+   */
+  async findStashedSuccessor(
     accountId: string,
-    restore: (document: CodexAuthDocument) => void | Promise<void>,
-  ): Promise<boolean> {
-    const current = this.readSlot(accountId, { fresh: true });
+    consumedFp: string,
+  ): Promise<{ stashId: string; document: CodexAuthDocument; consumedFp: string } | null> {
     let entries: UnclaimedIndexEntry[];
     try { entries = await listStashes(this.stashRoot(), PROVIDER, accountId); } catch {
       throw new Error('unclaimed credential unavailable');
     }
     for (const entry of entries) {
-      if (entry.consumedFp !== current.fingerprint) continue;
-      const stashed = await this.readDurableUnclaimed(entry.stashId);
-      if (!stashed.consumedFp || stashed.consumedFp !== current.fingerprint) continue;
-      await restore(stashed.document);
+      if (entry.consumedFp !== consumedFp) continue;
+      let stashed: ReadUnclaimedCodexSlot;
       try {
-        this.options.keychain.deleteSync(this.unclaimedService(entry.stashId), QLB_KEYCHAIN_ACCOUNT);
+        stashed = await this.readDurableUnclaimed(entry.stashId);
       } catch (error) {
-        if (!isCredentialNotFound(error)) throw new Error('unable to remove unclaimed credential');
+        // An index reservation with no Keychain or fallback body cannot be
+        // adopted. Drop only that non-secret row so a later refresh can mark
+        // the spent predecessor dead instead of reporting transient forever.
+        if (error instanceof Error && /unclaimed credential not found/.test(error.message)) {
+          try { await removeStash(this.stashRoot(), entry); } catch { /* retry cleanup later */ }
+          continue;
+        }
+        throw error;
       }
-      await rm(this.unclaimedFile(entry.stashId), { force: true });
-      await removeStash(this.stashRoot(), entry);
-      this.cache.clear();
-      return true;
+      if (!stashed.consumedFp || stashed.consumedFp !== consumedFp) continue;
+      return { stashId: entry.stashId, document: stashed.document, consumedFp: stashed.consumedFp };
     }
-    return false;
+    return null;
+  }
+
+  /** Delete a recovery body and its non-secret index only after DB commit. */
+  async removeStashedSuccessor(stashId: string): Promise<void> {
+    try {
+      this.options.keychain.deleteSync(this.unclaimedService(stashId), QLB_KEYCHAIN_ACCOUNT);
+    } catch (error) {
+      if (!isCredentialNotFound(error)) throw new Error('unable to remove unclaimed credential');
+    }
+    await rm(this.unclaimedFile(stashId), { force: true });
+    await removeStash(this.stashRoot(), { provider: PROVIDER, stashId });
+    this.cache.clear();
+  }
+
+  /** Legacy helper retained for pure callers; C10 consume uses find/remove. */
+  async adoptStashedSuccessor(
+    accountId: string,
+    restore: (document: CodexAuthDocument) => void | Promise<void>,
+  ): Promise<boolean> {
+    const current = this.readSlot(accountId, { fresh: true });
+    const stashed = await this.findStashedSuccessor(accountId, current.fingerprint);
+    if (!stashed) return false;
+    await restore(stashed.document);
+    await this.removeStashedSuccessor(stashed.stashId);
+    return true;
   }
 
   private readService(service: string, fresh: boolean): ReadCodexSlot {

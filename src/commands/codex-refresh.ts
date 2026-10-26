@@ -10,7 +10,7 @@ import {
 import { codexIdentity } from '../codex-auth';
 import { list, renewers, type CodexLiveObservation, type CodexSwitchLogRow } from '../codex-sessions';
 import { CodexSlots } from '../codex-slots';
-import { withProperLockfile } from '../cc-locks';
+import { ClaudeCodeLockTimeout, withProperLockfile } from '../cc-locks';
 import { platformKeychain } from '../keychain';
 import { openStore, type Store } from '../store';
 import type { CommandContext, CommandDefinition } from '../registry';
@@ -82,8 +82,10 @@ export async function runCodexRefreshCommand(args: string[], deps: CodexRefreshC
   if (result.status === 'successor-unpersisted') {
     error('codex refresh failed: successor-unpersisted');
   }
-  return result.status === 'refreshed' || result.status === 'fresh' || result.status === 'codex-won-inactive' ? 0
-    : result.status === 'c9-unavailable' ? 3 : 1;
+  if (result.status === 'c9-unavailable' || result.status === 'active-slot') return 3;
+  // S47's receipt exists only after the forced POST committed with its metadata.
+  if (parsed.c9) return result.status === 'refreshed' ? 0 : 1;
+  return result.status === 'refreshed' || result.status === 'fresh' || result.status === 'codex-won-inactive' ? 0 : 1;
 }
 
 function withHistory<T>(store: Pick<Store, 'dbPath'>, fn: (db: DatabaseSync) => T): T {
@@ -155,7 +157,7 @@ async function execute(args: string[], ctx: CommandContext): Promise<number> {
         // C6 and C10 share this provider lock for every read/CAS/write. The
         // consume lock additionally ensures only one process can spend a slot.
         const locks = join(dirname(store.dbPath), 'locks');
-        const consumeLock = join(locks, `consume-openai-codex-${accountId}.lock`);
+        const consumeLock = join(locks, `consume-openai-codex-${encodeURIComponent(accountId)}.lock`);
         const switchLock = join(locks, 'switch-openai-codex.lock');
         try {
           return await withProperLockfile(consumeLock, { timeoutMs: 10_000 }, async () =>
@@ -180,8 +182,11 @@ async function execute(args: string[], ctx: CommandContext): Promise<number> {
                 },
               });
             }));
-        } catch {
-          return { status: 'busy' };
+        } catch (error) {
+          // `busy` means no consume work ran. Do not hide a post-POST
+          // persistence failure behind lock contention.
+          if (error instanceof ClaudeCodeLockTimeout) return { status: 'busy' };
+          throw error;
         }
       },
     });

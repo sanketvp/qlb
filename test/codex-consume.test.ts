@@ -1,10 +1,18 @@
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { describe, it } from 'node:test';
 
 import { consumeCodexSlot } from '../src/codex-consume';
 import { runCodexRefreshCommand } from '../src/commands/codex-refresh';
 import { codexFingerprint, type CodexAuthDocument } from '../src/codex-auth';
 import type { CodexProcess } from '../src/codex-sessions';
+import { CodexSlots, importActiveCodexSlot } from '../src/codex-slots';
+import { MockKeychain } from '../src/keychain';
+import { openStore } from '../src/store';
+import { listStashes } from '../src/unclaimed-index';
 
 function jwt(payload: Record<string, unknown>): string {
   return `eyJhbGciOiJub25lIn0.${Buffer.from(JSON.stringify(payload)).toString('base64url')}.sig`;
@@ -37,6 +45,18 @@ function slots(initial: CodexAuthDocument) {
 }
 
 const holder: CodexProcess = { pid: 741, lstart: 'Fri Oct 24 12:00:00 2026', host: 'codex' };
+
+function managedFixture() {
+  const home = mkdtempSync(join(tmpdir(), 'qlb-codex-consume-'));
+  const store = openStore(join(home, 'qlb.db'));
+  const keychain = new MockKeychain();
+  const initial = document('refresh-a', 'access-a');
+  const plan = importActiveCodexSlot(initial, { store, keychain, now: () => 1 });
+  return {
+    home, store, keychain, plan, initial,
+    slots: new CodexSlots({ keychain, stashDir: join(home, 'unclaimed'), now: () => 1 }),
+  };
+}
 
 describe('Codex consume gate — AC34', () => {
   it('does not POST when an S12 holder may renew the inactive slot', async () => {
@@ -175,6 +195,143 @@ describe('Codex consume gate — AC34', () => {
       transport: async () => ({ status: 400, body: JSON.stringify({ error: 'refresh_token_reused' }) }),
     });
     assert.equal(result.status, 'dead');
+  });
+
+  it('repairs a Keychain successor that descends from the recorded row before its next POST', async () => {
+    const h = managedFixture();
+    try {
+      const successor = document('refresh-b', 'access-b');
+      h.slots.writeSlot(h.plan.slotId, successor, h.initial);
+      let posts = 0;
+      const result = await consumeCodexSlot({
+        accountId: h.plan.slotId, snapshot: successor, trigger: 'force', force: true,
+        slots: h.slots, store: h.store, holders: async () => [], now: () => 2,
+        transport: async () => {
+          posts += 1;
+          return { status: 200, body: JSON.stringify({ refresh_token: 'refresh-c', access_token: 'access-c' }) };
+        },
+      });
+      assert.equal(result.status, 'refreshed');
+      assert.equal(posts, 1);
+      const db = new DatabaseSync(h.store.dbPath, { readOnly: true });
+      try {
+        const row = db.prepare('SELECT fingerprint FROM codex_slots WHERE account_id = ?').get(h.plan.slotId) as { fingerprint: string };
+        assert.equal(row.fingerprint, codexFingerprint(h.slots.readSlot(h.plan.slotId, { fresh: true }).document));
+      } finally { db.close(); }
+    } finally {
+      h.store.close();
+      rmSync(h.home, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps an adoption stash when its metadata CAS cannot commit', async () => {
+    const h = managedFixture();
+    try {
+      const successor = document('refresh-b', 'access-b');
+      await h.slots.stashUnclaimedDurably('adoption-stash', successor, codexFingerprint(h.initial), h.plan.slotId);
+      (h.store as unknown as { db: DatabaseSync }).db.exec(`CREATE TRIGGER reject_adoption
+        BEFORE UPDATE OF fingerprint ON codex_slots WHEN NEW.fingerprint = '${codexFingerprint(successor)}'
+        BEGIN SELECT RAISE(FAIL, 'fixture metadata failure'); END;`);
+      const result = await consumeCodexSlot({
+        accountId: h.plan.slotId, snapshot: h.initial, trigger: 'scheduled', slots: h.slots, store: h.store,
+        holders: async () => [], now: () => 2,
+        transport: async () => { throw new Error('must not POST while adoption is unresolved'); },
+      });
+      assert.equal(result.status, 'stashed');
+      assert.equal((await listStashes(join(h.home, 'unclaimed'), 'openai-codex', h.plan.slotId)).length, 1);
+    } finally {
+      h.store.close();
+      rmSync(h.home, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses an unrelated Keychain/metadata split without POSTing', async () => {
+    const h = managedFixture();
+    try {
+      h.slots.writeSlot(h.plan.slotId, document('refresh-foreign', 'access-foreign'), document('refresh-unrelated', 'access-unrelated'));
+      let posts = 0;
+      const result = await consumeCodexSlot({
+        accountId: h.plan.slotId, snapshot: h.initial, trigger: 'force', force: true,
+        slots: h.slots, store: h.store, holders: async () => [], now: () => 2,
+        transport: async () => { posts += 1; return { status: 500, body: '{}' }; },
+      });
+      assert.equal(result.status, 'slot-split');
+      assert.equal(posts, 0);
+    } finally {
+      h.store.close();
+      rmSync(h.home, { recursive: true, force: true });
+    }
+  });
+
+  it('adopts a stashed successor after one metadata failure, then refreshes again without wedging', async () => {
+    const h = managedFixture();
+    try {
+      (h.store as unknown as { db: DatabaseSync }).db.exec(`CREATE TRIGGER reject_post_once
+        BEFORE UPDATE OF fingerprint ON codex_slots WHEN NEW.fingerprint != OLD.fingerprint
+        BEGIN SELECT RAISE(FAIL, 'fixture metadata failure'); END;`);
+      let posts = 0;
+      const refresh = async () => consumeCodexSlot({
+        accountId: h.plan.slotId, snapshot: h.slots.readSlot(h.plan.slotId, { fresh: true }).document,
+        trigger: 'force', force: true, slots: h.slots, store: h.store, holders: async () => [], now: () => 2,
+        transport: async () => {
+          posts += 1;
+          return { status: 200, body: JSON.stringify({ refresh_token: `refresh-${String.fromCharCode(97 + posts)}`, access_token: `access-${posts}` }) };
+        },
+      });
+      assert.equal((await refresh()).status, 'stashed');
+      (h.store as unknown as { db: DatabaseSync }).db.exec('DROP TRIGGER reject_post_once');
+      assert.equal((await refresh()).status, 'fresh');
+      assert.equal((await refresh()).status, 'refreshed');
+      assert.equal(posts, 2);
+    } finally {
+      h.store.close();
+      rmSync(h.home, { recursive: true, force: true });
+    }
+  });
+
+  it('leaves the issued successor in the managed slot when its recovery stash fails', async () => {
+    const h = managedFixture();
+    try {
+      (h.store as unknown as { db: DatabaseSync }).db.exec(`CREATE TRIGGER reject_post
+        BEFORE UPDATE OF fingerprint ON codex_slots WHEN NEW.fingerprint != OLD.fingerprint
+        BEGIN SELECT RAISE(FAIL, 'fixture metadata failure'); END;`);
+      const failingSlots = {
+        readSlot: h.slots.readSlot.bind(h.slots),
+        writeSlot: h.slots.writeSlot.bind(h.slots),
+        stashUnclaimed: h.slots.stashUnclaimed.bind(h.slots),
+        stashUnclaimedDurably: async () => { throw new Error('fixture stash failure'); },
+      };
+      const result = await consumeCodexSlot({
+        accountId: h.plan.slotId, snapshot: h.initial, trigger: 'force', force: true,
+        slots: failingSlots, store: h.store, holders: async () => [], now: () => 2,
+        transport: async () => ({ status: 200, body: JSON.stringify({ refresh_token: 'refresh-b', access_token: 'access-b' }) }),
+      });
+      assert.equal(result.status, 'successor-unpersisted');
+      assert.equal(codexFingerprint(h.slots.readSlot(h.plan.slotId, { fresh: true }).document), codexFingerprint(document('refresh-b', 'access-b')));
+    } finally {
+      h.store.close();
+      rmSync(h.home, { recursive: true, force: true });
+    }
+  });
+
+  it('rolls back the C9 receipt with a failed post metadata transaction', async () => {
+    const h = managedFixture();
+    try {
+      (h.store as unknown as { db: DatabaseSync }).db.exec(`CREATE TRIGGER reject_c9
+        BEFORE UPDATE OF fingerprint ON codex_slots WHEN NEW.fingerprint != OLD.fingerprint
+        BEGIN SELECT RAISE(FAIL, 'fixture metadata failure'); END;`);
+      const result = await consumeCodexSlot({
+        accountId: h.plan.slotId, snapshot: h.initial, trigger: 'force', force: true, allowHeld: true,
+        slots: h.slots, store: h.store, holders: async () => [], now: () => 2,
+        transport: async () => ({ status: 200, body: JSON.stringify({ refresh_token: 'refresh-b', access_token: 'access-b' }) }),
+      });
+      assert.equal(result.status, 'stashed');
+      assert.equal(h.store.getConfig('codex.l13VerifiedAt'), null);
+      assert.equal(codexFingerprint(h.slots.readSlot(h.plan.slotId, { fresh: true }).document), codexFingerprint(h.initial));
+    } finally {
+      h.store.close();
+      rmSync(h.home, { recursive: true, force: true });
+    }
   });
 
   it('refuses a forced refresh of the active Codex slot', async () => {
