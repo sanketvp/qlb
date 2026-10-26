@@ -53,6 +53,21 @@ export interface SlotLineageRow {
   prev_fingerprint: string | null;
 }
 
+/** Read-only anthropic slot view used by the Pi pool inventory. */
+export interface AnthropicSlotLineageRow {
+  accountId: string;
+  fingerprint: string | null;
+}
+
+/** S61's durable undo-export mapping for an anthropic-pool entry. */
+export interface PiExportTargetRow {
+  provider: string;
+  target: string;
+  slotAccountId: string;
+  lineageFp: string;
+  recordedAt: number;
+}
+
 /** Credential-migration journal (§4.8.3). One row per native store. */
 export interface MigrationRow {
   store: string;
@@ -2010,6 +2025,32 @@ export class Store {
     if (!table) return null;
     const row = this.db.prepare(`SELECT fingerprint, prev_fingerprint FROM ${table} WHERE account_id = ?`).get(accountId);
     return (row as SlotLineageRow | undefined) ?? null;
+  }
+
+  // --- P11 pool-inventory additions (S61) ---------------------------------
+
+  listAnthropicSlotLineages(): AnthropicSlotLineageRow[] {
+    return this.db.prepare('SELECT account_id AS accountId, fingerprint FROM claude_slots ORDER BY account_id')
+      .all() as unknown as AnthropicSlotLineageRow[];
+  }
+
+  /** Replace one provider's observed export targets as a single write transaction. */
+  replacePiExportTargets(provider: string, targets: PiExportTargetRow[]): void {
+    this.runImmediate(() => {
+      this.db.prepare('DELETE FROM pi_export_targets WHERE provider = ?').run(provider);
+      const insert = this.db.prepare(`INSERT INTO pi_export_targets
+        (provider, target, slot_account_id, lineage_fp, recorded_at) VALUES (?, ?, ?, ?, ?)`);
+      for (const target of targets) {
+        if (target.provider !== provider) throw new Error('pi export target provider mismatch');
+        insert.run(target.provider, target.target, target.slotAccountId, target.lineageFp, target.recordedAt);
+      }
+    });
+  }
+
+  listPiExportTargets(provider: string): PiExportTargetRow[] {
+    return this.db.prepare(`SELECT provider, target, slot_account_id AS slotAccountId,
+      lineage_fp AS lineageFp, recorded_at AS recordedAt FROM pi_export_targets
+      WHERE provider = ? ORDER BY target`).all(provider) as unknown as PiExportTargetRow[];
   }
 
   recordRelogin(row: { ts?: number; provider: string; accountId?: string | null; kind: string; detail?: string | null; evidence?: string | null; userDeniedAt?: number | null }): number {
