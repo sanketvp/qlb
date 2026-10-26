@@ -73,6 +73,24 @@ export interface LineageAppend {
 type RollbackHook = () => Promise<void> | void;
 type RegisterRollback = (hook: RollbackHook) => void;
 
+export interface ImportRunRecord {
+  runId: string;
+  startedAt: number;
+  committedAt: number | null;
+}
+
+/** K10's single-transaction destination write; credential effects stay outside SQLite. */
+export interface CswapImportCommit {
+  runId: string;
+  startedAt: number;
+  committedAt: number;
+  slots: Array<{ slot: ClaudeSlot; lineageFrom: string | null }>;
+  activeAccountId: string | null;
+  /** Imported read-only C-swap measurements; no synthetic usage rows. */
+  snapshots?: Array<{ accountId: string; bucket: string; usedPct: number; fetchedAt: number }>;
+  config?: Record<string, string>;
+}
+
 export interface ClaudeSlotRepository {
   getSlot(accountId: string): ClaudeSlot | null;
   listSlots(): ClaudeSlot[];
@@ -83,6 +101,10 @@ export interface ClaudeSlotRepository {
   createSlotWithLineage(slot: ClaudeSlot, lineage: LineageAppend): void;
   updateCredentialWithLineage(accountId: string, expectedFingerprint: string | null, fingerprint: string, prevFingerprint: string | null, lineage: LineageAppend | null): void;
   removeSlotWithGeneration(accountId: string): void;
+  /** K10: commits import_runs, slot metadata, accounts, active_login, snapshots, and lineage together. */
+  commitCswapImport(input: CswapImportCommit): void;
+  /** S62's committed-side crash-recovery authority. */
+  getImportRun(runId: string): ImportRunRecord | null;
   currentGeneration(): number;
 }
 
@@ -94,6 +116,8 @@ function cloneSlot(slot: ClaudeSlot): ClaudeSlot {
 export class InMemoryClaudeSlotRepository implements ClaudeSlotRepository {
   private readonly slots = new Map<string, ClaudeSlot>();
   readonly transitions: LineageAppend[] = [];
+  readonly importCommits: CswapImportCommit[] = [];
+  private readonly importRuns = new Map<string, ImportRunRecord>();
   generation = 0;
 
   getSlot(accountId: string): ClaudeSlot | null {
@@ -146,6 +170,25 @@ export class InMemoryClaudeSlotRepository implements ClaudeSlotRepository {
   removeSlotWithGeneration(accountId: string): void {
     this.slots.delete(accountId);
     this.generation += 1;
+  }
+
+  commitCswapImport(input: CswapImportCommit): void {
+    if (this.importRuns.has(input.runId)) throw new Error('import run already exists');
+    for (const { slot, lineageFrom } of input.slots) {
+      this.slots.set(slot.accountId, cloneSlot(slot));
+      this.transitions.push({
+        ts: input.committedAt, provider: ANTHROPIC_PROVIDER, accountId: slot.accountId,
+        fromFp: lineageFrom, toFp: slot.fingerprint!, cause: 'import', by: 'qlb-cli', evidence: 'import',
+      });
+    }
+    this.importRuns.set(input.runId, { runId: input.runId, startedAt: input.startedAt, committedAt: input.committedAt });
+    this.importCommits.push({ ...input, slots: input.slots.map(({ slot, lineageFrom }) => ({ slot: cloneSlot(slot), lineageFrom })) });
+    this.generation += 1;
+  }
+
+  getImportRun(runId: string): ImportRunRecord | null {
+    const row = this.importRuns.get(runId);
+    return row ? { ...row } : null;
   }
 
   currentGeneration(): number {
@@ -254,6 +297,61 @@ export class SqliteClaudeSlotRepository implements ClaudeSlotRepository {
       this.db.prepare('DELETE FROM claude_slots WHERE account_id = ?').run(accountId);
       this.bumpGenerationInTransaction();
     });
+  }
+
+  // K10 additions: deliberately self-contained so concurrent slices can merge this block intact.
+  commitCswapImport(input: CswapImportCommit): void {
+    this.transaction(() => {
+      for (const { slot, lineageFrom } of input.slots) {
+        this.db.prepare(`INSERT INTO claude_slots (account_id, slot_num, email, alias, org_uuid, config_json,
+          fingerprint, prev_fingerprint, threshold, dead, dead_reason, dead_at, healed_at,
+          added_at, last_active_at, source, archived_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, NULL, ?, ?, 'cswap-import', NULL)
+          ON CONFLICT(account_id) DO UPDATE SET slot_num = excluded.slot_num, email = excluded.email,
+          alias = excluded.alias, org_uuid = excluded.org_uuid, config_json = excluded.config_json,
+          fingerprint = excluded.fingerprint, prev_fingerprint = excluded.prev_fingerprint,
+          threshold = excluded.threshold, dead = 0, dead_reason = NULL, dead_at = NULL,
+          source = excluded.source, archived_at = NULL`).run(
+          slot.accountId, slot.slotNum ?? null, slot.email ?? null, slot.alias ?? null, slot.orgUuid ?? null,
+          slot.configJson ?? '{}', slot.fingerprint, slot.prevFingerprint, slot.threshold ?? null,
+          slot.addedAt, slot.lastActiveAt ?? null,
+        );
+        this.db.prepare(`INSERT INTO accounts (id, provider, label, status, created_at)
+          VALUES (?, 'anthropic', ?, 'active', ?)
+          ON CONFLICT(id) DO UPDATE SET provider = excluded.provider, label = excluded.label, status = excluded.status`)
+          .run(slot.accountId, slot.email ?? slot.accountId, input.committedAt);
+        this.appendLineage({
+          ts: input.committedAt, provider: ANTHROPIC_PROVIDER, accountId: slot.accountId,
+          fromFp: lineageFrom, toFp: slot.fingerprint!, cause: 'import', by: 'qlb-cli', evidence: 'import',
+        });
+      }
+      for (const snapshot of input.snapshots ?? []) {
+        this.db.prepare(`INSERT INTO snapshots (account_id, bucket, used_pct, used, limit_val, remaining, reset_at, fetched_at, source, confidence)
+          VALUES (?, ?, ?, NULL, NULL, NULL, NULL, ?, 'cswap-import', 'unknown')
+          ON CONFLICT(account_id, bucket) DO UPDATE SET used_pct = excluded.used_pct, fetched_at = excluded.fetched_at,
+          source = excluded.source, confidence = excluded.confidence WHERE excluded.fetched_at > snapshots.fetched_at`)
+          .run(snapshot.accountId, snapshot.bucket, snapshot.usedPct, snapshot.fetchedAt);
+      }
+      if (input.activeAccountId) {
+        this.db.prepare(`INSERT INTO active_login (provider, account_id, since, set_by) VALUES ('anthropic', ?, ?, 'import')
+          ON CONFLICT(provider) DO UPDATE SET account_id = excluded.account_id, since = excluded.since, set_by = excluded.set_by`)
+          .run(input.activeAccountId, input.committedAt);
+      }
+      for (const [key, value] of Object.entries(input.config ?? {})) {
+        this.db.prepare(`INSERT INTO config (key, value) VALUES (?, ?)
+          ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(key, value);
+      }
+      this.db.prepare('INSERT INTO import_runs (run_id, started_at, committed_at) VALUES (?, ?, ?)')
+        .run(input.runId, input.startedAt, input.committedAt);
+      this.bumpGenerationInTransaction();
+    });
+  }
+
+  getImportRun(runId: string): ImportRunRecord | null {
+    const row = this.db.prepare('SELECT run_id, started_at, committed_at FROM import_runs WHERE run_id = ?').get(runId) as {
+      run_id: string; started_at: number; committed_at: number | null;
+    } | undefined;
+    return row ? { runId: row.run_id, startedAt: row.started_at, committedAt: row.committed_at } : null;
   }
 
   currentGeneration(): number {
