@@ -33,6 +33,63 @@ export class ClaudeCodeLockTimeout extends Error {
   }
 }
 
+const credentialLocksHandle = Symbol('credential-locks-handle');
+const configLockHandle = Symbol('config-lock-handle');
+
+/** Opaque capability, valid only while withClaudeCredentialLocks invokes its callback. */
+export interface HeldClaudeCredentialLocks {
+  readonly [credentialLocksHandle]: true;
+}
+/** Opaque capability, valid only while withClaudeConfigLock invokes its callback. */
+export interface HeldClaudeConfigLock {
+  readonly [configLockHandle]: true;
+}
+
+const activeCredentialLockHandles = new WeakSet<HeldClaudeCredentialLocks>();
+const activeConfigLockHandles = new WeakSet<HeldClaudeConfigLock>();
+const activeCredentialLockPaths = new WeakMap<HeldClaudeCredentialLocks, ClaudeLockPaths>();
+const activeConfigLockPaths = new WeakMap<HeldClaudeConfigLock, ClaudeLockPaths>();
+
+export class ClaudeCredentialLocksRequired extends Error {
+  constructor() {
+    super('Claude credential locks must be held by the caller');
+    this.name = 'ClaudeCredentialLocksRequired';
+  }
+}
+
+export class ClaudeConfigLockRequired extends Error {
+  constructor() {
+    super('Claude config lock must be held by the caller');
+    this.name = 'ClaudeConfigLockRequired';
+  }
+}
+
+/** Fail fast unless this callback's active credential-lock capability was supplied. */
+export function assertClaudeCredentialLocksHeld(
+  handle: HeldClaudeCredentialLocks | undefined,
+  options: ClaudeLockOptions = {},
+): asserts handle is HeldClaudeCredentialLocks {
+  const expected = claudeLockPaths(options);
+  const heldPaths = handle && activeCredentialLockPaths.get(handle);
+  if (!handle || !activeCredentialLockHandles.has(handle) ||
+    heldPaths?.oauthRefreshLockDir !== expected.oauthRefreshLockDir ||
+    heldPaths?.credentialsLockDir !== expected.credentialsLockDir) {
+    throw new ClaudeCredentialLocksRequired();
+  }
+}
+
+/** Fail fast unless this callback's active config-lock capability was supplied. */
+export function assertClaudeConfigLockHeld(
+  handle: HeldClaudeConfigLock | undefined,
+  options: ClaudeLockOptions = {},
+): asserts handle is HeldClaudeConfigLock {
+  const expected = claudeLockPaths(options);
+  const heldPaths = handle && activeConfigLockPaths.get(handle);
+  if (!handle || !activeConfigLockHandles.has(handle) || heldPaths?.configLockDir !== expected.configLockDir) {
+    throw new ClaudeConfigLockRequired();
+  }
+}
+
 /**
  * Location inputs deliberately make all lock operations testable without using a real home.
  * `configDir` takes precedence over `env.CLAUDE_CONFIG_DIR`, as an explicit test/caller input.
@@ -245,21 +302,41 @@ export async function withProperLockfile<T>(
  */
 export async function withClaudeCredentialLocks<T>(
   options: ClaudeLockOptions = {},
-  fn: () => Promise<T> | T,
+  fn: (held: HeldClaudeCredentialLocks) => Promise<T> | T,
 ): Promise<T> {
   const paths = claudeLockPaths(options);
   const credentialOptions = { ...options, stalenessMs: CREDENTIALS_STALENESS_MS };
   return withProperLockfile(paths.oauthRefreshLockDir, credentialOptions, async () =>
-    withProperLockfile(paths.credentialsLockDir, credentialOptions, fn));
+    withProperLockfile(paths.credentialsLockDir, credentialOptions, async () => {
+      const held = { [credentialLocksHandle]: true } as HeldClaudeCredentialLocks;
+      activeCredentialLockHandles.add(held);
+      activeCredentialLockPaths.set(held, paths);
+      try {
+        return await fn(held);
+      } finally {
+        activeCredentialLockHandles.delete(held);
+        activeCredentialLockPaths.delete(held);
+      }
+    }));
 }
 
 /** Hold Claude Code's global-config proper-lockfile directory for a local read-modify-write. */
 export async function withClaudeConfigLock<T>(
   options: ClaudeLockOptions = {},
-  fn: () => Promise<T> | T,
+  fn: (held: HeldClaudeConfigLock) => Promise<T> | T,
 ): Promise<T> {
   return withProperLockfile(claudeLockPaths(options).configLockDir, {
     ...options,
     stalenessMs: CONFIG_STALENESS_MS,
-  }, fn);
+  }, async () => {
+    const held = { [configLockHandle]: true } as HeldClaudeConfigLock;
+    activeConfigLockHandles.add(held);
+    activeConfigLockPaths.set(held, claudeLockPaths(options));
+    try {
+      return await fn(held);
+    } finally {
+      activeConfigLockHandles.delete(held);
+      activeConfigLockPaths.delete(held);
+    }
+  });
 }

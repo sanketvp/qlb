@@ -6,15 +6,19 @@ import { describe, it } from 'node:test';
 
 import {
   ClaudeConfigFileError,
+  ClaudeConfigLockRequired,
+  ClaudeCredentialLocksRequired,
   InMemoryCredentialBackend,
   mergeSharedCredentialFields,
+  publishLiveClaudeCredentialsLocked,
   readClaudeConfig,
   rewriteCredentialsFileIfPresent,
   sharedCredentialFields,
   spliceOauthAccount,
+  spliceOauthAccountLocked,
   writeLiveClaudeCredentials,
 } from '../src/cc-credentials';
-import { claudeLockPaths } from '../src/cc-locks';
+import { claudeLockPaths, withClaudeConfigLock, withClaudeCredentialLocks } from '../src/cc-locks';
 import { claudePaths } from '../src/cc-paths';
 
 function fixtureHome(): string {
@@ -52,7 +56,7 @@ describe('Claude Code credentials', () => {
     const path = join(home, '.claude.json');
     const lockPath = claudeLockPaths({ configDir: home, env: {} }).configLockDir;
     writeFileSync(path, JSON.stringify({ keep: { nested: true }, oauthAccount: { accountUuid: 'old' } }));
-    await spliceOauthAccount(path, { accountUuid: 'new', emailAddress: 'fixture@example.invalid' }, {
+    await spliceOauthAccountLocked(path, { accountUuid: 'new', emailAddress: 'fixture@example.invalid' }, {
       writeText: (target, text) => {
         assert.equal(existsSync(lockPath), true, 'config lock is held across the read-modify-write');
         writeFileSync(target, text, { mode: 0o600 });
@@ -68,7 +72,7 @@ describe('Claude Code credentials', () => {
     const home = fixtureHome();
     const path = join(home, '.claude.json');
     writeFileSync(path, '{not json');
-    await assert.rejects(Promise.resolve().then(() => spliceOauthAccount(path, { accountUuid: 'new' })), ClaudeConfigFileError);
+    await assert.rejects(Promise.resolve().then(() => spliceOauthAccountLocked(path, { accountUuid: 'new' })), ClaudeConfigFileError);
     assert.equal(readFileSync(path, 'utf8'), '{not json');
   });
 
@@ -103,7 +107,7 @@ describe('Claude Code credentials', () => {
     writeFileSync(paths.credentialsPath, oauth('old', 'old'));
     const backend = new InMemoryCredentialBackend();
 
-    await writeLiveClaudeCredentials(oauth('new', 'new'), {
+    await publishLiveClaudeCredentialsLocked(oauth('new', 'new'), {
       paths,
       backend,
       account: 'fixture-user',
@@ -134,7 +138,7 @@ describe('Claude Code credentials', () => {
       deleteSync(): void {},
     };
 
-    await writeLiveClaudeCredentials(oauth('new', 'new'), {
+    await publishLiveClaudeCredentialsLocked(oauth('new', 'new'), {
       paths,
       backend,
       account: 'fixture-user',
@@ -144,5 +148,49 @@ describe('Claude Code credentials', () => {
       },
     });
     assert.equal(stored, oauth('new', 'new'));
+  });
+
+  it('publishes promptly inside caller-held credential locks', async () => {
+    const home = fixtureHome();
+    const configHome = join(home, '.claude');
+    mkdirSync(configHome);
+    const paths = claudePaths({ home, env: {} });
+    const backend = new InMemoryCredentialBackend();
+
+    await withClaudeCredentialLocks({ configDir: configHome, env: {} }, async (heldLocks) => {
+      await writeLiveClaudeCredentials(oauth('new', 'new'), {
+        paths,
+        backend,
+        account: 'fixture-user',
+      }, heldLocks);
+    });
+    assert.equal(await backend.get(paths.keychainService, 'fixture-user'), oauth('new', 'new'));
+  });
+
+  it('fails fast when a core credential publish lacks caller-held locks', async () => {
+    const home = fixtureHome();
+    const configHome = join(home, '.claude');
+    mkdirSync(configHome);
+    const paths = claudePaths({ home, env: {} });
+    const backend = new InMemoryCredentialBackend();
+
+    await assert.rejects(
+      writeLiveClaudeCredentials(oauth('new', 'new'), { paths, backend, account: 'fixture-user' }, undefined),
+      ClaudeCredentialLocksRequired,
+    );
+  });
+
+  it('splices promptly inside caller-held config lock and fails fast without one', async () => {
+    const home = fixtureHome();
+    const path = join(home, '.claude.json');
+    writeFileSync(path, JSON.stringify({ oauthAccount: { accountUuid: 'old' } }));
+
+    await withClaudeConfigLock({ configDir: home, env: {} }, async (heldLock) => {
+      await spliceOauthAccount(path, { accountUuid: 'new' }, heldLock);
+    });
+    await assert.rejects(
+      spliceOauthAccount(path, { accountUuid: 'new' }, undefined),
+      ClaudeConfigLockRequired,
+    );
   });
 });

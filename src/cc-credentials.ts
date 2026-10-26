@@ -7,7 +7,15 @@
 
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { withClaudeConfigLock, withClaudeCredentialLocks } from './cc-locks';
+import {
+  assertClaudeConfigLockHeld,
+  assertClaudeCredentialLocksHeld,
+  type HeldClaudeConfigLock,
+  type HeldClaudeCredentialLocks,
+  withClaudeConfigLock,
+  withClaudeCredentialLocks,
+} from './cc-locks';
+export { ClaudeConfigLockRequired, ClaudeCredentialLocksRequired } from './cc-locks';
 import { atomicWriteText } from './fsutil';
 import { macosKeychainAccountName } from './keychain';
 import { type CredentialBackend } from './credential-backends';
@@ -120,20 +128,34 @@ export function readClaudeConfig(path: string, readText: (path: string) => strin
   }
 }
 
-/** Replace exactly oauthAccount, preserving every other config field. */
+/**
+ * Replace exactly oauthAccount, preserving every other config field.
+ * The caller must hold the matching A1 config lock; use spliceOauthAccountLocked
+ * when no broader transaction already owns it.
+ */
 export async function spliceOauthAccount(
   path: string,
   oauthAccount: JsonObject,
+  heldLock: HeldClaudeConfigLock | undefined,
   options: Pick<ClaudeCredentialsOptions, 'readText' | 'writeText'> = {},
 ): Promise<void> {
   // `configDir` makes the A1 lock module select precisely `path.lock`, for
   // either global `.claude.json` or qualifying legacy `.config.json` paths.
-  await withClaudeConfigLock({ configDir: dirname(path), env: {} }, () => {
-    const config = readClaudeConfig(path, options.readText ?? defaultRead);
-    config.oauthAccount = oauthAccount;
-    const text = `${JSON.stringify(config, null, 2)}\n`;
-    (options.writeText ?? ((target, value) => { atomicWriteText(target, value, { mode: 0o600 }); }))(path, text);
-  });
+  assertClaudeConfigLockHeld(heldLock, { configDir: dirname(path), env: {} });
+  const config = readClaudeConfig(path, options.readText ?? defaultRead);
+  config.oauthAccount = oauthAccount;
+  const text = `${JSON.stringify(config, null, 2)}\n`;
+  (options.writeText ?? ((target, value) => { atomicWriteText(target, value, { mode: 0o600 }); }))(path, text);
+}
+
+/** Acquire only the config lock needed for a standalone oauthAccount splice. */
+export async function spliceOauthAccountLocked(
+  path: string,
+  oauthAccount: JsonObject,
+  options: Pick<ClaudeCredentialsOptions, 'readText' | 'writeText'> = {},
+): Promise<void> {
+  await withClaudeConfigLock({ configDir: dirname(path), env: {} }, (heldLock) =>
+    spliceOauthAccount(path, oauthAccount, heldLock, options));
 }
 
 /**
@@ -166,26 +188,34 @@ export async function readLiveClaudeCredentials(options: ClaudeCredentialsOption
 
 /**
  * Publish the live Keychain credential, then best-effort rewrite a pre-existing
- * plaintext file. The Keychain write remains authoritative; a file failure is
- * reported to the caller as `credentialsFileRefreshed: false` rather than
- * undoing the successful credential write.
+ * plaintext file. The caller must hold the matching A1 credential locks; use
+ * publishLiveClaudeCredentialsLocked when no broader transaction owns them.
+ * The Keychain write remains authoritative; a file failure is reported as
+ * `credentialsFileRefreshed: false` rather than undoing the credential write.
  */
 export async function writeLiveClaudeCredentials(
   credentials: string,
   options: ClaudeCredentialsOptions,
+  heldLocks: HeldClaudeCredentialLocks | undefined,
 ): Promise<{ credentialsFileRefreshed: boolean }> {
   const paths = resolvedPaths(options);
-  // Use A1's two credential locks for the full local publication. This keeps
-  // Claude's Keychain generation and its optional plaintext notification from
-  // interleaving with a Claude Code refresh or account switch.
-  return withClaudeCredentialLocks({ configDir: paths.configHome, env: {} }, async () => {
-    await options.backend.set(paths.keychainService, resolvedAccount(options), credentials);
-    try {
-      return {
-        credentialsFileRefreshed: rewriteCredentialsFileIfPresent(paths.credentialsPath, credentials, options),
-      };
-    } catch {
-      return { credentialsFileRefreshed: false };
-    }
-  });
+  assertClaudeCredentialLocksHeld(heldLocks, { configDir: paths.configHome, env: {} });
+  await options.backend.set(paths.keychainService, resolvedAccount(options), credentials);
+  try {
+    return {
+      credentialsFileRefreshed: rewriteCredentialsFileIfPresent(paths.credentialsPath, credentials, options),
+    };
+  } catch {
+    return { credentialsFileRefreshed: false };
+  }
+}
+
+/** Acquire both credential locks for a standalone live credential publication. */
+export async function publishLiveClaudeCredentialsLocked(
+  credentials: string,
+  options: ClaudeCredentialsOptions,
+): Promise<{ credentialsFileRefreshed: boolean }> {
+  const paths = resolvedPaths(options);
+  return withClaudeCredentialLocks({ configDir: paths.configHome, env: {} }, (heldLocks) =>
+    writeLiveClaudeCredentials(credentials, options, heldLocks));
 }
