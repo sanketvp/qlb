@@ -13,6 +13,7 @@ import { chmod, mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises
 import { join } from 'node:path';
 import { openStoreConnection } from './store';
 import { credentialFingerprint } from './anthropic-oauth';
+import { isCredentialNotFound } from './credential-backends';
 import { KeychainReadBackoff, platformKeychain, qlbKeychainService, QLB_KEYCHAIN_ACCOUNT } from './keychain';
 
 const DISPLAY_CACHE_TTL_MS = 60_000;
@@ -73,11 +74,11 @@ export interface ClaudeSlotRepository {
   getSlot(accountId: string): ClaudeSlot | null;
   listSlots(): ClaudeSlot[];
   createSlot(slot: ClaudeSlot): void;
-  updateCredential(accountId: string, fingerprint: string, prevFingerprint: string | null): void;
-  removeSlot(accountId: string): void;
+  /** Each method is one SQLite transaction in production. */
+  createSlotWithLineage(slot: ClaudeSlot, lineage: LineageAppend): void;
+  updateCredentialWithLineage(accountId: string, expectedFingerprint: string | null, fingerprint: string, prevFingerprint: string | null, lineage: LineageAppend | null): void;
+  removeSlotWithGeneration(accountId: string): void;
   currentGeneration(): number;
-  bumpGeneration(): number;
-  appendLineage(row: LineageAppend): void;
 }
 
 function cloneSlot(slot: ClaudeSlot): ClaudeSlot {
@@ -104,30 +105,34 @@ export class InMemoryClaudeSlotRepository implements ClaudeSlotRepository {
     this.slots.set(slot.accountId, cloneSlot(slot));
   }
 
-  updateCredential(accountId: string, fingerprint: string, prevFingerprint: string | null): void {
-    const slot = this.slots.get(accountId);
-    if (!slot) throw new Error('Claude slot not found');
-    slot.fingerprint = fingerprint;
-    slot.prevFingerprint = prevFingerprint;
-    slot.dead = false;
-    slot.deadReason = null;
+  createSlotWithLineage(slot: ClaudeSlot, lineage: LineageAppend): void {
+    if (this.slots.has(slot.accountId)) throw new Error('Claude slot already exists');
+    this.slots.set(slot.accountId, cloneSlot(slot));
+    this.transitions.push({ ...lineage });
+    this.generation += 1;
   }
 
-  removeSlot(accountId: string): void {
+  updateCredentialWithLineage(accountId: string, expectedFingerprint: string | null, fingerprint: string, prevFingerprint: string | null, lineage: LineageAppend | null): void {
+    const slot = this.slots.get(accountId);
+    if (!slot) throw new Error('Claude slot not found');
+    if (slot.fingerprint !== expectedFingerprint) throw new Error('Claude slot changed concurrently');
+    slot.fingerprint = fingerprint;
+    slot.prevFingerprint = prevFingerprint;
+    // A real lineage change heals a dead slot; idempotent writes never do.
+    if (slot.dead) slot.healedAt = lineage?.ts ?? slot.healedAt;
+    slot.dead = false;
+    slot.deadReason = null;
+    if (lineage) this.transitions.push({ ...lineage });
+    this.generation += 1;
+  }
+
+  removeSlotWithGeneration(accountId: string): void {
     this.slots.delete(accountId);
+    this.generation += 1;
   }
 
   currentGeneration(): number {
     return this.generation;
-  }
-
-  bumpGeneration(): number {
-    this.generation += 1;
-    return this.generation;
-  }
-
-  appendLineage(row: LineageAppend): void {
-    this.transitions.push({ ...row });
   }
 }
 
@@ -167,15 +172,31 @@ export class SqliteClaudeSlotRepository implements ClaudeSlotRepository {
         slot.addedAt, slot.lastActiveAt ?? null, slot.source ?? null, slot.archivedAt ?? null);
   }
 
-  updateCredential(accountId: string, fingerprint: string, prevFingerprint: string | null): void {
-    const result = this.db.prepare(`UPDATE claude_slots
-      SET fingerprint = ?, prev_fingerprint = ?, dead = 0, dead_reason = NULL
-      WHERE account_id = ?`).run(fingerprint, prevFingerprint, accountId);
-    if (Number(result.changes) !== 1) throw new Error('Claude slot not found');
+  createSlotWithLineage(slot: ClaudeSlot, lineage: LineageAppend): void {
+    this.transaction(() => {
+      this.createSlot(slot);
+      this.appendLineage(lineage);
+      this.bumpGenerationInTransaction();
+    });
   }
 
-  removeSlot(accountId: string): void {
-    this.db.prepare('DELETE FROM claude_slots WHERE account_id = ?').run(accountId);
+  updateCredentialWithLineage(accountId: string, expectedFingerprint: string | null, fingerprint: string, prevFingerprint: string | null, lineage: LineageAppend | null): void {
+    this.transaction(() => {
+      const result = this.db.prepare(`UPDATE claude_slots
+        SET fingerprint = ?, prev_fingerprint = ?, dead = 0, dead_reason = NULL,
+          healed_at = CASE WHEN dead != 0 THEN ? ELSE healed_at END
+        WHERE account_id = ? AND fingerprint IS ?`).run(fingerprint, prevFingerprint, lineage?.ts ?? null, accountId, expectedFingerprint);
+      if (Number(result.changes) !== 1) throw new Error('Claude slot changed concurrently');
+      if (lineage) this.appendLineage(lineage);
+      this.bumpGenerationInTransaction();
+    });
+  }
+
+  removeSlotWithGeneration(accountId: string): void {
+    this.transaction(() => {
+      this.db.prepare('DELETE FROM claude_slots WHERE account_id = ?').run(accountId);
+      this.bumpGenerationInTransaction();
+    });
   }
 
   currentGeneration(): number {
@@ -184,21 +205,21 @@ export class SqliteClaudeSlotRepository implements ClaudeSlotRepository {
     return Number.isSafeInteger(value) && value >= 0 ? value : 0;
   }
 
-  bumpGeneration(): number {
+  private transaction(fn: () => void): void {
     this.db.exec('BEGIN IMMEDIATE');
-    try {
-      const next = this.currentGeneration() + 1;
-      this.db.prepare(`INSERT INTO config (key, value) VALUES ('slots.generation', ?)
-        ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(String(next));
-      this.db.exec('COMMIT');
-      return next;
-    } catch (error) {
+    try { fn(); this.db.exec('COMMIT'); } catch (error) {
       try { this.db.exec('ROLLBACK'); } catch { /* preserve original failure */ }
       throw error;
     }
   }
 
-  appendLineage(row: LineageAppend): void {
+  private bumpGenerationInTransaction(): void {
+    const next = this.currentGeneration() + 1;
+    this.db.prepare(`INSERT INTO config (key, value) VALUES ('slots.generation', ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(String(next));
+  }
+
+  private appendLineage(row: LineageAppend): void {
     this.db.prepare(`INSERT INTO lineage_log (ts, provider, account_id, from_fp, to_fp, cause, by, evidence)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(
       row.ts, row.provider, row.accountId, row.fromFp, row.toFp, row.cause, row.by, row.evidence ?? null,
@@ -248,7 +269,9 @@ export interface ClaudeSlotsOptions {
 }
 
 export interface ReadSlotOptions {
-  /** Correctness reads (consume/switch/resync/import/add/undo) bypass cache and backoff. */
+  /** Display reads only; correctness reads are fresh by default. */
+  cached?: boolean;
+  /** @deprecated Fresh is the default; retained for call-site compatibility. */
   fresh?: boolean;
 }
 
@@ -260,14 +283,16 @@ export interface ReadClaudeSlot {
 type CachedSlot = ReadClaudeSlot & { expiresAt: number; generation: number };
 
 function missingItem(error: unknown): boolean {
-  const value = error as { code?: unknown; message?: unknown } | null;
-  const code = typeof value?.code === 'string' ? value.code : '';
-  const message = typeof value?.message === 'string' ? value.message.toLowerCase() : '';
-  return code === 'ENOENT' || message.includes('item not found') || message.includes('not found');
+  return isCredentialNotFound(error);
 }
 
 function assertId(value: string, kind: string): void {
   if (!value || /[\0/\\]/.test(value)) throw new Error(`invalid ${kind}`);
+}
+
+function assertSlotId(value: string): void {
+  // `:prev` and `unclaimed:` are storage namespaces, never slot identifiers.
+  if (!value || /[\0/\\:]/.test(value)) throw new Error('invalid slot id');
 }
 
 function parseUnclaimed(text: string): UnclaimedRecord {
@@ -290,6 +315,7 @@ export class ClaudeSlots {
   private readonly backoff: KeychainReadBackoff;
   private readonly files: ClaudeSlotFileOps;
   private readonly cache = new Map<string, CachedSlot>();
+  private readonly slotWrites = new Map<string, Promise<void>>();
   private cacheEpoch = 0;
 
   constructor(private readonly options: ClaudeSlotsOptions) {
@@ -304,74 +330,109 @@ export class ClaudeSlots {
   }
 
   async createSlot(input: CreateClaudeSlotInput): Promise<ClaudeSlot> {
-    assertId(input.accountId, 'slot id');
-    const fingerprint = this.fingerprint(input.credential);
-    const existing = this.options.repository.getSlot(input.accountId);
-    if (existing) throw new Error('Claude slot already exists');
-    this.invalidateCache();
-    await this.backend.set(this.slotService(input.accountId), QLB_KEYCHAIN_ACCOUNT, input.credential);
-    const slot: ClaudeSlot = {
-      accountId: input.accountId, slotNum: input.slotNum ?? null, email: input.email ?? null,
-      alias: input.alias ?? null, orgUuid: input.orgUuid ?? null, configJson: input.configJson ?? '{}',
-      fingerprint, prevFingerprint: null, threshold: input.threshold ?? null, dead: false,
-      addedAt: this.now(), lastActiveAt: null, source: input.source, archivedAt: null,
-    };
-    this.options.repository.createSlot(slot);
-    this.options.repository.bumpGeneration();
-    this.invalidateCache();
-    return slot;
+    assertSlotId(input.accountId);
+    return this.withSlotWrite(input.accountId, async () => {
+      const fingerprint = this.fingerprint(input.credential);
+      const existing = this.options.repository.getSlot(input.accountId);
+      if (existing) throw new Error('Claude slot already exists');
+      const previous = await this.readExistingCredential(input.accountId);
+      if (previous != null) throw new Error('Claude slot credential already exists');
+      const slot: ClaudeSlot = {
+        accountId: input.accountId, slotNum: input.slotNum ?? null, email: input.email ?? null,
+        alias: input.alias ?? null, orgUuid: input.orgUuid ?? null, configJson: input.configJson ?? '{}',
+        fingerprint, prevFingerprint: null, threshold: input.threshold ?? null, dead: false,
+        addedAt: this.now(), lastActiveAt: null, source: input.source, archivedAt: null,
+      };
+      this.invalidateCache();
+      await this.backend.set(this.slotService(input.accountId), QLB_KEYCHAIN_ACCOUNT, input.credential);
+      try {
+        this.options.repository.createSlotWithLineage(slot, {
+          ts: slot.addedAt, provider: ANTHROPIC_PROVIDER, accountId: input.accountId, fromFp: null,
+          toFp: fingerprint, cause: input.source === 'cswap-import' ? 'import' : 'add', by: 'qlb-cli',
+          evidence: input.source === 'cswap-import' ? 'import' : 'identity',
+        });
+      } catch (error) {
+        await this.deleteIfPresent(this.slotService(input.accountId));
+        throw error;
+      }
+      this.invalidateCache();
+      return slot;
+    });
   }
 
-  /** Cached display read by default; pass fresh for a correctness boundary. */
+  /** Fresh correctness read by default; only display callers opt into the cache. */
   async readSlot(accountId: string, options: ReadSlotOptions = {}): Promise<ReadClaudeSlot> {
-    assertId(accountId, 'slot id');
-    const fresh = options.fresh === true;
+    assertSlotId(accountId);
+    const cachedRead = options.cached === true && options.fresh !== true;
     const now = this.now();
     const generation = this.options.repository.currentGeneration();
     const cached = this.cache.get(accountId);
-    if (!fresh && cached && cached.expiresAt > now && cached.generation === generation) {
+    if (cachedRead && cached && cached.expiresAt > now && cached.generation === generation) {
       return { credential: cached.credential, fingerprint: cached.fingerprint };
     }
 
     const epoch = this.cacheEpoch;
     const credential = await this.readWithBackoff(
       () => this.backend.get(this.slotService(accountId), QLB_KEYCHAIN_ACCOUNT),
-      fresh,
+      !cachedRead,
     );
     const result: ReadClaudeSlot = { credential, fingerprint: this.fingerprint(credential) };
-    if (!fresh && epoch === this.cacheEpoch && generation === this.options.repository.currentGeneration()) {
+    if (cachedRead && epoch === this.cacheEpoch && generation === this.options.repository.currentGeneration()) {
       this.cache.set(accountId, { ...result, expiresAt: now + DISPLAY_CACHE_TTL_MS, generation });
     }
     return result;
   }
 
   async writeSlot(accountId: string, credential: string, transition: { cause: string; by?: string; evidence?: LineageAppend['evidence'] }): Promise<void> {
-    assertId(accountId, 'slot id');
+    assertSlotId(accountId);
+    return this.withSlotWrite(accountId, () => this.writeSlotUnlocked(accountId, credential, transition));
+  }
+
+  private async writeSlotUnlocked(accountId: string, credential: string, transition: { cause: string; by?: string; evidence?: LineageAppend['evidence'] }): Promise<void> {
     const slot = this.options.repository.getSlot(accountId);
     if (!slot) throw new Error('Claude slot not found');
     const nextFingerprint = this.fingerprint(credential);
     const existing = await this.readExistingCredential(accountId);
+    const existingFingerprint = existing == null ? null : this.fingerprint(existing);
+    // Idempotent writes preserve the undo generation and dead state.
+    if (slot.fingerprint === nextFingerprint && existingFingerprint === nextFingerprint) return;
+    const previous = await this.readPreviousCredential(accountId);
+    const lineage = slot.fingerprint === nextFingerprint ? null : {
+      ts: this.now(), provider: ANTHROPIC_PROVIDER, accountId, fromFp: existingFingerprint,
+      toFp: nextFingerprint, cause: transition.cause, by: transition.by ?? 'qlb-cli', evidence: transition.evidence ?? 'lineage',
+    } satisfies LineageAppend;
+    const prevFingerprint = existingFingerprint ?? slot.prevFingerprint;
     this.invalidateCache();
-    if (existing != null) await this.backend.set(this.previousService(accountId), QLB_KEYCHAIN_ACCOUNT, existing);
-    await this.backend.set(this.slotService(accountId), QLB_KEYCHAIN_ACCOUNT, credential);
-    this.options.repository.updateCredential(accountId, nextFingerprint, slot.fingerprint);
-    if (slot.fingerprint !== nextFingerprint) {
-      this.options.repository.appendLineage({
-        ts: this.now(), provider: ANTHROPIC_PROVIDER, accountId, fromFp: slot.fingerprint,
-        toFp: nextFingerprint, cause: transition.cause, by: transition.by ?? 'qlb-cli', evidence: transition.evidence ?? null,
-      });
+    try {
+      if (existing != null && lineage) await this.backend.set(this.previousService(accountId), QLB_KEYCHAIN_ACCOUNT, existing);
+      await this.backend.set(this.slotService(accountId), QLB_KEYCHAIN_ACCOUNT, credential);
+      if (lineage) {
+        this.options.repository.updateCredentialWithLineage(accountId, slot.fingerprint, nextFingerprint, prevFingerprint, lineage);
+      }
+    } catch (error) {
+      await this.restoreCredentialPair(accountId, existing, previous);
+      throw error;
     }
-    this.options.repository.bumpGeneration();
     this.invalidateCache();
   }
 
   async deleteSlot(accountId: string): Promise<void> {
-    assertId(accountId, 'slot id');
-    this.invalidateCache();
-    await this.backend.delete(this.slotService(accountId), QLB_KEYCHAIN_ACCOUNT);
-    this.options.repository.removeSlot(accountId);
-    this.options.repository.bumpGeneration();
-    this.invalidateCache();
+    assertSlotId(accountId);
+    return this.withSlotWrite(accountId, async () => {
+      if (!this.options.repository.getSlot(accountId)) throw new Error('Claude slot not found');
+      const current = await this.readExistingCredential(accountId);
+      const previous = await this.readPreviousCredential(accountId);
+      this.invalidateCache();
+      try {
+        await this.deleteIfPresent(this.slotService(accountId));
+        await this.deleteIfPresent(this.previousService(accountId));
+        this.options.repository.removeSlotWithGeneration(accountId);
+      } catch (error) {
+        await this.restoreCredentialPair(accountId, current, previous);
+        throw error;
+      }
+      this.invalidateCache();
+    });
   }
 
   /** S36: Keychain first; a private file is retained only if that write fails. */
@@ -423,13 +484,19 @@ export class ClaudeSlots {
   /** Restores an S36 record only when it was issued from the slot's current lineage. */
   async restoreUnclaimed(timestamp: string, accountId: string): Promise<void> {
     this.assertTimestamp(timestamp);
-    assertId(accountId, 'slot id');
-    const record = await this.readUnclaimed(timestamp);
-    const slot = this.options.repository.getSlot(accountId);
-    if (!slot) throw new Error('Claude slot not found');
-    if (record.consumedFp && record.consumedFp !== slot.fingerprint) throw new Error('unclaimed lineage mismatch');
-    await this.writeSlot(accountId, record.credential, { cause: 'stash-adopt' });
-    await this.deleteUnclaimed(timestamp);
+    assertSlotId(accountId);
+    return this.withSlotWrite(accountId, async () => {
+      const record = await this.readUnclaimed(timestamp);
+      const slot = this.options.repository.getSlot(accountId);
+      if (!slot) throw new Error('Claude slot not found');
+      if (!record.consumedFp || record.consumedFp !== slot.fingerprint) throw new Error('unclaimed lineage mismatch');
+      await this.writeSlotUnlocked(accountId, record.credential, { cause: 'stash-adopt', evidence: 'lineage' });
+      try {
+        await this.deleteUnclaimed(timestamp);
+      } catch {
+        // The restore is durable; retain the safety copy for a later sweep.
+      }
+    });
   }
 
   private async readExistingCredential(accountId: string): Promise<string | null> {
@@ -439,6 +506,13 @@ export class ClaudeSlots {
         true,
       );
     } catch (error) {
+      if (missingItem(error)) return null;
+      throw error;
+    }
+  }
+
+  private async readPreviousCredential(accountId: string): Promise<string | null> {
+    try { return await this.backend.get(this.previousService(accountId), QLB_KEYCHAIN_ACCOUNT); } catch (error) {
       if (missingItem(error)) return null;
       throw error;
     }
@@ -471,8 +545,39 @@ export class ClaudeSlots {
     try {
       return await read();
     } catch (error) {
-      try { this.backoff.read(() => { throw error; }, { fresh: true }); } catch { /* rethrow original below */ }
+      // rc 44 is an ordinary absent item, never a disabled Keychain.
+      if (!missingItem(error)) {
+        try { this.backoff.read(() => { throw error; }, { fresh: true }); } catch { /* rethrow original below */ }
+      }
       throw error;
+    }
+  }
+
+  private async deleteIfPresent(service: string): Promise<void> {
+    try { await this.backend.delete(service, QLB_KEYCHAIN_ACCOUNT); } catch (error) {
+      if (!missingItem(error)) throw error;
+    }
+  }
+
+  private async restoreCredentialPair(accountId: string, current: string | null, previous: string | null): Promise<void> {
+    try {
+      if (current == null) await this.deleteIfPresent(this.slotService(accountId));
+      else await this.backend.set(this.slotService(accountId), QLB_KEYCHAIN_ACCOUNT, current);
+      if (previous == null) await this.deleteIfPresent(this.previousService(accountId));
+      else await this.backend.set(this.previousService(accountId), QLB_KEYCHAIN_ACCOUNT, previous);
+    } catch { /* Best-effort compensation; preserve the original persistence error. */ }
+  }
+
+  private async withSlotWrite<T>(accountId: string, fn: () => Promise<T>): Promise<T> {
+    const previous = this.slotWrites.get(accountId) ?? Promise.resolve();
+    let release!: () => void;
+    const own = new Promise<void>((resolve) => { release = resolve; });
+    const queued = previous.then(() => own);
+    this.slotWrites.set(accountId, queued);
+    await previous;
+    try { return await fn(); } finally {
+      release();
+      if (this.slotWrites.get(accountId) === queued) this.slotWrites.delete(accountId);
     }
   }
 

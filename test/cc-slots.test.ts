@@ -69,7 +69,7 @@ describe('Claude slots (K2)', () => {
     assert.equal(await backend.get('qlb:anthropic:account-a:prev', 'qlb'), credential('one'));
     assert.equal((await slots.readSlot('account-a', { fresh: true })).credential, credential('two'));
     assert.equal(repo.getSlot('account-a')?.prevFingerprint, first.fingerprint);
-    assert.deepEqual(repo.transitions.map((row) => row.cause), ['post']);
+    assert.deepEqual(repo.transitions.map((row) => row.cause), ['import', 'post']);
     assert.equal(repo.generation, 2);
   });
 
@@ -99,9 +99,9 @@ describe('Claude slots (K2)', () => {
     await slots.createSlot({ accountId: 'account-a', credential: credential('one'), source: 'cswap-import' });
     backend.gets = 0;
 
-    await slots.readSlot('account-a');
-    await slots.readSlot('account-a');
-    await slots.readSlot('account-a');
+    await slots.readSlot('account-a', { cached: true });
+    await slots.readSlot('account-a', { cached: true });
+    await slots.readSlot('account-a', { cached: true });
     assert.equal(backend.gets, 1);
 
     now += 60_001;
@@ -113,10 +113,10 @@ describe('Claude slots (K2)', () => {
     const { slots, backend } = fixture();
     await slots.createSlot({ accountId: 'account-a', credential: credential('one'), source: 'cswap-import' });
     backend.gets = 0;
-    await slots.readSlot('account-a');
+    await slots.readSlot('account-a', { cached: true });
     await slots.writeSlot('account-a', credential('two'), { cause: 'post' });
     const afterWrite = backend.gets;
-    await slots.readSlot('account-a');
+    await slots.readSlot('account-a', { cached: true });
     assert.equal(backend.gets, afterWrite + 1);
   });
 
@@ -124,12 +124,48 @@ describe('Claude slots (K2)', () => {
     const { slots, backend } = fixture();
     await slots.createSlot({ accountId: 'account-a', credential: credential('one'), source: 'cswap-import' });
     backend.failReads = true;
-    await assert.rejects(slots.readSlot('account-a'), /fixture unavailable/);
-    await assert.rejects(slots.readSlot('account-a'), KeychainBackedOff);
+    await assert.rejects(slots.readSlot('account-a', { cached: true }), /fixture unavailable/);
+    await assert.rejects(slots.readSlot('account-a', { cached: true }), KeychainBackedOff);
 
     backend.failReads = false;
     const fresh = await slots.readSlot('account-a', { fresh: true });
     assert.equal(fresh.credential, credential('one'));
+    assert.equal(backend.gets, 3);
+  });
+
+  it('defaults to fresh reads and makes display caching explicit', async () => {
+    const { slots, backend } = fixture();
+    await slots.createSlot({ accountId: 'account-a', credential: credential('one'), source: 'cswap-import' });
+    backend.gets = 0;
+    await slots.readSlot('account-a');
+    await slots.readSlot('account-a');
     assert.equal(backend.gets, 2);
+    await slots.readSlot('account-a', { cached: true });
+    await slots.readSlot('account-a', { cached: true });
+    assert.equal(backend.gets, 3);
+  });
+
+  it('does not arm the cached-read backoff for an absent credential', async () => {
+    const { slots } = fixture();
+    await slots.createSlot({ accountId: 'account-a', credential: credential('one'), source: 'cswap-import' });
+    assert.equal((await slots.readSlot('account-a', { cached: true })).credential, credential('one'));
+  });
+
+  it('preserves :prev on an idempotent lineage write', async () => {
+    const { slots, backend, repo } = fixture();
+    await slots.createSlot({ accountId: 'account-a', credential: credential('one'), source: 'cswap-import' });
+    await slots.writeSlot('account-a', credential('two'), { cause: 'post' });
+    const previous = await backend.get('qlb:anthropic:account-a:prev', 'qlb');
+    const before = repo.getSlot('account-a')!;
+    await slots.writeSlot('account-a', credential('two'), { cause: 'post' });
+    assert.equal(await backend.get('qlb:anthropic:account-a:prev', 'qlb'), previous);
+    assert.equal(repo.getSlot('account-a')?.prevFingerprint, before.prevFingerprint);
+    assert.equal(repo.transitions.length, 2);
+  });
+
+  it('rejects IDs that collide with reserved predecessor and stash namespaces', async () => {
+    const { slots } = fixture();
+    await assert.rejects(slots.createSlot({ accountId: 'a:prev', credential: credential('one'), source: 'cswap-import' }), /invalid slot id/);
+    await assert.rejects(slots.createSlot({ accountId: 'unclaimed:x', credential: credential('one'), source: 'cswap-import' }), /invalid slot id/);
   });
 });

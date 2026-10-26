@@ -82,6 +82,14 @@ describe('Claude unclaimed stash and restore (K2 / AC48)', () => {
     await assert.rejects(slots.restoreUnclaimed('2026-10-25T12:02:00Z', 'account-a'), /lineage mismatch/);
   });
 
+  it('refuses a foreign safety stash without a consumed lineage', async () => {
+    const { slots } = fixture();
+    await slots.createSlot({ accountId: 'account-a', credential: credential('one'), source: 'cswap-import' });
+    await slots.stashUnclaimed('2026-10-25T12:02:30Z', credential('foreign'));
+    await assert.rejects(slots.restoreUnclaimed('2026-10-25T12:02:30Z', 'account-a'), /lineage mismatch/);
+    assert.equal((await slots.readSlot('account-a')).credential, credential('one'));
+  });
+
   it('registers a restoring command with strict argument handling and no credential output', async () => {
     const output: string[] = [];
     const seen: Array<[string, string]> = [];
