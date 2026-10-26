@@ -110,7 +110,7 @@ if (process.env.GATE_FAIL === '1') {
 process.stdout.write(JSON.stringify({ token: 'fixture-codex-access', accountId: 'user:slot', chatgptAccountId: 'bare-account', source: 'fixture' }));
 `;
 
-function load(owner?: string, gateFail = false, callCodex = false, perProviderOwner?: string): {
+function load(owner?: string, gateFail = false, callCodex = false, perProviderOwner?: string, ownerIsDirectory = false): {
   calls: string[];
   replaced: Record<string, boolean>;
   oauth: { resolve: number; refresh: number };
@@ -118,11 +118,14 @@ function load(owner?: string, gateFail = false, callCodex = false, perProviderOw
   runtimeApiKeys: Record<string, string>;
   codexModelCount: number;
   events: Array<{ error?: { errorMessage?: string } }>;
+  stderr: string;
 } {
   const home = mkdtempSync(join(tmpdir(), 'qlb-pi-wiring-'));
   const agent = join(home, '.pi', 'agent');
   mkdirSync(agent, { recursive: true });
-  if (owner !== undefined) writeFileSync(join(agent, 'qlb-owner.json'), owner);
+  const ownerPath = join(agent, 'qlb-owner.json');
+  if (ownerIsDirectory) mkdirSync(ownerPath);
+  else if (owner !== undefined) writeFileSync(ownerPath, owner);
   if (perProviderOwner !== undefined) writeFileSync(join(agent, 'qlb-owner-openai-codex.json'), perProviderOwner);
   const runner = join(home, 'fake-qlb.cjs');
   const entry = join(home, 'load.mjs');
@@ -143,7 +146,7 @@ function load(owner?: string, gateFail = false, callCodex = false, perProviderOw
     },
   });
   assert.equal(result.status, 0, result.stderr);
-  return JSON.parse(result.stdout.trim().split('\n').pop() ?? '') as ReturnType<typeof load>;
+  return { ...JSON.parse(result.stdout.trim().split('\n').pop() ?? ''), stderr: result.stderr } as ReturnType<typeof load>;
 }
 
 describe('qlb-pi provider wiring', { skip: piAvailable ? false : 'global Pi install not found' }, () => {
@@ -169,6 +172,19 @@ describe('qlb-pi provider wiring', { skip: piAvailable ? false : 'global Pi inst
 
     const legacyV1 = load(JSON.stringify({ owner: 'qlb', accounts: [] }));
     assert.equal(legacyV1.replaced['openai-codex'], false);
+  });
+
+  it('fails closed for malformed, non-object, or unreadable shared Codex owner documents', () => {
+    for (const owner of ['{not json', '[]', '1']) {
+      const result = load(owner);
+      assert.equal(result.replaced['openai-codex'], true, owner);
+      assert.match(result.stderr, /qlb-owner\.json/);
+      assert.doesNotMatch(result.stderr, new RegExp(owner.replace(/[{}[\]]/g, '\\$&')));
+    }
+
+    const unreadable = load(undefined, false, false, undefined, true);
+    assert.equal(unreadable.replaced['openai-codex'], true);
+    assert.match(unreadable.stderr, /qlb-owner\.json/);
   });
 
   it('registers Codex from the shadow-retaining per-provider owner artifact migration writes', () => {

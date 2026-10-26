@@ -138,16 +138,38 @@ function qlbOwnsProvider(provider: "openai-codex"): boolean {
   if (existsSync(OWNER_FILE)) {
     try {
       const parsed: unknown = JSON.parse(readFileSync(OWNER_FILE, "utf8"));
-      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-        const providers = (parsed as Record<string, unknown>).providers;
-        if (providers && typeof providers === "object" && !Array.isArray(providers)) {
-          const entry = (providers as Record<string, unknown>)[provider];
-          if (entry && typeof entry === "object" && !Array.isArray(entry)
-            && (entry as Record<string, unknown>).mode === "qlb") return true;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        console.error(`[qlb-pi] refusing native openai-codex fallback: malformed shared owner file ${OWNER_FILE}`);
+        return true;
+      }
+      const owner = parsed as Record<string, unknown>;
+      let recognized = false;
+      if ("providers" in owner) {
+        recognized = true;
+        const providers = owner.providers;
+        if (!providers || typeof providers !== "object" || Array.isArray(providers)) {
+          console.error(`[qlb-pi] refusing native openai-codex fallback: malformed shared owner file ${OWNER_FILE}`);
+          return true;
+        }
+        const entry = (providers as Record<string, unknown>)[provider];
+        if (entry && typeof entry === "object" && !Array.isArray(entry)
+          && (entry as Record<string, unknown>).mode === "qlb") return true;
+      }
+      if ("owner" in owner || "accounts" in owner) {
+        recognized = true;
+        if (typeof owner.owner !== "string" || !Array.isArray(owner.accounts)) {
+          console.error(`[qlb-pi] refusing native openai-codex fallback: malformed shared owner file ${OWNER_FILE}`);
+          return true;
         }
       }
-    } catch {
-      // A malformed shared document is an Anthropic conflict, not Codex ownership.
+      if (!recognized) {
+        console.error(`[qlb-pi] refusing native openai-codex fallback: malformed shared owner file ${OWNER_FILE}`);
+        return true;
+      }
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+      console.error(`[qlb-pi] refusing native openai-codex fallback: unreadable shared owner file ${OWNER_FILE}`);
+      return true;
     }
   }
 
