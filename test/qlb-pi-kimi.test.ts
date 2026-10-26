@@ -161,7 +161,9 @@ describe('qlb-pi Kimi Coding source', () => {
       }
       assert.equal(existsSync(started), true);
       controller.abort();
-      for (let tries = 0; !existsSync(terminated) && tries < 1_000; tries += 1) {
+      // The stream ends on the gate child's close event, which can land after the child
+      // writes its terminated marker, so wait for both.
+      for (let tries = 0; !(existsSync(terminated) && output?.ended) && tries < 1_000; tries += 1) {
         await new Promise((resolve) => setTimeout(resolve, 10));
       }
 
