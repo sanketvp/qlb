@@ -70,12 +70,15 @@ export interface LineageAppend {
 }
 
 /** Persistence boundary: tests use the in-memory implementation; production uses SQLite. */
+type RollbackHook = () => Promise<void> | void;
+type RegisterRollback = (hook: RollbackHook) => void;
+
 export interface ClaudeSlotRepository {
   getSlot(accountId: string): ClaudeSlot | null;
   listSlots(): ClaudeSlot[];
   createSlot(slot: ClaudeSlot): void;
   /** Holds SQLite's write lock across the credential and metadata effects. */
-  withWriteTransaction<T>(fn: () => Promise<T>): Promise<T>;
+  withWriteTransaction<T>(fn: (onRollback: RegisterRollback) => Promise<T>): Promise<T>;
   /** Each method is one SQLite transaction in production. */
   createSlotWithLineage(slot: ClaudeSlot, lineage: LineageAppend): void;
   updateCredentialWithLineage(accountId: string, expectedFingerprint: string | null, fingerprint: string, prevFingerprint: string | null, lineage: LineageAppend | null): void;
@@ -102,8 +105,16 @@ export class InMemoryClaudeSlotRepository implements ClaudeSlotRepository {
     return [...this.slots.values()].map(cloneSlot);
   }
 
-  async withWriteTransaction<T>(fn: () => Promise<T>): Promise<T> {
-    return fn();
+  async withWriteTransaction<T>(fn: (onRollback: RegisterRollback) => Promise<T>): Promise<T> {
+    const rollbackHooks: RollbackHook[] = [];
+    try {
+      return await fn((hook) => rollbackHooks.push(hook));
+    } catch (error) {
+      for (const hook of rollbackHooks.reverse()) {
+        try { await hook(); } catch { /* preserve original failure */ }
+      }
+      throw error;
+    }
   }
 
   createSlot(slot: ClaudeSlot): void {
@@ -174,7 +185,7 @@ export class SqliteClaudeSlotRepository implements ClaudeSlotRepository {
       added_at, last_active_at, source, archived_at FROM claude_slots ORDER BY slot_num, account_id`).all() as Record<string, unknown>[]).map((row) => this.toSlot(row));
   }
 
-  async withWriteTransaction<T>(fn: () => Promise<T>): Promise<T> {
+  async withWriteTransaction<T>(fn: (onRollback: RegisterRollback) => Promise<T>): Promise<T> {
     const previous = SqliteClaudeSlotRepository.writeQueues.get(this.writeQueueKey) ?? Promise.resolve();
     let release!: () => void;
     const own = new Promise<void>((resolve) => { release = resolve; });
@@ -182,16 +193,20 @@ export class SqliteClaudeSlotRepository implements ClaudeSlotRepository {
     SqliteClaudeSlotRepository.writeQueues.set(this.writeQueueKey, queued);
     await previous;
     let began = false;
+    const rollbackHooks: RollbackHook[] = [];
     try {
       this.db.exec('BEGIN IMMEDIATE');
       began = true;
       this.writeTransactionActive = true;
-      const result = await fn();
+      const result = await fn((hook) => rollbackHooks.push(hook));
       this.db.exec('COMMIT');
       return result;
     } catch (error) {
       if (began) {
         try { this.db.exec('ROLLBACK'); } catch { /* preserve original failure */ }
+      }
+      for (const hook of rollbackHooks.reverse()) {
+        try { await hook(); } catch { /* preserve original failure */ }
       }
       throw error;
     } finally {
@@ -384,7 +399,7 @@ export class ClaudeSlots {
 
   async createSlot(input: CreateClaudeSlotInput): Promise<ClaudeSlot> {
     assertSlotId(input.accountId);
-    return this.withSlotWrite(input.accountId, () => this.options.repository.withWriteTransaction(async () => {
+    return this.withSlotWrite(input.accountId, () => this.options.repository.withWriteTransaction(async (onRollback) => {
       const fingerprint = this.fingerprint(input.credential);
       const existing = this.options.repository.getSlot(input.accountId);
       if (existing) throw new Error('Claude slot already exists');
@@ -397,20 +412,15 @@ export class ClaudeSlots {
         addedAt: this.now(), lastActiveAt: null, source: input.source, archivedAt: null,
       };
       this.invalidateCache();
+      // The hook covers failures from the outer COMMIT as well as errors from
+      // the nested repository operation.
+      onRollback(() => this.restoreServiceIfUnchanged(this.slotService(input.accountId), input.credential, null));
       await this.backend.set(this.slotService(input.accountId), QLB_KEYCHAIN_ACCOUNT, input.credential);
-      try {
-        this.options.repository.createSlotWithLineage(slot, {
-          ts: slot.addedAt, provider: ANTHROPIC_PROVIDER, accountId: input.accountId, fromFp: null,
-          toFp: fingerprint, cause: input.source === 'cswap-import' ? 'import' : 'add', by: 'qlb-cli',
-          evidence: input.source === 'cswap-import' ? 'import' : 'identity',
-        });
-      } catch (error) {
-        // A losing create must not remove a credential committed by another
-        // process. The write transaction normally prevents that interleaving;
-        // the byte check also makes failed cleanup conservative.
-        await this.restoreServiceIfUnchanged(this.slotService(input.accountId), input.credential, null);
-        throw error;
-      }
+      this.options.repository.createSlotWithLineage(slot, {
+        ts: slot.addedAt, provider: ANTHROPIC_PROVIDER, accountId: input.accountId, fromFp: null,
+        toFp: fingerprint, cause: input.source === 'cswap-import' ? 'import' : 'add', by: 'qlb-cli',
+        evidence: input.source === 'cswap-import' ? 'import' : 'identity',
+      });
       this.invalidateCache();
       return slot;
     }));
@@ -442,11 +452,11 @@ export class ClaudeSlots {
   async writeSlot(accountId: string, credential: string, transition: { cause: string; by?: string; evidence?: LineageAppend['evidence'] }): Promise<void> {
     assertSlotId(accountId);
     return this.withSlotWrite(accountId, () => this.options.repository.withWriteTransaction(
-      () => this.writeSlotUnlocked(accountId, credential, transition),
+      (onRollback) => this.writeSlotUnlocked(accountId, credential, transition, onRollback),
     ));
   }
 
-  private async writeSlotUnlocked(accountId: string, credential: string, transition: { cause: string; by?: string; evidence?: LineageAppend['evidence'] }): Promise<void> {
+  private async writeSlotUnlocked(accountId: string, credential: string, transition: { cause: string; by?: string; evidence?: LineageAppend['evidence'] }, onRollback: RegisterRollback): Promise<void> {
     const slot = this.options.repository.getSlot(accountId);
     if (!slot) throw new Error('Claude slot not found');
     const nextFingerprint = this.fingerprint(credential);
@@ -465,36 +475,30 @@ export class ClaudeSlots {
     } satisfies LineageAppend;
     const prevFingerprint = lineage || saveExistingAsPrevious ? slot.fingerprint : slot.prevFingerprint;
     this.invalidateCache();
-    try {
-      if (saveExistingAsPrevious) await this.backend.set(this.previousService(accountId), QLB_KEYCHAIN_ACCOUNT, existing);
-      await this.backend.set(this.slotService(accountId), QLB_KEYCHAIN_ACCOUNT, credential);
-      // Even without a lineage edge, a changed credential blob must invalidate
-      // display readers in other processes via slots.generation.
-      this.options.repository.updateCredentialWithLineage(accountId, slot.fingerprint, nextFingerprint, prevFingerprint, lineage);
-    } catch (error) {
-      await this.restoreCredentialPair(
-        accountId, existing, previous, credential, saveExistingAsPrevious ? existing : previous,
-      );
-      throw error;
-    }
+    // Register before the first mutation so a backend error after a partial
+    // write and a failed outer COMMIT both restore the observed pre-image.
+    onRollback(() => this.restoreCredentialPair(
+      accountId, existing, previous, credential, saveExistingAsPrevious ? existing : previous,
+    ));
+    if (saveExistingAsPrevious) await this.backend.set(this.previousService(accountId), QLB_KEYCHAIN_ACCOUNT, existing);
+    await this.backend.set(this.slotService(accountId), QLB_KEYCHAIN_ACCOUNT, credential);
+    // Even without a lineage edge, a changed credential blob must invalidate
+    // display readers in other processes via slots.generation.
+    this.options.repository.updateCredentialWithLineage(accountId, slot.fingerprint, nextFingerprint, prevFingerprint, lineage);
     this.invalidateCache();
   }
 
   async deleteSlot(accountId: string): Promise<void> {
     assertSlotId(accountId);
-    return this.withSlotWrite(accountId, () => this.options.repository.withWriteTransaction(async () => {
+    return this.withSlotWrite(accountId, () => this.options.repository.withWriteTransaction(async (onRollback) => {
       if (!this.options.repository.getSlot(accountId)) throw new Error('Claude slot not found');
       const current = await this.readExistingCredential(accountId);
       const previous = await this.readPreviousCredential(accountId);
       this.invalidateCache();
-      try {
-        await this.deleteIfPresent(this.slotService(accountId));
-        await this.deleteIfPresent(this.previousService(accountId));
-        this.options.repository.removeSlotWithGeneration(accountId);
-      } catch (error) {
-        await this.restoreCredentialPair(accountId, current, previous, null, null);
-        throw error;
-      }
+      onRollback(() => this.restoreCredentialPair(accountId, current, previous, null, null));
+      await this.deleteIfPresent(this.slotService(accountId));
+      await this.deleteIfPresent(this.previousService(accountId));
+      this.options.repository.removeSlotWithGeneration(accountId);
       this.invalidateCache();
     }));
   }
@@ -549,20 +553,23 @@ export class ClaudeSlots {
   async restoreUnclaimed(timestamp: string, accountId: string): Promise<RestoreUnclaimedResult> {
     this.assertTimestamp(timestamp);
     assertSlotId(accountId);
-    return this.withSlotWrite(accountId, () => this.options.repository.withWriteTransaction(async () => {
-      const record = await this.readUnclaimed(timestamp);
-      const slot = this.options.repository.getSlot(accountId);
-      if (!slot) throw new Error('Claude slot not found');
-      if (!record.consumedFp || record.consumedFp !== slot.fingerprint) throw new Error('unclaimed lineage mismatch');
-      await this.writeSlotUnlocked(accountId, record.credential, { cause: 'stash-adopt', evidence: 'lineage' });
+    return this.withSlotWrite(accountId, async () => {
+      await this.options.repository.withWriteTransaction(async (onRollback) => {
+        const record = await this.readUnclaimed(timestamp);
+        const slot = this.options.repository.getSlot(accountId);
+        if (!slot) throw new Error('Claude slot not found');
+        if (!record.consumedFp || record.consumedFp !== slot.fingerprint) throw new Error('unclaimed lineage mismatch');
+        await this.writeSlotUnlocked(accountId, record.credential, { cause: 'stash-adopt', evidence: 'lineage' }, onRollback);
+      });
       try {
+        // The safety copy is only disposable after its slot metadata commit.
         await this.deleteUnclaimed(timestamp);
         return { cleanupPending: false };
       } catch {
         // The restore is durable, but callers must disclose the retained copy.
         return { cleanupPending: true };
       }
-    }));
+    });
   }
 
   private async readExistingCredential(accountId: string): Promise<string | null> {

@@ -19,6 +19,23 @@ function credential(tag: string): string {
   return JSON.stringify({ claudeAiOauth: { accessToken: `access-${tag}`, refreshToken: `refresh-${tag}` } });
 }
 
+function failNextCommit(repository: SqliteClaudeSlotRepository): void {
+  const db = (repository as unknown as { db: { exec(sql: string): void } }).db;
+  const exec = db.exec.bind(db);
+  let pending = true;
+  db.exec = (sql: string): void => {
+    if (pending && sql === 'COMMIT') {
+      pending = false;
+      throw new Error('fixture commit failed');
+    }
+    exec(sql);
+  };
+}
+
+async function assertMissing(backend: ClaudeSlotBackend, service: string): Promise<void> {
+  await assert.rejects(backend.get(service, 'qlb'));
+}
+
 class CountingBackend implements ClaudeSlotBackend {
   readonly kind = 'test-memory' as const;
   readonly inner = new MockKeychain();
@@ -194,6 +211,59 @@ describe('Claude slots (K2)', () => {
       fromFp: credentialFingerprint(credential('two')), toFp: credentialFingerprint(credential('three')),
       cause: 'post', by: 'qlb-cli', evidence: 'lineage',
     });
+  });
+
+  it('compensates a create when the outer SQLite commit fails', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-cc-slot-commit-create-'));
+    const dbPath = join(root, 'qlb.db');
+    const store = openStore(dbPath);
+    store.close();
+    const backend = new CountingBackend();
+    const repository = SqliteClaudeSlotRepository.open(dbPath);
+    const slots = new ClaudeSlots({ backend, repository, stashDir: join(root, 'unclaimed'), now: () => 1_000 });
+    failNextCommit(repository);
+
+    await assert.rejects(slots.createSlot({ accountId: 'account-a', credential: credential('one'), source: 'cswap-import' }), /fixture commit failed/);
+    await assertMissing(backend, 'qlb:anthropic:account-a');
+    assert.equal(repository.getSlot('account-a'), null);
+    repository.close();
+  });
+
+  it('compensates a write when the outer SQLite commit fails', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-cc-slot-commit-write-'));
+    const dbPath = join(root, 'qlb.db');
+    const store = openStore(dbPath);
+    store.close();
+    const backend = new CountingBackend();
+    const repository = SqliteClaudeSlotRepository.open(dbPath);
+    const slots = new ClaudeSlots({ backend, repository, stashDir: join(root, 'unclaimed'), now: () => 1_000 });
+    await slots.createSlot({ accountId: 'account-a', credential: credential('one'), source: 'cswap-import' });
+    failNextCommit(repository);
+
+    await assert.rejects(slots.writeSlot('account-a', credential('two'), { cause: 'post' }), /fixture commit failed/);
+    assert.equal(await backend.get('qlb:anthropic:account-a', 'qlb'), credential('one'));
+    await assertMissing(backend, 'qlb:anthropic:account-a:prev');
+    assert.equal(repository.getSlot('account-a')?.fingerprint, credentialFingerprint(credential('one')));
+    repository.close();
+  });
+
+  it('compensates a delete when the outer SQLite commit fails', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-cc-slot-commit-delete-'));
+    const dbPath = join(root, 'qlb.db');
+    const store = openStore(dbPath);
+    store.close();
+    const backend = new CountingBackend();
+    const repository = SqliteClaudeSlotRepository.open(dbPath);
+    const slots = new ClaudeSlots({ backend, repository, stashDir: join(root, 'unclaimed'), now: () => 1_000 });
+    await slots.createSlot({ accountId: 'account-a', credential: credential('one'), source: 'cswap-import' });
+    await slots.writeSlot('account-a', credential('two'), { cause: 'post' });
+    failNextCommit(repository);
+
+    await assert.rejects(slots.deleteSlot('account-a'), /fixture commit failed/);
+    assert.equal(await backend.get('qlb:anthropic:account-a', 'qlb'), credential('two'));
+    assert.equal(await backend.get('qlb:anthropic:account-a:prev', 'qlb'), credential('one'));
+    assert.equal(repository.getSlot('account-a')?.fingerprint, credentialFingerprint(credential('two')));
+    repository.close();
   });
 
   it('serializes concurrent writers from two SQLite connections with their Keychain effects', async () => {

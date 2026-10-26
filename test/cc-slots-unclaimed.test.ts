@@ -4,13 +4,27 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
-import { ClaudeSlots, InMemoryClaudeSlotRepository, type ClaudeSlotBackend } from '../src/cc-slots';
+import { ClaudeSlots, InMemoryClaudeSlotRepository, SqliteClaudeSlotRepository, type ClaudeSlotBackend } from '../src/cc-slots';
 import { runClaudeRestoreUnclaimedCommand } from '../src/commands/claude-restore-unclaimed';
 import { MockKeychain } from '../src/keychain';
+import { openStore } from '../src/store';
 import type { CommandContext } from '../src/registry';
 
 function credential(tag: string): string {
   return JSON.stringify({ claudeAiOauth: { accessToken: `access-${tag}`, refreshToken: `refresh-${tag}` } });
+}
+
+function failNextCommit(repository: SqliteClaudeSlotRepository): void {
+  const db = (repository as unknown as { db: { exec(sql: string): void } }).db;
+  const exec = db.exec.bind(db);
+  let pending = true;
+  db.exec = (sql: string): void => {
+    if (pending && sql === 'COMMIT') {
+      pending = false;
+      throw new Error('fixture commit failed');
+    }
+    exec(sql);
+  };
 }
 
 class StashFailingBackend implements ClaudeSlotBackend {
@@ -87,6 +101,26 @@ describe('Claude unclaimed stash and restore (K2 / AC48)', () => {
     backend.failUnclaimedDeletes = true;
 
     assert.deepEqual(await slots.restoreUnclaimed('2026-10-25T12:01:30Z', 'account-a'), { cleanupPending: true });
+  });
+
+  it('keeps the stash retryable when the outer SQLite commit fails', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-unclaimed-commit-'));
+    const dbPath = join(root, 'qlb.db');
+    const store = openStore(dbPath);
+    store.close();
+    const backend = new StashFailingBackend();
+    const repository = SqliteClaudeSlotRepository.open(dbPath);
+    const slots = new ClaudeSlots({ backend, repository, stashDir: join(root, 'unclaimed'), now: () => 1_000 });
+    await slots.createSlot({ accountId: 'account-a', credential: credential('one'), source: 'cswap-import' });
+    const current = (await slots.readSlot('account-a', { fresh: true })).fingerprint;
+    await slots.stashUnclaimed('2026-10-25T12:01:45Z', credential('issued'), current);
+    failNextCommit(repository);
+
+    await assert.rejects(slots.restoreUnclaimed('2026-10-25T12:01:45Z', 'account-a'), /fixture commit failed/);
+    assert.notEqual(await backend.get('qlb:anthropic:unclaimed:2026-10-25T12:01:45Z', 'qlb'), '');
+    assert.deepEqual(await slots.restoreUnclaimed('2026-10-25T12:01:45Z', 'account-a'), { cleanupPending: false });
+    await assert.rejects(backend.get('qlb:anthropic:unclaimed:2026-10-25T12:01:45Z', 'qlb'));
+    repository.close();
   });
 
   it('refuses a restore whose consumed lineage no longer matches', async () => {
