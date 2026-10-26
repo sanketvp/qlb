@@ -306,6 +306,57 @@ describe('release install (AC45)', () => {
     assert.equal(existsSync(join(root, 'app', 'pin-unreadable-sha')), false);
   });
 
+  it('records the pin without migrating a pre-existing database', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-release-helper-pin-no-migrate-'));
+    const sourceDir = sourceBuild(root, 'pin-no-migrate-sha');
+    const helper = join(sourceDir, 'native', 'keychain-helper', 'build', 'qlb-keychain-helper');
+    const dbPath = join(root, 'qlb.db');
+    mkdirSync(dirname(helper), { recursive: true });
+    writeFileSync(helper, 'fake helper bytes\n');
+    const before = new DatabaseSync(dbPath);
+    before.exec(`
+      CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT);
+      CREATE TABLE relogin_events (id INTEGER PRIMARY KEY, detail TEXT, evidence TEXT);
+      PRAGMA user_version = 4;
+    `);
+    before.close();
+
+    await installRelease({
+      sourceDir, appDir: join(root, 'app'), sha: 'pin-no-migrate-sha', dbPath, ...validHelperVerifier,
+    });
+
+    const after = new DatabaseSync(dbPath, { readOnly: true });
+    try {
+      assert.equal((after.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 4);
+      assert.equal(
+        (after.prepare('SELECT value FROM config WHERE key = ?').get('keychain.helperCheckIdentityHash') as { value: string }).value,
+        QLB_HELPER_SIGNING.identityHash,
+      );
+    } finally { after.close(); }
+  });
+
+  it('rolls back a newly recorded pin when publishing current fails', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-release-helper-pin-rollback-'));
+    const sourceDir = sourceBuild(root, 'pin-rollback-sha');
+    const helper = join(sourceDir, 'native', 'keychain-helper', 'build', 'qlb-keychain-helper');
+    const appDir = join(root, 'app');
+    const dbPath = join(root, 'qlb.db');
+    mkdirSync(dirname(helper), { recursive: true });
+    writeFileSync(helper, 'fake helper bytes\n');
+    mkdirSync(join(appDir, 'current'), { recursive: true });
+
+    await assert.rejects(
+      installRelease({ sourceDir, appDir, sha: 'pin-rollback-sha', dbPath, ...validHelperVerifier }),
+      /EISDIR|EEXIST|ENOTDIR/,
+    );
+
+    const after = new DatabaseSync(dbPath, { readOnly: true });
+    try {
+      assert.equal(after.prepare('SELECT value FROM config WHERE key = ?').get('keychain.helperCheckIdentityHash'), undefined);
+    } finally { after.close(); }
+    assert.ok(lstatSync(join(appDir, 'current')).isDirectory());
+  });
+
   it('refuses a helper reached through a symlinked ancestor outside the checkout', async () => {
     const root = mkdtempSync(join(tmpdir(), 'qlb-release-helper-symlink-'));
     const sourceDir = sourceBuild(root, 'symlink-helper-sha');
