@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync, execFileSync as runFile, spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
@@ -221,7 +221,7 @@ describe('Swift Keychain helper write path', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
-  it('refuses without a recorded helper pin before spawning the helper', () => {
+  it('allows a validly signed helper with the exact authority when no pin is recorded', () => {
     const dir = mkdtempSync(join(tmpdir(), 'qlb-helper-no-pin-'));
     const helper = join(dir, 'qlb-keychain-helper');
     writeFileSync(helper, 'fixture helper');
@@ -230,15 +230,77 @@ describe('Swift Keychain helper write path', () => {
       helperPath: helper,
       execFileSync: markFakeExecutor(() => { helperCalls += 1; return ''; }),
       helperConfigReader: () => null,
-      helperIdentityVerifier: () => ({ trusted: true }),
+      helperSigningInspector: () => ({
+        authority: 'QLB Keychain Helper', binaryHash: 'a'.repeat(40), identityHash: 'b'.repeat(40),
+      }),
+    });
+    try {
+      backend.setSync('qlb-test-helper', 'qlb', 'credential');
+      assert.equal(helperCalls, 1);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('refuses a pinless helper with the wrong authority before spawning it', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-helper-no-pin-wrong-authority-'));
+    const helper = join(dir, 'qlb-keychain-helper');
+    writeFileSync(helper, 'fixture helper');
+    let helperCalls = 0;
+    const backend = new MacosKeychainBackend({
+      helperPath: helper,
+      execFileSync: markFakeExecutor(() => { helperCalls += 1; return ''; }),
+      helperConfigReader: () => null,
+      helperSigningInspector: () => ({
+        authority: 'Other Signing Identity', binaryHash: 'a'.repeat(40), identityHash: 'b'.repeat(40),
+      }),
     });
     try {
       assert.throws(
         () => backend.setSync('qlb-test-helper', 'qlb', 'credential'),
-        /helper-untrusted: no pinned helper identity; run qlb keychain check-launchd/,
+        /helper-untrusted: helper signed by Other Signing Identity, expected QLB Keychain Helper/,
       );
       assert.equal(helperCalls, 0);
     } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('reads the helper pin from the configured database rather than the default database', () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-helper-configured-db-'));
+    const customDb = join(home, 'custom', 'qlb.db');
+    const helper = join(home, 'qlb-keychain-helper');
+    const previous = {
+      QLB_HOME: process.env.QLB_HOME,
+      QLB_TEST_MODE: process.env.QLB_TEST_MODE,
+      QLB_DB_PATH: process.env.QLB_DB_PATH,
+    };
+    writeFileSync(helper, 'fixture helper');
+    mkdirSync(join(home, '.qlb'), { recursive: true });
+    writeFileSync(join(home, '.qlb', 'config.json'), JSON.stringify({ dbPath: customDb }));
+    const store = openStore(customDb);
+    const pin = 'd'.repeat(40);
+    store.setConfig('keychain.helperCheckIdentityHash', pin);
+    store.close();
+    delete process.env.QLB_DB_PATH;
+    process.env.QLB_TEST_MODE = '1';
+    process.env.QLB_HOME = home;
+    let seenPin: string | undefined;
+    try {
+      const backend = new MacosKeychainBackend({
+        helperPath: helper,
+        execFileSync: markFakeExecutor(() => ''),
+        helperIdentityVerifier: (_path, candidate) => {
+          seenPin = candidate;
+          return { trusted: true };
+        },
+      });
+      backend.setSync('qlb-test-helper', 'qlb', 'credential');
+      assert.equal(seenPin, pin);
+      assert.equal(existsSync(defaultConfig(home).dbPath), false);
+    } finally {
+      for (const [key, value] of Object.entries(previous)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 
   it('passes the exact designated requirement to codesign for a pinned leaf', () => {
@@ -253,7 +315,7 @@ describe('Swift Keychain helper write path', () => {
         return { status: 0 };
       }), { trusted: true });
       assert.deepEqual(calls, [[
-        '--verify', '--strict', '-R', `certificate leaf = H"${pin}"`, helper,
+        '--verify', '--strict', '-R', `=certificate leaf = H"${pin}"`, helper,
       ]]);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });

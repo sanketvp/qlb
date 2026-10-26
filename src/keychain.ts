@@ -141,6 +141,9 @@ export function withServiceGuard(
       assertKeychainAccess(service, account, 'write', effectiveAllowlistOptions);
       backend.deleteSync(service, account);
     },
+    assertHelperUsable() {
+      backend.assertHelperUsable?.();
+    },
   };
 }
 
