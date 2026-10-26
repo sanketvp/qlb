@@ -67,16 +67,108 @@ const SENSITIVE_KEY_NAME = [...SENSITIVE_KEY]
   .sort((left, right) => right.length - left.length)
   .map((key) => key.split('').map(escapeRegExp).join('[_-]*'))
   .join('|');
+// Keep every textual key-value redaction rule on this matcher so the
+// line-oriented and multiline paths recognise the same sensitive key forms.
+const SENSITIVE_KEY_MATCHER = `(?<![A-Za-z0-9])(?:${SENSITIVE_KEY_NAME})[_-]*(?:["']?[ \\t]*[=:])`;
 const SENSITIVE_KEY_VALUE_TO_EOL = new RegExp(
-  `((?<![A-Za-z0-9])(?:${SENSITIVE_KEY_NAME})(?:["']?[ \\t]*[=:][ \\t]*))[^\\r\\n]*`,
+  `(${SENSITIVE_KEY_MATCHER}\\s*)[^\\r\\n]*`,
   'gi',
 );
+const SENSITIVE_YAML_VALUE = new RegExp(
+  `^([^\\r\\n]*?)(${SENSITIVE_KEY_MATCHER}[ \\t]*)([^\\r\\n]*)`,
+  'gim',
+);
+const PEM_BEGIN = /-----BEGIN ([A-Za-z0-9][A-Za-z0-9 ]*)-----/g;
+
+function lineIndent(value: string): number {
+  return value.match(/^[ \t]*/)?.[0].length ?? 0;
+}
+
+function lineContentEnd(text: string, start: number): number {
+  const newline = text.indexOf('\n', start);
+  const end = newline === -1 ? text.length : newline;
+  return text[end - 1] === '\r' ? end - 1 : end;
+}
+
+function sequenceKeyIndent(prefix: string): number {
+  return /^[ \t]*(?:-[ \t]+)+$/.test(prefix) ? prefix.length : lineIndent(prefix);
+}
+
+function followingIndentedValueEnd(text: string, start: number, keyIndent: number): number | undefined {
+  let cursor = start;
+  let end: number | undefined;
+  let sawIndentedLine = false;
+  while (cursor < text.length) {
+    const contentEnd = lineContentEnd(text, cursor);
+    const line = text.slice(cursor, contentEnd);
+    if (line.trim() === '') {
+      if (sawIndentedLine) end = contentEnd;
+    } else if (lineIndent(line) > keyIndent) {
+      sawIndentedLine = true;
+      end = contentEnd;
+    } else {
+      break;
+    }
+    const newline = text.indexOf('\n', contentEnd);
+    if (newline === -1) break;
+    cursor = newline + 1;
+  }
+  return sawIndentedLine ? end : undefined;
+}
+
+function redactPemBlocks(text: string): string {
+  let out = '';
+  let cursor = 0;
+  for (let begin = PEM_BEGIN.exec(text); begin; begin = PEM_BEGIN.exec(text)) {
+    const endPattern = new RegExp(`^[ \\t]*-----END ${escapeRegExp(begin[1])}-----[ \\t]*(?=\\r?$)`, 'gm');
+    endPattern.lastIndex = begin.index + begin[0].length;
+    const end = endPattern.exec(text);
+    const blockEnd = end ? end.index + end[0].length : text.length;
+
+    out += text.slice(cursor, begin.index) + REDACTED;
+    cursor = blockEnd;
+    PEM_BEGIN.lastIndex = blockEnd;
+  }
+  return out + text.slice(cursor);
+}
+
+function redactIndentedSensitiveValues(text: string): string {
+  let out = '';
+  let cursor = 0;
+  for (let match = SENSITIVE_YAML_VALUE.exec(text); match; match = SENSITIVE_YAML_VALUE.exec(text)) {
+    const valueStart = match.index + match[1].length + match[2].length;
+    const keyIndent = sequenceKeyIndent(match[1]);
+    const newline = text.indexOf('\n', valueStart + match[3].length);
+    const nextLine = newline === -1 ? undefined : newline + 1;
+    const indentedEnd = nextLine === undefined ? undefined : followingIndentedValueEnd(text, nextLine, keyIndent);
+    const isBlockScalar = /^[>|][0-9+-]*[ \t]*(?:#.*)?$/.test(match[3]);
+
+    // A block scalar always owns its marker. Other values only extend beyond
+    // their line when a more-indented continuation makes that ownership clear.
+    if (!isBlockScalar && indentedEnd === undefined) continue;
+
+    const valueEnd = indentedEnd ?? valueStart + match[3].length;
+    // Preserve the line break and its indentation for an empty next-line
+    // value, matching the diagnostic-text behaviour for `key=\n value`.
+    const redactionStart = match[3] === '' && nextLine !== undefined
+      ? nextLine + lineIndent(text.slice(nextLine, lineContentEnd(text, nextLine)))
+      : valueStart;
+    out += text.slice(cursor, redactionStart) + REDACTED;
+    cursor = valueEnd;
+    SENSITIVE_YAML_VALUE.lastIndex = valueEnd;
+  }
+  return out + text.slice(cursor);
+}
 
 /** Redacts credentials in diagnostic key/value text that is not valid JSON. */
 export function redactKeyValueText(text: string, secrets: readonly string[]): string {
+  // PEM blocks may occur without a recognisable key. Redact these before
+  // interpreting YAML so an unterminated block safely consumes the remainder.
+  const pemRedacted = redactPemBlocks(redactSecrets(text, secrets));
+  const multilineRedacted = redactIndentedSensitiveValues(pemRedacted);
   // Once a sensitive key has introduced a value, prefer losing the remainder
   // of that diagnostic line to retaining an unrecognised credential fragment.
-  return redactSecrets(text, secrets).replace(SENSITIVE_KEY_VALUE_TO_EOL, `$1${REDACTED}`);
+  return multilineRedacted.replace(SENSITIVE_KEY_VALUE_TO_EOL, `$1${REDACTED}`);
 }
 
 type RedactedValue = unknown | undefined;
