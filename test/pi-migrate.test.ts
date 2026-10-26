@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
@@ -11,6 +11,7 @@ import {
   hasLegacyPiOwnerEntry,
   migratePiSingleProvider,
   rollbackPiSingleProvider,
+  withPiAuthLock,
   type PiMigratePaths,
   type PiSingleProvider,
 } from '../src/pi-migrate';
@@ -85,7 +86,7 @@ async function raceStaleLockTakers(paths: PiMigratePaths, home: string, racers: 
     proc.stdout!.on('data', (chunk) => { output += String(chunk); });
     proc.once('message', (message) => { if (message === 'ready') resolveReady(); else rejectReady(new Error('racer did not become ready')); });
     proc.once('error', (error) => { rejectReady(error); rejectResult(error); });
-    proc.once('close', (code) => { resolveResult({ code, output }); });
+    proc.once('close', (code) => { rejectReady(new Error(`racer exited before ready: ${code}`)); resolveResult({ code, output }); });
     return { proc, ready, result };
   });
   await Promise.all(children.map(({ ready }) => ready));
@@ -284,6 +285,86 @@ describe('Pi migration S58 credential-first barrier', () => {
       } finally { h.cleanup(); }
     });
   }
+
+  it('restores a fresh lock moved after the stale check without evicting its holder', () => {
+    const h = setup();
+    const fsHooks = require('node:fs') as typeof import('node:fs');
+    const lock = `${h.paths.authJsonPath}.lock`; const original = `${lock}.original-stale`; const fresh = { pid: process.pid, nonce: 'fresh-a' };
+    try {
+      const owner = join(lock, 'qlb-lock-owner.json');
+      mkdirSync(lock); writeFileSync(owner, JSON.stringify({ pid: 999_999, nonce: 'dead' }));
+      utimesSync(lock, new Date(Date.now() - 2_000), new Date(Date.now() - 2_000));
+      const rename = fsHooks.renameSync; let injected = false;
+      fsHooks.renameSync = ((from: string, to: string) => {
+        if (!injected && from === lock && to.startsWith(`${lock}.stale-`)) {
+          injected = true;
+          rename(lock, original);
+          const pending = `${lock}.pending-fresh-a`;
+          writeFileSync(pending, JSON.stringify(fresh)); linkSync(pending, lock); unlinkSync(pending);
+        }
+        rename(from, to);
+      }) as typeof fsHooks.renameSync;
+      try {
+        assert.throws(() => withPiAuthLock(h.paths.authJsonPath, () => assert.fail('preempted taker entered'), { staleMs: 10, retries: 0, retryMs: 1 }), (error: unknown) => (error as { code?: string }).code === 'pi-auth-locked');
+      } finally { fsHooks.renameSync = rename; }
+      assert.equal(injected, true);
+      assert.deepEqual(JSON.parse(readFileSync(lock, 'utf8')), fresh, 'the fresh holder is restored');
+      assert.throws(() => withPiAuthLock(h.paths.authJsonPath, () => assert.fail('second holder entered'), { staleMs: 10, retries: 0, retryMs: 1 }), (error: unknown) => (error as { code?: string }).code === 'pi-auth-locked');
+    } finally { h.cleanup(); }
+  });
+
+  it('restores moved locks create-only when a third racer acquires the canonical path', () => {
+    const h = setup();
+    const fsHooks = require('node:fs') as typeof import('node:fs');
+    const lock = `${h.paths.authJsonPath}.lock`; const original = `${lock}.original-stale`; const fresh = { pid: process.pid, nonce: 'fresh-a' }; const third = { pid: process.pid, nonce: 'fresh-c' };
+    try {
+      const owner = join(lock, 'qlb-lock-owner.json');
+      mkdirSync(lock); writeFileSync(owner, JSON.stringify({ pid: 999_999, nonce: 'dead' }));
+      utimesSync(lock, new Date(Date.now() - 2_000), new Date(Date.now() - 2_000));
+      const rename = fsHooks.renameSync; const link = fsHooks.linkSync; let movedFreshLock = false; let thirdAcquired = false;
+      fsHooks.renameSync = ((from: string, to: string) => {
+        if (!movedFreshLock && from === lock && to.startsWith(`${lock}.stale-`)) {
+          movedFreshLock = true;
+          rename(lock, original);
+          const pending = `${lock}.pending-fresh-a`;
+          writeFileSync(pending, JSON.stringify(fresh)); link(pending, lock); unlinkSync(pending);
+        }
+        rename(from, to);
+      }) as typeof fsHooks.renameSync;
+      fsHooks.linkSync = ((from: string, to: string) => {
+        if (movedFreshLock && !thirdAcquired && from.startsWith(`${lock}.stale-`) && to === lock) {
+          thirdAcquired = true;
+          const pending = `${lock}.pending-fresh-c`;
+          writeFileSync(pending, JSON.stringify(third)); link(pending, lock); unlinkSync(pending);
+        }
+        link(from, to);
+      }) as typeof fsHooks.linkSync;
+      try {
+        assert.throws(() => withPiAuthLock(h.paths.authJsonPath, () => assert.fail('preempted taker entered'), { staleMs: 10, retries: 0, retryMs: 1 }), (error: unknown) => (error as { code?: string }).code === 'pi-auth-locked');
+      } finally { fsHooks.renameSync = rename; fsHooks.linkSync = link; }
+      assert.equal(thirdAcquired, true);
+      assert.deepEqual(JSON.parse(readFileSync(lock, 'utf8')), third, 'restore never replaces the third racer');
+      assert.throws(() => withPiAuthLock(h.paths.authJsonPath, () => assert.fail('second holder entered'), { staleMs: 10, retries: 0, retryMs: 1 }), (error: unknown) => (error as { code?: string }).code === 'pi-auth-locked');
+    } finally { h.cleanup(); }
+  });
+
+  it('allows one bounded refresh grace while a verifying reaper restores its identical owner record', () => {
+    const h = setup();
+    const fsHooks = require('node:fs') as typeof import('node:fs');
+    const lock = `${h.paths.authJsonPath}.lock`;
+    try {
+      const stat = fsHooks.statSync; let injectEnoent = true; let entered = false;
+      fsHooks.statSync = ((path: string) => {
+        if (injectEnoent && path === lock) {
+          injectEnoent = false;
+          throw Object.assign(new Error('temporarily moved by reaper'), { code: 'ENOENT' });
+        }
+        return stat(path);
+      }) as typeof fsHooks.statSync;
+      try { withPiAuthLock(h.paths.authJsonPath, () => { entered = true; }, { retries: 0 }); } finally { fsHooks.statSync = stat; }
+      assert.equal(entered, true, 'the identical owner record returned during the bounded grace');
+    } finally { h.cleanup(); }
+  });
 
   it('takes over only stale locks whose recorded owner is dead and never releases a foreign lock', () => {
     const h = setup();
