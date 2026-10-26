@@ -1,0 +1,265 @@
+import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
+
+import { codexFingerprint, readCodexAuthStable, type CodexAuthDocument, type CodexAuthStableResult } from './codex-auth';
+import { planImportActiveCodex } from './codex-slots';
+import { QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, type KeychainBackend } from './keychain';
+import type { Store } from './store';
+
+const PROVIDER = 'openai-codex';
+
+/**
+ * Codex source reference: openai/codex `rust-v0.164.0`,
+ * `codex-rs/cli/src/cli_login.rs:129-130,148-149,192`.
+ */
+export const CODEX_FILE_CREDENTIAL_STORE_CONFIG = 'cli_auth_credentials_store = "file"\n';
+
+export class CodexAddError extends Error {
+  constructor(message: string, readonly exitCode: 1 | 3 = 1) {
+    super(message);
+    this.name = 'CodexAddError';
+  }
+}
+
+export interface CodexAddInput {
+  home: string;
+  nativeAuthPath: string;
+  replace?: string;
+}
+
+export interface CodexLoginOptions {
+  command: string;
+  args: string[];
+  env: NodeJS.ProcessEnv;
+  cwd: string;
+}
+
+type SqlStore = Pick<Store, 'dbPath'>;
+type AddKeychain = Pick<KeychainBackend, 'getSync' | 'setSync' | 'deleteSync'>;
+
+/** All process, filesystem, clock, credential, and signal effects are seams. */
+export interface CodexAddDeps {
+  store: SqlStore;
+  keychain: AddKeychain;
+  env: NodeJS.ProcessEnv;
+  now: () => number;
+  createTemp: (home: string) => string;
+  writeConfig: (path: string, contents: string) => void;
+  removeTemp: (path: string) => void;
+  hashFile: (path: string) => string;
+  login: (options: CodexLoginOptions) => Promise<number>;
+  readAuth: (path: string) => Promise<CodexAuthStableResult>;
+  /** Installs process-exit and signal cleanup; returns an unregister function. */
+  installCleanup: (cleanup: () => void) => () => void;
+  /** Test seam for the short SQLite transaction. */
+  withDb: <T>(store: SqlStore, fn: (db: DatabaseSync) => T) => T;
+}
+
+export interface CodexAddResult {
+  slotId: string;
+  /** False means a same-identity slot was re-bound with --replace. */
+  added: boolean;
+}
+
+interface ExistingSlot {
+  fingerprint: string | null;
+}
+
+function withDatabase<T>(store: SqlStore, fn: (db: DatabaseSync) => T): T {
+  if (store.dbPath === ':memory:') return fn((store as unknown as { db: DatabaseSync }).db);
+  const db = new DatabaseSync(store.dbPath);
+  try {
+    db.exec('PRAGMA busy_timeout = 5000');
+    return fn(db);
+  } finally {
+    db.close();
+  }
+}
+
+function plan(doc: CodexAuthDocument): { slotId: string; chatgptUserId: string; accountId: string } {
+  try {
+    return planImportActiveCodex(doc);
+  } catch {
+    throw new CodexAddError('temporary Codex login has no S29 identity');
+  }
+}
+
+function stableDocument(result: CodexAuthStableResult): CodexAuthDocument {
+  if (result.status !== 'ok') throw new CodexAddError(`temporary Codex auth.json is ${result.status}`);
+  return result.doc;
+}
+
+function persist(doc: CodexAuthDocument, input: CodexAddInput, deps: CodexAddDeps): CodexAddResult {
+  const identity = plan(doc);
+  const fingerprint = codexFingerprint(doc);
+  const service = qlbKeychainService(PROVIDER, identity.slotId);
+  const withDb = deps.withDb;
+  let wroteCredential = false;
+  let priorCredential: string | undefined;
+  let exists = false;
+
+  try {
+    return withDb(deps.store, (db) => {
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        const existing = db.prepare('SELECT fingerprint FROM codex_slots WHERE account_id = ?')
+          .get(identity.slotId) as ExistingSlot | undefined;
+        exists = existing !== undefined;
+        if (existing && input.replace === undefined) {
+          throw new CodexAddError(`Codex slot already exists: ${identity.slotId}`, 3);
+        }
+        if (input.replace !== undefined && (!existing || input.replace !== identity.slotId)) {
+          throw new CodexAddError('Codex replacement identity differs; add as a new account and delete the old slot', 3);
+        }
+
+        if (existing?.fingerprint) {
+          priorCredential = deps.keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT);
+          deps.keychain.setSync(`${service}:prev`, QLB_KEYCHAIN_ACCOUNT, priorCredential);
+        }
+        deps.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(doc));
+        wroteCredential = true;
+
+        const now = deps.now();
+        db.prepare(`INSERT INTO codex_slots (
+          account_id, chatgpt_user_id, chatgpt_account_id, fingerprint, prev_fingerprint,
+          last_refresh, dead, pending_adopt, added_at, last_active_at, source, healed_at
+        ) VALUES (?, ?, ?, ?, NULL, ?, 0, 0, ?, NULL, 'qlb-add', NULL)
+        ON CONFLICT(account_id) DO UPDATE SET
+          chatgpt_user_id = excluded.chatgpt_user_id,
+          chatgpt_account_id = excluded.chatgpt_account_id,
+          prev_fingerprint = codex_slots.fingerprint,
+          fingerprint = excluded.fingerprint,
+          last_refresh = excluded.last_refresh,
+          dead = 0, dead_reason = NULL, dead_at = NULL, healed_at = excluded.added_at,
+          pending_adopt = 0, archived_at = NULL`).run(
+          identity.slotId, identity.chatgptUserId, identity.accountId, fingerprint, doc.last_refresh ?? null, now,
+        );
+        db.prepare(`INSERT INTO accounts (id, provider, label, status, created_at)
+          VALUES (?, ?, ?, 'active', ?)
+          ON CONFLICT(id) DO UPDATE SET provider = excluded.provider`)
+          .run(identity.accountId, PROVIDER, identity.accountId, now);
+        db.prepare(`INSERT INTO lineage_log (ts, provider, account_id, from_fp, to_fp, cause, by, evidence)
+          VALUES (?, ?, ?, ?, ?, ?, 'qlb-cli', ?)`)
+          .run(now, PROVIDER, identity.slotId, existing?.fingerprint ?? null, fingerprint, exists ? 'replace' : 'add', exists ? 'replace' : 'add');
+        if (exists) {
+          db.prepare(`INSERT INTO relogin_events (ts, provider, account_id, kind, detail, evidence)
+            VALUES (?, ?, ?, 'identity-replaced', NULL, 'identity')`)
+            .run(now, PROVIDER, identity.slotId);
+        }
+        db.exec('COMMIT');
+        return { slotId: identity.slotId, added: !exists };
+      } catch (error) {
+        try { db.exec('ROLLBACK'); } catch { /* retain the original failure */ }
+        throw error;
+      }
+    });
+  } catch (error) {
+    // A database failure must not leave an orphaned credential from this add.
+    if (wroteCredential) {
+      try {
+        if (priorCredential !== undefined) deps.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, priorCredential);
+        else deps.keychain.deleteSync(service, QLB_KEYCHAIN_ACCOUNT);
+      } catch { /* retain the primary persistence error */ }
+    }
+    throw error;
+  }
+}
+
+/**
+ * Adds one Codex account through an isolated file-store login. It never points
+ * Codex at the native home, and it never invokes logout.
+ */
+export async function addCodexAccount(input: CodexAddInput, deps: CodexAddDeps): Promise<CodexAddResult> {
+  const before = deps.hashFile(input.nativeAuthPath);
+  const temporaryHome = deps.createTemp(input.home);
+  let cleaned = false;
+  const cleanup = (): void => {
+    if (cleaned) return;
+    cleaned = true;
+    deps.removeTemp(temporaryHome);
+  };
+  const unregister = deps.installCleanup(cleanup);
+
+  try {
+    deps.writeConfig(join(temporaryHome, 'config.toml'), CODEX_FILE_CREDENTIAL_STORE_CONFIG);
+    const status = await deps.login({
+      command: 'codex', args: ['login'], cwd: temporaryHome, env: { ...deps.env, CODEX_HOME: temporaryHome },
+    });
+    if (status !== 0) throw new CodexAddError('codex login failed');
+
+    const doc = stableDocument(await deps.readAuth(join(temporaryHome, 'auth.json')));
+    if (deps.hashFile(input.nativeAuthPath) !== before) {
+      throw new CodexAddError('native Codex auth.json changed during isolated login', 3);
+    }
+    const result = persist(doc, input, deps);
+    if (deps.hashFile(input.nativeAuthPath) !== before) {
+      throw new CodexAddError('native Codex auth.json changed during isolated login', 3);
+    }
+    return result;
+  } finally {
+    unregister();
+    cleanup();
+  }
+}
+
+function createTemporaryHome(home: string): string {
+  const root = join(home, '.qlb', 'tmp');
+  mkdirSync(root, { recursive: true, mode: 0o700 });
+  chmodSync(root, 0o700);
+  const path = mkdtempSync(join(root, 'codex-add-'));
+  chmodSync(path, 0o700);
+  return path;
+}
+
+function writeTemporaryConfig(path: string, contents: string): void {
+  writeFileSync(path, contents, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+}
+
+function hashNativeAuth(path: string): string {
+  return createHash('sha256').update(readFileSync(path)).digest('hex');
+}
+
+function runCodexLogin(options: CodexLoginOptions): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(options.command, options.args, { cwd: options.cwd, env: options.env, stdio: 'inherit' });
+    child.once('error', reject);
+    child.once('exit', (code) => resolve(code ?? 1));
+  });
+}
+
+function installProcessCleanup(cleanup: () => void): () => void {
+  const safeCleanup = (): void => { try { cleanup(); } catch { /* exit cleanup is best effort */ } };
+  process.once('SIGINT', safeCleanup);
+  process.once('SIGTERM', safeCleanup);
+  process.once('exit', safeCleanup);
+  return () => {
+    process.removeListener('SIGINT', safeCleanup);
+    process.removeListener('SIGTERM', safeCleanup);
+    process.removeListener('exit', safeCleanup);
+  };
+}
+
+/** Production effects for the executing command; unit tests provide all seams. */
+export function productionCodexAddDeps(
+  store: SqlStore,
+  keychain: AddKeychain,
+  env: NodeJS.ProcessEnv = process.env,
+): CodexAddDeps {
+  return {
+    store,
+    keychain,
+    env,
+    now: Date.now,
+    createTemp: createTemporaryHome,
+    writeConfig: writeTemporaryConfig,
+    removeTemp: (path) => rmSync(path, { recursive: true, force: true }),
+    hashFile: hashNativeAuth,
+    login: runCodexLogin,
+    readAuth: readCodexAuthStable,
+    installCleanup: installProcessCleanup,
+    withDb: withDatabase,
+  };
+}
