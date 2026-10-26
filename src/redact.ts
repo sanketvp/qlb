@@ -63,6 +63,22 @@ export function redactSecrets(text: string, secrets: readonly string[]): string 
   return out;
 }
 
+const SENSITIVE_KEY_NAME = [...SENSITIVE_KEY]
+  .sort((left, right) => right.length - left.length)
+  .map((key) => key.split('').map(escapeRegExp).join('[_-]*'))
+  .join('|');
+const SENSITIVE_KEY_VALUE_TO_EOL = new RegExp(
+  `((?<![A-Za-z0-9])(?:${SENSITIVE_KEY_NAME})(?:["']?[ \\t]*[=:][ \\t]*))[^\\r\\n]*`,
+  'gi',
+);
+
+/** Redacts credentials in diagnostic key/value text that is not valid JSON. */
+export function redactKeyValueText(text: string, secrets: readonly string[]): string {
+  // Once a sensitive key has introduced a value, prefer losing the remainder
+  // of that diagnostic line to retaining an unrecognised credential fragment.
+  return redactSecrets(text, secrets).replace(SENSITIVE_KEY_VALUE_TO_EOL, `$1${REDACTED}`);
+}
+
 type RedactedValue = unknown | undefined;
 
 interface RedactOptions {
