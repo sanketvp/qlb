@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { MockKeychain, qlbKeychainService } from '../src/keychain';
+import { KeychainHelperUntrustedError } from '../src/credential-backends';
 import {
   RefreshLease,
   parseGrant,
@@ -118,6 +119,62 @@ describe('refresh lease — §4.8.2', () => {
     assert.equal(persisted.access, 'access-new');
     assert.equal(persisted.generation, 1);
     assert.equal(store.getLease(refreshLeaseName(id)), null, 'lease released');
+    store.close();
+  });
+
+  it('refuses an untrusted helper before the refresh HTTP call', async () => {
+    const store = openStore(':memory:');
+    const kc = new MockKeychain() as MockKeychain & { assertHelperUsable: () => void };
+    const id = 'acct-helper-untrusted';
+    const grant = nearExpiryGrant();
+    seedAccount(store, kc, id, grant);
+    let calls = 0;
+    kc.assertHelperUsable = () => {
+      throw new KeychainHelperUntrustedError('pinned leaf certificate did not verify');
+    };
+
+    const rl = new RefreshLease(store, kc, async () => {
+      calls += 1;
+      return farExpiryGrant();
+    });
+
+    await assert.rejects(
+      rl.refreshIfNeeded(id, grant),
+      /helper-untrusted: pinned leaf certificate did not verify/,
+    );
+    assert.equal(calls, 0);
+    assert.equal(store.getLease(refreshLeaseName(id)), null);
+    store.close();
+  });
+
+  it('preflights a trusted helper before refreshing and persists the renewed grant', async () => {
+    const store = openStore(':memory:');
+    const kc = new MockKeychain() as MockKeychain & { assertHelperUsable: () => void };
+    const id = 'acct-helper-trusted';
+    const grant = nearExpiryGrant();
+    const { service, account } = seedAccount(store, kc, id, grant);
+    let helperChecks = 0;
+    let httpCalls = 0;
+    let writes = 0;
+    const setSync = kc.setSync.bind(kc);
+    kc.setSync = (writeService, writeAccount, jsonValue) => {
+      writes += 1;
+      setSync(writeService, writeAccount, jsonValue);
+    };
+    writes = 0; // do not count fixture setup
+    kc.assertHelperUsable = () => { helperChecks += 1; };
+
+    const rl = new RefreshLease(store, kc, async () => {
+      httpCalls += 1;
+      return farExpiryGrant({ access: 'access-renewed', refresh: 'refresh-renewed' });
+    });
+    const result = await rl.refreshIfNeeded(id, grant);
+
+    assert.equal(helperChecks, 1);
+    assert.equal(httpCalls, 1);
+    assert.equal(writes, 1);
+    assert.equal(parseGrant(kc.getSync(service, account)).access, 'access-renewed');
+    assert.equal(result.access, 'access-renewed');
     store.close();
   });
 

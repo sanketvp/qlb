@@ -34,6 +34,10 @@ Two optional `Adapter` fields (`src/types.ts`) tailor refresh behavior; absent m
 - **Confidence:** `authoritative` once a header-derived reading exists; `unknown` before that (which makes the account a cold-start candidate only, never excluded by a missing number).
 - **Caveats:** because every reading requires a real request, Codex data is exactly as fresh as the last request that went through. There is no free refresh, and QLB does not send probe requests on its own in the CLI path.
 
+### Pi OAuth source compatibility (P3)
+
+Pi's `pi-ai/auth/oauth/openai-codex.js` was not present in this repository's `node_modules` while P3 was built, so this slice does not substitute a copy from a global Pi installation. The local P7a migration contract documents the Pi OAuth field set used for compatibility: `src/pi-migrate.ts:43` emits the `{type, access, refresh, expires}` placeholder shape and `src/pi-migrate.ts:56` validates non-empty `access` and `refresh` strings plus a finite numeric `expires`. P3 receives the ephemeral access token only from `qlb gate openai-codex --json`; it sends `Authorization: Bearer <token>` and uses the gate's bare `chatgptAccountId` (not the composite QLB `accountId`) for `ChatGPT-Account-Id`.
+
 ## xAI / Grok (`xai`)
 
 - **Credential source:** the `xai` entry (OAuth `access`/`expires`) in Pi's `auth.json` (configurable via `QLB_PI_AUTH_JSON_PATH`). Read-only: if the grant is expired, the adapter reports `xai grant expired — run pi once to refresh it` rather than refreshing it itself.

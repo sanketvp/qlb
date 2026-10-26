@@ -105,16 +105,18 @@ function stringOrNull(value: unknown): string | null {
   return typeof value === 'string' ? value : null;
 }
 
+export function phaseForConnection(db: DatabaseSync): LifecycleRow {
+  const row = db.prepare(`SELECT * FROM lifecycle WHERE state IN (${OPEN_STATES.map(() => '?').join(', ')})
+    ORDER BY id DESC LIMIT 1`).get(...OPEN_STATES) as Record<string, unknown> | undefined;
+  return row ? rowFromSql(row) : {
+    id: 0, state: 'pre-cutover', beganAt: 0, cutoverAt: null, windowEnd: null, extendedAt: null,
+    undoBeganAt: null, rollbackAt: null, retiredAt: null, closedAt: null, releaseSha: null,
+    drillDoneAt: null, note: null, preFenceState: null,
+  };
+}
+
 export function phase(store: Pick<Store, 'dbPath'>): LifecycleRow {
-  return withDb(store, (db) => {
-    const row = db.prepare(`SELECT * FROM lifecycle WHERE state IN (${OPEN_STATES.map(() => '?').join(', ')})
-      ORDER BY id DESC LIMIT 1`).get(...OPEN_STATES) as Record<string, unknown> | undefined;
-    return row ? rowFromSql(row) : {
-      id: 0, state: 'pre-cutover', beganAt: 0, cutoverAt: null, windowEnd: null, extendedAt: null,
-      undoBeganAt: null, rollbackAt: null, retiredAt: null, closedAt: null, releaseSha: null,
-      drillDoneAt: null, note: null, preFenceState: null,
-    };
-  });
+  return withDb(store, phaseForConnection);
 }
 
 export function isOperational(state: LifecycleState): boolean {
@@ -122,8 +124,7 @@ export function isOperational(state: LifecycleState): boolean {
 }
 
 /** Admission must be called before locks or journal reconciliation (S43/S59). */
-export function assertAdmitted(store: Store, operation: LifecycleOperation): LifecycleResult {
-  const current = phase(store);
+function assertAdmittedForPhase(current: LifecycleRow, operation: LifecycleOperation): LifecycleResult {
   if (current.state !== 'undoing' && operation.endsWith(':dry-run')) return { ok: true, row: current };
   // cutoverBegin's compensation uses its durable primitives directly. Every
   // separately admitted mutation must wait until that transaction clears this marker.
@@ -132,6 +133,15 @@ export function assertAdmitted(store: Store, operation: LifecycleOperation): Lif
   }
   if (PHASE_RULES[current.state].has(operation)) return { ok: true, row: current };
   return { ok: false, code: current.state === 'undoing' ? 'undo-in-progress' : `phase=${current.state}`, row: current };
+}
+
+/** Checks lifecycle admission with the caller's transaction-owning connection. */
+export function assertAdmittedInConnection(db: DatabaseSync, operation: LifecycleOperation): LifecycleResult {
+  return assertAdmittedForPhase(phaseForConnection(db), operation);
+}
+
+export function assertAdmitted(store: Store, operation: LifecycleOperation): LifecycleResult {
+  return assertAdmittedForPhase(phase(store), operation);
 }
 
 const TRANSITIONS: Partial<Record<LifecycleState, LifecycleState[]>> = {

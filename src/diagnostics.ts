@@ -1,4 +1,4 @@
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync, spawnSync, type ExecFileSyncOptionsWithStringEncoding } from 'node:child_process';
 import {
   inspectHelperSigning as inspectHelperSigningAt,
   verifyHelperIdentity,
@@ -45,6 +45,7 @@ import { hermesIntegrationChecks } from './hermes-integration';
 import { piIntegrationChecks } from './pi-integration';
 import { piExtensionDriftCheck } from './checks/pi-extension-drift';
 import { piStaleSessionsCheck } from './checks/pi-stale-sessions';
+import { piEvidenceGapCheck } from './checks/pi-evidence-gap';
 import { qlbHomeDir } from './home';
 import { piReleaseAppDir } from './pi-deploy';
 import { probeHostEnvironment, type HostCommandRunner } from './checks/hosts-env';
@@ -59,6 +60,9 @@ import { openStoreConnection } from './store';
 import { discoverChecks, type CheckDefinition } from './registry';
 import { lifecycleWindowCheck } from './checks/lifecycle-window';
 import { lifecycleDrillCheck } from './checks/lifecycle-drill';
+import { claudeConfigPathCheck } from './checks/claude-config-path';
+import { claudeConfigFileCheck } from './checks/claude-config-file';
+import { claudeLocksCheck } from './checks/claude-locks';
 
 export type CheckLevel = 'PASS' | 'WARN' | 'FAIL' | 'INFO' | 'N/A';
 
@@ -191,13 +195,20 @@ export function createCommandRunner(exec: ExecFileSyncFn = execFileUtf8): Comman
 const runCommand = createCommandRunner();
 
 /** A bounded runner for host probes; never return login-shell environment output. */
-const runHostCommand: HostCommandRunner = (command, args, options) =>
-  execFileSync(command, args, {
+// detached: hosts:env runs `<shell> -lic env`. An interactive shell attached to the caller's
+// terminal makes itself the terminal's foreground group and never hands it back, so a Pi session
+// that ran doctor could no longer restore its terminal and exited 129 on quit. Node's sync spawn
+// honours `detached` (src/spawn_sync.cc) but its typings omit it; the hosts-env test pins it.
+export const runHostCommand: HostCommandRunner = (command, args, options) => {
+  const spawnOptions: ExecFileSyncOptionsWithStringEncoding & { detached: boolean } = {
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'ignore'],
     timeout: 5_000,
     env: options?.env,
-  });
+    detached: true,
+  };
+  return execFileSync(command, args, spawnOptions);
+};
 
 function readJson(path: string): Record<string, unknown> | null {
   try {
@@ -673,6 +684,9 @@ export async function doctorQlb(
 
   const phase = lifecycle.phase;
   checks.push(
+    claudeConfigPathCheck(),
+    claudeConfigFileCheck(),
+    claudeLocksCheck(),
     autoBreakerCheck(config.dbPath, 'anthropic', lifecycle),
     claudeOauthClientCheck(config.dbPath, lifecycle),
     claudeSlotsCheck(config.dbPath, phase),
@@ -755,6 +769,7 @@ export async function doctorQlb(
       ? () => { throw new Error('Pi process listing requires an injected fixture in test mode'); }
       : undefined),
   }));
+  checks.push(piEvidenceGapCheck(config.dbPath));
 
   const providers = inspectProviders(config, options.command);
   if (options.live) {

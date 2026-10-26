@@ -26,10 +26,12 @@ import {
 } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { qlbHomeDir } from './home';
-import { defaultConfig } from './config';
+import { resolveConfig } from './config';
 import {
+  inspectHelperSigning,
   verifyHelperIdentity,
   type HelperIdentityVerification,
+  type HelperSigningState,
 } from './helper-signing';
 
 export interface CredentialBackend {
@@ -41,6 +43,8 @@ export interface CredentialBackend {
   setSync(service: string, account: string, jsonValue: string): void;
   getSync(service: string, account: string): string;
   deleteSync(service: string, account: string): void;
+  /** Refuses an unusable Keychain helper without sending credential bytes. */
+  assertHelperUsable?(): void;
 }
 
 export type CredentialBackendKind =
@@ -253,18 +257,27 @@ export class KeychainHelperUntrustedError extends Error {
 
 export type HelperConfigReader = (key: string) => string | null;
 type HelperIdentityVerifier = (path: string, pin: string) => HelperIdentityVerification;
+type HelperSigningInspector = (path: string) => HelperSigningState | null;
 
-function defaultHelperConfigReader(key: string): string | null {
+/**
+ * Returns null only when no pin can have been recorded (no database yet, or no
+ * config table). Any other read failure refuses, so a damaged or unreadable
+ * database never downgrades a pinned host to the pinless check.
+ */
+export function defaultHelperConfigReader(key: string): string | null {
+  const dbPath = resolveConfig().dbPath;
+  if (!existsSync(dbPath)) return null;
   try {
-    const db = new DatabaseSync(defaultConfig().dbPath, { readOnly: true });
+    const db = new DatabaseSync(dbPath, { readOnly: true });
     try {
       const row = db.prepare('SELECT value FROM config WHERE key = ?').get(key) as { value?: unknown } | undefined;
       return typeof row?.value === 'string' ? row.value : null;
     } finally {
       db.close();
     }
-  } catch {
-    return null;
+  } catch (error) {
+    if (/no such table: config\b/.test((error as Error | undefined)?.message ?? '')) return null;
+    throw new KeychainHelperUntrustedError('could not read the recorded helper pin from the QLB database');
   }
 }
 
@@ -272,11 +285,21 @@ function assertTrustedHelper(
   path: string,
   configReader: HelperConfigReader,
   verifier: HelperIdentityVerifier,
+  inspect: HelperSigningInspector,
 ): void {
   assertHelperPresent(path);
   const pin = configReader('keychain.helperCheckIdentityHash');
   if (!pin) {
-    throw new KeychainHelperUntrustedError('no pinned helper identity', 'qlb keychain check-launchd');
+    // First-run hosts have no matrix pin yet. Match release installation's
+    // pinless gate: codesign --verify --strict plus the exact helper authority.
+    const signing = inspect(path);
+    if (!signing) throw new KeychainHelperUntrustedError('helper signature did not verify');
+    if (signing.authority !== 'QLB Keychain Helper') {
+      throw new KeychainHelperUntrustedError(
+        `helper signed by ${signing.authority}, expected QLB Keychain Helper`,
+      );
+    }
+    return;
   }
   const verification = verifier(path, pin);
   if (!verification.trusted) throw new KeychainHelperUntrustedError(verification.reason);
@@ -335,6 +358,7 @@ export class MacosKeychainBackend extends SyncCredentialBackend {
   private readonly helperPath?: string;
   private readonly helperConfigReader?: HelperConfigReader;
   private readonly helperIdentityVerifier?: HelperIdentityVerifier;
+  private readonly helperSigningInspector?: HelperSigningInspector;
 
   constructor(opts: {
     execFileSync?: ExecFileSyncFn;
@@ -343,6 +367,8 @@ export class MacosKeychainBackend extends SyncCredentialBackend {
     helperConfigReader?: HelperConfigReader;
     /** Injectable only for hermetic codesign verification tests. */
     helperIdentityVerifier?: HelperIdentityVerifier;
+    /** Injectable only for hermetic pinless helper-signing tests. */
+    helperSigningInspector?: HelperSigningInspector;
   } = {}) {
     super();
     this.exec = opts.execFileSync ?? execFileUtf8;
@@ -350,13 +376,14 @@ export class MacosKeychainBackend extends SyncCredentialBackend {
     this.helperPath = opts.helperPath;
     this.helperConfigReader = opts.helperConfigReader;
     this.helperIdentityVerifier = opts.helperIdentityVerifier;
+    this.helperSigningInspector = opts.helperSigningInspector;
     if (isQlbTestMode() && !this.fakeExecutor) throw new NativeKeychainDisabled();
   }
 
   setSync(service: string, account: string, jsonValue: string): void {
     this.assertNativeAccessEnabled();
     const helper = this.helperPath ?? defaultKeychainHelperPath();
-    this.assertTrustedHelper(helper);
+    this.assertHelperUsable();
     try {
       // Every write, including test doubles, follows the helper's stdin protocol.
       this.exec(helper, ['set', service, account], {
@@ -391,7 +418,7 @@ export class MacosKeychainBackend extends SyncCredentialBackend {
   deleteSync(service: string, account: string): void {
     this.assertNativeAccessEnabled();
     const helper = this.helperPath ?? defaultKeychainHelperPath();
-    this.assertTrustedHelper(helper);
+    this.assertHelperUsable();
     try {
       this.exec(helper, ['delete', service, account], {
         encoding: 'utf8', timeout: MACOS_SECURITY_TIMEOUT_MS,
@@ -405,15 +432,19 @@ export class MacosKeychainBackend extends SyncCredentialBackend {
     }
   }
 
-  private assertTrustedHelper(path: string): void {
+  /** Verifies helper trust without sending any credential bytes to it. */
+  assertHelperUsable(): void {
+    this.assertNativeAccessEnabled();
+    const helper = this.helperPath ?? defaultKeychainHelperPath();
     // A plain fake executor cannot invoke a real helper. Tests opt into this
     // gate explicitly with either injected dependency, so production always
     // reads and verifies the pin immediately before the helper spawn.
-    if (!this.fakeExecutor || this.helperConfigReader || this.helperIdentityVerifier) {
+    if (!this.fakeExecutor || this.helperConfigReader || this.helperIdentityVerifier || this.helperSigningInspector) {
       assertTrustedHelper(
-        path,
+        helper,
         this.helperConfigReader ?? defaultHelperConfigReader,
         this.helperIdentityVerifier ?? verifyHelperIdentity,
+        this.helperSigningInspector ?? inspectHelperSigning,
       );
     }
   }

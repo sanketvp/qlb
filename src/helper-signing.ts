@@ -51,7 +51,7 @@ export function verifyHelperIdentity(
   if (!existsSync(path)) return { trusted: false, reason: 'helper is missing' };
   try {
     const verification = spawn('/usr/bin/codesign', [
-      '--verify', '--strict', '-R', `certificate leaf = H"${pin}"`, path,
+      '--verify', '--strict', '-R', `=certificate leaf = H"${pin}"`, path,
     ], { encoding: 'utf8' });
     return verification.status === 0
       ? { trusted: true }

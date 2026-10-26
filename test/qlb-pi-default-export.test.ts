@@ -19,6 +19,7 @@ const piAvailable = existsSync(join(PI_GLOBAL_ROOT, 'node_modules', 'jiti', 'lib
 interface SmokeResult {
   calls: string[];
   poolStillRegistered: boolean;
+  xaiStillRegistered: boolean;
   events: Array<{ type?: string; error?: { errorMessage?: string } }>;
 }
 
@@ -136,5 +137,11 @@ describe('qlb-pi production default export (Pi jiti loader)', { skip: piAvailabl
     const r = load({ owner: '{"accounts":[]}', states: 'NATIVE' });
     assert.deepEqual(r.calls, ['unregister:anthropic', 'register:anthropic']);
     assert.equal(r.poolStillRegistered, false);
+  });
+
+  it('leaves native xAI registered during an Anthropic-only rehearsal without an xAI owner entry', () => {
+    const r = load({ states: 'NATIVE', env: { QLB_PI_REHEARSAL: '1' } });
+    assert.equal(r.xaiStillRegistered, true);
+    assert.deepEqual(r.calls, ['unregister:anthropic', 'register:anthropic']);
   });
 });

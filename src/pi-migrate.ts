@@ -141,6 +141,9 @@ function assertOutsideGitWorktree(path: string, qlbHome: string): void {
   try { const top = String(execFileSync('git', ['-C', dirname(resolved), 'rev-parse', '--show-toplevel'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })).trim(); if (top) throw new Error(`refusing Pi migration write inside git work tree: ${resolved}`); } catch (error) { if (error instanceof Error && error.message.startsWith('refusing Pi migration')) throw error; }
 }
 function checkPaths(paths: PiMigratePaths, deps: PiMigrateDeps): void { for (const path of [paths.authJsonPath, paths.ownerPath]) { deps.checkWritablePath?.(path); assertOutsideGitWorktree(path, qlbHomeDir()); } }
+export function isPiQlbOwnerEntry(entry: unknown): boolean {
+  return !!entry && typeof entry === 'object' && !Array.isArray(entry) && (entry as JsonObject).mode === 'qlb';
+}
 function ownerFor(provider: PiSingleProvider, previous: JsonObject): JsonObject { return { providers: { ...(previous.providers as JsonObject), [provider]: { mode: 'qlb', since: Date.now() } } }; }
 function baselineValue(provider: PiSingleProvider, auth: JsonObject, deps: PiMigrateDeps): unknown {
   if (provider !== 'openrouter') return auth[provider];
