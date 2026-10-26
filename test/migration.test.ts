@@ -14,6 +14,7 @@ import {
   type StagedAccount,
 } from '../src/migration';
 import { parseGrant } from '../src/refresh-lease';
+import { withPiAuthLock, writePiOwnerEntry } from '../src/pi-migrate';
 import { openStore } from '../src/store';
 
 const FIXTURE_ACCOUNTS = [
@@ -199,6 +200,38 @@ describe('migration state machine — §4.8.3 / §4.8.3a', () => {
       assert.deepEqual(readFileSync(h.ownerPath), before);
       assert.equal(existsSync(stagingOwnerPath(h.ownerPath)), false, 'stage must not create staging');
       assert.equal(qlbWorks(h.kc), false, 'stage must not write Keychain credentials');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('refuses a pool commit when a v2 writer interleaves through the owner-map lock', async () => {
+    const h = setup();
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      const interleaved = new Migration(
+        h.store,
+        h.kc,
+        h.poolPath,
+        h.ownerPath,
+        undefined,
+        {
+          beforePoolCommitLock: () => {
+            withPiAuthLock(join(h.dir, 'auth.json'), () => {
+              writePiOwnerEntry(h.ownerPath, 'openrouter', true);
+            });
+          },
+        },
+      );
+
+      assert.throws(() => interleaved.commit(), /owner-map-present: anthropic pool migration waits for P7b8/);
+
+      const owner = JSON.parse(readFileSync(h.ownerPath, 'utf8')) as {
+        providers: Record<string, { mode?: string }>;
+      };
+      assert.equal(owner.providers.openrouter?.mode, 'qlb', 'the v2 entry is never lost to the pool rename');
+      assert.equal(existsSync(stagingOwnerPath(h.ownerPath)), true, 'refused commit leaves staging for rollback');
     } finally {
       h.cleanup();
     }

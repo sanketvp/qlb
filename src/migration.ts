@@ -103,6 +103,7 @@
 // strictly before unlinking the owner file.
 
 import { createHash } from 'node:crypto';
+import { isCredentialNotFound } from './credential-backends';
 import {
   chmodSync,
   closeSync,
@@ -307,6 +308,8 @@ export interface MigrationConfig {
    * Never writes the native service.
    */
   readNativeKey?: () => string;
+  /** Test-only barrier before a pool takes the final owner-map lock. */
+  beforePoolCommitLock?: () => void;
 }
 
 /**
@@ -735,6 +738,7 @@ export class Migration {
   readonly provider: string | undefined;
   readonly authJsonKey: string | undefined;
   private readonly readNativeKey: (() => string) | undefined;
+  private readonly beforePoolCommitLock: (() => void) | undefined;
 
   constructor(
     store: Store,
@@ -754,6 +758,7 @@ export class Migration {
     this.provider = config.provider;
     this.authJsonKey = config.authJsonKey ?? config.provider;
     this.readNativeKey = config.readNativeKey;
+    this.beforePoolCommitLock = config.beforePoolCommitLock;
   }
 
   private ownerProvider(): MigrateProvider {
@@ -817,15 +822,20 @@ export class Migration {
     }
   }
 
+  private staticKeychainLocations(): Array<{ service: string; account: string }> {
+    if (this.kind !== 'static-key' || this.ownerProvider() !== 'openrouter') return [];
+    return [
+      keychainCoords('openrouter', ADAPTER_ACCOUNT_IDS.openrouter, ADAPTER_ACCOUNT_LABELS.openrouter),
+      {
+        service: qlbKeychainService('openrouter', ADAPTER_ACCOUNT_IDS.openrouter),
+        account: ADAPTER_ACCOUNT_LABELS.openrouter,
+      },
+    ];
+  }
+
   /** Gate coordinates supersede the pre-P7b4 OpenRouter Keychain location. */
   private staticKeychainCoords(): { service: string; account: string } | null {
-    if (this.kind !== 'static-key' || this.ownerProvider() !== 'openrouter') return null;
-    const gate = keychainCoords('openrouter', ADAPTER_ACCOUNT_IDS.openrouter, ADAPTER_ACCOUNT_LABELS.openrouter);
-    const legacy = {
-      service: qlbKeychainService('openrouter', ADAPTER_ACCOUNT_IDS.openrouter),
-      account: ADAPTER_ACCOUNT_LABELS.openrouter,
-    };
-    for (const coords of [gate, legacy]) {
+    for (const coords of this.staticKeychainLocations()) {
       try {
         this.keychain.getSync(coords.service, coords.account);
         return coords;
@@ -836,12 +846,17 @@ export class Migration {
     return null;
   }
 
-  private deleteStaticKeychain(coords: { service: string; account: string } | null): void {
-    if (!coords) return;
-    try {
-      this.keychain.deleteSync(coords.service, coords.account);
-    } catch {
-      // Already gone or concurrently removed; rollback remains idempotent.
+  /** Remove every managed OpenRouter copy; only an absent item is idempotent. */
+  private deleteStaticKeychain(): void {
+    for (const coords of this.staticKeychainLocations()) {
+      try {
+        this.keychain.deleteSync(coords.service, coords.account);
+      } catch (error) {
+        if (isCredentialNotFound(error)) continue;
+        throw new Error(
+          `OpenRouter rollback Keychain delete failed at service=${coords.service} account=${coords.account}`,
+        );
+      }
     }
   }
 
@@ -1093,12 +1108,20 @@ export class Migration {
       return this.finishHygiene();
     }
 
-    // The map can have appeared after stage(), so make the P7b8 boundary
-    // check immediately before the pool's destructive v1 rename.
-    this.refusePoolOwnerMap();
-
-    // C — THE ONLY COMMIT POINT (atomic rename on APFS/POSIX).
-    renameSync(staging, this.ownerFilePath);
+    if (this.kind === 'pool') {
+      // Test-only interleaving barrier. A v2 writer that gets the lock here
+      // must be observed by the final check below, never overwritten.
+      this.beforePoolCommitLock?.();
+      // The map can have appeared after stage(). Hold the same lock as every
+      // v2 writer from the final P7b8 boundary check through the v1 rename.
+      this.withOwnerMapLock(() => {
+        this.refusePoolOwnerMap();
+        renameSync(staging, this.ownerFilePath);
+      });
+    } else {
+      // C — THE ONLY COMMIT POINT (atomic rename on APFS/POSIX).
+      renameSync(staging, this.ownerFilePath);
+    }
     try {
       chmodSync(this.ownerFilePath, 0o600);
     } catch {
@@ -1374,7 +1397,7 @@ export class Migration {
     if (!accounts) return;
     for (const meta of accounts) {
       if (meta.provider === 'openrouter') {
-        this.deleteStaticKeychain(this.staticKeychainCoords());
+        this.deleteStaticKeychain();
         continue;
       }
       const { service, account } = keychainCoords(meta.provider, meta.id, meta.label);
@@ -1405,13 +1428,14 @@ export class Migration {
     if (this.retainsNative()) {
       // Native was never moved (auth.json shadow-retained, or Keychain retained).
       if (this.kind === 'static-key') {
-        const staticCredential = this.staticKeychainCoords();
+        // Delete both QLB coordinate generations before dropping ownership;
+        // a non-not-found failure leaves the claim in place for a safe retry.
+        this.deleteStaticKeychain();
         if (this.ownerEntryPresentAt(this.ownerMapPath)) {
           this.withOwnerMapLock(() => writePiOwnerEntry(this.ownerMapPath, this.ownerProvider(), false));
         }
         const legacy = this.legacySidecarPath();
         if (legacy) unlinkIfExists(legacy);
-        this.deleteStaticKeychain(staticCredential);
       } else {
         unlinkIfExists(this.ownerFilePath);
       }

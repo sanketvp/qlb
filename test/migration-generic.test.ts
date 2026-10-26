@@ -476,12 +476,17 @@ describe('static-key migration — openrouter (single API key, no OAuth)', () =>
     }
   });
 
-  it('rolls back a legacy-coordinate OpenRouter credential without leaving either Keychain item', () => {
+  it('rolls back OpenRouter credentials at both gate and legacy coordinates', () => {
     const h = setupOpenRouter();
     try {
       const legacyPath = join(h.dir, 'qlb-owner-openrouter.json');
       const legacyService = qlbKeychainService('openrouter', OPENROUTER_ID);
       writeFileSync(legacyPath, JSON.stringify({ owner: 'qlb', accounts: [{ provider: 'openrouter' }] }) + '\n');
+      h.kc.setSync(
+        OPENROUTER_GATE_KEYCHAIN_SERVICE,
+        QLB_KEYCHAIN_ACCOUNT,
+        JSON.stringify({ type: 'api-key', access: FAKE_OPENROUTER_KEY }),
+      );
       h.kc.setSync(
         legacyService,
         OPENROUTER_LABEL,
@@ -495,8 +500,32 @@ describe('static-key migration — openrouter (single API key, no OAuth)', () =>
       assert.equal(rolled.state, 'VALIDATED');
       assert.equal(rolled.ownerFile, 'absent');
       assert.equal(existsSync(legacyPath), false);
-      assert.equal(openrouterKeychainHas(h.kc), false, 'gate coordinates remain absent');
+      assert.equal(openrouterKeychainHas(h.kc), false, 'gate credential removed');
       assert.throws(() => h.kc.getSync(legacyService, OPENROUTER_LABEL), /not found/i);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('fails rollback on a non-not-found OpenRouter Keychain delete error and names its coordinates', async () => {
+    const h = setupOpenRouter();
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockOpenRouterRehearse([]));
+      h.mig.commit();
+      const originalDelete = h.kc.deleteSync.bind(h.kc);
+      h.kc.deleteSync = (service, account) => {
+        if (service === OPENROUTER_GATE_KEYCHAIN_SERVICE && account === QLB_KEYCHAIN_ACCOUNT) {
+          throw new Error('fixture Keychain access denied');
+        }
+        originalDelete(service, account);
+      };
+
+      assert.throws(
+        () => h.mig.rollback(),
+        new RegExp(`service=${OPENROUTER_GATE_KEYCHAIN_SERVICE} account=${QLB_KEYCHAIN_ACCOUNT}`),
+      );
+      assert.equal(h.mig.status().ownerFile, 'present', 'failed rollback retains QLB ownership for retry');
     } finally {
       h.cleanup();
     }
