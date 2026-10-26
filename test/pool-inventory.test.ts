@@ -19,7 +19,8 @@ import {
 import { runPiPoolInventoryCommand } from '../src/commands/pi-pool-inventory';
 import { beginCutover } from '../src/lifecycle';
 import type { CommandContext } from '../src/registry';
-import { openStore } from '../src/store';
+import { DatabaseSync } from 'node:sqlite';
+import { openStore, type PiExportTargetRow } from '../src/store';
 
 const NOW = 1_700_000_000_000;
 const FP_A = `sha256:${'a'.repeat(64)}`;
@@ -170,6 +171,134 @@ describe('anthropic-pool inventory (P11, AC52)', () => {
     }
   });
 
+  it('classifies and records within one immediate transaction that blocks an external slot archive', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-pool-inventory-'));
+    const dbPath = join(dir, 'qlb.db');
+    const setup = openStore(dbPath);
+    try {
+      beginCutover(setup, NOW);
+      (setup as unknown as { db: { prepare(sql: string): { run(...args: unknown[]): unknown } } }).db.prepare(
+        "INSERT INTO claude_slots (account_id, config_json, fingerprint, dead, added_at) VALUES (?, '{}', ?, 0, ?)",
+      ).run('slot-a', FP_A, NOW);
+    } finally {
+      setup.close();
+    }
+
+    const output: string[] = [];
+    const commandContext = context(output);
+    commandContext.config = { ...commandContext.config, dbPath };
+    assert.equal(runPiPoolInventoryCommand(['--against', 'slots', '--record'], commandContext, {
+      openStore,
+      loadEntries: () => [entries[0]!],
+      loadCswapLineages: () => [],
+      loadSlotLineages: (store) => {
+        const lineages = slotInventoryLineages(store);
+        const writer = new DatabaseSync(dbPath);
+        try {
+          writer.exec('PRAGMA busy_timeout = 0');
+          assert.throws(
+            () => writer.prepare('UPDATE claude_slots SET archived_at = ? WHERE account_id = ?').run(NOW, 'slot-a'),
+            /SQLITE_BUSY|database is locked/i,
+          );
+        } finally {
+          writer.close();
+        }
+        return lineages;
+      },
+      admitRecord: () => ({ ok: true }),
+      now: () => NOW,
+    }), 0);
+
+    const check = openStore(dbPath);
+    try {
+      assert.deepEqual(check.listAnthropicSlotLineageChains(), [{ accountId: 'slot-a', lineages: [FP_A] }]);
+      assert.deepEqual(check.listPiExportTargets('anthropic').map((row) => ({ ...row })), [{
+        provider: 'anthropic', target: 'pool-a', slotAccountId: 'slot-a', lineageFp: FP_A, recordedAt: NOW,
+      }]);
+    } finally {
+      check.close();
+    }
+  });
+
+  it('uses a slot change committed immediately before the recording transaction', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-pool-inventory-'));
+    const dbPath = join(dir, 'qlb.db');
+    const store = openStore(dbPath);
+    try {
+      beginCutover(store, NOW);
+      (store as unknown as { db: { prepare(sql: string): { run(...args: unknown[]): unknown } } }).db.prepare(
+        "INSERT INTO claude_slots (account_id, config_json, fingerprint, dead, added_at) VALUES (?, '{}', ?, 0, ?)",
+      ).run('slot-a', FP_A, NOW);
+
+      const recordingStore = Object.create(store) as typeof store;
+      recordingStore.close = () => {};
+      recordingStore.recordPiExportTargetsIfEmptyClassified = <T extends { targets: PiExportTargetRow[] }>(
+        provider: string,
+        classifyInTransaction: () => T,
+        admit: (db: DatabaseSync) => { ok: boolean; code?: string },
+      ) => {
+        const writer = new DatabaseSync(dbPath);
+        try {
+          writer.prepare('UPDATE claude_slots SET fingerprint = ? WHERE account_id = ?').run(FP_B, 'slot-a');
+        } finally {
+          writer.close();
+        }
+        return store.recordPiExportTargetsIfEmptyClassified(provider, classifyInTransaction, admit);
+      };
+      const output: string[] = [];
+      const commandContext = context(output);
+      commandContext.config = { ...commandContext.config, dbPath };
+      assert.equal(runPiPoolInventoryCommand(['--against', 'slots', '--record'], commandContext, {
+        openStore: () => recordingStore,
+        loadEntries: () => [{ target: 'pool-b', lineageFp: FP_B, expiresAt: null }],
+        loadCswapLineages: () => [],
+        loadSlotLineages: (opened) => slotInventoryLineages(opened),
+        admitRecord: () => ({ ok: true }),
+        now: () => NOW,
+      }), 0);
+      assert.deepEqual(store.listPiExportTargets('anthropic').map((row) => ({ ...row })), [{
+        provider: 'anthropic', target: 'pool-b', slotAccountId: 'slot-a', lineageFp: FP_B, recordedAt: NOW,
+      }]);
+    } finally {
+      store.close();
+    }
+  });
+
+  it('rolls back and refuses a conflicting in-transaction slot classification', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-pool-inventory-'));
+    const dbPath = join(dir, 'qlb.db');
+    const setup = openStore(dbPath);
+    try {
+      (setup as unknown as { db: { prepare(sql: string): { run(...args: unknown[]): unknown } } }).db.prepare(
+        "INSERT INTO claude_slots (account_id, config_json, fingerprint, dead, added_at) VALUES (?, '{}', ?, 0, ?)",
+      ).run('slot-a', FP_A, NOW);
+      (setup as unknown as { db: { prepare(sql: string): { run(...args: unknown[]): unknown } } }).db.prepare(
+        "INSERT INTO claude_slots (account_id, config_json, fingerprint, dead, added_at) VALUES (?, '{}', ?, 0, ?)",
+      ).run('slot-b', FP_A, NOW);
+    } finally {
+      setup.close();
+    }
+
+    const output: string[] = [];
+    const commandContext = context(output);
+    commandContext.config = { ...commandContext.config, dbPath };
+    assert.equal(runPiPoolInventoryCommand(['--against', 'slots', '--record'], commandContext, {
+      openStore,
+      loadEntries: () => [entries[0]!],
+      loadCswapLineages: () => [],
+      loadSlotLineages: (store) => slotInventoryLineages(store),
+      admitRecord: () => ({ ok: true }),
+      now: () => NOW,
+    }), 3);
+    assert.equal(output.at(-1), 'ERR:qlb pi pool-inventory: refused: ambiguous-source-lineage');
+    const check = openStore(dbPath);
+    try {
+      assert.deepEqual(check.listPiExportTargets('anthropic'), []);
+    } finally {
+      check.close();
+    }
+  });
+
   it('invents no partial pool view and includes all strict .lkg lineages', () => {
     const dir = mkdtempSync(join(tmpdir(), 'qlb-pool-inventory-'));
     const poolPath = join(dir, 'anthropic-pool.json');
@@ -227,6 +356,11 @@ describe('anthropic-pool inventory (P11, AC52)', () => {
         replacements.push(targets);
         return { ok: true };
       },
+      recordPiExportTargetsIfEmptyClassified: <T extends { targets: unknown[] }>(_provider: string, classifyInTransaction: () => T) => {
+        const result = classifyInTransaction();
+        replacements.push(result.targets);
+        return { ok: true as const, result };
+      },
       listPiExportTargets: () => [], close: () => {},
       listAnthropicSlotLineages: () => [],
       listAnthropicSlotLineageChains: () => [],
@@ -247,6 +381,7 @@ describe('anthropic-pool inventory (P11, AC52)', () => {
     const existing = { ...deps, openStore: () => ({
       ...store,
       recordPiExportTargetsIfEmpty: () => ({ ok: false, code: 'pi-export-targets-exist' }),
+      recordPiExportTargetsIfEmptyClassified: () => ({ ok: false as const, code: 'pi-export-targets-exist' }),
     }) };
     assert.equal(runPiPoolInventoryCommand(['--against', 'slots', '--record'], context(output), existing), 3);
     assert.equal(output.at(-1), 'ERR:qlb pi pool-inventory: refused: pi-export-targets-exist');
@@ -260,6 +395,7 @@ describe('anthropic-pool inventory (P11, AC52)', () => {
       openStore: () => ({
         ...store,
         recordPiExportTargetsIfEmpty: () => ({ ok: true }),
+        recordPiExportTargetsIfEmptyClassified: <T extends { targets: unknown[] }>(_provider: string, classifyInTransaction: () => T) => ({ ok: true as const, result: classifyInTransaction() }),
         close: () => {}, listPiExportTargets: () => [],
         listAnthropicSlotLineageChains: () => [],
       }),

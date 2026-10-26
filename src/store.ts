@@ -80,6 +80,11 @@ export interface PiExportTargetRecordResult {
   code?: string;
 }
 
+/** Result of classifying and add-only recording on one immediate transaction. */
+export type PiExportTargetClassifiedRecordResult<T> =
+  | { ok: true; result: T }
+  | { ok: false; code?: string };
+
 /** Credential-migration journal (§4.8.3). One row per native store. */
 export interface MigrationRow {
   store: string;
@@ -2119,6 +2124,33 @@ export class Store {
         insert.run(target.provider, target.target, target.slotAccountId, target.lineageFp, target.recordedAt);
       }
       return { ok: true };
+    });
+  }
+
+  /**
+   * Classify and add observed targets under one immediate transaction. The
+   * classifier may read store state, which is therefore protected from a slot
+   * writer until either this insert commits or classification rolls back.
+   */
+  recordPiExportTargetsIfEmptyClassified<T extends { targets: PiExportTargetRow[] }>(
+    provider: string,
+    classifyInTransaction: () => T,
+    admit: (db: DatabaseSync) => PiExportTargetRecordResult,
+  ): PiExportTargetClassifiedRecordResult<T> {
+    return this.runImmediate(() => {
+      const classified = classifyInTransaction();
+      const admission = admit(this.db);
+      if (!admission.ok) return { ok: false, code: admission.code };
+      if (this.db.prepare('SELECT 1 FROM pi_export_targets WHERE provider = ? LIMIT 1').get(provider)) {
+        return { ok: false, code: 'pi-export-targets-exist' };
+      }
+      const insert = this.db.prepare(`INSERT INTO pi_export_targets
+        (provider, target, slot_account_id, lineage_fp, recorded_at) VALUES (?, ?, ?, ?, ?)`);
+      for (const target of classified.targets) {
+        if (target.provider !== provider) throw new Error('pi export target provider mismatch');
+        insert.run(target.provider, target.target, target.slotAccountId, target.lineageFp, target.recordedAt);
+      }
+      return { ok: true, result: classified };
     });
   }
 

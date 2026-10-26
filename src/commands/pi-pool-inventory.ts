@@ -3,6 +3,7 @@ import type { DatabaseSync } from 'node:sqlite';
 import { platformKeychain } from '../keychain';
 import {
   classify,
+  PoolInventoryError,
   readCswapInventoryLineages,
   readPoolInventoryEntries,
   slotInventoryLineages,
@@ -12,7 +13,12 @@ import {
   type SourceLineage,
 } from '../pool-inventory';
 import { assertAdmittedInConnection } from '../lifecycle';
-import { openStore, type PiExportTargetRow, type Store } from '../store';
+import {
+  openStore,
+  type PiExportTargetClassifiedRecordResult,
+  type PiExportTargetRow,
+  type Store,
+} from '../store';
 import type { CommandContext, CommandDefinition } from '../registry';
 
 export interface PoolInventoryCommandStore extends PoolInventoryStore {
@@ -24,6 +30,11 @@ export interface PoolInventoryCommandStore extends PoolInventoryStore {
     targets: PiExportTarget[],
     admit: (db: DatabaseSync) => { ok: boolean; code?: string },
   ): { ok: boolean; code?: string };
+  recordPiExportTargetsIfEmptyClassified<T extends { targets: PiExportTarget[] }>(
+    provider: string,
+    classifyInTransaction: () => T,
+    admit: (db: DatabaseSync) => { ok: boolean; code?: string },
+  ): PiExportTargetClassifiedRecordResult<T>;
 }
 
 export interface PiPoolInventoryCommandDeps {
@@ -102,23 +113,35 @@ export function runPiPoolInventoryCommand(
   const store = deps.openStore(ctx.config.dbPath);
   try {
     const entries = deps.loadEntries(ctx.config.anthropicPoolPath);
-    const lineages = deps.loadSlotLineages(store);
-    const result = classify(entries, lineages, deps.now());
-    if (options.record) {
-      // Admission, the no-overwrite guard, and insertion are one BEGIN
-      // IMMEDIATE transaction. This path is add-only and never replaces a
-      // migration's durable inventory fact.
-      const recorded = store.recordPiExportTargetsIfEmpty('anthropic', result.targets, deps.admitRecord);
-      if (!recorded.ok) {
-        ctx.stderr(`qlb pi pool-inventory: refused: ${recorded.code ?? 'inventory-record-refused'}`);
-        return 3;
-      }
-    }
+    const result = options.record
+      ? (() => {
+        // The slot read, classification, admission, no-overwrite guard, and
+        // insert share one BEGIN IMMEDIATE transaction. A durable undo mapping
+        // therefore cannot be based on a slot snapshot that a writer changed.
+        const recorded = store.recordPiExportTargetsIfEmptyClassified(
+          'anthropic',
+          () => classify(entries, deps.loadSlotLineages(store), deps.now()),
+          deps.admitRecord,
+        );
+        if (!recorded.ok) {
+          ctx.stderr(`qlb pi pool-inventory: refused: ${recorded.code ?? 'inventory-record-refused'}`);
+          return null;
+        }
+        return recorded.result;
+      })()
+      : classify(entries, deps.loadSlotLineages(store), deps.now());
+    if (result === null) return 3;
     const output = { against: options.against, entries: result.entries };
     if (options.json) ctx.stdout(JSON.stringify(output));
     else ctx.stdout(`${result.entries.length} pool entries; ${result.targets.length} shared lineages`);
     return 0;
-  } catch {
+  } catch (error) {
+    if (options.record && error instanceof PoolInventoryError) {
+      // A classifier conflict is a safety refusal. runImmediate already rolled
+      // back, so no stale or ambiguous mapping was persisted.
+      ctx.stderr(`qlb pi pool-inventory: refused: ${error.code}`);
+      return 3;
+    }
     // Never surface filesystem/Keychain diagnostics here: either can contain a
     // native value. The command dispatcher performs its normal redaction too.
     ctx.stderr('qlb pi pool-inventory: inventory unavailable');
