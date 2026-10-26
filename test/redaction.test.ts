@@ -32,6 +32,10 @@ describe('redaction', () => {
       ['Cookie: session=abc; csrf=def', 'Cookie: [redacted]'],
       ['msg: api_key=abc; ok', 'msg: api_key=[redacted]'],
       ['password="hunter 2"', 'password=[redacted]'],
+      ['token_ = hunter2', 'token_ = [redacted]'],
+      ['api-key- : value', 'api-key- : [redacted]'],
+      ['password=\nhunter2', 'password=\n[redacted]'],
+      ['api-key- :\n value', 'api-key- :\n [redacted]'],
       ['token_count=5', 'token_count=5'],
       ['passwordless login', 'passwordless login'],
     ] as const;

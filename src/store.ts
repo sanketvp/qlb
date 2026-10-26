@@ -597,8 +597,16 @@ function v5TableFacts(db: DatabaseSync, table: string): V5TableFacts {
   const constraintIndexes = indexes
     .filter(({ origin }) => origin === 'u' || origin === 'pk')
     .map(({ name, origin }) => {
-      const columns = db.prepare(`PRAGMA index_info(${quoteIdentifier(name)})`).all() as Array<{ name: string }>;
-      return `${origin}:${columns.map(({ name: column }) => column).join('\0')}`;
+      const columns = db.prepare(`PRAGMA index_xinfo(${quoteIdentifier(name)})`).all() as Array<{
+        name: string | null;
+        key: number;
+        coll: string | null;
+        desc: number;
+      }>;
+      return `${origin}:${columns
+        .filter((column) => column.key === 1)
+        .map((column) => `${column.name ?? '<expression>'}:${column.coll ?? ''}:${column.desc}`)
+        .join('\0')}`;
     });
   const tableList = db.prepare('PRAGMA table_list').all() as Array<{ name: string; strict: number; wr: number }>;
   const options = tableList.find(({ name }) => name === table);
@@ -782,14 +790,65 @@ const PROVIDERLESS_USAGE_POLLS_COLUMNS = new Set([
   'last_status', 'consecutive_failures', 'backoff_until', 'last_429_at', 'held_until',
 ]);
 
+const PROVIDERLESS_USAGE_POLLS_SHAPE: V5TableShape = {
+  columns: requiredV5TableShapes().get('usage_polls')!.columns.filter(({ name }) => name !== 'provider'),
+  sql: `CREATE TABLE usage_polls (
+    account_id TEXT NOT NULL, last_fetch_at INTEGER, last_attempt_at INTEGER, next_due_at INTEGER,
+    poll_interval_s REAL, last_status TEXT, consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    backoff_until INTEGER, last_429_at INTEGER, held_until INTEGER, PRIMARY KEY (account_id)
+  )`,
+};
+
 function assertProviderlessUsagePollsCanBeMigrated(db: DatabaseSync, verifiedBackupPath: string): void {
   if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'usage_polls'").get()
     || hasColumn(db, 'usage_polls', 'provider')) return;
-  const unexpected = tableColumns(db, 'usage_polls').find(({ name }) => !PROVIDERLESS_USAGE_POLLS_COLUMNS.has(name));
-  if (unexpected) {
-    refuseInexactV5Rebuild('usage_polls', `column ${unexpected.name} is not in the canonical definition and cannot be reproduced`, verifiedBackupPath);
+  const actual = v5TableFacts(db, 'usage_polls');
+  const expected = canonicalV5TableFacts(PROVIDERLESS_USAGE_POLLS_SHAPE, 'usage_polls');
+  if (actual.strict !== expected.strict || actual.withoutRowid !== expected.withoutRowid) {
+    refuseInexactV5Rebuild('usage_polls', 'table options differ from the canonical definition', verifiedBackupPath);
   }
-  const schemaObjects = db.prepare(`SELECT type, name FROM sqlite_master
+  const hidden = actual.xinfo.find((column) => column.hidden !== undefined && column.hidden !== 0);
+  if (hidden) {
+    refuseInexactV5Rebuild('usage_polls', `column ${hidden.name} is generated or hidden and cannot be reproduced`, verifiedBackupPath);
+  }
+  const expectedColumns = new Map(expected.xinfo.map((column) => [column.name, column]));
+  for (const column of actual.xinfo) {
+    if (!PROVIDERLESS_USAGE_POLLS_COLUMNS.has(column.name)) {
+      refuseInexactV5Rebuild('usage_polls', `column ${column.name} is not in the canonical definition and cannot be reproduced`, verifiedBackupPath);
+    }
+    const canonical = expectedColumns.get(column.name);
+    if (!canonical) continue;
+    const actualDefault = normalizedDefault(column.dflt_value);
+    const canonicalDefault = normalizedDefault(canonical.dflt_value);
+    if (column.type.trim().toLowerCase() !== canonical.type.trim().toLowerCase()
+      || (Boolean(column.notnull) && !Boolean(canonical.notnull))
+      || (actualDefault !== canonicalDefault && actualDefault !== null)
+      || column.pk !== canonical.pk) {
+      refuseInexactV5Rebuild('usage_polls', `column ${column.name} differs from the canonical definition and cannot be reproduced`, verifiedBackupPath);
+    }
+    if (Boolean(canonical.notnull) && !Boolean(column.notnull)
+      && db.prepare(`SELECT 1 FROM usage_polls WHERE ${quoteIdentifier(column.name)} IS NULL LIMIT 1`).get()) {
+      refuseInexactV5Rebuild('usage_polls', `copied rows violate new constraints (NOT NULL constraint failed: usage_polls_v5.${column.name})`, verifiedBackupPath);
+    }
+  }
+  if (actual.constraintIndexes.join('\0') !== expected.constraintIndexes.join('\0')) {
+    refuseInexactV5Rebuild('usage_polls', 'constraint index differs from the canonical definition and cannot be reproduced', verifiedBackupPath);
+  }
+  if (containsSqlKeyword(actual.sql, 'CHECK') && !containsSqlKeyword(expected.sql, 'CHECK')) {
+    refuseInexactV5Rebuild('usage_polls', 'CHECK differs from the canonical definition and cannot be reproduced', verifiedBackupPath);
+  }
+  const ownForeignKeys = db.prepare('PRAGMA foreign_key_list(usage_polls)').all();
+  if (ownForeignKeys.length !== 0) {
+    refuseInexactV5Rebuild('usage_polls', 'foreign-key definition differs from the canonical definition and cannot be reproduced', verifiedBackupPath);
+  }
+  const otherTables = db.prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND lower(name) <> 'usage_polls' ORDER BY name").all() as Array<{ name: string }>;
+  for (const { name } of otherTables) {
+    const foreignKeys = db.prepare(`PRAGMA foreign_key_list(${quoteIdentifier(name)})`).all() as Array<{ table: string }>;
+    if (foreignKeys.some((foreignKey) => foreignKey.table.toLowerCase() === 'usage_polls')) {
+      refuseInexactV5Rebuild('usage_polls', `foreign key on ${name} references usage_polls and prevents an exact rebuild`, verifiedBackupPath);
+    }
+  }
+  const schemaObjects = db.prepare(`SELECT type, name FROM sqlite_schema
     WHERE tbl_name = ? AND type IN ('index', 'trigger')
       AND (type = 'trigger' OR name NOT LIKE 'sqlite_autoindex_%')
     ORDER BY type, name`).all('usage_polls') as Array<{ type: 'index' | 'trigger'; name: string }>;
@@ -797,21 +856,19 @@ function assertProviderlessUsagePollsCanBeMigrated(db: DatabaseSync, verifiedBac
   if (schemaObject) {
     refuseInexactV5Rebuild('usage_polls', `${schemaObject.type} ${schemaObject.name} cannot be reproduced`, verifiedBackupPath);
   }
-  const actualSql = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'usage_polls'").get() as { sql: string };
-  const canonicalSql = requiredV5TableShapes().get('usage_polls')!.sql;
-  const normalizedActual = normalizedSql(sqlWithoutLiteralsOrComments(actualSql.sql));
-  const normalizedCanonical = normalizedSql(sqlWithoutLiteralsOrComments(canonicalSql));
-  for (const [name, pattern] of [
-    ['CHECK', /\bcheck\b/],
-    ['UNIQUE', /\bunique\b/],
-    ['FOREIGN KEY', /\bforeign\s+key\b/],
-    ['GENERATED', /\bgenerated\b/],
-    ['STRICT', /\bstrict\b/],
-    ['WITHOUT ROWID', /\bwithout\s+rowid\b/],
-  ] as const) {
-    if (pattern.test(normalizedActual) && !pattern.test(normalizedCanonical)) {
-      refuseInexactV5Rebuild('usage_polls', `${name} differs from the canonical definition and cannot be reproduced`, verifiedBackupPath);
-    }
+  const dependents = db.prepare(`SELECT type, name, sql FROM sqlite_schema
+    WHERE type IN ('view', 'trigger') AND sql IS NOT NULL
+    ORDER BY type, name`).all() as Array<{ type: 'view' | 'trigger'; name: string; sql: string }>;
+  const dependent = dependents.find(({ sql }) => sqlReferencesTableIdentifier(sql, 'usage_polls'));
+  if (dependent) {
+    const subject = dependent.type === 'view'
+      ? `view ${dependent.name} references usage_polls`
+      : `trigger ${dependent.name} on another table references usage_polls`;
+    refuseInexactV5Rebuild('usage_polls', `${subject} and prevents an exact rebuild`, verifiedBackupPath);
+  }
+  const nullRow = db.prepare('SELECT 1 FROM usage_polls WHERE consecutive_failures IS NULL LIMIT 1').get();
+  if (nullRow) {
+    refuseInexactV5Rebuild('usage_polls', 'copied rows violate new constraints (NOT NULL constraint failed: usage_polls_v5.consecutive_failures)', verifiedBackupPath);
   }
   const rows = db.prepare('SELECT account_id FROM usage_polls').all() as Array<{ account_id: string }>;
   const providerFor = db.prepare('SELECT provider FROM accounts WHERE id = ?');
@@ -838,7 +895,7 @@ function preflightV5Correction(db: DatabaseSync, verifiedBackupPath: string): vo
     if (plan.requiresRebuild) {
       for (const canonicalColumn of shape.columns) {
         const existingColumn = plan.existing.find(({ name }) => name === canonicalColumn.name);
-        if (!existingColumn || !canonicalColumn.notNull || canonicalColumn.defaultValue !== null || existingColumn.notnull) continue;
+        if (!existingColumn || !canonicalColumn.notNull || existingColumn.notnull) continue;
         const nullRow = db.prepare(`SELECT 1 FROM ${quoteIdentifier(table)} WHERE ${quoteIdentifier(canonicalColumn.name)} IS NULL LIMIT 1`).get();
         if (nullRow) {
           refuseInexactV5Rebuild(
@@ -846,6 +903,28 @@ function preflightV5Correction(db: DatabaseSync, verifiedBackupPath: string): vo
             `copied rows violate new constraints (NOT NULL constraint failed: ${table}__v5new.${canonicalColumn.name})`,
             verifiedBackupPath,
           );
+        }
+      }
+      const constraints = [
+        ...shape.columns.filter(({ unique }) => unique).map(({ name }) => ({ kind: 'UNIQUE', columns: [name] })),
+        ...(shape.columns.some(({ primaryKeyOrder }) => primaryKeyOrder > 0)
+          ? [{
+              kind: 'PRIMARY KEY',
+              columns: shape.columns
+                .filter(({ primaryKeyOrder }) => primaryKeyOrder > 0)
+                .sort((left, right) => left.primaryKeyOrder - right.primaryKeyOrder)
+                .map(({ name }) => name),
+            }]
+          : []),
+      ];
+      for (const { kind, columns } of constraints) {
+        if (!columns.every((column) => plan.existing.some(({ name }) => name === column))) continue;
+        const names = columns.map(quoteIdentifier).join(', ');
+        const nonNull = columns.map((name) => `${quoteIdentifier(name)} IS NOT NULL`).join(' AND ');
+        const duplicate = db.prepare(`SELECT 1 FROM ${quoteIdentifier(table)} WHERE ${nonNull}
+          GROUP BY ${names} HAVING count(*) > 1 LIMIT 1`).get();
+        if (duplicate) {
+          refuseInexactV5Rebuild(table, `duplicate values violate canonical ${kind} constraint on ${columns.join(', ')}`, verifiedBackupPath);
         }
       }
       const newTable = `${table}__v5new`;

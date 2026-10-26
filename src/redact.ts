@@ -68,7 +68,7 @@ const SENSITIVE_KEY_NAME = [...SENSITIVE_KEY]
   .map((key) => key.split('').map(escapeRegExp).join('[_-]*'))
   .join('|');
 const SENSITIVE_KEY_VALUE_TO_EOL = new RegExp(
-  `((?<![A-Za-z0-9])(?:${SENSITIVE_KEY_NAME})(?:["']?[ \\t]*[=:][ \\t]*))[^\\r\\n]*`,
+  `((?<![A-Za-z0-9])(?:${SENSITIVE_KEY_NAME})[_-]*(?:["']?[ \\t]*[=:]\\s*))[^\\r\\n]*`,
   'gi',
 );
 
