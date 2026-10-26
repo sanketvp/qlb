@@ -19,6 +19,10 @@ import {
 import {
   createRawCredentialBackend,
   defaultCredentialBackendHost,
+  defaultKeychainHelperPath,
+  KeychainBackedOff,
+  KeychainHelperMissingError,
+  KeychainReadBackoff,
   execFileUtf8,
   isCredentialNotFound,
   isFakeExecutor,
@@ -64,6 +68,10 @@ export {
   WINDOWS_POWERSHELL_BASE_ARGS,
   defaultCommandExists,
   defaultCredentialBackendHost,
+  defaultKeychainHelperPath,
+  KeychainBackedOff,
+  KeychainHelperMissingError,
+  KeychainReadBackoff,
   MACOS_SECURITY_BIN,
   MACOS_SECURITY_TIMEOUT_MS,
 } from './credential-backends';
@@ -132,6 +140,9 @@ export function withServiceGuard(
     deleteSync(service, account) {
       assertKeychainAccess(service, account, 'write', effectiveAllowlistOptions);
       backend.deleteSync(service, account);
+    },
+    assertHelperUsable() {
+      backend.assertHelperUsable?.();
     },
   };
 }

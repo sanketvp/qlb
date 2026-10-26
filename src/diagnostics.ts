@@ -1,4 +1,11 @@
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync, type ExecFileSyncOptionsWithStringEncoding } from 'node:child_process';
+import {
+  inspectHelperSigning as inspectHelperSigningAt,
+  verifyHelperIdentity,
+  type CodesignSpawn,
+  type HelperIdentityVerification,
+  type HelperSigningState,
+} from './helper-signing';
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { consumeMarkerPathFor, CSWAP_ANTHROPIC_STORE } from './cswap-consume';
@@ -14,6 +21,7 @@ import {
 } from './credential-backends';
 import {
   defaultCommandExists,
+  defaultKeychainHelperPath,
   MACOS_SECURITY_BIN,
   platformKeychain,
   readNativeOpenRouterKey,
@@ -52,6 +60,9 @@ import { openStoreConnection } from './store';
 import { discoverChecks, type CheckDefinition } from './registry';
 import { lifecycleWindowCheck } from './checks/lifecycle-window';
 import { lifecycleDrillCheck } from './checks/lifecycle-drill';
+import { claudeConfigPathCheck } from './checks/claude-config-path';
+import { claudeConfigFileCheck } from './checks/claude-config-file';
+import { claudeLocksCheck } from './checks/claude-locks';
 
 export type CheckLevel = 'PASS' | 'WARN' | 'FAIL' | 'INFO' | 'N/A';
 
@@ -89,6 +100,23 @@ export interface DoctorReport {
 }
 
 type CommandRunner = (command: string, args: string[]) => string;
+
+const HELPER_CHECK_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
+
+export {
+  verifyHelperIdentity,
+  type CodesignSpawn,
+  type HelperIdentityVerification,
+  type HelperSigningState,
+} from './helper-signing';
+
+/** Validates the code signature and reads its metadata; defaults to the installed helper path. */
+export function inspectHelperSigning(
+  path = defaultKeychainHelperPath(),
+  spawn: CodesignSpawn = spawnSync,
+): HelperSigningState | null {
+  return inspectHelperSigningAt(path, spawn);
+}
 
 /** The diagnostic registry is separate from the runtime report so checks can be added independently. */
 export function listCheckNames(): string[] {
@@ -167,13 +195,20 @@ export function createCommandRunner(exec: ExecFileSyncFn = execFileUtf8): Comman
 const runCommand = createCommandRunner();
 
 /** A bounded runner for host probes; never return login-shell environment output. */
-const runHostCommand: HostCommandRunner = (command, args, options) =>
-  execFileSync(command, args, {
+// detached: hosts:env runs `<shell> -lic env`. An interactive shell attached to the caller's
+// terminal makes itself the terminal's foreground group and never hands it back, so a Pi session
+// that ran doctor could no longer restore its terminal and exited 129 on quit. Node's sync spawn
+// honours `detached` (src/spawn_sync.cc) but its typings omit it; the hosts-env test pins it.
+export const runHostCommand: HostCommandRunner = (command, args, options) => {
+  const spawnOptions: ExecFileSyncOptionsWithStringEncoding & { detached: boolean } = {
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'ignore'],
     timeout: 5_000,
     env: options?.env,
-  });
+    detached: true,
+  };
+  return execFileSync(command, args, spawnOptions);
+};
 
 function readJson(path: string): Record<string, unknown> | null {
   try {
@@ -327,7 +362,7 @@ function unsupportedOpenRouterService(service: string): ProviderDiagnostic {
 function openRouterSetupExample(): string {
   const service = OPENROUTER_KEYCHAIN_SERVICE;
   if (process.platform === 'darwin') {
-    return `security add-generic-password -s ${service} -a qlb -w '<key>'`;
+    return `store the key in Keychain Access as service ${service} account qlb`;
   }
   if (process.platform === 'win32') {
     return `store the key in the DPAPI credential file (~/.qlb/credentials-windows.json) as service ${service} account qlb`;
@@ -467,6 +502,14 @@ export async function doctorQlb(
     hostPlatform?: NodeJS.Platform;
     hostShell?: string;
     hostShellExists?: (path: string) => boolean;
+    /** Tests may inject recorded Keychain matrix/authorization state without a real store. */
+    configReader?: (key: string) => string | null;
+    /** Tests inject signing metadata rather than requiring a locally built helper. */
+    helperSigning?: () => HelperSigningState | null;
+    /** Tests inject the pinned-identity verifier rather than invoking codesign. */
+    helperIdentityVerifier?: (path: string, pin: string) => HelperIdentityVerification;
+    /** Tests control matrix receipt age without changing the system clock. */
+    now?: () => number;
     /** Test-only fixture for `ps -axo pid=,lstart=,command=`. */
     piProcessList?: () => string;
     /** Tests inject a stable read; production reads lifecycle once per report. */
@@ -477,6 +520,7 @@ export async function doctorQlb(
   let migrations: Array<{ store: string; state: string; detail_json?: string }> = [];
   let accounts: Array<{ id: string; provider: string; label: string }> = [];
   let recoveryPending = false;
+  const recordedConfig = new Map<string, string>();
 
   if (!existsSync(config.dbPath)) {
     checks.push({ name: 'sqlite', level: 'WARN', message: `database does not exist yet: ${config.dbPath}; run qlb status` });
@@ -507,8 +551,20 @@ export async function doctorQlb(
       }
       const cfgTable = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='config'").get();
       if (cfgTable) {
-        const marker = db.prepare('SELECT value FROM config WHERE key = ?').get('migrations.recovery_pending');
-        recoveryPending = marker != null;
+        const rows = db.prepare('SELECT key, value FROM config WHERE key IN (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').all(
+          'migrations.recovery_pending',
+          'keychain.helperCheckResult',
+          'keychain.helperCheckPrompted',
+          'keychain.helperCheckAt',
+          'keychain.helperCheckBinaryHash',
+          'keychain.helperCheckIdentityHash',
+          'keychain.liveItemsReadAuthorizedAt',
+          'keychain.liveItemsReadAuthorizedIdentityHash',
+          'keychain.liveItemsAuthorizedAt',
+          'keychain.liveItemsAuthorizedIdentityHash',
+        ) as Array<{ key: string; value: string }>;
+        for (const row of rows) recordedConfig.set(row.key, row.value);
+        recoveryPending = recordedConfig.has('migrations.recovery_pending');
       }
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
@@ -558,8 +614,49 @@ export async function doctorQlb(
   }
 
   checks.push(probeCredentialStore(options.command));
+  const hostPlatform = options.hostPlatform ?? process.platform;
+  if (hostPlatform === 'darwin') {
+    const configValue = options.configReader ?? ((key: string) => recordedConfig.get(key) ?? null);
+    const signing = (options.helperSigning ?? inspectHelperSigning)();
+    const helperResult = configValue('keychain.helperCheckResult');
+    const helperPrompted = configValue('keychain.helperCheckPrompted') === 'true';
+    const helperAt = Number(configValue('keychain.helperCheckAt'));
+    const helperHash = configValue('keychain.helperCheckBinaryHash');
+    const helperIdentityHash = configValue('keychain.helperCheckIdentityHash');
+    const identityVerification = helperIdentityHash === null
+      ? null
+      : (options.helperIdentityVerifier ?? verifyHelperIdentity)(defaultKeychainHelperPath(), helperIdentityHash);
+    const recent = Number.isFinite(helperAt) && helperAt > 0 && (options.now ?? Date.now)() - helperAt <= HELPER_CHECK_MAX_AGE_MS;
+    if (helperIdentityHash !== null && !identityVerification!.trusted) {
+      checks.push({ name: 'keychain:helper', level: 'FAIL', message: `pinned helper identity does not verify: ${identityVerification!.reason}` });
+    } else if (helperIdentityHash === null && (!signing || signing.authority !== 'QLB Keychain Helper')) {
+      checks.push({ name: 'keychain:helper', level: 'FAIL', message: 'signed QLB Keychain Helper binary is missing or its identity does not match' });
+    } else if (!signing) {
+      checks.push({ name: 'keychain:helper', level: 'FAIL', message: 'signed helper metadata is unavailable' });
+    } else if (helperResult === null || !Number.isFinite(helperAt)) {
+      checks.push({ name: 'keychain:helper', level: 'WARN', message: 'helper matrix has not been evaluated; run qlb keychain check-launchd' });
+    } else if (helperResult !== 'ok' || helperPrompted || helperHash !== signing.binaryHash) {
+      checks.push({ name: 'keychain:helper', level: 'FAIL', message: helperPrompted ? 'helper matrix recorded a Keychain prompt' : 'helper matrix does not match the current signed helper' });
+    } else if (!recent) {
+      checks.push({ name: 'keychain:helper', level: 'WARN', message: 'helper matrix result is stale; run qlb keychain check-launchd' });
+    } else {
+      checks.push({ name: 'keychain:helper', level: 'PASS', message: 'current signed helper matrix passed without a prompt' });
+    }
+
+    const readAuthorizedAt = configValue('keychain.liveItemsReadAuthorizedAt');
+    const readHash = configValue('keychain.liveItemsReadAuthorizedIdentityHash');
+    const liveAuthorizedAt = configValue('keychain.liveItemsAuthorizedAt');
+    const liveHash = configValue('keychain.liveItemsAuthorizedIdentityHash');
+    if (readAuthorizedAt === null || readHash === null) {
+      checks.push({ name: 'keychain:live-items-authorized', level: 'WARN', message: 'unknown: live Keychain item authorization has not been evaluated' });
+    } else if (!signing || readHash !== signing.identityHash || (liveAuthorizedAt !== null && liveHash !== signing.identityHash)) {
+      checks.push({ name: 'keychain:live-items-authorized', level: 'FAIL', message: 'live Keychain authorization was recorded for a different helper identity' });
+    } else {
+      checks.push({ name: 'keychain:live-items-authorized', level: 'PASS', message: 'recorded live Keychain authorization matches the signed helper' });
+    }
+  }
   checks.push(probeHostEnvironment(options.hostCommand ?? runHostCommand, {
-    platform: options.hostPlatform ?? process.platform,
+    platform: hostPlatform,
     // An explicit hostShell key (even undefined) overrides the real SHELL, so tests are host-independent.
     shell: 'hostShell' in options ? options.hostShell : process.env.SHELL,
     shellExists: options.hostShellExists ?? existsSync,
@@ -587,6 +684,9 @@ export async function doctorQlb(
 
   const phase = lifecycle.phase;
   checks.push(
+    claudeConfigPathCheck(),
+    claudeConfigFileCheck(),
+    claudeLocksCheck(),
     autoBreakerCheck(config.dbPath, 'anthropic', lifecycle),
     claudeOauthClientCheck(config.dbPath, lifecycle),
     claudeSlotsCheck(config.dbPath, phase),

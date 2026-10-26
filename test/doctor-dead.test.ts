@@ -224,7 +224,12 @@ describe('A7 doctor health primitives', () => {
         return config;
       },
     ]) {
-      const report = await doctorQlb(makeConfig(), { command: () => '', hostCommand: () => '' });
+      // A signed helper stand-in keeps keychain:helper at WARN (matrix not run), so only A7 rows drive overall.
+      const report = await doctorQlb(makeConfig(), {
+        command: () => '',
+        hostCommand: () => '',
+        helperSigning: () => ({ authority: 'QLB Keychain Helper', binaryHash: 'binary-hash', identityHash: 'identity-hash' }),
+      });
       assert.equal(report.overall, 'WARN');
       assert.equal(
         report.checks.find((row) => row.name === 'auto:anthropic:breaker')?.message,

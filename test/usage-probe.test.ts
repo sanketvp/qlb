@@ -10,12 +10,12 @@ describe('usage probe command', () => {
 
     const errors: string[] = [];
     const code = await usageProbeCommand.execute!(
-      ['kimi-coding', '--json'],
+      ['kimi-coding'],
       { stdout: () => {}, stderr: (line: string) => errors.push(line) } as never,
     );
 
     assert.equal(code, 1);
-    assert.deepEqual(errors, ['qlb usage probe: expected openai-codex --json']);
+    assert.deepEqual(errors, ['qlb usage probe: expected openai-codex|kimi-coding --json']);
   });
 
   it('prints status, source, and top-level keys only', async () => {
@@ -50,7 +50,7 @@ describe('usage probe command', () => {
       error: (line: string) => errors.push(line),
     };
 
-    assert.equal(await runUsageProbe(['kimi-coding', '--json'], deps), 1);
+    assert.equal(await runUsageProbe(['other', '--json'], deps), 1);
     assert.equal(await runUsageProbe(['openai-codex'], deps), 1);
     assert.equal(probes, 0);
     assert.equal(errors.length, 2);
