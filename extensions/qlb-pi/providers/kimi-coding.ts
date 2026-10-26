@@ -20,7 +20,7 @@ export interface GateResult {
 }
 
 export interface KimiCodingSourceDeps {
-  gate?: () => Promise<GateResult>;
+  gate?: (signal?: AbortSignal) => Promise<GateResult>;
 }
 
 export interface KimiCodingProviderDeps extends KimiCodingSourceDeps {
@@ -36,24 +36,53 @@ function findQlbCli(): { command: string; prefix: string[] } {
   return existsSync(repoCli) ? { command: process.execPath, prefix: [repoCli] } : { command: 'qlb', prefix: [] };
 }
 
-function defaultGate(): Promise<GateResult> {
+// P13 may wait up to 60 seconds for a concurrent single-consume winner.
+const GATE_TIMEOUT_MS = 65_000;
+
+function defaultGate(signal?: AbortSignal): Promise<GateResult> {
+  if (signal?.aborted) return Promise.reject(new Error('request-aborted'));
   const { command, prefix } = findQlbCli();
   return new Promise((resolve, reject) => {
-    const child = spawn(command, [...prefix, 'gate', PROVIDER, '--json'], {
-      stdio: ['ignore', 'pipe', 'pipe'],
-      env: { ...process.env, QLB_PI_TOKEN_CALL: '1' },
-    });
+    let settled = false;
+    let child: ReturnType<typeof spawn>;
+    const finish = (result: (() => void)) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      signal?.removeEventListener('abort', abort);
+      result();
+    };
+    const abort = () => {
+      child.kill('SIGTERM');
+      finish(() => reject(new Error('request-aborted')));
+    };
+    const timeout = setTimeout(() => {
+      child.kill('SIGTERM');
+      finish(() => reject(new Error('gate-timeout')));
+    }, GATE_TIMEOUT_MS);
+    try {
+      child = spawn(command, [...prefix, 'gate', PROVIDER, '--json'], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: { ...process.env, QLB_PI_TOKEN_CALL: '1' },
+      });
+    } catch (error) {
+      finish(() => reject(error));
+      return;
+    }
     let stdout = '';
     let stderr = '';
     child.stdout?.on('data', (chunk: Buffer) => { stdout += chunk.toString('utf8'); });
     child.stderr?.on('data', (chunk: Buffer) => { stderr += chunk.toString('utf8'); });
-    child.on('error', reject);
-    child.on('close', (code) => resolve({ code: code ?? 1, stdout, stderr }));
+    child.on('error', (error: NodeJS.ErrnoException) => {
+      finish(() => reject(new Error(error.code === 'ENOENT' ? 'missing-binary' : 'unknown')));
+    });
+    child.on('close', (code) => finish(() => resolve({ code: code ?? 1, stdout, stderr })));
+    signal?.addEventListener('abort', abort, { once: true });
   });
 }
 
 function gateCause(result: GateResult): string {
-  const value = result.stderr.trim();
+  const value = result.stderr.trim().replace(/^qlb gate: refused: /, '');
   return /^[a-z][a-z0-9-]*$/.test(value) || /^phase=[a-z-]+$/.test(value) ? value : 'unknown';
 }
 
@@ -75,11 +104,11 @@ function parseAccess(stdout: string): ActiveAccess {
 }
 
 /** A fresh QLB gate call is deliberately made for every provider request. */
-export function createKimiCodingSource(deps: KimiCodingSourceDeps = {}): { provider: typeof PROVIDER; read(): Promise<ActiveAccess> } {
+export function createKimiCodingSource(deps: KimiCodingSourceDeps = {}): { provider: typeof PROVIDER; read(signal?: AbortSignal): Promise<ActiveAccess> } {
   return {
     provider: PROVIDER,
-    async read(): Promise<ActiveAccess> {
-      const result = await (deps.gate ?? defaultGate)();
+    async read(signal?: AbortSignal): Promise<ActiveAccess> {
+      const result = await (deps.gate ?? defaultGate)(signal);
       if (result.code !== 0) throw new Error(gateCause(result));
       return parseAccess(result.stdout);
     },
@@ -143,6 +172,16 @@ function qlbOwnsKimiCoding(): boolean {
   }) !== 'inert';
 }
 
+function qlbRequestOptions(options: Record<string, unknown> | undefined, token: string): Record<string, unknown> {
+  const inheritedHeaders = options?.headers;
+  const headers = inheritedHeaders && typeof inheritedHeaders === 'object' && !Array.isArray(inheritedHeaders)
+    ? Object.fromEntries(Object.entries(inheritedHeaders).filter(([name]) => name.toLowerCase() !== 'authorization'))
+    : {};
+  // Pi resolves native Kimi OAuth before this source. openai-completions merges
+  // request headers last, so retain no inherited Authorization value here.
+  return { ...options, apiKey: token, headers: { ...headers, Authorization: `Bearer ${token}` } };
+}
+
 /** Installs a fail-closed Kimi source without ever consulting Pi's stored OAuth grant. */
 export function registerKimiCodingProvider(
   pi: {
@@ -154,7 +193,8 @@ export function registerKimiCodingProvider(
   },
   deps: KimiCodingProviderDeps = {},
 ): void {
-  if (!(deps.owned ?? qlbOwnsKimiCoding)()) return;
+  const owned = deps.owned ?? qlbOwnsKimiCoding;
+  if (!owned()) return;
   const source = createKimiCodingSource(deps);
   const createStream = deps.createStream ?? fallbackStream;
   const builtin = deps.builtin;
@@ -166,9 +206,13 @@ export function registerKimiCodingProvider(
       const output = createStream();
       void (async () => {
         try {
-          const access = await source.read();
+          // Re-read ownership on every request. A rollback must never fall through
+          // to Pi's native OAuth grant while this source remains registered.
+          if (!owned()) throw new Error('owner-entry-missing');
+          const signal = options?.signal;
+          const access = await source.read(signal instanceof AbortSignal ? signal : undefined);
           const transport = builtin ?? await builtinKimiCoding();
-          for await (const event of transport(model, context, { ...options, apiKey: access.token })) output.push(event);
+          for await (const event of transport(model, context, qlbRequestOptions(options, access.token))) output.push(event);
         } catch (error) {
           const cause = error instanceof Error ? error.message : 'unknown';
           output.push(qlbUnavailable(PROVIDER, cause, model));

@@ -29,6 +29,13 @@ describe('qlb-pi Kimi Coding source', () => {
     await assert.rejects(malformed.read(), /unknown/);
   });
 
+  it('preserves a lifecycle refusal cause from the QLB gate', async () => {
+    const source = createKimiCodingSource({
+      gate: async () => ({ code: 3, stdout: '', stderr: 'qlb gate: refused: phase=pre-cutover' }),
+    });
+    await assert.rejects(source.read(), /phase=pre-cutover/);
+  });
+
   it('registers only when owned and sends each request through the gate', async () => {
     const calls: string[] = [];
     let registered: { api: string; streamSimple: (model: { id: string; api: string; provider: string }, context: unknown, options?: Record<string, unknown>) => { events: unknown[]; ended: boolean } } | undefined;
@@ -46,6 +53,10 @@ describe('qlb-pi Kimi Coding source', () => {
       },
       builtin: (_model, _context, options) => {
         assert.equal(options?.apiKey, 'kimi-test-access');
+        assert.deepEqual(options?.headers, {
+          'X-Trace': 'preserved',
+          Authorization: 'Bearer kimi-test-access',
+        });
         return (async function* () { yield { type: 'done' }; })();
       },
       gate: async () => {
@@ -56,11 +67,77 @@ describe('qlb-pi Kimi Coding source', () => {
     assert.deepEqual(calls, ['unregister:kimi-coding']);
     assert.ok(registered);
 
-    registered!.streamSimple({ id: 'k3', api: 'openai-completions', provider: 'kimi-coding' }, {}, {});
+    registered!.streamSimple({ id: 'k3', api: 'openai-completions', provider: 'kimi-coding' }, {}, {
+      headers: {
+        Authorization: 'Bearer qlb-managed',
+        authorization: 'Bearer native-login',
+        'X-Trace': 'preserved',
+      },
+    });
     await new Promise((resolve) => setImmediate(resolve));
     assert.equal(gates, 1);
     assert.deepEqual(output?.events, [{ type: 'done' }]);
     assert.equal(output?.ended, true);
+  });
+
+  it('rechecks ownership before every request and does not fall through after rollback', async () => {
+    let owned = true;
+    let gates = 0;
+    let transportCalls = 0;
+    let registered: { streamSimple: (model: { id: string }, context: unknown) => unknown } | undefined;
+    const outputs: Array<{ events: unknown[]; ended: boolean; push(event: unknown): void; end(): void }> = [];
+    registerKimiCodingProvider({
+      unregisterProvider: () => undefined,
+      registerProvider: (_name, config) => { registered = config as never; },
+    }, {
+      owned: () => owned,
+      createStream: () => {
+        const output = { events: [], ended: false, push(event: unknown) { this.events.push(event); }, end() { this.ended = true; } };
+        outputs.push(output);
+        return output;
+      },
+      gate: async () => {
+        gates += 1;
+        return { code: 0, stdout: JSON.stringify({ token: 'kimi-test-access', accountId: 'default', source: 'keychain' }), stderr: '' };
+      },
+      builtin: () => {
+        transportCalls += 1;
+        return (async function* () { yield { type: 'done' }; })();
+      },
+    });
+    assert.ok(registered);
+
+    registered!.streamSimple({ id: 'k3' }, {});
+    await new Promise((resolve) => setImmediate(resolve));
+    owned = false;
+    registered!.streamSimple({ id: 'k3' }, {});
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(gates, 1);
+    assert.equal(transportCalls, 1);
+    assert.equal((outputs[1]!.events[0] as { error?: { errorMessage?: string } }).error?.errorMessage, 'QLB unavailable for kimi-coding — run qlb doctor (unknown)');
+    assert.equal(outputs[1]!.ended, true);
+  });
+
+  it('passes the request abort signal to the QLB gate', async () => {
+    let gateSignal: AbortSignal | undefined;
+    let registered: { streamSimple: (model: { id: string }, context: unknown, options?: Record<string, unknown>) => unknown } | undefined;
+    registerKimiCodingProvider({
+      unregisterProvider: () => undefined,
+      registerProvider: (_name, config) => { registered = config as never; },
+    }, {
+      owned: () => true,
+      createStream: () => ({ push: () => undefined, end: () => undefined }),
+      gate: async (signal) => {
+        gateSignal = signal;
+        return { code: 0, stdout: JSON.stringify({ token: 'kimi-test-access', accountId: 'default', source: 'keychain' }), stderr: '' };
+      },
+      builtin: () => (async function* () { yield { type: 'done' }; })(),
+    });
+    const controller = new AbortController();
+    registered!.streamSimple({ id: 'k3' }, {}, { signal: controller.signal });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(gateSignal, controller.signal);
   });
 
   it('fails closed when the gate refuses and leaves an unowned provider untouched', async () => {
