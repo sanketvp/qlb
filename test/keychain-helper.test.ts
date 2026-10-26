@@ -262,6 +262,42 @@ describe('Swift Keychain helper write path', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
+  it('refuses instead of using the pinless check when the configured database cannot be read', () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-helper-unreadable-db-'));
+    const brokenDb = join(home, 'custom', 'qlb.db');
+    const helper = join(home, 'qlb-keychain-helper');
+    const previous = {
+      QLB_HOME: process.env.QLB_HOME,
+      QLB_TEST_MODE: process.env.QLB_TEST_MODE,
+      QLB_DB_PATH: process.env.QLB_DB_PATH,
+    };
+    writeFileSync(helper, 'fixture helper');
+    mkdirSync(join(home, 'custom'), { recursive: true });
+    writeFileSync(brokenDb, 'not a sqlite database');
+    process.env.QLB_DB_PATH = brokenDb;
+    process.env.QLB_TEST_MODE = '1';
+    process.env.QLB_HOME = home;
+    let helperCalls = 0;
+    let inspected = 0;
+    try {
+      const backend = new MacosKeychainBackend({
+        helperPath: helper,
+        execFileSync: markFakeExecutor(() => { helperCalls += 1; return ''; }),
+        helperSigningInspector: () => { inspected += 1; return { authority: 'QLB Keychain Helper' } as never; },
+        helperIdentityVerifier: () => ({ trusted: true }),
+      });
+      assert.throws(() => backend.setSync('qlb-test-helper', 'qlb', 'credential'), KeychainHelperUntrustedError);
+      assert.equal(helperCalls, 0);
+      assert.equal(inspected, 0);
+    } finally {
+      for (const [key, value] of Object.entries(previous)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it('reads the helper pin from the configured database rather than the default database', () => {
     const home = mkdtempSync(join(tmpdir(), 'qlb-helper-configured-db-'));
     const customDb = join(home, 'custom', 'qlb.db');

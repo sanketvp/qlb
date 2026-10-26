@@ -259,17 +259,25 @@ export type HelperConfigReader = (key: string) => string | null;
 type HelperIdentityVerifier = (path: string, pin: string) => HelperIdentityVerification;
 type HelperSigningInspector = (path: string) => HelperSigningState | null;
 
+/**
+ * Returns null only when no pin can have been recorded (no database yet, or no
+ * config table). Any other read failure refuses, so a damaged or unreadable
+ * database never downgrades a pinned host to the pinless check.
+ */
 export function defaultHelperConfigReader(key: string): string | null {
+  const dbPath = resolveConfig().dbPath;
+  if (!existsSync(dbPath)) return null;
   try {
-    const db = new DatabaseSync(resolveConfig().dbPath, { readOnly: true });
+    const db = new DatabaseSync(dbPath, { readOnly: true });
     try {
       const row = db.prepare('SELECT value FROM config WHERE key = ?').get(key) as { value?: unknown } | undefined;
       return typeof row?.value === 'string' ? row.value : null;
     } finally {
       db.close();
     }
-  } catch {
-    return null;
+  } catch (error) {
+    if (/no such table: config\b/.test((error as Error | undefined)?.message ?? '')) return null;
+    throw new KeychainHelperUntrustedError('could not read the recorded helper pin from the QLB database');
   }
 }
 
