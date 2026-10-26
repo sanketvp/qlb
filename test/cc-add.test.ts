@@ -8,9 +8,9 @@ import { DatabaseSync } from 'node:sqlite';
 
 import { addClaudeLogin, type ClaudeAddResult } from '../src/cc-add';
 import { ClaudeSlots, InMemoryClaudeSlotRepository, SqliteClaudeSlotRepository } from '../src/cc-slots';
-import { runClaudeAddCommand } from '../src/commands/claude-add';
+import { readClaudeLiveStateAtomically, runClaudeAddCommand } from '../src/commands/claude-add';
 import { MockKeychain } from '../src/keychain';
-import { beginCutover } from '../src/lifecycle';
+import { beginCutover, transition } from '../src/lifecycle';
 import { openStore } from '../src/store';
 import type { CommandContext } from '../src/registry';
 
@@ -65,11 +65,17 @@ describe('qlb claude add (K11 / AC32)', () => {
     const root = mkdtempSync(join(tmpdir(), 'qlb-cc-add-sqlite-'));
     const dbPath = join(root, 'qlb.db');
     const store = openStore(dbPath);
+    beginCutover(store);
     store.close();
     const repository = SqliteClaudeSlotRepository.open(dbPath);
-    const slots = new ClaudeSlots({ backend: new MockKeychain(), repository, stashDir: join(root, 'unclaimed'), now: () => 2_000 });
+    const backend = new MockKeychain();
+    const slots = new ClaudeSlots({ backend, repository, stashDir: join(root, 'unclaimed'), now: () => 2_000 });
     await addClaudeLogin({ credential: credential('old'), config: config('account-a'), slots });
     await addClaudeLogin({ credential: credential('new'), config: config('account-a'), replace: 'account-a', slots });
+    const predecessor = await backend.get('qlb:anthropic:account-a:prev', 'qlb');
+    const unchanged = await addClaudeLogin({ credential: credential('new'), config: config('account-a'), replace: 'account-a', slots });
+    assert.equal(unchanged.kind, 'already-current');
+    assert.equal(await backend.get('qlb:anthropic:account-a:prev', 'qlb'), predecessor);
     repository.close();
 
     const db = new DatabaseSync(dbPath, { readOnly: true });
@@ -77,7 +83,7 @@ describe('qlb claude add (K11 / AC32)', () => {
       assert.equal((db.prepare("SELECT count(*) AS count FROM accounts WHERE id = 'account-a'").get() as { count: number }).count, 1);
       assert.equal((db.prepare("SELECT count(*) AS count FROM lineage_log WHERE account_id = 'account-a' AND cause IN ('add', 'replace')").get() as { count: number }).count, 2);
       assert.equal((db.prepare("SELECT account_id, set_by FROM active_login WHERE provider = 'anthropic'").get() as { account_id: string; set_by: string }).account_id, 'account-a');
-      assert.equal((db.prepare("SELECT count(*) AS count FROM relogin_events WHERE kind = 'identity-replaced'").get() as { count: number }).count, 1);
+      assert.equal((db.prepare("SELECT count(*) AS count FROM relogin_events WHERE kind = 'identity-replaced'").get() as { count: number }).count, 2);
       assert.equal((db.prepare("SELECT dead, healed_at FROM claude_slots WHERE account_id = 'account-a'").get() as { dead: number; healed_at: number }).dead, 0);
     } finally { db.close(); }
   });
@@ -113,11 +119,68 @@ describe('qlb claude add (K11 / AC32)', () => {
     assert.equal((await slots.readSlot('account-b')).credential, credential('b'));
   });
 
-  it('refuses API keys and an absent accountUuid before it writes a slot', async () => {
+  it('refuses API keys, an absent accountUuid, and control characters before it writes a slot', async () => {
     const { slots } = fixture();
     await assert.rejects(addClaudeLogin({ credential: 'sk-ant-api-key', config: config('account-a'), slots }), /API key/);
     await assert.rejects(addClaudeLogin({ credential: credential('new'), config: { oauthAccount: {} }, slots }), /accountUuid/);
+    await assert.rejects(addClaudeLogin({ credential: credential('new'), config: config('account-a\nforged'), slots }), /invalid accountUuid/);
     assert.deepEqual(slots.listSlots(), []);
+  });
+
+  it('stores only the oauthAccount block on both add and replace', async () => {
+    const { slots } = fixture();
+    const addedConfig: Record<string, unknown> = {
+      ...config('account-a'),
+      primaryApiKey: 'token-shaped-fixture-value',
+      mcpServers: { fixture: { env: { TOKEN: 'another-token-shaped-fixture-value' } } },
+    };
+    const replacedConfig: Record<string, unknown> = {
+      ...config('account-a'),
+      customApiKeyResponses: ['token-shaped-fixture-value'],
+    };
+
+    await addClaudeLogin({ credential: credential('new'), config: addedConfig, slots });
+    assert.deepEqual(JSON.parse(slots.listSlots()[0]!.configJson!), { oauthAccount: addedConfig.oauthAccount });
+    await addClaudeLogin({ credential: credential('replaced'), config: replacedConfig, replace: 'account-a', slots });
+    assert.deepEqual(JSON.parse(slots.listSlots()[0]!.configJson!), { oauthAccount: replacedConfig.oauthAccount });
+  });
+
+  it('makes an unchanged replace already current without a self-edge or predecessor write', async () => {
+    const { slots, repository, backend } = fixture();
+    await addClaudeLogin({ credential: credential('old'), config: config('account-a'), slots });
+    await addClaudeLogin({ credential: credential('current'), config: config('account-a'), replace: 'account-a', slots });
+    const before = repository.getSlot('account-a')!;
+    const predecessor = await backend.get('qlb:anthropic:account-a:prev', 'qlb');
+    const result = await addClaudeLogin({ credential: credential('current'), config: config('account-a'), replace: 'account-a', slots });
+
+    assert.equal(result.kind, 'already-current');
+    assert.equal(repository.getSlot('account-a')?.prevFingerprint, before.prevFingerprint);
+    assert.equal(await backend.get('qlb:anthropic:account-a:prev', 'qlb'), predecessor);
+    assert.equal(repository.transitions.length, 2);
+    assert.notEqual(repository.transitions[1]!.fromFp, repository.transitions[1]!.toFp);
+  });
+
+  it('refuses add mode when an orphan slot Keychain item exists', async () => {
+    const { slots, backend } = fixture();
+    await backend.set('qlb:anthropic:account-a', 'qlb', credential('orphan'));
+    await assert.rejects(addClaudeLogin({ credential: credential('new'), config: config('account-a'), slots }), /credential already exists/);
+    assert.equal(await backend.get('qlb:anthropic:account-a', 'qlb'), credential('orphan'));
+  });
+
+  it('allows an archived identity to be added again and clears its archive', async () => {
+    const { slots, repository, backend } = fixture();
+    await slots.createSlot({ accountId: 'account-a', credential: credential('old'), source: 'cswap-import' });
+    // The in-memory repository returns copies, so install an archived fixture through its test map.
+    const rows = (repository as unknown as { slots: Map<string, { archivedAt: number | null }> }).slots;
+    rows.get('account-a')!.archivedAt = 1;
+    await backend.delete('qlb:anthropic:account-a', 'qlb');
+    await addClaudeLogin({ credential: credential('new'), config: config('account-a'), slots });
+    assert.equal(repository.getSlot('account-a')?.archivedAt, null);
+
+    rows.get('account-a')!.archivedAt = 2;
+    await backend.delete('qlb:anthropic:account-a', 'qlb');
+    await addClaudeLogin({ credential: credential('replacement'), config: config('account-a'), replace: 'account-a', slots });
+    assert.equal(repository.getSlot('account-a')?.archivedAt, null);
   });
 
   it('is refused in pre-cutover and does not read the live credential', async () => {
@@ -132,6 +195,50 @@ describe('qlb claude add (K11 / AC32)', () => {
     assert.equal(code, 3);
     assert.equal(reads, 0);
     assert.match(output[0]!, /phase=pre-cutover/);
+  });
+
+  it('reads the live credential and identity atomically, refusing a state change between reads', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-cc-add-live-'));
+    let liveCredential = credential('one');
+    let liveConfig = config('account-a');
+    let reads = 0;
+    await assert.rejects(readClaudeLiveStateAtomically({
+      configHome: join(root, '.claude'), globalConfigPath: join(root, '.claude.json'),
+      readCredential: async () => liveCredential,
+      readConfig: () => {
+        reads += 1;
+        if (reads === 1) {
+          liveCredential = credential('two');
+          liveConfig = config('account-b');
+        }
+        return liveConfig;
+      },
+    }), /live-state-inconsistent/);
+  });
+
+  it('re-checks admission in the write transaction after lifecycle changes', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-cc-add-admission-'));
+    const dbPath = join(root, 'qlb.db');
+    const store = openStore(dbPath);
+    beginCutover(store);
+    const repository = SqliteClaudeSlotRepository.open(dbPath);
+    const backend = new MockKeychain();
+    const slots = new ClaudeSlots({ backend, repository, stashDir: join(root, 'unclaimed') });
+    const output: string[] = [];
+    const code = await runClaudeAddCommand([], context(dbPath, output), {
+      readLive: async () => {
+        assert.equal(transition(store, 'cutover').ok, true);
+        assert.equal(transition(store, 'undoing').ok, true);
+        return { credential: credential('new'), config: config('account-a') };
+      },
+      add: async (input) => addClaudeLogin({ ...input, slots }),
+    });
+    assert.equal(code, 3);
+    assert.match(output[0]!, /undo-in-progress/);
+    assert.equal(repository.getSlot('account-a'), null);
+    await assert.rejects(backend.get('qlb:anthropic:account-a', 'qlb'));
+    repository.close();
+    store.close();
   });
 
   it('parses strict arguments and turns a cross-identity replacement into exit 3', async () => {

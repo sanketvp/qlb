@@ -1,8 +1,9 @@
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 import { addClaudeLogin, type ClaudeAddInput, type ClaudeAddResult } from '../cc-add';
 import { ClaudeSlots, SqliteClaudeSlotRepository } from '../cc-slots';
 import { claudePaths } from '../cc-paths';
+import { withClaudeConfigLock, withClaudeCredentialLocks } from '../cc-locks';
 import { readClaudeConfig, readLiveClaudeCredentials } from '../cc-credentials';
 import { qlbHomeDir } from '../home';
 import { platformKeychain } from '../keychain';
@@ -22,13 +23,49 @@ export interface ClaudeAddCommandDeps {
 
 type ParsedArgs = { replace?: string; alias?: string };
 
+export class ClaudeLiveStateInconsistent extends Error {
+  constructor() {
+    super('live-state-inconsistent');
+    this.name = 'ClaudeLiveStateInconsistent';
+  }
+}
+
+/**
+ * Snapshot credential and config identity while holding the same nested locks
+ * as Claude switching. A second read makes an uncooperative concurrent writer
+ * fail closed instead of pairing credential bytes with a different identity.
+ */
+function oauthIdentity(config: unknown): unknown {
+  if (!config || typeof config !== 'object' || Array.isArray(config)) return undefined;
+  return (config as Record<string, unknown>).oauthAccount;
+}
+
+export async function readClaudeLiveStateAtomically(input: {
+  configHome: string;
+  globalConfigPath: string;
+  readCredential: () => Promise<string>;
+  readConfig: () => unknown;
+}): Promise<Pick<ClaudeAddInput, 'credential' | 'config'>> {
+  return withClaudeCredentialLocks({ configDir: input.configHome, env: {} }, () =>
+    withClaudeConfigLock({ configDir: dirname(input.globalConfigPath), env: {} }, async () => {
+      const credential = await input.readCredential();
+      const config = input.readConfig();
+      const verifiedCredential = await input.readCredential();
+      const verifiedConfig = input.readConfig();
+      if (credential !== verifiedCredential || JSON.stringify(oauthIdentity(config)) !== JSON.stringify(oauthIdentity(verifiedConfig))) {
+        throw new ClaudeLiveStateInconsistent();
+      }
+      return { credential, config };
+    }));
+}
+
 function parse(args: string[]): ParsedArgs | null {
   const result: ParsedArgs = {};
   for (let i = 0; i < args.length; i += 1) {
     const flag = args[i];
     if ((flag !== '--replace' && flag !== '--alias') || i + 1 >= args.length) return null;
     const value = args[++i];
-    if (!value || value.startsWith('--') || (flag === '--replace' && /[\0/\\:]/.test(value))) return null;
+    if (!value || value.startsWith('--') || (flag === '--replace' && /[\p{Cc}/\\:]/u.test(value))) return null;
     if (flag === '--replace') {
       if (result.replace != null) return null;
       result.replace = value;
@@ -44,10 +81,12 @@ function defaultDeps(ctx: CommandContext): ClaudeAddCommandDeps {
   const paths = claudePaths({ home: ctx.home, env: ctx.env });
   return {
     async readLive() {
-      return {
-        credential: await readLiveClaudeCredentials({ backend: platformKeychain, paths }),
-        config: readClaudeConfig(paths.globalConfigPath),
-      };
+      return readClaudeLiveStateAtomically({
+        configHome: paths.configHome,
+        globalConfigPath: paths.globalConfigPath,
+        readCredential: () => readLiveClaudeCredentials({ backend: platformKeychain, paths }),
+        readConfig: () => readClaudeConfig(paths.globalConfigPath),
+      });
     },
     async add(input) {
       // Open this only after the live read succeeds, so a read failure cannot
@@ -99,14 +138,17 @@ export async function runClaudeAddCommand(
     // any unexpected backend error without ever rendering the credential.
     ctx.registerSecret(live.credential);
     const result = await deps.add({ ...live, replace: parsed.replace, alias: parsed.alias });
-    ctx.stdout(`${result.kind === 'added' ? 'added' : 'replaced'} Claude account ${result.accountId}`);
+    const action = result.kind === 'added' ? 'added' : result.kind === 'already-current' ? 'already current' : 'replaced';
+    ctx.stdout(`${action} Claude account ${result.accountId}`);
     return 0;
   } catch (error) {
     // Errors emitted by cc-add are deliberately payload-free. Do not pass through
     // backend/file errors, which could contain credential or path fragments.
-    const message = error instanceof Error && /^(active Claude login is an API key|Claude config has no |invalid |Claude slot already exists|replace target belongs|Claude replace slot not found)/.test(error.message)
+    const message = error instanceof ClaudeLiveStateInconsistent
       ? error.message
-      : 'could not add active Claude login';
+      : error instanceof Error && /^(active Claude login is an API key|Claude config has no |invalid |Claude slot (already exists|credential already exists)|replace target belongs|Claude replace slot not found|undo-in-progress|cutover-begin-in-progress|phase=)/.test(error.message)
+        ? error.message
+        : 'could not add active Claude login';
     ctx.stderr(`qlb claude add: refused: ${message}`);
     return 3;
   }

@@ -33,7 +33,7 @@ function stringOrNull(value: unknown): string | null {
 }
 
 function assertSafeId(value: string, description: string): void {
-  if (!value || /[\0/\\:]/.test(value)) throw new Error(`invalid ${description}`);
+  if (!value || /[\p{Cc}/\\:]/u.test(value)) throw new Error(`invalid ${description}`);
 }
 
 function identityFromConfig(config: unknown): ClaudeIdentity {
@@ -51,7 +51,9 @@ function identityFromConfig(config: unknown): ClaudeIdentity {
     accountId,
     email: stringOrNull((oauthAccount as Record<string, unknown>).emailAddress),
     orgUuid: stringOrNull((oauthAccount as Record<string, unknown>).organizationUuid),
-    configJson: JSON.stringify(config),
+    // The database owns only the account identity needed to reconstitute a
+    // slot. The surrounding Claude config may contain MCP/API secrets.
+    configJson: JSON.stringify({ oauthAccount }),
   };
 }
 
@@ -69,13 +71,14 @@ export async function addClaudeLogin(input: ClaudeAddInput): Promise<ClaudeAddRe
   if (looksLikeApiKey(input.credential)) throw new Error('active Claude login is an API key');
   const identity = identityFromConfig(input.config);
   const alias = validatedAlias(input.alias);
-  const existing = input.slots.listSlots().find((slot) => slot.accountId === identity.accountId) ?? null;
+  const matching = input.slots.listSlots().find((slot) => slot.accountId === identity.accountId) ?? null;
+  const existing = matching?.archivedAt == null ? matching : null;
 
   if (existing && input.replace !== identity.accountId) {
     if (input.replace) throw new Error('replace target belongs to a different identity');
     throw new Error(`Claude slot already exists for ${identity.accountId}`);
   }
-  if (!existing && input.replace) {
+  if (!matching && input.replace) {
     throw new Error('replace target belongs to a different identity');
   }
 
@@ -86,7 +89,9 @@ export async function addClaudeLogin(input: ClaudeAddInput): Promise<ClaudeAddRe
     alias,
     orgUuid: identity.orgUuid,
     configJson: identity.configJson,
-    replace: Boolean(existing),
+    // An archived row is an historical record, not a duplicate. Plain add
+    // reactivates it; explicit --replace also clears its archived marker.
+    replace: Boolean(existing || (matching && input.replace === identity.accountId)),
   });
   return { ...result, accountId: identity.accountId };
 }
