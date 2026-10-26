@@ -17,13 +17,17 @@ class StashFailingBackend implements ClaudeSlotBackend {
   readonly kind = 'test-memory' as const;
   readonly inner = new MockKeychain();
   failUnclaimedWrites = false;
+  failUnclaimedDeletes = false;
 
   async get(service: string, account: string): Promise<string> { return this.inner.get(service, account); }
   async set(service: string, account: string, value: string): Promise<void> {
     if (this.failUnclaimedWrites && service.includes(':unclaimed:')) throw new Error('fixture keychain write failed');
     return this.inner.set(service, account, value);
   }
-  async delete(service: string, account: string): Promise<void> { return this.inner.delete(service, account); }
+  async delete(service: string, account: string): Promise<void> {
+    if (this.failUnclaimedDeletes && service.includes(':unclaimed:')) throw new Error('fixture keychain delete failed');
+    return this.inner.delete(service, account);
+  }
 }
 
 function fixture(): { slots: ClaudeSlots; backend: StashFailingBackend; stashDir: string } {
@@ -75,6 +79,16 @@ describe('Claude unclaimed stash and restore (K2 / AC48)', () => {
     assert.equal((await slots.readSlot('account-a', { fresh: true })).credential, credential('issued'));
   });
 
+  it('reports when a restored stash could not be deleted', async () => {
+    const { slots, backend } = fixture();
+    await slots.createSlot({ accountId: 'account-a', credential: credential('one'), source: 'cswap-import' });
+    const current = (await slots.readSlot('account-a', { fresh: true })).fingerprint;
+    await slots.stashUnclaimed('2026-10-25T12:01:30Z', credential('issued'), current);
+    backend.failUnclaimedDeletes = true;
+
+    assert.deepEqual(await slots.restoreUnclaimed('2026-10-25T12:01:30Z', 'account-a'), { cleanupPending: true });
+  });
+
   it('refuses a restore whose consumed lineage no longer matches', async () => {
     const { slots } = fixture();
     await slots.createSlot({ accountId: 'account-a', credential: credential('one'), source: 'cswap-import' });
@@ -98,5 +112,16 @@ describe('Claude unclaimed stash and restore (K2 / AC48)', () => {
     assert.deepEqual(seen, [['2026-10-25T12:03:00Z', 'account-a']]);
     assert.deepEqual(output, ['restored unclaimed credential to account-a']);
     assert.equal(await runClaudeRestoreUnclaimedCommand([], context(output), { restore }), 2);
+    assert.equal(await runClaudeRestoreUnclaimedCommand(['2026-10-25T12:03:00Z', 'a:prev'], context(output), { restore }), 2);
+  });
+
+  it('prints a warning when command-level stash cleanup is pending', async () => {
+    const output: string[] = [];
+    const restore = async () => ({ cleanupPending: true });
+    assert.equal(await runClaudeRestoreUnclaimedCommand(['2026-10-25T12:04:00Z', 'account-a'], context(output), { restore }), 0);
+    assert.deepEqual(output, [
+      'restored unclaimed credential to account-a',
+      'ERR:qlb claude restore-unclaimed: warning: stash cleanup pending',
+    ]);
   });
 });

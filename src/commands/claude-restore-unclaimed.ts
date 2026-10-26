@@ -1,12 +1,12 @@
 import { join } from 'node:path';
-import { ClaudeSlots, SqliteClaudeSlotRepository } from '../cc-slots';
+import { ClaudeSlots, SqliteClaudeSlotRepository, type RestoreUnclaimedResult } from '../cc-slots';
 import { qlbHomeDir } from '../home';
 import { platformKeychain } from '../keychain';
 import type { CommandContext, CommandDefinition } from '../registry';
 import { openStore } from '../store';
 
 export interface ClaudeRestoreUnclaimedDeps {
-  restore: (timestamp: string, slot: string) => Promise<void>;
+  restore: (timestamp: string, slot: string) => Promise<RestoreUnclaimedResult | void>;
 }
 
 function defaultDeps(ctx: CommandContext): ClaudeRestoreUnclaimedDeps {
@@ -37,14 +37,15 @@ export async function runClaudeRestoreUnclaimedCommand(
   ctx: CommandContext,
   deps?: ClaudeRestoreUnclaimedDeps,
 ): Promise<number> {
-  if (args.length !== 2 || args.some((arg) => !arg || /[\0/\\]/.test(arg))) {
+  if (args.length !== 2 || !args[0] || /[\0/\\]/.test(args[0]) || !args[1] || /[\0/\\:]/.test(args[1])) {
     ctx.stderr('qlb claude restore-unclaimed: expected <timestamp> <slot>');
     return 2;
   }
   const [timestamp, slot] = args;
   try {
-    await (deps ?? defaultDeps(ctx)).restore(timestamp, slot);
+    const result = await (deps ?? defaultDeps(ctx)).restore(timestamp, slot);
     ctx.stdout(`restored unclaimed credential to ${slot}`);
+    if (result?.cleanupPending) ctx.stderr('qlb claude restore-unclaimed: warning: stash cleanup pending');
     return 0;
   } catch (error) {
     // The slot module deliberately uses non-secret messages; do not include

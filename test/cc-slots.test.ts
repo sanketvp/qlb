@@ -12,6 +12,7 @@ import {
   type ClaudeSlotBackend,
 } from '../src/cc-slots';
 import { KeychainBackedOff, KeychainReadBackoff, MockKeychain } from '../src/keychain';
+import { credentialFingerprint } from '../src/anthropic-oauth';
 import { openStore } from '../src/store';
 
 function credential(tag: string): string {
@@ -161,6 +162,85 @@ describe('Claude slots (K2)', () => {
     assert.equal(await backend.get('qlb:anthropic:account-a:prev', 'qlb'), previous);
     assert.equal(repo.getSlot('account-a')?.prevFingerprint, before.prevFingerprint);
     assert.equal(repo.transitions.length, 2);
+  });
+
+  it('persists a refresh blob when only access-token fields changed', async () => {
+    const { slots, backend, repo } = fixture();
+    const before = JSON.stringify({ claudeAiOauth: { refreshToken: 'refresh-stable', accessToken: 'access-old', expiresAt: 1 } });
+    const refreshed = JSON.stringify({ claudeAiOauth: { refreshToken: 'refresh-stable', accessToken: 'access-new', expiresAt: 2 } });
+    await slots.createSlot({ accountId: 'account-a', credential: before, source: 'cswap-import' });
+
+    await slots.writeSlot('account-a', refreshed, { cause: 'post' });
+
+    assert.equal((await slots.readSlot('account-a', { fresh: true })).credential, refreshed);
+    assert.equal(await backend.get('qlb:anthropic:account-a:prev', 'qlb'), before);
+    assert.equal(repo.generation, 2);
+  });
+
+  it('preserves the predecessor and DB lineage after retrying a crash-window drift', async () => {
+    const { slots, backend, repo } = fixture();
+    await slots.createSlot({ accountId: 'account-a', credential: credential('one'), source: 'cswap-import' });
+    await slots.writeSlot('account-a', credential('two'), { cause: 'post' });
+    // Simulate a crash after Keychain writes but before their metadata commit.
+    await backend.set('qlb:anthropic:account-a:prev', 'qlb', credential('two'));
+    await backend.set('qlb:anthropic:account-a', 'qlb', credential('three'));
+
+    await slots.writeSlot('account-a', credential('three'), { cause: 'post' });
+
+    assert.equal(await backend.get('qlb:anthropic:account-a:prev', 'qlb'), credential('two'));
+    assert.equal(repo.getSlot('account-a')?.prevFingerprint, credentialFingerprint(credential('two')));
+    assert.deepEqual(repo.transitions.at(-1), {
+      ts: 1_000, provider: 'anthropic', accountId: 'account-a',
+      fromFp: credentialFingerprint(credential('two')), toFp: credentialFingerprint(credential('three')),
+      cause: 'post', by: 'qlb-cli', evidence: 'lineage',
+    });
+  });
+
+  it('serializes concurrent writers from two SQLite connections with their Keychain effects', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-cc-slot-concurrent-'));
+    const dbPath = join(root, 'qlb.db');
+    const store = openStore(dbPath);
+    store.close();
+    const backend = new CountingBackend();
+    const firstRepository = SqliteClaudeSlotRepository.open(dbPath);
+    const secondRepository = SqliteClaudeSlotRepository.open(dbPath);
+    const first = new ClaudeSlots({ backend, repository: firstRepository, stashDir: join(root, 'unclaimed'), now: () => 1_000 });
+    const second = new ClaudeSlots({ backend, repository: secondRepository, stashDir: join(root, 'unclaimed'), now: () => 1_000 });
+    await first.createSlot({ accountId: 'account-a', credential: credential('one'), source: 'cswap-import' });
+
+    const writes = await Promise.allSettled([
+      first.writeSlot('account-a', credential('two'), { cause: 'post' }),
+      second.writeSlot('account-a', credential('three'), { cause: 'post' }),
+    ]);
+
+    assert.deepEqual(writes.map((result) => result.status), ['fulfilled', 'fulfilled']);
+    const persisted = await first.readSlot('account-a', { fresh: true });
+    assert.equal(firstRepository.getSlot('account-a')?.fingerprint, persisted.fingerprint);
+    firstRepository.close();
+    secondRepository.close();
+  });
+
+  it('does not let a losing concurrent SQLite create remove the winner credential', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-cc-slot-concurrent-create-'));
+    const dbPath = join(root, 'qlb.db');
+    const store = openStore(dbPath);
+    store.close();
+    const backend = new CountingBackend();
+    const firstRepository = SqliteClaudeSlotRepository.open(dbPath);
+    const secondRepository = SqliteClaudeSlotRepository.open(dbPath);
+    const first = new ClaudeSlots({ backend, repository: firstRepository, stashDir: join(root, 'unclaimed'), now: () => 1_000 });
+    const second = new ClaudeSlots({ backend, repository: secondRepository, stashDir: join(root, 'unclaimed'), now: () => 1_000 });
+
+    const creates = await Promise.allSettled([
+      first.createSlot({ accountId: 'account-a', credential: credential('one'), source: 'cswap-import' }),
+      second.createSlot({ accountId: 'account-a', credential: credential('two'), source: 'cswap-import' }),
+    ]);
+
+    assert.equal(creates.filter((result) => result.status === 'fulfilled').length, 1);
+    const persisted = await first.readSlot('account-a', { fresh: true });
+    assert.equal(firstRepository.getSlot('account-a')?.fingerprint, persisted.fingerprint);
+    firstRepository.close();
+    secondRepository.close();
   });
 
   it('rejects IDs that collide with reserved predecessor and stash namespaces', async () => {

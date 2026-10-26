@@ -74,6 +74,8 @@ export interface ClaudeSlotRepository {
   getSlot(accountId: string): ClaudeSlot | null;
   listSlots(): ClaudeSlot[];
   createSlot(slot: ClaudeSlot): void;
+  /** Holds SQLite's write lock across the credential and metadata effects. */
+  withWriteTransaction<T>(fn: () => Promise<T>): Promise<T>;
   /** Each method is one SQLite transaction in production. */
   createSlotWithLineage(slot: ClaudeSlot, lineage: LineageAppend): void;
   updateCredentialWithLineage(accountId: string, expectedFingerprint: string | null, fingerprint: string, prevFingerprint: string | null, lineage: LineageAppend | null): void;
@@ -98,6 +100,10 @@ export class InMemoryClaudeSlotRepository implements ClaudeSlotRepository {
 
   listSlots(): ClaudeSlot[] {
     return [...this.slots.values()].map(cloneSlot);
+  }
+
+  async withWriteTransaction<T>(fn: () => Promise<T>): Promise<T> {
+    return fn();
   }
 
   createSlot(slot: ClaudeSlot): void {
@@ -138,10 +144,17 @@ export class InMemoryClaudeSlotRepository implements ClaudeSlotRepository {
 
 /** SQLite adapter for the v5 `claude_slots`, `lineage_log`, and config tables. */
 export class SqliteClaudeSlotRepository implements ClaudeSlotRepository {
-  constructor(private readonly db: ReturnType<typeof openStoreConnection>) {}
+  private static readonly writeQueues = new Map<string, Promise<void>>();
+  private static nextConnectionId = 0;
+  private writeTransactionActive = false;
+
+  constructor(
+    private readonly db: ReturnType<typeof openStoreConnection>,
+    private readonly writeQueueKey = `connection-${SqliteClaudeSlotRepository.nextConnectionId++}`,
+  ) {}
 
   static open(dbPath: string): SqliteClaudeSlotRepository {
-    return new SqliteClaudeSlotRepository(openStoreConnection(dbPath));
+    return new SqliteClaudeSlotRepository(openStoreConnection(dbPath), dbPath);
   }
 
   close(): void {
@@ -159,6 +172,35 @@ export class SqliteClaudeSlotRepository implements ClaudeSlotRepository {
     return (this.db.prepare(`SELECT account_id, slot_num, email, alias, org_uuid, config_json,
       fingerprint, prev_fingerprint, threshold, dead, dead_reason, dead_at, healed_at,
       added_at, last_active_at, source, archived_at FROM claude_slots ORDER BY slot_num, account_id`).all() as Record<string, unknown>[]).map((row) => this.toSlot(row));
+  }
+
+  async withWriteTransaction<T>(fn: () => Promise<T>): Promise<T> {
+    const previous = SqliteClaudeSlotRepository.writeQueues.get(this.writeQueueKey) ?? Promise.resolve();
+    let release!: () => void;
+    const own = new Promise<void>((resolve) => { release = resolve; });
+    const queued = previous.then(() => own);
+    SqliteClaudeSlotRepository.writeQueues.set(this.writeQueueKey, queued);
+    await previous;
+    let began = false;
+    try {
+      this.db.exec('BEGIN IMMEDIATE');
+      began = true;
+      this.writeTransactionActive = true;
+      const result = await fn();
+      this.db.exec('COMMIT');
+      return result;
+    } catch (error) {
+      if (began) {
+        try { this.db.exec('ROLLBACK'); } catch { /* preserve original failure */ }
+      }
+      throw error;
+    } finally {
+      this.writeTransactionActive = false;
+      release();
+      if (SqliteClaudeSlotRepository.writeQueues.get(this.writeQueueKey) === queued) {
+        SqliteClaudeSlotRepository.writeQueues.delete(this.writeQueueKey);
+      }
+    }
   }
 
   createSlot(slot: ClaudeSlot): void {
@@ -206,10 +248,17 @@ export class SqliteClaudeSlotRepository implements ClaudeSlotRepository {
   }
 
   private transaction(fn: () => void): void {
+    if (this.writeTransactionActive) {
+      fn();
+      return;
+    }
     this.db.exec('BEGIN IMMEDIATE');
+    this.writeTransactionActive = true;
     try { fn(); this.db.exec('COMMIT'); } catch (error) {
       try { this.db.exec('ROLLBACK'); } catch { /* preserve original failure */ }
       throw error;
+    } finally {
+      this.writeTransactionActive = false;
     }
   }
 
@@ -244,6 +293,10 @@ export class SqliteClaudeSlotRepository implements ClaudeSlotRepository {
 export interface UnclaimedRecord {
   credential: string;
   consumedFp?: string;
+}
+
+export interface RestoreUnclaimedResult {
+  cleanupPending: boolean;
 }
 
 export interface ClaudeSlotFileOps {
@@ -331,7 +384,7 @@ export class ClaudeSlots {
 
   async createSlot(input: CreateClaudeSlotInput): Promise<ClaudeSlot> {
     assertSlotId(input.accountId);
-    return this.withSlotWrite(input.accountId, async () => {
+    return this.withSlotWrite(input.accountId, () => this.options.repository.withWriteTransaction(async () => {
       const fingerprint = this.fingerprint(input.credential);
       const existing = this.options.repository.getSlot(input.accountId);
       if (existing) throw new Error('Claude slot already exists');
@@ -352,12 +405,15 @@ export class ClaudeSlots {
           evidence: input.source === 'cswap-import' ? 'import' : 'identity',
         });
       } catch (error) {
-        await this.deleteIfPresent(this.slotService(input.accountId));
+        // A losing create must not remove a credential committed by another
+        // process. The write transaction normally prevents that interleaving;
+        // the byte check also makes failed cleanup conservative.
+        await this.restoreServiceIfUnchanged(this.slotService(input.accountId), input.credential, null);
         throw error;
       }
       this.invalidateCache();
       return slot;
-    });
+    }));
   }
 
   /** Fresh correctness read by default; only display callers opt into the cache. */
@@ -385,7 +441,9 @@ export class ClaudeSlots {
 
   async writeSlot(accountId: string, credential: string, transition: { cause: string; by?: string; evidence?: LineageAppend['evidence'] }): Promise<void> {
     assertSlotId(accountId);
-    return this.withSlotWrite(accountId, () => this.writeSlotUnlocked(accountId, credential, transition));
+    return this.withSlotWrite(accountId, () => this.options.repository.withWriteTransaction(
+      () => this.writeSlotUnlocked(accountId, credential, transition),
+    ));
   }
 
   private async writeSlotUnlocked(accountId: string, credential: string, transition: { cause: string; by?: string; evidence?: LineageAppend['evidence'] }): Promise<void> {
@@ -393,24 +451,30 @@ export class ClaudeSlots {
     if (!slot) throw new Error('Claude slot not found');
     const nextFingerprint = this.fingerprint(credential);
     const existing = await this.readExistingCredential(accountId);
-    const existingFingerprint = existing == null ? null : this.fingerprint(existing);
-    // Idempotent writes preserve the undo generation and dead state.
-    if (slot.fingerprint === nextFingerprint && existingFingerprint === nextFingerprint) return;
+    // Fingerprints identify credential lineage, but refreshes may retain the
+    // refresh token while changing access-token or expiry bytes. Only a full
+    // byte-for-byte match is an idempotent write.
+    if (slot.fingerprint === nextFingerprint && existing === credential) return;
     const previous = await this.readPreviousCredential(accountId);
+    const saveExistingAsPrevious = existing != null && existing !== credential;
+    // The DB record is the CAS and restore-lineage authority. A Keychain-only
+    // crash-window successor must never become a self-edge on retry.
     const lineage = slot.fingerprint === nextFingerprint ? null : {
-      ts: this.now(), provider: ANTHROPIC_PROVIDER, accountId, fromFp: existingFingerprint,
+      ts: this.now(), provider: ANTHROPIC_PROVIDER, accountId, fromFp: slot.fingerprint,
       toFp: nextFingerprint, cause: transition.cause, by: transition.by ?? 'qlb-cli', evidence: transition.evidence ?? 'lineage',
     } satisfies LineageAppend;
-    const prevFingerprint = existingFingerprint ?? slot.prevFingerprint;
+    const prevFingerprint = lineage || saveExistingAsPrevious ? slot.fingerprint : slot.prevFingerprint;
     this.invalidateCache();
     try {
-      if (existing != null && lineage) await this.backend.set(this.previousService(accountId), QLB_KEYCHAIN_ACCOUNT, existing);
+      if (saveExistingAsPrevious) await this.backend.set(this.previousService(accountId), QLB_KEYCHAIN_ACCOUNT, existing);
       await this.backend.set(this.slotService(accountId), QLB_KEYCHAIN_ACCOUNT, credential);
-      if (lineage) {
-        this.options.repository.updateCredentialWithLineage(accountId, slot.fingerprint, nextFingerprint, prevFingerprint, lineage);
-      }
+      // Even without a lineage edge, a changed credential blob must invalidate
+      // display readers in other processes via slots.generation.
+      this.options.repository.updateCredentialWithLineage(accountId, slot.fingerprint, nextFingerprint, prevFingerprint, lineage);
     } catch (error) {
-      await this.restoreCredentialPair(accountId, existing, previous);
+      await this.restoreCredentialPair(
+        accountId, existing, previous, credential, saveExistingAsPrevious ? existing : previous,
+      );
       throw error;
     }
     this.invalidateCache();
@@ -418,7 +482,7 @@ export class ClaudeSlots {
 
   async deleteSlot(accountId: string): Promise<void> {
     assertSlotId(accountId);
-    return this.withSlotWrite(accountId, async () => {
+    return this.withSlotWrite(accountId, () => this.options.repository.withWriteTransaction(async () => {
       if (!this.options.repository.getSlot(accountId)) throw new Error('Claude slot not found');
       const current = await this.readExistingCredential(accountId);
       const previous = await this.readPreviousCredential(accountId);
@@ -428,11 +492,11 @@ export class ClaudeSlots {
         await this.deleteIfPresent(this.previousService(accountId));
         this.options.repository.removeSlotWithGeneration(accountId);
       } catch (error) {
-        await this.restoreCredentialPair(accountId, current, previous);
+        await this.restoreCredentialPair(accountId, current, previous, null, null);
         throw error;
       }
       this.invalidateCache();
-    });
+    }));
   }
 
   /** S36: Keychain first; a private file is retained only if that write fails. */
@@ -482,10 +546,10 @@ export class ClaudeSlots {
   }
 
   /** Restores an S36 record only when it was issued from the slot's current lineage. */
-  async restoreUnclaimed(timestamp: string, accountId: string): Promise<void> {
+  async restoreUnclaimed(timestamp: string, accountId: string): Promise<RestoreUnclaimedResult> {
     this.assertTimestamp(timestamp);
     assertSlotId(accountId);
-    return this.withSlotWrite(accountId, async () => {
+    return this.withSlotWrite(accountId, () => this.options.repository.withWriteTransaction(async () => {
       const record = await this.readUnclaimed(timestamp);
       const slot = this.options.repository.getSlot(accountId);
       if (!slot) throw new Error('Claude slot not found');
@@ -493,10 +557,12 @@ export class ClaudeSlots {
       await this.writeSlotUnlocked(accountId, record.credential, { cause: 'stash-adopt', evidence: 'lineage' });
       try {
         await this.deleteUnclaimed(timestamp);
+        return { cleanupPending: false };
       } catch {
-        // The restore is durable; retain the safety copy for a later sweep.
+        // The restore is durable, but callers must disclose the retained copy.
+        return { cleanupPending: true };
       }
-    });
+    }));
   }
 
   private async readExistingCredential(accountId: string): Promise<string | null> {
@@ -559,13 +625,33 @@ export class ClaudeSlots {
     }
   }
 
-  private async restoreCredentialPair(accountId: string, current: string | null, previous: string | null): Promise<void> {
+  private async restoreCredentialPair(
+    accountId: string,
+    current: string | null,
+    previous: string | null,
+    expectedCurrent: string | null,
+    expectedPrevious: string | null,
+  ): Promise<void> {
     try {
-      if (current == null) await this.deleteIfPresent(this.slotService(accountId));
-      else await this.backend.set(this.slotService(accountId), QLB_KEYCHAIN_ACCOUNT, current);
-      if (previous == null) await this.deleteIfPresent(this.previousService(accountId));
-      else await this.backend.set(this.previousService(accountId), QLB_KEYCHAIN_ACCOUNT, previous);
+      // Do not put stale pre-images over a concurrent writer's values. A
+      // writer that respects the SQLite lock cannot interleave; this is a
+      // second, conservative guard for failed CAS or backend edge cases.
+      await this.restoreServiceIfUnchanged(this.slotService(accountId), expectedCurrent, current);
+      await this.restoreServiceIfUnchanged(this.previousService(accountId), expectedPrevious, previous);
     } catch { /* Best-effort compensation; preserve the original persistence error. */ }
+  }
+
+  private async restoreServiceIfUnchanged(service: string, expected: string | null, replacement: string | null): Promise<void> {
+    let actual: string | null;
+    try {
+      actual = await this.backend.get(service, QLB_KEYCHAIN_ACCOUNT);
+    } catch (error) {
+      if (!missingItem(error)) throw error;
+      actual = null;
+    }
+    if (actual !== expected) return;
+    if (replacement == null) await this.deleteIfPresent(service);
+    else await this.backend.set(service, QLB_KEYCHAIN_ACCOUNT, replacement);
   }
 
   private async withSlotWrite<T>(accountId: string, fn: () => Promise<T>): Promise<T> {
