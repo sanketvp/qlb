@@ -8,8 +8,39 @@
 // Pure provenance decisions for the active Claude credential path. Effects
 // (locks, live-store reads, POSTs, and slot writes) deliberately land in K6-3.
 
-import { credentialFingerprint, isOAuthTokenExpired, parseCredentialBlob } from './anthropic-oauth';
-import { readClaudeConfig } from './cc-credentials';
+import { appendFileSync, mkdirSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import {
+  buildRefreshRequest,
+  classifyRefreshResponse,
+  credentialFingerprint,
+  isOAuthTokenExpired,
+  parseCredentialBlob,
+  serializeCredentialBlob,
+  type HttpRequestDescription,
+} from './anthropic-oauth';
+import {
+  mergeSharedCredentialFields,
+  readClaudeConfig,
+  readLiveClaudeCredentials,
+  sharedCredentialFields,
+  writeLiveClaudeCredentials,
+  type ClaudeCredentialsOptions,
+} from './cc-credentials';
+import { claudePaths } from './cc-paths';
+import {
+  ClaudeCodeLockTimeout,
+  withClaudeConfigLock,
+  withClaudeConsumeLock,
+  withClaudeCredentialLocks,
+  withClaudeSwitchLock,
+  type HeldClaudeCredentialLocks,
+} from './cc-locks';
+import { defaultStashTimestamp } from './cc-consume';
+import { ClaudeSlots, type ReadClaudeSlot } from './cc-slots';
+import { listCswapProcesses, type CswapProcess } from './cswap-processes';
+import { isSuccessor, recordTransition } from './lineage-log';
+import type { Store } from './store';
 
 export type ActiveFetchSentinel =
   | 'token-expired'
@@ -211,4 +242,303 @@ export function chooseRefreshInput(input: ChooseRefreshInput): RefreshInputDecis
       : { kind: 'defer', reason: 'live-unattributed-newer' };
   }
   return backupDecision(input);
+}
+
+export interface RefreshHttpResponse {
+  status: number;
+  body: string;
+}
+
+type Lock = <T>(fn: () => Promise<T>, options?: { timeoutMs?: number }) => Promise<T>;
+type CredentialLock = <T>(fn: (held: HeldClaudeCredentialLocks) => Promise<T>, options?: { timeoutMs?: number }) => Promise<T>;
+type ConfigLock = <T>(fn: () => Promise<T>, options?: { timeoutMs?: number }) => Promise<T>;
+
+export interface RefreshActiveLoginDeps {
+  slots: ClaudeSlots;
+  store: Store;
+  live: ClaudeCredentialsOptions;
+  readLiveIdentity?: () => LiveIdentity | null;
+  postRefresh: (request: HttpRequestDescription) => Promise<RefreshHttpResponse>;
+  now: () => number;
+  warn?: (message: string) => void;
+  verdicts: ProbeVerdictMemo;
+  env: NodeJS.ProcessEnv;
+  by: 'qlb-auto' | 'qlb-gate' | 'qlb-cli';
+  cswapProcesses?: () => CswapProcess[];
+  withConsumeLock?: Lock;
+  withSwitchLock?: Lock;
+  withCredentialLocks?: CredentialLock;
+  withConfigLock?: ConfigLock;
+  stashTimestamp?: () => string;
+  deferSignals?: <T>(fn: () => Promise<T>) => Promise<T>;
+  autoLog?: (line: string) => void;
+}
+
+export interface RefreshActiveLoginInput {
+  accountId: string;
+  email: string;
+  orgUuid: string;
+  /** Credentials observed by the caller before it entered the locked path. */
+  creds: string;
+  forceRecord?: ActiveFetchRecord;
+  degraded: boolean;
+  /** Retained for compatibility with K6-2 callers; D-B65 deliberately ignores it. */
+  deadlineAt?: number;
+  /** Retained for compatibility with K6-2 callers; D-B65 deliberately ignores it. */
+  postFloorMs?: number;
+}
+
+/** Resolve S24 once, treating test mode in either the process or injected env as hermetic. */
+export function resolveCswapCheck(
+  injected: (() => CswapProcess[]) | undefined,
+  depsEnv: NodeJS.ProcessEnv,
+  list: () => CswapProcess[] = listCswapProcesses,
+): () => CswapProcess[] {
+  if (injected) return injected;
+  return process.env.QLB_TEST_MODE === '1' || depsEnv.QLB_TEST_MODE === '1' ? () => [] : list;
+}
+
+function withForce<T extends Omit<RefreshOutcome, 'forceRecord'>>(
+  input: RefreshActiveLoginInput,
+  outcome: T,
+): T & Pick<RefreshOutcome, 'forceRecord'> {
+  return (input.forceRecord === undefined ? outcome : { ...outcome, forceRecord: input.forceRecord }) as T & Pick<RefreshOutcome, 'forceRecord'>;
+}
+
+function warn(deps: RefreshActiveLoginDeps, message: string): void {
+  try { deps.warn?.(message); } catch { /* diagnostics never affect a credential safety path */ }
+}
+
+function refreshedCredential(current: string, response: Extract<ReturnType<typeof classifyRefreshResponse>, { kind: 'success' }>, now: number): string | null {
+  const blob = parseCredentialBlob(current);
+  if (!blob?.oauth) return null;
+  blob.oauth.accessToken = response.accessToken;
+  blob.oauth.expiresAt = now + response.expiresInMs;
+  if (response.refreshToken) blob.oauth.refreshToken = response.refreshToken;
+  if (response.scopes) blob.oauth.scopes = response.scopes;
+  return serializeCredentialBlob(blob);
+}
+
+function defaultDeferSignals<T>(fn: () => Promise<T>): Promise<T> {
+  const signals: NodeJS.Signals[] = ['SIGTERM', 'SIGINT', 'SIGHUP'];
+  const seen: NodeJS.Signals[] = [];
+  const handlers = new Map<NodeJS.Signals, () => void>();
+  for (const signal of signals) {
+    const handler = (): void => { seen.push(signal); };
+    handlers.set(signal, handler);
+    process.on(signal, handler);
+  }
+  return fn().finally(() => {
+    for (const [signal, handler] of handlers) process.removeListener(signal, handler);
+    // Re-raise only after all persistence attempts completed. A test can inject
+    // this seam instead of delivering a process signal to its runner.
+    for (const signal of seen) process.kill(process.pid, signal);
+  });
+}
+
+function defaultAutoLog(store: Store, line: string): void {
+  try {
+    const directory = dirname(store.dbPath);
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    appendFileSync(join(directory, 'auto.log'), `${line}\n`, { mode: 0o600 });
+  } catch { /* audit evidence must not discard an issued successor */ }
+}
+
+function identityMatches(observed: LiveIdentity | null, input: RefreshActiveLoginInput): boolean {
+  return observed !== null && observed.accountId === input.accountId
+    && observed.email === input.email && observed.orgUuid === input.orgUuid;
+}
+
+function slotUsable(credential: string | null): boolean {
+  return credential !== null && hasUsablePair(credential);
+}
+
+/**
+ * Refresh the one active Claude credential under the complete consume/switch/
+ * Claude-Code lock hierarchy. No caller is allowed to reuse an unlocked slot
+ * read: every provenance, restore, and strike decision below starts with the
+ * fresh slot read performed inside those locks.
+ */
+export async function refreshActiveLogin(
+  deps: RefreshActiveLoginDeps,
+  input: RefreshActiveLoginInput,
+): Promise<RefreshOutcome> {
+  const finish = (outcome: RefreshOutcome): RefreshOutcome => withForce(input, outcome as Omit<RefreshOutcome, 'forceRecord'>) as RefreshOutcome;
+  const earlySlot = deps.slots.getSlot(input.accountId);
+  if (earlySlot?.dead) return finish({ outcome: 'dead', reason: earlySlot.deadReason === 'no_refresh_token' ? 'no_refresh_token' : 'invalid_grant', struckFp: null });
+  if (deps.env.CLAUDE_SECURESTORAGE_CONFIG_DIR) return finish({ outcome: 'refused', reason: 'store-unmirrored' });
+  if (input.degraded) return finish({ outcome: 'deferred', deferReason: 'degraded-read' });
+
+  const earlyVerdict = deps.verdicts.get(input.accountId, input.email, credentialLineage(input.creds) ?? '');
+  if (!preLockAttribution({ creds: input.creds, slotFp: earlySlot?.fingerprint ?? null, slotPrevFp: earlySlot?.prevFingerprint ?? null, verdict: earlyVerdict })
+    && !slotUsable(input.creds)) {
+    if (deps.verdicts.warnOnce(input.accountId, input.email, 'unattributable')) warn(deps, 'Claude refresh deferred: credential is unattributable');
+    return finish({ outcome: 'deferred', deferReason: 'unattributable' });
+  }
+
+  try {
+    if (resolveCswapCheck(deps.cswapProcesses, deps.env)().length > 0) return finish({ outcome: 'refused', reason: 'cswap-process-alive' });
+  } catch {
+    return finish({ outcome: 'refused', reason: 'cswap-process-check-failed' });
+  }
+
+  const paths = claudePaths(deps.live);
+  const lockEnv = deps.live.env ?? deps.env;
+  const consumeLock: Lock = deps.withConsumeLock ?? ((fn, options) => withClaudeConsumeLock(input.accountId, fn, {
+    home: deps.live.home, env: lockEnv, timeoutMs: options?.timeoutMs,
+  }));
+  const switchLock: Lock = deps.withSwitchLock ?? ((fn, options) => withClaudeSwitchLock(fn, {
+    home: deps.live.home, env: lockEnv, timeoutMs: options?.timeoutMs,
+  }));
+  const credentialLocks: CredentialLock = deps.withCredentialLocks ?? ((fn, options) => withClaudeCredentialLocks({
+    configDir: paths.configHome, env: lockEnv, timeoutMs: options?.timeoutMs,
+  }, fn));
+  const configLock: ConfigLock = deps.withConfigLock ?? ((fn, options) => withClaudeConfigLock({
+    configDir: paths.configHome, env: lockEnv, timeoutMs: options?.timeoutMs,
+  }, () => fn()));
+
+  try {
+    return await consumeLock(() => switchLock(() => credentialLocks(async (heldLocks) => {
+      // This is deliberately the sole slot input for all work beneath it.
+      const row = deps.slots.getSlot(input.accountId);
+      if (!row) throw new Error('Claude slot is absent');
+      const locked = await deps.slots.readSlot(input.accountId, { fresh: true });
+      if (row.dead) return finish({ outcome: 'dead', reason: row.deadReason === 'no_refresh_token' ? 'no_refresh_token' : 'invalid_grant', struckFp: null });
+
+      let live: string | null;
+      try { live = await readLiveClaudeCredentials(deps.live); } catch {
+        return finish({ outcome: 'deferred', deferReason: 'live-read-error' });
+      }
+      const readIdentity = deps.readLiveIdentity ?? (() => liveIdentity(paths.globalConfigPath, deps.live.readText));
+      if (!identityMatches(readIdentity(), input)) return finish({ outcome: 'deferred', deferReason: 'identity-mismatch' });
+
+      let backup: ReadClaudeSlot = locked;
+      let slotFp: string | null = locked.fingerprint;
+      let slotPrevFp = row?.prevFingerprint ?? null;
+      const liveFp = credentialLineage(live);
+      const memo = liveFp ? deps.verdicts.get(input.accountId, input.email, liveFp) : undefined;
+      const adopted = adoptRotatedLive({ creds: input.creds, live, slotFp, slotPrevFp, verdict: memo, now: deps.now() });
+      if (adopted.kind === 'foreign') return finish({ outcome: 'failed', reason: 'foreign-credential' });
+      if (adopted.kind === 'adopt') {
+        if (adopted.writeSlot) {
+          try { await deps.slots.writeSlot(input.accountId, adopted.working, { cause: 'adopt', by: deps.by, evidence: memo?.source === 'post' ? 'post' : memo ? 'oracle' : 'lineage' }); }
+          catch { warn(deps, 'Claude rotated live credential could not repair slot'); }
+        }
+        return finish({ outcome: 'adopted', working: adopted.working });
+      }
+
+      const decide = (): RefreshInputDecision => {
+        const fp = credentialLineage(live);
+        const attributed = Boolean(fp && (deps.verdicts.matches(input.accountId, input.email, fp)
+          || (slotFp !== null && isSuccessor(deps.store, 'anthropic', input.accountId, slotFp, fp))));
+        return chooseRefreshInput({ creds: input.creds, live, backup: backup.credential, backupUsable: slotUsable(backup.credential), slotFp, attributed, forceRefresh: input.forceRecord !== undefined, now: deps.now() });
+      };
+      const publish = async (working: string, mergeLive: boolean): Promise<void> => {
+        const shared = mergeLive ? sharedCredentialFields(live) : null;
+        const target = shared ? mergeSharedCredentialFields(working, shared) : working;
+        await configLock(() => writeLiveClaudeCredentials(target, deps.live, heldLocks));
+      };
+
+      let choice = decide();
+      if (choice.kind === 'defer') return finish({ outcome: 'deferred', deferReason: choice.reason });
+      if (choice.kind === 'restore') {
+        try { await publish(backup.credential, true); return finish({ outcome: 'restored', working: backup.credential }); }
+        catch { return finish({ outcome: 'deferred', deferReason: 'unexpected' }); }
+      }
+
+      // S36's key is the currently locked slot lineage. It must be checked
+      // immediately before spending a grant, not before waiting for locks.
+      const stashed = await deps.slots.adoptStashedSuccessor(input.accountId);
+      if (stashed) {
+        backup = stashed;
+        slotFp = stashed.fingerprint;
+        slotPrevFp = deps.slots.getSlot(input.accountId)?.prevFingerprint ?? slotPrevFp;
+        choice = decide();
+        if (choice.kind === 'defer') return finish({ outcome: 'deferred', deferReason: choice.reason });
+        if (choice.kind === 'restore') {
+          try { await publish(backup.credential, true); return finish({ outcome: 'restored', working: backup.credential }); }
+          catch { return finish({ outcome: 'deferred', deferReason: 'unexpected' }); }
+        }
+      }
+
+      if (!choice.inputLineageIsSlot) {
+        const evidence = memo?.source === 'post' ? 'post' : memo ? 'oracle' : 'lineage';
+        try { await deps.slots.writeSlot(input.accountId, choice.input, { cause: 'adopt', by: deps.by, evidence }); }
+        catch { return finish({ outcome: 'deferred', deferReason: 'slot-write-failed' }); }
+        slotFp = credentialLineage(choice.input);
+      }
+
+      const request = buildRefreshRequest(choice.input, 6_000);
+      if (request.kind === 'no_refresh_token') {
+        const fp = credentialLineage(choice.input);
+        if (!fp) return finish({ outcome: 'failed', reason: 'refresh-failed' });
+        try {
+          const strike = await deps.slots.strikeDead(input.accountId, { reason: 'no_refresh_token', struckFp: fp, ts: deps.now() });
+          return strike === 'lineage-moved' ? finish({ outcome: 'failed', reason: 'refresh-failed' }) : finish({ outcome: 'dead', reason: 'no_refresh_token', struckFp: fp });
+        } catch { warn(deps, 'Claude dead-token strike failed'); return finish({ outcome: 'failed', reason: 'refresh-failed' }); }
+      }
+      if (request.kind !== 'request') return finish({ outcome: 'failed', reason: 'refresh-failed' });
+
+      return (deps.deferSignals ?? defaultDeferSignals)(async () => {
+        let response: RefreshHttpResponse;
+        try { response = await deps.postRefresh(request.request); } catch { return finish({ outcome: 'failed', reason: 'refresh-failed' }); }
+        const classified = classifyRefreshResponse(response.status, response.body);
+        if (classified.kind === 'dead') {
+          // Re-read source bytes before a permanent strike. A waiting peer may
+          // already have installed a successor with the same account.
+          const current = await deps.slots.readSlot(input.accountId, { fresh: true });
+          if (current.credential !== choice.input) return finish({ outcome: 'failed', reason: 'refresh-failed' });
+          const fp = credentialLineage(choice.input);
+          if (!fp) return finish({ outcome: 'failed', reason: 'refresh-failed' });
+          try {
+            const strike = await deps.slots.strikeDead(input.accountId, { reason: 'invalid_grant', struckFp: fp, ts: deps.now() });
+            return strike === 'lineage-moved' ? finish({ outcome: 'failed', reason: 'refresh-failed' }) : finish({ outcome: 'dead', reason: 'invalid_grant', struckFp: fp });
+          } catch { warn(deps, 'Claude dead-token strike failed'); return finish({ outcome: 'failed', reason: 'refresh-failed' }); }
+        }
+        if (classified.kind === 'invalid_client') return finish({ outcome: 'failed', reason: 'invalid_client' });
+        if (classified.kind !== 'success') return finish({ outcome: 'failed', reason: 'refresh-failed' });
+        const working = refreshedCredential(choice.input, classified, deps.now());
+        if (!working) return finish({ outcome: 'failed', reason: 'refresh-failed' });
+        const postedFp = credentialLineage(choice.input);
+        const workingFp = credentialLineage(working);
+        if (workingFp) deps.verdicts.set(input.accountId, input.email, workingFp, { match: true, source: 'post' });
+
+        let slotWritten = true;
+        try { await deps.slots.writeSlot(input.accountId, working, { cause: 'post', by: deps.by, evidence: 'post' }); }
+        catch {
+          slotWritten = false;
+          warn(deps, 'Claude refresh successor slot write failed');
+          if (postedFp && workingFp) {
+            try { recordTransition(deps.store, { provider: 'anthropic', accountId: input.accountId, fromFp: postedFp, toFp: workingFp, cause: 'post', by: deps.by, evidence: 'post' }); }
+            catch { warn(deps, 'Claude refresh successor lineage write failed'); }
+          }
+        }
+
+        let liveWritten = true;
+        try { await publish(working, choice.input !== live); }
+        catch { liveWritten = false; warn(deps, 'Claude refresh successor live write failed'); }
+        if (slotWritten && liveWritten) return finish({ outcome: 'posted', working });
+        if (!slotWritten && liveWritten) return finish({ outcome: 'posted-slot-unwritten', working });
+        if (slotWritten) return finish({ outcome: 'posted-live-unwritten', working });
+
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          try {
+            const stashId = deps.stashTimestamp?.() ?? defaultStashTimestamp(deps.now());
+            await deps.slots.stashUnclaimed(stashId, working, postedFp ?? undefined, input.accountId);
+            return finish({ outcome: 'stashed', working });
+          } catch (error) {
+            if (!deps.stashTimestamp && error instanceof Error && /already exists/.test(error.message) && attempt < 2) continue;
+            break;
+          }
+        }
+        const successorFailure = 'unable to persist refresh successor';
+        try { (deps.autoLog ?? ((line) => defaultAutoLog(deps.store, line)))(`claude:unpersisted-token provider=anthropic account=${input.accountId} at=${deps.now()}`); } catch { /* still return the explicit unsafe outcome */ }
+        return finish({ outcome: 'unpersisted', working, successorFailure });
+      });
+    })), { timeoutMs: undefined });
+  } catch (error) {
+    if (error instanceof ClaudeCodeLockTimeout) return finish({ outcome: 'deferred', deferReason: 'locks-held' });
+    warn(deps, 'Claude active refresh failed unexpectedly');
+    return finish({ outcome: 'deferred', deferReason: 'unexpected' });
+  }
 }
