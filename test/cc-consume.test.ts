@@ -248,7 +248,7 @@ describe('Claude consume gate (K3 / AC6)', () => {
   it('writes the issued successor after a same-lineage post-POST CAS conflict', async () => {
     const { slots, deps } = fixture();
     await slots.createSlot({ accountId: 'account-a', credential: credential('before'), source: 'cswap-import' });
-    const racer = JSON.stringify({ claudeAiOauth: { accessToken: 'access-racer', refreshToken: 'refresh-before', expiresAt: NOW + 600_000 } });
+    const racer = JSON.stringify({ claudeAiOauth: { accessToken: 'access-racer', refreshToken: 'refresh-before', expiresAt: NOW + 600_000, subscriptionType: 'racer-tier' } });
     let stashes = 0;
     const stash = slots.stashUnclaimed.bind(slots);
     slots.stashUnclaimed = async (...args) => {
@@ -265,6 +265,11 @@ describe('Claude consume gate (K3 / AC6)', () => {
     assert.equal(result.stashed, undefined);
     assert.equal(stashes, 0);
     assert.equal((await slots.readSlot('account-a')).credential, result.credential);
+    const stored = JSON.parse(result.credential ?? '{}');
+    assert.equal(stored.claudeAiOauth.subscriptionType, 'racer-tier');
+    assert.equal(stored.claudeAiOauth.accessToken, 'access-issued');
+    assert.equal(stored.claudeAiOauth.refreshToken, 'refresh-issued');
+    assert.equal(stored.claudeAiOauth.expiresAt, NOW + 3_600_000);
   });
 
   it('does not let restore interleave a consume CAS held by the shared switch lock', async () => {
@@ -335,13 +340,15 @@ describe('Claude consume gate (K3 / AC6)', () => {
     const { slots, deps } = fixture();
     await slots.createSlot({ accountId: 'account-a', credential: credential('before'), source: 'cswap-import' });
     slots.writeSlot = async () => { throw new Error('fixture persist failure'); };
-    deps.warn = () => { throw new Error('fixture warn failure'); };
-    deps.stashTimestamp = () => { throw new Error('fixture stash timestamp failure'); };
+    const warnings: string[] = [];
+    deps.warn = (message) => { warnings.push(message); };
+    deps.stashTimestamp = () => { throw new Error('SECRET-TOKEN-XYZ'); };
 
     const result = await consumeClaudeSlot(deps, { accountId: 'account-a', snapshot: credential('before') });
     assert.equal(result.kind, 'consume-gate-unpersisted');
     assert.equal(result.stashed, false);
     assert.ok(result.credential);
+    assert.doesNotMatch(JSON.stringify({ warnings, result }), /SECRET-TOKEN-XYZ/);
   });
 
   it('returns successor-unpersisted rather than discarding an issued successor after a CAS-conflict stash failure', async () => {
