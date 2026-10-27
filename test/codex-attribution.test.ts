@@ -548,6 +548,46 @@ describe('Codex live-document attribution (AC57)', () => {
     }
   });
 
+  it('a stalled import-active that lost the lock cannot overwrite active_login after the successor completes', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-codex-import-lost-active-home-'));
+    const codexHome = mkdtempSync(join(tmpdir(), 'qlb-codex-import-lost-active-auth-'));
+    const originalPlatformKeychain = keychainModule.platformKeychain;
+    try {
+      const keychain = new MockKeychain();
+      (keychainModule as unknown as { platformKeychain: MockKeychain }).platformKeychain = keychain;
+      const output: string[] = [];
+      const ctx = commandContext(home, codexHome, output);
+      const a = document('lost-active-a', 'account-a');
+      const b = document('lost-active-b', 'account-b');
+      writeFileSync(join(codexHome, 'auth.json'), JSON.stringify(a), { mode: 0o600 });
+      const store = openStore(join(home, 'qlb.db'));
+      beginCutover(store, 1);
+      const aPlan = importActiveCodexSlot(a, { store, keychain, now: () => 1 });
+      importActiveCodexSlot(b, { store, keychain, now: () => 2 });
+      store.close();
+
+      await assert.rejects(
+        runCodexImportActiveCommand([], ctx, {
+          readAuth: async () => ({ status: 'ok', doc: a }),
+          writeAuth: async () => 1,
+          withAuthLock: async (_options, fn) => fn({
+            assertNotCompromised: () => { throw new CodexAuthLockCompromised(); },
+          }),
+        }),
+        (error: unknown) => error instanceof CodexAuthLockCompromised && error.retryable,
+      );
+      const result = openStore(join(home, 'qlb.db'));
+      try {
+        assert.equal(result.getCodexActiveLogin(), 'fixture-user:account-b');
+        assert.equal(result.getCodexSlot(aPlan.slotId)?.fingerprint, codexFingerprint(a));
+      } finally { result.close(); }
+    } finally {
+      (keychainModule as unknown as { platformKeychain: typeof originalPlatformKeychain }).platformKeychain = originalPlatformKeychain;
+      rmSync(home, { recursive: true, force: true });
+      rmSync(codexHome, { recursive: true, force: true });
+    }
+  });
+
   it('serializes a second import after re-validation until repaired-slot publication completes', async () => {
     const home = mkdtempSync(join(tmpdir(), 'qlb-codex-import-lock-home-'));
     const codexHome = mkdtempSync(join(tmpdir(), 'qlb-codex-import-lock-auth-'));

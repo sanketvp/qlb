@@ -12,6 +12,9 @@ import {
   claudeLockPaths,
   withClaudeConfigLock,
   withClaudeCredentialLocks,
+  withCodexAuthLock,
+  codexAuthLockDir,
+  CodexAuthLockCompromised,
   withProperLockfile,
 } from '../src/cc-locks';
 import { spliceOauthAccount } from '../src/cc-credentials';
@@ -424,6 +427,24 @@ describe('Claude Code proper-lockfile locks', () => {
         assert.ok((await stat(lock)).mtimeMs > replacementMtime, 'upstream toucher refreshes by pathname');
       });
       assert.equal(existsSync(lock), false, 'upstream release removes by pathname');
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it('a takeover during the final mutation makes withCodexAuthLock throw CodexAuthLockCompromised, not succeed', async () => {
+    const home = await tempHome();
+    const lock = codexAuthLockDir({ home });
+    try {
+      await assert.rejects(
+        withCodexAuthLock({ home }, async () => {
+          await rm(lock, { recursive: true });
+          await mkdir(lock);
+          return 'callback succeeded';
+        }),
+        (error: unknown) => error instanceof CodexAuthLockCompromised && error.retryable,
+      );
+      assert.equal(existsSync(lock), true, 'the displaced holder must not release the successor lock');
     } finally {
       await rm(home, { recursive: true, force: true });
     }

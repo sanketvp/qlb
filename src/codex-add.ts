@@ -4,8 +4,8 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync 
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
-import { withCodexAuthLock, type CodexAuthLockOptions, type HeldCodexAuthLock } from './cc-locks';
-import { codexFingerprint, readCodexAuthStable, type CodexAuthDocument, type CodexAuthStableResult } from './codex-auth';
+import { CodexAuthLockCompromised, withCodexAuthLock, type CodexAuthLockOptions, type HeldCodexAuthLock } from './cc-locks';
+import { codexFingerprint, parseCodexAuth, readCodexAuthStable, type CodexAuthDocument, type CodexAuthStableResult } from './codex-auth';
 import { isCredentialNotFound } from './credential-backends';
 import { planImportActiveCodex } from './codex-slots';
 import { QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, type KeychainBackend } from './keychain';
@@ -20,7 +20,7 @@ const PROVIDER = 'openai-codex';
 export const CODEX_FILE_CREDENTIAL_STORE_CONFIG = 'cli_auth_credentials_store = "file"\n';
 
 export class CodexAddError extends Error {
-  constructor(message: string, readonly exitCode: 1 | 3 = 1) {
+  constructor(message: string, readonly exitCode: 1 | 3 = 1, readonly retryable = false) {
     super(message);
     this.name = 'CodexAddError';
   }
@@ -72,6 +72,20 @@ export interface CodexAddResult {
 
 interface ExistingSlot {
   fingerprint: string | null;
+}
+
+function storedCredentialMatchesFingerprint(value: string | undefined, fingerprint: string): boolean {
+  if (value === undefined) return false;
+  const parsed = parseCodexAuth(value);
+  return parsed.ok && codexFingerprint(parsed.doc) === fingerprint;
+}
+
+function unsafePredecessorError(accountId: string): CodexAddError {
+  return new CodexAddError(
+    `Codex replacement could not safely preserve predecessor for ${accountId}; retry codex add --replace`,
+    3,
+    true,
+  );
 }
 
 function withDatabase<T>(store: SqlStore, fn: (db: DatabaseSync) => T): T {
@@ -146,6 +160,11 @@ function persist(
           if (!isCredentialNotFound(error)) throw error;
           priorPrevious = undefined;
         }
+        // A retry after an interrupted replacement must not turn the new
+        // current value into :prev and thereby discard the old credential.
+        if (existing?.fingerprint && !storedCredentialMatchesFingerprint(priorCredential, existing.fingerprint)) {
+          throw unsafePredecessorError(identity.slotId);
+        }
 
         // Set this before every write: a backend can throw after modifying an
         // item, and compensation must cover that ambiguous outcome too.
@@ -198,13 +217,17 @@ function persist(
         // Compensate before ROLLBACK releases BEGIN IMMEDIATE. Each write is
         // conditional so an ambiguous write failure cannot overwrite a value
         // that was not written by this attempt.
+        let compensationSafe = true;
         if (wroteCredential) {
-          restoreCredentialIfUnchanged(deps.keychain, service, priorCredential, writtenCredential!, assertAuthLockHeld);
+          compensationSafe = restoreCredentialIfUnchanged(deps.keychain, service, priorCredential, writtenCredential!) && compensationSafe;
         }
         if (wrotePrevious) {
-          restoreCredentialIfUnchanged(deps.keychain, `${service}:prev`, priorPrevious, writtenPrevious!, assertAuthLockHeld);
+          compensationSafe = restoreCredentialIfUnchanged(deps.keychain, `${service}:prev`, priorPrevious, writtenPrevious!) && compensationSafe;
         }
         try { db.exec('ROLLBACK'); } catch { /* retain the original failure */ }
+        if (error instanceof CodexAuthLockCompromised && !compensationSafe) {
+          throw unsafePredecessorError(identity.slotId);
+        }
         throw error;
       }
     });
@@ -215,8 +238,7 @@ function restoreCredentialIfUnchanged(
   service: string,
   priorValue: string | undefined,
   writtenValue: string,
-  assertAuthLockHeld: () => void,
-): void {
+): boolean {
   try {
     let currentValue: string | undefined;
     try {
@@ -224,11 +246,15 @@ function restoreCredentialIfUnchanged(
     } catch (error) {
       if (!isCredentialNotFound(error)) throw error;
     }
-    if (currentValue !== writtenValue) return;
-    assertAuthLockHeld();
+    // This is deliberately independent of the lost auth lock: it is a CAS
+    // restoring only bytes this attempt can prove it wrote.
+    if (currentValue !== writtenValue) return false;
     if (priorValue === undefined) keychain.deleteSync(service, QLB_KEYCHAIN_ACCOUNT);
     else keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, priorValue);
-  } catch { /* retain the primary persistence error */ }
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**

@@ -1,6 +1,7 @@
 // S56 Codex native-document attribution. Codex has no inter-process lock, so
 // observations extend the lineage graph rather than rejecting ordinary rotations.
 
+import { CodexAuthLockCompromised } from './cc-locks';
 import { authTime, codexFingerprint, codexIdentity, parseCodexAuth, type CodexAuthDocument } from './codex-auth';
 import { isCredentialNotFound } from './credential-backends';
 import { QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, type KeychainBackend } from './keychain';
@@ -34,6 +35,8 @@ export interface AttributeLiveDocumentInput {
   /** C1c/X1 established that Codex's `auth_time` claim has its documented meaning. */
   l40Verified?: boolean;
   now?: () => number;
+  /** Assert the caller-owned Codex auth capability immediately before every mutation. */
+  assertNotCompromised?: () => void;
   /** Caller-owned atomic auth.json publication; injected for fixture-only tests. */
   republish?: (document: CodexAuthDocument) => Promise<void> | void;
 }
@@ -83,6 +86,19 @@ function fingerprintOfStoredDocument(value: string): string | null {
   return parsed.ok ? codexFingerprint(parsed.doc) : null;
 }
 
+function assertNotCompromised(input: AttributeLiveDocumentInput): void {
+  input.assertNotCompromised?.();
+}
+
+function markImportedActive(input: AttributeLiveDocumentInput, fingerprint: string, ts: number): void {
+  assertNotCompromised(input);
+  if (!input.store.markCodexSlotImportedActive(input.slot.accountId, fingerprint, ts, input.assertNotCompromised)) {
+    // The fingerprint was observed under the caller's lease. A mismatch means
+    // a successor already selected a different active slot; retry fresh.
+    throw new CodexAuthLockCompromised();
+  }
+}
+
 function repairedFingerprintStillCurrent(input: AttributeLiveDocumentInput, fingerprint: string): boolean {
   // republish() publishes to auth.json asynchronously, so it must not run
   // while SQLite's synchronous write transaction is held. Reacquire that lock
@@ -109,8 +125,10 @@ async function attributeSameSlot(
   // both actions otherwise claim authority for bytes that are not in the slot.
   if (codexFingerprint(input.slot.document) !== slotFp) {
     const liveFp = codexFingerprint(live);
+    assertNotCompromised(input);
     const repair = input.store.repairCodexSlotKeychain({
       accountId: input.slot.accountId,
+      assertNotCompromised: input.assertNotCompromised,
       // Choose the replacement only after BEGIN IMMEDIATE has re-read the
       // fingerprint that authorizes it and the Keychain document it replaces.
       prepare: (lockedFingerprint) => {
@@ -133,11 +151,13 @@ async function attributeSameSlot(
       // compare-before-write while the DB write lock excludes QLB adopters.
       writeIfUnchanged: (candidate) => {
         if (input.keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT) !== candidate.current) return false;
+        assertNotCompromised(input);
         input.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, candidate.replacement);
         return true;
       },
       restore: (candidate) => {
         if (input.keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT) === candidate.replacement) {
+          assertNotCompromised(input);
           input.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, candidate.current);
         }
       },
@@ -159,7 +179,7 @@ async function attributeSameSlot(
     if (repairedFingerprint && !repairedFingerprintStillCurrent(input, repairedFingerprint)) {
       return { action: 'slot-split', accountId: input.slot.accountId };
     }
-    input.store.markCodexSlotImportedActive(input.slot.accountId, now);
+    markImportedActive(input, slotFp, now);
     return { action: 'noop', accountId: input.slot.accountId };
   }
 
@@ -169,8 +189,9 @@ async function attributeSameSlot(
     if (repairedFingerprint && !repairedFingerprintStillCurrent(input, repairedFingerprint)) {
       return { action: 'slot-split', accountId: input.slot.accountId };
     }
+    assertNotCompromised(input);
     await input.republish?.(input.slot.document);
-    input.store.markCodexSlotImportedActive(input.slot.accountId, now);
+    markImportedActive(input, slotFp, now);
     return { action: 'republish-slot', accountId: input.slot.accountId };
   }
 
@@ -180,8 +201,10 @@ async function attributeSameSlot(
   const currentWritten = JSON.stringify(live);
   let wroteCurrent = false;
   let wrotePrevious = false;
+  assertNotCompromised(input);
   input.store.adoptCodexSlotWithKeychain({
     accountId: input.slot.accountId,
+    assertNotCompromised: input.assertNotCompromised,
     previousFingerprint: slotFp,
     fingerprint: liveFp,
     lastRefresh: live.last_refresh ?? null,
@@ -192,9 +215,11 @@ async function attributeSameSlot(
       // On a crash-retry the Keychain can already contain the live document.
       // Do not overwrite a real predecessor with that successor.
       if (fingerprintOfStoredDocument(currentBefore) === slotFp) {
+        assertNotCompromised(input);
         input.keychain.setSync(previousService, QLB_KEYCHAIN_ACCOUNT, currentBefore);
         wrotePrevious = true;
       }
+      assertNotCompromised(input);
       input.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, currentWritten);
       wroteCurrent = true;
     },
@@ -202,9 +227,11 @@ async function attributeSameSlot(
       // A later adopter may have committed after our write. Never replace its
       // current or predecessor document while compensating this failed attempt.
       if (wroteCurrent && input.keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT) === currentWritten) {
+        assertNotCompromised(input);
         input.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, currentBefore);
       }
       if (wrotePrevious && optionalKeychainValue(input.keychain, previousService) === currentBefore) {
+        assertNotCompromised(input);
         if (previousBefore === undefined) input.keychain.deleteSync(previousService, QLB_KEYCHAIN_ACCOUNT);
         else input.keychain.setSync(previousService, QLB_KEYCHAIN_ACCOUNT, previousBefore);
       }

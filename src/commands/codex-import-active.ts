@@ -91,6 +91,7 @@ export async function runCodexImportActiveCommand(
       // it must not prevent a newly logged-in account from becoming a slot.
       const ownSlot = store.getCodexSlot(plan.slotId);
       if (!ownSlot) {
+        held.assertNotCompromised();
         const result = importActiveCodexSlot(active.doc, {
           store,
           keychain: platformKeychain,
@@ -114,6 +115,7 @@ export async function runCodexImportActiveCommand(
         slot: { accountId: ownSlot.accountId, document: stored.doc, fingerprint: ownSlot.fingerprint ?? undefined },
         activeSlotId: activeSlotId != null && store.getCodexSlot(activeSlotId) ? activeSlotId : undefined,
         live: active.doc,
+        assertNotCompromised: () => held.assertNotCompromised(),
         republish: (document) => {
           // Keychain/SQLite work can block the event loop long enough for a
           // stale takeover. Do not recreate auth.json after losing this lease.

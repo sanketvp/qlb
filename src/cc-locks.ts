@@ -466,7 +466,7 @@ export async function withCodexAuthLock<T>(
     compromised ??= new CodexAuthLockCompromised();
     return compromised;
   };
-  return withProperLockfile(codexAuthLockDir(options), {
+  const result = await withProperLockfile(codexAuthLockDir(options), {
     timeoutMs: options.timeoutMs,
     stalenessMs: options.stalenessMs ?? CODEX_AUTH_STALENESS_MS,
     touchIntervalMs: options.touchIntervalMs,
@@ -483,6 +483,11 @@ export async function withCodexAuthLock<T>(
       }
     },
   }));
+  // withProperLockfile detects a takeover while it finalizes, after the
+  // callback has returned. A Codex writer must never report that callback
+  // result as success: its final mutation may have raced the successor.
+  if (compromised) throw compromised;
+  return result;
 }
 
 /**
