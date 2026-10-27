@@ -62,6 +62,7 @@ import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { Api, Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { validatePiOwnerDocument } from "../../src/pi-owner-document.js";
 import { streamWithAuthRetry } from "./auth-retry.js";
 import {
   composeOpenRouterModels,
@@ -79,6 +80,14 @@ import {
   type XaiEventSink,
   type XaiProviderApi,
 } from "./providers/xai.js";
+import {
+  QLB_RUNTIME_AUTH_SENTINEL,
+  registerOpenAICodexProvider,
+  type OpenAICodexBuiltin,
+  type OpenAICodexEventSink,
+  type OpenAICodexModel,
+  type OpenAICodexProviderApi,
+} from "./providers/openai-codex.js";
 import {
   accountFg,
   buildExpandPanelLines,
@@ -120,6 +129,37 @@ import {
 const OWNER_FILE = join(homedir(), ".pi", "agent", "qlb-owner.json");
 const AUDIT_DIR = join(homedir(), ".qlb");
 const AUDIT_FILE = join(AUDIT_DIR, "outcomes.jsonl");
+
+/**
+ * Codex ownership is explicit: the shared v2 document must name Codex, while
+ * the shadow-retaining migration artifact is itself Codex-specific. A legacy
+ * shared v1 document remains Anthropic-only (see ownerStateForProvider()).
+ */
+function qlbOwnsProvider(provider: "openai-codex"): boolean {
+  try {
+    const owner = validatePiOwnerDocument(JSON.parse(readFileSync(OWNER_FILE, "utf8")) as unknown);
+    if ("providers" in owner && (owner.providers as Record<string, unknown>)[provider]) return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      console.error(`[qlb-pi] refusing native openai-codex fallback: malformed shared owner file ${OWNER_FILE}`);
+      return true;
+    }
+  }
+
+  const providerOwnerFile = join(dirname(OWNER_FILE), `qlb-owner-${provider}.json`);
+  if (!existsSync(providerOwnerFile)) return false;
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(providerOwnerFile, "utf8"));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return true;
+    const owner = parsed as Record<string, unknown>;
+    // A malformed provider-specific artifact must still replace native OAuth.
+    if (typeof owner.owner !== "string" || !Array.isArray(owner.accounts)) return true;
+    return owner.owner === "qlb" && owner.accounts.some((account) => !!account && typeof account === "object"
+      && !Array.isArray(account) && (account as Record<string, unknown>).provider === provider);
+  } catch {
+    return true;
+  }
+}
 
 function findQlbCli(): { cmd: string; prefix: string[] } {
   if (process.env.QLB_CLI) {
@@ -342,6 +382,37 @@ async function registerOwnedXaiProvider(pi: ExtensionAPI): Promise<void> {
   }
 }
 
+/** Install Codex only after its v2 owner entry exists; compat failures stay fail-closed. */
+async function registerOwnedOpenAICodexProvider(pi: ExtensionAPI): Promise<void> {
+  const deps = { createStream: () => createAssistantMessageEventStream() as unknown as OpenAICodexEventSink };
+  try {
+    const namespace = (await import("@earendil-works/pi-ai/compat")) as unknown as {
+      openAICodexResponsesApi?: () => { streamSimple?: OpenAICodexBuiltin };
+    };
+    // Pi exposes only root, /compat, /models, /oauth, and /providers/all to
+    // extensions (Pi 1.4.0 dist/core/extensions/loader.js:63-81;
+    // dist/core/extensions/virtual-modules.js:14-38). Do not import a
+    // provider-specific subpath: bundled Pi cannot resolve it.
+    const providers = (await import("@earendil-works/pi-ai/providers/all")) as unknown as {
+      builtinProviders?: () => Array<{ id?: unknown; baseUrl?: string; getModels?: () => readonly OpenAICodexModel[] }>;
+    };
+    const builtin = namespace.openAICodexResponsesApi?.()?.streamSimple;
+    const catalog = providers.builtinProviders?.().find((candidate) => candidate.id === "openai-codex");
+    if (typeof builtin !== "function" || !catalog?.getModels) throw new Error("missing OpenAI Codex Pi transport/catalog");
+    registerOpenAICodexProvider(pi as unknown as OpenAICodexProviderApi, builtin, {
+      ...deps, models: catalog.getModels(), baseUrl: catalog.baseUrl,
+    });
+  } catch (err) {
+    // Never leave Pi's native Codex provider active when QLB owns it.
+    console.error("[qlb-pi] could not resolve builtin OpenAI Codex transport:", err);
+    const unavailableTransport: OpenAICodexBuiltin = () => { throw new Error("openai-codex transport unavailable"); };
+    registerOpenAICodexProvider(pi as unknown as OpenAICodexProviderApi, unavailableTransport, {
+      ...deps,
+      runGate: async () => { throw new Error("openai-codex gate unavailable"); },
+    });
+  }
+}
+
 export default async function (pi: ExtensionAPI): Promise<void> {
   registerKimiCodingProvider(pi as unknown as ProviderApi, {
     createStream: () => createAssistantMessageEventStream() as unknown as { push(event: unknown): void; end(): void },
@@ -390,6 +461,17 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     }) !== "inert";
   })();
   if (xaiOwner) await registerOwnedXaiProvider(pi);
+  const openAICodexOwner = base && qlbOwnsProvider("openai-codex");
+  if (openAICodexOwner) {
+    // RuntimeCredentials returns this in-memory non-secret sentinel before it
+    // consults auth.json (Pi 1.4.0 dist/core/runtime-credentials.js:17-19).
+    // The adapter immediately replaces it with the per-request QLB gate token.
+    pi.on("session_start", (_event, ctx) => {
+      const registry = ctx.modelRegistry as unknown as { runtime?: { setRuntimeApiKey?: (provider: string, key: string) => Promise<void> } };
+      void registry.runtime?.setRuntimeApiKey?.("openai-codex", QLB_RUNTIME_AUTH_SENTINEL).catch(() => undefined);
+    });
+    await registerOwnedOpenAICodexProvider(pi);
+  }
   if (mode === "inert") {
     // Inert for Anthropic: QLB does not own it and consume is off. Its pool remains registered.
     return;

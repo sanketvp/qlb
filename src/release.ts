@@ -275,8 +275,10 @@ function copyReleaseContents(
   if (existsSync(join(sourceDir, 'extensions'))) {
     copyContained(join(sourceDir, 'extensions'), join(stagingDir, 'extensions'), checkoutRoot);
   }
-  if (existsSync(join(sourceDir, 'src', 'redact.ts'))) {
-    copyContained(join(sourceDir, 'src', 'redact.ts'), join(stagingDir, 'src', 'redact.ts'), checkoutRoot);
+  for (const sourceFile of ['redact.ts', 'pi-owner-document.ts']) {
+    if (existsSync(join(sourceDir, 'src', sourceFile))) {
+      copyContained(join(sourceDir, 'src', sourceFile), join(stagingDir, 'src', sourceFile), checkoutRoot);
+    }
   }
   const helper = join(sourceDir, 'native', 'keychain-helper', 'build', 'qlb-keychain-helper');
   if (!existsSync(helper) && platform === 'darwin') {
