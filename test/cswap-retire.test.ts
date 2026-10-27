@@ -6,7 +6,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { describe, it } from 'node:test';
 
 import { evaluateRetirementGates, type CswapRetireDependencies } from '../src/cswap-retire';
-import piRollback from '../src/commands/pi-rollback';
+import piRollback, { executePiRollback } from '../src/commands/pi-rollback';
 import { beginCutover, beginRetirementFence, phase } from '../src/lifecycle';
 import { openStore } from '../src/store';
 
@@ -116,17 +116,57 @@ describe('qlb retire cswap (AC22 retire)', () => {
     await refusal('receipt stale', (f) => f.store.setConfig('report.receiptAt', String(NOW - 10 * 60 * 1000 - 1)), 'report-receipt-stale');
   });
 
-  it('pi rollback exits 3 retirement-in-progress under the fence', async () => {
+  it('pi rollback proceeds in pre-cutover and refuses only under the retirement fence', async () => {
     const f = fixture();
     try {
-      assert.equal(beginRetirementFence(f.store).ok, true);
+      const db = new DatabaseSync(f.store.dbPath);
+      try { db.prepare("UPDATE lifecycle SET state = 'pre-cutover'").run(); } finally { db.close(); }
+      const output: string[] = [];
+      let rollbacks = 0;
+      const context = {
+        stdout: (message: string) => output.push(message), stderr: () => {},
+        env: { QLB_TEST_MODE: '1', QLB_HOME: f.root }, home: f.root,
+        config: { dbPath: f.store.dbPath }, loadConfig: () => ({ dbPath: f.store.dbPath }),
+        registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
+      } as never;
+      assert.equal(await executePiRollback(['xai'], context, { rollback: () => {
+        rollbacks++;
+        return { provider: 'xai', state: 'migrated', resumed: false, wouldWrite: [] };
+      } }), 0);
+      assert.equal(rollbacks, 1);
+      assert.deepEqual(output, ['xai: rolled back']);
+
       const errors: string[] = [];
-      const code = await piRollback.execute!(['xai'], {
+      assert.equal(beginRetirementFence(f.store).ok, false, 'pre-cutover cannot have a fence');
+      const fenced = fixture();
+      try {
+        assert.equal(beginRetirementFence(fenced.store).ok, true);
+        const code = await piRollback.execute!(['xai'], {
+          stdout: () => {}, stderr: (message: string) => errors.push(message),
+          env: { QLB_TEST_MODE: '1', QLB_HOME: fenced.root }, home: fenced.root,
+          config: { dbPath: fenced.store.dbPath }, loadConfig: () => ({ dbPath: fenced.store.dbPath }),
+          registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
+        } as never);
+        assert.equal(code, 3);
+        assert.match(errors.join('\n'), /retirement-in-progress/);
+      } finally { fenced.cleanup(); }
+    } finally { f.cleanup(); }
+  });
+
+  it('pi rollback rechecks a retirement fence installed after its outer check', async () => {
+    const f = fixture();
+    try {
+      const errors: string[] = [];
+      const context = {
         stdout: () => {}, stderr: (message: string) => errors.push(message),
         env: { QLB_TEST_MODE: '1', QLB_HOME: f.root }, home: f.root,
         config: { dbPath: f.store.dbPath }, loadConfig: () => ({ dbPath: f.store.dbPath }),
         registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
-      } as never);
+      } as never;
+      const code = await executePiRollback(['xai'], context, {
+        rollback: () => assert.fail('rollback must not run after a fence is installed'),
+        beforeLock: () => assert.equal(beginRetirementFence(f.store).ok, true),
+      });
       assert.equal(code, 3);
       assert.match(errors.join('\n'), /retirement-in-progress/);
     } finally { f.cleanup(); }

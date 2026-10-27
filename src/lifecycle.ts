@@ -1,4 +1,5 @@
-import { mkdirSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
@@ -128,7 +129,9 @@ export function isOperational(state: LifecycleState): boolean {
   return state === 'cutover' || state === 'retired';
 }
 
-/** Admission must be called before locks or journal reconciliation (S43/S59). */
+/** Full lifecycle admission precedes locks and journal reconciliation (S43/S59).
+ * pi rollback keeps its historical phase availability, so it checks only the
+ * retirement fence before and again inside its retirement lock. */
 function assertAdmittedForPhase(current: LifecycleRow, operation: LifecycleOperation): LifecycleResult {
   if (current.state !== 'undoing' && operation.endsWith(':dry-run')) return { ok: true, row: current };
   // cutoverBegin's compensation uses its durable primitives directly. Every
@@ -236,47 +239,125 @@ export function retirementLockPath(stateDir: string): string {
   return join(stateDir, 'journal', 'retire-cswap.json.lock');
 }
 
+export function assertRetirementFenceClear(store: Store): LifecycleResult {
+  const current = phase(store);
+  return current.note === RETIREMENT_IN_PROGRESS
+    ? { ok: false, code: RETIREMENT_IN_PROGRESS, row: current }
+    : { ok: true, row: current };
+}
+
 function retirementLocked(lockPath: string): Error & { code: 'retirement-locked' } {
   return Object.assign(new Error(`retirement lock is held or indeterminate: ${lockPath}`), { code: 'retirement-locked' as const });
+}
+
+type RetirementLockOwner = { pid: number; token: string };
+
+export interface RetirementLockDependencies {
+  fs?: {
+    exists(path: string): boolean;
+    mkdir(path: string, options: { recursive?: boolean; mode?: number }): void;
+    readFile(path: string): string;
+    remove(path: string): void;
+    writeOwner(path: string, owner: RetirementLockOwner): void;
+  };
+  probe?(pid: number): void;
+  token?(): string;
+  /** Deterministic interleaving seam: invoked only after reclaim mutex acquisition. */
+  onReclaimMutexAcquired?(): void;
+  onReclaimStep?(step: 'probed' | 'mutex-acquired' | 'owner-reread' | 'lock-removed' | 'mutex-released'): void;
+}
+
+function ownerPath(lockPath: string): string {
+  return join(lockPath, 'qlb-lock-owner.json');
+}
+
+function parseRetirementLockOwner(lockPath: string, fs: NonNullable<RetirementLockDependencies['fs']>): RetirementLockOwner | null {
+  try {
+    const value: unknown = JSON.parse(fs.readFile(ownerPath(lockPath)));
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+    const { pid, token } = value as { pid?: unknown; token?: unknown };
+    return typeof pid === 'number' && Number.isSafeInteger(pid) && pid > 0 && typeof token === 'string' && token.length > 0
+      ? { pid, token }
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function sameLockOwner(left: RetirementLockOwner | null, right: RetirementLockOwner): boolean {
+  return left?.pid === right.pid && left.token === right.token;
 }
 
 /**
  * Serialize mutations that must not straddle retirement's durable fence.
  * An indeterminate existing lock is never reclaimed: only a proven-dead owner
- * (an ESRCH probe) permits cleanup.
+ * (an ESRCH probe) permits cleanup. A reclaim mutex serializes stale cleanup.
  */
-export async function withRetirementMutationLock<T>(lockPath: string, fn: () => Promise<T> | T): Promise<T> {
-  mkdirSync(dirname(lockPath), { recursive: true, mode: 0o700 });
+export async function withRetirementMutationLock<T>(
+  lockPath: string,
+  fn: () => Promise<T> | T,
+  dependencies: RetirementLockDependencies = {},
+): Promise<T> {
+  const fs = dependencies.fs ?? {
+    exists: existsSync,
+    mkdir: (path: string, options: { recursive?: boolean; mode?: number }) => { mkdirSync(path, options); },
+    readFile: (path: string) => readFileSync(path, 'utf8'),
+    remove: (path: string) => { rmSync(path, { recursive: true, force: true }); },
+    writeOwner: (path: string, owner: RetirementLockOwner) => atomicWriteText(path, `${JSON.stringify(owner)}\n`, { mode: 0o600 }),
+  };
+  const probe = dependencies.probe ?? ((pid: number) => { process.kill(pid, 0); });
+  const token = dependencies.token?.() ?? randomUUID();
+  const ours: RetirementLockOwner = { pid: process.pid, token };
+  const reclaimPath = `${lockPath}.reclaim`;
+  fs.mkdir(dirname(lockPath), { recursive: true, mode: 0o700 });
+  if (fs.exists(reclaimPath)) throw retirementLocked(lockPath);
+
+  let acquired = false;
   try {
-    mkdirSync(lockPath, { mode: 0o700 });
+    fs.mkdir(lockPath, { mode: 0o700 });
+    acquired = true;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-    let pid: unknown;
+    const staleOwner = parseRetirementLockOwner(lockPath, fs);
+    if (!staleOwner) throw retirementLocked(lockPath);
     try {
-      const owner = JSON.parse(readFileSync(join(lockPath, 'qlb-lock-owner.json'), 'utf8')) as { pid?: unknown };
-      pid = owner.pid;
-    } catch {
+      probe(staleOwner.pid);
       throw retirementLocked(lockPath);
+    } catch (probeError) {
+      if ((probeError as NodeJS.ErrnoException).code !== 'ESRCH') throw retirementLocked(lockPath);
     }
-    if (typeof pid !== 'number' || !Number.isSafeInteger(pid) || pid < 1) throw retirementLocked(lockPath);
+    dependencies.onReclaimStep?.('probed');
     try {
-      process.kill(pid, 0);
-      throw retirementLocked(lockPath);
-    } catch (probe) {
-      if ((probe as NodeJS.ErrnoException).code !== 'ESRCH') throw retirementLocked(lockPath);
+      fs.mkdir(reclaimPath, { mode: 0o700 });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'EEXIST') throw retirementLocked(lockPath);
+      throw error;
     }
     try {
-      rmSync(lockPath, { recursive: true, force: true });
-      mkdirSync(lockPath, { mode: 0o700 });
-    } catch {
-      throw retirementLocked(lockPath);
+      dependencies.onReclaimMutexAcquired?.();
+      dependencies.onReclaimStep?.('mutex-acquired');
+      if (!sameLockOwner(parseRetirementLockOwner(lockPath, fs), staleOwner)) throw retirementLocked(lockPath);
+      dependencies.onReclaimStep?.('owner-reread');
+      fs.remove(lockPath);
+      dependencies.onReclaimStep?.('lock-removed');
+    } finally {
+      fs.remove(reclaimPath);
+      dependencies.onReclaimStep?.('mutex-released');
+    }
+    try {
+      fs.mkdir(lockPath, { mode: 0o700 });
+      acquired = true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'EEXIST') throw retirementLocked(lockPath);
+      throw error;
     }
   }
+
   try {
-    atomicWriteText(join(lockPath, 'qlb-lock-owner.json'), `${JSON.stringify({ pid: process.pid })}\n`, { mode: 0o600 });
+    fs.writeOwner(ownerPath(lockPath), ours);
     return await fn();
   } finally {
-    rmSync(lockPath, { recursive: true, force: true });
+    if (acquired && sameLockOwner(parseRetirementLockOwner(lockPath, fs), ours)) fs.remove(lockPath);
   }
 }
 

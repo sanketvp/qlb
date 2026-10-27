@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -34,6 +34,14 @@ import type { CswapAgent } from '../src/cswap-agent';
 function fixtureStore() {
   return openStore(join(mkdtempSync(join(tmpdir(), 'qlb-lifecycle-')), 'qlb.db'));
 }
+
+const testRetirementLockFs = {
+  exists: existsSync,
+  mkdir: (path: string, options: { recursive?: boolean; mode?: number }) => { mkdirSync(path, options); },
+  readFile: (path: string) => readFileSync(path, 'utf8'),
+  remove: (path: string) => { rmSync(path, { recursive: true, force: true }); },
+  writeOwner: (path: string, owner: { pid: number; token: string }) => { writeFileSync(path, `${JSON.stringify(owner)}\n`); },
+};
 
 // @ts-expect-error S57 requires every CswapAgent to implement drain.
 const agentMissingDrain: CswapAgent = {
@@ -195,6 +203,69 @@ describe('lifecycle (AC49)', () => {
       },
     );
     assert.equal(called, false);
+  });
+
+  it('serializes stale-lock reclamation at every interleaving point and refuses a leftover reclaim mutex', async () => {
+    for (const step of ['probed', 'mutex-acquired', 'owner-reread', 'lock-removed', 'mutex-released'] as const) {
+      const root = mkdtempSync(join(tmpdir(), 'qlb-retirement-lock-'));
+      const lockPath = retirementLockPath(join(root, '.qlb'));
+      const ownerPath = join(lockPath, 'qlb-lock-owner.json');
+      mkdirSync(lockPath, { recursive: true });
+      writeFileSync(ownerPath, JSON.stringify({ pid: 42, token: 'dead-owner' }));
+      const probe = (pid: number) => {
+        if (pid === 42) throw Object.assign(new Error('gone'), { code: 'ESRCH' });
+      };
+      let ran = 0;
+      let releaseSecond: (() => void) | undefined;
+      let second: Promise<void> | undefined;
+      const first = withRetirementMutationLock(lockPath, () => { ran++; }, {
+        fs: testRetirementLockFs,
+        probe,
+        token: () => 'first-holder',
+        onReclaimStep: (at) => {
+          if (at !== step) return;
+          second = withRetirementMutationLock(lockPath, () => {
+            ran++;
+            return new Promise<void>((resolve) => { releaseSecond = resolve; });
+          }, { fs: testRetirementLockFs, probe, token: () => 'second-holder' });
+        },
+      });
+      const firstResult = first.then(
+        () => ({ ok: true as const }),
+        (error: unknown) => ({ ok: false as const, error }),
+      );
+      await firstResult;
+      assert.ok(second, step);
+      const secondResult = second!.then(
+        () => ({ ok: true as const }),
+        (error: unknown) => ({ ok: false as const, error }),
+      );
+      assert.equal(ran, 1, step);
+      releaseSecond?.();
+      const results = await Promise.all([firstResult, secondResult]);
+      assert.equal(results.filter((result) => result.ok).length, 1, step);
+      const rejected = results.find((result) => !result.ok);
+      assert.equal((rejected as { error: { code?: unknown } }).error.code, 'retirement-locked', step);
+    }
+
+    const root = mkdtempSync(join(tmpdir(), 'qlb-retirement-lock-'));
+    const lockPath = retirementLockPath(join(root, '.qlb'));
+    mkdirSync(`${lockPath}.reclaim`, { recursive: true });
+    await assert.rejects(
+      withRetirementMutationLock(lockPath, () => assert.fail('must not run')),
+      (error: unknown) => (error as { code?: unknown }).code === 'retirement-locked',
+    );
+  });
+
+  it('leaves a lock whose owner token was replaced while it held it', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-retirement-lock-'));
+    const lockPath = retirementLockPath(join(root, '.qlb'));
+    const ownerPath = join(lockPath, 'qlb-lock-owner.json');
+    await withRetirementMutationLock(lockPath, () => {
+      writeFileSync(ownerPath, JSON.stringify({ pid: process.pid, token: 'replacement-holder' }));
+    }, { token: () => 'original-holder' });
+    assert.equal(existsSync(lockPath), true);
+    assert.deepEqual(JSON.parse(readFileSync(ownerPath, 'utf8')), { pid: process.pid, token: 'replacement-holder' });
   });
 
   it('refuses a disallowed operation through the executing CLI dispatch path', async () => {

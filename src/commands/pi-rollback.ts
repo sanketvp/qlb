@@ -4,7 +4,7 @@ import { platformKeychain } from '../keychain';
 import { qlbHomeDir } from '../home';
 import { defaultPiMigratePaths, rollbackPiSingleProvider, type PiSingleProvider } from '../pi-migrate';
 import { openStore } from '../store';
-import { assertAdmitted, retirementLockPath, withRetirementMutationLock } from '../lifecycle';
+import { assertRetirementFenceClear, retirementLockPath, withRetirementMutationLock } from '../lifecycle';
 import type { CommandContext, CommandDefinition } from '../registry';
 
 function provider(args: string[]): PiSingleProvider | null {
@@ -12,7 +12,17 @@ function provider(args: string[]): PiSingleProvider | null {
   return args[0] === 'xai' || args[0] === 'kimi-coding' || args[0] === 'openrouter' ? args[0] : null;
 }
 
-async function execute(args: string[], ctx: CommandContext): Promise<number> {
+export interface PiRollbackDependencies {
+  rollback?: typeof rollbackPiSingleProvider;
+  /** Test seam for the outer-fence to inner-fence check/use interleaving. */
+  beforeLock?(): void;
+}
+
+export async function executePiRollback(
+  args: string[],
+  ctx: CommandContext,
+  dependencies: PiRollbackDependencies = {},
+): Promise<number> {
   const selected = provider(args);
   if (!selected) {
     ctx.stderr('usage: qlb pi rollback xai|kimi-coding|openrouter');
@@ -20,13 +30,23 @@ async function execute(args: string[], ctx: CommandContext): Promise<number> {
   }
   const store = openStore(ctx.config.dbPath);
   try {
+    const outerFence = assertRetirementFenceClear(store);
+    if (!outerFence.ok) {
+      ctx.stderr(`qlb pi rollback: refused: ${outerFence.code}`);
+      return 3;
+    }
+    dependencies.beforeLock?.();
     return await withRetirementMutationLock(retirementLockPath(join(qlbHomeDir(ctx.env), '.qlb')), async () => {
-      const admission = assertAdmitted(store, 'pi-rollback');
-      if (!admission.ok) {
-        ctx.stderr(`qlb pi rollback: refused: ${admission.code}`);
+      const innerFence = assertRetirementFenceClear(store);
+      if (!innerFence.ok) {
+        ctx.stderr(`qlb pi rollback: refused: ${innerFence.code}`);
         return 3;
       }
-      rollbackPiSingleProvider(selected, defaultPiMigratePaths(qlbHomeDir(ctx.env), ctx.config.piAuthJsonPath), { keychain: platformKeychain, store });
+      (dependencies.rollback ?? rollbackPiSingleProvider)(
+        selected,
+        defaultPiMigratePaths(qlbHomeDir(ctx.env), ctx.config.piAuthJsonPath),
+        { keychain: platformKeychain, store },
+      );
       ctx.stdout(`${selected}: rolled back`);
       return 0;
     });
@@ -42,5 +62,5 @@ async function execute(args: string[], ctx: CommandContext): Promise<number> {
   }
 }
 
-const command: CommandDefinition = { name: 'pi rollback', execute };
+const command: CommandDefinition = { name: 'pi rollback', execute: executePiRollback };
 export default command;
