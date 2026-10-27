@@ -1,9 +1,9 @@
 import { execFileSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync } from 'node:fs';
+import { chmodSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 
 import { credentialFingerprint } from '../anthropic-oauth';
-import { runRetirementDrain, unavailableCswapAgent, type CswapAgent } from '../cswap-agent';
+import { productionLaunchctlCswapAgent, runRetirementDrain, type CswapAgent } from '../cswap-agent';
 import { retireCswap, type CswapRetireDependencies, type CswapRetireResult } from '../cswap-retire';
 import { doctorQlb, type DoctorReport } from '../diagnostics';
 import { qlbHomeDir } from '../home';
@@ -11,13 +11,14 @@ import { withUndoCapability } from '../keychain-allowlist';
 import { listUnclaimedKeychainServices, platformKeychain } from '../keychain';
 import { isCredentialNotFound } from '../credential-backends';
 import { defaultPiMigratePaths } from '../pi-migrate';
+import { fsyncDirSync } from '../fsutil';
 import { openStore, openStoreConnection, type Store } from '../store';
 import type { CommandContext, CommandDefinition } from '../registry';
 
 export interface RetireCswapCommandDependencies {
   /** Tests inject the entire retirement transaction and all destructive effects. */
   retire?: (store: Store, context: CommandContext) => Promise<CswapRetireResult>;
-  /** The production S57 implementation is injected until its platform adapter exists. */
+  /** Tests may replace the production S57 LaunchAgent adapter. */
   cswapAgent?: CswapAgent;
 }
 
@@ -58,7 +59,7 @@ export function s64DoctorVerdict(report: DoctorReport): { overall: 'PASS' | 'FAI
 export function productionDependencies(
   store: Store,
   ctx: CommandContext,
-  agent: CswapAgent = unavailableCswapAgent,
+  agent: CswapAgent = productionLaunchctlCswapAgent(ctx.home, qlbHomeDir(ctx.env)),
   enumerateUnclaimed: () => string[] = listUnclaimedKeychainServices,
 ): CswapRetireDependencies {
   const sequencePath = ctx.config.cswapSequencePath;
@@ -138,6 +139,12 @@ export function productionDependencies(
     },
     cswapItems,
     readSlotFingerprint: (accountId) => fingerprint(platformKeychain.getSync(`qlb:anthropic:${accountId}`, 'qlb')),
+    fsyncArchive: (path) => {
+      const fd = openSync(path, 'r');
+      try { fsyncSync(fd); } finally { closeSync(fd); }
+      // fsutil tolerates filesystems where directory fsync is unsupported.
+      fsyncDirSync(dirname(path));
+    },
     effects: {
       drainCswap: () => runRetirementDrain(agent),
       archiveCswap: (archivePath) => archive(cswapBackup, archivePath),
@@ -159,7 +166,8 @@ export function productionDependencies(
         }
       },
       removeCswapLaunchArtifacts: () => {
-        rmSync(join(ctx.home, 'Library', 'LaunchAgents', 'com.claude-swap.auto.plist'), { force: true });
+        rmSync(join(ctx.home, 'Library', 'LaunchAgents', 'com.cswap.auto.plist'), { force: true });
+        rmSync(join(stateDir, 'backups', 'cswap-plist', 'com.cswap.auto.plist'), { force: true });
         rmSync(join(ctx.home, '.local', 'bin', 'cswap'), { force: true });
       },
       deletePiBaselines: () => rmSync(defaultPiMigratePaths(qlbHomeDir(ctx.env), ctx.config.piAuthJsonPath).baselineDir, { recursive: true, force: true }),

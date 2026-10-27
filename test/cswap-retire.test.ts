@@ -7,11 +7,12 @@ import { describe, it } from 'node:test';
 
 import { credentialFingerprint } from '../src/anthropic-oauth';
 import { runRetireCswapCommand, productionDependencies, s64DoctorVerdict } from '../src/commands/retire-cswap';
+import { productionLaunchctlCswapAgent, unavailableCswapAgent } from '../src/cswap-agent';
 import { evaluateRetirementGates, retireCswap, type CswapRetireDependencies, type CswapRetireItem } from '../src/cswap-retire';
 import piRollback, { executePiRollback } from '../src/commands/pi-rollback';
 import { defaultConfig } from '../src/config';
 import { qlbHomeDir } from '../src/home';
-import { listUnclaimedKeychainServices, platformKeychain } from '../src/keychain';
+import { listUnclaimedKeychainServices } from '../src/keychain';
 import { assertAdmitted, beginCutover, beginRetirementFence, phase } from '../src/lifecycle';
 import { defaultPiMigratePaths } from '../src/pi-migrate';
 import { openStore } from '../src/store';
@@ -440,6 +441,23 @@ describe('qlb retire cswap (AC22 retire)', () => {
     }
   });
 
+  it('the archive checkpoint is journaled only after the archive and its directory are fsynced', async () => {
+    const f = fixture();
+    try {
+      const order: string[] = [];
+      f.deps.effects.archiveCswap = () => { order.push('archive'); };
+      f.deps.fsyncArchive = () => { order.push('archive-file'); order.push('archive-directory'); };
+      f.deps.fsyncJournalDir = (dir) => {
+        const path = join(dir, 'retire-cswap.json');
+        if (existsSync(path) && (JSON.parse(readFileSync(path, 'utf8')) as { phase: string }).phase === 'archive') order.push('archive-checkpoint');
+      };
+      assert.equal((await retireCswap(f.store, f.deps)).ok, true);
+      assert.ok(order.indexOf('archive') < order.indexOf('archive-file'));
+      assert.ok(order.indexOf('archive-file') < order.indexOf('archive-directory'));
+      assert.ok(order.indexOf('archive-directory') < order.indexOf('archive-checkpoint'));
+    } finally { f.cleanup(); }
+  });
+
   it('fsyncs the journal dir parent on every journal write', async () => {
     const f = fixture();
     try {
@@ -697,6 +715,17 @@ describe('qlb retire cswap (AC22 retire)', () => {
     } finally { f.cleanup(); }
   });
 
+  it('the production CLI dependencies never use the placeholder C-swap agent', () => {
+    const f = fixture();
+    try {
+      const ctx = { stdout: () => {}, stderr: () => {}, env: { QLB_HOME: f.root, QLB_TEST_MODE: '1' }, home: f.root,
+        config: { ...defaultConfig(f.root), dbPath: f.store.dbPath }, loadConfig: () => defaultConfig(f.root), registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [] };
+      const production = productionLaunchctlCswapAgent(ctx.home, qlbHomeDir(ctx.env));
+      assert.notEqual(production, unavailableCswapAgent);
+      assert.doesNotThrow(() => productionDependencies(f.store, ctx));
+    } finally { f.cleanup(); }
+  });
+
   it('runs the injected production S57 drain in bootout, disable, plist-move, and cooperative-drain order', async () => {
     const f = fixture();
     try {
@@ -765,11 +794,44 @@ describe('qlb retire cswap (AC22 retire)', () => {
     assert.equal(s64DoctorVerdict({ ...base, checks: [{ name: 'auto:agent', level: 'PASS', message: 'ok' }] }).autoAgent, 'PASS');
   });
 
+  it('parses quoted, NULL and hex svce forms', () => {
+    const fixtureText = [
+      '    "svce"<blob>="qlb:anthropic:unclaimed:quoted"',
+      '    "svce"<blob>=<NULL>',
+      '    "svce"<blob>=0x716c623a7861693a756e636c61696d65643a686578  "qlb:xai:unclaimed:hex"',
+    ].join('\n');
+    assert.deepEqual(listUnclaimedKeychainServices({ platform: 'darwin', exec: () => fixtureText }), [
+      'qlb:anthropic:unclaimed:quoted', 'qlb:xai:unclaimed:hex',
+    ]);
+  });
+
+  it('a dump larger than 1 MiB is read', () => {
+    const fixtureText = `${'x'.repeat(1024 * 1024)}\n    "svce"<blob>="qlb:anthropic:unclaimed:large"`;
+    let maxBuffer = 0;
+    const result = listUnclaimedKeychainServices({ platform: 'darwin', exec: (_file, _args, options) => {
+      maxBuffer = Number(options?.maxBuffer ?? 0);
+      return fixtureText;
+    } });
+    assert.ok(maxBuffer >= 64 * 1024 * 1024);
+    assert.deepEqual(result, ['qlb:anthropic:unclaimed:large']);
+  });
+
+  it('an enumeration error never carries dump contents', () => {
+    const dumpFragment = 'fixture-dump-content-must-not-leak';
+    assert.throws(
+      () => listUnclaimedKeychainServices({ platform: 'darwin', exec: () => {
+        throw Object.assign(new Error(dumpFragment), { code: 'ENOBUFS', stdout: dumpFragment, stderr: dumpFragment });
+      } }),
+      (error: unknown) => error instanceof Error && !error.message.includes(dumpFragment) && error.message === 'Keychain service enumeration failed: ENOBUFS',
+    );
+  });
+
   it('listUnclaimedKeychainServices finds a stash behind a slot item', () => {
-    platformKeychain.setSync('qlb:anthropic:slot-a', 'qlb', 'fixture-slot');
-    platformKeychain.setSync('qlb:anthropic:unclaimed:123', 'qlb', 'fixture-stash');
-    platformKeychain.setSync('qlb:xai:unclaimed:5', 'qlb', 'fixture-stash');
-    const services = listUnclaimedKeychainServices();
+    const services = listUnclaimedKeychainServices({ platform: 'darwin', exec: () => [
+      '    "svce"<blob>="qlb:anthropic:slot-a"',
+      '    "svce"<blob>="qlb:anthropic:unclaimed:123"',
+      '    "svce"<blob>="qlb:xai:unclaimed:5"',
+    ].join('\n') });
     assert.ok(services.includes('qlb:anthropic:unclaimed:123'));
     assert.ok(services.includes('qlb:xai:unclaimed:5'));
     assert.equal(services.includes('qlb:anthropic:slot-a'), false);

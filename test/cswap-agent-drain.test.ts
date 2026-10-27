@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { cooperativeDrain, type CswapAgent } from '../src/cswap-agent';
+import { cooperativeDrain, launchctlCswapAgent, runRetirementDrain, type CswapAgent } from '../src/cswap-agent';
 import { cutoverBegin } from '../src/commands/cutover';
 import { phase } from '../src/lifecycle';
 import { openStore } from '../src/store';
@@ -70,6 +70,42 @@ test('waits for a held C-swap consume lock before signaling, then drains coopera
   } finally {
     store.close();
   }
+});
+
+test('launchctlCswapAgent issues bootout, disable and plist move with the exact argv', async () => {
+  const root = '/fixture-home';
+  const calls: Array<{ file: string; args: readonly string[] }> = [];
+  let plistMoved = false;
+  const agent = launchctlCswapAgent({
+    exec: (file, args) => { calls.push({ file, args }); },
+    fs: {
+      exists: (path) => path === `${root}/Library/LaunchAgents/com.cswap.auto.plist` ? !plistMoved : plistMoved,
+      mkdir: () => {}, readFile: () => JSON.stringify({ sequence: [] }),
+      rename: () => { plistMoved = true; },
+    },
+    uid: () => 501, home: () => root, qlbHome: () => root,
+    tryAcquireLock: () => () => {}, kill: () => {}, now: () => 0, sleep: async () => {},
+  });
+  assert.deepEqual(await agent.bootout(), { ok: true });
+  assert.deepEqual(await agent.disable(), { ok: true });
+  assert.deepEqual(await agent.movePlist(), { ok: true });
+  assert.deepEqual(calls, [
+    { file: '/bin/launchctl', args: ['bootout', 'gui/501/com.cswap.auto'] },
+    { file: '/bin/launchctl', args: ['disable', 'gui/501/com.cswap.auto'] },
+  ]);
+});
+
+test('an already booted-out agent is treated as drained', async () => {
+  const agent = launchctlCswapAgent({
+    exec: (file) => {
+      if (file === '/bin/launchctl') throw Object.assign(new Error('No such process'), { code: 'ESRCH' });
+      return '';
+    },
+    fs: { exists: () => true, mkdir: () => {}, readFile: () => JSON.stringify({ sequence: [] }), rename: () => {} },
+    uid: () => 501, home: () => '/fixture-home', qlbHome: () => '/fixture-home',
+    tryAcquireLock: () => () => {}, kill: () => {}, now: () => 0, sleep: async () => {},
+  });
+  assert.deepEqual(await runRetirementDrain(agent), { ok: true });
 });
 
 test('AC58 barrier assertion rejects a fake drain that signals before the consume lock is available', async () => {

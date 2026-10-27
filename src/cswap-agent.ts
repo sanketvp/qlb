@@ -1,7 +1,8 @@
-/**
- * K13 seam for the destructive C-swap LaunchAgent operations. No production
- * effect is implemented here: callers must inject every external operation.
- */
+import { execFileSync, spawn } from 'node:child_process';
+import { existsSync, mkdirSync, readFileSync, renameSync } from 'node:fs';
+import { join } from 'node:path';
+
+/** K13 seam for the destructive C-swap LaunchAgent operations. */
 export interface CswapAgentResult {
   ok: boolean;
   code?: string;
@@ -161,3 +162,194 @@ export const unavailableCswapAgent: CswapAgent = {
   restorePlist: unavailable,
   drain: unavailable,
 };
+
+export interface LaunchctlCswapAgentFs {
+  exists(path: string): boolean;
+  mkdir(path: string): void;
+  readFile(path: string): string;
+  rename(from: string, to: string): void;
+}
+
+export interface LaunchctlCswapAgentDependencies {
+  /** All commands are passed as file plus argv; never through a shell. */
+  exec(file: string, args: readonly string[]): string | void;
+  fs: LaunchctlCswapAgentFs;
+  uid(): number;
+  home(): string;
+  qlbHome(): string;
+  /** A non-blocking fcntl flock compatible with C-swap's flock locks. */
+  tryAcquireLock(path: string): CswapLockRelease | null | Promise<CswapLockRelease | null>;
+  kill(pid: number, signal: 'SIGTERM'): void | Promise<void>;
+  now(): number;
+  sleep(ms: number): Promise<void>;
+}
+
+const CSWAP_LABEL = 'com.cswap.auto';
+const CSWAP_PLIST = `${CSWAP_LABEL}.plist`;
+
+function commandErrorCode(error: unknown): string {
+  const code = errorCode(error);
+  return code ? `cswap-agent-error ${code}` : 'cswap-agent-error';
+}
+
+function alreadyInactive(error: unknown): boolean {
+  if (errorCode(error) === 'ESRCH') return true;
+  const message = error instanceof Error ? error.message : '';
+  return /(?:not found|no such process|could not find service|already disabled)/i.test(message);
+}
+
+function operation(
+  deps: LaunchctlCswapAgentDependencies,
+  args: string[],
+  idempotent = false,
+): CswapAgentResult {
+  try {
+    deps.exec('/bin/launchctl', args);
+    return { ok: true };
+  } catch (error) {
+    return idempotent && alreadyInactive(error) ? { ok: true } : { ok: false, code: commandErrorCode(error) };
+  }
+}
+
+function parseCswapProcesses(output: string): CswapProcess[] {
+  const processes: CswapProcess[] = [];
+  for (const line of output.split(/\r?\n/)) {
+    const match = /^\s*(\d+)\s+(.+)$/.exec(line);
+    if (!match || !/\bcswap\s+auto(?:\s|$)/.test(match[2])) continue;
+    const pid = Number(match[1]);
+    if (Number.isSafeInteger(pid) && pid > 0) processes.push({ pid });
+  }
+  return processes;
+}
+
+function sequenceLockPaths(deps: LaunchctlCswapAgentDependencies): string[] {
+  const backup = join(deps.home(), '.claude-swap-backup');
+  const parsed = JSON.parse(deps.fs.readFile(join(backup, 'sequence.json'))) as { sequence?: unknown };
+  if (!Array.isArray(parsed.sequence) || !parsed.sequence.every((value) => typeof value === 'number' || typeof value === 'string')) {
+    throw new Error('C-swap account registry is unreadable');
+  }
+  return [
+    join(backup, '.lock'),
+    ...parsed.sequence.map((number) => join(backup, 'credentials', `.consume-${number}.lock`)),
+  ];
+}
+
+/**
+ * Real S57 adapter. Every process, filesystem, uid, clock, and flock effect
+ * is a constructor seam so tests can exercise its exact argv without touching
+ * a host LaunchAgent, process, or Keychain-adjacent C-swap directory.
+ */
+export function launchctlCswapAgent(deps: LaunchctlCswapAgentDependencies): CswapAgent {
+  const domain = () => `gui/${deps.uid()}`;
+  const plist = () => join(deps.home(), 'Library', 'LaunchAgents', CSWAP_PLIST);
+  const backup = () => join(deps.qlbHome(), '.qlb', 'backups', 'cswap-plist', CSWAP_PLIST);
+  return {
+    bootout: () => operation(deps, ['bootout', `${domain()}/${CSWAP_LABEL}`], true),
+    disable: () => operation(deps, ['disable', `${domain()}/${CSWAP_LABEL}`], true),
+    movePlist: () => {
+      const source = plist();
+      const target = backup();
+      try {
+        if (!deps.fs.exists(source)) return deps.fs.exists(target) ? { ok: true } : { ok: false, code: 'cswap-plist-unavailable' };
+        deps.fs.mkdir(join(deps.qlbHome(), '.qlb', 'backups', 'cswap-plist'));
+        deps.fs.rename(source, target);
+        return { ok: true };
+      } catch (error) {
+        return { ok: false, code: commandErrorCode(error) };
+      }
+    },
+    restorePlist: () => {
+      const source = plist();
+      const target = backup();
+      try {
+        if (deps.fs.exists(target)) {
+          deps.fs.mkdir(join(deps.home(), 'Library', 'LaunchAgents'));
+          deps.fs.rename(target, source);
+        } else if (!deps.fs.exists(source)) {
+          return { ok: false, code: 'cswap-plist-unavailable' };
+        }
+      } catch (error) {
+        return { ok: false, code: commandErrorCode(error) };
+      }
+      const enable = operation(deps, ['enable', `${domain()}/${CSWAP_LABEL}`], true);
+      if (!enable.ok) return enable;
+      return operation(deps, ['bootstrap', domain(), source]);
+    },
+    drain: async () => cooperativeDrain({
+      listProcesses: () => parseCswapProcesses(String(deps.exec('/bin/ps', ['-axo', 'pid=,command=']) ?? '')),
+      lockPaths: () => sequenceLockPaths(deps),
+      tryAcquireLock: (path) => deps.tryAcquireLock(path),
+      kill: (pid, signal) => deps.kill(pid, signal),
+      now: () => deps.now(),
+      sleep: (ms) => deps.sleep(ms),
+    }),
+  };
+}
+
+const FLOCK_HELPER = [
+  'import fcntl, os, sys',
+  'fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600)',
+  'try:',
+  '    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)',
+  'except BlockingIOError:',
+  '    print("busy", flush=True)',
+  '    sys.exit(0)',
+  'print("locked", flush=True)',
+  'sys.stdin.buffer.read(1)',
+  'fcntl.flock(fd, fcntl.LOCK_UN)',
+  'os.close(fd)',
+].join('\n');
+
+/** Keeps a real fcntl flock in a tiny helper process until its release seam. */
+function productionTryAcquireLock(path: string): Promise<CswapLockRelease | null> {
+  return new Promise((resolve, reject) => {
+    const child = spawn('/usr/bin/python3', ['-c', FLOCK_HELPER, path], { stdio: ['pipe', 'pipe', 'ignore'] });
+    let state: 'pending' | 'locked' | 'busy' = 'pending';
+    let released: Promise<void> | undefined;
+    const closed = new Promise<void>((resolveClose, rejectClose) => {
+      child.once('error', rejectClose);
+      child.once('close', (code) => code === 0 ? resolveClose() : rejectClose(new Error('fcntl flock helper failed')));
+    });
+    child.stdout.on('data', (chunk: Buffer) => {
+      const line = String(chunk).trim();
+      if (state !== 'pending') return;
+      if (line === 'busy') state = 'busy';
+      else if (line === 'locked') {
+        state = 'locked';
+        resolve(() => {
+          if (!released) {
+            child.stdin.end();
+            released = closed;
+          }
+          return released;
+        });
+      }
+    });
+    closed.then(() => {
+      if (state === 'busy') resolve(null);
+      else if (state === 'pending') reject(new Error('fcntl flock helper failed'));
+    }, (error) => {
+      if (state !== 'locked') reject(error);
+    });
+  });
+}
+
+/** The live adapter's platform calls remain behind the factory seams above. */
+export function productionLaunchctlCswapAgent(home: string, qlbHome: string): CswapAgent {
+  return launchctlCswapAgent({
+    exec: (file, args) => String(execFileSync(file, [...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })),
+    fs: {
+      exists: existsSync,
+      mkdir: (path) => mkdirSync(path, { recursive: true, mode: 0o700 }),
+      readFile: (path) => readFileSync(path, 'utf8'),
+      rename: renameSync,
+    },
+    uid: () => process.getuid?.() ?? 0,
+    home: () => home,
+    qlbHome: () => qlbHome,
+    tryAcquireLock: productionTryAcquireLock,
+    kill: (pid, signal) => { process.kill(pid, signal); },
+    now: Date.now,
+    sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  });
+}

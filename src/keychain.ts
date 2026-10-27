@@ -222,6 +222,30 @@ export async function keychainDelete(
 }
 
 const UNCLAIMED_SERVICE = /^qlb:[^:]+:unclaimed:/;
+const KEYCHAIN_DUMP_MAX_BUFFER = 64 * 1024 * 1024;
+
+export interface KeychainEnumerationDependencies {
+  platform?: NodeJS.Platform;
+  exec?: ExecFileSyncFn;
+}
+
+function enumerationError(error: unknown): Error {
+  const code = typeof error === 'object' && error != null && 'code' in error
+    && typeof (error as { code?: unknown }).code === 'string'
+    ? (error as { code: string }).code
+    : undefined;
+  // Never retain a security dump attached as stdout/stderr on the thrown error.
+  return Object.assign(new Error(`Keychain service enumeration failed${code ? `: ${code}` : ''}`), code ? { code } : {});
+}
+
+function parsedServiceAttribute(line: string): string | null {
+  const quoted = /^\s*"svce"<blob>="([^"]*)"\s*$/.exec(line);
+  if (quoted) return quoted[1];
+  if (/^\s*"svce"<blob>=<NULL>\s*$/.test(line)) return null;
+  const hex = /^\s*"svce"<blob>=0x([0-9a-fA-F]+)\s+"[^"]*"\s*$/.exec(line);
+  if (hex && hex[1].length % 2 === 0) return Buffer.from(hex[1], 'hex').toString('utf8');
+  throw new Error('unable to parse Keychain service attribute');
+}
 
 /**
  * Lists the Keychain-first unclaimed-stash index without reading any secret
@@ -229,32 +253,32 @@ const UNCLAIMED_SERVICE = /^qlb:[^:]+:unclaimed:/;
  * the guarded in-memory backend instead. Any enumeration or parsing failure
  * is deliberately visible to the caller, which must fail its gate closed.
  */
-export function listUnclaimedKeychainServices(): string[] {
-  if (platformKeychain.kind === 'test-memory') {
+export function listUnclaimedKeychainServices(dependencies: KeychainEnumerationDependencies = {}): string[] {
+  if (platformKeychain.kind === 'test-memory' && dependencies.platform === undefined && dependencies.exec === undefined) {
     const services = (platformKeychain as ListingCredentialBackend).listServices;
     if (!services) throw new Error('test Keychain service enumeration is unavailable');
     return services().filter((service) => UNCLAIMED_SERVICE.test(service));
   }
-  if (process.platform !== 'darwin') {
+  if ((dependencies.platform ?? process.platform) !== 'darwin') {
     throw new Error('Keychain service enumeration is unavailable on this platform');
   }
   let output: string;
   try {
-    output = String(execFileUtf8(MACOS_SECURITY_BIN, ['dump-keychain'], {
+    output = String((dependencies.exec ?? execFileUtf8)(MACOS_SECURITY_BIN, ['dump-keychain'], {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: MACOS_SECURITY_TIMEOUT_MS,
+      maxBuffer: KEYCHAIN_DUMP_MAX_BUFFER,
     }));
   } catch (error) {
     if (isSecurityTimeout(error)) throw securityTimeoutError('dump-keychain');
-    throw error;
+    throw enumerationError(error);
   }
   const services: string[] = [];
   for (const line of output.split(/\r?\n/)) {
     if (!line.includes('"svce"')) continue;
-    const match = /"svce"<blob>="([^"]*)"/.exec(line);
-    if (!match) throw new Error('unable to parse Keychain service attribute');
-    if (UNCLAIMED_SERVICE.test(match[1])) services.push(match[1]);
+    const service = parsedServiceAttribute(line);
+    if (service != null && UNCLAIMED_SERVICE.test(service)) services.push(service);
   }
   return services;
 }
