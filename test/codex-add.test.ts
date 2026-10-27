@@ -7,6 +7,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { describe, it } from 'node:test';
 
 import { addCodexAccount, CodexAddError, type CodexAddDeps } from '../src/codex-add';
+import { CodexAuthLockCompromised, withCodexAuthLock } from '../src/cc-locks';
 import { codexFingerprint, parseCodexAuth } from '../src/codex-auth';
 import { MockKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from '../src/keychain';
 import { openStore } from '../src/store';
@@ -49,6 +50,7 @@ function fixture(doc = document()) {
     readAuth: async () => ({ status: 'ok', doc }),
     installCleanup: (handler) => { cleanup = handler; return () => { cleanup = undefined; }; },
     withDb: (_store, fn) => fn((store as unknown as { db: DatabaseSync }).db),
+    withAuthLock: async (_options, fn) => fn({ assertNotCompromised: () => undefined }),
   };
   return { store, keychain, calls, deps, fireCleanup: () => cleanup?.(), setHash: (fn: () => string) => { deps.hashFile = fn; }, hashCalls: () => hashCalls };
 }
@@ -111,6 +113,37 @@ describe('codex add', () => {
       const service = qlbKeychainService('openai-codex', result.slotId);
       assert.doesNotThrow(() => f.keychain.getSync(`${service}:prev`, QLB_KEYCHAIN_ACCOUNT));
     } finally { f.store.close(); }
+  });
+
+  it('codex add --replace racing import-active serialises', async () => {
+    const f = fixture(document('locked-original'));
+    const home = mkdtempSync(join(tmpdir(), 'qlb-codex-add-lock-'));
+    try {
+      await addCodexAccount({ home, nativeAuthPath: '/native-auth' }, f.deps);
+      f.deps.readAuth = async () => ({ status: 'ok', doc: document('locked-replacement') });
+      f.deps.withAuthLock = withCodexAuthLock;
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      let entered!: () => void;
+      const enteredLock = new Promise<void>((resolve) => { entered = resolve; });
+      const importer = withCodexAuthLock({ home, retryMinMs: 1, retryJitterMs: 0 }, async () => {
+        entered();
+        await held;
+      });
+      await enteredLock;
+      const replacement = addCodexAccount({
+        home, nativeAuthPath: '/native-auth', replace: 'fixture-user:fixture-account',
+      }, f.deps);
+      await new Promise<void>((resolve) => setTimeout(resolve, 20));
+      assert.equal(rows(f.store).slot?.fingerprint, codexFingerprint(document('locked-original')));
+      release();
+      await importer;
+      await replacement;
+      assert.equal(rows(f.store).slot?.fingerprint, codexFingerprint(document('locked-replacement')));
+    } finally {
+      f.store.close();
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 
   it('checks native auth twice before persisting, so a change between checks leaves nothing committed', async () => {
@@ -201,6 +234,38 @@ describe('codex add', () => {
       assert.equal(f.keychain.getSync(`${service}:prev`, QLB_KEYCHAIN_ACCOUNT), beforePrevious);
       const slot = db.prepare('SELECT prev_fingerprint FROM codex_slots WHERE account_id = ?').get('fixture-user:fixture-account') as { prev_fingerprint: string | null } | undefined;
       assert.equal(slot?.prev_fingerprint, beforeSlot?.prev_fingerprint);
+    } finally { f.store.close(); }
+  });
+
+  it('a takeover after the Keychain replace restores the predecessor and :prev never holds the new credential', async () => {
+    const f = fixture(document('takeover-original'));
+    try {
+      await addCodexAccount({ home: '/fixture-home', nativeAuthPath: '/native-auth' }, f.deps);
+      f.deps.readAuth = async () => ({ status: 'ok', doc: document('takeover-current') });
+      await addCodexAccount({ home: '/fixture-home', nativeAuthPath: '/native-auth', replace: 'fixture-user:fixture-account' }, f.deps);
+      const service = qlbKeychainService('openai-codex', 'fixture-user:fixture-account');
+      const predecessor = f.keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT);
+      const previous = f.keychain.getSync(`${service}:prev`, QLB_KEYCHAIN_ACCOUNT);
+      const replacement = document('takeover-replacement');
+      let assertions = 0;
+      f.deps.withAuthLock = async (_options, fn) => fn({
+        assertNotCompromised: () => {
+          assertions += 1;
+          if (assertions >= 4) throw new CodexAuthLockCompromised();
+        },
+      });
+      f.deps.readAuth = async () => ({ status: 'ok', doc: replacement });
+
+      await assert.rejects(
+        addCodexAccount({ home: '/fixture-home', nativeAuthPath: '/native-auth', replace: 'fixture-user:fixture-account' }, f.deps),
+        /Codex auth lock ownership was lost/,
+      );
+      assert.equal(f.keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT), predecessor);
+      assert.equal(f.keychain.getSync(`${service}:prev`, QLB_KEYCHAIN_ACCOUNT), previous);
+      assert.notEqual(
+        codexFingerprint(JSON.parse(f.keychain.getSync(`${service}:prev`, QLB_KEYCHAIN_ACCOUNT))),
+        codexFingerprint(replacement),
+      );
     } finally { f.store.close(); }
   });
 
