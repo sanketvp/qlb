@@ -195,6 +195,50 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     });
   }
 
+  it('T-RS re-stages xai and kimi-coding at the store generation, resets status, and clears prior hand-back detail', async () => {
+    for (const provider of ['xai', 'kimi-coding'] as const) {
+      for (const lifecycle of ['MIRRORED', 'VALIDATED', 'NATIVE'] as const) {
+        const h = setup(provider);
+        try {
+          const id = expectedId(provider);
+          h.mig.stage();
+          if (lifecycle === 'VALIDATED') {
+            await h.mig.rehearse(mockRehearse([]));
+          } else if (lifecycle === 'NATIVE') {
+            h.mig.rollback();
+            assert.equal(keychainHas(h.kc, provider), false, 'precondition: rollback deleted the staged grant');
+          }
+
+          assert.equal(h.store.casGrantGeneration(id, 0, 7), 1);
+          h.store.setAccountStatus(id, 'handed-back');
+          h.store.upsertMigration(`pi-${provider}`, lifecycle, JSON.stringify({
+            commitGeneration: 3,
+            rollbackDecision: { kind: 'keychain' },
+            handback: { phase: 'cleanup-pending' },
+            lastRollback: { cleanedAt: 1 },
+          }));
+
+          const staged = h.mig.stage();
+          const detail = JSON.parse(h.store.getMigration(`pi-${provider}`)!.detail_json) as Record<string, unknown>;
+          const grant = parseGrant(h.kc.getSync(
+            qlbKeychainService(provider, id),
+            expectedLabel(provider),
+          ));
+
+          assert.equal(staged.state, 'MIRRORED', `${provider} re-stages from ${lifecycle}`);
+          assert.equal(h.store.getAccount(id)?.status, 'imported-unvalidated');
+          assert.equal(grant.generation, 7);
+          assert.equal(detail.commitGeneration, undefined);
+          assert.equal(detail.rollbackDecision, undefined);
+          assert.equal(detail.handback, undefined);
+          assert.equal(detail.lastRollback, undefined);
+        } finally {
+          h.cleanup();
+        }
+      }
+    }
+  });
+
   it('rollback before commit: auth.json untouched; staged Keychain entries cleaned up', async () => {
     const h = setup('xai');
     try {
