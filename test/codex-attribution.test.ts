@@ -223,6 +223,36 @@ describe('Codex live-document attribution (AC57)', () => {
     }
   });
 
+  it('a takeover after the Keychain writes in adoption restores current and :prev and leaves DB and Keychain consistent', async () => {
+    const h = fixture();
+    try {
+      const old = document('takeover-adopt-old');
+      const live = document('takeover-adopt-live');
+      const plan = importActiveCodexSlot(old, { store: h.store, keychain: h.keychain, now: () => 1 });
+      const service = qlbKeychainService('openai-codex', plan.slotId);
+      let assertions = 0;
+
+      await assert.rejects(attributeLiveDocument({
+        store: h.store,
+        keychain: h.keychain,
+        slot: { accountId: plan.slotId, document: old, fingerprint: codexFingerprint(old) },
+        live,
+        now: () => 2,
+        assertNotCompromised: () => {
+          assertions += 1;
+          if (assertions >= 5) throw new CodexAuthLockCompromised();
+        },
+      }), (error: unknown) => error instanceof CodexAuthLockCompromised && error.retryable);
+
+      assert.equal(h.store.getCodexSlot(plan.slotId)?.fingerprint, codexFingerprint(old));
+      assert.equal(codexFingerprint(JSON.parse(h.keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT))), codexFingerprint(old));
+      assert.throws(() => h.keychain.getSync(`${service}:prev`, QLB_KEYCHAIN_ACCOUNT), /item not found/);
+    } finally {
+      h.store.close();
+      rmSync(h.home, { recursive: true, force: true });
+    }
+  });
+
   it('does not let a CAS loser write either Keychain item', async () => {
     const h = fixture();
     try {

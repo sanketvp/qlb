@@ -1834,7 +1834,8 @@ export class Store {
     assertNotCompromised?: () => void;
     prepare: (fingerprint: string) => { current: string; replacement: string; value: T } | undefined;
     writeIfUnchanged: (repair: { current: string; replacement: string; value: T }) => boolean;
-    restore: (repair: { current: string; replacement: string; value: T }) => void;
+    /** Restores only self-written bytes; false means its value CAS no longer matches. */
+    restore: (repair: { current: string; replacement: string; value: T }) => boolean;
   }): { fingerprint: string | null; repaired: boolean; value?: T } {
     this.db.exec('BEGIN IMMEDIATE');
     let repair: { current: string; replacement: string; value: T } | undefined;
@@ -1881,9 +1882,10 @@ export class Store {
       this.db.exec('COMMIT');
       return { fingerprint, repaired: true, value: repair.value };
     } catch (error) {
+      let compensationFailed = false;
       if (wrote && repair) {
         try {
-          input.restore(repair);
+          compensationFailed = !input.restore(repair);
         } catch (restoreError) {
           if (error && typeof error === 'object') Object.assign(error, { restoreError });
         }
@@ -1892,6 +1894,9 @@ export class Store {
         this.db.exec('ROLLBACK');
       } catch {
         // BEGIN may have failed, or SQLite already rolled back.
+      }
+      if (compensationFailed) {
+        throw new Error(`Codex Keychain compensation compare-and-set failed for ${input.accountId}`);
       }
       throw error;
     }
@@ -2259,7 +2264,9 @@ export class Store {
   adoptCodexSlotWithKeychain(input: {
     accountId: string; fingerprint: string; previousFingerprint: string; lastRefresh?: string | null;
     ts?: number; evidence: 'holder' | 'identity'; reloginEvidence?: 'auth-time' | 'unattributed-rotation' | null;
-    writeKeychain: () => void; restoreKeychain: () => void;
+    writeKeychain: () => void;
+    /** Restores only self-written bytes; false means a compensation CAS failed. */
+    restoreKeychain: () => boolean;
     /** Caller-owned capability, checked immediately before each SQLite write. */
     assertNotCompromised?: () => void;
   }): void {
@@ -2294,14 +2301,18 @@ export class Store {
             .run(ts, input.accountId, input.reloginEvidence, input.reloginEvidence);
         }
       } catch (error) {
+        let compensationFailed = false;
         if (keychainWriteStarted) {
           try {
             // Keep the SQLite write lock until the compensating write has
             // either restored our bytes or observed a newer adopter's bytes.
-            input.restoreKeychain();
+            compensationFailed = !input.restoreKeychain();
           } catch (restoreError) {
             if (error && typeof error === 'object') Object.assign(error, { restoreError });
           }
+        }
+        if (compensationFailed) {
+          throw new Error(`Codex Keychain compensation compare-and-set failed for ${input.accountId}`);
         }
         throw error;
       }

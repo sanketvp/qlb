@@ -156,10 +156,11 @@ async function attributeSameSlot(
         return true;
       },
       restore: (candidate) => {
-        if (input.keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT) === candidate.replacement) {
-          assertNotCompromised(input);
-          input.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, candidate.current);
-        }
+        // Compensation relies on its value CAS, not the capability that may
+        // have failed after this Keychain write.
+        if (input.keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT) !== candidate.replacement) return false;
+        input.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, candidate.current);
+        return true;
       },
     });
     if (!repair.repaired || !repair.value || !repair.fingerprint) {
@@ -216,25 +217,28 @@ async function attributeSameSlot(
       // Do not overwrite a real predecessor with that successor.
       if (fingerprintOfStoredDocument(currentBefore) === slotFp) {
         assertNotCompromised(input);
-        input.keychain.setSync(previousService, QLB_KEYCHAIN_ACCOUNT, currentBefore);
         wrotePrevious = true;
+        input.keychain.setSync(previousService, QLB_KEYCHAIN_ACCOUNT, currentBefore);
       }
       assertNotCompromised(input);
-      input.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, currentWritten);
       wroteCurrent = true;
+      input.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, currentWritten);
     },
     restoreKeychain: () => {
-      // A later adopter may have committed after our write. Never replace its
-      // current or predecessor document while compensating this failed attempt.
-      if (wroteCurrent && input.keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT) === currentWritten) {
-        assertNotCompromised(input);
+      // A later adopter may have committed after our write. Compensation is
+      // deliberately independent of the lost auth lock: each restoration is
+      // a value CAS of bytes this attempt wrote while SQLite excludes QLB
+      // adopters.
+      if (wroteCurrent) {
+        if (input.keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT) !== currentWritten) return false;
         input.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, currentBefore);
       }
-      if (wrotePrevious && optionalKeychainValue(input.keychain, previousService) === currentBefore) {
-        assertNotCompromised(input);
+      if (wrotePrevious) {
+        if (optionalKeychainValue(input.keychain, previousService) !== currentBefore) return false;
         if (previousBefore === undefined) input.keychain.deleteSync(previousService, QLB_KEYCHAIN_ACCOUNT);
         else input.keychain.setSync(previousService, QLB_KEYCHAIN_ACCOUNT, previousBefore);
       }
+      return true;
     },
   });
   return { action: 'adopt', accountId: input.slot.accountId };
