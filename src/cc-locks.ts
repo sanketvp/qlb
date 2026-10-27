@@ -5,6 +5,9 @@
  * Modified for QLB. See NOTICE.
  */
 
+// Gate lock order is consume → switch; the switch lock is not reentrant.
+// Never acquire a consume lock while holding the switch lock.
+
 import { existsSync, statSync } from 'node:fs';
 import { mkdir, rmdir, stat, utimes } from 'node:fs/promises';
 import { performance } from 'node:perf_hooks';
@@ -113,6 +116,49 @@ export interface ClaudeLockPaths {
   oauthRefreshLockDir: string;
   credentialsLockDir: string;
   configLockDir: string;
+}
+
+/** QLB's provider-level locks; independent from Claude Code's own lock paths. */
+export interface ClaudeGateLockOptions {
+  home?: string;
+  env?: NodeJS.ProcessEnv;
+  timeoutMs?: number;
+  stalenessMs?: number;
+}
+
+function gateLockHome(options: ClaudeGateLockOptions): string {
+  if (options.home) return options.home;
+  return qlbHomeDir(options.env ?? process.env);
+}
+
+function assertGateLockAccountId(accountId: string): void {
+  if (!accountId || /[\0/\\/:]/.test(accountId)) throw new Error('invalid Claude consume-lock account id');
+}
+
+/** Serialize refresh-token consumption for one QLB Claude slot. */
+export async function withClaudeConsumeLock<T>(
+  accountId: string,
+  fn: () => Promise<T> | T,
+  options: ClaudeGateLockOptions = {},
+): Promise<T> {
+  assertGateLockAccountId(accountId);
+  return withProperLockfile(join(gateLockHome(options), '.qlb', 'locks', `consume-anthropic-${accountId}.lock`), {
+    ...options,
+    timeoutMs: options.timeoutMs ?? 10_000,
+    stalenessMs: options.stalenessMs ?? CREDENTIALS_STALENESS_MS,
+  }, fn);
+}
+
+/** Briefly serialize slot CAS/adoption with Claude switch operations. */
+export async function withClaudeSwitchLock<T>(
+  fn: () => Promise<T> | T,
+  options: ClaudeGateLockOptions = {},
+): Promise<T> {
+  return withProperLockfile(join(gateLockHome(options), '.qlb', 'locks', 'switch-anthropic.lock'), {
+    ...options,
+    timeoutMs: options.timeoutMs ?? 10_000,
+    stalenessMs: options.stalenessMs ?? CREDENTIALS_STALENESS_MS,
+  }, fn);
 }
 
 /** Options for QLB's lock around a live Codex auth.json attribution/publish flow. */

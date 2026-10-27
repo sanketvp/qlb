@@ -9,11 +9,13 @@
 // Credential bytes are accepted only through injected backends and are never
 // included in errors, return metadata, or filesystem names.
 
+import { createHash } from 'node:crypto';
 import { chmod, link, lstat, mkdir, open, readdir, readFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { openStoreConnection } from './store';
 import { assertAdmittedInConnection } from './lifecycle';
 import { credentialFingerprint, parseCredentialBlob } from './anthropic-oauth';
+import { withClaudeSwitchLock } from './cc-locks';
 import { isCredentialNotFound } from './credential-backends';
 import { KeychainReadBackoff, platformKeychain, qlbKeychainService, QLB_KEYCHAIN_ACCOUNT } from './keychain';
 import { listStashes, recordStash, removeStash, updateStash, type UnclaimedIndexEntry, type UnclaimedIndexWriteOptions } from './unclaimed-index';
@@ -616,6 +618,8 @@ export interface ClaudeSlotsOptions {
   isPendingWriterAlive?: (pid: number) => boolean;
   /** Test seam invoked after the durable index reservation, before body storage. */
   afterStashReservation?: () => void | Promise<void>;
+  /** Serializes externally-visible slot writers with the consume gate. */
+  withSwitchLock?: <T>(fn: () => Promise<T>) => Promise<T>;
 }
 
 export interface ReadSlotOptions {
@@ -627,7 +631,10 @@ export interface ReadSlotOptions {
 
 export interface ReadClaudeSlot {
   credential: string;
+  /** Refresh-token lineage identity; never use this as a byte-level CAS. */
   fingerprint: string;
+  /** SHA-256 over the complete stored credential bytes, for CAS only. */
+  contentFingerprint: string;
 }
 
 type CachedSlot = ReadClaudeSlot & { expiresAt: number; generation: number };
@@ -661,6 +668,10 @@ function assertExistingId(value: string, kind: string): void {
 function assertSlotId(value: string): void {
   // `:prev` and `unclaimed:` are storage namespaces, never slot identifiers.
   if (!value || /[\0/\\:]/.test(value)) throw new Error('invalid slot id');
+}
+
+function credentialContentFingerprint(credential: string): string {
+  return `sha256-full:${createHash('sha256').update(credential, 'utf8').digest('hex')}`;
 }
 
 function parseUnclaimed(text: string): UnclaimedRecord {
@@ -699,6 +710,7 @@ export class ClaudeSlots {
   private readonly platform: NodeJS.Platform;
   private readonly directorySync: ((path: string) => Promise<void>) | undefined;
   private readonly warn: (message: string) => void;
+  private readonly switchLock: <T>(fn: () => Promise<T>) => Promise<T>;
   private readonly cache = new Map<string, CachedSlot>();
   private readonly slotWrites = new Map<string, Promise<void>>();
   private cacheEpoch = 0;
@@ -711,6 +723,7 @@ export class ClaudeSlots {
     this.platform = options.platform ?? process.platform;
     this.directorySync = options.directorySync;
     this.warn = options.warn ?? console.warn;
+    this.switchLock = options.withSwitchLock ?? ((fn) => withClaudeSwitchLock(fn));
   }
 
   listSlots(): ClaudeSlot[] {
@@ -754,7 +767,7 @@ export class ClaudeSlots {
     const generation = this.options.repository.currentGeneration();
     const cached = this.cache.get(accountId);
     if (cachedRead && cached && cached.expiresAt > now && cached.generation === generation) {
-      return { credential: cached.credential, fingerprint: cached.fingerprint };
+      return { credential: cached.credential, fingerprint: cached.fingerprint, contentFingerprint: cached.contentFingerprint };
     }
 
     const epoch = this.cacheEpoch;
@@ -762,7 +775,9 @@ export class ClaudeSlots {
       () => this.backend.get(this.slotService(accountId), QLB_KEYCHAIN_ACCOUNT),
       !cachedRead,
     );
-    const result: ReadClaudeSlot = { credential, fingerprint: this.fingerprint(credential) };
+    const result: ReadClaudeSlot = {
+      credential, fingerprint: this.fingerprint(credential), contentFingerprint: credentialContentFingerprint(credential),
+    };
     if (cachedRead && epoch === this.cacheEpoch && generation === this.options.repository.currentGeneration()) {
       this.cache.set(accountId, { ...result, expiresAt: now + DISPLAY_CACHE_TTL_MS, generation });
     }
@@ -819,7 +834,7 @@ export class ClaudeSlots {
     replace: boolean;
   }): Promise<ClaudeAddEffectsResult> {
     assertSlotId(input.accountId);
-    return this.withSlotWrite(input.accountId, () => this.options.repository.withWriteTransaction(async (onRollback) => {
+    return this.switchLock(() => this.withSlotWrite(input.accountId, () => this.options.repository.withWriteTransaction(async (onRollback) => {
       this.options.repository.assertAddAdmitted();
       const existing = this.options.repository.getSlot(input.accountId);
       if (input.replace ? !existing : Boolean(existing && existing.archivedAt == null)) {
@@ -852,7 +867,7 @@ export class ClaudeSlots {
       });
       this.invalidateCache();
       return result;
-    }));
+    })));
   }
 
   async deleteSlot(accountId: string): Promise<void> {
@@ -1040,7 +1055,11 @@ export class ClaudeSlots {
             continue;
           }
           await this.writeSlotUnlocked(accountId, record.credential, { cause: 'stash-adopt', evidence: 'lineage' }, onRollback);
-          adopted = { credential: record.credential, fingerprint: this.fingerprint(record.credential) };
+          adopted = {
+            credential: record.credential,
+            fingerprint: this.fingerprint(record.credential),
+            contentFingerprint: credentialContentFingerprint(record.credential),
+          };
           adoptedEntry = entry;
           break;
         }
@@ -1062,7 +1081,7 @@ export class ClaudeSlots {
   async restoreUnclaimed(timestamp: string, accountId: string): Promise<RestoreUnclaimedResult> {
     this.assertExistingTimestamp(timestamp);
     assertSlotId(accountId);
-    return this.withSlotWrite(accountId, async () => {
+    return this.switchLock(async () => this.withSlotWrite(accountId, async () => {
       await this.options.repository.withWriteTransaction(async (onRollback) => {
         const record = await this.readUnclaimed(timestamp);
         if (record.accountId != null && record.accountId !== accountId) {
@@ -1086,7 +1105,7 @@ export class ClaudeSlots {
         // The restore is durable, but callers must disclose the retained copy.
         return { cleanupPending: true };
       }
-    });
+    }));
   }
 
   private async unclaimedEntries(): Promise<UnclaimedIndexEntry[]> {
