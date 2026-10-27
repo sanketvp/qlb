@@ -239,6 +239,40 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     }
   });
 
+  it('T-CG commit journals commitGeneration before the owner write', async () => {
+    const h = setup('xai');
+    try {
+      const id = expectedId('xai');
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      assert.equal(h.store.casGrantGeneration(id, 0, 7), 1);
+      const originalUpsertMigration = h.store.upsertMigration.bind(h.store);
+      let journaledBeforeClaim = false;
+      h.store.upsertMigration = (store, state, detail) => {
+        const recorded = JSON.parse(detail ?? '{}') as { commitGeneration?: number };
+        if (store === 'pi-xai' && state === 'VALIDATED' && recorded.commitGeneration === 7) {
+          assert.equal(existsSync(h.ownerPath), false, 'the claim does not precede its baseline journal');
+          journaledBeforeClaim = true;
+        }
+        return originalUpsertMigration(store, state, detail);
+      };
+
+      h.mig.commit();
+
+      assert.equal(journaledBeforeClaim, true);
+      const committed = h.store.getMigration('pi-xai');
+      assert.equal(committed?.state, 'QLB_OWNED');
+      assert.equal(
+        JSON.parse(committed!.detail_json).commitGeneration,
+        7,
+        'the pre-claim journal records the store generation used as the commit baseline',
+      );
+      assert.equal(existsSync(h.ownerPath), true, 'the owner claim is written after the baseline journal');
+    } finally {
+      h.cleanup();
+    }
+  });
+
   it('rollback before commit: auth.json untouched; staged Keychain entries cleaned up', async () => {
     const h = setup('xai');
     try {

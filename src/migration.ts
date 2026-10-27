@@ -1111,6 +1111,16 @@ export class Migration {
       return this.finishHygiene();
     }
 
+    if (this.kind === 'single-grant') {
+      const account = Array.isArray(current.detail.accounts) ? current.detail.accounts[0] : null;
+      const id = isObjectRecord(account) && typeof account.id === 'string' ? account.id : null;
+      const generation = id ? this.store.getGrantGeneration(id) : null;
+      if (generation === null) throw new Error('single-grant commit has no account generation');
+      // Persist the baseline before the commit rename. A crash after the
+      // rename can therefore never reinterpret a re-staged grant as a refresh.
+      this.journal(current.state, { commitGeneration: generation });
+    }
+
     if (this.kind === 'pool') {
       // The map can have appeared after stage(). Hold the same lock as every
       // v2 writer from the final P7b8 boundary check through the v1 rename.
