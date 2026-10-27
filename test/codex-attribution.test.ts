@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -9,7 +9,7 @@ import importActiveCommand, {
   runCodexImportActiveCommand,
   type CodexImportActiveCommandDeps,
 } from '../src/commands/codex-import-active';
-import { withCodexAuthLock } from '../src/cc-locks';
+import { codexAuthLockDir, CodexAuthLockCompromised, withCodexAuthLock } from '../src/cc-locks';
 import { attributeLiveDocument } from '../src/codex-attribution';
 import { codexFingerprint, parseCodexAuth } from '../src/codex-auth';
 import { importActiveCodexSlot } from '../src/codex-slots';
@@ -502,6 +502,52 @@ describe('Codex live-document attribution (AC57)', () => {
     }
   });
 
+  it('a holder whose Codex auth lock was taken over aborts before writing', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-codex-import-compromised-home-'));
+    const codexHome = mkdtempSync(join(tmpdir(), 'qlb-codex-import-compromised-auth-'));
+    const originalPlatformKeychain = keychainModule.platformKeychain;
+    try {
+      const keychain = new MockKeychain();
+      (keychainModule as unknown as { platformKeychain: MockKeychain }).platformKeychain = keychain;
+      const output: string[] = [];
+      const ctx = commandContext(home, codexHome, output);
+      const old = document('compromised-old');
+      const newer = document('compromised-newer');
+      writeFileSync(join(codexHome, 'auth.json'), JSON.stringify(old), { mode: 0o600 });
+      const admitted = openStore(join(home, 'qlb.db'));
+      beginCutover(admitted, 1);
+      const plan = importActiveCodexSlot(old, { store: admitted, keychain, now: () => 1 });
+      importActiveCodexSlot(newer, { store: admitted, keychain, now: () => 2 });
+      admitted.close();
+
+      let writes = 0;
+      await assert.rejects(
+        runCodexImportActiveCommand([], ctx, {
+          withAuthLock: withCodexAuthLock,
+          readAuth: async () => {
+            // Model a stale-lock successor replacing the directory after the
+            // holder's read but before its only auth.json publication.
+            const lock = codexAuthLockDir({ home });
+            rmSync(lock, { recursive: true });
+            mkdirSync(lock);
+            return { status: 'ok', doc: old };
+          },
+          writeAuth: async () => { writes += 1; return 1; },
+        }),
+        (error: unknown) => error instanceof CodexAuthLockCompromised && error.retryable,
+      );
+      assert.equal(writes, 0);
+      const slot = openStore(join(home, 'qlb.db'));
+      try {
+        assert.equal(slot.getCodexSlot(plan.slotId)?.fingerprint, codexFingerprint(newer));
+      } finally { slot.close(); }
+    } finally {
+      (keychainModule as unknown as { platformKeychain: typeof originalPlatformKeychain }).platformKeychain = originalPlatformKeychain;
+      rmSync(home, { recursive: true, force: true });
+      rmSync(codexHome, { recursive: true, force: true });
+    }
+  });
+
   it('serializes a second import after re-validation until repaired-slot publication completes', async () => {
     const home = mkdtempSync(join(tmpdir(), 'qlb-codex-import-lock-home-'));
     const codexHome = mkdtempSync(join(tmpdir(), 'qlb-codex-import-lock-auth-'));
@@ -536,7 +582,7 @@ describe('Codex live-document attribution (AC57)', () => {
 
       const withAuthLock: CodexImportActiveCommandDeps['withAuthLock'] = async <T,>(
         options: import('../src/cc-locks').CodexAuthLockOptions,
-        fn: () => Promise<T> | T,
+        fn: (held: import('../src/cc-locks').HeldCodexAuthLock) => Promise<T> | T,
       ): Promise<T> => withCodexAuthLock({ ...options, retryMinMs: 1, retryJitterMs: 0 }, fn);
       let reads = 0;
       let republished = false;

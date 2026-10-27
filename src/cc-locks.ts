@@ -28,6 +28,12 @@ const RETRY_JITTER_MS = 250;
 export const TAKEOVER_SUFFIX = '.takeover';
 /** A stale takeover directory is abandoned after this long. */
 export const TAKEOVER_STALENESS_MS = 5_000;
+/**
+ * Codex publishes after synchronous Keychain/SQLite work, which can block the
+ * Node mtime toucher. Give an interactive holder substantially longer than the
+ * ordinary credential lease before another QLB process may take it over.
+ */
+export const CODEX_AUTH_STALENESS_MS = 5 * CREDENTIALS_STALENESS_MS;
 
 export class ClaudeCodeLockTimeout extends Error {
   constructor(lockDir: string) {
@@ -100,6 +106,8 @@ export function assertClaudeConfigLockHeld(
  * re-running the legacy selection heuristic.
  */
 export interface ClaudeLockOptions {
+  /** Called once when this holder discovers its lock directory was replaced. */
+  onCompromised?: (error: ProperLockfileCompromised) => void;
   home?: string;
   configDir?: string;
   configPath?: string;
@@ -227,6 +235,36 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+export class ProperLockfileCompromised extends Error {
+  readonly code = 'proper-lockfile-compromised';
+  readonly retryable = true;
+
+  constructor(lockDir: string) {
+    super(`Lock ownership was lost: ${lockDir}. Retry the operation.`);
+    this.name = 'ProperLockfileCompromised';
+  }
+}
+
+/** Capability passed to holders that opt into compromise detection. */
+export interface HeldProperLockfile {
+  /** Throws a typed retryable error unless this invocation still owns the directory. */
+  assertNotCompromised(): void;
+}
+
+interface LockIdentity {
+  dev: number;
+  ino: number;
+}
+
+function lockIdentity(lockDir: string): LockIdentity {
+  const held = statSync(lockDir);
+  return { dev: held.dev, ino: held.ino };
+}
+
+function sameLockIdentity(left: LockIdentity, right: LockIdentity): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
 async function bestEffortRelease(lockDir: string): Promise<void> {
   try {
     await rmdir(lockDir);
@@ -304,7 +342,7 @@ async function removeIfStillStale(lockDir: string, stalenessMs: number): Promise
 export async function withProperLockfile<T>(
   lockDir: string,
   options: ClaudeLockOptions = {},
-  fn: () => Promise<T> | T,
+  fn: (held: HeldProperLockfile) => Promise<T> | T,
 ): Promise<T> {
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const stalenessMs = options.stalenessMs ?? CONFIG_STALENESS_MS;
@@ -344,24 +382,69 @@ export async function withProperLockfile<T>(
     await sleep(retryMinMs + Math.random() * retryJitterMs);
   }
 
+  const acquiredIdentity = lockIdentity(lockDir);
+  let compromised: ProperLockfileCompromised | undefined;
+  const markCompromised = (): ProperLockfileCompromised => {
+    if (!compromised) {
+      compromised = new ProperLockfileCompromised(lockDir);
+      try { options.onCompromised?.(compromised); } catch { /* the holder still fails closed */ }
+    }
+    return compromised;
+  };
+  const held: HeldProperLockfile = {
+    assertNotCompromised: () => {
+      if (compromised) throw compromised;
+      try {
+        if (!sameLockIdentity(acquiredIdentity, lockIdentity(lockDir))) throw markCompromised();
+      } catch (error) {
+        if (error instanceof ProperLockfileCompromised) throw error;
+        throw markCompromised();
+      }
+    },
+  };
+
   let touchInFlight: Promise<void> | undefined;
   const timer = setInterval(() => {
     if (touchInFlight) return;
     touchInFlight = utimes(lockDir, new Date(), new Date()).catch(() => {
       // Match claude_locks.py:174-179: a removed/stolen lock ends this touch loop permanently.
+      markCompromised();
       clearInterval(timer);
     }).finally(() => { touchInFlight = undefined; });
   }, touchIntervalMs);
   timer.unref();
 
   try {
-    return await fn();
+    return await fn(held);
   } finally {
     clearInterval(timer);
     // Like claude_locks.py:186-195, wait for the toucher then release by pathname.
     await touchInFlight;
-    await releaseHeldLock(lockDir);
+    // Existing Claude-compatible callers retain upstream pathname release. QLB
+    // callers that opt into onCompromised must never remove a successor's lock.
+    if (options.onCompromised) {
+      try { held.assertNotCompromised(); } catch { /* a successor owns this path */ }
+      if (!compromised) await releaseHeldLock(lockDir);
+    } else {
+      await releaseHeldLock(lockDir);
+    }
   }
+}
+
+export class CodexAuthLockCompromised extends Error {
+  readonly code = 'codex-auth-lock-compromised';
+  readonly retryable = true;
+
+  constructor() {
+    super('Codex auth lock ownership was lost. Retry the operation.');
+    this.name = 'CodexAuthLockCompromised';
+  }
+}
+
+/** Capability valid only during a withCodexAuthLock callback. */
+export interface HeldCodexAuthLock {
+  /** Check immediately before a Codex auth publication or related slot write. */
+  assertNotCompromised(): void;
 }
 
 /**
@@ -371,19 +454,35 @@ export async function withProperLockfile<T>(
  * command boundary and pass it through all read/decision/publication work,
  * rather than acquiring it again in writeCodexAuthAtomic(). It lives in QLB
  * state, never alongside Codex's own auth.json, and uses the same bounded
- * proper-lockfile protocol as the Claude locks.
+ * proper-lockfile protocol as the Claude locks. Lock order is Codex auth lock
+ * → any SQLite transaction / Keychain rotation; it is non-reentrant.
  */
 export async function withCodexAuthLock<T>(
   options: CodexAuthLockOptions = {},
-  fn: () => Promise<T> | T,
+  fn: (held: HeldCodexAuthLock) => Promise<T> | T,
 ): Promise<T> {
+  let compromised: CodexAuthLockCompromised | undefined;
+  const failClosed = (): CodexAuthLockCompromised => {
+    compromised ??= new CodexAuthLockCompromised();
+    return compromised;
+  };
   return withProperLockfile(codexAuthLockDir(options), {
     timeoutMs: options.timeoutMs,
-    stalenessMs: options.stalenessMs ?? CREDENTIALS_STALENESS_MS,
+    stalenessMs: options.stalenessMs ?? CODEX_AUTH_STALENESS_MS,
     touchIntervalMs: options.touchIntervalMs,
     retryMinMs: options.retryMinMs,
     retryJitterMs: options.retryJitterMs,
-  }, fn);
+    onCompromised: () => { failClosed(); },
+  }, (properLock) => fn({
+    assertNotCompromised: () => {
+      if (compromised) throw compromised;
+      try {
+        properLock.assertNotCompromised();
+      } catch {
+        throw failClosed();
+      }
+    },
+  }));
 }
 
 /**

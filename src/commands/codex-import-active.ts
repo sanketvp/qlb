@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { withCodexAuthLock, type CodexAuthLockOptions } from '../cc-locks';
+import { withCodexAuthLock, type CodexAuthLockOptions, type HeldCodexAuthLock } from '../cc-locks';
 import { attributeLiveDocument } from '../codex-attribution';
 import { importActiveCodexSlot, planImportActiveCodex } from '../codex-slots';
 import { parseCodexAuth, readCodexAuthStable, writeCodexAuthAtomic } from '../codex-auth';
@@ -35,7 +35,7 @@ function piBaseline(path: string): unknown {
 export interface CodexImportActiveCommandDeps {
   readAuth: typeof readCodexAuthStable;
   writeAuth: typeof writeCodexAuthAtomic;
-  withAuthLock: <T>(options: CodexAuthLockOptions, fn: () => Promise<T> | T) => Promise<T>;
+  withAuthLock: <T>(options: CodexAuthLockOptions, fn: (held: HeldCodexAuthLock) => Promise<T> | T) => Promise<T>;
 }
 
 const defaultDeps: CodexImportActiveCommandDeps = {
@@ -71,7 +71,7 @@ export async function runCodexImportActiveCommand(
   // Keep the live read through active-login marking in one QLB-owned critical
   // section. In particular, the lock remains held after SQLite's re-validation
   // commit while attributeLiveDocument republishes a repaired slot.
-  return deps.withAuthLock({ home: ctx.home, env: ctx.env }, async () => {
+  return deps.withAuthLock({ home: ctx.home, env: ctx.env }, async (held) => {
     const active = await deps.readAuth(path);
     if (active.status !== 'ok') {
       ctx.stderr(`codex import-active refused: auth.json ${active.status}`);
@@ -114,7 +114,12 @@ export async function runCodexImportActiveCommand(
         slot: { accountId: ownSlot.accountId, document: stored.doc, fingerprint: ownSlot.fingerprint ?? undefined },
         activeSlotId: activeSlotId != null && store.getCodexSlot(activeSlotId) ? activeSlotId : undefined,
         live: active.doc,
-        republish: (document) => deps.writeAuth(path, document).then(() => undefined),
+        republish: (document) => {
+          // Keychain/SQLite work can block the event loop long enough for a
+          // stale takeover. Do not recreate auth.json after losing this lease.
+          held.assertNotCompromised();
+          return deps.writeAuth(path, document).then(() => undefined);
+        },
       });
       if (attribution.action === 'slot-split' || attribution.disposition === 'slot-split') {
         ctx.stderr('codex import-active refused: slot-split');
