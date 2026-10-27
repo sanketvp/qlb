@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import type { execFileSync as ExecFileSync } from 'node:child_process';
 import test from 'node:test';
 
-import { CswapProcessCheckError, listCswapProcesses } from '../src/cswap-processes';
+import { CswapProcessCheckError, listCswapProcesses, listCswapProcessesToSignal } from '../src/cswap-processes';
 
 const childProcess = require('node:child_process') as { execFileSync: typeof ExecFileSync };
 const supportedPlatform: NodeJS.Platform = 'darwin';
@@ -121,6 +121,33 @@ test('uses a large buffer and unlimited-width ps output on Linux', () => {
   assert.deepEqual(invocation?.args, ['-ww', '-ax', '-o', 'pid=,args=']);
   assert.equal(invocation?.file, '/bin/ps');
   assert.equal((invocation?.options as { maxBuffer?: number }).maxBuffer, 64 * 1024 * 1024);
+});
+
+test('strict signal lister accepts only positively identified C-swap processes', () => {
+  const processes = listCswapProcessesToSignal({
+    platform: supportedPlatform,
+    runPs: () => [
+      ' 101 /usr/local/bin/cswap',
+      ' 102 claude-swap --daemon',
+      ' 103 python3 /opt/claude-swap/bin/cswap',
+      ' 104 python3 -m claude_swap.daemon',
+      ' 201 python3 worker.py /tmp/cswap',
+      ' 202 vim /tmp/cswap',
+      ' 203 tail -f ~/cswap',
+      ' 204 python3 -u worker.py cswap',
+      ' 205 /opt/claude-swap/bin/python /srv/unrelated.py',
+      ' 206 /opt/claude-swap/bin/worker',
+    ].join('\n'),
+  });
+
+  assert.deepEqual(processes, [{ pid: 101 }, { pid: 102 }, { pid: 103 }, { pid: 104 }]);
+});
+
+test('strict signal lister throws CswapProcessCheckError when ps returns an empty table', () => {
+  assert.throws(
+    () => listCswapProcessesToSignal({ platform: supportedPlatform, runPs: () => '' }),
+    CswapProcessCheckError,
+  );
 });
 
 test('throws CswapProcessCheckError on unsupported platforms', () => {

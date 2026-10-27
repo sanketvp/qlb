@@ -9,10 +9,15 @@ import {
   ClaudeSlots,
   InMemoryClaudeSlotRepository,
   SqliteClaudeSlotRepository,
+  type ClaudeSlot,
   type ClaudeSlotBackend,
+  type ClaudeSlotRepository,
+  type LineageAppend,
 } from '../src/cc-slots';
 import { KeychainBackedOff, KeychainReadBackoff, MockKeychain } from '../src/keychain';
 import { credentialFingerprint } from '../src/anthropic-oauth';
+import { listReloginEvents } from '../src/relogin';
+import { reloginDetailFingerprint } from '../src/relogin-fields';
 import { beginCutover } from '../src/lifecycle';
 import { openStore } from '../src/store';
 
@@ -363,5 +368,242 @@ describe('Claude slots (K2)', () => {
     const { slots } = fixture();
     await assert.rejects(slots.createSlot({ accountId: 'a:prev', credential: credential('one'), source: 'cswap-import' }), /invalid slot id/);
     await assert.rejects(slots.createSlot({ accountId: 'unclaimed:x', credential: credential('one'), source: 'cswap-import' }), /invalid slot id/);
+  });
+
+  describe('K6-1 strike and heal semantics', () => {
+    type RepositoryFixture = {
+      repository: ClaudeSlotRepository;
+      relogins(): Array<{ kind: string; detail?: string | null; evidence?: string | null }>;
+      close(): void;
+    };
+
+    const repositories: Array<[string, () => RepositoryFixture]> = [
+      ['in-memory', () => {
+        const repository = new InMemoryClaudeSlotRepository();
+        return {
+          repository,
+          relogins: () => repository.relogins.map(({ kind, detail, evidence }) => ({ kind, detail, evidence })),
+          close: () => {},
+        };
+      }],
+      ['SQLite', () => {
+        const root = mkdtempSync(join(tmpdir(), 'qlb-cc-slot-strike-'));
+        const dbPath = join(root, 'qlb.db');
+        const store = openStore(dbPath);
+        store.close();
+        const repository = SqliteClaudeSlotRepository.open(dbPath);
+        return {
+          repository,
+          relogins: () => listReloginEvents(dbPath).map(({ kind, detail, evidence }) => ({ kind, detail, evidence })),
+          close: () => repository.close(),
+        };
+      }],
+    ];
+
+    function fingerprint(tag: string): string {
+      const value = credentialFingerprint(credential(tag));
+      assert.ok(value);
+      return value;
+    }
+
+    function slot(accountId: string, fingerprint: string): ClaudeSlot {
+      return {
+        accountId, fingerprint, prevFingerprint: null, dead: false, addedAt: 1_000,
+      };
+    }
+
+    function lineage(accountId: string, fromFp: string, toFp: string, ts = 2_000): LineageAppend {
+      return { ts, provider: 'anthropic', accountId, fromFp, toFp, cause: 'post', by: 'qlb-gate', evidence: 'post' };
+    }
+
+    for (const [name, createRepository] of repositories) {
+      it(`${name}: strikeDead writes dead=1 and exactly one dead row whose detail is the struck lineage fingerprint`, () => {
+        const fixture = createRepository();
+        const struckFp = fingerprint('struck');
+        try {
+          fixture.repository.createSlot(slot('account-a', struckFp));
+          assert.equal(fixture.repository.strikeDead('account-a', {
+            reason: 'invalid_grant', struckFp, ts: 1_500,
+          }), 'struck');
+          const stored = fixture.repository.getSlot('account-a');
+          assert.equal(stored?.fingerprint, struckFp);
+          assert.equal(stored?.dead, true);
+          assert.equal(stored?.deadReason, 'invalid_grant');
+          assert.equal(stored?.deadAt, 1_500);
+          assert.deepEqual(fixture.relogins(), [{
+            kind: 'dead', detail: reloginDetailFingerprint(struckFp), evidence: 'dead',
+          }]);
+        } finally { fixture.close(); }
+      });
+
+      it(`${name}: strikeDead on an already-dead slot writes nothing`, () => {
+        const fixture = createRepository();
+        const struckFp = fingerprint('struck');
+        try {
+          fixture.repository.createSlot(slot('account-a', struckFp));
+          fixture.repository.strikeDead('account-a', { reason: 'invalid_grant', struckFp, ts: 1_500 });
+          const before = fixture.repository.getSlot('account-a');
+          const relogins = fixture.relogins();
+          const generation = fixture.repository.currentGeneration();
+
+          assert.equal(fixture.repository.strikeDead('account-a', {
+            reason: 'no_refresh_token', struckFp, ts: 2_000,
+          }), 'already-dead');
+          assert.deepEqual(fixture.repository.getSlot('account-a'), before);
+          assert.deepEqual(fixture.relogins(), relogins);
+          assert.equal(fixture.repository.currentGeneration(), generation);
+        } finally { fixture.close(); }
+      });
+
+      it(`${name}: strikeDead whose struck lineage is no longer the slot's writes nothing and returns lineage-moved`, () => {
+        const fixture = createRepository();
+        const struckFp = fingerprint('struck');
+        const successorFp = fingerprint('successor');
+        try {
+          fixture.repository.createSlot(slot('account-a', struckFp));
+          fixture.repository.updateCredentialWithLineage('account-a', struckFp, successorFp, struckFp,
+            lineage('account-a', struckFp, successorFp));
+          const before = fixture.repository.getSlot('account-a');
+          const relogins = fixture.relogins();
+
+          assert.equal(fixture.repository.strikeDead('account-a', {
+            reason: 'invalid_grant', struckFp, ts: 3_000,
+          }), 'lineage-moved');
+          assert.deepEqual(fixture.repository.getSlot('account-a'), before);
+          assert.deepEqual(fixture.relogins(), relogins);
+        } finally { fixture.close(); }
+      });
+
+      it(`${name}: a same-lineage write to a dead slot leaves dead=1 and writes no row`, () => {
+        const fixture = createRepository();
+        const struckFp = fingerprint('struck');
+        try {
+          fixture.repository.createSlot(slot('account-a', struckFp));
+          fixture.repository.strikeDead('account-a', { reason: 'invalid_grant', struckFp, ts: 1_500 });
+          const relogins = fixture.relogins();
+          fixture.repository.updateCredentialWithLineage('account-a', struckFp, struckFp, null, null);
+
+          assert.equal(fixture.repository.getSlot('account-a')?.dead, true);
+          assert.equal(fixture.repository.getSlot('account-a')?.deadReason, 'invalid_grant');
+          assert.deepEqual(fixture.relogins(), relogins);
+        } finally { fixture.close(); }
+      });
+
+      it(`${name}: a lineage-changing write to a dead slot heals and writes one healed row`, () => {
+        const fixture = createRepository();
+        const struckFp = fingerprint('struck');
+        const successorFp = fingerprint('successor');
+        try {
+          fixture.repository.createSlot(slot('account-a', struckFp));
+          fixture.repository.strikeDead('account-a', { reason: 'invalid_grant', struckFp, ts: 1_500 });
+          fixture.repository.updateCredentialWithLineage('account-a', struckFp, successorFp, struckFp,
+            lineage('account-a', struckFp, successorFp, 2_000));
+
+          assert.equal(fixture.repository.getSlot('account-a')?.dead, false);
+          assert.equal(fixture.repository.getSlot('account-a')?.deadReason, null);
+          assert.equal(fixture.repository.getSlot('account-a')?.healedAt, 2_000);
+          assert.deepEqual(fixture.relogins().map(({ kind, detail, evidence }) => ({ kind, detail, evidence })), [
+            { kind: 'dead', detail: reloginDetailFingerprint(struckFp), evidence: 'dead' },
+            { kind: 'healed', detail: reloginDetailFingerprint(successorFp), evidence: null },
+          ]);
+        } finally { fixture.close(); }
+      });
+
+      it(`${name}: a lineage-changing write to a live slot writes no relogin row`, () => {
+        const fixture = createRepository();
+        const firstFp = fingerprint('first');
+        const successorFp = fingerprint('successor');
+        try {
+          fixture.repository.createSlot(slot('account-a', firstFp));
+          fixture.repository.updateCredentialWithLineage('account-a', firstFp, successorFp, firstFp,
+            lineage('account-a', firstFp, successorFp));
+          assert.deepEqual(fixture.relogins(), []);
+        } finally { fixture.close(); }
+      });
+    }
+
+    it('the one-argument in-memory markDead fixture still writes no relogin row', () => {
+      const repository = new InMemoryClaudeSlotRepository();
+      const struckFp = fingerprint('fixture');
+      repository.createSlot(slot('account-a', struckFp));
+      repository.markDead('account-a');
+      assert.equal(repository.getSlot('account-a')?.dead, true);
+      assert.deepEqual(repository.relogins, []);
+    });
+
+    it('exposes getSlot and strikeDead through ClaudeSlots', async () => {
+      const { slots, repo } = fixture();
+      await slots.createSlot({ accountId: 'account-a', credential: credential('one'), source: 'cswap-import' });
+      const current = slots.getSlot('account-a')!;
+      assert.equal(await slots.strikeDead('account-a', {
+        reason: 'invalid_grant', struckFp: current.fingerprint!, ts: 2_000,
+      }), 'struck');
+      assert.equal(slots.getSlot('account-a')?.dead, true);
+    });
+
+    it('a strike while another write transaction is open waits and commits on its own', async () => {
+      const root = mkdtempSync(join(tmpdir(), 'qlb-cc-slot-strike-queue-'));
+      const dbPath = join(root, 'qlb.db');
+      const store = openStore(dbPath);
+      store.close();
+      const repository = SqliteClaudeSlotRepository.open(dbPath);
+      const slots = new ClaudeSlots({ repository, stashDir: join(root, 'unclaimed') });
+      const struckFp = fingerprint('queued');
+      repository.createSlot(slot('account-a', struckFp));
+      let releaseOuter!: () => void;
+      const outerRelease = new Promise<void>((resolve) => { releaseOuter = resolve; });
+      let started!: () => void;
+      const outerStarted = new Promise<void>((resolve) => { started = resolve; });
+      const outer = repository.withWriteTransaction(async () => {
+        started();
+        await outerRelease;
+        throw new Error('fixture outer rollback');
+      });
+      await outerStarted;
+
+      let settled = false;
+      const strike = Promise.resolve().then(() => slots.strikeDead('account-a', {
+        reason: 'invalid_grant', struckFp, ts: 1_500,
+      }));
+      void strike.then(() => { settled = true; });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(settled, false);
+
+      releaseOuter();
+      await assert.rejects(outer, /fixture outer rollback/);
+      assert.equal(await strike, 'struck');
+      assert.equal(repository.getSlot('account-a')?.dead, true);
+      assert.deepEqual(listReloginEvents(dbPath).map((row) => row.kind), ['dead']);
+      repository.close();
+    });
+
+    it('strikeDead reports struck only after commit', async () => {
+      const repository: ClaudeSlotRepository = new InMemoryClaudeSlotRepository();
+      let releaseCommit!: () => void;
+      const commit = new Promise<void>((resolve) => { releaseCommit = resolve; });
+      let committed = false;
+      repository.withWriteTransaction = async (fn) => {
+        const result = await fn(() => {});
+        await commit;
+        committed = true;
+        return result;
+      };
+      const slots = new ClaudeSlots({ repository, stashDir: join(mkdtempSync(join(tmpdir(), 'qlb-cc-slots-')), 'unclaimed') });
+      const struckFp = fingerprint('commit');
+      repository.createSlot(slot('account-a', struckFp));
+
+      let settled = false;
+      const strike = Promise.resolve().then(() => slots.strikeDead('account-a', {
+        reason: 'invalid_grant', struckFp, ts: 1_500,
+      }));
+      void strike.then(() => { settled = true; });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(settled, false);
+      assert.equal(committed, false);
+
+      releaseCommit();
+      assert.equal(await strike, 'struck');
+      assert.equal(committed, true);
+    });
   });
 });

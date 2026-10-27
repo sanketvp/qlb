@@ -90,6 +90,11 @@ export interface CswapRetireDependencies {
   /** Must force a Keychain read; it returns only the resulting fingerprint. */
   readSlotFingerprint(accountId: string): Promise<string> | string;
   effects: CswapRetireEffects;
+  /**
+   * Durable archive barrier: sync the completed archive file then its parent
+   * directory before the `archive` checkpoint makes deletion recoverable.
+   */
+  fsyncArchive?(path: string): void;
   /** Test seam for requiring each atomic journal rename to be durable. */
   fsyncJournalDir?(dir: string): void;
   /** Test seam for simulating a crash after an effect and before its checkpoint. */
@@ -477,6 +482,7 @@ export async function retireCswap(store: Store, dependencies: CswapRetireDepende
         } catch {
           return retireRefusal(`retirement-effect-failed:${name}`);
         }
+        if (name === 'archive') dependencies.fsyncArchive?.(journal.archivePath);
         dependencies.afterEffect?.(name);
         journal = checkpoint(dependencies.journalDir, journal, name, dependencies.now(), fsyncJournalDir);
         dependencies.afterCheckpoint?.(name);
