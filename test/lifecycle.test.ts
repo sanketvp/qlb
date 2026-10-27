@@ -251,10 +251,36 @@ describe('lifecycle (AC49)', () => {
     const root = mkdtempSync(join(tmpdir(), 'qlb-retirement-lock-'));
     const lockPath = retirementLockPath(join(root, '.qlb'));
     mkdirSync(`${lockPath}.reclaim`, { recursive: true });
+    const reclaimPath = `${lockPath}.reclaim`;
     await assert.rejects(
       withRetirementMutationLock(lockPath, () => assert.fail('must not run')),
-      (error: unknown) => (error as { code?: unknown }).code === 'retirement-locked',
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'retirement-locked');
+        assert.match(error instanceof Error ? error.message : String(error), new RegExp(reclaimPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+        return true;
+      },
     );
+  });
+
+  it('removes its fresh lock when publishing the owner fails, then permits a later acquire', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-retirement-lock-'));
+    const lockPath = retirementLockPath(join(root, '.qlb'));
+    const ownerWriteError = Object.assign(new Error('injected owner write failure'), { code: 'EIO' });
+    await assert.rejects(
+      withRetirementMutationLock(lockPath, () => assert.fail('must not run'), {
+        fs: { ...testRetirementLockFs, writeOwner: () => { throw ownerWriteError; } },
+        token: () => 'failed-holder',
+      }),
+      (error: unknown) => error === ownerWriteError,
+    );
+    assert.equal(existsSync(lockPath), false, 'the failed owner write must not strand its fresh lock');
+    let acquired = false;
+    await withRetirementMutationLock(lockPath, () => { acquired = true; }, {
+      fs: testRetirementLockFs,
+      token: () => 'next-holder',
+    });
+    assert.equal(acquired, true);
+    assert.equal(existsSync(lockPath), false);
   });
 
   it('leaves a lock whose owner token was replaced while it held it', async () => {

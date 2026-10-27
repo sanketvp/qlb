@@ -246,6 +246,14 @@ export function assertRetirementFenceClear(store: Store): LifecycleResult {
     : { ok: true, row: current };
 }
 
+/** Pi rollback is phase-independent but must wait for either active mutation marker. */
+export function assertPiRollbackFencesClear(store: Store): LifecycleResult {
+  const current = phase(store);
+  return current.note === RETIREMENT_IN_PROGRESS || current.note === CUTOVER_BEGIN_IN_PROGRESS
+    ? { ok: false, code: current.note, row: current }
+    : { ok: true, row: current };
+}
+
 function retirementLocked(lockPath: string): Error & { code: 'retirement-locked' } {
   return Object.assign(new Error(`retirement lock is held or indeterminate: ${lockPath}`), { code: 'retirement-locked' as const });
 }
@@ -310,7 +318,7 @@ export async function withRetirementMutationLock<T>(
   const ours: RetirementLockOwner = { pid: process.pid, token };
   const reclaimPath = `${lockPath}.reclaim`;
   fs.mkdir(dirname(lockPath), { recursive: true, mode: 0o700 });
-  if (fs.exists(reclaimPath)) throw retirementLocked(lockPath);
+  if (fs.exists(reclaimPath)) throw retirementLocked(reclaimPath);
 
   let acquired = false;
   try {
@@ -330,7 +338,7 @@ export async function withRetirementMutationLock<T>(
     try {
       fs.mkdir(reclaimPath, { mode: 0o700 });
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'EEXIST') throw retirementLocked(lockPath);
+      if ((error as NodeJS.ErrnoException).code === 'EEXIST') throw retirementLocked(reclaimPath);
       throw error;
     }
     try {
@@ -355,6 +363,13 @@ export async function withRetirementMutationLock<T>(
 
   try {
     fs.writeOwner(ownerPath(lockPath), ours);
+  } catch (error) {
+    // mkdir succeeded exclusively, so an unpublished owner file cannot belong
+    // to another holder. Preserve the write error even if cleanup also fails.
+    try { fs.remove(lockPath); } catch { /* best-effort cleanup */ }
+    throw error;
+  }
+  try {
     return await fn();
   } finally {
     if (acquired && sameLockOwner(parseRetirementLockOwner(lockPath, fs), ours)) fs.remove(lockPath);

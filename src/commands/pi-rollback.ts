@@ -4,7 +4,7 @@ import { platformKeychain } from '../keychain';
 import { qlbHomeDir } from '../home';
 import { defaultPiMigratePaths, rollbackPiSingleProvider, type PiSingleProvider } from '../pi-migrate';
 import { openStore } from '../store';
-import { assertRetirementFenceClear, retirementLockPath, withRetirementMutationLock } from '../lifecycle';
+import { assertPiRollbackFencesClear, retirementLockPath, withRetirementMutationLock } from '../lifecycle';
 import type { CommandContext, CommandDefinition } from '../registry';
 
 function provider(args: string[]): PiSingleProvider | null {
@@ -30,14 +30,14 @@ export async function executePiRollback(
   }
   const store = openStore(ctx.config.dbPath);
   try {
-    const outerFence = assertRetirementFenceClear(store);
+    const outerFence = assertPiRollbackFencesClear(store);
     if (!outerFence.ok) {
       ctx.stderr(`qlb pi rollback: refused: ${outerFence.code}`);
       return 3;
     }
     dependencies.beforeLock?.();
     return await withRetirementMutationLock(retirementLockPath(join(qlbHomeDir(ctx.env), '.qlb')), async () => {
-      const innerFence = assertRetirementFenceClear(store);
+      const innerFence = assertPiRollbackFencesClear(store);
       if (!innerFence.ok) {
         ctx.stderr(`qlb pi rollback: refused: ${innerFence.code}`);
         return 3;
