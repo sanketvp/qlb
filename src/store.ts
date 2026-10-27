@@ -53,6 +53,48 @@ export interface SlotLineageRow {
   prev_fingerprint: string | null;
 }
 
+/** Public S56 view of a managed Codex slot; credential bytes stay in Keychain. */
+export interface CodexSlotRecord {
+  accountId: string;
+  chatgptUserId: string;
+  chatgptAccountId: string;
+  fingerprint: string | null;
+  prevFingerprint: string | null;
+  dead: boolean;
+}
+
+/** Read-only anthropic slot view used by the Pi pool inventory. */
+export interface AnthropicSlotLineageRow {
+  accountId: string;
+  fingerprint: string | null;
+}
+
+/** Read-only full lineage component for one active Anthropic slot (S46/S61). */
+export interface AnthropicSlotLineageChainRow {
+  accountId: string;
+  lineages: string[];
+}
+
+/** S61's durable undo-export mapping for an anthropic-pool entry. */
+export interface PiExportTargetRow {
+  provider: string;
+  target: string;
+  slotAccountId: string;
+  lineageFp: string;
+  recordedAt: number;
+}
+
+/** Atomic admission/insert result for the add-only Pi export inventory write. */
+export interface PiExportTargetRecordResult {
+  ok: boolean;
+  code?: string;
+}
+
+/** Result of classifying and add-only recording on one immediate transaction. */
+export type PiExportTargetClassifiedRecordResult<T> =
+  | { ok: true; result: T }
+  | { ok: false; code?: string };
+
 /** Credential-migration journal (§4.8.3). One row per native store. */
 export interface MigrationRow {
   store: string;
@@ -597,8 +639,16 @@ function v5TableFacts(db: DatabaseSync, table: string): V5TableFacts {
   const constraintIndexes = indexes
     .filter(({ origin }) => origin === 'u' || origin === 'pk')
     .map(({ name, origin }) => {
-      const columns = db.prepare(`PRAGMA index_info(${quoteIdentifier(name)})`).all() as Array<{ name: string }>;
-      return `${origin}:${columns.map(({ name: column }) => column).join('\0')}`;
+      const columns = db.prepare(`PRAGMA index_xinfo(${quoteIdentifier(name)})`).all() as Array<{
+        name: string | null;
+        key: number;
+        coll: string | null;
+        desc: number;
+      }>;
+      return `${origin}:${columns
+        .filter((column) => column.key === 1)
+        .map((column) => `${column.name ?? '<expression>'}:${column.coll ?? ''}:${column.desc}`)
+        .join('\0')}`;
     });
   const tableList = db.prepare('PRAGMA table_list').all() as Array<{ name: string; strict: number; wr: number }>;
   const options = tableList.find(({ name }) => name === table);
@@ -782,14 +832,65 @@ const PROVIDERLESS_USAGE_POLLS_COLUMNS = new Set([
   'last_status', 'consecutive_failures', 'backoff_until', 'last_429_at', 'held_until',
 ]);
 
+const PROVIDERLESS_USAGE_POLLS_SHAPE: V5TableShape = {
+  columns: requiredV5TableShapes().get('usage_polls')!.columns.filter(({ name }) => name !== 'provider'),
+  sql: `CREATE TABLE usage_polls (
+    account_id TEXT NOT NULL, last_fetch_at INTEGER, last_attempt_at INTEGER, next_due_at INTEGER,
+    poll_interval_s REAL, last_status TEXT, consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    backoff_until INTEGER, last_429_at INTEGER, held_until INTEGER, PRIMARY KEY (account_id)
+  )`,
+};
+
 function assertProviderlessUsagePollsCanBeMigrated(db: DatabaseSync, verifiedBackupPath: string): void {
   if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'usage_polls'").get()
     || hasColumn(db, 'usage_polls', 'provider')) return;
-  const unexpected = tableColumns(db, 'usage_polls').find(({ name }) => !PROVIDERLESS_USAGE_POLLS_COLUMNS.has(name));
-  if (unexpected) {
-    refuseInexactV5Rebuild('usage_polls', `column ${unexpected.name} is not in the canonical definition and cannot be reproduced`, verifiedBackupPath);
+  const actual = v5TableFacts(db, 'usage_polls');
+  const expected = canonicalV5TableFacts(PROVIDERLESS_USAGE_POLLS_SHAPE, 'usage_polls');
+  if (actual.strict !== expected.strict || actual.withoutRowid !== expected.withoutRowid) {
+    refuseInexactV5Rebuild('usage_polls', 'table options differ from the canonical definition', verifiedBackupPath);
   }
-  const schemaObjects = db.prepare(`SELECT type, name FROM sqlite_master
+  const hidden = actual.xinfo.find((column) => column.hidden !== undefined && column.hidden !== 0);
+  if (hidden) {
+    refuseInexactV5Rebuild('usage_polls', `column ${hidden.name} is generated or hidden and cannot be reproduced`, verifiedBackupPath);
+  }
+  const expectedColumns = new Map(expected.xinfo.map((column) => [column.name, column]));
+  for (const column of actual.xinfo) {
+    if (!PROVIDERLESS_USAGE_POLLS_COLUMNS.has(column.name)) {
+      refuseInexactV5Rebuild('usage_polls', `column ${column.name} is not in the canonical definition and cannot be reproduced`, verifiedBackupPath);
+    }
+    const canonical = expectedColumns.get(column.name);
+    if (!canonical) continue;
+    const actualDefault = normalizedDefault(column.dflt_value);
+    const canonicalDefault = normalizedDefault(canonical.dflt_value);
+    if (column.type.trim().toLowerCase() !== canonical.type.trim().toLowerCase()
+      || (Boolean(column.notnull) && !Boolean(canonical.notnull))
+      || (actualDefault !== canonicalDefault && actualDefault !== null)
+      || column.pk !== canonical.pk) {
+      refuseInexactV5Rebuild('usage_polls', `column ${column.name} differs from the canonical definition and cannot be reproduced`, verifiedBackupPath);
+    }
+    if (Boolean(canonical.notnull) && !Boolean(column.notnull)
+      && db.prepare(`SELECT 1 FROM usage_polls WHERE ${quoteIdentifier(column.name)} IS NULL LIMIT 1`).get()) {
+      refuseInexactV5Rebuild('usage_polls', `copied rows violate new constraints (NOT NULL constraint failed: usage_polls_v5.${column.name})`, verifiedBackupPath);
+    }
+  }
+  if (actual.constraintIndexes.join('\0') !== expected.constraintIndexes.join('\0')) {
+    refuseInexactV5Rebuild('usage_polls', 'constraint index differs from the canonical definition and cannot be reproduced', verifiedBackupPath);
+  }
+  if (containsSqlKeyword(actual.sql, 'CHECK') && !containsSqlKeyword(expected.sql, 'CHECK')) {
+    refuseInexactV5Rebuild('usage_polls', 'CHECK differs from the canonical definition and cannot be reproduced', verifiedBackupPath);
+  }
+  const ownForeignKeys = db.prepare('PRAGMA foreign_key_list(usage_polls)').all();
+  if (ownForeignKeys.length !== 0) {
+    refuseInexactV5Rebuild('usage_polls', 'foreign-key definition differs from the canonical definition and cannot be reproduced', verifiedBackupPath);
+  }
+  const otherTables = db.prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND lower(name) <> 'usage_polls' ORDER BY name").all() as Array<{ name: string }>;
+  for (const { name } of otherTables) {
+    const foreignKeys = db.prepare(`PRAGMA foreign_key_list(${quoteIdentifier(name)})`).all() as Array<{ table: string }>;
+    if (foreignKeys.some((foreignKey) => foreignKey.table.toLowerCase() === 'usage_polls')) {
+      refuseInexactV5Rebuild('usage_polls', `foreign key on ${name} references usage_polls and prevents an exact rebuild`, verifiedBackupPath);
+    }
+  }
+  const schemaObjects = db.prepare(`SELECT type, name FROM sqlite_schema
     WHERE tbl_name = ? AND type IN ('index', 'trigger')
       AND (type = 'trigger' OR name NOT LIKE 'sqlite_autoindex_%')
     ORDER BY type, name`).all('usage_polls') as Array<{ type: 'index' | 'trigger'; name: string }>;
@@ -797,21 +898,19 @@ function assertProviderlessUsagePollsCanBeMigrated(db: DatabaseSync, verifiedBac
   if (schemaObject) {
     refuseInexactV5Rebuild('usage_polls', `${schemaObject.type} ${schemaObject.name} cannot be reproduced`, verifiedBackupPath);
   }
-  const actualSql = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'usage_polls'").get() as { sql: string };
-  const canonicalSql = requiredV5TableShapes().get('usage_polls')!.sql;
-  const normalizedActual = normalizedSql(sqlWithoutLiteralsOrComments(actualSql.sql));
-  const normalizedCanonical = normalizedSql(sqlWithoutLiteralsOrComments(canonicalSql));
-  for (const [name, pattern] of [
-    ['CHECK', /\bcheck\b/],
-    ['UNIQUE', /\bunique\b/],
-    ['FOREIGN KEY', /\bforeign\s+key\b/],
-    ['GENERATED', /\bgenerated\b/],
-    ['STRICT', /\bstrict\b/],
-    ['WITHOUT ROWID', /\bwithout\s+rowid\b/],
-  ] as const) {
-    if (pattern.test(normalizedActual) && !pattern.test(normalizedCanonical)) {
-      refuseInexactV5Rebuild('usage_polls', `${name} differs from the canonical definition and cannot be reproduced`, verifiedBackupPath);
-    }
+  const dependents = db.prepare(`SELECT type, name, sql FROM sqlite_schema
+    WHERE type IN ('view', 'trigger') AND sql IS NOT NULL
+    ORDER BY type, name`).all() as Array<{ type: 'view' | 'trigger'; name: string; sql: string }>;
+  const dependent = dependents.find(({ sql }) => sqlReferencesTableIdentifier(sql, 'usage_polls'));
+  if (dependent) {
+    const subject = dependent.type === 'view'
+      ? `view ${dependent.name} references usage_polls`
+      : `trigger ${dependent.name} on another table references usage_polls`;
+    refuseInexactV5Rebuild('usage_polls', `${subject} and prevents an exact rebuild`, verifiedBackupPath);
+  }
+  const nullRow = db.prepare('SELECT 1 FROM usage_polls WHERE consecutive_failures IS NULL LIMIT 1').get();
+  if (nullRow) {
+    refuseInexactV5Rebuild('usage_polls', 'copied rows violate new constraints (NOT NULL constraint failed: usage_polls_v5.consecutive_failures)', verifiedBackupPath);
   }
   const rows = db.prepare('SELECT account_id FROM usage_polls').all() as Array<{ account_id: string }>;
   const providerFor = db.prepare('SELECT provider FROM accounts WHERE id = ?');
@@ -838,7 +937,7 @@ function preflightV5Correction(db: DatabaseSync, verifiedBackupPath: string): vo
     if (plan.requiresRebuild) {
       for (const canonicalColumn of shape.columns) {
         const existingColumn = plan.existing.find(({ name }) => name === canonicalColumn.name);
-        if (!existingColumn || !canonicalColumn.notNull || canonicalColumn.defaultValue !== null || existingColumn.notnull) continue;
+        if (!existingColumn || !canonicalColumn.notNull || existingColumn.notnull) continue;
         const nullRow = db.prepare(`SELECT 1 FROM ${quoteIdentifier(table)} WHERE ${quoteIdentifier(canonicalColumn.name)} IS NULL LIMIT 1`).get();
         if (nullRow) {
           refuseInexactV5Rebuild(
@@ -846,6 +945,28 @@ function preflightV5Correction(db: DatabaseSync, verifiedBackupPath: string): vo
             `copied rows violate new constraints (NOT NULL constraint failed: ${table}__v5new.${canonicalColumn.name})`,
             verifiedBackupPath,
           );
+        }
+      }
+      const constraints = [
+        ...shape.columns.filter(({ unique }) => unique).map(({ name }) => ({ kind: 'UNIQUE', columns: [name] })),
+        ...(shape.columns.some(({ primaryKeyOrder }) => primaryKeyOrder > 0)
+          ? [{
+              kind: 'PRIMARY KEY',
+              columns: shape.columns
+                .filter(({ primaryKeyOrder }) => primaryKeyOrder > 0)
+                .sort((left, right) => left.primaryKeyOrder - right.primaryKeyOrder)
+                .map(({ name }) => name),
+            }]
+          : []),
+      ];
+      for (const { kind, columns } of constraints) {
+        if (!columns.every((column) => plan.existing.some(({ name }) => name === column))) continue;
+        const names = columns.map(quoteIdentifier).join(', ');
+        const nonNull = columns.map((name) => `${quoteIdentifier(name)} IS NOT NULL`).join(' AND ');
+        const duplicate = db.prepare(`SELECT 1 FROM ${quoteIdentifier(table)} WHERE ${nonNull}
+          GROUP BY ${names} HAVING count(*) > 1 LIMIT 1`).get();
+        if (duplicate) {
+          refuseInexactV5Rebuild(table, `duplicate values violate canonical ${kind} constraint on ${columns.join(', ')}`, verifiedBackupPath);
         }
       }
       const newTable = `${table}__v5new`;
@@ -1386,6 +1507,21 @@ export class Store {
     return rows as unknown as AccountRow[];
   }
 
+  /** Current provider-owned login, if an adoption or switch has recorded one. */
+  getActiveLogin(provider: string): { provider: string; accountId: string | null; since: number; setBy: string } | null {
+    const row = this.db.prepare('SELECT provider, account_id, since, set_by FROM active_login WHERE provider = ?').get(provider) as
+      | { provider: string; account_id: string | null; since: number; set_by: string }
+      | undefined;
+    return row ? { provider: row.provider, accountId: row.account_id, since: row.since, setBy: row.set_by } : null;
+  }
+
+  /** Additive active-login upsert used by provider-specific adoption paths. */
+  setActiveLogin(provider: string, accountId: string | null, setBy: string): void {
+    this.db.prepare(`INSERT INTO active_login (provider, account_id, since, set_by) VALUES (?, ?, ?, ?)
+      ON CONFLICT(provider) DO UPDATE SET account_id = excluded.account_id, since = excluded.since, set_by = excluded.set_by`)
+      .run(provider, accountId, Date.now(), setBy);
+  }
+
   upsertSnapshot(accountId: string, bucket: string, reading: BucketReading): void {
     this.upsertSnapStmt.run(
       accountId,
@@ -1682,6 +1818,78 @@ export class Store {
         // BEGIN may have failed, or SQLite already rolled back
       }
       throw err;
+    }
+  }
+
+  /**
+   * Reconcile a Keychain document with the fingerprint authority in
+   * `codex_slots`. The write lock spans every Keychain read, the conditional
+   * write, and the post-write DB verification. If either that verification or
+   * COMMIT fails, compensation runs before ROLLBACK and only restores the
+   * exact bytes written by this repair.
+   */
+  repairCodexSlotKeychain<T>(input: {
+    accountId: string;
+    prepare: (fingerprint: string) => { current: string; replacement: string; value: T } | undefined;
+    writeIfUnchanged: (repair: { current: string; replacement: string; value: T }) => boolean;
+    restore: (repair: { current: string; replacement: string; value: T }) => void;
+  }): { fingerprint: string | null; repaired: boolean; value?: T } {
+    this.db.exec('BEGIN IMMEDIATE');
+    let repair: { current: string; replacement: string; value: T } | undefined;
+    let wrote = false;
+    try {
+      const row = this.db.prepare('SELECT fingerprint FROM codex_slots WHERE account_id = ?')
+        .get(input.accountId) as { fingerprint: string | null } | undefined;
+      if (!row?.fingerprint) {
+        this.db.exec('COMMIT');
+        return { fingerprint: null, repaired: false };
+      }
+      const fingerprint = row.fingerprint;
+      repair = input.prepare(fingerprint);
+      if (!repair) {
+        this.db.exec('COMMIT');
+        return { fingerprint, repaired: false };
+      }
+
+      // Re-check the exact row after choosing the replacement and before its
+      // Keychain write. BEGIN IMMEDIATE prevents a cooperating adopter from
+      // changing it between these reads.
+      const beforeWrite = this.db.prepare('SELECT fingerprint FROM codex_slots WHERE account_id = ?')
+        .get(input.accountId) as { fingerprint: string | null } | undefined;
+      if (beforeWrite?.fingerprint !== fingerprint) {
+        this.db.exec('COMMIT');
+        return { fingerprint: beforeWrite?.fingerprint ?? null, repaired: false };
+      }
+
+      wrote = input.writeIfUnchanged(repair);
+      if (!wrote) {
+        this.db.exec('COMMIT');
+        return { fingerprint, repaired: false };
+      }
+
+      // This also makes a DB/commit failure after the Keychain mutation pass
+      // through the compensating path below.
+      const afterWrite = this.db.prepare('SELECT fingerprint FROM codex_slots WHERE account_id = ?')
+        .get(input.accountId) as { fingerprint: string | null } | undefined;
+      if (afterWrite?.fingerprint !== fingerprint) {
+        throw new Error('Codex slot changed during split repair');
+      }
+      this.db.exec('COMMIT');
+      return { fingerprint, repaired: true, value: repair.value };
+    } catch (error) {
+      if (wrote && repair) {
+        try {
+          input.restore(repair);
+        } catch (restoreError) {
+          if (error && typeof error === 'object') Object.assign(error, { restoreError });
+        }
+      }
+      try {
+        this.db.exec('ROLLBACK');
+      } catch {
+        // BEGIN may have failed, or SQLite already rolled back.
+      }
+      throw error;
     }
   }
 
@@ -1983,6 +2191,137 @@ export class Store {
     return Number(result.lastInsertRowid);
   }
 
+  /** S56 lookup by the composite identity; never exposes a credential document. */
+  getCodexSlot(accountId: string): CodexSlotRecord | null {
+    const row = this.db.prepare(`SELECT account_id, chatgpt_user_id, chatgpt_account_id, fingerprint, prev_fingerprint, dead
+      FROM codex_slots WHERE account_id = ?`).get(accountId) as {
+      account_id: string; chatgpt_user_id: string; chatgpt_account_id: string;
+      fingerprint: string | null; prev_fingerprint: string | null; dead: number;
+    } | undefined;
+    if (!row) return null;
+    return {
+      accountId: row.account_id,
+      chatgptUserId: row.chatgpt_user_id,
+      chatgptAccountId: row.chatgpt_account_id,
+      fingerprint: row.fingerprint,
+      prevFingerprint: row.prev_fingerprint,
+      dead: row.dead !== 0,
+    };
+  }
+
+  /** S56 lookup for a live document whose identity belongs to another managed slot. */
+  getCodexSlotByIdentity(accountId: string): CodexSlotRecord | null {
+    return this.getCodexSlot(accountId);
+  }
+
+  /**
+   * Persist an adopted native Codex successor plus its S46/S65 evidence in
+   * one SQLite transaction. The Keychain caller writes `:prev` before this
+   * method so the durable slot metadata never points beyond the saved copy.
+   */
+  adoptCodexSlot(input: {
+    accountId: string; fingerprint: string; previousFingerprint: string; lastRefresh?: string | null;
+    ts?: number; evidence: 'holder' | 'identity'; reloginEvidence?: 'auth-time' | 'unattributed-rotation' | null;
+  }): void {
+    const ts = input.ts ?? Date.now();
+    this.runImmediate(() => {
+      const updated = this.db.prepare(`UPDATE codex_slots SET fingerprint = ?, prev_fingerprint = ?, last_refresh = ?,
+        dead = 0, dead_reason = NULL, dead_at = NULL, healed_at = CASE WHEN dead != 0 THEN ? ELSE healed_at END,
+        pending_adopt = 0, archived_at = NULL, last_active_at = ?
+        WHERE account_id = ? AND fingerprint = ?`).run(
+        input.fingerprint, input.previousFingerprint, input.lastRefresh ?? null, ts, ts, input.accountId, input.previousFingerprint,
+      );
+      if (updated.changes !== 1) throw new Error('Codex slot changed before adoption');
+      this.db.prepare(`INSERT INTO lineage_log (ts, provider, account_id, from_fp, to_fp, cause, by, evidence)
+        VALUES (?, 'openai-codex', ?, ?, ?, 'adopt', 'tool', ?)`).run(
+        ts, input.accountId, input.previousFingerprint, input.fingerprint, input.evidence,
+      );
+      this.db.prepare(`INSERT INTO active_login (provider, account_id, since, set_by) VALUES ('openai-codex', ?, ?, 'adopt')
+        ON CONFLICT(provider) DO UPDATE SET account_id = excluded.account_id, since = excluded.since, set_by = excluded.set_by`)
+        .run(input.accountId, ts);
+      if (input.reloginEvidence != null) {
+        assertStoredReloginFields(input.reloginEvidence, input.reloginEvidence);
+        this.db.prepare(`INSERT INTO relogin_events (ts, provider, account_id, kind, detail, evidence, user_denied_at)
+          VALUES (?, 'openai-codex', ?, 'external-login', ?, ?, NULL)`)
+          .run(ts, input.accountId, input.reloginEvidence, input.reloginEvidence);
+      }
+    });
+  }
+
+  /**
+   * S56 adoption with the Keychain write held between the metadata CAS and
+   * commit. The caller restores only items it changed if any later step fails.
+   */
+  adoptCodexSlotWithKeychain(input: {
+    accountId: string; fingerprint: string; previousFingerprint: string; lastRefresh?: string | null;
+    ts?: number; evidence: 'holder' | 'identity'; reloginEvidence?: 'auth-time' | 'unattributed-rotation' | null;
+    writeKeychain: () => void; restoreKeychain: () => void;
+  }): void {
+    const ts = input.ts ?? Date.now();
+    this.runImmediate(() => {
+      let keychainWriteStarted = false;
+      try {
+        const updated = this.db.prepare(`UPDATE codex_slots SET fingerprint = ?, prev_fingerprint = ?, last_refresh = ?,
+          dead = 0, dead_reason = NULL, dead_at = NULL, healed_at = CASE WHEN dead != 0 THEN ? ELSE healed_at END,
+          pending_adopt = 0, archived_at = NULL, last_active_at = ?
+          WHERE account_id = ? AND fingerprint = ?`).run(
+          input.fingerprint, input.previousFingerprint, input.lastRefresh ?? null, ts, ts, input.accountId, input.previousFingerprint,
+        );
+        if (updated.changes !== 1) throw new Error('Codex slot changed before adoption');
+        keychainWriteStarted = true;
+        input.writeKeychain();
+        this.db.prepare(`INSERT INTO lineage_log (ts, provider, account_id, from_fp, to_fp, cause, by, evidence)
+          VALUES (?, 'openai-codex', ?, ?, ?, 'adopt', 'tool', ?)`).run(
+          ts, input.accountId, input.previousFingerprint, input.fingerprint, input.evidence,
+        );
+        this.db.prepare(`INSERT INTO active_login (provider, account_id, since, set_by) VALUES ('openai-codex', ?, ?, 'import')
+          ON CONFLICT(provider) DO UPDATE SET account_id = excluded.account_id, since = excluded.since, set_by = excluded.set_by`)
+          .run(input.accountId, ts);
+        if (input.reloginEvidence != null) {
+          assertStoredReloginFields(input.reloginEvidence, input.reloginEvidence);
+          this.db.prepare(`INSERT INTO relogin_events (ts, provider, account_id, kind, detail, evidence, user_denied_at)
+            VALUES (?, 'openai-codex', ?, 'external-login', ?, ?, NULL)`)
+            .run(ts, input.accountId, input.reloginEvidence, input.reloginEvidence);
+        }
+      } catch (error) {
+        if (keychainWriteStarted) {
+          try {
+            // Keep the SQLite write lock until the compensating write has
+            // either restored our bytes or observed a newer adopter's bytes.
+            input.restoreKeychain();
+          } catch (restoreError) {
+            if (error && typeof error === 'object') Object.assign(error, { restoreError });
+          }
+        }
+        throw error;
+      }
+    });
+  }
+
+  /** Mark every successful import-active observation as the live Codex slot. */
+  markCodexSlotImportedActive(accountId: string, ts: number = Date.now()): void {
+    this.runImmediate(() => {
+      this.db.prepare(`UPDATE codex_slots SET pending_adopt = 0, archived_at = NULL, last_active_at = ?
+        WHERE account_id = ?`).run(ts, accountId);
+      this.db.prepare(`INSERT INTO active_login (provider, account_id, since, set_by) VALUES ('openai-codex', ?, ?, 'import')
+        ON CONFLICT(provider) DO UPDATE SET account_id = excluded.account_id, since = excluded.since, set_by = excluded.set_by`)
+        .run(accountId, ts);
+    });
+  }
+
+  /** Return the current Codex slot named by active_login, if there is one. */
+  getCodexActiveLogin(): string | null {
+    const row = this.db.prepare("SELECT account_id FROM active_login WHERE provider = 'openai-codex'").get() as { account_id: string | null } | undefined;
+    return row?.account_id ?? null;
+  }
+
+  /** S56 drift adopts another known identity as the active Codex slot. */
+  setCodexActiveLogin(accountId: string, ts: number = Date.now()): void {
+    this.db.prepare(`INSERT INTO active_login (provider, account_id, since, set_by) VALUES ('openai-codex', ?, ?, 'adopt')
+      ON CONFLICT(provider) DO UPDATE SET account_id = excluded.account_id, since = excluded.since, set_by = excluded.set_by`)
+      .run(accountId, ts);
+  }
+
   recordLineage(row: {
     ts?: number; provider: string; accountId: string; fromFp?: string | null; toFp: string; cause: string; by: string; evidence?: string | null;
   }): number {
@@ -2010,6 +2349,122 @@ export class Store {
     if (!table) return null;
     const row = this.db.prepare(`SELECT fingerprint, prev_fingerprint FROM ${table} WHERE account_id = ?`).get(accountId);
     return (row as SlotLineageRow | undefined) ?? null;
+  }
+
+  // --- P11 pool-inventory additions (S61) ---------------------------------
+
+  listAnthropicSlotLineages(): AnthropicSlotLineageRow[] {
+    return this.db.prepare('SELECT account_id AS accountId, fingerprint FROM claude_slots ORDER BY account_id')
+      .all() as unknown as AnthropicSlotLineageRow[];
+  }
+
+  /**
+   * Return each active slot's connected lineage component.  The graph is
+   * deliberately traversed by recorded edges rather than by hash ordering:
+   * either end may be the persisted current or `:prev` value after adoption.
+   */
+  listAnthropicSlotLineageChains(): AnthropicSlotLineageChainRow[] {
+    const slots = this.db.prepare(`SELECT account_id AS accountId, fingerprint, prev_fingerprint AS prevFingerprint
+      FROM claude_slots WHERE archived_at IS NULL AND dead = 0 ORDER BY account_id`).all() as Array<{
+      accountId: string; fingerprint: string | null; prevFingerprint: string | null;
+    }>;
+    const transitions = this.db.prepare(`SELECT account_id AS accountId, from_fp AS fromFp, to_fp AS toFp
+      FROM lineage_log WHERE provider = 'anthropic' ORDER BY id`).all() as Array<{
+      accountId: string; fromFp: string | null; toFp: string;
+    }>;
+    return slots.map((slot) => {
+      const lineages = new Set<string>();
+      if (slot.fingerprint) lineages.add(slot.fingerprint);
+      if (slot.prevFingerprint) lineages.add(slot.prevFingerprint);
+      let changed = true;
+      while (changed) {
+        changed = false;
+        for (const edge of transitions) {
+          if (edge.accountId !== slot.accountId) continue;
+          if (edge.fromFp && lineages.has(edge.fromFp) && !lineages.has(edge.toFp)) {
+            lineages.add(edge.toFp);
+            changed = true;
+          }
+          if (edge.fromFp && lineages.has(edge.toFp) && !lineages.has(edge.fromFp)) {
+            lineages.add(edge.fromFp);
+            changed = true;
+          }
+        }
+      }
+      return { accountId: slot.accountId, lineages: [...lineages] };
+    });
+  }
+
+  /** Replace one provider's observed export targets as a single write transaction. */
+  replacePiExportTargets(provider: string, targets: PiExportTargetRow[]): void {
+    this.runImmediate(() => {
+      this.db.prepare('DELETE FROM pi_export_targets WHERE provider = ?').run(provider);
+      const insert = this.db.prepare(`INSERT INTO pi_export_targets
+        (provider, target, slot_account_id, lineage_fp, recorded_at) VALUES (?, ?, ?, ?, ?)`);
+      for (const target of targets) {
+        if (target.provider !== provider) throw new Error('pi export target provider mismatch');
+        insert.run(target.provider, target.target, target.slotAccountId, target.lineageFp, target.recordedAt);
+      }
+    });
+  }
+
+  /**
+   * Add an observed target set only when no provider rows exist. The caller's
+   * lifecycle admission runs on this transaction's connection, so neither it
+   * nor the empty-table check can race the durable insert.
+   */
+  recordPiExportTargetsIfEmpty(
+    provider: string,
+    targets: PiExportTargetRow[],
+    admit: (db: DatabaseSync) => PiExportTargetRecordResult,
+  ): PiExportTargetRecordResult {
+    return this.runImmediate(() => {
+      const admission = admit(this.db);
+      if (!admission.ok) return admission;
+      if (this.db.prepare('SELECT 1 FROM pi_export_targets WHERE provider = ? LIMIT 1').get(provider)) {
+        return { ok: false, code: 'pi-export-targets-exist' };
+      }
+      const insert = this.db.prepare(`INSERT INTO pi_export_targets
+        (provider, target, slot_account_id, lineage_fp, recorded_at) VALUES (?, ?, ?, ?, ?)`);
+      for (const target of targets) {
+        if (target.provider !== provider) throw new Error('pi export target provider mismatch');
+        insert.run(target.provider, target.target, target.slotAccountId, target.lineageFp, target.recordedAt);
+      }
+      return { ok: true };
+    });
+  }
+
+  /**
+   * Classify and add observed targets under one immediate transaction. The
+   * classifier may read store state, which is therefore protected from a slot
+   * writer until either this insert commits or classification rolls back.
+   */
+  recordPiExportTargetsIfEmptyClassified<T extends { targets: PiExportTargetRow[] }>(
+    provider: string,
+    classifyInTransaction: () => T,
+    admit: (db: DatabaseSync) => PiExportTargetRecordResult,
+  ): PiExportTargetClassifiedRecordResult<T> {
+    return this.runImmediate(() => {
+      const classified = classifyInTransaction();
+      const admission = admit(this.db);
+      if (!admission.ok) return { ok: false, code: admission.code };
+      if (this.db.prepare('SELECT 1 FROM pi_export_targets WHERE provider = ? LIMIT 1').get(provider)) {
+        return { ok: false, code: 'pi-export-targets-exist' };
+      }
+      const insert = this.db.prepare(`INSERT INTO pi_export_targets
+        (provider, target, slot_account_id, lineage_fp, recorded_at) VALUES (?, ?, ?, ?, ?)`);
+      for (const target of classified.targets) {
+        if (target.provider !== provider) throw new Error('pi export target provider mismatch');
+        insert.run(target.provider, target.target, target.slotAccountId, target.lineageFp, target.recordedAt);
+      }
+      return { ok: true, result: classified };
+    });
+  }
+
+  listPiExportTargets(provider: string): PiExportTargetRow[] {
+    return this.db.prepare(`SELECT provider, target, slot_account_id AS slotAccountId,
+      lineage_fp AS lineageFp, recorded_at AS recordedAt FROM pi_export_targets
+      WHERE provider = ? ORDER BY target`).all(provider) as unknown as PiExportTargetRow[];
   }
 
   recordRelogin(row: { ts?: number; provider: string; accountId?: string | null; kind: string; detail?: string | null; evidence?: string | null; userDeniedAt?: number | null }): number {

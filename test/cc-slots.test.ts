@@ -13,6 +13,7 @@ import {
 } from '../src/cc-slots';
 import { KeychainBackedOff, KeychainReadBackoff, MockKeychain } from '../src/keychain';
 import { credentialFingerprint } from '../src/anthropic-oauth';
+import { beginCutover } from '../src/lifecycle';
 import { openStore } from '../src/store';
 
 function credential(tag: string): string {
@@ -109,6 +110,51 @@ describe('Claude slots (K2)', () => {
     assert.equal(reopened.getSlot('account-a')?.prevFingerprint !== null, true);
     assert.equal(reopened.listSlots().length, 1);
     reopened.close();
+  });
+
+  it('persists a computed slot number when reactivating an archived SQLite row with NULL slot_num', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-cc-slot-reactivate-'));
+    const dbPath = join(root, 'qlb.db');
+    const store = openStore(dbPath);
+    beginCutover(store);
+    store.close();
+    const backend = new CountingBackend();
+    const repository = SqliteClaudeSlotRepository.open(dbPath);
+    const slots = new ClaudeSlots({ backend, repository, stashDir: join(root, 'unclaimed'), now: () => 1_000 });
+    await slots.createSlot({ accountId: 'account-a', credential: credential('old'), source: 'cswap-import' });
+    const db = (repository as unknown as { db: { prepare(sql: string): { run(...values: unknown[]): void } } }).db;
+    db.prepare('UPDATE claude_slots SET archived_at = 1 WHERE account_id = ?').run('account-a');
+    await backend.delete('qlb:anthropic:account-a', 'qlb');
+
+    const result = await slots.applyAdd({
+      accountId: 'account-a', credential: credential('new'), email: null, alias: null, orgUuid: null,
+      configJson: '{}', replace: false,
+    });
+    assert.equal(result.slotNum, 1);
+    repository.close();
+
+    const reopened = SqliteClaudeSlotRepository.open(dbPath);
+    assert.equal(reopened.getSlot('account-a')?.slotNum, 1);
+    reopened.close();
+  });
+
+  it('takes the shared switch lock around an add slot write', async () => {
+    const backend = new CountingBackend();
+    const repo = new InMemoryClaudeSlotRepository();
+    let switchLockCalls = 0;
+    const slots = new ClaudeSlots({
+      backend, repository: repo, stashDir: join(mkdtempSync(join(tmpdir(), 'qlb-cc-slots-')), 'unclaimed'), now: () => 1_000,
+      withSwitchLock: async (fn) => {
+        switchLockCalls += 1;
+        return fn();
+      },
+    });
+
+    await slots.applyAdd({
+      accountId: 'account-a', credential: credential('one'), email: null, alias: null, orgUuid: null,
+      configJson: '{}', replace: false,
+    });
+    assert.equal(switchLockCalls, 1);
   });
 
   it('uses one Keychain read for cached displays within sixty seconds', async () => {

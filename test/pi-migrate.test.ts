@@ -8,6 +8,7 @@ import { describe, it } from 'node:test';
 import { MacosKeychainBackend, markFakeExecutor, MockKeychain, NativeOpenRouterKeyNotFoundError, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, readNativeOpenRouterKey, type ExecFileSyncFn } from '../src/keychain';
 import {
   defaultPiMigratePaths,
+  hasLegacyPiOwnerEntry,
   migratePiSingleProvider,
   rollbackPiSingleProvider,
   type PiMigratePaths,
@@ -104,6 +105,41 @@ describe('Pi migration S58 credential-first barrier', () => {
       });
     }
   }
+
+  it('refuses to publish into a legacy v1 Anthropic owner document and writes nothing', () => {
+    const h = setup();
+    try {
+      writeFileSync(h.paths.ownerPath, JSON.stringify({ owner: 'qlb', accounts: [{ provider: 'anthropic' }] }), { mode: 0o600 });
+      const ownerBefore = readFileSync(h.paths.ownerPath); const authBefore = readFileSync(h.paths.authJsonPath);
+      assert.throws(() => migratePiSingleProvider('xai', h.paths, { keychain: h.keychain }), /owner-file-legacy-v1/);
+      assert.equal(readFileSync(h.paths.ownerPath).equals(ownerBefore), true);
+      assert.equal(readFileSync(h.paths.authJsonPath).equals(authBefore), true);
+      assert.equal(existsSync(join(h.paths.journalPath, 'pi-migrate-xai.json')), false);
+      assert.equal(hasManaged(h.keychain, 'xai'), false);
+    } finally { h.cleanup(); }
+  });
+
+  it('rollback unlinks qlb-owner.json when its last entry is removed', () => {
+    const h = setup();
+    try {
+      migratePiSingleProvider('xai', h.paths, { keychain: h.keychain });
+      rollbackPiSingleProvider('xai', h.paths, { keychain: h.keychain });
+      assert.equal(existsSync(h.paths.ownerPath), false);
+    } finally { h.cleanup(); }
+  });
+
+  it('hasLegacyPiOwnerEntry is true for a v1 Anthropic claim and false for v2, missing and foreign-provider files', () => {
+    const h = setup();
+    try {
+      assert.equal(hasLegacyPiOwnerEntry(h.paths.ownerPath, 'anthropic'), false, 'missing');
+      writeFileSync(h.paths.ownerPath, JSON.stringify({ owner: 'qlb', accounts: [{ provider: 'anthropic' }] }), { mode: 0o600 });
+      assert.equal(hasLegacyPiOwnerEntry(h.paths.ownerPath, 'anthropic'), true, 'v1 claim');
+      writeFileSync(h.paths.ownerPath, JSON.stringify({ providers: { anthropic: { mode: 'qlb', since: 0 } } }), { mode: 0o600 });
+      assert.equal(hasLegacyPiOwnerEntry(h.paths.ownerPath, 'anthropic'), false, 'v2 map');
+      writeFileSync(h.paths.ownerPath, JSON.stringify({ owner: 'qlb', accounts: [{ provider: 'xai' }] }), { mode: 0o600 });
+      assert.equal(hasLegacyPiOwnerEntry(h.paths.ownerPath, 'anthropic'), false, 'foreign provider');
+    } finally { h.cleanup(); }
+  });
 
   it('writes not-applicable only when the Pi credential is absent', () => {
     const h = setup();
@@ -218,7 +254,7 @@ describe('Pi migration S58 credential-first barrier', () => {
             process.exitCode = 0;
           } catch (error) { process.stdout.write(String(error.code || error.message)); process.exitCode = 1; }
         `], {
-          env: { ...process.env, PI_MIGRATE_MODULE: modulePath, PI_MIGRATE_PATHS: JSON.stringify(h.paths), PI_MIGRATE_START: String(startAt) },
+          env: { ...process.env, QLB_TEST_MODE: '1', QLB_HOME: h.dir, HOME: h.dir, PI_MIGRATE_MODULE: modulePath, PI_MIGRATE_PATHS: JSON.stringify(h.paths), PI_MIGRATE_START: String(startAt) },
           stdio: ['ignore', 'pipe', 'inherit'],
         });
         let output = '';
@@ -227,8 +263,16 @@ describe('Pi migration S58 credential-first barrier', () => {
         proc.once('close', (code) => resolveChild({ code, output }));
       });
       const results = await Promise.all([child(), child()]);
-      assert.equal(results.filter(({ output }) => output.includes('entered')).length, 1);
-      assert.equal(results.filter(({ code }) => code === 0).length, 1);
+      const detail = JSON.stringify(results);
+      const winners = results.filter(({ output }) => output.includes('entered'));
+      assert.ok(winners.length <= 1, detail);
+      for (const result of results) {
+        if (!result.output.includes('entered')) {
+          assert.equal(result.code, 1, detail);
+          assert.match(result.output, /pi-auth-locked/, detail);
+        }
+      }
+      assert.equal(existsSync(lock), false, `finished racers left a lock behind: ${detail}`);
     } finally { h.cleanup(); }
   });
 

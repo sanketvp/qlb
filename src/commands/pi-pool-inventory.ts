@@ -1,0 +1,155 @@
+import { readFileSync } from 'node:fs';
+import type { DatabaseSync } from 'node:sqlite';
+import { platformKeychain } from '../keychain';
+import {
+  classify,
+  PoolInventoryError,
+  readCswapInventoryLineages,
+  readPoolInventoryEntries,
+  slotInventoryLineages,
+  type PoolInventoryEntry,
+  type PiExportTarget,
+  type PoolInventoryStore,
+  type SourceLineage,
+} from '../pool-inventory';
+import { assertAdmittedInConnection } from '../lifecycle';
+import {
+  openStore,
+  type PiExportTargetClassifiedRecordResult,
+  type PiExportTargetRow,
+  type Store,
+} from '../store';
+import type { CommandContext, CommandDefinition } from '../registry';
+
+export interface PoolInventoryCommandStore extends PoolInventoryStore {
+  close(): void;
+  listPiExportTargets(provider: string): PiExportTargetRow[];
+  listAnthropicSlotLineageChains(): Array<{ accountId: string; lineages: string[] }>;
+  recordPiExportTargetsIfEmpty(
+    provider: string,
+    targets: PiExportTarget[],
+    admit: (db: DatabaseSync) => { ok: boolean; code?: string },
+  ): { ok: boolean; code?: string };
+  recordPiExportTargetsIfEmptyClassified<T extends { targets: PiExportTarget[] }>(
+    provider: string,
+    classifyInTransaction: () => T,
+    admit: (db: DatabaseSync) => { ok: boolean; code?: string },
+  ): PiExportTargetClassifiedRecordResult<T>;
+}
+
+export interface PiPoolInventoryCommandDeps {
+  openStore(dbPath: string): PoolInventoryCommandStore;
+  loadEntries(path: string): PoolInventoryEntry[];
+  loadCswapLineages(sequencePath: string): SourceLineage[];
+  loadSlotLineages(store: PoolInventoryCommandStore): SourceLineage[];
+  /** Writing uses pi-migrate's lifecycle admission on the writer transaction. */
+  admitRecord(db: DatabaseSync): { ok: boolean; code?: string };
+  now(): number;
+}
+
+const defaultDeps: PiPoolInventoryCommandDeps = {
+  openStore,
+  loadEntries: (path) => readPoolInventoryEntries(path, readFileSync),
+  loadCswapLineages: (path) => readCswapInventoryLineages(path, platformKeychain, readFileSync),
+  loadSlotLineages: (store) => slotInventoryLineages(store as Pick<Store, 'listAnthropicSlotLineageChains'>),
+  admitRecord: (db) => assertAdmittedInConnection(db, 'pi-migrate'),
+  now: Date.now,
+};
+
+function parse(args: string[]): { against: 'cswap' | 'slots'; json: boolean; record: boolean } | null {
+  let against: 'cswap' | 'slots' = 'cswap';
+  let againstSet = false;
+  let json = false;
+  let record = false;
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === '--json' && !json) {
+      json = true;
+      continue;
+    }
+    if (arg === '--record' && !record) {
+      record = true;
+      continue;
+    }
+    if (arg === '--against' && !againstSet && index + 1 < args.length && (args[index + 1] === 'cswap' || args[index + 1] === 'slots')) {
+      against = args[index + 1] as 'cswap' | 'slots';
+      againstSet = true;
+      index += 1;
+      continue;
+    }
+    return null;
+  }
+  if (record && against !== 'slots') return null;
+  return { against, json, record };
+}
+
+/** `qlb pi pool-inventory [--against cswap|slots] [--record] [--json]`. */
+export function runPiPoolInventoryCommand(
+  args: string[],
+  ctx: CommandContext,
+  deps: PiPoolInventoryCommandDeps = defaultDeps,
+): number {
+  const options = parse(args);
+  if (!options) {
+    ctx.stderr('usage: qlb pi pool-inventory [--against cswap|slots] [--record] [--json]');
+    return 2;
+  }
+
+  // X1's default C-swap comparison must not even open the QLB store: opening
+  // SQLite can create WAL state, which violates the rehearsal's no-mutation rule.
+  if (options.against === 'cswap') {
+    try {
+      const result = classify(deps.loadEntries(ctx.config.anthropicPoolPath), deps.loadCswapLineages(ctx.config.cswapSequencePath), deps.now());
+      const output = { against: options.against, entries: result.entries };
+      if (options.json) ctx.stdout(JSON.stringify(output));
+      else ctx.stdout(`${result.entries.length} pool entries; ${result.targets.length} shared lineages`);
+      return 0;
+    } catch {
+      ctx.stderr('qlb pi pool-inventory: inventory unavailable');
+      return 1;
+    }
+  }
+
+  const store = deps.openStore(ctx.config.dbPath);
+  try {
+    const entries = deps.loadEntries(ctx.config.anthropicPoolPath);
+    const result = options.record
+      ? (() => {
+        // The slot read, classification, admission, no-overwrite guard, and
+        // insert share one BEGIN IMMEDIATE transaction. A durable undo mapping
+        // therefore cannot be based on a slot snapshot that a writer changed.
+        const recorded = store.recordPiExportTargetsIfEmptyClassified(
+          'anthropic',
+          () => classify(entries, deps.loadSlotLineages(store), deps.now()),
+          deps.admitRecord,
+        );
+        if (!recorded.ok) {
+          ctx.stderr(`qlb pi pool-inventory: refused: ${recorded.code ?? 'inventory-record-refused'}`);
+          return null;
+        }
+        return recorded.result;
+      })()
+      : classify(entries, deps.loadSlotLineages(store), deps.now());
+    if (result === null) return 3;
+    const output = { against: options.against, entries: result.entries };
+    if (options.json) ctx.stdout(JSON.stringify(output));
+    else ctx.stdout(`${result.entries.length} pool entries; ${result.targets.length} shared lineages`);
+    return 0;
+  } catch (error) {
+    if (options.record && error instanceof PoolInventoryError) {
+      // A classifier conflict is a safety refusal. runImmediate already rolled
+      // back, so no stale or ambiguous mapping was persisted.
+      ctx.stderr(`qlb pi pool-inventory: refused: ${error.code}`);
+      return 3;
+    }
+    // Never surface filesystem/Keychain diagnostics here: either can contain a
+    // native value. The command dispatcher performs its normal redaction too.
+    ctx.stderr('qlb pi pool-inventory: inventory unavailable');
+    return 1;
+  } finally {
+    store.close();
+  }
+}
+
+const command: CommandDefinition = { name: 'pi pool-inventory', execute: runPiPoolInventoryCommand };
+export default command;

@@ -6,11 +6,16 @@ import type { DatabaseSync } from 'node:sqlite';
 import { tokenCallAllowed } from './commands/token';
 import { loadGate } from './gate';
 import { assertAdmittedInConnection } from './lifecycle';
-import { isPiPlaceholder, isPiQlbOwnerEntry } from './pi-migrate';
+import { isPiPlaceholder } from './pi-migrate';
+import {
+  isPiQlbOwnerEntry,
+  PI_GATE_PROVIDERS,
+  type PiGateProvider,
+  validatePiOwnerDocument as validateOwnerDocument,
+} from './pi-owner-document';
 import { openStoreConnection } from './store';
 
-export const PI_GATE_PROVIDERS = ['anthropic', 'openai-codex', 'xai', 'kimi-coding', 'openrouter'] as const;
-export type PiGateProvider = (typeof PI_GATE_PROVIDERS)[number];
+export { PI_GATE_PROVIDERS, type PiGateProvider } from './pi-owner-document';
 
 export interface GateCredential {
   token: string;
@@ -84,6 +89,15 @@ function parsedObject(path: string, code: string): Record<string, unknown> {
 
 type OwnerFormat = 'v1' | 'v2';
 
+/** Converts the extension's dependency-free schema refusal to a gate failure. */
+export function validatePiOwnerDocument(document: unknown): Record<string, unknown> {
+  try {
+    return validateOwnerDocument(document);
+  } catch {
+    throw new GateFailure('owner-file-malformed');
+  }
+}
+
 function legacyOwnerEntry(owner: Record<string, unknown>, provider: PiGateProvider): boolean {
   if (owner.owner !== 'qlb' || !Array.isArray(owner.accounts)) return false;
   return owner.accounts.some((account) => !!account && typeof account === 'object' && !Array.isArray(account)
@@ -92,25 +106,12 @@ function legacyOwnerEntry(owner: Record<string, unknown>, provider: PiGateProvid
 
 /** Returns every writer format in this file that claims this provider. */
 function ownerFormats(path: string, provider: PiGateProvider): OwnerFormat[] {
-  const owner = parsedObject(path, 'owner-file-malformed');
+  const owner = validatePiOwnerDocument(parsedObject(path, 'owner-file-malformed'));
   const formats: OwnerFormat[] = [];
-  let recognized = false;
-  if ('providers' in owner) {
-    recognized = true;
-    const providers = owner.providers;
-    if (!providers || typeof providers !== 'object' || Array.isArray(providers)) {
-      throw new GateFailure('owner-file-malformed');
-    }
-    if (isPiQlbOwnerEntry((providers as Record<string, unknown>)[provider])) formats.push('v2');
+  if ('providers' in owner && isPiQlbOwnerEntry((owner.providers as Record<string, unknown>)[provider])) {
+    formats.push('v2');
   }
-  if ('owner' in owner || 'accounts' in owner) {
-    recognized = true;
-    if (typeof owner.owner !== 'string' || !Array.isArray(owner.accounts)) {
-      throw new GateFailure('owner-file-malformed');
-    }
-    if (legacyOwnerEntry(owner, provider)) formats.push('v1');
-  }
-  if (!recognized) throw new GateFailure('owner-file-malformed');
+  if (('owner' in owner || 'accounts' in owner) && legacyOwnerEntry(owner, provider)) formats.push('v1');
   return formats;
 }
 

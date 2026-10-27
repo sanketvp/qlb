@@ -32,11 +32,102 @@ describe('redaction', () => {
       ['Cookie: session=abc; csrf=def', 'Cookie: [redacted]'],
       ['msg: api_key=abc; ok', 'msg: api_key=[redacted]'],
       ['password="hunter 2"', 'password=[redacted]'],
+      ['token_ = hunter2', 'token_ = [redacted]'],
+      ['api-key- : value', 'api-key- : [redacted]'],
+      ['password=\nhunter2', 'password=\n[redacted]'],
+      ['api-key- :\n value', 'api-key- :\n [redacted]'],
       ['token_count=5', 'token_count=5'],
       ['passwordless login', 'passwordless login'],
     ] as const;
 
     for (const [input, expected] of cases) assert.equal(redactKeyValueText(input, []), expected);
+  });
+
+  it('redacts a sensitive key PEM value through its matching end line', () => {
+    const input = 'private_key:\n-----BEGIN PRIVATE KEY-----\nfixture-pem-body\n-----END PRIVATE KEY-----\nkind: safe';
+
+    const result = redactKeyValueText(input, []);
+
+    assert.equal(result, 'private_key:\n[redacted]\nkind: safe');
+    assert.equal(result.includes('fixture-pem-body'), false);
+  });
+
+  it('redacts a sensitive key PEM value with CRLF line endings', () => {
+    const input = 'private_key:\r\n-----BEGIN PRIVATE KEY-----\r\nfixture-pem-body\r\n-----END PRIVATE KEY-----\r\nkind: safe';
+
+    const result = redactKeyValueText(input, []);
+
+    assert.equal(result, 'private_key:\r\n[redacted]\r\nkind: safe');
+    assert.equal(result.includes('fixture-pem-body'), false);
+  });
+
+  it('redacts PEM blocks without a sensitive key', () => {
+    const input = 'before\n-----BEGIN CERTIFICATE-----\nfixture-pem-body\n-----END CERTIFICATE-----\nafter';
+
+    const result = redactKeyValueText(input, []);
+
+    assert.equal(result, 'before\n[redacted]\nafter');
+    assert.equal(result.includes('fixture-pem-body'), false);
+  });
+
+  it('redacts an unterminated PEM block through the end of text', () => {
+    const input = 'before\n-----BEGIN PRIVATE KEY-----\nfixture-pem-body';
+
+    assert.equal(redactKeyValueText(input, []), 'before\n[redacted]');
+  });
+
+  it('redacts YAML block scalar values for sensitive keys', () => {
+    const input = 'password: |\n  fixture-secret\n  continued-fixture\nkind: safe';
+
+    const result = redactKeyValueText(input, []);
+
+    assert.equal(result, 'password: [redacted]\nkind: safe');
+    assert.equal(result.includes('fixture-secret'), false);
+  });
+
+  it('leaves an unrelated following key unchanged after a multiline sensitive value', () => {
+    const input = 'token: >\n  fixture-secret\nkind: safe';
+
+    assert.equal(redactKeyValueText(input, []), 'token: [redacted]\nkind: safe');
+  });
+
+  it('redacts block scalars for sensitive prefixed and dotted keys', () => {
+    const cases = [
+      ['db_password: |\n  fixture-secret\nkind: safe', 'db_password: [redacted]\nkind: safe'],
+      ['spring.datasource.password: >\n  fixture-secret\nkind: safe', 'spring.datasource.password: [redacted]\nkind: safe'],
+      ['"password": |\n  fixture-secret\nkind: safe', '"password": [redacted]\nkind: safe'],
+    ] as const;
+
+    for (const [input, expected] of cases) {
+      const result = redactKeyValueText(input, []);
+      assert.equal(result.includes('fixture-secret'), false);
+      assert.equal(fingerprint(result), fingerprint(expected));
+    }
+  });
+
+  it('redacts block scalars for sensitive YAML sequence-item keys', () => {
+    const input = '- password: |\n    fixture-secret\n- kind: safe';
+    const expected = '- password: [redacted]\n- kind: safe';
+    const result = redactKeyValueText(input, []);
+
+    assert.equal(result.includes('fixture-secret'), false);
+    assert.equal(fingerprint(result), fingerprint(expected));
+  });
+
+  it('redacts indented continuation lines for sensitive YAML sequence-item keys', () => {
+    const input = '- password:\n    first-fixture\n    second-fixture\n- kind: safe';
+    const expected = '- password:\n    [redacted]\n- kind: safe';
+    const result = redactKeyValueText(input, []);
+
+    assert.equal(result.includes('first-fixture'), false);
+    assert.equal(result.includes('second-fixture'), false);
+    assert.equal(fingerprint(result), fingerprint(expected));
+  });
+
+  it('leaves non-sensitive YAML blocks unchanged', () => {
+    const input = 'kind: |\n  safe block\nnext: safe';
+
+    assert.equal(fingerprint(redactKeyValueText(input, [])), fingerprint(input));
   });
 
   it('redacts supplied secrets and their SHA-256 fingerprints', () => {

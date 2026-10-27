@@ -1,5 +1,5 @@
 import { join } from 'node:path';
-import { ClaudeSlots, SqliteClaudeSlotRepository, type RestoreUnclaimedResult } from '../cc-slots';
+import { ClaudeSlots, isReadableUnclaimedStashId, SqliteClaudeSlotRepository, type RestoreUnclaimedResult } from '../cc-slots';
 import { qlbHomeDir } from '../home';
 import { platformKeychain } from '../keychain';
 import type { CommandContext, CommandDefinition } from '../registry';
@@ -37,7 +37,7 @@ export async function runClaudeRestoreUnclaimedCommand(
   ctx: CommandContext,
   deps?: ClaudeRestoreUnclaimedDeps,
 ): Promise<number> {
-  if (args.length !== 2 || !args[0] || /[\0/\\]/.test(args[0]) || !args[1] || /[\0/\\:]/.test(args[1])) {
+  if (args.length !== 2 || !isReadableUnclaimedStashId(args[0]) || !args[1] || /[\0/\\:]/.test(args[1])) {
     ctx.stderr('qlb claude restore-unclaimed: expected <timestamp> <slot>');
     return 2;
   }

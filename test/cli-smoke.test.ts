@@ -13,6 +13,9 @@ function isolatedEnv(): NodeJS.ProcessEnv {
   mkdirSync(join(root, 'migrate'), { recursive: true });
   return {
     ...process.env,
+    QLB_TEST_MODE: '1',
+    QLB_HOME: root,
+    HOME: root,
     QLB_PLUGINS_DIR: join(root, 'plugins'),
     QLB_DB_PATH: join(root, 'qlb.db'),
     QLB_ANTHROPIC_POOL_PATH: join(root, 'missing-anthropic.json'),
@@ -251,14 +254,25 @@ describe('CLI smoke — documented commands', () => {
     assert.doesNotMatch(help.stderr + help.stdout, /unknown argument/);
   });
 
-  it('consume enable refuses while Pi Anthropic accounts are QLB-owned', () => {
-    const owned = isolatedEnv();
-    const ownerFile = join(dirname(String(owned.QLB_PI_AUTH_JSON_PATH)), 'qlb-owner.json');
-    writeFileSync(ownerFile, '{"accounts":[]}');
-    const byFile = runCli(['consume', 'enable', '--provider', 'anthropic', '--json'], owned);
-    assert.equal(byFile.status, 1);
-    assert.match(byFile.stderr, /DUAL_OWNERSHIP_REFUSED/);
+  it('consume enable still refuses on a v1 Anthropic owner document', () => {
+    const env = isolatedEnv();
+    const ownerFile = join(dirname(String(env.QLB_PI_AUTH_JSON_PATH)), 'qlb-owner.json');
+    writeFileSync(ownerFile, JSON.stringify({ owner: 'qlb', accounts: [{ provider: 'anthropic' }] }));
+    const result = runCli(['consume', 'enable', '--provider', 'anthropic', '--json'], env);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /DUAL_OWNERSHIP_REFUSED/);
+  });
 
+  it('consume enable still refuses on a v2 Anthropic owner entry', () => {
+    const env = isolatedEnv();
+    const ownerFile = join(dirname(String(env.QLB_PI_AUTH_JSON_PATH)), 'qlb-owner.json');
+    writeFileSync(ownerFile, JSON.stringify({ providers: { anthropic: { mode: 'qlb' } } }));
+    const result = runCli(['consume', 'enable', '--provider', 'anthropic', '--json'], env);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /DUAL_OWNERSHIP_REFUSED/);
+  });
+
+  it('consume enable refuses while the Pi pool journal owns Anthropic', () => {
     const journaled = isolatedEnv();
     const store = openStore(String(journaled.QLB_DB_PATH));
     store.upsertMigration('pi-pool', 'QLB_OWNED', '{}');
@@ -268,6 +282,14 @@ describe('CLI smoke — documented commands', () => {
     assert.match(byJournal.stderr, /DUAL_OWNERSHIP_REFUSED/);
     const after = runCli(['consume', 'status', '--provider', 'anthropic', '--json'], journaled);
     assert.equal(JSON.parse(after.stdout).state, 'NATIVE');
+  });
+
+  it('consume enable ignores a shared owner map when it has no Anthropic entry', () => {
+    const env = isolatedEnv();
+    const ownerFile = join(dirname(String(env.QLB_PI_AUTH_JSON_PATH)), 'qlb-owner.json');
+    writeFileSync(ownerFile, JSON.stringify({ providers: { xai: { mode: 'qlb' } } }));
+    const result = runCli(['consume', 'enable', '--provider', 'anthropic', '--json'], env);
+    assert.equal(result.status, 0, result.stderr);
   });
 
   it('consume enable writes the marker before the journal; a marker failure leaves NATIVE', () => {

@@ -6,24 +6,43 @@ import { join } from 'node:path';
 
 export interface UnclaimedIndexEntry {
   provider: string;
-  accountId: string;
+  /** null means a legacy file with no known account; it may match any account by lineage. */
+  accountId: string | null;
   stashId: string;
   consumedFp: string;
   location: 'keychain' | 'file';
   createdAt: number;
+  /** Present only while the creating process has not durably stored the body. */
+  pending?: number;
 }
 
-function assertComponent(value: string, name: string): void {
-  if (!value || /[\0/\\/]/.test(value)) throw new Error(`invalid unclaimed index ${name}`);
+export class InvalidUnclaimedIndexComponentError extends Error {
+  constructor(name: string) {
+    super(`invalid unclaimed index ${name}`);
+    this.name = 'InvalidUnclaimedIndexComponentError';
+  }
+}
+
+function assertNewComponent(value: string, name: string): void {
+  if (!value || /[\x00-\x1F\x7F\\/:*?"<>|]|[. ]$/.test(value)) {
+    throw new InvalidUnclaimedIndexComponentError(name);
+  }
+}
+
+/** Legacy rows may contain ISO-8601 stash ids; never use this for new paths. */
+function assertExistingComponent(value: string, name: string): void {
+  if (!value || value === '..' || /[\0/\\]/.test(value)) {
+    throw new InvalidUnclaimedIndexComponentError(name);
+  }
 }
 
 function indexDir(root: string, provider: string): string {
-  assertComponent(provider, 'provider');
+  assertNewComponent(provider, 'provider');
   return join(root, 'index', provider);
 }
 
-function indexPath(root: string, entry: UnclaimedIndexEntry): string {
-  assertComponent(entry.stashId, 'stash id');
+function indexPath(root: string, entry: UnclaimedIndexEntry, existing = false): string {
+  (existing ? assertExistingComponent : assertNewComponent)(entry.stashId, 'stash id');
   return join(indexDir(root, entry.provider), `${entry.stashId}.json`);
 }
 
@@ -32,21 +51,23 @@ function parseEntry(text: string): UnclaimedIndexEntry {
   try { value = JSON.parse(text); } catch { throw new Error('unclaimed index entry is malformed'); }
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('unclaimed index entry is malformed');
   const entry = value as Record<string, unknown>;
-  if (typeof entry.provider !== 'string' || typeof entry.accountId !== 'string' ||
+  if (typeof entry.provider !== 'string' || (entry.accountId !== null && typeof entry.accountId !== 'string') ||
     typeof entry.stashId !== 'string' || typeof entry.consumedFp !== 'string' ||
     (entry.location !== 'keychain' && entry.location !== 'file') ||
-    typeof entry.createdAt !== 'number' || !Number.isFinite(entry.createdAt)) {
+    typeof entry.createdAt !== 'number' || !Number.isFinite(entry.createdAt) ||
+    (entry.pending != null && (typeof entry.pending !== 'number' || !Number.isFinite(entry.pending)))) {
     throw new Error('unclaimed index entry is malformed');
   }
   try {
-    assertComponent(entry.provider, 'provider');
-    assertComponent(entry.stashId, 'stash id');
+    assertExistingComponent(entry.provider, 'provider');
+    assertExistingComponent(entry.stashId, 'stash id');
   } catch {
     throw new Error('unclaimed index entry is malformed');
   }
   return {
     provider: entry.provider, accountId: entry.accountId, stashId: entry.stashId,
     consumedFp: entry.consumedFp, location: entry.location, createdAt: entry.createdAt,
+    ...(typeof entry.pending === 'number' ? { pending: entry.pending } : {}),
   };
 }
 
@@ -55,7 +76,19 @@ async function privateDirectory(path: string): Promise<void> {
   await chmod(path, 0o700);
 }
 
-async function fsyncDirectory(path: string): Promise<void> {
+export interface UnclaimedIndexWriteOptions {
+  replace?: boolean;
+  /** Injectable for Windows behavior tests; defaults to the host platform. */
+  platform?: NodeJS.Platform;
+  /** Injectable directory sync for tests; failures are preserved off Windows. */
+  directorySync?: (path: string) => Promise<void>;
+}
+
+async function fsyncDirectory(path: string, options: UnclaimedIndexWriteOptions): Promise<void> {
+  // Node cannot fsync a directory handle on Windows. Its durability contract
+  // is unavailable there, while other platforms must still surface failures.
+  if ((options.platform ?? process.platform) === 'win32') return;
+  if (options.directorySync) return options.directorySync(path);
   const handle = await open(path, 'r');
   try { await handle.sync(); } finally { await handle.close(); }
 }
@@ -65,7 +98,7 @@ async function fsyncDirectory(path: string): Promise<void> {
  * contender cannot overwrite another process's stash reservation; updates use
  * rename only after the original row has reserved that stash id.
  */
-async function writeEntry(path: string, contents: string, replace: boolean): Promise<void> {
+async function writeEntry(path: string, contents: string, options: UnclaimedIndexWriteOptions): Promise<void> {
   const dir = join(path, '..');
   await privateDirectory(dir);
   const temporary = `${path}.tmp.${process.pid}.${Math.random().toString(16).slice(2)}`;
@@ -77,10 +110,10 @@ async function writeEntry(path: string, contents: string, replace: boolean): Pro
     await handle.close();
   }
   try {
-    if (replace) await rename(temporary, path);
+    if (options.replace) await rename(temporary, path);
     else await link(temporary, path);
     await chmod(path, 0o600);
-    await fsyncDirectory(dir);
+    await fsyncDirectory(dir, options);
   } finally {
     await rm(temporary, { force: true });
   }
@@ -94,12 +127,25 @@ async function writeEntry(path: string, contents: string, replace: boolean): Pro
 export async function recordStash(
   root: string,
   entry: UnclaimedIndexEntry,
-  options: { replace?: boolean } = {},
+  options: UnclaimedIndexWriteOptions = {},
 ): Promise<string> {
-  assertComponent(entry.provider, 'provider');
-  assertComponent(entry.stashId, 'stash id');
+  assertNewComponent(entry.provider, 'provider');
+  assertNewComponent(entry.stashId, 'stash id');
   const path = indexPath(root, entry);
-  await writeEntry(path, `${JSON.stringify(entry)}\n`, options.replace === true);
+  await writeEntry(path, `${JSON.stringify(entry)}\n`, options);
+  return path;
+}
+
+/** Update an already-reserved row, including a legacy ISO-8601 stash id. */
+export async function updateStash(
+  root: string,
+  entry: UnclaimedIndexEntry,
+  options: UnclaimedIndexWriteOptions = {},
+): Promise<string> {
+  assertNewComponent(entry.provider, 'provider');
+  assertExistingComponent(entry.stashId, 'stash id');
+  const path = indexPath(root, entry, true);
+  await writeEntry(path, `${JSON.stringify(entry)}\n`, { ...options, replace: true });
   return path;
 }
 
@@ -121,17 +167,21 @@ export async function listStashes(root: string, provider: string, accountId?: st
     } catch { throw new Error('unclaimed index unavailable'); }
     const entry = parseEntry(text);
     if (entry.provider !== provider) throw new Error('unclaimed index entry is malformed');
-    if (accountId == null || entry.accountId === accountId) entries.push(entry);
+    if (accountId == null || entry.accountId === null || entry.accountId === accountId) entries.push(entry);
   }
   return entries.sort((a, b) => a.createdAt - b.createdAt || a.stashId.localeCompare(b.stashId));
 }
 
 /** Remove a stash reservation only after its credential bytes have been removed. */
-export async function removeStash(root: string, entry: Pick<UnclaimedIndexEntry, 'provider' | 'stashId'>): Promise<void> {
-  const path = indexPath(root, entry as UnclaimedIndexEntry);
+export async function removeStash(
+  root: string,
+  entry: Pick<UnclaimedIndexEntry, 'provider' | 'stashId'>,
+  options: UnclaimedIndexWriteOptions = {},
+): Promise<void> {
+  const path = indexPath(root, entry as UnclaimedIndexEntry, true);
   try {
     await rm(path);
-    await fsyncDirectory(indexDir(root, entry.provider));
+    await fsyncDirectory(indexDir(root, entry.provider), options);
   } catch (error: unknown) {
     if (error && typeof error === 'object' && (error as NodeJS.ErrnoException).code === 'ENOENT') return;
     throw new Error('unable to remove unclaimed index entry');

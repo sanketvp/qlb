@@ -103,6 +103,7 @@
 // strictly before unlinking the owner file.
 
 import { createHash } from 'node:crypto';
+import { isCredentialNotFound } from './credential-backends';
 import {
   chmodSync,
   closeSync,
@@ -118,8 +119,10 @@ import {
 import { dirname, join, resolve, sep } from 'node:path';
 import { config } from './config';
 import type { KeychainBackend } from './keychain';
-import { openRouterMissingKeyMessage, qlbKeychainService, readNativeOpenRouterKey } from './keychain';
+import { openRouterMissingKeyMessage, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, readNativeOpenRouterKey } from './keychain';
 import { parseGrant } from './refresh-lease';
+import { hasLegacyPiOwnerEntry, readPiOwnerProviders, withPiAuthLock, writePiOwnerEntry } from './pi-migrate';
+import { OPENROUTER_GATE_KEYCHAIN_SERVICE } from './token/openrouter';
 import type { Store } from './store';
 import type { Grant } from './types';
 
@@ -218,7 +221,7 @@ export function migrationStoreNameFor(provider: string): string {
 }
 
 export function defaultOwnerFileFor(provider: MigrateProvider): string {
-  if (provider === 'anthropic') return DEFAULT_OWNER_FILE;
+  if (provider === 'anthropic' || provider === 'openrouter') return DEFAULT_OWNER_FILE;
   return join(dirname(config.piAuthJsonPath), `qlb-owner-${provider}.json`);
 }
 
@@ -285,6 +288,15 @@ export interface MigrationStatus {
   provider?: string;
 }
 
+export class OwnerMapPresentError extends Error {
+  readonly code = 'owner-map-present';
+
+  constructor() {
+    super('owner-map-present: anthropic pool migration waits for P7b8');
+    this.name = 'OwnerMapPresentError';
+  }
+}
+
 export interface MigrationConfig {
   kind?: MigrationKind;
   provider?: string;
@@ -296,6 +308,8 @@ export interface MigrationConfig {
    * Never writes the native service.
    */
   readNativeKey?: () => string;
+  /** Test-only barrier after a pool takes the final owner-map lock. */
+  beforePoolCommitLock?: () => void;
 }
 
 /**
@@ -406,8 +420,8 @@ export function readOpenRouterNativeKey(): string {
   return readNativeOpenRouterKey(NATIVE_OPENROUTER_KEYCHAIN_SERVICE);
 }
 
-export function stagingOwnerPath(ownerFilePath: string): string {
-  return `${ownerFilePath}.staging`;
+export function stagingOwnerPath(ownerFilePath: string, provider?: string): string {
+  return provider ? `${ownerFilePath}.${provider}.staging` : `${ownerFilePath}.staging`;
 }
 
 export function preQlbPath(poolFilePath: string): string {
@@ -422,6 +436,9 @@ function keychainCoords(provider: string, id: string, label: string): {
   service: string;
   account: string;
 } {
+  if (provider === 'openrouter') {
+    return { service: OPENROUTER_GATE_KEYCHAIN_SERVICE, account: QLB_KEYCHAIN_ACCOUNT };
+  }
   return {
     service: qlbKeychainService(provider, id),
     account: label || id,
@@ -715,11 +732,13 @@ export class Migration {
   private readonly keychain: KeychainBackend;
   private readonly poolFilePath: string;
   private readonly ownerFilePath: string;
+  private readonly ownerMapPath: string;
   readonly storeName: string;
   readonly kind: MigrationKind;
   readonly provider: string | undefined;
   readonly authJsonKey: string | undefined;
   private readonly readNativeKey: (() => string) | undefined;
+  private readonly beforePoolCommitLock: (() => void) | undefined;
 
   constructor(
     store: Store,
@@ -733,11 +752,127 @@ export class Migration {
     this.keychain = keychain;
     this.poolFilePath = poolFilePath;
     this.ownerFilePath = ownerFilePath;
+    this.ownerMapPath = join(dirname(ownerFilePath), 'qlb-owner.json');
     this.storeName = storeName;
     this.kind = config.kind ?? 'pool';
     this.provider = config.provider;
     this.authJsonKey = config.authJsonKey ?? config.provider;
     this.readNativeKey = config.readNativeKey;
+    this.beforePoolCommitLock = config.beforePoolCommitLock;
+  }
+
+  private ownerProvider(): MigrateProvider {
+    return (this.provider as MigrateProvider | undefined) ?? 'anthropic';
+  }
+
+  private stagingPath(): string {
+    return stagingOwnerPath(this.ownerMapPath, this.kind === 'pool' ? undefined : this.ownerProvider());
+  }
+
+  private legacySidecarPath(): string | null {
+    return this.kind === 'pool'
+      ? null
+      : join(dirname(this.ownerMapPath), `qlb-owner-${this.ownerProvider()}.json`);
+  }
+
+  private ownerEntryPresentAt(path: string): boolean {
+    try {
+      const entry = readPiOwnerProviders(path)[this.ownerProvider()];
+      return !!entry && typeof entry === 'object' && !Array.isArray(entry)
+        && (entry as Record<string, unknown>).mode === 'qlb';
+    } catch {
+      return false;
+    }
+  }
+
+  private legacySidecarOwned(): boolean {
+    const path = this.legacySidecarPath();
+    if (!path || !existsSync(path)) return false;
+    try {
+      const owner: unknown = JSON.parse(readFileSync(path, 'utf8'));
+      return !!owner && typeof owner === 'object' && !Array.isArray(owner)
+        && (owner as Record<string, unknown>).owner === 'qlb';
+    } catch {
+      return false;
+    }
+  }
+
+  private ownerEntryPresent(): boolean {
+    // Pool migration continues to read its pre-P7b v1 document until P7b8.
+    // A shared v2 map is not an Anthropic claim unless it names Anthropic.
+    if (this.kind === 'pool') {
+      return hasLegacyPiOwnerEntry(this.ownerFilePath, 'anthropic')
+        || this.ownerEntryPresentAt(this.ownerMapPath);
+    }
+    return this.ownerEntryPresentAt(this.ownerMapPath) || this.legacySidecarOwned();
+  }
+
+  /** P7b8 alone may convert the pool's v1 document into the shared v2 map. */
+  private refusePoolOwnerMap(): void {
+    if (this.kind !== 'pool' || !existsSync(this.ownerMapPath)) return;
+    try {
+      const owner: unknown = JSON.parse(readFileSync(this.ownerMapPath, 'utf8'));
+      if (isObjectRecord(owner) && Object.prototype.hasOwnProperty.call(owner, 'providers')) {
+        throw new OwnerMapPresentError();
+      }
+    } catch (error) {
+      if (error instanceof OwnerMapPresentError) throw error;
+      // Preserve the pool path's existing v1/malformed-file behavior. Only a
+      // parseable document declaring `providers` is the P7b8-only v2 map.
+    }
+  }
+
+  private staticKeychainLocations(): Array<{ service: string; account: string }> {
+    if (this.kind !== 'static-key' || this.ownerProvider() !== 'openrouter') return [];
+    return [
+      keychainCoords('openrouter', ADAPTER_ACCOUNT_IDS.openrouter, ADAPTER_ACCOUNT_LABELS.openrouter),
+      {
+        service: qlbKeychainService('openrouter', ADAPTER_ACCOUNT_IDS.openrouter),
+        account: ADAPTER_ACCOUNT_LABELS.openrouter,
+      },
+    ];
+  }
+
+  /** Gate coordinates supersede the pre-P7b4 OpenRouter Keychain location. */
+  private staticKeychainCoords(): { service: string; account: string } | null {
+    for (const coords of this.staticKeychainLocations()) {
+      try {
+        this.keychain.getSync(coords.service, coords.account);
+        return coords;
+      } catch {
+        // Try the pre-P7b4 coordinates after the gate location.
+      }
+    }
+    return null;
+  }
+
+  /** Remove every managed OpenRouter copy; only an absent item is idempotent. */
+  private deleteStaticKeychain(): void {
+    // Keep the gate credential available until the legacy copy is gone. A
+    // non-not-found legacy failure therefore leaves the owner claim and the
+    // working gate credential intact for a safe rollback retry.
+    for (const coords of this.staticKeychainLocations().reverse()) {
+      try {
+        this.keychain.deleteSync(coords.service, coords.account);
+      } catch (error) {
+        if (isCredentialNotFound(error)) continue;
+        throw new Error(
+          `OpenRouter rollback Keychain delete failed at service=${coords.service} account=${coords.account}`,
+        );
+      }
+    }
+  }
+
+  private withOwnerMapLock<T>(fn: () => T): T {
+    return withPiAuthLock(join(dirname(this.ownerMapPath), 'auth.json'), () => fn());
+  }
+
+  private removePoolOwnerEntry(): void {
+    if (hasLegacyPiOwnerEntry(this.ownerFilePath, 'anthropic')) {
+      unlinkIfExists(this.ownerFilePath);
+    } else if (this.ownerEntryPresentAt(this.ownerMapPath)) {
+      this.withOwnerMapLock(() => writePiOwnerEntry(this.ownerMapPath, 'anthropic', false));
+    }
   }
 
   /** True when commit must not rename/delete the native store. */
@@ -755,13 +890,14 @@ export class Migration {
     const row = this.store.getMigration(this.storeName);
     const state = asState(row?.state);
     const detail = parseDetail(row?.detail_json);
-    const ownerPresent = existsSync(this.ownerFilePath);
-    const ownerStaging = existsSync(stagingOwnerPath(this.ownerFilePath));
+    const ownerPresent = this.ownerEntryPresent();
+    const ownerStaging = existsSync(this.stagingPath());
     const nativePresent =
       this.kind === 'static-key' ? true : existsSync(this.poolFilePath);
     const prePresent =
       this.kind === 'static-key' ? false : existsSync(preQlbPath(this.poolFilePath));
     const intent = detail.intent === 'rollback';
+    const staticCredential = this.staticKeychainCoords();
 
     let ownerFile: MigrationStatus['ownerFile'] = 'absent';
     if (ownerPresent) ownerFile = 'present';
@@ -776,7 +912,7 @@ export class Migration {
     else if (prePresent) nativeStore = 'pre-qlb';
 
     let piAtNextLaunch: MigrationStatus['piAtNextLaunch'] = 'unknown';
-    if (ownerPresent) piAtNextLaunch = 'QLB works';
+    if (ownerPresent && (this.kind !== 'static-key' || staticCredential)) piAtNextLaunch = 'QLB works';
     else if (nativePresent) piAtNextLaunch = 'native works';
 
     const retains = this.retainsNative();
@@ -840,6 +976,12 @@ export class Migration {
    * Static-key (OpenRouter): 1 API key from native Keychain (read-only).
    */
   stage(): MigrationStatus {
+    // P7b8 alone may convert the pool's v1 owner document into the shared
+    // v2 map. Refuse before creating staging, Keychain, or journal state.
+    this.refusePoolOwnerMap();
+    // OpenRouter publishes into the v2 map, so reject a v1 Anthropic
+    // document before creating any staged Keychain or filesystem state.
+    if (this.kind === 'static-key') readPiOwnerProviders(this.ownerMapPath);
     const current = this.status();
     if (current.ownerFile === 'present' || current.state === 'QLB_OWNED' || current.state === 'RETIRED') {
       throw new Error(
@@ -891,7 +1033,7 @@ export class Migration {
       this.store.upsertAccount(acct.id, acct.provider, acct.label, 'imported-unvalidated');
     }
 
-    atomicWriteFile(stagingOwnerPath(this.ownerFilePath), JSON.stringify(owner, null, 2) + '\n');
+    atomicWriteFile(this.stagingPath(), JSON.stringify(owner, null, 2) + '\n');
     return this.status();
   }
 
@@ -943,10 +1085,16 @@ export class Migration {
    * rename is hygiene afterwards.
    */
   commit(): MigrationStatus {
-    if (existsSync(this.ownerFilePath)) {
+    // P7b8 alone may convert the pool's v1 owner document into the shared
+    // v2 map. Refuse before any journal or native-pool write.
+    this.refusePoolOwnerMap();
+    // OpenRouter must fail closed rather than add providers to a v1 Anthropic
+    // document. Read before checking or mutating any migration artifact.
+    if (this.kind === 'static-key') readPiOwnerProviders(this.ownerMapPath);
+    if (this.ownerEntryPresent()) {
       return this.finishHygiene();
     }
-    const staging = stagingOwnerPath(this.ownerFilePath);
+    const staging = this.stagingPath();
     if (!existsSync(staging)) {
       throw new Error(`cannot commit: missing ${staging}`);
     }
@@ -957,8 +1105,26 @@ export class Migration {
       );
     }
 
-    // C — THE ONLY COMMIT POINT (atomic rename on APFS/POSIX).
-    renameSync(staging, this.ownerFilePath);
+    if (this.kind === 'static-key') {
+      this.withOwnerMapLock(() => writePiOwnerEntry(this.ownerMapPath, this.ownerProvider(), true));
+      unlinkIfExists(staging);
+      return this.finishHygiene();
+    }
+
+    if (this.kind === 'pool') {
+      // The map can have appeared after stage(). Hold the same lock as every
+      // v2 writer from the final P7b8 boundary check through the v1 rename.
+      this.withOwnerMapLock(() => {
+        // Test-only interleaving barrier: a v2 writer started here must wait
+        // until this final check and rename have completed.
+        this.beforePoolCommitLock?.();
+        this.refusePoolOwnerMap();
+        renameSync(staging, this.ownerFilePath);
+      });
+    } else {
+      // C — THE ONLY COMMIT POINT (atomic rename on APFS/POSIX).
+      renameSync(staging, this.ownerFilePath);
+    }
     try {
       chmodSync(this.ownerFilePath, 0o600);
     } catch {
@@ -968,7 +1134,7 @@ export class Migration {
   }
 
   rollback(): MigrationStatus {
-    if (existsSync(this.ownerFilePath) || this.journalState() === 'QLB_OWNED') {
+    if (this.ownerEntryPresent() || this.journalState() === 'QLB_OWNED') {
       return this.postCommitRollback();
     }
     return this.preCommitRollback();
@@ -989,20 +1155,20 @@ export class Migration {
     if (intent) {
       return this.continueRollback();
     }
-    if (existsSync(this.ownerFilePath)) {
+    if (this.ownerEntryPresent()) {
       return this.finishHygiene();
     }
     if (
       current.state === 'QLB_OWNED' &&
-      !existsSync(this.ownerFilePath) &&
+      !this.ownerEntryPresent() &&
       (this.kind === 'static-key' || existsSync(this.poolFilePath))
     ) {
       return this.finishRollbackJournal();
     }
-    if (current.state === 'VALIDATED' && existsSync(stagingOwnerPath(this.ownerFilePath))) {
+    if (current.state === 'VALIDATED' && existsSync(this.stagingPath())) {
       return this.commit();
     }
-    if (current.state === 'MIRRORED' || existsSync(stagingOwnerPath(this.ownerFilePath))) {
+    if (current.state === 'MIRRORED' || existsSync(this.stagingPath())) {
       return this.preCommitRollback();
     }
     return current;
@@ -1062,7 +1228,7 @@ export class Migration {
 
     this.keychain.setSync(service, account, JSON.stringify(payload));
     this.store.upsertAccount(id, this.provider, label, 'imported-unvalidated');
-    atomicWriteFile(stagingOwnerPath(this.ownerFilePath), JSON.stringify(owner, null, 2) + '\n');
+    atomicWriteFile(this.stagingPath(), JSON.stringify(owner, null, 2) + '\n');
     return this.status();
   }
 
@@ -1122,7 +1288,7 @@ export class Migration {
 
     this.keychain.setSync(service, account, JSON.stringify(grant));
     this.store.upsertAccount(id, this.provider, label, 'imported-unvalidated');
-    atomicWriteFile(stagingOwnerPath(this.ownerFilePath), JSON.stringify(owner, null, 2) + '\n');
+    atomicWriteFile(this.stagingPath(), JSON.stringify(owner, null, 2) + '\n');
     return this.status();
   }
 
@@ -1140,7 +1306,7 @@ export class Migration {
   }
 
   private readOwnerPayload(): OwnerFile | null {
-    const candidates = [this.ownerFilePath, stagingOwnerPath(this.ownerFilePath)];
+    const candidates = [this.stagingPath()];
     for (const p of candidates) {
       if (!existsSync(p)) continue;
       try {
@@ -1193,19 +1359,6 @@ export class Migration {
   /** H1 + H2. Idempotent. Called after C and by resume() when owner is present. */
   private finishHygiene(): MigrationStatus {
     const now = Date.now();
-    if (existsSync(this.ownerFilePath)) {
-      try {
-        const raw = readFileSync(this.ownerFilePath, 'utf8');
-        const owner = JSON.parse(raw) as OwnerFile;
-        if (owner && owner.committedAt == null) {
-          owner.committedAt = now;
-          atomicWriteFile(this.ownerFilePath, JSON.stringify(owner, null, 2) + '\n');
-        }
-      } catch {
-        // owner file present but unreadable — still journal; doctor will flag
-      }
-    }
-
     this.journal('QLB_OWNED', { committedAt: now, intent: undefined });
 
     if (this.retainsNative()) {
@@ -1246,6 +1399,10 @@ export class Migration {
   private deleteStagedKeychain(accounts: OwnerFile['accounts'] | undefined): void {
     if (!accounts) return;
     for (const meta of accounts) {
+      if (meta.provider === 'openrouter') {
+        this.deleteStaticKeychain();
+        continue;
+      }
       const { service, account } = keychainCoords(meta.provider, meta.id, meta.label);
       try {
         this.keychain.deleteSync(service, account);
@@ -1258,7 +1415,7 @@ export class Migration {
   private preCommitRollback(): MigrationStatus {
     const owner = this.readOwnerPayload();
     this.deleteStagedKeychain(owner?.accounts);
-    unlinkIfExists(stagingOwnerPath(this.ownerFilePath));
+    unlinkIfExists(this.stagingPath());
     this.journal('NATIVE', { intent: undefined, rolledBackAt: Date.now(), rolledBackFrom: 'pre-commit' });
     return this.status();
   }
@@ -1273,8 +1430,19 @@ export class Migration {
   private continueRollback(): MigrationStatus {
     if (this.retainsNative()) {
       // Native was never moved (auth.json shadow-retained, or Keychain retained).
-      unlinkIfExists(this.ownerFilePath);
-      unlinkIfExists(stagingOwnerPath(this.ownerFilePath));
+      if (this.kind === 'static-key') {
+        // Delete both QLB coordinate generations before dropping ownership;
+        // a non-not-found failure leaves the claim in place for a safe retry.
+        this.deleteStaticKeychain();
+        if (this.ownerEntryPresentAt(this.ownerMapPath)) {
+          this.withOwnerMapLock(() => writePiOwnerEntry(this.ownerMapPath, this.ownerProvider(), false));
+        }
+        const legacy = this.legacySidecarPath();
+        if (legacy) unlinkIfExists(legacy);
+      } else {
+        unlinkIfExists(this.ownerFilePath);
+      }
+      unlinkIfExists(this.stagingPath());
       return this.finishRollbackJournal();
     }
 
@@ -1288,8 +1456,8 @@ export class Migration {
 
     // RC — unlink owner only after native is present again.
     if (existsSync(native)) {
-      unlinkIfExists(this.ownerFilePath);
-      unlinkIfExists(stagingOwnerPath(this.ownerFilePath));
+      this.removePoolOwnerEntry();
+      unlinkIfExists(this.stagingPath());
     } else {
       // Cannot yet drop the owner file — native is not restored. Leave it.
       return this.status();
