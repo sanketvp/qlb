@@ -15,6 +15,7 @@ import {
 import { MockKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from '../src/keychain';
 import { refreshXaiCredential, XAI_CLIENT_ID, XAI_REFRESH_URL } from '../src/oauth/xai-refresh';
 import { KIMI_CODING_CLIENT_ID, refreshKimiCodingCredential } from '../src/oauth/kimi-coding-refresh';
+import { adoptStashedSuccessor } from '../src/single-stash';
 import { listStashes, recordStash } from '../src/unclaimed-index';
 
 const NOW = 1_730_000_000_000;
@@ -33,6 +34,7 @@ function root(home: string): string {
 
 describe('single-account consume gate', () => {
   it('serializes two concurrent refreshes into one POST and returns the persisted winner', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'qlb-single-consume-'));
     const keychain = new MockKeychain();
     const service = qlbKeychainService('kimi-coding', 'default');
     keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(credential('access-before', 'refresh-before')));
@@ -45,29 +47,48 @@ describe('single-account consume gate', () => {
     };
 
     const snapshot = credential('access-before', 'refresh-before');
-    const [first, second] = await Promise.all([
-      consumeSingleCredential('kimi-coding', snapshot, { keychain, lock, refresh, now: () => NOW }),
-      consumeSingleCredential('kimi-coding', snapshot, { keychain, lock, refresh, now: () => NOW }),
-    ]);
+    try {
+      const [first, second] = await Promise.all([
+        consumeSingleCredential('kimi-coding', snapshot, { keychain, home, lock, refresh, now: () => NOW }),
+        consumeSingleCredential('kimi-coding', snapshot, { keychain, home, lock, refresh, now: () => NOW }),
+      ]);
 
-    assert.equal(posts, 1);
-    assert.equal(first.credential.access, 'access-after');
-    assert.equal(second.credential.access, 'access-after');
+      assert.equal(posts, 1);
+      assert.equal(first.credential.access, 'access-after');
+      assert.equal(second.credential.access, 'access-after');
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
   });
 
   it('does not POST when a different, unexpired winner appears under the consume lock (N8)', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'qlb-single-consume-'));
     const keychain = new MockKeychain();
     keychain.setSync(qlbKeychainService('xai', 'default'), QLB_KEYCHAIN_ACCOUNT,
       JSON.stringify(credential('winner-access', 'winner-refresh', NOW + 60_000)));
     let posts = 0;
-    const result = await consumeSingleCredential('xai', credential('stale-access', 'stale-refresh'), {
-      keychain, lock: createInMemorySingleConsumeLock(), now: () => NOW,
-      refresh: async () => { posts += 1; return { kind: 'transient' }; },
-    });
+    try {
+      const result = await consumeSingleCredential('xai', credential('stale-access', 'stale-refresh'), {
+        keychain, home, lock: createInMemorySingleConsumeLock(), now: () => NOW,
+        refresh: async () => { posts += 1; return { kind: 'transient' }; },
+      });
 
-    assert.equal(posts, 0);
-    assert.equal(result.outcome, 'winner');
-    assert.equal(result.credential.access, 'winner-access');
+      assert.equal(posts, 0);
+      assert.equal(result.outcome, 'winner');
+      assert.equal(result.credential.access, 'winner-access');
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses a missing home under node:test without QLB_TEST_MODE in consume and stash paths', async () => {
+    const keychain = new MockKeychain();
+    const env = { NODE_TEST_CONTEXT: 'child-v8' };
+    await assert.rejects(consumeSingleCredential('xai', credential('before', 'refresh-before'), {
+      keychain, env, lock: createInMemorySingleConsumeLock(), now: () => NOW,
+      refresh: async () => assert.fail('the guard must run before refresh'),
+    }), /explicit home/);
+    await assert.rejects(adoptStashedSuccessor('xai', { access: 'before', refresh: 'refresh-before', expires: NOW + 30_000 }, keychain, { env }), /explicit home/);
   });
 
   it('stashes an issued successor when persist fails instead of discarding it', async () => {
@@ -216,6 +237,62 @@ describe('single-account consume gate', () => {
     }
   });
 
+  it('an adopted successor with no expiry is refreshed on the next consume, not unreadable', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'qlb-single-consume-'));
+    const keychain = new MockKeychain();
+    const primary = qlbKeychainService('xai', 'default');
+    const stashId = 'unknown-expiry-second-pass';
+    const before = credential('before', 'refresh-before');
+    const saved = { type: 'oauth', access: 'saved', refresh: 'refresh-issued' };
+    keychain.setSync(primary, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(before));
+    try {
+      await recordStash(root(home), {
+        provider: 'xai', accountId: 'default', stashId, consumedFp: lineageFp('refresh-before'), location: 'keychain', createdAt: NOW,
+      });
+      keychain.setSync(qlbKeychainService('xai', `unclaimed:${stashId}`), QLB_KEYCHAIN_ACCOUNT,
+        JSON.stringify({ credential: saved, consumedFp: lineageFp('refresh-before') }));
+      const adopted = await consumeSingleCredential('xai', before, {
+        keychain, home, lock: createInMemorySingleConsumeLock(), now: () => NOW,
+        refresh: async () => assert.fail('the first pass must adopt without refreshing'),
+      });
+      let posts = 0;
+      const refreshed = await consumeSingleCredential('xai', adopted.credential, {
+        keychain, home, lock: createInMemorySingleConsumeLock(), now: () => NOW,
+        refresh: async () => {
+          posts += 1;
+          return { kind: 'success', credential: credential('refreshed', 'refresh-refreshed', NOW + 3_600_000) };
+        },
+      });
+      assert.equal(posts, 1);
+      assert.equal(refreshed.outcome, 'refreshed');
+      assert.equal(refreshed.credential.access, 'refreshed');
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it('refreshes a primary with a non-finite expiry', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'qlb-single-consume-'));
+    const keychain = new MockKeychain();
+    const primary = qlbKeychainService('xai', 'default');
+    keychain.setSync(primary, QLB_KEYCHAIN_ACCOUNT,
+      '{"type":"oauth","access":"before","refresh":"refresh-before","expires":1e999}');
+    try {
+      let posts = 0;
+      const result = await consumeSingleCredential('xai', credential('before', 'refresh-before'), {
+        keychain, home, lock: createInMemorySingleConsumeLock(), now: () => NOW,
+        refresh: async () => {
+          posts += 1;
+          return { kind: 'success', credential: credential('refreshed', 'refresh-refreshed', NOW + 3_600_000) };
+        },
+      });
+      assert.equal(posts, 1);
+      assert.equal(result.outcome, 'refreshed');
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
   it('defers SIGTERM after the POST until the successor is persisted', async () => {
     const home = await mkdtemp(join(tmpdir(), 'qlb-single-consume-signal-'));
     const marker = join(home, 'persisted');
@@ -233,7 +310,7 @@ describe('single-account consume gate', () => {
         deleteSync() {},
       };
       consumeSingleCredential('xai', { access: 'before', expires: 1730000000030 }, {
-        keychain, lock: createInMemorySingleConsumeLock(), now: () => 1730000000000,
+        keychain, home: process.env.QLB_HOME, lock: createInMemorySingleConsumeLock(), now: () => 1730000000000,
         refresh: async () => { posted = true; const delivered = new Promise((resolve) => { process.once('SIGTERM', resolve); setTimeout(resolve, 50); }); process.kill(process.pid, 'SIGTERM'); await delivered; return { kind: 'success', credential: { type: 'oauth', access: 'after', refresh: 'after-refresh', expires: 1730003600000 } }; },
       }).catch(() => process.exit(1));
     `;
@@ -249,19 +326,24 @@ describe('single-account consume gate', () => {
   });
 
   it('warns and keeps the installed successor when the lineage callback throws', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'qlb-single-consume-'));
     const keychain = new MockKeychain();
     const primary = qlbKeychainService('kimi-coding', 'default');
     keychain.setSync(primary, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(credential('before', 'refresh-before')));
     const warnings: string[] = [];
-    const result = await consumeSingleCredential('kimi-coding', credential('before', 'refresh-before'), {
-      keychain, lock: createInMemorySingleConsumeLock(), now: () => NOW,
-      warn: (message) => warnings.push(message),
-      onLineage: () => { throw new Error('audit unavailable'); },
-      refresh: async () => ({ kind: 'success', credential: credential('after', 'refresh-after', NOW + 3_600_000) }),
-    });
-    assert.equal(result.credential.access, 'after');
-    assert.equal(JSON.parse(keychain.getSync(primary, QLB_KEYCHAIN_ACCOUNT)).access, 'after');
-    assert.deepEqual(warnings, ['lineage callback failed']);
+    try {
+      const result = await consumeSingleCredential('kimi-coding', credential('before', 'refresh-before'), {
+        keychain, home, lock: createInMemorySingleConsumeLock(), now: () => NOW,
+        warn: (message) => warnings.push(message),
+        onLineage: () => { throw new Error('audit unavailable'); },
+        refresh: async () => ({ kind: 'success', credential: credential('after', 'refresh-after', NOW + 3_600_000) }),
+      });
+      assert.equal(result.credential.access, 'after');
+      assert.equal(JSON.parse(keychain.getSync(primary, QLB_KEYCHAIN_ACCOUNT)).access, 'after');
+      assert.deepEqual(warnings, ['lineage callback failed']);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
   });
 
   it('a double-failed stash leaves a reservation the next pass clears', async () => {
@@ -335,17 +417,22 @@ describe('single-account consume gate', () => {
   });
 
   it('reports a dead refresh even when its callback throws', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'qlb-single-consume-'));
     const keychain = new MockKeychain();
     keychain.setSync(qlbKeychainService('xai', 'default'), QLB_KEYCHAIN_ACCOUNT,
       JSON.stringify(credential('before', 'refresh-before')));
     const warnings: string[] = [];
-    await assert.rejects(consumeSingleCredential('xai', credential('before', 'refresh-before'), {
-      keychain, lock: createInMemorySingleConsumeLock(), now: () => NOW,
-      warn: (message) => warnings.push(message),
-      onDead: () => { throw new Error('audit unavailable'); },
-      refresh: async () => ({ kind: 'dead' }),
-    }), /refresh-dead/);
-    assert.deepEqual(warnings, ['dead callback failed']);
+    try {
+      await assert.rejects(consumeSingleCredential('xai', credential('before', 'refresh-before'), {
+        keychain, home, lock: createInMemorySingleConsumeLock(), now: () => NOW,
+        warn: (message) => warnings.push(message),
+        onDead: () => { throw new Error('audit unavailable'); },
+        refresh: async () => ({ kind: 'dead' }),
+      }), /refresh-dead/);
+      assert.deepEqual(warnings, ['dead callback failed']);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
   });
 
   it('mirrors Pi xAI refresh and retains the old refresh token when it is omitted', async () => {

@@ -75,8 +75,13 @@ function parseCredential(raw: string): OAuthCredential {
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new SingleConsumeFailure('credential-unavailable');
   const value = parsed as Record<string, unknown>;
   if (typeof value.access !== 'string' || !value.access || typeof value.refresh !== 'string' || !value.refresh
-    || typeof value.expires !== 'number' || !Number.isFinite(value.expires)) {
+    || (value.expires !== undefined && typeof value.expires !== 'number')) {
     throw new SingleConsumeFailure('credential-unavailable');
+  }
+  // D-B55 preserves a legacy successor with unknown expiry. Normalize it to
+  // immediately due so its next consume refreshes rather than stranding it.
+  if (value.expires === undefined || !Number.isFinite(value.expires)) {
+    return { ...value, expires: 0 } as OAuthCredential;
   }
   return value as OAuthCredential;
 }
@@ -178,6 +183,10 @@ export async function consumeSingleCredential(
   snapshot: CredentialSnapshot,
   deps: SingleConsumeDeps,
 ): Promise<SingleConsumeResult> {
+  const env = deps.env ?? process.env;
+  if (!deps.home && env.NODE_TEST_CONTEXT !== undefined && env.QLB_TEST_MODE !== '1') {
+    throw new Error('an explicit home is required under node:test without QLB_TEST_MODE=1');
+  }
   const keychain = deps.keychain ?? platformKeychain;
   const now = deps.now ?? Date.now;
   const lock = deps.lock ?? defaultSingleConsumeLock(deps.home, deps.env);

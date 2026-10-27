@@ -49,7 +49,11 @@ export interface SingleStashDeps {
 }
 
 function stashRoot(deps: Pick<SingleStashDeps, 'home' | 'env'>): string {
-  return join(deps.home ?? qlbHomeDir(deps.env ?? process.env), '.qlb', 'unclaimed');
+  const env = deps.env ?? process.env;
+  if (!deps.home && env.NODE_TEST_CONTEXT !== undefined && env.QLB_TEST_MODE !== '1') {
+    throw new Error('an explicit home is required under node:test without QLB_TEST_MODE=1');
+  }
+  return join(deps.home ?? qlbHomeDir(env), '.qlb', 'unclaimed');
 }
 
 function stashService(provider: SingleStashProvider, stashId: string): string {
