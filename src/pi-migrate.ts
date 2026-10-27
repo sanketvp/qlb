@@ -22,7 +22,7 @@ export interface PiMigratePaths { authJsonPath: string; ownerPath: string; journ
 export interface AuthLockTiming { staleMs?: number; retries?: number; retryMs?: number; }
 export interface PiMigrateDeps {
   keychain: Pick<KeychainBackend, 'getSync' | 'setSync' | 'deleteSync'>;
-  store?: Pick<Store, 'getMigration' | 'setConfig' | 'recordLineage' | 'upsertAccount'>;
+  store?: Pick<Store, 'getMigration' | 'getConfig' | 'setConfig' | 'recordLineage' | 'upsertAccount'>;
   readNativeOpenRouterKey?: () => string;
   withAuthLock?: <T>(path: string, fn: (refresh: () => void) => T) => T;
   authLockTiming?: AuthLockTiming;
@@ -183,7 +183,7 @@ function keychainPayload(provider: PiSingleProvider, baseline: unknown): string 
 function managedValue(provider: PiSingleProvider, deps: PiMigrateDeps): unknown | undefined { try { return JSON.parse(deps.keychain.getSync(managedService(provider), QLB_KEYCHAIN_ACCOUNT)); } catch { return undefined; } }
 
 /** S0.6: generic ownership must be quiescent before P7a may begin. */
-function genericMigrationAtRest(provider: PiSingleProvider, paths: PiMigratePaths, deps: PiMigrateDeps, ownJournalExists: boolean): boolean {
+function genericMigrationAtRest(provider: PiSingleProvider, paths: PiMigratePaths, deps: PiMigrateDeps, ownJournal: Journal | null): boolean {
   const row = deps.store?.getMigration(`pi-${provider}`);
   let detail: JsonObject | undefined;
   if (row) {
@@ -199,11 +199,13 @@ function genericMigrationAtRest(provider: PiSingleProvider, paths: PiMigratePath
   const customOwner = ownerFilePath && ownerFilePath !== paths.ownerPath ? ownerFilePath : undefined;
   let canonicalOwnerClaim = false;
   try { canonicalOwnerClaim = isPiQlbOwnerEntry(readPiOwnerProviders(paths.ownerPath)[provider]); } catch { /* readPiOwnerProviders fails closed before publication */ }
+  const ownPublishedClaim = ownJournal?.phase === 'published' || ownJournal?.phase === 'committed'
+    || deps.store?.getConfig(`pi.${provider}.state`) === 'migrated';
   return !existsSync(canonicalStaging)
     && !(recordedStaging && existsSync(recordedStaging))
     && !existsSync(legacySidecar)
     && !(customOwner && existsSync(customOwner))
-    && (ownJournalExists || !canonicalOwnerClaim)
+    && (!canonicalOwnerClaim || ownPublishedClaim)
     && detail?.intent !== 'rollback'
     && detail?.rollbackDecision == null
     && detail?.handback == null;
@@ -219,13 +221,17 @@ export function migratePiSingleProvider(provider: PiSingleProvider, paths: PiMig
   if (options.dryRun) return { provider, state: 'migrated', resumed: existing !== null, wouldWrite };
   checkPaths(paths, deps);
   const lock = deps.withAuthLock ?? ((path, fn) => withPiAuthLock(path, fn, deps.authLockTiming));
-  let journal = existing ?? { provider, phase: 'started' as JournalPhase, ownerPid: process.pid, updatedAt: Date.now() };
+  let journal: Journal;
+  let resumed = false;
   let state: PiMigrateResult['state'] = 'not-applicable';
   lock(paths.authJsonPath, (refresh) => {
-    if (!genericMigrationAtRest(provider, paths, deps, existing !== null)) throw genericMigrationOwnedError();
+    const inLockJournal = readJournal(paths, provider);
+    journal = inLockJournal ?? { provider, phase: 'started', ownerPid: process.pid, updatedAt: Date.now() };
+    resumed = inLockJournal !== null;
+    if (!genericMigrationAtRest(provider, paths, deps, inLockJournal)) throw genericMigrationOwnedError();
     const auth = readAuth(paths.authJsonPath); const currentOwner = readPiOwnerProviders(paths.ownerPath);
-    if (!existing) updatePhase(paths, provider, 'started', refresh);
-    if (!existing && (provider === 'openrouter' || isPiPlaceholder(auth[provider])) && currentOwner[provider]) {
+    if (!inLockJournal) updatePhase(paths, provider, 'started', refresh);
+    if (!inLockJournal && (provider === 'openrouter' || isPiPlaceholder(auth[provider])) && currentOwner[provider]) {
       state = 'migrated';
     } else {
       let baseline: unknown; const baselineFile = baselinePath(paths, provider);
@@ -250,7 +256,7 @@ export function migratePiSingleProvider(provider: PiSingleProvider, paths: PiMig
         if (!phaseAtLeast(journal.phase, 'credential-saved')) { updatePhase(paths, provider, 'credential-saved', refresh); journal = { ...journal, phase: 'credential-saved' }; deps.afterWrite?.('credential-saved'); }
         if (provider !== 'openrouter') { auth[provider] = piPlaceholder(); refresh(); writeJson(paths.authJsonPath, auth); refresh(); deps.afterWrite?.('placeholder'); }
       }
-      refresh(); writePiOwnerEntry(paths.ownerPath, provider, true); refresh(); deps.afterWrite?.('owner-entry'); updatePhase(paths, provider, 'published', refresh); journal = { ...journal, phase: 'published' }; state = 'migrated';
+      refresh(); writePiOwnerEntry(paths.ownerPath, provider, true); refresh(); updatePhase(paths, provider, 'published', refresh); journal = { ...journal, phase: 'published' }; deps.afterWrite?.('owner-entry'); state = 'migrated';
     }
     if (state !== 'migrated') return;
     const managed = deps.keychain.getSync(managedService(provider), QLB_KEYCHAIN_ACCOUNT); const parsed = JSON.parse(managed) as { refresh?: string; access?: string }; const lineage = fingerprint(typeof parsed.refresh === 'string' && parsed.refresh ? parsed.refresh : String(parsed.access ?? ''));
@@ -261,7 +267,7 @@ export function migratePiSingleProvider(provider: PiSingleProvider, paths: PiMig
     refresh(); deps.store?.setConfig(`pi.${provider}.migratedAt`, String(Date.now()));
     deps.afterWrite?.('before-committed'); updatePhase(paths, provider, 'committed', refresh); refresh(); rmSync(journalPath(paths, provider), { force: true });
   });
-  return { provider, state, resumed: existing !== null, wouldWrite };
+  return { provider, state, resumed, wouldWrite };
 }
 
 /** S49 rollback for P7a's xai/kimi/openrouter subset. */
