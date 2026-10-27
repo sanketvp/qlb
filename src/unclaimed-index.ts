@@ -12,6 +12,8 @@ export interface UnclaimedIndexEntry {
   consumedFp: string;
   location: 'keychain' | 'file';
   createdAt: number;
+  /** Present only while the creating process has not durably stored the body. */
+  pending?: number;
 }
 
 export class InvalidUnclaimedIndexComponentError extends Error {
@@ -52,7 +54,8 @@ function parseEntry(text: string): UnclaimedIndexEntry {
   if (typeof entry.provider !== 'string' || (entry.accountId !== null && typeof entry.accountId !== 'string') ||
     typeof entry.stashId !== 'string' || typeof entry.consumedFp !== 'string' ||
     (entry.location !== 'keychain' && entry.location !== 'file') ||
-    typeof entry.createdAt !== 'number' || !Number.isFinite(entry.createdAt)) {
+    typeof entry.createdAt !== 'number' || !Number.isFinite(entry.createdAt) ||
+    (entry.pending != null && (typeof entry.pending !== 'number' || !Number.isFinite(entry.pending)))) {
     throw new Error('unclaimed index entry is malformed');
   }
   try {
@@ -64,6 +67,7 @@ function parseEntry(text: string): UnclaimedIndexEntry {
   return {
     provider: entry.provider, accountId: entry.accountId, stashId: entry.stashId,
     consumedFp: entry.consumedFp, location: entry.location, createdAt: entry.createdAt,
+    ...(typeof entry.pending === 'number' ? { pending: entry.pending } : {}),
   };
 }
 

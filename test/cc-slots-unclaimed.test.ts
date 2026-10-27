@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import * as fs from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
-import { ClaudeSlots, InMemoryClaudeSlotRepository, SqliteClaudeSlotRepository, type ClaudeSlotBackend } from '../src/cc-slots';
+import { ClaudeSlots, InMemoryClaudeSlotRepository, SqliteClaudeSlotRepository, type ClaudeSlotBackend, type ClaudeSlotFileOps } from '../src/cc-slots';
 import { runClaudeRestoreUnclaimedCommand } from '../src/commands/claude-restore-unclaimed';
 import { MockKeychain } from '../src/keychain';
 import { listStashes, recordStash } from '../src/unclaimed-index';
@@ -17,6 +18,10 @@ function credential(tag: string, expiresAt = tag === 'issued' ? 2_000 : 1_000): 
 
 function credentialWithRefresh(tag: string, refreshToken: string, expiresAt: number): string {
   return JSON.stringify({ claudeAiOauth: { accessToken: `access-${tag}`, refreshToken, expiresAt } });
+}
+
+function credentialWithoutExpiry(tag: string): string {
+  return JSON.stringify({ claudeAiOauth: { accessToken: `access-${tag}`, refreshToken: `refresh-${tag}` } });
 }
 
 function failNextCommit(repository: SqliteClaudeSlotRepository): void {
@@ -57,6 +62,9 @@ function fixture(options: {
   platform?: NodeJS.Platform;
   directorySync?: (path: string) => Promise<void>;
   warn?: (message: string) => void;
+  files?: ClaudeSlotFileOps;
+  isPendingWriterAlive?: (pid: number) => boolean;
+  afterStashReservation?: () => void | Promise<void>;
 } = {}): { slots: ClaudeSlots; backend: StashFailingBackend; repository: InMemoryClaudeSlotRepository; stashDir: string } {
   const stashDir = join(mkdtempSync(join(tmpdir(), 'qlb-unclaimed-')), 'unclaimed');
   const backend = new StashFailingBackend();
@@ -339,7 +347,42 @@ describe('Claude unclaimed stash and restore (K2 / AC48)', () => {
     await assert.rejects(slots.restoreUnclaimed('foreign-account', 'account-b'), /belongs to a different account/);
   });
 
-  it('clears both absent-row crash windows, records stash-lost, and continues', async () => {
+  it('defers an in-progress reservation until its body is durable, then adopts it', async () => {
+    let rowsDuringReservation: Awaited<ReturnType<typeof listStashes>> = [];
+    const { slots, stashDir } = fixture({
+      isPendingWriterAlive: () => true,
+      afterStashReservation: async () => {
+        assert.equal(await slots.adoptStashedSuccessor('account-a'), null);
+        rowsDuringReservation = await listStashes(stashDir, 'anthropic');
+      },
+    });
+    await slots.createSlot({ accountId: 'account-a', credential: credential('one'), source: 'cswap-import' });
+    const current = (await slots.readSlot('account-a')).fingerprint;
+
+    await slots.stashUnclaimed('in-progress-stash', credential('issued'), current, 'account-a');
+
+    assert.equal(rowsDuringReservation.length, 1);
+    assert.equal(rowsDuringReservation[0]?.pending, process.pid);
+    assert.equal((await listStashes(stashDir, 'anthropic'))[0]?.pending, undefined);
+    assert.equal((await slots.adoptStashedSuccessor('account-a'))?.credential, credential('issued'));
+  });
+
+  it('clears a both-absent pending reservation after its writer is dead', async () => {
+    const warnings: string[] = [];
+    const { slots, stashDir } = fixture({ isPendingWriterAlive: () => false, warn: (message) => warnings.push(message) });
+    await slots.createSlot({ accountId: 'account-a', credential: credential('one'), source: 'cswap-import' });
+    const current = (await slots.readSlot('account-a')).fingerprint;
+    await recordStash(stashDir, {
+      provider: 'anthropic', accountId: 'account-a', stashId: 'dead-pending', consumedFp: current,
+      location: 'keychain', createdAt: 1, pending: 123,
+    });
+
+    assert.equal(await slots.adoptStashedSuccessor('account-a'), null);
+    assert.deepEqual(await listStashes(stashDir, 'anthropic'), []);
+    assert.deepEqual(warnings, ['stash-lost dead-pending credential-and-file-not-found']);
+  });
+
+  it('clears both absent legacy rows, records stash-lost, and continues', async () => {
     const warnings: string[] = [];
     const { slots, stashDir } = fixture({ warn: (message) => warnings.push(message) });
     await slots.createSlot({ accountId: 'account-a', credential: credential('one'), source: 'cswap-import' });
@@ -368,6 +411,39 @@ describe('Claude unclaimed stash and restore (K2 / AC48)', () => {
 
     await assert.rejects(slots.adoptStashedSuccessor('account-a'), /unclaimed credential unavailable/);
     assert.equal((await listStashes(stashDir, 'anthropic')).length, 1);
+  });
+
+  it('adopts a matching successor when the installed primary has no expiry', async () => {
+    const { slots } = fixture();
+    await slots.createSlot({ accountId: 'account-a', credential: credentialWithoutExpiry('one'), source: 'cswap-import' });
+    const current = (await slots.readSlot('account-a')).fingerprint;
+    await slots.stashUnclaimed('unknown-primary-expiry', credential('issued', 2_000), current, 'account-a');
+
+    assert.equal((await slots.adoptStashedSuccessor('account-a'))?.credential, credential('issued', 2_000));
+  });
+
+  it('adopts a matching successor when the successor has no expiry', async () => {
+    const { slots } = fixture();
+    await slots.createSlot({ accountId: 'account-a', credential: credential('one', 1_000), source: 'cswap-import' });
+    const current = (await slots.readSlot('account-a')).fingerprint;
+    await slots.stashUnclaimed('unknown-successor-expiry', credentialWithoutExpiry('issued'), current, 'account-a');
+
+    assert.equal((await slots.adoptStashedSuccessor('account-a'))?.credential, credentialWithoutExpiry('issued'));
+  });
+
+  it('fails closed when fallback discovery cannot read its directory', async () => {
+    const { slots, stashDir } = fixture({
+      files: {
+        mkdir: fs.mkdir, chmod: fs.chmod, open: fs.open, link: fs.link, lstat: fs.lstat, readFile: fs.readFile, rm: fs.rm,
+        readdir: async (path) => {
+          if (path === stashDir) throw Object.assign(new Error('fixture unreadable directory'), { code: 'EACCES' });
+          return fs.readdir(path);
+        },
+      },
+    });
+    await slots.createSlot({ accountId: 'account-a', credential: credential('one'), source: 'cswap-import' });
+
+    await assert.rejects(slots.adoptStashedSuccessor('account-a'), /unclaimed credential unavailable/);
   });
 
   it('removes a matching stash that is not strictly newer than the installed primary', async () => {

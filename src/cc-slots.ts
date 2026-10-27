@@ -612,6 +612,10 @@ export interface ClaudeSlotsOptions {
   directorySync?: (path: string) => Promise<void>;
   /** Non-secret warning sink for retained conflicting fallback files. */
   warn?: (message: string) => void;
+  /** Test seam: false only when a pending stash writer is known to be dead. */
+  isPendingWriterAlive?: (pid: number) => boolean;
+  /** Test seam invoked after the durable index reservation, before body storage. */
+  afterStashReservation?: () => void | Promise<void>;
 }
 
 export interface ReadSlotOptions {
@@ -884,8 +888,9 @@ export class ClaudeSlots {
     });
     const index: UnclaimedIndexEntry = {
       provider: ANTHROPIC_PROVIDER, accountId: accountId ?? null, stashId: timestamp, consumedFp: consumedFp ?? '',
-      location: 'keychain', createdAt: this.now(),
+      location: 'keychain', createdAt: this.now(), pending: process.pid,
     };
+    const { pending: _pending, ...completedIndex } = index;
     let indexWritable = true;
     let reservationCreated = false;
     try {
@@ -898,6 +903,7 @@ export class ClaudeSlots {
       indexWritable = false;
     }
     if (reservationCreated) {
+      await this.options.afterStashReservation?.();
       try {
         await this.assertUnclaimedFileAbsent(timestamp);
       } catch {
@@ -920,6 +926,8 @@ export class ClaudeSlots {
     if (keychainUsable) {
       try {
         await this.backend.set(this.unclaimedService(timestamp), QLB_KEYCHAIN_ACCOUNT, record);
+        // Clear the reservation marker only after the Keychain body is durable.
+        try { await updateStash(this.indexRoot(), completedIndex, this.indexOptions()); } catch { /* pending row still discovers the body */ }
         return { location: 'keychain' };
       } catch {
         // The private file is the durable fallback for every Keychain write error.
@@ -938,9 +946,9 @@ export class ClaudeSlots {
     // Discovery is best effort only after the fallback is durable. A legacy
     // file remains discoverable by the pre-adoption scan if this update fails.
     if (indexWritable) {
-      try { await updateStash(this.indexRoot(), { ...index, location: 'file' }, this.indexOptions()); } catch { /* file scan recovers it */ }
+      try { await updateStash(this.indexRoot(), { ...completedIndex, location: 'file' }, this.indexOptions()); } catch { /* file scan recovers it */ }
     } else {
-      try { await recordStash(this.indexRoot(), { ...index, location: 'file' }, this.indexOptions()); } catch { /* file scan recovers it */ }
+      try { await recordStash(this.indexRoot(), { ...completedIndex, location: 'file' }, this.indexOptions()); } catch { /* file scan recovers it */ }
     }
     return { location: 'file', path };
   }
@@ -1011,6 +1019,9 @@ export class ClaudeSlots {
             record = await this.readUnclaimed(entry.stashId);
           } catch (error) {
             if (error instanceof Error && error.message === 'unclaimed credential not found') {
+              // A row created before its body is written is a live reservation,
+              // not evidence of loss. Only a known-dead writer may be cleared.
+              if (entry.pending != null && this.pendingWriterMayBeAlive(entry.pending)) continue;
               await removeStash(this.indexRoot(), entry, this.indexOptions());
               this.warn(`stash-lost ${entry.stashId} credential-and-file-not-found`);
               continue;
@@ -1022,7 +1033,7 @@ export class ClaudeSlots {
           // strictly the post-POST CAS guard and never an adoption key.
           if (record.consumedFp !== currentFingerprint) continue;
           const successorExpiry = credentialExpiry(record.credential);
-          if (successorExpiry == null || currentExpiry == null || successorExpiry <= currentExpiry) {
+          if (successorExpiry != null && currentExpiry != null && successorExpiry <= currentExpiry) {
             await this.deleteUnclaimed(entry.stashId);
             await removeStash(this.indexRoot(), entry, this.indexOptions());
             this.warn(`stash-obsolete ${entry.stashId} not-newer-than-primary`);
@@ -1090,7 +1101,9 @@ export class ClaudeSlots {
     // Only a row-less fallback file is legacy and potentially belongs to any
     // account. A row for another account must never make that account read it.
     let names: string[] = [];
-    try { names = await this.files.readdir(this.options.stashDir); } catch { /* no fallback directory yet */ }
+    try { names = await this.files.readdir(this.options.stashDir); } catch (error) {
+      if (!missingFile(error)) throw new Error('unclaimed credential unavailable');
+    }
     for (const name of names) {
       if (!name.endsWith('.json')) continue;
       const stashId = name.slice(0, -'.json'.length);
@@ -1131,6 +1144,18 @@ export class ClaudeSlots {
     if (this.directorySync) return this.directorySync(this.options.stashDir);
     const handle = await this.files.open(this.options.stashDir, 'r');
     try { await handle.sync(); } finally { await handle.close(); }
+  }
+
+  private pendingWriterMayBeAlive(pid: number): boolean {
+    // Invalid pids and errors other than ESRCH cannot prove abandonment.
+    if (!Number.isSafeInteger(pid) || pid <= 0) return true;
+    try {
+      if (this.options.isPendingWriterAlive) return this.options.isPendingWriterAlive(pid);
+      process.kill(pid, 0);
+      return true;
+    } catch (error: unknown) {
+      return !(error && typeof error === 'object' && (error as NodeJS.ErrnoException).code === 'ESRCH');
+    }
   }
 
   private async discardReservation(index: UnclaimedIndexEntry): Promise<void> {
