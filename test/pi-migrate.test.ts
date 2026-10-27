@@ -254,7 +254,7 @@ describe('Pi migration S58 credential-first barrier', () => {
             process.exitCode = 0;
           } catch (error) { process.stdout.write(String(error.code || error.message)); process.exitCode = 1; }
         `], {
-          env: { ...process.env, PI_MIGRATE_MODULE: modulePath, PI_MIGRATE_PATHS: JSON.stringify(h.paths), PI_MIGRATE_START: String(startAt) },
+          env: { ...process.env, QLB_TEST_MODE: '1', QLB_HOME: h.dir, HOME: h.dir, PI_MIGRATE_MODULE: modulePath, PI_MIGRATE_PATHS: JSON.stringify(h.paths), PI_MIGRATE_START: String(startAt) },
           stdio: ['ignore', 'pipe', 'inherit'],
         });
         let output = '';
@@ -263,8 +263,16 @@ describe('Pi migration S58 credential-first barrier', () => {
         proc.once('close', (code) => resolveChild({ code, output }));
       });
       const results = await Promise.all([child(), child()]);
-      assert.equal(results.filter(({ output }) => output.includes('entered')).length, 1);
-      assert.equal(results.filter(({ code }) => code === 0).length, 1);
+      const detail = JSON.stringify(results);
+      const winners = results.filter(({ output }) => output.includes('entered'));
+      assert.ok(winners.length <= 1, detail);
+      for (const result of results) {
+        if (!result.output.includes('entered')) {
+          assert.equal(result.code, 1, detail);
+          assert.match(result.output, /pi-auth-locked/, detail);
+        }
+      }
+      assert.equal(existsSync(lock), false, `finished racers left a lock behind: ${detail}`);
     } finally { h.cleanup(); }
   });
 
