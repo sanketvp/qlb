@@ -116,13 +116,13 @@ describe('Claude active refresh provenance decisions (K6-2)', () => {
   it('same-lineage live is the refresh input', () => {
     const live = credential('live');
     const result = choice({ live, creds: live, slotFp: credentialLineage(live) });
-    assert.deepEqual(result, { kind: 'post', input: live, inputLineageIsSlot: true });
+    assert.deepEqual(result, { kind: 'post', input: live, inputLineageIsSlot: true, source: 'live' });
   });
 
   it('cleared live store refreshes from the backup', () => {
     const backup = credential('backup');
     assert.deepEqual(choice({ live: null, backup, slotFp: credentialLineage(backup) }), {
-      kind: 'post', input: backup, inputLineageIsSlot: true,
+      kind: 'post', input: backup, inputLineageIsSlot: true, source: 'slot',
     });
   });
 
@@ -138,7 +138,7 @@ describe('Claude active refresh provenance decisions (K6-2)', () => {
     const live = credential('live', NOW + 60 * 60_000);
     const backup = credential('backup', NOW + 60_000);
     assert.deepEqual(choice({ live, creds: live, backup, slotFp: credentialLineage(backup), attributed: true }), {
-      kind: 'post', input: live, inputLineageIsSlot: false,
+      kind: 'post', input: live, inputLineageIsSlot: false, source: 'live',
     });
   });
 
@@ -148,7 +148,7 @@ describe('Claude active refresh provenance decisions (K6-2)', () => {
     const memo = new ProbeVerdictMemo();
     memo.set('account-a', 'a@example.test', credentialLineage(live)!, { match: true, source: 'post' });
     assert.deepEqual(choice({ live, creds: live, backup, slotFp: credentialLineage(backup), attributed: memo.matches('account-a', 'a@example.test', credentialLineage(live)!) }), {
-      kind: 'post', input: live, inputLineageIsSlot: false,
+      kind: 'post', input: live, inputLineageIsSlot: false, source: 'live',
     });
   });
 
@@ -197,7 +197,7 @@ describe('Claude active refresh provenance decisions (K6-2)', () => {
     const live = credential('old', NOW + 60_000);
     const backup = credential('new', NOW + 60 * 60_000);
     assert.deepEqual(choice({ live, creds: live, backup, slotFp: credentialLineage(backup), forceRefresh: true }), {
-      kind: 'post', input: backup, inputLineageIsSlot: true,
+      kind: 'post', input: backup, inputLineageIsSlot: true, source: 'slot',
     });
   });
 
@@ -288,6 +288,46 @@ describe('Claude active refresh locked branch (K6-3)', () => {
     assert.equal(fixture.slots.getSlot('account-a')!.dead, false);
   });
 
+  it('strikes an unmoved live-sourced invalid_grant by lineage when live bytes differ from the slot', async () => {
+    const fixture = await refreshFixture();
+    const live = JSON.stringify({
+      claudeAiOauth: { accessToken: 'access-live', refreshToken: 'refresh-slot', expiresAt: NOW - 1 },
+      mcpOAuth: { machine: true },
+    });
+    await fixture.backend.set(fixture.liveOptions.paths.keychainService, 'fixture-user', live);
+    const result = await refresh(fixture, {
+      postRefresh: async () => ({ status: 400, body: '{"error":"invalid_grant"}' }),
+    });
+    assert.deepEqual(result, { outcome: 'dead', reason: 'invalid_grant', struckFp: credentialLineage(live) });
+    assert.equal(fixture.slots.getSlot('account-a')!.dead, true);
+  });
+
+  it('does not strike when a live-sourced lineage moves after the POST', async () => {
+    const fixture = await refreshFixture();
+    const result = await refresh(fixture, {
+      postRefresh: async () => {
+        await fixture.backend.set(fixture.liveOptions.paths.keychainService, 'fixture-user', credential('racer'));
+        return { status: 400, body: '{"error":"invalid_grant"}' };
+      },
+    });
+    assert.deepEqual(result, { outcome: 'failed', reason: 'refresh-failed' });
+    assert.equal(fixture.slots.getSlot('account-a')!.dead, false);
+  });
+
+  it('keeps a slot-sourced invalid_grant demotion bound to the slot lineage', async () => {
+    const fixture = await refreshFixture();
+    const observed = credential('observed');
+    await fixture.backend.set(fixture.liveOptions.paths.keychainService, 'fixture-user', observed);
+    const result = await refresh(fixture, {
+      postRefresh: async () => {
+        await fixture.slots.writeSlot('account-a', credential('racer'), { cause: 'post', by: 'qlb-cli', evidence: 'post' });
+        return { status: 400, body: '{"error":"invalid_grant"}' };
+      },
+    }, { creds: observed });
+    assert.deepEqual(result, { outcome: 'failed', reason: 'refresh-failed' });
+    assert.equal(fixture.slots.getSlot('account-a')!.dead, false);
+  });
+
   it('a consumed generation survives a live write failure', async () => {
     const fixture = await refreshFixture();
     const result = await refresh(fixture, { withConfigLock: async () => { throw new Error('fixture live failure'); } });
@@ -311,7 +351,18 @@ describe('Claude active refresh locked branch (K6-3)', () => {
   it('the securestorage override refuses with store-unmirrored and takes no lock', async () => {
     const fixture = await refreshFixture();
     let locks = 0;
-    const result = await refresh(fixture, { env: { CLAUDE_SECURESTORAGE_CONFIG_DIR: '/fixture' }, withConsumeLock: async () => { locks += 1; throw new Error('must not lock'); } });
+    const result = await refresh(fixture, { env: { CLAUDE_SECURESTORAGE_CONFIG_DIR: '/fixture' }, live: { ...fixture.liveOptions, env: undefined }, withConsumeLock: async () => { locks += 1; throw new Error('must not lock'); } });
+    assert.deepEqual(result, { outcome: 'refused', reason: 'store-unmirrored' });
+    assert.equal(locks, 0);
+  });
+
+  it('the live credential environment securestorage override refuses before taking a lock', async () => {
+    const fixture = await refreshFixture();
+    let locks = 0;
+    const result = await refresh(fixture, {
+      live: { ...fixture.liveOptions, env: { ...fixture.liveOptions.env, CLAUDE_SECURESTORAGE_CONFIG_DIR: '/fixture' } },
+      withConsumeLock: async () => { locks += 1; throw new Error('must not lock'); },
+    });
     assert.deepEqual(result, { outcome: 'refused', reason: 'store-unmirrored' });
     assert.equal(locks, 0);
   });

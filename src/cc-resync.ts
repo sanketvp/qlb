@@ -190,7 +190,7 @@ export function adoptRotatedLive(input: AdoptRotatedLiveInput): AdoptRotatedLive
 }
 
 export type RefreshInputDecision =
-  | { kind: 'post'; input: string; inputLineageIsSlot: boolean }
+  | { kind: 'post'; input: string; inputLineageIsSlot: boolean; source: 'live' | 'slot' }
   | { kind: 'restore' }
   | { kind: 'defer'; reason: 'unattributable' | 'live-unattributed-newer' | 'live-moved' };
 
@@ -209,16 +209,16 @@ export interface ChooseRefreshInput {
   now: number;
 }
 
-function postDecision(input: string, slotFp: string | null): Extract<RefreshInputDecision, { kind: 'post' }> {
-  return { kind: 'post', input, inputLineageIsSlot: credentialLineage(input) === slotFp };
+function postDecision(input: string, slotFp: string | null, source: 'live' | 'slot'): Extract<RefreshInputDecision, { kind: 'post' }> {
+  return { kind: 'post', input, inputLineageIsSlot: credentialLineage(input) === slotFp, source };
 }
 
 function backupDecision(input: ChooseRefreshInput): RefreshInputDecision {
   if (!input.backup || !input.backupUsable) {
-    return input.attributed ? postDecision(input.creds, input.slotFp) : { kind: 'defer', reason: 'unattributable' };
+    return input.attributed ? postDecision(input.creds, input.slotFp, 'live') : { kind: 'defer', reason: 'unattributable' };
   }
   if (!input.forceRefresh && !isOAuthTokenExpired(oauthExpiry(input.backup), input.now)) return { kind: 'restore' };
-  return postDecision(input.backup, input.slotFp);
+  return postDecision(input.backup, input.slotFp, 'slot');
 }
 
 /**
@@ -230,15 +230,15 @@ export function chooseRefreshInput(input: ChooseRefreshInput): RefreshInputDecis
   if (!input.live) return backupDecision(input);
 
   const liveFp = credentialLineage(input.live);
-  if (liveFp !== null && liveFp === input.slotFp) return postDecision(input.live, input.slotFp);
+  if (liveFp !== null && liveFp === input.slotFp) return postDecision(input.live, input.slotFp, 'live');
   if (input.live !== input.creds) return { kind: 'defer', reason: 'live-moved' };
 
   const backupFp = credentialLineage(input.backup);
-  if (liveFp !== null && liveFp === backupFp) return postDecision(input.live, input.slotFp);
+  if (liveFp !== null && liveFp === backupFp) return postDecision(input.live, input.slotFp, 'live');
 
   if (expiryValue(input.live) > expiryValue(input.backup) && hasUsablePair(input.live)) {
     return input.attributed
-      ? postDecision(input.live, input.slotFp)
+      ? postDecision(input.live, input.slotFp, 'live')
       : { kind: 'defer', reason: 'live-unattributed-newer' };
   }
   return backupDecision(input);
@@ -364,9 +364,11 @@ export async function refreshActiveLogin(
   input: RefreshActiveLoginInput,
 ): Promise<RefreshOutcome> {
   const finish = (outcome: RefreshOutcome): RefreshOutcome => withForce(input, outcome as Omit<RefreshOutcome, 'forceRecord'>) as RefreshOutcome;
+  const effectiveEnv = deps.live.env ?? deps.env;
+  const liveOptions = { ...deps.live, env: effectiveEnv };
   const earlySlot = deps.slots.getSlot(input.accountId);
   if (earlySlot?.dead) return finish({ outcome: 'dead', reason: earlySlot.deadReason === 'no_refresh_token' ? 'no_refresh_token' : 'invalid_grant', struckFp: null });
-  if (deps.env.CLAUDE_SECURESTORAGE_CONFIG_DIR) return finish({ outcome: 'refused', reason: 'store-unmirrored' });
+  if (effectiveEnv.CLAUDE_SECURESTORAGE_CONFIG_DIR) return finish({ outcome: 'refused', reason: 'store-unmirrored' });
   if (input.degraded) return finish({ outcome: 'deferred', deferReason: 'degraded-read' });
 
   const earlyVerdict = deps.verdicts.get(input.accountId, input.email, credentialLineage(input.creds) ?? '');
@@ -382,8 +384,8 @@ export async function refreshActiveLogin(
     return finish({ outcome: 'refused', reason: 'cswap-process-check-failed' });
   }
 
-  const paths = claudePaths(deps.live);
-  const lockEnv = deps.live.env ?? deps.env;
+  const paths = liveOptions.paths ?? claudePaths(liveOptions);
+  const lockEnv = effectiveEnv;
   const consumeLock: Lock = deps.withConsumeLock ?? ((fn, options) => withClaudeConsumeLock(input.accountId, fn, {
     home: deps.live.home, env: lockEnv, timeoutMs: options?.timeoutMs,
   }));
@@ -406,10 +408,10 @@ export async function refreshActiveLogin(
       if (row.dead) return finish({ outcome: 'dead', reason: row.deadReason === 'no_refresh_token' ? 'no_refresh_token' : 'invalid_grant', struckFp: null });
 
       let live: string | null;
-      try { live = await readLiveClaudeCredentials(deps.live); } catch {
+      try { live = await readLiveClaudeCredentials(liveOptions); } catch {
         return finish({ outcome: 'deferred', deferReason: 'live-read-error' });
       }
-      const readIdentity = deps.readLiveIdentity ?? (() => liveIdentity(paths.globalConfigPath, deps.live.readText));
+      const readIdentity = deps.readLiveIdentity ?? (() => liveIdentity(paths.globalConfigPath, liveOptions.readText));
       if (!identityMatches(readIdentity(), input)) return finish({ outcome: 'deferred', deferReason: 'identity-mismatch' });
 
       let backup: ReadClaudeSlot = locked;
@@ -436,7 +438,7 @@ export async function refreshActiveLogin(
       const publish = async (working: string, mergeLive: boolean): Promise<void> => {
         const shared = mergeLive ? sharedCredentialFields(live) : null;
         const target = shared ? mergeSharedCredentialFields(working, shared) : working;
-        await configLock(() => writeLiveClaudeCredentials(target, deps.live, heldLocks));
+        await configLock(() => writeLiveClaudeCredentials(target, liveOptions, heldLocks));
       };
 
       let choice = decide();
@@ -484,11 +486,16 @@ export async function refreshActiveLogin(
         try { response = await deps.postRefresh(request.request); } catch { return finish({ outcome: 'failed', reason: 'refresh-failed' }); }
         const classified = classifyRefreshResponse(response.status, response.body);
         if (classified.kind === 'dead') {
-          // Re-read source bytes before a permanent strike. A waiting peer may
-          // already have installed a successor with the same account.
-          const current = await deps.slots.readSlot(input.accountId, { fresh: true });
-          if (current.credential !== choice.input) return finish({ outcome: 'failed', reason: 'refresh-failed' });
+          // Re-read the source of the POSTed credential before a permanent
+          // strike. Live and slot blobs can differ while sharing a lineage.
           const fp = credentialLineage(choice.input);
+          let sourceNow: string | null = null;
+          try {
+            sourceNow = choice.source === 'live'
+              ? await readLiveClaudeCredentials(liveOptions)
+              : (await deps.slots.readSlot(input.accountId, { fresh: true })).credential;
+          } catch { /* an unreadable source does not falsely demote the strike */ }
+          if (sourceNow && credentialLineage(sourceNow) !== fp) return finish({ outcome: 'failed', reason: 'refresh-failed' });
           if (!fp) return finish({ outcome: 'failed', reason: 'refresh-failed' });
           try {
             const strike = await deps.slots.strikeDead(input.accountId, { reason: 'invalid_grant', struckFp: fp, ts: deps.now() });
