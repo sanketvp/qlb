@@ -81,14 +81,37 @@ describe('single-account consume gate', () => {
     }
   });
 
-  it('refuses a missing home under node:test without QLB_TEST_MODE in consume and stash paths', async () => {
+  it('refuses a missing home under node:test when deps.env is empty', async () => {
     const keychain = new MockKeychain();
-    const env = { NODE_TEST_CONTEXT: 'child-v8' };
-    await assert.rejects(consumeSingleCredential('xai', credential('before', 'refresh-before'), {
-      keychain, env, lock: createInMemorySingleConsumeLock(), now: () => NOW,
-      refresh: async () => assert.fail('the guard must run before refresh'),
-    }), /explicit home/);
-    await assert.rejects(adoptStashedSuccessor('xai', { access: 'before', refresh: 'refresh-before', expires: NOW + 30_000 }, keychain, { env }), /explicit home/);
+    const originalTestMode = process.env.QLB_TEST_MODE;
+    delete process.env.QLB_TEST_MODE;
+    try {
+      await assert.rejects(consumeSingleCredential('xai', credential('before', 'refresh-before'), {
+        keychain, env: {}, lock: createInMemorySingleConsumeLock(), now: () => NOW,
+        refresh: async () => assert.fail('the guard must run before refresh'),
+      }), /explicit home/);
+      await assert.rejects(adoptStashedSuccessor('xai', { access: 'before', refresh: 'refresh-before', expires: NOW + 30_000 }, keychain, { env: {} }), /explicit home/);
+    } finally {
+      if (originalTestMode === undefined) delete process.env.QLB_TEST_MODE;
+      else process.env.QLB_TEST_MODE = originalTestMode;
+    }
+  });
+
+  it('refuses a missing home under node:test when deps.env has only a provider host', async () => {
+    const keychain = new MockKeychain();
+    const originalTestMode = process.env.QLB_TEST_MODE;
+    delete process.env.QLB_TEST_MODE;
+    try {
+      const env = { KIMI_CODE_OAUTH_HOST: 'http://127.0.0.1:1' };
+      await assert.rejects(consumeSingleCredential('xai', credential('before', 'refresh-before'), {
+        keychain, env, lock: createInMemorySingleConsumeLock(), now: () => NOW,
+        refresh: async () => assert.fail('the guard must run before refresh'),
+      }), /explicit home/);
+      await assert.rejects(adoptStashedSuccessor('xai', { access: 'before', refresh: 'refresh-before', expires: NOW + 30_000 }, keychain, { env }), /explicit home/);
+    } finally {
+      if (originalTestMode === undefined) delete process.env.QLB_TEST_MODE;
+      else process.env.QLB_TEST_MODE = originalTestMode;
+    }
   });
 
   it('stashes an issued successor when persist fails instead of discarding it', async () => {

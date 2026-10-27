@@ -18,6 +18,7 @@ import {
   adoptStashedSuccessor,
   credentialLineage,
   persistStash,
+  requireExplicitHomeUnderNodeTest,
   SingleStashFailure,
   type OAuthCredential as StashCredential,
   type SingleStashKeychain,
@@ -183,10 +184,7 @@ export async function consumeSingleCredential(
   snapshot: CredentialSnapshot,
   deps: SingleConsumeDeps,
 ): Promise<SingleConsumeResult> {
-  const env = deps.env ?? process.env;
-  if (!deps.home && env.NODE_TEST_CONTEXT !== undefined && env.QLB_TEST_MODE !== '1') {
-    throw new Error('an explicit home is required under node:test without QLB_TEST_MODE=1');
-  }
+  requireExplicitHomeUnderNodeTest(deps.home);
   const keychain = deps.keychain ?? platformKeychain;
   const now = deps.now ?? Date.now;
   const lock = deps.lock ?? defaultSingleConsumeLock(deps.home, deps.env);
