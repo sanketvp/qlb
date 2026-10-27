@@ -6,6 +6,7 @@ import { dirname, join } from 'node:path';
 
 import { atomicWriteText, fsyncDirSync } from './fsutil';
 import { isSuccessor } from './lineage-log';
+import type { CswapAgentResult } from './cswap-agent';
 import {
   assertAdmitted,
   beginRetirementFence,
@@ -20,7 +21,7 @@ import { openStoreConnection, type Store } from './store';
 const RECEIPT_MAX_AGE_MS = 10 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const PI_PROVIDERS = ['anthropic', 'openai-codex', 'xai', 'kimi-coding', 'openrouter'] as const;
-const PHASES = ['started', 'archive', 'delete-cswap-items', 'uninstall-cswap', 'remove-launch-artifacts', 'delete-pi-baselines', 'archive-stash', 'committed'] as const;
+const PHASES = ['started', 'drain-cswap', 'archive', 'delete-cswap-items', 'uninstall-cswap', 'remove-launch-artifacts', 'delete-pi-baselines', 'archive-stash', 'committed'] as const;
 type RetirePhase = (typeof PHASES)[number];
 const defaultRetireLock = withRetirementMutationLock;
 
@@ -41,6 +42,15 @@ export interface CswapRetireItem {
 
 /** Every effect must be idempotent: rerunning after a crash completes the same end state safely. */
 export interface CswapRetireEffects {
+  /**
+   * Runs the full idempotent S57 drain: bootout + disable the agent, move its
+   * plist to ~/.qlb/backups/cswap-plist/, wait for cooperative exit, then
+   * flock every C-swap lock for a survivor before SIGTERM. The locks are
+   * released afterwards. The disabled agent and moved plist, not held locks,
+   * keep C-swap from adding or rotating items after this returns; an already
+   * disabled agent with no process is a no-op.
+   */
+  drainCswap(): Promise<CswapAgentResult> | CswapAgentResult;
   archiveCswap(archivePath: string): Promise<void> | void;
   /**
    * For every captured item, delete it only after a fresh fingerprint read
@@ -49,6 +59,11 @@ export interface CswapRetireEffects {
    */
   deleteCswapItems(items: CswapRetireItem[]): Promise<void> | void;
   uninstallCswap(): Promise<void> | void;
+  /**
+   * Final launch cleanup after S57 already booted out, disabled, and moved
+   * the plist: delete that moved plist and any remaining launch files. It
+   * does not disable the agent again.
+   */
   removeCswapLaunchArtifacts(): Promise<void> | void;
   deletePiBaselines(): Promise<void> | void;
   archiveExpiredStash(archivePath: string): Promise<void> | void;
@@ -66,6 +81,11 @@ export interface CswapRetireDependencies {
   hasUnadoptedStash(): boolean;
   claudeSlotsPass(): boolean;
   slots(): RetireSlot[];
+  /**
+   * Returns the C-swap inventory. After C-swap is uninstalled this must not
+   * throw and must return [] (the X4a-4 adapter must enumerate independently
+   * of the removed helper).
+   */
   cswapItems(): CswapRetireItem[];
   /** Must force a Keychain read; it returns only the resulting fingerprint. */
   readSlotFingerprint(accountId: string): Promise<string> | string;
@@ -124,6 +144,17 @@ function phaseAtLeast(actual: RetirePhase, expected: RetirePhase): boolean {
   return PHASES.indexOf(actual) >= PHASES.indexOf(expected);
 }
 
+function sameCswapItems(left: CswapRetireItem[], right: CswapRetireItem[]): boolean {
+  if (left.length !== right.length) return false;
+  const remaining = [...right];
+  for (const item of left) {
+    const index = remaining.findIndex((candidate) => candidate.id === item.id && candidate.fingerprint === item.fingerprint);
+    if (index < 0) return false;
+    remaining.splice(index, 1);
+  }
+  return true;
+}
+
 function validGates(value: unknown): value is RetireGateRecord {
   if (!value || typeof value !== 'object') return false;
   const gates = value as Partial<RetireGateRecord>;
@@ -161,6 +192,9 @@ function writeJournal(dir: string, journal: RetireJournal, fsyncJournalDir: (dir
   }
   atomicWriteText(journalPath(dir), `${JSON.stringify(journal)}\n`, { mode: 0o600 });
   fsyncJournalDir(dir);
+  // Persist journalDir's entry after every journal rename. This also closes
+  // a prior crash between a rename and its parent-directory sync.
+  fsyncJournalDir(dirname(dir));
 }
 
 function checkpoint(
@@ -382,9 +416,40 @@ export async function retireCswap(store: Store, dependencies: CswapRetireDepende
         }
       }
 
-      const effects: Array<[Exclude<RetirePhase, 'started' | 'committed'>, () => Promise<void> | void]> = [
+      let finalCswapItems: CswapRetireItem[] | null = null;
+      // S57 leaves C-swap disabled and its plist moved, while releasing its
+      // locks before returning. Re-run that idempotent sequence on every
+      // resume before remaining C-swap effects through launch cleanup: a
+      // reboot cannot revive the writer between retirement attempts.
+      if (!phaseAtLeast(journal.phase, 'remove-launch-artifacts')) {
+        let drained: CswapAgentResult;
+        try {
+          drained = await dependencies.effects.drainCswap();
+        } catch {
+          return retireRefusal('retirement-effect-failed:drain-cswap');
+        }
+        if (!drained.ok) return retireRefusal('retirement-effect-failed:drain-cswap');
+        dependencies.afterEffect?.('drain-cswap');
+        if (!phaseAtLeast(journal.phase, 'archive')) {
+          try {
+            // The S57 launch state, not a retained flock, keeps C-swap
+            // unscheduled. Before archiving, its exact inventory must still
+            // equal the pre-drain gate record.
+            finalCswapItems = dependencies.cswapItems();
+          } catch {
+            return retireRefusal('cswap-items-unavailable');
+          }
+          if (!sameCswapItems(finalCswapItems, journal.gates.cswapItems)) return retireRefusal('cswap-items-changed');
+        }
+        if (!phaseAtLeast(journal.phase, 'drain-cswap')) {
+          journal = checkpoint(dependencies.journalDir, journal, 'drain-cswap', dependencies.now(), fsyncJournalDir);
+          dependencies.afterCheckpoint?.('drain-cswap');
+        }
+      }
+
+      const effects: Array<[Exclude<RetirePhase, 'started' | 'drain-cswap' | 'committed'>, () => Promise<void> | void]> = [
         ['archive', () => dependencies.effects.archiveCswap(journal!.archivePath)],
-        ['delete-cswap-items', () => dependencies.effects.deleteCswapItems(journal!.gates.cswapItems)],
+        ['delete-cswap-items', () => dependencies.effects.deleteCswapItems(finalCswapItems ?? journal!.gates.cswapItems)],
         ['uninstall-cswap', () => dependencies.effects.uninstallCswap()],
         ['remove-launch-artifacts', () => dependencies.effects.removeCswapLaunchArtifacts()],
         ['delete-pi-baselines', () => dependencies.effects.deletePiBaselines()],
@@ -392,9 +457,6 @@ export async function retireCswap(store: Store, dependencies: CswapRetireDepende
       ];
       for (const [name, effect] of effects) {
         if (phaseAtLeast(journal.phase, name)) continue;
-        // C-swap stays live until its launch artifacts are removed. Recheck
-        // before every remaining C-swap-destructive effect, including resume
-        // after an earlier checkpoint, so only captured fingerprints remain.
         if (name === 'delete-cswap-items' || name === 'uninstall-cswap' || name === 'remove-launch-artifacts') {
           let currentItems: CswapRetireItem[];
           try {
@@ -402,9 +464,13 @@ export async function retireCswap(store: Store, dependencies: CswapRetireDepende
           } catch {
             return retireRefusal('cswap-items-unavailable');
           }
-          if (currentItems.some((item) => !journal!.gates.cswapItems.some(
-            (captured) => captured.id === item.id && captured.fingerprint === item.fingerprint,
-          ))) return retireRefusal('cswap-items-changed');
+          // Before delete, an already absent captured item is harmless. Once
+          // delete has checkpointed, no captured (or new) item may reappear.
+          if (phaseAtLeast(journal.phase, 'delete-cswap-items')
+            ? currentItems.length !== 0
+            : currentItems.some((item) => !journal!.gates.cswapItems.some(
+              (captured) => captured.id === item.id && captured.fingerprint === item.fingerprint,
+            ))) return retireRefusal('cswap-items-changed');
         }
         try {
           await effect();
