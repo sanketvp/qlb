@@ -88,12 +88,45 @@ function isCswapCommand(args: string): boolean {
   return firstPythonScriptIsCswap(args) || (hasPythonInterpreter && hasCswapModule);
 }
 
-/**
- * List running C-swap processes without retaining their command lines.
- * Callers MUST treat a CswapProcessCheckError as "C-swap may be alive" and
- * refuse the guarded operation.
- */
-export function listCswapProcesses(opts: CswapProcessOptions = {}): CswapProcess[] {
+function strictFirstPythonScriptIsCswap(args: string): boolean {
+  let remaining = pythonArguments(args);
+  if (remaining === undefined) return false;
+
+  // Match the liveness classifier's option handling, but inspect only the
+  // first script token. A later argument named cswap is never a signal target.
+  let option: RegExpExecArray | null;
+  while (true) {
+    if (isCswapModuleOption(remaining)) return true;
+    option = /^(?:(?:-W|-X|-Q)\s+\S+|--check-hash-based-pycs(?:=\S+|\s+\S+)|-\S+)\s+/.exec(remaining);
+    if (option === null) break;
+    remaining = remaining.slice(option[0].length);
+  }
+  const script = /^(\S+)/.exec(remaining)?.[1];
+  return script !== undefined && /(^|\/)(cswap|claude-swap)$/.test(script);
+}
+
+function executableToken(args: string): string {
+  const separator = args.indexOf(' ');
+  return separator === -1 ? args : args.slice(0, separator);
+}
+
+/** A positive, argv-position-aware classifier for processes safe to signal. */
+export function isCswapCommandToSignal(args: string): boolean {
+  const executable = executableToken(args);
+  // Exact basename only: a /claude-swap/ install directory can hold other
+  // executables (its venv python, helpers) that must never be signalled.
+  if (/(^|\/)(cswap|claude-swap)$/.test(executable)) return true;
+
+  // pythonArguments is deliberately also used here so interpreter recognition
+  // stays consistent with the liveness guard. Requiring it on argv[0] avoids
+  // mistaking a later argument or script path for the interpreter.
+  return pythonArguments(executable) !== undefined && strictFirstPythonScriptIsCswap(args);
+}
+
+function listCswapProcessesMatching(
+  opts: CswapProcessOptions,
+  matches: (args: string) => boolean,
+): CswapProcess[] {
   const platform = opts.platform ?? process.platform;
   if (platform !== 'darwin' && platform !== 'linux') {
     throw new CswapProcessCheckError(`cannot inspect C-swap processes on ${platform}`);
@@ -114,7 +147,7 @@ export function listCswapProcesses(opts: CswapProcessOptions = {}): CswapProcess
 
     parsedProcessCount += 1;
     const pid = Number(match[1]);
-    if (Number.isSafeInteger(pid) && pid > 0 && isCswapCommand(match[2])) {
+    if (Number.isSafeInteger(pid) && pid > 0 && matches(match[2])) {
       processes.push({ pid });
     }
   }
@@ -124,4 +157,21 @@ export function listCswapProcesses(opts: CswapProcessOptions = {}): CswapProcess
   }
 
   return processes;
+}
+
+/**
+ * List running C-swap processes without retaining their command lines.
+ * Callers MUST treat a CswapProcessCheckError as "C-swap may be alive" and
+ * refuse the guarded operation.
+ */
+export function listCswapProcesses(opts: CswapProcessOptions = {}): CswapProcess[] {
+  return listCswapProcessesMatching(opts, isCswapCommand);
+}
+
+/**
+ * List only C-swap processes positively identified as safe SIGTERM targets.
+ * Like listCswapProcesses, command lines remain local to this scan.
+ */
+export function listCswapProcessesToSignal(opts: CswapProcessOptions = {}): CswapProcess[] {
+  return listCswapProcessesMatching(opts, isCswapCommandToSignal);
 }
