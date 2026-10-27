@@ -21,6 +21,7 @@ import { existsSync, readFileSync } from 'node:fs';
 
 import type { KeychainBackend } from './keychain';
 import { qlbKeychainService } from './keychain';
+import { isCredentialNotFound } from './credential-backends';
 import {
   accountIdForSingleGrant,
   fingerprintApiKey,
@@ -190,6 +191,7 @@ function permitsNativeResync(row: MigrationRow | null): boolean {
 function mergeOwnedGeneration(
   native: ResyncCredential,
   owned: ResyncCredential | null,
+  floorGeneration?: number,
 ): ResyncCredential {
   if (isApiKeyCredential(native)) {
     const out: ApiKeyPayload = { type: 'api-key', access: native.access, writtenBy: 'native-resync' };
@@ -199,7 +201,11 @@ function mergeOwnedGeneration(
     owned && !isApiKeyCredential(owned) ? owned.generation : undefined;
   const grant: Grant = {
     ...native,
-    generation: ownedGen ?? native.generation ?? 0,
+    // With the store generation G as floor: keep a legal ahead K_m (C3 G+1),
+    // never stamp below G (D3: kgen < G is "Keychain older than journal").
+    generation: floorGeneration === undefined
+      ? ownedGen ?? native.generation ?? 0
+      : Math.max(ownedGen ?? floorGeneration, floorGeneration),
     writtenBy: 'native-resync',
   };
   return grant;
@@ -358,12 +364,29 @@ export async function attemptWithNativeResyncRetry<T>(opts: {
   return { result: second, resyncAttempted: resync, retried: true };
 }
 
+/** Sentinel: the item could not be read for a reason other than not-found. */
+const UNREADABLE = Symbol('unreadable');
+
 function readOwnedCredentialRawFromKeychain(
   keychain: KeychainBackend,
   provider: string,
   accountId: string,
   label: string,
-): string | null {
+): string | null;
+function readOwnedCredentialRawFromKeychain(
+  keychain: KeychainBackend,
+  provider: string,
+  accountId: string,
+  label: string,
+  strict: true,
+): string | null | typeof UNREADABLE;
+function readOwnedCredentialRawFromKeychain(
+  keychain: KeychainBackend,
+  provider: string,
+  accountId: string,
+  label: string,
+  strict = false,
+): string | null | typeof UNREADABLE {
   const service = qlbKeychainService(provider, accountId);
   const names = [label, accountId].filter((n) => typeof n === 'string' && n.length > 0);
   const tried = new Set<string>();
@@ -372,9 +395,11 @@ function readOwnedCredentialRawFromKeychain(
     tried.add(account);
     try {
       return keychain.getSync(service, account);
-    } catch {
+    } catch (error) {
       // try the next account name (Codex adapter labels with JWT email,
       // while migration stores the item under the chatgpt_account_id).
+      // In strict mode only not-found means absent (§5.6).
+      if (strict && !isCredentialNotFound(error)) return UNREADABLE;
     }
   }
   return null;
@@ -473,6 +498,7 @@ export function bindDetectAndResync(opts: {
     const migrationStore = migrationStoreNameFor(provider);
     let outerGeneration: number | null = null;
     let outerOwnedSerialized: string | null = null;
+    let outerOwnedRead = false;
     return detectAndResyncFromNative(provider, accountId, {
       keychain: opts.keychain,
       mayWriteOwnedCredential: () =>
@@ -480,7 +506,10 @@ export function bindDetectAndResync(opts: {
       readNativeCredential: () => opts.readNativeCredential(provider, accountId),
       readOwnedCredential: async (keychain, id) => {
         outerGeneration = opts.store.getGrantGeneration(id);
-        outerOwnedSerialized = readOwnedCredentialRawFromKeychain(keychain, provider, id, label);
+        const outerRead = readOwnedCredentialRawFromKeychain(keychain, provider, id, label, true);
+        if (outerRead === UNREADABLE) throw new Error('QLB Keychain item is unreadable');
+        outerOwnedSerialized = outerRead;
+        outerOwnedRead = true;
         if (outerOwnedSerialized === null) return null;
         if (isStaticKeyProvider(provider)) return parseApiKeyPayload(outerOwnedSerialized);
         return parseResyncCredential(outerOwnedSerialized);
@@ -494,14 +523,16 @@ export function bindDetectAndResync(opts: {
         return opts.store.runImmediate(() => {
           if (opts.store.getGrantGeneration(accountId) !== generation) return false;
           if (!permitsNativeResync(opts.store.getMigration(migrationStore))) return false;
+          if (!outerOwnedRead) return false;
           const currentOwnedSerialized = readOwnedCredentialRawFromKeychain(
             opts.keychain,
             provider,
             accountId,
             label,
+            true,
           );
-          if (currentOwnedSerialized !== outerOwnedSerialized) return false;
-          const credential = mergeOwnedGeneration(native, owned);
+          if (currentOwnedSerialized === UNREADABLE || currentOwnedSerialized !== outerOwnedSerialized) return false;
+          const credential = mergeOwnedGeneration(native, owned, generation);
           writeOwnedCredentialToKeychain(opts.keychain, provider, accountId, label, credential);
           return true;
         });

@@ -392,6 +392,42 @@ describe('bindDetectAndResync + MockKeychain', () => {
     store.close();
   });
 
+  it('T-W1 native-resync never stamps K_m below G and fences an unreadable K_m', async () => {
+    const cases = [
+      { name: 'missing K_m is created at G', owned: undefined as number | undefined, unreadable: false, resynced: true, generation: 7 },
+      { name: 'K_m behind G is raised to G', owned: 5, unreadable: false, resynced: true, generation: 7 },
+      { name: 'unreadable K_m is not treated as absent', owned: 7, unreadable: true, resynced: false, generation: 7 },
+    ];
+    for (const c of cases) {
+      const dir = mkdtempSync(join(tmpdir(), 'qlb-resync-floor-'));
+      temps.push(dir);
+      const store = openStore(join(dir, 'qlb.db'));
+      const kc = new MockKeychain();
+      const id = ADAPTER_ACCOUNT_IDS.xai;
+      const label = ADAPTER_ACCOUNT_LABELS.xai;
+      const service = qlbKeychainService('xai', id);
+      store.upsertAccount(id, 'xai', label);
+      assert.equal(store.casGrantGeneration(id, 0, 7), 1);
+      store.upsertMigration('pi-xai', 'QLB_OWNED');
+      if (c.owned !== undefined) kc.setSync(service, label, JSON.stringify({ ...grant('old'), generation: c.owned }));
+      if (c.unreadable) {
+        const getSync = kc.getSync.bind(kc);
+        kc.getSync = (svc: string, account: string) => {
+          if (svc === service) throw new Error('keychain helper timed out');
+          return getSync(svc, account);
+        };
+      }
+      const fn = bindDetectAndResync({ store, keychain: kc, readNativeCredential: async () => ({ ...grant('new'), generation: 0 }) });
+      const result = await fn(id, 'xai');
+      assert.equal(result.resynced, c.resynced, `${c.name}: ${result.reason}`);
+      if (c.unreadable) delete (kc as { getSync?: unknown }).getSync;
+      const stored = parseGrant(kc.getSync(service, label));
+      assert.equal(stored.generation, c.generation, c.name);
+      assert.equal(stored.access, c.resynced ? 'new' : 'old', c.name);
+      store.close();
+    }
+  });
+
   it('T-W1 native-resync preserves a legal ahead K_m generation and fences changed state', async () => {
     const fixtures = [
       {
