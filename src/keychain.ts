@@ -106,6 +106,11 @@ export function qlbKeychainService(provider: string, accountId: string): string 
   return `qlb:${provider}:${accountId}`;
 }
 
+interface ListingCredentialBackend extends CredentialBackend {
+  /** Test-memory enumeration used only for the retirement stash gate. */
+  listServices?(): string[];
+}
+
 export function withServiceGuard(
   backend: CredentialBackend,
   allowlistOptions: KeychainAllowlistOptions = {},
@@ -115,23 +120,31 @@ export function withServiceGuard(
   const effectiveAllowlistOptions = backend.kind === 'test-memory'
     ? { ...allowlistOptions, env: {} }
     : allowlistOptions;
-  return {
+  // The production Keychain has no safe item-listing API. In test mode retain
+  // service names at this facade boundary so the retirement stash gate can be
+  // exercised without ever invoking `security`.
+  const testMemoryItems = new Set<string>();
+  const testMemoryKey = (service: string, account: string) => `${service}\0${account}`;
+  const guarded: ListingCredentialBackend = {
     kind: backend.kind,
-    set(service, account, jsonValue) {
+    async set(service, account, jsonValue) {
       assertKeychainAccess(service, account, 'write', effectiveAllowlistOptions);
-      return backend.set(service, account, jsonValue);
+      await backend.set(service, account, jsonValue);
+      if (backend.kind === 'test-memory') testMemoryItems.add(testMemoryKey(service, account));
     },
     get(service, account) {
       assertKeychainAccess(service, account, 'read', effectiveAllowlistOptions);
       return backend.get(service, account);
     },
-    delete(service, account) {
+    async delete(service, account) {
       assertKeychainAccess(service, account, 'write', effectiveAllowlistOptions);
-      return backend.delete(service, account);
+      await backend.delete(service, account);
+      if (backend.kind === 'test-memory') testMemoryItems.delete(testMemoryKey(service, account));
     },
     setSync(service, account, jsonValue) {
       assertKeychainAccess(service, account, 'write', effectiveAllowlistOptions);
       backend.setSync(service, account, jsonValue);
+      if (backend.kind === 'test-memory') testMemoryItems.add(testMemoryKey(service, account));
     },
     getSync(service, account) {
       assertKeychainAccess(service, account, 'read', effectiveAllowlistOptions);
@@ -140,11 +153,19 @@ export function withServiceGuard(
     deleteSync(service, account) {
       assertKeychainAccess(service, account, 'write', effectiveAllowlistOptions);
       backend.deleteSync(service, account);
+      if (backend.kind === 'test-memory') testMemoryItems.delete(testMemoryKey(service, account));
     },
     assertHelperUsable() {
       backend.assertHelperUsable?.();
     },
+    listServices() {
+      if (backend.kind !== 'test-memory') {
+        throw new Error('credential backend does not support service enumeration');
+      }
+      return [...new Set([...testMemoryItems].map((key) => key.slice(0, key.indexOf('\0'))))];
+    },
   };
+  return guarded;
 }
 
 const rawDarwin = createRawCredentialBackend({
@@ -198,6 +219,44 @@ export async function keychainDelete(
   account: string,
 ): Promise<void> {
   await platformKeychain.delete(service, account);
+}
+
+const UNCLAIMED_SERVICE = /^qlb:[^:]+:unclaimed:/;
+
+/**
+ * Lists the Keychain-first unclaimed-stash index without reading any secret
+ * bytes. macOS `dump-keychain` emits attributes only; in test mode this reads
+ * the guarded in-memory backend instead. Any enumeration or parsing failure
+ * is deliberately visible to the caller, which must fail its gate closed.
+ */
+export function listUnclaimedKeychainServices(): string[] {
+  if (platformKeychain.kind === 'test-memory') {
+    const services = (platformKeychain as ListingCredentialBackend).listServices;
+    if (!services) throw new Error('test Keychain service enumeration is unavailable');
+    return services().filter((service) => UNCLAIMED_SERVICE.test(service));
+  }
+  if (process.platform !== 'darwin') {
+    throw new Error('Keychain service enumeration is unavailable on this platform');
+  }
+  let output: string;
+  try {
+    output = String(execFileUtf8(MACOS_SECURITY_BIN, ['dump-keychain'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: MACOS_SECURITY_TIMEOUT_MS,
+    }));
+  } catch (error) {
+    if (isSecurityTimeout(error)) throw securityTimeoutError('dump-keychain');
+    throw error;
+  }
+  const services: string[] = [];
+  for (const line of output.split(/\r?\n/)) {
+    if (!line.includes('"svce"')) continue;
+    const match = /"svce"<blob>="([^"]*)"/.exec(line);
+    if (!match) throw new Error('unable to parse Keychain service attribute');
+    if (UNCLAIMED_SERVICE.test(match[1])) services.push(match[1]);
+  }
+  return services;
 }
 
 /**

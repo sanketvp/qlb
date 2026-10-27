@@ -1,13 +1,19 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { describe, it } from 'node:test';
 
+import { credentialFingerprint } from '../src/anthropic-oauth';
+import { runRetireCswapCommand, productionDependencies, s64DoctorVerdict } from '../src/commands/retire-cswap';
 import { evaluateRetirementGates, retireCswap, type CswapRetireDependencies, type CswapRetireItem } from '../src/cswap-retire';
 import piRollback, { executePiRollback } from '../src/commands/pi-rollback';
+import { defaultConfig } from '../src/config';
+import { qlbHomeDir } from '../src/home';
+import { listUnclaimedKeychainServices, platformKeychain } from '../src/keychain';
 import { assertAdmitted, beginCutover, beginRetirementFence, phase } from '../src/lifecycle';
+import { defaultPiMigratePaths } from '../src/pi-migrate';
 import { openStore } from '../src/store';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -689,5 +695,118 @@ describe('qlb retire cswap (AC22 retire)', () => {
       assert.equal(existsSync(join(f.deps.journalDir, 'retire-cswap.json')), true);
       assert.equal(phase(f.store).note, 'retirement-in-progress');
     } finally { f.cleanup(); }
+  });
+
+  it('runs the injected production S57 drain in bootout, disable, plist-move, and cooperative-drain order', async () => {
+    const f = fixture();
+    try {
+      const calls: string[] = [];
+      const ctx = { stdout: () => {}, stderr: () => {}, env: { QLB_HOME: f.root, QLB_TEST_MODE: '1' }, home: f.root,
+        config: { ...defaultConfig(f.root), dbPath: f.store.dbPath }, loadConfig: () => defaultConfig(f.root), registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [] };
+      const deps = productionDependencies(f.store, ctx, {
+        bootout: () => { calls.push('bootout'); return { ok: true }; },
+        disable: () => { calls.push('disable'); return { ok: true }; },
+        movePlist: () => { calls.push('move-plist'); return { ok: true }; },
+        restorePlist: () => ({ ok: true }),
+        drain: () => { calls.push('drain'); return { ok: true }; },
+      });
+      assert.deepEqual(await deps.effects.drainCswap(), { ok: true });
+      assert.deepEqual(calls, ['bootout', 'disable', 'move-plist', 'drain']);
+    } finally { f.cleanup(); }
+  });
+
+  it('prints the unprovable slot and exits 3 at the command boundary', async () => {
+    const f = fixture();
+    try {
+      const stdout: string[] = []; const stderr: string[] = [];
+      const code = await runRetireCswapCommand([], {
+        stdout: (message: string) => stdout.push(message), stderr: (message: string) => stderr.push(message), env: { QLB_TEST_MODE: '1' }, home: f.root,
+        config: { ...defaultConfig(f.root), dbPath: f.store.dbPath }, loadConfig: () => defaultConfig(f.root), registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
+      }, { retire: async () => ({ ok: false, code: 'slot-lineage-unprovable:slot-a' }) });
+      assert.equal(code, 3);
+      assert.deepEqual(stdout, []);
+      assert.match(stderr.join('\n'), /slot-lineage-unprovable:slot-a/);
+    } finally { f.cleanup(); }
+  });
+
+  it('uses refresh-token fingerprints for real Claude credential blobs', async () => {
+    const f = fixture();
+    try {
+      const matching = JSON.stringify({ claudeAiOauth: { accessToken: 'access-a', refreshToken: 'refresh-a' } });
+      const different = JSON.stringify({ claudeAiOauth: { accessToken: 'access-b', refreshToken: 'refresh-b' } });
+      const fp = credentialFingerprint(matching)!;
+      f.deps.slots = () => [{ accountId: 'slot-a', source: 'cswap-import', sourceFingerprint: fp, currentFingerprint: fp }];
+      f.deps.readSlotFingerprint = () => credentialFingerprint(matching)!;
+      f.setCswapItems([{ id: 'cswap-a', fingerprint: credentialFingerprint(matching)! }]);
+      assert.deepEqual(await retireCswap(f.store, f.deps), { ok: true, archivePath: join(f.deps.backupsDir, `cswap-retired-${NOW}.tar.gz`) }, 'same refresh token maps');
+      const mismatch = fixture();
+      try {
+        mismatch.deps.slots = () => [{ accountId: 'slot-a', source: 'cswap-import', sourceFingerprint: fp, currentFingerprint: fp }];
+        mismatch.deps.readSlotFingerprint = () => credentialFingerprint(different)!;
+        assert.deepEqual(await retireCswap(mismatch.store, mismatch.deps), { ok: false, code: 'slot-lineage-mismatch:slot-a' });
+      } finally { mismatch.cleanup(); }
+    } finally { f.cleanup(); }
+  });
+
+  it('s64DoctorVerdict tolerates only the lifecycle:window WARN and fails on a provider WARN', () => {
+    const report = {
+      command: 'doctor' as const,
+      overall: 'WARN' as const,
+      checks: [{ name: 'lifecycle:window', level: 'WARN' as const, message: 'expected after window' }],
+      providers: [],
+    };
+    assert.deepEqual(s64DoctorVerdict(report), { overall: 'PASS', autoAgent: 'FAIL' });
+    assert.deepEqual(s64DoctorVerdict({ ...report, providers: [{ provider: 'xai', level: 'WARN', message: 'broken', source: 'fixture', envVar: 'FIXTURE', example: 'fixture' }] }), { overall: 'FAIL', autoAgent: 'FAIL' });
+  });
+
+  it('s64DoctorVerdict reports autoAgent FAIL when no auto:agent check exists and PASS when it is PASS', () => {
+    const base = { command: 'doctor' as const, overall: 'PASS' as const, checks: [], providers: [] };
+    assert.equal(s64DoctorVerdict(base).autoAgent, 'FAIL');
+    assert.equal(s64DoctorVerdict({ ...base, checks: [{ name: 'auto:agent', level: 'PASS', message: 'ok' }] }).autoAgent, 'PASS');
+  });
+
+  it('listUnclaimedKeychainServices finds a stash behind a slot item', () => {
+    platformKeychain.setSync('qlb:anthropic:slot-a', 'qlb', 'fixture-slot');
+    platformKeychain.setSync('qlb:anthropic:unclaimed:123', 'qlb', 'fixture-stash');
+    platformKeychain.setSync('qlb:xai:unclaimed:5', 'qlb', 'fixture-stash');
+    const services = listUnclaimedKeychainServices();
+    assert.ok(services.includes('qlb:anthropic:unclaimed:123'));
+    assert.ok(services.includes('qlb:xai:unclaimed:5'));
+    assert.equal(services.includes('qlb:anthropic:slot-a'), false);
+  });
+
+  it('hasUnadoptedStash fails closed when enumeration throws', async () => {
+    const f = fixture();
+    try {
+      const ctx = { stdout: () => {}, stderr: () => {}, env: { QLB_HOME: f.root, QLB_TEST_MODE: '1' }, home: f.root,
+        config: { ...defaultConfig(f.root), dbPath: f.store.dbPath }, loadConfig: () => defaultConfig(f.root), registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [] };
+      const deps = productionDependencies(f.store, ctx, undefined, () => { throw new Error('enumeration failed'); });
+      assert.throws(() => deps.hasUnadoptedStash(), /enumeration failed/);
+    } finally { f.cleanup(); }
+  });
+
+  it('stash dir and pi-auth baseline dir follow QLB_HOME, not --db-path', () => {
+    const f = fixture();
+    const home = mkdtempSync(join(tmpdir(), 'qlb-retire-home-'));
+    const elsewhere = mkdtempSync(join(tmpdir(), 'qlb-retire-db-'));
+    try {
+      const authPath = join(home, '.pi', 'agent', 'auth.json');
+      const config = { ...defaultConfig(home), dbPath: join(elsewhere, 'custom.db'), piAuthJsonPath: authPath };
+      const ctx = { stdout: () => {}, stderr: () => {}, env: { QLB_HOME: home, QLB_TEST_MODE: '1' }, home,
+        config, loadConfig: () => config, registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [] };
+      const deps = productionDependencies(f.store, ctx);
+      assert.equal(deps.stateDir, join(home, '.qlb'));
+      assert.equal(deps.journalDir, join(home, '.qlb', 'journal'));
+      const baseline = defaultPiMigratePaths(qlbHomeDir(ctx.env), authPath).baselineDir;
+      mkdirSync(baseline, { recursive: true });
+      writeFileSync(join(baseline, 'fixture'), 'fixture');
+      deps.effects.deletePiBaselines();
+      assert.equal(existsSync(baseline), false);
+      assert.equal(existsSync(join(elsewhere, 'backups', 'pi-auth')), false);
+    } finally {
+      f.cleanup();
+      rmSync(home, { recursive: true, force: true });
+      rmSync(elsewhere, { recursive: true, force: true });
+    }
   });
 });

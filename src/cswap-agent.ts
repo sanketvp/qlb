@@ -37,6 +37,18 @@ export interface CswapAgent {
   drain(): CswapAgentResult | Promise<CswapAgentResult>;
 }
 
+/**
+ * The retirement S57 sequence. The agent owns platform effects; this runner
+ * fixes their required order and does not continue after an uncertain step.
+ */
+export async function runRetirementDrain(agent: CswapAgent): Promise<CswapAgentResult> {
+  for (const operation of [agent.bootout, agent.disable, agent.movePlist]) {
+    const result = await operation.call(agent);
+    if (!result.ok) return result;
+  }
+  return agent.drain();
+}
+
 const COOPERATIVE_WAIT_MS = 60_000;
 const LOCK_WAIT_MS = 5 * 60_000;
 const TERM_WAIT_MS = 10_000;
