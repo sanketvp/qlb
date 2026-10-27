@@ -15,6 +15,7 @@ import { join } from 'node:path';
 import { openStoreConnection } from './store';
 import { assertAdmittedInConnection } from './lifecycle';
 import { credentialFingerprint, parseCredentialBlob } from './anthropic-oauth';
+import { withClaudeSwitchLock } from './cc-locks';
 import { isCredentialNotFound } from './credential-backends';
 import { KeychainReadBackoff, platformKeychain, qlbKeychainService, QLB_KEYCHAIN_ACCOUNT } from './keychain';
 import { listStashes, recordStash, removeStash, updateStash, type UnclaimedIndexEntry, type UnclaimedIndexWriteOptions } from './unclaimed-index';
@@ -617,6 +618,8 @@ export interface ClaudeSlotsOptions {
   isPendingWriterAlive?: (pid: number) => boolean;
   /** Test seam invoked after the durable index reservation, before body storage. */
   afterStashReservation?: () => void | Promise<void>;
+  /** Serializes externally-visible slot writers with the consume gate. */
+  withSwitchLock?: <T>(fn: () => Promise<T>) => Promise<T>;
 }
 
 export interface ReadSlotOptions {
@@ -707,6 +710,7 @@ export class ClaudeSlots {
   private readonly platform: NodeJS.Platform;
   private readonly directorySync: ((path: string) => Promise<void>) | undefined;
   private readonly warn: (message: string) => void;
+  private readonly switchLock: <T>(fn: () => Promise<T>) => Promise<T>;
   private readonly cache = new Map<string, CachedSlot>();
   private readonly slotWrites = new Map<string, Promise<void>>();
   private cacheEpoch = 0;
@@ -719,6 +723,7 @@ export class ClaudeSlots {
     this.platform = options.platform ?? process.platform;
     this.directorySync = options.directorySync;
     this.warn = options.warn ?? console.warn;
+    this.switchLock = options.withSwitchLock ?? ((fn) => withClaudeSwitchLock(fn));
   }
 
   listSlots(): ClaudeSlot[] {
@@ -829,7 +834,7 @@ export class ClaudeSlots {
     replace: boolean;
   }): Promise<ClaudeAddEffectsResult> {
     assertSlotId(input.accountId);
-    return this.withSlotWrite(input.accountId, () => this.options.repository.withWriteTransaction(async (onRollback) => {
+    return this.switchLock(() => this.withSlotWrite(input.accountId, () => this.options.repository.withWriteTransaction(async (onRollback) => {
       this.options.repository.assertAddAdmitted();
       const existing = this.options.repository.getSlot(input.accountId);
       if (input.replace ? !existing : Boolean(existing && existing.archivedAt == null)) {
@@ -862,7 +867,7 @@ export class ClaudeSlots {
       });
       this.invalidateCache();
       return result;
-    }));
+    })));
   }
 
   async deleteSlot(accountId: string): Promise<void> {
@@ -1076,7 +1081,7 @@ export class ClaudeSlots {
   async restoreUnclaimed(timestamp: string, accountId: string): Promise<RestoreUnclaimedResult> {
     this.assertExistingTimestamp(timestamp);
     assertSlotId(accountId);
-    return this.withSlotWrite(accountId, async () => {
+    return this.switchLock(async () => this.withSlotWrite(accountId, async () => {
       await this.options.repository.withWriteTransaction(async (onRollback) => {
         const record = await this.readUnclaimed(timestamp);
         if (record.accountId != null && record.accountId !== accountId) {
@@ -1100,7 +1105,7 @@ export class ClaudeSlots {
         // The restore is durable, but callers must disclose the retained copy.
         return { cleanupPending: true };
       }
-    });
+    }));
   }
 
   private async unclaimedEntries(): Promise<UnclaimedIndexEntry[]> {

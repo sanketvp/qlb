@@ -5,6 +5,9 @@
  * Modified for QLB. See NOTICE.
  */
 
+// Gate lock order is consume → switch; the switch lock is not reentrant.
+// Never acquire a consume lock while holding the switch lock.
+
 import { existsSync, statSync } from 'node:fs';
 import { mkdir, rmdir, stat, utimes } from 'node:fs/promises';
 import { performance } from 'node:perf_hooks';
