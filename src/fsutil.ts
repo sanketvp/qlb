@@ -43,6 +43,12 @@ function errno(error: unknown): string | undefined {
     : undefined;
 }
 
+/** Windows and some filesystems cannot open or fsync directory handles. */
+export function isUnsupportedDirectoryFsync(error: unknown): boolean {
+  const code = errno(error);
+  return code === 'EISDIR' || code === 'EPERM' || FSYNC_UNSUPPORTED.has(code ?? '');
+}
+
 function eloop(path: string): NodeJS.ErrnoException {
   const error = new Error(`too many symbolic links resolving '${path}'`) as NodeJS.ErrnoException;
   error.code = 'ELOOP';
@@ -203,12 +209,18 @@ export function atomicWriteBytes(path: string, data: Uint8Array, options: Atomic
  * F_FULLFSYNC.
  */
 export function fsyncDirSync(dir: string): void {
-  const fd = openSync(dir, constants.O_RDONLY);
+  let fd: number;
+  try {
+    fd = openSync(dir, constants.O_RDONLY);
+  } catch (error) {
+    if (isUnsupportedDirectoryFsync(error)) return;
+    throw error;
+  }
   try {
     try {
       fsyncSync(fd);
     } catch (error) {
-      if (!FSYNC_UNSUPPORTED.has(errno(error) ?? '')) throw error;
+      if (!isUnsupportedDirectoryFsync(error)) throw error;
     }
   } finally {
     closeSync(fd);
