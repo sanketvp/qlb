@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -11,6 +11,7 @@ import {
   persistStash,
   type OAuthCredential,
 } from '../src/single-stash';
+import { ClaudeSlots, InMemoryClaudeSlotRepository } from '../src/cc-slots';
 import { MockKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from '../src/keychain';
 import { listStashes, recordStash } from '../src/unclaimed-index';
 
@@ -31,6 +32,7 @@ function root(home: string): string {
 class StashFailingKeychain extends MockKeychain {
   deletes: string[] = [];
   failStashWrites = false;
+  failStashDeletes = false;
 
   override setSync(service: string, account: string, value: string): void {
     if (this.failStashWrites && service.includes(':unclaimed:')) throw new Error('fixture stash write failed');
@@ -38,6 +40,7 @@ class StashFailingKeychain extends MockKeychain {
   }
 
   override deleteSync(service: string, account: string): void {
+    if (this.failStashDeletes && service.includes(':unclaimed:')) throw new Error('fixture stash delete failed');
     this.deletes.push(service);
     super.deleteSync(service, account);
   }
@@ -52,7 +55,7 @@ describe('single-grant stash store', () => {
       await persistStash('xai', credential('issued', 'next'), lineage('before'), keychain, { home, now: () => NOW });
       const [entry] = await listStashes(root(home), 'xai', 'default');
       assert.equal(entry?.location, 'file');
-      assert.equal(existsSync(join(root(home), `${entry?.stashId}.json`)), true);
+      assert.equal(existsSync(join(root(home), 'xai', `${entry?.stashId}.json`)), true);
     } finally {
       await rm(home, { recursive: true, force: true });
     }
@@ -69,7 +72,7 @@ describe('single-grant stash store', () => {
     try {
       await persistStash('xai', successor, lineage('before-refresh'), keychain, { home, now: () => NOW });
       const [entry] = await listStashes(root(home), 'xai', 'default');
-      const file = join(root(home), `${entry!.stashId}.json`);
+      const file = join(root(home), 'xai', `${entry!.stashId}.json`);
 
       assert.deepEqual(await adoptStashedSuccessor('xai', current, keychain, { home }), successor);
       assert.equal(existsSync(file), false);
@@ -96,7 +99,7 @@ describe('single-grant stash store', () => {
 
       assert.deepEqual(await adoptStashedSuccessor('xai', current, keychain, { home }), successor);
       assert.deepEqual(keychain.deletes, [stashService]);
-      assert.equal(existsSync(join(root(home), `${stashId}.json`)), false);
+      assert.equal(existsSync(join(root(home), 'xai', `${stashId}.json`)), false);
       assert.deepEqual(await listStashes(root(home), 'xai', 'default'), []);
     } finally {
       await rm(home, { recursive: true, force: true });
@@ -151,9 +154,10 @@ describe('single-grant stash store', () => {
       await recordStash(root(home), {
         provider: 'xai', accountId: 'default', stashId, consumedFp: lineage('before-refresh'), location: 'file', createdAt: NOW,
       });
-      writeFileSync(join(root(home), `${stashId}.json`), '{not-json', { mode: 0o600 });
+      mkdirSync(join(root(home), 'xai'), { recursive: true, mode: 0o700 });
+      writeFileSync(join(root(home), 'xai', `${stashId}.json`), '{not-json', { mode: 0o600 });
       await assert.rejects(adoptStashedSuccessor('xai', current, keychain, { home }), /stash-unreadable/);
-      assert.equal(readFileSync(join(root(home), `${stashId}.json`), 'utf8'), '{not-json');
+      assert.equal(readFileSync(join(root(home), 'xai', `${stashId}.json`), 'utf8'), '{not-json');
       assert.equal((await listStashes(root(home), 'xai', 'default')).length, 1);
     } finally {
       await rm(home, { recursive: true, force: true });
@@ -175,6 +179,52 @@ describe('single-grant stash store', () => {
       keychain.setSync(qlbKeychainService('xai', `unclaimed:${stashId}`), QLB_KEYCHAIN_ACCOUNT, JSON.stringify({ credential: stale, consumedFp: lineage('same-refresh') }));
       assert.equal(await adoptStashedSuccessor('xai', current, keychain, { home }), null);
       assert.deepEqual(JSON.parse(keychain.getSync(primary, QLB_KEYCHAIN_ACCOUNT)), current);
+      assert.deepEqual(await listStashes(root(home), 'xai', 'default'), []);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it('an xAI file-fallback stash is invisible to Claude\'s unclaimed scan', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'qlb-single-stash-'));
+    const xaiKeychain = new StashFailingKeychain();
+    const claudeKeychain = new MockKeychain();
+    xaiKeychain.failStashWrites = true;
+    const claudeSlots = new ClaudeSlots({
+      backend: claudeKeychain,
+      repository: new InMemoryClaudeSlotRepository(),
+      stashDir: root(home),
+      now: () => NOW,
+    });
+    try {
+      await claudeSlots.createSlot({
+        accountId: 'claude-slot',
+        credential: JSON.stringify({ claudeAiOauth: { accessToken: 'claude-access', refreshToken: 'claude-refresh', expiresAt: NOW + 60_000 } }),
+        source: 'test',
+      });
+      await persistStash('xai', credential('issued', 'next'), lineage('before'), xaiKeychain, { home, now: () => NOW });
+
+      assert.equal(await claudeSlots.adoptStashedSuccessor('claude-slot'), null);
+      assert.deepEqual(await claudeSlots.sweepUnclaimed(), { swept: 0, retained: 0 });
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it('a row left by a failed cleanup is removed on the next pass after the refresh token rotated', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'qlb-single-stash-'));
+    const keychain = new StashFailingKeychain();
+    const current = credential('before', 'before-refresh');
+    const successor = credential('issued', 'next-refresh', NOW + 60_000);
+    const warnings: string[] = [];
+    try {
+      await persistStash('xai', successor, lineage('before-refresh'), keychain, { home, now: () => NOW });
+      keychain.failStashDeletes = true;
+      assert.deepEqual(await adoptStashedSuccessor('xai', current, keychain, { home, warn: (message) => warnings.push(message) }), successor);
+      assert.equal((await listStashes(root(home), 'xai', 'default')).length, 1);
+
+      keychain.failStashDeletes = false;
+      assert.equal(await adoptStashedSuccessor('xai', successor, keychain, { home, warn: (message) => warnings.push(message) }), null);
       assert.deepEqual(await listStashes(root(home), 'xai', 'default'), []);
     } finally {
       await rm(home, { recursive: true, force: true });

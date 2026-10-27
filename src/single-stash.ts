@@ -53,6 +53,14 @@ function stashService(provider: SingleStashProvider, stashId: string): string {
   return qlbKeychainService(provider, `unclaimed:${stashId}`);
 }
 
+function stashFileDirectory(root: string, provider: SingleStashProvider): string {
+  return join(root, provider);
+}
+
+function stashFilePath(root: string, provider: SingleStashProvider, stashId: string): string {
+  return join(stashFileDirectory(root, provider), `${stashId}.json`);
+}
+
 function primaryService(provider: SingleStashProvider): string {
   return qlbKeychainService(provider, 'default');
 }
@@ -79,12 +87,21 @@ async function fsyncDirectory(path: string): Promise<void> {
   try { await handle.sync(); } finally { await handle.close(); }
 }
 
+/** Create the provider directory before publishing body files beneath it. */
+async function ensureStashFileDirectory(root: string, provider: SingleStashProvider): Promise<string> {
+  const directory = stashFileDirectory(root, provider);
+  const created = await mkdir(directory, { recursive: true, mode: 0o700 });
+  await chmod(directory, 0o700);
+  // recordStash creates root before this point. Persist its new child entry too.
+  if (created !== undefined) await fsyncDirectory(root);
+  return directory;
+}
+
 /** Publish a fully fsynced fallback with link(2), never replacing a contender's body. */
-async function writeStashFile(root: string, stashId: string, record: string): Promise<void> {
-  await mkdir(root, { recursive: true, mode: 0o700 });
-  await chmod(root, 0o700);
-  const path = join(root, `${stashId}.json`);
-  const temporary = join(root, `.${stashId}.tmp.${process.pid}.${randomBytes(8).toString('hex')}`);
+async function writeStashFile(root: string, provider: SingleStashProvider, stashId: string, record: string): Promise<void> {
+  const directory = await ensureStashFileDirectory(root, provider);
+  const path = stashFilePath(root, provider, stashId);
+  const temporary = join(directory, `.${stashId}.tmp.${process.pid}.${randomBytes(8).toString('hex')}`);
   const handle = await open(temporary, 'wx', 0o600);
   try {
     await handle.writeFile(record, 'utf8');
@@ -94,7 +111,7 @@ async function writeStashFile(root: string, stashId: string, record: string): Pr
   }
   try {
     await link(temporary, path);
-    await fsyncDirectory(root);
+    await fsyncDirectory(directory);
   } finally {
     await rm(temporary, { force: true });
   }
@@ -104,6 +121,9 @@ async function writeStashFile(root: string, stashId: string, record: string): Pr
  * Reserve a discoverable non-secret row before persisting a successor. A failed
  * Keychain write falls back to a create-only private file. If neither body can
  * be written, the reservation remains so a later pass can prove it absent.
+ *
+ * The caller must hold this provider's consume lock. P13-2 owns that lock, so
+ * adoption cannot remove this reservation while its body is being written.
  */
 export async function persistStash(
   provider: SingleStashProvider,
@@ -135,7 +155,7 @@ export async function persistStash(
     }
 
     try {
-      await writeStashFile(root, stashId, record);
+      await writeStashFile(root, provider, stashId, record);
     } catch {
       // Keep this non-secret reservation for the both-absent recovery rule.
       break;
@@ -159,16 +179,42 @@ function parseCredential(value: unknown): OAuthCredential | null {
   return credential as unknown as OAuthCredential;
 }
 
-function parseStash(text: string, currentFp: string): OAuthCredential | null {
+interface ParsedStash {
+  credential: OAuthCredential;
+  consumedFp: string;
+}
+
+function parseStash(text: string): ParsedStash | null {
   let value: unknown;
   try { value = JSON.parse(text); } catch { return null; }
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   const record = value as { credential?: unknown; consumedFp?: unknown };
-  if (typeof record.consumedFp !== 'string' || record.consumedFp !== currentFp) return null;
-  return parseCredential(record.credential);
+  if (typeof record.consumedFp !== 'string') return null;
+  const credential = parseCredential(record.credential);
+  return credential ? { credential, consumedFp: record.consumedFp } : null;
 }
 
 type ReadLocation = 'keychain' | 'file';
+type StashBodyRead = { text: string; readFrom: ReadLocation } | 'absent' | 'unreadable';
+
+async function readStashBody(
+  provider: SingleStashProvider,
+  entry: UnclaimedIndexEntry,
+  keychain: SingleStashKeychain,
+  root: string,
+): Promise<StashBodyRead> {
+  let keychainError: unknown;
+  try {
+    return { text: keychain.getSync(stashService(provider, entry.stashId), QLB_KEYCHAIN_ACCOUNT), readFrom: 'keychain' };
+  } catch (error) {
+    keychainError = error;
+  }
+  try {
+    return { text: await readFile(stashFilePath(root, provider, entry.stashId), 'utf8'), readFrom: 'file' };
+  } catch (fileError) {
+    return isCredentialNotFound(keychainError) && isMissingFile(fileError) ? 'absent' : 'unreadable';
+  }
+}
 
 async function cleanupReadBody(
   provider: SingleStashProvider,
@@ -180,7 +226,7 @@ async function cleanupReadBody(
   if (readFrom === 'keychain') {
     keychain.deleteSync(stashService(provider, entry.stashId), QLB_KEYCHAIN_ACCOUNT);
   } else {
-    await rm(join(root, `${entry.stashId}.json`));
+    await rm(stashFilePath(root, provider, entry.stashId));
   }
   await removeStash(root, entry);
 }
@@ -192,7 +238,8 @@ function notNewer(successor: OAuthCredential, current: OAuthCredential): boolean
 /**
  * Adopt a matching successor before another refresh POST. Reads intentionally
  * probe Keychain first regardless of the index hint, then remove only the body
- * that was actually read. An ambiguous Keychain failure is fail-closed.
+ * that was actually read. An ambiguous Keychain failure is fail-closed. The
+ * caller must hold this provider's consume lock; P13-2 takes that lock.
  */
 export async function adoptStashedSuccessor(
   provider: SingleStashProvider,
@@ -209,61 +256,60 @@ export async function adoptStashedSuccessor(
   }
 
   const currentFp = credentialLineage(current);
+  let installed = current;
+  let adopted: OAuthCredential | null = null;
   for (const entry of entries) {
-    if (entry.consumedFp !== currentFp) continue;
-
-    let text: string | undefined;
-    let readFrom: ReadLocation | undefined;
-    let keychainError: unknown;
-    try {
-      text = keychain.getSync(stashService(provider, entry.stashId), QLB_KEYCHAIN_ACCOUNT);
-      readFrom = 'keychain';
-    } catch (error) {
-      keychainError = error;
-    }
-    if (text === undefined) {
+    const matching = entry.consumedFp === currentFp;
+    const body = await readStashBody(provider, entry, keychain, root);
+    if (body === 'absent') {
       try {
-        text = await readFile(join(root, `${entry.stashId}.json`), 'utf8');
-        readFrom = 'file';
-      } catch (fileError) {
-        if (isCredentialNotFound(keychainError) && isMissingFile(fileError)) {
-          try {
-            await removeStash(root, entry);
-          } catch {
-            throw new SingleStashFailure('stash-unreadable');
-          }
-          warn(deps, `stash-lost ${entry.stashId} credential-and-file-not-found`);
-          continue;
-        }
-        throw new SingleStashFailure('stash-unreadable');
+        await removeStash(root, entry);
+      } catch {
+        if (matching) throw new SingleStashFailure('stash-unreadable');
+        warn(deps, 'stash-unreadable');
+        continue;
       }
+      warn(deps, `stash-lost ${entry.stashId} credential-and-file-not-found`);
+      continue;
+    }
+    if (body === 'unreadable') {
+      if (matching) throw new SingleStashFailure('stash-unreadable');
+      warn(deps, 'stash-unreadable');
+      continue;
     }
 
-    const successor = parseStash(text, currentFp);
-    if (!successor || !readFrom) throw new SingleStashFailure('stash-unreadable');
-    if (notNewer(successor, current)) {
+    const record = parseStash(body.text);
+    if (!record) {
+      if (matching) throw new SingleStashFailure('stash-unreadable');
+      warn(deps, 'stash-unreadable');
+      continue;
+    }
+    if (matching && record.consumedFp !== currentFp) throw new SingleStashFailure('stash-unreadable');
+    if (notNewer(record.credential, installed)) {
       try {
-        await cleanupReadBody(provider, entry, readFrom, keychain, root);
+        await cleanupReadBody(provider, entry, body.readFrom, keychain, root);
         warn(deps, `stash-obsolete ${entry.stashId} not-newer-than-primary`);
       } catch {
         warn(deps, `stash-cleanup-pending ${entry.stashId}`);
       }
       continue;
     }
+    if (!matching || adopted) continue;
 
     try {
-      keychain.setSync(primaryService(provider), QLB_KEYCHAIN_ACCOUNT, JSON.stringify(successor));
+      keychain.setSync(primaryService(provider), QLB_KEYCHAIN_ACCOUNT, JSON.stringify(record.credential));
     } catch {
       throw new SingleStashFailure('stash-unreadable');
     }
+    installed = record.credential;
+    adopted = record.credential;
     try {
-      await cleanupReadBody(provider, entry, readFrom, keychain, root);
+      await cleanupReadBody(provider, entry, body.readFrom, keychain, root);
     } catch {
-      // The primary is durable. Retaining the body is safe and the next pass
-      // will clean it instead of re-installing an older successor.
+      // The primary is durable. Every later pass evaluates every row against
+      // the installed primary, so a retained body is removed, never reinstalled.
       warn(deps, `stash-cleanup-pending ${entry.stashId}`);
     }
-    return successor;
   }
-  return null;
+  return adopted;
 }
