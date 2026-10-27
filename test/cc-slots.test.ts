@@ -535,10 +535,75 @@ describe('Claude slots (K2)', () => {
       const { slots, repo } = fixture();
       await slots.createSlot({ accountId: 'account-a', credential: credential('one'), source: 'cswap-import' });
       const current = slots.getSlot('account-a')!;
-      assert.equal(slots.strikeDead('account-a', {
+      assert.equal(await slots.strikeDead('account-a', {
         reason: 'invalid_grant', struckFp: current.fingerprint!, ts: 2_000,
       }), 'struck');
       assert.equal(slots.getSlot('account-a')?.dead, true);
+    });
+
+    it('a strike while another write transaction is open waits and commits on its own', async () => {
+      const root = mkdtempSync(join(tmpdir(), 'qlb-cc-slot-strike-queue-'));
+      const dbPath = join(root, 'qlb.db');
+      const store = openStore(dbPath);
+      store.close();
+      const repository = SqliteClaudeSlotRepository.open(dbPath);
+      const slots = new ClaudeSlots({ repository, stashDir: join(root, 'unclaimed') });
+      const struckFp = fingerprint('queued');
+      repository.createSlot(slot('account-a', struckFp));
+      let releaseOuter!: () => void;
+      const outerRelease = new Promise<void>((resolve) => { releaseOuter = resolve; });
+      let started!: () => void;
+      const outerStarted = new Promise<void>((resolve) => { started = resolve; });
+      const outer = repository.withWriteTransaction(async () => {
+        started();
+        await outerRelease;
+        throw new Error('fixture outer rollback');
+      });
+      await outerStarted;
+
+      let settled = false;
+      const strike = Promise.resolve().then(() => slots.strikeDead('account-a', {
+        reason: 'invalid_grant', struckFp, ts: 1_500,
+      }));
+      void strike.then(() => { settled = true; });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(settled, false);
+
+      releaseOuter();
+      await assert.rejects(outer, /fixture outer rollback/);
+      assert.equal(await strike, 'struck');
+      assert.equal(repository.getSlot('account-a')?.dead, true);
+      assert.deepEqual(listReloginEvents(dbPath).map((row) => row.kind), ['dead']);
+      repository.close();
+    });
+
+    it('strikeDead reports struck only after commit', async () => {
+      const repository: ClaudeSlotRepository = new InMemoryClaudeSlotRepository();
+      let releaseCommit!: () => void;
+      const commit = new Promise<void>((resolve) => { releaseCommit = resolve; });
+      let committed = false;
+      repository.withWriteTransaction = async (fn) => {
+        const result = await fn(() => {});
+        await commit;
+        committed = true;
+        return result;
+      };
+      const slots = new ClaudeSlots({ repository, stashDir: join(mkdtempSync(join(tmpdir(), 'qlb-cc-slots-')), 'unclaimed') });
+      const struckFp = fingerprint('commit');
+      repository.createSlot(slot('account-a', struckFp));
+
+      let settled = false;
+      const strike = Promise.resolve().then(() => slots.strikeDead('account-a', {
+        reason: 'invalid_grant', struckFp, ts: 1_500,
+      }));
+      void strike.then(() => { settled = true; });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(settled, false);
+      assert.equal(committed, false);
+
+      releaseCommit();
+      assert.equal(await strike, 'struck');
+      assert.equal(committed, true);
     });
   });
 });

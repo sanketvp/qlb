@@ -826,9 +826,11 @@ export class ClaudeSlots {
     return this.options.repository.getSlot(accountId);
   }
 
-  strikeDead(accountId: string, strike: ClaudeSlotStrike): 'struck' | 'already-dead' | 'lineage-moved' {
+  async strikeDead(accountId: string, strike: ClaudeSlotStrike): Promise<'struck' | 'already-dead' | 'lineage-moved'> {
     assertSlotId(accountId);
-    return this.options.repository.strikeDead(accountId, strike);
+    return this.withSlotWrite(accountId, () => this.options.repository.withWriteTransaction(async () =>
+      this.options.repository.strikeDead(accountId, strike),
+    ));
   }
 
   async createSlot(input: CreateClaudeSlotInput): Promise<ClaudeSlot> {
