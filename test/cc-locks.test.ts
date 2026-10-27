@@ -512,7 +512,10 @@ describe('Claude Code proper-lockfile locks', () => {
       const a = withProperLockfile(lock, {
         onCompromised: () => {},
         timeoutMs: 100,
-        stalenessMs: 10,
+        // A must never judge B's live lock stale while it retries; only B's
+        // short staleness is needed (to take over A's stalled directory).
+        // A 10 ms window let a slow CI runner's late toucher look abandoned.
+        stalenessMs: 60_000,
         touchIntervalMs: 5,
         retryMinMs: 1,
         retryJitterMs: 0,
