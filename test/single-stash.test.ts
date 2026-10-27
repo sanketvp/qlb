@@ -1,0 +1,199 @@
+import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { describe, it } from 'node:test';
+
+import {
+  adoptStashedSuccessor,
+  persistStash,
+  type OAuthCredential,
+} from '../src/single-stash';
+import { MockKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from '../src/keychain';
+import { listStashes, recordStash } from '../src/unclaimed-index';
+
+const NOW = 1_730_000_000_000;
+
+function credential(access: string, refresh: string, expires = NOW + 30_000): OAuthCredential {
+  return { type: 'oauth', access, refresh, expires };
+}
+
+function lineage(refresh: string): string {
+  return `sha256:${createHash('sha256').update(refresh, 'utf8').digest('hex')}`;
+}
+
+function root(home: string): string {
+  return join(home, '.qlb', 'unclaimed');
+}
+
+class StashFailingKeychain extends MockKeychain {
+  deletes: string[] = [];
+  failStashWrites = false;
+
+  override setSync(service: string, account: string, value: string): void {
+    if (this.failStashWrites && service.includes(':unclaimed:')) throw new Error('fixture stash write failed');
+    super.setSync(service, account, value);
+  }
+
+  override deleteSync(service: string, account: string): void {
+    this.deletes.push(service);
+    super.deleteSync(service, account);
+  }
+}
+
+describe('single-grant stash store', () => {
+  it('persists a successor in a create-only file fallback when Keychain storage fails', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'qlb-single-stash-'));
+    const keychain = new StashFailingKeychain();
+    keychain.failStashWrites = true;
+    try {
+      await persistStash('xai', credential('issued', 'next'), lineage('before'), keychain, { home, now: () => NOW });
+      const [entry] = await listStashes(root(home), 'xai', 'default');
+      assert.equal(entry?.location, 'file');
+      assert.equal(existsSync(join(root(home), `${entry?.stashId}.json`)), true);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it('adopting a file-fallback stash deletes the file and its row and never calls the Keychain delete', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'qlb-single-stash-'));
+    const keychain = new StashFailingKeychain();
+    const current = credential('before', 'before-refresh');
+    const successor = credential('issued', 'next-refresh', NOW + 60_000);
+    const primary = qlbKeychainService('xai', 'default');
+    keychain.setSync(primary, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(current));
+    keychain.failStashWrites = true;
+    try {
+      await persistStash('xai', successor, lineage('before-refresh'), keychain, { home, now: () => NOW });
+      const [entry] = await listStashes(root(home), 'xai', 'default');
+      const file = join(root(home), `${entry!.stashId}.json`);
+
+      assert.deepEqual(await adoptStashedSuccessor('xai', current, keychain, { home }), successor);
+      assert.equal(existsSync(file), false);
+      assert.deepEqual(await listStashes(root(home), 'xai', 'default'), []);
+      assert.deepEqual(keychain.deletes, []);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it('adopting a Keychain stash deletes the item and leaves no file', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'qlb-single-stash-'));
+    const keychain = new StashFailingKeychain();
+    const current = credential('before', 'before-refresh');
+    const successor = credential('issued', 'next-refresh', NOW + 60_000);
+    const stashId = 'keychain-stash';
+    const stashService = qlbKeychainService('xai', `unclaimed:${stashId}`);
+    keychain.setSync(qlbKeychainService('xai', 'default'), QLB_KEYCHAIN_ACCOUNT, JSON.stringify(current));
+    try {
+      await recordStash(root(home), {
+        provider: 'xai', accountId: 'default', stashId, consumedFp: lineage('before-refresh'), location: 'keychain', createdAt: NOW,
+      });
+      keychain.setSync(stashService, QLB_KEYCHAIN_ACCOUNT, JSON.stringify({ credential: successor, consumedFp: lineage('before-refresh') }));
+
+      assert.deepEqual(await adoptStashedSuccessor('xai', current, keychain, { home }), successor);
+      assert.deepEqual(keychain.deletes, [stashService]);
+      assert.equal(existsSync(join(root(home), `${stashId}.json`)), false);
+      assert.deepEqual(await listStashes(root(home), 'xai', 'default'), []);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it('three xAI passes after a file-fallback adoption leave zero rows and the primary unchanged', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'qlb-single-stash-'));
+    const keychain = new StashFailingKeychain();
+    const current = credential('before', 'before-refresh');
+    const successor = credential('issued', 'next-refresh', NOW + 60_000);
+    const primary = qlbKeychainService('xai', 'default');
+    keychain.setSync(primary, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(current));
+    keychain.failStashWrites = true;
+    try {
+      await persistStash('xai', successor, lineage('before-refresh'), keychain, { home, now: () => NOW });
+      assert.deepEqual(await adoptStashedSuccessor('xai', current, keychain, { home }), successor);
+      const installed = keychain.getSync(primary, QLB_KEYCHAIN_ACCOUNT);
+      for (let pass = 0; pass < 3; pass += 1) {
+        assert.equal(await adoptStashedSuccessor('xai', successor, keychain, { home }), null);
+      }
+      assert.equal(keychain.getSync(primary, QLB_KEYCHAIN_ACCOUNT), installed);
+      assert.deepEqual(await listStashes(root(home), 'xai', 'default'), []);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it('clears a reservation whose body is absent in both places', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'qlb-single-stash-'));
+    const keychain = new StashFailingKeychain();
+    const current = credential('before', 'before-refresh');
+    const warnings: string[] = [];
+    try {
+      await recordStash(root(home), {
+        provider: 'xai', accountId: 'default', stashId: 'lost-stash', consumedFp: lineage('before-refresh'), location: 'keychain', createdAt: NOW,
+      });
+      assert.equal(await adoptStashedSuccessor('xai', current, keychain, { home, warn: (message) => warnings.push(message) }), null);
+      assert.deepEqual(await listStashes(root(home), 'xai', 'default'), []);
+      assert.deepEqual(warnings, ['stash-lost lost-stash credential-and-file-not-found']);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it('defers a present but corrupt stash rather than treating it as an orphan', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'qlb-single-stash-'));
+    const keychain = new StashFailingKeychain();
+    const current = credential('before', 'before-refresh');
+    const stashId = 'corrupt-stash';
+    try {
+      await recordStash(root(home), {
+        provider: 'xai', accountId: 'default', stashId, consumedFp: lineage('before-refresh'), location: 'file', createdAt: NOW,
+      });
+      writeFileSync(join(root(home), `${stashId}.json`), '{not-json', { mode: 0o600 });
+      await assert.rejects(adoptStashedSuccessor('xai', current, keychain, { home }), /stash-unreadable/);
+      assert.equal(readFileSync(join(root(home), `${stashId}.json`), 'utf8'), '{not-json');
+      assert.equal((await listStashes(root(home), 'xai', 'default')).length, 1);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it('a stash that is not newer than the installed primary is removed, never re-installed', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'qlb-single-stash-'));
+    const keychain = new StashFailingKeychain();
+    const current = credential('primary', 'same-refresh', NOW + 60_000);
+    const stale = credential('stale', 'same-refresh', NOW + 60_000);
+    const stashId = 'obsolete-stash';
+    const primary = qlbKeychainService('xai', 'default');
+    keychain.setSync(primary, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(current));
+    try {
+      await recordStash(root(home), {
+        provider: 'xai', accountId: 'default', stashId, consumedFp: lineage('same-refresh'), location: 'keychain', createdAt: NOW,
+      });
+      keychain.setSync(qlbKeychainService('xai', `unclaimed:${stashId}`), QLB_KEYCHAIN_ACCOUNT, JSON.stringify({ credential: stale, consumedFp: lineage('same-refresh') }));
+      assert.equal(await adoptStashedSuccessor('xai', current, keychain, { home }), null);
+      assert.deepEqual(JSON.parse(keychain.getSync(primary, QLB_KEYCHAIN_ACCOUNT)), current);
+      assert.deepEqual(await listStashes(root(home), 'xai', 'default'), []);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it('a Linux-style operational keychain error with no fallback file defers and keeps the row', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'qlb-single-stash-'));
+    const keychain = new StashFailingKeychain();
+    const current = credential('before', 'before-refresh');
+    try {
+      await recordStash(root(home), {
+        provider: 'xai', accountId: 'default', stashId: 'linux-operational', consumedFp: lineage('before-refresh'), location: 'keychain', createdAt: NOW,
+      });
+      keychain.getSync = () => { throw new Error('keychain get failed: exit 1'); };
+      await assert.rejects(adoptStashedSuccessor('xai', current, keychain, { home }), /stash-unreadable/);
+      assert.equal((await listStashes(root(home), 'xai', 'default')).length, 1);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+});
