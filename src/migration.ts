@@ -1284,10 +1284,16 @@ export class Migration {
       nativeStrategy: 'shadow-retain',
       authJsonKey: keyName,
       provider: this.provider,
+      commitGeneration: undefined,
+      rollbackDecision: undefined,
+      handback: undefined,
+      lastRollback: undefined,
     });
 
-    this.keychain.setSync(service, account, JSON.stringify(grant));
     this.store.upsertAccount(id, this.provider, label, 'imported-unvalidated');
+    this.store.setAccountStatus(id, 'imported-unvalidated');
+    grant.generation = this.store.getGrantGeneration(id) ?? 0;
+    this.keychain.setSync(service, account, JSON.stringify(grant));
     atomicWriteFile(this.stagingPath(), JSON.stringify(owner, null, 2) + '\n');
     return this.status();
   }
