@@ -6,7 +6,8 @@ import { DatabaseSync } from 'node:sqlite';
 import { describe, it } from 'node:test';
 
 import { evaluateRetirementGates, type CswapRetireDependencies } from '../src/cswap-retire';
-import { beginCutover, phase } from '../src/lifecycle';
+import piRollback from '../src/commands/pi-rollback';
+import { beginCutover, beginRetirementFence, phase } from '../src/lifecycle';
 import { openStore } from '../src/store';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -113,6 +114,22 @@ describe('qlb retire cswap (AC22 retire)', () => {
       f.deps.slots = () => [{ accountId: 'slot-a', source: 'cswap-import', sourceFingerprint: 'unrelated', currentFingerprint: 'current-a' }];
     }, 'slot-lineage-unprovable:slot-a');
     await refusal('receipt stale', (f) => f.store.setConfig('report.receiptAt', String(NOW - 10 * 60 * 1000 - 1)), 'report-receipt-stale');
+  });
+
+  it('pi rollback exits 3 retirement-in-progress under the fence', async () => {
+    const f = fixture();
+    try {
+      assert.equal(beginRetirementFence(f.store).ok, true);
+      const errors: string[] = [];
+      const code = await piRollback.execute!(['xai'], {
+        stdout: () => {}, stderr: (message: string) => errors.push(message),
+        env: { QLB_TEST_MODE: '1', QLB_HOME: f.root }, home: f.root,
+        config: { dbPath: f.store.dbPath }, loadConfig: () => ({ dbPath: f.store.dbPath }),
+        registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
+      } as never);
+      assert.equal(code, 3);
+      assert.match(errors.join('\n'), /retirement-in-progress/);
+    } finally { f.cleanup(); }
   });
 
   it('maps C-swap items only when the fresh QLB slot represents them', async () => {

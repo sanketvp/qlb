@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -8,15 +8,20 @@ import { describe, it } from 'node:test';
 import {
   CUTOVER_BEGIN_IN_PROGRESS,
   PHASE_RULES,
+  RETIREMENT_IN_PROGRESS,
   assertAdmitted,
   beginCutover,
+  beginRetirementFence,
+  clearRetirementFence,
   commitCutover,
   extendWindow,
   isOperational,
   lifecycleCheck,
   markDrillDone,
   phase,
+  retirementLockPath,
   transition,
+  withRetirementMutationLock,
   closeLifecycle,
 } from '../src/lifecycle';
 import { cutoverBegin } from '../src/commands/cutover';
@@ -128,6 +133,68 @@ describe('lifecycle (AC49)', () => {
       assert.equal(assertAdmitted(store, 'pi-migrate').code, 'phase=retired');
       assert.ok(PHASE_RULES.retired.has('gate'));
     } finally { store.close(); }
+  });
+
+  it('retirement fence refuses only undo-cswap, undo-cswap:resume, pi-rollback and retire-cswap', () => {
+    const store = fixtureStore();
+    try {
+      beginCutover(store);
+      const db = new DatabaseSync(store.dbPath);
+      try { db.prepare("UPDATE lifecycle SET state = 'cutover', note = ?").run(RETIREMENT_IN_PROGRESS); } finally { db.close(); }
+      for (const operation of ['gate', 'switch:manual', 'switch:auto', 'auto', 'report-cutover', 'claude-add', 'doctor', 'status', 'retire-cswap:resume'] as const) {
+        assert.equal(assertAdmitted(store, operation).ok, true, operation);
+      }
+      for (const operation of ['undo-cswap', 'undo-cswap:resume', 'pi-rollback', 'retire-cswap'] as const) {
+        assert.equal(assertAdmitted(store, operation).code, RETIREMENT_IN_PROGRESS, operation);
+      }
+    } finally { store.close(); }
+  });
+
+  it('retire-cswap:resume is admitted in cutover and retired without a fence', () => {
+    const store = fixtureStore();
+    try {
+      beginCutover(store);
+      const db = new DatabaseSync(store.dbPath);
+      try { db.prepare("UPDATE lifecycle SET state = 'cutover'").run(); } finally { db.close(); }
+      assert.equal(assertAdmitted(store, 'retire-cswap:resume').ok, true);
+      const retired = new DatabaseSync(store.dbPath);
+      try { retired.prepare("UPDATE lifecycle SET state = 'retired'").run(); } finally { retired.close(); }
+      assert.equal(assertAdmitted(store, 'retire-cswap:resume').ok, true);
+    } finally { store.close(); }
+  });
+
+  it('clearRetirementFence refuses outside retired-with-fence', () => {
+    const store = fixtureStore();
+    try {
+      beginCutover(store);
+      assert.equal(beginRetirementFence(store).ok, false);
+      const db = new DatabaseSync(store.dbPath);
+      try { db.prepare("UPDATE lifecycle SET state = 'cutover'").run(); } finally { db.close(); }
+      assert.equal(beginRetirementFence(store).ok, true);
+      assert.equal(beginRetirementFence(store).ok, true, 'idempotent');
+      assert.equal(clearRetirementFence(store).code, 'retirement-fence-state-lost');
+      const retired = new DatabaseSync(store.dbPath);
+      try { retired.prepare("UPDATE lifecycle SET state = 'retired'").run(); } finally { retired.close(); }
+      assert.equal(clearRetirementFence(store).ok, true);
+      assert.equal(phase(store).note, null);
+      assert.equal(clearRetirementFence(store).code, 'retirement-fence-state-lost');
+    } finally { store.close(); }
+  });
+
+  it('withRetirementMutationLock refuses with retirement-locked when the lock dir has no owner file', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-retirement-lock-'));
+    const lockPath = retirementLockPath(join(root, '.qlb'));
+    mkdirSync(lockPath, { recursive: true });
+    let called = false;
+    await assert.rejects(
+      withRetirementMutationLock(lockPath, async () => { called = true; }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'retirement-locked');
+        assert.match(error instanceof Error ? error.message : String(error), new RegExp(lockPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+        return true;
+      },
+    );
+    assert.equal(called, false);
   });
 
   it('refuses a disallowed operation through the executing CLI dispatch path', async () => {

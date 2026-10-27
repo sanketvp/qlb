@@ -1,7 +1,10 @@
+import { join } from 'node:path';
+
 import { platformKeychain } from '../keychain';
 import { qlbHomeDir } from '../home';
 import { defaultPiMigratePaths, rollbackPiSingleProvider, type PiSingleProvider } from '../pi-migrate';
 import { openStore } from '../store';
+import { assertAdmitted, retirementLockPath, withRetirementMutationLock } from '../lifecycle';
 import type { CommandContext, CommandDefinition } from '../registry';
 
 function provider(args: string[]): PiSingleProvider | null {
@@ -17,12 +20,20 @@ async function execute(args: string[], ctx: CommandContext): Promise<number> {
   }
   const store = openStore(ctx.config.dbPath);
   try {
-    rollbackPiSingleProvider(selected, defaultPiMigratePaths(qlbHomeDir(), ctx.config.piAuthJsonPath), { keychain: platformKeychain, store });
-    ctx.stdout(`${selected}: rolled back`);
-    return 0;
+    return await withRetirementMutationLock(retirementLockPath(join(qlbHomeDir(ctx.env), '.qlb')), async () => {
+      const admission = assertAdmitted(store, 'pi-rollback');
+      if (!admission.ok) {
+        ctx.stderr(`qlb pi rollback: refused: ${admission.code}`);
+        return 3;
+      }
+      rollbackPiSingleProvider(selected, defaultPiMigratePaths(qlbHomeDir(ctx.env), ctx.config.piAuthJsonPath), { keychain: platformKeychain, store });
+      ctx.stdout(`${selected}: rolled back`);
+      return 0;
+    });
   } catch (error) {
-    if ((error as { code?: unknown }).code === 'pi-auth-locked') {
-      ctx.stderr('pi-auth-locked');
+    const code = (error as { code?: unknown }).code;
+    if (code === 'pi-auth-locked' || code === 'retirement-locked') {
+      ctx.stderr(code === 'retirement-locked' ? 'retirement-in-progress' : 'pi-auth-locked');
       return 3;
     }
     throw error;
