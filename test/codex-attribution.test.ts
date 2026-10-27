@@ -62,6 +62,39 @@ class PreviousReadErrorKeychain extends MockKeychain {
   }
 }
 
+class CurrentWriteErrorKeychain extends MockKeychain {
+  private failCurrentWrite = false;
+
+  failNextCurrentWrite(): void {
+    this.failCurrentWrite = true;
+  }
+
+  override setSync(service: string, account: string, value: string): void {
+    if (this.failCurrentWrite && !service.endsWith(':prev')) {
+      this.failCurrentWrite = false;
+      throw new Error('fixture current-item write failed before mutation');
+    }
+    super.setSync(service, account, value);
+  }
+}
+
+class CurrentWriteTakeoverKeychain extends MockKeychain {
+  private replacement: string | undefined;
+
+  replaceNextCurrentWriteWith(value: string): void {
+    this.replacement = value;
+  }
+
+  override setSync(service: string, account: string, value: string): void {
+    super.setSync(service, account, value);
+    if (this.replacement !== undefined && !service.endsWith(':prev')) {
+      const replacement = this.replacement;
+      this.replacement = undefined;
+      super.setSync(service, account, replacement);
+    }
+  }
+}
+
 /** Frozen rev4 mistake: it only adopted a live document already proven as a successor. */
 function rev4SuccessorGatedRule(slotFp: string, liveFp: string, isSuccessor: boolean): 'noop' | 'republish-slot' | 'leave' {
   if (slotFp === liveFp) return 'noop';
@@ -250,6 +283,66 @@ describe('Codex live-document attribution (AC57)', () => {
     } finally {
       h.store.close();
       rmSync(h.home, { recursive: true, force: true });
+    }
+  });
+
+  it('a current-item write that throws before mutating still restores :prev', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-codex-current-write-error-'));
+    const keychain = new CurrentWriteErrorKeychain();
+    const store = openStore(join(home, 'qlb.db'));
+    try {
+      const old = document('current-write-error-old');
+      const previous = document('current-write-error-previous');
+      const live = document('current-write-error-live');
+      const plan = importActiveCodexSlot(old, { store, keychain, now: () => 1 });
+      const service = qlbKeychainService('openai-codex', plan.slotId);
+      keychain.setSync(`${service}:prev`, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(previous));
+      keychain.failNextCurrentWrite();
+
+      await assert.rejects(attributeLiveDocument({
+        store,
+        keychain,
+        slot: { accountId: plan.slotId, document: old, fingerprint: codexFingerprint(old) },
+        live,
+        now: () => 2,
+      }), /fixture current-item write failed before mutation/);
+
+      assert.equal(codexFingerprint(JSON.parse(keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT))), codexFingerprint(old));
+      assert.equal(codexFingerprint(JSON.parse(keychain.getSync(`${service}:prev`, QLB_KEYCHAIN_ACCOUNT))), codexFingerprint(previous));
+    } finally {
+      store.close();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('compensation failure keeps the original error as cause and its retryable flag', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-codex-compensation-cause-'));
+    const keychain = new CurrentWriteTakeoverKeychain();
+    const store = openStore(join(home, 'qlb.db'));
+    try {
+      const old = document('compensation-cause-old');
+      const live = document('compensation-cause-live');
+      const foreign = document('compensation-cause-foreign');
+      const plan = importActiveCodexSlot(old, { store, keychain, now: () => 1 });
+      keychain.replaceNextCurrentWriteWith(JSON.stringify(foreign));
+      let assertions = 0;
+
+      await assert.rejects(attributeLiveDocument({
+        store,
+        keychain,
+        slot: { accountId: plan.slotId, document: old, fingerprint: codexFingerprint(old) },
+        live,
+        now: () => 2,
+        assertNotCompromised: () => {
+          assertions += 1;
+          if (assertions >= 5) throw new CodexAuthLockCompromised();
+        },
+      }), (error: unknown) => error instanceof Error &&
+        /Codex Keychain compensation compare-and-set failed/.test(error.message) &&
+        error.cause instanceof CodexAuthLockCompromised && error.cause.retryable);
+    } finally {
+      store.close();
+      rmSync(home, { recursive: true, force: true });
     }
   });
 

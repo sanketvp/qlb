@@ -217,28 +217,34 @@ async function attributeSameSlot(
       // Do not overwrite a real predecessor with that successor.
       if (fingerprintOfStoredDocument(currentBefore) === slotFp) {
         assertNotCompromised(input);
-        wrotePrevious = true;
         input.keychain.setSync(previousService, QLB_KEYCHAIN_ACCOUNT, currentBefore);
+        wrotePrevious = true;
       }
       assertNotCompromised(input);
-      wroteCurrent = true;
       input.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, currentWritten);
+      wroteCurrent = true;
     },
     restoreKeychain: () => {
       // A later adopter may have committed after our write. Compensation is
       // deliberately independent of the lost auth lock: each restoration is
       // a value CAS of bytes this attempt wrote while SQLite excludes QLB
       // adopters.
+      let compareAndSetFailed = false;
       if (wroteCurrent) {
-        if (input.keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT) !== currentWritten) return false;
-        input.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, currentBefore);
+        const current = input.keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT);
+        if (current === currentWritten) input.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, currentBefore);
+        else if (current !== currentBefore) compareAndSetFailed = true;
       }
       if (wrotePrevious) {
-        if (optionalKeychainValue(input.keychain, previousService) !== currentBefore) return false;
-        if (previousBefore === undefined) input.keychain.deleteSync(previousService, QLB_KEYCHAIN_ACCOUNT);
-        else input.keychain.setSync(previousService, QLB_KEYCHAIN_ACCOUNT, previousBefore);
+        const previous = optionalKeychainValue(input.keychain, previousService);
+        if (previous === currentBefore) {
+          if (previousBefore === undefined) input.keychain.deleteSync(previousService, QLB_KEYCHAIN_ACCOUNT);
+          else input.keychain.setSync(previousService, QLB_KEYCHAIN_ACCOUNT, previousBefore);
+        } else if (previous !== previousBefore) {
+          compareAndSetFailed = true;
+        }
       }
-      return true;
+      return !compareAndSetFailed;
     },
   });
   return { action: 'adopt', accountId: input.slot.accountId };

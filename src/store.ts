@@ -1896,7 +1896,7 @@ export class Store {
         // BEGIN may have failed, or SQLite already rolled back.
       }
       if (compensationFailed) {
-        throw new Error(`Codex Keychain compensation compare-and-set failed for ${input.accountId}`);
+        throw new Error(`Codex Keychain compensation compare-and-set failed for ${input.accountId}`, { cause: error });
       }
       throw error;
     }
@@ -2312,7 +2312,7 @@ export class Store {
           }
         }
         if (compensationFailed) {
-          throw new Error(`Codex Keychain compensation compare-and-set failed for ${input.accountId}`);
+          throw new Error(`Codex Keychain compensation compare-and-set failed for ${input.accountId}`, { cause: error });
         }
         throw error;
       }
