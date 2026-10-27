@@ -64,6 +64,14 @@ export interface NativeResyncOpts {
     accountId: string,
     credential: ResyncCredential,
   ) => Promise<void>;
+  /**
+   * Production maintenance writers use this synchronous fenced path so the
+   * Keychain update stays inside the generation transaction.
+   */
+  writeOwnedCredentialInTransaction?: (
+    native: ResyncCredential,
+    owned: ResyncCredential | null,
+  ) => boolean;
   keychain: KeychainBackend;
 }
 
@@ -182,6 +190,7 @@ function permitsNativeResync(row: MigrationRow | null): boolean {
 function mergeOwnedGeneration(
   native: ResyncCredential,
   owned: ResyncCredential | null,
+  generation?: number,
 ): ResyncCredential {
   if (isApiKeyCredential(native)) {
     const out: ApiKeyPayload = { type: 'api-key', access: native.access, writtenBy: 'native-resync' };
@@ -191,7 +200,7 @@ function mergeOwnedGeneration(
     owned && !isApiKeyCredential(owned) ? owned.generation : undefined;
   const grant: Grant = {
     ...native,
-    generation: ownedGen ?? native.generation ?? 0,
+    generation: generation ?? ownedGen ?? native.generation ?? 0,
     writtenBy: 'native-resync',
   };
   return grant;
@@ -254,9 +263,18 @@ export async function detectAndResyncFromNative(
       };
     }
 
-    const toWrite = mergeOwnedGeneration(native, owned);
     try {
-      await opts.writeOwnedCredential(opts.keychain, accountId, toWrite);
+      if (opts.writeOwnedCredentialInTransaction) {
+        if (!opts.writeOwnedCredentialInTransaction(native, owned)) {
+          return {
+            resynced: false,
+            reason: `native resync fenced for ${provider}/${accountId}: generation or ownership changed`,
+          };
+        }
+      } else {
+        const toWrite = mergeOwnedGeneration(native, owned);
+        await opts.writeOwnedCredential(opts.keychain, accountId, toWrite);
+      }
     } catch (err) {
       return {
         resynced: false,
@@ -436,15 +454,30 @@ export function bindDetectAndResync(opts: {
   return async (accountId, provider) => {
     const acct = opts.store.getAccount(accountId);
     const label = acct?.label || accountId;
+    const migrationStore = migrationStoreNameFor(provider);
+    let outerGeneration: number | null = null;
     return detectAndResyncFromNative(provider, accountId, {
       keychain: opts.keychain,
       mayWriteOwnedCredential: () =>
-        permitsNativeResync(opts.store.getMigration(migrationStoreNameFor(provider))),
+        permitsNativeResync(opts.store.getMigration(migrationStore)),
       readNativeCredential: () => opts.readNativeCredential(provider, accountId),
-      readOwnedCredential: async (keychain, id) =>
-        readOwnedCredentialFromKeychain(keychain, provider, id, label),
+      readOwnedCredential: async (keychain, id) => {
+        outerGeneration = opts.store.getGrantGeneration(id);
+        return readOwnedCredentialFromKeychain(keychain, provider, id, label);
+      },
       writeOwnedCredential: async (keychain, id, credential) => {
         writeOwnedCredentialToKeychain(keychain, provider, id, label, credential);
+      },
+      writeOwnedCredentialInTransaction: (native, owned) => {
+        const generation = outerGeneration;
+        if (generation === null) return false;
+        return opts.store.runImmediate(() => {
+          if (opts.store.getGrantGeneration(accountId) !== generation) return false;
+          if (!permitsNativeResync(opts.store.getMigration(migrationStore))) return false;
+          const credential = mergeOwnedGeneration(native, owned, generation);
+          writeOwnedCredentialToKeychain(opts.keychain, provider, accountId, label, credential);
+          return true;
+        });
       },
     });
   };

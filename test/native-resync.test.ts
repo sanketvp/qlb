@@ -392,6 +392,69 @@ describe('bindDetectAndResync + MockKeychain', () => {
     store.close();
   });
 
+  it('T-W1 native-resync writes inside the generation transaction and is fenced by a moved generation', async () => {
+    const fixtures = [
+      {
+        name: 'unchanged generation and journal writes at the current generation',
+        mutate: (_store: ReturnType<typeof openStore>, _id: string) => undefined,
+        resynced: true,
+      },
+      {
+        name: 'moved generation fences the write',
+        mutate: (store: ReturnType<typeof openStore>, id: string) => {
+          const generation = store.getGrantGeneration(id);
+          if (generation === null) throw new Error('missing fixture generation');
+          assert.equal(store.casGrantGeneration(id, generation, generation + 1), 1);
+        },
+        resynced: false,
+      },
+      {
+        name: 'marker added after the outer read fences the write',
+        mutate: (store: ReturnType<typeof openStore>, _id: string) => {
+          store.upsertMigration('pi-xai', 'QLB_OWNED', '{"intent":"rollback"}');
+        },
+        resynced: false,
+      },
+    ];
+
+    for (const fixture of fixtures) {
+      const dir = mkdtempSync(join(tmpdir(), 'qlb-resync-w1-'));
+      temps.push(dir);
+      const store = openStore(join(dir, 'qlb.db'));
+      const kc = new MockKeychain();
+      const id = ADAPTER_ACCOUNT_IDS.xai;
+      const label = ADAPTER_ACCOUNT_LABELS.xai;
+      store.upsertAccount(id, 'xai', label);
+      assert.equal(store.casGrantGeneration(id, 0, 7), 1);
+      store.upsertMigration('pi-xai', 'QLB_OWNED');
+      kc.setSync(qlbKeychainService('xai', id), label, JSON.stringify({ ...grant('old'), generation: 7 }));
+
+      const runImmediate = store.runImmediate.bind(store);
+      store.runImmediate = function <T>(fn: () => T): T {
+        fixture.mutate(store, id);
+        return runImmediate(fn);
+      };
+
+      const result = await bindDetectAndResync({
+        store,
+        keychain: kc,
+        readNativeCredential: async () => grant('new'),
+      })(id, 'xai');
+
+      assert.equal(result.resynced, fixture.resynced, fixture.name);
+      const persisted = parseGrant(kc.getSync(qlbKeychainService('xai', id), label));
+      assert.equal(
+        persisted.access,
+        fixture.resynced ? 'new' : 'old',
+        fixture.name,
+      );
+      if (fixture.resynced) {
+        assert.equal(persisted.generation, 7, fixture.name);
+      }
+      store.close();
+    }
+  });
+
   it('T-W2 native-resync refuses while a hand-back marker is set or the journal is not QLB_OWNED', async () => {
     const cases = [
       { name: 'MIRRORED row with an existing copy', state: 'MIRRORED', detail: '{}', owned: true },
