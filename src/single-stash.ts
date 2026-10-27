@@ -6,6 +6,7 @@ import { chmod, link, mkdir, open, readFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { isCredentialNotFound } from './credential-backends';
+import { fsyncDirSync, isUnsupportedDirectoryFsync } from './fsutil';
 import { qlbHomeDir } from './home';
 import { QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, type KeychainBackend } from './keychain';
 import {
@@ -43,6 +44,8 @@ export interface SingleStashDeps {
   now?: () => number;
   /** Receives only non-secret stash identifiers and fixed reason text. */
   warn?: (message: string) => void;
+  /** Injectable directory durability sync for tests. */
+  directorySync?: (path: string) => Promise<void> | void;
 }
 
 function stashRoot(deps: Pick<SingleStashDeps, 'home' | 'env'>): string {
@@ -82,24 +85,41 @@ function warn(deps: Pick<SingleStashDeps, 'warn'>, message: string): void {
   try { deps.warn?.(message); } catch { /* Diagnostics cannot affect credential safety. */ }
 }
 
-async function fsyncDirectory(path: string): Promise<void> {
-  const handle = await open(path, 'r');
-  try { await handle.sync(); } finally { await handle.close(); }
+async function fsyncDirectory(
+  path: string,
+  directorySync?: (path: string) => Promise<void> | void,
+): Promise<void> {
+  try {
+    if (directorySync) await directorySync(path);
+    else fsyncDirSync(path);
+  } catch (error) {
+    if (!isUnsupportedDirectoryFsync(error)) throw error;
+  }
 }
 
 /** Create the provider directory before publishing body files beneath it. */
-async function ensureStashFileDirectory(root: string, provider: SingleStashProvider): Promise<string> {
+async function ensureStashFileDirectory(
+  root: string,
+  provider: SingleStashProvider,
+  directorySync?: (path: string) => Promise<void> | void,
+): Promise<string> {
   const directory = stashFileDirectory(root, provider);
   const created = await mkdir(directory, { recursive: true, mode: 0o700 });
   await chmod(directory, 0o700);
   // recordStash creates root before this point. Persist its new child entry too.
-  if (created !== undefined) await fsyncDirectory(root);
+  if (created !== undefined) await fsyncDirectory(root, directorySync);
   return directory;
 }
 
 /** Publish a fully fsynced fallback with link(2), never replacing a contender's body. */
-async function writeStashFile(root: string, provider: SingleStashProvider, stashId: string, record: string): Promise<void> {
-  const directory = await ensureStashFileDirectory(root, provider);
+async function writeStashFile(
+  root: string,
+  provider: SingleStashProvider,
+  stashId: string,
+  record: string,
+  directorySync?: (path: string) => Promise<void> | void,
+): Promise<void> {
+  const directory = await ensureStashFileDirectory(root, provider, directorySync);
   const path = stashFilePath(root, provider, stashId);
   const temporary = join(directory, `.${stashId}.tmp.${process.pid}.${randomBytes(8).toString('hex')}`);
   const handle = await open(temporary, 'wx', 0o600);
@@ -111,7 +131,7 @@ async function writeStashFile(root: string, provider: SingleStashProvider, stash
   }
   try {
     await link(temporary, path);
-    await fsyncDirectory(directory);
+    await fsyncDirectory(directory, directorySync);
   } finally {
     await rm(temporary, { force: true });
   }
@@ -130,7 +150,7 @@ export async function persistStash(
   credential: OAuthCredential,
   consumedFp: string,
   keychain: SingleStashKeychain,
-  deps: Pick<SingleStashDeps, 'home' | 'env' | 'now'>,
+  deps: Pick<SingleStashDeps, 'home' | 'env' | 'now' | 'directorySync'>,
 ): Promise<void> {
   const root = stashRoot(deps);
   const now = deps.now ?? Date.now;
@@ -155,7 +175,7 @@ export async function persistStash(
     }
 
     try {
-      await writeStashFile(root, provider, stashId, record);
+      await writeStashFile(root, provider, stashId, record, deps.directorySync);
     } catch {
       // Keep this non-secret reservation for the both-absent recovery rule.
       break;
@@ -265,7 +285,7 @@ export async function adoptStashedSuccessor(
       try {
         await removeStash(root, entry);
       } catch {
-        if (matching) throw new SingleStashFailure('stash-unreadable');
+        if (matching && !adopted) throw new SingleStashFailure('stash-unreadable');
         warn(deps, 'stash-unreadable');
         continue;
       }
@@ -273,24 +293,28 @@ export async function adoptStashedSuccessor(
       continue;
     }
     if (body === 'unreadable') {
-      if (matching) throw new SingleStashFailure('stash-unreadable');
+      if (matching && !adopted) throw new SingleStashFailure('stash-unreadable');
       warn(deps, 'stash-unreadable');
       continue;
     }
 
     const record = parseStash(body.text);
     if (!record) {
-      if (matching) throw new SingleStashFailure('stash-unreadable');
+      if (matching && !adopted) throw new SingleStashFailure('stash-unreadable');
       warn(deps, 'stash-unreadable');
       continue;
     }
-    if (matching && record.consumedFp !== currentFp) throw new SingleStashFailure('stash-unreadable');
+    if (matching && record.consumedFp !== currentFp) {
+      if (!adopted) throw new SingleStashFailure('stash-unreadable');
+      warn(deps, 'stash-unreadable');
+      continue;
+    }
     if (notNewer(record.credential, installed)) {
       try {
         await cleanupReadBody(provider, entry, body.readFrom, keychain, root);
         warn(deps, `stash-obsolete ${entry.stashId} not-newer-than-primary`);
       } catch {
-        warn(deps, `stash-cleanup-pending ${entry.stashId}`);
+        warn(deps, 'stash-cleanup-pending');
       }
       continue;
     }

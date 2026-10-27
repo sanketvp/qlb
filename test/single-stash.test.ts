@@ -33,10 +33,16 @@ class StashFailingKeychain extends MockKeychain {
   deletes: string[] = [];
   failStashWrites = false;
   failStashDeletes = false;
+  failStashReads = new Set<string>();
 
   override setSync(service: string, account: string, value: string): void {
     if (this.failStashWrites && service.includes(':unclaimed:')) throw new Error('fixture stash write failed');
     super.setSync(service, account, value);
+  }
+
+  override getSync(service: string, account: string): string {
+    if (this.failStashReads.has(service)) throw new Error('fixture stash read failed');
+    return super.getSync(service, account);
   }
 
   override deleteSync(service: string, account: string): void {
@@ -56,6 +62,32 @@ describe('single-grant stash store', () => {
       const [entry] = await listStashes(root(home), 'xai', 'default');
       assert.equal(entry?.location, 'file');
       assert.equal(existsSync(join(root(home), 'xai', `${entry?.stashId}.json`)), true);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it('a directory fsync that the platform does not support does not stop the file fallback', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'qlb-single-stash-'));
+    const keychain = new StashFailingKeychain();
+    const directorySyncCalls: string[] = [];
+    keychain.failStashWrites = true;
+    const deps = {
+      home,
+      now: () => NOW,
+      directorySync: async (path: string) => {
+        directorySyncCalls.push(path);
+        const error = new Error('unsupported directory fsync') as NodeJS.ErrnoException;
+        error.code = 'EINVAL';
+        throw error;
+      },
+    };
+    try {
+      await persistStash('xai', credential('issued', 'next'), lineage('before'), keychain, deps);
+      const [entry] = await listStashes(root(home), 'xai', 'default');
+      assert.equal(entry?.location, 'file');
+      assert.equal(existsSync(join(root(home), 'xai', `${entry?.stashId}.json`)), true);
+      assert.deepEqual(directorySyncCalls, [root(home), join(root(home), 'xai')]);
     } finally {
       await rm(home, { recursive: true, force: true });
     }
@@ -206,6 +238,32 @@ describe('single-grant stash store', () => {
 
       assert.equal(await claudeSlots.adoptStashedSuccessor('claude-slot'), null);
       assert.deepEqual(await claudeSlots.sweepUnclaimed(), { swept: 0, retained: 0 });
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it('an unreadable second row after a successful adoption still reports adopted', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'qlb-single-stash-'));
+    const keychain = new StashFailingKeychain();
+    const current = credential('before', 'before-refresh');
+    const successor = credential('issued', 'next-refresh', NOW + 60_000);
+    const firstStashId = 'adopt-first';
+    const secondStashId = 'unreadable-second';
+    const warnings: string[] = [];
+    try {
+      await recordStash(root(home), {
+        provider: 'xai', accountId: 'default', stashId: firstStashId, consumedFp: lineage('before-refresh'), location: 'keychain', createdAt: NOW,
+      });
+      await recordStash(root(home), {
+        provider: 'xai', accountId: 'default', stashId: secondStashId, consumedFp: lineage('before-refresh'), location: 'keychain', createdAt: NOW + 1,
+      });
+      keychain.setSync(qlbKeychainService('xai', `unclaimed:${firstStashId}`), QLB_KEYCHAIN_ACCOUNT, JSON.stringify({ credential: successor, consumedFp: lineage('before-refresh') }));
+      keychain.failStashReads.add(qlbKeychainService('xai', `unclaimed:${secondStashId}`));
+
+      assert.deepEqual(await adoptStashedSuccessor('xai', current, keychain, { home, warn: (message) => warnings.push(message) }), successor);
+      assert.deepEqual(JSON.parse(keychain.getSync(qlbKeychainService('xai', 'default'), QLB_KEYCHAIN_ACCOUNT)), successor);
+      assert.deepEqual(warnings, ['stash-unreadable']);
     } finally {
       await rm(home, { recursive: true, force: true });
     }
