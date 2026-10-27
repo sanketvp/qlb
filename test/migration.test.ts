@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -14,7 +15,6 @@ import {
   type StagedAccount,
 } from '../src/migration';
 import { parseGrant } from '../src/refresh-lease';
-import { withPiAuthLock, writePiOwnerEntry } from '../src/pi-migrate';
 import { openStore } from '../src/store';
 
 const FIXTURE_ACCOUNTS = [
@@ -96,6 +96,51 @@ function mockRehearse(calls: StagedAccount[]): RehearseFn {
     assert.ok(account.grant.refresh, 'rehearse received staged refresh token');
     return { ok: true };
   };
+}
+
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function waitForFile(path: string, description: string): void {
+  const deadline = Date.now() + 2_000;
+  while (!existsSync(path) && Date.now() < deadline) sleepSync(10);
+  assert.ok(existsSync(path), `timed out waiting for ${description}`);
+}
+
+function waitForChild(child: ChildProcess): Promise<number | null> {
+  return new Promise((resolve, reject) => {
+    child.once('error', reject);
+    child.once('exit', (code) => resolve(code));
+  });
+}
+
+function startV2MapWriter(
+  dir: string,
+  ownerPath: string,
+  readyPath: string,
+  acquiredPath: string,
+): ChildProcess {
+  const sourceDir = join(__dirname, '..', 'src');
+  const script = `
+    const { writeFileSync } = require('node:fs');
+    const { join } = require('node:path');
+    const sourceDir = process.argv[1];
+    const dir = process.argv[2];
+    const ownerPath = process.argv[3];
+    const readyPath = process.argv[4];
+    const acquiredPath = process.argv[5];
+    const { withPiAuthLock, writePiOwnerEntry } = require(join(sourceDir, 'pi-migrate.js'));
+    writeFileSync(readyPath, 'ready\\n');
+    withPiAuthLock(join(dir, 'auth.json'), () => {
+      writeFileSync(acquiredPath, 'acquired\\n');
+      writePiOwnerEntry(ownerPath, 'openrouter', true);
+    });
+  `;
+  return spawn(process.execPath, ['-e', script, sourceDir, dir, ownerPath, readyPath, acquiredPath], {
+    env: { ...process.env, QLB_TEST_MODE: '1', QLB_HOME: dir, HOME: dir },
+    stdio: 'ignore',
+  });
 }
 
 interface Harness {
@@ -205,11 +250,14 @@ describe('migration state machine — §4.8.3 / §4.8.3a', () => {
     }
   });
 
-  it('refuses a pool commit when a v2 writer interleaves through the owner-map lock', async () => {
+  it('holds the owner-map lock through the pool commit final check and rename', async () => {
     const h = setup();
     try {
       h.mig.stage();
       await h.mig.rehearse(mockRehearse([]));
+      const readyPath = join(h.dir, 'v2-writer-ready');
+      const acquiredPath = join(h.dir, 'v2-writer-acquired');
+      let writer: ChildProcess | undefined;
       const interleaved = new Migration(
         h.store,
         h.kc,
@@ -218,20 +266,29 @@ describe('migration state machine — §4.8.3 / §4.8.3a', () => {
         undefined,
         {
           beforePoolCommitLock: () => {
-            withPiAuthLock(join(h.dir, 'auth.json'), () => {
-              writePiOwnerEntry(h.ownerPath, 'openrouter', true);
-            });
+            writer = startV2MapWriter(h.dir, h.ownerPath, readyPath, acquiredPath);
+            waitForFile(readyPath, 'the v2 writer to attempt the owner-map lock');
+            sleepSync(100);
+            assert.equal(
+              existsSync(acquiredPath),
+              false,
+              'the v2 writer must still wait while pool commit holds the owner-map lock',
+            );
           },
         },
       );
 
-      assert.throws(() => interleaved.commit(), /owner-map-present: anthropic pool migration waits for P7b8/);
-
-      const owner = JSON.parse(readFileSync(h.ownerPath, 'utf8')) as {
-        providers: Record<string, { mode?: string }>;
-      };
-      assert.equal(owner.providers.openrouter?.mode, 'qlb', 'the v2 entry is never lost to the pool rename');
-      assert.equal(existsSync(stagingOwnerPath(h.ownerPath)), true, 'refused commit leaves staging for rollback');
+      interleaved.commit();
+      assert.ok(writer, 'pool barrier starts the concurrent v2 writer');
+      assert.equal(
+        await waitForChild(writer),
+        1,
+        'after commit releases its lock, the v2 writer sees the legacy pool owner document and refuses it',
+      );
+      assert.equal(existsSync(acquiredPath), true, 'the waiting v2 writer proceeds only after commit releases');
+      const owner = JSON.parse(readFileSync(h.ownerPath, 'utf8')) as { owner?: string };
+      assert.equal(owner.owner, 'qlb', 'the pool owner document remains authoritative');
+      assert.equal(existsSync(stagingOwnerPath(h.ownerPath)), false, 'commit consumes staging');
     } finally {
       h.cleanup();
     }

@@ -308,7 +308,7 @@ export interface MigrationConfig {
    * Never writes the native service.
    */
   readNativeKey?: () => string;
-  /** Test-only barrier before a pool takes the final owner-map lock. */
+  /** Test-only barrier after a pool takes the final owner-map lock. */
   beforePoolCommitLock?: () => void;
 }
 
@@ -848,7 +848,10 @@ export class Migration {
 
   /** Remove every managed OpenRouter copy; only an absent item is idempotent. */
   private deleteStaticKeychain(): void {
-    for (const coords of this.staticKeychainLocations()) {
+    // Keep the gate credential available until the legacy copy is gone. A
+    // non-not-found legacy failure therefore leaves the owner claim and the
+    // working gate credential intact for a safe rollback retry.
+    for (const coords of this.staticKeychainLocations().reverse()) {
       try {
         this.keychain.deleteSync(coords.service, coords.account);
       } catch (error) {
@@ -1109,12 +1112,12 @@ export class Migration {
     }
 
     if (this.kind === 'pool') {
-      // Test-only interleaving barrier. A v2 writer that gets the lock here
-      // must be observed by the final check below, never overwritten.
-      this.beforePoolCommitLock?.();
       // The map can have appeared after stage(). Hold the same lock as every
       // v2 writer from the final P7b8 boundary check through the v1 rename.
       this.withOwnerMapLock(() => {
+        // Test-only interleaving barrier: a v2 writer started here must wait
+        // until this final check and rename have completed.
+        this.beforePoolCommitLock?.();
         this.refusePoolOwnerMap();
         renameSync(staging, this.ownerFilePath);
       });

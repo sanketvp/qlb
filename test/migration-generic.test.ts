@@ -531,6 +531,47 @@ describe('static-key migration — openrouter (single API key, no OAuth)', () =>
     }
   });
 
+  it('keeps the gate credential and owner entry when the legacy delete fails, then retries safely', async () => {
+    const h = setupOpenRouter();
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockOpenRouterRehearse([]));
+      h.mig.commit();
+      const legacyService = qlbKeychainService('openrouter', OPENROUTER_ID);
+      h.kc.setSync(
+        legacyService,
+        OPENROUTER_LABEL,
+        JSON.stringify({ type: 'api-key', access: FAKE_OPENROUTER_KEY }),
+      );
+      const originalDelete = h.kc.deleteSync.bind(h.kc);
+      h.kc.deleteSync = (service, account) => {
+        if (service === legacyService && account === OPENROUTER_LABEL) {
+          throw new Error('fixture Keychain access denied');
+        }
+        originalDelete(service, account);
+      };
+
+      assert.throws(
+        () => h.mig.rollback(),
+        new RegExp(`service=${legacyService} account=${OPENROUTER_LABEL}`),
+      );
+      assert.equal(openrouterKeychainHas(h.kc), true, 'legacy failure leaves the working gate credential readable');
+      const ownerBeforeRetry = JSON.parse(readFileSync(h.ownerPath, 'utf8')) as {
+        providers: Record<string, { mode?: string }>;
+      };
+      assert.equal(ownerBeforeRetry.providers.openrouter?.mode, 'qlb', 'legacy failure leaves the owner entry present');
+
+      h.kc.deleteSync = originalDelete;
+      const rolled = h.mig.rollback();
+      assert.equal(rolled.state, 'VALIDATED');
+      assert.equal(openrouterKeychainHas(h.kc), false, 'retry removes the gate credential');
+      assert.throws(() => h.kc.getSync(legacyService, OPENROUTER_LABEL), /not found/i);
+      assert.equal(existsSync(h.ownerPath), false, 'retry removes the final owner entry');
+    } finally {
+      h.cleanup();
+    }
+  });
+
   it("openrouter rollback removes only its entry and keeps xai's", () => {
     const h = setupOpenRouter();
     try {
