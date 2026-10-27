@@ -41,6 +41,17 @@ describe('unclaimed stash index', () => {
     });
   });
 
+  it('round trips a pending writer marker while legacy rows remain optional', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-unclaimed-index-'));
+    const entry = {
+      provider: 'anthropic', accountId: 'account-a', stashId: 'pending-stash', consumedFp: 'sha256:lineage-a',
+      location: 'keychain' as const, createdAt: 1_000, pending: 123,
+    };
+
+    await recordStash(root, entry);
+    assert.deepEqual(await listStashes(root, 'anthropic'), [entry]);
+  });
+
   it('atomically records, lists by account, and removes non-secret stash metadata', async () => {
     const root = mkdtempSync(join(tmpdir(), 'qlb-unclaimed-index-'));
     const entry = {

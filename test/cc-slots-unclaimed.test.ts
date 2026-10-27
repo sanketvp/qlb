@@ -1,17 +1,26 @@
 import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import * as fs from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
-import { ClaudeSlots, InMemoryClaudeSlotRepository, SqliteClaudeSlotRepository, type ClaudeSlotBackend } from '../src/cc-slots';
+import { ClaudeSlots, InMemoryClaudeSlotRepository, SqliteClaudeSlotRepository, type ClaudeSlotBackend, type ClaudeSlotFileOps } from '../src/cc-slots';
 import { runClaudeRestoreUnclaimedCommand } from '../src/commands/claude-restore-unclaimed';
 import { MockKeychain } from '../src/keychain';
-import { listStashes } from '../src/unclaimed-index';
+import { listStashes, recordStash } from '../src/unclaimed-index';
 import { openStore } from '../src/store';
 import type { CommandContext } from '../src/registry';
 
-function credential(tag: string): string {
+function credential(tag: string, expiresAt = tag === 'issued' ? 2_000 : 1_000): string {
+  return JSON.stringify({ claudeAiOauth: { accessToken: `access-${tag}`, refreshToken: `refresh-${tag}`, expiresAt } });
+}
+
+function credentialWithRefresh(tag: string, refreshToken: string, expiresAt: number): string {
+  return JSON.stringify({ claudeAiOauth: { accessToken: `access-${tag}`, refreshToken, expiresAt } });
+}
+
+function credentialWithoutExpiry(tag: string): string {
   return JSON.stringify({ claudeAiOauth: { accessToken: `access-${tag}`, refreshToken: `refresh-${tag}` } });
 }
 
@@ -53,15 +62,17 @@ function fixture(options: {
   platform?: NodeJS.Platform;
   directorySync?: (path: string) => Promise<void>;
   warn?: (message: string) => void;
-} = {}): { slots: ClaudeSlots; backend: StashFailingBackend; stashDir: string } {
+  files?: ClaudeSlotFileOps;
+  isPendingWriterAlive?: (pid: number) => boolean;
+  afterStashReservation?: () => void | Promise<void>;
+} = {}): { slots: ClaudeSlots; backend: StashFailingBackend; repository: InMemoryClaudeSlotRepository; stashDir: string } {
   const stashDir = join(mkdtempSync(join(tmpdir(), 'qlb-unclaimed-')), 'unclaimed');
   const backend = new StashFailingBackend();
+  const repository = new InMemoryClaudeSlotRepository();
   return {
-    slots: new ClaudeSlots({
-      backend, repository: new InMemoryClaudeSlotRepository(), stashDir, now: () => 1_000,
-      ...options,
-    }),
+    slots: new ClaudeSlots({ backend, repository, stashDir, now: () => 1_000, ...options }),
     backend,
+    repository,
     stashDir,
   };
 }
@@ -259,6 +270,193 @@ describe('Claude unclaimed stash and restore (K2 / AC48)', () => {
     assert.equal(readFileSync(join(stashDir, 'different-copy.json'), 'utf8').length > 0, true);
     assert.equal((await backend.get('qlb:anthropic:unclaimed:different-copy', 'qlb')).length > 0, true);
     assert.deepEqual(warnings, ['unclaimed fallback conflicts with Keychain entry for different-copy']);
+  });
+
+  it('discovers and adopts a legacy fallback file that has no index row', async () => {
+    const { slots, stashDir } = fixture();
+    await slots.createSlot({ accountId: 'account-a', credential: credential('one'), source: 'cswap-import' });
+    const current = (await slots.readSlot('account-a')).fingerprint;
+    mkdirSync(stashDir, { recursive: true, mode: 0o700 });
+    writeFileSync(join(stashDir, 'legacy-file.json'), JSON.stringify({ credential: credential('issued'), consumedFp: current }), { mode: 0o600 });
+
+    assert.equal((await slots.adoptStashedSuccessor('account-a'))?.credential, credential('issued'));
+  });
+
+  it('a fresh instance adopts a prior Keychain stash', async () => {
+    const { slots, backend, repository, stashDir } = fixture();
+    await slots.createSlot({ accountId: 'account-a', credential: credential('one'), source: 'cswap-import' });
+    const current = (await slots.readSlot('account-a')).fingerprint;
+    await slots.stashUnclaimed('fresh-keychain', credential('issued'), current, 'account-a');
+
+    const fresh = new ClaudeSlots({ backend, repository, stashDir, now: () => 1_000 });
+    assert.equal((await fresh.adoptStashedSuccessor('account-a'))?.credential, credential('issued'));
+  });
+
+  it('a malformed index row defers adoption with unclaimed credential unavailable', async () => {
+    const { slots, backend, stashDir } = fixture();
+    await slots.createSlot({ accountId: 'account-a', credential: credential('one'), source: 'cswap-import' });
+    const current = (await slots.readSlot('account-a')).fingerprint;
+    await slots.stashUnclaimed('keychain-intact', credential('issued'), current, 'account-a');
+    mkdirSync(join(stashDir, 'index', 'anthropic'), { recursive: true, mode: 0o700 });
+    writeFileSync(join(stashDir, 'index', 'anthropic', 'other.json'), '{not json', { mode: 0o600 });
+
+    await assert.rejects(slots.adoptStashedSuccessor('account-a'), /unclaimed credential unavailable/);
+    assert.equal((await backend.get('qlb:anthropic:unclaimed:keychain-intact', 'qlb')).length > 0, true);
+  });
+
+  it("another account's corrupt fallback file does not defer this account", async () => {
+    const { slots, stashDir } = fixture();
+    await slots.createSlot({ accountId: 'account-a', credential: credential('a'), source: 'cswap-import' });
+    await slots.createSlot({ accountId: 'account-b', credential: credential('b'), source: 'cswap-import' });
+    const current = (await slots.readSlot('account-a')).fingerprint;
+    await recordStash(stashDir, {
+      provider: 'anthropic', accountId: 'account-a', stashId: 'a-corrupt-file', consumedFp: current,
+      location: 'file', createdAt: 1,
+    });
+    mkdirSync(stashDir, { recursive: true, mode: 0o700 });
+    writeFileSync(join(stashDir, 'a-corrupt-file.json'), '{not json', { mode: 0o600 });
+
+    assert.equal(await slots.adoptStashedSuccessor('account-b'), null);
+  });
+
+  it('defers an account whose own fallback body is corrupt', async () => {
+    const { slots, stashDir } = fixture();
+    await slots.createSlot({ accountId: 'account-a', credential: credential('a'), source: 'cswap-import' });
+    const current = (await slots.readSlot('account-a')).fingerprint;
+    await recordStash(stashDir, {
+      provider: 'anthropic', accountId: 'account-a', stashId: 'own-corrupt-file', consumedFp: current,
+      location: 'file', createdAt: 1,
+    });
+    mkdirSync(stashDir, { recursive: true, mode: 0o700 });
+    writeFileSync(join(stashDir, 'own-corrupt-file.json'), '{not json', { mode: 0o600 });
+
+    await assert.rejects(slots.adoptStashedSuccessor('account-a'), /unclaimed credential unavailable/);
+    assert.equal((await listStashes(stashDir, 'anthropic')).length, 1);
+  });
+
+  it('refuses to adopt a record whose accountId names another account', async () => {
+    const { slots, backend } = fixture();
+    const currentCredential = credentialWithRefresh('current', 'shared-refresh', 1_000);
+    await slots.createSlot({ accountId: 'account-a', credential: currentCredential, source: 'cswap-import' });
+    await slots.createSlot({ accountId: 'account-b', credential: currentCredential, source: 'cswap-import' });
+    const current = (await slots.readSlot('account-a')).fingerprint;
+    await slots.stashUnclaimed('foreign-account', credentialWithRefresh('issued', 'next-refresh', 2_000), current, 'account-a');
+
+    assert.equal(await slots.adoptStashedSuccessor('account-b'), null);
+    assert.notEqual(await backend.get('qlb:anthropic:unclaimed:foreign-account', 'qlb'), '');
+    await assert.rejects(slots.restoreUnclaimed('foreign-account', 'account-b'), /belongs to a different account/);
+  });
+
+  it('defers an in-progress reservation until its body is durable, then adopts it', async () => {
+    let rowsDuringReservation: Awaited<ReturnType<typeof listStashes>> = [];
+    const { slots, stashDir } = fixture({
+      isPendingWriterAlive: () => true,
+      afterStashReservation: async () => {
+        assert.equal(await slots.adoptStashedSuccessor('account-a'), null);
+        rowsDuringReservation = await listStashes(stashDir, 'anthropic');
+      },
+    });
+    await slots.createSlot({ accountId: 'account-a', credential: credential('one'), source: 'cswap-import' });
+    const current = (await slots.readSlot('account-a')).fingerprint;
+
+    await slots.stashUnclaimed('in-progress-stash', credential('issued'), current, 'account-a');
+
+    assert.equal(rowsDuringReservation.length, 1);
+    assert.equal(rowsDuringReservation[0]?.pending, process.pid);
+    assert.equal((await listStashes(stashDir, 'anthropic'))[0]?.pending, undefined);
+    assert.equal((await slots.adoptStashedSuccessor('account-a'))?.credential, credential('issued'));
+  });
+
+  it('clears a both-absent pending reservation after its writer is dead', async () => {
+    const warnings: string[] = [];
+    const { slots, stashDir } = fixture({ isPendingWriterAlive: () => false, warn: (message) => warnings.push(message) });
+    await slots.createSlot({ accountId: 'account-a', credential: credential('one'), source: 'cswap-import' });
+    const current = (await slots.readSlot('account-a')).fingerprint;
+    await recordStash(stashDir, {
+      provider: 'anthropic', accountId: 'account-a', stashId: 'dead-pending', consumedFp: current,
+      location: 'keychain', createdAt: 1, pending: 123,
+    });
+
+    assert.equal(await slots.adoptStashedSuccessor('account-a'), null);
+    assert.deepEqual(await listStashes(stashDir, 'anthropic'), []);
+    assert.deepEqual(warnings, ['stash-lost dead-pending credential-and-file-not-found']);
+  });
+
+  it('clears both absent legacy rows, records stash-lost, and continues', async () => {
+    const warnings: string[] = [];
+    const { slots, stashDir } = fixture({ warn: (message) => warnings.push(message) });
+    await slots.createSlot({ accountId: 'account-a', credential: credential('one'), source: 'cswap-import' });
+    const current = (await slots.readSlot('account-a')).fingerprint;
+    await recordStash(stashDir, { provider: 'anthropic', accountId: 'account-a', stashId: 'lost-keychain', consumedFp: current, location: 'keychain', createdAt: 1 });
+    await recordStash(stashDir, { provider: 'anthropic', accountId: 'account-a', stashId: 'lost-file', consumedFp: current, location: 'file', createdAt: 2 });
+
+    assert.equal(await slots.adoptStashedSuccessor('account-a'), null);
+    assert.deepEqual(await listStashes(stashDir, 'anthropic'), []);
+    assert.deepEqual(warnings, [
+      'stash-lost lost-keychain credential-and-file-not-found',
+      'stash-lost lost-file credential-and-file-not-found',
+    ]);
+  });
+
+  it('a Linux-style operational keychain error with no fallback file defers and keeps the row', async () => {
+    const { slots, backend, stashDir } = fixture();
+    await slots.createSlot({ accountId: 'account-a', credential: credential('one'), source: 'cswap-import' });
+    const current = (await slots.readSlot('account-a')).fingerprint;
+    await recordStash(stashDir, { provider: 'anthropic', accountId: 'account-a', stashId: 'linux-operational', consumedFp: current, location: 'keychain', createdAt: 1 });
+    const originalGet = backend.get.bind(backend);
+    backend.get = async (service, account) => {
+      if (service.includes(':unclaimed:')) throw new Error('keychain get failed: exit 1');
+      return originalGet(service, account);
+    };
+
+    await assert.rejects(slots.adoptStashedSuccessor('account-a'), /unclaimed credential unavailable/);
+    assert.equal((await listStashes(stashDir, 'anthropic')).length, 1);
+  });
+
+  it('adopts a matching successor when the installed primary has no expiry', async () => {
+    const { slots } = fixture();
+    await slots.createSlot({ accountId: 'account-a', credential: credentialWithoutExpiry('one'), source: 'cswap-import' });
+    const current = (await slots.readSlot('account-a')).fingerprint;
+    await slots.stashUnclaimed('unknown-primary-expiry', credential('issued', 2_000), current, 'account-a');
+
+    assert.equal((await slots.adoptStashedSuccessor('account-a'))?.credential, credential('issued', 2_000));
+  });
+
+  it('adopts a matching successor when the successor has no expiry', async () => {
+    const { slots } = fixture();
+    await slots.createSlot({ accountId: 'account-a', credential: credential('one', 1_000), source: 'cswap-import' });
+    const current = (await slots.readSlot('account-a')).fingerprint;
+    await slots.stashUnclaimed('unknown-successor-expiry', credentialWithoutExpiry('issued'), current, 'account-a');
+
+    assert.equal((await slots.adoptStashedSuccessor('account-a'))?.credential, credentialWithoutExpiry('issued'));
+  });
+
+  it('fails closed when fallback discovery cannot read its directory', async () => {
+    const { slots, stashDir } = fixture({
+      files: {
+        mkdir: fs.mkdir, chmod: fs.chmod, open: fs.open, link: fs.link, lstat: fs.lstat, readFile: fs.readFile, rm: fs.rm,
+        readdir: async (path) => {
+          if (path === stashDir) throw Object.assign(new Error('fixture unreadable directory'), { code: 'EACCES' });
+          return fs.readdir(path);
+        },
+      },
+    });
+    await slots.createSlot({ accountId: 'account-a', credential: credential('one'), source: 'cswap-import' });
+
+    await assert.rejects(slots.adoptStashedSuccessor('account-a'), /unclaimed credential unavailable/);
+  });
+
+  it('removes a matching stash that is not strictly newer than the installed primary', async () => {
+    const warnings: string[] = [];
+    const { slots, backend, stashDir } = fixture({ warn: (message) => warnings.push(message) });
+    await slots.createSlot({ accountId: 'account-a', credential: credential('one', 2_000), source: 'cswap-import' });
+    const current = (await slots.readSlot('account-a')).fingerprint;
+    await slots.stashUnclaimed('obsolete-stash', credential('issued', 2_000), current, 'account-a');
+
+    assert.equal(await slots.adoptStashedSuccessor('account-a'), null);
+    await assert.rejects(backend.get('qlb:anthropic:unclaimed:obsolete-stash', 'qlb'));
+    assert.deepEqual(await listStashes(stashDir, 'anthropic'), []);
+    assert.deepEqual(warnings, ['stash-obsolete obsolete-stash not-newer-than-primary']);
   });
 
   it('restores only when the stash consumed lineage matches the current slot', async () => {
