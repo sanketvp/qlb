@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, statSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
@@ -7,12 +7,27 @@ import { describe, it } from 'node:test';
 import { listStashes, recordStash, removeStash } from '../src/unclaimed-index';
 
 describe('unclaimed stash index', () => {
-  it('rejects a stash id containing a colon', async () => {
+  it('still rejects a colon in a NEW stash id', async () => {
     const root = mkdtempSync(join(tmpdir(), 'qlb-unclaimed-index-'));
     await assert.rejects(recordStash(root, {
       provider: 'anthropic', accountId: 'account-a', stashId: 'invalid:stash', consumedFp: 'sha256:lineage-a',
       location: 'keychain', createdAt: 1_000,
     }), /invalid unclaimed index stash id/);
+  });
+
+  it('lists a legacy index row whose stash id contains colons', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-unclaimed-index-'));
+    const entry = {
+      provider: 'anthropic', accountId: 'account-a', stashId: '2026-10-25T12:00:00Z', consumedFp: 'sha256:lineage-a',
+      location: 'file' as const, createdAt: 1_000,
+    };
+    const index = join(root, 'index', 'anthropic');
+    mkdirSync(index, { recursive: true, mode: 0o700 });
+    writeFileSync(join(index, `${entry.stashId}.json`), `${JSON.stringify(entry)}\n`, { mode: 0o600 });
+
+    assert.deepEqual(await listStashes(root, 'anthropic'), [entry]);
+    await removeStash(root, entry);
+    assert.deepEqual(await listStashes(root, 'anthropic'), []);
   });
 
   it('skips directory fsync on win32', async () => {

@@ -21,19 +21,26 @@ export class InvalidUnclaimedIndexComponentError extends Error {
   }
 }
 
-function assertComponent(value: string, name: string): void {
+function assertNewComponent(value: string, name: string): void {
   if (!value || /[\x00-\x1F\x7F\\/:*?"<>|]|[. ]$/.test(value)) {
     throw new InvalidUnclaimedIndexComponentError(name);
   }
 }
 
+/** Legacy rows may contain ISO-8601 stash ids; never use this for new paths. */
+function assertExistingComponent(value: string, name: string): void {
+  if (!value || value === '..' || /[\0/\\]/.test(value)) {
+    throw new InvalidUnclaimedIndexComponentError(name);
+  }
+}
+
 function indexDir(root: string, provider: string): string {
-  assertComponent(provider, 'provider');
+  assertNewComponent(provider, 'provider');
   return join(root, 'index', provider);
 }
 
-function indexPath(root: string, entry: UnclaimedIndexEntry): string {
-  assertComponent(entry.stashId, 'stash id');
+function indexPath(root: string, entry: UnclaimedIndexEntry, existing = false): string {
+  (existing ? assertExistingComponent : assertNewComponent)(entry.stashId, 'stash id');
   return join(indexDir(root, entry.provider), `${entry.stashId}.json`);
 }
 
@@ -49,8 +56,8 @@ function parseEntry(text: string): UnclaimedIndexEntry {
     throw new Error('unclaimed index entry is malformed');
   }
   try {
-    assertComponent(entry.provider, 'provider');
-    assertComponent(entry.stashId, 'stash id');
+    assertExistingComponent(entry.provider, 'provider');
+    assertExistingComponent(entry.stashId, 'stash id');
   } catch {
     throw new Error('unclaimed index entry is malformed');
   }
@@ -118,10 +125,23 @@ export async function recordStash(
   entry: UnclaimedIndexEntry,
   options: UnclaimedIndexWriteOptions = {},
 ): Promise<string> {
-  assertComponent(entry.provider, 'provider');
-  assertComponent(entry.stashId, 'stash id');
+  assertNewComponent(entry.provider, 'provider');
+  assertNewComponent(entry.stashId, 'stash id');
   const path = indexPath(root, entry);
   await writeEntry(path, `${JSON.stringify(entry)}\n`, options);
+  return path;
+}
+
+/** Update an already-reserved row, including a legacy ISO-8601 stash id. */
+export async function updateStash(
+  root: string,
+  entry: UnclaimedIndexEntry,
+  options: UnclaimedIndexWriteOptions = {},
+): Promise<string> {
+  assertNewComponent(entry.provider, 'provider');
+  assertExistingComponent(entry.stashId, 'stash id');
+  const path = indexPath(root, entry, true);
+  await writeEntry(path, `${JSON.stringify(entry)}\n`, { ...options, replace: true });
   return path;
 }
 
@@ -154,7 +174,7 @@ export async function removeStash(
   entry: Pick<UnclaimedIndexEntry, 'provider' | 'stashId'>,
   options: UnclaimedIndexWriteOptions = {},
 ): Promise<void> {
-  const path = indexPath(root, entry as UnclaimedIndexEntry);
+  const path = indexPath(root, entry as UnclaimedIndexEntry, true);
   try {
     await rm(path);
     await fsyncDirectory(indexDir(root, entry.provider), options);

@@ -16,7 +16,7 @@ import { assertAdmittedInConnection } from './lifecycle';
 import { credentialFingerprint } from './anthropic-oauth';
 import { isCredentialNotFound } from './credential-backends';
 import { KeychainReadBackoff, platformKeychain, qlbKeychainService, QLB_KEYCHAIN_ACCOUNT } from './keychain';
-import { listStashes, recordStash, removeStash, type UnclaimedIndexEntry, type UnclaimedIndexWriteOptions } from './unclaimed-index';
+import { listStashes, recordStash, removeStash, updateStash, type UnclaimedIndexEntry, type UnclaimedIndexWriteOptions } from './unclaimed-index';
 
 const DISPLAY_CACHE_TTL_MS = 60_000;
 const ANTHROPIC_PROVIDER = 'anthropic';
@@ -541,10 +541,19 @@ export class InvalidUnclaimedStashIdError extends Error {
   }
 }
 
-function assertId(value: string, kind: string): void {
+function assertNewId(value: string, kind: string): void {
   if (!value || /[\x00-\x1F\x7F\\/:*?"<>|]|[. ]$/.test(value)) {
     throw new InvalidUnclaimedStashIdError(kind);
   }
+}
+
+/** Existing stash ids predate the Windows-safe write rule. */
+export function isReadableUnclaimedStashId(value: string): boolean {
+  return Boolean(value) && value !== '..' && !/[\0/\\]/.test(value);
+}
+
+function assertExistingId(value: string, kind: string): void {
+  if (!isReadableUnclaimedStashId(value)) throw new InvalidUnclaimedStashIdError(kind);
 }
 
 function assertSlotId(value: string): void {
@@ -785,7 +794,7 @@ export class ClaudeSlots {
       try {
         await this.assertUnclaimedFileAbsent(timestamp);
       } catch {
-        await removeStash(this.indexRoot(), index, this.indexOptions());
+        await this.discardReservation(index);
         throw new Error('unclaimed credential already exists');
       }
     }
@@ -794,7 +803,10 @@ export class ClaudeSlots {
       try {
         await this.assertUnclaimedAbsent(timestamp);
       } catch (error) {
-        if (error instanceof Error && /already exists/.test(error.message)) throw error;
+        if (error instanceof Error && /already exists/.test(error.message)) {
+          if (reservationCreated) await this.discardReservation(index);
+          throw error;
+        }
         keychainUsable = false;
       }
     }
@@ -819,7 +831,7 @@ export class ClaudeSlots {
     // Discovery is best effort only after the fallback is durable. A legacy
     // file remains discoverable by the pre-adoption scan if this update fails.
     if (indexWritable) {
-      try { await recordStash(this.indexRoot(), { ...index, location: 'file' }, this.indexOptions(true)); } catch { /* file scan recovers it */ }
+      try { await updateStash(this.indexRoot(), { ...index, location: 'file' }, this.indexOptions()); } catch { /* file scan recovers it */ }
     } else {
       try { await recordStash(this.indexRoot(), { ...index, location: 'file' }, this.indexOptions()); } catch { /* file scan recovers it */ }
     }
@@ -836,7 +848,7 @@ export class ClaudeSlots {
       if (!name.endsWith('.json')) continue;
       const timestamp = name.slice(0, -'.json'.length);
       try {
-        this.assertTimestamp(timestamp);
+        this.assertExistingTimestamp(timestamp);
         const text = await this.files.readFile(join(this.options.stashDir, name), 'utf8');
         const parsed = parseUnclaimed(text);
         // Validate index availability before making a second durable copy.
@@ -853,11 +865,13 @@ export class ClaudeSlots {
           continue;
         }
         if (keychainText == null) await this.backend.set(this.unclaimedService(timestamp), QLB_KEYCHAIN_ACCOUNT, text);
-        await recordStash(this.indexRoot(), {
+        const updated = {
           provider: ANTHROPIC_PROVIDER, accountId: existing?.accountId ?? parsed.accountId ?? null,
-          stashId: timestamp, consumedFp: parsed.consumedFp ?? '', location: 'keychain',
+          stashId: timestamp, consumedFp: parsed.consumedFp ?? '', location: 'keychain' as const,
           createdAt: existing?.createdAt ?? this.now(),
-        }, this.indexOptions(existing != null));
+        };
+        if (existing) await updateStash(this.indexRoot(), updated, this.indexOptions());
+        else await recordStash(this.indexRoot(), updated, this.indexOptions());
         await this.files.rm(join(this.options.stashDir, name), { force: true });
         swept += 1;
       } catch {
@@ -869,7 +883,7 @@ export class ClaudeSlots {
 
   /** Restores an S36 record only when it was issued from the slot's current lineage. */
   async restoreUnclaimed(timestamp: string, accountId: string): Promise<RestoreUnclaimedResult> {
-    this.assertTimestamp(timestamp);
+    this.assertExistingTimestamp(timestamp);
     assertSlotId(accountId);
     return this.withSlotWrite(accountId, async () => {
       await this.options.repository.withWriteTransaction(async (onRollback) => {
@@ -919,6 +933,14 @@ export class ClaudeSlots {
     try { await handle.sync(); } finally { await handle.close(); }
   }
 
+  private async discardReservation(index: UnclaimedIndexEntry): Promise<void> {
+    try {
+      await removeStash(this.indexRoot(), index, this.indexOptions());
+    } catch {
+      this.warn(`unclaimed stash reservation cleanup failed for ${index.provider} ${index.stashId}`);
+    }
+  }
+
   private async assertUnclaimedFileAbsent(timestamp: string): Promise<void> {
     try {
       await this.files.lstat(this.filePath(timestamp));
@@ -943,8 +965,8 @@ export class ClaudeSlots {
     return this.options.stashDir;
   }
 
-  private indexOptions(replace = false): UnclaimedIndexWriteOptions {
-    return { replace, platform: this.platform, directorySync: this.directorySync };
+  private indexOptions(): UnclaimedIndexWriteOptions {
+    return { platform: this.platform, directorySync: this.directorySync };
   }
 
   private async readExistingCredential(accountId: string): Promise<string | null> {
@@ -1077,6 +1099,10 @@ export class ClaudeSlots {
   }
 
   private assertTimestamp(timestamp: string): void {
-    assertId(timestamp, 'unclaimed timestamp');
+    assertNewId(timestamp, 'unclaimed timestamp');
+  }
+
+  private assertExistingTimestamp(timestamp: string): void {
+    assertExistingId(timestamp, 'unclaimed timestamp');
   }
 }

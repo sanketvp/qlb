@@ -81,7 +81,7 @@ function context(output: string[]): CommandContext {
 }
 
 describe('Claude unclaimed stash and restore (K2 / AC48)', () => {
-  it('rejects a stash id containing a colon', async () => {
+  it('still rejects a colon in a NEW stash id', async () => {
     const { slots } = fixture();
     await assert.rejects(slots.stashUnclaimed('invalid:stash', credential('issued')), /invalid unclaimed timestamp/);
   });
@@ -92,6 +92,27 @@ describe('Claude unclaimed stash and restore (K2 / AC48)', () => {
       directorySync: async () => { throw new Error('directory fsync must not run on Windows'); },
     });
     assert.deepEqual(await slots.stashUnclaimed('win32-stash', credential('issued')), { location: 'keychain' });
+  });
+
+  it('restores and sweeps a stash whose id contains colons from before the Windows-safe rule', async () => {
+    const { slots, backend, stashDir } = fixture();
+    const stashId = '2026-10-25T12:00:00Z';
+    await slots.createSlot({ accountId: 'account-a', credential: credential('one'), source: 'cswap-import' });
+    const current = (await slots.readSlot('account-a', { fresh: true })).fingerprint;
+    const entry = {
+      provider: 'anthropic', accountId: 'account-a', stashId, consumedFp: current,
+      location: 'file' as const, createdAt: 1_000,
+    };
+    mkdirSync(join(stashDir, 'index', 'anthropic'), { recursive: true, mode: 0o700 });
+    writeFileSync(join(stashDir, 'index', 'anthropic', `${stashId}.json`), `${JSON.stringify(entry)}\n`, { mode: 0o600 });
+    mkdirSync(stashDir, { recursive: true, mode: 0o700 });
+    writeFileSync(join(stashDir, `${stashId}.json`), JSON.stringify({ credential: credential('issued'), consumedFp: current, accountId: 'account-a' }), { mode: 0o600 });
+
+    assert.deepEqual(await slots.sweepUnclaimed(), { swept: 1, retained: 0 });
+    assert.deepEqual(await listStashes(stashDir, 'anthropic'), [{ ...entry, location: 'keychain' }]);
+    await slots.restoreUnclaimed(stashId, 'account-a');
+    assert.equal((await slots.readSlot('account-a', { fresh: true })).credential, credential('issued'));
+    await assert.rejects(backend.get(`qlb:anthropic:unclaimed:${stashId}`, 'qlb'));
   });
 
   it('falls back to a private file, then sweeps it into Keychain', async () => {
@@ -162,6 +183,30 @@ describe('Claude unclaimed stash and restore (K2 / AC48)', () => {
     assert.equal(readFileSync(path, 'utf8'), original);
     await assert.rejects(backend.get('qlb:anthropic:unclaimed:row-less-id', 'qlb'));
     assert.deepEqual(await listStashes(stashDir, 'anthropic'), []);
+  });
+
+  it('cleans its reservation when a row-less Keychain stash id already exists', async () => {
+    const { slots, backend, stashDir } = fixture();
+    await backend.set('qlb:anthropic:unclaimed:reused-id', 'qlb', JSON.stringify({ credential: credential('original') }));
+
+    await assert.rejects(slots.stashUnclaimed('reused-id', credential('replacement'), 'sha256:replacement', 'account-a'), /already exists/);
+    assert.deepEqual(await listStashes(stashDir, 'anthropic'), []);
+  });
+
+  it('reports already exists when reservation cleanup after a Keychain collision fails', async () => {
+    const warnings: string[] = [];
+    let syncs = 0;
+    const { slots, backend } = fixture({
+      directorySync: async () => {
+        syncs += 1;
+        if (syncs === 2) throw new Error('fixture index cleanup failed');
+      },
+      warn: (message) => warnings.push(message),
+    });
+    await backend.set('qlb:anthropic:unclaimed:cleanup-failure', 'qlb', JSON.stringify({ credential: credential('original') }));
+
+    await assert.rejects(slots.stashUnclaimed('cleanup-failure', credential('replacement')), /already exists/);
+    assert.deepEqual(warnings, ['unclaimed stash reservation cleanup failed for anthropic cleanup-failure']);
   });
 
   it('refuses to replace an existing fallback file for a reused stash id', async () => {
@@ -271,7 +316,7 @@ describe('Claude unclaimed stash and restore (K2 / AC48)', () => {
     assert.equal((await slots.readSlot('account-a')).credential, credential('one'));
   });
 
-  it('registers a restoring command with strict argument handling and no credential output', async () => {
+  it('restore CLI accepts a legacy colon id with strict argument handling and no credential output', async () => {
     const output: string[] = [];
     const seen: Array<[string, string]> = [];
     const restore = async (timestamp: string, slot: string) => { seen.push([timestamp, slot]); };
@@ -280,6 +325,7 @@ describe('Claude unclaimed stash and restore (K2 / AC48)', () => {
     assert.deepEqual(output, ['restored unclaimed credential to account-a']);
     assert.equal(await runClaudeRestoreUnclaimedCommand([], context(output), { restore }), 2);
     assert.equal(await runClaudeRestoreUnclaimedCommand(['2026-10-25T12-03-00Z', 'a:prev'], context(output), { restore }), 2);
+    assert.equal(await runClaudeRestoreUnclaimedCommand(['..', 'account-a'], context(output), { restore }), 2);
   });
 
   it('prints a warning when command-level stash cleanup is pending', async () => {
