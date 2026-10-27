@@ -378,6 +378,7 @@ describe('bindDetectAndResync + MockKeychain', () => {
     const id = ADAPTER_ACCOUNT_IDS.xai;
     const label = ADAPTER_ACCOUNT_LABELS.xai;
     store.upsertAccount(id, 'xai', label);
+    store.upsertMigration('pi-xai', 'QLB_OWNED');
     kc.setSync(qlbKeychainService('xai', id), label, JSON.stringify(grant('old')));
     const fn = bindDetectAndResync({
       store,
@@ -388,6 +389,71 @@ describe('bindDetectAndResync + MockKeychain', () => {
     assert.equal(result.resynced, true);
     const stored = parseGrant(kc.getSync(qlbKeychainService('xai', id), label));
     assert.equal(stored.access, 'new');
+    store.close();
+  });
+
+  it('T-W2 native-resync refuses while a hand-back marker is set or the journal is not QLB_OWNED', async () => {
+    const cases = [
+      { name: 'MIRRORED row with an existing copy', state: 'MIRRORED', detail: '{}', owned: true },
+      { name: 'rollback intent', state: 'QLB_OWNED', detail: '{"intent":"rollback"}', owned: true },
+      { name: 'rollback decision', state: 'QLB_OWNED', detail: '{"rollbackDecision":{}}', owned: true },
+      { name: 'hand-back marker', state: 'QLB_OWNED', detail: '{"handback":{}}', owned: true },
+      { name: 'MIRRORED row with a missing copy', state: 'MIRRORED', detail: '{}', owned: false },
+    ];
+
+    for (const fixture of cases) {
+      const dir = mkdtempSync(join(tmpdir(), 'qlb-resync-w2-'));
+      temps.push(dir);
+      const store = openStore(join(dir, 'qlb.db'));
+      const kc = new MockKeychain();
+      const id = ADAPTER_ACCOUNT_IDS.xai;
+      const label = ADAPTER_ACCOUNT_LABELS.xai;
+      store.upsertAccount(id, 'xai', label);
+      store.upsertMigration('pi-xai', fixture.state, fixture.detail);
+      if (fixture.owned) {
+        kc.setSync(qlbKeychainService('xai', id), label, JSON.stringify(grant('old')));
+      }
+
+      const result = await bindDetectAndResync({
+        store,
+        keychain: kc,
+        readNativeCredential: async () => grant('new'),
+      })(id, 'xai');
+
+      assert.equal(result.resynced, false, fixture.name);
+      assert.match(result.reason, /not exclusively QLB-owned/, fixture.name);
+      if (fixture.owned) {
+        assert.equal(
+          parseGrant(kc.getSync(qlbKeychainService('xai', id), label)).access,
+          'old',
+          fixture.name,
+        );
+      } else {
+        assert.throws(() => kc.getSync(qlbKeychainService('xai', id), label), fixture.name);
+      }
+      store.close();
+    }
+
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-resync-w2-allowed-'));
+    temps.push(dir);
+    const store = openStore(join(dir, 'qlb.db'));
+    const kc = new MockKeychain();
+    const id = ADAPTER_ACCOUNT_IDS.xai;
+    const label = ADAPTER_ACCOUNT_LABELS.xai;
+    store.upsertAccount(id, 'xai', label);
+    store.upsertMigration('pi-xai', 'QLB_OWNED');
+    const result = await bindDetectAndResync({
+      store,
+      keychain: kc,
+      readNativeCredential: async () => grant('new'),
+    })(id, 'xai');
+
+    assert.equal(result.resynced, true);
+    assert.equal(
+      parseGrant(kc.getSync(qlbKeychainService('xai', id), label)).access,
+      'new',
+      'a missing copy may be created only for a marker-free QLB_OWNED row',
+    );
     store.close();
   });
 });
