@@ -1,6 +1,9 @@
 import { platformKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, type KeychainBackend } from '../keychain';
 import type { TokenResolution, TokenResolverDeps } from './xai';
 
+/** Canonical QLB credential location consumed by the OpenRouter Pi gate. */
+export const OPENROUTER_GATE_KEYCHAIN_SERVICE = qlbKeychainService('openrouter', 'default');
+
 function credentialUnavailable(): Error {
   return new Error('credential unavailable');
 }
