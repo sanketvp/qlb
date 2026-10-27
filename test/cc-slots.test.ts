@@ -138,6 +138,25 @@ describe('Claude slots (K2)', () => {
     reopened.close();
   });
 
+  it('takes the shared switch lock around an add slot write', async () => {
+    const backend = new CountingBackend();
+    const repo = new InMemoryClaudeSlotRepository();
+    let switchLockCalls = 0;
+    const slots = new ClaudeSlots({
+      backend, repository: repo, stashDir: join(mkdtempSync(join(tmpdir(), 'qlb-cc-slots-')), 'unclaimed'), now: () => 1_000,
+      withSwitchLock: async (fn) => {
+        switchLockCalls += 1;
+        return fn();
+      },
+    });
+
+    await slots.applyAdd({
+      accountId: 'account-a', credential: credential('one'), email: null, alias: null, orgUuid: null,
+      configJson: '{}', replace: false,
+    });
+    assert.equal(switchLockCalls, 1);
+  });
+
   it('uses one Keychain read for cached displays within sixty seconds', async () => {
     let now = 1_000;
     const { slots, backend } = fixture(() => now);
