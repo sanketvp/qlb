@@ -337,6 +337,77 @@ describe('qlb retire cswap (AC22 retire)', () => {
     } finally { f.cleanup(); }
   });
 
+  it('an item added after the drain is impossible (drain fake refuses writes)', async () => {
+    const f = fixture();
+    try {
+      let acceptsWrites = true;
+      const writeItem = () => {
+        if (!acceptsWrites) return false;
+        f.setCswapItems([...f.getCswapItems(), { id: 'new-item', fingerprint: 'new-fingerprint' }]);
+        return true;
+      };
+      f.deps.effects.drainCswap = () => {
+        acceptsWrites = false;
+        f.calls.push('drain-cswap');
+        return { ok: true };
+      };
+      f.deps.effects.archiveCswap = () => {
+        assert.equal(writeItem(), false);
+        assert.deepEqual(f.getCswapItems(), [{ id: 'cswap-a', fingerprint: 'source-a' }]);
+        f.calls.push('archive');
+      };
+      assert.equal((await retireCswap(f.store, f.deps)).ok, true);
+      assert.deepEqual(f.getCswapItems(), []);
+    } finally { f.cleanup(); }
+  });
+
+  it('a resume after the drain checkpoint re-drains before the archive', async () => {
+    const f = fixture();
+    try {
+      let drainCalls = 0;
+      let crash = true;
+      f.deps.effects.drainCswap = () => { drainCalls++; return { ok: true }; };
+      f.deps.afterCheckpoint = (name) => {
+        if (crash && name === 'drain-cswap') { crash = false; throw new Error('fixture crash'); }
+      };
+      await assert.rejects(retireCswap(f.store, f.deps), /fixture crash/);
+      f.deps.effects.archiveCswap = () => {
+        assert.equal(drainCalls, 2);
+        f.calls.push('archive');
+      };
+      assert.equal((await retireCswap(f.store, f.deps)).ok, true);
+    } finally { f.cleanup(); }
+  });
+
+  it('a C-swap that came back before resume is re-stopped and its new item refuses cswap-items-changed', async () => {
+    const f = fixture();
+    try {
+      let drainCalls = 0;
+      let acceptsWrites = true;
+      let crash = true;
+      const writeItem = () => {
+        if (!acceptsWrites) return false;
+        f.setCswapItems([...f.getCswapItems(), { id: 'new-item', fingerprint: 'new-fingerprint' }]);
+        return true;
+      };
+      f.deps.effects.drainCswap = () => {
+        drainCalls++;
+        acceptsWrites = false;
+        return { ok: true };
+      };
+      f.deps.afterCheckpoint = (name) => {
+        if (crash && name === 'drain-cswap') { crash = false; throw new Error('fixture crash'); }
+      };
+      await assert.rejects(retireCswap(f.store, f.deps), /fixture crash/);
+      acceptsWrites = true;
+      assert.equal(writeItem(), true, 'the rebooted fake C-swap accepts its new item before resume');
+      assert.deepEqual(await retireCswap(f.store, f.deps), { ok: false, code: 'cswap-items-changed' });
+      assert.equal(drainCalls, 2);
+      assert.equal(acceptsWrites, false, 'resume drain stops the restarted fake C-swap');
+      assert.equal(f.calls.some((call) => call.startsWith('archive:')), false);
+    } finally { f.cleanup(); }
+  });
+
   it('journals each effect, fences unsafe admissions, and resumes exactly once after every checkpoint', async () => {
     const phases = ['drain-cswap', 'archive', 'delete-cswap-items', 'uninstall-cswap', 'remove-launch-artifacts', 'delete-pi-baselines', 'archive-stash', 'committed'] as const;
     for (const crashAt of phases) {
@@ -352,6 +423,8 @@ describe('qlb retire cswap (AC22 retire)', () => {
         assert.equal(assertAdmitted(f.store, 'undo-cswap').code, 'retirement-in-progress');
         assert.equal(assertAdmitted(f.store, 'pi-rollback').code, 'retirement-in-progress');
         assert.equal((await retireCswap(f.store, f.deps)).ok, true, crashAt);
+        const reDrainPhases = ['drain-cswap', 'archive', 'delete-cswap-items', 'uninstall-cswap'];
+        assert.equal(f.calls.filter((call) => call === 'drain-cswap').length, reDrainPhases.includes(crashAt) ? 2 : 1, crashAt);
         assert.equal(phase(f.store).state, 'retired');
         assert.equal(existsSync(join(f.deps.journalDir, 'retire-cswap.json')), false);
         for (const effect of ['delete-cswap-items', 'uninstall-cswap', 'remove-launch-artifacts', 'delete-pi-baselines']) {
@@ -361,7 +434,7 @@ describe('qlb retire cswap (AC22 retire)', () => {
     }
   });
 
-  it('the journal dir parent is fsynced when the lock created it', async () => {
+  it('fsyncs the journal dir parent on every journal write', async () => {
     const f = fixture();
     try {
       const durableDirs: string[] = [];
@@ -372,10 +445,7 @@ describe('qlb retire cswap (AC22 retire)', () => {
         if (existsSync(path)) durablePhases.push((JSON.parse(readFileSync(path, 'utf8')) as { phase: string }).phase);
       };
       assert.equal((await retireCswap(f.store, f.deps)).ok, true);
-      assert.deepEqual(durableDirs, [
-        f.deps.journalDir, f.root,
-        ...Array(8).fill(f.deps.journalDir),
-      ]);
+      assert.deepEqual(durableDirs, Array(9).fill([f.deps.journalDir, f.root]).flat());
       assert.deepEqual(durablePhases, [
         'started', 'drain-cswap', 'archive', 'delete-cswap-items', 'uninstall-cswap',
         'remove-launch-artifacts', 'delete-pi-baselines', 'archive-stash', 'committed',

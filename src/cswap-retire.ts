@@ -1,7 +1,7 @@
 // C-swap retirement (§4.11). First-run gates are pure; this module writes a
 // journal and retirement fence only after that gate record is approved.
 
-import { existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
+import { mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
 import { atomicWriteText, fsyncDirSync } from './fsutil';
@@ -43,8 +43,12 @@ export interface CswapRetireItem {
 /** Every effect must be idempotent: rerunning after a crash completes the same end state safely. */
 export interface CswapRetireEffects {
   /**
-   * Runs the S57 cooperative drain. It must stop the C-swap helper and hold
-   * its locks so it can no longer add or rotate items before returning.
+   * Runs the full idempotent S57 drain: bootout + disable the agent, move its
+   * plist to ~/.qlb/backups/cswap-plist/, wait for cooperative exit, then
+   * flock every C-swap lock for a survivor before SIGTERM. The locks are
+   * released afterwards. The disabled agent and moved plist, not held locks,
+   * keep C-swap from adding or rotating items after this returns; an already
+   * disabled agent with no process is a no-op.
    */
   drainCswap(): Promise<CswapAgentResult> | CswapAgentResult;
   archiveCswap(archivePath: string): Promise<void> | void;
@@ -55,6 +59,11 @@ export interface CswapRetireEffects {
    */
   deleteCswapItems(items: CswapRetireItem[]): Promise<void> | void;
   uninstallCswap(): Promise<void> | void;
+  /**
+   * Final launch cleanup after S57 already booted out, disabled, and moved
+   * the plist: delete that moved plist and any remaining launch files. It
+   * does not disable the agent again.
+   */
   removeCswapLaunchArtifacts(): Promise<void> | void;
   deletePiBaselines(): Promise<void> | void;
   archiveExpiredStash(archivePath: string): Promise<void> | void;
@@ -171,7 +180,6 @@ function readJournal(dir: string): RetireJournal | null {
 }
 
 function writeJournal(dir: string, journal: RetireJournal, fsyncJournalDir: (dir: string) => void): void {
-  const firstWrite = !existsSync(journalPath(dir));
   const firstCreated = mkdirSync(dir, { recursive: true, mode: 0o700 });
   if (firstCreated !== undefined) {
     // mkdirSync reports the first newly-created directory. Sync every parent
@@ -184,9 +192,9 @@ function writeJournal(dir: string, journal: RetireJournal, fsyncJournalDir: (dir
   }
   atomicWriteText(journalPath(dir), `${JSON.stringify(journal)}\n`, { mode: 0o600 });
   fsyncJournalDir(dir);
-  // The retirement lock normally creates journalDir first. Persist that
-  // directory entry after the first journal rename, before the fence exists.
-  if (firstWrite) fsyncJournalDir(dirname(dir));
+  // Persist journalDir's entry after every journal rename. This also closes
+  // a prior crash between a rename and its parent-directory sync.
+  fsyncJournalDir(dirname(dir));
 }
 
 function checkpoint(
@@ -409,7 +417,11 @@ export async function retireCswap(store: Store, dependencies: CswapRetireDepende
       }
 
       let finalCswapItems: CswapRetireItem[] | null = null;
-      if (!phaseAtLeast(journal.phase, 'drain-cswap')) {
+      // S57 leaves C-swap disabled and its plist moved, while releasing its
+      // locks before returning. Re-run that idempotent sequence on every
+      // resume before remaining C-swap effects through launch cleanup: a
+      // reboot cannot revive the writer between retirement attempts.
+      if (!phaseAtLeast(journal.phase, 'remove-launch-artifacts')) {
         let drained: CswapAgentResult;
         try {
           drained = await dependencies.effects.drainCswap();
@@ -418,16 +430,21 @@ export async function retireCswap(store: Store, dependencies: CswapRetireDepende
         }
         if (!drained.ok) return retireRefusal('retirement-effect-failed:drain-cswap');
         dependencies.afterEffect?.('drain-cswap');
-        try {
-          // S57 has stopped the only C-swap writer. This is the final captured
-          // inventory; it must exactly match the pre-drain gate record.
-          finalCswapItems = dependencies.cswapItems();
-        } catch {
-          return retireRefusal('cswap-items-unavailable');
+        if (!phaseAtLeast(journal.phase, 'archive')) {
+          try {
+            // The S57 launch state, not a retained flock, keeps C-swap
+            // unscheduled. Before archiving, its exact inventory must still
+            // equal the pre-drain gate record.
+            finalCswapItems = dependencies.cswapItems();
+          } catch {
+            return retireRefusal('cswap-items-unavailable');
+          }
+          if (!sameCswapItems(finalCswapItems, journal.gates.cswapItems)) return retireRefusal('cswap-items-changed');
         }
-        if (!sameCswapItems(finalCswapItems, journal.gates.cswapItems)) return retireRefusal('cswap-items-changed');
-        journal = checkpoint(dependencies.journalDir, journal, 'drain-cswap', dependencies.now(), fsyncJournalDir);
-        dependencies.afterCheckpoint?.('drain-cswap');
+        if (!phaseAtLeast(journal.phase, 'drain-cswap')) {
+          journal = checkpoint(dependencies.journalDir, journal, 'drain-cswap', dependencies.now(), fsyncJournalDir);
+          dependencies.afterCheckpoint?.('drain-cswap');
+        }
       }
 
       const effects: Array<[Exclude<RetirePhase, 'started' | 'drain-cswap' | 'committed'>, () => Promise<void> | void]> = [
