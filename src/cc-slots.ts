@@ -9,6 +9,7 @@
 // Credential bytes are accepted only through injected backends and are never
 // included in errors, return metadata, or filesystem names.
 
+import { createHash } from 'node:crypto';
 import { chmod, link, lstat, mkdir, open, readdir, readFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { openStoreConnection } from './store';
@@ -627,7 +628,10 @@ export interface ReadSlotOptions {
 
 export interface ReadClaudeSlot {
   credential: string;
+  /** Refresh-token lineage identity; never use this as a byte-level CAS. */
   fingerprint: string;
+  /** SHA-256 over the complete stored credential bytes, for CAS only. */
+  contentFingerprint: string;
 }
 
 type CachedSlot = ReadClaudeSlot & { expiresAt: number; generation: number };
@@ -661,6 +665,10 @@ function assertExistingId(value: string, kind: string): void {
 function assertSlotId(value: string): void {
   // `:prev` and `unclaimed:` are storage namespaces, never slot identifiers.
   if (!value || /[\0/\\:]/.test(value)) throw new Error('invalid slot id');
+}
+
+function credentialContentFingerprint(credential: string): string {
+  return `sha256-full:${createHash('sha256').update(credential, 'utf8').digest('hex')}`;
 }
 
 function parseUnclaimed(text: string): UnclaimedRecord {
@@ -754,7 +762,7 @@ export class ClaudeSlots {
     const generation = this.options.repository.currentGeneration();
     const cached = this.cache.get(accountId);
     if (cachedRead && cached && cached.expiresAt > now && cached.generation === generation) {
-      return { credential: cached.credential, fingerprint: cached.fingerprint };
+      return { credential: cached.credential, fingerprint: cached.fingerprint, contentFingerprint: cached.contentFingerprint };
     }
 
     const epoch = this.cacheEpoch;
@@ -762,7 +770,9 @@ export class ClaudeSlots {
       () => this.backend.get(this.slotService(accountId), QLB_KEYCHAIN_ACCOUNT),
       !cachedRead,
     );
-    const result: ReadClaudeSlot = { credential, fingerprint: this.fingerprint(credential) };
+    const result: ReadClaudeSlot = {
+      credential, fingerprint: this.fingerprint(credential), contentFingerprint: credentialContentFingerprint(credential),
+    };
     if (cachedRead && epoch === this.cacheEpoch && generation === this.options.repository.currentGeneration()) {
       this.cache.set(accountId, { ...result, expiresAt: now + DISPLAY_CACHE_TTL_MS, generation });
     }
@@ -1040,7 +1050,11 @@ export class ClaudeSlots {
             continue;
           }
           await this.writeSlotUnlocked(accountId, record.credential, { cause: 'stash-adopt', evidence: 'lineage' }, onRollback);
-          adopted = { credential: record.credential, fingerprint: this.fingerprint(record.credential) };
+          adopted = {
+            credential: record.credential,
+            fingerprint: this.fingerprint(record.credential),
+            contentFingerprint: credentialContentFingerprint(record.credential),
+          };
           adoptedEntry = entry;
           break;
         }
