@@ -114,7 +114,7 @@ function fullFingerprint(document: CodexAuthDocument): string {
 
 /** Collision-free across processes; never derived from a clock value alone. */
 export function defaultCodexStashId(now: number): string {
-  return `${new Date(now).toISOString()}-${process.pid}-${randomBytes(12).toString('hex')}`;
+  return `${new Date(now).toISOString().replace(/:/g, '-')}-${process.pid}-${randomBytes(12).toString('hex')}`;
 }
 
 function openDatabase(store: SqlStore): { db: DatabaseSync; close: boolean } {
