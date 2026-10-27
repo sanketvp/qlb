@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { cooperativeDrain, launchctlCswapAgent, runRetirementDrain, type CswapAgent } from '../src/cswap-agent';
+import { cooperativeDrain, launchctlCswapAgent, runRetirementDrain, type CswapAgent, type LaunchctlCswapAgentDependencies } from '../src/cswap-agent';
+import { listCswapProcesses } from '../src/cswap-processes';
 import { cutoverBegin } from '../src/commands/cutover';
 import { phase } from '../src/lifecycle';
 import { openStore } from '../src/store';
@@ -103,9 +104,80 @@ test('an already booted-out agent is treated as drained', async () => {
     },
     fs: { exists: () => true, mkdir: () => {}, readFile: () => JSON.stringify({ sequence: [] }), rename: () => {} },
     uid: () => 501, home: () => '/fixture-home', qlbHome: () => '/fixture-home',
-    tryAcquireLock: () => () => {}, kill: () => {}, now: () => 0, sleep: async () => {},
+    listProcesses: () => [], tryAcquireLock: () => () => {}, kill: () => {}, now: () => 0, sleep: async () => {},
   });
   assert.deepEqual(await runRetirementDrain(agent), { ok: true });
+});
+
+test('a resume after a crash inside remove-launch-artifacts completes (both plist copies already gone)', async () => {
+  const agent = launchctlCswapAgent({
+    exec: () => {},
+    fs: { exists: () => false, mkdir: () => { throw new Error('must not create a backup directory'); }, readFile: () => '', rename: () => { throw new Error('must not move a missing plist'); } },
+    uid: () => 501, home: () => '/fixture-home', qlbHome: () => '/fixture-home',
+    tryAcquireLock: () => () => {}, kill: () => {}, now: () => 0, sleep: async () => {},
+  });
+
+  assert.deepEqual(await agent.movePlist(), { ok: true });
+});
+
+test('the production drain uses the A14 classifier and fails closed when ps output is empty', async () => {
+  let now = 0;
+  let alive = true;
+  const locked: string[] = [];
+  const customBackup = '/configured/cswap-state';
+  const dependencies: LaunchctlCswapAgentDependencies = {
+    exec: () => '',
+    fs: {
+      exists: () => true, mkdir: () => {},
+      readFile: (path: string) => {
+        assert.equal(path, `${customBackup}/sequence.json`);
+        return JSON.stringify({ sequence: [9] });
+      },
+      rename: () => {},
+    },
+    uid: () => 501, home: () => '/fixture-home', qlbHome: () => '/fixture-home',
+    cswapSequencePath: () => `${customBackup}/sequence.json`,
+    listProcesses: () => alive ? listCswapProcesses({ platform: 'linux', runPs: () => '123 python3 -m claude_swap auto' }) : [],
+    tryAcquireLock: (path: string) => { locked.push(path); return () => {}; },
+    kill: () => { alive = false; }, now: () => now, sleep: async () => { now += 60_000; },
+  };
+  const agent = launchctlCswapAgent(dependencies);
+
+  assert.deepEqual(await agent.drain(), { ok: true });
+  assert.deepEqual(locked, [
+    `${customBackup}/.lock`,
+    `${customBackup}/credentials/.consume-9.lock`,
+  ]);
+
+  const emptyAgent = launchctlCswapAgent({
+    ...dependencies,
+    listProcesses: () => listCswapProcesses({ platform: 'linux', runPs: () => '' }),
+  });
+  const empty = await emptyAgent.drain();
+  assert.equal(empty.ok, false);
+  assert.match(empty.code ?? '', /cswap-drain-error process table was empty/);
+});
+
+test('the production agent takes locks under the configured C-swap directory', async () => {
+  let now = 0;
+  let alive = true;
+  const locked: string[] = [];
+  const customBackup = '/configured/cswap-state';
+  const agent = launchctlCswapAgent({
+    exec: () => '',
+    fs: { exists: () => true, mkdir: () => {}, readFile: () => JSON.stringify({ sequence: ['42'] }), rename: () => {} },
+    uid: () => 501, home: () => '/fixture-home', qlbHome: () => '/fixture-home',
+    cswapSequencePath: () => `${customBackup}/sequence.json`,
+    listProcesses: () => alive ? [{ pid: 42 }] : [],
+    tryAcquireLock: (path: string) => { locked.push(path); return () => {}; },
+    kill: () => { alive = false; }, now: () => now, sleep: async () => { now += 60_000; },
+  });
+
+  assert.deepEqual(await agent.drain(), { ok: true });
+  assert.deepEqual(locked, [
+    `${customBackup}/.lock`,
+    `${customBackup}/credentials/.consume-42.lock`,
+  ]);
 });
 
 test('AC58 barrier assertion rejects a fake drain that signals before the consume lock is available', async () => {

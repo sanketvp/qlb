@@ -59,7 +59,7 @@ export function s64DoctorVerdict(report: DoctorReport): { overall: 'PASS' | 'FAI
 export function productionDependencies(
   store: Store,
   ctx: CommandContext,
-  agent: CswapAgent = productionLaunchctlCswapAgent(ctx.home, qlbHomeDir(ctx.env)),
+  agent: CswapAgent = productionLaunchctlCswapAgent(ctx.home, qlbHomeDir(ctx.env), ctx.config.cswapSequencePath),
   enumerateUnclaimed: () => string[] = listUnclaimedKeychainServices,
 ): CswapRetireDependencies {
   const sequencePath = ctx.config.cswapSequencePath;

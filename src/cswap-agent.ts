@@ -1,6 +1,8 @@
 import { execFileSync, spawn } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, renameSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+
+import { listCswapProcesses } from './cswap-processes';
 
 /** K13 seam for the destructive C-swap LaunchAgent operations. */
 export interface CswapAgentResult {
@@ -177,6 +179,10 @@ export interface LaunchctlCswapAgentDependencies {
   uid(): number;
   home(): string;
   qlbHome(): string;
+  /** C-swap's configured sequence.json; its parent owns all C-swap locks. */
+  cswapSequencePath?(): string;
+  /** Defaults to the reviewed A14 classifier; tests inject a hermetic seam. */
+  listProcesses?(): CswapProcess[] | Promise<CswapProcess[]>;
   /** A non-blocking fcntl flock compatible with C-swap's flock locks. */
   tryAcquireLock(path: string): CswapLockRelease | null | Promise<CswapLockRelease | null>;
   kill(pid: number, signal: 'SIGTERM'): void | Promise<void>;
@@ -211,20 +217,10 @@ function operation(
   }
 }
 
-function parseCswapProcesses(output: string): CswapProcess[] {
-  const processes: CswapProcess[] = [];
-  for (const line of output.split(/\r?\n/)) {
-    const match = /^\s*(\d+)\s+(.+)$/.exec(line);
-    if (!match || !/\bcswap\s+auto(?:\s|$)/.test(match[2])) continue;
-    const pid = Number(match[1]);
-    if (Number.isSafeInteger(pid) && pid > 0) processes.push({ pid });
-  }
-  return processes;
-}
-
 function sequenceLockPaths(deps: LaunchctlCswapAgentDependencies): string[] {
-  const backup = join(deps.home(), '.claude-swap-backup');
-  const parsed = JSON.parse(deps.fs.readFile(join(backup, 'sequence.json'))) as { sequence?: unknown };
+  const sequencePath = deps.cswapSequencePath?.() ?? join(deps.home(), '.claude-swap-backup', 'sequence.json');
+  const backup = dirname(sequencePath);
+  const parsed = JSON.parse(deps.fs.readFile(sequencePath)) as { sequence?: unknown };
   if (!Array.isArray(parsed.sequence) || !parsed.sequence.every((value) => typeof value === 'number' || typeof value === 'string')) {
     throw new Error('C-swap account registry is unreadable');
   }
@@ -250,7 +246,7 @@ export function launchctlCswapAgent(deps: LaunchctlCswapAgentDependencies): Cswa
       const source = plist();
       const target = backup();
       try {
-        if (!deps.fs.exists(source)) return deps.fs.exists(target) ? { ok: true } : { ok: false, code: 'cswap-plist-unavailable' };
+        if (!deps.fs.exists(source)) return { ok: true };
         deps.fs.mkdir(join(deps.qlbHome(), '.qlb', 'backups', 'cswap-plist'));
         deps.fs.rename(source, target);
         return { ok: true };
@@ -276,7 +272,7 @@ export function launchctlCswapAgent(deps: LaunchctlCswapAgentDependencies): Cswa
       return operation(deps, ['bootstrap', domain(), source]);
     },
     drain: async () => cooperativeDrain({
-      listProcesses: () => parseCswapProcesses(String(deps.exec('/bin/ps', ['-axo', 'pid=,command=']) ?? '')),
+      listProcesses: () => deps.listProcesses ? deps.listProcesses() : listCswapProcesses(),
       lockPaths: () => sequenceLockPaths(deps),
       tryAcquireLock: (path) => deps.tryAcquireLock(path),
       kill: (pid, signal) => deps.kill(pid, signal),
@@ -335,7 +331,8 @@ function productionTryAcquireLock(path: string): Promise<CswapLockRelease | null
 }
 
 /** The live adapter's platform calls remain behind the factory seams above. */
-export function productionLaunchctlCswapAgent(home: string, qlbHome: string): CswapAgent {
+export function productionLaunchctlCswapAgent(home: string, qlbHome: string, cswapSequencePath?: string): CswapAgent {
+  const sequencePath = cswapSequencePath ?? join(home, '.claude-swap-backup', 'sequence.json');
   return launchctlCswapAgent({
     exec: (file, args) => String(execFileSync(file, [...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })),
     fs: {
@@ -347,6 +344,8 @@ export function productionLaunchctlCswapAgent(home: string, qlbHome: string): Cs
     uid: () => process.getuid?.() ?? 0,
     home: () => home,
     qlbHome: () => qlbHome,
+    cswapSequencePath: () => sequencePath,
+    listProcesses: listCswapProcesses,
     tryAcquireLock: productionTryAcquireLock,
     kill: (pid, signal) => { process.kill(pid, signal); },
     now: Date.now,
