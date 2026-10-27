@@ -9,7 +9,7 @@
 // Never acquire a consume lock while holding the switch lock.
 
 import { randomBytes } from 'node:crypto';
-import { existsSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, statSync } from 'node:fs';
 import { mkdir, readdir, rmdir, stat, unlink, utimes, writeFile } from 'node:fs/promises';
 import { performance } from 'node:perf_hooks';
 import { basename, dirname, join } from 'node:path';
@@ -374,41 +374,53 @@ export async function withProperLockfile<T>(
   for (;;) {
     try {
       await mkdir(lockDir);
-      if (options.onCompromised) {
-        const ownerToken = newOwnerToken();
-        try {
-          await writeFile(join(lockDir, ownerToken), '', { flag: 'wx', mode: 0o600 });
-        } catch (error) {
-          await bestEffortRelease(lockDir);
-          throw error;
-        }
-        acquiredOwnerToken = ownerToken;
-      }
-      break;
     } catch (error: unknown) {
       if (!error || typeof error !== 'object' || (error as NodeJS.ErrnoException).code !== 'EEXIST') {
         throw error;
       }
-    }
+      // The normal contention/stale-lock path below owns EEXIST retries.
+      if (performance.now() - started > timeoutMs) throw new ClaudeCodeLockTimeout(lockDir);
 
-    if (performance.now() - started > timeoutMs) throw new ClaudeCodeLockTimeout(lockDir);
-
-    try {
-      const held = await stat(lockDir);
-      if (Date.now() - held.mtimeMs > stalenessMs) {
-        if (!await removeIfStillStale(lockDir, stalenessMs)) {
-          // Match C-swap's tiny backoff after a failed stale-lock removal/takeover.
-          await sleep(50);
+      try {
+        const held = await stat(lockDir);
+        if (Date.now() - held.mtimeMs > stalenessMs) {
+          if (!await removeIfStillStale(lockDir, stalenessMs)) {
+            // Match C-swap's tiny backoff after a failed stale-lock removal/takeover.
+            await sleep(50);
+          }
+          continue;
         }
-        continue;
+      } catch (statError: unknown) {
+        if (statError && typeof statError === 'object' && (statError as NodeJS.ErrnoException).code === 'ENOENT') {
+          continue; // Holder released between mkdir and stat; retry immediately.
+        }
+        throw statError;
       }
-    } catch (error: unknown) {
-      if (error && typeof error === 'object' && (error as NodeJS.ErrnoException).code === 'ENOENT') {
-        continue; // Holder released between mkdir and stat; retry immediately.
-      }
-      throw error;
+      await sleep(retryMinMs + Math.random() * retryJitterMs);
+      continue;
     }
-    await sleep(retryMinMs + Math.random() * retryJitterMs);
+
+    if (options.onCompromised) {
+      const ownerToken = newOwnerToken();
+      try {
+        await writeFile(join(lockDir, ownerToken), '', { flag: 'wx', mode: 0o600 });
+        const entries = await readdir(lockDir);
+        if (entries.some((entry) => QLB_OWNER_TOKEN.test(entry) && entry !== ownerToken)) {
+          // mkdir can be taken over before a stalled holder writes its token. Do
+          // not enter the callback from a directory that already has an owner.
+          // This holder may remove only the token it just wrote.
+          try { await unlink(join(lockDir, ownerToken)); } catch { /* retry without claiming this directory */ }
+          continue;
+        }
+      } catch (error) {
+        // Never use broad stale-lock cleanup here: this directory may now belong
+        // to another contender. At most remove the token generated above.
+        try { await unlink(join(lockDir, ownerToken)); } catch { /* nothing owned remains */ }
+        throw error;
+      }
+      acquiredOwnerToken = ownerToken;
+    }
+    break;
   }
 
   const acquiredIdentity = lockIdentity(lockDir);
@@ -426,8 +438,14 @@ export async function withProperLockfile<T>(
       try {
         if (!sameLockIdentity(acquiredIdentity, lockIdentity(lockDir))) throw markCompromised();
         // Linux may immediately recycle a removed directory's dev/ino pair.
-        // This per-acquisition token cannot appear in a successor directory.
-        if (acquiredOwnerToken && !existsSync(join(lockDir, acquiredOwnerToken))) throw markCompromised();
+        // A missing token or any other opt-in owner's token is compromised.
+        if (acquiredOwnerToken) {
+          const entries = readdirSync(lockDir);
+          if (!entries.includes(acquiredOwnerToken) ||
+            entries.some((entry) => QLB_OWNER_TOKEN.test(entry) && entry !== acquiredOwnerToken)) {
+            throw markCompromised();
+          }
+        }
       } catch (error) {
         if (error instanceof ProperLockfileCompromised) throw error;
         throw markCompromised();

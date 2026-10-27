@@ -432,6 +432,133 @@ describe('Claude Code proper-lockfile locks', () => {
     }
   });
 
+  it('backs off when a foreign owner token appears during acquisition', async () => {
+    const home = await tempHome();
+    const lock = join(home, 'exclusive-owner.lock');
+    const foreignToken = '.qlb-owner-999-deadbeef';
+    const fsPromises = require('node:fs/promises') as Record<string, (...args: any[]) => Promise<any>>;
+    const originalWriteFile = fsPromises.writeFile;
+    let ownerWrites = 0;
+    let callbackRan = false;
+    try {
+      fsPromises.writeFile = async (...args: any[]) => {
+        const result = await originalWriteFile(...args);
+        if (String(args[0]).startsWith(`${lock}/.qlb-owner-`) && ++ownerWrites === 1) {
+          await originalWriteFile(join(lock, foreignToken), '', { flag: 'wx' });
+        }
+        return result;
+      };
+
+      await assert.rejects(
+        withProperLockfile(lock, {
+          onCompromised: () => {},
+          timeoutMs: 60,
+          stalenessMs: 1_000,
+          retryMinMs: 5,
+          retryJitterMs: 0,
+        }, async () => { callbackRan = true; }),
+        ClaudeCodeLockTimeout,
+      );
+      assert.equal(callbackRan, false, 'a holder with a foreign token must not enter its callback');
+      assert.deepEqual(await readdir(lock), [foreignToken], 'only this holder\'s token is removed');
+    } finally {
+      fsPromises.writeFile = originalWriteFile;
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it('marks an opt-in holder compromised when a foreign owner token appears', async () => {
+    const home = await tempHome();
+    const lock = join(home, 'foreign-owner-after-acquisition.lock');
+    let compromised = 0;
+    try {
+      await withProperLockfile(lock, { onCompromised: () => { compromised += 1; } }, async (held) => {
+        await writeFile(join(lock, '.qlb-owner-999-deadbeef'), '', { flag: 'wx' });
+        assert.throws(() => held.assertNotCompromised(), /Lock ownership was lost/);
+        assert.throws(() => held.assertNotCompromised(), /Lock ownership was lost/);
+      });
+      assert.equal(compromised, 1, 'a foreign token marks the holder compromised once');
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it('does not enter A while a stalled acquisition writes into B\'s replacement lock', async () => {
+    const home = await tempHome();
+    const lock = join(home, 'exclusive-owner-race.lock');
+    const fsPromises = require('node:fs/promises') as Record<string, (...args: any[]) => Promise<any>>;
+    const originalWriteFile = fsPromises.writeFile;
+    let releaseAWrite!: () => void;
+    const aWriteReleased = new Promise<void>((resolve) => { releaseAWrite = resolve; });
+    let aWriteStalled!: () => void;
+    const aWriteStarted = new Promise<void>((resolve) => { aWriteStalled = resolve; });
+    let releaseB!: () => void;
+    const bReleased = new Promise<void>((resolve) => { releaseB = resolve; });
+    let bEntered!: () => void;
+    const bEnteredCallback = new Promise<void>((resolve) => { bEntered = resolve; });
+    let ownerWrites = 0;
+    let aCallbackRan = false;
+    let bPastAssert = 0;
+    let mostPastAssert = 0;
+    try {
+      fsPromises.writeFile = async (...args: any[]) => {
+        if (String(args[0]).startsWith(`${lock}/.qlb-owner-`) && ++ownerWrites === 1) {
+          aWriteStalled();
+          await aWriteReleased;
+        }
+        return originalWriteFile(...args);
+      };
+
+      const a = withProperLockfile(lock, {
+        onCompromised: () => {},
+        timeoutMs: 100,
+        stalenessMs: 10,
+        touchIntervalMs: 5,
+        retryMinMs: 1,
+        retryJitterMs: 0,
+      }, async (held) => {
+        held.assertNotCompromised();
+        aCallbackRan = true;
+      });
+      await aWriteStarted;
+      const old = new Date(Date.now() - 1_000);
+      await utimes(lock, old, old);
+
+      const b = withProperLockfile(lock, {
+        onCompromised: () => {},
+        timeoutMs: 1_000,
+        stalenessMs: 10,
+        touchIntervalMs: 5,
+        retryMinMs: 1,
+        retryJitterMs: 0,
+      }, async (held) => {
+        held.assertNotCompromised();
+        bPastAssert += 1;
+        mostPastAssert = Math.max(mostPastAssert, bPastAssert);
+        bEntered();
+        await bReleased;
+        bPastAssert -= 1;
+      });
+      await bEnteredCallback;
+      releaseAWrite();
+
+      await assert.rejects(a, ClaudeCodeLockTimeout);
+      assert.equal(aCallbackRan, false, 'A must retry or time out rather than enter B\'s lock');
+      const entries = await readdir(lock);
+      assert.equal(entries.length, 1, 'A removes the token it wrote into B\'s lock');
+      assert.match(entries[0], /^\.qlb-owner-\d+-[0-9a-f]+$/);
+      assert.equal(mostPastAssert, 1, 'at most one holder is past its compromise assertion');
+
+      releaseB();
+      await b;
+    } finally {
+      releaseAWrite?.();
+      releaseB?.();
+      fsPromises.writeFile = originalWriteFile;
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
   it('a takeover during the final mutation makes withCodexAuthLock throw CodexAuthLockCompromised, not succeed', async () => {
     const home = await tempHome();
     const lock = codexAuthLockDir({ home });
