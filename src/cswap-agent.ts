@@ -2,7 +2,7 @@ import { execFileSync, spawn } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, renameSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
-import { listCswapProcesses } from './cswap-processes';
+import { listCswapProcesses, listCswapProcessesToSignal } from './cswap-processes';
 
 /** K13 seam for the destructive C-swap LaunchAgent operations. */
 export interface CswapAgentResult {
@@ -18,7 +18,10 @@ export type CswapLockRelease = () => void | Promise<void>;
 
 /** Every effect used by the S57 drain is supplied by its caller. */
 export interface CswapDrainOptions {
+  /** Loose liveness list: governs waiting and lock acquisition. */
   listProcesses(): CswapProcess[] | Promise<CswapProcess[]>;
+  /** Strict list: only these positively identified PIDs may receive SIGTERM. */
+  listSignalTargets(): CswapProcess[] | Promise<CswapProcess[]>;
   lockPaths(): string[] | Promise<string[]>;
   tryAcquireLock(path: string): CswapLockRelease | null | Promise<CswapLockRelease | null>;
   /** Sends only SIGTERM; ESRCH means the target already exited. */
@@ -128,6 +131,10 @@ export async function cooperativeDrain(options: CswapDrainOptions): Promise<Cswa
       // Re-read under every lock so we never signal a process that already left.
       survivors = await options.listProcesses();
       if (survivors.length === 0) return { ok: true };
+      const signalTargetPids = new Set((await options.listSignalTargets()).map(({ pid }) => pid));
+      if (survivors.some(({ pid }) => !signalTargetPids.has(pid))) {
+        return { ok: false, code: 'cswap-unidentified-survivor' };
+      }
       const exited = new Set<number>();
       for (const process of survivors) {
         try {
@@ -181,8 +188,10 @@ export interface LaunchctlCswapAgentDependencies {
   qlbHome(): string;
   /** C-swap's configured sequence.json; its parent owns all C-swap locks. */
   cswapSequencePath?(): string;
-  /** Defaults to the reviewed A14 classifier; tests inject a hermetic seam. */
+  /** Defaults to the reviewed A14 loose liveness classifier; tests inject a hermetic seam. */
   listProcesses?(): CswapProcess[] | Promise<CswapProcess[]>;
+  /** Defaults to the strict signal-target classifier; tests inject a hermetic seam. */
+  listSignalTargets?(): CswapProcess[] | Promise<CswapProcess[]>;
   /** A non-blocking fcntl flock compatible with C-swap's flock locks. */
   tryAcquireLock(path: string): CswapLockRelease | null | Promise<CswapLockRelease | null>;
   kill(pid: number, signal: 'SIGTERM'): void | Promise<void>;
@@ -273,6 +282,7 @@ export function launchctlCswapAgent(deps: LaunchctlCswapAgentDependencies): Cswa
     },
     drain: async () => cooperativeDrain({
       listProcesses: () => deps.listProcesses ? deps.listProcesses() : listCswapProcesses(),
+      listSignalTargets: () => deps.listSignalTargets ? deps.listSignalTargets() : listCswapProcessesToSignal(),
       lockPaths: () => sequenceLockPaths(deps),
       tryAcquireLock: (path) => deps.tryAcquireLock(path),
       kill: (pid, signal) => deps.kill(pid, signal),
@@ -346,6 +356,7 @@ export function productionLaunchctlCswapAgent(home: string, qlbHome: string, csw
     qlbHome: () => qlbHome,
     cswapSequencePath: () => sequencePath,
     listProcesses: listCswapProcesses,
+    listSignalTargets: listCswapProcessesToSignal,
     tryAcquireLock: productionTryAcquireLock,
     kill: (pid, signal) => { process.kill(pid, signal); },
     now: Date.now,
