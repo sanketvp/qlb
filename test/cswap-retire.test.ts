@@ -6,7 +6,8 @@ import { DatabaseSync } from 'node:sqlite';
 import { describe, it } from 'node:test';
 
 import { evaluateRetirementGates, type CswapRetireDependencies } from '../src/cswap-retire';
-import { beginCutover, phase } from '../src/lifecycle';
+import piRollback, { executePiRollback } from '../src/commands/pi-rollback';
+import { beginCutover, beginRetirementFence, phase } from '../src/lifecycle';
 import { openStore } from '../src/store';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -113,6 +114,97 @@ describe('qlb retire cswap (AC22 retire)', () => {
       f.deps.slots = () => [{ accountId: 'slot-a', source: 'cswap-import', sourceFingerprint: 'unrelated', currentFingerprint: 'current-a' }];
     }, 'slot-lineage-unprovable:slot-a');
     await refusal('receipt stale', (f) => f.store.setConfig('report.receiptAt', String(NOW - 10 * 60 * 1000 - 1)), 'report-receipt-stale');
+  });
+
+  it('pi rollback proceeds in pre-cutover and refuses only under retirement or cutover-begin fences', async () => {
+    const f = fixture();
+    try {
+      const db = new DatabaseSync(f.store.dbPath);
+      try { db.prepare("UPDATE lifecycle SET state = 'pre-cutover'").run(); } finally { db.close(); }
+      const output: string[] = [];
+      let rollbacks = 0;
+      const context = {
+        stdout: (message: string) => output.push(message), stderr: () => {},
+        env: { QLB_TEST_MODE: '1', QLB_HOME: f.root }, home: f.root,
+        config: { dbPath: f.store.dbPath }, loadConfig: () => ({ dbPath: f.store.dbPath }),
+        registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
+      } as never;
+      assert.equal(await executePiRollback(['xai'], context, { rollback: () => {
+        rollbacks++;
+        return { provider: 'xai', state: 'migrated', resumed: false, wouldWrite: [] };
+      } }), 0);
+      assert.equal(rollbacks, 1);
+      assert.deepEqual(output, ['xai: rolled back']);
+
+      const errors: string[] = [];
+      assert.equal(beginRetirementFence(f.store).ok, false, 'pre-cutover cannot have a fence');
+      const fenced = fixture();
+      try {
+        assert.equal(beginRetirementFence(fenced.store).ok, true);
+        const code = await piRollback.execute!(['xai'], {
+          stdout: () => {}, stderr: (message: string) => errors.push(message),
+          env: { QLB_TEST_MODE: '1', QLB_HOME: fenced.root }, home: fenced.root,
+          config: { dbPath: fenced.store.dbPath }, loadConfig: () => ({ dbPath: fenced.store.dbPath }),
+          registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
+        } as never);
+        assert.equal(code, 3);
+        assert.match(errors.join('\n'), /retirement-in-progress/);
+      } finally { fenced.cleanup(); }
+
+      const cutoverBeginning = fixture();
+      try {
+        const beginningErrors: string[] = [];
+        const db = new DatabaseSync(cutoverBeginning.store.dbPath);
+        try { db.prepare('UPDATE lifecycle SET note = ?').run('cutover-begin-in-progress'); } finally { db.close(); }
+        const code = await executePiRollback(['xai'], {
+          stdout: () => {}, stderr: (message: string) => beginningErrors.push(message),
+          env: { QLB_TEST_MODE: '1', QLB_HOME: cutoverBeginning.root }, home: cutoverBeginning.root,
+          config: { dbPath: cutoverBeginning.store.dbPath }, loadConfig: () => ({ dbPath: cutoverBeginning.store.dbPath }),
+          registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
+        } as never, { rollback: () => assert.fail('rollback must not run during cutover begin') });
+        assert.equal(code, 3);
+        assert.match(beginningErrors.join('\n'), /cutover-begin-in-progress/);
+      } finally { cutoverBeginning.cleanup(); }
+    } finally { f.cleanup(); }
+  });
+
+  it('pi rollback rechecks retirement and cutover-begin fences installed after its outer check', async () => {
+    const f = fixture();
+    try {
+      const errors: string[] = [];
+      const context = {
+        stdout: () => {}, stderr: (message: string) => errors.push(message),
+        env: { QLB_TEST_MODE: '1', QLB_HOME: f.root }, home: f.root,
+        config: { dbPath: f.store.dbPath }, loadConfig: () => ({ dbPath: f.store.dbPath }),
+        registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
+      } as never;
+      const code = await executePiRollback(['xai'], context, {
+        rollback: () => assert.fail('rollback must not run after a fence is installed'),
+        beforeLock: () => assert.equal(beginRetirementFence(f.store).ok, true),
+      });
+      assert.equal(code, 3);
+      assert.match(errors.join('\n'), /retirement-in-progress/);
+
+      const cutoverBeginning = fixture();
+      try {
+        const beginningErrors: string[] = [];
+        const beginningContext = {
+          stdout: () => {}, stderr: (message: string) => beginningErrors.push(message),
+          env: { QLB_TEST_MODE: '1', QLB_HOME: cutoverBeginning.root }, home: cutoverBeginning.root,
+          config: { dbPath: cutoverBeginning.store.dbPath }, loadConfig: () => ({ dbPath: cutoverBeginning.store.dbPath }),
+          registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
+        } as never;
+        const beginningCode = await executePiRollback(['xai'], beginningContext, {
+          rollback: () => assert.fail('rollback must not run after cutover begin starts'),
+          beforeLock: () => {
+            const db = new DatabaseSync(cutoverBeginning.store.dbPath);
+            try { db.prepare('UPDATE lifecycle SET note = ?').run('cutover-begin-in-progress'); } finally { db.close(); }
+          },
+        });
+        assert.equal(beginningCode, 3);
+        assert.match(beginningErrors.join('\n'), /cutover-begin-in-progress/);
+      } finally { cutoverBeginning.cleanup(); }
+    } finally { f.cleanup(); }
   });
 
   it('maps C-swap items only when the fresh QLB slot represents them', async () => {

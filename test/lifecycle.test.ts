@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -8,15 +8,20 @@ import { describe, it } from 'node:test';
 import {
   CUTOVER_BEGIN_IN_PROGRESS,
   PHASE_RULES,
+  RETIREMENT_IN_PROGRESS,
   assertAdmitted,
   beginCutover,
+  beginRetirementFence,
+  clearRetirementFence,
   commitCutover,
   extendWindow,
   isOperational,
   lifecycleCheck,
   markDrillDone,
   phase,
+  retirementLockPath,
   transition,
+  withRetirementMutationLock,
   closeLifecycle,
 } from '../src/lifecycle';
 import { cutoverBegin } from '../src/commands/cutover';
@@ -29,6 +34,14 @@ import type { CswapAgent } from '../src/cswap-agent';
 function fixtureStore() {
   return openStore(join(mkdtempSync(join(tmpdir(), 'qlb-lifecycle-')), 'qlb.db'));
 }
+
+const testRetirementLockFs = {
+  exists: existsSync,
+  mkdir: (path: string, options: { recursive?: boolean; mode?: number }) => { mkdirSync(path, options); },
+  readFile: (path: string) => readFileSync(path, 'utf8'),
+  remove: (path: string) => { rmSync(path, { recursive: true, force: true }); },
+  writeOwner: (path: string, owner: { pid: number; token: string }) => { writeFileSync(path, `${JSON.stringify(owner)}\n`); },
+};
 
 // @ts-expect-error S57 requires every CswapAgent to implement drain.
 const agentMissingDrain: CswapAgent = {
@@ -128,6 +141,157 @@ describe('lifecycle (AC49)', () => {
       assert.equal(assertAdmitted(store, 'pi-migrate').code, 'phase=retired');
       assert.ok(PHASE_RULES.retired.has('gate'));
     } finally { store.close(); }
+  });
+
+  it('retirement fence refuses only undo-cswap, undo-cswap:resume, pi-rollback and retire-cswap', () => {
+    const store = fixtureStore();
+    try {
+      beginCutover(store);
+      const db = new DatabaseSync(store.dbPath);
+      try { db.prepare("UPDATE lifecycle SET state = 'cutover', note = ?").run(RETIREMENT_IN_PROGRESS); } finally { db.close(); }
+      for (const operation of ['gate', 'switch:manual', 'switch:auto', 'auto', 'report-cutover', 'claude-add', 'doctor', 'status', 'retire-cswap:resume'] as const) {
+        assert.equal(assertAdmitted(store, operation).ok, true, operation);
+      }
+      for (const operation of ['undo-cswap', 'undo-cswap:resume', 'pi-rollback', 'retire-cswap'] as const) {
+        assert.equal(assertAdmitted(store, operation).code, RETIREMENT_IN_PROGRESS, operation);
+      }
+    } finally { store.close(); }
+  });
+
+  it('retire-cswap:resume is admitted in cutover and retired without a fence', () => {
+    const store = fixtureStore();
+    try {
+      beginCutover(store);
+      const db = new DatabaseSync(store.dbPath);
+      try { db.prepare("UPDATE lifecycle SET state = 'cutover'").run(); } finally { db.close(); }
+      assert.equal(assertAdmitted(store, 'retire-cswap:resume').ok, true);
+      const retired = new DatabaseSync(store.dbPath);
+      try { retired.prepare("UPDATE lifecycle SET state = 'retired'").run(); } finally { retired.close(); }
+      assert.equal(assertAdmitted(store, 'retire-cswap:resume').ok, true);
+    } finally { store.close(); }
+  });
+
+  it('clearRetirementFence refuses outside retired-with-fence', () => {
+    const store = fixtureStore();
+    try {
+      beginCutover(store);
+      assert.equal(beginRetirementFence(store).ok, false);
+      const db = new DatabaseSync(store.dbPath);
+      try { db.prepare("UPDATE lifecycle SET state = 'cutover'").run(); } finally { db.close(); }
+      assert.equal(beginRetirementFence(store).ok, true);
+      assert.equal(beginRetirementFence(store).ok, true, 'idempotent');
+      assert.equal(clearRetirementFence(store).code, 'retirement-fence-state-lost');
+      const retired = new DatabaseSync(store.dbPath);
+      try { retired.prepare("UPDATE lifecycle SET state = 'retired'").run(); } finally { retired.close(); }
+      assert.equal(clearRetirementFence(store).ok, true);
+      assert.equal(phase(store).note, null);
+      assert.equal(clearRetirementFence(store).code, 'retirement-fence-state-lost');
+    } finally { store.close(); }
+  });
+
+  it('withRetirementMutationLock refuses with retirement-locked when the lock dir has no owner file', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-retirement-lock-'));
+    const lockPath = retirementLockPath(join(root, '.qlb'));
+    mkdirSync(lockPath, { recursive: true });
+    let called = false;
+    await assert.rejects(
+      withRetirementMutationLock(lockPath, async () => { called = true; }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'retirement-locked');
+        assert.match(error instanceof Error ? error.message : String(error), new RegExp(lockPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+        return true;
+      },
+    );
+    assert.equal(called, false);
+  });
+
+  it('serializes stale-lock reclamation at every interleaving point and refuses a leftover reclaim mutex', async () => {
+    for (const step of ['probed', 'mutex-acquired', 'owner-reread', 'lock-removed', 'mutex-released'] as const) {
+      const root = mkdtempSync(join(tmpdir(), 'qlb-retirement-lock-'));
+      const lockPath = retirementLockPath(join(root, '.qlb'));
+      const ownerPath = join(lockPath, 'qlb-lock-owner.json');
+      mkdirSync(lockPath, { recursive: true });
+      writeFileSync(ownerPath, JSON.stringify({ pid: 42, token: 'dead-owner' }));
+      const probe = (pid: number) => {
+        if (pid === 42) throw Object.assign(new Error('gone'), { code: 'ESRCH' });
+      };
+      let ran = 0;
+      let releaseSecond: (() => void) | undefined;
+      let second: Promise<void> | undefined;
+      const first = withRetirementMutationLock(lockPath, () => { ran++; }, {
+        fs: testRetirementLockFs,
+        probe,
+        token: () => 'first-holder',
+        onReclaimStep: (at) => {
+          if (at !== step) return;
+          second = withRetirementMutationLock(lockPath, () => {
+            ran++;
+            return new Promise<void>((resolve) => { releaseSecond = resolve; });
+          }, { fs: testRetirementLockFs, probe, token: () => 'second-holder' });
+        },
+      });
+      const firstResult = first.then(
+        () => ({ ok: true as const }),
+        (error: unknown) => ({ ok: false as const, error }),
+      );
+      await firstResult;
+      assert.ok(second, step);
+      const secondResult = second!.then(
+        () => ({ ok: true as const }),
+        (error: unknown) => ({ ok: false as const, error }),
+      );
+      assert.equal(ran, 1, step);
+      releaseSecond?.();
+      const results = await Promise.all([firstResult, secondResult]);
+      assert.equal(results.filter((result) => result.ok).length, 1, step);
+      const rejected = results.find((result) => !result.ok);
+      assert.equal((rejected as { error: { code?: unknown } }).error.code, 'retirement-locked', step);
+    }
+
+    const root = mkdtempSync(join(tmpdir(), 'qlb-retirement-lock-'));
+    const lockPath = retirementLockPath(join(root, '.qlb'));
+    mkdirSync(`${lockPath}.reclaim`, { recursive: true });
+    const reclaimPath = `${lockPath}.reclaim`;
+    await assert.rejects(
+      withRetirementMutationLock(lockPath, () => assert.fail('must not run')),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'retirement-locked');
+        assert.match(error instanceof Error ? error.message : String(error), new RegExp(reclaimPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+        return true;
+      },
+    );
+  });
+
+  it('removes its fresh lock when publishing the owner fails, then permits a later acquire', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-retirement-lock-'));
+    const lockPath = retirementLockPath(join(root, '.qlb'));
+    const ownerWriteError = Object.assign(new Error('injected owner write failure'), { code: 'EIO' });
+    await assert.rejects(
+      withRetirementMutationLock(lockPath, () => assert.fail('must not run'), {
+        fs: { ...testRetirementLockFs, writeOwner: () => { throw ownerWriteError; } },
+        token: () => 'failed-holder',
+      }),
+      (error: unknown) => error === ownerWriteError,
+    );
+    assert.equal(existsSync(lockPath), false, 'the failed owner write must not strand its fresh lock');
+    let acquired = false;
+    await withRetirementMutationLock(lockPath, () => { acquired = true; }, {
+      fs: testRetirementLockFs,
+      token: () => 'next-holder',
+    });
+    assert.equal(acquired, true);
+    assert.equal(existsSync(lockPath), false);
+  });
+
+  it('leaves a lock whose owner token was replaced while it held it', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-retirement-lock-'));
+    const lockPath = retirementLockPath(join(root, '.qlb'));
+    const ownerPath = join(lockPath, 'qlb-lock-owner.json');
+    await withRetirementMutationLock(lockPath, () => {
+      writeFileSync(ownerPath, JSON.stringify({ pid: process.pid, token: 'replacement-holder' }));
+    }, { token: () => 'original-holder' });
+    assert.equal(existsSync(lockPath), true);
+    assert.deepEqual(JSON.parse(readFileSync(ownerPath, 'utf8')), { pid: process.pid, token: 'replacement-holder' });
   });
 
   it('refuses a disallowed operation through the executing CLI dispatch path', async () => {
