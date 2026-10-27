@@ -4,7 +4,8 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync 
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
-import { codexFingerprint, readCodexAuthStable, type CodexAuthDocument, type CodexAuthStableResult } from './codex-auth';
+import { CodexAuthLockCompromised, withCodexAuthLock, type CodexAuthLockOptions, type HeldCodexAuthLock } from './cc-locks';
+import { codexFingerprint, parseCodexAuth, readCodexAuthStable, type CodexAuthDocument, type CodexAuthStableResult } from './codex-auth';
 import { isCredentialNotFound } from './credential-backends';
 import { planImportActiveCodex } from './codex-slots';
 import { QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, type KeychainBackend } from './keychain';
@@ -19,7 +20,7 @@ const PROVIDER = 'openai-codex';
 export const CODEX_FILE_CREDENTIAL_STORE_CONFIG = 'cli_auth_credentials_store = "file"\n';
 
 export class CodexAddError extends Error {
-  constructor(message: string, readonly exitCode: 1 | 3 = 1) {
+  constructor(message: string, readonly exitCode: 1 | 3 = 1, readonly retryable = false) {
     super(message);
     this.name = 'CodexAddError';
   }
@@ -59,6 +60,8 @@ export interface CodexAddDeps {
   installCleanup: (cleanup: () => Promise<void>) => () => void;
   /** Test seam for the short SQLite transaction. */
   withDb: <T>(store: SqlStore, fn: (db: DatabaseSync) => T) => T;
+  /** Holds the Codex auth lock around the slot/Keychain read-decide-write. */
+  withAuthLock: <T>(options: CodexAuthLockOptions, fn: (held: HeldCodexAuthLock) => Promise<T> | T) => Promise<T>;
 }
 
 export interface CodexAddResult {
@@ -69,6 +72,20 @@ export interface CodexAddResult {
 
 interface ExistingSlot {
   fingerprint: string | null;
+}
+
+function storedCredentialMatchesFingerprint(value: string | undefined, fingerprint: string): boolean {
+  if (value === undefined) return false;
+  const parsed = parseCodexAuth(value);
+  return parsed.ok && codexFingerprint(parsed.doc) === fingerprint;
+}
+
+function unsafePredecessorError(accountId: string): CodexAddError {
+  return new CodexAddError(
+    `Codex replacement could not safely preserve predecessor for ${accountId}; retry codex add --replace`,
+    3,
+    true,
+  );
 }
 
 function withDatabase<T>(store: SqlStore, fn: (db: DatabaseSync) => T): T {
@@ -95,7 +112,12 @@ function stableDocument(result: CodexAuthStableResult): CodexAuthDocument {
   return result.doc;
 }
 
-function persist(doc: CodexAuthDocument, input: CodexAddInput, deps: CodexAddDeps): CodexAddResult {
+function persist(
+  doc: CodexAuthDocument,
+  input: CodexAddInput,
+  deps: CodexAddDeps,
+  assertAuthLockHeld: () => void,
+): CodexAddResult {
   const identity = plan(doc);
   const fingerprint = codexFingerprint(doc);
   const service = qlbKeychainService(PROVIDER, identity.slotId);
@@ -109,6 +131,7 @@ function persist(doc: CodexAuthDocument, input: CodexAddInput, deps: CodexAddDep
   let exists = false;
 
   return withDb(deps.store, (db) => {
+      assertAuthLockHeld();
       db.exec('BEGIN IMMEDIATE');
       try {
         const existing = db.prepare('SELECT fingerprint FROM codex_slots WHERE account_id = ?')
@@ -137,19 +160,27 @@ function persist(doc: CodexAuthDocument, input: CodexAddInput, deps: CodexAddDep
           if (!isCredentialNotFound(error)) throw error;
           priorPrevious = undefined;
         }
+        // A retry after an interrupted replacement must not turn the new
+        // current value into :prev and thereby discard the old credential.
+        if (existing?.fingerprint && !storedCredentialMatchesFingerprint(priorCredential, existing.fingerprint)) {
+          throw unsafePredecessorError(identity.slotId);
+        }
 
         // Set this before every write: a backend can throw after modifying an
         // item, and compensation must cover that ambiguous outcome too.
         if (existing?.fingerprint) {
           writtenPrevious = priorCredential!;
           wrotePrevious = true;
+          assertAuthLockHeld();
           deps.keychain.setSync(`${service}:prev`, QLB_KEYCHAIN_ACCOUNT, writtenPrevious);
         }
         writtenCredential = JSON.stringify(doc);
         wroteCredential = true;
+        assertAuthLockHeld();
         deps.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, writtenCredential);
 
         const now = deps.now();
+        assertAuthLockHeld();
         db.prepare(`INSERT INTO codex_slots (
           account_id, chatgpt_user_id, chatgpt_account_id, fingerprint, prev_fingerprint,
           last_refresh, dead, pending_adopt, added_at, last_active_at, source, healed_at
@@ -164,31 +195,39 @@ function persist(doc: CodexAuthDocument, input: CodexAddInput, deps: CodexAddDep
           pending_adopt = 0, archived_at = NULL`).run(
           identity.slotId, identity.chatgptUserId, identity.accountId, fingerprint, doc.last_refresh ?? null, now,
         );
+        assertAuthLockHeld();
         db.prepare(`INSERT INTO accounts (id, provider, label, status, created_at)
           VALUES (?, ?, ?, 'active', ?)
           ON CONFLICT(id) DO UPDATE SET provider = excluded.provider`)
           .run(identity.accountId, PROVIDER, identity.accountId, now);
+        assertAuthLockHeld();
         db.prepare(`INSERT INTO lineage_log (ts, provider, account_id, from_fp, to_fp, cause, by, evidence)
           VALUES (?, ?, ?, ?, ?, ?, 'qlb-cli', ?)`)
           .run(now, PROVIDER, identity.slotId, existing?.fingerprint ?? null, fingerprint, exists ? 'replace' : 'add', exists ? 'replace' : 'add');
         if (exists) {
+          assertAuthLockHeld();
           db.prepare(`INSERT INTO relogin_events (ts, provider, account_id, kind, detail, evidence)
             VALUES (?, ?, ?, 'identity-replaced', NULL, 'identity')`)
             .run(now, PROVIDER, identity.slotId);
         }
+        assertAuthLockHeld();
         db.exec('COMMIT');
         return { slotId: identity.slotId, added: !exists };
       } catch (error) {
         // Compensate before ROLLBACK releases BEGIN IMMEDIATE. Each write is
         // conditional so an ambiguous write failure cannot overwrite a value
         // that was not written by this attempt.
+        let compensationSafe = true;
         if (wroteCredential) {
-          restoreCredentialIfUnchanged(deps.keychain, service, priorCredential, writtenCredential!);
+          compensationSafe = restoreCredentialIfUnchanged(deps.keychain, service, priorCredential, writtenCredential!) && compensationSafe;
         }
         if (wrotePrevious) {
-          restoreCredentialIfUnchanged(deps.keychain, `${service}:prev`, priorPrevious, writtenPrevious!);
+          compensationSafe = restoreCredentialIfUnchanged(deps.keychain, `${service}:prev`, priorPrevious, writtenPrevious!) && compensationSafe;
         }
         try { db.exec('ROLLBACK'); } catch { /* retain the original failure */ }
+        if (error instanceof CodexAuthLockCompromised && !compensationSafe) {
+          throw unsafePredecessorError(identity.slotId);
+        }
         throw error;
       }
     });
@@ -199,7 +238,7 @@ function restoreCredentialIfUnchanged(
   service: string,
   priorValue: string | undefined,
   writtenValue: string,
-): void {
+): boolean {
   try {
     let currentValue: string | undefined;
     try {
@@ -207,10 +246,15 @@ function restoreCredentialIfUnchanged(
     } catch (error) {
       if (!isCredentialNotFound(error)) throw error;
     }
-    if (currentValue !== writtenValue) return;
+    // This is deliberately independent of the lost auth lock: it is a CAS
+    // restoring only bytes this attempt can prove it wrote.
+    if (currentValue !== writtenValue) return false;
     if (priorValue === undefined) keychain.deleteSync(service, QLB_KEYCHAIN_ACCOUNT);
     else keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, priorValue);
-  } catch { /* retain the primary persistence error */ }
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -261,7 +305,12 @@ export async function addCodexAccount(input: CodexAddInput, deps: CodexAddDeps):
       throw new CodexAddError('native Codex auth.json changed during isolated login', 3);
     }
     if (cleaning) throw new CodexAddError('codex login interrupted');
-    return persist(doc, input, deps);
+    // The isolated login deliberately runs outside this non-reentrant lock.
+    // Once its native-file checks pass, lock order is Codex auth → SQLite /
+    // Keychain so replacement cannot race import-active's re-validation.
+    return deps.withAuthLock({ home: input.home, env: deps.env }, (held) =>
+      persist(doc, input, deps, () => held.assertNotCompromised()),
+    );
   } finally {
     unregister();
     await cleanup();
@@ -372,5 +421,6 @@ export function productionCodexAddDeps(
     readAuth: readCodexAuthStable,
     installCleanup: installProcessCleanup,
     withDb: withDatabase,
+    withAuthLock: withCodexAuthLock,
   };
 }
