@@ -22,6 +22,9 @@ function fixture(): {
   deps: CswapRetireDependencies;
   calls: string[];
   deleteCalls: CswapRetireItem[][];
+  setCswapItems(items: CswapRetireItem[]): void;
+  getCswapItems(): CswapRetireItem[];
+  beforeDeleteCswapItems(action: () => void): void;
   cleanup(): void;
 } {
   const root = mkdtempSync(join(tmpdir(), 'qlb-cswap-retire-'));
@@ -45,6 +48,8 @@ function fixture(): {
 
   const calls: string[] = [];
   const deleteCalls: CswapRetireItem[][] = [];
+  let currentCswapItems: CswapRetireItem[] = [{ id: 'cswap-a', fingerprint: 'source-a' }];
+  let beforeDelete: (() => void) | undefined;
   const deps: CswapRetireDependencies = {
     now: () => NOW,
     stateDir: root,
@@ -56,18 +61,41 @@ function fixture(): {
     hasUnadoptedStash: () => false,
     claudeSlotsPass: () => true,
     slots: () => [{ accountId: 'slot-a', source: 'cswap-import', sourceFingerprint: 'source-a', currentFingerprint: 'current-a' }],
-    cswapItems: () => [{ id: 'cswap-a', fingerprint: 'source-a' }],
+    cswapItems: () => currentCswapItems,
     readSlotFingerprint: async () => 'current-a',
     effects: {
       archiveCswap: (path) => { calls.push(`archive:${path}`); },
-      deleteCswapItems: (items) => { deleteCalls.push(items); calls.push('delete-cswap-items'); },
+      // The future production adapter must provide this compare-and-delete
+      // behavior: missing captured items are already deleted, but a captured
+      // id with a different current fingerprint refuses the effect.
+      deleteCswapItems: (items) => {
+        beforeDelete?.();
+        const captured = new Map(items.map((item) => [item.id, item.fingerprint]));
+        if (currentCswapItems.some((item) => {
+          const expected = captured.get(item.id);
+          return expected !== undefined && expected !== item.fingerprint;
+        })) throw new Error('captured C-swap item fingerprint changed');
+        currentCswapItems = currentCswapItems.filter((item) => captured.get(item.id) !== item.fingerprint);
+        deleteCalls.push(items);
+        calls.push('delete-cswap-items');
+      },
       uninstallCswap: () => { calls.push('uninstall-cswap'); },
       removeCswapLaunchArtifacts: () => { calls.push('remove-launch-artifacts'); },
       deletePiBaselines: () => { calls.push('delete-pi-baselines'); },
       archiveExpiredStash: (path) => { calls.push(`archive-stash:${path}`); },
     },
   };
-  return { root, store, deps, calls, deleteCalls, cleanup: () => { store.close(); rmSync(root, { recursive: true, force: true }); } };
+  return {
+    root,
+    store,
+    deps,
+    calls,
+    deleteCalls,
+    setCswapItems: (items) => { currentCswapItems = items; },
+    getCswapItems: () => currentCswapItems,
+    beforeDeleteCswapItems: (action) => { beforeDelete = action; },
+    cleanup: () => { store.close(); rmSync(root, { recursive: true, force: true }); },
+  };
 }
 
 async function refusal(name: string, mutate: (f: Fixture) => void, expected: string): Promise<void> {
@@ -301,14 +329,19 @@ describe('qlb retire cswap (AC22 retire)', () => {
     }
   });
 
-  it('fsyncs the journal directory after every journal write before continuing', async () => {
+  it('fsyncs a newly created journal directory parent and every journal write before continuing', async () => {
     const f = fixture();
     try {
+      f.deps.journalDir = join(f.root, 'nested', 'journal');
+      const durableDirs: string[] = [];
       const durablePhases: string[] = [];
       f.deps.fsyncJournalDir = (dir) => {
-        durablePhases.push((JSON.parse(readFileSync(join(dir, 'retire-cswap.json'), 'utf8')) as { phase: string }).phase);
+        durableDirs.push(dir);
+        const path = join(dir, 'retire-cswap.json');
+        if (existsSync(path)) durablePhases.push((JSON.parse(readFileSync(path, 'utf8')) as { phase: string }).phase);
       };
       assert.equal((await retireCswap(f.store, f.deps)).ok, true);
+      assert.deepEqual(durableDirs, [join(f.root, 'nested'), f.root, ...Array(8).fill(f.deps.journalDir)]);
       assert.deepEqual(durablePhases, [
         'started', 'archive', 'delete-cswap-items', 'uninstall-cswap',
         'remove-launch-artifacts', 'delete-pi-baselines', 'archive-stash', 'committed',
@@ -374,6 +407,47 @@ describe('qlb retire cswap (AC22 retire)', () => {
       assert.equal((await retireCswap(capturedOnly.store, capturedOnly.deps)).ok, true);
       assert.deepEqual(capturedOnly.deleteCalls, [[{ id: 'cswap-a', fingerprint: 'source-a' }]]);
     } finally { capturedOnly.cleanup(); }
+  });
+
+  it('refuses new C-swap items after the delete checkpoint before later C-swap effects', async () => {
+    const f = fixture();
+    try {
+      f.deps.afterCheckpoint = (name) => {
+        if (name === 'delete-cswap-items') f.setCswapItems([{ id: 'new-item', fingerprint: 'new-fingerprint' }]);
+      };
+      assert.deepEqual(await retireCswap(f.store, f.deps), { ok: false, code: 'cswap-items-changed' });
+      assert.equal(f.calls.includes('uninstall-cswap'), false);
+      assert.equal(existsSync(join(f.deps.journalDir, 'retire-cswap.json')), true);
+      assert.equal(phase(f.store).note, 'retirement-in-progress');
+    } finally { f.cleanup(); }
+
+    const resumed = fixture();
+    try {
+      let crash = true;
+      resumed.deps.afterCheckpoint = (name) => {
+        if (name === 'delete-cswap-items' && crash) {
+          crash = false;
+          resumed.setCswapItems([{ id: 'new-item', fingerprint: 'new-fingerprint' }]);
+          throw new Error('fixture crash');
+        }
+      };
+      await assert.rejects(retireCswap(resumed.store, resumed.deps), /fixture crash/);
+      assert.deepEqual(await retireCswap(resumed.store, resumed.deps), { ok: false, code: 'cswap-items-changed' });
+      assert.equal(resumed.calls.includes('uninstall-cswap'), false);
+      assert.equal(existsSync(join(resumed.deps.journalDir, 'retire-cswap.json')), true);
+      assert.equal(phase(resumed.store).note, 'retirement-in-progress');
+    } finally { resumed.cleanup(); }
+  });
+
+  it('keeps the journal and fence when a captured item changes after the recheck', async () => {
+    const f = fixture();
+    try {
+      f.beforeDeleteCswapItems(() => f.setCswapItems([{ id: 'cswap-a', fingerprint: 'rewritten-fingerprint' }]));
+      assert.deepEqual(await retireCswap(f.store, f.deps), { ok: false, code: 'retirement-effect-failed:delete-cswap-items' });
+      assert.deepEqual(f.getCswapItems(), [{ id: 'cswap-a', fingerprint: 'rewritten-fingerprint' }]);
+      assert.equal(existsSync(join(f.deps.journalDir, 'retire-cswap.json')), true);
+      assert.equal(phase(f.store).note, 'retirement-in-progress');
+    } finally { f.cleanup(); }
   });
 
   it('resumes after a stale receipt without rerunning time-based gates', async () => {

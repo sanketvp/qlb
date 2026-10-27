@@ -2,7 +2,7 @@
 // journal and retirement fence only after that gate record is approved.
 
 import { mkdirSync, readFileSync, rmSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 import { atomicWriteText, fsyncDirSync } from './fsutil';
 import { isSuccessor } from './lineage-log';
@@ -42,6 +42,11 @@ export interface CswapRetireItem {
 /** Every effect must be idempotent: rerunning after a crash completes the same end state safely. */
 export interface CswapRetireEffects {
   archiveCswap(archivePath: string): Promise<void> | void;
+  /**
+   * For every captured item, delete it only after a fresh fingerprint read
+   * still equals `item.fingerprint`. A missing item is already deleted; a
+   * changed fingerprint must throw so retirement keeps its journal and fence.
+   */
   deleteCswapItems(items: CswapRetireItem[]): Promise<void> | void;
   uninstallCswap(): Promise<void> | void;
   removeCswapLaunchArtifacts(): Promise<void> | void;
@@ -144,7 +149,16 @@ function readJournal(dir: string): RetireJournal | null {
 }
 
 function writeJournal(dir: string, journal: RetireJournal, fsyncJournalDir: (dir: string) => void): void {
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const firstCreated = mkdirSync(dir, { recursive: true, mode: 0o700 });
+  if (firstCreated !== undefined) {
+    // mkdirSync reports the first newly-created directory. Sync every parent
+    // entry it created, deepest first, before publishing the journal there.
+    const firstCreatedParent = dirname(firstCreated);
+    for (let parent = dirname(dir); ; parent = dirname(parent)) {
+      fsyncJournalDir(parent);
+      if (parent === firstCreatedParent) break;
+    }
+  }
   atomicWriteText(journalPath(dir), `${JSON.stringify(journal)}\n`, { mode: 0o600 });
   fsyncJournalDir(dir);
 }
@@ -378,7 +392,10 @@ export async function retireCswap(store: Store, dependencies: CswapRetireDepende
       ];
       for (const [name, effect] of effects) {
         if (phaseAtLeast(journal.phase, name)) continue;
-        if (name === 'delete-cswap-items') {
+        // C-swap stays live until its launch artifacts are removed. Recheck
+        // before every remaining C-swap-destructive effect, including resume
+        // after an earlier checkpoint, so only captured fingerprints remain.
+        if (name === 'delete-cswap-items' || name === 'uninstall-cswap' || name === 'remove-launch-artifacts') {
           let currentItems: CswapRetireItem[];
           try {
             currentItems = dependencies.cswapItems();

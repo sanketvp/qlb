@@ -197,14 +197,19 @@ export function atomicWriteBytes(path: string, data: Uint8Array, options: Atomic
 }
 
 /**
- * Make prior directory-entry updates durable. Call this after an atomic rename
- * when the caller's recovery protocol requires the rename itself to survive a
- * power loss.
+ * Request durability for prior directory-entry updates. Call this after an
+ * atomic rename when recovery depends on its ordering. On macOS this is best
+ * effort rather than a power-loss guarantee because Node exposes no
+ * F_FULLFSYNC.
  */
 export function fsyncDirSync(dir: string): void {
   const fd = openSync(dir, constants.O_RDONLY);
   try {
-    fsyncSync(fd);
+    try {
+      fsyncSync(fd);
+    } catch (error) {
+      if (!FSYNC_UNSUPPORTED.has(errno(error) ?? '')) throw error;
+    }
   } finally {
     closeSync(fd);
   }
