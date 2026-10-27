@@ -8,9 +8,11 @@ import { credentialFingerprint } from '../src/anthropic-oauth';
 import { InMemoryClaudeSlotRepository, SqliteClaudeSlotRepository } from '../src/cc-slots';
 import { withClaudeConfigPathLock, withClaudeCredentialLocks } from '../src/cc-locks';
 import { claudePaths } from '../src/cc-paths';
-import { readClaudeConfig } from '../src/cc-credentials';
-import { MockKeychain, QLB_KEYCHAIN_ACCOUNT } from '../src/keychain';
+import { macosKeychainAccountName, MockKeychain, platformKeychain, QLB_KEYCHAIN_ACCOUNT } from '../src/keychain';
+import importCswapCommand from '../src/commands/import-cswap';
+import { beginCutover } from '../src/lifecycle';
 import { openStore } from '../src/store';
+import type { CommandContext } from '../src/registry';
 import {
   CswapImportCommitUnknown, CswapImportInjectedCrash, CswapImportRefusalError,
   importCswap, planCswapImport, recoverUncommittedCswapImport,
@@ -275,38 +277,61 @@ describe('C-swap import (K10 / AC16)', () => {
     await assert.rejects(h.keychain.get('qlb:anthropic:account-a', QLB_KEYCHAIN_ACCOUNT), /item not found/);
   });
 
-  it('keeps one resolved config path locked and read when a legacy config appears after staging', async () => {
+  it('a legacy .claude/.config.json appearing before the first snapshot is the file locked and read', async () => {
     const h = fixture();
     const home = join(h.root, 'home');
-    const env = { QLB_TEST_MODE: '1', QLB_HOME: join(h.root, 'qlb-home'), HOME: home };
+    const env = { QLB_TEST_MODE: '1', QLB_HOME: join(h.root, 'qlb-home'), HOME: home, USER: macosKeychainAccountName() };
     const paths = claudePaths({ home, env });
     mkdirSync(paths.configHome, { recursive: true });
     writeFileSync(paths.globalConfigPath, JSON.stringify({ oauthAccount: { accountUuid: 'account-a' } }));
-    const withLiveStateLocks = <T>(fn: () => Promise<T> | T) => withClaudeCredentialLocks({ home, env }, () =>
-      withClaudeConfigPathLock(paths.globalConfigPath, { home, env }, fn));
-    let legacyAppeared = false;
-    const keychain = {
-      get: h.keychain.get.bind(h.keychain), delete: h.keychain.delete.bind(h.keychain),
-      set: async (service: string, account: string, value: string) => {
-        if (!legacyAppeared && service.includes(':staging:')) {
-          legacyAppeared = true;
-          writeFileSync(join(paths.configHome, '.config.json'), JSON.stringify({ oauthAccount: { accountUuid: 'account-b' } }));
-        }
-        await h.keychain.set(service, account, value);
-      },
-    };
-    await assert.doesNotReject(importCswap({
-      backupDir: h.backup, journalDir: join(h.root, 'journals'), keychain, repository: h.repo,
-      runId: 'fixed-config-path', withLiveStateLocks,
-      liveSnapshot: async () => {
-        assert.equal(existsSync(`${paths.globalConfigPath}.lock`), true, 'the resolved global config is locked');
-        assert.equal(existsSync(join(paths.configHome, '.config.json.lock')), false, 'the later legacy config is not locked');
-        const oauth = readClaudeConfig(paths.globalConfigPath).oauthAccount as { accountUuid?: unknown };
-        return { credential: credential('account-a', 'live-successor'), accountId: typeof oauth.accountUuid === 'string' ? oauth.accountUuid : null };
+    writeFileSync(join(h.backup, 'sequence.json'), JSON.stringify({
+      activeAccountNumber: 2,
+      sequence: [1, 2],
+      accounts: {
+        1: { email: 'a@example.test', uuid: 'account-a', threshold: 80 },
+        2: { email: 'b@example.test', uuid: 'account-b' },
       },
     }));
-    assert.equal(legacyAppeared, true);
-    assert.equal(h.repo.getSlot('account-a')?.fingerprint, credentialFingerprint(credential('account-a', 'live-successor')));
+    writeFileSync(join(h.backup, 'credentials', '.creds-2-b@example.test.enc'), Buffer.from(credential('account-b', 'refresh-b')).toString('base64'));
+    await platformKeychain.set(paths.keychainService, env.USER, credential('account-b', 'live-successor'));
+    const dbPath = join(h.root, 'qlb.db');
+    const store = openStore(dbPath);
+    beginCutover(store);
+    store.close();
+    const output: string[] = [];
+    const context: CommandContext = {
+      stdout: (line) => output.push(line), stderr: (line) => output.push(`ERR:${line}`), env,
+      config: { dbPath, cswapSequencePath: join(h.backup, 'sequence.json') } as CommandContext['config'],
+      loadConfig: () => { throw new Error('not used'); }, home,
+      registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
+    };
+    const legacyPath = join(paths.configHome, '.config.json');
+    const originalGet = platformKeychain.get;
+    let legacyAppeared = false;
+    platformKeychain.get = async (service, account) => {
+      if (service === paths.keychainService) {
+        assert.equal(legacyAppeared, true, 'the legacy config appears before the first snapshot');
+        assert.equal(existsSync(`${legacyPath}.lock`), true, 'the legacy config is locked');
+        assert.equal(existsSync(`${paths.globalConfigPath}.lock`), false, 'the stale global config is not locked');
+      }
+      return originalGet(service, account);
+    };
+    try {
+      const execution = importCswapCommand.execute!([], context);
+      queueMicrotask(() => {
+        legacyAppeared = true;
+        writeFileSync(legacyPath, JSON.stringify({ oauthAccount: { accountUuid: 'account-b' } }));
+      });
+      assert.equal(await execution, 0, output.join('\n'));
+    } finally {
+      platformKeychain.get = originalGet;
+    }
+    const repository = SqliteClaudeSlotRepository.open(dbPath);
+    try {
+      assert.equal(repository.getSlot('account-b')?.fingerprint, credentialFingerprint(credential('account-b', 'live-successor')));
+    } finally {
+      repository.close();
+    }
   });
 
   it('holds the live-state locks from the final re-check through the SQLite commit', async () => {
