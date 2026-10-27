@@ -450,6 +450,33 @@ describe('Claude Code proper-lockfile locks', () => {
     }
   });
 
+  it('detects a Codex-lock takeover even when stat reports a reused inode', async () => {
+    const home = await tempHome();
+    const lock = codexAuthLockDir({ home });
+    const fs = require('node:fs') as { statSync: (...args: any[]) => any };
+    const originalStatSync = fs.statSync;
+    try {
+      // Model Linux immediately reusing the deleted directory's dev/ino pair;
+      // this must not rely on a filesystem allocator's behaviour.
+      fs.statSync = (...args: any[]) => {
+        const held = originalStatSync(...args);
+        return String(args[0]) === lock ? { ...held, dev: 1, ino: 1 } : held;
+      };
+      await assert.rejects(
+        withCodexAuthLock({ home }, async () => {
+          await rm(lock, { recursive: true });
+          await mkdir(lock);
+          return 'callback succeeded';
+        }),
+        (error: unknown) => error instanceof CodexAuthLockCompromised && error.retryable,
+      );
+      assert.equal(existsSync(lock), true, 'the displaced holder must not release the successor lock');
+    } finally {
+      fs.statSync = originalStatSync;
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
   it('touches held locks and releases them when the callback throws', async () => {
     const home = await tempHome();
     const lock = join(home, 'touch.lock');
