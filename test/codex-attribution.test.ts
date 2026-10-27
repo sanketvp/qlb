@@ -1,11 +1,15 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { describe, it } from 'node:test';
 
-import importActiveCommand from '../src/commands/codex-import-active';
+import importActiveCommand, {
+  runCodexImportActiveCommand,
+  type CodexImportActiveCommandDeps,
+} from '../src/commands/codex-import-active';
+import { withCodexAuthLock } from '../src/cc-locks';
 import { attributeLiveDocument } from '../src/codex-attribution';
 import { codexFingerprint, parseCodexAuth } from '../src/codex-auth';
 import { importActiveCodexSlot } from '../src/codex-slots';
@@ -448,7 +452,7 @@ describe('Codex live-document attribution (AC57)', () => {
     }
   });
 
-  it('a concurrent adoption after the repair COMMIT is never overwritten', async () => {
+  it('rejects an adoption committed after split repair and before re-validation', async () => {
     const h = fixture();
     try {
       const old = document('repair-commit-old');
@@ -495,6 +499,93 @@ describe('Codex live-document attribution (AC57)', () => {
     } finally {
       h.store.close();
       rmSync(h.home, { recursive: true, force: true });
+    }
+  });
+
+  it('serializes a second import after re-validation until repaired-slot publication completes', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-codex-import-lock-home-'));
+    const codexHome = mkdtempSync(join(tmpdir(), 'qlb-codex-import-lock-auth-'));
+    const originalPlatformKeychain = keychainModule.platformKeychain;
+    let releasePublication: (() => void) | undefined;
+    const publicationReached = new Promise<void>((resolve) => { releasePublication = resolve; });
+    let allowPublication: (() => void) | undefined;
+    const publicationAllowed = new Promise<void>((resolve) => { allowPublication = resolve; });
+    try {
+      const keychain = new MockKeychain();
+      (keychainModule as unknown as { platformKeychain: MockKeychain }).platformKeychain = keychain;
+      const output: string[] = [];
+      const ctx = commandContext(home, codexHome, output);
+      const old = document('lock-old');
+      const repaired = document('lock-repaired');
+      const newer = document('lock-newer');
+      const authPath = join(codexHome, 'auth.json');
+      writeFileSync(authPath, JSON.stringify(old), { mode: 0o600 });
+      const admitted = openStore(join(home, 'qlb.db'));
+      beginCutover(admitted, 1);
+      const plan = importActiveCodexSlot(old, { store: admitted, keychain, now: () => 1 });
+      const service = qlbKeychainService('openai-codex', plan.slotId);
+      admitted.adoptCodexSlot({
+        accountId: plan.slotId,
+        previousFingerprint: codexFingerprint(old),
+        fingerprint: codexFingerprint(repaired),
+        ts: 2,
+        evidence: 'identity',
+      });
+      keychain.setSync(`${service}:prev`, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(repaired));
+      admitted.close();
+
+      const withAuthLock: CodexImportActiveCommandDeps['withAuthLock'] = async <T,>(
+        options: import('../src/cc-locks').CodexAuthLockOptions,
+        fn: () => Promise<T> | T,
+      ): Promise<T> => withCodexAuthLock({ ...options, retryMinMs: 1, retryJitterMs: 0 }, fn);
+      let reads = 0;
+      let republished = false;
+      const writes: string[] = [];
+      const deps: CodexImportActiveCommandDeps = {
+        withAuthLock,
+        readAuth: async () => {
+          reads += 1;
+          if (reads === 1) return { status: 'ok', doc: old };
+          // The second flow cannot make its newer adoption until the first has
+          // released the QLB lock. This represents its fresh native observation.
+          assert.equal(republished, true);
+          writeFileSync(authPath, JSON.stringify(newer), { mode: 0o600 });
+          return { status: 'ok', doc: newer };
+        },
+        writeAuth: async (_path, doc) => {
+          writes.push(codexFingerprint(doc));
+          assert.equal(codexFingerprint(doc), codexFingerprint(repaired));
+          releasePublication?.();
+          await publicationAllowed;
+          republished = true;
+          writeFileSync(authPath, JSON.stringify(doc), { mode: 0o600 });
+          return 1;
+        },
+      };
+
+      const first = runCodexImportActiveCommand([], ctx, deps);
+      await publicationReached;
+      // This starts after re-validation but cannot read/adopt until the first
+      // flow's protected publish and mark-imported-active have completed.
+      const second = runCodexImportActiveCommand([], ctx, deps);
+      await Promise.resolve();
+      assert.equal(reads, 1);
+      allowPublication?.();
+      assert.equal(await first, 0);
+      assert.equal(await second, 0);
+
+      const finalStore = openStore(join(home, 'qlb.db'));
+      try {
+        assert.equal(finalStore.getCodexSlot(plan.slotId)?.fingerprint, codexFingerprint(newer));
+      } finally {
+        finalStore.close();
+      }
+      assert.equal(codexFingerprint(JSON.parse(readFileSync(authPath, 'utf8'))), codexFingerprint(newer));
+      assert.deepEqual(writes, [codexFingerprint(repaired)]);
+    } finally {
+      (keychainModule as unknown as { platformKeychain: typeof originalPlatformKeychain }).platformKeychain = originalPlatformKeychain;
+      rmSync(home, { recursive: true, force: true });
+      rmSync(codexHome, { recursive: true, force: true });
     }
   });
 

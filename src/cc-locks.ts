@@ -115,6 +115,24 @@ export interface ClaudeLockPaths {
   configLockDir: string;
 }
 
+/** Options for QLB's lock around a live Codex auth.json attribution/publish flow. */
+export interface CodexAuthLockOptions {
+  /** QLB home; the lock is deliberately never placed below CODEX_HOME. */
+  home?: string;
+  env?: NodeJS.ProcessEnv;
+  timeoutMs?: number;
+  stalenessMs?: number;
+  touchIntervalMs?: number;
+  retryMinMs?: number;
+  retryJitterMs?: number;
+}
+
+/** QLB-owned, inter-process lock location for the one live Codex credential. */
+export function codexAuthLockDir(options: CodexAuthLockOptions = {}): string {
+  const home = options.home ?? qlbHomeDir(options.env);
+  return join(home, '.qlb', 'locks', 'codex-auth.lock');
+}
+
 function resolvedEnv({ env = process.env }: ClaudeLockOptions): NodeJS.ProcessEnv {
   return env;
 }
@@ -298,6 +316,28 @@ export async function withProperLockfile<T>(
     await touchInFlight;
     await releaseHeldLock(lockDir);
   }
+}
+
+/**
+ * Serialize QLB's entire live-Codex read/decide/write flow.
+ *
+ * This lock is deliberately non-reentrant: callers must acquire it at the
+ * command boundary and pass it through all read/decision/publication work,
+ * rather than acquiring it again in writeCodexAuthAtomic(). It lives in QLB
+ * state, never alongside Codex's own auth.json, and uses the same bounded
+ * proper-lockfile protocol as the Claude locks.
+ */
+export async function withCodexAuthLock<T>(
+  options: CodexAuthLockOptions = {},
+  fn: () => Promise<T> | T,
+): Promise<T> {
+  return withProperLockfile(codexAuthLockDir(options), {
+    timeoutMs: options.timeoutMs,
+    stalenessMs: options.stalenessMs ?? CREDENTIALS_STALENESS_MS,
+    touchIntervalMs: options.touchIntervalMs,
+    retryMinMs: options.retryMinMs,
+    retryJitterMs: options.retryJitterMs,
+  }, fn);
 }
 
 /**
