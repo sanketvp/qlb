@@ -35,7 +35,7 @@ import {
   type SingleGrantProvider,
 } from './migration';
 import { parseGrant } from './refresh-lease';
-import type { Store } from './store';
+import type { MigrationRow, Store } from './store';
 import type { Grant } from './types';
 
 export type ResyncCredential = Grant | ApiKeyPayload;
@@ -48,6 +48,12 @@ export interface ResyncResult {
 }
 
 export interface NativeResyncOpts {
+  /**
+   * Production binding supplies the generic-journal W2/W3 predicate. It runs
+   * immediately before the sole Keychain write, including a missing-copy
+   * repair; standalone unit callers have no journal and omit it.
+   */
+  mayWriteOwnedCredential?: () => boolean;
   readNativeCredential: () => Promise<ResyncCredential | null>;
   readOwnedCredential: (
     keychain: KeychainBackend,
@@ -160,6 +166,19 @@ function errMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+function permitsNativeResync(row: MigrationRow | null): boolean {
+  if (row?.state !== 'QLB_OWNED') return false;
+  try {
+    const detail: unknown = JSON.parse(row.detail_json);
+    if (!detail || typeof detail !== 'object' || Array.isArray(detail)) return false;
+    return !['intent', 'rollbackDecision', 'handback'].some((key) =>
+      Object.prototype.hasOwnProperty.call(detail, key),
+    );
+  } catch {
+    return false;
+  }
+}
+
 function mergeOwnedGeneration(
   native: ResyncCredential,
   owned: ResyncCredential | null,
@@ -219,6 +238,19 @@ export async function detectAndResyncFromNative(
         resynced: false,
         reason:
           'native credential identical to QLB copy (genuine revocation; re-auth required)',
+      };
+    }
+
+    let mayWrite = true;
+    try {
+      mayWrite = opts.mayWriteOwnedCredential?.() ?? true;
+    } catch {
+      mayWrite = false;
+    }
+    if (!mayWrite) {
+      return {
+        resynced: false,
+        reason: `native resync refused for ${provider}/${accountId}: migration is not exclusively QLB-owned`,
       };
     }
 
@@ -406,6 +438,8 @@ export function bindDetectAndResync(opts: {
     const label = acct?.label || accountId;
     return detectAndResyncFromNative(provider, accountId, {
       keychain: opts.keychain,
+      mayWriteOwnedCredential: () =>
+        permitsNativeResync(opts.store.getMigration(migrationStoreNameFor(provider))),
       readNativeCredential: () => opts.readNativeCredential(provider, accountId),
       readOwnedCredential: async (keychain, id) =>
         readOwnedCredentialFromKeychain(keychain, provider, id, label),
