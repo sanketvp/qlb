@@ -48,17 +48,17 @@ export interface SingleStashDeps {
   directorySync?: (path: string) => Promise<void> | void;
 }
 
-/** Test runners must never resolve an omitted home against the operator's account. */
-export function requireExplicitHomeUnderNodeTest(home?: string): void {
-  if (!home && process.env.NODE_TEST_CONTEXT !== undefined && process.env.QLB_TEST_MODE !== '1') {
-    throw new Error('an explicit home is required under node:test without QLB_TEST_MODE=1');
+/** Resolve QLB state from the process environment, never a caller's provider environment. */
+export function resolveQlbHome(home?: string): string {
+  const resolvedHome = home ?? qlbHomeDir();
+  if (process.env.NODE_TEST_CONTEXT !== undefined && resolvedHome === qlbHomeDir({})) {
+    throw new Error('an explicit home is required under node:test when QLB_HOME is unset');
   }
+  return resolvedHome;
 }
 
-function stashRoot(deps: Pick<SingleStashDeps, 'home' | 'env'>): string {
-  const env = deps.env ?? process.env;
-  requireExplicitHomeUnderNodeTest(deps.home);
-  return join(deps.home ?? qlbHomeDir(env), '.qlb', 'unclaimed');
+function stashRoot(deps: Pick<SingleStashDeps, 'home'>): string {
+  return join(resolveQlbHome(deps.home), '.qlb', 'unclaimed');
 }
 
 function stashService(provider: SingleStashProvider, stashId: string): string {

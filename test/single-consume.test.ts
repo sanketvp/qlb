@@ -15,7 +15,6 @@ import {
 import { MockKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from '../src/keychain';
 import { refreshXaiCredential, XAI_CLIENT_ID, XAI_REFRESH_URL } from '../src/oauth/xai-refresh';
 import { KIMI_CODING_CLIENT_ID, refreshKimiCodingCredential } from '../src/oauth/kimi-coding-refresh';
-import { adoptStashedSuccessor } from '../src/single-stash';
 import { listStashes, recordStash } from '../src/unclaimed-index';
 
 const NOW = 1_730_000_000_000;
@@ -81,36 +80,74 @@ describe('single-account consume gate', () => {
     }
   });
 
-  it('refuses a missing home under node:test when deps.env is empty', async () => {
+  it('uses the process QLB home rather than an empty injected environment', async () => {
+    const processHome = process.env.QLB_HOME;
+    assert.ok(processHome, 'the test runner supplies QLB_HOME');
+    const isolatedOsHome = await mkdtemp(join(tmpdir(), 'qlb-single-consume-os-home-'));
+    const originalHome = process.env.HOME;
     const keychain = new MockKeychain();
-    const originalTestMode = process.env.QLB_TEST_MODE;
-    delete process.env.QLB_TEST_MODE;
+    keychain.setSync(qlbKeychainService('xai', 'default'), QLB_KEYCHAIN_ACCOUNT,
+      JSON.stringify(credential('before', 'refresh-before', NOW + 3_600_000)));
     try {
+      process.env.HOME = isolatedOsHome;
+      const result = await consumeSingleCredential('xai', credential('before', 'refresh-before'), {
+        keychain, env: {}, now: () => NOW,
+        refresh: async () => assert.fail('the unexpired credential must win'),
+      });
+      assert.equal(result.outcome, 'winner');
+      assert.equal(existsSync(join(processHome, '.qlb', 'locks')), true);
+      assert.equal(existsSync(join(isolatedOsHome, '.qlb')), false);
+    } finally {
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      await rm(isolatedOsHome, { recursive: true, force: true });
+    }
+  });
+
+  it('uses the process QLB home when deps.env has only a Kimi provider host', async () => {
+    const processHome = process.env.QLB_HOME;
+    assert.ok(processHome, 'the test runner supplies QLB_HOME');
+    const isolatedOsHome = await mkdtemp(join(tmpdir(), 'qlb-single-consume-os-home-'));
+    const originalHome = process.env.HOME;
+    const keychain = new MockKeychain();
+    keychain.setSync(qlbKeychainService('kimi-coding', 'default'), QLB_KEYCHAIN_ACCOUNT,
+      JSON.stringify(credential('before', 'refresh-before', NOW + 3_600_000)));
+    try {
+      process.env.HOME = isolatedOsHome;
+      const result = await consumeSingleCredential('kimi-coding', credential('before', 'refresh-before'), {
+        keychain, env: { KIMI_CODE_OAUTH_HOST: 'http://127.0.0.1:1' }, now: () => NOW,
+        refresh: async () => assert.fail('the unexpired credential must win'),
+      });
+      assert.equal(result.outcome, 'winner');
+      assert.equal(existsSync(join(processHome, '.qlb', 'locks')), true);
+      assert.equal(existsSync(join(isolatedOsHome, '.qlb')), false);
+    } finally {
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      await rm(isolatedOsHome, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects an omitted home under node:test when process QLB_HOME is absent', async () => {
+    const originalQlbHome = process.env.QLB_HOME;
+    const originalHome = process.env.HOME;
+    const isolatedOsHome = await mkdtemp(join(tmpdir(), 'qlb-single-consume-os-home-'));
+    const keychain = new MockKeychain();
+    keychain.setSync(qlbKeychainService('xai', 'default'), QLB_KEYCHAIN_ACCOUNT,
+      JSON.stringify(credential('before', 'refresh-before', NOW + 3_600_000)));
+    try {
+      delete process.env.QLB_HOME;
+      process.env.HOME = isolatedOsHome;
       await assert.rejects(consumeSingleCredential('xai', credential('before', 'refresh-before'), {
         keychain, env: {}, lock: createInMemorySingleConsumeLock(), now: () => NOW,
         refresh: async () => assert.fail('the guard must run before refresh'),
       }), /explicit home/);
-      await assert.rejects(adoptStashedSuccessor('xai', { access: 'before', refresh: 'refresh-before', expires: NOW + 30_000 }, keychain, { env: {} }), /explicit home/);
     } finally {
-      if (originalTestMode === undefined) delete process.env.QLB_TEST_MODE;
-      else process.env.QLB_TEST_MODE = originalTestMode;
-    }
-  });
-
-  it('refuses a missing home under node:test when deps.env has only a provider host', async () => {
-    const keychain = new MockKeychain();
-    const originalTestMode = process.env.QLB_TEST_MODE;
-    delete process.env.QLB_TEST_MODE;
-    try {
-      const env = { KIMI_CODE_OAUTH_HOST: 'http://127.0.0.1:1' };
-      await assert.rejects(consumeSingleCredential('xai', credential('before', 'refresh-before'), {
-        keychain, env, lock: createInMemorySingleConsumeLock(), now: () => NOW,
-        refresh: async () => assert.fail('the guard must run before refresh'),
-      }), /explicit home/);
-      await assert.rejects(adoptStashedSuccessor('xai', { access: 'before', refresh: 'refresh-before', expires: NOW + 30_000 }, keychain, { env }), /explicit home/);
-    } finally {
-      if (originalTestMode === undefined) delete process.env.QLB_TEST_MODE;
-      else process.env.QLB_TEST_MODE = originalTestMode;
+      if (originalQlbHome === undefined) delete process.env.QLB_HOME;
+      else process.env.QLB_HOME = originalQlbHome;
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      await rm(isolatedOsHome, { recursive: true, force: true });
     }
   });
 

@@ -5,7 +5,6 @@ import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 
 import { CREDENTIALS_STALENESS_MS, withProperLockfile } from './cc-locks';
-import { qlbHomeDir } from './home';
 import { platformKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from './keychain';
 import { refreshKimiCodingCredential } from './oauth/kimi-coding-refresh';
 import {
@@ -18,7 +17,7 @@ import {
   adoptStashedSuccessor,
   credentialLineage,
   persistStash,
-  requireExplicitHomeUnderNodeTest,
+  resolveQlbHome,
   SingleStashFailure,
   type OAuthCredential as StashCredential,
   type SingleStashKeychain,
@@ -106,11 +105,11 @@ function warn(deps: Pick<SingleConsumeDeps, 'warn'>, message: string): void {
 }
 
 /** Proper-lockfile directory protocol is cross-process; tests replace it with the in-memory lock. */
-export function defaultSingleConsumeLock(home = qlbHomeDir(), env: NodeJS.ProcessEnv = process.env): SingleConsumeLock {
+export function defaultSingleConsumeLock(home = resolveQlbHome()): SingleConsumeLock {
   return {
     withLock: (provider, work) => withProperLockfile(
       join(home, '.qlb', 'locks', `consume-${provider}-default.lock`),
-      { env, timeoutMs: CREDENTIALS_STALENESS_MS, stalenessMs: CREDENTIALS_STALENESS_MS },
+      { timeoutMs: CREDENTIALS_STALENESS_MS, stalenessMs: CREDENTIALS_STALENESS_MS },
       work,
     ),
   };
@@ -184,17 +183,17 @@ export async function consumeSingleCredential(
   snapshot: CredentialSnapshot,
   deps: SingleConsumeDeps,
 ): Promise<SingleConsumeResult> {
-  requireExplicitHomeUnderNodeTest(deps.home);
+  const home = resolveQlbHome(deps.home);
   const keychain = deps.keychain ?? platformKeychain;
   const now = deps.now ?? Date.now;
-  const lock = deps.lock ?? defaultSingleConsumeLock(deps.home, deps.env);
+  const lock = deps.lock ?? defaultSingleConsumeLock(home);
   const dueWithinMs = deps.dueWithinMs ?? GATE_FRESHEN_MS;
   return lock.withLock(provider, async () => {
     let current = readStoredCredential(provider, keychain);
     const adoptedFromFp = credentialLineage(current.credential);
     let adopted: StashCredential | null;
     try {
-      adopted = await adoptStashedSuccessor(provider, current.credential as StashCredential, keychain, deps);
+      adopted = await adoptStashedSuccessor(provider, current.credential as StashCredential, keychain, { home, warn: deps.warn });
     } catch (error) {
       throw stashFailure(error);
     }
@@ -229,11 +228,11 @@ export async function consumeSingleCredential(
       // Any exception after a successful POST must first make the issued pair durable.
       let afterPost: StoredCredential;
       try { afterPost = readStoredCredential(provider, keychain); } catch (error) {
-        await persistStash(provider, refreshed.credential as StashCredential, consumedFp, keychain, deps);
+        await persistStash(provider, refreshed.credential as StashCredential, consumedFp, keychain, { home, now: deps.now });
         throw error;
       }
       if (contentFingerprint(afterPost.bytes) !== consumedContentFingerprint) {
-        await persistStash(provider, refreshed.credential as StashCredential, consumedFp, keychain, deps);
+        await persistStash(provider, refreshed.credential as StashCredential, consumedFp, keychain, { home, now: deps.now });
         if (winnerFor(snapshot, afterPost.credential, now())) return { credential: afterPost.credential, outcome: 'winner' };
         throw new SingleConsumeFailure('cas-conflict');
       }
@@ -241,7 +240,7 @@ export async function consumeSingleCredential(
       try {
         keychain.setSync(credentialService(provider), QLB_KEYCHAIN_ACCOUNT, JSON.stringify(refreshed.credential));
       } catch {
-        await persistStash(provider, refreshed.credential as StashCredential, consumedFp, keychain, deps);
+        await persistStash(provider, refreshed.credential as StashCredential, consumedFp, keychain, { home, now: deps.now });
         throw new SingleConsumeFailure('persist-failed');
       }
       notifyLineage(provider, consumedFp, refreshed.credential, deps);

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
@@ -13,7 +13,7 @@ import {
 } from '../src/single-stash';
 import { ClaudeSlots, InMemoryClaudeSlotRepository } from '../src/cc-slots';
 import { MockKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from '../src/keychain';
-import { listStashes, recordStash } from '../src/unclaimed-index';
+import { listStashes, recordStash, removeStash } from '../src/unclaimed-index';
 
 const NOW = 1_730_000_000_000;
 
@@ -53,6 +53,47 @@ class StashFailingKeychain extends MockKeychain {
 }
 
 describe('single-grant stash store', () => {
+  it('uses the process QLB home rather than an empty injected environment', async () => {
+    const processHome = process.env.QLB_HOME;
+    assert.ok(processHome, 'the test runner supplies QLB_HOME');
+    const isolatedOsHome = await mkdtemp(join(tmpdir(), 'qlb-single-stash-os-home-'));
+    const originalHome = process.env.HOME;
+    const keychain = new StashFailingKeychain();
+    try {
+      process.env.HOME = isolatedOsHome;
+      await persistStash('xai', credential('issued', 'next'), lineage('before'), keychain, { env: {}, now: () => NOW });
+      const [entry] = await listStashes(root(processHome), 'xai', 'default');
+      assert.ok(entry);
+      assert.equal(existsSync(root(isolatedOsHome)), false);
+      await removeStash(root(processHome), entry);
+    } finally {
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      await rm(isolatedOsHome, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects an omitted home under node:test when process QLB_HOME is absent', async () => {
+    const originalQlbHome = process.env.QLB_HOME;
+    const originalHome = process.env.HOME;
+    const isolatedOsHome = await mkdtemp(join(tmpdir(), 'qlb-single-stash-os-home-'));
+    try {
+      delete process.env.QLB_HOME;
+      process.env.HOME = isolatedOsHome;
+      assert.equal(homedir(), isolatedOsHome);
+      await assert.rejects(
+        persistStash('xai', credential('issued', 'next'), lineage('before'), new StashFailingKeychain(), { env: {}, now: () => NOW }),
+        /explicit home/,
+      );
+    } finally {
+      if (originalQlbHome === undefined) delete process.env.QLB_HOME;
+      else process.env.QLB_HOME = originalQlbHome;
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      await rm(isolatedOsHome, { recursive: true, force: true });
+    }
+  });
+
   it('persists a successor in a create-only file fallback when Keychain storage fails', async () => {
     const home = await mkdtemp(join(tmpdir(), 'qlb-single-stash-'));
     const keychain = new StashFailingKeychain();
