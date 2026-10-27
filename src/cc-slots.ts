@@ -16,6 +16,7 @@ import { openStoreConnection } from './store';
 import { assertAdmittedInConnection } from './lifecycle';
 import { credentialFingerprint, parseCredentialBlob } from './anthropic-oauth';
 import { withClaudeSwitchLock } from './cc-locks';
+import { recordRelogin } from './relogin';
 import { isCredentialNotFound } from './credential-backends';
 import { KeychainReadBackoff, platformKeychain, qlbKeychainService, QLB_KEYCHAIN_ACCOUNT } from './keychain';
 import { listStashes, recordStash, removeStash, updateStash, type UnclaimedIndexEntry, type UnclaimedIndexWriteOptions } from './unclaimed-index';
@@ -124,8 +125,16 @@ export interface CswapImportCommit {
   config?: Record<string, string>;
 }
 
+export interface ClaudeSlotStrike {
+  reason: 'invalid_grant' | 'no_refresh_token';
+  struckFp: string;
+  ts: number;
+}
+
 export interface ClaudeSlotRepository {
   getSlot(accountId: string): ClaudeSlot | null;
+  /** Atomically bind a dead mark to the lineage rejected by the OAuth server. */
+  strikeDead(accountId: string, strike: ClaudeSlotStrike): 'struck' | 'already-dead' | 'lineage-moved';
   listSlots(): ClaudeSlot[];
   createSlot(slot: ClaudeSlot): void;
   /** Holds SQLite's write lock across the credential and metadata effects. */
@@ -156,7 +165,7 @@ export class InMemoryClaudeSlotRepository implements ClaudeSlotRepository {
   readonly importCommits: CswapImportCommit[] = [];
   private readonly importRuns = new Map<string, ImportRunRecord>();
   readonly accounts: Array<{ id: string; provider: string; label: string; status: string }> = [];
-  readonly relogins: Array<{ provider: string; accountId: string; kind: string }> = [];
+  readonly relogins: Array<{ provider: string; accountId: string; kind: string; detail?: string | null; evidence?: string | null }> = [];
   activeLogin: { provider: string; accountId: string; setBy: string } | null = null;
   generation = 0;
 
@@ -198,16 +207,51 @@ export class InMemoryClaudeSlotRepository implements ClaudeSlotRepository {
     this.generation += 1;
   }
 
+  strikeDead(accountId: string, strike: ClaudeSlotStrike): 'struck' | 'already-dead' | 'lineage-moved' {
+    const slot = this.slots.get(accountId);
+    if (!slot || slot.fingerprint !== strike.struckFp) return 'lineage-moved';
+    if (slot.dead) return 'already-dead';
+    slot.dead = true;
+    slot.deadReason = strike.reason;
+    slot.deadAt = strike.ts;
+    recordRelogin({
+      recordRelogin: (row) => {
+        this.relogins.push({
+          provider: row.provider, accountId: row.accountId ?? '', kind: row.kind,
+          detail: row.detail ?? null, evidence: row.evidence ?? null,
+        });
+        return this.relogins.length;
+      },
+    }, {
+      ts: strike.ts, provider: ANTHROPIC_PROVIDER, accountId, kind: 'dead', detail: strike.struckFp, evidence: 'dead',
+    });
+    this.generation += 1;
+    return 'struck';
+  }
+
   updateCredentialWithLineage(accountId: string, expectedFingerprint: string | null, fingerprint: string, prevFingerprint: string | null, lineage: LineageAppend | null): void {
     const slot = this.slots.get(accountId);
     if (!slot) throw new Error('Claude slot not found');
     if (slot.fingerprint !== expectedFingerprint) throw new Error('Claude slot changed concurrently');
+    const heals = Boolean(slot.dead && lineage && fingerprint !== expectedFingerprint);
     slot.fingerprint = fingerprint;
     slot.prevFingerprint = prevFingerprint;
-    // A real lineage change heals a dead slot; idempotent writes never do.
-    if (slot.dead) slot.healedAt = lineage?.ts ?? slot.healedAt;
-    slot.dead = false;
-    slot.deadReason = null;
+    if (heals) {
+      slot.dead = false;
+      slot.deadReason = null;
+      slot.healedAt = lineage!.ts;
+      recordRelogin({
+        recordRelogin: (row) => {
+          this.relogins.push({
+            provider: row.provider, accountId: row.accountId ?? '', kind: row.kind,
+            detail: row.detail ?? null, evidence: row.evidence ?? null,
+          });
+          return this.relogins.length;
+        },
+      }, {
+        ts: lineage!.ts, provider: ANTHROPIC_PROVIDER, accountId, kind: 'healed', detail: fingerprint,
+      });
+    }
     if (lineage) this.transitions.push({ ...lineage });
     this.generation += 1;
   }
@@ -393,14 +437,49 @@ export class SqliteClaudeSlotRepository implements ClaudeSlotRepository {
     });
   }
 
+  strikeDead(accountId: string, strike: ClaudeSlotStrike): 'struck' | 'already-dead' | 'lineage-moved' {
+    let outcome: 'struck' | 'already-dead' | 'lineage-moved' = 'lineage-moved';
+    this.transaction(() => {
+      const slot = this.db.prepare('SELECT fingerprint, dead FROM claude_slots WHERE account_id = ?').get(accountId) as {
+        fingerprint: string | null; dead: number;
+      } | undefined;
+      if (!slot || slot.fingerprint !== strike.struckFp) return;
+      if (Number(slot.dead) !== 0) {
+        outcome = 'already-dead';
+        return;
+      }
+      this.db.prepare(`UPDATE claude_slots SET dead = 1, dead_reason = ?, dead_at = ?
+        WHERE account_id = ? AND fingerprint IS ? AND dead = 0`).run(strike.reason, strike.ts, accountId, strike.struckFp);
+      this.appendRelogin({
+        ts: strike.ts, provider: ANTHROPIC_PROVIDER, accountId, kind: 'dead', detail: strike.struckFp, evidence: 'dead',
+      });
+      this.bumpGenerationInTransaction();
+      outcome = 'struck';
+    });
+    return outcome;
+  }
+
   updateCredentialWithLineage(accountId: string, expectedFingerprint: string | null, fingerprint: string, prevFingerprint: string | null, lineage: LineageAppend | null): void {
     this.transaction(() => {
+      const existing = this.db.prepare('SELECT dead FROM claude_slots WHERE account_id = ? AND fingerprint IS ?').get(
+        accountId, expectedFingerprint,
+      ) as { dead: number } | undefined;
+      if (!existing) throw new Error('Claude slot changed concurrently');
+      const heals = Number(existing.dead) !== 0 && lineage != null && fingerprint !== expectedFingerprint;
       const result = this.db.prepare(`UPDATE claude_slots
-        SET fingerprint = ?, prev_fingerprint = ?, dead = 0, dead_reason = NULL,
-          healed_at = CASE WHEN dead != 0 THEN ? ELSE healed_at END
-        WHERE account_id = ? AND fingerprint IS ?`).run(fingerprint, prevFingerprint, lineage?.ts ?? null, accountId, expectedFingerprint);
+        SET fingerprint = ?, prev_fingerprint = ?,
+          dead = CASE WHEN ? THEN 0 ELSE dead END,
+          dead_reason = CASE WHEN ? THEN NULL ELSE dead_reason END,
+          healed_at = CASE WHEN ? THEN ? ELSE healed_at END
+        WHERE account_id = ? AND fingerprint IS ?`).run(
+        fingerprint, prevFingerprint, heals ? 1 : 0, heals ? 1 : 0, heals ? 1 : 0,
+        heals ? lineage!.ts : null, accountId, expectedFingerprint,
+      );
       if (Number(result.changes) !== 1) throw new Error('Claude slot changed concurrently');
       if (lineage) this.appendLineage(lineage);
+      if (heals) this.appendRelogin({
+        ts: lineage!.ts, provider: ANTHROPIC_PROVIDER, accountId, kind: 'healed', detail: fingerprint,
+      });
       this.bumpGenerationInTransaction();
     });
   }
@@ -548,6 +627,18 @@ export class SqliteClaudeSlotRepository implements ClaudeSlotRepository {
     const next = this.currentGeneration() + 1;
     this.db.prepare(`INSERT INTO config (key, value) VALUES ('slots.generation', ?)
       ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(String(next));
+  }
+
+  private appendRelogin(event: Parameters<typeof recordRelogin>[1]): void {
+    recordRelogin({
+      recordRelogin: (row) => {
+        const result = this.db.prepare(`INSERT INTO relogin_events
+          (ts, provider, account_id, kind, detail, evidence, user_denied_at) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+          .run(row.ts ?? Date.now(), row.provider, row.accountId ?? null, row.kind,
+            row.detail ?? null, row.evidence ?? null, row.userDeniedAt ?? null);
+        return Number(result.lastInsertRowid);
+      },
+    }, event);
   }
 
   private appendLineage(row: LineageAppend): void {
@@ -728,6 +819,18 @@ export class ClaudeSlots {
 
   listSlots(): ClaudeSlot[] {
     return this.options.repository.listSlots();
+  }
+
+  getSlot(accountId: string): ClaudeSlot | null {
+    assertSlotId(accountId);
+    return this.options.repository.getSlot(accountId);
+  }
+
+  async strikeDead(accountId: string, strike: ClaudeSlotStrike): Promise<'struck' | 'already-dead' | 'lineage-moved'> {
+    assertSlotId(accountId);
+    return this.withSlotWrite(accountId, () => this.options.repository.withWriteTransaction(async () =>
+      this.options.repository.strikeDead(accountId, strike),
+    ));
   }
 
   async createSlot(input: CreateClaudeSlotInput): Promise<ClaudeSlot> {

@@ -1,4 +1,7 @@
+import { createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
+import { chmod, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 
 import { codexFingerprint, codexIdentity, parseCodexAuth, type CodexAuthDocument } from './codex-auth';
 import { isCredentialNotFound } from './credential-backends';
@@ -9,6 +12,8 @@ import {
   type KeychainBackend,
 } from './keychain';
 import type { Store } from './store';
+import { qlbHomeDir } from './home';
+import { listStashes, recordStash, removeStash, type UnclaimedIndexEntry } from './unclaimed-index';
 
 const PROVIDER = 'openai-codex';
 const BASELINE_CONSUMED_BY_KEY = 'pi.openai-codex.baselineConsumedBy';
@@ -23,6 +28,8 @@ const DISPLAY_CACHE_TTL_MS = 60_000;
 export interface ReadCodexSlot {
   document: CodexAuthDocument;
   fingerprint: string;
+  /** SHA-256 of the complete stored credential bytes; CAS only. */
+  contentFingerprint?: string;
 }
 
 export interface ReadUnclaimedCodexSlot extends ReadCodexSlot {
@@ -43,6 +50,8 @@ export interface CodexSlotsOptions {
   keychain: SlotKeychain;
   now?: () => number;
   readBackoff?: KeychainReadBackoff;
+  /** Private S36 fallback and durable non-secret index root. */
+  stashDir?: string;
 }
 
 type CachedSlot = ReadCodexSlot & { expiresAt: number };
@@ -98,6 +107,19 @@ export class CodexSlots {
   }
 
   /**
+   * Persists a new managed lineage before the caller records its metadata.
+   * The predecessor copy is deliberately written first so a returned refresh
+   * successor is never the only recoverable copy after a later DB failure.
+   */
+  writeSlot(accountId: string, document: CodexAuthDocument, previous?: CodexAuthDocument): void {
+    const service = this.slotService(accountId);
+    const prior = previous ?? this.readSlot(accountId, { fresh: true }).document;
+    this.options.keychain.setSync(`${service}:prev`, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(prior));
+    this.options.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(document));
+    this.cache.delete(accountId);
+  }
+
+  /**
    * Restores an S36 stash only through the caller's slot transaction and only
    * if it was consumed from that slot's current lineage.
    */
@@ -116,11 +138,125 @@ export class CodexSlots {
     return unclaimed;
   }
 
+  /**
+   * S36: index first, then Keychain, then a private file fallback.  The index
+   * contains only discovery metadata, never the credential bytes.
+   */
+  async stashUnclaimedDurably(
+    stashId: string,
+    document: CodexAuthDocument,
+    consumedFp: string,
+    accountId: string,
+  ): Promise<{ stashId: string; location: 'keychain' | 'file' }> {
+    if (!consumedFp || !accountId) throw new Error('unclaimed consumed lineage is required');
+    const entry: UnclaimedIndexEntry = {
+      provider: PROVIDER, accountId, stashId, consumedFp, location: 'keychain', createdAt: this.now(),
+    };
+    try {
+      await recordStash(this.stashRoot(), entry);
+    } catch (error: unknown) {
+      if (error && typeof error === 'object' && (error as NodeJS.ErrnoException).code === 'EEXIST') {
+        throw new Error('unclaimed credential already exists');
+      }
+      throw new Error('unable to record unclaimed credential');
+    }
+
+    const text = JSON.stringify({ credential: document, consumedFp });
+    try {
+      try {
+        this.options.keychain.getSync(this.unclaimedService(stashId), QLB_KEYCHAIN_ACCOUNT);
+        throw new Error('unclaimed credential already exists');
+      } catch (error) {
+        if (error instanceof Error && error.message === 'unclaimed credential already exists') throw error;
+        if (!isCredentialNotFound(error)) throw error;
+      }
+      this.options.keychain.setSync(this.unclaimedService(stashId), QLB_KEYCHAIN_ACCOUNT, text);
+      return { stashId, location: 'keychain' };
+    } catch {
+      try {
+        await recordStash(this.stashRoot(), { ...entry, location: 'file' }, { replace: true });
+        await mkdir(this.stashRoot(), { recursive: true, mode: 0o700 });
+        await chmod(this.stashRoot(), 0o700);
+        const path = this.unclaimedFile(stashId);
+        await writeFile(path, text, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+        await chmod(path, 0o600);
+        return { stashId, location: 'file' };
+      } catch {
+        // Retain the non-secret reservation so a doctor/repair path can see
+        // that an issued successor was not safely persisted.
+        throw new Error('unable to persist unclaimed credential');
+      }
+    }
+  }
+
+  /**
+   * Finds, but deliberately does not delete, a successor whose predecessor is
+   * the supplied current lineage. The C10 metadata transaction owns the slot
+   * write; only its successful commit may make this recovery body disposable.
+   */
+  async findStashedSuccessor(
+    accountId: string,
+    consumedFp: string,
+  ): Promise<{ stashId: string; document: CodexAuthDocument; consumedFp: string } | null> {
+    let entries: UnclaimedIndexEntry[];
+    try { entries = await listStashes(this.stashRoot(), PROVIDER, accountId); } catch {
+      throw new Error('unclaimed credential unavailable');
+    }
+    for (const entry of entries) {
+      if (entry.consumedFp !== consumedFp) continue;
+      let stashed: ReadUnclaimedCodexSlot;
+      try {
+        stashed = await this.readDurableUnclaimed(entry.stashId);
+      } catch (error) {
+        // An index reservation with no Keychain or fallback body cannot be
+        // adopted. Drop only that non-secret row so a later refresh can mark
+        // the spent predecessor dead instead of reporting transient forever.
+        if (error instanceof Error && /unclaimed credential not found/.test(error.message)) {
+          try { await removeStash(this.stashRoot(), entry); } catch { /* retry cleanup later */ }
+          continue;
+        }
+        throw error;
+      }
+      if (!stashed.consumedFp || stashed.consumedFp !== consumedFp) continue;
+      return { stashId: entry.stashId, document: stashed.document, consumedFp: stashed.consumedFp };
+    }
+    return null;
+  }
+
+  /** Delete a recovery body and its non-secret index only after DB commit. */
+  async removeStashedSuccessor(stashId: string): Promise<void> {
+    try {
+      this.options.keychain.deleteSync(this.unclaimedService(stashId), QLB_KEYCHAIN_ACCOUNT);
+    } catch (error) {
+      if (!isCredentialNotFound(error)) throw new Error('unable to remove unclaimed credential');
+    }
+    await rm(this.unclaimedFile(stashId), { force: true });
+    await removeStash(this.stashRoot(), { provider: PROVIDER, stashId });
+    this.cache.clear();
+  }
+
+  /** Legacy helper retained for pure callers; C10 consume uses find/remove. */
+  async adoptStashedSuccessor(
+    accountId: string,
+    restore: (document: CodexAuthDocument) => void | Promise<void>,
+  ): Promise<boolean> {
+    const current = this.readSlot(accountId, { fresh: true });
+    const stashed = await this.findStashedSuccessor(accountId, current.fingerprint);
+    if (!stashed) return false;
+    await restore(stashed.document);
+    await this.removeStashedSuccessor(stashed.stashId);
+    return true;
+  }
+
   private readService(service: string, fresh: boolean): ReadCodexSlot {
     const text = this.readText(service, fresh);
     const parsed = parseCodexAuth(text);
     if (!parsed.ok) throw new Error('stored Codex document is malformed');
-    return { document: parsed.doc, fingerprint: codexFingerprint(parsed.doc) };
+    return {
+      document: parsed.doc,
+      fingerprint: codexFingerprint(parsed.doc),
+      contentFingerprint: `sha256-full:${createHash('sha256').update(text, 'utf8').digest('hex')}`,
+    };
   }
 
   private readText(service: string, fresh: boolean): string {
@@ -139,7 +275,11 @@ export class CodexSlots {
   private copy(slot: ReadCodexSlot): ReadCodexSlot {
     // The returned document may be inspected by callers; never hand out the
     // mutable object held in the display cache.
-    return { document: JSON.parse(JSON.stringify(slot.document)) as CodexAuthDocument, fingerprint: slot.fingerprint };
+    return {
+      document: JSON.parse(JSON.stringify(slot.document)) as CodexAuthDocument,
+      fingerprint: slot.fingerprint,
+      contentFingerprint: slot.contentFingerprint,
+    };
   }
 
   private slotService(accountId: string): string {
@@ -152,6 +292,29 @@ export class CodexSlots {
 
   private unclaimedService(timestamp: string): string {
     return qlbKeychainService(PROVIDER, `unclaimed:${timestamp}`);
+  }
+
+  private stashRoot(): string {
+    return this.options.stashDir ?? join(qlbHomeDir(), '.qlb', 'unclaimed');
+  }
+
+  private unclaimedFile(stashId: string): string {
+    if (!stashId || /[\0/\\/]/.test(stashId)) throw new Error('invalid unclaimed stash id');
+    return join(this.stashRoot(), `${stashId}.json`);
+  }
+
+  private async readDurableUnclaimed(stashId: string): Promise<ReadUnclaimedCodexSlot> {
+    try { return this.readUnclaimed(stashId, { fresh: true }); } catch (keychainError) {
+      try {
+        const record = parseUnclaimed(await readFile(this.unclaimedFile(stashId), 'utf8'));
+        return { document: record.credential, fingerprint: codexFingerprint(record.credential), consumedFp: record.consumedFp };
+      } catch (fileError) {
+        if (isCredentialNotFound(keychainError) && (fileError as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') {
+          throw new Error('unclaimed credential not found');
+        }
+        throw new Error('unclaimed credential unavailable');
+      }
+    }
   }
 }
 
