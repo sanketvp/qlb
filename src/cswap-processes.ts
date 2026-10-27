@@ -113,7 +113,9 @@ function executableToken(args: string): string {
 /** A positive, argv-position-aware classifier for processes safe to signal. */
 export function isCswapCommandToSignal(args: string): boolean {
   const executable = executableToken(args);
-  if (/(^|\/)(cswap|claude-swap)$/.test(executable) || executable.includes('/claude-swap/')) return true;
+  // Exact basename only: a /claude-swap/ install directory can hold other
+  // executables (its venv python, helpers) that must never be signalled.
+  if (/(^|\/)(cswap|claude-swap)$/.test(executable)) return true;
 
   // pythonArguments is deliberately also used here so interpreter recognition
   // stays consistent with the liveness guard. Requiring it on argv[0] avoids

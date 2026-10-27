@@ -135,6 +135,8 @@ test('strict signal lister accepts only positively identified C-swap processes',
       ' 202 vim /tmp/cswap',
       ' 203 tail -f ~/cswap',
       ' 204 python3 -u worker.py cswap',
+      ' 205 /opt/claude-swap/bin/python /srv/unrelated.py',
+      ' 206 /opt/claude-swap/bin/worker',
     ].join('\n'),
   });
 
