@@ -54,7 +54,7 @@ const jiti = createJiti(import.meta.url, { moduleCache: false, alias: {
   '@sinclair/typebox/value': typeboxValue,
 } });
 const factory = await jiti.import(process.env.QLB_PI_EXTENSION, { default: true });
-const names = ['xai', 'kimi-coding', 'openrouter', 'openai-codex'];
+const names = ['anthropic', 'xai', 'kimi-coding', 'openrouter', 'openai-codex'];
 const oauth = { resolve: 0, refresh: 0 };
 const authJson = { reads: 0, writes: 0 };
 const native = new Map(names.map((name) => [name, {
@@ -84,6 +84,12 @@ await listeners.get('session_start')?.({}, { ui: { setStatus() {} }, modelRegist
   setRuntimeApiKey(provider, key) { runtimeApiKeys[provider] = key; return Promise.resolve(); },
 } } });
 const events = [];
+if (process.env.CALL_ANTHROPIC === '1') {
+  const stream = providers.get('anthropic').streamSimple(
+    { id: 'claude-sonnet-5', api: 'anthropic-messages', provider: 'anthropic' }, { messages: [] }, {},
+  );
+  for await (const event of stream) events.push(event);
+}
 if (process.env.CALL_CODEX === '1') {
   const codex = providers.get('openai-codex');
   if (codex.auth?.oauth) {
@@ -102,16 +108,24 @@ console.log(JSON.stringify({ calls, replaced: Object.fromEntries(names.map((name
 `;
 
 const fakeQlb = String.raw`
+const fs = require('node:fs');
 const args = process.argv.slice(2);
-if (args.join(' ') !== 'gate openai-codex --json') process.exit(3);
+if (args[0] === 'consume' && args[1] === 'status') {
+  process.stdout.write(JSON.stringify({ state: 'NATIVE' }));
+  process.exit(0);
+}
+const provider = args[0] === 'gate' && args[2] === '--json' ? args[1] : undefined;
+if (!['anthropic', 'xai', 'kimi-coding', 'openrouter', 'openai-codex'].includes(provider)) process.exit(3);
+if (process.env.QLB_PI_TOKEN_CALL !== '1') process.exit(4);
+if (process.env.GATE_CALL_LOG) fs.appendFileSync(process.env.GATE_CALL_LOG, provider + '\n');
 if (process.env.GATE_FAIL === '1') {
   process.stderr.write('store-open-failed');
   process.exit(3);
 }
-process.stdout.write(JSON.stringify({ token: 'fixture-codex-access', accountId: 'user:slot', chatgptAccountId: 'bare-account', source: 'fixture' }));
+process.stdout.write(JSON.stringify({ token: 'fixture-' + provider + '-access', accountId: 'user:slot', chatgptAccountId: 'bare-account', source: 'fixture' }));
 `;
 
-function load(owner?: string, gateFail = false, callCodex = false, perProviderOwner?: string, ownerIsDirectory = false, deployedLayout = false): {
+function load(owner?: string, gateFail = false, callCodex = false, perProviderOwner?: string, ownerIsDirectory = false, deployedLayout = false, callAnthropic = false): {
   calls: string[];
   replaced: Record<string, boolean>;
   oauth: { resolve: number; refresh: number };
@@ -119,6 +133,7 @@ function load(owner?: string, gateFail = false, callCodex = false, perProviderOw
   runtimeApiKeys: Record<string, string>;
   codexModelCount: number;
   events: Array<{ error?: { errorMessage?: string } }>;
+  gateCalls: string[];
   stderr: string;
 } {
   const home = mkdtempSync(join(tmpdir(), 'qlb-pi-wiring-'));
@@ -139,6 +154,7 @@ function load(owner?: string, gateFail = false, callCodex = false, perProviderOw
     cpSync(join(ROOT, 'src', 'pi-owner-document.ts'), join(agent, 'src', 'pi-owner-document.ts'));
   }
   const runner = join(home, 'fake-qlb.cjs');
+  const gateLog = join(home, 'gate-calls');
   const entry = join(home, 'load.mjs');
   writeFileSync(runner, fakeQlb);
   writeFileSync(entry, loader);
@@ -152,29 +168,55 @@ function load(owner?: string, gateFail = false, callCodex = false, perProviderOw
       PI_GLOBAL_ROOT,
       QLB_PI_EXTENSION: extension,
       QLB_CLI: runner,
+      GATE_CALL_LOG: gateLog,
       ...(gateFail ? { GATE_FAIL: '1' } : {}),
       ...(callCodex ? { CALL_CODEX: '1' } : {}),
+      ...(callAnthropic ? { CALL_ANTHROPIC: '1' } : {}),
     },
   });
   assert.equal(result.status, 0, result.stderr);
-  return { ...JSON.parse(result.stdout.trim().split('\n').pop() ?? ''), stderr: result.stderr } as ReturnType<typeof load>;
+  return {
+    ...JSON.parse(result.stdout.trim().split('\n').pop() ?? ''),
+    gateCalls: existsSync(gateLog) ? readFileSync(gateLog, 'utf8').trim().split('\n').filter(Boolean) : [],
+    stderr: result.stderr,
+  } as ReturnType<typeof load>;
 }
 
 describe('qlb-pi provider wiring', { skip: piAvailable ? false : 'global Pi install not found' }, () => {
-  it('registers every v2-owned non-Anthropic source and leaves unowned native providers alone', () => {
+  it('registers every v2-owned provider through a replacement source and leaves unowned native providers alone', () => {
     const owner = JSON.stringify({ providers: {
+      anthropic: { mode: 'qlb', since: 1 },
       xai: { mode: 'qlb', since: 1 },
       'kimi-coding': { mode: 'qlb', since: 1 },
       openrouter: { mode: 'qlb', since: 1 },
       'openai-codex': { mode: 'qlb', since: 1 },
     } });
     const owned = load(owner);
-    assert.deepEqual(owned.replaced, { xai: true, 'kimi-coding': true, openrouter: true, 'openai-codex': true });
+    assert.deepEqual(owned.replaced, {
+      anthropic: true, xai: true, 'kimi-coding': true, openrouter: true, 'openai-codex': true,
+    });
 
     assert.ok(owned.codexModelCount > 0, 'an owned Codex provider keeps Pi\'s catalog');
 
     const inert = load();
-    assert.deepEqual(inert.replaced, { xai: false, 'kimi-coding': false, openrouter: false, 'openai-codex': false });
+    assert.deepEqual(inert.replaced, {
+      anthropic: false, xai: false, 'kimi-coding': false, openrouter: false, 'openai-codex': false,
+    });
+  });
+
+  it('uses the owned Anthropic gate source and emits the common unavailable event on gate failure', () => {
+    const owner = JSON.stringify({ providers: {
+      anthropic: { mode: 'qlb', since: 1 },
+      xai: { mode: 'qlb', since: 1 },
+      'kimi-coding': { mode: 'qlb', since: 1 },
+      openrouter: { mode: 'qlb', since: 1 },
+      'openai-codex': { mode: 'qlb', since: 1 },
+    } });
+    const result = load(owner, true, false, undefined, false, false, true);
+    assert.deepEqual(result.gateCalls, ['anthropic']);
+    assert.deepEqual(result.events.map((event) => event.error?.errorMessage), [
+      'QLB unavailable for anthropic — run qlb doctor (unknown)',
+    ]);
   });
 
   it('does not infer a Codex owner from a shared Anthropic-only v2 document or legacy v1 document', () => {

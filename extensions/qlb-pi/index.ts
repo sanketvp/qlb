@@ -49,7 +49,7 @@
 // conflict: Anthropic is replaced by a stub that only returns an error.
 // See decidePiMode in consume.ts.
 
-import { execFileSync, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
@@ -64,6 +64,8 @@ import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { validatePiOwnerDocument } from "../../src/pi-owner-document.js";
 import { streamWithAuthRetry } from "./auth-retry.js";
+import { qlbUnavailable } from "./active-access.js";
+import { createAnthropicSource } from "./providers/anthropic.js";
 import {
   composeOpenRouterModels,
   OpenRouterModelsJsonBlockedError,
@@ -105,10 +107,8 @@ import { shapeAnthropicOAuthPayload } from "./request-shaping.js";
 import {
   canSkipJournal,
   conflictMessage,
-  CONSUME_ERRORS,
   consumeMarkerPath,
   qlbDbPath,
-  CSWAP_ACTIVE_ID,
   decidePiMode,
   ownerStateForProvider,
   parseConsumeStatus,
@@ -119,7 +119,6 @@ import {
 } from "./consume.js";
 import { registerKimiCodingProvider } from "./providers/kimi-coding.js";
 import {
-  errorEvent,
   registerConflictProvider,
   registerConsumeProvider,
   type Builtin,
@@ -175,12 +174,13 @@ function findQlbCli(): { cmd: string; prefix: string[] } {
 function runQlb(
   args: string[],
   timeoutMs = 15_000,
+  env: NodeJS.ProcessEnv = process.env,
 ): Promise<{ stdout: string; stderr: string; code: number }> {
   const { cmd, prefix } = findQlbCli();
   return new Promise((resolve, reject) => {
     const child = spawn(cmd, [...prefix, ...args], {
       stdio: ["ignore", "pipe", "pipe"],
-      env: process.env,
+      env,
     });
     let stdout = "";
     let stderr = "";
@@ -214,18 +214,6 @@ interface ResolveOk {
   mode?: string;
 }
 
-async function qlbResolve(model: string, effort?: string): Promise<ResolveOk> {
-  const args = ["resolve", "--model", model, "--json", "--harness", "pi"];
-  if (effort) args.push("--effort", effort);
-  const result = await runQlb(args);
-  if (result.code !== 0) {
-    throw new Error(
-      `qlb resolve failed: ${result.stderr || result.stdout || `exit ${result.code}`}`,
-    );
-  }
-  return JSON.parse(result.stdout) as ResolveOk;
-}
-
 async function qlbConsumeJournal(timeoutMs = 10_000): Promise<ConsumeJournal> {
   try {
     const result = await runQlb(
@@ -238,33 +226,6 @@ async function qlbConsumeJournal(timeoutMs = 10_000): Promise<ConsumeJournal> {
   }
 }
 
-async function qlbNativeResync(
-  provider: string,
-  accountId: string,
-): Promise<{ resynced: boolean; reason: string }> {
-  try {
-    const result = await runQlb(
-      ["native-resync", "--provider", provider, "--account", accountId, "--json"],
-    );
-    if (result.code !== 0) {
-      return {
-        resynced: false,
-        reason: result.stderr || result.stdout || `exit ${result.code}`,
-      };
-    }
-    const parsed = JSON.parse(result.stdout) as { resynced?: unknown; reason?: unknown };
-    return {
-      resynced: parsed.resynced === true,
-      reason: typeof parsed.reason === "string" ? parsed.reason : "native-resync",
-    };
-  } catch (err) {
-    return {
-      resynced: false,
-      reason: err instanceof Error ? err.message : String(err),
-    };
-  }
-}
-
 function recordOutcome(entry: Record<string, unknown>): void {
   try {
     if (!existsSync(AUDIT_DIR)) mkdirSync(AUDIT_DIR, { recursive: true, mode: 0o700 });
@@ -274,33 +235,6 @@ function recordOutcome(entry: Record<string, unknown>): void {
     });
   } catch (err) {
     console.error("[qlb-pi] failed to record outcome:", err);
-  }
-}
-
-function readKeychainGrant(
-  provider: string,
-  accountId: string,
-  label: string,
-): { access: string } {
-  const service = `qlb:${provider}:${accountId}`;
-  const stdout = execFileSync(
-    "security",
-    ["find-generic-password", "-a", label || accountId, "-s", service, "-w"],
-    { encoding: "utf8" },
-  );
-  const grant = JSON.parse(stdout.replace(/\n$/, "")) as { access?: string };
-  if (!grant.access) throw new Error(`qlb-pi: empty access token for ${service}`);
-  return { access: grant.access };
-}
-
-function ownerAccountLabel(accountId: string): string {
-  try {
-    const owner = JSON.parse(readFileSync(OWNER_FILE, "utf8")) as {
-      accounts?: Array<{ id: string; label?: string }>;
-    };
-    return owner.accounts?.find((a) => a.id === accountId)?.label || accountId;
-  } catch {
-    return accountId;
   }
 }
 
@@ -535,6 +469,16 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       },
     });
   } else {
+    const source = createAnthropicSource({
+      runGate: async (provider) => {
+        const result = await runQlb(
+          ["gate", provider, "--json"],
+          15_000,
+          { ...process.env, QLB_PI_TOKEN_CALL: "1" },
+        );
+        return { code: result.code, stdout: result.stdout };
+      },
+    });
     pi.unregisterProvider("anthropic");
     pi.registerProvider("anthropic", {
       api: "anthropic-messages",
@@ -542,16 +486,14 @@ export default async function (pi: ExtensionAPI): Promise<void> {
         const output = createAssistantMessageEventStream();
         void (async () => {
           try {
-            const decision = await qlbResolve(model.id);
+            const access = await source.read();
+            const decision: ResolveOk = {
+              provider: "anthropic",
+              accountId: access.accountId,
+              model: model.id,
+              reason: access.source,
+            };
             lastDecision = decision;
-            if (!decision.accountId) {
-              throw new Error("qlb resolve returned no accountId");
-            }
-            if (decision.accountId === CSWAP_ACTIVE_ID) {
-              throw new Error(CONSUME_ERRORS.conflict);
-            }
-            const provider = decision.provider || "anthropic";
-            const label = ownerAccountLabel(decision.accountId);
             const callerOnPayload = options?.onPayload;
             const onPayload: SimpleStreamOptions["onPayload"] = async (
               payload: unknown,
@@ -564,50 +506,37 @@ export default async function (pi: ExtensionAPI): Promise<void> {
               return shapeAnthropicOAuthPayload(upstream);
             };
             const result = await streamWithAuthRetry({
-              readAccess: () =>
-                readKeychainGrant(provider, decision.accountId!, label).access,
-              startStream: (access) =>
+              readAccess: () => access.token,
+              startStream: (token) =>
                 builtin(model, context, {
                   ...options,
-                  apiKey: access,
+                  apiKey: token,
                   onPayload,
                 }),
-              resync: () => qlbNativeResync(provider, decision.accountId!),
+              // QLB owns token renewal; a failed request must not consult a
+              // native credential or retry through any fallback source.
+              resync: async () => ({ resynced: false, reason: "gate-source" }),
               onEvent: (event) => {
                 output.push(event as never);
               },
-              onResync: (resync) => {
-                recordOutcome({
-                  kind: "native_resync",
-                  decisionId: decision.decisionId,
-                  accountId: decision.accountId,
-                  provider,
-                  model: model.id,
-                  resynced: resync.resynced,
-                  reason: resync.reason,
-                });
-              },
+              onResync: () => undefined,
             });
             recordOutcome({
-              decisionId: decision.decisionId,
               accountId: decision.accountId,
               model: model.id,
               outcome: result.outcome,
               ...(result.outcome === "failed" && result.error
                 ? { error: result.error }
                 : {}),
-              ...(result.retried ? { retriedAfterNativeResync: true } : {}),
             });
-          } catch (err) {
-            const message = err instanceof Error ? err.message : String(err);
+          } catch {
             recordOutcome({
-              decisionId: lastDecision?.decisionId,
               accountId: lastDecision?.accountId,
               model: model.id,
               outcome: "failed",
-              error: message,
+              error: "QLB gate anthropic unavailable",
             });
-            output.push(errorEvent(model, message) as never);
+            output.push(qlbUnavailable("anthropic", "unknown", model) as never);
           } finally {
             output.end();
           }
