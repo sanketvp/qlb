@@ -4,7 +4,7 @@
 import { mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { atomicWriteText } from './fsutil';
+import { atomicWriteText, fsyncDirSync } from './fsutil';
 import { isSuccessor } from './lineage-log';
 import {
   assertAdmitted,
@@ -39,9 +39,10 @@ export interface CswapRetireItem {
   fingerprint: string;
 }
 
+/** Every effect must be idempotent: rerunning after a crash completes the same end state safely. */
 export interface CswapRetireEffects {
   archiveCswap(archivePath: string): Promise<void> | void;
-  deleteCswapItems(): Promise<void> | void;
+  deleteCswapItems(items: CswapRetireItem[]): Promise<void> | void;
   uninstallCswap(): Promise<void> | void;
   removeCswapLaunchArtifacts(): Promise<void> | void;
   deletePiBaselines(): Promise<void> | void;
@@ -64,6 +65,10 @@ export interface CswapRetireDependencies {
   /** Must force a Keychain read; it returns only the resulting fingerprint. */
   readSlotFingerprint(accountId: string): Promise<string> | string;
   effects: CswapRetireEffects;
+  /** Test seam for requiring each atomic journal rename to be durable. */
+  fsyncJournalDir?(dir: string): void;
+  /** Test seam for simulating a crash after an effect and before its checkpoint. */
+  afterEffect?(phase: Exclude<RetirePhase, 'started' | 'committed'>): void;
   afterCheckpoint?(phase: RetirePhase): void;
   afterTransition?(): void;
   withRetireLock?<T>(path: string, fn: () => Promise<T>): Promise<T>;
@@ -138,14 +143,21 @@ function readJournal(dir: string): RetireJournal | null {
   }
 }
 
-function writeJournal(dir: string, journal: RetireJournal): void {
+function writeJournal(dir: string, journal: RetireJournal, fsyncJournalDir: (dir: string) => void): void {
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   atomicWriteText(journalPath(dir), `${JSON.stringify(journal)}\n`, { mode: 0o600 });
+  fsyncJournalDir(dir);
 }
 
-function checkpoint(dir: string, journal: RetireJournal, nextPhase: RetirePhase, now: number): RetireJournal {
+function checkpoint(
+  dir: string,
+  journal: RetireJournal,
+  nextPhase: RetirePhase,
+  now: number,
+  fsyncJournalDir: (dir: string) => void,
+): RetireJournal {
   const next = { ...journal, phase: nextPhase, ownerPid: process.pid, updatedAt: now };
-  writeJournal(dir, next);
+  writeJournal(dir, next, fsyncJournalDir);
   return next;
 }
 
@@ -290,6 +302,7 @@ export async function retireCswap(store: Store, dependencies: CswapRetireDepende
   const lock = dependencies.withRetireLock ?? defaultRetireLock;
   try {
     return await lock(retirementLockPath(dependencies.stateDir), async () => {
+      const fsyncJournalDir = dependencies.fsyncJournalDir ?? fsyncDirSync;
       let journal: RetireJournal | null;
       try {
         journal = readJournal(dependencies.journalDir);
@@ -323,7 +336,7 @@ export async function retireCswap(store: Store, dependencies: CswapRetireDepende
           updatedAt: dependencies.now(),
         };
         // From this point a restart can finish or report the partial operation.
-        writeJournal(dependencies.journalDir, journal);
+        writeJournal(dependencies.journalDir, journal, fsyncJournalDir);
       }
 
       // The durable journal always precedes the fence. On resume this is
@@ -353,20 +366,11 @@ export async function retireCswap(store: Store, dependencies: CswapRetireDepende
             return retireRefusal(`slot-lineage-mismatch:${captured.accountId}`);
           }
         }
-        let currentItems: CswapRetireItem[];
-        try {
-          currentItems = dependencies.cswapItems();
-        } catch {
-          return retireRefusal('cswap-items-unavailable');
-        }
-        if (currentItems.some((item) => !journal!.gates.cswapItems.some(
-          (captured) => captured.id === item.id && captured.fingerprint === item.fingerprint,
-        ))) return retireRefusal('cswap-items-changed');
       }
 
       const effects: Array<[Exclude<RetirePhase, 'started' | 'committed'>, () => Promise<void> | void]> = [
         ['archive', () => dependencies.effects.archiveCswap(journal!.archivePath)],
-        ['delete-cswap-items', () => dependencies.effects.deleteCswapItems()],
+        ['delete-cswap-items', () => dependencies.effects.deleteCswapItems(journal!.gates.cswapItems)],
         ['uninstall-cswap', () => dependencies.effects.uninstallCswap()],
         ['remove-launch-artifacts', () => dependencies.effects.removeCswapLaunchArtifacts()],
         ['delete-pi-baselines', () => dependencies.effects.deletePiBaselines()],
@@ -374,12 +378,24 @@ export async function retireCswap(store: Store, dependencies: CswapRetireDepende
       ];
       for (const [name, effect] of effects) {
         if (phaseAtLeast(journal.phase, name)) continue;
+        if (name === 'delete-cswap-items') {
+          let currentItems: CswapRetireItem[];
+          try {
+            currentItems = dependencies.cswapItems();
+          } catch {
+            return retireRefusal('cswap-items-unavailable');
+          }
+          if (currentItems.some((item) => !journal!.gates.cswapItems.some(
+            (captured) => captured.id === item.id && captured.fingerprint === item.fingerprint,
+          ))) return retireRefusal('cswap-items-changed');
+        }
         try {
           await effect();
         } catch {
           return retireRefusal(`retirement-effect-failed:${name}`);
         }
-        journal = checkpoint(dependencies.journalDir, journal, name, dependencies.now());
+        dependencies.afterEffect?.(name);
+        journal = checkpoint(dependencies.journalDir, journal, name, dependencies.now(), fsyncJournalDir);
         dependencies.afterCheckpoint?.(name);
       }
 
@@ -387,7 +403,7 @@ export async function retireCswap(store: Store, dependencies: CswapRetireDepende
         const retired = transition(store, 'retired', journal.gates.checkedAt);
         if (!retired.ok) return retireRefusal(retired.code ?? 'retirement-transition-failed');
         dependencies.afterTransition?.();
-        journal = checkpoint(dependencies.journalDir, journal, 'committed', dependencies.now());
+        journal = checkpoint(dependencies.journalDir, journal, 'committed', dependencies.now(), fsyncJournalDir);
         dependencies.afterCheckpoint?.('committed');
       }
       const cleared = clearRetirementFence(store);

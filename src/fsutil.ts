@@ -196,6 +196,20 @@ export function atomicWriteBytes(path: string, data: Uint8Array, options: Atomic
   }
 }
 
+/**
+ * Make prior directory-entry updates durable. Call this after an atomic rename
+ * when the caller's recovery protocol requires the rename itself to survive a
+ * power loss.
+ */
+export function fsyncDirSync(dir: string): void {
+  const fd = openSync(dir, constants.O_RDONLY);
+  try {
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+}
+
 export function atomicWriteText(path: string, text: string, options: AtomicWriteOptions = {}): number {
   return atomicWriteBytes(path, Buffer.from(text, 'utf8'), options);
 }
