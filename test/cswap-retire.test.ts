@@ -1,13 +1,13 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { describe, it } from 'node:test';
 
-import { evaluateRetirementGates, type CswapRetireDependencies } from '../src/cswap-retire';
+import { evaluateRetirementGates, retireCswap, type CswapRetireDependencies } from '../src/cswap-retire';
 import piRollback, { executePiRollback } from '../src/commands/pi-rollback';
-import { beginCutover, beginRetirementFence, phase } from '../src/lifecycle';
+import { assertAdmitted, beginCutover, beginRetirementFence, phase } from '../src/lifecycle';
 import { openStore } from '../src/store';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -20,6 +20,7 @@ function fixture(): {
   root: string;
   store: ReturnType<typeof openStore>;
   deps: CswapRetireDependencies;
+  calls: string[];
   cleanup(): void;
 } {
   const root = mkdtempSync(join(tmpdir(), 'qlb-cswap-retire-'));
@@ -41,8 +42,10 @@ function fixture(): {
   }
   store.recordLineage({ provider: 'anthropic', accountId: 'slot-a', fromFp: 'source-a', toFp: 'current-a', cause: 'post', by: 'qlb' });
 
+  const calls: string[] = [];
   const deps: CswapRetireDependencies = {
     now: () => NOW,
+    stateDir: root,
     backupsDir: join(root, 'retirement-backups'),
     journalDir: join(root, 'journal'),
     doctor: async () => ({ overall: 'PASS', autoAgent: 'PASS' }),
@@ -54,11 +57,15 @@ function fixture(): {
     cswapItems: () => [{ id: 'cswap-a', fingerprint: 'source-a' }],
     readSlotFingerprint: async () => 'current-a',
     effects: {
-      archiveCswap: () => {}, deleteCswapItems: () => {}, uninstallCswap: () => {},
-      removeCswapLaunchArtifacts: () => {}, deletePiBaselines: () => {}, archiveExpiredStash: () => {},
+      archiveCswap: (path) => { calls.push(`archive:${path}`); },
+      deleteCswapItems: () => { calls.push('delete-cswap-items'); },
+      uninstallCswap: () => { calls.push('uninstall-cswap'); },
+      removeCswapLaunchArtifacts: () => { calls.push('remove-launch-artifacts'); },
+      deletePiBaselines: () => { calls.push('delete-pi-baselines'); },
+      archiveExpiredStash: (path) => { calls.push(`archive-stash:${path}`); },
     },
   };
-  return { root, store, deps, cleanup: () => { store.close(); rmSync(root, { recursive: true, force: true }); } };
+  return { root, store, deps, calls, cleanup: () => { store.close(); rmSync(root, { recursive: true, force: true }); } };
 }
 
 async function refusal(name: string, mutate: (f: Fixture) => void, expected: string): Promise<void> {
@@ -252,6 +259,155 @@ describe('qlb retire cswap (AC22 retire)', () => {
       assert.equal(phase(f.store).note, null);
       assert.equal(existsSync(f.deps.journalDir), false);
       assert.equal(existsSync(f.deps.backupsDir), false);
+    } finally { f.cleanup(); }
+  });
+
+  it('a gate refusal on the first run leaves no journal and no fence', async () => {
+    const f = fixture();
+    try {
+      const db = new DatabaseSync(f.store.dbPath);
+      try { db.prepare('UPDATE lifecycle SET window_end = ?').run(NOW + 1); } finally { db.close(); }
+      assert.deepEqual(await retireCswap(f.store, f.deps), { ok: false, code: 'window-not-ended' });
+      assert.equal(existsSync(join(f.deps.journalDir, 'retire-cswap.json')), false);
+      assert.equal(phase(f.store).note, null);
+      assert.equal(assertAdmitted(f.store, 'undo-cswap').ok, true);
+      assert.equal(assertAdmitted(f.store, 'pi-rollback').ok, true);
+    } finally { f.cleanup(); }
+  });
+
+  it('journals each effect, fences unsafe admissions, and resumes exactly once after every checkpoint', async () => {
+    const phases = ['archive', 'delete-cswap-items', 'uninstall-cswap', 'remove-launch-artifacts', 'delete-pi-baselines', 'archive-stash', 'committed'] as const;
+    for (const crashAt of phases) {
+      const f = fixture();
+      try {
+        let crash = true;
+        f.deps.afterCheckpoint = (name) => {
+          if (crash && name === crashAt) { crash = false; throw new Error('fixture crash'); }
+        };
+        await assert.rejects(retireCswap(f.store, f.deps), /fixture crash/);
+        const journal = JSON.parse(readFileSync(join(f.deps.journalDir, 'retire-cswap.json'), 'utf8')) as { phase: string };
+        assert.equal(journal.phase, crashAt);
+        assert.equal(assertAdmitted(f.store, 'undo-cswap').code, 'retirement-in-progress');
+        assert.equal(assertAdmitted(f.store, 'pi-rollback').code, 'retirement-in-progress');
+        assert.equal((await retireCswap(f.store, f.deps)).ok, true, crashAt);
+        assert.equal(phase(f.store).state, 'retired');
+        assert.equal(existsSync(join(f.deps.journalDir, 'retire-cswap.json')), false);
+        for (const effect of ['delete-cswap-items', 'uninstall-cswap', 'remove-launch-artifacts', 'delete-pi-baselines']) {
+          assert.equal(f.calls.filter((call) => call === effect).length, 1, `${crashAt}: ${effect}`);
+        }
+      } finally { f.cleanup(); }
+    }
+  });
+
+  it('resumes after a stale receipt without rerunning time-based gates', async () => {
+    const f = fixture();
+    try {
+      let crash = true;
+      f.deps.afterCheckpoint = (name) => {
+        if (crash && name === 'archive') { crash = false; throw new Error('fixture crash'); }
+      };
+      await assert.rejects(retireCswap(f.store, f.deps), /fixture crash/);
+      f.deps.now = () => NOW + 2 * DAY_MS;
+      f.deps.doctor = async () => ({ overall: 'FAIL', autoAgent: 'FAIL' });
+      f.store.setConfig('pi.anthropic.lastServedAt', String(NOW - DAY_MS - 1));
+      assert.equal((await retireCswap(f.store, f.deps)).ok, true);
+    } finally { f.cleanup(); }
+  });
+
+  it('resume accepts a lineage successor of the captured slot fingerprint', async () => {
+    const f = fixture();
+    try {
+      let crash = true;
+      f.deps.afterCheckpoint = (name) => {
+        if (crash && name === 'archive') { crash = false; throw new Error('fixture crash'); }
+      };
+      await assert.rejects(retireCswap(f.store, f.deps), /fixture crash/);
+      f.store.recordLineage({ provider: 'anthropic', accountId: 'slot-a', fromFp: 'current-a', toFp: 'rotated-a', cause: 'post', by: 'qlb' });
+      f.deps.readSlotFingerprint = () => 'rotated-a';
+      assert.equal((await retireCswap(f.store, f.deps)).ok, true);
+    } finally { f.cleanup(); }
+  });
+
+  it('resume refuses an unrelated fingerprint with slot-lineage-mismatch', async () => {
+    const f = fixture();
+    try {
+      let crash = true;
+      f.deps.afterCheckpoint = (name) => {
+        if (crash && name === 'archive') { crash = false; throw new Error('fixture crash'); }
+      };
+      await assert.rejects(retireCswap(f.store, f.deps), /fixture crash/);
+      f.deps.readSlotFingerprint = () => 'unrelated';
+      assert.deepEqual(await retireCswap(f.store, f.deps), { ok: false, code: 'slot-lineage-mismatch:slot-a' });
+    } finally { f.cleanup(); }
+  });
+
+  it('accepts already-deleted journal items but refuses newly appearing C-swap items on resume', async () => {
+    const f = fixture();
+    try {
+      let crash = true;
+      f.deps.afterCheckpoint = (name) => {
+        if (crash && name === 'archive') { crash = false; throw new Error('fixture crash'); }
+      };
+      await assert.rejects(retireCswap(f.store, f.deps), /fixture crash/);
+      f.deps.cswapItems = () => [];
+      assert.equal((await retireCswap(f.store, f.deps)).ok, true);
+    } finally { f.cleanup(); }
+
+    const changed = fixture();
+    try {
+      let crash = true;
+      changed.deps.afterCheckpoint = (name) => {
+        if (crash && name === 'archive') { crash = false; throw new Error('fixture crash'); }
+      };
+      await assert.rejects(retireCswap(changed.store, changed.deps), /fixture crash/);
+      changed.deps.cswapItems = () => [{ id: 'new-item', fingerprint: 'new-fingerprint' }];
+      assert.deepEqual(await retireCswap(changed.store, changed.deps), { ok: false, code: 'cswap-items-changed' });
+    } finally { changed.cleanup(); }
+  });
+
+  it('finishes a crash after retired transition before the committed checkpoint', async () => {
+    const f = fixture();
+    try {
+      let crash = true;
+      f.deps.afterTransition = () => {
+        if (crash) { crash = false; throw new Error('transition crash'); }
+      };
+      await assert.rejects(retireCswap(f.store, f.deps), /transition crash/);
+      assert.equal(phase(f.store).state, 'retired');
+      assert.equal((await retireCswap(f.store, f.deps)).ok, true);
+      assert.equal(phase(f.store).note, null);
+      assert.equal(existsSync(join(f.deps.journalDir, 'retire-cswap.json')), false);
+    } finally { f.cleanup(); }
+  });
+
+  it('a journal without a fence is resumed and the fence is installed first', async () => {
+    const f = fixture();
+    try {
+      let crash = true;
+      f.deps.afterCheckpoint = (name) => {
+        if (crash && name === 'archive') { crash = false; throw new Error('fixture crash'); }
+      };
+      await assert.rejects(retireCswap(f.store, f.deps), /fixture crash/);
+      const db = new DatabaseSync(f.store.dbPath);
+      try { db.prepare('UPDATE lifecycle SET note = NULL').run(); } finally { db.close(); }
+      assert.equal(phase(f.store).note, null);
+      f.deps.afterCheckpoint = undefined;
+      f.deps.readSlotFingerprint = () => {
+        assert.equal(phase(f.store).note, 'retirement-in-progress');
+        return 'current-a';
+      };
+      assert.equal((await retireCswap(f.store, f.deps)).ok, true);
+      assert.equal(phase(f.store).state, 'retired');
+    } finally { f.cleanup(); }
+  });
+
+  it('an effect failure keeps the journal and the fence', async () => {
+    const f = fixture();
+    try {
+      f.deps.effects.uninstallCswap = () => { throw new Error('fake effect failure'); };
+      assert.deepEqual(await retireCswap(f.store, f.deps), { ok: false, code: 'retirement-effect-failed:uninstall-cswap' });
+      assert.equal(existsSync(join(f.deps.journalDir, 'retire-cswap.json')), true);
+      assert.equal(phase(f.store).note, 'retirement-in-progress');
     } finally { f.cleanup(); }
   });
 });
