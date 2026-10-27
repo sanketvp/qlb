@@ -448,6 +448,56 @@ describe('Codex live-document attribution (AC57)', () => {
     }
   });
 
+  it('a concurrent adoption after the repair COMMIT is never overwritten', async () => {
+    const h = fixture();
+    try {
+      const old = document('repair-commit-old');
+      const repaired = document('repair-commit-repaired');
+      const newer = document('repair-commit-newer');
+      const plan = importActiveCodexSlot(old, { store: h.store, keychain: h.keychain, now: () => 1 });
+      const service = qlbKeychainService('openai-codex', plan.slotId);
+      h.store.adoptCodexSlot({
+        accountId: plan.slotId, previousFingerprint: codexFingerprint(old), fingerprint: codexFingerprint(repaired),
+        ts: 2, evidence: 'identity',
+      });
+      h.keychain.setSync(`${service}:prev`, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(repaired));
+      const raw = (h.store as unknown as { db: DatabaseSync }).db;
+      let injectAfterRepairCommit = true;
+      (h.store as unknown as { db: DatabaseSync }).db = new Proxy(raw, {
+        get(target, property, receiver) {
+          if (property === 'exec') return (sql: string) => {
+            const result = target.exec(sql);
+            if (sql === 'COMMIT' && injectAfterRepairCommit) {
+              injectAfterRepairCommit = false;
+              target.prepare('UPDATE codex_slots SET fingerprint = ?, prev_fingerprint = ? WHERE account_id = ?')
+                .run(codexFingerprint(newer), codexFingerprint(repaired), plan.slotId);
+              h.keychain.setSync(`${service}:prev`, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(repaired));
+              h.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(newer));
+            }
+            return result;
+          };
+          const value = Reflect.get(target, property, receiver);
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      });
+      const published: string[] = [];
+
+      const result = await attributeLiveDocument({
+        store: h.store, keychain: h.keychain,
+        slot: { accountId: plan.slotId, document: old, fingerprint: codexFingerprint(repaired) }, live: old,
+        republish: (doc) => { published.push(codexFingerprint(doc)); },
+      });
+
+      assert.equal(result.action, 'slot-split');
+      assert.deepEqual(published, []);
+      assert.equal(h.store.getCodexSlot(plan.slotId)?.fingerprint, codexFingerprint(newer));
+      assert.equal(codexFingerprint(JSON.parse(h.keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT))), codexFingerprint(newer));
+    } finally {
+      h.store.close();
+      rmSync(h.home, { recursive: true, force: true });
+    }
+  });
+
   it('restores a split repair when its database verification fails after the Keychain write', async () => {
     const h = fixture();
     try {

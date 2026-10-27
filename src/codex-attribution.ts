@@ -83,7 +83,19 @@ function fingerprintOfStoredDocument(value: string): string | null {
   return parsed.ok ? codexFingerprint(parsed.doc) : null;
 }
 
-async function attributeSameSlot(input: AttributeLiveDocumentInput): Promise<CodexAttributionResult & {
+function repairedFingerprintStillCurrent(input: AttributeLiveDocumentInput, fingerprint: string): boolean {
+  // republish() publishes to auth.json asynchronously, so it must not run
+  // while SQLite's synchronous write transaction is held. Reacquire that lock
+  // immediately before making the post-repair decision observable instead.
+  return input.store.runImmediate(
+    () => input.store.getCodexSlot(input.slot.accountId)?.fingerprint === fingerprint,
+  );
+}
+
+async function attributeSameSlot(
+  input: AttributeLiveDocumentInput,
+  repairedFingerprint?: string,
+): Promise<CodexAttributionResult & {
   action: Exclude<CodexAttributionAction, 'drift'>;
 }> {
   // The database, rather than a possibly half-written Keychain item, defines
@@ -135,15 +147,18 @@ async function attributeSameSlot(input: AttributeLiveDocumentInput): Promise<Cod
     }
     // Use the fingerprint re-read under the transaction, not the caller's
     // pre-lock snapshot, for the follow-up attribution decision.
-    return attributeSameSlot({
-      ...input,
-      slot: { ...input.slot, document: repair.value, fingerprint: repair.fingerprint },
-    });
+    return attributeSameSlot(
+      { ...input, slot: { ...input.slot, document: repair.value, fingerprint: repair.fingerprint } },
+      repair.fingerprint,
+    );
   }
 
   const now = (input.now ?? Date.now)();
   const liveFp = codexFingerprint(live);
   if (slotFp === liveFp) {
+    if (repairedFingerprint && !repairedFingerprintStillCurrent(input, repairedFingerprint)) {
+      return { action: 'slot-split', accountId: input.slot.accountId };
+    }
     input.store.markCodexSlotImportedActive(input.slot.accountId, now);
     return { action: 'noop', accountId: input.slot.accountId };
   }
@@ -151,6 +166,9 @@ async function attributeSameSlot(input: AttributeLiveDocumentInput): Promise<Cod
   // The only leave-equivalent: QLB saved the successor but failed before the
   // auth.json rename, so the managed slot must be published back to Codex.
   if (isSuccessor(input.store, PROVIDER, input.slot.accountId, liveFp, slotFp)) {
+    if (repairedFingerprint && !repairedFingerprintStillCurrent(input, repairedFingerprint)) {
+      return { action: 'slot-split', accountId: input.slot.accountId };
+    }
     await input.republish?.(input.slot.document);
     input.store.markCodexSlotImportedActive(input.slot.accountId, now);
     return { action: 'republish-slot', accountId: input.slot.accountId };
