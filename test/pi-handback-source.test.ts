@@ -33,7 +33,12 @@ function rank(overrides: Partial<Parameters<typeof rankSingleGrantSource>[0]> = 
     exactBackup: null,
     legacyBackup: null,
     nativeEntryPresent: true,
-    nativeEntry: { type: 'oauth', refresh: 'native-refresh-fake' },
+    nativeEntry: {
+      type: 'oauth',
+      access: 'native-access-fake',
+      refresh: 'native-refresh-fake',
+      expires: 4_102_444_800_000,
+    },
   };
   return rankSingleGrantSource({ ...defaults, ...overrides });
 }
@@ -61,14 +66,45 @@ describe('T-RK — ranks the sources per §5.1', () => {
     assert.equal(rank({ keychainGrant: grant({ generation: 6 }), exactBackup: backup() }).kind, 'exact-backup');
     assert.equal(rank({ keychainGrant: { generation: 8 }, exactBackup: backup() }).kind, 'exact-backup');
     assert.equal(rank({ keychainGrant: grant({ generation: 8, writtenBy: 'native-resync' }), exactBackup: backup() }).kind, 'exact-backup');
+    assert.equal(rank({ keychainGrant: grant({ expires: Number.NaN }), exactBackup: backup() }).kind, 'exact-backup');
+    assert.equal(rank({ keychainGrant: grant({ expires: Number.NaN }) }).kind, 'none');
   });
 
-  it('allows none only when Pi already has a valid native entry', () => {
-    assert.equal(rank().kind, 'none');
-    assert.throws(
-      () => rank({ nativeEntry: { type: 'oauth', refresh: '' } }),
-      (error: unknown) => error instanceof NoSingleGrantRestoreSourceError && error.code === 'no-restore-source',
+  it('skips malformed backups in favour of a trusted unrefreshed Keychain grant', () => {
+    assert.equal(
+      rank({
+        keychainGrant: grant(),
+        exactBackup: { entryPresent: true, entry: { refresh: 'backup-refresh-fake' } },
+      }).kind,
+      'keychain',
     );
+
+    for (const expires of [Number.NaN, '4_102_444_800_000']) {
+      assert.equal(
+        rank({
+          keychainGrant: grant(),
+          exactBackup: {
+            entryPresent: true,
+            entry: { type: 'oauth', access: 'backup-access-fake', refresh: 'backup-refresh-fake', expires },
+          },
+        }).kind,
+        'keychain',
+      );
+    }
+  });
+
+  it('allows none only when Pi already has a fully valid native entry', () => {
+    assert.equal(rank().kind, 'none');
+    for (const nativeEntry of [
+      { type: 'oauth', refresh: '' },
+      { type: 'oauth', refresh: 'native-refresh-fake' },
+      { type: 'oauth', access: 'native-access-fake', refresh: 'native-refresh-fake', expires: Number.NaN },
+    ]) {
+      assert.throws(
+        () => rank({ nativeEntry }),
+        (error: unknown) => error instanceof NoSingleGrantRestoreSourceError && error.code === 'no-restore-source',
+      );
+    }
     assert.throws(
       () => rank({ nativeEntryPresent: false, nativeEntry: undefined }),
       NoSingleGrantRestoreSourceError,

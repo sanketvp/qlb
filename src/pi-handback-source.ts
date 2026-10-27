@@ -65,9 +65,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function asTrustedGrant(value: unknown, storeGeneration: number): Grant | null {
   if (!isRecord(value)
-    || typeof value.access !== 'string'
-    || typeof value.refresh !== 'string'
-    || value.refresh.length === 0
     || typeof value.generation !== 'number'
     || !Number.isInteger(value.generation)
     || value.generation < storeGeneration
@@ -75,10 +72,13 @@ function asTrustedGrant(value: unknown, storeGeneration: number): Grant | null {
     return null;
   }
 
+  const entry = piEntryFromKeychainGrant(value);
+  if (!entry) return null;
+
   const grant: Grant = {
-    access: value.access,
-    refresh: value.refresh,
-    expires: typeof value.expires === 'number' && Number.isFinite(value.expires) ? value.expires : 0,
+    access: entry.access,
+    refresh: entry.refresh,
+    expires: entry.expires,
     generation: value.generation,
   };
   if (typeof value.writtenBy === 'string') grant.writtenBy = value.writtenBy;
@@ -92,11 +92,32 @@ function isPlaceholder(entry: Record<string, unknown>): boolean {
     && entry.type === 'oauth';
 }
 
-function isValidEntry(entry: unknown): boolean {
+interface ValidPiOAuthEntry {
+  type: 'oauth';
+  access: string;
+  refresh: string;
+  expires: number;
+}
+
+function isValidEntry(entry: unknown): entry is ValidPiOAuthEntry {
   return isRecord(entry)
     && !isPlaceholder(entry)
+    && entry.type === 'oauth'
+    && typeof entry.access === 'string'
     && typeof entry.refresh === 'string'
-    && entry.refresh.length > 0;
+    && entry.refresh.length > 0
+    && typeof entry.expires === 'number'
+    && Number.isFinite(entry.expires);
+}
+
+function piEntryFromKeychainGrant(grant: Record<string, unknown>): ValidPiOAuthEntry | null {
+  const entry = {
+    type: 'oauth' as const,
+    access: grant.access,
+    refresh: grant.refresh,
+    expires: grant.expires,
+  };
+  return isValidEntry(entry) ? entry : null;
 }
 
 function validBackup(backup: SingleGrantBackup | null): SingleGrantBackup | null {
