@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { describe, it } from 'node:test';
 
 import { MacosKeychainBackend, markFakeExecutor, MockKeychain, NativeOpenRouterKeyNotFoundError, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, readNativeOpenRouterKey, type ExecFileSyncFn } from '../src/keychain';
@@ -162,7 +162,7 @@ describe('Pi migration S58 credential-first barrier', () => {
   });
 
   it('T-PM1: refuses unless the generic migration is at rest', () => {
-    const cases: Array<{ name: string; state?: string; detail?: Record<string, unknown>; file?: 'staging' | 'sidecar' | 'custom' }> = [
+    const cases: Array<{ name: string; state?: string; detail?: Record<string, unknown>; file?: 'staging' | 'sidecar' | 'custom' | 'customStaging' }> = [
       { name: 'absent' },
       { name: 'NATIVE', state: 'NATIVE' },
       { name: 'VALIDATED without staging', state: 'VALIDATED' },
@@ -172,6 +172,7 @@ describe('Pi migration S58 credential-first barrier', () => {
       { name: 'RETIRED', state: 'RETIRED' },
       { name: 'legacy sidecar', state: 'VALIDATED', file: 'sidecar' },
       { name: 'custom owner', state: 'VALIDATED', detail: { ownerFilePath: 'custom' }, file: 'custom' },
+      { name: 'custom owner staging', state: 'VALIDATED', detail: { ownerFilePath: 'custom' }, file: 'customStaging' },
       { name: 'rollback intent', state: 'VALIDATED', detail: { intent: 'rollback' } },
       { name: 'rollback decision', state: 'VALIDATED', detail: { rollbackDecision: {} } },
       { name: 'hand-back marker', state: 'VALIDATED', detail: { handback: {} } },
@@ -183,13 +184,17 @@ describe('Pi migration S58 credential-first barrier', () => {
         const paths = {
           staging: join(h.dir, '.pi', 'agent', 'qlb-owner.json.xai.staging'),
           sidecar: join(h.dir, '.pi', 'agent', 'qlb-owner-xai.json'),
-          custom: join(h.dir, 'custom-owner.json'),
+          custom: join(h.dir, 'custom-owner-dir', 'custom-owner.json'),
+          customStaging: join(h.dir, 'custom-owner-dir', 'qlb-owner.json.xai.staging'),
         };
         const detail = fixture.detail?.ownerFilePath === 'custom'
           ? { ownerFilePath: paths.custom }
           : fixture.detail;
         if (fixture.state) h.store.upsertMigration('pi-xai', fixture.state, JSON.stringify(detail ?? {}));
-        if (fixture.file) writeFileSync(paths[fixture.file], '{}', { mode: 0o600 });
+        if (fixture.file) {
+          mkdirSync(dirname(paths[fixture.file]), { recursive: true, mode: 0o700 });
+          writeFileSync(paths[fixture.file], '{}', { mode: 0o600 });
+        }
         const authBefore = readFileSync(h.paths.authJsonPath);
         const journal = join(h.paths.journalPath, 'pi-migrate-xai.json');
         const admitted = fixture.state === undefined || fixture.state === 'NATIVE' || (fixture.state === 'VALIDATED' && !fixture.file && !fixture.detail);
@@ -204,6 +209,26 @@ describe('Pi migration S58 credential-first barrier', () => {
           assert.equal(readFileSync(h.paths.authJsonPath).equals(authBefore), true, `${fixture.name}: auth.json changed`);
           assert.equal(existsSync(journal), false, `${fixture.name}: Pi journal written`);
           assert.equal(hasManaged(h.keychain, 'xai'), false, `${fixture.name}: managed credential written`);
+        }
+      } finally { h.cleanup(); }
+    }
+  });
+
+  it('refuses generic ownership artifacts even without a migration row', () => {
+    for (const fixture of ['staging', 'legacy sidecar', 'canonical owner claim', 'nothing'] as const) {
+      const h = setup();
+      try {
+        if (fixture === 'staging') writeFileSync(join(h.dir, '.pi', 'agent', 'qlb-owner.json.xai.staging'), '{}', { mode: 0o600 });
+        if (fixture === 'legacy sidecar') writeFileSync(join(h.dir, '.pi', 'agent', 'qlb-owner-xai.json'), '{}', { mode: 0o600 });
+        if (fixture === 'canonical owner claim') writeFileSync(h.paths.ownerPath, JSON.stringify({ providers: { xai: { mode: 'qlb' } } }), { mode: 0o600 });
+        if (fixture === 'nothing') {
+          assert.equal(migratePiSingleProvider('xai', h.paths, { keychain: h.keychain }).state, 'migrated', fixture);
+        } else {
+          assert.throws(
+            () => migratePiSingleProvider('xai', h.paths, { keychain: h.keychain }),
+            (error: unknown) => (error as { code?: unknown; exitCode?: unknown }).code === 'owned-by-generic-migrate' && (error as { exitCode?: unknown }).exitCode === 3,
+            fixture,
+          );
         }
       } finally { h.cleanup(); }
     }

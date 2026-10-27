@@ -183,25 +183,30 @@ function keychainPayload(provider: PiSingleProvider, baseline: unknown): string 
 function managedValue(provider: PiSingleProvider, deps: PiMigrateDeps): unknown | undefined { try { return JSON.parse(deps.keychain.getSync(managedService(provider), QLB_KEYCHAIN_ACCOUNT)); } catch { return undefined; } }
 
 /** S0.6: generic ownership must be quiescent before P7a may begin. */
-function genericMigrationAtRest(provider: PiSingleProvider, paths: PiMigratePaths, deps: PiMigrateDeps): boolean {
+function genericMigrationAtRest(provider: PiSingleProvider, paths: PiMigratePaths, deps: PiMigrateDeps, ownJournalExists: boolean): boolean {
   const row = deps.store?.getMigration(`pi-${provider}`);
-  if (!row) return true;
-  if (row.state !== 'NATIVE' && row.state !== 'VALIDATED') return false;
+  let detail: JsonObject | undefined;
+  if (row) {
+    if (row.state !== 'NATIVE' && row.state !== 'VALIDATED') return false;
+    try { detail = asObject(JSON.parse(row.detail_json), 'generic migration journal is malformed'); } catch { return false; }
+  }
 
-  let detail: JsonObject;
-  try { detail = asObject(JSON.parse(row.detail_json), 'generic migration journal is malformed'); } catch { return false; }
-  const agentDir = dirname(paths.authJsonPath);
-  const staging = join(agentDir, `qlb-owner.json.${provider}.staging`);
-  const legacySidecar = join(agentDir, `qlb-owner-${provider}.json`);
-  const customOwner = typeof detail.ownerFilePath === 'string' && detail.ownerFilePath !== paths.ownerPath
-    ? detail.ownerFilePath
-    : undefined;
-  return !existsSync(staging)
+  const canonicalDir = dirname(paths.ownerPath);
+  const canonicalStaging = join(canonicalDir, `qlb-owner.json.${provider}.staging`);
+  const legacySidecar = join(canonicalDir, `qlb-owner-${provider}.json`);
+  const ownerFilePath = typeof detail?.ownerFilePath === 'string' ? detail.ownerFilePath : undefined;
+  const recordedStaging = ownerFilePath && join(dirname(ownerFilePath), `qlb-owner.json.${provider}.staging`);
+  const customOwner = ownerFilePath && ownerFilePath !== paths.ownerPath ? ownerFilePath : undefined;
+  let canonicalOwnerClaim = false;
+  try { canonicalOwnerClaim = isPiQlbOwnerEntry(readPiOwnerProviders(paths.ownerPath)[provider]); } catch { /* readPiOwnerProviders fails closed before publication */ }
+  return !existsSync(canonicalStaging)
+    && !(recordedStaging && existsSync(recordedStaging))
     && !existsSync(legacySidecar)
     && !(customOwner && existsSync(customOwner))
-    && detail.intent !== 'rollback'
-    && detail.rollbackDecision == null
-    && detail.handback == null;
+    && (ownJournalExists || !canonicalOwnerClaim)
+    && detail?.intent !== 'rollback'
+    && detail?.rollbackDecision == null
+    && detail?.handback == null;
 }
 
 function genericMigrationOwnedError(): Error {
@@ -217,7 +222,7 @@ export function migratePiSingleProvider(provider: PiSingleProvider, paths: PiMig
   let journal = existing ?? { provider, phase: 'started' as JournalPhase, ownerPid: process.pid, updatedAt: Date.now() };
   let state: PiMigrateResult['state'] = 'not-applicable';
   lock(paths.authJsonPath, (refresh) => {
-    if (!genericMigrationAtRest(provider, paths, deps)) throw genericMigrationOwnedError();
+    if (!genericMigrationAtRest(provider, paths, deps, existing !== null)) throw genericMigrationOwnedError();
     const auth = readAuth(paths.authJsonPath); const currentOwner = readPiOwnerProviders(paths.ownerPath);
     if (!existing) updatePhase(paths, provider, 'started', refresh);
     if (!existing && (provider === 'openrouter' || isPiPlaceholder(auth[provider])) && currentOwner[provider]) {
