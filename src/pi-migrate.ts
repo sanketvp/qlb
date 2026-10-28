@@ -281,8 +281,8 @@ export function migratePiSingleProvider(provider: PiSingleProvider, paths: PiMig
     if (state !== 'migrated') return;
     const managed = deps.keychain.getSync(managedService(provider), QLB_KEYCHAIN_ACCOUNT); const parsed = JSON.parse(managed) as { refresh?: string; access?: string }; const lineage = fingerprint(typeof parsed.refresh === 'string' && parsed.refresh ? parsed.refresh : String(parsed.access ?? ''));
     const store = deps.store;
-    refresh(); store?.upsertAccount(`${provider}-default`, provider, provider, 'active');
     const sharedAccountId = ADAPTER_ACCOUNT_IDS[provider];
+    refresh(); store?.upsertAccount(sharedAccountId, provider, provider, 'active');
     if (store && store.getAccount(sharedAccountId)?.status === 'handed-back') {
       refresh(); store.setAccountStatus(sharedAccountId, 'active');
     }

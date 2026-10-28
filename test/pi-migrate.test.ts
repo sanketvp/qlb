@@ -236,6 +236,15 @@ describe('Pi migration S58 credential-first barrier', () => {
     }
   });
 
+  it('kimi-coding upserts kimi-default, never kimi-coding-default', () => {
+    const h = setup('kimi-coding');
+    try {
+      assert.equal(migratePiSingleProvider('kimi-coding', h.paths, { keychain: h.keychain, store: h.store }).state, 'migrated');
+      assert.equal(h.store.getAccount('kimi-default')?.status, 'active');
+      assert.equal(h.store.getAccount('kimi-coding-default'), null);
+    } finally { h.cleanup(); }
+  });
+
   it('keeps auth_revoked on fresh and idempotent already-migrated runs', () => {
     for (const alreadyMigrated of [false, true]) {
       const h = setup();
