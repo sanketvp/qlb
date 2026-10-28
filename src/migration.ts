@@ -312,6 +312,8 @@ export interface MigrationConfig {
   readNativeKey?: () => string;
   /** Test-only barrier after a pool takes the final owner-map lock. */
   beforePoolCommitLock?: () => void;
+  /** Test-only barrier immediately before single-grant stage takes Pi's auth lock. */
+  beforeOwnershipLock?: () => void;
   /** P7a's in-progress journal directory; defaults to ~/.qlb/journal. */
   piMigrateJournalDir?: string;
 }
@@ -743,6 +745,7 @@ export class Migration {
   readonly authJsonKey: string | undefined;
   private readonly readNativeKey: (() => string) | undefined;
   private readonly beforePoolCommitLock: (() => void) | undefined;
+  private readonly beforeOwnershipLock: (() => void) | undefined;
   private readonly piMigrateJournalDir: string;
 
   constructor(
@@ -764,6 +767,7 @@ export class Migration {
     this.authJsonKey = config.authJsonKey ?? config.provider;
     this.readNativeKey = config.readNativeKey;
     this.beforePoolCommitLock = config.beforePoolCommitLock;
+    this.beforeOwnershipLock = config.beforeOwnershipLock;
     this.piMigrateJournalDir = config.piMigrateJournalDir ?? join(qlbHomeDir(), '.qlb', 'journal');
   }
 
@@ -1023,6 +1027,13 @@ export class Migration {
    * Static-key (OpenRouter): 1 API key from native Keychain (read-only).
    */
   stage(): MigrationStatus {
+    // D-B68 / OD-10: stage's P7a ownership check and first write share
+    // Pi's auth.json lock with `qlb pi migrate`'s started journal write.
+    if (this.kind === 'single-grant') {
+      this.beforeOwnershipLock?.();
+      return withPiAuthLock(resolve(this.poolFilePath), () => this.stageSingleGrant());
+    }
+
     this.assertNotP7aOwned();
     // P7b8 alone may convert the pool's v1 owner document into the shared
     // v2 map. Refuse before creating staging, Keychain, or journal state.
@@ -1038,9 +1049,6 @@ export class Migration {
     }
     if (this.kind === 'static-key') {
       return this.stageStaticKey();
-    }
-    if (this.kind === 'single-grant') {
-      return this.stageSingleGrant();
     }
     if (!existsSync(this.poolFilePath)) {
       throw new Error(`pool file not found: ${this.poolFilePath}`);
@@ -1133,6 +1141,13 @@ export class Migration {
    * rename is hygiene afterwards.
    */
   commit(): MigrationStatus {
+    if (this.kind === 'single-grant') {
+      return withPiAuthLock(resolve(this.poolFilePath), () => this.commitUnlocked());
+    }
+    return this.commitUnlocked();
+  }
+
+  private commitUnlocked(): MigrationStatus {
     this.assertNotP7aOwned();
     // P7b8 alone may convert the pool's v1 owner document into the shared
     // v2 map. Refuse before any journal or native-pool write.
@@ -1193,6 +1208,13 @@ export class Migration {
   }
 
   rollback(): MigrationStatus {
+    if (this.kind === 'single-grant') {
+      return withPiAuthLock(resolve(this.poolFilePath), () => this.rollbackUnlocked());
+    }
+    return this.rollbackUnlocked();
+  }
+
+  private rollbackUnlocked(): MigrationStatus {
     this.assertNotP7aOwned();
     if (this.ownerEntryPresent() || this.journalState() === 'QLB_OWNED') {
       return this.postCommitRollback();
@@ -1209,6 +1231,13 @@ export class Migration {
    *   - MIRRORED / staging leftovers         → preCommitRollback
    */
   resume(): MigrationStatus {
+    if (this.kind === 'single-grant') {
+      return withPiAuthLock(resolve(this.poolFilePath), () => this.resumeUnlocked());
+    }
+    return this.resumeUnlocked();
+  }
+
+  private resumeUnlocked(): MigrationStatus {
     this.assertNotP7aOwned();
     const current = this.status();
     const intent = current.detail.intent === 'rollback';
@@ -1227,7 +1256,7 @@ export class Migration {
       return this.finishRollbackJournal();
     }
     if (current.state === 'VALIDATED' && existsSync(this.stagingPath())) {
-      return this.commit();
+      return this.kind === 'single-grant' ? this.commitUnlocked() : this.commit();
     }
     if (current.state === 'MIRRORED' || existsSync(this.stagingPath())) {
       return this.preCommitRollback();
@@ -1298,6 +1327,16 @@ export class Migration {
    * owner file. NEVER writes auth.json.
    */
   private stageSingleGrant(): MigrationStatus {
+    // This method is called only while stage() holds Pi's auth.json lock.
+    // Keep the P7a ownership classifier here so it is adjacent to the
+    // single-grant's first durable write (the MIRRORED journal).
+    this.assertNotP7aOwned();
+    const current = this.status();
+    if (current.ownerFile === 'present' || current.state === 'QLB_OWNED' || current.state === 'RETIRED') {
+      throw new Error(
+        `cannot stage: migration already ${current.state} (owner file ${current.ownerFile})`,
+      );
+    }
     if (!this.provider || !isSingleGrantProvider(this.provider)) {
       throw new Error('single-grant migration requires provider xai|kimi-coding|openai-codex');
     }

@@ -343,6 +343,42 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     }
   });
 
+  it('T-OW2 a pi migrate journal written while stage waits for the auth lock makes stage refuse owned-by-pi-migrate with nothing written', () => {
+    const h = setup('xai');
+    try {
+      const journalDir = join(h.dir, 'pi-migrate-journal');
+      const p7aJournal = join(journalDir, 'pi-migrate-xai.json');
+      let seamCalls = 0;
+      const migration = new Migration(h.store, h.kc, h.authPath, h.ownerPath, 'pi-xai', {
+        kind: 'single-grant',
+        provider: 'xai',
+        authJsonKey: 'xai',
+        piMigrateJournalDir: journalDir,
+        beforeOwnershipLock: () => {
+          seamCalls += 1;
+          mkdirSync(journalDir, { recursive: true });
+          writeFileSync(p7aJournal, '{}\n');
+        },
+      });
+
+      assert.throws(
+        () => migration.stage(),
+        (error: Error & { exitCode?: unknown }) => {
+          assert.match(error.message, /owned-by-pi-migrate: run `qlb pi rollback xai`/);
+          assert.equal(error.exitCode, 3);
+          return true;
+        },
+      );
+      assert.equal(seamCalls, 1, 'the P7a publication races immediately before the shared lock');
+      assert.equal(h.store.getMigration('pi-xai'), null, 'stage writes no generic journal');
+      assert.equal(existsSync(stagingOwnerPath(join(h.dir, 'qlb-owner.json'), 'xai')), false);
+      assert.equal(keychainHas(h.kc, 'xai'), false, 'stage writes no managed credential');
+      assert.deepEqual(readFileSync(h.authPath), h.originalBytes, 'stage leaves auth.json unchanged');
+    } finally {
+      h.cleanup();
+    }
+  });
+
   it('T-S0d rebuilt default migration uses the journaled auth key', () => {
     const h = setup('xai');
     try {
