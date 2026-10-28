@@ -273,6 +273,44 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     }
   });
 
+  it('T-S0d rebuilt default migration uses the journaled auth key', () => {
+    const h = setup('xai');
+    try {
+      h.store.upsertMigration('pi-xai', 'QLB_OWNED', JSON.stringify({ authJsonKey: 'grok' }));
+      const rebuilt = createSingleGrantMigration(h.store, h.kc, 'xai', h.authPath, h.ownerPath);
+
+      const key = (rebuilt as unknown as { singleGrantAuthKey: () => string }).singleGrantAuthKey();
+
+      assert.equal(key, 'grok');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('T-S0d conflicting explicit auth key is refused with auth-key-mismatch', () => {
+    const h = setup('xai');
+    try {
+      const detail = JSON.stringify({ authJsonKey: 'grok' });
+      h.store.upsertMigration('pi-xai', 'QLB_OWNED', detail);
+      const conflicting = createSingleGrantMigration(
+        h.store,
+        h.kc,
+        'xai',
+        h.authPath,
+        h.ownerPath,
+        'other-alias',
+      );
+
+      assert.throws(
+        () => (conflicting as unknown as { singleGrantAuthKey: () => string }).singleGrantAuthKey(),
+        /auth\.json key mismatch/,
+      );
+      assert.equal(h.store.getMigration('pi-xai')?.detail_json, detail, 'refusal leaves the journal unchanged');
+    } finally {
+      h.cleanup();
+    }
+  });
+
   it('rollback before commit: auth.json untouched; staged Keychain entries cleaned up', async () => {
     const h = setup('xai');
     try {

@@ -1428,6 +1428,25 @@ export class Migration {
     }
   }
 
+  /**
+   * The journal owns the Pi auth.json key once staging has recorded it. A
+   * rebuilt default migration must therefore use that durable key, while an
+   * explicitly supplied non-default key is an assertion that must agree.
+   */
+  private singleGrantAuthKey(): string {
+    const detail = parseDetail(this.store.getMigration(this.storeName)?.detail_json);
+    const journalKey = typeof detail.authJsonKey === 'string' ? detail.authJsonKey : undefined;
+    if (journalKey) {
+      if (this.authJsonKey && this.authJsonKey !== this.provider && this.authJsonKey !== journalKey) {
+        throw new Error('single-grant rollback auth.json key mismatch');
+      }
+      return journalKey;
+    }
+    const key = this.authJsonKey ?? this.provider;
+    if (!key) throw new Error('single-grant rollback has no auth.json key');
+    return key;
+  }
+
   private preCommitRollback(): MigrationStatus {
     const owner = this.readOwnerPayload();
     this.deleteStagedKeychain(owner?.accounts);
