@@ -23,6 +23,7 @@ import {
   type StagedAccount,
 } from '../src/migration';
 import { parseGrant } from '../src/refresh-lease';
+import { piAuthBackupPath, writePiAuthBackup } from '../src/pi-auth-backup';
 import { openStore } from '../src/store';
 
 /**
@@ -195,6 +196,122 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     });
   }
 
+  it('T-RS re-stages xai and kimi-coding at the store generation, resets status, and clears prior hand-back detail', async () => {
+    for (const provider of ['xai', 'kimi-coding'] as const) {
+      for (const lifecycle of ['MIRRORED', 'VALIDATED', 'NATIVE'] as const) {
+        const h = setup(provider);
+        try {
+          const id = expectedId(provider);
+          h.mig.stage();
+          if (lifecycle === 'VALIDATED') {
+            await h.mig.rehearse(mockRehearse([]));
+          } else if (lifecycle === 'NATIVE') {
+            h.mig.rollback();
+            assert.equal(keychainHas(h.kc, provider), false, 'precondition: rollback deleted the staged grant');
+          }
+
+          assert.equal(h.store.casGrantGeneration(id, 0, 7), 1);
+          h.store.setAccountStatus(id, 'handed-back');
+          h.store.upsertMigration(`pi-${provider}`, lifecycle, JSON.stringify({
+            commitGeneration: 3,
+            rollbackDecision: { kind: 'keychain' },
+            handback: { phase: 'cleanup-pending' },
+            lastRollback: { cleanedAt: 1 },
+          }));
+
+          const staged = h.mig.stage();
+          const detail = JSON.parse(h.store.getMigration(`pi-${provider}`)!.detail_json) as Record<string, unknown>;
+          const grant = parseGrant(h.kc.getSync(
+            qlbKeychainService(provider, id),
+            expectedLabel(provider),
+          ));
+
+          assert.equal(staged.state, 'MIRRORED', `${provider} re-stages from ${lifecycle}`);
+          assert.equal(h.store.getAccount(id)?.status, 'imported-unvalidated');
+          assert.equal(grant.generation, 7);
+          assert.equal(detail.commitGeneration, undefined);
+          assert.equal(detail.rollbackDecision, undefined);
+          assert.equal(detail.handback, undefined);
+          assert.equal(detail.lastRollback, undefined);
+        } finally {
+          h.cleanup();
+        }
+      }
+    }
+  });
+
+  it('T-CG commit journals commitGeneration before the owner write', async () => {
+    const h = setup('xai');
+    try {
+      const id = expectedId('xai');
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      assert.equal(h.store.casGrantGeneration(id, 0, 7), 1);
+      const originalUpsertMigration = h.store.upsertMigration.bind(h.store);
+      let journaledBeforeClaim = false;
+      h.store.upsertMigration = (store, state, detail) => {
+        const recorded = JSON.parse(detail ?? '{}') as { commitGeneration?: number };
+        if (store === 'pi-xai' && state === 'VALIDATED' && recorded.commitGeneration === 7) {
+          assert.equal(existsSync(h.ownerPath), false, 'the claim does not precede its baseline journal');
+          journaledBeforeClaim = true;
+        }
+        return originalUpsertMigration(store, state, detail);
+      };
+
+      h.mig.commit();
+
+      assert.equal(journaledBeforeClaim, true);
+      const committed = h.store.getMigration('pi-xai');
+      assert.equal(committed?.state, 'QLB_OWNED');
+      assert.equal(
+        JSON.parse(committed!.detail_json).commitGeneration,
+        7,
+        'the pre-claim journal records the store generation used as the commit baseline',
+      );
+      assert.equal(existsSync(h.ownerPath), true, 'the owner claim is written after the baseline journal');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('T-S0d rebuilt default migration uses the journaled auth key', () => {
+    const h = setup('xai');
+    try {
+      h.store.upsertMigration('pi-xai', 'QLB_OWNED', JSON.stringify({ authJsonKey: 'grok' }));
+      const rebuilt = createSingleGrantMigration(h.store, h.kc, 'xai', h.authPath, h.ownerPath);
+
+      const key = (rebuilt as unknown as { singleGrantAuthKey: () => string }).singleGrantAuthKey();
+
+      assert.equal(key, 'grok');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('T-S0d conflicting explicit auth key is refused with auth-key-mismatch', () => {
+    const h = setup('xai');
+    try {
+      const detail = JSON.stringify({ authJsonKey: 'grok' });
+      h.store.upsertMigration('pi-xai', 'QLB_OWNED', detail);
+      const conflicting = createSingleGrantMigration(
+        h.store,
+        h.kc,
+        'xai',
+        h.authPath,
+        h.ownerPath,
+        'other-alias',
+      );
+
+      assert.throws(
+        () => (conflicting as unknown as { singleGrantAuthKey: () => string }).singleGrantAuthKey(),
+        /auth\.json key mismatch/,
+      );
+      assert.equal(h.store.getMigration('pi-xai')?.detail_json, detail, 'refusal leaves the journal unchanged');
+    } finally {
+      h.cleanup();
+    }
+  });
+
   it('rollback before commit: auth.json untouched; staged Keychain entries cleaned up', async () => {
     const h = setup('xai');
     try {
@@ -213,6 +330,39 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
         xai?: { access?: string };
       };
       assert.equal(parsed.xai?.access, FAKE_GRANTS.xai.access);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('T-PRE pre-commit rollback removes a leftover backup', () => {
+    const h = setup('xai');
+    try {
+      h.mig.stage();
+      writePiAuthBackup(h.authPath, 'xai', 'crashed-before-owner');
+      assert.equal(existsSync(piAuthBackupPath(h.authPath, 'xai')), true, 'fixture backup exists');
+
+      h.mig.rollback();
+
+      assert.equal(existsSync(piAuthBackupPath(h.authPath, 'xai')), false);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('T-PRE a conflicting auth key refuses pre-commit rollback before any cleanup', () => {
+    const h = setup('xai');
+    try {
+      h.mig.stage();
+      const row = h.store.getMigration('pi-xai');
+      const detail = { ...(JSON.parse(row?.detail_json ?? '{}') as Record<string, unknown>), authJsonKey: 'grok' };
+      h.store.upsertMigration('pi-xai', row!.state, JSON.stringify(detail));
+      const conflicting = createSingleGrantMigration(h.store, h.kc, 'xai', h.authPath, h.ownerPath, 'other-alias');
+
+      assert.throws(() => conflicting.rollback(), /auth\.json key mismatch/);
+
+      assert.equal(keychainHas(h.kc, 'xai'), true, 'staged Keychain item kept');
+      assert.equal(h.store.getMigration('pi-xai')?.state, row!.state, 'journal state unchanged');
     } finally {
       h.cleanup();
     }

@@ -120,6 +120,7 @@ import { dirname, join, resolve, sep } from 'node:path';
 import { config } from './config';
 import type { KeychainBackend } from './keychain';
 import { openRouterMissingKeyMessage, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, readNativeOpenRouterKey } from './keychain';
+import { removePiAuthBackup } from './pi-auth-backup';
 import { parseGrant } from './refresh-lease';
 import { hasLegacyPiOwnerEntry, readPiOwnerProviders, withPiAuthLock, writePiOwnerEntry } from './pi-migrate';
 import { OPENROUTER_GATE_KEYCHAIN_SERVICE } from './token/openrouter';
@@ -1111,6 +1112,16 @@ export class Migration {
       return this.finishHygiene();
     }
 
+    if (this.kind === 'single-grant') {
+      const account = Array.isArray(current.detail.accounts) ? current.detail.accounts[0] : null;
+      const id = isObjectRecord(account) && typeof account.id === 'string' ? account.id : null;
+      const generation = id ? this.store.getGrantGeneration(id) : null;
+      if (generation === null) throw new Error('single-grant commit has no account generation');
+      // Persist the baseline before the commit rename. A crash after the
+      // rename can therefore never reinterpret a re-staged grant as a refresh.
+      this.journal(current.state, { commitGeneration: generation });
+    }
+
     if (this.kind === 'pool') {
       // The map can have appeared after stage(). Hold the same lock as every
       // v2 writer from the final P7b8 boundary check through the v1 rename.
@@ -1284,10 +1295,16 @@ export class Migration {
       nativeStrategy: 'shadow-retain',
       authJsonKey: keyName,
       provider: this.provider,
+      commitGeneration: undefined,
+      rollbackDecision: undefined,
+      handback: undefined,
+      lastRollback: undefined,
     });
 
-    this.keychain.setSync(service, account, JSON.stringify(grant));
     this.store.upsertAccount(id, this.provider, label, 'imported-unvalidated');
+    this.store.setAccountStatus(id, 'imported-unvalidated');
+    grant.generation = this.store.getGrantGeneration(id) ?? 0;
+    this.keychain.setSync(service, account, JSON.stringify(grant));
     atomicWriteFile(this.stagingPath(), JSON.stringify(owner, null, 2) + '\n');
     return this.status();
   }
@@ -1412,10 +1429,33 @@ export class Migration {
     }
   }
 
+  /**
+   * The journal owns the Pi auth.json key once staging has recorded it. A
+   * rebuilt default migration must therefore use that durable key, while an
+   * explicitly supplied non-default key is an assertion that must agree.
+   */
+  private singleGrantAuthKey(): string {
+    const detail = parseDetail(this.store.getMigration(this.storeName)?.detail_json);
+    const journalKey = typeof detail.authJsonKey === 'string' ? detail.authJsonKey : undefined;
+    if (journalKey) {
+      if (this.authJsonKey && this.authJsonKey !== this.provider && this.authJsonKey !== journalKey) {
+        throw new Error('single-grant rollback auth.json key mismatch');
+      }
+      return journalKey;
+    }
+    const key = this.authJsonKey ?? this.provider;
+    if (!key) throw new Error('single-grant rollback has no auth.json key');
+    return key;
+  }
+
   private preCommitRollback(): MigrationStatus {
+    // Resolve (and validate) the journaled auth key before any cleanup, so a
+    // conflicting key refuses with every staged artifact still in place.
+    const authKey = this.kind === 'single-grant' ? this.singleGrantAuthKey() : undefined;
     const owner = this.readOwnerPayload();
     this.deleteStagedKeychain(owner?.accounts);
     unlinkIfExists(this.stagingPath());
+    if (authKey !== undefined) removePiAuthBackup(this.poolFilePath, authKey);
     this.journal('NATIVE', { intent: undefined, rolledBackAt: Date.now(), rolledBackFrom: 'pre-commit' });
     return this.status();
   }

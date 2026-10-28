@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { cooperativeDrain, type CswapAgent } from '../src/cswap-agent';
+import { cooperativeDrain, launchctlCswapAgent, runRetirementDrain, type CswapAgent, type LaunchctlCswapAgentDependencies } from '../src/cswap-agent';
+import { listCswapProcesses, listCswapProcessesToSignal } from '../src/cswap-processes';
 import { cutoverBegin } from '../src/commands/cutover';
 import { phase } from '../src/lifecycle';
 import { openStore } from '../src/store';
@@ -40,6 +41,7 @@ test('waits for a held C-swap consume lock before signaling, then drains coopera
   const releases: string[] = [];
   const { agent, calls } = drainingAgent(() => cooperativeDrain({
     listProcesses: () => terminated ? [] : [{ pid: 42 }],
+    listSignalTargets: () => terminated ? [] : [{ pid: 42 }],
     lockPaths: () => ['backup/.lock', 'backup/credentials/.consume-2.lock'],
     tryAcquireLock: (path) => {
       if (path.endsWith('.consume-2.lock') && consumeLockHeld) return null;
@@ -72,6 +74,153 @@ test('waits for a held C-swap consume lock before signaling, then drains coopera
   }
 });
 
+test('refuses to signal an unidentified loose-list survivor', async () => {
+  const kills: Array<{ pid: number; signal: 'SIGTERM' }> = [];
+  const result = await cooperativeDrain({
+    listProcesses: () => [{ pid: 88 }],
+    listSignalTargets: () => [],
+    lockPaths: () => ['backup/.lock'],
+    tryAcquireLock: () => () => {},
+    kill: (pid, signal) => { kills.push({ pid, signal }); },
+    now: () => 0,
+    sleep: async () => {},
+    cooperativeWaitMs: 0,
+  });
+
+  assert.deepEqual(result, { ok: false, code: 'cswap-unidentified-survivor' });
+  assert.deepEqual(kills, []);
+});
+
+test('signals a survivor only when the strict lister identifies its PID', async () => {
+  let now = 0;
+  let terminated = false;
+  const kills: Array<{ pid: number; signal: 'SIGTERM' }> = [];
+  const result = await cooperativeDrain({
+    listProcesses: () => terminated ? [] : [{ pid: 89 }],
+    listSignalTargets: () => terminated ? [] : [{ pid: 89 }],
+    lockPaths: () => ['backup/.lock'],
+    tryAcquireLock: () => () => {},
+    kill: (pid, signal) => { kills.push({ pid, signal }); terminated = true; },
+    now: () => now,
+    sleep: async () => { now += 1; },
+    cooperativeWaitMs: 0,
+    termWaitMs: 1,
+    pollMs: 1,
+  });
+
+  assert.deepEqual(result, { ok: true });
+  assert.deepEqual(kills, [{ pid: 89, signal: 'SIGTERM' }]);
+});
+
+test('launchctlCswapAgent issues bootout, disable and plist move with the exact argv', async () => {
+  const root = '/fixture-home';
+  const calls: Array<{ file: string; args: readonly string[] }> = [];
+  let plistMoved = false;
+  const agent = launchctlCswapAgent({
+    exec: (file, args) => { calls.push({ file, args }); },
+    fs: {
+      exists: (path) => path === `${root}/Library/LaunchAgents/com.cswap.auto.plist` ? !plistMoved : plistMoved,
+      mkdir: () => {}, readFile: () => JSON.stringify({ sequence: [] }),
+      rename: () => { plistMoved = true; },
+    },
+    uid: () => 501, home: () => root, qlbHome: () => root,
+    tryAcquireLock: () => () => {}, kill: () => {}, now: () => 0, sleep: async () => {},
+  });
+  assert.deepEqual(await agent.bootout(), { ok: true });
+  assert.deepEqual(await agent.disable(), { ok: true });
+  assert.deepEqual(await agent.movePlist(), { ok: true });
+  assert.deepEqual(calls, [
+    { file: '/bin/launchctl', args: ['bootout', 'gui/501/com.cswap.auto'] },
+    { file: '/bin/launchctl', args: ['disable', 'gui/501/com.cswap.auto'] },
+  ]);
+});
+
+test('an already booted-out agent is treated as drained', async () => {
+  const agent = launchctlCswapAgent({
+    exec: (file) => {
+      if (file === '/bin/launchctl') throw Object.assign(new Error('No such process'), { code: 'ESRCH' });
+      return '';
+    },
+    fs: { exists: () => true, mkdir: () => {}, readFile: () => JSON.stringify({ sequence: [] }), rename: () => {} },
+    uid: () => 501, home: () => '/fixture-home', qlbHome: () => '/fixture-home',
+    listProcesses: () => [], tryAcquireLock: () => () => {}, kill: () => {}, now: () => 0, sleep: async () => {},
+  });
+  assert.deepEqual(await runRetirementDrain(agent), { ok: true });
+});
+
+test('a resume after a crash inside remove-launch-artifacts completes (both plist copies already gone)', async () => {
+  const agent = launchctlCswapAgent({
+    exec: () => {},
+    fs: { exists: () => false, mkdir: () => { throw new Error('must not create a backup directory'); }, readFile: () => '', rename: () => { throw new Error('must not move a missing plist'); } },
+    uid: () => 501, home: () => '/fixture-home', qlbHome: () => '/fixture-home',
+    tryAcquireLock: () => () => {}, kill: () => {}, now: () => 0, sleep: async () => {},
+  });
+
+  assert.deepEqual(await agent.movePlist(), { ok: true });
+});
+
+test('the production drain uses the A14 classifier and fails closed when ps output is empty', async () => {
+  let now = 0;
+  let alive = true;
+  const locked: string[] = [];
+  const customBackup = '/configured/cswap-state';
+  const dependencies: LaunchctlCswapAgentDependencies = {
+    exec: () => '',
+    fs: {
+      exists: () => true, mkdir: () => {},
+      readFile: (path: string) => {
+        assert.equal(path, `${customBackup}/sequence.json`);
+        return JSON.stringify({ sequence: [9] });
+      },
+      rename: () => {},
+    },
+    uid: () => 501, home: () => '/fixture-home', qlbHome: () => '/fixture-home',
+    cswapSequencePath: () => `${customBackup}/sequence.json`,
+    listProcesses: () => alive ? listCswapProcesses({ platform: 'linux', runPs: () => '123 python3 -m claude_swap auto' }) : [],
+    listSignalTargets: () => alive ? listCswapProcessesToSignal({ platform: 'linux', runPs: () => '123 python3 -m claude_swap auto' }) : [],
+    tryAcquireLock: (path: string) => { locked.push(path); return () => {}; },
+    kill: () => { alive = false; }, now: () => now, sleep: async () => { now += 60_000; },
+  };
+  const agent = launchctlCswapAgent(dependencies);
+
+  assert.deepEqual(await agent.drain(), { ok: true });
+  assert.deepEqual(locked, [
+    `${customBackup}/.lock`,
+    `${customBackup}/credentials/.consume-9.lock`,
+  ]);
+
+  const emptyAgent = launchctlCswapAgent({
+    ...dependencies,
+    listProcesses: () => listCswapProcesses({ platform: 'linux', runPs: () => '' }),
+  });
+  const empty = await emptyAgent.drain();
+  assert.equal(empty.ok, false);
+  assert.match(empty.code ?? '', /cswap-drain-error process table was empty/);
+});
+
+test('the production agent takes locks under the configured C-swap directory', async () => {
+  let now = 0;
+  let alive = true;
+  const locked: string[] = [];
+  const customBackup = '/configured/cswap-state';
+  const agent = launchctlCswapAgent({
+    exec: () => '',
+    fs: { exists: () => true, mkdir: () => {}, readFile: () => JSON.stringify({ sequence: ['42'] }), rename: () => {} },
+    uid: () => 501, home: () => '/fixture-home', qlbHome: () => '/fixture-home',
+    cswapSequencePath: () => `${customBackup}/sequence.json`,
+    listProcesses: () => alive ? [{ pid: 42 }] : [],
+    listSignalTargets: () => alive ? [{ pid: 42 }] : [],
+    tryAcquireLock: (path: string) => { locked.push(path); return () => {}; },
+    kill: () => { alive = false; }, now: () => now, sleep: async () => { now += 60_000; },
+  });
+
+  assert.deepEqual(await agent.drain(), { ok: true });
+  assert.deepEqual(locked, [
+    `${customBackup}/.lock`,
+    `${customBackup}/credentials/.consume-42.lock`,
+  ]);
+});
+
 test('AC58 barrier assertion rejects a fake drain that signals before the consume lock is available', async () => {
   const kills: Array<{ pid: number; signal: 'SIGTERM' }> = [];
   let consumeLockHeld = true;
@@ -96,6 +245,7 @@ test('refuses a C-swap whose consume lock stays held, without sending any signal
   const kills: Array<{ pid: number; signal: 'SIGTERM' }> = [];
   const { agent, calls } = drainingAgent(() => cooperativeDrain({
     listProcesses: () => [{ pid: 77 }],
+    listSignalTargets: () => [{ pid: 77 }],
     lockPaths: () => ['backup/.lock', 'backup/credentials/.consume-2.lock'],
     tryAcquireLock: () => null,
     kill: (pid, signal) => { kills.push({ pid, signal }); },
@@ -125,6 +275,7 @@ test('refuses a SIGTERM-surviving C-swap, restores its plist, and never sends SI
   const kills: Array<{ pid: number; signal: 'SIGTERM' }> = [];
   const { agent, calls } = drainingAgent(() => cooperativeDrain({
     listProcesses: () => [{ pid: 99 }],
+    listSignalTargets: () => [{ pid: 99 }],
     lockPaths: () => ['backup/.lock', 'backup/credentials/.consume-2.lock'],
     tryAcquireLock: () => () => {},
     kill: (pid, signal) => { kills.push({ pid, signal }); },
@@ -154,6 +305,7 @@ test('names every SIGTERM survivor in the S57 refusal code', async () => {
   let now = 0;
   const result = await cooperativeDrain({
     listProcesses: () => [{ pid: 101 }, { pid: 102 }],
+    listSignalTargets: () => [{ pid: 101 }, { pid: 102 }],
     lockPaths: () => ['backup/.lock'],
     tryAcquireLock: () => () => {},
     kill: () => {},
@@ -173,6 +325,7 @@ test('treats ESRCH from SIGTERM as an already-exited process', async () => {
   let listed = true;
   const result = await cooperativeDrain({
     listProcesses: () => listed ? [{ pid: 123 }] : [],
+    listSignalTargets: () => listed ? [{ pid: 123 }] : [],
     lockPaths: () => ['backup/.lock'],
     tryAcquireLock: () => () => {},
     kill: () => {
@@ -194,6 +347,7 @@ test('fails closed with the named error when SIGTERM fails for another reason', 
   let now = 0;
   const result = await cooperativeDrain({
     listProcesses: () => [{ pid: 124 }],
+    listSignalTargets: () => [{ pid: 124 }],
     lockPaths: () => ['backup/.lock'],
     tryAcquireLock: () => () => {},
     kill: () => { throw Object.assign(new Error('not permitted'), { code: 'EPERM' }); },

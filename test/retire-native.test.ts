@@ -3,6 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'no
 import { tmpdir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
 import { after, describe, it } from 'node:test';
+import { withCodexAuthLock } from '../src/cc-locks';
 import {
   checkRetirementEligibility,
   MIN_OK_DECISIONS,
@@ -241,6 +242,38 @@ describe('retireNativeStore — extra safety gates', () => {
       );
       assert.equal(existsSync(fixture), true, 'failed ping must not touch the fixture');
       assert.equal(store.getMigration(HARNESS)?.state, 'QLB_OWNED');
+    } finally {
+      store.close();
+    }
+  });
+
+  it('retire codex-cli racing import-active serialises', async () => {
+    const { dir, store } = openTempStore();
+    const fixture = join(dir, 'auth.json');
+    writeFileSync(fixture, '{"tokens":{}}\n', { encoding: 'utf8', mode: 0o600 });
+    seedEligible(store);
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    let entered!: () => void;
+    const enteredLock = new Promise<void>((resolve) => { entered = resolve; });
+    try {
+      const importer = withCodexAuthLock({ home: dir, retryMinMs: 1, retryJitterMs: 0 }, async () => {
+        entered();
+        await held;
+      });
+      await enteredLock;
+      const retirement = retireNativeStore(store, HARNESS, {
+        nativePathToRemove: fixture,
+        confirmRealRetirement: true,
+        pingFn: async () => true,
+        authLockOptions: { home: dir, retryMinMs: 1, retryJitterMs: 0 },
+      });
+      await new Promise<void>((resolve) => setTimeout(resolve, 20));
+      assert.equal(existsSync(fixture), true, 'retire waits for import-active before its rename');
+      release();
+      await importer;
+      await retirement;
+      assert.equal(existsSync(fixture), false);
     } finally {
       store.close();
     }
