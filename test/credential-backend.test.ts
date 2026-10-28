@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
+import { isCredentialNotFound } from '../src/credential-backends';
 import {
   DPAPI_DECRYPT_SCRIPT,
   DPAPI_ENCRYPT_SCRIPT,
@@ -22,6 +23,29 @@ import {
   selectBackendKind,
   type ExecFileSyncFn,
 } from '../src/keychain';
+
+describe('isCredentialNotFound', () => {
+  it('accepts only definitive absent-item errors, including wrapped causes', () => {
+    assert.equal(isCredentialNotFound({ status: 44 }), true);
+    assert.equal(isCredentialNotFound(new Error('The specified item could not be found in the keychain.')), true);
+    assert.equal(isCredentialNotFound(new Error('keychain delete failed: item not found')), true);
+    assert.equal(
+      isCredentialNotFound(Object.assign(new Error('credential operation failed'), {
+        cause: new Error('The specified item could not be found in the keychain.'),
+      })),
+      true,
+    );
+  });
+
+  it('rejects missing keychains, access failures, other statuses, and non-errors', () => {
+    assert.equal(isCredentialNotFound(new Error('The specified keychain could not be found.')), false);
+    assert.equal(isCredentialNotFound(new Error('User interaction is not allowed.')), false);
+    assert.equal(isCredentialNotFound({ status: 51 }), false);
+    assert.equal(isCredentialNotFound({ status: 36 }), false);
+    assert.equal(isCredentialNotFound(null), false);
+    assert.equal(isCredentialNotFound('item not found'), false);
+  });
+});
 
 describe('CredentialBackend dispatch', () => {
   it('selects macos-keychain on darwin regardless of secret-tool', () => {
