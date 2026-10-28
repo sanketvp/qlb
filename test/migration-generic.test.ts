@@ -23,6 +23,7 @@ import {
   type StagedAccount,
 } from '../src/migration';
 import { parseGrant } from '../src/refresh-lease';
+import { piAuthBackupPath, writePiAuthBackup } from '../src/pi-auth-backup';
 import { openStore } from '../src/store';
 
 /**
@@ -329,6 +330,39 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
         xai?: { access?: string };
       };
       assert.equal(parsed.xai?.access, FAKE_GRANTS.xai.access);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('T-PRE pre-commit rollback removes a leftover backup', () => {
+    const h = setup('xai');
+    try {
+      h.mig.stage();
+      writePiAuthBackup(h.authPath, 'xai', 'crashed-before-owner');
+      assert.equal(existsSync(piAuthBackupPath(h.authPath, 'xai')), true, 'fixture backup exists');
+
+      h.mig.rollback();
+
+      assert.equal(existsSync(piAuthBackupPath(h.authPath, 'xai')), false);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('T-PRE a conflicting auth key refuses pre-commit rollback before any cleanup', () => {
+    const h = setup('xai');
+    try {
+      h.mig.stage();
+      const row = h.store.getMigration('pi-xai');
+      const detail = { ...(JSON.parse(row?.detail_json ?? '{}') as Record<string, unknown>), authJsonKey: 'grok' };
+      h.store.upsertMigration('pi-xai', row!.state, JSON.stringify(detail));
+      const conflicting = createSingleGrantMigration(h.store, h.kc, 'xai', h.authPath, h.ownerPath, 'other-alias');
+
+      assert.throws(() => conflicting.rollback(), /auth\.json key mismatch/);
+
+      assert.equal(keychainHas(h.kc, 'xai'), true, 'staged Keychain item kept');
+      assert.equal(h.store.getMigration('pi-xai')?.state, row!.state, 'journal state unchanged');
     } finally {
       h.cleanup();
     }
