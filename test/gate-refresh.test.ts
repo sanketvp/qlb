@@ -73,6 +73,7 @@ async function run(
   const gate = createAnthropicGate({
     store: f.store, slots: f.slots, live: f.live, env: f.env, now: () => NOW,
     readLiveIdentity: f.identity, verdicts: new ProbeVerdictMemo(),
+    postRefresh: async () => { throw new Error('unexpected network call'); },
     ...overrides,
     ...(outcome ? { refresh: async () => outcome } : {}),
   });
