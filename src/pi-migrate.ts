@@ -77,6 +77,7 @@ function writeJournal(path: string, journal: Journal, refresh?: () => void): voi
 function journalPath(paths: PiMigratePaths, provider: PiSingleProvider): string { return join(paths.journalPath, `pi-migrate-${provider}.json`); }
 function baselinePath(paths: PiMigratePaths, provider: PiSingleProvider): string { return join(paths.baselineDir, `${provider}.json`); }
 function readJournal(paths: PiMigratePaths, provider: PiSingleProvider): Journal | null { const path = journalPath(paths, provider); if (!existsSync(path)) return null; const parsed = asObject(JSON.parse(readFileSync(path, 'utf8')), 'Pi migration journal is malformed'); if (parsed.provider !== provider || typeof parsed.phase !== 'string' || !JOURNAL_PHASES.includes(parsed.phase as JournalPhase)) throw new Error('Pi migration journal is malformed'); return { provider, phase: parsed.phase as JournalPhase, ownerPid: Number(parsed.ownerPid) || 0, updatedAt: Number(parsed.updatedAt) || 0 }; }
+function placeholderBaselineError(provider: PiSingleProvider): Error { return new Error(`Pi ${provider} baseline would be a placeholder; run qlb pi rollback or restore auth.json`); }
 function phaseAtLeast(actual: JournalPhase, expected: JournalPhase): boolean { return JOURNAL_PHASES.indexOf(actual) >= JOURNAL_PHASES.indexOf(expected); }
 function updatePhase(paths: PiMigratePaths, provider: PiSingleProvider, phase: JournalPhase, refresh?: () => void): void { writeJournal(journalPath(paths, provider), { provider, phase, ownerPid: process.pid, updatedAt: Date.now() }, refresh); }
 function fingerprint(value: string): string { return `sha256:${createHash('sha256').update(value, 'utf8').digest('hex')}`; }
@@ -235,6 +236,8 @@ export function migratePiSingleProvider(provider: PiSingleProvider, paths: PiMig
     if (alreadyMigrated) {
       state = 'migrated';
     } else {
+      // D-B74: refuse a placeholder baseline before the first write (no stray 'started' journal).
+      if (!inLockJournal && provider !== 'openrouter' && isPiPlaceholder(auth[provider])) throw placeholderBaselineError(provider);
       if (!inLockJournal) updatePhase(paths, provider, 'started', refresh);
       let baseline: unknown; const baselineFile = baselinePath(paths, provider);
       if (phaseAtLeast(journal.phase, 'baseline') && existsSync(baselineFile)) baseline = JSON.parse(readFileSync(baselineFile, 'utf8'));
@@ -245,11 +248,13 @@ export function migratePiSingleProvider(provider: PiSingleProvider, paths: PiMig
           updatePhase(paths, provider, 'committed', refresh); refresh(); rmSync(journalPath(paths, provider), { force: true });
           return;
         }
-        if (isPiPlaceholder(baseline)) throw new Error(`Pi ${provider} baseline would be a placeholder; run qlb pi rollback or restore auth.json`);
+        if (isPiPlaceholder(baseline)) throw placeholderBaselineError(provider);
         refresh(); writeJson(baselineFile, baseline); updatePhase(paths, provider, 'baseline', refresh); journal = { ...journal, phase: 'baseline' }; deps.afterWrite?.('baseline');
       }
       if (provider !== 'openrouter' && phaseAtLeast(journal.phase, 'publishing') && !isPiPlaceholder(auth[provider])) throw new Error(`Pi ${provider} entry changed after publication`);
-      if (!phaseAtLeast(journal.phase, 'publishing')) {
+      // Install and verify the managed item on every resume before publication,
+      // including 'publishing': the item may have been lost or changed in the crash window.
+      if (!phaseAtLeast(journal.phase, 'published')) {
         let source: unknown = provider === 'openrouter' ? baseline : (isPiPlaceholder(auth[provider]) || auth[provider] === undefined ? baseline : auth[provider]);
         if (provider !== 'openrouter' && source !== baseline) { try { keychainPayload(provider, source); } catch { source = baseline; } }
         const payload = keychainPayload(provider, source);
@@ -258,7 +263,7 @@ export function migratePiSingleProvider(provider: PiSingleProvider, paths: PiMig
         const verified = deps.keychain.getSync(managedService(provider), QLB_KEYCHAIN_ACCOUNT); if (verified !== payload) throw new Error('managed credential verification failed');
         if (!phaseAtLeast(journal.phase, 'credential-saved')) { updatePhase(paths, provider, 'credential-saved', refresh); journal = { ...journal, phase: 'credential-saved' }; deps.afterWrite?.('credential-saved'); }
         if (provider !== 'openrouter') { auth[provider] = piPlaceholder(); refresh(); writeJson(paths.authJsonPath, auth); refresh(); deps.afterWrite?.('placeholder'); }
-        updatePhase(paths, provider, 'publishing', refresh); journal = { ...journal, phase: 'publishing' }; deps.afterWrite?.('publishing');
+        if (!phaseAtLeast(journal.phase, 'publishing')) { updatePhase(paths, provider, 'publishing', refresh); journal = { ...journal, phase: 'publishing' }; deps.afterWrite?.('publishing'); }
       }
       refresh(); writePiOwnerEntry(paths.ownerPath, provider, true); deps.afterWrite?.('owner-entry'); updatePhase(paths, provider, 'published', refresh); journal = { ...journal, phase: 'published' }; state = 'migrated';
     }

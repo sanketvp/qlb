@@ -274,6 +274,34 @@ describe('Pi migration S58 credential-first barrier', () => {
     } finally { h.cleanup(); }
   });
 
+  it('xai: a publishing resume reinstalls and verifies a lost managed item before publishing', () => {
+    const h = setup();
+    try {
+      assert.throws(() => migratePiSingleProvider('xai', h.paths, {
+        keychain: h.keychain,
+        store: h.store,
+        afterWrite: (point: string) => { if (point === 'publishing') throw new Error('injected crash'); },
+      }), /injected crash/);
+      h.keychain.deleteSync(qlbKeychainService('xai', 'default'), QLB_KEYCHAIN_ACCOUNT);
+      assert.equal(hasManaged(h.keychain, 'xai'), false);
+      assert.equal(migratePiSingleProvider('xai', h.paths, { keychain: h.keychain, store: h.store }).state, 'migrated');
+      assert.equal(hasManaged(h.keychain, 'xai'), true, 'resume reinstalled the managed item before publication');
+    } finally { h.cleanup(); }
+  });
+
+  it('refuses a placeholder auth entry with no journal before writing anything', () => {
+    const h = setup();
+    try {
+      writeFileSync(h.paths.authJsonPath, JSON.stringify({ xai: { type: 'oauth', access: 'qlb-managed', refresh: '' } }), { mode: 0o600 });
+      assert.throws(
+        () => migratePiSingleProvider('xai', h.paths, { keychain: h.keychain }),
+        /Pi xai baseline would be a placeholder; run qlb pi rollback or restore auth\.json/,
+      );
+      assert.equal(existsSync(join(h.paths.journalPath, 'pi-migrate-xai.json')), false, 'no stray started journal');
+      assert.equal(existsSync(join(h.paths.baselineDir, 'xai.json')), false);
+    } finally { h.cleanup(); }
+  });
+
   it('refuses a placeholder baseline without writing a baseline file', () => {
     const h = setup();
     try {
