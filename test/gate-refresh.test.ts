@@ -1,6 +1,6 @@
 // Ported from claude-swap v0.28.0 (MIT) tests/test_switcher.py:2039-3513
 import assert from 'node:assert/strict';
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
@@ -9,10 +9,12 @@ import defaultAnthropicGate, { createAnthropicGate, type AnthropicGateDeps } fro
 import { InMemoryCredentialBackend } from '../src/cc-credentials';
 import { claudePaths } from '../src/cc-paths';
 import { ClaudeSlots, SqliteClaudeSlotRepository } from '../src/cc-slots';
+import { ANTHROPIC_OAUTH_TOKEN_URL, ANTHROPIC_USAGE_URL } from '../src/anthropic-oauth';
 import { credentialLineage, ProbeVerdictMemo, type RefreshOutcome } from '../src/cc-resync';
-import { runPiGate } from '../src/pi-gate';
+import { qlbKeychainService } from '../src/keychain';
+import { runPiGate, type PiGateDeps } from '../src/pi-gate';
 import { beginCutover } from '../src/lifecycle';
-import { openStore } from '../src/store';
+import { openStore, openStoreConnection } from '../src/store';
 
 const NOW = 1_700_000_000_000;
 
@@ -51,7 +53,13 @@ async function fixture(expiresAt = NOW + 10 * 60_000): Promise<Fixture> {
   return { dbPath, store, slots, backend, live, env, identity: () => current };
 }
 
-async function run(f: Fixture, outcome?: RefreshOutcome, overrides: Partial<AnthropicGateDeps> = {}): Promise<{ code: number; stdout: string[]; stderr: string[]; trace: string[] }> {
+async function run(
+  f: Fixture,
+  outcome?: RefreshOutcome,
+  overrides: Partial<AnthropicGateDeps> = {},
+  gateOverrides: Partial<Pick<PiGateDeps, 'open' | 'evidenceGap'>> = {},
+  events: string[] = [],
+): Promise<{ code: number; stdout: string[]; stderr: string[]; trace: string[]; events: string[] }> {
   const stdout: string[] = [];
   const stderr: string[] = [];
   const trace: string[] = [];
@@ -62,21 +70,79 @@ async function run(f: Fixture, outcome?: RefreshOutcome, overrides: Partial<Anth
     ...(outcome ? { refresh: async () => outcome } : {}),
   });
   const code = await runPiGate('anthropic', {
-    dbPath: f.dbPath, env: f.env, deliver: (line) => stdout.push(line), stderr: (line) => stderr.push(line),
+    dbPath: f.dbPath, env: f.env,
+    deliver: (line) => { stdout.push(line); events.push('stdout'); }, stderr: (line) => stderr.push(line),
     guard: () => true, admitted: () => ({ ok: true }), prerequisites: () => undefined,
-    provider: gate, cswapProcesses: () => [], sqlTrace: (line) => trace.push(line),
+    provider: gate, cswapProcesses: () => [], sqlTrace: (line) => { trace.push(line); events.push(line); },
+    ...gateOverrides,
   });
-  return { code, stdout, stderr, trace };
+  return { code, stdout, stderr, trace, events };
+}
+
+function rotateLiveDuringLockedRead(f: Fixture, replacement: string): void {
+  const originalGet = f.backend.get.bind(f.backend);
+  let liveReads = 0;
+  f.backend.get = async (service, account) => {
+    if (service === f.live.paths.keychainService && account === f.live.account && ++liveReads === 2) return replacement;
+    return originalGet(service, account);
+  };
 }
 
 describe('Anthropic Pi gate refresh mapping (K6-7)', () => {
-  it('serves the live active token above five minutes with 0 POSTs and source live', async () => {
+  it('every success writes the evidence row in a BEGIN IMMEDIATE after the credential is determined', async () => {
     const f = await fixture();
-    const result = await run(f);
+    const originalGet = f.backend.get.bind(f.backend);
+    f.backend.get = async (service, account) => {
+      const value = await originalGet(service, account);
+      if (service === f.live.paths.keychainService && account === f.live.account) resultEvents.push('live-read');
+      return value;
+    };
+    const resultEvents: string[] = [];
+    const result = await run(f, undefined, {}, {}, resultEvents);
     assert.equal(result.code, 0);
     assert.equal(JSON.parse(result.stdout[0]!).source, 'live');
     assert.ok(result.trace.includes('BEGIN IMMEDIATE'));
+    assert.ok(resultEvents.indexOf('live-read') < resultEvents.indexOf('BEGIN IMMEDIATE'));
+    assert.ok(resultEvents.indexOf('BEGIN IMMEDIATE') < resultEvents.indexOf('stdout'));
+    assert.match(f.store.getConfig('pi.anthropic.lastServedFingerprint') ?? '', /^sha256:/);
+    assert.match(f.store.getConfig('pi.anthropic.lastServedAt') ?? '', /^\d+$/);
     assert.equal(f.store.getConfig('pi.anthropic.lastServedBy'), 'qlb-pi');
+    f.store.close();
+  });
+
+  it('an evidence write failing with SQLITE_BUSY still returns the credential and appends pi:evidence-gap', async () => {
+    const f = await fixture();
+    const holder = openStoreConnection(f.dbPath);
+    holder.exec('BEGIN IMMEDIATE');
+    try {
+      const result = await run(f, undefined, {}, {
+        open: (path) => {
+          const db = openStoreConnection(path);
+          db.exec('PRAGMA busy_timeout = 20');
+          return db;
+        },
+      });
+      assert.equal(result.code, 0);
+      assert.equal(result.stdout.length, 1);
+      assert.deepEqual(result.stderr, ['qlb gate anthropic: pi:evidence-gap']);
+      assert.match(readFileSync(join(f.live.home, 'auto.log'), 'utf8'), /^pi:evidence-gap provider=anthropic at=\d+\n$/);
+    } finally {
+      holder.exec('ROLLBACK');
+      holder.close();
+      f.store.close();
+    }
+  });
+
+  it('a rotated live credential under the locks is served with source adopted and 0 POSTs', async () => {
+    const f = await fixture(NOW - 1);
+    rotateLiveDuringLockedRead(f, credential('rotated', NOW + 60 * 60_000));
+    let posts = 0;
+    const result = await run(f, undefined, {
+      postRefresh: async () => { posts += 1; return { status: 500, body: '' }; },
+    });
+    assert.equal(result.code, 0);
+    assert.equal(posts, 0);
+    assert.equal(JSON.parse(result.stdout[0]!).source, 'adopted');
     f.store.close();
   });
 
@@ -109,7 +175,36 @@ describe('Anthropic Pi gate refresh mapping (K6-7)', () => {
     f.store.close();
   });
 
-  it('fails malformed live credentials closed', async () => {
+  it('the gate never calls the usage endpoint', async () => {
+    const requests: string[] = [];
+    const postRefresh: NonNullable<AnthropicGateDeps['postRefresh']> = async (request) => {
+      requests.push(request.url);
+      return { status: 200, body: JSON.stringify({ access_token: 'access-issued', refresh_token: 'refresh-issued', expires_in: 3600 }) };
+    };
+
+    const served = await fixture();
+    assert.equal((await run(served, undefined, { postRefresh })).code, 0);
+    served.store.close();
+
+    const adopted = await fixture(NOW - 1);
+    rotateLiveDuringLockedRead(adopted, credential('rotated', NOW + 60 * 60_000));
+    assert.equal((await run(adopted, undefined, { postRefresh })).code, 0);
+    adopted.store.close();
+
+    const restored = await fixture(NOW - 1);
+    await restored.slots.writeSlot('account-a', credential('slot-successor', NOW + 60 * 60_000), { cause: 'post', by: 'qlb-gate', evidence: 'post' });
+    assert.equal((await run(restored, undefined, { postRefresh })).code, 0);
+    restored.store.close();
+
+    const refreshed = await fixture(NOW - 1);
+    assert.equal((await run(refreshed, undefined, { postRefresh })).code, 0);
+    refreshed.store.close();
+
+    assert.deepEqual(requests, [ANTHROPIC_OAUTH_TOKEN_URL]);
+    assert.equal(requests.includes(ANTHROPIC_USAGE_URL), false);
+  });
+
+  it('a malformed live blob fails closed with no-credentials', async () => {
     const f = await fixture();
     await f.backend.set(f.live.paths.keychainService, f.live.account, '{bad');
     const result = await run(f);
@@ -119,7 +214,7 @@ describe('Anthropic Pi gate refresh mapping (K6-7)', () => {
     f.store.close();
   });
 
-  it('refuses an identity changed between reads', async () => {
+  it('an identity change between the live read and the re-read refuses with exit 3', async () => {
     const f = await fixture();
     let reads = 0;
     const gate = createAnthropicGate({
@@ -137,31 +232,83 @@ describe('Anthropic Pi gate refresh mapping (K6-7)', () => {
     f.store.close();
   });
 
-  it('a live write failure after a 2xx fails closed with exit 1, token-expired, no stdout, and appends one auto.log line', async () => {
+  it('a live write failure after a 2xx fails closed with exit 1, token-expired, no stdout, and appends one auto.log line; the next gate call restores live from the slot with 0 POSTs and serves source restored', async () => {
     const f = await fixture(NOW - 1);
-    const lines: string[] = [];
-    const result = await run(f, { outcome: 'posted-live-unwritten', working: credential('issued', NOW + 60 * 60_000) }, { autoLog: (line) => lines.push(line) });
-    assert.equal(result.code, 1);
-    assert.deepEqual(result.stdout, []);
-    assert.deepEqual(result.stderr, ['token-expired']);
+    const originalSet = f.backend.set.bind(f.backend);
+    let failLiveWrite = true;
+    f.backend.set = async (service, account, value) => {
+      if (failLiveWrite && service === f.live.paths.keychainService && account === f.live.account) throw new Error('fixture live write failed');
+      return originalSet(service, account, value);
+    };
+    let posts = 0;
+    const postRefresh: NonNullable<AnthropicGateDeps['postRefresh']> = async () => ({
+      status: 200,
+      body: JSON.stringify({ access_token: `access-issued-${++posts}`, refresh_token: 'refresh-issued', expires_in: 3600 }),
+    });
+    const failed = await run(f, undefined, { postRefresh });
+    assert.equal(failed.code, 1);
+    assert.deepEqual(failed.stdout, []);
+    assert.deepEqual(failed.stderr, ['token-expired']);
+    assert.equal(posts, 1);
+    const lines = readFileSync(join(f.live.home, 'auto.log'), 'utf8').trim().split('\n');
     assert.equal(lines.length, 1);
     assert.match(lines[0]!, /^claude:live-write-failed provider=anthropic account=account-a at=\d+$/);
+
+    failLiveWrite = false;
+    const restored = await run(f, undefined, { postRefresh: async () => { throw new Error('must not post'); } });
+    assert.equal(restored.code, 0);
+    assert.equal(JSON.parse(restored.stdout[0]!).source, 'restored');
+    assert.equal(posts, 1);
     f.store.close();
   });
 
   it('a stashed successor fails closed with exit 1 and no stdout; the next gate call adopts the stash and serves it with 0 POSTs', async () => {
     const f = await fixture(NOW - 1);
-    const result = await run(f, { outcome: 'stashed', working: credential('issued', NOW + 60 * 60_000) });
-    assert.equal(result.code, 1);
-    assert.deepEqual(result.stdout, []);
+    const originalSet = f.backend.set.bind(f.backend);
+    const slotService = qlbKeychainService('anthropic', 'account-a');
+    let failPersistence = true;
+    f.backend.set = async (service, account, value) => {
+      if (failPersistence && (service === slotService || (service === f.live.paths.keychainService && account === f.live.account))) {
+        throw new Error('fixture persistence write failed');
+      }
+      return originalSet(service, account, value);
+    };
+    let posts = 0;
+    const failed = await run(f, undefined, {
+      postRefresh: async () => ({
+        status: 200,
+        body: JSON.stringify({ access_token: `access-issued-${++posts}`, refresh_token: 'refresh-issued', expires_in: 3600 }),
+      }),
+    });
+    assert.equal(failed.code, 1);
+    assert.deepEqual(failed.stdout, []);
+    assert.equal(posts, 1);
+
+    failPersistence = false;
+    const adopted = await run(f, undefined, { postRefresh: async () => { throw new Error('must not post'); } });
+    assert.equal(adopted.code, 0);
+    assert.equal(JSON.parse(adopted.stdout[0]!).source, 'restored');
+    assert.equal(posts, 1);
     f.store.close();
   });
 
   it('an unpersisted successor fails closed with exit 1 and no stdout', async () => {
     const f = await fixture(NOW - 1);
-    const result = await run(f, { outcome: 'unpersisted', working: credential('issued', NOW + 60 * 60_000), successorFailure: 'fixture' });
+    const originalSet = f.backend.set.bind(f.backend);
+    f.backend.set = async () => { throw new Error('fixture keychain write failed'); };
+    const originalStash = f.slots.stashUnclaimed.bind(f.slots);
+    f.slots.stashUnclaimed = async () => { throw new Error('fixture stash write failed'); };
+    const lines: string[] = [];
+    const result = await run(f, undefined, {
+      postRefresh: async () => ({ status: 200, body: JSON.stringify({ access_token: 'access-issued', refresh_token: 'refresh-issued', expires_in: 3600 }) }),
+      autoLog: (line) => lines.push(line),
+    });
     assert.equal(result.code, 1);
     assert.deepEqual(result.stdout, []);
+    assert.equal(lines.length, 1);
+    assert.match(lines[0]!, /^claude:unpersisted-token provider=anthropic account=account-a at=\d+$/);
+    f.backend.set = originalSet;
+    f.slots.stashUnclaimed = originalStash;
     f.store.close();
   });
 
@@ -196,7 +343,7 @@ describe('Anthropic Pi gate refresh mapping (K6-7)', () => {
     f.store.close();
   });
 
-  it('the module default export loads through loadGate(anthropic) and receives its context', async () => {
+  it("the module's default export loads through loadGate('anthropic') and receives its context", async () => {
     const home = mkdtempSync(join(tmpdir(), 'qlb-gate-default-'));
     const dbPath = join(home, 'qlb.db');
     const store = openStore(dbPath);
