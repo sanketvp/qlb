@@ -123,6 +123,8 @@ import {
 const OWNER_FILE = join(homedir(), ".pi", "agent", "qlb-owner.json");
 const AUDIT_DIR = join(homedir(), ".qlb");
 const AUDIT_FILE = join(AUDIT_DIR, "outcomes.jsonl");
+// Covers 9s + 9s credential locks and a 10s refresh POST, with margin.
+const ANTHROPIC_GATE_TIMEOUT_MS = 45_000;
 
 /**
  * Codex ownership is explicit: the shared v2 document must name Codex, while
@@ -468,7 +470,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       runGate: async (provider) => {
         const result = await runQlb(
           ["gate", provider, "--json"],
-          15_000,
+          ANTHROPIC_GATE_TIMEOUT_MS,
           { ...process.env, QLB_PI_TOKEN_CALL: "1" },
         );
         return { code: result.code, stdout: result.stdout, stderr: result.stderr };

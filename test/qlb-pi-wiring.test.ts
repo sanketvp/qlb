@@ -118,14 +118,19 @@ const provider = args[0] === 'gate' && args[2] === '--json' ? args[1] : undefine
 if (!['anthropic', 'xai', 'kimi-coding', 'openrouter', 'openai-codex'].includes(provider)) process.exit(3);
 if (process.env.QLB_PI_TOKEN_CALL !== '1') process.exit(4);
 if (process.env.GATE_CALL_LOG) fs.appendFileSync(process.env.GATE_CALL_LOG, provider + '\n');
-if (process.env.GATE_FAIL === '1') {
-  process.stderr.write(process.env.GATE_CAUSE || 'store-open-failed');
-  process.exit(3);
-}
-process.stdout.write(JSON.stringify({ token: 'fixture-' + provider + '-access', accountId: 'user:slot', chatgptAccountId: 'bare-account', source: 'fixture' }));
+const finishGate = () => {
+  if (process.env.GATE_FAIL === '1') {
+    process.stderr.write(process.env.GATE_CAUSE || 'store-open-failed');
+    process.exit(3);
+  }
+  process.stdout.write(JSON.stringify({ token: 'fixture-' + provider + '-access', accountId: 'user:slot', chatgptAccountId: 'bare-account', source: 'fixture' }));
+};
+const delayMs = Number(process.env.GATE_DELAY_MS || '0');
+if (Number.isFinite(delayMs) && delayMs > 0) setTimeout(finishGate, delayMs);
+else finishGate();
 `;
 
-function load(owner?: string, gateFail = false, callCodex = false, perProviderOwner?: string, ownerIsDirectory = false, deployedLayout = false, callAnthropic = false, gateCause?: string, rehearsal = false): {
+function load(owner?: string, gateFail = false, callCodex = false, perProviderOwner?: string, ownerIsDirectory = false, deployedLayout = false, callAnthropic = false, gateCause?: string, rehearsal = false, gateDelayMs = 0): {
   calls: string[];
   replaced: Record<string, boolean>;
   oauth: { resolve: number; refresh: number };
@@ -173,6 +178,7 @@ function load(owner?: string, gateFail = false, callCodex = false, perProviderOw
       GATE_CALL_LOG: gateLog,
       ...(gateFail ? { GATE_FAIL: '1' } : {}),
       ...(gateCause ? { GATE_CAUSE: gateCause } : {}),
+      ...(gateDelayMs > 0 ? { GATE_DELAY_MS: String(gateDelayMs) } : {}),
       ...(rehearsal ? { QLB_PI_REHEARSAL: '1' } : {}),
       ...(callCodex ? { CALL_CODEX: '1' } : {}),
       ...(callAnthropic ? { CALL_ANTHROPIC: '1' } : {}),
@@ -228,6 +234,15 @@ describe('qlb-pi provider wiring', { skip: piAvailable ? false : 'global Pi inst
     assert.deepEqual(result.gateCalls, ['anthropic']);
     assert.deepEqual(result.events.map((event) => event.error?.errorMessage), [
       'QLB unavailable for anthropic — run qlb doctor (owner-entry-missing)',
+    ]);
+  });
+
+  it('waits for an Anthropic gate refresh beyond the default QLB process timeout', () => {
+    const owner = JSON.stringify({ providers: { anthropic: { mode: 'qlb', since: 1 } } });
+    const result = load(owner, true, false, undefined, false, false, true, undefined, false, 16_000);
+    assert.deepEqual(result.gateCalls, ['anthropic']);
+    assert.deepEqual(result.events.map((event) => event.error?.errorMessage), [
+      'QLB unavailable for anthropic — run qlb doctor (store-open-failed)',
     ]);
   });
 
@@ -341,6 +356,14 @@ describe('qlb-pi provider wiring', { skip: piAvailable ? false : 'global Pi inst
     const result = load(JSON.stringify({ providers: { 'openai-codex': { mode: 'qlb', since: 1 } } }), true, true);
     assert.equal(result.events.length, 1);
     assert.equal(result.events[0]?.error?.errorMessage, 'QLB unavailable for openai-codex — run qlb doctor (store-open-failed)');
+  });
+});
+
+describe('Anthropic gate timeout', () => {
+  it('passes the bounded-refresh budget only to the Anthropic gate call', () => {
+    const source = readFileSync(join(ROOT, 'extensions', 'qlb-pi', 'index.ts'), 'utf8');
+    assert.match(source, /const ANTHROPIC_GATE_TIMEOUT_MS = 45_000;/);
+    assert.match(source, /runQlb\(\s*\["gate", provider, "--json"\],\s*ANTHROPIC_GATE_TIMEOUT_MS,/);
   });
 });
 
