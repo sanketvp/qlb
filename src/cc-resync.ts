@@ -423,6 +423,9 @@ async function fetchUsageRecord(
       warn(deps, 'Claude active usage resync failed');
     }
   }
+  if (deps.verdicts.get(input.accountId, input.email, credentialLineage(creds) ?? '')?.match === false) {
+    return { sentinel: 'foreign-credential' };
+  }
   return { usage };
 }
 
@@ -488,18 +491,29 @@ export async function fetchActiveUsage(
     try {
       const live = await readLiveClaudeCredentials({ ...deps.live, env: deps.live.env ?? deps.env });
       if (!live || accessTokenFingerprint(live) !== accessTokenFingerprint(input.creds)) return initial;
-      // Bind forced recovery to the live snapshot whose access token was just
-      // rejected. A later locked read may still adopt a genuine rotation, but
-      // a shared-field or refresh-token-only rewrite cannot re-serve this 401.
-      refreshCreds = live;
+      // Bind a forced recovery to live only when it is still the caller's
+      // lineage. Metadata-only rewrites retain their shared fields, while a
+      // different or partial live snapshot remains subject to the locked
+      // provenance decisions below.
+      if (hasUsablePair(live) && credentialLineage(live) === credentialLineage(input.creds)) {
+        refreshCreds = live;
+      }
     } catch {
       return initial;
     }
     forceRecord = initial;
   }
 
-  const mapped = mapRefreshOutcome(await refreshActiveLogin(deps, { ...input, creds: refreshCreds, forceRecord }));
-  return 'working' in mapped ? fetchUsageRecord(deps, input, mapped.working) : mapped;
+  const outcome = await refreshActiveLogin(deps, { ...input, creds: refreshCreds, forceRecord });
+  const mapped = mapRefreshOutcome(outcome);
+  if (!('working' in mapped)) return mapped;
+  // A fresh live adoption may retain the access generation just rejected by
+  // the server. Do not make a second GET with that rejected generation.
+  if (outcome.outcome === 'adopted' && forceRecord !== undefined
+    && accessTokenFingerprint(mapped.working) === accessTokenFingerprint(input.creds)) {
+    return forceRecord;
+  }
+  return fetchUsageRecord(deps, input, mapped.working);
 }
 
 /**
@@ -521,7 +535,8 @@ export async function refreshActiveLogin(
   if (input.degraded) return finish({ outcome: 'deferred', deferReason: 'degraded-read' });
 
   const earlyVerdict = deps.verdicts.get(input.accountId, input.email, credentialLineage(input.creds) ?? '');
-  if (!preLockAttribution({ creds: input.creds, slotFp: earlySlot?.fingerprint ?? null, slotPrevFp: earlySlot?.prevFingerprint ?? null, verdict: earlyVerdict })
+  if (input.forceRecord === undefined
+    && !preLockAttribution({ creds: input.creds, slotFp: earlySlot?.fingerprint ?? null, slotPrevFp: earlySlot?.prevFingerprint ?? null, verdict: earlyVerdict })
     && !slotUsable(input.creds)) {
     if (deps.verdicts.warnOnce(input.accountId, input.email, 'unattributable')) warn(deps, 'Claude refresh deferred: credential is unattributable');
     return finish({ outcome: 'deferred', deferReason: 'unattributable' });
@@ -568,11 +583,16 @@ export async function refreshActiveLogin(
       let slotPrevFp = row?.prevFingerprint ?? null;
       const liveFp = credentialLineage(live);
       const memo = liveFp ? deps.verdicts.get(input.accountId, input.email, liveFp) : undefined;
-      // A forced 401 cannot adopt and re-serve an access generation already
-      // rejected by the server, even if only other bytes changed while queued.
+      // A forced 401 binds to live only when its complete lineage is unchanged.
+      // A differing or partial live blob must take the ordinary locked adopt,
+      // defer, or foreign-refusal path rather than laundering it as the input.
       const decisionCreds = input.forceRecord !== undefined && live
-        && accessTokenFingerprint(live) === accessTokenFingerprint(input.creds)
+        && hasUsablePair(live)
+        && credentialLineage(live) === credentialLineage(input.creds)
         ? live : input.creds;
+      if (input.forceRecord !== undefined && memo?.match === false) {
+        return finish({ outcome: 'failed', reason: 'foreign-credential' });
+      }
       const adopted = adoptRotatedLive({ creds: decisionCreds, live, slotFp, slotPrevFp, verdict: memo, now: deps.now() });
       if (adopted.kind === 'foreign') return finish({ outcome: 'failed', reason: 'foreign-credential' });
       if (adopted.kind === 'adopt') {
