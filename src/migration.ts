@@ -120,6 +120,7 @@ import { dirname, join, resolve, sep } from 'node:path';
 import { config } from './config';
 import type { KeychainBackend } from './keychain';
 import { openRouterMissingKeyMessage, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, readNativeOpenRouterKey } from './keychain';
+import { removePiAuthBackup } from './pi-auth-backup';
 import { parseGrant } from './refresh-lease';
 import { hasLegacyPiOwnerEntry, readPiOwnerProviders, withPiAuthLock, writePiOwnerEntry } from './pi-migrate';
 import { OPENROUTER_GATE_KEYCHAIN_SERVICE } from './token/openrouter';
@@ -1448,9 +1449,13 @@ export class Migration {
   }
 
   private preCommitRollback(): MigrationStatus {
+    // Resolve (and validate) the journaled auth key before any cleanup, so a
+    // conflicting key refuses with every staged artifact still in place.
+    const authKey = this.kind === 'single-grant' ? this.singleGrantAuthKey() : undefined;
     const owner = this.readOwnerPayload();
     this.deleteStagedKeychain(owner?.accounts);
     unlinkIfExists(this.stagingPath());
+    if (authKey !== undefined) removePiAuthBackup(this.poolFilePath, authKey);
     this.journal('NATIVE', { intent: undefined, rolledBackAt: Date.now(), rolledBackFrom: 'pre-commit' });
     return this.status();
   }
