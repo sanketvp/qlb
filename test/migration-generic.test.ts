@@ -23,6 +23,7 @@ import {
   type StagedAccount,
 } from '../src/migration';
 import { parseGrant } from '../src/refresh-lease';
+import { piAuthBackupPath, writePiAuthBackup } from '../src/pi-auth-backup';
 import { openStore } from '../src/store';
 
 /**
@@ -329,6 +330,21 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
         xai?: { access?: string };
       };
       assert.equal(parsed.xai?.access, FAKE_GRANTS.xai.access);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('T-PRE pre-commit rollback removes a leftover backup', () => {
+    const h = setup('xai');
+    try {
+      h.mig.stage();
+      writePiAuthBackup(h.authPath, 'xai', 'crashed-before-owner');
+      assert.equal(existsSync(piAuthBackupPath(h.authPath, 'xai')), true, 'fixture backup exists');
+
+      h.mig.rollback();
+
+      assert.equal(existsSync(piAuthBackupPath(h.authPath, 'xai')), false);
     } finally {
       h.cleanup();
     }

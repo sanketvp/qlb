@@ -120,6 +120,7 @@ import { dirname, join, resolve, sep } from 'node:path';
 import { config } from './config';
 import type { KeychainBackend } from './keychain';
 import { openRouterMissingKeyMessage, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, readNativeOpenRouterKey } from './keychain';
+import { removePiAuthBackup } from './pi-auth-backup';
 import { parseGrant } from './refresh-lease';
 import { hasLegacyPiOwnerEntry, readPiOwnerProviders, withPiAuthLock, writePiOwnerEntry } from './pi-migrate';
 import { OPENROUTER_GATE_KEYCHAIN_SERVICE } from './token/openrouter';
@@ -1451,6 +1452,7 @@ export class Migration {
     const owner = this.readOwnerPayload();
     this.deleteStagedKeychain(owner?.accounts);
     unlinkIfExists(this.stagingPath());
+    if (this.kind === 'single-grant') removePiAuthBackup(this.poolFilePath, this.singleGrantAuthKey());
     this.journal('NATIVE', { intent: undefined, rolledBackAt: Date.now(), rolledBackFrom: 'pre-commit' });
     return this.status();
   }
