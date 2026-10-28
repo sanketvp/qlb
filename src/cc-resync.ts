@@ -356,12 +356,6 @@ function slotUsable(credential: string | null): boolean {
   return credential !== null && hasUsablePair(credential);
 }
 
-/**
- * Refresh the one active Claude credential under the complete consume/switch/
- * Claude-Code lock hierarchy. No caller is allowed to reuse an unlocked slot
- * read: every provenance, restore, and strike decision below starts with the
- * fresh slot read performed inside those locks.
- */
 export interface ActiveUsageResponse {
   status: number;
   body: string;
@@ -412,6 +406,9 @@ async function fetchUsageRecord(
   } catch {
     return { error: 'usage-unreadable' };
   }
+  if (deps.verdicts.get(input.accountId, input.email, credentialLineage(creds) ?? '')?.match === false) {
+    return { sentinel: 'foreign-credential' };
+  }
   if (!input.degraded) {
     try {
       await deps.afterAcceptedUsage?.({
@@ -426,17 +423,9 @@ async function fetchUsageRecord(
       warn(deps, 'Claude active usage resync failed');
     }
   }
-  if (deps.verdicts.get(input.accountId, input.email, credentialLineage(creds) ?? '')?.match === false) {
-    return { sentinel: 'foreign-credential' };
-  }
   return { usage };
 }
 
-/**
- * Fetch usage for the active Claude login.  The only recovery POST is delegated
- * to refreshActiveLogin; this wrapper keeps usage I/O outside every credential
- * lock and translates every closed RefreshOutcome into collector-safe data.
- */
 export type RefreshOutcomeMapping = ActiveFetchRecord | { working: string };
 
 /** Map the closed refresh result union without ever exposing an unsafe successor. */
@@ -472,6 +461,11 @@ export function mapRefreshOutcome(outcome: RefreshOutcome): RefreshOutcomeMappin
   }
 }
 
+/**
+ * Fetch usage for the active Claude login. The only recovery POST is delegated
+ * to refreshActiveLogin; this wrapper keeps usage I/O outside every credential
+ * lock and translates every closed RefreshOutcome into collector-safe data.
+ */
 export async function fetchActiveUsage(
   deps: FetchActiveUsageDeps,
   input: FetchActiveUsageInput,
@@ -484,6 +478,7 @@ export async function fetchActiveUsage(
   if (!accessToken) return { sentinel: 'no-credentials' };
 
   let forceRecord: ActiveFetchRecord | undefined;
+  let refreshCreds = input.creds;
   if (!isOAuthTokenExpired(oauthExpiry(input.creds), deps.now())) {
     const initial = await fetchUsageRecord(deps, input, input.creds);
     if (initial.error !== 'http-401') return initial;
@@ -492,17 +487,27 @@ export async function fetchActiveUsage(
     // consume a grant based on the rejected snapshot in that case.
     try {
       const live = await readLiveClaudeCredentials({ ...deps.live, env: deps.live.env ?? deps.env });
-      if (accessTokenFingerprint(live ?? '') !== accessTokenFingerprint(input.creds)) return initial;
+      if (!live || accessTokenFingerprint(live) !== accessTokenFingerprint(input.creds)) return initial;
+      // Bind forced recovery to the live snapshot whose access token was just
+      // rejected. A later locked read may still adopt a genuine rotation, but
+      // a shared-field or refresh-token-only rewrite cannot re-serve this 401.
+      refreshCreds = live;
     } catch {
       return initial;
     }
     forceRecord = initial;
   }
 
-  const mapped = mapRefreshOutcome(await refreshActiveLogin(deps, { ...input, forceRecord }));
+  const mapped = mapRefreshOutcome(await refreshActiveLogin(deps, { ...input, creds: refreshCreds, forceRecord }));
   return 'working' in mapped ? fetchUsageRecord(deps, input, mapped.working) : mapped;
 }
 
+/**
+ * Refresh the one active Claude credential under the complete consume/switch/
+ * Claude-Code lock hierarchy. No caller is allowed to reuse an unlocked slot
+ * read: every provenance, restore, and strike decision below starts with the
+ * fresh slot read performed inside those locks.
+ */
 export async function refreshActiveLogin(
   deps: RefreshActiveLoginDeps,
   input: RefreshActiveLoginInput,
@@ -563,7 +568,12 @@ export async function refreshActiveLogin(
       let slotPrevFp = row?.prevFingerprint ?? null;
       const liveFp = credentialLineage(live);
       const memo = liveFp ? deps.verdicts.get(input.accountId, input.email, liveFp) : undefined;
-      const adopted = adoptRotatedLive({ creds: input.creds, live, slotFp, slotPrevFp, verdict: memo, now: deps.now() });
+      // A forced 401 cannot adopt and re-serve an access generation already
+      // rejected by the server, even if only other bytes changed while queued.
+      const decisionCreds = input.forceRecord !== undefined && live
+        && accessTokenFingerprint(live) === accessTokenFingerprint(input.creds)
+        ? live : input.creds;
+      const adopted = adoptRotatedLive({ creds: decisionCreds, live, slotFp, slotPrevFp, verdict: memo, now: deps.now() });
       if (adopted.kind === 'foreign') return finish({ outcome: 'failed', reason: 'foreign-credential' });
       if (adopted.kind === 'adopt') {
         if (adopted.writeSlot) {
@@ -577,7 +587,7 @@ export async function refreshActiveLogin(
         const fp = credentialLineage(live);
         const attributed = Boolean(fp && (deps.verdicts.matches(input.accountId, input.email, fp)
           || (slotFp !== null && isSuccessor(deps.store, 'anthropic', input.accountId, slotFp, fp))));
-        return chooseRefreshInput({ creds: input.creds, live, backup: backup.credential, backupUsable: slotUsable(backup.credential), slotFp, attributed, forceRefresh: input.forceRecord !== undefined, now: deps.now() });
+        return chooseRefreshInput({ creds: decisionCreds, live, backup: backup.credential, backupUsable: slotUsable(backup.credential), slotFp, attributed, forceRefresh: input.forceRecord !== undefined, now: deps.now() });
       };
       const publish = async (working: string, mergeLive: boolean): Promise<void> => {
         const shared = mergeLive ? sharedCredentialFields(live) : null;

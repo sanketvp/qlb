@@ -277,6 +277,49 @@ describe('Claude active usage fetch (K6-4)', () => {
     assert.ok(result.usage);
   });
 
+  it('a 401 with unchanged access but changed shared fields forces exactly one POST', async () => {
+    const fixture = await refreshFixture();
+    const fresh = credential('slot', NOW + 60 * 60_000);
+    const live = JSON.stringify({
+      claudeAiOauth: { accessToken: 'access-slot', refreshToken: 'refresh-slot', expiresAt: NOW + 60 * 60_000 },
+      mcpOAuth: { machine: true },
+    });
+    await fixture.slots.writeSlot('account-a', fresh, { cause: 'post', by: 'qlb-cli', evidence: 'post' });
+    await fixture.backend.set(fixture.liveOptions.paths.keychainService, 'fixture-user', live);
+    let posts = 0;
+    const tokens: string[] = [];
+    const result = await fetch(fixture, async (token) => {
+      tokens.push(token);
+      return tokens.length === 1 ? { status: 401, body: '' } : { status: 200, body: usageBody() };
+    }, { postRefresh: async () => {
+      posts += 1;
+      return { status: 200, body: JSON.stringify({ access_token: 'access-rotated', refresh_token: 'refresh-rotated', expires_in: 3600 }) };
+    } }, { creds: fresh });
+    assert.equal(posts, 1);
+    assert.deepEqual(tokens, ['access-slot', 'access-rotated']);
+    assert.ok(result.usage);
+  });
+
+  it('a 401 with unchanged access but a rotated refresh token forces exactly one POST', async () => {
+    const fixture = await refreshFixture();
+    const fresh = credential('slot', NOW + 60 * 60_000);
+    const live = credential('refresh-rotated', NOW + 60 * 60_000).replace('access-refresh-rotated', 'access-slot');
+    await fixture.slots.writeSlot('account-a', fresh, { cause: 'post', by: 'qlb-cli', evidence: 'post' });
+    await fixture.backend.set(fixture.liveOptions.paths.keychainService, 'fixture-user', live);
+    let posts = 0;
+    const tokens: string[] = [];
+    const result = await fetch(fixture, async (token) => {
+      tokens.push(token);
+      return tokens.length === 1 ? { status: 401, body: '' } : { status: 200, body: usageBody() };
+    }, { postRefresh: async () => {
+      posts += 1;
+      return { status: 200, body: JSON.stringify({ access_token: 'access-rotated', refresh_token: 'refresh-successor', expires_in: 3600 }) };
+    } }, { creds: fresh });
+    assert.equal(posts, 1);
+    assert.deepEqual(tokens, ['access-slot', 'access-rotated']);
+    assert.ok(result.usage);
+  });
+
   it('a 401 with a changed access token POSTs nothing and surfaces the 401 record', async () => {
     const fixture = await refreshFixture();
     const fresh = credential('slot', NOW + 60 * 60_000);
@@ -308,10 +351,16 @@ describe('Claude active usage fetch (K6-4)', () => {
   it('a live write failure after a 2xx yields token-expired and no usage GET', async () => {
     const fixture = await refreshFixture();
     let gets = 0;
+    let posts = 0;
     const result = await fetch(fixture, async () => { gets += 1; return { status: 200, body: usageBody() }; }, {
+      postRefresh: async () => {
+        posts += 1;
+        return { status: 200, body: JSON.stringify({ access_token: 'access-issued', refresh_token: 'refresh-issued', expires_in: 3600 }) };
+      },
       withConfigLock: async () => { throw new Error('fixture live failure'); },
     });
     assert.deepEqual(result, { sentinel: 'token-expired' });
+    assert.equal(posts, 1);
     assert.equal(gets, 0);
   });
 
@@ -331,12 +380,16 @@ describe('Claude active usage fetch (K6-4)', () => {
     assert.deepEqual(result, { sentinel: 'no-credentials' });
   });
 
-  it('a known-foreign served lineage returns foreign-credential and records no usage', async () => {
+  it('a known-foreign served lineage returns foreign-credential without calling the resync hook', async () => {
     const fixture = await refreshFixture();
     const foreign = credential('foreign', NOW + 60 * 60_000);
     fixture.deps.verdicts.set('account-a', 'a@example.test', credentialLineage(foreign)!, { match: false, source: 'oracle' });
-    const result = await fetch(fixture, async () => ({ status: 200, body: usageBody() }), {}, { creds: foreign });
+    let hooks = 0;
+    const result = await fetch(fixture, async () => ({ status: 200, body: usageBody() }), {
+      afterAcceptedUsage: async () => { hooks += 1; },
+    }, { creds: foreign });
     assert.deepEqual(result, { sentinel: 'foreign-credential' });
+    assert.equal(hooks, 0);
   });
 
   it('the relogin sentinel surfaces in the same pass as the invalid_grant', async () => {
@@ -364,9 +417,31 @@ describe('Claude active usage fetch (K6-4)', () => {
     assert.deepEqual(used, ['access-rotated']);
   });
 
-  it('a stashed or unpersisted successor yields token-expired and no usage GET', () => {
-    assert.deepEqual(mapRefreshOutcome({ outcome: 'stashed', working: credential('stashed') }), { sentinel: 'token-expired' });
-    assert.deepEqual(mapRefreshOutcome({ outcome: 'unpersisted', working: credential('lost'), successorFailure: 'unable to persist refresh successor' }), { sentinel: 'token-expired', unpersisted: true });
+  it('a stashed or unpersisted successor yields token-expired and no usage GET', async () => {
+    for (const [stashFails, expected] of [
+      [false, { sentinel: 'token-expired' }],
+      [true, { sentinel: 'token-expired', unpersisted: true }],
+    ] as const) {
+      const fixture = await refreshFixture();
+      const slots = fixture.slots as unknown as {
+        writeSlot: typeof fixture.slots.writeSlot;
+        stashUnclaimed: typeof fixture.slots.stashUnclaimed;
+      };
+      slots.writeSlot = async () => { throw new Error('fixture slot failure'); };
+      if (stashFails) slots.stashUnclaimed = async () => { throw new Error('fixture stash failure'); };
+      let gets = 0;
+      let posts = 0;
+      const result = await fetch(fixture, async () => { gets += 1; return { status: 200, body: usageBody() }; }, {
+        postRefresh: async () => {
+          posts += 1;
+          return { status: 200, body: JSON.stringify({ access_token: 'access-issued', refresh_token: 'refresh-issued', expires_in: 3600 }) };
+        },
+        withConfigLock: async () => { throw new Error('fixture live failure'); },
+      });
+      assert.deepEqual(result, expected);
+      assert.equal(posts, 1);
+      assert.equal(gets, 0);
+    }
   });
 
   it('an expired active credential is no longer statically gated', async () => {
@@ -440,6 +515,8 @@ describe('Claude active usage fetch (K6-4)', () => {
       [{ outcome: 'failed', reason: 'foreign-credential' }, { sentinel: 'foreign-credential' }],
       [{ outcome: 'dead', reason: 'invalid_grant', struckFp: null }, { sentinel: 'relogin-needed', error: 'invalid_grant' }],
       [{ outcome: 'deferred', deferReason: 'degraded-read' }, { sentinel: 'keychain-unavailable' }],
+      [{ outcome: 'deferred', deferReason: 'degraded-read', forceRecord: { error: 'http-401' } }, { error: 'http-401' }],
+      [{ outcome: 'deferred', deferReason: 'locks-held' }, { sentinel: 'token-expired' }],
       [{ outcome: 'deferred', deferReason: 'unexpected', forceRecord: { error: 'http-401' } }, { error: 'http-401' }],
       [{ outcome: 'refused', reason: 'store-unmirrored' }, { error: 'store-unmirrored' }],
     ];
