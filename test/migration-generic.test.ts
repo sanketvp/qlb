@@ -514,6 +514,28 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       const rolled = mig.rollback();
       assert.ok(states.includes('QLB_OWNED'), 'the Oc claim with own evidence is finished forward');
       assert.equal(rolled.detail.rolledBackFrom, 'post-commit');
+      assert.equal(existsSync(customPath), false, 'the hand-back removes the custom owner file');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('resume after a crash between the C5 forward finish and the rollback intent keeps an Oc claim owned', async () => {
+    const h = setup('xai');
+    try {
+      const customPath = join(h.dir, 'custom-owner.json');
+      const mig = createSingleGrantMigration(h.store, h.kc, 'xai', h.authPath, customPath);
+      mig.stage();
+      await mig.rehearse(mockRehearse([]));
+      const detail = JSON.parse(h.store.getMigration('pi-xai')!.detail_json) as Record<string, unknown>;
+      rmSync(stagingOwnerPath(join(h.dir, 'qlb-owner.json'), 'xai'), { force: true });
+      writeFileSync(customPath, JSON.stringify({ owner: 'qlb', accounts: [{ provider: 'xai' }] }) + '\n');
+      // State right after C5's finishHygiene, before postCommitRollback journals its intent.
+      h.store.upsertMigration('pi-xai', 'QLB_OWNED', JSON.stringify({ ...detail, committedAt: Date.now() }));
+
+      const resumed = mig.resume();
+      assert.equal(resumed.state, 'QLB_OWNED', 'resume must not report a hand-back while the Oc claim remains');
+      assert.equal(existsSync(customPath), true);
     } finally {
       h.cleanup();
     }

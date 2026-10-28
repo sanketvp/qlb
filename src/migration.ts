@@ -793,21 +793,24 @@ export class Migration {
     );
   }
 
+  /** Design §2 S0 `Claim` = `O` ∨ `L` ∨ `Oc` (a custom `--owner-file` v1 document naming this provider). */
+  private claimPresent(): boolean {
+    if (this.ownerEntryPresent()) return true;
+    if (this.kind === 'pool' || this.legacySidecarPath() === this.ownerFilePath) return false;
+    try {
+      return hasLegacyPiOwnerEntry(this.ownerFilePath, this.ownerProvider());
+    } catch {
+      return false;
+    }
+  }
+
   /** Design §2 S0 facts `Gen`, `Rb` and `Hb`, read from this path's own durable evidence. */
   private ownershipFacts(): { committed: boolean; rollbackInProgress: boolean; handbackPending: boolean } {
     const row = this.store.getMigration(this.storeName);
     const state = asState(row?.state);
     const detail = parseDetail(row?.detail_json);
     const legacySidecar = this.legacySidecarOwned();
-    const customOwner = this.legacySidecarPath() !== this.ownerFilePath
-      && (() => {
-        try {
-          return hasLegacyPiOwnerEntry(this.ownerFilePath, this.ownerProvider());
-        } catch {
-          return false;
-        }
-      })();
-    const claim = this.ownerEntryPresent() || customOwner;
+    const claim = this.claimPresent();
     const commitGenerationSet = Object.prototype.hasOwnProperty.call(detail, 'commitGeneration');
     return {
       committed: state === 'QLB_OWNED'
@@ -1261,12 +1264,12 @@ export class Migration {
     if (intent) {
       return this.continueRollback();
     }
-    if (this.ownerEntryPresent()) {
+    // Any claim, including a custom owner file (Oc), is past C: finish forward.
+    if (this.claimPresent()) {
       return this.finishHygiene();
     }
     if (
       current.state === 'QLB_OWNED' &&
-      !this.ownerEntryPresent() &&
       (this.kind === 'static-key' || existsSync(this.poolFilePath))
     ) {
       return this.finishRollbackJournal();
