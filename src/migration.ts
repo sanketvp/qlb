@@ -1681,8 +1681,11 @@ export class Migration {
       const { service, account } = keychainCoords(meta.provider, meta.id, meta.label);
       try {
         this.keychain.deleteSync(service, account);
-      } catch {
-        // already gone — rollback is idempotent
+      } catch (error) {
+        if (isCredentialNotFound(error)) continue;
+        throw new Error(
+          `migration rollback failed to delete staged Keychain credential for provider=${meta.provider} account=${meta.label}`,
+        );
       }
     }
   }
