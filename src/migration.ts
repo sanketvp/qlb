@@ -800,7 +800,9 @@ export class Migration {
     try {
       return hasLegacyPiOwnerEntry(this.ownerFilePath, this.ownerProvider());
     } catch {
-      return false;
+      // A custom owner file that cannot be read is still a durable claim.
+      // C6 must fail closed rather than treating it as absent and deleting it.
+      return existsSync(this.ownerFilePath);
     }
   }
 
@@ -820,6 +822,16 @@ export class Migration {
         || Object.prototype.hasOwnProperty.call(detail, 'rollbackDecision'),
       handbackPending: isObjectRecord(detail.handback) && detail.handback.phase === 'cleanup-pending',
     };
+  }
+
+  /** C6: a claim without this path's durable evidence must never be cleaned up. */
+  private assertNoOrphanOwnershipClaim(): void {
+    const facts = this.ownershipFacts();
+    if (!this.claimPresent() || facts.committed || facts.rollbackInProgress || facts.handbackPending) return;
+    throw Object.assign(
+      new Error('owner-file-orphan: remove the owner file before retrying'),
+      { exitCode: 3 },
+    );
   }
 
   private ownerProvider(): MigrateProvider {
@@ -1045,6 +1057,7 @@ export class Migration {
     }
 
     this.assertNotP7aOwned();
+    this.assertNoOrphanOwnershipClaim();
     // P7b8 alone may convert the pool's v1 owner document into the shared
     // v2 map. Refuse before creating staging, Keychain, or journal state.
     this.refusePoolOwnerMap();
@@ -1159,6 +1172,7 @@ export class Migration {
 
   private commitUnlocked(): MigrationStatus {
     this.assertNotP7aOwned();
+    this.assertNoOrphanOwnershipClaim();
     // P7b8 alone may convert the pool's v1 owner document into the shared
     // v2 map. Refuse before any journal or native-pool write.
     this.refusePoolOwnerMap();
@@ -1226,7 +1240,6 @@ export class Migration {
 
   private rollbackUnlocked(): MigrationStatus {
     this.assertNotP7aOwned();
-    const ownerPresent = this.claimPresent();
     // C5: a VALIDATED journal with this path's own commit evidence (`Gen`) is
     // a crash after the commit point. Finish the forward journal transition,
     // then take the ordinary post-commit hand-back path. C4 comes first: a
@@ -1235,6 +1248,8 @@ export class Migration {
       const facts = this.ownershipFacts();
       if (facts.committed && !facts.rollbackInProgress) this.finishHygiene();
     }
+    this.assertNoOrphanOwnershipClaim();
+    const ownerPresent = this.claimPresent();
     if (ownerPresent || this.journalState() === 'QLB_OWNED') {
       return this.postCommitRollback();
     }
@@ -1264,6 +1279,7 @@ export class Migration {
     if (intent) {
       return this.continueRollback();
     }
+    this.assertNoOrphanOwnershipClaim();
     // Any claim, including a custom owner file (Oc), is past C: finish forward.
     if (this.claimPresent()) {
       return this.finishHygiene();
@@ -1350,6 +1366,7 @@ export class Migration {
     // Keep the P7a ownership classifier here so it is adjacent to the
     // single-grant's first durable write (the MIRRORED journal).
     this.assertNotP7aOwned();
+    this.assertNoOrphanOwnershipClaim();
     const current = this.status();
     if (current.ownerFile === 'present' || current.state === 'QLB_OWNED' || current.state === 'RETIRED') {
       throw new Error(

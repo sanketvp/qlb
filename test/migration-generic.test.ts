@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { describe, it } from 'node:test';
@@ -486,6 +486,62 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
         assert.equal(rolled.detail.rolledBackFrom, 'post-commit');
       } finally {
         h.cleanup();
+      }
+    }
+  });
+
+  it('T-S0b every command refuses an orphan O, L, Oc, or unreadable Oc claim without changing durable state', () => {
+    for (const claim of ['O', 'L', 'Oc', 'unreadable-Oc'] as const) {
+      for (const command of ['stage', 'commit', 'rollback', 'resume'] as const) {
+        const h = setup('xai');
+        try {
+          const customPath = join(h.dir, 'custom-owner.json');
+          const migration = claim === 'O' || claim === 'L'
+            ? h.mig
+            : createSingleGrantMigration(h.store, h.kc, 'xai', h.authPath, customPath);
+          const ownerPath = claim === 'O' ? join(h.dir, 'qlb-owner.json')
+            : claim === 'L' ? h.ownerPath
+              : customPath;
+          const ownerBytes = claim === 'O'
+            ? JSON.stringify({ providers: { xai: { mode: 'qlb' } } }) + '\n'
+            : JSON.stringify({ owner: 'qlb', accounts: [{ provider: 'xai' }] }) + '\n';
+          writeFileSync(ownerPath, ownerBytes);
+          if (claim === 'unreadable-Oc') chmodSync(ownerPath, 0o000);
+
+          const service = qlbKeychainService('xai', expectedId('xai'));
+          const keychainBytes = JSON.stringify({ preserved: `${claim}-${command}` });
+          h.kc.setSync(service, expectedLabel('xai'), keychainBytes);
+          const journalBefore = h.store.getMigration('pi-xai');
+
+          assert.throws(
+            () => migration[command](),
+            (error: Error & { exitCode?: unknown }) => {
+              assert.match(error.message, /owner-file-orphan/);
+              assert.equal(error.exitCode, 3);
+              return true;
+            },
+            `${claim}/${command} is refused`,
+          );
+
+          assert.equal(
+            h.kc.getSync(service, expectedLabel('xai')),
+            keychainBytes,
+            `${claim}/${command} leaves the Keychain bytes unchanged`,
+          );
+          if (claim === 'unreadable-Oc') chmodSync(ownerPath, 0o600);
+          assert.deepEqual(
+            readFileSync(ownerPath),
+            Buffer.from(ownerBytes),
+            `${claim}/${command} leaves the owner file bytes unchanged`,
+          );
+          assert.deepEqual(
+            h.store.getMigration('pi-xai'),
+            journalBefore,
+            `${claim}/${command} leaves the journal unchanged`,
+          );
+        } finally {
+          h.cleanup();
+        }
       }
     }
   });
@@ -1061,13 +1117,20 @@ describe('static-key migration — openrouter (single API key, no OAuth)', () =>
     }
   });
 
-  it('stage refuses while a legacy sidecar claims the provider', () => {
+  it('stage refuses an orphan legacy sidecar claim for the provider', () => {
     const h = setupOpenRouter();
     try {
       const legacyPath = join(h.dir, 'qlb-owner-openrouter.json');
       writeFileSync(legacyPath, JSON.stringify({ owner: 'qlb', accounts: [{ provider: 'openrouter' }] }) + '\n');
 
-      assert.throws(() => h.mig.stage(), /migration already/);
+      assert.throws(
+        () => h.mig.stage(),
+        (error: Error & { exitCode?: unknown }) => {
+          assert.match(error.message, /owner-file-orphan/);
+          assert.equal(error.exitCode, 3);
+          return true;
+        },
+      );
       assert.equal(openrouterKeychainHas(h.kc), false);
     } finally {
       h.cleanup();
