@@ -277,6 +277,20 @@ describe('Anthropic Pi gate refresh mapping (K6-7)', () => {
     f.store.close();
   });
 
+  it('refuses when the active login changes while the refresh waits for locks', async () => {
+    const f = await fixture(NOW - 1);
+    const result = await run(f, undefined, {
+      refresh: async () => {
+        f.store.setActiveLogin('anthropic', 'account-b', 'fixture');
+        return { outcome: 'posted', working: credential('issued', NOW + 60 * 60_000) };
+      },
+    });
+    assert.equal(result.code, 3);
+    assert.deepEqual(result.stdout, []);
+    assert.deepEqual(result.stderr, ['active-login-stale']);
+    f.store.close();
+  });
+
   it('an identity change between the live read and the re-read refuses with exit 3', async () => {
     const f = await fixture();
     let reads = 0;

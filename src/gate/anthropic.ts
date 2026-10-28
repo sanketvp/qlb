@@ -207,6 +207,8 @@ export function createAnthropicGate(deps: AnthropicGateDeps = {}, initialContext
           creds: live,
           degraded: false,
         });
+        const activeAfterRefresh = configured.store.getActiveLogin('anthropic');
+        if (activeAfterRefresh?.accountId !== active.accountId) throw new GateRefused('active-login-stale');
         return mapRefreshOutcome(outcome, active.accountId, deps.autoLog ?? context.autoLog, now);
       } finally {
         configured.close();
