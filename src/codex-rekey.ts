@@ -1,6 +1,8 @@
 import type { DatabaseSync } from 'node:sqlite';
 
 import { inspectAccountSafety } from './accounts-prune';
+import { observationConfigKey } from './candidates';
+import { failoverConfigKey } from './overrides';
 import { refreshLeaseName } from './store';
 
 export type CodexRekeyReason =
@@ -45,7 +47,7 @@ export interface ApplyCodexRekeyOptions {
 
 type RekeyAuditEntry = {
   to: string;
-  kind: 'rename' | 'orphan';
+  kind: CodexRekeyMove['kind'];
   at: number;
 };
 
@@ -272,7 +274,9 @@ export function applyCodexRekey(
   const updateLeases = db.prepare('UPDATE leases SET name = ? WHERE name = ?');
   const renameAccount = db.prepare('UPDATE accounts SET id = ? WHERE id = ?');
   const updateFailover = db.prepare(`UPDATE config SET value = ?
-    WHERE key = 'failover:openai-codex' AND value = ?`);
+    WHERE key = ? AND value = ?`);
+  const failoverKey = failoverConfigKey('openai-codex');
+  const observationKey = observationConfigKey('openai-codex');
 
   for (const move of plan.moves) {
     updateSnapshots.run(move.to, move.from);
@@ -282,15 +286,15 @@ export function applyCodexRekey(
     updateLeases.run(refreshLeaseName(move.to), refreshLeaseName(move.from));
     if (move.kind === 'rename') renameAccount.run(move.to, move.from);
     if (move.kind === 'orphan') ensureCodexSlotAccount(db, move.to, options.now);
-    updateFailover.run(move.to, move.from);
+    updateFailover.run(move.to, failoverKey, move.from);
     audit[move.from] = {
       to: move.to,
-      kind: move.kind === 'orphan' ? 'orphan' : 'rename',
+      kind: move.kind,
       at: options.now,
     };
   }
 
-  db.prepare("DELETE FROM config WHERE key = 'observed:openai-codex'").run();
+  db.prepare('DELETE FROM config WHERE key = ?').run(observationKey);
   db.prepare(`INSERT INTO config (key, value) VALUES (?, ?)
     ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run('codex.rekey.v1', JSON.stringify(audit));
 }

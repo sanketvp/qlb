@@ -5,8 +5,10 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { describe, it } from 'node:test';
 
+import { observationConfigKey } from '../src/candidates';
 import { applyCodexRekey, ensureCodexSlotAccount, planCodexRekey } from '../src/codex-rekey';
 import { platformKeychain, type KeychainBackend } from '../src/keychain';
+import { failoverConfigKey } from '../src/overrides';
 import { openStore, refreshLeaseName } from '../src/store';
 
 function fixture(): { db: DatabaseSync; close: () => void } {
@@ -69,6 +71,18 @@ function applyPlan(db: DatabaseSync, now = 100): void {
 
 function configs(db: DatabaseSync): Array<{ key: string; value: string | null }> {
   return db.prepare('SELECT key, value FROM config ORDER BY key').all() as Array<{ key: string; value: string | null }>;
+}
+
+function rekeyState(db: DatabaseSync): unknown[] {
+  return [
+    db.prepare('SELECT * FROM accounts ORDER BY id').all(),
+    db.prepare('SELECT * FROM snapshots ORDER BY account_id, bucket').all(),
+    db.prepare('SELECT * FROM overrides ORDER BY account_id, kind, session').all(),
+    db.prepare('SELECT * FROM poll_claims ORDER BY account_id').all(),
+    db.prepare('SELECT * FROM usage_polls ORDER BY provider, account_id').all(),
+    db.prepare('SELECT * FROM leases ORDER BY name').all(),
+    configs(db),
+  ];
 }
 
 describe('Codex rekey planner', () => {
@@ -365,6 +379,8 @@ describe('Codex rekey apply', () => {
     try {
       slot(f.db, 'user:bare', 'bare');
       account(f.db, 'bare', 'openai-codex');
+      f.db.prepare("UPDATE accounts SET label = 'original', status = 'disabled', created_at = 42 WHERE id = 'bare'").run();
+      const originalAccount = { ...f.db.prepare("SELECT id, provider, label, status, created_at FROM accounts WHERE id = 'bare'").get() as object };
       f.db.prepare("INSERT INTO snapshots (account_id, bucket, fetched_at) VALUES ('bare', 'primary', 1)").run();
       f.db.prepare("INSERT INTO overrides (kind, account_id, session, until) VALUES ('pin', 'bare', 'fixture', 2)").run();
       pollClaim(f.db, 'bare', 99);
@@ -375,6 +391,11 @@ describe('Codex rekey apply', () => {
         assert.equal(f.db.prepare(`SELECT 1 FROM ${table} WHERE ${key} = 'user:bare'`).get() !== undefined, true);
       }
       assert.equal(f.db.prepare('SELECT 1 FROM leases WHERE name = ?').get(refreshLeaseName('user:bare')) !== undefined, true);
+      assert.deepEqual({ ...f.db.prepare("SELECT id, provider, label, status, created_at FROM accounts WHERE id = 'user:bare'").get() as object }, {
+        ...originalAccount,
+        id: 'user:bare',
+      });
+      assert.equal(f.db.prepare("SELECT 1 FROM accounts WHERE id = 'bare'").get(), undefined);
       assert.deepEqual(JSON.parse((f.db.prepare("SELECT value FROM config WHERE key = 'codex.rekey.v1'").get() as { value: string }).value), {
         bare: { to: 'user:bare', kind: 'rename', at: 100 },
       });
@@ -403,6 +424,12 @@ describe('Codex rekey apply', () => {
       f.db.prepare("INSERT INTO overrides (kind, account_id, session, until) VALUES ('pin', 'bare-B', 'fixture', 2)").run();
       f.db.prepare("INSERT INTO usage_polls (provider, account_id, next_due_at) VALUES ('openai-codex', 'bare-B', 3)").run();
       applyPlan(f.db);
+      for (const table of ['snapshots', 'overrides', 'usage_polls']) {
+        assert.equal((f.db.prepare(`SELECT count(*) AS count FROM ${table} WHERE account_id = 'composite-B'`).get() as { count: number }).count, 1);
+        assert.equal((f.db.prepare(`SELECT count(*) AS count FROM ${table} WHERE account_id = 'bare-B'`).get() as { count: number }).count, 0);
+      }
+      assert.equal(f.db.prepare("SELECT 1 FROM accounts WHERE id = 'composite-A' AND provider = 'openai-codex'").get() !== undefined, true);
+      assert.equal(f.db.prepare("SELECT 1 FROM accounts WHERE id = 'bare-A'").get(), undefined);
       const before = [
         f.db.prepare('SELECT * FROM snapshots ORDER BY account_id, bucket').all(),
         f.db.prepare('SELECT * FROM overrides ORDER BY account_id, kind, session').all(),
@@ -420,7 +447,7 @@ describe('Codex rekey apply', () => {
 
   it('a skipped orphan (in-use, journal-named, provider-mismatch) creates no account row', () => {
     for (const setup of [
-      (db: DatabaseSync) => pollClaim(db, 'bare', 101),
+      (db: DatabaseSync) => db.prepare("UPDATE poll_claims SET until = 101 WHERE account_id = 'bare'").run(),
       (db: DatabaseSync) => journal(db, 'pi-pool', 'QLB_OWNED', JSON.stringify({ qlbAccountIds: ['bare'] })),
       (db: DatabaseSync) => account(db, 'user:bare', 'anthropic'),
     ]) {
@@ -428,9 +455,21 @@ describe('Codex rekey apply', () => {
       try {
         slot(f.db, 'user:bare', 'bare');
         f.db.prepare("INSERT INTO snapshots (account_id, bucket, fetched_at) VALUES ('bare', 'primary', 1)").run();
+        f.db.prepare("INSERT INTO overrides (kind, account_id, session, until) VALUES ('pin', 'bare', 'fixture', 2)").run();
+        pollClaim(f.db, 'bare', 99);
+        f.db.prepare("INSERT INTO usage_polls (provider, account_id, next_due_at) VALUES ('openai-codex', 'bare', 3)").run();
+        lease(f.db, 'bare', 99);
         setup(f.db);
+        const foreignTarget = JSON.stringify(f.db.prepare("SELECT * FROM accounts WHERE id = 'user:bare'").get());
         applyPlan(f.db);
         assert.equal(f.db.prepare("SELECT 1 FROM accounts WHERE id = 'user:bare' AND provider = 'openai-codex'").get(), undefined);
+        for (const table of ['snapshots', 'overrides', 'poll_claims', 'usage_polls']) {
+          assert.equal((f.db.prepare(`SELECT count(*) AS count FROM ${table} WHERE account_id = 'bare'`).get() as { count: number }).count, 1);
+          assert.equal((f.db.prepare(`SELECT count(*) AS count FROM ${table} WHERE account_id = 'user:bare'`).get() as { count: number }).count, 0);
+        }
+        assert.equal(f.db.prepare('SELECT 1 FROM leases WHERE name = ?').get(refreshLeaseName('bare')) !== undefined, true);
+        assert.equal(f.db.prepare('SELECT 1 FROM leases WHERE name = ?').get(refreshLeaseName('user:bare')), undefined);
+        assert.equal(JSON.stringify(f.db.prepare("SELECT * FROM accounts WHERE id = 'user:bare'").get()), foreignTarget);
       } finally { f.close(); }
     }
   });
@@ -466,22 +505,24 @@ describe('Codex rekey apply', () => {
     try {
       slot(f.db, 'user:bare', 'bare');
       account(f.db, 'bare', 'openai-codex');
-      f.db.prepare("INSERT INTO config (key, value) VALUES ('failover:openai-codex', 'bare')").run();
+      const key = failoverConfigKey('openai-codex');
+      f.db.prepare('INSERT INTO config (key, value) VALUES (?, ?)').run(key, 'bare');
       applyPlan(f.db);
-      assert.equal((f.db.prepare("SELECT value FROM config WHERE key = 'failover:openai-codex'").get() as { value: string }).value, 'user:bare');
+      assert.equal((f.db.prepare('SELECT value FROM config WHERE key = ?').get(key) as { value: string }).value, 'user:bare');
     } finally { f.close(); }
   });
 
   it('observed cache is reset only when something moved', () => {
     const f = fixture();
     try {
-      f.db.prepare("INSERT INTO config (key, value) VALUES ('observed:openai-codex', 'cached')").run();
+      const key = observationConfigKey('openai-codex');
+      f.db.prepare('INSERT INTO config (key, value) VALUES (?, ?)').run(key, 'cached');
       applyPlan(f.db);
-      assert.equal(f.db.prepare("SELECT 1 FROM config WHERE key = 'observed:openai-codex'").get() !== undefined, true);
+      assert.equal(f.db.prepare('SELECT 1 FROM config WHERE key = ?').get(key) !== undefined, true);
       slot(f.db, 'user:bare', 'bare');
       account(f.db, 'bare', 'openai-codex');
       applyPlan(f.db);
-      assert.equal(f.db.prepare("SELECT 1 FROM config WHERE key = 'observed:openai-codex'").get(), undefined);
+      assert.equal(f.db.prepare('SELECT 1 FROM config WHERE key = ?').get(key), undefined);
     } finally { f.close(); }
   });
 
@@ -491,10 +532,17 @@ describe('Codex rekey apply', () => {
       slot(f.db, 'user:bare', 'bare');
       account(f.db, 'bare', 'openai-codex');
       f.db.prepare("INSERT INTO snapshots (account_id, bucket, fetched_at) VALUES ('bare', 'primary', 1)").run();
+      f.db.prepare("INSERT INTO overrides (kind, account_id, session, until) VALUES ('pin', 'bare', 'fixture', 2)").run();
+      pollClaim(f.db, 'bare', 99);
+      f.db.prepare("INSERT INTO usage_polls (provider, account_id, next_due_at) VALUES ('openai-codex', 'bare', 3)").run();
+      lease(f.db, 'bare', 99);
+      const failoverKey = failoverConfigKey('openai-codex');
+      const observationKey = observationConfigKey('openai-codex');
+      f.db.prepare('INSERT INTO config (key, value) VALUES (?, ?), (?, ?)').run(failoverKey, 'bare', observationKey, 'cached');
       applyPlan(f.db);
-      const before = [f.db.prepare('SELECT * FROM snapshots ORDER BY account_id, bucket').all(), configs(f.db)];
+      const before = rekeyState(f.db);
       applyPlan(f.db);
-      assert.deepEqual([f.db.prepare('SELECT * FROM snapshots ORDER BY account_id, bucket').all(), configs(f.db)], before);
+      assert.deepEqual(rekeyState(f.db), before);
     } finally { f.close(); }
   });
 
