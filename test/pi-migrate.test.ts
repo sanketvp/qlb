@@ -62,7 +62,7 @@ function hasManaged(keychain: MockKeychain, provider: PiSingleProvider): boolean
   }
 }
 
-function writePiJournal(paths: PiMigratePaths, provider: PiSingleProvider, phase: 'started' | 'baseline' | 'credential-saved' | 'published' | 'committed'): void {
+function writePiJournal(paths: PiMigratePaths, provider: PiSingleProvider, phase: string): void {
   mkdirSync(paths.journalPath, { recursive: true, mode: 0o700 });
   writeFileSync(join(paths.journalPath, `pi-migrate-${provider}.json`), JSON.stringify({ provider, phase, ownerPid: process.pid, updatedAt: Date.now() }), { mode: 0o600 });
 }
@@ -232,6 +232,60 @@ describe('Pi migration S58 credential-first barrier', () => {
       assert.equal(migratePiSingleProvider('openrouter', openrouter.paths, deps).state, 'migrated');
       assert.equal(migratePiSingleProvider('openrouter', openrouter.paths, deps).state, 'migrated');
     } finally { openrouter.cleanup(); }
+  });
+
+  for (const provider of ['xai', 'openrouter'] as const) {
+    it(`${provider}: resumes a crash at the publishing and owner-entry boundaries`, () => {
+      for (const point of ['publishing', 'owner-entry'] as const) {
+        const h = setup();
+        try {
+          const deps = provider === 'openrouter'
+            ? { keychain: h.keychain, store: h.store, readNativeOpenRouterKey: () => 'fixture-openrouter-key' }
+            : { keychain: h.keychain, store: h.store };
+          assert.throws(() => migratePiSingleProvider(provider, h.paths, {
+            ...deps,
+            afterWrite: (written: string) => {
+              if (written === point) throw new Error('injected crash');
+            },
+          }), /injected crash/, point);
+          const journal = JSON.parse(readFileSync(join(h.paths.journalPath, `pi-migrate-${provider}.json`), 'utf8')) as { phase?: unknown };
+          assert.equal(journal.phase, 'publishing', `${point}: publish intent is durable`);
+          assert.equal(existsSync(h.paths.ownerPath), point === 'owner-entry', `${point}: owner entry publication boundary`);
+          assert.equal(migratePiSingleProvider(provider, h.paths, deps).state, 'migrated', point);
+          assert.equal(placeholderPresent(h.paths, provider), provider !== 'openrouter', point);
+        } finally { h.cleanup(); }
+      }
+    });
+  }
+
+  it('keeps the baseline byte-identical across an interrupted completed-migration re-run', () => {
+    const h = setup();
+    try {
+      assert.equal(migratePiSingleProvider('xai', h.paths, { keychain: h.keychain, store: h.store }).state, 'migrated');
+      const baseline = join(h.paths.baselineDir, 'xai.json'); const before = readFileSync(baseline);
+      assert.throws(() => migratePiSingleProvider('xai', h.paths, {
+        keychain: h.keychain,
+        store: h.store,
+        afterWrite: (point) => { if (point === 'before-committed') throw new Error('injected crash'); },
+      }), /injected crash/);
+      assert.equal(existsSync(join(h.paths.journalPath, 'pi-migrate-xai.json')), false, 'idempotent re-run writes no journal');
+      assert.equal(migratePiSingleProvider('xai', h.paths, { keychain: h.keychain, store: h.store }).state, 'migrated');
+      assert.equal(readFileSync(baseline).equals(before), true, 'a re-run must not replace the native baseline');
+    } finally { h.cleanup(); }
+  });
+
+  it('refuses a placeholder baseline without writing a baseline file', () => {
+    const h = setup();
+    try {
+      writeFileSync(h.paths.authJsonPath, JSON.stringify({ xai: { type: 'oauth', access: 'qlb-managed', refresh: '' } }), { mode: 0o600 });
+      writePiJournal(h.paths, 'xai', 'started');
+      const baseline = join(h.paths.baselineDir, 'xai.json');
+      assert.throws(
+        () => migratePiSingleProvider('xai', h.paths, { keychain: h.keychain }),
+        /Pi xai baseline would be a placeholder; run qlb pi rollback or restore auth\.json/,
+      );
+      assert.equal(existsSync(baseline), false);
+    } finally { h.cleanup(); }
   });
 
   it('refuses a canonical claim with only a pre-publication P7a journal', () => {
