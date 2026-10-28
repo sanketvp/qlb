@@ -12,12 +12,15 @@ import { appendFileSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import {
   accessTokenFingerprint,
+  buildProfileRequest,
   buildRefreshRequest,
   classifyRefreshResponse,
   credentialFingerprint,
   extractAccessToken,
   isOAuthTokenExpired,
+  loginExpiresAtIso,
   parseCredentialBlob,
+  parseProfileResponse,
   parseUsageResponse,
   serializeCredentialBlob,
   type HttpRequestDescription,
@@ -42,7 +45,9 @@ import {
 import { defaultStashTimestamp } from './cc-consume';
 import { ClaudeSlots, type ReadClaudeSlot } from './cc-slots';
 import { listCswapProcesses, type CswapProcess } from './cswap-processes';
-import { isSuccessor, recordTransition } from './lineage-log';
+import { externalLoginCheck, isSuccessor, recordTransition, type HolderObservation } from './lineage-log';
+import { listReloginEvents, recordRelogin } from './relogin';
+import { reloginDetailValue } from './relogin-fields';
 import type { Store } from './store';
 
 export type ActiveFetchSentinel =
@@ -88,20 +93,20 @@ export class ProbeVerdictMemo {
   private readonly verdicts = new Map<string, ProbeVerdict>();
   private readonly warned = new Set<string>();
 
-  private key(accountId: string, email: string, lineageFp: string): string {
-    return `${accountId}\u0000${email}\u0000${lineageFp}`;
+  private key(accountId: string, email: string, lineageFp: string, orgUuid: string): string {
+    return `${accountId}\u0000${email}\u0000${orgUuid}\u0000${lineageFp}`;
   }
 
-  get(accountId: string, email: string, lineageFp: string): ProbeVerdict | undefined {
-    return this.verdicts.get(this.key(accountId, email, lineageFp));
+  get(accountId: string, email: string, lineageFp: string, orgUuid: string): ProbeVerdict | undefined {
+    return this.verdicts.get(this.key(accountId, email, lineageFp, orgUuid));
   }
 
-  set(accountId: string, email: string, lineageFp: string, verdict: ProbeVerdict): void {
-    this.verdicts.set(this.key(accountId, email, lineageFp), verdict);
+  set(accountId: string, email: string, lineageFp: string, orgUuid: string, verdict: ProbeVerdict): void {
+    this.verdicts.set(this.key(accountId, email, lineageFp, orgUuid), verdict);
   }
 
-  matches(accountId: string, email: string, lineageFp: string): boolean {
-    return this.get(accountId, email, lineageFp)?.match === true;
+  matches(accountId: string, email: string, lineageFp: string, orgUuid: string): boolean {
+    return this.get(accountId, email, lineageFp, orgUuid)?.match === true;
   }
 
   warnOnce(accountId: string, email: string, condition: string): boolean {
@@ -347,7 +352,7 @@ function defaultAutoLog(store: Store, line: string): void {
   } catch { /* audit evidence must not discard an issued successor */ }
 }
 
-function identityMatches(observed: LiveIdentity | null, input: RefreshActiveLoginInput): boolean {
+function identityMatches(observed: LiveIdentity | null, input: Pick<RefreshActiveLoginInput, 'accountId' | 'email' | 'orgUuid'>): boolean {
   return observed !== null && observed.accountId === input.accountId
     && observed.email === input.email && observed.orgUuid === input.orgUuid;
 }
@@ -406,7 +411,7 @@ async function fetchUsageRecord(
   } catch {
     return { error: 'usage-unreadable' };
   }
-  if (deps.verdicts.get(input.accountId, input.email, credentialLineage(creds) ?? '')?.match === false) {
+  if (deps.verdicts.get(input.accountId, input.email, credentialLineage(creds) ?? '', input.orgUuid)?.match === false) {
     return { sentinel: 'foreign-credential' };
   }
   if (!input.degraded) {
@@ -423,7 +428,7 @@ async function fetchUsageRecord(
       warn(deps, 'Claude active usage resync failed');
     }
   }
-  if (deps.verdicts.get(input.accountId, input.email, credentialLineage(creds) ?? '')?.match === false) {
+  if (deps.verdicts.get(input.accountId, input.email, credentialLineage(creds) ?? '', input.orgUuid)?.match === false) {
     return { sentinel: 'foreign-credential' };
   }
   return { usage };
@@ -534,7 +539,7 @@ export async function refreshActiveLogin(
   if (effectiveEnv.CLAUDE_SECURESTORAGE_CONFIG_DIR) return finish({ outcome: 'refused', reason: 'store-unmirrored' });
   if (input.degraded) return finish({ outcome: 'deferred', deferReason: 'degraded-read' });
 
-  const earlyVerdict = deps.verdicts.get(input.accountId, input.email, credentialLineage(input.creds) ?? '');
+  const earlyVerdict = deps.verdicts.get(input.accountId, input.email, credentialLineage(input.creds) ?? '', input.orgUuid);
   if (!preLockAttribution({ creds: input.creds, slotFp: earlySlot?.fingerprint ?? null, slotPrevFp: earlySlot?.prevFingerprint ?? null, verdict: earlyVerdict })
     && !slotUsable(input.creds)) {
     if (deps.verdicts.warnOnce(input.accountId, input.email, 'unattributable')) warn(deps, 'Claude refresh deferred: credential is unattributable');
@@ -581,7 +586,7 @@ export async function refreshActiveLogin(
       let slotFp: string | null = locked.fingerprint;
       let slotPrevFp = row?.prevFingerprint ?? null;
       const liveFp = credentialLineage(live);
-      const memo = liveFp ? deps.verdicts.get(input.accountId, input.email, liveFp) : undefined;
+      const memo = liveFp ? deps.verdicts.get(input.accountId, input.email, liveFp, input.orgUuid) : undefined;
       // A forced 401 binds to live only when both its lineage and the rejected
       // access generation are unchanged. A differing, partial or newly issued
       // live blob takes the ordinary locked adopt, defer, or foreign-refusal path.
@@ -605,7 +610,7 @@ export async function refreshActiveLogin(
 
       const decide = (): RefreshInputDecision => {
         const fp = credentialLineage(live);
-        const attributed = Boolean(fp && (deps.verdicts.matches(input.accountId, input.email, fp)
+        const attributed = Boolean(fp && (deps.verdicts.matches(input.accountId, input.email, fp, input.orgUuid)
           || (slotFp !== null && isSuccessor(deps.store, 'anthropic', input.accountId, slotFp, fp))));
         return chooseRefreshInput({ creds: decisionCreds, live, backup: backup.credential, backupUsable: slotUsable(backup.credential), slotFp, attributed, forceRefresh: input.forceRecord !== undefined, now: deps.now() });
       };
@@ -682,7 +687,7 @@ export async function refreshActiveLogin(
         if (!working) return finish({ outcome: 'failed', reason: 'refresh-failed' });
         const postedFp = credentialLineage(choice.input);
         const workingFp = credentialLineage(working);
-        if (workingFp) deps.verdicts.set(input.accountId, input.email, workingFp, { match: true, source: 'post' });
+        if (workingFp) deps.verdicts.set(input.accountId, input.email, workingFp, input.orgUuid, { match: true, source: 'post' });
 
         let slotWritten = true;
         try { await deps.slots.writeSlot(input.accountId, working, { cause: 'post', by: deps.by, evidence: 'post' }); }
@@ -722,4 +727,200 @@ export async function refreshActiveLogin(
     warn(deps, 'Claude active refresh failed unexpectedly');
     return finish({ outcome: 'deferred', deferReason: 'unexpected' });
   }
+}
+
+export interface ResyncProfileResponse {
+  status: number;
+  body: string;
+}
+
+/** Dependencies for the post-usage, no-POST rotated-backup reconciliation. */
+export interface ResyncRotatedBackupDeps {
+  slots: ClaudeSlots;
+  store: Store;
+  live: ClaudeCredentialsOptions;
+  env: NodeJS.ProcessEnv;
+  verdicts: ProbeVerdictMemo;
+  now: () => number;
+  /** Reads Claude Code's config identity; it is checked again while locked. */
+  readLiveIdentity?: () => LiveIdentity | null;
+  getProfile: (request: HttpRequestDescription) => Promise<ResyncProfileResponse>;
+  warn?: (message: string) => void;
+  /** X1's durable confirmation that refreshTokenExpiresAt is L41 evidence. */
+  l41Verified?: boolean;
+  withSwitchLock?: Lock;
+  withCredentialLocks?: CredentialLock;
+  /** Consumer attribution for the repair lineage row. */
+  by?: 'qlb-auto' | 'qlb-cli' | 'tool';
+}
+
+function resyncWarn(deps: ResyncRotatedBackupDeps, message: string): void {
+  try { deps.warn?.(message); } catch { /* resync diagnostics are best effort */ }
+}
+
+export interface ResyncRotatedBackupInput {
+  accountId: string;
+  email: string;
+  orgUuid: string;
+  /** The just-accepted credential; it is never persisted unless attributed. */
+  creds: string;
+  /** The caller's pre-lock slot view, used only to decide whether resync is needed. */
+  slot: Pick<ReadClaudeSlot, 'fingerprint'>;
+  holderObservation?: HolderObservation;
+}
+
+/** UUID is authoritative; a supplied organization corroborates rather than replaces it. */
+export function resolvedMatchesSlotIdentity(
+  resolved: ReturnType<typeof parseProfileResponse>,
+  input: Pick<ResyncRotatedBackupInput, 'accountId' | 'orgUuid'>,
+): boolean | null {
+  if (!resolved?.uuid) return null;
+  if (resolved.uuid !== input.accountId) return false;
+  if (resolved.organizationUuid && input.orgUuid && resolved.organizationUuid !== input.orgUuid) return false;
+  return true;
+}
+
+function livePairWithLineage(live: string | null, fingerprint: string): live is string {
+  return live !== null && hasUsablePair(live) && credentialLineage(live) === fingerprint;
+}
+
+function expiryMovedForward(before: string, after: string): boolean {
+  try {
+    const oldExpiry = loginExpiresAtIso(before);
+    const newExpiry = loginExpiresAtIso(after);
+    return oldExpiry !== null && newExpiry !== null && newExpiry > oldExpiry;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The locked half of rotated-backup resync. Exported so undo can perform the
+ * same re-read inside its already-held switch/credential-lock hierarchy.
+ */
+export async function resyncUnderHeldLocks(
+  deps: ResyncRotatedBackupDeps,
+  input: ResyncRotatedBackupInput,
+): Promise<void> {
+  const servedFp = credentialLineage(input.creds);
+  if (!servedFp) return;
+  const effectiveEnv = deps.live.env ?? deps.env;
+  const liveOptions = { ...deps.live, env: effectiveEnv };
+  const paths = liveOptions.paths ?? claudePaths(liveOptions);
+  const readIdentity = deps.readLiveIdentity ?? (() => liveIdentity(paths.globalConfigPath, liveOptions.readText));
+
+  // The live identity and the stored identity are both authority boundaries:
+  // a verdict issued for an earlier slot identity must not survive a rebuild.
+  const identity = readIdentity();
+  const current = deps.slots.getSlot(input.accountId);
+  if (!identityMatches(identity, input) || !current
+    || current.email !== input.email || (current.orgUuid ?? '') !== input.orgUuid) return;
+
+  if (current.fingerprint === servedFp) return;
+  // I1: a current successor is the only issued refresh chain. A positive
+  // attribution memo never licenses discarding it for its served ancestor.
+  if ((current.fingerprint !== null
+      && isSuccessor(deps.store, 'anthropic', input.accountId, servedFp, current.fingerprint))
+    || servedFp === current.prevFingerprint) return;
+  const memo = deps.verdicts.get(input.accountId, input.email, servedFp, input.orgUuid);
+  const successor = current.fingerprint !== null
+    && isSuccessor(deps.store, 'anthropic', input.accountId, current.fingerprint, servedFp);
+  if (memo?.match !== true && !successor) return;
+
+  let live: string;
+  try { live = await readLiveClaudeCredentials(liveOptions); } catch { return; }
+  if (!livePairWithLineage(live, servedFp)) return;
+
+  if (!successor) {
+    const l41Verified = deps.l41Verified ?? deps.store.getConfig('claude.l41Verified') === '1';
+    const hard = externalLoginCheck({
+      provider: 'anthropic', successor: false, qlbPost: memo?.source === 'post', oracleOwnAccount: memo?.source === 'oracle',
+      l41Verified, loginExpiryMoved: expiryMovedForward((await deps.slots.readSlot(input.accountId, { fresh: true })).credential, live),
+    });
+    const classification = hard === 'hard'
+      ? hard
+      : input.holderObservation === undefined
+        ? 'none'
+        : externalLoginCheck({ provider: 'anthropic', successor: false, qlbPost: memo?.source === 'post', oracleOwnAccount: memo?.source === 'oracle',
+          l41Verified, loginExpiryMoved: false, holderObservation: input.holderObservation });
+    if (classification !== 'none') {
+      const detail = reloginDetailValue(servedFp);
+      const alreadyRecorded = listReloginEvents(deps.store.dbPath).some((row) => row.provider === 'anthropic'
+        && row.accountId === input.accountId && row.kind === 'external-login' && row.detail === detail);
+      if (!alreadyRecorded) recordRelogin(deps.store, {
+        ts: deps.now(), provider: 'anthropic', accountId: input.accountId, kind: 'external-login', detail: servedFp,
+        evidence: classification === 'hard' ? 'login-expiry-jump' : 'unattributed-rotation',
+      });
+    }
+  }
+
+  const evidence = memo?.source === 'post' ? 'post' : memo?.source === 'oracle' ? 'oracle' : 'lineage';
+  await deps.slots.writeSlot(input.accountId, live, { cause: 'resync', by: deps.by ?? 'tool', evidence });
+}
+
+/**
+ * Best-effort reconciliation after an accepted usage GET. The profile request
+ * is deliberately outside all locks; only the final live re-read and slot
+ * write are serialized with Claude Code's credential writers.
+ */
+export async function resyncRotatedBackup(
+  deps: ResyncRotatedBackupDeps,
+  input: ResyncRotatedBackupInput,
+): Promise<void> {
+  const servedFp = credentialLineage(input.creds);
+  if (!servedFp || !hasUsablePair(input.creds) || input.slot.fingerprint === servedFp) return;
+  const cached = deps.verdicts.get(input.accountId, input.email, servedFp, input.orgUuid);
+  if (cached?.match === false) return;
+
+  let attributed = cached?.match === true
+    || isSuccessor(deps.store, 'anthropic', input.accountId, input.slot.fingerprint, servedFp);
+  if (!attributed) {
+    try {
+      const accessToken = extractAccessToken(input.creds);
+      if (!accessToken) return;
+      const response = await deps.getProfile(buildProfileRequest(accessToken));
+      if (response.status < 200 || response.status >= 300) return;
+      const resolved = parseProfileResponse(JSON.parse(response.body));
+      const matches = resolvedMatchesSlotIdentity(resolved, input);
+      // A partial profile is neither affirming nor condemning, so do not cache it.
+      if (matches === null) return;
+      deps.verdicts.set(input.accountId, input.email, servedFp, input.orgUuid, { match: matches, source: 'oracle' });
+      if (!matches) {
+        if (deps.verdicts.warnOnce(input.accountId, input.email, 'resync-foreign')) {
+          resyncWarn(deps, 'Claude rotated backup resync left foreign credential untouched');
+        }
+        return;
+      }
+      attributed = true;
+    } catch {
+      resyncWarn(deps, 'Claude rotated backup ownership probe failed');
+      return;
+    }
+  }
+  if (!attributed) return;
+
+  const effectiveEnv = deps.live.env ?? deps.env;
+  const paths = deps.live.paths ?? claudePaths({ ...deps.live, env: effectiveEnv });
+  const switchLock: Lock = deps.withSwitchLock ?? ((fn, options) => withClaudeSwitchLock(fn, {
+    home: deps.live.home, env: effectiveEnv, timeoutMs: options?.timeoutMs,
+  }));
+  const credentialLocks: CredentialLock = deps.withCredentialLocks ?? ((fn, options) => withClaudeCredentialLocks({
+    configDir: paths.configHome, env: effectiveEnv, timeoutMs: options?.timeoutMs,
+  }, fn));
+  try {
+    await switchLock(() => credentialLocks(() => resyncUnderHeldLocks(deps, input)));
+  } catch {
+    resyncWarn(deps, 'Claude rotated backup resync failed');
+  }
+}
+
+/** Adapt K6-4's accepted-usage hook to K6-5 with its shared verdict memo. */
+export function resyncHook(
+  deps: ResyncRotatedBackupDeps,
+  options: { holderObservation?: HolderObservation } = {},
+): (context: AcceptedUsageContext) => Promise<void> {
+  return async (context) => {
+    const slot = await deps.slots.readSlot(context.accountId, { fresh: true });
+    await resyncRotatedBackup(deps, { ...context, slot, holderObservation: options.holderObservation });
+  };
 }

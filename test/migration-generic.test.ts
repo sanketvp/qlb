@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { describe, it } from 'node:test';
 import { createOwnedCredentialSource } from '../src/credentials';
 import { MockKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from '../src/keychain';
@@ -340,6 +340,62 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       } finally {
         h.cleanup();
       }
+    }
+  });
+
+  it('T-OW2 a pi migrate journal written while stage waits for the auth lock makes stage refuse owned-by-pi-migrate with nothing written', () => {
+    const h = setup('xai');
+    try {
+      const journalDir = join(h.dir, 'pi-migrate-journal');
+      const p7aJournal = join(journalDir, 'pi-migrate-xai.json');
+      let seamCalls = 0;
+      const migration = new Migration(h.store, h.kc, h.authPath, h.ownerPath, 'pi-xai', {
+        kind: 'single-grant',
+        provider: 'xai',
+        authJsonKey: 'xai',
+        piMigrateJournalDir: journalDir,
+        beforeOwnershipLock: () => {
+          seamCalls += 1;
+          mkdirSync(journalDir, { recursive: true });
+          writeFileSync(p7aJournal, '{}\n');
+        },
+      });
+
+      assert.throws(
+        () => migration.stage(),
+        (error: Error & { exitCode?: unknown }) => {
+          assert.match(error.message, /owned-by-pi-migrate: run `qlb pi rollback xai`/);
+          assert.equal(error.exitCode, 3);
+          return true;
+        },
+      );
+      assert.equal(seamCalls, 1, 'the P7a publication races immediately before the shared lock');
+      assert.equal(h.store.getMigration('pi-xai'), null, 'stage writes no generic journal');
+      assert.equal(existsSync(stagingOwnerPath(join(h.dir, 'qlb-owner.json'), 'xai')), false);
+      assert.equal(keychainHas(h.kc, 'xai'), false, 'stage writes no managed credential');
+      assert.deepEqual(readFileSync(h.authPath), h.originalBytes, 'stage leaves auth.json unchanged');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('T-OW2 stage classifies ownership and makes its first writes while holding the auth lock pi migrate takes', () => {
+    const h = setup('xai');
+    try {
+      const lockDir = `${resolve(h.authPath)}.lock`;
+      assert.equal(existsSync(lockDir), false);
+      const heldAt: string[] = [];
+      const store = h.store as unknown as Record<string, (...args: unknown[]) => unknown>;
+      const originalUpsert = store.upsertMigration.bind(h.store);
+      store.upsertMigration = (...args: unknown[]) => { heldAt.push(`journal:${existsSync(lockDir)}`); return originalUpsert(...args); };
+      const originalSet = h.kc.setSync.bind(h.kc);
+      h.kc.setSync = (service: string, account: string, value: string) => { heldAt.push(`keychain:${existsSync(lockDir)}`); originalSet(service, account, value); };
+      h.mig.stage();
+      assert.ok(heldAt.length > 0, 'stage wrote something');
+      assert.ok(heldAt.every((entry) => entry.endsWith(':true')), `every stage write ran under ${lockDir}: ${heldAt.join(', ')}`);
+      assert.equal(existsSync(lockDir), false, 'the auth lock is released after stage');
+    } finally {
+      h.cleanup();
     }
   });
 
