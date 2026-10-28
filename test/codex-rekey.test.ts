@@ -44,7 +44,7 @@ function lease(db: DatabaseSync, accountId: string, until: number): void {
     .run(refreshLeaseName(accountId), until);
 }
 
-function pollClaim(db: DatabaseSync, accountId: string, until: number): void {
+function pollClaim(db: DatabaseSync, accountId: string, until: number | null): void {
   db.prepare(`INSERT INTO poll_claims (account_id, holder_id, claimed_at, until)
     VALUES (?, 'fixture', 1, ?)`)
     .run(accountId, until);
@@ -264,8 +264,36 @@ describe('Codex rekey planner', () => {
     try {
       slot(f.db, 'user:bare', 'bare');
       account(f.db, 'bare', 'openai-codex');
+      account(f.db, 'codex-default', 'openai-codex');
       lease(f.db, 'bare', 101);
+      assert.deepEqual(plan(f.db).skipped, [
+        { id: 'bare', reason: 'in-use' },
+        { id: 'codex-default', reason: 'in-use' },
+      ]);
+    } finally { f.close(); }
+  });
+
+  it('a poll claim with no end time counts as in use', () => {
+    const f = fixture();
+    try {
+      slot(f.db, 'user:bare', 'bare');
+      account(f.db, 'bare', 'openai-codex');
+      pollClaim(f.db, 'bare', null);
       assert.deepEqual(plan(f.db).skipped, [{ id: 'bare', reason: 'in-use' }]);
+    } finally { f.close(); }
+  });
+
+  it('a busy source skips every candidate for its target', () => {
+    const f = fixture();
+    try {
+      slot(f.db, 'user:bare', 'bare');
+      account(f.db, 'bare', 'openai-codex');
+      account(f.db, 'codex-default', 'openai-codex');
+      pollClaim(f.db, 'bare', 101);
+      assert.deepEqual(plan(f.db).skipped, [
+        { id: 'bare', reason: 'in-use' },
+        { id: 'codex-default', reason: 'in-use' },
+      ]);
     } finally { f.close(); }
   });
 

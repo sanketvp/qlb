@@ -148,12 +148,12 @@ export function planCodexRekey(db: DatabaseSync, options: PlanCodexRekeyOptions)
       .map((row) => row.name),
   );
   const livePollClaimIds = new Set(
-    (db.prepare('SELECT account_id FROM poll_claims WHERE until > ?').all(options.now) as Array<{ account_id: string }>)
+    (db.prepare('SELECT account_id FROM poll_claims WHERE until IS NULL OR until > ?').all(options.now) as Array<{ account_id: string }>)
       .map((row) => row.account_id),
   );
   const inUse = (id: string): boolean =>
     liveLeaseNames.has(refreshLeaseName(id)) || livePollClaimIds.has(id);
-  const eligible: Array<Candidate & { to: string }> = [];
+  const candidatesWithTargets: Array<Candidate & { to: string }> = [];
   for (const candidate of orderedCandidates) {
     if (skipped.has(candidate.id)) continue;
     const targets = candidate.id === 'codex-default'
@@ -167,22 +167,31 @@ export function planCodexRekey(db: DatabaseSync, options: PlanCodexRekeyOptions)
       skipped.set(candidate.id, 'ambiguous');
       continue;
     }
-    const to = targets[0]!;
+    candidatesWithTargets.push({ ...candidate, to: targets[0]! });
+  }
+
+  const busyTargets = new Set(
+    candidatesWithTargets
+      .filter((candidate) => inUse(candidate.id) || inUse(candidate.to))
+      .map((candidate) => candidate.to),
+  );
+  const eligible: Array<Candidate & { to: string }> = [];
+  for (const candidate of candidatesWithTargets) {
+    if (busyTargets.has(candidate.to)) {
+      skipped.set(candidate.id, 'in-use');
+      continue;
+    }
     const safety = inspectAccountSafety(migrations, candidate.id, lookupProvider);
     if (safety.unsafe) {
       skipped.set(candidate.id, safety.reason === 'untrusted' ? 'journal-untrusted' : 'journal-named');
       continue;
     }
-    const target = accountsById.get(to);
+    const target = accountsById.get(candidate.to);
     if (target && target.provider !== 'openai-codex') {
       skipped.set(candidate.id, 'provider-mismatch');
       continue;
     }
-    if (inUse(candidate.id) || inUse(to)) {
-      skipped.set(candidate.id, 'in-use');
-      continue;
-    }
-    eligible.push({ ...candidate, to });
+    eligible.push(candidate);
   }
 
   const targetIds = new Set(accountIds);
