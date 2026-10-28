@@ -69,17 +69,24 @@ interface BuildStamp {
 /** A build/release integrity failure is a deliberate, operator-actionable refusal (exit 3). */
 export class ReleaseIntegrityError extends Error {}
 
-function readRecordedConfig(dbPath: string, key: string): string | null {
+/** @internal test seam */
+export function readRecordedConfig(dbPath: string, key: string): string | null {
+  if (!existsSync(dbPath)) return null;
+  let db: DatabaseSync | undefined;
   try {
-    const db = new DatabaseSync(dbPath, { readOnly: true });
+    db = new DatabaseSync(dbPath, { readOnly: true });
+    db.exec('PRAGMA busy_timeout = 5000');
+    const row = db.prepare('SELECT value FROM config WHERE key = ?').get(key) as { value?: unknown } | undefined;
+    return typeof row?.value === 'string' ? row.value : null;
+  } catch (error) {
+    if (error instanceof Error && error.message.includes('no such table: config')) return null;
+    throw new ReleaseIntegrityError('could not read helper identity pin');
+  } finally {
     try {
-      const row = db.prepare('SELECT value FROM config WHERE key = ?').get(key) as { value?: unknown } | undefined;
-      return typeof row?.value === 'string' ? row.value : null;
-    } finally {
-      db.close();
+      db?.close();
+    } catch {
+      throw new ReleaseIntegrityError('could not read helper identity pin');
     }
-  } catch {
-    return null;
   }
 }
 
