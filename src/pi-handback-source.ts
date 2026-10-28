@@ -195,6 +195,39 @@ function piEntryFromKeychainGrant(grant: Record<string, unknown>): ValidPiOAuthE
   return isValidEntry(entry) ? entry : null;
 }
 
+export interface HandbackVerdict {
+  piFingerprint: string | null;
+  keychainDisposition: 'delete' | 'keep';
+}
+
+function keychainRefreshFingerprint(value: unknown): string | null {
+  if (!isRecord(value)
+    || typeof value.generation !== 'number'
+    || !Number.isSafeInteger(value.generation)
+    || value.generation < 0
+    || (value.writtenBy !== undefined && typeof value.writtenBy !== 'string')) {
+    return null;
+  }
+  const entry = piEntryFromKeychainGrant(value);
+  return entry ? fingerprint(entry.refresh) : null;
+}
+
+/**
+ * Pure S5 / OD-2 verdict. A malformed Keychain payload is deliberately a
+ * non-match: only a well-formed copy of Pi's final refresh-token lineage can
+ * be deleted.
+ */
+export function handbackVerdict(kmRead: unknown, piEntry: unknown): HandbackVerdict {
+  const piFingerprint = isValidEntry(piEntry) ? fingerprint(piEntry.refresh) : null;
+  const keychainFingerprint = keychainRefreshFingerprint(kmRead);
+  return {
+    piFingerprint,
+    keychainDisposition: piFingerprint !== null && keychainFingerprint === piFingerprint
+      ? 'delete'
+      : 'keep',
+  };
+}
+
 function validBackup(backup: SingleGrantBackup | null): SingleGrantBackup | null {
   return backup && (!backup.entryPresent || isValidEntry(backup.entry)) ? backup : null;
 }
