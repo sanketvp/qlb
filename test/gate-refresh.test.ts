@@ -1,11 +1,12 @@
 // Ported from claude-swap v0.28.0 (MIT) tests/test_switcher.py:2039-3513
 import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync } from 'node:fs';
+import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
-import defaultAnthropicGate, { createAnthropicGate, type AnthropicGateDeps } from '../src/gate/anthropic';
+import defaultAnthropicGate, { createAnthropicGate, sendRefresh, type AnthropicGateDeps } from '../src/gate/anthropic';
 import { InMemoryCredentialBackend } from '../src/cc-credentials';
 import { claudePaths } from '../src/cc-paths';
 import { ClaudeSlots, SqliteClaudeSlotRepository } from '../src/cc-slots';
@@ -89,6 +90,20 @@ function rotateLiveDuringLockedRead(f: Fixture, replacement: string): void {
 }
 
 describe('Anthropic Pi gate refresh mapping (K6-7)', () => {
+  it('bounds the refresh POST by request timeout', async () => {
+    const server = createServer(() => { /* deliberately never respond */ });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+    assert.ok(address && typeof address === 'object');
+    try {
+      await assert.rejects(() => sendRefresh({
+        url: `http://127.0.0.1:${address.port}/refresh`, method: 'POST', headers: {}, body: '', timeoutMs: 20,
+      }));
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
+  });
+
   it('serves the live active token above five minutes with 0 POSTs and source live', async () => {
     const f = await fixture();
     let posts = 0;

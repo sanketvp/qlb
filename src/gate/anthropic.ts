@@ -59,8 +59,10 @@ function credentialParts(credentials: string): { token: string; expiresAt?: numb
     : { token: oauth.accessToken };
 }
 
-async function sendRefresh(request: HttpRequestDescription): Promise<RefreshHttpResponse> {
-  const response = await fetch(request.url, { method: request.method, headers: request.headers, body: request.body });
+export async function sendRefresh(request: HttpRequestDescription): Promise<RefreshHttpResponse> {
+  const response = await fetch(request.url, {
+    method: request.method, headers: request.headers, body: request.body, signal: AbortSignal.timeout(request.timeoutMs),
+  });
   return { status: response.status, body: await response.text() };
 }
 
