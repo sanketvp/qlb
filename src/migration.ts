@@ -1125,7 +1125,7 @@ export class Migration {
     } else if (state === 'MIRRORED' || ownerStaging) {
       resumeAction = 'before commit: roll back staging (native untouched)';
     } else {
-      resumeAction = 'noop';
+      resumeAction = this.kind === 'single-grant' ? 'nothing to roll back' : 'noop';
     }
 
     return {
@@ -1369,6 +1369,17 @@ export class Migration {
     if (ownerPresent || this.journalState() === 'QLB_OWNED') {
       return this.postCommitRollback();
     }
+    // C7-C9: only an active pre-commit migration has rollback work. In
+    // particular, a finished single-grant hand-back has no claim or staging
+    // file but can intentionally retain K_m; deleting it here would destroy
+    // the retained copy on a repeated rollback.
+    if (
+      this.kind === 'single-grant'
+      && this.journalState() !== 'MIRRORED'
+      && !existsSync(this.stagingPath())
+    ) {
+      return this.status();
+    }
     return this.preCommitRollback();
   }
 
@@ -1413,6 +1424,8 @@ export class Migration {
     if (current.state === 'MIRRORED' || existsSync(this.stagingPath())) {
       return this.preCommitRollback();
     }
+    // C9: native and unstaged VALIDATED single-grant migrations are at rest.
+    // Keep K_m, the journal, and all migration files exactly as they are.
     return current;
   }
 
