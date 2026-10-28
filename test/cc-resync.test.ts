@@ -10,9 +10,12 @@ import {
   adoptRotatedLive,
   chooseRefreshInput,
   credentialLineage,
+  fetchActiveUsage,
+  mapRefreshOutcome,
   preLockAttribution,
   refreshActiveLogin,
   resolveCswapCheck,
+  type FetchActiveUsageDeps,
   type RefreshActiveLoginDeps,
   type RefreshOutcome,
 } from '../src/cc-resync';
@@ -211,6 +214,417 @@ describe('Claude active refresh provenance decisions (K6-2)', () => {
   it('the result union is exhaustive', () => {
     const result: RefreshOutcome = { outcome: 'posted-slot-unwritten', working: credential('working') };
     assert.equal(outcomeIsExhaustive(result), credential('working'));
+  });
+});
+
+describe('Claude active usage fetch (K6-4)', () => {
+  function usageBody(): string {
+    return JSON.stringify({ five_hour: { utilization: 12, resets_at: '2024-01-01T01:00:00Z' } });
+  }
+
+  async function fetch(
+    fixture: RefreshFixture,
+    getUsage: (accessToken: string) => Promise<{ status: number; body: string; retryAfterS?: number }>,
+    overrides: Partial<Omit<FetchActiveUsageDeps, 'getUsage'>> = {},
+    inputOverrides: Partial<Parameters<typeof fetchActiveUsage>[1]> = {},
+  ) {
+    return fetchActiveUsage({
+      ...fixture.deps,
+      postRefresh: async () => ({
+        status: 200,
+        body: JSON.stringify({ access_token: 'access-issued', refresh_token: 'refresh-issued', expires_in: 3600 }),
+      }),
+      getUsage,
+      ...overrides,
+    }, {
+      accountId: 'account-a', email: 'a@example.test', orgUuid: 'org-a', creds: credential('slot'), degraded: false,
+      ...inputOverrides,
+    });
+  }
+
+  it('a struck active login is quarantined: no usage GET, no POST, sentinel relogin-needed, even with a valid access token', async () => {
+    const fixture = await refreshFixture();
+    const fresh = credential('slot', NOW + 60 * 60_000);
+    await fixture.slots.writeSlot('account-a', fresh, { cause: 'post', by: 'qlb-cli', evidence: 'post' });
+    await fixture.backend.set(fixture.liveOptions.paths.keychainService, 'fixture-user', fresh);
+    await fixture.slots.strikeDead('account-a', { reason: 'invalid_grant', struckFp: credentialLineage(fresh)!, ts: NOW });
+    let gets = 0;
+    let posts = 0;
+    const result = await fetch(fixture, async () => { gets += 1; return { status: 200, body: usageBody() }; }, {
+      postRefresh: async () => { posts += 1; return { status: 500, body: '' }; },
+    }, { creds: fresh });
+    assert.deepEqual(result, { sentinel: 'relogin-needed' });
+    assert.equal(gets, 0);
+    assert.equal(posts, 0);
+  });
+
+  it('a 401 with an unchanged access token forces exactly one POST', async () => {
+    const fixture = await refreshFixture();
+    const fresh = credential('slot', NOW + 60 * 60_000);
+    await fixture.slots.writeSlot('account-a', fresh, { cause: 'post', by: 'qlb-cli', evidence: 'post' });
+    await fixture.backend.set(fixture.liveOptions.paths.keychainService, 'fixture-user', fresh);
+    let posts = 0;
+    const tokens: string[] = [];
+    const result = await fetch(fixture, async (token) => {
+      tokens.push(token);
+      return tokens.length === 1 ? { status: 401, body: '' } : { status: 200, body: usageBody() };
+    }, { postRefresh: async () => {
+      posts += 1;
+      return { status: 200, body: JSON.stringify({ access_token: 'access-rotated', refresh_token: 'refresh-rotated', expires_in: 3600 }) };
+    } }, { creds: fresh });
+    assert.equal(posts, 1);
+    assert.deepEqual(tokens, ['access-slot', 'access-rotated']);
+    assert.ok(result.usage);
+  });
+
+  it('a 401 with unchanged access but changed shared fields forces exactly one POST', async () => {
+    const fixture = await refreshFixture();
+    const fresh = credential('slot', NOW + 60 * 60_000);
+    const live = JSON.stringify({
+      claudeAiOauth: { accessToken: 'access-slot', refreshToken: 'refresh-slot', expiresAt: NOW + 60 * 60_000 },
+      mcpOAuth: { machine: true },
+    });
+    await fixture.slots.writeSlot('account-a', fresh, { cause: 'post', by: 'qlb-cli', evidence: 'post' });
+    await fixture.backend.set(fixture.liveOptions.paths.keychainService, 'fixture-user', live);
+    let posts = 0;
+    let postedRefreshToken: string | null = null;
+    const tokens: string[] = [];
+    const result = await fetch(fixture, async (token) => {
+      tokens.push(token);
+      return tokens.length === 1 ? { status: 401, body: '' } : { status: 200, body: usageBody() };
+    }, { postRefresh: async (request) => {
+      posts += 1;
+      postedRefreshToken = (JSON.parse(request.body ?? '{}') as { refresh_token?: string }).refresh_token ?? null;
+      return { status: 200, body: JSON.stringify({ access_token: 'access-rotated', refresh_token: 'refresh-rotated', expires_in: 3600 }) };
+    } }, { creds: fresh });
+    assert.equal(posts, 1);
+    assert.equal(postedRefreshToken, 'refresh-slot');
+    assert.deepEqual(tokens, ['access-slot', 'access-rotated']);
+    assert.ok(result.usage);
+  });
+
+  it('a 401 with unchanged access but a rotated refresh token returns the 401 without a POST or dead slot', async () => {
+    const fixture = await refreshFixture();
+    const fresh = credential('slot', NOW + 60 * 60_000);
+    const live = credential('refresh-rotated', NOW + 60 * 60_000).replace('access-refresh-rotated', 'access-slot');
+    await fixture.slots.writeSlot('account-a', fresh, { cause: 'post', by: 'qlb-cli', evidence: 'post' });
+    await fixture.backend.set(fixture.liveOptions.paths.keychainService, 'fixture-user', live);
+    let posts = 0;
+    const result = await fetch(fixture, async () => ({ status: 401, body: '' }), {
+      postRefresh: async () => {
+        posts += 1;
+        return { status: 200, body: JSON.stringify({ access_token: 'access-rotated', refresh_token: 'refresh-successor', expires_in: 3600 }) };
+      },
+    }, { creds: fresh });
+    assert.deepEqual(result, { error: 'http-401' });
+    assert.equal(posts, 0);
+    assert.equal(fixture.slots.getSlot('account-a')!.dead, false);
+  });
+
+  it('a rotated refresh lineage cannot strike the slot after an invalid_grant', async () => {
+    const fixture = await refreshFixture();
+    const fresh = credential('slot', NOW + 60 * 60_000);
+    const live = credential('refresh-rotated', NOW + 60 * 60_000).replace('access-refresh-rotated', 'access-slot');
+    await fixture.slots.writeSlot('account-a', fresh, { cause: 'post', by: 'qlb-cli', evidence: 'post' });
+    await fixture.backend.set(fixture.liveOptions.paths.keychainService, 'fixture-user', live);
+    let posts = 0;
+    const result = await fetch(fixture, async () => ({ status: 401, body: '' }), {
+      postRefresh: async () => {
+        posts += 1;
+        return { status: 400, body: JSON.stringify({ error: 'invalid_grant' }) };
+      },
+    }, { creds: fresh });
+    assert.deepEqual(result, { error: 'http-401' });
+    assert.equal(posts, 0);
+    assert.equal(fixture.slots.getSlot('account-a')!.dead, false);
+  });
+
+  it('a 401 with a changed access token POSTs nothing and surfaces the 401 record', async () => {
+    const fixture = await refreshFixture();
+    const fresh = credential('slot', NOW + 60 * 60_000);
+    await fixture.slots.writeSlot('account-a', fresh, { cause: 'post', by: 'qlb-cli', evidence: 'post' });
+    await fixture.backend.set(fixture.liveOptions.paths.keychainService, 'fixture-user', fresh);
+    let posts = 0;
+    const result = await fetch(fixture, async () => {
+      await fixture.backend.set(fixture.liveOptions.paths.keychainService, 'fixture-user', credential('moved', NOW + 60 * 60_000));
+      return { status: 401, body: '', retryAfterS: 7 };
+    }, { postRefresh: async () => { posts += 1; return { status: 500, body: '' }; } }, { creds: fresh });
+    assert.deepEqual(result, { error: 'http-401', retryAfterS: 7 });
+    assert.equal(posts, 0);
+  });
+
+  it('a non-expired token fetches usage without refreshing and outside every lock', async () => {
+    const fixture = await refreshFixture();
+    const fresh = credential('slot', NOW + 60 * 60_000);
+    await fixture.slots.writeSlot('account-a', fresh, { cause: 'post', by: 'qlb-cli', evidence: 'post' });
+    await fixture.backend.set(fixture.liveOptions.paths.keychainService, 'fixture-user', fresh);
+    let locks = 0;
+    const result = await fetch(fixture, async (token) => {
+      assert.equal(token, 'access-slot');
+      return { status: 200, body: usageBody() };
+    }, { withConsumeLock: async () => { locks += 1; throw new Error('must not lock'); } }, { creds: fresh });
+    assert.ok(result.usage);
+    assert.equal(locks, 0);
+  });
+
+  it('a live write failure after a 2xx yields token-expired and no usage GET', async () => {
+    const fixture = await refreshFixture();
+    let gets = 0;
+    let posts = 0;
+    const result = await fetch(fixture, async () => { gets += 1; return { status: 200, body: usageBody() }; }, {
+      postRefresh: async () => {
+        posts += 1;
+        return { status: 200, body: JSON.stringify({ access_token: 'access-issued', refresh_token: 'refresh-issued', expires_in: 3600 }) };
+      },
+      withConfigLock: async () => { throw new Error('fixture live failure'); },
+    });
+    assert.deepEqual(result, { sentinel: 'token-expired' });
+    assert.equal(posts, 1);
+    assert.equal(gets, 0);
+  });
+
+  it('a degraded read plus a server 401 defers with the 401 record', async () => {
+    const fixture = await refreshFixture();
+    const fresh = credential('slot', NOW + 60 * 60_000);
+    await fixture.slots.writeSlot('account-a', fresh, { cause: 'post', by: 'qlb-cli', evidence: 'post' });
+    await fixture.backend.set(fixture.liveOptions.paths.keychainService, 'fixture-user', fresh);
+    const result = await fetch(fixture, async () => ({ status: 401, body: '', retryAfterS: 4 }), {}, { creds: fresh, degraded: true });
+    assert.deepEqual(result, { error: 'http-401', retryAfterS: 4 });
+  });
+
+  it('no token returns no-credentials', async () => {
+    const fixture = await refreshFixture();
+    const noToken = JSON.stringify({ claudeAiOauth: { refreshToken: 'refresh-only', expiresAt: NOW + 60 * 60_000 } });
+    const result = await fetch(fixture, async () => { throw new Error('must not fetch'); }, {}, { creds: noToken });
+    assert.deepEqual(result, { sentinel: 'no-credentials' });
+  });
+
+  it('a known-foreign served lineage returns foreign-credential and records no usage', async () => {
+    const fixture = await refreshFixture();
+    const foreign = credential('foreign', NOW + 60 * 60_000);
+    fixture.deps.verdicts.set('account-a', 'a@example.test', credentialLineage(foreign)!, { match: false, source: 'oracle' });
+    let hooks = 0;
+    const result = await fetch(fixture, async () => ({ status: 200, body: usageBody() }), {
+      afterAcceptedUsage: async () => { hooks += 1; },
+    }, { creds: foreign });
+    assert.deepEqual(result, { sentinel: 'foreign-credential' });
+    assert.equal(hooks, 0);
+  });
+
+  it('a resync hook that discovers a foreign served lineage blocks usage in the same pass', async () => {
+    const fixture = await refreshFixture();
+    const served = credential('served', NOW + 60 * 60_000);
+    const result = await fetch(fixture, async () => ({ status: 200, body: usageBody() }), {
+      afterAcceptedUsage: async ({ creds }) => {
+        fixture.deps.verdicts.set('account-a', 'a@example.test', credentialLineage(creds)!, { match: false, source: 'oracle' });
+      },
+    }, { creds: served });
+    assert.deepEqual(result, { sentinel: 'foreign-credential' });
+  });
+
+  it('a known-foreign forced lineage is never POSTed', async () => {
+    const fixture = await refreshFixture();
+    const foreign = credential('foreign', NOW + 60 * 60_000);
+    await fixture.slots.writeSlot('account-a', foreign, { cause: 'adopt', by: 'qlb-cli', evidence: 'oracle' });
+    await fixture.backend.set(fixture.liveOptions.paths.keychainService, 'fixture-user', foreign);
+    fixture.deps.verdicts.set('account-a', 'a@example.test', credentialLineage(foreign)!, { match: false, source: 'oracle' });
+    let posts = 0;
+    const result = await fetch(fixture, async () => ({ status: 401, body: '' }), {
+      postRefresh: async () => {
+        posts += 1;
+        return { status: 200, body: JSON.stringify({ access_token: 'access-issued', refresh_token: 'refresh-issued', expires_in: 3600 }) };
+      },
+    }, { creds: foreign });
+    assert.deepEqual(result, { sentinel: 'foreign-credential' });
+    assert.equal(posts, 0);
+  });
+
+  it('an unusable same-access live snapshot still reaches the locked reread', async () => {
+    const fixture = await refreshFixture();
+    const fresh = credential('slot', NOW + 60 * 60_000);
+    const live = JSON.stringify({ claudeAiOauth: { accessToken: 'access-slot', expiresAt: NOW + 60 * 60_000 } });
+    await fixture.slots.writeSlot('account-a', fresh, { cause: 'post', by: 'qlb-cli', evidence: 'post' });
+    await fixture.backend.set(fixture.liveOptions.paths.keychainService, 'fixture-user', live);
+    let locks = 0;
+    let posts = 0;
+    const result = await fetch(fixture, async () => ({ status: 401, body: '' }), {
+      withConsumeLock: async (fn) => { locks += 1; return fn(); },
+      postRefresh: async () => { posts += 1; return { status: 500, body: '' }; },
+    }, { creds: fresh });
+    assert.deepEqual(result, { error: 'http-401' });
+    assert.equal(locks, 1);
+    assert.equal(posts, 0);
+  });
+
+  it('a same-lineage access rotation during the lock wait is adopted, not POSTed', async () => {
+    const fixture = await refreshFixture();
+    const fresh = credential('slot', NOW + 60 * 60_000);
+    const rotated = JSON.stringify({ claudeAiOauth: { accessToken: 'access-new', refreshToken: 'refresh-slot', expiresAt: NOW + 60 * 60_000 } });
+    await fixture.slots.writeSlot('account-a', fresh, { cause: 'post', by: 'qlb-cli', evidence: 'post' });
+    await fixture.backend.set(fixture.liveOptions.paths.keychainService, 'fixture-user', fresh);
+    const used: string[] = [];
+    let posts = 0;
+    const result = await fetch(fixture, async (token) => {
+      used.push(token);
+      return token === 'access-new' ? { status: 200, body: usageBody() } : { status: 401, body: '' };
+    }, {
+      withConsumeLock: async (fn) => {
+        await fixture.backend.set(fixture.liveOptions.paths.keychainService, 'fixture-user', rotated);
+        return fn();
+      },
+      postRefresh: async () => { posts += 1; return { status: 400, body: JSON.stringify({ error: 'invalid_grant' }) }; },
+    }, { creds: fresh });
+    assert.ok('usage' in result);
+    assert.equal(posts, 0);
+    assert.deepEqual(used, ['access-slot', 'access-new']);
+    assert.equal(fixture.slots.getSlot('account-a')!.dead, false);
+  });
+
+  it('a forced 401 on an unattributed access-only credential POSTs nothing', async () => {
+    const fixture = await refreshFixture();
+    const accessOnly = JSON.stringify({ claudeAiOauth: { accessToken: 'access-x', expiresAt: NOW + 60 * 60_000 } });
+    await fixture.slots.writeSlot('account-a', credential('slot', NOW + 60 * 60_000), { cause: 'post', by: 'qlb-cli', evidence: 'post' });
+    await fixture.backend.set(fixture.liveOptions.paths.keychainService, 'fixture-user', accessOnly);
+    let posts = 0;
+    const result = await fetch(fixture, async () => ({ status: 401, body: '' }), {
+      postRefresh: async () => { posts += 1; return { status: 400, body: JSON.stringify({ error: 'invalid_grant' }) }; },
+    }, { creds: accessOnly });
+    assert.deepEqual(result, { error: 'http-401' });
+    assert.equal(posts, 0);
+    assert.equal(fixture.slots.getSlot('account-a')!.dead, false);
+    assert.equal(await fixture.backend.get(fixture.liveOptions.paths.keychainService, 'fixture-user'), accessOnly);
+  });
+
+  it('the relogin sentinel surfaces in the same pass as the invalid_grant', async () => {
+    const fixture = await refreshFixture();
+    const result = await fetch(fixture, async () => { throw new Error('must not fetch'); }, {
+      postRefresh: async () => ({ status: 400, body: JSON.stringify({ error: 'invalid_grant' }) }),
+    });
+    assert.deepEqual(result, { sentinel: 'relogin-needed', error: 'invalid_grant' });
+  });
+
+  it('a server-rejected token with no recovery path surfaces the 401, not token-expired', async () => {
+    const fixture = await refreshFixture();
+    const foreign = credential('foreign', NOW + 60 * 60_000);
+    await fixture.backend.set(fixture.liveOptions.paths.keychainService, 'fixture-user', foreign);
+    const result = await fetch(fixture, async () => ({ status: 401, body: '' }), {}, { creds: foreign });
+    assert.deepEqual(result, { error: 'http-401' });
+  });
+
+  it('the rotated token is used for the usage fetch after the refresh', async () => {
+    const fixture = await refreshFixture();
+    const used: string[] = [];
+    await fetch(fixture, async (token) => { used.push(token); return { status: 200, body: usageBody() }; }, {
+      postRefresh: async () => ({ status: 200, body: JSON.stringify({ access_token: 'access-rotated', refresh_token: 'refresh-rotated', expires_in: 3600 }) }),
+    });
+    assert.deepEqual(used, ['access-rotated']);
+  });
+
+  it('a stashed or unpersisted successor yields token-expired and no usage GET', async () => {
+    for (const [stashFails, expected] of [
+      [false, { sentinel: 'token-expired' }],
+      [true, { sentinel: 'token-expired', unpersisted: true }],
+    ] as const) {
+      const fixture = await refreshFixture();
+      const slots = fixture.slots as unknown as {
+        writeSlot: typeof fixture.slots.writeSlot;
+        stashUnclaimed: typeof fixture.slots.stashUnclaimed;
+      };
+      slots.writeSlot = async () => { throw new Error('fixture slot failure'); };
+      if (stashFails) slots.stashUnclaimed = async () => { throw new Error('fixture stash failure'); };
+      let gets = 0;
+      let posts = 0;
+      const result = await fetch(fixture, async () => { gets += 1; return { status: 200, body: usageBody() }; }, {
+        postRefresh: async () => {
+          posts += 1;
+          return { status: 200, body: JSON.stringify({ access_token: 'access-issued', refresh_token: 'refresh-issued', expires_in: 3600 }) };
+        },
+        withConfigLock: async () => { throw new Error('fixture live failure'); },
+      });
+      assert.deepEqual(result, expected);
+      assert.equal(posts, 1);
+      assert.equal(gets, 0);
+    }
+  });
+
+  it('an expired active credential is no longer statically gated', async () => {
+    const fixture = await refreshFixture();
+    let posts = 0;
+    const result = await fetch(fixture, async () => ({ status: 200, body: usageBody() }), {
+      postRefresh: async () => {
+        posts += 1;
+        return { status: 200, body: JSON.stringify({ access_token: 'access-rotated', refresh_token: 'refresh-rotated', expires_in: 3600 }) };
+      },
+    });
+    assert.equal(posts, 1);
+    assert.ok(result.usage);
+  });
+
+  it('a strike bound to the slot is not lifted by a differing live fingerprint', async () => {
+    const fixture = await refreshFixture();
+    const struck = credential('slot', NOW + 60 * 60_000);
+    await fixture.slots.writeSlot('account-a', struck, { cause: 'post', by: 'qlb-cli', evidence: 'post' });
+    await fixture.slots.strikeDead('account-a', { reason: 'invalid_grant', struckFp: credentialLineage(struck)!, ts: NOW });
+    const result = await fetch(fixture, async () => { throw new Error('must not fetch'); }, {}, { creds: credential('different', NOW + 60 * 60_000) });
+    assert.deepEqual(result, { sentinel: 'relogin-needed' });
+    assert.equal(fixture.slots.getSlot('account-a')!.dead, true);
+  });
+
+  it('a slot write failure with a good live write still fetches usage with the new token and resyncs the slot', async () => {
+    const fixture = await refreshFixture();
+    const originalWrite = fixture.slots.writeSlot.bind(fixture.slots);
+    let writes = 0;
+    (fixture.slots as unknown as { writeSlot: typeof fixture.slots.writeSlot }).writeSlot = async (...args) => {
+      writes += 1;
+      if (writes === 1) throw new Error('fixture slot failure');
+      return originalWrite(...args);
+    };
+    const result = await fetch(fixture, async (token) => {
+      assert.equal(token, 'access-rotated');
+      return { status: 200, body: usageBody() };
+    }, {
+      postRefresh: async () => ({ status: 200, body: JSON.stringify({ access_token: 'access-rotated', refresh_token: 'refresh-rotated', expires_in: 3600 }) }),
+      afterAcceptedUsage: async ({ creds }) => originalWrite('account-a', creds, { cause: 'resync', by: 'qlb-cli', evidence: 'lineage' }),
+    });
+    assert.ok(result.usage);
+    assert.equal(credentialLineage((await fixture.slots.readSlot('account-a')).credential), credentialLineage(credential('rotated', NOW + 60 * 60_000)));
+  });
+
+  it('a healed strike unblocks fetching', async () => {
+    const fixture = await refreshFixture();
+    const current = credential('slot', NOW + 60 * 60_000);
+    await fixture.slots.writeSlot('account-a', current, { cause: 'post', by: 'qlb-cli', evidence: 'post' });
+    await fixture.slots.strikeDead('account-a', { reason: 'invalid_grant', struckFp: credentialLineage(current)!, ts: NOW });
+    const healed = credential('healed', NOW + 60 * 60_000);
+    await fixture.slots.writeSlot('account-a', healed, { cause: 'post', by: 'qlb-cli', evidence: 'post' });
+    let gets = 0;
+    const result = await fetch(fixture, async () => { gets += 1; return { status: 200, body: usageBody() }; }, {}, { creds: healed });
+    assert.ok(result.usage);
+    assert.equal(gets, 1);
+  });
+
+  it('every RefreshOutcome variant maps to exactly one record shape', () => {
+    const working = credential('working');
+    const cases: Array<[RefreshOutcome, unknown]> = [
+      [{ outcome: 'posted', working }, { working }],
+      [{ outcome: 'posted-slot-unwritten', working }, { working }],
+      [{ outcome: 'restored', working }, { working }],
+      [{ outcome: 'adopted', working }, { working }],
+      [{ outcome: 'posted-live-unwritten', working }, { sentinel: 'token-expired' }],
+      [{ outcome: 'stashed', working }, { sentinel: 'token-expired' }],
+      [{ outcome: 'unpersisted', working, successorFailure: 'unable to persist refresh successor' }, { sentinel: 'token-expired', unpersisted: true }],
+      [{ outcome: 'failed', reason: 'refresh-failed' }, { error: 'refresh-failed' }],
+      [{ outcome: 'failed', reason: 'invalid_client' }, { error: 'invalid_client' }],
+      [{ outcome: 'failed', reason: 'foreign-credential' }, { sentinel: 'foreign-credential' }],
+      [{ outcome: 'dead', reason: 'invalid_grant', struckFp: null }, { sentinel: 'relogin-needed', error: 'invalid_grant' }],
+      [{ outcome: 'dead', reason: 'no_refresh_token', struckFp: null }, { sentinel: 'relogin-needed', error: 'no_refresh_token' }],
+      [{ outcome: 'deferred', deferReason: 'degraded-read' }, { sentinel: 'keychain-unavailable' }],
+      [{ outcome: 'deferred', deferReason: 'degraded-read', forceRecord: { error: 'http-401' } }, { error: 'http-401' }],
+      [{ outcome: 'deferred', deferReason: 'locks-held' }, { sentinel: 'token-expired' }],
+      [{ outcome: 'deferred', deferReason: 'unexpected', forceRecord: { error: 'http-401' } }, { error: 'http-401' }],
+      [{ outcome: 'refused', reason: 'store-unmirrored' }, { error: 'store-unmirrored' }],
+    ];
+    for (const [outcome, expected] of cases) assert.deepEqual(mapRefreshOutcome(outcome), expected);
   });
 });
 

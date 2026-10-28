@@ -11,11 +11,14 @@
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import {
+  accessTokenFingerprint,
   buildRefreshRequest,
   classifyRefreshResponse,
   credentialFingerprint,
+  extractAccessToken,
   isOAuthTokenExpired,
   parseCredentialBlob,
+  parseUsageResponse,
   serializeCredentialBlob,
   type HttpRequestDescription,
 } from './anthropic-oauth';
@@ -353,6 +356,166 @@ function slotUsable(credential: string | null): boolean {
   return credential !== null && hasUsablePair(credential);
 }
 
+export interface ActiveUsageResponse {
+  status: number;
+  body: string;
+  retryAfterS?: number;
+}
+
+export interface AcceptedUsageContext {
+  accountId: string;
+  email: string;
+  orgUuid: string;
+  creds: string;
+  usage: unknown;
+}
+
+export interface FetchActiveUsageDeps extends RefreshActiveLoginDeps {
+  getUsage: (accessToken: string) => Promise<ActiveUsageResponse>;
+  /** Best-effort hook for the K6-5 resync path; never runs from a degraded read. */
+  afterAcceptedUsage?: (context: AcceptedUsageContext) => void | Promise<void>;
+}
+
+export type FetchActiveUsageInput = Omit<RefreshActiveLoginInput, 'forceRecord'>;
+
+function httpRecord(response: ActiveUsageResponse): ActiveFetchRecord {
+  const record: ActiveFetchRecord = { error: `http-${response.status}` };
+  if (response.retryAfterS !== undefined) record.retryAfterS = response.retryAfterS;
+  return record;
+}
+
+async function fetchUsageRecord(
+  deps: FetchActiveUsageDeps,
+  input: FetchActiveUsageInput,
+  creds: string,
+): Promise<ActiveFetchRecord> {
+  const accessToken = extractAccessToken(creds);
+  if (!accessToken) return { sentinel: 'no-credentials' };
+
+  let response: ActiveUsageResponse;
+  try {
+    response = await deps.getUsage(accessToken);
+  } catch {
+    return { error: 'usage-fetch-failed' };
+  }
+  if (response.status < 200 || response.status >= 300) return httpRecord(response);
+
+  let usage: unknown;
+  try {
+    usage = parseUsageResponse(JSON.parse(response.body));
+  } catch {
+    return { error: 'usage-unreadable' };
+  }
+  if (deps.verdicts.get(input.accountId, input.email, credentialLineage(creds) ?? '')?.match === false) {
+    return { sentinel: 'foreign-credential' };
+  }
+  if (!input.degraded) {
+    try {
+      await deps.afterAcceptedUsage?.({
+        accountId: input.accountId,
+        email: input.email,
+        orgUuid: input.orgUuid,
+        creds,
+        usage,
+      });
+    } catch {
+      // Resync is intentionally best-effort; accepted usage remains usable.
+      warn(deps, 'Claude active usage resync failed');
+    }
+  }
+  if (deps.verdicts.get(input.accountId, input.email, credentialLineage(creds) ?? '')?.match === false) {
+    return { sentinel: 'foreign-credential' };
+  }
+  return { usage };
+}
+
+export type RefreshOutcomeMapping = ActiveFetchRecord | { working: string };
+
+/** Map the closed refresh result union without ever exposing an unsafe successor. */
+export function mapRefreshOutcome(outcome: RefreshOutcome): RefreshOutcomeMapping {
+  switch (outcome.outcome) {
+    case 'posted':
+    case 'posted-slot-unwritten':
+    case 'restored':
+    case 'adopted':
+      return { working: outcome.working };
+    case 'posted-live-unwritten':
+    case 'stashed':
+      return { sentinel: 'token-expired' };
+    case 'unpersisted':
+      return { sentinel: 'token-expired', unpersisted: true };
+    case 'failed':
+      return outcome.reason === 'foreign-credential'
+        ? { sentinel: 'foreign-credential' }
+        : { error: outcome.reason };
+    case 'dead':
+      return { sentinel: 'relogin-needed', error: outcome.reason };
+    case 'deferred':
+      if (outcome.deferReason === 'degraded-read') {
+        return outcome.forceRecord ?? { sentinel: 'keychain-unavailable' };
+      }
+      return outcome.forceRecord ?? { sentinel: 'token-expired' };
+    case 'refused':
+      return { error: outcome.reason };
+    default: {
+      const exhaustive: never = outcome;
+      return exhaustive;
+    }
+  }
+}
+
+/**
+ * Fetch usage for the active Claude login. The only recovery POST is delegated
+ * to refreshActiveLogin; this wrapper keeps usage I/O outside every credential
+ * lock and translates every closed RefreshOutcome into collector-safe data.
+ */
+export async function fetchActiveUsage(
+  deps: FetchActiveUsageDeps,
+  input: FetchActiveUsageInput,
+): Promise<ActiveFetchRecord> {
+  // A strike binds to the slot, not the live blob.  Check it before even a
+  // locally-valid access token can make a usage request.
+  if (deps.slots.getSlot(input.accountId)?.dead) return { sentinel: 'relogin-needed' };
+
+  const accessToken = extractAccessToken(input.creds);
+  if (!accessToken) return { sentinel: 'no-credentials' };
+
+  let forceRecord: ActiveFetchRecord | undefined;
+  let refreshCreds = input.creds;
+  if (!isOAuthTokenExpired(oauthExpiry(input.creds), deps.now())) {
+    const initial = await fetchUsageRecord(deps, input, input.creds);
+    if (initial.error !== 'http-401') return initial;
+
+    // A different access generation means Claude Code already rotated; never
+    // consume a grant based on the rejected snapshot in that case.
+    try {
+      const live = await readLiveClaudeCredentials({ ...deps.live, env: deps.live.env ?? deps.env });
+      if (!live || accessTokenFingerprint(live) !== accessTokenFingerprint(input.creds)) return initial;
+      // Bind a forced recovery to live only when it is still the caller's
+      // lineage. Metadata-only rewrites retain their shared fields, while a
+      // different or partial live snapshot remains subject to the locked
+      // provenance decisions below.
+      if (hasUsablePair(live) && credentialLineage(live) === credentialLineage(input.creds)) {
+        refreshCreds = live;
+      }
+    } catch {
+      return initial;
+    }
+    forceRecord = initial;
+  }
+
+  const outcome = await refreshActiveLogin(deps, { ...input, creds: refreshCreds, forceRecord });
+  const mapped = mapRefreshOutcome(outcome);
+  if (!('working' in mapped)) return mapped;
+  // A fresh live adoption may retain the access generation just rejected by
+  // the server. Do not make a second GET with that rejected generation.
+  if (outcome.outcome === 'adopted' && forceRecord !== undefined
+    && accessTokenFingerprint(mapped.working) === accessTokenFingerprint(input.creds)) {
+    return forceRecord;
+  }
+  return fetchUsageRecord(deps, input, mapped.working);
+}
+
 /**
  * Refresh the one active Claude credential under the complete consume/switch/
  * Claude-Code lock hierarchy. No caller is allowed to reuse an unlocked slot
@@ -419,7 +582,18 @@ export async function refreshActiveLogin(
       let slotPrevFp = row?.prevFingerprint ?? null;
       const liveFp = credentialLineage(live);
       const memo = liveFp ? deps.verdicts.get(input.accountId, input.email, liveFp) : undefined;
-      const adopted = adoptRotatedLive({ creds: input.creds, live, slotFp, slotPrevFp, verdict: memo, now: deps.now() });
+      // A forced 401 binds to live only when both its lineage and the rejected
+      // access generation are unchanged. A differing, partial or newly issued
+      // live blob takes the ordinary locked adopt, defer, or foreign-refusal path.
+      const decisionCreds = input.forceRecord !== undefined && live
+        && hasUsablePair(live)
+        && credentialLineage(live) === credentialLineage(input.creds)
+        && accessTokenFingerprint(live) === accessTokenFingerprint(input.creds)
+        ? live : input.creds;
+      if (input.forceRecord !== undefined && memo?.match === false) {
+        return finish({ outcome: 'failed', reason: 'foreign-credential' });
+      }
+      const adopted = adoptRotatedLive({ creds: decisionCreds, live, slotFp, slotPrevFp, verdict: memo, now: deps.now() });
       if (adopted.kind === 'foreign') return finish({ outcome: 'failed', reason: 'foreign-credential' });
       if (adopted.kind === 'adopt') {
         if (adopted.writeSlot) {
@@ -433,7 +607,7 @@ export async function refreshActiveLogin(
         const fp = credentialLineage(live);
         const attributed = Boolean(fp && (deps.verdicts.matches(input.accountId, input.email, fp)
           || (slotFp !== null && isSuccessor(deps.store, 'anthropic', input.accountId, slotFp, fp))));
-        return chooseRefreshInput({ creds: input.creds, live, backup: backup.credential, backupUsable: slotUsable(backup.credential), slotFp, attributed, forceRefresh: input.forceRecord !== undefined, now: deps.now() });
+        return chooseRefreshInput({ creds: decisionCreds, live, backup: backup.credential, backupUsable: slotUsable(backup.credential), slotFp, attributed, forceRefresh: input.forceRecord !== undefined, now: deps.now() });
       };
       const publish = async (working: string, mergeLive: boolean): Promise<void> => {
         const shared = mergeLive ? sharedCredentialFields(live) : null;
