@@ -1142,6 +1142,77 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     }
   });
 
+  it('T-E2 rollback with a marker set routes exactly as resume', async () => {
+    const handback = {
+      phase: 'cleanup-pending' as const,
+      keychainDisposition: 'keep' as const,
+      piFingerprint: null,
+      decision: null,
+      fencedGeneration: null,
+      rolledBackAt: 123,
+    };
+
+    // C3 takes precedence over C4, clears the cleanup marker, and makes the
+    // terminal rollback repeat-safe just as resume does.
+    {
+      const h = setup('xai');
+      try {
+        h.store.upsertMigration('pi-xai', 'NATIVE', JSON.stringify({
+          handback,
+          intent: 'rollback',
+          rollbackDecision: ROLLBACK_DECISION,
+        }));
+
+        assert.doesNotThrow(() => h.mig.rollback(), 'cleanup-pending rollback must not demand resume');
+        const afterFirst = h.store.getMigration('pi-xai');
+        assert.equal(JSON.parse(afterFirst!.detail_json).handback, undefined, 'C3 clears the hand-back marker');
+        assert.equal(JSON.parse(afterFirst!.detail_json).rollbackDecision, undefined, 'C3 clears the recorded decision');
+        assert.ok(JSON.parse(afterFirst!.detail_json).lastRollback, 'C3 records the completed hand-back');
+
+        assert.doesNotThrow(() => h.mig.rollback(), 'a second terminal rollback is a no-op, never a resume refusal');
+        assert.deepEqual(h.store.getMigration('pi-xai'), afterFirst, 'a second rollback does not rewrite the terminal journal');
+      } finally {
+        h.cleanup();
+      }
+    }
+
+    // C4 must continue the existing rollback directly, without re-journaling
+    // intent through postCommitRollback. Use the complete eight-field decision
+    // shape required for a committed QLB_OWNED fixture.
+    {
+      const h = setup('xai');
+      try {
+        h.mig.stage();
+        await h.mig.rehearse(mockRehearse([]));
+        h.mig.commit();
+        const row = h.store.getMigration('pi-xai')!;
+        h.store.upsertMigration('pi-xai', 'QLB_OWNED', JSON.stringify({
+          ...JSON.parse(row.detail_json),
+          rollbackDecision: ROLLBACK_DECISION,
+        }));
+
+        const originalUpsertMigration = h.store.upsertMigration.bind(h.store);
+        const writes: Array<{ state: string; detail: Record<string, unknown> }> = [];
+        h.store.upsertMigration = (store, state, detail) => {
+          if (store === 'pi-xai') writes.push({ state, detail: JSON.parse(detail ?? '{}') as Record<string, unknown> });
+          return originalUpsertMigration(store, state, detail);
+        };
+
+        assert.doesNotThrow(() => h.mig.rollback(), 'rollback-decision must not demand resume');
+        assert.equal(writes.some((write) => write.state === 'QLB_OWNED' && write.detail.intent === 'rollback'), false,
+          'C4 continues directly instead of re-journaling intent');
+        const afterFirst = h.store.getMigration('pi-xai');
+        assert.equal(afterFirst?.state, 'VALIDATED', 'C4 finishes through the same rollback journal path as resume');
+        assert.equal(JSON.parse(afterFirst!.detail_json).rollbackDecision, undefined, 'terminal path clears the recorded decision');
+
+        assert.doesNotThrow(() => h.mig.rollback(), 'a second C4-completed rollback is a no-op, never a resume refusal');
+        assert.deepEqual(h.store.getMigration('pi-xai'), afterFirst, 'a second C4-completed rollback does not rewrite the journal');
+      } finally {
+        h.cleanup();
+      }
+    }
+  });
+
   it('cleanup-pending with leftover rollback intent and decision settles in one resume', () => {
     const h = setup('xai');
     try {
