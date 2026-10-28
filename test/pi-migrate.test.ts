@@ -321,6 +321,27 @@ describe('Pi migration S58 credential-first barrier', () => {
     } finally { h.cleanup(); }
   });
 
+  it('xai: a publishing resume with the owner entry visible fails closed on a Keychain read error', () => {
+    const h = setup();
+    try {
+      assert.throws(() => migratePiSingleProvider('xai', h.paths, {
+        keychain: h.keychain,
+        store: h.store,
+        afterWrite: (point: string) => { if (point === 'owner-entry') throw new Error('injected crash'); },
+      }), /injected crash/);
+      const service = qlbKeychainService('xai', 'default');
+      const rotated = JSON.stringify({ ...(JSON.parse(h.keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT)) as Record<string, unknown>), refresh: 'rotated-refresh', access: 'rotated-access' });
+      h.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, rotated);
+      const flaky = {
+        setSync: (s: string, a: string, v: string) => h.keychain.setSync(s, a, v),
+        getSync: (s: string, a: string): string => { if (s === service) throw new Error('security: keychain read timed out'); return h.keychain.getSync(s, a); },
+        deleteSync: (s: string, a: string) => h.keychain.deleteSync(s, a),
+      } as unknown as typeof h.keychain;
+      assert.throws(() => migratePiSingleProvider('xai', h.paths, { keychain: flaky, store: h.store }), /timed out/);
+      assert.equal(h.keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT), rotated, 'a read error never reinstalls the baseline over the managed item');
+    } finally { h.cleanup(); }
+  });
+
   for (const damage of ['lost', 'corrupt'] as const) {
     it(`xai: a publishing resume with the owner entry visible reinstalls a ${damage} managed item from the baseline`, () => {
       const h = setup();

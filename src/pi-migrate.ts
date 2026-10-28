@@ -183,7 +183,12 @@ function baselineValue(provider: PiSingleProvider, auth: JsonObject, deps: PiMig
 }
 function keychainPayload(provider: PiSingleProvider, baseline: unknown): string { if (provider === 'openrouter') { const value = asObject(baseline, 'openrouter credential is invalid'); if (typeof value.access !== 'string' || !value.access) throw new Error('openrouter credential is invalid'); return JSON.stringify({ type: 'api-key', access: value.access }); } return JSON.stringify(parseOAuth(baseline, provider)); }
 function managedValue(provider: PiSingleProvider, deps: PiMigrateDeps): unknown | undefined { try { return JSON.parse(deps.keychain.getSync(managedService(provider), QLB_KEYCHAIN_ACCOUNT)); } catch { return undefined; } }
-function usableManaged(provider: PiSingleProvider, deps: PiMigrateDeps): boolean { const managed = managedValue(provider, deps); if (managed === undefined) return false; try { keychainPayload(provider, managed); return true; } catch { return false; } }
+/** Only an explicit not-found or an invalid stored value counts as unusable; any other read error fails closed. */
+function usableManaged(provider: PiSingleProvider, deps: PiMigrateDeps): boolean {
+  let raw: string;
+  try { raw = deps.keychain.getSync(managedService(provider), QLB_KEYCHAIN_ACCOUNT); } catch (error) { if (isCredentialNotFound(error)) return false; throw error; }
+  try { keychainPayload(provider, JSON.parse(raw)); return true; } catch { return false; }
+}
 
 /** S0.6: generic ownership must be quiescent before P7a may begin. */
 function genericMigrationAtRest(provider: PiSingleProvider, paths: PiMigratePaths, deps: PiMigrateDeps, ownJournal: Journal | null): boolean {
