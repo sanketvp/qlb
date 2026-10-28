@@ -520,6 +520,38 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     }
   });
 
+  it('rollback with a journaled intent over an Oc claim takes the post-commit path', async () => {
+    const h = setup('xai');
+    try {
+      const customPath = join(h.dir, 'custom-owner.json');
+      const mig = createSingleGrantMigration(h.store, h.kc, 'xai', h.authPath, customPath);
+      mig.stage();
+      await mig.rehearse(mockRehearse([]));
+      const detail = JSON.parse(h.store.getMigration('pi-xai')!.detail_json) as Record<string, unknown>;
+      h.store.upsertMigration('pi-xai', 'VALIDATED', JSON.stringify({
+        ...detail,
+        commitGeneration: h.store.getGrantGeneration(expectedId('xai')),
+        intent: 'rollback',
+      }));
+      rmSync(stagingOwnerPath(join(h.dir, 'qlb-owner.json'), 'xai'), { force: true });
+      writeFileSync(customPath, JSON.stringify({ owner: 'qlb', accounts: [{ provider: 'xai' }] }) + '\n');
+
+      const states: string[] = [];
+      const original = h.store.upsertMigration.bind(h.store);
+      h.store.upsertMigration = (store, state, next) => {
+        if (store === 'pi-xai') states.push(state);
+        return original(store, state, next);
+      };
+      const rolled = mig.rollback();
+
+      assert.equal(states.includes('NATIVE'), false, 'rollback never takes the pre-commit path');
+      assert.equal(existsSync(customPath), false, 'the post-commit hand-back removes the custom owner file');
+      assert.equal(rolled.detail.rolledBackFrom, 'post-commit');
+    } finally {
+      h.cleanup();
+    }
+  });
+
   it('resume after a crash between the C5 forward finish and the rollback intent keeps an Oc claim owned', async () => {
     const h = setup('xai');
     try {

@@ -1226,7 +1226,7 @@ export class Migration {
 
   private rollbackUnlocked(): MigrationStatus {
     this.assertNotP7aOwned();
-    const ownerPresent = this.ownerEntryPresent();
+    const ownerPresent = this.claimPresent();
     // C5: a VALIDATED journal with this path's own commit evidence (`Gen`) is
     // a crash after the commit point. Finish the forward journal transition,
     // then take the ordinary post-commit hand-back path. C4 comes first: a
