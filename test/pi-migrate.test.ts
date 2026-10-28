@@ -289,6 +289,21 @@ describe('Pi migration S58 credential-first barrier', () => {
     } finally { h.cleanup(); }
   });
 
+  it('a foreign owner entry does not count as already migrated over a placeholder', () => {
+    const h = setup();
+    try {
+      writeFileSync(h.paths.authJsonPath, JSON.stringify({ xai: { type: 'oauth', access: 'qlb-managed', refresh: '' } }), { mode: 0o600 });
+      mkdirSync(dirname(h.paths.ownerPath), { recursive: true });
+      writeFileSync(h.paths.ownerPath, JSON.stringify({ providers: { xai: { mode: 'manual' } } }), { mode: 0o600 });
+      assert.throws(
+        () => migratePiSingleProvider('xai', h.paths, { keychain: h.keychain, store: h.store }),
+        /Pi xai baseline would be a placeholder/,
+      );
+      assert.equal(existsSync(join(h.paths.journalPath, 'pi-migrate-xai.json')), false);
+      assert.equal(h.store.getConfig('pi.xai.state'), null);
+    } finally { h.cleanup(); }
+  });
+
   it('refuses a placeholder auth entry with no journal before writing anything', () => {
     const h = setup();
     try {

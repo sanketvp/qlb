@@ -232,7 +232,7 @@ export function migratePiSingleProvider(provider: PiSingleProvider, paths: PiMig
     resumed = inLockJournal !== null;
     if (!genericMigrationAtRest(provider, paths, deps, inLockJournal)) throw genericMigrationOwnedError();
     const auth = readAuth(paths.authJsonPath); const currentOwner = readPiOwnerProviders(paths.ownerPath);
-    const alreadyMigrated = !inLockJournal && (provider === 'openrouter' || isPiPlaceholder(auth[provider])) && currentOwner[provider];
+    const alreadyMigrated = !inLockJournal && (provider === 'openrouter' || isPiPlaceholder(auth[provider])) && isPiQlbOwnerEntry(currentOwner[provider]);
     if (alreadyMigrated) {
       state = 'migrated';
     } else {
