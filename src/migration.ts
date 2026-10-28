@@ -109,6 +109,7 @@ import {
   closeSync,
   existsSync,
   fsyncSync,
+  lstatSync,
   openSync,
   readFileSync,
   renameSync,
@@ -123,7 +124,7 @@ import type { KeychainBackend } from './keychain';
 import { openRouterMissingKeyMessage, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, readNativeOpenRouterKey } from './keychain';
 import { removePiAuthBackup } from './pi-auth-backup';
 import { parseGrant } from './refresh-lease';
-import { hasLegacyPiOwnerEntry, readPiOwnerProviders, withPiAuthLock, writePiOwnerEntry } from './pi-migrate';
+import { hasLegacyPiOwnerEntry, PiOwnerLegacyError, readPiOwnerProviders, withPiAuthLock, writePiOwnerEntry } from './pi-migrate';
 import { OPENROUTER_GATE_KEYCHAIN_SERVICE } from './token/openrouter';
 import type { Store } from './store';
 import type { Grant } from './types';
@@ -795,13 +796,88 @@ export class Migration {
 
   /** Design §2 S0 `Claim` = `O` ∨ `L` ∨ `Oc` (a custom `--owner-file` v1 document naming this provider). */
   private claimPresent(): boolean {
-    if (this.ownerEntryPresent()) return true;
-    if (this.kind === 'pool' || this.legacySidecarPath() === this.ownerFilePath) return false;
+    const claim = this.ownershipClaim();
+    return claim !== null && claim.kind !== 'unreadable';
+  }
+
+  private claimPathPresent(path: string): boolean {
     try {
-      return hasLegacyPiOwnerEntry(this.ownerFilePath, this.ownerProvider());
-    } catch {
-      return false;
+      lstatSync(path);
+      return true;
+    } catch (error: unknown) {
+      // Only a definite absence is safe to classify as no claim. Permission,
+      // path-shape, and other lookup errors are ambiguous durable evidence.
+      return !isObjectRecord(error) || error.code !== 'ENOENT';
     }
+  }
+
+  private unreadableOwnerMapAt(path: string): boolean {
+    // Do not rely on readPiOwnerProviders' existsSync() guard: existsSync()
+    // reports a dangling symlink as absent. lstat makes only ENOENT absent.
+    if (!this.claimPathPresent(path)) return false;
+    try {
+      readFileSync(path, 'utf8');
+      readPiOwnerProviders(path);
+      return false;
+    } catch (error) {
+      // A legacy v1 file is readable and has its own explicit rejection at
+      // the static-key commit boundary; it is not an ambiguous O claim.
+      return !(error instanceof PiOwnerLegacyError);
+    }
+  }
+
+  private unreadableLegacySidecarAt(path: string): boolean {
+    // As above, lstat detects a dangling L symlink before readFileSync can
+    // otherwise be hidden by existsSync()-based callers.
+    if (!this.claimPathPresent(path)) return false;
+    try {
+      JSON.parse(readFileSync(path, 'utf8'));
+      return false;
+    } catch {
+      return true;
+    }
+  }
+
+  private unreadableCustomOwnerFileAt(path: string): boolean {
+    // Oc is a v1 document, so preserve ownershipClaim's read-then-parse probe
+    // while making it independently available to the fail-closed assertion.
+    if (!this.claimPathPresent(path)) return false;
+    try {
+      readFileSync(path, 'utf8');
+      hasLegacyPiOwnerEntry(path, this.ownerProvider());
+      return false;
+    } catch {
+      return true;
+    }
+  }
+
+  private ownershipClaim(): { kind: 'O' | 'L' | 'Oc' | 'unreadable'; path: string } | null {
+    // The pool path deliberately preserves its pre-P7b claim semantics. C6
+    // does not classify it, and its callers still need the committed claim.
+    if (this.kind === 'pool') {
+      return this.ownerEntryPresent() ? { kind: 'L', path: this.ownerFilePath } : null;
+    }
+
+    if (this.ownerEntryPresentAt(this.ownerMapPath)) return { kind: 'O', path: this.ownerMapPath };
+    if (this.unreadableOwnerMapAt(this.ownerMapPath)) return { kind: 'unreadable', path: this.ownerMapPath };
+
+    const legacyPath = this.legacySidecarPath();
+    if (legacyPath) {
+      if (this.legacySidecarOwned()) return { kind: 'L', path: legacyPath };
+      if (this.unreadableLegacySidecarAt(legacyPath)) return { kind: 'unreadable', path: legacyPath };
+    }
+
+    if (this.ownerFilePath === this.ownerMapPath || this.ownerFilePath === legacyPath) return null;
+    // lstat the custom path before its existsSync()-based reader so dangling
+    // Oc symlinks are ambiguous evidence, not an absent claim.
+    if (!this.claimPathPresent(this.ownerFilePath)) return null;
+    if (this.unreadableCustomOwnerFileAt(this.ownerFilePath)) {
+      return { kind: 'unreadable', path: this.ownerFilePath };
+    }
+    if (hasLegacyPiOwnerEntry(this.ownerFilePath, this.ownerProvider())) {
+      return { kind: 'Oc', path: this.ownerFilePath };
+    }
+    return null;
   }
 
   /** Design §2 S0 facts `Gen`, `Rb` and `Hb`, read from this path's own durable evidence. */
@@ -821,6 +897,48 @@ export class Migration {
         || Object.prototype.hasOwnProperty.call(detail, 'rollbackDecision'),
       handbackPending: isObjectRecord(detail.handback) && detail.handback.phase === 'cleanup-pending',
     };
+  }
+
+  /** Ambiguous O/L/Oc evidence fails closed, regardless of journal state. */
+  private assertNoUnreadableOwnershipClaim(): void {
+    if (this.kind === 'pool') return;
+
+    // Do not use ownershipClaim() here: it deliberately returns the first
+    // valid claim by precedence, but every claim form is durable evidence and
+    // any unreadable form must fail closed.
+    const legacyPath = this.legacySidecarPath();
+    const unreadableOwnerMap = this.unreadableOwnerMapAt(this.ownerMapPath);
+    const unreadableLegacySidecar = legacyPath !== null
+      && this.unreadableLegacySidecarAt(legacyPath);
+    const unreadableCustomOwnerFile = this.ownerFilePath !== this.ownerMapPath
+      && this.ownerFilePath !== legacyPath
+      && this.unreadableCustomOwnerFileAt(this.ownerFilePath);
+    const unreadablePath = unreadableOwnerMap
+      ? this.ownerMapPath
+      : unreadableLegacySidecar
+        ? legacyPath
+        : unreadableCustomOwnerFile
+          ? this.ownerFilePath
+          : null;
+    if (!unreadablePath) return;
+    throw Object.assign(
+      new Error(`owner-file-orphan: ${unreadablePath} could not be read; inspect and repair it before retrying.`),
+      { exitCode: 3 },
+    );
+  }
+
+  /** C6: a claim without this path's durable evidence must never be cleaned up. */
+  private assertNoOrphanOwnershipClaim(): void {
+    // C6 classifies the generic paths only; the pool's existing C5 recovery
+    // owns its v1 commit-point crash window.
+    if (this.kind === 'pool') return;
+    const facts = this.ownershipFacts();
+    const claim = this.ownershipClaim();
+    if (!claim || facts.committed || facts.rollbackInProgress || facts.handbackPending) return;
+    const message = claim.kind === 'O'
+      ? `owner-file-orphan: QLB has no record of committing ${this.ownerProvider()}, but the shared owner map ${claim.path} has a QLB entry for it. Remove only the ${this.ownerProvider()} entry from that file; do not delete the file (other providers' entries live there).`
+      : `owner-file-orphan: QLB has no record of committing ${this.ownerProvider()}, but the owner file ${claim.path} has a QLB entry for it. Remove the file ${claim.path} before retrying.`;
+    throw Object.assign(new Error(message), { exitCode: 3 });
   }
 
   private ownerProvider(): MigrateProvider {
@@ -1046,6 +1164,8 @@ export class Migration {
     }
 
     this.assertNotP7aOwned();
+    this.assertNoUnreadableOwnershipClaim();
+    this.assertNoOrphanOwnershipClaim();
     // P7b8 alone may convert the pool's v1 owner document into the shared
     // v2 map. Refuse before creating staging, Keychain, or journal state.
     this.refusePoolOwnerMap();
@@ -1114,6 +1234,7 @@ export class Migration {
     if (current.state !== 'MIRRORED' && current.state !== 'VALIDATED') {
       throw new Error(`cannot rehearse from state ${current.state}`);
     }
+    this.assertNoUnreadableOwnershipClaim();
     const staged = this.readStagedAccounts();
     if (staged.length === 0) {
       throw new Error('no staged Keychain credentials to rehearse');
@@ -1160,6 +1281,8 @@ export class Migration {
 
   private commitUnlocked(): MigrationStatus {
     this.assertNotP7aOwned();
+    this.assertNoUnreadableOwnershipClaim();
+    this.assertNoOrphanOwnershipClaim();
     // P7b8 alone may convert the pool's v1 owner document into the shared
     // v2 map. Refuse before any journal or native-pool write.
     this.refusePoolOwnerMap();
@@ -1232,7 +1355,7 @@ export class Migration {
 
   private rollbackUnlocked(): MigrationStatus {
     this.assertNotP7aOwned();
-    const ownerPresent = this.claimPresent();
+    this.assertNoUnreadableOwnershipClaim();
     // C5: a VALIDATED journal with this path's own commit evidence (`Gen`) is
     // a crash after the commit point. Finish the forward journal transition,
     // then take the ordinary post-commit hand-back path. C4 comes first: a
@@ -1241,6 +1364,8 @@ export class Migration {
       const facts = this.ownershipFacts();
       if (facts.committed && !facts.rollbackInProgress) this.finishHygiene();
     }
+    this.assertNoOrphanOwnershipClaim();
+    const ownerPresent = this.claimPresent();
     if (ownerPresent || this.journalState() === 'QLB_OWNED') {
       return this.postCommitRollback();
     }
@@ -1264,12 +1389,14 @@ export class Migration {
 
   private resumeUnlocked(): MigrationStatus {
     this.assertNotP7aOwned();
+    this.assertNoUnreadableOwnershipClaim();
     const current = this.status();
     const intent = current.detail.intent === 'rollback';
 
     if (intent) {
       return this.continueRollback();
     }
+    this.assertNoOrphanOwnershipClaim();
     // Any claim, including a custom owner file (Oc), is past C: finish forward.
     if (this.claimPresent()) {
       return this.finishHygiene();
@@ -1357,6 +1484,8 @@ export class Migration {
     // Keep the P7a ownership classifier here so it is adjacent to the
     // single-grant's first durable write (the MIRRORED journal).
     this.assertNotP7aOwned();
+    this.assertNoUnreadableOwnershipClaim();
+    this.assertNoOrphanOwnershipClaim();
     const current = this.status();
     if (current.ownerFile === 'present' || current.state === 'QLB_OWNED' || current.state === 'RETIRED') {
       throw new Error(
