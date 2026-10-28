@@ -1,8 +1,24 @@
 import { createHash } from 'node:crypto';
+import { resolve } from 'node:path';
 
+import type { PiAuthBackup } from './pi-auth-backup';
 import type { Grant } from './types';
 
 export type SingleGrantSourceKind = 'keychain' | 'exact-backup' | 'legacy-backup' | 'none';
+
+/** Digest used for a missing Keychain item (§2 S2). */
+export const ABSENT = 'ABSENT';
+/** @deprecated Use ABSENT. Kept as a descriptive alias for callers. */
+export const ABSENT_KEYCHAIN_DIGEST = ABSENT;
+
+export interface RestoreRecordInput {
+  authPath: string;
+  key: string;
+  decidedAt: number;
+  filePresent: boolean;
+  entryPresent: boolean;
+  entry?: unknown;
+}
 
 /** The restore-relevant portion of a Pi auth backup. */
 export interface SingleGrantBackup {
@@ -57,6 +73,65 @@ export class NoSingleGrantRestoreSourceError extends Error {
 
 function fingerprint(refresh: string): string {
   return createHash('sha256').update(refresh, 'utf8').digest('hex');
+}
+
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value === 'boolean' || typeof value === 'string') return JSON.stringify(value);
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) throw new TypeError('canonical digest requires finite numbers');
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (isRecord(value)) {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`;
+  }
+  throw new TypeError('canonical digest requires JSON data');
+}
+
+/** SHA-256 of a recursively key-sorted JSON value. */
+export function canonicalDigest(value: unknown): string {
+  return createHash('sha256').update(canonicalJson(value), 'utf8').digest('hex');
+}
+
+/** §5.2 fence calculation. An absent Keychain grant is represented by -1. */
+export function fencedGeneration(storeGeneration: number, keychainGeneration: number): number {
+  if (!Number.isSafeInteger(storeGeneration) || storeGeneration < 0
+    || !Number.isSafeInteger(keychainGeneration) || keychainGeneration < -1) {
+    throw new RangeError('invalid grant generation');
+  }
+  return Math.max(storeGeneration, keychainGeneration) + 1;
+}
+
+/**
+ * The S2(ii) comparison digest. Its fields deliberately exclude incidental
+ * Keychain payload data while binding the token lineage and write generation.
+ */
+export function keychainDigest(grant: Grant | null | undefined): string {
+  if (grant === null || grant === undefined) return ABSENT;
+  return canonicalDigest([
+    grant.generation,
+    grant.writtenBy ?? null,
+    fingerprint(grant.refresh),
+    fingerprint(grant.access),
+  ]);
+}
+
+/** Build the normalized restore record whose canonical digest is journaled. */
+export function restoreRecordFor(input: RestoreRecordInput): PiAuthBackup {
+  if (!Number.isFinite(input.decidedAt)) throw new TypeError('restore record requires a finite decision time');
+  if (input.entryPresent && !input.filePresent) throw new TypeError('restore record cannot contain an entry from an absent file');
+  if (input.entryPresent && !Object.prototype.hasOwnProperty.call(input, 'entry')) {
+    throw new TypeError('restore record requires an entry');
+  }
+  return {
+    version: 1,
+    authPath: resolve(input.authPath),
+    key: input.key,
+    cycleId: `handback:${input.decidedAt}`,
+    filePresent: input.filePresent,
+    entryPresent: input.entryPresent,
+    ...(input.entryPresent ? { entry: input.entry } : {}),
+  };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

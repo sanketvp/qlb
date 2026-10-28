@@ -1,8 +1,13 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import {
+  ABSENT_KEYCHAIN_DIGEST,
+  canonicalDigest,
+  fencedGeneration,
+  keychainDigest,
   NoSingleGrantRestoreSourceError,
   rankSingleGrantSource,
+  restoreRecordFor,
   type SingleGrantBackup,
 } from '../src/pi-handback-source';
 import type { Grant } from '../src/types';
@@ -42,6 +47,56 @@ function rank(overrides: Partial<Parameters<typeof rankSingleGrantSource>[0]> = 
   };
   return rankSingleGrantSource({ ...defaults, ...overrides });
 }
+
+describe('T-FD — pure fence arithmetic and digests', () => {
+  it('lands the fence above the store and Keychain generations, including an absent Keychain grant', () => {
+    assert.equal(fencedGeneration(7, -1), 8);
+    assert.equal(fencedGeneration(7, 7), 8);
+    assert.equal(fencedGeneration(7, 8), 9);
+  });
+
+  it('uses the ABSENT sentinel for an absent Keychain grant and digests every fencing field', () => {
+    const current = grant({ generation: 8, writtenBy: 'native-resync' });
+    assert.equal(keychainDigest(null), ABSENT_KEYCHAIN_DIGEST);
+    assert.equal(keychainDigest(undefined), ABSENT_KEYCHAIN_DIGEST);
+    assert.notEqual(keychainDigest(current), keychainDigest({ ...current, generation: 9 }));
+    assert.notEqual(keychainDigest(current), keychainDigest({ ...current, writtenBy: 'migrate-stage' }));
+    assert.notEqual(keychainDigest(current), keychainDigest({ ...current, refresh: 'other-refresh-fake' }));
+    assert.notEqual(keychainDigest(current), keychainDigest({ ...current, access: 'other-access-fake' }));
+  });
+
+  it('creates a stable canonical restore-record digest that changes when any field changes', () => {
+    const record = restoreRecordFor({
+      authPath: '/tmp/pi/auth.json',
+      key: 'xai',
+      decidedAt: 123,
+      filePresent: true,
+      entryPresent: true,
+      entry: { type: 'oauth', access: 'access-fake', refresh: 'refresh-fake', expires: 4_102_444_800_000 },
+    });
+    const reordered = restoreRecordFor({
+      authPath: '/tmp/pi/auth.json',
+      key: 'xai',
+      decidedAt: 123,
+      filePresent: true,
+      entryPresent: true,
+      entry: { refresh: 'refresh-fake', expires: 4_102_444_800_000, access: 'access-fake', type: 'oauth' },
+    });
+
+    const digest = canonicalDigest(record);
+    assert.equal(digest, canonicalDigest(reordered));
+    const { entry: _entry, ...recordWithoutEntry } = record;
+    for (const changed of [
+      { ...record, authPath: '/tmp/pi/other-auth.json' },
+      { ...record, key: 'kimi-coding' },
+      { ...record, cycleId: 'handback:124' },
+      { ...recordWithoutEntry, filePresent: false, entryPresent: false },
+      { ...record, entry: { ...record.entry as Record<string, unknown>, access: 'other-access-fake' } },
+    ]) {
+      assert.notEqual(canonicalDigest(changed), digest);
+    }
+  });
+});
 
 describe('T-RK — ranks the sources per §5.1', () => {
   it('prefers a trusted Keychain successor over exact and legacy backups', () => {
