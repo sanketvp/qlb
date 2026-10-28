@@ -89,6 +89,16 @@ function rotateLiveDuringLockedRead(f: Fixture, replacement: string): void {
 }
 
 describe('Anthropic Pi gate refresh mapping (K6-7)', () => {
+  it('serves the live active token above five minutes with 0 POSTs and source live', async () => {
+    const f = await fixture();
+    let posts = 0;
+    const result = await run(f, undefined, { postRefresh: async () => { posts += 1; return { status: 500, body: '' }; } });
+    assert.equal(posts, 0);
+    assert.equal(result.code, 0);
+    assert.equal(JSON.parse(result.stdout[0]!).source, 'live');
+    f.store.close();
+  });
+
   it('every success writes the evidence row in a BEGIN IMMEDIATE after the credential is determined', async () => {
     const f = await fixture();
     const originalGet = f.backend.get.bind(f.backend);
