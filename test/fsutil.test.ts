@@ -23,6 +23,7 @@ import { describe, it } from 'node:test';
 type Fsutil = {
   atomicWriteBytes(path: string, data: Uint8Array, options?: { mode?: number; followSymlinks?: boolean }): number;
   atomicWriteText(path: string, text: string, options?: { mode?: number; followSymlinks?: boolean }): number;
+  fsyncDirSync(dir: string): void;
   publishTarget(path: string): string;
   sweepStrayTemps(dir: string, options?: { isProcessAlive?: (pid: number) => boolean }): number;
 };
@@ -179,6 +180,28 @@ describe('fsutil atomic publish primitives', () => {
       mutableFs.fsyncSync = original;
     }
     assert.equal(readFileSync(target, 'utf8'), 'new');
+  }));
+
+  it('tolerates unsupported directory fsync but surfaces real errors', () => withFixture((dir) => {
+    const original = mutableFs.fsyncSync;
+    try {
+      for (const code of ['EINVAL', 'ENOTSUP', 'EOPNOTSUPP', 'ENOSYS']) {
+        mutableFs.fsyncSync = () => {
+          const error = new Error('unsupported') as NodeJS.ErrnoException;
+          error.code = code;
+          throw error;
+        };
+        fsutil.fsyncDirSync(dir);
+      }
+      mutableFs.fsyncSync = () => {
+        const error = new Error('io failure') as NodeJS.ErrnoException;
+        error.code = 'EIO';
+        throw error;
+      };
+      assert.throws(() => fsutil.fsyncDirSync(dir), { code: 'EIO' });
+    } finally {
+      mutableFs.fsyncSync = original;
+    }
   }));
 
   it('does not create a missing parent', () => withFixture((dir) => {

@@ -1,11 +1,14 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { spawn, type ChildProcess } from 'node:child_process';
+import { existsSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 import { MockKeychain, qlbKeychainService } from '../src/keychain';
 import {
   Migration,
+  PI_POOL_STORE,
+  createStaticKeyMigration,
   preQlbPath,
   sidecarPath,
   stagingOwnerPath,
@@ -96,6 +99,51 @@ function mockRehearse(calls: StagedAccount[]): RehearseFn {
   };
 }
 
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function waitForFile(path: string, description: string): void {
+  const deadline = Date.now() + 2_000;
+  while (!existsSync(path) && Date.now() < deadline) sleepSync(10);
+  assert.ok(existsSync(path), `timed out waiting for ${description}`);
+}
+
+function waitForChild(child: ChildProcess): Promise<number | null> {
+  return new Promise((resolve, reject) => {
+    child.once('error', reject);
+    child.once('exit', (code) => resolve(code));
+  });
+}
+
+function startV2MapWriter(
+  dir: string,
+  ownerPath: string,
+  readyPath: string,
+  acquiredPath: string,
+): ChildProcess {
+  const sourceDir = join(__dirname, '..', 'src');
+  const script = `
+    const { writeFileSync } = require('node:fs');
+    const { join } = require('node:path');
+    const sourceDir = process.argv[1];
+    const dir = process.argv[2];
+    const ownerPath = process.argv[3];
+    const readyPath = process.argv[4];
+    const acquiredPath = process.argv[5];
+    const { withPiAuthLock, writePiOwnerEntry } = require(join(sourceDir, 'pi-migrate.js'));
+    writeFileSync(readyPath, 'ready\\n');
+    withPiAuthLock(join(dir, 'auth.json'), () => {
+      writeFileSync(acquiredPath, 'acquired\\n');
+      writePiOwnerEntry(ownerPath, 'openrouter', true);
+    });
+  `;
+  return spawn(process.execPath, ['-e', script, sourceDir, dir, ownerPath, readyPath, acquiredPath], {
+    env: { ...process.env, QLB_TEST_MODE: '1', QLB_HOME: dir, HOME: dir },
+    stdio: 'ignore',
+  });
+}
+
 interface Harness {
   dir: string;
   poolPath: string;
@@ -173,6 +221,119 @@ describe('migration state machine — §4.8.3 / §4.8.3a', () => {
       assert.deepEqual(retired, h.originalBytes, '.pre-qlb is byte-identical to original');
       const owner = JSON.parse(readFileSync(h.ownerPath, 'utf8')) as { owner: string };
       assert.equal(owner.owner, 'qlb');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('refuses pool stage when OpenRouter has committed a v2 owner map, leaving it byte-identical', async () => {
+    const h = setup();
+    try {
+      const openrouter = createStaticKeyMigration(
+        h.store,
+        h.kc,
+        'openrouter',
+        h.ownerPath,
+        () => 'test-openrouter-key',
+      );
+      openrouter.stage();
+      await openrouter.rehearse(async () => ({ ok: true }));
+      openrouter.commit();
+      const before = readFileSync(h.ownerPath);
+
+      assert.throws(() => h.mig.stage(), /owner-map-present: anthropic pool migration waits for P7b8/);
+
+      assert.deepEqual(readFileSync(h.ownerPath), before);
+      assert.equal(existsSync(stagingOwnerPath(h.ownerPath)), false, 'stage must not create staging');
+      assert.equal(qlbWorks(h.kc), false, 'stage must not write Keychain credentials');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('holds the owner-map lock through the pool commit final check and rename', async () => {
+    const h = setup();
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      const readyPath = join(h.dir, 'v2-writer-ready');
+      const acquiredPath = join(h.dir, 'v2-writer-acquired');
+      let writer: ChildProcess | undefined;
+      const interleaved = new Migration(
+        h.store,
+        h.kc,
+        h.poolPath,
+        h.ownerPath,
+        undefined,
+        {
+          beforePoolCommitLock: () => {
+            writer = startV2MapWriter(h.dir, h.ownerPath, readyPath, acquiredPath);
+            waitForFile(readyPath, 'the v2 writer to attempt the owner-map lock');
+            sleepSync(100);
+            assert.equal(
+              existsSync(acquiredPath),
+              false,
+              'the v2 writer must still wait while pool commit holds the owner-map lock',
+            );
+          },
+        },
+      );
+
+      interleaved.commit();
+      assert.ok(writer, 'pool barrier starts the concurrent v2 writer');
+      assert.equal(
+        await waitForChild(writer),
+        1,
+        'after commit releases its lock, the v2 writer sees the legacy pool owner document and refuses it',
+      );
+      assert.equal(existsSync(acquiredPath), true, 'the waiting v2 writer proceeds only after commit releases');
+      const owner = JSON.parse(readFileSync(h.ownerPath, 'utf8')) as { owner?: string };
+      assert.equal(owner.owner, 'qlb', 'the pool owner document remains authoritative');
+      assert.equal(existsSync(stagingOwnerPath(h.ownerPath)), false, 'commit consumes staging');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('refuses pool commit when a v2 owner map appears after stage, leaving the map and staging intact', async () => {
+    const h = setup();
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      const openrouter = createStaticKeyMigration(
+        h.store,
+        h.kc,
+        'openrouter',
+        h.ownerPath,
+        () => 'test-openrouter-key',
+      );
+      openrouter.stage();
+      await openrouter.rehearse(async () => ({ ok: true }));
+      openrouter.commit();
+      const before = readFileSync(h.ownerPath);
+
+      assert.throws(() => h.mig.commit(), /owner-map-present: anthropic pool migration waits for P7b8/);
+
+      assert.deepEqual(readFileSync(h.ownerPath), before);
+      assert.equal(existsSync(stagingOwnerPath(h.ownerPath)), true, 'commit must leave staging for rollback');
+      assert.equal(existsSync(h.poolPath), true, 'commit must not retire the native pool');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('treats a v2 map without an Anthropic claim as absent and preserves it through resume and rollback', () => {
+    const h = setup();
+    try {
+      const map = JSON.stringify({ providers: { openrouter: { mode: 'qlb', since: 1 } } }, null, 2) + '\n';
+      writeFileSync(h.ownerPath, map, { mode: 0o600 });
+      h.store.upsertMigration('pi-pool', 'NATIVE', '{}');
+
+      assert.equal(h.mig.status().ownerFile, 'absent');
+      h.mig.resume();
+      assert.equal(existsSync(h.poolPath), true, 'resume must not retire the native Anthropic pool');
+      h.mig.rollback();
+      assert.deepEqual(readFileSync(h.ownerPath), Buffer.from(map), 'rollback must not rewrite another provider\'s map');
     } finally {
       h.cleanup();
     }
@@ -339,4 +500,26 @@ describe('migration state machine — §4.8.3 / §4.8.3a', () => {
       h.cleanup();
     }
   });
+  it('C5 is not applied to the pool: a crash-commit rollback never journals QLB_OWNED first', async () => {
+    const h = setup();
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      renameSync(stagingOwnerPath(h.ownerPath), h.ownerPath);
+      assert.equal(h.mig.status().state, 'VALIDATED');
+
+      const states: string[] = [];
+      const original = h.store.upsertMigration.bind(h.store);
+      h.store.upsertMigration = (store, state, next) => {
+        if (store === PI_POOL_STORE) states.push(state);
+        return original(store, state, next);
+      };
+      h.mig.rollback();
+      assert.equal(states.includes('QLB_OWNED'), false, 'pool rollback keeps its existing post-commit path');
+      assert.deepEqual(readFileSync(h.poolPath), h.originalBytes);
+    } finally {
+      h.cleanup();
+    }
+  });
+
 });

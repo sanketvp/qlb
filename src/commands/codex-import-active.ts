@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
+import { withCodexAuthLock, type CodexAuthLockOptions, type HeldCodexAuthLock } from '../cc-locks';
 import { attributeLiveDocument } from '../codex-attribution';
 import { importActiveCodexSlot, planImportActiveCodex } from '../codex-slots';
 import { parseCodexAuth, readCodexAuthStable, writeCodexAuthAtomic } from '../codex-auth';
@@ -31,75 +32,109 @@ function piBaseline(path: string): unknown {
   }
 }
 
-async function execute(args: string[], ctx: CommandContext): Promise<number> {
+export interface CodexImportActiveCommandDeps {
+  readAuth: typeof readCodexAuthStable;
+  writeAuth: typeof writeCodexAuthAtomic;
+  withAuthLock: <T>(options: CodexAuthLockOptions, fn: (held: HeldCodexAuthLock) => Promise<T> | T) => Promise<T>;
+}
+
+const defaultDeps: CodexImportActiveCommandDeps = {
+  readAuth: readCodexAuthStable,
+  writeAuth: writeCodexAuthAtomic,
+  withAuthLock: withCodexAuthLock,
+};
+
+export async function runCodexImportActiveCommand(
+  args: string[],
+  ctx: CommandContext,
+  deps: CodexImportActiveCommandDeps = defaultDeps,
+): Promise<number> {
   const opts = parse(args);
   if (!opts) {
     ctx.stderr('usage: qlb codex import-active [--dry-run] [--json]');
     return 2;
   }
 
-  const active = await readCodexAuthStable(codexAuthPath(ctx));
-  if (active.status !== 'ok') {
-    ctx.stderr(`codex import-active refused: auth.json ${active.status}`);
-    return 1;
-  }
-
+  const path = codexAuthPath(ctx);
   if (opts.dryRun) {
+    const active = await deps.readAuth(path);
+    if (active.status !== 'ok') {
+      ctx.stderr(`codex import-active refused: auth.json ${active.status}`);
+      return 1;
+    }
     const plan = planImportActiveCodex(active.doc);
     const result = { ...plan, dryRun: true };
     ctx.stdout(opts.json ? JSON.stringify(result) : `would import ${plan.slotId}`);
     return 0;
   }
 
-  const store = openStore(ctx.config.dbPath);
-  try {
-    const admission = assertAdmitted(store, 'codex-import-active');
-    if (!admission.ok) {
-      ctx.stderr(`codex import-active refused: ${admission.code}`);
-      return 3;
+  // Keep the live read through active-login marking in one QLB-owned critical
+  // section. In particular, the lock remains held after SQLite's re-validation
+  // commit while attributeLiveDocument republishes a repaired slot.
+  return deps.withAuthLock({ home: ctx.home, env: ctx.env }, async (held) => {
+    const active = await deps.readAuth(path);
+    if (active.status !== 'ok') {
+      ctx.stderr(`codex import-active refused: auth.json ${active.status}`);
+      return 1;
     }
-    const plan = planImportActiveCodex(active.doc);
-    // The live document's identity decides whether this is a new import. An
-    // existing active_login names a different account during ordinary drift;
-    // it must not prevent a newly logged-in account from becoming a slot.
-    const ownSlot = store.getCodexSlot(plan.slotId);
-    if (!ownSlot) {
-      const result = importActiveCodexSlot(active.doc, {
+
+    const store = openStore(ctx.config.dbPath);
+    try {
+      const admission = assertAdmitted(store, 'codex-import-active');
+      if (!admission.ok) {
+        ctx.stderr(`codex import-active refused: ${admission.code}`);
+        return 3;
+      }
+      const plan = planImportActiveCodex(active.doc);
+      // The live document's identity decides whether this is a new import. An
+      // existing active_login names a different account during ordinary drift;
+      // it must not prevent a newly logged-in account from becoming a slot.
+      const ownSlot = store.getCodexSlot(plan.slotId);
+      if (!ownSlot) {
+        held.assertNotCompromised();
+        const result = importActiveCodexSlot(active.doc, {
+          store,
+          keychain: platformKeychain,
+          piBaseline: piBaseline(ctx.config.piAuthJsonPath),
+        });
+        ctx.stdout(opts.json ? JSON.stringify(result) : `imported ${result.slotId}`);
+        return 0;
+      }
+
+      const activeSlotId = store.getCodexActiveLogin();
+      const stored = parseCodexAuth(platformKeychain.getSync(
+        qlbKeychainService('openai-codex', ownSlot.accountId), QLB_KEYCHAIN_ACCOUNT,
+      ));
+      if (!stored.ok) {
+        ctx.stderr('codex import-active refused: stored managed slot is malformed');
+        return 3;
+      }
+      const attribution = await attributeLiveDocument({
         store,
         keychain: platformKeychain,
-        piBaseline: piBaseline(ctx.config.piAuthJsonPath),
+        slot: { accountId: ownSlot.accountId, document: stored.doc, fingerprint: ownSlot.fingerprint ?? undefined },
+        activeSlotId: activeSlotId != null && store.getCodexSlot(activeSlotId) ? activeSlotId : undefined,
+        live: active.doc,
+        assertNotCompromised: () => held.assertNotCompromised(),
+        republish: (document) => {
+          // Keychain/SQLite work can block the event loop long enough for a
+          // stale takeover. Do not recreate auth.json after losing this lease.
+          held.assertNotCompromised();
+          return deps.writeAuth(path, document).then(() => undefined);
+        },
       });
-      ctx.stdout(opts.json ? JSON.stringify(result) : `imported ${result.slotId}`);
+      if (attribution.action === 'slot-split' || attribution.disposition === 'slot-split') {
+        ctx.stderr('codex import-active refused: slot-split');
+        return 3;
+      }
+      const result = { ...plan, action: attribution.action };
+      ctx.stdout(opts.json ? JSON.stringify(result) : `${attribution.action} ${plan.slotId}`);
       return 0;
+    } finally {
+      store.close();
     }
-
-    const activeSlotId = store.getCodexActiveLogin();
-    const stored = parseCodexAuth(platformKeychain.getSync(
-      qlbKeychainService('openai-codex', ownSlot.accountId), QLB_KEYCHAIN_ACCOUNT,
-    ));
-    if (!stored.ok) {
-      ctx.stderr('codex import-active refused: stored managed slot is malformed');
-      return 3;
-    }
-    const attribution = await attributeLiveDocument({
-      store,
-      keychain: platformKeychain,
-      slot: { accountId: ownSlot.accountId, document: stored.doc, fingerprint: ownSlot.fingerprint ?? undefined },
-      activeSlotId: activeSlotId != null && store.getCodexSlot(activeSlotId) ? activeSlotId : undefined,
-      live: active.doc,
-      republish: (document) => writeCodexAuthAtomic(codexAuthPath(ctx), document).then(() => undefined),
-    });
-    if (attribution.action === 'slot-split' || attribution.disposition === 'slot-split') {
-      ctx.stderr('codex import-active refused: slot-split');
-      return 3;
-    }
-    const result = { ...plan, action: attribution.action };
-    ctx.stdout(opts.json ? JSON.stringify(result) : `${attribution.action} ${plan.slotId}`);
-    return 0;
-  } finally {
-    store.close();
-  }
+  });
 }
 
-const command: CommandDefinition = { name: 'codex import-active', execute };
+const command: CommandDefinition = { name: 'codex import-active', execute: runCodexImportActiveCommand };
 export default command;

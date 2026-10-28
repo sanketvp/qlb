@@ -387,7 +387,7 @@ function parseMigrateArgs(args: string[]): MigrateOpts {
     const dir = targetDir.replace(/[/\\]+$/, '');
     if (!ownerFile) {
       ownerFile =
-        provider === 'anthropic'
+        provider === 'anthropic' || provider === 'openrouter'
           ? join(dir, 'qlb-owner.json')
           : join(dir, `qlb-owner-${provider}.json`);
     }

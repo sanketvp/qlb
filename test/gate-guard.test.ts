@@ -4,11 +4,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
-import { appendEvidenceGap, GateFailure, runPiGate } from '../src/pi-gate';
+import { appendEvidenceGap, GateFailure, GateRefused, runPiGate } from '../src/pi-gate';
 import { piEvidenceGapCheck } from '../src/checks/pi-evidence-gap';
 import { defaultPiMigratePaths, migratePiSingleProvider } from '../src/pi-migrate';
-import { createSingleGrantMigration, Migration } from '../src/migration';
-import { MockKeychain } from '../src/keychain';
+import { createSingleGrantMigration, createStaticKeyMigration, Migration } from '../src/migration';
+import { MockKeychain, platformKeychain } from '../src/keychain';
 import { redactSecrets } from '../src/redact';
 import { beginCutover } from '../src/lifecycle';
 import { openStore, openStoreConnection } from '../src/store';
@@ -130,6 +130,53 @@ describe('qlb gate core (S30/S54)', () => {
       });
       assert.equal(result, 0, provider);
       assert.equal(output.length, 1, provider);
+    }
+  });
+
+  it('serves openrouter from a v2 entry', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-gate-openrouter-map-'));
+    const agentDir = join(root, '.pi', 'agent');
+    mkdirSync(agentDir, { recursive: true, mode: 0o700 });
+    writeFileSync(join(agentDir, 'qlb-owner.json'), JSON.stringify({ providers: {
+      openrouter: { mode: 'qlb', since: 1 },
+    } }) + '\n');
+    const output: string[] = [];
+    const result = await runPiGate('openrouter', {
+      dbPath: fixtureDb(), env: { QLB_PI_TOKEN_CALL: '1' }, deliver: (value) => output.push(value),
+      guard: () => true, admitted: () => ({ ok: true }), piAgentDir: agentDir,
+      provider: { read: () => ({ token: 'openrouter-token', accountId: 'openrouter-default', source: 'fixture' }) },
+    });
+    assert.equal(result, 0);
+    assert.equal(output.length, 1);
+  });
+
+  it('serves an OpenRouter credential staged by Migration through the real gate resolver', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-gate-openrouter-migration-'));
+    const agentDir = join(root, '.pi', 'agent');
+    const ownerPath = join(agentDir, 'qlb-owner.json');
+    mkdirSync(agentDir, { recursive: true, mode: 0o700 });
+    const store = openStore(join(root, 'qlb.db'));
+    try {
+      const migration = createStaticKeyMigration(
+        store,
+        platformKeychain,
+        'openrouter',
+        ownerPath,
+        () => 'openrouter-test-key',
+      );
+      migration.stage();
+      await migration.rehearse(async () => ({ ok: true }));
+      migration.commit();
+
+      const output: string[] = [];
+      const result = await runPiGate('openrouter', {
+        dbPath: fixtureDb(), env: { QLB_PI_TOKEN_CALL: '1' }, deliver: (value) => output.push(value),
+        guard: () => true, admitted: () => ({ ok: true }), piAgentDir: agentDir,
+      });
+      assert.equal(result, 0);
+      assert.equal(output.length, 1);
+    } finally {
+      store.close();
     }
   });
 
@@ -325,6 +372,90 @@ describe('qlb gate core (S30/S54)', () => {
     assert.equal(result, 3);
     assert.deepEqual(stdout, []);
     assert.deepEqual(stderr, ['missing-provider-gate']);
+  });
+
+  it('refuses a live C-swap process with exit 3 before provider prerequisites and reads nothing', async () => {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    let prerequisites = 0;
+    let reads = 0;
+    const result = await runPiGate('xai', {
+      dbPath: fixtureDb(), env: { QLB_PI_TOKEN_CALL: '1' }, deliver: (value) => stdout.push(value), stderr: (line) => stderr.push(line),
+      guard: () => true, admitted: () => ({ ok: true }),
+      cswapProcesses: () => [{} as never],
+      provider: {
+        prerequisites: () => { prerequisites += 1; },
+        read: () => { reads += 1; return { token: 'never', accountId: 'never', source: 'fixture' }; },
+      },
+    });
+    assert.equal(result, 3);
+    assert.equal(prerequisites, 0);
+    assert.equal(reads, 0);
+    assert.deepEqual(stdout, []);
+    assert.deepEqual(stderr, ['cswap-process-alive']);
+  });
+
+  it('refuses an unreadable C-swap process table with exit 3', async () => {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const result = await runPiGate('xai', {
+      dbPath: fixtureDb(), env: { QLB_PI_TOKEN_CALL: '1' }, deliver: (value) => stdout.push(value), stderr: (line) => stderr.push(line),
+      guard: () => true, admitted: () => ({ ok: true }),
+      cswapProcesses: () => { throw new Error('fixture process table unavailable'); },
+      prerequisites: () => { throw new Error('must not run'); },
+      provider: { read: () => { throw new Error('must not read'); } },
+    });
+    assert.equal(result, 3);
+    assert.deepEqual(stdout, []);
+    assert.deepEqual(stderr, ['cswap-process-check-failed']);
+  });
+
+  it('under test mode with no injected process check the gate does not spawn ps', async () => {
+    const output: string[] = [];
+    let listed = 0;
+    const result = await runPiGate('xai', {
+      dbPath: fixtureDb(), env: { QLB_PI_TOKEN_CALL: '1' }, deliver: (value) => output.push(value),
+      guard: () => true, admitted: () => ({ ok: true }), prerequisites: () => undefined,
+      listCswap: () => { listed += 1; return []; },
+      provider: { read: () => ({ token: 'xai-token', accountId: 'xai-default', source: 'fixture' }) },
+    });
+    assert.equal(result, 0);
+    assert.equal(listed, 0);
+    assert.equal(output.length, 1);
+  });
+
+  it('returns exit 3 with no stdout when a provider module refuses', async () => {
+    const output: string[] = [];
+    const stderr: string[] = [];
+    const result = await runPiGate('xai', {
+      dbPath: fixtureDb(), env: { QLB_PI_TOKEN_CALL: '1' }, deliver: (value) => output.push(value), stderr: (line) => stderr.push(line),
+      guard: () => true, admitted: () => ({ ok: true }), prerequisites: () => undefined,
+      provider: { read: () => { throw new GateRefused('identity-mismatch'); } },
+    });
+    assert.equal(result, 3);
+    assert.deepEqual(output, []);
+    assert.deepEqual(stderr, ['identity-mismatch']);
+  });
+
+  it('the provider module receives the configured dbPath and env through context', async () => {
+    const dbPath = fixtureDb();
+    const env = { QLB_PI_TOKEN_CALL: '1', FIXTURE: 'context' };
+    let context: unknown;
+    const result = await runPiGate('xai', {
+      dbPath, env, piAgentDir: '/fixture/pi-agent', deliver: () => undefined,
+      guard: () => true, admitted: () => ({ ok: true }), prerequisites: () => undefined,
+      provider: {
+        context: (value) => { context = value; },
+        read: () => ({ token: 'xai-token', accountId: 'xai-default', source: 'fixture' }),
+      },
+    });
+    assert.equal(result, 0);
+    assert.deepEqual(context && {
+      dbPath: (context as { dbPath: string }).dbPath,
+      env: (context as { env: NodeJS.ProcessEnv }).env,
+      piAgentDir: (context as { piAgentDir?: string }).piAgentDir,
+    }, { dbPath, env, piAgentDir: '/fixture/pi-agent' });
+    assert.equal(typeof (context as { autoLog: unknown }).autoLog, 'function');
   });
 
   it('preserves explicit provider causes, registers the bare token, and opens one gate connection', async () => {

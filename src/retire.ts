@@ -17,6 +17,7 @@ import { existsSync, readFileSync, renameSync, statSync } from 'node:fs';
 import { dirname, join, parse, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
 
+import { withCodexAuthLock, type CodexAuthLockOptions, type HeldCodexAuthLock } from './cc-locks';
 import { CODEX_GATE_CONFIG_KEY } from './codex-gate';
 import { config } from './config';
 import { atomicWriteFile, preQlbPath, sidecarPath } from './migration';
@@ -84,6 +85,8 @@ export interface RetireNativeStoreOpts {
   confirmRealRetirement: boolean;
   pingFn: PingFn;
   now?: number;
+  /** Test/caller override; production uses the QLB home, never CODEX_HOME. */
+  authLockOptions?: CodexAuthLockOptions;
 }
 
 export interface RetireNativeStoreResult {
@@ -304,65 +307,74 @@ export async function retireNativeStore(
     refuse('REFUSED: live native ping failed; native access is not confirmed working');
   }
 
-  const nativePath = assertSafeFilePath(opts.nativePathToRemove);
-  if (!existsSync(nativePath)) {
-    refuse(`REFUSED: native path does not exist: ${nativePath}`);
-  }
-  try {
-    if (statSync(nativePath).isDirectory()) {
-      refuse(`REFUSED: nativePathToRemove is a directory: ${nativePath}`);
+  const retire = (held?: HeldCodexAuthLock): RetireNativeStoreResult => {
+    const nativePath = assertSafeFilePath(opts.nativePathToRemove);
+    if (!existsSync(nativePath)) {
+      refuse(`REFUSED: native path does not exist: ${nativePath}`);
     }
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    refuse(`REFUSED: cannot stat native path ${nativePath}: ${msg}`);
-  }
+    try {
+      if (statSync(nativePath).isDirectory()) {
+        refuse(`REFUSED: nativePathToRemove is a directory: ${nativePath}`);
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      refuse(`REFUSED: cannot stat native path ${nativePath}: ${msg}`);
+    }
 
-  const backup = preQlbPath(nativePath);
-  const sidecar = sidecarPath(nativePath);
-  if (existsSync(backup)) {
-    refuse(`REFUSED: backup already exists at ${backup}; will not overwrite`);
-  }
+    const backup = preQlbPath(nativePath);
+    const sidecar = sidecarPath(nativePath);
+    if (existsSync(backup)) {
+      refuse(`REFUSED: backup already exists at ${backup}; will not overwrite`);
+    }
 
-  const bytes = readFileSync(nativePath);
-  const fingerprint = createHash('sha256').update(bytes).digest('hex');
+    const bytes = readFileSync(nativePath);
+    const fingerprint = createHash('sha256').update(bytes).digest('hex');
 
-  // Rename is the retirement commit point (mirrors Phase 2 H2). Original
-  // path is gone afterwards; contents live at `.pre-qlb`.
-  renameSync(nativePath, backup);
-  atomicWriteFile(
-    sidecar,
-    JSON.stringify(
-      {
-        retiredAt: now,
-        harness,
-        nativePath,
-        backupPath: backup,
-        fingerprint,
-        qlbAccountIds: [],
-      },
-      null,
-      2,
-    ) + '\n',
-  );
+    // Rename is the retirement commit point (mirrors Phase 2 H2). For Codex,
+    // the auth lock is held from this fingerprint through sidecar/journal
+    // publication, so import-active cannot recreate the retired auth.json.
+    held?.assertNotCompromised();
+    renameSync(nativePath, backup);
+    held?.assertNotCompromised();
+    atomicWriteFile(
+      sidecar,
+      JSON.stringify(
+        {
+          retiredAt: now,
+          harness,
+          nativePath,
+          backupPath: backup,
+          fingerprint,
+          qlbAccountIds: [],
+        },
+        null,
+        2,
+      ) + '\n',
+    );
 
-  const prev = store.getMigration(harness);
-  const detail = {
-    ...parseDetail(prev?.detail_json),
-    retiredAt: now,
-    retiredPath: nativePath,
-    backupPath: backup,
-    sidecarPath: sidecar,
-    fingerprint,
+    const prev = store.getMigration(harness);
+    const detail = {
+      ...parseDetail(prev?.detail_json),
+      retiredAt: now,
+      retiredPath: nativePath,
+      backupPath: backup,
+      sidecarPath: sidecar,
+      fingerprint,
+    };
+    held?.assertNotCompromised();
+    store.upsertMigration(harness, 'RETIRED', JSON.stringify(detail), now);
+
+    return {
+      ok: true,
+      harness,
+      state: 'RETIRED',
+      nativePathRemoved: nativePath,
+      backupPath: backup,
+      sidecarPath: sidecar,
+      retiredAt: now,
+    };
   };
-  store.upsertMigration(harness, 'RETIRED', JSON.stringify(detail), now);
 
-  return {
-    ok: true,
-    harness,
-    state: 'RETIRED',
-    nativePathRemoved: nativePath,
-    backupPath: backup,
-    sidecarPath: sidecar,
-    retiredAt: now,
-  };
+  if (harness !== 'codex-cli') return retire();
+  return withCodexAuthLock({ home: qlbHomeDir(process.env), ...opts.authLockOptions }, retire);
 }

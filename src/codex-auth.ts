@@ -167,6 +167,11 @@ function errorCode(error: unknown): string | undefined {
  * Atomically publishes an auth document through fsutil and returns its inode.
  * The shared writer creates a private mode-0600 temporary file, fsyncs it, and
  * writes through a final-path symlink rather than replacing that symlink.
+ *
+ * Production callers must hold withCodexAuthLock across their live-file read,
+ * attribution decision, and this write. The lock is intentionally not acquired
+ * here because it is non-reentrant and the decision must stay protected until
+ * publication completes.
  */
 export async function writeCodexAuthAtomic(path: string, doc: CodexAuthDocument): Promise<number> {
   return atomicWriteText(path, `${JSON.stringify(doc, null, 2)}\n`, { mode: 0o600 });

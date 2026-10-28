@@ -43,6 +43,12 @@ function errno(error: unknown): string | undefined {
     : undefined;
 }
 
+/** Windows and some filesystems cannot open or fsync directory handles. */
+export function isUnsupportedDirectoryFsync(error: unknown): boolean {
+  const code = errno(error);
+  return code === 'EISDIR' || code === 'EPERM' || FSYNC_UNSUPPORTED.has(code ?? '');
+}
+
 function eloop(path: string): NodeJS.ErrnoException {
   const error = new Error(`too many symbolic links resolving '${path}'`) as NodeJS.ErrnoException;
   error.code = 'ELOOP';
@@ -193,6 +199,31 @@ export function atomicWriteBytes(path: string, data: Uint8Array, options: Atomic
       // It may already have been removed by a failed or successful rename.
     }
     throw error;
+  }
+}
+
+/**
+ * Request durability for prior directory-entry updates. Call this after an
+ * atomic rename when recovery depends on its ordering. On macOS this is best
+ * effort rather than a power-loss guarantee because Node exposes no
+ * F_FULLFSYNC.
+ */
+export function fsyncDirSync(dir: string): void {
+  let fd: number;
+  try {
+    fd = openSync(dir, constants.O_RDONLY);
+  } catch (error) {
+    if (isUnsupportedDirectoryFsync(error)) return;
+    throw error;
+  }
+  try {
+    try {
+      fsyncSync(fd);
+    } catch (error) {
+      if (!isUnsupportedDirectoryFsync(error)) throw error;
+    }
+  } finally {
+    closeSync(fd);
   }
 }
 

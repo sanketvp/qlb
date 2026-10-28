@@ -2,13 +2,15 @@ import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { describe, it } from 'node:test';
 
 import { MacosKeychainBackend, markFakeExecutor, MockKeychain, NativeOpenRouterKeyNotFoundError, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, readNativeOpenRouterKey, type ExecFileSyncFn } from '../src/keychain';
+import { openStore } from '../src/store';
 import {
   defaultPiMigratePaths,
   hasLegacyPiOwnerEntry,
+  withPiAuthLock,
   migratePiSingleProvider,
   rollbackPiSingleProvider,
   type PiMigratePaths,
@@ -24,18 +26,24 @@ function setup(provider: Exclude<PiSingleProvider, 'openrouter'> = 'xai'): {
   paths: PiMigratePaths;
   keychain: MockKeychain;
   provider: Exclude<PiSingleProvider, 'openrouter'>;
+  store: ReturnType<typeof openStore>;
   cleanup(): void;
 } {
   const dir = mkdtempSync(join(tmpdir(), 'qlb-pi-migrate-'));
   const paths = defaultPiMigratePaths(dir);
   mkdirSync(join(dir, '.pi', 'agent'), { recursive: true, mode: 0o700 });
   writeFileSync(paths.authJsonPath, JSON.stringify({ [provider]: oauth('native') }), { mode: 0o600 });
+  const store = openStore(join(dir, 'qlb.db'));
   return {
     dir,
     paths,
     keychain: new MockKeychain(),
     provider,
-    cleanup: () => rmSync(dir, { recursive: true, force: true }),
+    store,
+    cleanup: () => {
+      store.close();
+      rmSync(dir, { recursive: true, force: true });
+    },
   };
 }
 
@@ -52,6 +60,11 @@ function hasManaged(keychain: MockKeychain, provider: PiSingleProvider): boolean
   } catch {
     return false;
   }
+}
+
+function writePiJournal(paths: PiMigratePaths, provider: PiSingleProvider, phase: string): void {
+  mkdirSync(paths.journalPath, { recursive: true, mode: 0o700 });
+  writeFileSync(join(paths.journalPath, `pi-migrate-${provider}.json`), JSON.stringify({ provider, phase, ownerPid: process.pid, updatedAt: Date.now() }), { mode: 0o600 });
 }
 
 describe('Pi migration S58 credential-first barrier', () => {
@@ -153,6 +166,356 @@ describe('Pi migration S58 credential-first barrier', () => {
     }
   });
 
+  it('T-PM1: refuses unless the generic migration is at rest', () => {
+    const cases: Array<{ name: string; state?: string; detail?: Record<string, unknown>; file?: 'staging' | 'sidecar' | 'custom' | 'customStaging' }> = [
+      { name: 'absent' },
+      { name: 'NATIVE', state: 'NATIVE' },
+      { name: 'VALIDATED without staging', state: 'VALIDATED' },
+      { name: 'MIRRORED', state: 'MIRRORED' },
+      { name: 'VALIDATED with staging', state: 'VALIDATED', file: 'staging' },
+      { name: 'QLB_OWNED', state: 'QLB_OWNED' },
+      { name: 'RETIRED', state: 'RETIRED' },
+      { name: 'legacy sidecar', state: 'VALIDATED', file: 'sidecar' },
+      { name: 'custom owner', state: 'VALIDATED', detail: { ownerFilePath: 'custom' }, file: 'custom' },
+      { name: 'custom owner staging', state: 'VALIDATED', detail: { ownerFilePath: 'custom' }, file: 'customStaging' },
+      { name: 'rollback intent', state: 'VALIDATED', detail: { intent: 'rollback' } },
+      { name: 'rollback decision', state: 'VALIDATED', detail: { rollbackDecision: {} } },
+      { name: 'hand-back marker', state: 'VALIDATED', detail: { handback: {} } },
+    ];
+
+    for (const fixture of cases) {
+      const h = setup();
+      try {
+        const paths = {
+          staging: join(h.dir, '.pi', 'agent', 'qlb-owner.json.xai.staging'),
+          sidecar: join(h.dir, '.pi', 'agent', 'qlb-owner-xai.json'),
+          custom: join(h.dir, 'custom-owner-dir', 'custom-owner.json'),
+          customStaging: join(h.dir, 'custom-owner-dir', 'qlb-owner.json.xai.staging'),
+        };
+        const detail = fixture.detail?.ownerFilePath === 'custom'
+          ? { ownerFilePath: paths.custom }
+          : fixture.detail;
+        if (fixture.state) h.store.upsertMigration('pi-xai', fixture.state, JSON.stringify(detail ?? {}));
+        if (fixture.file) {
+          mkdirSync(dirname(paths[fixture.file]), { recursive: true, mode: 0o700 });
+          writeFileSync(paths[fixture.file], '{}', { mode: 0o600 });
+        }
+        const authBefore = readFileSync(h.paths.authJsonPath);
+        const journal = join(h.paths.journalPath, 'pi-migrate-xai.json');
+        const admitted = fixture.state === undefined || fixture.state === 'NATIVE' || (fixture.state === 'VALIDATED' && !fixture.file && !fixture.detail);
+        if (admitted) {
+          assert.equal(migratePiSingleProvider('xai', h.paths, { keychain: h.keychain, store: h.store }).state, 'migrated', fixture.name);
+        } else {
+          assert.throws(
+            () => migratePiSingleProvider('xai', h.paths, { keychain: h.keychain, store: h.store }),
+            (error: unknown) => (error as { code?: unknown; exitCode?: unknown }).code === 'owned-by-generic-migrate' && (error as { exitCode?: unknown }).exitCode === 3,
+            fixture.name,
+          );
+          assert.equal(readFileSync(h.paths.authJsonPath).equals(authBefore), true, `${fixture.name}: auth.json changed`);
+          assert.equal(existsSync(journal), false, `${fixture.name}: Pi journal written`);
+          assert.equal(hasManaged(h.keychain, 'xai'), false, `${fixture.name}: managed credential written`);
+        }
+      } finally { h.cleanup(); }
+    }
+  });
+
+  it('T-PM2: marks only the shared handed-back account row active', () => {
+    for (const { provider, accountId } of [
+      { provider: 'xai' as const, accountId: 'xai-default' },
+      { provider: 'kimi-coding' as const, accountId: 'kimi-default' },
+    ]) {
+      const h = setup(provider);
+      try {
+        h.store.upsertAccount(accountId, provider, provider, 'handed-back');
+        h.store.setAccountStatus(accountId, 'handed-back');
+        assert.equal(h.store.getAccount(accountId)?.status, 'handed-back');
+
+        assert.equal(migratePiSingleProvider(provider, h.paths, { keychain: h.keychain, store: h.store }).state, 'migrated');
+        assert.equal(h.store.getAccount(accountId)?.status, 'active');
+      } finally { h.cleanup(); }
+    }
+  });
+
+  it('kimi-coding upserts kimi-default, never kimi-coding-default', () => {
+    const h = setup('kimi-coding');
+    try {
+      assert.equal(migratePiSingleProvider('kimi-coding', h.paths, { keychain: h.keychain, store: h.store }).state, 'migrated');
+      assert.equal(h.store.getAccount('kimi-default')?.status, 'active');
+      assert.equal(h.store.getAccount('kimi-coding-default'), null);
+    } finally { h.cleanup(); }
+  });
+
+  it('keeps auth_revoked on fresh and idempotent already-migrated runs', () => {
+    for (const alreadyMigrated of [false, true]) {
+      const h = setup();
+      try {
+        if (alreadyMigrated) {
+          migratePiSingleProvider('xai', h.paths, { keychain: h.keychain, store: h.store });
+        }
+        h.store.upsertAccount('xai-default', 'xai', 'xai', 'auth_revoked');
+        h.store.setAccountStatus('xai-default', 'auth_revoked');
+
+        assert.equal(migratePiSingleProvider('xai', h.paths, { keychain: h.keychain, store: h.store }).state, 'migrated');
+        assert.equal(h.store.getAccount('xai-default')?.status, 'auth_revoked');
+      } finally { h.cleanup(); }
+    }
+  });
+
+  it('keeps validated account rows validated', () => {
+    const h = setup();
+    try {
+      h.store.upsertAccount('xai-default', 'xai', 'xai', 'validated');
+      h.store.setAccountStatus('xai-default', 'validated');
+
+      assert.equal(migratePiSingleProvider('xai', h.paths, { keychain: h.keychain, store: h.store }).state, 'migrated');
+      assert.equal(h.store.getAccount('xai-default')?.status, 'validated');
+    } finally { h.cleanup(); }
+  });
+
+  it('keeps completed xai and OpenRouter migrations idempotent', () => {
+    const xai = setup();
+    try {
+      assert.equal(migratePiSingleProvider('xai', xai.paths, { keychain: xai.keychain, store: xai.store }).state, 'migrated');
+      assert.equal(migratePiSingleProvider('xai', xai.paths, { keychain: xai.keychain, store: xai.store }).state, 'migrated');
+    } finally { xai.cleanup(); }
+
+    const openrouter = setup();
+    try {
+      const deps = { keychain: openrouter.keychain, store: openrouter.store, readNativeOpenRouterKey: () => 'fixture-openrouter-key' };
+      assert.equal(migratePiSingleProvider('openrouter', openrouter.paths, deps).state, 'migrated');
+      assert.equal(migratePiSingleProvider('openrouter', openrouter.paths, deps).state, 'migrated');
+    } finally { openrouter.cleanup(); }
+  });
+
+  for (const provider of ['xai', 'openrouter'] as const) {
+    it(`${provider}: resumes a crash at the publishing and owner-entry boundaries`, () => {
+      for (const point of ['publishing', 'owner-entry'] as const) {
+        const h = setup();
+        try {
+          const deps = provider === 'openrouter'
+            ? { keychain: h.keychain, store: h.store, readNativeOpenRouterKey: () => 'fixture-openrouter-key' }
+            : { keychain: h.keychain, store: h.store };
+          assert.throws(() => migratePiSingleProvider(provider, h.paths, {
+            ...deps,
+            afterWrite: (written: string) => {
+              if (written === point) throw new Error('injected crash');
+            },
+          }), /injected crash/, point);
+          const journal = JSON.parse(readFileSync(join(h.paths.journalPath, `pi-migrate-${provider}.json`), 'utf8')) as { phase?: unknown };
+          assert.equal(journal.phase, 'publishing', `${point}: publish intent is durable`);
+          assert.equal(existsSync(h.paths.ownerPath), point === 'owner-entry', `${point}: owner entry publication boundary`);
+          assert.equal(migratePiSingleProvider(provider, h.paths, deps).state, 'migrated', point);
+          assert.equal(placeholderPresent(h.paths, provider), provider !== 'openrouter', point);
+        } finally { h.cleanup(); }
+      }
+    });
+  }
+
+  it('keeps the baseline byte-identical across an interrupted completed-migration re-run', () => {
+    const h = setup();
+    try {
+      assert.equal(migratePiSingleProvider('xai', h.paths, { keychain: h.keychain, store: h.store }).state, 'migrated');
+      const baseline = join(h.paths.baselineDir, 'xai.json'); const before = readFileSync(baseline);
+      assert.throws(() => migratePiSingleProvider('xai', h.paths, {
+        keychain: h.keychain,
+        store: h.store,
+        afterWrite: (point) => { if (point === 'before-committed') throw new Error('injected crash'); },
+      }), /injected crash/);
+      assert.equal(existsSync(join(h.paths.journalPath, 'pi-migrate-xai.json')), false, 'idempotent re-run writes no journal');
+      assert.equal(migratePiSingleProvider('xai', h.paths, { keychain: h.keychain, store: h.store }).state, 'migrated');
+      assert.equal(readFileSync(baseline).equals(before), true, 'a re-run must not replace the native baseline');
+    } finally { h.cleanup(); }
+  });
+
+  it('xai: a publishing resume reinstalls and verifies a lost managed item before publishing', () => {
+    const h = setup();
+    try {
+      assert.throws(() => migratePiSingleProvider('xai', h.paths, {
+        keychain: h.keychain,
+        store: h.store,
+        afterWrite: (point: string) => { if (point === 'publishing') throw new Error('injected crash'); },
+      }), /injected crash/);
+      h.keychain.deleteSync(qlbKeychainService('xai', 'default'), QLB_KEYCHAIN_ACCOUNT);
+      assert.equal(hasManaged(h.keychain, 'xai'), false);
+      assert.equal(migratePiSingleProvider('xai', h.paths, { keychain: h.keychain, store: h.store }).state, 'migrated');
+      assert.equal(hasManaged(h.keychain, 'xai'), true, 'resume reinstalled the managed item before publication');
+    } finally { h.cleanup(); }
+  });
+
+  it('a foreign owner entry does not count as already migrated over a placeholder', () => {
+    const h = setup();
+    try {
+      writeFileSync(h.paths.authJsonPath, JSON.stringify({ xai: { type: 'oauth', access: 'qlb-managed', refresh: '' } }), { mode: 0o600 });
+      mkdirSync(dirname(h.paths.ownerPath), { recursive: true });
+      writeFileSync(h.paths.ownerPath, JSON.stringify({ providers: { xai: { mode: 'manual' } } }), { mode: 0o600 });
+      assert.throws(
+        () => migratePiSingleProvider('xai', h.paths, { keychain: h.keychain, store: h.store }),
+        /Pi xai baseline would be a placeholder/,
+      );
+      assert.equal(existsSync(join(h.paths.journalPath, 'pi-migrate-xai.json')), false);
+      assert.equal(h.store.getConfig('pi.xai.state'), null);
+    } finally { h.cleanup(); }
+  });
+
+  it('xai: a publishing resume with the owner entry visible keeps a rotated managed item', () => {
+    const h = setup();
+    try {
+      assert.throws(() => migratePiSingleProvider('xai', h.paths, {
+        keychain: h.keychain,
+        store: h.store,
+        afterWrite: (point: string) => { if (point === 'owner-entry') throw new Error('injected crash'); },
+      }), /injected crash/);
+      const service = qlbKeychainService('xai', 'default');
+      const rotated = { ...(JSON.parse(h.keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT)) as Record<string, unknown>), refresh: 'rotated-refresh', access: 'rotated-access' };
+      h.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(rotated));
+      assert.equal(migratePiSingleProvider('xai', h.paths, { keychain: h.keychain, store: h.store }).state, 'migrated');
+      const after = JSON.parse(h.keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT)) as { refresh?: string };
+      assert.equal(after.refresh, 'rotated-refresh', 'a published, rotated managed item is never replaced by the baseline');
+    } finally { h.cleanup(); }
+  });
+
+  it('xai: a publishing resume with the owner entry visible fails closed on a Keychain read error', () => {
+    const h = setup();
+    try {
+      assert.throws(() => migratePiSingleProvider('xai', h.paths, {
+        keychain: h.keychain,
+        store: h.store,
+        afterWrite: (point: string) => { if (point === 'owner-entry') throw new Error('injected crash'); },
+      }), /injected crash/);
+      const service = qlbKeychainService('xai', 'default');
+      const rotated = JSON.stringify({ ...(JSON.parse(h.keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT)) as Record<string, unknown>), refresh: 'rotated-refresh', access: 'rotated-access' });
+      h.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, rotated);
+      const flaky = {
+        setSync: (s: string, a: string, v: string) => h.keychain.setSync(s, a, v),
+        getSync: (s: string, a: string): string => { if (s === service) throw new Error('security: keychain read timed out'); return h.keychain.getSync(s, a); },
+        deleteSync: (s: string, a: string) => h.keychain.deleteSync(s, a),
+      } as unknown as typeof h.keychain;
+      assert.throws(() => migratePiSingleProvider('xai', h.paths, { keychain: flaky, store: h.store }), /timed out/);
+      assert.equal(h.keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT), rotated, 'a read error never reinstalls the baseline over the managed item');
+    } finally { h.cleanup(); }
+  });
+
+  for (const damage of ['lost', 'corrupt'] as const) {
+    it(`xai: a publishing resume with the owner entry visible reinstalls a ${damage} managed item from the baseline`, () => {
+      const h = setup();
+      try {
+        assert.throws(() => migratePiSingleProvider('xai', h.paths, {
+          keychain: h.keychain,
+          store: h.store,
+          afterWrite: (point: string) => { if (point === 'owner-entry') throw new Error('injected crash'); },
+        }), /injected crash/);
+        const service = qlbKeychainService('xai', 'default');
+        if (damage === 'lost') h.keychain.deleteSync(service, QLB_KEYCHAIN_ACCOUNT);
+        else h.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, 'not-json');
+        assert.equal(migratePiSingleProvider('xai', h.paths, { keychain: h.keychain, store: h.store }).state, 'migrated');
+        const after = JSON.parse(h.keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT)) as { refresh?: string };
+        assert.equal(after.refresh, 'refresh-native', 'the baseline was reinstalled');
+        assert.equal(existsSync(join(h.paths.journalPath, 'pi-migrate-xai.json')), false, 'the migration committed');
+      } finally { h.cleanup(); }
+    });
+  }
+
+  it('refuses a placeholder auth entry with no journal before writing anything', () => {
+    const h = setup();
+    try {
+      writeFileSync(h.paths.authJsonPath, JSON.stringify({ xai: { type: 'oauth', access: 'qlb-managed', refresh: '' } }), { mode: 0o600 });
+      assert.throws(
+        () => migratePiSingleProvider('xai', h.paths, { keychain: h.keychain }),
+        /Pi xai baseline would be a placeholder; run qlb pi rollback or restore auth\.json/,
+      );
+      assert.equal(existsSync(join(h.paths.journalPath, 'pi-migrate-xai.json')), false, 'no stray started journal');
+      assert.equal(existsSync(join(h.paths.baselineDir, 'xai.json')), false);
+    } finally { h.cleanup(); }
+  });
+
+  it('refuses a placeholder baseline without writing a baseline file', () => {
+    const h = setup();
+    try {
+      writeFileSync(h.paths.authJsonPath, JSON.stringify({ xai: { type: 'oauth', access: 'qlb-managed', refresh: '' } }), { mode: 0o600 });
+      writePiJournal(h.paths, 'xai', 'started');
+      const baseline = join(h.paths.baselineDir, 'xai.json');
+      assert.throws(
+        () => migratePiSingleProvider('xai', h.paths, { keychain: h.keychain }),
+        /Pi xai baseline would be a placeholder; run qlb pi rollback or restore auth\.json/,
+      );
+      assert.equal(existsSync(baseline), false);
+    } finally { h.cleanup(); }
+  });
+
+  it('refuses a canonical claim with only a pre-publication P7a journal', () => {
+    for (const phase of ['started', 'baseline', 'credential-saved'] as const) {
+      const h = setup();
+      try {
+        writeFileSync(h.paths.ownerPath, JSON.stringify({ providers: { xai: { mode: 'qlb' } } }), { mode: 0o600 });
+        writePiJournal(h.paths, 'xai', phase);
+        assert.throws(
+          () => migratePiSingleProvider('xai', h.paths, { keychain: h.keychain }),
+          (error: unknown) => (error as { code?: unknown; exitCode?: unknown }).code === 'owned-by-generic-migrate' && (error as { exitCode?: unknown }).exitCode === 3,
+          phase,
+        );
+      } finally { h.cleanup(); }
+    }
+  });
+
+  it('decides a canonical claim from the journal re-read inside the auth lock', () => {
+    const h = setup();
+    try {
+      writeFileSync(h.paths.ownerPath, JSON.stringify({ providers: { xai: { mode: 'qlb' } } }), { mode: 0o600 });
+      writePiJournal(h.paths, 'xai', 'credential-saved');
+      assert.throws(
+        () => migratePiSingleProvider('xai', h.paths, {
+          keychain: h.keychain,
+          withAuthLock: (path, fn) => {
+            writePiJournal(h.paths, 'xai', 'started');
+            return withPiAuthLock(path, fn);
+          },
+        }),
+        (error: unknown) => (error as { code?: unknown; exitCode?: unknown }).code === 'owned-by-generic-migrate' && (error as { exitCode?: unknown }).exitCode === 3,
+      );
+      assert.equal(hasManaged(h.keychain, 'xai'), false);
+    } finally { h.cleanup(); }
+  });
+
+  it('refuses generic ownership artifacts even without a migration row', () => {
+    for (const fixture of ['staging', 'legacy sidecar', 'canonical owner claim', 'nothing'] as const) {
+      const h = setup();
+      try {
+        if (fixture === 'staging') writeFileSync(join(h.dir, '.pi', 'agent', 'qlb-owner.json.xai.staging'), '{}', { mode: 0o600 });
+        if (fixture === 'legacy sidecar') writeFileSync(join(h.dir, '.pi', 'agent', 'qlb-owner-xai.json'), '{}', { mode: 0o600 });
+        if (fixture === 'canonical owner claim') writeFileSync(h.paths.ownerPath, JSON.stringify({ providers: { xai: { mode: 'qlb' } } }), { mode: 0o600 });
+        if (fixture === 'nothing') {
+          assert.equal(migratePiSingleProvider('xai', h.paths, { keychain: h.keychain }).state, 'migrated', fixture);
+        } else {
+          assert.throws(
+            () => migratePiSingleProvider('xai', h.paths, { keychain: h.keychain }),
+            (error: unknown) => (error as { code?: unknown; exitCode?: unknown }).code === 'owned-by-generic-migrate' && (error as { exitCode?: unknown }).exitCode === 3,
+            fixture,
+          );
+        }
+      } finally { h.cleanup(); }
+    }
+  });
+
+  it('T-OW1: refuses when generic stage publishes before the Pi auth lock is acquired', () => {
+    const h = setup();
+    try {
+      const staging = join(h.dir, '.pi', 'agent', 'qlb-owner.json.xai.staging');
+      const authBefore = readFileSync(h.paths.authJsonPath);
+      assert.throws(() => migratePiSingleProvider('xai', h.paths, {
+        keychain: h.keychain,
+        store: h.store,
+        withAuthLock: (path, fn) => {
+          h.store.upsertMigration('pi-xai', 'MIRRORED', '{}');
+          writeFileSync(staging, '{}', { mode: 0o600 });
+          return withPiAuthLock(path, fn);
+        },
+      }), (error: unknown) => (error as { code?: unknown; exitCode?: unknown }).code === 'owned-by-generic-migrate' && (error as { exitCode?: unknown }).exitCode === 3);
+      assert.equal(readFileSync(h.paths.authJsonPath).equals(authBefore), true);
+      assert.equal(existsSync(join(h.paths.journalPath, 'pi-migrate-xai.json')), false);
+      assert.equal(hasManaged(h.keychain, 'xai'), false);
+    } finally { h.cleanup(); }
+  });
+
   it('plans the managed service before the placeholder in dry-run output', () => {
     const h = setup();
     try {
@@ -197,7 +560,7 @@ describe('Pi migration S58 credential-first barrier', () => {
       const missing = migratePiSingleProvider('openrouter', h.paths, { keychain: h.keychain, readNativeOpenRouterKey: () => { throw new NativeOpenRouterKeyNotFoundError('pi-openrouter'); } });
       assert.equal(missing.state, 'not-applicable');
       let writes = 0;
-      assert.throws(() => migratePiSingleProvider('openrouter', h.paths, { keychain: h.keychain, store: { setConfig() { writes += 1; }, recordLineage() { return 0; }, upsertAccount() {} }, readNativeOpenRouterKey: () => { throw Object.assign(new Error('denied'), { code: 'EACCES' }); } }), /denied/);
+      assert.throws(() => migratePiSingleProvider('openrouter', h.paths, { keychain: h.keychain, store: { getMigration() { return null; }, getConfig() { return null; }, setConfig() { writes += 1; }, recordLineage() { return 0; }, upsertAccount() {}, getAccount() { return null; }, setAccountStatus() {} }, readNativeOpenRouterKey: () => { throw Object.assign(new Error('denied'), { code: 'EACCES' }); } }), /denied/);
       assert.equal(writes, 0);
     } finally { h.cleanup(); }
   });
@@ -206,7 +569,7 @@ describe('Pi migration S58 credential-first barrier', () => {
     const h = setup();
     try {
       const config = new Map<string, string>();
-      const store = { setConfig(key: string, value: string) { config.set(key, value); }, recordLineage() { return 0; }, upsertAccount() {} };
+      const store = { getMigration() { return null; }, getConfig(key: string) { return config.get(key) ?? null; }, setConfig(key: string, value: string) { config.set(key, value); }, recordLineage() { return 0; }, upsertAccount() {}, getAccount() { return null; }, setAccountStatus() {} };
       const missingExec: ExecFileSyncFn = markFakeExecutor((() => {
         throw { message: 'Command failed: /usr/bin/security find-generic-password -s pi-openrouter -w', status: 44, stderr: null };
       }) as ExecFileSyncFn);
@@ -357,7 +720,7 @@ describe('Pi migration S58 credential-first barrier', () => {
     const h = setup();
     try {
       const config = new Map<string, string>();
-      const store = { setConfig(key: string, value: string) { config.set(key, value); }, recordLineage() { return 0; }, upsertAccount() {} };
+      const store = { getMigration() { return null; }, getConfig(key: string) { return config.get(key) ?? null; }, setConfig(key: string, value: string) { config.set(key, value); }, recordLineage() { return 0; }, upsertAccount() {}, getAccount() { return null; }, setAccountStatus() {} };
       migratePiSingleProvider('xai', h.paths, {
         keychain: h.keychain,
         store,
@@ -402,7 +765,7 @@ describe('Pi migration S58 credential-first barrier', () => {
     const h = setup();
     try {
       const config = new Map<string, string>();
-      const store = { setConfig(key: string, value: string) { config.set(key, value); }, recordLineage() { return 0; }, upsertAccount() {} };
+      const store = { getMigration() { return null; }, getConfig(key: string) { return config.get(key) ?? null; }, setConfig(key: string, value: string) { config.set(key, value); }, recordLineage() { return 0; }, upsertAccount() {}, getAccount() { return null; }, setAccountStatus() {} };
       migratePiSingleProvider('xai', h.paths, { keychain: h.keychain, store });
       const journal = join(h.paths.journalPath, 'pi-migrate-xai.json');
       mkdirSync(h.paths.journalPath, { recursive: true });

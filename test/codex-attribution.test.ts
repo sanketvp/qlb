@@ -1,11 +1,15 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { describe, it } from 'node:test';
 
-import importActiveCommand from '../src/commands/codex-import-active';
+import importActiveCommand, {
+  runCodexImportActiveCommand,
+  type CodexImportActiveCommandDeps,
+} from '../src/commands/codex-import-active';
+import { codexAuthLockDir, CodexAuthLockCompromised, withCodexAuthLock } from '../src/cc-locks';
 import { attributeLiveDocument } from '../src/codex-attribution';
 import { codexFingerprint, parseCodexAuth } from '../src/codex-auth';
 import { importActiveCodexSlot } from '../src/codex-slots';
@@ -55,6 +59,39 @@ class PreviousReadErrorKeychain extends MockKeychain {
   override getSync(service: string, account: string): string {
     if (service.endsWith(':prev')) throw this.previousError;
     return super.getSync(service, account);
+  }
+}
+
+class CurrentWriteErrorKeychain extends MockKeychain {
+  private failCurrentWrite = false;
+
+  failNextCurrentWrite(): void {
+    this.failCurrentWrite = true;
+  }
+
+  override setSync(service: string, account: string, value: string): void {
+    if (this.failCurrentWrite && !service.endsWith(':prev')) {
+      this.failCurrentWrite = false;
+      throw new Error('fixture current-item write failed before mutation');
+    }
+    super.setSync(service, account, value);
+  }
+}
+
+class CurrentWriteTakeoverKeychain extends MockKeychain {
+  private replacement: string | undefined;
+
+  replaceNextCurrentWriteWith(value: string): void {
+    this.replacement = value;
+  }
+
+  override setSync(service: string, account: string, value: string): void {
+    super.setSync(service, account, value);
+    if (this.replacement !== undefined && !service.endsWith(':prev')) {
+      const replacement = this.replacement;
+      this.replacement = undefined;
+      super.setSync(service, account, replacement);
+    }
   }
 }
 
@@ -216,6 +253,96 @@ describe('Codex live-document attribution (AC57)', () => {
     } finally {
       h.store.close();
       rmSync(h.home, { recursive: true, force: true });
+    }
+  });
+
+  it('a takeover after the Keychain writes in adoption restores current and :prev and leaves DB and Keychain consistent', async () => {
+    const h = fixture();
+    try {
+      const old = document('takeover-adopt-old');
+      const live = document('takeover-adopt-live');
+      const plan = importActiveCodexSlot(old, { store: h.store, keychain: h.keychain, now: () => 1 });
+      const service = qlbKeychainService('openai-codex', plan.slotId);
+      let assertions = 0;
+
+      await assert.rejects(attributeLiveDocument({
+        store: h.store,
+        keychain: h.keychain,
+        slot: { accountId: plan.slotId, document: old, fingerprint: codexFingerprint(old) },
+        live,
+        now: () => 2,
+        assertNotCompromised: () => {
+          assertions += 1;
+          if (assertions >= 5) throw new CodexAuthLockCompromised();
+        },
+      }), (error: unknown) => error instanceof CodexAuthLockCompromised && error.retryable);
+
+      assert.equal(h.store.getCodexSlot(plan.slotId)?.fingerprint, codexFingerprint(old));
+      assert.equal(codexFingerprint(JSON.parse(h.keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT))), codexFingerprint(old));
+      assert.throws(() => h.keychain.getSync(`${service}:prev`, QLB_KEYCHAIN_ACCOUNT), /item not found/);
+    } finally {
+      h.store.close();
+      rmSync(h.home, { recursive: true, force: true });
+    }
+  });
+
+  it('a current-item write that throws before mutating still restores :prev', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-codex-current-write-error-'));
+    const keychain = new CurrentWriteErrorKeychain();
+    const store = openStore(join(home, 'qlb.db'));
+    try {
+      const old = document('current-write-error-old');
+      const previous = document('current-write-error-previous');
+      const live = document('current-write-error-live');
+      const plan = importActiveCodexSlot(old, { store, keychain, now: () => 1 });
+      const service = qlbKeychainService('openai-codex', plan.slotId);
+      keychain.setSync(`${service}:prev`, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(previous));
+      keychain.failNextCurrentWrite();
+
+      await assert.rejects(attributeLiveDocument({
+        store,
+        keychain,
+        slot: { accountId: plan.slotId, document: old, fingerprint: codexFingerprint(old) },
+        live,
+        now: () => 2,
+      }), /fixture current-item write failed before mutation/);
+
+      assert.equal(codexFingerprint(JSON.parse(keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT))), codexFingerprint(old));
+      assert.equal(codexFingerprint(JSON.parse(keychain.getSync(`${service}:prev`, QLB_KEYCHAIN_ACCOUNT))), codexFingerprint(previous));
+    } finally {
+      store.close();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('compensation failure keeps the original error as cause and its retryable flag', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-codex-compensation-cause-'));
+    const keychain = new CurrentWriteTakeoverKeychain();
+    const store = openStore(join(home, 'qlb.db'));
+    try {
+      const old = document('compensation-cause-old');
+      const live = document('compensation-cause-live');
+      const foreign = document('compensation-cause-foreign');
+      const plan = importActiveCodexSlot(old, { store, keychain, now: () => 1 });
+      keychain.replaceNextCurrentWriteWith(JSON.stringify(foreign));
+      let assertions = 0;
+
+      await assert.rejects(attributeLiveDocument({
+        store,
+        keychain,
+        slot: { accountId: plan.slotId, document: old, fingerprint: codexFingerprint(old) },
+        live,
+        now: () => 2,
+        assertNotCompromised: () => {
+          assertions += 1;
+          if (assertions >= 5) throw new CodexAuthLockCompromised();
+        },
+      }), (error: unknown) => error instanceof Error &&
+        /Codex Keychain compensation compare-and-set failed/.test(error.message) &&
+        error.cause instanceof CodexAuthLockCompromised && error.cause.retryable);
+    } finally {
+      store.close();
+      rmSync(home, { recursive: true, force: true });
     }
   });
 
@@ -445,6 +572,229 @@ describe('Codex live-document attribution (AC57)', () => {
     } finally {
       h.store.close();
       rmSync(h.home, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects an adoption committed after split repair and before re-validation', async () => {
+    const h = fixture();
+    try {
+      const old = document('repair-commit-old');
+      const repaired = document('repair-commit-repaired');
+      const newer = document('repair-commit-newer');
+      const plan = importActiveCodexSlot(old, { store: h.store, keychain: h.keychain, now: () => 1 });
+      const service = qlbKeychainService('openai-codex', plan.slotId);
+      h.store.adoptCodexSlot({
+        accountId: plan.slotId, previousFingerprint: codexFingerprint(old), fingerprint: codexFingerprint(repaired),
+        ts: 2, evidence: 'identity',
+      });
+      h.keychain.setSync(`${service}:prev`, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(repaired));
+      const raw = (h.store as unknown as { db: DatabaseSync }).db;
+      let injectAfterRepairCommit = true;
+      (h.store as unknown as { db: DatabaseSync }).db = new Proxy(raw, {
+        get(target, property, receiver) {
+          if (property === 'exec') return (sql: string) => {
+            const result = target.exec(sql);
+            if (sql === 'COMMIT' && injectAfterRepairCommit) {
+              injectAfterRepairCommit = false;
+              target.prepare('UPDATE codex_slots SET fingerprint = ?, prev_fingerprint = ? WHERE account_id = ?')
+                .run(codexFingerprint(newer), codexFingerprint(repaired), plan.slotId);
+              h.keychain.setSync(`${service}:prev`, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(repaired));
+              h.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(newer));
+            }
+            return result;
+          };
+          const value = Reflect.get(target, property, receiver);
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      });
+      const published: string[] = [];
+
+      const result = await attributeLiveDocument({
+        store: h.store, keychain: h.keychain,
+        slot: { accountId: plan.slotId, document: old, fingerprint: codexFingerprint(repaired) }, live: old,
+        republish: (doc) => { published.push(codexFingerprint(doc)); },
+      });
+
+      assert.equal(result.action, 'slot-split');
+      assert.deepEqual(published, []);
+      assert.equal(h.store.getCodexSlot(plan.slotId)?.fingerprint, codexFingerprint(newer));
+      assert.equal(codexFingerprint(JSON.parse(h.keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT))), codexFingerprint(newer));
+    } finally {
+      h.store.close();
+      rmSync(h.home, { recursive: true, force: true });
+    }
+  });
+
+  it('a holder whose Codex auth lock was taken over aborts before writing', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-codex-import-compromised-home-'));
+    const codexHome = mkdtempSync(join(tmpdir(), 'qlb-codex-import-compromised-auth-'));
+    const originalPlatformKeychain = keychainModule.platformKeychain;
+    try {
+      const keychain = new MockKeychain();
+      (keychainModule as unknown as { platformKeychain: MockKeychain }).platformKeychain = keychain;
+      const output: string[] = [];
+      const ctx = commandContext(home, codexHome, output);
+      const old = document('compromised-old');
+      const newer = document('compromised-newer');
+      writeFileSync(join(codexHome, 'auth.json'), JSON.stringify(old), { mode: 0o600 });
+      const admitted = openStore(join(home, 'qlb.db'));
+      beginCutover(admitted, 1);
+      const plan = importActiveCodexSlot(old, { store: admitted, keychain, now: () => 1 });
+      importActiveCodexSlot(newer, { store: admitted, keychain, now: () => 2 });
+      admitted.close();
+
+      let writes = 0;
+      await assert.rejects(
+        runCodexImportActiveCommand([], ctx, {
+          withAuthLock: withCodexAuthLock,
+          readAuth: async () => {
+            // Model a stale-lock successor replacing the directory after the
+            // holder's read but before its only auth.json publication.
+            const lock = codexAuthLockDir({ home });
+            rmSync(lock, { recursive: true });
+            mkdirSync(lock);
+            return { status: 'ok', doc: old };
+          },
+          writeAuth: async () => { writes += 1; return 1; },
+        }),
+        (error: unknown) => error instanceof CodexAuthLockCompromised && error.retryable,
+      );
+      assert.equal(writes, 0);
+      const slot = openStore(join(home, 'qlb.db'));
+      try {
+        assert.equal(slot.getCodexSlot(plan.slotId)?.fingerprint, codexFingerprint(newer));
+      } finally { slot.close(); }
+    } finally {
+      (keychainModule as unknown as { platformKeychain: typeof originalPlatformKeychain }).platformKeychain = originalPlatformKeychain;
+      rmSync(home, { recursive: true, force: true });
+      rmSync(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  it('a stalled import-active that lost the lock cannot overwrite active_login after the successor completes', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-codex-import-lost-active-home-'));
+    const codexHome = mkdtempSync(join(tmpdir(), 'qlb-codex-import-lost-active-auth-'));
+    const originalPlatformKeychain = keychainModule.platformKeychain;
+    try {
+      const keychain = new MockKeychain();
+      (keychainModule as unknown as { platformKeychain: MockKeychain }).platformKeychain = keychain;
+      const output: string[] = [];
+      const ctx = commandContext(home, codexHome, output);
+      const a = document('lost-active-a', 'account-a');
+      const b = document('lost-active-b', 'account-b');
+      writeFileSync(join(codexHome, 'auth.json'), JSON.stringify(a), { mode: 0o600 });
+      const store = openStore(join(home, 'qlb.db'));
+      beginCutover(store, 1);
+      const aPlan = importActiveCodexSlot(a, { store, keychain, now: () => 1 });
+      importActiveCodexSlot(b, { store, keychain, now: () => 2 });
+      store.close();
+
+      await assert.rejects(
+        runCodexImportActiveCommand([], ctx, {
+          readAuth: async () => ({ status: 'ok', doc: a }),
+          writeAuth: async () => 1,
+          withAuthLock: async (_options, fn) => fn({
+            assertNotCompromised: () => { throw new CodexAuthLockCompromised(); },
+          }),
+        }),
+        (error: unknown) => error instanceof CodexAuthLockCompromised && error.retryable,
+      );
+      const result = openStore(join(home, 'qlb.db'));
+      try {
+        assert.equal(result.getCodexActiveLogin(), 'fixture-user:account-b');
+        assert.equal(result.getCodexSlot(aPlan.slotId)?.fingerprint, codexFingerprint(a));
+      } finally { result.close(); }
+    } finally {
+      (keychainModule as unknown as { platformKeychain: typeof originalPlatformKeychain }).platformKeychain = originalPlatformKeychain;
+      rmSync(home, { recursive: true, force: true });
+      rmSync(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  it('serializes a second import after re-validation until repaired-slot publication completes', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-codex-import-lock-home-'));
+    const codexHome = mkdtempSync(join(tmpdir(), 'qlb-codex-import-lock-auth-'));
+    const originalPlatformKeychain = keychainModule.platformKeychain;
+    let releasePublication: (() => void) | undefined;
+    const publicationReached = new Promise<void>((resolve) => { releasePublication = resolve; });
+    let allowPublication: (() => void) | undefined;
+    const publicationAllowed = new Promise<void>((resolve) => { allowPublication = resolve; });
+    try {
+      const keychain = new MockKeychain();
+      (keychainModule as unknown as { platformKeychain: MockKeychain }).platformKeychain = keychain;
+      const output: string[] = [];
+      const ctx = commandContext(home, codexHome, output);
+      const old = document('lock-old');
+      const repaired = document('lock-repaired');
+      const newer = document('lock-newer');
+      const authPath = join(codexHome, 'auth.json');
+      writeFileSync(authPath, JSON.stringify(old), { mode: 0o600 });
+      const admitted = openStore(join(home, 'qlb.db'));
+      beginCutover(admitted, 1);
+      const plan = importActiveCodexSlot(old, { store: admitted, keychain, now: () => 1 });
+      const service = qlbKeychainService('openai-codex', plan.slotId);
+      admitted.adoptCodexSlot({
+        accountId: plan.slotId,
+        previousFingerprint: codexFingerprint(old),
+        fingerprint: codexFingerprint(repaired),
+        ts: 2,
+        evidence: 'identity',
+      });
+      keychain.setSync(`${service}:prev`, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(repaired));
+      admitted.close();
+
+      const withAuthLock: CodexImportActiveCommandDeps['withAuthLock'] = async <T,>(
+        options: import('../src/cc-locks').CodexAuthLockOptions,
+        fn: (held: import('../src/cc-locks').HeldCodexAuthLock) => Promise<T> | T,
+      ): Promise<T> => withCodexAuthLock({ ...options, retryMinMs: 1, retryJitterMs: 0 }, fn);
+      let reads = 0;
+      let republished = false;
+      const writes: string[] = [];
+      const deps: CodexImportActiveCommandDeps = {
+        withAuthLock,
+        readAuth: async () => {
+          reads += 1;
+          if (reads === 1) return { status: 'ok', doc: old };
+          // The second flow cannot make its newer adoption until the first has
+          // released the QLB lock. This represents its fresh native observation.
+          assert.equal(republished, true);
+          writeFileSync(authPath, JSON.stringify(newer), { mode: 0o600 });
+          return { status: 'ok', doc: newer };
+        },
+        writeAuth: async (_path, doc) => {
+          writes.push(codexFingerprint(doc));
+          assert.equal(codexFingerprint(doc), codexFingerprint(repaired));
+          releasePublication?.();
+          await publicationAllowed;
+          republished = true;
+          writeFileSync(authPath, JSON.stringify(doc), { mode: 0o600 });
+          return 1;
+        },
+      };
+
+      const first = runCodexImportActiveCommand([], ctx, deps);
+      await publicationReached;
+      // This starts after re-validation but cannot read/adopt until the first
+      // flow's protected publish and mark-imported-active have completed.
+      const second = runCodexImportActiveCommand([], ctx, deps);
+      await Promise.resolve();
+      assert.equal(reads, 1);
+      allowPublication?.();
+      assert.equal(await first, 0);
+      assert.equal(await second, 0);
+
+      const finalStore = openStore(join(home, 'qlb.db'));
+      try {
+        assert.equal(finalStore.getCodexSlot(plan.slotId)?.fingerprint, codexFingerprint(newer));
+      } finally {
+        finalStore.close();
+      }
+      assert.equal(codexFingerprint(JSON.parse(readFileSync(authPath, 'utf8'))), codexFingerprint(newer));
+      assert.deepEqual(writes, [codexFingerprint(repaired)]);
+    } finally {
+      (keychainModule as unknown as { platformKeychain: typeof originalPlatformKeychain }).platformKeychain = originalPlatformKeychain;
+      rmSync(home, { recursive: true, force: true });
+      rmSync(codexHome, { recursive: true, force: true });
     }
   });
 

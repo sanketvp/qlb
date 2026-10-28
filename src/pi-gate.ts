@@ -4,6 +4,8 @@ import { dirname, join } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 
 import { tokenCallAllowed } from './commands/token';
+import { resolveCswapCheck } from './cc-resync';
+import type { CswapProcess } from './cswap-processes';
 import { loadGate } from './gate';
 import { assertAdmittedInConnection } from './lifecycle';
 import { isPiPlaceholder } from './pi-migrate';
@@ -13,7 +15,8 @@ import {
   type PiGateProvider,
   validatePiOwnerDocument as validateOwnerDocument,
 } from './pi-owner-document';
-import { openStoreConnection } from './store';
+import { openStore, openStoreConnection, type Store } from './store';
+import { recordRelogin } from './relogin';
 
 export { PI_GATE_PROVIDERS, type PiGateProvider } from './pi-owner-document';
 
@@ -25,11 +28,27 @@ export interface GateCredential {
   source: string;
 }
 
+/** Durable transition callbacks supplied by each production refresh entry point. */
+export interface GateRefreshContext {
+  onLineage: (row: { provider: 'xai' | 'kimi-coding'; fromFp: string; toFp: string }) => void;
+  onDead: (provider: 'xai' | 'kimi-coding') => void;
+}
+
+/** Shared, value-free context for gate modules that need configured paths. */
+export interface GateContext {
+  dbPath: string;
+  env: NodeJS.ProcessEnv;
+  piAgentDir?: string;
+  autoLog: (line: string) => void;
+}
+
 /** Provider slices own identity resolution and any synchronous refresh. */
 export interface ProviderGate {
+  context?: (context: GateContext) => void | Promise<void>;
   prerequisites?: () => void | Promise<void>;
   read(): GateCredential | Promise<GateCredential>;
-  refresh?: () => GateCredential | Promise<GateCredential>;
+  /** Optional in-process refresh. P13 waits for single-consume's winner here. */
+  refresh?: (current?: GateCredential, context?: GateRefreshContext) => GateCredential | Promise<GateCredential>;
 }
 
 /** A stable, value-free failure cause surfaced by a provider gate module. */
@@ -45,6 +64,14 @@ export class GateAdmissionRefused extends GateFailure {
   constructor(code: string) {
     super(code);
     this.name = 'GateAdmissionRefused';
+  }
+}
+
+/** A safety refusal at the gate boundary; its exit status is always 3. */
+export class GateRefused extends GateFailure {
+  constructor(code: string) {
+    super(code);
+    this.name = 'GateRefused';
   }
 }
 
@@ -65,8 +92,16 @@ export interface PiGateDeps {
   open?: (dbPath: string) => DatabaseSync;
   sqlTrace?: (sql: string) => void;
   evidenceGap?: (provider: PiGateProvider, error: unknown) => void;
+  /** Injectable clock for the ≤60 s single-account gate boundary. */
+  now?: () => number;
+  /** Production defaults to a Store opened for this gate DB; tests may inject one. */
+  store?: Pick<Store, 'recordLineage' | 'recordRelogin'>;
   /** Command dispatch supplies the configured Pi agent directory. */
   piAgentDir?: string;
+  /** Injectable S24 result for hermetic tests. */
+  cswapProcesses?: () => CswapProcess[];
+  /** Test seam for the process listing used when no S24 result is injected. */
+  listCswap?: () => CswapProcess[];
 }
 
 function isProvider(value: string): value is PiGateProvider {
@@ -227,6 +262,17 @@ export function appendEvidenceGap(dbPath: string, provider: PiGateProvider): voi
   }
 }
 
+/** Best-effort, value-free diagnostic sink for provider context hooks. */
+function appendGateAutoLog(dbPath: string, line: string): void {
+  try {
+    const directory = dirname(dbPath);
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    appendFileSync(join(directory, 'auto.log'), `${line}\n`, { mode: 0o600 });
+  } catch {
+    // Diagnostics must not interrupt credential handling.
+  }
+}
+
 /** S30/S54 gate boundary. Credential resolution is deliberately outside the evidence transaction. */
 export async function runPiGate(providerName: string, deps: PiGateDeps): Promise<number> {
   if (!isProvider(providerName) || !(deps.guard ?? tokenCallAllowed)(deps.env)) return 3;
@@ -247,10 +293,48 @@ export async function runPiGate(providerName: string, deps: PiGateDeps): Promise
       return 3;
     }
 
-    await (deps.prerequisites ?? ((name, connection) => defaultPrerequisites(name, connection, deps.dbPath, deps.piAgentDir)))(providerName, db);
+    try {
+      if (resolveCswapCheck(deps.cswapProcesses, deps.env, deps.listCswap)().length > 0) {
+        throw new GateRefused('cswap-process-alive');
+      }
+    } catch (error) {
+      if (error instanceof GateRefused) throw error;
+      throw new GateRefused('cswap-process-check-failed');
+    }
+
     const gate = deps.provider ?? loadedProvider(providerName, deps.loadGate);
+    await (deps.prerequisites ?? ((name, connection) => defaultPrerequisites(name, connection, deps.dbPath, deps.piAgentDir)))(providerName, db);
+    await gate.context?.({
+      dbPath: deps.dbPath,
+      env: deps.env,
+      ...(deps.piAgentDir === undefined ? {} : { piAgentDir: deps.piAgentDir }),
+      autoLog: (line) => appendGateAutoLog(deps.dbPath, line),
+    });
     await gate.prerequisites?.();
-    const credential = await gate.read();
+    let credential = await gate.read();
+    // §4.5: Pi never receives a single-account token with ≤60 seconds left.
+    // The provider refresh waits for the consume-lock winner, then re-reads it.
+    // An unknown expiry is immediately due (D-B55), as in single-consume.
+    if (gate.refresh && credential && (credential.expiresAt === undefined || credential.expiresAt - (deps.now ?? Date.now)() <= 60_000)) {
+      const needsAudit = providerName === 'xai' || providerName === 'kimi-coding';
+      const ownedStore = needsAudit && !deps.store ? openStore(deps.dbPath) : undefined;
+      const store = deps.store ?? ownedStore;
+      try {
+        credential = await gate.refresh(credential, store ? {
+          onLineage: (row) => store.recordLineage({
+            provider: row.provider, accountId: 'default', fromFp: row.fromFp, toFp: row.toFp,
+            cause: 'post', by: 'qlb-gate', evidence: 'post',
+          }),
+          onDead: (provider) => recordRelogin(store, { ts: (deps.now ?? Date.now)(), provider, accountId: 'default', kind: 'dead' }),
+        } : undefined);
+      } finally {
+        ownedStore?.close();
+      }
+      // Never hand Pi a just-refreshed token that cannot survive the gate horizon.
+      if (!credential || credential.expiresAt === undefined || credential.expiresAt - (deps.now ?? Date.now)() <= 60_000) {
+        throw new GateFailure('credential-unavailable');
+      }
+    }
     if (!credential || typeof credential.token !== 'string' || !credential.token ||
         typeof credential.accountId !== 'string' || !credential.accountId ||
         typeof credential.source !== 'string' || !credential.source) {
@@ -291,7 +375,7 @@ export async function runPiGate(providerName: string, deps: PiGateDeps): Promise
   } catch (error) {
     const code = failureCode(error);
     deps.stderr?.(code);
-    return error instanceof GateAdmissionRefused || code === 'missing-provider-gate' || isLifecycleRefusal(code) ? 3 : 1;
+    return error instanceof GateAdmissionRefused || error instanceof GateRefused || code === 'missing-provider-gate' || isLifecycleRefusal(code) ? 3 : 1;
   } finally {
     db.close();
   }

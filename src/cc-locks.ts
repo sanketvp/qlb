@@ -5,8 +5,12 @@
  * Modified for QLB. See NOTICE.
  */
 
-import { existsSync, statSync } from 'node:fs';
-import { mkdir, rmdir, stat, utimes } from 'node:fs/promises';
+// Gate lock order is consume → switch; the switch lock is not reentrant.
+// Never acquire a consume lock while holding the switch lock.
+
+import { randomBytes } from 'node:crypto';
+import { existsSync, readdirSync, statSync } from 'node:fs';
+import { mkdir, readdir, rmdir, stat, unlink, utimes, writeFile } from 'node:fs/promises';
 import { performance } from 'node:perf_hooks';
 import { basename, dirname, join } from 'node:path';
 import { qlbHomeDir } from './home';
@@ -25,6 +29,12 @@ const RETRY_JITTER_MS = 250;
 export const TAKEOVER_SUFFIX = '.takeover';
 /** A stale takeover directory is abandoned after this long. */
 export const TAKEOVER_STALENESS_MS = 5_000;
+/**
+ * Codex publishes after synchronous Keychain/SQLite work, which can block the
+ * Node mtime toucher. Give an interactive holder substantially longer than the
+ * ordinary credential lease before another QLB process may take it over.
+ */
+export const CODEX_AUTH_STALENESS_MS = 5 * CREDENTIALS_STALENESS_MS;
 
 export class ClaudeCodeLockTimeout extends Error {
   constructor(lockDir: string) {
@@ -97,6 +107,8 @@ export function assertClaudeConfigLockHeld(
  * re-running the legacy selection heuristic.
  */
 export interface ClaudeLockOptions {
+  /** Called once when this holder discovers its lock directory was replaced. */
+  onCompromised?: (error: ProperLockfileCompromised) => void;
   home?: string;
   configDir?: string;
   configPath?: string;
@@ -113,6 +125,67 @@ export interface ClaudeLockPaths {
   oauthRefreshLockDir: string;
   credentialsLockDir: string;
   configLockDir: string;
+}
+
+/** QLB's provider-level locks; independent from Claude Code's own lock paths. */
+export interface ClaudeGateLockOptions {
+  home?: string;
+  env?: NodeJS.ProcessEnv;
+  timeoutMs?: number;
+  stalenessMs?: number;
+}
+
+function gateLockHome(options: ClaudeGateLockOptions): string {
+  if (options.home) return options.home;
+  return qlbHomeDir(options.env ?? process.env);
+}
+
+function assertGateLockAccountId(accountId: string): void {
+  if (!accountId || /[\0/\\/:]/.test(accountId)) throw new Error('invalid Claude consume-lock account id');
+}
+
+/** Serialize refresh-token consumption for one QLB Claude slot. */
+export async function withClaudeConsumeLock<T>(
+  accountId: string,
+  fn: () => Promise<T> | T,
+  options: ClaudeGateLockOptions = {},
+): Promise<T> {
+  assertGateLockAccountId(accountId);
+  return withProperLockfile(join(gateLockHome(options), '.qlb', 'locks', `consume-anthropic-${accountId}.lock`), {
+    ...options,
+    timeoutMs: options.timeoutMs ?? 10_000,
+    stalenessMs: options.stalenessMs ?? CREDENTIALS_STALENESS_MS,
+  }, fn);
+}
+
+/** Briefly serialize slot CAS/adoption with Claude switch operations. */
+export async function withClaudeSwitchLock<T>(
+  fn: () => Promise<T> | T,
+  options: ClaudeGateLockOptions = {},
+): Promise<T> {
+  return withProperLockfile(join(gateLockHome(options), '.qlb', 'locks', 'switch-anthropic.lock'), {
+    ...options,
+    timeoutMs: options.timeoutMs ?? 10_000,
+    stalenessMs: options.stalenessMs ?? CREDENTIALS_STALENESS_MS,
+  }, fn);
+}
+
+/** Options for QLB's lock around a live Codex auth.json attribution/publish flow. */
+export interface CodexAuthLockOptions {
+  /** QLB home; the lock is deliberately never placed below CODEX_HOME. */
+  home?: string;
+  env?: NodeJS.ProcessEnv;
+  timeoutMs?: number;
+  stalenessMs?: number;
+  touchIntervalMs?: number;
+  retryMinMs?: number;
+  retryJitterMs?: number;
+}
+
+/** QLB-owned, inter-process lock location for the one live Codex credential. */
+export function codexAuthLockDir(options: CodexAuthLockOptions = {}): string {
+  const home = options.home ?? qlbHomeDir(options.env);
+  return join(home, '.qlb', 'locks', 'codex-auth.lock');
 }
 
 function resolvedEnv({ env = process.env }: ClaudeLockOptions): NodeJS.ProcessEnv {
@@ -163,16 +236,62 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+export class ProperLockfileCompromised extends Error {
+  readonly code = 'proper-lockfile-compromised';
+  readonly retryable = true;
+
+  constructor(lockDir: string) {
+    super(`Lock ownership was lost: ${lockDir}. Retry the operation.`);
+    this.name = 'ProperLockfileCompromised';
+  }
+}
+
+/** Capability passed to holders that opt into compromise detection. */
+export interface HeldProperLockfile {
+  /** Throws a typed retryable error unless this invocation still owns the directory. */
+  assertNotCompromised(): void;
+}
+
+interface LockIdentity {
+  dev: number;
+  ino: number;
+}
+
+function lockIdentity(lockDir: string): LockIdentity {
+  const held = statSync(lockDir);
+  return { dev: held.dev, ino: held.ino };
+}
+
+function sameLockIdentity(left: LockIdentity, right: LockIdentity): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+const QLB_OWNER_TOKEN = /^\.qlb-owner-\d+-[0-9a-f]+$/;
+
+function newOwnerToken(): string {
+  return `.qlb-owner-${process.pid}-${randomBytes(16).toString('hex')}`;
+}
+
+/** Remove only QLB ownership tokens; any other entry leaves the directory intact. */
+async function removeQlBOwnerTokens(lockDir: string): Promise<boolean> {
+  const entries = await readdir(lockDir);
+  if (!entries.every((entry) => QLB_OWNER_TOKEN.test(entry))) return false;
+  await Promise.all(entries.map((entry) => unlink(join(lockDir, entry))));
+  return true;
+}
+
 async function bestEffortRelease(lockDir: string): Promise<void> {
   try {
+    if (!await removeQlBOwnerTokens(lockDir)) return;
     await rmdir(lockDir);
   } catch {
     // Match the ignored cleanup failure in claude_locks.py:121-125.
   }
 }
 
-async function releaseHeldLock(lockDir: string): Promise<void> {
+async function releaseHeldLock(lockDir: string, ownerToken?: string): Promise<void> {
   try {
+    if (ownerToken) await unlink(join(lockDir, ownerToken));
     await rmdir(lockDir);
   } catch (error: unknown) {
     // Match claude_locks.py:188-195: release failures must not replace the callback result.
@@ -200,7 +319,7 @@ async function removeIfStillStale(lockDir: string, stalenessMs: number): Promise
     if (!error || typeof error !== 'object' || (error as NodeJS.ErrnoException).code !== 'EEXIST') return false;
     try {
       const heldTakeover = await stat(takeoverDir);
-      if (Date.now() - heldTakeover.mtimeMs > TAKEOVER_STALENESS_MS) await rmdir(takeoverDir);
+      if (Date.now() - heldTakeover.mtimeMs > TAKEOVER_STALENESS_MS) await bestEffortRelease(takeoverDir);
     } catch {
       // Another contender released or retook the takeover directory; retry the lock protocol.
     }
@@ -210,6 +329,7 @@ async function removeIfStillStale(lockDir: string, stalenessMs: number): Promise
   try {
     const held = await stat(lockDir);
     if (Date.now() - held.mtimeMs <= stalenessMs) return false;
+    if (!await removeQlBOwnerTokens(lockDir)) return false;
     await rmdir(lockDir);
     return true;
   } catch {
@@ -240,7 +360,7 @@ async function removeIfStillStale(lockDir: string, stalenessMs: number): Promise
 export async function withProperLockfile<T>(
   lockDir: string,
   options: ClaudeLockOptions = {},
-  fn: () => Promise<T> | T,
+  fn: (held: HeldProperLockfile) => Promise<T> | T,
 ): Promise<T> {
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const stalenessMs = options.stalenessMs ?? CONFIG_STALENESS_MS;
@@ -248,56 +368,176 @@ export async function withProperLockfile<T>(
   const retryMinMs = options.retryMinMs ?? RETRY_MIN_MS;
   const retryJitterMs = options.retryJitterMs ?? RETRY_JITTER_MS;
   const started = performance.now();
+  let acquiredOwnerToken: string | undefined;
 
   await mkdir(join(lockDir, '..'), { recursive: true });
   for (;;) {
     try {
       await mkdir(lockDir);
-      break;
     } catch (error: unknown) {
       if (!error || typeof error !== 'object' || (error as NodeJS.ErrnoException).code !== 'EEXIST') {
         throw error;
       }
-    }
+      // The normal contention/stale-lock path below owns EEXIST retries.
+      if (performance.now() - started > timeoutMs) throw new ClaudeCodeLockTimeout(lockDir);
 
-    if (performance.now() - started > timeoutMs) throw new ClaudeCodeLockTimeout(lockDir);
-
-    try {
-      const held = await stat(lockDir);
-      if (Date.now() - held.mtimeMs > stalenessMs) {
-        if (!await removeIfStillStale(lockDir, stalenessMs)) {
-          // Match C-swap's tiny backoff after a failed stale-lock removal/takeover.
-          await sleep(50);
+      try {
+        const held = await stat(lockDir);
+        if (Date.now() - held.mtimeMs > stalenessMs) {
+          if (!await removeIfStillStale(lockDir, stalenessMs)) {
+            // Match C-swap's tiny backoff after a failed stale-lock removal/takeover.
+            await sleep(50);
+          }
+          continue;
         }
-        continue;
+      } catch (statError: unknown) {
+        if (statError && typeof statError === 'object' && (statError as NodeJS.ErrnoException).code === 'ENOENT') {
+          continue; // Holder released between mkdir and stat; retry immediately.
+        }
+        throw statError;
       }
-    } catch (error: unknown) {
-      if (error && typeof error === 'object' && (error as NodeJS.ErrnoException).code === 'ENOENT') {
-        continue; // Holder released between mkdir and stat; retry immediately.
-      }
-      throw error;
+      await sleep(retryMinMs + Math.random() * retryJitterMs);
+      continue;
     }
-    await sleep(retryMinMs + Math.random() * retryJitterMs);
+
+    if (options.onCompromised) {
+      const ownerToken = newOwnerToken();
+      try {
+        await writeFile(join(lockDir, ownerToken), '', { flag: 'wx', mode: 0o600 });
+        const entries = await readdir(lockDir);
+        if (entries.some((entry) => QLB_OWNER_TOKEN.test(entry) && entry !== ownerToken)) {
+          // mkdir can be taken over before a stalled holder writes its token. Do
+          // not enter the callback from a directory that already has an owner.
+          // This holder may remove only the token it just wrote.
+          try { await unlink(join(lockDir, ownerToken)); } catch { /* retry without claiming this directory */ }
+          continue;
+        }
+      } catch (error) {
+        // Never use broad stale-lock cleanup here: this directory may now belong
+        // to another contender. At most remove the token generated above.
+        try { await unlink(join(lockDir, ownerToken)); } catch { /* nothing owned remains */ }
+        throw error;
+      }
+      acquiredOwnerToken = ownerToken;
+    }
+    break;
   }
+
+  const acquiredIdentity = lockIdentity(lockDir);
+  let compromised: ProperLockfileCompromised | undefined;
+  const markCompromised = (): ProperLockfileCompromised => {
+    if (!compromised) {
+      compromised = new ProperLockfileCompromised(lockDir);
+      try { options.onCompromised?.(compromised); } catch { /* the holder still fails closed */ }
+    }
+    return compromised;
+  };
+  const held: HeldProperLockfile = {
+    assertNotCompromised: () => {
+      if (compromised) throw compromised;
+      try {
+        if (!sameLockIdentity(acquiredIdentity, lockIdentity(lockDir))) throw markCompromised();
+        // Linux may immediately recycle a removed directory's dev/ino pair.
+        // A missing token or any other opt-in owner's token is compromised.
+        if (acquiredOwnerToken) {
+          const entries = readdirSync(lockDir);
+          if (!entries.includes(acquiredOwnerToken) ||
+            entries.some((entry) => QLB_OWNER_TOKEN.test(entry) && entry !== acquiredOwnerToken)) {
+            throw markCompromised();
+          }
+        }
+      } catch (error) {
+        if (error instanceof ProperLockfileCompromised) throw error;
+        throw markCompromised();
+      }
+    },
+  };
 
   let touchInFlight: Promise<void> | undefined;
   const timer = setInterval(() => {
     if (touchInFlight) return;
     touchInFlight = utimes(lockDir, new Date(), new Date()).catch(() => {
       // Match claude_locks.py:174-179: a removed/stolen lock ends this touch loop permanently.
+      markCompromised();
       clearInterval(timer);
     }).finally(() => { touchInFlight = undefined; });
   }, touchIntervalMs);
   timer.unref();
 
   try {
-    return await fn();
+    return await fn(held);
   } finally {
     clearInterval(timer);
     // Like claude_locks.py:186-195, wait for the toucher then release by pathname.
     await touchInFlight;
-    await releaseHeldLock(lockDir);
+    // Existing Claude-compatible callers retain upstream pathname release. QLB
+    // callers that opt into onCompromised must never remove a successor's lock.
+    if (options.onCompromised) {
+      try { held.assertNotCompromised(); } catch { /* a successor owns this path */ }
+      if (!compromised) await releaseHeldLock(lockDir, acquiredOwnerToken);
+    } else {
+      await releaseHeldLock(lockDir);
+    }
   }
+}
+
+export class CodexAuthLockCompromised extends Error {
+  readonly code = 'codex-auth-lock-compromised';
+  readonly retryable = true;
+
+  constructor() {
+    super('Codex auth lock ownership was lost. Retry the operation.');
+    this.name = 'CodexAuthLockCompromised';
+  }
+}
+
+/** Capability valid only during a withCodexAuthLock callback. */
+export interface HeldCodexAuthLock {
+  /** Check immediately before a Codex auth publication or related slot write. */
+  assertNotCompromised(): void;
+}
+
+/**
+ * Serialize QLB's entire live-Codex read/decide/write flow.
+ *
+ * This lock is deliberately non-reentrant: callers must acquire it at the
+ * command boundary and pass it through all read/decision/publication work,
+ * rather than acquiring it again in writeCodexAuthAtomic(). It lives in QLB
+ * state, never alongside Codex's own auth.json, and uses the same bounded
+ * proper-lockfile protocol as the Claude locks. Lock order is Codex auth lock
+ * → any SQLite transaction / Keychain rotation; it is non-reentrant.
+ */
+export async function withCodexAuthLock<T>(
+  options: CodexAuthLockOptions = {},
+  fn: (held: HeldCodexAuthLock) => Promise<T> | T,
+): Promise<T> {
+  let compromised: CodexAuthLockCompromised | undefined;
+  const failClosed = (): CodexAuthLockCompromised => {
+    compromised ??= new CodexAuthLockCompromised();
+    return compromised;
+  };
+  const result = await withProperLockfile(codexAuthLockDir(options), {
+    timeoutMs: options.timeoutMs,
+    stalenessMs: options.stalenessMs ?? CODEX_AUTH_STALENESS_MS,
+    touchIntervalMs: options.touchIntervalMs,
+    retryMinMs: options.retryMinMs,
+    retryJitterMs: options.retryJitterMs,
+    onCompromised: () => { failClosed(); },
+  }, (properLock) => fn({
+    assertNotCompromised: () => {
+      if (compromised) throw compromised;
+      try {
+        properLock.assertNotCompromised();
+      } catch {
+        throw failClosed();
+      }
+    },
+  }));
+  // withProperLockfile detects a takeover while it finalizes, after the
+  // callback has returned. A Codex writer must never report that callback
+  // result as success: its final mutation may have raced the successor.
+  if (compromised) throw compromised;
+  return result;
 }
 
 /**

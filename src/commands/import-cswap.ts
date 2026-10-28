@@ -71,17 +71,36 @@ async function execute(args: string[], ctx: CommandContext): Promise<number> {
       print(ctx, { ...plan, dryRun: true }, opts.json);
       return 0;
     }
-    // Resolve once: Claude's legacy/global selection is filesystem-dependent,
-    // so every lock and read below must use this exact path.
-    const paths = claudePaths({ home: ctx.home, env: ctx.env });
-    const withLiveStateLocks = <T,>(fn: () => Promise<T> | T) => withClaudeCredentialLocks({ home: ctx.home, env: ctx.env }, () =>
-      withClaudeConfigPathLock(paths.globalConfigPath, { home: ctx.home, env: ctx.env }, fn));
-    const readLiveSnapshot = async () => ({
-      credential: await readLiveClaudeCredentials({ backend: platformKeychain, paths, env: ctx.env }),
-      // Claude's Keychain OAuth blob intentionally has no account UUID. The
-      // config identity and credential are read under the enclosing lock hold.
-      accountId: configuredOauthAccountId(paths.globalConfigPath),
+    let livePaths: ReturnType<typeof claudePaths> | undefined;
+    const withLiveStateLocks = <T,>(fn: () => Promise<T> | T) => withClaudeCredentialLocks({ home: ctx.home, env: ctx.env }, async () => {
+      // The legacy/global selection is filesystem-dependent. Resolve it while
+      // holding credential locks, then re-resolve while holding that path's
+      // config lock so a changed selection cannot pair an unlocked config with
+      // the live Keychain credential.
+      const lockedPaths = claudePaths({ home: ctx.home, env: ctx.env });
+      return withClaudeConfigPathLock(lockedPaths.globalConfigPath, { home: ctx.home, env: ctx.env }, async () => {
+        const paths = claudePaths({ home: ctx.home, env: ctx.env });
+        if (paths.globalConfigPath !== lockedPaths.globalConfigPath) {
+          throw new CswapImportRefusalError('live-changed', 'C-swap import refused: live state changed during import');
+        }
+        livePaths = paths;
+        try {
+          return await fn();
+        } finally {
+          livePaths = undefined;
+        }
+      });
     });
+    const readLiveSnapshot = async () => {
+      const paths = livePaths;
+      if (!paths) throw new CswapImportRefusalError('live-identity-unresolvable', 'C-swap import refused: live active identity is unresolvable');
+      return {
+        credential: await readLiveClaudeCredentials({ backend: platformKeychain, paths, env: ctx.env }),
+        // Claude's Keychain OAuth blob intentionally has no account UUID. The
+        // config identity and credential are read under the enclosing lock hold.
+        accountId: configuredOauthAccountId(paths.globalConfigPath),
+      };
+    };
     const result = await importCswap({ ...base, liveSnapshot: readLiveSnapshot, withLiveStateLocks });
     print(ctx, { ...result.plan, runId: result.runId, phase: result.phase }, opts.json);
     return 0;

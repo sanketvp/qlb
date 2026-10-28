@@ -1,11 +1,15 @@
+import { existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
+import { atomicWriteText } from './fsutil';
 import type { Store } from './store';
 
 export type LifecycleState = 'pre-cutover' | 'cutting-over' | 'cutover' | 'undoing' | 'rolled-back' | 'retired' | 'aborted';
 export type LifecycleOperation =
   | 'gate' | 'switch:manual' | 'switch:auto' | 'auto' | 'auto:dry-run'
-  | 'import-cswap' | 'undo-cswap' | 'undo-cswap:resume' | 'retire-cswap'
+  | 'import-cswap' | 'undo-cswap' | 'undo-cswap:resume' | 'retire-cswap' | 'retire-cswap:resume'
   | 'pi-migrate' | 'pi-rollback' | 'codex-import-active' | 'codex-add' | 'claude-add'
   | 'cutover-begin' | 'cutover-commit' | 'cutover-abort' | 'keychain-authorize-cswap'
   | 'keychain-check-launchd-live' | 'verify-l13' | 'report-cutover' | 'doctor' | 'status'
@@ -16,6 +20,8 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 const OPEN_STATES = ['cutting-over', 'cutover', 'undoing', 'rolled-back', 'retired', 'aborted'];
 const PI_PROVIDERS = ['anthropic', 'openai-codex', 'xai', 'kimi-coding', 'openrouter'] as const;
 export const CUTOVER_BEGIN_IN_PROGRESS = 'cutover-begin-in-progress';
+/** Set only after retire-cswap has durably recorded its journal. */
+export const RETIREMENT_IN_PROGRESS = 'retirement-in-progress';
 export const PI_STALE_SESSION_COUNT_KEY = 'pi.staleSessionCount';
 export const PI_STALE_SESSIONS_KEY = 'pi.staleSessions';
 export const PI_STALE_SESSION_COUNT_CLEAR = '0';
@@ -58,13 +64,13 @@ export const PHASE_RULES: Record<LifecycleState, Set<LifecycleOperation>> = {
   cutover: rules(
     'doctor', 'status', 'switch:manual', 'switch:auto', 'auto', 'auto:dry-run', 'gate',
     'codex-import-active', 'codex-add', 'claude-add', 'pi-migrate', 'pi-rollback',
-    'verify-l13', 'report-cutover', 'undo-cswap', 'retire-cswap', 'lifecycle-drill-done',
+    'verify-l13', 'report-cutover', 'undo-cswap', 'retire-cswap', 'retire-cswap:resume', 'lifecycle-drill-done',
   ),
   undoing: rules('doctor', 'status', 'undo-cswap:resume', 'pi-rollback'),
   'rolled-back': rules('doctor', 'status', 'report-cutover', 'undo-cswap:resume', 'pi-rollback', 'lifecycle-close'),
   retired: rules(
     'doctor', 'status', 'gate', 'switch:manual', 'switch:auto', 'auto', 'auto:dry-run',
-    'claude-add', 'codex-add', 'report-cutover', 'lifecycle-close',
+    'claude-add', 'codex-add', 'report-cutover', 'retire-cswap:resume', 'lifecycle-close',
   ),
   aborted: rules('doctor', 'status', 'report-cutover', 'undo-cswap:resume', 'pi-rollback', 'lifecycle-close'),
 };
@@ -123,13 +129,22 @@ export function isOperational(state: LifecycleState): boolean {
   return state === 'cutover' || state === 'retired';
 }
 
-/** Admission must be called before locks or journal reconciliation (S43/S59). */
+/** Full lifecycle admission precedes locks and journal reconciliation (S43/S59).
+ * pi rollback keeps its historical phase availability, so it checks only the
+ * retirement fence before and again inside its retirement lock. */
 function assertAdmittedForPhase(current: LifecycleRow, operation: LifecycleOperation): LifecycleResult {
   if (current.state !== 'undoing' && operation.endsWith(':dry-run')) return { ok: true, row: current };
   // cutoverBegin's compensation uses its durable primitives directly. Every
   // separately admitted mutation must wait until that transaction clears this marker.
   if (current.note === CUTOVER_BEGIN_IN_PROGRESS && operation !== 'doctor' && operation !== 'status') {
     return { ok: false, code: CUTOVER_BEGIN_IN_PROGRESS, row: current };
+  }
+  // Retirement fences only actions which could reverse or restart a partial
+  // retirement; normal service and its reporting remain available.
+  if (current.note === RETIREMENT_IN_PROGRESS && (
+    operation === 'undo-cswap' || operation === 'undo-cswap:resume' || operation === 'pi-rollback' || operation === 'retire-cswap'
+  )) {
+    return { ok: false, code: RETIREMENT_IN_PROGRESS, row: current };
   }
   if (PHASE_RULES[current.state].has(operation)) return { ok: true, row: current };
   return { ok: false, code: current.state === 'undoing' ? 'undo-in-progress' : `phase=${current.state}`, row: current };
@@ -188,6 +203,176 @@ export function beginCutover(store: Store, now: number = Date.now(), note: strin
     const constraint = new Error(`SQLITE_CONSTRAINT: ${message}`);
     (constraint as Error & { code?: string }).code = 'SQLITE_CONSTRAINT';
     throw constraint;
+  }
+}
+
+/** Install the retirement fence only after retire-cswap has durably recorded its journal. */
+export function beginRetirementFence(store: Store): LifecycleResult {
+  const current = phase(store);
+  if (current.note === RETIREMENT_IN_PROGRESS) return { ok: true, row: current };
+  if (current.state !== 'cutover' || current.note != null) {
+    return { ok: false, code: 'retirement-fence-state-lost', row: current };
+  }
+  const changed = withDb(store, (db) => db.prepare(
+    "UPDATE lifecycle SET note = ? WHERE id = ? AND state = 'cutover' AND note IS NULL",
+  ).run(RETIREMENT_IN_PROGRESS, current.id).changes);
+  return changed === 1
+    ? { ok: true, row: phase(store) }
+    : { ok: false, code: 'retirement-fence-state-lost', row: phase(store) };
+}
+
+/** The retirement journal is durable before this terminal fence is cleared. */
+export function clearRetirementFence(store: Store): LifecycleResult {
+  const current = phase(store);
+  if (current.state !== 'retired' || current.note !== RETIREMENT_IN_PROGRESS) {
+    return { ok: false, code: 'retirement-fence-state-lost', row: current };
+  }
+  const changed = withDb(store, (db) => db.prepare(
+    "UPDATE lifecycle SET note = NULL WHERE id = ? AND state = 'retired' AND note = ?",
+  ).run(current.id, RETIREMENT_IN_PROGRESS).changes);
+  return changed === 1
+    ? { ok: true, row: phase(store) }
+    : { ok: false, code: 'retirement-fence-state-lost', row: phase(store) };
+}
+
+export function retirementLockPath(stateDir: string): string {
+  return join(stateDir, 'journal', 'retire-cswap.json.lock');
+}
+
+export function assertRetirementFenceClear(store: Store): LifecycleResult {
+  const current = phase(store);
+  return current.note === RETIREMENT_IN_PROGRESS
+    ? { ok: false, code: RETIREMENT_IN_PROGRESS, row: current }
+    : { ok: true, row: current };
+}
+
+/** Pi rollback is phase-independent but must wait for either active mutation marker. */
+export function assertPiRollbackFencesClear(store: Store): LifecycleResult {
+  const current = phase(store);
+  return current.note === RETIREMENT_IN_PROGRESS || current.note === CUTOVER_BEGIN_IN_PROGRESS
+    ? { ok: false, code: current.note, row: current }
+    : { ok: true, row: current };
+}
+
+function retirementLocked(lockPath: string): Error & { code: 'retirement-locked' } {
+  return Object.assign(new Error(`retirement lock is held or indeterminate: ${lockPath}`), { code: 'retirement-locked' as const });
+}
+
+type RetirementLockOwner = { pid: number; token: string };
+
+export interface RetirementLockDependencies {
+  fs?: {
+    exists(path: string): boolean;
+    mkdir(path: string, options: { recursive?: boolean; mode?: number }): void;
+    readFile(path: string): string;
+    remove(path: string): void;
+    writeOwner(path: string, owner: RetirementLockOwner): void;
+  };
+  probe?(pid: number): void;
+  token?(): string;
+  /** Deterministic interleaving seam: invoked only after reclaim mutex acquisition. */
+  onReclaimMutexAcquired?(): void;
+  onReclaimStep?(step: 'probed' | 'mutex-acquired' | 'owner-reread' | 'lock-removed' | 'mutex-released'): void;
+}
+
+function ownerPath(lockPath: string): string {
+  return join(lockPath, 'qlb-lock-owner.json');
+}
+
+function parseRetirementLockOwner(lockPath: string, fs: NonNullable<RetirementLockDependencies['fs']>): RetirementLockOwner | null {
+  try {
+    const value: unknown = JSON.parse(fs.readFile(ownerPath(lockPath)));
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+    const { pid, token } = value as { pid?: unknown; token?: unknown };
+    return typeof pid === 'number' && Number.isSafeInteger(pid) && pid > 0 && typeof token === 'string' && token.length > 0
+      ? { pid, token }
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function sameLockOwner(left: RetirementLockOwner | null, right: RetirementLockOwner): boolean {
+  return left?.pid === right.pid && left.token === right.token;
+}
+
+/**
+ * Serialize mutations that must not straddle retirement's durable fence.
+ * An indeterminate existing lock is never reclaimed: only a proven-dead owner
+ * (an ESRCH probe) permits cleanup. A reclaim mutex serializes stale cleanup.
+ */
+export async function withRetirementMutationLock<T>(
+  lockPath: string,
+  fn: () => Promise<T> | T,
+  dependencies: RetirementLockDependencies = {},
+): Promise<T> {
+  const fs = dependencies.fs ?? {
+    exists: existsSync,
+    mkdir: (path: string, options: { recursive?: boolean; mode?: number }) => { mkdirSync(path, options); },
+    readFile: (path: string) => readFileSync(path, 'utf8'),
+    remove: (path: string) => { rmSync(path, { recursive: true, force: true }); },
+    writeOwner: (path: string, owner: RetirementLockOwner) => atomicWriteText(path, `${JSON.stringify(owner)}\n`, { mode: 0o600 }),
+  };
+  const probe = dependencies.probe ?? ((pid: number) => { process.kill(pid, 0); });
+  const token = dependencies.token?.() ?? randomUUID();
+  const ours: RetirementLockOwner = { pid: process.pid, token };
+  const reclaimPath = `${lockPath}.reclaim`;
+  fs.mkdir(dirname(lockPath), { recursive: true, mode: 0o700 });
+  if (fs.exists(reclaimPath)) throw retirementLocked(reclaimPath);
+
+  let acquired = false;
+  try {
+    fs.mkdir(lockPath, { mode: 0o700 });
+    acquired = true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    const staleOwner = parseRetirementLockOwner(lockPath, fs);
+    if (!staleOwner) throw retirementLocked(lockPath);
+    try {
+      probe(staleOwner.pid);
+      throw retirementLocked(lockPath);
+    } catch (probeError) {
+      if ((probeError as NodeJS.ErrnoException).code !== 'ESRCH') throw retirementLocked(lockPath);
+    }
+    dependencies.onReclaimStep?.('probed');
+    try {
+      fs.mkdir(reclaimPath, { mode: 0o700 });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'EEXIST') throw retirementLocked(reclaimPath);
+      throw error;
+    }
+    try {
+      dependencies.onReclaimMutexAcquired?.();
+      dependencies.onReclaimStep?.('mutex-acquired');
+      if (!sameLockOwner(parseRetirementLockOwner(lockPath, fs), staleOwner)) throw retirementLocked(lockPath);
+      dependencies.onReclaimStep?.('owner-reread');
+      fs.remove(lockPath);
+      dependencies.onReclaimStep?.('lock-removed');
+    } finally {
+      fs.remove(reclaimPath);
+      dependencies.onReclaimStep?.('mutex-released');
+    }
+    try {
+      fs.mkdir(lockPath, { mode: 0o700 });
+      acquired = true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'EEXIST') throw retirementLocked(lockPath);
+      throw error;
+    }
+  }
+
+  try {
+    fs.writeOwner(ownerPath(lockPath), ours);
+  } catch (error) {
+    // mkdir succeeded exclusively, so an unpublished owner file cannot belong
+    // to another holder. Preserve the write error even if cleanup also fails.
+    try { fs.remove(lockPath); } catch { /* best-effort cleanup */ }
+    throw error;
+  }
+  try {
+    return await fn();
+  } finally {
+    if (acquired && sameLockOwner(parseRetirementLockOwner(lockPath, fs), ours)) fs.remove(lockPath);
   }
 }
 

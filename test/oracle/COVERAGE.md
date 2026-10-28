@@ -104,13 +104,13 @@ added the optional `autoswitch.weeklyThreshold` setting and CLI flag.
 | `test_switcher.py::TestLiveSessionGuardOnAnUnreadableRecord` | pending |
 | `test_switcher.py::TestListAccountsUsage` | pending |
 | `test_switcher.py::TestUsageFetchStamps` | pending |
-| `test_switcher.py::TestActiveAccountRefresh` | pending |
+| `test_switcher.py::TestActiveAccountRefresh` | ported |
 | `test_switcher.py::TestPerformSwitchPostDisplay` | pending |
 | `test_switcher.py::TestSwitchToSelfSlotAndForce` | pending |
 | `test_switcher.py::TestAccountInfoOrgFields` | pending |
 | `test_switcher.py::TestAccountExistsCompositeKey` | pending |
 | `test_switcher.py::TestGetCurrentAccountOrgSupport` | pending |
-| `test_switcher.py::TestDeadTokenQuarantine` | pending |
+| `test_switcher.py::TestDeadTokenQuarantine` | ported (collector-models method: K7) |
 | `test_switcher.py::TestAddAccountOrgFields` | pending |
 | `test_switcher.py::TestResolveIdentifierAmbiguity` | pending |
 | `test_switcher.py::TestListAccountsOrgDisplay` | pending |
@@ -128,9 +128,9 @@ added the optional `autoswitch.weeklyThreshold` setting and CLI flag.
 | `test_switcher.py::TestProvenanceGuard` | pending |
 | `test_switcher.py::TestSelfSwitchProvenance` | pending |
 | `test_switcher.py::TestDuplicateAccountDetection` | pending |
-| `test_switcher.py::TestLockstepUsageDetection` | pending |
+| `test_switcher.py::TestLockstepUsageDetection` | ported |
 | `test_switcher.py::TestStashAndRetentionStore` | pending |
-| `test_switcher.py::TestActiveRefreshProvenance` | pending |
+| `test_switcher.py::TestActiveRefreshProvenance` | ported |
 | `test_switcher.py::TestDirectActivationPreservation` | pending |
 | `test_switcher.py::TestSharedOAuthCredentialPreservation` | pending |
 | `test_switcher.py::TestUuidConflictClassification` | pending |
@@ -147,13 +147,13 @@ added the optional `autoswitch.weeklyThreshold` setting and CLI flag.
 | `test_switcher.py::TestSwitchUnreadableBackup` | pending |
 | `test_switcher.py::TestConsumeGate` | pending |
 | `test_switcher.py::TestInactiveRefreshRoutesThroughGate` | pending |
-| `test_switcher.py::TestStrikeUnbindsInCollector` | pending |
+| `test_switcher.py::TestStrikeUnbindsInCollector` | ported |
 | `test_switcher.py::TestStoreResolutionParity` | pending |
 | `test_switcher.py::TestConsumeGateLockFailures` | pending |
 | `test_switcher.py::TestPermanentlyUnreadableStashRow` | pending |
-| `test_switcher.py::TestHealedStrikeUnblocksFetching` | pending |
+| `test_switcher.py::TestHealedStrikeUnblocksFetching` | ported |
 | `test_switcher.py::TestGateUltraReviewFixes` | pending |
-| `test_switcher.py::TestActiveSlotStrikeParity` | pending |
+| `test_switcher.py::TestActiveSlotStrikeParity` | ported |
 | `test_switcher.py::TestUltraReviewCoverageGaps` | pending |
 | `test_switcher.py::TestUnreadableBackupIsNotAbsent` | pending |
 | `test_switcher.py::TestStashReaderUnreadableVsAbsent` | pending |

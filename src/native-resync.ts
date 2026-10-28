@@ -21,6 +21,7 @@ import { existsSync, readFileSync } from 'node:fs';
 
 import type { KeychainBackend } from './keychain';
 import { qlbKeychainService } from './keychain';
+import { isCredentialNotFound } from './credential-backends';
 import {
   accountIdForSingleGrant,
   fingerprintApiKey,
@@ -35,7 +36,7 @@ import {
   type SingleGrantProvider,
 } from './migration';
 import { parseGrant } from './refresh-lease';
-import type { Store } from './store';
+import type { MigrationRow, Store } from './store';
 import type { Grant } from './types';
 
 export type ResyncCredential = Grant | ApiKeyPayload;
@@ -48,6 +49,12 @@ export interface ResyncResult {
 }
 
 export interface NativeResyncOpts {
+  /**
+   * Production binding supplies the generic-journal W2/W3 predicate. It runs
+   * immediately before the sole Keychain write, including a missing-copy
+   * repair; standalone unit callers have no journal and omit it.
+   */
+  mayWriteOwnedCredential?: () => boolean;
   readNativeCredential: () => Promise<ResyncCredential | null>;
   readOwnedCredential: (
     keychain: KeychainBackend,
@@ -58,6 +65,14 @@ export interface NativeResyncOpts {
     accountId: string,
     credential: ResyncCredential,
   ) => Promise<void>;
+  /**
+   * Production maintenance writers use this synchronous fenced path so the
+   * Keychain update stays inside the generation transaction.
+   */
+  writeOwnedCredentialInTransaction?: (
+    native: ResyncCredential,
+    owned: ResyncCredential | null,
+  ) => boolean | 'missing-account';
   keychain: KeychainBackend;
 }
 
@@ -160,9 +175,23 @@ function errMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+function permitsNativeResync(row: MigrationRow | null): boolean {
+  if (row?.state !== 'QLB_OWNED') return false;
+  try {
+    const detail: unknown = JSON.parse(row.detail_json);
+    if (!detail || typeof detail !== 'object' || Array.isArray(detail)) return false;
+    return !['intent', 'rollbackDecision', 'handback'].some((key) =>
+      Object.prototype.hasOwnProperty.call(detail, key),
+    );
+  } catch {
+    return false;
+  }
+}
+
 function mergeOwnedGeneration(
   native: ResyncCredential,
   owned: ResyncCredential | null,
+  floorGeneration?: number,
 ): ResyncCredential {
   if (isApiKeyCredential(native)) {
     const out: ApiKeyPayload = { type: 'api-key', access: native.access, writtenBy: 'native-resync' };
@@ -172,7 +201,11 @@ function mergeOwnedGeneration(
     owned && !isApiKeyCredential(owned) ? owned.generation : undefined;
   const grant: Grant = {
     ...native,
-    generation: ownedGen ?? native.generation ?? 0,
+    // With the store generation G as floor: keep a legal ahead K_m (C3 G+1),
+    // never stamp below G (D3: kgen < G is "Keychain older than journal").
+    generation: floorGeneration === undefined
+      ? ownedGen ?? native.generation ?? 0
+      : Math.max(ownedGen ?? floorGeneration, floorGeneration),
     writtenBy: 'native-resync',
   };
   return grant;
@@ -222,9 +255,38 @@ export async function detectAndResyncFromNative(
       };
     }
 
-    const toWrite = mergeOwnedGeneration(native, owned);
+    let mayWrite = true;
     try {
-      await opts.writeOwnedCredential(opts.keychain, accountId, toWrite);
+      mayWrite = opts.mayWriteOwnedCredential?.() ?? true;
+    } catch {
+      mayWrite = false;
+    }
+    if (!mayWrite) {
+      return {
+        resynced: false,
+        reason: `native resync refused for ${provider}/${accountId}: migration is not exclusively QLB-owned`,
+      };
+    }
+
+    try {
+      if (opts.writeOwnedCredentialInTransaction) {
+        const outcome = opts.writeOwnedCredentialInTransaction(native, owned);
+        if (outcome === 'missing-account') {
+          return {
+            resynced: false,
+            reason: `native resync refused for ${provider}/${accountId}: account row is missing`,
+          };
+        }
+        if (!outcome) {
+          return {
+            resynced: false,
+            reason: `native resync fenced for ${provider}/${accountId}: generation or ownership changed`,
+          };
+        }
+      } else {
+        const toWrite = mergeOwnedGeneration(native, owned);
+        await opts.writeOwnedCredential(opts.keychain, accountId, toWrite);
+      }
     } catch (err) {
       return {
         resynced: false,
@@ -302,12 +364,29 @@ export async function attemptWithNativeResyncRetry<T>(opts: {
   return { result: second, resyncAttempted: resync, retried: true };
 }
 
-export function readOwnedCredentialFromKeychain(
+/** Sentinel: the item could not be read for a reason other than not-found. */
+const UNREADABLE = Symbol('unreadable');
+
+function readOwnedCredentialRawFromKeychain(
   keychain: KeychainBackend,
   provider: string,
   accountId: string,
   label: string,
-): ResyncCredential | null {
+): string | null;
+function readOwnedCredentialRawFromKeychain(
+  keychain: KeychainBackend,
+  provider: string,
+  accountId: string,
+  label: string,
+  strict: true,
+): string | null | typeof UNREADABLE;
+function readOwnedCredentialRawFromKeychain(
+  keychain: KeychainBackend,
+  provider: string,
+  accountId: string,
+  label: string,
+  strict = false,
+): string | null | typeof UNREADABLE {
   const service = qlbKeychainService(provider, accountId);
   const names = [label, accountId].filter((n) => typeof n === 'string' && n.length > 0);
   const tried = new Set<string>();
@@ -315,15 +394,27 @@ export function readOwnedCredentialFromKeychain(
     if (tried.has(account)) continue;
     tried.add(account);
     try {
-      const raw = keychain.getSync(service, account);
-      if (isStaticKeyProvider(provider)) return parseApiKeyPayload(raw);
-      return parseResyncCredential(raw);
-    } catch {
+      return keychain.getSync(service, account);
+    } catch (error) {
       // try the next account name (Codex adapter labels with JWT email,
       // while migration stores the item under the chatgpt_account_id).
+      // In strict mode only not-found means absent (§5.6).
+      if (strict && !isCredentialNotFound(error)) return UNREADABLE;
     }
   }
   return null;
+}
+
+export function readOwnedCredentialFromKeychain(
+  keychain: KeychainBackend,
+  provider: string,
+  accountId: string,
+  label: string,
+): ResyncCredential | null {
+  const raw = readOwnedCredentialRawFromKeychain(keychain, provider, accountId, label);
+  if (raw === null) return null;
+  if (isStaticKeyProvider(provider)) return parseApiKeyPayload(raw);
+  return parseResyncCredential(raw);
 }
 
 export function writeOwnedCredentialToKeychain(
@@ -404,13 +495,47 @@ export function bindDetectAndResync(opts: {
   return async (accountId, provider) => {
     const acct = opts.store.getAccount(accountId);
     const label = acct?.label || accountId;
+    const migrationStore = migrationStoreNameFor(provider);
+    let outerGeneration: number | null = null;
+    let outerOwnedSerialized: string | null = null;
+    let outerOwnedRead = false;
     return detectAndResyncFromNative(provider, accountId, {
       keychain: opts.keychain,
+      mayWriteOwnedCredential: () =>
+        permitsNativeResync(opts.store.getMigration(migrationStore)),
       readNativeCredential: () => opts.readNativeCredential(provider, accountId),
-      readOwnedCredential: async (keychain, id) =>
-        readOwnedCredentialFromKeychain(keychain, provider, id, label),
+      readOwnedCredential: async (keychain, id) => {
+        outerGeneration = opts.store.getGrantGeneration(id);
+        const outerRead = readOwnedCredentialRawFromKeychain(keychain, provider, id, label, true);
+        if (outerRead === UNREADABLE) throw new Error('QLB Keychain item is unreadable');
+        outerOwnedSerialized = outerRead;
+        outerOwnedRead = true;
+        if (outerOwnedSerialized === null) return null;
+        if (isStaticKeyProvider(provider)) return parseApiKeyPayload(outerOwnedSerialized);
+        return parseResyncCredential(outerOwnedSerialized);
+      },
       writeOwnedCredential: async (keychain, id, credential) => {
         writeOwnedCredentialToKeychain(keychain, provider, id, label, credential);
+      },
+      writeOwnedCredentialInTransaction: (native, owned) => {
+        const generation = outerGeneration;
+        if (generation === null) return 'missing-account';
+        return opts.store.runImmediate(() => {
+          if (opts.store.getGrantGeneration(accountId) !== generation) return false;
+          if (!permitsNativeResync(opts.store.getMigration(migrationStore))) return false;
+          if (!outerOwnedRead) return false;
+          const currentOwnedSerialized = readOwnedCredentialRawFromKeychain(
+            opts.keychain,
+            provider,
+            accountId,
+            label,
+            true,
+          );
+          if (currentOwnedSerialized === UNREADABLE || currentOwnedSerialized !== outerOwnedSerialized) return false;
+          const credential = mergeOwnedGeneration(native, owned, generation);
+          writeOwnedCredentialToKeychain(opts.keychain, provider, accountId, label, credential);
+          return true;
+        });
       },
     });
   };

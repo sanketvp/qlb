@@ -1,16 +1,29 @@
-// C-swap retirement (§4.11) gate evaluation. This module deliberately has no
-// mutation primitives: callers may create a journal or retirement fence only
-// after this function returns an approved gate record.
+// C-swap retirement (§4.11). First-run gates are pure; this module writes a
+// journal and retirement fence only after that gate record is approved.
 
+import { mkdirSync, readFileSync, rmSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+
+import { atomicWriteText, fsyncDirSync } from './fsutil';
 import { isSuccessor } from './lineage-log';
-import { assertAdmitted, phase } from './lifecycle';
+import type { CswapAgentResult } from './cswap-agent';
+import {
+  assertAdmitted,
+  beginRetirementFence,
+  clearRetirementFence,
+  phase,
+  retirementLockPath,
+  transition,
+  withRetirementMutationLock,
+} from './lifecycle';
 import { openStoreConnection, type Store } from './store';
 
 const RECEIPT_MAX_AGE_MS = 10 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const PI_PROVIDERS = ['anthropic', 'openai-codex', 'xai', 'kimi-coding', 'openrouter'] as const;
-
-type RetirePhase = 'started' | 'archive' | 'delete-cswap-items' | 'uninstall-cswap' | 'remove-launch-artifacts' | 'delete-pi-baselines' | 'archive-stash' | 'committed';
+const PHASES = ['started', 'drain-cswap', 'archive', 'delete-cswap-items', 'uninstall-cswap', 'remove-launch-artifacts', 'delete-pi-baselines', 'archive-stash', 'committed'] as const;
+type RetirePhase = (typeof PHASES)[number];
+const defaultRetireLock = withRetirementMutationLock;
 
 export interface RetireSlot {
   accountId: string;
@@ -27,10 +40,30 @@ export interface CswapRetireItem {
   fingerprint: string;
 }
 
+/** Every effect must be idempotent: rerunning after a crash completes the same end state safely. */
 export interface CswapRetireEffects {
+  /**
+   * Runs the full idempotent S57 drain: bootout + disable the agent, move its
+   * plist to ~/.qlb/backups/cswap-plist/, wait for cooperative exit, then
+   * flock every C-swap lock for a survivor before SIGTERM. The locks are
+   * released afterwards. The disabled agent and moved plist, not held locks,
+   * keep C-swap from adding or rotating items after this returns; an already
+   * disabled agent with no process is a no-op.
+   */
+  drainCswap(): Promise<CswapAgentResult> | CswapAgentResult;
   archiveCswap(archivePath: string): Promise<void> | void;
-  deleteCswapItems(): Promise<void> | void;
+  /**
+   * For every captured item, delete it only after a fresh fingerprint read
+   * still equals `item.fingerprint`. A missing item is already deleted; a
+   * changed fingerprint must throw so retirement keeps its journal and fence.
+   */
+  deleteCswapItems(items: CswapRetireItem[]): Promise<void> | void;
   uninstallCswap(): Promise<void> | void;
+  /**
+   * Final launch cleanup after S57 already booted out, disabled, and moved
+   * the plist: delete that moved plist and any remaining launch files. It
+   * does not disable the agent again.
+   */
   removeCswapLaunchArtifacts(): Promise<void> | void;
   deletePiBaselines(): Promise<void> | void;
   archiveExpiredStash(archivePath: string): Promise<void> | void;
@@ -38,6 +71,8 @@ export interface CswapRetireEffects {
 
 export interface CswapRetireDependencies {
   now(): number;
+  /** The private QLB state root; the lock is derived from this, never dbPath. */
+  stateDir: string;
   backupsDir: string;
   journalDir: string;
   doctor(): Promise<{ overall: 'PASS' | 'FAIL'; autoAgent: 'PASS' | 'FAIL' }> | { overall: 'PASS' | 'FAIL'; autoAgent: 'PASS' | 'FAIL' };
@@ -46,10 +81,24 @@ export interface CswapRetireDependencies {
   hasUnadoptedStash(): boolean;
   claudeSlotsPass(): boolean;
   slots(): RetireSlot[];
+  /**
+   * Returns the C-swap inventory. After C-swap is uninstalled this must not
+   * throw and must return [] (the X4a-4 adapter must enumerate independently
+   * of the removed helper).
+   */
   cswapItems(): CswapRetireItem[];
   /** Must force a Keychain read; it returns only the resulting fingerprint. */
   readSlotFingerprint(accountId: string): Promise<string> | string;
   effects: CswapRetireEffects;
+  /**
+   * Durable archive barrier: sync the completed archive file then its parent
+   * directory before the `archive` checkpoint makes deletion recoverable.
+   */
+  fsyncArchive?(path: string): void;
+  /** Test seam for requiring each atomic journal rename to be durable. */
+  fsyncJournalDir?(dir: string): void;
+  /** Test seam for simulating a crash after an effect and before its checkpoint. */
+  afterEffect?(phase: Exclude<RetirePhase, 'started' | 'committed'>): void;
   afterCheckpoint?(phase: RetirePhase): void;
   afterTransition?(): void;
   withRetireLock?<T>(path: string, fn: () => Promise<T>): Promise<T>;
@@ -61,6 +110,18 @@ export interface RetireGateRecord {
   slots: Array<{ accountId: string; fingerprint: string }>;
   cswapItems: CswapRetireItem[];
 }
+
+interface RetireJournal {
+  phase: RetirePhase;
+  archivePath: string;
+  gates: RetireGateRecord;
+  ownerPid: number;
+  updatedAt: number;
+}
+
+export type CswapRetireResult =
+  | { ok: true; archivePath: string }
+  | { ok: false; code: string };
 
 export type RetirementGateResult =
   | { ok: true; gates: RetireGateRecord }
@@ -74,6 +135,83 @@ function validTimestamp(value: string | null): number | null {
 
 function refusal(code: string): RetirementGateResult {
   return { ok: false, code };
+}
+
+function retireRefusal(code: string): CswapRetireResult {
+  return { ok: false, code };
+}
+
+function journalPath(dir: string): string {
+  return join(dir, 'retire-cswap.json');
+}
+
+function phaseAtLeast(actual: RetirePhase, expected: RetirePhase): boolean {
+  return PHASES.indexOf(actual) >= PHASES.indexOf(expected);
+}
+
+function sameCswapItems(left: CswapRetireItem[], right: CswapRetireItem[]): boolean {
+  if (left.length !== right.length) return false;
+  const remaining = [...right];
+  for (const item of left) {
+    const index = remaining.findIndex((candidate) => candidate.id === item.id && candidate.fingerprint === item.fingerprint);
+    if (index < 0) return false;
+    remaining.splice(index, 1);
+  }
+  return true;
+}
+
+function validGates(value: unknown): value is RetireGateRecord {
+  if (!value || typeof value !== 'object') return false;
+  const gates = value as Partial<RetireGateRecord>;
+  return Number.isSafeInteger(gates.checkedAt) && Number.isSafeInteger(gates.receiptAt)
+    && Array.isArray(gates.slots) && gates.slots.every((slot) => slot && typeof slot.accountId === 'string' && typeof slot.fingerprint === 'string')
+    && Array.isArray(gates.cswapItems) && gates.cswapItems.every((item) => item && typeof item.id === 'string' && typeof item.fingerprint === 'string');
+}
+
+function readJournal(dir: string): RetireJournal | null {
+  try {
+    const value: unknown = JSON.parse(readFileSync(journalPath(dir), 'utf8'));
+    if (!value || typeof value !== 'object') throw new Error('malformed retirement journal');
+    const journal = value as Partial<RetireJournal>;
+    if (!PHASES.includes(journal.phase as RetirePhase) || typeof journal.archivePath !== 'string' || !journal.archivePath
+      || !validGates(journal.gates) || !Number.isSafeInteger(journal.ownerPid) || !Number.isSafeInteger(journal.updatedAt)) {
+      throw new Error('malformed retirement journal');
+    }
+    return journal as RetireJournal;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+function writeJournal(dir: string, journal: RetireJournal, fsyncJournalDir: (dir: string) => void): void {
+  const firstCreated = mkdirSync(dir, { recursive: true, mode: 0o700 });
+  if (firstCreated !== undefined) {
+    // mkdirSync reports the first newly-created directory. Sync every parent
+    // entry it created, deepest first, before publishing the journal there.
+    const firstCreatedParent = dirname(firstCreated);
+    for (let parent = dirname(dir); ; parent = dirname(parent)) {
+      fsyncJournalDir(parent);
+      if (parent === firstCreatedParent) break;
+    }
+  }
+  atomicWriteText(journalPath(dir), `${JSON.stringify(journal)}\n`, { mode: 0o600 });
+  fsyncJournalDir(dir);
+  // Persist journalDir's entry after every journal rename. This also closes
+  // a prior crash between a rename and its parent-directory sync.
+  fsyncJournalDir(dirname(dir));
+}
+
+function checkpoint(
+  dir: string,
+  journal: RetireJournal,
+  nextPhase: RetirePhase,
+  now: number,
+  fsyncJournalDir: (dir: string) => void,
+): RetireJournal {
+  const next = { ...journal, phase: nextPhase, ownerPid: process.pid, updatedAt: now };
+  writeJournal(dir, next, fsyncJournalDir);
+  return next;
 }
 
 function passesReceiptHealth(store: Store, now: number): string | null {
@@ -206,4 +344,164 @@ export async function evaluateRetirementGates(
       cswapItems: items,
     },
   };
+}
+
+/**
+ * Runs the destructive retirement protocol. First-run gates are deliberately
+ * evaluated before either durable recovery artifact is written. Resumes use
+ * only the captured credential-safety facts, never stale time-based gates.
+ */
+export async function retireCswap(store: Store, dependencies: CswapRetireDependencies): Promise<CswapRetireResult> {
+  const lock = dependencies.withRetireLock ?? defaultRetireLock;
+  try {
+    return await lock(retirementLockPath(dependencies.stateDir), async () => {
+      const fsyncJournalDir = dependencies.fsyncJournalDir ?? fsyncDirSync;
+      let journal: RetireJournal | null;
+      try {
+        journal = readJournal(dependencies.journalDir);
+      } catch {
+        return retireRefusal('retirement-journal-malformed');
+      }
+
+      const admission = assertAdmitted(store, journal ? 'retire-cswap:resume' : 'retire-cswap');
+      if (!admission.ok) return retireRefusal(admission.code ?? 'not-admitted');
+
+      // transition() is durable before the committed checkpoint. A retry must
+      // finish that terminal cleanup without recreating the retirement fence.
+      if (journal && phase(store).state === 'retired') {
+        if (phase(store).note === 'retirement-in-progress') {
+          const cleared = clearRetirementFence(store);
+          if (!cleared.ok) return retireRefusal(cleared.code ?? 'retirement-fence-clear-failed');
+        }
+        rmSync(journalPath(dependencies.journalDir), { force: true });
+        return { ok: true, archivePath: journal.archivePath };
+      }
+
+      const resuming = journal !== null;
+      if (!journal) {
+        const gates = await evaluateRetirementGates(store, dependencies);
+        if (!gates.ok) return gates;
+        journal = {
+          phase: 'started',
+          archivePath: join(dependencies.backupsDir, `cswap-retired-${gates.gates.checkedAt}.tar.gz`),
+          gates: gates.gates,
+          ownerPid: process.pid,
+          updatedAt: dependencies.now(),
+        };
+        // From this point a restart can finish or report the partial operation.
+        writeJournal(dependencies.journalDir, journal, fsyncJournalDir);
+      }
+
+      // The durable journal always precedes the fence. On resume this is
+      // intentionally before safety checks so reversals remain fenced while
+      // recovery determines whether effects may continue.
+      const fenced = beginRetirementFence(store);
+      if (!fenced.ok) return retireRefusal(fenced.code ?? 'retirement-fence-failed');
+
+      if (resuming) {
+        // A resumed run must never make an old receipt/window/doctor decision
+        // block recovery. It only proves the captured credentials are still
+        // safe to remove and that C-swap has not gained another item.
+        try {
+          if (dependencies.hasUnadoptedStash()) return retireRefusal('unadopted-stash');
+        } catch {
+          return retireRefusal('unadopted-stash-unavailable');
+        }
+        for (const captured of journal.gates.slots) {
+          let current: string;
+          try {
+            current = await dependencies.readSlotFingerprint(captured.accountId);
+          } catch {
+            return retireRefusal(`slot-read-failed:${captured.accountId}`);
+          }
+          if (current !== captured.fingerprint
+            && !isSuccessor(store, 'anthropic', captured.accountId, captured.fingerprint, current)) {
+            return retireRefusal(`slot-lineage-mismatch:${captured.accountId}`);
+          }
+        }
+      }
+
+      let finalCswapItems: CswapRetireItem[] | null = null;
+      // S57 leaves C-swap disabled and its plist moved, while releasing its
+      // locks before returning. Re-run that idempotent sequence on every
+      // resume before remaining C-swap effects through launch cleanup: a
+      // reboot cannot revive the writer between retirement attempts.
+      if (!phaseAtLeast(journal.phase, 'remove-launch-artifacts')) {
+        let drained: CswapAgentResult;
+        try {
+          drained = await dependencies.effects.drainCswap();
+        } catch {
+          return retireRefusal('retirement-effect-failed:drain-cswap');
+        }
+        if (!drained.ok) return retireRefusal('retirement-effect-failed:drain-cswap');
+        dependencies.afterEffect?.('drain-cswap');
+        if (!phaseAtLeast(journal.phase, 'archive')) {
+          try {
+            // The S57 launch state, not a retained flock, keeps C-swap
+            // unscheduled. Before archiving, its exact inventory must still
+            // equal the pre-drain gate record.
+            finalCswapItems = dependencies.cswapItems();
+          } catch {
+            return retireRefusal('cswap-items-unavailable');
+          }
+          if (!sameCswapItems(finalCswapItems, journal.gates.cswapItems)) return retireRefusal('cswap-items-changed');
+        }
+        if (!phaseAtLeast(journal.phase, 'drain-cswap')) {
+          journal = checkpoint(dependencies.journalDir, journal, 'drain-cswap', dependencies.now(), fsyncJournalDir);
+          dependencies.afterCheckpoint?.('drain-cswap');
+        }
+      }
+
+      const effects: Array<[Exclude<RetirePhase, 'started' | 'drain-cswap' | 'committed'>, () => Promise<void> | void]> = [
+        ['archive', () => dependencies.effects.archiveCswap(journal!.archivePath)],
+        ['delete-cswap-items', () => dependencies.effects.deleteCswapItems(finalCswapItems ?? journal!.gates.cswapItems)],
+        ['uninstall-cswap', () => dependencies.effects.uninstallCswap()],
+        ['remove-launch-artifacts', () => dependencies.effects.removeCswapLaunchArtifacts()],
+        ['delete-pi-baselines', () => dependencies.effects.deletePiBaselines()],
+        ['archive-stash', () => dependencies.effects.archiveExpiredStash(journal!.archivePath)],
+      ];
+      for (const [name, effect] of effects) {
+        if (phaseAtLeast(journal.phase, name)) continue;
+        if (name === 'delete-cswap-items' || name === 'uninstall-cswap' || name === 'remove-launch-artifacts') {
+          let currentItems: CswapRetireItem[];
+          try {
+            currentItems = dependencies.cswapItems();
+          } catch {
+            return retireRefusal('cswap-items-unavailable');
+          }
+          // Before delete, an already absent captured item is harmless. Once
+          // delete has checkpointed, no captured (or new) item may reappear.
+          if (phaseAtLeast(journal.phase, 'delete-cswap-items')
+            ? currentItems.length !== 0
+            : currentItems.some((item) => !journal!.gates.cswapItems.some(
+              (captured) => captured.id === item.id && captured.fingerprint === item.fingerprint,
+            ))) return retireRefusal('cswap-items-changed');
+        }
+        try {
+          await effect();
+        } catch {
+          return retireRefusal(`retirement-effect-failed:${name}`);
+        }
+        if (name === 'archive') dependencies.fsyncArchive?.(journal.archivePath);
+        dependencies.afterEffect?.(name);
+        journal = checkpoint(dependencies.journalDir, journal, name, dependencies.now(), fsyncJournalDir);
+        dependencies.afterCheckpoint?.(name);
+      }
+
+      if (!phaseAtLeast(journal.phase, 'committed')) {
+        const retired = transition(store, 'retired', journal.gates.checkedAt);
+        if (!retired.ok) return retireRefusal(retired.code ?? 'retirement-transition-failed');
+        dependencies.afterTransition?.();
+        journal = checkpoint(dependencies.journalDir, journal, 'committed', dependencies.now(), fsyncJournalDir);
+        dependencies.afterCheckpoint?.('committed');
+      }
+      const cleared = clearRetirementFence(store);
+      if (!cleared.ok) return retireRefusal(cleared.code ?? 'retirement-fence-clear-failed');
+      rmSync(journalPath(dependencies.journalDir), { force: true });
+      return { ok: true, archivePath: journal.archivePath };
+    });
+  } catch (error) {
+    if ((error as { code?: unknown }).code === 'retirement-locked') return retireRefusal('retirement-in-progress');
+    throw error;
+  }
 }
