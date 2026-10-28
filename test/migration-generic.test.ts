@@ -24,6 +24,7 @@ import {
   type StagedAccount,
 } from '../src/migration';
 import { parseGrant } from '../src/refresh-lease';
+import type { RollbackDecision } from '../src/single-grant-ownership';
 import { piAuthBackupPath, writePiAuthBackup } from '../src/pi-auth-backup';
 import { openStore } from '../src/store';
 
@@ -36,6 +37,17 @@ import { openStore } from '../src/store';
  *   src/adapters/kimi.ts   claimId            = 'kimi-default'
  *   src/adapters/codex.ts  chatgpt_account_id ?? 'codex-default'
  */
+const ROLLBACK_DECISION: RollbackDecision = {
+  kind: 'keychain',
+  generation: 0,
+  fingerprint: 'fixture-fingerprint',
+  entryPresent: true,
+  sourceDigest: 'fixture-source-digest',
+  kd0: 'fixture-kd0',
+  decidedAt: 123,
+  fencedGeneration: 0,
+};
+
 const FAKE_GRANTS: Record<
   SingleGrantProvider,
   { type: 'oauth'; access: string; refresh: string; expires: number }
@@ -1074,12 +1086,18 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       const service = qlbKeychainService('xai', expectedId('xai'));
       const account = expectedLabel('xai');
       h.kc.setSync(service, account, JSON.stringify({ ...FAKE_GRANTS.xai, generation: 0 }));
-      h.store.upsertMigration('pi-xai', 'NATIVE', JSON.stringify({ handback: marker }));
+      h.store.upsertMigration('pi-xai', 'NATIVE', JSON.stringify({
+        handback: marker,
+        intent: 'rollback',
+        rollbackDecision: ROLLBACK_DECISION,
+      }));
 
       const resumed = h.mig.resume();
       const detail = resumed.detail;
       assert.equal(resumed.state, 'NATIVE');
       assert.equal(detail.handback, undefined, 'S7 clears the cleanup-pending marker');
+      assert.equal(detail.intent, undefined, 'S7 clears leftover rollback intent');
+      assert.equal(detail.rollbackDecision, undefined, 'S7 clears leftover rollback decision');
       assert.deepEqual(
         detail.lastRollback,
         { ...marker, rolledBackFrom: 'post-commit', cleanedAt: (detail.lastRollback as { cleanedAt: unknown }).cleanedAt },
@@ -1093,6 +1111,64 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       assert.deepEqual(repeated.detail, detail, 'a terminal second resume is a no-op');
       assert.deepEqual(h.store.getMigration('pi-xai'), journalAfterFirstResume, 'the second resume does not rewrite the journal');
       assert.equal(h.kc.getSync(service, account), keychainAfterFirstResume, 'the second resume keeps K_m');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('decision-only resume settles: second resume is a no-op and stage works again', async () => {
+    const h = setup('xai');
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      h.mig.commit();
+      const row = h.store.getMigration('pi-xai')!;
+      h.store.upsertMigration('pi-xai', row.state, JSON.stringify({
+        ...JSON.parse(row.detail_json),
+        rollbackDecision: ROLLBACK_DECISION,
+      }));
+
+      const resumed = h.mig.resume();
+      assert.equal(resumed.detail.rollbackDecision, undefined, 'terminal rollback clears the decision');
+      const rolledBackAt = resumed.detail.rolledBackAt;
+      const journalAfterFirstResume = h.store.getMigration('pi-xai');
+
+      const repeated = h.mig.resume();
+      assert.equal(repeated.detail.rolledBackAt, rolledBackAt, 'second resume does not rewrite rolledBackAt');
+      assert.deepEqual(h.store.getMigration('pi-xai'), journalAfterFirstResume, 'second resume does not rewrite the journal');
+      assert.doesNotThrow(() => h.mig.stage(), 'stage is no longer refused by the settled journal');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('cleanup-pending with leftover rollback intent and decision settles in one resume', () => {
+    const h = setup('xai');
+    try {
+      const handback = {
+        phase: 'cleanup-pending' as const,
+        keychainDisposition: 'keep' as const,
+        piFingerprint: null,
+        decision: null,
+        fencedGeneration: null,
+        rolledBackAt: 123,
+      };
+      h.store.upsertMigration('pi-xai', 'NATIVE', JSON.stringify({
+        handback,
+        intent: 'rollback',
+        rollbackDecision: ROLLBACK_DECISION,
+      }));
+
+      const resumed = h.mig.resume();
+      assert.equal(resumed.detail.handback, undefined);
+      assert.equal(resumed.detail.intent, undefined);
+      assert.equal(resumed.detail.rollbackDecision, undefined);
+      assert.ok(resumed.detail.lastRollback);
+      const journalAfterFirstResume = h.store.getMigration('pi-xai');
+
+      const repeated = h.mig.resume();
+      assert.deepEqual(repeated.detail, resumed.detail, 'second resume is a no-op');
+      assert.deepEqual(h.store.getMigration('pi-xai'), journalAfterFirstResume, 'second resume does not rewrite the journal');
     } finally {
       h.cleanup();
     }
@@ -1113,10 +1189,11 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
         if (marker === 'decision') {
           h.mig.stage();
           await h.mig.rehearse(mockRehearse([]));
+          h.mig.commit();
           const row = h.store.getMigration('pi-xai')!;
           h.store.upsertMigration('pi-xai', row.state, JSON.stringify({
             ...JSON.parse(row.detail_json),
-            rollbackDecision: { kind: 'keychain' },
+            rollbackDecision: ROLLBACK_DECISION,
           }));
         } else {
           h.store.upsertMigration('pi-xai', 'NATIVE', JSON.stringify(

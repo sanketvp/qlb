@@ -1438,18 +1438,17 @@ export class Migration {
     this.assertNoUnreadableOwnershipClaim();
     const current = this.status();
     const handback = current.detail.handback;
+    const facts = this.ownershipFacts();
     // C3 precedes C4: a completed hand-back is already terminal, so resume
     // records S7 rather than falling through to commit's marker refusal.
-    if (isObjectRecord(handback) && handback.phase === 'cleanup-pending') {
+    if (facts.handbackPending && isObjectRecord(handback)) {
       return this.finishCleanupPendingHandback(handback);
     }
-    const intent = current.detail.intent === 'rollback';
-    const hasRollbackDecision = Object.prototype.hasOwnProperty.call(current.detail, 'rollbackDecision');
 
     // C4: a durable decision is already past source selection. On this main
     // Pi's retained native entry satisfies S3's guard, so continue the
     // existing post-commit path without re-ranking or invoking commit().
-    if (intent || hasRollbackDecision) {
+    if (facts.rollbackInProgress) {
       return this.continueRollback();
     }
     this.assertNoOrphanOwnershipClaim();
@@ -1679,8 +1678,11 @@ export class Migration {
 
   /** S7. C3's hygiene grows in later rows; this reader only records its completion. */
   private finishCleanupPendingHandback(handback: Record<string, unknown>): MigrationStatus {
+    const detail = parseDetail(this.store.getMigration(this.storeName)?.detail_json);
     this.journal(this.journalState(), {
       handback: undefined,
+      ...(detail.intent === 'rollback' ? { intent: undefined } : {}),
+      rollbackDecision: undefined,
       lastRollback: {
         ...handback,
         rolledBackFrom: 'post-commit',
@@ -1836,6 +1838,7 @@ export class Migration {
       intent: undefined,
       commitGeneration: undefined,
       commitStarted: undefined,
+      rollbackDecision: undefined,
       rolledBackAt: Date.now(),
       rolledBackFrom: 'post-commit',
     });
