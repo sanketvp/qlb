@@ -6,12 +6,7 @@
  * normalized result here before making a state-changing decision.
  */
 
-export type SingleGrantMigrationState =
-  | 'NATIVE'
-  | 'MIRRORED'
-  | 'VALIDATED'
-  | 'QLB_OWNED'
-  | 'RETIRED';
+import type { MigrationState } from './migration';
 
 export type RollbackSourceKind =
   | 'keychain'
@@ -52,19 +47,19 @@ export type H = HandbackMarker;
 export type SingleGrantRollbackDecision = RollbackDecision;
 
 /**
- * Durable facts used by the S0 classifier. `hasOwnerClaim` is Claim = O | L |
- * Oc. The L/Oc components remain separate because S0.6 ignores O and C5
- * treats only L as proof of this path's commit.
+ * Durable facts used by the S0 classifier. Claim is derived from the three
+ * ownership facts O, L, and Oc. The L/Oc components remain separate because
+ * S0.6 ignores O and C5 treats only L as proof of this path's commit.
  */
 export interface SingleGrantOwnershipFacts {
   p7aOwned: boolean;
-  state: SingleGrantMigrationState | null;
+  state: MigrationState | null;
   handback: HandbackMarker | null;
   rollbackIntent: boolean;
   rollbackDecision: RollbackDecision | null;
-  hasOwnerClaim: boolean;
+  hasV2OwnerEntry: boolean;
   hasLegacySidecar: boolean;
-  hasCustomOwnerFile?: boolean;
+  hasCustomOwnerFile: boolean;
   commitGeneration: number | null;
   hasStaging: boolean;
 }
@@ -96,13 +91,20 @@ export interface SingleGrantOwnershipClassification {
   route: SingleGrantOwnershipRoute;
 }
 
-function isGenericCommit(facts: SingleGrantOwnershipFacts): boolean {
+function hasHandback(facts: SingleGrantOwnershipFacts): boolean {
+  return facts.handback != null;
+}
+
+function isGenericCommit(
+  facts: SingleGrantOwnershipFacts,
+  claim: boolean,
+): boolean {
   return facts.state === 'QLB_OWNED'
     || facts.state === 'RETIRED'
     || (
       facts.state === 'VALIDATED'
-      && facts.hasOwnerClaim
-      && (facts.hasLegacySidecar || facts.commitGeneration !== null)
+      && claim
+      && (facts.hasLegacySidecar || facts.commitGeneration != null)
     );
 }
 
@@ -112,18 +114,21 @@ function isGenericCommit(facts: SingleGrantOwnershipFacts): boolean {
 export function classifySingleGrant(
   facts: SingleGrantOwnershipFacts,
 ): SingleGrantOwnershipClassification {
-  const hasHandback = facts.handback?.phase === 'cleanup-pending';
-  const hasRollback = facts.rollbackIntent || facts.rollbackDecision !== null;
-  const committed = isGenericCommit(facts);
+  const handbackPending = hasHandback(facts);
+  const hasRollback = facts.rollbackIntent || facts.rollbackDecision != null;
+  const claim = facts.hasV2OwnerEntry
+    || facts.hasLegacySidecar
+    || facts.hasCustomOwnerFile;
+  const committed = isGenericCommit(facts, claim);
 
-  if (facts.p7aOwned && (committed || hasRollback || hasHandback)) {
+  if (facts.p7aOwned && (committed || hasRollback || handbackPending)) {
     return { rule: 'C1', route: 'dual-ownership' };
   }
   if (facts.p7aOwned) return { rule: 'C2', route: 'owned-by-pi-migrate' };
-  if (hasHandback) return { rule: 'C3', route: 'handback-cleanup-pending' };
+  if (handbackPending) return { rule: 'C3', route: 'handback-cleanup-pending' };
   if (hasRollback) return { rule: 'C4', route: 'rollback-in-progress' };
   if (committed) return { rule: 'C5', route: 'post-commit' };
-  if (facts.hasOwnerClaim) return { rule: 'C6', route: 'owner-file-orphan' };
+  if (claim) return { rule: 'C6', route: 'owner-file-orphan' };
   if (facts.state === 'VALIDATED' && facts.hasStaging) {
     return { rule: 'C7', route: 'validated-staging' };
   }
@@ -135,9 +140,9 @@ export function classifySingleGrant(
 
 /** S0.6: generic migration admission predicate for `qlb pi migrate`. */
 export function isSingleGrantAtRest(facts: SingleGrantOwnershipFacts): boolean {
-  return facts.handback === null
+  return !hasHandback(facts)
     && !facts.rollbackIntent
-    && facts.rollbackDecision === null
+    && facts.rollbackDecision == null
     && !facts.hasLegacySidecar
     && !facts.hasCustomOwnerFile
     && !facts.hasStaging
