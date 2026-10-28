@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { describe, it } from 'node:test';
@@ -434,6 +434,181 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       assert.equal(h.store.getMigration('pi-xai')?.detail_json, detail, 'refusal leaves the journal unchanged');
     } finally {
       h.cleanup();
+    }
+  });
+
+  it('T-S0f rollback after a crash between the commit point and QLB_OWNED finishes the commit and hands back', async () => {
+    for (const claim of ['legacy-sidecar', 'owner-map'] as const) {
+      const h = setup('xai');
+      try {
+        h.mig.stage();
+        await h.mig.rehearse(mockRehearse([]));
+        const row = h.store.getMigration('pi-xai');
+        assert.ok(row, 'staging records the generic migration');
+        const detail = JSON.parse(row.detail_json) as Record<string, unknown>;
+        h.store.upsertMigration('pi-xai', 'VALIDATED', JSON.stringify({
+          ...detail,
+          commitGeneration: h.store.getGrantGeneration(expectedId('xai')),
+        }));
+
+        const staging = stagingOwnerPath(join(h.dir, 'qlb-owner.json'), 'xai');
+        if (claim === 'legacy-sidecar') {
+          renameSync(staging, h.ownerPath);
+        } else {
+          rmSync(staging);
+          writeFileSync(join(h.dir, 'qlb-owner.json'), JSON.stringify({
+            providers: { xai: { mode: 'qlb' } },
+          }) + '\n');
+        }
+
+        const transitions: Array<{ state: string; intent?: unknown }> = [];
+        const originalUpsertMigration = h.store.upsertMigration.bind(h.store);
+        h.store.upsertMigration = (store, state, nextDetail) => {
+          if (store === 'pi-xai') {
+            transitions.push({
+              state,
+              intent: (JSON.parse(nextDetail ?? '{}') as Record<string, unknown>).intent,
+            });
+          }
+          return originalUpsertMigration(store, state, nextDetail);
+        };
+
+        const rolled = h.mig.rollback();
+
+        const finishedForward = transitions.findIndex((entry) => entry.state === 'QLB_OWNED');
+        const beganHandback = transitions.findIndex(
+          (entry, index) => index > finishedForward && entry.intent === 'rollback',
+        );
+        assert.ok(finishedForward >= 0, `${claim}: finishHygiene completes the interrupted commit`);
+        assert.ok(beganHandback > finishedForward, `${claim}: rollback starts only after the forward finish`);
+        assert.equal(rolled.state, 'VALIDATED');
+        assert.equal(rolled.detail.intent, undefined);
+        assert.equal(rolled.detail.rolledBackFrom, 'post-commit');
+      } finally {
+        h.cleanup();
+      }
+    }
+  });
+
+  it('T-S0f a crash-commit under a custom owner file (Oc) finishes forward and hands back', async () => {
+    const h = setup('xai');
+    try {
+      const customPath = join(h.dir, 'custom-owner.json');
+      const mig = createSingleGrantMigration(h.store, h.kc, 'xai', h.authPath, customPath);
+      mig.stage();
+      await mig.rehearse(mockRehearse([]));
+      const detail = JSON.parse(h.store.getMigration('pi-xai')!.detail_json) as Record<string, unknown>;
+      h.store.upsertMigration('pi-xai', 'VALIDATED', JSON.stringify({
+        ...detail,
+        commitGeneration: h.store.getGrantGeneration(expectedId('xai')),
+      }));
+      rmSync(stagingOwnerPath(join(h.dir, 'qlb-owner.json'), 'xai'), { force: true });
+      writeFileSync(customPath, JSON.stringify({ owner: 'qlb', accounts: [{ provider: 'xai' }] }) + '\n');
+
+      const states: string[] = [];
+      const original = h.store.upsertMigration.bind(h.store);
+      h.store.upsertMigration = (store, state, next) => {
+        if (store === 'pi-xai') states.push(state);
+        return original(store, state, next);
+      };
+      const rolled = mig.rollback();
+      assert.ok(states.includes('QLB_OWNED'), 'the Oc claim with own evidence is finished forward');
+      assert.equal(rolled.detail.rolledBackFrom, 'post-commit');
+      assert.equal(existsSync(customPath), false, 'the hand-back removes the custom owner file');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('rollback with a journaled intent over an Oc claim takes the post-commit path', async () => {
+    const h = setup('xai');
+    try {
+      const customPath = join(h.dir, 'custom-owner.json');
+      const mig = createSingleGrantMigration(h.store, h.kc, 'xai', h.authPath, customPath);
+      mig.stage();
+      await mig.rehearse(mockRehearse([]));
+      const detail = JSON.parse(h.store.getMigration('pi-xai')!.detail_json) as Record<string, unknown>;
+      h.store.upsertMigration('pi-xai', 'VALIDATED', JSON.stringify({
+        ...detail,
+        commitGeneration: h.store.getGrantGeneration(expectedId('xai')),
+        intent: 'rollback',
+      }));
+      rmSync(stagingOwnerPath(join(h.dir, 'qlb-owner.json'), 'xai'), { force: true });
+      writeFileSync(customPath, JSON.stringify({ owner: 'qlb', accounts: [{ provider: 'xai' }] }) + '\n');
+
+      const states: string[] = [];
+      const original = h.store.upsertMigration.bind(h.store);
+      h.store.upsertMigration = (store, state, next) => {
+        if (store === 'pi-xai') states.push(state);
+        return original(store, state, next);
+      };
+      const rolled = mig.rollback();
+
+      assert.equal(states.includes('NATIVE'), false, 'rollback never takes the pre-commit path');
+      assert.equal(existsSync(customPath), false, 'the post-commit hand-back removes the custom owner file');
+      assert.equal(rolled.detail.rolledBackFrom, 'post-commit');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('resume after a crash between the C5 forward finish and the rollback intent keeps an Oc claim owned', async () => {
+    const h = setup('xai');
+    try {
+      const customPath = join(h.dir, 'custom-owner.json');
+      const mig = createSingleGrantMigration(h.store, h.kc, 'xai', h.authPath, customPath);
+      mig.stage();
+      await mig.rehearse(mockRehearse([]));
+      const detail = JSON.parse(h.store.getMigration('pi-xai')!.detail_json) as Record<string, unknown>;
+      rmSync(stagingOwnerPath(join(h.dir, 'qlb-owner.json'), 'xai'), { force: true });
+      writeFileSync(customPath, JSON.stringify({ owner: 'qlb', accounts: [{ provider: 'xai' }] }) + '\n');
+      // State right after C5's finishHygiene, before postCommitRollback journals its intent.
+      h.store.upsertMigration('pi-xai', 'QLB_OWNED', JSON.stringify({ ...detail, committedAt: Date.now() }));
+
+      const resumed = mig.resume();
+      assert.equal(resumed.state, 'QLB_OWNED', 'resume must not report a hand-back while the Oc claim remains');
+      assert.equal(existsSync(customPath), true);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('C5 never finishes forward without own evidence or over a journaled rollback', async () => {
+    for (const fixture of ['orphan-owner-map', 'rollback-intent'] as const) {
+      const h = setup('xai');
+      try {
+        h.mig.stage();
+        await h.mig.rehearse(mockRehearse([]));
+        const detail = JSON.parse(h.store.getMigration('pi-xai')!.detail_json) as Record<string, unknown>;
+        const staging = stagingOwnerPath(join(h.dir, 'qlb-owner.json'), 'xai');
+        if (fixture === 'orphan-owner-map') {
+          // O alone, with no L and no commitGeneration, is not this path's commit.
+          rmSync(staging);
+          writeFileSync(join(h.dir, 'qlb-owner.json'), JSON.stringify({ providers: { xai: { mode: 'qlb' } } }) + '\n');
+        } else {
+          renameSync(staging, h.ownerPath);
+          h.store.upsertMigration('pi-xai', 'VALIDATED', JSON.stringify({
+            ...detail,
+            commitGeneration: h.store.getGrantGeneration(expectedId('xai')),
+            intent: 'rollback',
+          }));
+        }
+
+        const states: string[] = [];
+        const original = h.store.upsertMigration.bind(h.store);
+        h.store.upsertMigration = (store, state, next) => {
+          if (store === 'pi-xai') states.push(state);
+          return original(store, state, next);
+        };
+        try {
+          h.mig.rollback();
+        } catch {
+          // Refusing is acceptable here; journaling QLB_OWNED is not.
+        }
+        assert.equal(states.includes('QLB_OWNED'), false, `${fixture}: C5 must not journal QLB_OWNED`);
+      } finally {
+        h.cleanup();
+      }
     }
   });
 
