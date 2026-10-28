@@ -907,6 +907,17 @@ export class Migration {
     };
   }
 
+  /** C3/C4: only resume/rollback may advance an active hand-back marker. */
+  private assertNoActiveHandbackMarker(): void {
+    const detail = parseDetail(this.store.getMigration(this.storeName)?.detail_json);
+    if (isObjectRecord(detail.handback) && detail.handback.phase === 'cleanup-pending') {
+      throw new Error('handback-cleanup-pending: run `qlb migrate resume`');
+    }
+    if (detail.intent === 'rollback' || Object.prototype.hasOwnProperty.call(detail, 'rollbackDecision')) {
+      throw new Error('rollback-in-progress: run `qlb migrate resume`');
+    }
+  }
+
   /** Ambiguous O/L/Oc evidence fails closed, regardless of journal state. */
   private assertNoUnreadableOwnershipClaim(): void {
     if (this.kind === 'pool') return;
@@ -1186,6 +1197,7 @@ export class Migration {
     }
 
     this.assertNotP7aOwned();
+    this.assertNoActiveHandbackMarker();
     this.assertNoUnreadableOwnershipClaim();
     this.assertNoOrphanOwnershipClaim();
     // P7b8 alone may convert the pool's v1 owner document into the shared
@@ -1303,6 +1315,7 @@ export class Migration {
 
   private commitUnlocked(): MigrationStatus {
     this.assertNotP7aOwned();
+    this.assertNoActiveHandbackMarker();
     this.assertNoUnreadableOwnershipClaim();
     this.assertNoOrphanOwnershipClaim();
     // P7b8 alone may convert the pool's v1 owner document into the shared
@@ -1519,6 +1532,7 @@ export class Migration {
     // Keep the P7a ownership classifier here so it is adjacent to the
     // single-grant's first durable write (the MIRRORED journal).
     this.assertNotP7aOwned();
+    this.assertNoActiveHandbackMarker();
     this.assertNoUnreadableOwnershipClaim();
     this.assertNoOrphanOwnershipClaim();
     const current = this.status();
