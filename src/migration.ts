@@ -118,6 +118,7 @@ import {
 } from 'node:fs';
 import { dirname, join, resolve, sep } from 'node:path';
 import { config } from './config';
+import { qlbHomeDir } from './home';
 import type { KeychainBackend } from './keychain';
 import { openRouterMissingKeyMessage, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, readNativeOpenRouterKey } from './keychain';
 import { removePiAuthBackup } from './pi-auth-backup';
@@ -311,6 +312,8 @@ export interface MigrationConfig {
   readNativeKey?: () => string;
   /** Test-only barrier after a pool takes the final owner-map lock. */
   beforePoolCommitLock?: () => void;
+  /** P7a's in-progress journal directory; defaults to ~/.qlb/journal. */
+  piMigrateJournalDir?: string;
 }
 
 /**
@@ -740,6 +743,7 @@ export class Migration {
   readonly authJsonKey: string | undefined;
   private readonly readNativeKey: (() => string) | undefined;
   private readonly beforePoolCommitLock: (() => void) | undefined;
+  private readonly piMigrateJournalDir: string;
 
   constructor(
     store: Store,
@@ -760,6 +764,16 @@ export class Migration {
     this.authJsonKey = config.authJsonKey ?? config.provider;
     this.readNativeKey = config.readNativeKey;
     this.beforePoolCommitLock = config.beforePoolCommitLock;
+    this.piMigrateJournalDir = config.piMigrateJournalDir ?? join(qlbHomeDir(), '.qlb', 'journal');
+  }
+
+  private assertNotP7aOwned(): void {
+    if (this.kind === 'pool' || !this.provider) return;
+    const state = this.store.getConfig(`pi.${this.provider}.state`);
+    const journal = join(this.piMigrateJournalDir, `pi-migrate-${this.provider}.json`);
+    if (state === 'migrated' || existsSync(journal)) {
+      throw new Error(`owned-by-pi-migrate: run \`qlb pi rollback ${this.provider}\``);
+    }
   }
 
   private ownerProvider(): MigrateProvider {
@@ -977,6 +991,7 @@ export class Migration {
    * Static-key (OpenRouter): 1 API key from native Keychain (read-only).
    */
   stage(): MigrationStatus {
+    this.assertNotP7aOwned();
     // P7b8 alone may convert the pool's v1 owner document into the shared
     // v2 map. Refuse before creating staging, Keychain, or journal state.
     this.refusePoolOwnerMap();
@@ -1086,6 +1101,7 @@ export class Migration {
    * rename is hygiene afterwards.
    */
   commit(): MigrationStatus {
+    this.assertNotP7aOwned();
     // P7b8 alone may convert the pool's v1 owner document into the shared
     // v2 map. Refuse before any journal or native-pool write.
     this.refusePoolOwnerMap();
@@ -1145,6 +1161,7 @@ export class Migration {
   }
 
   rollback(): MigrationStatus {
+    this.assertNotP7aOwned();
     if (this.ownerEntryPresent() || this.journalState() === 'QLB_OWNED') {
       return this.postCommitRollback();
     }
@@ -1160,6 +1177,7 @@ export class Migration {
    *   - MIRRORED / staging leftovers         → preCommitRollback
    */
   resume(): MigrationStatus {
+    this.assertNotP7aOwned();
     const current = this.status();
     const intent = current.detail.intent === 'rollback';
 
