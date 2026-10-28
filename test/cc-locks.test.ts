@@ -423,7 +423,10 @@ describe('Claude Code proper-lockfile locks', () => {
         const old = new Date(Date.now() - 60_000);
         await utimes(lock, old, old);
         const replacementMtime = (await stat(lock)).mtimeMs;
-        await sleep(80);
+        const deadline = Date.now() + 2_000;
+        while ((await stat(lock)).mtimeMs <= replacementMtime && Date.now() < deadline) {
+          await sleep(10);
+        }
         assert.ok((await stat(lock)).mtimeMs > replacementMtime, 'upstream toucher refreshes by pathname');
       });
       assert.equal(existsSync(lock), false, 'upstream release removes by pathname');
