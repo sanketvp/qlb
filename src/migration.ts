@@ -769,11 +769,43 @@ export class Migration {
 
   private assertNotP7aOwned(): void {
     if (this.kind === 'pool' || !this.provider) return;
-    const state = this.store.getConfig(`pi.${this.provider}.state`);
-    const journal = join(this.piMigrateJournalDir, `pi-migrate-${this.provider}.json`);
-    if (state === 'migrated' || existsSync(journal)) {
-      throw new Error(`owned-by-pi-migrate: run \`qlb pi rollback ${this.provider}\``);
+    const p7aState = this.store.getConfig(`pi.${this.provider}.state`);
+    const p7aJournal = join(this.piMigrateJournalDir, `pi-migrate-${this.provider}.json`);
+    if (p7aState !== 'migrated' && !existsSync(p7aJournal)) return;
+
+    const row = this.store.getMigration(this.storeName);
+    const state = asState(row?.state);
+    const detail = parseDetail(row?.detail_json);
+    const legacySidecar = this.legacySidecarOwned();
+    const customOwner = this.legacySidecarPath() !== this.ownerFilePath
+      && (() => {
+        try {
+          return hasLegacyPiOwnerEntry(this.ownerFilePath, this.ownerProvider());
+        } catch {
+          return false;
+        }
+      })();
+    const claim = this.ownerEntryPresent() || customOwner;
+    const commitGenerationSet = Object.prototype.hasOwnProperty.call(detail, 'commitGeneration');
+    const committed = state === 'QLB_OWNED'
+      || state === 'RETIRED'
+      || (state === 'VALIDATED' && claim && (legacySidecar || commitGenerationSet));
+    const rollbackInProgress = detail.intent === 'rollback'
+      || Object.prototype.hasOwnProperty.call(detail, 'rollbackDecision');
+    const handbackPending = isObjectRecord(detail.handback) && detail.handback.phase === 'cleanup-pending';
+
+    // C1 must precede C2: otherwise a generic command could mistake its own
+    // durable ownership evidence for a plain P7a-owned provider.
+    if (committed || rollbackInProgress || handbackPending) {
+      throw Object.assign(
+        new Error(`dual-ownership: run \`qlb pi rollback ${this.provider}\` first, then \`qlb migrate rollback --provider ${this.provider}\``),
+        { exitCode: 3 },
+      );
     }
+    throw Object.assign(
+      new Error(`owned-by-pi-migrate: run \`qlb pi rollback ${this.provider}\``),
+      { exitCode: 3 },
+    );
   }
 
   private ownerProvider(): MigrateProvider {
