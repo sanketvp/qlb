@@ -4,6 +4,8 @@ import { dirname, join } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 
 import { tokenCallAllowed } from './commands/token';
+import { resolveCswapCheck } from './cc-resync';
+import type { CswapProcess } from './cswap-processes';
 import { loadGate } from './gate';
 import { assertAdmittedInConnection } from './lifecycle';
 import { isPiPlaceholder } from './pi-migrate';
@@ -32,8 +34,17 @@ export interface GateRefreshContext {
   onDead: (provider: 'xai' | 'kimi-coding') => void;
 }
 
+/** Shared, value-free context for gate modules that need configured paths. */
+export interface GateContext {
+  dbPath: string;
+  env: NodeJS.ProcessEnv;
+  piAgentDir?: string;
+  autoLog: (line: string) => void;
+}
+
 /** Provider slices own identity resolution and any synchronous refresh. */
 export interface ProviderGate {
+  context?: (context: GateContext) => void | Promise<void>;
   prerequisites?: () => void | Promise<void>;
   read(): GateCredential | Promise<GateCredential>;
   /** Optional in-process refresh. P13 waits for single-consume's winner here. */
@@ -53,6 +64,14 @@ export class GateAdmissionRefused extends GateFailure {
   constructor(code: string) {
     super(code);
     this.name = 'GateAdmissionRefused';
+  }
+}
+
+/** A safety refusal at the gate boundary; its exit status is always 3. */
+export class GateRefused extends GateFailure {
+  constructor(code: string) {
+    super(code);
+    this.name = 'GateRefused';
   }
 }
 
@@ -79,6 +98,10 @@ export interface PiGateDeps {
   store?: Pick<Store, 'recordLineage' | 'recordRelogin'>;
   /** Command dispatch supplies the configured Pi agent directory. */
   piAgentDir?: string;
+  /** Injectable S24 result for hermetic tests. */
+  cswapProcesses?: () => CswapProcess[];
+  /** Test seam for the process listing used when no S24 result is injected. */
+  listCswap?: () => CswapProcess[];
 }
 
 function isProvider(value: string): value is PiGateProvider {
@@ -239,6 +262,17 @@ export function appendEvidenceGap(dbPath: string, provider: PiGateProvider): voi
   }
 }
 
+/** Best-effort, value-free diagnostic sink for provider context hooks. */
+function appendGateAutoLog(dbPath: string, line: string): void {
+  try {
+    const directory = dirname(dbPath);
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    appendFileSync(join(directory, 'auto.log'), `${line}\n`, { mode: 0o600 });
+  } catch {
+    // Diagnostics must not interrupt credential handling.
+  }
+}
+
 /** S30/S54 gate boundary. Credential resolution is deliberately outside the evidence transaction. */
 export async function runPiGate(providerName: string, deps: PiGateDeps): Promise<number> {
   if (!isProvider(providerName) || !(deps.guard ?? tokenCallAllowed)(deps.env)) return 3;
@@ -259,8 +293,23 @@ export async function runPiGate(providerName: string, deps: PiGateDeps): Promise
       return 3;
     }
 
-    await (deps.prerequisites ?? ((name, connection) => defaultPrerequisites(name, connection, deps.dbPath, deps.piAgentDir)))(providerName, db);
+    try {
+      if (resolveCswapCheck(deps.cswapProcesses, deps.env, deps.listCswap)().length > 0) {
+        throw new GateRefused('cswap-process-alive');
+      }
+    } catch (error) {
+      if (error instanceof GateRefused) throw error;
+      throw new GateRefused('cswap-process-check-failed');
+    }
+
     const gate = deps.provider ?? loadedProvider(providerName, deps.loadGate);
+    await (deps.prerequisites ?? ((name, connection) => defaultPrerequisites(name, connection, deps.dbPath, deps.piAgentDir)))(providerName, db);
+    await gate.context?.({
+      dbPath: deps.dbPath,
+      env: deps.env,
+      ...(deps.piAgentDir === undefined ? {} : { piAgentDir: deps.piAgentDir }),
+      autoLog: (line) => appendGateAutoLog(deps.dbPath, line),
+    });
     await gate.prerequisites?.();
     let credential = await gate.read();
     // §4.5: Pi never receives a single-account token with ≤60 seconds left.
@@ -326,7 +375,7 @@ export async function runPiGate(providerName: string, deps: PiGateDeps): Promise
   } catch (error) {
     const code = failureCode(error);
     deps.stderr?.(code);
-    return error instanceof GateAdmissionRefused || code === 'missing-provider-gate' || isLifecycleRefusal(code) ? 3 : 1;
+    return error instanceof GateAdmissionRefused || error instanceof GateRefused || code === 'missing-provider-gate' || isLifecycleRefusal(code) ? 3 : 1;
   } finally {
     db.close();
   }
