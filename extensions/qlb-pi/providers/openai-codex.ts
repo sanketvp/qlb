@@ -48,7 +48,7 @@ export function gateCause(stderr: string | undefined): string {
   return /^[a-z][a-z0-9=-]*$/.test(cause) ? cause : 'unknown';
 }
 
-function failureCause(error: unknown): string {
+export function failureCause(error: unknown): string {
   if (error instanceof OpenAICodexGateFailure) return error.causeCode;
   return (error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT' ? 'missing-binary' : 'unknown';
 }

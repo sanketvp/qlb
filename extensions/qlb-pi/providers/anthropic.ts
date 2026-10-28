@@ -4,7 +4,7 @@
 // credential, or falls back to Pi's persisted OAuth entry.
 
 import type { ActiveAccess, ActiveAccessSource } from '../active-access.js';
-import { gateCause } from './openai-codex.js';
+import { failureCause, gateCause } from './openai-codex.js';
 
 export interface GateResult {
   code: number;
@@ -73,8 +73,8 @@ export function createAnthropicSource(deps: AnthropicSourceDeps): ActiveAccessSo
       let result: GateResult;
       try {
         result = await deps.runGate('anthropic');
-      } catch {
-        throw unavailable();
+      } catch (error) {
+        throw unavailable(failureCause(error));
       }
       if (result.code !== 0) throw unavailable(gateCause(result.stderr));
       return parseGatePayload(result.stdout);
