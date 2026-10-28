@@ -535,8 +535,7 @@ export async function refreshActiveLogin(
   if (input.degraded) return finish({ outcome: 'deferred', deferReason: 'degraded-read' });
 
   const earlyVerdict = deps.verdicts.get(input.accountId, input.email, credentialLineage(input.creds) ?? '');
-  if (input.forceRecord === undefined
-    && !preLockAttribution({ creds: input.creds, slotFp: earlySlot?.fingerprint ?? null, slotPrevFp: earlySlot?.prevFingerprint ?? null, verdict: earlyVerdict })
+  if (!preLockAttribution({ creds: input.creds, slotFp: earlySlot?.fingerprint ?? null, slotPrevFp: earlySlot?.prevFingerprint ?? null, verdict: earlyVerdict })
     && !slotUsable(input.creds)) {
     if (deps.verdicts.warnOnce(input.accountId, input.email, 'unattributable')) warn(deps, 'Claude refresh deferred: credential is unattributable');
     return finish({ outcome: 'deferred', deferReason: 'unattributable' });
@@ -583,12 +582,13 @@ export async function refreshActiveLogin(
       let slotPrevFp = row?.prevFingerprint ?? null;
       const liveFp = credentialLineage(live);
       const memo = liveFp ? deps.verdicts.get(input.accountId, input.email, liveFp) : undefined;
-      // A forced 401 binds to live only when its complete lineage is unchanged.
-      // A differing or partial live blob must take the ordinary locked adopt,
-      // defer, or foreign-refusal path rather than laundering it as the input.
+      // A forced 401 binds to live only when both its lineage and the rejected
+      // access generation are unchanged. A differing, partial or newly issued
+      // live blob takes the ordinary locked adopt, defer, or foreign-refusal path.
       const decisionCreds = input.forceRecord !== undefined && live
         && hasUsablePair(live)
         && credentialLineage(live) === credentialLineage(input.creds)
+        && accessTokenFingerprint(live) === accessTokenFingerprint(input.creds)
         ? live : input.creds;
       if (input.forceRecord !== undefined && memo?.match === false) {
         return finish({ outcome: 'failed', reason: 'foreign-credential' });

@@ -456,6 +456,45 @@ describe('Claude active usage fetch (K6-4)', () => {
     assert.equal(posts, 0);
   });
 
+  it('a same-lineage access rotation during the lock wait is adopted, not POSTed', async () => {
+    const fixture = await refreshFixture();
+    const fresh = credential('slot', NOW + 60 * 60_000);
+    const rotated = JSON.stringify({ claudeAiOauth: { accessToken: 'access-new', refreshToken: 'refresh-slot', expiresAt: NOW + 60 * 60_000 } });
+    await fixture.slots.writeSlot('account-a', fresh, { cause: 'post', by: 'qlb-cli', evidence: 'post' });
+    await fixture.backend.set(fixture.liveOptions.paths.keychainService, 'fixture-user', fresh);
+    const used: string[] = [];
+    let posts = 0;
+    const result = await fetch(fixture, async (token) => {
+      used.push(token);
+      return token === 'access-new' ? { status: 200, body: usageBody() } : { status: 401, body: '' };
+    }, {
+      withConsumeLock: async (fn) => {
+        await fixture.backend.set(fixture.liveOptions.paths.keychainService, 'fixture-user', rotated);
+        return fn();
+      },
+      postRefresh: async () => { posts += 1; return { status: 400, body: JSON.stringify({ error: 'invalid_grant' }) }; },
+    }, { creds: fresh });
+    assert.ok('usage' in result);
+    assert.equal(posts, 0);
+    assert.deepEqual(used, ['access-slot', 'access-new']);
+    assert.equal(fixture.slots.getSlot('account-a')!.dead, false);
+  });
+
+  it('a forced 401 on an unattributed access-only credential POSTs nothing', async () => {
+    const fixture = await refreshFixture();
+    const accessOnly = JSON.stringify({ claudeAiOauth: { accessToken: 'access-x', expiresAt: NOW + 60 * 60_000 } });
+    await fixture.slots.writeSlot('account-a', credential('slot', NOW + 60 * 60_000), { cause: 'post', by: 'qlb-cli', evidence: 'post' });
+    await fixture.backend.set(fixture.liveOptions.paths.keychainService, 'fixture-user', accessOnly);
+    let posts = 0;
+    const result = await fetch(fixture, async () => ({ status: 401, body: '' }), {
+      postRefresh: async () => { posts += 1; return { status: 400, body: JSON.stringify({ error: 'invalid_grant' }) }; },
+    }, { creds: accessOnly });
+    assert.deepEqual(result, { error: 'http-401' });
+    assert.equal(posts, 0);
+    assert.equal(fixture.slots.getSlot('account-a')!.dead, false);
+    assert.equal(await fixture.backend.get(fixture.liveOptions.paths.keychainService, 'fixture-user'), accessOnly);
+  });
+
   it('the relogin sentinel surfaces in the same pass as the invalid_grant', async () => {
     const fixture = await refreshFixture();
     const result = await fetch(fixture, async () => { throw new Error('must not fetch'); }, {
