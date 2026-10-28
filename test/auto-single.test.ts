@@ -76,4 +76,54 @@ describe('single-account automatic bindings', () => {
     });
     assert.equal(status, 1);
   });
+  it('treats an unknown expiry as immediately due in both auto bindings (D-B55)', async () => {
+    const { expiresAt: _omitted, ...unknownExpiry } = gateCredential(0);
+    let xaiCalls = 0;
+    const xai = await refreshXaiIfDue({
+      now: () => NOW,
+      read: () => unknownExpiry,
+      refresh: async () => { xaiCalls += 1; return gateCredential(NOW + 3_600_000); },
+    });
+    assert.equal(xai.refreshed, true);
+    assert.equal(xaiCalls, 1);
+
+    let kimiCalls = 0;
+    const kimi = await refreshKimiCodingIfDue({
+      now: () => NOW,
+      read: () => unknownExpiry,
+      refresh: async () => { kimiCalls += 1; return gateCredential(NOW + 3_600_000); },
+    });
+    assert.equal(kimi.refreshed, true);
+    assert.equal(kimiCalls, 1);
+  });
+
+  it('gate refreshes a credential with unknown expiry before delivering it (D-B55)', async () => {
+    const { expiresAt: _omitted, ...unknownExpiry } = gateCredential(0);
+    const db = {
+      exec: () => undefined,
+      prepare: (sql: string) => ({
+        get: () => sql.includes('FROM lifecycle') ? { id: 1, state: 'cutting-over', began_at: NOW } : undefined,
+        run: () => undefined,
+      }),
+      close: () => undefined,
+    } as never;
+    let refreshed = 0;
+    const output: string[] = [];
+    const status = await runPiGate('kimi-coding', {
+      dbPath: ':memory:', env: {}, guard: () => true, admitted: () => ({ ok: true }), prerequisites: () => undefined, now: () => NOW,
+      open: () => db,
+      provider: {
+        read: () => unknownExpiry,
+        refresh: async () => {
+          refreshed += 1;
+          return { ...gateCredential(NOW + 3_600_000), token: 'winner-access' };
+        },
+      },
+      deliver: (value) => output.push(value),
+    });
+
+    assert.equal(status, 0);
+    assert.equal(refreshed, 1);
+    assert.equal(JSON.parse(output[0]!).token, 'winner-access');
+  });
 });

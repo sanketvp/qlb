@@ -265,7 +265,8 @@ export async function runPiGate(providerName: string, deps: PiGateDeps): Promise
     let credential = await gate.read();
     // §4.5: Pi never receives a single-account token with ≤60 seconds left.
     // The provider refresh waits for the consume-lock winner, then re-reads it.
-    if (gate.refresh && credential?.expiresAt !== undefined && credential.expiresAt - (deps.now ?? Date.now)() <= 60_000) {
+    // An unknown expiry is immediately due (D-B55), as in single-consume.
+    if (gate.refresh && credential && (credential.expiresAt === undefined || credential.expiresAt - (deps.now ?? Date.now)() <= 60_000)) {
       const needsAudit = providerName === 'xai' || providerName === 'kimi-coding';
       const ownedStore = needsAudit && !deps.store ? openStore(deps.dbPath) : undefined;
       const store = deps.store ?? ownedStore;

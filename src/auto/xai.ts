@@ -17,7 +17,8 @@ export interface XaiAutoDeps {
 export async function refreshXaiIfDue(deps: XaiAutoDeps = {}): Promise<{ refreshed: boolean; credential: GateCredential }> {
   const credential = (deps.read ?? resolve)();
   const now = (deps.now ?? Date.now)();
-  if (credential.expiresAt === undefined || credential.expiresAt - now > SINGLE_ACCOUNT_FRESHEN_MS) {
+  // D-B55: an unknown expiry is immediately due, matching single-consume.
+  if (credential.expiresAt !== undefined && credential.expiresAt - now > SINGLE_ACCOUNT_FRESHEN_MS) {
     return { refreshed: false, credential };
   }
   const refreshed = await (deps.refresh ?? (async () => {
