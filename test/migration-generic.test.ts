@@ -564,6 +564,9 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       const customPath = join(blockedParent, 'custom-owner.json');
       const migration = createSingleGrantMigration(h.store, h.kc, 'xai', h.authPath, customPath);
       const journalBefore = h.store.getMigration('pi-xai');
+      const service = qlbKeychainService('xai', expectedId('xai'));
+      const keychainBytes = JSON.stringify({ preserved: 'ENOTDIR' });
+      h.kc.setSync(service, expectedLabel('xai'), keychainBytes);
 
       assert.throws(
         () => migration.stage(),
@@ -575,6 +578,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
         },
       );
       assert.deepEqual(h.store.getMigration('pi-xai'), journalBefore);
+      assert.equal(h.kc.getSync(service, expectedLabel('xai')), keychainBytes);
     } finally {
       h.cleanup();
     }

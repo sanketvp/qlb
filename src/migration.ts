@@ -109,6 +109,7 @@ import {
   closeSync,
   existsSync,
   fsyncSync,
+  lstatSync,
   openSync,
   readFileSync,
   renameSync,
@@ -123,7 +124,7 @@ import type { KeychainBackend } from './keychain';
 import { openRouterMissingKeyMessage, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, readNativeOpenRouterKey } from './keychain';
 import { removePiAuthBackup } from './pi-auth-backup';
 import { parseGrant } from './refresh-lease';
-import { hasLegacyPiOwnerEntry, readPiOwnerProviders, withPiAuthLock, writePiOwnerEntry } from './pi-migrate';
+import { hasLegacyPiOwnerEntry, PiOwnerLegacyError, readPiOwnerProviders, withPiAuthLock, writePiOwnerEntry } from './pi-migrate';
 import { OPENROUTER_GATE_KEYCHAIN_SERVICE } from './token/openrouter';
 import type { Store } from './store';
 import type { Grant } from './types';
@@ -795,15 +796,68 @@ export class Migration {
 
   /** Design §2 S0 `Claim` = `O` ∨ `L` ∨ `Oc` (a custom `--owner-file` v1 document naming this provider). */
   private claimPresent(): boolean {
-    if (this.ownerEntryPresent()) return true;
-    if (this.kind === 'pool' || this.legacySidecarPath() === this.ownerFilePath) return false;
+    return this.ownershipClaim() !== null;
+  }
+
+  private claimPathPresent(path: string): boolean {
     try {
-      return hasLegacyPiOwnerEntry(this.ownerFilePath, this.ownerProvider());
-    } catch {
-      // A custom owner file that cannot be read is still a durable claim.
-      // C6 must fail closed rather than treating it as absent and deleting it.
-      return existsSync(this.ownerFilePath);
+      lstatSync(path);
+      return true;
+    } catch (error: unknown) {
+      // Only a definite absence is safe to classify as no claim. Permission,
+      // path-shape, and other lookup errors are ambiguous durable evidence.
+      return !isObjectRecord(error) || error.code !== 'ENOENT';
     }
+  }
+
+  private unreadableOwnerMapAt(path: string): boolean {
+    try {
+      readPiOwnerProviders(path);
+      return false;
+    } catch (error) {
+      // A legacy v1 file is readable and has its own explicit rejection at
+      // the static-key commit boundary; it is not an ambiguous O claim.
+      if (error instanceof PiOwnerLegacyError) return false;
+      return this.claimPathPresent(path);
+    }
+  }
+
+  private unreadableLegacySidecarAt(path: string): boolean {
+    try {
+      JSON.parse(readFileSync(path, 'utf8'));
+      return false;
+    } catch {
+      return this.claimPathPresent(path);
+    }
+  }
+
+  private ownershipClaim(): { kind: 'O' | 'L' | 'Oc' | 'unreadable'; path: string } | null {
+    // The pool path deliberately preserves its pre-P7b claim semantics. C6
+    // does not classify it, and its callers still need the committed claim.
+    if (this.kind === 'pool') {
+      return this.ownerEntryPresent() ? { kind: 'L', path: this.ownerFilePath } : null;
+    }
+
+    if (this.ownerEntryPresentAt(this.ownerMapPath)) return { kind: 'O', path: this.ownerMapPath };
+    if (this.unreadableOwnerMapAt(this.ownerMapPath)) return { kind: 'unreadable', path: this.ownerMapPath };
+
+    const legacyPath = this.legacySidecarPath();
+    if (legacyPath) {
+      if (this.legacySidecarOwned()) return { kind: 'L', path: legacyPath };
+      if (this.unreadableLegacySidecarAt(legacyPath)) return { kind: 'unreadable', path: legacyPath };
+    }
+
+    if (this.ownerFilePath === this.ownerMapPath || this.ownerFilePath === legacyPath) return null;
+    try {
+      if (hasLegacyPiOwnerEntry(this.ownerFilePath, this.ownerProvider())) {
+        return { kind: 'Oc', path: this.ownerFilePath };
+      }
+    } catch {
+      if (this.claimPathPresent(this.ownerFilePath)) {
+        return { kind: 'unreadable', path: this.ownerFilePath };
+      }
+    }
+    return null;
   }
 
   /** Design §2 S0 facts `Gen`, `Rb` and `Hb`, read from this path's own durable evidence. */
@@ -831,11 +885,14 @@ export class Migration {
     // owns its v1 commit-point crash window.
     if (this.kind === 'pool') return;
     const facts = this.ownershipFacts();
-    if (!this.claimPresent() || facts.committed || facts.rollbackInProgress || facts.handbackPending) return;
-    throw Object.assign(
-      new Error('owner-file-orphan: remove the owner file before retrying'),
-      { exitCode: 3 },
-    );
+    const claim = this.ownershipClaim();
+    if (!claim || facts.committed || facts.rollbackInProgress || facts.handbackPending) return;
+    const message = claim.kind === 'unreadable'
+      ? `owner-file-orphan: ${claim.path} could not be read; inspect and repair it before retrying.`
+      : claim.kind === 'O'
+        ? `owner-file-orphan: QLB has no record of committing ${this.ownerProvider()}, but the shared owner map ${claim.path} has a QLB entry for it. Remove only the ${this.ownerProvider()} entry from that file; do not delete the file (other providers' entries live there).`
+        : `owner-file-orphan: QLB has no record of committing ${this.ownerProvider()}, but the owner file ${claim.path} has a QLB entry for it. Remove the file ${claim.path} before retrying.`;
+    throw Object.assign(new Error(message), { exitCode: 3 });
   }
 
   private ownerProvider(): MigrateProvider {
