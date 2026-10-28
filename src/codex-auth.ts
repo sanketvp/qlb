@@ -131,6 +131,18 @@ export function codexIdentity(doc: CodexAuthDocument): string | null {
   return codexIdentityKey({ chatgpt_user_id: chatgptUserId, account_id: accountId });
 }
 
+/** Returns the S29 slot id from a Pi access grant, or null when its identity is incomplete. */
+export function codexSlotIdFromAccessToken(access: string, bareAccountId?: string): string | null {
+  const payload = decodeJwtPayload(access);
+  const authClaims = payload ? payload[OPENAI_AUTH_CLAIM] : undefined;
+  if (!isObject(authClaims)) return null;
+
+  const chatgptUserId = authClaims.chatgpt_user_id;
+  const accountId = bareAccountId || authClaims.chatgpt_account_id;
+  if (!nonEmptyString(chatgptUserId) || !nonEmptyString(accountId)) return null;
+  return codexIdentityKey({ chatgpt_user_id: chatgptUserId, account_id: accountId });
+}
+
 /** Returns the access-token JWT expiry in milliseconds, or null for an invalid JWT. */
 export function accessExpiry(doc: CodexAuthDocument): number | null {
   const payload = decodeJwtPayload(doc.tokens.access_token);

@@ -9,6 +9,7 @@ import {
   accessExpiry,
   codexFingerprint,
   codexIdentity,
+  codexSlotIdFromAccessToken,
   idTokenClaimNames,
   authTime,
   needsRefresh,
@@ -111,6 +112,37 @@ describe('codex auth.json helpers', () => {
       },
     });
     assert.equal(codexIdentity(noClaims), null);
+  });
+
+  it('slot id from a Pi grant uses the grant accountId before the claim', () => {
+    const access = jwt({
+      'https://api.openai.com/auth': {
+        chatgpt_user_id: 'pi-user',
+        chatgpt_account_id: 'claim-account',
+      },
+    });
+    assert.equal(codexSlotIdFromAccessToken(access, 'grant-account'), 'pi-user:grant-account');
+  });
+
+  it('slot id from a Pi grant falls back to the chatgpt_account_id claim', () => {
+    const access = jwt({
+      'https://api.openai.com/auth': {
+        chatgpt_user_id: 'pi-user',
+        chatgpt_account_id: 'claim-account',
+      },
+    });
+    assert.equal(codexSlotIdFromAccessToken(access), 'pi-user:claim-account');
+  });
+
+  it('slot id from a Pi grant is null without chatgpt_user_id', () => {
+    const access = jwt({
+      'https://api.openai.com/auth': { chatgpt_account_id: 'claim-account' },
+    });
+    assert.equal(codexSlotIdFromAccessToken(access, 'grant-account'), null);
+  });
+
+  it('slot id from a Pi grant is null for a non-JWT access token', () => {
+    assert.equal(codexSlotIdFromAccessToken('not-a-jwt', 'grant-account'), null);
   });
 
   it('reads access expiry and applies five-minute and eight-day refresh thresholds', () => {
