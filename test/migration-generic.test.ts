@@ -238,8 +238,6 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
           h.store.setAccountStatus(id, 'handed-back');
           h.store.upsertMigration(`pi-${provider}`, lifecycle, JSON.stringify({
             commitGeneration: 3,
-            rollbackDecision: { kind: 'keychain' },
-            handback: { phase: 'cleanup-pending' },
             lastRollback: { cleanedAt: 1 },
           }));
 
@@ -257,6 +255,70 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
           assert.equal(detail.rollbackDecision, undefined);
           assert.equal(detail.handback, undefined);
           assert.equal(detail.lastRollback, undefined);
+        } finally {
+          h.cleanup();
+        }
+      }
+    }
+  });
+
+  it('T-E1 stage and commit refuse while a hand-back marker is set', async () => {
+    const markers: Array<{
+      name: 'intent' | 'decision' | 'cleanup-pending';
+      detail: Record<string, unknown>;
+      code: 'rollback-in-progress' | 'handback-cleanup-pending';
+    }> = [
+      { name: 'intent', detail: { intent: 'rollback' }, code: 'rollback-in-progress' },
+      { name: 'decision', detail: { rollbackDecision: { kind: 'keychain' } }, code: 'rollback-in-progress' },
+      {
+        name: 'cleanup-pending',
+        detail: {
+          handback: {
+            phase: 'cleanup-pending',
+            keychainDisposition: 'keep',
+            piFingerprint: null,
+            decision: null,
+            fencedGeneration: null,
+            rolledBackAt: 1,
+          },
+        },
+        code: 'handback-cleanup-pending',
+      },
+    ];
+
+    for (const command of ['stage', 'commit'] as const) {
+      for (const marker of markers) {
+        const h = setup('xai');
+        try {
+          if (command === 'commit') {
+            h.mig.stage();
+            await h.mig.rehearse(mockRehearse([]));
+          }
+          const row = h.store.getMigration('pi-xai');
+          const state = command === 'stage' ? 'NATIVE' : row!.state;
+          const detail = command === 'stage'
+            ? marker.detail
+            : { ...JSON.parse(row!.detail_json), ...marker.detail };
+          h.store.upsertMigration('pi-xai', state, JSON.stringify(detail));
+          const rowBefore = h.store.getMigration('pi-xai');
+          const filesBefore = fileSnapshot(h.dir);
+          const service = qlbKeychainService('xai', expectedId('xai'));
+          const account = expectedLabel('xai');
+          const keychainBefore = command === 'commit' ? h.kc.getSync(service, account) : null;
+
+          assert.throws(
+            () => h.mig[command](),
+            (error: Error) => {
+              assert.match(error.message, new RegExp(marker.code));
+              return true;
+            },
+            `${command}/${marker.name} refuses its active hand-back marker`,
+          );
+          assert.deepEqual(h.store.getMigration('pi-xai'), rowBefore, `${command}/${marker.name} preserves the journal`);
+          assert.deepEqual(fileSnapshot(h.dir), filesBefore, `${command}/${marker.name} preserves files`);
+          if (keychainBefore !== null) {
+            assert.equal(h.kc.getSync(service, account), keychainBefore, `${command}/${marker.name} preserves Keychain`);
+          }
         } finally {
           h.cleanup();
         }
