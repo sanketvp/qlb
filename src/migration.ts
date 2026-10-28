@@ -838,6 +838,19 @@ export class Migration {
     }
   }
 
+  private unreadableCustomOwnerFileAt(path: string): boolean {
+    // Oc is a v1 document, so preserve ownershipClaim's read-then-parse probe
+    // while making it independently available to the fail-closed assertion.
+    if (!this.claimPathPresent(path)) return false;
+    try {
+      readFileSync(path, 'utf8');
+      hasLegacyPiOwnerEntry(path, this.ownerProvider());
+      return false;
+    } catch {
+      return true;
+    }
+  }
+
   private ownershipClaim(): { kind: 'O' | 'L' | 'Oc' | 'unreadable'; path: string } | null {
     // The pool path deliberately preserves its pre-P7b claim semantics. C6
     // does not classify it, and its callers still need the committed claim.
@@ -858,13 +871,11 @@ export class Migration {
     // lstat the custom path before its existsSync()-based reader so dangling
     // Oc symlinks are ambiguous evidence, not an absent claim.
     if (!this.claimPathPresent(this.ownerFilePath)) return null;
-    try {
-      readFileSync(this.ownerFilePath, 'utf8');
-      if (hasLegacyPiOwnerEntry(this.ownerFilePath, this.ownerProvider())) {
-        return { kind: 'Oc', path: this.ownerFilePath };
-      }
-    } catch {
+    if (this.unreadableCustomOwnerFileAt(this.ownerFilePath)) {
       return { kind: 'unreadable', path: this.ownerFilePath };
+    }
+    if (hasLegacyPiOwnerEntry(this.ownerFilePath, this.ownerProvider())) {
+      return { kind: 'Oc', path: this.ownerFilePath };
     }
     return null;
   }
@@ -891,10 +902,27 @@ export class Migration {
   /** Ambiguous O/L/Oc evidence fails closed, regardless of journal state. */
   private assertNoUnreadableOwnershipClaim(): void {
     if (this.kind === 'pool') return;
-    const claim = this.ownershipClaim();
-    if (claim?.kind !== 'unreadable') return;
+
+    // Do not use ownershipClaim() here: it deliberately returns the first
+    // valid claim by precedence, but every claim form is durable evidence and
+    // any unreadable form must fail closed.
+    const legacyPath = this.legacySidecarPath();
+    const unreadableOwnerMap = this.unreadableOwnerMapAt(this.ownerMapPath);
+    const unreadableLegacySidecar = legacyPath !== null
+      && this.unreadableLegacySidecarAt(legacyPath);
+    const unreadableCustomOwnerFile = this.ownerFilePath !== this.ownerMapPath
+      && this.ownerFilePath !== legacyPath
+      && this.unreadableCustomOwnerFileAt(this.ownerFilePath);
+    const unreadablePath = unreadableOwnerMap
+      ? this.ownerMapPath
+      : unreadableLegacySidecar
+        ? legacyPath
+        : unreadableCustomOwnerFile
+          ? this.ownerFilePath
+          : null;
+    if (!unreadablePath) return;
     throw Object.assign(
-      new Error(`owner-file-orphan: ${claim.path} could not be read; inspect and repair it before retrying.`),
+      new Error(`owner-file-orphan: ${unreadablePath} could not be read; inspect and repair it before retrying.`),
       { exitCode: 3 },
     );
   }
@@ -1206,6 +1234,7 @@ export class Migration {
     if (current.state !== 'MIRRORED' && current.state !== 'VALIDATED') {
       throw new Error(`cannot rehearse from state ${current.state}`);
     }
+    this.assertNoUnreadableOwnershipClaim();
     const staged = this.readStagedAccounts();
     if (staged.length === 0) {
       throw new Error('no staged Keychain credentials to rehearse');

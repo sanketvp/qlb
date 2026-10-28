@@ -556,6 +556,101 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     }
   });
 
+  it('T-S0h refuses a later unreadable O/L/Oc claim even when an earlier claim is valid', async () => {
+    const cases = [
+      { name: 'valid O + dangling L', valid: 'O', unreadable: 'L' },
+      { name: 'valid O + malformed L', valid: 'O', unreadable: 'L-malformed' },
+      { name: 'valid L + unreadable Oc', valid: 'L', unreadable: 'Oc' },
+    ] as const;
+
+    for (const testCase of cases) {
+      for (const command of ['stage', 'commit', 'rollback', 'resume'] as const) {
+        const h = setup('xai');
+        try {
+          const customPath = join(h.dir, 'custom-owner.json');
+          const migration = testCase.unreadable === 'Oc'
+            ? createSingleGrantMigration(h.store, h.kc, 'xai', h.authPath, customPath)
+            : h.mig;
+          if (command !== 'stage') {
+            migration.stage();
+            await migration.rehearse(mockRehearse([]));
+          }
+
+          const mapPath = join(h.dir, 'qlb-owner.json');
+          const validPath = testCase.valid === 'O' ? mapPath : h.ownerPath;
+          writeFileSync(validPath, testCase.valid === 'O'
+            ? JSON.stringify({ providers: { xai: { mode: 'qlb' } } }) + '\n'
+            : JSON.stringify({ owner: 'qlb', accounts: [{ provider: 'xai' }] }) + '\n');
+          const unreadablePath = testCase.unreadable.startsWith('L') ? h.ownerPath : customPath;
+          if (testCase.unreadable === 'L') {
+            const target = join(h.dir, `missing-${command}`);
+            symlinkSync(target, unreadablePath);
+          } else {
+            writeFileSync(unreadablePath, '{not valid JSON\n');
+          }
+
+          const stagingPath = stagingOwnerPath(mapPath, 'xai');
+          const service = qlbKeychainService('xai', expectedId('xai'));
+          if (command === 'stage') {
+            h.kc.setSync(service, expectedLabel('xai'), JSON.stringify({ preserved: testCase.name }));
+          }
+          const journalBefore = h.store.getMigration('pi-xai');
+          const keychainBefore = h.kc.getSync(service, expectedLabel('xai'));
+          const stagingBefore = existsSync(stagingPath) ? readFileSync(stagingPath) : null;
+          const validBefore = readFileSync(validPath);
+          const unreadableBefore = testCase.unreadable === 'L'
+            ? readlinkSync(unreadablePath)
+            : readFileSync(unreadablePath);
+
+          assert.throws(() => migration[command](), (error: Error & { exitCode?: unknown }) => {
+            assert.match(error.message, new RegExp(`owner-file-orphan: ${unreadablePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} could not be read`));
+            assert.equal(error.exitCode, 3);
+            return true;
+          }, `${testCase.name}/${command} refuses the later unreadable claim`);
+          assert.deepEqual(h.store.getMigration('pi-xai'), journalBefore, `${testCase.name}/${command} preserves the journal`);
+          assert.equal(h.kc.getSync(qlbKeychainService('xai', expectedId('xai')), expectedLabel('xai')), keychainBefore, `${testCase.name}/${command} preserves Keychain`);
+          assert.deepEqual(existsSync(stagingPath) ? readFileSync(stagingPath) : null, stagingBefore, `${testCase.name}/${command} preserves staging`);
+          assert.deepEqual(readFileSync(validPath), validBefore, `${testCase.name}/${command} preserves the valid claim`);
+          if (testCase.unreadable === 'L') {
+            assert.equal(readlinkSync(unreadablePath), unreadableBefore, `${testCase.name}/${command} keeps the dangling link`);
+          } else {
+            assert.deepEqual(readFileSync(unreadablePath), unreadableBefore, `${testCase.name}/${command} preserves the unreadable claim`);
+          }
+        } finally {
+          h.cleanup();
+        }
+      }
+    }
+  });
+
+  it('T-S0i rehearse refuses an unreadable L before validating the journal', async () => {
+    const h = setup('xai');
+    try {
+      h.mig.stage();
+      writeFileSync(h.ownerPath, '{not valid JSON\n');
+      const journalBefore = h.store.getMigration('pi-xai');
+      const stagingPath = stagingOwnerPath(join(h.dir, 'qlb-owner.json'), 'xai');
+      const stagingBefore = readFileSync(stagingPath);
+      const keychainBefore = h.kc.getSync(qlbKeychainService('xai', expectedId('xai')), expectedLabel('xai'));
+      const ownerBefore = readFileSync(h.ownerPath);
+
+      await assert.rejects(
+        () => h.mig.rehearse(mockRehearse([])),
+        (error: Error & { exitCode?: unknown }) => {
+          assert.match(error.message, new RegExp(`owner-file-orphan: ${h.ownerPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} could not be read`));
+          assert.equal(error.exitCode, 3);
+          return true;
+        },
+      );
+      assert.deepEqual(h.store.getMigration('pi-xai'), journalBefore);
+      assert.deepEqual(readFileSync(stagingPath), stagingBefore);
+      assert.equal(h.kc.getSync(qlbKeychainService('xai', expectedId('xai')), expectedLabel('xai')), keychainBefore);
+      assert.deepEqual(readFileSync(h.ownerPath), ownerBefore);
+    } finally {
+      h.cleanup();
+    }
+  });
+
   it('T-S0g refuses unreadable claims with write-ahead commit evidence without changing recovery artifacts', async () => {
     for (const command of ['commit', 'rollback', 'resume'] as const) {
       const h = setup('xai');
