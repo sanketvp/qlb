@@ -5,7 +5,8 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { describe, it } from 'node:test';
 
-import { planCodexRekey } from '../src/codex-rekey';
+import { applyCodexRekey, ensureCodexSlotAccount, planCodexRekey } from '../src/codex-rekey';
+import { platformKeychain, type KeychainBackend } from '../src/keychain';
 import { openStore, refreshLeaseName } from '../src/store';
 
 function fixture(): { db: DatabaseSync; close: () => void } {
@@ -48,6 +49,26 @@ function pollClaim(db: DatabaseSync, accountId: string, until: number | null): v
   db.prepare(`INSERT INTO poll_claims (account_id, holder_id, claimed_at, until)
     VALUES (?, 'fixture', 1, ?)`)
     .run(accountId, until);
+}
+
+function inTransaction<T>(db: DatabaseSync, fn: () => T): T {
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    const result = fn();
+    db.exec('COMMIT');
+    return result;
+  } catch (error) {
+    db.exec('ROLLBACK');
+    throw error;
+  }
+}
+
+function applyPlan(db: DatabaseSync, now = 100): void {
+  inTransaction(db, () => applyCodexRekey(db, plan(db), { now }));
+}
+
+function configs(db: DatabaseSync): Array<{ key: string; value: string | null }> {
+  return db.prepare('SELECT key, value FROM config ORDER BY key').all() as Array<{ key: string; value: string | null }>;
 }
 
 describe('Codex rekey planner', () => {
@@ -334,6 +355,206 @@ describe('Codex rekey planner', () => {
       plan(f.db);
       const after = (f.db.prepare('SELECT total_changes() AS changes').get() as { changes: number }).changes;
       assert.equal(after, before);
+    } finally { f.close(); }
+  });
+});
+
+describe('Codex rekey apply', () => {
+  it('rename carries snapshots, pins, poll claim, usage poll and expired lease', () => {
+    const f = fixture();
+    try {
+      slot(f.db, 'user:bare', 'bare');
+      account(f.db, 'bare', 'openai-codex');
+      f.db.prepare("INSERT INTO snapshots (account_id, bucket, fetched_at) VALUES ('bare', 'primary', 1)").run();
+      f.db.prepare("INSERT INTO overrides (kind, account_id, session, until) VALUES ('pin', 'bare', 'fixture', 2)").run();
+      pollClaim(f.db, 'bare', 99);
+      f.db.prepare("INSERT INTO usage_polls (provider, account_id, next_due_at) VALUES ('openai-codex', 'bare', 3)").run();
+      lease(f.db, 'bare', 99);
+      applyPlan(f.db);
+      for (const [table, key] of [['snapshots', 'account_id'], ['overrides', 'account_id'], ['poll_claims', 'account_id'], ['usage_polls', 'account_id']] as const) {
+        assert.equal(f.db.prepare(`SELECT 1 FROM ${table} WHERE ${key} = 'user:bare'`).get() !== undefined, true);
+      }
+      assert.equal(f.db.prepare('SELECT 1 FROM leases WHERE name = ?').get(refreshLeaseName('user:bare')) !== undefined, true);
+      assert.deepEqual(JSON.parse((f.db.prepare("SELECT value FROM config WHERE key = 'codex.rekey.v1'").get() as { value: string }).value), {
+        bare: { to: 'user:bare', kind: 'rename', at: 100 },
+      });
+    } finally { f.close(); }
+  });
+
+  it('an applied orphan move ensures the destination account row', () => {
+    const f = fixture();
+    try {
+      slot(f.db, 'user:bare', 'bare');
+      f.db.prepare("INSERT INTO snapshots (account_id, bucket, fetched_at) VALUES ('bare', 'primary', 1)").run();
+      applyPlan(f.db);
+      assert.deepEqual({ ...f.db.prepare("SELECT id, provider, label, status, created_at FROM accounts WHERE id = 'user:bare'").get() as object }, {
+        id: 'user:bare', provider: 'openai-codex', label: 'user:bare', status: 'active', created_at: 100,
+      });
+    } finally { f.close(); }
+  });
+
+  it("two slots A and B: B's orphan bare dependents, including a usage_polls row left by a prune, move to composite-B, B's account row exists, and a second plan+apply changes nothing", () => {
+    const f = fixture();
+    try {
+      slot(f.db, 'composite-A', 'bare-A');
+      slot(f.db, 'composite-B', 'bare-B');
+      account(f.db, 'bare-A', 'openai-codex');
+      f.db.prepare("INSERT INTO snapshots (account_id, bucket, fetched_at) VALUES ('bare-B', 'primary', 1)").run();
+      f.db.prepare("INSERT INTO overrides (kind, account_id, session, until) VALUES ('pin', 'bare-B', 'fixture', 2)").run();
+      f.db.prepare("INSERT INTO usage_polls (provider, account_id, next_due_at) VALUES ('openai-codex', 'bare-B', 3)").run();
+      applyPlan(f.db);
+      const before = [
+        f.db.prepare('SELECT * FROM snapshots ORDER BY account_id, bucket').all(),
+        f.db.prepare('SELECT * FROM overrides ORDER BY account_id, kind, session').all(),
+        f.db.prepare('SELECT * FROM usage_polls ORDER BY provider, account_id').all(), configs(f.db),
+      ];
+      applyPlan(f.db);
+      assert.equal(f.db.prepare("SELECT 1 FROM accounts WHERE id = 'composite-B' AND provider = 'openai-codex'").get() !== undefined, true);
+      assert.deepEqual([
+        f.db.prepare('SELECT * FROM snapshots ORDER BY account_id, bucket').all(),
+        f.db.prepare('SELECT * FROM overrides ORDER BY account_id, kind, session').all(),
+        f.db.prepare('SELECT * FROM usage_polls ORDER BY provider, account_id').all(), configs(f.db),
+      ], before);
+    } finally { f.close(); }
+  });
+
+  it('a skipped orphan (in-use, journal-named, provider-mismatch) creates no account row', () => {
+    for (const setup of [
+      (db: DatabaseSync) => pollClaim(db, 'bare', 101),
+      (db: DatabaseSync) => journal(db, 'pi-pool', 'QLB_OWNED', JSON.stringify({ qlbAccountIds: ['bare'] })),
+      (db: DatabaseSync) => account(db, 'user:bare', 'anthropic'),
+    ]) {
+      const f = fixture();
+      try {
+        slot(f.db, 'user:bare', 'bare');
+        f.db.prepare("INSERT INTO snapshots (account_id, bucket, fetched_at) VALUES ('bare', 'primary', 1)").run();
+        setup(f.db);
+        applyPlan(f.db);
+        assert.equal(f.db.prepare("SELECT 1 FROM accounts WHERE id = 'user:bare' AND provider = 'openai-codex'").get(), undefined);
+      } finally { f.close(); }
+    }
+  });
+
+  it('ensureCodexSlotAccount inserts once and never changes an existing row', () => {
+    const f = fixture();
+    try {
+      inTransaction(f.db, () => ensureCodexSlotAccount(f.db, 'user:bare', 100));
+      f.db.prepare("UPDATE accounts SET label = 'kept', status = 'disabled', created_at = 1 WHERE id = 'user:bare'").run();
+      inTransaction(f.db, () => ensureCodexSlotAccount(f.db, 'user:bare', 200));
+      assert.deepEqual({ ...f.db.prepare("SELECT provider, label, status, created_at FROM accounts WHERE id = 'user:bare'").get() as object }, {
+        provider: 'openai-codex', label: 'kept', status: 'disabled', created_at: 1,
+      });
+    } finally { f.close(); }
+  });
+
+  it("another provider's usage_polls row with the same id is untouched", () => {
+    const f = fixture();
+    try {
+      slot(f.db, 'user:bare', 'bare');
+      account(f.db, 'bare', 'openai-codex');
+      f.db.prepare("INSERT INTO usage_polls (provider, account_id, next_due_at) VALUES ('openai-codex', 'bare', 3)").run();
+      f.db.prepare("INSERT INTO usage_polls (provider, account_id, next_due_at) VALUES ('anthropic', 'bare', 4)").run();
+      applyPlan(f.db);
+      assert.deepEqual({ ...f.db.prepare("SELECT provider, account_id, next_due_at FROM usage_polls WHERE provider = 'anthropic'").get() as object }, {
+        provider: 'anthropic', account_id: 'bare', next_due_at: 4,
+      });
+    } finally { f.close(); }
+  });
+
+  it('failover pointer follows the rename', () => {
+    const f = fixture();
+    try {
+      slot(f.db, 'user:bare', 'bare');
+      account(f.db, 'bare', 'openai-codex');
+      f.db.prepare("INSERT INTO config (key, value) VALUES ('failover:openai-codex', 'bare')").run();
+      applyPlan(f.db);
+      assert.equal((f.db.prepare("SELECT value FROM config WHERE key = 'failover:openai-codex'").get() as { value: string }).value, 'user:bare');
+    } finally { f.close(); }
+  });
+
+  it('observed cache is reset only when something moved', () => {
+    const f = fixture();
+    try {
+      f.db.prepare("INSERT INTO config (key, value) VALUES ('observed:openai-codex', 'cached')").run();
+      applyPlan(f.db);
+      assert.equal(f.db.prepare("SELECT 1 FROM config WHERE key = 'observed:openai-codex'").get() !== undefined, true);
+      slot(f.db, 'user:bare', 'bare');
+      account(f.db, 'bare', 'openai-codex');
+      applyPlan(f.db);
+      assert.equal(f.db.prepare("SELECT 1 FROM config WHERE key = 'observed:openai-codex'").get(), undefined);
+    } finally { f.close(); }
+  });
+
+  it('a second plan+apply changes nothing (dependent tables and config identical)', () => {
+    const f = fixture();
+    try {
+      slot(f.db, 'user:bare', 'bare');
+      account(f.db, 'bare', 'openai-codex');
+      f.db.prepare("INSERT INTO snapshots (account_id, bucket, fetched_at) VALUES ('bare', 'primary', 1)").run();
+      applyPlan(f.db);
+      const before = [f.db.prepare('SELECT * FROM snapshots ORDER BY account_id, bucket').all(), configs(f.db)];
+      applyPlan(f.db);
+      assert.deepEqual([f.db.prepare('SELECT * FROM snapshots ORDER BY account_id, bucket').all(), configs(f.db)], before);
+    } finally { f.close(); }
+  });
+
+  it('refuses outside a transaction', () => {
+    const f = fixture();
+    try {
+      assert.throws(() => applyCodexRekey(f.db, { moves: [], skipped: [] }, { now: 100 }), /rekey-needs-transaction/);
+    } finally { f.close(); }
+  });
+
+  it('codex_watch, decisions, switch_log, lineage_log and migrations are unchanged', () => {
+    const f = fixture();
+    try {
+      slot(f.db, 'user:bare', 'bare');
+      account(f.db, 'bare', 'openai-codex');
+      f.db.prepare("INSERT INTO codex_watch (switch_id, provider, outgoing, target, next_at, until) VALUES (1, 'openai-codex', 'a', 'b', 1, 2)").run();
+      f.db.prepare("INSERT INTO decisions (ts, account_id) VALUES (1, 'bare')").run();
+      f.db.prepare("INSERT INTO switch_log (ts, provider, to_account, trigger, outcome) VALUES (1, 'openai-codex', 'bare', 'fixture', 'ok')").run();
+      f.db.prepare("INSERT INTO lineage_log (ts, provider, account_id, to_fp, cause, by) VALUES (1, 'openai-codex', 'bare', 'fp', 'fixture', 'fixture')").run();
+      journal(f.db, 'pi-pool', 'NATIVE', '{}');
+      const tables = ['codex_watch', 'decisions', 'switch_log', 'lineage_log', 'migrations'];
+      const before = tables.map((table) => f.db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all());
+      applyPlan(f.db);
+      assert.deepEqual(tables.map((table) => f.db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()), before);
+    } finally { f.close(); }
+  });
+
+  it('never touches the Keychain (spy never called)', () => {
+    const f = fixture();
+    const keychain = platformKeychain as KeychainBackend;
+    const original = {
+      get: keychain.get, set: keychain.set, delete: keychain.delete,
+      getSync: keychain.getSync, setSync: keychain.setSync, deleteSync: keychain.deleteSync,
+    };
+    let calls = 0;
+    const keychainSpy = () => { calls += 1; throw new Error('unexpected Keychain access'); };
+    keychain.get = keychainSpy as KeychainBackend['get'];
+    keychain.set = keychainSpy as KeychainBackend['set'];
+    keychain.delete = keychainSpy as KeychainBackend['delete'];
+    keychain.getSync = keychainSpy as KeychainBackend['getSync'];
+    keychain.setSync = keychainSpy as KeychainBackend['setSync'];
+    keychain.deleteSync = keychainSpy as KeychainBackend['deleteSync'];
+    try {
+      slot(f.db, 'user:bare', 'bare');
+      account(f.db, 'bare', 'openai-codex');
+      applyPlan(f.db);
+      assert.equal(calls, 0);
+    } finally {
+      Object.assign(keychain, original);
+      f.close();
+    }
+  });
+
+  it('refuses merge moves before applying them', () => {
+    const f = fixture();
+    try {
+      inTransaction(f.db, () => assert.throws(
+        () => applyCodexRekey(f.db, { moves: [{ from: 'old', to: 'new', kind: 'merge' }], skipped: [] }, { now: 100 }),
+        /rekey-merge-not-supported/,
+      ));
     } finally { f.close(); }
   });
 });

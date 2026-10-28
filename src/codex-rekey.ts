@@ -39,6 +39,16 @@ export interface PlanCodexRekeyOptions {
   prospective?: CodexRekeyProspectiveSlot;
 }
 
+export interface ApplyCodexRekeyOptions {
+  now: number;
+}
+
+type RekeyAuditEntry = {
+  to: string;
+  kind: 'rename' | 'orphan';
+  at: number;
+};
+
 type Candidate = { id: string; kind: 'account' | 'orphan' };
 type Slot = { account_id: string; chatgpt_account_id: string };
 
@@ -211,4 +221,76 @@ export function planCodexRekey(db: DatabaseSync, options: PlanCodexRekeyOptions)
       .sort(([a], [b]) => byteOrder(a, b))
       .map(([id, reason]) => ({ id, reason })),
   };
+}
+
+/** Ensures an orphan destination is visible as an active Codex account. */
+export function ensureCodexSlotAccount(db: DatabaseSync, id: string, ts: number): void {
+  db.prepare(`INSERT INTO accounts (id, provider, label, status, created_at)
+    VALUES (?, 'openai-codex', ?, 'active', ?)
+    ON CONFLICT(id) DO NOTHING`).run(id, id, ts);
+}
+
+function emptyRekeyAudit(): Record<string, RekeyAuditEntry> {
+  return Object.create(null) as Record<string, RekeyAuditEntry>;
+}
+
+function readRekeyAudit(db: DatabaseSync): Record<string, RekeyAuditEntry> {
+  const row = db.prepare('SELECT value FROM config WHERE key = ?').get('codex.rekey.v1') as { value: string } | undefined;
+  if (!row) return emptyRekeyAudit();
+  try {
+    const parsed: unknown = JSON.parse(row.value);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return emptyRekeyAudit();
+    const audit = emptyRekeyAudit();
+    for (const [id, entry] of Object.entries(parsed)) audit[id] = entry as RekeyAuditEntry;
+    return audit;
+  } catch {
+    return emptyRekeyAudit();
+  }
+}
+
+/**
+ * Applies a previously classified plan inside its caller-owned transaction.
+ * Clashes deliberately surface as SQLite constraint errors; S6 owns merging.
+ */
+export function applyCodexRekey(
+  db: DatabaseSync,
+  plan: CodexRekeyPlan,
+  options: ApplyCodexRekeyOptions,
+): void {
+  if (!db.isTransaction) throw new Error('rekey-needs-transaction');
+  if (plan.moves.some((move) => move.kind === 'merge')) {
+    throw new Error('rekey-merge-not-supported');
+  }
+  if (plan.moves.length === 0) return;
+
+  const audit = readRekeyAudit(db);
+  const updateSnapshots = db.prepare('UPDATE snapshots SET account_id = ? WHERE account_id = ?');
+  const updateOverrides = db.prepare('UPDATE overrides SET account_id = ? WHERE account_id = ?');
+  const updatePollClaims = db.prepare('UPDATE poll_claims SET account_id = ? WHERE account_id = ?');
+  const updateUsagePolls = db.prepare(`UPDATE usage_polls SET account_id = ?
+    WHERE provider = 'openai-codex' AND account_id = ?`);
+  const updateLeases = db.prepare('UPDATE leases SET name = ? WHERE name = ?');
+  const renameAccount = db.prepare('UPDATE accounts SET id = ? WHERE id = ?');
+  const updateFailover = db.prepare(`UPDATE config SET value = ?
+    WHERE key = 'failover:openai-codex' AND value = ?`);
+
+  for (const move of plan.moves) {
+    updateSnapshots.run(move.to, move.from);
+    updateOverrides.run(move.to, move.from);
+    updatePollClaims.run(move.to, move.from);
+    updateUsagePolls.run(move.to, move.from);
+    updateLeases.run(refreshLeaseName(move.to), refreshLeaseName(move.from));
+    if (move.kind === 'rename') renameAccount.run(move.to, move.from);
+    if (move.kind === 'orphan') ensureCodexSlotAccount(db, move.to, options.now);
+    updateFailover.run(move.to, move.from);
+    audit[move.from] = {
+      to: move.to,
+      kind: move.kind === 'orphan' ? 'orphan' : 'rename',
+      at: options.now,
+    };
+  }
+
+  db.prepare("DELETE FROM config WHERE key = 'observed:openai-codex'").run();
+  db.prepare(`INSERT INTO config (key, value) VALUES (?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run('codex.rekey.v1', JSON.stringify(audit));
 }
