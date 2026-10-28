@@ -1111,6 +1111,16 @@ export class Migration {
       return this.finishHygiene();
     }
 
+    if (this.kind === 'single-grant') {
+      const account = Array.isArray(current.detail.accounts) ? current.detail.accounts[0] : null;
+      const id = isObjectRecord(account) && typeof account.id === 'string' ? account.id : null;
+      const generation = id ? this.store.getGrantGeneration(id) : null;
+      if (generation === null) throw new Error('single-grant commit has no account generation');
+      // Persist the baseline before the commit rename. A crash after the
+      // rename can therefore never reinterpret a re-staged grant as a refresh.
+      this.journal(current.state, { commitGeneration: generation });
+    }
+
     if (this.kind === 'pool') {
       // The map can have appeared after stage(). Hold the same lock as every
       // v2 writer from the final P7b8 boundary check through the v1 rename.
@@ -1416,6 +1426,25 @@ export class Migration {
         // already gone — rollback is idempotent
       }
     }
+  }
+
+  /**
+   * The journal owns the Pi auth.json key once staging has recorded it. A
+   * rebuilt default migration must therefore use that durable key, while an
+   * explicitly supplied non-default key is an assertion that must agree.
+   */
+  private singleGrantAuthKey(): string {
+    const detail = parseDetail(this.store.getMigration(this.storeName)?.detail_json);
+    const journalKey = typeof detail.authJsonKey === 'string' ? detail.authJsonKey : undefined;
+    if (journalKey) {
+      if (this.authJsonKey && this.authJsonKey !== this.provider && this.authJsonKey !== journalKey) {
+        throw new Error('single-grant rollback auth.json key mismatch');
+      }
+      return journalKey;
+    }
+    const key = this.authJsonKey ?? this.provider;
+    if (!key) throw new Error('single-grant rollback has no auth.json key');
+    return key;
   }
 
   private preCommitRollback(): MigrationStatus {
