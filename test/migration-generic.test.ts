@@ -81,6 +81,16 @@ function expectedLabel(provider: SingleGrantProvider): string {
   return ADAPTER_ACCOUNT_LABELS[provider];
 }
 
+class RollbackDeleteKeychain extends MockKeychain {
+  mode: 'succeed' | 'denied' | 'not-found' = 'succeed';
+
+  override deleteSync(service: string, account: string): void {
+    if (this.mode === 'denied') throw new Error('fixture Keychain access denied');
+    if (this.mode === 'not-found') throw new Error('fixture Keychain item not found');
+    super.deleteSync(service, account);
+  }
+}
+
 function keychainHas(
   kc: MockKeychain,
   provider: SingleGrantProvider,
@@ -121,7 +131,7 @@ interface Harness {
   cleanup: () => void;
 }
 
-function setup(provider: SingleGrantProvider): Harness & {
+function setup(provider: SingleGrantProvider, kc: MockKeychain = new MockKeychain()): Harness & {
   mig: ReturnType<typeof createSingleGrantMigration>;
 } {
   const dir = mkdtempSync(join(tmpdir(), 'qlb-generic-mig-'));
@@ -131,7 +141,6 @@ function setup(provider: SingleGrantProvider): Harness & {
   writeFileSync(authPath, original, { encoding: 'utf8', mode: 0o600 });
   const originalBytes = readFileSync(authPath);
   const store = openStore(join(dir, 'qlb.db'));
-  const kc = new MockKeychain();
   const mig = createSingleGrantMigration(store, kc, provider, authPath, ownerPath);
   return {
     dir,
@@ -975,6 +984,38 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
         xai?: { access?: string };
       };
       assert.equal(parsed.xai?.access, FAKE_GRANTS.xai.access);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('pre-commit rollback keeps a staged migration retryable when its Keychain delete fails', () => {
+    const kc = new RollbackDeleteKeychain();
+    const h = setup('xai', kc);
+    try {
+      h.mig.stage();
+      const staging = stagingOwnerPath(join(h.dir, 'qlb-owner.json'), 'xai');
+      assert.equal(existsSync(staging), true, 'precondition: staging file exists');
+      assert.equal(keychainHas(kc, 'xai'), true, 'precondition: staged Keychain item exists');
+
+      kc.mode = 'denied';
+      assert.throws(
+        () => h.mig.rollback(),
+        /migration rollback failed to delete staged Keychain credential for provider=xai account=Grok \(xAI\)/,
+      );
+      assert.equal(h.store.getMigration('pi-xai')?.state, 'MIRRORED', 'failed delete keeps journal retryable');
+      assert.equal(existsSync(staging), true, 'failed delete keeps staging file');
+      assert.equal(keychainHas(kc, 'xai'), true, 'failed delete keeps staged Keychain item');
+
+      kc.mode = 'succeed';
+      assert.equal(h.mig.rollback().state, 'NATIVE', 'retry succeeds after Keychain recovers');
+      assert.equal(keychainHas(kc, 'xai'), false, 'retry removes staged Keychain item');
+
+      h.mig.stage();
+      kc.deleteSync(qlbKeychainService('xai', expectedId('xai')), expectedLabel('xai'));
+      kc.mode = 'not-found';
+      assert.equal(h.mig.rollback().state, 'NATIVE', 'not-found remains idempotent');
+      assert.equal(existsSync(staging), false, 'not-found cleanup removes staging file');
     } finally {
       h.cleanup();
     }
