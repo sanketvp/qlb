@@ -61,7 +61,7 @@
     {"id":"P5b","start":["P0","P1","P6","C4"],"files":["extensions/qlb-pi/providers/openrouter.ts","src/gate/openrouter.ts","src/usage/openrouter.ts","test/qlb-pi-openrouter.test.ts"]},
     {"id":"P6b","start":["P6"],"files":["claude-config/hooks/lib/secret-exposure-rules.js"]},
     {"id":"P12","start":["A11","R0","R0c","P1"],"files":["src/pi-deploy.ts","src/commands/pi-deploy.ts","src/checks/pi-extension-drift.ts","src/checks/pi-stale-sessions.ts","test/pi-deploy.test.ts"]},
-    {"id":"P13","start":["P6","A5","A13","P4","P5","K3"],"files":["src/single-consume.ts","src/auto/xai.ts","src/auto/kimi-coding.ts","src/gate/xai.ts","src/gate/kimi-coding.ts","test/single-consume.test.ts","test/auto-single.test.ts"]},
+    {"id":"P13","start":["P6","A5","A13","P4","P5"],"files":["src/single-consume.ts","src/oauth/xai-refresh.ts","src/oauth/kimi-coding-refresh.ts","src/auto/xai.ts","src/auto/kimi-coding.ts","src/gate/xai.ts","src/gate/kimi-coding.ts","src/pi-gate.ts","test/single-consume.test.ts","test/auto-single.test.ts"]},
     {"id":"A2c","start":["A2b","A14","K13"],"files":["native/keychain-helper/main.swift","src/commands/keychain.ts","test/keychain-authorize.test.ts"]},
     {"id":"C3b","start":["C3","A13","C5b"],"files":["src/codex-attribution.ts","src/commands/codex-import-active.ts","test/codex-attribution.test.ts","test/external-login.test.ts"]},
     {"id":"K13b","start":["K13","A14"],"files":["src/cswap-agent.ts","src/commands/cutover.ts","test/cswap-agent-drain.test.ts"]},
@@ -78,7 +78,7 @@
     {"id":"P8","start":["P2","P3","P4","P5","P5b"],"files":["test/qlb-pi-fail-closed.test.ts"]},
 
     {"id":"K5","start":["K1","K2","K3","K4","A1b","A2b","A14","K13","R0","R0c"],"files":["src/cc-switch.ts","src/commands/switch-anthropic.ts","test/cc-switch.test.ts","test/cc-switch-locks.test.ts","test/lifecycle-guards.test.ts"]},
-    {"id":"K6","start":["K1","K3","A4d","A13","P0","A14","P13"],"files":["src/cc-resync.ts","src/gate/anthropic.ts","test/cc-resync.test.ts","test/gate-refresh.test.ts","src/cc-slots.ts","test/cc-slots.test.ts"]},
+    {"id":"K6","start":["K1","K3","A4d","A13","P0","A14","P13"],"files":["src/cc-resync.ts","src/gate/anthropic.ts","test/cc-resync.test.ts","test/gate-refresh.test.ts","src/cc-slots.ts","test/cc-slots.test.ts","src/pi-gate.ts","src/commands/gate.ts","test/gate-guard.test.ts"]},
     {"id":"K10","start":["K1","K2","A5","A13","A14","R0","R0c"],"files":["src/cswap-import.ts","src/commands/import-cswap.ts","test/cswap-import.test.ts","test/wiring/commands.d/import cswap"]},
     {"id":"C6","start":["C3","C5b","C3b","A8","C10","K13","A13","R0","R0c"],"files":["src/codex-switch.ts","src/commands/switch-openai-codex.ts","test/codex-switch.test.ts"]},
 

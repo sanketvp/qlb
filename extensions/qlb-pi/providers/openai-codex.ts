@@ -13,6 +13,8 @@ import type { ActiveAccess, ActiveAccessSource } from '../active-access.js';
 export interface GateResult {
   code: number;
   stdout: string;
+  /** A stable gate failure code only; never surface raw stderr to Pi. */
+  stderr?: string;
 }
 
 /** Injectable process boundary for `qlb gate openai-codex --json`. */
@@ -30,9 +32,25 @@ type GatePayload = {
   source?: unknown;
 };
 
-function unavailable(): Error {
-  // Do not expose gate stdout/stderr: either may contain credential material.
-  return new Error('QLB gate openai-codex unavailable');
+class OpenAICodexGateFailure extends Error {
+  constructor(readonly causeCode = 'unknown') {
+    // Do not expose gate stdout/stderr: either may contain credential material.
+    super('QLB gate openai-codex unavailable');
+  }
+}
+
+function unavailable(causeCode = 'unknown'): OpenAICodexGateFailure {
+  return new OpenAICodexGateFailure(causeCode);
+}
+
+function gateCause(stderr: string | undefined): string {
+  const cause = stderr?.trim().replace(/^qlb gate: refused: /, '') ?? '';
+  return /^[a-z][a-z0-9=-]*$/.test(cause) ? cause : 'unknown';
+}
+
+function failureCause(error: unknown): string {
+  if (error instanceof OpenAICodexGateFailure) return error.causeCode;
+  return (error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT' ? 'missing-binary' : 'unknown';
 }
 
 function parseGatePayload(stdout: string): ActiveAccess {
@@ -72,10 +90,10 @@ export function createOpenAICodexSource(deps: OpenAICodexSourceDeps): ActiveAcce
       let result: GateResult;
       try {
         result = await deps.runGate('openai-codex');
-      } catch {
-        throw unavailable();
+      } catch (error) {
+        throw unavailable(failureCause(error));
       }
-      if (result.code !== 0) throw unavailable();
+      if (result.code !== 0) throw unavailable(gateCause(result.stderr));
       return parseGatePayload(result.stdout);
     },
   };
@@ -150,10 +168,11 @@ function runOpenAICodexGate(_provider: 'openai-codex'): Promise<GateResult> {
   const { command, prefix } = findQlbCli();
   return new Promise((resolve) => {
     const child = spawn(command, [...prefix, 'gate', 'openai-codex', '--json'], {
-      stdio: ['ignore', 'pipe', 'ignore'],
+      stdio: ['ignore', 'pipe', 'pipe'],
       env: { ...process.env, QLB_PI_TOKEN_CALL: '1' },
     });
     let stdout = '';
+    let stderr = '';
     let settled = false;
     const finish = (result: GateResult) => {
       if (settled) return;
@@ -163,11 +182,16 @@ function runOpenAICodexGate(_provider: 'openai-codex'): Promise<GateResult> {
     };
     const timeout = setTimeout(() => {
       try { child.kill('SIGTERM'); } catch { /* child already exited */ }
-      finish({ code: 1, stdout: '' });
+      finish({ code: 1, stdout: '', stderr: '' });
     }, 15_000);
     child.stdout?.on('data', (chunk: Buffer) => { stdout += chunk.toString('utf8'); });
-    child.once('error', () => finish({ code: 1, stdout: '' }));
-    child.once('close', (code) => finish({ code: code ?? 1, stdout }));
+    child.stderr?.on('data', (chunk: Buffer) => { stderr += chunk.toString('utf8'); });
+    child.once('error', (error: NodeJS.ErrnoException) => finish({
+      code: 1,
+      stdout: '',
+      stderr: error.code === 'ENOENT' ? 'missing-binary' : '',
+    }));
+    child.once('close', (code) => finish({ code: code ?? 1, stdout, stderr }));
   });
 }
 
@@ -201,8 +225,8 @@ export function registerOpenAICodexProvider(
         for await (const event of builtin(model, context, withQlbAccess(options, access))) {
           output.push(event);
         }
-      } catch {
-        output.push(qlbUnavailable('openai-codex', 'unknown', model));
+      } catch (error) {
+        output.push(qlbUnavailable('openai-codex', failureCause(error), model));
       } finally {
         output.end();
       }
