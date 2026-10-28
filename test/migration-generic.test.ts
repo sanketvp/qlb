@@ -294,13 +294,51 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
             piMigrateJournalDir: journalDir,
           });
 
-          assert.throws(() => migration[command](), /owned-by-pi-migrate: run `qlb pi rollback xai`/);
+          let error: Error & { exitCode?: unknown };
+          try {
+            migration[command]();
+            assert.fail('expected P7a ownership refusal');
+          } catch (caught) {
+            error = caught as Error & { exitCode?: unknown };
+          }
+          assert.match(error.message, /owned-by-pi-migrate: run `qlb pi rollback xai`/);
+          assert.equal(error.exitCode, 3, `${ownershipFact}/${command} is an operator refusal`);
           assert.equal(h.store.getMigration('pi-xai'), null, `${ownershipFact}/${command} leaves no generic journal`);
           assert.equal(existsSync(stagingOwnerPath(join(h.dir, 'qlb-owner.json'), 'xai')), false);
           assert.equal(keychainHas(h.kc, 'xai'), false);
         } finally {
           h.cleanup();
         }
+      }
+    }
+  });
+
+  it('T-S0e every generic entry point refuses a provider both paths own', async () => {
+    for (const command of ['stage', 'commit', 'rollback', 'resume'] as const) {
+      const h = setup('xai');
+      try {
+        h.mig.stage();
+        await h.mig.rehearse(mockRehearse([]));
+        h.mig.commit();
+        h.store.setConfig('pi.xai.state', 'migrated');
+
+        let error: Error & { exitCode?: unknown };
+        try {
+          h.mig[command]();
+          assert.fail('expected dual ownership refusal');
+        } catch (caught) {
+          error = caught as Error & { exitCode?: unknown };
+        }
+        assert.match(
+          error.message,
+          /dual-ownership: run `qlb pi rollback xai` first, then `qlb migrate rollback --provider xai`/,
+        );
+        assert.equal(error.exitCode, 3, `${command} is an operator refusal`);
+        assert.equal(h.store.getMigration('pi-xai')?.state, 'QLB_OWNED');
+        assert.equal(existsSync(h.ownerPath), true, `${command} leaves the generic claim intact`);
+        assert.equal(keychainHas(h.kc, 'xai'), true, `${command} leaves the generic credential intact`);
+      } finally {
+        h.cleanup();
       }
     }
   });
