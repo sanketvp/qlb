@@ -777,26 +777,7 @@ export class Migration {
     const p7aJournal = join(this.piMigrateJournalDir, `pi-migrate-${this.provider}.json`);
     if (p7aState !== 'migrated' && !existsSync(p7aJournal)) return;
 
-    const row = this.store.getMigration(this.storeName);
-    const state = asState(row?.state);
-    const detail = parseDetail(row?.detail_json);
-    const legacySidecar = this.legacySidecarOwned();
-    const customOwner = this.legacySidecarPath() !== this.ownerFilePath
-      && (() => {
-        try {
-          return hasLegacyPiOwnerEntry(this.ownerFilePath, this.ownerProvider());
-        } catch {
-          return false;
-        }
-      })();
-    const claim = this.ownerEntryPresent() || customOwner;
-    const commitGenerationSet = Object.prototype.hasOwnProperty.call(detail, 'commitGeneration');
-    const committed = state === 'QLB_OWNED'
-      || state === 'RETIRED'
-      || (state === 'VALIDATED' && claim && (legacySidecar || commitGenerationSet));
-    const rollbackInProgress = detail.intent === 'rollback'
-      || Object.prototype.hasOwnProperty.call(detail, 'rollbackDecision');
-    const handbackPending = isObjectRecord(detail.handback) && detail.handback.phase === 'cleanup-pending';
+    const { committed, rollbackInProgress, handbackPending } = this.ownershipFacts();
 
     // C1 must precede C2: otherwise a generic command could mistake its own
     // durable ownership evidence for a plain P7a-owned provider.
@@ -810,6 +791,35 @@ export class Migration {
       new Error(`owned-by-pi-migrate: run \`qlb pi rollback ${this.provider}\``),
       { exitCode: 3 },
     );
+  }
+
+  /** Design §2 S0 `Claim` = `O` ∨ `L` ∨ `Oc` (a custom `--owner-file` v1 document naming this provider). */
+  private claimPresent(): boolean {
+    if (this.ownerEntryPresent()) return true;
+    if (this.kind === 'pool' || this.legacySidecarPath() === this.ownerFilePath) return false;
+    try {
+      return hasLegacyPiOwnerEntry(this.ownerFilePath, this.ownerProvider());
+    } catch {
+      return false;
+    }
+  }
+
+  /** Design §2 S0 facts `Gen`, `Rb` and `Hb`, read from this path's own durable evidence. */
+  private ownershipFacts(): { committed: boolean; rollbackInProgress: boolean; handbackPending: boolean } {
+    const row = this.store.getMigration(this.storeName);
+    const state = asState(row?.state);
+    const detail = parseDetail(row?.detail_json);
+    const legacySidecar = this.legacySidecarOwned();
+    const claim = this.claimPresent();
+    const commitGenerationSet = Object.prototype.hasOwnProperty.call(detail, 'commitGeneration');
+    return {
+      committed: state === 'QLB_OWNED'
+        || state === 'RETIRED'
+        || (state === 'VALIDATED' && claim && (legacySidecar || commitGenerationSet)),
+      rollbackInProgress: detail.intent === 'rollback'
+        || Object.prototype.hasOwnProperty.call(detail, 'rollbackDecision'),
+      handbackPending: isObjectRecord(detail.handback) && detail.handback.phase === 'cleanup-pending',
+    };
   }
 
   private ownerProvider(): MigrateProvider {
@@ -1216,7 +1226,16 @@ export class Migration {
 
   private rollbackUnlocked(): MigrationStatus {
     this.assertNotP7aOwned();
-    if (this.ownerEntryPresent() || this.journalState() === 'QLB_OWNED') {
+    const ownerPresent = this.claimPresent();
+    // C5: a VALIDATED journal with this path's own commit evidence (`Gen`) is
+    // a crash after the commit point. Finish the forward journal transition,
+    // then take the ordinary post-commit hand-back path. C4 comes first: a
+    // journaled rollback keeps its intent. The pool path is not classified.
+    if (this.kind !== 'pool' && this.journalState() === 'VALIDATED') {
+      const facts = this.ownershipFacts();
+      if (facts.committed && !facts.rollbackInProgress) this.finishHygiene();
+    }
+    if (ownerPresent || this.journalState() === 'QLB_OWNED') {
       return this.postCommitRollback();
     }
     return this.preCommitRollback();
@@ -1245,12 +1264,12 @@ export class Migration {
     if (intent) {
       return this.continueRollback();
     }
-    if (this.ownerEntryPresent()) {
+    // Any claim, including a custom owner file (Oc), is past C: finish forward.
+    if (this.claimPresent()) {
       return this.finishHygiene();
     }
     if (
       current.state === 'QLB_OWNED' &&
-      !this.ownerEntryPresent() &&
       (this.kind === 'static-key' || existsSync(this.poolFilePath))
     ) {
       return this.finishRollbackJournal();

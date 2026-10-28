@@ -7,6 +7,7 @@ import { describe, it } from 'node:test';
 import { MockKeychain, qlbKeychainService } from '../src/keychain';
 import {
   Migration,
+  PI_POOL_STORE,
   createStaticKeyMigration,
   preQlbPath,
   sidecarPath,
@@ -499,4 +500,26 @@ describe('migration state machine — §4.8.3 / §4.8.3a', () => {
       h.cleanup();
     }
   });
+  it('C5 is not applied to the pool: a crash-commit rollback never journals QLB_OWNED first', async () => {
+    const h = setup();
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      renameSync(stagingOwnerPath(h.ownerPath), h.ownerPath);
+      assert.equal(h.mig.status().state, 'VALIDATED');
+
+      const states: string[] = [];
+      const original = h.store.upsertMigration.bind(h.store);
+      h.store.upsertMigration = (store, state, next) => {
+        if (store === PI_POOL_STORE) states.push(state);
+        return original(store, state, next);
+      };
+      h.mig.rollback();
+      assert.equal(states.includes('QLB_OWNED'), false, 'pool rollback keeps its existing post-commit path');
+      assert.deepEqual(readFileSync(h.poolPath), h.originalBytes);
+    } finally {
+      h.cleanup();
+    }
+  });
+
 });
