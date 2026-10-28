@@ -25,6 +25,12 @@ function credential(tag: string, expiresAt = NOW - 1): string {
   } });
 }
 
+function credentialWithoutExpiry(tag: string): string {
+  return JSON.stringify({ claudeAiOauth: {
+    accessToken: `access-${tag}`, refreshToken: `refresh-${tag}`,
+  } });
+}
+
 interface Fixture {
   dbPath: string;
   store: ReturnType<typeof openStore>;
@@ -228,6 +234,38 @@ describe('Anthropic Pi gate refresh mapping (K6-7)', () => {
     assert.deepEqual(requests, [ANTHROPIC_OAUTH_TOKEN_URL]);
     assert.equal(requests.includes(ANTHROPIC_USAGE_URL), false);
   });
+
+  it('routes a live credential with unknown expiry through refresh instead of serving it live', async () => {
+    const f = await fixture();
+    await f.backend.set(f.live.paths.keychainService, f.live.account, credentialWithoutExpiry('slot'));
+    let posts = 0;
+    const result = await run(f, undefined, {
+      postRefresh: async () => ({
+        status: 200,
+        body: JSON.stringify({ access_token: `access-issued-${++posts}`, refresh_token: 'refresh-issued', expires_in: 3600 }),
+      }),
+    });
+    assert.equal(posts, 1);
+    assert.equal(result.code, 0);
+    assert.equal(JSON.parse(result.stdout[0]!).source, 'refreshed');
+    f.store.close();
+  });
+
+  for (const expiresIn of [30, -5]) {
+    it(`refuses a refreshed credential with expires_in ${expiresIn}`, async () => {
+      const f = await fixture(NOW - 1);
+      const result = await run(f, undefined, {
+        postRefresh: async () => ({
+          status: 200,
+          body: JSON.stringify({ access_token: 'access-issued', refresh_token: 'refresh-issued', expires_in: expiresIn }),
+        }),
+      });
+      assert.equal(result.code, 1);
+      assert.deepEqual(result.stdout, []);
+      assert.deepEqual(result.stderr, ['credential-expiry-unusable']);
+      f.store.close();
+    });
+  }
 
   it('a malformed live blob fails closed with no-credentials', async () => {
     const f = await fixture();

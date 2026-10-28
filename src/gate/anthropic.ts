@@ -102,11 +102,18 @@ function mapRefreshOutcome(
   autoLog: (line: string) => void,
   now: () => number,
 ): GateCredential {
+  const refreshed = (working: string, source: GateCredential['source']): GateCredential => {
+    const credential = served(accountId, working, source);
+    if (credential.expiresAt === undefined || credential.expiresAt - now() <= 60_000) {
+      throw new GateFailure('credential-expiry-unusable');
+    }
+    return credential;
+  };
   switch (outcome.outcome) {
-    case 'posted': return served(accountId, outcome.working, 'refreshed');
-    case 'posted-slot-unwritten': return served(accountId, outcome.working, 'refreshed');
-    case 'restored': return served(accountId, outcome.working, 'restored');
-    case 'adopted': return served(accountId, outcome.working, 'adopted');
+    case 'posted': return refreshed(outcome.working, 'refreshed');
+    case 'posted-slot-unwritten': return refreshed(outcome.working, 'refreshed');
+    case 'restored': return refreshed(outcome.working, 'restored');
+    case 'adopted': return refreshed(outcome.working, 'adopted');
     case 'posted-live-unwritten':
       try { autoLog(`claude:live-write-failed provider=anthropic account=${accountId} at=${now()}`); } catch { /* diagnostics never change fail-closed handling */ }
       throw new GateFailure('token-expired');
@@ -178,7 +185,9 @@ export function createAnthropicGate(deps: AnthropicGateDeps = {}, initialContext
         if (currentActive?.accountId !== active.accountId || !identityMatchesSlot(finalIdentity, slot)) {
           throw new GateRefused('identity-mismatch');
         }
-        if (!isOAuthTokenExpired(parts.expiresAt, now())) return served(active.accountId, live, 'live');
+        if (parts.expiresAt !== undefined && !isOAuthTokenExpired(parts.expiresAt, now())) {
+          return served(active.accountId, live, 'live');
+        }
 
         const outcome = await (deps.refresh ?? refreshActiveLogin)({
           slots: configured.slots,
