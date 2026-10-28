@@ -128,7 +128,7 @@ added the optional `autoswitch.weeklyThreshold` setting and CLI flag.
 | `test_switcher.py::TestProvenanceGuard` | pending |
 | `test_switcher.py::TestSelfSwitchProvenance` | pending |
 | `test_switcher.py::TestDuplicateAccountDetection` | pending |
-| `test_switcher.py::TestLockstepUsageDetection` | pending |
+| `test_switcher.py::TestLockstepUsageDetection` | ported |
 | `test_switcher.py::TestStashAndRetentionStore` | pending |
 | `test_switcher.py::TestActiveRefreshProvenance` | ported |
 | `test_switcher.py::TestDirectActivationPreservation` | pending |

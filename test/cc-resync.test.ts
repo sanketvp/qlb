@@ -1,4 +1,4 @@
-// Ported from claude-swap v0.28.0 (MIT) tests/test_switcher.py:2039-3513,8098-8180
+// Ported from claude-swap v0.28.0 (MIT) tests/test_switcher.py:2039-3513,7857-7946,8098-8180
 import assert from 'node:assert/strict';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -11,6 +11,7 @@ import {
   chooseRefreshInput,
   credentialLineage,
   fetchActiveUsage,
+  lockstepUsageWarnings,
   mapRefreshOutcome,
   preLockAttribution,
   refreshActiveLogin,
@@ -788,6 +789,59 @@ describe('Claude active refresh locked branch (K6-3)', () => {
     const fixture = await refreshFixture();
     const result = await refresh(fixture, { readLiveIdentity: () => ({ accountId: 'account-a', email: 'a@example.test', orgUuid: 'other-org' }) });
     assert.deepEqual(result, { outcome: 'deferred', deferReason: 'identity-mismatch' });
+  });
+});
+
+describe('Lockstep usage warnings (K6-8)', () => {
+  function usage(fiveHourPct: unknown, fiveHourReset: unknown, sevenDayPct: unknown, sevenDayReset: unknown): unknown {
+    return {
+      five_hour: { pct: fiveHourPct, resets_at: fiveHourReset },
+      seven_day: { pct: sevenDayPct, resets_at: sevenDayReset },
+    };
+  }
+
+  const matchingUsage = () => usage(25, '2026-07-10T12:00:00Z', 60, '2026-07-14T00:00:00Z');
+
+  it('identical usage and resets are flagged', () => {
+    const warnings = lockstepUsageWarnings([
+      { accountId: '1', usage: matchingUsage() },
+      { accountId: '2', usage: matchingUsage() },
+    ]);
+    assert.deepEqual(warnings, [
+      'Account-1 and Account-2 report identical usage and reset times — they may be the same account (issue #117). If it persists, log in with the missing account and re-add it: cswap add --slot N',
+    ]);
+  });
+
+  it('differing resets are not flagged', () => {
+    assert.deepEqual(lockstepUsageWarnings([
+      { accountId: '1', usage: matchingUsage() },
+      { accountId: '2', usage: usage(25, '2026-07-10T13:00:00Z', 60, '2026-07-14T00:00:00Z') },
+    ]), []);
+  });
+
+  it('idle accounts without resets are not flagged', () => {
+    assert.deepEqual(lockstepUsageWarnings([
+      { accountId: '1', usage: usage(0, null, 0, null) },
+      { accountId: '2', usage: usage(0, null, 0, null) },
+    ]), []);
+  });
+
+  it('sentinel usage is never compared', () => {
+    assert.deepEqual(lockstepUsageWarnings([
+      { accountId: '1', usage: 'api-key' },
+      { accountId: '2', usage: 'api-key' },
+    ]), []);
+  });
+
+  it('warnings are additive', () => {
+    assert.deepEqual(lockstepUsageWarnings([
+      { accountId: '1', usage: matchingUsage() },
+      { accountId: '2', usage: matchingUsage() },
+      { accountId: '3', usage: matchingUsage() },
+    ]), [
+      'Account-1 and Account-2 report identical usage and reset times — they may be the same account (issue #117). If it persists, log in with the missing account and re-add it: cswap add --slot N',
+      'Account-1 and Account-3 report identical usage and reset times — they may be the same account (issue #117). If it persists, log in with the missing account and re-add it: cswap add --slot N',
+    ]);
   });
 });
 
