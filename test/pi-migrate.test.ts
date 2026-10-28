@@ -219,6 +219,18 @@ describe('Pi migration S58 credential-first barrier', () => {
     }
   });
 
+  it('T-PM2: marks a previously handed-back account row active', () => {
+    const h = setup();
+    try {
+      h.store.upsertAccount('xai-default', 'xai', 'xai', 'handed-back');
+      h.store.setAccountStatus('xai-default', 'handed-back');
+      assert.equal(h.store.getAccount('xai-default')?.status, 'handed-back');
+
+      assert.equal(migratePiSingleProvider('xai', h.paths, { keychain: h.keychain, store: h.store }).state, 'migrated');
+      assert.equal(h.store.getAccount('xai-default')?.status, 'active');
+    } finally { h.cleanup(); }
+  });
+
   it('keeps completed xai and OpenRouter migrations idempotent', () => {
     const xai = setup();
     try {
