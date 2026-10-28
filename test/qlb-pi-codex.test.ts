@@ -4,6 +4,7 @@ import { describe, it } from 'node:test';
 import {
   createOpenAICodexSource,
   openAICodexHeaders,
+  registerOpenAICodexProvider,
   type GateRunner,
 } from '../extensions/qlb-pi/providers/openai-codex';
 
@@ -60,6 +61,68 @@ describe('qlb-pi OpenAI Codex source', () => {
       'ChatGPT-Account-Id': chatgptAccountId,
     });
     assert.notEqual(headers['ChatGPT-Account-Id'], compositeId);
+  });
+
+  it('surfaces each safe gate failure cause once and never invokes transport', async () => {
+    const causes = [
+      'missing-binary',
+      'store-open-failed',
+      'owner-file-malformed',
+      'identity-mismatch',
+      'auth-json-unstable',
+      'refresh-failed',
+      'phase=pre-cutover',
+      'undo-in-progress',
+      'codex-token-expired-renewer-idle',
+    ];
+
+    for (const cause of causes) {
+      let transports = 0;
+      const events: unknown[] = [];
+      let registered: { streamSimple: (model: { id: string }, context: unknown) => unknown } | undefined;
+      registerOpenAICodexProvider({
+        unregisterProvider() {},
+        registerProvider(provider) { registered = provider; },
+      }, () => {
+        transports += 1;
+        return (async function* () {})();
+      }, {
+        createStream: () => ({ push(event: unknown) { events.push(event); }, end() {} }),
+        runGate: async () => cause === 'missing-binary'
+          ? Promise.reject(Object.assign(new Error('not displayed'), { code: 'ENOENT' }))
+          : { code: 1, stdout: '', stderr: cause },
+      });
+
+      registered!.streamSimple({ id: 'gpt-5' }, {});
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(transports, 0, cause);
+      assert.equal(events.length, 1, cause);
+      assert.equal((events[0] as { error: { errorMessage: string } }).error.errorMessage,
+        `QLB unavailable for openai-codex — run qlb doctor (${cause})`);
+    }
+  });
+
+  it('maps an unparseable gate cause to unknown and never invokes transport', async () => {
+    let transports = 0;
+    const events: unknown[] = [];
+    let registered: { streamSimple: (model: { id: string }, context: unknown) => unknown } | undefined;
+    registerOpenAICodexProvider({
+      unregisterProvider() {},
+      registerProvider(provider) { registered = provider; },
+    }, () => {
+      transports += 1;
+      return (async function* () {})();
+    }, {
+      createStream: () => ({ push(event: unknown) { events.push(event); }, end() {} }),
+      runGate: async () => ({ code: 1, stdout: '', stderr: 'raw failure detail must not escape' }),
+    });
+
+    registered!.streamSimple({ id: 'gpt-5' }, {});
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(transports, 0);
+    assert.equal(events.length, 1);
+    assert.equal((events[0] as { error: { errorMessage: string } }).error.errorMessage,
+      'QLB unavailable for openai-codex — run qlb doctor (unknown)');
   });
 
   it('fails closed for a failed, malformed, or incomplete gate result', async () => {
