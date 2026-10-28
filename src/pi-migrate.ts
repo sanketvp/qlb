@@ -7,6 +7,7 @@ import { dirname, join, resolve } from 'node:path';
 import { execFileSync } from 'node:child_process';
 
 import { atomicWriteText } from './fsutil';
+import { ADAPTER_ACCOUNT_IDS } from './migration';
 import { isCredentialNotFound } from './credential-backends';
 import { isNativeOpenRouterKeyNotFound, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, type KeychainBackend } from './keychain';
 import { qlbHomeDir } from './home';
@@ -23,7 +24,7 @@ export interface PiMigratePaths { authJsonPath: string; ownerPath: string; journ
 export interface AuthLockTiming { staleMs?: number; retries?: number; retryMs?: number; }
 export interface PiMigrateDeps {
   keychain: Pick<KeychainBackend, 'getSync' | 'setSync' | 'deleteSync'>;
-  store?: Pick<Store, 'getMigration' | 'getConfig' | 'setConfig' | 'recordLineage' | 'upsertAccount'> & Partial<Pick<Store, 'setAccountStatus'>>;
+  store?: Pick<Store, 'getMigration' | 'getConfig' | 'setConfig' | 'recordLineage' | 'upsertAccount' | 'getAccount' | 'setAccountStatus'>;
   readNativeOpenRouterKey?: () => string;
   withAuthLock?: <T>(path: string, fn: (refresh: () => void) => T) => T;
   authLockTiming?: AuthLockTiming;
@@ -279,8 +280,12 @@ export function migratePiSingleProvider(provider: PiSingleProvider, paths: PiMig
     }
     if (state !== 'migrated') return;
     const managed = deps.keychain.getSync(managedService(provider), QLB_KEYCHAIN_ACCOUNT); const parsed = JSON.parse(managed) as { refresh?: string; access?: string }; const lineage = fingerprint(typeof parsed.refresh === 'string' && parsed.refresh ? parsed.refresh : String(parsed.access ?? ''));
-    refresh(); deps.store?.upsertAccount(`${provider}-default`, provider, provider, 'active');
-    refresh(); deps.store?.setAccountStatus?.(`${provider}-default`, 'active');
+    const store = deps.store;
+    refresh(); store?.upsertAccount(`${provider}-default`, provider, provider, 'active');
+    const sharedAccountId = ADAPTER_ACCOUNT_IDS[provider];
+    if (store && store.getAccount(sharedAccountId)?.status === 'handed-back') {
+      refresh(); store.setAccountStatus(sharedAccountId, 'active');
+    }
     refresh(); deps.store?.recordLineage({ provider, accountId: 'default', toFp: lineage, cause: 'import', by: 'qlb-cli', evidence: 'import' });
     refresh(); deps.store?.setConfig(`single.${provider}.activeId`, 'default');
     refresh(); deps.store?.setConfig(`pi.${provider}.state`, 'migrated');

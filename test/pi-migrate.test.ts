@@ -219,15 +219,47 @@ describe('Pi migration S58 credential-first barrier', () => {
     }
   });
 
-  it('T-PM2: marks a previously handed-back account row active', () => {
+  it('T-PM2: marks only the shared handed-back account row active', () => {
+    for (const { provider, accountId } of [
+      { provider: 'xai' as const, accountId: 'xai-default' },
+      { provider: 'kimi-coding' as const, accountId: 'kimi-default' },
+    ]) {
+      const h = setup(provider);
+      try {
+        h.store.upsertAccount(accountId, provider, provider, 'handed-back');
+        h.store.setAccountStatus(accountId, 'handed-back');
+        assert.equal(h.store.getAccount(accountId)?.status, 'handed-back');
+
+        assert.equal(migratePiSingleProvider(provider, h.paths, { keychain: h.keychain, store: h.store }).state, 'migrated');
+        assert.equal(h.store.getAccount(accountId)?.status, 'active');
+      } finally { h.cleanup(); }
+    }
+  });
+
+  it('keeps auth_revoked on fresh and idempotent already-migrated runs', () => {
+    for (const alreadyMigrated of [false, true]) {
+      const h = setup();
+      try {
+        if (alreadyMigrated) {
+          migratePiSingleProvider('xai', h.paths, { keychain: h.keychain, store: h.store });
+        }
+        h.store.upsertAccount('xai-default', 'xai', 'xai', 'auth_revoked');
+        h.store.setAccountStatus('xai-default', 'auth_revoked');
+
+        assert.equal(migratePiSingleProvider('xai', h.paths, { keychain: h.keychain, store: h.store }).state, 'migrated');
+        assert.equal(h.store.getAccount('xai-default')?.status, 'auth_revoked');
+      } finally { h.cleanup(); }
+    }
+  });
+
+  it('keeps validated account rows validated', () => {
     const h = setup();
     try {
-      h.store.upsertAccount('xai-default', 'xai', 'xai', 'handed-back');
-      h.store.setAccountStatus('xai-default', 'handed-back');
-      assert.equal(h.store.getAccount('xai-default')?.status, 'handed-back');
+      h.store.upsertAccount('xai-default', 'xai', 'xai', 'validated');
+      h.store.setAccountStatus('xai-default', 'validated');
 
       assert.equal(migratePiSingleProvider('xai', h.paths, { keychain: h.keychain, store: h.store }).state, 'migrated');
-      assert.equal(h.store.getAccount('xai-default')?.status, 'active');
+      assert.equal(h.store.getAccount('xai-default')?.status, 'validated');
     } finally { h.cleanup(); }
   });
 
@@ -519,7 +551,7 @@ describe('Pi migration S58 credential-first barrier', () => {
       const missing = migratePiSingleProvider('openrouter', h.paths, { keychain: h.keychain, readNativeOpenRouterKey: () => { throw new NativeOpenRouterKeyNotFoundError('pi-openrouter'); } });
       assert.equal(missing.state, 'not-applicable');
       let writes = 0;
-      assert.throws(() => migratePiSingleProvider('openrouter', h.paths, { keychain: h.keychain, store: { getMigration() { return null; }, getConfig() { return null; }, setConfig() { writes += 1; }, recordLineage() { return 0; }, upsertAccount() {} }, readNativeOpenRouterKey: () => { throw Object.assign(new Error('denied'), { code: 'EACCES' }); } }), /denied/);
+      assert.throws(() => migratePiSingleProvider('openrouter', h.paths, { keychain: h.keychain, store: { getMigration() { return null; }, getConfig() { return null; }, setConfig() { writes += 1; }, recordLineage() { return 0; }, upsertAccount() {}, getAccount() { return null; }, setAccountStatus() {} }, readNativeOpenRouterKey: () => { throw Object.assign(new Error('denied'), { code: 'EACCES' }); } }), /denied/);
       assert.equal(writes, 0);
     } finally { h.cleanup(); }
   });
@@ -528,7 +560,7 @@ describe('Pi migration S58 credential-first barrier', () => {
     const h = setup();
     try {
       const config = new Map<string, string>();
-      const store = { getMigration() { return null; }, getConfig(key: string) { return config.get(key) ?? null; }, setConfig(key: string, value: string) { config.set(key, value); }, recordLineage() { return 0; }, upsertAccount() {} };
+      const store = { getMigration() { return null; }, getConfig(key: string) { return config.get(key) ?? null; }, setConfig(key: string, value: string) { config.set(key, value); }, recordLineage() { return 0; }, upsertAccount() {}, getAccount() { return null; }, setAccountStatus() {} };
       const missingExec: ExecFileSyncFn = markFakeExecutor((() => {
         throw { message: 'Command failed: /usr/bin/security find-generic-password -s pi-openrouter -w', status: 44, stderr: null };
       }) as ExecFileSyncFn);
@@ -679,7 +711,7 @@ describe('Pi migration S58 credential-first barrier', () => {
     const h = setup();
     try {
       const config = new Map<string, string>();
-      const store = { getMigration() { return null; }, getConfig(key: string) { return config.get(key) ?? null; }, setConfig(key: string, value: string) { config.set(key, value); }, recordLineage() { return 0; }, upsertAccount() {} };
+      const store = { getMigration() { return null; }, getConfig(key: string) { return config.get(key) ?? null; }, setConfig(key: string, value: string) { config.set(key, value); }, recordLineage() { return 0; }, upsertAccount() {}, getAccount() { return null; }, setAccountStatus() {} };
       migratePiSingleProvider('xai', h.paths, {
         keychain: h.keychain,
         store,
@@ -724,7 +756,7 @@ describe('Pi migration S58 credential-first barrier', () => {
     const h = setup();
     try {
       const config = new Map<string, string>();
-      const store = { getMigration() { return null; }, getConfig(key: string) { return config.get(key) ?? null; }, setConfig(key: string, value: string) { config.set(key, value); }, recordLineage() { return 0; }, upsertAccount() {} };
+      const store = { getMigration() { return null; }, getConfig(key: string) { return config.get(key) ?? null; }, setConfig(key: string, value: string) { config.set(key, value); }, recordLineage() { return 0; }, upsertAccount() {}, getAccount() { return null; }, setAccountStatus() {} };
       migratePiSingleProvider('xai', h.paths, { keychain: h.keychain, store });
       const journal = join(h.paths.journalPath, 'pi-migrate-xai.json');
       mkdirSync(h.paths.journalPath, { recursive: true });
