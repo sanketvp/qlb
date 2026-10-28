@@ -183,6 +183,7 @@ function baselineValue(provider: PiSingleProvider, auth: JsonObject, deps: PiMig
 }
 function keychainPayload(provider: PiSingleProvider, baseline: unknown): string { if (provider === 'openrouter') { const value = asObject(baseline, 'openrouter credential is invalid'); if (typeof value.access !== 'string' || !value.access) throw new Error('openrouter credential is invalid'); return JSON.stringify({ type: 'api-key', access: value.access }); } return JSON.stringify(parseOAuth(baseline, provider)); }
 function managedValue(provider: PiSingleProvider, deps: PiMigrateDeps): unknown | undefined { try { return JSON.parse(deps.keychain.getSync(managedService(provider), QLB_KEYCHAIN_ACCOUNT)); } catch { return undefined; } }
+function usableManaged(provider: PiSingleProvider, deps: PiMigrateDeps): boolean { const managed = managedValue(provider, deps); if (managed === undefined) return false; try { keychainPayload(provider, managed); return true; } catch { return false; } }
 
 /** S0.6: generic ownership must be quiescent before P7a may begin. */
 function genericMigrationAtRest(provider: PiSingleProvider, paths: PiMigratePaths, deps: PiMigrateDeps, ownJournal: Journal | null): boolean {
@@ -255,9 +256,10 @@ export function migratePiSingleProvider(provider: PiSingleProvider, paths: PiMig
       // Install and verify the managed item on every resume before publication,
       // including 'publishing': the item may have been lost or changed in the crash window.
       // A 'publishing' journal whose owner entry is already visible was published:
-      // the managed item may have been refreshed since, so it is never overwritten.
-      const ownerVisible = journal.phase === 'publishing' && isPiQlbOwnerEntry(currentOwner[provider]);
-      if (!phaseAtLeast(journal.phase, 'published') && !ownerVisible) {
+      // a valid managed item may have been refreshed since, so it is never overwritten.
+      // A missing or invalid one is reinstalled from the baseline like any other resume.
+      const publishedItemKept = journal.phase === 'publishing' && isPiQlbOwnerEntry(currentOwner[provider]) && usableManaged(provider, deps);
+      if (!phaseAtLeast(journal.phase, 'published') && !publishedItemKept) {
         let source: unknown = provider === 'openrouter' ? baseline : (isPiPlaceholder(auth[provider]) || auth[provider] === undefined ? baseline : auth[provider]);
         if (provider !== 'openrouter' && source !== baseline) { try { keychainPayload(provider, source); } catch { source = baseline; } }
         const payload = keychainPayload(provider, source);

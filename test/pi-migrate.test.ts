@@ -321,6 +321,26 @@ describe('Pi migration S58 credential-first barrier', () => {
     } finally { h.cleanup(); }
   });
 
+  for (const damage of ['lost', 'corrupt'] as const) {
+    it(`xai: a publishing resume with the owner entry visible reinstalls a ${damage} managed item from the baseline`, () => {
+      const h = setup();
+      try {
+        assert.throws(() => migratePiSingleProvider('xai', h.paths, {
+          keychain: h.keychain,
+          store: h.store,
+          afterWrite: (point: string) => { if (point === 'owner-entry') throw new Error('injected crash'); },
+        }), /injected crash/);
+        const service = qlbKeychainService('xai', 'default');
+        if (damage === 'lost') h.keychain.deleteSync(service, QLB_KEYCHAIN_ACCOUNT);
+        else h.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, 'not-json');
+        assert.equal(migratePiSingleProvider('xai', h.paths, { keychain: h.keychain, store: h.store }).state, 'migrated');
+        const after = JSON.parse(h.keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT)) as { refresh?: string };
+        assert.equal(after.refresh, 'refresh-native', 'the baseline was reinstalled');
+        assert.equal(existsSync(join(h.paths.journalPath, 'pi-migrate-xai.json')), false, 'the migration committed');
+      } finally { h.cleanup(); }
+    });
+  }
+
   it('refuses a placeholder auth entry with no journal before writing anything', () => {
     const h = setup();
     try {
