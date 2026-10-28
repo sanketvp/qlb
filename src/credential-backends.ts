@@ -160,7 +160,7 @@ export function isCredentialNotFound(err: unknown): boolean {
     seen.add(current);
     const { status, message, cause } = current as { status?: unknown; message?: unknown; cause?: unknown };
     if (status === 44) return true;
-    if (typeof message === 'string' && (/could not be found/i.test(message) || /item not found\s*$/i.test(message))) return true;
+    if (typeof message === 'string' && (/\bitem could not be found\b/i.test(message) || /item not found\s*$/i.test(message))) return true;
     current = cause;
   }
   return false;
