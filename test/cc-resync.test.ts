@@ -14,6 +14,7 @@ import {
   mapRefreshOutcome,
   preLockAttribution,
   refreshActiveLogin,
+  resyncRotatedBackup,
   resolveCswapCheck,
   type FetchActiveUsageDeps,
   type RefreshActiveLoginDeps,
@@ -21,8 +22,9 @@ import {
 } from '../src/cc-resync';
 import { InMemoryCredentialBackend } from '../src/cc-credentials';
 import { claudePaths } from '../src/cc-paths';
-import { ClaudeSlots, InMemoryClaudeSlotRepository } from '../src/cc-slots';
+import { ClaudeSlots, SqliteClaudeSlotRepository } from '../src/cc-slots';
 import { openStore } from '../src/store';
+import { listReloginEvents } from '../src/relogin';
 
 const NOW = 1_700_000_000_000;
 
@@ -84,11 +86,11 @@ async function refreshFixture(): Promise<RefreshFixture> {
   const backend = new InMemoryCredentialBackend();
   const paths = claudePaths({ home, env });
   const liveOptions = { backend, paths, account: 'fixture-user', home, env };
-  const repository = new InMemoryClaudeSlotRepository();
-  const slots = new ClaudeSlots({ backend, repository, stashDir: join(home, 'unclaimed'), now: () => NOW });
   const store = openStore(join(home, 'state.sqlite'));
+  const repository = SqliteClaudeSlotRepository.open(store.dbPath);
+  const slots = new ClaudeSlots({ backend, repository, stashDir: join(home, 'unclaimed'), now: () => NOW });
   const initial = credential('slot');
-  await slots.createSlot({ accountId: 'account-a', credential: initial, source: 'cswap-import' });
+  await slots.createSlot({ accountId: 'account-a', credential: initial, email: 'a@example.test', orgUuid: 'org-a', source: 'cswap-import' });
   await backend.set(paths.keychainService, 'fixture-user', initial);
   let postCount = 0;
   const deps: Omit<RefreshActiveLoginDeps, 'postRefresh'> = {
@@ -785,5 +787,120 @@ describe('Claude active refresh locked branch (K6-3)', () => {
     const fixture = await refreshFixture();
     const result = await refresh(fixture, { readLiveIdentity: () => ({ accountId: 'account-a', email: 'a@example.test', orgUuid: 'other-org' }) });
     assert.deepEqual(result, { outcome: 'deferred', deferReason: 'identity-mismatch' });
+  });
+});
+
+describe('Claude rotated backup resync (K6-5)', () => {
+  async function fixture() {
+    const value = await refreshFixture();
+    const run = async (served: string, overrides: Record<string, unknown> = {}, holderObservation?: { aliveBefore: boolean; aliveAfter: boolean }) => resyncRotatedBackup({
+      slots: value.slots, store: value.store, live: value.liveOptions, env: value.liveOptions.env,
+      verdicts: new ProbeVerdictMemo(), now: () => NOW,
+      readLiveIdentity: () => ({ accountId: 'account-a', email: 'a@example.test', orgUuid: 'org-a' }),
+      getProfile: async () => ({ status: 200, body: JSON.stringify({ account: { uuid: 'account-a', email: 'a@example.test' }, organization: { uuid: 'org-a' } }) }),
+      withSwitchLock: async <T>(fn: () => Promise<T>) => fn(),
+      withCredentialLocks: async <T>(fn: (held: never) => Promise<T>) => fn({} as never),
+      ...overrides,
+    }, { accountId: 'account-a', email: 'a@example.test', orgUuid: 'org-a', creds: served,
+      slot: await value.slots.readSlot('account-a', { fresh: true }), holderObservation });
+    return { ...value, run };
+  }
+
+  it('a fresh fetch resyncs the slot after an external rotation attributed by the oracle', async () => {
+    const f = await fixture(); const served = credential('external', NOW + 60 * 60_000);
+    await f.backend.set(f.liveOptions.paths.keychainService, 'fixture-user', served);
+    await f.run(served);
+    assert.equal((await f.slots.readSlot('account-a')).fingerprint, credentialLineage(served));
+    assert.deepEqual({ ...f.store.listLineageTransitions('anthropic', 'account-a').at(-1) }, { from_fp: credentialLineage(credential('slot')), to_fp: credentialLineage(served) });
+  });
+
+  it('same lineage skips the resync', async () => {
+    const f = await fixture(); let profiles = 0;
+    await f.run(credential('slot'), { getProfile: async () => { profiles += 1; return { status: 500, body: '' }; } });
+    assert.equal(profiles, 0);
+  });
+
+  it('a durable post edge skips the probe and resyncs without network', async () => {
+    const f = await fixture(); const served = credential('post-successor', NOW + 60 * 60_000);
+    f.store.recordLineage({ provider: 'anthropic', accountId: 'account-a', fromFp: credentialLineage(credential('slot')), toFp: credentialLineage(served)!,  cause: 'post', by: 'qlb-cli', evidence: 'post' });
+    await f.backend.set(f.liveOptions.paths.keychainService, 'fixture-user', served);
+    let profiles = 0; await f.run(served, { getProfile: async () => { profiles += 1; throw new Error('must not probe'); } });
+    assert.equal(profiles, 0); assert.equal((await f.slots.readSlot('account-a')).fingerprint, credentialLineage(served));
+  });
+
+  it('a foreign probe mismatch skips the resync, warns once and caches the verdict', async () => {
+    const f = await fixture(); const served = credential('foreign', NOW + 60 * 60_000); const verdicts = new ProbeVerdictMemo(); const warnings: string[] = [];
+    await f.backend.set(f.liveOptions.paths.keychainService, 'fixture-user', served);
+    const deps = { verdicts, warn: (line: string) => warnings.push(line), getProfile: async () => ({ status: 200, body: JSON.stringify({ account: { uuid: 'other' } }) }) };
+    await f.run(served, deps); await f.run(served, deps);
+    assert.equal(verdicts.get('account-a', 'a@example.test', credentialLineage(served)!)?.match, false); assert.equal(warnings.length, 1);
+  });
+
+  it('a profile without a uuid is unverifiable and never cached', async () => {
+    const f = await fixture(); const served = credential('partial', NOW + 60 * 60_000); const verdicts = new ProbeVerdictMemo();
+    await f.backend.set(f.liveOptions.paths.keychainService, 'fixture-user', served);
+    await f.run(served, { verdicts, getProfile: async () => ({ status: 200, body: JSON.stringify({ account: { email: 'a@example.test' } }) }) });
+    assert.equal(verdicts.get('account-a', 'a@example.test', credentialLineage(served)!), undefined);
+  });
+
+  it('a normal Claude Code rotation with no holder observation records 0 relogin rows', async () => {
+    const f = await fixture(); const served = credential('normal', NOW + 60 * 60_000);
+    await f.backend.set(f.liveOptions.paths.keychainService, 'fixture-user', served); await f.run(served);
+    assert.equal(listReloginEvents(f.store.dbPath).length, 0);
+  });
+
+  it('a login-expiry jump with L41 verified and a holder alive records one hard row', async () => {
+    const f = await fixture(); const previous = JSON.stringify({ claudeAiOauth: { accessToken: 'access-before', refreshToken: 'refresh-before', expiresAt: NOW - 1, refreshTokenExpiresAt: NOW + 1_000_000 } }); const served = JSON.stringify({ claudeAiOauth: { accessToken: 'access-hard', refreshToken: 'refresh-hard', expiresAt: NOW + 60 * 60_000, refreshTokenExpiresAt: NOW + 2_000_000 } });
+    await f.slots.writeSlot('account-a', previous, { cause: 'post', by: 'qlb-cli', evidence: 'post' });
+    await f.backend.set(f.liveOptions.paths.keychainService, 'fixture-user', served); await f.run(served, { l41Verified: true }, { aliveBefore: true, aliveAfter: false });
+    assert.deepEqual(listReloginEvents(f.store.dbPath).map(({ kind, evidence }) => ({ kind, evidence })), [{ kind: 'external-login', evidence: 'login-expiry-jump' }]);
+  });
+
+  it('a non-successor rotation observed with no holder at either point records one soft row', async () => {
+    const f = await fixture(); const served = credential('soft', NOW + 60 * 60_000);
+    await f.backend.set(f.liveOptions.paths.keychainService, 'fixture-user', served); await f.run(served, {}, { aliveBefore: false, aliveAfter: false });
+    assert.deepEqual(listReloginEvents(f.store.dbPath).map((row) => row.evidence), ['unattributed-rotation']);
+  });
+
+  it('a probe failure skips the resync and retries next pass', async () => {
+    const f = await fixture(); const served = credential('retry', NOW + 60 * 60_000); let probes = 0;
+    await f.backend.set(f.liveOptions.paths.keychainService, 'fixture-user', served);
+    const deps = { getProfile: async () => { probes += 1; if (probes === 1) throw new Error('fixture'); return { status: 200, body: JSON.stringify({ account: { uuid: 'account-a' } }) }; } };
+    await f.run(served, deps); await f.run(served, deps);
+    assert.equal(probes, 2); assert.equal((await f.slots.readSlot('account-a')).fingerprint, credentialLineage(served));
+  });
+
+  it('the lineage key binds the stored email too', async () => {
+    const f = await fixture(); const served = credential('email-bound', NOW + 60 * 60_000); const verdicts = new ProbeVerdictMemo();
+    verdicts.set('account-a', 'other@example.test', credentialLineage(served)!, { match: false, source: 'oracle' });
+    await f.backend.set(f.liveOptions.paths.keychainService, 'fixture-user', served); await f.run(served, { verdicts });
+    assert.equal((await f.slots.readSlot('account-a')).fingerprint, credentialLineage(served));
+  });
+
+  it('a verdict does not survive a slot identity change', async () => {
+    const f = await fixture(); const served = credential('identity-change', NOW + 60 * 60_000);
+    await f.backend.set(f.liveOptions.paths.keychainService, 'fixture-user', served);
+    await f.run(served, { readLiveIdentity: () => ({ accountId: 'account-a', email: 'other@example.test', orgUuid: 'org-a' }) });
+    assert.equal((await f.slots.readSlot('account-a')).fingerprint, credentialLineage(credential('slot')));
+  });
+
+  it('a memo-attributed live POST whose slot write failed records 0 relogin rows after a restart', async () => {
+    const f = await fixture(); const served = credential('post-edge', NOW + 60 * 60_000);
+    f.store.recordLineage({ provider: 'anthropic', accountId: 'account-a', fromFp: credentialLineage(credential('slot')), toFp: credentialLineage(served)!, cause: 'post', by: 'qlb-cli', evidence: 'post' });
+    await f.backend.set(f.liveOptions.paths.keychainService, 'fixture-user', served); await f.run(served, { verdicts: new ProbeVerdictMemo() });
+    assert.equal(listReloginEvents(f.store.dbPath).length, 0);
+  });
+
+  it('a non-successor rotation with a holder alive records none', async () => {
+    const f = await fixture(); const served = credential('holder', NOW + 60 * 60_000);
+    await f.backend.set(f.liveOptions.paths.keychainService, 'fixture-user', served); await f.run(served, {}, { aliveBefore: true, aliveAfter: false });
+    assert.equal(listReloginEvents(f.store.dbPath).length, 0);
+  });
+
+  it('L41 unverified writes no hard row', async () => {
+    const f = await fixture(); const previous = JSON.stringify({ claudeAiOauth: { accessToken: 'access-before', refreshToken: 'refresh-before', expiresAt: NOW - 1, refreshTokenExpiresAt: NOW + 1_000_000 } }); const served = JSON.stringify({ claudeAiOauth: { accessToken: 'access-l41', refreshToken: 'refresh-l41', expiresAt: NOW + 60 * 60_000, refreshTokenExpiresAt: NOW + 2_000_000 } });
+    await f.slots.writeSlot('account-a', previous, { cause: 'post', by: 'qlb-cli', evidence: 'post' }); await f.backend.set(f.liveOptions.paths.keychainService, 'fixture-user', served);
+    await f.run(served, { l41Verified: false }, { aliveBefore: true, aliveAfter: false });
+    assert.equal(listReloginEvents(f.store.dbPath).length, 0);
   });
 });
