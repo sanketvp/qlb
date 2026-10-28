@@ -814,10 +814,11 @@ export class Migration {
     const legacySidecar = this.legacySidecarOwned();
     const claim = this.claimPresent();
     const commitGenerationSet = Object.prototype.hasOwnProperty.call(detail, 'commitGeneration');
+    const commitStartedSet = Object.prototype.hasOwnProperty.call(detail, 'commitStarted');
     return {
       committed: state === 'QLB_OWNED'
         || state === 'RETIRED'
-        || (state === 'VALIDATED' && claim && (legacySidecar || commitGenerationSet)),
+        || (state === 'VALIDATED' && claim && (legacySidecar || commitGenerationSet || commitStartedSet)),
       rollbackInProgress: detail.intent === 'rollback'
         || Object.prototype.hasOwnProperty.call(detail, 'rollbackDecision'),
       handbackPending: isObjectRecord(detail.handback) && detail.handback.phase === 'cleanup-pending',
@@ -1194,7 +1195,12 @@ export class Migration {
     }
 
     if (this.kind === 'static-key') {
-      this.withOwnerMapLock(() => writePiOwnerEntry(this.ownerMapPath, this.ownerProvider(), true));
+      this.withOwnerMapLock(() => {
+        // Write-ahead journal: a crash after O can still be classified as this
+        // path's commit rather than P7a-only ownership.
+        this.journal(current.state, { commitStarted: true });
+        writePiOwnerEntry(this.ownerMapPath, this.ownerProvider(), true);
+      });
       unlinkIfExists(staging);
       return this.finishHygiene();
     }
@@ -1349,6 +1355,7 @@ export class Migration {
       nativeStrategy: 'keychain-retain',
       nativeKeychainService: NATIVE_OPENROUTER_KEYCHAIN_SERVICE,
       provider: this.provider,
+      commitStarted: undefined,
     });
 
     this.keychain.setSync(service, account, JSON.stringify(payload));
@@ -1421,6 +1428,7 @@ export class Migration {
       authJsonKey: keyName,
       provider: this.provider,
       commitGeneration: undefined,
+      commitStarted: undefined,
       rollbackDecision: undefined,
       handback: undefined,
       lastRollback: undefined,
@@ -1639,6 +1647,8 @@ export class Migration {
     }
     this.journal('VALIDATED', {
       intent: undefined,
+      commitGeneration: undefined,
+      commitStarted: undefined,
       rolledBackAt: Date.now(),
       rolledBackFrom: 'post-commit',
     });

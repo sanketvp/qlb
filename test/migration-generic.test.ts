@@ -961,6 +961,100 @@ describe('static-key migration — openrouter (single API key, no OAuth)', () =>
     }
   });
 
+  it('T-S0e recognizes an OpenRouter crash-commit as dual ownership, finishes it without P7a, and clears commitStarted on re-stage and hand-back', async () => {
+    for (const command of ['stage', 'commit', 'rollback', 'resume'] as const) {
+      const h = setupOpenRouter();
+      try {
+        h.mig.stage();
+        await h.mig.rehearse(mockOpenRouterRehearse([]));
+        const row = h.store.getMigration('pi-openrouter');
+        assert.ok(row, 'stage recorded the OpenRouter migration');
+        h.store.upsertMigration('pi-openrouter', 'VALIDATED', JSON.stringify({
+          ...JSON.parse(row.detail_json),
+          commitStarted: true,
+        }));
+        writeFileSync(h.ownerPath, JSON.stringify({
+          providers: { openrouter: { mode: 'qlb' } },
+        }) + '\n');
+        h.store.setConfig('pi.openrouter.state', 'migrated');
+        const before = h.store.getMigration('pi-openrouter')!;
+        const ownerBefore = readFileSync(h.ownerPath);
+        const credentialBefore = h.kc.getSync(OPENROUTER_GATE_KEYCHAIN_SERVICE, QLB_KEYCHAIN_ACCOUNT);
+
+        assert.throws(
+          () => h.mig[command](),
+          (error: Error & { exitCode?: unknown }) => {
+            assert.match(error.message, /dual-ownership: run `qlb pi rollback openrouter` first, then `qlb migrate rollback --provider openrouter`/);
+            assert.equal(error.exitCode, 3);
+            return true;
+          },
+        );
+        assert.deepEqual(h.store.getMigration('pi-openrouter'), before, `${command} leaves the crash journal unchanged`);
+        assert.deepEqual(readFileSync(h.ownerPath), ownerBefore, `${command} leaves O unchanged`);
+        assert.equal(h.kc.getSync(OPENROUTER_GATE_KEYCHAIN_SERVICE, QLB_KEYCHAIN_ACCOUNT), credentialBefore, `${command} leaves the managed key unchanged`);
+      } finally {
+        h.cleanup();
+      }
+    }
+
+    for (const command of ['resume', 'commit'] as const) {
+      const h = setupOpenRouter();
+      try {
+        h.mig.stage();
+        await h.mig.rehearse(mockOpenRouterRehearse([]));
+        const row = h.store.getMigration('pi-openrouter');
+        assert.ok(row);
+        h.store.upsertMigration('pi-openrouter', 'VALIDATED', JSON.stringify({
+          ...JSON.parse(row.detail_json),
+          commitStarted: true,
+        }));
+        writeFileSync(h.ownerPath, JSON.stringify({
+          providers: { openrouter: { mode: 'qlb' } },
+        }) + '\n');
+
+        const completed = h.mig[command]();
+        assert.equal(completed.state, 'QLB_OWNED', `${command} completes C5 without P7a ownership`);
+      } finally {
+        h.cleanup();
+      }
+    }
+
+    const h = setupOpenRouter();
+    try {
+      h.mig.stage();
+      const staged = h.store.getMigration('pi-openrouter')!;
+      h.store.upsertMigration('pi-openrouter', 'MIRRORED', JSON.stringify({
+        ...JSON.parse(staged.detail_json),
+        commitStarted: true,
+      }));
+      h.mig.stage();
+      assert.equal(JSON.parse(h.store.getMigration('pi-openrouter')!.detail_json).commitStarted, undefined, 're-stage clears commitStarted');
+
+      await h.mig.rehearse(mockOpenRouterRehearse([]));
+      const originalUpsertMigration = h.store.upsertMigration.bind(h.store);
+      let journaledBeforeOwner = false;
+      h.store.upsertMigration = (store, state, detail) => {
+        const recorded = JSON.parse(detail ?? '{}') as { commitStarted?: boolean };
+        if (store === 'pi-openrouter' && state === 'VALIDATED' && recorded.commitStarted === true) {
+          assert.equal(existsSync(`${join(h.dir, 'auth.json')}.lock`), true, 'commitStarted is journaled while the owner-map lock is held');
+          assert.equal(existsSync(h.ownerPath), false, 'commitStarted is journaled before O exists');
+          journaledBeforeOwner = true;
+        }
+        return originalUpsertMigration(store, state, detail);
+      };
+
+      h.mig.commit();
+
+      assert.equal(journaledBeforeOwner, true, 'normal OpenRouter commit journals before writing O');
+      assert.equal(JSON.parse(h.store.getMigration('pi-openrouter')!.detail_json).commitStarted, true);
+      const rolled = h.mig.rollback();
+      assert.equal(rolled.state, 'VALIDATED');
+      assert.equal(rolled.detail.commitStarted, undefined, 'hand-back terminal write clears commitStarted');
+    } finally {
+      h.cleanup();
+    }
+  });
+
   it('openrouter commit refuses into a legacy v1 Anthropic owner document, leaving staging, Keychain and the document byte-identical', async () => {
     const h = setupOpenRouter();
     try {
