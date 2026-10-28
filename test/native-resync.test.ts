@@ -678,6 +678,39 @@ describe('bindDetectAndResync + MockKeychain', () => {
     store.close();
   });
 
+  it('a Codex resync never writes under the slot account name', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-resync-codex-slot-account-'));
+    temps.push(dir);
+    const store = openStore(join(dir, 'qlb.db'));
+    const kc = new MockKeychain();
+    const id = 'u1:a1';
+    const service = qlbKeychainService('openai-codex', id);
+    const access = jwt({
+      'https://api.openai.com/auth': { chatgpt_user_id: 'u1', chatgpt_account_id: 'a1' },
+    });
+    const slot: CodexAuthDocument = {
+      tokens: { id_token: 'slot-id', access_token: 'slot-access', refresh_token: 'slot-refresh', account_id: 'a1' },
+    };
+    const slotSerialized = JSON.stringify(slot);
+    kc.setSync(service, QLB_KEYCHAIN_ACCOUNT, slotSerialized);
+    store.upsertAccount(id, 'openai-codex', QLB_KEYCHAIN_ACCOUNT);
+    store.upsertMigration('pi-openai-codex', 'QLB_OWNED');
+    const keychainBefore = [...(kc as unknown as { items: Map<string, string> }).items.entries()];
+    const generationBefore = store.getGrantGeneration(id);
+
+    const result = await bindDetectAndResync({
+      store,
+      keychain: kc,
+      readNativeCredential: async () => grant(access),
+    })(id, 'openai-codex');
+
+    assert.equal(result.resynced, false);
+    assert.match(result.reason, /refusing to write a Codex resync credential under the slot account name/);
+    assert.deepEqual([...(kc as unknown as { items: Map<string, string> }).items.entries()], keychainBefore);
+    assert.equal(store.getGrantGeneration(id), generationBefore);
+    store.close();
+  });
+
   it('slot-id resync never touches the slot document', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'qlb-resync-codex-slot-owned-'));
     temps.push(dir);
