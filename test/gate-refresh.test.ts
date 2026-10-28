@@ -8,6 +8,7 @@ import { describe, it } from 'node:test';
 
 import defaultAnthropicGate, { createAnthropicGate, sendRefresh, type AnthropicGateDeps } from '../src/gate/anthropic';
 import { InMemoryCredentialBackend } from '../src/cc-credentials';
+import { ClaudeCodeLockTimeout } from '../src/cc-locks';
 import { claudePaths } from '../src/cc-paths';
 import { ClaudeSlots, SqliteClaudeSlotRepository } from '../src/cc-slots';
 import { ANTHROPIC_OAUTH_TOKEN_URL, ANTHROPIC_USAGE_URL } from '../src/anthropic-oauth';
@@ -392,9 +393,18 @@ describe('Anthropic Pi gate refresh mapping (K6-7)', () => {
 
   it('a slot write failure with a good live write serves the new token as refreshed', async () => {
     const f = await fixture(NOW - 1);
-    const result = await run(f, { outcome: 'posted-slot-unwritten', working: credential('issued', NOW + 60 * 60_000) });
+    let posts = 0;
+    f.slots.writeSlot = async () => { throw new Error('slot write failed'); };
+    const result = await run(f, undefined, {
+      postRefresh: async () => {
+        posts += 1;
+        return { status: 200, body: JSON.stringify({ access_token: 'access-issued', refresh_token: 'refresh-issued', expires_in: 3600 }) };
+      },
+    });
+    assert.equal(posts, 1);
     assert.equal(result.code, 0);
     assert.equal(JSON.parse(result.stdout[0]!).source, 'refreshed');
+    assert.match(String(await f.backend.get(f.live.paths.keychainService, 'fixture-user')), /access-issued/);
     f.store.close();
   });
 
@@ -415,7 +425,12 @@ describe('Anthropic Pi gate refresh mapping (K6-7)', () => {
 
   it('lock contention refuses locks-held with exit 3 and 0 POSTs', async () => {
     const f = await fixture(NOW - 1);
-    const result = await run(f, { outcome: 'deferred', deferReason: 'locks-held' });
+    let posts = 0;
+    const result = await run(f, undefined, {
+      postRefresh: async () => { posts += 1; return { status: 500, body: '' }; },
+      withCredentialLocks: async () => { throw new ClaudeCodeLockTimeout(join(f.live.home, '.claude')); },
+    });
+    assert.equal(posts, 0);
     assert.equal(result.code, 3);
     assert.deepEqual(result.stdout, []);
     f.store.close();

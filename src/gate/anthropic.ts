@@ -28,6 +28,7 @@ export interface AnthropicGateDeps {
   verdicts?: ProbeVerdictMemo;
   autoLog?: (line: string) => void;
   refresh?: (deps: RefreshActiveLoginDeps, input: RefreshActiveLoginInput) => Promise<RefreshOutcome>;
+  withCredentialLocks?: RefreshActiveLoginDeps['withCredentialLocks'];
 }
 
 interface GateResources {
@@ -200,6 +201,7 @@ export function createAnthropicGate(deps: AnthropicGateDeps = {}, initialContext
           env: configured.env,
           by: 'qlb-gate',
           autoLog: deps.autoLog ?? context.autoLog,
+          withCredentialLocks: deps.withCredentialLocks,
         }, {
           accountId: active.accountId,
           email: slot.email ?? '',
