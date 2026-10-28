@@ -827,6 +827,9 @@ export class Migration {
 
   /** C6: a claim without this path's durable evidence must never be cleaned up. */
   private assertNoOrphanOwnershipClaim(): void {
+    // C6 classifies the generic paths only; the pool's existing C5 recovery
+    // owns its v1 commit-point crash window.
+    if (this.kind === 'pool') return;
     const facts = this.ownershipFacts();
     if (!this.claimPresent() || facts.committed || facts.rollbackInProgress || facts.handbackPending) return;
     throw Object.assign(
