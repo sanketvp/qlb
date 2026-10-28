@@ -6,7 +6,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
-import defaultAnthropicGate, { createAnthropicGate, sendRefresh, type AnthropicGateDeps } from '../src/gate/anthropic';
+import { createAnthropicGate, sendRefresh, type AnthropicGateDeps } from '../src/gate/anthropic';
+import { loadGate } from '../src/gate';
 import { InMemoryCredentialBackend } from '../src/cc-credentials';
 import { ClaudeCodeLockTimeout } from '../src/cc-locks';
 import { claudePaths } from '../src/cc-paths';
@@ -65,7 +66,7 @@ async function run(
   f: Fixture,
   outcome?: RefreshOutcome,
   overrides: Partial<AnthropicGateDeps> = {},
-  gateOverrides: Partial<Pick<PiGateDeps, 'open' | 'evidenceGap'>> = {},
+  gateOverrides: Partial<Pick<PiGateDeps, 'open' | 'evidenceGap' | 'cswapProcesses'>> = {},
   events: string[] = [],
 ): Promise<{ code: number; stdout: string[]; stderr: string[]; trace: string[]; events: string[] }> {
   const stdout: string[] = [];
@@ -82,8 +83,8 @@ async function run(
     dbPath: f.dbPath, env: f.env,
     deliver: (line) => { stdout.push(line); events.push('stdout'); }, stderr: (line) => stderr.push(line),
     guard: () => true, admitted: () => ({ ok: true }), prerequisites: () => undefined,
-    provider: gate, cswapProcesses: () => [], sqlTrace: (line) => { trace.push(line); events.push(line); },
-    ...gateOverrides,
+    provider: gate, sqlTrace: (line) => { trace.push(line); events.push(line); },
+    cswapProcesses: () => [], ...gateOverrides,
   });
   return { code, stdout, stderr, trace, events };
 }
@@ -436,20 +437,54 @@ describe('Anthropic Pi gate refresh mapping (K6-7)', () => {
     f.store.close();
   });
 
-  it("the module's default export loads through loadGate('anthropic') and receives its context", async () => {
+  it("loads the real Anthropic gate module through loadGate('anthropic') without missing-provider-gate", async () => {
     const home = mkdtempSync(join(tmpdir(), 'qlb-gate-default-'));
     const dbPath = join(home, 'qlb.db');
     const store = openStore(dbPath);
     beginCutover(store);
     store.close();
     const stderr: string[] = [];
+    const module = loadGate('anthropic');
     const code = await runPiGate('anthropic', {
       dbPath, env: { QLB_TEST_MODE: '1', HOME: home }, deliver: () => undefined, stderr: (line) => stderr.push(line),
       guard: () => true, admitted: () => ({ ok: true }), prerequisites: () => undefined,
-      loadGate: () => ({ default: defaultAnthropicGate }), cswapProcesses: () => [],
+      loadGate: () => module, cswapProcesses: () => [],
     });
     assert.equal(code, 1);
     assert.deepEqual(stderr, ['active-login-unset']);
+
+    // The production module was loaded above; exercise the same runPiGate
+    // boundary with fixture-only state and the in-memory Keychain seam.
+    const f = await fixture();
+    const stdout: string[] = [];
+    const injected = await runPiGate('anthropic', {
+      dbPath: f.dbPath, env: f.env, deliver: (line) => stdout.push(line),
+      guard: () => true, admitted: () => ({ ok: true }), prerequisites: () => undefined,
+      provider: createAnthropicGate({
+        store: f.store, slots: f.slots, live: f.live, env: f.env, now: () => NOW,
+        readLiveIdentity: f.identity, postRefresh: async () => { throw new Error('unexpected network call'); },
+      }),
+      cswapProcesses: () => [],
+    });
+    assert.equal(injected, 0);
+    assert.equal(JSON.parse(stdout[0]!).source, 'live');
+    f.store.close();
+  });
+
+  it('refuses an Anthropic gate request while C-swap consume is active before any credential read', async () => {
+    const f = await fixture();
+    let reads = 0;
+    const originalGet = f.backend.get.bind(f.backend);
+    f.backend.get = async (...args) => {
+      reads += 1;
+      return originalGet(...args);
+    };
+    const result = await run(f, undefined, {}, { cswapProcesses: () => [{ pid: 1 }] });
+    assert.equal(result.code, 3);
+    assert.deepEqual(result.stdout, []);
+    assert.deepEqual(result.stderr, ['cswap-process-alive']);
+    assert.equal(reads, 0);
+    f.store.close();
   });
 
   it('every RefreshOutcome variant maps to exactly one gate result', async () => {

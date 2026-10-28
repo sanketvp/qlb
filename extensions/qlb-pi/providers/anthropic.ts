@@ -4,10 +4,13 @@
 // credential, or falls back to Pi's persisted OAuth entry.
 
 import type { ActiveAccess, ActiveAccessSource } from '../active-access.js';
+import { failureCause, gateCause } from './openai-codex.js';
 
 export interface GateResult {
   code: number;
   stdout: string;
+  /** A stable gate failure code only; never surface raw stderr to Pi. */
+  stderr?: string;
 }
 
 /** Injectable process boundary for `qlb gate anthropic --json`. */
@@ -24,9 +27,15 @@ type GatePayload = {
   source?: unknown;
 };
 
-function unavailable(): Error {
-  // Do not expose gate stdout/stderr: either may contain credential material.
-  return new Error('QLB gate anthropic unavailable');
+class AnthropicGateFailure extends Error {
+  constructor(readonly causeCode = 'unknown') {
+    // Do not expose gate stdout/stderr: either may contain credential material.
+    super('QLB gate anthropic unavailable');
+  }
+}
+
+function unavailable(causeCode = 'unknown'): AnthropicGateFailure {
+  return new AnthropicGateFailure(causeCode);
 }
 
 function parseGatePayload(stdout: string): ActiveAccess {
@@ -64,10 +73,10 @@ export function createAnthropicSource(deps: AnthropicSourceDeps): ActiveAccessSo
       let result: GateResult;
       try {
         result = await deps.runGate('anthropic');
-      } catch {
-        throw unavailable();
+      } catch (error) {
+        throw unavailable(failureCause(error));
       }
-      if (result.code !== 0) throw unavailable();
+      if (result.code !== 0) throw unavailable(gateCause(result.stderr));
       return parseGatePayload(result.stdout);
     },
   };

@@ -5,6 +5,7 @@ import {
   createAnthropicSource,
   type GateRunner,
 } from '../extensions/qlb-pi/providers/anthropic';
+import { qlbUnavailable } from '../extensions/qlb-pi/active-access';
 
 function gateResponse(overrides: Record<string, unknown> = {}): string {
   return JSON.stringify({
@@ -16,7 +17,7 @@ function gateResponse(overrides: Record<string, unknown> = {}): string {
   });
 }
 
-function runner(result: { code?: number; stdout?: string } = {}): {
+function runner(result: { code?: number; stdout?: string; stderr?: string } = {}): {
   run: GateRunner;
   calls: string[];
 } {
@@ -25,7 +26,7 @@ function runner(result: { code?: number; stdout?: string } = {}): {
     calls,
     run: async (provider) => {
       calls.push(provider);
-      return { code: result.code ?? 0, stdout: result.stdout ?? gateResponse() };
+      return { code: result.code ?? 0, stdout: result.stdout ?? gateResponse(), stderr: result.stderr };
     },
   };
 }
@@ -67,13 +68,34 @@ describe('qlb-pi Anthropic source', () => {
     }
   });
 
-  it('fails closed when the injected process boundary rejects', async () => {
+  it('retains a stable gate failure cause without exposing gate output', async () => {
     const source = createAnthropicSource({
-      runGate: async () => { throw new Error('process detail must not escape'); },
+      runGate: runner({ code: 3, stdout: '{"token":"must-not-leak"}', stderr: 'owner-entry-missing\n' }).run,
     });
     await assert.rejects(source.read(), (error: unknown) => {
       assert.equal(error instanceof Error ? error.message : '', 'QLB gate anthropic unavailable');
+      assert.equal((error as { causeCode?: unknown }).causeCode, 'owner-entry-missing');
       return true;
     });
+  });
+
+  it('maps a missing gate binary to missing-binary and other runner failures to unknown', async () => {
+    for (const [failure, expected] of [
+      [Object.assign(new Error('not displayed'), { code: 'ENOENT' }), 'missing-binary'],
+      [new Error('timed out'), 'unknown'],
+    ]) {
+      const source = createAnthropicSource({
+        runGate: async () => Promise.reject(failure),
+      });
+      await assert.rejects(source.read(), (error: unknown) => {
+        const cause = (error as { causeCode?: unknown }).causeCode;
+        assert.equal(cause, expected);
+        assert.equal(
+          qlbUnavailable('anthropic', typeof cause === 'string' ? cause : 'unknown').error.errorMessage,
+          `QLB unavailable for anthropic — run qlb doctor (${expected})`,
+        );
+        return true;
+      });
+    }
   });
 });

@@ -101,6 +101,17 @@ describe('qlb-pi active access scaffold', () => {
     assert.match(qlbUnavailable('xai', 'token value must not appear').error.errorMessage, /unknown/);
   });
 
+  it('surfaces safe Anthropic gate refusals but refuses arbitrary causes', () => {
+    assert.equal(
+      qlbUnavailable('anthropic', 'cswap-process-alive').error.errorMessage,
+      'QLB unavailable for anthropic — run qlb doctor (cswap-process-alive)',
+    );
+    assert.equal(
+      qlbUnavailable('anthropic', 'arbitrary failure detail').error.errorMessage,
+      'QLB unavailable for anthropic — run qlb doctor (unknown)',
+    );
+  });
+
   it('never emits a token-shaped cause value', () => {
     const tokenShapedCause = 'sk-' + 'ant-' + 'x'.repeat(40);
     const errorMessage = qlbUnavailable('xai', tokenShapedCause).error.errorMessage;
