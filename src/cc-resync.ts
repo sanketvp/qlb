@@ -11,11 +11,14 @@
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import {
+  accessTokenFingerprint,
   buildRefreshRequest,
   classifyRefreshResponse,
   credentialFingerprint,
+  extractAccessToken,
   isOAuthTokenExpired,
   parseCredentialBlob,
+  parseUsageResponse,
   serializeCredentialBlob,
   type HttpRequestDescription,
 } from './anthropic-oauth';
@@ -359,6 +362,147 @@ function slotUsable(credential: string | null): boolean {
  * read: every provenance, restore, and strike decision below starts with the
  * fresh slot read performed inside those locks.
  */
+export interface ActiveUsageResponse {
+  status: number;
+  body: string;
+  retryAfterS?: number;
+}
+
+export interface AcceptedUsageContext {
+  accountId: string;
+  email: string;
+  orgUuid: string;
+  creds: string;
+  usage: unknown;
+}
+
+export interface FetchActiveUsageDeps extends RefreshActiveLoginDeps {
+  getUsage: (accessToken: string) => Promise<ActiveUsageResponse>;
+  /** Best-effort hook for the K6-5 resync path; never runs from a degraded read. */
+  afterAcceptedUsage?: (context: AcceptedUsageContext) => void | Promise<void>;
+}
+
+export type FetchActiveUsageInput = Omit<RefreshActiveLoginInput, 'forceRecord'>;
+
+function httpRecord(response: ActiveUsageResponse): ActiveFetchRecord {
+  const record: ActiveFetchRecord = { error: `http-${response.status}` };
+  if (response.retryAfterS !== undefined) record.retryAfterS = response.retryAfterS;
+  return record;
+}
+
+async function fetchUsageRecord(
+  deps: FetchActiveUsageDeps,
+  input: FetchActiveUsageInput,
+  creds: string,
+): Promise<ActiveFetchRecord> {
+  const accessToken = extractAccessToken(creds);
+  if (!accessToken) return { sentinel: 'no-credentials' };
+
+  let response: ActiveUsageResponse;
+  try {
+    response = await deps.getUsage(accessToken);
+  } catch {
+    return { error: 'usage-fetch-failed' };
+  }
+  if (response.status < 200 || response.status >= 300) return httpRecord(response);
+
+  let usage: unknown;
+  try {
+    usage = parseUsageResponse(JSON.parse(response.body));
+  } catch {
+    return { error: 'usage-unreadable' };
+  }
+  if (!input.degraded) {
+    try {
+      await deps.afterAcceptedUsage?.({
+        accountId: input.accountId,
+        email: input.email,
+        orgUuid: input.orgUuid,
+        creds,
+        usage,
+      });
+    } catch {
+      // Resync is intentionally best-effort; accepted usage remains usable.
+      warn(deps, 'Claude active usage resync failed');
+    }
+  }
+  if (deps.verdicts.get(input.accountId, input.email, credentialLineage(creds) ?? '')?.match === false) {
+    return { sentinel: 'foreign-credential' };
+  }
+  return { usage };
+}
+
+/**
+ * Fetch usage for the active Claude login.  The only recovery POST is delegated
+ * to refreshActiveLogin; this wrapper keeps usage I/O outside every credential
+ * lock and translates every closed RefreshOutcome into collector-safe data.
+ */
+export type RefreshOutcomeMapping = ActiveFetchRecord | { working: string };
+
+/** Map the closed refresh result union without ever exposing an unsafe successor. */
+export function mapRefreshOutcome(outcome: RefreshOutcome): RefreshOutcomeMapping {
+  switch (outcome.outcome) {
+    case 'posted':
+    case 'posted-slot-unwritten':
+    case 'restored':
+    case 'adopted':
+      return { working: outcome.working };
+    case 'posted-live-unwritten':
+    case 'stashed':
+      return { sentinel: 'token-expired' };
+    case 'unpersisted':
+      return { sentinel: 'token-expired', unpersisted: true };
+    case 'failed':
+      return outcome.reason === 'foreign-credential'
+        ? { sentinel: 'foreign-credential' }
+        : { error: outcome.reason };
+    case 'dead':
+      return { sentinel: 'relogin-needed', error: outcome.reason };
+    case 'deferred':
+      if (outcome.deferReason === 'degraded-read') {
+        return outcome.forceRecord ?? { sentinel: 'keychain-unavailable' };
+      }
+      return outcome.forceRecord ?? { sentinel: 'token-expired' };
+    case 'refused':
+      return { error: outcome.reason };
+    default: {
+      const exhaustive: never = outcome;
+      return exhaustive;
+    }
+  }
+}
+
+export async function fetchActiveUsage(
+  deps: FetchActiveUsageDeps,
+  input: FetchActiveUsageInput,
+): Promise<ActiveFetchRecord> {
+  // A strike binds to the slot, not the live blob.  Check it before even a
+  // locally-valid access token can make a usage request.
+  if (deps.slots.getSlot(input.accountId)?.dead) return { sentinel: 'relogin-needed' };
+
+  const accessToken = extractAccessToken(input.creds);
+  if (!accessToken) return { sentinel: 'no-credentials' };
+
+  let forceRecord: ActiveFetchRecord | undefined;
+  if (!isOAuthTokenExpired(oauthExpiry(input.creds), deps.now())) {
+    const initial = await fetchUsageRecord(deps, input, input.creds);
+    if (initial.error !== 'http-401') return initial;
+
+    // A different access generation means Claude Code already rotated; never
+    // consume a grant based on the rejected snapshot in that case.
+    try {
+      const live = await readLiveClaudeCredentials({ ...deps.live, env: deps.live.env ?? deps.env });
+      if (accessTokenFingerprint(live ?? '') !== accessTokenFingerprint(input.creds)) return initial;
+    } catch {
+      return initial;
+    }
+    forceRecord = initial;
+  }
+
+  const mapped = mapRefreshOutcome(await refreshActiveLogin(deps, { ...input, forceRecord }));
+  return 'working' in mapped ? fetchUsageRecord(deps, input, mapped.working) : mapped;
+}
+
 export async function refreshActiveLogin(
   deps: RefreshActiveLoginDeps,
   input: RefreshActiveLoginInput,
