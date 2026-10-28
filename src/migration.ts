@@ -777,6 +777,24 @@ export class Migration {
     const p7aJournal = join(this.piMigrateJournalDir, `pi-migrate-${this.provider}.json`);
     if (p7aState !== 'migrated' && !existsSync(p7aJournal)) return;
 
+    const { committed, rollbackInProgress, handbackPending } = this.ownershipFacts();
+
+    // C1 must precede C2: otherwise a generic command could mistake its own
+    // durable ownership evidence for a plain P7a-owned provider.
+    if (committed || rollbackInProgress || handbackPending) {
+      throw Object.assign(
+        new Error(`dual-ownership: run \`qlb pi rollback ${this.provider}\` first, then \`qlb migrate rollback --provider ${this.provider}\``),
+        { exitCode: 3 },
+      );
+    }
+    throw Object.assign(
+      new Error(`owned-by-pi-migrate: run \`qlb pi rollback ${this.provider}\``),
+      { exitCode: 3 },
+    );
+  }
+
+  /** Design §2 S0 facts `Gen`, `Rb` and `Hb`, read from this path's own durable evidence. */
+  private ownershipFacts(): { committed: boolean; rollbackInProgress: boolean; handbackPending: boolean } {
     const row = this.store.getMigration(this.storeName);
     const state = asState(row?.state);
     const detail = parseDetail(row?.detail_json);
@@ -791,25 +809,14 @@ export class Migration {
       })();
     const claim = this.ownerEntryPresent() || customOwner;
     const commitGenerationSet = Object.prototype.hasOwnProperty.call(detail, 'commitGeneration');
-    const committed = state === 'QLB_OWNED'
-      || state === 'RETIRED'
-      || (state === 'VALIDATED' && claim && (legacySidecar || commitGenerationSet));
-    const rollbackInProgress = detail.intent === 'rollback'
-      || Object.prototype.hasOwnProperty.call(detail, 'rollbackDecision');
-    const handbackPending = isObjectRecord(detail.handback) && detail.handback.phase === 'cleanup-pending';
-
-    // C1 must precede C2: otherwise a generic command could mistake its own
-    // durable ownership evidence for a plain P7a-owned provider.
-    if (committed || rollbackInProgress || handbackPending) {
-      throw Object.assign(
-        new Error(`dual-ownership: run \`qlb pi rollback ${this.provider}\` first, then \`qlb migrate rollback --provider ${this.provider}\``),
-        { exitCode: 3 },
-      );
-    }
-    throw Object.assign(
-      new Error(`owned-by-pi-migrate: run \`qlb pi rollback ${this.provider}\``),
-      { exitCode: 3 },
-    );
+    return {
+      committed: state === 'QLB_OWNED'
+        || state === 'RETIRED'
+        || (state === 'VALIDATED' && claim && (legacySidecar || commitGenerationSet)),
+      rollbackInProgress: detail.intent === 'rollback'
+        || Object.prototype.hasOwnProperty.call(detail, 'rollbackDecision'),
+      handbackPending: isObjectRecord(detail.handback) && detail.handback.phase === 'cleanup-pending',
+    };
   }
 
   private ownerProvider(): MigrateProvider {
@@ -1217,11 +1224,13 @@ export class Migration {
   private rollbackUnlocked(): MigrationStatus {
     this.assertNotP7aOwned();
     const ownerPresent = this.ownerEntryPresent();
-    // C5: a claim with a VALIDATED journal is a crash after the commit
-    // point. Complete the forward journal transition before entering the
-    // ordinary post-commit hand-back path.
-    if (this.journalState() === 'VALIDATED' && ownerPresent) {
-      this.finishHygiene();
+    // C5: a VALIDATED journal with this path's own commit evidence (`Gen`) is
+    // a crash after the commit point. Finish the forward journal transition,
+    // then take the ordinary post-commit hand-back path. C4 comes first: a
+    // journaled rollback keeps its intent. The pool path is not classified.
+    if (this.kind !== 'pool' && this.journalState() === 'VALIDATED') {
+      const facts = this.ownershipFacts();
+      if (facts.committed && !facts.rollbackInProgress) this.finishHygiene();
     }
     if (ownerPresent || this.journalState() === 'QLB_OWNED') {
       return this.postCommitRollback();

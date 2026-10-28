@@ -490,6 +490,74 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     }
   });
 
+  it('T-S0f a crash-commit under a custom owner file (Oc) finishes forward and hands back', async () => {
+    const h = setup('xai');
+    try {
+      const customPath = join(h.dir, 'custom-owner.json');
+      const mig = createSingleGrantMigration(h.store, h.kc, 'xai', h.authPath, customPath);
+      mig.stage();
+      await mig.rehearse(mockRehearse([]));
+      const detail = JSON.parse(h.store.getMigration('pi-xai')!.detail_json) as Record<string, unknown>;
+      h.store.upsertMigration('pi-xai', 'VALIDATED', JSON.stringify({
+        ...detail,
+        commitGeneration: h.store.getGrantGeneration(expectedId('xai')),
+      }));
+      rmSync(stagingOwnerPath(join(h.dir, 'qlb-owner.json'), 'xai'), { force: true });
+      writeFileSync(customPath, JSON.stringify({ owner: 'qlb', accounts: [{ provider: 'xai' }] }) + '\n');
+
+      const states: string[] = [];
+      const original = h.store.upsertMigration.bind(h.store);
+      h.store.upsertMigration = (store, state, next) => {
+        if (store === 'pi-xai') states.push(state);
+        return original(store, state, next);
+      };
+      const rolled = mig.rollback();
+      assert.ok(states.includes('QLB_OWNED'), 'the Oc claim with own evidence is finished forward');
+      assert.equal(rolled.detail.rolledBackFrom, 'post-commit');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('C5 never finishes forward without own evidence or over a journaled rollback', async () => {
+    for (const fixture of ['orphan-owner-map', 'rollback-intent'] as const) {
+      const h = setup('xai');
+      try {
+        h.mig.stage();
+        await h.mig.rehearse(mockRehearse([]));
+        const detail = JSON.parse(h.store.getMigration('pi-xai')!.detail_json) as Record<string, unknown>;
+        const staging = stagingOwnerPath(join(h.dir, 'qlb-owner.json'), 'xai');
+        if (fixture === 'orphan-owner-map') {
+          // O alone, with no L and no commitGeneration, is not this path's commit.
+          rmSync(staging);
+          writeFileSync(join(h.dir, 'qlb-owner.json'), JSON.stringify({ providers: { xai: { mode: 'qlb' } } }) + '\n');
+        } else {
+          renameSync(staging, h.ownerPath);
+          h.store.upsertMigration('pi-xai', 'VALIDATED', JSON.stringify({
+            ...detail,
+            commitGeneration: h.store.getGrantGeneration(expectedId('xai')),
+            intent: 'rollback',
+          }));
+        }
+
+        const states: string[] = [];
+        const original = h.store.upsertMigration.bind(h.store);
+        h.store.upsertMigration = (store, state, next) => {
+          if (store === 'pi-xai') states.push(state);
+          return original(store, state, next);
+        };
+        try {
+          h.mig.rollback();
+        } catch {
+          // Refusing is acceptable here; journaling QLB_OWNED is not.
+        }
+        assert.equal(states.includes('QLB_OWNED'), false, `${fixture}: C5 must not journal QLB_OWNED`);
+      } finally {
+        h.cleanup();
+      }
+    }
+  });
+
   it('rollback before commit: auth.json untouched; staged Keychain entries cleaned up', async () => {
     const h = setup('xai');
     try {
