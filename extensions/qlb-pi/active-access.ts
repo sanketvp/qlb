@@ -107,6 +107,7 @@ const FIXED_CAUSE_CODES = new Set([
   "undo-in-progress",
   "codex-token-expired-renewer-idle",
   "provider-not-applicable",
+  "owner-entry-missing",
 ]);
 const REFUSED_LIFECYCLE_PHASES = new Set(["pre-cutover", "undoing", "rolled-back", "aborted"]);
 

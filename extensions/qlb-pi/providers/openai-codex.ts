@@ -43,7 +43,7 @@ function unavailable(causeCode = 'unknown'): OpenAICodexGateFailure {
   return new OpenAICodexGateFailure(causeCode);
 }
 
-function gateCause(stderr: string | undefined): string {
+export function gateCause(stderr: string | undefined): string {
   const cause = stderr?.trim().replace(/^qlb gate: refused: /, '') ?? '';
   return /^[a-z][a-z0-9=-]*$/.test(cause) ? cause : 'unknown';
 }

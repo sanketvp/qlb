@@ -118,7 +118,7 @@ describe('qlb-pi Kimi Coding source', () => {
 
     assert.equal(gates, 1);
     assert.equal(transportCalls, 1);
-    assert.equal((outputs[1]!.events[0] as { error?: { errorMessage?: string } }).error?.errorMessage, 'QLB unavailable for kimi-coding — run qlb doctor (unknown)');
+    assert.equal((outputs[1]!.events[0] as { error?: { errorMessage?: string } }).error?.errorMessage, 'QLB unavailable for kimi-coding — run qlb doctor (owner-entry-missing)');
     assert.equal(outputs[1]!.ended, true);
   });
 

@@ -1,4 +1,4 @@
-// qlb-pi — Pi extension that selects accounts via `qlb resolve` (§4.9.1 / §4.8.3a).
+// qlb-pi — Pi extension that obtains owned-provider access through QLB gates (§4.7.2).
 //
 // Request-shaping is intentionally duplicated from anthropic-pool
 // (request-shaping.ts / system-prompt-shaping.ts / constants.ts). A live
@@ -14,31 +14,26 @@
 // accurate outcomes for those requests, after two bug fixes (request-shaping
 // and audit-log accuracy — see repo history for details).
 //
-// The extension remains INERT by default. Activation is gated on
-// ~/.pi/agent/qlb-owner.json (or QLB_PI_REHEARSAL=1); that file is only
-// created by QLB's own `qlb migrate ... --confirm-real-cutover` flow. This
-// means installing the package via `pi install` (which just registers the
-// extension file per package.json's "pi" manifest) does NOT by itself
-// activate anything, touch credentials, or affect anthropic-pool's
-// registration — a separate, explicit migration step is required first.
-//
-// Known structural risk: for any account in QLB_OWNED state, the native
-// provider's own credential store can drift out of sync with QLB's copy
-// (native-credential-drift). This is mitigated by the native-resync
-// mechanism added in src/native-resync.ts as of today, but the risk is
-// structural to the QLB_OWNED model, not fully eliminated — see
-// docs/CREDENTIAL-SAFETY.md.
+// The extension remains INERT by default. Standard activation is gated on
+// ~/.pi/agent/qlb-owner.json, created only by QLB's own
+// `qlb migrate ... --confirm-real-cutover` flow. QLB_PI_REHEARSAL=1 only
+// registers the Anthropic source; its gate still rejects requests without an
+// owner entry. Installing via `pi install` (which just registers the extension
+// file per package.json's "pi" manifest) does NOT by itself activate anything,
+// touch credentials, or affect anthropic-pool's registration — a separate,
+// explicit migration step is required first.
 //
 // When active:
 //   - unregisters the built-in anthropic provider (same hook anthropic-pool
-//     uses at index.ts:55-60) and re-registers with a streamSimple that asks
-//     `qlb resolve` for the account, injects that account's Keychain access
-//     token, and applies anthropic-pool's OAuth payload shaping via onPayload;
+//     uses at index.ts:55-60) and re-registers with a streamSimple that calls
+//     `qlb gate anthropic --json` per request. The gate selects and reads the
+//     credential; this extension never resolves an account or reads Keychain;
+//     it applies anthropic-pool's OAuth payload shaping via onPayload;
 //   - records each decision's outcome for audit (jsonl) from the real stream
 //     events / HTTP status — never assumed "ok";
 //   - adds `/qlb` (status / migrate status).
 //
-// QLB_PI_REHEARSAL=1  → force-active (forward rehearsal, S3), even with no owner file.
+// QLB_PI_REHEARSAL=1  → force Anthropic source registration for forward rehearsal (S3); the gate still requires an owner entry and fails closed without one.
 // QLB_PI_REHEARSAL=0  → force-inert (rollback verification, R3), even with an owner file.
 // unset               → owner file decides.
 //
@@ -476,7 +471,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
           15_000,
           { ...process.env, QLB_PI_TOKEN_CALL: "1" },
         );
-        return { code: result.code, stdout: result.stdout };
+        return { code: result.code, stdout: result.stdout, stderr: result.stderr };
       },
     });
     pi.unregisterProvider("anthropic");
@@ -529,14 +524,17 @@ export default async function (pi: ExtensionAPI): Promise<void> {
                 ? { error: result.error }
                 : {}),
             });
-          } catch {
+          } catch (error) {
+            const cause = error instanceof Error && typeof (error as Error & { causeCode?: unknown }).causeCode === "string"
+              ? (error as Error & { causeCode: string }).causeCode
+              : "unknown";
             recordOutcome({
               accountId: lastDecision?.accountId,
               model: model.id,
               outcome: "failed",
               error: "QLB gate anthropic unavailable",
             });
-            output.push(qlbUnavailable("anthropic", "unknown", model) as never);
+            output.push(qlbUnavailable("anthropic", cause, model) as never);
           } finally {
             output.end();
           }

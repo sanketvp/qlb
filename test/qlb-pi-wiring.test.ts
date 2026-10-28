@@ -119,13 +119,13 @@ if (!['anthropic', 'xai', 'kimi-coding', 'openrouter', 'openai-codex'].includes(
 if (process.env.QLB_PI_TOKEN_CALL !== '1') process.exit(4);
 if (process.env.GATE_CALL_LOG) fs.appendFileSync(process.env.GATE_CALL_LOG, provider + '\n');
 if (process.env.GATE_FAIL === '1') {
-  process.stderr.write('store-open-failed');
+  process.stderr.write(process.env.GATE_CAUSE || 'store-open-failed');
   process.exit(3);
 }
 process.stdout.write(JSON.stringify({ token: 'fixture-' + provider + '-access', accountId: 'user:slot', chatgptAccountId: 'bare-account', source: 'fixture' }));
 `;
 
-function load(owner?: string, gateFail = false, callCodex = false, perProviderOwner?: string, ownerIsDirectory = false, deployedLayout = false, callAnthropic = false): {
+function load(owner?: string, gateFail = false, callCodex = false, perProviderOwner?: string, ownerIsDirectory = false, deployedLayout = false, callAnthropic = false, gateCause?: string, rehearsal = false): {
   calls: string[];
   replaced: Record<string, boolean>;
   oauth: { resolve: number; refresh: number };
@@ -164,12 +164,16 @@ function load(owner?: string, gateFail = false, callCodex = false, perProviderOw
     env: {
       PATH: process.env.PATH,
       HOME: home,
+      QLB_HOME: join(home, 'qlb'),
+      QLB_TEST_MODE: '1',
       USER: 'qlb-test',
       PI_GLOBAL_ROOT,
       QLB_PI_EXTENSION: extension,
       QLB_CLI: runner,
       GATE_CALL_LOG: gateLog,
       ...(gateFail ? { GATE_FAIL: '1' } : {}),
+      ...(gateCause ? { GATE_CAUSE: gateCause } : {}),
+      ...(rehearsal ? { QLB_PI_REHEARSAL: '1' } : {}),
       ...(callCodex ? { CALL_CODEX: '1' } : {}),
       ...(callAnthropic ? { CALL_ANTHROPIC: '1' } : {}),
     },
@@ -215,7 +219,15 @@ describe('qlb-pi provider wiring', { skip: piAvailable ? false : 'global Pi inst
     const result = load(owner, true, false, undefined, false, false, true);
     assert.deepEqual(result.gateCalls, ['anthropic']);
     assert.deepEqual(result.events.map((event) => event.error?.errorMessage), [
-      'QLB unavailable for anthropic — run qlb doctor (unknown)',
+      'QLB unavailable for anthropic — run qlb doctor (store-open-failed)',
+    ]);
+  });
+
+  it('fails closed in Anthropic rehearsal without an owner entry, with the same gate cause as other owned providers', () => {
+    const result = load(undefined, true, false, undefined, false, false, true, 'owner-entry-missing', true);
+    assert.deepEqual(result.gateCalls, ['anthropic']);
+    assert.deepEqual(result.events.map((event) => event.error?.errorMessage), [
+      'QLB unavailable for anthropic — run qlb doctor (owner-entry-missing)',
     ]);
   });
 

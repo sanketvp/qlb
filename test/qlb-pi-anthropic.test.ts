@@ -16,7 +16,7 @@ function gateResponse(overrides: Record<string, unknown> = {}): string {
   });
 }
 
-function runner(result: { code?: number; stdout?: string } = {}): {
+function runner(result: { code?: number; stdout?: string; stderr?: string } = {}): {
   run: GateRunner;
   calls: string[];
 } {
@@ -25,7 +25,7 @@ function runner(result: { code?: number; stdout?: string } = {}): {
     calls,
     run: async (provider) => {
       calls.push(provider);
-      return { code: result.code ?? 0, stdout: result.stdout ?? gateResponse() };
+      return { code: result.code ?? 0, stdout: result.stdout ?? gateResponse(), stderr: result.stderr };
     },
   };
 }
@@ -65,6 +65,17 @@ describe('qlb-pi Anthropic source', () => {
         },
       );
     }
+  });
+
+  it('retains a stable gate failure cause without exposing gate output', async () => {
+    const source = createAnthropicSource({
+      runGate: runner({ code: 3, stdout: '{"token":"must-not-leak"}', stderr: 'owner-entry-missing\n' }).run,
+    });
+    await assert.rejects(source.read(), (error: unknown) => {
+      assert.equal(error instanceof Error ? error.message : '', 'QLB gate anthropic unavailable');
+      assert.equal((error as { causeCode?: unknown }).causeCode, 'owner-entry-missing');
+      return true;
+    });
   });
 
   it('fails closed when the injected process boundary rejects', async () => {
