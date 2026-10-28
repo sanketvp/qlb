@@ -1216,7 +1216,14 @@ export class Migration {
 
   private rollbackUnlocked(): MigrationStatus {
     this.assertNotP7aOwned();
-    if (this.ownerEntryPresent() || this.journalState() === 'QLB_OWNED') {
+    const ownerPresent = this.ownerEntryPresent();
+    // C5: a claim with a VALIDATED journal is a crash after the commit
+    // point. Complete the forward journal transition before entering the
+    // ordinary post-commit hand-back path.
+    if (this.journalState() === 'VALIDATED' && ownerPresent) {
+      this.finishHygiene();
+    }
+    if (ownerPresent || this.journalState() === 'QLB_OWNED') {
       return this.postCommitRollback();
     }
     return this.preCommitRollback();

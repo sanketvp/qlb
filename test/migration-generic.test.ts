@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { describe, it } from 'node:test';
@@ -434,6 +434,59 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       assert.equal(h.store.getMigration('pi-xai')?.detail_json, detail, 'refusal leaves the journal unchanged');
     } finally {
       h.cleanup();
+    }
+  });
+
+  it('T-S0f rollback after a crash between the commit point and QLB_OWNED finishes the commit and hands back', async () => {
+    for (const claim of ['legacy-sidecar', 'owner-map'] as const) {
+      const h = setup('xai');
+      try {
+        h.mig.stage();
+        await h.mig.rehearse(mockRehearse([]));
+        const row = h.store.getMigration('pi-xai');
+        assert.ok(row, 'staging records the generic migration');
+        const detail = JSON.parse(row.detail_json) as Record<string, unknown>;
+        h.store.upsertMigration('pi-xai', 'VALIDATED', JSON.stringify({
+          ...detail,
+          commitGeneration: h.store.getGrantGeneration(expectedId('xai')),
+        }));
+
+        const staging = stagingOwnerPath(join(h.dir, 'qlb-owner.json'), 'xai');
+        if (claim === 'legacy-sidecar') {
+          renameSync(staging, h.ownerPath);
+        } else {
+          rmSync(staging);
+          writeFileSync(join(h.dir, 'qlb-owner.json'), JSON.stringify({
+            providers: { xai: { mode: 'qlb' } },
+          }) + '\n');
+        }
+
+        const transitions: Array<{ state: string; intent?: unknown }> = [];
+        const originalUpsertMigration = h.store.upsertMigration.bind(h.store);
+        h.store.upsertMigration = (store, state, nextDetail) => {
+          if (store === 'pi-xai') {
+            transitions.push({
+              state,
+              intent: (JSON.parse(nextDetail ?? '{}') as Record<string, unknown>).intent,
+            });
+          }
+          return originalUpsertMigration(store, state, nextDetail);
+        };
+
+        const rolled = h.mig.rollback();
+
+        const finishedForward = transitions.findIndex((entry) => entry.state === 'QLB_OWNED');
+        const beganHandback = transitions.findIndex(
+          (entry, index) => index > finishedForward && entry.intent === 'rollback',
+        );
+        assert.ok(finishedForward >= 0, `${claim}: finishHygiene completes the interrupted commit`);
+        assert.ok(beganHandback > finishedForward, `${claim}: rollback starts only after the forward finish`);
+        assert.equal(rolled.state, 'VALIDATED');
+        assert.equal(rolled.detail.intent, undefined);
+        assert.equal(rolled.detail.rolledBackFrom, 'post-commit');
+      } finally {
+        h.cleanup();
+      }
     }
   });
 
