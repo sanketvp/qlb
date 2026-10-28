@@ -106,6 +106,11 @@ describe('Codex slots and import-active', () => {
     assert.equal(lookups, 0);
   });
 
+  it('a null lookup falls through to the suffix/bare header rule', () => {
+    assert.equal(codexHeaderAccountId(null, 'user:legacy-account'), 'legacy-account');
+    assert.equal(codexHeaderAccountId(null, 'bare-legacy-account'), 'bare-legacy-account');
+  });
+
   it("header value is the slot's chatgpt_account_id, else the slot-id suffix, else a bare id", () => {
     const slot = {
       accountId: 'user:slot-account',

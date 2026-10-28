@@ -316,7 +316,7 @@ function hopByHop(): Set<string> {
 
 function forwardHeaders(
   clientHeaders: IncomingHttpHeaders,
-  extra: Record<string, string>,
+  extra: Record<string, string | undefined>,
   contentLength: number,
 ): http.OutgoingHttpHeaders {
   const skip = hopByHop();
@@ -330,7 +330,13 @@ function forwardHeaders(
     out[k] = v;
   }
   for (const [k, v] of Object.entries(extra)) {
-    out[k] = v;
+    if (v === undefined) {
+      for (const header of Object.keys(out)) {
+        if (header.toLowerCase() === k.toLowerCase()) delete out[header];
+      }
+    } else {
+      out[k] = v;
+    }
   }
   out['content-length'] = contentLength;
   return out;
@@ -703,14 +709,14 @@ export class LoopbackProxy {
     }
     const forwardBody = Buffer.from(JSON.stringify(rewrite));
 
-    const extra: Record<string, string> = {
+    const extra: Record<string, string | undefined> = {
       authorization: `Bearer ${credential}`,
     };
     if (harness === 'claude-code') {
       Object.assign(extra, claudeCodeIdentityHeaders(req.headers));
     } else {
       const accountId = codexHeaderAccountId((id) => this.store.getCodexSlot(id), decision.accountId);
-      if (accountId !== undefined) extra['chatgpt-account-id'] = accountId;
+      extra['chatgpt-account-id'] = accountId;
       extra.originator = 'codex_cli_rs';
     }
 

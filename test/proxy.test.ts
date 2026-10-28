@@ -396,7 +396,7 @@ describe('qlb-proxy — loopback helper §4.9.2 / §4.9.3', () => {
     }
   });
 
-  it("codex request to a slot-id account sends the slot's chatgpt_account_id", async () => {
+  it("slot-id request replaces a client-sent chatgpt-account-id with the slot's value", async () => {
     const store = openStore(':memory:');
     const accountId = 'slot-user:slot-account';
     seedCodex(store, accountId);
@@ -413,7 +413,8 @@ describe('qlb-proxy — loopback helper §4.9.2 / §4.9.3', () => {
     const proxy = await startProxy({ store, mockUrl: mock.url });
     try {
       const response = await post(proxy.proxyInfo.port, '/backend-api/codex/responses',
-        { model: 'gpt-5.4--qlb-high', input: 'hi' }, proxy.proxyInfo.token);
+        { model: 'gpt-5.4--qlb-high', input: 'hi' }, proxy.proxyInfo.token,
+        { 'chatgpt-account-id': 'client-sent-account' });
       assert.equal(response.status, 200);
       assert.equal(seenHeader, 'stored-account');
     } finally {
@@ -423,7 +424,7 @@ describe('qlb-proxy — loopback helper §4.9.2 / §4.9.3', () => {
     }
   });
 
-  it('codex request to a bare legacy account sends the id itself', async () => {
+  it('bare legacy request replaces a client-sent chatgpt-account-id with the id itself', async () => {
     const store = openStore(':memory:');
     seedCodex(store, 'bare-legacy-account');
     let seenHeader: string | string[] | undefined;
@@ -435,7 +436,8 @@ describe('qlb-proxy — loopback helper §4.9.2 / §4.9.3', () => {
     const proxy = await startProxy({ store, mockUrl: mock.url });
     try {
       const response = await post(proxy.proxyInfo.port, '/backend-api/codex/responses',
-        { model: 'gpt-5.4--qlb-high', input: 'hi' }, proxy.proxyInfo.token);
+        { model: 'gpt-5.4--qlb-high', input: 'hi' }, proxy.proxyInfo.token,
+        { 'ChatGPT-Account-Id': 'client-sent-account' });
       assert.equal(response.status, 200);
       assert.equal(seenHeader, 'bare-legacy-account');
     } finally {
@@ -445,21 +447,24 @@ describe('qlb-proxy — loopback helper §4.9.2 / §4.9.3', () => {
     }
   });
 
-  it('codex request to codex-default sends no chatgpt-account-id', async () => {
+  it('codex-default request drops a client-sent chatgpt-account-id', async () => {
     const store = openStore(':memory:');
     seedCodex(store, 'codex-default');
-    let seenHeader: string | string[] | undefined;
+    const seenHeaders: Array<string | string[] | undefined> = [];
     const mock = await listenMock((req, res) => {
-      seenHeader = req.headers['chatgpt-account-id'];
+      seenHeaders.push(req.headers['chatgpt-account-id']);
       res.writeHead(200);
       res.end('{}');
     });
     const proxy = await startProxy({ store, mockUrl: mock.url });
     try {
-      const response = await post(proxy.proxyInfo.port, '/backend-api/codex/responses',
-        { model: 'gpt-5.4--qlb-high', input: 'hi' }, proxy.proxyInfo.token);
-      assert.equal(response.status, 200);
-      assert.equal(seenHeader, undefined);
+      for (const name of ['chatgpt-account-id', 'ChatGPT-Account-Id']) {
+        const response = await post(proxy.proxyInfo.port, '/backend-api/codex/responses',
+          { model: 'gpt-5.4--qlb-high', input: 'hi' }, proxy.proxyInfo.token,
+          { [name]: 'attacker' });
+        assert.equal(response.status, 200);
+      }
+      assert.deepEqual(seenHeaders, [undefined, undefined]);
     } finally {
       await proxy.stop();
       mock.server.close();

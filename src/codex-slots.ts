@@ -385,11 +385,11 @@ function idTokenAuthClaims(doc: { tokens: CodexAccountTokens }): JsonObject | nu
 
 /** Resolves the bare ChatGPT account identity for the Codex upstream header. */
 export function codexHeaderAccountId(
-  lookup: (id: string) => CodexSlotRecord | null | undefined,
+  lookup: ((id: string) => CodexSlotRecord | null | undefined) | null,
   id: string,
 ): string | undefined {
   if (id === 'codex-default') return undefined;
-  const slot = lookup(id);
+  const slot = lookup?.(id);
   if (nonEmpty(slot?.chatgptAccountId)) return slot.chatgptAccountId;
   const separator = id.indexOf(':');
   return separator === -1 ? id : id.slice(separator + 1);
