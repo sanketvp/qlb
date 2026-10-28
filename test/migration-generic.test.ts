@@ -490,23 +490,26 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     }
   });
 
-  it('T-S0b every command refuses an orphan O, L, Oc, or unreadable Oc claim without changing durable state', () => {
-    for (const claim of ['O', 'L', 'Oc', 'unreadable-Oc'] as const) {
+  it('T-S0b every command refuses an orphan or unreadable O, L, or Oc claim without changing durable state', () => {
+    for (const claim of ['O', 'L', 'Oc', 'unreadable-O', 'unreadable-L', 'unreadable-Oc'] as const) {
       for (const command of ['stage', 'commit', 'rollback', 'resume'] as const) {
         const h = setup('xai');
         try {
           const customPath = join(h.dir, 'custom-owner.json');
-          const migration = claim === 'O' || claim === 'L'
+          const useDefaultPath = claim === 'O' || claim === 'L' || claim === 'unreadable-O' || claim === 'unreadable-L';
+          const migration = useDefaultPath
             ? h.mig
             : createSingleGrantMigration(h.store, h.kc, 'xai', h.authPath, customPath);
-          const ownerPath = claim === 'O' ? join(h.dir, 'qlb-owner.json')
-            : claim === 'L' ? h.ownerPath
+          const ownerPath = claim === 'O' || claim === 'unreadable-O' ? join(h.dir, 'qlb-owner.json')
+            : claim === 'L' || claim === 'unreadable-L' ? h.ownerPath
               : customPath;
-          const ownerBytes = claim === 'O'
-            ? JSON.stringify({ providers: { xai: { mode: 'qlb' } } }) + '\n'
-            : JSON.stringify({ owner: 'qlb', accounts: [{ provider: 'xai' }] }) + '\n';
+          const unreadable = claim.startsWith('unreadable-');
+          const ownerBytes = unreadable
+            ? '{not valid JSON\n'
+            : claim === 'O'
+              ? JSON.stringify({ providers: { xai: { mode: 'qlb' } } }) + '\n'
+              : JSON.stringify({ owner: 'qlb', accounts: [{ provider: 'xai' }] }) + '\n';
           writeFileSync(ownerPath, ownerBytes);
-          if (claim === 'unreadable-Oc') chmodSync(ownerPath, 0o000);
 
           const service = qlbKeychainService('xai', expectedId('xai'));
           const keychainBytes = JSON.stringify({ preserved: `${claim}-${command}` });
@@ -517,6 +520,14 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
             () => migration[command](),
             (error: Error & { exitCode?: unknown }) => {
               assert.match(error.message, /owner-file-orphan/);
+              assert.match(error.message, new RegExp(ownerPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+              if (unreadable) {
+                assert.match(error.message, /could not be read/);
+              } else if (claim === 'O') {
+                assert.match(error.message, /Remove only the xai entry.*do not delete the file/);
+              } else {
+                assert.match(error.message, /Remove the file/);
+              }
               assert.equal(error.exitCode, 3);
               return true;
             },
@@ -528,7 +539,6 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
             keychainBytes,
             `${claim}/${command} leaves the Keychain bytes unchanged`,
           );
-          if (claim === 'unreadable-Oc') chmodSync(ownerPath, 0o600);
           assert.deepEqual(
             readFileSync(ownerPath),
             Buffer.from(ownerBytes),
@@ -543,6 +553,30 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
           h.cleanup();
         }
       }
+    }
+  });
+
+  it('T-S0b treats an ENOTDIR claim lookup as present before stage writes anything', () => {
+    const h = setup('xai');
+    try {
+      const blockedParent = join(h.dir, 'not-a-directory');
+      writeFileSync(blockedParent, 'not a directory');
+      const customPath = join(blockedParent, 'custom-owner.json');
+      const migration = createSingleGrantMigration(h.store, h.kc, 'xai', h.authPath, customPath);
+      const journalBefore = h.store.getMigration('pi-xai');
+
+      assert.throws(
+        () => migration.stage(),
+        (error: Error & { exitCode?: unknown }) => {
+          assert.match(error.message, /owner-file-orphan/);
+          assert.match(error.message, /could not be read/);
+          assert.equal(error.exitCode, 3);
+          return true;
+        },
+      );
+      assert.deepEqual(h.store.getMigration('pi-xai'), journalBefore);
+    } finally {
+      h.cleanup();
     }
   });
 
@@ -1052,6 +1086,44 @@ describe('static-key migration — openrouter (single API key, no OAuth)', () =>
       assert.equal(rolled.detail.commitStarted, undefined, 'hand-back terminal write clears commitStarted');
     } finally {
       h.cleanup();
+    }
+  });
+
+  it('T-S0e resumes or re-enters a static-key commit that crashes after the O write without classifying it as an orphan', async () => {
+    for (const recovery of ['resume', 'commit'] as const) {
+      const h = setupOpenRouter();
+      try {
+        h.mig.stage();
+        await h.mig.rehearse(mockOpenRouterRehearse([]));
+        const originalUpsertMigration = h.store.upsertMigration.bind(h.store);
+        let crashed = false;
+        h.store.upsertMigration = (store, state, detail) => {
+          if (!crashed && store === 'pi-openrouter' && state === 'QLB_OWNED') {
+            crashed = true;
+            throw new Error('simulated crash after O');
+          }
+          return originalUpsertMigration(store, state, detail);
+        };
+
+        assert.throws(() => h.mig.commit(), /simulated crash after O/);
+        assert.equal(crashed, true, 'the simulated crash follows the O write');
+        assert.equal(
+          JSON.parse(h.store.getMigration('pi-openrouter')!.detail_json).commitStarted,
+          true,
+          'the static-key commit journals commitStarted before O',
+        );
+        assert.equal(
+          JSON.parse(readFileSync(h.ownerPath, 'utf8')).providers.openrouter.mode,
+          'qlb',
+          'O was written before the crash',
+        );
+
+        h.store.upsertMigration = originalUpsertMigration;
+        const completed = h.mig[recovery]();
+        assert.equal(completed.state, 'QLB_OWNED', `${recovery} finishes C5 forward`);
+      } finally {
+        h.cleanup();
+      }
     }
   });
 
