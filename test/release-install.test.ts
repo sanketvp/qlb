@@ -381,6 +381,7 @@ describe('release install (AC45)', () => {
       const { DatabaseSync } = require('node:sqlite');
       const [dbPath, readyPath, releasePath] = process.argv.slice(1);
       const db = new DatabaseSync(dbPath);
+      db.exec('PRAGMA busy_timeout = 5000');
       db.exec('BEGIN IMMEDIATE');
       writeFileSync(readyPath, 'ready');
       const timer = setInterval(() => {
@@ -414,10 +415,15 @@ describe('release install (AC45)', () => {
       originalExec.call(this, sql);
     };
     try {
-      await assert.rejects(
+      const installRejection = assert.rejects(
         installRelease({ sourceDir, appDir, sha: 'pin-racing-schema-sha', dbPath, ...validHelperVerifier }),
         /qlb\.db schema user_version=6 is newer than this binary \(5\); upgrade qlb/,
       );
+      const migratorFailure = migratorExit.then(
+        () => new Promise<never>(() => {}),
+        (error: unknown) => Promise.reject(error),
+      );
+      await Promise.race([installRejection, migratorFailure]);
     } finally {
       DatabaseSync.prototype.exec = originalExec;
     }
