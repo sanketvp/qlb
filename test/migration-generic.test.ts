@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { describe, it } from 'node:test';
@@ -95,6 +95,20 @@ function keychainHas(
   } catch {
     return false;
   }
+}
+
+function fileSnapshot(dir: string, prefix = ''): Map<string, Buffer> {
+  const files = new Map<string, Buffer>();
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const relative = join(prefix, entry.name);
+    const path = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      for (const [nestedPath, bytes] of fileSnapshot(path, relative)) files.set(nestedPath, bytes);
+    } else if (entry.isFile()) {
+      files.set(relative, readFileSync(path));
+    }
+  }
+  return files;
 }
 
 interface Harness {
@@ -879,6 +893,66 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
         assert.equal(states.includes('QLB_OWNED'), false, `${fixture}: C5 must not journal QLB_OWNED`);
       } finally {
         h.cleanup();
+      }
+    }
+  });
+
+  it('T-E3 rollback and resume route C7-C9 without touching at-rest migration state', async () => {
+    for (const command of ['rollback', 'resume'] as const) {
+      const c7 = setup('xai');
+      try {
+        c7.mig.stage();
+        await c7.mig.rehearse(mockRehearse([]));
+        const result = c7.mig[command]();
+        assert.equal(result.state, command === 'rollback' ? 'NATIVE' : 'QLB_OWNED', `C7/${command}`);
+        assert.equal(
+          keychainHas(c7.kc, 'xai'),
+          command === 'resume',
+          `C7/${command} ${command === 'rollback' ? 'removes' : 'keeps'} the staged grant`,
+        );
+      } finally {
+        c7.cleanup();
+      }
+
+      const c8 = setup('xai');
+      try {
+        c8.mig.stage();
+        const result = c8.mig[command]();
+        assert.equal(result.state, 'NATIVE', `C8/${command}`);
+        assert.equal(keychainHas(c8.kc, 'xai'), false, `C8/${command} removes the staged grant`);
+      } finally {
+        c8.cleanup();
+      }
+
+      for (const state of ['NATIVE', 'VALIDATED'] as const) {
+        const c9 = setup('xai');
+        try {
+          c9.mig.stage();
+          rmSync(stagingOwnerPath(join(c9.dir, 'qlb-owner.json'), 'xai'));
+          const row = c9.store.getMigration('pi-xai');
+          assert.ok(row, 'fixture has a generic journal');
+          c9.store.upsertMigration('pi-xai', state, row.detail_json);
+          const keychainBefore = c9.kc.getSync(
+            qlbKeychainService('xai', expectedId('xai')),
+            expectedLabel('xai'),
+          );
+          const journalBefore = c9.store.getMigration('pi-xai');
+          const filesBefore = fileSnapshot(c9.dir);
+
+          const result = c9.mig[command]();
+
+          assert.equal(result.state, state, `C9 ${state}/${command} is a no-op`);
+          assert.equal(result.resumeAction, 'nothing to roll back', `C9 ${state}/${command} reports the no-op`);
+          assert.equal(
+            c9.kc.getSync(qlbKeychainService('xai', expectedId('xai')), expectedLabel('xai')),
+            keychainBefore,
+            `C9 ${state}/${command} keeps K_m byte-for-byte`,
+          );
+          assert.deepEqual(c9.store.getMigration('pi-xai'), journalBefore, `C9 ${state}/${command} keeps the journal`);
+          assert.deepEqual(fileSnapshot(c9.dir), filesBefore, `C9 ${state}/${command} keeps every file byte-for-byte`);
+        } finally {
+          c9.cleanup();
+        }
       }
     }
   });
