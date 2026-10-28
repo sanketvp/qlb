@@ -966,6 +966,38 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     }
   });
 
+  it('T-S5s status reports cleanup-pending, shows a null fence as not fenced, and writes nothing', () => {
+    const h = setup('xai');
+    try {
+      const marker = {
+        phase: 'cleanup-pending',
+        keychainDisposition: 'keep',
+        piFingerprint: null,
+        decision: null,
+        fencedGeneration: null,
+        rolledBackAt: 123,
+      };
+      const service = qlbKeychainService('xai', expectedId('xai'));
+      const account = expectedLabel('xai');
+      h.kc.setSync(service, account, JSON.stringify({ ...FAKE_GRANTS.xai, generation: 0 }));
+      h.store.upsertMigration('pi-xai', 'NATIVE', JSON.stringify({ handback: marker }));
+      const rowBefore = h.store.getMigration('pi-xai');
+      const filesBefore = fileSnapshot(h.dir);
+      const keychainBefore = h.kc.getSync(service, account);
+
+      const status = h.mig.status();
+
+      assert.equal(status.resumeAction, 'hand-back complete, cleanup pending — run `qlb migrate resume`');
+      assert.deepEqual(status.detail.handback, marker, 'status keeps the durable marker fields intact');
+      assert.deepEqual(status.handback, { ...marker, fencedGeneration: 'not fenced' });
+      assert.deepEqual(h.store.getMigration('pi-xai'), rowBefore, 'status does not write the journal');
+      assert.deepEqual(fileSnapshot(h.dir), filesBefore, 'status does not write files');
+      assert.equal(h.kc.getSync(service, account), keychainBefore, 'status does not write Keychain');
+    } finally {
+      h.cleanup();
+    }
+  });
+
   it('rollback before commit: auth.json untouched; staged Keychain entries cleaned up', async () => {
     const h = setup('xai');
     try {

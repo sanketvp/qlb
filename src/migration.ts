@@ -287,6 +287,8 @@ export interface MigrationStatus {
   piAtNextLaunch: 'native works' | 'QLB works' | 'unknown';
   resumeAction: string;
   detail: Record<string, unknown>;
+  /** Cleanup-pending hand-back marker, formatted for status output. */
+  handback?: Record<string, unknown>;
   nativeStrategy?: NativeStrategy;
   provider?: string;
 }
@@ -1083,6 +1085,17 @@ export class Migration {
     const prePresent =
       this.kind === 'static-key' ? false : existsSync(preQlbPath(this.poolFilePath));
     const intent = detail.intent === 'rollback';
+    const rawHandback = isObjectRecord(detail.handback) && detail.handback.phase === 'cleanup-pending'
+      ? detail.handback
+      : undefined;
+    const handback = rawHandback
+      ? {
+        ...rawHandback,
+        fencedGeneration: rawHandback.fencedGeneration === null
+          ? 'not fenced'
+          : rawHandback.fencedGeneration,
+      }
+      : undefined;
     const staticCredential = this.staticKeychainCoords();
 
     let ownerFile: MigrationStatus['ownerFile'] = 'absent';
@@ -1104,7 +1117,9 @@ export class Migration {
     const retains = this.retainsNative();
     const staticKey = this.kind === 'static-key';
     let resumeAction: string;
-    if (intent) {
+    if (rawHandback) {
+      resumeAction = 'hand-back complete, cleanup pending — run `qlb migrate resume`';
+    } else if (intent) {
       resumeAction = staticKey
         ? 'continue rollback to VALIDATED (owner unlinked; native Keychain was never moved)'
         : retains
@@ -1143,6 +1158,7 @@ export class Migration {
       piAtNextLaunch,
       resumeAction,
       detail,
+      handback,
       nativeStrategy: this.strategy(),
       provider: this.provider,
     };
