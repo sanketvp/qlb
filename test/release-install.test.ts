@@ -21,7 +21,13 @@ import { dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { describe, it } from 'node:test';
 
-import { installRelease as installReleaseForPlatform, readReleaseManifest, releaseDigest } from '../src/release';
+import {
+  installRelease as installReleaseForPlatform,
+  readRecordedConfig,
+  readReleaseManifest,
+  releaseDigest,
+  ReleaseIntegrityError,
+} from '../src/release';
 import { runReleaseCommand } from '../src/commands/release';
 import { releaseCurrentCheck } from '../src/checks/release-current';
 import type { CommandContext } from '../src/registry';
@@ -89,6 +95,86 @@ function compiledSource(dir: string, sha: string): string {
 }
 
 describe('release install (AC45)', () => {
+  it('reads no helper pin from a missing database without creating it', () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-release-recorded-config-missing-'));
+    const dbPath = join(root, 'qlb.db');
+
+    assert.equal(readRecordedConfig(dbPath, 'keychain.helperCheckIdentityHash'), null);
+    assert.equal(existsSync(dbPath), false);
+  });
+
+  it('reads no helper pin from a database without a config table', () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-release-recorded-config-no-table-'));
+    const dbPath = join(root, 'qlb.db');
+    const db = new DatabaseSync(dbPath);
+    db.exec('CREATE TABLE unrelated (id INTEGER PRIMARY KEY)');
+    db.close();
+
+    assert.equal(readRecordedConfig(dbPath, 'keychain.helperCheckIdentityHash'), null);
+  });
+
+  it('reads an existing helper pin', () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-release-recorded-config-pin-'));
+    const dbPath = join(root, 'qlb.db');
+    const db = new DatabaseSync(dbPath);
+    db.exec("CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT); INSERT INTO config VALUES ('keychain.helperCheckIdentityHash', 'pinned-identity')");
+    db.close();
+
+    assert.equal(readRecordedConfig(dbPath, 'keychain.helperCheckIdentityHash'), 'pinned-identity');
+  });
+
+  it('refuses to skip a helper pin when the database remains exclusively locked', { timeout: 30_000 }, async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-release-recorded-config-locked-'));
+    const dbPath = join(root, 'qlb.db');
+    const db = new DatabaseSync(dbPath);
+    db.exec('CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT)');
+    db.close();
+    const home = join(root, 'home');
+    const qlbHome = join(root, 'qlb-home');
+    mkdirSync(home);
+    mkdirSync(qlbHome);
+    const locker = spawn(process.execPath, ['-e', `
+      const { DatabaseSync } = require('node:sqlite');
+      const db = new DatabaseSync(process.argv[1]);
+      db.exec('BEGIN EXCLUSIVE');
+      process.stdout.write('lock held\\n');
+      setTimeout(() => { db.exec('COMMIT'); db.close(); }, 7000);
+    `, dbPath], {
+      env: { ...process.env, QLB_TEST_MODE: '1', QLB_HOME: qlbHome, HOME: home },
+    });
+    const lockerExit = new Promise<void>((resolve, reject) => {
+      locker.once('error', reject);
+      locker.once('exit', (code) => code === 0 ? resolve() : reject(new Error(`locker exited ${code}`)));
+    });
+    await new Promise<void>((resolve, reject) => {
+      locker.once('error', reject);
+      locker.stdout.once('data', (chunk: Buffer) => {
+        if (chunk.toString() === 'lock held\n') resolve();
+        else reject(new Error(`unexpected locker signal: ${chunk.toString()}`));
+      });
+    });
+
+    try {
+      assert.throws(
+        () => readRecordedConfig(dbPath, 'keychain.helperCheckIdentityHash'),
+        (error: unknown) => error instanceof ReleaseIntegrityError && error.message === 'could not read helper identity pin',
+      );
+    } finally {
+      await lockerExit;
+    }
+  });
+
+  it('refuses a non-SQLite helper-pin database', () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-release-recorded-config-invalid-'));
+    const dbPath = join(root, 'qlb.db');
+    writeFileSync(dbPath, 'not sqlite');
+
+    assert.throws(
+      () => readRecordedConfig(dbPath, 'keychain.helperCheckIdentityHash'),
+      (error: unknown) => error instanceof ReleaseIntegrityError && error.message === 'could not read helper identity pin',
+    );
+  });
+
   it('backs up an existing database, publishes the build, and atomically repoints current', async () => {
     const root = mkdtempSync(join(tmpdir(), 'qlb-release-install-'));
     const sourceDir = sourceBuild(root);
