@@ -19,12 +19,14 @@
 
 import { existsSync, readFileSync } from 'node:fs';
 
+import { codexSlotIdFromAccessToken } from './codex-auth';
 import type { KeychainBackend } from './keychain';
 import { qlbKeychainService } from './keychain';
 import { isCredentialNotFound } from './credential-backends';
 import {
   accountIdForSingleGrant,
   fingerprintApiKey,
+  legacyCodexAccountIdForSingleGrant,
   isSingleGrantProvider,
   isStaticKeyProvider,
   migrationStoreNameFor,
@@ -461,8 +463,12 @@ export function createNativeCredentialReader(opts: {
           readFileSync(opts.authJsonPath, 'utf8'),
           provider,
         );
-        const id = accountIdForSingleGrant(provider as SingleGrantProvider, parsed);
-        if (id !== accountId) return null;
+        const matches = provider === 'openai-codex'
+          ? accountId.includes(':')
+            ? codexSlotIdFromAccessToken(parsed.access, parsed.accountId) === accountId
+            : legacyCodexAccountIdForSingleGrant(parsed) === accountId
+          : accountIdForSingleGrant(provider as SingleGrantProvider, parsed) === accountId;
+        if (!matches) return null;
         const extra: Record<string, unknown> = {
           type: parsed.type ?? 'oauth',
           authJsonKey: provider,

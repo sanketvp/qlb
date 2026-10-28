@@ -597,15 +597,21 @@ function chatgptAccountIdFromJwt(token: string | undefined): string | undefined 
  *   kimi.ts         → 'kimi-default'
  *   codex.ts        → JWT chatgpt_account_id ?? 'codex-default'
  */
+export function legacyCodexAccountIdForSingleGrant(
+  grant: { accountId?: string; access?: string },
+): string {
+  if (typeof grant.accountId === 'string' && grant.accountId.length > 0) {
+    return grant.accountId;
+  }
+  return chatgptAccountIdFromJwt(grant.access) ?? ADAPTER_ACCOUNT_IDS['openai-codex'];
+}
+
 export function accountIdForSingleGrant(
   provider: SingleGrantProvider,
   grant: { accountId?: string; access?: string },
 ): string {
   if (provider === 'openai-codex') {
-    if (typeof grant.accountId === 'string' && grant.accountId.length > 0) {
-      return grant.accountId;
-    }
-    return chatgptAccountIdFromJwt(grant.access) ?? ADAPTER_ACCOUNT_IDS[provider];
+    return legacyCodexAccountIdForSingleGrant(grant);
   }
   return ADAPTER_ACCOUNT_IDS[provider];
 }
