@@ -129,11 +129,11 @@ describe('qlb-pi Kimi Coding source', () => {
     const terminated = join(dir, 'terminated');
     writeFileSync(fixture, `
       const { writeFileSync } = require('node:fs');
-      writeFileSync(${JSON.stringify(started)}, '');
       process.on('SIGTERM', () => {
         writeFileSync(${JSON.stringify(terminated)}, '');
         process.exit(0);
       });
+      writeFileSync(${JSON.stringify(started)}, '');
       setInterval(() => {}, 1_000);
     `);
     const previousCli = process.env.QLB_CLI;
