@@ -11,7 +11,7 @@ import {
   qlbKeychainService,
   type KeychainBackend,
 } from './keychain';
-import type { Store } from './store';
+import type { CodexSlotRecord, Store } from './store';
 import { qlbHomeDir } from './home';
 import { listStashes, recordStash, removeStash, type UnclaimedIndexEntry } from './unclaimed-index';
 
@@ -381,6 +381,18 @@ function idTokenAuthClaims(doc: { tokens: CodexAccountTokens }): JsonObject | nu
   } catch {
     return null;
   }
+}
+
+/** Resolves the bare ChatGPT account identity for the Codex upstream header. */
+export function codexHeaderAccountId(
+  lookup: (id: string) => CodexSlotRecord | null | undefined,
+  id: string,
+): string | undefined {
+  if (id === 'codex-default') return undefined;
+  const slot = lookup(id);
+  if (nonEmpty(slot?.chatgptAccountId)) return slot.chatgptAccountId;
+  const separator = id.indexOf(':');
+  return separator === -1 ? id : id.slice(separator + 1);
 }
 
 /** Bare account row identity shared by the Codex adapter and import-active. */

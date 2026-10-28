@@ -23,6 +23,7 @@ import {
 } from './policy';
 import { resolveFromSnapshots, snapshotsFromStore } from './resolve';
 import { config } from './config';
+import { codexHeaderAccountId } from './codex-slots';
 import { claudeCodeIdentityHeaders, ensureClaudeCodeSystemPrefix } from './claude-code-identity';
 import {
   attemptWithNativeResyncRetry,
@@ -708,7 +709,8 @@ export class LoopbackProxy {
     if (harness === 'claude-code') {
       Object.assign(extra, claudeCodeIdentityHeaders(req.headers));
     } else {
-      extra['chatgpt-account-id'] = decision.accountId;
+      const accountId = codexHeaderAccountId((id) => this.store.getCodexSlot(id), decision.accountId);
+      if (accountId !== undefined) extra['chatgpt-account-id'] = accountId;
       extra.originator = 'codex_cli_rs';
     }
 
