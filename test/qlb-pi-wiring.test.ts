@@ -286,7 +286,7 @@ describe('qlb-pi provider wiring', { skip: piAvailable ? false : 'global Pi inst
   it('fails closed once for an unavailable Codex gate without reaching a transport', () => {
     const result = load(JSON.stringify({ providers: { 'openai-codex': { mode: 'qlb', since: 1 } } }), true, true);
     assert.equal(result.events.length, 1);
-    assert.equal(result.events[0]?.error?.errorMessage, 'QLB unavailable for openai-codex — run qlb doctor (unknown)');
+    assert.equal(result.events[0]?.error?.errorMessage, 'QLB unavailable for openai-codex — run qlb doctor (store-open-failed)');
   });
 });
 
