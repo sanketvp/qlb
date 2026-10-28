@@ -254,7 +254,10 @@ export function migratePiSingleProvider(provider: PiSingleProvider, paths: PiMig
       if (provider !== 'openrouter' && phaseAtLeast(journal.phase, 'publishing') && !isPiPlaceholder(auth[provider])) throw new Error(`Pi ${provider} entry changed after publication`);
       // Install and verify the managed item on every resume before publication,
       // including 'publishing': the item may have been lost or changed in the crash window.
-      if (!phaseAtLeast(journal.phase, 'published')) {
+      // A 'publishing' journal whose owner entry is already visible was published:
+      // the managed item may have been refreshed since, so it is never overwritten.
+      const ownerVisible = journal.phase === 'publishing' && isPiQlbOwnerEntry(currentOwner[provider]);
+      if (!phaseAtLeast(journal.phase, 'published') && !ownerVisible) {
         let source: unknown = provider === 'openrouter' ? baseline : (isPiPlaceholder(auth[provider]) || auth[provider] === undefined ? baseline : auth[provider]);
         if (provider !== 'openrouter' && source !== baseline) { try { keychainPayload(provider, source); } catch { source = baseline; } }
         const payload = keychainPayload(provider, source);

@@ -304,6 +304,23 @@ describe('Pi migration S58 credential-first barrier', () => {
     } finally { h.cleanup(); }
   });
 
+  it('xai: a publishing resume with the owner entry visible keeps a rotated managed item', () => {
+    const h = setup();
+    try {
+      assert.throws(() => migratePiSingleProvider('xai', h.paths, {
+        keychain: h.keychain,
+        store: h.store,
+        afterWrite: (point: string) => { if (point === 'owner-entry') throw new Error('injected crash'); },
+      }), /injected crash/);
+      const service = qlbKeychainService('xai', 'default');
+      const rotated = { ...(JSON.parse(h.keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT)) as Record<string, unknown>), refresh: 'rotated-refresh', access: 'rotated-access' };
+      h.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(rotated));
+      assert.equal(migratePiSingleProvider('xai', h.paths, { keychain: h.keychain, store: h.store }).state, 'migrated');
+      const after = JSON.parse(h.keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT)) as { refresh?: string };
+      assert.equal(after.refresh, 'rotated-refresh', 'a published, rotated managed item is never replaced by the baseline');
+    } finally { h.cleanup(); }
+  });
+
   it('refuses a placeholder auth entry with no journal before writing anything', () => {
     const h = setup();
     try {
