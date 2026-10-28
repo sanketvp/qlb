@@ -10,6 +10,7 @@ import { OPENROUTER_GATE_KEYCHAIN_SERVICE } from '../src/token/openrouter';
 import {
   ADAPTER_ACCOUNT_IDS,
   ADAPTER_ACCOUNT_LABELS,
+  Migration,
   NATIVE_OPENROUTER_KEYCHAIN_SERVICE,
   SINGLE_GRANT_PROVIDERS,
   createSingleGrantMigration,
@@ -271,6 +272,36 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       assert.equal(existsSync(h.ownerPath), true, 'the owner claim is written after the baseline journal');
     } finally {
       h.cleanup();
+    }
+  });
+
+  it('T-S0a every generic entry point refuses a provider P7a owns', () => {
+    for (const ownershipFact of ['state', 'journal'] as const) {
+      for (const command of ['stage', 'commit', 'rollback', 'resume'] as const) {
+        const h = setup('xai');
+        try {
+          const journalDir = join(h.dir, 'pi-migrate-journal');
+          if (ownershipFact === 'state') {
+            h.store.setConfig('pi.xai.state', 'migrated');
+          } else {
+            mkdirSync(journalDir, { recursive: true });
+            writeFileSync(join(journalDir, 'pi-migrate-xai.json'), '{}\n');
+          }
+          const migration = new Migration(h.store, h.kc, h.authPath, h.ownerPath, 'pi-xai', {
+            kind: 'single-grant',
+            provider: 'xai',
+            authJsonKey: 'xai',
+            piMigrateJournalDir: journalDir,
+          });
+
+          assert.throws(() => migration[command](), /owned-by-pi-migrate: run `qlb pi rollback xai`/);
+          assert.equal(h.store.getMigration('pi-xai'), null, `${ownershipFact}/${command} leaves no generic journal`);
+          assert.equal(existsSync(stagingOwnerPath(join(h.dir, 'qlb-owner.json'), 'xai')), false);
+          assert.equal(keychainHas(h.kc, 'xai'), false);
+        } finally {
+          h.cleanup();
+        }
+      }
     }
   });
 
