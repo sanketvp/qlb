@@ -110,7 +110,7 @@ added the optional `autoswitch.weeklyThreshold` setting and CLI flag.
 | `test_switcher.py::TestAccountInfoOrgFields` | pending |
 | `test_switcher.py::TestAccountExistsCompositeKey` | pending |
 | `test_switcher.py::TestGetCurrentAccountOrgSupport` | pending |
-| `test_switcher.py::TestDeadTokenQuarantine` | ported |
+| `test_switcher.py::TestDeadTokenQuarantine` | ported (collector-models method: K7) |
 | `test_switcher.py::TestAddAccountOrgFields` | pending |
 | `test_switcher.py::TestResolveIdentifierAmbiguity` | pending |
 | `test_switcher.py::TestListAccountsOrgDisplay` | pending |
@@ -128,7 +128,7 @@ added the optional `autoswitch.weeklyThreshold` setting and CLI flag.
 | `test_switcher.py::TestProvenanceGuard` | pending |
 | `test_switcher.py::TestSelfSwitchProvenance` | pending |
 | `test_switcher.py::TestDuplicateAccountDetection` | pending |
-| `test_switcher.py::TestLockstepUsageDetection` | ported |
+| `test_switcher.py::TestLockstepUsageDetection` | pending |
 | `test_switcher.py::TestStashAndRetentionStore` | pending |
 | `test_switcher.py::TestActiveRefreshProvenance` | ported |
 | `test_switcher.py::TestDirectActivationPreservation` | pending |

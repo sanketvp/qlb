@@ -47,7 +47,7 @@ import { ClaudeSlots, type ReadClaudeSlot } from './cc-slots';
 import { listCswapProcesses, type CswapProcess } from './cswap-processes';
 import { externalLoginCheck, isSuccessor, recordTransition, type HolderObservation } from './lineage-log';
 import { listReloginEvents, recordRelogin } from './relogin';
-import { reloginDetailFingerprint } from './relogin-fields';
+import { reloginDetailValue } from './relogin-fields';
 import type { Store } from './store';
 
 export type ActiveFetchSentinel =
@@ -93,20 +93,20 @@ export class ProbeVerdictMemo {
   private readonly verdicts = new Map<string, ProbeVerdict>();
   private readonly warned = new Set<string>();
 
-  private key(accountId: string, email: string, lineageFp: string): string {
-    return `${accountId}\u0000${email}\u0000${lineageFp}`;
+  private key(accountId: string, email: string, lineageFp: string, orgUuid: string): string {
+    return `${accountId}\u0000${email}\u0000${orgUuid}\u0000${lineageFp}`;
   }
 
-  get(accountId: string, email: string, lineageFp: string): ProbeVerdict | undefined {
-    return this.verdicts.get(this.key(accountId, email, lineageFp));
+  get(accountId: string, email: string, lineageFp: string, orgUuid: string): ProbeVerdict | undefined {
+    return this.verdicts.get(this.key(accountId, email, lineageFp, orgUuid));
   }
 
-  set(accountId: string, email: string, lineageFp: string, verdict: ProbeVerdict): void {
-    this.verdicts.set(this.key(accountId, email, lineageFp), verdict);
+  set(accountId: string, email: string, lineageFp: string, orgUuid: string, verdict: ProbeVerdict): void {
+    this.verdicts.set(this.key(accountId, email, lineageFp, orgUuid), verdict);
   }
 
-  matches(accountId: string, email: string, lineageFp: string): boolean {
-    return this.get(accountId, email, lineageFp)?.match === true;
+  matches(accountId: string, email: string, lineageFp: string, orgUuid: string): boolean {
+    return this.get(accountId, email, lineageFp, orgUuid)?.match === true;
   }
 
   warnOnce(accountId: string, email: string, condition: string): boolean {
@@ -411,7 +411,7 @@ async function fetchUsageRecord(
   } catch {
     return { error: 'usage-unreadable' };
   }
-  if (deps.verdicts.get(input.accountId, input.email, credentialLineage(creds) ?? '')?.match === false) {
+  if (deps.verdicts.get(input.accountId, input.email, credentialLineage(creds) ?? '', input.orgUuid)?.match === false) {
     return { sentinel: 'foreign-credential' };
   }
   if (!input.degraded) {
@@ -428,7 +428,7 @@ async function fetchUsageRecord(
       warn(deps, 'Claude active usage resync failed');
     }
   }
-  if (deps.verdicts.get(input.accountId, input.email, credentialLineage(creds) ?? '')?.match === false) {
+  if (deps.verdicts.get(input.accountId, input.email, credentialLineage(creds) ?? '', input.orgUuid)?.match === false) {
     return { sentinel: 'foreign-credential' };
   }
   return { usage };
@@ -539,7 +539,7 @@ export async function refreshActiveLogin(
   if (effectiveEnv.CLAUDE_SECURESTORAGE_CONFIG_DIR) return finish({ outcome: 'refused', reason: 'store-unmirrored' });
   if (input.degraded) return finish({ outcome: 'deferred', deferReason: 'degraded-read' });
 
-  const earlyVerdict = deps.verdicts.get(input.accountId, input.email, credentialLineage(input.creds) ?? '');
+  const earlyVerdict = deps.verdicts.get(input.accountId, input.email, credentialLineage(input.creds) ?? '', input.orgUuid);
   if (!preLockAttribution({ creds: input.creds, slotFp: earlySlot?.fingerprint ?? null, slotPrevFp: earlySlot?.prevFingerprint ?? null, verdict: earlyVerdict })
     && !slotUsable(input.creds)) {
     if (deps.verdicts.warnOnce(input.accountId, input.email, 'unattributable')) warn(deps, 'Claude refresh deferred: credential is unattributable');
@@ -586,7 +586,7 @@ export async function refreshActiveLogin(
       let slotFp: string | null = locked.fingerprint;
       let slotPrevFp = row?.prevFingerprint ?? null;
       const liveFp = credentialLineage(live);
-      const memo = liveFp ? deps.verdicts.get(input.accountId, input.email, liveFp) : undefined;
+      const memo = liveFp ? deps.verdicts.get(input.accountId, input.email, liveFp, input.orgUuid) : undefined;
       // A forced 401 binds to live only when both its lineage and the rejected
       // access generation are unchanged. A differing, partial or newly issued
       // live blob takes the ordinary locked adopt, defer, or foreign-refusal path.
@@ -610,7 +610,7 @@ export async function refreshActiveLogin(
 
       const decide = (): RefreshInputDecision => {
         const fp = credentialLineage(live);
-        const attributed = Boolean(fp && (deps.verdicts.matches(input.accountId, input.email, fp)
+        const attributed = Boolean(fp && (deps.verdicts.matches(input.accountId, input.email, fp, input.orgUuid)
           || (slotFp !== null && isSuccessor(deps.store, 'anthropic', input.accountId, slotFp, fp))));
         return chooseRefreshInput({ creds: decisionCreds, live, backup: backup.credential, backupUsable: slotUsable(backup.credential), slotFp, attributed, forceRefresh: input.forceRecord !== undefined, now: deps.now() });
       };
@@ -687,7 +687,7 @@ export async function refreshActiveLogin(
         if (!working) return finish({ outcome: 'failed', reason: 'refresh-failed' });
         const postedFp = credentialLineage(choice.input);
         const workingFp = credentialLineage(working);
-        if (workingFp) deps.verdicts.set(input.accountId, input.email, workingFp, { match: true, source: 'post' });
+        if (workingFp) deps.verdicts.set(input.accountId, input.email, workingFp, input.orgUuid, { match: true, source: 'post' });
 
         let slotWritten = true;
         try { await deps.slots.writeSlot(input.accountId, working, { cause: 'post', by: deps.by, evidence: 'post' }); }
@@ -750,6 +750,8 @@ export interface ResyncRotatedBackupDeps {
   l41Verified?: boolean;
   withSwitchLock?: Lock;
   withCredentialLocks?: CredentialLock;
+  /** Consumer attribution for the repair lineage row. */
+  by?: 'qlb-auto' | 'qlb-cli' | 'tool';
 }
 
 function resyncWarn(deps: ResyncRotatedBackupDeps, message: string): void {
@@ -815,7 +817,12 @@ export async function resyncUnderHeldLocks(
     || current.email !== input.email || (current.orgUuid ?? '') !== input.orgUuid) return;
 
   if (current.fingerprint === servedFp) return;
-  const memo = deps.verdicts.get(input.accountId, input.email, servedFp);
+  // I1: a current successor is the only issued refresh chain. A positive
+  // attribution memo never licenses discarding it for its served ancestor.
+  if ((current.fingerprint !== null
+      && isSuccessor(deps.store, 'anthropic', input.accountId, servedFp, current.fingerprint))
+    || servedFp === current.prevFingerprint) return;
+  const memo = deps.verdicts.get(input.accountId, input.email, servedFp, input.orgUuid);
   const successor = current.fingerprint !== null
     && isSuccessor(deps.store, 'anthropic', input.accountId, current.fingerprint, servedFp);
   if (memo?.match !== true && !successor) return;
@@ -827,17 +834,17 @@ export async function resyncUnderHeldLocks(
   if (!successor) {
     const l41Verified = deps.l41Verified ?? deps.store.getConfig('claude.l41Verified') === '1';
     const hard = externalLoginCheck({
-      provider: 'anthropic', successor: false, qlbPost: false, oracleOwnAccount: true,
+      provider: 'anthropic', successor: false, qlbPost: memo?.source === 'post', oracleOwnAccount: memo?.source === 'oracle',
       l41Verified, loginExpiryMoved: expiryMovedForward((await deps.slots.readSlot(input.accountId, { fresh: true })).credential, live),
     });
     const classification = hard === 'hard'
       ? hard
       : input.holderObservation === undefined
         ? 'none'
-        : externalLoginCheck({ provider: 'anthropic', successor: false, qlbPost: false, oracleOwnAccount: true,
+        : externalLoginCheck({ provider: 'anthropic', successor: false, qlbPost: memo?.source === 'post', oracleOwnAccount: memo?.source === 'oracle',
           l41Verified, loginExpiryMoved: false, holderObservation: input.holderObservation });
     if (classification !== 'none') {
-      const detail = reloginDetailFingerprint(servedFp);
+      const detail = reloginDetailValue(servedFp);
       const alreadyRecorded = listReloginEvents(deps.store.dbPath).some((row) => row.provider === 'anthropic'
         && row.accountId === input.accountId && row.kind === 'external-login' && row.detail === detail);
       if (!alreadyRecorded) recordRelogin(deps.store, {
@@ -847,7 +854,8 @@ export async function resyncUnderHeldLocks(
     }
   }
 
-  await deps.slots.writeSlot(input.accountId, live, { cause: 'resync', by: 'tool', evidence: 'oracle' });
+  const evidence = memo?.source === 'post' ? 'post' : memo?.source === 'oracle' ? 'oracle' : 'lineage';
+  await deps.slots.writeSlot(input.accountId, live, { cause: 'resync', by: deps.by ?? 'tool', evidence });
 }
 
 /**
@@ -861,7 +869,7 @@ export async function resyncRotatedBackup(
 ): Promise<void> {
   const servedFp = credentialLineage(input.creds);
   if (!servedFp || !hasUsablePair(input.creds) || input.slot.fingerprint === servedFp) return;
-  const cached = deps.verdicts.get(input.accountId, input.email, servedFp);
+  const cached = deps.verdicts.get(input.accountId, input.email, servedFp, input.orgUuid);
   if (cached?.match === false) return;
 
   let attributed = cached?.match === true
@@ -876,7 +884,7 @@ export async function resyncRotatedBackup(
       const matches = resolvedMatchesSlotIdentity(resolved, input);
       // A partial profile is neither affirming nor condemning, so do not cache it.
       if (matches === null) return;
-      deps.verdicts.set(input.accountId, input.email, servedFp, { match: matches, source: 'oracle' });
+      deps.verdicts.set(input.accountId, input.email, servedFp, input.orgUuid, { match: matches, source: 'oracle' });
       if (!matches) {
         if (deps.verdicts.warnOnce(input.accountId, input.email, 'resync-foreign')) {
           resyncWarn(deps, 'Claude rotated backup resync left foreign credential untouched');
@@ -904,4 +912,15 @@ export async function resyncRotatedBackup(
   } catch {
     resyncWarn(deps, 'Claude rotated backup resync failed');
   }
+}
+
+/** Adapt K6-4's accepted-usage hook to K6-5 with its shared verdict memo. */
+export function resyncHook(
+  deps: ResyncRotatedBackupDeps,
+  options: { holderObservation?: HolderObservation } = {},
+): (context: AcceptedUsageContext) => Promise<void> {
+  return async (context) => {
+    const slot = await deps.slots.readSlot(context.accountId, { fresh: true });
+    await resyncRotatedBackup(deps, { ...context, slot, holderObservation: options.holderObservation });
+  };
 }
