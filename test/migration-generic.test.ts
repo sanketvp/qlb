@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { describe, it } from 'node:test';
 import { createOwnedCredentialSource } from '../src/credentials';
 import { MockKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from '../src/keychain';
@@ -374,6 +374,26 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       assert.equal(existsSync(stagingOwnerPath(join(h.dir, 'qlb-owner.json'), 'xai')), false);
       assert.equal(keychainHas(h.kc, 'xai'), false, 'stage writes no managed credential');
       assert.deepEqual(readFileSync(h.authPath), h.originalBytes, 'stage leaves auth.json unchanged');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('T-OW2 stage classifies ownership and makes its first writes while holding the auth lock pi migrate takes', () => {
+    const h = setup('xai');
+    try {
+      const lockDir = `${resolve(h.authPath)}.lock`;
+      assert.equal(existsSync(lockDir), false);
+      const heldAt: string[] = [];
+      const store = h.store as unknown as Record<string, (...args: unknown[]) => unknown>;
+      const originalUpsert = store.upsertMigration.bind(h.store);
+      store.upsertMigration = (...args: unknown[]) => { heldAt.push(`journal:${existsSync(lockDir)}`); return originalUpsert(...args); };
+      const originalSet = h.kc.setSync.bind(h.kc);
+      h.kc.setSync = (service: string, account: string, value: string) => { heldAt.push(`keychain:${existsSync(lockDir)}`); originalSet(service, account, value); };
+      h.mig.stage();
+      assert.ok(heldAt.length > 0, 'stage wrote something');
+      assert.ok(heldAt.every((entry) => entry.endsWith(':true')), `every stage write ran under ${lockDir}: ${heldAt.join(', ')}`);
+      assert.equal(existsSync(lockDir), false, 'the auth lock is released after stage');
     } finally {
       h.cleanup();
     }
