@@ -1,6 +1,6 @@
 /*
  * Ported from claude-swap 0.28.0.
- * Upstream file(s): src/claude_swap/switcher.py:4292-5038.
+ * Upstream file(s): src/claude_swap/switcher.py:4292-5038,5671-5730.
  * License: MIT.
  * Modified for QLB. See NOTICE.
  */
@@ -64,6 +64,36 @@ export interface ActiveFetchRecord {
   sentinel?: ActiveFetchSentinel;
   retryAfterS?: number;
   unpersisted?: true;
+}
+
+/**
+ * Find accounts whose two usage windows have identical percentages and reset
+ * times. This is a heuristic for two credential generations serving one
+ * account; incomplete and sentinel usage is intentionally not comparable.
+ */
+export function lockstepUsageWarnings(rows: { accountId: string; usage: unknown }[]): string[] {
+  const seen = new Map<string, string>();
+  const warnings: string[] = [];
+  for (const { accountId, usage } of rows) {
+    if (!usage || typeof usage !== 'object' || Array.isArray(usage)) continue;
+    const { five_hour: fiveHour, seven_day: sevenDay } = usage as Record<string, unknown>;
+    if (!fiveHour || typeof fiveHour !== 'object' || Array.isArray(fiveHour)
+      || !sevenDay || typeof sevenDay !== 'object' || Array.isArray(sevenDay)) continue;
+    const { pct: fiveHourPct, resets_at: fiveHourReset } = fiveHour as Record<string, unknown>;
+    const { pct: sevenDayPct, resets_at: sevenDayReset } = sevenDay as Record<string, unknown>;
+    if (fiveHourPct === null || fiveHourPct === undefined || fiveHourReset === null || fiveHourReset === undefined
+      || sevenDayPct === null || sevenDayPct === undefined || sevenDayReset === null || sevenDayReset === undefined) continue;
+    const key = JSON.stringify([fiveHourPct, fiveHourReset, sevenDayPct, sevenDayReset]);
+    const other = seen.get(key);
+    if (other) {
+      warnings.push(
+        `Account-${other} and Account-${accountId} report identical usage and reset times — they may be the same account (issue #117). If it persists, log in with the missing account and re-add it: cswap add --slot N`,
+      );
+    } else {
+      seen.set(key, accountId);
+    }
+  }
+  return warnings;
 }
 
 export type RefreshOutcome = (
