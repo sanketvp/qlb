@@ -20,8 +20,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 
 import { codexSlotIdFromAccessToken } from './codex-auth';
-import type { KeychainBackend } from './keychain';
-import { qlbKeychainService } from './keychain';
+import { QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, type KeychainBackend } from './keychain';
 import { isCredentialNotFound } from './credential-backends';
 import {
   accountIdForSingleGrant,
@@ -426,8 +425,11 @@ export function writeOwnedCredentialToKeychain(
   label: string,
   credential: ResyncCredential,
 ): void {
-  const service = qlbKeychainService(provider, accountId);
   const account = label || accountId;
+  if (provider === 'openai-codex' && account === QLB_KEYCHAIN_ACCOUNT) {
+    throw new Error('refusing to write a Codex resync credential under the slot account name');
+  }
+  const service = qlbKeychainService(provider, accountId);
   keychain.setSync(service, account, JSON.stringify(credential));
 }
 
