@@ -15,7 +15,7 @@ import {
   QLB_KEYCHAIN_ACCOUNT,
   qlbKeychainService,
 } from '../src/keychain';
-import { CodexSlots, importActiveCodexSlot, planImportActiveCodex } from '../src/codex-slots';
+import { CodexSlots, codexHeaderAccountId, importActiveCodexSlot, planImportActiveCodex } from '../src/codex-slots';
 import { snapshotsFromStore } from '../src/resolve';
 import { openStore } from '../src/store';
 
@@ -97,6 +97,34 @@ function dbRows(path: string): { slot: Record<string, unknown> | undefined; acco
 }
 
 describe('Codex slots and import-active', () => {
+  it('codex-default yields no header even with no slot row', () => {
+    let lookups = 0;
+    assert.equal(codexHeaderAccountId(() => {
+      lookups += 1;
+      return undefined;
+    }, 'codex-default'), undefined);
+    assert.equal(lookups, 0);
+  });
+
+  it('a null lookup falls through to the suffix/bare header rule', () => {
+    assert.equal(codexHeaderAccountId(null, 'user:legacy-account'), 'legacy-account');
+    assert.equal(codexHeaderAccountId(null, 'bare-legacy-account'), 'bare-legacy-account');
+  });
+
+  it("header value is the slot's chatgpt_account_id, else the slot-id suffix, else a bare id", () => {
+    const slot = {
+      accountId: 'user:slot-account',
+      chatgptUserId: 'user',
+      chatgptAccountId: 'stored-account',
+      fingerprint: null,
+      prevFingerprint: null,
+      dead: false,
+    };
+    assert.equal(codexHeaderAccountId((id) => id === slot.accountId ? slot : undefined, slot.accountId), 'stored-account');
+    assert.equal(codexHeaderAccountId(() => undefined, 'user:legacy-account:extra'), 'legacy-account:extra');
+    assert.equal(codexHeaderAccountId(() => undefined, 'bare-legacy-account'), 'bare-legacy-account');
+  });
+
   it('plans an S29 slot without writing credentials or the store', () => {
     const h = fixture();
     try {
