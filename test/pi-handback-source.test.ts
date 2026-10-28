@@ -4,6 +4,7 @@ import {
   ABSENT_KEYCHAIN_DIGEST,
   canonicalDigest,
   fencedGeneration,
+  handbackVerdict,
   keychainDigest,
   NoSingleGrantRestoreSourceError,
   rankSingleGrantSource,
@@ -95,6 +96,48 @@ describe('T-FD — pure fence arithmetic and digests', () => {
     ]) {
       assert.notEqual(canonicalDigest(changed), digest);
     }
+  });
+});
+
+describe('T-HV — hand-back verdict is delete only when the Keychain copy carries the lineage Pi holds', () => {
+  const piEntry = {
+    type: 'oauth',
+    access: 'native-access-fake',
+    refresh: 'native-refresh-fake',
+    expires: 4_102_444_800_000,
+  };
+
+  it('keeps absent or malformed Keychain copies and reports Pi\'s valid fingerprint', () => {
+    const absent = handbackVerdict(null, piEntry);
+    const malformed = handbackVerdict({ access: 'access-fake', refresh: 42, expires: 4_102_444_800_000 }, piEntry);
+
+    assert.equal(absent.keychainDisposition, 'keep');
+    assert.equal(malformed.keychainDisposition, 'keep');
+    assert.equal(absent.piFingerprint, malformed.piFingerprint);
+    assert.equal(typeof absent.piFingerprint, 'string');
+  });
+
+  it('keeps a Keychain copy from another lineage', () => {
+    const verdict = handbackVerdict(grant({ refresh: 'other-refresh-fake' }), piEntry);
+
+    assert.equal(verdict.keychainDisposition, 'keep');
+    assert.equal(typeof verdict.piFingerprint, 'string');
+  });
+
+  it('deletes only a well-formed Keychain copy whose refresh lineage matches Pi', () => {
+    const verdict = handbackVerdict(grant({ refresh: piEntry.refresh }), piEntry);
+
+    assert.equal(verdict.keychainDisposition, 'delete');
+    assert.equal(typeof verdict.piFingerprint, 'string');
+  });
+
+  it('keeps the Keychain copy when Pi\'s entry is invalid', () => {
+    const verdict = handbackVerdict(
+      grant({ refresh: piEntry.refresh }),
+      { ...piEntry, refresh: '' },
+    );
+
+    assert.deepEqual(verdict, { piFingerprint: null, keychainDisposition: 'keep' });
   });
 });
 
