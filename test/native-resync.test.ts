@@ -367,6 +367,96 @@ describe('createNativeCredentialReader (temp files only)', () => {
       delete process.env.QLB_TEST_NATIVE_READER_ROOT;
     }
   });
+
+  const jwt = (payload: Record<string, unknown>): string =>
+    `eyJhbGciOiJub25lIn0.${Buffer.from(JSON.stringify(payload)).toString('base64url')}.sig`;
+
+  it('matches a slot-id Codex takeover by the S29 derivation', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-resync-codex-slot-'));
+    temps.push(dir);
+    const auth = join(dir, 'auth.json');
+    writeFileSync(
+      auth,
+      JSON.stringify({
+        'openai-codex': {
+          type: 'oauth',
+          access: jwt({
+            'https://api.openai.com/auth': {
+              chatgpt_user_id: 'user-1',
+              chatgpt_account_id: 'claim-account',
+            },
+          }),
+          refresh: 'codex-r',
+          expires: 9,
+          accountId: 'acct-1',
+        },
+      }) + '\n',
+    );
+    process.env.QLB_TEST_NATIVE_READER_ROOT = dir;
+    try {
+      const read = createNativeCredentialReader({ poolFilePath: join(dir, 'unused'), authJsonPath: auth });
+      assert.ok(await read('openai-codex', 'user-1:acct-1'));
+    } finally {
+      delete process.env.QLB_TEST_NATIVE_READER_ROOT;
+    }
+  });
+
+  it('still matches a bare-id Codex takeover whose token lacks chatgpt_user_id', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-resync-codex-legacy-'));
+    temps.push(dir);
+    const auth = join(dir, 'auth.json');
+    writeFileSync(
+      auth,
+      JSON.stringify({
+        'openai-codex': {
+          type: 'oauth',
+          access: jwt({
+            'https://api.openai.com/auth': { chatgpt_account_id: 'claim-account' },
+          }),
+          refresh: 'codex-r',
+          expires: 9,
+          accountId: 'acct-1',
+        },
+      }) + '\n',
+    );
+    process.env.QLB_TEST_NATIVE_READER_ROOT = dir;
+    try {
+      const read = createNativeCredentialReader({ poolFilePath: join(dir, 'unused'), authJsonPath: auth });
+      assert.ok(await read('openai-codex', 'acct-1'));
+    } finally {
+      delete process.env.QLB_TEST_NATIVE_READER_ROOT;
+    }
+  });
+
+  it('does not match a slot-id Codex takeover for a different user', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-resync-codex-other-user-'));
+    temps.push(dir);
+    const auth = join(dir, 'auth.json');
+    writeFileSync(
+      auth,
+      JSON.stringify({
+        'openai-codex': {
+          type: 'oauth',
+          access: jwt({
+            'https://api.openai.com/auth': {
+              chatgpt_user_id: 'user-2',
+              chatgpt_account_id: 'claim-account',
+            },
+          }),
+          refresh: 'codex-r',
+          expires: 9,
+          accountId: 'acct-1',
+        },
+      }) + '\n',
+    );
+    process.env.QLB_TEST_NATIVE_READER_ROOT = dir;
+    try {
+      const read = createNativeCredentialReader({ poolFilePath: join(dir, 'unused'), authJsonPath: auth });
+      assert.equal(await read('openai-codex', 'user-1:acct-1'), null);
+    } finally {
+      delete process.env.QLB_TEST_NATIVE_READER_ROOT;
+    }
+  });
 });
 
 describe('bindDetectAndResync + MockKeychain', () => {
