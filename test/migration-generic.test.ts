@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { describe, it } from 'node:test';
@@ -487,6 +487,277 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       } finally {
         h.cleanup();
       }
+    }
+  });
+
+  it('T-S0b every command refuses an orphan or unreadable O, L, or Oc claim without changing durable state', () => {
+    for (const claim of ['O', 'L', 'Oc', 'unreadable-O', 'unreadable-L', 'unreadable-Oc'] as const) {
+      for (const command of ['stage', 'commit', 'rollback', 'resume'] as const) {
+        const h = setup('xai');
+        try {
+          const customPath = join(h.dir, 'custom-owner.json');
+          const useDefaultPath = claim === 'O' || claim === 'L' || claim === 'unreadable-O' || claim === 'unreadable-L';
+          const migration = useDefaultPath
+            ? h.mig
+            : createSingleGrantMigration(h.store, h.kc, 'xai', h.authPath, customPath);
+          const ownerPath = claim === 'O' || claim === 'unreadable-O' ? join(h.dir, 'qlb-owner.json')
+            : claim === 'L' || claim === 'unreadable-L' ? h.ownerPath
+              : customPath;
+          const unreadable = claim.startsWith('unreadable-');
+          const ownerBytes = unreadable
+            ? '{not valid JSON\n'
+            : claim === 'O'
+              ? JSON.stringify({ providers: { xai: { mode: 'qlb' } } }) + '\n'
+              : JSON.stringify({ owner: 'qlb', accounts: [{ provider: 'xai' }] }) + '\n';
+          writeFileSync(ownerPath, ownerBytes);
+
+          const service = qlbKeychainService('xai', expectedId('xai'));
+          const keychainBytes = JSON.stringify({ preserved: `${claim}-${command}` });
+          h.kc.setSync(service, expectedLabel('xai'), keychainBytes);
+          const journalBefore = h.store.getMigration('pi-xai');
+
+          assert.throws(
+            () => migration[command](),
+            (error: Error & { exitCode?: unknown }) => {
+              assert.match(error.message, /owner-file-orphan/);
+              assert.match(error.message, new RegExp(ownerPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+              if (unreadable) {
+                assert.match(error.message, /could not be read/);
+              } else if (claim === 'O') {
+                assert.match(error.message, /Remove only the xai entry.*do not delete the file/);
+              } else {
+                assert.match(error.message, /Remove the file/);
+              }
+              assert.equal(error.exitCode, 3);
+              return true;
+            },
+            `${claim}/${command} is refused`,
+          );
+
+          assert.equal(
+            h.kc.getSync(service, expectedLabel('xai')),
+            keychainBytes,
+            `${claim}/${command} leaves the Keychain bytes unchanged`,
+          );
+          assert.deepEqual(
+            readFileSync(ownerPath),
+            Buffer.from(ownerBytes),
+            `${claim}/${command} leaves the owner file bytes unchanged`,
+          );
+          assert.deepEqual(
+            h.store.getMigration('pi-xai'),
+            journalBefore,
+            `${claim}/${command} leaves the journal unchanged`,
+          );
+        } finally {
+          h.cleanup();
+        }
+      }
+    }
+  });
+
+  it('T-S0h refuses a later unreadable O/L/Oc claim even when an earlier claim is valid', async () => {
+    const cases = [
+      { name: 'valid O + dangling L', valid: 'O', unreadable: 'L' },
+      { name: 'valid O + malformed L', valid: 'O', unreadable: 'L-malformed' },
+      { name: 'valid L + unreadable Oc', valid: 'L', unreadable: 'Oc' },
+    ] as const;
+
+    for (const testCase of cases) {
+      for (const command of ['stage', 'commit', 'rollback', 'resume'] as const) {
+        const h = setup('xai');
+        try {
+          const customPath = join(h.dir, 'custom-owner.json');
+          const migration = testCase.unreadable === 'Oc'
+            ? createSingleGrantMigration(h.store, h.kc, 'xai', h.authPath, customPath)
+            : h.mig;
+          if (command !== 'stage') {
+            migration.stage();
+            await migration.rehearse(mockRehearse([]));
+          }
+
+          const mapPath = join(h.dir, 'qlb-owner.json');
+          const validPath = testCase.valid === 'O' ? mapPath : h.ownerPath;
+          writeFileSync(validPath, testCase.valid === 'O'
+            ? JSON.stringify({ providers: { xai: { mode: 'qlb' } } }) + '\n'
+            : JSON.stringify({ owner: 'qlb', accounts: [{ provider: 'xai' }] }) + '\n');
+          const unreadablePath = testCase.unreadable.startsWith('L') ? h.ownerPath : customPath;
+          if (testCase.unreadable === 'L') {
+            const target = join(h.dir, `missing-${command}`);
+            symlinkSync(target, unreadablePath);
+          } else {
+            writeFileSync(unreadablePath, '{not valid JSON\n');
+          }
+
+          const stagingPath = stagingOwnerPath(mapPath, 'xai');
+          const service = qlbKeychainService('xai', expectedId('xai'));
+          if (command === 'stage') {
+            h.kc.setSync(service, expectedLabel('xai'), JSON.stringify({ preserved: testCase.name }));
+          }
+          const journalBefore = h.store.getMigration('pi-xai');
+          const keychainBefore = h.kc.getSync(service, expectedLabel('xai'));
+          const stagingBefore = existsSync(stagingPath) ? readFileSync(stagingPath) : null;
+          const validBefore = readFileSync(validPath);
+          const unreadableBefore = testCase.unreadable === 'L'
+            ? readlinkSync(unreadablePath)
+            : readFileSync(unreadablePath);
+
+          assert.throws(() => migration[command](), (error: Error & { exitCode?: unknown }) => {
+            assert.match(error.message, new RegExp(`owner-file-orphan: ${unreadablePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} could not be read`));
+            assert.equal(error.exitCode, 3);
+            return true;
+          }, `${testCase.name}/${command} refuses the later unreadable claim`);
+          assert.deepEqual(h.store.getMigration('pi-xai'), journalBefore, `${testCase.name}/${command} preserves the journal`);
+          assert.equal(h.kc.getSync(qlbKeychainService('xai', expectedId('xai')), expectedLabel('xai')), keychainBefore, `${testCase.name}/${command} preserves Keychain`);
+          assert.deepEqual(existsSync(stagingPath) ? readFileSync(stagingPath) : null, stagingBefore, `${testCase.name}/${command} preserves staging`);
+          assert.deepEqual(readFileSync(validPath), validBefore, `${testCase.name}/${command} preserves the valid claim`);
+          if (testCase.unreadable === 'L') {
+            assert.equal(readlinkSync(unreadablePath), unreadableBefore, `${testCase.name}/${command} keeps the dangling link`);
+          } else {
+            assert.deepEqual(readFileSync(unreadablePath), unreadableBefore, `${testCase.name}/${command} preserves the unreadable claim`);
+          }
+        } finally {
+          h.cleanup();
+        }
+      }
+    }
+  });
+
+  it('T-S0i rehearse refuses an unreadable L before validating the journal', async () => {
+    const h = setup('xai');
+    try {
+      h.mig.stage();
+      writeFileSync(h.ownerPath, '{not valid JSON\n');
+      const journalBefore = h.store.getMigration('pi-xai');
+      const stagingPath = stagingOwnerPath(join(h.dir, 'qlb-owner.json'), 'xai');
+      const stagingBefore = readFileSync(stagingPath);
+      const keychainBefore = h.kc.getSync(qlbKeychainService('xai', expectedId('xai')), expectedLabel('xai'));
+      const ownerBefore = readFileSync(h.ownerPath);
+
+      await assert.rejects(
+        () => h.mig.rehearse(mockRehearse([])),
+        (error: Error & { exitCode?: unknown }) => {
+          assert.match(error.message, new RegExp(`owner-file-orphan: ${h.ownerPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} could not be read`));
+          assert.equal(error.exitCode, 3);
+          return true;
+        },
+      );
+      assert.deepEqual(h.store.getMigration('pi-xai'), journalBefore);
+      assert.deepEqual(readFileSync(stagingPath), stagingBefore);
+      assert.equal(h.kc.getSync(qlbKeychainService('xai', expectedId('xai')), expectedLabel('xai')), keychainBefore);
+      assert.deepEqual(readFileSync(h.ownerPath), ownerBefore);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('T-S0g refuses unreadable claims with write-ahead commit evidence without changing recovery artifacts', async () => {
+    for (const command of ['commit', 'rollback', 'resume'] as const) {
+      const h = setup('xai');
+      try {
+        h.mig.stage();
+        await h.mig.rehearse(mockRehearse([]));
+        const detail = JSON.parse(h.store.getMigration('pi-xai')!.detail_json) as Record<string, unknown>;
+        h.store.upsertMigration('pi-xai', 'VALIDATED', JSON.stringify({
+          ...detail,
+          commitGeneration: h.store.getGrantGeneration(expectedId('xai')),
+        }));
+        const mapPath = join(h.dir, 'qlb-owner.json');
+        const stagingPath = stagingOwnerPath(mapPath, 'xai');
+        writeFileSync(mapPath, '{not valid JSON\n');
+
+        const journalBefore = h.store.getMigration('pi-xai');
+        const keychainBefore = h.kc.getSync(qlbKeychainService('xai', expectedId('xai')), expectedLabel('xai'));
+        const stagingBefore = readFileSync(stagingPath);
+        const mapBefore = readFileSync(mapPath);
+
+        assert.throws(() => h.mig[command](), (error: Error & { exitCode?: unknown }) => {
+          assert.match(error.message, /owner-file-orphan: .*qlb-owner\.json could not be read/);
+          assert.equal(error.exitCode, 3);
+          return true;
+        }, `${command} refuses ambiguous C evidence`);
+        assert.deepEqual(h.store.getMigration('pi-xai'), journalBefore, `${command} preserves the journal`);
+        assert.equal(h.kc.getSync(qlbKeychainService('xai', expectedId('xai')), expectedLabel('xai')), keychainBefore, `${command} preserves the Keychain payload`);
+        assert.deepEqual(readFileSync(stagingPath), stagingBefore, `${command} preserves staging`);
+        assert.deepEqual(readFileSync(mapPath), mapBefore, `${command} preserves O`);
+        assert.equal(existsSync(h.ownerPath), false, `${command} does not create L`);
+      } finally {
+        h.cleanup();
+      }
+    }
+  });
+
+  it('T-S0g refuses dangling O, L, and Oc symlinks before stage or commit writes', async () => {
+    for (const claim of ['O', 'L', 'Oc'] as const) {
+      for (const command of ['stage', 'commit'] as const) {
+        const h = setup('xai');
+        try {
+          const customPath = join(h.dir, 'custom-owner.json');
+          const migration = claim === 'Oc'
+            ? createSingleGrantMigration(h.store, h.kc, 'xai', h.authPath, customPath)
+            : h.mig;
+          if (command === 'commit') {
+            migration.stage();
+            await migration.rehearse(mockRehearse([]));
+          }
+          const claimPath = claim === 'O' ? join(h.dir, 'qlb-owner.json')
+            : claim === 'L' ? h.ownerPath
+              : customPath;
+          const target = join(h.dir, `missing-${claim.toLowerCase()}-${command}`);
+          symlinkSync(target, claimPath);
+          const stagingPath = stagingOwnerPath(join(h.dir, 'qlb-owner.json'), 'xai');
+          const journalBefore = h.store.getMigration('pi-xai');
+          const keychainBefore = command === 'commit'
+            ? h.kc.getSync(qlbKeychainService('xai', expectedId('xai')), expectedLabel('xai'))
+            : null;
+          const stagingBefore = existsSync(stagingPath) ? readFileSync(stagingPath) : null;
+
+          assert.throws(() => migration[command](), (error: Error & { exitCode?: unknown }) => {
+            assert.match(error.message, /owner-file-orphan: .*could not be read/);
+            assert.equal(error.exitCode, 3);
+            return true;
+          }, `${claim}/${command} refuses the dangling link`);
+          assert.equal(readlinkSync(claimPath), target, `${claim}/${command} keeps the symlink`);
+          assert.equal(existsSync(target), false, `${claim}/${command} does not create the target`);
+          assert.deepEqual(h.store.getMigration('pi-xai'), journalBefore, `${claim}/${command} preserves the journal`);
+          if (keychainBefore === null) {
+            assert.throws(() => h.kc.getSync(qlbKeychainService('xai', expectedId('xai')), expectedLabel('xai')));
+          } else {
+            assert.equal(h.kc.getSync(qlbKeychainService('xai', expectedId('xai')), expectedLabel('xai')), keychainBefore, `${claim}/${command} preserves the Keychain payload`);
+          }
+          assert.deepEqual(existsSync(stagingPath) ? readFileSync(stagingPath) : null, stagingBefore, `${claim}/${command} preserves staging`);
+        } finally {
+          h.cleanup();
+        }
+      }
+    }
+  });
+
+  it('T-S0b treats an ENOTDIR claim lookup as present before stage writes anything', () => {
+    const h = setup('xai');
+    try {
+      const blockedParent = join(h.dir, 'not-a-directory');
+      writeFileSync(blockedParent, 'not a directory');
+      const customPath = join(blockedParent, 'custom-owner.json');
+      const migration = createSingleGrantMigration(h.store, h.kc, 'xai', h.authPath, customPath);
+      const journalBefore = h.store.getMigration('pi-xai');
+      const service = qlbKeychainService('xai', expectedId('xai'));
+      const keychainBytes = JSON.stringify({ preserved: 'ENOTDIR' });
+      h.kc.setSync(service, expectedLabel('xai'), keychainBytes);
+
+      assert.throws(
+        () => migration.stage(),
+        (error: Error & { exitCode?: unknown }) => {
+          assert.match(error.message, /owner-file-orphan/);
+          assert.match(error.message, /could not be read/);
+          assert.equal(error.exitCode, 3);
+          return true;
+        },
+      );
+      assert.deepEqual(h.store.getMigration('pi-xai'), journalBefore);
+      assert.equal(h.kc.getSync(service, expectedLabel('xai')), keychainBytes);
+    } finally {
+      h.cleanup();
     }
   });
 
@@ -999,6 +1270,112 @@ describe('static-key migration — openrouter (single API key, no OAuth)', () =>
     }
   });
 
+  it('T-S0g refuses an unreadable static-key O with commitStarted without changing recovery artifacts', async () => {
+    for (const command of ['commit', 'rollback', 'resume'] as const) {
+      const h = setupOpenRouter();
+      try {
+        h.mig.stage();
+        await h.mig.rehearse(mockOpenRouterRehearse([]));
+        const detail = JSON.parse(h.store.getMigration('pi-openrouter')!.detail_json) as Record<string, unknown>;
+        h.store.upsertMigration('pi-openrouter', 'VALIDATED', JSON.stringify({ ...detail, commitStarted: true }));
+        const stagingPath = stagingOwnerPath(h.ownerPath, 'openrouter');
+        writeFileSync(h.ownerPath, '{not valid JSON\n');
+
+        const journalBefore = h.store.getMigration('pi-openrouter');
+        const keychainBefore = h.kc.getSync(OPENROUTER_GATE_KEYCHAIN_SERVICE, QLB_KEYCHAIN_ACCOUNT);
+        const stagingBefore = readFileSync(stagingPath);
+        const ownerBefore = readFileSync(h.ownerPath);
+
+        assert.throws(() => h.mig[command](), (error: Error & { exitCode?: unknown }) => {
+          assert.match(error.message, /owner-file-orphan: .*qlb-owner\.json could not be read/);
+          assert.equal(error.exitCode, 3);
+          return true;
+        }, `${command} refuses ambiguous O evidence`);
+        assert.deepEqual(h.store.getMigration('pi-openrouter'), journalBefore, `${command} preserves the journal`);
+        assert.equal(h.kc.getSync(OPENROUTER_GATE_KEYCHAIN_SERVICE, QLB_KEYCHAIN_ACCOUNT), keychainBefore, `${command} preserves the Keychain payload`);
+        assert.deepEqual(readFileSync(stagingPath), stagingBefore, `${command} preserves staging`);
+        assert.deepEqual(readFileSync(h.ownerPath), ownerBefore, `${command} preserves O`);
+      } finally {
+        h.cleanup();
+      }
+    }
+  });
+
+  it('T-S0g refuses a dangling OpenRouter O symlink before stage or commit writes', async () => {
+    for (const command of ['stage', 'commit'] as const) {
+      const h = setupOpenRouter();
+      try {
+        if (command === 'commit') {
+          h.mig.stage();
+          await h.mig.rehearse(mockOpenRouterRehearse([]));
+        }
+        const target = join(h.dir, `missing-openrouter-o-${command}`);
+        symlinkSync(target, h.ownerPath);
+        const stagingPath = stagingOwnerPath(h.ownerPath, 'openrouter');
+        const journalBefore = h.store.getMigration('pi-openrouter');
+        const keychainBefore = command === 'commit'
+          ? h.kc.getSync(OPENROUTER_GATE_KEYCHAIN_SERVICE, QLB_KEYCHAIN_ACCOUNT)
+          : null;
+        const stagingBefore = existsSync(stagingPath) ? readFileSync(stagingPath) : null;
+
+        assert.throws(() => h.mig[command](), (error: Error & { exitCode?: unknown }) => {
+          assert.match(error.message, /owner-file-orphan: .*could not be read/);
+          assert.equal(error.exitCode, 3);
+          return true;
+        }, `${command} refuses the dangling O link`);
+        assert.equal(readlinkSync(h.ownerPath), target, `${command} keeps the symlink`);
+        assert.equal(existsSync(target), false, `${command} does not create the target`);
+        assert.deepEqual(h.store.getMigration('pi-openrouter'), journalBefore, `${command} preserves the journal`);
+        if (keychainBefore === null) {
+          assert.throws(() => h.kc.getSync(OPENROUTER_GATE_KEYCHAIN_SERVICE, QLB_KEYCHAIN_ACCOUNT));
+        } else {
+          assert.equal(h.kc.getSync(OPENROUTER_GATE_KEYCHAIN_SERVICE, QLB_KEYCHAIN_ACCOUNT), keychainBefore, `${command} preserves the Keychain payload`);
+        }
+        assert.deepEqual(existsSync(stagingPath) ? readFileSync(stagingPath) : null, stagingBefore, `${command} preserves staging`);
+      } finally {
+        h.cleanup();
+      }
+    }
+  });
+
+  it('T-S0e resumes or re-enters a static-key commit that crashes after the O write without classifying it as an orphan', async () => {
+    for (const recovery of ['resume', 'commit'] as const) {
+      const h = setupOpenRouter();
+      try {
+        h.mig.stage();
+        await h.mig.rehearse(mockOpenRouterRehearse([]));
+        const originalUpsertMigration = h.store.upsertMigration.bind(h.store);
+        let crashed = false;
+        h.store.upsertMigration = (store, state, detail) => {
+          if (!crashed && store === 'pi-openrouter' && state === 'QLB_OWNED') {
+            crashed = true;
+            throw new Error('simulated crash after O');
+          }
+          return originalUpsertMigration(store, state, detail);
+        };
+
+        assert.throws(() => h.mig.commit(), /simulated crash after O/);
+        assert.equal(crashed, true, 'the simulated crash follows the O write');
+        assert.equal(
+          JSON.parse(h.store.getMigration('pi-openrouter')!.detail_json).commitStarted,
+          true,
+          'the static-key commit journals commitStarted before O',
+        );
+        assert.equal(
+          JSON.parse(readFileSync(h.ownerPath, 'utf8')).providers.openrouter.mode,
+          'qlb',
+          'O was written before the crash',
+        );
+
+        h.store.upsertMigration = originalUpsertMigration;
+        const completed = h.mig[recovery]();
+        assert.equal(completed.state, 'QLB_OWNED', `${recovery} finishes C5 forward`);
+      } finally {
+        h.cleanup();
+      }
+    }
+  });
+
   it('openrouter commit refuses into a legacy v1 Anthropic owner document, leaving staging, Keychain and the document byte-identical', async () => {
     const h = setupOpenRouter();
     try {
@@ -1155,13 +1532,20 @@ describe('static-key migration — openrouter (single API key, no OAuth)', () =>
     }
   });
 
-  it('stage refuses while a legacy sidecar claims the provider', () => {
+  it('stage refuses an orphan legacy sidecar claim for the provider', () => {
     const h = setupOpenRouter();
     try {
       const legacyPath = join(h.dir, 'qlb-owner-openrouter.json');
       writeFileSync(legacyPath, JSON.stringify({ owner: 'qlb', accounts: [{ provider: 'openrouter' }] }) + '\n');
 
-      assert.throws(() => h.mig.stage(), /migration already/);
+      assert.throws(
+        () => h.mig.stage(),
+        (error: Error & { exitCode?: unknown }) => {
+          assert.match(error.message, /owner-file-orphan/);
+          assert.equal(error.exitCode, 3);
+          return true;
+        },
+      );
       assert.equal(openrouterKeychainHas(h.kc), false);
     } finally {
       h.cleanup();
