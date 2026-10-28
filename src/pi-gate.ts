@@ -13,7 +13,8 @@ import {
   type PiGateProvider,
   validatePiOwnerDocument as validateOwnerDocument,
 } from './pi-owner-document';
-import { openStoreConnection } from './store';
+import { openStore, openStoreConnection, type Store } from './store';
+import { recordRelogin } from './relogin';
 
 export { PI_GATE_PROVIDERS, type PiGateProvider } from './pi-owner-document';
 
@@ -25,11 +26,18 @@ export interface GateCredential {
   source: string;
 }
 
+/** Durable transition callbacks supplied by each production refresh entry point. */
+export interface GateRefreshContext {
+  onLineage: (row: { provider: 'xai' | 'kimi-coding'; fromFp: string; toFp: string }) => void;
+  onDead: (provider: 'xai' | 'kimi-coding') => void;
+}
+
 /** Provider slices own identity resolution and any synchronous refresh. */
 export interface ProviderGate {
   prerequisites?: () => void | Promise<void>;
   read(): GateCredential | Promise<GateCredential>;
-  refresh?: () => GateCredential | Promise<GateCredential>;
+  /** Optional in-process refresh. P13 waits for single-consume's winner here. */
+  refresh?: (current?: GateCredential, context?: GateRefreshContext) => GateCredential | Promise<GateCredential>;
 }
 
 /** A stable, value-free failure cause surfaced by a provider gate module. */
@@ -65,6 +73,10 @@ export interface PiGateDeps {
   open?: (dbPath: string) => DatabaseSync;
   sqlTrace?: (sql: string) => void;
   evidenceGap?: (provider: PiGateProvider, error: unknown) => void;
+  /** Injectable clock for the ≤60 s single-account gate boundary. */
+  now?: () => number;
+  /** Production defaults to a Store opened for this gate DB; tests may inject one. */
+  store?: Pick<Store, 'recordLineage' | 'recordRelogin'>;
   /** Command dispatch supplies the configured Pi agent directory. */
   piAgentDir?: string;
 }
@@ -250,7 +262,29 @@ export async function runPiGate(providerName: string, deps: PiGateDeps): Promise
     await (deps.prerequisites ?? ((name, connection) => defaultPrerequisites(name, connection, deps.dbPath, deps.piAgentDir)))(providerName, db);
     const gate = deps.provider ?? loadedProvider(providerName, deps.loadGate);
     await gate.prerequisites?.();
-    const credential = await gate.read();
+    let credential = await gate.read();
+    // §4.5: Pi never receives a single-account token with ≤60 seconds left.
+    // The provider refresh waits for the consume-lock winner, then re-reads it.
+    if (gate.refresh && credential?.expiresAt !== undefined && credential.expiresAt - (deps.now ?? Date.now)() <= 60_000) {
+      const needsAudit = providerName === 'xai' || providerName === 'kimi-coding';
+      const ownedStore = needsAudit && !deps.store ? openStore(deps.dbPath) : undefined;
+      const store = deps.store ?? ownedStore;
+      try {
+        credential = await gate.refresh(credential, store ? {
+          onLineage: (row) => store.recordLineage({
+            provider: row.provider, accountId: 'default', fromFp: row.fromFp, toFp: row.toFp,
+            cause: 'post', by: 'qlb-gate', evidence: 'post',
+          }),
+          onDead: (provider) => recordRelogin(store, { ts: (deps.now ?? Date.now)(), provider, accountId: 'default', kind: 'dead' }),
+        } : undefined);
+      } finally {
+        ownedStore?.close();
+      }
+      // Never hand Pi a just-refreshed token that cannot survive the gate horizon.
+      if (!credential || credential.expiresAt === undefined || credential.expiresAt - (deps.now ?? Date.now)() <= 60_000) {
+        throw new GateFailure('credential-unavailable');
+      }
+    }
     if (!credential || typeof credential.token !== 'string' || !credential.token ||
         typeof credential.accountId !== 'string' || !credential.accountId ||
         typeof credential.source !== 'string' || !credential.source) {

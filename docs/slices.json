@@ -61,7 +61,7 @@
     {"id":"P5b","start":["P0","P1","P6","C4"],"files":["extensions/qlb-pi/providers/openrouter.ts","src/gate/openrouter.ts","src/usage/openrouter.ts","test/qlb-pi-openrouter.test.ts"]},
     {"id":"P6b","start":["P6"],"files":["claude-config/hooks/lib/secret-exposure-rules.js"]},
     {"id":"P12","start":["A11","R0","R0c","P1"],"files":["src/pi-deploy.ts","src/commands/pi-deploy.ts","src/checks/pi-extension-drift.ts","src/checks/pi-stale-sessions.ts","test/pi-deploy.test.ts"]},
-    {"id":"P13","start":["P6","A5","A13","P4","P5","K3"],"files":["src/single-consume.ts","src/auto/xai.ts","src/auto/kimi-coding.ts","src/gate/xai.ts","src/gate/kimi-coding.ts","test/single-consume.test.ts","test/auto-single.test.ts"]},
+    {"id":"P13","start":["P6","A5","A13","P4","P5"],"files":["src/single-consume.ts","src/oauth/xai-refresh.ts","src/oauth/kimi-coding-refresh.ts","src/auto/xai.ts","src/auto/kimi-coding.ts","src/gate/xai.ts","src/gate/kimi-coding.ts","src/pi-gate.ts","test/single-consume.test.ts","test/auto-single.test.ts"]},
     {"id":"A2c","start":["A2b","A14","K13"],"files":["native/keychain-helper/main.swift","src/commands/keychain.ts","test/keychain-authorize.test.ts"]},
     {"id":"C3b","start":["C3","A13","C5b"],"files":["src/codex-attribution.ts","src/commands/codex-import-active.ts","test/codex-attribution.test.ts","test/external-login.test.ts"]},
     {"id":"K13b","start":["K13","A14"],"files":["src/cswap-agent.ts","src/commands/cutover.ts","test/cswap-agent-drain.test.ts"]},
