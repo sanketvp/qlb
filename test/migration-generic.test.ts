@@ -1060,6 +1060,77 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     }
   });
 
+  it('T-S7 resume with a cleanup-pending marker clears it into lastRollback, and a second resume is a no-op', () => {
+    const h = setup('xai');
+    try {
+      const marker = {
+        phase: 'cleanup-pending',
+        keychainDisposition: 'keep',
+        piFingerprint: null,
+        decision: null,
+        fencedGeneration: null,
+        rolledBackAt: 123,
+      };
+      const service = qlbKeychainService('xai', expectedId('xai'));
+      const account = expectedLabel('xai');
+      h.kc.setSync(service, account, JSON.stringify({ ...FAKE_GRANTS.xai, generation: 0 }));
+      h.store.upsertMigration('pi-xai', 'NATIVE', JSON.stringify({ handback: marker }));
+
+      const resumed = h.mig.resume();
+      const detail = resumed.detail;
+      assert.equal(resumed.state, 'NATIVE');
+      assert.equal(detail.handback, undefined, 'S7 clears the cleanup-pending marker');
+      assert.deepEqual(
+        detail.lastRollback,
+        { ...marker, rolledBackFrom: 'post-commit', cleanedAt: (detail.lastRollback as { cleanedAt: unknown }).cleanedAt },
+        'S7 preserves the complete marker as the rollback record',
+      );
+      assert.equal(typeof (detail.lastRollback as { cleanedAt: unknown }).cleanedAt, 'number');
+      const journalAfterFirstResume = h.store.getMigration('pi-xai');
+      const keychainAfterFirstResume = h.kc.getSync(service, account);
+
+      const repeated = h.mig.resume();
+      assert.deepEqual(repeated.detail, detail, 'a terminal second resume is a no-op');
+      assert.deepEqual(h.store.getMigration('pi-xai'), journalAfterFirstResume, 'the second resume does not rewrite the journal');
+      assert.equal(h.kc.getSync(service, account), keychainAfterFirstResume, 'the second resume keeps K_m');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('resume is never refused with a resume hint', async () => {
+    const cleanupPending = {
+      phase: 'cleanup-pending',
+      keychainDisposition: 'keep',
+      piFingerprint: null,
+      decision: null,
+      fencedGeneration: null,
+      rolledBackAt: 123,
+    };
+    for (const marker of ['intent', 'decision', 'cleanup-pending'] as const) {
+      const h = setup('xai');
+      try {
+        if (marker === 'decision') {
+          h.mig.stage();
+          await h.mig.rehearse(mockRehearse([]));
+          const row = h.store.getMigration('pi-xai')!;
+          h.store.upsertMigration('pi-xai', row.state, JSON.stringify({
+            ...JSON.parse(row.detail_json),
+            rollbackDecision: { kind: 'keychain' },
+          }));
+        } else {
+          h.store.upsertMigration('pi-xai', 'NATIVE', JSON.stringify(
+            marker === 'intent' ? { intent: 'rollback' } : { handback: cleanupPending },
+          ));
+        }
+
+        assert.doesNotThrow(() => h.mig.resume(), `${marker} routes through resume instead of refusing with a resume hint`);
+      } finally {
+        h.cleanup();
+      }
+    }
+  });
+
   it('rollback before commit: auth.json untouched; staged Keychain entries cleaned up', async () => {
     const h = setup('xai');
     try {
