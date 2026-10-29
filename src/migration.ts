@@ -1697,11 +1697,20 @@ export class Migration {
   /** S6a + S6b + S7. C3 removes backups and staging before recording cleanup completion. */
   private finishCleanupPendingHandback(handback: Record<string, unknown>): MigrationStatus {
     const syncedDirectories = new Set<string>();
+    const fsyncDirectoryIfPresent = (path: string): boolean => {
+      try {
+        statSync(path);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+        throw error;
+      }
+      this.fsyncDirectory(path);
+      return true;
+    };
     const fsyncDirectoryOnce = (path: string): void => {
       const canonicalPath = resolve(path);
-      if (syncedDirectories.has(canonicalPath) || !existsSync(path)) return;
-      this.fsyncDirectory(path);
-      syncedDirectories.add(canonicalPath);
+      if (syncedDirectories.has(canonicalPath)) return;
+      if (fsyncDirectoryIfPresent(path)) syncedDirectories.add(canonicalPath);
     };
     if (this.kind === 'single-grant') {
       const authKey = this.singleGrantAuthKey();
@@ -1718,7 +1727,7 @@ export class Migration {
     const staging = this.stagingPath();
     unlinkIfExists(staging);
     // S6b must be durable before S7 clears the retry marker.
-    fsyncDirectoryOnce(dirname(staging));
+    fsyncDirectoryIfPresent(dirname(staging));
     const detail = parseDetail(this.store.getMigration(this.storeName)?.detail_json);
     this.journal(this.journalState(), {
       handback: undefined,
