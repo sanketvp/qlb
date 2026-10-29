@@ -187,7 +187,15 @@ describe('qlb gate core (S30/S54)', () => {
     mkdirSync(agentDir, { recursive: true, mode: 0o700 });
     writeFileSync(paths.authJsonPath, JSON.stringify({
       xai: { type: 'oauth', access: 'xai-access', refresh: 'xai-refresh', expires: Date.now() + 60_000 },
-      'openai-codex': { type: 'oauth', access: 'codex-access', refresh: 'codex-refresh', expires: Date.now() + 60_000 },
+      'openai-codex': {
+        type: 'oauth',
+        access: `eyJhbGciOiJub25lIn0.${Buffer.from(JSON.stringify({
+          'https://api.openai.com/auth': { chatgpt_user_id: 'fixture-user', chatgpt_account_id: 'fixture-account' },
+        })).toString('base64url')}.sig`,
+        refresh: 'codex-refresh',
+        expires: Date.now() + 60_000,
+        accountId: 'fixture-account',
+      },
     }));
     const store = openStore(join(root, 'qlb.db'));
     try {
