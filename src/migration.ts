@@ -1694,8 +1694,13 @@ export class Migration {
     return out;
   }
 
-  /** S6b + S7. C3 removes staging before recording cleanup completion. */
+  /** S6a + S6b + S7. C3 removes backups and staging before recording cleanup completion. */
   private finishCleanupPendingHandback(handback: Record<string, unknown>): MigrationStatus {
+    if (this.kind === 'single-grant') {
+      // S6a precedes S6b/S7. Any failure leaves the marker durable so the
+      // next resume retries backup removal before clearing the hand-back.
+      removePiAuthBackup(this.poolFilePath, this.singleGrantAuthKey());
+    }
     const staging = this.stagingPath();
     unlinkIfExists(staging);
     // S6b must be durable before S7 clears the retry marker.
@@ -1875,6 +1880,7 @@ export function createSingleGrantMigration(
   authJsonPath: string,
   ownerFilePath: string,
   keyName: string = provider,
+  config: MigrationConfig = {},
 ): Migration {
   return new Migration(
     store,
@@ -1882,7 +1888,7 @@ export function createSingleGrantMigration(
     authJsonPath,
     ownerFilePath,
     migrationStoreNameFor(provider),
-    { kind: 'single-grant', provider, authJsonKey: keyName },
+    { ...config, kind: 'single-grant', provider, authJsonKey: keyName },
   );
 }
 

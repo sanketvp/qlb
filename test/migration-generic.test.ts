@@ -158,12 +158,15 @@ function setup(
   writeFileSync(authPath, original, { encoding: 'utf8', mode: 0o600 });
   const originalBytes = readFileSync(authPath);
   const store = openStore(join(dir, 'qlb.db'));
-  const mig = new Migration(store, kc, authPath, ownerPath, `pi-${provider}`, {
-    kind: 'single-grant',
+  const mig = createSingleGrantMigration(
+    store,
+    kc,
     provider,
-    authJsonKey: provider,
-    ...config,
-  });
+    authPath,
+    ownerPath,
+    provider,
+    config,
+  );
   return {
     dir,
     authPath,
@@ -1121,6 +1124,48 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       assert.deepEqual(repeated.detail, detail, 'a terminal second resume is a no-op');
       assert.deepEqual(h.store.getMigration('pi-xai'), journalAfterFirstResume, 'the second resume does not rewrite the journal');
       assert.equal(h.kc.getSync(service, account), keychainAfterFirstResume, 'the second resume keeps K_m');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('T-S6a backups are removed only under the cleanup-pending marker', () => {
+    const marker = {
+      phase: 'cleanup-pending',
+      keychainDisposition: 'keep',
+      piFingerprint: null,
+      decision: null,
+      fencedGeneration: null,
+      rolledBackAt: 123,
+    };
+    const h = setup('xai');
+    try {
+      const exact = piAuthBackupPath(h.authPath, 'xai');
+      const legacy = `${h.authPath}.qlb-xai.baseline.json`;
+      writePiAuthBackup(h.authPath, 'xai', 'fixture');
+      writeFileSync(legacy, JSON.stringify({ filePresent: true, entryPresent: true, entry: FAKE_GRANTS.xai }) + '\n');
+
+      h.mig.resume();
+      assert.equal(existsSync(exact), true, 'an at-rest resume does not remove the exact backup');
+      assert.equal(existsSync(legacy), true, 'an at-rest resume does not remove the legacy backup');
+
+      h.store.upsertMigration('pi-xai', 'NATIVE', JSON.stringify({ handback: marker }));
+      h.mig.resume();
+      assert.equal(existsSync(exact), false, 'S6a removes the exact backup under the marker');
+      assert.equal(existsSync(legacy), false, 'S6a removes the legacy backup under the marker');
+
+      mkdirSync(exact, { recursive: true });
+      h.store.upsertMigration('pi-xai', 'NATIVE', JSON.stringify({ handback: marker }));
+      assert.throws(() => h.mig.resume(), /EISDIR|directory/i, 'an S6a failure surfaces before S7');
+      assert.deepEqual(
+        JSON.parse(h.store.getMigration('pi-xai')!.detail_json).handback,
+        marker,
+        'a failed S6a keeps the marker for retry',
+      );
+
+      rmSync(exact, { recursive: true, force: true });
+      const settled = h.mig.resume();
+      assert.equal(settled.detail.handback, undefined, 'the next resume retries S6a then clears S7');
     } finally {
       h.cleanup();
     }
