@@ -8,6 +8,8 @@ import { CodexAuthLockCompromised, withCodexAuthLock, type CodexAuthLockOptions,
 import { codexFingerprint, parseCodexAuth, readCodexAuthStable, type CodexAuthDocument, type CodexAuthStableResult } from './codex-auth';
 import { isCredentialNotFound } from './credential-backends';
 import { planImportActiveCodex } from './codex-slots';
+import { codexAdmission, ensureCodexSlotAccount, rekeyCodexAccounts, type RekeySummary } from './codex-rekey';
+import { recordRestoreBaseline } from './codex-restore-baseline';
 import { QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, type KeychainBackend } from './keychain';
 import type { Store } from './store';
 
@@ -68,6 +70,7 @@ export interface CodexAddResult {
   slotId: string;
   /** False means a same-identity slot was re-bound with --replace. */
   added: boolean;
+  rekey: RekeySummary;
 }
 
 interface ExistingSlot {
@@ -143,6 +146,14 @@ function persist(
         if (input.replace !== undefined && (!existing || input.replace !== identity.slotId)) {
           throw new CodexAddError('Codex replacement identity differs; add as a new account and delete the old slot', 3);
         }
+        const refusal = codexAdmission(db, { slotId: identity.slotId, bareAccountId: identity.accountId });
+        if (refusal) throw new CodexAddError(refusal.message, 3);
+        const now = deps.now();
+        const summary = rekeyCodexAccounts(db, {
+          dbPath: deps.store.dbPath,
+          now,
+          prospective: { accountId: identity.slotId, chatgptAccountId: identity.accountId },
+        });
 
         // Snapshot both values before the first write. A failed replacement must
         // leave the current/predecessor pair exactly as it found it.
@@ -179,7 +190,6 @@ function persist(
         assertAuthLockHeld();
         deps.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, writtenCredential);
 
-        const now = deps.now();
         assertAuthLockHeld();
         db.prepare(`INSERT INTO codex_slots (
           account_id, chatgpt_user_id, chatgpt_account_id, fingerprint, prev_fingerprint,
@@ -196,10 +206,7 @@ function persist(
           identity.slotId, identity.chatgptUserId, identity.accountId, fingerprint, doc.last_refresh ?? null, now,
         );
         assertAuthLockHeld();
-        db.prepare(`INSERT INTO accounts (id, provider, label, status, created_at)
-          VALUES (?, ?, ?, 'active', ?)
-          ON CONFLICT(id) DO UPDATE SET provider = excluded.provider`)
-          .run(identity.accountId, PROVIDER, identity.accountId, now);
+        ensureCodexSlotAccount(db, identity.slotId, now);
         assertAuthLockHeld();
         db.prepare(`INSERT INTO lineage_log (ts, provider, account_id, from_fp, to_fp, cause, by, evidence)
           VALUES (?, ?, ?, ?, ?, ?, 'qlb-cli', ?)`)
@@ -210,9 +217,16 @@ function persist(
             VALUES (?, ?, ?, 'identity-replaced', NULL, 'identity')`)
             .run(now, PROVIDER, identity.slotId);
         }
+        if (summary.backupTaken) {
+          recordRestoreBaseline(db, {
+            saveKind: exists ? 'add-replace' : 'add',
+            backupPath: summary.backupTaken,
+            keychain: deps.keychain as KeychainBackend,
+          });
+        }
         assertAuthLockHeld();
         db.exec('COMMIT');
-        return { slotId: identity.slotId, added: !exists };
+        return { slotId: identity.slotId, added: !exists, rekey: summary };
       } catch (error) {
         // Compensate before ROLLBACK releases BEGIN IMMEDIATE. Each write is
         // conditional so an ambiguous write failure cannot overwrite a value

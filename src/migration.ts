@@ -119,6 +119,8 @@ import {
 } from 'node:fs';
 import { dirname, join, resolve, sep } from 'node:path';
 import { config } from './config';
+import { codexSlotIdFromAccessToken } from './codex-auth';
+import { codexHeaderAccountId } from './codex-slots';
 import { fsyncDirSync } from './fsutil';
 import { qlbHomeDir } from './home';
 import type { KeychainBackend } from './keychain';
@@ -202,13 +204,13 @@ export function isMigrateProvider(value: string | undefined): value is MigratePr
 /**
  * Phase 0 adapter accountId conventions. MUST stay in lockstep with
  * `src/adapters/{xai,kimi,codex,openrouter}.ts` so resolve/scoring keep
- * working after cutover. Codex falls back to `codex-default` when the grant
- * has no chatgpt_account_id (the adapter does the same).
+ * working after cutover. `codex-default` is a legacy name, recognised only
+ * for old rows.
  */
 export const ADAPTER_ACCOUNT_IDS: Record<SingleGrantProvider | StaticKeyProvider, string> = {
   xai: 'xai-default',
   'kimi-coding': 'kimi-default',
-  'openai-codex': 'codex-default',
+  'openai-codex': 'codex-default', // legacy name, recognised only for old rows
   openrouter: 'openrouter-default',
 };
 
@@ -598,7 +600,7 @@ function chatgptAccountIdFromJwt(token: string | undefined): string | undefined 
  * AccountId used for Keychain + journal. Must match Phase 0 adapters:
  *   xai.ts          → 'xai-default'
  *   kimi.ts         → 'kimi-default'
- *   codex.ts        → JWT chatgpt_account_id ?? 'codex-default'
+ *   codex.ts        → S29 slot identity
  */
 export function legacyCodexAccountIdForSingleGrant(
   grant: { accountId?: string; access?: string },
@@ -614,7 +616,9 @@ export function accountIdForSingleGrant(
   grant: { accountId?: string; access?: string },
 ): string {
   if (provider === 'openai-codex') {
-    return legacyCodexAccountIdForSingleGrant(grant);
+    const accountId = codexSlotIdFromAccessToken(grant.access ?? '', grant.accountId);
+    if (!accountId) throw new Error('codex-identity-missing');
+    return accountId;
   }
   return ADAPTER_ACCOUNT_IDS[provider];
 }
@@ -711,9 +715,8 @@ export async function defaultRehearseFn(
         'Content-Type': 'application/json',
         originator: 'codex_cli_rs',
       };
-      if (account.id !== 'codex-default') {
-        headers['chatgpt-account-id'] = account.id;
-      }
+      const accountId = codexHeaderAccountId(null, account.id);
+      if (accountId !== undefined) headers['chatgpt-account-id'] = accountId;
       const res = await fetch('https://chatgpt.com/backend-api/codex/responses', {
         method: 'POST',
         headers,

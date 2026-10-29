@@ -86,7 +86,7 @@ function dbRows(path: string): { slot: Record<string, unknown> | undefined; acco
   try {
     return {
       slot: plain(db.prepare('SELECT account_id, chatgpt_user_id, chatgpt_account_id, source FROM codex_slots').get() as Record<string, unknown> | undefined),
-      account: plain(db.prepare("SELECT id, provider, status FROM accounts WHERE id = 'fixture-account'").get() as Record<string, unknown> | undefined),
+      account: plain(db.prepare("SELECT id, provider, status FROM accounts WHERE id = 'fixture-user:fixture-account'").get() as Record<string, unknown> | undefined),
       active: plain(db.prepare("SELECT provider, account_id, set_by FROM active_login WHERE provider = 'openai-codex'").get() as Record<string, unknown> | undefined),
       lineage: plain(db.prepare("SELECT provider, account_id, cause, by, evidence FROM lineage_log WHERE provider = 'openai-codex'").get() as Record<string, unknown> | undefined),
       baseline: (db.prepare("SELECT value FROM config WHERE key = 'pi.openai-codex.baselineConsumedBy'").get() as { value?: string } | undefined)?.value,
@@ -142,12 +142,20 @@ describe('Codex slots and import-active', () => {
     }
   });
 
-  it('imports the whole document, account rows, active identity, lineage, and a matching Pi baseline', () => {
+  it('import-active renames the bare row to the slot id with readings, pins, lease and failover pointer (file-backed)', () => {
     const h = fixture();
     try {
-      // This is the adapter's existing bare-id row. Import must link the S29
-      // slot to it, not create a composite accounts row that resolve can pick.
+      // This is an adapter-era bare-id row. Import moves it and its dependents to the S29 slot id.
       h.store.upsertAccount('fixture-account', 'openai-codex', 'adapter-owned label', 'active');
+      const seed = (h.store as unknown as { db: DatabaseSync }).db;
+      seed.prepare(`INSERT INTO snapshots (account_id, bucket, used_pct, fetched_at)
+        VALUES ('fixture-account', 'primary', 12, 1)`).run();
+      seed.prepare(`INSERT INTO overrides (kind, account_id, session, until)
+        VALUES ('pin', 'fixture-account', 'fixture-session', 2)`).run();
+      seed.prepare(`INSERT INTO leases (name, holder_pid, holder_id, until, generation)
+        VALUES ('refresh:fixture-account', 1, 'fixture-holder', 1699999999999, 0)`).run();
+      seed.prepare(`INSERT INTO config (key, value)
+        VALUES ('failover:openai-codex', 'fixture-account')`).run();
       const result = importActiveCodexSlot(parsedDocument(), {
         store: h.store,
         keychain: h.keychain,
@@ -158,15 +166,26 @@ describe('Codex slots and import-active', () => {
       assert.doesNotThrow(() => h.keychain.getSync(qlbKeychainService('openai-codex', result.slotId), QLB_KEYCHAIN_ACCOUNT));
       assert.deepEqual(dbRows(h.store.dbPath), {
         slot: { account_id: 'fixture-user:fixture-account', chatgpt_user_id: 'fixture-user', chatgpt_account_id: 'fixture-account', source: 'import-active' },
-        account: { id: 'fixture-account', provider: 'openai-codex', status: 'active' },
+        account: { id: 'fixture-user:fixture-account', provider: 'openai-codex', status: 'active' },
         active: { provider: 'openai-codex', account_id: 'fixture-user:fixture-account', set_by: 'import' },
         lineage: { provider: 'openai-codex', account_id: 'fixture-user:fixture-account', cause: 'import', by: 'qlb-cli', evidence: 'import' },
         baseline: 'fixture-user:fixture-account',
       });
       const db = new DatabaseSync(h.store.dbPath, { readOnly: true });
       try {
+        const slotId = 'fixture-user:fixture-account';
         assert.equal((db.prepare("SELECT count(*) AS count FROM accounts WHERE provider = 'openai-codex'").get() as { count: number }).count, 1);
-        assert.deepEqual(snapshotsFromStore(h.store, 'openai-codex').map((snapshot) => snapshot.accountId), ['fixture-account']);
+        assert.equal((db.prepare('SELECT id FROM accounts WHERE id = ?').get(slotId) as { id: string }).id, slotId);
+        assert.equal((db.prepare('SELECT account_id FROM snapshots WHERE bucket = ?').get('primary') as { account_id: string }).account_id, slotId);
+        assert.equal((db.prepare('SELECT account_id FROM overrides WHERE kind = ?').get('pin') as { account_id: string }).account_id, slotId);
+        assert.equal((db.prepare('SELECT name FROM leases').get() as { name: string }).name, `refresh:${slotId}`);
+        assert.equal((db.prepare('SELECT value FROM config WHERE key = ?').get('failover:openai-codex') as { value: string }).value, slotId);
+        assert.equal((db.prepare(`SELECT count(*) AS count FROM accounts WHERE id = 'fixture-account'`).get() as { count: number }).count, 0);
+        assert.equal((db.prepare(`SELECT count(*) AS count FROM snapshots WHERE account_id = 'fixture-account'`).get() as { count: number }).count, 0);
+        assert.equal((db.prepare(`SELECT count(*) AS count FROM overrides WHERE account_id = 'fixture-account'`).get() as { count: number }).count, 0);
+        assert.equal((db.prepare(`SELECT count(*) AS count FROM leases WHERE name = 'refresh:fixture-account'`).get() as { count: number }).count, 0);
+        assert.equal((db.prepare(`SELECT count(*) AS count FROM config WHERE key = 'failover:openai-codex' AND value = 'fixture-account'`).get() as { count: number }).count, 0);
+        assert.deepEqual(snapshotsFromStore(h.store, 'openai-codex').map((snapshot) => snapshot.accountId), [slotId]);
       } finally {
         db.close();
       }
@@ -176,7 +195,7 @@ describe('Codex slots and import-active', () => {
     }
   });
 
-  it('uses the token account id for import-active and adapter upserts without recreating codex-default', async () => {
+  it('uses the token account id for import-active while the adapter writes no account row', async () => {
     const h = fixture();
     try {
       const doc = parsedDocumentWithAccountIds('token-account', undefined);
@@ -184,17 +203,16 @@ describe('Codex slots and import-active', () => {
       const adapter = createCodexAdapter({
         authPath: join(h.home, 'auth.json'),
         readAuth: async () => JSON.stringify(doc),
-        upsertAccount: h.store.upsertAccount.bind(h.store),
       });
 
       const [snapshot] = await adapter.fetchSnapshots();
       assert.equal(plan.accountId, 'token-account');
-      assert.equal(snapshot?.accountId, plan.accountId);
+      assert.equal(snapshot?.accountId, plan.slotId);
       const db = new DatabaseSync(h.store.dbPath, { readOnly: true });
       try {
         assert.deepEqual(
           (db.prepare("SELECT id FROM accounts WHERE provider = 'openai-codex' ORDER BY id").all() as Array<{ id: string }>).map((row) => row.id),
-          ['token-account'],
+          ['fixture-user:token-account'],
         );
       } finally {
         db.close();
@@ -212,11 +230,10 @@ describe('Codex slots and import-active', () => {
       const adapter = createCodexAdapter({
         authPath: join(h.home, 'auth.json'),
         readAuth: async () => JSON.stringify(doc),
-        upsertAccount: h.store.upsertAccount.bind(h.store),
       });
 
       assert.equal(planImportActiveCodex(doc).accountId, 'token-account');
-      assert.equal((await adapter.fetchSnapshots())[0]?.accountId, 'token-account');
+      assert.equal((await adapter.fetchSnapshots())[0]?.accountId, 'fixture-user:token-account');
     } finally {
       h.store.close();
       rmSync(h.home, { recursive: true, force: true });
@@ -230,11 +247,10 @@ describe('Codex slots and import-active', () => {
       const adapter = createCodexAdapter({
         authPath: join(h.home, 'auth.json'),
         readAuth: async () => JSON.stringify(doc),
-        upsertAccount: h.store.upsertAccount.bind(h.store),
       });
 
       assert.equal(planImportActiveCodex(doc).accountId, 'claim-account');
-      assert.equal((await adapter.fetchSnapshots())[0]?.accountId, 'claim-account');
+      assert.equal((await adapter.fetchSnapshots())[0]?.accountId, 'fixture-user:claim-account');
     } finally {
       h.store.close();
       rmSync(h.home, { recursive: true, force: true });
@@ -390,7 +406,7 @@ describe('Codex slots and import-active', () => {
               }
               return target.exec(sql);
             };
-            const value = Reflect.get(target, property, receiver);
+            const value = Reflect.get(target, property, target);
             return typeof value === 'function' ? value.bind(target) : value;
           },
         });
