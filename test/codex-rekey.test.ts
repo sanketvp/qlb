@@ -373,6 +373,16 @@ describe('Codex rekey planner', () => {
     } finally { f.close(); }
   });
 
+  it('a self-target is not reported even when recovery is pending', () => {
+    const f = fixture();
+    try {
+      slot(f.db, 'bare', 'bare');
+      account(f.db, 'bare', 'openai-codex');
+      f.db.prepare(`INSERT INTO config (key, value) VALUES ('migrations.recovery_pending', '1')`).run();
+      assert.deepEqual(plan(f.db), { moves: [], skipped: [] });
+    } finally { f.close(); }
+  });
+
   it('a slot already on its own id produces no move and changes nothing', () => {
     const f = fixture();
     try {
@@ -646,7 +656,7 @@ describe('Codex rekey apply', () => {
     } finally { f.close(); }
   });
 
-  it('a NULL-bucket snapshot moves on rename and clashes by the reading rule on merge', () => {
+  it('a NULL-bucket snapshot moves on rename and on merge', () => {
     const rename = fixture();
     try {
       slot(rename.db, 'user:bare', 'bare');
@@ -667,10 +677,49 @@ describe('Codex rekey apply', () => {
       merge.db.prepare(`INSERT INTO snapshots (account_id, bucket, used_pct, fetched_at)
         VALUES ('bare', NULL, 80, 20), ('user:bare', NULL, 10, 10)`).run();
       applyPlan(merge.db);
-      assert.deepEqual(plainRows(merge.db.prepare('SELECT * FROM snapshots ORDER BY account_id, bucket').all()), [
-        { account_id: 'user:bare', bucket: null, used_pct: 80, used: null, limit_val: null, remaining: null, reset_at: null, fetched_at: 20, source: null, confidence: null },
+      assert.deepEqual(plainRows(merge.db.prepare(`SELECT account_id, bucket, used_pct, fetched_at
+        FROM snapshots ORDER BY fetched_at`).all()), [
+        { account_id: 'user:bare', bucket: null, used_pct: 10, fetched_at: 10 },
+        { account_id: 'user:bare', bucket: null, used_pct: 80, fetched_at: 20 },
       ]);
     } finally { merge.close(); }
+  });
+
+  it('several NULL-bucket readings all survive a merge', () => {
+    const f = fixture();
+    try {
+      slot(f.db, 'user:bare', 'bare');
+      account(f.db, 'bare', 'openai-codex');
+      account(f.db, 'user:bare', 'openai-codex');
+      f.db.prepare(`INSERT INTO snapshots (account_id, bucket, fetched_at) VALUES
+        ('bare', NULL, 5), ('bare', NULL, 20), ('user:bare', NULL, 10)`).run();
+      applyPlan(f.db);
+      assert.deepEqual(plainRows(f.db.prepare(`SELECT account_id, bucket, fetched_at
+        FROM snapshots ORDER BY fetched_at`).all()), [
+        { account_id: 'user:bare', bucket: null, fetched_at: 5 },
+        { account_id: 'user:bare', bucket: null, fetched_at: 10 },
+        { account_id: 'user:bare', bucket: null, fetched_at: 20 },
+      ]);
+      assert.equal(f.db.prepare("SELECT 1 FROM accounts WHERE id = 'bare'").get(), undefined);
+    } finally { f.close(); }
+  });
+
+  it('several NULL-bucket readings all survive a rename', () => {
+    for (const fetchedAts of [[5, 20], [20, 5]]) {
+      const f = fixture();
+      try {
+        slot(f.db, 'user:bare', 'bare');
+        account(f.db, 'bare', 'openai-codex');
+        f.db.prepare(`INSERT INTO snapshots (account_id, bucket, fetched_at) VALUES
+          ('bare', NULL, ?), ('bare', NULL, ?)`).run(...fetchedAts);
+        applyPlan(f.db);
+        assert.deepEqual(plainRows(f.db.prepare(`SELECT account_id, bucket, fetched_at
+          FROM snapshots ORDER BY fetched_at`).all()), [
+          { account_id: 'user:bare', bucket: null, fetched_at: 5 },
+          { account_id: 'user:bare', bucket: null, fetched_at: 20 },
+        ]);
+      } finally { f.close(); }
+    }
   });
 
   it('a clashing expired poll claim keeps the target claim', () => {

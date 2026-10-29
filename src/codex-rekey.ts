@@ -126,7 +126,14 @@ export function planCodexRekey(db: DatabaseSync, options: PlanCodexRekeyOptions)
     if (provablyCodex) candidates.set(id, { id, kind: 'orphan' });
   }
 
-  const orderedCandidates = [...candidates.values()].sort((a, b) => byteOrder(a.id, b.id));
+  const orderedCandidates = [...candidates.values()]
+    .filter((candidate) => {
+      const targets = candidate.id === 'codex-default'
+        ? [...slots.keys()]
+        : slotBares.get(candidate.id) ?? [];
+      return targets.length !== 1 || targets[0] !== candidate.id;
+    })
+    .sort((a, b) => byteOrder(a.id, b.id));
   const result = (): CodexRekeyPlan => ({
     moves: [],
     skipped: [...skipped.entries()]
@@ -254,27 +261,32 @@ function readRekeyAudit(db: DatabaseSync): Record<string, RekeyAuditEntry> {
 }
 
 function moveSnapshots(db: DatabaseSync, from: string, to: string): void {
-  const sourceRows = db.prepare('SELECT bucket, fetched_at FROM snapshots WHERE account_id = ?').all(from) as Array<{
+  const sourceRows = db.prepare('SELECT rowid, bucket, fetched_at FROM snapshots WHERE account_id = ?').all(from) as Array<{
+    rowid: number;
     bucket: string | null;
     fetched_at: number | null;
   }>;
-  const findTarget = db.prepare('SELECT fetched_at FROM snapshots WHERE account_id = ? AND bucket IS ?');
-  const moveSource = db.prepare('UPDATE snapshots SET account_id = ? WHERE account_id = ? AND bucket IS ?');
-  const deleteSnapshot = db.prepare('DELETE FROM snapshots WHERE account_id = ? AND bucket IS ?');
+  const findTarget = db.prepare('SELECT rowid, fetched_at FROM snapshots WHERE account_id = ? AND bucket = ?');
+  const moveSource = db.prepare('UPDATE snapshots SET account_id = ? WHERE rowid = ?');
+  const deleteSnapshot = db.prepare('DELETE FROM snapshots WHERE rowid = ?');
 
   for (const source of sourceRows) {
-    const target = findTarget.get(to, source.bucket) as { fetched_at: number | null } | undefined;
+    if (source.bucket === null) {
+      moveSource.run(to, source.rowid);
+      continue;
+    }
+    const target = findTarget.get(to, source.bucket) as { rowid: number; fetched_at: number | null } | undefined;
     if (!target) {
-      moveSource.run(to, from, source.bucket);
+      moveSource.run(to, source.rowid);
       continue;
     }
     const sourceWins = source.fetched_at !== null
       && (target.fetched_at === null || source.fetched_at > target.fetched_at);
     if (sourceWins) {
-      deleteSnapshot.run(to, source.bucket);
-      moveSource.run(to, from, source.bucket);
+      deleteSnapshot.run(target.rowid);
+      moveSource.run(to, source.rowid);
     } else {
-      deleteSnapshot.run(from, source.bucket);
+      deleteSnapshot.run(source.rowid);
     }
   }
 }
