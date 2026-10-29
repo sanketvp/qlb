@@ -123,7 +123,7 @@ import { fsyncDirSync } from './fsutil';
 import { qlbHomeDir } from './home';
 import type { KeychainBackend } from './keychain';
 import { openRouterMissingKeyMessage, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, readNativeOpenRouterKey } from './keychain';
-import { removePiAuthBackup } from './pi-auth-backup';
+import { legacyPiAuthBackupPath, piAuthBackupPath, removePiAuthBackup } from './pi-auth-backup';
 import { parseGrant } from './refresh-lease';
 import { hasLegacyPiOwnerEntry, PiOwnerLegacyError, readPiOwnerProviders, withPiAuthLock, writePiOwnerEntry } from './pi-migrate';
 import { OPENROUTER_GATE_KEYCHAIN_SERVICE } from './token/openrouter';
@@ -1694,12 +1694,40 @@ export class Migration {
     return out;
   }
 
-  /** S6b + S7. C3 removes staging before recording cleanup completion. */
+  /** S6a + S6b + S7. C3 removes backups and staging before recording cleanup completion. */
   private finishCleanupPendingHandback(handback: Record<string, unknown>): MigrationStatus {
+    const syncedDirectories = new Set<string>();
+    const fsyncDirectoryIfPresent = (path: string): boolean => {
+      try {
+        statSync(path);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+        throw error;
+      }
+      this.fsyncDirectory(path);
+      return true;
+    };
+    const fsyncDirectoryOnce = (path: string): void => {
+      const canonicalPath = resolve(path);
+      if (syncedDirectories.has(canonicalPath)) return;
+      if (fsyncDirectoryIfPresent(path)) syncedDirectories.add(canonicalPath);
+    };
+    if (this.kind === 'single-grant') {
+      const authKey = this.singleGrantAuthKey();
+      const exactBackup = piAuthBackupPath(this.poolFilePath, authKey);
+      const legacyBackup = legacyPiAuthBackupPath(this.poolFilePath, authKey);
+      // S6a precedes S6b/S7. Any failure leaves the marker durable so the
+      // next resume retries backup removal before clearing the hand-back.
+      removePiAuthBackup(this.poolFilePath, authKey);
+      // A retry must re-sync backup parents: an earlier unlink may not be
+      // durable yet. S6a must be durable before S7 clears the retry marker.
+      fsyncDirectoryOnce(dirname(exactBackup));
+      fsyncDirectoryOnce(dirname(legacyBackup));
+    }
     const staging = this.stagingPath();
     unlinkIfExists(staging);
     // S6b must be durable before S7 clears the retry marker.
-    this.fsyncDirectory(dirname(staging));
+    fsyncDirectoryIfPresent(dirname(staging));
     const detail = parseDetail(this.store.getMigration(this.storeName)?.detail_json);
     this.journal(this.journalState(), {
       handback: undefined,
@@ -1875,6 +1903,7 @@ export function createSingleGrantMigration(
   authJsonPath: string,
   ownerFilePath: string,
   keyName: string = provider,
+  config: Omit<MigrationConfig, 'kind' | 'provider' | 'authJsonKey'> = {},
 ): Migration {
   return new Migration(
     store,
@@ -1882,7 +1911,7 @@ export function createSingleGrantMigration(
     authJsonPath,
     ownerFilePath,
     migrationStoreNameFor(provider),
-    { kind: 'single-grant', provider, authJsonKey: keyName },
+    { ...config, kind: 'single-grant', provider, authJsonKey: keyName },
   );
 }
 

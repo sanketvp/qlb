@@ -3,7 +3,7 @@ import { spawn } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { describe, it } from 'node:test';
+import { describe, it, mock } from 'node:test';
 import { createOwnedCredentialSource } from '../src/credentials';
 import { MockKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from '../src/keychain';
 import { OPENROUTER_GATE_KEYCHAIN_SERVICE } from '../src/token/openrouter';
@@ -26,8 +26,10 @@ import {
 } from '../src/migration';
 import { parseGrant } from '../src/refresh-lease';
 import type { RollbackDecision } from '../src/single-grant-ownership';
-import { piAuthBackupPath, writePiAuthBackup } from '../src/pi-auth-backup';
+import { legacyPiAuthBackupPath, piAuthBackupPath, writePiAuthBackup } from '../src/pi-auth-backup';
 import { openStore } from '../src/store';
+
+const fs = require('node:fs') as typeof import('node:fs');
 
 /**
  * Fixture grants — fake tokens only. This file never points at the live
@@ -158,12 +160,15 @@ function setup(
   writeFileSync(authPath, original, { encoding: 'utf8', mode: 0o600 });
   const originalBytes = readFileSync(authPath);
   const store = openStore(join(dir, 'qlb.db'));
-  const mig = new Migration(store, kc, authPath, ownerPath, `pi-${provider}`, {
-    kind: 'single-grant',
+  const mig = createSingleGrantMigration(
+    store,
+    kc,
     provider,
-    authJsonKey: provider,
-    ...config,
-  });
+    authPath,
+    ownerPath,
+    provider,
+    config,
+  );
   return {
     dir,
     authPath,
@@ -1126,6 +1131,244 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     }
   });
 
+  it('T-S6a backups are removed only under the cleanup-pending marker', () => {
+    const marker = {
+      phase: 'cleanup-pending',
+      keychainDisposition: 'keep',
+      piFingerprint: null,
+      decision: null,
+      fencedGeneration: null,
+      rolledBackAt: 123,
+    };
+    const h = setup('xai');
+    try {
+      const exact = piAuthBackupPath(h.authPath, 'xai');
+      const legacy = `${h.authPath}.qlb-xai.baseline.json`;
+      writePiAuthBackup(h.authPath, 'xai', 'fixture');
+      writeFileSync(legacy, JSON.stringify({ filePresent: true, entryPresent: true, entry: FAKE_GRANTS.xai }) + '\n');
+
+      h.mig.resume();
+      assert.equal(existsSync(exact), true, 'an at-rest resume does not remove the exact backup');
+      assert.equal(existsSync(legacy), true, 'an at-rest resume does not remove the legacy backup');
+
+      h.store.upsertMigration('pi-xai', 'NATIVE', JSON.stringify({ handback: marker }));
+      h.mig.resume();
+      assert.equal(existsSync(exact), false, 'S6a removes the exact backup under the marker');
+      assert.equal(existsSync(legacy), false, 'S6a removes the legacy backup under the marker');
+
+      mkdirSync(exact, { recursive: true });
+      h.store.upsertMigration('pi-xai', 'NATIVE', JSON.stringify({ handback: marker }));
+      assert.throws(() => h.mig.resume(), /EISDIR|directory/i, 'an S6a failure surfaces before S7');
+      assert.deepEqual(
+        JSON.parse(h.store.getMigration('pi-xai')!.detail_json).handback,
+        marker,
+        'a failed S6a keeps the marker for retry',
+      );
+
+      rmSync(exact, { recursive: true, force: true });
+      const settled = h.mig.resume();
+      assert.equal(settled.detail.handback, undefined, 'the next resume retries S6a then clears S7');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('T-S6a backup removal is made durable before the marker is cleared', () => {
+    const marker = {
+      phase: 'cleanup-pending',
+      keychainDisposition: 'keep',
+      piFingerprint: null,
+      decision: null,
+      fencedGeneration: null,
+      rolledBackAt: 123,
+    };
+    const calls: string[] = [];
+    const h = setup('xai', new MockKeychain(), {
+      fsyncDirectory: (path) => {
+        calls.push(path);
+        assert.equal(existsSync(piAuthBackupPath(h.authPath, 'xai')), false, 'S6a removes the exact backup before its directory sync');
+        assert.equal(existsSync(legacyPiAuthBackupPath(h.authPath, 'xai')), false, 'S6a removes the legacy backup before its directory sync');
+        const detail = JSON.parse(h.store.getMigration('pi-xai')!.detail_json) as Record<string, unknown>;
+        assert.deepEqual(detail.handback, marker, 'S6a directory sync runs before S7 clears the durable marker');
+      },
+    });
+    try {
+      const exact = piAuthBackupPath(h.authPath, 'xai');
+      const legacy = legacyPiAuthBackupPath(h.authPath, 'xai');
+      writePiAuthBackup(h.authPath, 'xai', 'fixture');
+      writeFileSync(legacy, JSON.stringify({ filePresent: true, entryPresent: true, entry: FAKE_GRANTS.xai }) + '\n');
+      h.store.upsertMigration('pi-xai', 'NATIVE', JSON.stringify({ handback: marker }));
+
+      const settled = h.mig.resume();
+
+      assert.deepEqual(
+        calls,
+        [dirname(exact), dirname(legacy), dirname(stagingOwnerPath(join(h.dir, 'qlb-owner.json'), 'xai'))],
+        'S6a syncs both backup parents before S6b re-syncs the staging directory',
+      );
+      assert.equal(settled.detail.handback, undefined, 'S7 clears the marker after durable S6a cleanup');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('T-S6a a failed backup-directory sync leaves the marker for the next resume', () => {
+    const marker = {
+      phase: 'cleanup-pending',
+      keychainDisposition: 'keep',
+      piFingerprint: null,
+      decision: null,
+      fencedGeneration: null,
+      rolledBackAt: 123,
+    };
+    let failSync = true;
+    const retrySyncCalls: string[] = [];
+    const h = setup('xai', new MockKeychain(), {
+      fsyncDirectory: (path) => {
+        if (failSync && path === dirname(piAuthBackupPath(h.authPath, 'xai'))) {
+          throw new Error('injected backup directory sync failure');
+        }
+        if (!failSync) {
+          retrySyncCalls.push(path);
+          const detail = JSON.parse(h.store.getMigration('pi-xai')!.detail_json) as Record<string, unknown>;
+          assert.deepEqual(detail.handback, marker, 'retry sync runs before S7 clears the durable marker');
+        }
+      },
+    });
+    try {
+      writePiAuthBackup(h.authPath, 'xai', 'fixture');
+      h.store.upsertMigration('pi-xai', 'NATIVE', JSON.stringify({ handback: marker }));
+
+      assert.throws(() => h.mig.resume(), /injected backup directory sync failure/);
+      assert.deepEqual(
+        JSON.parse(h.store.getMigration('pi-xai')!.detail_json).handback,
+        marker,
+        'a failed S6a directory sync keeps the marker for retry',
+      );
+
+      failSync = false;
+      const settled = h.mig.resume();
+      const exactBackupDirectory = dirname(piAuthBackupPath(h.authPath, 'xai'));
+      const legacyBackupDirectory = dirname(legacyPiAuthBackupPath(h.authPath, 'xai'));
+      assert.ok(retrySyncCalls.includes(exactBackupDirectory), 'a retry re-syncs the exact backup parent');
+      if (existsSync(legacyBackupDirectory)) {
+        assert.ok(retrySyncCalls.includes(legacyBackupDirectory), 'a retry syncs the legacy backup parent when it exists');
+      }
+      assert.equal(settled.detail.handback, undefined, 'a working retry completes S6a before S7');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('T-S6a a crash between unlink and sync still syncs on the next resume', () => {
+    const marker = {
+      phase: 'cleanup-pending',
+      keychainDisposition: 'keep',
+      piFingerprint: null,
+      decision: null,
+      fencedGeneration: null,
+      rolledBackAt: 123,
+    };
+    const calls: string[] = [];
+    const h = setup('xai', new MockKeychain(), {
+      fsyncDirectory: (path) => {
+        calls.push(path);
+        const detail = JSON.parse(h.store.getMigration('pi-xai')!.detail_json) as Record<string, unknown>;
+        assert.deepEqual(detail.handback, marker, 'backup-parent sync runs before S7 clears the durable marker');
+      },
+    });
+    try {
+      const exact = piAuthBackupPath(h.authPath, 'xai');
+      writePiAuthBackup(h.authPath, 'xai', 'fixture');
+      rmSync(exact, { force: true });
+      h.store.upsertMigration('pi-xai', 'NATIVE', JSON.stringify({ handback: marker }));
+
+      const settled = h.mig.resume();
+
+      assert.ok(calls.includes(dirname(exact)), 'resume syncs the exact backup parent after an unlink-before-sync crash');
+      assert.equal(settled.detail.handback, undefined, 'S7 clears the marker after the retry sync');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('the staging-directory sync runs after the staging unlink even when the legacy backup parent is the same directory', () => {
+    const marker = {
+      phase: 'cleanup-pending',
+      keychainDisposition: 'keep',
+      piFingerprint: null,
+      decision: null,
+      fencedGeneration: null,
+      rolledBackAt: 123,
+    };
+    const events: string[] = [];
+    const h = setup('xai', new MockKeychain(), {
+      fsyncDirectory: (path) => {
+        const staging = stagingOwnerPath(join(h.dir, 'qlb-owner.json'), 'xai');
+        if (path === dirname(staging)) {
+          const detail = JSON.parse(h.store.getMigration('pi-xai')!.detail_json) as Record<string, unknown>;
+          assert.deepEqual(detail.handback, marker, 'each directory sync runs before S7 clears the durable marker');
+          events.push(existsSync(staging) ? 'sync-before-staging-unlink' : 'sync-after-staging-unlink');
+        }
+      },
+    });
+    try {
+      const staging = stagingOwnerPath(join(h.dir, 'qlb-owner.json'), 'xai');
+      writePiAuthBackup(h.authPath, 'xai', 'fixture');
+      writeFileSync(legacyPiAuthBackupPath(h.authPath, 'xai'), JSON.stringify({ filePresent: true }) + '\n');
+      writeFileSync(staging, JSON.stringify({ fixture: 'staging' }), { mode: 0o600 });
+      h.store.upsertMigration('pi-xai', 'NATIVE', JSON.stringify({ handback: marker }));
+
+      const settled = h.mig.resume();
+
+      assert.deepEqual(
+        events,
+        ['sync-before-staging-unlink', 'sync-after-staging-unlink'],
+        'the same staging directory is synced again after S6b unlinks staging',
+      );
+      assert.equal(settled.detail.handback, undefined, 'S7 clears the marker only after the post-unlink sync');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a non-ENOENT stat error on a sync directory propagates and leaves the marker', () => {
+    const marker = {
+      phase: 'cleanup-pending',
+      keychainDisposition: 'keep',
+      piFingerprint: null,
+      decision: null,
+      fencedGeneration: null,
+      rolledBackAt: 123,
+    };
+    const h = setupOpenRouter();
+    const staging = stagingOwnerPath(h.ownerPath, 'openrouter');
+    const originalStatSync = fs.statSync;
+    const statMock = mock.method(fs, 'statSync', ((path: string | Buffer | URL) => {
+      if (path === dirname(staging)) {
+        throw Object.assign(new Error('injected sync-directory stat failure'), { code: 'EACCES' });
+      }
+      return originalStatSync(path);
+    }) as typeof fs.statSync);
+    try {
+      h.store.upsertMigration('pi-openrouter', 'NATIVE', JSON.stringify({ handback: marker }));
+
+      assert.throws(
+        () => h.mig.resume(),
+        (error: unknown) => (error as NodeJS.ErrnoException).code === 'EACCES',
+        'only ENOENT may be skipped before the S7 marker write',
+      );
+      assert.deepEqual(
+        JSON.parse(h.store.getMigration('pi-openrouter')!.detail_json).handback,
+        marker,
+        'a non-ENOENT stat failure leaves the durable marker for retry',
+      );
+    } finally {
+      statMock.mock.restore();
+      h.cleanup();
+    }
+  });
+
   it('T-S6b staging unlink is made durable before the marker is cleared', () => {
     const marker = {
       phase: 'cleanup-pending',
@@ -1150,7 +1393,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
 
       const settled = h.mig.resume();
 
-      assert.deepEqual(calls, [dirname(staging)], 'S6b syncs the staging directory exactly once');
+      assert.deepEqual(calls, [dirname(staging), dirname(staging)], 'S6b re-syncs the staging directory after its unlink');
       assert.equal(settled.state, 'NATIVE');
       assert.equal(existsSync(staging), false, 'S6b removes the staging file under the marker');
       assert.equal(existsSync(h.ownerPath), false, 'C3 cleanup does not commit the staging file');
@@ -1191,7 +1434,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
 
       failSync = false;
       const settled = h.mig.resume();
-      assert.equal(syncCalls, 2, 'the next resume retries the directory sync');
+      assert.equal(syncCalls, 3, 'the next resume retries S6a and then syncs S6b after its unlink');
       assert.equal(settled.detail.handback, undefined, 'the working retry clears S7');
     } finally {
       h.cleanup();
