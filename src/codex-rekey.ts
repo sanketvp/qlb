@@ -1,9 +1,10 @@
+import { existsSync } from 'node:fs';
 import type { DatabaseSync } from 'node:sqlite';
 
 import { inspectAccountSafety } from './accounts-prune';
 import { observationConfigKey } from './candidates';
 import { failoverConfigKey } from './overrides';
-import { refreshLeaseName } from './store';
+import { backupBeforeMigrateSync, refreshLeaseName } from './store';
 
 export type CodexRekeyReason =
   | 'no-provider'
@@ -45,6 +46,18 @@ export interface ApplyCodexRekeyOptions {
   now: number;
   /** Test-only seam for proving a caller transaction rolls back when a dependent remains. */
   testOnlyBeforeMergeCount?: (db: DatabaseSync, move: CodexRekeyMove) => void;
+}
+
+export interface RekeyCodexAccountsOptions extends PlanCodexRekeyOptions {
+  dbPath: string;
+  backup?: (dbPath: string, source: DatabaseSync) => string;
+}
+
+export interface RekeySummary {
+  moves: CodexRekeyMove[];
+  skipped: CodexRekeySkipped[];
+  backupTaken: string | undefined;
+  backupMissing: boolean;
 }
 
 type RekeyAuditEntry = {
@@ -403,6 +416,30 @@ function remainingDependents(db: DatabaseSync, id: string): number {
     (SELECT count(*) FROM leases WHERE name = ?) AS count`)
     .get(id, id, id, id, refreshLeaseName(id)) as { count: number };
   return row.count;
+}
+
+/** Plans, backs up once when needed, and applies the rekey in a caller-owned transaction. */
+export function rekeyCodexAccounts(
+  db: DatabaseSync,
+  { dbPath, now, prospective, backup = backupBeforeMigrateSync }: RekeyCodexAccountsOptions,
+): RekeySummary {
+  if (!db.isTransaction) throw new Error('rekey-needs-transaction');
+
+  const plan = planCodexRekey(db, { now, prospective });
+  const backupRow = db.prepare('SELECT value FROM config WHERE key = ?').get('codex.rekey.backupPath') as {
+    value: string | null;
+  } | undefined;
+  const backupMissing = backupRow !== undefined
+    && (typeof backupRow.value !== 'string' || !existsSync(backupRow.value));
+  let backupTaken: string | undefined;
+  if (plan.moves.length > 0 && backupRow === undefined && dbPath !== ':memory:') {
+    backupTaken = backup(dbPath, db);
+    db.prepare(`INSERT INTO config (key, value) VALUES (?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run('codex.rekey.backupPath', backupTaken);
+  }
+
+  applyCodexRekey(db, plan, { now });
+  return { moves: plan.moves, skipped: plan.skipped, backupTaken, backupMissing };
 }
 
 /** Applies a previously classified plan inside its caller-owned transaction. */
