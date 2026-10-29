@@ -1787,6 +1787,23 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     }
   });
 
+  it('no stage can create a bare-id Codex takeover after activation', () => {
+    const h = setup('openai-codex');
+    try {
+      const staged = stageGenericGrant(h.store, h.kc, 'openai-codex', h.authPath, 'openai-codex', h.ownerPath);
+      const db = (h.store as unknown as { db: import('node:sqlite').DatabaseSync }).db;
+      assert.equal(staged.state, 'MIRRORED');
+      assert.equal(db.prepare("SELECT 1 FROM accounts WHERE id = 'fixture-account'").get(), undefined);
+      assert.equal(db.prepare("SELECT 1 FROM migrations WHERE store = 'pi-openai-codex' AND detail_json LIKE '%fixture-account%'").get() !== undefined, true);
+      assert.equal(db.prepare("SELECT 1 FROM migrations WHERE store = 'pi-openai-codex' AND detail_json LIKE '%\"fixture-account\"%'").get(), undefined);
+      assert.doesNotThrow(() => h.kc.getSync(
+        qlbKeychainService('openai-codex', 'fixture-user:fixture-account'),
+        'fixture-user:fixture-account',
+      ));
+      assert.throws(() => h.kc.getSync(qlbKeychainService('openai-codex', 'fixture-account'), 'fixture-account'));
+    } finally { h.cleanup(); }
+  });
+
   it('stageGenericGrant helper stages xai without modifying the fixture file', () => {
     const h = setup('xai');
     try {

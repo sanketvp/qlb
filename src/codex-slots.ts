@@ -11,7 +11,7 @@ import {
   qlbKeychainService,
   type KeychainBackend,
 } from './keychain';
-import type { CodexSlotRecord, Store } from './store';
+import { backupBeforeMigrateSync, type CodexSlotRecord, type Store } from './store';
 import { qlbHomeDir } from './home';
 import { CodexAdmissionRefused, codexAdmission, ensureCodexSlotAccount, rekeyCodexAccounts, type RekeySummary } from './codex-rekey';
 import { recordRestoreBaseline } from './codex-restore-baseline';
@@ -336,6 +336,8 @@ export interface ImportActiveCodexDeps {
   now?: () => number;
   /** Test seam for the SQLite transaction; production opens a short-lived connection. */
   withDb?: <T>(store: SqlStore, fn: (db: DatabaseSync) => T) => T;
+  /** Test seam for the verified pre-migration backup. */
+  backup?: (dbPath: string, source: DatabaseSync) => string;
 }
 
 interface ExistingSlot {
@@ -474,6 +476,7 @@ export function importActiveCodexSlot(doc: CodexAuthDocument, deps: ImportActive
         dbPath: deps.store.dbPath,
         now: timestamp,
         prospective: { accountId: plan.slotId, chatgptAccountId: plan.accountId },
+        backup: deps.backup ?? backupBeforeMigrateSync,
       });
       const previousFingerprint = previous?.fingerprint && previous.fingerprint !== fingerprint
         ? previous.fingerprint
