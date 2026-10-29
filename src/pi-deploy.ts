@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { cpSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync } from 'node:fs';
+import { cpSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
 import { qlbHomeDir } from './home';
@@ -20,6 +20,8 @@ export interface PiDeployOptions {
   now?: () => number;
   /** Injectable filesystem rename for failure-path tests. */
   rename?: typeof renameSync;
+  /** Injectable filesystem device lookup for cross-volume layout tests. */
+  deviceOf?: (path: string) => number;
 }
 
 export interface PiDeployResult extends PiDeployPlan {
@@ -125,6 +127,7 @@ function replaceDeployment(
   redactTarget: string,
   ownerDocumentTarget: string,
   rename: typeof renameSync,
+  deviceOf: (path: string) => number,
 ): void {
   const extensionParent = dirname(target);
   const stagingRoot = join(dirname(dirname(target)), '.qlb-pi-staging');
@@ -147,6 +150,10 @@ function replaceDeployment(
     mkdirSync(dirname(redactTarget), { recursive: true, mode: 0o755 });
     mkdirSync(dirname(ownerDocumentTarget), { recursive: true, mode: 0o755 });
     mkdirSync(stagingRoot, { recursive: true, mode: 0o755 });
+    const devices = [stagingRoot, extensionParent, dirname(redactTarget)].map(deviceOf);
+    if (devices.some((device) => device !== devices[0])) {
+      throw new Error('qlb pi deploy: the Pi extensions folder and ~/.pi/agent are on different volumes; this layout is not supported');
+    }
     sweepStaging(stagingRoot, extensionParent);
     cpSync(source, staging, { recursive: true, dereference: true, errorOnExist: true, force: false });
     cpSync(redactSource, stagedRedact, { dereference: true, errorOnExist: true, force: false });
@@ -204,6 +211,7 @@ export function deployPiExtension(options: PiDeployOptions): PiDeployResult {
     redactTarget,
     ownerDocumentTarget,
     options.rename ?? renameSync,
+    options.deviceOf ?? ((path) => statSync(path).dev),
   );
   const deployedAt = Math.floor((options.now ?? Date.now)() / 1000);
   const store = openStore(options.dbPath);

@@ -251,6 +251,7 @@ describe('pi:extension copied-layout drift check', () => {
     }).find((candidate) => candidate.name === 'pi:extension')!;
     assert.equal(check.level, 'WARN');
     assert.match(check.message, /ELOOP/);
+    assert.equal((check.detail as { fix?: string }).fix, 'repair the ~/.pi/agent/extensions link, then run qlb pi deploy');
   });
 
   it('passes after deploy through symlinked extensions and reports edited real-path sources', () => {

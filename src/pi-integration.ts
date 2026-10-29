@@ -331,7 +331,7 @@ export function piIntegrationChecks(options: PiIntegrationOptions = {}): DoctorC
       name: 'pi:extension',
       level: 'WARN',
       message: `installed qlb-pi shared sources are unavailable: ${err instanceof Error ? err.message : String(err)}`,
-      detail: { fix: 'qlb pi deploy' },
+      detail: { fix: 'repair the ~/.pi/agent/extensions link, then run qlb pi deploy' },
     });
     return checks;
   }
@@ -349,8 +349,7 @@ export function piIntegrationChecks(options: PiIntegrationOptions = {}): DoctorC
   }
 
   // 1. Installed extension == tracked source (a QLB upgrade that touches extensions/qlb-pi must be re-synced).
-  // The copied-extension layout also needs its dependency-free shared files at
-  // ~/.pi/agent/src/: qlb-pi resolves both sibling imports from there.
+  // Shared files live beside the real (resolved) extensions directory, via piSharedSrcDirFor.
   const repoRoot = findQlbRepoRoot();
   if (repoRoot) {
     const src = join(repoRoot, 'extensions', 'qlb-pi');

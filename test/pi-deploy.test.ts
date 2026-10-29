@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
@@ -85,6 +85,32 @@ describe('qlb pi deploy (P12)', () => {
 
     writeFileSync(join(vaultSrc, 'redact.ts'), 'export const redact = 1;\nchanged\n');
     assert.equal(piExtensionDriftCheck({ home: f.home, appDir: f.appDir, dbPath: f.dbPath }).level, 'FAIL');
+  });
+
+  it('deploy refuses a cross-volume layout before moving anything', () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-pi-cross-volume-'));
+    const f = fixture(root);
+    deployPiExtension({ home: f.home, appDir: f.appDir, dbPath: f.dbPath });
+    const target = join(f.home, '.pi', 'agent', 'extensions', 'qlb-pi');
+    const redact = join(f.home, '.pi', 'agent', 'src', 'redact.ts');
+    const ownerDocument = join(f.home, '.pi', 'agent', 'src', 'pi-owner-document.ts');
+    const stagingRoot = join(f.home, '.pi', 'agent', '.qlb-pi-staging');
+    const previousTarget = readFileSync(join(target, 'index.ts'));
+    const previousRedact = readFileSync(redact);
+    const previousOwnerDocument = readFileSync(ownerDocument);
+    writeFileSync(join(f.extension, 'index.ts'), 'export const version = 2;\n');
+
+    assert.throws(() => deployPiExtension({
+      home: f.home,
+      appDir: f.appDir,
+      dbPath: f.dbPath,
+      deviceOf: (path: string) => path === stagingRoot ? 2 : 1,
+    }), /the Pi extensions folder and ~\/\.pi\/agent are on different volumes/);
+
+    assert.deepEqual(readFileSync(join(target, 'index.ts')), previousTarget);
+    assert.deepEqual(readFileSync(redact), previousRedact);
+    assert.deepEqual(readFileSync(ownerDocument), previousOwnerDocument);
+    assert.deepEqual(readdirSync(stagingRoot).filter((entry) => entry.startsWith('.qlb-pi-')), []);
   });
 
   it('returns FAIL instead of throwing when the extensions path cannot be resolved', () => {
