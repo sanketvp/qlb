@@ -3,6 +3,7 @@
 // supplies Pi's real event stream, builtin transport, CLI runner and Keychain reader.
 
 import { streamWithAuthRetry } from "./auth-retry.js";
+import { QLB_RUNTIME_AUTH_SENTINEL } from "./providers/openai-codex.js";
 import { redactEvent, redactSecrets } from "../../src/redact.js";
 import {
   consumeAccessSource,
@@ -30,19 +31,32 @@ export type Builtin = (
   options: Record<string, unknown>,
 ) => AsyncIterable<unknown>;
 
+export interface AnthropicNativeProvider {
+  id: "anthropic";
+  name: string;
+  baseUrl?: string;
+  auth: {
+    apiKey: {
+      name: string;
+      check(): Promise<{ type: "api_key"; source: string }>;
+      resolve(): Promise<{ auth: { apiKey: string }; source: string }>;
+    };
+  };
+  getModels(): readonly ModelLike[];
+  stream: (model: ModelLike, context: unknown, options?: Record<string, unknown>) => unknown;
+  streamSimple: (model: ModelLike, context: unknown, options?: Record<string, unknown>) => unknown;
+}
+
 export interface ProviderApi {
   unregisterProvider(name: string): void;
-  registerProvider(
-    name: string,
-    config: {
-      api: string;
-      streamSimple: (model: ModelLike, context: unknown, options?: Record<string, unknown>) => unknown;
-    },
-  ): void;
+  registerProvider(provider: AnthropicNativeProvider): void;
 }
 
 export interface ConsumeDeps {
   createStream: () => EventSink;
+  /** Built-in catalog metadata is safe to retain; built-in auth is never retained. */
+  models?: readonly ModelLike[];
+  baseUrl?: string;
   /** Per-request journal re-check (`qlb consume status`). */
   consumeJournal: () => Promise<ConsumeJournal>;
   ownerState: () => OwnerFileState;
@@ -86,29 +100,47 @@ export function errorEvent(model: ModelLike, message: string): Record<string, un
   };
 }
 
+function qlbManagedAuth() {
+  return {
+    apiKey: {
+      name: "QLB consume",
+      // A complete native Provider prevents Pi from merging the built-in OAuth
+      // handler; index.ts installs this sentinel before file-backed auth lookup.
+      async check() { return { type: "api_key" as const, source: "QLB consume" }; },
+      async resolve() {
+        return { auth: { apiKey: QLB_RUNTIME_AUTH_SENTINEL }, source: "QLB consume" };
+      },
+    },
+  };
+}
+
 /** Fail-closed stub: replaces any existing Anthropic provider and never reads credentials. */
 export function registerConflictProvider(
   pi: ProviderApi,
   createStream: () => EventSink,
   message: string = CONSUME_ERRORS.conflict,
+  catalog: Pick<ConsumeDeps, "models" | "baseUrl"> = {},
 ): void {
+  const streamSimple = (model: ModelLike) => {
+    const output = createStream();
+    output.push(errorEvent(model, message));
+    output.end();
+    return output;
+  };
   pi.unregisterProvider("anthropic");
-  pi.registerProvider("anthropic", {
-    api: "anthropic-messages",
-    streamSimple: (model) => {
-      const output = createStream();
-      output.push(errorEvent(model, message));
-      output.end();
-      return output;
-    },
+  pi.registerProvider({
+    id: "anthropic",
+    name: "Anthropic (QLB consume unavailable)",
+    ...(catalog.baseUrl ? { baseUrl: catalog.baseUrl } : {}),
+    auth: qlbManagedAuth(),
+    getModels: () => catalog.models ?? [],
+    stream: streamSimple,
+    streamSimple,
   });
 }
 
 export function registerConsumeProvider(pi: ProviderApi, builtin: Builtin, deps: ConsumeDeps): void {
-  pi.unregisterProvider("anthropic");
-  pi.registerProvider("anthropic", {
-    api: "anthropic-messages",
-    streamSimple: (model, context, options) => {
+  const streamSimple = (model: ModelLike, context: unknown, options: Record<string, unknown> = {}) => {
       const output = deps.createStream();
       void (async () => {
         let sent: () => string[] = () => [];
@@ -186,6 +218,15 @@ export function registerConsumeProvider(pi: ProviderApi, builtin: Builtin, deps:
         }
       })();
       return output;
-    },
+  };
+  pi.unregisterProvider("anthropic");
+  pi.registerProvider({
+    id: "anthropic",
+    name: "Anthropic (QLB consume)",
+    ...(deps.baseUrl ? { baseUrl: deps.baseUrl } : {}),
+    auth: qlbManagedAuth(),
+    getModels: () => deps.models ?? [],
+    stream: streamSimple,
+    streamSimple,
   });
 }
