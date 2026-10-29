@@ -139,8 +139,14 @@ export function registerConflictProvider(
   });
 }
 
-export function registerConsumeProvider(pi: ProviderApi, builtin: Builtin, deps: ConsumeDeps): void {
-  const streamSimple = (model: ModelLike, context: unknown, options: Record<string, unknown> = {}) => {
+export function registerConsumeProvider(
+  pi: ProviderApi,
+  builtin: Builtin,
+  deps: ConsumeDeps,
+  builtinStream: Builtin = builtin,
+): void {
+  const createConsumeStream = (transport: Builtin) =>
+    (model: ModelLike, context: unknown, options: Record<string, unknown> = {}) => {
       const output = deps.createStream();
       void (async () => {
         let sent: () => string[] = () => [];
@@ -168,7 +174,7 @@ export function registerConsumeProvider(pi: ProviderApi, builtin: Builtin, deps:
           const result = await streamWithAuthRetry({
             readAccess: source.readAccess,
             startStream: (access) =>
-              builtin(model, context, { ...options, apiKey: access, onPayload }),
+              transport(model, context, { ...options, apiKey: access, onPayload }),
             resync: source.resync,
             onEvent: (event) => {
               pushed += 1;
@@ -218,7 +224,12 @@ export function registerConsumeProvider(pi: ProviderApi, builtin: Builtin, deps:
         }
       })();
       return output;
-  };
+    };
+  const streamSimple = createConsumeStream(builtin);
+  // Pi's native Provider contract requires `stream`; its API-specific options
+  // (for example Anthropic thinkingEnabled) must reach the API-specific
+  // built-in transport rather than be reinterpreted by streamSimple.
+  const stream = createConsumeStream(builtinStream);
   pi.unregisterProvider("anthropic");
   pi.registerProvider({
     id: "anthropic",
@@ -226,7 +237,7 @@ export function registerConsumeProvider(pi: ProviderApi, builtin: Builtin, deps:
     ...(deps.baseUrl ? { baseUrl: deps.baseUrl } : {}),
     auth: qlbManagedAuth(),
     getModels: () => deps.models ?? [],
-    stream: streamSimple,
+    stream,
     streamSimple,
   });
 }

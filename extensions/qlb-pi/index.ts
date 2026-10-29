@@ -54,7 +54,7 @@ import type {
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import type { Api, Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
+import type { Api, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { validatePiOwnerDocument } from "../../src/pi-owner-document.js";
@@ -235,12 +235,6 @@ function recordOutcome(entry: Record<string, unknown>): void {
   }
 }
 
-type StreamSimple = (
-  model: Model<Api>,
-  context: Context,
-  options?: SimpleStreamOptions,
-) => AsyncIterable<unknown>;
-
 async function resolveOpenRouterSourceDeps(): Promise<OpenRouterSourceDeps> {
   // The extension loader resolves this import through Pi's Jiti aliases. Do
   // not use module.require(): pi-ai exposes ./compat to ESM imports only.
@@ -295,25 +289,35 @@ async function resolveBuiltinAnthropicCatalog(): Promise<BuiltinAnthropicCatalog
 }
 
 function setRuntimeAnthropicSentinel(ctx: unknown): void {
-  // This runtime credential wins before Pi reads its file-backed auth storage.
-  // The transport replaces it with the per-request cswap-active access.
+  // RuntimeCredentials reads this in-memory value before auth.json. The
+  // transport replaces it with the per-request QLB/cswap access.
   const registry = (ctx as { modelRegistry?: { runtime?: { setRuntimeApiKey?: (provider: string, key: string) => Promise<void> } } }).modelRegistry;
   void registry?.runtime?.setRuntimeApiKey?.("anthropic", QLB_RUNTIME_AUTH_SENTINEL).catch(() => undefined);
 }
 
-async function resolveBuiltinAnthropicStreamSimple(): Promise<StreamSimple> {
+function removeRuntimeAnthropicSentinel(ctx: unknown): void {
+  const registry = (ctx as { modelRegistry?: { runtime?: { removeRuntimeApiKey?: (provider: string) => Promise<void> } } }).modelRegistry;
+  void registry?.runtime?.removeRuntimeApiKey?.("anthropic").catch(() => undefined);
+}
+
+interface BuiltinAnthropicStreams {
+  stream: Builtin;
+  streamSimple: Builtin;
+}
+
+async function resolveBuiltinAnthropicStreams(): Promise<BuiltinAnthropicStreams> {
   // `as unknown as`: Pi's compat types evolve (0.87 narrowed Context → TranscriptContext); we
   // only rely on the runtime shape, which is verified right below and by `qlb doctor` (pi:typecheck).
   const namespace = (await import("@earendil-works/pi-ai/compat")) as unknown as {
-    anthropicMessagesApi?: () => { streamSimple?: StreamSimple };
+    anthropicMessagesApi?: () => { stream?: Builtin; streamSimple?: Builtin };
   };
-  const streamSimple = namespace.anthropicMessagesApi?.()?.streamSimple;
-  if (typeof streamSimple !== "function") {
+  const api = namespace.anthropicMessagesApi?.();
+  if (typeof api?.stream !== "function" || typeof api.streamSimple !== "function") {
     throw new Error(
-      "qlb-pi: @earendil-works/pi-ai/compat exported no anthropicMessagesApi().streamSimple",
+      "qlb-pi: @earendil-works/pi-ai/compat exported no anthropicMessagesApi stream/streamSimple",
     );
   }
-  return streamSimple;
+  return { stream: api.stream, streamSimple: api.streamSimple };
 }
 
 /** Install xAI only after its owner entry exists; a compat failure still replaces native auth. */
@@ -392,6 +396,16 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     }
   }
 
+  // ExtensionAPI exposes ModelRegistry only in lifecycle contexts. Register
+  // cleanup before evaluating the mode so a reload into inert cannot retain a
+  // sentinel the prior active extension installed.
+  pi.on("session_start", (_event, ctx) => {
+    removeRuntimeAnthropicSentinel(ctx);
+  });
+  pi.on("session_shutdown", (_event, ctx) => {
+    removeRuntimeAnthropicSentinel(ctx);
+  });
+
   const rehearsal = process.env.QLB_PI_REHEARSAL;
   const base =
     rehearsal === "0"
@@ -459,7 +473,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   let footerModelId: string | undefined;
   let footerExpanded = false;
   let requestFooterRender: (() => void) | null = null;
-  let builtin: StreamSimple;
+  let builtin: BuiltinAnthropicStreams;
   let catalog: BuiltinAnthropicCatalog | undefined;
 
   const toggleFooterExpand = () => {
@@ -474,7 +488,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     footerModelId = event.model.id;
   });
   try {
-    builtin = await resolveBuiltinAnthropicStreamSimple();
+    builtin = await resolveBuiltinAnthropicStreams();
     if (mode === "consume") catalog = await resolveBuiltinAnthropicCatalog();
   } catch (err) {
     console.error("[qlb-pi] could not resolve builtin anthropic transport/catalog:", err);
@@ -493,7 +507,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   }
 
   if (mode === "consume") {
-    registerConsumeProvider(providerApi, builtin as unknown as Builtin, {
+    registerConsumeProvider(providerApi, builtin.streamSimple, {
       createStream: () => createAssistantMessageEventStream() as never,
       models: catalog?.models,
       baseUrl: catalog?.baseUrl,
@@ -505,7 +519,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       onDecision: (decision) => {
         lastDecision = decision;
       },
-    });
+    }, builtin.stream);
     pi.on("session_start", (_event, ctx) => {
       setRuntimeAnthropicSentinel(ctx);
     });
@@ -549,7 +563,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
             const result = await streamWithAuthRetry({
               readAccess: () => access.token,
               startStream: (token) =>
-                builtin(model, context, {
+                builtin.streamSimple(model, context, {
                   ...options,
                   apiKey: token,
                   onPayload,

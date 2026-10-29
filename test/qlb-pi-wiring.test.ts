@@ -67,7 +67,7 @@ const native = new Map(names.map((name) => [name, {
 const providers = new Map(native);
 const calls = [];
 const listeners = new Map();
-const runtimeApiKeys = {};
+const runtimeApiKeys = process.env.PREEXISTING_ANTHROPIC_KEY === '1' ? { anthropic: 'qlb-managed' } : {};
 const pi = {
   unregisterProvider(name) { calls.push('unregister:' + name); providers.delete(name); },
   registerProvider(name, config) {
@@ -77,12 +77,18 @@ const pi = {
     const provider = typeof name === 'string' ? { ...native.get(id), ...config } : name;
     calls.push('register:' + id); providers.set(id, provider);
   },
-  on(event, handler) { listeners.set(event, handler); }, registerCommand() {}, registerShortcut() {},
+  on(event, handler) {
+    const handlers = listeners.get(event) || [];
+    handlers.push(handler);
+    listeners.set(event, handlers);
+  }, registerCommand() {}, registerShortcut() {},
 };
 await factory(pi);
-await listeners.get('session_start')?.({}, { ui: { setStatus() {} }, modelRegistry: { runtime: {
+const lifecycleContext = { ui: { setStatus() {} }, modelRegistry: { runtime: {
   setRuntimeApiKey(provider, key) { runtimeApiKeys[provider] = key; return Promise.resolve(); },
-} } });
+  removeRuntimeApiKey(provider) { delete runtimeApiKeys[provider]; return Promise.resolve(); },
+} } };
+for (const handler of listeners.get('session_start') || []) await handler({}, lifecycleContext);
 const events = [];
 if (process.env.CALL_ANTHROPIC === '1') {
   const stream = providers.get('anthropic').streamSimple(
@@ -130,7 +136,7 @@ if (Number.isFinite(delayMs) && delayMs > 0) setTimeout(finishGate, delayMs);
 else finishGate();
 `;
 
-function load(owner?: string, gateFail = false, callCodex = false, perProviderOwner?: string, ownerIsDirectory = false, deployedLayout = false, callAnthropic = false, gateCause?: string, rehearsal = false, gateDelayMs = 0): {
+function load(owner?: string, gateFail = false, callCodex = false, perProviderOwner?: string, ownerIsDirectory = false, deployedLayout = false, callAnthropic = false, gateCause?: string, rehearsal = false, gateDelayMs = 0, preexistingAnthropicKey = false): {
   calls: string[];
   replaced: Record<string, boolean>;
   oauth: { resolve: number; refresh: number };
@@ -180,6 +186,7 @@ function load(owner?: string, gateFail = false, callCodex = false, perProviderOw
       ...(gateCause ? { GATE_CAUSE: gateCause } : {}),
       ...(gateDelayMs > 0 ? { GATE_DELAY_MS: String(gateDelayMs) } : {}),
       ...(rehearsal ? { QLB_PI_REHEARSAL: '1' } : {}),
+      ...(preexistingAnthropicKey ? { PREEXISTING_ANTHROPIC_KEY: '1' } : {}),
       ...(callCodex ? { CALL_CODEX: '1' } : {}),
       ...(callAnthropic ? { CALL_ANTHROPIC: '1' } : {}),
     },
@@ -212,6 +219,11 @@ describe('qlb-pi provider wiring', { skip: piAvailable ? false : 'global Pi inst
     assert.deepEqual(inert.replaced, {
       anthropic: false, xai: false, 'kimi-coding': false, openrouter: false, 'openai-codex': false,
     });
+  });
+
+  it('a reload that goes inert leaves no anthropic runtime key', () => {
+    const result = load(undefined, false, false, undefined, false, false, false, undefined, false, 0, true);
+    assert.equal('anthropic' in result.runtimeApiKeys, false);
   });
 
   it('uses the owned Anthropic gate source and emits the common unavailable event on gate failure', () => {

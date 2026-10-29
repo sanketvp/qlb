@@ -12,6 +12,7 @@ const piAi = join(G, 'node_modules', '@earendil-works', 'pi-ai', 'dist', 'compat
 const jiti = createJiti(import.meta.url, {
   moduleCache: false,
   alias: {
+    '@earendil-works/pi-ai/providers/all': join(G, 'node_modules', '@earendil-works', 'pi-ai', 'dist', 'providers', 'all.js'),
     '@earendil-works/pi-ai/compat': piAi,
     '@earendil-works/pi-ai': piAi,
     '@earendil-works/pi-tui': join(G, 'node_modules', '@earendil-works', 'pi-tui', 'dist', 'index.js'),
@@ -26,7 +27,12 @@ const XAI = { native: true, api: 'openai-responses', streamSimple: () => { throw
 const providers = new Map([['anthropic', POOL], ['xai', XAI]]);
 const pi = {
   unregisterProvider: (name) => { calls.push(`unregister:${name}`); providers.delete(name); },
-  registerProvider: (name, config) => { calls.push(`register:${name}`); providers.set(name, config); },
+  registerProvider: (nameOrProvider, config) => {
+    const name = typeof nameOrProvider === 'string' ? nameOrProvider : nameOrProvider.id;
+    const provider = typeof nameOrProvider === 'string' ? config : nameOrProvider;
+    calls.push(`register:${name}`);
+    providers.set(name, provider);
+  },
   on: () => {},
   registerCommand: () => {},
   registerShortcut: () => {},

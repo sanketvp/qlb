@@ -408,6 +408,31 @@ describe('qlb-pi consume provider (fake Pi with pre-existing anthropic provider)
     assert.equal(fake.keys.includes(QLB_RUNTIME_AUTH_SENTINEL), false);
   });
 
+  it('delegates stream API options to the full builtin transport, not streamSimple', async () => {
+    const pi = fakePi();
+    let simpleCalls = 0;
+    let streamCalls = 0;
+    let streamOptions: Record<string, unknown> | undefined;
+    const simple: Builtin = () => {
+      simpleCalls += 1;
+      return (async function* () { yield { type: 'done' }; })();
+    };
+    const full: Builtin = (_model, _context, options) => {
+      streamCalls += 1;
+      streamOptions = options;
+      return (async function* () { yield { type: 'done' }; })();
+    };
+    registerConsumeProvider(pi, simple, deps({ read: () => access('cswap-active-access') }).deps, full);
+
+    const output = pi.providers.get('anthropic')!.stream(MODEL, {}, { thinkingEnabled: true }) as Sink;
+    for (let i = 0; i < 200 && !output.ended; i++) await delay(5);
+    assert.ok(output.ended, 'stream must end');
+    assert.equal(streamCalls, 1);
+    assert.equal(simpleCalls, 0);
+    assert.equal(streamOptions?.thinkingEnabled, true);
+    assert.equal(streamOptions?.apiKey, 'cswap-active-access');
+  });
+
   it('401 with rotated credential: two reads, retry with B, recovered 401 hidden, pool never used', async () => {
     const pi = fakePi();
     const seq = sequence(['A', 'B']);
