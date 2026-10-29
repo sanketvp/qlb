@@ -145,8 +145,17 @@ describe('Codex slots and import-active', () => {
   it('import-active renames the bare row to the slot id with readings, pins, lease and failover pointer (file-backed)', () => {
     const h = fixture();
     try {
-      // This is an adapter-era bare-id row. Import moves it to the S29 slot id.
+      // This is an adapter-era bare-id row. Import moves it and its dependents to the S29 slot id.
       h.store.upsertAccount('fixture-account', 'openai-codex', 'adapter-owned label', 'active');
+      const seed = (h.store as unknown as { db: DatabaseSync }).db;
+      seed.prepare(`INSERT INTO snapshots (account_id, bucket, used_pct, fetched_at)
+        VALUES ('fixture-account', 'primary', 12, 1)`).run();
+      seed.prepare(`INSERT INTO overrides (kind, account_id, session, until)
+        VALUES ('pin', 'fixture-account', 'fixture-session', 2)`).run();
+      seed.prepare(`INSERT INTO leases (name, holder_pid, holder_id, until, generation)
+        VALUES ('refresh:fixture-account', 1, 'fixture-holder', 1699999999999, 0)`).run();
+      seed.prepare(`INSERT INTO config (key, value)
+        VALUES ('failover:openai-codex', 'fixture-account')`).run();
       const result = importActiveCodexSlot(parsedDocument(), {
         store: h.store,
         keychain: h.keychain,
@@ -164,8 +173,19 @@ describe('Codex slots and import-active', () => {
       });
       const db = new DatabaseSync(h.store.dbPath, { readOnly: true });
       try {
+        const slotId = 'fixture-user:fixture-account';
         assert.equal((db.prepare("SELECT count(*) AS count FROM accounts WHERE provider = 'openai-codex'").get() as { count: number }).count, 1);
-        assert.deepEqual(snapshotsFromStore(h.store, 'openai-codex').map((snapshot) => snapshot.accountId), ['fixture-user:fixture-account']);
+        assert.equal((db.prepare('SELECT id FROM accounts WHERE id = ?').get(slotId) as { id: string }).id, slotId);
+        assert.equal((db.prepare('SELECT account_id FROM snapshots WHERE bucket = ?').get('primary') as { account_id: string }).account_id, slotId);
+        assert.equal((db.prepare('SELECT account_id FROM overrides WHERE kind = ?').get('pin') as { account_id: string }).account_id, slotId);
+        assert.equal((db.prepare('SELECT name FROM leases').get() as { name: string }).name, `refresh:${slotId}`);
+        assert.equal((db.prepare('SELECT value FROM config WHERE key = ?').get('failover:openai-codex') as { value: string }).value, slotId);
+        assert.equal((db.prepare(`SELECT count(*) AS count FROM accounts WHERE id = 'fixture-account'`).get() as { count: number }).count, 0);
+        assert.equal((db.prepare(`SELECT count(*) AS count FROM snapshots WHERE account_id = 'fixture-account'`).get() as { count: number }).count, 0);
+        assert.equal((db.prepare(`SELECT count(*) AS count FROM overrides WHERE account_id = 'fixture-account'`).get() as { count: number }).count, 0);
+        assert.equal((db.prepare(`SELECT count(*) AS count FROM leases WHERE name = 'refresh:fixture-account'`).get() as { count: number }).count, 0);
+        assert.equal((db.prepare(`SELECT count(*) AS count FROM config WHERE key = 'failover:openai-codex' AND value = 'fixture-account'`).get() as { count: number }).count, 0);
+        assert.deepEqual(snapshotsFromStore(h.store, 'openai-codex').map((snapshot) => snapshot.accountId), [slotId]);
       } finally {
         db.close();
       }

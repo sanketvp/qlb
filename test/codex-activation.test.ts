@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -12,7 +12,7 @@ import { importActiveCodexSlot } from '../src/codex-slots';
 import { CodexAdmissionRefused } from '../src/codex-rekey';
 import { checkRestorePrecondition } from '../src/codex-restore-baseline';
 import { MockKeychain } from '../src/keychain';
-import { accountIdForSingleGrant, defaultRehearseFn } from '../src/migration';
+import { createSingleGrantMigration, defaultRehearseFn, stagingOwnerPath } from '../src/migration';
 import { backupBeforeMigrateSync, openStore } from '../src/store';
 
 function jwt(payload: Record<string, unknown>): string {
@@ -63,6 +63,57 @@ function count(db: DatabaseSync, table: string): number {
   return (db.prepare(`SELECT count(*) AS count FROM ${table}`).get() as { count: number }).count;
 }
 
+class TrackingMockKeychain extends MockKeychain {
+  private readonly coordinates = new Set<string>();
+
+  override setSync(service: string, account: string, value: string): void {
+    super.setSync(service, account, value);
+    this.coordinates.add(`${service}\0${account}`);
+  }
+
+  override deleteSync(service: string, account: string): void {
+    super.deleteSync(service, account);
+    this.coordinates.delete(`${service}\0${account}`);
+  }
+
+  recordedItems(): string[] {
+    return [...this.coordinates].sort();
+  }
+}
+
+function stageHarness(withUser: boolean) {
+  const dir = mkdtempSync(join(tmpdir(), 'qlb-codex-stage-'));
+  const agentDir = join(dir, 'agent');
+  const authPath = join(agentDir, 'auth.json');
+  const ownerPath = join(agentDir, 'qlb-owner-openai-codex.json');
+  const claims: Record<string, string> = { chatgpt_account_id: 'fixture-account' };
+  if (withUser) claims.chatgpt_user_id = 'fixture-user';
+  mkdirSync(agentDir, { recursive: true, mode: 0o700 });
+  writeFileSync(authPath, JSON.stringify({
+    'openai-codex': {
+      type: 'oauth',
+      access: jwt({ 'https://api.openai.com/auth': claims }),
+      refresh: 'fixture-refresh',
+      expires: 2_000_000_000_000,
+      accountId: 'fixture-account',
+    },
+  }), { mode: 0o600 });
+  const store = openStore(join(dir, 'qlb.db'));
+  const keychain = new TrackingMockKeychain();
+  return {
+    dir,
+    agentDir,
+    ownerPath,
+    store,
+    keychain,
+    migration: createSingleGrantMigration(store, keychain, 'openai-codex', authPath, ownerPath),
+    cleanup: () => {
+      store.close();
+      rmSync(dir, { recursive: true, force: true });
+    },
+  };
+}
+
 describe('Codex S29 activation', () => {
   it('the adapter reports the slot id and writes no accounts row', async () => {
     const adapter = createCodexAdapter({ readAuth: async () => JSON.stringify(document()) });
@@ -97,15 +148,35 @@ describe('Codex S29 activation', () => {
   });
 
   it('openai-codex stage keys journal, account and Keychain item by the slot id', () => {
-    const access = document().tokens.access_token;
-    assert.equal(accountIdForSingleGrant('openai-codex', { access, accountId: 'fixture-account' }), 'fixture-user:fixture-account');
+    const h = stageHarness(true);
+    try {
+      h.migration.stage();
+      const slotId = 'fixture-user:fixture-account';
+      const migration = h.store.getMigration('pi-openai-codex');
+      assert.deepEqual(JSON.parse(migration?.detail_json ?? '{}').qlbAccountIds, [slotId]);
+      const db = (h.store as unknown as { db: DatabaseSync }).db;
+      assert.equal((db.prepare('SELECT id FROM accounts').get() as { id: string }).id, slotId);
+      assert.deepEqual(h.keychain.recordedItems(), [`qlb:openai-codex:${slotId}\0${slotId}`]);
+      assert.equal(count(db, "accounts WHERE id = 'fixture-account'"), 0);
+      assert.equal(h.keychain.recordedItems().some((item) => item.startsWith('qlb:openai-codex:fixture-account\0')), false);
+    } finally {
+      h.cleanup();
+    }
   });
 
   it('openai-codex stage refuses codex-identity-missing and writes nothing', () => {
-    assert.throws(
-      () => accountIdForSingleGrant('openai-codex', { access: 'not-a-jwt', accountId: 'fixture-account' }),
-      /codex-identity-missing/,
-    );
+    const h = stageHarness(false);
+    try {
+      assert.throws(() => h.migration.stage(), /codex-identity-missing/);
+      const db = (h.store as unknown as { db: DatabaseSync }).db;
+      assert.equal(count(db, 'migrations'), 0);
+      assert.equal(count(db, 'accounts'), 0);
+      assert.deepEqual(h.keychain.recordedItems(), []);
+      assert.equal(existsSync(stagingOwnerPath(h.ownerPath, 'openai-codex')), false);
+      assert.equal(existsSync(h.ownerPath), false);
+    } finally {
+      h.cleanup();
+    }
   });
 
   it('rehearse sends the bare id header for a slot id', async () => {
