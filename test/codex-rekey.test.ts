@@ -85,6 +85,19 @@ function rekeyState(db: DatabaseSync): unknown[] {
   ];
 }
 
+function plainRows(rows: object[]): object[] {
+  return rows.map((row) => ({ ...row }));
+}
+
+function everyTableState(db: DatabaseSync): string {
+  const tables = db.prepare(`SELECT name FROM sqlite_master
+    WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name`).all() as Array<{ name: string }>;
+  return JSON.stringify(tables.map(({ name }) => ({
+    name,
+    rows: db.prepare(`SELECT rowid, * FROM "${name.replaceAll('"', '""')}" ORDER BY rowid`).all(),
+  })));
+}
+
 describe('Codex rekey planner', () => {
   it('a bare row with one matching slot is a rename', () => {
     const f = fixture();
@@ -596,13 +609,158 @@ describe('Codex rekey apply', () => {
     }
   });
 
-  it('refuses merge moves before applying them', () => {
+  it('a clashing reading keeps the newer one', () => {
     const f = fixture();
     try {
-      inTransaction(f.db, () => assert.throws(
-        () => applyCodexRekey(f.db, { moves: [{ from: 'old', to: 'new', kind: 'merge' }], skipped: [] }, { now: 100 }),
-        /rekey-merge-not-supported/,
-      ));
+      slot(f.db, 'user:bare', 'bare');
+      account(f.db, 'bare', 'openai-codex');
+      account(f.db, 'user:bare', 'openai-codex');
+      f.db.prepare(`INSERT INTO snapshots (account_id, bucket, used_pct, fetched_at)
+        VALUES ('bare', 'primary', 80, 20), ('user:bare', 'primary', 10, 10)`).run();
+      applyPlan(f.db);
+      assert.deepEqual(plainRows(f.db.prepare('SELECT * FROM snapshots ORDER BY account_id, bucket').all()), [
+        { account_id: 'user:bare', bucket: 'primary', used_pct: 80, used: null, limit_val: null, remaining: null, reset_at: null, fetched_at: 20, source: null, confidence: null },
+      ]);
+    } finally { f.close(); }
+  });
+
+  it('a NULL fetched_at loses', () => {
+    const f = fixture();
+    try {
+      slot(f.db, 'user:bare', 'bare');
+      account(f.db, 'bare', 'openai-codex');
+      account(f.db, 'user:bare', 'openai-codex');
+      f.db.prepare(`INSERT INTO snapshots (account_id, bucket, used_pct, fetched_at)
+        VALUES ('bare', 'primary', 80, NULL), ('user:bare', 'primary', 10, 10)`).run();
+      applyPlan(f.db);
+      assert.deepEqual(plainRows(f.db.prepare('SELECT * FROM snapshots ORDER BY account_id, bucket').all()), [
+        { account_id: 'user:bare', bucket: 'primary', used_pct: 10, used: null, limit_val: null, remaining: null, reset_at: null, fetched_at: 10, source: null, confidence: null },
+      ]);
+    } finally { f.close(); }
+  });
+
+  it('a tie keeps the target reading', () => {
+    const f = fixture();
+    try {
+      slot(f.db, 'user:bare', 'bare');
+      account(f.db, 'bare', 'openai-codex');
+      account(f.db, 'user:bare', 'openai-codex');
+      f.db.prepare(`INSERT INTO snapshots (account_id, bucket, used_pct, fetched_at)
+        VALUES ('bare', 'primary', 80, 10), ('user:bare', 'primary', 10, 10)`).run();
+      applyPlan(f.db);
+      assert.deepEqual(plainRows(f.db.prepare('SELECT * FROM snapshots ORDER BY account_id, bucket').all()), [
+        { account_id: 'user:bare', bucket: 'primary', used_pct: 10, used: null, limit_val: null, remaining: null, reset_at: null, fetched_at: 10, source: null, confidence: null },
+      ]);
+    } finally { f.close(); }
+  });
+
+  it('identical pins are kept once and different pins are all kept', () => {
+    const f = fixture();
+    try {
+      slot(f.db, 'user:bare', 'bare');
+      account(f.db, 'bare', 'openai-codex');
+      account(f.db, 'user:bare', 'openai-codex');
+      f.db.prepare(`INSERT INTO overrides (kind, account_id, session, until) VALUES
+        ('pin', 'bare', 'duplicate', NULL),
+        ('pin', 'user:bare', 'duplicate', NULL),
+        ('pin', 'bare', 'source-only', 1),
+        ('pin', 'user:bare', 'target-only', 2)`).run();
+      applyPlan(f.db);
+      assert.deepEqual(plainRows(f.db.prepare('SELECT kind, account_id, session, until FROM overrides ORDER BY session').all()), [
+        { kind: 'pin', account_id: 'user:bare', session: 'duplicate', until: null },
+        { kind: 'pin', account_id: 'user:bare', session: 'source-only', until: 1 },
+        { kind: 'pin', account_id: 'user:bare', session: 'target-only', until: 2 },
+      ]);
+    } finally { f.close(); }
+  });
+
+  it('a clashing expired lease keeps the target generation', () => {
+    const f = fixture();
+    try {
+      slot(f.db, 'user:bare', 'bare');
+      account(f.db, 'bare', 'openai-codex');
+      account(f.db, 'user:bare', 'openai-codex');
+      lease(f.db, 'bare', 99);
+      f.db.prepare(`INSERT INTO leases (name, holder_pid, holder_id, until, generation)
+        VALUES (?, 2, 'target', 99, 8)`).run(refreshLeaseName('user:bare'));
+      applyPlan(f.db);
+      assert.deepEqual(plainRows(f.db.prepare('SELECT name, holder_pid, holder_id, until, generation FROM leases ORDER BY name').all()), [
+        { name: refreshLeaseName('user:bare'), holder_pid: 2, holder_id: 'target', until: 99, generation: 8 },
+      ]);
+    } finally { f.close(); }
+  });
+
+  it('merge deletes only the emptied source row and keeps target fields', () => {
+    const f = fixture();
+    try {
+      slot(f.db, 'user:bare', 'bare');
+      account(f.db, 'bare', 'openai-codex');
+      account(f.db, 'user:bare', 'openai-codex');
+      f.db.prepare("UPDATE accounts SET label = 'source', status = 'disabled', created_at = 2 WHERE id = 'bare'").run();
+      f.db.prepare("UPDATE accounts SET label = 'target', status = 'active', created_at = 3 WHERE id = 'user:bare'").run();
+      f.db.prepare("INSERT INTO snapshots (account_id, bucket, fetched_at) VALUES ('bare', 'primary', 1)").run();
+      applyPlan(f.db);
+      assert.deepEqual(plainRows(f.db.prepare('SELECT id, provider, label, status, created_at FROM accounts ORDER BY id').all()), [
+        { id: 'user:bare', provider: 'openai-codex', label: 'target', status: 'active', created_at: 3 },
+      ]);
+      assert.deepEqual(plainRows(f.db.prepare('SELECT * FROM snapshots ORDER BY account_id, bucket').all()), [
+        { account_id: 'user:bare', bucket: 'primary', used_pct: null, used: null, limit_val: null, remaining: null, reset_at: null, fetched_at: 1, source: null, confidence: null },
+      ]);
+    } finally { f.close(); }
+  });
+
+  it('bare and codex-default into one slot: rename then merge', () => {
+    const f = fixture();
+    try {
+      slot(f.db, 'user:bare', 'bare');
+      account(f.db, 'bare', 'openai-codex');
+      account(f.db, 'codex-default', 'openai-codex');
+      f.db.prepare(`INSERT INTO snapshots (account_id, bucket, fetched_at) VALUES
+        ('bare', 'primary', 1), ('codex-default', 'secondary', 2)`).run();
+      applyPlan(f.db);
+      assert.deepEqual(plainRows(f.db.prepare('SELECT id, provider, label, status, created_at FROM accounts ORDER BY id').all()), [
+        { id: 'user:bare', provider: 'openai-codex', label: 'fixture', status: 'active', created_at: 1 },
+      ]);
+      assert.deepEqual(plainRows(f.db.prepare('SELECT * FROM snapshots ORDER BY account_id, bucket').all()), [
+        { account_id: 'user:bare', bucket: 'primary', used_pct: null, used: null, limit_val: null, remaining: null, reset_at: null, fetched_at: 1, source: null, confidence: null },
+        { account_id: 'user:bare', bucket: 'secondary', used_pct: null, used: null, limit_val: null, remaining: null, reset_at: null, fetched_at: 2, source: null, confidence: null },
+      ]);
+    } finally { f.close(); }
+  });
+
+  it("another provider's usage_polls row does not block the merge count", () => {
+    const f = fixture();
+    try {
+      slot(f.db, 'user:bare', 'bare');
+      account(f.db, 'bare', 'openai-codex');
+      account(f.db, 'user:bare', 'openai-codex');
+      f.db.prepare("INSERT INTO snapshots (account_id, bucket, fetched_at) VALUES ('bare', 'primary', 1)").run();
+      f.db.prepare("INSERT INTO usage_polls (provider, account_id, next_due_at) VALUES ('anthropic', 'bare', 4)").run();
+      applyPlan(f.db);
+      assert.deepEqual(plainRows(f.db.prepare('SELECT id, provider FROM accounts ORDER BY id').all()), [
+        { id: 'user:bare', provider: 'openai-codex' },
+      ]);
+      assert.deepEqual(plainRows(f.db.prepare('SELECT * FROM usage_polls ORDER BY provider, account_id').all()), [
+        { provider: 'anthropic', account_id: 'bare', last_fetch_at: null, last_attempt_at: null, next_due_at: 4, poll_interval_s: null, last_status: null, consecutive_failures: 0, backoff_until: null, last_429_at: null, held_until: null },
+      ]);
+    } finally { f.close(); }
+  });
+
+  it('a remaining Codex dependent aborts the merge and nothing is committed', () => {
+    const f = fixture();
+    try {
+      slot(f.db, 'user:bare', 'bare');
+      account(f.db, 'bare', 'openai-codex');
+      account(f.db, 'user:bare', 'openai-codex');
+      f.db.prepare("INSERT INTO snapshots (account_id, bucket, fetched_at) VALUES ('bare', 'primary', 1)").run();
+      const before = everyTableState(f.db);
+      assert.throws(() => inTransaction(f.db, () => applyCodexRekey(f.db, plan(f.db), {
+        now: 100,
+        // Test-only seam: simulate a dependent written during a caller-owned transaction.
+        testOnlyBeforeMergeCount: (db) => db.prepare(`INSERT INTO snapshots (account_id, bucket, fetched_at)
+          VALUES ('bare', 'late', 2)`).run(),
+      })), /rekey-dependents-remain/);
+      assert.equal(everyTableState(f.db), before);
     } finally { f.close(); }
   });
 });
