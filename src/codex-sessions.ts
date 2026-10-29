@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import type { DatabaseSync } from 'node:sqlite';
+import { DatabaseSync } from 'node:sqlite';
 import { basename } from 'node:path';
 import { promisify } from 'node:util';
 import { codexIdentityKey, type CodexIdentity } from './codex-auth';
@@ -36,6 +36,10 @@ export interface CodexSwitchLogRow {
   publishedAt: number | null;
   /** `switch_log.ts`, the row creation/attempt timestamp when no publication exists. */
   attemptedAt: number | null;
+  /** Raw switch metadata retained for later switch-history consumers. */
+  detail?: string | null;
+  published_at?: number | null;
+  steps_json?: string | null;
 }
 
 export interface HolderEra {
@@ -59,6 +63,57 @@ export interface CodexLiveObservation {
   identity: string | null;
   lineageFp: string | null;
   by: string;
+}
+
+export interface CodexSwitchHistory {
+  rows: CodexSwitchLogRow[];
+  observations: CodexLiveObservation[];
+}
+
+/** Splits Codex's composite identity at its first separator. */
+export function codexIdentityParts(slotId: string): CodexIdentity {
+  const separator = slotId.indexOf(':');
+  return {
+    chatgpt_user_id: slotId.slice(0, separator),
+    account_id: slotId.slice(separator + 1),
+  };
+}
+
+/** Reads the credential-free Codex switch history without taking a write lock. */
+export function readCodexSwitchHistory(dbPath: string): CodexSwitchHistory {
+  const db = new DatabaseSync(dbPath, { readOnly: true });
+  try {
+    db.exec('PRAGMA busy_timeout = 5000');
+    return {
+      rows: db.prepare(`SELECT id, provider, from_account, to_account, outcome, detail, published_at, steps_json, ts
+        FROM switch_log WHERE provider = 'openai-codex' ORDER BY published_at, ts, id`).all()
+        .map((row) => {
+          const r = row as Record<string, unknown>;
+          const publishedAt = typeof r.published_at === 'number' ? r.published_at : null;
+          return {
+            id: Number(r.id), provider: String(r.provider),
+            fromAccountId: typeof r.from_account === 'string' ? r.from_account : null,
+            toAccountId: String(r.to_account), outcome: r.outcome as CodexSwitchLogRow['outcome'],
+            publishedAt,
+            attemptedAt: typeof r.ts === 'number' ? r.ts : null,
+            detail: typeof r.detail === 'string' ? r.detail : null,
+            published_at: publishedAt,
+            steps_json: typeof r.steps_json === 'string' ? r.steps_json : null,
+          };
+        }),
+      observations: db.prepare('SELECT ts, identity, lineage_fp, by FROM codex_live_observations ORDER BY ts, id').all()
+        .map((row) => {
+          const r = row as Record<string, unknown>;
+          return {
+            ts: Number(r.ts), identity: typeof r.identity === 'string' ? r.identity : null,
+            lineageFp: typeof r.lineage_fp === 'string' ? r.lineage_fp : null,
+            by: String(r.by),
+          };
+        }),
+    };
+  } finally {
+    db.close();
+  }
 }
 
 export interface PsOptions {
