@@ -1050,4 +1050,105 @@ describe('Codex attribution final save hooks (C3c-S9)', () => {
       rmSync(h.home, { recursive: true, force: true });
     }
   });
+
+  it('lock loss during beforeSave aborts the save before its first write', async () => {
+    for (const action of ['mark', 'adopt'] as const) {
+      const h = fixture();
+      try {
+        const old = document(`lock-before-save-${action}-old`);
+        const live = document(`lock-before-save-${action}-live`);
+        const plan = importActiveCodexSlot(old, { store: h.store, keychain: h.keychain, now: () => 1 });
+        const service = qlbKeychainService('openai-codex', plan.slotId);
+        const db = (h.store as unknown as { db: DatabaseSync }).db;
+        let slotWrites = 0;
+        (h.store as unknown as { db: DatabaseSync }).db = new Proxy(db, {
+          get(target, property, receiver) {
+            if (property === 'prepare') return (sql: string) => {
+              if (sql.startsWith('UPDATE codex_slots')) slotWrites += 1;
+              return target.prepare(sql);
+            };
+            const value = Reflect.get(target, property, receiver);
+            return typeof value === 'function' ? value.bind(target) : value;
+          },
+        });
+        let compromised = false;
+        const assertNotCompromised = () => {
+          if (compromised) {
+            assert.equal(slotWrites, 0, 'a compromised lock must be checked before the first slot write');
+            throw new CodexAuthLockCompromised();
+          }
+        };
+        const initialSlot = h.store.getCodexSlot(plan.slotId);
+        const initialActive = h.store.getCodexActiveLogin();
+        await assert.rejects(attributeLiveDocument(withSaveHooks({
+          store: h.store, keychain: h.keychain,
+          slot: { accountId: plan.slotId, document: old, fingerprint: codexFingerprint(old) },
+          live: action === 'mark' ? old : live, now: () => 2, assertNotCompromised,
+        }, { beforeSave: () => { compromised = true; } })), CodexAuthLockCompromised);
+        assert.deepEqual(h.store.getCodexSlot(plan.slotId), initialSlot);
+        assert.equal(h.store.getCodexActiveLogin(), initialActive);
+        if (action === 'adopt') {
+          assert.equal(codexFingerprint(JSON.parse(h.keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT))), codexFingerprint(old));
+          assert.throws(() => h.keychain.getSync(`${service}:prev`, QLB_KEYCHAIN_ACCOUNT), /item not found/);
+        }
+      } finally {
+        h.store.close();
+        rmSync(h.home, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it('lock loss during beforeSaveCommit rolls the whole save back', async () => {
+    for (const action of ['mark', 'adopt'] as const) {
+      const h = fixture();
+      try {
+        const old = document(`lock-before-commit-${action}-old`);
+        const live = document(`lock-before-commit-${action}-live`);
+        const plan = importActiveCodexSlot(old, { store: h.store, keychain: h.keychain, now: () => 1 });
+        const service = qlbKeychainService('openai-codex', plan.slotId);
+        const initialSlot = h.store.getCodexSlot(plan.slotId);
+        const initialActive = h.store.getCodexActiveLogin();
+        let compromised = false;
+        const assertNotCompromised = () => {
+          if (compromised) throw new CodexAuthLockCompromised();
+        };
+        await assert.rejects(attributeLiveDocument(withSaveHooks({
+          store: h.store, keychain: h.keychain,
+          slot: { accountId: plan.slotId, document: old, fingerprint: codexFingerprint(old) },
+          live: action === 'mark' ? old : live, now: () => 2, assertNotCompromised,
+        }, { beforeSaveCommit: () => { compromised = true; } })), CodexAuthLockCompromised);
+        assert.deepEqual(h.store.getCodexSlot(plan.slotId), initialSlot);
+        assert.equal(h.store.getCodexActiveLogin(), initialActive);
+        if (action === 'adopt') {
+          assert.equal(codexFingerprint(JSON.parse(h.keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT))), codexFingerprint(old));
+          assert.throws(() => h.keychain.getSync(`${service}:prev`, QLB_KEYCHAIN_ACCOUNT), /item not found/);
+        }
+      } finally {
+        h.store.close();
+        rmSync(h.home, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it('an async beforeSave is refused and nothing is saved', async () => {
+    for (const action of ['mark', 'adopt'] as const) {
+      const h = fixture();
+      try {
+        const old = document(`async-before-save-${action}-old`);
+        const live = document(`async-before-save-${action}-live`);
+        const plan = importActiveCodexSlot(old, { store: h.store, keychain: h.keychain, now: () => 1 });
+        const initialSlot = h.store.getCodexSlot(plan.slotId);
+        const initialActive = h.store.getCodexActiveLogin();
+        await assert.rejects(attributeLiveDocument(withSaveHooks({
+          store: h.store, keychain: h.keychain,
+          slot: { accountId: plan.slotId, document: old, fingerprint: codexFingerprint(old) }, live: action === 'mark' ? old : live, now: () => 2,
+        }, { beforeSave: async () => undefined })), /Codex save hooks must be synchronous/);
+        assert.deepEqual(h.store.getCodexSlot(plan.slotId), initialSlot);
+        assert.equal(h.store.getCodexActiveLogin(), initialActive);
+      } finally {
+        h.store.close();
+        rmSync(h.home, { recursive: true, force: true });
+      }
+    }
+  });
 });
