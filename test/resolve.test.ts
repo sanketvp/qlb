@@ -205,3 +205,82 @@ describe('qlb resolve — store-backed end-to-end', () => {
     store.close();
   });
 });
+
+describe('qlb resolve — Codex account ownership', () => {
+  const codexSnapshot: AccountSnapshot = {
+    accountId: 'fixture-user:fixture-account',
+    provider: 'openai-codex',
+    label: 'fixture-user:fixture-account',
+    buckets: {},
+  };
+
+  it('resolve skips a Codex slot-id snapshot that has no accounts row', () => {
+    const store = openStore(':memory:');
+    try {
+      const decision = resolveFromSnapshots({
+        model: 'gpt-5.4',
+        snapshots: [codexSnapshot],
+        store,
+      });
+
+      assert.equal(decision.ok, false);
+      if (decision.ok) return;
+      assert.equal(decision.error, 'EXHAUSTED');
+      assert.equal(store.listRoutingDecisions(1)[0]?.account_id, null);
+    } finally {
+      store.close();
+    }
+  });
+
+  it('resolve still picks an imported Codex slot', () => {
+    const store = openStore(':memory:');
+    try {
+      store.upsertAccount(codexSnapshot.accountId, 'openai-codex', codexSnapshot.label);
+      const decision = resolveFromSnapshots({
+        model: 'gpt-5.4',
+        snapshots: [codexSnapshot],
+        store,
+      });
+
+      assert.equal(decision.ok, true);
+      if (!decision.ok) return;
+      assert.equal(decision.accountId, codexSnapshot.accountId);
+    } finally {
+      store.close();
+    }
+  });
+
+  it('resolve without a store does not filter Codex snapshots', () => {
+    const decision = resolveFromSnapshots({
+      model: 'gpt-5.4',
+      snapshots: [codexSnapshot],
+    });
+
+    assert.equal(decision.ok, true);
+    if (!decision.ok) return;
+    assert.equal(decision.accountId, codexSnapshot.accountId);
+  });
+
+  it('non-Codex snapshots without an accounts row are unchanged', () => {
+    const store = openStore(':memory:');
+    try {
+      const xaiSnapshot: AccountSnapshot = {
+        accountId: 'xai-default',
+        provider: 'xai',
+        label: 'Grok (xAI)',
+        buckets: {},
+      };
+      const decision = resolveFromSnapshots({
+        model: 'grok-4.6',
+        snapshots: [xaiSnapshot],
+        store,
+      });
+
+      assert.equal(decision.ok, true);
+      if (!decision.ok) return;
+      assert.equal(decision.accountId, xaiSnapshot.accountId);
+    } finally {
+      store.close();
+    }
+  });
+});

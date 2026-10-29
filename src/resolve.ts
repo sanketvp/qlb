@@ -291,7 +291,12 @@ export function resolveFromSnapshots(req: ResolveRequest): ResolveDecision {
     const provider = providerForModel(candidateModel);
     if (!provider) continue;
     const candidates = req.snapshots.filter(
-      (s) => s.provider === provider && !reserved.has(s.accountId),
+      (s) =>
+        s.provider === provider &&
+        !reserved.has(s.accountId) &&
+        (req.store == null ||
+          s.provider !== 'openai-codex' ||
+          req.store.getAccount(s.accountId) !== null),
     );
     lastCandidates = candidates;
     const picked = pickAccount(strategy, {
