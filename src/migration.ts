@@ -119,6 +119,7 @@ import {
 } from 'node:fs';
 import { dirname, join, resolve, sep } from 'node:path';
 import { config } from './config';
+import { fsyncDirSync } from './fsutil';
 import { qlbHomeDir } from './home';
 import type { KeychainBackend } from './keychain';
 import { openRouterMissingKeyMessage, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, readNativeOpenRouterKey } from './keychain';
@@ -317,6 +318,8 @@ export interface MigrationConfig {
   beforePoolCommitLock?: () => void;
   /** Test-only barrier immediately before single-grant stage takes Pi's auth lock. */
   beforeOwnershipLock?: () => void;
+  /** Test-only directory durability seam for S6b cleanup. */
+  fsyncDirectory?: (path: string) => void;
   /** P7a's in-progress journal directory; defaults to ~/.qlb/journal. */
   piMigrateJournalDir?: string;
 }
@@ -755,6 +758,7 @@ export class Migration {
   private readonly readNativeKey: (() => string) | undefined;
   private readonly beforePoolCommitLock: (() => void) | undefined;
   private readonly beforeOwnershipLock: (() => void) | undefined;
+  private readonly fsyncDirectory: (path: string) => void;
   private readonly piMigrateJournalDir: string;
 
   constructor(
@@ -777,6 +781,7 @@ export class Migration {
     this.readNativeKey = config.readNativeKey;
     this.beforePoolCommitLock = config.beforePoolCommitLock;
     this.beforeOwnershipLock = config.beforeOwnershipLock;
+    this.fsyncDirectory = config.fsyncDirectory ?? fsyncDirSync;
     this.piMigrateJournalDir = config.piMigrateJournalDir ?? join(qlbHomeDir(), '.qlb', 'journal');
   }
 
@@ -1689,8 +1694,12 @@ export class Migration {
     return out;
   }
 
-  /** S7. C3's hygiene grows in later rows; this reader only records its completion. */
+  /** S6b + S7. C3 removes staging before recording cleanup completion. */
   private finishCleanupPendingHandback(handback: Record<string, unknown>): MigrationStatus {
+    const staging = this.stagingPath();
+    unlinkIfExists(staging);
+    // S6b must be durable before S7 clears the retry marker.
+    this.fsyncDirectory(dirname(staging));
     const detail = parseDetail(this.store.getMigration(this.storeName)?.detail_json);
     this.journal(this.journalState(), {
       handback: undefined,
