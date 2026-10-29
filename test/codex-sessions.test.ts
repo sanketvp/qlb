@@ -5,9 +5,11 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   appendObservation,
+  codexIdentityParts,
   holderEras,
   holderSets,
   list,
+  readCodexSwitchHistory,
   renewers,
   stillTheSameProcess,
   type CodexProcess,
@@ -55,6 +57,85 @@ const switchRows = [
 describe('Codex session process list and holder eras', () => {
   it('uses Codex auth’s canonical composite key for holder-era lookups', () => {
     assert.equal(A, 'user-a:account-a');
+  });
+
+  it('readCodexSwitchHistory returns only openai-codex rows ordered by published_at, ts, id', () => {
+    const dir = mkdtempSync('/tmp/qlb-codex-history-');
+    const dbPath = join(dir, 'qlb.db');
+    const db = new DatabaseSync(dbPath);
+    try {
+      db.exec(`CREATE TABLE switch_log (
+        id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, provider TEXT NOT NULL,
+        from_account TEXT, to_account TEXT NOT NULL, outcome TEXT NOT NULL,
+        detail TEXT, published_at INTEGER, steps_json TEXT
+      );
+      CREATE TABLE codex_live_observations (
+        id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, identity TEXT,
+        lineage_fp TEXT, by TEXT NOT NULL
+      );
+      INSERT INTO switch_log VALUES
+        (8, 5, 'openai-codex', 'user-b:account-b', 'user-c:account-c', 'ok', 'last', 100, '{"attempt":"third"}'),
+        (3, 30, 'openai-codex', 'user-a:account-a', 'user-b:account-b', 'failed', 'first', NULL, '{"attempt":"first"}'),
+        (5, 5, 'openai-codex', 'user-c:account-c', 'user-a:account-a', 'rolled-back', 'middle', 100, '{"attempt":"second"}'),
+        (2, 1, 'anthropic', 'other', 'ignored', 'ok', 'ignored', 0, '{}');
+      INSERT INTO codex_live_observations VALUES (1, 9, 'user-a:account-a', 'lineage-a', 'test');`);
+    } finally {
+      db.close();
+    }
+    try {
+      const history = readCodexSwitchHistory(dbPath);
+      assert.deepEqual(history.rows.map((entry) => entry.id), [3, 5, 8]);
+      assert.deepEqual(history.rows.map((entry) => ({
+        detail: entry.detail, published_at: entry.published_at, steps_json: entry.steps_json,
+      })), [
+        { detail: 'first', published_at: null, steps_json: '{"attempt":"first"}' },
+        { detail: 'middle', published_at: 100, steps_json: '{"attempt":"second"}' },
+        { detail: 'last', published_at: 100, steps_json: '{"attempt":"third"}' },
+      ]);
+      assert.deepEqual(history.observations, [
+        { ts: 9, identity: A, lineageFp: 'lineage-a', by: 'test' },
+      ]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('codexIdentityParts splits at the first colon', () => {
+    assert.deepEqual(codexIdentityParts('user-a:account:with:colons'), {
+      chatgpt_user_id: 'user-a', account_id: 'account:with:colons',
+    });
+  });
+
+  it('codex refresh holder sets are unchanged after the move', () => {
+    const dir = mkdtempSync('/tmp/qlb-codex-holders-');
+    const dbPath = join(dir, 'qlb.db');
+    const db = new DatabaseSync(dbPath);
+    try {
+      db.exec(`CREATE TABLE switch_log (
+        id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, provider TEXT NOT NULL,
+        from_account TEXT, to_account TEXT NOT NULL, outcome TEXT NOT NULL,
+        detail TEXT, published_at INTEGER, steps_json TEXT
+      );
+      CREATE TABLE codex_live_observations (
+        id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, identity TEXT,
+        lineage_fp TEXT, by TEXT NOT NULL
+      );
+      INSERT INTO switch_log VALUES
+        (1, ${T0}, 'openai-codex', '${A}', '${B}', 'ok', NULL, ${T0}, NULL),
+        (2, ${T0 + 15_000}, 'openai-codex', '${B}', '${A}', 'ok', NULL, ${T0 + 15_000}, NULL);`);
+    } finally {
+      db.close();
+    }
+    try {
+      const history = readCodexSwitchHistory(dbPath);
+      const holders = renewers(codexIdentityParts(B), [
+        { pid: 811, lstart: lstarts.afterFirst, host: 'codex' },
+        { pid: 812, lstart: lstarts.afterThird, host: 'codex' },
+      ], history.rows, history.observations);
+      assert.deepEqual(holders.map(({ pid }) => pid), [811]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('lists only Codex processes from injected ps output without running ps in tests', async () => {

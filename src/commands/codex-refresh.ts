@@ -8,7 +8,7 @@ import {
   type CodexRefreshResponse,
 } from '../codex-consume';
 import { codexIdentity } from '../codex-auth';
-import { list, renewers, type CodexLiveObservation, type CodexSwitchLogRow } from '../codex-sessions';
+import { codexIdentityParts, list, readCodexSwitchHistory, renewers } from '../codex-sessions';
 import { CodexSlots } from '../codex-slots';
 import { ClaudeCodeLockTimeout, withProperLockfile } from '../cc-locks';
 import { platformKeychain } from '../keychain';
@@ -88,41 +88,6 @@ export async function runCodexRefreshCommand(args: string[], deps: CodexRefreshC
   return result.status === 'refreshed' || result.status === 'fresh' || result.status === 'codex-won-inactive' ? 0 : 1;
 }
 
-function withHistory<T>(store: Pick<Store, 'dbPath'>, fn: (db: DatabaseSync) => T): T {
-  const db = new DatabaseSync(store.dbPath, { readOnly: true });
-  try {
-    db.exec('PRAGMA busy_timeout = 5000');
-    return fn(db);
-  } finally {
-    db.close();
-  }
-}
-
-function history(store: Pick<Store, 'dbPath'>): { rows: CodexSwitchLogRow[]; observations: CodexLiveObservation[] } {
-  return withHistory(store, (db) => ({
-    rows: db.prepare(`SELECT id, provider, from_account, to_account, outcome, published_at, ts
-      FROM switch_log WHERE provider = 'openai-codex' ORDER BY published_at, ts, id`).all()
-      .map((row) => {
-        const r = row as Record<string, unknown>;
-        return {
-          id: Number(r.id), provider: String(r.provider),
-          fromAccountId: typeof r.from_account === 'string' ? r.from_account : null,
-          toAccountId: String(r.to_account), outcome: r.outcome as CodexSwitchLogRow['outcome'],
-          publishedAt: typeof r.published_at === 'number' ? r.published_at : null,
-          attemptedAt: typeof r.ts === 'number' ? r.ts : null,
-        };
-      }),
-    observations: db.prepare('SELECT ts, identity, lineage_fp, by FROM codex_live_observations ORDER BY ts, id').all()
-      .map((row) => {
-        const r = row as Record<string, unknown>;
-        return {
-          ts: Number(r.ts), identity: typeof r.identity === 'string' ? r.identity : null,
-          lineageFp: typeof r.lineage_fp === 'string' ? r.lineage_fp : null,
-          by: String(r.by),
-        };
-      }),
-  }));
-}
 
 async function sendRefresh(request: { url: string; method: 'GET' | 'POST'; headers: Record<string, string>; body?: string }): Promise<CodexRefreshResponse> {
   const response = await fetch(request.url, { method: request.method, headers: request.headers, body: request.body });
@@ -130,10 +95,14 @@ async function sendRefresh(request: { url: string; method: 'GET' | 'POST'; heade
 }
 
 function activeCodexSlot(store: Store): string | null {
-  return withHistory(store, (db) => {
+  const db = new DatabaseSync(store.dbPath, { readOnly: true });
+  try {
+    db.exec('PRAGMA busy_timeout = 5000');
     const row = db.prepare("SELECT account_id FROM active_login WHERE provider = 'openai-codex'").get() as { account_id?: string | null } | undefined;
     return typeof row?.account_id === 'string' ? row.account_id : null;
-  });
+  } finally {
+    db.close();
+  }
 }
 
 async function execute(args: string[], ctx: CommandContext): Promise<number> {
@@ -173,10 +142,9 @@ async function execute(args: string[], ctx: CommandContext): Promise<number> {
                 holders: async (document) => {
                   const identity = codexIdentity(document);
                   if (!identity) throw new Error('Codex slot identity is invalid');
-                  const separator = identity.indexOf(':');
-                  const prior = history(store);
+                  const prior = readCodexSwitchHistory(store.dbPath);
                   return renewers(
-                    { chatgpt_user_id: identity.slice(0, separator), account_id: identity.slice(separator + 1) },
+                    codexIdentityParts(identity),
                     await list(), prior.rows, prior.observations,
                   );
                 },
