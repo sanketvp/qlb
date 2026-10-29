@@ -1731,6 +1731,27 @@ export class Migration {
     unlinkIfExists(staging);
     // S6b must be durable before S7 clears the retry marker.
     fsyncDirectoryIfPresent(dirname(staging));
+    // S6c1: the recorded verdict is the sole deletion authority. Read the
+    // Keychain coordinates from the durable journal rather than deriving them
+    // from the current migration configuration.
+    if (this.kind === 'single-grant' && handback.keychainDisposition === 'delete') {
+      const detail = parseDetail(this.store.getMigration(this.storeName)?.detail_json);
+      const journalAccount = Array.isArray(detail.accounts) ? detail.accounts[0] : undefined;
+      if (
+        !isObjectRecord(journalAccount)
+        || typeof journalAccount.provider !== 'string'
+        || typeof journalAccount.id !== 'string'
+        || typeof journalAccount.label !== 'string'
+      ) {
+        throw new Error('cleanup-pending hand-back has no valid journal account coordinates');
+      }
+      const coords = keychainCoords(journalAccount.provider, journalAccount.id, journalAccount.label);
+      try {
+        this.keychain.deleteSync(coords.service, coords.account);
+      } catch (error) {
+        if (!isCredentialNotFound(error)) throw error;
+      }
+    }
     const detail = parseDetail(this.store.getMigration(this.storeName)?.detail_json);
     this.journal(this.journalState(), {
       handback: undefined,

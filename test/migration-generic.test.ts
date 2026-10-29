@@ -1176,6 +1176,90 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     }
   });
 
+  it('a recorded delete removes the Keychain copy and a recorded keep, or any other value, leaves it untouched', () => {
+    for (const fixture of [
+      { disposition: 'delete', itemPresent: true, shouldRemain: false },
+      { disposition: 'delete', itemPresent: false, shouldRemain: false },
+      { disposition: 'keep', itemPresent: true, shouldRemain: true },
+      { disposition: 'unknown', itemPresent: true, shouldRemain: true },
+    ]) {
+      const h = setup('xai');
+      try {
+        const marker = {
+          phase: 'cleanup-pending',
+          keychainDisposition: fixture.disposition,
+          piFingerprint: null,
+          decision: null,
+          fencedGeneration: null,
+          rolledBackAt: 123,
+        };
+        const service = qlbKeychainService('xai', expectedId('xai'));
+        const account = expectedLabel('xai');
+        if (fixture.itemPresent) {
+          h.kc.setSync(service, account, JSON.stringify({ ...FAKE_GRANTS.xai, generation: 0 }));
+        }
+        h.store.upsertMigration('pi-xai', 'NATIVE', JSON.stringify({
+          accounts: [{
+            id: expectedId('xai'),
+            provider: 'xai',
+            label: expectedLabel('xai'),
+            fingerprint: 'fixture-fingerprint',
+          }],
+          handback: marker,
+        }));
+
+        const resumed = h.mig.resume();
+
+        assert.equal(
+          keychainHas(h.kc, 'xai'),
+          fixture.shouldRemain,
+          `${fixture.disposition} applies only the recorded disposition to J.accounts[0]`,
+        );
+        assert.equal(resumed.detail.handback, undefined, `${fixture.disposition} completes S7`);
+      } finally {
+        h.cleanup();
+      }
+    }
+  });
+
+  it('a Keychain delete error during S6c1 leaves the cleanup-pending marker', () => {
+    const kc = new RollbackDeleteKeychain();
+    const h = setup('xai', kc);
+    try {
+      const marker = {
+        phase: 'cleanup-pending',
+        keychainDisposition: 'delete',
+        piFingerprint: null,
+        decision: null,
+        fencedGeneration: null,
+        rolledBackAt: 123,
+      };
+      const service = qlbKeychainService('xai', expectedId('xai'));
+      const account = expectedLabel('xai');
+      kc.setSync(service, account, JSON.stringify({ ...FAKE_GRANTS.xai, generation: 0 }));
+      h.store.upsertMigration('pi-xai', 'NATIVE', JSON.stringify({
+        accounts: [{
+          id: expectedId('xai'),
+          provider: 'xai',
+          label: expectedLabel('xai'),
+          fingerprint: 'fixture-fingerprint',
+        }],
+        handback: marker,
+      }));
+      kc.mode = 'denied';
+
+      assert.throws(() => h.mig.resume(), /fixture Keychain access denied/);
+      assert.deepEqual(
+        JSON.parse(h.store.getMigration('pi-xai')!.detail_json).handback,
+        marker,
+        'S6c1 errors before S7 clears the marker',
+      );
+      assert.equal(keychainHas(kc, 'xai'), true, 'failed delete retains the Keychain item');
+    } finally {
+      h.cleanup();
+    }
+  });
+
   it('T-S6a backup removal is made durable before the marker is cleared', () => {
     const marker = {
       phase: 'cleanup-pending',
