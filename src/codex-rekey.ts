@@ -43,6 +43,8 @@ export interface PlanCodexRekeyOptions {
 
 export interface ApplyCodexRekeyOptions {
   now: number;
+  /** Test-only seam for proving a caller transaction rolls back when a dependent remains. */
+  testOnlyBeforeMergeCount?: (db: DatabaseSync, move: CodexRekeyMove) => void;
 }
 
 type RekeyAuditEntry = {
@@ -124,7 +126,14 @@ export function planCodexRekey(db: DatabaseSync, options: PlanCodexRekeyOptions)
     if (provablyCodex) candidates.set(id, { id, kind: 'orphan' });
   }
 
-  const orderedCandidates = [...candidates.values()].sort((a, b) => byteOrder(a.id, b.id));
+  const orderedCandidates = [...candidates.values()]
+    .filter((candidate) => {
+      const targets = candidate.id === 'codex-default'
+        ? [...slots.keys()]
+        : slotBares.get(candidate.id) ?? [];
+      return targets.length !== 1 || targets[0] !== candidate.id;
+    })
+    .sort((a, b) => byteOrder(a.id, b.id));
   const result = (): CodexRekeyPlan => ({
     moves: [],
     skipped: [...skipped.entries()]
@@ -179,6 +188,7 @@ export function planCodexRekey(db: DatabaseSync, options: PlanCodexRekeyOptions)
       skipped.set(candidate.id, 'ambiguous');
       continue;
     }
+    if (candidate.id === targets[0]) continue;
     candidatesWithTargets.push({ ...candidate, to: targets[0]! });
   }
 
@@ -250,41 +260,126 @@ function readRekeyAudit(db: DatabaseSync): Record<string, RekeyAuditEntry> {
   }
 }
 
-/**
- * Applies a previously classified plan inside its caller-owned transaction.
- * Clashes deliberately surface as SQLite constraint errors; S6 owns merging.
- */
+function moveSnapshots(db: DatabaseSync, from: string, to: string): void {
+  const sourceRows = db.prepare('SELECT rowid, bucket, fetched_at FROM snapshots WHERE account_id = ?').all(from) as Array<{
+    rowid: number;
+    bucket: string | null;
+    fetched_at: number | null;
+  }>;
+  const findTarget = db.prepare('SELECT rowid, fetched_at FROM snapshots WHERE account_id = ? AND bucket = ?');
+  const moveSource = db.prepare('UPDATE snapshots SET account_id = ? WHERE rowid = ?');
+  const deleteSnapshot = db.prepare('DELETE FROM snapshots WHERE rowid = ?');
+
+  for (const source of sourceRows) {
+    if (source.bucket === null) {
+      moveSource.run(to, source.rowid);
+      continue;
+    }
+    const target = findTarget.get(to, source.bucket) as { rowid: number; fetched_at: number | null } | undefined;
+    if (!target) {
+      moveSource.run(to, source.rowid);
+      continue;
+    }
+    const sourceWins = source.fetched_at !== null
+      && (target.fetched_at === null || source.fetched_at > target.fetched_at);
+    if (sourceWins) {
+      deleteSnapshot.run(target.rowid);
+      moveSource.run(to, source.rowid);
+    } else {
+      deleteSnapshot.run(source.rowid);
+    }
+  }
+}
+
+function moveOverrides(db: DatabaseSync, from: string, to: string): void {
+  db.prepare('UPDATE overrides SET account_id = ? WHERE account_id = ?').run(to, from);
+  db.prepare(`DELETE FROM overrides AS duplicate
+    WHERE duplicate.account_id = ? AND EXISTS (
+      SELECT 1 FROM overrides AS kept
+      WHERE kept.account_id = duplicate.account_id
+        AND kept.kind IS duplicate.kind
+        AND kept.session IS duplicate.session
+        AND kept.until IS duplicate.until
+        AND kept.rowid < duplicate.rowid
+    )`).run(to);
+}
+
+function movePollClaim(db: DatabaseSync, from: string, to: string, now: number): void {
+  const source = db.prepare('SELECT 1 FROM poll_claims WHERE account_id = ?').get(from);
+  if (!source) return;
+  const target = db.prepare('SELECT 1 FROM poll_claims WHERE account_id = ?').get(to);
+  if (target) {
+    db.prepare('DELETE FROM poll_claims WHERE account_id = ? AND until IS NOT NULL AND until <= ?').run(from, now);
+  } else {
+    db.prepare('UPDATE poll_claims SET account_id = ? WHERE account_id = ?').run(to, from);
+  }
+}
+
+function moveUsagePoll(db: DatabaseSync, from: string, to: string): void {
+  const source = db.prepare(`SELECT 1 FROM usage_polls
+    WHERE provider = 'openai-codex' AND account_id = ?`).get(from);
+  if (!source) return;
+  const target = db.prepare(`SELECT 1 FROM usage_polls
+    WHERE provider = 'openai-codex' AND account_id = ?`).get(to);
+  if (target) throw new Error('rekey-usage-polls-clash');
+  db.prepare(`UPDATE usage_polls SET account_id = ?
+    WHERE provider = 'openai-codex' AND account_id = ?`).run(to, from);
+}
+
+function moveLease(db: DatabaseSync, from: string, to: string, now: number): void {
+  const sourceName = refreshLeaseName(from);
+  const targetName = refreshLeaseName(to);
+  const source = db.prepare('SELECT 1 FROM leases WHERE name = ?').get(sourceName);
+  if (!source) return;
+  const target = db.prepare('SELECT 1 FROM leases WHERE name = ?').get(targetName);
+  if (target) {
+    db.prepare('DELETE FROM leases WHERE name = ? AND until IS NOT NULL AND until <= ?').run(sourceName, now);
+  } else {
+    db.prepare('UPDATE leases SET name = ? WHERE name = ?').run(targetName, sourceName);
+  }
+}
+
+function remainingDependents(db: DatabaseSync, id: string): number {
+  const row = db.prepare(`SELECT
+    (SELECT count(*) FROM snapshots WHERE account_id = ?) +
+    (SELECT count(*) FROM overrides WHERE account_id = ?) +
+    (SELECT count(*) FROM poll_claims WHERE account_id = ?) +
+    (SELECT count(*) FROM usage_polls WHERE provider = 'openai-codex' AND account_id = ?) +
+    (SELECT count(*) FROM leases WHERE name = ?) AS count`)
+    .get(id, id, id, id, refreshLeaseName(id)) as { count: number };
+  return row.count;
+}
+
+/** Applies a previously classified plan inside its caller-owned transaction. */
 export function applyCodexRekey(
   db: DatabaseSync,
   plan: CodexRekeyPlan,
   options: ApplyCodexRekeyOptions,
 ): void {
   if (!db.isTransaction) throw new Error('rekey-needs-transaction');
-  if (plan.moves.some((move) => move.kind === 'merge')) {
-    throw new Error('rekey-merge-not-supported');
-  }
+  if (plan.moves.some((move) => move.from === move.to)) throw new Error('rekey-self-move');
   if (plan.moves.length === 0) return;
 
   const audit = readRekeyAudit(db);
-  const updateSnapshots = db.prepare('UPDATE snapshots SET account_id = ? WHERE account_id = ?');
-  const updateOverrides = db.prepare('UPDATE overrides SET account_id = ? WHERE account_id = ?');
-  const updatePollClaims = db.prepare('UPDATE poll_claims SET account_id = ? WHERE account_id = ?');
-  const updateUsagePolls = db.prepare(`UPDATE usage_polls SET account_id = ?
-    WHERE provider = 'openai-codex' AND account_id = ?`);
-  const updateLeases = db.prepare('UPDATE leases SET name = ? WHERE name = ?');
   const renameAccount = db.prepare('UPDATE accounts SET id = ? WHERE id = ?');
+  const deleteAccount = db.prepare('DELETE FROM accounts WHERE id = ?');
   const updateFailover = db.prepare(`UPDATE config SET value = ?
     WHERE key = ? AND value = ?`);
   const failoverKey = failoverConfigKey('openai-codex');
   const observationKey = observationConfigKey('openai-codex');
 
   for (const move of plan.moves) {
-    updateSnapshots.run(move.to, move.from);
-    updateOverrides.run(move.to, move.from);
-    updatePollClaims.run(move.to, move.from);
-    updateUsagePolls.run(move.to, move.from);
-    updateLeases.run(refreshLeaseName(move.to), refreshLeaseName(move.from));
+    moveSnapshots(db, move.from, move.to);
+    moveOverrides(db, move.from, move.to);
+    movePollClaim(db, move.from, move.to, options.now);
+    moveUsagePoll(db, move.from, move.to);
+    moveLease(db, move.from, move.to, options.now);
     if (move.kind === 'rename') renameAccount.run(move.to, move.from);
+    if (move.kind === 'merge') {
+      options.testOnlyBeforeMergeCount?.(db, move);
+      if (remainingDependents(db, move.from) !== 0) throw new Error('rekey-dependents-remain');
+      deleteAccount.run(move.from);
+    }
     if (move.kind === 'orphan') ensureCodexSlotAccount(db, move.to, options.now);
     updateFailover.run(move.to, failoverKey, move.from);
     audit[move.from] = {
