@@ -2269,12 +2269,27 @@ export class Store {
     restoreKeychain: () => boolean;
     /** Caller-owned capability, checked immediately before each SQLite write. */
     assertNotCompromised?: () => void;
+    /** Called after the compare-and-set pre-check and before the first write. */
+    beforeWrite?: (db: DatabaseSync, dbPath: string) => undefined;
+    /** Called after the final write and immediately before COMMIT. */
+    beforeCommit?: (db: DatabaseSync, kind: 'existing-adopt') => undefined;
   }): void {
     const ts = input.ts ?? Date.now();
     this.runImmediate(() => {
       let keychainWriteStarted = false;
       try {
         input.assertNotCompromised?.();
+        const current = this.db.prepare('SELECT 1 FROM codex_slots WHERE account_id = ? AND fingerprint = ?')
+          .get(input.accountId, input.previousFingerprint);
+        if (!current) throw new Error('Codex slot changed before adoption');
+        if (input.beforeWrite) {
+          const result: unknown = input.beforeWrite(this.db, this.dbPath);
+          if (result && typeof (result as { then?: unknown }).then === 'function') {
+            (result as PromiseLike<unknown>).then(undefined, () => undefined);
+            throw new Error('Codex save hooks must be synchronous');
+          }
+          input.assertNotCompromised?.();
+        }
         const updated = this.db.prepare(`UPDATE codex_slots SET fingerprint = ?, prev_fingerprint = ?, last_refresh = ?,
           dead = 0, dead_reason = NULL, dead_at = NULL, healed_at = CASE WHEN dead != 0 THEN ? ELSE healed_at END,
           pending_adopt = 0, archived_at = NULL, last_active_at = ?
@@ -2299,6 +2314,14 @@ export class Store {
           this.db.prepare(`INSERT INTO relogin_events (ts, provider, account_id, kind, detail, evidence, user_denied_at)
             VALUES (?, 'openai-codex', ?, 'external-login', ?, ?, NULL)`)
             .run(ts, input.accountId, input.reloginEvidence, input.reloginEvidence);
+        }
+        if (input.beforeCommit) {
+          const result: unknown = input.beforeCommit(this.db, 'existing-adopt');
+          if (result && typeof (result as { then?: unknown }).then === 'function') {
+            (result as PromiseLike<unknown>).then(undefined, () => undefined);
+            throw new Error('Codex save hooks must be synchronous');
+          }
+          input.assertNotCompromised?.();
         }
       } catch (error) {
         let compensationFailed = false;
@@ -2325,9 +2348,23 @@ export class Store {
     fingerprint: string,
     ts: number = Date.now(),
     assertNotCompromised?: () => void,
+    hooks?: {
+      beforeWrite?: (db: DatabaseSync, dbPath: string) => undefined;
+      beforeCommit?: (db: DatabaseSync, kind: 'existing-mark') => undefined;
+    },
   ): boolean {
     return this.runImmediate(() => {
       assertNotCompromised?.();
+      const current = this.db.prepare('SELECT 1 FROM codex_slots WHERE account_id = ? AND fingerprint = ?').get(accountId, fingerprint);
+      if (!current) return false;
+      if (hooks?.beforeWrite) {
+        const result: unknown = hooks.beforeWrite(this.db, this.dbPath);
+        if (result && typeof (result as { then?: unknown }).then === 'function') {
+          (result as PromiseLike<unknown>).then(undefined, () => undefined);
+          throw new Error('Codex save hooks must be synchronous');
+        }
+        assertNotCompromised?.();
+      }
       const updated = this.db.prepare(`UPDATE codex_slots SET pending_adopt = 0, archived_at = NULL, last_active_at = ?
         WHERE account_id = ? AND fingerprint = ?`).run(ts, accountId, fingerprint);
       if (updated.changes !== 1) return false;
@@ -2335,6 +2372,14 @@ export class Store {
       this.db.prepare(`INSERT INTO active_login (provider, account_id, since, set_by) VALUES ('openai-codex', ?, ?, 'import')
         ON CONFLICT(provider) DO UPDATE SET account_id = excluded.account_id, since = excluded.since, set_by = excluded.set_by`)
         .run(accountId, ts);
+      if (hooks?.beforeCommit) {
+        const result: unknown = hooks.beforeCommit(this.db, 'existing-mark');
+        if (result && typeof (result as { then?: unknown }).then === 'function') {
+          (result as PromiseLike<unknown>).then(undefined, () => undefined);
+          throw new Error('Codex save hooks must be synchronous');
+        }
+        assertNotCompromised?.();
+      }
       return true;
     });
   }

@@ -1,6 +1,7 @@
 // S56 Codex native-document attribution. Codex has no inter-process lock, so
 // observations extend the lineage graph rather than rejecting ordinary rotations.
 
+import { DatabaseSync } from 'node:sqlite';
 import { CodexAuthLockCompromised } from './cc-locks';
 import { authTime, codexFingerprint, codexIdentity, parseCodexAuth, type CodexAuthDocument } from './codex-auth';
 import { isCredentialNotFound } from './credential-backends';
@@ -39,6 +40,10 @@ export interface AttributeLiveDocumentInput {
   assertNotCompromised?: () => void;
   /** Caller-owned atomic auth.json publication; injected for fixture-only tests. */
   republish?: (document: CodexAuthDocument) => Promise<void> | void;
+  /** Runs inside attribution's final save before its first write. */
+  beforeSave?: (db: DatabaseSync, dbPath: string, slotId: string) => undefined;
+  /** Runs inside attribution's final save immediately before COMMIT. */
+  beforeSaveCommit?: (db: DatabaseSync, kind: 'existing-mark' | 'existing-adopt') => undefined;
 }
 
 export interface CodexAttributionResult {
@@ -92,7 +97,10 @@ function assertNotCompromised(input: AttributeLiveDocumentInput): void {
 
 function markImportedActive(input: AttributeLiveDocumentInput, fingerprint: string, ts: number): void {
   assertNotCompromised(input);
-  if (!input.store.markCodexSlotImportedActive(input.slot.accountId, fingerprint, ts, input.assertNotCompromised)) {
+  if (!input.store.markCodexSlotImportedActive(input.slot.accountId, fingerprint, ts, input.assertNotCompromised, {
+    beforeWrite: input.beforeSave && ((db, dbPath) => input.beforeSave?.(db, dbPath, input.slot.accountId)),
+    beforeCommit: input.beforeSaveCommit,
+  })) {
     // The fingerprint was observed under the caller's lease. A mismatch means
     // a successor already selected a different active slot; retry fresh.
     throw new CodexAuthLockCompromised();
@@ -206,6 +214,8 @@ async function attributeSameSlot(
   input.store.adoptCodexSlotWithKeychain({
     accountId: input.slot.accountId,
     assertNotCompromised: input.assertNotCompromised,
+    beforeWrite: input.beforeSave && ((db, dbPath) => input.beforeSave?.(db, dbPath, input.slot.accountId)),
+    beforeCommit: input.beforeSaveCommit,
     previousFingerprint: slotFp,
     fingerprint: liveFp,
     lastRefresh: live.last_refresh ?? null,
