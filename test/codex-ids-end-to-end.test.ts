@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import * as http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
-import { join, relative } from 'node:path';
+import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { describe, it } from 'node:test';
 
@@ -16,7 +16,7 @@ import { beginCutover } from '../src/lifecycle';
 import { decodeJournalEvidence } from '../src/migration-health';
 import { setPolicy } from '../src/policy';
 import { LoopbackProxy } from '../src/proxy';
-import { openStore, type Store } from '../src/store';
+import { openStore, setStoreForTests, type Store } from '../src/store';
 
 const MODEL = 'gpt-5.4--qlb-high';
 const BARE_ID = 'fixture-bare-account';
@@ -85,13 +85,27 @@ function readRows(f: Fixture, sql: string, ...params: string[]): Array<Record<st
   }
 }
 
+function backupCount(f: Fixture): number {
+  return readdirSync(join(f.root, 'backups')).filter((name) => name.endsWith('.sqlite')).length;
+}
+
 function canonicalDependents(f: Fixture): string {
   return JSON.stringify({
+    accounts: readRows(f, 'SELECT * FROM accounts ORDER BY id'),
     snapshots: readRows(f, `SELECT account_id, bucket, used_pct, used, limit_val, remaining, reset_at, fetched_at, source, confidence
       FROM snapshots ORDER BY account_id, bucket`),
     overrides: readRows(f, 'SELECT kind, account_id, session, until FROM overrides ORDER BY kind, account_id, session, until'),
+    pollClaims: readRows(f, 'SELECT * FROM poll_claims ORDER BY account_id'),
+    usagePolls: readRows(f, 'SELECT * FROM usage_polls ORDER BY provider, account_id'),
     leases: readRows(f, 'SELECT name, holder_pid, holder_id, until, generation FROM leases ORDER BY name'),
-    failover: readRows(f, "SELECT key, value FROM config WHERE key = 'failover:openai-codex' ORDER BY key"),
+    codexSlots: readRows(f, `SELECT account_id, chatgpt_user_id, chatgpt_account_id, email, alias, fingerprint, prev_fingerprint,
+      threshold, last_refresh, dead, dead_reason, dead_at, healed_at, pending_adopt, added_at, source, archived_at
+      FROM codex_slots ORDER BY account_id`),
+    activeLogin: readRows(f, 'SELECT provider, account_id, set_by FROM active_login ORDER BY provider'),
+    config: readRows(f, `SELECT key, value FROM config
+      WHERE key IN ('failover:openai-codex', 'observed:openai-codex', 'codex.rekey.backupPath', 'codex.rekey.baseline')
+      ORDER BY key`),
+    backups: backupCount(f),
   });
 }
 
@@ -159,13 +173,24 @@ describe('Codex S29 ids end to end', () => {
       const backups = readdirSync(join(f.root, 'backups')).filter((name) => name.endsWith('.sqlite'));
       assert.equal(backups.length, 1);
       const backupPath = join(f.root, 'backups', backups[0]!);
-      assert.equal(existsSync(backupPath), true);
-      assert.ok(!relative(f.root, backupPath).startsWith('..'));
+      assert.deepEqual(readRows(f, "SELECT value FROM config WHERE key = 'codex.rekey.backupPath'"), [
+        { value: backupPath },
+      ]);
+      const baseline = readRows(f, "SELECT value FROM config WHERE key = 'codex.rekey.baseline'");
+      assert.equal(baseline.length, 1);
+      const baselineValue = baseline[0]?.value;
+      if (typeof baselineValue !== 'string') throw new Error('missing string codex.rekey.baseline');
+      assert.equal((JSON.parse(baselineValue) as { backupPath?: unknown }).backupPath, backupPath);
 
-      const beforeAdapter = readRows(f, 'SELECT id, provider, label FROM accounts ORDER BY id');
+      const beforeAdapter = readRows(f, 'SELECT * FROM accounts ORDER BY id');
       const adapter = createCodexAdapter({ readAuth: async () => JSON.stringify(doc) });
-      assert.equal((await adapter.fetchSnapshots())[0]?.accountId, SLOT_ID);
-      assert.deepEqual(readRows(f, 'SELECT id, provider, label FROM accounts ORDER BY id'), beforeAdapter);
+      setStoreForTests(f.store);
+      try {
+        assert.equal((await adapter.fetchSnapshots())[0]?.accountId, SLOT_ID);
+        assert.deepEqual(readRows(f, 'SELECT * FROM accounts ORDER BY id'), beforeAdapter);
+      } finally {
+        setStoreForTests(null);
+      }
 
       setPolicy(f.store, { harness: 'codex', virtualModel: MODEL, realModel: 'gpt-5.4', effort: 'high' });
       let receivedHeader: string | string[] | undefined;
@@ -174,16 +199,24 @@ describe('Codex S29 ids end to end', () => {
         response.writeHead(200, { 'content-type': 'application/json' });
         response.end('{}');
       });
+      let selectedAccountId: string | undefined;
       const proxy = new LoopbackProxy({
         store: f.store,
         infoPath: join(f.root, 'proxy.json'),
-        getCredentialForAccount: async () => 'fixture-proxy-credential',
+        getCredentialForAccount: async (accountId) => {
+          selectedAccountId = accountId;
+          return 'fixture-proxy-credential';
+        },
         upstreams: { anthropicBase: upstream.url, codexBase: upstream.url },
       });
       try {
         await proxy.start();
         assert.equal(await post(proxy), 200);
+        assert.equal(selectedAccountId, SLOT_ID);
         assert.equal(receivedHeader, BARE_ID);
+        assert.deepEqual(readRows(f, "SELECT account_id FROM decisions WHERE mode = 'proxy' ORDER BY id"), [
+          { account_id: SLOT_ID },
+        ]);
       } finally {
         await proxy.stop();
         await new Promise<void>((resolve) => upstream.server.close(() => resolve()));
