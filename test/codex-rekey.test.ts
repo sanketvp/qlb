@@ -6,7 +6,14 @@ import { DatabaseSync } from 'node:sqlite';
 import { describe, it } from 'node:test';
 
 import { observationConfigKey } from '../src/candidates';
-import { applyCodexRekey, ensureCodexSlotAccount, planCodexRekey, rekeyCodexAccounts } from '../src/codex-rekey';
+import {
+  applyCodexRekey,
+  CodexAdmissionRefused,
+  codexAdmission,
+  ensureCodexSlotAccount,
+  planCodexRekey,
+  rekeyCodexAccounts,
+} from '../src/codex-rekey';
 import { platformKeychain, type KeychainBackend } from '../src/keychain';
 import { failoverConfigKey } from '../src/overrides';
 import { openStore, refreshLeaseName } from '../src/store';
@@ -413,6 +420,110 @@ describe('Codex rekey planner', () => {
       account(f.db, 'bare', 'openai-codex');
       const before = (f.db.prepare('SELECT total_changes() AS changes').get() as { changes: number }).changes;
       plan(f.db);
+      const after = (f.db.prepare('SELECT total_changes() AS changes').get() as { changes: number }).changes;
+      assert.equal(after, before);
+    } finally { f.close(); }
+  });
+});
+
+describe('Codex admission', () => {
+  it('a trusted QLB_OWNED pi-openai-codex row naming the bare id refuses legacy-codex-takeover-active', () => {
+    const f = fixture();
+    try {
+      journal(f.db, 'pi-openai-codex', 'QLB_OWNED', JSON.stringify({ qlbAccountIds: ['bare'] }));
+      const refusal = codexAdmission(f.db, { slotId: 'user:bare', bareAccountId: 'bare' });
+      assert.deepEqual(refusal, {
+        code: 'legacy-codex-takeover-active',
+        message: 'hand the older takeover back first',
+      });
+      assert.ok(refusal);
+      const error = new CodexAdmissionRefused(refusal.code, refusal.message);
+      assert.equal(error.code, refusal.code);
+      assert.equal(error.exitCode, 3);
+      assert.equal(error.message, refusal.message);
+    } finally { f.close(); }
+  });
+
+  it('a trusted VALIDATED or MIRRORED row also refuses', () => {
+    for (const state of ['VALIDATED', 'MIRRORED']) {
+      const f = fixture();
+      try {
+        journal(f.db, 'pi-openai-codex', state, JSON.stringify({ qlbAccountIds: ['bare'] }));
+        assert.equal(codexAdmission(f.db, { slotId: 'user:bare', bareAccountId: 'bare' })?.code, 'legacy-codex-takeover-active');
+      } finally { f.close(); }
+    }
+  });
+
+  it('a row naming codex-default refuses for any login', () => {
+    const f = fixture();
+    try {
+      journal(f.db, 'pi-openai-codex', 'QLB_OWNED', JSON.stringify({ qlbAccountIds: ['codex-default'] }));
+      assert.equal(codexAdmission(f.db, { slotId: 'user:other', bareAccountId: 'other' })?.code, 'legacy-codex-takeover-active');
+    } finally { f.close(); }
+  });
+
+  it('a NATIVE (handed-back) row allows', () => {
+    const f = fixture();
+    try {
+      journal(f.db, 'pi-openai-codex', 'NATIVE', JSON.stringify({ qlbAccountIds: ['bare'] }));
+      assert.equal(codexAdmission(f.db, { slotId: 'user:bare', bareAccountId: 'bare' }), null);
+    } finally { f.close(); }
+  });
+
+  it('a takeover naming a different bare id allows', () => {
+    const f = fixture();
+    try {
+      journal(f.db, 'pi-openai-codex', 'QLB_OWNED', JSON.stringify({ qlbAccountIds: ['different'] }));
+      assert.equal(codexAdmission(f.db, { slotId: 'user:bare', bareAccountId: 'bare' }), null);
+    } finally { f.close(); }
+  });
+
+  it('a takeover naming an S29 id allows', () => {
+    const f = fixture();
+    try {
+      journal(f.db, 'pi-openai-codex', 'QLB_OWNED', JSON.stringify({ qlbAccountIds: ['user:bare'] }));
+      assert.equal(codexAdmission(f.db, { slotId: 'user:bare', bareAccountId: 'bare' }), null);
+    } finally { f.close(); }
+  });
+
+  it('an untrusted pi-openai-codex row refuses legacy-codex-takeover-unreadable', () => {
+    const f = fixture();
+    try {
+      journal(f.db, 'pi-openai-codex', 'QLB_OWNED', 'not-json');
+      assert.deepEqual(codexAdmission(f.db, { slotId: 'user:bare', bareAccountId: 'bare' }), {
+        code: 'legacy-codex-takeover-unreadable',
+        message: 'hand the older takeover back first (its record is unreadable)',
+      });
+    } finally { f.close(); }
+  });
+
+  it('an untrusted row of another store does not refuse', () => {
+    const f = fixture();
+    try {
+      journal(f.db, 'pi-pool', 'QLB_OWNED', 'not-json');
+      assert.equal(codexAdmission(f.db, { slotId: 'user:bare', bareAccountId: 'bare' }), null);
+    } finally { f.close(); }
+  });
+
+  it('a slot-id row with provider xai or NULL refuses slot-account-provider-mismatch', () => {
+    for (const provider of ['xai', null]) {
+      const f = fixture();
+      try {
+        account(f.db, 'user:bare', provider);
+        assert.deepEqual(codexAdmission(f.db, { slotId: 'user:bare', bareAccountId: 'bare' }), {
+          code: 'slot-account-provider-mismatch',
+          message: 'Codex slot id is already used by a non-Codex account',
+        });
+      } finally { f.close(); }
+    }
+  });
+
+  it('admission writes nothing', () => {
+    const f = fixture();
+    try {
+      journal(f.db, 'pi-openai-codex', 'QLB_OWNED', JSON.stringify({ qlbAccountIds: ['bare'] }));
+      const before = (f.db.prepare('SELECT total_changes() AS changes').get() as { changes: number }).changes;
+      codexAdmission(f.db, { slotId: 'user:bare', bareAccountId: 'bare' });
       const after = (f.db.prepare('SELECT total_changes() AS changes').get() as { changes: number }).changes;
       assert.equal(after, before);
     } finally { f.close(); }

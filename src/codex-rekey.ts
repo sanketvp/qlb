@@ -3,6 +3,7 @@ import type { DatabaseSync } from 'node:sqlite';
 
 import { inspectAccountSafety } from './accounts-prune';
 import { observationConfigKey } from './candidates';
+import { decodeJournalEvidence } from './migration-health';
 import { failoverConfigKey } from './overrides';
 import { backupBeforeMigrateSync, refreshLeaseName } from './store';
 
@@ -19,6 +20,66 @@ export type CodexRekeyReason =
 export interface CodexRekeyProspectiveSlot {
   accountId: string;
   chatgptAccountId: string;
+}
+
+export type CodexAdmissionCode =
+  | 'slot-account-provider-mismatch'
+  | 'legacy-codex-takeover-unreadable'
+  | 'legacy-codex-takeover-active';
+
+export interface CodexAdmissionRefusal {
+  code: CodexAdmissionCode;
+  message: string;
+}
+
+export class CodexAdmissionRefused extends Error {
+  readonly exitCode = 3 as const;
+
+  constructor(readonly code: CodexAdmissionCode, message: string) {
+    super(message);
+    this.name = 'CodexAdmissionRefused';
+  }
+}
+
+/** Read-only guard against foreign slot ownership and legacy Codex takeovers. */
+export function codexAdmission(
+  db: DatabaseSync,
+  { slotId, bareAccountId }: { slotId: string; bareAccountId: string },
+): CodexAdmissionRefusal | null {
+  const slot = db.prepare('SELECT provider FROM accounts WHERE id = ?').get(slotId) as {
+    provider: string | null;
+  } | undefined;
+  if (slot && slot.provider !== 'openai-codex') {
+    return {
+      code: 'slot-account-provider-mismatch',
+      message: 'Codex slot id is already used by a non-Codex account',
+    };
+  }
+
+  const migrations = db.prepare(`SELECT store, state, detail_json FROM migrations
+    WHERE store = 'pi-openai-codex'`).all() as Array<{
+    store: string;
+    state: string;
+    detail_json: string | null;
+  }>;
+  const evidence = migrations.map((migration) => decodeJournalEvidence(migration));
+  if (evidence.some((entry) => !entry.trusted)) {
+    return {
+      code: 'legacy-codex-takeover-unreadable',
+      message: 'hand the older takeover back first (its record is unreadable)',
+    };
+  }
+  for (const entry of evidence) {
+    if (!entry.trusted || entry.state === 'NATIVE') continue;
+    if ([...entry.participants].some((participant) =>
+      !participant.includes(':') && (participant === bareAccountId || participant === 'codex-default'))) {
+      return {
+        code: 'legacy-codex-takeover-active',
+        message: 'hand the older takeover back first',
+      };
+    }
+  }
+  return null;
 }
 
 export interface CodexRekeyMove {
