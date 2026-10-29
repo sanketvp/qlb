@@ -1,8 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
-import { dirname, join } from 'node:path';
-
 import {
   consumeCodexSlot,
+  withCodexConsumeThenSwitchLocks,
   hasCodexSlotIdentity,
   type CodexConsumeResult,
   type CodexRefreshResponse,
@@ -10,7 +9,7 @@ import {
 import { codexIdentity } from '../codex-auth';
 import { codexIdentityParts, list, readCodexSwitchHistory, renewers } from '../codex-sessions';
 import { CodexSlots } from '../codex-slots';
-import { ClaudeCodeLockTimeout, withProperLockfile } from '../cc-locks';
+import { ClaudeCodeLockTimeout } from '../cc-locks';
 import { platformKeychain } from '../keychain';
 import { openStore, type Store } from '../store';
 import type { CommandContext, CommandDefinition } from '../registry';
@@ -125,31 +124,27 @@ async function execute(args: string[], ctx: CommandContext): Promise<number> {
       consume: async ({ accountId, force, allowHeld, c9 }) => {
         // C6 and C10 share this provider lock for every read/CAS/write. The
         // consume lock additionally ensures only one process can spend a slot.
-        const locks = join(dirname(store.dbPath), 'locks');
-        const consumeLock = join(locks, `consume-openai-codex-${encodeURIComponent(accountId)}.lock`);
-        const switchLock = join(locks, 'switch-openai-codex.lock');
         try {
-          return await withProperLockfile(consumeLock, { timeoutMs: 10_000 }, async () =>
-            withProperLockfile(switchLock, { timeoutMs: 10_000 }, async () => {
-              // Re-check every mutable receipt and active state after lock acquisition.
-              if (activeCodexSlot(store) === accountId) return { status: 'active-slot' as const };
-              if (c9 && !c9Allowed(store.getConfig.bind(store))) return { status: 'c9-unavailable' as const };
-              let snapshot;
-              try { snapshot = slots.readSlot(accountId, { fresh: true }).document; } catch { return { status: 'slot-removed' as const }; }
-              if (!hasCodexSlotIdentity(snapshot, accountId)) return { status: 'slot-removed' as const };
-              return consumeCodexSlot({
-                accountId, snapshot, trigger: 'force', force, allowHeld, slots, store, transport: sendRefresh,
-                holders: async (document) => {
-                  const identity = codexIdentity(document);
-                  if (!identity) throw new Error('Codex slot identity is invalid');
-                  const prior = readCodexSwitchHistory(store.dbPath);
-                  return renewers(
-                    codexIdentityParts(identity),
-                    await list(), prior.rows, prior.observations,
-                  );
-                },
-              });
-            }));
+          return await withCodexConsumeThenSwitchLocks(store.dbPath, accountId, async () => {
+            // Re-check every mutable receipt and active state after lock acquisition.
+            if (activeCodexSlot(store) === accountId) return { status: 'active-slot' as const };
+            if (c9 && !c9Allowed(store.getConfig.bind(store))) return { status: 'c9-unavailable' as const };
+            let snapshot;
+            try { snapshot = slots.readSlot(accountId, { fresh: true }).document; } catch { return { status: 'slot-removed' as const }; }
+            if (!hasCodexSlotIdentity(snapshot, accountId)) return { status: 'slot-removed' as const };
+            return consumeCodexSlot({
+              accountId, snapshot, trigger: 'force', force, allowHeld, slots, store, transport: sendRefresh,
+              holders: async (document) => {
+                const identity = codexIdentity(document);
+                if (!identity) throw new Error('Codex slot identity is invalid');
+                const prior = readCodexSwitchHistory(store.dbPath);
+                return renewers(
+                  codexIdentityParts(identity),
+                  await list(), prior.rows, prior.observations,
+                );
+              },
+            });
+          });
         } catch (error) {
           // `busy` means no consume work ran. Do not hide a post-POST
           // persistence failure behind lock contention.
