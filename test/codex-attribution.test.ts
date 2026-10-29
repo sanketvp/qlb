@@ -646,6 +646,7 @@ describe('Codex live-document attribution (AC57)', () => {
       let writes = 0;
       await assert.rejects(
         runCodexImportActiveCommand([], ctx, {
+          keychain,
           withAuthLock: withCodexAuthLock,
           readAuth: async () => {
             // Model a stale-lock successor replacing the directory after the
@@ -691,6 +692,7 @@ describe('Codex live-document attribution (AC57)', () => {
 
       await assert.rejects(
         runCodexImportActiveCommand([], ctx, {
+          keychain,
           readAuth: async () => ({ status: 'ok', doc: a }),
           writeAuth: async () => 1,
           withAuthLock: async (_options, fn) => fn({
@@ -751,6 +753,7 @@ describe('Codex live-document attribution (AC57)', () => {
       let republished = false;
       const writes: string[] = [];
       const deps: CodexImportActiveCommandDeps = {
+        keychain,
         withAuthLock,
         readAuth: async () => {
           reads += 1;
