@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -12,7 +12,7 @@ import { importActiveCodexSlot } from '../src/codex-slots';
 import { CodexAdmissionRefused } from '../src/codex-rekey';
 import { checkRestorePrecondition } from '../src/codex-restore-baseline';
 import { MockKeychain } from '../src/keychain';
-import { createSingleGrantMigration, defaultRehearseFn, stagingOwnerPath } from '../src/migration';
+import { createSingleGrantMigration, defaultRehearseFn } from '../src/migration';
 import { backupBeforeMigrateSync, openStore } from '../src/store';
 
 function jwt(payload: Record<string, unknown>): string {
@@ -65,13 +65,17 @@ function count(db: DatabaseSync, table: string): number {
 
 class TrackingMockKeychain extends MockKeychain {
   private readonly coordinates = new Set<string>();
+  /** Every set or delete, kept even when a later delete removes the item. */
+  mutations = 0;
 
   override setSync(service: string, account: string, value: string): void {
+    this.mutations += 1;
     super.setSync(service, account, value);
     this.coordinates.add(`${service}\0${account}`);
   }
 
   override deleteSync(service: string, account: string): void {
+    this.mutations += 1;
     super.deleteSync(service, account);
     this.coordinates.delete(`${service}\0${account}`);
   }
@@ -172,8 +176,8 @@ describe('Codex S29 activation', () => {
       assert.equal(count(db, 'migrations'), 0);
       assert.equal(count(db, 'accounts'), 0);
       assert.deepEqual(h.keychain.recordedItems(), []);
-      assert.equal(existsSync(stagingOwnerPath(h.ownerPath, 'openai-codex')), false);
-      assert.equal(existsSync(h.ownerPath), false);
+      assert.equal(h.keychain.mutations, 0);
+      assert.deepEqual(readdirSync(h.agentDir), ['auth.json']);
     } finally {
       h.cleanup();
     }
