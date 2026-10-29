@@ -123,7 +123,7 @@ import { fsyncDirSync } from './fsutil';
 import { qlbHomeDir } from './home';
 import type { KeychainBackend } from './keychain';
 import { openRouterMissingKeyMessage, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, readNativeOpenRouterKey } from './keychain';
-import { removePiAuthBackup } from './pi-auth-backup';
+import { legacyPiAuthBackupPath, piAuthBackupPath, removePiAuthBackup } from './pi-auth-backup';
 import { parseGrant } from './refresh-lease';
 import { hasLegacyPiOwnerEntry, PiOwnerLegacyError, readPiOwnerProviders, withPiAuthLock, writePiOwnerEntry } from './pi-migrate';
 import { OPENROUTER_GATE_KEYCHAIN_SERVICE } from './token/openrouter';
@@ -1696,15 +1696,31 @@ export class Migration {
 
   /** S6a + S6b + S7. C3 removes backups and staging before recording cleanup completion. */
   private finishCleanupPendingHandback(handback: Record<string, unknown>): MigrationStatus {
+    const syncedDirectories = new Set<string>();
+    const fsyncDirectoryOnce = (path: string): void => {
+      const canonicalPath = resolve(path);
+      if (syncedDirectories.has(canonicalPath)) return;
+      this.fsyncDirectory(path);
+      syncedDirectories.add(canonicalPath);
+    };
     if (this.kind === 'single-grant') {
+      const authKey = this.singleGrantAuthKey();
+      const exactBackup = piAuthBackupPath(this.poolFilePath, authKey);
+      const legacyBackup = legacyPiAuthBackupPath(this.poolFilePath, authKey);
+      const exactBackupPresent = existsSync(exactBackup);
+      const legacyBackupPresent = existsSync(legacyBackup);
       // S6a precedes S6b/S7. Any failure leaves the marker durable so the
       // next resume retries backup removal before clearing the hand-back.
-      removePiAuthBackup(this.poolFilePath, this.singleGrantAuthKey());
+      removePiAuthBackup(this.poolFilePath, authKey);
+      // Only directory entries that existed before S6a need persistence.
+      // S6a must be durable before S7 clears the retry marker.
+      if (exactBackupPresent) fsyncDirectoryOnce(dirname(exactBackup));
+      if (legacyBackupPresent) fsyncDirectoryOnce(dirname(legacyBackup));
     }
     const staging = this.stagingPath();
     unlinkIfExists(staging);
     // S6b must be durable before S7 clears the retry marker.
-    this.fsyncDirectory(dirname(staging));
+    fsyncDirectoryOnce(dirname(staging));
     const detail = parseDetail(this.store.getMigration(this.storeName)?.detail_json);
     this.journal(this.journalState(), {
       handback: undefined,
@@ -1880,7 +1896,7 @@ export function createSingleGrantMigration(
   authJsonPath: string,
   ownerFilePath: string,
   keyName: string = provider,
-  config: MigrationConfig = {},
+  config: Omit<MigrationConfig, 'kind' | 'provider' | 'authJsonKey'> = {},
 ): Migration {
   return new Migration(
     store,

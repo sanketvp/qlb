@@ -26,7 +26,7 @@ import {
 } from '../src/migration';
 import { parseGrant } from '../src/refresh-lease';
 import type { RollbackDecision } from '../src/single-grant-ownership';
-import { piAuthBackupPath, writePiAuthBackup } from '../src/pi-auth-backup';
+import { legacyPiAuthBackupPath, piAuthBackupPath, writePiAuthBackup } from '../src/pi-auth-backup';
 import { openStore } from '../src/store';
 
 /**
@@ -1166,6 +1166,81 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       rmSync(exact, { recursive: true, force: true });
       const settled = h.mig.resume();
       assert.equal(settled.detail.handback, undefined, 'the next resume retries S6a then clears S7');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('T-S6a backup removal is made durable before the marker is cleared', () => {
+    const marker = {
+      phase: 'cleanup-pending',
+      keychainDisposition: 'keep',
+      piFingerprint: null,
+      decision: null,
+      fencedGeneration: null,
+      rolledBackAt: 123,
+    };
+    const calls: string[] = [];
+    const h = setup('xai', new MockKeychain(), {
+      fsyncDirectory: (path) => {
+        calls.push(path);
+        assert.equal(existsSync(piAuthBackupPath(h.authPath, 'xai')), false, 'S6a removes the exact backup before its directory sync');
+        assert.equal(existsSync(legacyPiAuthBackupPath(h.authPath, 'xai')), false, 'S6a removes the legacy backup before its directory sync');
+        const detail = JSON.parse(h.store.getMigration('pi-xai')!.detail_json) as Record<string, unknown>;
+        assert.deepEqual(detail.handback, marker, 'S6a directory sync runs before S7 clears the durable marker');
+      },
+    });
+    try {
+      const exact = piAuthBackupPath(h.authPath, 'xai');
+      const legacy = legacyPiAuthBackupPath(h.authPath, 'xai');
+      writePiAuthBackup(h.authPath, 'xai', 'fixture');
+      writeFileSync(legacy, JSON.stringify({ filePresent: true, entryPresent: true, entry: FAKE_GRANTS.xai }) + '\n');
+      h.store.upsertMigration('pi-xai', 'NATIVE', JSON.stringify({ handback: marker }));
+
+      const settled = h.mig.resume();
+
+      assert.deepEqual(
+        calls,
+        [dirname(exact), dirname(legacy)],
+        'S6a syncs both backup parents and S6b skips the already-synced legacy/staging directory',
+      );
+      assert.equal(settled.detail.handback, undefined, 'S7 clears the marker after durable S6a cleanup');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('T-S6a a failed backup-directory sync leaves the marker for the next resume', () => {
+    const marker = {
+      phase: 'cleanup-pending',
+      keychainDisposition: 'keep',
+      piFingerprint: null,
+      decision: null,
+      fencedGeneration: null,
+      rolledBackAt: 123,
+    };
+    let failSync = true;
+    const h = setup('xai', new MockKeychain(), {
+      fsyncDirectory: (path) => {
+        if (failSync && path === dirname(piAuthBackupPath(h.authPath, 'xai'))) {
+          throw new Error('injected backup directory sync failure');
+        }
+      },
+    });
+    try {
+      writePiAuthBackup(h.authPath, 'xai', 'fixture');
+      h.store.upsertMigration('pi-xai', 'NATIVE', JSON.stringify({ handback: marker }));
+
+      assert.throws(() => h.mig.resume(), /injected backup directory sync failure/);
+      assert.deepEqual(
+        JSON.parse(h.store.getMigration('pi-xai')!.detail_json).handback,
+        marker,
+        'a failed S6a directory sync keeps the marker for retry',
+      );
+
+      failSync = false;
+      const settled = h.mig.resume();
+      assert.equal(settled.detail.handback, undefined, 'a working retry completes S6a before S7');
     } finally {
       h.cleanup();
     }
