@@ -315,15 +315,70 @@ function movePollClaim(db: DatabaseSync, from: string, to: string, now: number):
   }
 }
 
+type UsagePollSchedule = {
+  last_fetch_at: number | null;
+  last_attempt_at: number | null;
+  next_due_at: number | null;
+  poll_interval_s: number | null;
+  last_status: string | null;
+  consecutive_failures: number | null;
+  backoff_until: number | null;
+  last_429_at: number | null;
+  held_until: number | null;
+};
+
+function maximumIgnoringNull(a: number | null, b: number | null): number | null {
+  if (a === null) return b;
+  if (b === null) return a;
+  return Math.max(a, b);
+}
+
+function statusFromNewerPoll(source: UsagePollSchedule, target: UsagePollSchedule): string | null {
+  if (source.last_attempt_at !== null
+    && (target.last_attempt_at === null || source.last_attempt_at > target.last_attempt_at)) {
+    return source.last_status;
+  }
+  if (target.last_attempt_at !== null
+    && (source.last_attempt_at === null || target.last_attempt_at > source.last_attempt_at)) {
+    return target.last_status;
+  }
+  if (source.last_fetch_at !== null
+    && (target.last_fetch_at === null || source.last_fetch_at > target.last_fetch_at)) {
+    return source.last_status;
+  }
+  return target.last_status;
+}
+
 function moveUsagePoll(db: DatabaseSync, from: string, to: string): void {
-  const source = db.prepare(`SELECT 1 FROM usage_polls
-    WHERE provider = 'openai-codex' AND account_id = ?`).get(from);
+  const findPoll = db.prepare(`SELECT last_fetch_at, last_attempt_at, next_due_at, poll_interval_s,
+    last_status, consecutive_failures, backoff_until, last_429_at, held_until
+    FROM usage_polls WHERE provider = 'openai-codex' AND account_id = ?`);
+  const source = findPoll.get(from) as UsagePollSchedule | undefined;
   if (!source) return;
-  const target = db.prepare(`SELECT 1 FROM usage_polls
-    WHERE provider = 'openai-codex' AND account_id = ?`).get(to);
-  if (target) throw new Error('rekey-usage-polls-clash');
-  db.prepare(`UPDATE usage_polls SET account_id = ?
-    WHERE provider = 'openai-codex' AND account_id = ?`).run(to, from);
+  const target = findPoll.get(to) as UsagePollSchedule | undefined;
+  if (!target) {
+    db.prepare(`UPDATE usage_polls SET account_id = ?
+      WHERE provider = 'openai-codex' AND account_id = ?`).run(to, from);
+    return;
+  }
+
+  db.prepare(`UPDATE usage_polls SET
+    next_due_at = ?, held_until = ?, backoff_until = ?, last_429_at = ?, poll_interval_s = ?,
+    consecutive_failures = ?, last_attempt_at = ?, last_fetch_at = ?, last_status = ?
+    WHERE provider = 'openai-codex' AND account_id = ?`).run(
+    maximumIgnoringNull(source.next_due_at, target.next_due_at),
+    maximumIgnoringNull(source.held_until, target.held_until),
+    maximumIgnoringNull(source.backoff_until, target.backoff_until),
+    maximumIgnoringNull(source.last_429_at, target.last_429_at),
+    maximumIgnoringNull(source.poll_interval_s, target.poll_interval_s),
+    maximumIgnoringNull(source.consecutive_failures, target.consecutive_failures),
+    maximumIgnoringNull(source.last_attempt_at, target.last_attempt_at),
+    maximumIgnoringNull(source.last_fetch_at, target.last_fetch_at),
+    statusFromNewerPoll(source, target),
+    to,
+  );
+  db.prepare(`DELETE FROM usage_polls
+    WHERE provider = 'openai-codex' AND account_id = ?`).run(from);
 }
 
 function moveLease(db: DatabaseSync, from: string, to: string, now: number): void {

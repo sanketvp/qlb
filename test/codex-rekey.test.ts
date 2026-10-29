@@ -756,18 +756,122 @@ describe('Codex rekey apply', () => {
     } finally { live.close(); }
   });
 
-  it('a Codex usage_polls clash throws rekey-usage-polls-clash and nothing is committed', () => {
-    const f = fixture();
-    try {
-      slot(f.db, 'user:bare', 'bare');
-      account(f.db, 'bare', 'openai-codex');
-      account(f.db, 'user:bare', 'openai-codex');
-      f.db.prepare(`INSERT INTO usage_polls (provider, account_id, next_due_at) VALUES
-        ('openai-codex', 'bare', 3), ('openai-codex', 'user:bare', 4)`).run();
-      const before = everyTableState(f.db);
-      assert.throws(() => inTransaction(f.db, () => applyCodexRekey(f.db, plan(f.db), { now: 100 })), /rekey-usage-polls-clash/);
-      assert.equal(everyTableState(f.db), before);
-    } finally { f.close(); }
+  it('usage-poll merge follows D-B83', () => {
+    type UsagePoll = {
+      provider: string;
+      account_id: string;
+      last_fetch_at: number | null;
+      last_attempt_at: number | null;
+      next_due_at: number | null;
+      poll_interval_s: number | null;
+      last_status: string | null;
+      consecutive_failures: number | null;
+      backoff_until: number | null;
+      last_429_at: number | null;
+      held_until: number | null;
+    };
+    type PollPair = {
+      source: Omit<UsagePoll, 'provider' | 'account_id'>;
+      target: Omit<UsagePoll, 'provider' | 'account_id'>;
+      merged: Omit<UsagePoll, 'provider' | 'account_id'>;
+      otherProvider?: Omit<UsagePoll, 'provider' | 'account_id'>;
+    };
+    type Fixture = PollPair & { name: string; reverse?: PollPair };
+    const fixtures: Fixture[] = [
+      {
+        name: '1 source schedule and hold, target attempt fetch and status',
+        source: { last_fetch_at: 15, last_attempt_at: 10, next_due_at: 40, poll_interval_s: 90, last_status: 'source', consecutive_failures: 2, backoff_until: 5, last_429_at: 6, held_until: 50 },
+        target: { last_fetch_at: 25, last_attempt_at: 20, next_due_at: 30, poll_interval_s: 60, last_status: 'target', consecutive_failures: 1, backoff_until: 7, last_429_at: 8, held_until: null },
+        merged: { last_fetch_at: 25, last_attempt_at: 20, next_due_at: 40, poll_interval_s: 90, last_status: 'target', consecutive_failures: 2, backoff_until: 7, last_429_at: 8, held_until: 50 },
+      },
+      {
+        name: '2 source attempt fetch and status, target backoff 429 and failures',
+        source: { last_fetch_at: 30, last_attempt_at: 30, next_due_at: 10, poll_interval_s: 10, last_status: 'source', consecutive_failures: 1, backoff_until: 2, last_429_at: 3, held_until: 4 },
+        target: { last_fetch_at: 20, last_attempt_at: 20, next_due_at: 15, poll_interval_s: 15, last_status: 'target', consecutive_failures: 4, backoff_until: 9, last_429_at: 11, held_until: 7 },
+        merged: { last_fetch_at: 30, last_attempt_at: 30, next_due_at: 15, poll_interval_s: 15, last_status: 'source', consecutive_failures: 4, backoff_until: 9, last_429_at: 11, held_until: 7 },
+      },
+      {
+        name: '3 a set hold beats a NULL source hold',
+        source: { last_fetch_at: 1, last_attempt_at: 1, next_due_at: 1, poll_interval_s: 1, last_status: 'source', consecutive_failures: 1, backoff_until: 1, last_429_at: 1, held_until: null },
+        target: { last_fetch_at: 2, last_attempt_at: 2, next_due_at: 2, poll_interval_s: 2, last_status: 'target', consecutive_failures: 2, backoff_until: 2, last_429_at: 2, held_until: 9 },
+        merged: { last_fetch_at: 2, last_attempt_at: 2, next_due_at: 2, poll_interval_s: 2, last_status: 'target', consecutive_failures: 2, backoff_until: 2, last_429_at: 2, held_until: 9 },
+        reverse: {
+          source: { last_fetch_at: 2, last_attempt_at: 2, next_due_at: 2, poll_interval_s: 2, last_status: 'source', consecutive_failures: 2, backoff_until: 2, last_429_at: 2, held_until: 9 },
+          target: { last_fetch_at: 1, last_attempt_at: 1, next_due_at: 1, poll_interval_s: 1, last_status: 'target', consecutive_failures: 1, backoff_until: 1, last_429_at: 1, held_until: null },
+          merged: { last_fetch_at: 2, last_attempt_at: 2, next_due_at: 2, poll_interval_s: 2, last_status: 'source', consecutive_failures: 2, backoff_until: 2, last_429_at: 2, held_until: 9 },
+        },
+      },
+      {
+        name: '4 both backoffs NULL',
+        source: { last_fetch_at: 2, last_attempt_at: 2, next_due_at: 2, poll_interval_s: 2, last_status: 'source', consecutive_failures: 2, backoff_until: null, last_429_at: 2, held_until: 2 },
+        target: { last_fetch_at: 1, last_attempt_at: 1, next_due_at: 1, poll_interval_s: 1, last_status: 'target', consecutive_failures: 1, backoff_until: null, last_429_at: 1, held_until: 1 },
+        merged: { last_fetch_at: 2, last_attempt_at: 2, next_due_at: 2, poll_interval_s: 2, last_status: 'source', consecutive_failures: 2, backoff_until: null, last_429_at: 2, held_until: 2 },
+      },
+      {
+        name: '5 NULL source attempt loses status selection',
+        source: { last_fetch_at: 20, last_attempt_at: null, next_due_at: 20, poll_interval_s: 20, last_status: 'source', consecutive_failures: 2, backoff_until: 20, last_429_at: 20, held_until: 20 },
+        target: { last_fetch_at: 10, last_attempt_at: 10, next_due_at: 10, poll_interval_s: 10, last_status: 'target', consecutive_failures: 1, backoff_until: 10, last_429_at: 10, held_until: 10 },
+        merged: { last_fetch_at: 20, last_attempt_at: 10, next_due_at: 20, poll_interval_s: 20, last_status: 'target', consecutive_failures: 2, backoff_until: 20, last_429_at: 20, held_until: 20 },
+      },
+      {
+        name: '6 equal attempts use later fetch for status',
+        source: { last_fetch_at: 20, last_attempt_at: 10, next_due_at: 20, poll_interval_s: 20, last_status: 'source', consecutive_failures: 2, backoff_until: 20, last_429_at: 20, held_until: 20 },
+        target: { last_fetch_at: 10, last_attempt_at: 10, next_due_at: 10, poll_interval_s: 10, last_status: 'target', consecutive_failures: 1, backoff_until: 10, last_429_at: 10, held_until: 10 },
+        merged: { last_fetch_at: 20, last_attempt_at: 10, next_due_at: 20, poll_interval_s: 20, last_status: 'source', consecutive_failures: 2, backoff_until: 20, last_429_at: 20, held_until: 20 },
+      },
+      {
+        name: '7 timestamp tie keeps target status',
+        source: { last_fetch_at: 10, last_attempt_at: 10, next_due_at: 20, poll_interval_s: 20, last_status: 'source', consecutive_failures: 2, backoff_until: 20, last_429_at: 20, held_until: 20 },
+        target: { last_fetch_at: 10, last_attempt_at: 10, next_due_at: 10, poll_interval_s: 10, last_status: 'target', consecutive_failures: 1, backoff_until: 10, last_429_at: 10, held_until: 10 },
+        merged: { last_fetch_at: 10, last_attempt_at: 10, next_due_at: 20, poll_interval_s: 20, last_status: 'target', consecutive_failures: 2, backoff_until: 20, last_429_at: 20, held_until: 20 },
+      },
+      {
+        name: '8 another provider row remains byte-identical',
+        source: { last_fetch_at: 20, last_attempt_at: 20, next_due_at: 20, poll_interval_s: 20, last_status: 'source', consecutive_failures: 2, backoff_until: 20, last_429_at: 20, held_until: 20 },
+        target: { last_fetch_at: 10, last_attempt_at: 10, next_due_at: 10, poll_interval_s: 10, last_status: 'target', consecutive_failures: 1, backoff_until: 10, last_429_at: 10, held_until: 10 },
+        merged: { last_fetch_at: 20, last_attempt_at: 20, next_due_at: 20, poll_interval_s: 20, last_status: 'source', consecutive_failures: 2, backoff_until: 20, last_429_at: 20, held_until: 20 },
+        otherProvider: { last_fetch_at: 99, last_attempt_at: 98, next_due_at: 97, poll_interval_s: 96, last_status: 'other', consecutive_failures: 95, backoff_until: 94, last_429_at: 93, held_until: 92 },
+      },
+    ];
+    const insert = (db: DatabaseSync, provider: string, accountId: string, row: Omit<UsagePoll, 'provider' | 'account_id'>) => {
+      db.prepare(`INSERT INTO usage_polls (
+        provider, account_id, last_fetch_at, last_attempt_at, next_due_at, poll_interval_s,
+        last_status, consecutive_failures, backoff_until, last_429_at, held_until
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        provider, accountId, row.last_fetch_at, row.last_attempt_at, row.next_due_at, row.poll_interval_s,
+        row.last_status, row.consecutive_failures, row.backoff_until, row.last_429_at, row.held_until,
+      );
+    };
+    for (const schedule of fixtures) {
+      const pairs: PollPair[] = [schedule, ...(schedule.reverse ? [schedule.reverse] : [])];
+      for (const [index, pair] of pairs.entries()) {
+        const f = fixture();
+        const caseName = `${schedule.name}${index === 0 ? '' : ' (reverse)'}`;
+        try {
+          slot(f.db, 'user:bare', 'bare');
+          account(f.db, 'bare', 'openai-codex');
+          account(f.db, 'user:bare', 'openai-codex');
+          insert(f.db, 'openai-codex', 'bare', pair.source);
+          insert(f.db, 'openai-codex', 'user:bare', pair.target);
+          if (pair.otherProvider) insert(f.db, 'anthropic', 'bare', pair.otherProvider);
+          applyPlan(f.db);
+          assert.deepEqual({ ...f.db.prepare(`SELECT provider, account_id, last_fetch_at, last_attempt_at,
+            next_due_at, poll_interval_s, last_status, consecutive_failures, backoff_until, last_429_at, held_until
+            FROM usage_polls WHERE provider = 'openai-codex' AND account_id = 'user:bare'`).get() as object }, {
+            provider: 'openai-codex', account_id: 'user:bare', ...pair.merged,
+          }, caseName);
+          assert.equal(f.db.prepare(`SELECT 1 FROM usage_polls
+            WHERE provider = 'openai-codex' AND account_id = 'bare'`).get(), undefined, caseName);
+          if (pair.otherProvider) {
+            assert.equal(JSON.stringify(f.db.prepare(`SELECT provider, account_id, last_fetch_at, last_attempt_at,
+              next_due_at, poll_interval_s, last_status, consecutive_failures, backoff_until, last_429_at, held_until
+              FROM usage_polls WHERE provider = 'anthropic' AND account_id = 'bare'`).get()), JSON.stringify({
+              provider: 'anthropic', account_id: 'bare', ...pair.otherProvider,
+            }), caseName);
+          }
+        } finally { f.close(); }
+      }
+    }
   });
 
   it('a clashing reading keeps the newer one', () => {
