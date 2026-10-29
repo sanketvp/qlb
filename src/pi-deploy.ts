@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { cpSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync } from 'node:fs';
+import { cpSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
 import { qlbHomeDir } from './home';
@@ -20,6 +20,8 @@ export interface PiDeployOptions {
   now?: () => number;
   /** Injectable filesystem rename for failure-path tests. */
   rename?: typeof renameSync;
+  /** Injectable filesystem device lookup for cross-volume layout tests. */
+  deviceOf?: (path: string) => number;
 }
 
 export interface PiDeployResult extends PiDeployPlan {
@@ -38,12 +40,27 @@ export function piExtensionTarget(home: string): string {
   return join(home, '.pi', 'agent', 'extensions', 'qlb-pi');
 }
 
+/** Returns the shared-source directory adjacent to an extension's resolved extensions directory. */
+export function piSharedSrcDirFor(extensionDir: string): string {
+  const extensionsDir = dirname(extensionDir);
+  try {
+    return join(dirname(realpathSync(extensionsDir)), 'src');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return join(dirname(extensionsDir), 'src');
+    throw error;
+  }
+}
+
+export function piSharedSrcDir(home: string): string {
+  return piSharedSrcDirFor(piExtensionTarget(home));
+}
+
 export function piRedactTarget(home: string): string {
-  return join(home, '.pi', 'agent', 'src', 'redact.ts');
+  return join(piSharedSrcDir(home), 'redact.ts');
 }
 
 export function piOwnerDocumentTarget(home: string): string {
-  return join(home, '.pi', 'agent', 'src', 'pi-owner-document.ts');
+  return join(piSharedSrcDir(home), 'pi-owner-document.ts');
 }
 
 export function piDeploymentDigest(extension: string, redact: string, ownerDocument: string): string {
@@ -110,10 +127,10 @@ function replaceDeployment(
   redactTarget: string,
   ownerDocumentTarget: string,
   rename: typeof renameSync,
+  deviceOf: (path: string) => number,
 ): void {
-  const agentDir = dirname(dirname(target));
   const extensionParent = dirname(target);
-  const stagingRoot = join(agentDir, '.qlb-pi-staging');
+  const stagingRoot = join(dirname(dirname(target)), '.qlb-pi-staging');
   const nonce = `${process.pid}-${Date.now()}`;
   const staging = join(stagingRoot, `.qlb-pi-${nonce}.tmp`);
   const stagedRedact = join(stagingRoot, `.redact-${nonce}.tmp`);
@@ -133,6 +150,10 @@ function replaceDeployment(
     mkdirSync(dirname(redactTarget), { recursive: true, mode: 0o755 });
     mkdirSync(dirname(ownerDocumentTarget), { recursive: true, mode: 0o755 });
     mkdirSync(stagingRoot, { recursive: true, mode: 0o755 });
+    const devices = [stagingRoot, extensionParent, dirname(redactTarget)].map(deviceOf);
+    if (devices.some((device) => device !== devices[0])) {
+      throw new Error('qlb pi deploy: the Pi extensions folder and ~/.pi/agent are on different volumes; this layout is not supported');
+    }
     sweepStaging(stagingRoot, extensionParent);
     cpSync(source, staging, { recursive: true, dereference: true, errorOnExist: true, force: false });
     cpSync(redactSource, stagedRedact, { dereference: true, errorOnExist: true, force: false });
@@ -179,15 +200,18 @@ export function deployPiExtension(options: PiDeployOptions): PiDeployResult {
   const releaseRoot = dirname(dirname(plan.source));
   const redactSource = join(releaseRoot, 'src', 'redact.ts');
   const ownerDocumentSource = join(releaseRoot, 'src', 'pi-owner-document.ts');
-  const home = options.home ?? qlbHomeDir();
+  const sharedSrcDir = piSharedSrcDirFor(plan.target);
+  const redactTarget = join(sharedSrcDir, 'redact.ts');
+  const ownerDocumentTarget = join(sharedSrcDir, 'pi-owner-document.ts');
   replaceDeployment(
     plan.source,
     redactSource,
     ownerDocumentSource,
     plan.target,
-    piRedactTarget(home),
-    piOwnerDocumentTarget(home),
+    redactTarget,
+    ownerDocumentTarget,
     options.rename ?? renameSync,
+    options.deviceOf ?? ((path) => statSync(path).dev),
   );
   const deployedAt = Math.floor((options.now ?? Date.now)() / 1000);
   const store = openStore(options.dbPath);
