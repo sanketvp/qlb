@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { describe, it } from 'node:test';
 import { createOwnedCredentialSource } from '../src/credentials';
 import { MockKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from '../src/keychain';
@@ -19,6 +19,7 @@ import {
   stageGenericGrant,
   stagingOwnerPath,
   type ApiKeyPayload,
+  type MigrationConfig,
   type RehearseFn,
   type SingleGrantProvider,
   type StagedAccount,
@@ -143,8 +144,12 @@ interface Harness {
   cleanup: () => void;
 }
 
-function setup(provider: SingleGrantProvider, kc: MockKeychain = new MockKeychain()): Harness & {
-  mig: ReturnType<typeof createSingleGrantMigration>;
+function setup(
+  provider: SingleGrantProvider,
+  kc: MockKeychain = new MockKeychain(),
+  config: Pick<MigrationConfig, 'fsyncDirectory'> = {},
+): Harness & {
+  mig: Migration;
 } {
   const dir = mkdtempSync(join(tmpdir(), 'qlb-generic-mig-'));
   const authPath = join(dir, 'auth.json');
@@ -153,7 +158,12 @@ function setup(provider: SingleGrantProvider, kc: MockKeychain = new MockKeychai
   writeFileSync(authPath, original, { encoding: 'utf8', mode: 0o600 });
   const originalBytes = readFileSync(authPath);
   const store = openStore(join(dir, 'qlb.db'));
-  const mig = createSingleGrantMigration(store, kc, provider, authPath, ownerPath);
+  const mig = new Migration(store, kc, authPath, ownerPath, `pi-${provider}`, {
+    kind: 'single-grant',
+    provider,
+    authJsonKey: provider,
+    ...config,
+  });
   return {
     dir,
     authPath,
@@ -1116,28 +1126,73 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     }
   });
 
-  it('T-S6b resume with the marker and staging present unlinks staging and reaches the terminal state without committing', () => {
-    const h = setup('xai');
+  it('T-S6b staging unlink is made durable before the marker is cleared', () => {
+    const marker = {
+      phase: 'cleanup-pending',
+      keychainDisposition: 'keep',
+      piFingerprint: null,
+      decision: null,
+      fencedGeneration: null,
+      rolledBackAt: 123,
+    };
+    const calls: string[] = [];
+    const h = setup('xai', new MockKeychain(), {
+      fsyncDirectory: (path) => {
+        calls.push(path);
+        const detail = JSON.parse(h.store.getMigration('pi-xai')!.detail_json) as Record<string, unknown>;
+        assert.deepEqual(detail.handback, marker, 'S6b sync runs before S7 clears the durable marker');
+      },
+    });
     try {
       const staging = stagingOwnerPath(join(h.dir, 'qlb-owner.json'), 'xai');
       writeFileSync(staging, JSON.stringify({ fixture: 'staging' }), { mode: 0o600 });
-      h.store.upsertMigration('pi-xai', 'NATIVE', JSON.stringify({
-        handback: {
-          phase: 'cleanup-pending',
-          keychainDisposition: 'keep',
-          piFingerprint: null,
-          decision: null,
-          fencedGeneration: null,
-          rolledBackAt: 123,
-        },
-      }));
+      h.store.upsertMigration('pi-xai', 'NATIVE', JSON.stringify({ handback: marker }));
 
       const settled = h.mig.resume();
 
+      assert.deepEqual(calls, [dirname(staging)], 'S6b syncs the staging directory exactly once');
       assert.equal(settled.state, 'NATIVE');
       assert.equal(existsSync(staging), false, 'S6b removes the staging file under the marker');
       assert.equal(existsSync(h.ownerPath), false, 'C3 cleanup does not commit the staging file');
-      assert.equal(settled.detail.handback, undefined, 'S7 clears the marker after hygiene');
+      assert.equal(settled.detail.handback, undefined, 'S7 clears the marker after durable hygiene');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('T-S6b a failed directory sync leaves the marker for the next resume', () => {
+    const marker = {
+      phase: 'cleanup-pending',
+      keychainDisposition: 'keep',
+      piFingerprint: null,
+      decision: null,
+      fencedGeneration: null,
+      rolledBackAt: 123,
+    };
+    let failSync = true;
+    let syncCalls = 0;
+    const h = setup('xai', new MockKeychain(), {
+      fsyncDirectory: () => {
+        syncCalls += 1;
+        if (failSync) throw new Error('injected directory sync failure');
+      },
+    });
+    try {
+      const staging = stagingOwnerPath(join(h.dir, 'qlb-owner.json'), 'xai');
+      writeFileSync(staging, JSON.stringify({ fixture: 'staging' }), { mode: 0o600 });
+      h.store.upsertMigration('pi-xai', 'NATIVE', JSON.stringify({ handback: marker }));
+
+      assert.throws(() => h.mig.resume(), /injected directory sync failure/);
+      assert.deepEqual(
+        JSON.parse(h.store.getMigration('pi-xai')!.detail_json).handback,
+        marker,
+        'a failed S6b sync leaves the durable marker for retry',
+      );
+
+      failSync = false;
+      const settled = h.mig.resume();
+      assert.equal(syncCalls, 2, 'the next resume retries the directory sync');
+      assert.equal(settled.detail.handback, undefined, 'the working retry clears S7');
     } finally {
       h.cleanup();
     }
