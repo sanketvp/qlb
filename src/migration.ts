@@ -1745,6 +1745,9 @@ export class Migration {
       ) {
         throw new Error('cleanup-pending hand-back has no valid journal account coordinates');
       }
+      if (journalAccount.provider !== this.provider) {
+        throw new Error(`cleanup-pending hand-back journal names ${journalAccount.provider}, not ${this.provider}`);
+      }
       const coords = keychainCoords(journalAccount.provider, journalAccount.id, journalAccount.label);
       try {
         this.keychain.deleteSync(coords.service, coords.account);

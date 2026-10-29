@@ -1260,6 +1260,41 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     }
   });
 
+  it('S6c1 refuses a journal account from another provider and leaves the marker and both Keychain items', () => {
+    const kc = new MockKeychain();
+    const h = setup('xai', kc);
+    try {
+      const marker = {
+        phase: 'cleanup-pending',
+        keychainDisposition: 'delete',
+        piFingerprint: null,
+        decision: null,
+        fencedGeneration: null,
+        rolledBackAt: 123,
+      };
+      const ownService = qlbKeychainService('xai', expectedId('xai'));
+      kc.setSync(ownService, expectedLabel('xai'), JSON.stringify({ ...FAKE_GRANTS.xai, generation: 0 }));
+      const otherService = qlbKeychainService('kimi-coding', expectedId('kimi-coding'));
+      kc.setSync(otherService, expectedLabel('kimi-coding'), JSON.stringify({ ...FAKE_GRANTS['kimi-coding'], generation: 0 }));
+      h.store.upsertMigration('pi-xai', 'NATIVE', JSON.stringify({
+        accounts: [{
+          id: expectedId('kimi-coding'),
+          provider: 'kimi-coding',
+          label: expectedLabel('kimi-coding'),
+          fingerprint: 'fixture-fingerprint',
+        }],
+        handback: marker,
+      }));
+
+      assert.throws(() => h.mig.resume(), /journal names kimi-coding, not xai/);
+      assert.deepEqual(JSON.parse(h.store.getMigration('pi-xai')!.detail_json).handback, marker);
+      assert.equal(keychainHas(kc, 'xai'), true, 'own item untouched');
+      assert.equal(keychainHas(kc, 'kimi-coding'), true, 'other provider item untouched');
+    } finally {
+      h.cleanup();
+    }
+  });
+
   it('T-S6a backup removal is made durable before the marker is cleared', () => {
     const marker = {
       phase: 'cleanup-pending',
