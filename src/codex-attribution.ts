@@ -41,9 +41,9 @@ export interface AttributeLiveDocumentInput {
   /** Caller-owned atomic auth.json publication; injected for fixture-only tests. */
   republish?: (document: CodexAuthDocument) => Promise<void> | void;
   /** Runs inside attribution's final save before its first write. */
-  beforeSave?: (db: DatabaseSync, dbPath: string, slotId: string) => void;
+  beforeSave?: (db: DatabaseSync, dbPath: string, slotId: string) => undefined;
   /** Runs inside attribution's final save immediately before COMMIT. */
-  beforeSaveCommit?: (db: DatabaseSync, kind: 'existing-mark' | 'existing-adopt') => void;
+  beforeSaveCommit?: (db: DatabaseSync, kind: 'existing-mark' | 'existing-adopt') => undefined;
 }
 
 export interface CodexAttributionResult {

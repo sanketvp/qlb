@@ -868,9 +868,13 @@ describe('Codex live-document attribution (AC57)', () => {
 });
 
 type SaveHooks = {
-  beforeSave?: (db: DatabaseSync, dbPath: string, slotId: string) => void;
-  beforeSaveCommit?: (db: DatabaseSync, kind: 'existing-mark' | 'existing-adopt') => void;
+  beforeSave?: (db: DatabaseSync, dbPath: string, slotId: string) => undefined;
+  beforeSaveCommit?: (db: DatabaseSync, kind: 'existing-mark' | 'existing-adopt') => undefined;
 };
+
+// @ts-expect-error async save hooks return Promise<undefined>, not undefined.
+const rejectedAsyncBeforeSave: NonNullable<SaveHooks['beforeSave']> = async () => undefined;
+void rejectedAsyncBeforeSave;
 
 function withSaveHooks<T>(input: T, hooks: SaveHooks): T & SaveHooks {
   return { ...input, ...hooks };
@@ -1142,13 +1146,60 @@ describe('Codex attribution final save hooks (C3c-S9)', () => {
         await assert.rejects(attributeLiveDocument(withSaveHooks({
           store: h.store, keychain: h.keychain,
           slot: { accountId: plan.slotId, document: old, fingerprint: codexFingerprint(old) }, live: action === 'mark' ? old : live, now: () => 2,
-        }, { beforeSave: async () => undefined })), /Codex save hooks must be synchronous/);
+        }, { beforeSave: (async () => undefined) as unknown as NonNullable<SaveHooks['beforeSave']> })), /Codex save hooks must be synchronous/);
         assert.deepEqual(h.store.getCodexSlot(plan.slotId), initialSlot);
         assert.equal(h.store.getCodexActiveLogin(), initialActive);
       } finally {
         h.store.close();
         rmSync(h.home, { recursive: true, force: true });
       }
+    }
+  });
+
+  it('an async beforeSaveCommit is refused and nothing is saved', async () => {
+    for (const action of ['mark', 'adopt'] as const) {
+      const h = fixture();
+      try {
+        const old = document(`async-before-save-commit-${action}-old`);
+        const live = document(`async-before-save-commit-${action}-live`);
+        const plan = importActiveCodexSlot(old, { store: h.store, keychain: h.keychain, now: () => 1 });
+        const initialSlot = h.store.getCodexSlot(plan.slotId);
+        const initialActive = h.store.getCodexActiveLogin();
+        await assert.rejects(attributeLiveDocument(withSaveHooks({
+          store: h.store, keychain: h.keychain,
+          slot: { accountId: plan.slotId, document: old, fingerprint: codexFingerprint(old) }, live: action === 'mark' ? old : live, now: () => 2,
+        }, { beforeSaveCommit: (async () => undefined) as unknown as NonNullable<SaveHooks['beforeSaveCommit']> })), /Codex save hooks must be synchronous/);
+        assert.deepEqual(h.store.getCodexSlot(plan.slotId), initialSlot);
+        assert.equal(h.store.getCodexActiveLogin(), initialActive);
+      } finally {
+        h.store.close();
+        rmSync(h.home, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it('a refused async hook whose promise later rejects has no unhandled rejection', async () => {
+    const h = fixture();
+    let unhandled: unknown;
+    const onUnhandledRejection = (reason: unknown) => { unhandled = reason; };
+    process.on('unhandledRejection', onUnhandledRejection);
+    try {
+      const saved = document('async-before-save-later-rejection');
+      const plan = importActiveCodexSlot(saved, { store: h.store, keychain: h.keychain, now: () => 1 });
+      await assert.rejects(attributeLiveDocument(withSaveHooks({
+        store: h.store, keychain: h.keychain, slot: { accountId: plan.slotId, document: saved }, live: saved, now: () => 2,
+      }, {
+        beforeSave: (async () => {
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          throw new Error('fixture rejected after refusal');
+        }) as unknown as NonNullable<SaveHooks['beforeSave']>,
+      })), /Codex save hooks must be synchronous/);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(unhandled, undefined);
+    } finally {
+      process.off('unhandledRejection', onUnhandledRejection);
+      h.store.close();
+      rmSync(h.home, { recursive: true, force: true });
     }
   });
 });

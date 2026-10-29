@@ -2270,9 +2270,9 @@ export class Store {
     /** Caller-owned capability, checked immediately before each SQLite write. */
     assertNotCompromised?: () => void;
     /** Called after the compare-and-set pre-check and before the first write. */
-    beforeWrite?: (db: DatabaseSync, dbPath: string) => void;
+    beforeWrite?: (db: DatabaseSync, dbPath: string) => undefined;
     /** Called after the final write and immediately before COMMIT. */
-    beforeCommit?: (db: DatabaseSync, kind: 'existing-adopt') => void;
+    beforeCommit?: (db: DatabaseSync, kind: 'existing-adopt') => undefined;
   }): void {
     const ts = input.ts ?? Date.now();
     this.runImmediate(() => {
@@ -2285,6 +2285,7 @@ export class Store {
         if (input.beforeWrite) {
           const result: unknown = input.beforeWrite(this.db, this.dbPath);
           if (result && typeof (result as { then?: unknown }).then === 'function') {
+            (result as PromiseLike<unknown>).then(undefined, () => undefined);
             throw new Error('Codex save hooks must be synchronous');
           }
           input.assertNotCompromised?.();
@@ -2317,6 +2318,7 @@ export class Store {
         if (input.beforeCommit) {
           const result: unknown = input.beforeCommit(this.db, 'existing-adopt');
           if (result && typeof (result as { then?: unknown }).then === 'function') {
+            (result as PromiseLike<unknown>).then(undefined, () => undefined);
             throw new Error('Codex save hooks must be synchronous');
           }
           input.assertNotCompromised?.();
@@ -2347,8 +2349,8 @@ export class Store {
     ts: number = Date.now(),
     assertNotCompromised?: () => void,
     hooks?: {
-      beforeWrite?: (db: DatabaseSync, dbPath: string) => void;
-      beforeCommit?: (db: DatabaseSync, kind: 'existing-mark') => void;
+      beforeWrite?: (db: DatabaseSync, dbPath: string) => undefined;
+      beforeCommit?: (db: DatabaseSync, kind: 'existing-mark') => undefined;
     },
   ): boolean {
     return this.runImmediate(() => {
@@ -2358,6 +2360,7 @@ export class Store {
       if (hooks?.beforeWrite) {
         const result: unknown = hooks.beforeWrite(this.db, this.dbPath);
         if (result && typeof (result as { then?: unknown }).then === 'function') {
+          (result as PromiseLike<unknown>).then(undefined, () => undefined);
           throw new Error('Codex save hooks must be synchronous');
         }
         assertNotCompromised?.();
@@ -2372,6 +2375,7 @@ export class Store {
       if (hooks?.beforeCommit) {
         const result: unknown = hooks.beforeCommit(this.db, 'existing-mark');
         if (result && typeof (result as { then?: unknown }).then === 'function') {
+          (result as PromiseLike<unknown>).then(undefined, () => undefined);
           throw new Error('Codex save hooks must be synchronous');
         }
         assertNotCompromised?.();
