@@ -1,14 +1,16 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 
 import { withCodexAuthLock, type CodexAuthLockOptions, type HeldCodexAuthLock } from '../cc-locks';
 import { attributeLiveDocument } from '../codex-attribution';
 import { importActiveCodexSlot, planImportActiveCodex } from '../codex-slots';
+import { CodexAdmissionRefused, codexAdmission, ensureCodexSlotAccount, rekeyCodexAccounts, type RekeySummary } from '../codex-rekey';
+import { recordRestoreBaseline } from '../codex-restore-baseline';
 import { parseCodexAuth, readCodexAuthStable, writeCodexAuthAtomic } from '../codex-auth';
-import { QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from '../keychain';
+import { QLB_KEYCHAIN_ACCOUNT, platformKeychain, qlbKeychainService, type KeychainBackend } from '../keychain';
 import { assertAdmitted } from '../lifecycle';
-import { platformKeychain } from '../keychain';
-import { openStore } from '../store';
+import { openStore, type Store } from '../store';
 import type { CommandContext, CommandDefinition } from '../registry';
 
 function parse(args: string[]): { dryRun: boolean; json: boolean } | null {
@@ -36,6 +38,20 @@ export interface CodexImportActiveCommandDeps {
   readAuth: typeof readCodexAuthStable;
   writeAuth: typeof writeCodexAuthAtomic;
   withAuthLock: <T>(options: CodexAuthLockOptions, fn: (held: HeldCodexAuthLock) => Promise<T> | T) => Promise<T>;
+  /** Injectable so command tests never reach the platform Keychain. */
+  keychain?: KeychainBackend;
+}
+
+/** Read-only view of the store for the admission pre-check, which must write nothing. */
+function withReadOnlyDatabase<T>(store: Pick<Store, 'dbPath'>, fn: (db: DatabaseSync) => T): T {
+  if (store.dbPath === ':memory:') return fn((store as unknown as { db: DatabaseSync }).db);
+  const db = new DatabaseSync(store.dbPath, { readOnly: true });
+  try {
+    db.exec('PRAGMA busy_timeout = 5000');
+    return fn(db);
+  } finally {
+    db.close();
+  }
 }
 
 const defaultDeps: CodexImportActiveCommandDeps = {
@@ -68,6 +84,9 @@ export async function runCodexImportActiveCommand(
     return 0;
   }
 
+  // Read at call time so a swapped platformKeychain export still applies.
+  const keychain = deps.keychain ?? platformKeychain;
+
   // Keep the live read through active-login marking in one QLB-owned critical
   // section. In particular, the lock remains held after SQLite's re-validation
   // commit while attributeLiveDocument republishes a repaired slot.
@@ -94,35 +113,68 @@ export async function runCodexImportActiveCommand(
         held.assertNotCompromised();
         const result = importActiveCodexSlot(active.doc, {
           store,
-          keychain: platformKeychain,
+          keychain,
           piBaseline: piBaseline(ctx.config.piAuthJsonPath),
         });
         ctx.stdout(opts.json ? JSON.stringify(result) : `imported ${result.slotId}`);
         return 0;
       }
 
+      const preliminaryRefusal = withReadOnlyDatabase(store, (db) => codexAdmission(db, {
+        slotId: plan.slotId,
+        bareAccountId: plan.accountId,
+      }));
+      if (preliminaryRefusal) {
+        ctx.stderr(`codex import-active refused: ${preliminaryRefusal.message}`);
+        return 3;
+      }
+
       const activeSlotId = store.getCodexActiveLogin();
-      const stored = parseCodexAuth(platformKeychain.getSync(
+      const stored = parseCodexAuth(keychain.getSync(
         qlbKeychainService('openai-codex', ownSlot.accountId), QLB_KEYCHAIN_ACCOUNT,
       ));
       if (!stored.ok) {
         ctx.stderr('codex import-active refused: stored managed slot is malformed');
         return 3;
       }
-      const attribution = await attributeLiveDocument({
-        store,
-        keychain: platformKeychain,
-        slot: { accountId: ownSlot.accountId, document: stored.doc, fingerprint: ownSlot.fingerprint ?? undefined },
-        activeSlotId: activeSlotId != null && store.getCodexSlot(activeSlotId) ? activeSlotId : undefined,
-        live: active.doc,
-        assertNotCompromised: () => held.assertNotCompromised(),
-        republish: (document) => {
-          // Keychain/SQLite work can block the event loop long enough for a
-          // stale takeover. Do not recreate auth.json after losing this lease.
-          held.assertNotCompromised();
-          return deps.writeAuth(path, document).then(() => undefined);
-        },
-      });
+      let summary: RekeySummary | undefined;
+      let attribution;
+      try {
+        attribution = await attributeLiveDocument({
+          store,
+          keychain,
+          slot: { accountId: ownSlot.accountId, document: stored.doc, fingerprint: ownSlot.fingerprint ?? undefined },
+          activeSlotId: activeSlotId != null && store.getCodexSlot(activeSlotId) ? activeSlotId : undefined,
+          live: active.doc,
+          assertNotCompromised: () => held.assertNotCompromised(),
+          republish: (document) => {
+            // Keychain/SQLite work can block the event loop long enough for a
+            // stale takeover. Do not recreate auth.json after losing this lease.
+            held.assertNotCompromised();
+            return deps.writeAuth(path, document).then(() => undefined);
+          },
+          beforeSave: (db, dbPath, slotId) => {
+            const refusal = codexAdmission(db, { slotId, bareAccountId: plan.accountId });
+            if (refusal) throw new CodexAdmissionRefused(refusal.code, refusal.message);
+            const now = Date.now();
+            summary = rekeyCodexAccounts(db, { dbPath, now });
+            ensureCodexSlotAccount(db, slotId, now);
+            return undefined;
+          },
+          beforeSaveCommit: (db, kind) => {
+            if (summary?.backupTaken) {
+              recordRestoreBaseline(db, { saveKind: kind, backupPath: summary.backupTaken, keychain });
+            }
+            return undefined;
+          },
+        });
+      } catch (error) {
+        if (error instanceof CodexAdmissionRefused) {
+          ctx.stderr(`codex import-active refused: ${error.message}`);
+          return 3;
+        }
+        throw error;
+      }
       if (attribution.action === 'slot-split' || attribution.disposition === 'slot-split') {
         ctx.stderr('codex import-active refused: slot-split');
         return 3;
