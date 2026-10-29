@@ -322,6 +322,8 @@ export interface MigrationConfig {
   beforeOwnershipLock?: () => void;
   /** Test-only directory durability seam for S6b cleanup. */
   fsyncDirectory?: (path: string) => void;
+  /** Test-only crash barrier after S6c1 deletes the recorded Keychain item. */
+  afterS6c1?: () => void;
   /** P7a's in-progress journal directory; defaults to ~/.qlb/journal. */
   piMigrateJournalDir?: string;
 }
@@ -761,6 +763,7 @@ export class Migration {
   private readonly readNativeKey: (() => string) | undefined;
   private readonly beforePoolCommitLock: (() => void) | undefined;
   private readonly beforeOwnershipLock: (() => void) | undefined;
+  private readonly afterS6c1: (() => void) | undefined;
   private readonly fsyncDirectory: (path: string) => void;
   private readonly piMigrateJournalDir: string;
 
@@ -784,6 +787,7 @@ export class Migration {
     this.readNativeKey = config.readNativeKey;
     this.beforePoolCommitLock = config.beforePoolCommitLock;
     this.beforeOwnershipLock = config.beforeOwnershipLock;
+    this.afterS6c1 = config.afterS6c1;
     this.fsyncDirectory = config.fsyncDirectory ?? fsyncDirSync;
     this.piMigrateJournalDir = config.piMigrateJournalDir ?? join(qlbHomeDir(), '.qlb', 'journal');
   }
@@ -1754,6 +1758,10 @@ export class Migration {
       } catch (error) {
         if (!isCredentialNotFound(error)) throw error;
       }
+      // S6c2 follows S6c1 so a crash leaves the marker and retry observes
+      // the same recorded delete verdict (with not-found treated as done).
+      this.afterS6c1?.();
+      this.store.setAccountStatus(journalAccount.id, 'handed-back');
     }
     const detail = parseDetail(this.store.getMigration(this.storeName)?.detail_json);
     this.journal(this.journalState(), {
