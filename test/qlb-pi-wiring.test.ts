@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { describe, it } from 'node:test';
 
-import { registerOpenAICodexProvider, type OpenAICodexBuiltin } from '../extensions/qlb-pi/providers/openai-codex';
+import { QLB_RUNTIME_AUTH_SENTINEL, registerOpenAICodexProvider, type OpenAICodexBuiltin } from '../extensions/qlb-pi/providers/openai-codex';
 import { GateFailure, validatePiOwnerDocument } from '../src/pi-gate';
 import { resolvePiPackageRoot } from '../src/pi-integration';
 
@@ -34,7 +34,7 @@ const jiti = createJiti(import.meta.url, { moduleCache: false, alias: {
   '@earendil-works/pi-agent-core': piAgentCore,
   '@earendil-works/pi-tui': piTui,
   '@earendil-works/pi-ai/providers/all': join(piAi, 'providers', 'all.js'),
-  '@earendil-works/pi-ai/compat': join(piAi, 'compat.js'),
+  '@earendil-works/pi-ai/compat': process.env.PI_COMPAT_OVERRIDE || join(piAi, 'compat.js'),
   '@earendil-works/pi-ai/models': join(piAi, 'models.js'),
   '@earendil-works/pi-ai/oauth': join(piAi, 'oauth.js'),
   '@earendil-works/pi-ai': join(piAi, 'compat.js'),
@@ -42,7 +42,7 @@ const jiti = createJiti(import.meta.url, { moduleCache: false, alias: {
   '@mariozechner/pi-agent-core': piAgentCore,
   '@mariozechner/pi-tui': piTui,
   '@mariozechner/pi-ai/providers/all': join(piAi, 'providers', 'all.js'),
-  '@mariozechner/pi-ai/compat': join(piAi, 'compat.js'),
+  '@mariozechner/pi-ai/compat': process.env.PI_COMPAT_OVERRIDE || join(piAi, 'compat.js'),
   '@mariozechner/pi-ai/models': join(piAi, 'models.js'),
   '@mariozechner/pi-ai/oauth': join(piAi, 'oauth.js'),
   '@mariozechner/pi-ai': join(piAi, 'compat.js'),
@@ -67,7 +67,7 @@ const native = new Map(names.map((name) => [name, {
 const providers = new Map(native);
 const calls = [];
 const listeners = new Map();
-const runtimeApiKeys = process.env.PREEXISTING_ANTHROPIC_KEY === '1' ? { anthropic: 'qlb-managed' } : {};
+const runtimeApiKeys = process.env.PREEXISTING_ANTHROPIC_KEY ? { anthropic: process.env.PREEXISTING_ANTHROPIC_KEY } : {};
 const pi = {
   unregisterProvider(name) { calls.push('unregister:' + name); providers.delete(name); },
   registerProvider(name, config) {
@@ -85,10 +85,22 @@ const pi = {
 };
 await factory(pi);
 const lifecycleContext = { ui: { setStatus() {} }, modelRegistry: { runtime: {
-  setRuntimeApiKey(provider, key) { runtimeApiKeys[provider] = key; return Promise.resolve(); },
-  removeRuntimeApiKey(provider) { delete runtimeApiKeys[provider]; return Promise.resolve(); },
+  setRuntimeApiKey(provider, key) { runtimeApiKeys[provider] = key; if (process.env.RUNTIME_KEY_CALLS_VOID !== '1') return Promise.resolve(); },
+  removeRuntimeApiKey(provider) { delete runtimeApiKeys[provider]; if (process.env.RUNTIME_KEY_CALLS_VOID !== '1') return Promise.resolve(); },
 } } };
 for (const handler of listeners.get('session_start') || []) await handler({}, lifecycleContext);
+if (process.env.RELOAD_INERT === '1') {
+  process.env.QLB_PI_REHEARSAL = '0';
+  const reloadListeners = new Map();
+  const reloadPi = { ...pi, on(event, handler) {
+    const handlers = reloadListeners.get(event) || [];
+    handlers.push(handler);
+    reloadListeners.set(event, handlers);
+  } };
+  const reloaded = await jiti.import(process.env.QLB_PI_EXTENSION, { default: true });
+  await reloaded(reloadPi);
+  for (const handler of reloadListeners.get('session_start') || []) await handler({}, lifecycleContext);
+}
 const events = [];
 if (process.env.CALL_ANTHROPIC === '1') {
   const stream = providers.get('anthropic').streamSimple(
@@ -117,7 +129,7 @@ const fakeQlb = String.raw`
 const fs = require('node:fs');
 const args = process.argv.slice(2);
 if (args[0] === 'consume' && args[1] === 'status') {
-  process.stdout.write(JSON.stringify({ state: 'NATIVE' }));
+  process.stdout.write(JSON.stringify({ state: process.env.CONSUME_MODE === '1' ? 'CONSUMED' : 'NATIVE' }));
   process.exit(0);
 }
 const provider = args[0] === 'gate' && args[2] === '--json' ? args[1] : undefined;
@@ -136,7 +148,13 @@ if (Number.isFinite(delayMs) && delayMs > 0) setTimeout(finishGate, delayMs);
 else finishGate();
 `;
 
-function load(owner?: string, gateFail = false, callCodex = false, perProviderOwner?: string, ownerIsDirectory = false, deployedLayout = false, callAnthropic = false, gateCause?: string, rehearsal = false, gateDelayMs = 0, preexistingAnthropicKey = false): {
+function load(owner?: string, gateFail = false, callCodex = false, perProviderOwner?: string, ownerIsDirectory = false, deployedLayout = false, callAnthropic = false, gateCause?: string, rehearsal = false, gateDelayMs = 0, options: {
+  preexistingAnthropicKey?: string;
+  consumeMode?: boolean;
+  runtimeKeyCallsVoid?: boolean;
+  streamSimpleOnly?: boolean;
+  reloadInert?: boolean;
+} = {}): {
   calls: string[];
   replaced: Record<string, boolean>;
   oauth: { resolve: number; refresh: number };
@@ -167,6 +185,16 @@ function load(owner?: string, gateFail = false, callCodex = false, perProviderOw
   const runner = join(home, 'fake-qlb.cjs');
   const gateLog = join(home, 'gate-calls');
   const entry = join(home, 'load.mjs');
+  const compatOverride = join(home, 'compat-stream-simple-only.mjs');
+  if (options.consumeMode) {
+    const dbPath = join(home, 'qlb', 'qlb.db');
+    mkdirSync(dirname(dbPath), { recursive: true });
+    writeFileSync(dbPath, '');
+  }
+  if (options.streamSimpleOnly) {
+    const compat = join(PI_GLOBAL_ROOT, 'node_modules', '@earendil-works', 'pi-ai', 'dist', 'compat.js');
+    writeFileSync(compatOverride, `import * as actual from ${JSON.stringify(compat)};\nexport * from ${JSON.stringify(compat)};\nexport function anthropicMessagesApi() { return { streamSimple: actual.anthropicMessagesApi().streamSimple }; }\n`);
+  }
   writeFileSync(runner, fakeQlb);
   writeFileSync(entry, loader);
   const result = spawnSync(process.execPath, [entry], {
@@ -186,7 +214,11 @@ function load(owner?: string, gateFail = false, callCodex = false, perProviderOw
       ...(gateCause ? { GATE_CAUSE: gateCause } : {}),
       ...(gateDelayMs > 0 ? { GATE_DELAY_MS: String(gateDelayMs) } : {}),
       ...(rehearsal ? { QLB_PI_REHEARSAL: '1' } : {}),
-      ...(preexistingAnthropicKey ? { PREEXISTING_ANTHROPIC_KEY: '1' } : {}),
+      ...(options.preexistingAnthropicKey ? { PREEXISTING_ANTHROPIC_KEY: options.preexistingAnthropicKey } : {}),
+      ...(options.consumeMode ? { CONSUME_MODE: '1', QLB_DB_PATH: join(home, 'qlb', 'qlb.db') } : {}),
+      ...(options.runtimeKeyCallsVoid ? { RUNTIME_KEY_CALLS_VOID: '1' } : {}),
+      ...(options.streamSimpleOnly ? { PI_COMPAT_OVERRIDE: compatOverride } : {}),
+      ...(options.reloadInert ? { RELOAD_INERT: '1' } : {}),
       ...(callCodex ? { CALL_CODEX: '1' } : {}),
       ...(callAnthropic ? { CALL_ANTHROPIC: '1' } : {}),
     },
@@ -221,9 +253,40 @@ describe('qlb-pi provider wiring', { skip: piAvailable ? false : 'global Pi inst
     });
   });
 
+  it('an operator --api-key for anthropic survives session start in inert and owned mode', () => {
+    const operatorKey = 'sk-ant-api-test';
+    assert.equal(load(undefined, false, false, undefined, false, false, false, undefined, false, 0, {
+      preexistingAnthropicKey: operatorKey,
+    }).runtimeApiKeys.anthropic, operatorKey);
+    assert.equal(load(JSON.stringify({ providers: { anthropic: { mode: 'qlb', since: 1 } } }), false, false, undefined, false, false, false, undefined, false, 0, {
+      preexistingAnthropicKey: operatorKey,
+    }).runtimeApiKeys.anthropic, operatorKey);
+  });
+
+  it('consume mode keeps the QLB sentinel after session start', () => {
+    const result = load(undefined, false, false, undefined, false, false, false, undefined, false, 0, { consumeMode: true });
+    assert.equal(result.runtimeApiKeys.anthropic, QLB_RUNTIME_AUTH_SENTINEL);
+  });
+
   it('a reload that goes inert leaves no anthropic runtime key', () => {
-    const result = load(undefined, false, false, undefined, false, false, false, undefined, false, 0, true);
+    const result = load(undefined, false, false, undefined, false, false, false, undefined, false, 0, {
+      consumeMode: true, reloadInert: true,
+    });
     assert.equal('anthropic' in result.runtimeApiKeys, false);
+  });
+
+  it('runtime key calls that return void do not throw', () => {
+    const result = load(undefined, false, false, undefined, false, false, false, undefined, false, 0, {
+      consumeMode: true, reloadInert: true, runtimeKeyCallsVoid: true,
+    });
+    assert.equal('anthropic' in result.runtimeApiKeys, false);
+  });
+
+  it('registers owned Anthropic with streamSimple when Pi has no stream', () => {
+    const result = load(JSON.stringify({ providers: { anthropic: { mode: 'qlb', since: 1 } } }), false, false, undefined, false, false, false, undefined, false, 0, {
+      streamSimpleOnly: true,
+    });
+    assert.equal(result.replaced.anthropic, true);
   });
 
   it('uses the owned Anthropic gate source and emits the common unavailable event on gate failure', () => {
