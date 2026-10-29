@@ -54,6 +54,33 @@ function withReadOnlyDatabase<T>(store: Pick<Store, 'dbPath'>, fn: (db: Database
   }
 }
 
+export function rekeyReport(summary: RekeySummary): {
+  moved: number;
+  skipped: number;
+  skippedReasons: Record<string, number>;
+  backupMissing: boolean;
+} {
+  const skippedReasons: Record<string, number> = {};
+  for (const { reason } of summary.skipped) skippedReasons[reason] = (skippedReasons[reason] ?? 0) + 1;
+  return {
+    moved: summary.moves.length,
+    skipped: summary.skipped.length,
+    skippedReasons,
+    backupMissing: summary.backupMissing,
+  };
+}
+
+/** Formats the optional command-report suffix without changing no-op output. */
+export function rekeyTextSuffix(summary: RekeySummary | undefined): string {
+  if (!summary) return '';
+  const report = rekeyReport(summary);
+  let suffix = report.moved > 0 || report.skipped > 0
+    ? ` (rekey: moved ${report.moved}, skipped ${report.skipped})`
+    : '';
+  if (report.backupMissing) suffix += ' (rekey backup missing)';
+  return suffix;
+}
+
 const defaultDeps: CodexImportActiveCommandDeps = {
   readAuth: readCodexAuthStable,
   writeAuth: writeCodexAuthAtomic,
@@ -111,12 +138,15 @@ export async function runCodexImportActiveCommand(
       const ownSlot = store.getCodexSlot(plan.slotId);
       if (!ownSlot) {
         held.assertNotCompromised();
+        let summary: RekeySummary | undefined;
         const result = importActiveCodexSlot(active.doc, {
           store,
           keychain,
           piBaseline: piBaseline(ctx.config.piAuthJsonPath),
+          onRekey: (value) => { summary = value; },
         });
-        ctx.stdout(opts.json ? JSON.stringify(result) : `imported ${result.slotId}`);
+        const report = summary ? { ...result, rekey: rekeyReport(summary) } : result;
+        ctx.stdout(opts.json ? JSON.stringify(report) : `imported ${result.slotId}${rekeyTextSuffix(summary)}`);
         return 0;
       }
 
@@ -180,7 +210,8 @@ export async function runCodexImportActiveCommand(
         return 3;
       }
       const result = { ...plan, action: attribution.action };
-      ctx.stdout(opts.json ? JSON.stringify(result) : `${attribution.action} ${plan.slotId}`);
+      const report = summary ? { ...result, rekey: rekeyReport(summary) } : result;
+      ctx.stdout(opts.json ? JSON.stringify(report) : `${attribution.action} ${plan.slotId}${rekeyTextSuffix(summary)}`);
       return 0;
     } finally {
       store.close();

@@ -72,8 +72,8 @@ function db(f: Fixture): DatabaseSync {
   return new DatabaseSync(join(f.home, 'qlb.db'));
 }
 
-async function run(f: Fixture, doc: ReturnType<typeof document>): Promise<number> {
-  return runCodexImportActiveCommand([], context(f), deps(f, doc));
+async function run(f: Fixture, doc: ReturnType<typeof document>, args: string[] = []): Promise<number> {
+  return runCodexImportActiveCommand(args, context(f), deps(f, doc));
 }
 
 function close(f: Fixture): void {
@@ -87,6 +87,80 @@ function accountRows(database: DatabaseSync): Array<Record<string, unknown>> {
 }
 
 describe('codex import-active existing-slot rekey', () => {
+  it('import --json reports moved and skipped counts on the new-slot path', async () => {
+    const f = fixture();
+    try {
+      const doc = document('report-new', 'account-a');
+      const other = document('report-other', 'account-b');
+      beginCutover(f.store, 1);
+      importActiveCodexSlot(other, { store: f.store, keychain: f.keychain, now: () => 2 });
+      const database = db(f);
+      database.prepare(`INSERT INTO accounts (id, provider, label, status, created_at) VALUES ('account-a', 'openai-codex', 'bare', 'active', 1)`).run();
+      database.prepare(`INSERT INTO accounts (id, provider, label, status, created_at) VALUES ('account-b', 'openai-codex', 'busy', 'active', 1)`).run();
+      database.prepare(`INSERT INTO poll_claims (account_id, holder_id, claimed_at, until) VALUES ('account-b', 'fixture', 1, ?)`).run(Date.now() + 60_000);
+      database.close();
+
+      assert.equal(await run(f, doc, ['--json']), 0);
+      const result = JSON.parse((f.output.at(-1) ?? '').slice('stdout:'.length)) as {
+        rekey: { moved: number; skipped: number; skippedReasons: Record<string, number> };
+      };
+      assert.equal(result.rekey.moved, 1);
+      assert.equal(result.rekey.skipped, 1);
+      assert.equal(result.rekey.skippedReasons['in-use'], 1);
+    } finally { close(f); }
+  });
+
+  it('import --json reports moved and skipped counts on the existing-slot path', async () => {
+    const f = fixture();
+    try {
+      const doc = document('report-existing', 'account-a');
+      const other = document('report-other', 'account-b');
+      const plan = seed(f, doc);
+      importActiveCodexSlot(other, { store: f.store, keychain: f.keychain, now: () => 2 });
+      const database = db(f);
+      database.prepare(`INSERT INTO accounts (id, provider, label, status, created_at) VALUES (?, 'openai-codex', 'bare', 'active', 1)`).run(plan.accountId);
+      database.prepare(`INSERT INTO accounts (id, provider, label, status, created_at) VALUES ('account-b', 'openai-codex', 'busy', 'active', 1)`).run();
+      database.prepare(`INSERT INTO poll_claims (account_id, holder_id, claimed_at, until) VALUES ('account-b', 'fixture', 1, ?)`).run(Date.now() + 60_000);
+      database.close();
+
+      assert.equal(await run(f, doc, ['--json']), 0);
+      const result = JSON.parse((f.output.at(-1) ?? '').slice('stdout:'.length)) as {
+        rekey: { moved: number; skipped: number; skippedReasons: Record<string, number> };
+      };
+      assert.equal(result.rekey.moved, 1);
+      assert.equal(result.rekey.skipped, 1);
+      assert.equal(result.rekey.skippedReasons['in-use'], 1);
+    } finally { close(f); }
+  });
+
+  it('text output is unchanged when nothing moved, was skipped or is missing', async () => {
+    const f = fixture();
+    try {
+      const doc = document('unchanged');
+      beginCutover(f.store, 1);
+      assert.equal(await run(f, doc), 0);
+      assert.deepEqual(f.output, ['stdout:imported fixture-user:fixture-account']);
+    } finally { close(f); }
+  });
+
+  it('backupMissing is reported', async () => {
+    const f = fixture();
+    try {
+      const doc = document('missing');
+      beginCutover(f.store, 1);
+      const database = db(f);
+      database.prepare(`INSERT INTO config (key, value) VALUES ('codex.rekey.backupPath', '/fixture/missing.sqlite')`).run();
+      database.close();
+
+      assert.equal(await run(f, doc, ['--json']), 0);
+      const json = JSON.parse((f.output.at(-1) ?? '').slice('stdout:'.length)) as { rekey: { backupMissing: boolean } };
+      assert.equal(json.rekey.backupMissing, true);
+      f.output.length = 0;
+      assert.equal(await run(f, doc), 0);
+      assert.match(f.output.at(-1) ?? '', / \(rekey backup missing\)$/);
+    } finally { close(f); }
+  });
+
   it('existing slot, zero accounts rows, orphan codex-default snapshots and pins ⇒ one visible slot-id row holding them; second run changes nothing', async () => {
     const f = fixture();
     try {
