@@ -7,9 +7,12 @@ import { DatabaseSync } from 'node:sqlite';
 import { describe, it } from 'node:test';
 
 import { addCodexAccount, CodexAddError, productionCodexAddDeps, type CodexAddDeps } from '../src/codex-add';
+import { runCodexAddCommand } from '../src/commands/codex-add';
 import { CodexAuthLockCompromised, withCodexAuthLock } from '../src/cc-locks';
 import { codexFingerprint, parseCodexAuth } from '../src/codex-auth';
 import { MockKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from '../src/keychain';
+import { beginCutover } from '../src/lifecycle';
+import type { CommandContext } from '../src/registry';
 import { openStore } from '../src/store';
 
 function jwt(payload: Record<string, unknown>): string {
@@ -67,6 +70,43 @@ function rows(store: ReturnType<typeof openStore>) {
 }
 
 describe('codex add', () => {
+  it('codex add prints the rekey suffix', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-codex-add-command-'));
+    const nativeAuthPath = join(home, 'native-auth.json');
+    const dbPath = join(home, 'qlb.db');
+    const keychain = new MockKeychain();
+    const output: string[] = [];
+    try {
+      writeFileSync(nativeAuthPath, '{}', { mode: 0o600 });
+      const seed = openStore(dbPath);
+      beginCutover(seed, 1);
+      seed.upsertAccount('fixture-account', 'openai-codex', 'bare');
+      seed.close();
+      const ctx: CommandContext = {
+        stdout: (line) => output.push(line), stderr: (line) => output.push(`stderr:${line}`),
+        env: { QLB_TEST_MODE: '1', HOME: home, QLB_HOME: join(home, 'qlb') },
+        config: { dbPath, codexAuthJsonPath: nativeAuthPath } as CommandContext['config'],
+        loadConfig: () => { throw new Error('not used'); }, home,
+        registerSecret: () => undefined, deliverSecret: () => undefined, knownSecrets: () => [],
+      };
+      assert.equal(await runCodexAddCommand([], ctx, {
+        openStore,
+        add: addCodexAccount,
+        productionDeps: (store, _platformKeychain, env) => {
+          const commandDeps = productionCodexAddDeps(store, keychain, env);
+          commandDeps.login = async (options) => {
+            writeFileSync(join(options.cwd, 'auth.json'), JSON.stringify(document()), { mode: 0o600 });
+            return 0;
+          };
+          return commandDeps;
+        },
+      }), 0);
+      assert.deepEqual(output, ['added fixture-user:fixture-account (rekey: moved 1, skipped 0)']);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it('uses an isolated file-store login and persists only its resulting composite identity', async () => {
     const f = fixture();
     try {

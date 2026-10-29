@@ -1,4 +1,5 @@
 import { addCodexAccount, productionCodexAddDeps } from '../codex-add';
+import { rekeyTextSuffix } from './codex-import-active';
 import { platformKeychain } from '../keychain';
 import { assertAdmitted } from '../lifecycle';
 import type { CommandContext, CommandDefinition } from '../registry';
@@ -44,7 +45,7 @@ export async function runCodexAddCommand(
       nativeAuthPath: ctx.config.codexAuthJsonPath,
       replace: parsed.replace,
     }, deps.productionDeps(store, platformKeychain, ctx.env));
-    ctx.stdout(result.added ? `added ${result.slotId}` : `replaced ${result.slotId}`);
+    ctx.stdout(`${result.added ? `added ${result.slotId}` : `replaced ${result.slotId}`}${rekeyTextSuffix(result.rekey)}`);
     return 0;
   } finally {
     store.close();
