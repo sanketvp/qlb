@@ -1116,6 +1116,33 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     }
   });
 
+  it('T-S6b resume with the marker and staging present unlinks staging and reaches the terminal state without committing', () => {
+    const h = setup('xai');
+    try {
+      const staging = stagingOwnerPath(join(h.dir, 'qlb-owner.json'), 'xai');
+      writeFileSync(staging, JSON.stringify({ fixture: 'staging' }), { mode: 0o600 });
+      h.store.upsertMigration('pi-xai', 'NATIVE', JSON.stringify({
+        handback: {
+          phase: 'cleanup-pending',
+          keychainDisposition: 'keep',
+          piFingerprint: null,
+          decision: null,
+          fencedGeneration: null,
+          rolledBackAt: 123,
+        },
+      }));
+
+      const settled = h.mig.resume();
+
+      assert.equal(settled.state, 'NATIVE');
+      assert.equal(existsSync(staging), false, 'S6b removes the staging file under the marker');
+      assert.equal(existsSync(h.ownerPath), false, 'C3 cleanup does not commit the staging file');
+      assert.equal(settled.detail.handback, undefined, 'S7 clears the marker after hygiene');
+    } finally {
+      h.cleanup();
+    }
+  });
+
   it('decision-only resume settles: second resume is a no-op and stage works again', async () => {
     const h = setup('xai');
     try {
@@ -1176,6 +1203,25 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       }
     }
 
+    // A crash inside continueRollback can leave intent without a decision.
+    // C4 must settle it directly rather than refusing with the resume hint.
+    {
+      const h = setup('xai');
+      try {
+        h.store.upsertMigration('pi-xai', 'QLB_OWNED', JSON.stringify({ intent: 'rollback' }));
+
+        assert.doesNotThrow(() => h.mig.rollback(), 'intent-only C4 rollback must not demand resume');
+        const afterFirst = h.store.getMigration('pi-xai');
+        assert.equal(afterFirst?.state, 'VALIDATED', 'intent-only C4 reaches the terminal journal');
+        assert.equal(JSON.parse(afterFirst!.detail_json).intent, undefined, 'intent-only C4 clears intent');
+
+        assert.doesNotThrow(() => h.mig.rollback(), 'a settled intent-only C4 fixture is never refused with the resume hint');
+        assert.deepEqual(h.store.getMigration('pi-xai'), afterFirst, 'a second intent-only C4 rollback is a no-op');
+      } finally {
+        h.cleanup();
+      }
+    }
+
     // C4 must continue the existing rollback directly, without re-journaling
     // intent through postCommitRollback. Use the complete eight-field decision
     // shape required for a committed QLB_OWNED fixture.
@@ -1210,6 +1256,43 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       } finally {
         h.cleanup();
       }
+    }
+
+    // C3 and C4 use the same terminal journal path regardless of whether the
+    // caller chose resume or rollback. Timestamps are deliberately ignored.
+    const stripTimestamps = (value: unknown): unknown => {
+      if (Array.isArray(value)) return value.map(stripTimestamps);
+      if (value && typeof value === 'object') {
+        return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+          .filter(([key]) => key !== 'rolledBackAt' && key !== 'cleanedAt')
+          .map(([key, child]) => [key, stripTimestamps(child)]));
+      }
+      return value;
+    };
+    const finish = (fixture: 'C3' | 'C4', command: 'resume' | 'rollback') => {
+      const h = setup('xai');
+      try {
+        if (fixture === 'C3') {
+          h.store.upsertMigration('pi-xai', 'NATIVE', JSON.stringify({
+            handback,
+            intent: 'rollback',
+            rollbackDecision: ROLLBACK_DECISION,
+          }));
+        } else {
+          h.store.upsertMigration('pi-xai', 'QLB_OWNED', JSON.stringify({ intent: 'rollback' }));
+        }
+        h.mig[command]();
+        return JSON.parse(h.store.getMigration('pi-xai')!.detail_json);
+      } finally {
+        h.cleanup();
+      }
+    };
+    for (const fixture of ['C3', 'C4'] as const) {
+      assert.deepEqual(
+        stripTimestamps(finish(fixture, 'resume')),
+        stripTimestamps(finish(fixture, 'rollback')),
+        `${fixture} resume and rollback have matching terminal journal detail`,
+      );
     }
   });
 

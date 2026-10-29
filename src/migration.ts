@@ -1689,8 +1689,9 @@ export class Migration {
     return out;
   }
 
-  /** S7. C3's hygiene grows in later rows; this reader only records its completion. */
+  /** S6b + S7. C3 removes staging before recording cleanup completion. */
   private finishCleanupPendingHandback(handback: Record<string, unknown>): MigrationStatus {
+    unlinkIfExists(this.stagingPath());
     const detail = parseDetail(this.store.getMigration(this.storeName)?.detail_json);
     this.journal(this.journalState(), {
       handback: undefined,
