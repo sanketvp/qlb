@@ -64,7 +64,7 @@ function insertRequiredKeychainItems(db: DatabaseSync, keychain: MockKeychain): 
   const slots = db.prepare('SELECT account_id FROM codex_slots ORDER BY account_id').all() as Array<{ account_id: string }>;
   for (const slot of slots) keychain.setSync(qlbKeychainService('openai-codex', slot.account_id), QLB_KEYCHAIN_ACCOUNT, '{"fixture":"slot"}');
   const grants = db.prepare(`SELECT id, provider, label FROM accounts
-    WHERE provider IN ('xai', 'kimi-coding', 'openai-codex') ORDER BY id`).all() as Array<{ id: string; provider: string; label: string | null }>;
+    WHERE provider IN ('xai', 'kimi-coding', 'openai-codex', 'anthropic') ORDER BY id`).all() as Array<{ id: string; provider: string; label: string | null }>;
   for (const grant of grants) keychain.setSync(qlbKeychainService(grant.provider, grant.id), grant.label || grant.id, '{"fixture":"grant"}');
 }
 
@@ -80,6 +80,12 @@ function baselineFixture(saveKind: 'import-new' | 'add' | 'add-replace' | 'exist
 function write(path: string, sql: string): void {
   const db = new DatabaseSync(path);
   try { db.exec(sql); } finally { db.close(); }
+}
+
+class ReadFailingMockKeychain extends MockKeychain {
+  override getSync(): string {
+    throw new Error('injected Keychain read failure');
+  }
 }
 
 describe('Codex restore baseline', () => {
@@ -196,5 +202,69 @@ describe('Codex restore baseline', () => {
     const f = baselineFixture();
     f.keychain.deleteSync(qlbKeychainService('xai', 'xai-default'), 'Grok (xAI)');
     assert.deepEqual(checkRestorePrecondition(f.path, { keychain: f.keychain }), { verdict: 'differ', reasons: ['keychain'] });
+  });
+
+  it('baseline records absent items instead of throwing', () => {
+    const f = fixture();
+    const keychain = new MockKeychain();
+    const backupPath = join(mkdtempSync(join(tmpdir(), 'qlb-restore-copy-')), 'backup.sqlite');
+    transaction(f.db, () => {
+      f.db.prepare(`INSERT INTO codex_slots (account_id, chatgpt_user_id, chatgpt_account_id, fingerprint, added_at)
+        VALUES ('user:codex', 'user', 'codex', 'fp', 1)`).run();
+      f.db.prepare(`INSERT INTO accounts (id, provider, label, status, created_at, grant_generation)
+        VALUES ('user:codex', 'openai-codex', 'user:codex', 'active', 1, 0),
+          ('xai-default', 'xai', 'Grok (xAI)', 'active', 1, 0)`).run();
+      f.db.prepare(`INSERT INTO config (key, value) VALUES ('codex.rekey.backupPath', ?)`).run(backupPath);
+      recordRestoreBaseline(f.db, { saveKind: 'add', backupPath, keychain });
+    });
+    f.db.close();
+    copyFileSync(f.path, backupPath);
+    assert.deepEqual(checkRestorePrecondition(f.path, { keychain }), { verdict: 'same' });
+  });
+
+  it('an item appearing after the baseline gives differ:keychain', () => {
+    const f = baselineFixture();
+    f.keychain.setSync(qlbKeychainService('xai', 'default'), QLB_KEYCHAIN_ACCOUNT, '{"fixture":"appeared"}');
+    assert.deepEqual(checkRestorePrecondition(f.path, { keychain: f.keychain }), { verdict: 'differ', reasons: ['keychain'] });
+  });
+
+  it('a single-mode renewal before its lineage write gives differ:keychain', () => {
+    const f = fixture();
+    const keychain = new MockKeychain();
+    seedComparedRows(f.db);
+    insertRequiredKeychainItems(f.db, keychain);
+    keychain.setSync(qlbKeychainService('kimi-coding', 'default'), QLB_KEYCHAIN_ACCOUNT, '{"fixture":"predecessor"}');
+    writeBaseline(f.db, f.path, keychain);
+    keychain.setSync(qlbKeychainService('kimi-coding', 'default'), QLB_KEYCHAIN_ACCOUNT, '{"fixture":"successor"}');
+    assert.deepEqual(checkRestorePrecondition(f.path, { keychain }), { verdict: 'differ', reasons: ['keychain'] });
+  });
+
+  it('an anthropic generic-grant successor gives differ:keychain', () => {
+    const f = fixture();
+    const keychain = new MockKeychain();
+    seedComparedRows(f.db);
+    f.db.prepare(`INSERT INTO accounts (id, provider, label, status, created_at, grant_generation)
+      VALUES ('anthropic-id', 'anthropic', 'Anthropic label', 'active', 1, 0)`).run();
+    insertRequiredKeychainItems(f.db, keychain);
+    writeBaseline(f.db, f.path, keychain);
+    keychain.setSync(qlbKeychainService('anthropic', 'anthropic-id'), 'Anthropic label', '{"fixture":"successor"}');
+    assert.deepEqual(checkRestorePrecondition(f.path, { keychain }), { verdict: 'differ', reasons: ['keychain'] });
+  });
+
+  it('a non-not-found read error during the baseline throws and rolls back the save', () => {
+    const f = fixture();
+    try {
+      seedComparedRows(f.db);
+      assert.throws(() => transaction(f.db, () => {
+        f.db.prepare(`INSERT INTO config (key, value) VALUES ('codex.rekey.backupPath', 'backup.sqlite')`).run();
+        recordRestoreBaseline(f.db, { saveKind: 'add', backupPath: 'backup.sqlite', keychain: new ReadFailingMockKeychain() });
+      }), /injected Keychain read failure/);
+      assert.equal(f.db.prepare(`SELECT value FROM config WHERE key = 'codex.rekey.baseline'`).get(), undefined);
+    } finally { f.close(); }
+  });
+
+  it('a non-not-found read error during the check gives differ:keychain', () => {
+    const f = baselineFixture();
+    assert.deepEqual(checkRestorePrecondition(f.path, { keychain: new ReadFailingMockKeychain() }), { verdict: 'differ', reasons: ['keychain'] });
   });
 });

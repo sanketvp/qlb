@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 
+import { isCredentialNotFound } from './credential-backends';
 import { platformKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, type KeychainBackend } from './keychain';
 
 const BASELINE_KEY = 'codex.rekey.baseline';
@@ -23,7 +24,7 @@ interface RestoreBaseline {
 interface BaselineOptions {
   saveKind: SaveKind;
   backupPath: string;
-  keychain?: KeychainBackend;
+  keychain: KeychainBackend;
 }
 
 interface CheckOptions {
@@ -89,13 +90,16 @@ function keychainItems(db: DatabaseSync): KeychainItem[] {
   for (const row of rows(db, 'SELECT account_id FROM codex_slots ORDER BY account_id') as Array<{ account_id: string }>) {
     items.push({ service: qlbKeychainService('openai-codex', row.account_id), account: QLB_KEYCHAIN_ACCOUNT });
   }
-  // S29 owns generic grants for precisely these providers. The coordinates are
-  // the same ones used by migration.ts and refresh-lease.ts: qlb:<provider>:<id>
-  // and label || id for the Keychain account attribute.
+  // D-B86 covers generic grants for these providers at qlb:<provider>:<id>
+  // using label || id as the Keychain account attribute.
   for (const row of rows(db, `SELECT id, provider, label FROM accounts
-    WHERE provider IN ('xai', 'kimi-coding', 'openai-codex') ORDER BY id`) as Array<{ id: string; provider: string; label: string | null }>) {
+    WHERE provider IN ('xai', 'kimi-coding', 'openai-codex', 'anthropic') ORDER BY id`) as Array<{ id: string; provider: string; label: string | null }>) {
     items.push({ service: qlbKeychainService(row.provider, row.id), account: row.label || row.id });
   }
+  items.push(
+    { service: qlbKeychainService('xai', 'default'), account: QLB_KEYCHAIN_ACCOUNT },
+    { service: qlbKeychainService('kimi-coding', 'default'), account: QLB_KEYCHAIN_ACCOUNT },
+  );
   const unique = new Map<string, KeychainItem>();
   for (const item of items) unique.set(`${item.service}\0${item.account}`, item);
   return [...unique.values()].sort((a, b) => `${a.service}\0${a.account}`.localeCompare(`${b.service}\0${b.account}`));
@@ -104,7 +108,13 @@ function keychainItems(db: DatabaseSync): KeychainItem[] {
 function keychainDigest(db: DatabaseSync, keychain: KeychainBackend): KeychainDigest {
   const result: KeychainDigest = {};
   for (const item of keychainItems(db)) {
-    result[`${item.service}\0${item.account}`] = sha256(keychain.getSync(item.service, item.account));
+    const key = `${item.service}\0${item.account}`;
+    try {
+      result[key] = sha256(keychain.getSync(item.service, item.account));
+    } catch (error) {
+      if (!isCredentialNotFound(error)) throw error;
+      result[key] = 'absent';
+    }
   }
   return result;
 }
@@ -139,7 +149,7 @@ export function recordRestoreBaseline(db: DatabaseSync, options: BaselineOptions
     saveKind: options.saveKind,
     userVersion: userVersion(db),
     digest: comparedSetDigest(db),
-    keychain: keychainDigest(db, options.keychain ?? platformKeychain),
+    keychain: keychainDigest(db, options.keychain),
   };
   db.prepare(`INSERT INTO config (key, value) VALUES (?, ?)
     ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(BASELINE_KEY, canonicalJson(baseline));
