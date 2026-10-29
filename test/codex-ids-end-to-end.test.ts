@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import * as http from 'node:http';
 import type { AddressInfo } from 'node:net';
@@ -11,7 +12,7 @@ import { createCodexAdapter } from '../src/adapters/codex';
 import { parseCodexAuth, type CodexAuthDocument } from '../src/codex-auth';
 import { importActiveCodexSlot } from '../src/codex-slots';
 import { createOwnedCredentialSource, notOwnedError } from '../src/credentials';
-import { MockKeychain, qlbKeychainService } from '../src/keychain';
+import { MockKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from '../src/keychain';
 import { beginCutover } from '../src/lifecycle';
 import { decodeJournalEvidence } from '../src/migration-health';
 import { setPolicy } from '../src/policy';
@@ -89,6 +90,20 @@ function backupCount(f: Fixture): number {
   return readdirSync(join(f.root, 'backups')).filter((name) => name.endsWith('.sqlite')).length;
 }
 
+/** Presence and digest of the slot's current and :prev Keychain items, never their values. */
+function keychainState(f: Fixture, slotId: string): Record<string, string> {
+  const service = qlbKeychainService('openai-codex', slotId);
+  const state: Record<string, string> = {};
+  for (const name of [service, `${service}:prev`]) {
+    try {
+      state[name] = createHash('sha256').update(f.keychain.getSync(name, QLB_KEYCHAIN_ACCOUNT)).digest('hex');
+    } catch {
+      state[name] = 'absent';
+    }
+  }
+  return state;
+}
+
 function canonicalDependents(f: Fixture): string {
   return JSON.stringify({
     accounts: readRows(f, 'SELECT * FROM accounts ORDER BY id'),
@@ -105,6 +120,7 @@ function canonicalDependents(f: Fixture): string {
     config: readRows(f, `SELECT key, value FROM config
       WHERE key IN ('failover:openai-codex', 'observed:openai-codex', 'codex.rekey.backupPath', 'codex.rekey.baseline')
       ORDER BY key`),
+    lineage: readRows(f, 'SELECT count(*) AS n, max(id) AS maxId FROM lineage_log'),
     backups: backupCount(f),
   });
 }
@@ -223,8 +239,10 @@ describe('Codex S29 ids end to end', () => {
       }
 
       const beforeSecondImport = canonicalDependents(f);
+      const keychainBefore = keychainState(f, SLOT_ID);
       importActiveCodexSlot(doc, { store: f.store, keychain: f.keychain, now: () => 3 });
       assert.equal(canonicalDependents(f), beforeSecondImport);
+      assert.deepEqual(keychainState(f, SLOT_ID), keychainBefore);
     } finally {
       close(f);
     }
