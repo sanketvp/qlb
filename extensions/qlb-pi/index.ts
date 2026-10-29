@@ -235,12 +235,6 @@ function recordOutcome(entry: Record<string, unknown>): void {
   }
 }
 
-type StreamSimple = (
-  model: Model<Api>,
-  context: Context,
-  options?: SimpleStreamOptions,
-) => AsyncIterable<unknown>;
-
 async function resolveOpenRouterSourceDeps(): Promise<OpenRouterSourceDeps> {
   // The extension loader resolves this import through Pi's Jiti aliases. Do
   // not use module.require(): pi-ai exposes ./compat to ESM imports only.
@@ -277,6 +271,71 @@ async function resolveOpenRouterSourceDeps(): Promise<OpenRouterSourceDeps> {
   };
 }
 
+type StreamSimple = (
+  model: Model<Api>,
+  context: Context,
+  options?: SimpleStreamOptions,
+) => AsyncIterable<unknown>;
+
+interface BuiltinAnthropicCatalog {
+  models: readonly Model<Api>[];
+  baseUrl?: string;
+}
+
+async function resolveBuiltinAnthropicCatalog(): Promise<BuiltinAnthropicCatalog> {
+  // Pi exposes only root, /compat, /models, /oauth, and /providers/all to
+  // extensions. Do not import a provider-specific subpath: bundled Pi cannot
+  // resolve it.
+  const providers = (await import("@earendil-works/pi-ai/providers/all")) as unknown as {
+    builtinProviders?: () => Array<{ id?: unknown; baseUrl?: string; getModels?: () => readonly Model<Api>[] }>;
+  };
+  const catalog = providers.builtinProviders?.().find((candidate) => candidate.id === "anthropic");
+  if (!catalog?.getModels) throw new Error("qlb-pi: Pi has no Anthropic provider catalog");
+  return { models: catalog.getModels(), ...(catalog.baseUrl ? { baseUrl: catalog.baseUrl } : {}) };
+}
+
+const ANTHROPIC_RUNTIME_SENTINEL_MARKER = Symbol.for("qlb-pi.anthropicRuntimeSentinel");
+
+type RuntimeApiKeyCall = () => void | Promise<void>;
+
+/** RuntimeCredentials returns void; ModelRuntime returns a Promise. */
+function callRuntimeApiKey(fn: RuntimeApiKeyCall | undefined): boolean {
+  try {
+    if (!fn) return false;
+    const result = fn();
+    if (result && typeof result.then === "function") result.then(undefined, () => undefined);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function setRuntimeAnthropicSentinel(ctx: unknown): void {
+  // RuntimeCredentials has no value reader (only hasRuntimeApiKey), so retain
+  // process ownership across jiti reloads instead of inspecting its private map.
+  const runtime = (ctx as { modelRegistry?: { runtime?: { setRuntimeApiKey?: (provider: string, key: string) => void | Promise<void> } } }).modelRegistry?.runtime;
+  const setRuntimeApiKey = runtime?.setRuntimeApiKey;
+  if (callRuntimeApiKey(setRuntimeApiKey
+    ? () => setRuntimeApiKey.call(runtime, "anthropic", QLB_RUNTIME_AUTH_SENTINEL)
+    : undefined)) {
+    (globalThis as Record<PropertyKey, unknown>)[ANTHROPIC_RUNTIME_SENTINEL_MARKER] = true;
+  }
+}
+
+function removeRuntimeAnthropicSentinel(ctx: unknown): void {
+  const marker = globalThis as Record<PropertyKey, unknown>;
+  if (marker[ANTHROPIC_RUNTIME_SENTINEL_MARKER] !== true) return;
+  const runtime = (ctx as { modelRegistry?: { runtime?: { removeRuntimeApiKey?: (provider: string) => void | Promise<void> } } }).modelRegistry?.runtime;
+  const removeRuntimeApiKey = runtime?.removeRuntimeApiKey;
+  callRuntimeApiKey(removeRuntimeApiKey ? () => removeRuntimeApiKey.call(runtime, "anthropic") : undefined);
+  delete marker[ANTHROPIC_RUNTIME_SENTINEL_MARKER];
+}
+
+interface BuiltinAnthropicStreams {
+  stream: Builtin;
+  streamSimple: Builtin;
+}
+
 async function resolveBuiltinAnthropicStreamSimple(): Promise<StreamSimple> {
   // `as unknown as`: Pi's compat types evolve (0.87 narrowed Context → TranscriptContext); we
   // only rely on the runtime shape, which is verified right below and by `qlb doctor` (pi:typecheck).
@@ -290,6 +349,19 @@ async function resolveBuiltinAnthropicStreamSimple(): Promise<StreamSimple> {
     );
   }
   return streamSimple;
+}
+
+async function resolveBuiltinAnthropicStreams(): Promise<BuiltinAnthropicStreams> {
+  const namespace = (await import("@earendil-works/pi-ai/compat")) as unknown as {
+    anthropicMessagesApi?: () => { stream?: Builtin; streamSimple?: Builtin };
+  };
+  const api = namespace.anthropicMessagesApi?.();
+  if (typeof api?.stream !== "function" || typeof api.streamSimple !== "function") {
+    throw new Error(
+      "qlb-pi: @earendil-works/pi-ai/compat exported no anthropicMessagesApi stream/streamSimple",
+    );
+  }
+  return { stream: api.stream, streamSimple: api.streamSimple };
 }
 
 /** Install xAI only after its owner entry exists; a compat failure still replaces native auth. */
@@ -345,7 +417,7 @@ async function registerOwnedOpenAICodexProvider(pi: ExtensionAPI): Promise<void>
 }
 
 export default async function (pi: ExtensionAPI): Promise<void> {
-  registerKimiCodingProvider(pi as unknown as ProviderApi, {
+  registerKimiCodingProvider(pi as unknown as Parameters<typeof registerKimiCodingProvider>[0], {
     createStream: () => createAssistantMessageEventStream() as unknown as { push(event: unknown): void; end(): void },
   });
   // Each v2 provider decides ownership independently; OpenRouter must be
@@ -367,6 +439,16 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       }
     }
   }
+
+  // ExtensionAPI exposes ModelRegistry only in lifecycle contexts. Register
+  // cleanup before evaluating the mode so a reload into inert cannot retain a
+  // sentinel the prior active extension installed.
+  pi.on("session_start", (_event, ctx) => {
+    removeRuntimeAnthropicSentinel(ctx);
+  });
+  pi.on("session_shutdown", (_event, ctx) => {
+    removeRuntimeAnthropicSentinel(ctx);
+  });
 
   const rehearsal = process.env.QLB_PI_REHEARSAL;
   const base =
@@ -410,12 +492,22 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   const providerApi = pi as unknown as ProviderApi;
   if (mode === "conflict") {
     // Fail closed before any credential read: no other provider may serve Anthropic.
+    // Retain only the built-in catalog; failure to load it still registers a
+    // complete QLB-auth provider rather than merging native OAuth.
+    let catalog: BuiltinAnthropicCatalog | undefined;
+    try {
+      catalog = await resolveBuiltinAnthropicCatalog();
+    } catch (err) {
+      console.error("[qlb-pi] could not resolve builtin anthropic catalog:", err);
+    }
     registerConflictProvider(
       providerApi,
       () => createAssistantMessageEventStream() as never,
       conflictMessage(modeInput!),
+      catalog,
     );
     pi.on("session_start", (_event, ctx) => {
+      setRuntimeAnthropicSentinel(ctx);
       ctx.ui.setStatus("qlb", "qlb-pi CONFLICT");
     });
     return;
@@ -426,6 +518,9 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   let footerExpanded = false;
   let requestFooterRender: (() => void) | null = null;
   let builtin: StreamSimple;
+  let consumeBuiltin: Builtin;
+  let consumeStream: Builtin | undefined;
+  let catalog: BuiltinAnthropicCatalog | undefined;
 
   const toggleFooterExpand = () => {
     try {
@@ -438,24 +533,29 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   pi.on("model_select", (event) => {
     footerModelId = event.model.id;
   });
-  try {
-    builtin = await resolveBuiltinAnthropicStreamSimple();
-  } catch (err) {
-    console.error("[qlb-pi] could not resolve builtin anthropic transport:", err);
-    if (mode === "consume") {
+  if (mode === "consume") {
+    try {
+      const streams = await resolveBuiltinAnthropicStreams();
+      consumeBuiltin = streams.streamSimple;
+      consumeStream = streams.stream;
+      catalog = await resolveBuiltinAnthropicCatalog();
+    } catch (err) {
+      console.error("[qlb-pi] could not resolve builtin anthropic transport/catalog:", err);
       // Do not fall back to anthropic-pool (it refreshes its own copies).
       registerConflictProvider(
         providerApi,
         () => createAssistantMessageEventStream() as never,
-        "qlb-pi could not load Pi's Anthropic transport; cswap consume is unavailable",
+        "qlb-pi could not load Pi's Anthropic transport/catalog; cswap consume is unavailable",
       );
+      pi.on("session_start", (_event, ctx) => {
+        setRuntimeAnthropicSentinel(ctx);
+      });
+      return;
     }
-    return;
-  }
-
-  if (mode === "consume") {
-    registerConsumeProvider(providerApi, builtin as unknown as Builtin, {
+    registerConsumeProvider(providerApi, consumeBuiltin, {
       createStream: () => createAssistantMessageEventStream() as never,
+      models: catalog?.models,
+      baseUrl: catalog?.baseUrl,
       consumeJournal: () => qlbConsumeJournal(5_000),
       ownerState: () => readOwnerFileState(OWNER_FILE),
       readAccess: () => readActiveClaudeAccess(),
@@ -464,8 +564,17 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       onDecision: (decision) => {
         lastDecision = decision;
       },
+    }, consumeStream);
+    pi.on("session_start", (_event, ctx) => {
+      setRuntimeAnthropicSentinel(ctx);
     });
   } else {
+    try {
+      builtin = await resolveBuiltinAnthropicStreamSimple();
+    } catch (err) {
+      console.error("[qlb-pi] could not resolve builtin anthropic transport:", err);
+      return;
+    }
     const source = createAnthropicSource({
       runGate: async (provider) => {
         const result = await runQlb(

@@ -34,12 +34,14 @@ import {
 import {
   registerConflictProvider,
   registerConsumeProvider,
+  type AnthropicNativeProvider,
   type Builtin,
   type ConsumeDeps,
   type EventSink,
   type ModelLike,
   type ProviderApi,
 } from '../extensions/qlb-pi/consume-provider';
+import { QLB_RUNTIME_AUTH_SENTINEL } from '../extensions/qlb-pi/providers/openai-codex';
 
 const FUTURE = 4102444800000;
 const REFRESH_SENTINEL = 'REFRESH-SENTINEL-must-never-leak';
@@ -304,21 +306,23 @@ function sink(): Sink {
   return s;
 }
 
-type StreamSimple = (model: ModelLike, context: unknown, options?: Record<string, unknown>) => unknown;
-
-function fakePi(): ProviderApi & { providers: Map<string, StreamSimple>; poolCalls: () => number } {
+function fakePi(): ProviderApi & { providers: Map<string, AnthropicNativeProvider>; poolCalls: () => number } {
   let poolCalls = 0;
-  const providers = new Map<string, StreamSimple>();
+  const providers = new Map<string, AnthropicNativeProvider>();
   // Pre-existing provider (anthropic-pool): any call through it is a fail-open defect.
-  providers.set('anthropic', () => {
-    poolCalls += 1;
-    return sink();
+  providers.set('anthropic', {
+    id: 'anthropic', name: 'anthropic-pool', auth: { apiKey: {
+      name: 'pool', async check() { return { type: 'api_key', source: 'pool' }; },
+      async resolve() { return { auth: { apiKey: 'pool' }, source: 'pool' }; },
+    } }, getModels: () => [],
+    stream: () => { poolCalls += 1; return sink(); },
+    streamSimple: () => { poolCalls += 1; return sink(); },
   });
   return {
     providers,
     poolCalls: () => poolCalls,
     unregisterProvider: (name) => { providers.delete(name); },
-    registerProvider: (name, config) => { providers.set(name, config.streamSimple); },
+    registerProvider: (provider) => { providers.set(provider.id, provider); },
   };
 }
 
@@ -353,7 +357,7 @@ function fakeBuiltin(reject: Set<string>): { builtin: Builtin; keys: string[]; p
 }
 
 async function run(pi: ReturnType<typeof fakePi>): Promise<Sink> {
-  const stream = pi.providers.get('anthropic')!(MODEL, {}, {}) as Sink;
+  const stream = pi.providers.get('anthropic')!.streamSimple(MODEL, {}, {}) as Sink;
   for (let i = 0; i < 200 && !stream.ended; i++) await delay(5);
   assert.ok(stream.ended, 'stream must end');
   return stream;
@@ -379,6 +383,56 @@ function deps(over: Partial<ConsumeDeps> & { read: () => CswapActiveAccess }): {
 }
 
 describe('qlb-pi consume provider (fake Pi with pre-existing anthropic provider)', () => {
+  it('registers Anthropic with QLB-managed api-key auth and sends cswap access, never the sentinel', async () => {
+    const pi = fakePi();
+    const fake = fakeBuiltin(new Set());
+    const d = deps({ read: () => access('cswap-active-access') });
+    registerConsumeProvider(pi, fake.builtin, {
+      ...d.deps,
+      models: [MODEL],
+      baseUrl: 'https://anthropic.example.test',
+    });
+
+    const provider = pi.providers.get('anthropic')!;
+    assert.equal(provider.id, 'anthropic');
+    assert.equal(provider.baseUrl, 'https://anthropic.example.test');
+    assert.deepEqual(provider.getModels(), [MODEL]);
+    assert.equal(provider.auth.apiKey.name, 'QLB consume');
+    assert.equal('oauth' in provider.auth, false);
+    assert.deepEqual(await provider.auth.apiKey.resolve(), {
+      auth: { apiKey: QLB_RUNTIME_AUTH_SENTINEL }, source: 'QLB consume',
+    });
+
+    await run(pi);
+    assert.deepEqual(fake.keys, ['cswap-active-access']);
+    assert.equal(fake.keys.includes(QLB_RUNTIME_AUTH_SENTINEL), false);
+  });
+
+  it('delegates stream API options to the full builtin transport, not streamSimple', async () => {
+    const pi = fakePi();
+    let simpleCalls = 0;
+    let streamCalls = 0;
+    let streamOptions: Record<string, unknown> | undefined;
+    const simple: Builtin = () => {
+      simpleCalls += 1;
+      return (async function* () { yield { type: 'done' }; })();
+    };
+    const full: Builtin = (_model, _context, options) => {
+      streamCalls += 1;
+      streamOptions = options;
+      return (async function* () { yield { type: 'done' }; })();
+    };
+    registerConsumeProvider(pi, simple, deps({ read: () => access('cswap-active-access') }).deps, full);
+
+    const output = pi.providers.get('anthropic')!.stream(MODEL, {}, { thinkingEnabled: true }) as Sink;
+    for (let i = 0; i < 200 && !output.ended; i++) await delay(5);
+    assert.ok(output.ended, 'stream must end');
+    assert.equal(streamCalls, 1);
+    assert.equal(simpleCalls, 0);
+    assert.equal(streamOptions?.thinkingEnabled, true);
+    assert.equal(streamOptions?.apiKey, 'cswap-active-access');
+  });
+
   it('401 with rotated credential: two reads, retry with B, recovered 401 hidden, pool never used', async () => {
     const pi = fakePi();
     const seq = sequence(['A', 'B']);
@@ -468,13 +522,37 @@ describe('qlb-pi consume provider (fake Pi with pre-existing anthropic provider)
     assert.match(text, /cswap-active request failed/);
   });
 
-  it('conflict provider replaces the pre-existing provider and only returns the error', async () => {
+  it('conflict provider registers QLB-managed auth and never resolves stored OAuth', async () => {
     const pi = fakePi();
-    registerConflictProvider(pi, sink);
+    registerConflictProvider(pi, sink, CONSUME_ERRORS.conflict, {
+      models: [MODEL], baseUrl: 'https://anthropic.example.test',
+    });
+    const provider = pi.providers.get('anthropic')!;
+    assert.equal(provider.baseUrl, 'https://anthropic.example.test');
+    assert.deepEqual(provider.getModels(), [MODEL]);
+    assert.equal('oauth' in provider.auth, false);
+    assert.deepEqual(await provider.auth.apiKey.check(), { type: 'api_key', source: 'QLB consume' });
+    assert.deepEqual(await provider.auth.apiKey.resolve(), {
+      auth: { apiKey: QLB_RUNTIME_AUTH_SENTINEL }, source: 'QLB consume',
+    });
     const out = await run(pi);
     assert.equal(pi.poolCalls(), 0);
     assert.equal(out.events.length, 1);
     assert.equal((out.events[0] as { error: { errorMessage: string } }).error.errorMessage, CONSUME_ERRORS.conflict);
+  });
+
+  it('a missing Anthropic catalog fails closed without native auth', async () => {
+    const pi = fakePi();
+    registerConflictProvider(pi, sink, 'catalog unavailable');
+    const provider = pi.providers.get('anthropic')!;
+    assert.deepEqual(provider.getModels(), []);
+    assert.equal(provider.baseUrl, undefined);
+    assert.equal('oauth' in provider.auth, false);
+    assert.deepEqual(await provider.auth.apiKey.resolve(), {
+      auth: { apiKey: QLB_RUNTIME_AUTH_SENTINEL }, source: 'QLB consume',
+    });
+    const out = await run(pi);
+    assert.equal((out.events[0] as { error: { errorMessage: string } }).error.errorMessage, 'catalog unavailable');
   });
 });
 
