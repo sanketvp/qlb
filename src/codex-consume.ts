@@ -1,6 +1,12 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
+import { dirname, join } from 'node:path';
 
+import {
+  ProperLockfileCompromised,
+  type HeldProperLockfile,
+  withProperLockfile,
+} from './cc-locks';
 import {
   applyRefresh,
   buildRefreshRequest,
@@ -16,6 +22,62 @@ import type { CodexSlots } from './codex-slots';
 import type { Store } from './store';
 
 const PROVIDER = 'openai-codex';
+
+/** Codex consume/switch locks survive a stalled synchronous authority write for five minutes. */
+export const CODEX_SWITCH_LOCK_STALE_MS = 300_000;
+
+export interface CodexLockPaths {
+  consume: string;
+  switch: string;
+}
+
+/** Shared C10/C6 lock locations. The consume lock must always precede switch. */
+export function codexLockPaths(dbPath: string, id: string): CodexLockPaths {
+  const locks = join(dirname(dbPath), 'locks');
+  return {
+    consume: join(locks, `consume-openai-codex-${encodeURIComponent(id)}.lock`),
+    switch: join(locks, 'switch-openai-codex.lock'),
+  };
+}
+
+export interface CodexSwitchLockOptions {
+  timeoutMs?: number;
+}
+
+async function withCodexOwnerTokenLock<T>(
+  lockPath: string,
+  fn: (held: HeldProperLockfile) => Promise<T> | T,
+  timeoutMs: number,
+): Promise<T> {
+  let compromised: ProperLockfileCompromised | undefined;
+  const result = await withProperLockfile(lockPath, {
+    timeoutMs,
+    stalenessMs: CODEX_SWITCH_LOCK_STALE_MS,
+    onCompromised: (error) => { compromised ??= error; },
+  }, (properLock) => fn(properLock));
+  if (compromised) throw compromised;
+  return result;
+}
+
+/** Serialize all Codex switch/recovery work under its owner-token lock. */
+export async function withCodexSwitchLock<T>(
+  dbPath: string,
+  fn: (held: HeldProperLockfile) => Promise<T> | T,
+  { timeoutMs = 10_000 }: CodexSwitchLockOptions = {},
+): Promise<T> {
+  return withCodexOwnerTokenLock(codexLockPaths(dbPath, '').switch, fn, timeoutMs);
+}
+
+/** Hold a Codex slot's consume lock, then the shared switch lock (I4). */
+export async function withCodexConsumeThenSwitchLocks<T>(
+  dbPath: string,
+  id: string,
+  fn: (heldConsume: HeldProperLockfile, heldSwitch: HeldProperLockfile) => Promise<T> | T,
+): Promise<T> {
+  const paths = codexLockPaths(dbPath, id);
+  return withCodexOwnerTokenLock(paths.consume, (heldConsume) =>
+    withCodexOwnerTokenLock(paths.switch, (heldSwitch) => fn(heldConsume, heldSwitch), 10_000), 10_000);
+}
 
 type SqlStore = Pick<Store, 'dbPath'>;
 type StashedSuccessor = { stashId: string; document: CodexAuthDocument; consumedFp: string };

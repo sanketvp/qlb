@@ -1,11 +1,18 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { describe, it } from 'node:test';
 
-import { consumeCodexSlot } from '../src/codex-consume';
+import {
+  CODEX_SWITCH_LOCK_STALE_MS,
+  codexLockPaths,
+  consumeCodexSlot,
+  withCodexConsumeThenSwitchLocks,
+  withCodexSwitchLock,
+} from '../src/codex-consume';
+import { ClaudeCodeLockTimeout } from '../src/cc-locks';
 import { runCodexRefreshCommand } from '../src/commands/codex-refresh';
 import { codexFingerprint, type CodexAuthDocument } from '../src/codex-auth';
 import type { CodexProcess } from '../src/codex-sessions';
@@ -46,6 +53,8 @@ function slots(initial: CodexAuthDocument) {
 
 const holder: CodexProcess = { pid: 741, lstart: 'Fri Oct 24 12:00:00 2026', host: 'codex' };
 
+const ownerToken = /^\.qlb-owner-\d+-[0-9a-f]+$/;
+
 function managedFixture() {
   const home = mkdtempSync(join(tmpdir(), 'qlb-codex-consume-'));
   const store = openStore(join(home, 'qlb.db'));
@@ -57,6 +66,93 @@ function managedFixture() {
     slots: new CodexSlots({ keychain, stashDir: join(home, 'unclaimed'), now: () => 1 }),
   };
 }
+
+describe('Codex consume lock helpers — C6-2', () => {
+  it('codexLockPaths encodes the slot id and matches the codex refresh lock paths', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-codex-lock-paths-'));
+    const dbPath = join(home, 'state', 'qlb.db');
+    const accountId = 'user:a/account';
+    const paths = codexLockPaths(dbPath, accountId);
+    try {
+      assert.deepEqual(paths, {
+        consume: join(dirname(dbPath), 'locks', 'consume-openai-codex-user%3Aa%2Faccount.lock'),
+        switch: join(dirname(dbPath), 'locks', 'switch-openai-codex.lock'),
+      });
+      await withCodexConsumeThenSwitchLocks(dbPath, accountId, async () => {
+        assert.equal(existsSync(paths.consume), true);
+        assert.equal(existsSync(paths.switch), true);
+      });
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('codex refresh takes consume then switch with owner tokens (lock-order spy)', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-codex-lock-order-'));
+    const dbPath = join(home, 'qlb.db');
+    const paths = codexLockPaths(dbPath, 'user:account');
+    const fsPromises = require('node:fs/promises') as Record<string, (...args: any[]) => Promise<any>>;
+    const originalMkdir = fsPromises.mkdir;
+    const acquired: string[] = [];
+    try {
+      fsPromises.mkdir = async (...args: any[]) => {
+        if (args[0] === paths.consume || args[0] === paths.switch) acquired.push(args[0]);
+        return originalMkdir(...args);
+      };
+      await withCodexConsumeThenSwitchLocks(dbPath, 'user:account', async () => {
+        assert.ok(readdirSync(paths.consume).some((entry) => ownerToken.test(entry)));
+        assert.ok(readdirSync(paths.switch).some((entry) => ownerToken.test(entry)));
+      });
+      assert.deepEqual(acquired, [paths.consume, paths.switch]);
+    } finally {
+      fsPromises.mkdir = originalMkdir;
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('a switch lock younger than five minutes is not taken over', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-codex-lock-stale-'));
+    const dbPath = join(home, 'qlb.db');
+    const { switch: lock } = codexLockPaths(dbPath, 'user:account');
+    try {
+      mkdirSync(lock, { recursive: true });
+      const fourMinutesAgo = new Date(Date.now() - 4 * 60_000);
+      utimesSync(lock, fourMinutesAgo, fourMinutesAgo);
+      await assert.rejects(
+        withCodexSwitchLock(dbPath, async () => assert.fail('a young lock must not be acquired'), { timeoutMs: 20 }),
+        ClaudeCodeLockTimeout,
+      );
+      assert.equal(existsSync(lock), true);
+
+      const sixMinutesAgo = new Date(Date.now() - CODEX_SWITCH_LOCK_STALE_MS - 60_000);
+      utimesSync(lock, sixMinutesAgo, sixMinutesAgo);
+      await withCodexSwitchLock(dbPath, async () => {
+        assert.ok(readdirSync(lock).some((entry) => ownerToken.test(entry)));
+      }, { timeoutMs: 1_000 });
+      assert.equal(existsSync(lock), false);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("releasing a lock that was taken over leaves the new owner's lock directory", async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-codex-lock-release-'));
+    const dbPath = join(home, 'qlb.db');
+    const { switch: lock } = codexLockPaths(dbPath, 'user:account');
+    const replacementToken = '.qlb-owner-999-deadbeef';
+    try {
+      await assert.rejects(withCodexSwitchLock(dbPath, async () => {
+        rmSync(lock, { recursive: true, force: true });
+        mkdirSync(lock);
+        writeFileSync(join(lock, replacementToken), '', { flag: 'wx', mode: 0o600 });
+      }), /Lock ownership was lost/);
+      assert.equal(existsSync(lock), true);
+      assert.deepEqual(readdirSync(lock), [replacementToken]);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+});
 
 describe('Codex consume gate — AC34', () => {
   it('does not POST when an S12 holder may renew the inactive slot', async () => {
