@@ -1391,13 +1391,26 @@ export class Migration {
   private rollbackUnlocked(): MigrationStatus {
     this.assertNotP7aOwned();
     this.assertNoUnreadableOwnershipClaim();
+    const current = this.status();
+    const handback = current.detail.handback;
+    const facts = this.ownershipFacts();
+    // C3 precedes C4: a completed hand-back is terminal except for its
+    // idempotent cleanup record, which is shared with resume.
+    if (facts.handbackPending && isObjectRecord(handback)) {
+      return this.finishCleanupPendingHandback(handback);
+    }
+    // C4 continues the already-journaled rollback directly. In particular,
+    // do not re-journal intent through postCommitRollback or re-rank a
+    // recorded decision.
+    if (facts.rollbackInProgress) {
+      return this.continueRollback();
+    }
     // C5: a VALIDATED journal with this path's own commit evidence (`Gen`) is
     // a crash after the commit point. Finish the forward journal transition,
-    // then take the ordinary post-commit hand-back path. C4 comes first: a
-    // journaled rollback keeps its intent. The pool path is not classified.
+    // then take the ordinary post-commit hand-back path. The pool path is not
+    // classified.
     if (this.kind !== 'pool' && this.journalState() === 'VALIDATED') {
-      const facts = this.ownershipFacts();
-      if (facts.committed && !facts.rollbackInProgress) this.finishHygiene();
+      if (facts.committed) this.finishHygiene();
     }
     this.assertNoOrphanOwnershipClaim();
     const ownerPresent = this.claimPresent();
