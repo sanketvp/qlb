@@ -259,6 +259,7 @@ describe('Codex restore baseline', () => {
         f.db.prepare(`INSERT INTO config (key, value) VALUES ('codex.rekey.backupPath', 'backup.sqlite')`).run();
         recordRestoreBaseline(f.db, { saveKind: 'add', backupPath: 'backup.sqlite', keychain: new ReadFailingMockKeychain() });
       }), /injected Keychain read failure/);
+      assert.equal(f.db.prepare(`SELECT value FROM config WHERE key = 'codex.rekey.backupPath'`).get(), undefined);
       assert.equal(f.db.prepare(`SELECT value FROM config WHERE key = 'codex.rekey.baseline'`).get(), undefined);
     } finally { f.close(); }
   });
