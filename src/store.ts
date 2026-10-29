@@ -1035,7 +1035,7 @@ function latestExistingBackupPath(dbPath: string): string {
   return candidates[0]?.path ?? 'none taken';
 }
 
-function backupBeforeMigrateSync(dbPath: string, source: DatabaseSync): string {
+export function backupBeforeMigrateSync(dbPath: string, source: DatabaseSync): string {
   const backupPath = join(dirname(dbPath), 'backups', `db-${Date.now()}-${process.pid}.sqlite`);
   mkdirSync(dirname(backupPath), { recursive: true, mode: 0o700 });
   const script = `

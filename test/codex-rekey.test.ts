@@ -1,21 +1,22 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync } from 'node:fs';
+import { existsSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { describe, it } from 'node:test';
 
 import { observationConfigKey } from '../src/candidates';
-import { applyCodexRekey, ensureCodexSlotAccount, planCodexRekey } from '../src/codex-rekey';
+import { applyCodexRekey, ensureCodexSlotAccount, planCodexRekey, rekeyCodexAccounts } from '../src/codex-rekey';
 import { platformKeychain, type KeychainBackend } from '../src/keychain';
 import { failoverConfigKey } from '../src/overrides';
 import { openStore, refreshLeaseName } from '../src/store';
 
-function fixture(): { db: DatabaseSync; close: () => void } {
+function fixture(): { db: DatabaseSync; path: string; close: () => void } {
   const path = join(mkdtempSync(join(tmpdir(), 'qlb-codex-rekey-')), 'qlb.db');
   const store = openStore(path);
   return {
     db: (store as unknown as { db: DatabaseSync }).db,
+    path,
     close: () => store.close(),
   };
 }
@@ -595,6 +596,7 @@ describe('Codex rekey apply', () => {
     const f = fixture();
     try {
       assert.throws(() => applyCodexRekey(f.db, { moves: [], skipped: [] }, { now: 100 }), /rekey-needs-transaction/);
+      assert.throws(() => rekeyCodexAccounts(f.db, { dbPath: f.path, now: 100 }), /rekey-needs-transaction/);
     } finally { f.close(); }
   });
 
@@ -1026,6 +1028,104 @@ describe('Codex rekey apply', () => {
           VALUES ('bare', 'late', 2)`).run(),
       })), /rekey-dependents-remain/);
       assert.equal(everyTableState(f.db), before);
+    } finally { f.close(); }
+  });
+});
+
+describe('Codex rekey backup wrapper', () => {
+  it('the first run with a move takes one verified backup and records its path', () => {
+    const f = fixture();
+    try {
+      slot(f.db, 'user:bare', 'bare');
+      account(f.db, 'bare', 'openai-codex');
+      const summary = inTransaction(f.db, () => rekeyCodexAccounts(f.db, { dbPath: f.path, now: 100 }));
+      assert.equal(summary.backupMissing, false);
+      assert.ok(summary.backupTaken);
+      assert.equal(existsSync(summary.backupTaken), true);
+      assert.equal((f.db.prepare('SELECT value FROM config WHERE key = ?').get('codex.rekey.backupPath') as { value: string }).value, summary.backupTaken);
+      const copy = new DatabaseSync(summary.backupTaken, { readOnly: true });
+      try {
+        assert.equal(copy.prepare("SELECT 1 FROM accounts WHERE id = 'bare'").get() !== undefined, true);
+        assert.equal(copy.prepare("SELECT 1 FROM accounts WHERE id = 'user:bare'").get(), undefined);
+      } finally { copy.close(); }
+    } finally { f.close(); }
+  });
+
+  it('the backup includes rows committed by another connection but not checkpointed (wal_autocheckpoint=0)', () => {
+    const f = fixture();
+    const other = new DatabaseSync(f.path);
+    try {
+      slot(f.db, 'user:bare', 'bare');
+      account(f.db, 'bare', 'openai-codex');
+      other.exec('PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0');
+      other.prepare("INSERT INTO config (key, value) VALUES ('other-committed', 'yes')").run();
+      const summary = inTransaction(f.db, () => rekeyCodexAccounts(f.db, { dbPath: f.path, now: 100 }));
+      assert.ok(summary.backupTaken);
+      const copy = new DatabaseSync(summary.backupTaken, { readOnly: true });
+      try {
+        assert.equal((copy.prepare("SELECT value FROM config WHERE key = 'other-committed'").get() as { value: string }).value, 'yes');
+      } finally { copy.close(); }
+    } finally {
+      other.close();
+      f.close();
+    }
+  });
+
+  it('a run after an earlier uncommitted write fails closed with backup verification failed', () => {
+    const f = fixture();
+    try {
+      slot(f.db, 'user:bare', 'bare');
+      account(f.db, 'bare', 'openai-codex');
+      assert.throws(() => inTransaction(f.db, () => {
+        f.db.prepare("INSERT INTO config (key, value) VALUES ('earlier-write', 'uncommitted')").run();
+        rekeyCodexAccounts(f.db, { dbPath: f.path, now: 100 });
+      }), /backup verification failed/);
+      assert.equal(f.db.prepare("SELECT 1 FROM config WHERE key = 'earlier-write'").get(), undefined);
+      assert.equal(f.db.prepare("SELECT 1 FROM accounts WHERE id = 'bare'").get() !== undefined, true);
+    } finally { f.close(); }
+  });
+
+  it('a failing backup aborts with nothing written', () => {
+    const f = fixture();
+    try {
+      slot(f.db, 'user:bare', 'bare');
+      account(f.db, 'bare', 'openai-codex');
+      const before = everyTableState(f.db);
+      assert.throws(() => inTransaction(f.db, () => rekeyCodexAccounts(f.db, {
+        dbPath: f.path,
+        now: 100,
+        backup: () => { throw new Error('backup failed'); },
+      })), /backup failed/);
+      assert.equal(everyTableState(f.db), before);
+    } finally { f.close(); }
+  });
+
+  it('a no-move run and a later run take no backup', () => {
+    const f = fixture();
+    try {
+      let calls = 0;
+      const backup = () => { calls += 1; return join(f.path, 'unexpected.sqlite'); };
+      inTransaction(f.db, () => rekeyCodexAccounts(f.db, { dbPath: f.path, now: 100, backup }));
+      inTransaction(f.db, () => rekeyCodexAccounts(f.db, { dbPath: f.path, now: 101, backup }));
+      assert.equal(calls, 0);
+    } finally { f.close(); }
+  });
+
+  it('a recorded backup path whose file is gone ⇒ backupMissing true and no new copy', () => {
+    const f = fixture();
+    try {
+      slot(f.db, 'user:bare', 'bare');
+      account(f.db, 'bare', 'openai-codex');
+      f.db.prepare('INSERT INTO config (key, value) VALUES (?, ?)').run('codex.rekey.backupPath', join(f.path, 'gone.sqlite'));
+      let calls = 0;
+      const summary = inTransaction(f.db, () => rekeyCodexAccounts(f.db, {
+        dbPath: f.path,
+        now: 100,
+        backup: () => { calls += 1; return join(f.path, 'unexpected.sqlite'); },
+      }));
+      assert.equal(summary.backupTaken, undefined);
+      assert.equal(summary.backupMissing, true);
+      assert.equal(calls, 0);
     } finally { f.close(); }
   });
 });
