@@ -42,9 +42,10 @@ export interface CodexImportActiveCommandDeps {
   keychain?: KeychainBackend;
 }
 
-function withDatabase<T>(store: Pick<Store, 'dbPath'>, fn: (db: DatabaseSync) => T): T {
+/** Read-only view of the store for the admission pre-check, which must write nothing. */
+function withReadOnlyDatabase<T>(store: Pick<Store, 'dbPath'>, fn: (db: DatabaseSync) => T): T {
   if (store.dbPath === ':memory:') return fn((store as unknown as { db: DatabaseSync }).db);
-  const db = new DatabaseSync(store.dbPath);
+  const db = new DatabaseSync(store.dbPath, { readOnly: true });
   try {
     db.exec('PRAGMA busy_timeout = 5000');
     return fn(db);
@@ -57,7 +58,6 @@ const defaultDeps: CodexImportActiveCommandDeps = {
   readAuth: readCodexAuthStable,
   writeAuth: writeCodexAuthAtomic,
   withAuthLock: withCodexAuthLock,
-  keychain: platformKeychain,
 };
 
 export async function runCodexImportActiveCommand(
@@ -84,7 +84,8 @@ export async function runCodexImportActiveCommand(
     return 0;
   }
 
-  const keychain = deps.keychain ?? defaultDeps.keychain!;
+  // Read at call time so a swapped platformKeychain export still applies.
+  const keychain = deps.keychain ?? platformKeychain;
 
   // Keep the live read through active-login marking in one QLB-owned critical
   // section. In particular, the lock remains held after SQLite's re-validation
@@ -119,7 +120,7 @@ export async function runCodexImportActiveCommand(
         return 0;
       }
 
-      const preliminaryRefusal = withDatabase(store, (db) => codexAdmission(db, {
+      const preliminaryRefusal = withReadOnlyDatabase(store, (db) => codexAdmission(db, {
         slotId: plan.slotId,
         bareAccountId: plan.accountId,
       }));
