@@ -24,6 +24,7 @@ import { tmpdir } from 'node:os';
 import { delimiter, dirname, isAbsolute, join, resolve } from 'node:path';
 import type { DoctorCheck } from './diagnostics';
 import { qlbHomeDir } from './home';
+import { piSharedSrcDirFor } from './pi-deploy';
 import { findQlbRepoRoot } from './setup';
 
 const PI_PACKAGE_NAME = '@earendil-works/pi-coding-agent';
@@ -318,7 +319,23 @@ export function piIntegrationChecks(options: PiIntegrationOptions = {}): DoctorC
     return checks;
   }
   const PI_PKG = located.root;
-  if (!PI_PKG || !existsSync(PI_EXT_DIR)) {
+  if (!PI_PKG) {
+    checks.push({ name: 'pi:extension', level: 'PASS', message: 'Pi or the qlb-pi extension is not installed; skipping Pi checks' });
+    return checks;
+  }
+  let sharedSrcDir: string;
+  try {
+    sharedSrcDir = piSharedSrcDirFor(PI_EXT_DIR);
+  } catch (err) {
+    checks.push({
+      name: 'pi:extension',
+      level: 'WARN',
+      message: `installed qlb-pi shared sources are unavailable: ${err instanceof Error ? err.message : String(err)}`,
+      detail: { fix: 'qlb pi deploy' },
+    });
+    return checks;
+  }
+  if (!existsSync(PI_EXT_DIR)) {
     checks.push({ name: 'pi:extension', level: 'PASS', message: 'Pi or the qlb-pi extension is not installed; skipping Pi checks' });
     return checks;
   }
@@ -337,8 +354,8 @@ export function piIntegrationChecks(options: PiIntegrationOptions = {}): DoctorC
   const repoRoot = findQlbRepoRoot();
   if (repoRoot) {
     const src = join(repoRoot, 'extensions', 'qlb-pi');
-    const installedRedact = join(PI_EXT_DIR, '..', '..', 'src', 'redact.ts');
-    const installedOwnerDocument = join(PI_EXT_DIR, '..', '..', 'src', 'pi-owner-document.ts');
+    const installedRedact = join(sharedSrcDir, 'redact.ts');
+    const installedOwnerDocument = join(sharedSrcDir, 'pi-owner-document.ts');
     const sourceFiles = extensionTypeScriptFiles(src);
     const installedFiles = extensionTypeScriptFiles(PI_EXT_DIR);
     const drift = [

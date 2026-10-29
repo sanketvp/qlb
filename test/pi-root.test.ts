@@ -5,6 +5,7 @@ import { join, relative } from 'node:path';
 import { after, describe, it } from 'node:test';
 
 import { locatePi, piIntegrationChecks, piTypecheckConfig, resolvePiPackageRoot } from '../src/pi-integration';
+import { deployPiExtension } from '../src/pi-deploy';
 
 const temps: string[] = [];
 after(() => {
@@ -236,6 +237,51 @@ describe('pi:extension copied-layout drift check', () => {
       readFileSync(join(__dirname, '..', '..', 'src', 'pi-owner-document.ts')));
     check = extensionCheck();
     assert.equal(check.level, 'PASS');
+  });
+
+  it('WARNs instead of throwing when shared sources cannot be resolved', () => {
+    const base = tmp('qlb-pi-extension-loop-');
+    const agentDir = join(base, 'agent');
+    mkdirSync(agentDir, { recursive: true });
+    symlinkSync('extensions', join(agentDir, 'extensions'));
+    const pi = fakePiPackage(join(base, 'pi'), '1.0.1');
+
+    const check = piIntegrationChecks({
+      pi: { root: pi }, extensionDir: join(agentDir, 'extensions', 'qlb-pi'),
+    }).find((candidate) => candidate.name === 'pi:extension')!;
+    assert.equal(check.level, 'WARN');
+    assert.match(check.message, /ELOOP/);
+  });
+
+  it('passes after deploy through symlinked extensions and reports edited real-path sources', () => {
+    const base = tmp('qlb-pi-extension-symlink-');
+    const home = join(base, 'home');
+    const agentDir = join(home, '.pi', 'agent');
+    const vaultConfig = join(base, 'vault', 'pi-config');
+    const vaultExtensions = join(vaultConfig, 'extensions');
+    const appDir = join(home, 'app');
+    const release = join(appDir, 'release-fixture');
+    const sourceDir = join(__dirname, '..', '..', 'extensions', 'qlb-pi');
+    mkdirSync(vaultExtensions, { recursive: true });
+    mkdirSync(agentDir, { recursive: true });
+    symlinkSync(vaultExtensions, join(agentDir, 'extensions'));
+    cpSync(sourceDir, join(release, 'extensions', 'qlb-pi'), { recursive: true });
+    mkdirSync(join(release, 'src'), { recursive: true });
+    cpSync(join(__dirname, '..', '..', 'src', 'redact.ts'), join(release, 'src', 'redact.ts'));
+    cpSync(join(__dirname, '..', '..', 'src', 'pi-owner-document.ts'), join(release, 'src', 'pi-owner-document.ts'));
+    symlinkSync('release-fixture', join(appDir, 'current'));
+
+    deployPiExtension({ home, appDir, dbPath: join(home, 'qlb.db') });
+    const pi = fakePiPackage(join(base, 'pi'), '1.0.1');
+    const extensionCheck = () => piIntegrationChecks({
+      pi: { root: pi }, extensionDir: join(agentDir, 'extensions', 'qlb-pi'),
+    }).find((check) => check.name === 'pi:extension')!;
+
+    assert.equal(extensionCheck().level, 'PASS');
+    writeFileSync(join(vaultConfig, 'src', 'redact.ts'), 'changed\n');
+    const changed = extensionCheck();
+    assert.equal(changed.level, 'WARN');
+    assert.match(changed.message, /src\/redact\.ts/);
   });
 });
 

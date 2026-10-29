@@ -1,10 +1,10 @@
 import { existsSync, lstatSync, readdirSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
-import { dirname } from 'node:path';
+import { dirname, join } from 'node:path';
 
 import type { DoctorCheck } from '../diagnostics';
 import { qlbHomeDir } from '../home';
-import { piDeployPlan, piDeploymentDigest, piExtensionTarget, piOwnerDocumentTarget, piRedactTarget, piReleaseAppDir } from '../pi-deploy';
+import { piDeployPlan, piDeploymentDigest, piExtensionTarget, piReleaseAppDir, piSharedSrcDirFor } from '../pi-deploy';
 import { check } from './_check';
 
 export default check('pi:extension-drift');
@@ -44,10 +44,11 @@ export function piExtensionDriftCheck(options: PiExtensionDriftOptions): DoctorC
   } catch (err) {
     return { name: 'pi:extension-drift', level: 'WARN', message: `unknown: ${err instanceof Error ? err.message : String(err)}` };
   }
-  const target = piExtensionTarget(home);
-  const redactTarget = piRedactTarget(home);
-  const ownerDocumentTarget = piOwnerDocumentTarget(home);
   try {
+    const target = piExtensionTarget(home);
+    const sharedSrcDir = piSharedSrcDirFor(target);
+    const redactTarget = join(sharedSrcDir, 'redact.ts');
+    const ownerDocumentTarget = join(sharedSrcDir, 'pi-owner-document.ts');
     if (!lstatSync(target).isDirectory()) throw new Error('installed extension is not a directory');
     if (!lstatSync(redactTarget).isFile()) throw new Error('installed redact.ts is not a file');
     if (!lstatSync(ownerDocumentTarget).isFile()) throw new Error('installed pi-owner-document.ts is not a file');

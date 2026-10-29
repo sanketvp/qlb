@@ -80,10 +80,24 @@ describe('qlb pi deploy (P12)', () => {
     assert.equal(readFileSync(join(vaultSrc, 'redact.ts'), 'utf8'), 'export const redact = 1;\n');
     assert.equal(readFileSync(join(vaultSrc, 'pi-owner-document.ts'), 'utf8'), 'export const ownerDocument = 1;\n');
     assert.equal(existsSync(join(f.home, '.pi', 'agent', 'src')), false);
+    assert.equal(existsSync(join(root, 'vault', 'pi-config', '.qlb-pi-staging')), false);
     assert.equal(piExtensionDriftCheck({ home: f.home, appDir: f.appDir, dbPath: f.dbPath }).level, 'PASS');
 
     writeFileSync(join(vaultSrc, 'redact.ts'), 'export const redact = 1;\nchanged\n');
     assert.equal(piExtensionDriftCheck({ home: f.home, appDir: f.appDir, dbPath: f.dbPath }).level, 'FAIL');
+  });
+
+  it('returns FAIL instead of throwing when the extensions path cannot be resolved', () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-pi-drift-loop-'));
+    const f = fixture(root);
+    deployPiExtension({ home: f.home, appDir: f.appDir, dbPath: f.dbPath });
+    const extensions = join(f.home, '.pi', 'agent', 'extensions');
+    rmSync(extensions, { recursive: true });
+    symlinkSync('extensions', extensions);
+
+    const check = piExtensionDriftCheck({ home: f.home, appDir: f.appDir, dbPath: f.dbPath });
+    assert.equal(check.level, 'FAIL');
+    assert.match(check.message, /ELOOP/);
   });
 
   it('falls back to the unresolved agent src directory while extensions is missing', () => {

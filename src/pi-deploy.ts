@@ -38,15 +38,19 @@ export function piExtensionTarget(home: string): string {
   return join(home, '.pi', 'agent', 'extensions', 'qlb-pi');
 }
 
-/** Returns the shared-source directory adjacent to Pi's resolved extensions directory. */
-export function piSharedSrcDir(home: string): string {
-  const extensionsDir = join(home, '.pi', 'agent', 'extensions');
+/** Returns the shared-source directory adjacent to an extension's resolved extensions directory. */
+export function piSharedSrcDirFor(extensionDir: string): string {
+  const extensionsDir = dirname(extensionDir);
   try {
     return join(dirname(realpathSync(extensionsDir)), 'src');
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return join(dirname(extensionsDir), 'src');
     throw error;
   }
+}
+
+export function piSharedSrcDir(home: string): string {
+  return piSharedSrcDirFor(piExtensionTarget(home));
 }
 
 export function piRedactTarget(home: string): string {
@@ -123,7 +127,7 @@ function replaceDeployment(
   rename: typeof renameSync,
 ): void {
   const extensionParent = dirname(target);
-  const stagingRoot = join(dirname(dirname(redactTarget)), '.qlb-pi-staging');
+  const stagingRoot = join(dirname(dirname(target)), '.qlb-pi-staging');
   const nonce = `${process.pid}-${Date.now()}`;
   const staging = join(stagingRoot, `.qlb-pi-${nonce}.tmp`);
   const stagedRedact = join(stagingRoot, `.redact-${nonce}.tmp`);
@@ -189,14 +193,16 @@ export function deployPiExtension(options: PiDeployOptions): PiDeployResult {
   const releaseRoot = dirname(dirname(plan.source));
   const redactSource = join(releaseRoot, 'src', 'redact.ts');
   const ownerDocumentSource = join(releaseRoot, 'src', 'pi-owner-document.ts');
-  const home = options.home ?? qlbHomeDir();
+  const sharedSrcDir = piSharedSrcDirFor(plan.target);
+  const redactTarget = join(sharedSrcDir, 'redact.ts');
+  const ownerDocumentTarget = join(sharedSrcDir, 'pi-owner-document.ts');
   replaceDeployment(
     plan.source,
     redactSource,
     ownerDocumentSource,
     plan.target,
-    piRedactTarget(home),
-    piOwnerDocumentTarget(home),
+    redactTarget,
+    ownerDocumentTarget,
     options.rename ?? renameSync,
   );
   const deployedAt = Math.floor((options.now ?? Date.now)() / 1000);
