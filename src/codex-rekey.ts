@@ -181,6 +181,7 @@ export function planCodexRekey(db: DatabaseSync, options: PlanCodexRekeyOptions)
       skipped.set(candidate.id, 'ambiguous');
       continue;
     }
+    if (candidate.id === targets[0]) continue;
     candidatesWithTargets.push({ ...candidate, to: targets[0]! });
   }
 
@@ -254,12 +255,12 @@ function readRekeyAudit(db: DatabaseSync): Record<string, RekeyAuditEntry> {
 
 function moveSnapshots(db: DatabaseSync, from: string, to: string): void {
   const sourceRows = db.prepare('SELECT bucket, fetched_at FROM snapshots WHERE account_id = ?').all(from) as Array<{
-    bucket: string;
+    bucket: string | null;
     fetched_at: number | null;
   }>;
-  const findTarget = db.prepare('SELECT fetched_at FROM snapshots WHERE account_id = ? AND bucket = ?');
-  const moveSource = db.prepare('UPDATE snapshots SET account_id = ? WHERE account_id = ? AND bucket = ?');
-  const deleteSnapshot = db.prepare('DELETE FROM snapshots WHERE account_id = ? AND bucket = ?');
+  const findTarget = db.prepare('SELECT fetched_at FROM snapshots WHERE account_id = ? AND bucket IS ?');
+  const moveSource = db.prepare('UPDATE snapshots SET account_id = ? WHERE account_id = ? AND bucket IS ?');
+  const deleteSnapshot = db.prepare('DELETE FROM snapshots WHERE account_id = ? AND bucket IS ?');
 
   for (const source of sourceRows) {
     const target = findTarget.get(to, source.bucket) as { fetched_at: number | null } | undefined;
@@ -344,6 +345,7 @@ export function applyCodexRekey(
   options: ApplyCodexRekeyOptions,
 ): void {
   if (!db.isTransaction) throw new Error('rekey-needs-transaction');
+  if (plan.moves.some((move) => move.from === move.to)) throw new Error('rekey-self-move');
   if (plan.moves.length === 0) return;
 
   const audit = readRekeyAudit(db);

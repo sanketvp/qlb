@@ -373,6 +373,28 @@ describe('Codex rekey planner', () => {
     } finally { f.close(); }
   });
 
+  it('a slot already on its own id produces no move and changes nothing', () => {
+    const f = fixture();
+    try {
+      slot(f.db, 'bare', 'bare');
+      account(f.db, 'bare', 'openai-codex');
+      f.db.prepare("INSERT INTO snapshots (account_id, bucket, fetched_at) VALUES ('bare', 'primary', 1)").run();
+      f.db.prepare("INSERT INTO overrides (kind, account_id, session, until) VALUES ('pin', 'bare', 'fixture', 2)").run();
+      const before = JSON.stringify([
+        f.db.prepare('SELECT * FROM accounts ORDER BY id').all(),
+        f.db.prepare('SELECT * FROM snapshots ORDER BY account_id, bucket').all(),
+        f.db.prepare('SELECT * FROM overrides ORDER BY account_id, kind, session').all(),
+      ]);
+      assert.deepEqual(plan(f.db), { moves: [], skipped: [] });
+      applyPlan(f.db);
+      assert.equal(JSON.stringify([
+        f.db.prepare('SELECT * FROM accounts ORDER BY id').all(),
+        f.db.prepare('SELECT * FROM snapshots ORDER BY account_id, bucket').all(),
+        f.db.prepare('SELECT * FROM overrides ORDER BY account_id, kind, session').all(),
+      ]), before);
+    } finally { f.close(); }
+  });
+
   it('planning writes nothing (total_changes unchanged)', () => {
     const f = fixture();
     try {
@@ -607,6 +629,96 @@ describe('Codex rekey apply', () => {
       Object.assign(keychain, original);
       f.close();
     }
+  });
+
+  it('apply refuses a self-move', () => {
+    const f = fixture();
+    try {
+      account(f.db, 'bare', 'openai-codex');
+      f.db.prepare("INSERT INTO snapshots (account_id, bucket, fetched_at) VALUES ('bare', 'primary', 1)").run();
+      f.db.prepare("INSERT INTO overrides (kind, account_id, session, until) VALUES ('pin', 'bare', 'fixture', 2)").run();
+      const before = everyTableState(f.db);
+      assert.throws(() => inTransaction(f.db, () => applyCodexRekey(f.db, {
+        moves: [{ from: 'bare', to: 'bare', kind: 'merge' }],
+        skipped: [],
+      }, { now: 100 })), /rekey-self-move/);
+      assert.equal(everyTableState(f.db), before);
+    } finally { f.close(); }
+  });
+
+  it('a NULL-bucket snapshot moves on rename and clashes by the reading rule on merge', () => {
+    const rename = fixture();
+    try {
+      slot(rename.db, 'user:bare', 'bare');
+      account(rename.db, 'bare', 'openai-codex');
+      rename.db.prepare(`INSERT INTO snapshots (account_id, bucket, used_pct, fetched_at)
+        VALUES ('bare', NULL, 80, 20)`).run();
+      applyPlan(rename.db);
+      assert.deepEqual(plainRows(rename.db.prepare('SELECT * FROM snapshots ORDER BY account_id, bucket').all()), [
+        { account_id: 'user:bare', bucket: null, used_pct: 80, used: null, limit_val: null, remaining: null, reset_at: null, fetched_at: 20, source: null, confidence: null },
+      ]);
+    } finally { rename.close(); }
+
+    const merge = fixture();
+    try {
+      slot(merge.db, 'user:bare', 'bare');
+      account(merge.db, 'bare', 'openai-codex');
+      account(merge.db, 'user:bare', 'openai-codex');
+      merge.db.prepare(`INSERT INTO snapshots (account_id, bucket, used_pct, fetched_at)
+        VALUES ('bare', NULL, 80, 20), ('user:bare', NULL, 10, 10)`).run();
+      applyPlan(merge.db);
+      assert.deepEqual(plainRows(merge.db.prepare('SELECT * FROM snapshots ORDER BY account_id, bucket').all()), [
+        { account_id: 'user:bare', bucket: null, used_pct: 80, used: null, limit_val: null, remaining: null, reset_at: null, fetched_at: 20, source: null, confidence: null },
+      ]);
+    } finally { merge.close(); }
+  });
+
+  it('a clashing expired poll claim keeps the target claim', () => {
+    const expired = fixture();
+    try {
+      slot(expired.db, 'user:bare', 'bare');
+      account(expired.db, 'bare', 'openai-codex');
+      account(expired.db, 'user:bare', 'openai-codex');
+      pollClaim(expired.db, 'bare', 99);
+      expired.db.prepare(`INSERT INTO poll_claims (account_id, holder_id, claimed_at, until)
+        VALUES ('user:bare', 'target', 2, 101)`).run();
+      inTransaction(expired.db, () => applyCodexRekey(expired.db, {
+        moves: [{ from: 'bare', to: 'user:bare', kind: 'merge' }],
+        skipped: [],
+      }, { now: 100 }));
+      assert.deepEqual(plainRows(expired.db.prepare('SELECT * FROM poll_claims ORDER BY account_id').all()), [
+        { account_id: 'user:bare', holder_id: 'target', claimed_at: 2, until: 101 },
+      ]);
+    } finally { expired.close(); }
+
+    const live = fixture();
+    try {
+      account(live.db, 'bare', 'openai-codex');
+      account(live.db, 'user:bare', 'openai-codex');
+      pollClaim(live.db, 'bare', 101);
+      live.db.prepare(`INSERT INTO poll_claims (account_id, holder_id, claimed_at, until)
+        VALUES ('user:bare', 'target', 2, 101)`).run();
+      const before = everyTableState(live.db);
+      assert.throws(() => inTransaction(live.db, () => applyCodexRekey(live.db, {
+        moves: [{ from: 'bare', to: 'user:bare', kind: 'merge' }],
+        skipped: [],
+      }, { now: 100 })), /rekey-dependents-remain/);
+      assert.equal(everyTableState(live.db), before);
+    } finally { live.close(); }
+  });
+
+  it('a Codex usage_polls clash throws rekey-usage-polls-clash and nothing is committed', () => {
+    const f = fixture();
+    try {
+      slot(f.db, 'user:bare', 'bare');
+      account(f.db, 'bare', 'openai-codex');
+      account(f.db, 'user:bare', 'openai-codex');
+      f.db.prepare(`INSERT INTO usage_polls (provider, account_id, next_due_at) VALUES
+        ('openai-codex', 'bare', 3), ('openai-codex', 'user:bare', 4)`).run();
+      const before = everyTableState(f.db);
+      assert.throws(() => inTransaction(f.db, () => applyCodexRekey(f.db, plan(f.db), { now: 100 })), /rekey-usage-polls-clash/);
+      assert.equal(everyTableState(f.db), before);
+    } finally { f.close(); }
   });
 
   it('a clashing reading keeps the newer one', () => {
