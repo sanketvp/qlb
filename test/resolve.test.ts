@@ -250,6 +250,22 @@ describe('qlb resolve — Codex account ownership', () => {
     }
   });
 
+  it('resolve skips a Codex snapshot whose id has only another provider\'s accounts row', () => {
+    const store = openStore(':memory:');
+    try {
+      store.upsertAccount(codexSnapshot.accountId, 'xai', codexSnapshot.label);
+      const decision = resolveFromSnapshots({
+        model: 'gpt-5.4',
+        snapshots: [codexSnapshot],
+        store,
+      });
+
+      assert.equal(decision.ok && decision.accountId === codexSnapshot.accountId, false);
+    } finally {
+      store.close();
+    }
+  });
+
   it('resolve without a store does not filter Codex snapshots', () => {
     const decision = resolveFromSnapshots({
       model: 'gpt-5.4',

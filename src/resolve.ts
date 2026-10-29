@@ -296,7 +296,7 @@ export function resolveFromSnapshots(req: ResolveRequest): ResolveDecision {
         !reserved.has(s.accountId) &&
         (req.store == null ||
           s.provider !== 'openai-codex' ||
-          req.store.getAccount(s.accountId) !== null),
+          req.store.getAccount(s.accountId)?.provider === 'openai-codex'),
     );
     lastCandidates = candidates;
     const picked = pickAccount(strategy, {
