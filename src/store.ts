@@ -2269,12 +2269,20 @@ export class Store {
     restoreKeychain: () => boolean;
     /** Caller-owned capability, checked immediately before each SQLite write. */
     assertNotCompromised?: () => void;
+    /** Called after the compare-and-set pre-check and before the first write. */
+    beforeWrite?: (db: DatabaseSync, dbPath: string) => void;
+    /** Called after the final write and immediately before COMMIT. */
+    beforeCommit?: (db: DatabaseSync, kind: 'existing-adopt') => void;
   }): void {
     const ts = input.ts ?? Date.now();
     this.runImmediate(() => {
       let keychainWriteStarted = false;
       try {
         input.assertNotCompromised?.();
+        const current = this.db.prepare('SELECT 1 FROM codex_slots WHERE account_id = ? AND fingerprint = ?')
+          .get(input.accountId, input.previousFingerprint);
+        if (!current) throw new Error('Codex slot changed before adoption');
+        input.beforeWrite?.(this.db, this.dbPath);
         const updated = this.db.prepare(`UPDATE codex_slots SET fingerprint = ?, prev_fingerprint = ?, last_refresh = ?,
           dead = 0, dead_reason = NULL, dead_at = NULL, healed_at = CASE WHEN dead != 0 THEN ? ELSE healed_at END,
           pending_adopt = 0, archived_at = NULL, last_active_at = ?
@@ -2300,6 +2308,7 @@ export class Store {
             VALUES (?, 'openai-codex', ?, 'external-login', ?, ?, NULL)`)
             .run(ts, input.accountId, input.reloginEvidence, input.reloginEvidence);
         }
+        input.beforeCommit?.(this.db, 'existing-adopt');
       } catch (error) {
         let compensationFailed = false;
         if (keychainWriteStarted) {
@@ -2325,9 +2334,16 @@ export class Store {
     fingerprint: string,
     ts: number = Date.now(),
     assertNotCompromised?: () => void,
+    hooks?: {
+      beforeWrite?: (db: DatabaseSync, dbPath: string) => void;
+      beforeCommit?: (db: DatabaseSync, kind: 'existing-mark') => void;
+    },
   ): boolean {
     return this.runImmediate(() => {
       assertNotCompromised?.();
+      const current = this.db.prepare('SELECT 1 FROM codex_slots WHERE account_id = ? AND fingerprint = ?').get(accountId, fingerprint);
+      if (!current) return false;
+      hooks?.beforeWrite?.(this.db, this.dbPath);
       const updated = this.db.prepare(`UPDATE codex_slots SET pending_adopt = 0, archived_at = NULL, last_active_at = ?
         WHERE account_id = ? AND fingerprint = ?`).run(ts, accountId, fingerprint);
       if (updated.changes !== 1) return false;
@@ -2335,6 +2351,7 @@ export class Store {
       this.db.prepare(`INSERT INTO active_login (provider, account_id, since, set_by) VALUES ('openai-codex', ?, ?, 'import')
         ON CONFLICT(provider) DO UPDATE SET account_id = excluded.account_id, since = excluded.since, set_by = excluded.set_by`)
         .run(accountId, ts);
+      hooks?.beforeCommit?.(this.db, 'existing-mark');
       return true;
     });
   }
