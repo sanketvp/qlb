@@ -7,7 +7,7 @@ import { describe, it } from 'node:test';
 import { runPiDeployCommand } from '../src/commands/pi-deploy';
 import { piExtensionDriftCheck } from '../src/checks/pi-extension-drift';
 import { piStaleSessionsCheck } from '../src/checks/pi-stale-sessions';
-import { deployPiExtension } from '../src/pi-deploy';
+import { deployPiExtension, piRedactTarget, piSharedSrcDir } from '../src/pi-deploy';
 import { openStore } from '../src/store';
 import type { CommandContext } from '../src/registry';
 
@@ -64,6 +64,33 @@ describe('qlb pi deploy (P12)', () => {
     assert.notEqual(second.hash, first.hash);
     assert.equal(readFileSync(join(target, 'index.ts'), 'utf8'), 'export const version = 2;\n');
     assert.equal(existsSync(join(target, 'manifest.json')), true);
+  });
+
+  it('deploy with a symlinked extensions dir writes shared sources beside its real path and detects drift there', () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-pi-symlink-'));
+    const f = fixture(root);
+    const vaultExtensions = join(root, 'vault', 'pi-config', 'extensions');
+    mkdirSync(vaultExtensions, { recursive: true });
+    mkdirSync(join(f.home, '.pi', 'agent'), { recursive: true });
+    symlinkSync(vaultExtensions, join(f.home, '.pi', 'agent', 'extensions'));
+
+    deployPiExtension({ home: f.home, appDir: f.appDir, dbPath: f.dbPath });
+
+    const vaultSrc = join(root, 'vault', 'pi-config', 'src');
+    assert.equal(readFileSync(join(vaultSrc, 'redact.ts'), 'utf8'), 'export const redact = 1;\n');
+    assert.equal(readFileSync(join(vaultSrc, 'pi-owner-document.ts'), 'utf8'), 'export const ownerDocument = 1;\n');
+    assert.equal(existsSync(join(f.home, '.pi', 'agent', 'src')), false);
+    assert.equal(piExtensionDriftCheck({ home: f.home, appDir: f.appDir, dbPath: f.dbPath }).level, 'PASS');
+
+    writeFileSync(join(vaultSrc, 'redact.ts'), 'export const redact = 1;\nchanged\n');
+    assert.equal(piExtensionDriftCheck({ home: f.home, appDir: f.appDir, dbPath: f.dbPath }).level, 'FAIL');
+  });
+
+  it('falls back to the unresolved agent src directory while extensions is missing', () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-pi-missing-extensions-'));
+    const home = join(root, 'home');
+
+    assert.equal(piSharedSrcDir(home), join(home, '.pi', 'agent', 'src'));
   });
 
   it('dry-run reports source, target, and hash without writing', async () => {
@@ -136,7 +163,7 @@ describe('qlb pi deploy (P12)', () => {
     const f = fixture(root);
     const first = deployPiExtension({ home: f.home, appDir: f.appDir, dbPath: f.dbPath, now: () => 1_700_000_000_000 });
     const target = join(f.home, '.pi', 'agent', 'extensions', 'qlb-pi');
-    const redact = join(f.home, '.pi', 'agent', 'src', 'redact.ts');
+    const redact = piRedactTarget(f.home);
     writeFileSync(join(f.extension, 'index.ts'), 'export const version = 2;\n');
     writeFileSync(join(f.appDir, 'release-fixture', 'src', 'redact.ts'), 'export const redact = 2;\n');
     const output: string[] = [];

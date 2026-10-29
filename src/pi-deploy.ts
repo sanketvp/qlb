@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { cpSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync } from 'node:fs';
+import { cpSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
 import { qlbHomeDir } from './home';
@@ -38,12 +38,23 @@ export function piExtensionTarget(home: string): string {
   return join(home, '.pi', 'agent', 'extensions', 'qlb-pi');
 }
 
+/** Returns the shared-source directory adjacent to Pi's resolved extensions directory. */
+export function piSharedSrcDir(home: string): string {
+  const extensionsDir = join(home, '.pi', 'agent', 'extensions');
+  try {
+    return join(dirname(realpathSync(extensionsDir)), 'src');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return join(dirname(extensionsDir), 'src');
+    throw error;
+  }
+}
+
 export function piRedactTarget(home: string): string {
-  return join(home, '.pi', 'agent', 'src', 'redact.ts');
+  return join(piSharedSrcDir(home), 'redact.ts');
 }
 
 export function piOwnerDocumentTarget(home: string): string {
-  return join(home, '.pi', 'agent', 'src', 'pi-owner-document.ts');
+  return join(piSharedSrcDir(home), 'pi-owner-document.ts');
 }
 
 export function piDeploymentDigest(extension: string, redact: string, ownerDocument: string): string {
@@ -111,9 +122,8 @@ function replaceDeployment(
   ownerDocumentTarget: string,
   rename: typeof renameSync,
 ): void {
-  const agentDir = dirname(dirname(target));
   const extensionParent = dirname(target);
-  const stagingRoot = join(agentDir, '.qlb-pi-staging');
+  const stagingRoot = join(dirname(dirname(redactTarget)), '.qlb-pi-staging');
   const nonce = `${process.pid}-${Date.now()}`;
   const staging = join(stagingRoot, `.qlb-pi-${nonce}.tmp`);
   const stagedRedact = join(stagingRoot, `.redact-${nonce}.tmp`);
