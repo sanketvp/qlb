@@ -1699,7 +1699,7 @@ export class Migration {
     const syncedDirectories = new Set<string>();
     const fsyncDirectoryOnce = (path: string): void => {
       const canonicalPath = resolve(path);
-      if (syncedDirectories.has(canonicalPath)) return;
+      if (syncedDirectories.has(canonicalPath) || !existsSync(path)) return;
       this.fsyncDirectory(path);
       syncedDirectories.add(canonicalPath);
     };
@@ -1707,15 +1707,13 @@ export class Migration {
       const authKey = this.singleGrantAuthKey();
       const exactBackup = piAuthBackupPath(this.poolFilePath, authKey);
       const legacyBackup = legacyPiAuthBackupPath(this.poolFilePath, authKey);
-      const exactBackupPresent = existsSync(exactBackup);
-      const legacyBackupPresent = existsSync(legacyBackup);
       // S6a precedes S6b/S7. Any failure leaves the marker durable so the
       // next resume retries backup removal before clearing the hand-back.
       removePiAuthBackup(this.poolFilePath, authKey);
-      // Only directory entries that existed before S6a need persistence.
-      // S6a must be durable before S7 clears the retry marker.
-      if (exactBackupPresent) fsyncDirectoryOnce(dirname(exactBackup));
-      if (legacyBackupPresent) fsyncDirectoryOnce(dirname(legacyBackup));
+      // A retry must re-sync backup parents: an earlier unlink may not be
+      // durable yet. S6a must be durable before S7 clears the retry marker.
+      fsyncDirectoryOnce(dirname(exactBackup));
+      fsyncDirectoryOnce(dirname(legacyBackup));
     }
     const staging = this.stagingPath();
     unlinkIfExists(staging);

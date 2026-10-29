@@ -1220,10 +1220,16 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       rolledBackAt: 123,
     };
     let failSync = true;
+    const retrySyncCalls: string[] = [];
     const h = setup('xai', new MockKeychain(), {
       fsyncDirectory: (path) => {
         if (failSync && path === dirname(piAuthBackupPath(h.authPath, 'xai'))) {
           throw new Error('injected backup directory sync failure');
+        }
+        if (!failSync) {
+          retrySyncCalls.push(path);
+          const detail = JSON.parse(h.store.getMigration('pi-xai')!.detail_json) as Record<string, unknown>;
+          assert.deepEqual(detail.handback, marker, 'retry sync runs before S7 clears the durable marker');
         }
       },
     });
@@ -1240,7 +1246,45 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
 
       failSync = false;
       const settled = h.mig.resume();
+      const exactBackupDirectory = dirname(piAuthBackupPath(h.authPath, 'xai'));
+      const legacyBackupDirectory = dirname(legacyPiAuthBackupPath(h.authPath, 'xai'));
+      assert.ok(retrySyncCalls.includes(exactBackupDirectory), 'a retry re-syncs the exact backup parent');
+      if (existsSync(legacyBackupDirectory)) {
+        assert.ok(retrySyncCalls.includes(legacyBackupDirectory), 'a retry syncs the legacy backup parent when it exists');
+      }
       assert.equal(settled.detail.handback, undefined, 'a working retry completes S6a before S7');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('T-S6a a crash between unlink and sync still syncs on the next resume', () => {
+    const marker = {
+      phase: 'cleanup-pending',
+      keychainDisposition: 'keep',
+      piFingerprint: null,
+      decision: null,
+      fencedGeneration: null,
+      rolledBackAt: 123,
+    };
+    const calls: string[] = [];
+    const h = setup('xai', new MockKeychain(), {
+      fsyncDirectory: (path) => {
+        calls.push(path);
+        const detail = JSON.parse(h.store.getMigration('pi-xai')!.detail_json) as Record<string, unknown>;
+        assert.deepEqual(detail.handback, marker, 'backup-parent sync runs before S7 clears the durable marker');
+      },
+    });
+    try {
+      const exact = piAuthBackupPath(h.authPath, 'xai');
+      writePiAuthBackup(h.authPath, 'xai', 'fixture');
+      rmSync(exact, { force: true });
+      h.store.upsertMigration('pi-xai', 'NATIVE', JSON.stringify({ handback: marker }));
+
+      const settled = h.mig.resume();
+
+      assert.ok(calls.includes(dirname(exact)), 'resume syncs the exact backup parent after an unlink-before-sync crash');
+      assert.equal(settled.detail.handback, undefined, 'S7 clears the marker after the retry sync');
     } finally {
       h.cleanup();
     }
