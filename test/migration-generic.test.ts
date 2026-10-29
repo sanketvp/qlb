@@ -38,7 +38,7 @@ const fs = require('node:fs') as typeof import('node:fs');
  * Adapter accountId sources (must stay in lockstep):
  *   src/adapters/xai.ts    snapshot.accountId = 'xai-default'
  *   src/adapters/kimi.ts   claimId            = 'kimi-default'
- *   src/adapters/codex.ts  chatgpt_account_id ?? 'codex-default'
+ *   src/adapters/codex.ts  S29 slot identity
  */
 const ROLLBACK_DECISION: RollbackDecision = {
   kind: 'keychain',
@@ -53,7 +53,7 @@ const ROLLBACK_DECISION: RollbackDecision = {
 
 const FAKE_GRANTS: Record<
   SingleGrantProvider,
-  { type: 'oauth'; access: string; refresh: string; expires: number }
+  { type: 'oauth'; access: string; refresh: string; expires: number; accountId?: string }
 > = {
   xai: {
     type: 'oauth',
@@ -69,9 +69,12 @@ const FAKE_GRANTS: Record<
   },
   'openai-codex': {
     type: 'oauth',
-    access: 'codex-access-fake',
+    access: `eyJhbGciOiJub25lIn0.${Buffer.from(JSON.stringify({
+      'https://api.openai.com/auth': { chatgpt_user_id: 'fixture-user', chatgpt_account_id: 'fixture-account' },
+    })).toString('base64url')}.sig`,
     refresh: 'codex-refresh-fake',
     expires: Date.now() + 7 * 24 * 3600 * 1000,
+    accountId: 'fixture-account',
   },
 };
 
@@ -89,11 +92,11 @@ function mockRehearse(calls: StagedAccount[]): RehearseFn {
 }
 
 function expectedId(provider: SingleGrantProvider): string {
-  return ADAPTER_ACCOUNT_IDS[provider];
+  return provider === 'openai-codex' ? 'fixture-user:fixture-account' : ADAPTER_ACCOUNT_IDS[provider];
 }
 
 function expectedLabel(provider: SingleGrantProvider): string {
-  return ADAPTER_ACCOUNT_LABELS[provider];
+  return provider === 'openai-codex' ? expectedId(provider) : ADAPTER_ACCOUNT_LABELS[provider];
 }
 
 class RollbackDeleteKeychain extends MockKeychain {

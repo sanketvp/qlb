@@ -13,6 +13,8 @@ import {
 } from './keychain';
 import type { CodexSlotRecord, Store } from './store';
 import { qlbHomeDir } from './home';
+import { CodexAdmissionRefused, codexAdmission, ensureCodexSlotAccount, rekeyCodexAccounts, type RekeySummary } from './codex-rekey';
+import { recordRestoreBaseline } from './codex-restore-baseline';
 import { listStashes, recordStash, removeStash, type UnclaimedIndexEntry } from './unclaimed-index';
 
 const PROVIDER = 'openai-codex';
@@ -327,6 +329,8 @@ export interface CodexImportPlan {
 export interface ImportActiveCodexDeps {
   store: SqlStore;
   keychain: Keychain;
+  /** Called after a successful rekey commit; used by the command report path. */
+  onRekey?: (summary: RekeySummary) => void;
   /** The Pi entry observed before openai-codex migration, if it is available. */
   piBaseline?: unknown;
   now?: () => number;
@@ -457,11 +461,20 @@ export function importActiveCodexSlot(doc: CodexAuthDocument, deps: ImportActive
   const fingerprint = codexFingerprint(doc);
   const storeDb = deps.withDb ?? withDatabase;
   const service = qlbKeychainService(PROVIDER, plan.slotId);
+  const timestamp = now();
+  let summary: RekeySummary | undefined;
 
   storeDb(deps.store, (db) => {
     db.exec('BEGIN IMMEDIATE');
     try {
       const previous = existingSlot(db, plan.slotId);
+      const refusal = codexAdmission(db, { slotId: plan.slotId, bareAccountId: plan.accountId });
+      if (refusal) throw new CodexAdmissionRefused(refusal.code, refusal.message);
+      summary = rekeyCodexAccounts(db, {
+        dbPath: deps.store.dbPath,
+        now: timestamp,
+        prospective: { accountId: plan.slotId, chatgptAccountId: plan.accountId },
+      });
       const previousFingerprint = previous?.fingerprint && previous.fingerprint !== fingerprint
         ? previous.fingerprint
         : previous?.prev_fingerprint ?? null;
@@ -477,7 +490,6 @@ export function importActiveCodexSlot(doc: CodexAuthDocument, deps: ImportActive
       }
       deps.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(doc));
 
-      const timestamp = now();
       db.prepare(`INSERT INTO codex_slots (
         account_id, chatgpt_user_id, chatgpt_account_id, fingerprint, prev_fingerprint,
         last_refresh, dead, pending_adopt, added_at, last_active_at, source
@@ -497,14 +509,10 @@ export function importActiveCodexSlot(doc: CodexAuthDocument, deps: ImportActive
         plan.slotId, plan.chatgptUserId, plan.accountId, fingerprint, previousFingerprint,
         doc.last_refresh ?? null, timestamp, timestamp,
       );
-      db.prepare(`INSERT INTO accounts (id, provider, label, status, created_at)
-        VALUES (?, ?, ?, 'active', ?)
-        ON CONFLICT(id) DO UPDATE SET provider = excluded.provider`)
-        .run(plan.accountId, PROVIDER, plan.accountId, timestamp);
+      ensureCodexSlotAccount(db, plan.slotId, timestamp);
       db.prepare(`INSERT INTO active_login (provider, account_id, since, set_by) VALUES (?, ?, ?, 'import')
         ON CONFLICT(provider) DO UPDATE SET account_id = excluded.account_id, since = excluded.since, set_by = excluded.set_by`)
         .run(PROVIDER, plan.slotId, timestamp);
-      db.prepare("DELETE FROM accounts WHERE id = 'codex-default'").run();
       if (!previous || previous.fingerprint !== fingerprint) {
         db.prepare(`INSERT INTO lineage_log (ts, provider, account_id, from_fp, to_fp, cause, by, evidence)
           VALUES (?, ?, ?, ?, ?, 'import', 'qlb-cli', 'import')`)
@@ -515,11 +523,19 @@ export function importActiveCodexSlot(doc: CodexAuthDocument, deps: ImportActive
           ON CONFLICT(key) DO UPDATE SET value = excluded.value`)
           .run(BASELINE_CONSUMED_BY_KEY, plan.slotId);
       }
+      if (summary.backupTaken) {
+        recordRestoreBaseline(db, {
+          saveKind: 'import-new',
+          backupPath: summary.backupTaken,
+          keychain: deps.keychain as KeychainBackend,
+        });
+      }
       db.exec('COMMIT');
     } catch (error) {
       try { db.exec('ROLLBACK'); } catch { /* preserve original error */ }
       throw error;
     }
   });
+  if (summary) deps.onRekey?.(summary);
   return plan;
 }

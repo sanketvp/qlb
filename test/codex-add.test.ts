@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { describe, it } from 'node:test';
 
-import { addCodexAccount, CodexAddError, type CodexAddDeps } from '../src/codex-add';
+import { addCodexAccount, CodexAddError, productionCodexAddDeps, type CodexAddDeps } from '../src/codex-add';
 import { CodexAuthLockCompromised, withCodexAuthLock } from '../src/cc-locks';
 import { codexFingerprint, parseCodexAuth } from '../src/codex-auth';
 import { MockKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from '../src/keychain';
@@ -71,13 +71,17 @@ describe('codex add', () => {
     const f = fixture();
     try {
       const result = await addCodexAccount({ home: '/fixture-home', nativeAuthPath: '/fixture-home/.codex/auth.json' }, f.deps);
-      assert.deepEqual(result, { slotId: 'fixture-user:fixture-account', added: true });
+      assert.deepEqual(result, {
+        slotId: 'fixture-user:fixture-account',
+        added: true,
+        rekey: { moves: [], skipped: [], backupTaken: undefined, backupMissing: false },
+      });
       assert.deepEqual(rows(f.store), {
         slot: {
           account_id: 'fixture-user:fixture-account', chatgpt_user_id: 'fixture-user', chatgpt_account_id: 'fixture-account',
           source: 'qlb-add', fingerprint: rows(f.store).slot?.fingerprint,
         },
-        accounts: [{ id: 'fixture-account', provider: 'openai-codex' }],
+        accounts: [{ id: 'fixture-user:fixture-account', provider: 'openai-codex' }],
         lineage: [{ cause: 'add', by: 'qlb-cli', evidence: 'add' }],
         relogins: [],
       });
@@ -86,6 +90,38 @@ describe('codex add', () => {
       assert.ok(f.calls.includes('remove:/tmp/codex-add-fixture'));
       assert.doesNotThrow(() => f.keychain.getSync(qlbKeychainService('openai-codex', result.slotId), QLB_KEYCHAIN_ACCOUNT));
     } finally { f.store.close(); }
+  });
+
+  it('codex add (file-backed) writes the slot-id row and rekeys', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-codex-add-file-'));
+    const nativeAuthPath = join(home, 'native-auth.json');
+    const store = openStore(join(home, 'qlb.db'));
+    const keychain = new MockKeychain();
+    try {
+      writeFileSync(nativeAuthPath, '{}', { mode: 0o600 });
+      store.upsertAccount('fixture-account', 'openai-codex', 'legacy');
+      const deps = productionCodexAddDeps(store, keychain, {
+        QLB_TEST_MODE: '1', HOME: home, QLB_HOME: join(home, 'qlb'),
+      });
+      deps.login = async (options) => {
+        writeFileSync(join(options.cwd, 'auth.json'), JSON.stringify(document()), { mode: 0o600 });
+        return 0;
+      };
+      const result = await addCodexAccount({ home, nativeAuthPath }, deps);
+      assert.equal(result.slotId, 'fixture-user:fixture-account');
+      assert.equal(result.rekey.moves.length, 1);
+      assert.ok(result.rekey.backupTaken);
+      const db = new DatabaseSync(store.dbPath, { readOnly: true });
+      try {
+        assert.deepEqual(
+          (db.prepare("SELECT id FROM accounts WHERE provider = 'openai-codex'").all() as Array<{ id: string }>).map((row) => row.id),
+          ['fixture-user:fixture-account'],
+        );
+      } finally { db.close(); }
+    } finally {
+      store.close();
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 
   it('refuses an existing identity without --replace and removes the temporary login home', async () => {
@@ -107,7 +143,11 @@ describe('codex add', () => {
       await addCodexAccount({ home: '/fixture-home', nativeAuthPath: '/native-auth' }, f.deps);
       f.deps.readAuth = async () => ({ status: 'ok', doc: document('second-fixture-refresh') });
       const result = await addCodexAccount({ home: '/fixture-home', nativeAuthPath: '/native-auth', replace: 'fixture-user:fixture-account' }, f.deps);
-      assert.deepEqual(result, { slotId: 'fixture-user:fixture-account', added: false });
+      assert.deepEqual(result, {
+        slotId: 'fixture-user:fixture-account',
+        added: false,
+        rekey: { moves: [], skipped: [], backupTaken: undefined, backupMissing: false },
+      });
       assert.deepEqual(rows(f.store).lineage.map((row) => row.cause), ['add', 'replace']);
       assert.deepEqual(rows(f.store).relogins, [{ kind: 'identity-replaced' }]);
       const service = qlbKeychainService('openai-codex', result.slotId);

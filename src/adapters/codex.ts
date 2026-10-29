@@ -1,7 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import { config } from '../config';
-import { getStore } from '../store';
-import { codexBareAccountId } from '../codex-slots';
+import { codexIdentity, type CodexAuthDocument } from '../codex-auth';
 import type { Adapter } from '../types';
 
 // Codex exposes quota only in response headers from real, quota-consuming requests.
@@ -46,15 +45,11 @@ function stringClaim(payload: JsonObject | undefined, name: string): string | un
 export interface CodexAdapterDeps {
   authPath?: string;
   readAuth?: (path: string) => Promise<string>;
-  upsertAccount?: (accountId: string, provider: string, label: string) => void;
 }
 
 export function createCodexAdapter(deps: CodexAdapterDeps = {}): Adapter {
   const authPath = deps.authPath ?? AUTH_PATH;
   const readAuth = deps.readAuth ?? ((path: string) => readFile(path, 'utf8'));
-  const upsertAccount = deps.upsertAccount ?? ((accountId, provider, label) => {
-    getStore().upsertAccount(accountId, provider, label);
-  });
 
   return {
     id: 'openai-codex',
@@ -86,12 +81,17 @@ export function createCodexAdapter(deps: CodexAdapterDeps = {}): Adapter {
 
         const idToken = auth.tokens.id_token;
         const payload = typeof idToken === 'string' ? parseJwtPayload(idToken) : undefined;
-        const accountId = codexBareAccountId({ tokens: auth.tokens }) ?? 'codex-default';
-        const label = stringClaim(payload, 'email') ?? 'codex-default';
-        // Phase 0/1: no free usage GET and probes are off. Persist the account
-        // row so resolve can see it; buckets stay empty (unknown) until organic
-        // headers or an explicit probe land in a later phase.
-        upsertAccount(accountId, 'openai-codex', label);
+        const accountId = codexIdentity(auth as CodexAuthDocument);
+        if (!accountId) {
+          return [{
+            accountId: 'codex-default',
+            provider: 'openai-codex',
+            label: 'codex-default',
+            buckets: {},
+            error: 'Codex login has no S29 identity',
+          }];
+        }
+        const label = stringClaim(payload, 'email') ?? accountId;
         return [{
           accountId,
           provider: 'openai-codex',
