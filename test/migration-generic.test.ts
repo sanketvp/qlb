@@ -1178,8 +1178,12 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
         assert.equal(marker!.phase, 'cleanup-pending');
         assert.equal(marker!.keychainDisposition, disposition);
         assert.equal(typeof marker!.piFingerprint, 'string');
-        assert.equal(marker!.decision, null);
-        assert.equal(marker!.fencedGeneration, null);
+        assert.ok(marker!.decision, `${name}: S5 copies the recorded S2 decision`);
+        assert.equal(
+          marker!.fencedGeneration,
+          (marker!.decision as RollbackDecision).fencedGeneration,
+          `${name}: S5 copies the S2 fence`,
+        );
         assert.equal(typeof marker!.rolledBackAt, 'number');
         const lastRollback = rolled.detail.lastRollback as Record<string, unknown>;
         const { rolledBackFrom, cleanedAt, ...lastMarker } = lastRollback;
@@ -1294,35 +1298,199 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     }
   });
 
-  it('a refresh that commits a rotated grant during the hand-back is refused, not deleted', async () => {
-    const h = setup('xai');
+  it('T-I2 a refresh that commits between the outside reads and the fence forces re-selection', async () => {
+    let reads = 0;
+    let observedFence: number | undefined;
+    const h = setup('xai', new MockKeychain(), {
+      afterStep: (point) => {
+        if (point === 'S2-reads' && reads++ === 0) {
+          const id = expectedId('xai');
+          const service = qlbKeychainService('xai', id);
+          const raw = h.kc.getSync(service, expectedLabel('xai'));
+          h.kc.setSync(service, expectedLabel('xai'), JSON.stringify({
+            ...JSON.parse(raw), generation: 1, refresh: 'xai-refresh-rotated-fake',
+          }));
+          assert.equal(h.store.casGrantGeneration(id, 0, 1), 1, 'fake refresher commits generation one');
+        }
+        if (point === 'S2') {
+          observedFence = (JSON.parse(h.store.getMigration('pi-xai')!.detail_json).rollbackDecision as RollbackDecision).fencedGeneration;
+        }
+      },
+    });
     try {
       h.mig.stage();
       await h.mig.rehearse(mockRehearse([]));
       h.mig.commit();
-      const accountId = (JSON.parse(h.store.getMigration('pi-xai')!.detail_json).accounts as Array<{ id: string }>)[0].id;
-      let leaseLive = true;
-      const originalGetLease = h.store.getLease.bind(h.store);
-      h.store.getLease = (name) => leaseLive && name === `refresh:${accountId}`
-        ? { name, holder_pid: 1, holder_id: 'fixture-refresher', until: Date.now() + 60_000, generation: 1 }
-        : originalGetLease(name);
-      // The refresher commits its rotated grant and drops its lease the moment
-      // the hand-back first reads K_m.
-      const originalGetSync = h.kc.getSync.bind(h.kc);
-      h.kc.getSync = (service, account) => {
-        const raw = originalGetSync(service, account);
-        if (leaseLive) {
-          leaseLive = false;
-          const rotated = { ...(JSON.parse(raw) as Record<string, unknown>), refresh: 'xai-refresh-rotated-fake' };
-          h.kc.setSync(service, account, JSON.stringify(rotated));
+      h.mig.rollback();
+
+      assert.equal(reads, 2, 'a generation mismatch re-runs the outside reads');
+      assert.equal(observedFence, 2, 'the retry ranks and fences the committed refresher generation');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('T-S2a decision and fence commit in one transaction', async () => {
+    let committedDecision: RollbackDecision | undefined;
+    const h = setup('xai', new MockKeychain(), {
+      afterStep: (point) => {
+        if (point !== 'S2') return;
+        const row = h.store.getMigration('pi-xai')!;
+        committedDecision = JSON.parse(row.detail_json).rollbackDecision as RollbackDecision;
+        assert.equal(h.store.getGrantGeneration(expectedId('xai')), committedDecision.fencedGeneration);
+        assert.equal(existsSync(h.ownerPath), true, 'S2 commits before the existing un-own path');
+        throw new Error('fixture crash after S2');
+      },
+    });
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      h.mig.commit();
+      const runImmediate = h.store.runImmediate.bind(h.store);
+      let inS2Transaction = false;
+      let casInsideTransaction = false;
+      let journalInsideTransaction = false;
+      const cas = h.store.casGrantGeneration.bind(h.store);
+      const journal = h.store.upsertMigration.bind(h.store);
+      h.store.runImmediate = (<T>(fn: () => T): T => runImmediate(() => {
+        inS2Transaction = true;
+        try {
+          return fn();
+        } finally {
+          inS2Transaction = false;
         }
-        return raw;
+      })) as typeof h.store.runImmediate;
+      h.store.casGrantGeneration = (id, from, to) => {
+        casInsideTransaction ||= inS2Transaction;
+        return cas(id, from, to);
+      };
+      h.store.upsertMigration = (store, state, detail, updatedAt) => {
+        if (store === 'pi-xai' && JSON.parse(detail ?? '{}').rollbackDecision) {
+          journalInsideTransaction ||= inS2Transaction;
+        }
+        return journal(store, state, detail, updatedAt);
       };
 
-      assert.throws(() => h.mig.rollback(), /refresh-in-progress/);
-      assert.equal(existsSync(h.ownerPath), true, 'the refusal leaves the owner claim intact');
-      assert.equal(JSON.parse(h.store.getMigration('pi-xai')!.detail_json).handback, undefined);
-      assert.equal(keychainHas(h.kc, 'xai'), true, 'the Keychain copy is not deleted');
+      assert.throws(() => h.mig.rollback(), /fixture crash after S2/);
+      assert.equal(casInsideTransaction, true, 'the fence CAS runs in S2\'s immediate transaction');
+      assert.equal(journalInsideTransaction, true, 'the decision journal write runs in that transaction');
+      assert.equal(committedDecision?.kind, 'keychain');
+      assert.equal(committedDecision?.fencedGeneration, 1);
+      assert.equal(JSON.parse(h.store.getMigration('pi-xai')!.detail_json).intent, 'rollback');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('T-S2b fence lands above a C3 Keychain generation', async () => {
+    let decision: RollbackDecision | undefined;
+    const h = setup('xai', new MockKeychain(), {
+      afterStep: (point) => {
+        if (point === 'S2') {
+          decision = JSON.parse(h.store.getMigration('pi-xai')!.detail_json).rollbackDecision as RollbackDecision;
+          throw new Error('fixture crash after S2');
+        }
+      },
+    });
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      h.mig.commit();
+      const service = qlbKeychainService('xai', expectedId('xai'));
+      const raw = h.kc.getSync(service, expectedLabel('xai'));
+      h.kc.setSync(service, expectedLabel('xai'), JSON.stringify({ ...JSON.parse(raw), generation: 1 }));
+
+      assert.throws(() => h.mig.rollback(), /fixture crash after S2/);
+      assert.equal(decision?.generation, 1);
+      assert.equal(decision?.fencedGeneration, 2);
+      assert.equal(h.store.getGrantGeneration(expectedId('xai')), 2);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('T-S2h backup-only rollback fences at g0+1', async () => {
+    let decision: RollbackDecision | undefined;
+    const h = setup('xai', new MockKeychain(), {
+      afterStep: (point) => {
+        if (point === 'S2') {
+          decision = JSON.parse(h.store.getMigration('pi-xai')!.detail_json).rollbackDecision as RollbackDecision;
+          throw new Error('fixture crash after S2');
+        }
+      },
+    });
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      h.mig.commit();
+      writePiAuthBackup(h.authPath, 'xai', 'fixture');
+      const service = qlbKeychainService('xai', expectedId('xai'));
+      const raw = h.kc.getSync(service, expectedLabel('xai'));
+      h.kc.setSync(service, expectedLabel('xai'), JSON.stringify({ ...JSON.parse(raw), writtenBy: 'native-resync' }));
+
+      assert.throws(() => h.mig.rollback(), /fixture crash after S2/);
+      assert.equal(decision?.kind, 'exact-backup');
+      assert.equal(decision?.fencedGeneration, 1);
+      assert.equal(h.store.getGrantGeneration(expectedId('xai')), 1);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('T-I1 a refresh that commits before S2 is ranked first', async () => {
+    let decision: RollbackDecision | undefined;
+    const h = setup('xai', new MockKeychain(), {
+      afterStep: (point) => {
+        if (point === 'S1') {
+          const id = expectedId('xai');
+          const service = qlbKeychainService('xai', id);
+          const raw = h.kc.getSync(service, expectedLabel('xai'));
+          h.kc.setSync(service, expectedLabel('xai'), JSON.stringify({
+            ...JSON.parse(raw), generation: 1, refresh: 'xai-refresh-refreshed-fake',
+          }));
+          assert.equal(h.store.casGrantGeneration(id, 0, 1), 1, 'fake refresher commits before S2 reads');
+        }
+        if (point === 'S2') {
+          decision = JSON.parse(h.store.getMigration('pi-xai')!.detail_json).rollbackDecision as RollbackDecision;
+          throw new Error('fixture crash after S2');
+        }
+      },
+    });
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      h.mig.commit();
+
+      assert.throws(() => h.mig.rollback(), /fixture crash after S2/);
+      assert.equal(decision?.kind, 'keychain');
+      assert.equal(decision?.generation, 1);
+      assert.equal(decision?.fencedGeneration, 2);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('T-RR resume with a recorded decision never re-ranks', async () => {
+    let reads = 0;
+    const h = setup('xai', new MockKeychain(), {
+      afterStep: (point) => {
+        if (point === 'S2-reads') reads += 1;
+        if (point === 'S2') throw new Error('fixture crash after S2');
+      },
+    });
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      h.mig.commit();
+      assert.throws(() => h.mig.rollback(), /fixture crash after S2/);
+      const decision = JSON.parse(h.store.getMigration('pi-xai')!.detail_json).rollbackDecision as RollbackDecision;
+      const service = qlbKeychainService('xai', expectedId('xai'));
+      const raw = h.kc.getSync(service, expectedLabel('xai'));
+      h.kc.setSync(service, expectedLabel('xai'), JSON.stringify({ ...JSON.parse(raw), generation: 99 }));
+
+      const resumed = h.mig.resume();
+      assert.equal(reads, 1, 'resume uses the durable decision instead of taking S2 reads');
+      assert.deepEqual((resumed.detail.lastRollback as { decision: RollbackDecision }).decision, decision);
     } finally {
       h.cleanup();
     }
@@ -2055,7 +2223,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       if (Array.isArray(value)) return value.map(stripTimestamps);
       if (value && typeof value === 'object') {
         return Object.fromEntries(Object.entries(value as Record<string, unknown>)
-          .filter(([key]) => !['rolledBackAt', 'cleanedAt', 'nativeMtime', 'poolFilePath', 'ownerFilePath', 'stagedAt'].includes(key))
+          .filter(([key]) => !['rolledBackAt', 'cleanedAt', 'decidedAt', 'sourceDigest', 'nativeMtime', 'poolFilePath', 'ownerFilePath', 'stagedAt'].includes(key))
           .map(([key, child]) => [key, stripTimestamps(child)]));
       }
       return value;
