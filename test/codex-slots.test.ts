@@ -520,7 +520,7 @@ describe('Codex slots and import-active', () => {
       const slots = new CodexSlots({ keychain: h.keychain, stashDir });
       const doc = parsedDocument('foreign-reservation-refresh');
       const fp = codexFingerprint(doc);
-      const stashId = 'foreign-reservation';
+      const stashId = 'foreign-reservation-unknown';
       await slots.stashUnclaimedDurably(stashId, doc, fp, 'some-other-account');
       h.keychain.deleteSync(qlbKeychainService('openai-codex', `unclaimed:${stashId}`), QLB_KEYCHAIN_ACCOUNT);
 
@@ -656,7 +656,7 @@ describe('Codex slots and import-active', () => {
       const doc = parsedDocument('expected-unknown-refresh');
       const other = parsedDocument('other-unknown-refresh');
       const fp = codexFingerprint(doc);
-      const stashId = 'mismatched-stash';
+      const stashId = 'mismatched-stash-unknown';
       await slots.stashUnclaimedDurably(stashId, other, fp, planImportActiveCodex(doc).slotId!);
       const before = h.keychain.getSync(qlbKeychainService('openai-codex', `unclaimed:${stashId}`), QLB_KEYCHAIN_ACCOUNT);
 
