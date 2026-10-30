@@ -466,6 +466,130 @@ describe('Codex consume gate — AC34', () => {
     }
   });
 
+  it('a C10 consume whose lock was taken over before the POST sends nothing and writes nothing', async () => {
+    const fixture = slots(document());
+    let posts = 0;
+    const input = {
+      accountId: 'user-a:account-a', snapshot: fixture.current(), trigger: 'force' as const, force: true,
+      slots: fixture.slots, holders: async () => [], now: () => 1,
+      assertHeld: () => { throw new Error('owner token replaced'); },
+      transport: async () => { posts += 1; return { status: 200, body: '{}' }; },
+    };
+
+    const result = await consumeCodexSlot(input);
+    assert.equal(result.status, 'transient');
+    assert.equal(posts, 0);
+    assert.equal(fixture.writes.length, 0);
+  });
+
+  it("a C10 consume that loses its lock after a successful POST stashes the successor, mutates no slot or row, leaves the new owner's lock, and the next refresh adopts it with no second POST", async () => {
+    const h = managedFixture();
+    try {
+      const original = codexFingerprint(h.initial);
+      let posted = false;
+      let posts = 0;
+      const first = await consumeCodexSlot({
+        accountId: h.plan.slotId, snapshot: h.initial, trigger: 'force', force: true, slots: h.slots, store: h.store,
+        holders: async () => [], now: () => 2,
+        assertHeld: () => { if (posted) throw new Error('new owner holds the lock'); },
+        transport: async () => {
+          posts += 1;
+          posted = true;
+          return { status: 200, body: JSON.stringify({ refresh_token: 'refresh-b', access_token: 'access-b' }) };
+        },
+      });
+      assert.equal(first.status, 'stashed-lock-lost');
+      assert.ok(first.stashId);
+      assert.equal(posts, 1);
+      assert.equal(codexFingerprint(h.slots.readSlot(h.plan.slotId, { fresh: true }).document), original);
+      const db = new DatabaseSync(h.store.dbPath, { readOnly: true });
+      try {
+        const row = db.prepare('SELECT fingerprint FROM codex_slots WHERE account_id = ?').get(h.plan.slotId) as { fingerprint: string };
+        assert.equal(row.fingerprint, original);
+      } finally { db.close(); }
+
+      const next = await consumeCodexSlot({
+        accountId: h.plan.slotId, snapshot: h.initial, trigger: 'scheduled', slots: h.slots, store: h.store,
+        holders: async () => [], now: () => 3,
+        transport: async () => { posts += 1; throw new Error('must adopt instead of POSTing'); },
+      });
+      assert.equal(next.status, 'fresh');
+      assert.equal(posts, 1);
+    } finally {
+      h.store.close();
+      rmSync(h.home, { recursive: true, force: true });
+    }
+  });
+
+  it("a new owner consuming while the old owner's emergency stash is between body and index adopts it and sends no POST", async () => {
+    const h = managedFixture();
+    let bodyWritten!: () => void;
+    const bodyReady = new Promise<void>((resolve) => { bodyWritten = resolve; });
+    let continueIndex!: () => void;
+    const indexMayContinue = new Promise<void>((resolve) => { continueIndex = resolve; });
+    try {
+      const slotsWithBarrier = new CodexSlots({
+        keychain: h.keychain,
+        stashDir: join(h.home, 'unclaimed'),
+        emergencyStashAfterBody: async () => { bodyWritten(); await indexMayContinue; },
+      });
+      const owner = slotsWithBarrier.stashSuccessorEmergency(
+        h.plan.slotId, document('refresh-b', 'access-b'), codexFingerprint(h.initial), 2,
+      );
+      await bodyReady;
+      let posts = 0;
+      const adopted = await consumeCodexSlot({
+        accountId: h.plan.slotId, snapshot: h.initial, trigger: 'scheduled', slots: slotsWithBarrier, store: h.store,
+        holders: async () => [], now: () => 3,
+        transport: async () => { posts += 1; throw new Error('must adopt orphan before POSTing'); },
+      });
+      assert.equal(adopted.status, 'fresh');
+      assert.equal(posts, 0);
+      continueIndex();
+      await owner;
+    } finally {
+      h.store.close();
+      rmSync(h.home, { recursive: true, force: true });
+    }
+  });
+
+  it('the store-backed path asserts before the :344 slot write and the metadata transaction', async () => {
+    const h = managedFixture();
+    try {
+      let assertions = 0;
+      const originalWrite = h.slots.writeSlot.bind(h.slots);
+      h.slots.writeSlot = (accountId, successor, predecessor) => {
+        assert.ok(assertions >= 3, 'the authority fences run before the slot write');
+        originalWrite(accountId, successor, predecessor);
+      };
+      const result = await consumeCodexSlot({
+        accountId: h.plan.slotId, snapshot: h.initial, trigger: 'force', force: true, slots: h.slots, store: h.store,
+        holders: async () => [], now: () => 2,
+        assertHeld: () => { assertions += 1; },
+        transport: async () => ({ status: 200, body: JSON.stringify({ refresh_token: 'refresh-b', access_token: 'access-b' }) }),
+      });
+      assert.equal(result.status, 'refreshed');
+      assert.ok(assertions >= 3);
+    } finally {
+      h.store.close();
+      rmSync(h.home, { recursive: true, force: true });
+    }
+  });
+
+  it('a consume whose locks stay held writes as before', async () => {
+    const fixture = slots(document());
+    let assertions = 0;
+    const result = await consumeCodexSlot({
+      accountId: 'user-a:account-a', snapshot: fixture.current(), trigger: 'force', force: true,
+      slots: fixture.slots, holders: async () => [], now: () => 1,
+      assertHeld: () => { assertions += 1; },
+      transport: async () => ({ status: 200, body: JSON.stringify({ refresh_token: 'refresh-b', access_token: 'access-b' }) }),
+    });
+    assert.equal(result.status, 'refreshed');
+    assert.equal(fixture.writes.length, 1);
+    assert.ok(assertions > 0);
+  });
+
   it('refuses a forced refresh of the active Codex slot', async () => {
     let called = 0;
     const errors: string[] = [];

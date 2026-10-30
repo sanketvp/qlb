@@ -125,7 +125,7 @@ async function execute(args: string[], ctx: CommandContext): Promise<number> {
         // C6 and C10 share this provider lock for every read/CAS/write. The
         // consume lock additionally ensures only one process can spend a slot.
         try {
-          return await withCodexConsumeThenSwitchLocks(store.dbPath, accountId, async () => {
+          return await withCodexConsumeThenSwitchLocks(store.dbPath, accountId, async (heldConsume, heldSwitch) => {
             // Re-check every mutable receipt and active state after lock acquisition.
             if (activeCodexSlot(store) === accountId) return { status: 'active-slot' as const };
             if (c9 && !c9Allowed(store.getConfig.bind(store))) return { status: 'c9-unavailable' as const };
@@ -134,6 +134,7 @@ async function execute(args: string[], ctx: CommandContext): Promise<number> {
             if (!hasCodexSlotIdentity(snapshot, accountId)) return { status: 'slot-removed' as const };
             return consumeCodexSlot({
               accountId, snapshot, trigger: 'force', force, allowHeld, slots, store, transport: sendRefresh,
+              assertHeld: () => { heldConsume.assertNotCompromised(); heldSwitch.assertNotCompromised(); },
               holders: async (document) => {
                 const identity = codexIdentity(document);
                 if (!identity) throw new Error('Codex slot identity is invalid');
