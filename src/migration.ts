@@ -1963,6 +1963,21 @@ export class Migration {
     return { provider: journalAccount.provider, id: journalAccount.id, label: journalAccount.label };
   }
 
+  private readSingleGrantRollbackKeychain(service: string, account: string): Grant | null {
+    let raw: string;
+    try {
+      raw = this.keychain.getSync(service, account);
+    } catch (error) {
+      if (isCredentialNotFound(error)) return null;
+      throw Object.assign(new Error('keychain-unavailable', { cause: error }), { exitCode: 3 });
+    }
+    try {
+      return parseGrant(raw);
+    } catch {
+      throw Object.assign(new Error('rollback-source-malformed'), { exitCode: 3 });
+    }
+  }
+
   /**
    * S2: rank outside the transaction, then atomically verify G and K_m, fence
    * them, and persist the full decision. Lease re-checks land in later rows.
@@ -1985,12 +2000,7 @@ export class Migration {
       if (g0 === null) throw new Error('single-grant rollback has no account generation');
 
       const coords = keychainCoords(journalAccount.provider, journalAccount.id, journalAccount.label);
-      let keychainGrant: Grant | null = null;
-      try {
-        keychainGrant = parseGrant(this.keychain.getSync(coords.service, coords.account));
-      } catch (error) {
-        if (!isCredentialNotFound(error)) throw new Error('keychain-unavailable', { cause: error });
-      }
+      const keychainGrant = this.readSingleGrantRollbackKeychain(coords.service, coords.account);
       const k0 = keychainGrant?.generation ?? -1;
 
       const backup = readPiAuthBackup(this.poolFilePath, authKey);
@@ -2065,12 +2075,7 @@ export class Migration {
       try {
         const fenced = this.store.runImmediate(() => {
           if (this.store.getGrantGeneration(journalAccount.id) !== g0) throw new RetryS2();
-          let transactionKeychainGrant: Grant | null = null;
-          try {
-            transactionKeychainGrant = parseGrant(this.keychain.getSync(coords.service, coords.account));
-          } catch (error) {
-            if (!isCredentialNotFound(error)) throw new Error('keychain-unavailable', { cause: error });
-          }
+          const transactionKeychainGrant = this.readSingleGrantRollbackKeychain(coords.service, coords.account);
           if (keychainDigest(transactionKeychainGrant) !== decision.kd0) throw new RetryS2();
           // S2 (iii): roll back, then wait outside the transaction for a live
           // lease. Expired leases are ignored, like acquireRefreshLease.
