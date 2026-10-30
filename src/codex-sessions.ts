@@ -185,8 +185,9 @@ export function readCodexSwitchHistory(
     const config = db.prepare("SELECT value FROM config WHERE key = 'codex.recoveryFence'").get() as { value?: unknown } | undefined;
     const fenceValue = config?.value;
     const recoveryFence = typeof fenceValue === 'string' ? parseCodexRecoveryFence(fenceValue) : null;
-    // Any stored value that is not the exact fence shape (including a non-string) fails closed.
-    const malformedFence = fenceValue !== undefined && fenceValue !== null && recoveryFence === null;
+    // Any stored value that is not the exact fence shape (a non-string or NULL included) fails
+    // closed. Clearing a fence deletes the row, so only an absent row means no fence.
+    const malformedFence = config !== undefined && recoveryFence === null;
     const journal = readCodexSwitchJournal({ journalDir: options.journalDir });
     // A journal that exists but cannot be parsed is never treated as absent.
     const malformedJournal = journal.state === 'malformed';
@@ -196,6 +197,8 @@ export function readCodexSwitchHistory(
     const journalInvolved = journalNeedsRow
       ? expandInvolvedAccounts(journal.journal.unresolved?.involvedAccounts ?? [journal.journal.from, journal.journal.to], slots)
       : [];
+    const fenceInvolved = recoveryFence === null ? []
+      : [recoveryFence.from, recoveryFence.to, ...expandInvolvedAccounts(recoveryFence.involvedAccounts, slots)];
     let synthetic: Omit<CodexSwitchLogRow, 'id'> | undefined;
     if (malformedFence || malformedJournal) {
       // A malformed durable fence or journal is conservatively active from the
@@ -203,7 +206,8 @@ export function readCodexSwitchHistory(
       synthetic = {
         provider: 'openai-codex', fromAccountId: null, toAccountId: slots[0] ?? '',
         outcome: 'in-flight', publishedAt: 0, attemptedAt: 0,
-        open_sessions_json: '[]', involved: expandInvolvedAccounts('*', slots),
+        // '*' never drops an account that a still-valid fence or journal names.
+        open_sessions_json: '[]', involved: [...new Set([...slots, ...fenceInvolved, ...journalInvolved])],
       };
     } else if (recoveryFence !== null) {
       const source = rows.find((row) => row.id === recoveryFence.switchId);
@@ -212,7 +216,7 @@ export function readCodexSwitchHistory(
         outcome: 'in-flight', publishedAt: recoveryFence.publishedAt, attemptedAt: recoveryFence.publishedAt,
         open_sessions_json: source?.open_sessions_json ?? '[]',
         // Involved sets are only ever unioned, never shrunk: keep an uncommitted journal's accounts too.
-        involved: [...new Set([...expandInvolvedAccounts(recoveryFence.involvedAccounts, slots), ...journalInvolved])],
+        involved: [...new Set([...fenceInvolved, ...journalInvolved])],
       };
     } else if (journalNeedsRow) {
       synthetic = {
@@ -414,11 +418,14 @@ export function holderEras(switchLogRows: readonly CodexSwitchLogRow[]): HolderE
   );
 }
 
-/** Every account a standing recovery fence (a synthetic in-flight row) keeps live. */
+/**
+ * Every account a standing recovery fence keeps live. Only the synthetic row
+ * from readCodexSwitchHistory carries `involved`; a stored row never does.
+ */
 function fencedIdentities(rows: readonly CodexSwitchLogRow[]): Set<string> {
   const fenced = new Set<string>();
   for (const row of rows) {
-    if (row.outcome !== 'in-flight') continue;
+    if (row.outcome !== 'in-flight' || row.involved === undefined) continue;
     for (const identity of [row.fromAccountId, row.toAccountId, ...(row.involved ?? [])]) {
       if (identity) fenced.add(identity);
     }

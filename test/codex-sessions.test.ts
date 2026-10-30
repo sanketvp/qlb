@@ -90,7 +90,7 @@ function fenceHistoryDb(dir: string, fenceValue?: unknown): string {
     CREATE TABLE codex_slots (account_id TEXT PRIMARY KEY);`);
     db.prepare('INSERT INTO codex_slots (account_id) VALUES (?), (?), (?)').run(A, B, C);
     if (fenceValue !== undefined) {
-      db.prepare('INSERT INTO config (key, value) VALUES (?, ?)').run('codex.recoveryFence', fenceValue as string | number);
+      db.prepare('INSERT INTO config (key, value) VALUES (?, ?)').run('codex.recoveryFence', fenceValue as string | number | null);
     }
   } finally {
     db.close();
@@ -266,6 +266,45 @@ describe('Codex session process list and holder eras', () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it('a NULL recovery fence value keeps every slot live', () => {
+    const dir = mkdtempSync('/tmp/qlb-codex-null-fence-history-');
+    try {
+      const dbPath = fenceHistoryDb(dir, null);
+      assert.deepEqual(openIdentities(readCodexSwitchHistory(dbPath, { journalDir: join(dir, 'journal') }).rows), [A, B, C].sort());
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a malformed journal keeps a valid fence account that is no longer a slot', () => {
+    const dir = mkdtempSync('/tmp/qlb-codex-malformed-journal-fence-history-');
+    try {
+      const D = 'user-d:account-d';
+      const dbPath = fenceHistoryDb(dir, JSON.stringify({
+        v: 1, switchId: 81, attempt: 'fence-attempt', from: A, to: B,
+        publishedAt: T0, reason: 'slot-split', involvedAccounts: [A, B, D], since: T0 + 1,
+      }));
+      const journalDir = join(dir, 'journal');
+      mkdirSync(journalDir, { recursive: true });
+      writeFileSync(join(journalDir, 'switch-openai-codex.json'), '{"v":2');
+      assert.deepEqual(openIdentities(readCodexSwitchHistory(dbPath, { journalDir }).rows), [A, B, C, D].sort());
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a stored in-flight row without an involved set is not a permanent fence', () => {
+    const stored: CodexSwitchLogRow = {
+      id: 7, provider: 'openai-codex', fromAccountId: A, toAccountId: B, outcome: 'in-flight',
+      publishedAt: T0, attemptedAt: T0,
+    };
+    const ok: CodexSwitchLogRow = {
+      id: 8, provider: 'openai-codex', fromAccountId: A, toAccountId: B, outcome: 'ok',
+      publishedAt: T0 + 60_000, attemptedAt: T0 + 60_000,
+    };
+    assert.deepEqual(openIdentities([stored, ok]), [B]);
   });
 
   it('a non-string recovery fence value keeps every slot live', () => {
