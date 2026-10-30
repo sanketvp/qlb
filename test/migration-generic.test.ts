@@ -2135,7 +2135,11 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       mkdirSync(lock);
       writeFileSync(join(lock, 'qlb-lock-owner.json'), `${JSON.stringify({ pid: process.pid, nonce: 'another-holder' })}\n`);
 
-      assert.throws(() => mig.rollback(), /pi-auth-locked/);
+      assert.throws(() => mig.rollback(), (error: unknown) => {
+        assert.match(String((error as Error).message), /pi-auth-locked/);
+        assert.equal((error as { exitCode?: unknown }).exitCode, 3, 'a held owner-map lock refuses with exit 3');
+        return true;
+      });
       const held = JSON.parse(readFileSync(ownerMapPath, 'utf8')) as { providers: Record<string, unknown> };
       assert.ok(held.providers.xai, 'a held owner-map lock keeps the v2 entry');
 

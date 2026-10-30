@@ -1947,7 +1947,17 @@ export class Migration {
         // a directory; it is not re-entrant, so only a different one is taken here.
         const unown = () => writePiOwnerEntry(this.ownerMapPath, this.ownerProvider(), false);
         if (resolve(dirname(this.ownerMapPath), 'auth.json') === resolve(this.poolFilePath)) unown();
-        else this.withOwnerMapLock(unown);
+        else {
+          try {
+            this.withOwnerMapLock(unown);
+          } catch (error: unknown) {
+            // A held owner-map lock is the same refusal as a held auth lock (exit 3).
+            if (error && typeof error === 'object' && (error as { code?: unknown }).code === 'pi-auth-locked') {
+              throw Object.assign(error, { exitCode: 3 });
+            }
+            throw error;
+          }
+        }
         unlinkIfExists(this.ownerFilePath);
         // The un-own must survive power loss before S5 records the hand-back:
         // resume after S5 never revisits the owner claim.
