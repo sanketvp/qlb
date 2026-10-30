@@ -361,6 +361,8 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
               return null;
             }
           })();
+          // Pin the starting state so the before/after comparison cannot pass vacuously.
+          assert.equal(keychainBefore === null, command === 'stage', `${command} starts with the staged item ${command === 'stage' ? 'absent' : 'present'}`);
 
           assert.throws(
             () => h.mig[command](),
@@ -409,6 +411,8 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
               return null;
             }
           })();
+          // Pin the starting state so the before/after comparison cannot pass vacuously.
+          assert.equal(keychainBefore === null, command === 'stage', `${command} starts with the staged item ${command === 'stage' ? 'absent' : 'present'}`);
 
           assert.throws(
             () => h.mig[command](),
