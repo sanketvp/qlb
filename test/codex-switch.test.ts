@@ -19,6 +19,7 @@ import {
   probeCodexSwitchJournal,
   readCodexSwitchJournal,
   releaseCodexSwitchJournal,
+  releaseCodexSwitchJournalHeld,
   withCodexSwitchJournalOwner,
   writeCodexSwitchJournal,
 } from '../src/codex-switch';
@@ -218,6 +219,73 @@ describe('Codex switch journal v2', () => {
       assert.equal(fsynced, h.journalDir);
       assert.deepEqual(readCodexSwitchJournal(h.options), { state: 'ok', journal: journalFixture(h.root) });
       assert.doesNotMatch(readFileSync(path, 'utf8'), /fixture-token-value/);
+    } finally { executingCodexAttempts.clear(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('the journal writer persists only allowlisted fields, so extra caller properties never reach disk', () => {
+    const h = journalHarness();
+    try {
+      const fixture = journalFixture(h.root);
+      const leaky = { ...fixture, extraSecret: 'fixture-token-value',
+        openSessions: [{ ...fixture.openSessions[0], access_token: 'fixture-token-value' } as CodexSwitchJournal['openSessions'][number]] } as CodexSwitchJournal;
+      writeCodexSwitchJournal(leaky, h.options);
+      assert.doesNotMatch(readFileSync(codexSwitchJournalPath(h.options), 'utf8'), /fixture-token-value/);
+      assert.deepEqual(readCodexSwitchJournal(h.options), { state: 'ok', journal: fixture });
+    } finally { executingCodexAttempts.clear(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('a recovery mark does not re-register a finished attempt, so the same process can still resume it', async () => {
+    const h = journalHarness();
+    try {
+      writeCodexSwitchJournal(journalFixture(h.root, { owner: { pid: process.pid, lstart: 'fixture', state: 'active' } }), h.options);
+      finishCodexSwitchAttempt('attempt-1');
+      const probe = await probeCodexSwitchJournal({ ...h.options, sameProcess: async () => true },
+        ({ held }) => markCodexSwitchJournalUnresolved(held, 'attempt-1', 'slot-split', ['from:account'], h.options));
+      assert.equal(probe.state === 'orphaned' ? probe.result : undefined, true);
+      assert.equal(executingCodexAttempts.has('attempt-1'), false);
+      assert.equal((await probeCodexSwitchJournal({ ...h.options, sameProcess: async () => true })).state, 'orphaned');
+    } finally { executingCodexAttempts.clear(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('an orphaned journal is handed over with the owner lock held, and release works under that lock', async () => {
+    const h = journalHarness();
+    try {
+      writeCodexSwitchJournal(journalFixture(h.root), h.options);
+      const probe = await probeCodexSwitchJournal(h.options, ({ held }) => releaseCodexSwitchJournalHeld(held, 'attempt-1', h.options));
+      assert.equal(probe.state === 'orphaned' ? probe.result : undefined, true);
+      const read = readCodexSwitchJournal(h.options);
+      assert.equal(read.state === 'ok' ? read.journal.owner.state : undefined, 'released');
+    } finally { executingCodexAttempts.clear(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('a live successor that replaced the journal while the probe waited for the owner lock is in progress, not orphaned', async () => {
+    const h = journalHarness();
+    try {
+      writeCodexSwitchJournal(journalFixture(h.root), h.options);
+      const options = { ...h.options, ownerLockTimeoutMs: 5_000, sameProcess: async (owner: { pid: number }) => owner.pid === 4242 };
+      let probe: ReturnType<typeof probeCodexSwitchJournal> | undefined;
+      await withCodexSwitchJournalOwner(options, async () => {
+        probe = probeCodexSwitchJournal(options, () => assert.fail('a live successor must not be handed over'));
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        writeCodexSwitchJournal(journalFixture(h.root, { attemptId: 'attempt-2', owner: { pid: 4242, lstart: 'successor', state: 'active' } }), options);
+      });
+      const result = await probe!;
+      assert.equal(result.state, 'in-progress');
+      assert.equal(result.state === 'in-progress' ? result.journal.attemptId : undefined, 'attempt-2');
+    } finally { executingCodexAttempts.clear(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('an owner lease lost during a journal operation is reported as a failure, not success', async () => {
+    const h = journalHarness();
+    try {
+      writeCodexSwitchJournal(journalFixture(h.root), h.options);
+      const lock = codexSwitchJournalOwnerLockPath(h.options);
+      await assert.rejects(withCodexSwitchJournalOwner(h.options, () => {
+        rmSync(lock, { recursive: true, force: true });
+        mkdirSync(lock);
+        return true;
+      }));
+      assert.ok(statSync(lock).isDirectory(), "the successor's lock is left in place");
     } finally { executingCodexAttempts.clear(); rmSync(h.root, { recursive: true, force: true }); }
   });
 

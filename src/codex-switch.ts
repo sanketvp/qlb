@@ -209,7 +209,7 @@ function parseCodexSwitchJournal(value: unknown): CodexSwitchJournal | null {
   return { v: 2, attemptId: value.attemptId, from: value.from, to: value.to,
     target: { identity: { chatgpt_user_id: value.target.identity.chatgpt_user_id, account_id: value.target.identity.account_id }, fingerprint: value.target.fingerprint },
     adoptingTarget: [...value.adoptingTarget], trigger: value.trigger, decision,
-    openSessions: value.openSessions.map((process) => ({ ...process })),
+    openSessions: value.openSessions.map(({ pid, lstart, host }) => ({ pid, lstart, host })),
     outgoing: { sha256: value.outgoing.sha256, inode: value.outgoing.inode as number }, publishedAt: value.publishedAt,
     owner: { pid: value.owner.pid as number, lstart: value.owner.lstart, state: value.owner.state },
     ...(unresolved === undefined ? {} : { unresolved }) };
@@ -226,13 +226,19 @@ export function readCodexSwitchJournal(options: CodexSwitchJournalOptions = {}):
   }
 }
 
-/** Atomically write mode-0600 journal bytes, then fsync the containing directory. */
-export function writeCodexSwitchJournal(journal: CodexSwitchJournal, options: CodexSwitchJournalOptions = {}): void {
-  if (parseCodexSwitchJournal(journal) === null) throw new Error('Invalid Codex switch journal');
+/** Persist only the parsed, allowlisted fields, so extra caller properties never reach disk. */
+function persistCodexSwitchJournal(journal: CodexSwitchJournal, options: CodexSwitchJournalOptions): void {
+  const parsed = parseCodexSwitchJournal(journal);
+  if (parsed === null) throw new Error('Invalid Codex switch journal');
   const path = codexSwitchJournalPath(options);
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-  atomicWriteText(path, `${JSON.stringify(journal)}\n`, { mode: 0o600, followSymlinks: false });
+  atomicWriteText(path, `${JSON.stringify(parsed)}\n`, { mode: 0o600, followSymlinks: false });
   (options.fsyncDirectory ?? fsyncDirSync)(dirname(path));
+}
+
+/** The attempt's own write: atomic mode-0600 bytes plus a dir fsync, and registers the attempt as executing. */
+export function writeCodexSwitchJournal(journal: CodexSwitchJournal, options: CodexSwitchJournalOptions = {}): void {
+  persistCodexSwitchJournal(journal, options);
   executingCodexAttempts.add(journal.attemptId);
 }
 
@@ -248,7 +254,12 @@ export async function withCodexSwitchJournalOwner<T>(options: CodexSwitchJournal
     retryMinMs: options.ownerLockRetryMinMs, retryJitterMs: options.ownerLockRetryJitterMs,
     // Always opt in: a journal owner must never silently publish after takeover.
     onCompromised: (error) => { options.onOwnerLockCompromised?.(error); },
-  }, (proper: HeldProperLockfile) => fn({ [journalOwnerHandle]: true, journalDir, assertHeld: () => proper.assertNotCompromised() }));
+  }, async (proper: HeldProperLockfile) => {
+    const result = await fn({ [journalOwnerHandle]: true, journalDir, assertHeld: () => proper.assertNotCompromised() });
+    // A lease lost during fn must surface as a failure, never as a reported success.
+    proper.assertNotCompromised();
+    return result;
+  });
 }
 
 function assertJournalOwner(held: HeldCodexSwitchJournalOwner, options: CodexSwitchJournalOptions): void {
@@ -266,7 +277,7 @@ export function markCodexSwitchJournalUnresolved(held: HeldCodexSwitchJournalOwn
   const current = readCodexSwitchJournal(resolved);
   if (current.state !== 'ok' || current.journal.attemptId !== attemptId) return false;
   const previous = current.journal.unresolved;
-  writeCodexSwitchJournal({ ...current.journal, unresolved: { reason,
+  persistCodexSwitchJournal({ ...current.journal, unresolved: { reason,
     involvedAccounts: unionAccounts(previous?.involvedAccounts ?? [], involvedAccounts),
     since: previous?.since ?? (options.now ?? Date.now)() } }, resolved);
   return true;
@@ -278,7 +289,7 @@ export function markCodexSwitchJournalAdoptingTarget(held: HeldCodexSwitchJourna
   assertJournalOwner(held, resolved);
   const current = readCodexSwitchJournal(resolved);
   if (current.state !== 'ok' || current.journal.attemptId !== attemptId) return false;
-  writeCodexSwitchJournal({ ...current.journal, adoptingTarget: [...current.journal.adoptingTarget, fingerprint] }, resolved);
+  persistCodexSwitchJournal({ ...current.journal, adoptingTarget: [...current.journal.adoptingTarget, fingerprint] }, resolved);
   return true;
 }
 
@@ -293,39 +304,56 @@ export function deleteCodexSwitchJournalIf(journalDir: string, attemptId: string
   return true;
 }
 
-/** Re-acquire a ten-second owner lease and change only matching owner.state to released. */
-export async function releaseCodexSwitchJournal(attemptId: string, options: CodexSwitchJournalOptions = {}): Promise<boolean> {
-  return withCodexSwitchJournalOwner({ ...options, ownerLockTimeoutMs: CODEX_SWITCH_JOURNAL_TIMEOUT_MS }, () => {
-    const current = readCodexSwitchJournal(options);
-    if (current.state !== 'ok' || current.journal.attemptId !== attemptId) return false;
-    writeCodexSwitchJournal({ ...current.journal, owner: { ...current.journal.owner, state: 'released' } }, options);
-    return true;
-  });
+/** Conditional release under a held owner lock: change only a matching journal's owner.state. */
+export function releaseCodexSwitchJournalHeld(held: HeldCodexSwitchJournalOwner, attemptId: string, options: CodexSwitchJournalOptions = {}): boolean {
+  const resolved = { ...options, journalDir: held.journalDir };
+  assertJournalOwner(held, resolved);
+  const current = readCodexSwitchJournal(resolved);
+  if (current.state !== 'ok' || current.journal.attemptId !== attemptId) return false;
+  persistCodexSwitchJournal({ ...current.journal, owner: { ...current.journal.owner, state: 'released' } }, resolved);
+  return true;
 }
 
-export type CodexSwitchJournalProbe =
+/** When the owner lock was lost: re-acquire a ten-second owner lease, then release conditionally. */
+export async function releaseCodexSwitchJournal(attemptId: string, options: CodexSwitchJournalOptions = {}): Promise<boolean> {
+  return withCodexSwitchJournalOwner({ ...options, ownerLockTimeoutMs: CODEX_SWITCH_JOURNAL_TIMEOUT_MS },
+    (held) => releaseCodexSwitchJournalHeld(held, attemptId, options));
+}
+
+export type CodexSwitchJournalProbe<T = undefined> =
   | { state: 'absent' } | { state: 'malformed' }
   | { state: 'in-progress'; journal: CodexSwitchJournal }
-  | { state: 'orphaned'; journal: CodexSwitchJournal }
+  | { state: 'orphaned'; journal: CodexSwitchJournal; result: T | undefined }
   | { state: 'owner-lock-not-yet-stale'; journal: CodexSwitchJournal; retryAt: number };
 function ownerLockRetryAt(options: CodexSwitchJournalOptions): number {
   try { return statSync(codexSwitchJournalOwnerLockPath(options)).mtimeMs + (options.ownerLockStalenessMs ?? CODEX_SWITCH_JOURNAL_STALENESS_MS); }
   catch { return (options.now ?? Date.now)() + (options.ownerLockStalenessMs ?? CODEX_SWITCH_JOURNAL_STALENESS_MS); }
 }
 
-/** Probe under the caller's switch→auth locks; a live active owner wins at any lock age. */
-export async function probeCodexSwitchJournal(options: CodexSwitchJournalOptions = {}): Promise<CodexSwitchJournalProbe> {
+async function journalInProgress(journal: CodexSwitchJournal, options: CodexSwitchJournalOptions): Promise<boolean> {
+  return journal.owner.state === 'active'
+    && await (options.sameProcess ?? stillTheSameProcess)(journal.owner)
+    && !(journal.owner.pid === process.pid && !executingCodexAttempts.has(journal.attemptId));
+}
+
+export type OrphanedCodexSwitchJournal = { journal: CodexSwitchJournal; held: HeldCodexSwitchJournalOwner };
+
+/**
+ * Probe under the caller's switch→auth locks; a live active owner wins at any lock age.
+ * An orphaned journal is handed to `onOrphaned` while the owner lock is still held.
+ */
+export async function probeCodexSwitchJournal<T = undefined>(options: CodexSwitchJournalOptions = {},
+  onOrphaned?: (orphan: OrphanedCodexSwitchJournal) => Promise<T> | T): Promise<CodexSwitchJournalProbe<T>> {
   const initial = readCodexSwitchJournal(options);
   if (initial.state !== 'ok') return initial;
-  const ownerAlive = initial.journal.owner.state === 'active'
-    && await (options.sameProcess ?? stillTheSameProcess)(initial.journal.owner);
-  if (ownerAlive && !(initial.journal.owner.pid === process.pid && !executingCodexAttempts.has(initial.journal.attemptId))) {
-    return { state: 'in-progress', journal: initial.journal };
-  }
+  if (await journalInProgress(initial.journal, options)) return { state: 'in-progress', journal: initial.journal };
   try {
-    return await withCodexSwitchJournalOwner(options, () => {
+    return await withCodexSwitchJournalOwner<CodexSwitchJournalProbe<T>>(options, async (held) => {
       const reread = readCodexSwitchJournal(options);
-      return reread.state === 'ok' ? { state: 'orphaned', journal: reread.journal } : reread;
+      if (reread.state !== 'ok') return reread;
+      // A successor may have replaced the journal while we waited for the owner lock.
+      if (await journalInProgress(reread.journal, options)) return { state: 'in-progress', journal: reread.journal };
+      return { state: 'orphaned', journal: reread.journal, result: await onOrphaned?.({ journal: reread.journal, held }) };
     });
   } catch (error) {
     if (error instanceof ClaudeCodeLockTimeout) return { state: 'owner-lock-not-yet-stale', journal: initial.journal, retryAt: ownerLockRetryAt(options) };
