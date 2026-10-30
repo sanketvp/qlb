@@ -29,6 +29,7 @@ import { parseGrant } from '../src/refresh-lease';
 import type { RollbackDecision } from '../src/single-grant-ownership';
 import { legacyPiAuthBackupPath, piAuthBackupPath, readPiAuthBackup, writePiAuthBackup } from '../src/pi-auth-backup';
 import { canonicalDigest, keychainDigest, restoreRecordFor } from '../src/pi-handback-source';
+import { hasLegacyPiOwnerEntry } from '../src/pi-migrate';
 import { openStore } from '../src/store';
 
 const fs = require('node:fs') as typeof import('node:fs');
@@ -2186,6 +2187,28 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       assert.ok(JSON.parse(h.store.getMigration('pi-xai')!.detail_json).lastRollback);
     } finally {
       h.cleanup();
+    }
+  });
+
+  it('S4a leaves a v1 owner file at the map path to the owner-file unlink and completes the hand-back (P7b5-40 r3)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-generic-mig-'));
+    const store = openStore(join(dir, 'qlb.db'));
+    try {
+      const authPath = join(dir, 'auth.json');
+      const ownerMapPath = join(dir, 'qlb-owner.json');
+      writeFileSync(authPath, fixtureAuthJson(), { encoding: 'utf8', mode: 0o600 });
+      const mig = createSingleGrantMigration(store, new MockKeychain(), 'xai', authPath, ownerMapPath, 'xai', {});
+      mig.stage();
+      await mig.rehearse(mockRehearse([]));
+      mig.commit();
+      assert.equal(hasLegacyPiOwnerEntry(ownerMapPath, 'xai'), true, 'the commit wrote a v1 owner file at the map path');
+
+      mig.rollback();
+      assert.equal(existsSync(ownerMapPath), false, 'the v1 owner file is unlinked');
+      assert.ok(JSON.parse(store.getMigration('pi-xai')!.detail_json).lastRollback);
+    } finally {
+      store.close();
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 

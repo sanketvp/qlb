@@ -1945,7 +1945,15 @@ export class Migration {
         // S4a: atomic and idempotent, under the owner-map lock. rollback()/resume()
         // already hold Pi's auth.json lock, which is that lock when both files share
         // a directory; it is not re-entrant, so only a different one is taken here.
-        const unown = () => writePiOwnerEntry(this.ownerMapPath, this.ownerProvider(), false);
+        // A v1 document at the map path has no v2 entry to remove; the owner-file
+        // unlink below handles it, as before S4a.
+        const unown = () => {
+          try {
+            writePiOwnerEntry(this.ownerMapPath, this.ownerProvider(), false);
+          } catch (error: unknown) {
+            if (!(error instanceof PiOwnerLegacyError)) throw error;
+          }
+        };
         if (resolve(dirname(this.ownerMapPath), 'auth.json') === resolve(this.poolFilePath)) unown();
         else {
           try {
