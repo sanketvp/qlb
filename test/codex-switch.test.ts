@@ -237,6 +237,40 @@ describe('Codex recovery fence state — C6-12', () => {
   });
 });
 
+describe('Codex recovery fence state — C6-12 review r1', () => {
+  it('a present recovery-fence row with a NULL value fences every account as malformed', () => {
+    const h = fixture();
+    try {
+      h.db.prepare("INSERT INTO config (key, value) VALUES ('codex.recoveryFence', NULL)").run();
+      const state = codexRecoveryFenceState(join(h.root, 'no-journal'), h.store);
+      assert.equal(state.state, 'fenced');
+      if (state.state !== 'fenced') return;
+      assert.equal(state.accounts, '*');
+      assert.equal(state.reason, 'switch-recovery-malformed');
+    } finally {
+      h.store.close();
+      rmSync(h.root, { recursive: true, force: true });
+    }
+  });
+
+  it('an in-flight journal is refused switch-in-flight without the unresolved-fence login instruction', () => {
+    const h = fixture();
+    const journalDir = join(h.root, 'journal');
+    try {
+      writeCodexSwitchJournal(journalFixture(h.root), { journalDir });
+      const state = codexRecoveryFenceState(journalDir, h.store);
+      assert.equal(state.state, 'fenced');
+      if (state.state !== 'fenced') return;
+      assert.equal(state.reason, 'switch-in-flight');
+      assert.doesNotMatch(state.message, /codex login|import-active/);
+      assert.deepEqual((state.accounts === '*' ? [] : [...state.accounts]).sort(), ['from:account', 'to:account']);
+    } finally {
+      h.store.close();
+      rmSync(h.root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('Codex switch journal v2', () => {
   it('journal v2 round-trips at mode 0600 and contains no token value', () => {
     const h = journalHarness();

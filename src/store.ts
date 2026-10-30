@@ -2154,6 +2154,11 @@ export class Store {
     return row?.value ?? null;
   }
 
+  /** True when a config row exists, even one whose value is NULL. */
+  hasConfig(key: string): boolean {
+    return this.getConfigStmt.get(key) !== undefined;
+  }
+
   setConfig(key: string, value: string): void {
     this.setConfigStmt.run(key, value);
   }

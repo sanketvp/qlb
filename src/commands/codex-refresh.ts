@@ -76,12 +76,12 @@ export async function runCodexRefreshCommand(args: string[], deps: CodexRefreshC
     allowHeld: parsed.c9,
     c9: parsed.c9,
   });
+  const output = { accountId: parsed.accountId, status: result.status };
+  write(parsed.json ? JSON.stringify(output) : `${parsed.accountId}: ${result.status}`);
   if (result.status === 'switch-in-flight') {
     error(result.message ?? 'codex refresh refused: switch-in-flight');
     return 3;
   }
-  const output = { accountId: parsed.accountId, status: result.status };
-  write(parsed.json ? JSON.stringify(output) : `${parsed.accountId}: ${result.status}`);
   if (result.stashId) error(`codex refresh successor stash: ${result.stashId}`);
   if (result.status === 'successor-unpersisted') {
     error('codex refresh failed: successor-unpersisted');

@@ -248,12 +248,13 @@ function unionRecoveryAccounts(...accounts: Array<string[] | '*'>): Set<string> 
  */
 export function codexRecoveryFenceState(
   journalDir: string,
-  store: Pick<Store, 'getConfig'>,
+  store: Pick<Store, 'getConfig' | 'hasConfig'>,
 ): CodexRecoveryFenceState {
   const journal = readCodexSwitchJournal({ journalDir });
-  const fenceValue = store.getConfig('codex.recoveryFence');
-  const configFence = parseCodexRecoveryFence(fenceValue);
-  if (journal.state === 'malformed' || (fenceValue !== null && configFence === null)) {
+  const configFence = parseCodexRecoveryFence(store.getConfig('codex.recoveryFence'));
+  // Clearing a fence deletes the row, so any present row that does not parse
+  // (a NULL value included) fails closed, as in readCodexSwitchHistory.
+  if (journal.state === 'malformed' || (store.hasConfig('codex.recoveryFence') && configFence === null)) {
     const reason = 'switch-recovery-malformed';
     return { state: 'fenced', accounts: '*', reason, message: codexRecoveryFenceMessage(reason) };
   }
@@ -264,8 +265,14 @@ export function codexRecoveryFenceState(
       [journal.journal.from, journal.journal.to], journalAccounts,
       ...(configFence === null ? [] : [[configFence.from, configFence.to], configAccounts]),
     );
-    const reason = journal.journal.unresolved?.reason ?? 'switch-in-flight';
-    return { state: 'fenced', accounts, reason, message: codexRecoveryFenceMessage(reason) };
+    const unresolved = journal.journal.unresolved;
+    if (!unresolved) {
+      // §3.1's "needs you" text is for unresolved fences; a journal still in
+      // flight finishes or is recovered without the operator.
+      const reason = 'switch-in-flight';
+      return { state: 'fenced', accounts, reason, message: `codex refresh refused: ${reason} (a Codex switch involving this account has not finished)` };
+    }
+    return { state: 'fenced', accounts, reason: unresolved.reason, message: codexRecoveryFenceMessage(unresolved.reason) };
   }
   if (configFence !== null) {
     const accounts = unionRecoveryAccounts([configFence.from, configFence.to], configFence.involvedAccounts);
