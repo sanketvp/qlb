@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { writeCodexSwitchJournal, type CodexSwitchJournal } from '../src/codex-switch';
 import { join } from 'node:path';
 import {
@@ -72,6 +72,36 @@ const switchRows = [
   row(2, B, A, 'ok', T0 + 15_000),
   row(3, A, C, 'ok', T0 + 25_000),
 ];
+
+function fenceHistoryDb(dir: string, fenceValue?: unknown): string {
+  const dbPath = join(dir, 'qlb.db');
+  const db = new DatabaseSync(dbPath);
+  try {
+    db.exec(`CREATE TABLE switch_log (
+      id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, provider TEXT NOT NULL,
+      from_account TEXT, to_account TEXT NOT NULL, outcome TEXT NOT NULL,
+      detail TEXT, published_at INTEGER, steps_json TEXT, open_sessions_json TEXT
+    );
+    CREATE TABLE codex_live_observations (
+      id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, identity TEXT,
+      lineage_fp TEXT, by TEXT NOT NULL
+    );
+    CREATE TABLE config (key TEXT PRIMARY KEY, value);
+    CREATE TABLE codex_slots (account_id TEXT PRIMARY KEY);`);
+    db.prepare('INSERT INTO codex_slots (account_id) VALUES (?), (?), (?)').run(A, B, C);
+    if (fenceValue !== undefined) {
+      db.prepare('INSERT INTO config (key, value) VALUES (?, ?)').run('codex.recoveryFence', fenceValue as string | number);
+    }
+  } finally {
+    db.close();
+  }
+  return dbPath;
+}
+
+function openIdentities(rows: readonly CodexSwitchLogRow[]): string[] {
+  return holderEras(rows).filter((era) => era.endsAt === null).map((era) => era.identity).sort();
+}
+
 
 describe('Codex session process list and holder eras', () => {
   it('uses Codex auth’s canonical composite key for holder-era lookups', () => {
@@ -180,7 +210,8 @@ describe('Codex session process list and holder eras', () => {
     try {
       const history = readCodexSwitchHistory(dbPath, { journalDir: join(dir, 'journal') });
       assert.deepEqual(holderEras(history.rows).filter((era) => era.endsAt === null), [
-        { identity: A, startsAt: T0, endsAt: null },
+        // The fence's source keeps its prehistory: processes already holding it stay renewers.
+        { identity: A, startsAt: null, endsAt: null },
         { identity: B, startsAt: T0, endsAt: null },
         { identity: C, startsAt: T0, endsAt: null },
       ]);
@@ -222,6 +253,52 @@ describe('Codex session process list and holder eras', () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it('a malformed on-disk journal keeps every slot live instead of reading as absent', () => {
+    const dir = mkdtempSync('/tmp/qlb-codex-malformed-journal-history-');
+    try {
+      const dbPath = fenceHistoryDb(dir);
+      const journalDir = join(dir, 'journal');
+      mkdirSync(journalDir, { recursive: true });
+      writeFileSync(join(journalDir, 'switch-openai-codex.json'), '{"v":2');
+      assert.deepEqual(openIdentities(readCodexSwitchHistory(dbPath, { journalDir }).rows), [A, B, C].sort());
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a non-string recovery fence value keeps every slot live', () => {
+    const dir = mkdtempSync('/tmp/qlb-codex-numeric-fence-history-');
+    try {
+      const dbPath = fenceHistoryDb(dir, 42);
+      assert.deepEqual(openIdentities(readCodexSwitchHistory(dbPath, { journalDir: join(dir, 'journal') }).rows), [A, B, C].sort());
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a standing fence is not shrunk by a later ok switch or a later observation', () => {
+    const fence: CodexSwitchLogRow = {
+      id: -1, provider: 'openai-codex', fromAccountId: A, toAccountId: B, outcome: 'in-flight',
+      publishedAt: T0, attemptedAt: T0, involved: [A, B, C],
+    };
+    const ok: CodexSwitchLogRow = {
+      id: 81, provider: 'openai-codex', fromAccountId: A, toAccountId: B, outcome: 'ok',
+      publishedAt: T0, attemptedAt: T0,
+    };
+    assert.deepEqual(openIdentities([fence, ok]), [A, B, C].sort());
+    const sets = holderSets([fence, ok], [{ ts: T0 + 60_000, identity: B, lineageFp: null, by: 'test' }]);
+    assert.deepEqual(sets.at(-1)?.identities, [A, B, C].sort());
+  });
+
+  it('a process started before an unresolved switch published still renews its source account', () => {
+    const fence: CodexSwitchLogRow = {
+      id: -1, provider: 'openai-codex', fromAccountId: A, toAccountId: B, outcome: 'in-flight',
+      publishedAt: T0, attemptedAt: T0, involved: [A, B],
+    };
+    const before = { pid: 501, lstart: 'Fri Oct 24 11:59:50 2026', host: 'codex' };
+    assert.deepEqual(renewers(identityA, [before], [fence]), [before]);
   });
 
   it('a malformed recovery fence keeps every slot live', () => {
