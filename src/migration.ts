@@ -1872,7 +1872,7 @@ export class Migration {
   }
 
   private postCommitRollback(): MigrationStatus {
-    this.journal(this.journalState() === 'NATIVE' ? 'QLB_OWNED' : this.journalState(), {
+    this.journal(this.journalState(), {
       intent: 'rollback',
     });
     return this.continueRollback();

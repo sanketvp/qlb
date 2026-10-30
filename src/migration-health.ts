@@ -248,7 +248,9 @@ export function decodeJournalEvidence(row: {
   if (!ctl.ok) return untrusted(ctl.reason);
   const shape = checkShape(kind, state, detail.value);
   if (!shape.ok) return untrusted(shape.reason);
-  const required = kind === 'pi-transfer' && state !== 'NATIVE';
+  // A NATIVE row still carrying a rollback intent is mid-hand-back (S1 keeps
+  // the state), so it must name its participants exactly like an owned row.
+  const required = kind === 'pi-transfer' && (state !== 'NATIVE' || hasRollbackIntent(detail.value));
   const inv = decodeInventory(detail.value, { required, allowEmpty: !required });
   if (!inv.ok) return untrusted(inv.reason);
   return {
@@ -274,7 +276,11 @@ export function parseAccountIds(detailJson: string | null | undefined): ParseAcc
   return { ok: true, ids: ev.participants };
 }
 
-/** Doctor WARN predicate: untrusted, or trusted MIRRORED/VALIDATED. */
+export function hasRollbackIntent(detail: unknown): boolean {
+  return detail !== null && typeof detail === 'object' && (detail as { intent?: unknown }).intent != null;
+}
+
+/** Doctor WARN predicate: untrusted, trusted MIRRORED/VALIDATED, or an unfinished rollback. */
 export function isStuckMigration(migration: {
   store: string;
   state: string;
@@ -282,7 +288,12 @@ export function isStuckMigration(migration: {
 }): boolean {
   const ev = decodeJournalEvidence(migration);
   if (!ev.trusted) return true;
-  return ev.state === 'MIRRORED' || ev.state === 'VALIDATED';
+  if (ev.state === 'MIRRORED' || ev.state === 'VALIDATED') return true;
+  try {
+    return hasRollbackIntent(JSON.parse(migration.detail_json ?? 'null'));
+  } catch {
+    return false;
+  }
 }
 
 export function validatedAdvisoryMessage(store: string, accountCount: number): string {

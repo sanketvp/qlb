@@ -545,6 +545,29 @@ describe('accounts-prune in-flight migration refusal', () => {
       store.close();
     }
   });
+
+  it('REFUSES prune of a participant of a NATIVE pool row whose rollback is unfinished', () => {
+    const store = openTempStore();
+    seedOrphanAccount(store);
+    store.upsertMigration(
+      'pi-pool',
+      'NATIVE',
+      JSON.stringify({ qlbAccountIds: ['account-orphan'], intent: 'rollback' }),
+      Date.now(),
+    );
+    assert.throws(() => pruneAccount(store, { accountId: 'account-orphan', confirm: true }), PruneRefusedError);
+    assert.ok(store.getAccount('account-orphan'), 'S1 keeps NATIVE but the rollback still owns its accounts');
+    store.close();
+  });
+
+  it('a NATIVE pool row with a rollback intent but no inventory refuses every prune', () => {
+    const store = openTempStore();
+    seedOrphanAccount(store);
+    store.upsertMigration('pi-pool', 'NATIVE', JSON.stringify({ intent: 'rollback' }), Date.now());
+    assert.throws(() => pruneAccount(store, { accountId: 'account-orphan', confirm: true }), PruneRefusedError);
+    assert.ok(store.getAccount('account-orphan'));
+    store.close();
+  });
 });
 
 describe('accounts-prune TOCTOU / two-connection', () => {
