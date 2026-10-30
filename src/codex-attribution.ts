@@ -40,8 +40,11 @@ export interface AttributeLiveDocumentInput {
   now?: () => number;
   /** Assert the caller-owned Codex auth capability immediately before every mutation. */
   assertNotCompromised?: () => void;
-  /** Caller-owned atomic auth.json publication; injected for fixture-only tests. */
-  republish?: (document: CodexAuthDocument) => Promise<void> | void;
+  /**
+   * Caller-owned atomic auth.json publication; injected for fixture-only tests.
+   * `slotId` is the managed slot being republished (not re-derived from `document`).
+   */
+  republish?: (document: CodexAuthDocument, slotId: string) => Promise<void> | void;
   /** Runs inside attribution's final save before its first write. */
   beforeSave?: (db: DatabaseSync, dbPath: string, slotId: string) => undefined;
   /** Runs inside attribution's final save immediately before COMMIT. */
@@ -201,7 +204,7 @@ async function attributeSameSlot(
       return { action: 'slot-split', accountId: input.slot.accountId };
     }
     assertNotCompromised(input);
-    await input.republish?.(input.slot.document);
+    await input.republish?.(input.slot.document, input.slot.accountId);
     markImportedActive(input, slotFp, now);
     return { action: 'republish-slot', accountId: input.slot.accountId };
   }
