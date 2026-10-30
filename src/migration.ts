@@ -2213,7 +2213,7 @@ export class Migration {
     const restoredEntry = restored[authKey];
     if (
       restoredPresent !== record.entryPresent
-      || (record.entryPresent && (!isDeepStrictEqual(restoredEntry, record.entry) || !this.isValidSingleGrantRestoreEntry(restoredEntry, true)))
+      || (record.entryPresent && (!isDeepStrictEqual(restoredEntry, record.entry) || !isValidEntry(restoredEntry)))
     ) {
       throw Object.assign(new Error('restore verification failed'), { exitCode: 3 });
     }
@@ -2225,7 +2225,11 @@ export class Migration {
   }
 
   private isValidSingleGrantRestoreEntry(entry: unknown, entryPresent: boolean): boolean {
-    return !entryPresent || isValidEntry(entry);
+    if (!entryPresent) return true;
+    return isObjectRecord(entry)
+      && !isPiPlaceholder(entry)
+      && typeof entry.refresh === 'string'
+      && entry.refresh.length > 0;
   }
 
   private readSingleGrantAuth(): Record<string, unknown> {
