@@ -13,6 +13,10 @@ const PROVIDER = 'openai-codex';
 
 type Keychain = Pick<KeychainBackend, 'getSync' | 'setSync' | 'deleteSync'>;
 
+/** The store methods attribution and its successor proofs call. */
+export type CodexAttributionStore = Pick<Store, 'adoptCodexSlotWithKeychain' | 'getCodexSlot' | 'getCodexSlotByIdentity'
+  | 'getSlotLineage' | 'listLineageTransitions' | 'markCodexSlotImportedActive' | 'repairCodexSlotKeychain' | 'runImmediate'>;
+
 export type CodexAttributionAction = 'noop' | 'republish-slot' | 'adopt' | 'drift' | 'unclaimed' | 'wiped' | 'slot-split';
 
 export interface ManagedCodexDocument {
@@ -24,7 +28,7 @@ export interface ManagedCodexDocument {
 }
 
 export interface AttributeLiveDocumentInput {
-  store: Store;
+  store: CodexAttributionStore;
   keychain: Keychain;
   slot: ManagedCodexDocument;
   /** The active_login identity when it differs from the live identity's known slot. */

@@ -89,7 +89,7 @@ export function recordTransition(store: Store, transition: LineageTransition): n
  * equality must test it explicitly (S40).
  */
 export function isSuccessor(
-  store: Store,
+  store: Pick<Store, 'listLineageTransitions' | 'getSlotLineage'>,
   provider: string,
   accountId: string,
   ancestor: string,
