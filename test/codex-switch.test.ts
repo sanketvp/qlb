@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, fsyncSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -7,9 +7,11 @@ import { describe, it } from 'node:test';
 
 import {
   checkCodexSwitchPreconditions,
+  classifyPostPublish,
   codexRecoveryFenceState,
   freshenCodexTarget,
   preflightCodexLive,
+  publishCodexAuth,
   type CodexSwitchDeps,
   type CodexSwitchJournal,
   codexSwitchJournalOwnerLockPath,
@@ -27,7 +29,7 @@ import {
 } from '../src/codex-switch';
 import { ClaudeCodeLockTimeout } from '../src/cc-locks';
 import { codexLockPaths } from '../src/codex-consume';
-import { accessExpiry, codexFingerprint, type CodexAuthDocument } from '../src/codex-auth';
+import { accessExpiry, codexFingerprint, readCodexAuthStableWithStat, type CodexAuthDocument } from '../src/codex-auth';
 import type { CodexProcess } from '../src/codex-sessions';
 import { openStore } from '../src/store';
 
@@ -263,6 +265,171 @@ function journalFixture(root: string, overrides: Partial<CodexSwitchJournal> = {
     ...overrides,
   };
 }
+
+describe('Codex publish wrapper and post-publish classifier — C6-14', () => {
+  function document(refresh: string): CodexAuthDocument {
+    return freshenDocument(1_700_000_000_000 + 60 * 60_000, refresh);
+  }
+
+  function journal(root: string, target: CodexAuthDocument, overrides: Partial<CodexSwitchJournal> = {}): CodexSwitchJournal {
+    return journalFixture(root, {
+      target: { identity: { chatgpt_user_id: 'target', account_id: 'account' }, fingerprint: codexFingerprint(target) },
+      ...overrides,
+    });
+  }
+
+  it('the published target bytes classify ok', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-codex-publish-'));
+    try {
+      const path = join(root, 'auth.json');
+      const target = document('target-refresh');
+      const result = await publishCodexAuth(path, target);
+      assert.equal(result.stage, 'published');
+      const observed = await readCodexAuthStableWithStat(path, { delayMs: 0 });
+      assert.equal(classifyPostPublish({ journal: journal(root, target), publish: result, observed,
+        targetSlotFp: codexFingerprint(target) }), 'ok');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('a thrown rename classifies not-landed', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-codex-publish-'));
+    const mutableFs = require('node:fs') as { renameSync: typeof renameSync };
+    const originalRename = mutableFs.renameSync;
+    try {
+      const path = join(root, 'auth.json');
+      const target = document('target-refresh');
+      mutableFs.renameSync = () => { throw Object.assign(new Error('fixture rename failure'), { code: 'ENOSPC' }); };
+      const result = await publishCodexAuth(path, target);
+      assert.equal(result.stage, 'rename-threw');
+      const observed = { status: 'ok', doc: target, sha256: 'sha256-file:target', inode: 101 } as const;
+      assert.equal(classifyPostPublish({ journal: journal(root, target), publish: result, observed,
+        targetSlotFp: codexFingerprint(target) }), 'not-landed');
+    } finally {
+      mutableFs.renameSync = originalRename;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('unchanged inode and bytes classify not-landed in recovery', () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-codex-publish-'));
+    try {
+      const target = document('target-refresh');
+      const unchanged = { status: 'ok', doc: target, sha256: 'sha256-file:outgoing', inode: 42 } as const;
+      assert.equal(classifyPostPublish({ journal: journal(root, target), observed: unchanged,
+        targetSlotFp: codexFingerprint(target) }), 'not-landed');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('a parent-directory fsync error after the rename is verified, never classified not-landed', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-codex-publish-'));
+    const mutableFs = require('node:fs') as { fsyncSync: typeof fsyncSync };
+    const originalFsync = mutableFs.fsyncSync;
+    let fsyncs = 0;
+    try {
+      const path = join(root, 'auth.json');
+      const target = document('target-refresh');
+      mutableFs.fsyncSync = ((fd: number) => {
+        fsyncs += 1;
+        if (fsyncs === 2) throw Object.assign(new Error('fixture directory fsync failure'), { code: 'EIO' });
+        return originalFsync(fd);
+      }) as typeof fsyncSync;
+      const result = await publishCodexAuth(path, target);
+      assert.equal(result.stage, 'published');
+      assert.ok(result.dirFsyncError instanceof Error);
+      assert.deepEqual(JSON.parse(readFileSync(path, 'utf8')), target, 'rename landed before the directory sync failed');
+      const observed = await readCodexAuthStableWithStat(path, { delayMs: 0 });
+      assert.equal(classifyPostPublish({ journal: journal(root, target), publish: result, observed,
+        targetSlotFp: codexFingerprint(target) }), 'ok');
+    } finally {
+      mutableFs.fsyncSync = originalFsync;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('a publish through a symlinked auth.json fsyncs the directory the rename landed in (C6-14 r1)', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-codex-publish-'));
+    const mutableFs = require('node:fs') as { openSync: typeof import('node:fs').openSync };
+    const originalOpen = mutableFs.openSync;
+    const opened: string[] = [];
+    try {
+      const realDir = join(root, 'real');
+      const linkDir = join(root, 'codex');
+      mkdirSync(realDir);
+      mkdirSync(linkDir);
+      writeFileSync(join(realDir, 'auth.json'), '{}\n');
+      const path = join(linkDir, 'auth.json');
+      symlinkSync(join(realDir, 'auth.json'), path);
+      const target = document('target-refresh');
+      mutableFs.openSync = ((file: Parameters<typeof originalOpen>[0], ...rest: unknown[]) => {
+        opened.push(String(file));
+        return (originalOpen as (...args: unknown[]) => number)(file, ...rest);
+      }) as typeof originalOpen;
+      const result = await publishCodexAuth(path, target);
+      mutableFs.openSync = originalOpen;
+      assert.equal(result.stage, 'published');
+      assert.equal(result.stage === 'published' ? result.dirFsyncError : 'n/a', undefined);
+      assert.ok(lstatSync(path).isSymbolicLink(), 'the symlink is written through, not replaced');
+      assert.deepEqual(JSON.parse(readFileSync(join(realDir, 'auth.json'), 'utf8')), target);
+      assert.ok(opened.includes(realpathSync(realDir)), `the rename's directory is fsynced (opened: ${opened.join(', ')})`);
+    } finally {
+      mutableFs.openSync = originalOpen;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('slot B replaced after the swap with the live file still on the published bytes classifies target-changed', () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-codex-publish-'));
+    try {
+      const target = document('target-refresh');
+      const observed = { status: 'ok', doc: target, sha256: 'sha256-file:target', inode: 101 } as const;
+      assert.equal(classifyPostPublish({ journal: journal(root, target), observed,
+        targetSlotFp: 'sha256:replacement' }), 'target-changed');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('slot B and the live file both moved to B′ by an import after the swap classify target-changed, not ok', () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-codex-publish-'));
+    try {
+      const target = document('target-refresh');
+      const imported = { ...target, last_refresh: '2023-10-02T00:00:00.000Z' };
+      const observed = { status: 'ok', doc: imported, sha256: 'sha256-file:imported', inode: 101 } as const;
+      assert.equal(classifyPostPublish({ journal: journal(root, target), observed,
+        targetSlotFp: 'sha256:imported-slot' }), 'target-changed');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("slot B moved by QLB's own recorded post-publish adopt is not target-changed", () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-codex-publish-'));
+    try {
+      const target = document('target-refresh');
+      const adopted = document('adopted-refresh');
+      const observed = { status: 'ok', doc: adopted, sha256: 'sha256-file:adopted', inode: 101 } as const;
+      assert.deepEqual(classifyPostPublish({ journal: journal(root, target, { adoptingTarget: [codexFingerprint(adopted)] }), observed,
+        targetSlotFp: codexFingerprint(adopted) }), { status: 'external', doc: adopted });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('the outgoing inode with different bytes is external', () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-codex-publish-'));
+    try {
+      const target = document('target-refresh');
+      const external = document('external-refresh');
+      const observed = { status: 'ok', doc: external, sha256: 'sha256-file:external', inode: 42 } as const;
+      assert.deepEqual(classifyPostPublish({ journal: journal(root, target), observed,
+        targetSlotFp: codexFingerprint(target) }), { status: 'external', doc: external });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('unreadable passes through', () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-codex-publish-'));
+    try {
+      const target = document('target-refresh');
+      const observed = { status: 'unreadable', code: 'EACCES' } as const;
+      assert.equal(classifyPostPublish({ journal: journal(root, target), observed,
+        targetSlotFp: codexFingerprint(target) }), observed);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+});
 
 function journalHarness() {
   const root = mkdtempSync(join(tmpdir(), 'qlb-codex-journal-'));
