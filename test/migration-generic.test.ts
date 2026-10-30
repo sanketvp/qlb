@@ -2114,6 +2114,77 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     }
   });
 
+  it('S4a takes the owner-map lock when the owner file is outside auth.json\'s directory (P7b5-40 r1)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-generic-mig-'));
+    const store = openStore(join(dir, 'qlb.db'));
+    try {
+      const authPath = join(dir, 'auth.json');
+      const ownerDir = join(dir, 'owner');
+      mkdirSync(ownerDir);
+      writeFileSync(authPath, fixtureAuthJson(), { encoding: 'utf8', mode: 0o600 });
+      const mig = createSingleGrantMigration(store, new MockKeychain(), 'xai', authPath, join(ownerDir, 'qlb-owner-xai.json'), 'xai', {});
+      mig.stage();
+      await mig.rehearse(mockRehearse([]));
+      mig.commit();
+      const ownerMapPath = join(ownerDir, 'qlb-owner.json');
+      const otherEntry = { mode: 'qlb', since: 987_654 };
+      writeFileSync(ownerMapPath, JSON.stringify({ providers: { xai: { mode: 'qlb', since: 123_456 }, 'kimi-coding': otherEntry } }, null, 2) + '\n');
+      writeFileSync(authPath, JSON.stringify({ ...FAKE_GRANTS, xai: { type: 'oauth', access: 'qlb-managed', refresh: '' } }, null, 2) + '\n');
+      // A live holder of the owner-map lock in the owner file's directory.
+      const lock = join(ownerDir, 'auth.json.lock');
+      mkdirSync(lock);
+      writeFileSync(join(lock, 'qlb-lock-owner.json'), `${JSON.stringify({ pid: process.pid, nonce: 'another-holder' })}\n`);
+
+      assert.throws(() => mig.rollback(), /pi-auth-locked/);
+      const held = JSON.parse(readFileSync(ownerMapPath, 'utf8')) as { providers: Record<string, unknown> };
+      assert.ok(held.providers.xai, 'a held owner-map lock keeps the v2 entry');
+
+      rmSync(lock, { recursive: true, force: true });
+      mig.resume();
+      const after = JSON.parse(readFileSync(ownerMapPath, 'utf8')) as { providers: Record<string, unknown> };
+      assert.equal(Object.prototype.hasOwnProperty.call(after.providers, 'xai'), false);
+      assert.deepEqual(after.providers['kimi-coding'], otherEntry);
+      assert.ok(JSON.parse(store.getMigration('pi-xai')!.detail_json).lastRollback);
+    } finally {
+      store.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('S4a refuses on an owner map that became unreadable after the entry checks and keeps the decision (P7b5-40 r1)', async () => {
+    const h = setup('xai');
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      h.mig.commit();
+      const ownerMapPath = join(h.dir, 'qlb-owner.json');
+      writeFileSync(ownerMapPath, JSON.stringify({ providers: { xai: { mode: 'qlb', since: 1 } } }, null, 2) + '\n');
+      writeFileSync(h.authPath, JSON.stringify({ ...FAKE_GRANTS, xai: { type: 'oauth', access: 'qlb-managed', refresh: '' } }, null, 2) + '\n');
+      const guarded = h.mig as unknown as { restoreSingleGrantPiAuthEntry: (key: string, record: unknown) => unknown };
+      const restore = guarded.restoreSingleGrantPiAuthEntry.bind(h.mig);
+      let corrupt = true;
+      guarded.restoreSingleGrantPiAuthEntry = (key, record) => {
+        // The map turns unreadable after rollback's entry checks, before S4a.
+        if (corrupt) writeFileSync(ownerMapPath, '{ not json');
+        return restore(key, record);
+      };
+
+      assert.throws(() => h.mig.rollback());
+      const detail = JSON.parse(h.store.getMigration('pi-xai')!.detail_json) as Record<string, unknown>;
+      assert.equal(detail.intent, 'rollback', 'an unreadable map keeps the rollback intent');
+      assert.ok(detail.rollbackDecision, 'an unreadable map keeps the fenced decision');
+      assert.equal(detail.lastRollback, undefined, 'the hand-back is not recorded over a stale claim');
+
+      corrupt = false;
+      writeFileSync(ownerMapPath, JSON.stringify({ providers: { xai: { mode: 'qlb', since: 1 } } }, null, 2) + '\n');
+      h.mig.resume();
+      assert.equal(existsSync(ownerMapPath), false, 'the emptied map is unlinked');
+      assert.ok(JSON.parse(h.store.getMigration('pi-xai')!.detail_json).lastRollback);
+    } finally {
+      h.cleanup();
+    }
+  });
+
   it('T-S3f a recorded source whose bytes changed under the fence refuses rollback-source-tampered; a native login then completes the hand-back', async () => {
     for (const fixture of [
       { name: 'a Keychain source', kind: 'keychain' as const, tamper: 'bytes' },
