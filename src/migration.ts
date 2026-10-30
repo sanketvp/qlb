@@ -943,7 +943,22 @@ export class Migration {
 
   /** C3/C4: only resume/rollback may advance an active hand-back marker. */
   private assertNoActiveHandbackMarker(): void {
-    const detail = parseDetail(this.store.getMigration(this.storeName)?.detail_json);
+    const rawDetail = this.store.getMigration(this.storeName)?.detail_json;
+    let detail: Record<string, unknown>;
+    if (!rawDetail) {
+      detail = {};
+    } else {
+      try {
+        const parsed: unknown = JSON.parse(rawDetail);
+        if (!isObjectRecord(parsed)) throw new Error('not an object');
+        detail = parsed;
+      } catch {
+        throw Object.assign(
+          new Error('journal-detail-malformed: inspect and repair it before retrying.'),
+          { exitCode: 3 },
+        );
+      }
+    }
     if (isObjectRecord(detail.handback) && detail.handback.phase === 'cleanup-pending') {
       throw new Error('handback-cleanup-pending: run `qlb migrate resume`');
     }
