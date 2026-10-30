@@ -24,6 +24,8 @@ const identityC: CodexIdentity = { chatgpt_user_id: 'user-c', account_id: 'accou
 const A = codexIdentityKey(identityA);
 const B = codexIdentityKey(identityB);
 const C = codexIdentityKey(identityC);
+const D = 'user-d:account-d';
+const E = 'user-e:account-e';
 const T0 = Date.parse('2026-10-24T12:00:00.000Z');
 
 function row(
@@ -178,6 +180,46 @@ describe('Codex session process list and holder eras', () => {
       assert.equal(history.rows.length, 1);
       assert.equal(history.rows[0].outcome, 'in-flight');
       assert.deepEqual([...new Set(holderSets(history.rows, []).flatMap((set) => set.identities))].sort(), [A, B]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a surviving journal whose attempt wrote a not-published row keeps both sides live (C6-13 r1)', () => {
+    const dir = mkdtempSync('/tmp/qlb-codex-journal-q1-');
+    const journalDir = join(dir, 'journal');
+    try {
+      const dbPath = fenceHistoryDb(dir);
+      const db = new DatabaseSync(dbPath);
+      try {
+        db.prepare(`INSERT INTO switch_log (id, ts, provider, from_account, to_account, outcome, detail, published_at, steps_json, open_sessions_json)
+          VALUES (1, ?, 'openai-codex', ?, ?, 'failed', 'not-published', NULL, ?, '[]')`)
+          .run(T0, A, B, JSON.stringify({ attempt: 'attempt-in-flight', via: 'switch' }));
+      } finally {
+        db.close();
+      }
+      // The attempt crashed after its failure row and before deleting its journal.
+      writeCodexSwitchJournal(journalFixture(), { journalDir });
+      const history = readCodexSwitchHistory(dbPath, { journalDir });
+      assert.deepEqual([...new Set(holderSets(history.rows, []).flatMap((held) => held.identities))].sort(), [A, B]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a not-published failed row whose published_at is malformed is never skipped (C6-13 r1)', () => {
+    const dir = mkdtempSync('/tmp/qlb-codex-malformed-published-');
+    try {
+      const dbPath = fenceHistoryDb(dir);
+      const db = new DatabaseSync(dbPath);
+      try {
+        db.prepare(`INSERT INTO switch_log (id, ts, provider, from_account, to_account, outcome, detail, published_at, steps_json, open_sessions_json)
+          VALUES (1, ?, 'openai-codex', ?, ?, 'failed', 'not-published', 'not-a-time', NULL, '[]')`).run(T0, A, B);
+      } finally {
+        db.close();
+      }
+      const history = readCodexSwitchHistory(dbPath, { journalDir: join(dir, 'journal') });
+      assert.throws(() => holderEras(history.rows), /Invalid Codex switch-log row time/);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -508,6 +550,45 @@ describe('Codex session process list and holder eras', () => {
       { identity: A, startsAt: T0 + 15_000, endsAt: T0 + 25_000 },
       { identity: C, startsAt: T0 + 25_000, endsAt: null },
     ]);
+  });
+
+  it('a failed row marked not-published opens no era for either side', () => {
+    const rows = [
+      row(1, A, B, 'ok', T0),
+      { ...row(2, C, D, 'failed', null, T0 + 10_000), detail: 'not-published', published_at: null },
+    ];
+
+    assert.deepEqual(holderEras(rows), [
+      { identity: A, startsAt: null, endsAt: T0 },
+      { identity: B, startsAt: T0, endsAt: null },
+    ]);
+    assert.deepEqual(
+      [...new Set(holderSets(rows, []).flatMap((set) => set.identities))].sort(),
+      [A, B],
+    );
+  });
+
+  it('a failed row with published_at set keeps both sides live', () => {
+    const rows = [
+      row(1, A, B, 'ok', T0),
+      { ...row(2, C, D, 'failed', T0 + 10_000), detail: 'not-published', published_at: T0 + 10_000 },
+    ];
+
+    assert.deepEqual(openIdentities(rows), [B, C, D].sort());
+    assert.ok(holderSets(rows, []).some((set) => set.identities.includes(C) && set.identities.includes(D)));
+  });
+
+  it('an in-flight row is never skipped', () => {
+    const rows = [
+      row(1, A, B, 'ok', T0),
+      {
+        ...row(2, C, D, 'in-flight', null, T0 + 10_000), detail: 'not-published', published_at: null,
+        involved: [E],
+      },
+    ];
+
+    assert.deepEqual(openIdentities(rows), [B, C, D, E].sort());
+    assert.ok(holderSets(rows, []).some((set) => set.identities.includes(E)));
   });
 
   it('keeps both sides of failed, rolled-back, and reverted switches live until an ok replacement', () => {
