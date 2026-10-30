@@ -70,6 +70,9 @@ function freshenHarness(expiryOffset: number) {
   const target = 'target:account';
   const journalDir = join(h.root, 'journal');
   let current = freshenDocument(now + expiryOffset);
+  // The managed-slot metadata C10 checks before spending a grant (repairDrift).
+  insertSlot(h.db, target);
+  h.db.prepare('UPDATE codex_slots SET fingerprint = ? WHERE account_id = ?').run(codexFingerprint(current), target);
   let posts = 0;
   let writes = 0;
   let onTransport: () => void = () => {};
@@ -338,6 +341,25 @@ describe('Codex target freshen — C6-12b', () => {
     const h = freshenHarness(10 * 60_000 + 1_000);
     try {
       assert.deepEqual(await h.run(), { kind: 'go' });
+      assert.equal(h.posts(), 0);
+    } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('a target whose recorded metadata disagrees with its slot is refused slot-split with no POST (C6-12b r1)', async () => {
+    const h = freshenHarness(9 * 60_000);
+    try {
+      h.db.prepare("UPDATE codex_slots SET fingerprint = 'some-other-lineage' WHERE account_id = ?").run(h.target);
+      assert.deepEqual(await h.run(), { kind: 'refused', reason: 'target-freshen-slot-split' });
+      assert.equal(h.posts(), 0);
+    } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('a slot whose document is another account is refused without a POST (C6-12b r1)', async () => {
+    const h = freshenHarness(9 * 60_000);
+    try {
+      const other = freshenDocument(h.now + 9 * 60_000);
+      other.tokens = { ...other.tokens!, id_token: freshenJwt({ 'https://api.openai.com/auth': { chatgpt_user_id: 'someone-else', chatgpt_account_id: 'account' } }) };
+      assert.deepEqual(await h.run({ slots: { ...h.slots, readSlot: () => ({ document: other, fingerprint: codexFingerprint(other) }) } }), { kind: 'refused', reason: 'target-freshen-slot-removed' });
       assert.equal(h.posts(), 0);
     } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
   });

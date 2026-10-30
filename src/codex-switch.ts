@@ -1,8 +1,8 @@
 import { mkdirSync, readFileSync, statSync, unlinkSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { accessExpiry, type CodexAuthStableWithStatResult, type CodexIdentity } from './codex-auth';
+import { accessExpiry, codexIdentity, type CodexAuthDocument, type CodexAuthStableWithStatResult, type CodexIdentity } from './codex-auth';
 import { ClaudeCodeLockTimeout, type HeldProperLockfile, withProperLockfile } from './cc-locks';
-import { consumeCodexSlot, withCodexConsumeThenSwitchLocks, type CodexConsumeOptions } from './codex-consume';
+import { consumeCodexSlot, hasCodexSlotIdentity, withCodexConsumeThenSwitchLocks, type CodexConsumeOptions, type CodexConsumeResult } from './codex-consume';
 import { fsyncDirSync, atomicWriteText } from './fsutil';
 import { qlbHomeDir } from './home';
 import {
@@ -327,22 +327,39 @@ export async function freshenCodexTarget(
   { target, now }: { target: string; now: number },
 ): Promise<CodexTargetFreshenResult> {
   const configured = freshenDeps(deps);
-  const initial = configured.slots.readSlot(target, { fresh: true });
-  const expiry = accessExpiry(initial.document);
-  if (expiry !== null && expiry > now + 10 * 60_000) return { kind: 'go' };
+  // Same adapter guard as codex refresh: an unreadable slot, or a document
+  // that is not account `target`, is never spent.
+  const readTarget = (): CodexAuthDocument | null => {
+    let document: CodexAuthDocument;
+    try { document = configured.slots.readSlot(target, { fresh: true }).document; } catch { return null; }
+    return hasCodexSlotIdentity(document, target) ? document : null;
+  };
+  const initial = readTarget();
+  if (!initial) return { kind: 'refused', reason: 'target-freshen-slot-removed' };
+  if (expiresAfter(initial, now + 10 * 60_000)) return { kind: 'go' };
 
-  const holders = async (): Promise<CodexProcess[]> => {
+  const holders = async (document: CodexAuthDocument): Promise<CodexProcess[]> => {
+    const identity = codexIdentity(document);
+    if (!identity) throw new Error('Codex slot identity is invalid');
     const history = readCodexSwitchHistory(configured.dbPath, { journalDir: configured.journalDir });
-    return renewers(codexIdentityParts(target), await configured.list(), history.rows, history.observations);
+    return renewers(codexIdentityParts(identity), await configured.list(), history.rows, history.observations);
   };
-  const holderResult = (processes: readonly CodexProcess[]): CodexTargetFreshenResult => {
-    if (expiry !== null && expiry > now + 5 * 60_000) return { kind: 'go' };
-    return { kind: 'refused', reason: 'target-held-by-session', pids: processes.map(({ pid }) => pid) };
+  // The 5-minute holder rule is judged against the document it was checked on.
+  const holderResult = (document: CodexAuthDocument, pids: readonly number[]): CodexTargetFreshenResult =>
+    expiresAfter(document, now + 5 * 60_000)
+      ? { kind: 'go' }
+      : { kind: 'refused', reason: 'target-held-by-session', pids: [...pids] };
+
+  const initialHolders = await holders(initial);
+  if (initialHolders.length > 0) return holderResult(initial, initialHolders.map(({ pid }) => pid));
+
+  let outcome: CodexConsumeResult | undefined;
+  const fromConsume = (result: CodexConsumeResult, snapshot: CodexAuthDocument): CodexTargetFreshenResult => {
+    if (result.status === 'refreshed' || result.status === 'fresh') return { kind: 'go' };
+    if (result.status === 'held') return holderResult(snapshot, result.holders ?? []);
+    return { kind: 'refused', reason: `target-freshen-${result.status}` };
   };
-
-  const initialHolders = await holders();
-  if (initialHolders.length > 0) return holderResult(initialHolders);
-
+  let lockedSnapshot: CodexAuthDocument | undefined;
   try {
     return await withCodexConsumeThenSwitchLocks(configured.dbPath, target, async (heldConsume, heldSwitch) => {
       const fence = codexRecoveryFenceState(configured.journalDir, deps.store);
@@ -350,26 +367,38 @@ export async function freshenCodexTarget(
         return { kind: 'refused', reason: fence.reason };
       }
       if (deps.store.getCodexActiveLogin() === target) return { kind: 'go' };
+      const snapshot = readTarget();
+      if (!snapshot) return { kind: 'refused', reason: 'target-freshen-slot-removed' };
+      lockedSnapshot = snapshot;
 
-      const result = await consumeCodexSlot({
+      outcome = await consumeCodexSlot({
         accountId: target,
         trigger: 'proactive-expiry',
-        snapshot: initial.document,
+        snapshot,
         slots: configured.slots,
+        store: { dbPath: configured.dbPath },
         transport: configured.transport,
         now: () => now,
-        holders: async () => holders(),
+        holders,
         inFlightSlots: fence.state === 'fenced' ? fence.accounts : undefined,
         assertHeld: () => { heldConsume.assertNotCompromised(); heldSwitch.assertNotCompromised(); },
       });
-      if (result.status === 'refreshed' || result.status === 'fresh') return { kind: 'go' };
-      if (result.status === 'held') return holderResult((result.holders ?? []).map((pid) => ({ pid, lstart: '', host: '' })));
-      return { kind: 'refused', reason: `target-freshen-${result.status}` };
+      return fromConsume(outcome, snapshot);
     });
   } catch (error) {
     if (error instanceof ClaudeCodeLockTimeout) return { kind: 'refused', reason: 'target-freshen-busy' };
+    // The lock wrapper rethrows its compromise after the callback; an issued
+    // successor's fate must still reach the caller (as in codex refresh).
+    if ((outcome?.status === 'stashed-lock-lost' || outcome?.status === 'successor-unpersisted') && lockedSnapshot) {
+      return fromConsume(outcome, lockedSnapshot);
+    }
     throw error;
   }
+}
+
+function expiresAfter(document: CodexAuthDocument, instant: number): boolean {
+  const expiry = accessExpiry(document);
+  return expiry !== null && expiry > instant;
 }
 
 /** Persist only the parsed, allowlisted fields, so extra caller properties never reach disk. */
