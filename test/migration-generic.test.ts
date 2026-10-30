@@ -2055,6 +2055,101 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     }
   });
 
+  it('T-S3f a recorded source whose bytes changed under the fence refuses rollback-source-tampered; a native login then completes the hand-back', async () => {
+    for (const fixture of [
+      { name: 'a Keychain source', kind: 'keychain' as const, tamper: 'bytes' },
+      { name: 'an exact backup source', kind: 'exact-backup' as const, tamper: 'bytes' },
+      { name: 'a deleted Keychain source', kind: 'keychain' as const, tamper: 'delete' },
+      { name: 'a deleted exact backup source', kind: 'exact-backup' as const, tamper: 'delete' },
+      { name: 'an exact backup source made unreadable', kind: 'exact-backup' as const, tamper: 'corrupt' },
+    ]) {
+      const h = setup('xai', new MockKeychain(), {
+        afterStep: (point) => {
+          if (point === 'S2') throw new Error('fixture crash after S2');
+        },
+      });
+      try {
+        h.mig.stage();
+        await h.mig.rehearse(mockRehearse([]));
+        h.mig.commit();
+        const id = expectedId('xai');
+        const service = qlbKeychainService('xai', id);
+        const account = expectedLabel('xai');
+        const backupPaths = [piAuthBackupPath(h.authPath, 'xai'), legacyPiAuthBackupPath(h.authPath, 'xai')];
+        if (fixture.kind === 'exact-backup') {
+          writePiAuthBackup(h.authPath, 'xai', 's3f-fixture');
+          const raw = h.kc.getSync(service, account);
+          h.kc.setSync(service, account, JSON.stringify({ ...JSON.parse(raw), writtenBy: 'native-resync' }));
+        }
+
+        assert.throws(() => h.mig.rollback(), /fixture crash after S2/, fixture.name);
+        const decision = JSON.parse(h.store.getMigration('pi-xai')!.detail_json).rollbackDecision as RollbackDecision;
+        assert.equal(decision.kind, fixture.kind, `${fixture.name}: S2 records the expected source`);
+        writeFileSync(h.authPath, JSON.stringify({
+          ...FAKE_GRANTS,
+          xai: { type: 'oauth', access: 'qlb-managed', refresh: '' },
+        }, null, 2) + '\n');
+        if (fixture.kind === 'keychain' && fixture.tamper === 'delete') {
+          h.kc.deleteSync(service, account);
+        } else if (fixture.kind === 'keychain') {
+          const raw = h.kc.getSync(service, account);
+          h.kc.setSync(service, account, JSON.stringify({ ...JSON.parse(raw), writtenBy: 's3f-tampered' }));
+        } else if (fixture.tamper === 'delete') {
+          rmSync(piAuthBackupPath(h.authPath, 'xai'), { force: true });
+        } else if (fixture.tamper === 'corrupt') {
+          writeFileSync(piAuthBackupPath(h.authPath, 'xai'), '{ not json');
+        } else {
+          const path = piAuthBackupPath(h.authPath, 'xai');
+          const backup = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
+          writeFileSync(path, JSON.stringify({
+            ...backup,
+            entry: { ...FAKE_GRANTS.xai, access: 'xai-access-tampered-fake' },
+          }, null, 2) + '\n');
+        }
+
+        const journalBefore = h.store.getMigration('pi-xai');
+        const detailBefore = JSON.parse(journalBefore!.detail_json) as Record<string, unknown>;
+        const generationBefore = h.store.getGrantGeneration(id);
+        const authBefore = readFileSync(h.authPath);
+        const ownerBefore = readFileSync(h.ownerPath);
+        const backupsBefore = backupPaths.map((path) => existsSync(path) ? readFileSync(path) : undefined);
+        const readKeychain = () => { try { return h.kc.getSync(service, account); } catch { return undefined; } };
+        const keychainBefore = readKeychain();
+
+        assert.throws(
+          () => h.mig.resume(),
+          (error: unknown) => {
+            assert.ok(error instanceof Error);
+            assert.equal(error.message, 'rollback-source-tampered', fixture.name);
+            assert.equal((error as Error & { exitCode?: number }).exitCode, 3, fixture.name);
+            return true;
+          },
+        );
+        const detailAfter = JSON.parse(h.store.getMigration('pi-xai')!.detail_json) as Record<string, unknown>;
+        assert.equal(detailAfter.intent, 'rollback', `${fixture.name}: intent is unchanged`);
+        assert.deepEqual(detailAfter.rollbackDecision, detailBefore.rollbackDecision, `${fixture.name}: decision is unchanged`);
+        assert.deepEqual(h.store.getMigration('pi-xai'), journalBefore, `${fixture.name}: journal is unchanged`);
+        assert.equal(h.store.getGrantGeneration(id), generationBefore, `${fixture.name}: G is unchanged`);
+        assert.deepEqual(readFileSync(h.authPath), authBefore, `${fixture.name}: auth.json is unchanged`);
+        assert.deepEqual(readFileSync(h.ownerPath), ownerBefore, `${fixture.name}: owner claim is unchanged`);
+        assert.deepEqual(backupPaths.map((path) => existsSync(path) ? readFileSync(path) : undefined), backupsBefore, `${fixture.name}: backups are unchanged`);
+        assert.equal(readKeychain(), keychainBefore, `${fixture.name}: Keychain fake is unchanged`);
+
+        const nativeLogin = JSON.stringify({
+          ...FAKE_GRANTS,
+          xai: { ...FAKE_GRANTS.xai, access: 'xai-access-native-fake', refresh: 'xai-refresh-native-fake' },
+        }, null, 2) + '\n';
+        writeFileSync(h.authPath, nativeLogin);
+        h.mig.resume();
+        assert.equal(existsSync(h.ownerPath), false, `${fixture.name}: guard (a) releases the owner`);
+        assert.ok(JSON.parse(h.store.getMigration('pi-xai')!.detail_json).lastRollback, `${fixture.name}: terminal journal records the hand-back`);
+        assert.deepEqual(readFileSync(h.authPath), Buffer.from(nativeLogin), `${fixture.name}: native login bytes are retained`);
+      } finally {
+        h.cleanup();
+      }
+    }
+  });
+
   it('T-S3e a defined, non-placeholder, invalid native entry refuses native-entry-invalid', async () => {
     for (const fixture of [
       {

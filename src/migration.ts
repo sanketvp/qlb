@@ -2188,26 +2188,34 @@ export class Migration {
       throw Object.assign(new Error('native-entry-missing'), { exitCode: 3 });
     }
 
-    let record: PiAuthBackup;
+    // Design §2 S3 Materialise: any difference from what S2 recorded,
+    // including a source that is now absent or unreadable, is tampering.
+    const tampered = () => Object.assign(new Error('rollback-source-tampered'), { exitCode: 3 });
+    const readRecordedBackup = (): PiAuthBackup | null => {
+      try {
+        return readPiAuthBackup(this.poolFilePath, authKey);
+      } catch {
+        throw tampered();
+      }
+    };
+    let record: PiAuthBackup | null;
     if (decision.kind === 'keychain') {
       const journalAccount = this.singleGrantJournalAccount();
       const coords = keychainCoords(journalAccount.provider, journalAccount.id, journalAccount.label);
       const grant = this.readSingleGrantRollbackKeychain(coords.service, coords.account);
-      if (!grant) throw Object.assign(new Error('no-restore-source'), { exitCode: 3 });
-      const backup = readPiAuthBackup(this.poolFilePath, authKey);
+      if (!grant || keychainDigest(grant) !== decision.kd0) throw tampered();
       record = restoreRecordFor({
         authPath: this.poolFilePath,
         key: authKey,
         decidedAt: decision.decidedAt,
         filePresent: true,
         entryPresent: true,
-        entry: this.piEntryFromGrant(grant, backup),
+        entry: this.piEntryFromGrant(grant, readRecordedBackup()),
       });
     } else {
-      const backup = readPiAuthBackup(this.poolFilePath, authKey);
-      if (!backup) throw Object.assign(new Error('no-restore-source'), { exitCode: 3 });
-      record = backup;
+      record = readRecordedBackup();
     }
+    if (!record || canonicalDigest(record) !== decision.sourceDigest) throw tampered();
 
     // Check the source before writing: a retry's guard (a) must never find an
     // entry here that the strict verify below would have rejected.
