@@ -351,10 +351,8 @@ async function persistStash(
 function reportStash(options: CodexConsumeOptions, consumedFp: string, successorFp: string, now: number, reason: string): void {
   // A stash is already durable. Its audit row is diagnostic only and must not
   // turn a safely retained successor into successor-unpersisted.
-  try { emit(options, { kind: 'stash', accountId: options.accountId, fromFingerprint: consumedFp, toFingerprint: successorFp, reason }, now); } catch (error) {
-    if (error instanceof CodexLockLost) throw error;
-    /* retryable audit gap */
-  }
+  // That includes a lock loss: the audit row is skipped, never a second copy.
+  try { emit(options, { kind: 'stash', accountId: options.accountId, fromFingerprint: consumedFp, toFingerprint: successorFp, reason }, now); } catch { /* retryable audit gap */ }
 }
 
 async function stashSuccessor(
@@ -377,7 +375,9 @@ function holdsAttempt(current: CurrentSlot, attempt: CodexAuthDocument): boolean
 
 /** Restore only when the slot still holds this attempt's successor. */
 function compensateSlot(options: CodexConsumeOptions, predecessor: CodexAuthDocument, successor: CodexAuthDocument): void {
-  assertHeld(options);
+  // Callers compensate only after the successor is durably stashed, so a lost
+  // lock skips the restore rather than writing a second (emergency) copy.
+  try { assertHeld(options); } catch { return; }
   try {
     const latest = options.slots.readSlot(options.accountId, { fresh: true });
     if (holdsAttempt(latest, successor)) options.slots.writeSlot(options.accountId, predecessor, successor);
@@ -459,6 +459,8 @@ async function persistTransition(
         ON CONFLICT(key) DO UPDATE SET value = excluded.value WHERE config.value IS NULL`).run(String(now));
       if (Number(receipt.changes) !== 1) throw new Error('C9 receipt is no longer available');
     }
+    // The Keychain write above can block; re-check authority before COMMIT.
+    assertHeld(options);
     db.exec('COMMIT');
     options.record?.({ kind: 'post', accountId: options.accountId, fromFingerprint: current.fingerprint, toFingerprint: successorFp, c9 });
     return 'committed';

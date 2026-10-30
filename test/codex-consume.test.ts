@@ -13,7 +13,7 @@ import {
   withCodexSwitchLock,
 } from '../src/codex-consume';
 import { ClaudeCodeLockTimeout } from '../src/cc-locks';
-import { runCodexRefreshCommand } from '../src/commands/codex-refresh';
+import { consumeUnderCodexLocks, runCodexRefreshCommand } from '../src/commands/codex-refresh';
 import { codexFingerprint, type CodexAuthDocument } from '../src/codex-auth';
 import type { CodexProcess } from '../src/codex-sessions';
 import { CodexSlots, importActiveCodexSlot } from '../src/codex-slots';
@@ -570,6 +570,87 @@ describe('Codex consume gate — AC34', () => {
       });
       assert.equal(result.status, 'refreshed');
       assert.ok(assertions >= 3);
+    } finally {
+      h.store.close();
+      rmSync(h.home, { recursive: true, force: true });
+    }
+  });
+
+  it("a lock taken over during codex refresh still reports the issued successor's emergency stash, and a pre-POST loss still asks for a retry", async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-codex-lock-outcome-'));
+    const dbPath = join(home, 'qlb.db');
+    const { consume: lock } = codexLockPaths(dbPath, 'user:account');
+    const takeOver = (): void => {
+      rmSync(lock, { recursive: true, force: true });
+      mkdirSync(lock);
+      writeFileSync(join(lock, '.qlb-owner-999-deadbeef'), '', { flag: 'wx', mode: 0o600 });
+    };
+    try {
+      const kept = await consumeUnderCodexLocks(dbPath, 'user:account', async (assertHeld) => {
+        takeOver();
+        assert.throws(assertHeld);
+        return { status: 'stashed-lock-lost' as const, stashId: 'fixture-lost' };
+      });
+      assert.deepEqual(kept, { status: 'stashed-lock-lost', stashId: 'fixture-lost' });
+      rmSync(lock, { recursive: true, force: true });
+
+      await assert.rejects(consumeUnderCodexLocks(dbPath, 'user:account', async (assertHeld) => {
+        takeOver();
+        assert.throws(assertHeld);
+        return { status: 'transient' as const };
+      }), /Lock ownership was lost/);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('a lock lost after a durable stash skips the audit row and writes no second emergency copy', async () => {
+    const h = managedFixture();
+    try {
+      let posted = false;
+      let afterPost = 0;
+      const result = await consumeCodexSlot({
+        accountId: h.plan.slotId, snapshot: h.initial, trigger: 'force', force: true, slots: h.slots, store: h.store,
+        holders: async () => [], now: () => 2,
+        // Passes the pre-transaction fence, then fails at the stash audit.
+        assertHeld: () => { if (posted && ++afterPost >= 2) throw new Error('new owner holds the lock'); },
+        transport: async () => {
+          posted = true;
+          // Another writer moves the metadata row, so the transaction stashes.
+          const db = new DatabaseSync(h.store.dbPath);
+          try { db.prepare("UPDATE codex_slots SET fingerprint = 'moved' WHERE account_id = ?").run(h.plan.slotId); } finally { db.close(); }
+          return { status: 200, body: JSON.stringify({ refresh_token: 'refresh-b', access_token: 'access-b' }) };
+        },
+      });
+      assert.equal(result.status, 'stashed');
+      const stashDir = join(h.home, 'unclaimed');
+      const lost = existsSync(stashDir) ? readdirSync(stashDir).filter((name) => name.includes('-lost-')) : [];
+      assert.deepEqual(lost, [], 'no emergency copy of an already durable successor');
+    } finally {
+      h.store.close();
+      rmSync(h.home, { recursive: true, force: true });
+    }
+  });
+
+  it('a lock lost between the slot write and COMMIT rolls the metadata back and stashes the successor', async () => {
+    const h = managedFixture();
+    try {
+      const original = codexFingerprint(h.initial);
+      let wrote = false;
+      const originalWrite = h.slots.writeSlot.bind(h.slots);
+      h.slots.writeSlot = (accountId, successor, predecessor) => { originalWrite(accountId, successor, predecessor); wrote = true; };
+      const result = await consumeCodexSlot({
+        accountId: h.plan.slotId, snapshot: h.initial, trigger: 'force', force: true, slots: h.slots, store: h.store,
+        holders: async () => [], now: () => 2,
+        assertHeld: () => { if (wrote) throw new Error('new owner holds the lock'); },
+        transport: async () => ({ status: 200, body: JSON.stringify({ refresh_token: 'refresh-b', access_token: 'access-b' }) }),
+      });
+      assert.equal(result.status, 'stashed-lock-lost');
+      const db = new DatabaseSync(h.store.dbPath, { readOnly: true });
+      try {
+        const row = db.prepare('SELECT fingerprint FROM codex_slots WHERE account_id = ?').get(h.plan.slotId) as { fingerprint: string };
+        assert.equal(row.fingerprint, original, 'the stale owner does not commit');
+      } finally { db.close(); }
     } finally {
       h.store.close();
       rmSync(h.home, { recursive: true, force: true });

@@ -122,40 +122,59 @@ async function execute(args: string[], ctx: CommandContext): Promise<number> {
       write: ctx.stdout,
       error: ctx.stderr,
       consume: async ({ accountId, force, allowHeld, c9 }) => {
-        // C6 and C10 share this provider lock for every read/CAS/write. The
-        // consume lock additionally ensures only one process can spend a slot.
-        try {
-          return await withCodexConsumeThenSwitchLocks(store.dbPath, accountId, async (heldConsume, heldSwitch) => {
-            // Re-check every mutable receipt and active state after lock acquisition.
-            if (activeCodexSlot(store) === accountId) return { status: 'active-slot' as const };
-            if (c9 && !c9Allowed(store.getConfig.bind(store))) return { status: 'c9-unavailable' as const };
-            let snapshot;
-            try { snapshot = slots.readSlot(accountId, { fresh: true }).document; } catch { return { status: 'slot-removed' as const }; }
-            if (!hasCodexSlotIdentity(snapshot, accountId)) return { status: 'slot-removed' as const };
-            return consumeCodexSlot({
-              accountId, snapshot, trigger: 'force', force, allowHeld, slots, store, transport: sendRefresh,
-              assertHeld: () => { heldConsume.assertNotCompromised(); heldSwitch.assertNotCompromised(); },
-              holders: async (document) => {
-                const identity = codexIdentity(document);
-                if (!identity) throw new Error('Codex slot identity is invalid');
-                const prior = readCodexSwitchHistory(store.dbPath);
-                return renewers(
-                  codexIdentityParts(identity),
-                  await list(), prior.rows, prior.observations,
-                );
-              },
-            });
+        return consumeUnderCodexLocks(store.dbPath, accountId, async (assertHeld) => {
+          // Re-check every mutable receipt and active state after lock acquisition.
+          if (activeCodexSlot(store) === accountId) return { status: 'active-slot' as const };
+          if (c9 && !c9Allowed(store.getConfig.bind(store))) return { status: 'c9-unavailable' as const };
+          let snapshot;
+          try { snapshot = slots.readSlot(accountId, { fresh: true }).document; } catch { return { status: 'slot-removed' as const }; }
+          if (!hasCodexSlotIdentity(snapshot, accountId)) return { status: 'slot-removed' as const };
+          return consumeCodexSlot({
+            accountId, snapshot, trigger: 'force', force, allowHeld, slots, store, transport: sendRefresh,
+            assertHeld,
+            holders: async (document) => {
+              const identity = codexIdentity(document);
+              if (!identity) throw new Error('Codex slot identity is invalid');
+              const prior = readCodexSwitchHistory(store.dbPath);
+              return renewers(
+                codexIdentityParts(identity),
+                await list(), prior.rows, prior.observations,
+              );
+            },
           });
-        } catch (error) {
-          // `busy` means no consume work ran. Do not hide a post-POST
-          // persistence failure behind lock contention.
-          if (error instanceof ClaudeCodeLockTimeout) return { status: 'busy' };
-          throw error;
-        }
+        });
       },
     });
   } finally {
     store.close();
+  }
+}
+
+/**
+ * C6 and C10 share the switch lock for every read/CAS/write; the consume lock
+ * additionally ensures only one process can spend a slot. `run` receives the
+ * C6-3 authority fence over both owner tokens.
+ */
+export async function consumeUnderCodexLocks<T extends { status: string }>(
+  dbPath: string,
+  accountId: string,
+  run: (assertHeld: () => void) => Promise<T>,
+): Promise<T | { status: 'busy' }> {
+  let outcome: T | undefined;
+  try {
+    return await withCodexConsumeThenSwitchLocks(dbPath, accountId, async (heldConsume, heldSwitch) => {
+      outcome = await run(() => { heldConsume.assertNotCompromised(); heldSwitch.assertNotCompromised(); });
+      return outcome;
+    });
+  } catch (error) {
+    // `busy` means no consume work ran. Do not hide a post-POST
+    // persistence failure behind lock contention.
+    if (error instanceof ClaudeCodeLockTimeout) return { status: 'busy' };
+    // The lock wrapper rethrows its compromise after the callback. An issued
+    // successor's fate (its emergency stash, or its loss) must still reach the
+    // operator instead of a generic "retry".
+    if (outcome?.status === 'stashed-lock-lost' || outcome?.status === 'successor-unpersisted') return outcome;
+    throw error;
   }
 }
 
