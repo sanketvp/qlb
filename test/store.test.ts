@@ -172,3 +172,105 @@ describe('store decision columns', () => {
     }
   });
 });
+
+describe('Codex observations', () => {
+  function openObservationStore() {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-store-observations-'));
+    return openStore(join(dir, 'qlb.db'));
+  }
+
+  function privateDb(store: ReturnType<typeof openStore>): DatabaseSync {
+    return (store as unknown as { db: DatabaseSync }).db;
+  }
+
+  function observationCount(store: ReturnType<typeof openStore>): number {
+    return Number((privateDb(store).prepare('SELECT COUNT(*) AS count FROM codex_live_observations').get() as { count: number }).count);
+  }
+
+  function reloginCount(store: ReturnType<typeof openStore>): number {
+    return Number((privateDb(store).prepare('SELECT COUNT(*) AS count FROM relogin_events').get() as { count: number }).count);
+  }
+
+  it('an unchanged read updates lastObservedAt and appends nothing', () => {
+    const store = openObservationStore();
+    try {
+      store.recordCodexObservation({ identity: 'user:account', lineageFp: 'lineage-a', by: 'qlb-switch', now: 100 });
+      const result = store.recordCodexObservation({ identity: 'user:account', lineageFp: 'lineage-a', by: 'qlb-watch', now: 200 });
+
+      assert.deepEqual(result, { appended: false, wipedEvent: false });
+      assert.equal(store.getConfig('codex.lastObservedAt'), '200');
+      assert.equal(observationCount(store), 1);
+      assert.equal(reloginCount(store), 0);
+    } finally {
+      store.close();
+    }
+  });
+
+  it('a changed lineage appends one row', () => {
+    const store = openObservationStore();
+    try {
+      store.recordCodexObservation({ identity: 'user:account', lineageFp: 'lineage-a', by: 'qlb-switch', now: 100 });
+      const result = store.recordCodexObservation({ identity: 'user:account', lineageFp: 'lineage-b', by: 'qlb-watch', now: 200 });
+
+      assert.deepEqual(result, { appended: true, wipedEvent: false });
+      assert.equal(observationCount(store), 2);
+      assert.deepEqual(
+        { ...(privateDb(store).prepare('SELECT ts, identity, lineage_fp, by FROM codex_live_observations ORDER BY ts DESC, id DESC LIMIT 1').get() as object) },
+        { ts: 200, identity: 'user:account', lineage_fp: 'lineage-b', by: 'qlb-watch' },
+      );
+    } finally {
+      store.close();
+    }
+  });
+
+  it('a wipe appends one observation and one wiped event atomically', () => {
+    const store = openObservationStore();
+    try {
+      store.recordCodexObservation({ identity: 'user:account', lineageFp: 'lineage-a', by: 'qlb-switch', now: 100 });
+      const result = store.recordCodexObservation({ identity: null, lineageFp: null, by: 'qlb-watch', now: 200 });
+
+      assert.deepEqual(result, { appended: true, wipedEvent: true });
+      assert.equal(observationCount(store), 2);
+      assert.deepEqual(
+        { ...(privateDb(store).prepare('SELECT ts, provider, account_id, kind, detail, evidence, user_denied_at FROM relogin_events').get() as object) },
+        { ts: 200, provider: 'openai-codex', account_id: null, kind: 'wiped', detail: 'wiped', evidence: 'wiped', user_denied_at: null },
+      );
+    } finally {
+      store.close();
+    }
+  });
+
+  it('a repeated wipe writes neither', () => {
+    const store = openObservationStore();
+    try {
+      store.recordCodexObservation({ identity: null, lineageFp: null, by: 'qlb-switch', now: 100 });
+      const result = store.recordCodexObservation({ identity: null, lineageFp: null, by: 'qlb-reconcile', now: 200 });
+
+      assert.deepEqual(result, { appended: false, wipedEvent: false });
+      assert.equal(store.getConfig('codex.lastObservedAt'), '200');
+      assert.equal(observationCount(store), 1);
+      assert.equal(reloginCount(store), 1);
+    } finally {
+      store.close();
+    }
+  });
+
+  it('a failure inside the transaction writes neither row', () => {
+    const store = openObservationStore();
+    try {
+      store.recordCodexObservation({ identity: 'user:account', lineageFp: 'lineage-a', by: 'qlb-switch', now: 100 });
+      privateDb(store).exec(`CREATE TEMP TRIGGER fail_wiped_event BEFORE INSERT ON relogin_events
+        BEGIN SELECT RAISE(ABORT, 'x'); END`);
+
+      assert.throws(
+        () => store.recordCodexObservation({ identity: null, lineageFp: null, by: 'qlb-watch', now: 200 }),
+        /x/,
+      );
+      assert.equal(store.getConfig('codex.lastObservedAt'), '100');
+      assert.equal(observationCount(store), 1);
+      assert.equal(reloginCount(store), 0);
+    } finally {
+      store.close();
+    }
+  });
+});
