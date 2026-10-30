@@ -1178,6 +1178,42 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     }
   });
 
+  it('a refresh lease taken after the pre-unlink check and live at the K_m read refuses the hand-back', async () => {
+    const h = setup('xai');
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      h.mig.commit();
+      const accountId = (JSON.parse(h.store.getMigration('pi-xai')!.detail_json).accounts as Array<{ id: string }>)[0].id;
+      const service = qlbKeychainService('xai', accountId);
+      const account = expectedLabel('xai');
+      let leaseLive = false;
+      const originalGetLease = h.store.getLease.bind(h.store);
+      const originalGetSync = h.kc.getSync.bind(h.kc);
+      h.store.getLease = (name) => leaseLive && name === `refresh:${accountId}`
+        ? { name, holder_pid: 1, holder_id: 'fixture-refresher', until: Date.now() + 60_000, generation: 1 }
+        : originalGetLease(name);
+      h.kc.getSync = (readService, readAccount) => {
+        const raw = originalGetSync(readService, readAccount);
+        if (!leaseLive && readService === service && readAccount === account) leaseLive = true;
+        return raw;
+      };
+
+      assert.throws(() => h.mig.rollback(), /refresh-in-progress/);
+      const refused = JSON.parse(h.store.getMigration('pi-xai')!.detail_json) as Record<string, unknown>;
+      assert.equal(refused.handback, undefined, 'no hand-back marker is recorded after the post-read refusal');
+      assert.equal(refused.intent, 'rollback', 'the rollback intent stays durable');
+      assert.equal(keychainHas(h.kc, 'xai'), true, 'the Keychain copy remains present');
+
+      h.store.getLease = originalGetLease;
+      h.kc.getSync = originalGetSync;
+      const settled = h.mig.resume();
+      assert.equal(settled.state, 'NATIVE', 'resume completes once the lease is gone');
+    } finally {
+      h.cleanup();
+    }
+  });
+
   it('a refresh that commits a rotated grant during the hand-back is refused, not deleted', async () => {
     const h = setup('xai');
     try {
