@@ -177,7 +177,7 @@ function load(owner?: string, gateFail = false, callCodex = false, perProviderOw
   authJson: { reads: number; writes: number };
   runtimeApiKeys: Record<string, string>;
   codexModelCount: number;
-  events: Array<{ error?: { errorMessage?: string } }>;
+  events: Array<{ type?: string; error?: { errorMessage?: string } }>;
   gateCalls: string[];
   gateArgs: string[][];
   stderr: string;
@@ -209,9 +209,15 @@ function load(owner?: string, gateFail = false, callCodex = false, perProviderOw
     mkdirSync(dirname(dbPath), { recursive: true });
     writeFileSync(dbPath, '');
   }
-  if (options.streamSimpleOnly) {
+  if (options.streamSimpleOnly || options.auth401) {
     const compat = join(PI_GLOBAL_ROOT, 'node_modules', '@earendil-works', 'pi-ai', 'dist', 'compat.js');
-    writeFileSync(compatOverride, `import * as actual from ${JSON.stringify(compat)};\nexport * from ${JSON.stringify(compat)};\nexport function anthropicMessagesApi() { return { streamSimple: actual.anthropicMessagesApi().streamSimple }; }\n`);
+    const fakeAnthropicApi = options.auth401
+      ? `const response = (stopReason, errorMessage) => ({ role: 'assistant', content: [], api: 'anthropic-messages', provider: 'anthropic', model: 'claude-sonnet-5', usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason, ...(errorMessage ? { errorMessage } : {}), timestamp: Date.now() });\nexport function anthropicMessagesApi() { return { streamSimple(_model, _context, options) { return (async function* () { if (options?.apiKey === 'fixture-anthropic-access') yield { type: 'error', reason: 'error', error: response('error', '401 unauthorized') }; else yield { type: 'done', reason: 'stop', message: response('stop') }; })(); } }; }\n`
+      : `export function anthropicMessagesApi() { return { streamSimple: actual.anthropicMessagesApi().streamSimple }; }\n`;
+    // The extension obtains its builtin transport from Pi compat, not the
+    // registered provider map. Override compat so the 401 test neither calls
+    // the real transport nor accidentally tests an unrelated error path.
+    writeFileSync(compatOverride, `import * as actual from ${JSON.stringify(compat)};\nexport * from ${JSON.stringify(compat)};\n${fakeAnthropicApi}`);
   }
   writeFileSync(runner, fakeQlb);
   writeFileSync(entry, loader);
@@ -237,7 +243,7 @@ function load(owner?: string, gateFail = false, callCodex = false, perProviderOw
       ...(options.preexistingAnthropicKey ? { PREEXISTING_ANTHROPIC_KEY: options.preexistingAnthropicKey } : {}),
       ...(options.consumeMode ? { CONSUME_MODE: '1', QLB_DB_PATH: join(home, 'qlb', 'qlb.db') } : {}),
       ...(options.runtimeKeyCallsVoid ? { RUNTIME_KEY_CALLS_VOID: '1' } : {}),
-      ...(options.streamSimpleOnly ? { PI_COMPAT_OVERRIDE: compatOverride } : {}),
+      ...(options.streamSimpleOnly || options.auth401 ? { PI_COMPAT_OVERRIDE: compatOverride } : {}),
       ...(options.reloadInert ? { RELOAD_INERT: '1' } : {}),
       ...(callCodex ? { CALL_CODEX: '1' } : {}),
       ...(callAnthropic ? { CALL_ANTHROPIC: '1' } : {}),
@@ -351,7 +357,7 @@ describe('qlb-pi provider wiring', { skip: piAvailable ? false : 'global Pi inst
       ['gate', 'anthropic', '--json'],
       ['gate', 'anthropic', '--json', '--retry-after-401', fp],
     ]);
-    assert.deepEqual(result.events, [{ type: 'done' }]);
+    assert.deepEqual(result.events.map((event) => event.type), ['done']);
   });
 
   it('does not infer a Codex owner from a shared Anthropic-only v2 document or legacy v1 document', () => {
