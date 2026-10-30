@@ -272,7 +272,37 @@ describe('Claude unclaimed stash and restore (K2 / AC48)', () => {
     assert.deepEqual(warnings, ['unclaimed fallback conflicts with Keychain entry for different-copy']);
   });
 
-  it('discovers and adopts a legacy fallback file that has no index row', async () => {
+  it('a Codex file stash indexed under openai-codex is not adopted as an Anthropic legacy stash', async () => {
+    const { slots, stashDir } = fixture();
+    await slots.createSlot({ accountId: 'account-a', credential: credential('one'), source: 'cswap-import' });
+    const codexBody = JSON.stringify({ credential: {} });
+    const codexPath = join(stashDir, 'codex-file.json');
+    mkdirSync(stashDir, { recursive: true, mode: 0o700 });
+    writeFileSync(codexPath, codexBody, { mode: 0o600 });
+    await recordStash(stashDir, {
+      provider: 'openai-codex', accountId: 'codex-account', stashId: 'codex-file', consumedFp: 'sha256:codex',
+      location: 'file', createdAt: 1,
+    });
+
+    assert.equal(await slots.adoptStashedSuccessor('account-a'), null);
+    assert.equal((await slots.readSlot('account-a', { fresh: true })).credential, credential('one'));
+    assert.equal(readFileSync(codexPath, 'utf8'), codexBody);
+  });
+
+  it('an unindexed Codex -lost- body is not adopted as an Anthropic legacy stash', async () => {
+    const { slots, stashDir } = fixture();
+    await slots.createSlot({ accountId: 'account-a', credential: credential('one'), source: 'cswap-import' });
+    const codexBody = JSON.stringify({ credential: {} });
+    const codexPath = join(stashDir, 'codex-lost-abcdef.json');
+    mkdirSync(stashDir, { recursive: true, mode: 0o700 });
+    writeFileSync(codexPath, codexBody, { mode: 0o600 });
+
+    assert.equal(await slots.adoptStashedSuccessor('account-a'), null);
+    assert.equal((await slots.readSlot('account-a', { fresh: true })).credential, credential('one'));
+    assert.equal(readFileSync(codexPath, 'utf8'), codexBody);
+  });
+
+  it('a genuine row-less Anthropic legacy stash is still adopted', async () => {
     const { slots, stashDir } = fixture();
     await slots.createSlot({ accountId: 'account-a', credential: credential('one'), source: 'cswap-import' });
     const current = (await slots.readSlot('account-a')).fingerprint;
