@@ -10,6 +10,7 @@
 
 import {
   decodeJournalEvidence,
+  hasRollbackIntent,
   parseAccountIds,
   type UntrustedReason,
 } from './migration-health';
@@ -111,7 +112,7 @@ export function inspectAccountSafety(
 
   for (const { row, ev } of decoded) {
     if (!ev.trusted) continue;
-    if (ev.state === 'NATIVE' && !keepsHandedBackCredential(row)) continue;
+    if (ev.state === 'NATIVE' && !nativeRowProtects(row)) continue;
     if (ev.participants.has(accountId)) {
       return {
         unsafe: true,
@@ -126,11 +127,12 @@ export function inspectAccountSafety(
 }
 
 /**
- * A post-commit hand-back ends at NATIVE; when it kept the Keychain copy (or its
- * cleanup is still pending), that copy may hold the newest grant, so the
- * account stays protected. Any disposition other than 'delete' reads as keep.
+ * A NATIVE row still protects its participants while a rollback is unfinished
+ * (S1 keeps the state and journals only the intent), and after a post-commit
+ * hand-back that kept the Keychain copy or is still pending cleanup: that copy
+ * may hold the newest grant. Any disposition other than 'delete' reads as keep.
  */
-function keepsHandedBackCredential(row: JournalRow): boolean {
+function nativeRowProtects(row: JournalRow): boolean {
   let detail: unknown;
   try {
     detail = JSON.parse(row.detail_json ?? 'null');
@@ -138,6 +140,7 @@ function keepsHandedBackCredential(row: JournalRow): boolean {
     return false;
   }
   if (detail === null || typeof detail !== 'object') return false;
+  if (hasRollbackIntent(detail)) return true;
   const { handback, lastRollback } = detail as { handback?: unknown; lastRollback?: unknown };
   if (handback != null) return true;
   if (lastRollback === null || typeof lastRollback !== 'object' || !('keychainDisposition' in lastRollback)) {
