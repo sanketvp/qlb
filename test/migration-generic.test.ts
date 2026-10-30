@@ -111,6 +111,21 @@ class RollbackDeleteKeychain extends MockKeychain {
   }
 }
 
+class S2ReadTaxonomyKeychain extends MockKeychain {
+  getCalls = 0;
+  faultOnGet: number | undefined;
+  fault: 'malformed' | 'unavailable' | undefined;
+
+  override getSync(service: string, account: string): string {
+    this.getCalls += 1;
+    if (this.faultOnGet === this.getCalls) {
+      if (this.fault === 'malformed') return '{not-json';
+      if (this.fault === 'unavailable') throw new Error('fixture Keychain unavailable');
+    }
+    return super.getSync(service, account);
+  }
+}
+
 function keychainHas(
   kc: MockKeychain,
   provider: SingleGrantProvider,
@@ -1731,6 +1746,66 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       assert.throws(() => h.kc.getSync(service, account), 'the missing Keychain item remains absent');
     } finally {
       h.cleanup();
+    }
+  });
+
+  it('T-S2i malformed Keychain payload refuses rollback-source-malformed and an operational error refuses keychain-unavailable, both keeping only the intent', async () => {
+    for (const fixture of [
+      { name: 'outside malformed payload', fault: 'malformed' as const, faultOnGet: 1, message: 'rollback-source-malformed' },
+      { name: 'outside operational error', fault: 'unavailable' as const, faultOnGet: 1, message: 'keychain-unavailable' },
+      { name: 'in-transaction malformed payload', fault: 'malformed' as const, faultOnGet: 2, message: 'rollback-source-malformed' },
+      { name: 'in-transaction operational error', fault: 'unavailable' as const, faultOnGet: 2, message: 'keychain-unavailable' },
+    ]) {
+      const kc = new S2ReadTaxonomyKeychain();
+      const h = setup('xai', kc);
+      try {
+        h.mig.stage();
+        await h.mig.rehearse(mockRehearse([]));
+        h.mig.commit();
+        const id = expectedId('xai');
+        const service = qlbKeychainService('xai', id);
+        const account = expectedLabel('xai');
+        const keychainBefore = kc.getSync(service, account);
+        const generationBefore = h.store.getGrantGeneration(id);
+        const authBefore = readFileSync(h.authPath);
+        const ownerBefore = readFileSync(h.ownerPath);
+        const backupPaths = [piAuthBackupPath(h.authPath, 'xai'), legacyPiAuthBackupPath(h.authPath, 'xai')];
+        const backupsBefore = backupPaths.map((path) => existsSync(path) ? readFileSync(path) : undefined);
+        kc.getCalls = 0;
+        kc.fault = fixture.fault;
+        kc.faultOnGet = fixture.faultOnGet;
+
+        assert.throws(
+          () => h.mig.rollback(),
+          (error: unknown) => {
+            const refusal = error as { message?: unknown; exitCode?: unknown };
+            assert.equal(refusal.message, fixture.message, fixture.name);
+            assert.equal(refusal.exitCode, 3, fixture.name);
+            return true;
+          },
+        );
+
+        const callsAtRefusal = kc.getCalls;
+        if (fixture.fault === 'unavailable') {
+          assert.equal(callsAtRefusal, fixture.faultOnGet, `${fixture.name}: no retry loop`);
+        }
+        const detail = JSON.parse(h.store.getMigration('pi-xai')!.detail_json) as Record<string, unknown>;
+        assert.equal(detail.intent, 'rollback', `${fixture.name}: intent remains durable`);
+        assert.equal(detail.rollbackDecision, undefined, `${fixture.name}: no decision is recorded`);
+        assert.equal(h.store.getGrantGeneration(id), generationBefore, `${fixture.name}: G is unchanged`);
+        assert.deepEqual(readFileSync(h.authPath), authBefore, `${fixture.name}: auth.json is unchanged`);
+        assert.deepEqual(readFileSync(h.ownerPath), ownerBefore, `${fixture.name}: owner file is unchanged`);
+        assert.deepEqual(
+          backupPaths.map((path) => existsSync(path) ? readFileSync(path) : undefined),
+          backupsBefore,
+          `${fixture.name}: backups are unchanged`,
+        );
+        kc.fault = undefined;
+        kc.faultOnGet = undefined;
+        assert.equal(kc.getSync(service, account), keychainBefore, `${fixture.name}: Keychain is unchanged`);
+      } finally {
+        h.cleanup();
+      }
     }
   });
 
