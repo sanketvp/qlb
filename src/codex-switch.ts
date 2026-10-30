@@ -1,7 +1,7 @@
 import { mkdirSync, readFileSync, statSync, unlinkSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { accessExpiry, codexFingerprint, codexIdentity, writeCodexAuthAtomic, type CodexAuthDocument, type CodexAuthStableWithStatResult, type CodexIdentity } from './codex-auth';
-import { attributeLiveDocument, type AttributeLiveDocumentInput, type CodexAttributionResult } from './codex-attribution';
+import { attributeLiveDocument, type AttributeLiveDocumentInput, type CodexAttributionResult, type CodexAttributionStore } from './codex-attribution';
 import { ClaudeCodeLockTimeout, withCodexAuthLock, type CodexAuthLockOptions, type HeldProperLockfile, withProperLockfile } from './cc-locks';
 import { consumeCodexSlot, hasCodexSlotIdentity, withCodexConsumeThenSwitchLocks, withCodexSwitchLock, type CodexConsumeOptions, type CodexConsumeResult } from './codex-consume';
 import { fsyncDirSync, atomicWriteText, publishTarget } from './fsutil';
@@ -43,7 +43,7 @@ type CodexObservationKeychain = Pick<KeychainBackend, 'getSync' | 'setSync' | 'd
 
 export interface CodexSwitchDeps {
   store: Pick<Store, 'getCodexActiveLogin' | 'getCodexSlot' | 'getConfig' | 'hasConfig' | 'recordSwitch'
-    | 'recordCodexObservation' | 'setActiveLogin'>;
+    | 'recordCodexObservation' | 'setActiveLogin'> & CodexAttributionStore;
   readLive: () => Promise<CodexAuthStableWithStatResult>;
   cswapProcesses: () => CswapProcess[];
   now: () => number;
@@ -217,8 +217,6 @@ export async function observeLiveCodex(
   // earlier unknown-login refusal cleared it, a now-known live identity is the
   // only managed slot that can be adopted as active.
   const selectedSlotId = activeSlotId ?? (liveIdentity ? deps.store.getCodexSlot(liveIdentity)?.accountId ?? null : null);
-  if (!selectedSlotId) throw new Error('Codex active slot is required for a stable live observation');
-  const selected = configured.slots.readSlot(selectedSlotId, { fresh: true });
 
   const history = deps.dbPath
     ? readCodexSwitchHistory(deps.dbPath, { journalDir: deps.journalDir })
@@ -237,10 +235,19 @@ export async function observeLiveCodex(
   });
 
   try {
-    const attribution = await attributeForPhase({ assertHeld }, 'pre', {
-      store: deps.store as Store,
+    // With no active slot and no managed slot for the live identity, there is
+    // nothing S56 could attribute against: the live identity is unknown or
+    // unparseable, which is step 2's unclaimed path.
+    const attribution: CodexPhaseAttribution = selectedSlotId === null ? { action: 'unclaimed' } : await attributeForPhase({ assertHeld }, 'pre', {
+      store: deps.store,
       keychain: configured.keychain,
-      slot: { accountId: selectedSlotId, document: selected.document, fingerprint: selected.fingerprint },
+      // The DB row, not the Keychain item, is the noop/CAS authority, so a
+      // DB/Keychain split stays detectable (as codex import-active passes it).
+      slot: {
+        accountId: selectedSlotId,
+        document: configured.slots.readSlot(selectedSlotId, { fresh: true }).document,
+        fingerprint: deps.store.getCodexSlot(selectedSlotId)?.fingerprint ?? undefined,
+      },
       activeSlotId: activeSlotId ?? undefined,
       activeSetBy: 'adopt',
       live: live.doc,
@@ -248,17 +255,25 @@ export async function observeLiveCodex(
       l40Verified: deps.store.getConfig('codex.l40Verified') === '1',
       beforeSave: deps.observationBeforeSave,
       beforeSaveCommit: deps.observationBeforeSaveCommit,
+      now: deps.now,
       republish: async (document) => {
         assertHeld();
         const reread = await deps.readLive();
         if (!sameLiveObservation(live, reread)) throw new CodexLiveChanged();
         if (!deps.authPath) throw new Error('Codex pre-switch republish requires authPath');
+        // The re-read can wait over a second; a lock taken over meanwhile must
+        // not be followed by a rename of slot bytes.
+        assertHeld();
         const published = await publishCodexAuth(deps.authPath, document);
         if (published.stage === 'rename-threw') throw new CodexRepublishFailed();
       },
     });
-    if (attribution.action === 'republish-slot') throw new CodexLiveChanged();
+    if (attribution.action === 'republish-slot'
+      || (attribution.action === 'drift' && attribution.disposition === 'republish-slot')) {
+      throw new CodexLiveChanged();
+    }
     if (attribution.action === 'unclaimed') {
+      assertHeld();
       try {
         await configured.slots.ensureUnclaimedStash(live.doc, deps.now());
       } catch (error) {

@@ -150,17 +150,20 @@ function observeHarness() {
   const a0 = observedDocument('a', 'a0');
   const plan = importActiveCodexSlot(a0, { store: h.store, keychain, now: () => 1 });
   writeFileSync(authPath, JSON.stringify(a0));
-  let stashes = 0;
+  // Idempotent by fingerprint, like CodexSlots.ensureUnclaimedStash.
+  const stashed = new Set<string>();
   let stashError: Error | undefined;
   const slots = {
     readSlot: (accountId: string) => {
       const document = JSON.parse(keychain.getSync(qlbKeychainService('openai-codex', accountId), QLB_KEYCHAIN_ACCOUNT)) as CodexAuthDocument;
       return { document, fingerprint: codexFingerprint(document) };
     },
-    ensureUnclaimedStash: async () => {
+    ensureUnclaimedStash: async (document: CodexAuthDocument) => {
       if (stashError) throw stashError;
-      stashes += 1;
-      return { stashId: 'fixture-stash', created: stashes === 1 };
+      const fingerprint = codexFingerprint(document);
+      const created = !stashed.has(fingerprint);
+      stashed.add(fingerprint);
+      return { stashId: `fixture-stash-${fingerprint}`, created };
     },
   };
   const run = (overrides: Partial<CodexSwitchDeps> = {}, assertHeld: () => void = () => undefined) => observeLiveCodex(h.deps({
@@ -174,7 +177,7 @@ function observeHarness() {
   }), assertHeld);
   return {
     ...h, keychain, authPath, a0, plan, slots, run,
-    stashes: () => stashes,
+    stashes: () => stashed.size,
     stashError: (error: Error | undefined) => { stashError = error; },
   };
 }
@@ -965,6 +968,100 @@ describe('Codex locked observe step — C6-16', () => {
       await assert.rejects(h.run({ observationBeforeSaveCommit: () => { throw new Error('fixture crash'); } }), /fixture crash/);
       assert.equal((await h.run()).outcome, 'settled');
       assert.equal(scalarCount(h.db, "SELECT COUNT(*) AS count FROM lineage_log WHERE cause = 'adopt' AND by = 'tool'"), 1);
+    } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('a DB/Keychain split on the active slot refuses slot-split', async () => {
+    const h = observeHarness();
+    const a1 = observedDocument('a', 'a1');
+    const a2 = observedDocument('a', 'a2');
+    const service = qlbKeychainService('openai-codex', h.plan.slotId);
+    try {
+      // A hard kill after the Keychain write and before the SQLite commit: the
+      // DB row still names a0, the Keychain holds a1, and no :prev records a0.
+      h.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(a1));
+      writeFileSync(h.authPath, JSON.stringify(a2));
+      assert.deepEqual(await h.run(), { outcome: 'refused', reason: 'slot-split' });
+      assert.equal(h.store.getCodexSlot(h.plan.slotId)?.fingerprint, codexFingerprint(h.a0));
+      assert.equal(h.keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT), JSON.stringify(a1));
+      assert.equal(codexFingerprint(JSON.parse(readFileSync(h.authPath, 'utf8')) as CodexAuthDocument), codexFingerprint(a2));
+    } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('a drift republish of another known slot restarts instead of settling on the replaced bytes', async () => {
+    const h = observeHarness();
+    const b0 = observedDocument('b', 'b0');
+    const b1 = observedDocument('b', 'b1');
+    try {
+      importActiveCodexSlot(b0, { store: h.store, keychain: h.keychain, now: () => 2 });
+      importActiveCodexSlot(b1, { store: h.store, keychain: h.keychain, now: () => 3 });
+      h.store.setActiveLogin('openai-codex', h.plan.slotId, 'import');
+      writeFileSync(h.authPath, JSON.stringify(b0));
+      await assert.rejects(h.run(), CodexLiveChanged);
+      assert.equal(codexFingerprint(JSON.parse(readFileSync(h.authPath, 'utf8')) as CodexAuthDocument), codexFingerprint(b1));
+      const rerun = await h.run();
+      assert.equal(rerun.outcome, 'settled');
+      assert.equal(rerun.outcome === 'settled' && codexFingerprint(rerun.outgoing.document), codexFingerprint(b1));
+      assert.equal(rerun.outcome === 'settled' && rerun.outgoing.inode, statSync(h.authPath).ino);
+    } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('a repeated observe of the same unknown login with active_login NULL refuses unknown-live-identity and stashes once', async () => {
+    const h = observeHarness();
+    try {
+      writeFileSync(h.authPath, JSON.stringify(observedDocument('unknown', 'unknown-0')));
+      assert.deepEqual(await h.run(), { outcome: 'refused', reason: 'unknown-live-identity' });
+      assert.equal(h.store.getCodexActiveLogin(), null);
+      assert.deepEqual(await h.run(), { outcome: 'refused', reason: 'unknown-live-identity' });
+      assert.equal(h.stashes(), 1);
+      assert.equal(h.store.getCodexActiveLogin(), null);
+    } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('an unparseable live identity with active_login NULL refuses unknown-live-identity', async () => {
+    const h = observeHarness();
+    const anonymous = { ...h.a0, tokens: { ...h.a0.tokens, id_token: freshenJwt({}), account_id: '' } };
+    try {
+      h.store.setActiveLogin('openai-codex', null, 'adopt');
+      writeFileSync(h.authPath, JSON.stringify(anonymous));
+      assert.deepEqual(await h.run(), { outcome: 'refused', reason: 'unknown-live-identity' });
+      assert.equal(h.stashes(), 1);
+      assert.equal(h.store.getCodexActiveLogin(), null);
+      assert.equal(h.store.getCodexSlot(h.plan.slotId)?.fingerprint, codexFingerprint(h.a0));
+    } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('a lock lost during the step-2 re-read aborts before the republish', async () => {
+    const h = observeHarness();
+    const a1 = observedDocument('a', 'a1');
+    try {
+      importActiveCodexSlot(a1, { store: h.store, keychain: h.keychain, now: () => 2 });
+      let reads = 0;
+      let lost = false;
+      await assert.rejects(h.run({ readLive: async () => {
+        reads += 1;
+        // The lock is taken over while the stable re-read is waiting.
+        if (reads === 2) lost = true;
+        return readCodexAuthStableWithStat(h.authPath, { delayMs: 0 });
+      } }, () => { if (lost) throw new Error('auth lock lost'); }), /auth lock lost/);
+      assert.equal(reads, 2);
+      assert.equal(codexFingerprint(JSON.parse(readFileSync(h.authPath, 'utf8')) as CodexAuthDocument), codexFingerprint(h.a0));
+    } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('a lost lock before the unknown-login stash writes no stash', async () => {
+    const h = observeHarness();
+    try {
+      writeFileSync(h.authPath, JSON.stringify(observedDocument('unknown', 'unknown-0')));
+      const active = h.store.getCodexActiveLogin();
+      let assertions = 0;
+      // The first assertion guards the observation row; the next is the stash's.
+      await assert.rejects(h.run({}, () => {
+        assertions += 1;
+        if (assertions === 2) throw new Error('auth lock lost');
+      }), /auth lock lost/);
+      assert.equal(h.stashes(), 0);
+      assert.equal(h.store.getCodexActiveLogin(), active);
     } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
   });
 
