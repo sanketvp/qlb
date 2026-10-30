@@ -314,6 +314,10 @@ export interface MigrationConfig {
   kind?: MigrationKind;
   provider?: string;
   authJsonKey?: string;
+  /** S2 test seam; defaults to a real synchronous wall-clock sleep. */
+  sleepSync?: (ms: number) => void;
+  /** S2 test seam for lease liveness and its bounded wait clock; defaults to Date.now. */
+  now?: () => number;
   /**
    * Static-key (OpenRouter): injectable native-key reader.
    * Tests MUST pass a function that returns a fake key. The CLI passes
@@ -769,6 +773,10 @@ export class Migration {
   private readonly beforePoolCommitLock: (() => void) | undefined;
   private readonly beforeOwnershipLock: (() => void) | undefined;
   private readonly afterStep: ((point: MigrationCrashPoint) => void) | undefined;
+  private readonly sleepSync: (ms: number) => void;
+  /** Keeps Pi's auth.json lock fresh during S2's lease wait; throws lock-lost. */
+  private piAuthLockRefresh: (() => void) | undefined;
+  private readonly now: () => number;
   private readonly fsyncDirectory: (path: string) => void;
   private readonly piMigrateJournalDir: string;
 
@@ -793,6 +801,10 @@ export class Migration {
     this.beforePoolCommitLock = config.beforePoolCommitLock;
     this.beforeOwnershipLock = config.beforeOwnershipLock;
     this.afterStep = config.afterStep;
+    this.sleepSync = config.sleepSync ?? ((ms) => {
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+    });
+    this.now = config.now ?? Date.now;
     this.fsyncDirectory = config.fsyncDirectory ?? fsyncDirSync;
     this.piMigrateJournalDir = config.piMigrateJournalDir ?? join(qlbHomeDir(), '.qlb', 'journal');
   }
@@ -1400,7 +1412,7 @@ export class Migration {
 
   rollback(): MigrationStatus {
     if (this.kind === 'single-grant') {
-      return withPiAuthLock(resolve(this.poolFilePath), () => this.rollbackUnlocked());
+      return withPiAuthLock(resolve(this.poolFilePath), (refresh) => this.holdingPiAuthLock(refresh, () => this.rollbackUnlocked()));
     }
     return this.rollbackUnlocked();
   }
@@ -1458,7 +1470,7 @@ export class Migration {
    */
   resume(): MigrationStatus {
     if (this.kind === 'single-grant') {
-      return withPiAuthLock(resolve(this.poolFilePath), () => this.resumeUnlocked());
+      return withPiAuthLock(resolve(this.poolFilePath), (refresh) => this.holdingPiAuthLock(refresh, () => this.resumeUnlocked()));
     }
     return this.resumeUnlocked();
   }
@@ -1893,7 +1905,8 @@ export class Migration {
         const legacy = this.legacySidecarPath();
         if (legacy) unlinkIfExists(legacy);
       } else {
-        // S2 runs after S1's durable intent and before the existing un-own
+        // S2 runs after S1's durable intent. It checks a live refresh lease
+        // inside its fence transaction, then waits before the existing un-own
         // path. Once it records a decision, C4 resumes here without ranking
         // again; the decision is copied into S5's marker below.
         const journalAccount = this.singleGrantJournalAccount();
@@ -1962,7 +1975,12 @@ export class Migration {
     if (existing !== undefined && existing !== null) return;
 
     class RetryS2 extends Error {}
-    for (let attempt = 0; attempt < 8; attempt += 1) {
+    // Private control-flow signal: runImmediate rolls back before S2 sleeps.
+    class LeaseWaitS2 extends Error {}
+    const refreshInProgress = () => Object.assign(new Error('refresh-in-progress'), { exitCode: 3 });
+    let leaseWaitStartedAt: number | undefined;
+    let attempts = 0;
+    while (attempts < 8) {
       const g0 = this.store.getGrantGeneration(journalAccount.id);
       if (g0 === null) throw new Error('single-grant rollback has no account generation');
 
@@ -2002,7 +2020,7 @@ export class Migration {
         nativeEntryPresent,
         nativeEntry,
       });
-      const decidedAt = Date.now();
+      const decidedAt = this.now();
       const sourceBackup = ranked.kind === 'exact-backup'
         ? exactBackup
         : ranked.kind === 'legacy-backup'
@@ -2043,11 +2061,10 @@ export class Migration {
             if (!isCredentialNotFound(error)) throw new Error('keychain-unavailable', { cause: error });
           }
           if (keychainDigest(transactionKeychainGrant) !== decision.kd0) throw new RetryS2();
-          // S2 (iii): a live refresh lease refuses before any fence, so an
-          // in-flight refresher's rotated grant is never fenced out. Row 30
-          // turns this refusal into a bounded wait.
+          // S2 (iii): roll back, then wait outside the transaction for a live
+          // lease. Expired leases are ignored, like acquireRefreshLease.
           const lease = this.store.getLease(refreshLeaseName(journalAccount.id));
-          if (lease && lease.until > Date.now()) throw new Error('refresh-in-progress');
+          if (lease && lease.until > this.now()) throw new LeaseWaitS2();
           const fence = fencedGeneration(g0, k0);
           if (this.store.casGrantGeneration(journalAccount.id, g0, fence) !== 1) {
             throw new RetryS2();
@@ -2062,11 +2079,30 @@ export class Migration {
           return;
         }
       } catch (error) {
-        if (error instanceof RetryS2) continue;
+        if (error instanceof LeaseWaitS2) {
+          const waitedAt = this.now();
+          if (leaseWaitStartedAt === undefined) leaseWaitStartedAt = waitedAt;
+          if (waitedAt - leaseWaitStartedAt >= 30_000) throw refreshInProgress();
+          // Pi treats auth.json.lock as stale after 10 s of an unchanged mtime.
+          this.piAuthLockRefresh?.();
+          this.sleepSync(100);
+          this.piAuthLockRefresh?.();
+          // Re-enter at the outside reads; lease waits do not spend RETRY attempts.
+          continue;
+        }
+        if (error instanceof RetryS2) {
+          attempts += 1;
+          continue;
+        }
         throw error;
       }
     }
-    throw Object.assign(new Error('refresh-in-progress'), { exitCode: 3 });
+    throw refreshInProgress();
+  }
+
+  private holdingPiAuthLock<T>(refresh: () => void, fn: () => T): T {
+    this.piAuthLockRefresh = refresh;
+    try { return fn(); } finally { this.piAuthLockRefresh = undefined; }
   }
 
   /** Pi's entry for a Keychain grant, keeping the backup entry's other fields (design §2 S3). */
@@ -2087,12 +2123,13 @@ export class Migration {
   }
 
   /**
-   * Until S2's fence (row 28), a refresh that is mid-flight could rotate K_m
-   * after the S5 verdict; refuse rather than record a delete against it.
+   * S5's existing post-fence check for a live refresh lease. S2 now checks
+   * its lease in the fence transaction and waits in a bounded loop before
+   * fencing.
    */
   private refuseDuringRefresh(accountId: string): void {
     const lease = this.store.getLease(refreshLeaseName(accountId));
-    if (lease && lease.until > Date.now()) throw new Error('refresh-in-progress');
+    if (lease && lease.until > this.now()) throw new Error('refresh-in-progress');
   }
 
   /** S5, followed by the existing C3 path (S6 → S7). Caller holds Pi's auth lock. */
