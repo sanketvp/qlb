@@ -242,9 +242,11 @@ export class CodexSlots {
         stashed = await this.readUnclaimedDurable(entry.stashId);
       } catch (error) {
         if (error instanceof CodexStashNotFound) {
-          // Complete only this login's own reservation: a row keyed to another
-          // account (e.g. a successor stash keyed by its predecessor) is not ours.
-          if (!identity || entry.accountId !== identity) throw new CodexStashUnverifiable();
+          // Complete only this login's own unknown-login reservation: a
+          // successor or -lost- row, or one keyed to another account, is not ours.
+          if (!identity || entry.accountId !== identity || !isUnknownLoginStashId(entry.stashId)) {
+            throw new CodexStashUnverifiable();
+          }
           await this.writeUnclaimedBody(entry.stashId, document, fingerprint);
           return { stashId: entry.stashId, created: true };
         }
@@ -257,7 +259,7 @@ export class CodexSlots {
     }
     if (!identity) throw new CodexStashUnverifiable();
     const { stashId } = await this.stashUnclaimedDurably(
-      defaultCodexStashId(now), document, fingerprint, identity,
+      `${defaultCodexStashId(now)}${UNKNOWN_LOGIN_SUFFIX}`, document, fingerprint, identity,
     );
     return { stashId, created: true };
   }
@@ -304,6 +306,9 @@ export class CodexSlots {
     }
     for (const entry of entries) {
       if (entry.consumedFp !== consumedFp) continue;
+      // An unknown-login stash (C6-7) is a safety copy of a document, never a
+      // successor; the refresh fingerprint alone cannot tell them apart.
+      if (isUnknownLoginStashId(entry.stashId)) continue;
       let stashed: ReadUnclaimedCodexSlot;
       try {
         stashed = await this.readUnclaimedDurable(entry.stashId);
@@ -322,9 +327,6 @@ export class CodexSlots {
         throw error;
       }
       if (!stashed.consumedFp || stashed.consumedFp !== consumedFp) continue;
-      // An unknown-login stash (C6-7) records its own fingerprint as consumedFp;
-      // a document is never its own successor.
-      if (stashed.fingerprint === consumedFp) continue;
       return { stashId: entry.stashId, document: stashed.document, consumedFp: stashed.consumedFp };
     }
     return null;
@@ -547,6 +549,12 @@ interface ExistingSlot {
 
 function isAlreadyExists(error: unknown): boolean {
   return (error as NodeJS.ErrnoException | undefined)?.code === 'EEXIST';
+}
+
+const UNKNOWN_LOGIN_SUFFIX = '-unknown';
+
+function isUnknownLoginStashId(stashId: string): boolean {
+  return stashId.endsWith(UNKNOWN_LOGIN_SUFFIX);
 }
 
 function isEmergencyStashId(stashId: string): boolean {

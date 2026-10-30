@@ -498,7 +498,7 @@ describe('Codex slots and import-active', () => {
       const slots = new CodexSlots({ keychain: h.keychain, stashDir });
       const doc = parsedDocument('completed-unknown-refresh');
       const fp = codexFingerprint(doc);
-      const stashId = 'bodyless-stash';
+      const stashId = 'bodyless-stash-unknown';
       await slots.stashUnclaimedDurably(stashId, doc, fp, planImportActiveCodex(doc).slotId!);
       h.keychain.deleteSync(qlbKeychainService('openai-codex', `unclaimed:${stashId}`), QLB_KEYCHAIN_ACCOUNT);
 
@@ -545,6 +545,47 @@ describe('Codex slots and import-active', () => {
       assert.equal(await slots.findStashedSuccessor(slotId, codexFingerprint(doc)), null);
       const read = await slots.readUnclaimedDurable(stashId);
       assert.equal(read.fingerprint, codexFingerprint(doc), 'the safety stash is kept');
+    } finally {
+      h.store.close();
+      rmSync(h.home, { recursive: true, force: true });
+    }
+  });
+
+  it('a stashed successor whose refresh token was not rotated is still adopted', async () => {
+    const h = fixture();
+    try {
+      const stashDir = join(h.home, 'stash');
+      const slots = new CodexSlots({ keychain: h.keychain, stashDir });
+      const predecessor = parsedDocument('unrotated-refresh');
+      const successor = parsedDocument('unrotated-refresh');
+      successor.last_refresh = '2026-10-30T00:00:00.000Z';
+      const consumedFp = codexFingerprint(predecessor);
+      assert.equal(codexFingerprint(successor), consumedFp, 'fixture keeps the refresh token');
+      const slotId = planImportActiveCodex(predecessor).slotId!;
+      await slots.stashUnclaimedDurably('unrotated-successor', successor, consumedFp, slotId);
+
+      const found = await slots.findStashedSuccessor(slotId, consumedFp);
+      assert.equal(found?.stashId, 'unrotated-successor');
+      assert.equal(found?.document.last_refresh, '2026-10-30T00:00:00.000Z');
+    } finally {
+      h.store.close();
+      rmSync(h.home, { recursive: true, force: true });
+    }
+  });
+
+  it('a bodyless successor reservation for this login is not completed as an unknown-login stash', async () => {
+    const h = fixture();
+    try {
+      const stashDir = join(h.home, 'stash');
+      const slots = new CodexSlots({ keychain: h.keychain, stashDir });
+      const doc = parsedDocument('own-successor-reservation');
+      const fp = codexFingerprint(doc);
+      const stashId = 'successor-reservation';
+      await slots.stashUnclaimedDurably(stashId, doc, fp, planImportActiveCodex(doc).slotId!);
+      h.keychain.deleteSync(qlbKeychainService('openai-codex', `unclaimed:${stashId}`), QLB_KEYCHAIN_ACCOUNT);
+
+      await assert.rejects(slots.ensureUnclaimedStash(doc, 2), CodexStashUnverifiable);
+      await assert.rejects(slots.readUnclaimedDurable(stashId), CodexStashNotFound);
     } finally {
       h.store.close();
       rmSync(h.home, { recursive: true, force: true });
