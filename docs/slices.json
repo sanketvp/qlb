@@ -79,6 +79,7 @@
 
     {"id":"K5","start":["K1","K2","K3","K4","A1b","A2b","A14","K13","R0","R0c"],"files":["src/cc-switch.ts","src/commands/switch-anthropic.ts","test/cc-switch.test.ts","test/cc-switch-locks.test.ts","test/lifecycle-guards.test.ts"]},
     {"id":"K6","start":["K1","K3","A4d","A13","P0","A14","P13"],"files":["src/cc-resync.ts","src/gate/anthropic.ts","test/cc-resync.test.ts","test/gate-refresh.test.ts","src/cc-slots.ts","test/cc-slots.test.ts","src/pi-gate.ts","src/commands/gate.ts","test/gate-guard.test.ts"]},
+    {"id":"K6b","start":["K6","P1","P2"],"files":["src/commands/gate.ts","src/pi-gate.ts","src/gate/anthropic.ts","extensions/qlb-pi/index.ts","extensions/qlb-pi/providers/anthropic.ts","test/gate-anthropic-401.test.ts","test/qlb-pi-wiring.test.ts"]},
     {"id":"K10","start":["K1","K2","A5","A13","A14","R0","R0c"],"files":["src/cswap-import.ts","src/commands/import-cswap.ts","test/cswap-import.test.ts","test/wiring/commands.d/import cswap"]},
     {"id":"C6","start":["C3","C5b","C3b","A8","C10","K13","A13","R0","R0c","A14","C1c"],"files":["src/codex-switch.ts","src/commands/switch-openai-codex.ts","test/codex-switch.test.ts","src/codex-sessions.ts","src/commands/codex-refresh.ts","test/codex-sessions.test.ts","src/codex-consume.ts","test/codex-consume.test.ts","src/codex-slots.ts","test/codex-slots.test.ts"]},
 
@@ -101,7 +102,7 @@
 
     {"id":"C4-live","start":["C4","P3","A11"],"files":[]},
     {"id":"P5-live","start":["P5","A11"],"files":[]},
-    {"id":"X1","start":["A0b","A0c","H1","R0","A12","A8","A9","K0","D1","D3","P1","C2b","C5","A14","A3c","A3d","A5","A10","C1b","C1c","A13","A2b","A2d","A4d","A7","A11","A6b","P0","P6","C4","K13","A10b","C5b","K1","K2","C3","P2","P3","P4","P5","P5b","P6b","P12","P13","A2c","C3b","K13b","P7a","K3","K4","C10","C7","K11","P10","P11","P7","P8","K5","K6","K10","C6","K8","C6b","P9","K12","K9","K14","X4a","K7","K5b","C8","H2","H3","D2"],"files":[]},
+    {"id":"X1","start":["A0b","A0c","H1","R0","A12","A8","A9","K0","D1","D3","P1","C2b","C5","A14","A3c","A3d","A5","A10","C1b","C1c","A13","A2b","A2d","A4d","A7","A11","A6b","P0","P6","C4","K13","A10b","C5b","K1","K2","C3","P2","P3","P4","P5","P5b","P6b","P12","P13","A2c","C3b","K13b","P7a","K3","K4","C10","C7","K11","P10","P11","P7","P8","K5","K6","K6b","K10","C6","K8","C6b","P9","K12","K9","K14","X4a","K7","K5b","C8","H2","H3","D2"],"files":[]},
     {"id":"X2","start":["X1"],"files":[]},
     {"id":"C9","start":["X2"],"files":[]},
     {"id":"X3","start":["X2","C9"],"files":[]},

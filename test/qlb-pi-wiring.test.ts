@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -58,7 +59,19 @@ const names = ['anthropic', 'xai', 'kimi-coding', 'openrouter', 'openai-codex'];
 const oauth = { resolve: 0, refresh: 0 };
 const authJson = { reads: 0, writes: 0 };
 const native = new Map(names.map((name) => [name, {
-  native: true, api: name, streamSimple: () => { throw new Error('native used'); },
+  native: true, api: name, streamSimple: (...streamArgs) => {
+    if (name === 'anthropic' && process.env.AUTH_401 === '1') {
+      const apiKey = streamArgs[2]?.apiKey;
+      return (async function* () {
+        if (apiKey === 'fixture-anthropic-access') {
+          yield { type: 'error', reason: 'error', error: { errorMessage: '401 unauthorized' } };
+        } else {
+          yield { type: 'done' };
+        }
+      })();
+    }
+    throw new Error('native used');
+  },
   ...(name === 'openai-codex' ? { auth: { oauth: {
     toAuth() { oauth.resolve += 1; return { apiKey: 'native' }; },
     refresh() { oauth.refresh += 1; return {}; },
@@ -136,12 +149,14 @@ const provider = args[0] === 'gate' && args[2] === '--json' ? args[1] : undefine
 if (!['anthropic', 'xai', 'kimi-coding', 'openrouter', 'openai-codex'].includes(provider)) process.exit(3);
 if (process.env.QLB_PI_TOKEN_CALL !== '1') process.exit(4);
 if (process.env.GATE_CALL_LOG) fs.appendFileSync(process.env.GATE_CALL_LOG, provider + '\n');
+if (process.env.GATE_ARGS_LOG) fs.appendFileSync(process.env.GATE_ARGS_LOG, JSON.stringify(args) + '\n');
 const finishGate = () => {
   if (process.env.GATE_FAIL === '1') {
     process.stderr.write(process.env.GATE_CAUSE || 'store-open-failed');
     process.exit(3);
   }
-  process.stdout.write(JSON.stringify({ token: 'fixture-' + provider + '-access', accountId: 'user:slot', chatgptAccountId: 'bare-account', source: 'fixture' }));
+  const retry = args.indexOf('--retry-after-401') !== -1;
+  process.stdout.write(JSON.stringify({ token: 'fixture-' + provider + (retry ? '-refreshed' : '-access'), accountId: 'user:slot', chatgptAccountId: 'bare-account', source: 'fixture' }));
 };
 const delayMs = Number(process.env.GATE_DELAY_MS || '0');
 if (Number.isFinite(delayMs) && delayMs > 0) setTimeout(finishGate, delayMs);
@@ -154,6 +169,7 @@ function load(owner?: string, gateFail = false, callCodex = false, perProviderOw
   runtimeKeyCallsVoid?: boolean;
   streamSimpleOnly?: boolean;
   reloadInert?: boolean;
+  auth401?: boolean;
 } = {}): {
   calls: string[];
   replaced: Record<string, boolean>;
@@ -163,6 +179,7 @@ function load(owner?: string, gateFail = false, callCodex = false, perProviderOw
   codexModelCount: number;
   events: Array<{ error?: { errorMessage?: string } }>;
   gateCalls: string[];
+  gateArgs: string[][];
   stderr: string;
 } {
   const home = mkdtempSync(join(tmpdir(), 'qlb-pi-wiring-'));
@@ -184,6 +201,7 @@ function load(owner?: string, gateFail = false, callCodex = false, perProviderOw
   }
   const runner = join(home, 'fake-qlb.cjs');
   const gateLog = join(home, 'gate-calls');
+  const gateArgsLog = join(home, 'gate-args');
   const entry = join(home, 'load.mjs');
   const compatOverride = join(home, 'compat-stream-simple-only.mjs');
   if (options.consumeMode) {
@@ -210,6 +228,8 @@ function load(owner?: string, gateFail = false, callCodex = false, perProviderOw
       QLB_PI_EXTENSION: extension,
       QLB_CLI: runner,
       GATE_CALL_LOG: gateLog,
+      GATE_ARGS_LOG: gateArgsLog,
+      ...(options.auth401 ? { AUTH_401: '1' } : {}),
       ...(gateFail ? { GATE_FAIL: '1' } : {}),
       ...(gateCause ? { GATE_CAUSE: gateCause } : {}),
       ...(gateDelayMs > 0 ? { GATE_DELAY_MS: String(gateDelayMs) } : {}),
@@ -227,6 +247,7 @@ function load(owner?: string, gateFail = false, callCodex = false, perProviderOw
   return {
     ...JSON.parse(result.stdout.trim().split('\n').pop() ?? ''),
     gateCalls: existsSync(gateLog) ? readFileSync(gateLog, 'utf8').trim().split('\n').filter(Boolean) : [],
+    gateArgs: existsSync(gateArgsLog) ? readFileSync(gateArgsLog, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line) as string[]) : [],
     stderr: result.stderr,
   } as ReturnType<typeof load>;
 }
@@ -319,6 +340,18 @@ describe('qlb-pi provider wiring', { skip: piAvailable ? false : 'global Pi inst
     assert.deepEqual(result.events.map((event) => event.error?.errorMessage), [
       'QLB unavailable for anthropic — run qlb doctor (store-open-failed)',
     ]);
+  });
+
+  it('re-runs the Anthropic gate with the failed token fingerprint after a 401', () => {
+    const owner = JSON.stringify({ providers: { anthropic: { mode: 'qlb', since: 1 } } });
+    const result = load(owner, false, false, undefined, false, false, true, undefined, false, 0, { auth401: true });
+    const fp = `sha256-at:${createHash('sha256').update('fixture-anthropic-access', 'utf8').digest('hex')}`;
+    assert.deepEqual(result.gateCalls, ['anthropic', 'anthropic']);
+    assert.deepEqual(result.gateArgs, [
+      ['gate', 'anthropic', '--json'],
+      ['gate', 'anthropic', '--json', '--retry-after-401', fp],
+    ]);
+    assert.deepEqual(result.events, [{ type: 'done' }]);
   });
 
   it('does not infer a Codex owner from a shared Anthropic-only v2 document or legacy v1 document', () => {
@@ -438,7 +471,7 @@ describe('Anthropic gate timeout', () => {
   it('passes the bounded-refresh budget only to the Anthropic gate call', () => {
     const source = readFileSync(join(ROOT, 'extensions', 'qlb-pi', 'index.ts'), 'utf8');
     assert.match(source, /const ANTHROPIC_GATE_TIMEOUT_MS = 45_000;/);
-    assert.match(source, /runQlb\(\s*\["gate", provider, "--json"\],\s*ANTHROPIC_GATE_TIMEOUT_MS,/);
+    assert.match(source, /runQlb\(\s*\["gate", provider, "--json", \.\.\.\(retryAfter401Fp === undefined \? \[\] : \["--retry-after-401", retryAfter401Fp\]\)\],\s*ANTHROPIC_GATE_TIMEOUT_MS,/);
   });
 });
 

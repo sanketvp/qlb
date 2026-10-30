@@ -39,6 +39,8 @@ export interface GateContext {
   dbPath: string;
   env: NodeJS.ProcessEnv;
   piAgentDir?: string;
+  /** Access-token fingerprint rejected by Pi's immediately preceding request. */
+  retryAfter401Fp?: string;
   autoLog: (line: string) => void;
 }
 
@@ -98,6 +100,8 @@ export interface PiGateDeps {
   store?: Pick<Store, 'recordLineage' | 'recordRelogin'>;
   /** Command dispatch supplies the configured Pi agent directory. */
   piAgentDir?: string;
+  /** Non-secret access fingerprint supplied by `gate --retry-after-401`. */
+  retryAfter401Fp?: string;
   /** Injectable S24 result for hermetic tests. */
   cswapProcesses?: () => CswapProcess[];
   /** Test seam for the process listing used when no S24 result is injected. */
@@ -308,6 +312,7 @@ export async function runPiGate(providerName: string, deps: PiGateDeps): Promise
       dbPath: deps.dbPath,
       env: deps.env,
       ...(deps.piAgentDir === undefined ? {} : { piAgentDir: deps.piAgentDir }),
+      ...(deps.retryAfter401Fp === undefined ? {} : { retryAfter401Fp: deps.retryAfter401Fp }),
       autoLog: (line) => appendGateAutoLog(deps.dbPath, line),
     });
     await gate.prerequisites?.();

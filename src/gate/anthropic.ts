@@ -1,13 +1,16 @@
+import { randomUUID } from 'node:crypto';
 import { dirname, join } from 'node:path';
 
-import { isOAuthTokenExpired, parseCredentialBlob, type HttpRequestDescription } from '../anthropic-oauth';
+import { accessTokenFingerprint, isOAuthTokenExpired, parseCredentialBlob, type HttpRequestDescription } from '../anthropic-oauth';
 import { readLiveClaudeCredentials, type ClaudeCredentialsOptions } from '../cc-credentials';
 import { claudePaths } from '../cc-paths';
 import { ClaudeSlots, SqliteClaudeSlotRepository } from '../cc-slots';
 import {
   liveIdentity,
   ProbeVerdictMemo,
+  credentialLineage,
   refreshActiveLogin,
+  type ActiveFetchRecord,
   type RefreshActiveLoginDeps,
   type RefreshActiveLoginInput,
   type RefreshHttpResponse,
@@ -15,7 +18,8 @@ import {
 } from '../cc-resync';
 import { platformKeychain } from '../keychain';
 import { GateFailure, GateRefused, type GateContext, type GateCredential, type ProviderGate } from '../pi-gate';
-import { openStore, type Store } from '../store';
+import { openStore, openStoreConnection, type Store } from '../store';
+import { MIN_INTERVAL_S } from '../poll-policy';
 
 export interface AnthropicGateDeps {
   store?: Store;
@@ -29,6 +33,19 @@ export interface AnthropicGateDeps {
   autoLog?: (line: string) => void;
   refresh?: (deps: RefreshActiveLoginDeps, input: RefreshActiveLoginInput) => Promise<RefreshOutcome>;
   withCredentialLocks?: RefreshActiveLoginDeps['withCredentialLocks'];
+  /** Test seam for the fixed-string warning emitted only when release fails. */
+  warn?: (message: string) => void;
+}
+
+export interface Forced401Claim {
+  claimId: string;
+  previous: string | null;
+}
+
+interface Forced401Config {
+  fp: string;
+  at: number;
+  claimId: string;
 }
 
 interface GateResources {
@@ -89,6 +106,99 @@ function resources(deps: AnthropicGateDeps, context: GateContext): GateResources
       if (ownedStore) store.close();
     },
   };
+}
+
+function forced401Config(value: string | null): Forced401Config | null {
+  if (value === null) return null;
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+    const row = parsed as Record<string, unknown>;
+    return typeof row.fp === 'string' && typeof row.at === 'number' && Number.isFinite(row.at)
+      && typeof row.claimId === 'string'
+      ? { fp: row.fp, at: row.at, claimId: row.claimId }
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Atomically reserve one forced recovery without retaining credential bytes. */
+export function claimForced401(store: Store, accountId: string, fp: string, now: number): Forced401Claim | null {
+  void accountId; // The active Anthropic login is singleton; the config key is its durable claim.
+  const db = openStoreConnection(store.dbPath);
+  try {
+    db.exec('BEGIN IMMEDIATE');
+    const row = db.prepare('SELECT value FROM config WHERE key = ?').get('pi.anthropic.forced401') as { value?: unknown } | undefined;
+    const previous = typeof row?.value === 'string' ? row.value : null;
+    const current = forced401Config(previous);
+    if (current === null && previous !== null) {
+      db.exec('COMMIT');
+      return null;
+    }
+    if (current && (current.fp === fp || now - current.at < MIN_INTERVAL_S * 1000)) {
+      db.exec('COMMIT');
+      return null;
+    }
+    const claimId = randomUUID();
+    db.prepare(`INSERT INTO config (key, value) VALUES (?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(
+      'pi.anthropic.forced401', JSON.stringify({ fp, at: now, claimId }),
+    );
+    db.exec('COMMIT');
+    return { claimId, previous };
+  } catch (error) {
+    try { db.exec('ROLLBACK'); } catch { /* preserve claim failure */ }
+    throw error;
+  } finally {
+    db.close();
+  }
+}
+
+/** Return a no-POST claim only while no newer claimant has replaced it. */
+export function releaseForced401(store: Store, claimId: string, previous: string | null): void {
+  const db = openStoreConnection(store.dbPath);
+  try {
+    db.exec('BEGIN IMMEDIATE');
+    const row = db.prepare('SELECT value FROM config WHERE key = ?').get('pi.anthropic.forced401') as { value?: unknown } | undefined;
+    const current = forced401Config(typeof row?.value === 'string' ? row.value : null);
+    if (current?.claimId === claimId) {
+      if (previous === null) db.prepare('DELETE FROM config WHERE key = ?').run('pi.anthropic.forced401');
+      else db.prepare(`INSERT INTO config (key, value) VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run('pi.anthropic.forced401', previous);
+    }
+    db.exec('COMMIT');
+  } catch (error) {
+    try { db.exec('ROLLBACK'); } catch { /* preserve release failure */ }
+    throw error;
+  } finally {
+    db.close();
+  }
+}
+
+/** Whether the closed refresh result spent (or attempted to spend) a grant. */
+export function startedPost(outcome: RefreshOutcome): boolean {
+  switch (outcome.outcome) {
+    case 'posted':
+    case 'posted-slot-unwritten':
+    case 'posted-live-unwritten':
+    case 'stashed':
+    case 'unpersisted':
+      return true;
+    case 'restored':
+    case 'adopted':
+    case 'deferred':
+    case 'refused':
+      return false;
+    case 'dead':
+      return outcome.struckFp !== null;
+    case 'failed':
+      return outcome.reason === 'refresh-failed' || outcome.reason === 'invalid_client';
+    default: {
+      const exhaustive: never = outcome;
+      return exhaustive;
+    }
+  }
 }
 
 function served(accountId: string, working: string, source: GateCredential['source']): GateCredential {
@@ -167,7 +277,8 @@ export function createAnthropicGate(deps: AnthropicGateDeps = {}, initialContext
       try {
         const active = configured.store.getActiveLogin('anthropic');
         if (!active?.accountId) throw new GateFailure('active-login-unset');
-        const slot = configured.slots.getSlot(active.accountId);
+        const accountId = active.accountId;
+        const slot = configured.slots.getSlot(accountId);
         if (!slot) throw new GateFailure('active-slot-missing');
 
         const paths = configured.live.paths ?? claudePaths(configured.live);
@@ -186,32 +297,59 @@ export function createAnthropicGate(deps: AnthropicGateDeps = {}, initialContext
         if (currentActive?.accountId !== active.accountId || !identityMatchesSlot(finalIdentity, slot)) {
           throw new GateRefused('identity-mismatch');
         }
-        if (parts.expiresAt !== undefined && !isOAuthTokenExpired(parts.expiresAt, now())) {
-          return served(active.accountId, live, 'live');
+        const autoLog = deps.autoLog ?? context.autoLog;
+        const refresh = async (forceRecord?: ActiveFetchRecord): Promise<RefreshOutcome> => {
+          const outcome = await (deps.refresh ?? refreshActiveLogin)({
+            slots: configured.slots,
+            store: configured.store,
+            live: configured.live,
+            readLiveIdentity: readIdentity,
+            postRefresh: deps.postRefresh ?? sendRefresh,
+            now,
+            verdicts: deps.verdicts ?? new ProbeVerdictMemo(),
+            env: configured.env,
+            by: 'qlb-gate',
+            autoLog,
+            withCredentialLocks: deps.withCredentialLocks,
+          }, {
+            accountId,
+            email: slot.email ?? '',
+            orgUuid: slot.orgUuid ?? '',
+            creds: live,
+            ...(forceRecord === undefined ? {} : { forceRecord }),
+            degraded: false,
+          });
+          const activeAfterRefresh = configured.store.getActiveLogin('anthropic');
+          if (activeAfterRefresh?.accountId !== accountId) throw new GateRefused('active-login-stale');
+          return outcome;
+        };
+
+        const retryAfter401Fp = context.retryAfter401Fp;
+        if (retryAfter401Fp !== undefined) {
+          // A changed access generation, a divergent served lineage, and a
+          // quarantined slot must never consume a grant because of a stale 401.
+          if (accessTokenFingerprint(live) !== retryAfter401Fp
+            || credentialLineage(live) !== slot.fingerprint || slot.dead) {
+            return served(accountId, live, 'live');
+          }
+          const claim = claimForced401(configured.store, accountId, retryAfter401Fp, now());
+          if (!claim) return served(accountId, live, 'live');
+          let outcome: RefreshOutcome | undefined;
+          try {
+            outcome = await refresh({ error: 'http-401' });
+            return mapRefreshOutcome(outcome, accountId, autoLog, now);
+          } finally {
+            if (outcome === undefined || !startedPost(outcome)) {
+              try { releaseForced401(configured.store, claim.claimId, claim.previous); }
+              catch { (deps.warn ?? console.warn)('Claude forced-401 claim release failed'); }
+            }
+          }
         }
 
-        const outcome = await (deps.refresh ?? refreshActiveLogin)({
-          slots: configured.slots,
-          store: configured.store,
-          live: configured.live,
-          readLiveIdentity: readIdentity,
-          postRefresh: deps.postRefresh ?? sendRefresh,
-          now,
-          verdicts: deps.verdicts ?? new ProbeVerdictMemo(),
-          env: configured.env,
-          by: 'qlb-gate',
-          autoLog: deps.autoLog ?? context.autoLog,
-          withCredentialLocks: deps.withCredentialLocks,
-        }, {
-          accountId: active.accountId,
-          email: slot.email ?? '',
-          orgUuid: slot.orgUuid ?? '',
-          creds: live,
-          degraded: false,
-        });
-        const activeAfterRefresh = configured.store.getActiveLogin('anthropic');
-        if (activeAfterRefresh?.accountId !== active.accountId) throw new GateRefused('active-login-stale');
-        return mapRefreshOutcome(outcome, active.accountId, deps.autoLog ?? context.autoLog, now);
+        if (parts.expiresAt !== undefined && !isOAuthTokenExpired(parts.expiresAt, now())) {
+          return served(accountId, live, 'live');
+        }
+        return mapRefreshOutcome(await refresh(), accountId, autoLog, now);
       } finally {
         configured.close();
       }
