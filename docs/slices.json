@@ -83,7 +83,8 @@
     {"id":"C6","start":["C3","C5b","C3b","A8","C10","K13","A13","R0","R0c","A14","C1c"],"files":["src/codex-switch.ts","src/commands/switch-openai-codex.ts","test/codex-switch.test.ts","src/codex-sessions.ts","src/commands/codex-refresh.ts","test/codex-sessions.test.ts","src/codex-consume.ts","test/codex-consume.test.ts","src/codex-slots.ts","test/codex-slots.test.ts"]},
 
     {"id":"K8","start":["K5"],"files":["src/cc-switch.ts","test/cc-switch-rollback.test.ts"]},
-    {"id":"C6b","start":["C6","C10","C5b","C3b","P3","P0","K6","R0","R0c"],"files":["src/codex-active.ts","src/gate/openai-codex.ts","src/commands/codex-verify-l13.ts","src/checks/codex-first-switch.ts","test/codex-active-refresh.test.ts","test/gate-refresh.test.ts","test/codex-verify-l13.test.ts"]},
+    {"id":"C6-10","start":["C6"],"files":["src/codex-switch.ts","test/codex-switch.test.ts"]},
+    {"id":"C6b","start":["C6-10","C10","C5b","C3b","P3","P0","K6","R0","R0c"],"files":["src/codex-active.ts","src/gate/openai-codex.ts","src/commands/codex-verify-l13.ts","src/checks/codex-first-switch.ts","test/codex-active-refresh.test.ts","test/gate-refresh.test.ts","test/codex-verify-l13.test.ts"]},
     {"id":"P9","start":["P7","P12","R0"],"files":["src/checks/pi-provider.ts","src/checks/pi-anthropic.ts","test/pi-root.test.ts"]},
     {"id":"K12","start":["K2","K10","A2d","P7","A14","K13b","A13","C3b","C6","K6","R0","R0c"],"files":["src/cswap-undo.ts","src/commands/undo-cswap.ts","src/checks/undo-lineage-match.ts","src/checks/undo-incomplete.ts","src/commands/cutover.ts","test/cswap-undo.test.ts","test/pi-migrate.test.ts"]},
 

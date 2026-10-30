@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, readdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -9,6 +9,18 @@ import {
   checkCodexSwitchPreconditions,
   preflightCodexLive,
   type CodexSwitchDeps,
+  type CodexSwitchJournal,
+  codexSwitchJournalOwnerLockPath,
+  codexSwitchJournalPath,
+  deleteCodexSwitchJournalIf,
+  executingCodexAttempts,
+  finishCodexSwitchAttempt,
+  markCodexSwitchJournalUnresolved,
+  probeCodexSwitchJournal,
+  readCodexSwitchJournal,
+  releaseCodexSwitchJournal,
+  withCodexSwitchJournalOwner,
+  writeCodexSwitchJournal,
 } from '../src/codex-switch';
 import { openStore } from '../src/store';
 
@@ -169,5 +181,131 @@ describe('Codex switch preflight and preconditions', () => {
       h.store.close();
       rmSync(h.root, { recursive: true, force: true });
     }
+  });
+});
+
+function journalFixture(root: string, overrides: Partial<CodexSwitchJournal> = {}): CodexSwitchJournal {
+  return {
+    v: 2, attemptId: 'attempt-1', from: 'from:account', to: 'to:account',
+    target: { identity: { chatgpt_user_id: 'target', account_id: 'account' }, fingerprint: 'fp-target' },
+    adoptingTarget: [], trigger: 'manual', decision: null,
+    openSessions: [{ pid: 4101, lstart: 'Tue Oct 28 10:00:00 2026', host: 'codex' }],
+    outgoing: { sha256: 'sha256-file:outgoing', inode: 42 }, publishedAt: 1_700_000_000_000,
+    owner: { pid: 4101, lstart: 'Tue Oct 28 10:00:00 2026', state: 'active' },
+    ...overrides,
+  };
+}
+
+function journalHarness() {
+  const root = mkdtempSync(join(tmpdir(), 'qlb-codex-journal-'));
+  const journalDir = join(root, 'qlb', '.qlb', 'journal');
+  const options = {
+    journalDir, now: () => 1_700_000_000_000,
+    sameProcess: async () => false,
+    ownerLockTimeoutMs: 20, ownerLockRetryMinMs: 1, ownerLockRetryJitterMs: 0,
+  };
+  return { root, journalDir, options };
+}
+
+describe('Codex switch journal v2', () => {
+  it('journal v2 round-trips at mode 0600 and contains no token value', () => {
+    const h = journalHarness();
+    try {
+      let fsynced = '';
+      writeCodexSwitchJournal(journalFixture(h.root), { ...h.options, fsyncDirectory: (path) => { fsynced = path; } });
+      const path = codexSwitchJournalPath(h.options);
+      assert.equal(statSync(path).mode & 0o777, 0o600);
+      assert.equal(fsynced, h.journalDir);
+      assert.deepEqual(readCodexSwitchJournal(h.options), { state: 'ok', journal: journalFixture(h.root) });
+      assert.doesNotMatch(readFileSync(path, 'utf8'), /fixture-token-value/);
+    } finally { executingCodexAttempts.clear(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('a truncated or v1 journal reads as malformed', () => {
+    const h = journalHarness();
+    try {
+      mkdirSync(h.journalDir, { recursive: true });
+      writeFileSync(codexSwitchJournalPath(h.options), '{"v":2');
+      assert.deepEqual(readCodexSwitchJournal(h.options), { state: 'malformed' });
+      writeFileSync(codexSwitchJournalPath(h.options), JSON.stringify({ ...journalFixture(h.root), v: 1 }));
+      assert.deepEqual(readCodexSwitchJournal(h.options), { state: 'malformed' });
+    } finally { rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('a journal whose owner pid is alive with the same lstart and state active is in progress even after its lock went stale', async () => {
+    const h = journalHarness();
+    try {
+      writeCodexSwitchJournal(journalFixture(h.root), h.options);
+      mkdirSync(codexSwitchJournalOwnerLockPath(h.options), { recursive: true });
+      utimesSync(codexSwitchJournalOwnerLockPath(h.options), new Date(Date.now() - 600_000), new Date(Date.now() - 600_000));
+      const result = await probeCodexSwitchJournal({ ...h.options, sameProcess: async () => true });
+      assert.equal(result.state, 'in-progress');
+    } finally { executingCodexAttempts.clear(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('a released journal owned by a live process is resumable', async () => {
+    const h = journalHarness();
+    try {
+      writeCodexSwitchJournal(journalFixture(h.root, { owner: { pid: 4101, lstart: 'Tue Oct 28 10:00:00 2026', state: 'released' } }), h.options);
+      assert.equal((await probeCodexSwitchJournal({ ...h.options, sameProcess: async () => true })).state, 'orphaned');
+      assert.equal(await releaseCodexSwitchJournal('attempt-1', h.options), true);
+    } finally { executingCodexAttempts.clear(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('a journal owned by this process whose attempt is no longer executing is resumable without a restart', async () => {
+    const h = journalHarness();
+    try {
+      writeCodexSwitchJournal(journalFixture(h.root, { owner: { pid: process.pid, lstart: 'fixture', state: 'active' } }), h.options);
+      finishCodexSwitchAttempt('attempt-1');
+      assert.equal((await probeCodexSwitchJournal({ ...h.options, sameProcess: async () => true })).state, 'orphaned');
+    } finally { executingCodexAttempts.clear(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it(`a dead owner's fresh lock refuses with the retry time and the next attempt after five minutes recovers`, async () => {
+    const h = journalHarness();
+    try {
+      writeCodexSwitchJournal(journalFixture(h.root), h.options);
+      mkdirSync(codexSwitchJournalOwnerLockPath(h.options), { recursive: true });
+      const fresh = await probeCodexSwitchJournal(h.options);
+      assert.equal(fresh.state, 'owner-lock-not-yet-stale');
+      if (fresh.state === 'owner-lock-not-yet-stale') assert.ok(fresh.retryAt > Date.now());
+      utimesSync(codexSwitchJournalOwnerLockPath(h.options), new Date(Date.now() - 300_001), new Date(Date.now() - 300_001));
+      assert.equal((await probeCodexSwitchJournal(h.options)).state, 'orphaned');
+    } finally { executingCodexAttempts.clear(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it(`a dead owner's stale lock is reclaimed and reads orphaned`, async () => {
+    const h = journalHarness();
+    try {
+      writeCodexSwitchJournal(journalFixture(h.root), h.options);
+      mkdirSync(codexSwitchJournalOwnerLockPath(h.options), { recursive: true });
+      utimesSync(codexSwitchJournalOwnerLockPath(h.options), new Date(Date.now() - 300_001), new Date(Date.now() - 300_001));
+      assert.equal((await probeCodexSwitchJournal(h.options)).state, 'orphaned');
+    } finally { executingCodexAttempts.clear(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('an unresolved mark unions involved accounts and never shrinks them', async () => {
+    const h = journalHarness();
+    try {
+      writeCodexSwitchJournal(journalFixture(h.root), h.options);
+      await withCodexSwitchJournalOwner(h.options, (held) => {
+        assert.equal(markCodexSwitchJournalUnresolved(held, 'attempt-1', 'slot-split', ['from:account', 'third:account'], h.options), true);
+        assert.equal(markCodexSwitchJournalUnresolved(held, 'attempt-1', 'target-ancestor', ['to:account'], h.options), true);
+      });
+      const read = readCodexSwitchJournal(h.options);
+      assert.deepEqual(read.state === 'ok' ? read.journal.unresolved?.involvedAccounts : undefined, ['from:account', 'third:account', 'to:account']);
+    } finally { executingCodexAttempts.clear(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('a conditional delete or mark with another attempt id leaves the file', async () => {
+    const h = journalHarness();
+    try {
+      writeCodexSwitchJournal(journalFixture(h.root), h.options);
+      await withCodexSwitchJournalOwner(h.options, (held) => {
+        assert.equal(markCodexSwitchJournalUnresolved(held, 'another-attempt', 'slot-split', ['third:account'], h.options), false);
+        assert.equal(deleteCodexSwitchJournalIf(h.journalDir, 'another-attempt', held, h.options), false);
+      });
+      assert.equal(readCodexSwitchJournal(h.options).state, 'ok');
+    } finally { executingCodexAttempts.clear(); rmSync(h.root, { recursive: true, force: true }); }
   });
 });
