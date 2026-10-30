@@ -1842,6 +1842,219 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     }
   });
 
+  it('T-S3a restore write is verified under the auth lock and a failed write keeps everything', async () => {
+    {
+      const h = setup('xai');
+      try {
+        h.mig.stage();
+        await h.mig.rehearse(mockRehearse([]));
+        h.mig.commit();
+        writeFileSync(h.authPath, JSON.stringify({
+          ...FAKE_GRANTS,
+          xai: { type: 'oauth', access: 'qlb-managed', refresh: '' },
+        }, null, 2) + '\n');
+        const guarded = h.mig as unknown as {
+          restoreSingleGrantPiAuthEntry: (key: string, record: unknown) => unknown;
+        };
+        const restore = guarded.restoreSingleGrantPiAuthEntry.bind(h.mig);
+        let writes = 0;
+        guarded.restoreSingleGrantPiAuthEntry = (key, record) => {
+          writes += 1;
+          assert.equal(existsSync(`${resolve(h.authPath)}.lock`), true, 'S3 writes while Pi auth lock is held');
+          return restore(key, record);
+        };
+
+        h.mig.rollback();
+
+        assert.equal(writes, 1, 'S3 has one durable restore write path');
+        assert.deepEqual(readFileSync(h.authPath), h.originalBytes, 'the restored auth.json bytes match the Keychain source');
+        assert.equal(existsSync(h.ownerPath), false, 'S4 releases ownership only after verified restore');
+        assert.ok((h.store.getMigration('pi-xai') && JSON.parse(h.store.getMigration('pi-xai')!.detail_json).lastRollback), 'the rollback journal reaches its terminal record');
+      } finally {
+        h.cleanup();
+      }
+    }
+
+    for (const failure of ['write', 'verify'] as const) {
+      const h = setup('xai');
+      try {
+        h.mig.stage();
+        await h.mig.rehearse(mockRehearse([]));
+        h.mig.commit();
+        writePiAuthBackup(h.authPath, 'xai', 's3a-fixture');
+        writeFileSync(h.authPath, JSON.stringify({
+          ...FAKE_GRANTS,
+          xai: { type: 'oauth', access: 'qlb-managed', refresh: '' },
+        }, null, 2) + '\n');
+        const id = expectedId('xai');
+        const service = qlbKeychainService('xai', id);
+        const account = expectedLabel('xai');
+        const ownerBefore = readFileSync(h.ownerPath);
+        const backupBefore = readFileSync(piAuthBackupPath(h.authPath, 'xai'));
+        const keychainBefore = h.kc.getSync(service, account);
+        const guarded = h.mig as unknown as {
+          restoreSingleGrantPiAuthEntry: (key: string, record: unknown) => unknown;
+          readSingleGrantAuth: () => Record<string, unknown>;
+        };
+        if (failure === 'write') {
+          guarded.restoreSingleGrantPiAuthEntry = () => {
+            assert.equal(existsSync(`${resolve(h.authPath)}.lock`), true, 'failed S3 write is attempted under the lock');
+            throw new Error('injected S3 write failure');
+          };
+        } else {
+          const read = guarded.readSingleGrantAuth.bind(h.mig);
+          let reads = 0;
+          guarded.readSingleGrantAuth = () => {
+            reads += 1;
+            if (reads === 2) return { ...read(), xai: { ...FAKE_GRANTS.xai, refresh: 'verify-mismatch-fake' } };
+            return read();
+          };
+        }
+
+        assert.throws(() => h.mig.rollback(), failure === 'write' ? /injected S3 write failure/ : /restore verification failed/);
+
+        const detail = JSON.parse(h.store.getMigration('pi-xai')!.detail_json) as Record<string, unknown>;
+        assert.equal(detail.intent, 'rollback', `${failure}: S1 intent is retained`);
+        assert.ok(detail.rollbackDecision, `${failure}: S2 decision is retained`);
+        assert.deepEqual(readFileSync(h.ownerPath), ownerBefore, `${failure}: S4 does not release the owner claim`);
+        assert.deepEqual(readFileSync(piAuthBackupPath(h.authPath, 'xai')), backupBefore, `${failure}: backup is retained`);
+        assert.equal(h.kc.getSync(service, account), keychainBefore, `${failure}: K_m is unchanged`);
+        if (failure === 'write') {
+          assert.match(readFileSync(h.authPath, 'utf8'), /qlb-managed/, 'failed write leaves the auth bytes unchanged');
+        } else {
+          assert.match(readFileSync(h.authPath, 'utf8'), /xai-refresh-fake/, 'failed verify keeps the completed write for retry verification');
+        }
+      } finally {
+        h.cleanup();
+      }
+    }
+  });
+
+  it('T-S3c an entryPresent:false source deletes the key and a retry does not resurrect it', async () => {
+    const h = setup('xai');
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      h.mig.commit();
+      const withoutXai = { ...FAKE_GRANTS } as Record<string, unknown>;
+      delete withoutXai.xai;
+      writeFileSync(h.authPath, JSON.stringify(withoutXai, null, 2) + '\n');
+      writePiAuthBackup(h.authPath, 'xai', 'entry-absent-fixture');
+      writeFileSync(h.authPath, JSON.stringify({
+        ...withoutXai,
+        xai: { type: 'oauth', access: 'qlb-managed', refresh: '' },
+      }, null, 2) + '\n');
+
+      h.mig.rollback();
+      const bytesAfterRollback = readFileSync(h.authPath);
+      const authAfterRollback = JSON.parse(bytesAfterRollback.toString('utf8')) as Record<string, unknown>;
+      assert.equal(Object.prototype.hasOwnProperty.call(authAfterRollback, 'xai'), false, 'the recorded absent entry deletes the placeholder key');
+      assert.deepEqual(bytesAfterRollback, Buffer.from(JSON.stringify(withoutXai, null, 2) + '\n'), 'auth.json bytes contain no resurrected key');
+      assert.equal(existsSync(h.ownerPath), false, 'S4 releases the owner after the deletion verifies');
+      assert.ok(JSON.parse(h.store.getMigration('pi-xai')!.detail_json).lastRollback, 'the terminal journal records the hand-back');
+
+      h.mig.resume();
+      assert.deepEqual(readFileSync(h.authPath), bytesAfterRollback, 'retry leaves the absent key absent');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('T-S3c2 guard (c): an absent key with an entryPresent:false decision is satisfied without a write', async () => {
+    const h = setup('xai');
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      h.mig.commit();
+      const withoutXai = { ...FAKE_GRANTS } as Record<string, unknown>;
+      delete withoutXai.xai;
+      writeFileSync(h.authPath, JSON.stringify(withoutXai, null, 2) + '\n');
+      writePiAuthBackup(h.authPath, 'xai', 'entry-absent-guard-c');
+      const before = readFileSync(h.authPath);
+
+      h.mig.rollback();
+
+      assert.deepEqual(readFileSync(h.authPath), before, 'guard (c) writes nothing and never resurrects the key');
+      assert.equal(existsSync(h.ownerPath), false, 'S4 releases the owner once guard (c) is satisfied');
+      assert.ok(JSON.parse(h.store.getMigration('pi-xai')!.detail_json).lastRollback, 'the terminal journal records the hand-back');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('T-S3d restore recreates a deleted auth.json from the backup', async () => {
+    const h = setup('xai');
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      h.mig.commit();
+      writePiAuthBackup(h.authPath, 'xai', 'recreate-file-fixture');
+      rmSync(h.authPath, { force: true });
+
+      h.mig.rollback();
+
+      const expected = Buffer.from(JSON.stringify({ xai: FAKE_GRANTS.xai }, null, 2) + '\n');
+      assert.deepEqual(readFileSync(h.authPath), expected, 'S3 recreates auth.json with the backed-up key');
+      assert.equal(existsSync(h.ownerPath), false, 'S4 follows only after the restore verifies');
+      assert.ok(JSON.parse(h.store.getMigration('pi-xai')!.detail_json).lastRollback, 'the terminal journal records the hand-back');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('T-S3k rollback for xai staged from key grok restores auth.grok and never writes auth.xai', async () => {
+    const h = setup('xai');
+    try {
+      const grok = { ...FAKE_GRANTS.xai, access: 'grok-access-fake', refresh: 'grok-refresh-fake' };
+      writeFileSync(h.authPath, JSON.stringify({ ...FAKE_GRANTS, grok }, null, 2) + '\n');
+      const migration = createSingleGrantMigration(h.store, h.kc, 'xai', h.authPath, h.ownerPath, 'grok');
+      migration.stage();
+      await migration.rehearse(mockRehearse([]));
+      migration.commit();
+      const xaiBefore = JSON.parse(readFileSync(h.authPath, 'utf8')).xai;
+      writeFileSync(h.authPath, JSON.stringify({
+        ...JSON.parse(readFileSync(h.authPath, 'utf8')),
+        grok: { type: 'oauth', access: 'qlb-managed', refresh: '' },
+      }, null, 2) + '\n');
+
+      migration.rollback();
+
+      const bytes = readFileSync(h.authPath);
+      const auth = JSON.parse(bytes.toString('utf8')) as Record<string, unknown>;
+      assert.deepEqual(auth.grok, grok, 'S3 restores the journaled grok key');
+      assert.deepEqual(auth.xai, xaiBefore, 'S3 never writes the provider-default xai key');
+      assert.deepEqual(bytes, Buffer.from(JSON.stringify({ ...FAKE_GRANTS, grok }, null, 2) + '\n'), 'final auth.json bytes modify only auth.grok');
+      assert.equal(existsSync(h.ownerPath), false, 'S4 releases the owner after the grok write verifies');
+      assert.ok(JSON.parse(h.store.getMigration('pi-xai')!.detail_json).lastRollback, 'the terminal journal records the hand-back');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('T-S3p a placeholder entry is restored, not refused', async () => {
+    const h = setup('xai');
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      h.mig.commit();
+      writeFileSync(h.authPath, JSON.stringify({
+        ...FAKE_GRANTS,
+        xai: { type: 'oauth', access: 'qlb-managed', refresh: '' },
+      }, null, 2) + '\n');
+
+      h.mig.rollback();
+
+      const bytes = readFileSync(h.authPath);
+      const auth = JSON.parse(bytes.toString('utf8')) as Record<string, unknown>;
+      assert.deepEqual(auth.xai, FAKE_GRANTS.xai, 'the fenced Keychain source replaces the placeholder');
+      assert.deepEqual(bytes, h.originalBytes, 'final auth.json bytes contain the restored native entry');
+      assert.equal(existsSync(h.ownerPath), false, 'restore and verify complete before S4 un-owns');
+      assert.ok(JSON.parse(h.store.getMigration('pi-xai')!.detail_json).lastRollback, 'the terminal journal records the hand-back');
+    } finally {
+      h.cleanup();
+    }
+  });
+
   it('T-S3e a defined, non-placeholder, invalid native entry refuses native-entry-invalid', async () => {
     for (const fixture of [
       {
