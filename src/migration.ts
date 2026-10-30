@@ -1951,8 +1951,8 @@ export class Migration {
   }
 
   /**
-   * S2: rank outside the transaction, then atomically verify G, fence it,
-   * and persist the full decision. Digest/lease re-checks land in later rows.
+   * S2: rank outside the transaction, then atomically verify G and K_m, fence
+   * them, and persist the full decision. Lease re-checks land in later rows.
    */
   private decideAndFenceSingleGrantRollback(
     journalAccount: { provider: string; id: string; label: string },
@@ -2036,6 +2036,13 @@ export class Migration {
       try {
         const fenced = this.store.runImmediate(() => {
           if (this.store.getGrantGeneration(journalAccount.id) !== g0) throw new RetryS2();
+          let transactionKeychainGrant: Grant | null = null;
+          try {
+            transactionKeychainGrant = parseGrant(this.keychain.getSync(coords.service, coords.account));
+          } catch (error) {
+            if (!isCredentialNotFound(error)) throw new Error('keychain-unavailable', { cause: error });
+          }
+          if (keychainDigest(transactionKeychainGrant) !== decision.kd0) throw new RetryS2();
           // S2 (iii): a live refresh lease refuses before any fence, so an
           // in-flight refresher's rotated grant is never fenced out. Row 30
           // turns this refusal into a bounded wait.
