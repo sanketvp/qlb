@@ -84,6 +84,8 @@ type StashedSuccessor = { stashId: string; document: CodexAuthDocument; consumed
 type SlotStore = Pick<CodexSlots, 'readSlot' | 'writeSlot' | 'stashUnclaimed'> & {
   readPrevious?: (accountId: string, options?: { fresh?: boolean }) => { fingerprint: string };
   stashUnclaimedDurably?: (stashId: string, document: CodexAuthDocument, consumedFp: string, accountId: string) => Promise<{ stashId: string }>;
+  /** C6-3's append-only, body-first lock-loss preservation path. */
+  stashSuccessorEmergency?: (accountId: string, successor: CodexAuthDocument, consumedFp: string, now: number) => Promise<{ stashId: string }>;
   findStashedSuccessor?: (accountId: string, consumedFp: string) => Promise<StashedSuccessor | null>;
   removeStashedSuccessor?: (stashId: string) => Promise<void>;
   /** Compatibility seam for older pure consume fixtures. Production uses find/remove above. */
@@ -102,6 +104,7 @@ export type CodexConsumeStatus =
   | 'codex-won-inactive'
   | 'transient'
   | 'stashed'
+  | 'stashed-lock-lost'
   | 'successor-unpersisted'
   | 'slot-removed'
   | 'slot-split';
@@ -130,6 +133,14 @@ export interface CodexConsumeResult {
   successorFailure?: { kind: 'successor-unpersisted'; stashFailure: string };
 }
 
+/** A caller's consume/switch owner token is no longer authoritative. */
+export class CodexLockLost extends Error {
+  constructor(message = 'Codex consume lock was lost') {
+    super(message);
+    this.name = 'CodexLockLost';
+  }
+}
+
 export interface CodexConsumeOptions {
   accountId: string;
   /** Caller snapshot is used only for N8's already-refreshed comparison. */
@@ -149,6 +160,8 @@ export interface CodexConsumeOptions {
   store?: SqlStore;
   /** Test seam for metadata observation, never receives credential values. */
   record?: (event: CodexConsumeEvent) => void;
+  /** C6-3 authority fence supplied by the consume and switch lock holders. */
+  assertHeld?: () => void;
 }
 
 interface CurrentSlot {
@@ -193,26 +206,40 @@ function closeDatabase(connection: { db: DatabaseSync; close: boolean }): void {
 }
 
 /** Metadata-only outcomes that do not publish a new slot document. */
-function recordInStore(store: SqlStore, event: CodexConsumeEvent, now: number): boolean {
+function assertHeld(options: CodexConsumeOptions): void {
+  try {
+    options.assertHeld?.();
+  } catch (error) {
+    if (error instanceof CodexLockLost) throw error;
+    throw new CodexLockLost(error instanceof Error ? error.message : undefined);
+  }
+}
+
+function recordInStore(options: CodexConsumeOptions, store: SqlStore, event: CodexConsumeEvent, now: number): boolean {
   const connection = openDatabase(store);
   const { db } = connection;
   try {
+    assertHeld(options);
     db.exec('BEGIN IMMEDIATE');
     try {
       let changed = true;
       if (event.kind === 'stash') {
+        assertHeld(options);
         db.prepare(`INSERT INTO lineage_log (ts, provider, account_id, from_fp, to_fp, cause, by, evidence)
           VALUES (?, ?, ?, ?, ?, 'stash', 'qlb-cli', 'post')`)
           .run(now, PROVIDER, event.accountId, event.fromFingerprint, event.toFingerprint ?? null);
       } else if (event.kind === 'codex-won-inactive') {
+        assertHeld(options);
         const result = db.prepare('UPDATE codex_slots SET pending_adopt = 1 WHERE account_id = ? AND fingerprint = ?')
           .run(event.accountId, event.fromFingerprint);
         changed = Number(result.changes) === 1;
       } else if (event.kind === 'dead') {
+        assertHeld(options);
         const result = db.prepare(`UPDATE codex_slots SET dead = 1, dead_reason = ?, dead_at = ?
           WHERE account_id = ? AND fingerprint = ?`).run(event.reason ?? null, now, event.accountId, event.fromFingerprint);
         changed = Number(result.changes) === 1;
         if (changed) {
+          assertHeld(options);
           db.prepare(`INSERT INTO relogin_events (ts, provider, account_id, kind, detail, evidence)
             VALUES (?, ?, ?, 'dead', NULL, 'dead')`).run(now, PROVIDER, event.accountId);
         }
@@ -230,7 +257,7 @@ function recordInStore(store: SqlStore, event: CodexConsumeEvent, now: number): 
 
 function emit(options: CodexConsumeOptions, event: CodexConsumeEvent, now: number): boolean {
   options.record?.(event);
-  return options.store ? recordInStore(options.store, event, now) : true;
+  return options.store ? recordInStore(options, options.store, event, now) : true;
 }
 
 function absentSlot(error: unknown): boolean {
@@ -248,6 +275,7 @@ function repairDrift(options: CodexConsumeOptions, current: CurrentSlot, now: nu
   const { db } = connection;
   try {
     try {
+      assertHeld(options);
       db.exec('BEGIN IMMEDIATE');
       const row = db.prepare('SELECT fingerprint, prev_fingerprint FROM codex_slots WHERE account_id = ?').get(options.accountId) as
         | { fingerprint: string | null; prev_fingerprint: string | null }
@@ -269,6 +297,7 @@ function repairDrift(options: CodexConsumeOptions, current: CurrentSlot, now: nu
         db.exec('ROLLBACK');
         return 'slot-split';
       }
+      assertHeld(options);
       const repaired = db.prepare(`UPDATE codex_slots SET fingerprint = ?, prev_fingerprint = ?, last_refresh = ?
         WHERE account_id = ? AND fingerprint = ?`).run(
         current.fingerprint, previousMatches ? row.fingerprint : row.prev_fingerprint, current.document.last_refresh ?? null,
@@ -279,14 +308,16 @@ function repairDrift(options: CodexConsumeOptions, current: CurrentSlot, now: nu
         return 'slot-split';
       }
       if (!knownEdge) {
+        assertHeld(options);
         db.prepare(`INSERT INTO lineage_log (ts, provider, account_id, from_fp, to_fp, cause, by, evidence)
           VALUES (?, ?, ?, ?, ?, 'repair', 'qlb-cli', 'lineage')`)
           .run(now, PROVIDER, options.accountId, row.fingerprint, current.fingerprint);
       }
       db.exec('COMMIT');
       return 'ok';
-    } catch {
+    } catch (error) {
       try { db.exec('ROLLBACK'); } catch { /* preserve typed transient */ }
+      if (error instanceof CodexLockLost) throw error;
       return 'transient';
     }
   } finally {
@@ -320,6 +351,7 @@ async function persistStash(
 function reportStash(options: CodexConsumeOptions, consumedFp: string, successorFp: string, now: number, reason: string): void {
   // A stash is already durable. Its audit row is diagnostic only and must not
   // turn a safely retained successor into successor-unpersisted.
+  // That includes a lock loss: the audit row is skipped, never a second copy.
   try { emit(options, { kind: 'stash', accountId: options.accountId, fromFingerprint: consumedFp, toFingerprint: successorFp, reason }, now); } catch { /* retryable audit gap */ }
 }
 
@@ -343,6 +375,9 @@ function holdsAttempt(current: CurrentSlot, attempt: CodexAuthDocument): boolean
 
 /** Restore only when the slot still holds this attempt's successor. */
 function compensateSlot(options: CodexConsumeOptions, predecessor: CodexAuthDocument, successor: CodexAuthDocument): void {
+  // Callers compensate only after the successor is durably stashed, so a lost
+  // lock skips the restore rather than writing a second (emergency) copy.
+  try { assertHeld(options); } catch { return; }
   try {
     const latest = options.slots.readSlot(options.accountId, { fresh: true });
     if (holdsAttempt(latest, successor)) options.slots.writeSlot(options.accountId, predecessor, successor);
@@ -351,6 +386,7 @@ function compensateSlot(options: CodexConsumeOptions, predecessor: CodexAuthDocu
 
 /** Preserve an issued successor if durable stash recovery itself has failed. */
 function retainSuccessorInSlot(options: CodexConsumeOptions, predecessor: CodexAuthDocument, successor: CodexAuthDocument): void {
+  assertHeld(options);
   try {
     const latest = options.slots.readSlot(options.accountId, { fresh: true });
     if (holdsAttempt(latest, predecessor)) options.slots.writeSlot(options.accountId, successor, predecessor);
@@ -376,10 +412,12 @@ async function persistTransition(
   const successorFp = codexFingerprint(successor);
   if (!options.store) {
     try {
+      assertHeld(options);
       options.slots.writeSlot(options.accountId, successor, current.document);
       options.record?.({ kind: 'post', accountId: options.accountId, fromFingerprint: current.fingerprint, toFingerprint: successorFp, c9 });
       return 'committed';
-    } catch {
+    } catch (error) {
+      if (error instanceof CodexLockLost) throw error;
       const stashed = successorAlreadyStashed
         ? { status: 'stashed' as const }
         : await persistStash(options, successor, current.fingerprint, now);
@@ -393,6 +431,7 @@ async function persistTransition(
   try {
     connection = openDatabase(options.store);
     const { db } = connection;
+    assertHeld(options);
     db.exec('BEGIN IMMEDIATE');
     const row = db.prepare('SELECT fingerprint FROM codex_slots WHERE account_id = ?').get(options.accountId) as { fingerprint: string | null } | undefined;
     if (!row || row.fingerprint !== current.fingerprint) {
@@ -403,6 +442,7 @@ async function persistTransition(
       return stashed.status === 'successor-unpersisted' ? 'successor-unpersisted' : 'stashed';
     }
 
+    assertHeld(options);
     options.slots.writeSlot(options.accountId, successor, current.document);
     wroteSlot = true;
     const update = db.prepare(`UPDATE codex_slots SET fingerprint = ?, prev_fingerprint = ?, last_refresh = ?,
@@ -419,10 +459,16 @@ async function persistTransition(
         ON CONFLICT(key) DO UPDATE SET value = excluded.value WHERE config.value IS NULL`).run(String(now));
       if (Number(receipt.changes) !== 1) throw new Error('C9 receipt is no longer available');
     }
+    // The Keychain write above can block; re-check authority before COMMIT.
+    assertHeld(options);
     db.exec('COMMIT');
     options.record?.({ kind: 'post', accountId: options.accountId, fromFingerprint: current.fingerprint, toFingerprint: successorFp, c9 });
     return 'committed';
-  } catch {
+  } catch (error) {
+    if (error instanceof CodexLockLost) {
+      try { connection?.db.exec('ROLLBACK'); } catch { /* preserve lock-loss */ }
+      throw error;
+    }
     // This await deliberately remains before ROLLBACK: the SQLite writer lock
     // prevents a metadata observer from advancing while the recovery copy is
     // being made. Never restore a spent predecessor until that copy exists.
@@ -459,6 +505,7 @@ async function adoptSuccessor(options: CodexConsumeOptions, current: CurrentSlot
   if (!options.slots.adoptStashedSuccessor) return null;
   try {
     const adopted = await options.slots.adoptStashedSuccessor(options.accountId, (successor) => {
+      assertHeld(options);
       options.slots.writeSlot(options.accountId, successor, current.document);
     });
     if (!adopted) return null;
@@ -472,7 +519,9 @@ async function adoptSuccessor(options: CodexConsumeOptions, current: CurrentSlot
 /** C10's inactive-slot consume gate. The caller holds the provider locks. */
 async function consumeCodexSlotLocked(options: CodexConsumeOptions): Promise<CodexConsumeResult> {
   const now = options.now?.() ?? Date.now();
-  let current: CurrentSlot;
+  let issuedSuccessor: CodexAuthDocument | undefined;
+  let current!: CurrentSlot;
+  try {
   try { current = options.slots.readSlot(options.accountId, { fresh: true }); } catch (error) {
     return { status: absentSlot(error) ? 'slot-removed' : 'transient' };
   }
@@ -497,6 +546,7 @@ async function consumeCodexSlotLocked(options: CodexConsumeOptions): Promise<Cod
   }
 
   let response: CodexRefreshResponse;
+  assertHeld(options);
   try {
     response = await options.transport(buildRefreshRequest(refreshToken, refreshReasonFor(options.trigger)));
   } catch {
@@ -526,6 +576,7 @@ async function consumeCodexSlotLocked(options: CodexConsumeOptions): Promise<Cod
   }
 
   const successor = applyRefresh(current.document as OAuthCodexAuthDocument, classified.tokens, now) as CodexAuthDocument;
+  issuedSuccessor = successor;
   let latest: CurrentSlot;
   try { latest = options.slots.readSlot(options.accountId, { fresh: true }); } catch (error) {
     return stashSuccessor(options, successor, current.fingerprint, codexFingerprint(successor), now,
@@ -547,6 +598,25 @@ async function consumeCodexSlotLocked(options: CodexConsumeOptions): Promise<Cod
     };
   }
   return { status: 'stashed', document: successor };
+  } catch (error) {
+    if (!(error instanceof CodexLockLost)) throw error;
+    if (!issuedSuccessor) return { status: 'transient' };
+    try {
+      if (!options.slots.stashSuccessorEmergency) throw new Error('emergency successor stash is unavailable');
+      const { stashId } = await options.slots.stashSuccessorEmergency(
+        options.accountId, issuedSuccessor, current.fingerprint, now,
+      );
+      return { status: 'stashed-lock-lost', document: issuedSuccessor, stashId };
+    } catch (stashError) {
+      return {
+        status: 'successor-unpersisted', document: issuedSuccessor,
+        successorFailure: {
+          kind: 'successor-unpersisted',
+          stashFailure: stashError instanceof Error ? stashError.message : 'unable to preserve issued successor',
+        },
+      };
+    }
+  }
 }
 
 const consumeQueues = new Map<string, Promise<void>>();
