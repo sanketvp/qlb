@@ -194,8 +194,10 @@ export function readCodexSwitchHistory(
     const journalNeedsRow = journal.state === 'ok'
       && !rows.some((row) => attemptFromSteps(row.steps_json) === journal.journal.attemptId);
 
+    // A journal always involves its own endpoints, even when its unresolved set is '*' or omits one.
     const journalInvolved = journalNeedsRow
-      ? expandInvolvedAccounts(journal.journal.unresolved?.involvedAccounts ?? [journal.journal.from, journal.journal.to], slots)
+      ? [...new Set([journal.journal.from, journal.journal.to,
+        ...expandInvolvedAccounts(journal.journal.unresolved?.involvedAccounts ?? [], slots)])]
       : [];
     const fenceInvolved = recoveryFence === null ? []
       : [recoveryFence.from, recoveryFence.to, ...expandInvolvedAccounts(recoveryFence.involvedAccounts, slots)];

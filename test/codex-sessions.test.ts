@@ -295,6 +295,19 @@ describe('Codex session process list and holder eras', () => {
     }
   });
 
+  it('a malformed fence keeps a wildcard journal endpoint that is no longer a slot', () => {
+    const dir = mkdtempSync('/tmp/qlb-codex-malformed-fence-journal-endpoint-');
+    try {
+      const D = 'user-d:account-d';
+      const dbPath = fenceHistoryDb(dir, 'not-json');
+      const journalDir = join(dir, 'journal');
+      writeCodexSwitchJournal(journalFixture({ to: D, unresolved: { reason: 'slot-split', involvedAccounts: '*', since: T0 + 1 } }), { journalDir });
+      assert.deepEqual(openIdentities(readCodexSwitchHistory(dbPath, { journalDir }).rows), [A, B, C, D].sort());
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('a stored in-flight row without an involved set is not a permanent fence', () => {
     const stored: CodexSwitchLogRow = {
       id: 7, provider: 'openai-codex', fromAccountId: A, toAccountId: B, outcome: 'in-flight',
