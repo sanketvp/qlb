@@ -31,6 +31,15 @@ function seed(
   }
 }
 
+function codex(accountId: string): AccountSnapshot {
+  return {
+    accountId,
+    provider: 'openai-codex',
+    label: accountId,
+    buckets: {},
+  };
+}
+
 describe('qlb resolve — store-backed end-to-end', () => {
   it('normal resolve: picks the higher-scoring account (case 1 A vs B)', () => {
     const store = openStore(':memory:');
@@ -203,6 +212,167 @@ describe('qlb resolve — store-backed end-to-end', () => {
     assert.equal(row.strategy, 'pin');
     assert.equal(row.provider, 'anthropic');
     store.close();
+  });
+});
+
+describe('qlb resolve — Codex bare-id aliases', () => {
+  it('a pin on a bare Codex id resolves to the slot whose account part matches', () => {
+    const store = openStore(':memory:');
+    try {
+      const snapshot = codex('user:X');
+      store.upsertAccount(snapshot.accountId, snapshot.provider, snapshot.label);
+      store.upsertOverride({
+        kind: 'pin',
+        accountId: 'X',
+        session: 'bare-pin',
+        until: Date.now() + 60_000,
+      });
+
+      const decision = resolveFromSnapshots({
+        model: 'gpt-5.4',
+        session: 'bare-pin',
+        snapshots: [snapshot],
+        store,
+      });
+
+      assert.equal(decision.ok, true);
+      if (!decision.ok) return;
+      assert.equal(decision.accountId, 'user:X');
+      assert.equal(store.getPinOverride('bare-pin')?.account_id, 'X');
+    } finally {
+      store.close();
+    }
+  });
+
+  it('a bare Codex pin never aliases a slot QLB does not own', () => {
+    const store = openStore(':memory:');
+    try {
+      store.upsertOverride({ kind: 'pin', accountId: 'X', session: 'unowned-pin', until: Date.now() + 60_000 });
+
+      const decision = resolveFromSnapshots({
+        model: 'gpt-5.4',
+        session: 'unowned-pin',
+        snapshots: [codex('user:X')],
+        store,
+      });
+
+      assert.equal(decision.ok, false);
+      if (decision.ok || decision.error !== 'PINNED_UNAVAILABLE') assert.fail('expected PINNED_UNAVAILABLE');
+      assert.equal(decision.accountId, 'X');
+    } finally {
+      store.close();
+    }
+  });
+
+  it('an aliased pin whose slot is unavailable reports and records the slot id', () => {
+    const store = openStore(':memory:');
+    try {
+      const snapshot = { ...codex('user:X'), error: 'fixture-error' };
+      store.upsertAccount(snapshot.accountId, snapshot.provider, snapshot.label);
+      store.upsertOverride({ kind: 'pin', accountId: 'X', session: 'errored-pin', until: Date.now() + 60_000 });
+
+      const decision = resolveFromSnapshots({
+        model: 'gpt-5.4',
+        session: 'errored-pin',
+        snapshots: [snapshot],
+        store,
+      });
+
+      assert.equal(decision.ok, false);
+      if (decision.ok || decision.error !== 'PINNED_UNAVAILABLE') assert.fail('expected PINNED_UNAVAILABLE');
+      assert.equal(decision.accountId, 'user:X');
+      assert.match(decision.reason ?? '', /user:X is in an error state/);
+      assert.equal(store.getPinOverride('errored-pin')?.account_id, 'X');
+    } finally {
+      store.close();
+    }
+  });
+
+  it('a bare Codex pin matching two slots stays unavailable', () => {
+    const store = openStore(':memory:');
+    try {
+      const snapshots = [codex('u1:X'), codex('u2:X')];
+      for (const snapshot of snapshots) {
+        store.upsertAccount(snapshot.accountId, snapshot.provider, snapshot.label);
+      }
+      store.upsertOverride({
+        kind: 'pin',
+        accountId: 'X',
+        session: 'ambiguous-bare-pin',
+        until: Date.now() + 60_000,
+      });
+
+      const decision = resolveFromSnapshots({
+        model: 'gpt-5.4',
+        session: 'ambiguous-bare-pin',
+        snapshots,
+        store,
+      });
+
+      assert.equal(decision.ok, false);
+      if (decision.ok) return;
+      assert.equal(decision.error, 'PINNED_UNAVAILABLE');
+    } finally {
+      store.close();
+    }
+  });
+
+  it('an exact pin match beats an alias match', () => {
+    const store = openStore(':memory:');
+    try {
+      const snapshots = [codex('X'), codex('user:X')];
+      for (const snapshot of snapshots) {
+        store.upsertAccount(snapshot.accountId, snapshot.provider, snapshot.label);
+      }
+      store.upsertOverride({
+        kind: 'pin',
+        accountId: 'X',
+        session: 'exact-bare-pin',
+        until: Date.now() + 60_000,
+      });
+
+      const decision = resolveFromSnapshots({
+        model: 'gpt-5.4',
+        session: 'exact-bare-pin',
+        snapshots,
+        store,
+      });
+
+      assert.equal(decision.ok, true);
+      if (!decision.ok) return;
+      assert.equal(decision.accountId, 'X');
+    } finally {
+      store.close();
+    }
+  });
+
+  it('a bare id never aliases a non-Codex snapshot', () => {
+    const store = openStore(':memory:');
+    try {
+      store.upsertOverride({
+        kind: 'pin',
+        accountId: 'X',
+        session: 'non-codex-bare-pin',
+        until: Date.now() + 60_000,
+      });
+      const decision = resolveFromSnapshots({
+        model: 'gpt-5.4',
+        session: 'non-codex-bare-pin',
+        snapshots: [{
+          accountId: 'user:X',
+          provider: 'xai',
+          label: 'user:X',
+          buckets: {},
+        }],
+        store,
+      });
+
+      assert.equal(decision.ok, false);
+      if (decision.ok) return;
+      assert.equal(decision.error, 'PINNED_UNAVAILABLE');
+    } finally {
+      store.close();
+    }
   });
 });
 

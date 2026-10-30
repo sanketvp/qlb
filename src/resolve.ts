@@ -5,7 +5,7 @@ import {
   scoreAccount,
   type Strategy,
 } from './scoring';
-import { isFullyExhausted, pickAccount } from './strategies';
+import { findUniqueCodexAlias, isFullyExhausted, pickAccount } from './strategies';
 import { ROUTING_DECISION_MODES, type Store } from './store';
 
 export { ROUTING_DECISION_MODES };
@@ -212,13 +212,20 @@ function resolvePinned(
   const pin = req.store.getPinOverride(req.session);
   if (!pin) return null;
 
-  const snap = req.snapshots.find((s) => s.accountId === pin.account_id);
+  const store = req.store;
+  // A bare-id alias only reaches Codex slots QLB owns (the C3c-RV2 rule).
+  const snap = req.snapshots.find((s) => s.accountId === pin.account_id)
+    ?? findUniqueCodexAlias(
+      pin.account_id,
+      req.snapshots.filter((s) => store.getAccount(s.accountId)?.provider === 'openai-codex'),
+    );
+  const pinnedId = snap?.accountId ?? pin.account_id;
   const unavailable = (reason: string): ResolvePinnedUnavailable => {
     const decision: ResolvePinnedUnavailable = {
       ok: false,
       error: 'PINNED_UNAVAILABLE',
       requestedModel: req.model,
-      accountId: pin.account_id,
+      accountId: pinnedId,
       reason,
     };
     decision.decisionId = record(req.store, req, decision);
@@ -232,7 +239,7 @@ function resolvePinned(
   }
   if (snap.error) {
     return unavailable(
-      `pinned account unavailable: ${pin.account_id} is in an error state (${snap.error})`,
+      `pinned account unavailable: ${pinnedId} is in an error state (${snap.error})`,
     );
   }
 
@@ -265,7 +272,7 @@ function resolvePinned(
   }
 
   return unavailable(
-    `pinned account unavailable: ${pin.account_id} has no remaining headroom for ${req.model}`,
+    `pinned account unavailable: ${pinnedId} has no remaining headroom for ${req.model}`,
   );
 }
 
