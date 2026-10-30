@@ -118,6 +118,7 @@ import {
   writeSync,
 } from 'node:fs';
 import { dirname, join, resolve, sep } from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
 import { config } from './config';
 import { codexSlotIdFromAccessToken } from './codex-auth';
 import { codexHeaderAccountId } from './codex-slots';
@@ -125,8 +126,8 @@ import { fsyncDirSync } from './fsutil';
 import { qlbHomeDir } from './home';
 import type { KeychainBackend } from './keychain';
 import { openRouterMissingKeyMessage, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, readNativeOpenRouterKey } from './keychain';
-import { legacyPiAuthBackupPath, piAuthBackupPath, readPiAuthBackup, removePiAuthBackup, type PiAuthBackup } from './pi-auth-backup';
-import { canonicalDigest, fencedGeneration, handbackVerdict, keychainDigest, NoSingleGrantRestoreSourceError, rankSingleGrantSource, restoreRecordFor } from './pi-handback-source';
+import { legacyPiAuthBackupPath, piAuthBackupPath, readPiAuthBackup, removePiAuthBackup, restorePiAuthEntryLocked, type PiAuthBackup } from './pi-auth-backup';
+import { canonicalDigest, fencedGeneration, handbackVerdict, isValidEntry, keychainDigest, NoSingleGrantRestoreSourceError, rankSingleGrantSource, restoreRecordFor } from './pi-handback-source';
 import type { RollbackDecision } from './single-grant-ownership';
 import { parseGrant } from './refresh-lease';
 import { hasLegacyPiOwnerEntry, isPiPlaceholder, PiOwnerLegacyError, readPiOwnerProviders, withPiAuthLock, writePiOwnerEntry, type AuthLockTiming } from './pi-migrate';
@@ -2145,7 +2146,7 @@ export class Migration {
     try { return fn(); } finally { this.piAuthLockRefresh = undefined; }
   }
 
-  /** S3 guards (a), (b), and (d): keep a valid native entry; refuse missing kind:none or invalid native entries. */
+  /** S3 guards: retain a valid native entry; otherwise restore the recorded non-none source under the held auth lock. */
   private singleGrantNativeEntryWins(authKey: string): boolean {
     let auth: Record<string, unknown>;
     try {
@@ -2169,22 +2170,62 @@ export class Migration {
       if (decision?.kind === 'none') {
         throw Object.assign(new Error('native-entry-missing'), { exitCode: 3 });
       }
-      // Row 37 materialises a non-none source here.
-      return false;
+      this.restoreRecordedSingleGrantEntry(authKey, decision);
+      return true;
     }
-    // Guard (c), implemented in row 37, is the remaining absent-entry case.
-    if (!entryPresent) return false;
+    // Guard (c): a recorded absent source is already satisfied and must never
+    // resurrect the key on a retry.
+    if (!entryPresent && decision?.entryPresent === false) return true;
 
     // Guard (d): a defined, non-placeholder, invalid entry is never replaced.
     throw Object.assign(new Error('native-entry-invalid'), { exitCode: 3 });
   }
 
+  private restoreRecordedSingleGrantEntry(authKey: string, decision: RollbackDecision | null): void {
+    if (!decision || decision.kind === 'none') {
+      throw Object.assign(new Error('native-entry-missing'), { exitCode: 3 });
+    }
+
+    let record: PiAuthBackup;
+    if (decision.kind === 'keychain') {
+      const journalAccount = this.singleGrantJournalAccount();
+      const coords = keychainCoords(journalAccount.provider, journalAccount.id, journalAccount.label);
+      const grant = this.readSingleGrantRollbackKeychain(coords.service, coords.account);
+      if (!grant) throw Object.assign(new Error('no-restore-source'), { exitCode: 3 });
+      const backup = readPiAuthBackup(this.poolFilePath, authKey);
+      record = restoreRecordFor({
+        authPath: this.poolFilePath,
+        key: authKey,
+        decidedAt: decision.decidedAt,
+        filePresent: true,
+        entryPresent: true,
+        entry: this.piEntryFromGrant(grant, backup),
+      });
+    } else {
+      const backup = readPiAuthBackup(this.poolFilePath, authKey);
+      if (!backup) throw Object.assign(new Error('no-restore-source'), { exitCode: 3 });
+      record = backup;
+    }
+
+    this.restoreSingleGrantPiAuthEntry(authKey, record);
+    const restored = this.readSingleGrantAuth();
+    const restoredPresent = Object.prototype.hasOwnProperty.call(restored, authKey);
+    const restoredEntry = restored[authKey];
+    if (
+      restoredPresent !== record.entryPresent
+      || (record.entryPresent && (!isDeepStrictEqual(restoredEntry, record.entry) || !this.isValidSingleGrantRestoreEntry(restoredEntry, true)))
+    ) {
+      throw Object.assign(new Error('restore verification failed'), { exitCode: 3 });
+    }
+  }
+
+  /** Test seam; callers already hold withPiAuthLock, which is deliberately not re-entrant. */
+  private restoreSingleGrantPiAuthEntry(authKey: string, record: PiAuthBackup): unknown {
+    return restorePiAuthEntryLocked(this.poolFilePath, authKey, record);
+  }
+
   private isValidSingleGrantRestoreEntry(entry: unknown, entryPresent: boolean): boolean {
-    if (!entryPresent) return true;
-    return isObjectRecord(entry)
-      && !isPiPlaceholder(entry)
-      && typeof entry.refresh === 'string'
-      && entry.refresh.length > 0;
+    return !entryPresent || isValidEntry(entry);
   }
 
   private readSingleGrantAuth(): Record<string, unknown> {

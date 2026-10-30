@@ -174,7 +174,7 @@ interface ValidPiOAuthEntry {
   expires: number;
 }
 
-function isValidEntry(entry: unknown): entry is ValidPiOAuthEntry {
+export function isValidEntry(entry: unknown): entry is ValidPiOAuthEntry {
   return isRecord(entry)
     && !isPlaceholder(entry)
     && entry.type === 'oauth'
