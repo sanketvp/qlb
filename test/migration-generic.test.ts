@@ -2055,6 +2055,65 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     }
   });
 
+  it('T-S4a owner entry is removed only after the restore is verified', async () => {
+    const h = setup('xai');
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      h.mig.commit();
+      const placeholder = { type: 'oauth', access: 'qlb-managed', refresh: '' };
+      const placeholderBytes = Buffer.from(JSON.stringify({ ...FAKE_GRANTS, xai: placeholder }, null, 2) + '\n');
+      const ownerMapPath = join(h.dir, 'qlb-owner.json');
+      const otherEntry = { mode: 'qlb', since: 987_654 };
+      writeFileSync(ownerMapPath, JSON.stringify({
+        providers: {
+          xai: { mode: 'qlb', since: 123_456 },
+          'kimi-coding': otherEntry,
+        },
+      }, null, 2) + '\n');
+      const ownerBefore = JSON.parse(readFileSync(ownerMapPath, 'utf8')) as { providers: Record<string, unknown> };
+      const otherEntryBytes = Buffer.from(JSON.stringify(ownerBefore.providers['kimi-coding']));
+      writeFileSync(h.authPath, placeholderBytes);
+
+      const guarded = h.mig as unknown as {
+        restoreSingleGrantPiAuthEntry: (key: string, record: unknown) => unknown;
+      };
+      const restore = guarded.restoreSingleGrantPiAuthEntry.bind(h.mig);
+      let failRestore = true;
+      guarded.restoreSingleGrantPiAuthEntry = (key, record) => {
+        const ownerDuringRestore = JSON.parse(readFileSync(ownerMapPath, 'utf8')) as { providers: Record<string, unknown> };
+        const authDuringRestore = JSON.parse(readFileSync(h.authPath, 'utf8')) as Record<string, unknown>;
+        assert.deepEqual(ownerDuringRestore.providers.xai, ownerBefore.providers.xai, 'S4a keeps the v2 entry until S3 has restored and verified');
+        assert.deepEqual(authDuringRestore.xai, placeholder, 'the v2 entry is never removed while A is the placeholder');
+        if (failRestore) throw new Error('injected S3 restore failure');
+        const result = restore(key, record);
+        const ownerAfterRestoreWrite = JSON.parse(readFileSync(ownerMapPath, 'utf8')) as { providers: Record<string, unknown> };
+        assert.deepEqual(ownerAfterRestoreWrite.providers.xai, ownerBefore.providers.xai, 'S4a follows the S3 verification, not merely its write');
+        return result;
+      };
+
+      assert.throws(() => h.mig.rollback(), /injected S3 restore failure/);
+      const failedDetail = JSON.parse(h.store.getMigration('pi-xai')!.detail_json) as Record<string, unknown>;
+      const ownerAfterFailure = JSON.parse(readFileSync(ownerMapPath, 'utf8')) as { providers: Record<string, unknown> };
+      assert.deepEqual(readFileSync(h.authPath), placeholderBytes, 'failed S3 keeps auth.json');
+      assert.deepEqual(ownerAfterFailure.providers.xai, ownerBefore.providers.xai, 'failed S3 keeps the v2 owner entry');
+      assert.equal(failedDetail.intent, 'rollback', 'failed S3 keeps the rollback intent');
+      assert.ok(failedDetail.rollbackDecision, 'failed S3 keeps the fenced decision');
+
+      failRestore = false;
+      h.mig.resume();
+
+      const ownerAfterResume = JSON.parse(readFileSync(ownerMapPath, 'utf8')) as { providers: Record<string, unknown> };
+      const authAfterResume = JSON.parse(readFileSync(h.authPath, 'utf8')) as Record<string, unknown>;
+      assert.equal(Object.prototype.hasOwnProperty.call(ownerAfterResume.providers, 'xai'), false, 'S4a removes only this provider from the v2 map');
+      assert.deepEqual(Buffer.from(JSON.stringify(ownerAfterResume.providers['kimi-coding'])), otherEntryBytes, 'S4a keeps the other v2 entry byte-for-byte');
+      assert.deepEqual(authAfterResume.xai, FAKE_GRANTS.xai, 'A is the verified restored entry');
+      assert.ok(JSON.parse(h.store.getMigration('pi-xai')!.detail_json).lastRollback, 'the completed hand-back records lastRollback');
+    } finally {
+      h.cleanup();
+    }
+  });
+
   it('T-S3f a recorded source whose bytes changed under the fence refuses rollback-source-tampered; a native login then completes the hand-back', async () => {
     for (const fixture of [
       { name: 'a Keychain source', kind: 'keychain' as const, tamper: 'bytes' },

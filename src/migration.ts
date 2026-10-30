@@ -1942,6 +1942,11 @@ export class Migration {
         // Validate and check for a live refresh before un-owning, so a refusal
         // leaves the claim intact.
         this.refuseDuringRefresh(journalAccount.id);
+        // rollback()/resume() already hold Pi's auth.json lock, which is also
+        // the owner-map lock. Do not nest its non-re-entrant acquisition.
+        if (this.ownerEntryPresentAt(this.ownerMapPath)) {
+          writePiOwnerEntry(this.ownerMapPath, this.ownerProvider(), false);
+        }
         unlinkIfExists(this.ownerFilePath);
         // The un-own must survive power loss before S5 records the hand-back:
         // resume after S5 never revisits the owner claim.
