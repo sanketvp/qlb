@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -15,7 +15,13 @@ import {
   QLB_KEYCHAIN_ACCOUNT,
   qlbKeychainService,
 } from '../src/keychain';
-import { CodexSlots, codexHeaderAccountId, importActiveCodexSlot, planImportActiveCodex } from '../src/codex-slots';
+import {
+  CodexSlots,
+  CodexStashUnverifiable,
+  codexHeaderAccountId,
+  importActiveCodexSlot,
+  planImportActiveCodex,
+} from '../src/codex-slots';
 import { snapshotsFromStore } from '../src/resolve';
 import { openStore } from '../src/store';
 
@@ -432,6 +438,131 @@ describe('Codex slots and import-active', () => {
       doc.tokens.id_token = jwt({ sub: 'not-an-S29-identity' });
       assert.throws(() => importActiveCodexSlot(doc, { store: h.store, keychain: h.keychain }), /S29 identity/);
       assert.deepEqual(dbRows(h.store.dbPath), { slot: undefined, account: undefined, active: undefined, lineage: undefined, baseline: undefined });
+    } finally {
+      h.store.close();
+      rmSync(h.home, { recursive: true, force: true });
+    }
+  });
+
+  it('the same unknown login stashed twice keeps one stash', async () => {
+    const h = fixture();
+    try {
+      const stashDir = join(h.home, 'stash');
+      const slots = new CodexSlots({ keychain: h.keychain, stashDir });
+      const doc = parsedDocument('unknown-refresh');
+
+      const first = await slots.ensureUnclaimedStash(doc, 1);
+      const second = await slots.ensureUnclaimedStash(doc, 2);
+
+      assert.deepEqual(second, { stashId: first.stashId, created: false });
+      assert.equal(readdirSync(join(stashDir, 'index', 'openai-codex')).length, 1);
+      assert.doesNotThrow(() => slots.readUnclaimedDurable(first.stashId));
+    } finally {
+      h.store.close();
+      rmSync(h.home, { recursive: true, force: true });
+    }
+  });
+
+  it('a file-backed body is reused', async () => {
+    class FileOnlyKeychain extends MockKeychain {
+      override setSync(service: string, account: string, value: string): void {
+        if (service.includes(':unclaimed:')) throw new Error('fixture Keychain write failed');
+        super.setSync(service, account, value);
+      }
+    }
+    const h = fixture();
+    try {
+      const stashDir = join(h.home, 'stash');
+      const keychain = new FileOnlyKeychain();
+      const slots = new CodexSlots({ keychain, stashDir });
+      const doc = parsedDocument('file-backed-unknown-refresh');
+
+      const first = await slots.ensureUnclaimedStash(doc, 1);
+      const second = await slots.ensureUnclaimedStash(doc, 2);
+
+      assert.deepEqual(second, { stashId: first.stashId, created: false });
+      assert.equal(existsSync(join(stashDir, `${first.stashId}.json`)), true);
+      assert.equal(readdirSync(join(stashDir, 'index', 'openai-codex')).length, 1);
+    } finally {
+      h.store.close();
+      rmSync(h.home, { recursive: true, force: true });
+    }
+  });
+
+  it('an index entry whose body is in neither location is completed, not duplicated', async () => {
+    const h = fixture();
+    try {
+      const stashDir = join(h.home, 'stash');
+      const slots = new CodexSlots({ keychain: h.keychain, stashDir });
+      const doc = parsedDocument('completed-unknown-refresh');
+      const fp = codexFingerprint(doc);
+      const stashId = 'bodyless-stash';
+      await slots.stashUnclaimedDurably(stashId, doc, fp, planImportActiveCodex(doc).slotId!);
+      h.keychain.deleteSync(qlbKeychainService('openai-codex', `unclaimed:${stashId}`), QLB_KEYCHAIN_ACCOUNT);
+
+      assert.deepEqual(await slots.ensureUnclaimedStash(doc, 2), { stashId, created: true });
+      assert.equal(readdirSync(join(stashDir, 'index', 'openai-codex')).length, 1);
+      assert.doesNotThrow(() => slots.readUnclaimedDurable(stashId));
+    } finally {
+      h.store.close();
+      rmSync(h.home, { recursive: true, force: true });
+    }
+  });
+
+  it('an unreadable body fails closed and writes nothing', async () => {
+    class UnavailableUnclaimedKeychain extends MockKeychain {
+      unavailable = false;
+      writes = 0;
+
+      override getSync(service: string, account: string): string {
+        if (this.unavailable && service.includes(':unclaimed:')) throw new Error('fixture Keychain unavailable');
+        return super.getSync(service, account);
+      }
+
+      override setSync(service: string, account: string, value: string): void {
+        this.writes += 1;
+        super.setSync(service, account, value);
+      }
+    }
+    const h = fixture();
+    try {
+      const stashDir = join(h.home, 'stash');
+      const keychain = new UnavailableUnclaimedKeychain();
+      const slots = new CodexSlots({ keychain, stashDir });
+      const doc = parsedDocument('unreadable-unknown-refresh');
+      const fp = codexFingerprint(doc);
+      const stashId = 'unreadable-stash';
+      await slots.stashUnclaimedDurably(stashId, doc, fp, planImportActiveCodex(doc).slotId!);
+      keychain.deleteSync(qlbKeychainService('openai-codex', `unclaimed:${stashId}`), QLB_KEYCHAIN_ACCOUNT);
+      const index = readFileSync(join(stashDir, 'index', 'openai-codex', `${stashId}.json`), 'utf8');
+      const writes = keychain.writes;
+      keychain.unavailable = true;
+
+      await assert.rejects(slots.ensureUnclaimedStash(doc, 2), CodexStashUnverifiable);
+      assert.equal(keychain.writes, writes);
+      assert.equal(existsSync(join(stashDir, `${stashId}.json`)), false);
+      assert.equal(readFileSync(join(stashDir, 'index', 'openai-codex', `${stashId}.json`), 'utf8'), index);
+    } finally {
+      h.store.close();
+      rmSync(h.home, { recursive: true, force: true });
+    }
+  });
+
+  it('a body with another fingerprint fails closed and is not replaced', async () => {
+    const h = fixture();
+    try {
+      const stashDir = join(h.home, 'stash');
+      const slots = new CodexSlots({ keychain: h.keychain, stashDir });
+      const doc = parsedDocument('expected-unknown-refresh');
+      const other = parsedDocument('other-unknown-refresh');
+      const fp = codexFingerprint(doc);
+      const stashId = 'mismatched-stash';
+      await slots.stashUnclaimedDurably(stashId, other, fp, planImportActiveCodex(doc).slotId!);
+      const before = h.keychain.getSync(qlbKeychainService('openai-codex', `unclaimed:${stashId}`), QLB_KEYCHAIN_ACCOUNT);
+
+      await assert.rejects(slots.ensureUnclaimedStash(doc, 2), CodexStashUnverifiable);
+      assert.equal(h.keychain.getSync(qlbKeychainService('openai-codex', `unclaimed:${stashId}`), QLB_KEYCHAIN_ACCOUNT), before);
+      assert.equal(readdirSync(join(stashDir, 'index', 'openai-codex')).length, 1);
     } finally {
       h.store.close();
       rmSync(h.home, { recursive: true, force: true });
