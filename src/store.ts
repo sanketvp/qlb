@@ -61,6 +61,7 @@ export interface CodexSlotRecord {
   fingerprint: string | null;
   prevFingerprint: string | null;
   dead: boolean;
+  pendingAdopt: boolean;
 }
 
 /** Read-only anthropic slot view used by the Pi pool inventory. */
@@ -2241,10 +2242,10 @@ export class Store {
 
   /** S56 lookup by the composite identity; never exposes a credential document. */
   getCodexSlot(accountId: string): CodexSlotRecord | null {
-    const row = this.db.prepare(`SELECT account_id, chatgpt_user_id, chatgpt_account_id, fingerprint, prev_fingerprint, dead
+    const row = this.db.prepare(`SELECT account_id, chatgpt_user_id, chatgpt_account_id, fingerprint, prev_fingerprint, dead, pending_adopt
       FROM codex_slots WHERE account_id = ?`).get(accountId) as {
       account_id: string; chatgpt_user_id: string; chatgpt_account_id: string;
-      fingerprint: string | null; prev_fingerprint: string | null; dead: number;
+      fingerprint: string | null; prev_fingerprint: string | null; dead: number; pending_adopt: number;
     } | undefined;
     if (!row) return null;
     return {
@@ -2254,6 +2255,7 @@ export class Store {
       fingerprint: row.fingerprint,
       prevFingerprint: row.prev_fingerprint,
       dead: row.dead !== 0,
+      pendingAdopt: row.pending_adopt !== 0,
     };
   }
 

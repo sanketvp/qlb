@@ -126,6 +126,7 @@ describe('Codex slots and import-active', () => {
       fingerprint: null,
       prevFingerprint: null,
       dead: false,
+      pendingAdopt: false,
     };
     assert.equal(codexHeaderAccountId((id) => id === slot.accountId ? slot : undefined, slot.accountId), 'stored-account');
     assert.equal(codexHeaderAccountId(() => undefined, 'user:legacy-account:extra'), 'legacy-account:extra');
