@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { readFile as readFileFromDisk } from 'node:fs/promises';
+import { open as openFile, readFile as readFileFromDisk } from 'node:fs/promises';
 import { atomicWriteText } from './fsutil';
 
 const ACCESS_EXPIRY_BUFFER_MS = 5 * 60 * 1_000;
@@ -53,6 +53,19 @@ export interface ReadCodexAuthStableOptions {
   retries?: number;
   sleep?: (ms: number) => Promise<void> | void;
   readFile?: (path: string, encoding: 'utf8') => Promise<string> | string;
+}
+
+export type CodexAuthStableWithStatResult =
+  | { status: 'ok'; doc: CodexAuthDocument; sha256: string; inode: number }
+  | { status: 'wiped'; error: Exclude<CodexAuthParseError, { error: 'unparseable' }> }
+  | { status: 'missing' }
+  | { status: 'unreadable'; code: string }
+  | { status: 'unstable' };
+
+export interface ReadCodexAuthStableWithStatOptions {
+  openRead?: (path: string) => Promise<{ text: string; ino: number }> | { text: string; ino: number };
+  attempts?: number;
+  delayMs?: number;
 }
 
 type JsonObject = Record<string, unknown>;
@@ -198,6 +211,18 @@ type ReadCodexAuthOnceResult =
   | { status: 'missing' }
   | { status: 'unreadable'; code: string };
 
+type ReadCodexAuthOnceWithStatResult =
+  | { status: 'read'; text: string; ino: number; parsed: CodexAuthParseResult }
+  | { status: 'missing' }
+  | { status: 'unreadable'; code: string };
+
+function classifyReadError(error: unknown): Extract<ReadCodexAuthOnceResult, { status: 'missing' | 'unreadable' }> {
+  const code = errorCode(error);
+  return code === 'ENOENT'
+    ? { status: 'missing' }
+    : { status: 'unreadable', code: code ?? 'UNKNOWN' };
+}
+
 async function readOnce(
   path: string,
   read: NonNullable<ReadCodexAuthStableOptions['readFile']>,
@@ -206,10 +231,30 @@ async function readOnce(
     const text = await read(path, 'utf8');
     return { status: 'read', text, parsed: parseCodexAuth(text) };
   } catch (error) {
-    const code = errorCode(error);
-    return code === 'ENOENT'
-      ? { status: 'missing' }
-      : { status: 'unreadable', code: code ?? 'UNKNOWN' };
+    return classifyReadError(error);
+  }
+}
+
+async function defaultOpenRead(path: string): Promise<{ text: string; ino: number }> {
+  const handle = await openFile(path);
+  try {
+    const metadata = await handle.stat();
+    const text = await handle.readFile({ encoding: 'utf8' });
+    return { text, ino: metadata.ino };
+  } finally {
+    await handle.close();
+  }
+}
+
+async function readOnceWithStat(
+  path: string,
+  openRead: NonNullable<ReadCodexAuthStableWithStatOptions['openRead']>,
+): Promise<ReadCodexAuthOnceWithStatResult> {
+  try {
+    const { text, ino } = await openRead(path);
+    return { status: 'read', text, ino, parsed: parseCodexAuth(text) };
+  } catch (error) {
+    return classifyReadError(error);
   }
 }
 
@@ -246,6 +291,42 @@ export async function readCodexAuthStable(
     }
     if (!second.parsed.ok) continue;
     return { status: 'ok', doc: first.parsed.doc };
+  }
+  return { status: 'unstable' };
+}
+
+/**
+ * Reads auth.json through one file descriptor per observation. A document is
+ * stable only if both its bytes and inode match on two consecutive reads.
+ */
+export async function readCodexAuthStableWithStat(
+  path: string,
+  options: ReadCodexAuthStableWithStatOptions = {},
+): Promise<CodexAuthStableWithStatResult> {
+  const attempts = Math.max(1, Math.floor(options.attempts ?? 5));
+  const delayMs = options.delayMs ?? 200;
+  const openRead = options.openRead ?? defaultOpenRead;
+
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const first = await readOnceWithStat(path, openRead);
+    if (first.status === 'missing' || first.status === 'unreadable') return first;
+
+    await defaultSleep(delayMs);
+    const second = await readOnceWithStat(path, openRead);
+    if (second.status === 'missing' || second.status === 'unreadable') return second;
+    if (first.text !== second.text || first.ino !== second.ino) continue;
+
+    if (!first.parsed.ok) {
+      if (first.parsed.error === 'unparseable') continue;
+      return { status: 'wiped', error: first.parsed };
+    }
+    if (!second.parsed.ok) continue;
+    return {
+      status: 'ok',
+      doc: first.parsed.doc,
+      sha256: `sha256-file:${createHash('sha256').update(first.text, 'utf8').digest('hex')}`,
+      inode: first.ino,
+    };
   }
   return { status: 'unstable' };
 }
