@@ -185,6 +185,46 @@ describe('Codex session process list and holder eras', () => {
     }
   });
 
+  it('a surviving journal whose attempt wrote a not-published row keeps both sides live (C6-13 r1)', () => {
+    const dir = mkdtempSync('/tmp/qlb-codex-journal-q1-');
+    const journalDir = join(dir, 'journal');
+    try {
+      const dbPath = fenceHistoryDb(dir);
+      const db = new DatabaseSync(dbPath);
+      try {
+        db.prepare(`INSERT INTO switch_log (id, ts, provider, from_account, to_account, outcome, detail, published_at, steps_json, open_sessions_json)
+          VALUES (1, ?, 'openai-codex', ?, ?, 'failed', 'not-published', NULL, ?, '[]')`)
+          .run(T0, A, B, JSON.stringify({ attempt: 'attempt-in-flight', via: 'switch' }));
+      } finally {
+        db.close();
+      }
+      // The attempt crashed after its failure row and before deleting its journal.
+      writeCodexSwitchJournal(journalFixture(), { journalDir });
+      const history = readCodexSwitchHistory(dbPath, { journalDir });
+      assert.deepEqual([...new Set(holderSets(history.rows, []).flatMap((held) => held.identities))].sort(), [A, B]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a not-published failed row whose published_at is malformed is never skipped (C6-13 r1)', () => {
+    const dir = mkdtempSync('/tmp/qlb-codex-malformed-published-');
+    try {
+      const dbPath = fenceHistoryDb(dir);
+      const db = new DatabaseSync(dbPath);
+      try {
+        db.prepare(`INSERT INTO switch_log (id, ts, provider, from_account, to_account, outcome, detail, published_at, steps_json, open_sessions_json)
+          VALUES (1, ?, 'openai-codex', ?, ?, 'failed', 'not-published', 'not-a-time', NULL, '[]')`).run(T0, A, B);
+      } finally {
+        db.close();
+      }
+      const history = readCodexSwitchHistory(dbPath, { journalDir: join(dir, 'journal') });
+      assert.throws(() => holderEras(history.rows), /Invalid Codex switch-log row time/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('a recovery fence keeps every involved account live, including a third slot', () => {
     const dir = mkdtempSync('/tmp/qlb-codex-fence-history-');
     const dbPath = join(dir, 'qlb.db');

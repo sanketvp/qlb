@@ -167,7 +167,11 @@ export function readCodexSwitchHistory(
       FROM switch_log WHERE provider = 'openai-codex' ORDER BY published_at, ts, id`).all()
       .map((row) => {
         const r = row as Record<string, unknown>;
-        const publishedAt = typeof r.published_at === 'number' ? r.published_at : null;
+        // A stored but malformed publication time stays non-null (NaN): rowTime then
+        // refuses it, and it is never read as proof that the switch was not published.
+        const publishedAt = r.published_at === null || r.published_at === undefined
+          ? null
+          : typeof r.published_at === 'number' ? r.published_at : Number.NaN;
         return {
           id: Number(r.id), provider: String(r.provider),
           fromAccountId: typeof r.from_account === 'string' ? r.from_account : null,
@@ -191,8 +195,10 @@ export function readCodexSwitchHistory(
     const journal = readCodexSwitchJournal({ journalDir: options.journalDir });
     // A journal that exists but cannot be parsed is never treated as absent.
     const malformedJournal = journal.state === 'malformed';
+    // A not-published row is skipped by the holder sets, so it never stands in
+    // for a journal that is still on disk.
     const journalNeedsRow = journal.state === 'ok'
-      && !rows.some((row) => attemptFromSteps(row.steps_json) === journal.journal.attemptId);
+      && !rows.some((row) => !notPublished(row) && attemptFromSteps(row.steps_json) === journal.journal.attemptId);
 
     // A journal always involves its own endpoints, even when its unresolved set is '*' or omits one.
     const journalInvolved = journalNeedsRow
@@ -358,7 +364,9 @@ function compareRows(a: CodexSwitchLogRow, b: CodexSwitchLogRow): number {
  * interim conservative rule; replaced by S12 holder sets in slice C5b; may
  * over-count holders (safe), never under-count. Every input row must be for
  * `openai-codex`. A writing row (anything except `refused` or `noop`) makes
- * both sides possibly live from its row time; an `ok` row then definitely
+ * both sides possibly live from its row time, except the Q1 marker (I11:
+ * `failed`, `not-published`, no `published_at`), which opens and closes
+ * nothing and so is not the first row either; an `ok` row then definitely
  * replaces its source at that same instant.
  */
 export function holderEras(switchLogRows: readonly CodexSwitchLogRow[]): HolderEra[] {
