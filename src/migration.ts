@@ -309,7 +309,7 @@ export class OwnerMapPresentError extends Error {
 }
 
 /** Named crash points for MigrationConfig.afterStep; later rows add their own. */
-export type MigrationCrashPoint = 'S1' | 'S2-reads' | 'S2' | 'S5' | 'S6c1';
+export type MigrationCrashPoint = 'S1' | 'S2-reads' | 'S2' | 'S4a' | 'S5' | 'S6c1';
 
 export interface MigrationConfig {
   kind?: MigrationKind;
@@ -1106,6 +1106,60 @@ export class Migration {
     } else if (this.ownerEntryPresentAt(this.ownerMapPath)) {
       this.withOwnerMapLock(() => writePiOwnerEntry(this.ownerMapPath, 'anthropic', false));
     }
+  }
+
+  /**
+   * S4b: remove the generic path's legacy claims after S4a released its v2
+   * entry. The caller already holds Pi's auth.json lock; do not take it (or
+   * the owner-map lock) again here.
+   */
+  private unlinkSingleGrantLegacyOwnerFiles(): string[] {
+    const syncedDirectories = new Set<string>();
+    const rememberDirectory = (path: string): void => {
+      syncedDirectories.add(resolve(dirname(path)));
+    };
+    const legacySidecar = this.legacySidecarPath();
+    if (legacySidecar) {
+      unlinkIfExists(legacySidecar);
+      rememberDirectory(legacySidecar);
+    }
+
+    if (this.ownerFilePath !== this.ownerMapPath) {
+      // Oc is a v1 claim only. A v2 map, a foreign v1 document, or no file is
+      // not this migration's claim and must survive.
+      if (hasLegacyPiOwnerEntry(this.ownerFilePath, this.ownerProvider())) {
+        unlinkIfExists(this.ownerFilePath);
+        rememberDirectory(this.ownerFilePath);
+      }
+      return [...syncedDirectories];
+    }
+
+    // A custom --owner-file may name qlb-owner.json itself. S4a deliberately
+    // leaves its v1 shape alone; distinguish that legacy document from a v2
+    // map before deciding whether it is safe to unlink the shared pathname.
+    try {
+      readPiOwnerProviders(this.ownerMapPath);
+      return [...syncedDirectories]; // v2 (or absent): S4a owns this map.
+    } catch (error) {
+      if (!(error instanceof PiOwnerLegacyError)) throw error;
+    }
+
+    const owner: unknown = JSON.parse(readFileSync(this.ownerMapPath, 'utf8'));
+    const accounts = isObjectRecord(owner) && Array.isArray(owner.accounts) ? owner.accounts : null;
+    const namesOnlyThisProvider = accounts !== null
+      && accounts.length > 0
+      && accounts.every((account) =>
+        isObjectRecord(account) && account.provider === this.ownerProvider(),
+      );
+    if (!hasLegacyPiOwnerEntry(this.ownerMapPath, this.ownerProvider()) || !namesOnlyThisProvider) {
+      throw Object.assign(
+        new Error(`owner-file-orphan: ${this.ownerMapPath} is a v1 owner file naming another provider; leave it in place and repair it before retrying.`),
+        { exitCode: 3 },
+      );
+    }
+    unlinkIfExists(this.ownerMapPath);
+    rememberDirectory(this.ownerMapPath);
+    return [...syncedDirectories];
   }
 
   /** True when commit must not rename/delete the native store. */
@@ -1966,10 +2020,13 @@ export class Migration {
             throw error;
           }
         }
-        unlinkIfExists(this.ownerFilePath);
+        this.afterStep?.('S4a');
+        // S4b follows S4a under the already-held auth lock. It unlinks L and
+        // only this provider's v1 Oc; it never deletes the shared v2 map.
+        // The unlink directories must be durable before S5's terminal marker.
+        for (const path of this.unlinkSingleGrantLegacyOwnerFiles()) this.fsyncDirectory(path);
         // The un-own must survive power loss before S5 records the hand-back:
         // resume after S5 never revisits the owner claim.
-        this.fsyncDirectory(dirname(this.ownerFilePath));
         // rollback()/resume() already hold Pi's auth.json lock for the whole
         // single-grant path. S5 therefore reads A under that existing lock;
         // withPiAuthLock is not re-entrant.

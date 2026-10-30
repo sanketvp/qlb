@@ -29,6 +29,7 @@ import { parseGrant } from '../src/refresh-lease';
 import type { RollbackDecision } from '../src/single-grant-ownership';
 import { legacyPiAuthBackupPath, piAuthBackupPath, readPiAuthBackup, writePiAuthBackup } from '../src/pi-auth-backup';
 import { canonicalDigest, keychainDigest, restoreRecordFor } from '../src/pi-handback-source';
+import { bindDetectAndResync } from '../src/native-resync';
 import { hasLegacyPiOwnerEntry } from '../src/pi-migrate';
 import { openStore } from '../src/store';
 
@@ -2190,7 +2191,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     }
   });
 
-  it('S4a leaves a v1 owner file at the map path to the owner-file unlink and completes the hand-back (P7b5-40 r3)', async () => {
+  it('S4b unlinks a v1 owner file at the map path that names only this provider', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'qlb-generic-mig-'));
     const store = openStore(join(dir, 'qlb.db'));
     try {
@@ -2209,6 +2210,185 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     } finally {
       store.close();
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("T-S4b legacy sidecar and a custom v1 owner file are unlinked; another provider's entry kept", async () => {
+    {
+      const dir = mkdtempSync(join(tmpdir(), 'qlb-generic-mig-'));
+      const store = openStore(join(dir, 'qlb.db'));
+      try {
+        const authPath = join(dir, 'auth.json');
+        const ownerMapPath = join(dir, 'qlb-owner.json');
+        writeFileSync(authPath, fixtureAuthJson(), { encoding: 'utf8', mode: 0o600 });
+        const mig = createSingleGrantMigration(store, new MockKeychain(), 'xai', authPath, ownerMapPath);
+        mig.stage();
+        await mig.rehearse(mockRehearse([]));
+        mig.commit();
+        writeFileSync(ownerMapPath, JSON.stringify({
+          providers: {
+            xai: { mode: 'qlb', since: 123_456 },
+            'kimi-coding': { mode: 'qlb', since: 987_654 },
+          },
+        }, null, 2) + '\n');
+
+        mig.rollback();
+
+        assert.equal(existsSync(ownerMapPath), true, 'S4b never unlinks the shared v2 map');
+        const map = JSON.parse(readFileSync(ownerMapPath, 'utf8')) as { providers: Record<string, unknown> };
+        assert.equal(map.providers.xai, undefined, 'S4a removes only this provider');
+        assert.deepEqual(map.providers['kimi-coding'], { mode: 'qlb', since: 987_654 }, 'the other v2 provider survives');
+      } finally {
+        store.close();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+
+    const h = setup('xai');
+    try {
+      const customOwnerPath = join(h.dir, 'custom-owner.json');
+      const mig = createSingleGrantMigration(h.store, h.kc, 'xai', h.authPath, customOwnerPath);
+      const ownerMapPath = join(h.dir, 'qlb-owner.json');
+      const legacySidecarPath = join(h.dir, 'qlb-owner-xai.json');
+      mig.stage();
+      await mig.rehearse(mockRehearse([]));
+      mig.commit();
+      writeFileSync(legacySidecarPath, JSON.stringify({ owner: 'qlb', accounts: [{ provider: 'xai' }] }) + '\n');
+      writeFileSync(ownerMapPath, JSON.stringify({
+        providers: {
+          xai: { mode: 'qlb', since: 123_456 },
+          'kimi-coding': { mode: 'qlb', since: 987_654 },
+        },
+      }, null, 2) + '\n');
+
+      mig.rollback();
+
+      assert.equal(existsSync(legacySidecarPath), false, 'S4b unlinks L');
+      assert.equal(existsSync(customOwnerPath), false, 'S4b unlinks Oc');
+      const map = JSON.parse(readFileSync(ownerMapPath, 'utf8')) as { providers: Record<string, unknown> };
+      assert.equal(map.providers.xai, undefined, 'S4a removes only this provider');
+      assert.deepEqual(map.providers['kimi-coding'], { mode: 'qlb', since: 987_654 }, 'the other v2 provider survives S4b');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('S4b refuses a v1 owner file at the map path that names another provider', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-generic-mig-'));
+    const store = openStore(join(dir, 'qlb.db'));
+    try {
+      const authPath = join(dir, 'auth.json');
+      const ownerMapPath = join(dir, 'qlb-owner.json');
+      writeFileSync(authPath, fixtureAuthJson(), { encoding: 'utf8', mode: 0o600 });
+      const mig = createSingleGrantMigration(store, new MockKeychain(), 'xai', authPath, ownerMapPath);
+      mig.stage();
+      await mig.rehearse(mockRehearse([]));
+      mig.commit();
+      const mixedV1 = JSON.stringify({
+        owner: 'qlb',
+        accounts: [{ provider: 'xai' }, { provider: 'kimi-coding' }],
+      }) + '\n';
+      writeFileSync(ownerMapPath, mixedV1);
+
+      assert.throws(() => mig.rollback(), (error: Error & { exitCode?: unknown }) => {
+        assert.match(error.message, /owner-file-orphan/);
+        assert.equal(error.exitCode, 3);
+        return true;
+      });
+      assert.deepEqual(readFileSync(ownerMapPath), Buffer.from(mixedV1), 'S4b leaves the foreign v1 owner file intact');
+      const detail = JSON.parse(store.getMigration('pi-xai')!.detail_json) as Record<string, unknown>;
+      assert.equal(detail.lastRollback, undefined, 'the hand-back remains unfinished');
+    } finally {
+      store.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('T-S4c crash between map entry removal and sidecar unlink resumes without rewriting auth.json', async () => {
+    let crash = true;
+    const h = setup('xai', new MockKeychain(), {
+      afterStep: (point) => {
+        if (point === 'S4a' && crash) {
+          crash = false;
+          throw new Error('fixture crash after S4a');
+        }
+      },
+    });
+    try {
+      const ownerMapPath = join(h.dir, 'qlb-owner.json');
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      h.mig.commit();
+      writeFileSync(ownerMapPath, JSON.stringify({
+        providers: {
+          xai: { mode: 'qlb', since: 123_456 },
+          'kimi-coding': { mode: 'qlb', since: 987_654 },
+        },
+      }, null, 2) + '\n');
+
+      assert.throws(() => h.mig.rollback(), /fixture crash after S4a/);
+      assert.equal(existsSync(h.ownerPath), true, 'the crash leaves L for S4b');
+      const authBeforeResume = readFileSync(h.authPath);
+      const authMtimeBeforeResume = statSync(h.authPath).mtimeMs;
+
+      const resumed = h.mig.resume();
+
+      assert.equal(existsSync(h.ownerPath), false, 'resume unlinks L');
+      assert.deepEqual(readFileSync(h.authPath), authBeforeResume, 'resume does not rewrite auth.json');
+      assert.equal(statSync(h.authPath).mtimeMs, authMtimeBeforeResume, 'resume preserves auth.json mtime');
+      assert.ok(resumed.detail.lastRollback, 'the hand-back completes after the S4a crash');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('T-S0c a sidecar-owned provider on main runs the full hand-back with auth.json byte-identical', async () => {
+    const h = setup('xai');
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      h.mig.commit();
+      assert.equal(existsSync(h.ownerPath), true, 'main\'s commit created L');
+
+      const rolled = h.mig.rollback();
+
+      assert.deepEqual(readFileSync(h.authPath), h.originalBytes, 'S3 guard (a) leaves Pi\'s valid auth bytes intact');
+      assert.equal(existsSync(h.ownerPath), false, 'S4b unlinks the main sidecar');
+      assert.ok(rolled.detail.lastRollback, 'the hand-back records lastRollback');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('T-I7 after the hand-back every native-resync is refused until re-stage', async () => {
+    const h = setup('xai');
+    try {
+      const id = expectedId('xai');
+      const resync = bindDetectAndResync({
+        store: h.store,
+        keychain: h.kc,
+        readNativeCredential: async () => ({
+          ...FAKE_GRANTS.xai,
+          access: 'xai-access-native-resync-fixture',
+          generation: 0,
+        }),
+      });
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      h.mig.commit();
+      h.mig.rollback();
+
+      const refused = await resync(id, 'xai');
+      assert.equal(refused.resynced, false, 'W2 refuses native-resync after the hand-back');
+      assert.match(refused.reason, /not exclusively QLB-owned/);
+
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      h.mig.commit();
+      const admitted = await resync(id, 'xai');
+      assert.equal(admitted.resynced, true, 'a re-stage followed by commit re-admits native-resync');
+    } finally {
+      h.cleanup();
     }
   });
 
