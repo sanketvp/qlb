@@ -9,7 +9,7 @@ import {
 import { codexIdentity } from '../codex-auth';
 import { codexIdentityParts, list, readCodexSwitchHistory, renewers } from '../codex-sessions';
 import { CodexSlots } from '../codex-slots';
-import { codexSwitchJournalDir } from '../codex-switch';
+import { codexRecoveryFenceState, codexSwitchJournalDir } from '../codex-switch';
 import { ClaudeCodeLockTimeout } from '../cc-locks';
 import { platformKeychain } from '../keychain';
 import { openStore, type Store } from '../store';
@@ -76,6 +76,10 @@ export async function runCodexRefreshCommand(args: string[], deps: CodexRefreshC
     allowHeld: parsed.c9,
     c9: parsed.c9,
   });
+  if (result.status === 'switch-in-flight') {
+    error(result.message ?? 'codex refresh refused: switch-in-flight');
+    return 3;
+  }
   const output = { accountId: parsed.accountId, status: result.status };
   write(parsed.json ? JSON.stringify(output) : `${parsed.accountId}: ${result.status}`);
   if (result.stashId) error(`codex refresh successor stash: ${result.stashId}`);
@@ -127,11 +131,13 @@ async function execute(args: string[], ctx: CommandContext): Promise<number> {
           // Re-check every mutable receipt and active state after lock acquisition.
           if (activeCodexSlot(store) === accountId) return { status: 'active-slot' as const };
           if (c9 && !c9Allowed(store.getConfig.bind(store))) return { status: 'c9-unavailable' as const };
+          const recoveryFence = codexRecoveryFenceState(codexSwitchJournalDir({ env: ctx.env }), store);
           let snapshot;
           try { snapshot = slots.readSlot(accountId, { fresh: true }).document; } catch { return { status: 'slot-removed' as const }; }
           if (!hasCodexSlotIdentity(snapshot, accountId)) return { status: 'slot-removed' as const };
-          return consumeCodexSlot({
+          const result = await consumeCodexSlot({
             accountId, snapshot, trigger: 'force', force, allowHeld, slots, store, transport: sendRefresh,
+            inFlightSlots: recoveryFence.state === 'fenced' ? recoveryFence.accounts : undefined,
             assertHeld,
             holders: async (document) => {
               const identity = codexIdentity(document);
@@ -145,6 +151,9 @@ async function execute(args: string[], ctx: CommandContext): Promise<number> {
               );
             },
           });
+          return result.status === 'switch-in-flight' && recoveryFence.state === 'fenced'
+            ? { ...result, message: recoveryFence.message }
+            : result;
         });
       },
     });

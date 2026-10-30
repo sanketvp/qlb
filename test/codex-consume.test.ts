@@ -15,6 +15,7 @@ import {
 import { ClaudeCodeLockTimeout } from '../src/cc-locks';
 import { consumeUnderCodexLocks, runCodexRefreshCommand } from '../src/commands/codex-refresh';
 import { codexFingerprint, type CodexAuthDocument } from '../src/codex-auth';
+import { codexRecoveryFenceState, writeCodexSwitchJournal, type CodexSwitchJournal } from '../src/codex-switch';
 import type { CodexProcess } from '../src/codex-sessions';
 import { CodexSlots, importActiveCodexSlot } from '../src/codex-slots';
 import { MockKeychain } from '../src/keychain';
@@ -52,6 +53,16 @@ function slots(initial: CodexAuthDocument) {
 }
 
 const holder: CodexProcess = { pid: 741, lstart: 'Fri Oct 24 12:00:00 2026', host: 'codex' };
+
+function recoveryJournal(overrides: Partial<CodexSwitchJournal> = {}): CodexSwitchJournal {
+  return {
+    v: 2, attemptId: 'recovery-attempt', from: 'user-a:account-a', to: 'user-b:account-b',
+    target: { identity: { chatgpt_user_id: 'user-b', account_id: 'account-b' }, fingerprint: 'fixture-target' },
+    adoptingTarget: [], trigger: 'manual', decision: null, openSessions: [],
+    outgoing: { sha256: 'sha256-file:fixture', inode: 1 }, publishedAt: 1, owner: { pid: 1, lstart: 'fixture', state: 'released' },
+    ...overrides,
+  };
+}
 
 const ownerToken = /^\.qlb-owner-\d+-[0-9a-f]+$/;
 
@@ -669,6 +680,150 @@ describe('Codex consume gate — AC34', () => {
     assert.equal(result.status, 'refreshed');
     assert.equal(fixture.writes.length, 1);
     assert.ok(assertions > 0);
+  });
+
+  it('codex refresh of the journal target and source is refused while the journal exists', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-codex-refresh-fence-'));
+    const store = openStore(join(home, 'qlb.db'));
+    const journalDir = join(home, 'journal');
+    let posts = 0;
+    try {
+      writeCodexSwitchJournal(recoveryJournal(), { journalDir });
+      for (const accountId of ['user-a:account-a', 'user-b:account-b']) {
+        const state = codexRecoveryFenceState(journalDir, store);
+        const fixture = slots(document());
+        const result = await consumeCodexSlot({
+          accountId, snapshot: fixture.current(), trigger: 'force', force: true, slots: fixture.slots, holders: async () => [],
+          inFlightSlots: state.state === 'fenced' ? state.accounts : undefined,
+          transport: async () => { posts += 1; return { status: 200, body: '{}' }; },
+        });
+        assert.equal(result.status, 'switch-in-flight');
+        assert.equal(fixture.writes.length, 0);
+      }
+      assert.equal(posts, 0);
+    } finally {
+      store.close();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("a journal created between the refresh's start and its switch lock is honoured", async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-codex-refresh-race-'));
+    const store = openStore(join(home, 'qlb.db'));
+    const journalDir = join(home, 'journal');
+    const fixture = slots(document());
+    let posts = 0;
+    try {
+      assert.equal(codexRecoveryFenceState(journalDir, store).state, 'none');
+      const result = await consumeUnderCodexLocks(join(home, 'qlb.db'), 'user-a:account-a', async () => {
+        writeCodexSwitchJournal(recoveryJournal(), { journalDir });
+        const state = codexRecoveryFenceState(journalDir, store);
+        return consumeCodexSlot({
+          accountId: 'user-a:account-a', snapshot: fixture.current(), trigger: 'force', force: true, slots: fixture.slots,
+          holders: async () => [], inFlightSlots: state.state === 'fenced' ? state.accounts : undefined,
+          transport: async () => { posts += 1; return { status: 200, body: '{}' }; },
+        });
+      });
+      assert.equal(result.status, 'switch-in-flight');
+      assert.equal(posts, 0);
+      assert.equal(fixture.writes.length, 0);
+    } finally {
+      store.close();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('an unresolved fence that names a third slot C refuses codex refresh of C with the recovery message and zero POSTs', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-codex-refresh-third-fence-'));
+    const store = openStore(join(home, 'qlb.db'));
+    const fixture = slots(document());
+    let posts = 0;
+    const expected = 'Codex switch recovery needs you (slot-split): log in to Codex with the account you want (codex login), then run qlb codex import-active. QLB finishes the recovery at its next check.';
+    try {
+      store.setConfig('codex.recoveryFence', JSON.stringify({
+        v: 1, switchId: 1, attempt: 'fence-attempt', from: 'user-a:account-a', to: 'user-b:account-b', publishedAt: 1,
+        reason: 'slot-split', involvedAccounts: ['user-a:account-a', 'user-b:account-b', 'user-c:account-c'], since: 1,
+      }));
+      const state = codexRecoveryFenceState(join(home, 'no-journal'), store);
+      assert.equal(state.state, 'fenced');
+      if (state.state !== 'fenced') return;
+      assert.equal(state.message, expected);
+      const code = await runCodexRefreshCommand(['user-c:account-c', '--force'], {
+        getConfig: store.getConfig.bind(store),
+        consume: async () => {
+          const result = await consumeCodexSlot({
+            accountId: 'user-c:account-c', snapshot: fixture.current(), trigger: 'force', force: true, slots: fixture.slots,
+            holders: async () => [], inFlightSlots: state.accounts,
+            transport: async () => { posts += 1; return { status: 200, body: '{}' }; },
+          });
+          return { ...result, message: state.message };
+        },
+        write: () => {}, error: (line) => { assert.equal(line, expected); },
+      });
+      assert.equal(code, 3);
+      assert.equal(posts, 0);
+      assert.equal(fixture.writes.length, 0);
+    } finally {
+      store.close();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('a malformed fence refuses every account', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-codex-refresh-malformed-fence-'));
+    const store = openStore(join(home, 'qlb.db'));
+    let posts = 0;
+    try {
+      store.setConfig('codex.recoveryFence', '{');
+      const state = codexRecoveryFenceState(join(home, 'no-journal'), store);
+      assert.equal(state.state, 'fenced');
+      if (state.state !== 'fenced') return;
+      assert.equal(state.accounts, '*');
+      for (const accountId of ['user-a:account-a', 'other:account']) {
+        const fixture = slots(document());
+        const result = await consumeCodexSlot({
+          accountId, snapshot: fixture.current(), trigger: 'force', force: true, slots: fixture.slots, holders: async () => [],
+          inFlightSlots: state.accounts,
+          transport: async () => { posts += 1; return { status: 200, body: '{}' }; },
+        });
+        assert.equal(result.status, 'switch-in-flight');
+        assert.equal(fixture.writes.length, 0);
+      }
+      assert.equal(posts, 0);
+    } finally {
+      store.close();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('codex refresh proceeds once the fence is gone', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-codex-refresh-fence-cleared-'));
+    const store = openStore(join(home, 'qlb.db'));
+    const fixture = slots(document());
+    let posts = 0;
+    try {
+      store.setConfig('codex.recoveryFence', '{');
+      const fenced = codexRecoveryFenceState(join(home, 'no-journal'), store);
+      assert.equal(fenced.state, 'fenced');
+      const blocked = await consumeCodexSlot({
+        accountId: 'user-a:account-a', snapshot: fixture.current(), trigger: 'force', force: true, slots: fixture.slots,
+        holders: async () => [], inFlightSlots: fenced.state === 'fenced' ? fenced.accounts : undefined,
+        transport: async () => { posts += 1; return { status: 200, body: '{}' }; },
+      });
+      assert.equal(blocked.status, 'switch-in-flight');
+      (store as unknown as { db: DatabaseSync }).db.prepare("DELETE FROM config WHERE key = 'codex.recoveryFence'").run();
+      const clear = codexRecoveryFenceState(join(home, 'no-journal'), store);
+      const refreshed = await consumeCodexSlot({
+        accountId: 'user-a:account-a', snapshot: fixture.current(), trigger: 'force', force: true, slots: fixture.slots,
+        holders: async () => [], inFlightSlots: clear.state === 'fenced' ? clear.accounts : undefined,
+        transport: async () => { posts += 1; return { status: 200, body: JSON.stringify({ refresh_token: 'refresh-b', access_token: 'access-b' }) }; },
+      });
+      assert.equal(refreshed.status, 'refreshed');
+      assert.equal(posts, 1);
+    } finally {
+      store.close();
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 
   it('refuses a forced refresh of the active Codex slot', async () => {

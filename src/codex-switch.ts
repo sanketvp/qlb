@@ -4,7 +4,7 @@ import type { CodexAuthStableWithStatResult, CodexIdentity } from './codex-auth'
 import { ClaudeCodeLockTimeout, type HeldProperLockfile, withProperLockfile } from './cc-locks';
 import { fsyncDirSync, atomicWriteText } from './fsutil';
 import { qlbHomeDir } from './home';
-import { stillTheSameProcess, type CodexProcess } from './codex-sessions';
+import { parseCodexRecoveryFence, stillTheSameProcess, type CodexProcess } from './codex-sessions';
 import type { CswapProcess } from './cswap-processes';
 import type { Store } from './store';
 
@@ -224,6 +224,57 @@ export function readCodexSwitchJournal(options: CodexSwitchJournalOptions = {}):
     if (typeof error === 'object' && error !== null && (error as NodeJS.ErrnoException).code === 'ENOENT') return { state: 'absent' };
     return { state: 'malformed' };
   }
+}
+
+export type CodexRecoveryFenceState = { state: 'none' } | {
+  state: 'fenced';
+  accounts: Set<string> | '*';
+  reason: string;
+  message: string;
+};
+
+function codexRecoveryFenceMessage(reason: string): string {
+  return `Codex switch recovery needs you (${reason}): log in to Codex with the account you want (codex login), then run qlb codex import-active. QLB finishes the recovery at its next check.`;
+}
+
+function unionRecoveryAccounts(...accounts: Array<string[] | '*'>): Set<string> | '*' {
+  if (accounts.includes('*')) return '*';
+  return new Set(accounts.flat());
+}
+
+/**
+ * Reads the two durable recovery artifacts as one fail-closed consumer fence.
+ * Callers must invoke this while holding the shared switch lock.
+ */
+export function codexRecoveryFenceState(
+  journalDir: string,
+  store: Pick<Store, 'getConfig'>,
+): CodexRecoveryFenceState {
+  const journal = readCodexSwitchJournal({ journalDir });
+  const fenceValue = store.getConfig('codex.recoveryFence');
+  const configFence = parseCodexRecoveryFence(fenceValue);
+  if (journal.state === 'malformed' || (fenceValue !== null && configFence === null)) {
+    const reason = 'switch-recovery-malformed';
+    return { state: 'fenced', accounts: '*', reason, message: codexRecoveryFenceMessage(reason) };
+  }
+  if (journal.state === 'ok') {
+    const journalAccounts = journal.journal.unresolved?.involvedAccounts ?? [];
+    const configAccounts = configFence?.involvedAccounts ?? [];
+    const accounts = unionRecoveryAccounts(
+      [journal.journal.from, journal.journal.to], journalAccounts,
+      ...(configFence === null ? [] : [[configFence.from, configFence.to], configAccounts]),
+    );
+    const reason = journal.journal.unresolved?.reason ?? 'switch-in-flight';
+    return { state: 'fenced', accounts, reason, message: codexRecoveryFenceMessage(reason) };
+  }
+  if (configFence !== null) {
+    const accounts = unionRecoveryAccounts([configFence.from, configFence.to], configFence.involvedAccounts);
+    return {
+      state: 'fenced', accounts, reason: configFence.reason,
+      message: codexRecoveryFenceMessage(configFence.reason),
+    };
+  }
+  return { state: 'none' };
 }
 
 /** Persist only the parsed, allowlisted fields, so extra caller properties never reach disk. */
