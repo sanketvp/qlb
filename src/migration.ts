@@ -774,6 +774,8 @@ export class Migration {
   private readonly beforeOwnershipLock: (() => void) | undefined;
   private readonly afterStep: ((point: MigrationCrashPoint) => void) | undefined;
   private readonly sleepSync: (ms: number) => void;
+  /** Keeps Pi's auth.json lock fresh during S2's lease wait; throws lock-lost. */
+  private piAuthLockRefresh: (() => void) | undefined;
   private readonly now: () => number;
   private readonly fsyncDirectory: (path: string) => void;
   private readonly piMigrateJournalDir: string;
@@ -1410,7 +1412,7 @@ export class Migration {
 
   rollback(): MigrationStatus {
     if (this.kind === 'single-grant') {
-      return withPiAuthLock(resolve(this.poolFilePath), () => this.rollbackUnlocked());
+      return withPiAuthLock(resolve(this.poolFilePath), (refresh) => this.holdingPiAuthLock(refresh, () => this.rollbackUnlocked()));
     }
     return this.rollbackUnlocked();
   }
@@ -1468,7 +1470,7 @@ export class Migration {
    */
   resume(): MigrationStatus {
     if (this.kind === 'single-grant') {
-      return withPiAuthLock(resolve(this.poolFilePath), () => this.resumeUnlocked());
+      return withPiAuthLock(resolve(this.poolFilePath), (refresh) => this.holdingPiAuthLock(refresh, () => this.resumeUnlocked()));
     }
     return this.resumeUnlocked();
   }
@@ -2081,7 +2083,10 @@ export class Migration {
           const waitedAt = this.now();
           if (leaseWaitStartedAt === undefined) leaseWaitStartedAt = waitedAt;
           if (waitedAt - leaseWaitStartedAt >= 30_000) throw refreshInProgress();
+          // Pi treats auth.json.lock as stale after 10 s of an unchanged mtime.
+          this.piAuthLockRefresh?.();
           this.sleepSync(100);
+          this.piAuthLockRefresh?.();
           // Re-enter at the outside reads; lease waits do not spend RETRY attempts.
           continue;
         }
@@ -2093,6 +2098,11 @@ export class Migration {
       }
     }
     throw refreshInProgress();
+  }
+
+  private holdingPiAuthLock<T>(refresh: () => void, fn: () => T): T {
+    this.piAuthLockRefresh = refresh;
+    try { return fn(); } finally { this.piAuthLockRefresh = undefined; }
   }
 
   /** Pi's entry for a Keychain grant, keeping the backup entry's other fields (design §2 S3). */

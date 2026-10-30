@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { describe, it, mock } from 'node:test';
@@ -1317,6 +1317,46 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       assert.equal(refused.rollbackDecision, undefined, 'S2 records no decision after the wait cap');
       assert.equal(h.store.getGrantGeneration(accountId), generationBefore, 'S2 does not fence under a live lease');
       assert.equal(keychainHas(h.kc, 'xai'), keychainPresentBefore, 'the Keychain copy is unchanged');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('S2 keeps the Pi auth lock fresh while it waits and stops if the lock is taken over', async () => {
+    let now = 2_500_000;
+    let sleeps = 0;
+    let authPath = '';
+    const lockMtimes: number[] = [];
+    const h = setup('xai', new MockKeychain(), {
+      now: () => now,
+      sleepSync: () => {
+        sleeps += 1;
+        now += 100;
+        const lock = `${authPath}.lock`;
+        lockMtimes.push(statSync(lock).mtimeMs);
+        utimesSync(lock, new Date(0), new Date(0));
+        if (sleeps === 3) writeFileSync(join(lock, 'qlb-lock-owner.json'), '{"pid":1,"nonce":"pi-takeover"}\n');
+      },
+    });
+    try {
+      authPath = h.authPath;
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      h.mig.commit();
+      const accountId = (JSON.parse(h.store.getMigration('pi-xai')!.detail_json).accounts as Array<{ id: string }>)[0].id;
+      const generationBefore = h.store.getGrantGeneration(accountId);
+      const originalGetLease = h.store.getLease.bind(h.store);
+      h.store.getLease = (name) => name === `refresh:${accountId}`
+        ? { name, holder_pid: 1, holder_id: 'fixture-refresher', until: now + 1_000, generation: 1 }
+        : originalGetLease(name);
+
+      assert.throws(() => h.mig.rollback(), /lock-lost/);
+      assert.equal(sleeps, 3, 'S2 stops at the first refresh after the takeover');
+      assert.ok(lockMtimes.slice(1).every((mtime) => mtime > 0), 'every wait step re-touches the lock');
+      const refused = JSON.parse(h.store.getMigration('pi-xai')!.detail_json) as Record<string, unknown>;
+      assert.equal(refused.intent, 'rollback', 'the rollback intent stays durable');
+      assert.equal(refused.rollbackDecision, undefined, 'S2 records no decision');
+      assert.equal(h.store.getGrantGeneration(accountId), generationBefore, 'S2 does not fence');
     } finally {
       h.cleanup();
     }
