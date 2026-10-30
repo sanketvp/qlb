@@ -1932,8 +1932,9 @@ export class Migration {
         this.decideAndFenceSingleGrantRollback(journalAccount, authKey);
         // S3 under the auth lock that rollback()/resume() hold. Guard (a): a
         // valid native entry (a newer login, or Pi's rotation) is kept and
-        // nothing is written. Main writes nothing here for any other A
-        // either; rows 35–37 add guards (b)–(d) and the materialising write.
+        // nothing is written. Guard (d): a defined, non-placeholder, invalid
+        // entry refuses native-entry-invalid before the un-own. Guards (b)
+        // and (c) and the materialising write come in rows 36–37.
         this.singleGrantNativeEntryWins(authKey);
         // Validate and check for a live refresh before un-owning, so a refusal
         // leaves the claim intact.
