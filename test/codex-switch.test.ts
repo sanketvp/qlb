@@ -6,8 +6,10 @@ import { DatabaseSync } from 'node:sqlite';
 import { describe, it } from 'node:test';
 
 import {
+  attributeForPhase,
   checkCodexSwitchPreconditions,
   classifyPostPublish,
+  resolveRecoveryVerdict,
   codexRecoveryFenceState,
   freshenCodexTarget,
   preflightCodexLive,
@@ -30,6 +32,8 @@ import {
 import { ClaudeCodeLockTimeout } from '../src/cc-locks';
 import { codexLockPaths } from '../src/codex-consume';
 import { accessExpiry, codexFingerprint, readCodexAuthStableWithStat, type CodexAuthDocument } from '../src/codex-auth';
+import { importActiveCodexSlot } from '../src/codex-slots';
+import { MockKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from '../src/keychain';
 import type { CodexProcess } from '../src/codex-sessions';
 import { openStore } from '../src/store';
 
@@ -428,6 +432,203 @@ describe('Codex publish wrapper and post-publish classifier — C6-14', () => {
       assert.equal(classifyPostPublish({ journal: journal(root, target), observed,
         targetSlotFp: codexFingerprint(target) }), observed);
     } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+});
+
+describe('phase-aware attribution and §3.1 recovery resolution — C6-15', () => {
+  function targetDocument(refresh = 'target-refresh'): CodexAuthDocument {
+    return freshenDocument(1_700_000_000_000 + 60 * 60_000, refresh);
+  }
+  function context(target: CodexAuthDocument, phase: 'post' | 'recovery' | 'watch' = 'post', overrides: Record<string, unknown> = {}) {
+    const journal = journalFixture('unused', {
+      to: 'target:account',
+      target: { identity: { chatgpt_user_id: 'target', account_id: 'account' }, fingerprint: codexFingerprint(target) },
+    });
+    return { phase, journal, targetSlotFingerprint: codexFingerprint(target), live: target, ...overrides } as const;
+  }
+
+  it('§3.1 not-landed is resolvable in post-publish and recovery', () => {
+    const target = targetDocument();
+    for (const phase of ['post', 'recovery'] as const) {
+      assert.deepEqual(resolveRecoveryVerdict('not-landed', undefined, context(target, phase)), {
+        class: 'resolvable', effect: { outcome: 'failed', detail: 'not-published' },
+      });
+    }
+  });
+
+  it('§3.1 ok requires both the live and current slot B fingerprints in post, recovery and watch', () => {
+    const target = targetDocument();
+    for (const phase of ['post', 'recovery', 'watch'] as const) {
+      const verdict = resolveRecoveryVerdict('ok', { action: 'noop', accountId: 'target:account' }, context(target, phase));
+      assert.equal(verdict.class, 'resolvable');
+      if (verdict.class === 'resolvable') assert.equal(verdict.effect.outcome, phase === 'watch' ? 'quiet' : 'ok');
+    }
+  });
+
+  it("a classified ok whose slot B moved by QLB's own adopt is not the §3.1 ok row", () => {
+    const target = targetDocument();
+    const moved = targetDocument('target-rotation');
+    const verdict = resolveRecoveryVerdict('ok', { action: 'republish-forbidden', slotId: 'target:account' }, context(target, 'recovery', {
+      targetSlotFingerprint: codexFingerprint(moved), live: target,
+      journal: journalFixture('unused', {
+        to: 'target:account',
+        target: { identity: { chatgpt_user_id: 'target', account_id: 'account' }, fingerprint: codexFingerprint(target) },
+        adoptingTarget: [codexFingerprint(moved)],
+      }),
+    }));
+    assert.deepEqual(verdict, {
+      class: 'unresolved', reason: 'target-ancestor', involvedAccounts: ['from:account', 'target:account'],
+    });
+  });
+
+  it('target-changed after an import becomes resolvable only as failed(target-changed) once live equals the current slot head', () => {
+    const target = targetDocument();
+    const imported = targetDocument('imported-target');
+    const unresolved = resolveRecoveryVerdict('target-changed', { action: 'adopt', accountId: 'target:account' }, context(target, 'recovery', {
+      targetSlotFingerprint: codexFingerprint(imported), live: target,
+    }));
+    assert.equal(unresolved.class, 'unresolved');
+    const resolved = resolveRecoveryVerdict('target-changed', { action: 'noop', accountId: 'target:account' }, context(target, 'recovery', {
+      targetSlotFingerprint: codexFingerprint(imported), live: imported,
+    }));
+    assert.deepEqual(resolved, { class: 'resolvable', effect: { outcome: 'failed', detail: 'target-changed' } });
+  });
+
+  it('§3.1 settled-on-target is ok in post/recovery and quiet-adopted in watch', () => {
+    const target = targetDocument();
+    const rotation = targetDocument('target-rotation');
+    const external = { status: 'external', doc: rotation } as const;
+    for (const phase of ['post', 'recovery'] as const) {
+      assert.deepEqual(resolveRecoveryVerdict(external, { action: 'adopt', accountId: 'target:account' }, context(target, phase, { live: rotation })),
+        { class: 'resolvable', effect: { outcome: 'ok', adopted: true } });
+    }
+    assert.deepEqual(resolveRecoveryVerdict(external, { action: 'adopt', accountId: 'target:account' }, context(target, 'watch', { live: rotation })),
+      { class: 'resolvable', effect: { outcome: 'quiet', adopted: true } });
+  });
+
+  it('§3.1 settled-on-from-or-third-slot resolves to a revert in every phase', () => {
+    const target = targetDocument();
+    const third = targetDocument('third-rotation');
+    for (const phase of ['post', 'recovery', 'watch'] as const) {
+      assert.deepEqual(resolveRecoveryVerdict({ status: 'external', doc: third }, { action: 'drift', accountId: 'third:account', disposition: 'noop' },
+        context(target, phase, { live: third })), { class: 'resolvable', effect: { outcome: 'reverted-by-codex', accountId: 'third:account' } });
+    }
+  });
+
+  it('republish-slot onto the outgoing slot after the rename resolves to reverted-by-codex', () => {
+    const target = targetDocument();
+    for (const phase of ['post', 'recovery', 'watch'] as const) {
+      assert.deepEqual(resolveRecoveryVerdict({ status: 'external', doc: target }, { action: 'republish-forbidden', slotId: 'from:account' }, context(target, phase)),
+        { class: 'resolvable', effect: { outcome: 'reverted-by-codex', accountId: 'from:account' } });
+    }
+  });
+
+  it('republish-slot onto the target is unresolved target-ancestor', () => {
+    const target = targetDocument();
+    for (const phase of ['post', 'recovery', 'watch'] as const) {
+      const verdict = resolveRecoveryVerdict({ status: 'external', doc: target }, { action: 'republish-forbidden', slotId: 'target:account' }, context(target, phase));
+      assert.equal(verdict.class, 'unresolved');
+      if (verdict.class === 'unresolved') assert.equal(verdict.reason, 'target-ancestor');
+    }
+  });
+
+  it('slot-split direct or as drift disposition is unresolved', () => {
+    const target = targetDocument();
+    for (const attribution of [
+      { action: 'slot-split', accountId: 'third:account' },
+      { action: 'drift', accountId: 'third:account', disposition: 'slot-split' },
+    ] as const) {
+      for (const phase of ['post', 'recovery', 'watch'] as const) {
+        const verdict = resolveRecoveryVerdict({ status: 'external', doc: target }, attribution, context(target, phase));
+        assert.equal(verdict.class, 'unresolved');
+        if (verdict.class === 'unresolved') assert.equal(verdict.reason, 'slot-split');
+      }
+    }
+  });
+
+  it('an unresolved slot-split onto a third slot C involves {from, to, C}', () => {
+    const target = targetDocument();
+    assert.deepEqual(resolveRecoveryVerdict({ status: 'external', doc: target }, { action: 'slot-split', accountId: 'third:account' }, context(target)), {
+      class: 'unresolved', reason: 'slot-split', involvedAccounts: ['from:account', 'target:account', 'third:account'],
+    });
+  });
+
+  it('§3.1 unknown identity, stash-unverifiable and wiped have their table effects in every phase', () => {
+    const target = targetDocument();
+    for (const phase of ['post', 'recovery', 'watch'] as const) {
+      assert.equal(resolveRecoveryVerdict({ status: 'external', doc: target }, { action: 'unclaimed' }, context(target, phase)).class, 'resolvable');
+      const stash = resolveRecoveryVerdict({ status: 'external', doc: target }, { action: 'stash-unverifiable' }, context(target, phase));
+      assert.deepEqual(stash, { class: 'unresolved', reason: 'stash-unverifiable', involvedAccounts: '*' });
+      assert.equal(resolveRecoveryVerdict({ status: 'wiped', error: { ok: false, error: 'tokens-empty', status: 'wiped' } }, undefined, context(target, phase)).class, 'resolvable');
+    }
+  });
+
+  it('§3.1 missing is unresolved after publish/recovery and stopped in watch', () => {
+    const target = targetDocument();
+    for (const phase of ['post', 'recovery'] as const) {
+      assert.deepEqual(resolveRecoveryVerdict({ status: 'missing' }, undefined, context(target, phase, { live: undefined })),
+        { class: 'unresolved', reason: 'logged-out', involvedAccounts: '*' });
+    }
+    assert.deepEqual(resolveRecoveryVerdict({ status: 'missing' }, undefined, context(target, 'watch', { live: undefined })),
+      { class: 'resolvable', effect: { outcome: 'stopped', reason: 'logged-out' } });
+  });
+
+  it('§3.1 unstable and unreadable are pending in every phase', () => {
+    const target = targetDocument();
+    for (const phase of ['post', 'recovery', 'watch'] as const) {
+      assert.deepEqual(resolveRecoveryVerdict({ status: 'unstable' }, undefined, context(target, phase)), { class: 'pending', status: 'unstable' });
+      assert.deepEqual(resolveRecoveryVerdict({ status: 'unreadable', code: 'EIO' }, undefined, context(target, phase)), { class: 'pending', status: 'unreadable' });
+    }
+  });
+
+  it('an unresolved verdict with no establishable identity involves every account', () => {
+    const target = targetDocument();
+    const malformed = { tokens: {} } as CodexAuthDocument;
+    assert.deepEqual(resolveRecoveryVerdict({ status: 'external', doc: malformed }, { action: 'slot-split', accountId: 'third:account' },
+      context(target, 'recovery', { live: malformed })), { class: 'unresolved', reason: 'slot-split', involvedAccounts: '*' });
+  });
+
+  it('a forbidden republish writes nothing to auth.json, Keychain or SQLite', async () => {
+    const h = fixture();
+    const keychain = new MockKeychain();
+    const oldLive = targetDocument('live-a0');
+    const newerSlot = targetDocument('slot-a1');
+    const authPath = join(h.root, 'auth.json');
+    try {
+      const plan = importActiveCodexSlot(oldLive, { store: h.store, keychain, now: () => 1 });
+      importActiveCodexSlot(newerSlot, { store: h.store, keychain, now: () => 2 });
+      writeFileSync(authPath, JSON.stringify(oldLive));
+      const service = qlbKeychainService('openai-codex', plan.slotId);
+      const keychainBefore = codexFingerprint(JSON.parse(keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT)) as CodexAuthDocument);
+      const slotBefore = h.store.getCodexSlot(plan.slotId)?.fingerprint;
+      const rowsBefore = h.db.prepare('SELECT COUNT(*) AS count FROM lineage_log').get() as { count: number };
+      const result = await attributeForPhase({ assertHeld: () => undefined }, 'post', {
+        store: h.store, keychain, slot: { accountId: plan.slotId, document: newerSlot }, live: oldLive,
+        republish: () => writeFileSync(authPath, JSON.stringify(newerSlot)),
+      });
+      assert.deepEqual(result, { action: 'republish-forbidden', slotId: plan.slotId });
+      assert.equal(codexFingerprint(JSON.parse(readFileSync(authPath, 'utf8')) as CodexAuthDocument), codexFingerprint(oldLive));
+      assert.equal(codexFingerprint(JSON.parse(keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT)) as CodexAuthDocument), keychainBefore);
+      assert.equal(h.store.getCodexSlot(plan.slotId)?.fingerprint, slotBefore);
+      assert.deepEqual(h.db.prepare('SELECT COUNT(*) AS count FROM lineage_log').get(), rowsBefore);
+    } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('attribution receives assertHeld in every phase', async () => {
+    const h = fixture();
+    const keychain = new MockKeychain();
+    const document = targetDocument();
+    try {
+      const plan = importActiveCodexSlot(document, { store: h.store, keychain, now: () => 1 });
+      for (const phase of ['pre', 'post', 'recovery', 'watch'] as const) {
+        let assertions = 0;
+        const result = await attributeForPhase({ assertHeld: () => { assertions += 1; } }, phase, {
+          store: h.store, keychain, slot: { accountId: plan.slotId, document }, live: document,
+        });
+        assert.equal(result.action, 'noop');
+        assert.ok(assertions > 0, `${phase} forwards assertHeld into attribution`);
+      }
+    } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
   });
 });
 
