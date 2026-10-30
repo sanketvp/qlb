@@ -2303,6 +2303,7 @@ export class Store {
   adoptCodexSlotWithKeychain(input: {
     accountId: string; fingerprint: string; previousFingerprint: string; lastRefresh?: string | null;
     ts?: number; evidence: 'holder' | 'identity'; reloginEvidence?: 'auth-time' | 'unattributed-rotation' | null;
+    setBy?: 'import' | 'adopt';
     writeKeychain: () => void;
     /** Restores only self-written bytes; false means a compensation CAS failed. */
     restoreKeychain: () => boolean;
@@ -2314,6 +2315,7 @@ export class Store {
     beforeCommit?: (db: DatabaseSync, kind: 'existing-adopt') => undefined;
   }): void {
     const ts = input.ts ?? Date.now();
+    const setBy = input.setBy ?? 'import';
     this.runImmediate(() => {
       let keychainWriteStarted = false;
       try {
@@ -2344,9 +2346,9 @@ export class Store {
           ts, input.accountId, input.previousFingerprint, input.fingerprint, input.evidence,
         );
         input.assertNotCompromised?.();
-        this.db.prepare(`INSERT INTO active_login (provider, account_id, since, set_by) VALUES ('openai-codex', ?, ?, 'import')
+        this.db.prepare(`INSERT INTO active_login (provider, account_id, since, set_by) VALUES ('openai-codex', ?, ?, ?)
           ON CONFLICT(provider) DO UPDATE SET account_id = excluded.account_id, since = excluded.since, set_by = excluded.set_by`)
-          .run(input.accountId, ts);
+          .run(input.accountId, ts, setBy);
         if (input.reloginEvidence != null) {
           assertStoredReloginFields(input.reloginEvidence, input.reloginEvidence);
           input.assertNotCompromised?.();
@@ -2391,6 +2393,7 @@ export class Store {
       beforeWrite?: (db: DatabaseSync, dbPath: string) => undefined;
       beforeCommit?: (db: DatabaseSync, kind: 'existing-mark') => undefined;
     },
+    setBy: 'import' | 'adopt' = 'import',
   ): boolean {
     return this.runImmediate(() => {
       assertNotCompromised?.();
@@ -2408,9 +2411,9 @@ export class Store {
         WHERE account_id = ? AND fingerprint = ?`).run(ts, accountId, fingerprint);
       if (updated.changes !== 1) return false;
       assertNotCompromised?.();
-      this.db.prepare(`INSERT INTO active_login (provider, account_id, since, set_by) VALUES ('openai-codex', ?, ?, 'import')
+      this.db.prepare(`INSERT INTO active_login (provider, account_id, since, set_by) VALUES ('openai-codex', ?, ?, ?)
         ON CONFLICT(provider) DO UPDATE SET account_id = excluded.account_id, since = excluded.since, set_by = excluded.set_by`)
-        .run(accountId, ts);
+        .run(accountId, ts, setBy);
       if (hooks?.beforeCommit) {
         const result: unknown = hooks.beforeCommit(this.db, 'existing-mark');
         if (result && typeof (result as { then?: unknown }).then === 'function') {
