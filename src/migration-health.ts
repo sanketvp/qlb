@@ -277,7 +277,10 @@ export function parseAccountIds(detailJson: string | null | undefined): ParseAcc
 }
 
 export function hasRollbackIntent(detail: unknown): boolean {
-  return detail !== null && typeof detail === 'object' && (detail as { intent?: unknown }).intent != null;
+  return detail !== null
+    && typeof detail === 'object'
+    && ((detail as { intent?: unknown }).intent != null
+      || (detail as { rollbackDecision?: unknown }).rollbackDecision != null);
 }
 
 /** Doctor WARN predicate: untrusted, trusted MIRRORED/VALIDATED, or an unfinished rollback. */

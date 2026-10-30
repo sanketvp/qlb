@@ -560,6 +560,23 @@ describe('accounts-prune in-flight migration refusal', () => {
     store.close();
   });
 
+  it('a NATIVE row carrying only a rollbackDecision stays prune-protected', () => {
+    const store = openTempStore();
+    seedOrphanAccount(store);
+    store.upsertMigration(
+      'pi-xai',
+      'NATIVE',
+      JSON.stringify({
+        qlbAccountIds: ['account-orphan'],
+        rollbackDecision: { kind: 'keychain' },
+      }),
+      Date.now(),
+    );
+    assert.throws(() => pruneAccount(store, { accountId: 'account-orphan', confirm: true }), PruneRefusedError);
+    assert.ok(store.getAccount('account-orphan'));
+    store.close();
+  });
+
   it('a NATIVE pool row with a rollback intent but no inventory refuses every prune', () => {
     const store = openTempStore();
     seedOrphanAccount(store);

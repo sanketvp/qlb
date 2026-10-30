@@ -125,8 +125,9 @@ import { fsyncDirSync } from './fsutil';
 import { qlbHomeDir } from './home';
 import type { KeychainBackend } from './keychain';
 import { openRouterMissingKeyMessage, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, readNativeOpenRouterKey } from './keychain';
-import { legacyPiAuthBackupPath, piAuthBackupPath, removePiAuthBackup } from './pi-auth-backup';
-import { handbackVerdict } from './pi-handback-source';
+import { legacyPiAuthBackupPath, piAuthBackupPath, readPiAuthBackup, removePiAuthBackup, type PiAuthBackup } from './pi-auth-backup';
+import { canonicalDigest, fencedGeneration, handbackVerdict, keychainDigest, rankSingleGrantSource, restoreRecordFor } from './pi-handback-source';
+import type { RollbackDecision } from './single-grant-ownership';
 import { parseGrant } from './refresh-lease';
 import { hasLegacyPiOwnerEntry, PiOwnerLegacyError, readPiOwnerProviders, withPiAuthLock, writePiOwnerEntry } from './pi-migrate';
 import { OPENROUTER_GATE_KEYCHAIN_SERVICE } from './token/openrouter';
@@ -307,7 +308,7 @@ export class OwnerMapPresentError extends Error {
 }
 
 /** Named crash points for MigrationConfig.afterStep; later rows add their own. */
-export type MigrationCrashPoint = 'S5' | 'S6c1';
+export type MigrationCrashPoint = 'S1' | 'S2-reads' | 'S2' | 'S5' | 'S6c1';
 
 export interface MigrationConfig {
   kind?: MigrationKind;
@@ -1875,6 +1876,7 @@ export class Migration {
     this.journal(this.journalState(), {
       intent: 'rollback',
     });
+    this.afterStep?.('S1');
     return this.continueRollback();
   }
 
@@ -1891,10 +1893,14 @@ export class Migration {
         const legacy = this.legacySidecarPath();
         if (legacy) unlinkIfExists(legacy);
       } else {
-        // Validate and check for a live refresh before un-owning, so a refusal
-        // leaves the claim intact.
+        // S2 runs after S1's durable intent and before the existing un-own
+        // path. Once it records a decision, C4 resumes here without ranking
+        // again; the decision is copied into S5's marker below.
         const journalAccount = this.singleGrantJournalAccount();
         const authKey = this.singleGrantAuthKey();
+        this.decideAndFenceSingleGrantRollback(journalAccount, authKey);
+        // Validate and check for a live refresh before un-owning, so a refusal
+        // leaves the claim intact.
         this.refuseDuringRefresh(journalAccount.id);
         unlinkIfExists(this.ownerFilePath);
         // The un-own must survive power loss before S5 records the hand-back:
@@ -1945,6 +1951,135 @@ export class Migration {
   }
 
   /**
+   * S2: rank outside the transaction, then atomically verify G, fence it,
+   * and persist the full decision. Digest/lease re-checks land in later rows.
+   */
+  private decideAndFenceSingleGrantRollback(
+    journalAccount: { provider: string; id: string; label: string },
+    authKey: string,
+  ): void {
+    const existing = parseDetail(this.store.getMigration(this.storeName)?.detail_json).rollbackDecision;
+    if (existing !== undefined && existing !== null) return;
+
+    class RetryS2 extends Error {}
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      const g0 = this.store.getGrantGeneration(journalAccount.id);
+      if (g0 === null) throw new Error('single-grant rollback has no account generation');
+
+      const coords = keychainCoords(journalAccount.provider, journalAccount.id, journalAccount.label);
+      let keychainGrant: Grant | null = null;
+      try {
+        keychainGrant = parseGrant(this.keychain.getSync(coords.service, coords.account));
+      } catch (error) {
+        if (!isCredentialNotFound(error)) throw new Error('keychain-unavailable', { cause: error });
+      }
+      const k0 = keychainGrant?.generation ?? -1;
+
+      const backup = readPiAuthBackup(this.poolFilePath, authKey);
+      const exactBackup = backup && existsSync(piAuthBackupPath(this.poolFilePath, authKey)) ? backup : null;
+      const legacyBackup = backup && !exactBackup ? backup : null;
+      let nativeEntry: unknown;
+      let nativeEntryPresent = false;
+      try {
+        const parsed: unknown = JSON.parse(readFileSync(this.poolFilePath, 'utf8'));
+        if (isObjectRecord(parsed)) {
+          nativeEntryPresent = Object.prototype.hasOwnProperty.call(parsed, authKey);
+          nativeEntry = parsed[authKey];
+        }
+      } catch {
+        // S2 only ranks the read-only native entry; later S3 owns its guards.
+      }
+
+      const ranked = rankSingleGrantSource({
+        keychainGrant,
+        storeGeneration: g0,
+        commitGeneration: (() => {
+          const value = parseDetail(this.store.getMigration(this.storeName)?.detail_json).commitGeneration;
+          return typeof value === 'number' ? value : undefined;
+        })(),
+        exactBackup,
+        legacyBackup,
+        nativeEntryPresent,
+        nativeEntry,
+      });
+      const decidedAt = Date.now();
+      const sourceBackup = ranked.kind === 'exact-backup'
+        ? exactBackup
+        : ranked.kind === 'legacy-backup'
+          ? legacyBackup
+          : null;
+      const record = ranked.kind === 'keychain'
+        ? restoreRecordFor({
+          authPath: this.poolFilePath,
+          key: authKey,
+          decidedAt,
+          filePresent: true,
+          entryPresent: true,
+          entry: this.piEntryFromGrant(ranked.grant, backup),
+        })
+        : ranked.kind === 'none'
+          ? null
+          // Design §2 S3: a backup kind's record is the normalised backup as
+          // readPiAuthBackup returns it, with its own cycleId.
+          : sourceBackup;
+      const decision: Omit<RollbackDecision, 'fencedGeneration'> = {
+        kind: ranked.kind,
+        generation: ranked.kind === 'none' ? null : ranked.generation,
+        fingerprint: ranked.kind === 'none' ? null : ranked.fingerprint,
+        entryPresent: record?.entryPresent ?? false,
+        sourceDigest: record ? canonicalDigest(record) : null,
+        kd0: keychainDigest(keychainGrant),
+        decidedAt,
+      };
+      this.afterStep?.('S2-reads');
+
+      try {
+        const fenced = this.store.runImmediate(() => {
+          if (this.store.getGrantGeneration(journalAccount.id) !== g0) throw new RetryS2();
+          // S2 (iii): a live refresh lease refuses before any fence, so an
+          // in-flight refresher's rotated grant is never fenced out. Row 30
+          // turns this refusal into a bounded wait.
+          const lease = this.store.getLease(refreshLeaseName(journalAccount.id));
+          if (lease && lease.until > Date.now()) throw new Error('refresh-in-progress');
+          const fence = fencedGeneration(g0, k0);
+          if (this.store.casGrantGeneration(journalAccount.id, g0, fence) !== 1) {
+            throw new RetryS2();
+          }
+          this.journal(this.journalState(), {
+            rollbackDecision: { ...decision, fencedGeneration: fence },
+          });
+          return fence;
+        });
+        if (fenced >= 0) {
+          this.afterStep?.('S2');
+          return;
+        }
+      } catch (error) {
+        if (error instanceof RetryS2) continue;
+        throw error;
+      }
+    }
+    throw Object.assign(new Error('refresh-in-progress'), { exitCode: 3 });
+  }
+
+  /** Pi's entry for a Keychain grant, keeping the backup entry's other fields (design §2 S3). */
+  private piEntryFromGrant(grant: Grant, backup: PiAuthBackup | null): Record<string, unknown> {
+    const previous = isObjectRecord(backup?.entry) ? backup.entry : {};
+    const type = typeof grant.extra?.type === 'string'
+      ? grant.extra.type
+      : typeof previous.type === 'string' ? previous.type : 'oauth';
+    const accountId = grant.extra?.accountId;
+    return {
+      ...previous,
+      type,
+      access: grant.access,
+      refresh: grant.refresh,
+      expires: grant.expires,
+      ...(typeof accountId === 'string' ? { accountId } : {}),
+    };
+  }
+
+  /**
    * Until S2's fence (row 28), a refresh that is mid-flight could rotate K_m
    * after the S5 verdict; refuse rather than record a delete against it.
    */
@@ -1990,12 +2125,14 @@ export class Migration {
     this.refuseDuringRefresh(journalAccount.id);
 
     const verdict = handbackVerdict(kmRead, piEntry);
+    const recordedDecision = parseDetail(this.store.getMigration(this.storeName)?.detail_json).rollbackDecision;
+    const decision = isObjectRecord(recordedDecision) ? recordedDecision as unknown as RollbackDecision : null;
     const handback = {
       phase: 'cleanup-pending' as const,
       keychainDisposition: verdict.keychainDisposition,
       piFingerprint: verdict.piFingerprint,
-      decision: null,
-      fencedGeneration: null,
+      decision,
+      fencedGeneration: decision?.fencedGeneration ?? null,
       rolledBackAt: Date.now(),
     };
     // This is S5's sole durable write. Its full marker shape is complete from
