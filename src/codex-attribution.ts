@@ -29,6 +29,8 @@ export interface AttributeLiveDocumentInput {
   slot: ManagedCodexDocument;
   /** The active_login identity when it differs from the live identity's known slot. */
   activeSlotId?: string;
+  /** active_login provenance; defaults to import for ordinary observations. */
+  activeSetBy?: 'import' | 'adopt';
   /** `null` is the stable-reader's tokens-empty/wiped result. */
   live: CodexAuthDocument | null;
   /** Holder facts around the two observations, injected by the session watcher. */
@@ -100,7 +102,7 @@ function markImportedActive(input: AttributeLiveDocumentInput, fingerprint: stri
   if (!input.store.markCodexSlotImportedActive(input.slot.accountId, fingerprint, ts, input.assertNotCompromised, {
     beforeWrite: input.beforeSave && ((db, dbPath) => input.beforeSave?.(db, dbPath, input.slot.accountId)),
     beforeCommit: input.beforeSaveCommit,
-  })) {
+  }, input.activeSetBy)) {
     // The fingerprint was observed under the caller's lease. A mismatch means
     // a successor already selected a different active slot; retry fresh.
     throw new CodexAuthLockCompromised();
@@ -222,6 +224,7 @@ async function attributeSameSlot(
     ts: now,
     evidence: evidenceFor(input.holderObservation),
     reloginEvidence: reloginEvidence(slotFp, live, input),
+    setBy: input.activeSetBy,
     writeKeychain: () => {
       // On a crash-retry the Keychain can already contain the live document.
       // Do not overwrite a real predecessor with that successor.

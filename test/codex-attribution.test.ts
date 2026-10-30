@@ -837,6 +837,73 @@ describe('Codex live-document attribution (AC57)', () => {
     }
   });
 
+  it('attribution with activeSetBy adopt stamps adopt on noop, republish and adopt paths', async () => {
+    const h = fixture();
+    const setBy = (): string => {
+      const db = new DatabaseSync(join(h.home, 'qlb.db'), { readOnly: true });
+      const row = db.prepare("SELECT set_by FROM active_login WHERE provider = 'openai-codex'").get() as { set_by: string };
+      db.close();
+      return row.set_by;
+    };
+    try {
+      const noop = document('provenance-noop', 'provenance-noop');
+      const noopPlan = importActiveCodexSlot(noop, { store: h.store, keychain: h.keychain, now: () => 1 });
+      assert.equal((await attributeLiveDocument({
+        store: h.store, keychain: h.keychain,
+        slot: { accountId: noopPlan.slotId, document: noop }, live: noop, now: () => 2,
+        activeSetBy: 'adopt',
+      })).action, 'noop');
+      assert.equal(setBy(), 'adopt');
+
+      const oldLive = document('provenance-live-a0', 'provenance-republish');
+      const republished = document('provenance-slot-a1', 'provenance-republish');
+      const republishPlan = importActiveCodexSlot(oldLive, { store: h.store, keychain: h.keychain, now: () => 3 });
+      importActiveCodexSlot(republished, { store: h.store, keychain: h.keychain, now: () => 4 });
+      h.store.setCodexActiveLogin('fixture-user:other-account', 5);
+      assert.equal((await attributeLiveDocument({
+        store: h.store, keychain: h.keychain,
+        slot: { accountId: republishPlan.slotId, document: republished }, live: oldLive, now: () => 6,
+        activeSetBy: 'adopt', republish: () => undefined,
+      })).action, 'republish-slot');
+      assert.equal(setBy(), 'adopt');
+
+      const previous = document('provenance-adopt-a0', 'provenance-adopt');
+      const live = document('provenance-adopt-a1', 'provenance-adopt');
+      const adoptPlan = importActiveCodexSlot(previous, { store: h.store, keychain: h.keychain, now: () => 7 });
+      const db = new DatabaseSync(join(h.home, 'qlb.db'));
+      db.prepare('DELETE FROM lineage_log WHERE provider = ? AND account_id = ?').run('openai-codex', adoptPlan.slotId);
+      db.close();
+      assert.equal((await attributeLiveDocument({
+        store: h.store, keychain: h.keychain,
+        slot: { accountId: adoptPlan.slotId, document: previous }, live, now: () => 8,
+        activeSetBy: 'adopt',
+      })).action, 'adopt');
+      assert.equal(setBy(), 'adopt');
+    } finally {
+      h.store.close();
+      rmSync(h.home, { recursive: true, force: true });
+    }
+  });
+
+  it('import-active still stamps import', async () => {
+    const h = fixture();
+    try {
+      const slot = document('provenance-import', 'provenance-import');
+      const plan = importActiveCodexSlot(slot, { store: h.store, keychain: h.keychain, now: () => 1 });
+      assert.equal((await attributeLiveDocument({
+        store: h.store, keychain: h.keychain,
+        slot: { accountId: plan.slotId, document: slot }, live: slot, now: () => 2,
+      })).action, 'noop');
+      const db = new DatabaseSync(join(h.home, 'qlb.db'), { readOnly: true });
+      const active = db.prepare("SELECT set_by FROM active_login WHERE provider = 'openai-codex'").get() as { set_by: string };
+      db.close();
+      assert.equal(active.set_by, 'import');
+    } finally {
+      h.store.close();
+      rmSync(h.home, { recursive: true, force: true });
+    }
+  });
+
   it('republishes the managed slot, without copying the older live document back, when the slot is newer', async () => {
     const h = fixture();
     try {
