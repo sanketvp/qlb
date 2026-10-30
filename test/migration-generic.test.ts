@@ -154,7 +154,7 @@ interface Harness {
 function setup(
   provider: SingleGrantProvider,
   kc: MockKeychain = new MockKeychain(),
-  config: Pick<MigrationConfig, 'fsyncDirectory' | 'afterStep'> = {},
+  config: Pick<MigrationConfig, 'fsyncDirectory' | 'afterStep' | 'sleepSync' | 'now'> = {},
 ): Harness & {
   mig: Migration;
 } {
@@ -1238,8 +1238,100 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     }
   });
 
-  it('a live refresh lease refuses the hand-back before S5 records a verdict', async () => {
-    const h = setup('xai');
+  it('T-I4 a live lease makes S2 wait without spending retry attempts and a released lease lets it fence', async () => {
+    const waits = 9;
+    let now = 1_000_000;
+    let sleeps = 0;
+    let outsideReads = 0;
+    const h = setup('xai', new MockKeychain(), {
+      now: () => now,
+      sleepSync: (ms) => {
+        assert.equal(ms, 100);
+        sleeps += 1;
+        now += ms;
+      },
+      afterStep: (point) => {
+        if (point === 'S2-reads') outsideReads += 1;
+      },
+    });
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      h.mig.commit();
+      const accountId = (JSON.parse(h.store.getMigration('pi-xai')!.detail_json).accounts as Array<{ id: string }>)[0].id;
+      const originalGetLease = h.store.getLease.bind(h.store);
+      h.store.getLease = (name) => name === `refresh:${accountId}` && sleeps < waits
+        ? { name, holder_pid: 1, holder_id: 'fixture-refresher', until: now + 1_000, generation: 1 }
+        : originalGetLease(name);
+
+      const rolled = h.mig.rollback();
+
+      assert.equal(rolled.state, 'NATIVE');
+      assert.equal(sleeps, waits, 'the live lease is waited out');
+      assert.equal(outsideReads, waits + 1, 'every wait re-runs outside reads without consuming a RETRY attempt');
+      assert.equal(h.store.getGrantGeneration(accountId), 1, 'S2 fences after the lease is released');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('T-I4 cap: a lease live past 30 s refuses refresh-in-progress with exit code 3 and keeps only the intent', async () => {
+    let now = 2_000_000;
+    let sleeps = 0;
+    let outsideReads = 0;
+    const h = setup('xai', new MockKeychain(), {
+      now: () => now,
+      sleepSync: (ms) => {
+        assert.equal(ms, 100);
+        sleeps += 1;
+        now += ms;
+      },
+      afterStep: (point) => {
+        if (point === 'S2-reads') outsideReads += 1;
+      },
+    });
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      h.mig.commit();
+      const accountId = (JSON.parse(h.store.getMigration('pi-xai')!.detail_json).accounts as Array<{ id: string }>)[0].id;
+      const generationBefore = h.store.getGrantGeneration(accountId);
+      const keychainPresentBefore = keychainHas(h.kc, 'xai');
+      const originalGetLease = h.store.getLease.bind(h.store);
+      h.store.getLease = (name) => name === `refresh:${accountId}`
+        ? { name, holder_pid: 1, holder_id: 'fixture-refresher', until: now + 1_000, generation: 1 }
+        : originalGetLease(name);
+
+      assert.throws(
+        () => h.mig.rollback(),
+        (error: Error & { exitCode?: unknown }) => {
+          assert.match(error.message, /refresh-in-progress/);
+          assert.equal(error.exitCode, 3);
+          return true;
+        },
+      );
+      const refused = JSON.parse(h.store.getMigration('pi-xai')!.detail_json) as Record<string, unknown>;
+      assert.equal(sleeps, 300, 'the wait cap is 30 seconds at 100 ms intervals');
+      assert.equal(outsideReads, 301, 'the last live-lease check also re-runs outside reads');
+      assert.equal(refused.intent, 'rollback', 'the rollback intent stays durable');
+      assert.equal(refused.rollbackDecision, undefined, 'S2 records no decision after the wait cap');
+      assert.equal(h.store.getGrantGeneration(accountId), generationBefore, 'S2 does not fence under a live lease');
+      assert.equal(keychainHas(h.kc, 'xai'), keychainPresentBefore, 'the Keychain copy is unchanged');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('T-I5 a refresher whose lease expired before the fence is fenced at its write', async () => {
+    let now = 3_000_000;
+    let sleeps = 0;
+    const h = setup('xai', new MockKeychain(), {
+      now: () => now,
+      sleepSync: () => { sleeps += 1; },
+      afterStep: (point) => {
+        if (point === 'S2') throw new Error('fixture crash after S2');
+      },
+    });
     try {
       h.mig.stage();
       await h.mig.rehearse(mockRehearse([]));
@@ -1247,56 +1339,20 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       const accountId = (JSON.parse(h.store.getMigration('pi-xai')!.detail_json).accounts as Array<{ id: string }>)[0].id;
       const originalGetLease = h.store.getLease.bind(h.store);
       h.store.getLease = (name) => name === `refresh:${accountId}`
-        ? { name, holder_pid: 1, holder_id: 'fixture-refresher', until: Date.now() + 60_000, generation: 1 }
+        ? { name, holder_pid: 1, holder_id: 'fixture-refresher', until: now, generation: 0 }
         : originalGetLease(name);
 
-      assert.throws(() => h.mig.rollback(), /refresh-in-progress/);
-      const refused = JSON.parse(h.store.getMigration('pi-xai')!.detail_json) as Record<string, unknown>;
-      assert.equal(refused.handback, undefined, 'no verdict is recorded against an in-flight refresh');
-      assert.equal(refused.intent, 'rollback', 'the rollback intent stays durable');
-      assert.equal(keychainHas(h.kc, 'xai'), true);
-
-      h.store.getLease = originalGetLease;
-      const settled = createSingleGrantMigration(h.store, h.kc, 'xai', h.authPath, h.ownerPath).resume();
-      assert.equal(settled.state, 'NATIVE', 'resume completes once the lease is gone');
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  it('a refresh lease live during S2 refuses before the fence and leaves the generation unchanged', async () => {
-    const h = setup('xai');
-    try {
-      h.mig.stage();
-      await h.mig.rehearse(mockRehearse([]));
-      h.mig.commit();
-      const accountId = (JSON.parse(h.store.getMigration('pi-xai')!.detail_json).accounts as Array<{ id: string }>)[0].id;
-      const service = qlbKeychainService('xai', accountId);
-      const account = expectedLabel('xai');
-      let leaseLive = false;
-      const originalGetLease = h.store.getLease.bind(h.store);
-      const originalGetSync = h.kc.getSync.bind(h.kc);
-      h.store.getLease = (name) => leaseLive && name === `refresh:${accountId}`
-        ? { name, holder_pid: 1, holder_id: 'fixture-refresher', until: Date.now() + 60_000, generation: 1 }
-        : originalGetLease(name);
-      h.kc.getSync = (readService, readAccount) => {
-        const raw = originalGetSync(readService, readAccount);
-        if (!leaseLive && readService === service && readAccount === account) leaseLive = true;
-        return raw;
+      assert.throws(() => h.mig.rollback(), /fixture crash after S2/);
+      assert.equal(sleeps, 0, 'an expired lease is not waited for');
+      assert.equal(h.store.getGrantGeneration(accountId), 1, 'S2 fences despite the expired lease');
+      let refresherWrote = false;
+      const writeAtOldGeneration = (): number => {
+        if (h.store.casGrantGeneration(accountId, 0, 1) !== 1) return 0;
+        refresherWrote = true;
+        return 1;
       };
-
-      assert.throws(() => h.mig.rollback(), /refresh-in-progress/);
-      const refused = JSON.parse(h.store.getMigration('pi-xai')!.detail_json) as Record<string, unknown>;
-      assert.equal(refused.handback, undefined, 'no hand-back marker is recorded after the post-read refusal');
-      assert.equal(refused.intent, 'rollback', 'the rollback intent stays durable');
-      assert.equal(refused.rollbackDecision, undefined, 'S2 records no decision under a live lease');
-      assert.equal(h.store.getGrantGeneration(accountId), 0, 'S2 does not fence under a live lease');
-      assert.equal(keychainHas(h.kc, 'xai'), true, 'the Keychain copy remains present');
-
-      h.store.getLease = originalGetLease;
-      h.kc.getSync = originalGetSync;
-      const settled = h.mig.resume();
-      assert.equal(settled.state, 'NATIVE', 'resume completes once the lease is gone');
+      assert.equal(writeAtOldGeneration(), 0, 'the refresher\'s stale generation CAS is refused');
+      assert.equal(refresherWrote, false, 'the refused stale CAS prevents the refresher write');
     } finally {
       h.cleanup();
     }
