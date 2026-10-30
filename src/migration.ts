@@ -129,7 +129,7 @@ import { legacyPiAuthBackupPath, piAuthBackupPath, readPiAuthBackup, removePiAut
 import { canonicalDigest, fencedGeneration, handbackVerdict, keychainDigest, NoSingleGrantRestoreSourceError, rankSingleGrantSource, restoreRecordFor } from './pi-handback-source';
 import type { RollbackDecision } from './single-grant-ownership';
 import { parseGrant } from './refresh-lease';
-import { hasLegacyPiOwnerEntry, PiOwnerLegacyError, readPiOwnerProviders, withPiAuthLock, writePiOwnerEntry } from './pi-migrate';
+import { hasLegacyPiOwnerEntry, isPiPlaceholder, PiOwnerLegacyError, readPiOwnerProviders, withPiAuthLock, writePiOwnerEntry } from './pi-migrate';
 import { OPENROUTER_GATE_KEYCHAIN_SERVICE } from './token/openrouter';
 import { refreshLeaseName, type Store } from './store';
 import type { Grant } from './types';
@@ -1912,6 +1912,11 @@ export class Migration {
         const journalAccount = this.singleGrantJournalAccount();
         const authKey = this.singleGrantAuthKey();
         this.decideAndFenceSingleGrantRollback(journalAccount, authKey);
+        // S3 under the auth lock that rollback()/resume() hold. Guard (a): a
+        // valid native entry (a newer login, or Pi's rotation) is kept and
+        // nothing is written. Main writes nothing here for any other A
+        // either; rows 35–37 add guards (b)–(d) and the materialising write.
+        this.singleGrantNativeEntryWins(authKey);
         // Validate and check for a live refresh before un-owning, so a refusal
         // leaves the claim intact.
         this.refuseDuringRefresh(journalAccount.id);
@@ -2119,6 +2124,34 @@ export class Migration {
   private holdingPiAuthLock<T>(refresh: () => void, fn: () => T): T {
     this.piAuthLockRefresh = refresh;
     try { return fn(); } finally { this.piAuthLockRefresh = undefined; }
+  }
+
+  /** S3 guard (a): true when Pi's entry `A` is valid (§5.1). Invalid or unreadable `A` belongs to rows 35–37. */
+  private singleGrantNativeEntryWins(authKey: string): boolean {
+    try {
+      const auth = this.readSingleGrantAuth();
+      return Object.prototype.hasOwnProperty.call(auth, authKey)
+        && this.isValidSingleGrantRestoreEntry(auth[authKey], true);
+    } catch {
+      return false;
+    }
+  }
+
+  private isValidSingleGrantRestoreEntry(entry: unknown, entryPresent: boolean): boolean {
+    if (!entryPresent) return true;
+    return isObjectRecord(entry)
+      && !isPiPlaceholder(entry)
+      && typeof entry.refresh === 'string'
+      && entry.refresh.length > 0;
+  }
+
+  private readSingleGrantAuth(): Record<string, unknown> {
+    // A directory at auth.json is treated as an unwritable absent file so a
+    // later restore (row 37) fails before ownership can be released.
+    if (!existsSync(this.poolFilePath) || !statSync(this.poolFilePath).isFile()) return {};
+    const parsed: unknown = JSON.parse(readFileSync(this.poolFilePath, 'utf8'));
+    if (!isObjectRecord(parsed)) throw new Error('auth.json is not a JSON object');
+    return parsed;
   }
 
   /** Pi's entry for a Keychain grant, keeping the backup entry's other fields (design §2 S3). */
