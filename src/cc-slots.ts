@@ -19,7 +19,7 @@ import { withClaudeSwitchLock } from './cc-locks';
 import { recordRelogin } from './relogin';
 import { isCredentialNotFound } from './credential-backends';
 import { KeychainReadBackoff, platformKeychain, qlbKeychainService, QLB_KEYCHAIN_ACCOUNT } from './keychain';
-import { listStashes, recordStash, removeStash, updateStash, type UnclaimedIndexEntry, type UnclaimedIndexWriteOptions } from './unclaimed-index';
+import { isCodexEmergencyStashId, listStashes, recordStash, removeStash, updateStash, type UnclaimedIndexEntry, type UnclaimedIndexWriteOptions } from './unclaimed-index';
 
 const DISPLAY_CACHE_TTL_MS = 60_000;
 const ANTHROPIC_PROVIDER = 'anthropic';
@@ -1220,17 +1220,33 @@ export class ClaudeSlots {
       throw new Error('unclaimed credential unavailable');
     }
     for (const entry of indexed) entries.set(entry.stashId, entry);
-    // Only a row-less fallback file is legacy and potentially belongs to any
-    // account. A row for another account must never make that account read it.
+    // Only a row-less fallback file that is neither Codex-indexed nor a Codex
+    // emergency body is legacy and potentially belongs to any account. A row
+    // for another account must never make that account read it.
     let names: string[] = [];
     try { names = await this.files.readdir(this.options.stashDir); } catch (error) {
       if (!missingFile(error)) throw new Error('unclaimed credential unavailable');
     }
+    const legacyCandidates: string[] = [];
     for (const name of names) {
       if (!name.endsWith('.json')) continue;
       const stashId = name.slice(0, -'.json'.length);
       try { this.assertExistingTimestamp(stashId); } catch { continue; }
-      if (!entries.has(stashId)) {
+      if (!entries.has(stashId) && !isCodexEmergencyStashId(stashId)) legacyCandidates.push(stashId);
+    }
+    let codexStashIds = new Set<string>();
+    if (legacyCandidates.length > 0) {
+      try {
+        // Only a Codex row that points at a file here claims that file.
+        codexStashIds = new Set((await listStashes(this.indexRoot(), 'openai-codex'))
+          .filter((entry) => entry.location === 'file')
+          .map((entry) => entry.stashId));
+      } catch {
+        throw new Error('unclaimed credential unavailable');
+      }
+    }
+    for (const stashId of legacyCandidates) {
+      if (!codexStashIds.has(stashId)) {
         entries.set(stashId, {
           provider: ANTHROPIC_PROVIDER, accountId: null, stashId, consumedFp: '', location: 'file', createdAt: 0,
         });
