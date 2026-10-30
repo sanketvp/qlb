@@ -1152,6 +1152,70 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     }
   });
 
+  it('a live refresh lease refuses the hand-back before S5 records a verdict', async () => {
+    const h = setup('xai');
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      h.mig.commit();
+      const accountId = (JSON.parse(h.store.getMigration('pi-xai')!.detail_json).accounts as Array<{ id: string }>)[0].id;
+      const originalGetLease = h.store.getLease.bind(h.store);
+      h.store.getLease = (name) => name === `refresh:${accountId}`
+        ? { name, holder_pid: 1, holder_id: 'fixture-refresher', until: Date.now() + 60_000, generation: 1 }
+        : originalGetLease(name);
+
+      assert.throws(() => h.mig.rollback(), /refresh-in-progress/);
+      const refused = JSON.parse(h.store.getMigration('pi-xai')!.detail_json) as Record<string, unknown>;
+      assert.equal(refused.handback, undefined, 'no verdict is recorded against an in-flight refresh');
+      assert.equal(refused.intent, 'rollback', 'the rollback intent stays durable');
+      assert.equal(keychainHas(h.kc, 'xai'), true);
+
+      h.store.getLease = originalGetLease;
+      const settled = createSingleGrantMigration(h.store, h.kc, 'xai', h.authPath, h.ownerPath).resume();
+      assert.equal(settled.state, 'NATIVE', 'resume completes once the lease is gone');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('the owner claim is unlinked durably before S5 records the hand-back', async () => {
+    const synced: string[] = [];
+    const h = setup('xai', new MockKeychain(), { fsyncDirectory: (path) => { synced.push(path); } });
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      h.mig.commit();
+      let syncedBeforeMarker = false;
+      const originalUpsertMigration = h.store.upsertMigration.bind(h.store);
+      h.store.upsertMigration = (store, state, detail) => {
+        if (JSON.parse(detail ?? '{}').handback) syncedBeforeMarker ||= synced.includes(dirname(h.ownerPath));
+        return originalUpsertMigration(store, state, detail);
+      };
+
+      h.mig.rollback();
+      assert.equal(syncedBeforeMarker, true, 'the owner directory is fsynced before the S5 write');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a bad journal account refuses the hand-back with the owner claim intact', async () => {
+    const h = setup('xai');
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      h.mig.commit();
+      const row = h.store.getMigration('pi-xai')!;
+      const detail = JSON.parse(row.detail_json) as Record<string, unknown>;
+      h.store.upsertMigration('pi-xai', row.state, JSON.stringify({ ...detail, accounts: [] }));
+
+      assert.throws(() => h.mig.rollback(), /no valid journal account coordinates/);
+      assert.equal(existsSync(h.ownerPath), true, 'the claim is not dropped before validation');
+    } finally {
+      h.cleanup();
+    }
+  });
+
   it('T-S5s status reports cleanup-pending, shows a null fence as not fenced, and writes nothing', () => {
     const h = setup('xai');
     try {

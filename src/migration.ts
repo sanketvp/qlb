@@ -130,7 +130,7 @@ import { handbackVerdict } from './pi-handback-source';
 import { parseGrant } from './refresh-lease';
 import { hasLegacyPiOwnerEntry, PiOwnerLegacyError, readPiOwnerProviders, withPiAuthLock, writePiOwnerEntry } from './pi-migrate';
 import { OPENROUTER_GATE_KEYCHAIN_SERVICE } from './token/openrouter';
-import type { Store } from './store';
+import { refreshLeaseName, type Store } from './store';
 import type { Grant } from './types';
 
 export const DEFAULT_POOL_FILE = config.anthropicPoolPath;
@@ -1150,7 +1150,7 @@ export class Migration {
       resumeAction = staticKey
         ? 'continue rollback to VALIDATED (owner unlinked; native Keychain was never moved)'
         : retains
-          ? 'continue rollback to VALIDATED (owner unlinked; auth.json was never moved)'
+          ? 'continue rollback to NATIVE (owner unlinked; auth.json was never moved)'
           : 'continue rollback to VALIDATED (native restored, owner unlinked)';
     } else if (ownerPresent && STATE_RANK[state] < STATE_RANK.QLB_OWNED) {
       resumeAction = staticKey
@@ -1891,11 +1891,16 @@ export class Migration {
         const legacy = this.legacySidecarPath();
         if (legacy) unlinkIfExists(legacy);
       } else {
+        // Validate before un-owning, so a bad journal row refuses with the claim intact.
+        const journalAccount = this.singleGrantJournalAccount();
         unlinkIfExists(this.ownerFilePath);
+        // The un-own must survive power loss before S5 records the hand-back:
+        // resume after S5 never revisits the owner claim.
+        this.fsyncDirectory(dirname(this.ownerFilePath));
         // rollback()/resume() already hold Pi's auth.json lock for the whole
         // single-grant path. S5 therefore reads A under that existing lock;
         // withPiAuthLock is not re-entrant.
-        return this.recordSingleGrantHandbackAndCleanup();
+        return this.recordSingleGrantHandbackAndCleanup(journalAccount);
       }
       unlinkIfExists(this.stagingPath());
       return this.finishRollbackJournal();
@@ -1921,18 +1926,7 @@ export class Migration {
     return this.finishRollbackJournal();
   }
 
-  /** S5, followed by the existing C3 path (S6 → S7). Caller holds Pi's auth lock. */
-  private recordSingleGrantHandbackAndCleanup(): MigrationStatus {
-    const authKey = this.singleGrantAuthKey();
-    let piEntry: unknown = null;
-    try {
-      const parsed: unknown = JSON.parse(readFileSync(this.poolFilePath, 'utf8'));
-      if (isObjectRecord(parsed)) piEntry = parsed[authKey];
-    } catch {
-      // An unreadable or malformed Pi entry is invalid for the S5 verdict.
-      piEntry = null;
-    }
-
+  private singleGrantJournalAccount(): { provider: string; id: string; label: string } {
     const detail = parseDetail(this.store.getMigration(this.storeName)?.detail_json);
     const journalAccount = Array.isArray(detail.accounts) ? detail.accounts[0] : undefined;
     if (
@@ -1944,6 +1938,23 @@ export class Migration {
     ) {
       throw new Error('single-grant hand-back has no valid journal account coordinates');
     }
+    return { provider: journalAccount.provider, id: journalAccount.id, label: journalAccount.label };
+  }
+
+  /** S5, followed by the existing C3 path (S6 → S7). Caller holds Pi's auth lock. */
+  private recordSingleGrantHandbackAndCleanup(
+    journalAccount: { provider: string; id: string; label: string },
+  ): MigrationStatus {
+    const authKey = this.singleGrantAuthKey();
+    let piEntry: unknown = null;
+    try {
+      const parsed: unknown = JSON.parse(readFileSync(this.poolFilePath, 'utf8'));
+      if (isObjectRecord(parsed)) piEntry = parsed[authKey];
+    } catch {
+      // An unreadable or malformed Pi entry is invalid for the S5 verdict.
+      piEntry = null;
+    }
+
     const coords = keychainCoords(journalAccount.provider, journalAccount.id, journalAccount.label);
     let kmRead: unknown = null;
     try {
@@ -1958,9 +1969,14 @@ export class Migration {
       if (!isCredentialNotFound(error)) {
         // The pre-existing rollback intent remains durable because S5 has not
         // written its terminal row yet.
-        throw new Error('keychain-unavailable');
+        throw new Error('keychain-unavailable', { cause: error });
       }
     }
+
+    // Until S2's fence (row 28), a refresh that is mid-flight could rotate K_m
+    // after this verdict; refuse rather than record a delete against it.
+    const lease = this.store.getLease(refreshLeaseName(journalAccount.id));
+    if (lease && lease.until > Date.now()) throw new Error('refresh-in-progress');
 
     const verdict = handbackVerdict(kmRead, piEntry);
     const handback = {
