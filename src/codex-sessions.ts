@@ -3,6 +3,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { basename } from 'node:path';
 import { promisify } from 'node:util';
 import { codexIdentityKey, type CodexIdentity } from './codex-auth';
+import { readCodexSwitchJournal } from './codex-switch';
 
 const execFileAsync = promisify(execFile);
 
@@ -21,7 +22,8 @@ export type CodexSwitchOutcome =
   | 'failed'
   | 'refused'
   | 'noop'
-  | 'reverted-by-codex';
+  | 'reverted-by-codex'
+  | 'in-flight';
 
 export interface CodexSwitchLogRow {
   /** Must be `openai-codex`; callers must not pass shared-log rows from another provider. */
@@ -40,6 +42,9 @@ export interface CodexSwitchLogRow {
   detail?: string | null;
   published_at?: number | null;
   steps_json?: string | null;
+  open_sessions_json?: string | null;
+  /** Every account fenced by an unresolved or malformed recovery record. */
+  involved?: string[];
 }
 
 export interface HolderEra {
@@ -79,28 +84,153 @@ export function codexIdentityParts(slotId: string): CodexIdentity {
   };
 }
 
+interface CodexRecoveryFence {
+  v: 1;
+  switchId: number;
+  attempt: string;
+  from: string;
+  to: string;
+  publishedAt: number;
+  reason: string;
+  involvedAccounts: string[] | '*';
+  since: number;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function nonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0;
+}
+
+/** Recovery fences are deliberately an exact, credential-free config shape. */
+function parseCodexRecoveryFence(value: string | null): CodexRecoveryFence | null {
+  if (value === null) return null;
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (!isRecord(parsed)
+      || Object.keys(parsed).length !== 9
+      || !['v', 'switchId', 'attempt', 'from', 'to', 'publishedAt', 'reason', 'involvedAccounts', 'since']
+        .every((key) => Object.hasOwn(parsed, key))
+      || parsed.v !== 1
+      || !Number.isSafeInteger(parsed.switchId)
+      || !nonEmptyString(parsed.attempt)
+      || !nonEmptyString(parsed.from)
+      || !nonEmptyString(parsed.to)
+      || typeof parsed.publishedAt !== 'number' || !Number.isFinite(parsed.publishedAt)
+      || !nonEmptyString(parsed.reason)
+      || typeof parsed.since !== 'number' || !Number.isFinite(parsed.since)
+      || (parsed.involvedAccounts !== '*' && (!Array.isArray(parsed.involvedAccounts)
+        || !parsed.involvedAccounts.every(nonEmptyString)))) return null;
+    return {
+      v: 1, switchId: parsed.switchId as number, attempt: parsed.attempt, from: parsed.from, to: parsed.to,
+      publishedAt: parsed.publishedAt, reason: parsed.reason,
+      involvedAccounts: parsed.involvedAccounts === '*' ? '*' : [...parsed.involvedAccounts],
+      since: parsed.since,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function attemptFromSteps(stepsJson: string | null | undefined): string | null {
+  if (stepsJson === null || stepsJson === undefined) return null;
+  try {
+    const parsed: unknown = JSON.parse(stepsJson);
+    return isRecord(parsed) && nonEmptyString(parsed.attempt) ? parsed.attempt : null;
+  } catch {
+    return null;
+  }
+}
+
+function expandInvolvedAccounts(accounts: string[] | '*', slots: readonly string[]): string[] {
+  return accounts === '*' ? [...slots] : [...new Set(accounts)];
+}
+
+function syntheticRowId(rows: readonly CodexSwitchLogRow[]): number {
+  const used = new Set(rows.map((row) => row.id));
+  let id = 0;
+  while (used.has(id)) id -= 1;
+  return id;
+}
+
 /** Reads the credential-free Codex switch history without taking a write lock. */
-export function readCodexSwitchHistory(dbPath: string): CodexSwitchHistory {
+export function readCodexSwitchHistory(
+  dbPath: string,
+  options: { journalDir?: string } = {},
+): CodexSwitchHistory {
   const db = new DatabaseSync(dbPath, { readOnly: true });
   try {
     db.exec('PRAGMA busy_timeout = 5000');
+    const rows: CodexSwitchLogRow[] = db.prepare(`SELECT id, provider, from_account, to_account, outcome, detail, published_at, steps_json, open_sessions_json, ts
+      FROM switch_log WHERE provider = 'openai-codex' ORDER BY published_at, ts, id`).all()
+      .map((row) => {
+        const r = row as Record<string, unknown>;
+        const publishedAt = typeof r.published_at === 'number' ? r.published_at : null;
+        return {
+          id: Number(r.id), provider: String(r.provider),
+          fromAccountId: typeof r.from_account === 'string' ? r.from_account : null,
+          toAccountId: String(r.to_account), outcome: r.outcome as CodexSwitchLogRow['outcome'],
+          publishedAt,
+          attemptedAt: typeof r.ts === 'number' ? r.ts : null,
+          detail: typeof r.detail === 'string' ? r.detail : null,
+          published_at: publishedAt,
+          steps_json: typeof r.steps_json === 'string' ? r.steps_json : null,
+          open_sessions_json: typeof r.open_sessions_json === 'string' ? r.open_sessions_json : null,
+        } satisfies CodexSwitchLogRow;
+      });
+    const slots = db.prepare('SELECT account_id FROM codex_slots ORDER BY account_id').all()
+      .map((row) => String((row as { account_id: unknown }).account_id));
+    const config = db.prepare("SELECT value FROM config WHERE key = 'codex.recoveryFence'").get() as { value?: unknown } | undefined;
+    const fenceValue = config?.value;
+    const recoveryFence = typeof fenceValue === 'string' ? parseCodexRecoveryFence(fenceValue) : null;
+    // Any stored value that is not the exact fence shape (a non-string or NULL included) fails
+    // closed. Clearing a fence deletes the row, so only an absent row means no fence.
+    const malformedFence = config !== undefined && recoveryFence === null;
+    const journal = readCodexSwitchJournal({ journalDir: options.journalDir });
+    // A journal that exists but cannot be parsed is never treated as absent.
+    const malformedJournal = journal.state === 'malformed';
+    const journalNeedsRow = journal.state === 'ok'
+      && !rows.some((row) => attemptFromSteps(row.steps_json) === journal.journal.attemptId);
+
+    // A journal always involves its own endpoints, even when its unresolved set is '*' or omits one.
+    const journalInvolved = journalNeedsRow
+      ? [...new Set([journal.journal.from, journal.journal.to,
+        ...expandInvolvedAccounts(journal.journal.unresolved?.involvedAccounts ?? [], slots)])]
+      : [];
+    const fenceInvolved = recoveryFence === null ? []
+      : [recoveryFence.from, recoveryFence.to, ...expandInvolvedAccounts(recoveryFence.involvedAccounts, slots)];
+    let synthetic: Omit<CodexSwitchLogRow, 'id'> | undefined;
+    if (malformedFence || malformedJournal) {
+      // A malformed durable fence or journal is conservatively active from the
+      // epoch: its missing switch metadata cannot justify excluding any slot.
+      synthetic = {
+        provider: 'openai-codex', fromAccountId: null, toAccountId: slots[0] ?? '',
+        outcome: 'in-flight', publishedAt: 0, attemptedAt: 0,
+        // '*' never drops an account that a still-valid fence or journal names.
+        open_sessions_json: '[]', involved: [...new Set([...slots, ...fenceInvolved, ...journalInvolved])],
+      };
+    } else if (recoveryFence !== null) {
+      const source = rows.find((row) => row.id === recoveryFence.switchId);
+      synthetic = {
+        provider: 'openai-codex', fromAccountId: recoveryFence.from, toAccountId: recoveryFence.to,
+        outcome: 'in-flight', publishedAt: recoveryFence.publishedAt, attemptedAt: recoveryFence.publishedAt,
+        open_sessions_json: source?.open_sessions_json ?? '[]',
+        // Involved sets are only ever unioned, never shrunk: keep an uncommitted journal's accounts too.
+        involved: [...new Set([...fenceInvolved, ...journalInvolved])],
+      };
+    } else if (journalNeedsRow) {
+      synthetic = {
+        provider: 'openai-codex', fromAccountId: journal.journal.from, toAccountId: journal.journal.to,
+        outcome: 'in-flight', publishedAt: journal.journal.publishedAt, attemptedAt: journal.journal.publishedAt,
+        open_sessions_json: JSON.stringify(journal.journal.openSessions), involved: journalInvolved,
+      };
+    }
+    if (synthetic !== undefined) rows.push({ id: syntheticRowId(rows), ...synthetic });
+
     return {
-      rows: db.prepare(`SELECT id, provider, from_account, to_account, outcome, detail, published_at, steps_json, ts
-        FROM switch_log WHERE provider = 'openai-codex' ORDER BY published_at, ts, id`).all()
-        .map((row) => {
-          const r = row as Record<string, unknown>;
-          const publishedAt = typeof r.published_at === 'number' ? r.published_at : null;
-          return {
-            id: Number(r.id), provider: String(r.provider),
-            fromAccountId: typeof r.from_account === 'string' ? r.from_account : null,
-            toAccountId: String(r.to_account), outcome: r.outcome as CodexSwitchLogRow['outcome'],
-            publishedAt,
-            attemptedAt: typeof r.ts === 'number' ? r.ts : null,
-            detail: typeof r.detail === 'string' ? r.detail : null,
-            published_at: publishedAt,
-            steps_json: typeof r.steps_json === 'string' ? r.steps_json : null,
-          };
-        }),
+      rows: rows.sort(compareRows),
       observations: db.prepare('SELECT ts, identity, lineage_fp, by FROM codex_live_observations ORDER BY ts, id').all()
         .map((row) => {
           const r = row as Record<string, unknown>;
@@ -247,12 +377,14 @@ export function holderEras(switchLogRows: readonly CodexSwitchLogRow[]): HolderE
   const live = new Map<string, number | null>();
   const first = rows[0];
   if (first.fromAccountId !== null) live.set(first.fromAccountId, null);
+  const fenced = fencedIdentities(rows);
 
   const start = (identity: string | null, startsAt: number): void => {
-    if (identity !== null && !live.has(identity)) live.set(identity, startsAt);
+    if (identity !== null && identity.length > 0 && !live.has(identity)) live.set(identity, startsAt);
   };
   const end = (identity: string | null, endsAt: number): void => {
-    if (identity === null) return;
+    // While a recovery fence stands, nothing ends an involved account's era (I12).
+    if (identity === null || fenced.has(identity)) return;
     const startsAt = live.get(identity);
     if (startsAt !== undefined || live.has(identity)) {
       eras.push({ identity, startsAt: startsAt!, endsAt });
@@ -272,6 +404,9 @@ export function holderEras(switchLogRows: readonly CodexSwitchLogRow[]): HolderE
     } else {
       start(row.fromAccountId, time);
       start(row.toAccountId, time);
+      if (row.outcome === 'in-flight') {
+        for (const accountId of row.involved ?? []) start(accountId, time);
+      }
     }
   }
 
@@ -283,6 +418,21 @@ export function holderEras(switchLogRows: readonly CodexSwitchLogRow[]): HolderE
       || (a.endsAt ?? Number.POSITIVE_INFINITY) - (b.endsAt ?? Number.POSITIVE_INFINITY)
       || a.identity.localeCompare(b.identity),
   );
+}
+
+/**
+ * Every account a standing recovery fence keeps live. Only the synthetic row
+ * from readCodexSwitchHistory carries `involved`; a stored row never does.
+ */
+function fencedIdentities(rows: readonly CodexSwitchLogRow[]): Set<string> {
+  const fenced = new Set<string>();
+  for (const row of rows) {
+    if (row.outcome !== 'in-flight' || row.involved === undefined) continue;
+    for (const identity of [row.fromAccountId, row.toAccountId, ...(row.involved ?? [])]) {
+      if (identity) fenced.add(identity);
+    }
+  }
+  return fenced;
 }
 
 function processStartedAt(process: CodexProcess): number | null {
@@ -317,6 +467,7 @@ export function holderSets(
 ): HolderSet[] {
   const switchEras: MutableHolderEra[] = holderEras(switchLogRows).map((era) => ({ ...era }));
   const rows = [...switchLogRows].sort(compareRows);
+  const fenced = fencedIdentities(rows);
 
   // `published_at`, when present, is the publish boundary; migrated v4 rows
   // use their attempted-at fallback. Intervals are half-open, so T + 1 s is
@@ -418,7 +569,7 @@ export function holderSets(
     // An era that starts within the observation's ambiguity window may instead
     // be the later switch target, so it must remain open.
     for (const era of switchEras) {
-      if (era.endsAt === null
+      if (era.endsAt === null && !fenced.has(era.identity)
         && (era.startsAt === null || era.startsAt + 1_000 < group.ts)
         && !group.identities.includes(era.identity)) {
         era.endsAt = group.ts + 1_000;
