@@ -29,6 +29,8 @@ export interface StrategyContext {
   drainFirstIds?: Set<string>;
   /** When false, peek rotation/sticky state without writing. Default true. */
   persist?: boolean;
+  /** Candidates before error/drain-first filtering; bare-id alias uniqueness is judged here. */
+  aliasSnapshots?: AccountSnapshot[];
 }
 
 function notErrored(snapshot: AccountSnapshot): boolean {
@@ -200,14 +202,18 @@ function pickFailover(
   model: string,
   store: Store | undefined,
   persist = true,
+  aliasSnapshots: AccountSnapshot[] = snapshots,
 ): StrategyPick | null {
   const eligible = snapshots.filter((s) => hasFailoverHeadroom(s, model)).sort(byAccountId);
   if (eligible.length === 0) return null;
   const provider = eligible[0].provider;
   const key = failoverConfigKey(provider);
   const currentId = store?.getConfig(key) ?? null;
+  // Alias uniqueness is judged over every candidate, not just the ones with
+  // headroom now, so a duplicated bare id never binds by transient quota.
+  const alias = currentId ? findUniqueCodexAlias(currentId, aliasSnapshots) : null;
   let snapshot = currentId
-    ? eligible.find((s) => s.accountId === currentId) ?? findUniqueCodexAlias(currentId, eligible)
+    ? eligible.find((s) => s.accountId === currentId) ?? (alias && eligible.includes(alias) ? alias : null)
     : null;
   if (!snapshot) {
     snapshot = eligible[0];
@@ -236,7 +242,7 @@ function pickWithStrategy(strategy: Strategy, ctx: StrategyContext): StrategyPic
     case 'round-robin':
       return pickRoundRobin(ctx.snapshots, ctx.model, ctx.store, ctx.persist !== false);
     case 'failover':
-      return pickFailover(ctx.snapshots, ctx.model, ctx.store, ctx.persist !== false);
+      return pickFailover(ctx.snapshots, ctx.model, ctx.store, ctx.persist !== false, ctx.aliasSnapshots);
   }
 }
 
@@ -244,7 +250,8 @@ function pickWithStrategy(strategy: Strategy, ctx: StrategyContext): StrategyPic
  * Apply drain-first (try those accounts before the rest), then the named strategy.
  * Reserved accounts must already have been removed from `ctx.snapshots`.
  */
-export function pickAccount(strategy: Strategy, ctx: StrategyContext): StrategyPick | null {
+export function pickAccount(strategy: Strategy, input: StrategyContext): StrategyPick | null {
+  const ctx = { ...input, aliasSnapshots: input.aliasSnapshots ?? input.snapshots };
   const filtered = ctx.snapshots.filter(notErrored);
   const drainIds = ctx.drainFirstIds;
   if (drainIds && drainIds.size > 0) {

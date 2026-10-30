@@ -371,6 +371,33 @@ describe('strategy: failover', () => {
     }
   });
 
+  it('failover on a bare id shared by two slots does not alias while one of them is unavailable', () => {
+    const store = openStore(':memory:');
+    try {
+      const unavailable = { ...codex('u1:X'), error: 'fixture-error' };
+      const available = codex('u2:X');
+      const sortedFirst = codex('a-user:other');
+      for (const snapshot of [unavailable, available, sortedFirst]) {
+        store.upsertAccount(snapshot.accountId, snapshot.provider, snapshot.label);
+      }
+      store.setConfig('failover:openai-codex', 'X');
+
+      const decision = resolveFromSnapshots({
+        model: 'gpt-5.4',
+        snapshots: [unavailable, available, sortedFirst],
+        strategy: 'failover',
+        store,
+      });
+
+      assert.equal(decision.ok, true);
+      if (!decision.ok) return;
+      assert.equal(decision.accountId, 'a-user:other');
+      assert.equal(store.getConfig('failover:openai-codex'), 'a-user:other');
+    } finally {
+      store.close();
+    }
+  });
+
   it('sticks to one account until it is genuinely exhausted, then switches', () => {
     const store = openStore(':memory:');
     const A = anthropic('A', { '5h': reading(90), '7d': reading(90) });

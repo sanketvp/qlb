@@ -244,6 +244,50 @@ describe('qlb resolve — Codex bare-id aliases', () => {
     }
   });
 
+  it('a bare Codex pin never aliases a slot QLB does not own', () => {
+    const store = openStore(':memory:');
+    try {
+      store.upsertOverride({ kind: 'pin', accountId: 'X', session: 'unowned-pin', until: Date.now() + 60_000 });
+
+      const decision = resolveFromSnapshots({
+        model: 'gpt-5.4',
+        session: 'unowned-pin',
+        snapshots: [codex('user:X')],
+        store,
+      });
+
+      assert.equal(decision.ok, false);
+      if (decision.ok || decision.error !== 'PINNED_UNAVAILABLE') assert.fail('expected PINNED_UNAVAILABLE');
+      assert.equal(decision.accountId, 'X');
+    } finally {
+      store.close();
+    }
+  });
+
+  it('an aliased pin whose slot is unavailable reports and records the slot id', () => {
+    const store = openStore(':memory:');
+    try {
+      const snapshot = { ...codex('user:X'), error: 'fixture-error' };
+      store.upsertAccount(snapshot.accountId, snapshot.provider, snapshot.label);
+      store.upsertOverride({ kind: 'pin', accountId: 'X', session: 'errored-pin', until: Date.now() + 60_000 });
+
+      const decision = resolveFromSnapshots({
+        model: 'gpt-5.4',
+        session: 'errored-pin',
+        snapshots: [snapshot],
+        store,
+      });
+
+      assert.equal(decision.ok, false);
+      if (decision.ok || decision.error !== 'PINNED_UNAVAILABLE') assert.fail('expected PINNED_UNAVAILABLE');
+      assert.equal(decision.accountId, 'user:X');
+      assert.match(decision.reason ?? '', /user:X is in an error state/);
+      assert.equal(store.getPinOverride('errored-pin')?.account_id, 'X');
+    } finally {
+      store.close();
+    }
+  });
+
   it('a bare Codex pin matching two slots stays unavailable', () => {
     const store = openStore(':memory:');
     try {
