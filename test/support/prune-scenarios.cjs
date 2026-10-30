@@ -112,7 +112,10 @@ function seedMetadata(store, id, createAccount = true) {
   });
   store.upsertOverride({ kind: 'exclude', accountId: id, until: Date.now() + 60_000 });
   store.claimPoll(id, `poll-${id}`, 15_000);
-  store.acquireRefreshLease(id, `lease-${id}`, process.pid, 0, 15_000);
+  // A fenced rollback (S2) moves the grant generation, so take the lease at
+  // the current one, and fail loudly if the fixture lease is not granted.
+  const leased = store.acquireRefreshLease(id, `lease-${id}`, process.pid, store.getGrantGeneration(id) ?? 0, 15_000);
+  if (leased !== 'acquired') throw new Error(`fixture refresh lease not acquired for ${id}: ${leased}`);
   store.recordDecision({
     requested_model: 'fixture-model',
     mode: 'proxy',
