@@ -252,7 +252,11 @@ export class CodexSlots {
         }
         throw new CodexStashUnverifiable();
       }
-      if (codexIdentity(stashed.document) === identity && stashed.fingerprint === fingerprint) {
+      if (
+        isUnknownLoginStashId(entry.stashId)
+        && codexIdentity(stashed.document) === identity
+        && stashed.fingerprint === fingerprint
+      ) {
         return { stashId: entry.stashId, created: false };
       }
       throw new CodexStashUnverifiable();

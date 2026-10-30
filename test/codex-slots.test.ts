@@ -573,6 +573,23 @@ describe('Codex slots and import-active', () => {
     }
   });
 
+  it('a readable successor row for this login is not reused as its unknown-login stash', async () => {
+    const h = fixture();
+    try {
+      const stashDir = join(h.home, 'stash');
+      const slots = new CodexSlots({ keychain: h.keychain, stashDir });
+      const doc = parsedDocument('readable-successor-row');
+      const fp = codexFingerprint(doc);
+      await slots.stashUnclaimedDurably('readable-successor', doc, fp, planImportActiveCodex(doc).slotId!);
+
+      await assert.rejects(slots.ensureUnclaimedStash(doc, 2), CodexStashUnverifiable);
+      assert.equal(readdirSync(join(stashDir, 'index', 'openai-codex')).length, 1, 'nothing new is written');
+    } finally {
+      h.store.close();
+      rmSync(h.home, { recursive: true, force: true });
+    }
+  });
+
   it('a bodyless successor reservation for this login is not completed as an unknown-login stash', async () => {
     const h = fixture();
     try {
