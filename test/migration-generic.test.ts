@@ -3077,7 +3077,11 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
 
       assert.equal(status.resumeAction, 'hand-back complete, cleanup pending — run `qlb migrate resume`');
       assert.deepEqual(status.detail.handback, marker, 'status keeps the durable marker fields intact');
-      assert.deepEqual(status.handback, { ...marker, fencedGeneration: 'not fenced' });
+      assert.deepEqual(status.handback, {
+        ...marker,
+        decision: 'not fenced',
+        fencedGeneration: 'not fenced',
+      });
       assert.deepEqual(h.store.getMigration('pi-xai'), rowBefore, 'status does not write the journal');
       assert.deepEqual(fileSnapshot(h.dir), filesBefore, 'status does not write files');
       assert.equal(h.kc.getSync(service, account), keychainBefore, 'status does not write Keychain');

@@ -1240,6 +1240,20 @@ function printMigrate(status: ReturnType<Migration['status']>, json: boolean): v
   console.log(`native:    ${status.nativeStore}`);
   console.log(`pi next:   ${status.piAtNextLaunch}`);
   console.log(`resume:    ${status.resumeAction}`);
+  if (status.handback) {
+    const value = (field: string): string => {
+      const current = status.handback![field];
+      return current !== null && typeof current === 'object'
+        ? JSON.stringify(current)
+        : String(current);
+    };
+    console.log(`hand-back phase: ${value('phase')}`);
+    console.log(`hand-back keychain disposition: ${value('keychainDisposition')}`);
+    console.log(`hand-back pi fingerprint: ${value('piFingerprint')}`);
+    console.log(`hand-back decision: ${value('decision')}`);
+    console.log(`hand-back fenced generation: ${value('fencedGeneration')}`);
+    console.log(`hand-back rolled back at: ${value('rolledBackAt')}`);
+  }
 }
 
 /** Refusal code shared by the Pi-ownership vs cswap-consume guards. */
