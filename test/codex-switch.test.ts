@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync, fsyncSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, fsyncSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -342,6 +342,37 @@ describe('Codex publish wrapper and post-publish classifier — C6-14', () => {
         targetSlotFp: codexFingerprint(target) }), 'ok');
     } finally {
       mutableFs.fsyncSync = originalFsync;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('a publish through a symlinked auth.json fsyncs the directory the rename landed in (C6-14 r1)', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-codex-publish-'));
+    const mutableFs = require('node:fs') as { openSync: typeof import('node:fs').openSync };
+    const originalOpen = mutableFs.openSync;
+    const opened: string[] = [];
+    try {
+      const realDir = join(root, 'real');
+      const linkDir = join(root, 'codex');
+      mkdirSync(realDir);
+      mkdirSync(linkDir);
+      writeFileSync(join(realDir, 'auth.json'), '{}\n');
+      const path = join(linkDir, 'auth.json');
+      symlinkSync(join(realDir, 'auth.json'), path);
+      const target = document('target-refresh');
+      mutableFs.openSync = ((file: Parameters<typeof originalOpen>[0], ...rest: unknown[]) => {
+        opened.push(String(file));
+        return (originalOpen as (...args: unknown[]) => number)(file, ...rest);
+      }) as typeof originalOpen;
+      const result = await publishCodexAuth(path, target);
+      mutableFs.openSync = originalOpen;
+      assert.equal(result.stage, 'published');
+      assert.equal(result.stage === 'published' ? result.dirFsyncError : 'n/a', undefined);
+      assert.ok(lstatSync(path).isSymbolicLink(), 'the symlink is written through, not replaced');
+      assert.deepEqual(JSON.parse(readFileSync(join(realDir, 'auth.json'), 'utf8')), target);
+      assert.ok(opened.includes(realpathSync(realDir)), `the rename's directory is fsynced (opened: ${opened.join(', ')})`);
+    } finally {
+      mutableFs.openSync = originalOpen;
       rmSync(root, { recursive: true, force: true });
     }
   });

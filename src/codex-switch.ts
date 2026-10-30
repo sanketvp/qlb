@@ -3,7 +3,7 @@ import { dirname, join } from 'node:path';
 import { accessExpiry, codexFingerprint, codexIdentity, writeCodexAuthAtomic, type CodexAuthDocument, type CodexAuthStableWithStatResult, type CodexIdentity } from './codex-auth';
 import { ClaudeCodeLockTimeout, type HeldProperLockfile, withProperLockfile } from './cc-locks';
 import { consumeCodexSlot, hasCodexSlotIdentity, withCodexConsumeThenSwitchLocks, type CodexConsumeOptions, type CodexConsumeResult } from './codex-consume';
-import { fsyncDirSync, atomicWriteText } from './fsutil';
+import { fsyncDirSync, atomicWriteText, publishTarget } from './fsutil';
 import { qlbHomeDir } from './home';
 import {
   codexIdentityParts,
@@ -141,7 +141,9 @@ export async function publishCodexAuth(path: string, doc: CodexAuthDocument): Pr
     return { stage: 'rename-threw', error };
   }
   try {
-    fsyncDirSync(dirname(path));
+    // The atomic write follows a final-path symlink, so the rename lands beside
+    // the resolved target; that is the directory entry to make durable.
+    fsyncDirSync(dirname(publishTarget(path)));
     return { stage: 'published', inode };
   } catch (dirFsyncError: unknown) {
     return { stage: 'published', inode, dirFsyncError };
