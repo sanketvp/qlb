@@ -522,6 +522,29 @@ describe('accounts-prune in-flight migration refusal', () => {
     assert.equal(store.getAccount('account-orphan'), null);
     store.close();
   });
+
+  it('REFUSES prune after a NATIVE hand-back that kept the Keychain copy, and allows it after a delete', () => {
+    for (const [disposition, refused] of [['keep', true], ['delete', false]] as const) {
+      const store = openTempStore();
+      seedOrphanAccount(store);
+      store.upsertMigration(
+        'pi-xai',
+        'NATIVE',
+        JSON.stringify({
+          qlbAccountIds: ['account-orphan'],
+          lastRollback: { phase: 'cleanup-pending', keychainDisposition: disposition, rolledBackFrom: 'post-commit' },
+        }),
+        Date.now(),
+      );
+      if (refused) {
+        assert.throws(() => pruneAccount(store, { accountId: 'account-orphan', confirm: true }), PruneRefusedError);
+        assert.ok(store.getAccount('account-orphan'), 'the kept Keychain copy keeps its account row');
+      } else {
+        assert.equal(pruneAccount(store, { accountId: 'account-orphan', confirm: true }).ok, true);
+      }
+      store.close();
+    }
+  });
 });
 
 describe('accounts-prune TOCTOU / two-connection', () => {

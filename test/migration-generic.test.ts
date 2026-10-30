@@ -152,7 +152,7 @@ interface Harness {
 function setup(
   provider: SingleGrantProvider,
   kc: MockKeychain = new MockKeychain(),
-  config: Pick<MigrationConfig, 'fsyncDirectory'> = {},
+  config: Pick<MigrationConfig, 'fsyncDirectory' | 'afterStep'> = {},
 ): Harness & {
   mig: Migration;
 } {
@@ -596,9 +596,9 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
         );
         assert.ok(finishedForward >= 0, `${claim}: finishHygiene completes the interrupted commit`);
         assert.ok(beganHandback > finishedForward, `${claim}: rollback starts only after the forward finish`);
-        assert.equal(rolled.state, 'VALIDATED');
+        assert.equal(rolled.state, 'NATIVE');
         assert.equal(rolled.detail.intent, undefined);
-        assert.equal(rolled.detail.rolledBackFrom, 'post-commit');
+        assert.equal((rolled.detail.lastRollback as { rolledBackFrom: unknown }).rolledBackFrom, 'post-commit');
       } finally {
         h.cleanup();
       }
@@ -899,7 +899,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       };
       const rolled = mig.rollback();
       assert.ok(states.includes('QLB_OWNED'), 'the Oc claim with own evidence is finished forward');
-      assert.equal(rolled.detail.rolledBackFrom, 'post-commit');
+      assert.equal((rolled.detail.lastRollback as { rolledBackFrom: unknown }).rolledBackFrom, 'post-commit');
       assert.equal(existsSync(customPath), false, 'the hand-back removes the custom owner file');
     } finally {
       h.cleanup();
@@ -930,9 +930,9 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       };
       const rolled = mig.rollback();
 
-      assert.equal(states.includes('NATIVE'), false, 'rollback never takes the pre-commit path');
+      assert.equal(states.includes('NATIVE'), true, 'S5 writes the OD-7 post-commit terminal state');
       assert.equal(existsSync(customPath), false, 'the post-commit hand-back removes the custom owner file');
-      assert.equal(rolled.detail.rolledBackFrom, 'post-commit');
+      assert.equal((rolled.detail.lastRollback as { rolledBackFrom: unknown }).rolledBackFrom, 'post-commit');
     } finally {
       h.cleanup();
     }
@@ -1055,6 +1055,198 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
           c9.cleanup();
         }
       }
+    }
+  });
+
+  it('a post-commit hand-back writes the full marker shape and ends through it', async () => {
+    for (const [name, disposition] of [
+      ['matching Pi entry', 'delete'],
+      ['non-matching Pi entry', 'keep'],
+    ] as const) {
+      const h = setup('xai');
+      try {
+        h.mig.stage();
+        await h.mig.rehearse(mockRehearse([]));
+        h.mig.commit();
+        if (disposition === 'keep') {
+          const auth = JSON.parse(readFileSync(h.authPath, 'utf8')) as typeof FAKE_GRANTS;
+          auth.xai = { ...auth.xai, refresh: 'xai-refresh-nonmatching-fake' };
+          writeFileSync(h.authPath, JSON.stringify(auth, null, 2) + '\n');
+        }
+
+        let marker: Record<string, unknown> | undefined;
+        const originalUpsertMigration = h.store.upsertMigration.bind(h.store);
+        h.store.upsertMigration = (store, state, detail) => {
+          const parsed = JSON.parse(detail ?? '{}') as Record<string, unknown>;
+          if (store === 'pi-xai' && state === 'NATIVE' && parsed.handback) {
+            marker = parsed.handback as Record<string, unknown>;
+          }
+          return originalUpsertMigration(store, state, detail);
+        };
+
+        const rolled = h.mig.rollback();
+        assert.equal(rolled.state, 'NATIVE', `${name}: OD-7 terminal state`);
+        assert.ok(marker, `${name}: S5 writes its cleanup-pending marker`);
+        assert.deepEqual(Object.keys(marker!).sort(), [
+          'decision',
+          'fencedGeneration',
+          'keychainDisposition',
+          'phase',
+          'piFingerprint',
+          'rolledBackAt',
+        ]);
+        assert.equal(marker!.phase, 'cleanup-pending');
+        assert.equal(marker!.keychainDisposition, disposition);
+        assert.equal(typeof marker!.piFingerprint, 'string');
+        assert.equal(marker!.decision, null);
+        assert.equal(marker!.fencedGeneration, null);
+        assert.equal(typeof marker!.rolledBackAt, 'number');
+        const lastRollback = rolled.detail.lastRollback as Record<string, unknown>;
+        const { rolledBackFrom, cleanedAt, ...lastMarker } = lastRollback;
+        assert.deepEqual(lastMarker, marker, `${name}: S7 copies every H field verbatim`);
+        assert.equal(rolledBackFrom, 'post-commit');
+        assert.equal(typeof cleanedAt, 'number');
+        assert.equal(rolled.detail.commitGeneration, undefined, `${name}: S5 clears commitGeneration`);
+        assert.equal(rolled.detail.handback, undefined, `${name}: S7 clears the marker`);
+        assert.equal(keychainHas(h.kc, 'xai'), disposition === 'keep', `${name}: recorded disposition controls K_m`);
+      } finally {
+        h.cleanup();
+      }
+    }
+  });
+
+  it('a crash right after the S5 write resumes to the same terminal state and disposition', async () => {
+    for (const disposition of ['delete', 'keep'] as const) {
+      const h = setup('xai', new MockKeychain(), {
+        afterStep: (point) => {
+          if ((point as string) === 'S5') throw new Error('fixture crash after S5');
+        },
+      });
+      try {
+        h.mig.stage();
+        await h.mig.rehearse(mockRehearse([]));
+        h.mig.commit();
+        if (disposition === 'keep') {
+          const auth = JSON.parse(readFileSync(h.authPath, 'utf8')) as typeof FAKE_GRANTS;
+          auth.xai = { ...auth.xai, refresh: 'xai-refresh-nonmatching-fake' };
+          writeFileSync(h.authPath, JSON.stringify(auth, null, 2) + '\n');
+        }
+
+        assert.throws(() => h.mig.rollback(), /fixture crash after S5/);
+        const crashed = h.store.getMigration('pi-xai');
+        assert.equal(crashed?.state, 'NATIVE');
+        assert.equal((JSON.parse(crashed!.detail_json).handback as { keychainDisposition: unknown }).keychainDisposition, disposition);
+
+        const resumed = createSingleGrantMigration(h.store, h.kc, 'xai', h.authPath, h.ownerPath);
+        const settled = resumed.resume();
+        assert.equal(settled.state, 'NATIVE');
+        assert.equal(
+          (settled.detail.lastRollback as { keychainDisposition: unknown }).keychainDisposition,
+          disposition,
+          'resume uses the recorded S5 verdict rather than re-ranking',
+        );
+        assert.equal(keychainHas(h.kc, 'xai'), disposition === 'keep');
+      } finally {
+        h.cleanup();
+      }
+    }
+  });
+
+  it('a live refresh lease refuses the hand-back before S5 records a verdict', async () => {
+    const h = setup('xai');
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      h.mig.commit();
+      const accountId = (JSON.parse(h.store.getMigration('pi-xai')!.detail_json).accounts as Array<{ id: string }>)[0].id;
+      const originalGetLease = h.store.getLease.bind(h.store);
+      h.store.getLease = (name) => name === `refresh:${accountId}`
+        ? { name, holder_pid: 1, holder_id: 'fixture-refresher', until: Date.now() + 60_000, generation: 1 }
+        : originalGetLease(name);
+
+      assert.throws(() => h.mig.rollback(), /refresh-in-progress/);
+      const refused = JSON.parse(h.store.getMigration('pi-xai')!.detail_json) as Record<string, unknown>;
+      assert.equal(refused.handback, undefined, 'no verdict is recorded against an in-flight refresh');
+      assert.equal(refused.intent, 'rollback', 'the rollback intent stays durable');
+      assert.equal(keychainHas(h.kc, 'xai'), true);
+
+      h.store.getLease = originalGetLease;
+      const settled = createSingleGrantMigration(h.store, h.kc, 'xai', h.authPath, h.ownerPath).resume();
+      assert.equal(settled.state, 'NATIVE', 'resume completes once the lease is gone');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a refresh that commits a rotated grant during the hand-back is refused, not deleted', async () => {
+    const h = setup('xai');
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      h.mig.commit();
+      const accountId = (JSON.parse(h.store.getMigration('pi-xai')!.detail_json).accounts as Array<{ id: string }>)[0].id;
+      let leaseLive = true;
+      const originalGetLease = h.store.getLease.bind(h.store);
+      h.store.getLease = (name) => leaseLive && name === `refresh:${accountId}`
+        ? { name, holder_pid: 1, holder_id: 'fixture-refresher', until: Date.now() + 60_000, generation: 1 }
+        : originalGetLease(name);
+      // The refresher commits its rotated grant and drops its lease the moment
+      // the hand-back first reads K_m.
+      const originalGetSync = h.kc.getSync.bind(h.kc);
+      h.kc.getSync = (service, account) => {
+        const raw = originalGetSync(service, account);
+        if (leaseLive) {
+          leaseLive = false;
+          const rotated = { ...(JSON.parse(raw) as Record<string, unknown>), refresh: 'xai-refresh-rotated-fake' };
+          h.kc.setSync(service, account, JSON.stringify(rotated));
+        }
+        return raw;
+      };
+
+      assert.throws(() => h.mig.rollback(), /refresh-in-progress/);
+      assert.equal(existsSync(h.ownerPath), true, 'the refusal leaves the owner claim intact');
+      assert.equal(JSON.parse(h.store.getMigration('pi-xai')!.detail_json).handback, undefined);
+      assert.equal(keychainHas(h.kc, 'xai'), true, 'the Keychain copy is not deleted');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('the owner claim is unlinked durably before S5 records the hand-back', async () => {
+    const synced: string[] = [];
+    const h = setup('xai', new MockKeychain(), { fsyncDirectory: (path) => { synced.push(path); } });
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      h.mig.commit();
+      let syncedBeforeMarker = false;
+      const originalUpsertMigration = h.store.upsertMigration.bind(h.store);
+      h.store.upsertMigration = (store, state, detail) => {
+        if (JSON.parse(detail ?? '{}').handback) syncedBeforeMarker ||= synced.includes(dirname(h.ownerPath));
+        return originalUpsertMigration(store, state, detail);
+      };
+
+      h.mig.rollback();
+      assert.equal(syncedBeforeMarker, true, 'the owner directory is fsynced before the S5 write');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a bad journal account refuses the hand-back with the owner claim intact', async () => {
+    const h = setup('xai');
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      h.mig.commit();
+      const row = h.store.getMigration('pi-xai')!;
+      const detail = JSON.parse(row.detail_json) as Record<string, unknown>;
+      h.store.upsertMigration('pi-xai', row.state, JSON.stringify({ ...detail, accounts: [] }));
+
+      assert.throws(() => h.mig.rollback(), /no valid journal account coordinates/);
+      assert.equal(existsSync(h.ownerPath), true, 'the claim is not dropped before validation');
+    } finally {
+      h.cleanup();
     }
   });
 
@@ -1686,11 +1878,16 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     {
       const h = setup('xai');
       try {
-        h.store.upsertMigration('pi-xai', 'QLB_OWNED', JSON.stringify({ intent: 'rollback' }));
+        h.mig.stage();
+        const staged = h.store.getMigration('pi-xai')!;
+        h.store.upsertMigration('pi-xai', 'QLB_OWNED', JSON.stringify({
+          ...JSON.parse(staged.detail_json),
+          intent: 'rollback',
+        }));
 
         assert.doesNotThrow(() => h.mig.rollback(), 'intent-only C4 rollback must not demand resume');
         const afterFirst = h.store.getMigration('pi-xai');
-        assert.equal(afterFirst?.state, 'VALIDATED', 'intent-only C4 reaches the terminal journal');
+        assert.equal(afterFirst?.state, 'NATIVE', 'intent-only C4 ends through S5/S7 at the OD-7 terminal state');
         assert.equal(JSON.parse(afterFirst!.detail_json).intent, undefined, 'intent-only C4 clears intent');
 
         assert.doesNotThrow(() => h.mig.rollback(), 'a settled intent-only C4 fixture is never refused with the resume hint');
@@ -1726,7 +1923,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
         assert.equal(writes.some((write) => write.state === 'QLB_OWNED' && write.detail.intent === 'rollback'), false,
           'C4 continues directly instead of re-journaling intent');
         const afterFirst = h.store.getMigration('pi-xai');
-        assert.equal(afterFirst?.state, 'VALIDATED', 'C4 finishes through the same rollback journal path as resume');
+        assert.equal(afterFirst?.state, 'NATIVE', 'C4 finishes through S5/S7 at the OD-7 terminal state');
         assert.equal(JSON.parse(afterFirst!.detail_json).rollbackDecision, undefined, 'terminal path clears the recorded decision');
 
         assert.doesNotThrow(() => h.mig.rollback(), 'a second C4-completed rollback is a no-op, never a resume refusal');
@@ -1742,7 +1939,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       if (Array.isArray(value)) return value.map(stripTimestamps);
       if (value && typeof value === 'object') {
         return Object.fromEntries(Object.entries(value as Record<string, unknown>)
-          .filter(([key]) => key !== 'rolledBackAt' && key !== 'cleanedAt')
+          .filter(([key]) => !['rolledBackAt', 'cleanedAt', 'nativeMtime', 'poolFilePath', 'ownerFilePath', 'stagedAt'].includes(key))
           .map(([key, child]) => [key, stripTimestamps(child)]));
       }
       return value;
@@ -1757,7 +1954,12 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
             rollbackDecision: ROLLBACK_DECISION,
           }));
         } else {
-          h.store.upsertMigration('pi-xai', 'QLB_OWNED', JSON.stringify({ intent: 'rollback' }));
+          h.mig.stage();
+          const staged = h.store.getMigration('pi-xai')!;
+          h.store.upsertMigration('pi-xai', 'QLB_OWNED', JSON.stringify({
+            ...JSON.parse(staged.detail_json),
+            intent: 'rollback',
+          }));
         }
         h.mig[command]();
         return JSON.parse(h.store.getMigration('pi-xai')!.detail_json);
@@ -1827,10 +2029,15 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
             ...JSON.parse(row.detail_json),
             rollbackDecision: ROLLBACK_DECISION,
           }));
+        } else if (marker === 'intent') {
+          h.mig.stage();
+          const staged = h.store.getMigration('pi-xai')!;
+          h.store.upsertMigration('pi-xai', 'NATIVE', JSON.stringify({
+            ...JSON.parse(staged.detail_json),
+            intent: 'rollback',
+          }));
         } else {
-          h.store.upsertMigration('pi-xai', 'NATIVE', JSON.stringify(
-            marker === 'intent' ? { intent: 'rollback' } : { handback: cleanupPending },
-          ));
+          h.store.upsertMigration('pi-xai', 'NATIVE', JSON.stringify({ handback: cleanupPending }));
         }
 
         assert.doesNotThrow(() => h.mig.resume(), `${marker} routes through resume instead of refusing with a resume hint`);

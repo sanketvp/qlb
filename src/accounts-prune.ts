@@ -4,8 +4,9 @@
 // refresh:<id> lease. Never touches credentials, native stores, owner files,
 // or decisions/errors. Participants of any trusted MIRRORED / VALIDATED /
 // QLB_OWNED / RETIRED journal row are refused, including after rollback
-// (post-rollback prune is deferred). Untrusted rows and a pending recovery
-// marker refuse globally.
+// (post-rollback prune is deferred), as are participants of a NATIVE row whose
+// hand-back kept the Keychain copy or is still pending cleanup. Untrusted rows
+// and a pending recovery marker refuse globally.
 
 import {
   decodeJournalEvidence,
@@ -65,7 +66,8 @@ export type ProviderLookup = (id: string) =>
 /**
  * Decide whether `accountId` is safe to prune given the current journal.
  * First untrusted row fails closed. Then D-ID provider consistency. Then any
- * trusted non-NATIVE row that names the target protects it. VALIDATED always
+ * trusted non-NATIVE row, or NATIVE row that kept its Keychain copy, that
+ * names the target protects it. VALIDATED always
  * protects named participants (option A: no receipt/filesystem exception).
  */
 export function inspectAccountSafety(
@@ -109,7 +111,7 @@ export function inspectAccountSafety(
 
   for (const { row, ev } of decoded) {
     if (!ev.trusted) continue;
-    if (ev.state === 'NATIVE') continue;
+    if (ev.state === 'NATIVE' && !keepsHandedBackCredential(row)) continue;
     if (ev.participants.has(accountId)) {
       return {
         unsafe: true,
@@ -121,6 +123,27 @@ export function inspectAccountSafety(
     }
   }
   return { unsafe: false };
+}
+
+/**
+ * A post-commit hand-back ends at NATIVE; when it kept the Keychain copy (or its
+ * cleanup is still pending), that copy may hold the newest grant, so the
+ * account stays protected. Any disposition other than 'delete' reads as keep.
+ */
+function keepsHandedBackCredential(row: JournalRow): boolean {
+  let detail: unknown;
+  try {
+    detail = JSON.parse(row.detail_json ?? 'null');
+  } catch {
+    return false;
+  }
+  if (detail === null || typeof detail !== 'object') return false;
+  const { handback, lastRollback } = detail as { handback?: unknown; lastRollback?: unknown };
+  if (handback != null) return true;
+  if (lastRollback === null || typeof lastRollback !== 'object' || !('keychainDisposition' in lastRollback)) {
+    return false;
+  }
+  return lastRollback.keychainDisposition !== 'delete';
 }
 
 export function safetyRefusalMessage(
