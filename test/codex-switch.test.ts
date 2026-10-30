@@ -98,6 +98,31 @@ describe('Codex switch preflight and preconditions', () => {
     }
   });
 
+  it('a failed refusal write is not recorded as a process-table failure', () => {
+    const h = fixture();
+    try {
+      insertSlot(h.db, 'target:account');
+      const store = Object.create(h.store) as typeof h.store;
+      let writes = 0;
+      store.recordSwitch = (input) => {
+        writes += 1;
+        if (writes === 1) throw new Error('fixture store write failed');
+        return h.store.recordSwitch(input);
+      };
+      assert.throws(
+        () => checkCodexSwitchPreconditions(h.deps({ store, cswapProcesses: () => [{ pid: 1 }] }), {
+          target: 'target:account', trigger: 'manual',
+        }),
+        /fixture store write failed/,
+      );
+      assert.equal(writes, 1, 'no second refusal row is attempted');
+      assert.equal(switchRows(h.db).length, 0);
+    } finally {
+      h.store.close();
+      rmSync(h.root, { recursive: true, force: true });
+    }
+  });
+
   it('an automatic trigger without codex.l13VerifiedAt is refused codex-l13-unverified', () => {
     const h = fixture();
     try {

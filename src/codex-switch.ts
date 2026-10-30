@@ -73,12 +73,14 @@ export function checkCodexSwitchPreconditions(
     return { kind: 'refused', reason };
   };
 
+  let cswapAlive: boolean;
   try {
-    if (deps.cswapProcesses().length > 0) return refuse('cswap-process-alive');
+    cswapAlive = deps.cswapProcesses().length > 0;
   } catch {
     // S24 treats CswapProcessCheckError and every other inspection failure alike.
     return refuse('cswap-process-check-failed');
   }
+  if (cswapAlive) return refuse('cswap-process-alive');
 
   const target = deps.store.getCodexSlot(input.target);
   if (target === null) return refuse('target-missing');
