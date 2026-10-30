@@ -347,8 +347,10 @@ export async function probeCodexSwitchJournal<T = undefined>(options: CodexSwitc
   const initial = readCodexSwitchJournal(options);
   if (initial.state !== 'ok') return initial;
   if (await journalInProgress(initial.journal, options)) return { state: 'in-progress', journal: initial.journal };
+  let acquired = false;
   try {
     return await withCodexSwitchJournalOwner<CodexSwitchJournalProbe<T>>(options, async (held) => {
+      acquired = true;
       const reread = readCodexSwitchJournal(options);
       if (reread.state !== 'ok') return reread;
       // A successor may have replaced the journal while we waited for the owner lock.
@@ -356,7 +358,12 @@ export async function probeCodexSwitchJournal<T = undefined>(options: CodexSwitc
       return { state: 'orphaned', journal: reread.journal, result: await onOrphaned?.({ journal: reread.journal, held }) };
     });
   } catch (error) {
-    if (error instanceof ClaudeCodeLockTimeout) return { state: 'owner-lock-not-yet-stale', journal: initial.journal, retryAt: ownerLockRetryAt(options) };
-    throw error;
+    // Only a timeout acquiring the owner lock is translated; onOrphaned's own errors propagate.
+    if (acquired || !(error instanceof ClaudeCodeLockTimeout)) throw error;
+    // A successor may hold the lock past our timeout: a live active owner wins at any lock age.
+    const latest = readCodexSwitchJournal(options);
+    if (latest.state !== 'ok') return latest;
+    if (await journalInProgress(latest.journal, options)) return { state: 'in-progress', journal: latest.journal };
+    return { state: 'owner-lock-not-yet-stale', journal: latest.journal, retryAt: ownerLockRetryAt(options) };
   }
 }

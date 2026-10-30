@@ -23,6 +23,7 @@ import {
   withCodexSwitchJournalOwner,
   writeCodexSwitchJournal,
 } from '../src/codex-switch';
+import { ClaudeCodeLockTimeout } from '../src/cc-locks';
 import { openStore } from '../src/store';
 
 function fixture() {
@@ -270,6 +271,31 @@ describe('Codex switch journal v2', () => {
         writeCodexSwitchJournal(journalFixture(h.root, { attemptId: 'attempt-2', owner: { pid: 4242, lstart: 'successor', state: 'active' } }), options);
       });
       const result = await probe!;
+      assert.equal(result.state, 'in-progress');
+      assert.equal(result.state === 'in-progress' ? result.journal.attemptId : undefined, 'attempt-2');
+    } finally { executingCodexAttempts.clear(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('a lock timeout thrown inside onOrphaned propagates instead of reading as owner-lock-not-yet-stale', async () => {
+    const h = journalHarness();
+    try {
+      writeCodexSwitchJournal(journalFixture(h.root), h.options);
+      await assert.rejects(probeCodexSwitchJournal(h.options, () => releaseCodexSwitchJournal('attempt-1', h.options)),
+        (error: unknown) => error instanceof ClaudeCodeLockTimeout);
+    } finally { executingCodexAttempts.clear(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('a live successor holding the owner lock past the probe timeout is in progress', async () => {
+    const h = journalHarness();
+    try {
+      writeCodexSwitchJournal(journalFixture(h.root), h.options);
+      const options = { ...h.options, ownerLockTimeoutMs: 5_000, sameProcess: async (owner: { pid: number }) => owner.pid === 4242 };
+      const result = await withCodexSwitchJournalOwner(options, async () => {
+        // The probe's first read sees the dead owner; the successor then writes and keeps the lock.
+        const probe = probeCodexSwitchJournal({ ...options, ownerLockTimeoutMs: 20 });
+        writeCodexSwitchJournal(journalFixture(h.root, { attemptId: 'attempt-2', owner: { pid: 4242, lstart: 'successor', state: 'active' } }), options);
+        return probe;
+      });
       assert.equal(result.state, 'in-progress');
       assert.equal(result.state === 'in-progress' ? result.journal.attemptId : undefined, 'attempt-2');
     } finally { executingCodexAttempts.clear(); rmSync(h.root, { recursive: true, force: true }); }
