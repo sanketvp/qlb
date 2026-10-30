@@ -242,6 +242,9 @@ export class CodexSlots {
         stashed = await this.readUnclaimedDurable(entry.stashId);
       } catch (error) {
         if (error instanceof CodexStashNotFound) {
+          // Complete only this login's own reservation: a row keyed to another
+          // account (e.g. a successor stash keyed by its predecessor) is not ours.
+          if (!identity || entry.accountId !== identity) throw new CodexStashUnverifiable();
           await this.writeUnclaimedBody(entry.stashId, document, fingerprint);
           return { stashId: entry.stashId, created: true };
         }
@@ -319,6 +322,9 @@ export class CodexSlots {
         throw error;
       }
       if (!stashed.consumedFp || stashed.consumedFp !== consumedFp) continue;
+      // An unknown-login stash (C6-7) records its own fingerprint as consumedFp;
+      // a document is never its own successor.
+      if (stashed.fingerprint === consumedFp) continue;
       return { stashId: entry.stashId, document: stashed.document, consumedFp: stashed.consumedFp };
     }
     return null;

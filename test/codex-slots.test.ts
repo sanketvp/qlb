@@ -17,6 +17,7 @@ import {
 } from '../src/keychain';
 import {
   CodexSlots,
+  CodexStashNotFound,
   CodexStashUnverifiable,
   codexHeaderAccountId,
   importActiveCodexSlot,
@@ -456,7 +457,8 @@ describe('Codex slots and import-active', () => {
 
       assert.deepEqual(second, { stashId: first.stashId, created: false });
       assert.equal(readdirSync(join(stashDir, 'index', 'openai-codex')).length, 1);
-      assert.doesNotThrow(() => slots.readUnclaimedDurable(first.stashId));
+      const read = await slots.readUnclaimedDurable(first.stashId);
+      assert.equal(read.fingerprint, codexFingerprint(doc));
     } finally {
       h.store.close();
       rmSync(h.home, { recursive: true, force: true });
@@ -502,7 +504,47 @@ describe('Codex slots and import-active', () => {
 
       assert.deepEqual(await slots.ensureUnclaimedStash(doc, 2), { stashId, created: true });
       assert.equal(readdirSync(join(stashDir, 'index', 'openai-codex')).length, 1);
-      assert.doesNotThrow(() => slots.readUnclaimedDurable(stashId));
+      const read = await slots.readUnclaimedDurable(stashId);
+      assert.equal(read.fingerprint, fp, 'the completed body is readable and carries the login');
+      assert.equal(read.consumedFp, fp);
+    } finally {
+      h.store.close();
+      rmSync(h.home, { recursive: true, force: true });
+    }
+  });
+
+  it('a bodyless reservation owned by another account is not completed with this login', async () => {
+    const h = fixture();
+    try {
+      const stashDir = join(h.home, 'stash');
+      const slots = new CodexSlots({ keychain: h.keychain, stashDir });
+      const doc = parsedDocument('foreign-reservation-refresh');
+      const fp = codexFingerprint(doc);
+      const stashId = 'foreign-reservation';
+      await slots.stashUnclaimedDurably(stashId, doc, fp, 'some-other-account');
+      h.keychain.deleteSync(qlbKeychainService('openai-codex', `unclaimed:${stashId}`), QLB_KEYCHAIN_ACCOUNT);
+
+      await assert.rejects(slots.ensureUnclaimedStash(doc, 2), CodexStashUnverifiable);
+      await assert.rejects(slots.readUnclaimedDurable(stashId), CodexStashNotFound);
+      assert.equal(readdirSync(join(stashDir, 'index', 'openai-codex')).length, 1);
+    } finally {
+      h.store.close();
+      rmSync(h.home, { recursive: true, force: true });
+    }
+  });
+
+  it('an unknown-login stash is never returned as its own successor', async () => {
+    const h = fixture();
+    try {
+      const stashDir = join(h.home, 'stash');
+      const slots = new CodexSlots({ keychain: h.keychain, stashDir });
+      const doc = parsedDocument('imported-later-refresh');
+      const { stashId } = await slots.ensureUnclaimedStash(doc, 1);
+      const slotId = planImportActiveCodex(doc).slotId!;
+
+      assert.equal(await slots.findStashedSuccessor(slotId, codexFingerprint(doc)), null);
+      const read = await slots.readUnclaimedDurable(stashId);
+      assert.equal(read.fingerprint, codexFingerprint(doc), 'the safety stash is kept');
     } finally {
       h.store.close();
       rmSync(h.home, { recursive: true, force: true });
