@@ -287,6 +287,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
           h.store.setAccountStatus(id, 'handed-back');
           h.store.upsertMigration(`pi-${provider}`, lifecycle, JSON.stringify({
             commitGeneration: 3,
+            handback: { phase: 'completed' },
             lastRollback: { cleanedAt: 1 },
           }));
 
@@ -353,7 +354,13 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
           const filesBefore = fileSnapshot(h.dir);
           const service = qlbKeychainService('xai', expectedId('xai'));
           const account = expectedLabel('xai');
-          const keychainBefore = command === 'commit' ? h.kc.getSync(service, account) : null;
+          const keychainBefore = (() => {
+            try {
+              return h.kc.getSync(service, account);
+            } catch {
+              return null;
+            }
+          })();
 
           assert.throws(
             () => h.mig[command](),
@@ -363,11 +370,66 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
             },
             `${command}/${marker.name} refuses its active hand-back marker`,
           );
+          const keychainAfter = (() => {
+            try {
+              return h.kc.getSync(service, account);
+            } catch {
+              return null;
+            }
+          })();
+          assert.equal(keychainAfter, keychainBefore, `${command}/${marker.name} preserves Keychain`);
           assert.deepEqual(h.store.getMigration('pi-xai'), rowBefore, `${command}/${marker.name} preserves the journal`);
           assert.deepEqual(fileSnapshot(h.dir), filesBefore, `${command}/${marker.name} preserves files`);
-          if (keychainBefore !== null) {
-            assert.equal(h.kc.getSync(service, account), keychainBefore, `${command}/${marker.name} preserves Keychain`);
+        } finally {
+          h.cleanup();
+        }
+      }
+    }
+  });
+
+  it('stage and commit refuse a journal whose detail is not a JSON object', async () => {
+    for (const command of ['stage', 'commit'] as const) {
+      for (const detail of ['{not-json', '[]']) {
+        const h = setup('xai');
+        try {
+          if (command === 'commit') {
+            h.mig.stage();
+            await h.mig.rehearse(mockRehearse([]));
           }
+          const row = h.store.getMigration('pi-xai');
+          h.store.upsertMigration('pi-xai', command === 'stage' ? 'NATIVE' : row!.state, detail);
+          const rowBefore = h.store.getMigration('pi-xai');
+          const filesBefore = fileSnapshot(h.dir);
+          const service = qlbKeychainService('xai', expectedId('xai'));
+          const account = expectedLabel('xai');
+          const keychainBefore = (() => {
+            try {
+              return h.kc.getSync(service, account);
+            } catch {
+              return null;
+            }
+          })();
+
+          assert.throws(
+            () => h.mig[command](),
+            (error: unknown) => {
+              const refusal = error as { message?: unknown; exitCode?: unknown };
+              assert.match(String(refusal.message), /journal-detail-malformed/);
+              assert.equal(refusal.exitCode, 3);
+              return true;
+            },
+            `${command} refuses malformed detail ${detail}`,
+          );
+          const keychainAfter = (() => {
+            try {
+              return h.kc.getSync(service, account);
+            } catch {
+              return null;
+            }
+          })();
+          assert.deepEqual(h.store.getMigration('pi-xai'), rowBefore, `${command} preserves malformed journal`);
+          assert.deepEqual(fileSnapshot(h.dir), filesBefore, `${command} preserves files`);
+          assert.equal(keychainAfter, keychainBefore, `${command} preserves Keychain`);
         } finally {
           h.cleanup();
         }
