@@ -1255,7 +1255,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
         h.authPath,
         h.ownerPath,
         'xai',
-        { afterS6c1: () => { throw new Error('fixture crash after S6c1'); } },
+        { afterStep: (point) => { if (point === 'S6c1') throw new Error('fixture crash after S6c1'); } },
       );
 
       assert.throws(() => crashing.resume(), /fixture crash after S6c1/);
