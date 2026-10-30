@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
-import { chmod, link, mkdir, open, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
+import { chmod, link, mkdir, open, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { codexFingerprint, codexIdentity, parseCodexAuth, type CodexAuthDocument } from './codex-auth';
@@ -333,8 +333,15 @@ export class CodexSlots {
       if (!isEmergencyStashFilename(name)) continue;
       const stashId = name.slice(0, -'.json'.length);
       if (indexedIds.has(stashId)) continue;
+      let text: string;
+      try { text = await readFile(this.unclaimedFile(stashId), 'utf8'); } catch (error: unknown) {
+        // A concurrent adopter may have consumed and removed it; any other
+        // read failure must not look like "no successor" (fail closed).
+        if ((error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') continue;
+        throw new Error('unclaimed credential unavailable');
+      }
       let record: UnclaimedRecord;
-      try { record = parseUnclaimed(await readFile(this.unclaimedFile(stashId), 'utf8')); } catch { continue; }
+      try { record = parseUnclaimed(text); } catch { continue; }
       if (codexIdentity(record.credential) !== accountId || record.consumedFp !== consumedFp) continue;
       const entry: UnclaimedIndexEntry = {
         provider: PROVIDER, accountId, stashId, consumedFp, location: 'file', createdAt: this.now(),
@@ -369,9 +376,10 @@ export class CodexSlots {
         if (isAlreadyExists(error)) return;
         throw error;
       }
-      // After link(2) reserved the final name without replacement, rename is
-      // safe: both names are hard links to this same body on POSIX.
-      await rename(temporary, path);
+      // link(2) published the final name without replacement. Drop the temp
+      // name before the directory sync so no second link to the secret body
+      // outlives this call (rename onto a hard link of itself is a no-op).
+      await rm(temporary, { force: true });
       await chmod(path, 0o600);
       const body = await open(path, 'r');
       try { await body.sync(); } finally { await body.close(); }

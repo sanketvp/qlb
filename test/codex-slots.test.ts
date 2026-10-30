@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -537,6 +537,46 @@ describe('Codex slots and import-active', () => {
       assert.equal(await slots.findStashedSuccessor(accountId, codexFingerprint(parsedDocument('predecessor'))), null);
       assert.equal(existsSync(join(stashDir, 'index', 'openai-codex', `${stashId}.json`)), true);
     } finally {
+      h.store.close();
+      rmSync(h.home, { recursive: true, force: true });
+    }
+  });
+
+  it('an emergency stash leaves no second link to the body after it returns', async () => {
+    const h = fixture();
+    try {
+      const accountId = planImportActiveCodex(parsedDocument()).slotId;
+      const stashDir = join(h.home, 'stash');
+      const slots = new CodexSlots({ keychain: h.keychain, stashDir });
+      const { stashId } = await slots.stashSuccessorEmergency(
+        accountId, parsedDocument('emergency-successor'), codexFingerprint(parsedDocument('predecessor')), 1,
+      );
+
+      assert.deepEqual(readdirSync(stashDir).filter((name) => name !== 'index').sort(), [`${stashId}.json`]);
+    } finally {
+      h.store.close();
+      rmSync(h.home, { recursive: true, force: true });
+    }
+  });
+
+  it('an orphan -lost- stash that cannot be read fails closed instead of reporting no successor', async () => {
+    const h = fixture();
+    const stashDir = join(h.home, 'stash');
+    const orphan = join(stashDir, 'unreadable-lost-deadbeef.json');
+    try {
+      const accountId = planImportActiveCodex(parsedDocument()).slotId;
+      mkdirSync(stashDir, { recursive: true, mode: 0o700 });
+      writeFileSync(orphan, '{}', { mode: 0o600 });
+      chmodSync(orphan, 0o000);
+
+      const slots = new CodexSlots({ keychain: h.keychain, stashDir });
+      await assert.rejects(
+        slots.findStashedSuccessor(accountId, codexFingerprint(parsedDocument('predecessor'))),
+        /unclaimed credential unavailable/,
+      );
+      assert.equal(existsSync(orphan), true);
+    } finally {
+      try { chmodSync(orphan, 0o600); } catch { /* already removed */ }
       h.store.close();
       rmSync(h.home, { recursive: true, force: true });
     }
