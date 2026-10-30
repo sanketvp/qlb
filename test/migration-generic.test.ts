@@ -1809,6 +1809,90 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     }
   });
 
+  it('T-S3b a valid native entry present at write time wins and nothing is written', async () => {
+    const h = setup('xai');
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      h.mig.commit();
+      const nativeLogin = JSON.stringify({
+        ...FAKE_GRANTS,
+        xai: { ...FAKE_GRANTS.xai, access: 'xai-access-native-fake', refresh: 'xai-refresh-native-fake' },
+      }, null, 2) + '\n';
+      const guarded = h.mig as unknown as {
+        readSingleGrantAuth?: () => Record<string, unknown>;
+      };
+      assert.ok(guarded.readSingleGrantAuth, 'S3 must read Pi auth.json under the auth lock');
+      const readSingleGrantAuth = guarded.readSingleGrantAuth.bind(h.mig);
+      let s3Reads = 0;
+      guarded.readSingleGrantAuth = () => {
+        s3Reads += 1;
+        assert.equal(existsSync(`${resolve(h.authPath)}.lock`), true, 'S3 reads while Pi auth lock is held');
+        writeFileSync(h.authPath, nativeLogin);
+        return readSingleGrantAuth();
+      };
+
+      const rolled = h.mig.rollback();
+
+      assert.equal(s3Reads, 1, 'S3 re-reads the journaled Pi entry once');
+      assert.equal(rolled.state, 'NATIVE', 'the hand-back completes');
+      assert.deepEqual(readFileSync(h.authPath), Buffer.from(nativeLogin), 'S3 does not write over the native entry');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('T-P2 Pi rotation of the restored entry before the retry is kept', async () => {
+    const h = setup('xai', new MockKeychain(), {
+      afterStep: (point) => {
+        if (point === 'S2') throw new Error('fixture crash after S2');
+      },
+    });
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      h.mig.commit();
+      assert.throws(() => h.mig.rollback(), /fixture crash after S2/);
+      const piRotation = JSON.stringify({
+        ...FAKE_GRANTS,
+        xai: { ...FAKE_GRANTS.xai, access: 'xai-access-rotated-fake', refresh: 'xai-refresh-rotated-fake' },
+      }, null, 2) + '\n';
+      writeFileSync(h.authPath, piRotation);
+
+      const resumed = createSingleGrantMigration(h.store, h.kc, 'xai', h.authPath, h.ownerPath).resume();
+
+      assert.equal(resumed.state, 'NATIVE', 'the retry completes the hand-back');
+      assert.deepEqual(readFileSync(h.authPath), Buffer.from(piRotation), 'S3 keeps Pi\'s rotated entry');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('T-P3 a native re-login over a placeholder is kept by rollback', async () => {
+    const h = setup('xai');
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      h.mig.commit();
+      writeFileSync(h.authPath, JSON.stringify({
+        ...FAKE_GRANTS,
+        xai: { type: 'oauth', access: 'qlb-managed', refresh: '' },
+      }, null, 2) + '\n');
+      const nativeLogin = JSON.stringify({
+        ...FAKE_GRANTS,
+        xai: { ...FAKE_GRANTS.xai, access: 'xai-access-relogin-fake', refresh: 'xai-refresh-relogin-fake' },
+      }, null, 2) + '\n';
+      writeFileSync(h.authPath, nativeLogin);
+
+      const rolled = h.mig.rollback();
+
+      assert.equal(rolled.state, 'NATIVE', 'the hand-back completes');
+      assert.deepEqual(readFileSync(h.authPath), Buffer.from(nativeLogin), 'S3 keeps the native re-login');
+    } finally {
+      h.cleanup();
+    }
+  });
+
   it('after a native Pi login, resume completes the hand-back without a QLB source', async () => {
     const h = setup('xai');
     try {
