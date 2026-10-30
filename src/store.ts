@@ -2157,6 +2157,45 @@ export class Store {
     this.setConfigStmt.run(key, value);
   }
 
+  /** Record one de-duplicated, credential-free observation of the live Codex login. */
+  recordCodexObservation(input: {
+    identity: string | null;
+    lineageFp: string | null;
+    by: 'qlb-switch' | 'qlb-watch' | 'qlb-reconcile';
+    now: number;
+  }): { appended: boolean; wipedEvent: boolean } {
+    return this.runImmediate(() => {
+      this.setConfig('codex.lastObservedAt', String(input.now));
+      if (!Number.isFinite(input.now) || input.by.trim() === '') {
+        throw new Error('Invalid Codex live observation');
+      }
+      if (input.identity !== null && input.identity.length === 0) {
+        throw new Error('Invalid Codex live observation identity');
+      }
+
+      const newest = this.db.prepare(`SELECT identity, lineage_fp FROM codex_live_observations
+        ORDER BY ts DESC, id DESC LIMIT 1`).get() as { identity: string | null; lineage_fp: string | null } | undefined;
+      const appended = newest === undefined
+        || newest.identity !== input.identity
+        || newest.lineage_fp !== input.lineageFp;
+      let wipedEvent = false;
+
+      if (appended) {
+        this.db.prepare(
+          'INSERT INTO codex_live_observations (ts, identity, lineage_fp, by) VALUES (?, ?, ?, ?)',
+        ).run(input.now, input.identity, input.lineageFp, input.by);
+        if (input.lineageFp === null) {
+          assertStoredReloginFields('wiped', 'wiped');
+          this.db.prepare(`INSERT INTO relogin_events (ts, provider, account_id, kind, detail, evidence, user_denied_at)
+            VALUES (?, 'openai-codex', NULL, 'wiped', 'wiped', 'wiped', NULL)`).run(input.now);
+          wipedEvent = true;
+        }
+      }
+
+      return { appended, wipedEvent };
+    });
+  }
+
   /** Settings.py:128-170 bounds; out-of-range persisted strings clamp, not reject. */
   getAutoswitchSettings(): AutoswitchSettings {
     // settings.py:128-134: threshold and weeklyThreshold are 50..99.9.
