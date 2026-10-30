@@ -2057,8 +2057,11 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
 
   it('T-S3f a recorded source whose bytes changed under the fence refuses rollback-source-tampered; a native login then completes the hand-back', async () => {
     for (const fixture of [
-      { name: 'a Keychain source', kind: 'keychain' as const },
-      { name: 'an exact backup source', kind: 'exact-backup' as const },
+      { name: 'a Keychain source', kind: 'keychain' as const, tamper: 'bytes' },
+      { name: 'an exact backup source', kind: 'exact-backup' as const, tamper: 'bytes' },
+      { name: 'a deleted Keychain source', kind: 'keychain' as const, tamper: 'delete' },
+      { name: 'a deleted exact backup source', kind: 'exact-backup' as const, tamper: 'delete' },
+      { name: 'an exact backup source made unreadable', kind: 'exact-backup' as const, tamper: 'corrupt' },
     ]) {
       const h = setup('xai', new MockKeychain(), {
         afterStep: (point) => {
@@ -2086,9 +2089,15 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
           ...FAKE_GRANTS,
           xai: { type: 'oauth', access: 'qlb-managed', refresh: '' },
         }, null, 2) + '\n');
-        if (fixture.kind === 'keychain') {
+        if (fixture.kind === 'keychain' && fixture.tamper === 'delete') {
+          h.kc.deleteSync(service, account);
+        } else if (fixture.kind === 'keychain') {
           const raw = h.kc.getSync(service, account);
           h.kc.setSync(service, account, JSON.stringify({ ...JSON.parse(raw), writtenBy: 's3f-tampered' }));
+        } else if (fixture.tamper === 'delete') {
+          rmSync(piAuthBackupPath(h.authPath, 'xai'), { force: true });
+        } else if (fixture.tamper === 'corrupt') {
+          writeFileSync(piAuthBackupPath(h.authPath, 'xai'), '{ not json');
         } else {
           const path = piAuthBackupPath(h.authPath, 'xai');
           const backup = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
@@ -2104,7 +2113,8 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
         const authBefore = readFileSync(h.authPath);
         const ownerBefore = readFileSync(h.ownerPath);
         const backupsBefore = backupPaths.map((path) => existsSync(path) ? readFileSync(path) : undefined);
-        const keychainBefore = h.kc.getSync(service, account);
+        const readKeychain = () => { try { return h.kc.getSync(service, account); } catch { return undefined; } };
+        const keychainBefore = readKeychain();
 
         assert.throws(
           () => h.mig.resume(),
@@ -2123,7 +2133,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
         assert.deepEqual(readFileSync(h.authPath), authBefore, `${fixture.name}: auth.json is unchanged`);
         assert.deepEqual(readFileSync(h.ownerPath), ownerBefore, `${fixture.name}: owner claim is unchanged`);
         assert.deepEqual(backupPaths.map((path) => existsSync(path) ? readFileSync(path) : undefined), backupsBefore, `${fixture.name}: backups are unchanged`);
-        assert.equal(h.kc.getSync(service, account), keychainBefore, `${fixture.name}: Keychain fake is unchanged`);
+        assert.equal(readKeychain(), keychainBefore, `${fixture.name}: Keychain fake is unchanged`);
 
         const nativeLogin = JSON.stringify({
           ...FAKE_GRANTS,
