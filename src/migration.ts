@@ -1933,9 +1933,11 @@ export class Migration {
         this.decideAndFenceSingleGrantRollback(journalAccount, authKey);
         // S3 under the auth lock that rollback()/resume() hold. Guard (a): a
         // valid native entry (a newer login, or Pi's rotation) is kept and
-        // nothing is written. Guard (b) refuses a missing native entry after
-        // a kind:none decision; guard (d) refuses a defined, non-placeholder,
-        // invalid entry. Guards (b)'s materialising write and (c) come in row 37.
+        // nothing is written. Guard (b) restores the recorded source and
+        // verifies it (or refuses native-entry-missing for kind:none); guard
+        // (c) keeps an intentionally absent key absent; guard (d) refuses a
+        // defined, non-placeholder, invalid entry. All of this precedes the
+        // un-own below (OD-4).
         this.singleGrantNativeEntryWins(authKey);
         // Validate and check for a live refresh before un-owning, so a refusal
         // leaves the claim intact.
@@ -2207,6 +2209,11 @@ export class Migration {
       record = backup;
     }
 
+    // Check the source before writing: a retry's guard (a) must never find an
+    // entry here that the strict verify below would have rejected.
+    if (record.entryPresent && !isValidEntry(record.entry)) {
+      throw Object.assign(new Error('rollback-source-malformed'), { exitCode: 3 });
+    }
     this.restoreSingleGrantPiAuthEntry(authKey, record);
     const restored = this.readSingleGrantAuth();
     const restoredPresent = Object.prototype.hasOwnProperty.call(restored, authKey);

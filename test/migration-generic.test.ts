@@ -1960,6 +1960,28 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     }
   });
 
+  it('T-S3c2 guard (c): an absent key with an entryPresent:false decision is satisfied without a write', async () => {
+    const h = setup('xai');
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      h.mig.commit();
+      const withoutXai = { ...FAKE_GRANTS } as Record<string, unknown>;
+      delete withoutXai.xai;
+      writeFileSync(h.authPath, JSON.stringify(withoutXai, null, 2) + '\n');
+      writePiAuthBackup(h.authPath, 'xai', 'entry-absent-guard-c');
+      const before = readFileSync(h.authPath);
+
+      h.mig.rollback();
+
+      assert.deepEqual(readFileSync(h.authPath), before, 'guard (c) writes nothing and never resurrects the key');
+      assert.equal(existsSync(h.ownerPath), false, 'S4 releases the owner once guard (c) is satisfied');
+      assert.ok(JSON.parse(h.store.getMigration('pi-xai')!.detail_json).lastRollback, 'the terminal journal records the hand-back');
+    } finally {
+      h.cleanup();
+    }
+  });
+
   it('T-S3d restore recreates a deleted auth.json from the backup', async () => {
     const h = setup('xai');
     try {
