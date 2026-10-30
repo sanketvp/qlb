@@ -2,8 +2,8 @@ import { mkdirSync, readFileSync, statSync, unlinkSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { accessExpiry, codexFingerprint, codexIdentity, writeCodexAuthAtomic, type CodexAuthDocument, type CodexAuthStableWithStatResult, type CodexIdentity } from './codex-auth';
 import { attributeLiveDocument, type AttributeLiveDocumentInput, type CodexAttributionResult } from './codex-attribution';
-import { ClaudeCodeLockTimeout, type HeldProperLockfile, withProperLockfile } from './cc-locks';
-import { consumeCodexSlot, hasCodexSlotIdentity, withCodexConsumeThenSwitchLocks, type CodexConsumeOptions, type CodexConsumeResult } from './codex-consume';
+import { ClaudeCodeLockTimeout, withCodexAuthLock, type CodexAuthLockOptions, type HeldProperLockfile, withProperLockfile } from './cc-locks';
+import { consumeCodexSlot, hasCodexSlotIdentity, withCodexConsumeThenSwitchLocks, withCodexSwitchLock, type CodexConsumeOptions, type CodexConsumeResult } from './codex-consume';
 import { fsyncDirSync, atomicWriteText, publishTarget } from './fsutil';
 import { qlbHomeDir } from './home';
 import {
@@ -15,6 +15,8 @@ import {
   type CodexProcess,
 } from './codex-sessions';
 import type { CswapProcess } from './cswap-processes';
+import { CodexStashUnverifiable, type CodexSlots } from './codex-slots';
+import type { KeychainBackend } from './keychain';
 import type { Store } from './store';
 
 const PROVIDER = 'openai-codex';
@@ -36,15 +38,26 @@ export type CodexSwitchPreconditionsResult =
   | { kind: 'refused'; reason: CodexSwitchPreconditionReason };
 
 /** All external effects are injected; the production caller binds readLive to auth.json. */
+type CodexObservationSlots = Pick<CodexSlots, 'readSlot' | 'ensureUnclaimedStash'>;
+type CodexObservationKeychain = Pick<KeychainBackend, 'getSync' | 'setSync' | 'deleteSync'>;
+
 export interface CodexSwitchDeps {
-  store: Pick<Store, 'getCodexActiveLogin' | 'getCodexSlot' | 'getConfig' | 'hasConfig' | 'recordSwitch'>;
+  store: Pick<Store, 'getCodexActiveLogin' | 'getCodexSlot' | 'getConfig' | 'hasConfig' | 'recordSwitch'
+    | 'recordCodexObservation' | 'setActiveLogin'>;
   readLive: () => Promise<CodexAuthStableWithStatResult>;
   cswapProcesses: () => CswapProcess[];
   now: () => number;
   attempt: string;
   /** C6-12b seams; C6-18 supplies their production bindings. */
   dbPath?: string;
-  slots?: CodexConsumeOptions['slots'];
+  slots?: CodexConsumeOptions['slots'] & Partial<CodexObservationSlots>;
+  keychain?: CodexObservationKeychain;
+  /** The native auth.json path, needed only by the pre-switch republish. */
+  authPath?: string;
+  authLockOptions?: CodexAuthLockOptions;
+  /** Fixture-only interruption seams for the step-2 attribution transaction. */
+  observationBeforeSave?: AttributeLiveDocumentInput['beforeSave'];
+  observationBeforeSaveCommit?: AttributeLiveDocumentInput['beforeSaveCommit'];
   list?: () => Promise<CodexProcess[]>;
   transport?: CodexConsumeOptions['transport'];
   journalDir?: string;
@@ -111,6 +124,160 @@ export function checkCodexSwitchPreconditions(
     return refuse('codex-l13-unverified');
   }
   return { kind: 'go' };
+}
+
+/** The pre-switch republish found that Codex changed auth.json after step 1. */
+export class CodexLiveChanged extends Error {
+  constructor() {
+    super('Codex changed auth.json during the pre-switch observation. Restart the observation.');
+    this.name = 'CodexLiveChanged';
+  }
+}
+
+/** The only pre-switch QLB publication failed before its rename. */
+export class CodexRepublishFailed extends Error {
+  constructor() {
+    super('Codex pre-switch republish failed before rename.');
+    this.name = 'CodexRepublishFailed';
+  }
+}
+
+export type CodexLiveOutgoing = {
+  document: CodexAuthDocument;
+  sha256: string;
+  inode: number;
+};
+
+export type ObserveLiveCodexResult =
+  | { outcome: 'settled'; outgoing: CodexLiveOutgoing }
+  | { outcome: 'refused'; reason: 'codex-writing' | 'codex-logged-out' | 'codex-auth-unreadable' | 'wiped' | 'republish-failed' | 'unknown-live-identity' | 'stash-unverifiable' | 'slot-split' };
+
+function observationDeps(deps: CodexSwitchDeps): {
+  slots: CodexObservationSlots;
+  keychain: CodexObservationKeychain;
+  list: () => Promise<CodexProcess[]>;
+} {
+  if (!deps.slots?.ensureUnclaimedStash || !deps.keychain || !deps.list) {
+    throw new Error('Codex live observation dependencies are required');
+  }
+  return { slots: deps.slots as CodexObservationSlots, keychain: deps.keychain, list: deps.list };
+}
+
+function sameLiveObservation(
+  left: CodexAuthStableWithStatResult,
+  right: CodexAuthStableWithStatResult,
+): boolean {
+  return left.status === 'ok' && right.status === 'ok'
+    && left.sha256 === right.sha256 && left.inode === right.inode;
+}
+
+/**
+ * Holds the two locks required for every phase-L Codex write.  The caller gets
+ * one assertion capability so an adoption or republish can never outlive
+ * either lock's owner token.
+ */
+export async function withCodexSwitchLocks<T>(
+  deps: Pick<CodexSwitchDeps, 'dbPath' | 'authLockOptions'>,
+  fn: (assertHeld: () => void) => Promise<T> | T,
+): Promise<T> {
+  if (!deps.dbPath) throw new Error('Codex switch lock requires dbPath');
+  return withCodexSwitchLock(deps.dbPath, (switchLock) => withCodexAuthLock(deps.authLockOptions, (authLock) =>
+    fn(() => {
+      switchLock.assertNotCompromised();
+      authLock.assertNotCompromised();
+    })));
+}
+
+/**
+ * Executes §4.4.1 steps 1--2 while the caller owns switch → auth.  A changed
+ * file during a pre-switch republish is deliberately thrown to the enclosing
+ * retry loop; it must never be overwritten with stale slot bytes.
+ */
+export async function observeLiveCodex(
+  deps: CodexSwitchDeps,
+  assertHeld: () => void,
+): Promise<ObserveLiveCodexResult> {
+  const configured = observationDeps(deps);
+  const p0 = await configured.list();
+  const live = await deps.readLive();
+  const p1 = await configured.list();
+
+  if (live.status === 'unstable') return { outcome: 'refused', reason: 'codex-writing' };
+  if (live.status === 'missing') return { outcome: 'refused', reason: 'codex-logged-out' };
+  if (live.status === 'unreadable') return { outcome: 'refused', reason: 'codex-auth-unreadable' };
+  if (live.status === 'wiped') {
+    assertHeld();
+    deps.store.recordCodexObservation({ identity: null, lineageFp: null, by: 'qlb-switch', now: deps.now() });
+    return { outcome: 'refused', reason: 'wiped' };
+  }
+
+  const liveIdentity = codexIdentity(live.doc);
+  const activeSlotId = deps.store.getCodexActiveLogin();
+  // An active id is normally established by the switch preconditions.  If an
+  // earlier unknown-login refusal cleared it, a now-known live identity is the
+  // only managed slot that can be adopted as active.
+  const selectedSlotId = activeSlotId ?? (liveIdentity ? deps.store.getCodexSlot(liveIdentity)?.accountId ?? null : null);
+  if (!selectedSlotId) throw new Error('Codex active slot is required for a stable live observation');
+  const selected = configured.slots.readSlot(selectedSlotId, { fresh: true });
+
+  const history = deps.dbPath
+    ? readCodexSwitchHistory(deps.dbPath, { journalDir: deps.journalDir })
+    : { rows: [], observations: [] };
+  const holderObservation = liveIdentity === null ? undefined : {
+    aliveBefore: renewers(codexIdentityParts(liveIdentity), p0, history.rows, history.observations).length > 0,
+    aliveAfter: renewers(codexIdentityParts(liveIdentity), p1, history.rows, history.observations).length > 0,
+  };
+
+  assertHeld();
+  deps.store.recordCodexObservation({
+    identity: liveIdentity,
+    lineageFp: codexFingerprint(live.doc),
+    by: 'qlb-switch',
+    now: deps.now(),
+  });
+
+  try {
+    const attribution = await attributeForPhase({ assertHeld }, 'pre', {
+      store: deps.store as Store,
+      keychain: configured.keychain,
+      slot: { accountId: selectedSlotId, document: selected.document, fingerprint: selected.fingerprint },
+      activeSlotId: activeSlotId ?? undefined,
+      activeSetBy: 'adopt',
+      live: live.doc,
+      holderObservation,
+      l40Verified: deps.store.getConfig('codex.l40Verified') === '1',
+      beforeSave: deps.observationBeforeSave,
+      beforeSaveCommit: deps.observationBeforeSaveCommit,
+      republish: async (document) => {
+        assertHeld();
+        const reread = await deps.readLive();
+        if (!sameLiveObservation(live, reread)) throw new CodexLiveChanged();
+        if (!deps.authPath) throw new Error('Codex pre-switch republish requires authPath');
+        const published = await publishCodexAuth(deps.authPath, document);
+        if (published.stage === 'rename-threw') throw new CodexRepublishFailed();
+      },
+    });
+    if (attribution.action === 'republish-slot') throw new CodexLiveChanged();
+    if (attribution.action === 'unclaimed') {
+      try {
+        await configured.slots.ensureUnclaimedStash(live.doc, deps.now());
+      } catch (error) {
+        if (error instanceof CodexStashUnverifiable) return { outcome: 'refused', reason: 'stash-unverifiable' };
+        throw error;
+      }
+      assertHeld();
+      deps.store.setActiveLogin(PROVIDER, null, 'adopt');
+      return { outcome: 'refused', reason: 'unknown-live-identity' };
+    }
+    if (attribution.action === 'slot-split'
+      || (attribution.action === 'drift' && attribution.disposition === 'slot-split')) {
+      return { outcome: 'refused', reason: 'slot-split' };
+    }
+    return { outcome: 'settled', outgoing: { document: live.doc, sha256: live.sha256, inode: live.inode } };
+  } catch (error) {
+    if (error instanceof CodexRepublishFailed) return { outcome: 'refused', reason: 'republish-failed' };
+    throw error;
+  }
 }
 
 /** Result of a single atomic target publication, including post-rename durability. */
