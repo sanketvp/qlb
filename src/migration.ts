@@ -125,7 +125,7 @@ import { fsyncDirSync } from './fsutil';
 import { qlbHomeDir } from './home';
 import type { KeychainBackend } from './keychain';
 import { openRouterMissingKeyMessage, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, readNativeOpenRouterKey } from './keychain';
-import { legacyPiAuthBackupPath, piAuthBackupPath, readPiAuthBackup, removePiAuthBackup } from './pi-auth-backup';
+import { legacyPiAuthBackupPath, piAuthBackupPath, readPiAuthBackup, removePiAuthBackup, type PiAuthBackup } from './pi-auth-backup';
 import { canonicalDigest, fencedGeneration, handbackVerdict, keychainDigest, rankSingleGrantSource, restoreRecordFor } from './pi-handback-source';
 import type { RollbackDecision } from './single-grant-ownership';
 import { parseGrant } from './refresh-lease';
@@ -2015,23 +2015,13 @@ export class Migration {
           decidedAt,
           filePresent: true,
           entryPresent: true,
-          entry: {
-            type: 'oauth',
-            access: ranked.grant.access,
-            refresh: ranked.grant.refresh,
-            expires: ranked.grant.expires,
-          },
+          entry: this.piEntryFromGrant(ranked.grant, backup),
         })
         : ranked.kind === 'none'
           ? null
-          : restoreRecordFor({
-            authPath: this.poolFilePath,
-            key: authKey,
-            decidedAt,
-            filePresent: sourceBackup!.filePresent,
-            entryPresent: sourceBackup!.entryPresent,
-            ...(sourceBackup!.entryPresent ? { entry: sourceBackup!.entry } : {}),
-          });
+          // Design §2 S3: a backup kind's record is the normalised backup as
+          // readPiAuthBackup returns it, with its own cycleId.
+          : sourceBackup;
       const decision: Omit<RollbackDecision, 'fencedGeneration'> = {
         kind: ranked.kind,
         generation: ranked.kind === 'none' ? null : ranked.generation,
@@ -2046,6 +2036,11 @@ export class Migration {
       try {
         const fenced = this.store.runImmediate(() => {
           if (this.store.getGrantGeneration(journalAccount.id) !== g0) throw new RetryS2();
+          // S2 (iii): a live refresh lease refuses before any fence, so an
+          // in-flight refresher's rotated grant is never fenced out. Row 30
+          // turns this refusal into a bounded wait.
+          const lease = this.store.getLease(refreshLeaseName(journalAccount.id));
+          if (lease && lease.until > Date.now()) throw new Error('refresh-in-progress');
           const fence = fencedGeneration(g0, k0);
           if (this.store.casGrantGeneration(journalAccount.id, g0, fence) !== 1) {
             throw new RetryS2();
@@ -2065,6 +2060,23 @@ export class Migration {
       }
     }
     throw Object.assign(new Error('refresh-in-progress'), { exitCode: 3 });
+  }
+
+  /** Pi's entry for a Keychain grant, keeping the backup entry's other fields (design §2 S3). */
+  private piEntryFromGrant(grant: Grant, backup: PiAuthBackup | null): Record<string, unknown> {
+    const previous = isObjectRecord(backup?.entry) ? backup.entry : {};
+    const type = typeof grant.extra?.type === 'string'
+      ? grant.extra.type
+      : typeof previous.type === 'string' ? previous.type : 'oauth';
+    const accountId = grant.extra?.accountId;
+    return {
+      ...previous,
+      type,
+      access: grant.access,
+      refresh: grant.refresh,
+      expires: grant.expires,
+      ...(typeof accountId === 'string' ? { accountId } : {}),
+    };
   }
 
   /**

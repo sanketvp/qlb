@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -26,7 +27,8 @@ import {
 } from '../src/migration';
 import { parseGrant } from '../src/refresh-lease';
 import type { RollbackDecision } from '../src/single-grant-ownership';
-import { legacyPiAuthBackupPath, piAuthBackupPath, writePiAuthBackup } from '../src/pi-auth-backup';
+import { legacyPiAuthBackupPath, piAuthBackupPath, readPiAuthBackup, writePiAuthBackup } from '../src/pi-auth-backup';
+import { canonicalDigest, restoreRecordFor } from '../src/pi-handback-source';
 import { openStore } from '../src/store';
 
 const fs = require('node:fs') as typeof import('node:fs');
@@ -1262,7 +1264,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     }
   });
 
-  it('a refresh lease taken after the pre-unlink check and live at the K_m read refuses the hand-back', async () => {
+  it('a refresh lease live during S2 refuses before the fence and leaves the generation unchanged', async () => {
     const h = setup('xai');
     try {
       h.mig.stage();
@@ -1287,6 +1289,8 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       const refused = JSON.parse(h.store.getMigration('pi-xai')!.detail_json) as Record<string, unknown>;
       assert.equal(refused.handback, undefined, 'no hand-back marker is recorded after the post-read refusal');
       assert.equal(refused.intent, 'rollback', 'the rollback intent stays durable');
+      assert.equal(refused.rollbackDecision, undefined, 'S2 records no decision under a live lease');
+      assert.equal(h.store.getGrantGeneration(accountId), 0, 'S2 does not fence under a live lease');
       assert.equal(keychainHas(h.kc, 'xai'), true, 'the Keychain copy remains present');
 
       h.store.getLease = originalGetLease;
@@ -1298,9 +1302,88 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     }
   });
 
+  it('a refresh lease live at the S5 Keychain read refuses the hand-back and keeps the Keychain copy', async () => {
+    const h = setup('xai');
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      h.mig.commit();
+      const accountId = (JSON.parse(h.store.getMigration('pi-xai')!.detail_json).accounts as Array<{ id: string }>)[0].id;
+      const service = qlbKeychainService('xai', accountId);
+      const account = expectedLabel('xai');
+      let reads = 0;
+      const originalGetLease = h.store.getLease.bind(h.store);
+      const originalGetSync = h.kc.getSync.bind(h.kc);
+      h.store.getLease = (name) => reads >= 2 && name === `refresh:${accountId}`
+        ? { name, holder_pid: 1, holder_id: 'fixture-refresher', until: Date.now() + 60_000, generation: 1 }
+        : originalGetLease(name);
+      h.kc.getSync = (readService, readAccount) => {
+        const raw = originalGetSync(readService, readAccount);
+        if (readService === service && readAccount === account) reads += 1;
+        return raw;
+      };
+
+      assert.throws(() => h.mig.rollback(), /refresh-in-progress/);
+      assert.ok(reads >= 2, 'the refusal comes from the S5 read, after S2 fenced');
+      const refused = JSON.parse(h.store.getMigration('pi-xai')!.detail_json) as Record<string, unknown>;
+      assert.notEqual(refused.rollbackDecision, undefined, 'S2 already recorded its decision');
+      assert.equal(refused.handback, undefined, 'no hand-back marker is recorded');
+      assert.equal(keychainHas(h.kc, 'xai'), true, 'the Keychain copy is not deleted');
+
+      h.store.getLease = originalGetLease;
+      h.kc.getSync = originalGetSync;
+      assert.equal(h.mig.resume().state, 'NATIVE', 'resume completes once the lease is gone');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('S2 keychain sourceDigest is the S3 restore record built from the grant and the backup entry', async () => {
+    let decision: RollbackDecision | undefined;
+    const h = setup('openai-codex', new MockKeychain(), {
+      afterStep: (point) => {
+        if (point === 'S2') {
+          decision = JSON.parse(h.store.getMigration('pi-openai-codex')!.detail_json).rollbackDecision as RollbackDecision;
+          throw new Error('fixture crash after S2');
+        }
+      },
+    });
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      h.mig.commit();
+      const grant = parseGrant(h.kc.getSync(qlbKeychainService('openai-codex', expectedId('openai-codex')), expectedLabel('openai-codex')))!;
+      assert.equal(typeof grant.extra?.accountId, 'string', 'the fixture grant carries an accountId');
+      const backup = readPiAuthBackup(h.authPath, 'openai-codex');
+
+      assert.throws(() => h.mig.rollback(), /fixture crash after S2/);
+      assert.equal(decision?.kind, 'keychain');
+      const previous = backup?.entry && typeof backup.entry === 'object' ? backup.entry as Record<string, unknown> : {};
+      const expected = restoreRecordFor({
+        authPath: h.authPath,
+        key: 'openai-codex',
+        decidedAt: decision!.decidedAt,
+        filePresent: true,
+        entryPresent: true,
+        entry: {
+          ...previous,
+          type: grant.extra?.type ?? previous.type ?? 'oauth',
+          access: grant.access,
+          refresh: grant.refresh,
+          expires: grant.expires,
+          accountId: grant.extra?.accountId,
+        },
+      });
+      assert.equal(decision?.sourceDigest, canonicalDigest(expected));
+    } finally {
+      h.cleanup();
+    }
+  });
+
   it('T-I2 a refresh that commits between the outside reads and the fence forces re-selection', async () => {
     let reads = 0;
     let observedFence: number | undefined;
+    let observedDecision: RollbackDecision | undefined;
     const h = setup('xai', new MockKeychain(), {
       afterStep: (point) => {
         if (point === 'S2-reads' && reads++ === 0) {
@@ -1313,7 +1396,8 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
           assert.equal(h.store.casGrantGeneration(id, 0, 1), 1, 'fake refresher commits generation one');
         }
         if (point === 'S2') {
-          observedFence = (JSON.parse(h.store.getMigration('pi-xai')!.detail_json).rollbackDecision as RollbackDecision).fencedGeneration;
+          observedDecision = JSON.parse(h.store.getMigration('pi-xai')!.detail_json).rollbackDecision as RollbackDecision;
+          observedFence = observedDecision.fencedGeneration;
         }
       },
     });
@@ -1325,6 +1409,8 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
 
       assert.equal(reads, 2, 'a generation mismatch re-runs the outside reads');
       assert.equal(observedFence, 2, 'the retry ranks and fences the committed refresher generation');
+      assert.equal(observedDecision?.generation, 1, 'the retry re-ranked onto the refresher grant');
+      assert.equal(observedDecision?.fingerprint, createHash('sha256').update('xai-refresh-rotated-fake', 'utf8').digest('hex'));
     } finally {
       h.cleanup();
     }
@@ -1430,6 +1516,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
 
       assert.throws(() => h.mig.rollback(), /fixture crash after S2/);
       assert.equal(decision?.kind, 'exact-backup');
+      assert.equal(decision?.sourceDigest, canonicalDigest(readPiAuthBackup(h.authPath, 'xai')), 'a backup kind digests the normalised backup');
       assert.equal(decision?.fencedGeneration, 1);
       assert.equal(h.store.getGrantGeneration(expectedId('xai')), 1);
     } finally {
