@@ -1,10 +1,18 @@
 import { mkdirSync, readFileSync, statSync, unlinkSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import type { CodexAuthStableWithStatResult, CodexIdentity } from './codex-auth';
+import { accessExpiry, type CodexAuthStableWithStatResult, type CodexIdentity } from './codex-auth';
 import { ClaudeCodeLockTimeout, type HeldProperLockfile, withProperLockfile } from './cc-locks';
+import { consumeCodexSlot, withCodexConsumeThenSwitchLocks, type CodexConsumeOptions } from './codex-consume';
 import { fsyncDirSync, atomicWriteText } from './fsutil';
 import { qlbHomeDir } from './home';
-import { parseCodexRecoveryFence, stillTheSameProcess, type CodexProcess } from './codex-sessions';
+import {
+  codexIdentityParts,
+  parseCodexRecoveryFence,
+  readCodexSwitchHistory,
+  renewers,
+  stillTheSameProcess,
+  type CodexProcess,
+} from './codex-sessions';
 import type { CswapProcess } from './cswap-processes';
 import type { Store } from './store';
 
@@ -28,11 +36,17 @@ export type CodexSwitchPreconditionsResult =
 
 /** All external effects are injected; the production caller binds readLive to auth.json. */
 export interface CodexSwitchDeps {
-  store: Pick<Store, 'getCodexActiveLogin' | 'getCodexSlot' | 'getConfig' | 'recordSwitch'>;
+  store: Pick<Store, 'getCodexActiveLogin' | 'getCodexSlot' | 'getConfig' | 'hasConfig' | 'recordSwitch'>;
   readLive: () => Promise<CodexAuthStableWithStatResult>;
   cswapProcesses: () => CswapProcess[];
   now: () => number;
   attempt: string;
+  /** C6-12b seams; C6-18 supplies their production bindings. */
+  dbPath?: string;
+  slots?: CodexConsumeOptions['slots'];
+  list?: () => Promise<CodexProcess[]>;
+  transport?: CodexConsumeOptions['transport'];
+  journalDir?: string;
 }
 
 /**
@@ -282,6 +296,80 @@ export function codexRecoveryFenceState(
     };
   }
   return { state: 'none' };
+}
+
+export type CodexTargetFreshenResult =
+  | { kind: 'go' }
+  | { kind: 'refused'; reason: string; pids?: number[] };
+
+function freshenDeps(deps: CodexSwitchDeps): {
+  dbPath: string;
+  slots: CodexConsumeOptions['slots'];
+  list: () => Promise<CodexProcess[]>;
+  transport: CodexConsumeOptions['transport'];
+  journalDir: string;
+} {
+  if (!deps.dbPath || !deps.slots || !deps.list || !deps.transport || !deps.journalDir) {
+    throw new Error('Codex target freshen dependencies are required');
+  }
+  return {
+    dbPath: deps.dbPath, slots: deps.slots, list: deps.list,
+    transport: deps.transport, journalDir: deps.journalDir,
+  };
+}
+
+/**
+ * Freshens an inactive switch target only when its near expiry is not held by
+ * a Codex session. The consume lock is acquired before the shared switch lock.
+ */
+export async function freshenCodexTarget(
+  deps: CodexSwitchDeps,
+  { target, now }: { target: string; now: number },
+): Promise<CodexTargetFreshenResult> {
+  const configured = freshenDeps(deps);
+  const initial = configured.slots.readSlot(target, { fresh: true });
+  const expiry = accessExpiry(initial.document);
+  if (expiry !== null && expiry > now + 10 * 60_000) return { kind: 'go' };
+
+  const holders = async (): Promise<CodexProcess[]> => {
+    const history = readCodexSwitchHistory(configured.dbPath, { journalDir: configured.journalDir });
+    return renewers(codexIdentityParts(target), await configured.list(), history.rows, history.observations);
+  };
+  const holderResult = (processes: readonly CodexProcess[]): CodexTargetFreshenResult => {
+    if (expiry !== null && expiry > now + 5 * 60_000) return { kind: 'go' };
+    return { kind: 'refused', reason: 'target-held-by-session', pids: processes.map(({ pid }) => pid) };
+  };
+
+  const initialHolders = await holders();
+  if (initialHolders.length > 0) return holderResult(initialHolders);
+
+  try {
+    return await withCodexConsumeThenSwitchLocks(configured.dbPath, target, async (heldConsume, heldSwitch) => {
+      const fence = codexRecoveryFenceState(configured.journalDir, deps.store);
+      if (fence.state === 'fenced' && (fence.accounts === '*' || fence.accounts.has(target))) {
+        return { kind: 'refused', reason: fence.reason };
+      }
+      if (deps.store.getCodexActiveLogin() === target) return { kind: 'go' };
+
+      const result = await consumeCodexSlot({
+        accountId: target,
+        trigger: 'proactive-expiry',
+        snapshot: initial.document,
+        slots: configured.slots,
+        transport: configured.transport,
+        now: () => now,
+        holders: async () => holders(),
+        inFlightSlots: fence.state === 'fenced' ? fence.accounts : undefined,
+        assertHeld: () => { heldConsume.assertNotCompromised(); heldSwitch.assertNotCompromised(); },
+      });
+      if (result.status === 'refreshed' || result.status === 'fresh') return { kind: 'go' };
+      if (result.status === 'held') return holderResult((result.holders ?? []).map((pid) => ({ pid, lstart: '', host: '' })));
+      return { kind: 'refused', reason: `target-freshen-${result.status}` };
+    });
+  } catch (error) {
+    if (error instanceof ClaudeCodeLockTimeout) return { kind: 'refused', reason: 'target-freshen-busy' };
+    throw error;
+  }
 }
 
 /** Persist only the parsed, allowlisted fields, so extra caller properties never reach disk. */

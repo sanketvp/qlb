@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -8,6 +8,7 @@ import { describe, it } from 'node:test';
 import {
   checkCodexSwitchPreconditions,
   codexRecoveryFenceState,
+  freshenCodexTarget,
   preflightCodexLive,
   type CodexSwitchDeps,
   type CodexSwitchJournal,
@@ -25,6 +26,9 @@ import {
   writeCodexSwitchJournal,
 } from '../src/codex-switch';
 import { ClaudeCodeLockTimeout } from '../src/cc-locks';
+import { codexLockPaths } from '../src/codex-consume';
+import { accessExpiry, codexFingerprint, type CodexAuthDocument } from '../src/codex-auth';
+import type { CodexProcess } from '../src/codex-sessions';
 import { openStore } from '../src/store';
 
 function fixture() {
@@ -42,6 +46,64 @@ function fixture() {
     ...overrides,
   });
   return { root, stashDir, store, db, deps };
+}
+
+function freshenJwt(payload: Record<string, unknown>): string {
+  return `eyJhbGciOiJub25lIn0.${Buffer.from(JSON.stringify(payload)).toString('base64url')}.sig`;
+}
+
+function freshenDocument(expiry: number, refresh = 'freshen-refresh-a'): CodexAuthDocument {
+  return {
+    tokens: {
+      id_token: freshenJwt({ 'https://api.openai.com/auth': { chatgpt_user_id: 'target', chatgpt_account_id: 'account' } }),
+      access_token: freshenJwt({ exp: Math.floor(expiry / 1_000) }),
+      refresh_token: refresh,
+      account_id: 'account',
+    },
+    last_refresh: '2023-10-01T00:00:00.000Z',
+  };
+}
+
+function freshenHarness(expiryOffset: number) {
+  const h = fixture();
+  const now = 1_700_000_000_000;
+  const target = 'target:account';
+  const journalDir = join(h.root, 'journal');
+  let current = freshenDocument(now + expiryOffset);
+  let posts = 0;
+  let writes = 0;
+  let onTransport: () => void = () => {};
+  const slots = {
+    readSlot: () => ({ document: current, fingerprint: codexFingerprint(current) }),
+    writeSlot: (_accountId: string, next: CodexAuthDocument) => { writes += 1; current = next; },
+    stashUnclaimed: () => 'unused',
+  };
+  const transport = async () => {
+    onTransport();
+    posts += 1;
+    return {
+      status: 200,
+      body: JSON.stringify({
+        refresh_token: `freshen-refresh-${posts + 1}`,
+        access_token: freshenJwt({ exp: Math.floor((now + 20 * 60_000) / 1_000) }),
+      }),
+    };
+  };
+  const run = (overrides: Partial<CodexSwitchDeps> = {}) => freshenCodexTarget(h.deps({
+    dbPath: h.store.dbPath, slots, list: async () => [], transport, journalDir, ...overrides,
+  }), { target, now });
+  return {
+    ...h, now, target, journalDir, slots, run, posts: () => posts, writes: () => writes, current: () => current,
+    onTransport: (handler: () => void) => { onTransport = handler; },
+  };
+}
+
+function recordFreshenHolder(h: ReturnType<typeof freshenHarness>, pid = 742): CodexProcess {
+  h.store.recordSwitch({
+    ts: 1, provider: 'openai-codex', fromAccount: 'old:account', toAccount: h.target,
+    trigger: 'manual', outcome: 'failed',
+  });
+  return { pid, lstart: 'Fri Oct 24 12:00:00 2026', host: 'codex' };
 }
 
 function insertSlot(db: DatabaseSync, accountId: string, options: { dead?: boolean; pendingAdopt?: boolean } = {}): void {
@@ -268,6 +330,100 @@ describe('Codex recovery fence state — C6-12 review r1', () => {
       h.store.close();
       rmSync(h.root, { recursive: true, force: true });
     }
+  });
+});
+
+describe('Codex target freshen — C6-12b', () => {
+  it('a target with more than ten minutes left is not freshened (0 transport calls)', async () => {
+    const h = freshenHarness(10 * 60_000 + 1_000);
+    try {
+      assert.deepEqual(await h.run(), { kind: 'go' });
+      assert.equal(h.posts(), 0);
+    } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('a target within ten minutes and no holder is refreshed once under consume then switch lock', async () => {
+    const h = freshenHarness(9 * 60_000);
+    try {
+      const paths = codexLockPaths(h.store.dbPath, h.target);
+      h.onTransport(() => {
+        assert.equal(existsSync(paths.consume), true);
+        assert.equal(existsSync(paths.switch), true);
+      });
+      assert.deepEqual(await h.run(), { kind: 'go' });
+      assert.equal(h.posts(), 1);
+      assert.equal(existsSync(paths.consume), false);
+      assert.equal(existsSync(paths.switch), false);
+    } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('a held target with more than five minutes left skips the freshen', async () => {
+    const h = freshenHarness(6 * 60_000);
+    try {
+      const holder = recordFreshenHolder(h);
+      assert.deepEqual(await h.run({ list: async () => [holder] }), { kind: 'go' });
+      assert.equal(h.posts(), 0);
+    } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('a held target with five minutes or less is refused target-held-by-session naming the pids', async () => {
+    const h = freshenHarness(5 * 60_000);
+    try {
+      const holder = recordFreshenHolder(h, 743);
+      assert.deepEqual(await h.run({ list: async () => [holder] }), {
+        kind: 'refused', reason: 'target-held-by-session', pids: [743],
+      });
+      assert.equal(h.posts(), 0);
+    } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('a target that became active while waiting returns go without a POST', async () => {
+    const h = freshenHarness(9 * 60_000);
+    try {
+      assert.deepEqual(await h.run({ list: async () => {
+        h.store.setActiveLogin('openai-codex', h.target, 'import');
+        return [];
+      } }), { kind: 'go' });
+      assert.equal(h.posts(), 0);
+    } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it(`a journal written (C6-10 writer) after this switch's recovery and before its freshen lock makes the freshen send zero POSTs and write nothing`, async () => {
+    const h = freshenHarness(9 * 60_000);
+    try {
+      assert.deepEqual(await h.run({ list: async () => {
+        writeCodexSwitchJournal(journalFixture(h.root, {
+          from: 'from:account', to: h.target,
+          target: { identity: { chatgpt_user_id: 'target', account_id: 'account' }, fingerprint: 'fp-target' },
+        }), { journalDir: h.journalDir });
+        return [];
+      } }), { kind: 'refused', reason: 'switch-in-flight' });
+      assert.equal(h.posts(), 0);
+      assert.equal(h.writes(), 0);
+      assert.deepEqual(switchRows(h.db), []);
+    } finally { executingCodexAttempts.clear(); h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('a fence naming the target as a third account refuses the freshen', async () => {
+    const h = freshenHarness(9 * 60_000);
+    try {
+      h.store.setConfig('codex.recoveryFence', JSON.stringify({
+        v: 1, switchId: 1, attempt: 'fence-attempt', from: 'from:account', to: 'to:account',
+        publishedAt: h.now, reason: 'slot-split', involvedAccounts: [h.target], since: h.now,
+      }));
+      assert.deepEqual(await h.run(), { kind: 'refused', reason: 'slot-split' });
+      assert.equal(h.posts(), 0);
+    } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('a crash after the freshen leaves B fresh and the rerun sends no second POST', async () => {
+    const h = freshenHarness(9 * 60_000);
+    try {
+      assert.deepEqual(await h.run(), { kind: 'go' });
+      assert.ok((accessExpiry(h.current()) ?? 0) > h.now + 10 * 60_000);
+      assert.deepEqual(await h.run(), { kind: 'go' });
+      assert.equal(h.posts(), 1);
+    } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
   });
 });
 
