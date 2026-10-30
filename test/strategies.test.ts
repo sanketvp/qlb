@@ -37,6 +37,15 @@ function anthropic(
   return snap;
 }
 
+function codex(accountId: string): AccountSnapshot {
+  return {
+    accountId,
+    provider: 'openai-codex',
+    label: accountId,
+    buckets: {},
+  };
+}
+
 function sessionForSlot(slot: number, count: number): string {
   for (let i = 0; i < 20_000; i++) {
     const id = `synth-session-${i}`;
@@ -336,6 +345,32 @@ describe('strategy: round-robin', () => {
 });
 
 describe('strategy: failover', () => {
+  it('failover on a bare Codex id keeps the matching slot and writes no config', () => {
+    const store = openStore(':memory:');
+    try {
+      const matching = codex('z-user:X');
+      const sortedFirst = codex('a-user:other');
+      for (const snapshot of [matching, sortedFirst]) {
+        store.upsertAccount(snapshot.accountId, snapshot.provider, snapshot.label);
+      }
+      store.setConfig('failover:openai-codex', 'X');
+
+      const decision = resolveFromSnapshots({
+        model: 'gpt-5.4',
+        snapshots: [matching, sortedFirst],
+        strategy: 'failover',
+        store,
+      });
+
+      assert.equal(decision.ok, true);
+      if (!decision.ok) return;
+      assert.equal(decision.accountId, 'z-user:X');
+      assert.equal(store.getConfig('failover:openai-codex'), 'X');
+    } finally {
+      store.close();
+    }
+  });
+
   it('sticks to one account until it is genuinely exhausted, then switches', () => {
     const store = openStore(':memory:');
     const A = anthropic('A', { '5h': reading(90), '7d': reading(90) });

@@ -39,6 +39,23 @@ function byAccountId(a: AccountSnapshot, b: AccountSnapshot): number {
   return a.accountId < b.accountId ? -1 : a.accountId > b.accountId ? 1 : 0;
 }
 
+/**
+ * Resolves a legacy bare Codex account id to one unique S29 slot id.
+ * Exact matching remains the caller's responsibility and always takes precedence.
+ */
+export function findUniqueCodexAlias(
+  storedId: string,
+  snapshots: AccountSnapshot[],
+): AccountSnapshot | null {
+  if (storedId.includes(':')) return null;
+  const matches = snapshots.filter((snapshot) => {
+    if (snapshot.provider !== 'openai-codex') return false;
+    const separator = snapshot.accountId.indexOf(':');
+    return separator >= 0 && snapshot.accountId.slice(separator + 1) === storedId;
+  });
+  return matches.length === 1 ? matches[0] : null;
+}
+
 /** Existing headroom-then-all-in picker. First max-score wins (iteration order). */
 function bestOf(
   snapshots: AccountSnapshot[],
@@ -190,7 +207,7 @@ function pickFailover(
   const key = failoverConfigKey(provider);
   const currentId = store?.getConfig(key) ?? null;
   let snapshot = currentId
-    ? eligible.find((s) => s.accountId === currentId) ?? null
+    ? eligible.find((s) => s.accountId === currentId) ?? findUniqueCodexAlias(currentId, eligible)
     : null;
   if (!snapshot) {
     snapshot = eligible[0];

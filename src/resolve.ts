@@ -5,7 +5,7 @@ import {
   scoreAccount,
   type Strategy,
 } from './scoring';
-import { isFullyExhausted, pickAccount } from './strategies';
+import { findUniqueCodexAlias, isFullyExhausted, pickAccount } from './strategies';
 import { ROUTING_DECISION_MODES, type Store } from './store';
 
 export { ROUTING_DECISION_MODES };
@@ -212,7 +212,8 @@ function resolvePinned(
   const pin = req.store.getPinOverride(req.session);
   if (!pin) return null;
 
-  const snap = req.snapshots.find((s) => s.accountId === pin.account_id);
+  const snap = req.snapshots.find((s) => s.accountId === pin.account_id)
+    ?? findUniqueCodexAlias(pin.account_id, req.snapshots);
   const unavailable = (reason: string): ResolvePinnedUnavailable => {
     const decision: ResolvePinnedUnavailable = {
       ok: false,
