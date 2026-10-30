@@ -208,7 +208,9 @@ export async function attributeForPhase(
       ...input,
       assertNotCompromised: deps.assertHeld,
       ...(phase === 'pre' ? {} : {
-        republish: (doc: CodexAuthDocument) => { throw new CodexRepublishForbidden(codexIdentity(doc)); },
+        // Report the slot attribution selected; the bytes it would republish
+        // may carry missing or mismatched identity claims.
+        republish: (_doc: CodexAuthDocument, slotId: string) => { throw new CodexRepublishForbidden(slotId); },
       }),
     });
   } catch (error) {
@@ -222,7 +224,7 @@ export type CodexRecoveryEffect =
   | { outcome: 'ok'; adopted?: boolean }
   | { outcome: 'reverted-by-codex'; accountId: string }
   | { outcome: 'quiet'; adopted?: boolean }
-  | { outcome: 'stopped'; reason: 'logged-out' | 'unknown-live-identity' | 'wiped' };
+  | { outcome: 'stopped'; reason: 'logged-out' | 'unknown-live-identity' | 'wiped'; activeAccountId?: null };
 
 export type CodexRecoveryVerdict =
   | { class: 'resolvable'; effect: CodexRecoveryEffect }
@@ -235,7 +237,18 @@ export interface ResolveRecoveryVerdictContext {
   watch?: Pick<CodexSwitchJournal, 'from' | 'to' | 'target' | 'adoptingTarget'>;
   /** The current fingerprint of slot B, read in the same locked observation. */
   targetSlotFingerprint: string;
-  /** The observed live document, retained when classification lost it (target-changed). */
+  /**
+   * Every managed slot id → its current head fingerprint, read in the same
+   * locked observation.  A slot whose DB and Keychain disagree (split) has no
+   * established head: it maps to `null`, so it still counts as a known slot
+   * for the fenced set but never as a head live can have caught up with.
+   */
+  slotHeads: ReadonlyMap<string, string | null>;
+  /**
+   * The observed live document.  When absent it defaults to the classified
+   * document for `{status:'external'}`; pass it for `target-changed`, whose
+   * classification does not carry the document.
+   */
   live?: CodexAuthDocument | null;
 }
 
@@ -245,15 +258,29 @@ function recoveryContext(context: ResolveRecoveryVerdictContext): Pick<CodexSwit
   return source;
 }
 
+function liveDocument(
+  classified: CodexPostPublishClassification,
+  context: ResolveRecoveryVerdictContext,
+): CodexAuthDocument | null | undefined {
+  if (context.live !== undefined) return context.live;
+  return typeof classified === 'object' && classified.status === 'external' ? classified.doc : undefined;
+}
+
 function unresolvedAccounts(
   context: ResolveRecoveryVerdictContext,
+  live: CodexAuthDocument | null | undefined,
   attribution: CodexPhaseAttribution | undefined,
   reason: Extract<CodexRecoveryVerdict, { class: 'unresolved' }>['reason'],
 ): string[] | '*' {
   const state = recoveryContext(context);
-  // §3.1 fails closed when the live identity cannot be established.
-  if (reason === 'logged-out' || attribution?.action === 'stash-unverifiable' || context.live === undefined || context.live === null) return '*';
+  // §3.1 fails closed when the live identity, or the republished slot, cannot be established.
+  if (reason === 'logged-out' || attribution?.action === 'stash-unverifiable' || live === undefined || live === null) return '*';
+  if (attribution?.action === 'republish-forbidden' && attribution.slotId === null) return '*';
+  const liveIdentity = codexIdentity(live);
+  if (!liveIdentity) return '*';
   const accounts = new Set([state.from, state.to]);
+  // The live identity's known slot is fenced whatever the attribution says.
+  if (context.slotHeads.has(liveIdentity)) accounts.add(liveIdentity);
   if (attribution?.action === 'slot-split' && attribution.accountId) accounts.add(attribution.accountId);
   if (attribution?.action === 'republish-forbidden' && attribution.slotId) accounts.add(attribution.slotId);
   if (attribution?.action === 'drift' && attribution.disposition === 'slot-split' && attribution.accountId) {
@@ -262,7 +289,6 @@ function unresolvedAccounts(
   // A managed live identity is reported by attribution's accountId.  An
   // unmanaged, but syntactically valid identity contributes no managed slot.
   if (attribution && 'accountId' in attribution && attribution.accountId) accounts.add(attribution.accountId);
-  if (!codexIdentity(context.live)) return '*';
   return [...accounts].sort();
 }
 
@@ -279,9 +305,21 @@ export function resolveRecoveryVerdict(
 ): CodexRecoveryVerdict {
   const state = recoveryContext(context);
   const isWatch = context.phase === 'watch';
+  const live = liveDocument(classified, context);
   const resolved = (effect: CodexRecoveryEffect): CodexRecoveryVerdict => ({ class: 'resolvable', effect });
   const unresolved = (reason: Extract<CodexRecoveryVerdict, { class: 'unresolved' }>['reason']): CodexRecoveryVerdict =>
-    ({ class: 'unresolved', reason, involvedAccounts: unresolvedAccounts(context, attribution, reason) });
+    ({ class: 'unresolved', reason, involvedAccounts: unresolvedAccounts(context, live, attribution, reason) });
+  // Fail-closed attribution rows.  A forbidden republish onto the target, or
+  // onto a slot that cannot be established, is target-ancestor: an unknown
+  // slot may be the target, and that row is the unresolved one.
+  const failClosed = (): CodexRecoveryVerdict | undefined => {
+    if (attribution?.action === 'republish-forbidden'
+      && (attribution.slotId === null || attribution.slotId === state.to)) return unresolved('target-ancestor');
+    if (attribution?.action === 'slot-split'
+      || (attribution?.action === 'drift' && attribution.disposition === 'slot-split')) return unresolved('slot-split');
+    if (attribution?.action === 'stash-unverifiable') return unresolved('stash-unverifiable');
+    return undefined;
+  };
 
   if (classified === 'not-landed') return resolved({ outcome: 'failed', detail: 'not-published' });
   if (typeof classified === 'object' && classified.status === 'missing') {
@@ -295,31 +333,35 @@ export function resolveRecoveryVerdict(
     : { outcome: 'failed', detail: 'wiped' });
 
   if (classified === 'target-changed') {
-    // A changed B is never an ok row.  It is recoverable only when the live
-    // bytes have caught up with B's current head, and remains target-changed.
-    if (context.live !== undefined && context.live !== null
-      && codexFingerprint(context.live) === context.targetSlotFingerprint) {
-      return resolved({ outcome: 'failed', detail: 'target-changed' });
+    // A changed B is never an ok row.  A fail-closed attribution wins; else it
+    // is recoverable only once the live bytes equal a current slot head (any
+    // managed slot, not only B), and remains target-changed.
+    const blocked = failClosed();
+    if (blocked) return blocked;
+    if (live !== undefined && live !== null) {
+      const liveFp = codexFingerprint(live);
+      if ([...context.slotHeads.values()].some((head) => head !== null && head === liveFp)) {
+        return resolved({ outcome: 'failed', detail: 'target-changed' });
+      }
     }
     return unresolved('target-changed');
   }
 
   const targetWasMoved = context.targetSlotFingerprint !== state.target.fingerprint;
-  if (attribution?.action === 'republish-forbidden') {
-    return attribution.slotId === state.to ? unresolved('target-ancestor')
-      : resolved({ outcome: 'reverted-by-codex', accountId: attribution.slotId ?? state.from });
+  const blocked = failClosed();
+  if (blocked) return blocked;
+  // failClosed() has already returned for a null slot or the target.
+  if (attribution?.action === 'republish-forbidden' && attribution.slotId !== null) {
+    return resolved({ outcome: 'reverted-by-codex', accountId: attribution.slotId });
   }
-  if (attribution?.action === 'slot-split'
-    || (attribution?.action === 'drift' && attribution.disposition === 'slot-split')) return unresolved('slot-split');
-  if (attribution?.action === 'stash-unverifiable') return unresolved('stash-unverifiable');
   if (attribution?.action === 'unclaimed') return resolved(isWatch
-    ? { outcome: 'stopped', reason: 'unknown-live-identity' }
+    ? { outcome: 'stopped', reason: 'unknown-live-identity', activeAccountId: null }
     : { outcome: 'failed', detail: 'unknown-live-identity', activeAccountId: null });
 
   if (classified === 'ok' && !targetWasMoved) return resolved(isWatch ? { outcome: 'quiet' } : { outcome: 'ok' });
 
   const disposition = attribution?.action === 'drift' ? attribution.disposition : attribution?.action;
-  const accountId = attribution?.accountId;
+  const accountId = attribution && 'accountId' in attribution ? attribution.accountId : undefined;
   if ((disposition === 'noop' || disposition === 'adopt') && accountId === state.to) {
     return resolved(isWatch ? { outcome: 'quiet', adopted: disposition === 'adopt' } : { outcome: 'ok', adopted: disposition === 'adopt' });
   }

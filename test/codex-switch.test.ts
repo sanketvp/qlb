@@ -439,12 +439,21 @@ describe('phase-aware attribution and §3.1 recovery resolution — C6-15', () =
   function targetDocument(refresh = 'target-refresh'): CodexAuthDocument {
     return freshenDocument(1_700_000_000_000 + 60 * 60_000, refresh);
   }
+  /** A document whose S29 identity is `<user>:account`. */
+  function identityDocument(user: string, refresh: string): CodexAuthDocument {
+    const doc = targetDocument(refresh);
+    return { ...doc, tokens: { ...doc.tokens, id_token: freshenJwt({ 'https://api.openai.com/auth': { chatgpt_user_id: user, chatgpt_account_id: 'account' } }) } };
+  }
   function context(target: CodexAuthDocument, phase: 'post' | 'recovery' | 'watch' = 'post', overrides: Record<string, unknown> = {}) {
     const journal = journalFixture('unused', {
       to: 'target:account',
       target: { identity: { chatgpt_user_id: 'target', account_id: 'account' }, fingerprint: codexFingerprint(target) },
     });
-    return { phase, journal, targetSlotFingerprint: codexFingerprint(target), live: target, ...overrides } as const;
+    const slotHeads = new Map<string, string | null>([
+      ['from:account', codexFingerprint(identityDocument('from', 'from-head'))],
+      ['target:account', codexFingerprint(target)],
+    ]);
+    return { phase, journal, targetSlotFingerprint: codexFingerprint(target), slotHeads, live: target, ...overrides } as const;
   }
 
   it('§3.1 not-landed is resolvable in post-publish and recovery', () => {
@@ -484,14 +493,57 @@ describe('phase-aware attribution and §3.1 recovery resolution — C6-15', () =
   it('target-changed after an import becomes resolvable only as failed(target-changed) once live equals the current slot head', () => {
     const target = targetDocument();
     const imported = targetDocument('imported-target');
+    const slotHeads = new Map([['from:account', codexFingerprint(identityDocument('from', 'from-head'))], ['target:account', codexFingerprint(imported)]]);
     const unresolved = resolveRecoveryVerdict('target-changed', { action: 'adopt', accountId: 'target:account' }, context(target, 'recovery', {
-      targetSlotFingerprint: codexFingerprint(imported), live: target,
+      targetSlotFingerprint: codexFingerprint(imported), slotHeads, live: target,
     }));
     assert.equal(unresolved.class, 'unresolved');
     const resolved = resolveRecoveryVerdict('target-changed', { action: 'noop', accountId: 'target:account' }, context(target, 'recovery', {
-      targetSlotFingerprint: codexFingerprint(imported), live: imported,
+      targetSlotFingerprint: codexFingerprint(imported), slotHeads, live: imported,
     }));
     assert.deepEqual(resolved, { class: 'resolvable', effect: { outcome: 'failed', detail: 'target-changed' } });
+  });
+
+  it('target-changed resolves as failed(target-changed) once live equals the outgoing slot\'s current head', () => {
+    const target = targetDocument();
+    const imported = targetDocument('imported-target');
+    const fromHead = identityDocument('from', 'from-head');
+    const verdict = resolveRecoveryVerdict('target-changed', undefined, context(target, 'recovery', {
+      targetSlotFingerprint: codexFingerprint(imported),
+      slotHeads: new Map([['from:account', codexFingerprint(fromHead)], ['target:account', codexFingerprint(imported)]]),
+      live: fromHead,
+    }));
+    assert.deepEqual(verdict, { class: 'resolvable', effect: { outcome: 'failed', detail: 'target-changed' } });
+  });
+
+  it('an unresolved target-changed with live on a third managed slot C involves {from, to, C} without attribution', () => {
+    const target = targetDocument();
+    const imported = targetDocument('imported-target');
+    const thirdLive = identityDocument('third', 'third-older');
+    const verdict = resolveRecoveryVerdict('target-changed', undefined, context(target, 'recovery', {
+      targetSlotFingerprint: codexFingerprint(imported),
+      slotHeads: new Map([
+        ['from:account', codexFingerprint(identityDocument('from', 'from-head'))],
+        ['target:account', codexFingerprint(imported)],
+        ['third:account', codexFingerprint(identityDocument('third', 'third-head'))],
+      ]),
+      live: thirdLive,
+    }));
+    assert.deepEqual(verdict, {
+      class: 'unresolved', reason: 'target-changed', involvedAccounts: ['from:account', 'target:account', 'third:account'],
+    });
+  });
+
+  it('a slot-split attribution keeps target-changed unresolved even when live equals the split slot\'s DB fingerprint', () => {
+    const target = targetDocument();
+    const imported = targetDocument('imported-target');
+    const verdict = resolveRecoveryVerdict('target-changed', { action: 'slot-split', accountId: 'target:account' }, context(target, 'recovery', {
+      targetSlotFingerprint: codexFingerprint(imported),
+      // A split slot has no established head.
+      slotHeads: new Map([['from:account', codexFingerprint(identityDocument('from', 'from-head'))], ['target:account', null]]),
+      live: imported,
+    }));
+    assert.deepEqual(verdict, { class: 'unresolved', reason: 'slot-split', involvedAccounts: ['from:account', 'target:account'] });
   });
 
   it('§3.1 settled-on-target is ok in post/recovery and quiet-adopted in watch', () => {
@@ -612,6 +664,50 @@ describe('phase-aware attribution and §3.1 recovery resolution — C6-15', () =
       assert.equal(h.store.getCodexSlot(plan.slotId)?.fingerprint, slotBefore);
       assert.deepEqual(h.db.prepare('SELECT COUNT(*) AS count FROM lineage_log').get(), rowsBefore);
     } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('a forbidden republish whose stored document lacks identity claims is attributed to the selected slot, not to from', async () => {
+    const h = fixture();
+    const keychain = new MockKeychain();
+    const oldLive = targetDocument('live-b0');
+    const newerSlot = targetDocument('slot-b1');
+    try {
+      const plan = importActiveCodexSlot(oldLive, { store: h.store, keychain, now: () => 1 });
+      importActiveCodexSlot(newerSlot, { store: h.store, keychain, now: () => 2 });
+      // Same lineage bytes (fingerprint), but no identity claims to re-derive the slot from.
+      const claimless = { ...newerSlot, tokens: { ...newerSlot.tokens, id_token: freshenJwt({}) } };
+      const result = await attributeForPhase({ assertHeld: () => undefined }, 'recovery', {
+        store: h.store, keychain, slot: { accountId: plan.slotId, document: claimless }, live: oldLive,
+      });
+      assert.deepEqual(result, { action: 'republish-forbidden', slotId: plan.slotId });
+      assert.deepEqual(resolveRecoveryVerdict({ status: 'external', doc: oldLive }, result, context(newerSlot, 'recovery', { live: oldLive })), {
+        class: 'unresolved', reason: 'target-ancestor', involvedAccounts: ['from:account', 'target:account'],
+      });
+    } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('a forbidden republish with no establishable slot is unresolved and involves every account', () => {
+    const target = targetDocument();
+    for (const phase of ['post', 'recovery', 'watch'] as const) {
+      assert.deepEqual(resolveRecoveryVerdict({ status: 'external', doc: target }, { action: 'republish-forbidden', slotId: null }, context(target, phase)),
+        { class: 'unresolved', reason: 'target-ancestor', involvedAccounts: '*' });
+    }
+  });
+
+  it('an external slot-split onto C without an explicit live document involves {from, to, C}', () => {
+    const target = targetDocument();
+    const third = identityDocument('third', 'third-live');
+    assert.deepEqual(resolveRecoveryVerdict({ status: 'external', doc: third }, { action: 'slot-split', accountId: 'third:account' },
+      context(target, 'recovery', { live: undefined })), {
+      class: 'unresolved', reason: 'slot-split', involvedAccounts: ['from:account', 'target:account', 'third:account'],
+    });
+  });
+
+  it('watch on an unclaimed identity stops with activeAccountId null', () => {
+    const target = targetDocument();
+    assert.deepEqual(resolveRecoveryVerdict({ status: 'external', doc: target }, { action: 'unclaimed' }, context(target, 'watch')), {
+      class: 'resolvable', effect: { outcome: 'stopped', reason: 'unknown-live-identity', activeAccountId: null },
+    });
   });
 
   it('attribution receives assertHeld in every phase', async () => {
