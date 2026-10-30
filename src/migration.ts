@@ -2203,10 +2203,16 @@ export class Migration {
         entryPresent: true,
         entry: this.piEntryFromGrant(grant, backup),
       });
+      if (keychainDigest(grant) !== decision.kd0 || canonicalDigest(record) !== decision.sourceDigest) {
+        throw Object.assign(new Error('rollback-source-tampered'), { exitCode: 3 });
+      }
     } else {
       const backup = readPiAuthBackup(this.poolFilePath, authKey);
       if (!backup) throw Object.assign(new Error('no-restore-source'), { exitCode: 3 });
       record = backup;
+      if (canonicalDigest(record) !== decision.sourceDigest) {
+        throw Object.assign(new Error('rollback-source-tampered'), { exitCode: 3 });
+      }
     }
 
     // Check the source before writing: a retry's guard (a) must never find an
