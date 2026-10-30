@@ -364,6 +364,23 @@ describe('Codex target freshen — C6-12b', () => {
     } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
   });
 
+  it('a target another process refreshed while this freshen waited for the locks is not refreshed again (C6-12b r2)', async () => {
+    const h = freshenHarness(9 * 60_000);
+    try {
+      const stale = h.current();
+      const refreshed = freshenDocument(h.now + 20 * 60_000, 'freshen-refresh-other');
+      let reads = 0;
+      const readSlot = () => {
+        reads += 1;
+        const document = reads === 1 ? stale : refreshed;
+        return { document, fingerprint: codexFingerprint(document) };
+      };
+      assert.deepEqual(await h.run({ slots: { ...h.slots, readSlot } }), { kind: 'go' });
+      assert.equal(h.posts(), 0);
+      assert.equal(h.writes(), 0);
+    } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
   it('a target within ten minutes and no holder is refreshed once under consume then switch lock', async () => {
     const h = freshenHarness(9 * 60_000);
     try {

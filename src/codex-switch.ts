@@ -369,6 +369,8 @@ export async function freshenCodexTarget(
       if (deps.store.getCodexActiveLogin() === target) return { kind: 'go' };
       const snapshot = readTarget();
       if (!snapshot) return { kind: 'refused', reason: 'target-freshen-slot-removed' };
+      // Another process may have refreshed it while this call waited for the locks.
+      if (expiresAfter(snapshot, now + 10 * 60_000)) return { kind: 'go' };
       lockedSnapshot = snapshot;
 
       outcome = await consumeCodexSlot({
