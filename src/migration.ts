@@ -1226,6 +1226,9 @@ export class Migration {
     const handback = rawHandback
       ? {
         ...rawHandback,
+        decision: rawHandback.decision === null
+          ? 'not fenced'
+          : rawHandback.decision,
         fencedGeneration: rawHandback.fencedGeneration === null
           ? 'not fenced'
           : rawHandback.fencedGeneration,

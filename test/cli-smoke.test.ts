@@ -174,6 +174,57 @@ describe('CLI smoke — documented commands', () => {
     }
   });
 
+  it('plain-text migrate status prints the hand-back record fields with null shown as not fenced', () => {
+    const env = isolatedEnv();
+    const store = openStore(env.QLB_DB_PATH!);
+    try {
+      store.upsertMigration('pi-xai', 'NATIVE', JSON.stringify({
+        handback: {
+          phase: 'cleanup-pending',
+          keychainDisposition: 'keep',
+          piFingerprint: null,
+          decision: null,
+          fencedGeneration: null,
+          rolledBackAt: 123,
+        },
+      }));
+    } finally {
+      store.close();
+    }
+
+    const result = runCli([
+      'migrate',
+      'status',
+      '--provider',
+      'xai',
+      '--target-dir',
+      join(env.QLB_HOME!, 'migrate'),
+      '--db',
+      env.QLB_DB_PATH!,
+    ], env);
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /hand-back phase: cleanup-pending/);
+    assert.match(result.stdout, /hand-back keychain disposition: keep/);
+    assert.match(result.stdout, /hand-back pi fingerprint: null/);
+    assert.match(result.stdout, /hand-back decision: not fenced/);
+    assert.match(result.stdout, /hand-back fenced generation: not fenced/);
+    assert.match(result.stdout, /hand-back rolled back at: 123/);
+    assert.ok(
+      result.stdout.indexOf('hand-back phase:')
+        < result.stdout.indexOf('hand-back keychain disposition:')
+        && result.stdout.indexOf('hand-back keychain disposition:')
+          < result.stdout.indexOf('hand-back pi fingerprint:')
+        && result.stdout.indexOf('hand-back pi fingerprint:')
+          < result.stdout.indexOf('hand-back decision:')
+        && result.stdout.indexOf('hand-back decision:')
+          < result.stdout.indexOf('hand-back fenced generation:')
+        && result.stdout.indexOf('hand-back fenced generation:')
+          < result.stdout.indexOf('hand-back rolled back at:'),
+      'hand-back fields print in record order',
+    );
+  });
+
   it('override list --json exits 0 with an empty list', () => {
     const env = isolatedEnv();
     const result = runCli(['override', 'list', '--json', '--db', env.QLB_DB_PATH!], env);
