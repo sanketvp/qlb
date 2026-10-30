@@ -1925,6 +1925,11 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
           xai: { type: 'oauth', access: 'qlb-managed', refresh: '' },
         },
       },
+      {
+        name: 'the key absent under a decision recorded by an earlier build (entryPresent:false)',
+        auth: { 'kimi-coding': FAKE_GRANTS['kimi-coding'] },
+        legacyDecision: true,
+      },
     ]) {
       const h = setup('xai', new MockKeychain(), {
         afterStep: (point) => {
@@ -1942,9 +1947,16 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
         assert.throws(() => h.mig.rollback(), /fixture crash after S2/);
 
         const detailBefore = JSON.parse(h.store.getMigration('pi-xai')!.detail_json) as Record<string, unknown>;
-        const decisionBefore = detailBefore.rollbackDecision as RollbackDecision;
+        let decisionBefore = detailBefore.rollbackDecision as RollbackDecision;
         assert.equal(decisionBefore.kind, 'none', `${fixture.name}: S2 records kind:none`);
         assert.equal(decisionBefore.entryPresent, true, `${fixture.name}: S2 records the native entry was present`);
+        if ('legacyDecision' in fixture) {
+          // Earlier builds always recorded entryPresent:false for kind:none.
+          decisionBefore = { ...decisionBefore, entryPresent: false };
+          const migration = h.store.getMigration('pi-xai')!;
+          h.store.upsertMigration('pi-xai', migration.state,
+            JSON.stringify({ ...detailBefore, rollbackDecision: decisionBefore }), migration.updated_at);
+        }
         writeFileSync(h.authPath, JSON.stringify(fixture.auth, null, 2) + '\n');
         const journalBefore = h.store.getMigration('pi-xai');
         const generationBefore = h.store.getGrantGeneration(id);

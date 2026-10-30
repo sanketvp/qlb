@@ -2163,7 +2163,9 @@ export class Migration {
     const decision = isObjectRecord(recordedDecision) ? recordedDecision as unknown as RollbackDecision : null;
     // Guard (b): preserve the fenced decision; do not rank again when Pi's
     // formerly valid entry disappears or becomes the P7a placeholder.
-    if (isPiPlaceholder(entry) || (!entryPresent && decision?.entryPresent)) {
+    // S2 ranks kind:none only when A was valid, so kind:none itself proves A was
+    // present; that also covers decisions recorded before entryPresent was kept.
+    if (isPiPlaceholder(entry) || (!entryPresent && (decision?.kind === 'none' || decision?.entryPresent))) {
       if (decision?.kind === 'none') {
         throw Object.assign(new Error('native-entry-missing'), { exitCode: 3 });
       }
