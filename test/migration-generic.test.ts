@@ -2304,6 +2304,107 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     }
   });
 
+  it('S4a\'s map write is made durable before S5 when S4b unlinks nothing (P7b5-41 r1)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-generic-mig-'));
+    const store = openStore(join(dir, 'qlb.db'));
+    try {
+      const authPath = join(dir, 'auth.json');
+      const ownerMapPath = join(dir, 'qlb-owner.json');
+      writeFileSync(authPath, fixtureAuthJson(), { encoding: 'utf8', mode: 0o600 });
+      const synced: string[] = [];
+      const mig = createSingleGrantMigration(store, new MockKeychain(), 'xai', authPath, ownerMapPath, 'xai', {
+        fsyncDirectory: (path) => { synced.push(resolve(path)); },
+      });
+      mig.stage();
+      await mig.rehearse(mockRehearse([]));
+      mig.commit();
+      const otherEntry = { mode: 'qlb', since: 987_654 };
+      writeFileSync(ownerMapPath, JSON.stringify({ providers: { xai: { mode: 'qlb', since: 1 }, 'kimi-coding': otherEntry } }, null, 2) + '\n');
+      synced.length = 0;
+
+      mig.rollback();
+      assert.ok(synced.includes(resolve(dir)), `the owner map's directory is fsynced (synced: ${synced.join(', ')})`);
+      const after = JSON.parse(readFileSync(ownerMapPath, 'utf8')) as { providers: Record<string, unknown> };
+      assert.deepEqual(after.providers, { 'kimi-coding': otherEntry }, 'the v2 map survives without this provider');
+    } finally {
+      store.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('S4b applies the map-path rule to an unnormalised --owner-file and a refusal keeps the legacy sidecar (P7b5-41 r1)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-generic-mig-'));
+    const store = openStore(join(dir, 'qlb.db'));
+    try {
+      const authPath = join(dir, 'auth.json');
+      const ownerMapPath = join(dir, 'qlb-owner.json');
+      writeFileSync(authPath, fixtureAuthJson(), { encoding: 'utf8', mode: 0o600 });
+      const mig = createSingleGrantMigration(store, new MockKeychain(), 'xai', authPath, `${dir}/./qlb-owner.json`);
+      mig.stage();
+      await mig.rehearse(mockRehearse([]));
+      mig.commit();
+      const mixedV1 = JSON.stringify({ owner: 'qlb', accounts: [{ provider: 'xai' }, { provider: 'kimi-coding' }] }) + '\n';
+      writeFileSync(ownerMapPath, mixedV1);
+      const sidecar = join(dir, 'qlb-owner-xai.json');
+      writeFileSync(sidecar, JSON.stringify({ owner: 'qlb', accounts: [{ provider: 'xai' }] }) + '\n');
+
+      assert.throws(() => mig.rollback(), (error: Error & { exitCode?: unknown }) => {
+        assert.match(error.message, /owner-file-orphan: .* names another provider/);
+        assert.equal(error.exitCode, 3);
+        return true;
+      });
+      assert.deepEqual(readFileSync(ownerMapPath), Buffer.from(mixedV1), 'the shared v1 file naming another provider is kept');
+      assert.equal(existsSync(sidecar), true, 'a refusal unlinks nothing, not even the legacy sidecar');
+    } finally {
+      store.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('S4b decides and unlinks a map-path v1 file under the owner-map lock when it is not the auth lock (P7b5-41 r1)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-generic-mig-'));
+    const store = openStore(join(dir, 'qlb.db'));
+    try {
+      const authPath = join(dir, 'auth.json');
+      const ownerDir = join(dir, 'owner');
+      mkdirSync(ownerDir);
+      const ownerMapPath = join(ownerDir, 'qlb-owner.json');
+      writeFileSync(authPath, fixtureAuthJson(), { encoding: 'utf8', mode: 0o600 });
+      const lock = join(ownerDir, 'auth.json.lock');
+      let holdLock = false;
+      const mig = createSingleGrantMigration(store, new MockKeychain(), 'xai', authPath, ownerMapPath, 'xai', {
+        afterStep: (point) => {
+          // Another writer takes the owner-map lock between S4a and S4b.
+          if (point === 'S4a' && holdLock) {
+            mkdirSync(lock);
+            writeFileSync(join(lock, 'qlb-lock-owner.json'), `${JSON.stringify({ pid: process.pid, nonce: 'another-holder' })}\n`);
+          }
+        },
+      });
+      mig.stage();
+      await mig.rehearse(mockRehearse([]));
+      mig.commit();
+      assert.equal(hasLegacyPiOwnerEntry(ownerMapPath, 'xai'), true, 'the commit wrote a v1 owner file at the map path');
+      holdLock = true;
+
+      assert.throws(() => mig.rollback(), (error: Error & { exitCode?: unknown }) => {
+        assert.match(error.message, /pi-auth-locked/);
+        assert.equal(error.exitCode, 3);
+        return true;
+      });
+      assert.equal(existsSync(ownerMapPath), true, 'S4b does not unlink the map without the owner-map lock');
+
+      holdLock = false;
+      rmSync(lock, { recursive: true, force: true });
+      mig.resume();
+      assert.equal(existsSync(ownerMapPath), false);
+      assert.ok(JSON.parse(store.getMigration('pi-xai')!.detail_json).lastRollback);
+    } finally {
+      store.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('T-S4c crash between map entry removal and sidecar unlink resumes without rewriting auth.json', async () => {
     let crash = true;
     const h = setup('xai', new MockKeychain(), {

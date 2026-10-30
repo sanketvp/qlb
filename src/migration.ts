@@ -1109,57 +1109,78 @@ export class Migration {
   }
 
   /**
+   * Run `fn` under the owner-map lock. rollback()/resume() already hold Pi's
+   * auth.json lock, which is that lock when both files share a directory; it is
+   * not re-entrant, so only a different one is taken. A held lock refuses with
+   * exit 3, like a held auth lock.
+   */
+  private withOwnerMapLockUnlessHeld<T>(fn: () => T): T {
+    if (resolve(dirname(this.ownerMapPath), 'auth.json') === resolve(this.poolFilePath)) return fn();
+    try {
+      return this.withOwnerMapLock(fn);
+    } catch (error: unknown) {
+      if (error && typeof error === 'object' && (error as { code?: unknown }).code === 'pi-auth-locked') {
+        throw Object.assign(error, { exitCode: 3 });
+      }
+      throw error;
+    }
+  }
+
+  /**
    * S4b: remove the generic path's legacy claims after S4a released its v2
-   * entry. The caller already holds Pi's auth.json lock; do not take it (or
-   * the owner-map lock) again here.
+   * entry. Returns every directory to make durable before S5, always including
+   * the owner map's (S4a's write).
    */
   private unlinkSingleGrantLegacyOwnerFiles(): string[] {
-    const syncedDirectories = new Set<string>();
-    const rememberDirectory = (path: string): void => {
-      syncedDirectories.add(resolve(dirname(path)));
+    const directories = new Set<string>([resolve(dirname(this.ownerMapPath))]);
+    const unlinkClaim = (path: string): void => {
+      unlinkIfExists(path);
+      directories.add(resolve(dirname(path)));
     };
-    const legacySidecar = this.legacySidecarPath();
-    if (legacySidecar) {
-      unlinkIfExists(legacySidecar);
-      rememberDirectory(legacySidecar);
-    }
 
-    if (this.ownerFilePath !== this.ownerMapPath) {
+    if (resolve(this.ownerFilePath) === resolve(this.ownerMapPath)) {
+      // A custom --owner-file may name qlb-owner.json itself (user decision
+      // 2026-10-30). Decide and unlink under the owner-map lock, before any
+      // other unlink, so a refusal changes nothing and no other writer can
+      // swap in a v2 map between the check and the unlink.
+      this.withOwnerMapLockUnlessHeld(() => {
+        if (this.mapPathV1NamesOnlyThisProvider()) unlinkClaim(this.ownerMapPath);
+      });
+    } else if (hasLegacyPiOwnerEntry(this.ownerFilePath, this.ownerProvider())) {
       // Oc is a v1 claim only. A v2 map, a foreign v1 document, or no file is
       // not this migration's claim and must survive.
-      if (hasLegacyPiOwnerEntry(this.ownerFilePath, this.ownerProvider())) {
-        unlinkIfExists(this.ownerFilePath);
-        rememberDirectory(this.ownerFilePath);
-      }
-      return [...syncedDirectories];
+      unlinkClaim(this.ownerFilePath);
     }
 
-    // A custom --owner-file may name qlb-owner.json itself. S4a deliberately
-    // leaves its v1 shape alone; distinguish that legacy document from a v2
-    // map before deciding whether it is safe to unlink the shared pathname.
+    const legacySidecar = this.legacySidecarPath();
+    if (legacySidecar) unlinkClaim(legacySidecar);
+    return [...directories];
+  }
+
+  /**
+   * For the map path: false for a v2 map or no file (S4a owns those), true for
+   * a v1 document whose accounts all name this provider; any other v1 document
+   * refuses owner-file-orphan (exit 3) and is kept.
+   */
+  private mapPathV1NamesOnlyThisProvider(): boolean {
     try {
       readPiOwnerProviders(this.ownerMapPath);
-      return [...syncedDirectories]; // v2 (or absent): S4a owns this map.
+      return false;
     } catch (error) {
       if (!(error instanceof PiOwnerLegacyError)) throw error;
     }
-
     const owner: unknown = JSON.parse(readFileSync(this.ownerMapPath, 'utf8'));
-    const accounts = isObjectRecord(owner) && Array.isArray(owner.accounts) ? owner.accounts : null;
-    const namesOnlyThisProvider = accounts !== null
-      && accounts.length > 0
-      && accounts.every((account) =>
-        isObjectRecord(account) && account.provider === this.ownerProvider(),
-      );
-    if (!hasLegacyPiOwnerEntry(this.ownerMapPath, this.ownerProvider()) || !namesOnlyThisProvider) {
-      throw Object.assign(
-        new Error(`owner-file-orphan: ${this.ownerMapPath} is a v1 owner file naming another provider; leave it in place and repair it before retrying.`),
-        { exitCode: 3 },
-      );
-    }
-    unlinkIfExists(this.ownerMapPath);
-    rememberDirectory(this.ownerMapPath);
-    return [...syncedDirectories];
+    const accounts = isObjectRecord(owner) && Array.isArray(owner.accounts) ? owner.accounts : [];
+    const provider = this.ownerProvider();
+    const isThisProvider = (account: unknown): boolean => isObjectRecord(account) && account.provider === provider;
+    if (hasLegacyPiOwnerEntry(this.ownerMapPath, provider) && accounts.every(isThisProvider)) return true;
+    const detail = accounts.some((account) => !isThisProvider(account))
+      ? 'names another provider'
+      : `does not record a QLB claim for ${provider} alone`;
+    throw Object.assign(
+      new Error(`owner-file-orphan: ${this.ownerMapPath} is a v1 owner file that ${detail}; leave it in place and repair it before retrying.`),
+      { exitCode: 3 },
+    );
   }
 
   /** True when commit must not rename/delete the native store. */
@@ -2008,22 +2029,11 @@ export class Migration {
             if (!(error instanceof PiOwnerLegacyError)) throw error;
           }
         };
-        if (resolve(dirname(this.ownerMapPath), 'auth.json') === resolve(this.poolFilePath)) unown();
-        else {
-          try {
-            this.withOwnerMapLock(unown);
-          } catch (error: unknown) {
-            // A held owner-map lock is the same refusal as a held auth lock (exit 3).
-            if (error && typeof error === 'object' && (error as { code?: unknown }).code === 'pi-auth-locked') {
-              throw Object.assign(error, { exitCode: 3 });
-            }
-            throw error;
-          }
-        }
+        this.withOwnerMapLockUnlessHeld(unown);
         this.afterStep?.('S4a');
-        // S4b follows S4a under the already-held auth lock. It unlinks L and
-        // only this provider's v1 Oc; it never deletes the shared v2 map.
-        // The unlink directories must be durable before S5's terminal marker.
+        // S4b unlinks L and only this provider's v1 Oc; it never deletes the
+        // shared v2 map. S4a's map write and every unlink must be durable
+        // before S5's terminal marker.
         for (const path of this.unlinkSingleGrantLegacyOwnerFiles()) this.fsyncDirectory(path);
         // The un-own must survive power loss before S5 records the hand-back:
         // resume after S5 never revisits the owner claim.
