@@ -1942,6 +1942,30 @@ export class Migration {
         // Validate and check for a live refresh before un-owning, so a refusal
         // leaves the claim intact.
         this.refuseDuringRefresh(journalAccount.id);
+        // S4a: atomic and idempotent, under the owner-map lock. rollback()/resume()
+        // already hold Pi's auth.json lock, which is that lock when both files share
+        // a directory; it is not re-entrant, so only a different one is taken here.
+        // A v1 document at the map path has no v2 entry to remove; the owner-file
+        // unlink below handles it, as before S4a.
+        const unown = () => {
+          try {
+            writePiOwnerEntry(this.ownerMapPath, this.ownerProvider(), false);
+          } catch (error: unknown) {
+            if (!(error instanceof PiOwnerLegacyError)) throw error;
+          }
+        };
+        if (resolve(dirname(this.ownerMapPath), 'auth.json') === resolve(this.poolFilePath)) unown();
+        else {
+          try {
+            this.withOwnerMapLock(unown);
+          } catch (error: unknown) {
+            // A held owner-map lock is the same refusal as a held auth lock (exit 3).
+            if (error && typeof error === 'object' && (error as { code?: unknown }).code === 'pi-auth-locked') {
+              throw Object.assign(error, { exitCode: 3 });
+            }
+            throw error;
+          }
+        }
         unlinkIfExists(this.ownerFilePath);
         // The un-own must survive power loss before S5 records the hand-back:
         // resume after S5 never revisits the owner claim.

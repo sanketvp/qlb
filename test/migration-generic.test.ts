@@ -29,6 +29,7 @@ import { parseGrant } from '../src/refresh-lease';
 import type { RollbackDecision } from '../src/single-grant-ownership';
 import { legacyPiAuthBackupPath, piAuthBackupPath, readPiAuthBackup, writePiAuthBackup } from '../src/pi-auth-backup';
 import { canonicalDigest, keychainDigest, restoreRecordFor } from '../src/pi-handback-source';
+import { hasLegacyPiOwnerEntry } from '../src/pi-migrate';
 import { openStore } from '../src/store';
 
 const fs = require('node:fs') as typeof import('node:fs');
@@ -2052,6 +2053,162 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       assert.ok(JSON.parse(h.store.getMigration('pi-xai')!.detail_json).lastRollback, 'the terminal journal records the hand-back');
     } finally {
       h.cleanup();
+    }
+  });
+
+  it('T-S4a owner entry is removed only after the restore is verified', async () => {
+    const h = setup('xai');
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      h.mig.commit();
+      const placeholder = { type: 'oauth', access: 'qlb-managed', refresh: '' };
+      const placeholderBytes = Buffer.from(JSON.stringify({ ...FAKE_GRANTS, xai: placeholder }, null, 2) + '\n');
+      const ownerMapPath = join(h.dir, 'qlb-owner.json');
+      const otherEntry = { mode: 'qlb', since: 987_654 };
+      writeFileSync(ownerMapPath, JSON.stringify({
+        providers: {
+          xai: { mode: 'qlb', since: 123_456 },
+          'kimi-coding': otherEntry,
+        },
+      }, null, 2) + '\n');
+      const ownerBefore = JSON.parse(readFileSync(ownerMapPath, 'utf8')) as { providers: Record<string, unknown> };
+      const otherEntryBytes = Buffer.from(JSON.stringify(ownerBefore.providers['kimi-coding']));
+      writeFileSync(h.authPath, placeholderBytes);
+
+      const guarded = h.mig as unknown as {
+        restoreSingleGrantPiAuthEntry: (key: string, record: unknown) => unknown;
+      };
+      const restore = guarded.restoreSingleGrantPiAuthEntry.bind(h.mig);
+      let failRestore = true;
+      guarded.restoreSingleGrantPiAuthEntry = (key, record) => {
+        const ownerDuringRestore = JSON.parse(readFileSync(ownerMapPath, 'utf8')) as { providers: Record<string, unknown> };
+        const authDuringRestore = JSON.parse(readFileSync(h.authPath, 'utf8')) as Record<string, unknown>;
+        assert.deepEqual(ownerDuringRestore.providers.xai, ownerBefore.providers.xai, 'S4a keeps the v2 entry until S3 has restored and verified');
+        assert.deepEqual(authDuringRestore.xai, placeholder, 'the v2 entry is never removed while A is the placeholder');
+        if (failRestore) throw new Error('injected S3 restore failure');
+        const result = restore(key, record);
+        const ownerAfterRestoreWrite = JSON.parse(readFileSync(ownerMapPath, 'utf8')) as { providers: Record<string, unknown> };
+        assert.deepEqual(ownerAfterRestoreWrite.providers.xai, ownerBefore.providers.xai, 'S4a follows the S3 verification, not merely its write');
+        return result;
+      };
+
+      assert.throws(() => h.mig.rollback(), /injected S3 restore failure/);
+      const failedDetail = JSON.parse(h.store.getMigration('pi-xai')!.detail_json) as Record<string, unknown>;
+      const ownerAfterFailure = JSON.parse(readFileSync(ownerMapPath, 'utf8')) as { providers: Record<string, unknown> };
+      assert.deepEqual(readFileSync(h.authPath), placeholderBytes, 'failed S3 keeps auth.json');
+      assert.deepEqual(ownerAfterFailure.providers.xai, ownerBefore.providers.xai, 'failed S3 keeps the v2 owner entry');
+      assert.equal(failedDetail.intent, 'rollback', 'failed S3 keeps the rollback intent');
+      assert.ok(failedDetail.rollbackDecision, 'failed S3 keeps the fenced decision');
+
+      failRestore = false;
+      h.mig.resume();
+
+      const ownerAfterResume = JSON.parse(readFileSync(ownerMapPath, 'utf8')) as { providers: Record<string, unknown> };
+      const authAfterResume = JSON.parse(readFileSync(h.authPath, 'utf8')) as Record<string, unknown>;
+      assert.equal(Object.prototype.hasOwnProperty.call(ownerAfterResume.providers, 'xai'), false, 'S4a removes only this provider from the v2 map');
+      assert.deepEqual(Buffer.from(JSON.stringify(ownerAfterResume.providers['kimi-coding'])), otherEntryBytes, 'S4a keeps the other v2 entry byte-for-byte');
+      assert.deepEqual(authAfterResume.xai, FAKE_GRANTS.xai, 'A is the verified restored entry');
+      assert.ok(JSON.parse(h.store.getMigration('pi-xai')!.detail_json).lastRollback, 'the completed hand-back records lastRollback');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('S4a takes the owner-map lock when the owner file is outside auth.json\'s directory (P7b5-40 r1)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-generic-mig-'));
+    const store = openStore(join(dir, 'qlb.db'));
+    try {
+      const authPath = join(dir, 'auth.json');
+      const ownerDir = join(dir, 'owner');
+      mkdirSync(ownerDir);
+      writeFileSync(authPath, fixtureAuthJson(), { encoding: 'utf8', mode: 0o600 });
+      const mig = createSingleGrantMigration(store, new MockKeychain(), 'xai', authPath, join(ownerDir, 'qlb-owner-xai.json'), 'xai', {});
+      mig.stage();
+      await mig.rehearse(mockRehearse([]));
+      mig.commit();
+      const ownerMapPath = join(ownerDir, 'qlb-owner.json');
+      const otherEntry = { mode: 'qlb', since: 987_654 };
+      writeFileSync(ownerMapPath, JSON.stringify({ providers: { xai: { mode: 'qlb', since: 123_456 }, 'kimi-coding': otherEntry } }, null, 2) + '\n');
+      writeFileSync(authPath, JSON.stringify({ ...FAKE_GRANTS, xai: { type: 'oauth', access: 'qlb-managed', refresh: '' } }, null, 2) + '\n');
+      // A live holder of the owner-map lock in the owner file's directory.
+      const lock = join(ownerDir, 'auth.json.lock');
+      mkdirSync(lock);
+      writeFileSync(join(lock, 'qlb-lock-owner.json'), `${JSON.stringify({ pid: process.pid, nonce: 'another-holder' })}\n`);
+
+      assert.throws(() => mig.rollback(), (error: unknown) => {
+        assert.match(String((error as Error).message), /pi-auth-locked/);
+        assert.equal((error as { exitCode?: unknown }).exitCode, 3, 'a held owner-map lock refuses with exit 3');
+        return true;
+      });
+      const held = JSON.parse(readFileSync(ownerMapPath, 'utf8')) as { providers: Record<string, unknown> };
+      assert.ok(held.providers.xai, 'a held owner-map lock keeps the v2 entry');
+
+      rmSync(lock, { recursive: true, force: true });
+      mig.resume();
+      const after = JSON.parse(readFileSync(ownerMapPath, 'utf8')) as { providers: Record<string, unknown> };
+      assert.equal(Object.prototype.hasOwnProperty.call(after.providers, 'xai'), false);
+      assert.deepEqual(after.providers['kimi-coding'], otherEntry);
+      assert.ok(JSON.parse(store.getMigration('pi-xai')!.detail_json).lastRollback);
+    } finally {
+      store.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('S4a refuses on an owner map that became unreadable after the entry checks and keeps the decision (P7b5-40 r1)', async () => {
+    const h = setup('xai');
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      h.mig.commit();
+      const ownerMapPath = join(h.dir, 'qlb-owner.json');
+      writeFileSync(ownerMapPath, JSON.stringify({ providers: { xai: { mode: 'qlb', since: 1 } } }, null, 2) + '\n');
+      writeFileSync(h.authPath, JSON.stringify({ ...FAKE_GRANTS, xai: { type: 'oauth', access: 'qlb-managed', refresh: '' } }, null, 2) + '\n');
+      const guarded = h.mig as unknown as { restoreSingleGrantPiAuthEntry: (key: string, record: unknown) => unknown };
+      const restore = guarded.restoreSingleGrantPiAuthEntry.bind(h.mig);
+      let corrupt = true;
+      guarded.restoreSingleGrantPiAuthEntry = (key, record) => {
+        // The map turns unreadable after rollback's entry checks, before S4a.
+        if (corrupt) writeFileSync(ownerMapPath, '{ not json');
+        return restore(key, record);
+      };
+
+      assert.throws(() => h.mig.rollback());
+      const detail = JSON.parse(h.store.getMigration('pi-xai')!.detail_json) as Record<string, unknown>;
+      assert.equal(detail.intent, 'rollback', 'an unreadable map keeps the rollback intent');
+      assert.ok(detail.rollbackDecision, 'an unreadable map keeps the fenced decision');
+      assert.equal(detail.lastRollback, undefined, 'the hand-back is not recorded over a stale claim');
+
+      corrupt = false;
+      writeFileSync(ownerMapPath, JSON.stringify({ providers: { xai: { mode: 'qlb', since: 1 } } }, null, 2) + '\n');
+      h.mig.resume();
+      assert.equal(existsSync(ownerMapPath), false, 'the emptied map is unlinked');
+      assert.ok(JSON.parse(h.store.getMigration('pi-xai')!.detail_json).lastRollback);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('S4a leaves a v1 owner file at the map path to the owner-file unlink and completes the hand-back (P7b5-40 r3)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-generic-mig-'));
+    const store = openStore(join(dir, 'qlb.db'));
+    try {
+      const authPath = join(dir, 'auth.json');
+      const ownerMapPath = join(dir, 'qlb-owner.json');
+      writeFileSync(authPath, fixtureAuthJson(), { encoding: 'utf8', mode: 0o600 });
+      const mig = createSingleGrantMigration(store, new MockKeychain(), 'xai', authPath, ownerMapPath, 'xai', {});
+      mig.stage();
+      await mig.rehearse(mockRehearse([]));
+      mig.commit();
+      assert.equal(hasLegacyPiOwnerEntry(ownerMapPath, 'xai'), true, 'the commit wrote a v1 owner file at the map path');
+
+      mig.rollback();
+      assert.equal(existsSync(ownerMapPath), false, 'the v1 owner file is unlinked');
+      assert.ok(JSON.parse(store.getMigration('pi-xai')!.detail_json).lastRollback);
+    } finally {
+      store.close();
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 
