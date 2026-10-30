@@ -1,6 +1,6 @@
 import { mkdirSync, readFileSync, statSync, unlinkSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { accessExpiry, codexIdentity, type CodexAuthDocument, type CodexAuthStableWithStatResult, type CodexIdentity } from './codex-auth';
+import { accessExpiry, codexFingerprint, codexIdentity, writeCodexAuthAtomic, type CodexAuthDocument, type CodexAuthStableWithStatResult, type CodexIdentity } from './codex-auth';
 import { ClaudeCodeLockTimeout, type HeldProperLockfile, withProperLockfile } from './cc-locks';
 import { consumeCodexSlot, hasCodexSlotIdentity, withCodexConsumeThenSwitchLocks, type CodexConsumeOptions, type CodexConsumeResult } from './codex-consume';
 import { fsyncDirSync, atomicWriteText } from './fsutil';
@@ -110,6 +110,59 @@ export function checkCodexSwitchPreconditions(
     return refuse('codex-l13-unverified');
   }
   return { kind: 'go' };
+}
+
+/** Result of a single atomic target publication, including post-rename durability. */
+export type CodexAuthPublishResult =
+  | { stage: 'rename-threw'; error: unknown }
+  | { stage: 'published'; inode: number; dirFsyncError?: unknown };
+
+/**
+ * The post-rename verification classification. Non-OK stable-read results
+ * remain intact so callers retain their read error details.
+ */
+export type CodexPostPublishClassification =
+  | 'ok'
+  | 'not-landed'
+  | 'target-changed'
+  | { status: 'external'; doc: CodexAuthDocument }
+  | Exclude<CodexAuthStableWithStatResult, { status: 'ok' }>;
+
+/**
+ * Atomically replace the live auth file, then request durability of its parent
+ * directory entry. A directory-sync failure happens after rename and therefore
+ * remains distinguishable from a rename failure for verification.
+ */
+export async function publishCodexAuth(path: string, doc: CodexAuthDocument): Promise<CodexAuthPublishResult> {
+  let inode: number;
+  try {
+    inode = await writeCodexAuthAtomic(path, doc);
+  } catch (error: unknown) {
+    return { stage: 'rename-threw', error };
+  }
+  try {
+    fsyncDirSync(dirname(path));
+    return { stage: 'published', inode };
+  } catch (dirFsyncError: unknown) {
+    return { stage: 'published', inode, dirFsyncError };
+  }
+}
+
+/** Classify the stable post-publish read without performing any side effects. */
+export function classifyPostPublish(input: {
+  journal: CodexSwitchJournal;
+  publish?: CodexAuthPublishResult;
+  observed: CodexAuthStableWithStatResult;
+  targetSlotFp: string;
+}): CodexPostPublishClassification {
+  const { journal, publish, observed, targetSlotFp } = input;
+  if (publish?.stage === 'rename-threw') return 'not-landed';
+  if (publish === undefined && observed.status === 'ok'
+    && observed.inode === journal.outgoing.inode && observed.sha256 === journal.outgoing.sha256) return 'not-landed';
+  if (targetSlotFp !== journal.target.fingerprint && !journal.adoptingTarget.includes(targetSlotFp)) return 'target-changed';
+  if (observed.status !== 'ok') return observed;
+  if (codexFingerprint(observed.doc) === journal.target.fingerprint) return 'ok';
+  return { status: 'external', doc: observed.doc };
 }
 
 export const CODEX_SWITCH_JOURNAL_STALENESS_MS = 5 * 60_000;
