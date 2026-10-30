@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { lstat, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -15,6 +16,7 @@ import {
   needsRefresh,
   parseCodexAuth,
   readCodexAuthStable,
+  readCodexAuthStableWithStat,
   writeCodexAuthAtomic,
 } from '../src/codex-auth';
 import { redactSecrets } from '../src/redact';
@@ -453,5 +455,69 @@ describe('codex auth.json helpers', () => {
     });
     assert.equal(stable.status, 'ok');
     if (stable.status === 'ok') assert.equal(stable.doc.last_refresh, '2026-01-02T00:00:00.000Z');
+  });
+
+  it('stable read with stat returns the inode and file hash of the bytes it parsed', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'qlb-codex-auth-'));
+    const path = join(dir, 'auth.json');
+    const text = JSON.stringify(validDocument());
+    try {
+      await writeFile(path, text, 'utf8');
+      const result = await readCodexAuthStableWithStat(path, { delayMs: 0 });
+      assert.equal(result.status, 'ok');
+      if (result.status !== 'ok') throw new Error('expected stable auth document');
+      assert.equal(result.inode, (await stat(path)).ino);
+      assert.equal(result.sha256, `sha256-file:${createHash('sha256').update(text, 'utf8').digest('hex')}`);
+      assert.deepEqual(result.doc, parseValid());
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('equal bytes under two different inodes are not stable', async () => {
+    const text = JSON.stringify(validDocument());
+    const inodes = [101, 102, 103, 104];
+    const result = await readCodexAuthStableWithStat('/fake/auth.json', {
+      attempts: 2,
+      delayMs: 0,
+      openRead: async () => ({ text, ino: inodes.shift() ?? 104 }),
+    });
+    assert.deepEqual(result, { status: 'unstable' });
+  });
+
+  it('a truncated read retries and then reports unstable', async () => {
+    let reads = 0;
+    const result = await readCodexAuthStableWithStat('/fake/auth.json', {
+      attempts: 3,
+      delayMs: 0,
+      openRead: async () => {
+        reads += 1;
+        return { text: '{', ino: 101 };
+      },
+    });
+    assert.deepEqual(result, { status: 'unstable' });
+    assert.equal(reads, 6);
+  });
+
+  it('EACCES and EIO report unreadable with the code', async () => {
+    for (const code of ['EACCES', 'EIO']) {
+      const result = await readCodexAuthStableWithStat('/fake/auth.json', {
+        delayMs: 0,
+        openRead: async () => { throw Object.assign(new Error(code), { code }); },
+      });
+      assert.deepEqual(result, { status: 'unreadable', code });
+    }
+  });
+
+  it('the file hash is not the refresh-token fingerprint', async () => {
+    const text = JSON.stringify(validDocument());
+    const result = await readCodexAuthStableWithStat('/fake/auth.json', {
+      delayMs: 0,
+      openRead: async () => ({ text, ino: 101 }),
+    });
+    assert.equal(result.status, 'ok');
+    if (result.status !== 'ok') throw new Error('expected stable auth document');
+    assert.notEqual(result.sha256, codexFingerprint(parseValid()));
+    assert.match(result.sha256, /^sha256-file:[a-f0-9]{64}$/);
   });
 });
