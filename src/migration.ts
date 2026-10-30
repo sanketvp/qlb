@@ -1891,8 +1891,11 @@ export class Migration {
         const legacy = this.legacySidecarPath();
         if (legacy) unlinkIfExists(legacy);
       } else {
-        // Validate before un-owning, so a bad journal row refuses with the claim intact.
+        // Validate and check for a live refresh before un-owning, so a refusal
+        // leaves the claim intact.
         const journalAccount = this.singleGrantJournalAccount();
+        const authKey = this.singleGrantAuthKey();
+        this.refuseDuringRefresh(journalAccount.id);
         unlinkIfExists(this.ownerFilePath);
         // The un-own must survive power loss before S5 records the hand-back:
         // resume after S5 never revisits the owner claim.
@@ -1900,7 +1903,7 @@ export class Migration {
         // rollback()/resume() already hold Pi's auth.json lock for the whole
         // single-grant path. S5 therefore reads A under that existing lock;
         // withPiAuthLock is not re-entrant.
-        return this.recordSingleGrantHandbackAndCleanup(journalAccount);
+        return this.recordSingleGrantHandbackAndCleanup(journalAccount, authKey);
       }
       unlinkIfExists(this.stagingPath());
       return this.finishRollbackJournal();
@@ -1941,11 +1944,20 @@ export class Migration {
     return { provider: journalAccount.provider, id: journalAccount.id, label: journalAccount.label };
   }
 
+  /**
+   * Until S2's fence (row 28), a refresh that is mid-flight could rotate K_m
+   * after the S5 verdict; refuse rather than record a delete against it.
+   */
+  private refuseDuringRefresh(accountId: string): void {
+    const lease = this.store.getLease(refreshLeaseName(accountId));
+    if (lease && lease.until > Date.now()) throw new Error('refresh-in-progress');
+  }
+
   /** S5, followed by the existing C3 path (S6 → S7). Caller holds Pi's auth lock. */
   private recordSingleGrantHandbackAndCleanup(
     journalAccount: { provider: string; id: string; label: string },
+    authKey: string,
   ): MigrationStatus {
-    const authKey = this.singleGrantAuthKey();
     let piEntry: unknown = null;
     try {
       const parsed: unknown = JSON.parse(readFileSync(this.poolFilePath, 'utf8'));
@@ -1973,10 +1985,9 @@ export class Migration {
       }
     }
 
-    // Until S2's fence (row 28), a refresh that is mid-flight could rotate K_m
-    // after this verdict; refuse rather than record a delete against it.
-    const lease = this.store.getLease(refreshLeaseName(journalAccount.id));
-    if (lease && lease.until > Date.now()) throw new Error('refresh-in-progress');
+    // A refresh that took its lease after the pre-unlink check may still be
+    // live around the K_m read above.
+    this.refuseDuringRefresh(journalAccount.id);
 
     const verdict = handbackVerdict(kmRead, piEntry);
     const handback = {

@@ -1178,6 +1178,40 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     }
   });
 
+  it('a refresh that commits a rotated grant during the hand-back is refused, not deleted', async () => {
+    const h = setup('xai');
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      h.mig.commit();
+      const accountId = (JSON.parse(h.store.getMigration('pi-xai')!.detail_json).accounts as Array<{ id: string }>)[0].id;
+      let leaseLive = true;
+      const originalGetLease = h.store.getLease.bind(h.store);
+      h.store.getLease = (name) => leaseLive && name === `refresh:${accountId}`
+        ? { name, holder_pid: 1, holder_id: 'fixture-refresher', until: Date.now() + 60_000, generation: 1 }
+        : originalGetLease(name);
+      // The refresher commits its rotated grant and drops its lease the moment
+      // the hand-back first reads K_m.
+      const originalGetSync = h.kc.getSync.bind(h.kc);
+      h.kc.getSync = (service, account) => {
+        const raw = originalGetSync(service, account);
+        if (leaseLive) {
+          leaseLive = false;
+          const rotated = { ...(JSON.parse(raw) as Record<string, unknown>), refresh: 'xai-refresh-rotated-fake' };
+          h.kc.setSync(service, account, JSON.stringify(rotated));
+        }
+        return raw;
+      };
+
+      assert.throws(() => h.mig.rollback(), /refresh-in-progress/);
+      assert.equal(existsSync(h.ownerPath), true, 'the refusal leaves the owner claim intact');
+      assert.equal(JSON.parse(h.store.getMigration('pi-xai')!.detail_json).handback, undefined);
+      assert.equal(keychainHas(h.kc, 'xai'), true, 'the Keychain copy is not deleted');
+    } finally {
+      h.cleanup();
+    }
+  });
+
   it('the owner claim is unlinked durably before S5 records the hand-back', async () => {
     const synced: string[] = [];
     const h = setup('xai', new MockKeychain(), { fsyncDirectory: (path) => { synced.push(path); } });
