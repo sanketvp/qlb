@@ -39,6 +39,27 @@ export interface ReadUnclaimedCodexSlot extends ReadCodexSlot {
   consumedFp?: string;
 }
 
+export class CodexStashNotFound extends Error {
+  constructor() {
+    super('unclaimed credential not found');
+    this.name = 'CodexStashNotFound';
+  }
+}
+
+export class CodexStashUnavailable extends Error {
+  constructor() {
+    super('unclaimed credential unavailable');
+    this.name = 'CodexStashUnavailable';
+  }
+}
+
+export class CodexStashUnverifiable extends Error {
+  constructor() {
+    super('unclaimed credential unverifiable');
+    this.name = 'CodexStashUnverifiable';
+  }
+}
+
 interface UnclaimedRecord {
   credential: CodexAuthDocument;
   consumedFp?: string;
@@ -194,6 +215,59 @@ export class CodexSlots {
     }
   }
 
+  async findUnclaimedByFingerprint(fingerprint: string): Promise<UnclaimedIndexEntry | null> {
+    let entries: UnclaimedIndexEntry[];
+    try { entries = await listStashes(this.stashRoot(), PROVIDER); } catch {
+      throw new CodexStashUnavailable();
+    }
+    return entries.find((entry) => entry.consumedFp === fingerprint) ?? null;
+  }
+
+  async ensureUnclaimedStash(
+    document: CodexAuthDocument,
+    now: number,
+  ): Promise<{ stashId: string; created: boolean }> {
+    const fingerprint = codexFingerprint(document);
+    const identity = codexIdentity(document);
+    let entry: UnclaimedIndexEntry | null;
+    try {
+      entry = await this.findUnclaimedByFingerprint(fingerprint);
+    } catch (error) {
+      if (error instanceof CodexStashUnavailable) throw new CodexStashUnverifiable();
+      throw error;
+    }
+    if (entry) {
+      let stashed: ReadUnclaimedCodexSlot;
+      try {
+        stashed = await this.readUnclaimedDurable(entry.stashId);
+      } catch (error) {
+        if (error instanceof CodexStashNotFound) {
+          // Complete only this login's own unknown-login reservation: a
+          // successor or -lost- row, or one keyed to another account, is not ours.
+          if (!identity || entry.accountId !== identity || !isUnknownLoginStashId(entry.stashId)) {
+            throw new CodexStashUnverifiable();
+          }
+          await this.writeUnclaimedBody(entry.stashId, document, fingerprint);
+          return { stashId: entry.stashId, created: true };
+        }
+        throw new CodexStashUnverifiable();
+      }
+      if (
+        isUnknownLoginStashId(entry.stashId)
+        && codexIdentity(stashed.document) === identity
+        && stashed.fingerprint === fingerprint
+      ) {
+        return { stashId: entry.stashId, created: false };
+      }
+      throw new CodexStashUnverifiable();
+    }
+    if (!identity) throw new CodexStashUnverifiable();
+    const { stashId } = await this.stashUnclaimedDurably(
+      `${defaultCodexStashId(now)}${UNKNOWN_LOGIN_SUFFIX}`, document, fingerprint, identity,
+    );
+    return { stashId, created: true };
+  }
+
   /**
    * Lock-loss preservation writes its secret body before its non-secret index.
    * The file name is unique, and a concurrent orphan adopter can safely win
@@ -236,14 +310,17 @@ export class CodexSlots {
     }
     for (const entry of entries) {
       if (entry.consumedFp !== consumedFp) continue;
+      // An unknown-login stash (C6-7) is a safety copy of a document, never a
+      // successor; the refresh fingerprint alone cannot tell them apart.
+      if (isUnknownLoginStashId(entry.stashId)) continue;
       let stashed: ReadUnclaimedCodexSlot;
       try {
-        stashed = await this.readDurableUnclaimed(entry.stashId);
+        stashed = await this.readUnclaimedDurable(entry.stashId);
       } catch (error) {
         // An index reservation with no Keychain or fallback body cannot be
         // adopted. Drop only that non-secret row so a later refresh can mark
         // the spent predecessor dead instead of reporting transient forever.
-        if (error instanceof Error && /unclaimed credential not found/.test(error.message)) {
+        if (error instanceof CodexStashNotFound) {
           // Emergency files are body-first, so a -lost- reservation must never
           // be treated as the legacy bodyless reservation cleanup case.
           if (!isEmergencyStashId(entry.stashId)) {
@@ -411,16 +488,39 @@ export class CodexSlots {
     return join(this.stashRoot(), `${stashId}.json`);
   }
 
-  private async readDurableUnclaimed(stashId: string): Promise<ReadUnclaimedCodexSlot> {
+  async readUnclaimedDurable(stashId: string): Promise<ReadUnclaimedCodexSlot> {
     try { return this.readUnclaimed(stashId, { fresh: true }); } catch (keychainError) {
       try {
         const record = parseUnclaimed(await readFile(this.unclaimedFile(stashId), 'utf8'));
         return { document: record.credential, fingerprint: codexFingerprint(record.credential), consumedFp: record.consumedFp };
       } catch (fileError) {
         if (isCredentialNotFound(keychainError) && (fileError as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') {
-          throw new Error('unclaimed credential not found');
+          throw new CodexStashNotFound();
         }
-        throw new Error('unclaimed credential unavailable');
+        throw new CodexStashUnavailable();
+      }
+    }
+  }
+
+  /** Writes only the secret body for an existing index reservation. */
+  private async writeUnclaimedBody(
+    stashId: string,
+    document: CodexAuthDocument,
+    consumedFp: string,
+  ): Promise<void> {
+    const text = JSON.stringify({ credential: document, consumedFp });
+    try {
+      this.options.keychain.setSync(this.unclaimedService(stashId), QLB_KEYCHAIN_ACCOUNT, text);
+      return;
+    } catch {
+      try {
+        await mkdir(this.stashRoot(), { recursive: true, mode: 0o700 });
+        await chmod(this.stashRoot(), 0o700);
+        const path = this.unclaimedFile(stashId);
+        await writeFile(path, text, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+        await chmod(path, 0o600);
+      } catch {
+        throw new Error('unable to persist unclaimed credential');
       }
     }
   }
@@ -453,6 +553,12 @@ interface ExistingSlot {
 
 function isAlreadyExists(error: unknown): boolean {
   return (error as NodeJS.ErrnoException | undefined)?.code === 'EEXIST';
+}
+
+const UNKNOWN_LOGIN_SUFFIX = '-unknown';
+
+function isUnknownLoginStashId(stashId: string): boolean {
+  return stashId.endsWith(UNKNOWN_LOGIN_SUFFIX);
 }
 
 function isEmergencyStashId(stashId: string): boolean {
