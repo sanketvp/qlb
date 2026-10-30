@@ -1,6 +1,6 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
-import { chmod, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, link, mkdir, open, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { codexFingerprint, codexIdentity, parseCodexAuth, type CodexAuthDocument } from './codex-auth';
@@ -14,6 +14,7 @@ import {
 import { backupBeforeMigrateSync, type CodexSlotRecord, type Store } from './store';
 import { qlbHomeDir } from './home';
 import { CodexAdmissionRefused, codexAdmission, ensureCodexSlotAccount, rekeyCodexAccounts, type RekeySummary } from './codex-rekey';
+import { defaultCodexStashId } from './codex-consume';
 import { recordRestoreBaseline } from './codex-restore-baseline';
 import { listStashes, recordStash, removeStash, type UnclaimedIndexEntry } from './unclaimed-index';
 
@@ -54,6 +55,8 @@ export interface CodexSlotsOptions {
   readBackoff?: KeychainReadBackoff;
   /** Private S36 fallback and durable non-secret index root. */
   stashDir?: string;
+  /** Test-only barrier after an emergency body is durable and before its index. */
+  emergencyStashAfterBody?: (stashId: string) => void | Promise<void>;
 }
 
 type CachedSlot = ReadCodexSlot & { expiresAt: number };
@@ -192,6 +195,32 @@ export class CodexSlots {
   }
 
   /**
+   * Lock-loss preservation writes its secret body before its non-secret index.
+   * The file name is unique, and a concurrent orphan adopter can safely win
+   * the index race without either writer touching the Keychain.
+   */
+  async stashSuccessorEmergency(
+    accountId: string,
+    successor: CodexAuthDocument,
+    consumedFp: string,
+    now: number,
+  ): Promise<{ stashId: string }> {
+    if (!accountId || !consumedFp) throw new Error('unclaimed consumed lineage is required');
+    const stashId = `${defaultCodexStashId(now)}-lost-${randomBytes(4).toString('hex')}`;
+    await this.writeEmergencyBody(stashId, JSON.stringify({ credential: successor, consumedFp }));
+    await this.options.emergencyStashAfterBody?.(stashId);
+    const entry: UnclaimedIndexEntry = {
+      provider: PROVIDER, accountId, stashId, consumedFp, location: 'file', createdAt: now,
+    };
+    try {
+      await recordStash(this.stashRoot(), entry);
+    } catch (error: unknown) {
+      if (!isAlreadyExists(error)) throw new Error('unable to record unclaimed credential');
+    }
+    return { stashId };
+  }
+
+  /**
    * Finds, but deliberately does not delete, a successor whose predecessor is
    * the supplied current lineage. The C10 metadata transaction owns the slot
    * write; only its successful commit may make this recovery body disposable.
@@ -200,6 +229,7 @@ export class CodexSlots {
     accountId: string,
     consumedFp: string,
   ): Promise<{ stashId: string; document: CodexAuthDocument; consumedFp: string } | null> {
+    await this.adoptEmergencyOrphans(accountId, consumedFp);
     let entries: UnclaimedIndexEntry[];
     try { entries = await listStashes(this.stashRoot(), PROVIDER, accountId); } catch {
       throw new Error('unclaimed credential unavailable');
@@ -214,7 +244,11 @@ export class CodexSlots {
         // adopted. Drop only that non-secret row so a later refresh can mark
         // the spent predecessor dead instead of reporting transient forever.
         if (error instanceof Error && /unclaimed credential not found/.test(error.message)) {
-          try { await removeStash(this.stashRoot(), entry); } catch { /* retry cleanup later */ }
+          // Emergency files are body-first, so a -lost- reservation must never
+          // be treated as the legacy bodyless reservation cleanup case.
+          if (!isEmergencyStashId(entry.stashId)) {
+            try { await removeStash(this.stashRoot(), entry); } catch { /* retry cleanup later */ }
+          }
           continue;
         }
         throw error;
@@ -284,6 +318,78 @@ export class CodexSlots {
     };
   }
 
+  private async adoptEmergencyOrphans(accountId: string, consumedFp: string): Promise<void> {
+    let indexed: UnclaimedIndexEntry[];
+    try { indexed = await listStashes(this.stashRoot(), PROVIDER); } catch {
+      throw new Error('unclaimed credential unavailable');
+    }
+    const indexedIds = new Set(indexed.map((entry) => entry.stashId));
+    let names: string[];
+    try { names = await readdir(this.stashRoot()); } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') return;
+      throw new Error('unclaimed credential unavailable');
+    }
+    for (const name of names) {
+      if (!isEmergencyStashFilename(name)) continue;
+      const stashId = name.slice(0, -'.json'.length);
+      if (indexedIds.has(stashId)) continue;
+      let text: string;
+      try { text = await readFile(this.unclaimedFile(stashId), 'utf8'); } catch (error: unknown) {
+        // A concurrent adopter may have consumed and removed it; any other
+        // read failure must not look like "no successor" (fail closed).
+        if ((error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') continue;
+        throw new Error('unclaimed credential unavailable');
+      }
+      let record: UnclaimedRecord;
+      try { record = parseUnclaimed(text); } catch { continue; }
+      if (codexIdentity(record.credential) !== accountId || record.consumedFp !== consumedFp) continue;
+      const entry: UnclaimedIndexEntry = {
+        provider: PROVIDER, accountId, stashId, consumedFp, location: 'file', createdAt: this.now(),
+      };
+      try {
+        await recordStash(this.stashRoot(), entry);
+      } catch (error: unknown) {
+        if (!isAlreadyExists(error)) throw new Error('unclaimed credential unavailable');
+      }
+      indexedIds.add(stashId);
+    }
+  }
+
+  private async writeEmergencyBody(stashId: string, contents: string): Promise<void> {
+    const root = this.stashRoot();
+    await mkdir(root, { recursive: true, mode: 0o700 });
+    await chmod(root, 0o700);
+    const path = this.unclaimedFile(stashId);
+    // Keep temps outside the final *.json orphan-discovery pattern.
+    const temporary = join(root, `.${stashId}.tmp.${process.pid}.${randomBytes(8).toString('hex')}`);
+    const handle = await open(temporary, 'wx', 0o600);
+    try {
+      await handle.writeFile(contents, 'utf8');
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    try {
+      // Node's rename replaces an existing destination on POSIX. link(2) is
+      // the no-replace publication primitive that preserves wx semantics.
+      try { await link(temporary, path); } catch (error: unknown) {
+        if (isAlreadyExists(error)) return;
+        throw error;
+      }
+      // link(2) published the final name without replacement. Drop the temp
+      // name before the directory sync so no second link to the secret body
+      // outlives this call (rename onto a hard link of itself is a no-op).
+      await rm(temporary, { force: true });
+      await chmod(path, 0o600);
+      const body = await open(path, 'r');
+      try { await body.sync(); } finally { await body.close(); }
+      const directory = await open(root, 'r');
+      try { await directory.sync(); } finally { await directory.close(); }
+    } finally {
+      await rm(temporary, { force: true });
+    }
+  }
+
   private slotService(accountId: string): string {
     return qlbKeychainService(PROVIDER, accountId);
   }
@@ -343,6 +449,18 @@ export interface ImportActiveCodexDeps {
 interface ExistingSlot {
   fingerprint: string | null;
   prev_fingerprint: string | null;
+}
+
+function isAlreadyExists(error: unknown): boolean {
+  return (error as NodeJS.ErrnoException | undefined)?.code === 'EEXIST';
+}
+
+function isEmergencyStashId(stashId: string): boolean {
+  return stashId.includes('-lost-');
+}
+
+function isEmergencyStashFilename(name: string): boolean {
+  return name.endsWith('.json') && isEmergencyStashId(name.slice(0, -'.json'.length));
 }
 
 function parseUnclaimed(text: string): UnclaimedRecord {

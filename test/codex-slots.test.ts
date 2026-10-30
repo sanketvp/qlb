@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -432,6 +432,217 @@ describe('Codex slots and import-active', () => {
       doc.tokens.id_token = jwt({ sub: 'not-an-S29-identity' });
       assert.throws(() => importActiveCodexSlot(doc, { store: h.store, keychain: h.keychain }), /S29 identity/);
       assert.deepEqual(dbRows(h.store.dbPath), { slot: undefined, account: undefined, active: undefined, lineage: undefined, baseline: undefined });
+    } finally {
+      h.store.close();
+      rmSync(h.home, { recursive: true, force: true });
+    }
+  });
+
+  it('an emergency stash paused after the body and before the index is found by a concurrent locked consume, which adopts it and sends no POST', async () => {
+    const h = fixture();
+    let bodyWritten!: () => void;
+    const bodyReady = new Promise<void>((resolve) => { bodyWritten = resolve; });
+    let continueIndex!: () => void;
+    const indexMayContinue = new Promise<void>((resolve) => { continueIndex = resolve; });
+    try {
+      const accountId = planImportActiveCodex(parsedDocument()).slotId;
+      const successor = parsedDocument('emergency-successor');
+      const slots = new CodexSlots({
+        keychain: h.keychain,
+        stashDir: join(h.home, 'stash'),
+        emergencyStashAfterBody: async () => { bodyWritten(); await indexMayContinue; },
+      });
+      const write = slots.stashSuccessorEmergency(accountId, successor, codexFingerprint(parsedDocument('predecessor')), 1);
+      await bodyReady;
+
+      // findStashedSuccessor is the consume-path operation that skips its POST.
+      const found = await slots.findStashedSuccessor(accountId, codexFingerprint(parsedDocument('predecessor')));
+      assert.equal(found?.document.tokens.refresh_token, 'emergency-successor');
+      continueIndex();
+      await write;
+    } finally {
+      h.store.close();
+      rmSync(h.home, { recursive: true, force: true });
+    }
+  });
+
+  it('an emergency stash killed before the index is discovered from its file and adopted', async () => {
+    const h = fixture();
+    let bodyWritten!: () => void;
+    const bodyReady = new Promise<void>((resolve) => { bodyWritten = resolve; });
+    let continueIndex!: () => void;
+    const indexMayContinue = new Promise<void>((resolve) => { continueIndex = resolve; });
+    try {
+      const accountId = planImportActiveCodex(parsedDocument()).slotId;
+      const predecessor = codexFingerprint(parsedDocument('predecessor'));
+      const slots = new CodexSlots({
+        keychain: h.keychain,
+        stashDir: join(h.home, 'stash'),
+        emergencyStashAfterBody: async () => { bodyWritten(); await indexMayContinue; },
+      });
+      const interruptedOwner = slots.stashSuccessorEmergency(accountId, parsedDocument('emergency-successor'), predecessor, 1);
+      await bodyReady;
+
+      const recovered = await new CodexSlots({ keychain: h.keychain, stashDir: join(h.home, 'stash') })
+        .findStashedSuccessor(accountId, predecessor);
+      assert.equal(recovered?.document.tokens.refresh_token, 'emergency-successor');
+      continueIndex();
+      await interruptedOwner;
+    } finally {
+      h.store.close();
+      rmSync(h.home, { recursive: true, force: true });
+    }
+  });
+
+  it("the owner's later index write after a concurrent adoption is harmless (EEXIST is success; no second body)", async () => {
+    const h = fixture();
+    let bodyWritten!: () => void;
+    const bodyReady = new Promise<void>((resolve) => { bodyWritten = resolve; });
+    let continueIndex!: () => void;
+    const indexMayContinue = new Promise<void>((resolve) => { continueIndex = resolve; });
+    try {
+      const accountId = planImportActiveCodex(parsedDocument()).slotId;
+      const predecessor = codexFingerprint(parsedDocument('predecessor'));
+      const stashDir = join(h.home, 'stash');
+      const slots = new CodexSlots({
+        keychain: h.keychain,
+        stashDir,
+        emergencyStashAfterBody: async () => { bodyWritten(); await indexMayContinue; },
+      });
+      const owner = slots.stashSuccessorEmergency(accountId, parsedDocument('emergency-successor'), predecessor, 1);
+      await bodyReady;
+      const adopted = await slots.findStashedSuccessor(accountId, predecessor);
+      assert.ok(adopted);
+      continueIndex();
+      await owner;
+      assert.equal(readdirSync(stashDir).filter((name) => name.endsWith('.json')).length, 1);
+      assert.equal(readdirSync(join(stashDir, 'index', 'openai-codex')).length, 1);
+    } finally {
+      h.store.close();
+      rmSync(h.home, { recursive: true, force: true });
+    }
+  });
+
+  it('a -lost- reservation is never deleted as bodyless', async () => {
+    const h = fixture();
+    try {
+      const accountId = planImportActiveCodex(parsedDocument()).slotId;
+      const stashDir = join(h.home, 'stash');
+      const slots = new CodexSlots({ keychain: h.keychain, stashDir });
+      const { stashId } = await slots.stashSuccessorEmergency(
+        accountId, parsedDocument('emergency-successor'), codexFingerprint(parsedDocument('predecessor')), 1,
+      );
+      rmSync(join(stashDir, `${stashId}.json`));
+
+      assert.equal(await slots.findStashedSuccessor(accountId, codexFingerprint(parsedDocument('predecessor'))), null);
+      assert.equal(existsSync(join(stashDir, 'index', 'openai-codex', `${stashId}.json`)), true);
+    } finally {
+      h.store.close();
+      rmSync(h.home, { recursive: true, force: true });
+    }
+  });
+
+  it('an emergency stash leaves no second link to the body after it returns', async () => {
+    const h = fixture();
+    try {
+      const accountId = planImportActiveCodex(parsedDocument()).slotId;
+      const stashDir = join(h.home, 'stash');
+      const slots = new CodexSlots({ keychain: h.keychain, stashDir });
+      const { stashId } = await slots.stashSuccessorEmergency(
+        accountId, parsedDocument('emergency-successor'), codexFingerprint(parsedDocument('predecessor')), 1,
+      );
+
+      assert.deepEqual(readdirSync(stashDir).filter((name) => name !== 'index').sort(), [`${stashId}.json`]);
+    } finally {
+      h.store.close();
+      rmSync(h.home, { recursive: true, force: true });
+    }
+  });
+
+  it('an orphan -lost- stash that cannot be read fails closed instead of reporting no successor', async () => {
+    const h = fixture();
+    const stashDir = join(h.home, 'stash');
+    const orphan = join(stashDir, 'unreadable-lost-deadbeef.json');
+    try {
+      const accountId = planImportActiveCodex(parsedDocument()).slotId;
+      mkdirSync(stashDir, { recursive: true, mode: 0o700 });
+      writeFileSync(orphan, '{}', { mode: 0o600 });
+      chmodSync(orphan, 0o000);
+
+      const slots = new CodexSlots({ keychain: h.keychain, stashDir });
+      await assert.rejects(
+        slots.findStashedSuccessor(accountId, codexFingerprint(parsedDocument('predecessor'))),
+        /unclaimed credential unavailable/,
+      );
+      assert.equal(existsSync(orphan), true);
+    } finally {
+      try { chmodSync(orphan, 0o600); } catch { /* already removed */ }
+      h.store.close();
+      rmSync(h.home, { recursive: true, force: true });
+    }
+  });
+
+  it('a partial temp file is never read as a stash', async () => {
+    const h = fixture();
+    try {
+      const accountId = planImportActiveCodex(parsedDocument()).slotId;
+      const stashDir = join(h.home, 'stash');
+      mkdirSync(stashDir, { recursive: true, mode: 0o700 });
+      writeFileSync(join(stashDir, 'anything-lost-deadbeef.json.tmp'), '{', { mode: 0o600 });
+
+      const slots = new CodexSlots({ keychain: h.keychain, stashDir });
+      assert.equal(await slots.findStashedSuccessor(accountId, codexFingerprint(parsedDocument('predecessor'))), null);
+      assert.equal(existsSync(join(stashDir, 'index')), false);
+    } finally {
+      h.store.close();
+      rmSync(h.home, { recursive: true, force: true });
+    }
+  });
+
+  it('an unparseable orphan -lost- stash is neither adopted nor deleted', async () => {
+    const h = fixture();
+    try {
+      const accountId = planImportActiveCodex(parsedDocument()).slotId;
+      const stashDir = join(h.home, 'stash');
+      const orphan = join(stashDir, 'corrupt-lost-deadbeef.json');
+      mkdirSync(stashDir, { recursive: true, mode: 0o700 });
+      writeFileSync(orphan, '{', { mode: 0o600 });
+
+      const slots = new CodexSlots({ keychain: h.keychain, stashDir });
+      assert.equal(await slots.findStashedSuccessor(accountId, codexFingerprint(parsedDocument('predecessor'))), null);
+      assert.equal(existsSync(orphan), true);
+      assert.equal(existsSync(join(stashDir, 'index')), false);
+    } finally {
+      h.store.close();
+      rmSync(h.home, { recursive: true, force: true });
+    }
+  });
+
+  it('an orphan -lost- stash for another account is neither adopted nor deleted', async () => {
+    const h = fixture();
+    let bodyWritten!: () => void;
+    const bodyReady = new Promise<void>((resolve) => { bodyWritten = resolve; });
+    let continueIndex!: () => void;
+    const indexMayContinue = new Promise<void>((resolve) => { continueIndex = resolve; });
+    try {
+      const accountId = planImportActiveCodex(parsedDocument()).slotId;
+      const otherAccountId = planImportActiveCodex(parsedDocumentWithAccountIds('other-account', 'other-account')).slotId;
+      const stashDir = join(h.home, 'stash');
+      const slots = new CodexSlots({
+        keychain: h.keychain,
+        stashDir,
+        emergencyStashAfterBody: async () => { bodyWritten(); await indexMayContinue; },
+      });
+      const owner = slots.stashSuccessorEmergency(
+        otherAccountId, parsedDocumentWithAccountIds('other-account', 'other-account'), codexFingerprint(parsedDocument('predecessor')), 1,
+      );
+      await bodyReady;
+
+      assert.equal(await slots.findStashedSuccessor(accountId, codexFingerprint(parsedDocument('predecessor'))), null);
+      assert.equal(readdirSync(stashDir).filter((name) => name.endsWith('.json')).length, 1);
+      assert.equal(existsSync(join(stashDir, 'index')), false);
+      continueIndex();
+      await owner;
     } finally {
       h.store.close();
       rmSync(h.home, { recursive: true, force: true });
