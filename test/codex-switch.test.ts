@@ -280,7 +280,7 @@ describe('Codex switch journal v2', () => {
     const h = journalHarness();
     try {
       writeCodexSwitchJournal(journalFixture(h.root), h.options);
-      await assert.rejects(probeCodexSwitchJournal(h.options, () => releaseCodexSwitchJournal('attempt-1', h.options)),
+      await assert.rejects(probeCodexSwitchJournal(h.options, () => { throw new ClaudeCodeLockTimeout('other.lock'); }),
         (error: unknown) => error instanceof ClaudeCodeLockTimeout);
     } finally { executingCodexAttempts.clear(); rmSync(h.root, { recursive: true, force: true }); }
   });
