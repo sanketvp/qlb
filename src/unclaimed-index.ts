@@ -4,6 +4,17 @@
 import { chmod, link, mkdir, open, readdir, rename, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 
+/**
+ * Exact name of a Codex lock-loss emergency stash: defaultCodexStashId(now)
+ * plus `-lost-<8 hex>` (C6-2b). Shared so the Anthropic scan and the Codex
+ * writer cannot drift apart.
+ */
+const CODEX_EMERGENCY_STASH_ID = /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}\.\d{3}Z-\d+-[0-9a-f]{24}-lost-[0-9a-f]{8}$/;
+
+export function isCodexEmergencyStashId(stashId: string): boolean {
+  return CODEX_EMERGENCY_STASH_ID.test(stashId);
+}
+
 export interface UnclaimedIndexEntry {
   provider: string;
   /** null means a legacy file with no known account; it may match any account by lineage. */

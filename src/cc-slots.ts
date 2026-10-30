@@ -19,7 +19,7 @@ import { withClaudeSwitchLock } from './cc-locks';
 import { recordRelogin } from './relogin';
 import { isCredentialNotFound } from './credential-backends';
 import { KeychainReadBackoff, platformKeychain, qlbKeychainService, QLB_KEYCHAIN_ACCOUNT } from './keychain';
-import { listStashes, recordStash, removeStash, updateStash, type UnclaimedIndexEntry, type UnclaimedIndexWriteOptions } from './unclaimed-index';
+import { isCodexEmergencyStashId, listStashes, recordStash, removeStash, updateStash, type UnclaimedIndexEntry, type UnclaimedIndexWriteOptions } from './unclaimed-index';
 
 const DISPLAY_CACHE_TTL_MS = 60_000;
 const ANTHROPIC_PROVIDER = 'anthropic';
@@ -1232,12 +1232,15 @@ export class ClaudeSlots {
       if (!name.endsWith('.json')) continue;
       const stashId = name.slice(0, -'.json'.length);
       try { this.assertExistingTimestamp(stashId); } catch { continue; }
-      if (!entries.has(stashId) && !stashId.includes('-lost-')) legacyCandidates.push(stashId);
+      if (!entries.has(stashId) && !isCodexEmergencyStashId(stashId)) legacyCandidates.push(stashId);
     }
     let codexStashIds = new Set<string>();
     if (legacyCandidates.length > 0) {
       try {
-        codexStashIds = new Set((await listStashes(this.indexRoot(), 'openai-codex')).map((entry) => entry.stashId));
+        // Only a Codex row that points at a file here claims that file.
+        codexStashIds = new Set((await listStashes(this.indexRoot(), 'openai-codex'))
+          .filter((entry) => entry.location === 'file')
+          .map((entry) => entry.stashId));
       } catch {
         throw new Error('unclaimed credential unavailable');
       }
