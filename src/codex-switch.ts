@@ -1,10 +1,18 @@
 import { mkdirSync, readFileSync, statSync, unlinkSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import type { CodexAuthStableWithStatResult, CodexIdentity } from './codex-auth';
+import { accessExpiry, codexIdentity, type CodexAuthDocument, type CodexAuthStableWithStatResult, type CodexIdentity } from './codex-auth';
 import { ClaudeCodeLockTimeout, type HeldProperLockfile, withProperLockfile } from './cc-locks';
+import { consumeCodexSlot, hasCodexSlotIdentity, withCodexConsumeThenSwitchLocks, type CodexConsumeOptions, type CodexConsumeResult } from './codex-consume';
 import { fsyncDirSync, atomicWriteText } from './fsutil';
 import { qlbHomeDir } from './home';
-import { parseCodexRecoveryFence, stillTheSameProcess, type CodexProcess } from './codex-sessions';
+import {
+  codexIdentityParts,
+  parseCodexRecoveryFence,
+  readCodexSwitchHistory,
+  renewers,
+  stillTheSameProcess,
+  type CodexProcess,
+} from './codex-sessions';
 import type { CswapProcess } from './cswap-processes';
 import type { Store } from './store';
 
@@ -28,11 +36,17 @@ export type CodexSwitchPreconditionsResult =
 
 /** All external effects are injected; the production caller binds readLive to auth.json. */
 export interface CodexSwitchDeps {
-  store: Pick<Store, 'getCodexActiveLogin' | 'getCodexSlot' | 'getConfig' | 'recordSwitch'>;
+  store: Pick<Store, 'getCodexActiveLogin' | 'getCodexSlot' | 'getConfig' | 'hasConfig' | 'recordSwitch'>;
   readLive: () => Promise<CodexAuthStableWithStatResult>;
   cswapProcesses: () => CswapProcess[];
   now: () => number;
   attempt: string;
+  /** C6-12b seams; C6-18 supplies their production bindings. */
+  dbPath?: string;
+  slots?: CodexConsumeOptions['slots'];
+  list?: () => Promise<CodexProcess[]>;
+  transport?: CodexConsumeOptions['transport'];
+  journalDir?: string;
 }
 
 /**
@@ -282,6 +296,111 @@ export function codexRecoveryFenceState(
     };
   }
   return { state: 'none' };
+}
+
+export type CodexTargetFreshenResult =
+  | { kind: 'go' }
+  | { kind: 'refused'; reason: string; pids?: number[] };
+
+function freshenDeps(deps: CodexSwitchDeps): {
+  dbPath: string;
+  slots: CodexConsumeOptions['slots'];
+  list: () => Promise<CodexProcess[]>;
+  transport: CodexConsumeOptions['transport'];
+  journalDir: string;
+} {
+  if (!deps.dbPath || !deps.slots || !deps.list || !deps.transport || !deps.journalDir) {
+    throw new Error('Codex target freshen dependencies are required');
+  }
+  return {
+    dbPath: deps.dbPath, slots: deps.slots, list: deps.list,
+    transport: deps.transport, journalDir: deps.journalDir,
+  };
+}
+
+/**
+ * Freshens an inactive switch target only when its near expiry is not held by
+ * a Codex session. The consume lock is acquired before the shared switch lock.
+ */
+export async function freshenCodexTarget(
+  deps: CodexSwitchDeps,
+  { target, now }: { target: string; now: number },
+): Promise<CodexTargetFreshenResult> {
+  const configured = freshenDeps(deps);
+  // Same adapter guard as codex refresh: an unreadable slot, or a document
+  // that is not account `target`, is never spent.
+  const readTarget = (): CodexAuthDocument | null => {
+    let document: CodexAuthDocument;
+    try { document = configured.slots.readSlot(target, { fresh: true }).document; } catch { return null; }
+    return hasCodexSlotIdentity(document, target) ? document : null;
+  };
+  const initial = readTarget();
+  if (!initial) return { kind: 'refused', reason: 'target-freshen-slot-removed' };
+  if (expiresAfter(initial, now + 10 * 60_000)) return { kind: 'go' };
+
+  const holders = async (document: CodexAuthDocument): Promise<CodexProcess[]> => {
+    const identity = codexIdentity(document);
+    if (!identity) throw new Error('Codex slot identity is invalid');
+    const history = readCodexSwitchHistory(configured.dbPath, { journalDir: configured.journalDir });
+    return renewers(codexIdentityParts(identity), await configured.list(), history.rows, history.observations);
+  };
+  // The 5-minute holder rule is judged against the document it was checked on.
+  const holderResult = (document: CodexAuthDocument, pids: readonly number[]): CodexTargetFreshenResult =>
+    expiresAfter(document, now + 5 * 60_000)
+      ? { kind: 'go' }
+      : { kind: 'refused', reason: 'target-held-by-session', pids: [...pids] };
+
+  const initialHolders = await holders(initial);
+  if (initialHolders.length > 0) return holderResult(initial, initialHolders.map(({ pid }) => pid));
+
+  let outcome: CodexConsumeResult | undefined;
+  const fromConsume = (result: CodexConsumeResult, snapshot: CodexAuthDocument): CodexTargetFreshenResult => {
+    if (result.status === 'refreshed' || result.status === 'fresh') return { kind: 'go' };
+    if (result.status === 'held') return holderResult(snapshot, result.holders ?? []);
+    return { kind: 'refused', reason: `target-freshen-${result.status}` };
+  };
+  let lockedSnapshot: CodexAuthDocument | undefined;
+  try {
+    return await withCodexConsumeThenSwitchLocks(configured.dbPath, target, async (heldConsume, heldSwitch) => {
+      const fence = codexRecoveryFenceState(configured.journalDir, deps.store);
+      if (fence.state === 'fenced' && (fence.accounts === '*' || fence.accounts.has(target))) {
+        return { kind: 'refused', reason: fence.reason };
+      }
+      if (deps.store.getCodexActiveLogin() === target) return { kind: 'go' };
+      const snapshot = readTarget();
+      if (!snapshot) return { kind: 'refused', reason: 'target-freshen-slot-removed' };
+      // Another process may have refreshed it while this call waited for the locks.
+      if (expiresAfter(snapshot, now + 10 * 60_000)) return { kind: 'go' };
+      lockedSnapshot = snapshot;
+
+      outcome = await consumeCodexSlot({
+        accountId: target,
+        trigger: 'proactive-expiry',
+        snapshot,
+        slots: configured.slots,
+        store: { dbPath: configured.dbPath },
+        transport: configured.transport,
+        now: () => now,
+        holders,
+        inFlightSlots: fence.state === 'fenced' ? fence.accounts : undefined,
+        assertHeld: () => { heldConsume.assertNotCompromised(); heldSwitch.assertNotCompromised(); },
+      });
+      return fromConsume(outcome, snapshot);
+    });
+  } catch (error) {
+    if (error instanceof ClaudeCodeLockTimeout) return { kind: 'refused', reason: 'target-freshen-busy' };
+    // The lock wrapper rethrows its compromise after the callback; an issued
+    // successor's fate must still reach the caller (as in codex refresh).
+    if ((outcome?.status === 'stashed-lock-lost' || outcome?.status === 'successor-unpersisted') && lockedSnapshot) {
+      return fromConsume(outcome, lockedSnapshot);
+    }
+    throw error;
+  }
+}
+
+function expiresAfter(document: CodexAuthDocument, instant: number): boolean {
+  const expiry = accessExpiry(document);
+  return expiry !== null && expiry > instant;
 }
 
 /** Persist only the parsed, allowlisted fields, so extra caller properties never reach disk. */
