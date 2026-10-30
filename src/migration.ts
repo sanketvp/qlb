@@ -129,7 +129,7 @@ import { legacyPiAuthBackupPath, piAuthBackupPath, readPiAuthBackup, removePiAut
 import { canonicalDigest, fencedGeneration, handbackVerdict, keychainDigest, NoSingleGrantRestoreSourceError, rankSingleGrantSource, restoreRecordFor } from './pi-handback-source';
 import type { RollbackDecision } from './single-grant-ownership';
 import { parseGrant } from './refresh-lease';
-import { hasLegacyPiOwnerEntry, isPiPlaceholder, PiOwnerLegacyError, readPiOwnerProviders, withPiAuthLock, writePiOwnerEntry } from './pi-migrate';
+import { hasLegacyPiOwnerEntry, isPiPlaceholder, PiOwnerLegacyError, readPiOwnerProviders, withPiAuthLock, writePiOwnerEntry, type AuthLockTiming } from './pi-migrate';
 import { OPENROUTER_GATE_KEYCHAIN_SERVICE } from './token/openrouter';
 import { refreshLeaseName, type Store } from './store';
 import type { Grant } from './types';
@@ -318,6 +318,8 @@ export interface MigrationConfig {
   sleepSync?: (ms: number) => void;
   /** S2 test seam for lease liveness and its bounded wait clock; defaults to Date.now. */
   now?: () => number;
+  /** S3 test seam for rollback/resume's Pi auth-lock acquisition timing. */
+  authLockTiming?: AuthLockTiming;
   /**
    * Static-key (OpenRouter): injectable native-key reader.
    * Tests MUST pass a function that returns a fake key. The CLI passes
@@ -777,6 +779,7 @@ export class Migration {
   /** Keeps Pi's auth.json lock fresh during S2's lease wait; throws lock-lost. */
   private piAuthLockRefresh: (() => void) | undefined;
   private readonly now: () => number;
+  private readonly authLockTiming: AuthLockTiming | undefined;
   private readonly fsyncDirectory: (path: string) => void;
   private readonly piMigrateJournalDir: string;
 
@@ -805,6 +808,7 @@ export class Migration {
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
     });
     this.now = config.now ?? Date.now;
+    this.authLockTiming = config.authLockTiming;
     this.fsyncDirectory = config.fsyncDirectory ?? fsyncDirSync;
     this.piMigrateJournalDir = config.piMigrateJournalDir ?? join(qlbHomeDir(), '.qlb', 'journal');
   }
@@ -1410,10 +1414,26 @@ export class Migration {
     return this.finishHygiene();
   }
 
-  rollback(): MigrationStatus {
-    if (this.kind === 'single-grant') {
-      return withPiAuthLock(resolve(this.poolFilePath), (refresh) => this.holdingPiAuthLock(refresh, () => this.rollbackUnlocked()));
+  /** S3 precondition: a lock timeout refuses `pi-auth-locked` (exit 3) with the decision kept. */
+  private withSingleGrantRollbackAuthLock<T>(fn: () => T): T {
+    let acquired = false;
+    try {
+      return withPiAuthLock(
+        resolve(this.poolFilePath),
+        (refresh) => { acquired = true; return this.holdingPiAuthLock(refresh, fn); },
+        this.authLockTiming,
+      );
+    } catch (error: unknown) {
+      // Only a failure to acquire the lock wrote nothing; errors from fn pass through unchanged.
+      if (!acquired && error && typeof error === 'object' && (error as { code?: unknown }).code === 'pi-auth-locked') {
+        throw Object.assign(error, { exitCode: 3 });
+      }
+      throw error;
     }
+  }
+
+  rollback(): MigrationStatus {
+    if (this.kind === 'single-grant') return this.withSingleGrantRollbackAuthLock(() => this.rollbackUnlocked());
     return this.rollbackUnlocked();
   }
 
@@ -1469,9 +1489,7 @@ export class Migration {
    *   - MIRRORED / staging leftovers         → preCommitRollback
    */
   resume(): MigrationStatus {
-    if (this.kind === 'single-grant') {
-      return withPiAuthLock(resolve(this.poolFilePath), (refresh) => this.holdingPiAuthLock(refresh, () => this.resumeUnlocked()));
-    }
+    if (this.kind === 'single-grant') return this.withSingleGrantRollbackAuthLock(() => this.resumeUnlocked());
     return this.resumeUnlocked();
   }
 

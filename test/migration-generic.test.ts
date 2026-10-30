@@ -169,7 +169,7 @@ interface Harness {
 function setup(
   provider: SingleGrantProvider,
   kc: MockKeychain = new MockKeychain(),
-  config: Pick<MigrationConfig, 'fsyncDirectory' | 'afterStep' | 'sleepSync' | 'now'> = {},
+  config: Pick<MigrationConfig, 'fsyncDirectory' | 'afterStep' | 'sleepSync' | 'now' | 'authLockTiming'> = {},
 ): Harness & {
   mig: Migration;
 } {
@@ -1863,6 +1863,72 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
 
       assert.equal(resumed.state, 'NATIVE', 'the retry completes the hand-back');
       assert.deepEqual(readFileSync(h.authPath), Buffer.from(piRotation), 'S3 keeps Pi\'s rotated entry');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('T-P4b a Pi process holding the auth lock at S3 makes rollback refuse pi-auth-locked and resume completes after release', async () => {
+    const h = setup('xai', new MockKeychain(), {
+      afterStep: (point) => {
+        if (point === 'S2') throw new Error('fixture crash after S2');
+      },
+    });
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      h.mig.commit();
+      assert.throws(() => h.mig.rollback(), /fixture crash after S2/);
+
+      const id = expectedId('xai');
+      const service = qlbKeychainService('xai', id);
+      const account = expectedLabel('xai');
+      const journalBefore = h.store.getMigration('pi-xai');
+      const detailBefore = JSON.parse(journalBefore!.detail_json) as Record<string, unknown>;
+      const generationBefore = h.store.getGrantGeneration(id);
+      const authBefore = readFileSync(h.authPath);
+      const ownerBefore = readFileSync(h.ownerPath);
+      const keychainBefore = h.kc.getSync(service, account);
+      const backupPaths = [piAuthBackupPath(h.authPath, 'xai'), legacyPiAuthBackupPath(h.authPath, 'xai')];
+      const backupsBefore = backupPaths.map((path) => existsSync(path) ? readFileSync(path) : undefined);
+
+      // Match a live Pi lock: fresh directory mtime plus a valid, live owner.
+      const lock = `${resolve(h.authPath)}.lock`;
+      mkdirSync(lock, { mode: 0o700 });
+      writeFileSync(join(lock, 'qlb-lock-owner.json'), `${JSON.stringify({ pid: process.pid, nonce: 'fixture-live-pi-owner' })}\n`, { mode: 0o600 });
+      const refreshPiLock = () => utimesSync(lock, new Date(), new Date());
+      refreshPiLock();
+      const retry = createSingleGrantMigration(h.store, h.kc, 'xai', h.authPath, h.ownerPath, 'xai', {
+        authLockTiming: { retries: 0, retryMs: 1 },
+      });
+
+      refreshPiLock();
+      assert.throws(
+        () => retry.rollback(),
+        (error: unknown) => {
+          const refusal = error as { message?: unknown; exitCode?: unknown; code?: unknown };
+          assert.equal(refusal.message, 'pi-auth-locked');
+          assert.equal(refusal.code, 'pi-auth-locked', 'the established error code is kept');
+          assert.equal(refusal.exitCode, 3);
+          return true;
+        },
+      );
+
+      const detailAfter = JSON.parse(h.store.getMigration('pi-xai')!.detail_json) as Record<string, unknown>;
+      assert.equal(detailBefore.intent, 'rollback', 'the refusal starts from a recorded S1 intent');
+      assert.ok(detailBefore.rollbackDecision && typeof detailBefore.rollbackDecision === 'object', 'the refusal starts from a recorded S2 decision');
+      assert.equal(detailAfter.intent, detailBefore.intent, 'S1 intent is unchanged');
+      assert.deepEqual(detailAfter.rollbackDecision, detailBefore.rollbackDecision, 'S2 decision is unchanged');
+      assert.deepEqual(h.store.getMigration('pi-xai'), journalBefore, 'journal state is unchanged');
+      assert.equal(h.store.getGrantGeneration(id), generationBefore, 'G is unchanged');
+      assert.deepEqual(readFileSync(h.authPath), authBefore, 'auth.json is unchanged');
+      assert.deepEqual(readFileSync(h.ownerPath), ownerBefore, 'owner claim is unchanged');
+      assert.deepEqual(backupPaths.map((path) => existsSync(path) ? readFileSync(path) : undefined), backupsBefore, 'backups are unchanged');
+      assert.equal(h.kc.getSync(service, account), keychainBefore, 'Keychain fake is unchanged');
+
+      rmSync(lock, { recursive: true, force: true });
+      const resumed = retry.resume();
+      assert.equal(resumed.state, 'NATIVE', 'resume completes the hand-back after Pi releases the lock');
     } finally {
       h.cleanup();
     }
