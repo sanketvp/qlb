@@ -190,6 +190,9 @@ export function readCodexSwitchHistory(
     const journalNeedsRow = journal.state === 'ok'
       && !rows.some((row) => attemptFromSteps(row.steps_json) === journal.journal.attemptId);
 
+    const journalInvolved = journalNeedsRow
+      ? expandInvolvedAccounts(journal.journal.unresolved?.involvedAccounts ?? [journal.journal.from, journal.journal.to], slots)
+      : [];
     let synthetic: Omit<CodexSwitchLogRow, 'id'> | undefined;
     if (recoveryFence !== null) {
       const source = rows.find((row) => row.id === recoveryFence.switchId);
@@ -197,12 +200,11 @@ export function readCodexSwitchHistory(
         provider: 'openai-codex', fromAccountId: recoveryFence.from, toAccountId: recoveryFence.to,
         outcome: 'in-flight', publishedAt: recoveryFence.publishedAt, attemptedAt: recoveryFence.publishedAt,
         open_sessions_json: source?.open_sessions_json ?? '[]',
-        involved: expandInvolvedAccounts(recoveryFence.involvedAccounts, slots),
+        // Involved sets are only ever unioned, never shrunk: keep an uncommitted journal's accounts too.
+        involved: [...new Set([...expandInvolvedAccounts(recoveryFence.involvedAccounts, slots), ...journalInvolved])],
       };
     } else if (journalNeedsRow) {
-      const involved = malformedFence
-        ? expandInvolvedAccounts('*', slots)
-        : expandInvolvedAccounts(journal.journal.unresolved?.involvedAccounts ?? [journal.journal.from, journal.journal.to], slots);
+      const involved = malformedFence ? expandInvolvedAccounts('*', slots) : journalInvolved;
       synthetic = {
         provider: 'openai-codex', fromAccountId: journal.journal.from, toAccountId: journal.journal.to,
         outcome: 'in-flight', publishedAt: journal.journal.publishedAt, attemptedAt: journal.journal.publishedAt,

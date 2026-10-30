@@ -189,6 +189,41 @@ describe('Codex session process list and holder eras', () => {
     }
   });
 
+  it('a recovery fence and an uncommitted journal keep the union of their involved accounts live', () => {
+    const dir = mkdtempSync('/tmp/qlb-codex-fence-journal-history-');
+    const dbPath = join(dir, 'qlb.db');
+    const journalDir = join(dir, 'journal');
+    const db = new DatabaseSync(dbPath);
+    try {
+      db.exec(`CREATE TABLE switch_log (
+        id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, provider TEXT NOT NULL,
+        from_account TEXT, to_account TEXT NOT NULL, outcome TEXT NOT NULL,
+        detail TEXT, published_at INTEGER, steps_json TEXT, open_sessions_json TEXT
+      );
+      CREATE TABLE codex_live_observations (
+        id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, identity TEXT,
+        lineage_fp TEXT, by TEXT NOT NULL
+      );
+      CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT);
+      CREATE TABLE codex_slots (account_id TEXT PRIMARY KEY);`);
+      db.prepare('INSERT INTO codex_slots (account_id) VALUES (?), (?), (?)').run(A, B, C);
+      db.prepare('INSERT INTO config (key, value) VALUES (?, ?)').run('codex.recoveryFence', JSON.stringify({
+        v: 1, switchId: 81, attempt: 'fence-attempt', from: A, to: B,
+        publishedAt: T0, reason: 'slot-split', involvedAccounts: [A, B], since: T0 + 1,
+      }));
+    } finally {
+      db.close();
+    }
+    try {
+      writeCodexSwitchJournal(journalFixture({ unresolved: { reason: 'target-ancestor', involvedAccounts: [C], since: T0 + 2 } }), { journalDir });
+      const history = readCodexSwitchHistory(dbPath, { journalDir });
+      assert.equal(history.rows.filter((row) => row.outcome === 'in-flight').length, 1, 'one synthetic row');
+      assert.deepEqual(holderEras(history.rows).filter((era) => era.endsAt === null).map((era) => era.identity).sort(), [A, B, C].sort());
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('a malformed recovery fence keeps every slot live', () => {
     const dir = mkdtempSync('/tmp/qlb-codex-malformed-fence-history-');
     const dbPath = join(dir, 'qlb.db');
