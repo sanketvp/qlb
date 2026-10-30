@@ -1454,14 +1454,14 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
   it('T-I6 a native-resync copy between the reads and the fence is excluded by ranking', async () => {
     let reads = 0;
     let observedDecision: RollbackDecision | undefined;
+    let resynced: string | undefined;
     const h = setup('xai', new MockKeychain(), {
       afterStep: (point) => {
         if (point === 'S2-reads' && reads++ === 0) {
           const service = qlbKeychainService('xai', expectedId('xai'));
           const raw = h.kc.getSync(service, expectedLabel('xai'));
-          h.kc.setSync(service, expectedLabel('xai'), JSON.stringify({
-            ...JSON.parse(raw), generation: 1, writtenBy: 'native-resync',
-          }));
+          resynced = JSON.stringify({ ...JSON.parse(raw), generation: 1, writtenBy: 'native-resync' });
+          h.kc.setSync(service, expectedLabel('xai'), resynced);
         }
         if (point === 'S2') {
           observedDecision = JSON.parse(h.store.getMigration('pi-xai')!.detail_json).rollbackDecision as RollbackDecision;
@@ -1478,6 +1478,8 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
 
       assert.equal(reads, 2, 'a native-resync Keychain write re-runs the outside reads');
       assert.equal(observedDecision?.kind, 'exact-backup', 'ranking excludes the native-resync copy');
+      assert.equal(observedDecision?.kd0, keychainDigest(parseGrant(resynced!)), 'the decision records the re-read Keychain digest');
+      assert.equal(observedDecision?.fencedGeneration, 2, 'the fence is max(g0, k0) + 1 from the re-read k0 = 1');
     } finally {
       h.cleanup();
     }
