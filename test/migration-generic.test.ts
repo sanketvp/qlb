@@ -28,7 +28,7 @@ import {
 import { parseGrant } from '../src/refresh-lease';
 import type { RollbackDecision } from '../src/single-grant-ownership';
 import { legacyPiAuthBackupPath, piAuthBackupPath, readPiAuthBackup, writePiAuthBackup } from '../src/pi-auth-backup';
-import { canonicalDigest, restoreRecordFor } from '../src/pi-handback-source';
+import { canonicalDigest, keychainDigest, restoreRecordFor } from '../src/pi-handback-source';
 import { openStore } from '../src/store';
 
 const fs = require('node:fs') as typeof import('node:fs');
@@ -1314,7 +1314,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       let reads = 0;
       const originalGetLease = h.store.getLease.bind(h.store);
       const originalGetSync = h.kc.getSync.bind(h.kc);
-      h.store.getLease = (name) => reads >= 2 && name === `refresh:${accountId}`
+      h.store.getLease = (name) => reads >= 3 && name === `refresh:${accountId}`
         ? { name, holder_pid: 1, holder_id: 'fixture-refresher', until: Date.now() + 60_000, generation: 1 }
         : originalGetLease(name);
       h.kc.getSync = (readService, readAccount) => {
@@ -1324,7 +1324,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       };
 
       assert.throws(() => h.mig.rollback(), /refresh-in-progress/);
-      assert.ok(reads >= 2, 'the refusal comes from the S5 read, after S2 fenced');
+      assert.ok(reads >= 3, 'the refusal comes from the S5 read, after S2 fenced');
       const refused = JSON.parse(h.store.getMigration('pi-xai')!.detail_json) as Record<string, unknown>;
       assert.notEqual(refused.rollbackDecision, undefined, 'S2 already recorded its decision');
       assert.equal(refused.handback, undefined, 'no hand-back marker is recorded');
@@ -1411,6 +1411,73 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       assert.equal(observedFence, 2, 'the retry ranks and fences the committed refresher generation');
       assert.equal(observedDecision?.generation, 1, 'the retry re-ranked onto the refresher grant');
       assert.equal(observedDecision?.fingerprint, createHash('sha256').update('xai-refresh-rotated-fake', 'utf8').digest('hex'));
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('T-I3 a C3 Keychain write between the reads and a backup decision forces re-selection', async () => {
+    let reads = 0;
+    let observedDecision: RollbackDecision | undefined;
+    const h = setup('xai', new MockKeychain(), {
+      afterStep: (point) => {
+        if (point === 'S2-reads' && reads++ === 0) {
+          const service = qlbKeychainService('xai', expectedId('xai'));
+          const raw = h.kc.getSync(service, expectedLabel('xai'));
+          h.kc.setSync(service, expectedLabel('xai'), JSON.stringify({
+            ...JSON.parse(raw), generation: 1, refresh: 'xai-refresh-c3-fake',
+          }));
+        }
+        if (point === 'S2') {
+          observedDecision = JSON.parse(h.store.getMigration('pi-xai')!.detail_json).rollbackDecision as RollbackDecision;
+        }
+      },
+    });
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      h.mig.commit();
+      writePiAuthBackup(h.authPath, 'xai', 'fixture');
+
+      h.mig.rollback();
+
+      const service = qlbKeychainService('xai', expectedId('xai'));
+      const rewritten = parseGrant(h.kc.getSync(service, expectedLabel('xai')));
+      assert.equal(reads, 2, 'a Keychain digest mismatch re-runs the outside reads');
+      assert.equal(observedDecision?.kind, 'keychain', 'the new C3 grant outranks the backup');
+      assert.equal(observedDecision?.kd0, keychainDigest(rewritten), 'the committed decision records the rewritten Keychain digest');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('T-I6 a native-resync copy between the reads and the fence is excluded by ranking', async () => {
+    let reads = 0;
+    let observedDecision: RollbackDecision | undefined;
+    const h = setup('xai', new MockKeychain(), {
+      afterStep: (point) => {
+        if (point === 'S2-reads' && reads++ === 0) {
+          const service = qlbKeychainService('xai', expectedId('xai'));
+          const raw = h.kc.getSync(service, expectedLabel('xai'));
+          h.kc.setSync(service, expectedLabel('xai'), JSON.stringify({
+            ...JSON.parse(raw), generation: 1, writtenBy: 'native-resync',
+          }));
+        }
+        if (point === 'S2') {
+          observedDecision = JSON.parse(h.store.getMigration('pi-xai')!.detail_json).rollbackDecision as RollbackDecision;
+        }
+      },
+    });
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      h.mig.commit();
+      writePiAuthBackup(h.authPath, 'xai', 'fixture');
+
+      h.mig.rollback();
+
+      assert.equal(reads, 2, 'a native-resync Keychain write re-runs the outside reads');
+      assert.equal(observedDecision?.kind, 'exact-backup', 'ranking excludes the native-resync copy');
     } finally {
       h.cleanup();
     }
