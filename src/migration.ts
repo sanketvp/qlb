@@ -305,6 +305,9 @@ export class OwnerMapPresentError extends Error {
   }
 }
 
+/** Named crash points for MigrationConfig.afterStep; later rows add their own. */
+export type MigrationCrashPoint = 'S6c1';
+
 export interface MigrationConfig {
   kind?: MigrationKind;
   provider?: string;
@@ -322,6 +325,8 @@ export interface MigrationConfig {
   beforeOwnershipLock?: () => void;
   /** Test-only directory durability seam for S6b cleanup. */
   fsyncDirectory?: (path: string) => void;
+  /** Test-only crash seam after a named hand-back step (design §6; row 22 adds `S6c1`). */
+  afterStep?: (point: MigrationCrashPoint) => void;
   /** P7a's in-progress journal directory; defaults to ~/.qlb/journal. */
   piMigrateJournalDir?: string;
 }
@@ -761,6 +766,7 @@ export class Migration {
   private readonly readNativeKey: (() => string) | undefined;
   private readonly beforePoolCommitLock: (() => void) | undefined;
   private readonly beforeOwnershipLock: (() => void) | undefined;
+  private readonly afterStep: ((point: MigrationCrashPoint) => void) | undefined;
   private readonly fsyncDirectory: (path: string) => void;
   private readonly piMigrateJournalDir: string;
 
@@ -784,6 +790,7 @@ export class Migration {
     this.readNativeKey = config.readNativeKey;
     this.beforePoolCommitLock = config.beforePoolCommitLock;
     this.beforeOwnershipLock = config.beforeOwnershipLock;
+    this.afterStep = config.afterStep;
     this.fsyncDirectory = config.fsyncDirectory ?? fsyncDirSync;
     this.piMigrateJournalDir = config.piMigrateJournalDir ?? join(qlbHomeDir(), '.qlb', 'journal');
   }
@@ -1754,6 +1761,10 @@ export class Migration {
       } catch (error) {
         if (!isCredentialNotFound(error)) throw error;
       }
+      // S6c2 follows S6c1 so a crash leaves the marker and retry observes
+      // the same recorded delete verdict (with not-found treated as done).
+      this.afterStep?.('S6c1');
+      this.store.setAccountStatus(journalAccount.id, 'handed-back');
     }
     const detail = parseDetail(this.store.getMigration(this.storeName)?.detail_json);
     this.journal(this.journalState(), {

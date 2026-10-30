@@ -1198,6 +1198,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
         if (fixture.itemPresent) {
           h.kc.setSync(service, account, JSON.stringify({ ...FAKE_GRANTS.xai, generation: 0 }));
         }
+        h.store.upsertAccount(expectedId('xai'), 'xai', expectedLabel('xai'), 'active');
         h.store.upsertMigration('pi-xai', 'NATIVE', JSON.stringify({
           accounts: [{
             id: expectedId('xai'),
@@ -1216,9 +1217,66 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
           `${fixture.disposition} applies only the recorded disposition to J.accounts[0]`,
         );
         assert.equal(resumed.detail.handback, undefined, `${fixture.disposition} completes S7`);
+        assert.equal(
+          h.store.getAccount(expectedId('xai'))?.status,
+          fixture.disposition === 'delete' ? 'handed-back' : 'active',
+          `${fixture.disposition} writes account status only for the recorded delete verdict`,
+        );
       } finally {
         h.cleanup();
       }
+    }
+  });
+
+  it('crash between the Keychain delete and the status write resumes to the same disposition', () => {
+    const h = setup('xai');
+    try {
+      const marker = {
+        phase: 'cleanup-pending',
+        keychainDisposition: 'delete',
+        piFingerprint: null,
+        decision: null,
+        fencedGeneration: null,
+        rolledBackAt: 123,
+      };
+      const id = expectedId('xai');
+      const service = qlbKeychainService('xai', id);
+      const account = expectedLabel('xai');
+      h.kc.setSync(service, account, JSON.stringify({ ...FAKE_GRANTS.xai, generation: 0 }));
+      h.store.upsertAccount(id, 'xai', account, 'active');
+      h.store.upsertMigration('pi-xai', 'NATIVE', JSON.stringify({
+        accounts: [{ id, provider: 'xai', label: account, fingerprint: 'fixture-fingerprint' }],
+        handback: marker,
+      }));
+      const crashing = createSingleGrantMigration(
+        h.store,
+        h.kc,
+        'xai',
+        h.authPath,
+        h.ownerPath,
+        'xai',
+        { afterStep: (point) => { if (point === 'S6c1') throw new Error('fixture crash after S6c1'); } },
+      );
+
+      assert.throws(() => crashing.resume(), /fixture crash after S6c1/);
+      assert.equal(keychainHas(h.kc, 'xai'), false, 'S6c1 deleted K_m before the crash');
+      assert.equal(h.store.getAccount(id)?.status, 'active', 'S6c2 has not written the status');
+      assert.deepEqual(
+        JSON.parse(h.store.getMigration('pi-xai')!.detail_json).handback,
+        marker,
+        'the marker remains set for retry',
+      );
+
+      const resumed = h.mig.resume();
+      assert.equal(h.store.getAccount(id)?.status, 'handed-back', 'S6c2 writes on the recorded delete verdict');
+      assert.equal(resumed.detail.handback, undefined, 'S7 clears the marker after S6c2');
+      assert.equal(
+        (resumed.detail.lastRollback as { keychainDisposition: unknown }).keychainDisposition,
+        'delete',
+        'the recorded disposition is retained through recovery',
+      );
+    } finally {
+      h.cleanup();
     }
   });
 
