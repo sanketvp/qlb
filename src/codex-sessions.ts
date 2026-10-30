@@ -331,6 +331,10 @@ export async function stillTheSameProcess(
   }
 }
 
+function notPublished(row: CodexSwitchLogRow): boolean {
+  return row.outcome === 'failed' && row.detail === 'not-published' && row.publishedAt === null;
+}
+
 function isWritingRow(outcome: CodexSwitchOutcome): boolean {
   return outcome !== 'refused' && outcome !== 'noop';
 }
@@ -372,7 +376,9 @@ export function holderEras(switchLogRows: readonly CodexSwitchLogRow[]): HolderE
     rowTime(row);
   }
 
-  const rows = [...switchLogRows].sort(compareRows);
+  const rows = switchLogRows.filter((row) => !notPublished(row)).sort(compareRows);
+  if (rows.length === 0) return [];
+
   const eras: HolderEra[] = [];
   const live = new Map<string, number | null>();
   const first = rows[0];
@@ -466,7 +472,7 @@ export function holderSets(
   observations: readonly CodexLiveObservation[],
 ): HolderSet[] {
   const switchEras: MutableHolderEra[] = holderEras(switchLogRows).map((era) => ({ ...era }));
-  const rows = [...switchLogRows].sort(compareRows);
+  const rows = switchLogRows.filter((row) => !notPublished(row)).sort(compareRows);
   const fenced = fencedIdentities(rows);
 
   // `published_at`, when present, is the publish boundary; migrated v4 rows

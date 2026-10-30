@@ -24,6 +24,8 @@ const identityC: CodexIdentity = { chatgpt_user_id: 'user-c', account_id: 'accou
 const A = codexIdentityKey(identityA);
 const B = codexIdentityKey(identityB);
 const C = codexIdentityKey(identityC);
+const D = 'user-d:account-d';
+const E = 'user-e:account-e';
 const T0 = Date.parse('2026-10-24T12:00:00.000Z');
 
 function row(
@@ -508,6 +510,45 @@ describe('Codex session process list and holder eras', () => {
       { identity: A, startsAt: T0 + 15_000, endsAt: T0 + 25_000 },
       { identity: C, startsAt: T0 + 25_000, endsAt: null },
     ]);
+  });
+
+  it('a failed row marked not-published opens no era for either side', () => {
+    const rows = [
+      row(1, A, B, 'ok', T0),
+      { ...row(2, C, D, 'failed', null, T0 + 10_000), detail: 'not-published', published_at: null },
+    ];
+
+    assert.deepEqual(holderEras(rows), [
+      { identity: A, startsAt: null, endsAt: T0 },
+      { identity: B, startsAt: T0, endsAt: null },
+    ]);
+    assert.deepEqual(
+      [...new Set(holderSets(rows, []).flatMap((set) => set.identities))].sort(),
+      [A, B],
+    );
+  });
+
+  it('a failed row with published_at set keeps both sides live', () => {
+    const rows = [
+      row(1, A, B, 'ok', T0),
+      { ...row(2, C, D, 'failed', T0 + 10_000), detail: 'not-published', published_at: T0 + 10_000 },
+    ];
+
+    assert.deepEqual(openIdentities(rows), [B, C, D].sort());
+    assert.ok(holderSets(rows, []).some((set) => set.identities.includes(C) && set.identities.includes(D)));
+  });
+
+  it('an in-flight row is never skipped', () => {
+    const rows = [
+      row(1, A, B, 'ok', T0),
+      {
+        ...row(2, C, D, 'in-flight', null, T0 + 10_000), detail: 'not-published', published_at: null,
+        involved: [E],
+      },
+    ];
+
+    assert.deepEqual(openIdentities(rows), [B, C, D, E].sort());
+    assert.ok(holderSets(rows, []).some((set) => set.identities.includes(E)));
   });
 
   it('keeps both sides of failed, rolled-back, and reverted switches live until an ok replacement', () => {
