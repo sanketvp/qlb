@@ -605,6 +605,86 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     }
   });
 
+  it('T-S1 rollback journals intent before any other write and keeps the journal state', async () => {
+    {
+      const h = setup('xai');
+      try {
+        h.mig.stage();
+        await h.mig.rehearse(mockRehearse([]));
+        h.mig.commit();
+        const writes: Array<{ state: string; detail: Record<string, unknown> }> = [];
+        const originalUpsertMigration = h.store.upsertMigration.bind(h.store);
+        h.store.upsertMigration = (store, state, detail) => {
+          if (store === 'pi-xai') writes.push({ state, detail: JSON.parse(detail ?? '{}') as Record<string, unknown> });
+          return originalUpsertMigration(store, state, detail);
+        };
+
+        h.mig.rollback();
+
+        assert.equal(writes[0]?.detail.intent, 'rollback', 'S1 is the first rollback write');
+        assert.equal(writes[0]?.state, 'QLB_OWNED', 'S1 preserves a QLB_OWNED journal state');
+      } finally {
+        h.cleanup();
+      }
+    }
+
+    {
+      const dir = mkdtempSync(join(tmpdir(), 'qlb-s1-native-'));
+      const poolPath = join(dir, 'anthropic-pool.json');
+      const ownerPath = join(dir, 'qlb-owner.json');
+      const store = openStore(join(dir, 'qlb.db'));
+      const kc = new MockKeychain();
+      const mig = new Migration(store, kc, poolPath, ownerPath);
+      writeFileSync(poolPath, JSON.stringify({
+        version: 1,
+        accounts: [{
+          id: 'fixture-account',
+          name: 'Fixture Account',
+          credentials: {
+            type: 'oauth',
+            access: 'pool-access-fake',
+            refresh: 'pool-refresh-fake',
+            expires: Date.now() + 7 * 24 * 3600 * 1000,
+          },
+        }],
+      }) + '\n');
+      try {
+        mig.stage();
+        await mig.rehearse(mockRehearse([]));
+        mig.commit();
+        const committed = store.getMigration('pi-pool');
+        assert.ok(committed);
+        store.upsertMigration('pi-pool', 'NATIVE', committed.detail_json);
+
+        const writes: Array<{ state: string; detail: Record<string, unknown> }> = [];
+        const originalUpsertMigration = store.upsertMigration.bind(store);
+        let crashAfterS1 = true;
+        store.upsertMigration = (storeName, state, detail) => {
+          if (storeName === 'pi-pool') {
+            const write = { state, detail: JSON.parse(detail ?? '{}') as Record<string, unknown> };
+            writes.push(write);
+            const result = originalUpsertMigration(storeName, state, detail);
+            if (crashAfterS1 && write.detail.intent === 'rollback') throw new Error('fixture crash after S1');
+            return result;
+          }
+          return originalUpsertMigration(storeName, state, detail);
+        };
+
+        assert.throws(() => mig.rollback(), /fixture crash after S1/);
+        assert.equal(writes[0]?.detail.intent, 'rollback', 'S1 is the first rollback write');
+        assert.equal(writes[0]?.state, 'NATIVE', 'S1 preserves a NATIVE journal state');
+        assert.equal(mig.status().detail.intent, 'rollback', 'status reports the interrupted C4 hand-back');
+        assert.match(mig.status().resumeAction, /continue rollback/, 'status directs C4 recovery');
+
+        crashAfterS1 = false;
+        assert.equal(mig.resume().state, 'VALIDATED', 'resume routes the NATIVE intent through C4 continuation');
+      } finally {
+        store.close();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  });
+
   it('T-S0b every command refuses an orphan or unreadable O, L, or Oc claim without changing durable state', () => {
     for (const claim of ['O', 'L', 'Oc', 'unreadable-O', 'unreadable-L', 'unreadable-Oc'] as const) {
       for (const command of ['stage', 'commit', 'rollback', 'resume'] as const) {
