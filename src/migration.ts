@@ -126,7 +126,7 @@ import { qlbHomeDir } from './home';
 import type { KeychainBackend } from './keychain';
 import { openRouterMissingKeyMessage, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, readNativeOpenRouterKey } from './keychain';
 import { legacyPiAuthBackupPath, piAuthBackupPath, readPiAuthBackup, removePiAuthBackup, type PiAuthBackup } from './pi-auth-backup';
-import { canonicalDigest, fencedGeneration, handbackVerdict, keychainDigest, rankSingleGrantSource, restoreRecordFor } from './pi-handback-source';
+import { canonicalDigest, fencedGeneration, handbackVerdict, keychainDigest, NoSingleGrantRestoreSourceError, rankSingleGrantSource, restoreRecordFor } from './pi-handback-source';
 import type { RollbackDecision } from './single-grant-ownership';
 import { parseGrant } from './refresh-lease';
 import { hasLegacyPiOwnerEntry, PiOwnerLegacyError, readPiOwnerProviders, withPiAuthLock, writePiOwnerEntry } from './pi-migrate';
@@ -2008,18 +2008,29 @@ export class Migration {
         // S2 only ranks the read-only native entry; later S3 owns its guards.
       }
 
-      const ranked = rankSingleGrantSource({
-        keychainGrant,
-        storeGeneration: g0,
-        commitGeneration: (() => {
-          const value = parseDetail(this.store.getMigration(this.storeName)?.detail_json).commitGeneration;
-          return typeof value === 'number' ? value : undefined;
-        })(),
-        exactBackup,
-        legacyBackup,
-        nativeEntryPresent,
-        nativeEntry,
-      });
+      let ranked;
+      try {
+        ranked = rankSingleGrantSource({
+          keychainGrant,
+          storeGeneration: g0,
+          commitGeneration: (() => {
+            const value = parseDetail(this.store.getMigration(this.storeName)?.detail_json).commitGeneration;
+            return typeof value === 'number' ? value : undefined;
+          })(),
+          exactBackup,
+          legacyBackup,
+          nativeEntryPresent,
+          nativeEntry,
+        });
+      } catch (error) {
+        if (error instanceof NoSingleGrantRestoreSourceError) {
+          throw Object.assign(
+            new Error(`no-restore-source: log in to Pi natively, then run \`qlb migrate resume --provider ${this.provider}\``),
+            { exitCode: 3 },
+          );
+        }
+        throw error;
+      }
       const decidedAt = this.now();
       const sourceBackup = ranked.kind === 'exact-backup'
         ? exactBackup

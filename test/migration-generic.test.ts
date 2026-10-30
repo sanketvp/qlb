@@ -1689,6 +1689,77 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     }
   });
 
+  it('T-S2c no restore source and no valid native entry keeps only the intent', async () => {
+    const h = setup('xai');
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      h.mig.commit();
+      const id = expectedId('xai');
+      const service = qlbKeychainService('xai', id);
+      const account = expectedLabel('xai');
+      h.kc.deleteSync(service, account);
+      writeFileSync(h.authPath, JSON.stringify({ 'kimi-coding': FAKE_GRANTS['kimi-coding'] }, null, 2) + '\n');
+
+      const generationBefore = h.store.getGrantGeneration(id);
+      const authBefore = readFileSync(h.authPath);
+      const ownerBefore = readFileSync(h.ownerPath);
+      const exactBackup = piAuthBackupPath(h.authPath, 'xai');
+      const legacyBackup = legacyPiAuthBackupPath(h.authPath, 'xai');
+      assert.equal(existsSync(exactBackup), false, 'fixture has no exact backup');
+      assert.equal(existsSync(legacyBackup), false, 'fixture has no legacy backup');
+
+      assert.throws(
+        () => h.mig.rollback(),
+        (error: unknown) => {
+          const refusal = error as { message?: unknown; exitCode?: unknown };
+          assert.match(String(refusal.message), /^no-restore-source: log in to Pi natively, then run `qlb migrate resume --provider xai`$/);
+          assert.equal(refusal.exitCode, 3);
+          return true;
+        },
+      );
+
+      const detail = JSON.parse(h.store.getMigration('pi-xai')!.detail_json) as Record<string, unknown>;
+      assert.equal(detail.intent, 'rollback', 'S1 intent remains durable');
+      assert.equal(detail.rollbackDecision, undefined, 'S2 records no decision');
+      assert.equal(h.store.getGrantGeneration(id), generationBefore, 'S2 does not fence');
+      assert.deepEqual(readFileSync(h.authPath), authBefore, 'auth.json is unchanged');
+      assert.equal(existsSync(h.ownerPath), true, 'the owner file remains present');
+      assert.deepEqual(readFileSync(h.ownerPath), ownerBefore, 'the owner file is unchanged');
+      assert.equal(existsSync(exactBackup), false, 'the exact backup remains absent');
+      assert.equal(existsSync(legacyBackup), false, 'the legacy backup remains absent');
+      assert.throws(() => h.kc.getSync(service, account), 'the missing Keychain item remains absent');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('after a native Pi login, resume completes the hand-back without a QLB source', async () => {
+    const h = setup('xai');
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      h.mig.commit();
+      const id = expectedId('xai');
+      const service = qlbKeychainService('xai', id);
+      const account = expectedLabel('xai');
+      h.kc.deleteSync(service, account);
+      writeFileSync(h.authPath, JSON.stringify({ 'kimi-coding': FAKE_GRANTS['kimi-coding'] }, null, 2) + '\n');
+
+      assert.throws(() => h.mig.rollback(), /no-restore-source/);
+      const nativeLogin = JSON.stringify({ xai: FAKE_GRANTS.xai, 'kimi-coding': FAKE_GRANTS['kimi-coding'] }, null, 2) + '\n';
+      writeFileSync(h.authPath, nativeLogin);
+
+      const resumed = h.mig.resume();
+      assert.equal(resumed.state, 'NATIVE');
+      assert.equal((resumed.detail.lastRollback as { decision: RollbackDecision }).decision.kind, 'none');
+      assert.deepEqual(readFileSync(h.authPath), Buffer.from(nativeLogin), 'resume keeps the native Pi login');
+      assert.throws(() => h.kc.getSync(service, account), 'the completed hand-back has no QLB source');
+    } finally {
+      h.cleanup();
+    }
+  });
+
   it('T-I1 a refresh that commits before S2 is ranked first', async () => {
     let decision: RollbackDecision | undefined;
     const h = setup('xai', new MockKeychain(), {
