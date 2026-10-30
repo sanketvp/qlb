@@ -1912,21 +1912,11 @@ export class Migration {
         const journalAccount = this.singleGrantJournalAccount();
         const authKey = this.singleGrantAuthKey();
         this.decideAndFenceSingleGrantRollback(journalAccount, authKey);
-        // S3 guard (a): rollback()/resume() hold the auth lock. A native
-        // entry written since S2 (including Pi rotating an entry) wins; the
-        // existing path below is deliberately unchanged for every other A.
-        let nativeEntryWins = false;
-        try {
-          const auth = this.readSingleGrantAuth();
-          const nativeEntryPresent = Object.prototype.hasOwnProperty.call(auth, authKey);
-          nativeEntryWins = nativeEntryPresent
-            && this.isValidSingleGrantRestoreEntry(auth[authKey], nativeEntryPresent);
-        } catch {
-          // Rows 35–37 own invalid/unreadable A. Preserve main's path for now.
-        }
-        if (nativeEntryWins) {
-          // S3 is satisfied without writing auth.json. S4/S5 still complete.
-        }
+        // S3 under the auth lock that rollback()/resume() hold. Guard (a): a
+        // valid native entry (a newer login, or Pi's rotation) is kept and
+        // nothing is written. Main writes nothing here for any other A
+        // either; rows 35–37 add guards (b)–(d) and the materialising write.
+        this.singleGrantNativeEntryWins(authKey);
         // Validate and check for a live refresh before un-owning, so a refusal
         // leaves the claim intact.
         this.refuseDuringRefresh(journalAccount.id);
@@ -2134,6 +2124,17 @@ export class Migration {
   private holdingPiAuthLock<T>(refresh: () => void, fn: () => T): T {
     this.piAuthLockRefresh = refresh;
     try { return fn(); } finally { this.piAuthLockRefresh = undefined; }
+  }
+
+  /** S3 guard (a): true when Pi's entry `A` is valid (§5.1). Invalid or unreadable `A` belongs to rows 35–37. */
+  private singleGrantNativeEntryWins(authKey: string): boolean {
+    try {
+      const auth = this.readSingleGrantAuth();
+      return Object.prototype.hasOwnProperty.call(auth, authKey)
+        && this.isValidSingleGrantRestoreEntry(auth[authKey], true);
+    } catch {
+      return false;
+    }
   }
 
   private isValidSingleGrantRestoreEntry(entry: unknown, entryPresent: boolean): boolean {
