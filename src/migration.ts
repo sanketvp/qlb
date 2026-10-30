@@ -1932,9 +1932,9 @@ export class Migration {
         this.decideAndFenceSingleGrantRollback(journalAccount, authKey);
         // S3 under the auth lock that rollback()/resume() hold. Guard (a): a
         // valid native entry (a newer login, or Pi's rotation) is kept and
-        // nothing is written. Guard (d): a defined, non-placeholder, invalid
-        // entry refuses native-entry-invalid before the un-own. Guards (b)
-        // and (c) and the materialising write come in rows 36–37.
+        // nothing is written. Guard (b) refuses a missing native entry after
+        // a kind:none decision; guard (d) refuses a defined, non-placeholder,
+        // invalid entry. Guards (b)'s materialising write and (c) come in row 37.
         this.singleGrantNativeEntryWins(authKey);
         // Validate and check for a live refresh before un-owning, so a refusal
         // leaves the claim intact.
@@ -2089,7 +2089,7 @@ export class Migration {
         kind: ranked.kind,
         generation: ranked.kind === 'none' ? null : ranked.generation,
         fingerprint: ranked.kind === 'none' ? null : ranked.fingerprint,
-        entryPresent: record?.entryPresent ?? false,
+        entryPresent: record?.entryPresent ?? nativeEntryPresent,
         sourceDigest: record ? canonicalDigest(record) : null,
         kd0: keychainDigest(keychainGrant),
         decidedAt,
@@ -2145,7 +2145,7 @@ export class Migration {
     try { return fn(); } finally { this.piAuthLockRefresh = undefined; }
   }
 
-  /** S3 guards (a) and (d): keep a valid native entry; refuse a defined invalid non-placeholder entry. */
+  /** S3 guards (a), (b), and (d): keep a valid native entry; refuse missing kind:none or invalid native entries. */
   private singleGrantNativeEntryWins(authKey: string): boolean {
     let auth: Record<string, unknown>;
     try {
@@ -2154,14 +2154,29 @@ export class Migration {
       // An unreadable or non-object auth.json retains main's existing path.
       return false;
     }
-    if (!Object.prototype.hasOwnProperty.call(auth, authKey)) return false;
 
+    const entryPresent = Object.prototype.hasOwnProperty.call(auth, authKey);
     const entry = auth[authKey];
-    if (this.isValidSingleGrantRestoreEntry(entry, true)) return true;
-    if (!isPiPlaceholder(entry)) {
-      throw Object.assign(new Error('native-entry-invalid'), { exitCode: 3 });
+    if (entryPresent && this.isValidSingleGrantRestoreEntry(entry, true)) return true;
+
+    const recordedDecision = parseDetail(this.store.getMigration(this.storeName)?.detail_json).rollbackDecision;
+    const decision = isObjectRecord(recordedDecision) ? recordedDecision as unknown as RollbackDecision : null;
+    // Guard (b): preserve the fenced decision; do not rank again when Pi's
+    // formerly valid entry disappears or becomes the P7a placeholder.
+    // S2 ranks kind:none only when A was valid, so kind:none itself proves A was
+    // present; that also covers decisions recorded before entryPresent was kept.
+    if (isPiPlaceholder(entry) || (!entryPresent && (decision?.kind === 'none' || decision?.entryPresent))) {
+      if (decision?.kind === 'none') {
+        throw Object.assign(new Error('native-entry-missing'), { exitCode: 3 });
+      }
+      // Row 37 materialises a non-none source here.
+      return false;
     }
-    return false;
+    // Guard (c), implemented in row 37, is the remaining absent-entry case.
+    if (!entryPresent) return false;
+
+    // Guard (d): a defined, non-placeholder, invalid entry is never replaced.
+    throw Object.assign(new Error('native-entry-invalid'), { exitCode: 3 });
   }
 
   private isValidSingleGrantRestoreEntry(entry: unknown, entryPresent: boolean): boolean {
