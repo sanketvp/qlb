@@ -9,6 +9,7 @@ import {
 import { codexIdentity } from '../codex-auth';
 import { codexIdentityParts, list, readCodexSwitchHistory, renewers } from '../codex-sessions';
 import { CodexSlots } from '../codex-slots';
+import { codexSwitchJournalDir } from '../codex-switch';
 import { ClaudeCodeLockTimeout } from '../cc-locks';
 import { platformKeychain } from '../keychain';
 import { openStore, type Store } from '../store';
@@ -135,7 +136,9 @@ async function execute(args: string[], ctx: CommandContext): Promise<number> {
             holders: async (document) => {
               const identity = codexIdentity(document);
               if (!identity) throw new Error('Codex slot identity is invalid');
-              const prior = readCodexSwitchHistory(store.dbPath);
+              const prior = readCodexSwitchHistory(store.dbPath, {
+                journalDir: codexSwitchJournalDir({ env: ctx.env }),
+              });
               return renewers(
                 codexIdentityParts(identity),
                 await list(), prior.rows, prior.observations,
