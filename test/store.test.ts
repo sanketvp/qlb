@@ -274,3 +274,168 @@ describe('Codex observations', () => {
     }
   });
 });
+
+describe('Codex switch commit primitive', () => {
+  function openCommitStore() {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-store-commit-codex-switch-'));
+    return openStore(join(dir, 'qlb.db'));
+  }
+
+  function commitInput(overrides: Partial<Parameters<ReturnType<typeof openStore>['commitCodexSwitch']>[0]> = {}) {
+    return {
+      now: 1_000,
+      accountId: 'to:account',
+      setBy: 'auto' as const,
+      fromAccount: 'from:account',
+      toAccount: 'to:account',
+      trigger: 'proactive',
+      outcome: 'ok',
+      attempt: 'attempt-1',
+      via: 'switch' as const,
+      openSessionsJson: '[{"pid":44}]',
+      publishedAt: 900,
+      committedAt: 1_000,
+      detail: 'verified',
+      outgoing: 'from:account',
+      target: 'to:account',
+      observation: { identity: 'to:account', lineageFp: 'lineage-to' },
+      decision: { leftHeadroom: 23, leftRecoveryAt: 2_000, leftTrigger: 'headroom' },
+      ...overrides,
+    };
+  }
+
+  function commitDb(store: ReturnType<typeof openStore>): DatabaseSync {
+    return (store as unknown as { db: DatabaseSync }).db;
+  }
+
+  function tableCount(store: ReturnType<typeof openStore>, table: string): number {
+    return Number((commitDb(store).prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number }).count);
+  }
+
+  it('commitCodexSwitch writes every step-5 effect in one transaction', () => {
+    const store = openCommitStore();
+    try {
+      const id = store.commitCodexSwitch(commitInput());
+      assert.equal(id, 1);
+      assert.deepEqual(store.getActiveLogin('openai-codex'), {
+        provider: 'openai-codex', accountId: 'to:account', since: 1_000, setBy: 'auto',
+      });
+      for (const [key, value] of Object.entries({
+        'cooldown.openai-codex': '301000',
+        'auto.openai-codex.lastSwitchFrom': 'from:account',
+        'auto.openai-codex.lastSwitchTo': 'to:account',
+        'auto.openai-codex.leftHeadroom': '23',
+        'auto.openai-codex.leftRecoveryAt': '2000',
+        'auto.openai-codex.leftTrigger': 'headroom',
+        'codex.lastObservedAt': '1000',
+      })) assert.equal(store.getConfig(key), value, key);
+      assert.deepEqual(
+        { ...(commitDb(store).prepare('SELECT provider, from_account, to_account, trigger, outcome, steps_json, open_sessions_json, published_at, committed_at, detail FROM switch_log').get() as object) },
+        {
+          provider: 'openai-codex', from_account: 'from:account', to_account: 'to:account', trigger: 'proactive', outcome: 'ok',
+          steps_json: '{"attempt":"attempt-1","via":"switch"}', open_sessions_json: '[{"pid":44}]',
+          published_at: 900, committed_at: 1_000, detail: 'verified',
+        },
+      );
+      assert.deepEqual(
+        { ...(commitDb(store).prepare('SELECT identity, lineage_fp, by, ts FROM codex_live_observations').get() as object) },
+        { identity: 'to:account', lineage_fp: 'lineage-to', by: 'qlb-switch', ts: 1_000 },
+      );
+      assert.deepEqual(
+        { ...(commitDb(store).prepare('SELECT switch_id, provider, outgoing, target, next_at, until FROM codex_watch').get() as object) },
+        { switch_id: id, provider: 'openai-codex', outgoing: 'from:account', target: 'to:account', next_at: 121_000, until: 301_000 },
+      );
+    } finally {
+      store.close();
+    }
+  });
+
+  it('ok writes auto.openai-codex.lastSwitchFrom and lastSwitchTo and a manual switch deletes lastSwitchTo', () => {
+    const store = openCommitStore();
+    try {
+      store.commitCodexSwitch(commitInput());
+      assert.equal(store.getConfig('auto.openai-codex.lastSwitchFrom'), 'from:account');
+      assert.equal(store.getConfig('auto.openai-codex.lastSwitchTo'), 'to:account');
+      store.commitCodexSwitch(commitInput({
+        now: 2_000, attempt: 'attempt-2', trigger: 'manual', setBy: 'manual',
+        fromAccount: 'to:account', toAccount: 'from:account', outgoing: 'to:account', target: 'from:account',
+      }));
+      assert.equal(store.getConfig('auto.openai-codex.lastSwitchFrom'), 'to:account');
+      assert.equal(store.getConfig('auto.openai-codex.lastSwitchTo'), null);
+    } finally {
+      store.close();
+    }
+  });
+
+  it('null S45 values delete their keys', () => {
+    const store = openCommitStore();
+    try {
+      for (const key of [
+        'auto.openai-codex.lastSwitchTo',
+        'auto.openai-codex.leftHeadroom',
+        'auto.openai-codex.leftRecoveryAt',
+        'auto.openai-codex.leftTrigger',
+      ]) store.setConfig(key, 'stale');
+      store.commitCodexSwitch(commitInput({
+        trigger: 'manual', setBy: 'manual',
+        decision: { leftHeadroom: null, leftRecoveryAt: null, leftTrigger: null },
+      }));
+      for (const key of [
+        'auto.openai-codex.lastSwitchTo',
+        'auto.openai-codex.leftHeadroom',
+        'auto.openai-codex.leftRecoveryAt',
+        'auto.openai-codex.leftTrigger',
+      ]) assert.equal(store.getConfig(key), null, key);
+    } finally {
+      store.close();
+    }
+  });
+
+  it('a failure in any statement writes none of them', () => {
+    const failures: Array<[string, (db: DatabaseSync) => void]> = [
+      ['active login', (db) => db.exec("CREATE TEMP TRIGGER fail_active BEFORE INSERT ON active_login BEGIN SELECT RAISE(ABORT, 'active'); END")],
+      ['cooldown', (db) => db.exec("CREATE TEMP TRIGGER fail_cooldown BEFORE INSERT ON config WHEN NEW.key = 'cooldown.openai-codex' BEGIN SELECT RAISE(ABORT, 'cooldown'); END")],
+      ['last switch from', (db) => db.exec("CREATE TEMP TRIGGER fail_from BEFORE INSERT ON config WHEN NEW.key = 'auto.openai-codex.lastSwitchFrom' BEGIN SELECT RAISE(ABORT, 'from'); END")],
+      ['last switch to', (db) => db.exec("CREATE TEMP TRIGGER fail_to BEFORE INSERT ON config WHEN NEW.key = 'auto.openai-codex.lastSwitchTo' BEGIN SELECT RAISE(ABORT, 'to'); END")],
+      ['left headroom', (db) => db.exec("CREATE TEMP TRIGGER fail_headroom BEFORE INSERT ON config WHEN NEW.key = 'auto.openai-codex.leftHeadroom' BEGIN SELECT RAISE(ABORT, 'headroom'); END")],
+      ['left recovery', (db) => db.exec("CREATE TEMP TRIGGER fail_recovery BEFORE INSERT ON config WHEN NEW.key = 'auto.openai-codex.leftRecoveryAt' BEGIN SELECT RAISE(ABORT, 'recovery'); END")],
+      ['left trigger', (db) => db.exec("CREATE TEMP TRIGGER fail_trigger BEFORE INSERT ON config WHEN NEW.key = 'auto.openai-codex.leftTrigger' BEGIN SELECT RAISE(ABORT, 'trigger'); END")],
+      ['switch row', (db) => db.exec("CREATE TEMP TRIGGER fail_switch BEFORE INSERT ON switch_log BEGIN SELECT RAISE(ABORT, 'switch'); END")],
+      ['observation timestamp', (db) => db.exec("CREATE TEMP TRIGGER fail_observed BEFORE INSERT ON config WHEN NEW.key = 'codex.lastObservedAt' BEGIN SELECT RAISE(ABORT, 'observed'); END")],
+      ['observation', (db) => db.exec("CREATE TEMP TRIGGER fail_observation BEFORE INSERT ON codex_live_observations BEGIN SELECT RAISE(ABORT, 'observation'); END")],
+      ['watch', (db) => db.exec("CREATE TEMP TRIGGER fail_watch BEFORE INSERT ON codex_watch BEGIN SELECT RAISE(ABORT, 'watch'); END")],
+    ];
+    for (const [name, inject] of failures) {
+      const store = openCommitStore();
+      try {
+        inject(commitDb(store));
+        const before = Object.fromEntries(
+          ['active_login', 'switch_log', 'codex_live_observations', 'codex_watch', 'config']
+            .map((table) => [table, tableCount(store, table)]),
+        );
+        assert.throws(() => store.commitCodexSwitch(commitInput()), Error, name);
+        for (const [table, count] of Object.entries(before)) {
+          assert.equal(tableCount(store, table), count, `${name}: ${table}`);
+        }
+      } finally {
+        store.close();
+      }
+    }
+  });
+
+  it('findCodexSwitchByAttempt finds the committed row', () => {
+    const store = openCommitStore();
+    try {
+      const id = store.commitCodexSwitch(commitInput());
+      assert.deepEqual(store.findCodexSwitchByAttempt('attempt-1'), {
+        id, ts: 1_000, provider: 'openai-codex', fromAccount: 'from:account', toAccount: 'to:account',
+        trigger: 'proactive', outcome: 'ok', detail: 'verified',
+        stepsJson: '{"attempt":"attempt-1","via":"switch"}', openSessionsJson: '[{"pid":44}]',
+        publishedAt: 900, committedAt: 1_000,
+      });
+      assert.equal(store.findCodexSwitchByAttempt('missing'), null);
+    } finally {
+      store.close();
+    }
+  });
+});
