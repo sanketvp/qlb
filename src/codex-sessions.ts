@@ -84,7 +84,7 @@ export function codexIdentityParts(slotId: string): CodexIdentity {
   };
 }
 
-interface CodexRecoveryFence {
+export interface CodexRecoveryFence {
   v: 1;
   switchId: number;
   attempt: string;
@@ -105,7 +105,7 @@ function nonEmptyString(value: unknown): value is string {
 }
 
 /** Recovery fences are deliberately an exact, credential-free config shape. */
-function parseCodexRecoveryFence(value: string | null): CodexRecoveryFence | null {
+export function parseCodexRecoveryFence(value: string | null): CodexRecoveryFence | null {
   if (value === null) return null;
   try {
     const parsed: unknown = JSON.parse(value);

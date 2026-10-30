@@ -107,7 +107,8 @@ export type CodexConsumeStatus =
   | 'stashed-lock-lost'
   | 'successor-unpersisted'
   | 'slot-removed'
-  | 'slot-split';
+  | 'slot-split'
+  | 'switch-in-flight';
 
 export interface CodexRefreshResponse {
   status: number;
@@ -127,6 +128,8 @@ export interface CodexConsumeEvent {
 
 export interface CodexConsumeResult {
   status: CodexConsumeStatus;
+  /** Consumer adapters attach the durable recovery explanation for operator output. */
+  message?: string;
   document?: CodexAuthDocument;
   holders?: number[];
   stashId?: string;
@@ -162,6 +165,8 @@ export interface CodexConsumeOptions {
   record?: (event: CodexConsumeEvent) => void;
   /** C6-3 authority fence supplied by the consume and switch lock holders. */
   assertHeld?: () => void;
+  /** C6-12 recovery fence read under the shared switch lock by the caller. */
+  inFlightSlots?: ReadonlySet<string> | '*';
 }
 
 interface CurrentSlot {
@@ -518,6 +523,9 @@ async function adoptSuccessor(options: CodexConsumeOptions, current: CurrentSlot
 
 /** C10's inactive-slot consume gate. The caller holds the provider locks. */
 async function consumeCodexSlotLocked(options: CodexConsumeOptions): Promise<CodexConsumeResult> {
+  if (options.inFlightSlots === '*' || options.inFlightSlots?.has(options.accountId)) {
+    return { status: 'switch-in-flight' };
+  }
   const now = options.now?.() ?? Date.now();
   let issuedSuccessor: CodexAuthDocument | undefined;
   let current!: CurrentSlot;

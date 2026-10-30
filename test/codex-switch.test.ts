@@ -7,6 +7,7 @@ import { describe, it } from 'node:test';
 
 import {
   checkCodexSwitchPreconditions,
+  codexRecoveryFenceState,
   preflightCodexLive,
   type CodexSwitchDeps,
   type CodexSwitchJournal,
@@ -208,6 +209,67 @@ function journalHarness() {
   };
   return { root, journalDir, options };
 }
+
+describe('Codex recovery fence state — C6-12', () => {
+  it('a journal and a config fence together fence the union and report the journal\'s reason', () => {
+    const h = fixture();
+    const journalDir = join(h.root, 'journal');
+    try {
+      writeCodexSwitchJournal(journalFixture(h.root, {
+        unresolved: { reason: 'slot-split', involvedAccounts: ['from:account', 'journal-third:account'], since: 1 },
+      }), { journalDir });
+      h.store.setConfig('codex.recoveryFence', JSON.stringify({
+        v: 1, switchId: 1, attempt: 'fence-attempt', from: 'fence-from:account', to: 'fence-to:account',
+        publishedAt: 1, reason: 'target-ancestor', involvedAccounts: ['fence-third:account'], since: 1,
+      }));
+      const state = codexRecoveryFenceState(journalDir, h.store);
+      assert.equal(state.state, 'fenced');
+      if (state.state !== 'fenced') return;
+      assert.equal(state.reason, 'slot-split');
+      assert.equal(state.message, 'Codex switch recovery needs you (slot-split): log in to Codex with the account you want (codex login), then run qlb codex import-active. QLB finishes the recovery at its next check.');
+      assert.deepEqual((state.accounts === '*' ? [] : [...state.accounts]).sort(), [
+        'fence-from:account', 'fence-third:account', 'fence-to:account', 'from:account', 'journal-third:account', 'to:account',
+      ]);
+    } finally {
+      h.store.close();
+      rmSync(h.root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('Codex recovery fence state — C6-12 review r1', () => {
+  it('a present recovery-fence row with a NULL value fences every account as malformed', () => {
+    const h = fixture();
+    try {
+      h.db.prepare("INSERT INTO config (key, value) VALUES ('codex.recoveryFence', NULL)").run();
+      const state = codexRecoveryFenceState(join(h.root, 'no-journal'), h.store);
+      assert.equal(state.state, 'fenced');
+      if (state.state !== 'fenced') return;
+      assert.equal(state.accounts, '*');
+      assert.equal(state.reason, 'switch-recovery-malformed');
+    } finally {
+      h.store.close();
+      rmSync(h.root, { recursive: true, force: true });
+    }
+  });
+
+  it('an in-flight journal is refused switch-in-flight without the unresolved-fence login instruction', () => {
+    const h = fixture();
+    const journalDir = join(h.root, 'journal');
+    try {
+      writeCodexSwitchJournal(journalFixture(h.root), { journalDir });
+      const state = codexRecoveryFenceState(journalDir, h.store);
+      assert.equal(state.state, 'fenced');
+      if (state.state !== 'fenced') return;
+      assert.equal(state.reason, 'switch-in-flight');
+      assert.doesNotMatch(state.message, /codex login|import-active/);
+      assert.deepEqual((state.accounts === '*' ? [] : [...state.accounts]).sort(), ['from:account', 'to:account']);
+    } finally {
+      h.store.close();
+      rmSync(h.root, { recursive: true, force: true });
+    }
+  });
+});
 
 describe('Codex switch journal v2', () => {
   it('journal v2 round-trips at mode 0600 and contains no token value', () => {
