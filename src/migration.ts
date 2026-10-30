@@ -2144,15 +2144,23 @@ export class Migration {
     try { return fn(); } finally { this.piAuthLockRefresh = undefined; }
   }
 
-  /** S3 guard (a): true when Pi's entry `A` is valid (§5.1). Invalid or unreadable `A` belongs to rows 35–37. */
+  /** S3 guards (a) and (d): keep a valid native entry; refuse a defined invalid non-placeholder entry. */
   private singleGrantNativeEntryWins(authKey: string): boolean {
+    let auth: Record<string, unknown>;
     try {
-      const auth = this.readSingleGrantAuth();
-      return Object.prototype.hasOwnProperty.call(auth, authKey)
-        && this.isValidSingleGrantRestoreEntry(auth[authKey], true);
+      auth = this.readSingleGrantAuth();
     } catch {
+      // An unreadable or non-object auth.json retains main's existing path.
       return false;
     }
+    if (!Object.prototype.hasOwnProperty.call(auth, authKey)) return false;
+
+    const entry = auth[authKey];
+    if (this.isValidSingleGrantRestoreEntry(entry, true)) return true;
+    if (!isPiPlaceholder(entry)) {
+      throw Object.assign(new Error('native-entry-invalid'), { exitCode: 3 });
+    }
+    return false;
   }
 
   private isValidSingleGrantRestoreEntry(entry: unknown, entryPresent: boolean): boolean {

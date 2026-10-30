@@ -1842,6 +1842,76 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     }
   });
 
+  it('T-S3e a defined, non-placeholder, invalid native entry refuses native-entry-invalid', async () => {
+    for (const fixture of [
+      {
+        name: 'an object with an empty refresh',
+        entry: { ...FAKE_GRANTS.xai, refresh: '' },
+      },
+      { name: 'a string', entry: 'not-an-auth-entry' },
+    ]) {
+      const h = setup('xai', new MockKeychain(), {
+        afterStep: (point) => {
+          if (point === 'S2') throw new Error('fixture crash after S2');
+        },
+      });
+      try {
+        h.mig.stage();
+        await h.mig.rehearse(mockRehearse([]));
+        h.mig.commit();
+        assert.throws(() => h.mig.rollback(), /fixture crash after S2/);
+
+        writeFileSync(h.authPath, JSON.stringify({
+          ...FAKE_GRANTS,
+          xai: fixture.entry,
+        }, null, 2) + '\n');
+        const id = expectedId('xai');
+        const service = qlbKeychainService('xai', id);
+        const account = expectedLabel('xai');
+        const journalBefore = h.store.getMigration('pi-xai');
+        const generationBefore = h.store.getGrantGeneration(id);
+        const authBefore = readFileSync(h.authPath);
+        const ownerBefore = readFileSync(h.ownerPath);
+        const backupPaths = [piAuthBackupPath(h.authPath, 'xai'), legacyPiAuthBackupPath(h.authPath, 'xai')];
+        const backupsBefore = backupPaths.map((path) => existsSync(path) ? readFileSync(path) : undefined);
+        const keychainBefore = h.kc.getSync(service, account);
+
+        assert.throws(
+          () => h.mig.resume(),
+          (error: unknown) => {
+            const refusal = error as { message?: unknown; exitCode?: unknown };
+            assert.equal(refusal.message, 'native-entry-invalid', fixture.name);
+            assert.equal(refusal.exitCode, 3, fixture.name);
+            return true;
+          },
+        );
+
+        const detailAfter = JSON.parse(h.store.getMigration('pi-xai')!.detail_json) as Record<string, unknown>;
+        assert.equal(detailAfter.intent, 'rollback', `${fixture.name}: intent is unchanged`);
+        assert.ok(detailAfter.rollbackDecision, `${fixture.name}: decision is retained`);
+        assert.deepEqual(h.store.getMigration('pi-xai'), journalBefore, `${fixture.name}: journal state is unchanged`);
+        assert.equal(h.store.getGrantGeneration(id), generationBefore, `${fixture.name}: G is unchanged`);
+        assert.deepEqual(readFileSync(h.authPath), authBefore, `${fixture.name}: auth.json is unchanged`);
+        assert.deepEqual(readFileSync(h.ownerPath), ownerBefore, `${fixture.name}: owner claim is unchanged`);
+        assert.deepEqual(
+          backupPaths.map((path) => existsSync(path) ? readFileSync(path) : undefined),
+          backupsBefore,
+          `${fixture.name}: backups are unchanged`,
+        );
+        assert.equal(h.kc.getSync(service, account), keychainBefore, `${fixture.name}: Keychain fake is unchanged`);
+
+        const nativeLogin = JSON.stringify({ ...FAKE_GRANTS }, null, 2) + '\n';
+        writeFileSync(h.authPath, nativeLogin);
+        const resumed = h.mig.resume();
+        assert.equal(resumed.state, 'NATIVE', `${fixture.name}: native login lets the hand-back complete`);
+        assert.deepEqual(readFileSync(h.authPath), Buffer.from(nativeLogin), `${fixture.name}: guard (a) keeps the native login`);
+        assert.equal(existsSync(h.ownerPath), false, `${fixture.name}: completed hand-back releases the owner claim`);
+      } finally {
+        h.cleanup();
+      }
+    }
+  });
+
   it('T-P2 Pi rotation of the restored entry before the retry is kept', async () => {
     const h = setup('xai', new MockKeychain(), {
       afterStep: (point) => {
