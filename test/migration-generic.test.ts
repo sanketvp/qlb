@@ -1906,14 +1906,17 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       assert.throws(
         () => retry.rollback(),
         (error: unknown) => {
-          const refusal = error as { message?: unknown; exitCode?: unknown };
+          const refusal = error as { message?: unknown; exitCode?: unknown; code?: unknown };
           assert.equal(refusal.message, 'pi-auth-locked');
+          assert.equal(refusal.code, 'pi-auth-locked', 'the established error code is kept');
           assert.equal(refusal.exitCode, 3);
           return true;
         },
       );
 
       const detailAfter = JSON.parse(h.store.getMigration('pi-xai')!.detail_json) as Record<string, unknown>;
+      assert.equal(detailBefore.intent, 'rollback', 'the refusal starts from a recorded S1 intent');
+      assert.ok(detailBefore.rollbackDecision && typeof detailBefore.rollbackDecision === 'object', 'the refusal starts from a recorded S2 decision');
       assert.equal(detailAfter.intent, detailBefore.intent, 'S1 intent is unchanged');
       assert.deepEqual(detailAfter.rollbackDecision, detailBefore.rollbackDecision, 'S2 decision is unchanged');
       assert.deepEqual(h.store.getMigration('pi-xai'), journalBefore, 'journal state is unchanged');

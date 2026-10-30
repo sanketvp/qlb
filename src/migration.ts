@@ -1414,18 +1414,21 @@ export class Migration {
     return this.finishHygiene();
   }
 
+  /** S3 precondition: a lock timeout refuses `pi-auth-locked` (exit 3) with the decision kept. */
   private withSingleGrantRollbackAuthLock<T>(fn: () => T): T {
+    let acquired = false;
     try {
       return withPiAuthLock(
         resolve(this.poolFilePath),
-        (refresh) => this.holdingPiAuthLock(refresh, fn),
+        (refresh) => { acquired = true; return this.holdingPiAuthLock(refresh, fn); },
         this.authLockTiming,
       );
-    } catch (cause: unknown) {
-      if (cause && typeof cause === 'object' && (cause as { code?: unknown }).code === 'pi-auth-locked') {
-        throw Object.assign(new Error('pi-auth-locked', { cause }), { exitCode: 3 });
+    } catch (error: unknown) {
+      // Only a failure to acquire the lock wrote nothing; errors from fn pass through unchanged.
+      if (!acquired && error && typeof error === 'object' && (error as { code?: unknown }).code === 'pi-auth-locked') {
+        throw Object.assign(error, { exitCode: 3 });
       }
-      throw cause;
+      throw error;
     }
   }
 
