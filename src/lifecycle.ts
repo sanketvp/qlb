@@ -143,6 +143,7 @@ function assertAdmittedForPhase(current: LifecycleRow, operation: LifecycleOpera
   // retirement; normal service and its reporting remain available.
   if (current.note === RETIREMENT_IN_PROGRESS && (
     operation === 'undo-cswap' || operation === 'undo-cswap:resume' || operation === 'pi-rollback' || operation === 'retire-cswap'
+    || operation === 'lifecycle-close'
   )) {
     return { ok: false, code: RETIREMENT_IN_PROGRESS, row: current };
   }
@@ -480,8 +481,14 @@ export function closeLifecycle(store: Store, id: number, note: string, now: numb
   if (!['rolled-back', 'aborted', 'retired'].includes(current.state) || current.id !== id) {
     return { ok: false, code: `phase=${current.state}`, row: current };
   }
-  withDb(store, (db) => db.prepare("UPDATE lifecycle SET state = 'closed', closed_at = ?, note = ? WHERE id = ?").run(now, note, id));
-  return { ok: true, row: phase(store) };
+  // Closing would overwrite the fence and strand the retirement's journal (user decision X4a-r).
+  if (current.note === RETIREMENT_IN_PROGRESS) return { ok: false, code: RETIREMENT_IN_PROGRESS, row: current };
+  const changed = withDb(store, (db) => db.prepare(
+    "UPDATE lifecycle SET state = 'closed', closed_at = ?, note = ? WHERE id = ? AND note IS NOT ?",
+  ).run(now, note, id, RETIREMENT_IN_PROGRESS).changes);
+  return changed === 1
+    ? { ok: true, row: phase(store) }
+    : { ok: false, code: RETIREMENT_IN_PROGRESS, row: phase(store) };
 }
 
 export function lifecycleCheck(store: Pick<Store, 'dbPath'>, kind: 'window' | 'drill', now: number = Date.now()): { level: 'PASS' | 'WARN' | 'FAIL'; message: string } {
