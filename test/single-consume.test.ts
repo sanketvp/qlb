@@ -19,7 +19,7 @@ import { KIMI_CODING_CLIENT_ID, refreshKimiCodingCredential } from '../src/oauth
 import { listStashes, recordStash } from '../src/unclaimed-index';
 import { ADAPTER_ACCOUNT_IDS } from '../src/migration';
 import { sharedSingleGrantCoords } from '../src/single-grant-ownership';
-import { Store } from '../src/store';
+import { refreshLeaseName, Store } from '../src/store';
 
 const NOW = 1_730_000_000_000;
 
@@ -558,6 +558,127 @@ describe('single-account consume gate', () => {
         assert.equal(store.getGrantGeneration(accountId), 1);
         assert.equal(written.generation, 1);
         assert.equal(written.writtenBy, 'single-consume');
+      } finally { store.close(); await rm(home, { recursive: true, force: true }); }
+    });
+
+    it(`P13 on a generic-held item holds the refresh lease across the POST [${provider}]`, async () => {
+      const home = await mkdtemp(join(tmpdir(), 'qlb-single-consume-'));
+      const keychain = new MockKeychain();
+      const store = new Store(':memory:');
+      const accountId = ADAPTER_ACCOUNT_IDS[provider];
+      store.upsertAccount(accountId, provider, provider);
+      store.upsertMigration(`pi-${provider}`, 'QLB_OWNED', JSON.stringify({ accounts: [{ id: accountId, provider, label: provider, keychain: sharedSingleGrantCoords(provider) }] }));
+      keychain.setSync(qlbKeychainService(provider, 'default'), QLB_KEYCHAIN_ACCOUNT, JSON.stringify({ ...credential('before', 'refresh-before'), generation: 0 }));
+      try {
+        await consumeSingleCredential(provider, credential('before', 'refresh-before'), {
+          keychain, home, store, lock: createInMemorySingleConsumeLock(), now: () => NOW,
+          refresh: async () => {
+            const lease = store.getLease(refreshLeaseName(accountId));
+            assert.ok(lease, 'P13 holds a live refresh lease during its POST');
+            assert.match(lease.holder_id, /:/);
+            assert.equal(lease.generation, 0);
+            return { kind: 'success', credential: credential('after', 'refresh-after', NOW + 3_600_000) };
+          },
+        });
+        assert.equal(store.getLease(refreshLeaseName(accountId)), null);
+      } finally { store.close(); await rm(home, { recursive: true, force: true }); }
+    });
+
+    it(`P13 on a generic-held item releases the refresh lease on every refusal [${provider}]`, async () => {
+      const home = await mkdtemp(join(tmpdir(), 'qlb-single-consume-'));
+      const keychain = new MockKeychain();
+      const store = new Store(':memory:');
+      const accountId = ADAPTER_ACCOUNT_IDS[provider];
+      const service = qlbKeychainService(provider, 'default');
+      const detail = { accounts: [{ id: accountId, provider, label: provider, keychain: sharedSingleGrantCoords(provider) }] };
+      const reset = (): void => {
+        store.upsertAccount(accountId, provider, provider);
+        store.upsertMigration(`pi-${provider}`, 'QLB_OWNED', JSON.stringify(detail));
+        keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, JSON.stringify({ ...credential('before', 'refresh-before'), generation: store.getGrantGeneration(accountId) ?? 0 }));
+      };
+      const assertP13Lease = (): void => {
+        const lease = store.getLease(refreshLeaseName(accountId));
+        assert.ok(lease, 'P13 holds a refresh lease during its POST');
+        assert.match(lease.holder_id, /:/);
+      };
+      try {
+        reset();
+        await assert.rejects(consumeSingleCredential(provider, credential('before', 'refresh-before'), {
+          keychain, home: join(home, 'cas'), store, lock: createInMemorySingleConsumeLock(), now: () => NOW,
+          refresh: async () => {
+            assertP13Lease();
+            assert.equal(store.bumpGrantGeneration(accountId, store.getGrantGeneration(accountId) ?? -1), 1);
+            return { kind: 'success', credential: credential('after-cas', 'refresh-after-cas', NOW + 3_600_000) };
+          },
+        }), /cas-conflict/);
+        assert.equal(store.getLease(refreshLeaseName(accountId)), null);
+
+        store.upsertMigration(`pi-${provider}`, 'QLB_OWNED', JSON.stringify(detail));
+        keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, JSON.stringify({ ...credential('before', 'refresh-before'), generation: store.getGrantGeneration(accountId) }));
+        await assert.rejects(consumeSingleCredential(provider, credential('before', 'refresh-before'), {
+          keychain, home: join(home, 'stash'), store, lock: createInMemorySingleConsumeLock(), now: () => NOW,
+          refresh: async () => {
+            assertP13Lease();
+            store.upsertMigration(`pi-${provider}`, 'QLB_OWNED', JSON.stringify({ ...detail, handback: {} }));
+            return { kind: 'success', credential: credential('after-stash', 'refresh-after-stash', NOW + 3_600_000) };
+          },
+        }), /generic-ownership-marker/);
+        assert.equal(store.getLease(refreshLeaseName(accountId)), null);
+        assert.equal((await listStashes(root(join(home, 'cas')), provider, 'default')).length, 1);
+        assert.equal((await listStashes(root(join(home, 'stash')), provider, 'default')).length, 1);
+
+        store.upsertMigration(`pi-${provider}`, 'QLB_OWNED', JSON.stringify(detail));
+        keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, JSON.stringify({ ...credential('before', 'refresh-before'), generation: store.getGrantGeneration(accountId) }));
+        await assert.rejects(consumeSingleCredential(provider, credential('before', 'refresh-before'), {
+          keychain, home: join(home, 'throw'), store, lock: createInMemorySingleConsumeLock(), now: () => NOW,
+          refresh: async () => { assertP13Lease(); throw new Error('POST exploded'); },
+        }), /POST exploded/);
+        assert.equal(store.getLease(refreshLeaseName(accountId)), null);
+      } finally { store.close(); await rm(home, { recursive: true, force: true }); }
+    });
+
+    it(`P13 waits for another live refresh lease and does not POST meanwhile [${provider}]`, async () => {
+      const home = await mkdtemp(join(tmpdir(), 'qlb-single-consume-'));
+      const keychain = new MockKeychain();
+      const store = new Store(':memory:');
+      const accountId = ADAPTER_ACCOUNT_IDS[provider];
+      store.upsertAccount(accountId, provider, provider);
+      store.upsertMigration(`pi-${provider}`, 'QLB_OWNED', JSON.stringify({ accounts: [{ id: accountId, provider, label: provider, keychain: sharedSingleGrantCoords(provider) }] }));
+      keychain.setSync(qlbKeychainService(provider, 'default'), QLB_KEYCHAIN_ACCOUNT, JSON.stringify({ ...credential('before', 'refresh-before'), generation: 0 }));
+      assert.equal(store.acquireRefreshLease(accountId, 'other-holder', process.pid, 0, 15_000), 'acquired');
+      let posts = 0;
+      try {
+        const pending = consumeSingleCredential(provider, credential('before', 'refresh-before'), {
+          keychain, home, store, lock: createInMemorySingleConsumeLock(), now: () => NOW,
+          refresh: async () => {
+            posts += 1;
+            return { kind: 'success', credential: credential('after', 'refresh-after', NOW + 3_600_000) };
+          },
+        });
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        assert.equal(posts, 0);
+        store.releaseRefreshLease(accountId, 'other-holder');
+        await pending;
+        assert.equal(posts, 1);
+      } finally { store.close(); await rm(home, { recursive: true, force: true }); }
+    });
+
+    it(`P13 on an item that is not generic-held takes no refresh lease [${provider}]`, async () => {
+      const home = await mkdtemp(join(tmpdir(), 'qlb-single-consume-'));
+      const keychain = new MockKeychain();
+      const store = new Store(':memory:');
+      const accountId = ADAPTER_ACCOUNT_IDS[provider];
+      store.upsertAccount(accountId, provider, provider);
+      keychain.setSync(qlbKeychainService(provider, 'default'), QLB_KEYCHAIN_ACCOUNT, JSON.stringify(credential('before', 'refresh-before')));
+      try {
+        await consumeSingleCredential(provider, credential('before', 'refresh-before'), {
+          keychain, home, store, lock: createInMemorySingleConsumeLock(), now: () => NOW,
+          refresh: async () => {
+            assert.equal(store.getLease(refreshLeaseName(accountId)), null);
+            return { kind: 'success', credential: credential('after', 'refresh-after', NOW + 3_600_000) };
+          },
+        });
+        assert.equal(store.getLease(refreshLeaseName(accountId)), null);
       } finally { store.close(); await rm(home, { recursive: true, force: true }); }
     });
 

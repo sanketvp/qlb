@@ -1,16 +1,23 @@
 // Single-account refresh consume gate for xAI and Kimi Coding (spec §4.5).
 // The lock, Keychain, HTTP transport, clock and durable side effects are injectable.
 
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { CREDENTIALS_STALENESS_MS, withProperLockfile } from './cc-locks';
 import { platformKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from './keychain';
 import { ADAPTER_ACCOUNT_IDS } from './migration';
-import { parseGrant } from './refresh-lease';
+import {
+  DEFAULT_HEARTBEAT_MS,
+  DEFAULT_LEASE_TTL_MS,
+  DEFAULT_WAIT_POLL_MS,
+  DEFAULT_WAIT_TIMEOUT_MS,
+  parseGrant,
+  waitForRefreshLease,
+} from './refresh-lease';
 import { sharedSingleGrantCoords, resolveSingleGrantKeychain } from './single-grant-ownership';
-import type { Store } from './store';
+import { refreshLeaseName, type Store } from './store';
 import { refreshKimiCodingCredential } from './oauth/kimi-coding-refresh';
 import {
   refreshXaiCredential,
@@ -44,7 +51,18 @@ export interface SingleConsumeLock {
   withLock<T>(provider: SingleConsumeProvider, work: () => Promise<T>): Promise<T>;
 }
 
-export type SingleConsumeStore = Pick<Store, 'getMigration' | 'getConfig' | 'getGrantGeneration' | 'repairGrantGeneration' | 'runImmediate' | 'bumpGrantGeneration'>;
+export type SingleConsumeStore = Pick<Store,
+  'getMigration' | 'getConfig' | 'getGrantGeneration' | 'repairGrantGeneration'
+  | 'runImmediate' | 'bumpGrantGeneration'
+> & Partial<Pick<Store,
+  'getLease' | 'acquireRefreshLease' | 'heartbeatRefreshLease'
+  | 'releaseRefreshLease' | 'deleteLeaseIfHolder'
+>>;
+
+type RefreshLeaseStore = Required<Pick<SingleConsumeStore,
+  'getLease' | 'acquireRefreshLease' | 'heartbeatRefreshLease'
+  | 'releaseRefreshLease' | 'deleteLeaseIfHolder'
+>>;
 
 export interface SingleConsumeDeps {
   keychain?: SingleStashKeychain;
@@ -75,6 +93,7 @@ export interface SingleConsumeResult {
 interface StoredCredential { credential: OAuthCredential; bytes: string; }
 
 const GATE_FRESHEN_MS = 60_000;
+const PROCESS_UUID = randomUUID();
 
 function credentialService(provider: SingleConsumeProvider): string {
   return qlbKeychainService(provider, 'default');
@@ -248,6 +267,7 @@ function genericWrite(
   baseline: GenericBaseline | null,
   keychain: SingleStashKeychain,
   deps: Pick<SingleConsumeDeps, 'store' | 'home' | 'p7aJournalPath'>,
+  refreshLeaseHolder?: string,
 ): GenericBaseline & StoredCredential {
   const { store } = deps;
   return store.runImmediate(() => {
@@ -266,6 +286,7 @@ function genericWrite(
     const written = JSON.stringify(stamped);
     keychain.setSync(credentialService(provider), QLB_KEYCHAIN_ACCOUNT, written);
     if (store.bumpGrantGeneration(accountId, baseline.generation) !== 1) throw new SingleConsumeFailure('cas-conflict');
+    if (refreshLeaseHolder) (store as RefreshLeaseStore).deleteLeaseIfHolder(refreshLeaseName(accountId), refreshLeaseHolder);
     return { generation, bytes: written, credential: stamped };
   });
 }
@@ -287,6 +308,7 @@ export async function consumeSingleCredential(
   const lock = deps.lock ?? defaultSingleConsumeLock(home);
   const dueWithinMs = deps.dueWithinMs ?? GATE_FRESHEN_MS;
   return lock.withLock(provider, async () => {
+    for (;;) {
     // A generic-held item may not spend a refresh token unless W2 admits it.
     const owner = sharedItemOwner(provider, deps);
     let current = readStoredCredential(provider, keychain);
@@ -334,9 +356,38 @@ export async function consumeSingleCredential(
 
     const consumedFp = credentialLineage(current.credential);
     const consumedContentFingerprint = contentFingerprint(current.bytes);
+    let refreshLeaseHolder: string | undefined;
+    let heartbeat: NodeJS.Timeout | undefined;
+    if (owner === 'generic') {
+      const accountId = ADAPTER_ACCOUNT_IDS[provider];
+      const leaseStore = deps.store as SingleConsumeStore & RefreshLeaseStore;
+      const holderId = `${PROCESS_UUID}:${randomUUID()}`;
+      const acquired = leaseStore.acquireRefreshLease(
+        accountId,
+        holderId,
+        process.pid,
+        baseline!.generation,
+        DEFAULT_LEASE_TTL_MS,
+      );
+      if (acquired === 'stale_gen') throw new SingleConsumeFailure('cas-conflict');
+      if (acquired === 'busy') {
+        const waited = await waitForRefreshLease(leaseStore, accountId, baseline!.generation, {
+          timeoutMs: DEFAULT_WAIT_TIMEOUT_MS,
+          pollMs: DEFAULT_WAIT_POLL_MS,
+        });
+        if (waited === 'timeout') throw new SingleConsumeFailure('credential-unavailable');
+        continue;
+      }
+      refreshLeaseHolder = holderId;
+      heartbeat = setInterval(() => {
+        leaseStore.heartbeatRefreshLease(accountId, holderId, baseline!.generation, DEFAULT_LEASE_TTL_MS);
+      }, DEFAULT_HEARTBEAT_MS);
+    }
+
     // The handler is installed before the POST and stays in place until the
     // response is either primary-persisted or durably stashed.
-    return deferTermination(async () => {
+    try {
+    return await deferTermination(async () => {
       const refreshed = await deps.refresh(current.credential);
       if (refreshed.kind === 'dead') {
         notifyDead(provider, deps);
@@ -359,7 +410,7 @@ export async function consumeSingleCredential(
       let persisted: OAuthCredential;
       try {
         persisted = sharedItemOwner(provider, deps) === 'generic'
-          ? genericWrite(provider, refreshed.credential, baseline, keychain, deps).credential
+          ? genericWrite(provider, refreshed.credential, baseline, keychain, deps, refreshLeaseHolder).credential
           : (() => {
             keychain.setSync(credentialService(provider), QLB_KEYCHAIN_ACCOUNT, JSON.stringify(refreshed.credential));
             return refreshed.credential;
@@ -372,6 +423,11 @@ export async function consumeSingleCredential(
       notifyLineage(provider, consumedFp, persisted, deps);
       return { credential: persisted, outcome: 'refreshed' };
     });
+    } finally {
+      if (heartbeat) clearInterval(heartbeat);
+      if (refreshLeaseHolder) (deps.store as RefreshLeaseStore).releaseRefreshLease(ADAPTER_ACCOUNT_IDS[provider], refreshLeaseHolder);
+    }
+    }
   });
 }
 
