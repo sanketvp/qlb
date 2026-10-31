@@ -1957,7 +1957,10 @@ export class Migration {
         this.deleteStaticKeychain();
         continue;
       }
-      const { service, account } = keychainCoords(meta.provider, meta.id, meta.label);
+      const { service, account } = this.kind === 'single-grant'
+        && (this.provider === 'xai' || this.provider === 'kimi-coding')
+        ? resolveSingleGrantKeychain(this.provider, meta)
+        : keychainCoords(meta.provider, meta.id, meta.label);
       try {
         this.keychain.deleteSync(service, account);
       } catch (error) {

@@ -357,6 +357,42 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     });
   }
 
+  for (const provider of ['xai', 'kimi-coding'] as const) {
+    it(`T-KC5 [${provider}] pre-commit rollback deletes only the Keychain item the journal records`, () => {
+      const shared = sharedSingleGrantCoords(provider);
+      const legacy = kmCoords(provider);
+      const journalName = `pi-${provider}`;
+
+      for (const [recorded, target, decoy] of [
+        ['shared', shared, legacy],
+        ['legacy', legacy, shared],
+      ] as const) {
+        const h = setup(provider);
+        try {
+          h.mig.stage();
+          rmSync(stagingOwnerPath(join(h.dir, 'qlb-owner.json'), provider));
+          const row = h.store.getMigration(journalName)!;
+          const detail = JSON.parse(row.detail_json) as { accounts: Array<Record<string, unknown>> };
+          if (recorded === 'shared') detail.accounts[0]!.keychain = shared;
+          else delete detail.accounts[0]!.keychain;
+          h.store.upsertMigration(journalName, 'MIRRORED', JSON.stringify(detail));
+
+          const targetBytes = JSON.stringify({ target: recorded });
+          const decoyBytes = JSON.stringify({ decoy: recorded });
+          h.kc.setSync(target.service, target.account, targetBytes);
+          h.kc.setSync(decoy.service, decoy.account, decoyBytes);
+
+          h.mig.rollback();
+
+          assert.throws(() => h.kc.getSync(target.service, target.account), /item not found/);
+          assert.equal(h.kc.getSync(decoy.service, decoy.account), decoyBytes);
+        } finally {
+          h.cleanup();
+        }
+      }
+    });
+  }
+
   it('T-RS re-stages xai and kimi-coding at the store generation, resets status, and clears prior hand-back detail', async () => {
     for (const provider of ['xai', 'kimi-coding'] as const) {
       for (const lifecycle of ['MIRRORED', 'VALIDATED', 'NATIVE'] as const) {
