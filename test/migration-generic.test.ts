@@ -103,6 +103,13 @@ function expectedLabel(provider: SingleGrantProvider): string {
   return provider === 'openai-codex' ? expectedId(provider) : ADAPTER_ACCOUNT_LABELS[provider];
 }
 
+function kmCoords(provider: SingleGrantProvider): { service: string; account: string } {
+  return {
+    service: qlbKeychainService(provider, expectedId(provider)),
+    account: expectedLabel(provider),
+  };
+}
+
 class RollbackDeleteKeychain extends MockKeychain {
   mode: 'succeed' | 'denied' | 'not-found' = 'succeed';
 
@@ -134,8 +141,8 @@ function keychainHas(
 ): boolean {
   try {
     const raw = kc.getSync(
-      qlbKeychainService(provider, expectedId(provider)),
-      expectedLabel(provider),
+      kmCoords(provider).service,
+      kmCoords(provider).account,
     );
     const grant = parseGrant(raw);
     return grant.access === FAKE_GRANTS[provider].access;
@@ -294,8 +301,8 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
           const staged = h.mig.stage();
           const detail = JSON.parse(h.store.getMigration(`pi-${provider}`)!.detail_json) as Record<string, unknown>;
           const grant = parseGrant(h.kc.getSync(
-            qlbKeychainService(provider, id),
-            expectedLabel(provider),
+            kmCoords(provider).service,
+            kmCoords(provider).account,
           ));
 
           assert.equal(staged.state, 'MIRRORED', `${provider} re-stages from ${lifecycle}`);
@@ -352,8 +359,8 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
           h.store.upsertMigration('pi-xai', state, JSON.stringify(detail));
           const rowBefore = h.store.getMigration('pi-xai');
           const filesBefore = fileSnapshot(h.dir);
-          const service = qlbKeychainService('xai', expectedId('xai'));
-          const account = expectedLabel('xai');
+          const service = kmCoords('xai').service;
+          const account = kmCoords('xai').account;
           const keychainBefore = (() => {
             try {
               return h.kc.getSync(service, account);
@@ -402,8 +409,8 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
           h.store.upsertMigration('pi-xai', command === 'stage' ? 'NATIVE' : row!.state, detail);
           const rowBefore = h.store.getMigration('pi-xai');
           const filesBefore = fileSnapshot(h.dir);
-          const service = qlbKeychainService('xai', expectedId('xai'));
-          const account = expectedLabel('xai');
+          const service = kmCoords('xai').service;
+          const account = kmCoords('xai').account;
           const keychainBefore = (() => {
             try {
               return h.kc.getSync(service, account);
@@ -791,9 +798,9 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
               : JSON.stringify({ owner: 'qlb', accounts: [{ provider: 'xai' }] }) + '\n';
           writeFileSync(ownerPath, ownerBytes);
 
-          const service = qlbKeychainService('xai', expectedId('xai'));
+          const service = kmCoords('xai').service;
           const keychainBytes = JSON.stringify({ preserved: `${claim}-${command}` });
-          h.kc.setSync(service, expectedLabel('xai'), keychainBytes);
+          h.kc.setSync(service, kmCoords('xai').account, keychainBytes);
           const journalBefore = h.store.getMigration('pi-xai');
 
           assert.throws(
@@ -815,7 +822,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
           );
 
           assert.equal(
-            h.kc.getSync(service, expectedLabel('xai')),
+            h.kc.getSync(service, kmCoords('xai').account),
             keychainBytes,
             `${claim}/${command} leaves the Keychain bytes unchanged`,
           );
@@ -870,12 +877,12 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
           }
 
           const stagingPath = stagingOwnerPath(mapPath, 'xai');
-          const service = qlbKeychainService('xai', expectedId('xai'));
+          const service = kmCoords('xai').service;
           if (command === 'stage') {
-            h.kc.setSync(service, expectedLabel('xai'), JSON.stringify({ preserved: testCase.name }));
+            h.kc.setSync(service, kmCoords('xai').account, JSON.stringify({ preserved: testCase.name }));
           }
           const journalBefore = h.store.getMigration('pi-xai');
-          const keychainBefore = h.kc.getSync(service, expectedLabel('xai'));
+          const keychainBefore = h.kc.getSync(service, kmCoords('xai').account);
           const stagingBefore = existsSync(stagingPath) ? readFileSync(stagingPath) : null;
           const validBefore = readFileSync(validPath);
           const unreadableBefore = testCase.unreadable === 'L'
@@ -888,7 +895,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
             return true;
           }, `${testCase.name}/${command} refuses the later unreadable claim`);
           assert.deepEqual(h.store.getMigration('pi-xai'), journalBefore, `${testCase.name}/${command} preserves the journal`);
-          assert.equal(h.kc.getSync(qlbKeychainService('xai', expectedId('xai')), expectedLabel('xai')), keychainBefore, `${testCase.name}/${command} preserves Keychain`);
+          assert.equal(h.kc.getSync(kmCoords('xai').service, kmCoords('xai').account), keychainBefore, `${testCase.name}/${command} preserves Keychain`);
           assert.deepEqual(existsSync(stagingPath) ? readFileSync(stagingPath) : null, stagingBefore, `${testCase.name}/${command} preserves staging`);
           assert.deepEqual(readFileSync(validPath), validBefore, `${testCase.name}/${command} preserves the valid claim`);
           if (testCase.unreadable === 'L') {
@@ -911,7 +918,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       const journalBefore = h.store.getMigration('pi-xai');
       const stagingPath = stagingOwnerPath(join(h.dir, 'qlb-owner.json'), 'xai');
       const stagingBefore = readFileSync(stagingPath);
-      const keychainBefore = h.kc.getSync(qlbKeychainService('xai', expectedId('xai')), expectedLabel('xai'));
+      const keychainBefore = h.kc.getSync(kmCoords('xai').service, kmCoords('xai').account);
       const ownerBefore = readFileSync(h.ownerPath);
 
       await assert.rejects(
@@ -924,7 +931,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       );
       assert.deepEqual(h.store.getMigration('pi-xai'), journalBefore);
       assert.deepEqual(readFileSync(stagingPath), stagingBefore);
-      assert.equal(h.kc.getSync(qlbKeychainService('xai', expectedId('xai')), expectedLabel('xai')), keychainBefore);
+      assert.equal(h.kc.getSync(kmCoords('xai').service, kmCoords('xai').account), keychainBefore);
       assert.deepEqual(readFileSync(h.ownerPath), ownerBefore);
     } finally {
       h.cleanup();
@@ -947,7 +954,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
         writeFileSync(mapPath, '{not valid JSON\n');
 
         const journalBefore = h.store.getMigration('pi-xai');
-        const keychainBefore = h.kc.getSync(qlbKeychainService('xai', expectedId('xai')), expectedLabel('xai'));
+        const keychainBefore = h.kc.getSync(kmCoords('xai').service, kmCoords('xai').account);
         const stagingBefore = readFileSync(stagingPath);
         const mapBefore = readFileSync(mapPath);
 
@@ -957,7 +964,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
           return true;
         }, `${command} refuses ambiguous C evidence`);
         assert.deepEqual(h.store.getMigration('pi-xai'), journalBefore, `${command} preserves the journal`);
-        assert.equal(h.kc.getSync(qlbKeychainService('xai', expectedId('xai')), expectedLabel('xai')), keychainBefore, `${command} preserves the Keychain payload`);
+        assert.equal(h.kc.getSync(kmCoords('xai').service, kmCoords('xai').account), keychainBefore, `${command} preserves the Keychain payload`);
         assert.deepEqual(readFileSync(stagingPath), stagingBefore, `${command} preserves staging`);
         assert.deepEqual(readFileSync(mapPath), mapBefore, `${command} preserves O`);
         assert.equal(existsSync(h.ownerPath), false, `${command} does not create L`);
@@ -988,7 +995,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
           const stagingPath = stagingOwnerPath(join(h.dir, 'qlb-owner.json'), 'xai');
           const journalBefore = h.store.getMigration('pi-xai');
           const keychainBefore = command === 'commit'
-            ? h.kc.getSync(qlbKeychainService('xai', expectedId('xai')), expectedLabel('xai'))
+            ? h.kc.getSync(kmCoords('xai').service, kmCoords('xai').account)
             : null;
           const stagingBefore = existsSync(stagingPath) ? readFileSync(stagingPath) : null;
 
@@ -1001,9 +1008,9 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
           assert.equal(existsSync(target), false, `${claim}/${command} does not create the target`);
           assert.deepEqual(h.store.getMigration('pi-xai'), journalBefore, `${claim}/${command} preserves the journal`);
           if (keychainBefore === null) {
-            assert.throws(() => h.kc.getSync(qlbKeychainService('xai', expectedId('xai')), expectedLabel('xai')));
+            assert.throws(() => h.kc.getSync(kmCoords('xai').service, kmCoords('xai').account));
           } else {
-            assert.equal(h.kc.getSync(qlbKeychainService('xai', expectedId('xai')), expectedLabel('xai')), keychainBefore, `${claim}/${command} preserves the Keychain payload`);
+            assert.equal(h.kc.getSync(kmCoords('xai').service, kmCoords('xai').account), keychainBefore, `${claim}/${command} preserves the Keychain payload`);
           }
           assert.deepEqual(existsSync(stagingPath) ? readFileSync(stagingPath) : null, stagingBefore, `${claim}/${command} preserves staging`);
         } finally {
@@ -1021,9 +1028,9 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       const customPath = join(blockedParent, 'custom-owner.json');
       const migration = createSingleGrantMigration(h.store, h.kc, 'xai', h.authPath, customPath);
       const journalBefore = h.store.getMigration('pi-xai');
-      const service = qlbKeychainService('xai', expectedId('xai'));
+      const service = kmCoords('xai').service;
       const keychainBytes = JSON.stringify({ preserved: 'ENOTDIR' });
-      h.kc.setSync(service, expectedLabel('xai'), keychainBytes);
+      h.kc.setSync(service, kmCoords('xai').account, keychainBytes);
 
       assert.throws(
         () => migration.stage(),
@@ -1035,7 +1042,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
         },
       );
       assert.deepEqual(h.store.getMigration('pi-xai'), journalBefore);
-      assert.equal(h.kc.getSync(service, expectedLabel('xai')), keychainBytes);
+      assert.equal(h.kc.getSync(service, kmCoords('xai').account), keychainBytes);
     } finally {
       h.cleanup();
     }
@@ -1199,8 +1206,8 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
           assert.ok(row, 'fixture has a generic journal');
           c9.store.upsertMigration('pi-xai', state, row.detail_json);
           const keychainBefore = c9.kc.getSync(
-            qlbKeychainService('xai', expectedId('xai')),
-            expectedLabel('xai'),
+            kmCoords('xai').service,
+            kmCoords('xai').account,
           );
           const journalBefore = c9.store.getMigration('pi-xai');
           const filesBefore = fileSnapshot(c9.dir);
@@ -1210,7 +1217,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
           assert.equal(result.state, state, `C9 ${state}/${command} is a no-op`);
           assert.equal(result.resumeAction, 'nothing to roll back', `C9 ${state}/${command} reports the no-op`);
           assert.equal(
-            c9.kc.getSync(qlbKeychainService('xai', expectedId('xai')), expectedLabel('xai')),
+            c9.kc.getSync(kmCoords('xai').service, kmCoords('xai').account),
             keychainBefore,
             `C9 ${state}/${command} keeps K_m byte-for-byte`,
           );
@@ -1488,8 +1495,8 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       await h.mig.rehearse(mockRehearse([]));
       h.mig.commit();
       const accountId = (JSON.parse(h.store.getMigration('pi-xai')!.detail_json).accounts as Array<{ id: string }>)[0].id;
-      const service = qlbKeychainService('xai', accountId);
-      const account = expectedLabel('xai');
+      const service = kmCoords('xai').service;
+      const account = kmCoords('xai').account;
       let reads = 0;
       const originalGetLease = h.store.getLease.bind(h.store);
       const originalGetSync = h.kc.getSync.bind(h.kc);
@@ -1567,9 +1574,9 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       afterStep: (point) => {
         if (point === 'S2-reads' && reads++ === 0) {
           const id = expectedId('xai');
-          const service = qlbKeychainService('xai', id);
-          const raw = h.kc.getSync(service, expectedLabel('xai'));
-          h.kc.setSync(service, expectedLabel('xai'), JSON.stringify({
+          const service = kmCoords('xai').service;
+          const raw = h.kc.getSync(service, kmCoords('xai').account);
+          h.kc.setSync(service, kmCoords('xai').account, JSON.stringify({
             ...JSON.parse(raw), generation: 1, refresh: 'xai-refresh-rotated-fake',
           }));
           assert.equal(h.store.casGrantGeneration(id, 0, 1), 1, 'fake refresher commits generation one');
@@ -1601,9 +1608,9 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     const h = setup('xai', new MockKeychain(), {
       afterStep: (point) => {
         if (point === 'S2-reads' && reads++ === 0) {
-          const service = qlbKeychainService('xai', expectedId('xai'));
-          const raw = h.kc.getSync(service, expectedLabel('xai'));
-          h.kc.setSync(service, expectedLabel('xai'), JSON.stringify({
+          const service = kmCoords('xai').service;
+          const raw = h.kc.getSync(service, kmCoords('xai').account);
+          h.kc.setSync(service, kmCoords('xai').account, JSON.stringify({
             ...JSON.parse(raw), generation: 1, refresh: 'xai-refresh-c3-fake',
           }));
         }
@@ -1620,8 +1627,8 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
 
       h.mig.rollback();
 
-      const service = qlbKeychainService('xai', expectedId('xai'));
-      const rewritten = parseGrant(h.kc.getSync(service, expectedLabel('xai')));
+      const service = kmCoords('xai').service;
+      const rewritten = parseGrant(h.kc.getSync(service, kmCoords('xai').account));
       assert.equal(reads, 2, 'a Keychain digest mismatch re-runs the outside reads');
       assert.equal(observedDecision?.kind, 'keychain', 'the new C3 grant outranks the backup');
       assert.equal(observedDecision?.kd0, keychainDigest(rewritten), 'the committed decision records the rewritten Keychain digest');
@@ -1637,10 +1644,10 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     const h = setup('xai', new MockKeychain(), {
       afterStep: (point) => {
         if (point === 'S2-reads' && reads++ === 0) {
-          const service = qlbKeychainService('xai', expectedId('xai'));
-          const raw = h.kc.getSync(service, expectedLabel('xai'));
+          const service = kmCoords('xai').service;
+          const raw = h.kc.getSync(service, kmCoords('xai').account);
           resynced = JSON.stringify({ ...JSON.parse(raw), generation: 1, writtenBy: 'native-resync' });
-          h.kc.setSync(service, expectedLabel('xai'), resynced);
+          h.kc.setSync(service, kmCoords('xai').account, resynced);
         }
         if (point === 'S2') {
           observedDecision = JSON.parse(h.store.getMigration('pi-xai')!.detail_json).rollbackDecision as RollbackDecision;
@@ -1730,9 +1737,9 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       h.mig.stage();
       await h.mig.rehearse(mockRehearse([]));
       h.mig.commit();
-      const service = qlbKeychainService('xai', expectedId('xai'));
-      const raw = h.kc.getSync(service, expectedLabel('xai'));
-      h.kc.setSync(service, expectedLabel('xai'), JSON.stringify({ ...JSON.parse(raw), generation: 1 }));
+      const service = kmCoords('xai').service;
+      const raw = h.kc.getSync(service, kmCoords('xai').account);
+      h.kc.setSync(service, kmCoords('xai').account, JSON.stringify({ ...JSON.parse(raw), generation: 1 }));
 
       assert.throws(() => h.mig.rollback(), /fixture crash after S2/);
       assert.equal(decision?.generation, 1);
@@ -1758,9 +1765,9 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       await h.mig.rehearse(mockRehearse([]));
       h.mig.commit();
       writePiAuthBackup(h.authPath, 'xai', 'fixture');
-      const service = qlbKeychainService('xai', expectedId('xai'));
-      const raw = h.kc.getSync(service, expectedLabel('xai'));
-      h.kc.setSync(service, expectedLabel('xai'), JSON.stringify({ ...JSON.parse(raw), writtenBy: 'native-resync' }));
+      const service = kmCoords('xai').service;
+      const raw = h.kc.getSync(service, kmCoords('xai').account);
+      h.kc.setSync(service, kmCoords('xai').account, JSON.stringify({ ...JSON.parse(raw), writtenBy: 'native-resync' }));
 
       assert.throws(() => h.mig.rollback(), /fixture crash after S2/);
       assert.equal(decision?.kind, 'exact-backup');
@@ -1779,8 +1786,8 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       await h.mig.rehearse(mockRehearse([]));
       h.mig.commit();
       const id = expectedId('xai');
-      const service = qlbKeychainService('xai', id);
-      const account = expectedLabel('xai');
+      const service = kmCoords('xai').service;
+      const account = kmCoords('xai').account;
       h.kc.deleteSync(service, account);
       writeFileSync(h.authPath, JSON.stringify({ 'kimi-coding': FAKE_GRANTS['kimi-coding'] }, null, 2) + '\n');
 
@@ -1831,8 +1838,8 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
         await h.mig.rehearse(mockRehearse([]));
         h.mig.commit();
         const id = expectedId('xai');
-        const service = qlbKeychainService('xai', id);
-        const account = expectedLabel('xai');
+        const service = kmCoords('xai').service;
+        const account = kmCoords('xai').account;
         const keychainBefore = kc.getSync(service, account);
         const generationBefore = h.store.getGrantGeneration(id);
         const authBefore = readFileSync(h.authPath);
@@ -1955,8 +1962,8 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
           xai: { type: 'oauth', access: 'qlb-managed', refresh: '' },
         }, null, 2) + '\n');
         const id = expectedId('xai');
-        const service = qlbKeychainService('xai', id);
-        const account = expectedLabel('xai');
+        const service = kmCoords('xai').service;
+        const account = kmCoords('xai').account;
         const ownerBefore = readFileSync(h.ownerPath);
         const backupBefore = readFileSync(piAuthBackupPath(h.authPath, 'xai'));
         const keychainBefore = h.kc.getSync(service, account);
@@ -2577,8 +2584,8 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
         await h.mig.rehearse(mockRehearse([]));
         h.mig.commit();
         const id = expectedId('xai');
-        const service = qlbKeychainService('xai', id);
-        const account = expectedLabel('xai');
+        const service = kmCoords('xai').service;
+        const account = kmCoords('xai').account;
         const backupPaths = [piAuthBackupPath(h.authPath, 'xai'), legacyPiAuthBackupPath(h.authPath, 'xai')];
         if (fixture.kind === 'exact-backup') {
           writePiAuthBackup(h.authPath, 'xai', 's3f-fixture');
@@ -2678,8 +2685,8 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
           xai: fixture.entry,
         }, null, 2) + '\n');
         const id = expectedId('xai');
-        const service = qlbKeychainService('xai', id);
-        const account = expectedLabel('xai');
+        const service = kmCoords('xai').service;
+        const account = kmCoords('xai').account;
         const journalBefore = h.store.getMigration('pi-xai');
         const generationBefore = h.store.getGrantGeneration(id);
         const authBefore = readFileSync(h.authPath);
@@ -2753,8 +2760,8 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
         await h.mig.rehearse(mockRehearse([]));
         h.mig.commit();
         const id = expectedId('xai');
-        const service = qlbKeychainService('xai', id);
-        const account = expectedLabel('xai');
+        const service = kmCoords('xai').service;
+        const account = kmCoords('xai').account;
         h.kc.deleteSync(service, account);
         assert.throws(() => h.mig.rollback(), /fixture crash after S2/);
 
@@ -2853,8 +2860,8 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       assert.throws(() => h.mig.rollback(), /fixture crash after S2/);
 
       const id = expectedId('xai');
-      const service = qlbKeychainService('xai', id);
-      const account = expectedLabel('xai');
+      const service = kmCoords('xai').service;
+      const account = kmCoords('xai').account;
       const journalBefore = h.store.getMigration('pi-xai');
       const detailBefore = JSON.parse(journalBefore!.detail_json) as Record<string, unknown>;
       const generationBefore = h.store.getGrantGeneration(id);
@@ -2938,8 +2945,8 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       await h.mig.rehearse(mockRehearse([]));
       h.mig.commit();
       const id = expectedId('xai');
-      const service = qlbKeychainService('xai', id);
-      const account = expectedLabel('xai');
+      const service = kmCoords('xai').service;
+      const account = kmCoords('xai').account;
       h.kc.deleteSync(service, account);
       writeFileSync(h.authPath, JSON.stringify({ 'kimi-coding': FAKE_GRANTS['kimi-coding'] }, null, 2) + '\n');
 
@@ -2963,9 +2970,9 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       afterStep: (point) => {
         if (point === 'S1') {
           const id = expectedId('xai');
-          const service = qlbKeychainService('xai', id);
-          const raw = h.kc.getSync(service, expectedLabel('xai'));
-          h.kc.setSync(service, expectedLabel('xai'), JSON.stringify({
+          const service = kmCoords('xai').service;
+          const raw = h.kc.getSync(service, kmCoords('xai').account);
+          h.kc.setSync(service, kmCoords('xai').account, JSON.stringify({
             ...JSON.parse(raw), generation: 1, refresh: 'xai-refresh-refreshed-fake',
           }));
           assert.equal(h.store.casGrantGeneration(id, 0, 1), 1, 'fake refresher commits before S2 reads');
@@ -3004,9 +3011,9 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       h.mig.commit();
       assert.throws(() => h.mig.rollback(), /fixture crash after S2/);
       const decision = JSON.parse(h.store.getMigration('pi-xai')!.detail_json).rollbackDecision as RollbackDecision;
-      const service = qlbKeychainService('xai', expectedId('xai'));
-      const raw = h.kc.getSync(service, expectedLabel('xai'));
-      h.kc.setSync(service, expectedLabel('xai'), JSON.stringify({ ...JSON.parse(raw), generation: 99 }));
+      const service = kmCoords('xai').service;
+      const raw = h.kc.getSync(service, kmCoords('xai').account);
+      h.kc.setSync(service, kmCoords('xai').account, JSON.stringify({ ...JSON.parse(raw), generation: 99 }));
 
       const resumed = h.mig.resume();
       assert.equal(reads, 1, 'resume uses the durable decision instead of taking S2 reads');
@@ -3065,8 +3072,8 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
         fencedGeneration: null,
         rolledBackAt: 123,
       };
-      const service = qlbKeychainService('xai', expectedId('xai'));
-      const account = expectedLabel('xai');
+      const service = kmCoords('xai').service;
+      const account = kmCoords('xai').account;
       h.kc.setSync(service, account, JSON.stringify({ ...FAKE_GRANTS.xai, generation: 0 }));
       h.store.upsertMigration('pi-xai', 'NATIVE', JSON.stringify({ handback: marker }));
       const rowBefore = h.store.getMigration('pi-xai');
@@ -3101,8 +3108,8 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
         fencedGeneration: null,
         rolledBackAt: 123,
       };
-      const service = qlbKeychainService('xai', expectedId('xai'));
-      const account = expectedLabel('xai');
+      const service = kmCoords('xai').service;
+      const account = kmCoords('xai').account;
       h.kc.setSync(service, account, JSON.stringify({ ...FAKE_GRANTS.xai, generation: 0 }));
       h.store.upsertMigration('pi-xai', 'NATIVE', JSON.stringify({
         handback: marker,
@@ -3193,8 +3200,8 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
           fencedGeneration: null,
           rolledBackAt: 123,
         };
-        const service = qlbKeychainService('xai', expectedId('xai'));
-        const account = expectedLabel('xai');
+        const service = kmCoords('xai').service;
+        const account = kmCoords('xai').account;
         if (fixture.itemPresent) {
           h.kc.setSync(service, account, JSON.stringify({ ...FAKE_GRANTS.xai, generation: 0 }));
         }
@@ -3240,8 +3247,8 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
         rolledBackAt: 123,
       };
       const id = expectedId('xai');
-      const service = qlbKeychainService('xai', id);
-      const account = expectedLabel('xai');
+      const service = kmCoords('xai').service;
+      const account = kmCoords('xai').account;
       h.kc.setSync(service, account, JSON.stringify({ ...FAKE_GRANTS.xai, generation: 0 }));
       h.store.upsertAccount(id, 'xai', account, 'active');
       h.store.upsertMigration('pi-xai', 'NATIVE', JSON.stringify({
@@ -3292,8 +3299,8 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
         fencedGeneration: null,
         rolledBackAt: 123,
       };
-      const service = qlbKeychainService('xai', expectedId('xai'));
-      const account = expectedLabel('xai');
+      const service = kmCoords('xai').service;
+      const account = kmCoords('xai').account;
       kc.setSync(service, account, JSON.stringify({ ...FAKE_GRANTS.xai, generation: 0 }));
       h.store.upsertMigration('pi-xai', 'NATIVE', JSON.stringify({
         accounts: [{
@@ -3330,10 +3337,10 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
         fencedGeneration: null,
         rolledBackAt: 123,
       };
-      const ownService = qlbKeychainService('xai', expectedId('xai'));
-      kc.setSync(ownService, expectedLabel('xai'), JSON.stringify({ ...FAKE_GRANTS.xai, generation: 0 }));
-      const otherService = qlbKeychainService('kimi-coding', expectedId('kimi-coding'));
-      kc.setSync(otherService, expectedLabel('kimi-coding'), JSON.stringify({ ...FAKE_GRANTS['kimi-coding'], generation: 0 }));
+      const ownService = kmCoords('xai').service;
+      kc.setSync(ownService, kmCoords('xai').account, JSON.stringify({ ...FAKE_GRANTS.xai, generation: 0 }));
+      const otherService = kmCoords('kimi-coding').service;
+      kc.setSync(otherService, kmCoords('kimi-coding').account, JSON.stringify({ ...FAKE_GRANTS['kimi-coding'], generation: 0 }));
       h.store.upsertMigration('pi-xai', 'NATIVE', JSON.stringify({
         accounts: [{
           id: expectedId('kimi-coding'),
@@ -3901,7 +3908,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       assert.equal(keychainHas(kc, 'xai'), false, 'retry removes staged Keychain item');
 
       h.mig.stage();
-      kc.deleteSync(qlbKeychainService('xai', expectedId('xai')), expectedLabel('xai'));
+      kc.deleteSync(kmCoords('xai').service, kmCoords('xai').account);
       kc.mode = 'not-found';
       assert.equal(h.mig.rollback().state, 'NATIVE', 'not-found remains idempotent');
       assert.equal(existsSync(staging), false, 'not-found cleanup removes staging file');
