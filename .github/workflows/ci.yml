@@ -36,4 +36,5 @@ jobs:
         run: |
           export QLB_TEST_MODE=1 QLB_HOME="$(mktemp -d)"
           node --test dist-test/test/qlb-pi-*.test.js | tee pi-suites.log
-          grep -q '^ℹ skipped 0$' pi-suites.log
+          # Node 22 prints TAP totals ("# skipped 0"); newer Node prints "ℹ skipped 0".
+          grep -Eq '^(ℹ|#) skipped 0$' pi-suites.log

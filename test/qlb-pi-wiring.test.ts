@@ -225,7 +225,9 @@ function load(owner?: string, gateFail = false, callCodex = false, perProviderOw
   }
   writeFileSync(runner, fakeQlb);
   writeFileSync(entry, loader);
-  const result = spawnSync(process.execPath, [entry], {
+  // Node 22 prints an SQLite ExperimentalWarning to stderr; suppress only that
+  // so the stderr assertions see the extension's own output.
+  const result = spawnSync(process.execPath, ['--disable-warning=ExperimentalWarning', entry], {
     encoding: 'utf8',
     timeout: 60_000,
     env: {
