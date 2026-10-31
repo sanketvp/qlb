@@ -394,6 +394,7 @@ export function rollbackPiSingleProvider(provider: PiSingleProvider, paths: PiMi
     // non-placeholder credential or verified a restored one. This makes a
     // retry converge after a prior delete failure.
     refresh();
+    stashKeptGenericCopy(provider, deps, readJournal(paths, provider));
     try { deps.keychain.deleteSync(managedService(provider), QLB_KEYCHAIN_ACCOUNT); } catch (error) {
       if (!isCredentialNotFound(error)) throw error;
     }
