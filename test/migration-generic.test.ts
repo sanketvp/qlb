@@ -26,7 +26,7 @@ import {
   type StagedAccount,
 } from '../src/migration';
 import { parseGrant } from '../src/refresh-lease';
-import type { RollbackDecision } from '../src/single-grant-ownership';
+import { sharedSingleGrantCoords, type RollbackDecision } from '../src/single-grant-ownership';
 import { legacyPiAuthBackupPath, piAuthBackupPath, readPiAuthBackup, writePiAuthBackup } from '../src/pi-auth-backup';
 import { canonicalDigest, keychainDigest, restoreRecordFor } from '../src/pi-handback-source';
 import { bindDetectAndResync } from '../src/native-resync';
@@ -131,6 +131,15 @@ class S2ReadTaxonomyKeychain extends MockKeychain {
       if (this.fault === 'malformed') return '{not-json';
       if (this.fault === 'unavailable') throw new Error('fixture Keychain unavailable');
     }
+    return super.getSync(service, account);
+  }
+}
+
+class ReadTrackingKeychain extends MockKeychain {
+  getCalls: Array<{ service: string; account: string }> = [];
+
+  override getSync(service: string, account: string): string {
+    this.getCalls.push({ service, account });
     return super.getSync(service, account);
   }
 }
@@ -270,6 +279,78 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
         assert.equal(owner.nativeStrategy, 'shadow-retain');
         assert.deepEqual(owner.qlbAccountIds, [id]);
         assert.equal(keychainHas(h.kc, provider), true);
+      } finally {
+        h.cleanup();
+      }
+    });
+  }
+
+  for (const provider of ['xai', 'kimi-coding'] as const) {
+    it(`T-KC4 [${provider}] rehearse reads the Keychain item the journal records`, async () => {
+      const shared = sharedSingleGrantCoords(provider);
+      const id = expectedId(provider);
+      const label = expectedLabel(provider);
+      const journalName = `pi-${provider}`;
+
+      const stageWithSharedStaging = (): Harness & { mig: Migration } => {
+        const kc = new ReadTrackingKeychain();
+        const h = setup(provider, kc);
+        h.mig.stage();
+        const stagingPath = stagingOwnerPath(join(h.dir, 'qlb-owner.json'), provider);
+        const owner = JSON.parse(readFileSync(stagingPath, 'utf8')) as { accounts: Array<Record<string, unknown>> };
+        owner.accounts[0]!.keychain = shared;
+        writeFileSync(stagingPath, JSON.stringify(owner, null, 2) + '\n');
+        kc.setSync(shared.service, shared.account, JSON.stringify({
+          ...FAKE_GRANTS[provider], generation: 0, writtenBy: 'fixture', extra: {},
+        }));
+        kc.setSync(kmCoords(provider).service, kmCoords(provider).account, '{decoy');
+        kc.getCalls.length = 0;
+        return h;
+      };
+
+      const stageWithSharedJournal = (): Harness & { mig: Migration } => {
+        const kc = new ReadTrackingKeychain();
+        const h = setup(provider, kc);
+        h.mig.stage();
+        rmSync(stagingOwnerPath(join(h.dir, 'qlb-owner.json'), provider));
+        const row = h.store.getMigration(journalName)!;
+        const detail = JSON.parse(row.detail_json) as { accounts: Array<Record<string, unknown>> };
+        detail.accounts[0]!.keychain = shared;
+        h.store.upsertMigration(journalName, 'MIRRORED', JSON.stringify(detail));
+        kc.setSync(shared.service, shared.account, JSON.stringify({
+          ...FAKE_GRANTS[provider], generation: 0, writtenBy: 'fixture', extra: {},
+        }));
+        kc.setSync(kmCoords(provider).service, kmCoords(provider).account, '{decoy');
+        kc.getCalls.length = 0;
+        return h;
+      };
+
+      for (const setupFixture of [stageWithSharedStaging, stageWithSharedJournal]) {
+        const h = setupFixture();
+        try {
+          const calls: StagedAccount[] = [];
+          await h.mig.rehearse(mockRehearse(calls));
+          assert.equal(calls[0]?.id, id);
+          assert.deepEqual((h.kc as ReadTrackingKeychain).getCalls, [shared]);
+        } finally {
+          h.cleanup();
+        }
+      }
+
+      const h = setup(provider, new ReadTrackingKeychain());
+      try {
+        h.mig.stage();
+        rmSync(stagingOwnerPath(join(h.dir, 'qlb-owner.json'), provider));
+        const row = h.store.getMigration(journalName)!;
+        const detail = JSON.parse(row.detail_json) as { accounts: Array<Record<string, unknown>> };
+        detail.accounts[0]!.keychain = { service: shared.service, account: label };
+        h.store.upsertMigration(journalName, 'MIRRORED', JSON.stringify(detail));
+        const journalBefore = h.store.getMigration(journalName)!;
+        (h.kc as ReadTrackingKeychain).getCalls.length = 0;
+
+        await assert.rejects(() => h.mig.rehearse(mockRehearse([])), /journal-keychain-invalid/);
+        assert.deepEqual(h.store.getMigration(journalName), journalBefore);
+        assert.deepEqual((h.kc as ReadTrackingKeychain).getCalls, []);
       } finally {
         h.cleanup();
       }
