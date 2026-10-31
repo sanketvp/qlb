@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import {
   classifySingleGrant,
+  genericHoldsSharedItem,
   isSingleGrantAtRest,
   resolveSingleGrantKeychain,
   sharedSingleGrantCoords,
@@ -99,6 +100,60 @@ for (const provider of providers) {
 
     for (const value of invalid) {
       assert.throws(() => resolveSingleGrantKeychain(provider, value), /journal-keychain-invalid/);
+    }
+  });
+
+  it(`T-KC3 [${provider}] the shared item is protected exactly while the generic journal is QLB_OWNED and records it`, () => {
+    const account = journalAccount(provider);
+    const detail = (value: unknown) => JSON.stringify({ accounts: [value] });
+    const shared = { ...account, keychain: sharedSingleGrantCoords(provider) };
+
+    for (const marker of [
+      {},
+      { intent: 'rollback' },
+      { rollbackDecision: {} },
+      { handback: { phase: 'cleanup-pending' } },
+    ]) {
+      assert.equal(genericHoldsSharedItem(provider, {
+        state: 'QLB_OWNED',
+        detailJson: JSON.stringify({ accounts: [shared], ...marker }),
+      }), true);
+    }
+    assert.equal(genericHoldsSharedItem(provider, {
+      state: 'QLB_OWNED',
+      detailJson: '{',
+    }), true);
+    assert.equal(genericHoldsSharedItem(provider, {
+      state: 'QLB_OWNED',
+      detailJson: detail({ ...account, keychain: { service: 'invalid', account: 'invalid' } }),
+    }), true);
+    // A single-grant journal records exactly one account; anything else is
+    // ambiguous evidence and fails closed (§1).
+    for (const accounts of [[], [account, shared], [account, { bogus: true }]]) {
+      assert.equal(genericHoldsSharedItem(provider, {
+        state: 'QLB_OWNED',
+        detailJson: JSON.stringify({ accounts }),
+      }), true, `${accounts.length} accounts`);
+    }
+
+    assert.equal(genericHoldsSharedItem(provider, {
+      state: 'QLB_OWNED',
+      detailJson: detail(account),
+    }), false);
+    assert.equal(genericHoldsSharedItem(provider, {
+      state: 'QLB_OWNED',
+      detailJson: detail({ ...account, keychain: undefined }),
+    }), false);
+
+    for (const state of [null, 'NATIVE', 'MIRRORED', 'VALIDATED', 'RETIRED']) {
+      assert.equal(genericHoldsSharedItem(provider, {
+        state,
+        detailJson: detail(shared),
+      }), false, `${state ?? 'no row'} shared`);
+      assert.equal(genericHoldsSharedItem(provider, {
+        state,
+        detailJson: detail(account),
+      }), false, `${state ?? 'no row'} legacy`);
     }
   });
 }
