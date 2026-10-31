@@ -389,6 +389,30 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     }
   });
 
+  it('openai-codex pre-commit rollback with a multi-account journal still deletes the staged Keychain items', () => {
+    const h = setup('openai-codex');
+    try {
+      h.mig.stage();
+      rmSync(stagingOwnerPath(join(h.dir, 'qlb-owner.json'), 'openai-codex'));
+      const row = h.store.getMigration('pi-openai-codex')!;
+      const detail = JSON.parse(row.detail_json) as { accounts: Array<Record<string, unknown>> };
+      const secondId = 'fixture-user:second-account';
+      detail.accounts.push({ ...detail.accounts[0]!, id: secondId, label: secondId });
+      h.store.upsertMigration('pi-openai-codex', 'MIRRORED', JSON.stringify(detail));
+      const second = { service: qlbKeychainService('openai-codex', secondId), account: secondId };
+      h.kc.setSync(second.service, second.account, JSON.stringify({ fixture: 'second' }));
+      assert.equal(keychainHas(h.kc, 'openai-codex'), true);
+
+      h.mig.rollback();
+
+      assert.equal(keychainHas(h.kc, 'openai-codex'), false);
+      assert.throws(() => h.kc.getSync(second.service, second.account), /item not found/);
+      assert.equal(h.mig.status().state, 'NATIVE');
+    } finally {
+      h.cleanup();
+    }
+  });
+
   for (const provider of ['xai', 'kimi-coding'] as const) {
     it(`T-KC5 [${provider}] pre-commit rollback deletes only the Keychain item the journal records`, () => {
       const shared = sharedSingleGrantCoords(provider);
