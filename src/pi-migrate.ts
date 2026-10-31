@@ -386,7 +386,7 @@ export function rollbackPiSingleProvider(provider: PiSingleProvider, paths: PiMi
       let genericDetail: JsonObject | undefined;
       try {
         if (generic) genericDetail = asObject(JSON.parse(generic.detail_json), 'generic migration journal is malformed');
-      } catch { /* genericHoldsSharedItem applies S0's fail-closed rule */ }
+      } catch { /* unreadable: genericHoldsSharedItem holds it without the recorded-path probes */ }
       const pathFacts = genericMigrationPathFacts(provider, paths, genericDetail);
       if (genericHoldsSharedItem(provider, {
         state: generic?.state ?? null,

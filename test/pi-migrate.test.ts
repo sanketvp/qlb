@@ -330,9 +330,18 @@ describe('Pi migration S58 credential-first barrier', () => {
         } finally { h.cleanup(); }
       }
 
-      const admitted = [
+      const admitted: Array<{ name: string; state?: string; detail?: string; dual?: boolean; file?: string }> = [
         { name: 'no generic row' },
+        // With no row nothing names the shared item, so a stray owner file does not hold it.
+        { name: 'no generic row with a staging file', file: `qlb-owner.json.${provider}.staging` },
+        { name: 'no generic row with a legacy sidecar', file: `qlb-owner-${provider}.json` },
         { name: 'NATIVE', state: 'NATIVE', detail: JSON.stringify({ accounts: [shared] }) },
+        // preCommitRollback leaves commitGeneration behind; NATIVE is still at rest.
+        {
+          name: 'NATIVE after a pre-commit rollback',
+          state: 'NATIVE',
+          detail: JSON.stringify({ accounts: [shared], commitGeneration: 3, rolledBackFrom: 'pre-commit' }),
+        },
         { name: 'VALIDATED without staging', state: 'VALIDATED', detail: JSON.stringify({ accounts: [shared] }) },
         { name: 'QLB_OWNED legacy', state: 'QLB_OWNED', detail: JSON.stringify({ accounts: [singleGrantJournalAccount(provider)] }) },
         { name: 'OD-9 dual ownership with legacy generic journal', state: 'QLB_OWNED', detail: JSON.stringify({ accounts: [singleGrantJournalAccount(provider)] }), dual: true },
@@ -342,6 +351,7 @@ describe('Pi migration S58 credential-first barrier', () => {
         try {
           if (fixture.dual) migratePiSingleProvider(provider, h.paths, { keychain: h.keychain, store: h.store });
           if (fixture.state && fixture.detail) h.store.upsertMigration(`pi-${provider}`, fixture.state, fixture.detail);
+          if (fixture.file) writeFileSync(join(dirname(h.paths.ownerPath), fixture.file), '{}', { mode: 0o600 });
           assert.doesNotThrow(() => rollbackPiSingleProvider(provider, h.paths, { keychain: h.keychain, store: h.store }), fixture.name);
         } finally { h.cleanup(); }
       }
@@ -352,20 +362,33 @@ describe('Pi migration S58 credential-first barrier', () => {
       const cases: Array<{
         name: string;
         state: string;
-        detail: Record<string, unknown>;
+        detail: Record<string, unknown> | string;
         staging?: boolean;
       }> = [
         { name: 'MIRRORED', state: 'MIRRORED', detail: { accounts: [shared] } },
         { name: 'VALIDATED with staging', state: 'VALIDATED', detail: { accounts: [shared] }, staging: true },
         { name: 'VALIDATED with commit generation', state: 'VALIDATED', detail: { accounts: [shared], commitGeneration: 1 } },
         { name: 'RETIRED', state: 'RETIRED', detail: { accounts: [shared] } },
+        // Unreadable or ambiguous evidence is protected by the same S0.6 rules.
+        { name: 'VALIDATED with unparseable detail', state: 'VALIDATED', detail: '{' },
+        { name: 'NATIVE with unparseable detail', state: 'NATIVE', detail: '{' },
+        { name: 'VALIDATED with no accounts and commit generation', state: 'VALIDATED', detail: { accounts: [], commitGeneration: 1 } },
+        {
+          name: 'VALIDATED with two accounts and commit generation',
+          state: 'VALIDATED',
+          detail: { accounts: [shared, singleGrantJournalAccount(provider)], commitGeneration: 1 },
+        },
       ];
 
       for (const fixture of cases) {
         const h = setup(provider);
         try {
           migratePiSingleProvider(provider, h.paths, { keychain: h.keychain, store: h.store });
-          h.store.upsertMigration(`pi-${provider}`, fixture.state, JSON.stringify(fixture.detail));
+          h.store.upsertMigration(
+            `pi-${provider}`,
+            fixture.state,
+            typeof fixture.detail === 'string' ? fixture.detail : JSON.stringify(fixture.detail),
+          );
           if (fixture.staging) {
             writeFileSync(join(dirname(h.paths.ownerPath), `qlb-owner.json.${provider}.staging`), '{}', { mode: 0o600 });
           }
