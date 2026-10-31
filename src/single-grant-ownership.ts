@@ -6,7 +6,8 @@
  * normalized result here before making a state-changing decision.
  */
 
-import type { MigrationState } from './migration';
+import { qlbKeychainService } from './keychain';
+import { ADAPTER_ACCOUNT_IDS, type MigrationState } from './migration';
 
 export type RollbackSourceKind =
   | 'keychain'
@@ -31,6 +32,64 @@ export interface RollbackDecision {
 }
 
 export type KeychainDisposition = 'delete' | 'keep';
+
+export type SingleGrantKeychainProvider = 'xai' | 'kimi-coding';
+
+export interface SingleGrantKeychainCoords {
+  service: string;
+  account: string;
+}
+
+export class JournalKeychainInvalidError extends Error {
+  readonly code = 'journal-keychain-invalid';
+
+  constructor() {
+    super('journal-keychain-invalid');
+    this.name = 'JournalKeychainInvalidError';
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value != null && typeof value === 'object' && !Array.isArray(value);
+}
+
+/** Returns the shared Keychain coordinates for a single-grant provider. */
+export function sharedSingleGrantCoords(provider: SingleGrantKeychainProvider): SingleGrantKeychainCoords {
+  return { service: `qlb:${provider}:default`, account: 'qlb' };
+}
+
+/**
+ * Resolves a durable single-grant journal account to its Keychain item.
+ * Legacy accounts omit `keychain`; any recorded coordinates must be the
+ * provider's exact shared item so malformed journals fail closed.
+ */
+export function resolveSingleGrantKeychain(
+  provider: SingleGrantKeychainProvider,
+  account: unknown,
+): SingleGrantKeychainCoords {
+  const id = ADAPTER_ACCOUNT_IDS[provider];
+  if (!isRecord(account) || account.provider !== provider || account.id !== id) {
+    throw new JournalKeychainInvalidError();
+  }
+
+  if (!Object.prototype.hasOwnProperty.call(account, 'keychain')) {
+    const label = typeof account.label === 'string' ? account.label : '';
+    return { service: qlbKeychainService(provider, id), account: label || id };
+  }
+
+  const keychain = account.keychain;
+  const shared = sharedSingleGrantCoords(provider);
+  if (
+    !isRecord(keychain)
+    || Object.keys(keychain).length !== 2
+    || keychain.service !== shared.service
+    || keychain.account !== shared.account
+  ) {
+    throw new JournalKeychainInvalidError();
+  }
+
+  return shared;
+}
 
 /** The complete durable S5 hand-back marker. */
 export interface HandbackMarker {
