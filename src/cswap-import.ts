@@ -28,7 +28,8 @@ export type CswapImportRefusalCode =
   | 'live-identity-unresolvable'
   | 'live-changed'
   | 'api-key-source'
-  | 'session-profiles';
+  | 'session-profiles'
+  | 'duplicate-login';
 
 /** A credential-free, operator-actionable refusal (command exit 3). */
 export class CswapImportRefusalError extends Error {
@@ -265,6 +266,7 @@ async function readSourceSlots(options: CswapImportOptions): Promise<{ slots: So
   const activeNumber = sequence.activeAccountNumber == null ? null : String(sequence.activeAccountNumber);
   const slots: SourceSlot[] = [];
   const identities = new Set<string>();
+  const lineages = new Map<string, number>();
   for (const [number, rawRecord] of Object.entries(accounts)) {
     const record = object(rawRecord, 'C-swap account record is malformed');
     const slotNum = Number(number);
@@ -293,6 +295,12 @@ async function readSourceSlots(options: CswapImportOptions): Promise<{ slots: So
       throw new CswapImportRefusalError('api-key-source', `C-swap API-key slot refused: ${number}`);
     }
     const fingerprint = oauthFingerprint(credential, slotNum);
+    // One refresh-token lineage, one slot (user decision K3-r): never two consumers of one refresh token.
+    const holder = lineages.get(fingerprint);
+    if (holder != null) {
+      throw new CswapImportRefusalError('duplicate-login', `C-swap import refused: slots ${holder} and ${slotNum} hold the same login`);
+    }
+    lineages.set(fingerprint, slotNum);
     let previousFromEnc: string | null = null;
     if (io.exists(`${encPath}.prev`)) {
       try { previousFromEnc = base64Credential(io.readText(`${encPath}.prev`)); } catch { /* Keychain prev remains a fallback */ }

@@ -132,6 +132,26 @@ describe('C-swap import (K10 / AC16)', () => {
     await assert.rejects(importCswap({ backupDir: sessions.backup, journalDir: join(sessions.root, 'journals'), keychain: sessions.keychain, repository: sessions.repo }), /session profiles/);
   });
 
+  it('cswap import refuses two slots on one refresh-token lineage', async () => {
+    const h = fixture();
+    // Slot 2 holds the same refresh token as slot 1 under a different account.
+    h.keychain.setSync('claude-swap', 'account-2-b@example.test', credential('account-b', 'refresh-a'));
+    for (const run of [
+      () => planCswapImport({ backupDir: h.backup, keychain: h.keychain, repository: h.repo }),
+      () => importCswap({ backupDir: h.backup, journalDir: join(h.root, 'journals'), keychain: h.keychain, repository: h.repo }),
+    ]) {
+      await assert.rejects(run(), (error: unknown) => {
+        assert.ok(error instanceof CswapImportRefusalError);
+        assert.equal(error.code, 'duplicate-login');
+        assert.doesNotMatch(error.message, /refresh-a/);
+        return true;
+      });
+    }
+    assert.equal(h.repo.listSlots().length, 0);
+    await assert.rejects(h.keychain.get('qlb:anthropic:account-a', QLB_KEYCHAIN_ACCOUNT), /item not found/);
+    await assert.rejects(h.keychain.get('qlb:anthropic:account-b', QLB_KEYCHAIN_ACCOUNT), /item not found/);
+  });
+
   it('refuses malformed source credentials before any Keychain write', async () => {
     const h = fixture();
     writeFileSync(join(h.backup, 'credentials', '.creds-1-a@example.test.enc'), Buffer.from(JSON.stringify({ claudeAiOauth: { refreshToken: 7 } })).toString('base64'));
