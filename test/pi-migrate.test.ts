@@ -382,6 +382,70 @@ describe('Pi migration S58 credential-first barrier', () => {
       }
     });
 
+    it(`${provider}: T-PR3: pi rollback over a generic hand-back that kept its copy`, () => {
+      const h = setup(provider);
+      try {
+        const kept = plantKeptGenericCopy(h, provider);
+        rollbackPiSingleProvider(provider, h.paths, { keychain: h.keychain, store: h.store });
+        assert.equal(h.keychain.getSync(kept.stashService, kept.account), kept.kept);
+        assert.throws(() => h.keychain.getSync(kept.service, kept.account), /item not found/);
+      } finally { h.cleanup(); }
+    });
+
+    it(`${provider}: a malformed Pi journal does not block pi rollback when no copy was kept`, () => {
+      const h = setup(provider);
+      try {
+        mkdirSync(h.paths.journalPath, { recursive: true, mode: 0o700 });
+        const journal = join(h.paths.journalPath, `pi-migrate-${provider}.json`);
+        writeFileSync(journal, '{not json', { mode: 0o600 });
+        assert.doesNotThrow(() => rollbackPiSingleProvider(provider, h.paths, { keychain: h.keychain, store: h.store }));
+        assert.equal(existsSync(journal), false, 'rollback still clears the journal');
+      } finally { h.cleanup(); }
+    });
+
+    it(`${provider}: T-PR3b: pi rollback over a kept copy re-runs after a crash at each step to the same end state`, () => {
+      for (const crash of ['stash', 'delete'] as const) {
+        const h = setup(provider);
+        try {
+          const kept = plantKeptGenericCopy(h, provider);
+          let stashWrites = 0;
+          let crashAfterStashRead = crash === 'stash';
+          let crashAfterDelete = crash === 'delete';
+          const keychain = {
+            setSync(service: string, account: string, value: string) {
+              if (service === kept.stashService && account === kept.account) stashWrites += 1;
+              h.keychain.setSync(service, account, value);
+            },
+            getSync(service: string, account: string) {
+              const value = h.keychain.getSync(service, account);
+              if (crashAfterStashRead && service === kept.stashService && account === kept.account) {
+                crashAfterStashRead = false;
+                throw new Error('injected crash');
+              }
+              return value;
+            },
+            deleteSync(service: string, account: string) {
+              h.keychain.deleteSync(service, account);
+              if (crashAfterDelete && service === kept.service && account === kept.account) {
+                crashAfterDelete = false;
+                throw new Error('injected crash');
+              }
+            },
+          };
+          assert.throws(
+            () => rollbackPiSingleProvider(provider, h.paths, { keychain, store: h.store }),
+            /injected crash/,
+            crash,
+          );
+          assert.equal(h.keychain.getSync(kept.stashService, kept.account), kept.kept, `${crash}: stash preserves the kept copy`);
+          assert.doesNotThrow(() => rollbackPiSingleProvider(provider, h.paths, { keychain, store: h.store }), crash);
+          assert.equal(stashWrites, 1, `${crash}: exactly one stash`);
+          assert.equal(h.keychain.getSync(kept.stashService, kept.account), kept.kept, `${crash}: stash remains the kept copy`);
+          assert.throws(() => h.keychain.getSync(kept.service, kept.account), /item not found/, `${crash}: shared item is deleted`);
+        } finally { h.cleanup(); }
+      }
+    });
+
     it(`${provider}: pi migrate after migrate, pi rollback and a kept-copy stash finishes without reading the absent item`, () => {
       const h = setup(provider);
       try {
