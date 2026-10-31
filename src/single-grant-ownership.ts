@@ -97,6 +97,36 @@ export function resolveSingleGrantKeychain(
   return shared;
 }
 
+/** Durable generic migration facts used for the S66 shared-item guard. */
+export interface GenericSharedItemFacts {
+  state: string | null;
+  detailJson: string | null;
+}
+
+/**
+ * Returns whether S66 protects the shared item from a P7a rollback.
+ * A QLB-owned journal protects the item when it records the shared coordinates;
+ * unreadable journal evidence fails closed. Legacy coordinates remain unheld.
+ */
+export function genericHoldsSharedItem(
+  provider: SingleGrantKeychainProvider,
+  facts: GenericSharedItemFacts,
+): boolean {
+  if (facts.state !== 'QLB_OWNED') return false;
+
+  try {
+    const detail: unknown = facts.detailJson == null ? null : JSON.parse(facts.detailJson);
+    if (!isRecord(detail) || !Array.isArray(detail.accounts)) {
+      throw new JournalKeychainInvalidError();
+    }
+    const coords = resolveSingleGrantKeychain(provider, detail.accounts[0]);
+    const shared = sharedSingleGrantCoords(provider);
+    return coords.service === shared.service && coords.account === shared.account;
+  } catch {
+    return true;
+  }
+}
+
 /** The complete durable S5 hand-back marker. */
 export interface HandbackMarker {
   phase: 'cleanup-pending';
