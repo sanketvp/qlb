@@ -247,6 +247,7 @@ describe('Pi migration S58 credential-first barrier', () => {
       const shared = singleGrantJournalAccount(provider, true);
       const held = [
         { name: 'shared coordinates', detail: JSON.stringify({ accounts: [shared] }) },
+        { name: 'rollback intent marker', detail: JSON.stringify({ accounts: [shared], intent: 'rollback' }) },
         { name: 'rollback decision marker', detail: JSON.stringify({ accounts: [shared], rollbackDecision: {} }) },
         { name: 'hand-back marker', detail: JSON.stringify({ accounts: [shared], handback: { phase: 'cleanup-pending' } }) },
         { name: 'unparseable detail', detail: '{' },
