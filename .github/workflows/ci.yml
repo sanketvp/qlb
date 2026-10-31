@@ -4,6 +4,10 @@ on:
   push:
   pull_request:
 
+env:
+  # Pinned to the version the local suites run against; bump deliberately.
+  PI_VERSION: 1.4.0
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -17,5 +21,20 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm install
+      - name: Install pinned Pi for the Pi-dependent suites
+        run: |
+          npm install -g "@earendil-works/pi-coding-agent@${PI_VERSION}"
+          pi_root="$(npm root -g)/@earendil-works/pi-coding-agent"
+          test -f "$pi_root/package.json"
+          echo "QLB_TEST_PI_ROOT=$pi_root" >> "$GITHUB_ENV"
+          echo "QLB_PI_PACKAGE_ROOT=$pi_root" >> "$GITHUB_ENV"
       - run: npm run build
+      - run: npm run typecheck:pi
       - run: npm test
+      - name: Pi suites must run, not skip
+        shell: bash
+        run: |
+          export QLB_TEST_MODE=1 QLB_HOME="$(mktemp -d)"
+          node --test dist-test/test/qlb-pi-*.test.js | tee pi-suites.log
+          # Node 22 prints TAP totals ("# skipped 0"); newer Node prints "ℹ skipped 0".
+          grep -Eq '^(ℹ|#) skipped 0$' pi-suites.log
