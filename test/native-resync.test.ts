@@ -502,6 +502,40 @@ describe('bindDetectAndResync + MockKeychain', () => {
     store.close();
   });
 
+  it('native-resync does not write an account the provider\'s journal does not list', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-resync-unlisted-'));
+    temps.push(dir);
+    const store = openStore(join(dir, 'qlb.db'));
+    const kc = new MockKeychain();
+    for (const id of ['acct-a', 'acct-b']) {
+      store.upsertAccount(id, 'anthropic', id);
+      kc.setSync(qlbKeychainService('anthropic', id), id, JSON.stringify(grant('old')));
+    }
+    store.upsertMigration('pi-pool', 'QLB_OWNED', JSON.stringify({
+      accounts: [{ id: 'acct-a', provider: 'anthropic', label: 'acct-a', fingerprint: 'fixture' }],
+    }));
+    const fn = bindDetectAndResync({ store, keychain: kc, readNativeCredential: async () => grant('new') });
+
+    const unlisted = await fn('acct-b', 'anthropic');
+    assert.equal(unlisted.resynced, false, unlisted.reason);
+    assert.equal(parseGrant(kc.getSync(qlbKeychainService('anthropic', 'acct-b'), 'acct-b')).access, 'old');
+    const listed = await fn('acct-a', 'anthropic');
+    assert.equal(listed.resynced, true, listed.reason);
+    assert.equal(parseGrant(kc.getSync(qlbKeychainService('anthropic', 'acct-a'), 'acct-a')).access, 'new');
+
+    const xaiId = ADAPTER_ACCOUNT_IDS.xai;
+    const xaiLabel = ADAPTER_ACCOUNT_LABELS.xai;
+    store.upsertAccount(xaiId, 'xai', xaiLabel);
+    kc.setSync(qlbKeychainService('xai', xaiId), xaiLabel, JSON.stringify(grant('old')));
+    const journal = JSON.parse(singleGrantJournal('xai')) as { accounts: Array<Record<string, unknown>> };
+    journal.accounts[0].id = 'xai-other';
+    store.upsertMigration('pi-xai', 'QLB_OWNED', JSON.stringify(journal));
+    const xai = await fn(xaiId, 'xai');
+    assert.equal(xai.resynced, false, xai.reason);
+    assert.equal(parseGrant(kc.getSync(qlbKeychainService('xai', xaiId), xaiLabel)).access, 'old');
+    store.close();
+  });
+
   it('T-W1 native-resync never stamps K_m below G and fences an unreadable K_m', async () => {
     const cases = [
       { name: 'missing K_m is created at G', owned: undefined as number | undefined, unreadable: false, resynced: true, generation: 7 },
@@ -667,7 +701,7 @@ describe('bindDetectAndResync + MockKeychain', () => {
     };
     const slotSerialized = JSON.stringify(slot);
     kc.setSync(service, QLB_KEYCHAIN_ACCOUNT, slotSerialized);
-    store.upsertMigration('pi-openai-codex', 'QLB_OWNED');
+    store.upsertMigration('pi-openai-codex', 'QLB_OWNED', JSON.stringify({ accounts: [{ id }] }));
     const accountsBefore = store.listAccounts();
     const migrationsBefore = store.listMigrations();
     let writes = 0;
@@ -710,7 +744,7 @@ describe('bindDetectAndResync + MockKeychain', () => {
     const slotSerialized = JSON.stringify(slot);
     kc.setSync(service, QLB_KEYCHAIN_ACCOUNT, slotSerialized);
     store.upsertAccount(id, 'openai-codex', QLB_KEYCHAIN_ACCOUNT);
-    store.upsertMigration('pi-openai-codex', 'QLB_OWNED');
+    store.upsertMigration('pi-openai-codex', 'QLB_OWNED', JSON.stringify({ accounts: [{ id }] }));
     const keychainBefore = [...(kc as unknown as { items: Map<string, string> }).items.entries()];
     const generationBefore = store.getGrantGeneration(id);
 
@@ -743,7 +777,7 @@ describe('bindDetectAndResync + MockKeychain', () => {
     const slotSerialized = JSON.stringify(slot);
     kc.setSync(service, QLB_KEYCHAIN_ACCOUNT, slotSerialized);
     store.upsertAccount(id, 'openai-codex', id);
-    store.upsertMigration('pi-openai-codex', 'QLB_OWNED');
+    store.upsertMigration('pi-openai-codex', 'QLB_OWNED', JSON.stringify({ accounts: [{ id }] }));
 
     assert.equal(codexSlotIdFromAccessToken(access), id);
     const result = await bindDetectAndResync({
