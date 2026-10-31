@@ -366,6 +366,29 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     });
   }
 
+  it('rehearse refuses a generic journal with more than one account', async () => {
+    const h = setup('xai');
+    try {
+      h.mig.stage();
+      rmSync(stagingOwnerPath(join(h.dir, 'qlb-owner.json'), 'xai'));
+      const row = h.store.getMigration('pi-xai')!;
+      const detail = JSON.parse(row.detail_json) as { accounts: Array<Record<string, unknown>> };
+      detail.accounts.push({ ...detail.accounts[0]! });
+      h.store.upsertMigration('pi-xai', 'MIRRORED', JSON.stringify(detail));
+      const journalBefore = h.store.getMigration('pi-xai')!;
+      const calls: StagedAccount[] = [];
+
+      await assert.rejects(
+        () => h.mig.rehearse(mockRehearse(calls)),
+        /no staged Keychain credentials to rehearse/,
+      );
+      assert.deepEqual(calls, []);
+      assert.deepEqual(h.store.getMigration('pi-xai'), journalBefore);
+    } finally {
+      h.cleanup();
+    }
+  });
+
   for (const provider of ['xai', 'kimi-coding'] as const) {
     it(`T-KC5 [${provider}] pre-commit rollback deletes only the Keychain item the journal records`, () => {
       const shared = sharedSingleGrantCoords(provider);

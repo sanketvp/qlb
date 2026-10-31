@@ -1805,9 +1805,14 @@ export class Migration {
     const staged = this.readStagingOwnerFile();
     if (staged) return staged;
     const detail = parseDetail(this.store.getMigration(this.storeName)?.detail_json);
-    const accounts = Array.isArray(detail.accounts)
-      ? (detail.accounts as OwnerFile['accounts'])
-      : [];
+    const journalAccount = this.kind === 'single-grant'
+      ? singleJournalAccount(detail.accounts)
+      : undefined;
+    const accounts = this.kind === 'single-grant'
+      ? journalAccount === undefined ? [] : [journalAccount as OwnerFile['accounts'][number]]
+      : Array.isArray(detail.accounts)
+        ? (detail.accounts as OwnerFile['accounts'])
+        : [];
     if (accounts.length === 0) return null;
     return {
       owner: 'qlb',
