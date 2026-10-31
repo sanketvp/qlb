@@ -128,7 +128,7 @@ import type { KeychainBackend } from './keychain';
 import { openRouterMissingKeyMessage, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, readNativeOpenRouterKey } from './keychain';
 import { legacyPiAuthBackupPath, piAuthBackupPath, readPiAuthBackup, removePiAuthBackup, restorePiAuthEntryLocked, type PiAuthBackup } from './pi-auth-backup';
 import { canonicalDigest, fencedGeneration, handbackVerdict, isValidEntry, keychainDigest, NoSingleGrantRestoreSourceError, rankSingleGrantSource, restoreRecordFor } from './pi-handback-source';
-import type { RollbackDecision } from './single-grant-ownership';
+import { resolveSingleGrantKeychain, type RollbackDecision } from './single-grant-ownership';
 import { parseGrant } from './refresh-lease';
 import { hasLegacyPiOwnerEntry, isPiPlaceholder, PiOwnerLegacyError, readPiOwnerProviders, withPiAuthLock, writePiOwnerEntry, type AuthLockTiming } from './pi-migrate';
 import { OPENROUTER_GATE_KEYCHAIN_SERVICE } from './token/openrouter';
@@ -271,6 +271,7 @@ export interface OwnerFile {
     provider: string;
     label: string;
     fingerprint: string;
+    keychain?: { service: string; account: string };
   }>;
   /**
    * `rename` (Anthropic pool): native file is moved to `.pre-qlb` after commit.
@@ -1813,7 +1814,10 @@ export class Migration {
     if (!owner) return [];
     const out: StagedAccount[] = [];
     for (const meta of owner.accounts) {
-      const { service, account } = keychainCoords(meta.provider, meta.id, meta.label);
+      const { service, account } = this.kind === 'single-grant'
+        && (this.provider === 'xai' || this.provider === 'kimi-coding')
+        ? resolveSingleGrantKeychain(this.provider, meta)
+        : keychainCoords(meta.provider, meta.id, meta.label);
       const raw = this.keychain.getSync(service, account);
       const grant =
         this.kind === 'static-key'
