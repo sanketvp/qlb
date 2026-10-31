@@ -37,6 +37,12 @@ import {
   type SingleGrantProvider,
 } from './migration';
 import { parseGrant } from './refresh-lease';
+import {
+  resolveSingleGrantKeychain,
+  sharedSingleGrantCoords,
+  type SingleGrantKeychainCoords,
+  type SingleGrantKeychainProvider,
+} from './single-grant-ownership';
 import type { MigrationRow, Store } from './store';
 import type { Grant } from './types';
 
@@ -368,6 +374,54 @@ export async function attemptWithNativeResyncRetry<T>(opts: {
 /** Sentinel: the item could not be read for a reason other than not-found. */
 const UNREADABLE = Symbol('unreadable');
 
+function isMovedSingleGrantProvider(provider: string): provider is SingleGrantKeychainProvider {
+  return provider === 'xai' || provider === 'kimi-coding';
+}
+
+function resolveNativeResyncKeychain(
+  provider: SingleGrantKeychainProvider,
+  row: MigrationRow | null,
+): SingleGrantKeychainCoords {
+  if (!row) throw new Error('generic migration journal is missing');
+  const detail: unknown = JSON.parse(row.detail_json);
+  if (!detail || typeof detail !== 'object' || Array.isArray(detail)) {
+    throw new Error('generic migration journal is invalid');
+  }
+  return resolveSingleGrantKeychain(
+    provider,
+    (detail as { accounts?: unknown }).accounts instanceof Array
+      ? (detail as { accounts: unknown[] }).accounts[0]
+      : undefined,
+  );
+}
+
+function sameKeychainCoords(
+  left: SingleGrantKeychainCoords,
+  right: SingleGrantKeychainCoords,
+): boolean {
+  return left.service === right.service && left.account === right.account;
+}
+
+function readOwnedCredentialRawAtCoords(
+  keychain: KeychainBackend,
+  coords: SingleGrantKeychainCoords,
+  strict: boolean,
+): string | null | typeof UNREADABLE {
+  try {
+    return keychain.getSync(coords.service, coords.account);
+  } catch (error) {
+    return strict && !isCredentialNotFound(error) ? UNREADABLE : null;
+  }
+}
+
+function writeOwnedCredentialAtCoords(
+  keychain: KeychainBackend,
+  coords: SingleGrantKeychainCoords,
+  credential: ResyncCredential,
+): void {
+  keychain.setSync(coords.service, coords.account, JSON.stringify(credential));
+}
+
 function readOwnedCredentialRawFromKeychain(
   keychain: KeychainBackend,
   provider: string,
@@ -506,6 +560,7 @@ export function bindDetectAndResync(opts: {
     const migrationStore = migrationStoreNameFor(provider);
     let outerGeneration: number | null = null;
     let outerOwnedSerialized: string | null = null;
+    let outerKeychain: SingleGrantKeychainCoords | null = null;
     let outerOwnedRead = false;
     return detectAndResyncFromNative(provider, accountId, {
       keychain: opts.keychain,
@@ -514,7 +569,12 @@ export function bindDetectAndResync(opts: {
       readNativeCredential: () => opts.readNativeCredential(provider, accountId),
       readOwnedCredential: async (keychain, id) => {
         outerGeneration = opts.store.getGrantGeneration(id);
-        const outerRead = readOwnedCredentialRawFromKeychain(keychain, provider, id, label, true);
+        outerKeychain = isMovedSingleGrantProvider(provider)
+          ? resolveNativeResyncKeychain(provider, opts.store.getMigration(migrationStore))
+          : null;
+        const outerRead = outerKeychain
+          ? readOwnedCredentialRawAtCoords(keychain, outerKeychain, true)
+          : readOwnedCredentialRawFromKeychain(keychain, provider, id, label, true);
         if (outerRead === UNREADABLE) throw new Error('QLB Keychain item is unreadable');
         outerOwnedSerialized = outerRead;
         outerOwnedRead = true;
@@ -523,6 +583,10 @@ export function bindDetectAndResync(opts: {
         return parseResyncCredential(outerOwnedSerialized);
       },
       writeOwnedCredential: async (keychain, id, credential) => {
+        if (outerKeychain) {
+          writeOwnedCredentialAtCoords(keychain, outerKeychain, credential);
+          return;
+        }
         writeOwnedCredentialToKeychain(keychain, provider, id, label, credential);
       },
       writeOwnedCredentialInTransaction: (native, owned) => {
@@ -532,16 +596,36 @@ export function bindDetectAndResync(opts: {
           if (opts.store.getGrantGeneration(accountId) !== generation) return false;
           if (!permitsNativeResync(opts.store.getMigration(migrationStore))) return false;
           if (!outerOwnedRead) return false;
-          const currentOwnedSerialized = readOwnedCredentialRawFromKeychain(
-            opts.keychain,
-            provider,
-            accountId,
-            label,
-            true,
-          );
+          const currentKeychain = outerKeychain && isMovedSingleGrantProvider(provider)
+            ? resolveNativeResyncKeychain(provider, opts.store.getMigration(migrationStore))
+            : null;
+          if (outerKeychain && (!currentKeychain || !sameKeychainCoords(currentKeychain, outerKeychain))) return false;
+          const currentOwnedSerialized = currentKeychain
+            ? readOwnedCredentialRawAtCoords(opts.keychain, currentKeychain, true)
+            : readOwnedCredentialRawFromKeychain(
+              opts.keychain,
+              provider,
+              accountId,
+              label,
+              true,
+            );
           if (currentOwnedSerialized === UNREADABLE || currentOwnedSerialized !== outerOwnedSerialized) return false;
+          const sharedKeychain = isMovedSingleGrantProvider(provider)
+            ? sharedSingleGrantCoords(provider)
+            : null;
+          if (currentKeychain && sharedKeychain && sameKeychainCoords(currentKeychain, sharedKeychain)) {
+            if (opts.store.bumpGrantGeneration(accountId, generation) !== 1) return false;
+            const credential = mergeOwnedGeneration(native, owned, generation + 1);
+            if (!isApiKeyCredential(credential)) credential.generation = generation + 1;
+            writeOwnedCredentialAtCoords(opts.keychain, currentKeychain, credential);
+            return true;
+          }
           const credential = mergeOwnedGeneration(native, owned, generation);
-          writeOwnedCredentialToKeychain(opts.keychain, provider, accountId, label, credential);
+          if (currentKeychain) {
+            writeOwnedCredentialAtCoords(opts.keychain, currentKeychain, credential);
+          } else {
+            writeOwnedCredentialToKeychain(opts.keychain, provider, accountId, label, credential);
+          }
           return true;
         });
       },
