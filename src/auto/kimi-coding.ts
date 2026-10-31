@@ -10,7 +10,7 @@ export interface KimiCodingAutoDeps {
   now?: () => number;
   read?: () => GateCredential;
   refresh?: () => Promise<GateCredential>;
-  store?: Pick<Store, 'recordLineage' | 'recordRelogin' | 'getMigration' | 'getConfig' | 'getGrantGeneration' | 'runImmediate' | 'bumpGrantGeneration'>;
+  store?: Pick<Store, 'recordLineage' | 'recordRelogin' | 'getMigration' | 'getConfig' | 'getGrantGeneration' | 'repairGrantGeneration' | 'runImmediate' | 'bumpGrantGeneration'>;
 }
 
 /** P13 §4.5: pre-refresh Kimi Coding only at or inside the ten-minute horizon. */

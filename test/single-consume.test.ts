@@ -11,6 +11,7 @@ import {
   consumeSingleCredential,
   createInMemorySingleConsumeLock,
   type OAuthCredential,
+  type SingleConsumeStore,
 } from '../src/single-consume';
 import { MockKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from '../src/keychain';
 import { refreshXaiCredential, XAI_CLIENT_ID, XAI_REFRESH_URL } from '../src/oauth/xai-refresh';
@@ -34,6 +35,16 @@ function root(home: string): string {
   return join(home, '.qlb', 'unclaimed');
 }
 
+/** No generic journal: the shared item follows today's P7a rules. */
+const NO_JOURNAL: SingleConsumeStore = {
+  getMigration: () => null,
+  getConfig: () => null,
+  getGrantGeneration: () => null,
+  repairGrantGeneration: () => undefined,
+  runImmediate: <T>(work: () => T): T => work(),
+  bumpGrantGeneration: () => 0,
+};
+
 describe('single-account consume gate', () => {
   it('serializes two concurrent refreshes into one POST and returns the persisted winner', async () => {
     const home = await mkdtemp(join(tmpdir(), 'qlb-single-consume-'));
@@ -51,8 +62,8 @@ describe('single-account consume gate', () => {
     const snapshot = credential('access-before', 'refresh-before');
     try {
       const [first, second] = await Promise.all([
-        consumeSingleCredential('kimi-coding', snapshot, { keychain, home, lock, refresh, now: () => NOW }),
-        consumeSingleCredential('kimi-coding', snapshot, { keychain, home, lock, refresh, now: () => NOW }),
+        consumeSingleCredential('kimi-coding', snapshot, { keychain, home, store: NO_JOURNAL, lock, refresh, now: () => NOW }),
+        consumeSingleCredential('kimi-coding', snapshot, { keychain, home, store: NO_JOURNAL, lock, refresh, now: () => NOW }),
       ]);
 
       assert.equal(posts, 1);
@@ -71,7 +82,7 @@ describe('single-account consume gate', () => {
     let posts = 0;
     try {
       const result = await consumeSingleCredential('xai', credential('stale-access', 'stale-refresh'), {
-        keychain, home, lock: createInMemorySingleConsumeLock(), now: () => NOW,
+        keychain, store: NO_JOURNAL, home, lock: createInMemorySingleConsumeLock(), now: () => NOW,
         refresh: async () => { posts += 1; return { kind: 'transient' }; },
       });
 
@@ -94,7 +105,7 @@ describe('single-account consume gate', () => {
     try {
       process.env.HOME = isolatedOsHome;
       const result = await consumeSingleCredential('xai', credential('before', 'refresh-before'), {
-        keychain, env: {}, now: () => NOW,
+        keychain, store: NO_JOURNAL, env: {}, now: () => NOW,
         refresh: async () => assert.fail('the unexpired credential must win'),
       });
       assert.equal(result.outcome, 'winner');
@@ -118,7 +129,7 @@ describe('single-account consume gate', () => {
     try {
       process.env.HOME = isolatedOsHome;
       const result = await consumeSingleCredential('kimi-coding', credential('before', 'refresh-before'), {
-        keychain, env: { KIMI_CODE_OAUTH_HOST: 'http://127.0.0.1:1' }, now: () => NOW,
+        keychain, store: NO_JOURNAL, env: { KIMI_CODE_OAUTH_HOST: 'http://127.0.0.1:1' }, now: () => NOW,
         refresh: async () => assert.fail('the unexpired credential must win'),
       });
       assert.equal(result.outcome, 'winner');
@@ -142,7 +153,7 @@ describe('single-account consume gate', () => {
       delete process.env.QLB_HOME;
       process.env.HOME = isolatedOsHome;
       await assert.rejects(consumeSingleCredential('xai', credential('before', 'refresh-before'), {
-        keychain, env: {}, lock: createInMemorySingleConsumeLock(), now: () => NOW,
+        keychain, store: NO_JOURNAL, env: {}, lock: createInMemorySingleConsumeLock(), now: () => NOW,
         refresh: async () => assert.fail('the guard must run before refresh'),
       }), /explicit home/);
     } finally {
@@ -176,7 +187,7 @@ describe('single-account consume gate', () => {
     };
     try {
       await assert.rejects(consumeSingleCredential('xai', credential('before', 'refresh-before'), {
-        keychain, home, lock: createInMemorySingleConsumeLock(), now: () => NOW,
+        keychain, store: NO_JOURNAL, home, lock: createInMemorySingleConsumeLock(), now: () => NOW,
         refresh: async () => ({ kind: 'success', credential: credential('issued', 'refresh-issued', NOW + 3_600_000) }),
       }), /persist-failed/);
       const [stash] = await listStashes(root(home), 'xai', 'default');
@@ -186,7 +197,7 @@ describe('single-account consume gate', () => {
       rejectPrimary = false;
       let posts = 0;
       const recovered = await consumeSingleCredential('xai', credential('before', 'refresh-before'), {
-        keychain, home, lock: createInMemorySingleConsumeLock(), now: () => NOW,
+        keychain, store: NO_JOURNAL, home, lock: createInMemorySingleConsumeLock(), now: () => NOW,
         refresh: async () => { posts += 1; return { kind: 'transient' }; },
       });
       assert.equal(posts, 0);
@@ -217,7 +228,7 @@ describe('single-account consume gate', () => {
     };
     try {
       await assert.rejects(consumeSingleCredential('kimi-coding', credential('before', 'refresh-before'), {
-        keychain, home, lock: createInMemorySingleConsumeLock(), now: () => NOW,
+        keychain, store: NO_JOURNAL, home, lock: createInMemorySingleConsumeLock(), now: () => NOW,
         refresh: async () => ({ kind: 'success', credential: credential('issued', 'refresh-issued') }),
       }), /credential-unavailable/);
       const [stash] = await listStashes(root(home), 'kimi-coding', 'default');
@@ -253,11 +264,11 @@ describe('single-account consume gate', () => {
     const lock = createInMemorySingleConsumeLock();
     try {
       const first = consumeSingleCredential('xai', credential('before', 'refresh-before'), {
-        keychain, home, lock, now: () => NOW,
+        keychain, store: NO_JOURNAL, home, lock, now: () => NOW,
         refresh: async () => { posts += 1; return { kind: 'success' as const, credential: credential('issued', 'refresh-issued', NOW + 3_600_000) }; },
       });
       const second = consumeSingleCredential('xai', credential('before', 'refresh-before'), {
-        keychain, home, lock, now: () => NOW,
+        keychain, store: NO_JOURNAL, home, lock, now: () => NOW,
         refresh: async () => { posts += 1; return { kind: 'transient' as const }; },
       });
       await assert.rejects(first, /persist-failed/);
@@ -288,7 +299,7 @@ describe('single-account consume gate', () => {
         JSON.stringify({ credential: saved, consumedFp: lineageFp('refresh-before') }));
       let posts = 0;
       const result = await consumeSingleCredential('xai', before, {
-        keychain, home, lock: createInMemorySingleConsumeLock(), now: () => NOW,
+        keychain, store: NO_JOURNAL, home, lock: createInMemorySingleConsumeLock(), now: () => NOW,
         refresh: async () => { posts += 1; return { kind: 'transient' }; },
       });
       assert.equal(posts, 0);
@@ -315,12 +326,12 @@ describe('single-account consume gate', () => {
       keychain.setSync(qlbKeychainService('xai', `unclaimed:${stashId}`), QLB_KEYCHAIN_ACCOUNT,
         JSON.stringify({ credential: saved, consumedFp: lineageFp('refresh-before') }));
       const adopted = await consumeSingleCredential('xai', before, {
-        keychain, home, lock: createInMemorySingleConsumeLock(), now: () => NOW,
+        keychain, store: NO_JOURNAL, home, lock: createInMemorySingleConsumeLock(), now: () => NOW,
         refresh: async () => assert.fail('the first pass must adopt without refreshing'),
       });
       let posts = 0;
       const refreshed = await consumeSingleCredential('xai', adopted.credential, {
-        keychain, home, lock: createInMemorySingleConsumeLock(), now: () => NOW,
+        keychain, store: NO_JOURNAL, home, lock: createInMemorySingleConsumeLock(), now: () => NOW,
         refresh: async () => {
           posts += 1;
           return { kind: 'success', credential: credential('refreshed', 'refresh-refreshed', NOW + 3_600_000) };
@@ -343,7 +354,7 @@ describe('single-account consume gate', () => {
     try {
       let posts = 0;
       const result = await consumeSingleCredential('xai', credential('before', 'refresh-before'), {
-        keychain, home, lock: createInMemorySingleConsumeLock(), now: () => NOW,
+        keychain, store: NO_JOURNAL, home, lock: createInMemorySingleConsumeLock(), now: () => NOW,
         refresh: async () => {
           posts += 1;
           return { kind: 'success', credential: credential('refreshed', 'refresh-refreshed', NOW + 3_600_000) };
@@ -373,7 +384,7 @@ describe('single-account consume gate', () => {
         deleteSync() {},
       };
       consumeSingleCredential('xai', { access: 'before', expires: 1730000000030 }, {
-        keychain, home: process.env.QLB_HOME, lock: createInMemorySingleConsumeLock(), now: () => 1730000000000,
+        keychain, store: { getMigration: () => null }, home: process.env.QLB_HOME, lock: createInMemorySingleConsumeLock(), now: () => 1730000000000,
         refresh: async () => { posted = true; const delivered = new Promise((resolve) => { process.once('SIGTERM', resolve); setTimeout(resolve, 50); }); process.kill(process.pid, 'SIGTERM'); await delivered; return { kind: 'success', credential: { type: 'oauth', access: 'after', refresh: 'after-refresh', expires: 1730003600000 } }; },
       }).catch(() => process.exit(1));
     `;
@@ -396,7 +407,7 @@ describe('single-account consume gate', () => {
     const warnings: string[] = [];
     try {
       const result = await consumeSingleCredential('kimi-coding', credential('before', 'refresh-before'), {
-        keychain, home, lock: createInMemorySingleConsumeLock(), now: () => NOW,
+        keychain, store: NO_JOURNAL, home, lock: createInMemorySingleConsumeLock(), now: () => NOW,
         warn: (message) => warnings.push(message),
         onLineage: () => { throw new Error('audit unavailable'); },
         refresh: async () => ({ kind: 'success', credential: credential('after', 'refresh-after', NOW + 3_600_000) }),
@@ -437,7 +448,7 @@ describe('single-account consume gate', () => {
     };
     try {
       await assert.rejects(consumeSingleCredential('xai', credential('before', 'refresh-before'), {
-        keychain, home, lock: createInMemorySingleConsumeLock(), now: () => NOW,
+        keychain, store: NO_JOURNAL, home, lock: createInMemorySingleConsumeLock(), now: () => NOW,
         refresh: async () => ({ kind: 'success', credential: credential('issued', 'refresh-issued') }),
       }), /successor-unpersisted/);
       assert.equal((await listStashes(root(home), 'xai', 'default')).length, 1);
@@ -445,7 +456,7 @@ describe('single-account consume gate', () => {
       rejectPrimary = false;
       let posts = 0;
       const recovered = await consumeSingleCredential('xai', credential('before', 'refresh-before'), {
-        keychain, home, lock: createInMemorySingleConsumeLock(), now: () => NOW,
+        keychain, store: NO_JOURNAL, home, lock: createInMemorySingleConsumeLock(), now: () => NOW,
         refresh: async () => { posts += 1; return { kind: 'success', credential: credential('recovered', 'refresh-recovered') }; },
       });
       assert.equal(posts, 1);
@@ -463,7 +474,7 @@ describe('single-account consume gate', () => {
     keychain.setSync(primary, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(credential('before', 'refresh-before')));
     try {
       const result = await consumeSingleCredential('xai', credential('before', 'refresh-before'), {
-        keychain, home, lock: createInMemorySingleConsumeLock(), now: () => NOW,
+        keychain, store: NO_JOURNAL, home, lock: createInMemorySingleConsumeLock(), now: () => NOW,
         refresh: async () => {
           keychain.setSync(primary, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(credential('winner', 'winner-refresh', NOW + 3_600_000)));
           return { kind: 'success', credential: credential('issued', 'issued-refresh', NOW + 3_600_000) };
@@ -487,7 +498,7 @@ describe('single-account consume gate', () => {
     const warnings: string[] = [];
     try {
       await assert.rejects(consumeSingleCredential('xai', credential('before', 'refresh-before'), {
-        keychain, home, lock: createInMemorySingleConsumeLock(), now: () => NOW,
+        keychain, store: NO_JOURNAL, home, lock: createInMemorySingleConsumeLock(), now: () => NOW,
         warn: (message) => warnings.push(message),
         onDead: () => { throw new Error('audit unavailable'); },
         refresh: async () => ({ kind: 'dead' }),
@@ -627,6 +638,72 @@ describe('single-account consume gate', () => {
         }), /generic-ownership-unreadable/);
       } finally { store.close(); await rm(home, { recursive: true, force: true }); }
     });
+
+    it(`P13 on a generic-held item refuses and stashes when another writer bumped G after the POST [${provider}]`, async () => {
+      const home = await mkdtemp(join(tmpdir(), 'qlb-single-consume-'));
+      const keychain = new MockKeychain();
+      const store = new Store(':memory:');
+      const accountId = ADAPTER_ACCOUNT_IDS[provider];
+      const service = qlbKeychainService(provider, 'default');
+      store.upsertAccount(accountId, provider, provider);
+      store.upsertMigration(`pi-${provider}`, 'QLB_OWNED', JSON.stringify({ accounts: [{ id: accountId, provider, label: provider, keychain: sharedSingleGrantCoords(provider) }] }));
+      const before = JSON.stringify({ ...credential('before', 'refresh-before'), generation: 0 });
+      keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, before);
+      try {
+        await assert.rejects(consumeSingleCredential(provider, credential('before', 'refresh-before'), {
+          keychain, home, store, lock: createInMemorySingleConsumeLock(), now: () => NOW,
+          refresh: async () => {
+            assert.equal(store.bumpGrantGeneration(accountId, 0), 1);
+            return { kind: 'success', credential: credential('after', 'refresh-after', NOW + 3_600_000) };
+          },
+        }), /cas-conflict/);
+        assert.equal(keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT), before);
+        assert.equal(store.getGrantGeneration(accountId), 1);
+        assert.equal((await listStashes(root(home), provider, 'default')).length, 1);
+      } finally { store.close(); await rm(home, { recursive: true, force: true }); }
+    });
+
+    it(`P13 on a generic-held item after a Keychain-ahead crash does not reuse a generation [${provider}]`, async () => {
+      const home = await mkdtemp(join(tmpdir(), 'qlb-single-consume-'));
+      const keychain = new MockKeychain();
+      const store = new Store(':memory:');
+      const accountId = ADAPTER_ACCOUNT_IDS[provider];
+      const service = qlbKeychainService(provider, 'default');
+      store.upsertAccount(accountId, provider, provider);
+      store.upsertMigration(`pi-${provider}`, 'QLB_OWNED', JSON.stringify({ accounts: [{ id: accountId, provider, label: provider, keychain: sharedSingleGrantCoords(provider) }] }));
+      // C3: the Keychain write at generation 1 landed and the SQLite bump rolled back.
+      keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, JSON.stringify({ ...credential('before', 'refresh-before'), generation: 1 }));
+      try {
+        await consumeSingleCredential(provider, credential('before', 'refresh-before'), {
+          keychain, home, store, lock: createInMemorySingleConsumeLock(), now: () => NOW,
+          refresh: async () => ({ kind: 'success', credential: credential('after', 'refresh-after', NOW + 3_600_000) }),
+        });
+        assert.equal(JSON.parse(keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT)).generation, 2);
+        assert.equal(store.getGrantGeneration(accountId), 2);
+
+        // The Keychain behind the journal is a restored item: refuse before the POST.
+        const behind = JSON.stringify({ ...credential('before', 'refresh-before'), generation: 1 });
+        keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, behind);
+        await assert.rejects(consumeSingleCredential(provider, credential('before', 'refresh-before'), {
+          keychain, home, store, lock: createInMemorySingleConsumeLock(), now: () => NOW,
+          refresh: async () => assert.fail('a Keychain behind the journal refuses before the POST'),
+        }), /cas-conflict/);
+        assert.equal(keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT), behind);
+        assert.equal(store.getGrantGeneration(accountId), 2);
+      } finally { store.close(); await rm(home, { recursive: true, force: true }); }
+    });
+
+    it(`P13 without a store refuses before the POST [${provider}]`, async () => {
+      const home = await mkdtemp(join(tmpdir(), 'qlb-single-consume-'));
+      const keychain = new MockKeychain();
+      keychain.setSync(qlbKeychainService(provider, 'default'), QLB_KEYCHAIN_ACCOUNT, JSON.stringify(credential('before', 'refresh-before')));
+      try {
+        await assert.rejects(consumeSingleCredential(provider, credential('before', 'refresh-before'), {
+          keychain, home, lock: createInMemorySingleConsumeLock(), now: () => NOW,
+          refresh: async () => assert.fail('no ownership authority, no POST'),
+        } as unknown as Parameters<typeof consumeSingleCredential>[2]), /generic-ownership-unreadable/);
+      } finally { await rm(home, { recursive: true, force: true }); }
+    });
   }
 
   it('passes the consumed lineage to a callback after adopting a stashed successor', async () => {
@@ -642,13 +719,13 @@ describe('single-account consume gate', () => {
     };
     try {
       await assert.rejects(consumeSingleCredential('xai', credential('before', 'refresh-before'), {
-        keychain, home, lock: createInMemorySingleConsumeLock(), now: () => NOW,
+        keychain, store: NO_JOURNAL, home, lock: createInMemorySingleConsumeLock(), now: () => NOW,
         refresh: async () => ({ kind: 'success', credential: credential('issued', 'refresh-issued', NOW + 3_600_000) }),
       }), /persist-failed/);
       failPrimary = false;
       const edges: Array<{ fromFp: string; toFp: string }> = [];
       const adopted = await consumeSingleCredential('xai', credential('before', 'refresh-before'), {
-        keychain, home, lock: createInMemorySingleConsumeLock(), now: () => NOW,
+        keychain, store: NO_JOURNAL, home, lock: createInMemorySingleConsumeLock(), now: () => NOW,
         onLineage: (row) => edges.push({ fromFp: row.fromFp, toFp: row.toFp }),
         refresh: async () => assert.fail('adoption must precede a second POST'),
       });

@@ -369,6 +369,66 @@ describe('single-grant stash store', () => {
         assert.equal(store.getGrantGeneration(accountId), 1);
       } finally { store.close(); await rm(home, { recursive: true, force: true }); }
     });
+
+    it(`a due stash adopted into a generic-held item refreshes once without cas-conflict [${provider}]`, async () => {
+      const home = await mkdtemp(join(tmpdir(), 'qlb-single-stash-'));
+      const keychain = new StashFailingKeychain();
+      const store = new Store(':memory:');
+      const accountId = ADAPTER_ACCOUNT_IDS[provider];
+      const primary = qlbKeychainService(provider, 'default');
+      const before = credential('before', 'before-refresh', NOW - 100_000);
+      store.upsertAccount(accountId, provider, provider);
+      store.upsertMigration(`pi-${provider}`, 'QLB_OWNED', JSON.stringify({ accounts: [{ id: accountId, provider, label: provider, keychain: sharedSingleGrantCoords(provider) }] }));
+      keychain.setSync(primary, QLB_KEYCHAIN_ACCOUNT, JSON.stringify({ ...before, generation: 0 }));
+      try {
+        await persistStash(provider, credential('issued', 'issued-refresh', NOW - 1), lineage('before-refresh'), keychain, { home, now: () => NOW });
+        let posts = 0;
+        const result = await consumeSingleCredential(provider, { access: before.access, expires: before.expires! }, {
+          keychain, home, store, lock: createInMemorySingleConsumeLock(), now: () => NOW,
+          refresh: async () => {
+            posts += 1;
+            return { kind: 'success', credential: { type: 'oauth', access: 'fresh', refresh: 'fresh-refresh', expires: NOW + 3_600_000 } };
+          },
+        });
+        const installed = JSON.parse(keychain.getSync(primary, QLB_KEYCHAIN_ACCOUNT));
+        assert.equal(posts, 1);
+        assert.equal(result.outcome, 'refreshed');
+        assert.equal(installed.access, 'fresh');
+        assert.equal(installed.generation, 2);
+        assert.equal(store.getGrantGeneration(accountId), 2);
+        assert.deepEqual(await listStashes(root(home), provider, 'default'), []);
+      } finally { store.close(); await rm(home, { recursive: true, force: true }); }
+    });
+
+    it(`an ownership refusal during stash adoption is reported as an ownership refusal [${provider}]`, async () => {
+      const home = await mkdtemp(join(tmpdir(), 'qlb-single-stash-'));
+      const store = new Store(':memory:');
+      const accountId = ADAPTER_ACCOUNT_IDS[provider];
+      const primary = qlbKeychainService(provider, 'default');
+      const before = credential('before', 'before-refresh');
+      const detail = { accounts: [{ id: accountId, provider, label: provider, keychain: sharedSingleGrantCoords(provider) }] };
+      // A hand-back marker lands while the stash body is being read.
+      let armed = false;
+      const keychain = new (class extends StashFailingKeychain {
+        override getSync(service: string, account: string): string {
+          if (armed && service.includes(':unclaimed:')) store.upsertMigration(`pi-${provider}`, 'QLB_OWNED', JSON.stringify({ ...detail, handback: {} }));
+          return super.getSync(service, account);
+        }
+      })();
+      store.upsertAccount(accountId, provider, provider);
+      store.upsertMigration(`pi-${provider}`, 'QLB_OWNED', JSON.stringify(detail));
+      keychain.setSync(primary, QLB_KEYCHAIN_ACCOUNT, JSON.stringify({ ...before, generation: 0 }));
+      try {
+        await persistStash(provider, credential('issued', 'issued-refresh', NOW + 60_000), lineage('before-refresh'), keychain, { home, now: () => NOW });
+        armed = true;
+        await assert.rejects(consumeSingleCredential(provider, { access: before.access, expires: before.expires! }, {
+          keychain, home, store, lock: createInMemorySingleConsumeLock(), now: () => NOW,
+          refresh: async () => assert.fail('stash adoption precedes POST'),
+        }), /generic-ownership-marker/);
+        assert.equal(store.getGrantGeneration(accountId), 0);
+        assert.equal((await listStashes(root(home), provider, 'default')).length, 1);
+      } finally { store.close(); await rm(home, { recursive: true, force: true }); }
+    });
   }
 
   it('a Linux-style operational keychain error with no fallback file defers and keeps the row', async () => {

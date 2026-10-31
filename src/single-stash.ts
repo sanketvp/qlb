@@ -42,8 +42,11 @@ export interface SingleStashDeps {
   home?: string;
   env?: NodeJS.ProcessEnv;
   now?: () => number;
-  /** Optional owner-controlled primary install; it runs before stash cleanup. */
-  installPrimary?: (credential: OAuthCredential) => void;
+  /**
+   * Optional owner-controlled primary install; it runs before stash cleanup,
+   * returns the credential it wrote, and reports its own refusals.
+   */
+  installPrimary?: (credential: OAuthCredential) => OAuthCredential;
   /** Receives only non-secret stash identifiers and fixed reason text. */
   warn?: (message: string) => void;
   /** Injectable directory durability sync for tests. */
@@ -331,14 +334,17 @@ export async function adoptStashedSuccessor(
     }
     if (!matching || adopted) continue;
 
-    try {
-      if (deps.installPrimary) deps.installPrimary(record.credential);
-      else keychain.setSync(primaryService(provider), QLB_KEYCHAIN_ACCOUNT, JSON.stringify(record.credential));
-    } catch {
-      throw new SingleStashFailure('stash-unreadable');
+    if (deps.installPrimary) {
+      installed = deps.installPrimary(record.credential);
+    } else {
+      try {
+        keychain.setSync(primaryService(provider), QLB_KEYCHAIN_ACCOUNT, JSON.stringify(record.credential));
+      } catch {
+        throw new SingleStashFailure('stash-unreadable');
+      }
+      installed = record.credential;
     }
-    installed = record.credential;
-    adopted = record.credential;
+    adopted = installed;
     try {
       await cleanupReadBody(provider, entry, body.readFrom, keychain, root);
     } catch {
