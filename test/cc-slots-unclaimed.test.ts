@@ -7,7 +7,7 @@ import { describe, it } from 'node:test';
 
 import { ClaudeSlots, InMemoryClaudeSlotRepository, SqliteClaudeSlotRepository, type ClaudeSlotBackend, type ClaudeSlotFileOps } from '../src/cc-slots';
 import { runClaudeRestoreUnclaimedCommand } from '../src/commands/claude-restore-unclaimed';
-import { MockKeychain } from '../src/keychain';
+import { MockKeychain, qlbKeychainService } from '../src/keychain';
 import { listStashes, recordStash } from '../src/unclaimed-index';
 import { openStore } from '../src/store';
 import type { CommandContext } from '../src/registry';
@@ -389,10 +389,13 @@ describe('Claude unclaimed stash and restore (K2 / AC48)', () => {
   });
 
   it('refuses to adopt a record whose accountId names another account', async () => {
-    const { slots, backend } = fixture();
+    const { slots, backend, repository } = fixture();
     const currentCredential = credentialWithRefresh('current', 'shared-refresh', 1_000);
     await slots.createSlot({ accountId: 'account-a', credential: currentCredential, source: 'cswap-import' });
-    await slots.createSlot({ accountId: 'account-b', credential: currentCredential, source: 'cswap-import' });
+    // createSlot refuses a second slot on one lineage (K3-r); a store written
+    // before that rule can still hold one, so seed account-b directly.
+    repository.createSlot({ ...slots.getSlot('account-a')!, accountId: 'account-b', slotNum: null });
+    await backend.set(qlbKeychainService('anthropic', 'account-b'), 'qlb', currentCredential);
     const current = (await slots.readSlot('account-a')).fingerprint;
     await slots.stashUnclaimed('foreign-account', credentialWithRefresh('issued', 'next-refresh', 2_000), current, 'account-a');
 

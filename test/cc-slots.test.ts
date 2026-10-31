@@ -46,6 +46,7 @@ class CountingBackend implements ClaudeSlotBackend {
   readonly kind = 'test-memory' as const;
   readonly inner = new MockKeychain();
   gets = 0;
+  sets: Array<{ service: string; account: string }> = [];
   failReads = false;
 
   async get(service: string, account: string): Promise<string> {
@@ -55,6 +56,7 @@ class CountingBackend implements ClaudeSlotBackend {
   }
 
   async set(service: string, account: string, value: string): Promise<void> {
+    this.sets.push({ service, account });
     return this.inner.set(service, account, value);
   }
 
@@ -95,6 +97,64 @@ describe('Claude slots (K2)', () => {
     assert.equal(repo.getSlot('account-a')?.prevFingerprint, first.fingerprint);
     assert.deepEqual(repo.transitions.map((row) => row.cause), ['import', 'post']);
     assert.equal(repo.generation, 2);
+  });
+
+  it('two account ids with the same refresh token → creation refused', async () => {
+    const { slots, backend, repo } = fixture();
+    await slots.createSlot({ accountId: 'account-a', credential: credential('shared'), source: 'cswap-import' });
+
+    await assert.rejects(
+      slots.createSlot({ accountId: 'account-b', credential: credential('shared'), source: 'cswap-import' }),
+      /account-a/,
+    );
+
+    assert.deepEqual(backend.sets, [{ service: 'qlb:anthropic:account-a', account: 'qlb' }]);
+    assert.equal(repo.listSlots().length, 1);
+  });
+
+  it('add --replace onto another account\'s refresh-token lineage is refused', async () => {
+    const { slots, backend, repo } = fixture();
+    await slots.applyAdd({
+      accountId: 'account-a', credential: credential('shared'), email: null, alias: null, orgUuid: null,
+      configJson: '{}', replace: false,
+    });
+    await slots.applyAdd({
+      accountId: 'account-b', credential: credential('other'), email: null, alias: null, orgUuid: null,
+      configJson: '{}', replace: false,
+    });
+
+    await assert.rejects(
+      slots.applyAdd({
+        accountId: 'account-b', credential: credential('shared'), email: null, alias: null, orgUuid: null,
+        configJson: '{}', replace: true,
+      }),
+      /account-a/,
+    );
+
+    assert.deepEqual(backend.sets.map(({ service, account }) => ({ service, account })), [
+      { service: 'qlb:anthropic:account-a', account: 'qlb' },
+      { service: 'qlb:anthropic:account-b', account: 'qlb' },
+    ]);
+    assert.equal(repo.getSlot('account-b')?.fingerprint, credentialFingerprint(credential('other')));
+  });
+
+  it('an archived slot\'s lineage does not block a new slot', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-cc-slot-archived-lineage-'));
+    const dbPath = join(root, 'qlb.db');
+    const store = openStore(dbPath);
+    store.close();
+    const backend = new CountingBackend();
+    const repository = SqliteClaudeSlotRepository.open(dbPath);
+    const slots = new ClaudeSlots({ backend, repository, stashDir: join(root, 'unclaimed'), now: () => 1_000 });
+    await slots.createSlot({ accountId: 'account-a', credential: credential('shared'), source: 'cswap-import' });
+    const db = (repository as unknown as { db: { prepare(sql: string): { run(...values: unknown[]): void } } }).db;
+    db.prepare('UPDATE claude_slots SET archived_at = 1 WHERE account_id = ?').run('account-a');
+
+    await slots.createSlot({ accountId: 'account-b', credential: credential('shared'), source: 'cswap-import' });
+
+    assert.equal(repository.listSlots().length, 2);
+    assert.equal(repository.getSlot('account-b')?.fingerprint, credentialFingerprint(credential('shared')));
+    repository.close();
   });
 
   it('persists Claude slot CRUD in the v5 SQLite tables', async () => {
