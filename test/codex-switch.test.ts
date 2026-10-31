@@ -2434,6 +2434,8 @@ describe('reconcileCodexRecovery — C6-20', () => {
       assert.deepEqual(await h.recover(), { state: 'clear' });
       // Slot B moved, so the resolution is target-changed with the publish time, never ok.
       assert.deepEqual(lastRow(h), viaJournal(j, 'failed', 'target-changed'));
+      // C6-Q2: the login actually in the file is active.
+      assert.deepEqual(activeLogin(h), { account_id: 'b:account', set_by: 'adopt' });
       assert.equal(onDisk(h).state, 'absent');
       assert.deepEqual(codexRecoveryFenceState(journalDir(h), h.store), { state: 'none' });
     } finally { close(h); }
@@ -2513,8 +2515,47 @@ describe('reconcileCodexRecovery — C6-20', () => {
       importActiveCodexSlot(bLogin, { store: h.store, keychain: h.keychain, now: () => 4 });
       assert.deepEqual(await h.recover(stillRunning), { state: 'clear' });
       assert.deepEqual(lastRow(h), viaJournal(kept.journal, 'failed', 'target-changed'));
+      // C6-Q2: the login actually in the file is active.
+      assert.deepEqual(activeLogin(h), { account_id: 'b:account', set_by: 'adopt' });
       assert.equal(onDisk(h).state, 'absent');
       assert.deepEqual(codexRecoveryFenceState(journalDir(h), h.store), { state: 'none' });
+    } finally { close(h); }
+  });
+
+  it('a narrower unresolved re-check of a journal returns the first fenced accounts', async () => {
+    const h = switchHarness();
+    try {
+      importActiveCodexSlot(observedDocument('c', 'c0'), { store: h.store, keychain: h.keychain, now: () => 2 });
+      const bHead = observedDocument('b', 'b-head');
+      importActiveCodexSlot(bHead, { store: h.store, keychain: h.keychain, now: () => 3 });
+      h.store.setActiveLogin('openai-codex', 'a:account', 'import', 4);
+      const j = recoveryJournal(h);
+      j.target = { ...j.target, fingerprint: codexFingerprint(bHead) };
+      install(h, j);
+      // First check: slot C is split and Codex is on C′ ⇒ slot-split {A, B, C}.
+      h.keychain.setSync(qlbKeychainService('openai-codex', 'c:account'), QLB_KEYCHAIN_ACCOUNT, JSON.stringify(observedDocument('c', 'c-killed')));
+      writeFileSync(h.authPath, JSON.stringify(observedDocument('c', 'c-live')));
+      assert.deepEqual(fenced(await h.recover()), { state: 'fenced', reason: 'slot-split', message: recoveryMessage('slot-split'),
+        accounts: ['a:account', 'b:account', 'c:account'] });
+      // Second check: Codex wrote B's older lineage ⇒ target-ancestor, whose own set is only {A, B}.
+      codexWrites(h, h.b);
+      assert.deepEqual(fenced(await h.recover()), { state: 'fenced', reason: 'target-ancestor', message: recoveryMessage('target-ancestor'),
+        accounts: ['a:account', 'b:account', 'c:account'] });
+      assert.deepEqual(unresolvedJournal(h), { attempt: j.attemptId, reason: 'target-ancestor', accounts: ['a:account', 'b:account', 'c:account'] });
+      assert.deepEqual(await refresh(h, 'c:account'), refused('target-ancestor'));
+      assert.deepEqual(switchRows(h.db), []);
+    } finally { close(h); }
+  });
+
+  it('a wiped auth.json at recovery records failed wiped and no active login', async () => {
+    const h = switchHarness();
+    try {
+      const j = install(h);
+      const wiped = { status: 'wiped', error: { ok: false, error: 'tokens-empty', status: 'wiped' } } as const;
+      assert.deepEqual(await h.recover({ readLive: async () => wiped }), { state: 'clear' });
+      assert.deepEqual(lastRow(h), viaJournal(j, 'failed', 'wiped'));
+      assert.equal((activeLogin(h) as { account_id: string | null }).account_id, null);
+      assert.equal(onDisk(h).state, 'absent');
     } finally { close(h); }
   });
 

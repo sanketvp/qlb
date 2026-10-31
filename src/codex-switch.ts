@@ -1120,16 +1120,21 @@ export async function reconcileCodexRecoveryLocked(
       if (!markCodexSwitchJournalUnresolved(held, journal.attemptId, verdict.reason, verdict.involvedAccounts, options)) {
         throw new Error('Codex switch journal changed before recovery unresolved mark');
       }
-      return fenced(verdict.reason, accountSet(journal, verdict.involvedAccounts));
+      // §3.1: the fenced set is unioned and never shrinks until cleared.
+      return fenced(verdict.reason, unionRecoveryAccounts([journal.from, journal.to],
+        journal.unresolved?.involvedAccounts ?? [], verdict.involvedAccounts));
     }
     const effect = verdict.effect;
     const activeAccountId = 'activeAccountId' in effect ? effect.activeAccountId : undefined;
+    // C6-Q2: a resolved target-changed records the slot whose head the live file equals.
+    const liveSlot = effect.outcome === 'failed' && effect.detail === 'target-changed' && live
+      ? [...slotHeads].find(([, head]) => head === codexFingerprint(live))?.[0] : undefined;
     const accountId = effect.outcome === 'ok' ? journal.to : effect.outcome === 'reverted-by-codex' ? effect.accountId
-      : activeAccountId === null ? null : journal.from;
+      : liveSlot ?? (activeAccountId === null ? null : journal.from);
     const outcome: CodexSwitchResult['outcome'] = effect.outcome === 'quiet' ? 'ok' : effect.outcome === 'stopped' ? 'failed' : effect.outcome;
     const detail = effect.outcome === 'failed' ? effect.detail : effect.outcome === 'stopped' ? effect.reason : null;
     assertHeld(); held.assertHeld(); deps.crashAt?.('recovery-before-commit');
-    deps.store.commitCodexSwitch({ now: deps.now(), accountId, setBy: 'journal', fromAccount: journal.from, toAccount: journal.to,
+    deps.store.commitCodexSwitch({ now: deps.now(), accountId, setBy: liveSlot ? 'adopt' : 'journal', fromAccount: journal.from, toAccount: journal.to,
       trigger: journal.trigger, outcome, attempt: journal.attemptId, via: 'journal', openSessionsJson: openSessionsJson(deps, journal.openSessions),
       publishedAt: detail === 'not-published' ? null : journal.publishedAt, committedAt: deps.now(), detail,
       outgoing: journal.from, target: journal.to,
