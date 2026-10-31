@@ -33,7 +33,12 @@ export type CswapImportRefusalCode =
 
 /** A credential-free, operator-actionable refusal (command exit 3). */
 export class CswapImportRefusalError extends Error {
-  constructor(readonly code: CswapImportRefusalCode, message: string) {
+  constructor(
+    readonly code: CswapImportRefusalCode,
+    message: string,
+    /** The two source slot numbers of a 'duplicate-login' refusal. */
+    readonly slots?: readonly [number, number],
+  ) {
     super(message);
     this.name = 'CswapImportRefusalError';
   }
@@ -298,7 +303,7 @@ async function readSourceSlots(options: CswapImportOptions): Promise<{ slots: So
     // One refresh-token lineage, one slot (user decision K3-r): never two consumers of one refresh token.
     const holder = lineages.get(fingerprint);
     if (holder != null) {
-      throw new CswapImportRefusalError('duplicate-login', `C-swap import refused: slots ${holder} and ${slotNum} hold the same login`);
+      throw duplicateLogin(holder, slotNum);
     }
     lineages.set(fingerprint, slotNum);
     let previousFromEnc: string | null = null;
@@ -498,6 +503,11 @@ async function rollbackEffects(
 
 type LiveSnapshot = { credential: string; accountId: string | null };
 
+function duplicateLogin(first: number, second: number): CswapImportRefusalError {
+  const slots: [number, number] = first < second ? [first, second] : [second, first];
+  return new CswapImportRefusalError('duplicate-login', `C-swap import refused: slots ${slots[0]} and ${slots[1]} hold the same login`, slots);
+}
+
 async function withLiveStateLocks<T>(options: CswapImportOptions, fn: () => Promise<T> | T): Promise<T> {
   return options.withLiveStateLocks ? options.withLiveStateLocks(fn) : fn();
 }
@@ -530,6 +540,9 @@ async function liveEffectiveCredentials(options: CswapImportOptions, sourceSlots
     effective[activeIndex].effectivePrevious = liveFingerprint === effective[activeIndex].fingerprint
       ? effective[activeIndex].previousCredential : effective[activeIndex].credential;
     effective[activeIndex].effectiveFrom = liveFingerprint === effective[activeIndex].fingerprint ? null : effective[activeIndex].fingerprint;
+    // The live login is promoted without passing readSourceSlots' lineage check.
+    const holder = effective.find((slot, index) => index !== activeIndex && slot.fingerprint === liveFingerprint);
+    if (holder) throw duplicateLogin(holder.slotNum, effective[activeIndex].slotNum);
   }
   return { effective, snapshot };
 }

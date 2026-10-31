@@ -152,6 +152,50 @@ describe('C-swap import (K10 / AC16)', () => {
     await assert.rejects(h.keychain.get('qlb:anthropic:account-b', QLB_KEYCHAIN_ACCOUNT), /item not found/);
   });
 
+  it('cswap import refuses a live login that another slot already holds', async () => {
+    const h = fixture();
+    const backupFiles = () => ['sequence.json', 'configs/.claude-config-1-a@example.test.json',
+      'configs/.claude-config-2-b@example.test.json', 'credentials/.creds-1-a@example.test.enc']
+      .map((path) => readFileSync(join(h.backup, path), 'utf8'));
+    const before = backupFiles();
+    const sourceItem = await h.keychain.get('claude-swap', 'account-2-b@example.test');
+    // The live credential for active slot 1 holds slot 2's refresh token.
+    await assert.rejects(importCswap({
+      backupDir: h.backup, journalDir: join(h.root, 'journals'), keychain: h.keychain, repository: h.repo, runId: 'live-duplicate',
+      liveCredential: async () => credential('account-a', 'refresh-b'), liveAccountId: async () => 'account-a',
+    }), (error: unknown) => {
+      assert.ok(error instanceof CswapImportRefusalError);
+      assert.equal(error.code, 'duplicate-login');
+      assert.match(error.message, /slots 1 and 2/);
+      assert.doesNotMatch(error.message, /refresh-|access-/);
+      return true;
+    });
+    assert.equal(h.repo.listSlots().length, 0);
+    assert.deepEqual(h.keychain.listServices().filter((name) => name.startsWith('qlb:')), []);
+    assert.deepEqual(backupFiles(), before);
+    assert.equal(await h.keychain.get('claude-swap', 'account-2-b@example.test'), sourceItem);
+  });
+
+  it('import cswap command names both slots of a duplicate login and exits 3', async () => {
+    const h = fixture();
+    const home = join(h.root, 'home');
+    const env = { QLB_TEST_MODE: '1', QLB_HOME: join(h.root, 'qlb-home'), HOME: home, USER: macosKeychainAccountName() };
+    writeFileSync(join(h.backup, 'credentials', '.creds-2-b@example.test.enc'), Buffer.from(credential('account-b', 'refresh-a')).toString('base64'));
+    const dbPath = join(h.root, 'qlb.db');
+    const store = openStore(dbPath);
+    beginCutover(store);
+    store.close();
+    const stderr: string[] = [];
+    const context: CommandContext = {
+      stdout: () => {}, stderr: (line) => stderr.push(line), env,
+      config: { dbPath, cswapSequencePath: join(h.backup, 'sequence.json') } as CommandContext['config'],
+      loadConfig: () => { throw new Error('not used'); }, home,
+      registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
+    };
+    assert.equal(await importCswapCommand.execute!([], context), 3);
+    assert.deepEqual(stderr, ['import cswap refused: duplicate-login (slots 1 and 2 hold the same login)']);
+  });
+
   it('refuses malformed source credentials before any Keychain write', async () => {
     const h = fixture();
     writeFileSync(join(h.backup, 'credentials', '.creds-1-a@example.test.enc'), Buffer.from(JSON.stringify({ claudeAiOauth: { refreshToken: 7 } })).toString('base64'));
