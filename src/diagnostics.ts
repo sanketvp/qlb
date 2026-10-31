@@ -642,20 +642,32 @@ export async function doctorQlb(
   }
 
   const keychainCheck = probeCredentialStore(options.command);
-  try {
-    const keptCopies = listKeptKeychainServices({ keychain: options.keychain });
-    keychainCheck.message += keptCopies.length === 0
-      ? '; no generic hand-back kept copies found'
-      : `; ${keptCopies.length} generic hand-back kept ${keptCopies.length === 1 ? 'copy' : 'copies'} found`;
-    keychainCheck.detail = { keptCopies };
-  } catch {
-    // The enumerator redacts dump output; doctor likewise reports only the
-    // operational failure, never attributes or credential bytes.
-    keychainCheck.level = 'WARN';
-    keychainCheck.message += '; generic hand-back kept-copy enumeration is unavailable';
+  const hostPlatform = options.hostPlatform ?? process.platform;
+  const testKeychain = options.keychain?.kind === 'test-memory';
+  // Kept copies exist only in the macOS Keychain; elsewhere the listing is skipped
+  // so it never lowers the row.
+  if (testKeychain || hostPlatform === 'darwin') {
+    try {
+      const command = options.command;
+      const keptCopies = listKeptKeychainServices({
+        keychain: options.keychain,
+        ...(testKeychain || !command ? {} : {
+          platform: hostPlatform,
+          exec: (file: string, args: readonly string[]) => command(file, [...args]),
+        }),
+      });
+      keychainCheck.message += keptCopies.length === 0
+        ? '; no generic hand-back kept copies found'
+        : `; ${keptCopies.length} generic hand-back kept ${keptCopies.length === 1 ? 'copy' : 'copies'} found: ${keptCopies.join(', ')}`;
+      keychainCheck.detail = { keptCopies };
+    } catch {
+      // The enumerator redacts dump output; doctor likewise reports only the
+      // operational failure, never attributes or credential bytes.
+      keychainCheck.level = 'WARN';
+      keychainCheck.message += '; generic hand-back kept-copy enumeration is unavailable';
+    }
   }
   checks.push(keychainCheck);
-  const hostPlatform = options.hostPlatform ?? process.platform;
   if (hostPlatform === 'darwin') {
     const configValue = options.configReader ?? ((key: string) => recordedConfig.get(key) ?? null);
     const signing = (options.helperSigning ?? inspectHelperSigning)();

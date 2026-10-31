@@ -44,6 +44,31 @@ describe('qlb doctor', () => {
     const keychain = report.checks.find((check) => check.name === 'keychain');
     assert.equal(keychain?.level, 'PASS');
     assert.deepEqual(keychain?.detail, { keptCopies: [service] });
+    assert.match(keychain?.message ?? '', new RegExp(service.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')), 'plain output names the copy');
+  });
+
+  it('qlb doctor kept-copy listing never lowers the keychain row off macOS', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-kept-copies-linux-'));
+    // A non-test backend; enumeration here would fail and WARN if attempted.
+    const keychain = Object.assign(new MockKeychain(), { kind: 'linux-file' }) as unknown as MockKeychain;
+    const report = await doctorQlb(defaultConfig(home), {
+      command: (_file, args) => { if (args.includes('dump-keychain')) throw new Error('enumeration attempted'); return 'ok'; },
+      hostCommand: () => '', hostPlatform: 'linux', keychain,
+    });
+    const row = report.checks.find((check) => check.name === 'keychain');
+    assert.doesNotMatch(row?.message ?? '', /kept-cop/);
+    assert.equal(row?.detail, undefined);
+  });
+
+  it('qlb doctor lists kept copies through its injected command runner', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-kept-copies-command-'));
+    const service = 'qlb:kimi-coding:kept:2026-10-30T12:00:00.000Z';
+    const keychain = Object.assign(new MockKeychain(), { kind: 'macos-keychain' }) as unknown as MockKeychain;
+    const report = await doctorQlb(defaultConfig(home), {
+      command: (_file, args) => args.includes('dump-keychain') ? `    "svce"<blob>="${service}"\n` : 'ok',
+      hostCommand: () => '', hostPlatform: 'darwin', keychain,
+    });
+    assert.deepEqual(report.checks.find((check) => check.name === 'keychain')?.detail, { keptCopies: [service] });
   });
 
   it('WARNs when kept-copy enumeration is unavailable without leaking dump output', async () => {
