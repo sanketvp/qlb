@@ -1,6 +1,7 @@
 import { resolve, type TokenResolution } from '../token/xai';
 import type { GateCredential, GateRefreshContext, ProviderGate } from '../pi-gate';
 import { getStore } from '../store';
+import { defaultPiMigratePaths } from '../pi-migrate';
 import { recordRelogin } from '../relogin';
 
 export interface XaiGateDeps {
@@ -37,6 +38,8 @@ export async function refresh(current?: GateCredential, context?: GateRefreshCon
   })();
   const { consumeXaiCredential } = await import('../single-consume');
   const credential = await consumeXaiCredential({ access: current.token, expires: current.expiresAt ?? 0 }, {
+    store: getStore(),
+    p7aJournalPath: defaultPiMigratePaths().journalPath,
     onLineage: audit.onLineage,
     onDead: audit.onDead,
   });

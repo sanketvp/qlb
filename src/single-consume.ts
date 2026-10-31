@@ -2,10 +2,15 @@
 // The lock, Keychain, HTTP transport, clock and durable side effects are injectable.
 
 import { createHash } from 'node:crypto';
+import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { CREDENTIALS_STALENESS_MS, withProperLockfile } from './cc-locks';
 import { platformKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from './keychain';
+import { ADAPTER_ACCOUNT_IDS } from './migration';
+import { parseGrant } from './refresh-lease';
+import { sharedSingleGrantCoords, resolveSingleGrantKeychain } from './single-grant-ownership';
+import type { Store } from './store';
 import { refreshKimiCodingCredential } from './oauth/kimi-coding-refresh';
 import {
   refreshXaiCredential,
@@ -29,7 +34,7 @@ export type SingleRefreshResult = OAuthRefreshResult;
 export type CredentialSnapshot = Pick<OAuthCredential, 'access' | 'expires'>;
 
 export class SingleConsumeFailure extends Error {
-  constructor(readonly code: 'credential-unavailable' | 'refresh-dead' | 'refresh-failed' | 'persist-failed' | 'cas-conflict' | 'stash-unreadable' | 'successor-unpersisted') {
+  constructor(readonly code: 'credential-unavailable' | 'refresh-dead' | 'refresh-failed' | 'persist-failed' | 'cas-conflict' | 'stash-unreadable' | 'successor-unpersisted' | 'generic-ownership-unreadable' | 'generic-ownership-marker' | 'dual-ownership') {
     super(code);
     this.name = 'SingleConsumeFailure';
   }
@@ -39,8 +44,14 @@ export interface SingleConsumeLock {
   withLock<T>(provider: SingleConsumeProvider, work: () => Promise<T>): Promise<T>;
 }
 
+export type SingleConsumeStore = Pick<Store, 'getMigration' | 'getConfig' | 'getGrantGeneration' | 'repairGrantGeneration' | 'runImmediate' | 'bumpGrantGeneration'>;
+
 export interface SingleConsumeDeps {
   keychain?: SingleStashKeychain;
+  /** The ownership authority for the shared item. */
+  store: SingleConsumeStore;
+  /** P7a's journal directory; its presence is an ownership fact. */
+  p7aJournalPath?: string;
   lock?: SingleConsumeLock;
   now?: () => number;
   home?: string;
@@ -168,8 +179,95 @@ function notifyDead(provider: SingleConsumeProvider, deps: Pick<SingleConsumeDep
 }
 
 function stashFailure(error: unknown): SingleConsumeFailure {
+  if (error instanceof SingleConsumeFailure) return error;
   if (error instanceof SingleStashFailure) return new SingleConsumeFailure(error.code);
   return new SingleConsumeFailure('stash-unreadable');
+}
+
+type SharedItemOwner = 'p7a' | 'generic';
+
+function p7aJournalPath(provider: SingleConsumeProvider, deps: Pick<SingleConsumeDeps, 'home' | 'p7aJournalPath'>): string {
+  return join(deps.p7aJournalPath ?? join(resolveQlbHome(deps.home), '.qlb', 'journal'), `pi-migrate-${provider}.json`);
+}
+
+/** Resolves the owner facts before a P13 write; malformed generic evidence fails closed. */
+function sharedItemOwner(provider: SingleConsumeProvider, deps: Pick<SingleConsumeDeps, 'store' | 'home' | 'p7aJournalPath'>): SharedItemOwner {
+  // Untyped callers can still omit the store; without the authority, fail closed.
+  if (!deps.store) throw new SingleConsumeFailure('generic-ownership-unreadable');
+  const row = deps.store.getMigration(`pi-${provider}`);
+  if (row?.state !== 'QLB_OWNED') return 'p7a';
+
+  let detail: unknown;
+  try { detail = JSON.parse(row.detail_json); } catch { throw new SingleConsumeFailure('generic-ownership-unreadable'); }
+  if (!detail || typeof detail !== 'object' || Array.isArray(detail)) throw new SingleConsumeFailure('generic-ownership-unreadable');
+  const accounts = (detail as { accounts?: unknown }).accounts;
+  const account = Array.isArray(accounts) ? accounts[0] : undefined;
+  let coords;
+  try { coords = resolveSingleGrantKeychain(provider, account); } catch { throw new SingleConsumeFailure('generic-ownership-unreadable'); }
+  const shared = sharedSingleGrantCoords(provider);
+  if (coords.service !== shared.service || coords.account !== shared.account) return 'p7a';
+
+  const p7aOwned = deps.store.getConfig(`pi.${provider}.state`) === 'migrated'
+    || existsSync(p7aJournalPath(provider, deps));
+  if (p7aOwned) throw new SingleConsumeFailure('dual-ownership');
+  if (['intent', 'rollbackDecision', 'handback'].some((key) => Object.prototype.hasOwnProperty.call(detail, key))) {
+    throw new SingleConsumeFailure('generic-ownership-marker');
+  }
+  return 'generic';
+}
+
+/** The generic item as read outside the write transaction: its G and its exact bytes. */
+interface GenericBaseline { generation: number; bytes: string; }
+
+/**
+ * RefreshLease step 1 for the generic-held item: a Keychain stamp ahead of G
+ * is a crash after the Keychain write (C3) and is repaired on read; a stamp
+ * behind G is a restored item and is refused before anything is spent.
+ */
+function genericBaseline(provider: SingleConsumeProvider, bytes: string, store: SingleConsumeStore): GenericBaseline {
+  const accountId = ADAPTER_ACCOUNT_IDS[provider];
+  const generation = store.getGrantGeneration(accountId);
+  if (generation === null) throw new SingleConsumeFailure('generic-ownership-unreadable');
+  const kgen = parseGrant(bytes).generation;
+  if (kgen > generation) {
+    store.repairGrantGeneration(accountId, generation, kgen);
+    return { generation: kgen, bytes };
+  }
+  if (kgen < generation) throw new SingleConsumeFailure('cas-conflict');
+  return { generation, bytes };
+}
+
+/**
+ * W1 as RefreshLease step 5: inside one BEGIN IMMEDIATE, the journal still
+ * holds the item, and G and the item are still the baseline read before the
+ * POST (equal bytes imply the stamp equals G); then CAS G -> G+1 and stamp.
+ */
+function genericWrite(
+  provider: SingleConsumeProvider,
+  credential: OAuthCredential,
+  baseline: GenericBaseline | null,
+  keychain: SingleStashKeychain,
+  deps: Pick<SingleConsumeDeps, 'store' | 'home' | 'p7aJournalPath'>,
+): GenericBaseline & StoredCredential {
+  const { store } = deps;
+  return store.runImmediate(() => {
+    if (sharedItemOwner(provider, deps) !== 'generic') throw new SingleConsumeFailure('generic-ownership-unreadable');
+    // No baseline: the journal took the item after it was read.
+    if (!baseline) throw new SingleConsumeFailure('cas-conflict');
+    const accountId = ADAPTER_ACCOUNT_IDS[provider];
+    if (store.getGrantGeneration(accountId) !== baseline.generation) throw new SingleConsumeFailure('cas-conflict');
+    let bytes: string;
+    try { bytes = keychain.getSync(credentialService(provider), QLB_KEYCHAIN_ACCOUNT); } catch {
+      throw new SingleConsumeFailure('cas-conflict');
+    }
+    if (bytes !== baseline.bytes) throw new SingleConsumeFailure('cas-conflict');
+    const generation = baseline.generation + 1;
+    const stamped = { ...credential, generation, writtenBy: 'single-consume' } as OAuthCredential;
+    const written = JSON.stringify(stamped);
+    keychain.setSync(credentialService(provider), QLB_KEYCHAIN_ACCOUNT, written);
+    if (store.bumpGrantGeneration(accountId, baseline.generation) !== 1) throw new SingleConsumeFailure('cas-conflict');
+    return { generation, bytes: written, credential: stamped };
+  });
 }
 
 /**
@@ -189,11 +287,32 @@ export async function consumeSingleCredential(
   const lock = deps.lock ?? defaultSingleConsumeLock(home);
   const dueWithinMs = deps.dueWithinMs ?? GATE_FRESHEN_MS;
   return lock.withLock(provider, async () => {
+    // A generic-held item may not spend a refresh token unless W2 admits it.
+    const owner = sharedItemOwner(provider, deps);
     let current = readStoredCredential(provider, keychain);
+    let baseline = owner === 'generic' ? genericBaseline(provider, current.bytes, deps.store) : null;
     const adoptedFromFp = credentialLineage(current.credential);
     let adopted: StashCredential | null;
     try {
-      adopted = await adoptStashedSuccessor(provider, current.credential as StashCredential, keychain, { home, warn: deps.warn });
+      adopted = await adoptStashedSuccessor(provider, current.credential as StashCredential, keychain, {
+        home,
+        warn: deps.warn,
+        installPrimary: (credential) => {
+          try {
+            if (sharedItemOwner(provider, deps) !== 'generic') {
+              keychain.setSync(credentialService(provider), QLB_KEYCHAIN_ACCOUNT, JSON.stringify(credential));
+              return credential;
+            }
+            // Hand back the stamped bytes actually written, and refresh from them.
+            const written = genericWrite(provider, credential as OAuthCredential, baseline, keychain, deps);
+            baseline = written;
+            return written.credential as StashCredential;
+          } catch (error) {
+            if (error instanceof SingleConsumeFailure) throw error;
+            throw new SingleStashFailure('stash-unreadable');
+          }
+        },
+      });
     } catch (error) {
       throw stashFailure(error);
     }
@@ -237,14 +356,21 @@ export async function consumeSingleCredential(
         throw new SingleConsumeFailure('cas-conflict');
       }
 
+      let persisted: OAuthCredential;
       try {
-        keychain.setSync(credentialService(provider), QLB_KEYCHAIN_ACCOUNT, JSON.stringify(refreshed.credential));
-      } catch {
+        persisted = sharedItemOwner(provider, deps) === 'generic'
+          ? genericWrite(provider, refreshed.credential, baseline, keychain, deps).credential
+          : (() => {
+            keychain.setSync(credentialService(provider), QLB_KEYCHAIN_ACCOUNT, JSON.stringify(refreshed.credential));
+            return refreshed.credential;
+          })();
+      } catch (error) {
         await persistStash(provider, refreshed.credential as StashCredential, consumedFp, keychain, { home, now: deps.now });
+        if (error instanceof SingleConsumeFailure) throw error;
         throw new SingleConsumeFailure('persist-failed');
       }
-      notifyLineage(provider, consumedFp, refreshed.credential, deps);
-      return { credential: refreshed.credential, outcome: 'refreshed' };
+      notifyLineage(provider, consumedFp, persisted, deps);
+      return { credential: persisted, outcome: 'refreshed' };
     });
   });
 }
@@ -268,14 +394,14 @@ function isSnapshot(value: CredentialSnapshot | XaiConsumeOptions | KimiConsumeO
 }
 
 /** The one-argument options form is retained for existing injected callers. */
-export function consumeXaiCredential(deps?: XaiConsumeOptions): Promise<OAuthCredential>;
-export function consumeXaiCredential(snapshot: CredentialSnapshot, deps?: XaiConsumeOptions): Promise<OAuthCredential>;
+export function consumeXaiCredential(deps: XaiConsumeOptions): Promise<OAuthCredential>;
+export function consumeXaiCredential(snapshot: CredentialSnapshot, deps: XaiConsumeOptions): Promise<OAuthCredential>;
 export async function consumeXaiCredential(
-  snapshotOrDeps: CredentialSnapshot | XaiConsumeOptions = {},
-  suppliedDeps: XaiConsumeOptions = {},
+  snapshotOrDeps: CredentialSnapshot | XaiConsumeOptions,
+  suppliedDeps?: XaiConsumeOptions,
 ): Promise<OAuthCredential> {
   const snapshot = isSnapshot(snapshotOrDeps) ? snapshotOrDeps : undefined;
-  const deps = isSnapshot(snapshotOrDeps) ? suppliedDeps : snapshotOrDeps;
+  const deps = ((isSnapshot(snapshotOrDeps) ? suppliedDeps : snapshotOrDeps) ?? {}) as XaiConsumeOptions;
   const keychain = deps.keychain ?? platformKeychain;
   const observed = snapshot ?? readStoredCredential('xai', keychain).credential;
   return singleCredentialFromResult(await consumeSingleCredential('xai', observed, {
@@ -286,14 +412,14 @@ export async function consumeXaiCredential(
 }
 
 /** The one-argument options form is retained for existing injected callers. */
-export function consumeKimiCodingCredential(deps?: KimiConsumeOptions): Promise<OAuthCredential>;
-export function consumeKimiCodingCredential(snapshot: CredentialSnapshot, deps?: KimiConsumeOptions): Promise<OAuthCredential>;
+export function consumeKimiCodingCredential(deps: KimiConsumeOptions): Promise<OAuthCredential>;
+export function consumeKimiCodingCredential(snapshot: CredentialSnapshot, deps: KimiConsumeOptions): Promise<OAuthCredential>;
 export async function consumeKimiCodingCredential(
-  snapshotOrDeps: CredentialSnapshot | KimiConsumeOptions = {},
-  suppliedDeps: KimiConsumeOptions = {},
+  snapshotOrDeps: CredentialSnapshot | KimiConsumeOptions,
+  suppliedDeps?: KimiConsumeOptions,
 ): Promise<OAuthCredential> {
   const snapshot = isSnapshot(snapshotOrDeps) ? snapshotOrDeps : undefined;
-  const deps = isSnapshot(snapshotOrDeps) ? suppliedDeps : snapshotOrDeps;
+  const deps = ((isSnapshot(snapshotOrDeps) ? suppliedDeps : snapshotOrDeps) ?? {}) as KimiConsumeOptions;
   const keychain = deps.keychain ?? platformKeychain;
   const observed = snapshot ?? readStoredCredential('kimi-coding', keychain).credential;
   const env = deps.env ?? process.env;

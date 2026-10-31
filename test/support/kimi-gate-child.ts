@@ -4,6 +4,7 @@ import { appendFileSync, existsSync, writeFileSync } from 'node:fs';
 import { QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from '../../src/keychain';
 import { runPiGate } from '../../src/pi-gate';
 import { consumeKimiCodingCredential } from '../../src/single-consume';
+import { openStore } from '../../src/store';
 import { resolve } from '../../src/token/kimi-coding';
 import { FileKeychain } from './file-keychain';
 
@@ -74,6 +75,7 @@ async function main(): Promise<void> {
           expires: current?.expiresAt ?? 0,
         }, {
           keychain,
+          store: openStore(dbPath),
           home,
           env: process.env,
           ...(disabledLock ? { lock: { withLock: async <T>(_name: 'xai' | 'kimi-coding', work: () => Promise<T>) => work() } } : {}),

@@ -3,13 +3,14 @@ import { resolve } from '../token/kimi-coding';
 import type { GateCredential } from '../pi-gate';
 import { SINGLE_ACCOUNT_FRESHEN_MS } from './xai';
 import { getStore, type Store } from '../store';
+import { defaultPiMigratePaths } from '../pi-migrate';
 import { recordRelogin } from '../relogin';
 
 export interface KimiCodingAutoDeps {
   now?: () => number;
   read?: () => GateCredential;
   refresh?: () => Promise<GateCredential>;
-  store?: Pick<Store, 'recordLineage' | 'recordRelogin'>;
+  store?: Pick<Store, 'recordLineage' | 'recordRelogin' | 'getMigration' | 'getConfig' | 'getGrantGeneration' | 'repairGrantGeneration' | 'runImmediate' | 'bumpGrantGeneration'>;
 }
 
 /** P13 §4.5: pre-refresh Kimi Coding only at or inside the ten-minute horizon. */
@@ -24,6 +25,8 @@ export async function refreshKimiCodingIfDue(deps: KimiCodingAutoDeps = {}): Pro
     const store = deps.store ?? getStore();
     const current = await consumeKimiCodingCredential({ access: credential.token, expires: credential.expiresAt ?? 0 }, {
       dueWithinMs: SINGLE_ACCOUNT_FRESHEN_MS,
+      store,
+      p7aJournalPath: defaultPiMigratePaths().journalPath,
       onLineage: (row) => store.recordLineage({
         provider: row.provider, accountId: 'default', fromFp: row.fromFp, toFp: row.toFp,
         cause: 'post', by: 'qlb-auto', evidence: 'post',

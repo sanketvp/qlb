@@ -1,6 +1,7 @@
 import { GateFailure, type GateCredential, type GateRefreshContext, type ProviderGate } from '../pi-gate';
 import { resolve } from '../token/kimi-coding';
 import { getStore } from '../store';
+import { defaultPiMigratePaths } from '../pi-migrate';
 import { recordRelogin } from '../relogin';
 
 /** P13 §4.5: wait for single-consume's persisted winner; never return busy to Pi. */
@@ -20,6 +21,8 @@ export function refresh(current?: GateCredential, context?: GateRefreshContext):
   })();
   return import('../single-consume').then(async ({ consumeKimiCodingCredential }) => {
     const credential = await consumeKimiCodingCredential({ access: current.token, expires: current.expiresAt ?? 0 }, {
+      store: getStore(),
+      p7aJournalPath: defaultPiMigratePaths().journalPath,
       onLineage: audit.onLineage,
       onDead: audit.onDead,
     });
