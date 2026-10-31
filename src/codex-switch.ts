@@ -1081,6 +1081,18 @@ export async function reconcileCodexRecoveryLocked(
     try { return slots.readSlot(accountId, { fresh: true }).document; }
     catch (error) { if (tolerate) return undefined; throw error; }
   };
+  /**
+   * Without attribution, a slot's SQLite head may only resolve recovery when its Keychain copy
+   * backs it (read fresh): a missing, unreadable or different copy is a split and maps to null.
+   */
+  const verifySlotHeads = (slotHeads: Map<string, string | null>): void => {
+    for (const [accountId, head] of slotHeads) {
+      if (head === null) continue;
+      let keychainFp: string | null;
+      try { keychainFp = codexFingerprint(slots.readSlot(accountId, { fresh: true }).document); } catch { keychainFp = null; }
+      if (keychainFp !== head) slotHeads.set(accountId, null);
+    }
+  };
 
   const resolveJournal = async (journal: CodexSwitchJournal, held: HeldCodexSwitchJournalOwner): Promise<ReturnType<typeof fenced> | { state: 'clear' }> => {
     assertHeld(); held.assertHeld();
@@ -1110,7 +1122,10 @@ export async function reconcileCodexRecoveryLocked(
     // A target-changed attempt can resolve without attribution (§3.1), so an unreadable slot B
     // only makes attribution unavailable: B then has no established head.
     const target = attribute && live && targetRow ? readTargetSlot(journal.to, classified === 'target-changed') : undefined;
-    if (attribute && live && targetRow && !target) slotHeads.set(journal.to, null);
+    if (attribute && live && targetRow && !target) {
+      slotHeads.set(journal.to, null);
+      verifySlotHeads(slotHeads);
+    }
     if (target && live && targetRow) {
       const targetFp = codexFingerprint(target);
       const history = deps.dbPath ? readCodexSwitchHistory(deps.dbPath, { journalDir: deps.journalDir }) : { rows: [], observations: [] };
@@ -1220,8 +1235,18 @@ export async function reconcileCodexRecoveryLocked(
   // that needs attribution to resolve is kept as stored, with no write.
   const target = attribute ? readTargetSlot(fence.to, true) : undefined;
   if (attribute && !target) {
-    if (classified !== 'target-changed') return fenced(fence.reason, fencedAccounts);
+    if (classified !== 'target-changed') {
+      // §3.1: the live identity's managed slot is fenced whatever the attribution says.
+      if (liveIdentity && deps.store.getCodexSlot(liveIdentity) && fencedAccounts !== '*' && !fencedAccounts.has(liveIdentity)) {
+        assertHeld();
+        deps.store.setRecoveryFence({ ...fence, involvedAccounts: [liveIdentity] });
+        const stored = parseCodexRecoveryFence(deps.store.getConfig('codex.recoveryFence'));
+        return fenced(stored?.reason ?? fence.reason, unionRecoveryAccounts([fence.from, fence.to], stored?.involvedAccounts ?? '*'));
+      }
+      return fenced(fence.reason, fencedAccounts);
+    }
     slotHeads.set(fence.to, null);
+    verifySlotHeads(slotHeads);
   }
   if (target && live && targetRow) {
     // §3 holder evidence: aliveBefore from the fence's switch row snapshot, aliveAfter from the current list().

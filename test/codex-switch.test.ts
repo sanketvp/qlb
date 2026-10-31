@@ -2921,4 +2921,66 @@ describe('reconcileCodexRecovery — C6-20', () => {
       } finally { close(h); }
     }
   });
+
+  // ---- C6-20 review r3 ----
+  it('an unreadable target slot does not clear recovery on another slot whose Keychain copy is missing or different', async () => {
+    const serviceA = qlbKeychainService('openai-codex', 'a:account');
+    const damage = {
+      missing: (h: Harness) => h.keychain.deleteSync(serviceA, QLB_KEYCHAIN_ACCOUNT),
+      corrupt: (h: Harness) => h.keychain.setSync(serviceA, QLB_KEYCHAIN_ACCOUNT, '{'),
+      different: (h: Harness) => h.keychain.setSync(serviceA, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(observedDocument('a', 'a-other'))),
+    };
+    for (const [name, damageA] of Object.entries(damage)) {
+      // Fence: live equals A's SQLite head, but A's Keychain copy does not back it.
+      {
+        const h = switchHarness();
+        try {
+          const fence = configFence(h, 'target-changed');
+          breakSlot(h, 'b:account');
+          codexWrites(h, h.a);
+          damageA(h);
+          const active = activeLogin(h);
+          assert.deepEqual(fenced(await h.recover()), { state: 'fenced', reason: 'target-changed', message: recoveryMessage('target-changed'),
+            accounts: ['a:account', 'b:account'] }, `fence ${name}`);
+          assert.deepEqual(JSON.parse(h.store.getConfig('codex.recoveryFence')!), fence, `fence ${name}`);
+          assert.deepEqual(activeLogin(h), active, `fence ${name}`);
+          assert.deepEqual(switchRows(h.db).filter(({ steps_json }) => String(steps_json).includes('"fence"')), [], `fence ${name}`);
+        } finally { close(h); }
+      }
+      // Journal: the same, on an orphaned target-changed journal.
+      {
+        const h = switchHarness();
+        try {
+          const j = install(h);
+          importActiveCodexSlot(observedDocument('b', 'b-new'), { store: h.store, keychain: h.keychain, now: () => 2 });
+          h.store.setActiveLogin('openai-codex', 'a:account', 'import', 3);
+          breakSlot(h, 'b:account');
+          codexWrites(h, h.a);
+          damageA(h);
+          const active = activeLogin(h);
+          assert.deepEqual(fenced(await h.recover()), { state: 'fenced', reason: 'target-changed', message: recoveryMessage('target-changed'),
+            accounts: ['a:account', 'b:account'] }, `journal ${name}`);
+          assert.deepEqual(unresolvedJournal(h), { attempt: j.attemptId, reason: 'target-changed', accounts: ['a:account', 'b:account'] }, `journal ${name}`);
+          assert.deepEqual(activeLogin(h), active, `journal ${name}`);
+          assert.deepEqual(switchRows(h.db), [], `journal ${name}`);
+        } finally { close(h); }
+      }
+    }
+  });
+
+  it('a fence kept because slot B is unreadable still fences the live identity\'s managed slot (§3.1, C6-20 r3)', async () => {
+    const h = switchHarness();
+    try {
+      importActiveCodexSlot(observedDocument('c', 'c0'), { store: h.store, keychain: h.keychain, now: () => 2 });
+      h.store.setActiveLogin('openai-codex', 'a:account', 'import', 3);
+      const fence = configFence(h, 'slot-split');
+      breakSlot(h, 'b:account');
+      codexWrites(h, observedDocument('c', 'c-live'));
+      assert.deepEqual(fenced(await h.recover()), { state: 'fenced', reason: 'slot-split', message: recoveryMessage('slot-split'),
+        accounts: ['a:account', 'b:account', 'c:account'] });
+      assert.deepEqual(JSON.parse(h.store.getConfig('codex.recoveryFence')!), { ...fence, involvedAccounts: ['a:account', 'b:account', 'c:account'] });
+      assert.deepEqual(await refresh(h, 'c:account'), refused('slot-split'));
+      assert.deepEqual(switchRows(h.db).filter(({ steps_json }) => String(steps_json).includes('"fence"')), []);
+    } finally { close(h); }
+  });
 });
