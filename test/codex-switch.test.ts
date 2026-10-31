@@ -1869,6 +1869,17 @@ describe('switchCodex landed and not-landed — C6-18', () => {
     } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
   });
 
+  it('a wiped verify after the rename records no active login', async () => {
+    const h = switchHarness(); let verify = false;
+    try {
+      const wiped = { status: 'wiped', error: { ok: false, error: 'tokens-empty', status: 'wiped' } } as const;
+      const result = await h.runWith({ hooks: { afterRename: () => { verify = true; } }, readLive: async () => verify
+        ? wiped : readCodexAuthStableWithStat(h.authPath, { delayMs: 0 }) });
+      assert.equal(result.outcome, 'failed');
+      assert.equal(h.store.getCodexActiveLogin(), null);
+    } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
   it('an unresolved target-ancestor journal does not let a later import of those bytes resolve as ok', async () => {
     const h = switchHarness();
     try {
