@@ -518,6 +518,7 @@ describe('bindDetectAndResync + MockKeychain', () => {
 
     const unlisted = await fn('acct-b', 'anthropic');
     assert.equal(unlisted.resynced, false, unlisted.reason);
+    assert.match(unlisted.reason ?? '', /not exclusively QLB-owned/);
     assert.equal(parseGrant(kc.getSync(qlbKeychainService('anthropic', 'acct-b'), 'acct-b')).access, 'old');
     const listed = await fn('acct-a', 'anthropic');
     assert.equal(listed.resynced, true, listed.reason);
@@ -532,6 +533,7 @@ describe('bindDetectAndResync + MockKeychain', () => {
     store.upsertMigration('pi-xai', 'QLB_OWNED', JSON.stringify(journal));
     const xai = await fn(xaiId, 'xai');
     assert.equal(xai.resynced, false, xai.reason);
+    assert.match(xai.reason ?? '', /not exclusively QLB-owned/);
     assert.equal(parseGrant(kc.getSync(qlbKeychainService('xai', xaiId), xaiLabel)).access, 'old');
     store.close();
   });
