@@ -105,6 +105,24 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/** Step 6: wait for a refresh holder, then callers must re-read from step 1. */
+export async function waitForRefreshLease(
+  store: Pick<Store, 'getGrantGeneration' | 'getLease'>,
+  accountId: string,
+  gen: number,
+  opts: { timeoutMs: number; pollMs: number },
+): Promise<'advanced' | 'expired' | 'timeout'> {
+  const start = Date.now();
+  while (Date.now() - start < opts.timeoutMs) {
+    await sleep(opts.pollMs);
+    const current = store.getGrantGeneration(accountId);
+    if (current != null && current > gen) return 'advanced';
+    const lease = store.getLease(refreshLeaseName(accountId));
+    if (!lease || lease.until <= Date.now()) return 'expired';
+  }
+  return 'timeout';
+}
+
 function isAbortError(err: unknown): boolean {
   if (!err || typeof err !== 'object') return false;
   const name = (err as { name?: string }).name;
@@ -388,18 +406,13 @@ export class RefreshLease {
     }
   }
 
-  private async waitForRefresh(
+  private waitForRefresh(
     accountId: string,
     gen: number,
   ): Promise<'advanced' | 'expired' | 'timeout'> {
-    const start = Date.now();
-    while (Date.now() - start < this.waitTimeoutMs) {
-      await sleep(this.waitPollMs);
-      const current = this.store.getGrantGeneration(accountId);
-      if (current != null && current > gen) return 'advanced';
-      const lease = this.store.getLease(refreshLeaseName(accountId));
-      if (!lease || lease.until <= Date.now()) return 'expired';
-    }
-    return 'timeout';
+    return waitForRefreshLease(this.store, accountId, gen, {
+      timeoutMs: this.waitTimeoutMs,
+      pollMs: this.waitPollMs,
+    });
   }
 }

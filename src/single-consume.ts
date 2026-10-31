@@ -1,16 +1,23 @@
 // Single-account refresh consume gate for xAI and Kimi Coding (spec §4.5).
 // The lock, Keychain, HTTP transport, clock and durable side effects are injectable.
 
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { CREDENTIALS_STALENESS_MS, withProperLockfile } from './cc-locks';
 import { platformKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from './keychain';
 import { ADAPTER_ACCOUNT_IDS } from './migration';
-import { parseGrant } from './refresh-lease';
+import {
+  DEFAULT_HEARTBEAT_MS,
+  DEFAULT_LEASE_TTL_MS,
+  DEFAULT_WAIT_POLL_MS,
+  DEFAULT_WAIT_TIMEOUT_MS,
+  parseGrant,
+  waitForRefreshLease,
+} from './refresh-lease';
 import { sharedSingleGrantCoords, resolveSingleGrantKeychain } from './single-grant-ownership';
-import type { Store } from './store';
+import { refreshLeaseName, type Store } from './store';
 import { refreshKimiCodingCredential } from './oauth/kimi-coding-refresh';
 import {
   refreshXaiCredential,
@@ -44,7 +51,18 @@ export interface SingleConsumeLock {
   withLock<T>(provider: SingleConsumeProvider, work: () => Promise<T>): Promise<T>;
 }
 
-export type SingleConsumeStore = Pick<Store, 'getMigration' | 'getConfig' | 'getGrantGeneration' | 'repairGrantGeneration' | 'runImmediate' | 'bumpGrantGeneration'>;
+export type SingleConsumeStore = Pick<Store,
+  'getMigration' | 'getConfig' | 'getGrantGeneration' | 'repairGrantGeneration'
+  | 'runImmediate' | 'bumpGrantGeneration'
+> & Partial<Pick<Store,
+  'getLease' | 'acquireRefreshLease' | 'heartbeatRefreshLease'
+  | 'releaseRefreshLease' | 'deleteLeaseIfHolder'
+>>;
+
+type RefreshLeaseStore = Required<Pick<SingleConsumeStore,
+  'getLease' | 'acquireRefreshLease' | 'heartbeatRefreshLease'
+  | 'releaseRefreshLease' | 'deleteLeaseIfHolder'
+>>;
 
 export interface SingleConsumeDeps {
   keychain?: SingleStashKeychain;
@@ -58,8 +76,11 @@ export interface SingleConsumeDeps {
   env?: NodeJS.ProcessEnv;
   /** Gate refresh uses 60 s; the automatic loop supplies its 10-minute horizon. */
   dueWithinMs?: number;
-  /** Executes the provider POST; never supplied by production tests without a fake. */
-  refresh: (credential: OAuthCredential) => Promise<SingleRefreshResult>;
+  /**
+   * Executes the provider POST; never supplied by production tests without a fake.
+   * The signal aborts when a generic-held POST loses its refresh lease.
+   */
+  refresh: (credential: OAuthCredential, opts?: { signal?: AbortSignal }) => Promise<SingleRefreshResult>;
   /** Best-effort audit edge, called only after the replacement is durable. */
   onLineage?: (row: { provider: SingleConsumeProvider; fromFp: string; toFp: string }) => void;
   onDead?: (provider: SingleConsumeProvider) => void;
@@ -75,6 +96,9 @@ export interface SingleConsumeResult {
 interface StoredCredential { credential: OAuthCredential; bytes: string; }
 
 const GATE_FRESHEN_MS = 60_000;
+const PROCESS_UUID = randomUUID();
+/** A lost race inside the POST window: discard this pass and re-read, as RefreshLease's goto 1. */
+const RELOOP = Symbol('reloop');
 
 function credentialService(provider: SingleConsumeProvider): string {
   return qlbKeychainService(provider, 'default');
@@ -248,6 +272,7 @@ function genericWrite(
   baseline: GenericBaseline | null,
   keychain: SingleStashKeychain,
   deps: Pick<SingleConsumeDeps, 'store' | 'home' | 'p7aJournalPath'>,
+  refreshLeaseHolder?: string,
 ): GenericBaseline & StoredCredential {
   const { store } = deps;
   return store.runImmediate(() => {
@@ -256,6 +281,11 @@ function genericWrite(
     if (!baseline) throw new SingleConsumeFailure('cas-conflict');
     const accountId = ADAPTER_ACCOUNT_IDS[provider];
     if (store.getGrantGeneration(accountId) !== baseline.generation) throw new SingleConsumeFailure('cas-conflict');
+    // A POST made under the refresh lease writes only while this holder still holds it.
+    if (refreshLeaseHolder
+      && (store as RefreshLeaseStore).getLease(refreshLeaseName(accountId))?.holder_id !== refreshLeaseHolder) {
+      throw new SingleConsumeFailure('cas-conflict');
+    }
     let bytes: string;
     try { bytes = keychain.getSync(credentialService(provider), QLB_KEYCHAIN_ACCOUNT); } catch {
       throw new SingleConsumeFailure('cas-conflict');
@@ -266,6 +296,7 @@ function genericWrite(
     const written = JSON.stringify(stamped);
     keychain.setSync(credentialService(provider), QLB_KEYCHAIN_ACCOUNT, written);
     if (store.bumpGrantGeneration(accountId, baseline.generation) !== 1) throw new SingleConsumeFailure('cas-conflict');
+    if (refreshLeaseHolder) (store as RefreshLeaseStore).deleteLeaseIfHolder(refreshLeaseName(accountId), refreshLeaseHolder);
     return { generation, bytes: written, credential: stamped };
   });
 }
@@ -287,6 +318,7 @@ export async function consumeSingleCredential(
   const lock = deps.lock ?? defaultSingleConsumeLock(home);
   const dueWithinMs = deps.dueWithinMs ?? GATE_FRESHEN_MS;
   return lock.withLock(provider, async () => {
+    for (;;) {
     // A generic-held item may not spend a refresh token unless W2 admits it.
     const owner = sharedItemOwner(provider, deps);
     let current = readStoredCredential(provider, keychain);
@@ -334,11 +366,59 @@ export async function consumeSingleCredential(
 
     const consumedFp = credentialLineage(current.credential);
     const consumedContentFingerprint = contentFingerprint(current.bytes);
+    const leaseAbort = new AbortController();
+    let refreshLeaseHolder: string | undefined;
+    let leaseReleased = false;
+    let heartbeat: NodeJS.Timeout | undefined;
+    if (owner === 'generic') {
+      const accountId = ADAPTER_ACCOUNT_IDS[provider];
+      const leaseStore = deps.store as SingleConsumeStore & RefreshLeaseStore;
+      const holderId = `${PROCESS_UUID}:${randomUUID()}`;
+      const acquired = leaseStore.acquireRefreshLease(
+        accountId,
+        holderId,
+        process.pid,
+        baseline!.generation,
+        DEFAULT_LEASE_TTL_MS,
+      );
+      if (acquired === 'stale_gen') throw new SingleConsumeFailure('cas-conflict');
+      if (acquired === 'busy') {
+        const waited = await waitForRefreshLease(leaseStore, accountId, baseline!.generation, {
+          timeoutMs: DEFAULT_WAIT_TIMEOUT_MS,
+          pollMs: DEFAULT_WAIT_POLL_MS,
+        });
+        if (waited === 'timeout') throw new SingleConsumeFailure('credential-unavailable');
+        continue;
+      }
+      refreshLeaseHolder = holderId;
+      heartbeat = setInterval(() => {
+        // A throw here would be an uncaught exception mid-POST; treat it as a lost lease.
+        let held = false;
+        try {
+          held = leaseStore.heartbeatRefreshLease(accountId, holderId, baseline!.generation, DEFAULT_LEASE_TTL_MS);
+        } catch {
+          warn(deps, 'refresh lease heartbeat failed');
+        }
+        if (!held) {
+          clearInterval(heartbeat);
+          leaseAbort.abort('lease_lost_or_generation_moved');
+        }
+      }, DEFAULT_HEARTBEAT_MS);
+    }
+
     // The handler is installed before the POST and stays in place until the
     // response is either primary-persisted or durably stashed.
-    return deferTermination(async () => {
-      const refreshed = await deps.refresh(current.credential);
+    let result: SingleConsumeResult | typeof RELOOP;
+    try {
+    result = await deferTermination(async (): Promise<SingleConsumeResult | typeof RELOOP> => {
+      const refreshed = await deps.refresh(current.credential, { signal: leaseAbort.signal });
       if (refreshed.kind === 'dead') {
+        // invalid_grant after the lease was lost or G moved is a lost race, not a revocation.
+        if (baseline && (leaseAbort.signal.aborted
+          || deps.store.getGrantGeneration(ADAPTER_ACCOUNT_IDS[provider]) !== baseline.generation)) {
+          warn(deps, 'invalid_grant after a lost refresh race');
+          return RELOOP;
+        }
         notifyDead(provider, deps);
         throw new SingleConsumeFailure('refresh-dead');
       }
@@ -350,7 +430,8 @@ export async function consumeSingleCredential(
         await persistStash(provider, refreshed.credential as StashCredential, consumedFp, keychain, { home, now: deps.now });
         throw error;
       }
-      if (contentFingerprint(afterPost.bytes) !== consumedContentFingerprint) {
+      // A POST whose lease was lost never writes the primary; its pair may be the only live one.
+      if (leaseAbort.signal.aborted || contentFingerprint(afterPost.bytes) !== consumedContentFingerprint) {
         await persistStash(provider, refreshed.credential as StashCredential, consumedFp, keychain, { home, now: deps.now });
         if (winnerFor(snapshot, afterPost.credential, now())) return { credential: afterPost.credential, outcome: 'winner' };
         throw new SingleConsumeFailure('cas-conflict');
@@ -359,11 +440,13 @@ export async function consumeSingleCredential(
       let persisted: OAuthCredential;
       try {
         persisted = sharedItemOwner(provider, deps) === 'generic'
-          ? genericWrite(provider, refreshed.credential, baseline, keychain, deps).credential
+          ? genericWrite(provider, refreshed.credential, baseline, keychain, deps, refreshLeaseHolder).credential
           : (() => {
             keychain.setSync(credentialService(provider), QLB_KEYCHAIN_ACCOUNT, JSON.stringify(refreshed.credential));
             return refreshed.credential;
           })();
+        // genericWrite deleted the lease inside its committed transaction.
+        leaseReleased = true;
       } catch (error) {
         await persistStash(provider, refreshed.credential as StashCredential, consumedFp, keychain, { home, now: deps.now });
         if (error instanceof SingleConsumeFailure) throw error;
@@ -372,12 +455,26 @@ export async function consumeSingleCredential(
       notifyLineage(provider, consumedFp, persisted, deps);
       return { credential: persisted, outcome: 'refreshed' };
     });
+    } finally {
+      if (heartbeat) clearInterval(heartbeat);
+      if (refreshLeaseHolder && !leaseReleased) {
+        // A release failure must not replace the outcome; the lease then lapses by TTL.
+        try { (deps.store as RefreshLeaseStore).releaseRefreshLease(ADAPTER_ACCOUNT_IDS[provider], refreshLeaseHolder); } catch {
+          warn(deps, 'refresh lease release failed');
+        }
+      }
+    }
+    if (result === RELOOP) continue;
+    return result;
+    }
   });
 }
 
-async function fetchTransport(request: { url: string; method: 'POST'; headers: Record<string, string>; body: string }): Promise<{ status: number; body: unknown }> {
+async function fetchTransport(request: { url: string; method: 'POST'; headers: Record<string, string>; body: string; signal?: AbortSignal }): Promise<{ status: number; body: unknown }> {
+  const timeout = AbortSignal.timeout(30_000);
   const response = await fetch(request.url, {
-    method: request.method, headers: request.headers, body: request.body, signal: AbortSignal.timeout(30_000),
+    method: request.method, headers: request.headers, body: request.body,
+    signal: request.signal ? AbortSignal.any([request.signal, timeout]) : timeout,
   });
   let body: unknown = null;
   try { body = await response.json(); } catch { /* the classifier fails closed on malformed JSON */ }
@@ -407,7 +504,9 @@ export async function consumeXaiCredential(
   return singleCredentialFromResult(await consumeSingleCredential('xai', observed, {
     ...deps,
     keychain,
-    refresh: (credential) => refreshXaiCredential(credential, { transport: deps.transport ?? { request: fetchTransport }, now: deps.now }),
+    refresh: (credential, opts) => refreshXaiCredential(credential, {
+      transport: deps.transport ?? { request: fetchTransport }, now: deps.now, signal: opts?.signal,
+    }),
   }));
 }
 
@@ -426,8 +525,8 @@ export async function consumeKimiCodingCredential(
   return singleCredentialFromResult(await consumeSingleCredential('kimi-coding', observed, {
     ...deps,
     keychain,
-    refresh: (credential) => refreshKimiCodingCredential(credential, {
-      transport: deps.transport ?? { request: fetchTransport }, now: deps.now, sleep: deps.sleep,
+    refresh: (credential, opts) => refreshKimiCodingCredential(credential, {
+      transport: deps.transport ?? { request: fetchTransport }, now: deps.now, sleep: deps.sleep, signal: opts?.signal,
       oauthHost: env.KIMI_CODE_OAUTH_HOST ?? env.KIMI_OAUTH_HOST,
     }),
   }));
