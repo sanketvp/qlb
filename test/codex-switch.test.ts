@@ -2547,6 +2547,27 @@ describe('reconcileCodexRecovery — C6-20', () => {
     } finally { close(h); }
   });
 
+  it('a pending re-check of a journal keeps the earlier unresolved accounts', async () => {
+    const h = switchHarness();
+    try {
+      importActiveCodexSlot(observedDocument('c', 'c0'), { store: h.store, keychain: h.keychain, now: () => 2 });
+      h.store.setActiveLogin('openai-codex', 'a:account', 'import', 3);
+      const j = install(h);
+      // First check: slot C is split and Codex is on C′ ⇒ slot-split {A, B, C}.
+      h.keychain.setSync(qlbKeychainService('openai-codex', 'c:account'), QLB_KEYCHAIN_ACCOUNT, JSON.stringify(observedDocument('c', 'c-killed')));
+      writeFileSync(h.authPath, JSON.stringify(observedDocument('c', 'c-live')));
+      assert.deepEqual(fenced(await h.recover()), { state: 'fenced', reason: 'slot-split', message: recoveryMessage('slot-split'),
+        accounts: ['a:account', 'b:account', 'c:account'] });
+      // Second check: the verify read is unreadable ⇒ pending, which keeps the fence.
+      const pending = await h.recover({ readLive: async () => ({ status: 'unreadable', code: 'EACCES' }) });
+      assert.deepEqual(fenced(pending), { state: 'fenced', reason: 'journal-verify-unreadable', message: recoveryMessage('journal-verify-unreadable'),
+        accounts: ['a:account', 'b:account', 'c:account'] });
+      assert.deepEqual(unresolvedJournal(h), { attempt: j.attemptId, reason: 'slot-split', accounts: ['a:account', 'b:account', 'c:account'] });
+      assert.deepEqual(await refresh(h, 'c:account'), refused('slot-split'));
+      assert.deepEqual(switchRows(h.db), []);
+    } finally { close(h); }
+  });
+
   it('a wiped auth.json at recovery records failed wiped and no active login', async () => {
     const h = switchHarness();
     try {

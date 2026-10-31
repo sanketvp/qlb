@@ -1114,7 +1114,7 @@ export async function reconcileCodexRecoveryLocked(
     const verdict = resolveRecoveryVerdict(classified, attribution, {
       phase: 'recovery', journal, targetSlotFingerprint: deps.store.getCodexSlot(journal.to)?.fingerprint ?? '', slotHeads, live,
     });
-    if (verdict.class === 'pending') return fenced(`journal-verify-${verdict.status}`, accountSet(journal));
+    if (verdict.class === 'pending') return fenced(`journal-verify-${verdict.status}`, accountSet(journal, journal.unresolved?.involvedAccounts));
     if (verdict.class === 'unresolved') {
       assertHeld(); held.assertHeld();
       if (!markCodexSwitchJournalUnresolved(held, journal.attemptId, verdict.reason, verdict.involvedAccounts, options)) {
