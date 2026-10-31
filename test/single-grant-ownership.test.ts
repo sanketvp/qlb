@@ -3,6 +3,8 @@ import { describe, it } from 'node:test';
 import {
   classifySingleGrant,
   isSingleGrantAtRest,
+  resolveSingleGrantKeychain,
+  sharedSingleGrantCoords,
   type HandbackMarker,
   type RollbackDecision,
   type SingleGrantOwnershipFacts,
@@ -42,6 +44,63 @@ function facts(overrides: Partial<SingleGrantOwnershipFacts> = {}): SingleGrantO
     hasStaging: false,
     ...overrides,
   };
+}
+
+const providers = ['xai', 'kimi-coding'] as const;
+
+function journalAccount(provider: (typeof providers)[number]): Record<string, unknown> {
+  const id = provider === 'xai' ? 'xai-default' : 'kimi-default';
+  const label = provider === 'xai' ? 'Grok (xAI)' : 'Kimi K3';
+  return { id, provider, label, fingerprint: 'fake-fingerprint' };
+}
+
+for (const provider of providers) {
+  it(`T-KC1 [${provider}] a journal account resolves to its recorded shared Keychain item, else to the legacy adapter item`, () => {
+    const account = journalAccount(provider);
+    assert.deepEqual(
+      resolveSingleGrantKeychain(provider, {
+        ...account,
+        keychain: sharedSingleGrantCoords(provider),
+      }),
+      sharedSingleGrantCoords(provider),
+    );
+    assert.deepEqual(resolveSingleGrantKeychain(provider, account), {
+      service: `qlb:${provider}:${account.id}`,
+      account: account.label,
+    });
+    // As today's keychainCoords: an empty recorded label falls back to the id.
+    assert.deepEqual(resolveSingleGrantKeychain(provider, { ...account, label: '' }), {
+      service: `qlb:${provider}:${account.id}`,
+      account: account.id,
+    });
+  });
+
+  it(`T-KC2 [${provider}] a recorded Keychain coordinate other than the provider's shared item is refused`, () => {
+    const account = journalAccount(provider);
+    const otherProvider = provider === 'xai' ? 'kimi-coding' : 'xai';
+    const legacy = {
+      service: `qlb:${provider}:${account.id}`,
+      account: account.label,
+    };
+    const invalid = [
+      { ...account, keychain: legacy },
+      { ...account, keychain: sharedSingleGrantCoords(otherProvider) },
+      { ...account, keychain: { service: `qlb:${provider}:default`, account: 'xai-default' } },
+      { ...account, keychain: { ...sharedSingleGrantCoords(provider), extra: true } },
+      { ...account, keychain: { service: `qlb:${provider}:default` } },
+      { ...account, keychain: 'qlb:invalid' },
+      undefined,
+      { ...account, provider: otherProvider },
+      { ...account, id: 'mismatched-id' },
+      // Today's journal readers refuse a legacy account without a string label.
+      { id: account.id, provider: account.provider, fingerprint: account.fingerprint },
+      { ...account, label: 42 },
+    ];
+
+    for (const value of invalid) {
+      assert.throws(() => resolveSingleGrantKeychain(provider, value), /journal-keychain-invalid/);
+    }
+  });
 }
 
 describe('single-grant ownership classifier (T-CL)', () => {
