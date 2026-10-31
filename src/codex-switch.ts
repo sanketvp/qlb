@@ -63,7 +63,7 @@ export interface CodexSwitchDeps {
   list?: () => Promise<CodexProcess[]>;
   transport?: CodexConsumeOptions['transport'];
   journalDir?: string;
-  /** Command-owned lifecycle admission; it runs before every switch phase. */
+  /** Command-owned lifecycle admission, checked once, before the preflight (§3 step 2). */
   admitted?: () => { ok: boolean; reason?: string } | Promise<{ ok: boolean; reason?: string }>;
   /** Test seams for ordered switch phases; production leaves them unset. */
   hooks?: {
