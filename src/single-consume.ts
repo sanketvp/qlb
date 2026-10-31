@@ -2,10 +2,14 @@
 // The lock, Keychain, HTTP transport, clock and durable side effects are injectable.
 
 import { createHash } from 'node:crypto';
+import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { CREDENTIALS_STALENESS_MS, withProperLockfile } from './cc-locks';
 import { platformKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from './keychain';
+import { ADAPTER_ACCOUNT_IDS } from './migration';
+import { sharedSingleGrantCoords, resolveSingleGrantKeychain } from './single-grant-ownership';
+import type { Store } from './store';
 import { refreshKimiCodingCredential } from './oauth/kimi-coding-refresh';
 import {
   refreshXaiCredential,
@@ -29,7 +33,7 @@ export type SingleRefreshResult = OAuthRefreshResult;
 export type CredentialSnapshot = Pick<OAuthCredential, 'access' | 'expires'>;
 
 export class SingleConsumeFailure extends Error {
-  constructor(readonly code: 'credential-unavailable' | 'refresh-dead' | 'refresh-failed' | 'persist-failed' | 'cas-conflict' | 'stash-unreadable' | 'successor-unpersisted') {
+  constructor(readonly code: 'credential-unavailable' | 'refresh-dead' | 'refresh-failed' | 'persist-failed' | 'cas-conflict' | 'stash-unreadable' | 'successor-unpersisted' | 'generic-ownership-unreadable' | 'generic-ownership-marker' | 'dual-ownership') {
     super(code);
     this.name = 'SingleConsumeFailure';
   }
@@ -41,6 +45,10 @@ export interface SingleConsumeLock {
 
 export interface SingleConsumeDeps {
   keychain?: SingleStashKeychain;
+  /** Production callers supply the ownership authority for the shared item. */
+  store?: Pick<Store, 'getMigration' | 'getConfig' | 'getGrantGeneration' | 'runImmediate' | 'bumpGrantGeneration'>;
+  /** P7a's journal directory; its presence is an ownership fact. */
+  p7aJournalPath?: string;
   lock?: SingleConsumeLock;
   now?: () => number;
   home?: string;
@@ -172,6 +180,56 @@ function stashFailure(error: unknown): SingleConsumeFailure {
   return new SingleConsumeFailure('stash-unreadable');
 }
 
+type SharedItemOwner = 'p7a' | 'generic';
+
+function p7aJournalPath(provider: SingleConsumeProvider, deps: Pick<SingleConsumeDeps, 'home' | 'p7aJournalPath'>): string {
+  return join(deps.p7aJournalPath ?? join(resolveQlbHome(deps.home), '.qlb', 'journal'), `pi-migrate-${provider}.json`);
+}
+
+/** Resolves the owner facts before a P13 write; malformed generic evidence fails closed. */
+function sharedItemOwner(provider: SingleConsumeProvider, deps: Pick<SingleConsumeDeps, 'store' | 'home' | 'p7aJournalPath'>): SharedItemOwner {
+  const row = deps.store?.getMigration(`pi-${provider}`);
+  if (row?.state !== 'QLB_OWNED') return 'p7a';
+
+  let detail: unknown;
+  try { detail = JSON.parse(row.detail_json); } catch { throw new SingleConsumeFailure('generic-ownership-unreadable'); }
+  if (!detail || typeof detail !== 'object' || Array.isArray(detail)) throw new SingleConsumeFailure('generic-ownership-unreadable');
+  const accounts = (detail as { accounts?: unknown }).accounts;
+  const account = Array.isArray(accounts) ? accounts[0] : undefined;
+  let coords;
+  try { coords = resolveSingleGrantKeychain(provider, account); } catch { throw new SingleConsumeFailure('generic-ownership-unreadable'); }
+  const shared = sharedSingleGrantCoords(provider);
+  if (coords.service !== shared.service || coords.account !== shared.account) return 'p7a';
+
+  const p7aOwned = deps.store?.getConfig(`pi.${provider}.state`) === 'migrated'
+    || existsSync(p7aJournalPath(provider, deps));
+  if (p7aOwned) throw new SingleConsumeFailure('dual-ownership');
+  if (['intent', 'rollbackDecision', 'handback'].some((key) => Object.prototype.hasOwnProperty.call(detail, key))) {
+    throw new SingleConsumeFailure('generic-ownership-marker');
+  }
+  return 'generic';
+}
+
+function genericWrite(
+  provider: SingleConsumeProvider,
+  credential: OAuthCredential,
+  keychain: SingleStashKeychain,
+  deps: Pick<SingleConsumeDeps, 'store' | 'home' | 'p7aJournalPath'>,
+): OAuthCredential {
+  const store = deps.store;
+  if (!store) throw new SingleConsumeFailure('generic-ownership-unreadable');
+  return store.runImmediate(() => {
+    if (sharedItemOwner(provider, deps) !== 'generic') throw new SingleConsumeFailure('generic-ownership-unreadable');
+    const accountId = ADAPTER_ACCOUNT_IDS[provider];
+    const generation = store.getGrantGeneration(accountId);
+    if (generation === null) throw new SingleConsumeFailure('generic-ownership-unreadable');
+    const stamped = { ...credential, generation: generation + 1, writtenBy: 'single-consume' } as OAuthCredential;
+    keychain.setSync(credentialService(provider), QLB_KEYCHAIN_ACCOUNT, JSON.stringify(stamped));
+    if (store.bumpGrantGeneration(accountId, generation) !== 1) throw new SingleConsumeFailure('cas-conflict');
+    return stamped;
+  });
+}
+
 /**
  * Consume one single-account refresh token. Every contender re-reads inside
  * the provider consume lock; the loser observes the persisted winner rather
@@ -189,11 +247,20 @@ export async function consumeSingleCredential(
   const lock = deps.lock ?? defaultSingleConsumeLock(home);
   const dueWithinMs = deps.dueWithinMs ?? GATE_FRESHEN_MS;
   return lock.withLock(provider, async () => {
+    // A generic-held item may not spend a refresh token unless W2 admits it.
+    sharedItemOwner(provider, deps);
     let current = readStoredCredential(provider, keychain);
     const adoptedFromFp = credentialLineage(current.credential);
     let adopted: StashCredential | null;
     try {
-      adopted = await adoptStashedSuccessor(provider, current.credential as StashCredential, keychain, { home, warn: deps.warn });
+      adopted = await adoptStashedSuccessor(provider, current.credential as StashCredential, keychain, {
+        home,
+        warn: deps.warn,
+        installPrimary: (credential) => {
+          if (sharedItemOwner(provider, deps) === 'generic') genericWrite(provider, credential as OAuthCredential, keychain, deps);
+          else keychain.setSync(credentialService(provider), QLB_KEYCHAIN_ACCOUNT, JSON.stringify(credential));
+        },
+      });
     } catch (error) {
       throw stashFailure(error);
     }
@@ -237,14 +304,21 @@ export async function consumeSingleCredential(
         throw new SingleConsumeFailure('cas-conflict');
       }
 
+      let persisted: OAuthCredential;
       try {
-        keychain.setSync(credentialService(provider), QLB_KEYCHAIN_ACCOUNT, JSON.stringify(refreshed.credential));
-      } catch {
+        persisted = sharedItemOwner(provider, deps) === 'generic'
+          ? genericWrite(provider, refreshed.credential, keychain, deps)
+          : (() => {
+            keychain.setSync(credentialService(provider), QLB_KEYCHAIN_ACCOUNT, JSON.stringify(refreshed.credential));
+            return refreshed.credential;
+          })();
+      } catch (error) {
         await persistStash(provider, refreshed.credential as StashCredential, consumedFp, keychain, { home, now: deps.now });
+        if (error instanceof SingleConsumeFailure) throw error;
         throw new SingleConsumeFailure('persist-failed');
       }
-      notifyLineage(provider, consumedFp, refreshed.credential, deps);
-      return { credential: refreshed.credential, outcome: 'refreshed' };
+      notifyLineage(provider, consumedFp, persisted, deps);
+      return { credential: persisted, outcome: 'refreshed' };
     });
   });
 }

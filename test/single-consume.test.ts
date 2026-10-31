@@ -16,6 +16,9 @@ import { MockKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from '../src/k
 import { refreshXaiCredential, XAI_CLIENT_ID, XAI_REFRESH_URL } from '../src/oauth/xai-refresh';
 import { KIMI_CODING_CLIENT_ID, refreshKimiCodingCredential } from '../src/oauth/kimi-coding-refresh';
 import { listStashes, recordStash } from '../src/unclaimed-index';
+import { ADAPTER_ACCOUNT_IDS } from '../src/migration';
+import { sharedSingleGrantCoords } from '../src/single-grant-ownership';
+import { Store } from '../src/store';
 
 const NOW = 1_730_000_000_000;
 
@@ -524,6 +527,107 @@ describe('single-account consume gate', () => {
     assert.equal(new URLSearchParams(request?.body).get('client_id'), KIMI_CODING_CLIENT_ID);
     assert.deepEqual(result, { kind: 'success', credential: credential('access-after', 'refresh-after', NOW + 3_600_000) });
   });
+
+  for (const provider of ['xai', 'kimi-coding'] as const) {
+    it(`P13 refresh of a generic-held shared item advances the generation and stamps the grant [${provider}]`, async () => {
+      const home = await mkdtemp(join(tmpdir(), 'qlb-single-consume-'));
+      const keychain = new MockKeychain();
+      const store = new Store(':memory:');
+      const accountId = ADAPTER_ACCOUNT_IDS[provider];
+      const service = qlbKeychainService(provider, 'default');
+      store.upsertAccount(accountId, provider, provider);
+      store.upsertMigration(`pi-${provider}`, 'QLB_OWNED', JSON.stringify({ accounts: [{ id: accountId, provider, label: provider, keychain: sharedSingleGrantCoords(provider) }] }));
+      keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, JSON.stringify({ ...credential('before', 'refresh-before'), generation: 0 }));
+      try {
+        await consumeSingleCredential(provider, credential('before', 'refresh-before'), {
+          keychain, home, store, lock: createInMemorySingleConsumeLock(), now: () => NOW,
+          refresh: async () => ({ kind: 'success', credential: credential('after', 'refresh-after', NOW + 3_600_000) }),
+        });
+        const written = JSON.parse(keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT));
+        assert.equal(store.getGrantGeneration(accountId), 1);
+        assert.equal(written.generation, 1);
+        assert.equal(written.writtenBy, 'single-consume');
+      } finally { store.close(); await rm(home, { recursive: true, force: true }); }
+    });
+
+    it(`P13 refuses a generic-held shared item under a hand-back marker and stashes the issued pair [${provider}]`, async () => {
+      const home = await mkdtemp(join(tmpdir(), 'qlb-single-consume-'));
+      const keychain = new MockKeychain();
+      const store = new Store(':memory:');
+      const accountId = ADAPTER_ACCOUNT_IDS[provider];
+      store.upsertAccount(accountId, provider, provider);
+      const detail = { accounts: [{ id: accountId, provider, label: provider, keychain: sharedSingleGrantCoords(provider) }] };
+      store.upsertMigration(`pi-${provider}`, 'QLB_OWNED', JSON.stringify(detail));
+      keychain.setSync(qlbKeychainService(provider, 'default'), QLB_KEYCHAIN_ACCOUNT, JSON.stringify(credential('before', 'refresh-before')));
+      try {
+        await assert.rejects(consumeSingleCredential(provider, credential('before', 'refresh-before'), {
+          keychain, home, store, lock: createInMemorySingleConsumeLock(), now: () => NOW,
+          refresh: async () => {
+            store.upsertMigration(`pi-${provider}`, 'QLB_OWNED', JSON.stringify({ ...detail, handback: {} }));
+            return { kind: 'success', credential: credential('after', 'refresh-after', NOW + 3_600_000) };
+          },
+        }), /generic-ownership-marker/);
+        assert.equal((await listStashes(root(home), provider, 'default')).length, 1);
+      } finally { store.close(); await rm(home, { recursive: true, force: true }); }
+    });
+
+    it(`P13 is unchanged when no generic journal exists [${provider}]`, async () => {
+      const home = await mkdtemp(join(tmpdir(), 'qlb-single-consume-'));
+      const keychain = new MockKeychain();
+      const store = new Store(':memory:');
+      const accountId = ADAPTER_ACCOUNT_IDS[provider];
+      store.upsertAccount(accountId, provider, provider);
+      keychain.setSync(qlbKeychainService(provider, 'default'), QLB_KEYCHAIN_ACCOUNT, JSON.stringify(credential('before', 'refresh-before')));
+      try {
+        await consumeSingleCredential(provider, credential('before', 'refresh-before'), {
+          keychain, home, store, lock: createInMemorySingleConsumeLock(), now: () => NOW,
+          refresh: async () => ({ kind: 'success', credential: credential('after', 'refresh-after', NOW + 3_600_000) }),
+        });
+        assert.equal(store.getGrantGeneration(accountId), 0);
+      } finally { store.close(); await rm(home, { recursive: true, force: true }); }
+    });
+
+    it(`P13 follows P7a rules when the generic journal names the shared item but is NATIVE and P7a owns the provider [${provider}]`, async () => {
+      const home = await mkdtemp(join(tmpdir(), 'qlb-single-consume-'));
+      const keychain = new MockKeychain();
+      const store = new Store(':memory:');
+      const accountId = ADAPTER_ACCOUNT_IDS[provider];
+      store.upsertAccount(accountId, provider, provider);
+      store.upsertMigration(`pi-${provider}`, 'NATIVE', JSON.stringify({ accounts: [{ id: accountId, provider, label: provider, keychain: sharedSingleGrantCoords(provider) }] }));
+      store.setConfig(`pi.${provider}.state`, 'migrated');
+      keychain.setSync(qlbKeychainService(provider, 'default'), QLB_KEYCHAIN_ACCOUNT, JSON.stringify(credential('before', 'refresh-before')));
+      try {
+        await consumeSingleCredential(provider, credential('before', 'refresh-before'), {
+          keychain, home, store, lock: createInMemorySingleConsumeLock(), now: () => NOW,
+          refresh: async () => ({ kind: 'success', credential: credential('after', 'refresh-after', NOW + 3_600_000) }),
+        });
+        assert.equal(store.getGrantGeneration(accountId), 0);
+      } finally { store.close(); await rm(home, { recursive: true, force: true }); }
+    });
+
+    it(`P13 refuses when the generic journal is QLB_OWNED and P7a also claims the provider, or the journal is unreadable [${provider}]`, async () => {
+      const home = await mkdtemp(join(tmpdir(), 'qlb-single-consume-'));
+      const keychain = new MockKeychain();
+      const store = new Store(':memory:');
+      const accountId = ADAPTER_ACCOUNT_IDS[provider];
+      store.upsertAccount(accountId, provider, provider);
+      const detail = JSON.stringify({ accounts: [{ id: accountId, provider, label: provider, keychain: sharedSingleGrantCoords(provider) }] });
+      store.upsertMigration(`pi-${provider}`, 'QLB_OWNED', detail);
+      store.setConfig(`pi.${provider}.state`, 'migrated');
+      keychain.setSync(qlbKeychainService(provider, 'default'), QLB_KEYCHAIN_ACCOUNT, JSON.stringify(credential('before', 'refresh-before')));
+      try {
+        await assert.rejects(consumeSingleCredential(provider, credential('before', 'refresh-before'), {
+          keychain, home, store, lock: createInMemorySingleConsumeLock(), now: () => NOW,
+          refresh: async () => assert.fail('ownership refusal precedes POST'),
+        }), /dual-ownership/);
+        store.upsertMigration(`pi-${provider}`, 'QLB_OWNED', 'not-json');
+        await assert.rejects(consumeSingleCredential(provider, credential('before', 'refresh-before'), {
+          keychain, home, store, lock: createInMemorySingleConsumeLock(), now: () => NOW,
+          refresh: async () => assert.fail('ownership refusal precedes POST'),
+        }), /generic-ownership-unreadable/);
+      } finally { store.close(); await rm(home, { recursive: true, force: true }); }
+    });
+  }
 
   it('passes the consumed lineage to a callback after adopting a stashed successor', async () => {
     const home = await mkdtemp(join(tmpdir(), 'qlb-single-consume-'));

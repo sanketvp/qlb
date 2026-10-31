@@ -11,6 +11,10 @@ import {
   persistStash,
   type OAuthCredential,
 } from '../src/single-stash';
+import { consumeSingleCredential, createInMemorySingleConsumeLock } from '../src/single-consume';
+import { ADAPTER_ACCOUNT_IDS } from '../src/migration';
+import { sharedSingleGrantCoords } from '../src/single-grant-ownership';
+import { Store } from '../src/store';
 import { ClaudeSlots, InMemoryClaudeSlotRepository } from '../src/cc-slots';
 import { MockKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from '../src/keychain';
 import { listStashes, recordStash, removeStash } from '../src/unclaimed-index';
@@ -329,6 +333,43 @@ describe('single-grant stash store', () => {
       await rm(home, { recursive: true, force: true });
     }
   });
+
+  for (const provider of ['xai', 'kimi-coding'] as const) {
+    it(`stash adoption into a generic-held shared item advances the generation and stamps the grant [${provider}]`, async () => {
+      const home = await mkdtemp(join(tmpdir(), 'qlb-single-stash-'));
+      const keychain = new StashFailingKeychain();
+      const store = new Store(':memory:');
+      const accountId = ADAPTER_ACCOUNT_IDS[provider];
+      const primary = qlbKeychainService(provider, 'default');
+      const before = credential('before', 'before-refresh');
+      const successor = credential('issued', 'issued-refresh', NOW + 60_000);
+      store.upsertAccount(accountId, provider, provider);
+      store.upsertMigration(`pi-${provider}`, 'QLB_OWNED', JSON.stringify({ accounts: [{ id: accountId, provider, label: provider, keychain: sharedSingleGrantCoords(provider) }] }));
+      keychain.setSync(primary, QLB_KEYCHAIN_ACCOUNT, JSON.stringify({ ...before, generation: 0 }));
+      try {
+        await persistStash(provider, successor, lineage('before-refresh'), keychain, { home, now: () => NOW });
+        const result = await consumeSingleCredential(provider, { access: before.access, expires: before.expires! }, {
+          keychain, home, store, lock: createInMemorySingleConsumeLock(), now: () => NOW,
+          refresh: async () => assert.fail('stash adoption precedes POST'),
+        });
+        const installed = JSON.parse(keychain.getSync(primary, QLB_KEYCHAIN_ACCOUNT));
+        assert.equal(result.outcome, 'winner');
+        assert.equal(store.getGrantGeneration(accountId), 1);
+        assert.equal(installed.generation, 1);
+        assert.equal(installed.writtenBy, 'single-consume');
+
+        store.upsertMigration(`pi-${provider}`, 'NATIVE', JSON.stringify({ accounts: [{ id: accountId, provider, label: provider, keychain: sharedSingleGrantCoords(provider) }] }));
+        store.setConfig(`pi.${provider}.state`, 'migrated');
+        keychain.setSync(primary, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(before));
+        await persistStash(provider, successor, lineage('before-refresh'), keychain, { home, now: () => NOW + 1 });
+        await consumeSingleCredential(provider, { access: before.access, expires: before.expires! }, {
+          keychain, home, store, lock: createInMemorySingleConsumeLock(), now: () => NOW,
+          refresh: async () => assert.fail('stash adoption precedes POST'),
+        });
+        assert.equal(store.getGrantGeneration(accountId), 1);
+      } finally { store.close(); await rm(home, { recursive: true, force: true }); }
+    });
+  }
 
   it('a Linux-style operational keychain error with no fallback file defers and keeps the row', async () => {
     const home = await mkdtemp(join(tmpdir(), 'qlb-single-stash-'));
