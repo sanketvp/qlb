@@ -68,6 +68,11 @@ for (const provider of providers) {
       service: `qlb:${provider}:${account.id}`,
       account: account.label,
     });
+    // As today's keychainCoords: an empty recorded label falls back to the id.
+    assert.deepEqual(resolveSingleGrantKeychain(provider, { ...account, label: '' }), {
+      service: `qlb:${provider}:${account.id}`,
+      account: account.id,
+    });
   });
 
   it(`T-KC2 [${provider}] a recorded Keychain coordinate other than the provider's shared item is refused`, () => {
@@ -87,6 +92,9 @@ for (const provider of providers) {
       undefined,
       { ...account, provider: otherProvider },
       { ...account, id: 'mismatched-id' },
+      // Today's journal readers refuse a legacy account without a string label.
+      { id: account.id, provider: account.provider, fingerprint: account.fingerprint },
+      { ...account, label: 42 },
     ];
 
     for (const value of invalid) {

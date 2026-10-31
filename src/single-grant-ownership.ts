@@ -60,21 +60,27 @@ export function sharedSingleGrantCoords(provider: SingleGrantKeychainProvider): 
 
 /**
  * Resolves a durable single-grant journal account to its Keychain item.
- * Legacy accounts omit `keychain`; any recorded coordinates must be the
- * provider's exact shared item so malformed journals fail closed.
+ * Legacy accounts omit `keychain` and resolve as today's journal readers do
+ * (a string `label`, falling back to the id when empty); any recorded
+ * coordinates must be the provider's exact shared item so malformed journals
+ * fail closed.
  */
 export function resolveSingleGrantKeychain(
   provider: SingleGrantKeychainProvider,
   account: unknown,
 ): SingleGrantKeychainCoords {
   const id = ADAPTER_ACCOUNT_IDS[provider];
-  if (!isRecord(account) || account.provider !== provider || account.id !== id) {
+  if (
+    !isRecord(account)
+    || account.provider !== provider
+    || account.id !== id
+    || typeof account.label !== 'string'
+  ) {
     throw new JournalKeychainInvalidError();
   }
 
   if (!Object.prototype.hasOwnProperty.call(account, 'keychain')) {
-    const label = typeof account.label === 'string' ? account.label : '';
-    return { service: qlbKeychainService(provider, id), account: label || id };
+    return { service: qlbKeychainService(provider, id), account: account.label || id };
   }
 
   const keychain = account.keychain;
