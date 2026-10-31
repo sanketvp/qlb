@@ -138,7 +138,11 @@ process.exit(code);
 `;
 }
 
-function run(provider: Provider, failure: (typeof CAUSES)[number]): {
+function run(
+  provider: Provider,
+  failure: (typeof CAUSES)[number],
+  { absentAtStartup = false }: { absentAtStartup?: boolean } = {},
+): {
   events: Array<{ error?: { errorMessage?: string } }>;
   registrations: string[];
   replaced: boolean;
@@ -166,8 +170,10 @@ function run(provider: Provider, failure: (typeof CAUSES)[number]): {
 
   mkdirSync(gateDir);
   const gate = join(gateDir, 'qlb');
-  writeFileSync(gate, fakeGateSource());
-  chmodSync(gate, 0o755);
+  if (!absentAtStartup) {
+    writeFileSync(gate, fakeGateSource());
+    chmodSync(gate, 0o755);
+  }
   const path = gateDir;
   const child = spawnSync(process.execPath, [entry], {
     encoding: 'utf8',
@@ -203,7 +209,10 @@ describe('qlb-pi registered streamSimple fail-closed matrix', { skip: piAvailabl
         const result = run(provider, failure);
         assert.equal(result.replaced, true, 'registered provider source was not selected');
         assert.equal(result.events.length, 1);
-        assert.match(result.events[0]?.error?.errorMessage ?? '', new RegExp(`^QLB unavailable for ${provider}`));
+        assert.equal(
+          result.events[0]?.error?.errorMessage,
+          `QLB unavailable for ${provider} — run qlb doctor (${failure.cause})`,
+        );
         assert.deepEqual(result.transportCalls, []);
         if (failure.cause !== 'missing-binary') assert.deepEqual(result.gateCalls, [provider]);
         if (provider === 'openrouter') {
@@ -212,4 +221,17 @@ describe('qlb-pi registered streamSimple fail-closed matrix', { skip: piAvailabl
       });
     }
   }
+
+  it('anthropic: missing binary at startup', () => {
+    const failure = CAUSES[0];
+    const result = run('anthropic', failure, { absentAtStartup: true });
+    assert.equal(result.replaced, true, 'registered provider source was not selected');
+    assert.equal(result.events.length, 1);
+    assert.equal(
+      result.events[0]?.error?.errorMessage,
+      'QLB unavailable for anthropic — run qlb doctor (missing-binary)',
+    );
+    assert.deepEqual(result.transportCalls, []);
+    assert.deepEqual(result.gateCalls, []);
+  });
 });
