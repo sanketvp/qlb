@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { describe, it } from 'node:test';
+import { DEFAULT_HEARTBEAT_MS } from '../src/refresh-lease';
 
 import {
   consumeSingleCredential,
@@ -854,6 +855,138 @@ describe('single-account consume gate', () => {
       assert.deepEqual(edges, [{ fromFp: lineageFp('refresh-before'), toFp: lineageFp('refresh-issued') }]);
     } finally {
       await rm(home, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('P13 refresh lease failure handling (D-OD6-12a round 1)', () => {
+  const PROVIDERS = ['xai', 'kimi-coding'] as const;
+
+  /** A generic-held shared item at generation 0 in a fresh in-memory store. */
+  async function genericHeld(provider: typeof PROVIDERS[number]) {
+    const home = await mkdtemp(join(tmpdir(), 'qlb-single-consume-'));
+    const keychain = new MockKeychain();
+    const store = new Store(':memory:');
+    const accountId = ADAPTER_ACCOUNT_IDS[provider];
+    const service = qlbKeychainService(provider, 'default');
+    store.upsertAccount(accountId, provider, provider);
+    store.upsertMigration(`pi-${provider}`, 'QLB_OWNED', JSON.stringify({ accounts: [{ id: accountId, provider, label: provider, keychain: sharedSingleGrantCoords(provider) }] }));
+    const before = JSON.stringify({ ...credential('before', 'refresh-before'), generation: 0 });
+    keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, before);
+    const cleanup = async (): Promise<void> => { store.close(); await rm(home, { recursive: true, force: true }); };
+    return { home, keychain, store, accountId, service, before, cleanup };
+  }
+
+  it('P13 survives a throwing lease heartbeat and stashes the issued pair', async (t) => {
+    t.mock.timers.enable({ apis: ['setInterval'] });
+    for (const provider of PROVIDERS) {
+      const { home, keychain, store, accountId, service, before, cleanup } = await genericHeld(provider);
+      store.heartbeatRefreshLease = () => { throw new Error('database is locked'); };
+      const warnings: string[] = [];
+      try {
+        await assert.rejects(consumeSingleCredential(provider, credential('before', 'refresh-before'), {
+          keychain, home, store, lock: createInMemorySingleConsumeLock(), now: () => NOW,
+          warn: (message) => warnings.push(message),
+          refresh: async () => {
+            // A SQLITE_BUSY in the timer must not escape as an uncaught exception.
+            t.mock.timers.tick(DEFAULT_HEARTBEAT_MS);
+            return { kind: 'success', credential: credential('after', 'refresh-after', NOW + 3_600_000) };
+          },
+        }), /cas-conflict/);
+        assert.equal(keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT), before);
+        assert.equal(store.getGrantGeneration(accountId), 0);
+        assert.equal((await listStashes(root(home), provider, 'default')).length, 1);
+        assert.equal(store.getLease(refreshLeaseName(accountId)), null);
+        assert.ok(warnings.some((message) => /heartbeat/.test(message)));
+      } finally { await cleanup(); }
+    }
+  });
+
+  it('P13 aborts the POST and never writes the primary when the lease is lost', async (t) => {
+    t.mock.timers.enable({ apis: ['setInterval'] });
+    for (const provider of PROVIDERS) {
+      // (a) The heartbeat sees the lease taken: the POST signal aborts, but the
+      // response arrives anyway. (b) No heartbeat fires: the in-transaction fence refuses.
+      for (const heartbeatFires of [true, false]) {
+        const { home, keychain, store, accountId, service, before, cleanup } = await genericHeld(provider);
+        let signal: AbortSignal | undefined;
+        try {
+          await assert.rejects(consumeSingleCredential(provider, credential('before', 'refresh-before'), {
+            keychain, home, store, lock: createInMemorySingleConsumeLock(), now: () => NOW,
+            refresh: async (...args: unknown[]) => {
+              signal = (args[1] as { signal?: AbortSignal } | undefined)?.signal;
+              store.stealLease(refreshLeaseName(accountId), 'other-holder');
+              if (heartbeatFires) {
+                t.mock.timers.tick(DEFAULT_HEARTBEAT_MS);
+                assert.equal(signal?.aborted, true, 'a lost lease aborts the POST');
+              }
+              return { kind: 'success', credential: credential('after', 'refresh-after', NOW + 3_600_000) };
+            },
+          }), /cas-conflict/);
+          assert.ok(signal, 'the POST receives an abort signal');
+          assert.equal(keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT), before);
+          assert.equal(store.getGrantGeneration(accountId), 0);
+          assert.equal((await listStashes(root(home), provider, 'default')).length, 1);
+          assert.equal(store.getLease(refreshLeaseName(accountId))?.holder_id, 'other-holder');
+        } finally { await cleanup(); }
+      }
+    }
+  });
+
+  it('P13 treats invalid_grant after a generation advance as a lost race, not dead', async () => {
+    for (const provider of PROVIDERS) {
+      const { home, keychain, store, accountId, service, cleanup } = await genericHeld(provider);
+      const winner = JSON.stringify({ ...credential('winner', 'refresh-winner', NOW + 3_600_000), generation: 1, writtenBy: 'other' });
+      let posts = 0;
+      let dead = 0;
+      try {
+        const result = await consumeSingleCredential(provider, credential('before', 'refresh-before'), {
+          keychain, home, store, lock: createInMemorySingleConsumeLock(), now: () => NOW,
+          onDead: () => { dead += 1; },
+          refresh: async () => {
+            posts += 1;
+            // Another holder committed g+1 first; this POST's token is now spent.
+            keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, winner);
+            assert.equal(store.bumpGrantGeneration(accountId, 0), 1);
+            return { kind: 'dead' };
+          },
+        });
+        assert.equal(dead, 0);
+        assert.equal(posts, 1);
+        assert.equal(result.outcome, 'winner');
+        assert.equal(result.credential.access, 'winner');
+        assert.equal(keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT), winner);
+        assert.equal(store.getLease(refreshLeaseName(accountId)), null);
+      } finally { await cleanup(); }
+    }
+  });
+
+  it('P13 lease release failure does not replace a committed refresh', async () => {
+    for (const provider of PROVIDERS) {
+      const { home, keychain, store, accountId, service, cleanup } = await genericHeld(provider);
+      const releaseRefreshLease = store.releaseRefreshLease.bind(store);
+      store.releaseRefreshLease = () => { throw new Error('database is locked'); };
+      const warnings: string[] = [];
+      try {
+        const result = await consumeSingleCredential(provider, credential('before', 'refresh-before'), {
+          keychain, home, store, lock: createInMemorySingleConsumeLock(), now: () => NOW,
+          warn: (message) => warnings.push(message),
+          refresh: async () => ({ kind: 'success', credential: credential('after', 'refresh-after', NOW + 3_600_000) }),
+        });
+        assert.equal(result.outcome, 'refreshed');
+        assert.equal(store.getGrantGeneration(accountId), 1);
+        assert.equal(JSON.parse(keychain.getSync(service, QLB_KEYCHAIN_ACCOUNT)).access, 'after');
+
+        // A typed refusal survives a failing release too.
+        keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, JSON.stringify({ ...credential('before', 'refresh-before'), generation: 1 }));
+        await assert.rejects(consumeSingleCredential(provider, credential('before', 'refresh-before'), {
+          keychain, home, store, lock: createInMemorySingleConsumeLock(), now: () => NOW,
+          warn: (message) => warnings.push(message),
+          refresh: async () => ({ kind: 'dead' }),
+        }), /refresh-dead/);
+        assert.ok(warnings.some((message) => /release/.test(message)));
+        store.releaseRefreshLease = releaseRefreshLease;
+      } finally { await cleanup(); }
     }
   });
 });
