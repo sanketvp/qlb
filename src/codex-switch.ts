@@ -1007,7 +1007,7 @@ export async function probeCodexSwitchJournal<T = undefined>(options: CodexSwitc
 }
 
 export type CodexSwitchResult = {
-  outcome: 'ok' | 'noop' | 'failed' | 'refused'; reason?: string; message?: string;
+  outcome: 'ok' | 'noop' | 'failed' | 'refused' | 'reverted-by-codex'; reason?: string; message?: string;
   switchId?: number; attemptId?: string; watch?: { state: 'pending'; until: number }; lockLostAfterCommit?: boolean;
 };
 export interface SwitchCodexInput {
@@ -1114,19 +1114,113 @@ export async function switchCodex(deps: CodexSwitchDeps, input: SwitchCodexInput
               const publish = await publishCodexAuth(deps.authPath!, target.document); renamed = publish.stage === 'published';
               if (renamed) await deps.hooks?.afterRename?.();
               assertHeld(); held.assertHeld(); await deps.hooks?.beforeVerify?.();
-              const classified = classifyPostPublish({ journal, publish, observed: await deps.readLive(), targetSlotFp: targetRow.fingerprint! });
-              if (classified !== 'ok' && classified !== 'not-landed') throw new Error('codex-switch-external-unhandled');
-              assertHeld(); held.assertHeld(); const now = deps.now(); const outcome = classified === 'ok' ? 'ok' : 'failed';
+              const observed = await deps.readLive();
+              const classified = classifyPostPublish({ journal, publish, observed, targetSlotFp: targetRow.fingerprint! });
+              // Missing verify reads are deliberately retried by recovery rather
+              // than being turned into a logged-out fence by this first attempt.
+              if (observed.status === 'missing' || observed.status === 'unstable' || observed.status === 'unreadable') {
+                assertHeld(); held.assertHeld();
+                releaseCodexSwitchJournalHeld(held, deps.attempt, options); released = true;
+                const pendingResult: CodexSwitchResult = { outcome: 'failed', reason: `verify-${observed.status}`, attemptId: deps.attempt };
+                return { result: pendingResult };
+              }
+
+              let attribution: CodexPhaseAttribution | undefined;
+              let currentTarget = deps.store.getCodexSlot(input.target);
+              const slotHeads = new Map<string, string | null>();
+              for (const accountId of [journal.from, journal.to]) slotHeads.set(accountId, deps.store.getCodexSlot(accountId)?.fingerprint ?? null);
+              const liveDocument = observed.status === 'ok' ? observed.doc : undefined;
+              const liveIdentity = liveDocument ? codexIdentity(liveDocument) : null;
+              if (liveIdentity !== null) slotHeads.set(liveIdentity, deps.store.getCodexSlot(liveIdentity)?.fingerprint ?? null);
+
+              if (typeof classified === 'object' && classified.status === 'external' || classified === 'target-changed') {
+                const phaseDeps = observationDeps(deps);
+                if (!currentTarget) throw new Error('Codex target slot disappeared during post-publish verification');
+                const currentTargetDocument = phaseDeps.slots.readSlot(input.target, { fresh: true }).document;
+                // The durable acknowledgement has to precede the target-slot
+                // adoption: a crash after attribution must not reclassify B′ as
+                // an import that replaced the original target.
+                if (liveDocument && liveIdentity === input.target
+                  && codexFingerprint(liveDocument) !== codexFingerprint(currentTargetDocument)) {
+                  assertHeld(); held.assertHeld();
+                  markCodexSwitchJournalAdoptingTarget(held, deps.attempt, codexFingerprint(liveDocument), options);
+                }
+                const currentSessions = await phaseDeps.list();
+                const postHistory = deps.dbPath
+                  ? readCodexSwitchHistory(deps.dbPath, { journalDir: deps.journalDir })
+                  : { rows: [], observations: [] };
+                const liveIdentityParts = liveIdentity === null ? null : codexIdentityParts(liveIdentity);
+                attribution = await attributeForPhase({ assertHeld }, 'post', {
+                  store: deps.store,
+                  keychain: phaseDeps.keychain,
+                  slot: { accountId: input.target, document: currentTargetDocument, fingerprint: currentTarget.fingerprint ?? undefined },
+                  activeSlotId: journal.from,
+                  activeSetBy: 'adopt',
+                  live: liveDocument!,
+                  // Post-publish aliveBefore comes from the journal snapshot,
+                  // so a holder that exits before verification still counts.
+                  holderObservation: {
+                    aliveBefore: liveIdentityParts !== null && renewers(liveIdentityParts, journal.openSessions,
+                      postHistory.rows, postHistory.observations).length > 0,
+                    aliveAfter: liveIdentityParts !== null && renewers(liveIdentityParts, currentSessions,
+                      postHistory.rows, postHistory.observations).length > 0,
+                  },
+                  l40Verified: deps.store.getConfig('codex.l40Verified') === '1',
+                  now: deps.now,
+                });
+                if (attribution.action === 'unclaimed') {
+                  assertHeld(); held.assertHeld();
+                  try {
+                    await phaseDeps.slots.ensureUnclaimedStash!(liveDocument!, deps.now());
+                  } catch (error) {
+                    if (error instanceof CodexStashUnverifiable) attribution = { action: 'stash-unverifiable' };
+                    else throw error;
+                  }
+                }
+                currentTarget = deps.store.getCodexSlot(input.target);
+                slotHeads.set(input.target, currentTarget?.fingerprint ?? null);
+                if (liveIdentity !== null) slotHeads.set(liveIdentity, deps.store.getCodexSlot(liveIdentity)?.fingerprint ?? null);
+              }
+
+              const verdict = resolveRecoveryVerdict(classified, attribution, {
+                phase: 'post', journal, targetSlotFingerprint: currentTarget?.fingerprint ?? '',
+                slotHeads, live: liveDocument,
+              });
+              if (verdict.class === 'pending') {
+                assertHeld(); held.assertHeld();
+                releaseCodexSwitchJournalHeld(held, deps.attempt, options); released = true;
+                const pendingResult: CodexSwitchResult = { outcome: 'failed', reason: `verify-${verdict.status}`, attemptId: deps.attempt };
+                return { result: pendingResult };
+              }
+              if (verdict.class === 'unresolved') {
+                assertHeld(); held.assertHeld();
+                markCodexSwitchJournalUnresolved(held, deps.attempt, verdict.reason, verdict.involvedAccounts, options);
+                releaseCodexSwitchJournalHeld(held, deps.attempt, options); released = true;
+                const unresolvedResult: CodexSwitchResult = { outcome: 'failed', reason: verdict.reason,
+                  message: codexRecoveryFenceMessage(verdict.reason), attemptId: deps.attempt };
+                return { result: unresolvedResult };
+              }
+
+              const effect = verdict.effect;
+              assertHeld(); held.assertHeld(); const now = deps.now();
+              const outcome: CodexSwitchResult['outcome'] = effect.outcome === 'quiet' || effect.outcome === 'stopped'
+                ? effect.outcome === 'quiet' ? 'ok' : 'failed' : effect.outcome;
+              const activeAccountId = 'activeAccountId' in effect ? effect.activeAccountId : undefined;
+              const accountId = effect.outcome === 'ok' ? input.target
+                : effect.outcome === 'reverted-by-codex' ? effect.accountId
+                  : activeAccountId === null ? null : journal.from;
+              const setBy = effect.outcome === 'reverted-by-codex' || activeAccountId === null
+                ? 'adopt' : input.trigger === 'manual' ? 'manual' : 'auto';
+              const detail = effect.outcome === 'failed' ? effect.detail : null;
               let id: number;
               try {
-                id = deps.store.commitCodexSwitch({ now, accountId: outcome === 'ok' ? input.target : journal.from,
-                  setBy: input.trigger === 'manual' ? 'manual' : 'auto', fromAccount: journal.from, toAccount: input.target,
+                id = deps.store.commitCodexSwitch({ now, accountId, setBy, fromAccount: journal.from, toAccount: input.target,
                   trigger: input.trigger, outcome, attempt: deps.attempt, via: 'switch', openSessionsJson: openSessionsJson(deps, sessions),
                   // I11: a not-landed row is the Q1 marker, so it never carries a publish time.
-                  publishedAt: outcome === 'ok' ? publishedAt : null, committedAt: now, detail: outcome === 'failed' ? 'not-published' : null,
+                  publishedAt: detail === 'not-published' ? null : publishedAt, committedAt: now, detail,
                   outgoing: journal.from, target: input.target,
-                  observation: { identity: outcome === 'ok' ? input.target : journal.from,
-                    lineageFp: outcome === 'ok' ? journal.target.fingerprint : codexFingerprint(outgoing.document) },
+                  observation: { identity: accountId, lineageFp: liveDocument ? codexFingerprint(liveDocument)
+                    : effect.outcome === 'ok' ? journal.target.fingerprint : codexFingerprint(outgoing.document) },
                   decision: { leftHeadroom: decision?.leftHeadroom ?? null, leftRecoveryAt: decision?.leftRecoveryAtMs ?? null,
                     leftTrigger: decision?.leftTrigger ?? null } });
               } catch (error) { commitFailed = true; throw error; }
