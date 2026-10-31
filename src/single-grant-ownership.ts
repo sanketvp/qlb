@@ -116,9 +116,11 @@ export interface GenericSharedItemFacts {
 }
 
 /**
- * Applies S0.6 as `genericMigrationAtRest` does: a row whose detail cannot be
- * read is not at rest, and a VALIDATED journal at a generic commit point
- * (`commitGeneration`) is not at rest. NATIVE is at rest whatever it records.
+ * S0.6 at-rest test for the shared-item hold. Like `genericMigrationAtRest`, a
+ * row whose detail cannot be read is not at rest. Unlike it, a VALIDATED
+ * journal at a generic commit point (`commitGeneration`) is also not at rest
+ * here (OQ-10: the in-between stages are protected); `genericMigrationAtRest`
+ * does not read `commitGeneration`. NATIVE is at rest whatever it records.
  */
 function genericSharedItemAtRest(
   facts: GenericSharedItemFacts,
