@@ -13,6 +13,10 @@ import {
   parseApiKeyPayload,
 } from './migration';
 import { parseGrant } from './refresh-lease';
+import {
+  JournalKeychainInvalidError,
+  resolveSingleGrantKeychain,
+} from './single-grant-ownership';
 import type { Store } from './store';
 import {
   CSWAP_ACTIVE_ID,
@@ -83,9 +87,28 @@ export function createOwnedCredentialSource(opts: {
       throw notOwnedError(accountId, provider);
     }
     const storeName = provider ? migrationStoreNameFor(provider) : undefined;
-    const state = storeName ? opts.store.getMigration(storeName)?.state : undefined;
+    const migration = storeName ? opts.store.getMigration(storeName) : undefined;
+    const state = migration?.state;
     if (!state || !OWNED_OR_LATER.has(state)) {
       throw notOwnedError(accountId, provider);
+    }
+    if (provider === 'xai' || provider === 'kimi-coding') {
+      let journalAccount: unknown;
+      try {
+        const detail: unknown = JSON.parse(migration.detail_json);
+        if (detail && typeof detail === 'object' && !Array.isArray(detail)) {
+          const accounts = (detail as Record<string, unknown>).accounts;
+          if (Array.isArray(accounts)) journalAccount = accounts[0];
+        }
+      } catch {
+        // The resolver rejects an unreadable journal before any Keychain read.
+      }
+      if (accountId !== ADAPTER_ACCOUNT_IDS[provider]) {
+        throw new JournalKeychainInvalidError();
+      }
+      const coords = resolveSingleGrantKeychain(provider, journalAccount);
+      const raw = opts.keychain.getSync(coords.service, coords.account);
+      return parseGrant(raw).access;
     }
     if (!acct) {
       throw notOwnedError(accountId, provider);
