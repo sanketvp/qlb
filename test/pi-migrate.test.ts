@@ -392,6 +392,17 @@ describe('Pi migration S58 credential-first barrier', () => {
       } finally { h.cleanup(); }
     });
 
+    it(`${provider}: a malformed Pi journal does not block pi rollback when no copy was kept`, () => {
+      const h = setup(provider);
+      try {
+        mkdirSync(h.paths.journalPath, { recursive: true, mode: 0o700 });
+        const journal = join(h.paths.journalPath, `pi-migrate-${provider}.json`);
+        writeFileSync(journal, '{not json', { mode: 0o600 });
+        assert.doesNotThrow(() => rollbackPiSingleProvider(provider, h.paths, { keychain: h.keychain, store: h.store }));
+        assert.equal(existsSync(journal), false, 'rollback still clears the journal');
+      } finally { h.cleanup(); }
+    });
+
     it(`${provider}: T-PR3b: pi rollback over a kept copy re-runs after a crash at each step to the same end state`, () => {
       for (const crash of ['stash', 'delete'] as const) {
         const h = setup(provider);

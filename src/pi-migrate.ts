@@ -256,9 +256,9 @@ function readKeychainItem(deps: PiMigrateDeps, service: string, account: string)
 function stashKeptGenericCopy(
   provider: PiSingleProvider,
   deps: PiMigrateDeps,
-  ownJournal: Journal | null,
+  readOwnJournal: () => Journal | null,
 ): void {
-  if (provider === 'openrouter' || ownJournal || deps.store?.getConfig(`pi.${provider}.state`) === 'migrated') return;
+  if (provider === 'openrouter' || deps.store?.getConfig(`pi.${provider}.state`) === 'migrated') return;
   const generic = deps.store?.getMigration(`pi-${provider}`);
   if (!generic || generic.state !== 'NATIVE') return;
 
@@ -267,6 +267,9 @@ function stashKeptGenericCopy(
   if (!lastRollback || typeof lastRollback !== 'object' || Array.isArray(lastRollback)) return;
   const rollback = lastRollback as JsonObject;
   if (rollback.keychainDisposition !== 'keep') return;
+  // Read Pi's own journal only once a kept copy is in play, so a malformed
+  // journal never blocks the rollback that would otherwise clear it.
+  if (readOwnJournal()) return;
   let coords;
   try { coords = resolveSingleGrantKeychain(provider, Array.isArray(detail.accounts) ? detail.accounts[0] : undefined); } catch (error) { throw journalKeychainInvalidError(error); }
   const shared = sharedSingleGrantCoords(provider);
@@ -308,7 +311,7 @@ export function migratePiSingleProvider(provider: PiSingleProvider, paths: PiMig
       // D-B74: refuse a placeholder baseline before the first write (no stray 'started' journal).
       if (!inLockJournal && provider !== 'openrouter' && isPiPlaceholder(auth[provider])) throw placeholderBaselineError(provider);
       // OQ-7 (c1): after admission and before the first write, so a crash never leaves a P7a journal ahead of the stash.
-      stashKeptGenericCopy(provider, deps, inLockJournal);
+      stashKeptGenericCopy(provider, deps, () => inLockJournal);
       if (!inLockJournal) updatePhase(paths, provider, 'started', refresh);
       let baseline: unknown; const baselineFile = baselinePath(paths, provider);
       if (phaseAtLeast(journal.phase, 'baseline') && existsSync(baselineFile)) baseline = JSON.parse(readFileSync(baselineFile, 'utf8'));
@@ -394,7 +397,7 @@ export function rollbackPiSingleProvider(provider: PiSingleProvider, paths: PiMi
     // non-placeholder credential or verified a restored one. This makes a
     // retry converge after a prior delete failure.
     refresh();
-    stashKeptGenericCopy(provider, deps, readJournal(paths, provider));
+    stashKeptGenericCopy(provider, deps, () => readJournal(paths, provider));
     try { deps.keychain.deleteSync(managedService(provider), QLB_KEYCHAIN_ACCOUNT); } catch (error) {
       if (!isCredentialNotFound(error)) throw error;
     }
