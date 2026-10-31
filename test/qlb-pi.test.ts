@@ -133,7 +133,9 @@ describe('qlb-pi footer helpers', () => {
     const config = defaultConfig(home);
     const store = openStore(config.dbPath);
     store.upsertAccount('xai-default', 'xai', 'Grok (xAI)');
-    store.upsertMigration('pi-xai', 'QLB_OWNED');
+    store.upsertMigration('pi-xai', 'QLB_OWNED', JSON.stringify({
+      accounts: [{ id: 'xai-default', provider: 'xai', label: 'Grok (xAI)', fingerprint: 'fixture' }],
+    }));
     store.close();
     const owned = JSON.stringify({ access: 'qlb-copy', refresh: '', expires: 0, generation: 0 });
     const keychain = {
