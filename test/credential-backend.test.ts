@@ -214,6 +214,34 @@ describe('Linux libsecret command construction', () => {
     backend.deleteSync(service, account);
     assert.deepEqual(calls[2]?.args, linuxSecretToolClearArgs(service, account));
   });
+
+  it('linux secret-tool lookups pass a timeout and a timeout is an operational error, not not-found', () => {
+    const calls: Array<{ timeout?: number }> = [];
+    const exec: ExecFileSyncFn = (_file, args, opts) => {
+      calls.push({ timeout: opts?.timeout });
+      return args[0] === 'lookup' ? 'stored-value\n' : '';
+    };
+    const backend = new LinuxLibsecretBackend({ execFileSync: exec });
+
+    backend.setSync('qlb-test-linux-timeout', 'acct', '{"test":true}');
+    assert.equal(backend.getSync('qlb-test-linux-timeout', 'acct'), 'stored-value');
+    backend.deleteSync('qlb-test-linux-timeout', 'acct');
+    assert.deepEqual(calls.map((call) => call.timeout), [5_000, 5_000, 5_000]);
+
+    const timeout = Object.assign(new Error('secret-tool timed out'), {
+      code: 'ETIMEDOUT',
+      signal: 'SIGTERM',
+    });
+    const timedOutBackend = new LinuxLibsecretBackend({
+      execFileSync: () => { throw timeout; },
+    });
+    let thrown: unknown;
+    assert.throws(() => timedOutBackend.getSync('qlb-test-linux-timeout', 'acct'), (error: unknown) => {
+      thrown = error;
+      return error instanceof Error && /timed out/.test(error.message);
+    });
+    assert.equal(isCredentialNotFound(thrown), false);
+  });
 });
 
 describe('Windows DPAPI command construction', () => {

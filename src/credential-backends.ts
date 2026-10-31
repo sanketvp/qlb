@@ -487,6 +487,20 @@ export class InMemoryCredentialBackend extends SyncCredentialBackend {
 //   secret-tool lookup attribute value ...
 //   secret-tool clear attribute value ...
 
+/** Bound every Linux libsecret spawn so a hung keyring daemon cannot hang the CLI. */
+export const LINUX_SECRET_TOOL_TIMEOUT_MS = 5_000;
+
+export function isLinuxSecretToolTimeout(err: unknown): boolean {
+  return !!err && typeof err === 'object' && (err as { code?: unknown }).code === 'ETIMEDOUT';
+}
+
+export function linuxSecretToolTimeoutError(command: string): Error {
+  return Object.assign(
+    new Error(`secret-tool ${command} timed out after ${LINUX_SECRET_TOOL_TIMEOUT_MS / 1_000}s`),
+    { code: 'ETIMEDOUT' },
+  );
+}
+
 export function linuxSecretToolStoreArgs(service: string, account: string): string[] {
   return ['store', '--label', service, 'service', service, 'account', account];
 }
@@ -513,8 +527,12 @@ export class LinuxLibsecretBackend extends SyncCredentialBackend {
       this.exec('secret-tool', linuxSecretToolStoreArgs(service, account), {
         encoding: 'utf8',
         input: jsonValue,
+        timeout: LINUX_SECRET_TOOL_TIMEOUT_MS,
       });
     } catch (err) {
+      if (isLinuxSecretToolTimeout(err)) {
+        throw wrapCredentialError('set', service, account, linuxSecretToolTimeoutError('store'));
+      }
       throw wrapCredentialError('set', service, account, err);
     }
   }
@@ -523,9 +541,13 @@ export class LinuxLibsecretBackend extends SyncCredentialBackend {
     try {
       const stdout = this.exec('secret-tool', linuxSecretToolLookupArgs(service, account), {
         encoding: 'utf8',
+        timeout: LINUX_SECRET_TOOL_TIMEOUT_MS,
       });
       return stdout.replace(/\n$/, '');
     } catch (err) {
+      if (isLinuxSecretToolTimeout(err)) {
+        throw wrapCredentialError('get', service, account, linuxSecretToolTimeoutError('lookup'));
+      }
       throw wrapCredentialError('get', service, account, err);
     }
   }
@@ -534,8 +556,12 @@ export class LinuxLibsecretBackend extends SyncCredentialBackend {
     try {
       this.exec('secret-tool', linuxSecretToolClearArgs(service, account), {
         encoding: 'utf8',
+        timeout: LINUX_SECRET_TOOL_TIMEOUT_MS,
       });
     } catch (err) {
+      if (isLinuxSecretToolTimeout(err)) {
+        throw wrapCredentialError('delete', service, account, linuxSecretToolTimeoutError('clear'));
+      }
       throw wrapCredentialError('delete', service, account, err);
     }
   }
