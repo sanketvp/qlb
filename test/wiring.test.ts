@@ -109,7 +109,9 @@ describe('command and diagnostic wiring', () => {
     const config = defaultConfig(home);
     const store = openStore(config.dbPath);
     store.upsertAccount('xai-default', 'xai', 'fixture xAI account');
-    store.upsertMigration('pi-xai', 'QLB_OWNED');
+    store.upsertMigration('pi-xai', 'QLB_OWNED', JSON.stringify({
+      accounts: [{ id: 'xai-default', provider: 'xai', label: 'fixture xAI account', fingerprint: 'fixture' }],
+    }));
     store.close();
     const keychain = new MockKeychain();
     keychain.setSync(
