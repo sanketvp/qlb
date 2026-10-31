@@ -11,7 +11,7 @@ import { ADAPTER_ACCOUNT_IDS } from './migration';
 import { isCredentialNotFound } from './credential-backends';
 import { isNativeOpenRouterKeyNotFound, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, type KeychainBackend } from './keychain';
 import { qlbHomeDir } from './home';
-import { resolveSingleGrantKeychain, sharedSingleGrantCoords } from './single-grant-ownership';
+import { genericHoldsSharedItem, resolveSingleGrantKeychain, sharedSingleGrantCoords } from './single-grant-ownership';
 import type { Store } from './store';
 
 export const PI_SINGLE_PROVIDERS = ['xai', 'kimi-coding', 'openrouter'] as const;
@@ -225,6 +225,20 @@ function genericMigrationOwnedError(): Error {
   return Object.assign(new Error('owned-by-generic-migrate'), { code: 'owned-by-generic-migrate', exitCode: 3 });
 }
 
+function genericRollbackOwnershipUnreadableError(provider: OAuthProvider): Error {
+  return Object.assign(
+    new Error(`generic-ownership-unreadable: cannot determine whether generic migration pi-${provider} owns the shared item; run \`qlb migrate rollback --provider ${provider}\` first`),
+    { code: 'generic-ownership-unreadable', exitCode: 3 },
+  );
+}
+
+function genericRollbackOwnedError(provider: OAuthProvider): Error {
+  return Object.assign(
+    new Error(`owned-by-generic-migrate: generic migration pi-${provider} owns the shared item; run \`qlb migrate rollback --provider ${provider}\` first`),
+    { code: 'owned-by-generic-migrate', exitCode: 3 },
+  );
+}
+
 function keptCopyStashUnverifiedError(): Error {
   return Object.assign(new Error('kept-copy-stash-unverified'), { code: 'kept-copy-stash-unverified', exitCode: 3 });
 }
@@ -350,6 +364,16 @@ export function rollbackPiSingleProvider(provider: PiSingleProvider, paths: PiMi
   assertPiSingleProvider(provider); checkPaths(paths, deps);
   const lock = deps.withAuthLock ?? ((path, fn) => withPiAuthLock(path, fn, deps.authLockTiming));
   lock(paths.authJsonPath, (refresh) => {
+    if (provider !== 'openrouter') {
+      if (!deps.store) throw genericRollbackOwnershipUnreadableError(provider);
+      const generic = deps.store.getMigration(`pi-${provider}`);
+      if (genericHoldsSharedItem(provider, {
+        state: generic?.state ?? null,
+        detailJson: generic?.detail_json ?? null,
+      })) {
+        throw genericRollbackOwnedError(provider);
+      }
+    }
     const baselineFile = baselinePath(paths, provider); const baseline = existsSync(baselineFile) ? JSON.parse(readFileSync(baselineFile, 'utf8')) : undefined;
     const managed = provider === 'openrouter' ? undefined : managedValue(provider, deps);
     const auth = provider === 'openrouter' ? undefined : readAuth(paths.authJsonPath);

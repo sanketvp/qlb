@@ -1002,13 +1002,119 @@ describe('openai-codex JWT credential parsing', () => {
 });
 
 describe('qlb doctor native-sync checks', () => {
+  it('T-KC9 doctor native-sync compares the Keychain item the generic journal records', async () => {
+    for (const provider of ['xai', 'kimi-coding'] as const) {
+      const home = mkdtempSync(join(tmpdir(), `qlb-doctor-journal-${provider}-`));
+      temps.push(home);
+      const cfg = defaultConfig(home);
+      const id = ADAPTER_ACCOUNT_IDS[provider];
+      const label = ADAPTER_ACCOUNT_LABELS[provider];
+      const shared = sharedSingleGrantCoords(provider);
+      const store = openStore(cfg.dbPath);
+      store.upsertAccount(id, provider, label);
+      store.upsertMigration('pi-' + provider, 'QLB_OWNED', singleGrantJournal(provider, shared));
+      store.close();
+
+      const kc = new MockKeychain();
+      kc.setSync(shared.service, shared.account, JSON.stringify(grant('shared-copy')));
+      const legacy = { service: qlbKeychainService(provider, id), account: label };
+      kc.setSync(legacy.service, legacy.account, JSON.stringify(grant('legacy-decoy')));
+      const getSync = kc.getSync.bind(kc);
+      const reads: Array<{ service: string; account: string }> = [];
+      kc.getSync = ((service: string, account: string) => {
+        reads.push({ service, account });
+        return getSync(service, account);
+      }) as typeof kc.getSync;
+
+      const report = await doctorQlb(cfg, {
+        command: () => 'ok',
+        hostCommand: () => '',
+        keychain: kc,
+        readNativeCredential: async () => grant('shared-copy'),
+      });
+      const check = report.checks.find((row) => row.name === `native-sync:${id}`);
+      assert.ok(check, JSON.stringify(report.checks));
+      assert.equal(check.level, 'PASS');
+      assert.deepEqual(reads, [shared]);
+
+      const invalidHome = mkdtempSync(join(tmpdir(), `qlb-doctor-journal-invalid-${provider}-`));
+      temps.push(invalidHome);
+      const invalidCfg = defaultConfig(invalidHome);
+      const invalidStore = openStore(invalidCfg.dbPath);
+      invalidStore.upsertAccount(id, provider, label);
+      invalidStore.upsertMigration(
+        'pi-' + provider,
+        'QLB_OWNED',
+        singleGrantJournal(provider, { ...shared, extra: true }),
+      );
+      invalidStore.close();
+
+      const invalidReads: Array<{ service: string; account: string }> = [];
+      const invalidKc = new MockKeychain();
+      const invalidGetSync = invalidKc.getSync.bind(invalidKc);
+      invalidKc.getSync = ((service: string, account: string) => {
+        invalidReads.push({ service, account });
+        return invalidGetSync(service, account);
+      }) as typeof invalidKc.getSync;
+      const invalidReport = await doctorQlb(invalidCfg, {
+        command: () => 'ok',
+        hostCommand: () => '',
+        keychain: invalidKc,
+        readNativeCredential: async () => grant('shared-copy'),
+      });
+      const invalidCheck = invalidReport.checks.find((row) => row.name === `native-sync:${id}`);
+      assert.ok(invalidCheck, JSON.stringify(invalidReport.checks));
+      assert.equal(invalidCheck.level, 'WARN');
+      assert.match(invalidCheck.message, /QLB Keychain copy unreadable/);
+      assert.deepEqual(invalidReads, []);
+    }
+  });
+
+  it('doctor native-sync refuses a generic journal with more than one account', async () => {
+    for (const provider of ['xai', 'kimi-coding'] as const) {
+      const home = mkdtempSync(join(tmpdir(), `qlb-doctor-journal-multi-${provider}-`));
+      temps.push(home);
+      const cfg = defaultConfig(home);
+      const id = ADAPTER_ACCOUNT_IDS[provider];
+      const label = ADAPTER_ACCOUNT_LABELS[provider];
+      const shared = sharedSingleGrantCoords(provider);
+      const journal = JSON.parse(singleGrantJournal(provider, shared)) as { accounts: unknown[] };
+      journal.accounts.push(journal.accounts[0]);
+      const store = openStore(cfg.dbPath);
+      store.upsertAccount(id, provider, label);
+      store.upsertMigration('pi-' + provider, 'QLB_OWNED', JSON.stringify(journal));
+      store.close();
+
+      const kc = new MockKeychain();
+      kc.setSync(shared.service, shared.account, JSON.stringify(grant('shared-copy')));
+      const getSync = kc.getSync.bind(kc);
+      const reads: Array<{ service: string; account: string }> = [];
+      kc.getSync = ((service: string, account: string) => {
+        reads.push({ service, account });
+        return getSync(service, account);
+      }) as typeof kc.getSync;
+
+      const report = await doctorQlb(cfg, {
+        command: () => 'ok',
+        hostCommand: () => '',
+        keychain: kc,
+        readNativeCredential: async () => grant('shared-copy'),
+      });
+      const check = report.checks.find((row) => row.name === `native-sync:${id}`);
+      assert.ok(check, JSON.stringify(report.checks));
+      assert.equal(check.level, 'WARN');
+      assert.match(check.message, /QLB Keychain copy unreadable/);
+      assert.deepEqual(reads, []);
+    }
+  });
+
   it('reports drift for a QLB_OWNED account without writing Keychain', async () => {
     const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-resync-'));
     temps.push(home);
     const cfg = defaultConfig(home);
     const store = openStore(cfg.dbPath);
     store.upsertAccount('xai-default', 'xai', 'Grok (xAI)');
-    store.upsertMigration('pi-xai', 'QLB_OWNED');
+    store.upsertMigration('pi-xai', 'QLB_OWNED', singleGrantJournal('xai'));
     store.close();
     const kc = new MockKeychain();
     kc.setSync(

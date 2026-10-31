@@ -120,6 +120,15 @@ class RollbackDeleteKeychain extends MockKeychain {
   }
 }
 
+class DeleteTrackingKeychain extends MockKeychain {
+  deleteCalls: Array<{ service: string; account: string }> = [];
+
+  override deleteSync(service: string, account: string): void {
+    this.deleteCalls.push({ service, account });
+    super.deleteSync(service, account);
+  }
+}
+
 class S2ReadTaxonomyKeychain extends MockKeychain {
   getCalls = 0;
   faultOnGet: number | undefined;
@@ -354,6 +363,126 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       } finally {
         h.cleanup();
       }
+    });
+  }
+
+  for (const provider of ['xai', 'kimi-coding'] as const) {
+    it(`T-KC5 [${provider}] pre-commit rollback deletes only the Keychain item the journal records`, () => {
+      const shared = sharedSingleGrantCoords(provider);
+      const legacy = kmCoords(provider);
+      const journalName = `pi-${provider}`;
+
+      for (const [recorded, target, decoy] of [
+        ['shared', shared, legacy],
+        ['legacy', legacy, shared],
+      ] as const) {
+        const h = setup(provider);
+        try {
+          h.mig.stage();
+          rmSync(stagingOwnerPath(join(h.dir, 'qlb-owner.json'), provider));
+          const row = h.store.getMigration(journalName)!;
+          const detail = JSON.parse(row.detail_json) as { accounts: Array<Record<string, unknown>> };
+          if (recorded === 'shared') detail.accounts[0]!.keychain = shared;
+          else delete detail.accounts[0]!.keychain;
+          h.store.upsertMigration(journalName, 'MIRRORED', JSON.stringify(detail));
+
+          const targetBytes = JSON.stringify({ target: recorded });
+          const decoyBytes = JSON.stringify({ decoy: recorded });
+          h.kc.setSync(target.service, target.account, targetBytes);
+          h.kc.setSync(decoy.service, decoy.account, decoyBytes);
+
+          h.mig.rollback();
+
+          assert.throws(() => h.kc.getSync(target.service, target.account), /item not found/);
+          assert.equal(h.kc.getSync(decoy.service, decoy.account), decoyBytes);
+        } finally {
+          h.cleanup();
+        }
+      }
+    });
+  }
+
+  type JournalAccounts = Array<Record<string, unknown>>;
+
+  /**
+   * Stages, rewrites the journal's accounts (and the staging file's, with the
+   * same edit unless one is given), plants both Keychain items, and asserts
+   * that pre-commit rollback refuses journal-keychain-invalid with no delete
+   * and the items, staging file, auth.json backup and journal byte-equal.
+   */
+  function assertPreCommitRollbackRefuses(
+    provider: 'xai' | 'kimi-coding',
+    editJournal: (accounts: JournalAccounts) => JournalAccounts,
+    editStaging: (accounts: JournalAccounts) => JournalAccounts = editJournal,
+  ): void {
+    const kc = new DeleteTrackingKeychain();
+    const h = setup(provider, kc);
+    try {
+      h.mig.stage();
+      const journalName = `pi-${provider}`;
+      const stagingPath = stagingOwnerPath(join(h.dir, 'qlb-owner.json'), provider);
+      const detail = JSON.parse(h.store.getMigration(journalName)!.detail_json) as { accounts: JournalAccounts };
+      detail.accounts = editJournal(detail.accounts);
+      h.store.upsertMigration(journalName, 'MIRRORED', JSON.stringify(detail));
+      const owner = JSON.parse(readFileSync(stagingPath, 'utf8')) as { accounts: JournalAccounts };
+      owner.accounts = editStaging(owner.accounts);
+      writeFileSync(stagingPath, JSON.stringify(owner, null, 2) + '\n');
+
+      const shared = sharedSingleGrantCoords(provider);
+      const legacy = kmCoords(provider);
+      kc.setSync(shared.service, shared.account, '{"item":"shared"}');
+      kc.setSync(legacy.service, legacy.account, '{"item":"legacy"}');
+      writePiAuthBackup(h.authPath, provider, 'pre-commit-refusal');
+      const backupPath = piAuthBackupPath(h.authPath, provider);
+      const stagingBefore = readFileSync(stagingPath);
+      const backupBefore = readFileSync(backupPath);
+      const journalBefore = h.store.getMigration(journalName);
+      kc.deleteCalls.length = 0;
+
+      assert.throws(() => h.mig.rollback(), /journal-keychain-invalid/);
+
+      assert.deepEqual(kc.deleteCalls, []);
+      assert.equal(kc.getSync(shared.service, shared.account), '{"item":"shared"}');
+      assert.equal(kc.getSync(legacy.service, legacy.account), '{"item":"legacy"}');
+      assert.deepEqual(readFileSync(stagingPath), stagingBefore);
+      assert.deepEqual(readFileSync(backupPath), backupBefore);
+      assert.deepEqual(h.store.getMigration(journalName), journalBefore);
+    } finally {
+      h.cleanup();
+    }
+  }
+
+  for (const provider of ['xai', 'kimi-coding'] as const) {
+    it(`[${provider}] pre-commit rollback refuses when the staging file and the journal record different Keychain items and deletes nothing`, () => {
+      const shared = sharedSingleGrantCoords(provider);
+      const withShared = (accounts: JournalAccounts): JournalAccounts => [{ ...accounts[0], keychain: shared }];
+      const asLegacy = (accounts: JournalAccounts): JournalAccounts => accounts;
+      const otherLabel = (accounts: JournalAccounts): JournalAccounts => [{ ...accounts[0], label: 'other-label' }];
+
+      assertPreCommitRollbackRefuses(provider, withShared, asLegacy);
+      assertPreCommitRollbackRefuses(provider, asLegacy, withShared);
+      assertPreCommitRollbackRefuses(provider, asLegacy, otherLabel);
+    });
+
+    it(`[${provider}] pre-commit rollback with a two-account single-grant journal deletes nothing`, () => {
+      const shared = sharedSingleGrantCoords(provider);
+      assertPreCommitRollbackRefuses(provider, (accounts) => [
+        { ...accounts[0], keychain: shared },
+        { ...accounts[0], id: 'bogus' },
+      ]);
+      assertPreCommitRollbackRefuses(provider, (accounts) => [
+        accounts[0]!,
+        { ...accounts[0], keychain: shared },
+      ]);
+    });
+
+    it(`[${provider}] pre-commit rollback of an ${provider} journal whose account names openrouter refuses`, () => {
+      assertPreCommitRollbackRefuses(provider, (accounts) => [{ ...accounts[0], provider: 'openrouter' }]);
+    });
+
+    it(`[${provider}] pre-commit rollback with an invalid recorded keychain deletes nothing`, () => {
+      const other = sharedSingleGrantCoords(provider === 'xai' ? 'kimi-coding' : 'xai');
+      assertPreCommitRollbackRefuses(provider, (accounts) => [{ ...accounts[0], keychain: other }]);
     });
   }
 

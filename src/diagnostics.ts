@@ -37,6 +37,7 @@ import {
 import {
   createNativeCredentialReader,
   inspectOwnedNativeDrift,
+  parseResyncCredential,
   readOwnedCredentialFromKeychain,
   type ResyncCredential,
 } from './native-resync';
@@ -45,6 +46,13 @@ import { hermesIntegrationChecks } from './hermes-integration';
 import { piIntegrationChecks } from './pi-integration';
 import { piExtensionDriftCheck } from './checks/pi-extension-drift';
 import { piStaleSessionsCheck } from './checks/pi-stale-sessions';
+import {
+  JournalKeychainInvalidError,
+  resolveSingleGrantKeychain,
+  type SingleGrantKeychainCoords,
+  type SingleGrantKeychainProvider,
+} from './single-grant-ownership';
+import { ADAPTER_ACCOUNT_IDS } from './migration';
 import { piEvidenceGapCheck } from './checks/pi-evidence-gap';
 import { qlbHomeDir } from './home';
 import { piReleaseAppDir } from './pi-deploy';
@@ -484,6 +492,25 @@ function probeCredentialStore(command?: CommandRunner): DoctorCheck {
   };
 }
 
+/**
+ * Resolves the Keychain item doctor compares for a single-grant provider.
+ * Fails closed, as the proxy does: only the adapter account, and only a
+ * generic journal that records exactly one account.
+ */
+function resolveDoctorOwnedKeychain(
+  provider: SingleGrantKeychainProvider,
+  accountId: string,
+  detailJson: string | undefined,
+): SingleGrantKeychainCoords {
+  if (accountId !== ADAPTER_ACCOUNT_IDS[provider]) throw new JournalKeychainInvalidError();
+  const detail: unknown = JSON.parse(detailJson ?? '');
+  const accounts = detail != null && typeof detail === 'object' && !Array.isArray(detail)
+    ? (detail as { accounts?: unknown }).accounts
+    : undefined;
+  if (!Array.isArray(accounts) || accounts.length !== 1) throw new JournalKeychainInvalidError();
+  return resolveSingleGrantKeychain(provider, accounts[0]);
+}
+
 export async function doctorQlb(
   config: QlbConfig,
   options: {
@@ -709,8 +736,14 @@ export async function doctorQlb(
       accounts,
       migrations,
       readNativeCredential: readNative,
-      readOwnedCredential: async (provider, accountId, label) =>
-        readOwnedCredentialFromKeychain(keychain, provider, accountId, label),
+      readOwnedCredential: async (provider, accountId, label) => {
+        if (provider === 'xai' || provider === 'kimi-coding') {
+          const migration = migrations.find((row) => row.store === `pi-${provider}`);
+          const coords = resolveDoctorOwnedKeychain(provider, accountId, migration?.detail_json);
+          return parseResyncCredential(keychain.getSync(coords.service, coords.account));
+        }
+        return readOwnedCredentialFromKeychain(keychain, provider, accountId, label);
+      },
     });
     for (const row of drift) {
       checks.push({
