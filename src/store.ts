@@ -1517,10 +1517,10 @@ export class Store {
   }
 
   /** Additive active-login upsert used by provider-specific adoption paths. */
-  setActiveLogin(provider: string, accountId: string | null, setBy: string): void {
+  setActiveLogin(provider: string, accountId: string | null, setBy: string, since: number = Date.now()): void {
     this.db.prepare(`INSERT INTO active_login (provider, account_id, since, set_by) VALUES (?, ?, ?, ?)
       ON CONFLICT(provider) DO UPDATE SET account_id = excluded.account_id, since = excluded.since, set_by = excluded.set_by`)
-      .run(provider, accountId, Date.now(), setBy);
+      .run(provider, accountId, since, setBy);
   }
 
   upsertSnapshot(accountId: string, bucket: string, reading: BucketReading): void {
@@ -2170,36 +2170,44 @@ export class Store {
     by: 'qlb-switch' | 'qlb-watch' | 'qlb-reconcile';
     now: number;
   }): { appended: boolean; wipedEvent: boolean } {
-    return this.runImmediate(() => {
-      this.setConfig('codex.lastObservedAt', String(input.now));
-      if (!Number.isFinite(input.now) || input.by.trim() === '') {
-        throw new Error('Invalid Codex live observation');
-      }
-      if (input.identity !== null && input.identity.length === 0) {
-        throw new Error('Invalid Codex live observation identity');
-      }
+    return this.runImmediate(() => this.recordCodexObservationInTransaction(input));
+  }
 
-      const newest = this.db.prepare(`SELECT identity, lineage_fp FROM codex_live_observations
-        ORDER BY ts DESC, id DESC LIMIT 1`).get() as { identity: string | null; lineage_fp: string | null } | undefined;
-      const appended = newest === undefined
-        || newest.identity !== input.identity
-        || newest.lineage_fp !== input.lineageFp;
-      let wipedEvent = false;
+  /** Caller holds this Store's BEGIN IMMEDIATE transaction. */
+  private recordCodexObservationInTransaction(input: {
+    identity: string | null;
+    lineageFp: string | null;
+    by: 'qlb-switch' | 'qlb-watch' | 'qlb-reconcile';
+    now: number;
+  }): { appended: boolean; wipedEvent: boolean } {
+    this.setConfig('codex.lastObservedAt', String(input.now));
+    if (!Number.isFinite(input.now) || input.by.trim() === '') {
+      throw new Error('Invalid Codex live observation');
+    }
+    if (input.identity !== null && input.identity.length === 0) {
+      throw new Error('Invalid Codex live observation identity');
+    }
 
-      if (appended) {
-        this.db.prepare(
-          'INSERT INTO codex_live_observations (ts, identity, lineage_fp, by) VALUES (?, ?, ?, ?)',
-        ).run(input.now, input.identity, input.lineageFp, input.by);
-        if (input.lineageFp === null) {
-          assertStoredReloginFields('wiped', 'wiped');
-          this.db.prepare(`INSERT INTO relogin_events (ts, provider, account_id, kind, detail, evidence, user_denied_at)
-            VALUES (?, 'openai-codex', NULL, 'wiped', 'wiped', 'wiped', NULL)`).run(input.now);
-          wipedEvent = true;
-        }
+    const newest = this.db.prepare(`SELECT identity, lineage_fp FROM codex_live_observations
+      ORDER BY ts DESC, id DESC LIMIT 1`).get() as { identity: string | null; lineage_fp: string | null } | undefined;
+    const appended = newest === undefined
+      || newest.identity !== input.identity
+      || newest.lineage_fp !== input.lineageFp;
+    let wipedEvent = false;
+
+    if (appended) {
+      this.db.prepare(
+        'INSERT INTO codex_live_observations (ts, identity, lineage_fp, by) VALUES (?, ?, ?, ?)',
+      ).run(input.now, input.identity, input.lineageFp, input.by);
+      if (input.lineageFp === null) {
+        assertStoredReloginFields('wiped', 'wiped');
+        this.db.prepare(`INSERT INTO relogin_events (ts, provider, account_id, kind, detail, evidence, user_denied_at)
+          VALUES (?, 'openai-codex', NULL, 'wiped', 'wiped', 'wiped', NULL)`).run(input.now);
+        wipedEvent = true;
       }
+    }
 
-      return { appended, wipedEvent };
-    });
+    return { appended, wipedEvent };
   }
 
   /** Settings.py:128-170 bounds; out-of-range persisted strings clamp, not reject. */
@@ -2243,6 +2251,130 @@ export class Store {
       row.detail == null ? null : redactSecrets(row.detail, []), row.publishedAt ?? null, row.committedAt ?? null,
     );
     return Number(result.lastInsertRowid);
+  }
+
+  /**
+   * Step 5: atomically make a fully classified Codex switch observable.
+   * `now`, `publishedAt`, and `committedAt` are caller-owned durable times;
+   * this method deliberately does not sample the clock while committing.
+   */
+  commitCodexSwitch(input: {
+    now: number;
+    accountId: string | null;
+    setBy: 'manual' | 'auto' | 'adopt' | 'journal';
+    fromAccount: string;
+    toAccount: string;
+    trigger: string;
+    outcome: string;
+    attempt: string;
+    via: 'switch' | 'journal';
+    openSessionsJson: string;
+    publishedAt: number | null;
+    committedAt: number;
+    detail?: string | null;
+    outgoing: string;
+    target: string;
+    observation: { identity: string | null; lineageFp: string | null };
+    decision: {
+      leftHeadroom: number | string | null;
+      leftRecoveryAt: number | string | null;
+      leftTrigger: number | string | null;
+    };
+  }): number {
+    return this.runImmediate(() => {
+      this.setActiveLogin('openai-codex', input.accountId, input.setBy, input.now);
+      this.setConfig('cooldown.openai-codex', String(input.now + 300_000));
+
+      if (input.outcome === 'ok') {
+        const setOrDelete = (key: string, value: number | string | null): void => {
+          if (value === null) {
+            this.db.prepare('DELETE FROM config WHERE key = ?').run(key);
+          } else {
+            this.setConfig(key, String(value));
+          }
+        };
+        this.setConfig('auto.openai-codex.lastSwitchFrom', input.fromAccount);
+        setOrDelete(
+          'auto.openai-codex.lastSwitchTo',
+          input.trigger === 'manual' ? null : input.toAccount,
+        );
+        setOrDelete('auto.openai-codex.leftHeadroom', input.decision.leftHeadroom);
+        setOrDelete('auto.openai-codex.leftRecoveryAt', input.decision.leftRecoveryAt);
+        setOrDelete('auto.openai-codex.leftTrigger', input.decision.leftTrigger);
+      }
+
+      const switchId = this.recordSwitch({
+        ts: input.now,
+        provider: 'openai-codex',
+        fromAccount: input.fromAccount,
+        toAccount: input.toAccount,
+        trigger: input.trigger,
+        outcome: input.outcome,
+        stepsJson: JSON.stringify({ attempt: input.attempt, via: input.via }),
+        openSessionsJson: input.openSessionsJson,
+        publishedAt: input.publishedAt,
+        committedAt: input.committedAt,
+        detail: input.detail ?? null,
+      });
+      this.recordCodexObservationInTransaction({
+        ...input.observation,
+        by: input.via === 'journal' ? 'qlb-reconcile' : 'qlb-switch',
+        now: input.now,
+      });
+      if (input.outcome === 'ok') {
+        this.db.prepare(`INSERT INTO codex_watch (switch_id, provider, outgoing, target, next_at, until)
+          VALUES (?, 'openai-codex', ?, ?, ?, ?)`).run(
+          switchId, input.outgoing, input.target, input.now + 120_000, input.now + 300_000,
+        );
+      }
+      return switchId;
+    });
+  }
+
+  /**
+   * Find the committed Codex switch for a durable attempt id. Only rows written
+   * by commitCodexSwitch carry committed_at, so a refusal row with the same
+   * attempt is skipped; rows whose steps_json is not JSON have no attempt.
+   */
+  findCodexSwitchByAttempt(attemptId: string): {
+    id: number;
+    ts: number;
+    provider: string;
+    fromAccount: string | null;
+    toAccount: string;
+    trigger: string;
+    outcome: string;
+    detail: string | null;
+    stepsJson: string | null;
+    openSessionsJson: string | null;
+    publishedAt: number | null;
+    committedAt: number | null;
+  } | null {
+    const row = this.db.prepare(`SELECT id, ts, provider, from_account, to_account, trigger, outcome, detail,
+      steps_json, open_sessions_json, published_at, committed_at
+      FROM switch_log
+      WHERE provider = 'openai-codex' AND committed_at IS NOT NULL
+        AND CASE WHEN json_valid(steps_json) THEN json_extract(steps_json, '$.attempt') END = ?
+      ORDER BY id DESC LIMIT 1`).get(attemptId) as {
+      id: number; ts: number; provider: string; from_account: string | null; to_account: string;
+      trigger: string; outcome: string; detail: string | null; steps_json: string | null;
+      open_sessions_json: string | null; published_at: number | null; committed_at: number | null;
+    } | undefined;
+    if (!row) return null;
+    return {
+      id: row.id,
+      ts: row.ts,
+      provider: row.provider,
+      fromAccount: row.from_account,
+      toAccount: row.to_account,
+      trigger: row.trigger,
+      outcome: row.outcome,
+      detail: row.detail,
+      stepsJson: row.steps_json,
+      openSessionsJson: row.open_sessions_json,
+      publishedAt: row.published_at,
+      committedAt: row.committed_at,
+    };
   }
 
   /** S56 lookup by the composite identity; never exposes a credential document. */
