@@ -85,9 +85,9 @@ export const runGate: GateRun = async (args, env) => {
     const timer = setTimeout(() => child.kill('SIGTERM'), 15_000);
     child.stdout?.on('data', (chunk: Buffer) => { stdout += chunk.toString('utf8'); });
     child.stderr?.on('data', (chunk: Buffer) => { stderr += chunk.toString('utf8'); });
-    child.on('error', () => {
+    child.on('error', (error: NodeJS.ErrnoException) => {
       clearTimeout(timer);
-      resolve({ code: 1, stdout: '', stderr: '' });
+      resolve({ code: 1, stdout: '', stderr: error.code === 'ENOENT' ? 'missing-binary' : '' });
     });
     child.on('close', (code) => {
       clearTimeout(timer);
@@ -110,7 +110,8 @@ function parseAccess(stdout: string): ActiveAccess {
 }
 
 function safeGateCause(result: { code: number; stderr: string }): string {
-  return result.code === 0 ? 'unknown' : result.stderr.trim() || 'unknown';
+  const value = result.stderr.trim().replace(/^qlb gate: refused: /, '');
+  return result.code === 0 ? 'unknown' : value || 'unknown';
 }
 
 /** Pi lets caller headers win over adapter defaults, so never pass stored auth through. */

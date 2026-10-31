@@ -216,15 +216,25 @@ interface ResolveOk {
   mode?: string;
 }
 
-async function qlbConsumeJournal(timeoutMs = 10_000): Promise<ConsumeJournal> {
+interface ConsumeJournalResult {
+  state: ConsumeJournal;
+  cause?: "missing-binary";
+}
+
+async function qlbConsumeJournal(timeoutMs = 10_000): Promise<ConsumeJournalResult> {
   try {
     const result = await runQlb(
       ["consume", "status", "--provider", "anthropic", "--json"],
       timeoutMs,
     );
-    return parseConsumeStatus(result.code, result.stdout);
-  } catch {
-    return "unknown";
+    return { state: parseConsumeStatus(result.code, result.stdout) };
+  } catch (error) {
+    return {
+      state: "unknown",
+      ...(error instanceof Error && (error as NodeJS.ErrnoException).code === "ENOENT"
+        ? { cause: "missing-binary" as const }
+        : {}),
+    };
   }
 }
 
@@ -466,10 +476,11 @@ export default async function (pi: ExtensionAPI): Promise<void> {
           marker: existsSync(consumeMarkerPath()),
         };
   // Pi users who never used QLB (no database) are decided without spawning the CLI.
-  const modeInput =
+  const journal =
     base && !canSkipJournal({ ...base, dbExists: existsSync(qlbDbPath()) })
-      ? { ...base, journal: await qlbConsumeJournal() }
+      ? await qlbConsumeJournal()
       : null;
+  const modeInput = journal ? { ...base!, journal: journal.state } : null;
   const mode = modeInput ? decidePiMode(modeInput) : "inert";
   const xaiOwner = base && (() => {
     const owner = readPiOwnerFile(OWNER_FILE);
@@ -508,7 +519,10 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     registerConflictProvider(
       providerApi,
       () => createAssistantMessageEventStream() as never,
-      conflictMessage(modeInput!),
+      // A malformed owner file is the conflict's own cause, so its text outranks missing-binary.
+      journal?.cause === "missing-binary" && modeInput!.owner !== "malformed"
+        ? qlbUnavailable("anthropic", "missing-binary").error.errorMessage
+        : conflictMessage(modeInput!),
       catalog,
     );
     pi.on("session_start", (_event, ctx) => {
@@ -561,7 +575,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       createStream: () => createAssistantMessageEventStream() as never,
       models: catalog?.models,
       baseUrl: catalog?.baseUrl,
-      consumeJournal: () => qlbConsumeJournal(5_000),
+      consumeJournal: async () => (await qlbConsumeJournal(5_000)).state,
       ownerState: () => readOwnerFileState(OWNER_FILE),
       readAccess: () => readActiveClaudeAccess(),
       shapePayload: shapeAnthropicOAuthPayload,

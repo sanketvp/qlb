@@ -6,6 +6,7 @@ import { dirname, join, resolve } from 'node:path';
 import { describe, it } from 'node:test';
 
 import { resolvePiPackageRoot } from '../src/pi-integration';
+import { CONSUME_ERRORS } from '../extensions/qlb-pi/consume';
 
 const ROOT = join(__dirname, '..', '..');
 const PI_GLOBAL_ROOT = process.env.QLB_TEST_PI_ROOT ?? resolvePiPackageRoot() ?? '/nonexistent-pi';
@@ -138,7 +139,11 @@ process.exit(code);
 `;
 }
 
-function run(provider: Provider, failure: (typeof CAUSES)[number]): {
+function run(
+  provider: Provider,
+  failure: (typeof CAUSES)[number],
+  { absentAtStartup = false, malformedOwner = false }: { absentAtStartup?: boolean; malformedOwner?: boolean } = {},
+): {
   events: Array<{ error?: { errorMessage?: string } }>;
   registrations: string[];
   replaced: boolean;
@@ -156,7 +161,9 @@ function run(provider: Provider, failure: (typeof CAUSES)[number]): {
   mkdirSync(join(agent, 'src'), { recursive: true });
   cpSync(join(ROOT, 'src', 'redact.ts'), join(agent, 'src', 'redact.ts'));
   cpSync(join(ROOT, 'src', 'pi-owner-document.ts'), join(agent, 'src', 'pi-owner-document.ts'));
-  writeFileSync(join(agent, 'qlb-owner.json'), JSON.stringify({ providers: Object.fromEntries(PROVIDERS.map((name) => [name, { mode: 'qlb', since: 1 }])) }));
+  writeFileSync(join(agent, 'qlb-owner.json'), malformedOwner
+    ? '{not json'
+    : JSON.stringify({ providers: Object.fromEntries(PROVIDERS.map((name) => [name, { mode: 'qlb', since: 1 }])) }));
   // The adapter parses this literal configuration but must never execute it.
   writeFileSync(join(agent, 'models.json'), JSON.stringify({ providers: { openrouter: { baseUrl: 'https://fixture.invalid', apiKey: `!command touch ${commandMarker}` } } }));
   const entry = join(home, 'load.mjs');
@@ -166,8 +173,10 @@ function run(provider: Provider, failure: (typeof CAUSES)[number]): {
 
   mkdirSync(gateDir);
   const gate = join(gateDir, 'qlb');
-  writeFileSync(gate, fakeGateSource());
-  chmodSync(gate, 0o755);
+  if (!absentAtStartup) {
+    writeFileSync(gate, fakeGateSource());
+    chmodSync(gate, 0o755);
+  }
   const path = gateDir;
   const child = spawnSync(process.execPath, [entry], {
     encoding: 'utf8',
@@ -203,7 +212,10 @@ describe('qlb-pi registered streamSimple fail-closed matrix', { skip: piAvailabl
         const result = run(provider, failure);
         assert.equal(result.replaced, true, 'registered provider source was not selected');
         assert.equal(result.events.length, 1);
-        assert.match(result.events[0]?.error?.errorMessage ?? '', new RegExp(`^QLB unavailable for ${provider}`));
+        assert.equal(
+          result.events[0]?.error?.errorMessage,
+          `QLB unavailable for ${provider} — run qlb doctor (${failure.cause})`,
+        );
         assert.deepEqual(result.transportCalls, []);
         if (failure.cause !== 'missing-binary') assert.deepEqual(result.gateCalls, [provider]);
         if (provider === 'openrouter') {
@@ -212,4 +224,24 @@ describe('qlb-pi registered streamSimple fail-closed matrix', { skip: piAvailabl
       });
     }
   }
+
+  it('anthropic: missing binary at startup', () => {
+    const failure = CAUSES[0];
+    const result = run('anthropic', failure, { absentAtStartup: true });
+    assert.equal(result.replaced, true, 'registered provider source was not selected');
+    assert.equal(result.events.length, 1);
+    assert.equal(
+      result.events[0]?.error?.errorMessage,
+      'QLB unavailable for anthropic — run qlb doctor (missing-binary)',
+    );
+    assert.deepEqual(result.transportCalls, []);
+    assert.deepEqual(result.gateCalls, []);
+  });
+
+  it('anthropic: a malformed owner file outranks a missing binary at startup', () => {
+    const result = run('anthropic', CAUSES[0], { absentAtStartup: true, malformedOwner: true });
+    assert.equal(result.events.length, 1);
+    assert.equal(result.events[0]?.error?.errorMessage, CONSUME_ERRORS.conflict);
+    assert.deepEqual(result.transportCalls, []);
+  });
 });
