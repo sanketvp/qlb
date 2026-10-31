@@ -7,7 +7,7 @@ import {
   type HelperSigningState,
 } from './helper-signing';
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { dirname, join } from 'node:path';
 import { consumeMarkerPathFor, CSWAP_ANTHROPIC_STORE } from './cswap-consume';
 import { builtInAdapters } from './adapters';
 import { CONFIG_ENV_VARS, OPENROUTER_KEYCHAIN_SERVICE, type QlbConfig } from './config';
@@ -669,7 +669,10 @@ export async function doctorQlb(
     }
   }
   checks.push(keychainCheck);
-  checks.push(...await libsecretStashChecks(options.keychain ?? platformKeychain));
+  checks.push(...await libsecretStashChecks(
+    options.keychain ?? platformKeychain,
+    join(dirname(config.dbPath), 'unclaimed'),
+  ));
   if (hostPlatform === 'darwin') {
     const configValue = options.configReader ?? ((key: string) => recordedConfig.get(key) ?? null);
     const signing = (options.helperSigning ?? inspectHelperSigning)();
