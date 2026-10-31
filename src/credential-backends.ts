@@ -145,8 +145,10 @@ export function wrapCredentialError(
   if (msg.startsWith(prefix) && err instanceof Error) return err;
   const wrapped = new Error(msg.startsWith(prefix) ? msg : `${prefix}${msg}`);
   if (err && typeof err === 'object') {
-    const status = (err as { status?: unknown }).status;
+    const { status, code } = err as { status?: unknown; code?: unknown };
     if (status !== undefined) Object.assign(wrapped, { status });
+    // Keep `code` so callers such as qlb doctor still recognise a timeout (ETIMEDOUT).
+    if (code !== undefined) Object.assign(wrapped, { code });
     Object.assign(wrapped, { cause: err });
   }
   return wrapped;

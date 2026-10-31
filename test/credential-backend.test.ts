@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
-import { isCredentialNotFound } from '../src/credential-backends';
+import { isCredentialNotFound, isSecurityTimeout } from '../src/credential-backends';
 import {
   DPAPI_DECRYPT_SCRIPT,
   DPAPI_ENCRYPT_SCRIPT,
@@ -241,6 +241,8 @@ describe('Linux libsecret command construction', () => {
       return error instanceof Error && /timed out/.test(error.message);
     });
     assert.equal(isCredentialNotFound(thrown), false);
+    // qlb doctor classifies timeouts with isSecurityTimeout; the wrapped error must keep its code.
+    assert.equal(isSecurityTimeout(thrown), true);
   });
 });
 
