@@ -11,6 +11,7 @@ import { ADAPTER_ACCOUNT_IDS } from './migration';
 import { isCredentialNotFound } from './credential-backends';
 import { isNativeOpenRouterKeyNotFound, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, type KeychainBackend } from './keychain';
 import { qlbHomeDir } from './home';
+import { resolveSingleGrantKeychain, sharedSingleGrantCoords } from './single-grant-ownership';
 import type { Store } from './store';
 
 export const PI_SINGLE_PROVIDERS = ['xai', 'kimi-coding', 'openrouter'] as const;
@@ -224,6 +225,44 @@ function genericMigrationOwnedError(): Error {
   return Object.assign(new Error('owned-by-generic-migrate'), { code: 'owned-by-generic-migrate', exitCode: 3 });
 }
 
+function stashKeptGenericCopy(
+  provider: PiSingleProvider,
+  deps: PiMigrateDeps,
+  ownJournal: Journal | null,
+): void {
+  if (provider === 'openrouter' || ownJournal || deps.store?.getConfig(`pi.${provider}.state`) === 'migrated') return;
+  const generic = deps.store?.getMigration(`pi-${provider}`);
+  if (!generic || generic.state !== 'NATIVE') return;
+
+  const detail = asObject(JSON.parse(generic.detail_json), 'generic migration journal is malformed');
+  const accounts = detail.accounts;
+  if (!Array.isArray(accounts)) return;
+  let coords;
+  try { coords = resolveSingleGrantKeychain(provider, accounts[0]); } catch { return; }
+  const shared = sharedSingleGrantCoords(provider);
+  if (coords.service !== shared.service || coords.account !== shared.account) return;
+
+  const lastRollback = detail.lastRollback;
+  if (!lastRollback || typeof lastRollback !== 'object' || Array.isArray(lastRollback)) return;
+  const rollback = lastRollback as JsonObject;
+  if (rollback.keychainDisposition !== 'keep') return;
+  if (typeof rollback.cleanedAt !== 'number' || !Number.isFinite(rollback.cleanedAt)) {
+    throw new Error('generic migration lastRollback cleanedAt is invalid');
+  }
+  const stashService = `qlb:${provider}:unclaimed:${new Date(rollback.cleanedAt).toISOString()}`;
+  const kept = deps.keychain.getSync(shared.service, shared.account);
+  let stash: string | undefined;
+  try { stash = deps.keychain.getSync(stashService, QLB_KEYCHAIN_ACCOUNT); } catch (error) {
+    if (!isCredentialNotFound(error)) throw error;
+  }
+  if (stash === undefined) {
+    deps.keychain.setSync(stashService, QLB_KEYCHAIN_ACCOUNT, kept);
+    if (deps.keychain.getSync(stashService, QLB_KEYCHAIN_ACCOUNT) !== kept) {
+      throw new Error('kept generic copy stash verification failed');
+    }
+  }
+}
+
 /** P7a migration with S58's credential-first publication order. */
 export function migratePiSingleProvider(provider: PiSingleProvider, paths: PiMigratePaths = defaultPiMigratePaths(), deps: PiMigrateDeps, options: { dryRun?: boolean } = {}): PiMigrateResult {
   assertPiSingleProvider(provider); const existing = readJournal(paths, provider); const wouldWrite = [managedService(provider), `placeholder:${provider}`, `owner:${provider}`];
@@ -238,6 +277,7 @@ export function migratePiSingleProvider(provider: PiSingleProvider, paths: PiMig
     journal = inLockJournal ?? { provider, phase: 'started', ownerPid: process.pid, updatedAt: Date.now() };
     resumed = inLockJournal !== null;
     if (!genericMigrationAtRest(provider, paths, deps, inLockJournal)) throw genericMigrationOwnedError();
+    stashKeptGenericCopy(provider, deps, inLockJournal);
     const auth = readAuth(paths.authJsonPath); const currentOwner = readPiOwnerProviders(paths.ownerPath);
     const alreadyMigrated = !inLockJournal && (provider === 'openrouter' || isPiPlaceholder(auth[provider])) && isPiQlbOwnerEntry(currentOwner[provider]);
     if (alreadyMigrated) {
