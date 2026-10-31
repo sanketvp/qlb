@@ -387,12 +387,12 @@ function resolveNativeResyncKeychain(
   if (!detail || typeof detail !== 'object' || Array.isArray(detail)) {
     throw new Error('generic migration journal is invalid');
   }
-  return resolveSingleGrantKeychain(
-    provider,
-    (detail as { accounts?: unknown }).accounts instanceof Array
-      ? (detail as { accounts: unknown[] }).accounts[0]
-      : undefined,
-  );
+  const accounts = (detail as { accounts?: unknown }).accounts;
+  // Exactly one account, as genericHoldsSharedItem, rollback and doctor require.
+  if (!Array.isArray(accounts) || accounts.length !== 1) {
+    throw new Error('generic migration journal must record exactly one account');
+  }
+  return resolveSingleGrantKeychain(provider, accounts[0]);
 }
 
 function sameKeychainCoords(

@@ -913,6 +913,38 @@ describe('bindDetectAndResync + MockKeychain', () => {
     assert.equal(kc.getSync(legacyService, label), legacyBefore);
     store.close();
   });
+
+  it('native-resync refuses a generic journal with more than one account and writes nothing', async () => {
+    for (const provider of ['xai', 'kimi-coding'] as const) {
+      const dir = mkdtempSync(join(tmpdir(), `qlb-resync-journal-multi-${provider}-`));
+      temps.push(dir);
+      const store = openStore(join(dir, 'qlb.db'));
+      const kc = new MockKeychain();
+      const id = ADAPTER_ACCOUNT_IDS[provider];
+      const label = ADAPTER_ACCOUNT_LABELS[provider];
+      const shared = sharedSingleGrantCoords(provider);
+      const legacyService = qlbKeychainService(provider, id);
+      const sharedBefore = JSON.stringify({ ...grant('shared'), generation: 0 });
+      const legacyBefore = JSON.stringify({ ...grant('legacy'), generation: 0 });
+      const journal = JSON.parse(singleGrantJournal(provider, shared)) as { accounts: unknown[] };
+      journal.accounts.push(journal.accounts[0]);
+      store.upsertAccount(id, provider, label);
+      store.upsertMigration(`pi-${provider}`, 'QLB_OWNED', JSON.stringify(journal));
+      kc.setSync(shared.service, shared.account, sharedBefore);
+      kc.setSync(legacyService, label, legacyBefore);
+
+      const result = await bindDetectAndResync({
+        store,
+        keychain: kc,
+        readNativeCredential: async () => grant('native'),
+      })(id, provider);
+
+      assert.equal(result.resynced, false, `${provider}: ${result.reason}`);
+      assert.equal(kc.getSync(shared.service, shared.account), sharedBefore, provider);
+      assert.equal(kc.getSync(legacyService, label), legacyBefore, provider);
+      store.close();
+    }
+  });
 });
 
 describe('inspectOwnedNativeDrift (read-only)', () => {
