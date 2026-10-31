@@ -301,6 +301,37 @@ describe('qlb claude add (K11 / AC32)', () => {
     store.close();
   });
 
+  it('qlb claude add names the account that already holds the login', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-cc-add-duplicate-'));
+    const dbPath = join(root, 'qlb.db');
+    const store = openStore(dbPath);
+    beginCutover(store);
+    store.close();
+    const { slots, repository } = fixture();
+    await slots.createSlot({ accountId: 'account-a', credential: credential('shared'), source: 'cswap-import' });
+    const output: string[] = [];
+
+    const code = await runClaudeAddCommand([], context(dbPath, output), {
+      readLive: async () => ({ credential: credential('shared'), config: config('account-b') }),
+      add: async (input) => addClaudeLogin({ ...input, slots }),
+    });
+
+    assert.equal(code, 3);
+    assert.match(output[0]!, /already belongs to slot account-a/);
+    assert.equal(repository.getSlot('account-b'), null);
+  });
+
+  it('replacing an account with its own login is not refused when a legacy store also holds that login elsewhere', async () => {
+    const { slots, repository, backend } = fixture();
+    await slots.createSlot({ accountId: 'account-b', credential: credential('shared'), source: 'cswap-import' });
+    // A store written before K3-r can hold a second slot on the same lineage; seed it directly.
+    repository.createSlot({ ...slots.getSlot('account-b')!, accountId: 'account-a', slotNum: null });
+    await backend.set('qlb:anthropic:account-a', 'qlb', credential('shared'));
+
+    const result = await addClaudeLogin({ credential: credential('shared'), config: config('account-b'), slots, replace: 'account-b' });
+    assert.equal(result.accountId, 'account-b');
+  });
+
   it('parses strict arguments and turns a cross-identity replacement into exit 3', async () => {
     const root = mkdtempSync(join(tmpdir(), 'qlb-cc-add-command-'));
     const dbPath = join(root, 'qlb.db');

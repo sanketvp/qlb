@@ -945,7 +945,8 @@ export class ClaudeSlots {
         throw new Error(input.replace ? 'Claude replace slot not found' : 'Claude slot already exists');
       }
       const fingerprint = this.fingerprint(input.credential);
-      this.assertLineageAvailable(input.accountId, fingerprint);
+      // A slot that already holds this lineage may keep it, even in a legacy store that duplicates it.
+      if (existing?.fingerprint !== fingerprint) this.assertLineageAvailable(input.accountId, fingerprint);
       const oldCurrent = await this.readExistingCredential(input.accountId);
       // Add must preserve createSlot's crash-window orphan guard, including
       // when an archived row is being reactivated.

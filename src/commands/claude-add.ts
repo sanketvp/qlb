@@ -146,7 +146,7 @@ export async function runClaudeAddCommand(
     // backend/file errors, which could contain credential or path fragments.
     const message = error instanceof ClaudeLiveStateInconsistent
       ? error.message
-      : error instanceof Error && /^(active Claude login is an API key|Claude config has no |invalid |Claude slot (already exists|credential already exists)|replace target belongs|Claude replace slot not found|undo-in-progress|cutover-begin-in-progress|phase=)/.test(error.message)
+      : error instanceof Error && /^(active Claude login is an API key|Claude config has no |invalid |Claude slot (already exists|credential already exists)|Claude credential already belongs to slot |replace target belongs|Claude replace slot not found|undo-in-progress|cutover-begin-in-progress|phase=)/.test(error.message)
         ? error.message
         : 'could not add active Claude login';
     ctx.stderr(`qlb claude add: refused: ${message}`);
