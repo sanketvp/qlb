@@ -14,7 +14,7 @@ export interface GateResult {
 }
 
 /** Injectable process boundary for `qlb gate anthropic --json`. */
-export type GateRunner = (provider: 'anthropic') => Promise<GateResult>;
+export type GateRunner = (provider: 'anthropic', retryAfter401Fp?: string) => Promise<GateResult>;
 
 export interface AnthropicSourceDeps {
   runGate: GateRunner;
@@ -69,10 +69,10 @@ function parseGatePayload(stdout: string): ActiveAccess {
 export function createAnthropicSource(deps: AnthropicSourceDeps): ActiveAccessSource {
   return {
     provider: 'anthropic',
-    async read(): Promise<ActiveAccess> {
+    async read(retryAfter401Fp?: string): Promise<ActiveAccess> {
       let result: GateResult;
       try {
-        result = await deps.runGate('anthropic');
+        result = await deps.runGate('anthropic', retryAfter401Fp);
       } catch (error) {
         throw unavailable(failureCause(error));
       }

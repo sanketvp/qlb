@@ -45,6 +45,7 @@
 // See decidePiMode in consume.ts.
 
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
@@ -125,6 +126,10 @@ const AUDIT_DIR = join(homedir(), ".qlb");
 const AUDIT_FILE = join(AUDIT_DIR, "outcomes.jsonl");
 // Covers 9s + 9s credential locks and a 10s refresh POST, with margin.
 const ANTHROPIC_GATE_TIMEOUT_MS = 45_000;
+
+function accessFingerprint(token: string): string {
+  return `sha256-at:${createHash("sha256").update(token, "utf8").digest("hex")}`;
+}
 
 /**
  * Codex ownership is explicit: the shared v2 document must name Codex, while
@@ -576,9 +581,9 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       return;
     }
     const source = createAnthropicSource({
-      runGate: async (provider) => {
+      runGate: async (provider, retryAfter401Fp) => {
         const result = await runQlb(
-          ["gate", provider, "--json"],
+          ["gate", provider, "--json", ...(retryAfter401Fp === undefined ? [] : ["--retry-after-401", retryAfter401Fp])],
           ANTHROPIC_GATE_TIMEOUT_MS,
           { ...process.env, QLB_PI_TOKEN_CALL: "1" },
         );
@@ -592,7 +597,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
         const output = createAssistantMessageEventStream();
         void (async () => {
           try {
-            const access = await source.read();
+            let access = await source.read();
             const decision: ResolveOk = {
               provider: "anthropic",
               accountId: access.accountId,
@@ -611,6 +616,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
                 : payload;
               return shapeAnthropicOAuthPayload(upstream);
             };
+            let accountChanged = false;
             const result = await streamWithAuthRetry({
               readAccess: () => access.token,
               startStream: (token) =>
@@ -619,14 +625,26 @@ export default async function (pi: ExtensionAPI): Promise<void> {
                   apiKey: token,
                   onPayload,
                 }),
-              // QLB owns token renewal; a failed request must not consult a
-              // native credential or retry through any fallback source.
-              resync: async () => ({ resynced: false, reason: "gate-source" }),
+              // QLB owns token renewal; on one failed request, re-run its
+              // gate with the rejected access generation's non-secret hash.
+              resync: async () => {
+                const next = await (source.read as (retryAfter401Fp?: string) => Promise<typeof access>)(accessFingerprint(access.token));
+                // A retry never switches accounts: surface the original 401
+                // and record nothing (spec rev 5, K6b r1 item 2).
+                if (next.accountId !== access.accountId) {
+                  accountChanged = true;
+                  return { resynced: false, reason: "gate-source-account-changed" };
+                }
+                if (next.token === access.token) return { resynced: false, reason: "gate-source-unchanged" };
+                access = next;
+                return { resynced: true, reason: "gate-source-refreshed" };
+              },
               onEvent: (event) => {
                 output.push(event as never);
               },
               onResync: () => undefined,
             });
+            if (accountChanged) return;
             recordOutcome({
               accountId: decision.accountId,
               model: model.id,
