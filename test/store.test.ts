@@ -485,3 +485,42 @@ describe('Codex switch commit primitive', () => {
     }
   });
 });
+
+describe('Codex recovery fence resolution — C6-20', () => {
+  function openFenceStore() { return openStore(join(mkdtempSync(join(tmpdir(), 'qlb-store-fence-')), 'qlb.db')); }
+  function fenceFor(store: ReturnType<typeof openStore>) {
+    const id = store.commitCodexSwitch({ now: 100, accountId: 'to:account', setBy: 'manual', fromAccount: 'from:account',
+      toAccount: 'to:account', trigger: 'manual', outcome: 'ok', attempt: 'switch-attempt', via: 'switch', openSessionsJson: '[]',
+      publishedAt: 90, committedAt: 100, outgoing: 'from:account', target: 'to:account',
+      observation: { identity: 'to:account', lineageFp: 'to-fp' }, decision: { leftHeadroom: null, leftRecoveryAt: null, leftTrigger: null } });
+    return { v: 1 as const, switchId: id, attempt: 'fence-attempt', from: 'from:account', to: 'to:account', publishedAt: 90,
+      reason: 'slot-split', involvedAccounts: ['from:account', 'to:account'], since: 101 };
+  }
+
+  it('commitFenceResolution writes the effect row with the fence\'s published_at and via fence, deletes the fence and the codex_watch row, in one transaction', () => {
+    const store = openFenceStore();
+    try {
+      const fence = fenceFor(store); store.setRecoveryFence(fence);
+      store.commitFenceResolution({ fence, effect: { outcome: 'reverted-by-codex', accountId: 'from:account' },
+        setActive: 'from:account', attempt: fence.attempt, now: 200 });
+      const db = (store as unknown as { db: DatabaseSync }).db;
+      assert.equal(store.getConfig('codex.recoveryFence'), null);
+      assert.equal(Number((db.prepare('SELECT COUNT(*) AS count FROM codex_watch').get() as { count: number }).count), 0);
+      assert.deepEqual({ ...(db.prepare('SELECT outcome, published_at, steps_json FROM switch_log ORDER BY id DESC').get() as object) },
+        { outcome: 'reverted-by-codex', published_at: 90, steps_json: '{"attempt":"fence-attempt","via":"fence"}' });
+    } finally { store.close(); }
+  });
+
+  it('a failure inside commitFenceResolution leaves the fence', () => {
+    const store = openFenceStore();
+    try {
+      const fence = fenceFor(store); store.setRecoveryFence(fence);
+      const db = (store as unknown as { db: DatabaseSync }).db;
+      db.exec("CREATE TEMP TRIGGER fail_fence_delete BEFORE DELETE ON config WHEN OLD.key = 'codex.recoveryFence' BEGIN SELECT RAISE(ABORT, 'fence'); END");
+      assert.throws(() => store.commitFenceResolution({ fence, effect: { outcome: 'failed', detail: 'wiped' },
+        setActive: null, attempt: fence.attempt, now: 200 }), /fence/);
+      assert.notEqual(store.getConfig('codex.recoveryFence'), null);
+      assert.equal(Number((db.prepare("SELECT COUNT(*) AS count FROM switch_log WHERE steps_json LIKE '%\"via\":\"fence\"%'").get() as { count: number }).count), 0);
+    } finally { store.close(); }
+  });
+});

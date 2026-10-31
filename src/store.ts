@@ -13,6 +13,7 @@ import { inspectAccountSafety, safetyRefusalMessage } from './accounts-prune';
 import { config } from './config';
 import { redactJson, redactKeyValueText, redactSecrets } from './redact';
 import type { BucketReading, Confidence } from './types';
+import { parseCodexRecoveryFence, type CodexRecoveryFence } from './codex-sessions';
 
 export const DEFAULT_DB_PATH = config.dbPath;
 
@@ -2375,6 +2376,56 @@ export class Store {
       publishedAt: row.published_at,
       committedAt: row.committed_at,
     };
+  }
+
+  /**
+   * Persist an unresolved recovery fence. Repeated unresolved observations can
+   * only widen its account set; malformed prior state fails closed to '*'.
+   */
+  setRecoveryFence(fence: CodexRecoveryFence): void {
+    this.runImmediate(() => {
+      const raw = this.getConfig('codex.recoveryFence');
+      const prior = parseCodexRecoveryFence(raw);
+      const involvedAccounts = this.hasConfig('codex.recoveryFence') && prior === null
+        ? '*'
+        : prior === null || prior.involvedAccounts === '*' || fence.involvedAccounts === '*'
+          ? fence.involvedAccounts
+          : [...new Set([...prior.involvedAccounts, ...fence.involvedAccounts])].sort();
+      const next: CodexRecoveryFence = { ...fence, involvedAccounts,
+        since: prior?.since ?? fence.since };
+      this.setConfig('codex.recoveryFence', JSON.stringify(next));
+    });
+  }
+
+  /** Clearing is intentionally only called by locked reconciliation. */
+  clearRecoveryFence(): void {
+    this.db.prepare("DELETE FROM config WHERE key = 'codex.recoveryFence'").run();
+  }
+
+  /** Resolve a config fence and its old watch in the same SQLite transaction. */
+  commitFenceResolution(input: {
+    fence: CodexRecoveryFence;
+    effect: { outcome: 'failed'; detail: string } | { outcome: 'reverted-by-codex'; accountId: string } | { outcome: 'ok' | 'quiet' | 'stopped'; reason?: string; detail?: string };
+    setActive?: string | null;
+    attempt: string;
+    now: number;
+  }): number {
+    return this.runImmediate(() => {
+      const source = this.db.prepare(`SELECT from_account, to_account, trigger FROM switch_log WHERE id = ?`)
+        .get(input.fence.switchId) as { from_account: string | null; to_account: string; trigger: string } | undefined;
+      if (!source || source.from_account === null) throw new Error('Recovery fence switch row is missing');
+      if (input.setActive !== undefined) this.setActiveLogin('openai-codex', input.setActive, 'adopt', input.now);
+      const outcome = input.effect.outcome === 'quiet' ? 'ok' : input.effect.outcome === 'stopped' ? 'failed' : input.effect.outcome;
+      const detail = input.effect.outcome === 'failed' ? input.effect.detail
+        : input.effect.outcome === 'stopped' ? (input.effect.reason ?? null) : null;
+      const switchId = this.recordSwitch({ ts: input.now, provider: 'openai-codex', fromAccount: source.from_account,
+        toAccount: source.to_account, trigger: source.trigger, outcome,
+        stepsJson: JSON.stringify({ attempt: input.attempt, via: 'fence' }), publishedAt: input.fence.publishedAt,
+        committedAt: input.now, detail });
+      this.clearRecoveryFence();
+      this.db.prepare('DELETE FROM codex_watch WHERE switch_id = ?').run(input.fence.switchId);
+      return switchId;
+    });
   }
 
   /** S56 lookup by the composite identity; never exposes a credential document. */

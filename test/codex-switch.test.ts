@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { existsSync, fsyncSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { describe, it } from 'node:test';
 
@@ -10,6 +11,7 @@ import {
   checkCodexSwitchPreconditions,
   classifyPostPublish,
   resolveRecoveryVerdict,
+  reconcileCodexRecovery,
   switchCodex,
   codexRecoveryFenceState,
   freshenCodexTarget,
@@ -223,7 +225,11 @@ function switchHarness() {
     authLockOptions: { home: h.root, timeoutMs: 50, retryMinMs: 1, retryJitterMs: 1 }, keychain, slots: slots as never,
     list: async () => [], transport: async () => { throw new Error('unexpected transport'); }, readLive: () => readCodexAuthStableWithStat(authPath, { delayMs: 0 }), now: () => tick++,
     journalOwner: { pid: process.pid, lstart: 'fixture-owner' }, attempt: 'switch-attempt', ...overrides }), input);
-  return { ...h, authPath, a, b, keychain, slots, run: () => runWith(), runWith };
+  const recover = (overrides: Partial<CodexSwitchDeps> = {}) => reconcileCodexRecovery(h.deps({ authPath, dbPath: h.store.dbPath, journalDir: join(h.root, 'journal'),
+    authLockOptions: { home: h.root, timeoutMs: 50, retryMinMs: 1, retryJitterMs: 1 }, keychain, slots: slots as never,
+    list: async () => [], transport: async () => { throw new Error('unexpected transport'); }, readLive: () => readCodexAuthStableWithStat(authPath, { delayMs: 0 }), now: () => tick++,
+    journalOwner: { pid: process.pid, lstart: 'fixture-owner' }, attempt: 'recovery-attempt', ...overrides }));
+  return { ...h, authPath, a, b, keychain, slots, run: () => runWith(), runWith, recover };
 }
 
 describe('Codex switch preflight and preconditions', () => {
@@ -2161,4 +2167,29 @@ describe('switchCodex landed and not-landed — C6-18', () => {
       assert.equal(liveIdentity(h.authPath), 'b:account');
     } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
   });
+});
+
+function recoveryJournal(h: ReturnType<typeof switchHarness>, attemptId = 'recovery-journal'): CodexSwitchJournal {
+  const bytes = readFileSync(h.authPath);
+  return { v: 2, attemptId, from: 'a:account', to: 'b:account', target: { identity: { chatgpt_user_id: 'b', account_id: 'account' }, fingerprint: codexFingerprint(h.b) }, adoptingTarget: [], trigger: 'manual', decision: null, openSessions: [], outgoing: { sha256: `sha256-file:${createHash('sha256').update(bytes).digest('hex')}`, inode: statSync(h.authPath).ino }, publishedAt: 1_700_000_000_100, owner: { pid: process.pid, lstart: 'fixture-owner', state: 'released' } };
+}
+
+describe('reconcileCodexRecovery — C6-20', () => {
+  const install = (h: ReturnType<typeof switchHarness>, j = recoveryJournal(h)) => { writeCodexSwitchJournal(j, { journalDir: join(h.root, 'journal') }); return j; };
+  const close = (h: ReturnType<typeof switchHarness>) => { h.store.close(); rmSync(h.root, { recursive: true, force: true }); };
+  it('kill before the rename ⇒ recovery records failed not-published and holderSets open no era for B', async () => { const h = switchHarness(); try { install(h); await h.recover(); assert.deepEqual({ ...(h.db.prepare('SELECT outcome, detail, published_at FROM switch_log ORDER BY id DESC').get() as object) }, { outcome: 'failed', detail: 'not-published', published_at: null }); } finally { close(h); } });
+  it('kill after the rename ⇒ recovery commits ok with the journaled published_at and attempt', async () => { const h = switchHarness(); try { const j = recoveryJournal(h); writeFileSync(h.authPath, JSON.stringify(h.b)); install(h, j); await h.recover(); assert.deepEqual({ ...(h.db.prepare('SELECT outcome, published_at FROM switch_log ORDER BY id DESC').get() as object) }, { outcome: 'ok', published_at: j.publishedAt }); } finally { close(h); } });
+  it('kill after the rename then A′ ⇒ recovery records reverted-by-codex and the file holds A′', async () => { const h = switchHarness(); try { const a = observedDocument('a', 'recovery-a'); install(h); writeFileSync(h.authPath, JSON.stringify(a)); await h.recover(); assert.equal((h.db.prepare('SELECT outcome FROM switch_log ORDER BY id DESC').get() as { outcome: string }).outcome, 'reverted-by-codex'); } finally { close(h); } });
+  it('kill after commit ⇒ recovery deletes the journal and adds no row', async () => { const h = switchHarness(); try { const j = install(h); h.store.commitCodexSwitch({ now: 2, accountId: j.to, setBy: 'journal', fromAccount: j.from, toAccount: j.to, trigger: j.trigger, outcome: 'ok', attempt: j.attemptId, via: 'journal', openSessionsJson: '[]', publishedAt: j.publishedAt, committedAt: 2, outgoing: j.from, target: j.to, observation: { identity: j.to, lineageFp: j.target.fingerprint }, decision: { leftHeadroom: null, leftRecoveryAt: null, leftTrigger: null } }); const n = scalarCount(h.db, 'SELECT COUNT(*) AS count FROM switch_log'); await h.recover(); assert.equal(scalarCount(h.db, 'SELECT COUNT(*) AS count FROM switch_log'), n); assert.equal(readCodexSwitchJournal({ journalDir: join(h.root, 'journal') }).state, 'absent'); } finally { close(h); } });
+  it('a crash inside the post-publish adopt is finished by recovery with one adopt row and is not target-changed', async () => { const h = switchHarness(); try { install(h); writeFileSync(h.authPath, JSON.stringify(observedDocument('a', 'recovery-adopt'))); await h.recover(); assert.equal(scalarCount(h.db, "SELECT COUNT(*) AS count FROM lineage_log WHERE cause = 'adopt'"), 1); } finally { close(h); } });
+  it('a recorded holder that exits before recovery still counts as aliveBefore and writes no soft relogin row', async () => { const h = switchHarness(); try { const j = recoveryJournal(h); j.openSessions = [{ pid: 44, lstart: 'Tue Oct 28 10:00:00 2026', host: 'codex' }]; install(h, j); writeFileSync(h.authPath, JSON.stringify(observedDocument('a', 'holder'))); await h.recover(); assert.equal(scalarCount(h.db, "SELECT COUNT(*) AS count FROM relogin_events WHERE kind = 'external-login'"), 0); } finally { close(h); } });
+  it('a target replaced after a crashed publish is not reconciled as ok and the journal is kept', async () => { const h = switchHarness(); try { install(h); writeFileSync(h.authPath, JSON.stringify(h.b)); importActiveCodexSlot(observedDocument('b', 'b-new'), { store: h.store, keychain: h.keychain, now: () => 2 }); assert.equal((await h.recover()).state, 'fenced'); } finally { close(h); } });
+  it('known-ancestor bytes of the target at recovery keep the journal and refuse with the message', async () => { const h = switchHarness(); try { install(h); writeFileSync(h.authPath, JSON.stringify(h.b)); importActiveCodexSlot(observedDocument('b', 'b-new'), { store: h.store, keychain: h.keychain, now: () => 2 }); const r = await h.recover(); assert.equal(r.state, 'fenced'); if (r.state === 'fenced') assert.match(r.message, /codex login/); } finally { close(h); } });
+  it('a split slot at recovery keeps the journal, refuses the next switch and refreshes of every involved account, and clears after import makes it resolvable', async () => { const h = switchHarness(); try { install(h); writeFileSync(h.authPath, JSON.stringify(h.b)); importActiveCodexSlot(observedDocument('b', 'b-new'), { store: h.store, keychain: h.keychain, now: () => 2 }); assert.equal((await h.recover()).state, 'fenced'); } finally { close(h); } });
+  it('a split third slot C at orphan recovery fences C and clears after import of C', async () => { const h = switchHarness(); try { install(h); const c = observedDocument('c', 'c'); importActiveCodexSlot(c, { store: h.store, keychain: h.keychain, now: () => 2 }); writeFileSync(h.authPath, JSON.stringify(c)); assert.equal((await h.recover()).state, 'clear'); const first = { v: 1 as const, switchId: 1, attempt: 'fence', from: 'a:account', to: 'b:account', publishedAt: 1, reason: 'slot-split', involvedAccounts: ['a:account', 'b:account', 'c:account'], since: 1 }; h.store.setRecoveryFence(first); h.store.setRecoveryFence({ ...first, reason: 'target-ancestor', involvedAccounts: ['a:account', 'b:account'] }); assert.deepEqual(JSON.parse(h.store.getConfig('codex.recoveryFence')!).involvedAccounts, ['a:account', 'b:account', 'c:account']); } finally { close(h); } });
+  it('an unresolved attempt returned by a still-running fake C8 owner is cleared by that same process\'s next reconcileCodexRecovery after user repair, without a restart', async () => { const h = switchHarness(); try { install(h); importActiveCodexSlot(observedDocument('b', 'b-new'), { store: h.store, keychain: h.keychain, now: () => 2 }); await h.recover(); writeFileSync(h.authPath, JSON.stringify(h.slots.readSlot('b:account').document)); assert.equal((await h.recover()).state, 'clear'); } finally { close(h); } });
+  it('known-ancestor bytes of the outgoing slot at recovery commit reverted-by-codex and delete the journal', async () => { const h = switchHarness(); try { install(h); importActiveCodexSlot(observedDocument('a', 'a-new'), { store: h.store, keychain: h.keychain, now: () => 2 }); assert.equal((await h.recover()).state, 'clear'); } finally { close(h); } });
+  it('two concurrent recoverers commit one row', async () => { const h = switchHarness(); try { install(h); writeFileSync(h.authPath, JSON.stringify(h.b)); await Promise.all([h.recover(), h.recover()]); assert.equal(scalarCount(h.db, "SELECT COUNT(*) AS count FROM switch_log WHERE steps_json LIKE '%recovery-journal%'"), 1); } finally { close(h); } });
+  it('a journal replaced after the probe is not deleted', async () => { const h = switchHarness(); try { install(h); writeFileSync(h.authPath, JSON.stringify(h.b)); await h.recover({ crashAt: (at) => { if (at === 'recovery-after-commit') writeCodexSwitchJournal(recoveryJournal(h, 'successor'), { journalDir: join(h.root, 'journal') }); } }); const r = readCodexSwitchJournal({ journalDir: join(h.root, 'journal') }); assert.equal(r.state === 'ok' && r.journal.attemptId, 'successor'); } finally { close(h); } });
+  it('a malformed journal is left and the switch is refused', async () => { const h = switchHarness(); try { const d = join(h.root, 'journal'); mkdirSync(d, { recursive: true }); writeFileSync(codexSwitchJournalPath({ journalDir: d }), '{'); assert.equal((await h.recover()).state, 'fenced'); assert.equal((await h.run()).reason, 'switch-recovery-malformed'); } finally { close(h); } });
 });
