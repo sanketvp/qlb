@@ -7,6 +7,8 @@ import { describe, it } from 'node:test';
 
 import { MacosKeychainBackend, markFakeExecutor, MockKeychain, NativeOpenRouterKeyNotFoundError, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, readNativeOpenRouterKey, type ExecFileSyncFn } from '../src/keychain';
 import { openStore } from '../src/store';
+import { ADAPTER_ACCOUNT_IDS } from '../src/migration';
+import { sharedSingleGrantCoords } from '../src/single-grant-ownership';
 import {
   defaultPiMigratePaths,
   hasLegacyPiOwnerEntry,
@@ -65,6 +67,21 @@ function hasManaged(keychain: MockKeychain, provider: PiSingleProvider): boolean
 function writePiJournal(paths: PiMigratePaths, provider: PiSingleProvider, phase: string): void {
   mkdirSync(paths.journalPath, { recursive: true, mode: 0o700 });
   writeFileSync(join(paths.journalPath, `pi-migrate-${provider}.json`), JSON.stringify({ provider, phase, ownerPid: process.pid, updatedAt: Date.now() }), { mode: 0o600 });
+}
+
+function plantKeptGenericCopy(
+  h: ReturnType<typeof setup>,
+  provider: Exclude<PiSingleProvider, 'openrouter'>,
+): { service: string; account: string; stashService: string; kept: string } {
+  const { service, account } = sharedSingleGrantCoords(provider);
+  const cleanedAt = Date.UTC(2026, 9, 30, 12, 0, 0);
+  const kept = JSON.stringify(oauth(`kept-${provider}`));
+  h.keychain.setSync(service, account, kept);
+  h.store.upsertMigration(`pi-${provider}`, 'NATIVE', JSON.stringify({
+    accounts: [{ id: ADAPTER_ACCOUNT_IDS[provider], provider, label: provider, keychain: { service, account } }],
+    lastRollback: { keychainDisposition: 'keep', cleanedAt },
+  }));
+  return { service, account, stashService: `qlb:${provider}:unclaimed:${new Date(cleanedAt).toISOString()}`, kept };
 }
 
 describe('Pi migration S58 credential-first barrier', () => {
@@ -218,6 +235,176 @@ describe('Pi migration S58 credential-first barrier', () => {
       } finally { h.cleanup(); }
     }
   });
+
+  for (const provider of ['xai', 'kimi-coding'] as const) {
+    it(`${provider}: T-PR2: pi migrate over a generic hand-back that kept its copy`, () => {
+      const h = setup(provider);
+      try {
+        const kept = plantKeptGenericCopy(h, provider);
+        const native = JSON.parse(readFileSync(h.paths.authJsonPath, 'utf8'))[provider];
+        assert.equal(migratePiSingleProvider(provider, h.paths, { keychain: h.keychain, store: h.store }).state, 'migrated');
+        assert.equal(h.keychain.getSync(kept.stashService, kept.account), kept.kept);
+        assert.deepEqual(JSON.parse(h.keychain.getSync(kept.service, kept.account)), native);
+      } finally { h.cleanup(); }
+    });
+
+    it(`${provider}: T-PR2b: pi migrate over a kept copy re-runs after a crash at each step to the same end state`, () => {
+      for (const crash of ['stash', 'overwrite'] as const) {
+        const h = setup(provider);
+        try {
+          const kept = plantKeptGenericCopy(h, provider);
+          const native = JSON.parse(readFileSync(h.paths.authJsonPath, 'utf8'))[provider];
+          let stashWrites = 0;
+          let crashAfterStashRead = crash === 'stash';
+          const keychain = {
+            setSync(service: string, account: string, value: string) {
+              if (service === kept.stashService && account === kept.account) stashWrites += 1;
+              h.keychain.setSync(service, account, value);
+            },
+            getSync(service: string, account: string) {
+              const value = h.keychain.getSync(service, account);
+              if (crashAfterStashRead && service === kept.stashService && account === kept.account) {
+                crashAfterStashRead = false;
+                throw new Error('injected crash');
+              }
+              return value;
+            },
+            deleteSync: h.keychain.deleteSync.bind(h.keychain),
+          };
+          assert.throws(() => migratePiSingleProvider(provider, h.paths, {
+            keychain,
+            store: h.store,
+            afterWrite: (point) => { if (crash === 'overwrite' && point === 'credential-saved') throw new Error('injected crash'); },
+          }), /injected crash/, crash);
+          assert.equal(h.keychain.getSync(kept.stashService, kept.account), kept.kept, `${crash}: stash preserves the kept copy`);
+          assert.equal(migratePiSingleProvider(provider, h.paths, { keychain, store: h.store }).state, 'migrated', crash);
+          assert.equal(stashWrites, 1, `${crash}: exactly one stash`);
+          assert.equal(h.keychain.getSync(kept.stashService, kept.account), kept.kept, `${crash}: stash remains the kept copy`);
+          assert.deepEqual(JSON.parse(h.keychain.getSync(kept.service, kept.account)), native, `${crash}: shared item is Pi's entry`);
+        } finally { h.cleanup(); }
+      }
+    });
+
+    it(`${provider}: pi migrate after migrate, pi rollback and a kept-copy stash finishes without reading the absent item`, () => {
+      const h = setup(provider);
+      try {
+        const kept = plantKeptGenericCopy(h, provider);
+        const native = JSON.parse(readFileSync(h.paths.authJsonPath, 'utf8'))[provider];
+        assert.equal(migratePiSingleProvider(provider, h.paths, { keychain: h.keychain, store: h.store }).state, 'migrated');
+        rollbackPiSingleProvider(provider, h.paths, { keychain: h.keychain, store: h.store });
+        assert.equal(hasManaged(h.keychain, provider), false, 'pi rollback removed the shared item');
+        const sharedOps: string[] = [];
+        let stashWrites = 0;
+        const keychain = {
+          setSync(service: string, account: string, value: string) {
+            if (service === kept.service && account === kept.account) sharedOps.push('set');
+            if (service === kept.stashService) stashWrites += 1;
+            h.keychain.setSync(service, account, value);
+          },
+          getSync(service: string, account: string) {
+            if (service === kept.service && account === kept.account) sharedOps.push('get');
+            return h.keychain.getSync(service, account);
+          },
+          deleteSync: h.keychain.deleteSync.bind(h.keychain),
+        };
+        assert.equal(migratePiSingleProvider(provider, h.paths, { keychain, store: h.store }).state, 'migrated');
+        assert.equal(sharedOps[0], 'set', 'the absent shared item is not read before the write');
+        assert.equal(stashWrites, 0, 'no second stash');
+        assert.equal(h.keychain.getSync(kept.stashService, kept.account), kept.kept);
+        assert.deepEqual(JSON.parse(h.keychain.getSync(kept.service, kept.account)), native);
+      } finally { h.cleanup(); }
+    });
+
+    it(`${provider}: pi migrate over a kept hand-back whose shared item is already gone finishes with no stash`, () => {
+      const h = setup(provider);
+      try {
+        const kept = plantKeptGenericCopy(h, provider);
+        h.keychain.deleteSync(kept.service, kept.account);
+        const native = JSON.parse(readFileSync(h.paths.authJsonPath, 'utf8'))[provider];
+        assert.equal(migratePiSingleProvider(provider, h.paths, { keychain: h.keychain, store: h.store }).state, 'migrated');
+        assert.throws(() => h.keychain.getSync(kept.stashService, kept.account), /item not found/);
+        assert.deepEqual(JSON.parse(h.keychain.getSync(kept.service, kept.account)), native);
+      } finally { h.cleanup(); }
+    });
+
+    it(`${provider}: pi migrate refuses a kept hand-back whose journal account cannot be resolved and writes nothing`, () => {
+      for (const variant of ['extra-keychain-field', 'no-accounts'] as const) {
+        const h = setup(provider);
+        try {
+          const kept = plantKeptGenericCopy(h, provider);
+          const detail = JSON.parse(h.store.getMigration(`pi-${provider}`)!.detail_json) as { accounts?: Array<{ keychain: Record<string, unknown> }> };
+          if (variant === 'extra-keychain-field') detail.accounts![0].keychain.extra = 'x';
+          else delete detail.accounts;
+          h.store.upsertMigration(`pi-${provider}`, 'NATIVE', JSON.stringify(detail));
+          const authBefore = readFileSync(h.paths.authJsonPath, 'utf8');
+          assert.throws(
+            () => migratePiSingleProvider(provider, h.paths, { keychain: h.keychain, store: h.store }),
+            (error: unknown) => (error as { code?: unknown }).code === 'journal-keychain-invalid' && (error as { exitCode?: unknown }).exitCode === 3,
+            variant,
+          );
+          assert.equal(h.keychain.getSync(kept.service, kept.account), kept.kept, `${variant}: kept copy untouched`);
+          assert.throws(() => h.keychain.getSync(kept.stashService, kept.account), /item not found/, `${variant}: no stash`);
+          assert.equal(readFileSync(h.paths.authJsonPath, 'utf8'), authBefore, `${variant}: auth.json untouched`);
+          assert.equal(existsSync(join(h.paths.journalPath, `pi-migrate-${provider}.json`)), false, `${variant}: no P7a journal`);
+          assert.equal(existsSync(h.paths.ownerPath), false, `${variant}: no owner entry`);
+        } finally { h.cleanup(); }
+      }
+    });
+
+    it(`${provider}: pi migrate that refuses before writing leaves no stash`, () => {
+      const h = setup(provider);
+      try {
+        const kept = plantKeptGenericCopy(h, provider);
+        writeFileSync(h.paths.authJsonPath, JSON.stringify({ [provider]: { type: 'oauth', access: 'qlb-managed', refresh: '', expires: Date.now() + 60_000 } }), { mode: 0o600 });
+        assert.throws(() => migratePiSingleProvider(provider, h.paths, { keychain: h.keychain, store: h.store }), /baseline would be a placeholder/);
+        assert.throws(() => h.keychain.getSync(kept.stashService, kept.account), /item not found/, 'no stash');
+        assert.equal(h.keychain.getSync(kept.service, kept.account), kept.kept, 'kept copy untouched');
+      } finally { h.cleanup(); }
+    });
+
+    it(`${provider}: pi migrate over a kept copy that crashed after the stash and the journal resumes with the kept copy stashed`, () => {
+      const h = setup(provider);
+      try {
+        const kept = plantKeptGenericCopy(h, provider);
+        const native = JSON.parse(readFileSync(h.paths.authJsonPath, 'utf8'))[provider];
+        assert.throws(() => migratePiSingleProvider(provider, h.paths, {
+          keychain: h.keychain,
+          store: h.store,
+          afterWrite: (point) => { if (point === 'baseline') throw new Error('injected crash'); },
+        }), /injected crash/);
+        assert.equal(h.keychain.getSync(kept.service, kept.account), kept.kept, 'the crash left the kept copy in place');
+        assert.equal(migratePiSingleProvider(provider, h.paths, { keychain: h.keychain, store: h.store }).state, 'migrated');
+        assert.equal(h.keychain.getSync(kept.stashService, kept.account), kept.kept, 'the kept copy is stashed');
+        assert.deepEqual(JSON.parse(h.keychain.getSync(kept.service, kept.account)), native);
+      } finally { h.cleanup(); }
+    });
+
+    it(`${provider}: a stash whose verify read differs is removed and pi migrate refuses without overwriting`, () => {
+      const h = setup(provider);
+      try {
+        const kept = plantKeptGenericCopy(h, provider);
+        const native = JSON.parse(readFileSync(h.paths.authJsonPath, 'utf8'))[provider];
+        let corrupt = true;
+        const keychain = {
+          setSync(service: string, account: string, value: string) {
+            if (corrupt && service === kept.stashService) { corrupt = false; value = value.slice(0, 10); }
+            h.keychain.setSync(service, account, value);
+          },
+          getSync: h.keychain.getSync.bind(h.keychain),
+          deleteSync: h.keychain.deleteSync.bind(h.keychain),
+        };
+        assert.throws(
+          () => migratePiSingleProvider(provider, h.paths, { keychain, store: h.store }),
+          (error: unknown) => (error as { code?: unknown }).code === 'kept-copy-stash-unverified' && (error as { exitCode?: unknown }).exitCode === 3,
+        );
+        assert.throws(() => h.keychain.getSync(kept.stashService, kept.account), /item not found/, 'the unverified stash is removed');
+        assert.equal(h.keychain.getSync(kept.service, kept.account), kept.kept, 'the kept copy is not overwritten');
+        assert.equal(migratePiSingleProvider(provider, h.paths, { keychain, store: h.store }).state, 'migrated', 're-run');
+        assert.equal(h.keychain.getSync(kept.stashService, kept.account), kept.kept, 're-run stashes the kept copy');
+        assert.deepEqual(JSON.parse(h.keychain.getSync(kept.service, kept.account)), native);
+      } finally { h.cleanup(); }
+    });
+  }
 
   it('T-PM2: marks only the shared handed-back account row active', () => {
     for (const { provider, accountId } of [

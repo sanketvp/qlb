@@ -11,6 +11,7 @@ import { ADAPTER_ACCOUNT_IDS } from './migration';
 import { isCredentialNotFound } from './credential-backends';
 import { isNativeOpenRouterKeyNotFound, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, type KeychainBackend } from './keychain';
 import { qlbHomeDir } from './home';
+import { resolveSingleGrantKeychain, sharedSingleGrantCoords } from './single-grant-ownership';
 import type { Store } from './store';
 
 export const PI_SINGLE_PROVIDERS = ['xai', 'kimi-coding', 'openrouter'] as const;
@@ -224,6 +225,53 @@ function genericMigrationOwnedError(): Error {
   return Object.assign(new Error('owned-by-generic-migrate'), { code: 'owned-by-generic-migrate', exitCode: 3 });
 }
 
+function keptCopyStashUnverifiedError(): Error {
+  return Object.assign(new Error('kept-copy-stash-unverified'), { code: 'kept-copy-stash-unverified', exitCode: 3 });
+}
+
+function journalKeychainInvalidError(cause: unknown): Error {
+  return Object.assign(new Error('journal-keychain-invalid', { cause }), { code: 'journal-keychain-invalid', exitCode: 3 });
+}
+
+/** Not-found is undefined; any other read error fails closed. */
+function readKeychainItem(deps: PiMigrateDeps, service: string, account: string): string | undefined {
+  try { return deps.keychain.getSync(service, account); } catch (error) { if (isCredentialNotFound(error)) return undefined; throw error; }
+}
+
+/** OQ-7 (c1): preserve a generic hand-back's kept copy under a name fixed by lastRollback.cleanedAt. */
+function stashKeptGenericCopy(
+  provider: PiSingleProvider,
+  deps: PiMigrateDeps,
+  ownJournal: Journal | null,
+): void {
+  if (provider === 'openrouter' || ownJournal || deps.store?.getConfig(`pi.${provider}.state`) === 'migrated') return;
+  const generic = deps.store?.getMigration(`pi-${provider}`);
+  if (!generic || generic.state !== 'NATIVE') return;
+
+  const detail = asObject(JSON.parse(generic.detail_json), 'generic migration journal is malformed');
+  const lastRollback = detail.lastRollback;
+  if (!lastRollback || typeof lastRollback !== 'object' || Array.isArray(lastRollback)) return;
+  const rollback = lastRollback as JsonObject;
+  if (rollback.keychainDisposition !== 'keep') return;
+  let coords;
+  try { coords = resolveSingleGrantKeychain(provider, Array.isArray(detail.accounts) ? detail.accounts[0] : undefined); } catch (error) { throw journalKeychainInvalidError(error); }
+  const shared = sharedSingleGrantCoords(provider);
+  if (coords.service !== shared.service || coords.account !== shared.account) return;
+  if (typeof rollback.cleanedAt !== 'number' || !Number.isFinite(rollback.cleanedAt)) {
+    throw new Error('generic migration lastRollback cleanedAt is invalid');
+  }
+  const stashService = `qlb:${provider}:unclaimed:${new Date(rollback.cleanedAt).toISOString()}`;
+  if (readKeychainItem(deps, stashService, QLB_KEYCHAIN_ACCOUNT) !== undefined) return;
+  const kept = readKeychainItem(deps, shared.service, shared.account);
+  if (kept === undefined) return;
+  deps.keychain.setSync(stashService, QLB_KEYCHAIN_ACCOUNT, kept);
+  if (readKeychainItem(deps, stashService, QLB_KEYCHAIN_ACCOUNT) !== kept) {
+    // A stash that does not hold the kept copy must not read as "already preserved" on the next run.
+    try { deps.keychain.deleteSync(stashService, QLB_KEYCHAIN_ACCOUNT); } catch (error) { if (!isCredentialNotFound(error)) throw error; }
+    throw keptCopyStashUnverifiedError();
+  }
+}
+
 /** P7a migration with S58's credential-first publication order. */
 export function migratePiSingleProvider(provider: PiSingleProvider, paths: PiMigratePaths = defaultPiMigratePaths(), deps: PiMigrateDeps, options: { dryRun?: boolean } = {}): PiMigrateResult {
   assertPiSingleProvider(provider); const existing = readJournal(paths, provider); const wouldWrite = [managedService(provider), `placeholder:${provider}`, `owner:${provider}`];
@@ -245,6 +293,8 @@ export function migratePiSingleProvider(provider: PiSingleProvider, paths: PiMig
     } else {
       // D-B74: refuse a placeholder baseline before the first write (no stray 'started' journal).
       if (!inLockJournal && provider !== 'openrouter' && isPiPlaceholder(auth[provider])) throw placeholderBaselineError(provider);
+      // OQ-7 (c1): after admission and before the first write, so a crash never leaves a P7a journal ahead of the stash.
+      stashKeptGenericCopy(provider, deps, inLockJournal);
       if (!inLockJournal) updatePhase(paths, provider, 'started', refresh);
       let baseline: unknown; const baselineFile = baselinePath(paths, provider);
       if (phaseAtLeast(journal.phase, 'baseline') && existsSync(baselineFile)) baseline = JSON.parse(readFileSync(baselineFile, 'utf8'));
