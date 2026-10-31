@@ -156,7 +156,8 @@ const finishGate = () => {
     process.exit(3);
   }
   const retry = args.indexOf('--retry-after-401') !== -1;
-  process.stdout.write(JSON.stringify({ token: 'fixture-' + provider + (retry ? '-refreshed' : '-access'), accountId: 'user:slot', chatgptAccountId: 'bare-account', source: 'fixture' }));
+  const accountId = retry && process.env.RETRY_ACCOUNT ? process.env.RETRY_ACCOUNT : 'user:slot';
+  process.stdout.write(JSON.stringify({ token: 'fixture-' + provider + (retry ? '-refreshed' : '-access'), accountId, chatgptAccountId: 'bare-account', source: 'fixture' }));
 };
 const delayMs = Number(process.env.GATE_DELAY_MS || '0');
 if (Number.isFinite(delayMs) && delayMs > 0) setTimeout(finishGate, delayMs);
@@ -170,6 +171,7 @@ function load(owner?: string, gateFail = false, callCodex = false, perProviderOw
   streamSimpleOnly?: boolean;
   reloadInert?: boolean;
   auth401?: boolean;
+  retryAccount?: string;
 } = {}): {
   calls: string[];
   replaced: Record<string, boolean>;
@@ -180,6 +182,7 @@ function load(owner?: string, gateFail = false, callCodex = false, perProviderOw
   events: Array<{ type?: string; error?: { errorMessage?: string } }>;
   gateCalls: string[];
   gateArgs: string[][];
+  outcomes: Array<Record<string, unknown>>;
   stderr: string;
 } {
   const home = mkdtempSync(join(tmpdir(), 'qlb-pi-wiring-'));
@@ -202,6 +205,7 @@ function load(owner?: string, gateFail = false, callCodex = false, perProviderOw
   const runner = join(home, 'fake-qlb.cjs');
   const gateLog = join(home, 'gate-calls');
   const gateArgsLog = join(home, 'gate-args');
+  const outcomesLog = join(home, '.qlb', 'outcomes.jsonl');
   const entry = join(home, 'load.mjs');
   const compatOverride = join(home, 'compat-stream-simple-only.mjs');
   if (options.consumeMode) {
@@ -236,6 +240,7 @@ function load(owner?: string, gateFail = false, callCodex = false, perProviderOw
       GATE_CALL_LOG: gateLog,
       GATE_ARGS_LOG: gateArgsLog,
       ...(options.auth401 ? { AUTH_401: '1' } : {}),
+      ...(options.retryAccount ? { RETRY_ACCOUNT: options.retryAccount } : {}),
       ...(gateFail ? { GATE_FAIL: '1' } : {}),
       ...(gateCause ? { GATE_CAUSE: gateCause } : {}),
       ...(gateDelayMs > 0 ? { GATE_DELAY_MS: String(gateDelayMs) } : {}),
@@ -253,6 +258,7 @@ function load(owner?: string, gateFail = false, callCodex = false, perProviderOw
   return {
     ...JSON.parse(result.stdout.trim().split('\n').pop() ?? ''),
     gateCalls: existsSync(gateLog) ? readFileSync(gateLog, 'utf8').trim().split('\n').filter(Boolean) : [],
+    outcomes: existsSync(outcomesLog) ? readFileSync(outcomesLog, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>) : [],
     gateArgs: existsSync(gateArgsLog) ? readFileSync(gateArgsLog, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line) as string[]) : [],
     stderr: result.stderr,
   } as ReturnType<typeof load>;
@@ -358,6 +364,19 @@ describe('qlb-pi provider wiring', { skip: piAvailable ? false : 'global Pi inst
       ['gate', 'anthropic', '--json', '--retry-after-401', fp],
     ]);
     assert.deepEqual(result.events.map((event) => event.type), ['done']);
+  });
+
+  it('a 401 resync that returns another account surfaces the original 401 and records no outcome', () => {
+    const owner = JSON.stringify({ providers: { anthropic: { mode: 'qlb', since: 1 } } });
+    const result = load(owner, false, false, undefined, false, false, true, undefined, false, 0, { auth401: true, retryAccount: 'user:other' });
+    const fp = `sha256-at:${createHash('sha256').update('fixture-anthropic-access', 'utf8').digest('hex')}`;
+    assert.deepEqual(result.gateArgs, [
+      ['gate', 'anthropic', '--json'],
+      ['gate', 'anthropic', '--json', '--retry-after-401', fp],
+    ]);
+    assert.deepEqual(result.events.map((event) => event.type), ['error']);
+    assert.match(result.events[0]?.error?.errorMessage ?? '', /401/);
+    assert.deepEqual(result.outcomes, []);
   });
 
   it('does not infer a Codex owner from a shared Anthropic-only v2 document or legacy v1 document', () => {

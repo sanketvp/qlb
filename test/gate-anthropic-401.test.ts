@@ -197,6 +197,38 @@ describe('Anthropic gate 401 recovery (K6b)', () => {
     f.store.close();
   });
 
+  it('a spent grant followed by an active-login-stale refusal keeps the claim', async () => {
+    const f = await fixture();
+    const fp = accessFingerprint('access-slot');
+    let posts = 0;
+    const result = await run(f, fp, async () => {
+      posts += 1;
+      // A concurrent `qlb switch` lands as soon as the refresh drops its locks.
+      f.store.setActiveLogin('anthropic', 'account-b', 'fixture');
+      return posted(credential('rotated'));
+    });
+    assert.equal(result.code, 3);
+    assert.equal(posts, 1);
+    const row = JSON.parse(f.store.getConfig('pi.anthropic.forced401') ?? 'null') as { fp?: unknown; at?: unknown } | null;
+    assert.equal(row?.fp, fp);
+    assert.equal(row?.at, NOW);
+    f.store.close();
+  });
+
+  it('a malformed forced401 row is replaced by the next claim', async () => {
+    const f = await fixture();
+    const fp = accessFingerprint('access-slot');
+    for (const malformed of ['not-json', JSON.stringify({ fp, at: 'later', claimId: 'x' }), JSON.stringify({ at: NOW - 1_000_000 })]) {
+      f.store.setConfig('pi.anthropic.forced401', malformed);
+      const claim = claimForced401(f.store, 'account-a', fp, NOW);
+      assert.ok(claim, malformed);
+      assert.equal(claim.previous, malformed);
+      const row = JSON.parse(f.store.getConfig('pi.anthropic.forced401') ?? 'null') as { fp?: unknown; at?: unknown; claimId?: unknown };
+      assert.deepEqual(row, { fp, at: NOW, claimId: claim.claimId });
+    }
+    f.store.close();
+  });
+
   it('a release never overwrites a newer claim', async () => {
     const f = await fixture();
     const claim = claimForced401(f.store, 'account-a', accessFingerprint('access-slot'), NOW);

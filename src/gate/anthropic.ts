@@ -131,11 +131,8 @@ export function claimForced401(store: Store, accountId: string, fp: string, now:
     db.exec('BEGIN IMMEDIATE');
     const row = db.prepare('SELECT value FROM config WHERE key = ?').get('pi.anthropic.forced401') as { value?: unknown } | undefined;
     const previous = typeof row?.value === 'string' ? row.value : null;
+    // An unparseable row is treated as absent, so it can never disable recovery.
     const current = forced401Config(previous);
-    if (current === null && previous !== null) {
-      db.exec('COMMIT');
-      return null;
-    }
     if (current && (current.fp === fp || now - current.at < MIN_INTERVAL_S * 1000)) {
       db.exec('COMMIT');
       return null;
@@ -298,8 +295,8 @@ export function createAnthropicGate(deps: AnthropicGateDeps = {}, initialContext
           throw new GateRefused('identity-mismatch');
         }
         const autoLog = deps.autoLog ?? context.autoLog;
-        const refresh = async (forceRecord?: ActiveFetchRecord): Promise<RefreshOutcome> => {
-          const outcome = await (deps.refresh ?? refreshActiveLogin)({
+        const runRefresh = (forceRecord?: ActiveFetchRecord): Promise<RefreshOutcome> =>
+          (deps.refresh ?? refreshActiveLogin)({
             slots: configured.slots,
             store: configured.store,
             live: configured.live,
@@ -319,9 +316,9 @@ export function createAnthropicGate(deps: AnthropicGateDeps = {}, initialContext
             ...(forceRecord === undefined ? {} : { forceRecord }),
             degraded: false,
           });
+        const assertStillActive = (): void => {
           const activeAfterRefresh = configured.store.getActiveLogin('anthropic');
           if (activeAfterRefresh?.accountId !== accountId) throw new GateRefused('active-login-stale');
-          return outcome;
         };
 
         const retryAfter401Fp = context.retryAfter401Fp;
@@ -334,9 +331,12 @@ export function createAnthropicGate(deps: AnthropicGateDeps = {}, initialContext
           }
           const claim = claimForced401(configured.store, accountId, retryAfter401Fp, now());
           if (!claim) return served(accountId, live, 'live');
+          // Capture the outcome before any later check, so only a zero-POST
+          // result or a throw from refreshActiveLogin itself gives it back.
           let outcome: RefreshOutcome | undefined;
           try {
-            outcome = await refresh({ error: 'http-401' });
+            outcome = await runRefresh({ error: 'http-401' });
+            assertStillActive();
             return mapRefreshOutcome(outcome, accountId, autoLog, now);
           } finally {
             if (outcome === undefined || !startedPost(outcome)) {
@@ -349,7 +349,9 @@ export function createAnthropicGate(deps: AnthropicGateDeps = {}, initialContext
         if (parts.expiresAt !== undefined && !isOAuthTokenExpired(parts.expiresAt, now())) {
           return served(accountId, live, 'live');
         }
-        return mapRefreshOutcome(await refresh(), accountId, autoLog, now);
+        const outcome = await runRefresh();
+        assertStillActive();
+        return mapRefreshOutcome(outcome, accountId, autoLog, now);
       } finally {
         configured.close();
       }

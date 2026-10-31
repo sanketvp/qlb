@@ -616,6 +616,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
                 : payload;
               return shapeAnthropicOAuthPayload(upstream);
             };
+            let accountChanged = false;
             const result = await streamWithAuthRetry({
               readAccess: () => access.token,
               startStream: (token) =>
@@ -628,6 +629,12 @@ export default async function (pi: ExtensionAPI): Promise<void> {
               // gate with the rejected access generation's non-secret hash.
               resync: async () => {
                 const next = await (source.read as (retryAfter401Fp?: string) => Promise<typeof access>)(accessFingerprint(access.token));
+                // A retry never switches accounts: surface the original 401
+                // and record nothing (spec rev 5, K6b r1 item 2).
+                if (next.accountId !== access.accountId) {
+                  accountChanged = true;
+                  return { resynced: false, reason: "gate-source-account-changed" };
+                }
                 if (next.token === access.token) return { resynced: false, reason: "gate-source-unchanged" };
                 access = next;
                 return { resynced: true, reason: "gate-source-refreshed" };
@@ -637,6 +644,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
               },
               onResync: () => undefined,
             });
+            if (accountChanged) return;
             recordOutcome({
               accountId: decision.accountId,
               model: model.id,
