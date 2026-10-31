@@ -526,9 +526,10 @@ export function resolveRecoveryVerdict(
   if (typeof classified === 'object' && (classified.status === 'unstable' || classified.status === 'unreadable')) {
     return { class: 'pending', status: classified.status };
   }
+  // A wiped file holds no login, so the switch records none (user decision C6-Q1).
   if (typeof classified === 'object' && classified.status === 'wiped') return resolved(isWatch
     ? { outcome: 'stopped', reason: 'wiped' }
-    : { outcome: 'failed', detail: 'wiped' });
+    : { outcome: 'failed', detail: 'wiped', activeAccountId: null });
 
   if (classified === 'target-changed') {
     // A changed B is never an ok row.  A fail-closed attribution wins; else it
