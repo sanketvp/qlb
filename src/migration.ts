@@ -128,7 +128,13 @@ import type { KeychainBackend } from './keychain';
 import { openRouterMissingKeyMessage, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, readNativeOpenRouterKey } from './keychain';
 import { legacyPiAuthBackupPath, piAuthBackupPath, readPiAuthBackup, removePiAuthBackup, restorePiAuthEntryLocked, type PiAuthBackup } from './pi-auth-backup';
 import { canonicalDigest, fencedGeneration, handbackVerdict, isValidEntry, keychainDigest, NoSingleGrantRestoreSourceError, rankSingleGrantSource, restoreRecordFor } from './pi-handback-source';
-import { resolveSingleGrantKeychain, type RollbackDecision } from './single-grant-ownership';
+import {
+  JournalKeychainInvalidError,
+  resolveSingleGrantKeychain,
+  type RollbackDecision,
+  type SingleGrantKeychainCoords,
+  type SingleGrantKeychainProvider,
+} from './single-grant-ownership';
 import { parseGrant } from './refresh-lease';
 import { hasLegacyPiOwnerEntry, isPiPlaceholder, PiOwnerLegacyError, readPiOwnerProviders, withPiAuthLock, writePiOwnerEntry, type AuthLockTiming } from './pi-migrate';
 import { OPENROUTER_GATE_KEYCHAIN_SERVICE } from './token/openrouter';
@@ -1780,19 +1786,23 @@ export class Migration {
     this.store.upsertMigration(this.storeName, state, JSON.stringify(detail));
   }
 
-  private readOwnerPayload(): OwnerFile | null {
-    const candidates = [this.stagingPath()];
-    for (const p of candidates) {
-      if (!existsSync(p)) continue;
-      try {
-        const parsed: unknown = JSON.parse(readFileSync(p, 'utf8'));
-        if (parsed && typeof parsed === 'object' && (parsed as OwnerFile).owner === 'qlb') {
-          return parsed as OwnerFile;
-        }
-      } catch {
-        // unreadable; try the other candidate
+  private readStagingOwnerFile(): OwnerFile | null {
+    const p = this.stagingPath();
+    if (!existsSync(p)) return null;
+    try {
+      const parsed: unknown = JSON.parse(readFileSync(p, 'utf8'));
+      if (parsed && typeof parsed === 'object' && (parsed as OwnerFile).owner === 'qlb') {
+        return parsed as OwnerFile;
       }
+    } catch {
+      // unreadable; fall back to the journal
     }
+    return null;
+  }
+
+  private readOwnerPayload(): OwnerFile | null {
+    const staged = this.readStagingOwnerFile();
+    if (staged) return staged;
     const detail = parseDetail(this.store.getMigration(this.storeName)?.detail_json);
     const accounts = Array.isArray(detail.accounts)
       ? (detail.accounts as OwnerFile['accounts'])
@@ -1957,19 +1967,45 @@ export class Migration {
         this.deleteStaticKeychain();
         continue;
       }
-      const { service, account } = this.kind === 'single-grant'
-        && (this.provider === 'xai' || this.provider === 'kimi-coding')
-        ? resolveSingleGrantKeychain(this.provider, meta)
-        : keychainCoords(meta.provider, meta.id, meta.label);
-      try {
-        this.keychain.deleteSync(service, account);
-      } catch (error) {
-        if (isCredentialNotFound(error)) continue;
-        throw new Error(
-          `migration rollback failed to delete staged Keychain credential for provider=${meta.provider} account=${meta.label}`,
-        );
+      this.deleteStagedItem(keychainCoords(meta.provider, meta.id, meta.label), meta.provider, meta.label);
+    }
+  }
+
+  private deleteStagedItem(coords: SingleGrantKeychainCoords, provider: string, label: string): void {
+    try {
+      this.keychain.deleteSync(coords.service, coords.account);
+    } catch (error) {
+      if (isCredentialNotFound(error)) return;
+      throw new Error(
+        `migration rollback failed to delete staged Keychain credential for provider=${provider} account=${label}`,
+      );
+    }
+  }
+
+  /**
+   * The journal is the xai/kimi-coding pre-commit delete authority. It must
+   * hold exactly one account, and a staging owner file that resolves to a
+   * different Keychain item refuses, so every check runs before any delete.
+   */
+  private deleteJournalStagedKeychain(provider: SingleGrantKeychainProvider): void {
+    const journalAccounts = parseDetail(this.store.getMigration(this.storeName)?.detail_json).accounts;
+    if (!Array.isArray(journalAccounts) || journalAccounts.length !== 1) {
+      throw new JournalKeychainInvalidError();
+    }
+    const meta = journalAccounts[0] as OwnerFile['accounts'][number];
+    const coords = resolveSingleGrantKeychain(provider, meta);
+    const staging = this.readStagingOwnerFile();
+    if (staging) {
+      const stagedAccounts: unknown = staging.accounts;
+      if (!Array.isArray(stagedAccounts) || stagedAccounts.length !== 1) {
+        throw new JournalKeychainInvalidError();
+      }
+      const staged = resolveSingleGrantKeychain(provider, stagedAccounts[0]);
+      if (staged.service !== coords.service || staged.account !== coords.account) {
+        throw new JournalKeychainInvalidError();
       }
     }
+    this.deleteStagedItem(coords, provider, meta.label);
   }
 
   /**
@@ -1995,8 +2031,11 @@ export class Migration {
     // Resolve (and validate) the journaled auth key before any cleanup, so a
     // conflicting key refuses with every staged artifact still in place.
     const authKey = this.kind === 'single-grant' ? this.singleGrantAuthKey() : undefined;
-    const owner = this.readOwnerPayload();
-    this.deleteStagedKeychain(owner?.accounts);
+    if (this.kind === 'single-grant' && (this.provider === 'xai' || this.provider === 'kimi-coding')) {
+      this.deleteJournalStagedKeychain(this.provider);
+    } else {
+      this.deleteStagedKeychain(this.readOwnerPayload()?.accounts);
+    }
     unlinkIfExists(this.stagingPath());
     if (authKey !== undefined) removePiAuthBackup(this.poolFilePath, authKey);
     this.journal('NATIVE', { intent: undefined, rolledBackAt: Date.now(), rolledBackFrom: 'pre-commit' });
