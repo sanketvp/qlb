@@ -196,6 +196,75 @@ describe('C-swap import (K10 / AC16)', () => {
     assert.deepEqual(stderr, ['import cswap refused: duplicate-login (slots 1 and 2 hold the same login)']);
   });
 
+  // K3-rb-Q1: an older copy of another slot's login is the same login.
+  const assertDuplicateLogin = (error: unknown): boolean => {
+    assert.ok(error instanceof CswapImportRefusalError);
+    assert.equal(error.code, 'duplicate-login');
+    assert.match(error.message, /slots 1 and 2/);
+    assert.doesNotMatch(error.message, /refresh-|access-|old-login|new-login/);
+    return true;
+  };
+  const backupSnapshot = (backup: string): Record<string, string> => Object.fromEntries([
+    'sequence.json', 'configs/.claude-config-1-a@example.test.json', 'configs/.claude-config-2-b@example.test.json',
+    'credentials/.creds-1-a@example.test.enc', 'credentials/.creds-1-a@example.test.enc.prev',
+  ].filter((path) => existsSync(join(backup, path))).map((path) => [path, readFileSync(join(backup, path), 'utf8')]));
+
+  it('cswap import refuses a slot holding another slot\'s previous login', async () => {
+    // Both orders: the previous login sits on the earlier and on the later slot.
+    for (const previousOn of [1, 2]) {
+      const h = fixture();
+      if (previousOn === 1) {
+        writeFileSync(join(h.backup, 'credentials', '.creds-1-a@example.test.enc'), Buffer.from(credential('account-a', 'new-login')).toString('base64'));
+        writeFileSync(join(h.backup, 'credentials', '.creds-1-a@example.test.enc.prev'), Buffer.from(credential('account-a', 'old-login')).toString('base64'));
+        h.keychain.setSync('claude-swap', 'account-2-b@example.test', credential('account-b', 'old-login'));
+      } else {
+        writeFileSync(join(h.backup, 'credentials', '.creds-1-a@example.test.enc'), Buffer.from(credential('account-a', 'old-login')).toString('base64'));
+        h.keychain.setSync('claude-swap', 'account-2-b@example.test', credential('account-b', 'new-login'));
+        h.keychain.setSync('claude-swap', 'account-2-b@example.test.prev', credential('account-b', 'old-login'));
+      }
+      const before = backupSnapshot(h.backup);
+      const sourceItems = async () => Promise.all(['account-2-b@example.test', 'account-2-b@example.test.prev']
+        .map((account) => h.keychain.get('claude-swap', account).catch(() => null)));
+      const sourceBefore = await sourceItems();
+      await assert.rejects(planCswapImport({ backupDir: h.backup, keychain: h.keychain, repository: h.repo }), assertDuplicateLogin);
+      await assert.rejects(importCswap({
+        backupDir: h.backup, journalDir: join(h.root, 'journals'), keychain: h.keychain, repository: h.repo, runId: `previous-login-${previousOn}`,
+      }), assertDuplicateLogin);
+      assert.equal(h.repo.listSlots().length, 0);
+      assert.deepEqual(h.keychain.listServices().filter((name) => name.startsWith('qlb:')), []);
+      assert.deepEqual(backupSnapshot(h.backup), before);
+      assert.deepEqual(await sourceItems(), sourceBefore);
+    }
+  });
+
+  it('cswap import refuses a live login that is another slot\'s previous login', async () => {
+    const h = fixture();
+    // Slot 2 previously held "old-login"; the live credential of active slot 1 is that login.
+    h.keychain.setSync('claude-swap', 'account-2-b@example.test.prev', credential('account-b', 'old-login'));
+    const before = backupSnapshot(h.backup);
+    await assert.rejects(importCswap({
+      backupDir: h.backup, journalDir: join(h.root, 'journals'), keychain: h.keychain, repository: h.repo, runId: 'live-previous-login',
+      liveCredential: async () => credential('account-a', 'old-login'), liveAccountId: async () => 'account-a',
+    }), assertDuplicateLogin);
+    assert.equal(h.repo.listSlots().length, 0);
+    assert.deepEqual(h.keychain.listServices().filter((name) => name.startsWith('qlb:')), []);
+    assert.deepEqual(backupSnapshot(h.backup), before);
+  });
+
+  it('a slot whose previous login is its own, or an unrelated one, still imports', async () => {
+    const h = fixture();
+    // Slot 1's previous copy is its own login (same refresh token, older access token).
+    writeFileSync(join(h.backup, 'credentials', '.creds-1-a@example.test.enc.prev'), Buffer.from(credential('account-a-old', 'refresh-a')).toString('base64'));
+    // Slot 2's previous login belongs to no other slot.
+    h.keychain.setSync('claude-swap', 'account-2-b@example.test.prev', credential('account-b', 'refresh-unrelated'));
+    const result = await importCswap({
+      backupDir: h.backup, journalDir: join(h.root, 'journals'), keychain: h.keychain, repository: h.repo, runId: 'no-false-positive',
+      liveCredential: async () => credential('account-a', 'refresh-a'), liveAccountId: async () => 'account-a',
+    });
+    assert.equal(result.phase, 'cleaned');
+    assert.deepEqual(h.repo.listSlots().map((slot) => slot.accountId).sort(), ['account-a', 'account-b']);
+  });
+
   it('refuses malformed source credentials before any Keychain write', async () => {
     const h = fixture();
     writeFileSync(join(h.backup, 'credentials', '.creds-1-a@example.test.enc'), Buffer.from(JSON.stringify({ claudeAiOauth: { refreshToken: 7 } })).toString('base64'));

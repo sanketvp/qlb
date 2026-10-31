@@ -323,6 +323,7 @@ async function readSourceSlots(options: CswapImportOptions): Promise<{ slots: So
     });
   }
   slots.sort((left, right) => left.slotNum - right.slotNum);
+  assertOneLoginPerSlot(slots);
   if (slots.length === 0) throw new Error('C-swap sequence has no accounts');
   if (activeNumber !== null && !slots.some((slot) => slot.active)) throw new Error('C-swap active slot is missing');
   return { slots, sessionProfiles: countSessions(options.backupDir, io) };
@@ -508,6 +509,19 @@ function duplicateLogin(first: number, second: number): CswapImportRefusalError 
   return new CswapImportRefusalError('duplicate-login', `C-swap import refused: slots ${slots[0]} and ${slots[1]} hold the same login`, slots);
 }
 
+/**
+ * One login, one slot (K3-r, K3-rb-Q1): a slot's current refresh-token lineage
+ * may not be another slot's current or previous lineage. A slot's own previous
+ * copy of its login is not a conflict.
+ */
+function assertOneLoginPerSlot(slots: ReadonlyArray<{ slotNum: number; fingerprint: string; previousFingerprint: string | null }>): void {
+  for (const slot of slots) {
+    const holder = slots.find((other) => other !== slot
+      && (other.fingerprint === slot.fingerprint || other.previousFingerprint === slot.fingerprint));
+    if (holder) throw duplicateLogin(holder.slotNum, slot.slotNum);
+  }
+}
+
 async function withLiveStateLocks<T>(options: CswapImportOptions, fn: () => Promise<T> | T): Promise<T> {
   return options.withLiveStateLocks ? options.withLiveStateLocks(fn) : fn();
 }
@@ -541,8 +555,9 @@ async function liveEffectiveCredentials(options: CswapImportOptions, sourceSlots
       ? effective[activeIndex].previousCredential : effective[activeIndex].credential;
     effective[activeIndex].effectiveFrom = liveFingerprint === effective[activeIndex].fingerprint ? null : effective[activeIndex].fingerprint;
     // The live login is promoted without passing readSourceSlots' lineage check.
-    const holder = effective.find((slot, index) => index !== activeIndex && slot.fingerprint === liveFingerprint);
-    if (holder) throw duplicateLogin(holder.slotNum, effective[activeIndex].slotNum);
+    assertOneLoginPerSlot(effective.map((slot, index) => index === activeIndex
+      ? { slotNum: slot.slotNum, fingerprint: liveFingerprint, previousFingerprint: slot.effectiveFrom ?? slot.previousFingerprint }
+      : slot));
   }
   return { effective, snapshot };
 }
