@@ -2,7 +2,7 @@ import { mkdirSync, readFileSync, statSync, unlinkSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { accessExpiry, codexFingerprint, codexIdentity, writeCodexAuthAtomic, type CodexAuthDocument, type CodexAuthStableWithStatResult, type CodexIdentity } from './codex-auth';
 import { attributeLiveDocument, type AttributeLiveDocumentInput, type CodexAttributionResult, type CodexAttributionStore } from './codex-attribution';
-import { ClaudeCodeLockTimeout, ProperLockfileCompromised, withCodexAuthLock, type CodexAuthLockOptions, type HeldProperLockfile, withProperLockfile } from './cc-locks';
+import { ClaudeCodeLockTimeout, CodexAuthLockCompromised, ProperLockfileCompromised, withCodexAuthLock, type CodexAuthLockOptions, type HeldProperLockfile, withProperLockfile } from './cc-locks';
 import { consumeCodexSlot, hasCodexSlotIdentity, withCodexConsumeThenSwitchLocks, withCodexSwitchLock, type CodexConsumeOptions, type CodexConsumeResult } from './codex-consume';
 import { fsyncDirSync, atomicWriteText, publishTarget } from './fsutil';
 import { qlbHomeDir } from './home';
@@ -1064,7 +1064,8 @@ export async function switchCodex(deps: CodexSwitchDeps, input: SwitchCodexInput
         const again = checkCodexSwitchPreconditions(deps, input);
         if (again.kind === 'refused') return { result: switchResult(again.reason) };
         let live: ObserveLiveCodexResult | undefined;
-        for (let i = 0; i < 5; i += 1) {
+        // The first observation plus five permitted restarts means six attempts.
+        for (let i = 0; i < 6; i += 1) {
           try { live = await observeLiveCodex(deps, assertHeld); break; } catch (error) {
             if (!(error instanceof CodexLiveChanged)) throw error;
           }
@@ -1126,16 +1127,16 @@ export async function switchCodex(deps: CodexSwitchDeps, input: SwitchCodexInput
       });
       if ('retryObserve' in result) {
         observeRestarts += 1;
-        if (observeRestarts >= 5) return switchRefusal(deps, input, 'codex-writing');
+        if (observeRestarts >= 6) return switchRefusal(deps, input, 'codex-writing');
         continue;
       }
       if ('retryFreshen' in result) { freshenRound += 1; continue; }
       return result.result;
     } catch (error) {
       if (error instanceof ClaudeCodeLockTimeout) return switchRefusal(deps, input, 'switch-busy');
-      if (error instanceof ProperLockfileCompromised) {
+      if (error instanceof ProperLockfileCompromised || error instanceof CodexAuthLockCompromised) {
         if (committed) return { ...committed, lockLostAfterCommit: true };
-        if (journalExists || renamed) {
+        if (renamed) {
           try { await releaseCodexSwitchJournal(deps.attempt, { ...deps.journalOptions, journalDir: deps.journalDir, now: deps.now }); } catch { /* preserved journal wins */ }
           return { outcome: 'failed', reason: 'lock-lost-after-publish', attemptId: deps.attempt };
         }
