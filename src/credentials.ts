@@ -16,6 +16,7 @@ import { parseGrant } from './refresh-lease';
 import {
   JournalKeychainInvalidError,
   resolveSingleGrantKeychain,
+  singleJournalAccount,
 } from './single-grant-ownership';
 import type { Store } from './store';
 import {
@@ -98,7 +99,7 @@ export function createOwnedCredentialSource(opts: {
         const detail: unknown = JSON.parse(migration.detail_json);
         if (detail && typeof detail === 'object' && !Array.isArray(detail)) {
           const accounts = (detail as Record<string, unknown>).accounts;
-          if (Array.isArray(accounts)) journalAccount = accounts[0];
+          journalAccount = singleJournalAccount(accounts);
         }
       } catch {
         // The resolver rejects an unreadable journal before any Keychain read.

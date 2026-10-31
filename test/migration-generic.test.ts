@@ -3396,6 +3396,39 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     }
   });
 
+  it('hand-back S5 refuses a generic journal with more than one account', async () => {
+    const h = setup('xai');
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      h.mig.commit();
+      const row = h.store.getMigration('pi-xai')!;
+      const detail = JSON.parse(row.detail_json) as { accounts: Array<Record<string, unknown>> };
+      detail.accounts.push({ ...detail.accounts[0]! });
+      h.store.upsertMigration('pi-xai', row.state, JSON.stringify(detail));
+      const { service, account } = kmCoords('xai');
+      const keychainBefore = h.kc.getSync(service, account);
+      const setSync = h.kc.setSync.bind(h.kc);
+      const deleteSync = h.kc.deleteSync.bind(h.kc);
+      const writes: string[] = [];
+      const deletes: string[] = [];
+      h.kc.setSync = (itemService, itemAccount, value) => {
+        writes.push(`${itemService}/${itemAccount}`);
+        return setSync(itemService, itemAccount, value);
+      };
+      h.kc.deleteSync = (itemService, itemAccount) => {
+        deletes.push(`${itemService}/${itemAccount}`);
+        return deleteSync(itemService, itemAccount);
+      };
+
+      assert.throws(() => h.mig.rollback(), /single-grant hand-back has no valid journal account coordinates/);
+      assert.deepEqual(writes, []);
+      assert.deepEqual(deletes, []);
+      assert.equal(h.kc.getSync(service, account), keychainBefore);
+      assert.equal(existsSync(h.ownerPath), true, 'the claim is not dropped before validation');
+    } finally { h.cleanup(); }
+  });
+
   it('T-S5s status reports cleanup-pending, shows a null fence as not fenced, and writes nothing', () => {
     const h = setup('xai');
     try {
@@ -3658,6 +3691,47 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     } finally {
       h.cleanup();
     }
+  });
+
+  it('hand-back S6c1 refuses a generic journal with more than one account', () => {
+    const h = setup('xai');
+    try {
+      const marker = {
+        phase: 'cleanup-pending',
+        keychainDisposition: 'delete',
+        piFingerprint: null,
+        decision: null,
+        fencedGeneration: null,
+        rolledBackAt: 123,
+      };
+      const { service, account } = kmCoords('xai');
+      h.kc.setSync(service, account, JSON.stringify({ ...FAKE_GRANTS.xai, generation: 0 }));
+      h.store.upsertMigration('pi-xai', 'NATIVE', JSON.stringify({
+        accounts: [
+          { id: expectedId('xai'), provider: 'xai', label: expectedLabel('xai'), fingerprint: 'fixture-fingerprint' },
+          { id: expectedId('xai'), provider: 'xai', label: expectedLabel('xai'), fingerprint: 'fixture-fingerprint' },
+        ],
+        handback: marker,
+      }));
+      const setSync = h.kc.setSync.bind(h.kc);
+      const deleteSync = h.kc.deleteSync.bind(h.kc);
+      const writes: string[] = [];
+      const deletes: string[] = [];
+      h.kc.setSync = (itemService, itemAccount, value) => {
+        writes.push(`${itemService}/${itemAccount}`);
+        return setSync(itemService, itemAccount, value);
+      };
+      h.kc.deleteSync = (itemService, itemAccount) => {
+        deletes.push(`${itemService}/${itemAccount}`);
+        return deleteSync(itemService, itemAccount);
+      };
+
+      assert.throws(() => h.mig.resume(), /cleanup-pending hand-back has no valid journal account coordinates/);
+      assert.deepEqual(writes, []);
+      assert.deepEqual(deletes, []);
+      assert.equal(keychainHas(h.kc, 'xai'), true);
+      assert.deepEqual(JSON.parse(h.store.getMigration('pi-xai')!.detail_json).handback, marker);
+    } finally { h.cleanup(); }
   });
 
   it('S6c1 refuses a journal account from another provider and leaves the marker and both Keychain items', () => {

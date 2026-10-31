@@ -101,6 +101,39 @@ describe('Pi migration S58 credential-first barrier', () => {
     } finally { h.cleanup(); }
   });
 
+  it('pi migrate kept-copy stash refuses a generic journal with more than one account', () => {
+    for (const provider of ['xai', 'kimi-coding'] as const) {
+      const h = setup(provider);
+      try {
+        const kept = plantKeptGenericCopy(h, provider);
+        const row = h.store.getMigration(`pi-${provider}`)!;
+        const detail = JSON.parse(row.detail_json) as { accounts: Array<Record<string, unknown>> };
+        detail.accounts.push({ ...detail.accounts[0]! });
+        h.store.upsertMigration(`pi-${provider}`, 'NATIVE', JSON.stringify(detail));
+        const setSync = h.keychain.setSync.bind(h.keychain);
+        const deleteSync = h.keychain.deleteSync.bind(h.keychain);
+        const writes: string[] = [];
+        const deletes: string[] = [];
+        h.keychain.setSync = (service, account, value) => {
+          writes.push(`${service}/${account}`);
+          return setSync(service, account, value);
+        };
+        h.keychain.deleteSync = (service, account) => {
+          deletes.push(`${service}/${account}`);
+          return deleteSync(service, account);
+        };
+
+        assert.throws(
+          () => migratePiSingleProvider(provider, h.paths, { keychain: h.keychain, store: h.store }),
+          (error: unknown) => (error as { code?: unknown }).code === 'journal-keychain-invalid',
+        );
+        assert.deepEqual(writes, []);
+        assert.deepEqual(deletes, []);
+        assert.equal(h.keychain.getSync(kept.service, kept.account), kept.kept);
+      } finally { h.cleanup(); }
+    }
+  });
+
   it('never leaves a placeholder without a managed item after a crash', () => {
     const h = setup();
     try {

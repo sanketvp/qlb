@@ -11,7 +11,7 @@ import { ADAPTER_ACCOUNT_IDS } from './migration';
 import { isCredentialNotFound } from './credential-backends';
 import { isNativeOpenRouterKeyNotFound, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, type KeychainBackend } from './keychain';
 import { qlbHomeDir } from './home';
-import { genericHoldsSharedItem, resolveSingleGrantKeychain, sharedSingleGrantCoords } from './single-grant-ownership';
+import { genericHoldsSharedItem, resolveSingleGrantKeychain, sharedSingleGrantCoords, singleJournalAccount } from './single-grant-ownership';
 import type { Store } from './store';
 
 export const PI_SINGLE_PROVIDERS = ['xai', 'kimi-coding', 'openrouter'] as const;
@@ -271,7 +271,7 @@ function stashKeptGenericCopy(
   // journal never blocks the rollback that would otherwise clear it.
   if (readOwnJournal()) return;
   let coords;
-  try { coords = resolveSingleGrantKeychain(provider, Array.isArray(detail.accounts) ? detail.accounts[0] : undefined); } catch (error) { throw journalKeychainInvalidError(error); }
+  try { coords = resolveSingleGrantKeychain(provider, singleJournalAccount(detail.accounts)); } catch (error) { throw journalKeychainInvalidError(error); }
   const shared = sharedSingleGrantCoords(provider);
   if (coords.service !== shared.service || coords.account !== shared.account) return;
   if (typeof rollback.cleanedAt !== 'number' || !Number.isFinite(rollback.cleanedAt)) {
