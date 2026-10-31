@@ -182,13 +182,18 @@ function errMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-function permitsNativeResync(row: MigrationRow | null): boolean {
+function permitsNativeResync(row: MigrationRow | null, accountId: string): boolean {
   if (row?.state !== 'QLB_OWNED') return false;
   try {
     const detail: unknown = JSON.parse(row.detail_json);
     if (!detail || typeof detail !== 'object' || Array.isArray(detail)) return false;
-    return !['intent', 'rollbackDecision', 'handback'].some((key) =>
+    if (['intent', 'rollbackDecision', 'handback'].some((key) =>
       Object.prototype.hasOwnProperty.call(detail, key),
+    )) return false;
+    // Only logins the migration took over (user decision NR-pa).
+    const accounts = (detail as { accounts?: unknown }).accounts;
+    return Array.isArray(accounts) && accounts.some((account) =>
+      account != null && typeof account === 'object' && (account as { id?: unknown }).id === accountId,
     );
   } catch {
     return false;
@@ -565,7 +570,7 @@ export function bindDetectAndResync(opts: {
     return detectAndResyncFromNative(provider, accountId, {
       keychain: opts.keychain,
       mayWriteOwnedCredential: () =>
-        permitsNativeResync(opts.store.getMigration(migrationStore)),
+        permitsNativeResync(opts.store.getMigration(migrationStore), accountId),
       readNativeCredential: () => opts.readNativeCredential(provider, accountId),
       readOwnedCredential: async (keychain, id) => {
         outerGeneration = opts.store.getGrantGeneration(id);
@@ -594,7 +599,7 @@ export function bindDetectAndResync(opts: {
         if (generation === null) return 'missing-account';
         return opts.store.runImmediate(() => {
           if (opts.store.getGrantGeneration(accountId) !== generation) return false;
-          if (!permitsNativeResync(opts.store.getMigration(migrationStore))) return false;
+          if (!permitsNativeResync(opts.store.getMigration(migrationStore), accountId)) return false;
           if (!outerOwnedRead) return false;
           const currentKeychain = outerKeychain && isMovedSingleGrantProvider(provider)
             ? resolveNativeResyncKeychain(provider, opts.store.getMigration(migrationStore))
