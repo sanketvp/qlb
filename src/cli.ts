@@ -4,7 +4,7 @@ import * as net from 'node:net';
 import { dirname, join, resolve } from 'node:path';
 import { adapters } from './adapters';
 import { assertTestHomeIsIsolated } from './bootstrap';
-import { assertAdmitted, type LifecycleOperation } from './lifecycle';
+import { FINISH_RETIREMENT_FIRST, RETIREMENT_IN_PROGRESS, assertAdmitted, type LifecycleOperation } from './lifecycle';
 import { createDefaultCodexGateDeps, runCodexGate } from './codex-gate';
 import { config, resolveConfig, stripConfigArgs } from './config';
 import { qlbHomeDir } from './home';
@@ -1879,7 +1879,8 @@ export async function runExecutingCommand(
     if (operation != null) {
       const refusal = lifecycleAdmissionCode(context.config.dbPath, operation);
       if (refusal != null) {
-        redactingContext.stderr(`qlb ${match.command.name}: refused: ${refusal}`);
+        const guidance = operation === 'lifecycle-close' && refusal === RETIREMENT_IN_PROGRESS ? `; ${FINISH_RETIREMENT_FIRST}` : '';
+        redactingContext.stderr(`qlb ${match.command.name}: refused: ${refusal}${guidance}`);
         return 3;
       }
     }

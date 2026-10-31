@@ -25,6 +25,8 @@ import {
   closeLifecycle,
 } from '../src/lifecycle';
 import { cutoverBegin } from '../src/commands/cutover';
+import lifecycleCommand from '../src/commands/lifecycle';
+import type { CommandContext } from '../src/registry';
 import { openStore } from '../src/store';
 import { defaultConfig } from '../src/config';
 import { doctorQlb } from '../src/diagnostics';
@@ -143,7 +145,7 @@ describe('lifecycle (AC49)', () => {
     } finally { store.close(); }
   });
 
-  it('retirement fence refuses only undo-cswap, undo-cswap:resume, pi-rollback and retire-cswap', () => {
+  it('retirement fence refuses only undo-cswap, undo-cswap:resume, pi-rollback, retire-cswap and lifecycle-close', () => {
     const store = fixtureStore();
     try {
       beginCutover(store);
@@ -152,9 +154,34 @@ describe('lifecycle (AC49)', () => {
       for (const operation of ['gate', 'switch:manual', 'switch:auto', 'auto', 'report-cutover', 'claude-add', 'doctor', 'status', 'retire-cswap:resume'] as const) {
         assert.equal(assertAdmitted(store, operation).ok, true, operation);
       }
-      for (const operation of ['undo-cswap', 'undo-cswap:resume', 'pi-rollback', 'retire-cswap'] as const) {
+      for (const operation of ['undo-cswap', 'undo-cswap:resume', 'pi-rollback', 'retire-cswap', 'lifecycle-close'] as const) {
         assert.equal(assertAdmitted(store, operation).code, RETIREMENT_IN_PROGRESS, operation);
       }
+    } finally { store.close(); }
+  });
+
+  it('lifecycle close is refused while a retirement is half-finished', async () => {
+    const store = fixtureStore();
+    try {
+      beginCutover(store);
+      const db = new DatabaseSync(store.dbPath);
+      try { db.prepare("UPDATE lifecycle SET state = 'retired', note = ?").run(RETIREMENT_IN_PROGRESS); } finally { db.close(); }
+      const before = phase(store);
+      assert.equal(assertAdmitted(store, 'lifecycle-close').code, RETIREMENT_IN_PROGRESS);
+      assert.equal(closeLifecycle(store, before.id, 'fixture', 40).code, RETIREMENT_IN_PROGRESS);
+      // Through the real dispatch path, whose admission gate runs before the command.
+      const home = mkdtempSync(join(tmpdir(), 'qlb-lifecycle-close-'));
+      const config = { ...defaultConfig(home), dbPath: store.dbPath };
+      for (const args of [['close', String(before.id), '--note', 'fixture'], ['close', String(before.id), '--note', 'fixture', '--json']]) {
+        const output: string[] = [];
+        const code = await runExecutingCommand({ command: lifecycleCommand, args }, {
+          config, env: {}, home, stdout: (line: string) => output.push(line), stderr: (line: string) => output.push(line),
+          loadConfig: () => config, registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
+        } as unknown as CommandContext);
+        assert.equal(code, 3, args.join(' '));
+        assert.match(output.join('\n'), /run qlb retire cswap again/, args.join(' '));
+      }
+      assert.deepEqual(phase(store), before);
     } finally { store.close(); }
   });
 
