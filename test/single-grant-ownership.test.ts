@@ -145,7 +145,7 @@ for (const provider of providers) {
       detailJson: detail({ ...account, keychain: undefined }),
     }), false);
 
-    for (const state of [null, 'NATIVE', 'MIRRORED', 'VALIDATED', 'RETIRED']) {
+    for (const state of [null, 'NATIVE', 'VALIDATED']) {
       assert.equal(genericHoldsSharedItem(provider, {
         state,
         detailJson: detail(shared),
@@ -155,6 +155,66 @@ for (const provider of providers) {
         detailJson: detail(account),
       }), false, `${state ?? 'no row'} legacy`);
     }
+    for (const state of ['MIRRORED', 'RETIRED']) {
+      assert.equal(genericHoldsSharedItem(provider, {
+        state,
+        detailJson: detail(account),
+      }), false, `${state} without keychain`);
+    }
+  });
+
+  it(`T-KC3b [${provider}] the shared item is also protected while the generic journal stages it or is retired`, () => {
+    const account = journalAccount(provider);
+    const shared = { ...account, keychain: sharedSingleGrantCoords(provider) };
+    const detail = (value: unknown, extra: Record<string, unknown> = {}) => JSON.stringify({ accounts: [value], ...extra });
+
+    for (const fixture of [
+      { name: 'MIRRORED', state: 'MIRRORED', facts: {} },
+      { name: 'VALIDATED with staging', state: 'VALIDATED', facts: { hasStaging: true } },
+      { name: 'VALIDATED with commit generation', state: 'VALIDATED', facts: {}, detail: { commitGeneration: 1 } },
+      { name: 'RETIRED', state: 'RETIRED', facts: {} },
+      { name: 'legacy sidecar', state: 'VALIDATED', facts: { hasLegacySidecar: true } },
+      { name: 'custom owner file', state: 'VALIDATED', facts: { hasCustomOwnerFile: true } },
+    ]) {
+      assert.equal(genericHoldsSharedItem(provider, {
+        state: fixture.state,
+        detailJson: detail(shared, fixture.detail),
+        ...fixture.facts,
+      }), true, fixture.name);
+    }
+
+    for (const fixture of [
+      { name: 'NATIVE', state: 'NATIVE', facts: {} },
+      { name: 'VALIDATED without staging', state: 'VALIDATED', facts: {} },
+    ]) {
+      assert.equal(genericHoldsSharedItem(provider, {
+        state: fixture.state,
+        detailJson: detail(shared),
+        ...fixture.facts,
+      }), false, fixture.name);
+    }
+
+    for (const fixture of [
+      { name: 'MIRRORED', state: 'MIRRORED', facts: {} },
+      { name: 'VALIDATED with staging', state: 'VALIDATED', facts: { hasStaging: true } },
+      { name: 'VALIDATED with commit generation', state: 'VALIDATED', facts: {}, detail: { commitGeneration: 1 } },
+      { name: 'RETIRED', state: 'RETIRED', facts: {} },
+      { name: 'legacy sidecar', state: 'VALIDATED', facts: { hasLegacySidecar: true } },
+      { name: 'custom owner file', state: 'VALIDATED', facts: { hasCustomOwnerFile: true } },
+    ]) {
+      assert.equal(genericHoldsSharedItem(provider, {
+        state: fixture.state,
+        detailJson: detail(account, fixture.detail),
+        ...fixture.facts,
+      }), false, `${fixture.name}: legacy journal`);
+    }
+  });
+
+  it(`T-KC3c [${provider}] an unreadable retired generic journal protects the shared item`, () => {
+    assert.equal(genericHoldsSharedItem(provider, {
+      state: 'RETIRED',
+      detailJson: '{',
+    }), true);
   });
 }
 

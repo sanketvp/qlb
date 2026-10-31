@@ -106,31 +106,64 @@ export function resolveSingleGrantKeychain(
 export interface GenericSharedItemFacts {
   state: string | null;
   detailJson: string | null;
+  hasStaging?: boolean;
+  hasLegacySidecar?: boolean;
+  hasCustomOwnerFile?: boolean;
+}
+
+/** Maps the raw generic journal detail into the S0.6 predicate's durable facts. */
+function genericSharedItemAtRest(
+  facts: GenericSharedItemFacts,
+  detail: Record<string, unknown> | null,
+): boolean {
+  return isSingleGrantAtRest({
+    p7aOwned: false,
+    state: facts.state as MigrationState | null,
+    handback: detail?.handback == null ? null : {} as HandbackMarker,
+    rollbackIntent: detail?.intent === 'rollback',
+    rollbackDecision: detail?.rollbackDecision == null ? null : {} as RollbackDecision,
+    hasV2OwnerEntry: false,
+    hasLegacySidecar: facts.hasLegacySidecar ?? false,
+    hasCustomOwnerFile: facts.hasCustomOwnerFile ?? false,
+    commitGeneration: typeof detail?.commitGeneration === 'number' ? detail.commitGeneration : null,
+    hasStaging: facts.hasStaging ?? false,
+  });
 }
 
 /**
  * Returns whether S66 protects the shared item from a P7a rollback.
- * A QLB-owned journal protects the item when it records the shared coordinates;
- * unreadable or ambiguous journal evidence (anything but exactly one account)
- * fails closed. Legacy coordinates remain unheld.
+ * A QLB-owned journal protects the item when it records the shared coordinates.
+ * A shared journal is also held during every non-rest stage and RETIRED. An
+ * unreadable or ambiguous journal fails closed only when that state is itself
+ * non-rest; a resolvable legacy journal remains unheld.
  */
 export function genericHoldsSharedItem(
   provider: SingleGrantKeychainProvider,
   facts: GenericSharedItemFacts,
 ): boolean {
-  if (facts.state !== 'QLB_OWNED') return false;
-
+  let detail: Record<string, unknown> | null = null;
   try {
-    const detail: unknown = facts.detailJson == null ? null : JSON.parse(facts.detailJson);
-    if (!isRecord(detail) || !Array.isArray(detail.accounts) || detail.accounts.length !== 1) {
+    const parsed: unknown = facts.detailJson == null ? null : JSON.parse(facts.detailJson);
+    if (!isRecord(parsed)) throw new JournalKeychainInvalidError();
+    detail = parsed;
+    if (!Array.isArray(detail.accounts) || detail.accounts.length !== 1) {
       throw new JournalKeychainInvalidError();
     }
     const coords = resolveSingleGrantKeychain(provider, detail.accounts[0]);
     const shared = sharedSingleGrantCoords(provider);
-    return coords.service === shared.service && coords.account === shared.account;
+    if (coords.service !== shared.service || coords.account !== shared.account) return false;
   } catch {
-    return true;
+    return facts.state === 'QLB_OWNED'
+      || facts.state === 'RETIRED'
+      || !genericSharedItemAtRest(facts, detail);
   }
+
+  return facts.state === 'QLB_OWNED'
+    || facts.state === 'RETIRED'
+    || !genericSharedItemAtRest(facts, detail)
+    // A commit generation is durable evidence of a generic commit point. It
+    // must not be treated as safe to delete before that commit is resolved.
+    || detail.commitGeneration != null;
 }
 
 /** The complete durable S5 hand-back marker. */
