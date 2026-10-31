@@ -34,7 +34,7 @@ import {
   writeCodexSwitchJournal,
 } from '../src/codex-switch';
 import { ClaudeCodeLockTimeout, codexAuthLockDir, withCodexAuthLock } from '../src/cc-locks';
-import { codexLockPaths, withCodexSwitchLock } from '../src/codex-consume';
+import { codexLockPaths, consumeCodexSlot, withCodexSwitchLock } from '../src/codex-consume';
 import { accessExpiry, codexFingerprint, codexIdentity, readCodexAuthStable, readCodexAuthStableWithStat, writeCodexAuthAtomic, type CodexAuthDocument } from '../src/codex-auth';
 import { CodexStashUnverifiable, importActiveCodexSlot } from '../src/codex-slots';
 import { MockKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from '../src/keychain';
@@ -1570,6 +1570,25 @@ describe('switchCodex landed and not-landed — C6-18', () => {
     } finally { mutableFs.renameSync = original; h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
   });
 
+  it('no code path writes the staged outgoing bytes after the rename (publish spy sees exactly one write)', async () => {
+    const h = switchHarness(); const mutableFs = require('node:fs') as { renameSync: typeof renameSync }; const original = mutableFs.renameSync;
+    try {
+      const atRename: Array<{ state: string; attemptId?: string }> = [];
+      const aPrime = observedDocument('a', 'switch-a-prime');
+      mutableFs.renameSync = ((from: Parameters<typeof original>[0], to: Parameters<typeof original>[1]) => {
+        if (String(to) === h.authPath) {
+          const read = journalState(h.root);
+          atRename.push(read.state === 'ok' ? { state: read.state, attemptId: read.journal.attemptId } : { state: read.state });
+        }
+        return original(from, to);
+      }) as typeof original;
+      const result = await h.runWith({ hooks: { afterRename: () => { writeFileSync(h.authPath, JSON.stringify(aPrime)); } } });
+      assert.equal(result.outcome, 'reverted-by-codex');
+      assert.deepEqual(atRename, [{ state: 'ok', attemptId: 'switch-attempt' }]);
+      assert.deepEqual(JSON.parse(readFileSync(h.authPath, 'utf8')), aPrime);
+    } finally { mutableFs.renameSync = original; h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
   it('a missing or unreadable auth.json at the start of a full switch leaves the database, Keychain, journal and watch rows byte-identical and sends zero transport calls, even with a due watch row and a failing precondition', async () => {
     const dumpDb = (db: DatabaseSync) => JSON.stringify((db.prepare(`SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name`).all() as Array<{ name: string }>)
       .map(({ name }) => [name, db.prepare(`SELECT * FROM "${name}"`).all()]));
@@ -1691,15 +1710,215 @@ describe('switchCodex landed and not-landed — C6-18', () => {
     } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
   });
 
-  it('an external write classified after the rename throws codex-switch-external-unhandled and keeps the released journal', async () => {
+  it('A′ written between the rename and the verify read ⇒ reverted-by-codex, slot A holds A′, active_login A (adopt), file holds A′, dead 0, no relogin row, slot B unchanged', async () => {
     const h = switchHarness();
     try {
-      const third = observedDocument('c', 'external-c');
-      await assert.rejects(h.runWith({ hooks: { beforeVerify: () => { writeFileSync(h.authPath, JSON.stringify(third)); } } }),
-        { message: 'codex-switch-external-unhandled' });
+      const aPrime = observedDocument('a', 'switch-a-prime');
+      const holder = { pid: 4411, lstart: 'Tue Oct 28 10:00:00 2026', host: 'codex' };
+      const beforeB = h.slots.readSlot('b:account').document;
+      const result = await h.runWith({ list: async () => [holder], hooks: { afterRename: () => { writeFileSync(h.authPath, JSON.stringify(aPrime)); } } });
+      assert.equal(result.outcome, 'reverted-by-codex');
+      assert.deepEqual(h.slots.readSlot('a:account').document, aPrime);
+      assert.deepEqual(h.slots.readSlot('b:account').document, beforeB);
+      assert.deepEqual(JSON.parse(readFileSync(h.authPath, 'utf8')), aPrime);
+      assert.equal(h.store.getCodexActiveLogin(), 'a:account');
+      assert.equal(scalarCount(h.db, `SELECT COUNT(*) AS count FROM codex_slots WHERE account_id = 'a:account' AND dead = 1`), 0);
+      assert.equal(scalarCount(h.db, 'SELECT COUNT(*) AS count FROM relogin_events'), 0);
+      assert.equal((h.db.prepare('SELECT outcome FROM switch_log ORDER BY id DESC').get() as { outcome: string }).outcome, 'reverted-by-codex');
+    } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('a rotated B written there ⇒ ok and slot B holds the rotation', async () => {
+    const h = switchHarness();
+    try {
+      const bPrime = observedDocument('b', 'switch-b-prime');
+      const result = await h.runWith({ hooks: { afterRename: () => { writeFileSync(h.authPath, JSON.stringify(bPrime)); } } });
+      assert.equal(result.outcome, 'ok');
+      assert.deepEqual(h.slots.readSlot('b:account').document, bPrime);
+      assert.deepEqual(JSON.parse(readFileSync(h.authPath, 'utf8')), bPrime);
+    } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('a third known identity there ⇒ reverted-by-codex with active_login on that slot', async () => {
+    const h = switchHarness();
+    try {
+      const c = observedDocument('c', 'switch-c');
+      importActiveCodexSlot(c, { store: h.store, keychain: h.keychain, now: () => 1 });
+      const result = await h.runWith({ hooks: { afterRename: () => { writeFileSync(h.authPath, JSON.stringify(c)); } } });
+      assert.equal(result.outcome, 'reverted-by-codex');
+      assert.equal(h.store.getCodexActiveLogin(), 'c:account');
+    } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('a known ancestor of the outgoing slot after the rename records reverted-by-codex without writing auth.json', async () => {
+    const h = switchHarness(); const mutableFs = require('node:fs') as { renameSync: typeof renameSync }; const original = mutableFs.renameSync;
+    try {
+      const aPrime = observedDocument('a', 'switch-a-prime');
+      importActiveCodexSlot(aPrime, { store: h.store, keychain: h.keychain, now: () => 1 });
+      let writes = 0;
+      mutableFs.renameSync = ((from: Parameters<typeof original>[0], to: Parameters<typeof original>[1]) => {
+        if (String(to) === h.authPath) writes += 1;
+        return original(from, to);
+      }) as typeof original;
+      const result = await h.runWith({ hooks: { afterRename: () => { writeFileSync(h.authPath, JSON.stringify(h.a)); } } });
+      assert.equal(result.outcome, 'reverted-by-codex');
+      assert.equal(writes, 2, 'the step-2 republish and target publish are the only writes');
+      assert.deepEqual(JSON.parse(readFileSync(h.authPath, 'utf8')), h.a);
+    } finally { mutableFs.renameSync = original; h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('a known ancestor of the target after the rename keeps the journal', async () => {
+    const h = switchHarness();
+    try {
+      const bPrime = observedDocument('b', 'switch-b-prime');
+      importActiveCodexSlot(bPrime, { store: h.store, keychain: h.keychain, now: () => 1 });
+      const result = await h.runWith({ hooks: { afterRename: () => { writeFileSync(h.authPath, JSON.stringify(h.b)); } } });
+      assert.equal(result.outcome, 'failed'); assert.equal(result.reason, 'target-ancestor');
       assert.equal(ownerState(h.root), 'released');
       assert.equal(scalarCount(h.db, 'SELECT COUNT(*) AS count FROM switch_log'), 0);
     } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('a split third slot C after the rename keeps the journal with involved {A, B, C}, and codex refresh of C is refused while it stands', async () => {
+    const h = switchHarness();
+    try {
+      const c = observedDocument('c', 'switch-c'); const cSplit = observedDocument('c', 'switch-c-split'); const cExternal = observedDocument('c', 'switch-c-external');
+      importActiveCodexSlot(c, { store: h.store, keychain: h.keychain, now: () => 1 });
+      h.keychain.setSync(qlbKeychainService('openai-codex', 'c:account'), QLB_KEYCHAIN_ACCOUNT, JSON.stringify(cSplit));
+      const result = await h.runWith({ hooks: { afterRename: () => { writeFileSync(h.authPath, JSON.stringify(cExternal)); } } });
+      assert.equal(result.outcome, 'failed'); assert.equal(result.reason, 'slot-split');
+      const state = codexRecoveryFenceState(join(h.root, 'journal'), h.store);
+      assert.equal(state.state, 'fenced');
+      if (state.state !== 'fenced') return;
+      assert.deepEqual([...state.accounts as Set<string>].sort(), ['a:account', 'b:account', 'c:account']);
+      let posts = 0;
+      const refresh = await consumeCodexSlot({ accountId: 'c:account', snapshot: h.slots.readSlot('c:account').document,
+        trigger: 'force', force: true, slots: h.slots as never, holders: async () => [], inFlightSlots: state.accounts,
+        transport: async () => { posts += 1; return { status: 200, body: '{}' }; } });
+      assert.equal(refresh.status, 'switch-in-flight'); assert.equal(posts, 0);
+    } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('an unknown identity there ⇒ failed unknown-live-identity, active_login NULL, one stash', async () => {
+    const h = switchHarness();
+    try {
+      const unknown = observedDocument('unknown', 'switch-unknown'); let stashes = 0;
+      h.slots.ensureUnclaimedStash = async () => { stashes += 1; return { stashId: 'unknown', created: true }; };
+      const result = await h.runWith({ hooks: { afterRename: () => { writeFileSync(h.authPath, JSON.stringify(unknown)); } } });
+      assert.equal(result.outcome, 'failed');
+      assert.equal((h.db.prepare('SELECT detail FROM switch_log ORDER BY id DESC').get() as { detail: string }).detail, 'unknown-live-identity');
+      assert.equal(h.store.getCodexActiveLogin(), null); assert.equal(stashes, 1);
+    } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('an unstable, missing or unreadable verify keeps the journal, commits no row and exits 1', async () => {
+    for (const status of ['unstable', 'missing', 'unreadable'] as const) {
+      const h = switchHarness(); let verify = false;
+      try {
+        const result = await h.runWith({ hooks: { afterRename: () => { verify = true; } }, readLive: async () => verify
+          ? status === 'unreadable' ? { status, code: 'EIO' } : { status }
+          : readCodexAuthStableWithStat(h.authPath, { delayMs: 0 }) });
+        assert.deepEqual(result, { outcome: 'failed', reason: `verify-${status}`, attemptId: 'switch-attempt' });
+        assert.equal(ownerState(h.root), 'released'); assert.equal(scalarCount(h.db, 'SELECT COUNT(*) AS count FROM switch_log'), 0);
+      } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+    }
+  });
+
+  const newestObservation = (db: DatabaseSync) => ({ ...db.prepare(`SELECT identity, lineage_fp FROM codex_live_observations
+    ORDER BY ts DESC, id DESC LIMIT 1`).get() as Record<string, unknown> });
+
+  it('a thrown rename with an unstable, missing or unreadable verify still records failed not-published and deletes the journal', async () => {
+    // `foreign` is a stable verify read of another identity: the not-landed observation stays A with the outgoing fingerprint.
+    for (const status of ['unstable', 'missing', 'unreadable', 'foreign'] as const) {
+      const h = switchHarness(); const mutableFs = require('node:fs') as { renameSync: typeof renameSync }; const original = mutableFs.renameSync;
+      let verify = false;
+      try {
+        const before = readFileSync(h.authPath, 'utf8');
+        const foreign = observedDocument('c', 'switch-c-foreign');
+        mutableFs.renameSync = ((from: Parameters<typeof original>[0], to: Parameters<typeof original>[1]) => {
+          if (String(to) === h.authPath) throw new Error('fixture rename');
+          return original(from, to);
+        }) as typeof original;
+        const result = await h.runWith({ hooks: { beforeVerify: () => { verify = true; } }, readLive: async () => !verify
+          ? readCodexAuthStableWithStat(h.authPath, { delayMs: 0 })
+          : status === 'foreign' ? { status: 'ok', doc: foreign, sha256: 'sha256-file:foreign', inode: 99 }
+            : status === 'unreadable' ? { status, code: 'EIO' } : { status } });
+        assert.equal(result.outcome, 'failed', status); assert.equal(result.reason, undefined, status);
+        assert.equal(readFileSync(h.authPath, 'utf8'), before);
+        const row = h.db.prepare('SELECT outcome, detail, published_at FROM switch_log ORDER BY id DESC').get() as Record<string, unknown>;
+        assert.deepEqual({ ...row }, { outcome: 'failed', detail: 'not-published', published_at: null }, status);
+        assert.equal(journalState(h.root).state, 'absent', status);
+        assert.deepEqual(newestObservation(h.db), { identity: 'a:account', lineage_fp: codexFingerprint(h.a) }, status);
+      } finally { mutableFs.renameSync = original; h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+    }
+  });
+
+  it('a wiped verify after the rename records no live observation of the outgoing account and records the wiped event', async () => {
+    const h = switchHarness(); let verify = false;
+    try {
+      const wiped = { status: 'wiped', error: { ok: false, error: 'tokens-empty', status: 'wiped' } } as const;
+      const observationsOfA = () => scalarCount(h.db, "SELECT COUNT(*) AS count FROM codex_live_observations WHERE identity = 'a:account'");
+      const result = await h.runWith({ hooks: { afterRename: () => { verify = true; } }, readLive: async () => verify
+        ? wiped : readCodexAuthStableWithStat(h.authPath, { delayMs: 0 }) });
+      assert.equal(result.outcome, 'failed');
+      assert.equal((h.db.prepare('SELECT detail FROM switch_log ORDER BY id DESC').get() as { detail: string }).detail, 'wiped');
+      assert.deepEqual(newestObservation(h.db), { identity: null, lineage_fp: null });
+      assert.equal(observationsOfA(), 1, 'only the pre-switch observation names A');
+      assert.equal(scalarCount(h.db, "SELECT COUNT(*) AS count FROM relogin_events WHERE kind = 'wiped'"), 1);
+      assert.equal(journalState(h.root).state, 'absent');
+    } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('an unresolved target-ancestor journal does not let a later import of those bytes resolve as ok', async () => {
+    const h = switchHarness();
+    try {
+      const bPrime = observedDocument('b', 'switch-b-prime');
+      importActiveCodexSlot(bPrime, { store: h.store, keychain: h.keychain, now: () => 1 });
+      const result = await h.runWith({ hooks: { afterRename: () => { writeFileSync(h.authPath, JSON.stringify(h.b)); } } });
+      assert.equal(result.reason, 'target-ancestor');
+      const read = journalState(h.root);
+      assert.equal(read.state, 'ok');
+      if (read.state !== 'ok') return;
+      assert.equal(read.journal.adoptingTarget.includes(codexFingerprint(h.b)), false);
+      // The user imports the ancestor bytes into slot B without logging in again.
+      h.slots.writeSlot('b:account', h.b);
+      const observed = await readCodexAuthStableWithStat(h.authPath, { delayMs: 0 });
+      const classified = classifyPostPublish({ journal: read.journal, observed, targetSlotFp: codexFingerprint(h.b) });
+      assert.equal(classified, 'target-changed');
+      const verdict = resolveRecoveryVerdict(classified, { action: 'noop', accountId: 'b:account' }, {
+        phase: 'recovery', journal: read.journal, targetSlotFingerprint: codexFingerprint(h.b),
+        slotHeads: new Map([['a:account', codexFingerprint(h.a)], ['b:account', codexFingerprint(h.b)]]), live: h.b });
+      assert.notDeepEqual(verdict, { class: 'resolvable', effect: { outcome: 'ok', adopted: false } });
+      assert.deepEqual(verdict, { class: 'resolvable', effect: { outcome: 'failed', detail: 'target-changed' } });
+    } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('a journal mark that returns false fails the attempt closed with the journal kept', async () => {
+    // Replacing the journal's attempt id makes the conditional mark return false.
+    const tamper = (root: string) => {
+      const path = codexSwitchJournalPath({ journalDir: join(root, 'journal') });
+      writeFileSync(path, JSON.stringify({ ...JSON.parse(readFileSync(path, 'utf8')), attemptId: 'tampered' }));
+    };
+    for (const mark of ['adopting-target', 'unresolved'] as const) {
+      const h = switchHarness();
+      try {
+        const beforeB = h.slots.readSlot('b:account');
+        const live = mark === 'adopting-target' ? observedDocument('b', 'switch-b-prime') : observedDocument('c', 'switch-c-external');
+        if (mark === 'unresolved') {
+          importActiveCodexSlot(observedDocument('c', 'switch-c'), { store: h.store, keychain: h.keychain, now: () => 1 });
+          h.keychain.setSync(qlbKeychainService('openai-codex', 'c:account'), QLB_KEYCHAIN_ACCOUNT, JSON.stringify(observedDocument('c', 'switch-c-split')));
+        }
+        await assert.rejects(h.runWith({ hooks: { afterRename: () => { writeFileSync(h.authPath, JSON.stringify(live)); tamper(h.root); } } }), mark);
+        const read = journalState(h.root);
+        assert.equal(read.state, 'ok', mark);
+        if (read.state !== 'ok') return;
+        assert.equal(read.journal.attemptId, 'tampered', mark);
+        assert.deepEqual(read.journal.adoptingTarget, [], mark); assert.equal(read.journal.unresolved, undefined, mark);
+        assert.equal(scalarCount(h.db, 'SELECT COUNT(*) AS count FROM switch_log'), 0, mark);
+        assert.deepEqual(h.slots.readSlot('b:account'), beforeB, mark);
+        assert.equal(h.store.getCodexSlot('b:account')?.fingerprint, beforeB.fingerprint, mark);
+      } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+    }
   });
 
   it('a journal written without an injected owner records this process\'s ps start so stillTheSameProcess recognises it', async () => {
