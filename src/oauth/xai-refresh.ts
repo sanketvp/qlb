@@ -15,7 +15,7 @@ export interface OAuthRefreshCredential {
 }
 
 export interface OAuthRefreshTransport {
-  request(request: { url: string; method: 'POST'; headers: Record<string, string>; body: string }): Promise<{
+  request(request: { url: string; method: 'POST'; headers: Record<string, string>; body: string; signal?: AbortSignal }): Promise<{
     status: number;
     body: unknown;
   }>;
@@ -37,7 +37,7 @@ function bodyObject(value: unknown): Record<string, unknown> | null {
 /** xAI permits the old refresh token when the response omits refresh_token. */
 export async function refreshXaiCredential(
   credential: OAuthRefreshCredential,
-  deps: { transport: OAuthRefreshTransport; now?: () => number },
+  deps: { transport: OAuthRefreshTransport; now?: () => number; signal?: AbortSignal },
 ): Promise<OAuthRefreshResult> {
   let response: { status: number; body: unknown };
   try {
@@ -50,6 +50,7 @@ export async function refreshXaiCredential(
         client_id: XAI_CLIENT_ID,
         refresh_token: credential.refresh,
       }).toString(),
+      signal: deps.signal,
     });
   } catch {
     return { kind: 'transient' };

@@ -30,12 +30,15 @@ export async function refreshKimiCodingCredential(
     now?: () => number;
     sleep?: (ms: number) => Promise<void>;
     oauthHost?: string;
+    /** An aborted signal stops the retry chain; the in-flight request gets it too. */
+    signal?: AbortSignal;
   },
 ): Promise<OAuthRefreshResult> {
   const oauthHost = (deps.oauthHost ?? KIMI_CODING_OAUTH_HOST).replace(/\/+$/, '');
   let response: { status: number; body: unknown } | undefined;
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt += 1) {
     if (attempt > 0) await (deps.sleep ?? ((ms) => new Promise<void>((resolve) => setTimeout(resolve, ms))))(1000 * 2 ** (attempt - 1));
+    if (deps.signal?.aborted) return { kind: 'transient' };
     try {
       response = await deps.transport.request({
         url: `${oauthHost}/api/oauth/token`,
@@ -46,6 +49,7 @@ export async function refreshKimiCodingCredential(
           grant_type: 'refresh_token',
           refresh_token: credential.refresh,
         }).toString(),
+        signal: deps.signal,
       });
     } catch {
       if (attempt < MAX_RETRIES) continue;

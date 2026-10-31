@@ -76,8 +76,11 @@ export interface SingleConsumeDeps {
   env?: NodeJS.ProcessEnv;
   /** Gate refresh uses 60 s; the automatic loop supplies its 10-minute horizon. */
   dueWithinMs?: number;
-  /** Executes the provider POST; never supplied by production tests without a fake. */
-  refresh: (credential: OAuthCredential) => Promise<SingleRefreshResult>;
+  /**
+   * Executes the provider POST; never supplied by production tests without a fake.
+   * The signal aborts when a generic-held POST loses its refresh lease.
+   */
+  refresh: (credential: OAuthCredential, opts?: { signal?: AbortSignal }) => Promise<SingleRefreshResult>;
   /** Best-effort audit edge, called only after the replacement is durable. */
   onLineage?: (row: { provider: SingleConsumeProvider; fromFp: string; toFp: string }) => void;
   onDead?: (provider: SingleConsumeProvider) => void;
@@ -94,6 +97,8 @@ interface StoredCredential { credential: OAuthCredential; bytes: string; }
 
 const GATE_FRESHEN_MS = 60_000;
 const PROCESS_UUID = randomUUID();
+/** A lost race inside the POST window: discard this pass and re-read, as RefreshLease's goto 1. */
+const RELOOP = Symbol('reloop');
 
 function credentialService(provider: SingleConsumeProvider): string {
   return qlbKeychainService(provider, 'default');
@@ -276,6 +281,11 @@ function genericWrite(
     if (!baseline) throw new SingleConsumeFailure('cas-conflict');
     const accountId = ADAPTER_ACCOUNT_IDS[provider];
     if (store.getGrantGeneration(accountId) !== baseline.generation) throw new SingleConsumeFailure('cas-conflict');
+    // A POST made under the refresh lease writes only while this holder still holds it.
+    if (refreshLeaseHolder
+      && (store as RefreshLeaseStore).getLease(refreshLeaseName(accountId))?.holder_id !== refreshLeaseHolder) {
+      throw new SingleConsumeFailure('cas-conflict');
+    }
     let bytes: string;
     try { bytes = keychain.getSync(credentialService(provider), QLB_KEYCHAIN_ACCOUNT); } catch {
       throw new SingleConsumeFailure('cas-conflict');
@@ -356,7 +366,9 @@ export async function consumeSingleCredential(
 
     const consumedFp = credentialLineage(current.credential);
     const consumedContentFingerprint = contentFingerprint(current.bytes);
+    const leaseAbort = new AbortController();
     let refreshLeaseHolder: string | undefined;
+    let leaseReleased = false;
     let heartbeat: NodeJS.Timeout | undefined;
     if (owner === 'generic') {
       const accountId = ADAPTER_ACCOUNT_IDS[provider];
@@ -380,16 +392,33 @@ export async function consumeSingleCredential(
       }
       refreshLeaseHolder = holderId;
       heartbeat = setInterval(() => {
-        leaseStore.heartbeatRefreshLease(accountId, holderId, baseline!.generation, DEFAULT_LEASE_TTL_MS);
+        // A throw here would be an uncaught exception mid-POST; treat it as a lost lease.
+        let held = false;
+        try {
+          held = leaseStore.heartbeatRefreshLease(accountId, holderId, baseline!.generation, DEFAULT_LEASE_TTL_MS);
+        } catch {
+          warn(deps, 'refresh lease heartbeat failed');
+        }
+        if (!held) {
+          clearInterval(heartbeat);
+          leaseAbort.abort('lease_lost_or_generation_moved');
+        }
       }, DEFAULT_HEARTBEAT_MS);
     }
 
     // The handler is installed before the POST and stays in place until the
     // response is either primary-persisted or durably stashed.
+    let result: SingleConsumeResult | typeof RELOOP;
     try {
-    return await deferTermination(async () => {
-      const refreshed = await deps.refresh(current.credential);
+    result = await deferTermination(async (): Promise<SingleConsumeResult | typeof RELOOP> => {
+      const refreshed = await deps.refresh(current.credential, { signal: leaseAbort.signal });
       if (refreshed.kind === 'dead') {
+        // invalid_grant after the lease was lost or G moved is a lost race, not a revocation.
+        if (baseline && (leaseAbort.signal.aborted
+          || deps.store.getGrantGeneration(ADAPTER_ACCOUNT_IDS[provider]) !== baseline.generation)) {
+          warn(deps, 'invalid_grant after a lost refresh race');
+          return RELOOP;
+        }
         notifyDead(provider, deps);
         throw new SingleConsumeFailure('refresh-dead');
       }
@@ -401,7 +430,8 @@ export async function consumeSingleCredential(
         await persistStash(provider, refreshed.credential as StashCredential, consumedFp, keychain, { home, now: deps.now });
         throw error;
       }
-      if (contentFingerprint(afterPost.bytes) !== consumedContentFingerprint) {
+      // A POST whose lease was lost never writes the primary; its pair may be the only live one.
+      if (leaseAbort.signal.aborted || contentFingerprint(afterPost.bytes) !== consumedContentFingerprint) {
         await persistStash(provider, refreshed.credential as StashCredential, consumedFp, keychain, { home, now: deps.now });
         if (winnerFor(snapshot, afterPost.credential, now())) return { credential: afterPost.credential, outcome: 'winner' };
         throw new SingleConsumeFailure('cas-conflict');
@@ -415,6 +445,8 @@ export async function consumeSingleCredential(
             keychain.setSync(credentialService(provider), QLB_KEYCHAIN_ACCOUNT, JSON.stringify(refreshed.credential));
             return refreshed.credential;
           })();
+        // genericWrite deleted the lease inside its committed transaction.
+        leaseReleased = true;
       } catch (error) {
         await persistStash(provider, refreshed.credential as StashCredential, consumedFp, keychain, { home, now: deps.now });
         if (error instanceof SingleConsumeFailure) throw error;
@@ -425,15 +457,24 @@ export async function consumeSingleCredential(
     });
     } finally {
       if (heartbeat) clearInterval(heartbeat);
-      if (refreshLeaseHolder) (deps.store as RefreshLeaseStore).releaseRefreshLease(ADAPTER_ACCOUNT_IDS[provider], refreshLeaseHolder);
+      if (refreshLeaseHolder && !leaseReleased) {
+        // A release failure must not replace the outcome; the lease then lapses by TTL.
+        try { (deps.store as RefreshLeaseStore).releaseRefreshLease(ADAPTER_ACCOUNT_IDS[provider], refreshLeaseHolder); } catch {
+          warn(deps, 'refresh lease release failed');
+        }
+      }
     }
+    if (result === RELOOP) continue;
+    return result;
     }
   });
 }
 
-async function fetchTransport(request: { url: string; method: 'POST'; headers: Record<string, string>; body: string }): Promise<{ status: number; body: unknown }> {
+async function fetchTransport(request: { url: string; method: 'POST'; headers: Record<string, string>; body: string; signal?: AbortSignal }): Promise<{ status: number; body: unknown }> {
+  const timeout = AbortSignal.timeout(30_000);
   const response = await fetch(request.url, {
-    method: request.method, headers: request.headers, body: request.body, signal: AbortSignal.timeout(30_000),
+    method: request.method, headers: request.headers, body: request.body,
+    signal: request.signal ? AbortSignal.any([request.signal, timeout]) : timeout,
   });
   let body: unknown = null;
   try { body = await response.json(); } catch { /* the classifier fails closed on malformed JSON */ }
@@ -463,7 +504,9 @@ export async function consumeXaiCredential(
   return singleCredentialFromResult(await consumeSingleCredential('xai', observed, {
     ...deps,
     keychain,
-    refresh: (credential) => refreshXaiCredential(credential, { transport: deps.transport ?? { request: fetchTransport }, now: deps.now }),
+    refresh: (credential, opts) => refreshXaiCredential(credential, {
+      transport: deps.transport ?? { request: fetchTransport }, now: deps.now, signal: opts?.signal,
+    }),
   }));
 }
 
@@ -482,8 +525,8 @@ export async function consumeKimiCodingCredential(
   return singleCredentialFromResult(await consumeSingleCredential('kimi-coding', observed, {
     ...deps,
     keychain,
-    refresh: (credential) => refreshKimiCodingCredential(credential, {
-      transport: deps.transport ?? { request: fetchTransport }, now: deps.now, sleep: deps.sleep,
+    refresh: (credential, opts) => refreshKimiCodingCredential(credential, {
+      transport: deps.transport ?? { request: fetchTransport }, now: deps.now, sleep: deps.sleep, signal: opts?.signal,
       oauthHost: env.KIMI_CODE_OAUTH_HOST ?? env.KIMI_OAUTH_HOST,
     }),
   }));
