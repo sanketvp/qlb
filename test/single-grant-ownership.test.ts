@@ -127,6 +127,14 @@ for (const provider of providers) {
       state: 'QLB_OWNED',
       detailJson: detail({ ...account, keychain: { service: 'invalid', account: 'invalid' } }),
     }), true);
+    // A single-grant journal records exactly one account; anything else is
+    // ambiguous evidence and fails closed (§1).
+    for (const accounts of [[], [account, shared], [account, { bogus: true }]]) {
+      assert.equal(genericHoldsSharedItem(provider, {
+        state: 'QLB_OWNED',
+        detailJson: JSON.stringify({ accounts }),
+      }), true, `${accounts.length} accounts`);
+    }
 
     assert.equal(genericHoldsSharedItem(provider, {
       state: 'QLB_OWNED',

@@ -106,7 +106,8 @@ export interface GenericSharedItemFacts {
 /**
  * Returns whether S66 protects the shared item from a P7a rollback.
  * A QLB-owned journal protects the item when it records the shared coordinates;
- * unreadable journal evidence fails closed. Legacy coordinates remain unheld.
+ * unreadable or ambiguous journal evidence (anything but exactly one account)
+ * fails closed. Legacy coordinates remain unheld.
  */
 export function genericHoldsSharedItem(
   provider: SingleGrantKeychainProvider,
@@ -116,7 +117,7 @@ export function genericHoldsSharedItem(
 
   try {
     const detail: unknown = facts.detailJson == null ? null : JSON.parse(facts.detailJson);
-    if (!isRecord(detail) || !Array.isArray(detail.accounts)) {
+    if (!isRecord(detail) || !Array.isArray(detail.accounts) || detail.accounts.length !== 1) {
       throw new JournalKeychainInvalidError();
     }
     const coords = resolveSingleGrantKeychain(provider, detail.accounts[0]);
