@@ -519,7 +519,8 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     registerConflictProvider(
       providerApi,
       () => createAssistantMessageEventStream() as never,
-      journal?.cause === "missing-binary"
+      // A malformed owner file is the conflict's own cause, so its text outranks missing-binary.
+      journal?.cause === "missing-binary" && modeInput!.owner !== "malformed"
         ? qlbUnavailable("anthropic", "missing-binary").error.errorMessage
         : conflictMessage(modeInput!),
       catalog,

@@ -6,6 +6,7 @@ import { dirname, join, resolve } from 'node:path';
 import { describe, it } from 'node:test';
 
 import { resolvePiPackageRoot } from '../src/pi-integration';
+import { CONSUME_ERRORS } from '../extensions/qlb-pi/consume';
 
 const ROOT = join(__dirname, '..', '..');
 const PI_GLOBAL_ROOT = process.env.QLB_TEST_PI_ROOT ?? resolvePiPackageRoot() ?? '/nonexistent-pi';
@@ -141,7 +142,7 @@ process.exit(code);
 function run(
   provider: Provider,
   failure: (typeof CAUSES)[number],
-  { absentAtStartup = false }: { absentAtStartup?: boolean } = {},
+  { absentAtStartup = false, malformedOwner = false }: { absentAtStartup?: boolean; malformedOwner?: boolean } = {},
 ): {
   events: Array<{ error?: { errorMessage?: string } }>;
   registrations: string[];
@@ -160,7 +161,9 @@ function run(
   mkdirSync(join(agent, 'src'), { recursive: true });
   cpSync(join(ROOT, 'src', 'redact.ts'), join(agent, 'src', 'redact.ts'));
   cpSync(join(ROOT, 'src', 'pi-owner-document.ts'), join(agent, 'src', 'pi-owner-document.ts'));
-  writeFileSync(join(agent, 'qlb-owner.json'), JSON.stringify({ providers: Object.fromEntries(PROVIDERS.map((name) => [name, { mode: 'qlb', since: 1 }])) }));
+  writeFileSync(join(agent, 'qlb-owner.json'), malformedOwner
+    ? '{not json'
+    : JSON.stringify({ providers: Object.fromEntries(PROVIDERS.map((name) => [name, { mode: 'qlb', since: 1 }])) }));
   // The adapter parses this literal configuration but must never execute it.
   writeFileSync(join(agent, 'models.json'), JSON.stringify({ providers: { openrouter: { baseUrl: 'https://fixture.invalid', apiKey: `!command touch ${commandMarker}` } } }));
   const entry = join(home, 'load.mjs');
@@ -233,5 +236,12 @@ describe('qlb-pi registered streamSimple fail-closed matrix', { skip: piAvailabl
     );
     assert.deepEqual(result.transportCalls, []);
     assert.deepEqual(result.gateCalls, []);
+  });
+
+  it('anthropic: a malformed owner file outranks a missing binary at startup', () => {
+    const result = run('anthropic', CAUSES[0], { absentAtStartup: true, malformedOwner: true });
+    assert.equal(result.events.length, 1);
+    assert.equal(result.events[0]?.error?.errorMessage, CONSUME_ERRORS.conflict);
+    assert.deepEqual(result.transportCalls, []);
   });
 });
