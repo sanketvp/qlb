@@ -362,7 +362,7 @@ describe('Pi migration S58 credential-first barrier', () => {
       } finally { h.cleanup(); }
     });
 
-    it(`${provider}: pi migrate over a kept copy that crashed after its journal and before the stash still stashes on re-run`, () => {
+    it(`${provider}: pi migrate over a kept copy that crashed after the stash and the journal resumes with the kept copy stashed`, () => {
       const h = setup(provider);
       try {
         const kept = plantKeptGenericCopy(h, provider);
