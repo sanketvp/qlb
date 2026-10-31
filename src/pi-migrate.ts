@@ -277,7 +277,7 @@ function stashKeptGenericCopy(
   if (typeof rollback.cleanedAt !== 'number' || !Number.isFinite(rollback.cleanedAt)) {
     throw new Error('generic migration lastRollback cleanedAt is invalid');
   }
-  const stashService = `qlb:${provider}:unclaimed:${new Date(rollback.cleanedAt).toISOString()}`;
+  const stashService = qlbKeychainService(provider, `kept:${new Date(rollback.cleanedAt).toISOString()}`);
   if (readKeychainItem(deps, stashService, QLB_KEYCHAIN_ACCOUNT) !== undefined) return;
   const kept = readKeychainItem(deps, shared.service, shared.account);
   if (kept === undefined) return;
