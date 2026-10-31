@@ -402,6 +402,58 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     });
   }
 
+  for (const provider of ['xai', 'kimi-coding'] as const) {
+    it(`T-KC6a [${provider}] a hand-back of a journal that records the shared item ranks and restores from that item`, async () => {
+      const h = setup(provider);
+      try {
+        const shared = sharedSingleGrantCoords(provider);
+        const legacy = kmCoords(provider);
+        const sharedGrant = {
+          ...FAKE_GRANTS[provider],
+          access: `${provider}-access-shared-item-fake`,
+          refresh: `${provider}-refresh-shared-item-fake`,
+          generation: 0,
+          writtenBy: 'fixture',
+          extra: {},
+        };
+        const legacyGrant = {
+          ...FAKE_GRANTS[provider],
+          access: `${provider}-access-legacy-decoy-fake`,
+          refresh: `${provider}-refresh-legacy-decoy-fake`,
+          generation: 0,
+          writtenBy: 'fixture',
+          extra: {},
+        };
+
+        h.mig.stage();
+        await h.mig.rehearse(mockRehearse([]));
+        h.mig.commit();
+        const row = h.store.getMigration(`pi-${provider}`)!;
+        const detail = JSON.parse(row.detail_json) as { accounts: Array<Record<string, unknown>> };
+        detail.accounts[0]!.keychain = shared;
+        h.store.upsertMigration(`pi-${provider}`, 'QLB_OWNED', JSON.stringify(detail));
+        h.kc.setSync(shared.service, shared.account, JSON.stringify(sharedGrant));
+        h.kc.setSync(legacy.service, legacy.account, JSON.stringify(legacyGrant));
+        writeFileSync(h.authPath, JSON.stringify({
+          ...FAKE_GRANTS,
+          [provider]: { type: 'oauth', access: 'qlb-managed', refresh: '' },
+        }, null, 2) + '\n');
+
+        const rolled = h.mig.rollback();
+
+        assert.equal(rolled.state, 'NATIVE');
+        const auth = JSON.parse(readFileSync(h.authPath, 'utf8')) as Record<string, typeof sharedGrant>;
+        assert.equal(auth[provider]?.access, sharedGrant.access);
+        assert.equal(auth[provider]?.refresh, sharedGrant.refresh);
+        const decision = (rolled.detail.lastRollback as { decision: RollbackDecision }).decision;
+        assert.equal(decision.kind, 'keychain');
+        assert.equal(decision.fingerprint, createHash('sha256').update(sharedGrant.refresh).digest('hex'));
+      } finally {
+        h.cleanup();
+      }
+    });
+  }
+
   type JournalAccounts = Array<Record<string, unknown>>;
 
   /**

@@ -2130,7 +2130,12 @@ export class Migration {
     return this.finishRollbackJournal();
   }
 
-  private singleGrantJournalAccount(): { provider: string; id: string; label: string } {
+  private singleGrantJournalAccount(): {
+    provider: string;
+    id: string;
+    label: string;
+    keychain: SingleGrantKeychainCoords;
+  } {
     const detail = parseDetail(this.store.getMigration(this.storeName)?.detail_json);
     const journalAccount = Array.isArray(detail.accounts) ? detail.accounts[0] : undefined;
     if (
@@ -2142,7 +2147,10 @@ export class Migration {
     ) {
       throw new Error('single-grant hand-back has no valid journal account coordinates');
     }
-    return { provider: journalAccount.provider, id: journalAccount.id, label: journalAccount.label };
+    const keychain = this.provider === 'xai' || this.provider === 'kimi-coding'
+      ? resolveSingleGrantKeychain(this.provider, journalAccount)
+      : keychainCoords(journalAccount.provider, journalAccount.id, journalAccount.label);
+    return { provider: journalAccount.provider, id: journalAccount.id, label: journalAccount.label, keychain };
   }
 
   private readSingleGrantRollbackKeychain(service: string, account: string): Grant | null {
@@ -2165,7 +2173,7 @@ export class Migration {
    * them, and persist the full decision. Lease re-checks land in later rows.
    */
   private decideAndFenceSingleGrantRollback(
-    journalAccount: { provider: string; id: string; label: string },
+    journalAccount: { provider: string; id: string; label: string; keychain: SingleGrantKeychainCoords },
     authKey: string,
   ): void {
     const existing = parseDetail(this.store.getMigration(this.storeName)?.detail_json).rollbackDecision;
@@ -2181,8 +2189,10 @@ export class Migration {
       const g0 = this.store.getGrantGeneration(journalAccount.id);
       if (g0 === null) throw new Error('single-grant rollback has no account generation');
 
-      const coords = keychainCoords(journalAccount.provider, journalAccount.id, journalAccount.label);
-      const keychainGrant = this.readSingleGrantRollbackKeychain(coords.service, coords.account);
+      const keychainGrant = this.readSingleGrantRollbackKeychain(
+        journalAccount.keychain.service,
+        journalAccount.keychain.account,
+      );
       const k0 = keychainGrant?.generation ?? -1;
 
       const backup = readPiAuthBackup(this.poolFilePath, authKey);
@@ -2257,7 +2267,10 @@ export class Migration {
       try {
         const fenced = this.store.runImmediate(() => {
           if (this.store.getGrantGeneration(journalAccount.id) !== g0) throw new RetryS2();
-          const transactionKeychainGrant = this.readSingleGrantRollbackKeychain(coords.service, coords.account);
+          const transactionKeychainGrant = this.readSingleGrantRollbackKeychain(
+            journalAccount.keychain.service,
+            journalAccount.keychain.account,
+          );
           if (keychainDigest(transactionKeychainGrant) !== decision.kd0) throw new RetryS2();
           // S2 (iii): roll back, then wait outside the transaction for a live
           // lease. Expired leases are ignored, like acquireRefreshLease.
@@ -2356,8 +2369,10 @@ export class Migration {
     let record: PiAuthBackup | null;
     if (decision.kind === 'keychain') {
       const journalAccount = this.singleGrantJournalAccount();
-      const coords = keychainCoords(journalAccount.provider, journalAccount.id, journalAccount.label);
-      const grant = this.readSingleGrantRollbackKeychain(coords.service, coords.account);
+      const grant = this.readSingleGrantRollbackKeychain(
+        journalAccount.keychain.service,
+        journalAccount.keychain.account,
+      );
       if (!grant || keychainDigest(grant) !== decision.kd0) throw tampered();
       record = restoreRecordFor({
         authPath: this.poolFilePath,
