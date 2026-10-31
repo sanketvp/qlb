@@ -389,10 +389,12 @@ export interface AttributeForPhaseDeps {
  * Apply S56 under a switch phase.  In particular, always pass the caller's
  * capability through to attribution: attribution writes Keychain/SQLite.
  *
- * A post/recovery/watch caller that will adopt live bytes onto the target must
+ * A post/recovery/watch caller that may adopt live bytes onto the target must
  * append that fingerprint with markCodexSwitchJournalAdoptingTarget *before*
- * invoking attribution.  This wrapper intentionally has no journal-owner
- * capability, so that ordering remains the responsibility of those callers.
+ * the adopt write, from attribution's `beforeSave` hook, so that an attribution
+ * that adopts nothing onto the target records nothing.  This wrapper
+ * intentionally has no journal-owner capability, so that ordering remains the
+ * responsibility of those callers.
  */
 export async function attributeForPhase(
   deps: AttributeForPhaseDeps,
@@ -1118,7 +1120,9 @@ export async function switchCodex(deps: CodexSwitchDeps, input: SwitchCodexInput
               const classified = classifyPostPublish({ journal, publish, observed, targetSlotFp: targetRow.fingerprint! });
               // Missing verify reads are deliberately retried by recovery rather
               // than being turned into a logged-out fence by this first attempt.
-              if (observed.status === 'missing' || observed.status === 'unstable' || observed.status === 'unreadable') {
+              // A thrown rename is not-landed whatever the verify read shows (§3.1).
+              if (classified !== 'not-landed'
+                && (observed.status === 'missing' || observed.status === 'unstable' || observed.status === 'unreadable')) {
                 assertHeld(); held.assertHeld();
                 releaseCodexSwitchJournalHeld(held, deps.attempt, options); released = true;
                 const pendingResult: CodexSwitchResult = { outcome: 'failed', reason: `verify-${observed.status}`, attemptId: deps.attempt };
@@ -1137,14 +1141,7 @@ export async function switchCodex(deps: CodexSwitchDeps, input: SwitchCodexInput
                 const phaseDeps = observationDeps(deps);
                 if (!currentTarget) throw new Error('Codex target slot disappeared during post-publish verification');
                 const currentTargetDocument = phaseDeps.slots.readSlot(input.target, { fresh: true }).document;
-                // The durable acknowledgement has to precede the target-slot
-                // adoption: a crash after attribution must not reclassify B′ as
-                // an import that replaced the original target.
-                if (liveDocument && liveIdentity === input.target
-                  && codexFingerprint(liveDocument) !== codexFingerprint(currentTargetDocument)) {
-                  assertHeld(); held.assertHeld();
-                  markCodexSwitchJournalAdoptingTarget(held, deps.attempt, codexFingerprint(liveDocument), options);
-                }
+                const currentTargetFp = codexFingerprint(currentTargetDocument);
                 const currentSessions = await phaseDeps.list();
                 const postHistory = deps.dbPath
                   ? readCodexSwitchHistory(deps.dbPath, { journalDir: deps.journalDir })
@@ -1167,6 +1164,19 @@ export async function switchCodex(deps: CodexSwitchDeps, input: SwitchCodexInput
                   },
                   l40Verified: deps.store.getConfig('codex.l40Verified') === '1',
                   now: deps.now,
+                  // The durable acknowledgement has to precede the target-slot
+                  // adoption: a crash after attribution must not reclassify B′ as
+                  // an import that replaced the original target.  It is written
+                  // inside attribution's save, so a verdict that adopts nothing
+                  // onto B (target-ancestor, slot-split) never records it (X17).
+                  beforeSave: (_db, _dbPath, slotId) => {
+                    if (slotId !== input.target || !liveDocument || codexFingerprint(liveDocument) === currentTargetFp) return undefined;
+                    assertHeld(); held.assertHeld();
+                    if (!markCodexSwitchJournalAdoptingTarget(held, deps.attempt, codexFingerprint(liveDocument), options)) {
+                      throw new Error('Codex switch journal changed before the target adoption was recorded');
+                    }
+                    return undefined;
+                  },
                 });
                 if (attribution.action === 'unclaimed') {
                   assertHeld(); held.assertHeld();
@@ -1194,7 +1204,9 @@ export async function switchCodex(deps: CodexSwitchDeps, input: SwitchCodexInput
               }
               if (verdict.class === 'unresolved') {
                 assertHeld(); held.assertHeld();
-                markCodexSwitchJournalUnresolved(held, deps.attempt, verdict.reason, verdict.involvedAccounts, options);
+                if (!markCodexSwitchJournalUnresolved(held, deps.attempt, verdict.reason, verdict.involvedAccounts, options)) {
+                  throw new Error('Codex switch journal changed before the unresolved verdict was recorded');
+                }
                 releaseCodexSwitchJournalHeld(held, deps.attempt, options); released = true;
                 const unresolvedResult: CodexSwitchResult = { outcome: 'failed', reason: verdict.reason,
                   message: codexRecoveryFenceMessage(verdict.reason), attemptId: deps.attempt };
@@ -1219,8 +1231,13 @@ export async function switchCodex(deps: CodexSwitchDeps, input: SwitchCodexInput
                   // I11: a not-landed row is the Q1 marker, so it never carries a publish time.
                   publishedAt: detail === 'not-published' ? null : publishedAt, committedAt: now, detail,
                   outgoing: journal.from, target: input.target,
-                  observation: { identity: accountId, lineageFp: liveDocument ? codexFingerprint(liveDocument)
-                    : effect.outcome === 'ok' ? journal.target.fingerprint : codexFingerprint(outgoing.document) },
+                  // The observation describes the document actually read: a not-landed
+                  // row keeps C6-18's outgoing observation, and a wiped read is null/null
+                  // (as in the pre-switch step), which records the wiped event.
+                  observation: detail === 'not-published'
+                    ? { identity: journal.from, lineageFp: codexFingerprint(outgoing.document) }
+                    : liveDocument ? { identity: liveIdentity, lineageFp: codexFingerprint(liveDocument) }
+                      : { identity: null, lineageFp: null },
                   decision: { leftHeadroom: decision?.leftHeadroom ?? null, leftRecoveryAt: decision?.leftRecoveryAtMs ?? null,
                     leftTrigger: decision?.leftTrigger ?? null } });
               } catch (error) { commitFailed = true; throw error; }
