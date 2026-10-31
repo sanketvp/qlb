@@ -37,6 +37,7 @@ import {
 import {
   createNativeCredentialReader,
   inspectOwnedNativeDrift,
+  parseResyncCredential,
   readOwnedCredentialFromKeychain,
   type ResyncCredential,
 } from './native-resync';
@@ -45,6 +46,7 @@ import { hermesIntegrationChecks } from './hermes-integration';
 import { piIntegrationChecks } from './pi-integration';
 import { piExtensionDriftCheck } from './checks/pi-extension-drift';
 import { piStaleSessionsCheck } from './checks/pi-stale-sessions';
+import { resolveSingleGrantKeychain } from './single-grant-ownership';
 import { piEvidenceGapCheck } from './checks/pi-evidence-gap';
 import { qlbHomeDir } from './home';
 import { piReleaseAppDir } from './pi-deploy';
@@ -709,8 +711,21 @@ export async function doctorQlb(
       accounts,
       migrations,
       readNativeCredential: readNative,
-      readOwnedCredential: async (provider, accountId, label) =>
-        readOwnedCredentialFromKeychain(keychain, provider, accountId, label),
+      readOwnedCredential: async (provider, accountId, label) => {
+        if (provider === 'xai' || provider === 'kimi-coding') {
+          const migration = migrations.find((row) => row.store === `pi-${provider}`);
+          const detail: unknown = JSON.parse(migration?.detail_json ?? '');
+          const account = detail != null
+            && typeof detail === 'object'
+            && !Array.isArray(detail)
+            && Array.isArray((detail as { accounts?: unknown }).accounts)
+            ? (detail as { accounts: unknown[] }).accounts[0]
+            : undefined;
+          const coords = resolveSingleGrantKeychain(provider, account);
+          return parseResyncCredential(keychain.getSync(coords.service, coords.account));
+        }
+        return readOwnedCredentialFromKeychain(keychain, provider, accountId, label);
+      },
     });
     for (const row of drift) {
       checks.push({
