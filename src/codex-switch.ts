@@ -1180,7 +1180,8 @@ export async function reconcileCodexRecoveryLocked(
   if (verdict.class === 'pending') return fenced(`journal-verify-${verdict.status}`, fence.involvedAccounts === '*' ? '*' : new Set(fence.involvedAccounts));
   if (verdict.class === 'unresolved') {
     deps.store.setRecoveryFence({ ...fence, reason: verdict.reason, involvedAccounts: verdict.involvedAccounts, since: fence.since });
-    return fenced(verdict.reason, verdict.involvedAccounts === '*' ? '*' : new Set(verdict.involvedAccounts));
+    // §3.1: the fenced set is unioned and never shrinks until cleared.
+    return fenced(verdict.reason, unionRecoveryAccounts(fence.involvedAccounts, verdict.involvedAccounts));
   }
   const effect = verdict.effect;
   const setActive = effect.outcome === 'reverted-by-codex' ? effect.accountId

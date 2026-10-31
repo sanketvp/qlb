@@ -496,18 +496,42 @@ describe('Codex recovery fence resolution — C6-20', () => {
     return { v: 1 as const, switchId: id, attempt: 'fence-attempt', from: 'from:account', to: 'to:account', publishedAt: 90,
       reason: 'slot-split', involvedAccounts: ['from:account', 'to:account'], since: 101 };
   }
+  function fenceState(store: ReturnType<typeof openStore>) {
+    const db = (store as unknown as { db: DatabaseSync }).db;
+    return {
+      fence: store.getConfig('codex.recoveryFence'),
+      active: { ...(db.prepare("SELECT account_id, set_by, since FROM active_login WHERE provider = 'openai-codex'").get() as object) },
+      watches: (db.prepare('SELECT switch_id FROM codex_watch ORDER BY switch_id').all() as Array<{ switch_id: number }>).map((row) => row.switch_id),
+      rows: (db.prepare(`SELECT ts, from_account, to_account, trigger, outcome, detail, published_at, committed_at, steps_json
+        FROM switch_log ORDER BY id`).all() as object[]).map((row) => ({ ...row })),
+    };
+  }
 
   it('commitFenceResolution writes the effect row with the fence\'s published_at and via fence, deletes the fence and the codex_watch row, in one transaction', () => {
     const store = openFenceStore();
     try {
       const fence = fenceFor(store); store.setRecoveryFence(fence);
-      store.commitFenceResolution({ fence, effect: { outcome: 'reverted-by-codex', accountId: 'from:account' },
-        setActive: 'from:account', attempt: fence.attempt, now: 200 });
       const db = (store as unknown as { db: DatabaseSync }).db;
-      assert.equal(store.getConfig('codex.recoveryFence'), null);
-      assert.equal(Number((db.prepare('SELECT COUNT(*) AS count FROM codex_watch').get() as { count: number }).count), 0);
-      assert.deepEqual({ ...(db.prepare('SELECT outcome, published_at, steps_json FROM switch_log ORDER BY id DESC').get() as object) },
-        { outcome: 'reverted-by-codex', published_at: 90, steps_json: '{"attempt":"fence-attempt","via":"fence"}' });
+      db.prepare("INSERT INTO codex_watch (switch_id, provider, outgoing, target, next_at, until) VALUES (999, 'openai-codex', 'x:account', 'y:account', 1, 2)").run();
+      const before = fenceState(store);
+      assert.deepEqual(before.watches, [fence.switchId, 999]);
+      const resolve = () => store.commitFenceResolution({ fence, effect: { outcome: 'reverted-by-codex', accountId: 'from:account' },
+        setActive: 'from:account', attempt: fence.attempt, now: 200 });
+      // One transaction: a failure in its last statement (the codex_watch delete) undoes every earlier write.
+      db.exec("CREATE TEMP TRIGGER fail_watch_delete BEFORE DELETE ON codex_watch BEGIN SELECT RAISE(ABORT, 'watch'); END");
+      assert.throws(resolve, /watch/);
+      assert.deepEqual(fenceState(store), before);
+      db.exec('DROP TRIGGER fail_watch_delete');
+
+      const id = resolve();
+      const after = fenceState(store);
+      assert.equal(after.fence, null);
+      assert.equal(store.hasConfig('codex.recoveryFence'), false);
+      assert.deepEqual(after.watches, [999]);
+      assert.deepEqual(after.active, { account_id: 'from:account', set_by: 'adopt', since: 200 });
+      assert.deepEqual(after.rows, [...before.rows, { ts: 200, from_account: 'from:account', to_account: 'to:account', trigger: 'manual',
+        outcome: 'reverted-by-codex', detail: null, published_at: 90, committed_at: 200, steps_json: '{"attempt":"fence-attempt","via":"fence"}' }]);
+      assert.equal((db.prepare('SELECT MAX(id) AS id FROM switch_log').get() as { id: number }).id, id);
     } finally { store.close(); }
   });
 
@@ -516,11 +540,13 @@ describe('Codex recovery fence resolution — C6-20', () => {
     try {
       const fence = fenceFor(store); store.setRecoveryFence(fence);
       const db = (store as unknown as { db: DatabaseSync }).db;
+      const before = fenceState(store);
       db.exec("CREATE TEMP TRIGGER fail_fence_delete BEFORE DELETE ON config WHEN OLD.key = 'codex.recoveryFence' BEGIN SELECT RAISE(ABORT, 'fence'); END");
       assert.throws(() => store.commitFenceResolution({ fence, effect: { outcome: 'failed', detail: 'wiped' },
         setActive: null, attempt: fence.attempt, now: 200 }), /fence/);
-      assert.notEqual(store.getConfig('codex.recoveryFence'), null);
-      assert.equal(Number((db.prepare("SELECT COUNT(*) AS count FROM switch_log WHERE steps_json LIKE '%\"via\":\"fence\"%'").get() as { count: number }).count), 0);
+      // The fence, the active login, the watch row and switch_log are exactly as before.
+      assert.deepEqual(fenceState(store), before);
+      assert.deepEqual(JSON.parse(store.getConfig('codex.recoveryFence')!), fence);
     } finally { store.close(); }
   });
 });
