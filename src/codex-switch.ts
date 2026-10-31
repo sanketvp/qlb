@@ -1076,6 +1076,11 @@ export async function reconcileCodexRecoveryLocked(
   });
   const accountSet = (journal: CodexSwitchJournal, involved: string[] | '*' = []): Set<string> | '*' =>
     involved === '*' ? '*' : new Set([journal.from, journal.to, ...involved]);
+  /** Slot B's document, or undefined when `tolerate` and its Keychain item is missing or unreadable. */
+  const readTargetSlot = (accountId: string, tolerate: boolean): CodexAuthDocument | undefined => {
+    try { return slots.readSlot(accountId, { fresh: true }).document; }
+    catch (error) { if (tolerate) return undefined; throw error; }
+  };
 
   const resolveJournal = async (journal: CodexSwitchJournal, held: HeldCodexSwitchJournalOwner): Promise<ReturnType<typeof fenced> | { state: 'clear' }> => {
     assertHeld(); held.assertHeld();
@@ -1086,6 +1091,10 @@ export async function reconcileCodexRecoveryLocked(
     const observed = await deps.readLive();
     const targetRow = deps.store.getCodexSlot(journal.to);
     const classified = classifyPostPublish({ journal, observed, targetSlotFp: targetRow?.fingerprint ?? '' });
+    // §3.1: an unstable or unreadable read is pending, target-changed included; nothing is written.
+    if (classified === 'target-changed' && (observed.status === 'unstable' || observed.status === 'unreadable')) {
+      return fenced(`journal-verify-${observed.status}`, accountSet(journal, journal.unresolved?.involvedAccounts));
+    }
     const live = observed.status === 'ok' ? observed.doc : undefined;
     const liveIdentity = live ? codexIdentity(live) : null;
     const slotHeads = new Map<string, string | null>();
@@ -1098,8 +1107,11 @@ export async function reconcileCodexRecoveryLocked(
       || (classified === 'ok' && targetMoved);
     // With no live document (wiped, missing, unstable, unreadable) or no slot B there is nothing to
     // attribute: the verdict fences, or is pending, without it.
-    if (attribute && live && targetRow) {
-      const target = slots.readSlot(journal.to, { fresh: true }).document;
+    // A target-changed attempt can resolve without attribution (§3.1), so an unreadable slot B
+    // only makes attribution unavailable: B then has no established head.
+    const target = attribute && live && targetRow ? readTargetSlot(journal.to, classified === 'target-changed') : undefined;
+    if (attribute && live && targetRow && !target) slotHeads.set(journal.to, null);
+    if (target && live && targetRow) {
       const targetFp = codexFingerprint(target);
       const history = deps.dbPath ? readCodexSwitchHistory(deps.dbPath, { journalDir: deps.journalDir }) : { rows: [], observations: [] };
       const currentSessions = await list();
@@ -1197,11 +1209,21 @@ export async function reconcileCodexRecoveryLocked(
   if (liveIdentity) slotHeads.set(liveIdentity, deps.store.getCodexSlot(liveIdentity)?.fingerprint ?? null);
   // A fence has no journaled target fingerprint, so a target-changed fence stays target-changed:
   // it resolves only once live equals a current slot head (§3.1, C6-Q2).
-  const classified: CodexPostPublishClassification = fence.reason === 'target-changed' ? 'target-changed'
+  // An unstable or unreadable read stays pending even for a target-changed fence (§3.1).
+  const transient = observed.status === 'unstable' || observed.status === 'unreadable';
+  const classified: CodexPostPublishClassification = fence.reason === 'target-changed' && !transient ? 'target-changed'
     : classifyPostPublish({ journal: pseudoJournal, observed, targetSlotFp: targetRow?.fingerprint ?? '' });
+  const fencedAccounts = unionRecoveryAccounts([fence.from, fence.to], fence.involvedAccounts);
   let attribution: CodexPhaseAttribution | undefined;
-  if (((typeof classified === 'object' && classified.status === 'external') || classified === 'target-changed') && live && targetRow) {
-    const target = slots.readSlot(fence.to, { fresh: true }).document;
+  const attribute = ((typeof classified === 'object' && classified.status === 'external') || classified === 'target-changed') && live && targetRow;
+  // An unreadable slot B makes attribution unavailable: B has no established head, and a fence
+  // that needs attribution to resolve is kept as stored, with no write.
+  const target = attribute ? readTargetSlot(fence.to, true) : undefined;
+  if (attribute && !target) {
+    if (classified !== 'target-changed') return fenced(fence.reason, fencedAccounts);
+    slotHeads.set(fence.to, null);
+  }
+  if (target && live && targetRow) {
     // §3 holder evidence: aliveBefore from the fence's switch row snapshot, aliveAfter from the current list().
     const history = deps.dbPath ? readCodexSwitchHistory(deps.dbPath, { journalDir: deps.journalDir }) : { rows: [], observations: [] };
     const recorded = recordedOpenSessions(history.rows.find((row) => row.id === fence.switchId)?.open_sessions_json);
@@ -1223,15 +1245,16 @@ export async function reconcileCodexRecoveryLocked(
   const verdict = resolveRecoveryVerdict(classified, attribution, { phase: 'recovery', journal: pseudoJournal,
     targetSlotFingerprint: deps.store.getCodexSlot(fence.to)?.fingerprint ?? '', slotHeads, live });
   if (verdict.class === 'pending') {
-    return fenced(`journal-verify-${verdict.status}`, unionRecoveryAccounts([fence.from, fence.to], fence.involvedAccounts));
+    return fenced(`journal-verify-${verdict.status}`, fencedAccounts);
   }
   if (verdict.class === 'unresolved') {
     assertHeld();
-    // A target-changed fence stays target-changed until cleared, so it can never resolve as ok (§3.1).
-    const reason = fence.reason === 'target-changed' ? fence.reason : verdict.reason;
-    deps.store.setRecoveryFence({ ...fence, reason, involvedAccounts: verdict.involvedAccounts, since: fence.since });
-    // §3.1: the fenced set is unioned and never shrinks until cleared.
-    return fenced(verdict.reason, unionRecoveryAccounts([fence.from, fence.to], fence.involvedAccounts, verdict.involvedAccounts));
+    deps.store.setRecoveryFence({ ...fence, reason: verdict.reason, involvedAccounts: verdict.involvedAccounts, since: fence.since });
+    // Report what was stored (the store keeps a target-changed reason and unions the set), so this
+    // call and later codexRecoveryFenceState reads agree.
+    const stored = parseCodexRecoveryFence(deps.store.getConfig('codex.recoveryFence'));
+    return fenced(stored?.reason ?? verdict.reason,
+      unionRecoveryAccounts([fence.from, fence.to], fence.involvedAccounts, verdict.involvedAccounts, stored?.involvedAccounts ?? []));
   }
   const effect = verdict.effect;
   // C6-Q2: a resolved target-changed records the slot whose head the live file equals.

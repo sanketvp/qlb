@@ -2392,8 +2392,9 @@ export class Store {
         ? '*'
         : prior === null ? fence.involvedAccounts
           : [...new Set([...prior.involvedAccounts, ...fence.involvedAccounts])].sort();
-      const next: CodexRecoveryFence = { ...fence, involvedAccounts,
-        since: prior?.since ?? fence.since };
+      // A target-changed fence stays target-changed until cleared, so it can never resolve as ok (§3.1).
+      const next: CodexRecoveryFence = { ...fence, reason: prior?.reason === 'target-changed' ? 'target-changed' : fence.reason,
+        involvedAccounts, since: prior?.since ?? fence.since };
       this.setConfig('codex.recoveryFence', JSON.stringify(next));
     });
   }

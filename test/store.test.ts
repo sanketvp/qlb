@@ -559,4 +559,20 @@ describe('Codex recovery fence resolution — C6-20', () => {
       assert.deepEqual(JSON.parse(store.getConfig('codex.recoveryFence')!), { ...fence, reason: 'target-ancestor', involvedAccounts: '*' });
     } finally { store.close(); }
   });
+
+  it('setRecoveryFence keeps a stored target-changed reason until the fence is cleared (C6-20 r2)', () => {
+    const store = openFenceStore();
+    try {
+      const fence = fenceFor(store);
+      store.setRecoveryFence({ ...fence, reason: 'target-changed' });
+      store.setRecoveryFence({ ...fence, reason: 'slot-split', involvedAccounts: ['from:account', 'to:account', 'c:account'] });
+      assert.deepEqual(JSON.parse(store.getConfig('codex.recoveryFence')!), { ...fence, reason: 'target-changed',
+        involvedAccounts: ['c:account', 'from:account', 'to:account'] });
+      // A non-target-changed reason still follows the latest verdict.
+      store.clearRecoveryFence();
+      store.setRecoveryFence({ ...fence, reason: 'slot-split' });
+      store.setRecoveryFence({ ...fence, reason: 'target-ancestor' });
+      assert.equal(JSON.parse(store.getConfig('codex.recoveryFence')!).reason, 'target-ancestor');
+    } finally { store.close(); }
+  });
 });
