@@ -454,6 +454,79 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     });
   }
 
+  for (const provider of ['xai', 'kimi-coding'] as const) {
+    it(`T-KC6b [${provider}] the hand-back verdict reads, and a recorded delete removes, only the journal's Keychain item`, async () => {
+      const shared = sharedSingleGrantCoords(provider);
+      const legacy = kmCoords(provider);
+      const sharedGrant = {
+        ...FAKE_GRANTS[provider],
+        generation: 0,
+        writtenBy: 'fixture',
+        extra: {},
+      };
+      const legacyGrant = {
+        ...sharedGrant,
+        access: `${provider}-access-legacy-decoy-fake`,
+        refresh: `${provider}-refresh-legacy-decoy-fake`,
+      };
+      const h = setup(provider, new MockKeychain(), {
+        afterStep: (point) => {
+          if (point === 'S5') throw new Error('fixture crash after S5');
+        },
+      });
+      try {
+        h.mig.stage();
+        await h.mig.rehearse(mockRehearse([]));
+        h.mig.commit();
+        const row = h.store.getMigration(`pi-${provider}`)!;
+        const detail = JSON.parse(row.detail_json) as { accounts: Array<Record<string, unknown>> };
+        detail.accounts[0]!.keychain = shared;
+        h.store.upsertMigration(`pi-${provider}`, 'QLB_OWNED', JSON.stringify(detail));
+        h.kc.setSync(shared.service, shared.account, JSON.stringify(sharedGrant));
+        h.kc.setSync(legacy.service, legacy.account, JSON.stringify(legacyGrant));
+
+        assert.throws(() => h.mig.rollback(), /fixture crash after S5/);
+        const handback = JSON.parse(h.store.getMigration(`pi-${provider}`)!.detail_json).handback;
+        assert.equal(handback.keychainDisposition, 'delete', 'S5 reads the shared item, not the legacy decoy');
+
+        h.mig.resume();
+        assert.throws(() => h.kc.getSync(shared.service, shared.account), /item not found/);
+        assert.equal(h.kc.getSync(legacy.service, legacy.account), JSON.stringify(legacyGrant));
+      } finally {
+        h.cleanup();
+      }
+
+      const legacyJournal = setup(provider);
+      try {
+        legacyJournal.kc.setSync(shared.service, shared.account, JSON.stringify(sharedGrant));
+        legacyJournal.kc.setSync(legacy.service, legacy.account, JSON.stringify(legacyGrant));
+        legacyJournal.store.upsertAccount(expectedId(provider), provider, expectedLabel(provider), 'active');
+        legacyJournal.store.upsertMigration(`pi-${provider}`, 'NATIVE', JSON.stringify({
+          accounts: [{
+            id: expectedId(provider),
+            provider,
+            label: expectedLabel(provider),
+            fingerprint: 'fixture-fingerprint',
+          }],
+          handback: {
+            phase: 'cleanup-pending',
+            keychainDisposition: 'delete',
+            piFingerprint: null,
+            decision: null,
+            fencedGeneration: null,
+            rolledBackAt: 123,
+          },
+        }));
+
+        legacyJournal.mig.resume();
+        assert.equal(legacyJournal.kc.getSync(shared.service, shared.account), JSON.stringify(sharedGrant));
+        assert.throws(() => legacyJournal.kc.getSync(legacy.service, legacy.account), /item not found/);
+      } finally {
+        legacyJournal.cleanup();
+      }
+    });
+  }
+
   type JournalAccounts = Array<Record<string, unknown>>;
 
   /**
