@@ -10,6 +10,7 @@ import {
   checkCodexSwitchPreconditions,
   classifyPostPublish,
   resolveRecoveryVerdict,
+  switchCodex,
   codexRecoveryFenceState,
   freshenCodexTarget,
   preflightCodexLive,
@@ -34,7 +35,7 @@ import {
 } from '../src/codex-switch';
 import { ClaudeCodeLockTimeout } from '../src/cc-locks';
 import { codexLockPaths } from '../src/codex-consume';
-import { accessExpiry, codexFingerprint, readCodexAuthStableWithStat, type CodexAuthDocument } from '../src/codex-auth';
+import { accessExpiry, codexFingerprint, codexIdentity, readCodexAuthStableWithStat, type CodexAuthDocument } from '../src/codex-auth';
 import { CodexStashUnverifiable, importActiveCodexSlot } from '../src/codex-slots';
 import { MockKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from '../src/keychain';
 import type { CodexProcess } from '../src/codex-sessions';
@@ -189,6 +190,33 @@ function scalarCount(db: DatabaseSync, sql: string): number {
 function switchRows(db: DatabaseSync): Array<Record<string, unknown>> {
   return (db.prepare(`SELECT provider, from_account, to_account, trigger, outcome, detail, steps_json, published_at
     FROM switch_log ORDER BY id`).all() as Array<Record<string, unknown>>).map((row) => ({ ...row }));
+}
+
+function switchHarness() {
+  const h = fixture();
+  const keychain = new MockKeychain();
+  const authPath = join(h.root, 'auth.json');
+  const now = 1_700_000_000_000;
+  const a = observedDocument('a', 'switch-a');
+  const b = observedDocument('b', 'switch-b');
+  importActiveCodexSlot(a, { store: h.store, keychain, now: () => now - 10 });
+  importActiveCodexSlot(b, { store: h.store, keychain, now: () => now - 5 });
+  h.store.setActiveLogin('openai-codex', 'a:account', 'import', now - 1);
+  writeFileSync(authPath, JSON.stringify(a));
+  const slots = {
+    readSlot: (id: string) => {
+      const doc = JSON.parse(keychain.getSync(qlbKeychainService('openai-codex', id), QLB_KEYCHAIN_ACCOUNT)) as CodexAuthDocument;
+      return { document: doc, fingerprint: codexFingerprint(doc) };
+    },
+    writeSlot: () => undefined,
+    stashUnclaimed: () => 'unused',
+    ensureUnclaimedStash: async () => ({ stashId: 'unused', created: false }),
+  };
+  let tick = now;
+  return { ...h, authPath, a, b, run: () => switchCodex(h.deps({ authPath, dbPath: h.store.dbPath, journalDir: join(h.root, 'journal'),
+    authLockOptions: { home: h.root, timeoutMs: 50, retryMinMs: 1, retryJitterMs: 1 }, keychain, slots: slots as never,
+    list: async () => [], transport: async () => { throw new Error('unexpected transport'); }, readLive: () => readCodexAuthStableWithStat(authPath, { delayMs: 0 }), now: () => tick++,
+    journalOwner: { pid: process.pid, lstart: 'fixture-owner' }, attempt: 'switch-attempt' }), { target: 'b:account', trigger: 'manual' }) };
 }
 
 describe('Codex switch preflight and preconditions', () => {
@@ -1468,5 +1496,18 @@ describe('Codex switch journal v2', () => {
       });
       assert.equal(readCodexSwitchJournal(h.options).state, 'ok');
     } finally { executingCodexAttempts.clear(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+});
+
+describe('switchCodex landed and not-landed — C6-18', () => {
+  it('stable live A publishes B, verifies it and commits ok with published_at = journaled time < committed_at', async () => {
+    const h = switchHarness();
+    try {
+      const result = await h.run();
+      assert.equal(result.outcome, 'ok');
+      const row = h.db.prepare(`SELECT outcome, published_at, committed_at FROM switch_log WHERE provider = 'openai-codex' ORDER BY id DESC`).get() as { outcome: string; published_at: number; committed_at: number };
+      assert.equal(row.outcome, 'ok'); assert.ok(row.published_at < row.committed_at);
+      assert.equal(codexIdentity(JSON.parse(readFileSync(h.authPath, 'utf8'))), 'b:account');
+    } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
   });
 });
