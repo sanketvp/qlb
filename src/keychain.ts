@@ -222,11 +222,14 @@ export async function keychainDelete(
 }
 
 const UNCLAIMED_SERVICE = /^qlb:[^:]+:unclaimed:/;
+const KEPT_SERVICE = /^qlb:[^:]+:kept:/;
 const KEYCHAIN_DUMP_MAX_BUFFER = 64 * 1024 * 1024;
 
 export interface KeychainEnumerationDependencies {
   platform?: NodeJS.Platform;
   exec?: ExecFileSyncFn;
+  /** Tests may provide a names-only in-memory backend. */
+  keychain?: KeychainBackend;
 }
 
 function enumerationError(error: unknown): Error {
@@ -247,17 +250,16 @@ function parsedServiceAttribute(line: string): string | null {
   throw new Error('unable to parse Keychain service attribute');
 }
 
-/**
- * Lists the Keychain-first unclaimed-stash index without reading any secret
- * bytes. macOS `dump-keychain` emits attributes only; in test mode this reads
- * the guarded in-memory backend instead. Any enumeration or parsing failure
- * is deliberately visible to the caller, which must fail its gate closed.
- */
-export function listUnclaimedKeychainServices(dependencies: KeychainEnumerationDependencies = {}): string[] {
-  if (platformKeychain.kind === 'test-memory' && dependencies.platform === undefined && dependencies.exec === undefined) {
-    const services = (platformKeychain as ListingCredentialBackend).listServices;
+/** Lists matching service names only; it never reads Keychain credential bytes. */
+function listKeychainServices(
+  matcher: RegExp,
+  dependencies: KeychainEnumerationDependencies,
+): string[] {
+  const keychain = dependencies.keychain ?? platformKeychain;
+  if (keychain.kind === 'test-memory' && dependencies.platform === undefined && dependencies.exec === undefined) {
+    const services = (keychain as ListingCredentialBackend).listServices;
     if (!services) throw new Error('test Keychain service enumeration is unavailable');
-    return services().filter((service) => UNCLAIMED_SERVICE.test(service));
+    return services().filter((service) => matcher.test(service));
   }
   if ((dependencies.platform ?? process.platform) !== 'darwin') {
     throw new Error('Keychain service enumeration is unavailable on this platform');
@@ -278,9 +280,19 @@ export function listUnclaimedKeychainServices(dependencies: KeychainEnumerationD
   for (const line of output.split(/\r?\n/)) {
     if (!line.includes('"svce"')) continue;
     const service = parsedServiceAttribute(line);
-    if (service != null && UNCLAIMED_SERVICE.test(service)) services.push(service);
+    if (service != null && matcher.test(service)) services.push(service);
   }
   return services;
+}
+
+/** Lists the Keychain-first unclaimed-stash index without reading secret bytes. */
+export function listUnclaimedKeychainServices(dependencies: KeychainEnumerationDependencies = {}): string[] {
+  return listKeychainServices(UNCLAIMED_SERVICE, dependencies);
+}
+
+/** Lists generic hand-back kept-copy names without reading secret bytes. */
+export function listKeptKeychainServices(dependencies: KeychainEnumerationDependencies = {}): string[] {
+  return listKeychainServices(KEPT_SERVICE, dependencies);
 }
 
 /**
@@ -372,6 +384,7 @@ export function readNativeOpenRouterKey(
  * as the real wrapper (`set`/`get`/`delete`), plus sync variants.
  */
 export class MockKeychain implements KeychainBackend {
+  readonly kind = 'test-memory' as const;
   private readonly items = new Map<string, string>();
 
   private key(service: string, account: string): string {
@@ -412,5 +425,9 @@ export class MockKeychain implements KeychainBackend {
 
   async delete(service: string, account: string): Promise<void> {
     this.deleteSync(service, account);
+  }
+
+  listServices(): string[] {
+    return [...new Set([...this.items.keys()].map((key) => key.slice(0, key.indexOf('\0'))))];
   }
 }

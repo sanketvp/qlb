@@ -22,6 +22,7 @@ import {
 import {
   defaultCommandExists,
   defaultKeychainHelperPath,
+  listKeptKeychainServices,
   MACOS_SECURITY_BIN,
   platformKeychain,
   readNativeOpenRouterKey,
@@ -640,7 +641,20 @@ export async function doctorQlb(
     });
   }
 
-  checks.push(probeCredentialStore(options.command));
+  const keychainCheck = probeCredentialStore(options.command);
+  try {
+    const keptCopies = listKeptKeychainServices({ keychain: options.keychain });
+    keychainCheck.message += keptCopies.length === 0
+      ? '; no generic hand-back kept copies found'
+      : `; ${keptCopies.length} generic hand-back kept ${keptCopies.length === 1 ? 'copy' : 'copies'} found`;
+    keychainCheck.detail = { keptCopies };
+  } catch {
+    // The enumerator redacts dump output; doctor likewise reports only the
+    // operational failure, never attributes or credential bytes.
+    keychainCheck.level = 'WARN';
+    keychainCheck.message += '; generic hand-back kept-copy enumeration is unavailable';
+  }
+  checks.push(keychainCheck);
   const hostPlatform = options.hostPlatform ?? process.platform;
   if (hostPlatform === 'darwin') {
     const configValue = options.configReader ?? ((key: string) => recordedConfig.get(key) ?? null);

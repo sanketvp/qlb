@@ -87,10 +87,20 @@ function plantKeptGenericCopy(
     accounts: [{ id: ADAPTER_ACCOUNT_IDS[provider], provider, label: provider, keychain: { service, account } }],
     lastRollback: { keychainDisposition: 'keep', cleanedAt },
   }));
-  return { service, account, stashService: `qlb:${provider}:unclaimed:${new Date(cleanedAt).toISOString()}`, kept };
+  return { service, account, stashService: `qlb:${provider}:kept:${new Date(cleanedAt).toISOString()}`, kept };
 }
 
 describe('Pi migration S58 credential-first barrier', () => {
+  it('pi migrate sets a kept copy aside at qlb:<p>:kept:<ISO>', () => {
+    const h = setup('xai');
+    try {
+      const kept = plantKeptGenericCopy(h, 'xai');
+      assert.equal(migratePiSingleProvider('xai', h.paths, { keychain: h.keychain, store: h.store }).state, 'migrated');
+      assert.equal(kept.stashService, 'qlb:xai:kept:2026-10-30T12:00:00.000Z');
+      assert.equal(h.keychain.getSync(kept.stashService, QLB_KEYCHAIN_ACCOUNT), kept.kept);
+    } finally { h.cleanup(); }
+  });
+
   it('never leaves a placeholder without a managed item after a crash', () => {
     const h = setup();
     try {

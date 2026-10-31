@@ -8,7 +8,7 @@ import { describe, it } from 'node:test';
 import { defaultConfig } from '../src/config';
 import { createCommandRunner, doctorQlb, inspectProviders, registeredDoctorChecks } from '../src/diagnostics';
 import { discoverChecks } from '../src/registry';
-import { MACOS_SECURITY_TIMEOUT_MS } from '../src/keychain';
+import { MACOS_SECURITY_TIMEOUT_MS, MockKeychain } from '../src/keychain';
 import { validatedAdvisoryMessage } from '../src/migration-health';
 import { openStore } from '../src/store';
 
@@ -27,6 +27,40 @@ async function doctorReport(
 }
 
 describe('qlb doctor', () => {
+  it('qlb doctor lists kept copies without reading their bytes', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-kept-copies-'));
+    const service = 'qlb:xai:kept:2026-10-30T12:00:00.000Z';
+    class KeptListingKeychain extends MockKeychain {
+      override getSync(candidate: string, account: string): string {
+        if (candidate.includes(':kept:')) throw new Error('kept copy bytes must not be read');
+        return super.getSync(candidate, account);
+      }
+
+      listServices(): string[] { return [service]; }
+    }
+    const report = await doctorQlb(defaultConfig(home), {
+      command: () => 'ok', hostCommand: () => '', keychain: new KeptListingKeychain(),
+    });
+    const keychain = report.checks.find((check) => check.name === 'keychain');
+    assert.equal(keychain?.level, 'PASS');
+    assert.deepEqual(keychain?.detail, { keptCopies: [service] });
+  });
+
+  it('WARNs when kept-copy enumeration is unavailable without leaking dump output', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-kept-copies-unavailable-'));
+    const dumpFragment = 'fixture-dump-content-must-not-leak';
+    class UnavailableListingKeychain extends MockKeychain {
+      listServices(): string[] { throw new Error(dumpFragment); }
+    }
+    const report = await doctorQlb(defaultConfig(home), {
+      command: () => 'ok', hostCommand: () => '', keychain: new UnavailableListingKeychain(),
+    });
+    const keychain = report.checks.find((check) => check.name === 'keychain');
+    assert.equal(keychain?.level, 'WARN');
+    assert.match(keychain?.message ?? '', /kept-copy enumeration is unavailable/);
+    assert.doesNotMatch(keychain?.message ?? '', new RegExp(dumpFragment));
+  });
+
   it('passes SQLite integrity and WARNs for an in-flight MIRRORED migration', async () => {
     const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-test-'));
     const report = await doctorReport(home, (store) => {

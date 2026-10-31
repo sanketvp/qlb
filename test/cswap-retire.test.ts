@@ -837,6 +837,19 @@ describe('qlb retire cswap (AC22 retire)', () => {
     assert.equal(services.includes('qlb:anthropic:slot-a'), false);
   });
 
+  it('a kept copy does not trip the retire unadopted-stash gate', async () => {
+    const f = fixture();
+    try {
+      const ctx = { stdout: () => {}, stderr: () => {}, env: { QLB_HOME: f.root, QLB_TEST_MODE: '1' }, home: f.root,
+        config: { ...defaultConfig(f.root), dbPath: f.store.dbPath }, loadConfig: () => defaultConfig(f.root), registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [] };
+      const kept = 'qlb:xai:kept:2026-10-30T12:00:00.000Z';
+      const listed = listUnclaimedKeychainServices({ platform: 'darwin', exec: () => `    "svce"<blob>="${kept}"` });
+      assert.deepEqual(listed, [], 'kept copies are not unclaimed successors');
+      const deps = productionDependencies(f.store, ctx, undefined, () => listed);
+      assert.equal(deps.hasUnadoptedStash(), false);
+    } finally { f.cleanup(); }
+  });
+
   it('hasUnadoptedStash fails closed when enumeration throws', async () => {
     const f = fixture();
     try {
