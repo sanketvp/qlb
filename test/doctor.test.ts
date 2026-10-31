@@ -8,7 +8,8 @@ import { describe, it } from 'node:test';
 import { defaultConfig } from '../src/config';
 import { createCommandRunner, doctorQlb, inspectProviders, registeredDoctorChecks } from '../src/diagnostics';
 import { discoverChecks } from '../src/registry';
-import { MACOS_SECURITY_TIMEOUT_MS, MockKeychain } from '../src/keychain';
+import { MACOS_SECURITY_TIMEOUT_MS, MockKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, type KeychainBackend } from '../src/keychain';
+import { recordStash } from '../src/unclaimed-index';
 import { validatedAdvisoryMessage } from '../src/migration-health';
 import { openStore } from '../src/store';
 
@@ -27,6 +28,41 @@ async function doctorReport(
 }
 
 describe('qlb doctor', () => {
+  it('WARNs for each Linux libsecret stash reservation whose body is operationally unreadable', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-libsecret-stash-'));
+    const stashRoot = join(process.env.QLB_HOME!, '.qlb', 'unclaimed');
+    const unreadableId = 'linux-operational';
+    const readableId = 'body-readable';
+    const credentialText = 'fixture-credential-must-not-appear';
+    class LinuxLibsecretFake extends MockKeychain {
+      override getSync(service: string, account: string): string {
+        if (service === qlbKeychainService('xai', `unclaimed:${unreadableId}`)) {
+          throw new Error('secret-tool exit 1');
+        }
+        return super.getSync(service, account);
+      }
+    }
+    const keychain = Object.assign(new LinuxLibsecretFake(), { kind: 'linux-libsecret' }) as unknown as KeychainBackend;
+    await recordStash(stashRoot, {
+      provider: 'xai', accountId: 'default', stashId: unreadableId, consumedFp: 'sha256:lineage', location: 'keychain', createdAt: 1,
+    });
+    await recordStash(stashRoot, {
+      provider: 'xai', accountId: 'default', stashId: readableId, consumedFp: 'sha256:lineage', location: 'keychain', createdAt: 2,
+    });
+    keychain.setSync(qlbKeychainService('xai', `unclaimed:${readableId}`), QLB_KEYCHAIN_ACCOUNT, credentialText);
+
+    const report = await doctorQlb(defaultConfig(home), {
+      command: () => 'ok', hostCommand: () => '', hostPlatform: 'linux', keychain,
+    });
+    const warning = report.checks.find((check) => check.name.includes(unreadableId));
+    assert.equal(warning?.level, 'WARN');
+    assert.match(warning?.message ?? '', /xai/);
+    assert.match(warning?.message ?? '', new RegExp(unreadableId));
+    assert.match(warning?.message ?? '', /unlock your login keyring \(GNOME Keyring \/ KWallet\), then run qlb doctor again/);
+    assert.equal(report.checks.some((check) => check.name.includes(readableId)), false);
+    assert.doesNotMatch(JSON.stringify(report), new RegExp(credentialText));
+  });
+
   it('qlb doctor lists kept copies without reading their bytes', async () => {
     const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-kept-copies-'));
     const service = 'qlb:xai:kept:2026-10-30T12:00:00.000Z';
