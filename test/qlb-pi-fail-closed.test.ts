@@ -17,7 +17,11 @@ type Provider = (typeof PROVIDERS)[number];
 const CAUSES = [
   // Missing command is the spawn ENOENT path, not a synthetic gate response.
   { name: 'missing binary', cause: 'missing-binary', code: 1, stderr: undefined },
-  // runPiGate() writes these direct gate failures to stderr (src/pi-gate.ts).
+  // Gate failures written to stderr. store-open-failed, owner-file-malformed,
+  // identity-mismatch and refresh-failed come from src/pi-gate.ts and
+  // src/gate/anthropic.ts; auth-json-unstable and
+  // codex-token-expired-renewer-idle are AC13 causes the Pi allowlist accepts
+  // (extensions/qlb-pi/active-access.ts) but no src/ path emits yet (D-P8-3).
   { name: 'unreadable DB', cause: 'store-open-failed', code: 1, stderr: 'store-open-failed' },
   { name: 'malformed owner file', cause: 'owner-file-malformed', code: 1, stderr: 'owner-file-malformed' },
   { name: 'identity mismatch', cause: 'identity-mismatch', code: 3, stderr: 'identity-mismatch' },
