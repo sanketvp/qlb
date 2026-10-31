@@ -828,6 +828,40 @@ describe('single-account consume gate', () => {
     });
   }
 
+  it('single-consume refuses a generic journal with more than one account', async () => {
+    for (const provider of ['xai', 'kimi-coding'] as const) {
+      const home = await mkdtemp(join(tmpdir(), 'qlb-single-consume-'));
+      const keychain = new MockKeychain();
+      const store = new Store(':memory:');
+      const accountId = ADAPTER_ACCOUNT_IDS[provider];
+      const shared = sharedSingleGrantCoords(provider);
+      const account = { id: accountId, provider, label: provider, keychain: shared };
+      keychain.setSync(shared.service, shared.account, JSON.stringify(credential('before', 'refresh-before')));
+      const setSync = keychain.setSync.bind(keychain);
+      const deleteSync = keychain.deleteSync.bind(keychain);
+      const writes: string[] = [];
+      const deletes: string[] = [];
+      keychain.setSync = (service, name, value) => {
+        writes.push(`${service}/${name}`);
+        return setSync(service, name, value);
+      };
+      keychain.deleteSync = (service, name) => {
+        deletes.push(`${service}/${name}`);
+        return deleteSync(service, name);
+      };
+      store.upsertAccount(accountId, provider, provider);
+      store.upsertMigration(`pi-${provider}`, 'QLB_OWNED', JSON.stringify({ accounts: [account, { ...account }] }));
+      try {
+        await assert.rejects(consumeSingleCredential(provider, credential('before', 'refresh-before'), {
+          keychain, home, store, lock: createInMemorySingleConsumeLock(), now: () => NOW,
+          refresh: async () => assert.fail('invalid ownership refuses before the POST'),
+        }), /generic-ownership-unreadable/);
+        assert.deepEqual(writes, []);
+        assert.deepEqual(deletes, []);
+      } finally { store.close(); await rm(home, { recursive: true, force: true }); }
+    }
+  });
+
   it('passes the consumed lineage to a callback after adopting a stashed successor', async () => {
     const home = await mkdtemp(join(tmpdir(), 'qlb-single-consume-'));
     const primary = qlbKeychainService('xai', 'default');

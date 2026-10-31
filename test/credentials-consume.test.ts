@@ -78,6 +78,40 @@ describe('credentials consume gating', () => {
     }
   });
 
+  it('proxy owned read refuses a generic journal with more than one account', async () => {
+    for (const [provider, accountId] of [
+      ['xai', 'xai-default'],
+      ['kimi-coding', 'kimi-default'],
+    ] as const) {
+      const store = openStore(':memory:');
+      const keychain = new MockKeychain();
+      const shared = sharedSingleGrantCoords(provider);
+      const account = { id: accountId, provider, label: `${provider}-fixture`, keychain: shared };
+      keychain.setSync(shared.service, shared.account, JSON.stringify({
+        access: `${provider}-fixture`, refresh: 'fixture-refresh', expires: 1,
+      }));
+      const setSync = keychain.setSync.bind(keychain);
+      const deleteSync = keychain.deleteSync.bind(keychain);
+      const writes: string[] = [];
+      const deletes: string[] = [];
+      keychain.setSync = (service, name, value) => {
+        writes.push(`${service}/${name}`);
+        return setSync(service, name, value);
+      };
+      keychain.deleteSync = (service, name) => {
+        deletes.push(`${service}/${name}`);
+        return deleteSync(service, name);
+      };
+      store.upsertAccount(accountId, provider, account.label);
+      store.upsertMigration(`pi-${provider}`, 'QLB_OWNED', JSON.stringify({ accounts: [account, { ...account }] }));
+
+      await assert.rejects(() => createOwnedCredentialSource({ store, keychain })(accountId), /journal-keychain-invalid/);
+      assert.deepEqual(writes, []);
+      assert.deepEqual(deletes, []);
+      store.close();
+    }
+  });
+
   it('the proxy refuses a malformed or mismatched generic journal without reading the Keychain', async () => {
     for (const detailJson of [
       '{not-json',

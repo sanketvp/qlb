@@ -53,6 +53,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value != null && typeof value === 'object' && !Array.isArray(value);
 }
 
+/** Returns a journal account only when it is the journal's sole account. */
+export function singleJournalAccount(accounts: unknown): unknown | undefined {
+  return Array.isArray(accounts) && accounts.length === 1 ? accounts[0] : undefined;
+}
+
 /** Returns the shared Keychain coordinates for a single-grant provider. */
 export function sharedSingleGrantCoords(provider: SingleGrantKeychainProvider): SingleGrantKeychainCoords {
   return { service: `qlb:${provider}:default`, account: 'qlb' };

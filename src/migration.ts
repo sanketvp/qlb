@@ -131,6 +131,7 @@ import { canonicalDigest, fencedGeneration, handbackVerdict, isValidEntry, keych
 import {
   JournalKeychainInvalidError,
   resolveSingleGrantKeychain,
+  singleJournalAccount,
   type RollbackDecision,
   type SingleGrantKeychainCoords,
   type SingleGrantKeychainProvider,
@@ -1883,7 +1884,7 @@ export class Migration {
     // from the current migration configuration.
     if (this.kind === 'single-grant' && handback.keychainDisposition === 'delete') {
       const detail = parseDetail(this.store.getMigration(this.storeName)?.detail_json);
-      const journalAccount = Array.isArray(detail.accounts) ? detail.accounts[0] : undefined;
+      const journalAccount = singleJournalAccount(detail.accounts);
       if (
         !isObjectRecord(journalAccount)
         || typeof journalAccount.provider !== 'string'
@@ -2139,7 +2140,7 @@ export class Migration {
     keychain: SingleGrantKeychainCoords;
   } {
     const detail = parseDetail(this.store.getMigration(this.storeName)?.detail_json);
-    const journalAccount = Array.isArray(detail.accounts) ? detail.accounts[0] : undefined;
+    const journalAccount = singleJournalAccount(detail.accounts);
     if (
       !isObjectRecord(journalAccount)
       || typeof journalAccount.provider !== 'string'

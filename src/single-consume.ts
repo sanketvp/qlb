@@ -16,7 +16,7 @@ import {
   parseGrant,
   waitForRefreshLease,
 } from './refresh-lease';
-import { sharedSingleGrantCoords, resolveSingleGrantKeychain } from './single-grant-ownership';
+import { sharedSingleGrantCoords, resolveSingleGrantKeychain, singleJournalAccount } from './single-grant-ownership';
 import { refreshLeaseName, type Store } from './store';
 import { refreshKimiCodingCredential } from './oauth/kimi-coding-refresh';
 import {
@@ -225,7 +225,7 @@ function sharedItemOwner(provider: SingleConsumeProvider, deps: Pick<SingleConsu
   try { detail = JSON.parse(row.detail_json); } catch { throw new SingleConsumeFailure('generic-ownership-unreadable'); }
   if (!detail || typeof detail !== 'object' || Array.isArray(detail)) throw new SingleConsumeFailure('generic-ownership-unreadable');
   const accounts = (detail as { accounts?: unknown }).accounts;
-  const account = Array.isArray(accounts) ? accounts[0] : undefined;
+  const account = singleJournalAccount(accounts);
   let coords;
   try { coords = resolveSingleGrantKeychain(provider, account); } catch { throw new SingleConsumeFailure('generic-ownership-unreadable'); }
   const shared = sharedSingleGrantCoords(provider);
