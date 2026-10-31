@@ -22,6 +22,8 @@ const PI_PROVIDERS = ['anthropic', 'openai-codex', 'xai', 'kimi-coding', 'openro
 export const CUTOVER_BEGIN_IN_PROGRESS = 'cutover-begin-in-progress';
 /** Set only after retire-cswap has durably recorded its journal. */
 export const RETIREMENT_IN_PROGRESS = 'retirement-in-progress';
+/** Operator guidance when lifecycle close meets the retirement fence (user decision X4a-r). */
+export const FINISH_RETIREMENT_FIRST = 'finish the retirement first: run qlb retire cswap again';
 export const PI_STALE_SESSION_COUNT_KEY = 'pi.staleSessionCount';
 export const PI_STALE_SESSIONS_KEY = 'pi.staleSessions';
 export const PI_STALE_SESSION_COUNT_CLEAR = '0';
@@ -484,11 +486,11 @@ export function closeLifecycle(store: Store, id: number, note: string, now: numb
   // Closing would overwrite the fence and strand the retirement's journal (user decision X4a-r).
   if (current.note === RETIREMENT_IN_PROGRESS) return { ok: false, code: RETIREMENT_IN_PROGRESS, row: current };
   const changed = withDb(store, (db) => db.prepare(
-    "UPDATE lifecycle SET state = 'closed', closed_at = ?, note = ? WHERE id = ? AND note IS NOT ?",
+    "UPDATE lifecycle SET state = 'closed', closed_at = ?, note = ? WHERE id = ? AND state IN ('rolled-back', 'aborted', 'retired') AND note IS NOT ?",
   ).run(now, note, id, RETIREMENT_IN_PROGRESS).changes);
-  return changed === 1
-    ? { ok: true, row: phase(store) }
-    : { ok: false, code: RETIREMENT_IN_PROGRESS, row: phase(store) };
+  if (changed === 1) return { ok: true, row: phase(store) };
+  const after = phase(store);
+  return { ok: false, code: after.note === RETIREMENT_IN_PROGRESS ? RETIREMENT_IN_PROGRESS : `phase=${after.state}`, row: after };
 }
 
 export function lifecycleCheck(store: Pick<Store, 'dbPath'>, kind: 'window' | 'drill', now: number = Date.now()): { level: 'PASS' | 'WARN' | 'FAIL'; message: string } {

@@ -169,13 +169,18 @@ describe('lifecycle (AC49)', () => {
       const before = phase(store);
       assert.equal(assertAdmitted(store, 'lifecycle-close').code, RETIREMENT_IN_PROGRESS);
       assert.equal(closeLifecycle(store, before.id, 'fixture', 40).code, RETIREMENT_IN_PROGRESS);
-      const output: string[] = [];
-      const code = await lifecycleCommand.execute!(['close', String(before.id), '--note', 'fixture'], {
-        stdout: (line: string) => output.push(line), stderr: (line: string) => output.push(line),
-        config: { dbPath: store.dbPath },
-      } as unknown as CommandContext);
-      assert.equal(code, 3);
-      assert.match(output.join('\n'), /run qlb retire cswap again/);
+      // Through the real dispatch path, whose admission gate runs before the command.
+      const home = mkdtempSync(join(tmpdir(), 'qlb-lifecycle-close-'));
+      const config = { ...defaultConfig(home), dbPath: store.dbPath };
+      for (const args of [['close', String(before.id), '--note', 'fixture'], ['close', String(before.id), '--note', 'fixture', '--json']]) {
+        const output: string[] = [];
+        const code = await runExecutingCommand({ command: lifecycleCommand, args }, {
+          config, env: {}, home, stdout: (line: string) => output.push(line), stderr: (line: string) => output.push(line),
+          loadConfig: () => config, registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
+        } as unknown as CommandContext);
+        assert.equal(code, 3, args.join(' '));
+        assert.match(output.join('\n'), /run qlb retire cswap again/, args.join(' '));
+      }
       assert.deepEqual(phase(store), before);
     } finally { store.close(); }
   });
