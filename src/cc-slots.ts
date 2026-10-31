@@ -839,6 +839,7 @@ export class ClaudeSlots {
       const fingerprint = this.fingerprint(input.credential);
       const existing = this.options.repository.getSlot(input.accountId);
       if (existing) throw new Error('Claude slot already exists');
+      this.assertLineageAvailable(input.accountId, fingerprint);
       const previous = await this.readExistingCredential(input.accountId);
       if (previous != null) throw new Error('Claude slot credential already exists');
       const slot: ClaudeSlot = {
@@ -944,6 +945,7 @@ export class ClaudeSlots {
         throw new Error(input.replace ? 'Claude replace slot not found' : 'Claude slot already exists');
       }
       const fingerprint = this.fingerprint(input.credential);
+      this.assertLineageAvailable(input.accountId, fingerprint);
       const oldCurrent = await this.readExistingCredential(input.accountId);
       // Add must preserve createSlot's crash-window orphan guard, including
       // when an archived row is being reactivated.
@@ -1437,6 +1439,13 @@ export class ClaudeSlots {
       release();
       if (this.slotWrites.get(accountId) === queued) this.slotWrites.delete(accountId);
     }
+  }
+
+  private assertLineageAvailable(accountId: string, fingerprint: string): void {
+    const existing = this.options.repository.listSlots().find((slot) =>
+      slot.accountId !== accountId && slot.archivedAt == null && slot.fingerprint === fingerprint,
+    );
+    if (existing) throw new Error(`Claude credential already belongs to slot ${existing.accountId}`);
   }
 
   private fingerprint(credential: string): string {
