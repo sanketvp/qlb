@@ -2386,10 +2386,11 @@ export class Store {
     this.runImmediate(() => {
       const raw = this.getConfig('codex.recoveryFence');
       const prior = parseCodexRecoveryFence(raw);
-      const involvedAccounts = this.hasConfig('codex.recoveryFence') && prior === null
+      // '*' on either side stays '*': a narrower re-check never releases an account.
+      const involvedAccounts = (this.hasConfig('codex.recoveryFence') && prior === null)
+        || prior?.involvedAccounts === '*' || fence.involvedAccounts === '*'
         ? '*'
-        : prior === null || prior.involvedAccounts === '*' || fence.involvedAccounts === '*'
-          ? fence.involvedAccounts
+        : prior === null ? fence.involvedAccounts
           : [...new Set([...prior.involvedAccounts, ...fence.involvedAccounts])].sort();
       const next: CodexRecoveryFence = { ...fence, involvedAccounts,
         since: prior?.since ?? fence.since };

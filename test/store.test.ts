@@ -549,4 +549,14 @@ describe('Codex recovery fence resolution — C6-20', () => {
       assert.deepEqual(JSON.parse(store.getConfig('codex.recoveryFence')!), fence);
     } finally { store.close(); }
   });
+
+  it('setRecoveryFence never narrows a stored \'*\' fence to an account list (C6-20 r1)', () => {
+    const store = openFenceStore();
+    try {
+      const fence = fenceFor(store);
+      store.setRecoveryFence({ ...fence, reason: 'logged-out', involvedAccounts: '*' });
+      store.setRecoveryFence({ ...fence, reason: 'target-ancestor', involvedAccounts: ['from:account', 'to:account'] });
+      assert.deepEqual(JSON.parse(store.getConfig('codex.recoveryFence')!), { ...fence, reason: 'target-ancestor', involvedAccounts: '*' });
+    } finally { store.close(); }
+  });
 });
