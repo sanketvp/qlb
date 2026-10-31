@@ -29,6 +29,7 @@ import {
   type ResyncResult,
 } from '../src/native-resync';
 import { setPolicy } from '../src/policy';
+import { sharedSingleGrantCoords } from '../src/single-grant-ownership';
 import { LoopbackProxy } from '../src/proxy';
 import { parseGrant } from '../src/refresh-lease';
 import { openStore } from '../src/store';
@@ -51,6 +52,21 @@ function grant(access: string, refresh = 'refresh-1'): Grant {
 
 function apiKey(access: string): ApiKeyPayload {
   return { type: 'api-key', access };
+}
+
+function singleGrantJournal(
+  provider: 'xai' | 'kimi-coding',
+  keychain?: unknown,
+  fields: Record<string, unknown> = {},
+): string {
+  const account: Record<string, unknown> = {
+    id: ADAPTER_ACCOUNT_IDS[provider],
+    provider,
+    label: ADAPTER_ACCOUNT_LABELS[provider],
+    fingerprint: 'fixture',
+  };
+  if (keychain !== undefined) account.keychain = keychain;
+  return JSON.stringify({ ...fields, accounts: [account] });
 }
 
 describe('detectAndResyncFromNative', () => {
@@ -472,7 +488,7 @@ describe('bindDetectAndResync + MockKeychain', () => {
     const id = ADAPTER_ACCOUNT_IDS.xai;
     const label = ADAPTER_ACCOUNT_LABELS.xai;
     store.upsertAccount(id, 'xai', label);
-    store.upsertMigration('pi-xai', 'QLB_OWNED');
+    store.upsertMigration('pi-xai', 'QLB_OWNED', singleGrantJournal('xai'));
     kc.setSync(qlbKeychainService('xai', id), label, JSON.stringify(grant('old')));
     const fn = bindDetectAndResync({
       store,
@@ -502,7 +518,7 @@ describe('bindDetectAndResync + MockKeychain', () => {
       const service = qlbKeychainService('xai', id);
       store.upsertAccount(id, 'xai', label);
       assert.equal(store.casGrantGeneration(id, 0, 7), 1);
-      store.upsertMigration('pi-xai', 'QLB_OWNED');
+      store.upsertMigration('pi-xai', 'QLB_OWNED', singleGrantJournal('xai'));
       if (c.owned !== undefined) kc.setSync(service, label, JSON.stringify({ ...grant('old'), generation: c.owned }));
       if (c.unreadable) {
         const getSync = kc.getSync.bind(kc);
@@ -551,7 +567,7 @@ describe('bindDetectAndResync + MockKeychain', () => {
         name: 'marker added after the outer read fences the write',
         ownedGeneration: 7,
         mutate: (store: ReturnType<typeof openStore>, _id: string) => {
-          store.upsertMigration('pi-xai', 'QLB_OWNED', '{"intent":"rollback"}');
+          store.upsertMigration('pi-xai', 'QLB_OWNED', singleGrantJournal('xai', undefined, { intent: 'rollback' }));
         },
         resynced: false,
         persistedAccess: 'old',
@@ -585,7 +601,7 @@ describe('bindDetectAndResync + MockKeychain', () => {
       const label = ADAPTER_ACCOUNT_LABELS.xai;
       store.upsertAccount(id, 'xai', label);
       assert.equal(store.casGrantGeneration(id, 0, 7), 1);
-      store.upsertMigration('pi-xai', 'QLB_OWNED');
+      store.upsertMigration('pi-xai', 'QLB_OWNED', singleGrantJournal('xai'));
       kc.setSync(
         qlbKeychainService('xai', id),
         label,
@@ -619,7 +635,7 @@ describe('bindDetectAndResync + MockKeychain', () => {
     const kc = new MockKeychain();
     const id = ADAPTER_ACCOUNT_IDS.xai;
     kc.setSync(qlbKeychainService('xai', id), id, JSON.stringify(grant('old')));
-    store.upsertMigration('pi-xai', 'QLB_OWNED');
+    store.upsertMigration('pi-xai', 'QLB_OWNED', singleGrantJournal('xai'));
 
     const result = await bindDetectAndResync({
       store,
@@ -746,11 +762,12 @@ describe('bindDetectAndResync + MockKeychain', () => {
 
   it('T-W2 native-resync refuses while a hand-back marker is set or the journal is not QLB_OWNED', async () => {
     const cases = [
-      { name: 'MIRRORED row with an existing copy', state: 'MIRRORED', detail: '{}', owned: true },
-      { name: 'rollback intent', state: 'QLB_OWNED', detail: '{"intent":"rollback"}', owned: true },
-      { name: 'rollback decision', state: 'QLB_OWNED', detail: '{"rollbackDecision":{}}', owned: true },
-      { name: 'hand-back marker', state: 'QLB_OWNED', detail: '{"handback":{}}', owned: true },
-      { name: 'MIRRORED row with a missing copy', state: 'MIRRORED', detail: '{}', owned: false },
+      { name: 'MIRRORED row with an existing copy', state: 'MIRRORED', detail: singleGrantJournal('xai'), owned: true },
+      { name: 'rollback intent', state: 'QLB_OWNED', detail: singleGrantJournal('xai', undefined, { intent: 'rollback' }), owned: true },
+      { name: 'rollback decision', state: 'QLB_OWNED', detail: singleGrantJournal('xai', undefined, { rollbackDecision: {} }), owned: true },
+      { name: 'hand-back marker', state: 'QLB_OWNED', detail: singleGrantJournal('xai', undefined, { handback: {} }), owned: true },
+      { name: 'shared-item rollback intent', state: 'QLB_OWNED', detail: singleGrantJournal('xai', sharedSingleGrantCoords('xai'), { intent: 'rollback' }), owned: true },
+      { name: 'MIRRORED row with a missing copy', state: 'MIRRORED', detail: singleGrantJournal('xai'), owned: false },
     ];
 
     for (const fixture of cases) {
@@ -793,7 +810,7 @@ describe('bindDetectAndResync + MockKeychain', () => {
     const id = ADAPTER_ACCOUNT_IDS.xai;
     const label = ADAPTER_ACCOUNT_LABELS.xai;
     store.upsertAccount(id, 'xai', label);
-    store.upsertMigration('pi-xai', 'QLB_OWNED');
+    store.upsertMigration('pi-xai', 'QLB_OWNED', singleGrantJournal('xai'));
     const result = await bindDetectAndResync({
       store,
       keychain: kc,
@@ -806,6 +823,94 @@ describe('bindDetectAndResync + MockKeychain', () => {
       'new',
       'a missing copy may be created only for a marker-free QLB_OWNED row',
     );
+    store.close();
+  });
+
+  it('T-KC8 native-resync reads and writes the Keychain item the generic journal records', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-resync-journal-shared-'));
+    temps.push(dir);
+    const store = openStore(join(dir, 'qlb.db'));
+    const kc = new MockKeychain();
+    const id = ADAPTER_ACCOUNT_IDS.xai;
+    const label = ADAPTER_ACCOUNT_LABELS.xai;
+    const shared = sharedSingleGrantCoords('xai');
+    const legacyService = qlbKeychainService('xai', id);
+    const legacyBefore = JSON.stringify({ ...grant('legacy'), generation: 7 });
+    store.upsertAccount(id, 'xai', label);
+    assert.equal(store.casGrantGeneration(id, 0, 7), 1);
+    store.upsertMigration('pi-xai', 'QLB_OWNED', singleGrantJournal('xai', shared));
+    kc.setSync(legacyService, label, legacyBefore);
+    kc.setSync(shared.service, shared.account, JSON.stringify({ ...grant('shared'), generation: 7 }));
+
+    const result = await bindDetectAndResync({
+      store,
+      keychain: kc,
+      readNativeCredential: async () => grant('native'),
+    })(id, 'xai');
+
+    assert.equal(result.resynced, true, result.reason);
+    assert.equal(kc.getSync(legacyService, label), legacyBefore);
+    const written = parseGrant(kc.getSync(shared.service, shared.account));
+    assert.equal(written.access, 'native');
+    assert.equal(written.generation, 8);
+    assert.equal(written.writtenBy, 'native-resync');
+    assert.equal(store.getGrantGeneration(id), 8);
+    store.close();
+
+    const raceDir = mkdtempSync(join(tmpdir(), 'qlb-resync-journal-shared-race-'));
+    temps.push(raceDir);
+    const raceStore = openStore(join(raceDir, 'qlb.db'));
+    const raceKc = new MockKeychain();
+    raceStore.upsertAccount(id, 'xai', label);
+    assert.equal(raceStore.casGrantGeneration(id, 0, 7), 1);
+    raceStore.upsertMigration('pi-xai', 'QLB_OWNED', singleGrantJournal('xai', shared));
+    const raceSharedBefore = JSON.stringify({ ...grant('shared'), generation: 7 });
+    const raceLegacyBefore = JSON.stringify({ ...grant('legacy'), generation: 7 });
+    raceKc.setSync(shared.service, shared.account, raceSharedBefore);
+    raceKc.setSync(legacyService, label, raceLegacyBefore);
+    const runImmediate = raceStore.runImmediate.bind(raceStore);
+    raceStore.runImmediate = function <T>(fn: () => T): T {
+      assert.equal(raceStore.bumpGrantGeneration(id, 7), 1);
+      return runImmediate(fn);
+    };
+
+    const raced = await bindDetectAndResync({
+      store: raceStore,
+      keychain: raceKc,
+      readNativeCredential: async () => grant('native'),
+    })(id, 'xai');
+
+    assert.equal(raced.resynced, false, raced.reason);
+    assert.equal(raceKc.getSync(shared.service, shared.account), raceSharedBefore);
+    assert.equal(raceKc.getSync(legacyService, label), raceLegacyBefore);
+    raceStore.close();
+  });
+
+  it('T-KC8b native-resync with an unresolvable generic journal writes nothing', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-resync-journal-invalid-'));
+    temps.push(dir);
+    const store = openStore(join(dir, 'qlb.db'));
+    const kc = new MockKeychain();
+    const id = ADAPTER_ACCOUNT_IDS.xai;
+    const label = ADAPTER_ACCOUNT_LABELS.xai;
+    const shared = sharedSingleGrantCoords('xai');
+    const legacyService = qlbKeychainService('xai', id);
+    const sharedBefore = JSON.stringify({ ...grant('shared'), generation: 0 });
+    const legacyBefore = JSON.stringify({ ...grant('legacy'), generation: 0 });
+    store.upsertAccount(id, 'xai', label);
+    store.upsertMigration('pi-xai', 'QLB_OWNED', singleGrantJournal('xai', { ...shared, extra: true }));
+    kc.setSync(shared.service, shared.account, sharedBefore);
+    kc.setSync(legacyService, label, legacyBefore);
+
+    const result = await bindDetectAndResync({
+      store,
+      keychain: kc,
+      readNativeCredential: async () => grant('native'),
+    })(id, 'xai');
+
+    assert.equal(result.resynced, false, result.reason);
+    assert.equal(kc.getSync(shared.service, shared.account), sharedBefore);
+    assert.equal(kc.getSync(legacyService, label), legacyBefore);
     store.close();
   });
 });
