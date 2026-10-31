@@ -438,4 +438,50 @@ describe('Codex switch commit primitive', () => {
       store.close();
     }
   });
+  it('findCodexSwitchByAttempt ignores a malformed steps_json row and still finds the committed row', () => {
+    const store = openCommitStore();
+    try {
+      const id = store.commitCodexSwitch(commitInput());
+      commitDb(store).prepare(`INSERT INTO switch_log (ts, provider, to_account, trigger, outcome, steps_json)
+        VALUES (2000, 'openai-codex', 'to:account', 'manual', 'refused', 'not json')`).run();
+      assert.equal(store.findCodexSwitchByAttempt('attempt-1')?.id, id);
+      assert.equal(store.findCodexSwitchByAttempt('missing'), null);
+    } finally {
+      store.close();
+    }
+  });
+
+  it('findCodexSwitchByAttempt skips a refusal row with the same attempt', () => {
+    const store = openCommitStore();
+    try {
+      const id = store.commitCodexSwitch(commitInput());
+      store.recordSwitch({
+        ts: 2_000, provider: 'openai-codex', fromAccount: 'from:account', toAccount: 'to:account',
+        trigger: 'manual', outcome: 'refused', detail: 'switch-busy',
+        stepsJson: JSON.stringify({ attempt: 'attempt-1', via: 'switch' }), publishedAt: null,
+      });
+      assert.equal(store.findCodexSwitchByAttempt('attempt-1')?.id, id);
+      store.recordSwitch({
+        ts: 3_000, provider: 'openai-codex', fromAccount: 'from:account', toAccount: 'to:account',
+        trigger: 'manual', outcome: 'refused', detail: 'switch-busy',
+        stepsJson: JSON.stringify({ attempt: 'attempt-only-refused', via: 'switch' }), publishedAt: null,
+      });
+      assert.equal(store.findCodexSwitchByAttempt('attempt-only-refused'), null);
+    } finally {
+      store.close();
+    }
+  });
+
+  it('a journal-recovery commit records its observation by qlb-reconcile', () => {
+    const store = openCommitStore();
+    try {
+      store.commitCodexSwitch(commitInput({ via: 'journal', setBy: 'journal' }));
+      assert.equal(
+        (commitDb(store).prepare('SELECT by FROM codex_live_observations').get() as { by: string }).by,
+        'qlb-reconcile',
+      );
+    } finally {
+      store.close();
+    }
+  });
 });

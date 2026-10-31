@@ -2270,7 +2270,7 @@ export class Store {
     via: 'switch' | 'journal';
     openSessionsJson: string;
     publishedAt: number | null;
-    committedAt: number | null;
+    committedAt: number;
     detail?: string | null;
     outgoing: string;
     target: string;
@@ -2318,7 +2318,7 @@ export class Store {
       });
       this.recordCodexObservationInTransaction({
         ...input.observation,
-        by: 'qlb-switch',
+        by: input.via === 'journal' ? 'qlb-reconcile' : 'qlb-switch',
         now: input.now,
       });
       if (input.outcome === 'ok') {
@@ -2331,7 +2331,11 @@ export class Store {
     });
   }
 
-  /** Find one committed Codex switch by its durable attempt id. */
+  /**
+   * Find the committed Codex switch for a durable attempt id. Only rows written
+   * by commitCodexSwitch carry committed_at, so a refusal row with the same
+   * attempt is skipped; rows whose steps_json is not JSON have no attempt.
+   */
   findCodexSwitchByAttempt(attemptId: string): {
     id: number;
     ts: number;
@@ -2349,7 +2353,8 @@ export class Store {
     const row = this.db.prepare(`SELECT id, ts, provider, from_account, to_account, trigger, outcome, detail,
       steps_json, open_sessions_json, published_at, committed_at
       FROM switch_log
-      WHERE provider = 'openai-codex' AND json_extract(steps_json, '$.attempt') = ?
+      WHERE provider = 'openai-codex' AND committed_at IS NOT NULL
+        AND CASE WHEN json_valid(steps_json) THEN json_extract(steps_json, '$.attempt') END = ?
       ORDER BY id DESC LIMIT 1`).get(attemptId) as {
       id: number; ts: number; provider: string; from_account: string | null; to_account: string;
       trigger: string; outcome: string; detail: string | null; steps_json: string | null;
