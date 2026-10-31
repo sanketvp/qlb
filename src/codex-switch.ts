@@ -1227,7 +1227,9 @@ export async function reconcileCodexRecoveryLocked(
   }
   if (verdict.class === 'unresolved') {
     assertHeld();
-    deps.store.setRecoveryFence({ ...fence, reason: verdict.reason, involvedAccounts: verdict.involvedAccounts, since: fence.since });
+    // A target-changed fence stays target-changed until cleared, so it can never resolve as ok (§3.1).
+    const reason = fence.reason === 'target-changed' ? fence.reason : verdict.reason;
+    deps.store.setRecoveryFence({ ...fence, reason, involvedAccounts: verdict.involvedAccounts, since: fence.since });
     // §3.1: the fenced set is unioned and never shrinks until cleared.
     return fenced(verdict.reason, unionRecoveryAccounts([fence.from, fence.to], fence.involvedAccounts, verdict.involvedAccounts));
   }

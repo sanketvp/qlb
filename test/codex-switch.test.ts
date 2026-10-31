@@ -2816,4 +2816,26 @@ describe('reconcileCodexRecovery — C6-20', () => {
       assert.equal(h.store.hasConfig('codex.recoveryFence'), false);
     } finally { close(h); }
   });
+
+  it('a target-changed fence re-checked as slot-split keeps target-changed and later resolves as failed(target-changed), never ok', async () => {
+    const h = switchHarness();
+    try {
+      const fence = configFence(h, 'target-changed');
+      // A killed adopt left slot B's Keychain on other bytes than its SQLite row; Codex is on a rotated B.
+      h.keychain.setSync(qlbKeychainService('openai-codex', 'b:account'), QLB_KEYCHAIN_ACCOUNT, JSON.stringify(observedDocument('b', 'b-killed')));
+      codexWrites(h, observedDocument('b', 'b-rotated'));
+      assert.deepEqual(fenced(await h.recover()), { state: 'fenced', reason: 'slot-split', message: recoveryMessage('slot-split'),
+        accounts: ['a:account', 'b:account'] });
+      // The fence is still target-changed (§3.1: never ok); only its account set is unioned.
+      assert.deepEqual(JSON.parse(h.store.getConfig('codex.recoveryFence')!), { ...fence, reason: 'target-changed' });
+      // The user logs in to B and imports it: live now equals B's current head.
+      const bLogin = observedDocument('b', 'b-login');
+      codexWrites(h, bLogin);
+      importActiveCodexSlot(bLogin, { store: h.store, keychain: h.keychain, now: () => 4 });
+      assert.deepEqual(await h.recover(), { state: 'clear' });
+      assert.deepEqual(lastRow(h), viaFence(fence, 'failed', 'target-changed'));
+      assert.deepEqual(activeLogin(h), { account_id: 'b:account', set_by: 'adopt' });
+      assert.equal(h.store.hasConfig('codex.recoveryFence'), false);
+    } finally { close(h); }
+  });
 });
