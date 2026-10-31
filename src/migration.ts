@@ -1895,7 +1895,9 @@ export class Migration {
       if (journalAccount.provider !== this.provider) {
         throw new Error(`cleanup-pending hand-back journal names ${journalAccount.provider}, not ${this.provider}`);
       }
-      const coords = keychainCoords(journalAccount.provider, journalAccount.id, journalAccount.label);
+      const coords = journalAccount.provider === 'xai' || journalAccount.provider === 'kimi-coding'
+        ? resolveSingleGrantKeychain(journalAccount.provider, journalAccount)
+        : keychainCoords(journalAccount.provider, journalAccount.id, journalAccount.label);
       try {
         this.keychain.deleteSync(coords.service, coords.account);
       } catch (error) {
@@ -2455,7 +2457,7 @@ export class Migration {
 
   /** S5, followed by the existing C3 path (S6 → S7). Caller holds Pi's auth lock. */
   private recordSingleGrantHandbackAndCleanup(
-    journalAccount: { provider: string; id: string; label: string },
+    journalAccount: { provider: string; id: string; label: string; keychain: SingleGrantKeychainCoords },
     authKey: string,
   ): MigrationStatus {
     let piEntry: unknown = null;
@@ -2467,7 +2469,7 @@ export class Migration {
       piEntry = null;
     }
 
-    const coords = keychainCoords(journalAccount.provider, journalAccount.id, journalAccount.label);
+    const coords = journalAccount.keychain;
     let kmRead: unknown = null;
     try {
       const raw = this.keychain.getSync(coords.service, coords.account);
