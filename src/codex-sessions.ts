@@ -320,18 +320,26 @@ export async function stillTheSameProcess(
   recorded: Pick<CodexProcess, 'pid' | 'lstart'>,
   options: CodexSessionsOptions = {},
 ): Promise<boolean> {
+  const currentLstart = await processLstart(recorded.pid, options);
+  return currentLstart !== null && currentLstart.length > 0 && currentLstart === recorded.lstart.replace(/\s+/g, ' ');
+}
+
+/**
+ * A process's `ps lstart` in the exact form stillTheSameProcess compares, so a
+ * recorded owner (C6-10) is recognised while it lives. Null when it is absent.
+ */
+export async function processLstart(pid: number, options: CodexSessionsOptions = {}): Promise<string | null> {
   const runPs = options.runPs ?? runPsDefault;
   try {
-    const output = await runPs('ps', ['-p', String(recorded.pid), '-o', 'lstart='], {
+    const output = await runPs('ps', ['-p', String(pid), '-o', 'lstart='], {
       env: PS_ENV,
     });
-    const currentLstart = output.trim().replace(/\s+/g, ' ');
-    return currentLstart.length > 0 && currentLstart === recorded.lstart.replace(/\s+/g, ' ');
+    return output.trim().replace(/\s+/g, ' ');
   } catch (error) {
     // `ps -p <pid>` exits 1 exactly when that PID is absent. Permission,
     // spawn, and other failures leave liveness unknown and must reach callers.
     if (typeof error === 'object' && error !== null && 'code' in error && error.code === 1) {
-      return false;
+      return null;
     }
     throw error;
   }

@@ -10,6 +10,7 @@ import {
   checkCodexSwitchPreconditions,
   classifyPostPublish,
   resolveRecoveryVerdict,
+  switchCodex,
   codexRecoveryFenceState,
   freshenCodexTarget,
   preflightCodexLive,
@@ -32,12 +33,15 @@ import {
   withCodexSwitchJournalOwner,
   writeCodexSwitchJournal,
 } from '../src/codex-switch';
-import { ClaudeCodeLockTimeout } from '../src/cc-locks';
-import { codexLockPaths } from '../src/codex-consume';
-import { accessExpiry, codexFingerprint, readCodexAuthStableWithStat, type CodexAuthDocument } from '../src/codex-auth';
+import { ClaudeCodeLockTimeout, codexAuthLockDir, withCodexAuthLock } from '../src/cc-locks';
+import { codexLockPaths, withCodexSwitchLock } from '../src/codex-consume';
+import { accessExpiry, codexFingerprint, codexIdentity, readCodexAuthStable, readCodexAuthStableWithStat, writeCodexAuthAtomic, type CodexAuthDocument } from '../src/codex-auth';
 import { CodexStashUnverifiable, importActiveCodexSlot } from '../src/codex-slots';
 import { MockKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from '../src/keychain';
-import type { CodexProcess } from '../src/codex-sessions';
+import { stillTheSameProcess, type CodexProcess } from '../src/codex-sessions';
+import { runCodexImportActiveCommand } from '../src/commands/codex-import-active';
+import type { CommandContext } from '../src/registry';
+import { beginCutover } from '../src/lifecycle';
 import { openStore } from '../src/store';
 
 function fixture() {
@@ -189,6 +193,37 @@ function scalarCount(db: DatabaseSync, sql: string): number {
 function switchRows(db: DatabaseSync): Array<Record<string, unknown>> {
   return (db.prepare(`SELECT provider, from_account, to_account, trigger, outcome, detail, steps_json, published_at
     FROM switch_log ORDER BY id`).all() as Array<Record<string, unknown>>).map((row) => ({ ...row }));
+}
+
+function switchHarness() {
+  const h = fixture();
+  const keychain = new MockKeychain();
+  const authPath = join(h.root, 'auth.json');
+  const now = 1_700_000_000_000;
+  const a = observedDocument('a', 'switch-a');
+  const b = observedDocument('b', 'switch-b');
+  importActiveCodexSlot(a, { store: h.store, keychain, now: () => now - 10 });
+  importActiveCodexSlot(b, { store: h.store, keychain, now: () => now - 5 });
+  h.store.setActiveLogin('openai-codex', 'a:account', 'import', now - 1);
+  writeFileSync(authPath, JSON.stringify(a));
+  const slots = {
+    readSlot: (id: string) => {
+      const doc = JSON.parse(keychain.getSync(qlbKeychainService('openai-codex', id), QLB_KEYCHAIN_ACCOUNT)) as CodexAuthDocument;
+      return { document: doc, fingerprint: codexFingerprint(doc) };
+    },
+    writeSlot: (id: string, document: CodexAuthDocument) => {
+      keychain.setSync(qlbKeychainService('openai-codex', id), QLB_KEYCHAIN_ACCOUNT, JSON.stringify(document));
+      h.db.prepare('UPDATE codex_slots SET fingerprint = ? WHERE account_id = ?').run(codexFingerprint(document), id);
+    },
+    stashUnclaimed: () => 'unused',
+    ensureUnclaimedStash: async () => ({ stashId: 'unused', created: false }),
+  };
+  let tick = now;
+  const runWith = (overrides: Partial<CodexSwitchDeps> = {}, input = { target: 'b:account', trigger: 'manual' }) => switchCodex(h.deps({ authPath, dbPath: h.store.dbPath, journalDir: join(h.root, 'journal'),
+    authLockOptions: { home: h.root, timeoutMs: 50, retryMinMs: 1, retryJitterMs: 1 }, keychain, slots: slots as never,
+    list: async () => [], transport: async () => { throw new Error('unexpected transport'); }, readLive: () => readCodexAuthStableWithStat(authPath, { delayMs: 0 }), now: () => tick++,
+    journalOwner: { pid: process.pid, lstart: 'fixture-owner' }, attempt: 'switch-attempt', ...overrides }), input);
+  return { ...h, authPath, a, b, keychain, slots, run: () => runWith(), runWith };
 }
 
 describe('Codex switch preflight and preconditions', () => {
@@ -1468,5 +1503,432 @@ describe('Codex switch journal v2', () => {
       });
       assert.equal(readCodexSwitchJournal(h.options).state, 'ok');
     } finally { executingCodexAttempts.clear(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+});
+
+describe('switchCodex landed and not-landed — C6-18', () => {
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+  const journalState = (root: string) => readCodexSwitchJournal({ journalDir: join(root, 'journal') });
+  const ownerState = (root: string) => { const read = journalState(root); return read.state === 'ok' ? read.journal.owner.state : read.state; };
+  const liveIdentity = (path: string) => codexIdentity(JSON.parse(readFileSync(path, 'utf8')) as CodexAuthDocument);
+  /**
+   * Pauses the switch's first `list()`: with B fresh, the freshen lists nothing, so this is step 1 under switch → auth,
+   * before any phase-L write. Records which locks were held at the pause.
+   */
+  const pauseUnderLocks = (root: string, dbPath: string) => {
+    let release!: () => void; const gate = new Promise<void>((resolve) => { release = resolve; });
+    const state = { paused: false, locksHeld: false, release: () => release() };
+    const list = async (): Promise<CodexProcess[]> => {
+      if (!state.paused) {
+        state.paused = true;
+        state.locksHeld = existsSync(codexLockPaths(dbPath, '').switch) && existsSync(codexAuthLockDir({ home: root }));
+        await gate;
+      }
+      return [];
+    };
+    const untilPaused = async () => {
+      const deadline = Date.now() + 5_000;
+      while (!state.paused) {
+        assert.ok(Date.now() < deadline, 'the switch reached step 1');
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+    };
+    return { state, list, untilPaused };
+  };
+
+  it('stable live A publishes B, verifies it and commits ok with published_at = journaled time < committed_at', async () => {
+    const h = switchHarness();
+    try {
+      let journaledAt: number | undefined;
+      const result = await h.runWith({ hooks: { afterRename: () => {
+        const read = journalState(h.root); if (read.state === 'ok') journaledAt = read.journal.publishedAt;
+      } } });
+      assert.equal(result.outcome, 'ok');
+      const row = h.db.prepare(`SELECT outcome, published_at, committed_at FROM switch_log WHERE provider = 'openai-codex' ORDER BY id DESC`).get() as { outcome: string; published_at: number; committed_at: number };
+      assert.equal(row.outcome, 'ok');
+      assert.equal(typeof journaledAt, 'number');
+      assert.equal(row.published_at, journaledAt);
+      assert.ok(row.published_at < row.committed_at);
+      assert.equal(liveIdentity(h.authPath), 'b:account');
+    } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('the journal is on disk at the moment of the rename (publish spy)', async () => {
+    const h = switchHarness(); const mutableFs = require('node:fs') as { renameSync: typeof renameSync }; const original = mutableFs.renameSync;
+    try {
+      const atRename: Array<{ state: string; attemptId?: string }> = [];
+      mutableFs.renameSync = ((from: Parameters<typeof original>[0], to: Parameters<typeof original>[1]) => {
+        if (String(to) === h.authPath) {
+          const read = journalState(h.root);
+          atRename.push(read.state === 'ok' ? { state: read.state, attemptId: read.journal.attemptId } : { state: read.state });
+        }
+        return original(from, to);
+      }) as typeof original;
+      const result = await h.run();
+      assert.equal(result.outcome, 'ok');
+      assert.deepEqual(atRename, [{ state: 'ok', attemptId: 'switch-attempt' }]);
+    } finally { mutableFs.renameSync = original; h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('a missing or unreadable auth.json at the start of a full switch leaves the database, Keychain, journal and watch rows byte-identical and sends zero transport calls, even with a due watch row and a failing precondition', async () => {
+    const dumpDb = (db: DatabaseSync) => JSON.stringify((db.prepare(`SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name`).all() as Array<{ name: string }>)
+      .map(({ name }) => [name, db.prepare(`SELECT * FROM "${name}"`).all()]));
+    const dumpKeychain = (keychain: MockKeychain) => JSON.stringify([...(keychain as unknown as { items: Map<string, string> }).items].sort());
+    for (const live of [{ status: 'missing' }, { status: 'unreadable', code: 'EACCES' }] as const) {
+      const h = switchHarness();
+      try {
+        h.db.prepare('INSERT INTO codex_watch (switch_id, provider, outgoing, target, next_at, until) VALUES (?, ?, ?, ?, ?, ?)')
+          .run(77, 'openai-codex', 'a:account', 'b:account', 1_700_000_000_000 - 60_000, 1_700_000_000_000 + 240_000);
+        const journalPath = join(h.root, 'journal', 'switch-openai-codex.json');
+        const before = { db: dumpDb(h.db), keychain: dumpKeychain(h.keychain), journal: existsSync(journalPath), auth: readFileSync(h.authPath, 'utf8') };
+        assert.match(before.db, /"codex_watch",\[\{"switch_id":77/);
+        let posts = 0;
+        const result = await h.runWith({ readLive: async () => live, cswapProcesses: () => [{ pid: 1 }], transport: async () => { posts += 1; throw new Error('unexpected'); } });
+        assert.equal(result.outcome, 'refused');
+        assert.equal(dumpDb(h.db), before.db);
+        assert.equal(dumpKeychain(h.keychain), before.keychain);
+        assert.equal(existsSync(journalPath), before.journal);
+        assert.equal(readFileSync(h.authPath, 'utf8'), before.auth);
+        assert.equal(posts, 0);
+      } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+    }
+  });
+
+  it('open_sessions_json lists each codex pid with its holder set', async () => {
+    const h = switchHarness();
+    try {
+      // An earlier C→A switch: sessions started before it hold C, sessions started after it hold A.
+      const earlier = 1_699_990_000_000; // Tue Nov 14 19:26:40 2023 UTC
+      h.store.recordSwitch({ ts: earlier, provider: 'openai-codex', fromAccount: 'c:account', toAccount: 'a:account', trigger: 'manual',
+        outcome: 'ok', stepsJson: JSON.stringify({ attempt: 'earlier', via: 'switch' }), publishedAt: earlier, committedAt: earlier });
+      const beforeEarlier = { pid: 9901, lstart: 'Tue Nov 14 18:00:00 2023', host: 'codex' };
+      const afterEarlier = { pid: 9902, lstart: 'Tue Nov 14 21:00:00 2023', host: 'codex' };
+      assert.equal((await h.runWith({ list: async () => [beforeEarlier, afterEarlier] })).outcome, 'ok');
+      const sessions = JSON.parse((h.db.prepare('SELECT open_sessions_json FROM switch_log ORDER BY id DESC').get() as { open_sessions_json: string }).open_sessions_json) as Array<CodexProcess & { holderSet: string[] }>;
+      assert.deepEqual(sessions, [{ ...beforeEarlier, holderSet: ['c:account'] }, { ...afterEarlier, holderSet: ['a:account'] }]);
+    } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('a Codex write between the first read and the pre-rename read restarts at step 2 and never loses the new bytes', async () => {
+    const h = switchHarness();
+    const a1 = observedDocument('a', 'switch-a1');
+    try {
+      let reads = 0; let freshens = 0;
+      const result = await h.runWith({ hooks: { beforeFreshenLock: () => { freshens += 1; } }, readLive: async () => {
+        reads += 1;
+        if (reads === 3) writeFileSync(h.authPath, JSON.stringify(a1));
+        return readCodexAuthStableWithStat(h.authPath, { delayMs: 0 });
+      } });
+      assert.equal(result.outcome, 'ok');
+      // Preflight, step 1, the changed CAS read, step 1 again, the CAS read, the verify: the restart stays under the held locks.
+      assert.equal(reads, 6);
+      assert.equal(freshens, 1, 'a CAS restart does not release the locks or re-run the freshen');
+      assert.equal(liveIdentity(h.authPath), 'b:account');
+      assert.equal(h.store.getCodexSlot('a:account')?.fingerprint, codexFingerprint(a1));
+    } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('six consecutive changes refuse codex-writing with no publish', async () => {
+    const h = switchHarness();
+    try {
+      // Slot A moves on to a2, so the live `a` is a known ancestor: each step-1 read of it republishes a2 and restarts.
+      importActiveCodexSlot(observedDocument('a', 'switch-a2'), { store: h.store, keychain: h.keychain, now: () => 1_700_000_000_000 - 2 });
+      let reads = 0; let freshens = 0;
+      const result = await h.runWith({ hooks: { beforeFreshenLock: () => { freshens += 1; } }, readLive: async () => {
+        reads += 1;
+        // Reads 2-7: three republish restarts (step-1 read of `a`, then the republish re-read).
+        if (reads === 4 || reads === 6) writeFileSync(h.authPath, JSON.stringify(h.a));
+        // Reads 8-13: three CAS restarts (step-1 read, then a changed pre-rename read).
+        if (reads === 9 || reads === 11 || reads === 13) writeFileSync(h.authPath, JSON.stringify(observedDocument('a', `race-${reads}`)));
+        return readCodexAuthStableWithStat(h.authPath, { delayMs: 0 });
+      } });
+      assert.deepEqual(result, { outcome: 'refused', reason: 'codex-writing' });
+      assert.equal(reads, 13, 'one budget: the initial observation plus five restarts, whichever kind of change');
+      assert.equal(freshens, 1);
+      assert.equal(existsSync(join(h.root, 'journal', 'switch-openai-codex.json')), false);
+      assert.notEqual(liveIdentity(h.authPath), 'b:account');
+    } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('a rename that throws is failed not-published with the file unchanged and no codex_watch row', async () => {
+    const h = switchHarness(); const mutableFs = require('node:fs') as { renameSync: typeof renameSync }; const original = mutableFs.renameSync;
+    try {
+      const before = readFileSync(h.authPath, 'utf8');
+      mutableFs.renameSync = ((from: Parameters<typeof original>[0], to: Parameters<typeof original>[1]) => {
+        if (String(to) === h.authPath) throw new Error('fixture rename');
+        return original(from, to);
+      }) as typeof original;
+      const result = await h.run();
+      assert.equal(result.outcome, 'failed');
+      assert.equal(readFileSync(h.authPath, 'utf8'), before);
+      // I11: the canonical Q1 marker, so holder sets open no era for B.
+      const row = h.db.prepare('SELECT outcome, detail, published_at FROM switch_log ORDER BY id DESC').get() as Record<string, unknown>;
+      assert.deepEqual({ ...row }, { outcome: 'failed', detail: 'not-published', published_at: null });
+      assert.equal(scalarCount(h.db, 'SELECT COUNT(*) AS count FROM codex_watch'), 0);
+      assert.equal(journalState(h.root).state, 'absent');
+    } finally { mutableFs.renameSync = original; h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('a commit failure after the rename keeps the journal and exits 1 with the file holding B', async () => {
+    const h = switchHarness();
+    try {
+      h.db.exec("CREATE TEMP TRIGGER fail_switch BEFORE INSERT ON switch_log BEGIN SELECT RAISE(ABORT, 'commit failure'); END");
+      assert.deepEqual(await h.run(), { outcome: 'failed', reason: 'commit-failed', attemptId: 'switch-attempt' });
+      assert.equal(liveIdentity(h.authPath), 'b:account');
+      assert.equal(ownerState(h.root), 'released');
+    } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('a journal delete that fails after the commit returns the committed outcome, never commit-failed', async () => {
+    const h = switchHarness();
+    try {
+      const journalPath = codexSwitchJournalPath({ journalDir: join(h.root, 'journal') });
+      const result = await h.runWith({ journalOptions: { fsyncDirectory: () => {
+        if (!existsSync(journalPath)) throw Object.assign(new Error('fixture EIO'), { code: 'EIO' });
+      } } });
+      assert.equal(result.outcome, 'ok'); assert.equal(result.reason, undefined); assert.equal(result.watch?.state, 'pending');
+      assert.equal(scalarCount(h.db, `SELECT COUNT(*) AS count FROM switch_log WHERE outcome = 'ok'`), 1);
+    } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('an external write classified after the rename throws codex-switch-external-unhandled and keeps the released journal', async () => {
+    const h = switchHarness();
+    try {
+      const third = observedDocument('c', 'external-c');
+      await assert.rejects(h.runWith({ hooks: { beforeVerify: () => { writeFileSync(h.authPath, JSON.stringify(third)); } } }),
+        { message: 'codex-switch-external-unhandled' });
+      assert.equal(ownerState(h.root), 'released');
+      assert.equal(scalarCount(h.db, 'SELECT COUNT(*) AS count FROM switch_log'), 0);
+    } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('a journal written without an injected owner records this process\'s ps start so stillTheSameProcess recognises it', async () => {
+    const h = switchHarness();
+    try {
+      let owner: CodexSwitchJournal['owner'] | undefined;
+      const result = await h.runWith({ journalOwner: undefined, hooks: { afterRename: () => {
+        const read = journalState(h.root); if (read.state === 'ok') owner = read.journal.owner;
+      } } });
+      assert.equal(result.outcome, 'ok');
+      assert.equal(owner?.pid, process.pid);
+      assert.equal(await stillTheSameProcess(owner!), true);
+    } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('a lost lock after the rename keeps the journal and does not commit', async () => {
+    const h = switchHarness();
+    try {
+      const authLock = codexAuthLockDir({ home: h.root });
+      const result = await h.runWith({ hooks: { afterRename: () => { rmSync(authLock, { recursive: true, force: true }); mkdirSync(authLock, { recursive: true }); } } });
+      assert.deepEqual(result, { outcome: 'failed', reason: 'lock-lost-after-publish', attemptId: 'switch-attempt' });
+      assert.equal(ownerState(h.root), 'released');
+      assert.equal(scalarCount(h.db, 'SELECT COUNT(*) AS count FROM switch_log'), 0);
+    } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('a compromise reported after the commit returns the committed outcome with lockLostAfterCommit', async () => {
+    const h = switchHarness();
+    try {
+      const commit = h.store.commitCodexSwitch.bind(h.store); const authLock = codexAuthLockDir({ home: h.root });
+      h.store.commitCodexSwitch = ((input: Parameters<typeof h.store.commitCodexSwitch>[0]) => {
+        const id = commit(input); rmSync(authLock, { recursive: true, force: true }); mkdirSync(authLock, { recursive: true }); return id;
+      }) as typeof h.store.commitCodexSwitch;
+      const result = await h.run();
+      assert.equal(result.outcome, 'ok'); assert.equal(result.lockLostAfterCommit, true);
+      // The committed attempt's kept journal is released; C6-20 recovery would delete it (X7), as this test does.
+      assert.equal(ownerState(h.root), 'released');
+      rmSync(join(h.root, 'journal'), { recursive: true, force: true }); rmSync(authLock, { recursive: true, force: true });
+      // The same rule for a committed noop (I3): the live file already holds B.
+      const noop = await h.runWith({ attempt: 'switch-attempt-noop' });
+      assert.equal(noop.outcome, 'noop'); assert.equal(noop.lockLostAfterCommit, true); assert.equal(typeof noop.switchId, 'number');
+      assert.deepEqual((h.db.prepare('SELECT outcome FROM switch_log ORDER BY id').all() as Array<{ outcome: string }>).map((row) => row.outcome), ['ok', 'noop']);
+    } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('lock wait timeout refuses switch-busy', async () => {
+    const h = switchHarness();
+    try {
+      const lock = codexLockPaths(h.store.dbPath, '').switch; mkdirSync(lock, { recursive: true });
+      const result = await h.run();
+      assert.deepEqual(result, { outcome: 'refused', reason: 'switch-busy' });
+      assert.equal(liveIdentity(h.authPath), 'a:account');
+    } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('a target whose Keychain bytes differ from its recorded fingerprint is refused target-slot-split', async () => {
+    const h = switchHarness();
+    try {
+      h.keychain.setSync(qlbKeychainService('openai-codex', 'b:account'), QLB_KEYCHAIN_ACCOUNT, JSON.stringify(observedDocument('b', 'split-b')));
+      assert.deepEqual(await h.run(), { outcome: 'refused', reason: 'target-slot-split' });
+      assert.equal(liveIdentity(h.authPath), 'a:account');
+    } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('a target refreshed by codex refresh while the switch waited publishes the new successor', async () => {
+    const h = switchHarness(); const fresh = observedDocument('b', 'fresh-b');
+    let release!: () => void; const gate = new Promise<void>((resolve) => { release = resolve; }); let held = false;
+    try {
+      // codex refresh holds the switch lock (consume → switch) while the switch queues behind it.
+      const refreshing = withCodexSwitchLock(h.store.dbPath, async () => { held = true; await gate; });
+      while (!held) await new Promise((resolve) => setImmediate(resolve));
+      let targetReads = 0;
+      const switching = h.runWith({ slots: { ...h.slots, readSlot: (id: string) => {
+        if (id === 'b:account') targetReads += 1;
+        return h.slots.readSlot(id);
+      } } as never });
+      while (targetReads === 0) await new Promise((resolve) => setImmediate(resolve));
+      await sleep(400);
+      assert.equal(targetReads, 1, 'the freshen read B and the switch is waiting for its lock');
+      h.keychain.setSync(qlbKeychainService('openai-codex', 'b:account'), QLB_KEYCHAIN_ACCOUNT, JSON.stringify(fresh));
+      h.db.prepare('UPDATE codex_slots SET fingerprint = ? WHERE account_id = ?').run(codexFingerprint(fresh), 'b:account');
+      release(); await refreshing;
+      assert.equal((await switching).outcome, 'ok');
+      assert.equal(codexFingerprint(JSON.parse(readFileSync(h.authPath, 'utf8')) as CodexAuthDocument), codexFingerprint(fresh));
+    } finally { release(); h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('a target with under five minutes left at publish is freshened again in lock order', async () => {
+    const h = switchHarness();
+    const withExpiry = (document: CodexAuthDocument, expiry: number) => ({ ...document, tokens: { ...document.tokens, access_token: freshenJwt({ exp: Math.floor(expiry / 1_000) }) } });
+    const soon = withExpiry(h.b, 1_700_000_000_000 + 6 * 60_000);
+    const near = withExpiry(h.b, 1_700_000_000_000 + 4 * 60_000);
+    const locks = { ...codexLockPaths(h.store.dbPath, 'b:account'), auth: codexAuthLockDir({ home: h.root }) };
+    const held = () => ({ consume: existsSync(locks.consume), switch: existsSync(locks.switch), auth: existsSync(locks.auth) });
+    try {
+      h.keychain.setSync(qlbKeychainService('openai-codex', 'b:account'), QLB_KEYCHAIN_ACCOUNT, JSON.stringify(soon));
+      h.db.prepare('UPDATE codex_slots SET fingerprint = ? WHERE account_id = ?').run(codexFingerprint(soon), 'b:account');
+      let scheduledMutation = false; let posts = 0; const events: Array<[string, ReturnType<typeof held>]> = [];
+      const result = await h.runWith({ hooks: { beforeFreshenLock: () => { events.push(['freshen', held()]); } }, slots: { ...h.slots, writeSlot: (id: string, document: CodexAuthDocument) => {
+        h.keychain.setSync(qlbKeychainService('openai-codex', id), QLB_KEYCHAIN_ACCOUNT, JSON.stringify(document));
+        if (!scheduledMutation) {
+          scheduledMutation = true;
+          queueMicrotask(() => {
+            h.keychain.setSync(qlbKeychainService('openai-codex', id), QLB_KEYCHAIN_ACCOUNT, JSON.stringify(near));
+            h.db.prepare('UPDATE codex_slots SET fingerprint = ? WHERE account_id = ?').run(codexFingerprint(near), id);
+          });
+        }
+      } } as never, transport: async () => {
+        posts += 1; events.push(['post', held()]);
+        return { status: 200, body: JSON.stringify({ refresh_token: `post-${posts}`, access_token: freshenJwt({ exp: 1_700_003_600 }) }) };
+      } });
+      assert.equal(result.outcome, 'ok'); assert.equal(posts, 2);
+      // I4: each freshen starts with switch and auth released, and POSTs under consume → switch, never with auth held.
+      const free = { consume: false, switch: false, auth: false }; const posting = { consume: true, switch: true, auth: false };
+      assert.deepEqual(events, [['freshen', free], ['post', posting], ['freshen', free], ['post', posting]]);
+    } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('a stale active_login naming the target still publishes when live is another slot', async () => {
+    const h = switchHarness();
+    try {
+      h.store.setActiveLogin('openai-codex', 'b:account', 'import');
+      assert.equal((await h.run()).outcome, 'ok');
+      assert.equal(h.store.getCodexActiveLogin(), 'b:account');
+      assert.equal(liveIdentity(h.authPath), 'b:account');
+    } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('codex import-active started during the switch waits on the auth lock and then sees B active', async () => {
+    const h = switchHarness(); const pause = pauseUnderLocks(h.root, h.store.dbPath); const output: string[] = [];
+    const ctx: CommandContext = {
+      stdout: (line) => output.push(line), stderr: (line) => output.push(`stderr:${line}`),
+      env: { QLB_TEST_MODE: '1', QLB_HOME: h.root, HOME: h.root, CODEX_HOME: h.root },
+      config: { dbPath: h.store.dbPath, piAuthJsonPath: join(h.root, 'pi-auth.json') } as CommandContext['config'],
+      loadConfig: () => { throw new Error('not used'); }, home: h.root,
+      registerSecret: () => undefined, deliverSecret: () => undefined, knownSecrets: () => [],
+    };
+    const control = mkdtempSync(join(tmpdir(), 'qlb-codex-switch-control-'));
+    try {
+      beginCutover(h.store, 1);
+      const switching = h.runWith({ list: pause.list });
+      await pause.untilPaused();
+      assert.equal(liveIdentity(h.authPath), 'a:account', 'paused before the rename');
+      let importLocked = false; let committedWhenLocked = -1;
+      const importing = runCodexImportActiveCommand(['--json'], ctx, {
+        readAuth: readCodexAuthStable, writeAuth: writeCodexAuthAtomic, keychain: h.keychain,
+        withAuthLock: (options, fn) => withCodexAuthLock({ ...options, retryMinMs: 1, retryJitterMs: 0 }, (held) => {
+          importLocked = true; committedWhenLocked = scalarCount(h.db, `SELECT COUNT(*) AS count FROM switch_log WHERE outcome = 'ok'`);
+          return fn(held);
+        }),
+      });
+      // An uncontended auth lock is taken well within this window, so a still-blocked import is waiting on the switch.
+      await withCodexAuthLock({ home: control, retryMinMs: 1, retryJitterMs: 0 }, () => undefined);
+      await sleep(200);
+      assert.equal(importLocked, false, 'import-active waits while the switch holds the auth lock');
+      pause.state.release();
+      assert.equal((await switching).outcome, 'ok');
+      assert.equal(await importing, 0, output.join('\n'));
+      assert.equal(committedWhenLocked, 1, 'import-active ran after the switch committed');
+      assert.equal((JSON.parse(output.at(-1)!) as { slotId: string }).slotId, 'b:account');
+      assert.equal(h.store.getCodexActiveLogin(), 'b:account');
+    } finally { pause.state.release(); h.store.close(); rmSync(h.root, { recursive: true, force: true }); rmSync(control, { recursive: true, force: true }); }
+  });
+
+  it('a queued second switch to the same target records noop', async () => {
+    const h = switchHarness(); const pause = pauseUnderLocks(h.root, h.store.dbPath);
+    try {
+      const first = h.runWith({ list: pause.list });
+      await pause.untilPaused();
+      let secondReads = 0;
+      const second = h.runWith({ attempt: 'switch-attempt-2', readLive: async () => { secondReads += 1; return readCodexAuthStableWithStat(h.authPath, { delayMs: 0 }); } });
+      await sleep(600);
+      // Its preflight read saw A; it is now queued on the switch lock, so the noop must be decided live under phase L (I9).
+      assert.equal(secondReads, 1);
+      pause.state.release();
+      assert.equal((await first).outcome, 'ok');
+      assert.equal((await second).outcome, 'noop');
+      const outcomes = h.db.prepare('SELECT outcome FROM switch_log ORDER BY id').all() as Array<{ outcome: string }>;
+      assert.deepEqual(outcomes.map((row) => row.outcome), ['ok', 'noop']);
+    } finally { pause.state.release(); h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('a switch whose auth lock was taken over aborts before the rename and publishes nothing', async () => {
+    const h = switchHarness();
+    try {
+      const authLock = codexAuthLockDir({ home: h.root });
+      const result = await h.runWith({ journalOptions: { fsyncDirectory: () => { rmSync(authLock, { recursive: true, force: true }); mkdirSync(authLock, { recursive: true }); } } });
+      assert.deepEqual(result, { outcome: 'refused', reason: 'lock-lost' });
+      assert.equal(liveIdentity(h.authPath), 'a:account');
+      assert.equal(ownerState(h.root), 'released');
+    } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('a stalled switch resumes after takeover and publishes nothing', async () => {
+    const h = switchHarness(); const pause = pauseUnderLocks(h.root, h.store.dbPath); const authLock = codexAuthLockDir({ home: h.root });
+    let releaseTakeover!: () => void; const takeoverGate = new Promise<void>((resolve) => { releaseTakeover = resolve; });
+    try {
+      const observations = scalarCount(h.db, 'SELECT COUNT(*) AS count FROM codex_live_observations');
+      const switching = h.runWith({ list: pause.list });
+      await pause.untilPaused();
+      assert.equal(pause.state.locksHeld, true, 'stalled holding switch and auth');
+      // The stall outlives the lock's staleness, and another owner takes the lock over through the staleness path.
+      const stale = new Date(Date.now() - 300_001); utimesSync(authLock, stale, stale);
+      let tookOver = false;
+      const takeover = withCodexAuthLock({ home: h.root, timeoutMs: 2_000, retryMinMs: 1, retryJitterMs: 0 }, async () => { tookOver = true; await takeoverGate; });
+      while (!tookOver) await new Promise((resolve) => setImmediate(resolve));
+      pause.state.release();
+      assert.deepEqual(await switching, { outcome: 'refused', reason: 'lock-lost' });
+      assert.equal(liveIdentity(h.authPath), 'a:account');
+      assert.equal(scalarCount(h.db, 'SELECT COUNT(*) AS count FROM switch_log'), 0);
+      assert.equal(scalarCount(h.db, 'SELECT COUNT(*) AS count FROM codex_live_observations'), observations);
+      assert.equal(journalState(h.root).state, 'absent');
+      assert.equal(existsSync(authLock), true, 'the new owner still holds the auth lock');
+      releaseTakeover(); await takeover;
+    } finally { pause.state.release(); releaseTakeover(); h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('a switch whose owner died holding every lock is taken over after staleness and the next switch completes', async () => {
+    const h = switchHarness();
+    try {
+      const locks = [codexLockPaths(h.store.dbPath, '').switch, codexAuthLockDir({ home: h.root }), codexSwitchJournalOwnerLockPath({ journalDir: join(h.root, 'journal') })];
+      const age = (lock: string, ms: number) => { mkdirSync(lock, { recursive: true }); const at = new Date(Date.now() - ms); utimesSync(lock, at, at); };
+      // A lock younger than five minutes still blocks.
+      age(locks[0], 300_001); age(locks[1], 290_000); age(locks[2], 300_001);
+      assert.deepEqual(await h.run(), { outcome: 'refused', reason: 'switch-busy' });
+      assert.equal(liveIdentity(h.authPath), 'a:account');
+      for (const lock of locks) age(lock, 300_001);
+      assert.equal((await h.runWith({ attempt: 'switch-attempt-2' })).outcome, 'ok');
+      assert.equal(liveIdentity(h.authPath), 'b:account');
+    } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
   });
 });

@@ -2,13 +2,15 @@ import { mkdirSync, readFileSync, statSync, unlinkSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { accessExpiry, codexFingerprint, codexIdentity, writeCodexAuthAtomic, type CodexAuthDocument, type CodexAuthStableWithStatResult, type CodexIdentity } from './codex-auth';
 import { attributeLiveDocument, type AttributeLiveDocumentInput, type CodexAttributionResult, type CodexAttributionStore } from './codex-attribution';
-import { ClaudeCodeLockTimeout, withCodexAuthLock, type CodexAuthLockOptions, type HeldProperLockfile, withProperLockfile } from './cc-locks';
+import { ClaudeCodeLockTimeout, CodexAuthLockCompromised, ProperLockfileCompromised, withCodexAuthLock, type CodexAuthLockOptions, type HeldProperLockfile, withProperLockfile } from './cc-locks';
 import { consumeCodexSlot, hasCodexSlotIdentity, withCodexConsumeThenSwitchLocks, withCodexSwitchLock, type CodexConsumeOptions, type CodexConsumeResult } from './codex-consume';
 import { fsyncDirSync, atomicWriteText, publishTarget } from './fsutil';
 import { qlbHomeDir } from './home';
 import {
   codexIdentityParts,
+  holderSets,
   parseCodexRecoveryFence,
+  processLstart,
   readCodexSwitchHistory,
   renewers,
   stillTheSameProcess,
@@ -43,7 +45,7 @@ type CodexObservationKeychain = Pick<KeychainBackend, 'getSync' | 'setSync' | 'd
 
 export interface CodexSwitchDeps {
   store: Pick<Store, 'getCodexActiveLogin' | 'getCodexSlot' | 'getConfig' | 'hasConfig' | 'recordSwitch'
-    | 'recordCodexObservation' | 'setActiveLogin'> & CodexAttributionStore;
+    | 'recordCodexObservation' | 'setActiveLogin' | 'commitCodexSwitch' | 'findCodexSwitchByAttempt'> & CodexAttributionStore;
   readLive: () => Promise<CodexAuthStableWithStatResult>;
   cswapProcesses: () => CswapProcess[];
   now: () => number;
@@ -61,6 +63,18 @@ export interface CodexSwitchDeps {
   list?: () => Promise<CodexProcess[]>;
   transport?: CodexConsumeOptions['transport'];
   journalDir?: string;
+  /** Command-owned lifecycle admission, checked once, before the preflight (§3 step 2). */
+  admitted?: () => { ok: boolean; reason?: string } | Promise<{ ok: boolean; reason?: string }>;
+  /** Test seams for ordered switch phases; production leaves them unset. */
+  hooks?: {
+    afterPost?: () => void | Promise<void>;
+    afterRename?: () => void | Promise<void>;
+    beforeVerify?: () => void | Promise<void>;
+    beforeFreshenLock?: () => void | Promise<void>;
+  };
+  /** Owner identity is injected by the command/test harness; a journal only needs it if it survives this attempt. */
+  journalOwner?: Pick<CodexProcess, 'pid' | 'lstart'>;
+  journalOptions?: CodexSwitchJournalOptions;
 }
 
 /**
@@ -990,4 +1004,161 @@ export async function probeCodexSwitchJournal<T = undefined>(options: CodexSwitc
     if (await journalInProgress(latest.journal, options)) return { state: 'in-progress', journal: latest.journal };
     return { state: 'owner-lock-not-yet-stale', journal: latest.journal, retryAt: ownerLockRetryAt(options) };
   }
+}
+
+export type CodexSwitchResult = {
+  outcome: 'ok' | 'noop' | 'failed' | 'refused'; reason?: string; message?: string;
+  switchId?: number; attemptId?: string; watch?: { state: 'pending'; until: number }; lockLostAfterCommit?: boolean;
+};
+export interface SwitchCodexInput {
+  target: string; trigger: string;
+  /** Store uses leftRecoveryAt; the durable journal deliberately says leftRecoveryAtMs. */
+  decision?: { leftHeadroom?: number | null; leftRecoveryAt?: number | null; leftTrigger?: string | null };
+}
+const switchResult = (reason: string, message?: string): CodexSwitchResult =>
+  ({ outcome: 'refused', reason, ...(message === undefined ? {} : { message }) });
+function journalDecision(decision: SwitchCodexInput['decision']): CodexSwitchJournal['decision'] {
+  return decision ? { leftHeadroom: decision.leftHeadroom ?? null, leftRecoveryAtMs: decision.leftRecoveryAt ?? null,
+    leftTrigger: decision.leftTrigger ?? null } : null;
+}
+function switchRefusal(deps: CodexSwitchDeps, input: SwitchCodexInput, reason: string): CodexSwitchResult {
+  deps.store.recordSwitch({ ts: deps.now(), provider: PROVIDER, fromAccount: deps.store.getCodexActiveLogin(),
+    toAccount: input.target, trigger: input.trigger, outcome: 'refused', detail: reason,
+    stepsJson: JSON.stringify({ attempt: deps.attempt, via: 'switch' }), publishedAt: null });
+  return switchResult(reason);
+}
+function openSessionsJson(deps: CodexSwitchDeps, sessions: CodexProcess[]): string {
+  if (!deps.dbPath) return JSON.stringify(sessions);
+  const history = readCodexSwitchHistory(deps.dbPath, { journalDir: deps.journalDir });
+  const sets = holderSets(history.rows, history.observations);
+  return JSON.stringify(sessions.map((session) => {
+    const at = Date.parse(`${session.lstart} UTC`);
+    const holderSet = Number.isFinite(at) ? [...new Set(sets.filter((set) =>
+      (set.startsAt === null || at >= set.startsAt) && (set.endsAt === null || at < set.endsAt))
+      .flatMap((set) => set.identities))].sort() : [];
+    return { ...session, holderSet };
+  }));
+}
+
+/** C6-18: switch through the journaled publication; C6-20 supplies recovery. */
+export async function switchCodex(deps: CodexSwitchDeps, input: SwitchCodexInput): Promise<CodexSwitchResult> {
+  const admitted = await deps.admitted?.() ?? { ok: true };
+  if (!admitted.ok) return switchResult(admitted.reason ?? 'not-admitted');
+  const preflight = await preflightCodexLive(deps);
+  if (preflight.kind === 'refused') return switchResult(preflight.reason);
+  const preconditions = checkCodexSwitchPreconditions(deps, input);
+  if (preconditions.kind === 'refused') return switchResult(preconditions.reason);
+  if (!deps.authPath || !deps.journalDir || !deps.slots || !deps.list) throw new Error('Codex switch dependencies are required');
+
+  const options: CodexSwitchJournalOptions = { ...deps.journalOptions, journalDir: deps.journalDir, now: deps.now };
+  let freshenRound = 0;
+  // One budget for the attempt: the first observation plus five restarts (§4.4.1 steps 1 and 4).
+  let observeRestarts = 0;
+  while (freshenRound < 2) {
+    await deps.hooks?.beforeFreshenLock?.();
+    const freshen = await freshenCodexTarget(deps, { target: input.target, now: deps.now() });
+    if (freshen.kind === 'refused') return switchRefusal(deps, input, freshen.reason);
+    let journalExists = false; let released = false; let renamed = false; let commitFailed = false;
+    let committed: CodexSwitchResult | undefined;
+    try {
+      const result = await withCodexSwitchLocks(deps, async (assertHeld) => {
+        const fence = codexRecoveryFenceState(deps.journalDir!, deps.store);
+        if (fence.state === 'fenced') return { result: switchResult(fence.reason, fence.message) };
+        assertHeld();
+        const again = checkCodexSwitchPreconditions(deps, input);
+        if (again.kind === 'refused') return { result: switchResult(again.reason) };
+        // A changed file restarts at step 2 under the same locks, never at the freshen.
+        for (;; observeRestarts += 1) {
+          if (observeRestarts > 5) return { result: switchRefusal(deps, input, 'codex-writing') };
+          let live: ObserveLiveCodexResult;
+          try { live = await observeLiveCodex(deps, assertHeld); } catch (error) {
+            if (error instanceof CodexLiveChanged) continue;
+            throw error;
+          }
+          if (live.outcome === 'refused') return { result: switchRefusal(deps, input, live.reason) };
+          const outgoing = live.outgoing;
+          if (codexIdentity(outgoing.document) === input.target) {
+            assertHeld(); const now = deps.now();
+            const id = deps.store.commitCodexSwitch({ now, accountId: input.target, setBy: input.trigger === 'manual' ? 'manual' : 'auto',
+              fromAccount: input.target, toAccount: input.target, trigger: input.trigger, outcome: 'noop', attempt: deps.attempt,
+              via: 'switch', openSessionsJson: '[]', publishedAt: null, committedAt: now, outgoing: input.target, target: input.target,
+              observation: { identity: input.target, lineageFp: codexFingerprint(outgoing.document) },
+              decision: { leftHeadroom: null, leftRecoveryAt: null, leftTrigger: null } });
+            committed = { outcome: 'noop', switchId: id, attemptId: deps.attempt };
+            return { result: committed };
+          }
+          const target = deps.slots!.readSlot(input.target, { fresh: true });
+          const targetIdentity = codexIdentity(target.document); const targetRow = deps.store.getCodexSlot(input.target);
+          if (!targetIdentity || targetIdentity !== input.target || targetRow?.fingerprint !== codexFingerprint(target.document)) {
+            return { result: switchRefusal(deps, input, 'target-slot-split') };
+          }
+          if (!expiresAfter(target.document, deps.now() + 300_000)) return { retryFreshen: true };
+          const sessions = await deps.list!(); const cas = await deps.readLive();
+          if (!sameLiveObservation({ status: 'ok', doc: outgoing.document, sha256: outgoing.sha256, inode: outgoing.inode }, cas)) continue;
+          assertHeld();
+          const decision = journalDecision(input.decision);
+          // C6-10 owner identity: the same `ps lstart` that stillTheSameProcess compares.
+          const owner = deps.journalOwner ?? { pid: process.pid, lstart: await processLstart(process.pid) ?? '' };
+          return withCodexSwitchJournalOwner(options, async (held) => {
+            assertHeld(); held.assertHeld();
+            const publishedAt = deps.now();
+            const journal: CodexSwitchJournal = { v: 2, attemptId: deps.attempt,
+              from: codexIdentity(outgoing.document) ?? deps.store.getCodexActiveLogin() ?? '', to: input.target,
+              target: { identity: codexIdentityParts(targetIdentity), fingerprint: codexFingerprint(target.document) }, adoptingTarget: [], trigger: input.trigger,
+              decision, openSessions: sessions, outgoing: { sha256: outgoing.sha256, inode: outgoing.inode }, publishedAt,
+              owner: { ...owner, state: 'active' } };
+            if (!journal.from) throw new Error('Codex switch outgoing identity is required');
+            writeCodexSwitchJournal(journal, options); journalExists = true;
+            try {
+              assertHeld(); held.assertHeld();
+              const publish = await publishCodexAuth(deps.authPath!, target.document); renamed = publish.stage === 'published';
+              if (renamed) await deps.hooks?.afterRename?.();
+              assertHeld(); held.assertHeld(); await deps.hooks?.beforeVerify?.();
+              const classified = classifyPostPublish({ journal, publish, observed: await deps.readLive(), targetSlotFp: targetRow.fingerprint! });
+              if (classified !== 'ok' && classified !== 'not-landed') throw new Error('codex-switch-external-unhandled');
+              assertHeld(); held.assertHeld(); const now = deps.now(); const outcome = classified === 'ok' ? 'ok' : 'failed';
+              let id: number;
+              try {
+                id = deps.store.commitCodexSwitch({ now, accountId: outcome === 'ok' ? input.target : journal.from,
+                  setBy: input.trigger === 'manual' ? 'manual' : 'auto', fromAccount: journal.from, toAccount: input.target,
+                  trigger: input.trigger, outcome, attempt: deps.attempt, via: 'switch', openSessionsJson: openSessionsJson(deps, sessions),
+                  // I11: a not-landed row is the Q1 marker, so it never carries a publish time.
+                  publishedAt: outcome === 'ok' ? publishedAt : null, committedAt: now, detail: outcome === 'failed' ? 'not-published' : null,
+                  outgoing: journal.from, target: input.target,
+                  observation: { identity: outcome === 'ok' ? input.target : journal.from,
+                    lineageFp: outcome === 'ok' ? journal.target.fingerprint : codexFingerprint(outgoing.document) },
+                  decision: { leftHeadroom: decision?.leftHeadroom ?? null, leftRecoveryAt: decision?.leftRecoveryAtMs ?? null,
+                    leftTrigger: decision?.leftTrigger ?? null } });
+              } catch (error) { commitFailed = true; throw error; }
+              committed = { outcome, switchId: id, attemptId: deps.attempt,
+                ...(outcome === 'ok' ? { watch: { state: 'pending' as const, until: now + 300_000 } } : {}) };
+              assertHeld(); held.assertHeld(); deleteCodexSwitchJournalIf(deps.journalDir!, deps.attempt, held, options); journalExists = false;
+              return { result: committed };
+            } catch (error) {
+              // C6-10: a kept journal is released before the owner lock is.
+              try { releaseCodexSwitchJournalHeld(held, deps.attempt, options); released = true; } catch { /* re-acquired below */ }
+              throw error;
+            }
+          });
+        }
+      });
+      if ('retryFreshen' in result) { freshenRound += 1; continue; }
+      return result.result;
+    } catch (error) {
+      if (journalExists && !released) {
+        try { await releaseCodexSwitchJournal(deps.attempt, options); } catch { /* preserved journal wins */ }
+      }
+      if (error instanceof ClaudeCodeLockTimeout) return switchRefusal(deps, input, 'switch-busy');
+      if (error instanceof ProperLockfileCompromised || error instanceof CodexAuthLockCompromised) {
+        if (committed) return { ...committed, lockLostAfterCommit: true };
+        if (renamed) return { outcome: 'failed', reason: 'lock-lost-after-publish', attemptId: deps.attempt };
+        return switchResult('lock-lost');
+      }
+      // Only the commit itself maps to commit-failed; a committed attempt keeps its outcome.
+      if (committed) return committed;
+      if (commitFailed) return { outcome: 'failed', reason: 'commit-failed', attemptId: deps.attempt };
+      throw error;
+    } finally { finishCodexSwitchAttempt(deps.attempt); }
+  }
+  return switchRefusal(deps, input, 'target-freshen-too-close');
 }
