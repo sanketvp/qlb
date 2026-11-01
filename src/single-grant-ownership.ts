@@ -42,6 +42,7 @@ export interface SingleGrantKeychainCoords {
 
 export class JournalKeychainInvalidError extends Error {
   readonly code = 'journal-keychain-invalid';
+  readonly exitCode = 3;
 
   constructor() {
     super('journal-keychain-invalid');

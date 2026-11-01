@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { describe, it, mock } from 'node:test';
@@ -655,13 +655,174 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
           breakIt(h);
           const before = snapshotRestage(h, provider);
           kc.deleteCalls.length = 0;
-          assert.throws(() => h.mig.stage(), /journal-keychain-invalid/, name);
+          assert.throws(
+            () => h.mig.stage(),
+            (error: unknown) => (error as { code?: unknown }).code === 'journal-keychain-invalid'
+              && (error as { exitCode?: unknown }).exitCode === 3,
+            name,
+          );
           assert.deepEqual(kc.deleteCalls, [], `${name}: nothing deleted`);
           assert.deepEqual(snapshotRestage(h, provider), before, name);
           assert.ok(kc.getSync(legacy.service, legacy.account), name);
         } finally {
           h.cleanup();
         }
+      }
+    });
+
+    it(`T-KC11f [${provider}] a malformed staging file refuses before deleting the old staged copy`, () => {
+      const legacy = legacyKmCoords(provider);
+      const kc = new DeleteTrackingKeychain();
+      const h = oldPreCommitFixture(provider, 'MIRRORED', kc);
+      try {
+        writeFileSync(h.staging, '{ malformed staging owner file');
+        const before = snapshotRestage(h, provider);
+        kc.deleteCalls.length = 0;
+
+        assert.throws(
+          () => h.mig.stage(),
+          (error: unknown) => (error as { code?: unknown }).code === 'journal-keychain-invalid'
+            && (error as { exitCode?: unknown }).exitCode === 3,
+        );
+        assert.deepEqual(kc.deleteCalls, []);
+        assert.deepEqual(snapshotRestage(h, provider), before);
+        assert.ok(kc.getSync(legacy.service, legacy.account));
+      } finally {
+        h.cleanup();
+      }
+    });
+
+    it(`T-KC11h [${provider}] a dangling staging symlink refuses re-stage but rolls back like present staging`, () => {
+      const legacy = legacyKmCoords(provider);
+      const kc = new DeleteTrackingKeychain();
+      const h = oldPreCommitFixture(provider, 'VALIDATED', kc);
+      const normal = oldPreCommitFixture(provider, 'VALIDATED', new DeleteTrackingKeychain());
+      try {
+        rmSync(h.staging);
+        const target = join(h.dir, 'missing-staging-owner');
+        symlinkSync(target, h.staging);
+        const before = snapshotRestage(h, provider);
+        kc.deleteCalls.length = 0;
+
+        assert.throws(
+          () => h.mig.stage(),
+          (error: unknown) => (error as { code?: unknown }).code === 'journal-keychain-invalid'
+            && (error as { exitCode?: unknown }).exitCode === 3,
+        );
+        assert.deepEqual(kc.deleteCalls, []);
+        assert.deepEqual(snapshotRestage(h, provider), before);
+        assert.equal(readlinkSync(h.staging), target, 'the dangling staging symlink stays in place before recovery');
+        assert.ok(kc.getSync(legacy.service, legacy.account));
+        assert.equal(h.mig.status().ownerFile, 'staging', 'status reports the dangling staging path');
+
+        const rolled = h.mig.rollback();
+        const normalRolled = normal.mig.rollback();
+        assert.deepEqual(
+          {
+            state: rolled.state,
+            ownerFile: rolled.ownerFile,
+            nativeStore: rolled.nativeStore,
+            piAtNextLaunch: rolled.piAtNextLaunch,
+            resumeAction: rolled.resumeAction,
+          },
+          {
+            state: normalRolled.state,
+            ownerFile: normalRolled.ownerFile,
+            nativeStore: normalRolled.nativeStore,
+            piAtNextLaunch: normalRolled.piAtNextLaunch,
+            resumeAction: normalRolled.resumeAction,
+          },
+          'dangling staging recovers to the normal pre-commit rollback state',
+        );
+        assert.throws(
+          () => lstatSync(h.staging),
+          (error: unknown) => (error as { code?: unknown }).code === 'ENOENT',
+          'rollback removes the dangling staging symlink',
+        );
+        assert.throws(() => kc.getSync(legacy.service, legacy.account), /item not found/);
+      } finally {
+        normal.cleanup();
+        h.cleanup();
+      }
+    });
+
+    it(`T-KC11f [${provider}] foreign-owner and unreadable staging files refuse before deleting the old staged copy`, () => {
+      const legacy = legacyKmCoords(provider);
+      const cases: Array<[string, (h: OldFixture) => (() => void) | undefined]> = [
+        ['foreign owner', (h) => {
+          const owner = JSON.parse(readFileSync(h.staging, 'utf8')) as Record<string, unknown>;
+          owner.owner = 'pi';
+          writeFileSync(h.staging, JSON.stringify(owner, null, 2) + '\n');
+          return undefined;
+        }],
+        ['unreadable file', (h) => {
+          chmodSync(h.staging, 0o000);
+          return () => chmodSync(h.staging, 0o600);
+        }],
+      ];
+      for (const [name, makeInvalid] of cases) {
+        const kc = new DeleteTrackingKeychain();
+        const h = oldPreCommitFixture(provider, 'MIRRORED', kc);
+        let restore: (() => void) | undefined;
+        try {
+          restore = makeInvalid(h);
+          kc.deleteCalls.length = 0;
+
+          assert.throws(
+            () => h.mig.stage(),
+            (error: unknown) => (error as { code?: unknown }).code === 'journal-keychain-invalid'
+              && (error as { exitCode?: unknown }).exitCode === 3,
+            name,
+          );
+          assert.deepEqual(kc.deleteCalls, [], `${name}: nothing deleted`);
+          assert.ok(kc.getSync(legacy.service, legacy.account), `${name}: legacy item stays`);
+        } finally {
+          restore?.();
+          h.cleanup();
+        }
+      }
+    });
+
+    it(`T-KC11g [${provider}] an unparseable auth.json refuses before deleting a VALIDATED journal's old staged copy`, () => {
+      const legacy = legacyKmCoords(provider);
+      const invalidAuthJson: Array<[string, string, RegExp]> = [
+        ['not a JSON object', JSON.stringify('not an object'), /auth\.json is not a JSON object/],
+        ['no importable grant', '{}', /missing importable OAuth grant under key/],
+        ['no access and refresh', JSON.stringify({ [provider]: { type: 'oauth' } }), /is missing access\/refresh/],
+      ];
+      for (const [name, authJson, expected] of invalidAuthJson) {
+        const kc = new DeleteTrackingKeychain();
+        const h = oldPreCommitFixture(provider, 'VALIDATED', kc);
+        try {
+          writeFileSync(h.authPath, authJson + '\n');
+          const before = snapshotRestage(h, provider);
+          kc.deleteCalls.length = 0;
+
+          assert.throws(() => h.mig.stage(), expected, name);
+          assert.deepEqual(kc.deleteCalls, [], `${name}: nothing deleted`);
+          assert.deepEqual(snapshotRestage(h, provider), before, name);
+          assert.ok(kc.getSync(legacy.service, legacy.account), `${name}: legacy item stays`);
+        } finally {
+          h.cleanup();
+        }
+      }
+    });
+
+    it(`T-KC11g [${provider}] a missing auth.json refuses before deleting a VALIDATED journal's old staged copy`, () => {
+      const legacy = legacyKmCoords(provider);
+      const kc = new DeleteTrackingKeychain();
+      const h = oldPreCommitFixture(provider, 'VALIDATED', kc);
+      try {
+        rmSync(h.authPath);
+        const before = snapshotRestage(h, provider);
+        kc.deleteCalls.length = 0;
+
+        assert.throws(() => h.mig.stage(), /auth\.json not found/);
+        assert.deepEqual(kc.deleteCalls, []);
+        assert.deepEqual(snapshotRestage(h, provider), before);
+        assert.ok(kc.getSync(legacy.service, legacy.account));
+      } finally {
+        h.cleanup();
       }
     });
 
