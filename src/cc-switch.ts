@@ -439,7 +439,7 @@ async function switchClaudeAttempt(deps: ClaudeSwitchDeps, input: SwitchClaudeIn
           if (!outgoingLive) return refusal(deps, input, attempt, from, 'live-credential-empty');
           state.started.push(4); await deps.hooks?.afterStep4?.();
 
-          // Step 5: only own classifications can pass K5 interim routing.
+          // Step 5: preserve routed outgoing credentials before switching.
           const outgoingSlot = deps.slots.getSlot(from);
           if (outgoingSlot === null) return refusal(deps, input, attempt, from, 'active-login-unset');
           const outgoing = { accountId: outgoingSlot.accountId, email: outgoingSlot.email ?? null, orgUuid: outgoingSlot.orgUuid ?? null, credential: await readSlotOrNull(deps, from) };
@@ -447,7 +447,15 @@ async function switchClaudeAttempt(deps: ClaudeSwitchDeps, input: SwitchClaudeIn
           try { classified = classifyOutgoingCredential({ outgoing, slots: prepared.slots, liveCredential: outgoingLive, provenance: prepared.prefetch, probeVerdict: input.probeVerdict }); } catch (error) { return failed(deps, input, attempt, from, 'outgoing-backup-failed', writeError(error, 'keychain-write-failed'), state, 5); }
           if (classified.kind === 'own-family' || classified.kind === 'own-rotated' || classified.kind === 'unresolved') {
             try { await deps.slots.writeSlot(from, outgoingLive, { cause: 'adopt', by: deps.by, evidence: classified.kind === 'own-rotated' ? 'oracle' : classified.kind === 'unresolved' ? null : 'lineage' }); } catch (error) { return failed(deps, input, attempt, from, 'outgoing-backup-failed', writeError(error, 'keychain-write-failed'), state, 5); }
-          } else if (classified.kind !== 'own-bytes') return refusal(deps, input, attempt, from, `outgoing-unrouted:${classified.kind}`);
+          } else if (classified.kind === 'foreign' || classified.kind === 'alien' || classified.kind === 'known-foreign' || (classified.kind === 'foreign-synced' && prepared.slots.find((slot) => slot.accountId === classified.foreignSlotId)?.credential !== outgoingLive)) {
+            const stashId = (deps.stashTimestamp ?? (() => defaultStashTimestamp(deps.now())))();
+            try {
+              await deps.slots.stashUnclaimed(stashId, outgoingLive, undefined, classified.foreignSlotId ?? undefined);
+              state.unclaimed = stashId;
+            } catch (error) {
+              return failed(deps, input, attempt, from, 'outgoing-backup-failed', writeError(error, 'keychain-write-failed'), state, 5);
+            }
+          } else if (classified.kind !== 'own-bytes' && classified.kind !== 'foreign-synced') return refusal(deps, input, attempt, from, `outgoing-unrouted:${classified.kind}`);
           state.started.push(5); await deps.hooks?.afterStep5?.();
 
           // Step 6: write intent before the staged Keychain copy.
