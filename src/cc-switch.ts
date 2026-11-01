@@ -129,6 +129,8 @@ export class AdmissionRefused extends Error {
 }
 /** Test-only interruption signal; transaction code deliberately does not convert it to a result. */
 export class CrashSignal extends Error { constructor(checkpoint: string) { super(checkpoint); this.name = 'CrashSignal'; } }
+/** Internal control flow: restart Phase A only after every Phase-B lock has released. */
+class RestartPhaseA extends Error { constructor() { super('restart Phase A'); this.name = 'RestartPhaseA'; } }
 
 function refused(reason: ClaudeSwitchPreconditionReason): Extract<ClaudeSwitchPreconditionsResult, { kind: 'refused' }> { return { kind: 'refused', reason }; }
 function activeAccount(deps: ClaudeSwitchDeps): string | null { const accountId = deps.store.getActiveLogin('anthropic')?.accountId; return accountId && deps.slots.getSlot(accountId) ? accountId : null; }
@@ -207,21 +209,21 @@ function writeError(error: unknown, fallback: 'keychain-write-failed' | 'config-
   const classified = classifySwitchError(error);
   return classified === 'switch-failed' ? fallback : classified;
 }
-function failed(deps: ClaudeSwitchDeps, input: SwitchClaudeInput, attempt: string, from: string | null, reason: string, error?: string, state = steps(), failedStep?: number): ClaudeSwitchResult {
+function failed(deps: ClaudeSwitchDeps, input: SwitchClaudeInput, attempt: string, from: string | null, reason: string, error?: string, state = steps(), failedStep?: number, publishedAt?: number | null): ClaudeSwitchResult {
   if (failedStep !== undefined) state.failedStep = failedStep;
   const result: ClaudeSwitchResult = { outcome: 'failed', from, to: input.to, reason, ...(error ? { error } : {}), attempt, injected: input.injected === true, steps: state, exitCode: 1 };
   try {
     deps.store.recordSwitch({
       ts: deps.now(), provider: 'anthropic', fromAccount: from, toAccount: input.to, trigger: input.trigger,
       outcome: 'failed', error: error ?? null, detail: reason, injected: input.injected === true,
-      stepsJson: JSON.stringify({ ...state, attempt }),
+      stepsJson: JSON.stringify({ ...state, attempt }), ...(publishedAt !== undefined ? { publishedAt } : {}),
     });
   } catch { warn(deps, 'could not record failed Claude switch'); }
   return result;
 }
 
 /** K5-5's non-rollback transaction. K8-2 replaces the step-7--9 failure return with rollback. */
-export async function switchClaude(deps: ClaudeSwitchDeps, input: SwitchClaudeInput): Promise<ClaudeSwitchResult> {
+async function switchClaudeAttempt(deps: ClaudeSwitchDeps, input: SwitchClaudeInput, retriedPhaseA: boolean): Promise<ClaudeSwitchResult> {
   const attempt = deps.attempt;
   const paths = deps.live.paths ?? claudePaths({ home: deps.home, env: deps.env });
   const live = deps.live.paths ? deps.live : { ...deps.live, paths };
@@ -265,13 +267,21 @@ export async function switchClaude(deps: ClaudeSwitchDeps, input: SwitchClaudeIn
           }
           const from = activeAccount(deps);
           if (from === null) return refusal(deps, input, attempt, null, 'active-login-unset');
+          // Phase A is lock-free. Its self-target freshen skip is valid only
+          // while the same account is active under the transaction locks.
+          if (prepared.active !== from) {
+            if (retriedPhaseA) return refusal(deps, input, attempt, from, 'active-changed');
+            if (prepared.active === input.to && from !== input.to) throw new RestartPhaseA();
+          }
           // Phase A has already admitted immutable inputs. Re-check mutable
           // breaker and C-swap admission while the transaction is serialized.
           const lockedCheck = checkClaudeSwitchPreconditions(deps, input);
           if (lockedCheck.kind === 'refused') return refusal(deps, input, attempt, from, lockedCheck.reason);
           const target = deps.slots.getSlot(input.to)!;
           if (from === input.to) {
-            deps.store.recordSwitch({ ts: deps.now(), provider: 'anthropic', fromAccount: from, toAccount: input.to, trigger: input.trigger, outcome: 'noop', injected: input.injected === true, stepsJson: JSON.stringify({ attempt }) });
+            try {
+              deps.store.recordSwitch({ ts: deps.now(), provider: 'anthropic', fromAccount: from, toAccount: input.to, trigger: input.trigger, outcome: 'noop', injected: input.injected === true, stepsJson: JSON.stringify({ attempt }) });
+            } catch { warn(deps, 'could not record noop Claude switch'); }
             return { outcome: 'noop', from, to: input.to, attempt, injected: input.injected === true, steps: state, exitCode: 0 };
           }
           let outgoingLive: string;
@@ -341,14 +351,14 @@ export async function switchClaude(deps: ClaudeSwitchDeps, input: SwitchClaudeIn
               journalUpdate(ownerHeld, { configWritten: true }, options);
             });
             state.started.push(8); await deps.hooks?.afterStep8?.(); deps.crashAt?.('after-step-8');
-          } catch (error) { if (isCrash(error)) throw error; return failed(deps, input, attempt, from, 'step-8', writeError(error, 'config-write-failed'), state, 8); }
+          } catch (error) { if (isCrash(error)) throw error; return failed(deps, input, attempt, from, 'step-8', writeError(error, 'config-write-failed'), state, 8, publishedAt); }
           // Step 9 plus the finished-marker cleanup sequence.
           let switchId: number;
           try {
             await deps.hooks?.beforeStep9?.();
             switchId = deps.store.commitClaudeSwitch({ now: deps.now(), fromAccount: from, toAccount: input.to, trigger: input.trigger, setBy: input.trigger === 'manual' ? 'manual' : 'auto', attempt, outgoingKind: classified.kind, bindingJson: input.bindingJson ?? null, stepsJson: JSON.stringify(state), publishedAt, injected: input.injected === true, detail: null, republish: false, decision: input.decision ?? noDecision() });
             state.started.push(9); deps.crashAt?.('after-commit');
-          } catch (error) { if (isCrash(error)) throw error; return failed(deps, input, attempt, from, 'step-9', classifySwitchError(error), state, 9); }
+          } catch (error) { if (isCrash(error)) throw error; return failed(deps, input, attempt, from, 'step-9', classifySwitchError(error), state, 9, publishedAt); }
           try { journalUpdate(ownerHeld, { committed: deps.now() }, options); } catch (error) { state.cleanup.push(classifySwitchError(error)); }
           if (state.cleanup.length === 0) try { await deleteStagedRollback(live.backend, stagedBlobService); } catch (error) { state.cleanup.push(classifySwitchError(error)); }
           if (state.cleanup.length === 0) try { journalRemove(ownerHeld, options); } catch (error) { state.cleanup.push(classifySwitchError(error)); }
@@ -360,7 +370,7 @@ export async function switchClaude(deps: ClaudeSwitchDeps, input: SwitchClaudeIn
       } catch (error) {
         if (isCrash(error)) throw error;
         if ((error instanceof ClaudeCodeLockTimeout || error instanceof ProperLockfileCompromised) && ownerResult !== undefined) {
-          if (ownerResult.outcome === 'ok') {
+          if (ownerResult.outcome === 'ok' && !ownerResult.steps?.cleanup.includes('lock-timeout')) {
             ownerResult.steps?.cleanup.push('lock-timeout');
           }
           return ownerResult;
@@ -378,7 +388,12 @@ export async function switchClaude(deps: ClaudeSwitchDeps, input: SwitchClaudeIn
     return result;
   } catch (error) {
     if (isCrash(error)) throw error;
+    if (error instanceof RestartPhaseA) return switchClaudeAttempt(deps, input, true);
     if (error instanceof ClaudeCodeLockTimeout || error instanceof ProperLockfileCompromised) return refusal(deps, input, attempt, activeAccount(deps), 'lock-timeout');
     throw error;
   }
+}
+
+export async function switchClaude(deps: ClaudeSwitchDeps, input: SwitchClaudeInput): Promise<ClaudeSwitchResult> {
+  return switchClaudeAttempt(deps, input, false);
 }

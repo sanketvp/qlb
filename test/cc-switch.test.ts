@@ -364,6 +364,82 @@ describe('Claude switch transaction (K5-5)', () => {
     assert.deepEqual({ outcome: result.outcome, from: result.from, to: result.to, exitCode: result.exitCode }, { outcome: 'noop', from: 'account-a', to: 'account-a', exitCode: 0 });
   });
 
+  it('a target that was active in Phase A but is no longer active under the lock restarts Phase A once, freshens and commits', async () => {
+    const subject = await transactionFixture();
+    const events: string[] = [];
+    let inSwitch = false;
+    let inCredential = false;
+    let inOwner = false;
+    let switchCalls = 0;
+    subject.deps.store.setActiveLogin('anthropic', 'account-b', 'manual', NOW);
+    await subject.slots.writeSlot('account-b', credential('b', NOW + 10 * 60_000), { cause: 'post' });
+    subject.deps.consume.postRefresh = async () => {
+      assert.equal(inSwitch || inCredential || inOwner, false, 'freshening must happen after every transaction lock releases');
+      events.push('freshen');
+      return { status: 200, body: JSON.stringify({ access_token: 'fixture-issued', refresh_token: 'fixture-refresh-issued', expires_in: 3600 }) };
+    };
+    subject.deps.locks = {
+      switch: (async (fn: () => Promise<unknown>, options: unknown) => {
+        events.push('switch+'); inSwitch = true;
+        if (++switchCalls === 1) subject.deps.store.setActiveLogin('anthropic', 'account-a', 'manual', NOW);
+        try { return await withClaudeSwitchLock(fn, options as never); }
+        finally { inSwitch = false; events.push('switch-'); }
+      }) as unknown as NonNullable<ClaudeSwitchDeps['locks']>['switch'],
+      credential: (async (options: unknown, fn: (value: unknown) => Promise<unknown>) => {
+        events.push('credential+'); inCredential = true;
+        try { return await withClaudeCredentialLocks(options as never, fn as never); }
+        finally { inCredential = false; events.push('credential-'); }
+      }) as unknown as NonNullable<ClaudeSwitchDeps['locks']>['credential'],
+      owner: (async (options: unknown, fn: (value: unknown) => Promise<unknown>) => {
+        events.push('owner+'); inOwner = true;
+        try { return await withClaudeSwitchJournalOwner(options as never, fn as never); }
+        finally { inOwner = false; events.push('owner-'); }
+      }) as unknown as NonNullable<ClaudeSwitchDeps['locks']>['owner'],
+    };
+    const result = await switchClaude(subject.deps, manual);
+    assert.equal(result.outcome, 'ok');
+    assert.equal(switchCalls, 2);
+    assert.deepEqual(events, [
+      'switch+', 'credential+', 'owner+', 'owner-', 'credential-', 'switch-',
+      'freshen',
+      'switch+', 'credential+', 'owner+', 'owner-', 'credential-', 'switch-',
+    ]);
+  });
+
+  it('a second invalidation on the retry refuses active-changed with exit 3 and writes nothing but the refusal row', async () => {
+    const subject = await transactionFixture();
+    let switchCalls = 0;
+    subject.deps.store.setActiveLogin('anthropic', 'account-b', 'manual', NOW);
+    const liveBefore = await subject.backend.get(subject.paths.keychainService, 'fixture-user');
+    const configBefore = readFileSync(subject.paths.globalConfigPath, 'utf8');
+    subject.deps.locks = {
+      switch: (async (fn: () => Promise<unknown>, options: unknown) => {
+        switchCalls += 1;
+        if (switchCalls === 1) subject.deps.store.setActiveLogin('anthropic', 'account-a', 'manual', NOW);
+        if (switchCalls === 2) subject.deps.store.setActiveLogin('anthropic', 'account-a', 'manual', NOW);
+        try { return await withClaudeSwitchLock(fn, options as never); }
+        finally { if (switchCalls === 1) subject.deps.store.setActiveLogin('anthropic', 'account-b', 'manual', NOW); }
+      }) as unknown as NonNullable<ClaudeSwitchDeps['locks']>['switch'],
+    };
+    const result = await switchClaude(subject.deps, manual);
+    assert.deepEqual({ outcome: result.outcome, reason: result.reason, exitCode: result.exitCode }, { outcome: 'refused', reason: 'active-changed', exitCode: 3 });
+    assert.equal(switchCalls, 2);
+    assert.equal(await subject.backend.get(subject.paths.keychainService, 'fixture-user'), liveBefore);
+    assert.equal(readFileSync(subject.paths.globalConfigPath, 'utf8'), configBefore);
+    assert.equal(existsSync(join(subject.deps.journalDir!, 'switch-anthropic.json')), false);
+    assert.equal(subject.rows.length, 1);
+    assert.equal((subject.rows[0] as { outcome: string }).outcome, 'refused');
+  });
+
+  it('a noop row-write failure returns noop with a warning instead of throwing', async () => {
+    const subject = await transactionFixture();
+    subject.deps.store.recordSwitch = () => { throw new Error('sqlite write failed'); };
+    const result = await switchClaude(subject.deps, { to: 'account-a', trigger: 'manual' });
+    assert.equal(result.outcome, 'noop');
+    assert.equal(result.exitCode, 0);
+    assert.equal(subject.warnings.length, 1);
+  });
+
   it('an empty live item refuses before classification and writes nothing', async () => {
     const subject = await transactionFixture();
     await subject.backend.delete(subject.paths.keychainService, 'fixture-user');
@@ -951,6 +1027,14 @@ describe('Claude switch transaction (K5-5)', () => {
     }]);
   });
 
+  it('a failed step-8 switch_log row records the step-7 publishedAt time', async () => {
+    const subject = await transactionFixture();
+    subject.deps.live.writeText = () => { throw new Error('config write failed'); };
+    const result = await switchClaude(subject.deps, manual);
+    assert.deepEqual({ outcome: result.outcome, reason: result.reason }, { outcome: 'failed', reason: 'step-8' });
+    assert.equal((subject.rows[0] as { publishedAt?: number }).publishedAt, NOW);
+  });
+
   it('a failed step-7 writes one failed switch_log row', async () => {
     const subject = await transactionFixture();
     subject.deps.live.backend = {
@@ -1005,6 +1089,26 @@ describe('Claude switch transaction (K5-5)', () => {
     assert.deepEqual(result.steps?.cleanup, ['lock-timeout']);
     assert.equal(subject.refusals.length, 0);
     assert.equal(warnings.length, 1);
+  });
+
+  it('dedupes lock-timeout when the post-commit journal update and owner-lock exit both report the compromise', async () => {
+    const subject = await transactionFixture();
+    subject.deps.journalOps = {
+      update: (held, patch, options) => {
+        if (patch.committed !== undefined) throw new ProperLockfileCompromised('/fixture/journal.lock');
+        return updateClaudeSwitchJournal(held, patch, options);
+      },
+      remove: deleteClaudeSwitchJournal,
+    };
+    subject.deps.locks = {
+      owner: async (options, fn) => {
+        await withClaudeSwitchJournalOwner(options, fn);
+        throw new ProperLockfileCompromised('/fixture/journal.lock');
+      },
+    };
+    const result = await switchClaude(subject.deps, manual);
+    assert.equal(result.outcome, 'ok');
+    assert.deepEqual(result.steps?.cleanup, ['lock-timeout']);
   });
 
   it('a Phase-C afterSwitch error is warned and does not replace the committed ok result', async () => {
