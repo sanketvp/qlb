@@ -3628,9 +3628,15 @@ describe('Codex watch tick — C6-21', () => {
       try {
         let clock = 1_700_000_000_000;
         const waits: number[] = [];
-        const result = await h.runWith({ now: () => clock, sleep: async (ms) => { waits.push(ms); clock += ms; } });
+        const admissions: Array<string | undefined> = [];
+        const result = await h.runWith({
+          now: () => clock,
+          sleep: async (ms) => { waits.push(ms); clock += ms; },
+          admitted: (trigger) => { admissions.push(trigger); return { ok: true }; },
+        });
         assert.equal(result.outcome, 'ok');
         assert.deepEqual(waits, [1_000, 4_000, 25_000]);
+        assert.deepEqual(admissions, ['manual', 'manual', 'manual', 'manual'], 'initial admission plus all three ticks');
         assert.deepEqual(result.watch, { state: 'pending', until: 1_700_000_300_000 });
       } finally { close(h); }
     });
@@ -3657,6 +3663,8 @@ describe('Codex watch tick — C6-21', () => {
         } });
         assert.equal(result.outcome, 'ok');
         assert.deepEqual(result.watch, { state: 'stopped', reason: 'logged-out' });
+        assert.equal(rows(h).length, 1, 'logged-out writes no watch result row');
+        assert.equal(watchRows(h), 0, 'the terminal foreground stop consumes the durable row');
       } finally { close(h); }
     });
 
@@ -3666,13 +3674,108 @@ describe('Codex watch tick — C6-21', () => {
         const result = await h.runWith({ sleep: async () => undefined });
         assert.equal(result.outcome, 'ok');
         const due = h.db.prepare('SELECT next_at, until FROM codex_watch').get() as { next_at: number; until: number };
+        const admissions: Array<string | undefined> = [];
+        const admitted = (trigger?: string) => { admissions.push(trigger); return { ok: true }; };
         await runDueCodexWatches(h.deps({ authPath: h.authPath, dbPath: h.store.dbPath, journalDir: join(h.root, 'journal'), keychain: h.keychain,
           slots: h.slots as never, list: async () => [], readLive: () => readCodexAuthStableWithStat(h.authPath, { delayMs: 0 }),
-          authLockOptions: { home: h.root, timeoutMs: 50, retryMinMs: 1, retryJitterMs: 1 }, now: () => due.next_at }), due.next_at);
+          authLockOptions: { home: h.root, timeoutMs: 50, retryMinMs: 1, retryJitterMs: 1 }, now: () => due.next_at, admitted }), due.next_at);
         assert.equal((h.db.prepare('SELECT next_at FROM codex_watch').get() as { next_at: number }).next_at, due.until);
         await runDueCodexWatches(h.deps({ authPath: h.authPath, dbPath: h.store.dbPath, journalDir: join(h.root, 'journal'), keychain: h.keychain,
           slots: h.slots as never, list: async () => [], readLive: () => readCodexAuthStableWithStat(h.authPath, { delayMs: 0 }),
-          authLockOptions: { home: h.root, timeoutMs: 50, retryMinMs: 1, retryJitterMs: 1 }, now: () => due.until }), due.until);
+          authLockOptions: { home: h.root, timeoutMs: 50, retryMinMs: 1, retryJitterMs: 1 }, now: () => due.until, admitted }), due.until);
+        assert.deepEqual(admissions, ['manual', 'manual'], 'both +2 and +5 minute ticks ran');
+        assert.equal(watchRows(h), 0);
+      } finally { close(h); }
+    });
+
+    it('a foreground stopped watch consumes not-admitted and superseded rows so the due consumer cannot resume either one', async () => {
+      for (const terminal of ['not-admitted', 'superseded'] as const) {
+        const h = switchHarness();
+        try {
+          let clock = 1_700_000_000_000;
+          let checks = 0;
+          const result = await h.runWith({
+            now: () => clock,
+            admitted: () => ({ ok: terminal !== 'not-admitted' || ++checks === 1, reason: 'not-admitted' }),
+            sleep: async (ms) => {
+              clock += ms;
+              if (terminal === 'superseded' && clock === 1_700_000_001_000) {
+                h.store.recordSwitch({ ts: clock, provider: 'openai-codex', fromAccount: 'b:account', toAccount: 'a:account', trigger: 'manual',
+                  outcome: 'ok', stepsJson: JSON.stringify({ attempt: 'later', via: 'switch' }), publishedAt: clock });
+              }
+            },
+          });
+          assert.deepEqual(result.watch, { state: 'stopped', reason: terminal });
+          assert.equal(watchRows(h), 0, `${terminal}: foreground consumed the terminal watch`);
+          const before = switchRows(h.db);
+          await runDueCodexWatches(h.deps({ now: () => 1_700_000_120_000 }), 1_700_000_120_000);
+          assert.deepEqual(switchRows(h.db), before, `${terminal}: later due pass did nothing`);
+        } finally { close(h); }
+      }
+    });
+
+    it('a foreground tick error returns the committed outcome and leaves its durable watch for C8', async () => {
+      const h = switchHarness();
+      try {
+        let verifying = false;
+        let readsAfterVerify = 0;
+        const result = await h.runWith({
+          hooks: { beforeVerify: () => { verifying = true; } },
+          readLive: async () => {
+            if (verifying && ++readsAfterVerify === 2) throw new Error('fixture foreground tick error');
+            return readCodexAuthStableWithStat(h.authPath, { delayMs: 0 });
+          },
+        });
+        assert.equal(result.outcome, 'ok');
+        assert.equal(watchRows(h), 1);
+      } finally { close(h); }
+    });
+
+    it('a lock timeout at +1 s still runs the +5 s and +30 s foreground ticks', async () => {
+      const h = switchHarness();
+      try {
+        let clock = 1_700_000_000_000;
+        let releaseLock!: () => void;
+        let lockReady!: () => void;
+        const lockHeld = new Promise<void>((resolve) => { releaseLock = resolve; });
+        const lockIsReady = new Promise<void>((resolve) => { lockReady = resolve; });
+        let lockOwner: Promise<unknown> | undefined;
+        const admissions: Array<string | undefined> = [];
+        const result = await h.runWith({
+          now: () => clock,
+          authLockOptions: { home: h.root, timeoutMs: 5, retryMinMs: 1, retryJitterMs: 1 },
+          admitted: (trigger) => { admissions.push(trigger); return { ok: true }; },
+          sleep: async (ms) => {
+            clock += ms;
+            if (clock === 1_700_000_001_000) {
+              lockOwner = withCodexAuthLock({ home: h.root, timeoutMs: 50, retryMinMs: 1, retryJitterMs: 1 }, async () => {
+                lockReady(); await lockHeld;
+              });
+              await lockIsReady;
+            }
+            if (clock === 1_700_000_005_000) { releaseLock(); await lockOwner; }
+          },
+        });
+        assert.equal(result.outcome, 'ok');
+        assert.deepEqual(admissions, ['manual', 'manual', 'manual', 'manual']);
+      } finally { close(h); }
+    });
+
+    it('runDueCodexWatches reads the clock again before each tick and drops a row that became overdue', async () => {
+      const h = switchHarness();
+      try {
+        const result = await h.runWith({ sleep: async () => undefined });
+        assert.equal(result.outcome, 'ok');
+        const row = h.db.prepare('SELECT until FROM codex_watch').get() as { until: number };
+        const started = row.until + 59_999;
+        codexWrites(h, observedDocument('a', 'late-after-lock-wait'));
+        const before = switchRows(h.db);
+        await runDueCodexWatches(h.deps({
+          authPath: h.authPath, dbPath: h.store.dbPath, journalDir: join(h.root, 'journal'), keychain: h.keychain,
+          slots: h.slots as never, list: async () => [], readLive: () => readCodexAuthStableWithStat(h.authPath, { delayMs: 0 }),
+          authLockOptions: { home: h.root, timeoutMs: 50, retryMinMs: 1, retryJitterMs: 1 }, now: () => row.until + 60_000,
+        }), started);
+        assert.deepEqual(switchRows(h.db), before, 'overdue consumption writes no retroactive verdict');
         assert.equal(watchRows(h), 0);
       } finally { close(h); }
     });
@@ -3681,7 +3784,8 @@ describe('Codex watch tick — C6-21', () => {
       const h = switchHarness();
       try {
         let clock = 1_700_000_000_000;
-        await assert.rejects(h.runWith({ now: () => clock, sleep: async (ms) => { clock += ms; throw new Error('fixture crash'); } }), /fixture crash/);
+        const interrupted = await h.runWith({ now: () => clock, sleep: async (ms) => { clock += ms; throw new Error('fixture crash'); } });
+        assert.equal(interrupted.outcome, 'ok', 'an in-process foreground error keeps the committed outcome');
         assert.equal(watchRows(h), 1);
         await runDueCodexWatches(h.deps({ authPath: h.authPath, dbPath: h.store.dbPath, journalDir: join(h.root, 'journal'), keychain: h.keychain,
           slots: h.slots as never, list: async () => [], readLive: () => readCodexAuthStableWithStat(h.authPath, { delayMs: 0 }),
@@ -3726,10 +3830,20 @@ describe('Codex watch tick — C6-21', () => {
       const h = switchHarness();
       try {
         let clock = 1_700_000_000_000;
-        const result = await h.runWith({ now: () => clock, sleep: async (ms) => {
-          clock += ms; if (clock === 1_700_000_001_000) codexWrites(h, observedDocument('a', 'a-session-save'));
-        } });
+        let preRenameSave = false;
+        const savedBeforeRename = observedDocument('a', 'a-session-save-before-rename');
+        const savedDuringWatch = observedDocument('a', 'a-session-save-during-watch');
+        const result = await h.runWith({
+          now: () => clock,
+          hooks: { beforeRename: () => { preRenameSave = true; codexWrites(h, savedBeforeRename); } },
+          sleep: async (ms) => {
+            clock += ms;
+            if (clock === 1_700_000_001_000) codexWrites(h, savedDuringWatch);
+          },
+        });
+        assert.equal(preRenameSave, true, 'a Codex save landed after CAS and before QLB renamed B');
         assert.equal(result.outcome, 'reverted-by-codex');
+        assert.deepEqual(slotFps(h, 'a:account'), { db: codexFingerprint(savedDuringWatch), keychain: codexFingerprint(savedDuringWatch) });
         assert.deepEqual(activeLogin(h), { account_id: 'a:account', set_by: 'adopt' });
       } finally { close(h); }
     });

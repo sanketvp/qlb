@@ -91,6 +91,8 @@ export interface CodexSwitchDeps {
   /** Test seams for ordered switch phases; production leaves them unset. */
   hooks?: {
     afterPost?: () => void | Promise<void>;
+    /** Test-only seam after CAS and journalling, immediately before QLB renames the target. */
+    beforeRename?: () => void | Promise<void>;
     afterRename?: () => void | Promise<void>;
     beforeVerify?: () => void | Promise<void>;
     beforeFreshenLock?: () => void | Promise<void>;
@@ -1522,13 +1524,24 @@ async function runForegroundCodexWatches(deps: CodexSwitchDeps, result: CodexSwi
     let tick: CodexWatchTickResult;
     try { tick = await codexWatchTick(deps, watch); }
     catch (error) {
-      if (error instanceof ClaudeCodeLockTimeout) return result;
+      // Contention at one foreground point does not cancel the remaining
+      // scheduled checks; the durable row still covers C8 after this window.
+      if (error instanceof ClaudeCodeLockTimeout) continue;
       throw error;
     }
     if (tick.state === 'reverted') return { ...result, outcome: 'reverted-by-codex', watch: { state: 'stopped', reason: 'reverted-by-codex' } };
-    if (tick.state === 'stopped') return { ...result, watch: { state: 'stopped', reason: tick.reason } };
+    // Consume foreground terminal results exactly as C8's durable consumer does.
+    // In particular, admission can change before C8 wakes, so a reported stop
+    // must never be resumed from its retained row.
+    if (tick.state === 'stopped') {
+      deps.store.deleteCodexWatch(watch.switchId);
+      return { ...result, watch: { state: 'stopped', reason: tick.reason } };
+    }
     if (tick.state === 'unresolved') return { ...result, watch: { state: 'unresolved', reason: tick.reason } };
-    if (tick.state === 'inconclusive') return { ...result, watch: { state: 'stopped', reason: 'inconclusive' } };
+    if (tick.state === 'inconclusive') {
+      deps.store.deleteCodexWatch(watch.switchId);
+      return { ...result, watch: { state: 'stopped', reason: 'inconclusive' } };
+    }
   }
   return result;
 }
@@ -1536,18 +1549,21 @@ async function runForegroundCodexWatches(deps: CodexSwitchDeps, result: CodexSwi
 /** C8 consumer: process only due persisted watches; foreground switching never calls this. */
 export async function runDueCodexWatches(deps: CodexSwitchDeps, now: number): Promise<void> {
   for (const watch of deps.store.listDueCodexWatches(now)) {
-    // X10b comes before every lock/recovery/read: an overdue watch has no retroactive verdict.
-    if (now >= watch.until + CODEX_WATCH_OVERDUE_MS) {
+    // The due query is intentionally one batch, but time-sensitive X10b
+    // decisions use the live clock for each row: lock waits can span a minute.
+    const tickNow = deps.now();
+    if (tickNow >= watch.until + CODEX_WATCH_OVERDUE_MS) {
       deps.store.deleteCodexWatch(watch.switchId);
       continue;
     }
-    const tick = await codexWatchTick({ ...deps, now: () => now }, watch);
+    const tick = await codexWatchTick(deps, watch);
+    const afterTickNow = deps.now();
     if (tick.state === 'reverted' || tick.state === 'stopped' || tick.state === 'inconclusive'
-      || (now >= watch.until && tick.state !== 'unresolved')) {
+      || (afterTickNow >= watch.until && tick.state !== 'unresolved')) {
       deps.store.deleteCodexWatch(watch.switchId);
       continue;
     }
-    const nextAt = [watch.publishedAt + 120_000, watch.until].find((at) => at > now);
+    const nextAt = [watch.publishedAt + 120_000, watch.until].find((at) => at > afterTickNow);
     // An unresolved final tick remains due: it is retried in the grace period until X10b deletes it.
     if (nextAt !== undefined) deps.store.advanceCodexWatch(watch.switchId, nextAt);
   }
@@ -1626,6 +1642,7 @@ export async function switchCodex(deps: CodexSwitchDeps, input: SwitchCodexInput
             if (!journal.from) throw new Error('Codex switch outgoing identity is required');
             writeCodexSwitchJournal(journal, options); journalExists = true;
             try {
+              assertHeld(); held.assertHeld(); await deps.hooks?.beforeRename?.();
               assertHeld(); held.assertHeld();
               const publish = await publishCodexAuth(deps.authPath!, target.document); renamed = publish.stage === 'published';
               if (renamed) await deps.hooks?.afterRename?.();
@@ -1772,7 +1789,7 @@ export async function switchCodex(deps: CodexSwitchDeps, input: SwitchCodexInput
         }
       });
       if ('retryFreshen' in result) { freshenRound += 1; continue; }
-      if (committedWatch && result.result.outcome === 'ok') return runForegroundCodexWatches(deps, result.result, committedWatch);
+      if (committedWatch && result.result.outcome === 'ok') return await runForegroundCodexWatches(deps, result.result, committedWatch);
       return result.result;
     } catch (error) {
       if (journalExists && !released) {
