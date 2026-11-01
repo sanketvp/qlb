@@ -30,7 +30,7 @@ import { sharedSingleGrantCoords, type RollbackDecision } from '../src/single-gr
 import { legacyPiAuthBackupPath, piAuthBackupPath, readPiAuthBackup, writePiAuthBackup } from '../src/pi-auth-backup';
 import { canonicalDigest, keychainDigest, restoreRecordFor } from '../src/pi-handback-source';
 import { bindDetectAndResync } from '../src/native-resync';
-import { hasLegacyPiOwnerEntry } from '../src/pi-migrate';
+import { hasLegacyPiOwnerEntry, isPiPlaceholder } from '../src/pi-migrate';
 import { openStore } from '../src/store';
 
 const fs = require('node:fs') as typeof import('node:fs');
@@ -214,7 +214,7 @@ interface Harness {
 function setup(
   provider: SingleGrantProvider,
   kc: MockKeychain = new MockKeychain(),
-  config: Pick<MigrationConfig, 'fsyncDirectory' | 'afterStep' | 'sleepSync' | 'now' | 'authLockTiming' | 'beforeOwnerFileRename'> = {},
+  config: Pick<MigrationConfig, 'fsyncDirectory' | 'afterStep' | 'afterWrite' | 'sleepSync' | 'now' | 'authLockTiming' | 'beforeOwnerFileRename'> = {},
 ): Harness & {
   mig: Migration;
 } {
@@ -337,7 +337,7 @@ function snapshotRestage(h: OldFixture, provider: 'xai' | 'kimi-coding'): unknow
 
 describe('generic single-grant migration — xai / kimi-coding / openai-codex', () => {
   for (const provider of SINGLE_GRANT_PROVIDERS) {
-    it(`happy path ${provider}: stage → rehearse → commit; accountId matches adapter; auth.json shadow-retained`, async () => {
+    it(`happy path ${provider}: stage → rehearse → commit; publishes v2 ownership and the auth placeholder`, async () => {
       const h = setup(provider);
       try {
         const before = readFileSync(h.authPath);
@@ -370,29 +370,104 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
         assert.equal(committed.nativeStore, 'intact', 'auth.json stays in place');
         assert.equal(committed.piAtNextLaunch, 'QLB works');
         assert.equal(committed.nativeStrategy, 'shadow-retain');
-        assert.deepEqual(
-          readFileSync(h.authPath),
-          h.originalBytes,
-          'commit must shadow-retain auth.json byte-identical',
-        );
         const parsed = JSON.parse(readFileSync(h.authPath, 'utf8')) as Record<string, unknown>;
-        assert.ok(parsed.xai, 'other providers remain in the shared file');
-        assert.ok(parsed['kimi-coding']);
-        assert.ok(parsed['openai-codex']);
-        const owner = JSON.parse(readFileSync(h.ownerPath, 'utf8')) as {
-          owner: string;
-          nativeStrategy?: string;
-          qlbAccountIds: string[];
+        assert.equal(isPiPlaceholder(parsed[provider]), true);
+        for (const other of SINGLE_GRANT_PROVIDERS) {
+          if (other !== provider) assert.deepEqual(parsed[other], FAKE_GRANTS[other]);
+        }
+        const owner = JSON.parse(readFileSync(join(h.dir, 'qlb-owner.json'), 'utf8')) as {
+          providers: Record<string, { mode: string }>;
         };
-        assert.equal(owner.owner, 'qlb');
-        assert.equal(owner.nativeStrategy, 'shadow-retain');
-        assert.deepEqual(owner.qlbAccountIds, [id]);
+        assert.equal(owner.providers[provider]?.mode, 'qlb');
+        assert.equal(existsSync(join(h.dir, `qlb-owner-${provider}.json`)), false, 'no legacy sidecar is published');
         assert.equal(keychainHas(h.kc, provider), true);
       } finally {
         h.cleanup();
       }
     });
   }
+
+  it('P7b6 commit writes the owner entry before the placeholder and resume completes it', async () => {
+    const h = setup('xai', new MockKeychain(), {
+      afterWrite: (point) => {
+        if (point === 'owner-entry') throw new Error('fixture crash after owner entry');
+      },
+    });
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      assert.throws(() => h.mig.commit(), /fixture crash after owner entry/);
+      const map = join(h.dir, 'qlb-owner.json');
+      assert.equal(JSON.parse(readFileSync(map, 'utf8')).providers.xai.mode, 'qlb');
+      assert.deepEqual(JSON.parse(readFileSync(h.authPath, 'utf8')).xai, FAKE_GRANTS.xai);
+      assert.ok(readPiAuthBackup(h.authPath, 'xai'));
+      const resumed = createSingleGrantMigration(h.store, h.kc, 'xai', h.authPath, h.ownerPath);
+      assert.equal(resumed.resume().state, 'QLB_OWNED');
+      assert.equal(isPiPlaceholder(JSON.parse(readFileSync(h.authPath, 'utf8')).xai), true);
+    } finally { h.cleanup(); }
+  });
+
+  it('P7b6 commit refuses a native entry whose lineage changed after stage', async () => {
+    const h = setup('xai');
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      const changed = JSON.parse(readFileSync(h.authPath, 'utf8')) as typeof FAKE_GRANTS;
+      changed.xai = { ...changed.xai, refresh: 'xai-refreshed-after-stage-fake' };
+      writeFileSync(h.authPath, JSON.stringify(changed, null, 2) + '\n');
+      const authBefore = readFileSync(h.authPath);
+      assert.throws(() => h.mig.commit(), /native entry changed since stage/);
+      assert.deepEqual(readFileSync(h.authPath), authBefore);
+      assert.equal(existsSync(join(h.dir, 'qlb-owner.json')), false);
+      assert.equal(keychainHas(h.kc, 'xai'), true);
+    } finally { h.cleanup(); }
+  });
+
+  it('P7b6 pre-commit rollback removes only this cycle backup', () => {
+    const h = setup('xai');
+    try {
+      h.mig.stage();
+      const detail = JSON.parse(h.store.getMigration('pi-xai')!.detail_json) as { authBackupCycle: string };
+      writePiAuthBackup(h.authPath, 'xai', detail.authBackupCycle);
+      h.mig.rollback();
+      assert.equal(readPiAuthBackup(h.authPath, 'xai'), null);
+      h.mig.stage();
+      writePiAuthBackup(h.authPath, 'xai', 'other-cycle');
+      h.mig.rollback();
+      assert.equal(readPiAuthBackup(h.authPath, 'xai')?.cycleId, 'other-cycle');
+    } finally { h.cleanup(); }
+  });
+
+  it('P7b6 VALIDATED shared-map ownership lets commit and resume finish hygiene', async () => {
+    const h = setup('xai');
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      const row = h.store.getMigration('pi-xai')!;
+      h.store.upsertMigration('pi-xai', 'VALIDATED', JSON.stringify({ ...JSON.parse(row.detail_json), commitGeneration: 0 }));
+      writeFileSync(join(h.dir, 'qlb-owner.json'), JSON.stringify({ providers: { xai: { mode: 'qlb', since: 1 } } }) + '\n');
+      assert.notEqual(h.mig.status().resumeAction, 'invalid published owner; run `qlb migrate rollback`');
+      assert.equal(h.mig.commit().state, 'QLB_OWNED');
+      assert.equal(isPiPlaceholder(JSON.parse(readFileSync(h.authPath, 'utf8')).xai), true);
+      assert.equal(h.mig.resume().state, 'QLB_OWNED');
+    } finally { h.cleanup(); }
+  });
+
+  it('P7b6 QLB_OWNED resume reports a stale native writer without replacing it', async () => {
+    const h = setup('xai');
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      h.mig.commit();
+      const native = JSON.parse(readFileSync(h.authPath, 'utf8')) as typeof FAKE_GRANTS;
+      native.xai = { ...FAKE_GRANTS.xai, refresh: 'xai-native-relogin-fake' };
+      writeFileSync(h.authPath, JSON.stringify(native, null, 2) + '\n');
+      const before = readFileSync(h.authPath);
+      assert.equal(h.mig.status().resumeAction, 'stale native writer: auth.json[xai] is not the placeholder; rollback or re-stage');
+      assert.equal(h.mig.resume().state, 'QLB_OWNED');
+      assert.deepEqual(readFileSync(h.authPath), before);
+    } finally { h.cleanup(); }
+  });
 
   for (const provider of ['xai', 'kimi-coding'] as const) {
     it(`T-KC4 [${provider}] rehearse reads the Keychain item the journal records`, async () => {

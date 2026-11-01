@@ -404,7 +404,7 @@ export function accountHealth(snap: AccountSnapshot): { health: HealthLevel; hea
 export function readOwnership(store: Store, provider: string): string {
   if (!isMigrateProvider(provider)) return 'n/a';
   try {
-    const ownerFile = provider === 'openrouter' ? DEFAULT_OWNER_FILE : defaultOwnerFileFor(provider);
+    const ownerFile = defaultOwnerFileFor(provider);
     const mig = isStaticKeyProvider(provider)
       ? createStaticKeyMigration(store, platformKeychain, provider, ownerFile, () => '')
       : isSingleGrantProvider(provider)

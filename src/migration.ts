@@ -102,7 +102,7 @@
 // renamed, because H2 is strictly after C and rollback restores native
 // strictly before unlinking the owner file.
 
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
 import { isCredentialNotFound } from './credential-backends';
 import {
@@ -129,7 +129,7 @@ import { fsyncDirSync } from './fsutil';
 import { qlbHomeDir } from './home';
 import type { KeychainBackend } from './keychain';
 import { openRouterMissingKeyMessage, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, readNativeOpenRouterKey } from './keychain';
-import { legacyPiAuthBackupPath, piAuthBackupPath, readPiAuthBackup, removePiAuthBackup, restorePiAuthEntryLocked, type PiAuthBackup } from './pi-auth-backup';
+import { legacyPiAuthBackupPath, piAuthBackupPath, readPiAuthBackup, removePiAuthBackup, restorePiAuthEntryLocked, writePiAuthBackup, type PiAuthBackup } from './pi-auth-backup';
 import { canonicalDigest, fencedGeneration, handbackVerdict, isValidEntry, keychainDigest, NoSingleGrantRestoreSourceError, rankSingleGrantSource, restoreRecordFor } from './pi-handback-source';
 import {
   JournalKeychainInvalidError,
@@ -141,7 +141,7 @@ import {
   type SingleGrantKeychainProvider,
 } from './single-grant-ownership';
 import { parseGrant } from './refresh-lease';
-import { hasLegacyPiOwnerEntry, isPiPlaceholder, PiOwnerLegacyError, readPiOwnerProviders, withPiAuthLock, writePiOwnerEntry, type AuthLockTiming } from './pi-migrate';
+import { hasLegacyPiOwnerEntry, isPiPlaceholder, piPlaceholder, PiOwnerLegacyError, readPiOwnerProviders, withPiAuthLock, writePiOwnerEntry, type AuthLockTiming } from './pi-migrate';
 import { validatePiOwnerDocument } from './pi-owner-document';
 import { OPENROUTER_GATE_KEYCHAIN_SERVICE } from './token/openrouter';
 import { refreshLeaseName, type Store } from './store';
@@ -241,9 +241,8 @@ export function migrationStoreNameFor(provider: string): string {
   return `pi-${provider}`;
 }
 
-export function defaultOwnerFileFor(provider: MigrateProvider): string {
-  if (provider === 'anthropic' || provider === 'openrouter') return DEFAULT_OWNER_FILE;
-  return join(dirname(config.piAuthJsonPath), `qlb-owner-${provider}.json`);
+export function defaultOwnerFileFor(_provider: MigrateProvider): string {
+  return DEFAULT_OWNER_FILE;
 }
 
 export function defaultNativePathFor(provider: MigrateProvider): string {
@@ -323,6 +322,7 @@ export class OwnerMapPresentError extends Error {
 
 /** Named crash points for MigrationConfig.afterStep; later rows add their own. */
 export type MigrationCrashPoint = 'S1' | 'S1-stage' | 'S1-legacy-delete' | 'S1-legacy-unlink' | 'S2-reads' | 'S2' | 'S4a' | 'S5' | 'S6c1';
+export type MigrationWritePoint = 'backup' | 'owner-entry' | 'placeholder';
 
 export interface MigrationConfig {
   kind?: MigrationKind;
@@ -351,6 +351,8 @@ export interface MigrationConfig {
   fsyncDirectory?: (path: string) => void;
   /** Test-only crash seam after a named hand-back step (design §6; row 22 adds `S6c1`). */
   afterStep?: (point: MigrationCrashPoint) => void;
+  /** Test-only crash seam for P7b6's ordered single-grant publication. */
+  afterWrite?: (point: MigrationWritePoint) => void;
   /** P7a's in-progress journal directory; defaults to ~/.qlb/journal. */
   piMigrateJournalDir?: string;
 }
@@ -815,6 +817,7 @@ export class Migration {
   private readonly beforeOwnerFileRename: (() => void) | undefined;
   private readonly beforeOwnershipLock: (() => void) | undefined;
   private readonly afterStep: ((point: MigrationCrashPoint) => void) | undefined;
+  private readonly afterWrite: ((point: MigrationWritePoint) => void) | undefined;
   private readonly sleepSync: (ms: number) => void;
   /** Keeps Pi's auth.json lock fresh during S2's lease wait; throws lock-lost. */
   private piAuthLockRefresh: (() => void) | undefined;
@@ -845,6 +848,7 @@ export class Migration {
     this.beforeOwnerFileRename = config.beforeOwnerFileRename;
     this.beforeOwnershipLock = config.beforeOwnershipLock;
     this.afterStep = config.afterStep;
+    this.afterWrite = config.afterWrite;
     this.sleepSync = config.sleepSync ?? ((ms) => {
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
     });
@@ -1272,6 +1276,11 @@ export class Migration {
       }
       : undefined;
     const staticCredential = this.staticKeychainCoords();
+    const singleGrantV2Owner = this.kind === 'single-grant' && this.ownerEntryPresentAt(this.ownerMapPath);
+    let singleGrantPlaceholder = false;
+    if (this.kind === 'single-grant') {
+      try { singleGrantPlaceholder = isPiPlaceholder(this.readSingleGrantAuth()[this.singleGrantAuthKey()]); } catch { /* status reports recovery without parsing credentials */ }
+    }
 
     let ownerFile: MigrationStatus['ownerFile'] = 'absent';
     if (ownerPresent) ownerFile = 'present';
@@ -1310,17 +1319,21 @@ export class Migration {
     } else if (ownerPresent && STATE_RANK[state] < STATE_RANK.QLB_OWNED) {
       resumeAction = staticKey
         ? 'already committed; finish hygiene (journal only; native Keychain retained) → QLB_OWNED'
-        : retains
-          ? 'already committed; finish hygiene (journal only; auth.json shadow-retained) → QLB_OWNED'
-          : 'already committed; finish hygiene (H1–H2) → QLB_OWNED';
+        : singleGrantV2Owner && !singleGrantPlaceholder
+          ? 'complete commit: write Pi auth.json placeholder → QLB_OWNED'
+          : retains
+            ? 'already committed; finish hygiene → QLB_OWNED'
+            : 'already committed; finish hygiene (H1–H2) → QLB_OWNED';
     } else if (ownerPresent && nativePresent && !prePresent && !retains) {
       resumeAction = 'finish hygiene: rename native → .pre-qlb';
     } else if (ownerPresent) {
       resumeAction = staticKey
         ? 'noop (already QLB_OWNED; native Keychain retained)'
-        : retains
-          ? 'noop (already QLB_OWNED; native auth.json shadow-retained)'
-          : 'noop (already QLB_OWNED)';
+        : singleGrantV2Owner && !singleGrantPlaceholder
+          ? `stale native writer: auth.json[${this.singleGrantAuthKey()}] is not the placeholder; rollback or re-stage`
+          : retains
+            ? 'noop (already QLB_OWNED; auth.json placeholder present)'
+            : 'noop (already QLB_OWNED)';
     } else if (state === 'QLB_OWNED' && !ownerPresent && nativePresent) {
       resumeAction = 'post-RC hygiene: journal VALIDATED';
     } else if (preCommitRollbackIntent) {
@@ -1498,8 +1511,10 @@ export class Migration {
     // OpenRouter must fail closed rather than add providers to a v1 Anthropic
     // document. Read before checking or mutating any migration artifact.
     if (this.kind === 'static-key') readPiOwnerProviders(this.ownerMapPath);
+    const current = this.status();
     if (this.ownerEntryPresent()) {
       this.assertCommittedOwnerFileRevalidated();
+      this.completeSingleGrantClaimForward(current);
       return this.finishHygiene();
     }
     const staging = this.stagingPath();
@@ -1509,7 +1524,6 @@ export class Migration {
     if (this.readStagingOwnerFile() === null) {
       throw this.invalidStagingError(staging);
     }
-    const current = this.status();
     if (current.state !== 'VALIDATED' && current.state !== 'QLB_OWNED') {
       throw new Error(
         `cannot commit from state ${current.state} (rehearse must succeed first)`,
@@ -1528,6 +1542,9 @@ export class Migration {
     }
 
     if (this.kind === 'single-grant') {
+      // Never fold a legacy v1 Anthropic document into the shared v2 map.
+      // This check precedes every publication write, including the backup.
+      readPiOwnerProviders(this.ownerMapPath);
       const account = Array.isArray(current.detail.accounts) ? current.detail.accounts[0] : null;
       if (this.provider === 'xai' || this.provider === 'kimi-coding') {
         const coords = resolveSingleGrantKeychain(this.provider, account);
@@ -1542,9 +1559,28 @@ export class Migration {
       const id = isObjectRecord(account) && typeof account.id === 'string' ? account.id : null;
       const generation = id ? this.store.getGrantGeneration(id) : null;
       if (generation === null) throw new Error('single-grant commit has no account generation');
-      // Persist the baseline before the commit rename. A crash after the
-      // rename can therefore never reinterpret a re-staged grant as a refresh.
+      const authKey = this.singleGrantAuthKey();
+      const stagedFingerprint = isObjectRecord(account) && typeof account.fingerprint === 'string'
+        ? account.fingerprint
+        : null;
+      const auth = this.readSingleGrantAuth();
+      const native = auth[authKey];
+      if (!isObjectRecord(native) || typeof native.refresh !== 'string' || !stagedFingerprint
+        || fingerprintRefresh(native.refresh) !== stagedFingerprint) {
+        throw new Error('native entry changed since stage; re-run stage');
+      }
+      // `commitGeneration` remains the C5 crash classifier. The ordered
+      // publication below is backup → v2 owner entry → Pi placeholder.
       this.journal(current.state, { commitGeneration: generation });
+      const cycle = this.ensureAuthBackupCycle();
+      writePiAuthBackup(this.poolFilePath, authKey, cycle);
+      this.afterWrite?.('backup');
+      writePiOwnerEntry(this.ownerMapPath, this.ownerProvider(), true);
+      this.afterWrite?.('owner-entry');
+      this.writeSingleGrantPlaceholder(authKey);
+      this.afterWrite?.('placeholder');
+      unlinkIfExists(staging);
+      return this.finishHygiene();
     }
 
     if (this.kind === 'pool') {
@@ -1676,6 +1712,7 @@ export class Migration {
     // Any claim, including a custom owner file (Oc), is past C: finish forward.
     if (this.claimPresent()) {
       this.assertCommittedOwnerFileRevalidated();
+      this.completeSingleGrantClaimForward(current);
       return this.finishHygiene();
     }
     if (
@@ -1863,6 +1900,7 @@ export class Migration {
       nativeStrategy: 'shadow-retain',
       authJsonKey: keyName,
       provider: this.provider,
+      authBackupCycle: randomUUID(),
       commitGeneration: undefined,
       commitStarted: undefined,
       rollbackDecision: undefined,
@@ -1955,13 +1993,29 @@ export class Migration {
     }
   }
 
-  /** Re-open by descriptor so chmod cannot follow a staging-path swap after the commit rename. */
+  /** Validate the durable claim actually published by this migration. */
   private revalidateAndSecureCommittedOwnerFile(): boolean {
+    if (this.kind !== 'pool' && this.ownerEntryPresentAt(this.ownerMapPath)) {
+      // v2's durable claim is providers[provider], not a legacy sidecar.
+      // writePiOwnerEntry already publishes this map atomically at mode 0600.
+      return true;
+    }
+    const legacyPath = this.kind === 'pool'
+      ? this.ownerFilePath
+      : this.legacySidecarOwned()
+        ? this.legacySidecarPath()
+        : this.ownerFilePath;
+    if (!legacyPath) return false;
+    return this.revalidateAndSecureLegacyOwnerFile(legacyPath);
+  }
+
+  /** Re-open a legacy v1 owner document by descriptor before hardening it. */
+  private revalidateAndSecureLegacyOwnerFile(path: string): boolean {
     try {
       // lstat distinguishes a symlink before open; O_NOFOLLOW closes the
       // remaining gap before fchmod operates on this descriptor.
-      if (!lstatSync(this.ownerFilePath).isFile()) return false;
-      const fd = openSync(this.ownerFilePath, constants.O_RDONLY | constants.O_NOFOLLOW);
+      if (!lstatSync(path).isFile()) return false;
+      const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
       try {
         if (!fstatSync(fd).isFile()) return false;
         const owner = validatedMigrationOwnerFile(JSON.parse(readFileSync(fd, 'utf8')) as unknown);
@@ -2235,6 +2289,43 @@ export class Migration {
     return key;
   }
 
+  /** Complete the owner-entry → placeholder half of a crashed single-grant commit. */
+  private completeSingleGrantClaimForward(current: MigrationStatus): void {
+    if (this.kind !== 'single-grant' || !this.ownerEntryPresentAt(this.ownerMapPath)
+      || STATE_RANK[current.state] >= STATE_RANK.QLB_OWNED) return;
+    const authKey = this.singleGrantAuthKey();
+    const auth = this.readSingleGrantAuth();
+    if (isPiPlaceholder(auth[authKey])) return;
+    const cycle = this.ensureAuthBackupCycle();
+    writePiAuthBackup(this.poolFilePath, authKey, cycle);
+    this.afterWrite?.('backup');
+    this.writeSingleGrantPlaceholder(authKey);
+    this.afterWrite?.('placeholder');
+  }
+
+  /** The backup cycle is durable before B is written, including C5 recovery of old journals. */
+  private ensureAuthBackupCycle(): string {
+    const detail = parseDetail(this.store.getMigration(this.storeName)?.detail_json);
+    if (typeof detail.authBackupCycle === 'string') return detail.authBackupCycle;
+    const cycle = randomUUID();
+    this.journal(this.journalState(), { authBackupCycle: cycle });
+    return cycle;
+  }
+
+  private removeCurrentCycleAuthBackup(authKey: string): void {
+    const cycle = parseDetail(this.store.getMigration(this.storeName)?.detail_json).authBackupCycle;
+    if (typeof cycle !== 'string') return;
+    const backup = readPiAuthBackup(this.poolFilePath, authKey);
+    if (backup?.cycleId === cycle) removePiAuthBackup(this.poolFilePath, authKey);
+  }
+
+  /** Call only while the single-grant auth lock is held. */
+  private writeSingleGrantPlaceholder(authKey: string): void {
+    const auth = this.readSingleGrantAuth();
+    auth[authKey] = piPlaceholder();
+    atomicWriteFile(this.poolFilePath, JSON.stringify(auth, null, 2) + '\n');
+  }
+
   private preCommitRollback(): MigrationStatus {
     // Resolve (and validate) the journaled auth key before any cleanup, so a
     // conflicting key refuses with every staged artifact still in place.
@@ -2285,7 +2376,7 @@ export class Migration {
       throw error;
     }
     unlinkIfExists(rollbackStaging);
-    if (authKey !== undefined) removePiAuthBackup(this.poolFilePath, authKey);
+    if (authKey !== undefined) this.removeCurrentCycleAuthBackup(authKey);
     this.journal('NATIVE', {
       intent: undefined,
       rolledBackAt: Date.now(),
