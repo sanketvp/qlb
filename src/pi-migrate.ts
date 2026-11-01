@@ -46,6 +46,14 @@ export function assertPiSingleProvider(value: string): asserts value is PiSingle
 export function assertPiMigrateProvider(value: string): asserts value is PiMigrateProvider { if (!isProvider(value)) throw new Error('provider must be xai, kimi-coding, openrouter, openai-codex, or anthropic'); }
 function isNoImportProvider(provider: PiMigrateProvider): provider is 'openai-codex' | 'anthropic' { return provider === 'openai-codex' || provider === 'anthropic'; }
 function refusal(code: string, detail?: string): Error { return Object.assign(new Error(detail ? `${code}: ${detail}` : code), { code, exitCode: 3 }); }
+function assertEnabledProvider(provider: PiMigrateProvider, enabled: ReadonlySet<PiMigrateProvider>): void {
+  if (!enabled.has(provider)) throw refusal('provider-not-enabled');
+}
+function assertProviderImplemented(provider: PiMigrateProvider): void {
+  // P7-1a implements only the legacy single-provider path. The test seam may
+  // enable future providers, but it must not expose that incomplete path.
+  if (!isPiSingleProvider(provider)) throw refusal('provider-not-enabled');
+}
 function requireStore(provider: PiMigrateProvider, deps: PiMigrateDeps): void { if (isNoImportProvider(provider) && !deps.store) throw refusal('store-required'); }
 
 /** authJsonPath may be overridden; QLB state always stays below qlbHome. */
@@ -210,7 +218,13 @@ function assertOutsideGitWorktree(path: string, qlbHome: string): void {
 export function assertDirOutsideGitWorktree(dir: string, qlbHome: string): void {
   const resolved = realPathAllowMissing(dir); const exempt = realPathAllowMissing(join(qlbHome, '.qlb'));
   if (resolved === exempt || resolved.startsWith(`${exempt}/`)) return;
-  try { const top = String(execFileSync('git', ['-C', resolved, 'rev-parse', '--show-toplevel'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })).trim(); if (top) throw refusal('pi-path-in-git-worktree', `refusing Pi migration write inside git work tree: ${resolved}`); } catch (error) { if ((error as { code?: unknown }).code === 'pi-path-in-git-worktree') throw error; }
+  let probe = resolved;
+  while (!existsSync(probe)) {
+    const parent = dirname(probe);
+    if (parent === probe) break;
+    probe = parent;
+  }
+  try { const top = String(execFileSync('git', ['-C', probe, 'rev-parse', '--show-toplevel'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })).trim(); if (top) throw refusal('pi-path-in-git-worktree', `refusing Pi migration write inside git work tree: ${resolved}`); } catch (error) { if ((error as { code?: unknown }).code === 'pi-path-in-git-worktree') throw error; }
 }
 function checkPaths(paths: PiMigratePaths, deps: PiMigrateDeps): void { for (const path of [paths.authJsonPath, paths.ownerPath]) { deps.checkWritablePath?.(path); assertOutsideGitWorktree(path, qlbHomeDir()); } }
 export function isPiQlbOwnerEntry(entry: unknown): boolean {
@@ -354,8 +368,9 @@ function stashKeptGenericCopy(
 export function migratePiSingleProvider(provider: PiMigrateProvider, paths: PiMigratePaths = defaultPiMigratePaths(), deps: PiMigrateDeps, options: { dryRun?: boolean } = {}): PiMigrateResult {
   assertPiMigrateProvider(provider);
   const enabled = deps.enabledProviders ?? ENABLED_PI_MIGRATE_PROVIDERS;
-  if (!enabled.has(provider)) throw refusal('provider-not-enabled');
+  assertEnabledProvider(provider, enabled);
   requireStore(provider, deps);
+  assertProviderImplemented(provider);
   const existing = readJournal(paths, provider); const wouldWrite = [managedService(provider), `placeholder:${provider}`, `owner:${provider}`];
   if (options.dryRun) return { provider, state: 'migrated', resumed: existing !== null, wouldWrite };
   checkPaths(paths, deps);
@@ -431,8 +446,9 @@ export function migratePiSingleProvider(provider: PiMigrateProvider, paths: PiMi
 export function rollbackPiSingleProvider(provider: PiMigrateProvider, paths: PiMigratePaths = defaultPiMigratePaths(), deps: PiMigrateDeps): PiMigrateResult {
   assertPiMigrateProvider(provider);
   const enabled = deps.enabledProviders ?? ENABLED_PI_MIGRATE_PROVIDERS;
-  if (!enabled.has(provider)) throw refusal('provider-not-enabled');
+  assertEnabledProvider(provider, enabled);
   requireStore(provider, deps);
+  assertProviderImplemented(provider);
   checkPaths(paths, deps);
   const lock = deps.withAuthLock ?? ((path, fn) => withPiAuthLock(path, fn, deps.authLockTiming));
   underAuthLock(lock, paths.authJsonPath, (refresh) => {

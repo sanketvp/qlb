@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { describe, it } from 'node:test';
@@ -85,13 +85,28 @@ const STORE_PICK_STUBS = {
 
 function gitInit(dir: string): void { execFileSync('git', ['init', '-q', dir]); }
 
-function expectRefusal(h: ReturnType<typeof setup>, code: string, fn: () => unknown): void {
+function snapshotDirectory(path: string): Array<[string, Buffer]> | null {
+  return existsSync(path)
+    ? readdirSync(path).sort().map((name) => [name, readFileSync(join(path, name))])
+    : null;
+}
+
+function expectRefusal(h: ReturnType<typeof setup>, provider: PiMigrateProvider, code: string, fn: () => unknown): void {
   const snapshot = () => ({
     auth: readFileSync(h.paths.authJsonPath, 'utf8'),
     owner: existsSync(h.paths.ownerPath) ? readFileSync(h.paths.ownerPath, 'utf8') : null,
-    baseline: existsSync(h.paths.baselineDir) ? readFileSync(join(h.paths.baselineDir, 'xai.json'), 'utf8') : null,
-    journal: existsSync(join(h.paths.journalPath, 'pi-migrate-xai.json')) ? readFileSync(join(h.paths.journalPath, 'pi-migrate-xai.json'), 'utf8') : null,
-    lock: existsSync(`${h.paths.authJsonPath}.lock`),
+    baseline: snapshotDirectory(h.paths.baselineDir),
+    journal: existsSync(join(h.paths.journalPath, `pi-migrate-${provider}.json`))
+      ? readFileSync(join(h.paths.journalPath, `pi-migrate-${provider}.json`), 'utf8')
+      : null,
+    lock: snapshotDirectory(`${h.paths.authJsonPath}.lock`),
+    config: [
+      `pi.${provider}.state`,
+      `pi.${provider}.migratedAt`,
+      `pi.${provider}.baselineConsumedBy`,
+      `single.${provider}.activeId`,
+    ].map((key) => [key, h.store.getConfig(key)]),
+    exportTargets: h.store.listPiExportTargets(provider),
   });
   const before = snapshot();
   assert.throws(fn, (error: unknown) => {
@@ -128,14 +143,23 @@ function plantKeptGenericCopy(
 }
 
 describe('Pi migration S58 credential-first barrier', () => {
-  it('openai-codex and anthropic are refused provider-not-enabled by migrate and rollback before the lock and nothing is written', () => {
+  it('openai-codex and anthropic are refused provider-not-enabled by migrate and rollback before the lock, including when enabledProviders includes them', () => {
     for (const provider of ['openai-codex', 'anthropic'] as const) {
-      const h = setup();
-      try {
-        expectRefusal(h, 'provider-not-enabled', () => migratePiSingleProvider(provider, h.paths, { keychain: h.keychain, store: h.store }));
-        expectRefusal(h, 'provider-not-enabled', () => rollbackPiSingleProvider(provider, h.paths, { keychain: h.keychain, store: h.store }));
-        assert.equal(existsSync(`${h.paths.authJsonPath}.lock`), false, `${provider}: no lock directory`);
-      } finally { h.cleanup(); }
+      for (const enabledProviders of [undefined, ALL] as const) {
+        for (const operation of [migratePiSingleProvider, rollbackPiSingleProvider]) {
+          const h = setup();
+          let lockCalls = 0;
+          try {
+            expectRefusal(h, provider, 'provider-not-enabled', () => operation(provider, h.paths, {
+              keychain: h.keychain,
+              store: h.store,
+              enabledProviders,
+              withAuthLock: (_path, _fn) => { lockCalls += 1; throw new Error('lock must not be taken'); },
+            }));
+            assert.equal(lockCalls, 0, `${provider}: refusal must precede the lock`);
+          } finally { h.cleanup(); }
+        }
+      }
     }
   });
 
@@ -143,8 +167,8 @@ describe('Pi migration S58 credential-first barrier', () => {
     for (const provider of ['openai-codex', 'anthropic'] as const) {
       const h = setup();
       try {
-        expectRefusal(h, 'store-required', () => migratePiSingleProvider(provider, h.paths, { keychain: h.keychain, enabledProviders: ALL }));
-        expectRefusal(h, 'store-required', () => rollbackPiSingleProvider(provider, h.paths, { keychain: h.keychain, enabledProviders: ALL }));
+        expectRefusal(h, provider, 'store-required', () => migratePiSingleProvider(provider, h.paths, { keychain: h.keychain, enabledProviders: ALL }));
+        expectRefusal(h, provider, 'store-required', () => rollbackPiSingleProvider(provider, h.paths, { keychain: h.keychain, enabledProviders: ALL }));
       } finally { h.cleanup(); }
     }
   });
@@ -164,17 +188,18 @@ describe('Pi migration S58 credential-first barrier', () => {
     const h = setup();
     try {
       gitInit(h.dir);
-      expectRefusal(h, 'pi-path-in-git-worktree', () => migratePiSingleProvider('xai', h.paths, { keychain: h.keychain }));
+      expectRefusal(h, 'xai', 'pi-path-in-git-worktree', () => migratePiSingleProvider('xai', h.paths, { keychain: h.keychain }));
     } finally { h.cleanup(); }
   });
 
-  it('assertDirOutsideGitWorktree refuses a directory that is itself a repository root and accepts a directory outside any repository', () => {
+  it('assertDirOutsideGitWorktree refuses a directory that is itself a repository root or a missing child of one, and accepts a missing directory outside any repository', () => {
     const repo = mkdtempSync(join(tmpdir(), 'qlb-pi-repo-'));
     const outside = mkdtempSync(join(tmpdir(), 'qlb-pi-outside-'));
     try {
       gitInit(repo);
       assert.throws(() => assertDirOutsideGitWorktree(repo, outside), (error: unknown) => (error as { code?: unknown; exitCode?: unknown }).code === 'pi-path-in-git-worktree' && (error as { exitCode?: unknown }).exitCode === 3);
-      assert.doesNotThrow(() => assertDirOutsideGitWorktree(outside, outside));
+      assert.throws(() => assertDirOutsideGitWorktree(join(repo, 'missing', 'child'), outside), (error: unknown) => (error as { code?: unknown; exitCode?: unknown }).code === 'pi-path-in-git-worktree' && (error as { exitCode?: unknown }).exitCode === 3);
+      assert.doesNotThrow(() => assertDirOutsideGitWorktree(join(outside, 'missing', 'child'), outside));
     } finally {
       rmSync(repo, { recursive: true, force: true });
       rmSync(outside, { recursive: true, force: true });
