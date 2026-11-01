@@ -337,6 +337,8 @@ export interface MigrationConfig {
   readNativeKey?: () => string;
   /** Test-only barrier after a pool takes the final owner-map lock. */
   beforePoolCommitLock?: () => void;
+  /** Test-only seam after custom conversion writes v2 and before it unlinks v1. */
+  beforePoolLegacyUnlink?: () => void;
   /** Test-only barrier after staging validation and immediately before the commit rename. */
   beforeOwnerFileRename?: () => void;
   /** Test-only barrier immediately before single-grant stage takes Pi's auth lock. */
@@ -834,6 +836,7 @@ export class Migration {
   private readonly authJsonPath: string;
   private readonly readNativeKey: (() => string) | undefined;
   private readonly beforePoolCommitLock: (() => void) | undefined;
+  private readonly beforePoolLegacyUnlink: (() => void) | undefined;
   private readonly beforeOwnerFileRename: (() => void) | undefined;
   private readonly beforeOwnershipLock: (() => void) | undefined;
   private readonly afterStep: ((point: MigrationCrashPoint) => void) | undefined;
@@ -867,6 +870,7 @@ export class Migration {
     this.authJsonPath = config.authJsonPath ?? DEFAULT_AUTH_JSON;
     this.readNativeKey = config.readNativeKey;
     this.beforePoolCommitLock = config.beforePoolCommitLock;
+    this.beforePoolLegacyUnlink = config.beforePoolLegacyUnlink;
     this.beforeOwnerFileRename = config.beforeOwnerFileRename;
     this.beforeOwnershipLock = config.beforeOwnershipLock;
     this.afterStep = config.afterStep;
@@ -1122,21 +1126,49 @@ export class Migration {
     return this.kind === 'pool' && hasLegacyPiOwnerEntry(this.ownerFilePath, 'anthropic');
   }
 
+  private readPoolAuthForPublication(): Record<string, unknown> {
+    if (!existsSync(this.authJsonPath)) return {};
+    let auth: unknown;
+    try {
+      auth = JSON.parse(readFileSync(this.authJsonPath, 'utf8'));
+    } catch {
+      throw this.poolRollbackRefusal('Pi auth.json is malformed');
+    }
+    if (!isObjectRecord(auth)) throw this.poolRollbackRefusal('Pi auth.json is not an object');
+    return auth;
+  }
+
   private poolPlaceholderPresent(): boolean {
     if (!existsSync(this.authJsonPath)) return false;
-    const auth: unknown = JSON.parse(readFileSync(this.authJsonPath, 'utf8'));
-    if (!isObjectRecord(auth)) throw new Error('Pi auth.json is not an object');
-    return isPiPlaceholder(auth.anthropic);
+    return isPiPlaceholder(this.readPoolAuthForPublication().anthropic);
+  }
+
+  private poolNativeEntryChangedSinceStage(): boolean {
+    const cycle = parseDetail(this.store.getMigration(this.storeName)?.detail_json).authBackupCycle;
+    if (typeof cycle !== 'string') return false;
+    let backup: PiAuthBackup | null;
+    try {
+      backup = readPiAuthBackup(this.authJsonPath, 'anthropic');
+    } catch {
+      return false;
+    }
+    if (backup?.cycleId !== cycle) return false;
+    try {
+      const auth = this.readPoolAuthForPublication();
+      const hasLiveEntry = Object.prototype.hasOwnProperty.call(auth, 'anthropic');
+      const live = auth.anthropic;
+      if (!backup.entryPresent) return hasLiveEntry && !isPiPlaceholder(live);
+      return !isObjectRecord(live) || typeof live.refresh !== 'string'
+        || !isObjectRecord(backup.entry) || typeof backup.entry.refresh !== 'string'
+        || fingerprintRefresh(live.refresh) !== fingerprintRefresh(backup.entry.refresh);
+    } catch {
+      return false;
+    }
   }
 
   /** Write only after B and O, while the configured Pi auth.json lock is held. */
   private writePoolAnthropicPlaceholder(): void {
-    let auth: Record<string, unknown> = {};
-    if (existsSync(this.authJsonPath)) {
-      const parsed: unknown = JSON.parse(readFileSync(this.authJsonPath, 'utf8'));
-      if (!isObjectRecord(parsed)) throw new Error('Pi auth.json is not an object');
-      auth = parsed;
-    }
+    const auth = this.readPoolAuthForPublication();
     auth.anthropic = piPlaceholder();
     atomicWriteFile(this.authJsonPath, JSON.stringify(auth, null, 2) + '\n');
   }
@@ -1144,8 +1176,13 @@ export class Migration {
   /** Whether resume must finish the only permitted v1-to-v2 conversion window. */
   private poolNeedsV2Publication(current: MigrationStatus): boolean {
     if (this.kind !== 'pool') return false;
-    if (this.poolLegacyOwnerPresent()) return this.allowPoolLegacyConversion && current.state === 'QLB_OWNED';
-    return this.ownerEntryPresentAt(this.ownerMapPath)
+    const legacy = this.poolLegacyOwnerPresent();
+    const v2 = this.ownerEntryPresentAt(this.ownerMapPath);
+    // Dual claims are an incomplete conversion. Never fall through to hygiene
+    // while the v2 claim lacks its required placeholder.
+    if (legacy && v2) return true;
+    if (legacy) return this.allowPoolLegacyConversion && current.state === 'QLB_OWNED';
+    return v2
       && (STATE_RANK[current.state] < STATE_RANK.QLB_OWNED
         || !this.poolPlaceholderPresent()
         || this.claimPathPresent(this.stagingPath()));
@@ -1163,13 +1200,19 @@ export class Migration {
     );
   }
 
+  private poolLegacyOwnerClaimsOnlyAnthropic(): boolean {
+    try {
+      const parsed: unknown = JSON.parse(readFileSync(this.ownerFilePath, 'utf8'));
+      return isObjectRecord(parsed) && parsed.owner === 'qlb' && Array.isArray(parsed.accounts)
+        && parsed.accounts.every((account) => isObjectRecord(account) && account.provider === 'anthropic');
+    } catch {
+      return false;
+    }
+  }
+
   private assertPoolLegacyOwnerClaimsOnlyAnthropic(): void {
     if (!this.poolLegacyOwnerPresent()) return;
-    const parsed: unknown = JSON.parse(readFileSync(this.ownerFilePath, 'utf8'));
-    if (!isObjectRecord(parsed) || !Array.isArray(parsed.accounts) || parsed.accounts.some((account) =>
-      !isObjectRecord(account) || account.provider !== 'anthropic')) {
-      throw new PiOwnerLegacyError();
-    }
+    if (!this.poolLegacyOwnerClaimsOnlyAnthropic()) throw new PiOwnerLegacyError();
   }
 
   /** A placeholder may only be resumed from the current cycle's valid backup. */
@@ -1200,10 +1243,20 @@ export class Migration {
     }
     if (backup?.cycleId === cycle) {
       if (backup.entryPresent && !isValidEntry(backup.entry)) throw this.poolRollbackRefusal('Anthropic auth backup is invalid');
+      if (this.poolNativeEntryChangedSinceStage()) {
+        throw this.poolNativeEntryChangedSinceStageError();
+      }
       return;
     }
     writePiAuthBackup(this.authJsonPath, 'anthropic', cycle);
     this.afterWrite?.('backup');
+  }
+
+  private poolNativeEntryChangedSinceStageError(): Error {
+    return Object.assign(
+      new Error('native entry changed since stage; run qlb migrate rollback --provider anthropic or re-stage'),
+      { exitCode: 3 },
+    );
   }
 
   /** P7b8's ordered pool publication: B → O → placeholder → hygiene. */
@@ -1234,17 +1287,38 @@ export class Migration {
 
     this.assertPoolLegacyOwnerClaimsOnlyAnthropic();
     this.assertPoolPlaceholderBackupLineage();
-    this.journal(current.state, { poolV2PublicationStarted: true });
     this.withPoolRollbackAuthLock(() => {
       this.beforePoolCommitLock?.();
-      this.writePoolAnthropicBackupOnce();
-      this.withOwnerMapLockUnlessHeld(() => writePiOwnerEntry(
+      // Refuse before even journaling a resume when the current-cycle backup
+      // proves Pi has since written a newer native entry.
+      if (!this.poolPlaceholderPresent() && this.poolNativeEntryChangedSinceStage()) {
+        throw this.poolNativeEntryChangedSinceStageError();
+      }
+      this.journal(current.state, { poolV2PublicationStarted: true });
+      // Re-read under the auth lock. A dual claim is the crash window between
+      // publishing the canonical map and retiring a custom v1 document; close
+      // it before touching the user's auth.json or backup.
+      const lockedLegacy = this.poolLegacyOwnerPresent();
+      const lockedV2 = this.ownerEntryPresentAt(this.ownerMapPath);
+      const writeOwner = (replaceLegacyDocument: boolean): void => this.withOwnerMapLockUnlessHeld(() => writePiOwnerEntry(
         this.ownerMapPath,
         'anthropic',
         true,
-        { replaceLegacyDocument: legacy, legacyDocumentPath: legacy ? this.ownerFilePath : undefined },
+        {
+          replaceLegacyDocument,
+          legacyDocumentPath: replaceLegacyDocument ? this.ownerFilePath : undefined,
+          beforeLegacyUnlink: this.beforePoolLegacyUnlink,
+        },
       ));
-      this.afterWrite?.('owner-entry');
+      if (lockedLegacy && lockedV2) {
+        writeOwner(true);
+        this.afterWrite?.('owner-entry');
+      }
+      this.writePoolAnthropicBackupOnce();
+      if (!(lockedLegacy && lockedV2)) {
+        writeOwner(lockedLegacy);
+        this.afterWrite?.('owner-entry');
+      }
       this.writePoolAnthropicPlaceholder();
       this.afterWrite?.('placeholder');
     });
@@ -1299,9 +1373,12 @@ export class Migration {
 
   /** RC: called while the pool rollback holds Pi's configured auth.json lock. */
   private removePoolOwnerEntry(): void {
+    // A crash after publishing v2 but before retiring a custom v1 document
+    // leaves both claims. Rollback owns and removes both, never just the v1.
     if (hasLegacyPiOwnerEntry(this.ownerFilePath, 'anthropic')) {
       unlinkIfExists(this.ownerFilePath);
-    } else if (this.ownerEntryPresentAt(this.ownerMapPath)) {
+    }
+    if (this.ownerEntryPresentAt(this.ownerMapPath)) {
       this.withOwnerMapLockUnlessHeld(() => writePiOwnerEntry(this.ownerMapPath, 'anthropic', false));
     }
   }
@@ -1505,11 +1582,12 @@ export class Migration {
     const poolLegacyOwner = this.poolLegacyOwnerPresent();
     let singleGrantPlaceholder = false;
     let poolPlaceholder = false;
+    let poolAuthMalformed = false;
     if (this.kind === 'single-grant') {
       try { singleGrantPlaceholder = isPiPlaceholder(this.readSingleGrantAuth()[this.singleGrantAuthKey()]); } catch { /* status reports recovery without parsing credentials */ }
     }
     if (this.kind === 'pool') {
-      try { poolPlaceholder = this.poolPlaceholderPresent(); } catch { /* status reports recovery without parsing credentials */ }
+      try { poolPlaceholder = this.poolPlaceholderPresent(); } catch { poolAuthMalformed = true; }
     }
 
     let ownerFile: MigrationStatus['ownerFile'] = 'absent';
@@ -1547,8 +1625,17 @@ export class Migration {
       && !this.revalidateAndSecureCommittedOwnerFile()
     ) {
       resumeAction = 'invalid published owner; run `qlb migrate rollback`';
+    } else if (poolV2Owner && !ownerStaging
+      && !(detail.poolV2PublicationStarted === true && STATE_RANK[state] >= STATE_RANK.VALIDATED)) {
+      resumeAction = 'owner-file-orphan: v2 Anthropic ownership has no staging file or pool publication journal; remove its Anthropic claim before retrying';
+    } else if (poolV2Owner && poolAuthMalformed) {
+      resumeAction = 'Pi auth.json is malformed; repair it before resuming';
     } else if (poolLegacyOwner && state === 'QLB_OWNED') {
-      resumeAction = 'convert legacy Anthropic owner: back up Pi auth.json, publish v2 ownership, then write placeholder';
+      resumeAction = !this.poolLegacyOwnerClaimsOnlyAnthropic()
+        ? 'mixed v1 owner document: remove other providers’ claims or run `qlb pi rollback` for them'
+        : !this.allowPoolLegacyConversion
+          ? 'legacy Anthropic conversion requires `qlb migrate resume --provider anthropic`'
+          : 'convert legacy Anthropic owner: back up Pi auth.json, publish v2 ownership, then write placeholder';
     } else if (ownerPresent && STATE_RANK[state] < STATE_RANK.QLB_OWNED) {
       resumeAction = staticKey
         ? 'already committed; finish hygiene (journal only; native Keychain retained) → QLB_OWNED'
@@ -1566,7 +1653,9 @@ export class Migration {
         : singleGrantV2Owner && !singleGrantPlaceholder
           ? `stale native writer: auth.json[${this.singleGrantAuthKey()}] is not the placeholder; rollback or re-stage`
           : poolV2Owner && !poolPlaceholder
-            ? 'v2 Anthropic owner is missing its Pi auth.json placeholder; run `qlb migrate resume --provider anthropic`'
+            ? this.poolNativeEntryChangedSinceStage()
+              ? 'stale native writer: auth.json[anthropic] is not the placeholder; rollback or re-stage'
+              : 'v2 Anthropic owner is missing its Pi auth.json placeholder; run `qlb migrate resume --provider anthropic`'
             : retains
             ? 'noop (already QLB_OWNED; auth.json placeholder present)'
             : 'noop (already QLB_OWNED)';

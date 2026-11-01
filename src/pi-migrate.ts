@@ -105,13 +105,19 @@ export interface WritePiOwnerEntryOptions {
   replaceLegacyDocument?: boolean;
   /** The v1 document being converted when it is not at the canonical map path. */
   legacyDocumentPath?: string;
+  /** Test seam after the v2 write and immediately before revalidating the v1 unlink. */
+  beforeLegacyUnlink?: () => void;
+}
+
+function legacyDocumentChangedDuringConversion(): Error {
+  return refusal('owner-file-orphan', 'legacy owner document changed during conversion; re-stage');
 }
 
 function assertLegacyDocumentClaimsOnly(path: string, provider: string): void {
   const owner = asObject(JSON.parse(readFileSync(path, 'utf8')), 'Pi owner file is not an object');
-  if (Object.prototype.hasOwnProperty.call(owner, 'providers')) return;
+  if (Object.prototype.hasOwnProperty.call(owner, 'providers')) throw legacyDocumentChangedDuringConversion();
   const accounts = owner.accounts;
-  if (!Array.isArray(accounts) || accounts.some((account) => !account || typeof account !== 'object'
+  if (owner.owner !== 'qlb' || !Array.isArray(accounts) || accounts.some((account) => !account || typeof account !== 'object'
     || Array.isArray(account) || (account as JsonObject).provider !== provider)) {
     throw new PiOwnerLegacyError();
   }
@@ -142,6 +148,11 @@ export function writePiOwnerEntry(
   if (Object.keys(providers).length === 0) { if (lstatPresent(path)) unlinkSync(path); return; }
   writeJson(path, { providers });
   if (options.replaceLegacyDocument && resolve(legacyPath) !== resolve(path) && lstatPresent(legacyPath)) {
+    options.beforeLegacyUnlink?.();
+    // The custom document may be outside the canonical-map lock. Re-read it
+    // under the caller's auth lock so a concurrently published shared v2 map
+    // is never mistaken for the v1 document selected before locking.
+    assertLegacyDocumentClaimsOnly(legacyPath, provider);
     unlinkSync(legacyPath);
   }
 }
