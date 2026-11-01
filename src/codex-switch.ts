@@ -24,6 +24,9 @@ import type { Store } from './store';
 
 const PROVIDER = 'openai-codex';
 
+/** Dark-launch gate; C8 flips this only alongside its background watch consumer. */
+export const CODEX_SWITCH_COMMAND_ENABLED = false;
+
 export type CodexSwitchPreflightResult =
   | { kind: 'go' }
   | { kind: 'refused'; reason: 'codex-logged-out' | 'codex-auth-unreadable'; write: false };

@@ -1,5 +1,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { defaultConfig } from '../config';
+import { qlbHomeDir } from '../home';
 import { DatabaseSync } from 'node:sqlite';
 
 import { withCodexAuthLock, type CodexAuthLockOptions, type HeldCodexAuthLock } from '../cc-locks';
@@ -18,8 +20,17 @@ function parse(args: string[]): { dryRun: boolean; json: boolean } | null {
   return { dryRun: args.includes('--dry-run'), json: args.includes('--json') };
 }
 
+/** Resolve the live Codex credential path consistently for all Codex commands. */
+export function resolveCodexAuthPath(
+  env: NodeJS.ProcessEnv,
+  config?: Pick<CommandContext['config'], 'codexAuthJsonPath'>,
+): string {
+  if (env.CODEX_HOME) return join(env.CODEX_HOME, 'auth.json');
+  return config?.codexAuthJsonPath ?? defaultConfig(qlbHomeDir(env)).codexAuthJsonPath;
+}
+
 function codexAuthPath(ctx: CommandContext): string {
-  return ctx.env.CODEX_HOME ? join(ctx.env.CODEX_HOME, 'auth.json') : ctx.config.codexAuthJsonPath;
+  return resolveCodexAuthPath(ctx.env, ctx.config);
 }
 
 /** Reads only the Pi OpenAI Codex entry; malformed/absent input is no match. */
