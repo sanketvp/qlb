@@ -22,7 +22,7 @@ export const ENABLED_PI_MIGRATE_PROVIDERS: ReadonlySet<PiMigrateProvider> = new 
 type OAuthProvider = Exclude<PiMigrateProvider, 'openrouter'>;
 const JOURNAL_PHASES = ['started', 'baseline', 'credential-saved', 'consumption-recorded', 'pool-moved', 'publishing', 'published', 'committed'] as const;
 type JournalPhase = (typeof JOURNAL_PHASES)[number];
-type CrashPoint = 'baseline' | 'credential-saved' | 'placeholder' | 'publishing' | 'owner-entry' | 'before-committed' | 'phase-dropped' | 'consumption-recorded' | 'pool-moved' | 'migrated-at' | 'journal-cleared' | 'entry-restored' | 'pool-rewritten' | 'rows-deleted' | 'pool-dir-restored';
+type CrashPoint = 'baseline' | 'credential-saved' | 'placeholder' | 'publishing' | 'owner-entry' | 'before-committed' | 'not-applicable' | 'phase-dropped' | 'consumption-recorded' | 'pool-moved' | 'migrated-at' | 'journal-cleared' | 'entry-restored' | 'pool-rewritten' | 'rows-deleted' | 'pool-dir-restored';
 
 export interface PiMigratePaths { authJsonPath: string; ownerPath: string; journalPath: string; baselineDir: string; }
 export interface AuthLockTiming { staleMs?: number; retries?: number; retryMs?: number; now?: () => number; }
@@ -395,17 +395,23 @@ function preflightCodexMigration(paths: PiMigratePaths, deps: PiMigrateDeps): Co
   const stateMigrated = deps.store!.getConfig('pi.openai-codex.state') === 'migrated';
   const ownerPresent = isPiQlbOwnerEntry(owner['openai-codex']);
   const alreadyMigrated = !journal && isPiPlaceholder(rawCurrent) && ownerPresent;
-  if (alreadyMigrated) return { journal, auth, owner, current: undefined, baseline: undefined, chosen: undefined, alreadyMigrated, notApplicable: false };
+  const file = baselinePath(paths, 'openai-codex');
+  if (alreadyMigrated) {
+    if (!existsSync(file)) throw refusal('baseline-unreadable');
+    try {
+      const baseline = parseOAuth(JSON.parse(readFileSync(file, 'utf8')), 'openai-codex');
+      return { journal, auth, owner, current: undefined, baseline, chosen: undefined, alreadyMigrated, notApplicable: false };
+    } catch { throw refusal('baseline-unreadable'); }
+  }
   if (!journal && stateMigrated && rawCurrent !== undefined && !isPiPlaceholder(rawCurrent)) throw refusal('native-entry-rewritten');
   if (rawCurrent === undefined && (stateMigrated || ownerPresent) && (!journal || !phaseAtLeast(journal.phase, 'baseline'))) {
     throw refusal('native-entry-removed', 'run qlb pi rollback openai-codex, then re-run');
   }
-  if (!journal && isPiPlaceholder(rawCurrent)) throw placeholderBaselineError('openai-codex');
+  if (isPiPlaceholder(rawCurrent) && (!journal || !phaseAtLeast(journal.phase, 'baseline'))) throw placeholderBaselineError('openai-codex');
   const noEvidence = rawCurrent === undefined && !stateMigrated && !ownerPresent && (!journal || journal.phase === 'started');
   if (noEvidence) return { journal, auth, owner, current: undefined, baseline: undefined, chosen: undefined, alreadyMigrated: false, notApplicable: true };
 
   let baseline: JsonObject | undefined;
-  const file = baselinePath(paths, 'openai-codex');
   if (existsSync(file)) {
     try { baseline = parseOAuth(JSON.parse(readFileSync(file, 'utf8')), 'openai-codex'); } catch { throw new Error('Pi openai-codex baseline is invalid'); }
   }
@@ -414,6 +420,10 @@ function preflightCodexMigration(paths: PiMigratePaths, deps: PiMigrateDeps): Co
   if (!current && !baseline) {
     if (journal && phaseAtLeast(journal.phase, 'publishing')) throw new Error('Pi openai-codex entry changed after publication');
     throw new Error('Pi auth.json has no openai-codex credential');
+  }
+  if (journal && phaseAtLeast(journal.phase, 'publishing')) {
+    if (!baseline) throw new Error('Pi auth.json has no openai-codex credential');
+    if (!isPiPlaceholder(rawCurrent) && canonicalJson(rawCurrent) !== canonicalJson(baseline)) throw new Error('Pi openai-codex entry changed after publication');
   }
   const chosen = current && (!baseline || canonicalJson(current) !== canonicalJson(baseline)) ? current : baseline!;
   return { journal, auth, owner, current, baseline, chosen, alreadyMigrated: false, notApplicable: false };
@@ -442,8 +452,8 @@ function migrateOpenAiCodex(paths: PiMigratePaths, deps: PiMigrateDeps, options:
         updatePhase(paths, 'openai-codex', 'started', refresh, { priorBaselineConsumedBy: deps.store!.getConfig('pi.openai-codex.baselineConsumedBy') ?? '' });
         journal = readJournal(paths, 'openai-codex');
       }
-      refresh(); deps.store!.setConfig('pi.openai-codex.state', 'not-applicable');
-      updatePhase(paths, 'openai-codex', 'committed', refresh); refresh(); rmSync(journalPath(paths, 'openai-codex'), { force: true });
+      refresh(); deps.store!.setConfig('pi.openai-codex.state', 'not-applicable'); deps.afterWrite?.('not-applicable');
+      refresh(); rmSync(journalPath(paths, 'openai-codex'), { force: true });
       state = 'not-applicable'; reason = 'no-pi-credential';
       return;
     }

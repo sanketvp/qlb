@@ -1951,6 +1951,70 @@ describe('Pi migration S58 credential-first barrier', () => {
     } finally { h.cleanup(); }
   });
 
+  it('openai-codex: a crash after not-applicable state is written leaves only a started journal, then re-run and rollback ignore a stale baseline', () => {
+    const h = setup();
+    try {
+      const stale = oauth('stale-baseline');
+      writeFileSync(h.paths.authJsonPath, '{}', { mode: 0o600 });
+      mkdirSync(h.paths.baselineDir, { recursive: true, mode: 0o700 });
+      writeFileSync(join(h.paths.baselineDir, 'openai-codex.json'), JSON.stringify(stale), { mode: 0o600 });
+      assert.throws(() => migratePiSingleProvider('openai-codex', h.paths, {
+        keychain: h.keychain, store: h.store, enabledProviders: ALL,
+        afterWrite: (point: string) => { if (point === 'not-applicable') throw new Error('injected crash'); },
+      }), /injected crash/);
+      assert.equal(h.store.getConfig('pi.openai-codex.state'), 'not-applicable');
+      assert.equal(JSON.parse(readFileSync(join(h.paths.journalPath, 'pi-migrate-openai-codex.json'), 'utf8')).phase, 'started');
+      assert.equal(migratePiSingleProvider('openai-codex', h.paths, { keychain: h.keychain, store: h.store, enabledProviders: ALL }).state, 'not-applicable');
+      expectRefusal(h, 'openai-codex', 'pi-not-migrated', () => rollbackPiSingleProvider('openai-codex', h.paths, { keychain: h.keychain, store: h.store, enabledProviders: ALL }));
+      assert.deepEqual(JSON.parse(readFileSync(h.paths.authJsonPath, 'utf8')), {});
+    } finally { h.cleanup(); }
+  });
+
+  for (const damage of ['missing', 'corrupt'] as const) {
+    for (const dryRun of [false, true]) {
+      it(`openai-codex: ${dryRun ? 'dry-run' : 're-run'} refuses baseline-unreadable after a completed migration's baseline is ${damage}`, () => {
+        const h = setup();
+        try {
+          writeFileSync(h.paths.authJsonPath, JSON.stringify({ 'openai-codex': oauth('native') }), { mode: 0o600 });
+          migratePiSingleProvider('openai-codex', h.paths, { keychain: h.keychain, store: h.store, enabledProviders: ALL });
+          const file = join(h.paths.baselineDir, 'openai-codex.json');
+          if (damage === 'missing') rmSync(file);
+          else writeFileSync(file, '{"access":"truncated"', { mode: 0o600 });
+          expectRefusal(h, 'openai-codex', 'baseline-unreadable', () => migratePiSingleProvider(
+            'openai-codex', h.paths, { keychain: h.keychain, store: h.store, enabledProviders: ALL }, { dryRun },
+          ));
+        } finally { h.cleanup(); }
+      });
+    }
+  }
+
+  for (const dryRun of [false, true]) {
+    it(`openai-codex: ${dryRun ? 'dry-run' : 'migrate'} refuses a placeholder under a started journal without adopting a stale baseline`, () => {
+      const h = setup();
+      try {
+        writeFileSync(h.paths.authJsonPath, JSON.stringify({ 'openai-codex': { type: 'oauth', access: 'qlb-managed', refresh: '', expires: 1 } }), { mode: 0o600 });
+        mkdirSync(h.paths.baselineDir, { recursive: true, mode: 0o700 });
+        writeFileSync(join(h.paths.baselineDir, 'openai-codex.json'), JSON.stringify(oauth('stale-baseline')), { mode: 0o600 });
+        writePiJournal(h.paths, 'openai-codex', 'started', { priorBaselineConsumedBy: '' });
+        const before = {
+          auth: readFileSync(h.paths.authJsonPath, 'utf8'),
+          baseline: readFileSync(join(h.paths.baselineDir, 'openai-codex.json'), 'utf8'),
+          journal: readFileSync(join(h.paths.journalPath, 'pi-migrate-openai-codex.json'), 'utf8'),
+          state: h.store.getConfig('pi.openai-codex.state'),
+        };
+        assert.throws(() => migratePiSingleProvider(
+          'openai-codex', h.paths, { keychain: h.keychain, store: h.store, enabledProviders: ALL }, { dryRun },
+        ), /baseline would be a placeholder/);
+        assert.deepEqual({
+          auth: readFileSync(h.paths.authJsonPath, 'utf8'),
+          baseline: readFileSync(join(h.paths.baselineDir, 'openai-codex.json'), 'utf8'),
+          journal: readFileSync(join(h.paths.journalPath, 'pi-migrate-openai-codex.json'), 'utf8'),
+          state: h.store.getConfig('pi.openai-codex.state'),
+        }, before);
+      } finally { h.cleanup(); }
+    });
+  }
+
   it('openai-codex: refuses native-entry-removed when state is migrated and the entry is gone, and rollback then restores the baseline', () => {
     const h = setupCodexRollback();
     try {
@@ -2018,6 +2082,24 @@ describe('Pi migration S58 credential-first barrier', () => {
       const baseline = readFileSync(join(h.paths.baselineDir, 'openai-codex.json'));
       writeFileSync(h.paths.authJsonPath, JSON.stringify({ 'openai-codex': oauth('rotated') }), { mode: 0o600 });
       assert.throws(() => migratePiSingleProvider('openai-codex', h.paths, { keychain: h.keychain, store: h.store, enabledProviders: ALL }), /entry changed after publication/);
+      assert.equal(readFileSync(join(h.paths.baselineDir, 'openai-codex.json')).equals(baseline), true);
+    } finally { h.cleanup(); }
+  });
+
+  it('openai-codex: dry-run refuses a rotated entry after publishing just as a real resume does', () => {
+    const h = setup();
+    try {
+      const native = oauth('native');
+      writeFileSync(h.paths.authJsonPath, JSON.stringify({ 'openai-codex': native }), { mode: 0o600 });
+      assert.throws(() => migratePiSingleProvider('openai-codex', h.paths, {
+        keychain: h.keychain, store: h.store, enabledProviders: ALL,
+        afterWrite: (point) => { if (point === 'publishing') throw new Error('crash'); },
+      }), /crash/);
+      const baseline = readFileSync(join(h.paths.baselineDir, 'openai-codex.json'));
+      writeFileSync(h.paths.authJsonPath, JSON.stringify({ 'openai-codex': oauth('rotated') }), { mode: 0o600 });
+      assert.throws(() => migratePiSingleProvider(
+        'openai-codex', h.paths, { keychain: h.keychain, store: h.store, enabledProviders: ALL }, { dryRun: true },
+      ), /entry changed after publication/);
       assert.equal(readFileSync(join(h.paths.baselineDir, 'openai-codex.json')).equals(baseline), true);
     } finally { h.cleanup(); }
   });
