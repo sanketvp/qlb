@@ -131,6 +131,7 @@ import { canonicalDigest, fencedGeneration, handbackVerdict, isValidEntry, keych
 import {
   JournalKeychainInvalidError,
   resolveSingleGrantKeychain,
+  sharedSingleGrantCoords,
   singleJournalAccount,
   type RollbackDecision,
   type SingleGrantKeychainCoords,
@@ -317,7 +318,7 @@ export class OwnerMapPresentError extends Error {
 }
 
 /** Named crash points for MigrationConfig.afterStep; later rows add their own. */
-export type MigrationCrashPoint = 'S1' | 'S2-reads' | 'S2' | 'S4a' | 'S5' | 'S6c1';
+export type MigrationCrashPoint = 'S1' | 'S1-stage' | 'S1-legacy-delete' | 'S2-reads' | 'S2' | 'S4a' | 'S5' | 'S6c1';
 
 export interface MigrationConfig {
   kind?: MigrationKind;
@@ -1486,6 +1487,16 @@ export class Migration {
 
     if (this.kind === 'single-grant') {
       const account = Array.isArray(current.detail.accounts) ? current.detail.accounts[0] : null;
+      if (this.provider === 'xai' || this.provider === 'kimi-coding') {
+        const coords = resolveSingleGrantKeychain(this.provider, account);
+        const shared = sharedSingleGrantCoords(this.provider);
+        if (coords.service !== shared.service || coords.account !== shared.account) {
+          throw Object.assign(new Error('staged-under-legacy-keychain'), {
+            code: 'staged-under-legacy-keychain',
+            exitCode: 3,
+          });
+        }
+      }
       const id = isObjectRecord(account) && typeof account.id === 'string' ? account.id : null;
       const generation = id ? this.store.getGrantGeneration(id) : null;
       if (generation === null) throw new Error('single-grant commit has no account generation');
@@ -1715,6 +1726,32 @@ export class Migration {
     if (!this.provider || !isSingleGrantProvider(this.provider)) {
       throw new Error('single-grant migration requires provider xai|kimi-coding|openai-codex');
     }
+
+    // OQ-2(a): old pre-commit xai/kimi journals name the legacy per-account
+    // item. Clear that staging copy before replacing its journal with shared
+    // coordinates; C9 (NATIVE) deliberately leaves a kept legacy copy alone.
+    if (
+      (current.state === 'MIRRORED' || (current.state === 'VALIDATED' && current.ownerFile === 'staging'))
+      && (this.provider === 'xai' || this.provider === 'kimi-coding')
+    ) {
+      const journalAccount = Array.isArray(current.detail.accounts)
+        ? current.detail.accounts[0]
+        : undefined;
+      try {
+        const recorded = resolveSingleGrantKeychain(this.provider, journalAccount);
+        const shared = sharedSingleGrantCoords(this.provider);
+        if (recorded.service !== shared.service || recorded.account !== shared.account) {
+          this.deleteStagedItem(recorded, this.provider, typeof journalAccount?.label === 'string' ? journalAccount.label : 'unknown');
+          this.afterStep?.('S1-legacy-delete');
+        }
+      } catch (error) {
+        // Only a journal that resolves to the legacy item is cleared here.
+        // Older incomplete journals are overwritten by this new stage and
+        // remain subject to the normal reader-side fail-closed checks.
+        if (!(error instanceof JournalKeychainInvalidError)) throw error;
+      }
+    }
+
     const keyName = this.authJsonKey ?? this.provider;
     if (!existsSync(this.poolFilePath)) {
       throw new Error(`auth.json not found: ${this.poolFilePath}`);
@@ -1736,7 +1773,9 @@ export class Migration {
       extra,
     };
     const fingerprint = fingerprintRefresh(grant.refresh);
-    const { service, account } = keychainCoords(this.provider, id, label);
+    const keychain = this.provider === 'xai' || this.provider === 'kimi-coding'
+      ? sharedSingleGrantCoords(this.provider)
+      : keychainCoords(this.provider, id, label);
 
     const owner: OwnerFile = {
       owner: 'qlb',
@@ -1745,7 +1784,13 @@ export class Migration {
       exportSeq: 0,
       qlbAccountIds: [id],
       stores: [this.storeName],
-      accounts: [{ id, provider: this.provider, label, fingerprint }],
+      accounts: [{
+        id,
+        provider: this.provider,
+        label,
+        fingerprint,
+        ...(this.provider === 'xai' || this.provider === 'kimi-coding' ? { keychain } : {}),
+      }],
       nativeStrategy: 'shadow-retain',
       authJsonKey: keyName,
     };
@@ -1765,11 +1810,12 @@ export class Migration {
       handback: undefined,
       lastRollback: undefined,
     });
+    this.afterStep?.('S1-stage');
 
     this.store.upsertAccount(id, this.provider, label, 'imported-unvalidated');
     this.store.setAccountStatus(id, 'imported-unvalidated');
     grant.generation = this.store.getGrantGeneration(id) ?? 0;
-    this.keychain.setSync(service, account, JSON.stringify(grant));
+    this.keychain.setSync(keychain.service, keychain.account, JSON.stringify(grant));
     atomicWriteFile(this.stagingPath(), JSON.stringify(owner, null, 2) + '\n');
     return this.status();
   }
