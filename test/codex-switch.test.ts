@@ -3636,6 +3636,22 @@ describe('Codex watch tick — C6-21', () => {
     } finally { close(h); }
   });
 
+  it('after a fence resolution, findCodexSwitchByAttempt returns the ok commit', async () => {
+    const h = switchHarness();
+    try {
+      const watch = await committedWatch(h);
+      splitSlot(h, 'b:account', 'b-killed');
+      codexWrites(h, observedDocument('b', 'b-rotated'));
+      assert.deepEqual(await tick(h, watch, 5_000), { state: 'unresolved', reason: 'slot-split' });
+      const bLogin = observedDocument('b', 'b-login');
+      codexWrites(h, bLogin);
+      importActiveCodexSlot(bLogin, { store: h.store, keychain: h.keychain, now: () => watch.publishedAt + 6_000 });
+      assert.deepEqual(await h.recover(), { state: 'clear' });
+      const found = h.store.findCodexSwitchByAttempt(watch.attempt);
+      assert.deepEqual([found?.id, found?.outcome], [watch.switchId, 'ok']);
+    } finally { close(h); }
+  });
+
   it('switchCodex passes its trigger to admission', async () => {
     const h = switchHarness();
     try {
