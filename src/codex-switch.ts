@@ -65,7 +65,8 @@ export interface CodexSwitchDeps {
     | 'recordCodexObservation' | 'setActiveLogin' | 'commitCodexSwitch' | 'findCodexSwitchByAttempt'
     | 'setRecoveryFence' | 'clearRecoveryFence' | 'commitFenceResolution'
     | 'codexPublishingRowsAfter' | 'commitCodexWatchRevert' | 'commitCodexWatchStop'
-    | 'listDueCodexWatches' | 'advanceCodexWatch' | 'deleteCodexWatch' | 'hasCodexWatch' | 'findCodexWatchCompletion'> & CodexAttributionStore;
+    | 'listDueCodexWatches' | 'advanceCodexWatch' | 'deleteCodexWatch' | 'hasCodexWatch' | 'findCodexWatchCompletion'
+    | 'readCodexWatchDurableResult'> & CodexAttributionStore;
   readLive: () => Promise<CodexAuthStableWithStatResult>;
   cswapProcesses: () => CswapProcess[];
   now: () => number;
@@ -1521,12 +1522,18 @@ function foregroundWatchResultFromDurable(
   result: CodexSwitchResult,
   watch: CodexWatch,
 ): CodexSwitchResult {
-  const completion = deps.store.findCodexWatchCompletion(watch.switchId, watch.attempt);
-  if (completion?.outcome === 'reverted-by-codex') {
+  const durable = deps.store.readCodexWatchDurableResult(watch.switchId, watch.attempt);
+  if (durable.completion?.outcome === 'reverted-by-codex') {
     return { ...result, outcome: 'reverted-by-codex', watch: { state: 'stopped', reason: 'reverted-by-codex' } };
   }
-  if (!deps.store.hasCodexWatch(watch.switchId)) {
-    return { ...result, watch: { state: 'stopped', reason: completion?.detail ?? completion?.outcome ?? 'watch-consumed' } };
+  if (!durable.hasWatch) {
+    return { ...result, watch: { state: 'stopped', reason: durable.completion?.detail ?? durable.completion?.outcome ?? 'watch-consumed' } };
+  }
+  if (durable.recoveryFence?.switchId === watch.switchId && durable.recoveryFence.attempt === watch.attempt) {
+    return { ...result, watch: { state: 'unresolved', reason: durable.recoveryFence.reason } };
+  }
+  if (durable.hasSupersedingPublication) {
+    return { ...result, watch: { state: 'stopped', reason: 'superseded' } };
   }
   return result;
 }

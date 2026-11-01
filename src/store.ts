@@ -2577,6 +2577,24 @@ export class Store {
     return row ?? null;
   }
 
+  /** Snapshot the durable effects a foreground watch may have left before losing its locks. */
+  readCodexWatchDurableResult(switchId: number, attempt: string): {
+    completion: { outcome: string; detail: string | null } | null;
+    hasWatch: boolean;
+    recoveryFence: CodexRecoveryFence | null;
+    hasSupersedingPublication: boolean;
+  } {
+    return this.runImmediate(() => {
+      const completion = this.findCodexWatchCompletion(switchId, attempt);
+      const hasWatch = this.hasCodexWatch(switchId);
+      const recoveryFence = parseCodexRecoveryFence(this.getConfig('codex.recoveryFence'));
+      const hasSupersedingPublication = this.db.prepare(`SELECT 1 FROM switch_log
+        WHERE provider = 'openai-codex' AND id > ?
+          AND (published_at IS NOT NULL OR outcome = 'reverted-by-codex') LIMIT 1`).get(switchId) !== undefined;
+      return { completion, hasWatch, recoveryFence, hasSupersedingPublication };
+    });
+  }
+
   /** Atomically record a watch reversion and consume its watch row. No committed_at: findCodexSwitchByAttempt still finds the ok commit. */
   commitCodexWatchRevert(input: {
     watch: { switchId: number; outgoing: string; target: string; trigger: string };

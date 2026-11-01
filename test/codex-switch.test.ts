@@ -44,7 +44,7 @@ import { codexLockPaths, consumeCodexSlot, withCodexSwitchLock } from '../src/co
 import { accessExpiry, codexFingerprint, codexIdentity, readCodexAuthStable, readCodexAuthStableWithStat, writeCodexAuthAtomic, type CodexAuthDocument } from '../src/codex-auth';
 import { CodexStashUnverifiable, importActiveCodexSlot } from '../src/codex-slots';
 import { MockKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from '../src/keychain';
-import { holderSets, readCodexSwitchHistory, stillTheSameProcess, type CodexProcess } from '../src/codex-sessions';
+import { holderSets, readCodexSwitchHistory, stillTheSameProcess, type CodexProcess, type CodexRecoveryFence } from '../src/codex-sessions';
 import { consumeUnderCodexLocks, runCodexRefreshCommand } from '../src/commands/codex-refresh';
 import { runCodexImportActiveCommand } from '../src/commands/codex-import-active';
 import type { CommandContext } from '../src/registry';
@@ -3768,6 +3768,88 @@ describe('Codex watch tick — C6-21', () => {
           assert.equal(result.lockLostAfterCommit, true);
           assert.equal(watchRows(quiet), 1);
         } finally { close(quiet); }
+      } finally { close(h); }
+    });
+
+    it('a compromise after a tick sets the fence reports its unresolved durable result', async () => {
+      const h = switchHarness();
+      try {
+        let clock = 1_700_000_000_000;
+        const store = Object.create(h.store) as typeof h.store;
+        store.setRecoveryFence = (input) => {
+          h.store.setRecoveryFence(input);
+          throw new CodexAuthLockCompromised();
+        };
+        const result = await h.runWith({ store, now: () => clock, sleep: async (ms) => {
+          clock += ms;
+          if (clock === 1_700_000_001_000) h.keychain.setSync(qlbKeychainService('openai-codex', 'b:account'), QLB_KEYCHAIN_ACCOUNT, '{');
+        } });
+        assert.equal(result.outcome, 'ok');
+        assert.deepEqual(result.watch, { state: 'unresolved', reason: 'slot-split' });
+        assert.equal(result.lockLostAfterCommit, true);
+      } finally { close(h); }
+    });
+
+    it('a compromise after a superseding switch reports stopped/superseded from durable state', async () => {
+      const h = switchHarness();
+      try {
+        let clock = 1_700_000_000_000;
+        const store = Object.create(h.store) as typeof h.store;
+        store.deleteCodexWatch = () => { throw new CodexAuthLockCompromised(); };
+        const result = await h.runWith({ store, now: () => clock, sleep: async (ms) => {
+          clock += ms;
+          if (clock === 1_700_000_001_000) {
+            h.store.recordSwitch({ ts: clock, provider: 'openai-codex', fromAccount: 'b:account', toAccount: 'a:account', trigger: 'manual',
+              outcome: 'ok', stepsJson: JSON.stringify({ attempt: 'later', via: 'switch' }), publishedAt: clock });
+          }
+        } });
+        assert.equal(result.outcome, 'ok');
+        assert.deepEqual(result.watch, { state: 'stopped', reason: 'superseded' });
+        assert.equal(result.lockLostAfterCommit, true);
+      } finally { close(h); }
+    });
+
+    it('a completion injected between durable reads reports reverted-by-codex', async () => {
+      const h = switchHarness();
+      try {
+        type DurableWatchResult = {
+          completion: { outcome: string; detail: string | null } | null;
+          hasWatch: boolean;
+          recoveryFence: CodexRecoveryFence | null;
+          hasSupersedingPublication: boolean;
+        };
+        type DurableStore = typeof h.store & {
+          readCodexWatchDurableResult: (switchId: number, attempt: string) => DurableWatchResult;
+        };
+        const base = h.store as DurableStore;
+        const store = Object.create(base) as DurableStore;
+        let injected = false;
+        let legacyReads = 0;
+        let durableReads = 0;
+        const injectCompletion = (switchId: number, attempt: string) => {
+          if (injected) return;
+          injected = true;
+          h.store.commitCodexWatchRevert({ watch: { switchId, outgoing: 'a:account', target: 'b:account', trigger: 'manual' },
+            setActive: 'a:account', attempt, now: 1_700_000_001_000 });
+        };
+        store.findCodexWatchCompletion = (switchId, attempt) => {
+          legacyReads += 1;
+          const completion = h.store.findCodexWatchCompletion(switchId, attempt);
+          injectCompletion(switchId, attempt);
+          return completion;
+        };
+        store.readCodexWatchDurableResult = (switchId, attempt) => {
+          durableReads += 1;
+          injectCompletion(switchId, attempt);
+          return base.readCodexWatchDurableResult(switchId, attempt);
+        };
+        const result = await h.runWith({ store, hooks: { afterWatchLock: () => { throw new CodexAuthLockCompromised(); } } });
+        assert.equal(injected, true);
+        assert.equal(legacyReads, 0);
+        assert.equal(durableReads, 1);
+        assert.equal(result.outcome, 'reverted-by-codex');
+        assert.deepEqual(result.watch, { state: 'stopped', reason: 'reverted-by-codex' });
+        assert.equal(result.lockLostAfterCommit, true);
       } finally { close(h); }
     });
 
