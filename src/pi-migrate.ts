@@ -334,8 +334,8 @@ function genericMigrationAtRest(provider: PiMigrateProvider, paths: PiMigratePat
     && !pathFacts.hasLegacySidecar
     && !pathFacts.hasCustomOwnerFile
     && !anthropicPathFacts
-    && !legacyOwnerClaim
-    && !danglingOwnerPath
+    && (provider !== 'anthropic' || !legacyOwnerClaim)
+    && (provider !== 'anthropic' || !danglingOwnerPath)
     && (!canonicalOwnerClaim || ownPublishedClaim)
     && detail?.intent !== 'rollback'
     && detail?.rollbackDecision == null
@@ -644,8 +644,8 @@ function rollbackAnthropic(paths: PiMigratePaths, deps: PiMigrateDeps, refresh: 
   if (!genericMigrationAtRest('anthropic', paths, deps, journal)) {
     throw refusal('owned-by-generic-migrate', 'generic pool migration owns anthropic; run qlb migrate rollback --provider anthropic first');
   }
-  // This deliberately happens after ownership evidence and the generic guard:
-  // v1 ownership is a conversion error, not evidence that P7 ran.
+  // A v1 claim for anthropic is generic ownership evidence; any other v1
+  // document remains a conversion error and must stop before the first write.
   readPiOwnerProviders(paths.ownerPath);
   const livePoolPath = join(paths.extensionsDir, 'anthropic-pool');
   const disabledPoolPath = join(paths.disabledExtensionsDir, 'anthropic-pool');
@@ -655,10 +655,17 @@ function rollbackAnthropic(paths: PiMigratePaths, deps: PiMigrateDeps, refresh: 
 
   const auth = readAuth(paths.authJsonPath);
   const current = auth.anthropic;
-  const needsRestore = !isValidEntry(current);
+  const needsRestore = current === undefined || isPiPlaceholder(current);
   let restore: JsonObject | undefined;
   const warnings: string[] = [];
-  if (needsRestore) {
+  if (!needsRestore) {
+    if (!isValidEntry(current)) {
+      throw refusal('unrecognised-anthropic-entry', 'fix or remove the Pi auth.json anthropic entry before rolling back');
+    }
+    try { parseOAuth(current, 'anthropic'); } catch {
+      throw refusal('unrecognised-anthropic-entry', 'fix or remove the Pi auth.json anthropic entry before rolling back');
+    }
+  } else {
     const consumer = store.getConfig('pi.anthropic.baselineConsumedBy') ?? '';
     const consumerRecorded = !journal || phaseAtLeast(journal.phase, 'consumption-recorded');
     if (consumer && consumerRecorded) {
@@ -675,7 +682,9 @@ function rollbackAnthropic(paths: PiMigratePaths, deps: PiMigrateDeps, refresh: 
         if (!oauth || typeof oauth.accessToken !== 'string' || !oauth.accessToken || typeof oauth.refreshToken !== 'string' || !oauth.refreshToken || typeof oauth.expiresAt !== 'number' || !Number.isFinite(oauth.expiresAt)) {
           throw refusal('claude-slot-unreadable');
         }
-        restore = { type: 'oauth', access: oauth.accessToken, refresh: oauth.refreshToken, expires: oauth.expiresAt };
+        const candidate = { type: 'oauth', access: oauth.accessToken, refresh: oauth.refreshToken, expires: oauth.expiresAt };
+        if (!isValidEntry(candidate)) throw refusal('claude-slot-unreadable');
+        restore = parseOAuth(candidate, 'anthropic');
       }
     }
     if (!restore) {
@@ -688,9 +697,8 @@ function rollbackAnthropic(paths: PiMigratePaths, deps: PiMigrateDeps, refresh: 
           if (isValidEntry(candidate)) restore = candidate;
         } catch { throw refusal('baseline-unreadable'); }
       }
-      if (!restore && (current !== undefined || isPiPlaceholder(current))) throw refusal('no-restore-source');
     }
-    if (restore && !isValidEntry(restore)) throw refusal('no-restore-source');
+    if (!restore) throw refusal('no-restore-source');
   }
 
   refresh(); writePiOwnerEntry(paths.ownerPath, 'anthropic', false); refresh(); deps.afterWrite?.('owner-entry');

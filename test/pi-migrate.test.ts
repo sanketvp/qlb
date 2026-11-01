@@ -397,6 +397,14 @@ describe('Pi migration S58 credential-first barrier', () => {
     } finally { h.cleanup(); }
   });
 
+  it('xai migrate with a v1 document claiming xai keeps the origin/main owner-file-legacy-v1 outcome', () => {
+    const h = setup();
+    try {
+      writeFileSync(h.paths.ownerPath, JSON.stringify({ owner: 'qlb', accounts: [{ provider: 'xai' }] }), { mode: 0o600 });
+      expectRefusal(h, 'xai', 'owner-file-legacy-v1', () => migratePiSingleProvider('xai', h.paths, { keychain: h.keychain, store: h.store }));
+    } finally { h.cleanup(); }
+  });
+
   it('rollback unlinks qlb-owner.json when its last entry is removed', () => {
     const h = setup();
     try {
@@ -2011,11 +2019,13 @@ describe('Pi migration S58 credential-first barrier', () => {
     } finally { h.cleanup(); }
   });
 
-  it('anthropic: rollback refuses a legacy v1 owner claim as generic ownership before any write', () => {
+  it('anthropic: rollback refuses owner-file-legacy-v1 with exitCode 3 and writes nothing', () => {
     const h = setupAnthropicRollback();
     try {
-      writeFileSync(h.paths.ownerPath, JSON.stringify({ owner: 'qlb', accounts: [{ provider: 'anthropic' }] }));
-      expectRefusal(h, 'anthropic', 'owned-by-generic-migrate', () => rollbackPiSingleProvider('anthropic', h.paths, { keychain: h.keychain, store: h.store, enabledProviders: ALL }));
+      // This v1 document does not claim anthropic, so the at-rest ownership
+      // check permits it and rollback reaches the legacy-document refusal.
+      writeFileSync(h.paths.ownerPath, JSON.stringify({ owner: 'qlb', accounts: [{ provider: 'xai' }] }));
+      expectRefusal(h, 'anthropic', 'owner-file-legacy-v1', () => rollbackPiSingleProvider('anthropic', h.paths, { keychain: h.keychain, store: h.store, enabledProviders: ALL }));
     } finally { h.cleanup(); }
   });
 
@@ -2097,21 +2107,23 @@ describe('Pi migration S58 credential-first barrier', () => {
     } finally { h.cleanup(); }
   });
 
-  it('anthropic: malformed present entries are restored from a valid baseline, or refuse no-restore-source without cleanup when every source is invalid', () => {
-    for (const current of [{ type: 'oauth', access: 'partial' }, null, 'malformed']) {
+  it('anthropic: rollback refuses absent or placeholder entries without a valid source and every unrecognised present entry before cleanup', () => {
+    const cases: Array<{ name: string; current: unknown; baseline: Record<string, unknown>; code: string }> = [
+      { name: 'absent entry with invalid baseline', current: undefined, baseline: { ...oauth('invalid-absent'), type: 'api-key' }, code: 'no-restore-source' },
+      { name: 'placeholder with invalid baseline', current: { type: 'oauth', access: 'qlb-managed', refresh: '', expires: 1 }, baseline: { ...oauth('invalid-placeholder'), type: 'api-key' }, code: 'no-restore-source' },
+      { name: 'incomplete entry', current: { type: 'oauth', access: 'partial' }, baseline: oauth('valid-incomplete'), code: 'unrecognised-anthropic-entry' },
+      { name: 'Pi api key entry', current: { type: 'api_key', key: 'fixture' }, baseline: oauth('valid-api-key'), code: 'unrecognised-anthropic-entry' },
+      { name: 'empty-access OAuth entry', current: { type: 'oauth', access: '', refresh: 'refresh-fixture', expires: 1 }, baseline: oauth('valid-empty-access'), code: 'unrecognised-anthropic-entry' },
+    ];
+    for (const fixture of cases) {
       const h = setupAnthropicRollback();
       try {
-        writeFileSync(h.paths.authJsonPath, JSON.stringify({ anthropic: current }));
-        rollbackPiSingleProvider('anthropic', h.paths, { keychain: h.keychain, store: h.store, enabledProviders: ALL });
-        assertAnthropicRollbackClean(h);
+        writeFileSync(h.paths.authJsonPath, JSON.stringify(fixture.current === undefined ? {} : { anthropic: fixture.current }));
+        writeFileSync(join(h.paths.baselineDir, 'anthropic.json'), JSON.stringify(fixture.baseline));
+        writePiJournal(h.paths, 'anthropic', 'published');
+        expectRefusal(h, 'anthropic', fixture.code, () => rollbackPiSingleProvider('anthropic', h.paths, { keychain: h.keychain, store: h.store, enabledProviders: ALL }));
       } finally { h.cleanup(); }
     }
-    const h = setupAnthropicRollback();
-    try {
-      writeFileSync(h.paths.authJsonPath, JSON.stringify({ anthropic: { type: 'oauth', access: 'partial' } }));
-      writeFileSync(join(h.paths.baselineDir, 'anthropic.json'), JSON.stringify({ ...h.baseline, type: 'api-key' }));
-      expectRefusal(h, 'anthropic', 'no-restore-source', () => rollbackPiSingleProvider('anthropic', h.paths, { keychain: h.keychain, store: h.store, enabledProviders: ALL }));
-    } finally { h.cleanup(); }
   });
 
   it('anthropic: rollback un-owns before restoring the auth entry', () => {
