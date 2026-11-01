@@ -576,3 +576,27 @@ describe('Codex recovery fence resolution — C6-20', () => {
     } finally { store.close(); }
   });
 });
+
+describe('Codex slot lineage chains', () => {
+  it('listCodexSlotLineageChains follows lineage_log edges in both directions and omits archived and dead slots', () => {
+    const store = openStore(':memory:');
+    try {
+      const db = (store as unknown as { db: DatabaseSync }).db;
+      db.prepare(`INSERT INTO codex_slots (
+        account_id, chatgpt_user_id, chatgpt_account_id, fingerprint, prev_fingerprint, dead, source, archived_at, added_at
+      ) VALUES
+        ('slot-a', 'user-a', 'account-a', 'F1', 'F0', 0, 'import-active', NULL, 1),
+        ('slot-b', 'user-b', 'account-b', 'B1', 'B0', 0, 'import-active', 2, 1),
+        ('slot-c', 'user-c', 'account-c', 'C1', 'C0', 1, 'import-active', NULL, 1)`).run();
+      db.prepare(`INSERT INTO lineage_log (ts, provider, account_id, from_fp, to_fp, cause, by) VALUES
+        (1, 'openai-codex', 'slot-a', 'F0', 'F1', 'fixture', 'test'),
+        (2, 'openai-codex', 'slot-a', 'F1', 'F2', 'fixture', 'test')`).run();
+
+      assert.deepEqual(store.listCodexSlotLineageChains().map(({ lineages, ...slot }) => ({
+        ...slot, lineages: new Set(lineages),
+      })), [{ accountId: 'slot-a', source: 'import-active', lineages: new Set(['F1', 'F0', 'F2']) }]);
+    } finally {
+      store.close();
+    }
+  });
+});
