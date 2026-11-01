@@ -271,7 +271,7 @@ async function switchClaudeAttempt(deps: ClaudeSwitchDeps, input: SwitchClaudeIn
           // while the same account is active under the transaction locks.
           if (prepared.active !== from) {
             if (retriedPhaseA) return refusal(deps, input, attempt, from, 'active-changed');
-            if (prepared.active === input.to && from !== input.to) throw new RestartPhaseA();
+            if (prepared.active === input.to || from === input.to) throw new RestartPhaseA();
           }
           // Phase A has already admitted immutable inputs. Re-check mutable
           // breaker and C-swap admission while the transaction is serialized.
@@ -336,7 +336,7 @@ async function switchClaudeAttempt(deps: ClaudeSwitchDeps, input: SwitchClaudeIn
             publishedAt = deps.now();
             journalUpdate(ownerHeld, { credentialsWritten: true, publishedAt }, options);
             state.started.push(7); await deps.hooks?.afterStep7?.(); deps.crashAt?.('after-step-7');
-          } catch (error) { if (isCrash(error)) throw error; return failed(deps, input, attempt, from, 'step-7', writeError(error, 'keychain-write-failed'), state, 7); }
+          } catch (error) { if (isCrash(error)) throw error; return failed(deps, input, attempt, from, 'step-7', writeError(error, 'keychain-write-failed'), state, 7, publishedAt); }
           // Step 8: config lock covers raw read, planning splice, journal intent, and write only.
           try {
             await configLock(paths.globalConfigPath, { env: deps.env }, async (configHeld) => {

@@ -364,6 +364,33 @@ describe('Claude switch transaction (K5-5)', () => {
     assert.deepEqual({ outcome: result.outcome, from: result.from, to: result.to, exitCode: result.exitCode }, { outcome: 'noop', from: 'account-a', to: 'account-a', exitCode: 0 });
   });
 
+  it('a target that becomes active while its Phase-A freshen is in flight is not reported noop: Phase A restarts once and the live credential and the slot agree', async () => {
+    const subject = await transactionFixture();
+    let transactionLocks = 0;
+    let consumeSwitchLocks = 0;
+    await subject.slots.writeSlot('account-b', credential('b', NOW + 10 * 60_000), { cause: 'post' });
+    subject.deps.consume.postRefresh = async () => ({ status: 200, body: JSON.stringify({ access_token: 'fixture-issued', refresh_token: 'fixture-refresh-issued', expires_in: 3600 }) });
+    subject.deps.consume.withSwitchLock = async (fn) => {
+      consumeSwitchLocks += 1;
+      if (consumeSwitchLocks === 3) {
+        subject.deps.store.setActiveLogin('anthropic', 'account-b', 'manual', NOW);
+        await subject.backend.set(subject.paths.keychainService, 'fixture-user', JSON.stringify({ claudeAiOauth: { accessToken: 'fixture-issued', refreshToken: 'fixture-refresh-issued', expiresAt: NOW + 60 * 60_000 } }));
+      }
+      return fn();
+    };
+    subject.deps.locks = {
+      switch: (async (fn: () => Promise<unknown>, options: unknown) => {
+        transactionLocks += 1;
+        return withClaudeSwitchLock(fn, options as never);
+      }) as unknown as NonNullable<ClaudeSwitchDeps['locks']>['switch'],
+    };
+
+    await switchClaude(subject.deps, manual);
+
+    assert.equal(transactionLocks, 2);
+    assert.equal(await subject.backend.get(subject.paths.keychainService, 'fixture-user'), (await subject.slots.readSlot('account-b', { fresh: true })).credential);
+  });
+
   it('a target that was active in Phase A but is no longer active under the lock restarts Phase A once, freshens and commits', async () => {
     const subject = await transactionFixture();
     const events: string[] = [];
@@ -951,14 +978,14 @@ describe('Claude switch transaction (K5-5)', () => {
     assert.equal(existsSync(path), false);
   });
 
-  it('a second switch that starts while the first holds the journal owner lock does not refuse: it waits on the switch lock and records noop (owner-probe spy returns held)', async () => {
+  it('a target that is active in Phase A and still active under the lock is a noop (a second switch starts while the first holds the journal owner lock)', async () => {
     const subject = await transactionFixture();
     const journalPath = seedJournal(subject);
     let probes = 0;
     subject.deps.probeOwner = () => { probes += 1; return 'held'; };
+    subject.deps.store.setActiveLogin('anthropic', 'account-b', 'manual', NOW);
     subject.deps.locks = { owner: async (options, fn) => {
       unlinkSync(journalPath);
-      subject.deps.store.setActiveLogin('anthropic', 'account-b', 'manual', NOW);
       return withClaudeSwitchJournalOwner(options, fn);
     } };
     const result = await switchClaude(subject.deps, manual);
@@ -1047,7 +1074,7 @@ describe('Claude switch transaction (K5-5)', () => {
     assert.equal(subject.rows.length, 1);
     assert.deepEqual(subject.rows[0], {
       ts: NOW, provider: 'anthropic', fromAccount: 'account-a', toAccount: 'account-b', trigger: 'manual', outcome: 'failed',
-      error: 'keychain-write-failed', detail: 'step-7', injected: false, stepsJson: JSON.stringify({ ...result.steps, attempt: 'attempt-k5-5' }),
+      error: 'keychain-write-failed', detail: 'step-7', injected: false, stepsJson: JSON.stringify({ ...result.steps, attempt: 'attempt-k5-5' }), publishedAt: null,
     });
   });
 
