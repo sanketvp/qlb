@@ -9,13 +9,16 @@ import { MacosKeychainBackend, markFakeExecutor, MockKeychain, NativeOpenRouterK
 import { openStore } from '../src/store';
 import { ADAPTER_ACCOUNT_IDS, Migration, PI_POOL_STORE } from '../src/migration';
 import { sharedSingleGrantCoords } from '../src/single-grant-ownership';
+import { piAuthBackupPath } from '../src/pi-auth-backup';
 import { exitCodeForError, runExecutingCommand } from '../src/cli';
 import { executePiRollback } from '../src/commands/pi-rollback';
 import {
   assertDirOutsideGitWorktree,
   defaultPiMigratePaths,
   hasLegacyPiOwnerEntry,
+  PiOwnerLegacyError,
   withPiAuthLock,
+  writePiOwnerEntry,
   migratePiSingleProvider,
   rollbackPiSingleProvider,
   type PiMigratePaths,
@@ -203,25 +206,51 @@ describe('Pi migration S58 credential-first barrier', () => {
       writeFileSync(h.paths.authJsonPath, JSON.stringify({
         anthropic: oauth('anthropic-native'),
         xai: oauth('xai-native'),
-      }) + '\n', { mode: 0o600 });
+      }, null, 2) + '\n', { mode: 0o600 });
       h.store.upsertMigration(PI_POOL_STORE, 'QLB_OWNED', '{}');
 
+      const originalAuth = readFileSync(h.paths.authJsonPath);
       const pool = new Migration(h.store, h.keychain, h.paths.poolFilePath, h.paths.ownerPath, undefined, {
         authJsonPath: h.paths.authJsonPath,
+        allowPoolLegacyConversion: true,
       });
       pool.resume();
       const converted = JSON.parse(readFileSync(h.paths.ownerPath, 'utf8')) as { providers: Record<string, { mode?: string }> };
       assert.equal(converted.providers.anthropic?.mode, 'qlb');
       assert.equal(placeholderPresent(h.paths, 'anthropic'), true);
+      const backup = JSON.parse(readFileSync(piAuthBackupPath(h.paths.authJsonPath, 'anthropic'), 'utf8')) as { entry?: unknown };
+      assert.deepEqual(backup.entry, JSON.parse(originalAuth.toString()).anthropic);
 
       migratePiSingleProvider('xai', h.paths, { keychain: h.keychain, store: h.store, enabledProviders: ALL });
       const shared = JSON.parse(readFileSync(h.paths.ownerPath, 'utf8')) as { providers: Record<string, { mode?: string }> };
       assert.equal(shared.providers.anthropic?.mode, 'qlb');
       assert.equal(shared.providers.xai?.mode, 'qlb');
+      pool.rollback();
+      assert.equal(existsSync(h.paths.ownerPath), true, 'xai remains after Anthropic rollback');
+      const afterPoolRollback = JSON.parse(readFileSync(h.paths.ownerPath, 'utf8')) as { providers: Record<string, unknown> };
+      assert.equal(afterPoolRollback.providers.anthropic, undefined);
+      rollbackPiSingleProvider('xai', h.paths, { keychain: h.keychain, store: h.store, enabledProviders: ALL });
+      assert.deepEqual(readFileSync(h.paths.authJsonPath), originalAuth);
+      assert.equal(existsSync(h.paths.ownerPath), false);
     } finally {
       h.cleanup();
     }
   });
+  it('refuses replacing a mixed legacy owner document without writing', () => {
+    const h = setup();
+    try {
+      const legacy = JSON.stringify({ owner: 'qlb', accounts: [{ provider: 'anthropic' }, { provider: 'xai' }] }) + '\n';
+      writeFileSync(h.paths.ownerPath, legacy, { mode: 0o600 });
+      assert.throws(
+        () => writePiOwnerEntry(h.paths.ownerPath, 'anthropic', true, { replaceLegacyDocument: true }),
+        (error: unknown) => error instanceof PiOwnerLegacyError && error.exitCode === 3,
+      );
+      assert.equal(readFileSync(h.paths.ownerPath, 'utf8'), legacy);
+    } finally {
+      h.cleanup();
+    }
+  });
+
   it('openai-codex and anthropic are refused provider-not-enabled by migrate and rollback before the lock by default', () => {
     for (const provider of ['openai-codex', 'anthropic'] as const) {
       for (const operation of [migratePiSingleProvider, rollbackPiSingleProvider]) {

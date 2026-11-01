@@ -103,6 +103,18 @@ export function hasLegacyPiOwnerEntry(path: string, provider: string): boolean {
 export interface WritePiOwnerEntryOptions {
   /** P7b8 Anthropic conversion only: replace a legacy v1 owner document. */
   replaceLegacyDocument?: boolean;
+  /** The v1 document being converted when it is not at the canonical map path. */
+  legacyDocumentPath?: string;
+}
+
+function assertLegacyDocumentClaimsOnly(path: string, provider: string): void {
+  const owner = asObject(JSON.parse(readFileSync(path, 'utf8')), 'Pi owner file is not an object');
+  if (Object.prototype.hasOwnProperty.call(owner, 'providers')) return;
+  const accounts = owner.accounts;
+  if (!Array.isArray(accounts) || accounts.some((account) => !account || typeof account !== 'object'
+    || Array.isArray(account) || (account as JsonObject).provider !== provider)) {
+    throw new PiOwnerLegacyError();
+  }
 }
 
 /** Atomic, caller-lock-protected mutation of the canonical v2 owner map. */
@@ -112,11 +124,16 @@ export function writePiOwnerEntry(
   owned: boolean,
   options: WritePiOwnerEntryOptions = {},
 ): void {
+  const legacyPath = options.legacyDocumentPath ?? path;
+  if (options.replaceLegacyDocument && lstatPresent(legacyPath)) {
+    assertLegacyDocumentClaimsOnly(legacyPath, provider);
+  }
   let current: JsonObject;
   try {
     current = readPiOwnerProviders(path);
   } catch (error) {
     if (!(error instanceof PiOwnerLegacyError) || !options.replaceLegacyDocument) throw error;
+    assertLegacyDocumentClaimsOnly(path, provider);
     current = {};
   }
   const providers = { ...current };
@@ -124,6 +141,9 @@ export function writePiOwnerEntry(
   else delete providers[provider];
   if (Object.keys(providers).length === 0) { if (lstatPresent(path)) unlinkSync(path); return; }
   writeJson(path, { providers });
+  if (options.replaceLegacyDocument && resolve(legacyPath) !== resolve(path) && lstatPresent(legacyPath)) {
+    unlinkSync(legacyPath);
+  }
 }
 function writeJson(path: string, value: unknown): void { mkdirSync(dirname(path), { recursive: true, mode: 0o700 }); atomicWriteText(path, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 }); }
 function writeJournal(path: string, journal: Journal, refresh?: () => void): void { refresh?.(); mkdirSync(dirname(path), { recursive: true, mode: 0o700 }); atomicWriteText(path, `${JSON.stringify(journal)}\n`, { mode: 0o600 }); }

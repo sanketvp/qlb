@@ -209,6 +209,7 @@ type MigrateOpts = {
   sub: MigrateSub;
   json: boolean;
   provider: MigrateProvider;
+  providerExplicit: boolean;
   poolFile: string;
   ownerFile: string;
   authJson: string;
@@ -395,6 +396,7 @@ function parseMigrateArgs(args: string[]): MigrateOpts {
     sub: subRaw,
     json,
     provider,
+    providerExplicit: providerRaw !== undefined,
     poolFile: poolFile ?? DEFAULT_POOL_FILE,
     ownerFile: ownerFile ?? defaultOwnerFileFor(provider),
     authJson: authJson ?? DEFAULT_AUTH_JSON,
@@ -1311,7 +1313,10 @@ async function runMigrate(opts: MigrateOpts): Promise<number> {
             opts.authJson,
             opts.ownerFile,
           )
-        : new Migration(store, platformKeychain, opts.poolFile, opts.ownerFile, undefined, { authJsonPath: opts.authJson });
+        : new Migration(store, platformKeychain, opts.poolFile, opts.ownerFile, undefined, {
+          authJsonPath: opts.authJson,
+          allowPoolLegacyConversion: opts.provider === 'anthropic' && opts.providerExplicit,
+        });
     let status;
     switch (opts.sub) {
       case 'stage':
