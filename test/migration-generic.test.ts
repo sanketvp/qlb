@@ -423,12 +423,19 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       const changed = JSON.parse(readFileSync(h.authPath, 'utf8')) as typeof FAKE_GRANTS;
       changed.xai = { ...changed.xai, refresh: 'xai-refresh-after-owner-crash-fake' };
       writeFileSync(h.authPath, JSON.stringify(changed, null, 2) + '\n');
+      const nativeAfterCrash = readFileSync(h.authPath);
+      const backupAfterCrash = readFileSync(piAuthBackupPath(h.authPath, 'xai'));
       const resumed = createSingleGrantMigration(h.store, h.kc, 'xai', h.authPath, h.ownerPath);
-      assert.equal(resumed.resume().state, 'QLB_OWNED');
-      assert.deepEqual(readPiAuthBackup(h.authPath, 'xai')?.entry, FAKE_GRANTS.xai, 'resume preserves the pre-claim native backup');
-      assert.equal(isPiPlaceholder(JSON.parse(readFileSync(h.authPath, 'utf8')).xai), true);
+      assert.throws(() => resumed.resume(), (error: Error & { exitCode?: unknown }) => {
+        assert.match(error.message, /native entry changed since stage; re-run stage/);
+        assert.equal(error.exitCode, undefined, 'resume retains the commit refusal exit code');
+        return true;
+      });
+      assert.deepEqual(readFileSync(h.authPath), nativeAfterCrash, 'resume preserves the newer native entry');
+      assert.deepEqual(readFileSync(piAuthBackupPath(h.authPath, 'xai')), backupAfterCrash, 'resume preserves the pre-claim backup');
       resumed.rollback();
-      assert.deepEqual(JSON.parse(readFileSync(h.authPath, 'utf8')).xai, FAKE_GRANTS.xai, 'rollback restores the original native entry');
+      assert.equal(existsSync(map), false, 'rollback removes the owner entry after the refused resume');
+      assert.deepEqual(JSON.parse(readFileSync(h.authPath, 'utf8')).xai, changed.xai, 'rollback keeps the newer native entry');
     } finally { h.cleanup(); }
   });
 

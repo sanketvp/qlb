@@ -503,6 +503,12 @@ function parseDetail(raw: string | null | undefined): Record<string, unknown> {
   return {};
 }
 
+/** The generic journal can bind a provider to a non-default Pi auth.json key. */
+export function genericAuthJsonKey(provider: string, detailJson?: string | null): string {
+  const key = parseDetail(detailJson).authJsonKey;
+  return typeof key === 'string' && key.length > 0 ? key : provider;
+}
+
 function asState(raw: string | null | undefined): MigrationState {
   if (
     raw === 'NATIVE' ||
@@ -1214,8 +1220,9 @@ export class Migration {
 
   /**
    * For the map path: false for a v2 map or no file (S4a owns those), true for
-   * a v1 document whose accounts all name this provider; any other v1 document
-   * refuses owner-file-orphan (exit 3) and is kept.
+   * a v1 document whose accounts all name this provider; a foreign-only v1
+   * document is kept while this provider's sidecar is unlinked, while mixed or
+   * ownerless v1 documents refuse owner-file-orphan (exit 3).
    */
   private mapPathV1NamesOnlyThisProvider(): boolean {
     try {
@@ -1572,7 +1579,7 @@ export class Migration {
       const native = auth[authKey];
       if (!isObjectRecord(native) || typeof native.refresh !== 'string' || !stagedFingerprint
         || fingerprintRefresh(native.refresh) !== stagedFingerprint) {
-        throw new Error('native entry changed since stage; re-run stage');
+        throw this.nativeEntryChangedSinceStage();
       }
       // `commitGeneration` remains the C5 crash classifier. The ordered
       // publication below is backup → v2 owner entry → Pi placeholder.
@@ -2303,12 +2310,24 @@ export class Migration {
     if (isPiPlaceholder(auth[authKey])) return;
     const cycle = this.ensureAuthBackupCycle();
     const existing = readPiAuthBackup(this.poolFilePath, authKey);
-    if (existing?.cycleId !== cycle) {
+    if (existing?.cycleId === cycle) {
+      const live = auth[authKey];
+      const backedUp = existing.entry;
+      if (!isObjectRecord(live) || typeof live.refresh !== 'string'
+        || !isObjectRecord(backedUp) || typeof backedUp.refresh !== 'string'
+        || fingerprintRefresh(live.refresh) !== fingerprintRefresh(backedUp.refresh)) {
+        throw this.nativeEntryChangedSinceStage();
+      }
+    } else {
       writePiAuthBackup(this.poolFilePath, authKey, cycle);
       this.afterWrite?.('backup');
     }
     this.writeSingleGrantPlaceholder(authKey);
     this.afterWrite?.('placeholder');
+  }
+
+  private nativeEntryChangedSinceStage(): Error {
+    return new Error('native entry changed since stage; re-run stage');
   }
 
   /** The backup cycle is durable before B is written, including C5 recovery of old journals. */

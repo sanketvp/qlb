@@ -25,6 +25,7 @@ import { QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, type KeychainBackend } from '
 import { isCredentialNotFound } from './credential-backends';
 import {
   accountIdForSingleGrant,
+  genericAuthJsonKey,
   fingerprintApiKey,
   legacyCodexAccountIdForSingleGrant,
   isSingleGrantProvider,
@@ -502,8 +503,8 @@ export function createNativeCredentialReader(opts: {
   poolFilePath: string;
   authJsonPath: string;
   readOpenRouterKey?: () => string;
-}): (provider: string, accountId: string) => Promise<ResyncCredential | null> {
-  return async (provider, accountId) => {
+}): (provider: string, accountId: string, migration?: MigrationRow | null) => Promise<ResyncCredential | null> {
+  return async (provider, accountId, migration) => {
     try {
       if (provider === 'anthropic') {
         const live = opts.poolFilePath;
@@ -521,9 +522,10 @@ export function createNativeCredentialReader(opts: {
       }
       if (isSingleGrantProvider(provider)) {
         if (!existsSync(opts.authJsonPath)) return null;
+        const authJsonKey = genericAuthJsonKey(provider, migration?.detail_json);
         const parsed = parseAuthJsonGrant(
           readFileSync(opts.authJsonPath, 'utf8'),
-          provider,
+          authJsonKey,
         );
         // A generic P7b6 commit deliberately replaces the native entry with
         // QLB's placeholder. It is an ownership marker, never a credential
@@ -537,7 +539,7 @@ export function createNativeCredentialReader(opts: {
         if (!matches) return null;
         const extra: Record<string, unknown> = {
           type: parsed.type ?? 'oauth',
-          authJsonKey: provider,
+          authJsonKey,
         };
         if (parsed.accountId) extra.accountId = parsed.accountId;
         const grant: Grant = {
@@ -562,6 +564,7 @@ export function bindDetectAndResync(opts: {
   readNativeCredential: (
     provider: string,
     accountId: string,
+    migration?: MigrationRow | null,
   ) => Promise<ResyncCredential | null>;
 }): (accountId: string, provider: string) => Promise<ResyncResult> {
   return async (accountId, provider) => {
@@ -576,7 +579,11 @@ export function bindDetectAndResync(opts: {
       keychain: opts.keychain,
       mayWriteOwnedCredential: () =>
         permitsNativeResync(opts.store.getMigration(migrationStore), accountId),
-      readNativeCredential: () => opts.readNativeCredential(provider, accountId),
+      readNativeCredential: () => opts.readNativeCredential(
+        provider,
+        accountId,
+        opts.store.getMigration(migrationStore),
+      ),
       readOwnedCredential: async (keychain, id) => {
         outerGeneration = opts.store.getGrantGeneration(id);
         outerKeychain = isMovedSingleGrantProvider(provider)
