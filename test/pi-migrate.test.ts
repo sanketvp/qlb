@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { describe, it } from 'node:test';
@@ -9,6 +9,8 @@ import { MacosKeychainBackend, markFakeExecutor, MockKeychain, NativeOpenRouterK
 import { openStore } from '../src/store';
 import { ADAPTER_ACCOUNT_IDS } from '../src/migration';
 import { sharedSingleGrantCoords } from '../src/single-grant-ownership';
+import { exitCodeForError, runExecutingCommand } from '../src/cli';
+import { executePiRollback } from '../src/commands/pi-rollback';
 import {
   defaultPiMigratePaths,
   hasLegacyPiOwnerEntry,
@@ -1118,6 +1120,229 @@ describe('Pi migration S58 credential-first barrier', () => {
         }
       }
       assert.equal(existsSync(lock), false, `finished racers left a lock behind: ${detail}`);
+    } finally { h.cleanup(); }
+  });
+
+  it('P7a-r: holder A makes no write after holder B takes over its stale lock', () => {
+    const h = setup();
+    try {
+      const kept = plantKeptGenericCopy(h, 'xai');
+      const setSync = h.keychain.setSync.bind(h.keychain);
+      const writes: string[] = [];
+      h.keychain.setSync = (service, account, value) => {
+        writes.push(`${service}/${account}`);
+        return setSync(service, account, value);
+      };
+      let bTookOver = false;
+      const now = () => 10_000;
+
+      assert.throws(() => migratePiSingleProvider('xai', h.paths, {
+        keychain: h.keychain,
+        store: h.store,
+        withAuthLock: (path, holderA) => withPiAuthLock(path, (refreshA) => {
+          const lock = `${path}.lock`;
+          writeFileSync(join(lock, 'qlb-lock-owner.json'), JSON.stringify({ pid: 999_999, nonce: 'misjudged-stale' }));
+          utimesSync(lock, new Date(now() - 2), new Date(now() - 2));
+          return withPiAuthLock(path, () => {
+            bTookOver = true;
+            return holderA(refreshA);
+          }, { staleMs: 1, retries: 0, retryMs: 0, now });
+        }, { staleMs: 1, retries: 0, retryMs: 0, now }),
+      }), (error: unknown) => (error as { code?: unknown; message?: unknown }).code === 'pi-auth-lock-lost'
+        && /another run took the auth\.json lock over/.test(String((error as { message?: unknown }).message)));
+
+      assert.equal(bTookOver, true, 'holder B took over holder A\'s stale lock');
+      assert.deepEqual(writes, [], 'holder A must make no write after the takeover');
+      assert.throws(() => h.keychain.getSync(kept.stashService, QLB_KEYCHAIN_ACCOUNT), /item not found/);
+    } finally { h.cleanup(); }
+  });
+
+  it('P7a-r: pi rollback makes no managed-item delete after its lock is taken over during the kept-copy stash', () => {
+    const h = setup();
+    try {
+      const kept = plantKeptGenericCopy(h, 'xai');
+      const lockOwner = join(`${h.paths.authJsonPath}.lock`, 'qlb-lock-owner.json');
+      const deletes: string[] = [];
+      const keychain = {
+        setSync(service: string, account: string, value: string) {
+          h.keychain.setSync(service, account, value);
+          // Barrier: holder B takes the lock over right after A's stash write.
+          if (service === kept.stashService) writeFileSync(lockOwner, JSON.stringify({ pid: process.pid, nonce: 'holder-b' }));
+        },
+        getSync: h.keychain.getSync.bind(h.keychain),
+        deleteSync(service: string, account: string) { deletes.push(`${service}/${account}`); h.keychain.deleteSync(service, account); },
+      };
+      assert.throws(
+        () => rollbackPiSingleProvider('xai', h.paths, { keychain, store: h.store }),
+        (error: unknown) => (error as { code?: unknown }).code === 'pi-auth-lock-lost',
+      );
+      assert.deepEqual(deletes, [], 'holder A must not delete the managed item after the takeover');
+      assert.equal(h.keychain.getSync(kept.service, kept.account), kept.kept, 'the shared item is intact');
+      assert.deepEqual(JSON.parse(readFileSync(lockOwner, 'utf8')), { pid: process.pid, nonce: 'holder-b' }, 'B\'s lock is left intact');
+    } finally { h.cleanup(); }
+  });
+
+  it('P7a-r: a lock lost before removing an unverified stash names the stash left behind', () => {
+    const h = setup();
+    try {
+      const kept = plantKeptGenericCopy(h, 'xai');
+      const lockOwner = join(`${h.paths.authJsonPath}.lock`, 'qlb-lock-owner.json');
+      const deletes: string[] = [];
+      let stashReads = 0;
+      const keychain = {
+        setSync: h.keychain.setSync.bind(h.keychain),
+        getSync(service: string, account: string) {
+          const value = h.keychain.getSync(service, account);
+          // The presence check throws not-found above, so the first stash value read is the verify read.
+          // Barrier: the read-back differs and holder B takes the lock over at the same moment.
+          if (service !== kept.stashService || ++stashReads !== 1) return value;
+          writeFileSync(lockOwner, JSON.stringify({ pid: process.pid, nonce: 'holder-b' }));
+          return value.slice(0, 10);
+        },
+        deleteSync(service: string, account: string) { deletes.push(`${service}/${account}`); h.keychain.deleteSync(service, account); },
+      };
+      assert.throws(
+        () => migratePiSingleProvider('xai', h.paths, { keychain, store: h.store }),
+        (error: unknown) => {
+          const e = error as { code?: unknown; message?: unknown; cause?: { code?: unknown } };
+          return e.code === 'pi-auth-lock-lost'
+            && String(e.message).includes('another run took the auth.json lock over')
+            && String(e.message).includes(`unverified kept-copy stash ${kept.stashService} (account ${QLB_KEYCHAIN_ACCOUNT})`)
+            && e.cause?.code === 'kept-copy-stash-unverified'
+            && exitCodeForError(error) === 1;
+        },
+      );
+      assert.deepEqual(deletes, [], 'holder A must not delete after the takeover');
+    } finally { h.cleanup(); }
+  });
+
+  describe('P7a-r-Q2: pi-auth-lock-lost exits 3 before the first write and 1 once a write has landed', () => {
+    // Barrier: holder B takes the lock over by rewriting its owner file.
+    const takeOver = (path: string) => writeFileSync(join(`${path}.lock`, 'qlb-lock-owner.json'), JSON.stringify({ pid: process.pid, nonce: 'holder-b' }));
+    // Lock wrapper that lets B take over after A acquires the lock and before A runs.
+    const takenOverOnEntry = <T>(path: string, fn: (refresh: () => void) => T): T => withPiAuthLock(path, (refresh) => { takeOver(path); return fn(refresh); });
+    const lockLostWithExit = (exit: number) => (error: unknown) => (error as { code?: unknown }).code === 'pi-auth-lock-lost' && exitCodeForError(error) === exit;
+    const snapshot = (h: ReturnType<typeof setup>) => ({
+      auth: readFileSync(h.paths.authJsonPath, 'utf8'),
+      owner: existsSync(h.paths.ownerPath) ? readFileSync(h.paths.ownerPath, 'utf8') : null,
+      journal: existsSync(join(h.paths.journalPath, 'pi-migrate-xai.json')),
+      baseline: existsSync(join(h.paths.baselineDir, 'xai.json')) ? readFileSync(join(h.paths.baselineDir, 'xai.json'), 'utf8') : null,
+      managed: hasManaged(h.keychain, 'xai') ? h.keychain.getSync(qlbKeychainService('xai', 'default'), QLB_KEYCHAIN_ACCOUNT) : null,
+      state: h.store.getConfig('pi.xai.state') ?? null,
+    });
+
+    it('pi migrate: lock lost before the first write exits 3 and writes nothing', () => {
+      const h = setup();
+      try {
+        const before = snapshot(h);
+        assert.throws(() => migratePiSingleProvider('xai', h.paths, { keychain: h.keychain, store: h.store, withAuthLock: takenOverOnEntry }), lockLostWithExit(3));
+        assert.deepEqual(snapshot(h), before, 'nothing written');
+      } finally { h.cleanup(); }
+    });
+
+    it('pi migrate: lock lost after a write exits 1', () => {
+      const h = setup();
+      try {
+        assert.throws(() => migratePiSingleProvider('xai', h.paths, {
+          keychain: h.keychain,
+          store: h.store,
+          afterWrite: (point) => { if (point === 'baseline') takeOver(h.paths.authJsonPath); },
+        }), lockLostWithExit(1));
+        assert.equal(existsSync(join(h.paths.baselineDir, 'xai.json')), true, 'the baseline write landed');
+      } finally { h.cleanup(); }
+    });
+
+    it('pi rollback: lock lost before the first write exits 3 and writes nothing', () => {
+      const h = setup();
+      try {
+        assert.equal(migratePiSingleProvider('xai', h.paths, { keychain: h.keychain, store: h.store }).state, 'migrated');
+        const before = snapshot(h);
+        assert.throws(() => rollbackPiSingleProvider('xai', h.paths, { keychain: h.keychain, store: h.store, withAuthLock: takenOverOnEntry }), lockLostWithExit(3));
+        assert.deepEqual(snapshot(h), before, 'nothing written');
+      } finally { h.cleanup(); }
+    });
+
+    it('qlb pi rollback through the CLI entry: lock lost before the first write exits 3', async () => {
+      const h = setup();
+      try {
+        assert.equal(migratePiSingleProvider('xai', h.paths, { keychain: h.keychain, store: h.store }).state, 'migrated');
+        const before = snapshot(h);
+        const errors: string[] = [];
+        const exit = await runExecutingCommand({
+          command: {
+            name: 'pi rollback',
+            execute: (args, ctx) => executePiRollback(args, ctx, {
+              rollback: (provider) => rollbackPiSingleProvider(provider, h.paths, { keychain: h.keychain, store: h.store, withAuthLock: takenOverOnEntry }),
+            }),
+          },
+          args: ['xai'],
+        }, {
+          stdout: () => {}, stderr: (message: string) => errors.push(message),
+          env: { QLB_TEST_MODE: '1', QLB_HOME: h.dir }, home: h.dir,
+          config: { dbPath: join(h.dir, 'qlb.db') }, loadConfig: () => ({ dbPath: join(h.dir, 'qlb.db') }),
+          registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
+        } as never);
+        assert.equal(exit, 3, errors.join('\n'));
+        assert.match(errors.join('\n'), /pi-auth-lock-lost/);
+        assert.deepEqual(snapshot(h), before, 'nothing written');
+      } finally { h.cleanup(); }
+    });
+
+    it('pi rollback: lock lost after a write exits 1', () => {
+      const h = setup();
+      try {
+        assert.equal(migratePiSingleProvider('xai', h.paths, { keychain: h.keychain, store: h.store }).state, 'migrated');
+        assert.throws(() => rollbackPiSingleProvider('xai', h.paths, {
+          keychain: h.keychain,
+          store: h.store,
+          afterWrite: (point) => { if (point === 'owner-entry') takeOver(h.paths.authJsonPath); },
+        }), lockLostWithExit(1));
+        assert.equal(existsSync(h.paths.ownerPath), false, 'the owner-entry write landed');
+      } finally { h.cleanup(); }
+    });
+  });
+
+  it('P7a-r: a lock replaced between the owner check and the touch reports pi-auth-lock-lost', () => {
+    const h = setup();
+    try {
+      const lock = `${h.paths.authJsonPath}.lock`;
+      let replace = false;
+      const now = () => {
+        // Barrier: refresh() reads now() after its owner check and before utimesSync; holder B
+        // moves A's lock aside and creates its own in that window.
+        if (replace) {
+          replace = false;
+          renameSync(lock, `${lock}.stale-taker`);
+          mkdirSync(lock);
+          writeFileSync(join(lock, 'qlb-lock-owner.json'), JSON.stringify({ pid: process.pid, nonce: 'holder-b' }));
+        }
+        return 10_000;
+      };
+      let wroteAfterRefresh = false;
+      assert.throws(
+        () => withPiAuthLock(h.paths.authJsonPath, (refresh) => { replace = true; refresh(); wroteAfterRefresh = true; }, { now }),
+        (error: unknown) => (error as { code?: unknown }).code === 'pi-auth-lock-lost',
+      );
+      assert.equal(wroteAfterRefresh, false, 'holder A must not continue to a write');
+      assert.deepEqual(JSON.parse(readFileSync(join(lock, 'qlb-lock-owner.json'), 'utf8')), { pid: process.pid, nonce: 'holder-b' }, 'B\'s lock is left intact');
+    } finally { h.cleanup(); }
+  });
+
+  it('P7a-r: a lock moved aside between the owner check and the touch reports pi-auth-lock-lost', () => {
+    const h = setup();
+    try {
+      const lock = `${h.paths.authJsonPath}.lock`;
+      let moveAside = false;
+      const now = () => {
+        // Barrier: refresh() reads now() after its owner check and before utimesSync.
+        if (moveAside) { moveAside = false; renameSync(lock, `${lock}.stale-taker`); }
+        return 10_000;
+      };
+      assert.throws(
+        () => withPiAuthLock(h.paths.authJsonPath, (refresh) => { moveAside = true; refresh(); }, { now }),
+        (error: unknown) => (error as { code?: unknown }).code === 'pi-auth-lock-lost',
+      );
+      assert.equal(existsSync(`${lock}.stale-taker`), true, 'the moved-aside lock is not removed by the old holder');
     } finally { h.cleanup(); }
   });
 

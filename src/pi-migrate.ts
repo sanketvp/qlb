@@ -22,7 +22,7 @@ type JournalPhase = (typeof JOURNAL_PHASES)[number];
 type CrashPoint = 'baseline' | 'credential-saved' | 'placeholder' | 'publishing' | 'owner-entry' | 'before-committed';
 
 export interface PiMigratePaths { authJsonPath: string; ownerPath: string; journalPath: string; baselineDir: string; }
-export interface AuthLockTiming { staleMs?: number; retries?: number; retryMs?: number; }
+export interface AuthLockTiming { staleMs?: number; retries?: number; retryMs?: number; now?: () => number; }
 export interface PiMigrateDeps {
   keychain: Pick<KeychainBackend, 'getSync' | 'setSync' | 'deleteSync'>;
   store?: Pick<Store, 'getMigration' | 'getConfig' | 'setConfig' | 'recordLineage' | 'upsertAccount' | 'getAccount' | 'setAccountStatus'>;
@@ -89,7 +89,20 @@ export function isPiPlaceholder(entry: unknown): boolean { return !!entry && typ
 
 function sleepSync(ms: number): void { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); }
 function lockedError(): Error { return Object.assign(new Error('pi-auth-locked'), { code: 'pi-auth-locked', name: 'PiAuthLockedError' }); }
-function lockLostError(): Error { return Object.assign(new Error('lock-lost'), { code: 'pi-auth-lock-lost', name: 'PiAuthLockLostError' }); }
+function lockLostError(detail = '', cause?: Error): Error { return Object.assign(new Error(`pi-auth-lock-lost: another run took the auth.json lock over${detail}`, cause ? { cause } : undefined), { code: 'pi-auth-lock-lost', name: 'PiAuthLockLostError' }); }
+/**
+ * P7a-r-Q2: run fn under the auth lock; a lost lock exits 3 before the run's first write and 1 once a write may have landed.
+ * Every write is preceded by a passing refresh(), so "a refresh passed" over-reports writes, never under-reports them.
+ */
+function underAuthLock(lock: NonNullable<PiMigrateDeps['withAuthLock']>, authPath: string, fn: (refresh: () => void) => void): void {
+  let wrote = false;
+  try {
+    lock(authPath, (refresh) => fn(() => { refresh(); wrote = true; }));
+  } catch (error) {
+    if ((error as { code?: unknown }).code === 'pi-auth-lock-lost') Object.assign(error as object, { exitCode: wrote ? 1 : 3 });
+    throw error;
+  }
+}
 interface AuthLockOwner { pid: number; nonce: string; }
 function lockOwnerPath(lock: string): string { return join(lock, 'qlb-lock-owner.json'); }
 function readLockOwner(lock: string): AuthLockOwner | null {
@@ -107,9 +120,9 @@ function ownerMatches(lock: string, owner: AuthLockOwner): boolean {
 function ownerIsDead(owner: AuthLockOwner): boolean {
   try { process.kill(owner.pid, 0); return false; } catch (error) { return (error as NodeJS.ErrnoException).code === 'ESRCH'; }
 }
-function staleLockOwner(lock: string, staleMs: number): AuthLockOwner | null | undefined {
+function staleLockOwner(lock: string, staleMs: number, now: () => number): AuthLockOwner | null | undefined {
   try {
-    if (Date.now() - statSync(lock).mtimeMs <= staleMs) return undefined;
+    if (now() - statSync(lock).mtimeMs <= staleMs) return undefined;
     const owner = readLockOwner(lock);
     return owner === null || ownerIsDead(owner) ? owner : undefined;
   } catch { return undefined; }
@@ -118,12 +131,12 @@ function sameOwner(left: AuthLockOwner | null, right: AuthLockOwner | null): boo
   return left === null ? right === null : right?.pid === left.pid && right.nonce === left.nonce;
 }
 /** Atomically move a stale lock aside; only the rename winner may remove it. */
-function takeOverStaleLock(lock: string, staleMs: number, nonce: string): boolean {
-  const expected = staleLockOwner(lock, staleMs);
+function takeOverStaleLock(lock: string, staleMs: number, nonce: string, now: () => number): boolean {
+  const expected = staleLockOwner(lock, staleMs, now);
   if (expected === undefined) return false;
   const stalePath = `${lock}.stale-${nonce}`;
   try { renameSync(lock, stalePath); } catch { return false; }
-  const confirmed = staleLockOwner(stalePath, staleMs);
+  const confirmed = staleLockOwner(stalePath, staleMs, now);
   if (confirmed !== undefined && sameOwner(expected, confirmed)) {
     rmSync(stalePath, { recursive: true, force: true });
     return true;
@@ -136,7 +149,7 @@ function takeOverStaleLock(lock: string, staleMs: number, nonce: string): boolea
   return false;
 }
 export function withPiAuthLock<T>(authPath: string, fn: (refresh: () => void) => T, timing: AuthLockTiming = {}): T {
-  const lock = `${authPath}.lock`; const staleMs = timing.staleMs ?? 10_000; const retries = timing.retries ?? 20; const retryMs = timing.retryMs ?? 250;
+  const lock = `${authPath}.lock`; const staleMs = timing.staleMs ?? 10_000; const retries = timing.retries ?? 20; const retryMs = timing.retryMs ?? 250; const now = timing.now ?? Date.now;
   const owner: AuthLockOwner = { pid: process.pid, nonce: randomUUID() };
   let acquired = false;
   for (let attempt = 0; attempt <= retries; attempt += 1) {
@@ -147,7 +160,7 @@ export function withPiAuthLock<T>(authPath: string, fn: (refresh: () => void) =>
       break;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-      if (takeOverStaleLock(lock, staleMs, owner.nonce)) { attempt -= 1; continue; }
+      if (takeOverStaleLock(lock, staleMs, owner.nonce, now)) { attempt -= 1; continue; }
       if (attempt === retries) throw lockedError();
       sleepSync(retryMs);
     }
@@ -155,7 +168,12 @@ export function withPiAuthLock<T>(authPath: string, fn: (refresh: () => void) =>
   if (!acquired) throw lockedError();
   const refresh = () => {
     if (!ownerMatches(lock, owner)) throw lockLostError();
-    utimesSync(lock, new Date(), new Date());
+    // A taker may move the lock aside, or replace it, between the owner check and the touch.
+    try { utimesSync(lock, new Date(now()), new Date(now())); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw lockLostError();
+      throw error;
+    }
+    if (!ownerMatches(lock, owner)) throw lockLostError();
   };
   try { refresh(); return fn(refresh); } finally { if (ownerMatches(lock, owner)) rmSync(lock, { recursive: true, force: true }); }
 }
@@ -270,6 +288,7 @@ function stashKeptGenericCopy(
   provider: PiSingleProvider,
   deps: PiMigrateDeps,
   readOwnJournal: () => Journal | null,
+  assertLockHeld: () => void,
 ): void {
   if (provider === 'openrouter' || deps.store?.getConfig(`pi.${provider}.state`) === 'migrated') return;
   const generic = deps.store?.getMigration(`pi-${provider}`);
@@ -294,9 +313,15 @@ function stashKeptGenericCopy(
   if (readKeychainItem(deps, stashService, QLB_KEYCHAIN_ACCOUNT) !== undefined) return;
   const kept = readKeychainItem(deps, shared.service, shared.account);
   if (kept === undefined) return;
+  assertLockHeld();
   deps.keychain.setSync(stashService, QLB_KEYCHAIN_ACCOUNT, kept);
   if (readKeychainItem(deps, stashService, QLB_KEYCHAIN_ACCOUNT) !== kept) {
     // A stash that does not hold the kept copy must not read as "already preserved" on the next run.
+    try { assertLockHeld(); } catch (error) {
+      // Lock lost: removing it now could delete the new holder's stash, so name what is left behind.
+      if ((error as { code?: unknown }).code !== 'pi-auth-lock-lost') throw error;
+      throw lockLostError(`; the unverified kept-copy stash ${stashService} (account ${QLB_KEYCHAIN_ACCOUNT}) was left in place`, keptCopyStashUnverifiedError());
+    }
     try { deps.keychain.deleteSync(stashService, QLB_KEYCHAIN_ACCOUNT); } catch (error) { if (!isCredentialNotFound(error)) throw error; }
     throw keptCopyStashUnverifiedError();
   }
@@ -311,7 +336,7 @@ export function migratePiSingleProvider(provider: PiSingleProvider, paths: PiMig
   let journal: Journal;
   let resumed = false;
   let state: PiMigrateResult['state'] = 'not-applicable';
-  lock(paths.authJsonPath, (refresh) => {
+  underAuthLock(lock, paths.authJsonPath, (refresh) => {
     const inLockJournal = readJournal(paths, provider);
     journal = inLockJournal ?? { provider, phase: 'started', ownerPid: process.pid, updatedAt: Date.now() };
     resumed = inLockJournal !== null;
@@ -324,7 +349,7 @@ export function migratePiSingleProvider(provider: PiSingleProvider, paths: PiMig
       // D-B74: refuse a placeholder baseline before the first write (no stray 'started' journal).
       if (!inLockJournal && provider !== 'openrouter' && isPiPlaceholder(auth[provider])) throw placeholderBaselineError(provider);
       // OQ-7 (c1): after admission and before the first write, so a crash never leaves a P7a journal ahead of the stash.
-      stashKeptGenericCopy(provider, deps, () => inLockJournal);
+      stashKeptGenericCopy(provider, deps, () => inLockJournal, refresh);
       if (!inLockJournal) updatePhase(paths, provider, 'started', refresh);
       let baseline: unknown; const baselineFile = baselinePath(paths, provider);
       if (phaseAtLeast(journal.phase, 'baseline') && existsSync(baselineFile)) baseline = JSON.parse(readFileSync(baselineFile, 'utf8'));
@@ -379,7 +404,7 @@ export function migratePiSingleProvider(provider: PiSingleProvider, paths: PiMig
 export function rollbackPiSingleProvider(provider: PiSingleProvider, paths: PiMigratePaths = defaultPiMigratePaths(), deps: PiMigrateDeps): PiMigrateResult {
   assertPiSingleProvider(provider); checkPaths(paths, deps);
   const lock = deps.withAuthLock ?? ((path, fn) => withPiAuthLock(path, fn, deps.authLockTiming));
-  lock(paths.authJsonPath, (refresh) => {
+  underAuthLock(lock, paths.authJsonPath, (refresh) => {
     if (provider !== 'openrouter') {
       if (!deps.store) throw genericRollbackOwnershipUnreadableError(provider);
       const generic = deps.store.getMigration(`pi-${provider}`);
@@ -415,8 +440,9 @@ export function rollbackPiSingleProvider(provider: PiSingleProvider, paths: PiMi
     // Always release QLB's managed item once Pi has either retained its own
     // non-placeholder credential or verified a restored one. This makes a
     // retry converge after a prior delete failure.
+    // The stash checks the lock before its own writes; the delete gets a fresh check after it.
+    stashKeptGenericCopy(provider, deps, () => readJournal(paths, provider), refresh);
     refresh();
-    stashKeptGenericCopy(provider, deps, () => readJournal(paths, provider));
     try { deps.keychain.deleteSync(managedService(provider), QLB_KEYCHAIN_ACCOUNT); } catch (error) {
       if (!isCredentialNotFound(error)) throw error;
     }
