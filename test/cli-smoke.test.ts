@@ -174,6 +174,19 @@ describe('CLI smoke — documented commands', () => {
     }
   });
 
+  it('migrate status --provider xai --target-dir reports owner: present from the map', () => {
+    const env = isolatedEnv();
+    const target = join(env.QLB_HOME!, 'migrate');
+    writeFileSync(join(target, 'qlb-owner.json'), JSON.stringify({ providers: { xai: { mode: 'qlb', since: 1 } } }) + '\n');
+
+    const result = runCli([
+      'migrate', 'status', '--provider', 'xai', '--target-dir', target, '--db', env.QLB_DB_PATH!,
+    ], env);
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /owner:\s+present/);
+  });
+
   it('plain-text migrate status prints the hand-back record fields with null shown as not fenced', () => {
     const env = isolatedEnv();
     const store = openStore(env.QLB_DB_PATH!);

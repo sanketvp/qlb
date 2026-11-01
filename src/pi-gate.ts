@@ -8,6 +8,7 @@ import { resolveCswapCheck } from './cc-resync';
 import type { CswapProcess } from './cswap-processes';
 import { loadGate } from './gate';
 import { assertAdmittedInConnection } from './lifecycle';
+import { genericAuthJsonKey } from './migration';
 import { isPiPlaceholder } from './pi-migrate';
 import {
   isPiQlbOwnerEntry,
@@ -181,7 +182,15 @@ function defaultPrerequisites(provider: PiGateProvider, db: DatabaseSync, dbPath
   if (provider === 'openrouter' || (provider === 'anthropic' && formats.includes('v1'))) return;
 
   const auth = parsedObject(join(agentDir, 'auth.json'), 'placeholder-missing');
-  if (formats.includes('v2') && isPiPlaceholder(auth[provider])) return;
+  let detailJson: string | undefined;
+  try {
+    const row = db.prepare('SELECT detail_json FROM migrations WHERE store = ?').get(`pi-${provider}`) as { detail_json?: unknown } | undefined;
+    detailJson = typeof row?.detail_json === 'string' ? row.detail_json : undefined;
+  } catch {
+    // A missing or unreadable journal falls back to the provider key.
+  }
+  const authKey = genericAuthJsonKey(provider, detailJson);
+  if (formats.includes('v2') && isPiPlaceholder(auth[authKey])) return;
   if (formats.includes('v1') && isShadowRetainedEntry(auth[provider])) return;
   throw new GateFailure('placeholder-missing');
 }

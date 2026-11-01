@@ -480,6 +480,53 @@ describe('bindDetectAndResync + MockKeychain', () => {
   const jwt = (payload: Record<string, unknown>): string =>
     `eyJhbGciOiJub25lIn0.${Buffer.from(JSON.stringify(payload)).toString('base64url')}.sig`;
 
+  it('does not resync a QLB placeholder in auth.json over the owned xai grant', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-resync-placeholder-'));
+    temps.push(dir);
+    const authPath = join(dir, 'auth.json');
+    writeFileSync(authPath, JSON.stringify({ xai: { type: 'oauth', access: 'qlb-managed', refresh: '' } }) + '\n');
+    const store = openStore(join(dir, 'qlb.db'));
+    const kc = new MockKeychain();
+    const id = ADAPTER_ACCOUNT_IDS.xai;
+    const label = ADAPTER_ACCOUNT_LABELS.xai;
+    const service = qlbKeychainService('xai', id);
+    store.upsertAccount(id, 'xai', label);
+    store.upsertMigration('pi-xai', 'QLB_OWNED', singleGrantJournal('xai'));
+    kc.setSync(service, label, JSON.stringify({ ...grant('owned'), generation: 7 }));
+    const readNativeCredential = createNativeCredentialReader({ poolFilePath: join(dir, 'unused'), authJsonPath: authPath });
+    const result = await bindDetectAndResync({ store, keychain: kc, readNativeCredential })(id, 'xai');
+    assert.equal(result.resynced, false, result.reason);
+    const stored = parseGrant(kc.getSync(service, label));
+    assert.equal(stored.generation, 7, 'the owned generation is unchanged');
+    assert.equal(stored.access, 'owned', 'the QLB placeholder is never written to Keychain');
+    store.close();
+  });
+
+  it('does not resync xai from its provider key when its journaled grok key is a QLB placeholder', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-resync-custom-auth-key-'));
+    temps.push(dir);
+    const authPath = join(dir, 'auth.json');
+    writeFileSync(authPath, JSON.stringify({
+      grok: { type: 'oauth', access: 'qlb-managed', refresh: '' },
+      xai: { type: 'oauth', access: 'native-xai-access', refresh: 'native-xai-refresh', expires: 1 },
+    }) + '\n');
+    const store = openStore(join(dir, 'qlb.db'));
+    const kc = new MockKeychain();
+    const id = ADAPTER_ACCOUNT_IDS.xai;
+    const label = ADAPTER_ACCOUNT_LABELS.xai;
+    const service = qlbKeychainService('xai', id);
+    store.upsertAccount(id, 'xai', label);
+    store.upsertMigration('pi-xai', 'QLB_OWNED', singleGrantJournal('xai', undefined, { authJsonKey: 'grok' }));
+    kc.setSync(service, label, JSON.stringify({ ...grant('owned'), generation: 7 }));
+    const keychainBefore = kc.getSync(service, label);
+    const readNativeCredential = createNativeCredentialReader({ poolFilePath: join(dir, 'unused'), authJsonPath: authPath });
+    const result = await bindDetectAndResync({ store, keychain: kc, readNativeCredential })(id, 'xai');
+    assert.equal(result.resynced, false, result.reason);
+    assert.equal(kc.getSync(service, label), keychainBefore, 'the QLB-owned Keychain item is unchanged');
+    assert.equal(parseGrant(kc.getSync(service, label)).generation, 7, 'the owned generation is unchanged');
+    store.close();
+  });
+
   it('overwrites the QLB Keychain item for a drifted xai grant', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'qlb-resync-bind-'));
     temps.push(dir);
