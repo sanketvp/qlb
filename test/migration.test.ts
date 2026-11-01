@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn, type ChildProcess } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
@@ -460,6 +460,200 @@ describe('migration state machine — §4.8.3 / §4.8.3a', () => {
       assert.deepEqual(readFileSync(h.poolPath), h.originalBytes);
       assert.deepEqual(readFileSync(h.authPath), Buffer.from(auth));
       assert.equal(existsSync(piAuthBackupPath(h.authPath, 'anthropic')), false);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('rolls back a pre-P7b v1 document without reading malformed auth.json', async () => {
+    const h = setup();
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      h.mig.commit();
+      const malformed = '{not-json\n';
+      writeFileSync(h.authPath, malformed, { mode: 0o600 });
+
+      const rolled = h.mig.rollback();
+      assert.equal(rolled.state, 'VALIDATED');
+      assert.equal(existsSync(h.ownerPath), false);
+      assert.equal(readFileSync(h.authPath, 'utf8'), malformed);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('rolls back a legacy pool when the default auth parent is absent and no backup exists', async () => {
+    const h = setup();
+    try {
+      const absentAuthPath = join(h.dir, 'missing-agent', 'auth.json');
+      const migration = new Migration(h.store, h.kc, h.poolPath, h.ownerPath, undefined, { authJsonPath: absentAuthPath });
+      migration.stage();
+      await migration.rehearse(mockRehearse([]));
+      migration.commit();
+
+      const rolled = migration.rollback();
+      assert.equal(rolled.state, 'VALIDATED');
+      assert.equal(existsSync(h.ownerPath), false);
+      assert.equal(existsSync(`${absentAuthPath}.lock`), false);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('refuses a v2 rollback when its auth parent is absent but its backup remains', () => {
+    const h = setup();
+    try {
+      const absentAuthPath = join(h.dir, 'missing-agent', 'auth.json');
+      const migration = new Migration(h.store, h.kc, h.poolPath, h.ownerPath, undefined, { authJsonPath: absentAuthPath });
+      writePiAuthBackup(absentAuthPath, 'anthropic', 'missing-parent');
+      writePiOwnerEntry(h.ownerPath, 'anthropic', true);
+      renameSync(h.poolPath, preQlbPath(h.poolPath));
+      h.store.upsertMigration(PI_POOL_STORE, 'QLB_OWNED', '{}');
+
+      assert.throws(
+        () => migration.rollback(),
+        (error: unknown) => (error as { exitCode?: unknown }).exitCode === 3,
+      );
+      assert.ok(readFileSync(piAuthBackupPath(absentAuthPath, 'anthropic')));
+      const owner = JSON.parse(readFileSync(h.ownerPath, 'utf8')) as { providers: Record<string, unknown> };
+      assert.ok(owner.providers.anthropic);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('refuses a v2 rollback with missing auth.json and no backup', () => {
+    const h = setup();
+    try {
+      writePiOwnerEntry(h.ownerPath, 'anthropic', true);
+      renameSync(h.poolPath, preQlbPath(h.poolPath));
+      h.store.upsertMigration(PI_POOL_STORE, 'QLB_OWNED', '{}');
+
+      assert.throws(
+        () => h.mig.rollback(),
+        (error: unknown) => (error as { exitCode?: unknown }).exitCode === 3,
+      );
+      const owner = JSON.parse(readFileSync(h.ownerPath, 'utf8')) as { providers: Record<string, unknown> };
+      assert.ok(owner.providers.anthropic);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('refuses a malformed v2 auth.json while preserving its owner and backup', () => {
+    const h = setup();
+    try {
+      writeFileSync(h.authPath, JSON.stringify({ anthropic: { type: 'oauth', access: 'native-access', refresh: 'native-refresh' } }) + '\n', { mode: 0o600 });
+      writePiAuthBackup(h.authPath, 'anthropic', 'malformed-v2');
+      writeFileSync(h.authPath, '{not-json\n', { mode: 0o600 });
+      writePiOwnerEntry(h.ownerPath, 'anthropic', true);
+      renameSync(h.poolPath, preQlbPath(h.poolPath));
+      h.store.upsertMigration(PI_POOL_STORE, 'QLB_OWNED', '{}');
+
+      assert.throws(
+        () => h.mig.rollback(),
+        (error: unknown) => (error as { exitCode?: unknown }).exitCode === 3,
+      );
+      assert.ok(existsSync(piAuthBackupPath(h.authPath, 'anthropic')));
+      const owner = JSON.parse(readFileSync(h.ownerPath, 'utf8')) as { providers: Record<string, unknown> };
+      assert.ok(owner.providers.anthropic);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('restores the backed-up anthropic entry when auth.json is absent', () => {
+    const h = setup();
+    try {
+      const nativeAuth = { type: 'oauth', access: 'native-access', refresh: 'native-refresh', expires: 1 };
+      writeFileSync(h.authPath, JSON.stringify({ anthropic: nativeAuth }) + '\n', { mode: 0o600 });
+      writePiAuthBackup(h.authPath, 'anthropic', 'missing-file');
+      rmSync(h.authPath);
+      writePiOwnerEntry(h.ownerPath, 'anthropic', true);
+      renameSync(h.poolPath, preQlbPath(h.poolPath));
+      h.store.upsertMigration(PI_POOL_STORE, 'QLB_OWNED', '{}');
+
+      const rolled = h.mig.rollback();
+      assert.equal(rolled.state, 'VALIDATED');
+      assert.deepEqual(JSON.parse(readFileSync(h.authPath, 'utf8')).anthropic, nativeAuth);
+      assert.equal(existsSync(piAuthBackupPath(h.authPath, 'anthropic')), false);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('restores the backed-up anthropic entry when its auth.json key is absent', () => {
+    const h = setup();
+    try {
+      const nativeAuth = { type: 'oauth', access: 'native-access', refresh: 'native-refresh', expires: 1 };
+      writeFileSync(h.authPath, JSON.stringify({ anthropic: nativeAuth }) + '\n', { mode: 0o600 });
+      writePiAuthBackup(h.authPath, 'anthropic', 'missing-key');
+      writeFileSync(h.authPath, JSON.stringify({ xai: { refresh: 'other-refresh' } }) + '\n', { mode: 0o600 });
+      writePiOwnerEntry(h.ownerPath, 'anthropic', true);
+      renameSync(h.poolPath, preQlbPath(h.poolPath));
+      h.store.upsertMigration(PI_POOL_STORE, 'QLB_OWNED', '{}');
+
+      const rolled = h.mig.rollback();
+      assert.equal(rolled.state, 'VALIDATED');
+      assert.deepEqual(JSON.parse(readFileSync(h.authPath, 'utf8')), {
+        anthropic: nativeAuth,
+        xai: { refresh: 'other-refresh' },
+      });
+      assert.equal(existsSync(piAuthBackupPath(h.authPath, 'anthropic')), false);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('refuses an invalid Anthropic backup before un-owning or deleting it', () => {
+    const h = setup();
+    try {
+      writeFileSync(h.authPath, JSON.stringify({ anthropic: { type: 'oauth', access: 'native-access', refresh: 'native-refresh' } }) + '\n', { mode: 0o600 });
+      writePiAuthBackup(h.authPath, 'anthropic', 'invalid-backup');
+      const backupPath = piAuthBackupPath(h.authPath, 'anthropic');
+      const backup = JSON.parse(readFileSync(backupPath, 'utf8')) as Record<string, unknown>;
+      backup.entry = piPlaceholder();
+      writeFileSync(backupPath, JSON.stringify(backup) + '\n', { mode: 0o600 });
+      writeFileSync(h.authPath, JSON.stringify({ anthropic: piPlaceholder() }) + '\n', { mode: 0o600 });
+      writePiOwnerEntry(h.ownerPath, 'anthropic', true);
+      renameSync(h.poolPath, preQlbPath(h.poolPath));
+      h.store.upsertMigration(PI_POOL_STORE, 'QLB_OWNED', '{}');
+
+      assert.throws(
+        () => h.mig.rollback(),
+        (error: unknown) => (error as { exitCode?: unknown }).exitCode === 3,
+      );
+      assert.ok(existsSync(backupPath));
+      const owner = JSON.parse(readFileSync(h.ownerPath, 'utf8')) as { providers: Record<string, unknown> };
+      assert.ok(owner.providers.anthropic);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('refuses a contended v2 pool auth lock with exit 3', () => {
+    const h = setup();
+    try {
+      writeFileSync(h.authPath, JSON.stringify({ anthropic: piPlaceholder() }) + '\n', { mode: 0o600 });
+      writePiAuthBackup(h.authPath, 'anthropic', 'contended-lock');
+      writePiOwnerEntry(h.ownerPath, 'anthropic', true);
+      renameSync(h.poolPath, preQlbPath(h.poolPath));
+      h.store.upsertMigration(PI_POOL_STORE, 'QLB_OWNED', '{}');
+      mkdirSync(`${h.authPath}.lock`, { mode: 0o700 });
+      const migration = new Migration(h.store, h.kc, h.poolPath, h.ownerPath, undefined, {
+        authJsonPath: h.authPath,
+        authLockTiming: { retries: 0, retryMs: 1, staleMs: 60_000 },
+      });
+
+      assert.throws(
+        () => migration.rollback(),
+        (error: unknown) => (error as { code?: unknown; exitCode?: unknown }).code === 'pi-auth-locked'
+          && (error as { exitCode?: unknown }).exitCode === 3,
+      );
+      assert.ok(existsSync(piAuthBackupPath(h.authPath, 'anthropic')));
+      const owner = JSON.parse(readFileSync(h.ownerPath, 'utf8')) as { providers: Record<string, unknown> };
+      assert.ok(owner.providers.anthropic);
     } finally {
       h.cleanup();
     }

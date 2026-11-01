@@ -1174,20 +1174,54 @@ export class Migration {
     }
   }
 
+  private poolRollbackRefusal(message: string): Error {
+    return Object.assign(new Error(message), { exitCode: 3 });
+  }
+
+  /** A v2 owner entry or backup is durable evidence that this rollback owns Pi auth.json. */
+  private poolRollbackNeedsAuthReconciliation(): boolean {
+    return this.ownerEntryPresentAt(this.ownerMapPath)
+      || readPiAuthBackup(this.authJsonPath, 'anthropic') !== null;
+  }
+
   private restorePoolAnthropicAuthIfPlaceholder(): void {
-    if (!existsSync(this.authJsonPath)) return;
-    const auth: unknown = JSON.parse(readFileSync(this.authJsonPath, 'utf8'));
-    if (!isObjectRecord(auth)) throw new Error('Pi auth.json is not an object');
-    if (!isPiPlaceholder(auth.anthropic)) return;
     const backup = readPiAuthBackup(this.authJsonPath, 'anthropic');
-    if (!backup) throw new Error('no Anthropic auth backup');
+    if (!existsSync(this.authJsonPath)) {
+      if (!backup) throw this.poolRollbackRefusal('no Anthropic auth backup');
+      this.restorePoolAnthropicBackup(backup);
+      return;
+    }
+    let auth: unknown;
+    try {
+      auth = JSON.parse(readFileSync(this.authJsonPath, 'utf8'));
+    } catch {
+      throw this.poolRollbackRefusal('Pi auth.json is malformed');
+    }
+    if (!isObjectRecord(auth)) throw this.poolRollbackRefusal('Pi auth.json is not an object');
+    const entry = auth.anthropic;
+    if (!Object.prototype.hasOwnProperty.call(auth, 'anthropic') || isPiPlaceholder(entry)) {
+      if (!backup) throw this.poolRollbackRefusal('no Anthropic auth backup');
+      this.restorePoolAnthropicBackup(backup);
+      return;
+    }
+    // A newer valid Pi credential wins over an older QLB backup. Invalid
+    // non-placeholder data is neither a safe restore target nor a safe source.
+    if (!this.isValidSingleGrantRestoreEntry(entry, true)) {
+      throw this.poolRollbackRefusal('Anthropic auth entry is invalid');
+    }
+  }
+
+  private restorePoolAnthropicBackup(backup: PiAuthBackup): void {
+    if (!this.isValidSingleGrantRestoreEntry(backup.entry, backup.entryPresent)) {
+      throw this.poolRollbackRefusal('Anthropic auth backup is invalid');
+    }
     restorePiAuthEntryLocked(this.authJsonPath, 'anthropic', backup);
     // The backup helper preserves unrelated keys. When this placeholder was
     // the only key in a file that did not exist at backup time, remove the
     // now-empty file as part of restoring that original absence.
     if (!backup.filePresent && !backup.entryPresent && existsSync(this.authJsonPath)) {
       const restoredAuth: unknown = JSON.parse(readFileSync(this.authJsonPath, 'utf8'));
-      if (!isObjectRecord(restoredAuth)) throw new Error('Pi auth.json is not an object');
+      if (!isObjectRecord(restoredAuth)) throw this.poolRollbackRefusal('Pi auth.json is not an object');
       if (Object.keys(restoredAuth).length === 0) unlinkIfExists(this.authJsonPath);
     }
     const verified = existsSync(this.authJsonPath)
@@ -1195,7 +1229,7 @@ export class Migration {
       : undefined;
     const expected = backup.entryPresent ? backup.entry : undefined;
     if (!isDeepStrictEqual(verified, expected)) {
-      throw new Error('Anthropic auth restore verification failed');
+      throw this.poolRollbackRefusal('Anthropic auth restore verification failed');
     }
   }
 
@@ -1651,22 +1685,30 @@ export class Migration {
     return this.finishHygiene();
   }
 
-  /** S3 precondition: a lock timeout refuses `pi-auth-locked` (exit 3) with the decision kept. */
-  private withSingleGrantRollbackAuthLock<T>(fn: () => T): T {
+  /** A pre-acquire lock timeout refuses with exit 3; errors from fn pass through unchanged. */
+  private withRollbackAuthLock<T>(authPath: string, fn: () => T): T {
     let acquired = false;
     try {
       return withPiAuthLock(
-        resolve(this.poolFilePath),
+        authPath,
         (refresh) => { acquired = true; return this.holdingPiAuthLock(refresh, fn); },
         this.authLockTiming,
       );
     } catch (error: unknown) {
-      // Only a failure to acquire the lock wrote nothing; errors from fn pass through unchanged.
       if (!acquired && error && typeof error === 'object' && (error as { code?: unknown }).code === 'pi-auth-locked') {
         throw Object.assign(error, { exitCode: 3 });
       }
       throw error;
     }
+  }
+
+  /** S3 precondition: a lock timeout refuses `pi-auth-locked` (exit 3) with the decision kept. */
+  private withSingleGrantRollbackAuthLock<T>(fn: () => T): T {
+    return this.withRollbackAuthLock(resolve(this.poolFilePath), fn);
+  }
+
+  private withPoolRollbackAuthLock<T>(fn: () => T): T {
+    return this.withRollbackAuthLock(this.authJsonPath, fn);
   }
 
   rollback(): MigrationStatus {
@@ -2520,14 +2562,24 @@ export class Migration {
     }
 
     // RC — restore any P7b8 Anthropic placeholder and only then unlink its
-    // owner claim. Legacy v1 pool documents never had a placeholder, so they
-    // retain their existing read-compatible rollback path.
+    // owner claim. Legacy v1 pool documents never recorded a v2 owner entry
+    // or Pi backup, so they do not read or lock auth.json at all.
     if (existsSync(native)) {
-      withPiAuthLock(this.authJsonPath, () => {
-        this.restorePoolAnthropicAuthIfPlaceholder();
+      if (this.poolRollbackNeedsAuthReconciliation()) {
+        const backup = readPiAuthBackup(this.authJsonPath, 'anthropic');
+        const authDir = dirname(this.authJsonPath);
+        if (!existsSync(authDir) || !statSync(authDir).isDirectory()) {
+          if (backup) throw this.poolRollbackRefusal('Pi auth.json directory is missing');
+          throw this.poolRollbackRefusal('no Anthropic auth backup');
+        }
+        this.withPoolRollbackAuthLock(() => {
+          this.restorePoolAnthropicAuthIfPlaceholder();
+          this.removePoolOwnerEntry();
+          removePiAuthBackup(this.authJsonPath, 'anthropic');
+        });
+      } else {
         this.removePoolOwnerEntry();
-        removePiAuthBackup(this.authJsonPath, 'anthropic');
-      });
+      }
       unlinkIfExists(this.stagingPath());
     } else {
       // Cannot yet drop the owner file — native is not restored. Leave it.
