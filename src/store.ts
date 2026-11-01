@@ -2597,6 +2597,37 @@ export class Store {
     });
   }
 
+  /** Due watches carry their switch provenance from the committing switch row. */
+  listDueCodexWatches(now: number): Array<{
+    switchId: number; outgoing: string; target: string; nextAt: number; until: number;
+    trigger: string; attempt: string; publishedAt: number; openSessions: Array<{ pid: number; lstart: string; host: string }>;
+  }> {
+    return this.db.prepare(`SELECT w.switch_id, w.outgoing, w.target, w.next_at, w.until,
+      s.trigger, json_extract(s.steps_json, '$.attempt') AS attempt, s.published_at, s.open_sessions_json
+      FROM codex_watch w JOIN switch_log s ON s.id = w.switch_id
+      WHERE w.next_at <= ? ORDER BY w.next_at, w.switch_id`).all(now).map((row) => {
+      const typed = row as { switch_id: number; outgoing: string; target: string; next_at: number; until: number;
+        trigger: string; attempt: string; published_at: number; open_sessions_json: string | null };
+      let openSessions: Array<{ pid: number; lstart: string; host: string }> = [];
+      try {
+        const parsed = typed.open_sessions_json === null ? [] : JSON.parse(typed.open_sessions_json) as unknown;
+        if (Array.isArray(parsed)) openSessions = parsed.filter((entry): entry is { pid: number; lstart: string; host: string } =>
+          typeof entry === 'object' && entry !== null && typeof (entry as { pid?: unknown }).pid === 'number'
+          && typeof (entry as { lstart?: unknown }).lstart === 'string' && typeof (entry as { host?: unknown }).host === 'string');
+      } catch { /* committed switches write valid JSON; malformed legacy data has no holder evidence */ }
+      if (typeof typed.attempt !== 'string' || !Number.isFinite(typed.published_at)) {
+        throw new Error(`Codex watch ${typed.switch_id} has invalid committed switch provenance`);
+      }
+      return { switchId: typed.switch_id, outgoing: typed.outgoing, target: typed.target, nextAt: typed.next_at, until: typed.until,
+        trigger: typed.trigger, attempt: typed.attempt, publishedAt: typed.published_at, openSessions };
+    });
+  }
+
+  /** Move a non-terminal durable watch to its next fixed background tick. */
+  advanceCodexWatch(switchId: number, nextAt: number): void {
+    this.db.prepare('UPDATE codex_watch SET next_at = ? WHERE switch_id = ?').run(nextAt, switchId);
+  }
+
   /** Whether a watch row is still pending (not yet consumed by a terminal outcome). */
   hasCodexWatch(switchId: number): boolean {
     return this.db.prepare('SELECT 1 FROM codex_watch WHERE switch_id = ?').get(switchId) !== undefined;
