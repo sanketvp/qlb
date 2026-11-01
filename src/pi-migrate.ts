@@ -50,9 +50,12 @@ function assertEnabledProvider(provider: PiMigrateProvider, enabled: ReadonlySet
   if (!enabled.has(provider)) throw refusal('provider-not-enabled');
 }
 function assertProviderImplemented(provider: PiMigrateProvider): void {
-  // P7-1a implements only the legacy single-provider path. The test seam may
-  // enable future providers, but it must not expose that incomplete path.
+  // P7-1a implements only the legacy single-provider migration path. The test
+  // seam may enable future providers, but it must not expose that incomplete path.
   if (!isPiSingleProvider(provider)) throw refusal('provider-not-enabled');
+}
+function assertRollbackProviderImplemented(provider: PiMigrateProvider): void {
+  if (!isPiSingleProvider(provider) && provider !== 'openai-codex') throw refusal('provider-not-enabled');
 }
 function requireStore(provider: PiMigrateProvider, deps: PiMigrateDeps): void { if (isNoImportProvider(provider) && !deps.store) throw refusal('store-required'); }
 
@@ -448,10 +451,39 @@ export function rollbackPiSingleProvider(provider: PiMigrateProvider, paths: PiM
   const enabled = deps.enabledProviders ?? ENABLED_PI_MIGRATE_PROVIDERS;
   assertEnabledProvider(provider, enabled);
   requireStore(provider, deps);
-  assertProviderImplemented(provider);
+  assertRollbackProviderImplemented(provider);
   checkPaths(paths, deps);
   const lock = deps.withAuthLock ?? ((path, fn) => withPiAuthLock(path, fn, deps.authLockTiming));
   underAuthLock(lock, paths.authJsonPath, (refresh) => {
+    if (provider === 'openai-codex') {
+      const journal = readJournal(paths, provider);
+      if (deps.store?.getConfig('pi.openai-codex.state') !== 'migrated' && !journal) throw refusal('pi-not-migrated');
+      if (!genericMigrationAtRest(provider, paths, deps, journal)) {
+        throw refusal('owned-by-generic-migrate', 'generic migration pi-openai-codex owns the provider; run qlb migrate rollback --provider openai-codex first');
+      }
+      // Validate the canonical owner document before the first write, rather
+      // than discovering a v1 or malformed file at owner-entry removal.
+      readPiOwnerProviders(paths.ownerPath);
+      const auth = readAuth(paths.authJsonPath);
+      const current = auth[provider];
+      const needsRestore = current === undefined || isPiPlaceholder(current);
+      let restore: JsonObject | undefined;
+      if (needsRestore) {
+        const file = baselinePath(paths, provider);
+        if (!existsSync(file)) throw refusal('no-restore-source');
+        try { restore = parseOAuth(JSON.parse(readFileSync(file, 'utf8')), provider); } catch { throw refusal('baseline-unreadable'); }
+      }
+      refresh(); writePiOwnerEntry(paths.ownerPath, provider, false); refresh(); deps.afterWrite?.('owner-entry');
+      if (needsRestore) {
+        auth[provider] = restore; refresh(); writeJson(paths.authJsonPath, auth); refresh();
+        if (JSON.stringify(readAuth(paths.authJsonPath)[provider]) !== JSON.stringify(restore)) throw new Error('Pi credential rollback verification failed');
+        deps.afterWrite?.('entry-restored');
+      }
+      refresh(); deps.store?.setConfig('pi.openai-codex.state', '');
+      refresh(); deps.store?.setConfig('pi.openai-codex.migratedAt', '');
+      refresh(); rmSync(journalPath(paths, provider), { force: true });
+      return;
+    }
     if (isPiSingleProvider(provider) && provider !== 'openrouter') {
       if (!deps.store) throw genericRollbackOwnershipUnreadableError(provider);
       const generic = deps.store.getMigration(`pi-${provider}`);
