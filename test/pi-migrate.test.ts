@@ -185,14 +185,20 @@ describe('Pi migration S58 credential-first barrier', () => {
     }
   });
 
-  it('openai-codex migrate and anthropic rollback remain provider-not-enabled when the test seam enables them', () => {
+  it('openai-codex migrate and both anthropic operations remain provider-not-enabled when the test seam enables them', () => {
     for (const [provider, operation] of [
       ['openai-codex', migratePiSingleProvider],
+      ['anthropic', migratePiSingleProvider],
       ['anthropic', rollbackPiSingleProvider],
     ] as const) {
       const h = setup();
+      let lockCalls = 0;
       try {
-        expectRefusal(h, provider, 'provider-not-enabled', () => operation(provider, h.paths, { keychain: h.keychain, store: h.store, enabledProviders: ALL }));
+        expectRefusal(h, provider, 'provider-not-enabled', () => operation(provider, h.paths, {
+          keychain: h.keychain, store: h.store, enabledProviders: ALL,
+          withAuthLock: (_path, _fn) => { lockCalls += 1; throw new Error('lock must not be taken'); },
+        }));
+        assert.equal(lockCalls, 0, `${provider}: refusal must precede the lock`);
       } finally { h.cleanup(); }
     }
   });
@@ -1744,6 +1750,46 @@ describe('Pi migration S58 credential-first barrier', () => {
     } finally { h.cleanup(); }
   });
 
+  it('openai-codex: rollback ignores a stale baseline on a started journal with an absent entry, and restores it from a baseline journal', () => {
+    for (const [phase, restores] of [['started', false], ['baseline', true]] as const) {
+      const h = setupCodexRollback();
+      try {
+        h.store.setConfig('pi.openai-codex.state', '');
+        writePiJournal(h.paths, 'openai-codex', phase);
+        writeFileSync(h.paths.authJsonPath, '{}', { mode: 0o600 });
+        const authBefore = readFileSync(h.paths.authJsonPath, 'utf8');
+        rollbackPiSingleProvider('openai-codex', h.paths, { keychain: h.keychain, store: h.store, enabledProviders: ALL });
+        const auth = JSON.parse(readFileSync(h.paths.authJsonPath, 'utf8')) as Record<string, unknown>;
+        assert.equal(auth['openai-codex'] === undefined, !restores, phase);
+        if (restores) assert.deepEqual(auth['openai-codex'], h.baseline);
+        else assert.equal(readFileSync(h.paths.authJsonPath, 'utf8'), authBefore);
+        assert.equal(h.store.getConfig('pi.openai-codex.state'), '');
+        assert.equal(h.store.getConfig('pi.openai-codex.migratedAt'), '');
+        assert.equal(existsSync(join(h.paths.journalPath, 'pi-migrate-openai-codex.json')), false);
+      } finally { h.cleanup(); }
+    }
+  });
+
+  it('openai-codex: rollback refuses no-restore-source for a placeholder with only a stale started-journal baseline', () => {
+    const h = setupCodexRollback();
+    try {
+      h.store.setConfig('pi.openai-codex.state', '');
+      writePiJournal(h.paths, 'openai-codex', 'started');
+      expectRefusal(h, 'openai-codex', 'no-restore-source', () => rollbackPiSingleProvider('openai-codex', h.paths, { keychain: h.keychain, store: h.store, enabledProviders: ALL }));
+    } finally { h.cleanup(); }
+  });
+
+  it('openai-codex: rollback accepts journal-only evidence at baseline phase and removes the journal', () => {
+    const h = setupCodexRollback();
+    try {
+      h.store.setConfig('pi.openai-codex.state', '');
+      writePiJournal(h.paths, 'openai-codex', 'baseline');
+      rollbackPiSingleProvider('openai-codex', h.paths, { keychain: h.keychain, store: h.store, enabledProviders: ALL });
+      assert.deepEqual(JSON.parse(readFileSync(h.paths.authJsonPath, 'utf8'))['openai-codex'], h.baseline);
+      assert.equal(existsSync(join(h.paths.journalPath, 'pi-migrate-openai-codex.json')), false);
+    } finally { h.cleanup(); }
+  });
+
   it('openai-codex: rollback refuses owned-by-generic-migrate before any write while migrations.pi-openai-codex is QLB_OWNED, MIRRORED or carries a rollback intent', () => {
     for (const [state, detail] of [
       ['QLB_OWNED', '{}'],
@@ -1773,8 +1819,8 @@ describe('Pi migration S58 credential-first barrier', () => {
     } finally { h.cleanup(); }
   });
 
-  it('openai-codex: rollback is re-runnable after a crash at owner-entry and entry-restored', () => {
-    for (const crashPoint of ['owner-entry', 'entry-restored'] as const) {
+  it('openai-codex: rollback is re-runnable after a crash at owner-entry, entry-restored, migrated-at or journal-cleared', () => {
+    for (const crashPoint of ['owner-entry', 'entry-restored', 'migrated-at', 'journal-cleared'] as const) {
       const h = setupCodexRollback();
       try {
         assert.throws(() => rollbackPiSingleProvider('openai-codex', h.paths, {
@@ -1785,6 +1831,8 @@ describe('Pi migration S58 credential-first barrier', () => {
         assert.deepEqual(JSON.parse(readFileSync(h.paths.authJsonPath, 'utf8')), { 'openai-codex': h.baseline });
         assert.deepEqual(JSON.parse(readFileSync(h.paths.ownerPath, 'utf8')), { providers: { xai: { mode: 'qlb', since: 1 } } });
         assert.equal(h.store.getConfig('pi.openai-codex.state'), '');
+        assert.equal(h.store.getConfig('pi.openai-codex.migratedAt'), '');
+        assert.equal(existsSync(join(h.paths.journalPath, 'pi-migrate-openai-codex.json')), false);
       } finally { h.cleanup(); }
     }
   });

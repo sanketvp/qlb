@@ -22,7 +22,7 @@ export const ENABLED_PI_MIGRATE_PROVIDERS: ReadonlySet<PiMigrateProvider> = new 
 type OAuthProvider = Exclude<PiMigrateProvider, 'openrouter'>;
 const JOURNAL_PHASES = ['started', 'baseline', 'credential-saved', 'consumption-recorded', 'pool-moved', 'publishing', 'published', 'committed'] as const;
 type JournalPhase = (typeof JOURNAL_PHASES)[number];
-type CrashPoint = 'baseline' | 'credential-saved' | 'placeholder' | 'publishing' | 'owner-entry' | 'before-committed' | 'phase-dropped' | 'consumption-recorded' | 'pool-moved' | 'migrated-at' | 'entry-restored' | 'pool-rewritten' | 'rows-deleted' | 'pool-dir-restored';
+type CrashPoint = 'baseline' | 'credential-saved' | 'placeholder' | 'publishing' | 'owner-entry' | 'before-committed' | 'phase-dropped' | 'consumption-recorded' | 'pool-moved' | 'migrated-at' | 'journal-cleared' | 'entry-restored' | 'pool-rewritten' | 'rows-deleted' | 'pool-dir-restored';
 
 export interface PiMigratePaths { authJsonPath: string; ownerPath: string; journalPath: string; baselineDir: string; }
 export interface AuthLockTiming { staleMs?: number; retries?: number; retryMs?: number; now?: () => number; }
@@ -270,7 +270,7 @@ function genericMigrationPathFacts(
 }
 
 /** S0.6: generic ownership must be quiescent before P7a may begin. */
-function genericMigrationAtRest(provider: PiMigrateProvider, paths: PiMigratePaths, deps: PiMigrateDeps, ownJournal: Journal | null): boolean {
+function genericMigrationAtRest(provider: PiMigrateProvider, paths: PiMigratePaths, deps: PiMigrateDeps, ownJournal: Journal | null, ownJournalClaimsOwner = false): boolean {
   const row = deps.store?.getMigration(`pi-${provider}`);
   let detail: JsonObject | undefined;
   if (row) {
@@ -281,7 +281,8 @@ function genericMigrationAtRest(provider: PiMigrateProvider, paths: PiMigratePat
   const pathFacts = genericMigrationPathFacts(provider, paths, detail);
   let canonicalOwnerClaim = false;
   try { canonicalOwnerClaim = isPiQlbOwnerEntry(readPiOwnerProviders(paths.ownerPath)[provider]); } catch { /* readPiOwnerProviders fails closed before publication */ }
-  const ownPublishedClaim = ownJournal?.phase === 'publishing' || ownJournal?.phase === 'published' || ownJournal?.phase === 'committed'
+  const ownPublishedClaim = (ownJournalClaimsOwner && ownJournal !== null)
+    || ownJournal?.phase === 'publishing' || ownJournal?.phase === 'published' || ownJournal?.phase === 'committed'
     || deps.store?.getConfig(`pi.${provider}.state`) === 'migrated';
   return !pathFacts.hasStaging
     && !pathFacts.hasLegacySidecar
@@ -457,8 +458,9 @@ export function rollbackPiSingleProvider(provider: PiMigrateProvider, paths: PiM
   underAuthLock(lock, paths.authJsonPath, (refresh) => {
     if (provider === 'openai-codex') {
       const journal = readJournal(paths, provider);
-      if (deps.store?.getConfig('pi.openai-codex.state') !== 'migrated' && !journal) throw refusal('pi-not-migrated');
-      if (!genericMigrationAtRest(provider, paths, deps, journal)) {
+      const stateMigrated = deps.store?.getConfig('pi.openai-codex.state') === 'migrated';
+      if (!stateMigrated && !journal) throw refusal('pi-not-migrated');
+      if (!genericMigrationAtRest(provider, paths, deps, journal, true)) {
         throw refusal('owned-by-generic-migrate', 'generic migration pi-openai-codex owns the provider; run qlb migrate rollback --provider openai-codex first');
       }
       // Validate the canonical owner document before the first write, rather
@@ -469,19 +471,28 @@ export function rollbackPiSingleProvider(provider: PiMigrateProvider, paths: PiM
       const needsRestore = current === undefined || isPiPlaceholder(current);
       let restore: JsonObject | undefined;
       if (needsRestore) {
-        const file = baselinePath(paths, provider);
-        if (!existsSync(file)) throw refusal('no-restore-source');
-        try { restore = parseOAuth(JSON.parse(readFileSync(file, 'utf8')), provider); } catch { throw refusal('baseline-unreadable'); }
+        // A journal below baseline did not capture this cycle's auth entry, so
+        // an on-disk baseline can only be an earlier cycle's stale backup.
+        const baselineCaptured = stateMigrated || !!journal && phaseAtLeast(journal.phase, 'baseline');
+        if (!baselineCaptured) {
+          if (isPiPlaceholder(current)) throw refusal('no-restore-source');
+        } else {
+          const file = baselinePath(paths, provider);
+          if (!existsSync(file)) throw refusal('no-restore-source');
+          try { restore = parseOAuth(JSON.parse(readFileSync(file, 'utf8')), provider); } catch { throw refusal('baseline-unreadable'); }
+        }
       }
       refresh(); writePiOwnerEntry(paths.ownerPath, provider, false); refresh(); deps.afterWrite?.('owner-entry');
-      if (needsRestore) {
+      if (needsRestore && restore) {
         auth[provider] = restore; refresh(); writeJson(paths.authJsonPath, auth); refresh();
         if (JSON.stringify(readAuth(paths.authJsonPath)[provider]) !== JSON.stringify(restore)) throw new Error('Pi credential rollback verification failed');
         deps.afterWrite?.('entry-restored');
       }
+      // Preserve state as retry evidence until every other cleanup step has
+      // landed. A retry after either earlier step can still complete rollback.
+      refresh(); deps.store?.setConfig('pi.openai-codex.migratedAt', ''); deps.afterWrite?.('migrated-at');
+      refresh(); rmSync(journalPath(paths, provider), { force: true }); deps.afterWrite?.('journal-cleared');
       refresh(); deps.store?.setConfig('pi.openai-codex.state', '');
-      refresh(); deps.store?.setConfig('pi.openai-codex.migratedAt', '');
-      refresh(); rmSync(journalPath(paths, provider), { force: true });
       return;
     }
     if (isPiSingleProvider(provider) && provider !== 'openrouter') {
