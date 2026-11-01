@@ -964,7 +964,7 @@ export function markCodexSwitchJournalUnresolved(held: HeldCodexSwitchJournalOwn
   const current = readCodexSwitchJournal(resolved);
   if (current.state !== 'ok' || current.journal.attemptId !== attemptId) return false;
   const previous = current.journal.unresolved;
-  persistCodexSwitchJournal({ ...current.journal, unresolved: { reason,
+  persistCodexSwitchJournal({ ...current.journal, unresolved: { reason: previous?.reason === 'target-changed' ? 'target-changed' : reason,
     involvedAccounts: unionAccounts(previous?.involvedAccounts ?? [], involvedAccounts),
     since: previous?.since ?? (options.now ?? Date.now)() } }, resolved);
   return true;
@@ -1133,13 +1133,25 @@ export async function reconcileCodexRecoveryLocked(
     }
     const observed = await deps.readLive();
     const targetRow = deps.store.getCodexSlot(journal.to);
-    const classified = classifyPostPublish({ journal, observed, targetSlotFp: targetRow?.fingerprint ?? '' });
+    // Once B has changed outside this attempt, that attempt can never become ok.
+    // Keep this fact in the journal before an adoption can make B match live,
+    // so a crash between that adoption and the terminal commit cannot erase it.
+    let classified = journal.unresolved?.reason === 'target-changed' ? 'target-changed' as const
+      : classifyPostPublish({ journal, observed, targetSlotFp: targetRow?.fingerprint ?? '' });
     // §3.1: an unstable or unreadable read is pending, target-changed included; nothing is written.
     if (classified === 'target-changed' && (observed.status === 'unstable' || observed.status === 'unreadable')) {
       return fenced(`journal-verify-${observed.status}`, accountSet(journal, journal.unresolved?.involvedAccounts));
     }
     const live = observed.status === 'ok' ? observed.doc : undefined;
     const liveIdentity = live ? codexIdentity(live) : null;
+    if (classified === 'target-changed' && journal.unresolved?.reason !== 'target-changed') {
+      const involved = [journal.from, journal.to];
+      if (liveIdentity && deps.store.getCodexSlot(liveIdentity)) involved.push(liveIdentity);
+      assertHeld(); held.assertHeld();
+      if (!markCodexSwitchJournalUnresolved(held, journal.attemptId, 'target-changed', involved, options)) {
+        throw new Error('Codex switch journal changed before recovery target-changed mark');
+      }
+    }
     const slotHeads = new Map<string, string | null>();
     for (const accountId of [journal.from, journal.to]) slotHeads.set(accountId, deps.store.getCodexSlot(accountId)?.fingerprint ?? null);
     if (liveIdentity) slotHeads.set(liveIdentity, deps.store.getCodexSlot(liveIdentity)?.fingerprint ?? null);
