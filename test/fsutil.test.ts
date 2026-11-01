@@ -245,6 +245,25 @@ describe('fsutil atomic publish primitives', () => {
     assert.equal(fsutil.publishTarget(join(dir, 'hop1')), realpathSync.native(final));
   }));
 
+  it('resolves link/.. after following the linked directory', () => withFixture((dir) => {
+    const agent = join(dir, 'agent');
+    const extensions = join(agent, 'extensions');
+    const link = join(dir, 'agent-link');
+    require('node:fs').mkdirSync(extensions, { recursive: true });
+    symlinkSync(extensions, link);
+
+    assert.equal(fsutil.publishTarget(`${link}/../auth.json`), join(realpathSync(agent), 'auth.json'));
+  }));
+
+  it('resolves a dangling symlink to its intended final referent', () => withFixture((dir) => {
+    const agent = join(dir, 'agent');
+    const link = join(dir, 'auth-link.json');
+    require('node:fs').mkdirSync(agent);
+    symlinkSync(join(agent, 'auth.json'), link);
+
+    assert.equal(fsutil.publishTarget(link), join(realpathSync(agent), 'auth.json'));
+  }));
+
   it('writes a dangling symlink at its intended final referent', () => withFixture((dir) => {
     const gone = join(dir, 'gone');
     require('node:fs').mkdirSync(gone);
@@ -294,11 +313,12 @@ describe('fsutil atomic publish primitives', () => {
     assert.deepEqual(readdirSync(dir), ['loop.json']);
   }));
 
-  it('returns a plain path unchanged from publishTarget', () => withFixture((dir) => {
+  it('returns the canonical plain path from publishTarget', () => withFixture((dir) => {
     const target = join(dir, 'plain.json');
-    assert.equal(fsutil.publishTarget(target), target);
+    const canonical = join(realpathSync(dir), 'plain.json');
+    assert.equal(fsutil.publishTarget(target), canonical);
     writeFileSync(target, 'x');
-    assert.equal(fsutil.publishTarget(target), target);
+    assert.equal(fsutil.publishTarget(target), canonical);
   }));
 
   it('keeps temporary names bounded for destinations near NAME_MAX', () => withFixture((dir) => {

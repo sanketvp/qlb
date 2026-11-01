@@ -114,19 +114,18 @@ import {
   fsyncSync,
   lstatSync,
   openSync,
-  realpathSync,
   readFileSync,
   renameSync,
   rmSync,
   statSync,
   writeSync,
 } from 'node:fs';
-import { basename, dirname, join, resolve, sep } from 'node:path';
+import { dirname, join, resolve, sep } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { config } from './config';
 import { codexSlotIdFromAccessToken } from './codex-auth';
 import { codexHeaderAccountId } from './codex-slots';
-import { fsyncDirSync } from './fsutil';
+import { fsyncDirSync, resolveAllowMissing } from './fsutil';
 import { qlbHomeDir } from './home';
 import type { KeychainBackend } from './keychain';
 import { openRouterMissingKeyMessage, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, readNativeOpenRouterKey } from './keychain';
@@ -408,17 +407,9 @@ export function realPiAgentDir(): string {
   return resolve(dirname(config.piAuthJsonPath));
 }
 
-/** Resolve existing symlinks, retaining missing trailing segments for safe containment checks. */
+/** Resolve symlinks like the atomic writer for safe containment checks. */
 function realpathWithMissingTail(p: string): string {
-  let current = resolve(p);
-  const tail: string[] = [];
-  while (!existsSync(current)) {
-    const parent = dirname(current);
-    if (parent === current) break;
-    tail.unshift(basename(current));
-    current = parent;
-  }
-  return resolve(realpathSync(current), ...tail);
+  return resolveAllowMissing(p);
 }
 
 /** True if `p` is the live Pi agent dir or a file inside it. */
@@ -1226,10 +1217,14 @@ export class Migration {
     const entry = auth.anthropic;
     // A valid newer Pi OAuth credential wins without parsing an old backup.
     if (entryPresent && isValidEntry(entry)) return;
-    // An API-key entry is intentionally not treated as an Anthropic OAuth
-    // credential or replaced by a recorded OAuth backup.
-    if (entryPresent && isObjectRecord(entry) && entry.type === 'api-key') {
-      throw this.poolRollbackRefusal('Anthropic auth entry is invalid');
+    // Only QLB's own complete placeholder is safe to replace. Preserve every
+    // other present shape for the user to repair or remove explicitly.
+    const placeholder = isObjectRecord(entry)
+      && isPiPlaceholder(entry)
+      && typeof entry.expires === 'number'
+      && Number.isFinite(entry.expires);
+    if (entryPresent && !placeholder) {
+      throw this.poolRollbackRefusal('Anthropic auth entry is invalid; fix or remove it before rollback');
     }
     const backup = this.readPoolAnthropicBackup();
     if (!backup) throw this.poolRollbackRefusal('no Anthropic auth backup');

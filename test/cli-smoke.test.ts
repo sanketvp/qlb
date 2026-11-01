@@ -454,6 +454,47 @@ describe('CLI smoke — documented commands', () => {
     assert.match(result.stderr, /REAL Pi credential cutover/);
   });
 
+  it('refuses an Anthropic rollback whose auth path traverses link/.. into the real Pi agent dir', () => {
+    const env = isolatedEnv();
+    const liveAgent = join(String(env.HOME), '.pi', 'agent');
+    const extensions = join(liveAgent, 'extensions');
+    mkdirSync(extensions, { recursive: true });
+    const migrateDir = mkdtempSync(join(tmpdir(), 'qlb-smoke-real-auth-dotdot-'));
+    const link = join(migrateDir, 'agent-link');
+    symlinkSync(extensions, link);
+
+    const result = runCli([
+      'migrate', 'rollback', '--provider', 'anthropic',
+      '--pool-file', join(migrateDir, 'pool.json'),
+      '--owner-file', join(migrateDir, 'qlb-owner.json'),
+      '--auth-json', `${link}/../auth.json`,
+      '--json',
+    ], env);
+
+    assert.equal(result.status, 2, result.stderr);
+    assert.match(result.stderr, /REAL Pi credential cutover/);
+  });
+
+  it('refuses an Anthropic rollback whose dangling auth symlink targets the real Pi agent dir', () => {
+    const env = isolatedEnv();
+    const liveAgent = join(String(env.HOME), '.pi', 'agent');
+    mkdirSync(liveAgent, { recursive: true });
+    const migrateDir = mkdtempSync(join(tmpdir(), 'qlb-smoke-real-auth-dangling-'));
+    const linkedAuth = join(migrateDir, 'linked-auth.json');
+    symlinkSync(join(liveAgent, 'auth.json'), linkedAuth);
+
+    const result = runCli([
+      'migrate', 'rollback', '--provider', 'anthropic',
+      '--pool-file', join(migrateDir, 'pool.json'),
+      '--owner-file', join(migrateDir, 'qlb-owner.json'),
+      '--auth-json', linkedAuth,
+      '--json',
+    ], env);
+
+    assert.equal(result.status, 2, result.stderr);
+    assert.match(result.stderr, /REAL Pi credential cutover/);
+  });
+
   it('forward anthropic migration refuses while cswap consume is enabled; status and rollback do not', () => {
     const env = isolatedEnv();
     const enabled = runCli(['consume', 'enable', '--provider', 'anthropic', '--json'], env);
@@ -474,6 +515,7 @@ describe('CLI smoke — documented commands', () => {
     const status = runCli(['migrate', 'status', '--provider', 'anthropic', ...paths, '--json'], env);
     assert.equal(status.status, 0, status.stderr);
     const rollback = runCli(['migrate', 'rollback', '--provider', 'anthropic', ...paths, '--json'], env);
+    assert.equal(rollback.status, 0, rollback.stderr);
     assert.doesNotMatch(rollback.stderr, /DUAL_OWNERSHIP_REFUSED/);
   });
 

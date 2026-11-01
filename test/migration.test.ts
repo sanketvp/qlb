@@ -683,25 +683,43 @@ describe('migration state machine — §4.8.3 / §4.8.3a', () => {
     }
   });
 
-  it('restores the valid backup when a non-placeholder Anthropic entry is incomplete', () => {
-    const h = setup();
-    try {
-      const native = { type: 'oauth', access: 'native-access', refresh: 'native-refresh', expires: Date.now() + 60_000 };
-      writeFileSync(h.authPath, JSON.stringify({ anthropic: native }) + '\n', { mode: 0o600 });
-      writePiAuthBackup(h.authPath, 'anthropic', 'incomplete-present');
-      writeFileSync(h.authPath, JSON.stringify({ anthropic: { refresh: 'incomplete' } }) + '\n', { mode: 0o600 });
-      writePiOwnerEntry(h.ownerPath, 'anthropic', true);
-      renameSync(h.poolPath, preQlbPath(h.poolPath));
-      h.store.upsertMigration(PI_POOL_STORE, 'QLB_OWNED', '{}');
+  for (const [name, entry] of [
+    ['an incomplete entry', { refresh: 'incomplete' }],
+    ["Pi's api_key entry", { type: 'api_key', key: 'fixture' }],
+    ["QLB's api-key entry", { type: 'api-key', key: 'fixture' }],
+    ['an OAuth entry with empty access', { type: 'oauth', access: '', refresh: 'refresh-fake', expires: Date.now() + 60_000 }],
+    ['an incomplete QLB-shaped entry', { type: 'oauth', access: 'qlb-managed', refresh: '' }],
+  ] as const) {
+    it(`refuses rollback for ${name}, preserving auth.json, owner, and backup bytes`, () => {
+      const h = setup();
+      try {
+        const native = { type: 'oauth', access: 'native-access', refresh: 'native-refresh', expires: Date.now() + 60_000 };
+        writeFileSync(h.authPath, JSON.stringify({ anthropic: native }) + '\n', { mode: 0o600 });
+        writePiAuthBackup(h.authPath, 'anthropic', `present-${name}`);
+        writeFileSync(h.authPath, JSON.stringify({ anthropic: entry }) + '\n', { mode: 0o600 });
+        writePiOwnerEntry(h.ownerPath, 'anthropic', true);
+        renameSync(h.poolPath, preQlbPath(h.poolPath));
+        h.store.upsertMigration(PI_POOL_STORE, 'QLB_OWNED', '{}');
+        const backupPath = piAuthBackupPath(h.authPath, 'anthropic');
+        const before = {
+          auth: readFileSync(h.authPath),
+          owner: readFileSync(h.ownerPath),
+          backup: readFileSync(backupPath),
+        };
 
-      h.mig.rollback();
+        assert.throws(
+          () => h.mig.rollback(),
+          (error: unknown) => (error as { exitCode?: unknown }).exitCode === 3,
+        );
 
-      assert.deepEqual(JSON.parse(readFileSync(h.authPath, 'utf8')).anthropic, native);
-      assert.equal(existsSync(piAuthBackupPath(h.authPath, 'anthropic')), false);
-    } finally {
-      h.cleanup();
-    }
-  });
+        assert.deepEqual(readFileSync(h.authPath), before.auth);
+        assert.deepEqual(readFileSync(h.ownerPath), before.owner);
+        assert.deepEqual(readFileSync(backupPath), before.backup);
+      } finally {
+        h.cleanup();
+      }
+    });
+  }
 
   it('refuses an incomplete Anthropic backup without releasing its owner claim', () => {
     const h = setup();
