@@ -1389,9 +1389,17 @@ export async function codexWatchTick(deps: CodexSwitchDeps, watch: CodexWatch): 
     if (liveIdentity) slotHeads.set(liveIdentity, deps.store.getCodexSlot(liveIdentity)?.fingerprint ?? null);
     let attribution: CodexPhaseAttribution | undefined;
     if (typeof classified === 'object' && classified.status === 'external') {
+      let target: CodexAuthDocument;
+      try { target = slots.readSlot(watch.target, { fresh: true }).document; }
+      catch {
+        // C6-21-R1 (from C6-20d): B's row with no readable Keychain copy is a split; fence {A, B}, no other write.
+        const reason = 'slot-split';
+        assertHeld(); deps.store.setRecoveryFence({ v: 1, switchId: watch.switchId, attempt: watch.attempt, from: watch.outgoing, to: watch.target,
+          publishedAt: watch.publishedAt, reason, involvedAccounts: [watch.outgoing, watch.target].sort(), since: deps.now() });
+        return { state: 'unresolved', reason };
+      }
       const history = deps.dbPath ? readCodexSwitchHistory(deps.dbPath, { journalDir: deps.journalDir }) : { rows: [], observations: [] };
       const current = await list();
-      const target = slots.readSlot(watch.target, { fresh: true }).document;
       // After the committed switch, B is the active login.
       attribution = await attributeForPhase({ assertHeld }, 'watch', { store: deps.store, keychain,
         slot: { accountId: watch.target, document: target, fingerprint: targetFp }, activeSlotId: watch.target,

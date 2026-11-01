@@ -3378,6 +3378,33 @@ describe('Codex watch tick — C6-21', () => {
     } finally { close(h); }
   });
 
+  it('a missing or corrupt slot-B Keychain item during a tick fences slot-split with {A, B}, writes no row and keeps the watch (C6-21-R1)', async () => {
+    const service = qlbKeychainService('openai-codex', 'b:account');
+    const damage = {
+      missing: (h: Harness) => h.keychain.deleteSync(service, QLB_KEYCHAIN_ACCOUNT),
+      corrupt: (h: Harness) => h.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, '{not json'),
+    };
+    for (const [label, apply] of Object.entries(damage)) {
+      const h = switchHarness();
+      try {
+        const watch = await committedWatch(h);
+        const aPrime = observedDocument('a', 'a-prime');
+        codexWrites(h, aPrime);
+        apply(h);
+        const before = { rows: rows(h), a: h.store.getCodexSlot('a:account')?.fingerprint, active: activeLogin(h) };
+        assert.deepEqual(await tick(h, watch, 30_000), { state: 'unresolved', reason: 'slot-split' }, label);
+        assert.deepEqual(fence(h), { v: 1, switchId: watch.switchId, attempt: watch.attempt, from: 'a:account', to: 'b:account',
+          publishedAt: watch.publishedAt, reason: 'slot-split', involvedAccounts: ['a:account', 'b:account'], since: watch.publishedAt + 30_000 }, label);
+        assert.deepEqual({ rows: rows(h), a: h.store.getCodexSlot('a:account')?.fingerprint, active: activeLogin(h) }, before, label);
+        assert.equal(watchRows(h), 1, `${label}: the watch is kept`);
+        for (const accountId of ['a:account', 'b:account']) {
+          if (accountId === 'b:account') h.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(h.b)); // refresh reads the slot first
+          assert.deepEqual(await refresh(h, accountId), { code: 3, posts: 0, writes: 0, errors: [recoveryMessage('slot-split')] }, `${label}: ${accountId}`);
+        }
+      } finally { close(h); }
+    }
+  });
+
   it('a tick outside an admitting lifecycle state stops', async () => {
     const h = switchHarness();
     try {
