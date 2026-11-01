@@ -7,7 +7,7 @@ import { describe, it } from 'node:test';
 
 import { ClaudeConfigFileError } from '../src/cc-credentials';
 import { ClaudeCodeLockTimeout, ProperLockfileCompromised, withClaudeConfigPathLock, withClaudeCredentialLocks, withClaudeSwitchLock } from '../src/cc-locks';
-import { withClaudeSwitchJournalOwner } from '../src/cc-switch-journal';
+import { deleteClaudeSwitchJournal, updateClaudeSwitchJournal, withClaudeSwitchJournalOwner } from '../src/cc-switch-journal';
 import { ClaudeSlots, InMemoryClaudeSlotRepository } from '../src/cc-slots';
 import { MockKeychain } from '../src/keychain';
 import { claudePaths } from '../src/cc-paths';
@@ -759,10 +759,107 @@ describe('Claude switch transaction (K5-5)', () => {
     assert.equal(existsSync(join(subject.deps.journalDir!, 'switch-anthropic.json')), false);
   });
 
+  it('a failing stagedWritten update deletes the staged item and the journal', async () => {
+    const subject = await transactionFixture();
+    subject.deps.journalOps = {
+      update: (held, patch, options) => {
+        if (patch.stagedWritten === true) throw new Error('stagedWritten update failed');
+        return updateClaudeSwitchJournal(held, patch, options);
+      },
+      remove: deleteClaudeSwitchJournal,
+    };
+    const result = await switchClaude(subject.deps, manual);
+    assert.deepEqual({ outcome: result.outcome, reason: result.reason, failedStep: result.steps?.failedStep }, { outcome: 'failed', reason: 'stage-failed', failedStep: 6 });
+    assert.equal(subject.backend.listServices().some((service) => service.startsWith('qlb:anthropic:staged-rollback:')), false);
+    assert.equal(existsSync(join(subject.deps.journalDir!, 'switch-anthropic.json')), false);
+  });
+
+  it('a step-6 marker write that fails keeps the unmarked journal and the staged item, lists cleanup, and the next switch refuses switch-journal-present', async () => {
+    const subject = await transactionFixture();
+    const originalSet = subject.backend.set.bind(subject.backend);
+    subject.deps.live.backend = {
+      kind: 'test-memory', get: (...args) => subject.backend.get(...args), delete: (...args) => subject.backend.delete(...args),
+      set: async (service, account, value) => {
+        await originalSet(service, account, value);
+        if (service.startsWith('qlb:anthropic:staged-rollback:')) throw new Error('staged write failed');
+      },
+      setSync: (...args) => subject.backend.setSync(...args), getSync: (...args) => subject.backend.getSync(...args), deleteSync: (...args) => subject.backend.deleteSync(...args),
+    };
+    subject.deps.journalOps = {
+      update: (held, patch, options) => {
+        if (patch.closed === 'stage-failed') throw new Error('journal marker write failed');
+        return updateClaudeSwitchJournal(held, patch, options);
+      },
+      remove: deleteClaudeSwitchJournal,
+    };
+    const failed = await switchClaude(subject.deps, manual);
+    const journalPath = join(subject.deps.journalDir!, 'switch-anthropic.json');
+    assert.equal(failed.reason, 'stage-failed');
+    assert.deepEqual(failed.steps?.cleanup, ['journal-io-failed']);
+    assert.equal((JSON.parse(readFileSync(journalPath, 'utf8')) as { closed: null }).closed, null);
+    assert.equal(subject.backend.listServices().some((service) => service.startsWith('qlb:anthropic:staged-rollback:')), true);
+    subject.deps.journalOps = undefined;
+    subject.deps.live.backend = subject.backend;
+    subject.deps.probeOwner = () => 'free';
+    subject.deps.stillTheSameProcess = async () => false;
+    const next = await switchClaude(subject.deps, manual);
+    assert.deepEqual({ outcome: next.outcome, reason: next.reason }, { outcome: 'refused', reason: 'switch-journal-present' });
+  });
+
+  it('a step-6 journal delete that fails after the staged delete succeeded keeps a finished journal with no item, and the next switch deletes it and commits ok (the absent staged item is not an error)', async () => {
+    const subject = await transactionFixture();
+    const originalSet = subject.backend.set.bind(subject.backend);
+    let failJournalDelete = true;
+    subject.deps.live.backend = {
+      kind: 'test-memory', get: (...args) => subject.backend.get(...args), delete: (...args) => subject.backend.delete(...args),
+      set: async (service, account, value) => {
+        await originalSet(service, account, value);
+        if (service.startsWith('qlb:anthropic:staged-rollback:')) throw new Error('staged write failed');
+      },
+      setSync: (...args) => subject.backend.setSync(...args), getSync: (...args) => subject.backend.getSync(...args), deleteSync: (...args) => subject.backend.deleteSync(...args),
+    };
+    subject.deps.journalOps = {
+      update: updateClaudeSwitchJournal,
+      remove: (held, options) => {
+        if (failJournalDelete) throw new Error('journal delete failed');
+        deleteClaudeSwitchJournal(held, options);
+      },
+    };
+    const failed = await switchClaude(subject.deps, manual);
+    const journalPath = join(subject.deps.journalDir!, 'switch-anthropic.json');
+    assert.equal(failed.reason, 'stage-failed');
+    assert.deepEqual(failed.steps?.cleanup, ['journal-io-failed']);
+    assert.equal((JSON.parse(readFileSync(journalPath, 'utf8')) as { closed: string }).closed, 'stage-failed');
+    assert.equal(subject.backend.listServices().some((service) => service.startsWith('qlb:anthropic:staged-rollback:')), false);
+    failJournalDelete = false;
+    subject.deps.journalOps = undefined;
+    subject.deps.live.backend = subject.backend;
+    subject.deps.probeOwner = () => 'free';
+    subject.deps.stillTheSameProcess = async () => false;
+    const next = await switchClaude(subject.deps, manual);
+    assert.equal(next.outcome, 'ok');
+    assert.equal(existsSync(journalPath), false);
+  });
+
   it('crashAt \'after-commit\' leaves one ok row and an uncommitted journal that the next switch\'s preflight deletes without a second row', async () => {
-    const subject = await transactionFixture(); subject.deps.crashAt = (checkpoint) => { if (checkpoint === 'after-commit') throw new CrashSignal(checkpoint); };
+    const subject = await transactionFixture();
+    const commit = subject.deps.store.commitClaudeSwitch.bind(subject.deps.store);
+    let commits = 0;
+    subject.deps.store.commitClaudeSwitch = (row) => { commits += 1; return commit(row); };
+    subject.deps.crashAt = (checkpoint) => { if (checkpoint === 'after-commit') throw new CrashSignal(checkpoint); };
     await assert.rejects(() => switchClaude(subject.deps, manual), CrashSignal);
-    assert.equal(subject.committed !== null, true); assert.equal(existsSync(join(subject.deps.journalDir!, 'switch-anthropic.json')), true);
+    const journalPath = join(subject.deps.journalDir!, 'switch-anthropic.json');
+    assert.equal(subject.committed !== null, true);
+    assert.equal(existsSync(journalPath), true);
+    subject.deps.store.findClaudeSwitchByAttempt = (attempt) => attempt === 'attempt-k5-5'
+      ? { id: 42, outcome: 'ok', ts: NOW, committedAt: NOW } : null;
+    subject.deps.probeOwner = () => 'free';
+    subject.deps.stillTheSameProcess = async () => false;
+    subject.deps.crashAt = undefined;
+    const next = await switchClaude(subject.deps, manual);
+    assert.equal(next.outcome, 'noop');
+    assert.equal(existsSync(journalPath), false);
+    assert.equal(commits, 1);
   });
 
   it('a failing staged-item delete after the commit keeps outcome ok, lists cleanup, leaves the journal in place, and the next preflight (committed row found) deletes the item and then the journal', async () => {

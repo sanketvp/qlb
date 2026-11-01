@@ -83,6 +83,11 @@ export interface ClaudeSwitchDeps {
   };
   journalDir?: string;
   journalOwner?: { pid: number; lstart: string };
+  /** Test seam for journal mutations; production uses the real helpers. */
+  journalOps?: {
+    update: typeof updateClaudeSwitchJournal;
+    remove: typeof deleteClaudeSwitchJournal;
+  };
   probeOwner?: (options: { journalDir?: string; home?: string; env?: NodeJS.ProcessEnv }) => 'held' | 'free';
   stillTheSameProcess?: (owner: { pid: number; lstart: string }) => Promise<boolean>;
   stashTimestamp?: () => string;
@@ -241,6 +246,8 @@ export async function switchClaude(deps: ClaudeSwitchDeps, input: SwitchClaudeIn
   const credentialLock = deps.locks?.credential ?? withClaudeCredentialLocks;
   const ownerLock = deps.locks?.owner ?? withClaudeSwitchJournalOwner;
   const configLock = deps.locks?.configPath ?? withClaudeConfigPathLock;
+  const journalUpdate = deps.journalOps?.update ?? updateClaudeSwitchJournal;
+  const journalRemove = deps.journalOps?.remove ?? deleteClaudeSwitchJournal;
   const state = steps();
   let ownerResult: ClaudeSwitchResult | undefined;
   try {
@@ -254,7 +261,7 @@ export async function switchClaude(deps: ClaudeSwitchDeps, input: SwitchClaudeIn
           if (inside.state === 'ok') {
             const done = inside.journal.committed !== undefined || inside.journal.closed !== null || deps.store.findClaudeSwitchByAttempt(inside.journal.attemptId) !== null;
             if (!done) return refusal(deps, input, attempt, activeAccount(deps), 'switch-journal-present');
-            try { await deleteStagedRollback(live.backend, inside.journal.stagedBlobService); deleteClaudeSwitchJournal(ownerHeld, options); } catch { return refusal(deps, input, attempt, activeAccount(deps), 'switch-journal-present'); }
+            try { await deleteStagedRollback(live.backend, inside.journal.stagedBlobService); journalRemove(ownerHeld, options); } catch { return refusal(deps, input, attempt, activeAccount(deps), 'switch-journal-present'); }
           }
           const from = activeAccount(deps);
           if (from === null) return refusal(deps, input, attempt, null, 'active-login-unset');
@@ -298,14 +305,14 @@ export async function switchClaude(deps: ClaudeSwitchDeps, input: SwitchClaudeIn
             createClaudeSwitchJournal({ v: 1, provider: 'anthropic', attemptId: attempt, from, to: input.to, trigger: input.trigger, by: deps.by, republish: false, injected: input.injected === true, detail: null, decision: input.decision ?? noDecision(), outgoingKind: classified.kind, bindingJson: input.bindingJson ?? null, step: 6, stagedBlobService, stagedAccount: 'qlb', stagedWritten: false, keychainService: paths.keychainService, configPath: paths.globalConfigPath, configText: null, configWrittenHash: null, fromOauthAccount: null, credentialsWrittenHash: null, credentialsWriteStarted: false, credentialsWritten: false, configWriteStarted: false, configWritten: false, closed: null, startedAt: deps.now(), owner }, options);
             deps.crashAt?.('after-journal');
             await writeStagedRollback(live.backend, stagedBlobService, outgoingLive);
-            updateClaudeSwitchJournal(ownerHeld, { stagedWritten: true }, options);
+            journalUpdate(ownerHeld, { stagedWritten: true }, options);
             deps.crashAt?.('after-stage');
           } catch (error) {
             if (isCrash(error)) throw error;
             if (error instanceof ClaudeSwitchJournalPresent) return refusal(deps, input, attempt, from, 'switch-journal-present');
-            try { updateClaudeSwitchJournal(ownerHeld, { closed: 'stage-failed' }, options); } catch (cleanup) { state.cleanup.push(classifySwitchError(cleanup)); return failed(deps, input, attempt, from, 'stage-failed', classifySwitchError(error), state, 6); }
+            try { journalUpdate(ownerHeld, { closed: 'stage-failed' }, options); } catch (cleanup) { state.cleanup.push(classifySwitchError(cleanup)); return failed(deps, input, attempt, from, 'stage-failed', classifySwitchError(error), state, 6); }
             try { await deleteStagedRollback(live.backend, stagedBlobService); } catch (cleanup) { state.cleanup.push(classifySwitchError(cleanup)); return failed(deps, input, attempt, from, 'stage-failed', classifySwitchError(error), state, 6); }
-            try { deleteClaudeSwitchJournal(ownerHeld, options); } catch (cleanup) { state.cleanup.push(classifySwitchError(cleanup)); }
+            try { journalRemove(ownerHeld, options); } catch (cleanup) { state.cleanup.push(classifySwitchError(cleanup)); }
             return failed(deps, input, attempt, from, 'stage-failed', classifySwitchError(error), state, 6);
           }
           state.started.push(6); await deps.hooks?.beforeStep7?.();
@@ -313,11 +320,11 @@ export async function switchClaude(deps: ClaudeSwitchDeps, input: SwitchClaudeIn
           let publishedAt: number | null = null;
           try {
             const composed = mergeSharedCredentialFields(targetCredential, sharedCredentialFields(outgoingLive) ?? {});
-            updateClaudeSwitchJournal(ownerHeld, { step: 7, credentialsWriteStarted: true, credentialsWrittenHash: sha256(composed) }, options);
+            journalUpdate(ownerHeld, { step: 7, credentialsWriteStarted: true, credentialsWrittenHash: sha256(composed) }, options);
             deps.crashAt?.('before-step-7-write');
             await writeLiveClaudeCredentials(composed, live, credentialHeld);
             publishedAt = deps.now();
-            updateClaudeSwitchJournal(ownerHeld, { credentialsWritten: true, publishedAt }, options);
+            journalUpdate(ownerHeld, { credentialsWritten: true, publishedAt }, options);
             state.started.push(7); await deps.hooks?.afterStep7?.(); deps.crashAt?.('after-step-7');
           } catch (error) { if (isCrash(error)) throw error; return failed(deps, input, attempt, from, 'step-7', writeError(error, 'keychain-write-failed'), state, 7); }
           // Step 8: config lock covers raw read, planning splice, journal intent, and write only.
@@ -329,9 +336,9 @@ export async function switchClaude(deps: ClaudeSwitchDeps, input: SwitchClaudeIn
               let planned: string | undefined;
               await spliceOauthAccount(paths.globalConfigPath, targetOauth!, configHeld, { readText: () => raw, writeText: (_path, text) => { planned = text; } });
               if (planned === undefined) throw new ClaudeConfigFileError(paths.globalConfigPath, 'could not plan file');
-              updateClaudeSwitchJournal(ownerHeld, { step: 8, configText: raw, fromOauthAccount, configWrittenHash: sha256(planned), configWriteStarted: true }, options);
+              journalUpdate(ownerHeld, { step: 8, configText: raw, fromOauthAccount, configWrittenHash: sha256(planned), configWriteStarted: true }, options);
               (live.writeText ?? ((path: string, text: string) => { atomicWriteText(path, text, { mode: 0o600 }); }))(paths.globalConfigPath, planned);
-              updateClaudeSwitchJournal(ownerHeld, { configWritten: true }, options);
+              journalUpdate(ownerHeld, { configWritten: true }, options);
             });
             state.started.push(8); await deps.hooks?.afterStep8?.(); deps.crashAt?.('after-step-8');
           } catch (error) { if (isCrash(error)) throw error; return failed(deps, input, attempt, from, 'step-8', writeError(error, 'config-write-failed'), state, 8); }
@@ -342,9 +349,9 @@ export async function switchClaude(deps: ClaudeSwitchDeps, input: SwitchClaudeIn
             switchId = deps.store.commitClaudeSwitch({ now: deps.now(), fromAccount: from, toAccount: input.to, trigger: input.trigger, setBy: input.trigger === 'manual' ? 'manual' : 'auto', attempt, outgoingKind: classified.kind, bindingJson: input.bindingJson ?? null, stepsJson: JSON.stringify(state), publishedAt, injected: input.injected === true, detail: null, republish: false, decision: input.decision ?? noDecision() });
             state.started.push(9); deps.crashAt?.('after-commit');
           } catch (error) { if (isCrash(error)) throw error; return failed(deps, input, attempt, from, 'step-9', classifySwitchError(error), state, 9); }
-          try { updateClaudeSwitchJournal(ownerHeld, { committed: deps.now() }, options); } catch (error) { state.cleanup.push(classifySwitchError(error)); }
+          try { journalUpdate(ownerHeld, { committed: deps.now() }, options); } catch (error) { state.cleanup.push(classifySwitchError(error)); }
           if (state.cleanup.length === 0) try { await deleteStagedRollback(live.backend, stagedBlobService); } catch (error) { state.cleanup.push(classifySwitchError(error)); }
-          if (state.cleanup.length === 0) try { deleteClaudeSwitchJournal(ownerHeld, options); } catch (error) { state.cleanup.push(classifySwitchError(error)); }
+          if (state.cleanup.length === 0) try { journalRemove(ownerHeld, options); } catch (error) { state.cleanup.push(classifySwitchError(error)); }
           return { outcome: 'ok', from, to: input.to, switchId, attempt, outgoingKind: classified.kind, injected: input.injected === true, steps: state, exitCode: 0 };
           })();
           ownerResult = outcome;
