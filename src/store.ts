@@ -2537,7 +2537,7 @@ export class Store {
     this.db.prepare("DELETE FROM config WHERE key = 'codex.recoveryFence'").run();
   }
 
-  /** Resolve a config fence and its old watch in the same SQLite transaction. */
+  /** Resolve a config fence and its old watch in one transaction. No committed_at: the attempt's ok commit remains findable. */
   commitFenceResolution(input: {
     fence: CodexRecoveryFence;
     effect: { outcome: 'failed'; detail: string } | { outcome: 'reverted-by-codex'; accountId: string } | { outcome: 'ok' | 'quiet' | 'stopped'; reason?: string; detail?: string };
@@ -2556,7 +2556,7 @@ export class Store {
       const switchId = this.recordSwitch({ ts: input.now, provider: 'openai-codex', fromAccount: source.from_account,
         toAccount: source.to_account, trigger: source.trigger, outcome,
         stepsJson: JSON.stringify({ attempt: input.attempt, via: 'fence' }), publishedAt: input.fence.publishedAt,
-        committedAt: input.now, detail });
+        detail });
       this.clearRecoveryFence();
       this.db.prepare('DELETE FROM codex_watch WHERE switch_id = ?').run(input.fence.switchId);
       return switchId;

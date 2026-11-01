@@ -530,7 +530,7 @@ describe('Codex recovery fence resolution — C6-20', () => {
       assert.deepEqual(after.watches, [999]);
       assert.deepEqual(after.active, { account_id: 'from:account', set_by: 'adopt', since: 200 });
       assert.deepEqual(after.rows, [...before.rows, { ts: 200, from_account: 'from:account', to_account: 'to:account', trigger: 'manual',
-        outcome: 'reverted-by-codex', detail: null, published_at: 90, committed_at: 200, steps_json: '{"attempt":"fence-attempt","via":"fence"}' }]);
+        outcome: 'reverted-by-codex', detail: null, published_at: 90, committed_at: null, steps_json: '{"attempt":"fence-attempt","via":"fence"}' }]);
       assert.equal((db.prepare('SELECT MAX(id) AS id FROM switch_log').get() as { id: number }).id, id);
     } finally { store.close(); }
   });
