@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { existsSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -574,6 +574,82 @@ describe('Codex recovery fence resolution — C6-20', () => {
       store.setRecoveryFence({ ...fence, reason: 'target-ancestor' });
       assert.equal(JSON.parse(store.getConfig('codex.recoveryFence')!).reason, 'target-ancestor');
     } finally { store.close(); }
+  });
+});
+
+describe('Pi export target provenance', () => {
+  it('pi_export_targets rows carry recorded_by: replace keeps each row\'s tag, recordIfEmpty tags pool-inventory, delete removes only one tag\'s rows', () => {
+    const store = openStore(':memory:');
+    try {
+      store.replacePiExportTargets('anthropic', [
+        { provider: 'anthropic', target: 'migrated', slotAccountId: 'slot-migrated', lineageFp: 'fp-migrated', recordedAt: 1, recordedBy: 'pi-migrate' },
+        { provider: 'anthropic', target: 'inventory', slotAccountId: 'slot-inventory', lineageFp: 'fp-inventory', recordedAt: 2 },
+      ]);
+      assert.deepEqual(store.listPiExportTargets('anthropic').map((row) => ({ ...row })), [
+        { provider: 'anthropic', target: 'inventory', slotAccountId: 'slot-inventory', lineageFp: 'fp-inventory', recordedAt: 2, recordedBy: 'pool-inventory' },
+        { provider: 'anthropic', target: 'migrated', slotAccountId: 'slot-migrated', lineageFp: 'fp-migrated', recordedAt: 1, recordedBy: 'pi-migrate' },
+      ]);
+      assert.equal(store.deletePiExportTargets('anthropic', 'pi-migrate'), 1);
+      assert.deepEqual(store.listPiExportTargets('anthropic').map((row) => ({ ...row })), [
+        { provider: 'anthropic', target: 'inventory', slotAccountId: 'slot-inventory', lineageFp: 'fp-inventory', recordedAt: 2, recordedBy: 'pool-inventory' },
+      ]);
+      assert.deepEqual(store.recordPiExportTargetsIfEmpty('xai', [{
+        provider: 'xai', target: 'default', slotAccountId: 'slot-xai', lineageFp: 'fp-xai', recordedAt: 3,
+      }], () => ({ ok: true })), { ok: true });
+      assert.deepEqual(store.listPiExportTargets('xai').map((row) => ({ ...row })), [{
+        provider: 'xai', target: 'default', slotAccountId: 'slot-xai', lineageFp: 'fp-xai', recordedAt: 3, recordedBy: 'pool-inventory',
+      }]);
+    } finally {
+      store.close();
+    }
+  });
+
+  it('an existing user_version=5 qlb.db without recorded_by is backed up and gains the column on open, its rows read as pool-inventory, and a second open takes no further backup', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-pi-export-target-provenance-'));
+    const path = join(dir, 'qlb.db');
+    const initial = openStore(path);
+    initial.replacePiExportTargets('anthropic', [{
+      provider: 'anthropic', target: 'pool-a', slotAccountId: 'slot-a', lineageFp: 'fp-a', recordedAt: 1,
+    }]);
+    initial.close();
+
+    const beforeDrop = new DatabaseSync(path);
+    beforeDrop.exec('ALTER TABLE pi_export_targets DROP COLUMN recorded_by');
+    assert.equal((beforeDrop.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 5);
+    assert.equal((beforeDrop.prepare('PRAGMA table_info(pi_export_targets)').all() as Array<{ name: string }>).length, 5);
+    beforeDrop.close();
+
+    const backupsDir = join(dir, 'backups');
+    const backupsBefore = readdirSync(backupsDir).filter((file) => file.endsWith('.sqlite'));
+    const corrected = openStore(path);
+    try {
+      const backups = readdirSync(backupsDir).filter((file) => file.endsWith('.sqlite'));
+      assert.equal(backups.length, backupsBefore.length + 1);
+      const correctionBackup = backups.find((file) => !backupsBefore.includes(file));
+      assert.ok(correctionBackup);
+      const backup = new DatabaseSync(join(backupsDir, correctionBackup), { readOnly: true });
+      try {
+        assert.equal((backup.prepare('PRAGMA table_info(pi_export_targets)').all() as Array<{ name: string }>).some(({ name }) => name === 'recorded_by'), false);
+      } finally {
+        backup.close();
+      }
+      const live = new DatabaseSync(path, { readOnly: true });
+      try {
+        assert.equal((live.prepare('PRAGMA table_info(pi_export_targets)').all() as Array<{ name: string }>).some(({ name }) => name === 'recorded_by'), true);
+      } finally {
+        live.close();
+      }
+      assert.deepEqual(corrected.listPiExportTargets('anthropic').map((row) => ({ ...row })), [{
+        provider: 'anthropic', target: 'pool-a', slotAccountId: 'slot-a', lineageFp: 'fp-a', recordedAt: 1, recordedBy: 'pool-inventory',
+      }]);
+      corrected.close();
+      const reopened = openStore(path);
+      reopened.close();
+      assert.equal(readdirSync(backupsDir).filter((file) => file.endsWith('.sqlite')).length, backups.length);
+    } finally {
+      // The store may already be closed after the second-open assertion.
+      try { corrected.close(); } catch { /* already closed */ }
+    }
   });
 });
 

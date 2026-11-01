@@ -84,6 +84,9 @@ export interface CodexSlotLineageChainRow {
   lineages: string[];
 }
 
+/** The durable writer provenance for a Pi export target. */
+export type PiExportTargetRecordedBy = 'pool-inventory' | 'pi-migrate';
+
 /** S61's durable undo-export mapping for an anthropic-pool entry. */
 export interface PiExportTargetRow {
   provider: string;
@@ -91,7 +94,13 @@ export interface PiExportTargetRow {
   slotAccountId: string;
   lineageFp: string;
   recordedAt: number;
+  recordedBy: PiExportTargetRecordedBy;
 }
+
+/** Input permits callers without provenance to use the pool-inventory default. */
+export type PiExportTargetInput = Omit<PiExportTargetRow, 'recordedBy'> & {
+  recordedBy?: PiExportTargetRecordedBy;
+};
 
 /** Atomic admission/insert result for the add-only Pi export inventory write. */
 export interface PiExportTargetRecordResult {
@@ -381,7 +390,7 @@ const V5_SCHEMA_DDL = `
   CREATE TABLE IF NOT EXISTS lifecycle (id INTEGER PRIMARY KEY AUTOINCREMENT, state TEXT NOT NULL, began_at INTEGER NOT NULL, cutover_at INTEGER, window_end INTEGER, extended_at INTEGER, undo_began_at INTEGER, rollback_at INTEGER, retired_at INTEGER, closed_at INTEGER, release_sha TEXT, drill_done_at INTEGER, note TEXT, pre_fence_state TEXT);
   CREATE TABLE IF NOT EXISTS codex_watch (switch_id INTEGER PRIMARY KEY, provider TEXT NOT NULL, outgoing TEXT NOT NULL, target TEXT NOT NULL, next_at INTEGER NOT NULL, until INTEGER NOT NULL);
   CREATE TABLE IF NOT EXISTS import_runs (run_id TEXT PRIMARY KEY, started_at INTEGER NOT NULL, committed_at INTEGER);
-  CREATE TABLE IF NOT EXISTS pi_export_targets (provider TEXT NOT NULL, target TEXT NOT NULL, slot_account_id TEXT NOT NULL, lineage_fp TEXT NOT NULL, recorded_at INTEGER NOT NULL, PRIMARY KEY (provider, target));
+  CREATE TABLE IF NOT EXISTS pi_export_targets (provider TEXT NOT NULL, target TEXT NOT NULL, slot_account_id TEXT NOT NULL, lineage_fp TEXT NOT NULL, recorded_at INTEGER NOT NULL, recorded_by TEXT NOT NULL DEFAULT 'pool-inventory', PRIMARY KEY (provider, target));
   CREATE TABLE IF NOT EXISTS codex_live_observations (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, identity TEXT, lineage_fp TEXT, by TEXT NOT NULL);
 `;
 
@@ -1486,6 +1495,7 @@ export class Store {
     this.addColumnIfMissing('relogin_events', 'user_denied_at', 'INTEGER');
     this.addColumnIfMissing('lineage_log', 'evidence', 'TEXT');
     this.addColumnIfMissing('lifecycle', 'pre_fence_state', 'TEXT');
+    this.addColumnIfMissing('pi_export_targets', 'recorded_by', "TEXT NOT NULL DEFAULT 'pool-inventory'");
   }
 
   private tableExists(table: string): boolean {
@@ -2977,16 +2987,20 @@ export class Store {
   }
 
   /** Replace one provider's observed export targets as a single write transaction. */
-  replacePiExportTargets(provider: string, targets: PiExportTargetRow[]): void {
+  replacePiExportTargets(provider: string, targets: PiExportTargetInput[]): void {
     this.runImmediate(() => {
       this.db.prepare('DELETE FROM pi_export_targets WHERE provider = ?').run(provider);
       const insert = this.db.prepare(`INSERT INTO pi_export_targets
-        (provider, target, slot_account_id, lineage_fp, recorded_at) VALUES (?, ?, ?, ?, ?)`);
+        (provider, target, slot_account_id, lineage_fp, recorded_at, recorded_by) VALUES (?, ?, ?, ?, ?, ?)`);
       for (const target of targets) {
         if (target.provider !== provider) throw new Error('pi export target provider mismatch');
-        insert.run(target.provider, target.target, target.slotAccountId, target.lineageFp, target.recordedAt);
+        insert.run(target.provider, target.target, target.slotAccountId, target.lineageFp, target.recordedAt, target.recordedBy ?? 'pool-inventory');
       }
     });
+  }
+
+  deletePiExportTargets(provider: string, recordedBy: PiExportTargetRecordedBy): number {
+    return Number(this.db.prepare('DELETE FROM pi_export_targets WHERE provider = ? AND recorded_by = ?').run(provider, recordedBy).changes);
   }
 
   /**
@@ -2996,7 +3010,7 @@ export class Store {
    */
   recordPiExportTargetsIfEmpty(
     provider: string,
-    targets: PiExportTargetRow[],
+    targets: PiExportTargetInput[],
     admit: (db: DatabaseSync) => PiExportTargetRecordResult,
   ): PiExportTargetRecordResult {
     return this.runImmediate(() => {
@@ -3006,10 +3020,10 @@ export class Store {
         return { ok: false, code: 'pi-export-targets-exist' };
       }
       const insert = this.db.prepare(`INSERT INTO pi_export_targets
-        (provider, target, slot_account_id, lineage_fp, recorded_at) VALUES (?, ?, ?, ?, ?)`);
+        (provider, target, slot_account_id, lineage_fp, recorded_at, recorded_by) VALUES (?, ?, ?, ?, ?, ?)`);
       for (const target of targets) {
         if (target.provider !== provider) throw new Error('pi export target provider mismatch');
-        insert.run(target.provider, target.target, target.slotAccountId, target.lineageFp, target.recordedAt);
+        insert.run(target.provider, target.target, target.slotAccountId, target.lineageFp, target.recordedAt, 'pool-inventory');
       }
       return { ok: true };
     });
@@ -3020,7 +3034,7 @@ export class Store {
    * classifier may read store state, which is therefore protected from a slot
    * writer until either this insert commits or classification rolls back.
    */
-  recordPiExportTargetsIfEmptyClassified<T extends { targets: PiExportTargetRow[] }>(
+  recordPiExportTargetsIfEmptyClassified<T extends { targets: PiExportTargetInput[] }>(
     provider: string,
     classifyInTransaction: () => T,
     admit: (db: DatabaseSync) => PiExportTargetRecordResult,
@@ -3033,10 +3047,10 @@ export class Store {
         return { ok: false, code: 'pi-export-targets-exist' };
       }
       const insert = this.db.prepare(`INSERT INTO pi_export_targets
-        (provider, target, slot_account_id, lineage_fp, recorded_at) VALUES (?, ?, ?, ?, ?)`);
+        (provider, target, slot_account_id, lineage_fp, recorded_at, recorded_by) VALUES (?, ?, ?, ?, ?, ?)`);
       for (const target of classified.targets) {
         if (target.provider !== provider) throw new Error('pi export target provider mismatch');
-        insert.run(target.provider, target.target, target.slotAccountId, target.lineageFp, target.recordedAt);
+        insert.run(target.provider, target.target, target.slotAccountId, target.lineageFp, target.recordedAt, 'pool-inventory');
       }
       return { ok: true, result: classified };
     });
@@ -3044,7 +3058,7 @@ export class Store {
 
   listPiExportTargets(provider: string): PiExportTargetRow[] {
     return this.db.prepare(`SELECT provider, target, slot_account_id AS slotAccountId,
-      lineage_fp AS lineageFp, recorded_at AS recordedAt FROM pi_export_targets
+      lineage_fp AS lineageFp, recorded_at AS recordedAt, recorded_by AS recordedBy FROM pi_export_targets
       WHERE provider = ? ORDER BY target`).all(provider) as unknown as PiExportTargetRow[];
   }
 
