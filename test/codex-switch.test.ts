@@ -3120,6 +3120,27 @@ describe('Codex watch tick — C6-21', () => {
     }
   });
 
+  it('a valid but non-head slot-B Keychain document fences {A, B}, writes no row and keeps the watch (C6-21b r1)', async () => {
+    const service = qlbKeychainService('openai-codex', 'b:account');
+    const mismatches = {
+      'another B version': observedDocument('b', 'b-other-version'),
+      'another account': observedDocument('c', 'c-other-account'),
+    };
+    for (const [label, document] of Object.entries(mismatches)) {
+      const h = switchHarness();
+      try {
+        const watch = await committedWatch(h);
+        const before = { rows: rows(h), active: activeLogin(h) };
+        h.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(document));
+        assert.deepEqual(await tick(h, watch, 30_000), { state: 'unresolved', reason: 'slot-split' }, label);
+        assert.deepEqual(fence(h), { v: 1, switchId: watch.switchId, attempt: watch.attempt, from: 'a:account', to: 'b:account',
+          publishedAt: watch.publishedAt, reason: 'slot-split', involvedAccounts: ['a:account', 'b:account'], since: watch.publishedAt + 30_000 }, label);
+        assert.deepEqual({ rows: rows(h), active: activeLogin(h) }, before, label);
+        assert.equal(watchRows(h), 1, `${label}: the watch is kept`);
+      } finally { close(h); }
+    }
+  });
+
   it('a quiet B continues with no row', async () => {
     const h = switchHarness();
     try {

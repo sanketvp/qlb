@@ -1393,13 +1393,9 @@ export async function codexWatchTick(deps: CodexSwitchDeps, watch: CodexWatch): 
       [watch.target, targetRow.fingerprint],
     ]);
     if (liveIdentity) slotHeads.set(liveIdentity, deps.store.getCodexSlot(liveIdentity)?.fingerprint ?? null);
-    // C6-21b: B must have a readable Keychain copy even when the live file
-    // equals B's recorded head; otherwise the DB/Keychain split is fenced.
-    let target: CodexAuthDocument;
-    try { target = slots.readSlot(watch.target, { fresh: true }).document; }
-    catch (error) {
-      // C6-21-R1 (from C6-20d): only a missing or corrupt item is a split; any other Keychain failure propagates, writing nothing.
-      if (!isCredentialNotFound(error) && !isMalformedCodexSlot(error)) throw error;
+    // C6-21b: B's Keychain copy must be the DB-recorded head, even when the
+    // live file equals that head; otherwise the DB/Keychain split is fenced.
+    const fenceTargetSlotSplit = (): CodexWatchTickResult => {
       // Fence {A, B} plus, per §3.1, the live identity's managed slot (as recovery's unreadable-B branch); '*' with no identity.
       const involvedAccounts = liveIdentity === null ? '*'
         : [...new Set([watch.outgoing, watch.target, ...(deps.store.getCodexSlot(liveIdentity) ? [liveIdentity] : [])])].sort();
@@ -1407,7 +1403,15 @@ export async function codexWatchTick(deps: CodexSwitchDeps, watch: CodexWatch): 
       assertHeld(); deps.store.setRecoveryFence({ v: 1, switchId: watch.switchId, attempt: watch.attempt, from: watch.outgoing, to: watch.target,
         publishedAt: watch.publishedAt, reason, involvedAccounts, since: deps.now() });
       return { state: 'unresolved', reason };
+    };
+    let target: CodexAuthDocument;
+    try { target = slots.readSlot(watch.target, { fresh: true }).document; }
+    catch (error) {
+      // C6-21-R1 (from C6-20d): only a missing or corrupt item is a split; any other Keychain failure propagates, writing nothing.
+      if (!isCredentialNotFound(error) && !isMalformedCodexSlot(error)) throw error;
+      return fenceTargetSlotSplit();
     }
+    if (codexFingerprint(target) !== targetFp) return fenceTargetSlotSplit();
     let attribution: CodexPhaseAttribution | undefined;
     if (typeof classified === 'object' && classified.status === 'external') {
       const history = deps.dbPath ? readCodexSwitchHistory(deps.dbPath, { journalDir: deps.journalDir }) : { rows: [], observations: [] };
