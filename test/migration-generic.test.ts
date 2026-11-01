@@ -251,6 +251,88 @@ function setup(
   };
 }
 
+type CrashWindow = 'S1-legacy-delete' | 'S1-legacy-unlink' | 'S1-stage' | 'keychain-write-failed' | 'after-keychain-write';
+
+class CrashingStageKeychain extends MockKeychain {
+  setMode: 'ok' | 'fail-before' | 'fail-after' = 'ok';
+
+  override setSync(service: string, account: string, value: string): void {
+    if (this.setMode === 'fail-before') throw new Error('fixture crash: Keychain write failed');
+    super.setSync(service, account, value);
+    if (this.setMode === 'fail-after') throw new Error('fixture crash after Keychain write');
+  }
+}
+
+type OldFixture = Harness & { mig: Migration; staging: string; crashAt: { point: string | undefined } };
+
+/**
+ * A pre-commit migration staged by the old code: the journal and staging file
+ * record no `keychain` (so both name qlb:<p>:<id>), the Grant sits at that
+ * old item, and the shared item does not exist.
+ */
+function oldPreCommitFixture(
+  provider: 'xai' | 'kimi-coding',
+  state: 'MIRRORED' | 'VALIDATED',
+  kc: MockKeychain = new CrashingStageKeychain(),
+): OldFixture {
+  const crashAt: { point: string | undefined } = { point: undefined };
+  const h = setup(provider, kc, {
+    afterStep: (point) => {
+      if (point === crashAt.point) throw new Error(`fixture crash at ${point}`);
+    },
+  });
+  h.mig.stage();
+  const staging = stagingOwnerPath(join(h.dir, 'qlb-owner.json'), provider);
+  const detail = JSON.parse(h.store.getMigration(`pi-${provider}`)!.detail_json) as { accounts: Array<Record<string, unknown>> };
+  delete detail.accounts[0]!.keychain;
+  h.store.upsertMigration(`pi-${provider}`, state, JSON.stringify(detail));
+  const owner = JSON.parse(readFileSync(staging, 'utf8')) as { accounts: Array<Record<string, unknown>> };
+  delete owner.accounts[0]!.keychain;
+  writeFileSync(staging, JSON.stringify(owner, null, 2) + '\n');
+  const shared = sharedSingleGrantCoords(provider);
+  kc.deleteSync(shared.service, shared.account);
+  const legacy = legacyKmCoords(provider);
+  kc.setSync(legacy.service, legacy.account, JSON.stringify({ ...FAKE_GRANTS[provider], generation: 0, writtenBy: 'fixture', extra: {} }));
+  return { ...h, staging, crashAt };
+}
+
+function armCrash(h: OldFixture, window: CrashWindow): void {
+  const kc = h.kc as CrashingStageKeychain;
+  if (window === 'keychain-write-failed') kc.setMode = 'fail-before';
+  else if (window === 'after-keychain-write') kc.setMode = 'fail-after';
+  else h.crashAt.point = window;
+}
+
+function disarmCrash(h: OldFixture): void {
+  (h.kc as CrashingStageKeychain).setMode = 'ok';
+  h.crashAt.point = undefined;
+}
+
+function journalAccount(h: Harness, provider: string): Record<string, unknown> {
+  const detail = JSON.parse(h.store.getMigration(`pi-${provider}`)!.detail_json) as { accounts: Array<Record<string, unknown>> };
+  return detail.accounts[0]!;
+}
+
+function stagingAccount(h: OldFixture, provider: string): Record<string, unknown> | undefined {
+  if (!existsSync(h.staging)) return undefined;
+  const owner = JSON.parse(readFileSync(h.staging, 'utf8')) as { accounts: Array<Record<string, unknown>> };
+  assert.equal(owner.accounts[0]?.provider, provider);
+  return owner.accounts[0];
+}
+
+/** Everything a refused re-stage must leave alone (files other than the db, the journal, the account row). */
+function snapshotRestage(h: OldFixture, provider: 'xai' | 'kimi-coding'): unknown {
+  const files = [...fileSnapshot(h.dir)].filter(([name]) => !name.startsWith('qlb.db'));
+  const legacy = legacyKmCoords(provider);
+  return {
+    files,
+    journal: h.store.getMigration(`pi-${provider}`),
+    account: h.store.getAccount(expectedId(provider)),
+    generation: h.store.getGrantGeneration(expectedId(provider)),
+    legacyItem: h.kc.getSync(legacy.service, legacy.account),
+  };
+}
+
 describe('generic single-grant migration — xai / kimi-coding / openai-codex', () => {
   for (const provider of SINGLE_GRANT_PROVIDERS) {
     it(`happy path ${provider}: stage → rehearse → commit; accountId matches adapter; auth.json shadow-retained`, async () => {
@@ -428,43 +510,179 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     });
 
     it(`T-KC11 [${provider}] re-staging a journal staged under the old Keychain name removes the old staged copy and records the shared item`, () => {
-      let crashAfterLegacyDelete = false;
-      const kc = new MockKeychain();
-      const h = setup(provider, kc, {
-        afterStep: (point) => {
-          if (crashAfterLegacyDelete && point === 'S1-legacy-delete') throw new Error('fixture crash after legacy delete');
-        },
-      });
+      const legacy = legacyKmCoords(provider);
+      const shared = sharedSingleGrantCoords(provider);
+      const h = oldPreCommitFixture(provider, 'MIRRORED');
       try {
         h.mig.stage();
-        const legacy = legacyKmCoords(provider);
-        const shared = sharedSingleGrantCoords(provider);
-        const oldDetail = JSON.parse(h.store.getMigration(`pi-${provider}`)!.detail_json) as {
-          accounts: Array<Record<string, unknown>>;
-        };
-        delete oldDetail.accounts[0]!.keychain;
-        h.store.upsertMigration(`pi-${provider}`, 'MIRRORED', JSON.stringify(oldDetail));
-        kc.setSync(legacy.service, legacy.account, JSON.stringify({ old: true }));
+        assert.throws(() => h.kc.getSync(legacy.service, legacy.account), /item not found/);
+        assert.equal(keychainHas(h.kc, provider), true);
+        assert.deepEqual(journalAccount(h, provider).keychain, shared);
+        assert.deepEqual(stagingAccount(h, provider)?.keychain, shared);
+      } finally {
+        h.cleanup();
+      }
+
+      // Plus a crash after the delete: the old journal and staging file are
+      // left exactly as they were, and a new stage finishes the job.
+      const crash = oldPreCommitFixture(provider, 'MIRRORED');
+      try {
+        const journalBefore = crash.store.getMigration(`pi-${provider}`);
+        const stagingBefore = readFileSync(crash.staging);
+        crash.crashAt.point = 'S1-legacy-delete';
+        assert.throws(() => crash.mig.stage(), /fixture crash at S1-legacy-delete/);
+        assert.throws(() => crash.kc.getSync(legacy.service, legacy.account), /item not found/);
+        assert.deepEqual(crash.store.getMigration(`pi-${provider}`), journalBefore, 'journal untouched until the delete is done');
+        assert.deepEqual(readFileSync(crash.staging), stagingBefore);
+        assert.throws(() => crash.kc.getSync(shared.service, shared.account), /item not found/);
+
+        crash.crashAt.point = undefined;
+        crash.mig.stage();
+        assert.deepEqual(journalAccount(crash, provider).keychain, shared);
+        assert.deepEqual(stagingAccount(crash, provider)?.keychain, shared);
+        assert.equal(keychainHas(crash.kc, provider), true);
+      } finally {
+        crash.cleanup();
+      }
+    });
+
+    it(`T-KC11b [${provider}] every crash point of a re-stage over an old pre-commit journal recovers by rollback, resume or a new stage, and commit publishes nothing`, () => {
+      const legacy = legacyKmCoords(provider);
+      const shared = sharedSingleGrantCoords(provider);
+      const windows: CrashWindow[] = ['S1-stage', 'keychain-write-failed', 'after-keychain-write', 'S1-legacy-delete', 'S1-legacy-unlink'];
+      for (const oldState of ['MIRRORED', 'VALIDATED'] as const) {
+        for (const window of windows) {
+          for (const recovery of ['rollback', 'resume', 'stage'] as const) {
+            const where = `${oldState} / ${window} / ${recovery}`;
+            const h = oldPreCommitFixture(provider, oldState);
+            try {
+              armCrash(h, window);
+              assert.throws(() => h.mig.stage(), /fixture crash/, where);
+              disarmCrash(h);
+              assert.throws(() => h.kc.getSync(legacy.service, legacy.account), /item not found/, `${where}: legacy deleted first`);
+
+              // Journal and staging file never name different items.
+              const staged = stagingAccount(h, provider);
+              if (staged) {
+                assert.deepEqual(staged.keychain, journalAccount(h, provider).keychain, `${where}: journal and staging agree`);
+              }
+
+              // Commit publishes nothing from any crash state.
+              const journalBefore = h.store.getMigration(`pi-${provider}`);
+              const stagingBefore = existsSync(h.staging) ? readFileSync(h.staging) : null;
+              assert.throws(() => h.mig.commit(), Error, `${where}: commit refuses`);
+              assert.equal(existsSync(h.ownerPath), false, `${where}: no owner file`);
+              assert.deepEqual(h.store.getMigration(`pi-${provider}`), journalBefore, `${where}: commit wrote no journal`);
+              assert.deepEqual(existsSync(h.staging) ? readFileSync(h.staging) : null, stagingBefore, `${where}: commit kept staging`);
+
+              const atRest = oldState === 'VALIDATED' && window === 'S1-legacy-unlink';
+              const oldValidatedStaged = oldState === 'VALIDATED' && window === 'S1-legacy-delete';
+              if (recovery === 'stage') {
+                const s = h.mig.stage();
+                assert.equal(s.state, 'MIRRORED', where);
+                assert.deepEqual(journalAccount(h, provider).keychain, shared, where);
+                assert.deepEqual(stagingAccount(h, provider)?.keychain, shared, where);
+                assert.equal(keychainHas(h.kc, provider), true, where);
+              } else if (recovery === 'resume' && oldValidatedStaged) {
+                // An old VALIDATED journal with its staging file is exactly
+                // what commit refuses (OQ-2(a)); resume reaches commit.
+                assert.throws(
+                  () => h.mig.resume(),
+                  (error: unknown) => (error as { code?: unknown }).code === 'staged-under-legacy-keychain'
+                    && (error as { exitCode?: unknown }).exitCode === 3,
+                  where,
+                );
+                assert.deepEqual(h.store.getMigration(`pi-${provider}`), journalBefore, where);
+                assert.deepEqual(readFileSync(h.staging), stagingBefore, where);
+              } else {
+                const s = recovery === 'rollback' ? h.mig.rollback() : h.mig.resume();
+                // C9: a VALIDATED journal with no staging file is at rest.
+                assert.equal(s.state, atRest ? 'VALIDATED' : 'NATIVE', where);
+                assert.equal(existsSync(h.staging), false, where);
+                assert.throws(() => h.kc.getSync(shared.service, shared.account), /item not found/, `${where}: no orphan`);
+              }
+              assert.throws(() => h.kc.getSync(legacy.service, legacy.account), /item not found/, where);
+            } finally {
+              h.cleanup();
+            }
+          }
+        }
+      }
+    });
+
+    it(`T-KC11c [${provider}] a re-stage whose old staged copy cannot be deleted refuses with nothing else written`, () => {
+      const legacy = legacyKmCoords(provider);
+      const shared = sharedSingleGrantCoords(provider);
+      for (const oldState of ['MIRRORED', 'VALIDATED'] as const) {
+        const kc = new RollbackDeleteKeychain();
+        const h = oldPreCommitFixture(provider, oldState, kc);
+        try {
+          const before = snapshotRestage(h, provider);
+          kc.mode = 'denied';
+          assert.throws(
+            () => h.mig.stage(),
+            new RegExp(`^Error: migration stage failed to delete staged Keychain credential for provider=${provider} `),
+          );
+          assert.deepEqual(snapshotRestage(h, provider), before, oldState);
+          assert.throws(() => kc.getSync(shared.service, shared.account), /item not found/);
+          assert.ok(kc.getSync(legacy.service, legacy.account));
+        } finally {
+          h.cleanup();
+        }
+      }
+    });
+
+    it(`T-KC11d [${provider}] a re-stage refuses before any delete when the old journal is malformed or disagrees with the staging file`, () => {
+      const legacy = legacyKmCoords(provider);
+      const shared = sharedSingleGrantCoords(provider);
+      const breakers: Array<[string, (h: OldFixture) => void]> = [
+        ['staging names the shared item', (h) => {
+          const owner = JSON.parse(readFileSync(h.staging, 'utf8')) as { accounts: Array<Record<string, unknown>> };
+          owner.accounts[0]!.keychain = shared;
+          writeFileSync(h.staging, JSON.stringify(owner, null, 2) + '\n');
+        }],
+        ['journal holds two accounts', (h) => {
+          const row = h.store.getMigration(`pi-${provider}`)!;
+          const detail = JSON.parse(row.detail_json) as { accounts: Array<Record<string, unknown>> };
+          detail.accounts.push({ ...detail.accounts[0]! });
+          h.store.upsertMigration(`pi-${provider}`, row.state, JSON.stringify(detail));
+        }],
+      ];
+      for (const [name, breakIt] of breakers) {
+        const kc = new DeleteTrackingKeychain();
+        const h = oldPreCommitFixture(provider, 'MIRRORED', kc);
+        try {
+          breakIt(h);
+          const before = snapshotRestage(h, provider);
+          kc.deleteCalls.length = 0;
+          assert.throws(() => h.mig.stage(), /journal-keychain-invalid/, name);
+          assert.deepEqual(kc.deleteCalls, [], `${name}: nothing deleted`);
+          assert.deepEqual(snapshotRestage(h, provider), before, name);
+          assert.ok(kc.getSync(legacy.service, legacy.account), name);
+        } finally {
+          h.cleanup();
+        }
+      }
+    });
+
+    it(`T-KC11e [${provider}] stage never deletes a kept old copy under a NATIVE journal (C9, OQ-8)`, () => {
+      const legacy = legacyKmCoords(provider);
+      const kc = new DeleteTrackingKeychain();
+      const h = setup(provider, kc);
+      try {
+        h.mig.stage();
+        assert.equal(h.mig.rollback().state, 'NATIVE');
+        const row = h.store.getMigration(`pi-${provider}`)!;
+        const detail = JSON.parse(row.detail_json) as { accounts: Array<Record<string, unknown>> };
+        delete detail.accounts[0]!.keychain;
+        h.store.upsertMigration(`pi-${provider}`, 'NATIVE', JSON.stringify(detail));
+        kc.setSync(legacy.service, legacy.account, 'kept-copy');
+        kc.deleteCalls.length = 0;
 
         h.mig.stage();
-        assert.throws(() => kc.getSync(legacy.service, legacy.account), /item not found/);
-        assert.ok(kc.getSync(shared.service, shared.account));
-        const detail = JSON.parse(h.store.getMigration(`pi-${provider}`)!.detail_json) as { accounts: Array<{ keychain?: unknown }> };
-        assert.deepEqual(detail.accounts[0]?.keychain, shared);
-
-        const retry = createSingleGrantMigration(h.store, kc, provider, h.authPath, h.ownerPath, provider);
-        delete detail.accounts[0]!.keychain;
-        h.store.upsertMigration(`pi-${provider}`, 'MIRRORED', JSON.stringify(detail));
-        kc.setSync(legacy.service, legacy.account, JSON.stringify({ old: true }));
-        crashAfterLegacyDelete = true;
-        assert.throws(() => h.mig.stage(), /fixture crash after legacy delete/);
-        assert.throws(() => kc.getSync(legacy.service, legacy.account), /item not found/);
-        crashAfterLegacyDelete = false;
-        retry.stage();
-        assert.deepEqual(
-          (JSON.parse(h.store.getMigration(`pi-${provider}`)!.detail_json) as { accounts: Array<{ keychain?: unknown }> }).accounts[0]?.keychain,
-          shared,
-        );
+        assert.deepEqual(kc.deleteCalls, []);
+        assert.equal(kc.getSync(legacy.service, legacy.account), 'kept-copy');
+        assert.equal(keychainHas(kc, provider), true);
       } finally {
         h.cleanup();
       }
@@ -496,6 +714,17 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
         assert.deepEqual(h.store.getMigration(`pi-${provider}`), beforeJournal);
         assert.deepEqual(readFileSync(staging), beforeStaging);
         assert.equal(h.kc.getSync(legacy.service, legacy.account), beforeKeychain);
+
+        // resume() on VALIDATED + staging enters the same commit and refuses.
+        assert.throws(
+          () => h.mig.resume(),
+          (error: unknown) => (error as { code?: unknown; exitCode?: unknown }).code === 'staged-under-legacy-keychain'
+            && (error as { exitCode?: unknown }).exitCode === 3,
+        );
+        assert.deepEqual(h.store.getMigration(`pi-${provider}`), beforeJournal);
+        assert.deepEqual(readFileSync(staging), beforeStaging);
+        assert.equal(h.kc.getSync(legacy.service, legacy.account), beforeKeychain);
+        assert.equal(existsSync(h.ownerPath), false);
       } finally {
         h.cleanup();
       }

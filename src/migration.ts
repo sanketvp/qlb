@@ -318,7 +318,7 @@ export class OwnerMapPresentError extends Error {
 }
 
 /** Named crash points for MigrationConfig.afterStep; later rows add their own. */
-export type MigrationCrashPoint = 'S1' | 'S1-stage' | 'S1-legacy-delete' | 'S2-reads' | 'S2' | 'S4a' | 'S5' | 'S6c1';
+export type MigrationCrashPoint = 'S1' | 'S1-stage' | 'S1-legacy-delete' | 'S1-legacy-unlink' | 'S2-reads' | 'S2' | 'S4a' | 'S5' | 'S6c1';
 
 export interface MigrationConfig {
   kind?: MigrationKind;
@@ -1727,28 +1727,26 @@ export class Migration {
       throw new Error('single-grant migration requires provider xai|kimi-coding|openai-codex');
     }
 
-    // OQ-2(a): old pre-commit xai/kimi journals name the legacy per-account
-    // item. Clear that staging copy before replacing its journal with shared
-    // coordinates; C9 (NATIVE) deliberately leaves a kept legacy copy alone.
+    // OQ-2(a): an old pre-commit xai/kimi journal names the legacy per-account
+    // item. The journal is the delete authority, checked exactly as rollback
+    // checks it, so a malformed journal or a disagreeing staging file refuses
+    // before any delete. The stale staging file goes with the old item, before
+    // the journal moves to the shared item, so every crash leaves a journal and
+    // staging file that rollback and resume accept. A journal that records no
+    // account names no old item, so there is nothing to delete. C9 (NATIVE)
+    // keeps a kept legacy copy (OQ-8).
     if (
       (current.state === 'MIRRORED' || (current.state === 'VALIDATED' && current.ownerFile === 'staging'))
       && (this.provider === 'xai' || this.provider === 'kimi-coding')
+      && current.detail.accounts !== undefined
     ) {
-      const journalAccount = Array.isArray(current.detail.accounts)
-        ? current.detail.accounts[0]
-        : undefined;
-      try {
-        const recorded = resolveSingleGrantKeychain(this.provider, journalAccount);
-        const shared = sharedSingleGrantCoords(this.provider);
-        if (recorded.service !== shared.service || recorded.account !== shared.account) {
-          this.deleteStagedItem(recorded, this.provider, typeof journalAccount?.label === 'string' ? journalAccount.label : 'unknown');
-          this.afterStep?.('S1-legacy-delete');
-        }
-      } catch (error) {
-        // Only a journal that resolves to the legacy item is cleared here.
-        // Older incomplete journals are overwritten by this new stage and
-        // remain subject to the normal reader-side fail-closed checks.
-        if (!(error instanceof JournalKeychainInvalidError)) throw error;
+      const { coords, label } = this.journalStagedKeychain(this.provider);
+      const shared = sharedSingleGrantCoords(this.provider);
+      if (coords.service !== shared.service || coords.account !== shared.account) {
+        this.deleteStagedItem(coords, this.provider, label, 'stage');
+        this.afterStep?.('S1-legacy-delete');
+        unlinkIfExists(this.stagingPath());
+        this.afterStep?.('S1-legacy-unlink');
       }
     }
 
@@ -2021,17 +2019,22 @@ export class Migration {
         this.deleteStaticKeychain();
         continue;
       }
-      this.deleteStagedItem(keychainCoords(meta.provider, meta.id, meta.label), meta.provider, meta.label);
+      this.deleteStagedItem(keychainCoords(meta.provider, meta.id, meta.label), meta.provider, meta.label, 'rollback');
     }
   }
 
-  private deleteStagedItem(coords: SingleGrantKeychainCoords, provider: string, label: string): void {
+  private deleteStagedItem(
+    coords: SingleGrantKeychainCoords,
+    provider: string,
+    label: string,
+    operation: 'rollback' | 'stage',
+  ): void {
     try {
       this.keychain.deleteSync(coords.service, coords.account);
     } catch (error) {
       if (isCredentialNotFound(error)) return;
       throw new Error(
-        `migration rollback failed to delete staged Keychain credential for provider=${provider} account=${label}`,
+        `migration ${operation} failed to delete staged Keychain credential for provider=${provider} account=${label}`,
       );
     }
   }
@@ -2041,7 +2044,7 @@ export class Migration {
    * hold exactly one account, and a staging owner file that resolves to a
    * different Keychain item refuses, so every check runs before any delete.
    */
-  private deleteJournalStagedKeychain(provider: SingleGrantKeychainProvider): void {
+  private journalStagedKeychain(provider: SingleGrantKeychainProvider): { coords: SingleGrantKeychainCoords; label: string } {
     const journalAccounts = parseDetail(this.store.getMigration(this.storeName)?.detail_json).accounts;
     if (!Array.isArray(journalAccounts) || journalAccounts.length !== 1) {
       throw new JournalKeychainInvalidError();
@@ -2059,7 +2062,12 @@ export class Migration {
         throw new JournalKeychainInvalidError();
       }
     }
-    this.deleteStagedItem(coords, provider, meta.label);
+    return { coords, label: meta.label };
+  }
+
+  private deleteJournalStagedKeychain(provider: SingleGrantKeychainProvider): void {
+    const { coords, label } = this.journalStagedKeychain(provider);
+    this.deleteStagedItem(coords, provider, label, 'rollback');
   }
 
   /**
