@@ -1121,6 +1121,40 @@ describe('Pi migration S58 credential-first barrier', () => {
     } finally { h.cleanup(); }
   });
 
+  it('P7a-r: holder A makes no write after holder B takes over its stale lock', () => {
+    const h = setup();
+    try {
+      const kept = plantKeptGenericCopy(h, 'xai');
+      const setSync = h.keychain.setSync.bind(h.keychain);
+      const writes: string[] = [];
+      h.keychain.setSync = (service, account, value) => {
+        writes.push(`${service}/${account}`);
+        return setSync(service, account, value);
+      };
+      let bTookOver = false;
+      const now = () => 10_000;
+
+      assert.throws(() => migratePiSingleProvider('xai', h.paths, {
+        keychain: h.keychain,
+        store: h.store,
+        withAuthLock: (path, holderA) => withPiAuthLock(path, (refreshA) => {
+          const lock = `${path}.lock`;
+          writeFileSync(join(lock, 'qlb-lock-owner.json'), JSON.stringify({ pid: 999_999, nonce: 'misjudged-stale' }));
+          utimesSync(lock, new Date(now() - 2), new Date(now() - 2));
+          return withPiAuthLock(path, () => {
+            bTookOver = true;
+            return holderA(refreshA);
+          }, { staleMs: 1, retries: 0, retryMs: 0, now });
+        }, { staleMs: 1, retries: 0, retryMs: 0, now }),
+      }), (error: unknown) => (error as { code?: unknown; message?: unknown }).code === 'pi-auth-lock-lost'
+        && /another run took the auth\.json lock over/.test(String((error as { message?: unknown }).message)));
+
+      assert.equal(bTookOver, true, 'holder B took over holder A\'s stale lock');
+      assert.deepEqual(writes, [], 'holder A must make no write after the takeover');
+      assert.throws(() => h.keychain.getSync(kept.stashService, QLB_KEYCHAIN_ACCOUNT), /item not found/);
+    } finally { h.cleanup(); }
+  });
+
   it('takes over only stale locks whose recorded owner is dead and never releases a foreign lock', () => {
     const h = setup();
     try {
