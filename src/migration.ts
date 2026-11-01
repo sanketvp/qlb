@@ -114,18 +114,19 @@ import {
   fsyncSync,
   lstatSync,
   openSync,
+  realpathSync,
   readFileSync,
   renameSync,
   rmSync,
   statSync,
   writeSync,
 } from 'node:fs';
-import { dirname, join, resolve, sep } from 'node:path';
+import { basename, dirname, join, resolve, sep } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { config } from './config';
 import { codexSlotIdFromAccessToken } from './codex-auth';
 import { codexHeaderAccountId } from './codex-slots';
-import { fsyncDirSync, resolveAllowMissing } from './fsutil';
+import { fsyncDirSync } from './fsutil';
 import { qlbHomeDir } from './home';
 import type { KeychainBackend } from './keychain';
 import { openRouterMissingKeyMessage, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, readNativeOpenRouterKey } from './keychain';
@@ -407,9 +408,21 @@ export function realPiAgentDir(): string {
   return resolve(dirname(config.piAuthJsonPath));
 }
 
-/** Resolve symlinks like the atomic writer for safe containment checks. */
+/**
+ * Resolve existing symlinks, retaining missing trailing segments for safe containment checks.
+ * Known gap: `..` after a symlink and dangling symlinks are not resolved like the kernel;
+ * the restricted migrate-path design (contract rows P7g-*) replaces this.
+ */
 function realpathWithMissingTail(p: string): string {
-  return resolveAllowMissing(p);
+  let current = resolve(p);
+  const tail: string[] = [];
+  while (!existsSync(current)) {
+    const parent = dirname(current);
+    if (parent === current) break;
+    tail.unshift(basename(current));
+    current = parent;
+  }
+  return resolve(realpathSync(current), ...tail);
 }
 
 /** True if `p` is the live Pi agent dir or a file inside it. */

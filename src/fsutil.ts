@@ -21,7 +21,7 @@ import {
   unlinkSync,
   writeSync,
 } from 'node:fs';
-import { basename, dirname, isAbsolute, join, parse, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, parse, resolve, sep } from 'node:path';
 
 const FSYNC_UNSUPPORTED = new Set(['EINVAL', 'ENOTSUP', 'EOPNOTSUPP', 'ENOSYS']);
 const TEMP_PREFIX_CHARS = 40;
@@ -60,12 +60,12 @@ function splitPath(path: string): string[] {
 }
 
 /**
- * Resolve a symlink chain while allowing its final referent to be absent.
- * Walk raw segments so `link/..` follows `link` before taking its parent,
- * matching kernel pathname resolution and atomic publication.
+ * Resolve a symlink chain while allowing only its final referent to be absent.
+ * Node's realpath is used for the ordinary case; this fallback preserves the
+ * upstream ALLOW_MISSING behavior for a dangling final link.
  */
-export function resolveAllowMissing(path: string): string {
-  const absolute = isAbsolute(path) ? path : `${process.cwd()}${sep}${path}`;
+function resolveAllowMissing(path: string): string {
+  const absolute = resolve(path);
   let resolved = parse(absolute).root;
   let pending = splitPath(absolute.slice(resolved.length));
   let links = 0;
@@ -93,13 +93,6 @@ export function resolveAllowMissing(path: string): string {
     }
 
     if (++links > MAX_SYMLINKS) throw eloop(path);
-    try {
-      resolved = realpathSync.native(candidate);
-      continue;
-    } catch (error) {
-      if (errno(error) !== 'ENOENT') throw error;
-    }
-
     const target = readlinkSync(candidate);
     if (isAbsolute(target)) {
       resolved = parse(target).root;
@@ -118,7 +111,19 @@ export function resolveAllowMissing(path: string): string {
  * their links.
  */
 export function publishTarget(path: string): string {
-  return resolveAllowMissing(path);
+  try {
+    if (!lstatSync(path).isSymbolicLink()) return path;
+  } catch (error) {
+    if (errno(error) === 'ENOENT') return path;
+    throw error;
+  }
+
+  try {
+    return realpathSync.native(path);
+  } catch (error) {
+    if (errno(error) !== 'ENOENT') throw error;
+    return resolveAllowMissing(path);
+  }
 }
 
 function createTemp(target: string): { fd: number; path: string } {
