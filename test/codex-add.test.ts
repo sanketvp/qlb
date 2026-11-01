@@ -413,9 +413,10 @@ describe('codex add', () => {
       const fakeCodex = join(fakeBin, 'codex');
       writeFileSync(fakeCodex, `#!/usr/bin/env node
 const fs = require('node:fs');
-fs.writeFileSync(process.env.MARKER, JSON.stringify({ home: process.env.CODEX_HOME }));
 process.on('exit', () => fs.writeFileSync(process.env.STOPPED, 'stopped'));
 process.on('SIGTERM', () => {});
+// Signal readiness only after the handlers above are installed.
+fs.writeFileSync(process.env.MARKER, JSON.stringify({ home: process.env.CODEX_HOME }));
 setTimeout(() => {
   fs.mkdirSync(process.env.CODEX_HOME, { recursive: true });
   fs.writeFileSync(require('node:path').join(process.env.CODEX_HOME, 'auth.json'), '{}');
