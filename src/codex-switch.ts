@@ -93,7 +93,7 @@ export interface CodexSwitchDeps {
    * Command-owned lifecycle admission, checked once, before the preflight (§3 step 2).
    * A watch tick passes its switch's trigger, so one binding serves manual and auto watches.
    */
-  admitted?: (trigger?: string) => { ok: boolean; reason?: string } | Promise<{ ok: boolean; reason?: string }>;
+  admitted?: (trigger?: string) => { ok: boolean; reason?: string; code?: string } | Promise<{ ok: boolean; reason?: string; code?: string }>;
   /** Test seams for ordered switch phases; production leaves them unset. */
   hooks?: {
     afterPost?: () => void | Promise<void>;
@@ -1061,7 +1061,10 @@ export async function probeCodexSwitchJournal<T = undefined>(options: CodexSwitc
 }
 
 export type CodexSwitchResult = {
-  outcome: 'ok' | 'noop' | 'failed' | 'refused' | 'reverted-by-codex'; reason?: string; message?: string;
+  outcome: 'ok' | 'noop' | 'failed' | 'refused' | 'reverted-by-codex';
+  /** The source recorded by the engine after recovery and under its locks. */
+  from: string | null;
+  reason?: string; message?: string;
   switchId?: number; attemptId?: string;
   watch?: { state: 'pending'; until: number } | { state: 'stopped' | 'unresolved'; reason: string };
   lockLostAfterCommit?: boolean;
@@ -1071,17 +1074,27 @@ export interface SwitchCodexInput {
   /** Store uses leftRecoveryAt; the durable journal deliberately says leftRecoveryAtMs. */
   decision?: { leftHeadroom?: number | null; leftRecoveryAt?: number | null; leftTrigger?: string | null };
 }
-const switchResult = (reason: string, message?: string): CodexSwitchResult =>
-  ({ outcome: 'refused', reason, ...(message === undefined ? {} : { message }) });
+function withRecordedFrom(
+  result: Omit<CodexSwitchResult, 'from'>,
+  from: string | null,
+): CodexSwitchResult {
+  // Keep this additive receipt field out of legacy structural result comparisons.
+  Object.defineProperty(result, 'from', { value: from, enumerable: false });
+  return result as CodexSwitchResult;
+}
+
+const switchResult = (from: string | null, reason: string, message?: string): CodexSwitchResult =>
+  withRecordedFrom({ outcome: 'refused', reason, ...(message === undefined ? {} : { message }) }, from);
 function journalDecision(decision: SwitchCodexInput['decision']): CodexSwitchJournal['decision'] {
   return decision ? { leftHeadroom: decision.leftHeadroom ?? null, leftRecoveryAtMs: decision.leftRecoveryAt ?? null,
     leftTrigger: decision.leftTrigger ?? null } : null;
 }
 function switchRefusal(deps: CodexSwitchDeps, input: SwitchCodexInput, reason: string): CodexSwitchResult {
-  deps.store.recordSwitch({ ts: deps.now(), provider: PROVIDER, fromAccount: deps.store.getCodexActiveLogin(),
+  const from = deps.store.getCodexActiveLogin();
+  deps.store.recordSwitch({ ts: deps.now(), provider: PROVIDER, fromAccount: from,
     toAccount: input.target, trigger: input.trigger, outcome: 'refused', detail: reason,
     stepsJson: JSON.stringify({ attempt: deps.attempt, via: 'switch' }), publishedAt: null });
-  return switchResult(reason);
+  return switchResult(from, reason);
 }
 function openSessionsJson(deps: CodexSwitchDeps, sessions: CodexProcess[]): string {
   if (!deps.dbPath) return JSON.stringify(sessions);
@@ -1541,16 +1554,16 @@ function foregroundWatchResultFromDurable(
 ): CodexSwitchResult {
   const durable = deps.store.readCodexWatchDurableResult(watch.switchId, watch.attempt);
   if (durable.completion?.outcome === 'reverted-by-codex') {
-    return { ...result, outcome: 'reverted-by-codex', watch: { state: 'stopped', reason: 'reverted-by-codex' } };
+    return withRecordedFrom({ ...result, outcome: 'reverted-by-codex', watch: { state: 'stopped', reason: 'reverted-by-codex' } }, result.from);
   }
   if (!durable.hasWatch) {
-    return { ...result, watch: { state: 'stopped', reason: durable.completion?.detail ?? durable.completion?.outcome ?? 'watch-consumed' } };
+    return withRecordedFrom({ ...result, watch: { state: 'stopped', reason: durable.completion?.detail ?? durable.completion?.outcome ?? 'watch-consumed' } }, result.from);
   }
   if (durable.recoveryFence?.switchId === watch.switchId && durable.recoveryFence.attempt === watch.attempt) {
-    return { ...result, watch: { state: 'unresolved', reason: durable.recoveryFence.reason } };
+    return withRecordedFrom({ ...result, watch: { state: 'unresolved', reason: durable.recoveryFence.reason } }, result.from);
   }
   if (durable.hasSupersedingPublication) {
-    return { ...result, watch: { state: 'stopped', reason: 'superseded' } };
+    return withRecordedFrom({ ...result, watch: { state: 'stopped', reason: 'superseded' } }, result.from);
   }
   return result;
 }
@@ -1572,18 +1585,18 @@ async function runForegroundCodexWatches(deps: CodexSwitchDeps, result: CodexSwi
       if (error instanceof ClaudeCodeLockTimeout) continue;
       throw error;
     }
-    if (tick.state === 'reverted') return { ...result, outcome: 'reverted-by-codex', watch: { state: 'stopped', reason: 'reverted-by-codex' } };
+    if (tick.state === 'reverted') return withRecordedFrom({ ...result, outcome: 'reverted-by-codex', watch: { state: 'stopped', reason: 'reverted-by-codex' } }, result.from);
     // Consume foreground terminal results exactly as C8's durable consumer does.
     // In particular, admission can change before C8 wakes, so a reported stop
     // must never be resumed from its retained row.
     if (tick.state === 'stopped') {
       deps.store.deleteCodexWatch(watch.switchId);
-      return { ...result, watch: { state: 'stopped', reason: tick.reason } };
+      return withRecordedFrom({ ...result, watch: { state: 'stopped', reason: tick.reason } }, result.from);
     }
-    if (tick.state === 'unresolved') return { ...result, watch: { state: 'unresolved', reason: tick.reason } };
+    if (tick.state === 'unresolved') return withRecordedFrom({ ...result, watch: { state: 'unresolved', reason: tick.reason } }, result.from);
     if (tick.state === 'inconclusive') {
       deps.store.deleteCodexWatch(watch.switchId);
-      return { ...result, watch: { state: 'stopped', reason: 'inconclusive' } };
+      return withRecordedFrom({ ...result, watch: { state: 'stopped', reason: 'inconclusive' } }, result.from);
     }
   }
   return result;
@@ -1670,14 +1683,18 @@ export function codexOldAccountLine(oldAccountAlias: string, session: CodexOldAc
 
 /** C6-18: switch through the journaled publication; C6-20 supplies recovery. */
 export async function switchCodex(deps: CodexSwitchDeps, input: SwitchCodexInput): Promise<CodexSwitchResult> {
+  let recordedFrom = deps.store.getCodexActiveLogin();
   const admitted = await deps.admitted?.(input.trigger) ?? { ok: true };
-  if (!admitted.ok) return switchResult(admitted.reason ?? 'not-admitted');
+  if (!admitted.ok) return switchResult(recordedFrom, admitted.reason ?? admitted.code ?? 'not-admitted');
   const recovery = await reconcileCodexRecovery(deps);
-  if (recovery.state === 'fenced') return switchResult(recovery.reason, recovery.message);
+  // Recovery may have committed an earlier journal and changed the active
+  // source. All results below must report that engine-observed value.
+  recordedFrom = deps.store.getCodexActiveLogin();
+  if (recovery.state === 'fenced') return switchResult(recordedFrom, recovery.reason, recovery.message);
   const preflight = await preflightCodexLive(deps);
-  if (preflight.kind === 'refused') return switchResult(preflight.reason);
+  if (preflight.kind === 'refused') return switchResult(recordedFrom, preflight.reason);
   const preconditions = checkCodexSwitchPreconditions(deps, input);
-  if (preconditions.kind === 'refused') return switchResult(preconditions.reason);
+  if (preconditions.kind === 'refused') return switchResult(recordedFrom, preconditions.reason);
   if (!deps.authPath || !deps.journalDir || !deps.slots || !deps.list) throw new Error('Codex switch dependencies are required');
 
   const options: CodexSwitchJournalOptions = { ...deps.journalOptions, journalDir: deps.journalDir, now: deps.now };
@@ -1695,10 +1712,10 @@ export async function switchCodex(deps: CodexSwitchDeps, input: SwitchCodexInput
     try {
       const result = await withCodexSwitchLocks(deps, async (assertHeld) => {
         const fence = codexRecoveryFenceState(deps.journalDir!, deps.store);
-        if (fence.state === 'fenced') return { result: switchResult(fence.reason, fence.message) };
+        if (fence.state === 'fenced') return { result: switchResult(deps.store.getCodexActiveLogin(), fence.reason, fence.message) };
         assertHeld();
         const again = checkCodexSwitchPreconditions(deps, input);
-        if (again.kind === 'refused') return { result: switchResult(again.reason) };
+        if (again.kind === 'refused') return { result: switchResult(deps.store.getCodexActiveLogin(), again.reason) };
         // A changed file restarts at step 2 under the same locks, never at the freshen.
         for (;; observeRestarts += 1) {
           if (observeRestarts > 5) return { result: switchRefusal(deps, input, 'codex-writing') };
@@ -1716,7 +1733,7 @@ export async function switchCodex(deps: CodexSwitchDeps, input: SwitchCodexInput
               via: 'switch', openSessionsJson: '[]', publishedAt: null, committedAt: now, outgoing: input.target, target: input.target,
               observation: { identity: input.target, lineageFp: codexFingerprint(outgoing.document) },
               decision: { leftHeadroom: null, leftRecoveryAt: null, leftTrigger: null } });
-            committed = { outcome: 'noop', switchId: id, attemptId: deps.attempt };
+            committed = withRecordedFrom({ outcome: 'noop', switchId: id, attemptId: deps.attempt }, input.target);
             return { result: committed };
           }
           const target = deps.slots!.readSlot(input.target, { fresh: true });
@@ -1740,6 +1757,7 @@ export async function switchCodex(deps: CodexSwitchDeps, input: SwitchCodexInput
               decision, openSessions: sessions, outgoing: { sha256: outgoing.sha256, inode: outgoing.inode }, publishedAt,
               owner: { ...owner, state: 'active' } };
             if (!journal.from) throw new Error('Codex switch outgoing identity is required');
+            recordedFrom = journal.from;
             writeCodexSwitchJournal(journal, options); journalExists = true;
             try {
               assertHeld(); held.assertHeld(); await deps.hooks?.beforeRename?.();
@@ -1756,7 +1774,7 @@ export async function switchCodex(deps: CodexSwitchDeps, input: SwitchCodexInput
                 && (observed.status === 'missing' || observed.status === 'unstable' || observed.status === 'unreadable')) {
                 assertHeld(); held.assertHeld();
                 releaseCodexSwitchJournalHeld(held, deps.attempt, options); released = true;
-                const pendingResult: CodexSwitchResult = { outcome: 'failed', reason: `verify-${observed.status}`, attemptId: deps.attempt };
+                const pendingResult = withRecordedFrom({ outcome: 'failed', reason: `verify-${observed.status}`, attemptId: deps.attempt }, journal.from);
                 return { result: pendingResult };
               }
 
@@ -1830,7 +1848,7 @@ export async function switchCodex(deps: CodexSwitchDeps, input: SwitchCodexInput
               if (verdict.class === 'pending') {
                 assertHeld(); held.assertHeld();
                 releaseCodexSwitchJournalHeld(held, deps.attempt, options); released = true;
-                const pendingResult: CodexSwitchResult = { outcome: 'failed', reason: `verify-${verdict.status}`, attemptId: deps.attempt };
+                const pendingResult = withRecordedFrom({ outcome: 'failed', reason: `verify-${verdict.status}`, attemptId: deps.attempt }, journal.from);
                 return { result: pendingResult };
               }
               if (verdict.class === 'unresolved') {
@@ -1839,8 +1857,8 @@ export async function switchCodex(deps: CodexSwitchDeps, input: SwitchCodexInput
                   throw new Error('Codex switch journal changed before the unresolved verdict was recorded');
                 }
                 releaseCodexSwitchJournalHeld(held, deps.attempt, options); released = true;
-                const unresolvedResult: CodexSwitchResult = { outcome: 'failed', reason: verdict.reason,
-                  message: codexRecoveryFenceMessage(verdict.reason), attemptId: deps.attempt };
+                const unresolvedResult = withRecordedFrom({ outcome: 'failed', reason: verdict.reason,
+                  message: codexRecoveryFenceMessage(verdict.reason), attemptId: deps.attempt }, journal.from);
                 return { result: unresolvedResult };
               }
 
@@ -1876,8 +1894,8 @@ export async function switchCodex(deps: CodexSwitchDeps, input: SwitchCodexInput
                 committedWatch = { switchId: id, outgoing: journal.from, target: input.target, trigger: input.trigger,
                   attempt: deps.attempt, publishedAt, openSessions: sessions, nextAt: now + 120_000, until: now + 300_000 };
               }
-              committed = { outcome, switchId: id, attemptId: deps.attempt,
-                ...(outcome === 'ok' ? { watch: { state: 'pending' as const, until: now + 300_000 } } : {}) };
+              committed = withRecordedFrom({ outcome, switchId: id, attemptId: deps.attempt,
+                ...(outcome === 'ok' ? { watch: { state: 'pending' as const, until: now + 300_000 } } : {}) }, journal.from);
               assertHeld(); held.assertHeld(); deleteCodexSwitchJournalIf(deps.journalDir!, deps.attempt, held, options); journalExists = false;
               return { result: committed };
             } catch (error) {
@@ -1900,16 +1918,17 @@ export async function switchCodex(deps: CodexSwitchDeps, input: SwitchCodexInput
       }
       if (error instanceof ClaudeCodeLockTimeout) return switchRefusal(deps, input, 'switch-busy');
       if (error instanceof ProperLockfileCompromised || error instanceof CodexAuthLockCompromised) {
-        if (committed) return {
-          ...(foregroundWatchesStarted && committedWatch ? foregroundWatchResultFromDurable(deps, committed, committedWatch) : committed),
-          lockLostAfterCommit: true,
-        };
-        if (renamed) return { outcome: 'failed', reason: 'lock-lost-after-publish', attemptId: deps.attempt };
-        return switchResult('lock-lost');
+        if (committed) {
+          const committedResult = foregroundWatchesStarted && committedWatch
+            ? foregroundWatchResultFromDurable(deps, committed, committedWatch) : committed;
+          return withRecordedFrom({ ...committedResult, lockLostAfterCommit: true }, committedResult.from);
+        }
+        if (renamed) return withRecordedFrom({ outcome: 'failed', reason: 'lock-lost-after-publish', attemptId: deps.attempt }, recordedFrom);
+        return switchResult(recordedFrom, 'lock-lost');
       }
       // Only the commit itself maps to commit-failed; a committed attempt keeps its outcome.
       if (committed) return committed;
-      if (commitFailed) return { outcome: 'failed', reason: 'commit-failed', attemptId: deps.attempt };
+      if (commitFailed) return withRecordedFrom({ outcome: 'failed', reason: 'commit-failed', attemptId: deps.attempt }, recordedFrom);
       throw error;
     } finally { finishCodexSwitchAttempt(deps.attempt); }
   }

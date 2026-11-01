@@ -75,13 +75,12 @@ function safeMessage(message: string | undefined): string | undefined {
 
 function receipt(
   result: CodexSwitchResult,
-  from: string | null,
   to: string,
   oldAccountPids: number[],
 ): Record<string, unknown> {
   return {
     outcome: result.outcome,
-    from,
+    from: result.from,
     to,
     switchId: result.switchId ?? null,
     ...(safeReason(result.reason) === undefined ? {} : { reason: safeReason(result.reason) }),
@@ -92,10 +91,18 @@ function receipt(
   };
 }
 
-function exitCode(result: CodexSwitchResult): 0 | 1 | 3 {
+function recoveryFenceMessage(result: CodexSwitchResult): string | undefined {
+  const message = safeMessage(result.message);
+  if (message !== undefined) return message;
+  const reason = result.watch?.state === 'unresolved' ? safeReason(result.watch.reason) : undefined;
+  return reason === undefined ? undefined
+    : `Codex switch recovery needs you (${reason}): log in to Codex with the account you want (codex login), then run qlb codex import-active. QLB finishes the recovery at its next check.`;
+}
+
+function exitCode(result: CodexSwitchResult, fenced: boolean): 0 | 1 | 3 {
+  if (fenced || result.outcome === 'refused') return 3;
   if (result.lockLostAfterCommit) return 1;
   if (result.outcome === 'ok' || result.outcome === 'noop') return 0;
-  if (result.outcome === 'refused') return 3;
   return 1;
 }
 
@@ -122,7 +129,10 @@ function defaultSwitchDeps(
       return { status: response.status, body: await response.text() };
     },
     journalDir: codexSwitchJournalDir({ env: ctx.env }),
-    admitted: (trigger) => assertAdmitted(store, trigger === 'manual' ? 'switch:manual' : 'switch:auto'),
+    admitted: (trigger) => {
+      const admission = assertAdmitted(store, trigger === 'manual' ? 'switch:manual' : 'switch:auto');
+      return { ok: admission.ok, reason: admission.code };
+    },
     journalOwner: { pid: process.pid, lstart: '' },
   };
 }
@@ -143,7 +153,6 @@ export function createSwitchOpenAiCodexCommand(deps: SwitchOpenAiCodexCommandDep
 
       const store = (deps.openStore ?? openStore)(ctx.config.dbPath);
       try {
-        const from = store.getCodexActiveLogin();
         const engineDeps = deps.makeSwitchDeps
           ? await deps.makeSwitchDeps(ctx, store)
           : defaultSwitchDeps(ctx, store, deps);
@@ -154,24 +163,28 @@ export function createSwitchOpenAiCodexCommand(deps: SwitchOpenAiCodexCommandDep
           lstart: await (deps.processLstart ?? processLstart)(process.pid) ?? '',
         };
         const result = await (deps.switchCodex ?? switchCodex)(engineDeps, { target: parsed.target, trigger: 'manual' });
+        const from = result.from;
         let oldSessions: CodexOldAccountSession[] = [];
         if (result.outcome === 'reverted-by-codex' && from !== null) {
           oldSessions = await (deps.listCodexOldAccountSessions ?? listCodexOldAccountSessions)(engineDeps, { from });
         }
         const oldAccountPids = oldSessions.map(({ pid }) => pid);
+        const fenceMessage = recoveryFenceMessage(result);
         if (parsed.json) {
-          ctx.stdout(JSON.stringify(receipt(result, from, parsed.target, oldAccountPids)));
-        } else if (result.outcome === 'refused' && safeMessage(result.message) !== undefined) {
-          ctx.stderr(safeMessage(result.message)!);
+          ctx.stdout(JSON.stringify(receipt(result, parsed.target, oldAccountPids)));
+        } else if (fenceMessage !== undefined) {
+          ctx.stderr(fenceMessage);
         } else {
-          ctx.stdout(`Codex switch ${from ?? '-'} → ${parsed.target}: ${result.outcome}`);
+          const reason = (result.outcome === 'failed' || result.outcome === 'refused') ? safeReason(result.reason) : undefined;
+          ctx.stdout(`Codex switch ${from ?? '-'} → ${parsed.target}: ${result.outcome}${reason === undefined ? '' : `: ${reason}`}`);
           if (result.outcome === 'reverted-by-codex') {
             ctx.stdout(`Codex reverted the switch at ${new Date((deps.now ?? Date.now)()).toISOString()}; ${oldSessions.length} sessions on old account`);
             for (const session of oldSessions) ctx.stdout((deps.codexOldAccountLine ?? codexOldAccountLine)(from ?? '-', session));
           }
           if (result.watch?.state === 'pending') ctx.stdout(`QLB keeps checking until ${new Date(result.watch.until).toISOString()}`);
+          if (result.lockLostAfterCommit) ctx.stdout('the switch committed, but its lock was lost afterwards; run qlb status');
         }
-        return exitCode(result);
+        return exitCode(result, fenceMessage !== undefined);
       } finally {
         store.close();
       }

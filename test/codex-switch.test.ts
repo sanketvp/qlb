@@ -1572,6 +1572,14 @@ describe('switchCodex landed and not-landed — C6-18', () => {
     } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
   });
 
+  it('returns the recorded journal source', async () => {
+    const h = switchHarness();
+    try {
+      const result = await h.run();
+      assert.equal(result.from, 'a:account');
+    } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
   it('the journal is on disk at the moment of the rename (publish spy)', async () => {
     const h = switchHarness(); const mutableFs = require('node:fs') as { renameSync: typeof renameSync }; const original = mutableFs.renameSync;
     try {

@@ -8,7 +8,7 @@ import {
   type SwitchOpenAiCodexCommandDeps,
 } from '../src/commands/switch-openai-codex';
 import { resolveCodexAuthPath } from '../src/commands/codex-import-active';
-import type { CodexSwitchDeps, CodexSwitchResult } from '../src/codex-switch';
+import { switchCodex, type CodexSwitchDeps, type CodexSwitchResult } from '../src/codex-switch';
 import { discoverCommands, type CommandContext } from '../src/registry';
 
 const DISABLED = "qlb switch openai-codex is not enabled yet: it turns on together with QLB's background checks (C8).";
@@ -30,7 +30,8 @@ function context(): { ctx: CommandContext; stdout: string[]; stderr: string[] } 
 }
 
 function result(overrides: Partial<CodexSwitchResult> = {}): CodexSwitchResult {
-  return { outcome: 'ok', switchId: 71, watch: { state: 'pending', until: 1_700_000_300_000 }, ...overrides };
+  const { from = 'a:account', ...rest } = overrides;
+  return { outcome: 'ok', from, switchId: 71, watch: { state: 'pending', until: 1_700_000_300_000 }, ...rest };
 }
 
 function subject(overrides: Partial<SwitchOpenAiCodexCommandDeps> = {}) {
@@ -89,6 +90,60 @@ describe('qlb switch openai-codex command (C6-24)', () => {
     assert.equal(await subject({ switchCodex: async () => result({ outcome: 'refused', reason: 'slot-split', message: FENCE }) })
       .execute!(['b:account'], run.ctx), 3);
     assert.deepEqual(run.stderr, [FENCE]);
+  });
+
+  it('enabled: a post-publish unresolved result exits 3 with the recovery message', async () => {
+    const run = context();
+    assert.equal(await subject({ switchCodex: async () => result({ outcome: 'failed', reason: 'slot-split', message: FENCE }) })
+      .execute!(['b:account'], run.ctx), 3);
+    assert.deepEqual(run.stderr, [FENCE]);
+  });
+
+  it('enabled: an unresolved foreground tick exits 3 with the recovery message', async () => {
+    const run = context();
+    assert.equal(await subject({ switchCodex: async () => result({ watch: { state: 'unresolved', reason: 'slot-split' } }) })
+      .execute!(['b:account'], run.ctx), 3);
+    assert.deepEqual(run.stderr, [FENCE]);
+  });
+
+  it('uses the engine-recorded source after recovery in text and JSON output', async () => {
+    const switchedAfterRecovery = result({ from: 'recovered:account' });
+    const text = context();
+    assert.equal(await subject({ switchCodex: async () => switchedAfterRecovery }).execute!(['b:account'], text.ctx), 0);
+    assert.deepEqual(text.stdout, ['Codex switch recovered:account → b:account: ok', 'QLB keeps checking until 2023-11-14T22:18:20.000Z']);
+
+    const json = context();
+    assert.equal(await subject({ switchCodex: async () => switchedAfterRecovery }).execute!(['b:account', '--json'], json.ctx), 0);
+    assert.equal(JSON.parse(json.stdout[0]).from, 'recovered:account');
+  });
+
+  it('shows the specific admission refusal code', async () => {
+    const run = context();
+    const command = subject({
+      switchCodex,
+      makeSwitchDeps: () => ({
+        store: { getCodexActiveLogin: () => 'a:account' },
+        admitted: () => ({ ok: false, code: 'specific-admission-code' }),
+      } as unknown as CodexSwitchDeps),
+    });
+    assert.equal(await command.execute!(['b:account'], run.ctx), 3);
+    assert.deepEqual(run.stdout, ['Codex switch a:account → b:account: refused: specific-admission-code']);
+  });
+
+  it('prints safe failed and refused reasons and reports a post-commit lock loss', async () => {
+    const failed = context();
+    assert.equal(await subject({ switchCodex: async () => result({ outcome: 'failed', reason: 'commit-failed', watch: undefined }) })
+      .execute!(['b:account'], failed.ctx), 1);
+    assert.deepEqual(failed.stdout, ['Codex switch a:account → b:account: failed: commit-failed']);
+
+    const refused = context();
+    assert.equal(await subject({ switchCodex: async () => result({ outcome: 'refused', reason: 'specific-admission-code', watch: undefined }) })
+      .execute!(['b:account'], refused.ctx), 3);
+    assert.deepEqual(refused.stdout, ['Codex switch a:account → b:account: refused: specific-admission-code']);
+
+    const lockLost = context();
+    assert.equal(await subject({ switchCodex: async () => result({ lockLostAfterCommit: true }) }).execute!(['b:account'], lockLost.ctx), 1);
+    assert.ok(lockLost.stdout.includes('the switch committed, but its lock was lost afterwards; run qlb status'));
   });
 
   it('unknown flags exit 2', async () => {
