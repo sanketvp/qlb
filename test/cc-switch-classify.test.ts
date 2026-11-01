@@ -164,7 +164,7 @@ describe('Claude switch classification routing (K9)', () => {
     assert.equal(stored.credential, live);
   });
 
-  it('wiped writes one relogin row and the switch commits ok', async () => {
+  it('the nine kinds route exactly as §4.1 step 5 (table-driven: expected slot write / stash / relogin / nothing per kind)', async () => {
     const wiped = JSON.stringify({ claudeAiOauth: { accessToken: '', refreshToken: '', expiresAt: NOW + 3_600_000 } });
     const ownFamily = JSON.stringify({ claudeAiOauth: { accessToken: 'fixture-access-a-rotated', refreshToken: 'fixture-refresh-a', expiresAt: NOW + 3_600_000 } });
     const cases = [
@@ -206,6 +206,32 @@ describe('Claude switch classification routing (K9)', () => {
         assert.deepEqual(subject.relogins[0], { ts: NOW, provider: 'anthropic', accountId: 'account-a', kind: 'wiped', detail: null, evidence: 'wiped', userDeniedAt: undefined }, scenario.kind);
       }
     }
+  });
+
+  it('wiped writes one relogin row and the switch commits ok', async () => {
+    const wiped = JSON.stringify({ claudeAiOauth: { accessToken: '', refreshToken: '', expiresAt: NOW + 3_600_000 } });
+    const subject = await fixture({ live: wiped, resolveProfile: async () => null });
+    const slotWrites: string[] = [];
+    const stashes: string[] = [];
+    const writeSlot = subject.slots.writeSlot.bind(subject.slots);
+    const stashUnclaimed = subject.slots.stashUnclaimed.bind(subject.slots);
+    subject.slots.writeSlot = async (accountId, value, transition) => {
+      slotWrites.push(accountId);
+      return writeSlot(accountId, value, transition);
+    };
+    subject.slots.stashUnclaimed = async (timestamp, value, consumedFp, accountId) => {
+      stashes.push(timestamp);
+      return stashUnclaimed(timestamp, value, consumedFp, accountId);
+    };
+
+    const result = await switchClaude(subject.deps, subject.input);
+
+    assert.equal(result.outcome, 'ok');
+    assert.equal(result.outgoingKind, 'wiped');
+    assert.deepEqual(slotWrites, []);
+    assert.deepEqual(stashes, []);
+    assert.equal(subject.relogins.length, 1);
+    assert.deepEqual(subject.relogins[0], { ts: NOW, provider: 'anthropic', accountId: 'account-a', kind: 'wiped', detail: null, evidence: 'wiped', userDeniedAt: undefined });
   });
 
   it('own-rotated adopts with evidence oracle, own-family with evidence lineage, unresolved with null evidence', async () => {
