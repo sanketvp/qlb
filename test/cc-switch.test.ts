@@ -1067,7 +1067,7 @@ describe('Claude switch transaction (K5-5)', () => {
     assert.equal(subject.rows.length, 1);
     assert.deepEqual(subject.rows[0], {
       ts: NOW, provider: 'anthropic', fromAccount: 'account-a', toAccount: 'account-b', trigger: 'manual', outcome: 'rolled-back',
-      error: 'keychain-write-failed', detail: 'step-7', injected: false, stepsJson: JSON.stringify({ ...result.steps, attempt: 'attempt-k5-5' }),
+      error: 'keychain-write-failed', detail: 'step-7', injected: false, outgoingKind: 'own-bytes', stepsJson: JSON.stringify({ ...result.steps, attempt: 'attempt-k5-5' }),
     });
     assert.equal(existsSync(join(subject.deps.journalDir!, 'switch-anthropic.json')), false);
   });

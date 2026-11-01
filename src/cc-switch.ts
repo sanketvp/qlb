@@ -51,6 +51,7 @@ import type { CswapProcess } from './cswap-processes';
 import { atomicWriteText } from './fsutil';
 import { injectionDetail } from './fault-injection';
 import { processLstart, stillTheSameProcess } from './codex-sessions';
+import { recordRelogin } from './relogin';
 import type { Store } from './store';
 
 export type ClaudeSwitchPreconditionReason =
@@ -101,6 +102,8 @@ export interface ClaudeSwitchDeps {
   crashAt?: (checkpoint: 'before-step-6' | 'after-journal' | 'after-stage' | 'before-step-7-write' | 'after-step-7' | 'after-step-8' | 'after-commit') => void;
   /** K8's deterministic post-write rollback seam. */
   injectFailStep?: 7 | 8 | 9;
+  /** Test seam for exercising fail-closed routing of an unexpected runtime kind. */
+  classifyOutgoing?: typeof classifyOutgoingCredential;
 }
 
 export interface SwitchClaudeInput {
@@ -217,14 +220,14 @@ function writeError(error: unknown, fallback: 'keychain-write-failed' | 'config-
   const classified = classifySwitchError(error);
   return classified === 'switch-failed' ? fallback : classified;
 }
-function failed(deps: ClaudeSwitchDeps, input: SwitchClaudeInput, attempt: string, from: string | null, reason: string, error?: string, state = steps(), failedStep?: number, publishedAt?: number | null): ClaudeSwitchResult {
+function failed(deps: ClaudeSwitchDeps, input: SwitchClaudeInput, attempt: string, from: string | null, reason: string, error?: string, state = steps(), failedStep?: number, publishedAt?: number | null, outgoingKind?: string): ClaudeSwitchResult {
   if (failedStep !== undefined) state.failedStep = failedStep;
   const result: ClaudeSwitchResult = { outcome: 'failed', from, to: input.to, reason, ...(error ? { error } : {}), attempt, injected: switchWasInjected(deps, input), steps: state, exitCode: 1 };
   try {
     deps.store.recordSwitch({
       ts: deps.now(), provider: 'anthropic', fromAccount: from, toAccount: input.to, trigger: input.trigger,
       outcome: 'failed', error: error ?? null, detail: reason, injected: switchWasInjected(deps, input),
-      stepsJson: JSON.stringify({ ...state, attempt }), ...(publishedAt !== undefined ? { publishedAt } : {}),
+      outgoingKind: outgoingKind ?? null, stepsJson: JSON.stringify({ ...state, attempt }), ...(publishedAt !== undefined ? { publishedAt } : {}),
     });
   } catch { warn(deps, 'could not record failed Claude switch'); }
   return result;
@@ -298,6 +301,7 @@ async function rollbackClaudeSwitch(
   deps: ClaudeSwitchDeps,
   input: SwitchClaudeInput,
   from: string,
+  outgoingKind: string,
   outgoingLive: string,
   options: ClaudeSwitchJournalOptions,
   ownerHeld: Parameters<typeof updateClaudeSwitchJournal>[0],
@@ -352,7 +356,7 @@ async function rollbackClaudeSwitch(
   try {
     deps.store.recordSwitch({
       ts: deps.now(), provider: 'anthropic', fromAccount: from, toAccount: input.to, trigger: input.trigger,
-      outcome: 'rolled-back', error, detail, injected,
+      outcome: 'rolled-back', error, detail, injected, outgoingKind,
       stepsJson: JSON.stringify({ ...state, attempt: deps.attempt }), ...(publishedAt === null ? {} : { publishedAt }),
     });
   } catch { warn(deps, 'could not record rolled-back Claude switch'); }
@@ -444,27 +448,38 @@ async function switchClaudeAttempt(deps: ClaudeSwitchDeps, input: SwitchClaudeIn
           if (outgoingSlot === null) return refusal(deps, input, attempt, from, 'active-login-unset');
           const outgoing = { accountId: outgoingSlot.accountId, email: outgoingSlot.email ?? null, orgUuid: outgoingSlot.orgUuid ?? null, credential: await readSlotOrNull(deps, from) };
           let classified;
-          try { classified = classifyOutgoingCredential({ outgoing, slots: prepared.slots, liveCredential: outgoingLive, provenance: prepared.prefetch, probeVerdict: input.probeVerdict }); } catch (error) { return failed(deps, input, attempt, from, 'outgoing-backup-failed', writeError(error, 'keychain-write-failed'), state, 5); }
+          try { classified = (deps.classifyOutgoing ?? classifyOutgoingCredential)({ outgoing, slots: prepared.slots, liveCredential: outgoingLive, provenance: prepared.prefetch, probeVerdict: input.probeVerdict }); } catch (error) { return failed(deps, input, attempt, from, 'outgoing-backup-failed', writeError(error, 'keychain-write-failed'), state, 5); }
           if (classified.kind === 'own-family' || classified.kind === 'own-rotated' || classified.kind === 'unresolved') {
-            try { await deps.slots.writeSlot(from, outgoingLive, { cause: 'adopt', by: deps.by, evidence: classified.kind === 'own-rotated' ? 'oracle' : classified.kind === 'unresolved' ? null : 'lineage' }); } catch (error) { return failed(deps, input, attempt, from, 'outgoing-backup-failed', writeError(error, 'keychain-write-failed'), state, 5); }
+            try { await deps.slots.writeSlot(from, outgoingLive, { cause: 'adopt', by: deps.by, evidence: classified.kind === 'own-rotated' ? 'oracle' : classified.kind === 'unresolved' ? null : 'lineage' }); } catch (error) { return failed(deps, input, attempt, from, 'outgoing-backup-failed', writeError(error, 'keychain-write-failed'), state, 5, undefined, classified.kind); }
           } else if (classified.kind === 'foreign' || classified.kind === 'alien' || classified.kind === 'known-foreign' || (classified.kind === 'foreign-synced' && prepared.slots.find((slot) => slot.accountId === classified.foreignSlotId)?.credential !== outgoingLive)) {
             const stashId = (deps.stashTimestamp ?? (() => defaultStashTimestamp(deps.now())))();
             try {
               await deps.slots.stashUnclaimed(stashId, outgoingLive, undefined, classified.foreignSlotId ?? undefined);
               state.unclaimed = stashId;
             } catch (error) {
-              return failed(deps, input, attempt, from, 'outgoing-backup-failed', writeError(error, 'keychain-write-failed'), state, 5);
+              return failed(deps, input, attempt, from, 'outgoing-backup-failed', writeError(error, 'keychain-write-failed'), state, 5, undefined, classified.kind);
             }
-          } else if (classified.kind !== 'own-bytes' && classified.kind !== 'foreign-synced') return refusal(deps, input, attempt, from, `outgoing-unrouted:${classified.kind}`);
+          } else if (classified.kind === 'wiped') {
+            try {
+              recordRelogin(deps.store, { ts: deps.now(), provider: 'anthropic', accountId: from, kind: 'wiped', evidence: 'wiped' });
+            } catch (error) {
+              return failed(deps, input, attempt, from, 'outgoing-backup-failed', writeError(error, 'keychain-write-failed'), state, 5, undefined, classified.kind);
+            }
+          } else if (classified.kind === 'own-bytes' || classified.kind === 'foreign-synced') {
+            // These outgoing kinds are intentionally retained in place.
+          } else {
+            const unexpectedKind: never = classified.kind;
+            return refusal(deps, input, attempt, from, `outgoing-unrouted:${String(unexpectedKind)}`);
+          }
           state.started.push(5); await deps.hooks?.afterStep5?.();
 
           // Step 6: write intent before the staged Keychain copy.
           deps.crashAt?.('before-step-6');
           let targetCredential: string;
-          try { targetCredential = (await deps.slots.readSlot(input.to, { fresh: true })).credential; } catch { return failed(deps, input, attempt, from, 'target-unreadable', undefined, state, 6); }
+          try { targetCredential = (await deps.slots.readSlot(input.to, { fresh: true })).credential; } catch { return failed(deps, input, attempt, from, 'target-unreadable', undefined, state, 6, undefined, classified.kind); }
           let targetOauth: JsonObject | null = null;
           try { const config = JSON.parse(target.configJson ?? '') as { oauthAccount?: unknown }; if (config.oauthAccount && typeof config.oauthAccount === 'object' && !Array.isArray(config.oauthAccount) && (config.oauthAccount as Record<string, unknown>).accountUuid === input.to) targetOauth = config.oauthAccount as JsonObject; } catch { /* invalid below */ }
-          if (!parseCredentialBlob(targetCredential)?.oauth || targetOauth === null) return failed(deps, input, attempt, from, 'target-invalid', undefined, state, 6);
+          if (!parseCredentialBlob(targetCredential)?.oauth || targetOauth === null) return failed(deps, input, attempt, from, 'target-invalid', undefined, state, 6, undefined, classified.kind);
           const timestamp = (deps.stashTimestamp ?? (() => defaultStashTimestamp(deps.now())))();
           const stagedBlobService = stagedRollbackService(timestamp);
           const owner = deps.journalOwner ?? { pid: process.pid, lstart: await processLstart(process.pid) ?? '' };
@@ -478,10 +493,10 @@ async function switchClaudeAttempt(deps: ClaudeSwitchDeps, input: SwitchClaudeIn
           } catch (error) {
             if (isCrash(error)) throw error;
             if (error instanceof ClaudeSwitchJournalPresent) return refusal(deps, input, attempt, from, 'switch-journal-present');
-            try { journalUpdate(ownerHeld, { closed: 'stage-failed' }, options); } catch (cleanup) { state.cleanup.push(classifySwitchError(cleanup)); return failed(deps, input, attempt, from, 'stage-failed', classifySwitchError(error), state, 6); }
-            try { await deleteStagedRollback(live.backend, stagedBlobService); } catch (cleanup) { state.cleanup.push(classifySwitchError(cleanup)); return failed(deps, input, attempt, from, 'stage-failed', classifySwitchError(error), state, 6); }
+            try { journalUpdate(ownerHeld, { closed: 'stage-failed' }, options); } catch (cleanup) { state.cleanup.push(classifySwitchError(cleanup)); return failed(deps, input, attempt, from, 'stage-failed', classifySwitchError(error), state, 6, undefined, classified.kind); }
+            try { await deleteStagedRollback(live.backend, stagedBlobService); } catch (cleanup) { state.cleanup.push(classifySwitchError(cleanup)); return failed(deps, input, attempt, from, 'stage-failed', classifySwitchError(error), state, 6, undefined, classified.kind); }
             try { journalRemove(ownerHeld, options); } catch (cleanup) { state.cleanup.push(classifySwitchError(cleanup)); }
-            return failed(deps, input, attempt, from, 'stage-failed', classifySwitchError(error), state, 6);
+            return failed(deps, input, attempt, from, 'stage-failed', classifySwitchError(error), state, 6, undefined, classified.kind);
           }
           state.started.push(6); await deps.hooks?.beforeStep7?.();
           // This process's rollback source remains usable even if a journal
@@ -504,7 +519,7 @@ async function switchClaudeAttempt(deps: ClaudeSwitchDeps, input: SwitchClaudeIn
             await deps.hooks?.afterStep7?.(); deps.crashAt?.('after-step-7');
           } catch (error) {
             if (isCrash(error)) throw error;
-            return rollbackClaudeSwitch(deps, input, from, outgoingLive, options, ownerHeld, state, 7, error, publishedAt, configLock, credentialHeld, live, rollbackJournal);
+            return rollbackClaudeSwitch(deps, input, from, classified.kind, outgoingLive, options, ownerHeld, state, 7, error, publishedAt, configLock, credentialHeld, live, rollbackJournal);
           }
           // Step 8: config lock covers raw read, planning splice, journal intent, and write only.
           try {
@@ -528,7 +543,7 @@ async function switchClaudeAttempt(deps: ClaudeSwitchDeps, input: SwitchClaudeIn
             await deps.hooks?.afterStep8?.(); deps.crashAt?.('after-step-8');
           } catch (error) {
             if (isCrash(error)) throw error;
-            return rollbackClaudeSwitch(deps, input, from, outgoingLive, options, ownerHeld, state, 8, error, publishedAt, configLock, credentialHeld, live, rollbackJournal);
+            return rollbackClaudeSwitch(deps, input, from, classified.kind, outgoingLive, options, ownerHeld, state, 8, error, publishedAt, configLock, credentialHeld, live, rollbackJournal);
           }
           // Step 9 plus the finished-marker cleanup sequence.
           let switchId: number;
@@ -538,7 +553,7 @@ async function switchClaudeAttempt(deps: ClaudeSwitchDeps, input: SwitchClaudeIn
             state.started.push(9); deps.crashAt?.('after-commit');
           } catch (error) {
             if (isCrash(error)) throw error;
-            return rollbackClaudeSwitch(deps, input, from, outgoingLive, options, ownerHeld, state, 9, error, publishedAt, configLock, credentialHeld, live, rollbackJournal);
+            return rollbackClaudeSwitch(deps, input, from, classified.kind, outgoingLive, options, ownerHeld, state, 9, error, publishedAt, configLock, credentialHeld, live, rollbackJournal);
           }
           try { journalUpdate(ownerHeld, { committed: deps.now() }, options); } catch (error) { state.cleanup.push(classifySwitchError(error)); }
           if (state.cleanup.length === 0) try { await deleteStagedRollback(live.backend, stagedBlobService); } catch (error) { state.cleanup.push(classifySwitchError(error)); }
