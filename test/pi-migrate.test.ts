@@ -9,7 +9,8 @@ import { MacosKeychainBackend, markFakeExecutor, MockKeychain, NativeOpenRouterK
 import { openStore } from '../src/store';
 import { ADAPTER_ACCOUNT_IDS } from '../src/migration';
 import { sharedSingleGrantCoords } from '../src/single-grant-ownership';
-import { exitCodeForError } from '../src/cli';
+import { exitCodeForError, runExecutingCommand } from '../src/cli';
+import { executePiRollback } from '../src/commands/pi-rollback';
 import {
   defaultPiMigratePaths,
   hasLegacyPiOwnerEntry,
@@ -1207,7 +1208,8 @@ describe('Pi migration S58 credential-first barrier', () => {
           return e.code === 'pi-auth-lock-lost'
             && String(e.message).includes('another run took the auth.json lock over')
             && String(e.message).includes(`unverified kept-copy stash ${kept.stashService} (account ${QLB_KEYCHAIN_ACCOUNT})`)
-            && e.cause?.code === 'kept-copy-stash-unverified';
+            && e.cause?.code === 'kept-copy-stash-unverified'
+            && exitCodeForError(error) === 1;
         },
       );
       assert.deepEqual(deletes, [], 'holder A must not delete after the takeover');
@@ -1260,6 +1262,32 @@ describe('Pi migration S58 credential-first barrier', () => {
       } finally { h.cleanup(); }
     });
 
+    it('qlb pi rollback through the CLI entry: lock lost before the first write exits 3', async () => {
+      const h = setup();
+      try {
+        assert.equal(migratePiSingleProvider('xai', h.paths, { keychain: h.keychain, store: h.store }).state, 'migrated');
+        const before = snapshot(h);
+        const errors: string[] = [];
+        const exit = await runExecutingCommand({
+          command: {
+            name: 'pi rollback',
+            execute: (args, ctx) => executePiRollback(args, ctx, {
+              rollback: (provider) => rollbackPiSingleProvider(provider, h.paths, { keychain: h.keychain, store: h.store, withAuthLock: takenOverOnEntry }),
+            }),
+          },
+          args: ['xai'],
+        }, {
+          stdout: () => {}, stderr: (message: string) => errors.push(message),
+          env: { QLB_TEST_MODE: '1', QLB_HOME: h.dir }, home: h.dir,
+          config: { dbPath: join(h.dir, 'qlb.db') }, loadConfig: () => ({ dbPath: join(h.dir, 'qlb.db') }),
+          registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
+        } as never);
+        assert.equal(exit, 3, errors.join('\n'));
+        assert.match(errors.join('\n'), /pi-auth-lock-lost/);
+        assert.deepEqual(snapshot(h), before, 'nothing written');
+      } finally { h.cleanup(); }
+    });
+
     it('pi rollback: lock lost after a write exits 1', () => {
       const h = setup();
       try {
@@ -1272,6 +1300,32 @@ describe('Pi migration S58 credential-first barrier', () => {
         assert.equal(existsSync(h.paths.ownerPath), false, 'the owner-entry write landed');
       } finally { h.cleanup(); }
     });
+  });
+
+  it('P7a-r: a lock replaced between the owner check and the touch reports pi-auth-lock-lost', () => {
+    const h = setup();
+    try {
+      const lock = `${h.paths.authJsonPath}.lock`;
+      let replace = false;
+      const now = () => {
+        // Barrier: refresh() reads now() after its owner check and before utimesSync; holder B
+        // moves A's lock aside and creates its own in that window.
+        if (replace) {
+          replace = false;
+          renameSync(lock, `${lock}.stale-taker`);
+          mkdirSync(lock);
+          writeFileSync(join(lock, 'qlb-lock-owner.json'), JSON.stringify({ pid: process.pid, nonce: 'holder-b' }));
+        }
+        return 10_000;
+      };
+      let wroteAfterRefresh = false;
+      assert.throws(
+        () => withPiAuthLock(h.paths.authJsonPath, (refresh) => { replace = true; refresh(); wroteAfterRefresh = true; }, { now }),
+        (error: unknown) => (error as { code?: unknown }).code === 'pi-auth-lock-lost',
+      );
+      assert.equal(wroteAfterRefresh, false, 'holder A must not continue to a write');
+      assert.deepEqual(JSON.parse(readFileSync(join(lock, 'qlb-lock-owner.json'), 'utf8')), { pid: process.pid, nonce: 'holder-b' }, 'B\'s lock is left intact');
+    } finally { h.cleanup(); }
   });
 
   it('P7a-r: a lock moved aside between the owner check and the touch reports pi-auth-lock-lost', () => {

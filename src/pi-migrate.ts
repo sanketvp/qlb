@@ -168,11 +168,12 @@ export function withPiAuthLock<T>(authPath: string, fn: (refresh: () => void) =>
   if (!acquired) throw lockedError();
   const refresh = () => {
     if (!ownerMatches(lock, owner)) throw lockLostError();
-    // A taker may move the lock aside between the owner check and the touch.
+    // A taker may move the lock aside, or replace it, between the owner check and the touch.
     try { utimesSync(lock, new Date(now()), new Date(now())); } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw lockLostError();
       throw error;
     }
+    if (!ownerMatches(lock, owner)) throw lockLostError();
   };
   try { refresh(); return fn(refresh); } finally { if (ownerMatches(lock, owner)) rmSync(lock, { recursive: true, force: true }); }
 }
