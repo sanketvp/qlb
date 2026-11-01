@@ -2255,6 +2255,122 @@ export class Store {
   }
 
   /**
+   * Step 9: atomically publish a Claude switch after the live writes complete.
+   * `beforeCommit` is a fail-step seam and must remain the final operation in
+   * the transaction so a throw rolls back every durable switch effect.
+   */
+  commitClaudeSwitch(input: {
+    now: number;
+    fromAccount: string;
+    toAccount: string;
+    trigger: string;
+    setBy: 'manual' | 'auto' | 'journal';
+    attempt: string;
+    outgoingKind: string | null;
+    bindingJson: string | null;
+    stepsJson: string | null;
+    publishedAt: number | null;
+    injected: boolean;
+    detail: string | null;
+    republish: boolean;
+    decision: {
+      leftHeadroom: number | string | null;
+      leftRecoveryAt: number | string | null;
+      leftTrigger: number | string | null;
+    };
+    beforeCommit?: () => void;
+  }): number {
+    return this.runImmediate(() => {
+      let steps: Record<string, unknown> = {};
+      if (input.stepsJson !== null) {
+        const parsed: unknown = JSON.parse(input.stepsJson);
+        if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+          throw new Error('Claude switch stepsJson must be an object');
+        }
+        steps = parsed as Record<string, unknown>;
+      }
+      const stepsJson = JSON.stringify({ ...steps, attempt: input.attempt });
+      const setOrDelete = (key: string, value: number | string | null): void => {
+        if (value === null) {
+          this.db.prepare('DELETE FROM config WHERE key = ?').run(key);
+        } else {
+          this.setConfig(key, String(value));
+        }
+      };
+
+      const updated = this.db.prepare('UPDATE claude_slots SET last_active_at = ? WHERE account_id = ?').run(input.now, input.toAccount);
+      if (updated.changes !== 1) throw new Error('Claude switch target slot not found');
+      this.setActiveLogin('anthropic', input.toAccount, input.setBy, input.now);
+      if (!input.republish) {
+        this.setConfig('cooldown.anthropic', String(input.now + 300_000));
+        this.setConfig('auto.anthropic.lastSwitchFrom', input.fromAccount);
+        setOrDelete('auto.anthropic.lastSwitchTo', input.trigger === 'manual' ? null : input.toAccount);
+        setOrDelete('auto.anthropic.leftHeadroom', input.decision.leftHeadroom);
+        setOrDelete('auto.anthropic.leftRecoveryAt', input.decision.leftRecoveryAt);
+        setOrDelete('auto.anthropic.leftTrigger', input.decision.leftTrigger);
+      }
+      const switchId = this.recordSwitch({
+        ts: input.now,
+        provider: 'anthropic',
+        fromAccount: input.fromAccount,
+        toAccount: input.toAccount,
+        trigger: input.trigger,
+        outcome: 'ok',
+        outgoingKind: input.outgoingKind,
+        bindingJson: input.bindingJson,
+        stepsJson,
+        publishedAt: input.publishedAt,
+        committedAt: input.now,
+        injected: input.injected,
+        detail: input.republish ? 'republish' : input.detail,
+      });
+      input.beforeCommit?.();
+      return switchId;
+    });
+  }
+
+  /** Write one refusal row before a Claude switch has changed any state. */
+  recordClaudeSwitchRefusal(input: {
+    from: string | null;
+    to: string;
+    trigger: string;
+    reason: string;
+    injected: boolean;
+    attempt: string;
+    now: number;
+  }): number {
+    return this.recordSwitch({
+      ts: input.now,
+      provider: 'anthropic',
+      fromAccount: input.from,
+      toAccount: input.to,
+      trigger: input.trigger,
+      outcome: 'refused',
+      detail: input.reason,
+      injected: input.injected,
+      stepsJson: JSON.stringify({ attempt: input.attempt }),
+    });
+  }
+
+  /** Find the committed Claude switch for an attempt; refusals and rollbacks do not finish one. */
+  findClaudeSwitchByAttempt(attempt: string): {
+    id: number;
+    outcome: string;
+    ts: number;
+    committedAt: number | null;
+  } | null {
+    const row = this.db.prepare(`SELECT id, outcome, ts, committed_at
+      FROM switch_log
+      WHERE provider = 'anthropic' AND committed_at IS NOT NULL
+        AND CASE WHEN json_valid(steps_json) THEN json_extract(steps_json, '$.attempt') END = ?
+      ORDER BY id DESC LIMIT 1`).get(attempt) as {
+      id: number; outcome: string; ts: number; committed_at: number | null;
+    } | undefined;
+    if (!row) return null;
+    return { id: row.id, outcome: row.outcome, ts: row.ts, committedAt: row.committed_at };
+  }
+
+  /**
    * Step 5: atomically make a fully classified Codex switch observable.
    * `now`, `publishedAt`, and `committedAt` are caller-owned durable times;
    * this method deliberately does not sample the clock while committing.
