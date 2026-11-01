@@ -77,6 +77,13 @@ export interface AnthropicSlotLineageChainRow {
   lineages: string[];
 }
 
+/** Read-only full lineage component for one active Codex slot (S46/S61). */
+export interface CodexSlotLineageChainRow {
+  accountId: string;
+  source: string | null;
+  lineages: string[];
+}
+
 /** S61's durable undo-export mapping for an anthropic-pool entry. */
 export interface PiExportTargetRow {
   provider: string;
@@ -2871,6 +2878,39 @@ export class Store {
         }
       }
       return { accountId: slot.accountId, lineages: [...lineages] };
+    });
+  }
+
+  /** Return each active Codex slot's connected lineage component (S46/S61). */
+  listCodexSlotLineageChains(): CodexSlotLineageChainRow[] {
+    const slots = this.db.prepare(`SELECT account_id AS accountId, source, fingerprint, prev_fingerprint AS prevFingerprint
+      FROM codex_slots WHERE archived_at IS NULL AND dead = 0 ORDER BY account_id`).all() as Array<{
+      accountId: string; source: string | null; fingerprint: string | null; prevFingerprint: string | null;
+    }>;
+    const transitions = this.db.prepare(`SELECT account_id AS accountId, from_fp AS fromFp, to_fp AS toFp
+      FROM lineage_log WHERE provider = 'openai-codex' ORDER BY id`).all() as Array<{
+      accountId: string; fromFp: string | null; toFp: string;
+    }>;
+    return slots.map((slot) => {
+      const lineages = new Set<string>();
+      if (slot.fingerprint) lineages.add(slot.fingerprint);
+      if (slot.prevFingerprint) lineages.add(slot.prevFingerprint);
+      let changed = true;
+      while (changed) {
+        changed = false;
+        for (const edge of transitions) {
+          if (edge.accountId !== slot.accountId) continue;
+          if (edge.fromFp && lineages.has(edge.fromFp) && !lineages.has(edge.toFp)) {
+            lineages.add(edge.toFp);
+            changed = true;
+          }
+          if (edge.fromFp && lineages.has(edge.toFp) && !lineages.has(edge.fromFp)) {
+            lineages.add(edge.fromFp);
+            changed = true;
+          }
+        }
+      }
+      return { accountId: slot.accountId, source: slot.source, lineages: [...lineages] };
     });
   }
 
