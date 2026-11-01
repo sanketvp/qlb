@@ -1802,8 +1802,10 @@ export class Migration {
   }
 
   private readOwnerPayload(): OwnerFile | null {
-    const staged = this.readStagingOwnerFile();
-    if (staged) return staged;
+    return this.readStagingOwnerFile() ?? this.readJournalOwnerPayload();
+  }
+
+  private readJournalOwnerPayload(): OwnerFile | null {
     const detail = parseDetail(this.store.getMigration(this.storeName)?.detail_json);
     const accounts = Array.isArray(detail.accounts)
       ? (detail.accounts as OwnerFile['accounts'])
@@ -1821,8 +1823,11 @@ export class Migration {
   }
 
   private readStagedAccounts(): StagedAccount[] {
-    const owner = this.readOwnerPayload();
+    const staged = this.readStagingOwnerFile();
+    const owner = staged ?? this.readJournalOwnerPayload();
     if (!owner) return [];
+    // Rehearse reads a generic journal only when it holds exactly one account.
+    if (!staged && this.kind === 'single-grant' && singleJournalAccount(owner.accounts) === undefined) return [];
     const out: StagedAccount[] = [];
     for (const meta of owner.accounts) {
       const { service, account } = this.kind === 'single-grant'
