@@ -255,6 +255,9 @@ function collect(child: ChildProcess): { stdout: string; stderr: string } {
 
 function waitExit(child: ChildProcess, timeoutMs = 15_000): Promise<number> {
   return new Promise((resolve, reject) => {
+    // The child may have exited before we were called; its 'exit' event is already gone.
+    if (child.exitCode !== null) { closePipes(child); resolve(child.exitCode); return; }
+    if (child.signalCode !== null) { closePipes(child); resolve(128); return; }
     const t = setTimeout(() => {
       try { child.kill('SIGKILL'); } catch { /* ignore */ }
       closePipes(child);
@@ -609,7 +612,8 @@ print('SECOND_ACQUIRED')
     const fake = writeFakeClaude(dir);
     const env = envFor(dir, port, fake);
     const w = spawnTracked('/usr/bin/python3', [WRAPPER, '--exit', '0'], { env });
-    collect(w);
+    const out = collect(w);
+    await waitFor(() => out.stdout.includes('ANTHROPIC_BASE_URL='), 12_000, 'native launch');
     await waitExit(w, 12_000);
     assert.equal(existsSync(join(leases, '1')), false);
     await assertCaseQuiet(dir, port);
