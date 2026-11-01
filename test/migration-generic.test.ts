@@ -214,7 +214,7 @@ interface Harness {
 function setup(
   provider: SingleGrantProvider,
   kc: MockKeychain = new MockKeychain(),
-  config: Pick<MigrationConfig, 'fsyncDirectory' | 'afterStep' | 'sleepSync' | 'now' | 'authLockTiming'> = {},
+  config: Pick<MigrationConfig, 'fsyncDirectory' | 'afterStep' | 'sleepSync' | 'now' | 'authLockTiming' | 'beforeOwnerFileRename'> = {},
 ): Harness & {
   mig: Migration;
 } {
@@ -4929,9 +4929,94 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
           'forward mutation is fenced until resume completes the marked rollback',
         );
       }
+      await assert.rejects(
+        () => h.mig.rehearse(mockRehearse([])),
+        (error: unknown) => (error as { message?: unknown; exitCode?: unknown }).message === 'rollback-in-progress: run `qlb migrate resume`'
+          && (error as { exitCode?: unknown }).exitCode === 3,
+        'rehearse is also a forward mutation fenced until resume completes the marked rollback',
+      );
 
       kc.mode = 'succeed';
       assert.equal(h.mig.resume().state, 'NATIVE', 'resume completes the marked rollback');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('T-OD6-13c refuses regular malformed or mismatched staging before commit or resume preserves native state', async () => {
+    const corruptions: Array<[string, (staging: string) => void]> = [
+      ['missing owner document fields', (staging) => writeFileSync(staging, JSON.stringify({ owner: 'qlb' }) + '\n')],
+      ['wrong provider account', (staging) => {
+        const owner = JSON.parse(readFileSync(staging, 'utf8')) as { accounts: Array<Record<string, unknown>> };
+        owner.accounts[0]!.provider = 'kimi-coding';
+        writeFileSync(staging, JSON.stringify(owner, null, 2) + '\n');
+      }],
+      ['wrong account id', (staging) => {
+        const owner = JSON.parse(readFileSync(staging, 'utf8')) as { qlbAccountIds: string[]; accounts: Array<Record<string, unknown>> };
+        owner.qlbAccountIds[0] = 'wrong-account';
+        owner.accounts[0]!.id = 'wrong-account';
+        writeFileSync(staging, JSON.stringify(owner, null, 2) + '\n');
+      }],
+    ];
+    for (const [corruption, corrupt] of corruptions) {
+      for (const command of ['commit', 'resume'] as const) {
+        const h = setup('xai');
+        try {
+          h.mig.stage();
+          await h.mig.rehearse(mockRehearse([]));
+          const staging = stagingOwnerPath(join(h.dir, 'qlb-owner.json'), 'xai');
+          corrupt(staging);
+          const journalBefore = h.store.getMigration('pi-xai');
+          const nativeBefore = readFileSync(h.authPath);
+
+          assert.throws(
+            () => h.mig[command](),
+            (error: unknown) => (error as { message?: unknown; exitCode?: unknown }).message === `cannot commit: invalid staging ${staging}; run \`qlb migrate rollback\``
+              && (error as { exitCode?: unknown }).exitCode === 3,
+            `${corruption}/${command}`,
+          );
+          assert.equal(existsSync(h.ownerPath), false, `${corruption}/${command}: staging is never published`);
+          assert.equal(existsSync(staging), true, `${corruption}/${command}: staging remains for explicit rollback`);
+          assert.deepEqual(readFileSync(h.authPath), nativeBefore, `${corruption}/${command}: native auth stays untouched`);
+          assert.deepEqual(h.store.getMigration('pi-xai'), journalBefore, `${corruption}/${command}: journal stays unchanged`);
+        } finally {
+          h.cleanup();
+        }
+      }
+    }
+  });
+
+  it('T-OD6-13c refuses a staging-to-symlink swap after validation without chmod or hygiene', async () => {
+    let h: (Harness & { mig: Migration }) | undefined;
+    let journalAtSwap: ReturnType<ReturnType<typeof openStore>['getMigration']> | undefined;
+    const hConfig = {
+      beforeOwnerFileRename: () => {
+        const staging = stagingOwnerPath(join(h!.dir, 'qlb-owner.json'), 'xai');
+        const target = join(h!.dir, 'post-validation-target.json');
+        writeFileSync(target, readFileSync(staging), { mode: 0o644 });
+        chmodSync(target, 0o644);
+        rmSync(staging);
+        symlinkSync(target, staging);
+        journalAtSwap = h!.store.getMigration('pi-xai');
+      },
+    };
+    h = setup('xai', new MockKeychain(), hConfig);
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      const target = join(h.dir, 'post-validation-target.json');
+      const nativeBefore = readFileSync(h.authPath);
+
+      assert.throws(
+        () => h!.mig.commit(),
+        (error: unknown) => (error as { message?: unknown; exitCode?: unknown }).message === `cannot commit: invalid published owner ${h!.ownerPath}; run \`qlb migrate rollback\``
+          && (error as { exitCode?: unknown }).exitCode === 3,
+      );
+      assert.equal(lstatSync(h.ownerPath).isSymbolicLink(), true, 'the swapped symlink is never chmodded through');
+      assert.equal(statSync(target).mode & 0o777, 0o644, 'target permissions remain unchanged');
+      assert.ok(journalAtSwap, 'the seam captured the pre-rename journal');
+      assert.deepEqual(h.store.getMigration('pi-xai'), journalAtSwap, 'finishHygiene does not advance the journal');
+      assert.deepEqual(readFileSync(h.authPath), nativeBefore, 'native auth stays untouched');
     } finally {
       h.cleanup();
     }
