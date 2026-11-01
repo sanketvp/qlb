@@ -37,15 +37,17 @@ async function fixture(options: {
 
   let active = 'account-a';
   const rows: Record<string, unknown>[] = [];
+  const relogins: Record<string, unknown>[] = [];
+  const commits: Record<string, unknown>[] = [];
   const deps: ClaudeSwitchDeps = {
     store: {
       getActiveLogin: () => ({ provider: 'anthropic', accountId: active, since: NOW, setBy: 'manual' }),
       getConfig: () => null,
       recordSwitch: (row: Record<string, unknown>) => { rows.push(row); return rows.length; },
-      recordRelogin: () => 1,
+      recordRelogin: (row: Record<string, unknown>) => { relogins.push(row); return relogins.length; },
       recordClaudeSwitchRefusal: (row: Record<string, unknown>) => { rows.push(row); return rows.length; },
       findClaudeSwitchByAttempt: () => null,
-      commitClaudeSwitch: (row: { toAccount: string; beforeCommit?: () => void }) => { row.beforeCommit?.(); active = row.toAccount; return rows.length + 1; },
+      commitClaudeSwitch: (row: { toAccount: string; beforeCommit?: () => void }) => { row.beforeCommit?.(); commits.push(row); active = row.toAccount; return commits.length; },
     } as unknown as ClaudeSwitchDeps['store'],
     slots,
     live: { backend, paths, account: 'fixture-user' },
@@ -62,7 +64,7 @@ async function fixture(options: {
     stashTimestamp: () => 'k9-unclaimed',
     injectFailStep: options.injectFailStep,
   };
-  return { backend, slots, paths, deps, accountA, accountB, rows, active: () => active, input: { to: 'account-b', trigger: 'manual', probeVerdict: options.probeVerdict } };
+  return { backend, slots, paths, deps, accountA, accountB, rows, relogins, commits, active: () => active, input: { to: 'account-b', trigger: 'manual', probeVerdict: options.probeVerdict } };
 }
 
 async function slotCredentials(subject: Awaited<ReturnType<typeof fixture>>) {
@@ -76,7 +78,7 @@ function unclaimedService(timestamp = 'k9-unclaimed'): string {
   return `qlb:anthropic:unclaimed:${timestamp}`;
 }
 
-describe('Claude switch classification routing (K9-1)', () => {
+describe('Claude switch classification routing (K9)', () => {
   it('foreign ⇒ unclaimed:* written, both slots unchanged, switch commits ok', async () => {
     const live = credential('foreign');
     const subject = await fixture({ live, resolveProfile: async () => ({ uuid: 'account-b', email: 'b@example.test', organizationUuid: 'org-b' }) });
@@ -161,13 +163,112 @@ describe('Claude switch classification routing (K9-1)', () => {
     assert.equal(stored.credential, live);
   });
 
-  it('wiped is still refused outgoing-unrouted:wiped (until K9-2)', async () => {
+  it('X22: the nine kinds route exactly as §4.1 step 5 (table-driven: expected slot write / stash / relogin / nothing per kind)', async () => {
     const wiped = JSON.stringify({ claudeAiOauth: { accessToken: '', refreshToken: '', expiresAt: NOW + 3_600_000 } });
-    const subject = await fixture({ live: wiped, resolveProfile: async () => null });
+    const ownFamily = JSON.stringify({ claudeAiOauth: { accessToken: 'fixture-access-a-rotated', refreshToken: 'fixture-refresh-a', expiresAt: NOW + 3_600_000 } });
+    const cases = [
+      { kind: 'own-bytes', live: credential('a'), resolveProfile: async () => null, action: 'nothing' },
+      { kind: 'own-family', live: ownFamily, resolveProfile: async () => null, action: 'slot' },
+      { kind: 'own-rotated', live: credential('own-rotated'), resolveProfile: async () => ({ uuid: 'account-a', email: 'a@example.test', organizationUuid: 'org-a' }), action: 'slot' },
+      { kind: 'foreign', live: credential('foreign'), resolveProfile: async () => ({ uuid: 'account-b', email: 'b@example.test', organizationUuid: 'org-b' }), action: 'stash' },
+      { kind: 'foreign-synced', live: credential('b'), resolveProfile: async () => ({ uuid: 'account-b', email: 'b@example.test', organizationUuid: 'org-b' }), action: 'nothing' },
+      { kind: 'wiped', live: wiped, resolveProfile: async () => null, action: 'relogin' },
+      { kind: 'alien', live: credential('alien'), resolveProfile: async () => ({ uuid: 'unmanaged', email: 'unmanaged@example.test', organizationUuid: 'org-unmanaged' }), action: 'stash' },
+      { kind: 'known-foreign', live: credential('known-foreign'), resolveProfile: async () => { throw new Error('fixture profile unavailable'); }, probeVerdict: false, action: 'stash' },
+      { kind: 'unresolved', live: credential('unresolved'), resolveProfile: async () => null, action: 'slot' },
+    ] as const;
+
+    for (const scenario of cases) {
+      const subject = await fixture(scenario);
+      const slotWrites: Array<{ accountId: string; evidence: string | null | undefined }> = [];
+      const stashes: string[] = [];
+      const writeSlot = subject.slots.writeSlot.bind(subject.slots);
+      const stashUnclaimed = subject.slots.stashUnclaimed.bind(subject.slots);
+      subject.slots.writeSlot = async (accountId, value, transition) => {
+        slotWrites.push({ accountId, evidence: transition.evidence });
+        return writeSlot(accountId, value, transition);
+      };
+      subject.slots.stashUnclaimed = async (timestamp, value, consumedFp, accountId) => {
+        stashes.push(timestamp);
+        return stashUnclaimed(timestamp, value, consumedFp, accountId);
+      };
+
+      const result = await switchClaude(subject.deps, subject.input);
+
+      assert.equal(result.outcome, 'ok', scenario.kind);
+      assert.equal(result.outgoingKind, scenario.kind, scenario.kind);
+      assert.equal(slotWrites.length, scenario.action === 'slot' ? 1 : 0, scenario.kind);
+      assert.equal(stashes.length, scenario.action === 'stash' ? 1 : 0, scenario.kind);
+      assert.equal(subject.relogins.length, scenario.action === 'relogin' ? 1 : 0, scenario.kind);
+      if (scenario.action === 'slot') assert.equal(slotWrites[0]?.accountId, 'account-a', scenario.kind);
+      if (scenario.action === 'relogin') {
+        assert.deepEqual(subject.relogins[0], { ts: NOW, provider: 'anthropic', accountId: 'account-a', kind: 'wiped', detail: null, evidence: 'wiped', userDeniedAt: undefined }, scenario.kind);
+      }
+    }
+  });
+
+  it('own-rotated adopts with evidence oracle, own-family with evidence lineage, unresolved with null evidence', async () => {
+    const ownFamily = JSON.stringify({ claudeAiOauth: { accessToken: 'fixture-access-a-rotated', refreshToken: 'fixture-refresh-a', expiresAt: NOW + 3_600_000 } });
+    const cases = [
+      { kind: 'own-rotated', live: credential('own-rotated'), resolveProfile: async () => ({ uuid: 'account-a', email: 'a@example.test', organizationUuid: 'org-a' }), evidence: 'oracle' },
+      { kind: 'own-family', live: ownFamily, resolveProfile: async () => null, evidence: 'lineage' },
+      { kind: 'unresolved', live: credential('unresolved'), resolveProfile: async () => null, evidence: null },
+    ] as const;
+
+    for (const scenario of cases) {
+      const subject = await fixture(scenario);
+      const writes: Array<{ evidence: string | null | undefined }> = [];
+      const writeSlot = subject.slots.writeSlot.bind(subject.slots);
+      subject.slots.writeSlot = async (accountId, value, transition) => {
+        writes.push({ evidence: transition.evidence });
+        return writeSlot(accountId, value, transition);
+      };
+
+      const result = await switchClaude(subject.deps, subject.input);
+
+      assert.equal(result.outgoingKind, scenario.kind);
+      assert.deepEqual(writes, [{ evidence: scenario.evidence }], scenario.kind);
+    }
+  });
+
+  it('an empty live item is refused before classification (AC5)', async () => {
+    const subject = await fixture({ live: '', resolveProfile: async () => null });
+    const writes: string[] = [];
+    const writeSlot = subject.slots.writeSlot.bind(subject.slots);
+    subject.slots.writeSlot = async (accountId, value, transition) => {
+      writes.push(accountId);
+      return writeSlot(accountId, value, transition);
+    };
 
     const result = await switchClaude(subject.deps, subject.input);
 
-    assert.equal(result.outcome, 'refused');
-    assert.equal(result.reason, 'outgoing-unrouted:wiped');
+    assert.deepEqual({ outcome: result.outcome, reason: result.reason, outgoingKind: result.outgoingKind }, { outcome: 'refused', reason: 'live-credential-empty', outgoingKind: undefined });
+    assert.deepEqual(writes, []);
+    assert.deepEqual(subject.relogins, []);
+    assert.deepEqual(subject.commits, []);
+  });
+
+  it('switch_log.outgoing_kind records the kind for every outcome that reaches step 5', async () => {
+    const wiped = JSON.stringify({ claudeAiOauth: { accessToken: '', refreshToken: '', expiresAt: NOW + 3_600_000 } });
+    const ownFamily = JSON.stringify({ claudeAiOauth: { accessToken: 'fixture-access-a-rotated', refreshToken: 'fixture-refresh-a', expiresAt: NOW + 3_600_000 } });
+    const cases = [
+      { kind: 'own-bytes', live: credential('a'), resolveProfile: async () => null },
+      { kind: 'own-family', live: ownFamily, resolveProfile: async () => null },
+      { kind: 'own-rotated', live: credential('own-rotated'), resolveProfile: async () => ({ uuid: 'account-a', email: 'a@example.test', organizationUuid: 'org-a' }) },
+      { kind: 'foreign', live: credential('foreign'), resolveProfile: async () => ({ uuid: 'account-b', email: 'b@example.test', organizationUuid: 'org-b' }) },
+      { kind: 'foreign-synced', live: credential('b'), resolveProfile: async () => ({ uuid: 'account-b', email: 'b@example.test', organizationUuid: 'org-b' }) },
+      { kind: 'wiped', live: wiped, resolveProfile: async () => null },
+      { kind: 'alien', live: credential('alien'), resolveProfile: async () => ({ uuid: 'unmanaged', email: 'unmanaged@example.test', organizationUuid: 'org-unmanaged' }) },
+      { kind: 'known-foreign', live: credential('known-foreign'), resolveProfile: async () => { throw new Error('fixture profile unavailable'); }, probeVerdict: false },
+      { kind: 'unresolved', live: credential('unresolved'), resolveProfile: async () => null },
+    ] as const;
+
+    for (const scenario of cases) {
+      const subject = await fixture(scenario);
+      const result = await switchClaude(subject.deps, subject.input);
+      assert.equal(result.outgoingKind, scenario.kind, scenario.kind);
+      assert.equal(subject.commits.length, 1, scenario.kind);
+      assert.equal(subject.commits[0]?.outgoingKind, scenario.kind, scenario.kind);
+    }
   });
 });

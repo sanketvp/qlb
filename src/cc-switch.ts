@@ -51,6 +51,7 @@ import type { CswapProcess } from './cswap-processes';
 import { atomicWriteText } from './fsutil';
 import { injectionDetail } from './fault-injection';
 import { processLstart, stillTheSameProcess } from './codex-sessions';
+import { recordRelogin } from './relogin';
 import type { Store } from './store';
 
 export type ClaudeSwitchPreconditionReason =
@@ -455,7 +456,9 @@ async function switchClaudeAttempt(deps: ClaudeSwitchDeps, input: SwitchClaudeIn
             } catch (error) {
               return failed(deps, input, attempt, from, 'outgoing-backup-failed', writeError(error, 'keychain-write-failed'), state, 5);
             }
-          } else if (classified.kind !== 'own-bytes' && classified.kind !== 'foreign-synced') return refusal(deps, input, attempt, from, `outgoing-unrouted:${classified.kind}`);
+          } else if (classified.kind === 'wiped') {
+            recordRelogin(deps.store, { ts: deps.now(), provider: 'anthropic', accountId: from, kind: 'wiped', evidence: 'wiped' });
+          }
           state.started.push(5); await deps.hooks?.afterStep5?.();
 
           // Step 6: write intent before the staged Keychain copy.
