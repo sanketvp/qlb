@@ -9,7 +9,8 @@ import { defaultConfig } from '../src/config';
 import { createCommandRunner, doctorQlb, inspectProviders, registeredDoctorChecks } from '../src/diagnostics';
 import { discoverChecks } from '../src/registry';
 import { MACOS_SECURITY_TIMEOUT_MS, MockKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, type KeychainBackend } from '../src/keychain';
-import { recordStash } from '../src/unclaimed-index';
+import { listStashes, recordStash } from '../src/unclaimed-index';
+import { persistStash } from '../src/single-stash';
 import { validatedAdvisoryMessage } from '../src/migration-health';
 import { openStore } from '../src/store';
 
@@ -25,6 +26,21 @@ async function doctorReport(
     command: (_command, args) => args[0] === 'list-keychains' ? 'ok' : '',
     hostCommand: () => '',
   });
+}
+
+async function withTestQlbHome<T>(home: string, operation: () => Promise<T>): Promise<T> {
+  const previousTestMode = process.env.QLB_TEST_MODE;
+  const previousQlbHome = process.env.QLB_HOME;
+  process.env.QLB_TEST_MODE = '1';
+  process.env.QLB_HOME = home;
+  try {
+    return await operation();
+  } finally {
+    if (previousTestMode === undefined) delete process.env.QLB_TEST_MODE;
+    else process.env.QLB_TEST_MODE = previousTestMode;
+    if (previousQlbHome === undefined) delete process.env.QLB_HOME;
+    else process.env.QLB_HOME = previousQlbHome;
+  }
 }
 
 describe('qlb doctor', () => {
@@ -48,6 +64,7 @@ describe('qlb doctor', () => {
     }
     const keychain = Object.assign(new LinuxLibsecretFake(), { kind: 'linux-libsecret' }) as unknown as KeychainBackend;
     try {
+      await withTestQlbHome(home, async () => {
       await recordStash(stashRoot, {
         provider: 'xai', accountId: 'default', stashId: unreadableId, consumedFp: 'sha256:lineage', location: 'keychain', createdAt: 1,
       });
@@ -60,7 +77,9 @@ describe('qlb doctor', () => {
       await recordStash(stashRoot, {
         provider: 'xai', accountId: 'default', stashId: fallbackMalformedId, consumedFp: 'sha256:lineage', location: 'file', createdAt: 4,
       });
-      keychain.setSync(qlbKeychainService('xai', `unclaimed:${readableId}`), QLB_KEYCHAIN_ACCOUNT, credentialText);
+      keychain.setSync(qlbKeychainService('xai', `unclaimed:${readableId}`), QLB_KEYCHAIN_ACCOUNT, JSON.stringify({
+        credential: { access: credentialText, refresh: credentialText }, consumedFp: 'sha256:lineage',
+      }));
       mkdirSync(join(stashRoot, 'xai'), { recursive: true });
       writeFileSync(join(stashRoot, 'xai', `${fallbackReadableId}.json`), JSON.stringify({
         credential: { access: credentialText, refresh: credentialText }, consumedFp: 'sha256:lineage',
@@ -79,6 +98,62 @@ describe('qlb doctor', () => {
       assert.equal(report.checks.some((check) => check.name.includes(fallbackReadableId)), false);
       assert.equal(report.checks.find((check) => check.name.includes(fallbackMalformedId))?.level, 'WARN');
       assert.doesNotMatch(JSON.stringify(report), new RegExp(credentialText));
+      });
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('reads the single-stash root when the doctor db path is overridden', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-libsecret-overridden-db-'));
+    const stashRoot = join(home, '.qlb', 'unclaimed');
+    class FallbackOnlyLibsecretFake extends MockKeychain {
+      override getSync(service: string, account: string): string {
+        if (service.includes(':unclaimed:')) throw new Error('secret-tool exit 1');
+        return super.getSync(service, account);
+      }
+
+      override setSync(service: string, account: string, value: string): void {
+        if (service.includes(':unclaimed:')) throw new Error('secret-tool exit 1');
+        super.setSync(service, account, value);
+      }
+    }
+    const keychain = Object.assign(new FallbackOnlyLibsecretFake(), { kind: 'linux-libsecret' }) as unknown as KeychainBackend;
+    try {
+      await withTestQlbHome(home, async () => {
+        await persistStash('xai', { access: 'fixture-access', refresh: 'fixture-refresh' }, 'sha256:lineage', keychain, { home });
+        const [entry] = await listStashes(stashRoot, 'xai', 'default');
+        assert.ok(entry);
+        writeFileSync(join(stashRoot, 'xai', `${entry.stashId}.json`), '{');
+        const report = await doctorQlb({ ...defaultConfig(home), dbPath: join(home, 'overridden', 'qlb.sqlite') }, {
+          command: () => 'ok', hostCommand: () => '', hostPlatform: 'linux', keychain,
+        });
+        assert.equal(report.checks.find((check) => check.name.includes(entry.stashId))?.level, 'WARN');
+      });
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('WARNs when a successful Linux libsecret stash lookup returns a malformed record', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-libsecret-malformed-keychain-'));
+    const stashRoot = join(home, '.qlb', 'unclaimed');
+    const stashId = 'malformed-keychain-record';
+    const keychain = Object.assign(new MockKeychain(), { kind: 'linux-libsecret' }) as unknown as KeychainBackend;
+    try {
+      await withTestQlbHome(home, async () => {
+        await recordStash(stashRoot, {
+          provider: 'xai', accountId: 'default', stashId, consumedFp: 'sha256:lineage', location: 'keychain', createdAt: 1,
+        });
+        keychain.setSync(qlbKeychainService('xai', `unclaimed:${stashId}`), QLB_KEYCHAIN_ACCOUNT, '{');
+        const report = await doctorQlb(defaultConfig(home), {
+          command: () => 'ok', hostCommand: () => '', hostPlatform: 'linux', keychain,
+        });
+        const warning = report.checks.find((check) => check.name.includes(stashId));
+        assert.equal(warning?.level, 'WARN');
+        assert.match(warning?.message ?? '', /xai/);
+        assert.match(warning?.message ?? '', new RegExp(stashId));
+      });
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
@@ -90,6 +165,7 @@ describe('qlb doctor', () => {
     const malformedIndexText = 'fixture-index-content-must-not-appear';
     const keychain = Object.assign(new MockKeychain(), { kind: 'linux-libsecret' }) as unknown as KeychainBackend;
     try {
+      await withTestQlbHome(home, async () => {
       mkdirSync(join(stashRoot, 'index', 'xai'), { recursive: true });
       writeFileSync(join(stashRoot, 'index', 'xai', 'malformed.json'), malformedIndexText);
 
@@ -101,6 +177,7 @@ describe('qlb doctor', () => {
       assert.match(warning?.message ?? '', /stash index could not be read/);
       assert.match(warning?.message ?? '', /xai/);
       assert.doesNotMatch(JSON.stringify(report), new RegExp(malformedIndexText));
+      });
     } finally {
       rmSync(home, { recursive: true, force: true });
     }

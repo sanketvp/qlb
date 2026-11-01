@@ -2,6 +2,7 @@ import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { isCredentialNotFound } from '../credential-backends';
+import { isMissingFile, parseStash } from '../single-stash';
 import type { DoctorCheck } from '../diagnostics';
 import { QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, type KeychainBackend } from '../keychain';
 import { listStashes } from '../unclaimed-index';
@@ -13,22 +14,10 @@ const SINGLE_STASH_PROVIDERS = ['xai', 'kimi-coding'] as const;
 
 type FallbackBodyStatus = 'absent' | 'readable' | 'unreadable';
 
-function isMissingFile(error: unknown): boolean {
-  return !!error && typeof error === 'object' && (error as NodeJS.ErrnoException).code === 'ENOENT';
-}
-
 /** Match single-stash's file read and record validation without reporting bytes. */
 async function fallbackBodyStatus(root: string, provider: string, stashId: string): Promise<FallbackBodyStatus> {
   try {
-    const value = JSON.parse(await readFile(join(root, provider, `${stashId}.json`), 'utf8')) as unknown;
-    if (!value || typeof value !== 'object' || Array.isArray(value)) return 'unreadable';
-    const record = value as { credential?: unknown; consumedFp?: unknown };
-    if (typeof record.consumedFp !== 'string' || !record.credential ||
-      typeof record.credential !== 'object' || Array.isArray(record.credential)) return 'unreadable';
-    const credential = record.credential as { access?: unknown; refresh?: unknown; expires?: unknown };
-    return typeof credential.access === 'string' && credential.access.length > 0 &&
-      typeof credential.refresh === 'string' && credential.refresh.length > 0 &&
-      (credential.expires === undefined || (typeof credential.expires === 'number' && Number.isFinite(credential.expires)))
+    return parseStash(await readFile(join(root, provider, `${stashId}.json`), 'utf8'))
       ? 'readable'
       : 'unreadable';
   } catch (error) {
@@ -58,8 +47,8 @@ export async function libsecretStashChecks(keychain: KeychainBackend, root: stri
     }
     for (const entry of entries) {
       try {
-        keychain.getSync(qlbKeychainService(provider, `unclaimed:${entry.stashId}`), QLB_KEYCHAIN_ACCOUNT);
-        continue;
+        const body = keychain.getSync(qlbKeychainService(provider, `unclaimed:${entry.stashId}`), QLB_KEYCHAIN_ACCOUNT);
+        if (parseStash(body)) continue;
       } catch (error) {
         const fallback = await fallbackBodyStatus(root, provider, entry.stashId);
         if (fallback === 'readable' || (fallback === 'absent' && isCredentialNotFound(error))) continue;
