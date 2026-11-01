@@ -20,6 +20,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 
 import { codexSlotIdFromAccessToken } from './codex-auth';
+import { isPiPlaceholder } from './pi-migrate';
 import { QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, type KeychainBackend } from './keychain';
 import { isCredentialNotFound } from './credential-backends';
 import {
@@ -524,6 +525,10 @@ export function createNativeCredentialReader(opts: {
           readFileSync(opts.authJsonPath, 'utf8'),
           provider,
         );
+        // A generic P7b6 commit deliberately replaces the native entry with
+        // QLB's placeholder. It is an ownership marker, never a credential
+        // that native-resync may copy back into the managed Keychain item.
+        if (isPiPlaceholder(parsed)) return null;
         const matches = provider === 'openai-codex'
           ? accountId.includes(':')
             ? codexSlotIdFromAccessToken(parsed.access, parsed.accountId) === accountId

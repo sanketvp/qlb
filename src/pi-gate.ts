@@ -160,6 +160,20 @@ function isShadowRetainedEntry(entry: unknown): boolean {
     && typeof (entry as Record<string, unknown>).refresh === 'string';
 }
 
+/** The generic migration may stage a provider from a differently named auth key. */
+function stagedAuthJsonKey(db: DatabaseSync, provider: PiGateProvider): string {
+  try {
+    const row = db.prepare('SELECT detail_json FROM migrations WHERE store = ?').get(`pi-${provider}`) as { detail_json?: unknown } | undefined;
+    if (!row || typeof row.detail_json !== 'string') return provider;
+    const detail: unknown = JSON.parse(row.detail_json);
+    if (!detail || typeof detail !== 'object' || Array.isArray(detail)) return provider;
+    const key = (detail as Record<string, unknown>).authJsonKey;
+    return typeof key === 'string' && key.length > 0 ? key : provider;
+  } catch {
+    return provider;
+  }
+}
+
 function defaultPrerequisites(provider: PiGateProvider, db: DatabaseSync, dbPath: string, piAgentDir?: string): void {
   const agentDir = piAgentDir ?? join(dirname(dbPath), '..', '.pi', 'agent');
   const ownerPaths = [
@@ -181,7 +195,7 @@ function defaultPrerequisites(provider: PiGateProvider, db: DatabaseSync, dbPath
   if (provider === 'openrouter' || (provider === 'anthropic' && formats.includes('v1'))) return;
 
   const auth = parsedObject(join(agentDir, 'auth.json'), 'placeholder-missing');
-  if (formats.includes('v2') && isPiPlaceholder(auth[provider])) return;
+  if (formats.includes('v2') && isPiPlaceholder(auth[stagedAuthJsonKey(db, provider)])) return;
   if (formats.includes('v1') && isShadowRetainedEntry(auth[provider])) return;
   throw new GateFailure('placeholder-missing');
 }

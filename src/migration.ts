@@ -1229,6 +1229,11 @@ export class Migration {
     const provider = this.ownerProvider();
     const isThisProvider = (account: unknown): boolean => isObjectRecord(account) && account.provider === provider;
     if (hasLegacyPiOwnerEntry(this.ownerMapPath, provider) && accounts.every(isThisProvider)) return true;
+    // A v1 pool document belonging entirely to another provider is not this
+    // migration's claim. Keep it byte-for-byte and continue unlinking this
+    // provider's legacy sidecar; only a document that also claims this
+    // provider is ambiguous and must fail closed.
+    if (accounts.length > 0 && !accounts.some(isThisProvider)) return false;
     const detail = accounts.some((account) => !isThisProvider(account))
       ? 'names another provider'
       : `does not record a QLB claim for ${provider} alone`;
@@ -1575,7 +1580,7 @@ export class Migration {
       const cycle = this.ensureAuthBackupCycle();
       writePiAuthBackup(this.poolFilePath, authKey, cycle);
       this.afterWrite?.('backup');
-      writePiOwnerEntry(this.ownerMapPath, this.ownerProvider(), true);
+      this.withOwnerMapLockUnlessHeld(() => writePiOwnerEntry(this.ownerMapPath, this.ownerProvider(), true));
       this.afterWrite?.('owner-entry');
       this.writeSingleGrantPlaceholder(authKey);
       this.afterWrite?.('placeholder');
@@ -2297,8 +2302,11 @@ export class Migration {
     const auth = this.readSingleGrantAuth();
     if (isPiPlaceholder(auth[authKey])) return;
     const cycle = this.ensureAuthBackupCycle();
-    writePiAuthBackup(this.poolFilePath, authKey, cycle);
-    this.afterWrite?.('backup');
+    const existing = readPiAuthBackup(this.poolFilePath, authKey);
+    if (existing?.cycleId !== cycle) {
+      writePiAuthBackup(this.poolFilePath, authKey, cycle);
+      this.afterWrite?.('backup');
+    }
     this.writeSingleGrantPlaceholder(authKey);
     this.afterWrite?.('placeholder');
   }
