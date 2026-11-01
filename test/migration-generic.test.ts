@@ -655,13 +655,58 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
           breakIt(h);
           const before = snapshotRestage(h, provider);
           kc.deleteCalls.length = 0;
-          assert.throws(() => h.mig.stage(), /journal-keychain-invalid/, name);
+          assert.throws(
+            () => h.mig.stage(),
+            (error: unknown) => (error as { code?: unknown }).code === 'journal-keychain-invalid'
+              && (error as { exitCode?: unknown }).exitCode === 3,
+            name,
+          );
           assert.deepEqual(kc.deleteCalls, [], `${name}: nothing deleted`);
           assert.deepEqual(snapshotRestage(h, provider), before, name);
           assert.ok(kc.getSync(legacy.service, legacy.account), name);
         } finally {
           h.cleanup();
         }
+      }
+    });
+
+    it(`T-KC11f [${provider}] a malformed staging file refuses before deleting the old staged copy`, () => {
+      const legacy = legacyKmCoords(provider);
+      const kc = new DeleteTrackingKeychain();
+      const h = oldPreCommitFixture(provider, 'MIRRORED', kc);
+      try {
+        writeFileSync(h.staging, '{ malformed staging owner file');
+        const before = snapshotRestage(h, provider);
+        kc.deleteCalls.length = 0;
+
+        assert.throws(
+          () => h.mig.stage(),
+          (error: unknown) => (error as { code?: unknown }).code === 'journal-keychain-invalid'
+            && (error as { exitCode?: unknown }).exitCode === 3,
+        );
+        assert.deepEqual(kc.deleteCalls, []);
+        assert.deepEqual(snapshotRestage(h, provider), before);
+        assert.ok(kc.getSync(legacy.service, legacy.account));
+      } finally {
+        h.cleanup();
+      }
+    });
+
+    it(`T-KC11g [${provider}] a missing auth.json refuses before deleting a VALIDATED journal's old staged copy`, () => {
+      const legacy = legacyKmCoords(provider);
+      const kc = new DeleteTrackingKeychain();
+      const h = oldPreCommitFixture(provider, 'VALIDATED', kc);
+      try {
+        rmSync(h.authPath);
+        const before = snapshotRestage(h, provider);
+        kc.deleteCalls.length = 0;
+
+        assert.throws(() => h.mig.stage(), /auth\.json not found/);
+        assert.deepEqual(kc.deleteCalls, []);
+        assert.deepEqual(snapshotRestage(h, provider), before);
+        assert.ok(kc.getSync(legacy.service, legacy.account));
+      } finally {
+        h.cleanup();
       }
     });
 

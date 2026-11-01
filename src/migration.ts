@@ -1727,10 +1727,20 @@ export class Migration {
       throw new Error('single-grant migration requires provider xai|kimi-coding|openai-codex');
     }
 
+    const keyName = this.authJsonKey ?? this.provider;
+    if (!existsSync(this.poolFilePath)) {
+      throw new Error(`auth.json not found: ${this.poolFilePath}`);
+    }
+
+    const raw = readFileSync(this.poolFilePath, 'utf8');
+    const parsed = parseAuthJsonGrant(raw, keyName);
+    const mtime = statSync(this.poolFilePath).mtimeMs;
+
     // OQ-2(a): an old pre-commit xai/kimi journal names the legacy per-account
-    // item. The journal is the delete authority, checked exactly as rollback
-    // checks it, so a malformed journal or a disagreeing staging file refuses
-    // before any delete. The stale staging file goes with the old item, before
+    // item. Do this only after the incoming auth.json grant has parsed, so an
+    // invalid source cannot destroy a recoverable old staged copy. The journal
+    // is the delete authority; a malformed journal or staging file refuses
+    // before any delete. The stale staging file goes with the old item before
     // the journal moves to the shared item, so every crash leaves a journal and
     // staging file that rollback and resume accept. A journal that records no
     // account names no old item, so there is nothing to delete. C9 (NATIVE)
@@ -1740,7 +1750,7 @@ export class Migration {
       && (this.provider === 'xai' || this.provider === 'kimi-coding')
       && current.detail.accounts !== undefined
     ) {
-      const { coords, label } = this.journalStagedKeychain(this.provider);
+      const { coords, label } = this.journalStagedKeychain(this.provider, true);
       const shared = sharedSingleGrantCoords(this.provider);
       if (coords.service !== shared.service || coords.account !== shared.account) {
         this.deleteStagedItem(coords, this.provider, label, 'stage');
@@ -1750,14 +1760,6 @@ export class Migration {
       }
     }
 
-    const keyName = this.authJsonKey ?? this.provider;
-    if (!existsSync(this.poolFilePath)) {
-      throw new Error(`auth.json not found: ${this.poolFilePath}`);
-    }
-
-    const raw = readFileSync(this.poolFilePath, 'utf8');
-    const parsed = parseAuthJsonGrant(raw, keyName);
-    const mtime = statSync(this.poolFilePath).mtimeMs;
     const id = accountIdForSingleGrant(this.provider, parsed);
     const label = labelForSingleGrant(this.provider, parsed);
     const extra: Record<string, unknown> = { type: parsed.type ?? 'oauth', authJsonKey: keyName };
@@ -2044,7 +2046,10 @@ export class Migration {
    * hold exactly one account, and a staging owner file that resolves to a
    * different Keychain item refuses, so every check runs before any delete.
    */
-  private journalStagedKeychain(provider: SingleGrantKeychainProvider): { coords: SingleGrantKeychainCoords; label: string } {
+  private journalStagedKeychain(
+    provider: SingleGrantKeychainProvider,
+    refuseInvalidStagingFile = false,
+  ): { coords: SingleGrantKeychainCoords; label: string } {
     const journalAccounts = parseDetail(this.store.getMigration(this.storeName)?.detail_json).accounts;
     if (!Array.isArray(journalAccounts) || journalAccounts.length !== 1) {
       throw new JournalKeychainInvalidError();
@@ -2052,6 +2057,9 @@ export class Migration {
     const meta = journalAccounts[0] as OwnerFile['accounts'][number];
     const coords = resolveSingleGrantKeychain(provider, meta);
     const staging = this.readStagingOwnerFile();
+    if (!staging && refuseInvalidStagingFile && existsSync(this.stagingPath())) {
+      throw new JournalKeychainInvalidError();
+    }
     if (staging) {
       const stagedAccounts: unknown = staging.accounts;
       if (!Array.isArray(stagedAccounts) || stagedAccounts.length !== 1) {
