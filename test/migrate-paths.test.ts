@@ -3,8 +3,10 @@ import {
   lstatSync,
   mkdtempSync,
   mkdirSync,
+  readlinkSync,
   realpathSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
@@ -12,22 +14,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
-type MigratePaths = {
-  MigratePathError: new (...args: never[]) => Error & { code: string };
-  assertSupportedPlatform(platform?: string): void;
-  validateRawMigratePath(raw: string, options: { flag: string; kind: 'file' | 'dir'; cwd: string }): string;
-  resolveMigratePath(abs: string, options: {
-    flag: string;
-    kind: 'file' | 'dir';
-    entryLeaf?: boolean;
-    fs?: object;
-  }): { physical: string; anchor: string; missingSuffix: string[]; endpoint: 'file' | 'dir' | 'missing'; leafWasSymlink: boolean };
-  resolveProtectedRoot(authJsonPathRaw: string, options: { flag: string; cwd: string; fs?: object }): unknown;
-  isInsideProtectedRoot(resolved: unknown, root: unknown): boolean;
-};
-
-// Deliberately required before this slice exists: the red run must fail at load.
-const paths = require('../src/migrate-paths') as MigratePaths;
+import * as paths from '../src/migrate-paths';
 
 function fixture(): string {
   const root = mkdtempSync(join(tmpdir(), 'qlb-migrate-paths-'));
@@ -88,14 +75,19 @@ describe('migrate path admission primitives', () => {
     });
   }));
 
-  it('13 migrate rejects cyclic symlinks and excessive symlink depth', () => withFixture((root) => {
-    const safe = join(root, 'safe');
+  it('13 migrate rejects cyclic symlinks and pins the eight-expansion cap', () => withFixture((root) => {
+    const safe = realpathSync.native(join(root, 'safe'));
     symlinkSync('b', join(safe, 'a'));
     symlinkSync('a', join(safe, 'b'));
     unsafe(() => paths.resolveMigratePath(file('a', safe), { flag: '--auth-json', kind: 'file' }), /symlink-depth-limit \(ELOOP\)/);
-    for (let index = 0; index < 9; index += 1) symlinkSync(`link-${index + 1}`, join(safe, `link-${index}`));
-    writeFileSync(join(safe, 'link-9'), '{}');
-    unsafe(() => paths.resolveMigratePath(file('link-0', safe), { flag: '--auth-json', kind: 'file' }), /symlink-depth-limit \(ELOOP\)/);
+
+    for (let index = 0; index < 8; index += 1) symlinkSync(`eight-${index + 1}`, join(safe, `eight-${index}`));
+    writeFileSync(join(safe, 'eight-8'), '{}');
+    assert.equal(paths.resolveMigratePath(file('eight-0', safe), { flag: '--auth-json', kind: 'file' }).endpoint, 'file');
+
+    for (let index = 0; index < 9; index += 1) symlinkSync(`nine-${index + 1}`, join(safe, `nine-${index}`));
+    writeFileSync(join(safe, 'nine-9'), '{}');
+    unsafe(() => paths.resolveMigratePath(file('nine-0', safe), { flag: '--auth-json', kind: 'file' }), /symlink-depth-limit \(ELOOP\)/);
   }));
 
   it('14 migrate rejects dot segments in existing symlink targets', () => withFixture((root) => {
@@ -149,8 +141,10 @@ describe('migrate path admission primitives', () => {
       return;
     }
     const protectedRoot = paths.resolveProtectedRoot(join(upper, 'auth.json'), { flag: 'QLB_PI_AUTH_JSON_PATH', cwd: join(root, 'safe') });
-    const resolved = paths.resolveMigratePath(file(`${lower}/new.json`, join(root, 'safe')), { flag: '--auth-json', kind: 'file' });
-    assert.equal(paths.isInsideProtectedRoot(resolved, protectedRoot), true);
+    const missing = paths.resolveMigratePath(file(`${lower}/new.json`, join(root, 'safe')), { flag: '--auth-json', kind: 'file' });
+    const existing = paths.resolveMigratePath(file(`${lower}/auth.json`, join(root, 'safe')), { flag: '--auth-json', kind: 'file' });
+    assert.equal(paths.isInsideProtectedRoot(missing, protectedRoot), true);
+    assert.equal(paths.isInsideProtectedRoot(existing, protectedRoot), true);
   }));
 
   it('19 migrate does not classify a prefix sibling as inside Pi', () => withFixture((root) => {
@@ -182,14 +176,18 @@ describe('migrate path admission primitives', () => {
     assert.equal(paths.isInsideProtectedRoot(resolved, protectedRoot), true);
   }));
 
-  it('21 migrate resolves a symlinked protected root', () => withFixture((root) => {
+  it('21 migrate protects both a symlinked auth leaf directory and its resolved target directory', () => withFixture((root) => {
     const live = join(root, 'live-agent');
     const safe = join(root, 'safe');
-    writeFileSync(join(live, 'auth.json'), '{}');
-    symlinkSync('live-agent', join(root, 'root-link'));
-    const protectedRoot = paths.resolveProtectedRoot(join(root, 'root-link', 'auth.json'), { flag: 'QLB_PI_AUTH_JSON_PATH', cwd: safe });
-    const resolved = paths.resolveMigratePath(file(join(live, 'new.json'), safe), { flag: '--auth-json', kind: 'file' });
-    assert.equal(paths.isInsideProtectedRoot(resolved, protectedRoot), true);
+    const elsewhere = join(root, 'elsewhere');
+    mkdirSync(elsewhere);
+    writeFileSync(join(elsewhere, 'real-auth.json'), '{}');
+    symlinkSync(join(elsewhere, 'real-auth.json'), join(live, 'auth.json'));
+    const protectedRoot = paths.resolveProtectedRoot(join(live, 'auth.json'), { flag: 'QLB_PI_AUTH_JSON_PATH', cwd: safe });
+    const linkedDirectoryCandidate = paths.resolveMigratePath(file(join(live, 'new.json'), safe), { flag: '--auth-json', kind: 'file' });
+    const targetDirectoryCandidate = paths.resolveMigratePath(file(join(elsewhere, 'new.json'), safe), { flag: '--auth-json', kind: 'file' });
+    assert.equal(paths.isInsideProtectedRoot(linkedDirectoryCandidate, protectedRoot), true);
+    assert.equal(paths.isInsideProtectedRoot(targetDirectoryCandidate, protectedRoot), true);
   }));
 
   it('22 migrate fails closed when the protected root is missing', () => withFixture((root) => {
@@ -207,11 +205,24 @@ describe('migrate path admission primitives', () => {
   }));
 
   it('23 migrate refuses lookup errors instead of treating them as outside', () => withFixture((root) => {
+    const live = join(root, 'live-agent');
     const safe = join(root, 'safe');
     const denied = Object.assign(new Error('denied'), { code: 'EACCES' });
     const io = Object.assign(new Error('io'), { code: 'EIO' });
-    unsafe(() => paths.resolveMigratePath('/safe/auth.json', { flag: '--auth-json', kind: 'file', fs: { lstatSync: () => { throw denied; }, readlinkSync: () => '', statSync: () => { throw denied; } } }), /EACCES/);
-    unsafe(() => paths.resolveMigratePath('/safe/auth.json', { flag: '--auth-json', kind: 'file', fs: { lstatSync: () => { throw io; }, readlinkSync: () => '', statSync: () => { throw io; } } }), /EIO/);
+    unsafe(() => paths.resolveMigratePath('/safe/auth.json', { flag: '--auth-json', kind: 'file', fs: { lstatSync: () => { throw denied; }, readlinkSync, statSync: () => { throw denied; } } }), /EACCES/);
+    unsafe(() => paths.resolveMigratePath('/safe/auth.json', { flag: '--auth-json', kind: 'file', fs: { lstatSync: () => { throw io; }, readlinkSync, statSync: () => { throw io; } } }), /EIO/);
+
+    symlinkSync('target', join(safe, 'readlink-error'));
+    unsafe(() => paths.resolveMigratePath(join(safe, 'readlink-error'), {
+      flag: '--auth-json', kind: 'file', fs: { lstatSync, readlinkSync: () => { throw io; }, statSync },
+    }), /EIO/);
+
+    writeFileSync(join(live, 'auth.json'), '{}');
+    const protectedRoot = paths.resolveProtectedRoot(join(live, 'auth.json'), { flag: 'QLB_PI_AUTH_JSON_PATH', cwd: safe });
+    protectedRoot.fs = { lstatSync, readlinkSync, statSync: () => { throw denied; } };
+    const candidate = paths.resolveMigratePath(file(join(live, 'new.json'), safe), { flag: '--auth-json', kind: 'file' });
+    unsafe(() => paths.isInsideProtectedRoot(candidate, protectedRoot), /EACCES/);
+
     writeFileSync(join(safe, 'not-a-directory'), '{}');
     unsafe(() => paths.resolveProtectedRoot(join(safe, 'not-a-directory', 'auth.json'), { flag: 'QLB_PI_AUTH_JSON_PATH', cwd: safe }), /ENOTDIR/);
   }));
@@ -228,13 +239,61 @@ describe('migrate path admission primitives', () => {
     const safe = join(root, 'safe');
     assert.equal(dir('/', safe), '/');
     assert.equal(dir(`${safe}/`, safe), safe);
+    unsafe(() => dir('//', safe), /double-leading slashes/);
+    unsafe(() => dir('///', safe), /double-leading slashes/);
     unsafe(() => file(`${safe}/auth.json/`, safe), /trailing slash/);
+    unsafe(() => paths.resolveMigratePath(`${safe}/auth.json/`, { flag: '--auth-json', kind: 'file' }), /trailing slash/);
   }));
 
   it('34 migrate rejects a non-UTF8 symlink target rather than decoding a different pathname', () => withFixture((root) => {
     const safe = join(root, 'safe');
     symlinkSync(Buffer.from([0xc3, 0x28]), join(safe, 'bad-link'));
     unsafe(() => paths.resolveMigratePath(file('bad-link', safe), { flag: '--auth-json', kind: 'file' }), /non-UTF-8 symlink target/);
+  }));
+
+  it('35 migrate preserves a BOM in a symlink target rather than following the BOM-stripped name', () => withFixture((root) => {
+    const safe = join(root, 'safe');
+    const bomDirectory = join(safe, '\ufefftarget');
+    mkdirSync(bomDirectory);
+    mkdirSync(join(safe, 'target'));
+    writeFileSync(join(bomDirectory, 'auth.json'), '{}');
+    symlinkSync(Buffer.from([0xef, 0xbb, 0xbf, ...Buffer.from('target')]), join(safe, 'bom-link'));
+    const protectedRoot = paths.resolveProtectedRoot(join(bomDirectory, 'auth.json'), { flag: 'QLB_PI_AUTH_JSON_PATH', cwd: safe });
+    const resolved = paths.resolveMigratePath(file('bom-link/auth.json', safe), { flag: '--auth-json', kind: 'file' });
+    assert.equal(resolved.physical, realpathSync.native(join(bomDirectory, 'auth.json')));
+    assert.equal(paths.isInsideProtectedRoot(resolved, protectedRoot), true);
+  }));
+
+  it('36 migrate refuses darwin /.vol paths in raw input, symlink targets, and protected roots', () => withFixture((root) => {
+    const safe = join(root, 'safe');
+    unsafe(() => paths.validateRawMigratePath('/.vol/1/auth.json', {
+      flag: '--auth-json', kind: 'file', cwd: safe, platform: 'darwin',
+    }), /\.vol/);
+
+    symlinkSync(Buffer.from('/.vol/1/auth.json'), join(safe, 'vol-link'));
+    unsafe(() => paths.resolveMigratePath(join(safe, 'vol-link'), {
+      flag: '--auth-json', kind: 'file', platform: 'darwin',
+    }), /\.vol/);
+    unsafe(() => paths.resolveProtectedRoot('/.vol/1/auth.json', {
+      flag: 'QLB_PI_AUTH_JSON_PATH', cwd: safe, platform: 'darwin',
+    }), /\.vol/);
+  }));
+
+  it('37 migrate finds a protected ancestor identity for deep existing and missing candidates', () => withFixture((root) => {
+    const live = join(root, 'live-agent');
+    const safe = join(root, 'safe');
+    mkdirSync(join(live, 'sub'));
+    mkdirSync(join(live, 'sub', 'deep'));
+    writeFileSync(join(live, 'auth.json'), '{}');
+    writeFileSync(join(live, 'sub', 'deep', 'existing.json'), '{}');
+    const protectedRoot = paths.resolveProtectedRoot(join(live, 'auth.json'), { flag: 'QLB_PI_AUTH_JSON_PATH', cwd: safe });
+    const existing = paths.resolveMigratePath(file(join(live, 'sub', 'deep', 'existing.json'), safe), { flag: '--auth-json', kind: 'file' });
+    const missing = paths.resolveMigratePath(file(join(live, 'sub', 'deep', 'missing.json'), safe), { flag: '--auth-json', kind: 'file' });
+    const deep = realpathSync.native(join(live, 'sub', 'deep'));
+    assert.equal(existing.anchor, deep);
+    assert.equal(missing.anchor, deep);
+    assert.equal(paths.isInsideProtectedRoot(existing, protectedRoot), true);
+    assert.equal(paths.isInsideProtectedRoot(missing, protectedRoot), true);
   }));
 
   it('refuses Windows explicitly through the exported platform check', () => {
