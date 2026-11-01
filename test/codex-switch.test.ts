@@ -3161,6 +3161,51 @@ describe('Codex watch tick — C6-21', () => {
     } finally { close(h); }
   });
 
+  it('an external reversion with a split B fences instead of logging reverted-by-codex (C6-21b r3a)', async () => {
+    const splitB = {
+      'a non-head B': () => observedDocument('b', 'b-non-head'),
+      'a wrong-identity B': () => {
+        const document = observedDocument('b', 'b-wrong-identity');
+        return { ...document, tokens: { ...document.tokens!, id_token: freshenJwt({ 'https://api.openai.com/auth': { chatgpt_user_id: 'c', chatgpt_account_id: 'account' } }) } };
+      },
+    };
+    for (const [label, makeDocument] of Object.entries(splitB)) {
+      const h = switchHarness();
+      try {
+        const watch = await committedWatch(h);
+        h.keychain.setSync(qlbKeychainService('openai-codex', 'b:account'), QLB_KEYCHAIN_ACCOUNT, JSON.stringify(makeDocument()));
+        codexWrites(h, h.a);
+        assert.deepEqual(await tick(h, watch, 30_000), { state: 'unresolved', reason: 'slot-split' }, label);
+        assert.equal((fence(h) as { reason: string }).reason, 'slot-split', label);
+        assert.equal(scalarCount(h.db, "SELECT COUNT(*) AS count FROM switch_log WHERE outcome IN ('ok', 'reverted-by-codex')"), 1, label);
+        assert.equal(watchRows(h), 1, `${label}: the watch is kept`);
+      } finally { close(h); }
+    }
+  });
+
+  it('an existing slot-split fence remains while an external reversion leaves B split (C6-21b r3a)', async () => {
+    const service = qlbKeychainService('openai-codex', 'b:account');
+    const damage = {
+      'a non-head B': (h: Harness) => splitSlot(h, 'b:account', 'b-non-head'),
+      'a missing B': (h: Harness) => h.keychain.deleteSync(service, QLB_KEYCHAIN_ACCOUNT),
+      'a corrupt B': (h: Harness) => h.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, '{not json'),
+    };
+    for (const [label, apply] of Object.entries(damage)) {
+      const h = switchHarness();
+      try {
+        const watch = await committedWatch(h);
+        apply(h);
+        assert.deepEqual(await tick(h, watch, 1_000), { state: 'unresolved', reason: 'slot-split' }, `${label}: creates the fence`);
+        const before = rows(h);
+        codexWrites(h, h.a);
+        assert.deepEqual(await tick(h, watch, 5_000), { state: 'quiet' }, label);
+        assert.equal((fence(h) as { reason: string }).reason, 'slot-split', label);
+        assert.deepEqual(rows(h), before, `${label}: no fence-resolution row`);
+        assert.equal(watchRows(h), 1, `${label}: the watch is kept`);
+      } finally { close(h); }
+    }
+  });
+
   it('an external adopt-crash state repairs B instead of fencing it (C6-21b r2)', async () => {
     const h = switchHarness();
     try {
