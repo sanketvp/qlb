@@ -62,8 +62,12 @@ export function resolveQlbHome(home?: string): string {
   return resolvedHome;
 }
 
+export function stashRootFor(home: string): string {
+  return join(home, '.qlb', 'unclaimed');
+}
+
 export function stashRoot(deps: Pick<SingleStashDeps, 'home'>): string {
-  return join(resolveQlbHome(deps.home), '.qlb', 'unclaimed');
+  return stashRootFor(resolveQlbHome(deps.home));
 }
 
 function stashService(provider: SingleStashProvider, stashId: string): string {

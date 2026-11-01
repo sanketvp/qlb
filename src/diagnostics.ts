@@ -73,7 +73,7 @@ import { claudeConfigPathCheck } from './checks/claude-config-path';
 import { claudeConfigFileCheck } from './checks/claude-config-file';
 import { claudeLocksCheck } from './checks/claude-locks';
 import { libsecretStashChecks } from './checks/stash-libsecret';
-import { stashRoot } from './single-stash';
+import { stashRootFor } from './single-stash';
 
 export type CheckLevel = 'PASS' | 'WARN' | 'FAIL' | 'INFO' | 'N/A';
 
@@ -672,7 +672,8 @@ export async function doctorQlb(
   checks.push(keychainCheck);
   checks.push(...await libsecretStashChecks(
     options.keychain ?? platformKeychain,
-    stashRoot({}),
+    // Doctor only reads; it uses the same home production consume resolves.
+    stashRootFor(qlbHomeDir()),
   ));
   if (hostPlatform === 'darwin') {
     const configValue = options.configReader ?? ((key: string) => recordedConfig.get(key) ?? null);
