@@ -2564,6 +2564,19 @@ export class Store {
       });
   }
 
+  /**
+   * The terminal row a watch wrote for one committed switch attempt.  The
+   * attempt is unique and is stored on both the committing and watch rows, so
+   * it remains a stable association after the watch row has been consumed.
+   */
+  findCodexWatchCompletion(switchId: number, attempt: string): { outcome: string; detail: string | null } | null {
+    const row = this.db.prepare(`SELECT outcome, detail FROM switch_log
+      WHERE provider = 'openai-codex' AND id > ?
+        AND CASE WHEN json_valid(steps_json) THEN json_extract(steps_json, '$.attempt') END = ?
+      ORDER BY id DESC LIMIT 1`).get(switchId, attempt) as { outcome: string; detail: string | null } | undefined;
+    return row ?? null;
+  }
+
   /** Atomically record a watch reversion and consume its watch row. No committed_at: findCodexSwitchByAttempt still finds the ok commit. */
   commitCodexWatchRevert(input: {
     watch: { switchId: number; outgoing: string; target: string; trigger: string };

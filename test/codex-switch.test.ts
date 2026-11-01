@@ -39,7 +39,7 @@ import {
   withCodexSwitchJournalOwner,
   writeCodexSwitchJournal,
 } from '../src/codex-switch';
-import { ClaudeCodeLockTimeout, codexAuthLockDir, withCodexAuthLock } from '../src/cc-locks';
+import { ClaudeCodeLockTimeout, CodexAuthLockCompromised, codexAuthLockDir, withCodexAuthLock } from '../src/cc-locks';
 import { codexLockPaths, consumeCodexSlot, withCodexSwitchLock } from '../src/codex-consume';
 import { accessExpiry, codexFingerprint, codexIdentity, readCodexAuthStable, readCodexAuthStableWithStat, writeCodexAuthAtomic, type CodexAuthDocument } from '../src/codex-auth';
 import { CodexStashUnverifiable, importActiveCodexSlot } from '../src/codex-slots';
@@ -3728,6 +3728,66 @@ describe('Codex watch tick — C6-21', () => {
         });
         assert.equal(result.outcome, 'ok');
         assert.equal(watchRows(h), 1);
+      } finally { close(h); }
+    });
+
+    it('a foreground lock compromise re-reads a committed revert, but keeps a quiet watch pending', async () => {
+      const h = switchHarness();
+      try {
+        let clock = 1_700_000_000_000;
+        const store = Object.create(h.store) as typeof h.store;
+        store.commitCodexWatchRevert = (input) => {
+          const id = h.store.commitCodexWatchRevert(input);
+          throw new CodexAuthLockCompromised();
+          return id;
+        };
+        const reverted = await h.runWith({ store, now: () => clock, sleep: async (ms) => {
+          clock += ms;
+          if (clock === 1_700_000_001_000) codexWrites(h, observedDocument('a', 'a-before-compromise'));
+        } });
+        assert.equal(reverted.outcome, 'reverted-by-codex');
+        assert.deepEqual(reverted.watch, { state: 'stopped', reason: 'reverted-by-codex' });
+        assert.equal(reverted.lockLostAfterCommit, true);
+        assert.equal(watchRows(h), 0);
+
+        const quiet = switchHarness();
+        try {
+          let quietClock = 1_700_000_000_000;
+          let foreground = false;
+          const quietStore = Object.create(quiet.store) as typeof quiet.store;
+          quietStore.recordCodexObservation = (input) => {
+            const observation = quiet.store.recordCodexObservation(input);
+            if (foreground) throw new CodexAuthLockCompromised();
+            return observation;
+          };
+          const result = await quiet.runWith({ store: quietStore, now: () => quietClock, sleep: async (ms) => {
+            foreground = true; quietClock += ms;
+          } });
+          assert.equal(result.outcome, 'ok');
+          assert.equal(result.watch?.state, 'pending');
+          assert.equal(result.lockLostAfterCommit, true);
+          assert.equal(watchRows(quiet), 1);
+        } finally { close(quiet); }
+      } finally { close(h); }
+    });
+
+    it('runDueCodexWatches uses the live in-tick clock after lock acquisition', async () => {
+      const h = switchHarness();
+      try {
+        const result = await h.runWith({ sleep: async () => undefined });
+        assert.equal(result.outcome, 'ok');
+        const row = h.db.prepare('SELECT until FROM codex_watch').get() as { until: number };
+        let clock = row.until + 59_999;
+        codexWrites(h, observedDocument('a', 'overdue-during-lock-wait'));
+        const before = switchRows(h.db);
+        await runDueCodexWatches(h.deps({
+          authPath: h.authPath, dbPath: h.store.dbPath, journalDir: join(h.root, 'journal'), keychain: h.keychain,
+          slots: h.slots as never, list: async () => [], readLive: () => readCodexAuthStableWithStat(h.authPath, { delayMs: 0 }),
+          authLockOptions: { home: h.root, timeoutMs: 50, retryMinMs: 1, retryJitterMs: 1 }, now: () => clock,
+          hooks: { afterWatchLock: () => { clock += 1; } },
+        }), clock);
+        assert.deepEqual(switchRows(h.db), before, 'the overdue tick writes no retroactive revert');
+        assert.equal(watchRows(h), 0);
       } finally { close(h); }
     });
 
