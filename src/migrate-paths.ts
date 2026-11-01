@@ -49,13 +49,13 @@ export type ResolvedMigratePath = {
 
 type DirectoryIdentity = { dev: bigint; ino: bigint };
 
+type ProtectedRootIdentities = readonly [DirectoryIdentity, ...DirectoryIdentity[]];
+
 export type ProtectedRoot = {
   /** Directory containing the configured auth-path spelling. */
   physical: string;
-  /** Compatibility alias for the configured auth-path directory identity. */
-  identity: DirectoryIdentity;
   /** Both the configured auth directory and a followed auth-leaf target directory. */
-  identities: readonly DirectoryIdentity[];
+  identities: ProtectedRootIdentities;
   /** Kept with the root so identity checks use the same injectable filesystem. */
   fs: MigratePathFs;
   flag: string;
@@ -97,12 +97,12 @@ function assertNoDotSegments(value: string, flag: string, detail = 'dot segments
   if (value.split('/').some((segment) => segment === '.' || segment === '..')) pathError(flag, detail);
 }
 
-/** Validate an already-absolute accepted-path spelling without touching the filesystem. */
-function assertNoDarwinVol(value: string, flag: string, platform: string): void {
-  if (platform !== 'darwin') return;
-  const firstComponent = (value.startsWith('/') ? value.slice(1) : value).split('/')[0];
-  // volfs can resolve /.vol/<dev>/<ino> even when an earlier lstat says ENOENT.
-  if (firstComponent === '.vol') pathError(flag, 'darwin /.vol paths are not supported');
+/** Refuse Darwin root namespaces whose kernel lookup may not match ordinary directory walking. */
+function assertNoDarwinReservedRootEntry(value: string, flag: string, platform: string): void {
+  if (platform !== 'darwin' || !value.startsWith('/')) return;
+  const firstComponent = value.slice(1).split('/')[0];
+  // Includes volfs and XNU lookup prefixes such as /.nofollow and /.resolve.
+  if (firstComponent.startsWith('.')) pathError(flag, 'reserved root entry');
 }
 
 function assertAbsoluteGrammar(value: string, flag: string, platform: string = process.platform): void {
@@ -111,7 +111,7 @@ function assertAbsoluteGrammar(value: string, flag: string, platform: string = p
   if (value !== '/' && value.includes('//')) pathError(flag, 'repeated separators are not supported');
   if (value !== '/' && value.endsWith('/')) pathError(flag, 'path has a trailing slash');
   assertNoDotSegments(value, flag);
-  assertNoDarwinVol(value, flag, platform);
+  assertNoDarwinReservedRootEntry(value, flag, platform);
 }
 
 function stripDirectoryTrailingSeparators(value: string): string {
@@ -134,7 +134,7 @@ export function validateRawMigratePath(raw: string, options: ValidateRawMigrateP
   if (raw.startsWith('//')) pathError(flag, 'double-leading slashes are not supported');
   if (raw !== '/' && raw.includes('//')) pathError(flag, 'repeated separators are not supported');
   assertNoDotSegments(raw, flag);
-  assertNoDarwinVol(raw, flag, platform);
+  assertNoDarwinReservedRootEntry(raw, flag, platform);
 
   if (kind === 'file' && raw.endsWith('/')) pathError(flag, 'file path has a trailing slash');
   const acceptedRaw = kind === 'dir' ? stripDirectoryTrailingSeparators(raw) : raw;
@@ -195,7 +195,7 @@ function symlinkTarget(value: string | Buffer, flag: string, platform: string): 
   if (body.split('/').some((segment) => segment === '.' || segment === '..')) {
     pathError(flag, 'symlink target contains dot segments');
   }
-  assertNoDarwinVol(target, flag, platform);
+  assertNoDarwinReservedRootEntry(target, flag, platform);
   return { absolute: target.startsWith('/'), components: body.split('/') };
 }
 
@@ -282,7 +282,12 @@ function identityOf(path: string, fs: MigratePathFs, flag: string): DirectoryIde
   }
 }
 
-/** Resolve and require the existing directory that contains the configured Pi auth path. */
+/**
+ * Resolve the configured auth directory and any followed auth-leaf target anchor.
+ * Throws MigratePathError for malformed/reserved paths, a missing or non-directory
+ * protected root, lookup/identity failures, and every auth-leaf resolution failure
+ * (including unsafe links, depth exhaustion, or a non-regular existing endpoint).
+ */
 export function resolveProtectedRoot(authJsonPathRaw: string, options: ResolveProtectedRootOptions): ProtectedRoot {
   const { flag, cwd, platform = process.platform } = options;
   const auth = validateRawMigratePath(authJsonPathRaw, { flag, kind: 'file', cwd, platform });
@@ -292,20 +297,16 @@ export function resolveProtectedRoot(authJsonPathRaw: string, options: ResolvePr
   const authTarget = resolveMigratePath(auth, { flag, kind: 'file', fs, platform });
   const identity = identityOf(root.physical, fs, flag);
   const targetIdentity = identityOf(authTarget.anchor, fs, flag);
-  const identities = identity.dev === targetIdentity.dev && identity.ino === targetIdentity.ino
+  const identities: ProtectedRootIdentities = identity.dev === targetIdentity.dev && identity.ino === targetIdentity.ino
     ? [identity]
     : [identity, targetIdentity];
-  return {
-    physical: root.physical,
-    identity,
-    identities,
-    fs,
-    flag,
-  };
+  if (identities.length === 0) pathError(flag, 'protected root has no identities');
+  return { physical: root.physical, identities, fs, flag };
 }
 
 /** Compare directory device/inode identities, including the candidate anchor itself. */
 export function isInsideProtectedRoot(resolved: ResolvedMigratePath, root: ProtectedRoot): boolean {
+  if (root.identities.length === 0) pathError(root.flag, 'protected root has no identities');
   let current = resolved.anchor;
   while (true) {
     const identity = identityOf(current, root.fs, root.flag);
