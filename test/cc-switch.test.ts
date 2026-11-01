@@ -203,8 +203,8 @@ describe('Claude switch Phase A (K5-4)', () => {
 
   it('skips Phase-A freshening for republish', async () => {
     const subject = await fixture();
-    await subject.slots.writeSlot('account-b', credential('b', NOW + 10 * 60_000), { cause: 'post' });
-    const result = await prepareClaudeSwitch(subject.deps, { ...manual, republish: true });
+    await subject.slots.writeSlot('account-a', credential('a', NOW + 10 * 60_000), { cause: 'post' });
+    const result = await prepareClaudeSwitch(subject.deps, { to: 'account-a', trigger: 'manual', republish: true });
     assert.equal('active' in result, true);
     assert.equal(subject.posts(), 0);
   });
@@ -472,13 +472,6 @@ describe('Claude switch transaction (K5-5)', () => {
     await subject.backend.delete(subject.paths.keychainService, 'fixture-user');
     const result = await switchClaude(subject.deps, manual);
     assert.deepEqual({ outcome: result.outcome, reason: result.reason }, { outcome: 'refused', reason: 'live-credential-empty' });
-    assert.equal(existsSync(join(subject.deps.journalDir!, 'switch-anthropic.json')), false);
-  });
-
-  it('republish is unavailable before any transaction write', async () => {
-    const subject = await transactionFixture();
-    const result = await switchClaude(subject.deps, { ...manual, republish: true });
-    assert.deepEqual({ outcome: result.outcome, reason: result.reason, exitCode: result.exitCode }, { outcome: 'refused', reason: 'republish-unavailable', exitCode: 3 });
     assert.equal(existsSync(join(subject.deps.journalDir!, 'switch-anthropic.json')), false);
   });
 

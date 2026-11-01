@@ -56,7 +56,8 @@ import type { Store } from './store';
 
 export type ClaudeSwitchPreconditionReason =
   | 'active-login-unset' | 'target-missing' | 'target-dead' | 'target-archived'
-  | 'breaker-open' | 'cswap-process-alive' | 'cswap-process-check-failed';
+  | 'breaker-open' | 'cswap-process-alive' | 'cswap-process-check-failed'
+  | 'republish-not-active' | 'republish-live-not-own';
 
 export type ClaudeSwitchPhaseAReason = ClaudeSwitchPreconditionReason | 'claude:config-file'
   | 'live-credential-empty' | 'live-credential-unreadable' | 'target-unreadable' | `freshen-${string}`;
@@ -147,7 +148,9 @@ function refused(reason: ClaudeSwitchPreconditionReason): Extract<ClaudeSwitchPr
 function activeAccount(deps: ClaudeSwitchDeps): string | null { const accountId = deps.store.getActiveLogin('anthropic')?.accountId; return accountId && deps.slots.getSlot(accountId) ? accountId : null; }
 
 export function checkClaudeSwitchPreconditions(deps: ClaudeSwitchDeps, input: SwitchClaudeInput): ClaudeSwitchPreconditionsResult {
-  if (activeAccount(deps) === null) return refused('active-login-unset');
+  const active = activeAccount(deps);
+  if (active === null) return refused('active-login-unset');
+  if (input.republish && input.to !== active) return refused('republish-not-active');
   const target = deps.slots.getSlot(input.to);
   if (target === null) return refused('target-missing');
   if (target.dead) return refused('target-dead');
@@ -392,7 +395,6 @@ async function switchClaudeAttempt(deps: ClaudeSwitchDeps, input: SwitchClaudeIn
   }
   const checked = checkClaudeSwitchPreconditions(deps, input);
   if (checked.kind === 'refused') return refusal(deps, input, attempt, activeAccount(deps), checked.reason);
-  if (input.republish) return refusal(deps, input, attempt, activeAccount(deps), 'republish-unavailable');
   const prepared = await prepareClaudeSwitch(deps, input, true);
   if ('kind' in prepared) {
     if (prepared.kind === 'refused') return refusal(deps, input, attempt, activeAccount(deps), prepared.reason);
@@ -432,7 +434,7 @@ async function switchClaudeAttempt(deps: ClaudeSwitchDeps, input: SwitchClaudeIn
           const lockedCheck = checkClaudeSwitchPreconditions(deps, input);
           if (lockedCheck.kind === 'refused') return refusal(deps, input, attempt, from, lockedCheck.reason);
           const target = deps.slots.getSlot(input.to)!;
-          if (from === input.to) {
+          if (!input.republish && from === input.to) {
             try {
               deps.store.recordSwitch({ ts: deps.now(), provider: 'anthropic', fromAccount: from, toAccount: input.to, trigger: input.trigger, outcome: 'noop', injected: switchWasInjected(deps, input), stepsJson: JSON.stringify({ attempt }) });
             } catch { warn(deps, 'could not record noop Claude switch'); }
@@ -449,9 +451,12 @@ async function switchClaudeAttempt(deps: ClaudeSwitchDeps, input: SwitchClaudeIn
           const outgoing = { accountId: outgoingSlot.accountId, email: outgoingSlot.email ?? null, orgUuid: outgoingSlot.orgUuid ?? null, credential: await readSlotOrNull(deps, from) };
           let classified;
           try { classified = (deps.classifyOutgoing ?? classifyOutgoingCredential)({ outgoing, slots: prepared.slots, liveCredential: outgoingLive, provenance: prepared.prefetch, probeVerdict: input.probeVerdict }); } catch (error) { return failed(deps, input, attempt, from, 'outgoing-backup-failed', writeError(error, 'keychain-write-failed'), state, 5); }
-          if (classified.kind === 'own-family' || classified.kind === 'own-rotated' || classified.kind === 'unresolved') {
+          if (input.republish && classified.kind !== 'own-bytes' && classified.kind !== 'own-family' && classified.kind !== 'own-rotated') {
+            return refusal(deps, input, attempt, from, 'republish-live-not-own');
+          }
+          if (classified.kind === 'own-family' || classified.kind === 'own-rotated' || (!input.republish && classified.kind === 'unresolved')) {
             try { await deps.slots.writeSlot(from, outgoingLive, { cause: 'adopt', by: deps.by, evidence: classified.kind === 'own-rotated' ? 'oracle' : classified.kind === 'unresolved' ? null : 'lineage' }); } catch (error) { return failed(deps, input, attempt, from, 'outgoing-backup-failed', writeError(error, 'keychain-write-failed'), state, 5, undefined, classified.kind); }
-          } else if (classified.kind === 'foreign' || classified.kind === 'alien' || classified.kind === 'known-foreign' || (classified.kind === 'foreign-synced' && prepared.slots.find((slot) => slot.accountId === classified.foreignSlotId)?.credential !== outgoingLive)) {
+          } else if (!input.republish && (classified.kind === 'foreign' || classified.kind === 'alien' || classified.kind === 'known-foreign' || (classified.kind === 'foreign-synced' && prepared.slots.find((slot) => slot.accountId === classified.foreignSlotId)?.credential !== outgoingLive))) {
             const stashId = (deps.stashTimestamp ?? (() => defaultStashTimestamp(deps.now())))();
             try {
               await deps.slots.stashUnclaimed(stashId, outgoingLive, undefined, classified.foreignSlotId ?? undefined);
@@ -467,9 +472,10 @@ async function switchClaudeAttempt(deps: ClaudeSwitchDeps, input: SwitchClaudeIn
             }
           } else if (classified.kind === 'own-bytes' || classified.kind === 'foreign-synced') {
             // These outgoing kinds are intentionally retained in place.
+          } else if (input.republish) {
+            return refusal(deps, input, attempt, from, 'republish-live-not-own');
           } else {
-            const unexpectedKind: never = classified.kind;
-            return refusal(deps, input, attempt, from, `outgoing-unrouted:${String(unexpectedKind)}`);
+            return refusal(deps, input, attempt, from, `outgoing-unrouted:${classified.kind}`);
           }
           state.started.push(5); await deps.hooks?.afterStep5?.();
 
@@ -485,7 +491,7 @@ async function switchClaudeAttempt(deps: ClaudeSwitchDeps, input: SwitchClaudeIn
           const owner = deps.journalOwner ?? { pid: process.pid, lstart: await processLstart(process.pid) ?? '' };
           try {
             ownerHeld.assertHeld();
-            createClaudeSwitchJournal({ v: 1, provider: 'anthropic', attemptId: attempt, from, to: input.to, trigger: input.trigger, by: deps.by, republish: false, injected: switchWasInjected(deps, input), detail: null, decision: input.decision ?? noDecision(), outgoingKind: classified.kind, bindingJson: input.bindingJson ?? null, step: 6, stagedBlobService, stagedAccount: 'qlb', stagedWritten: false, keychainService: paths.keychainService, configPath: paths.globalConfigPath, configText: null, configWrittenHash: null, fromOauthAccount: null, credentialsWrittenHash: null, credentialsWriteStarted: false, credentialsWritten: false, configWriteStarted: false, configWritten: false, closed: null, startedAt: deps.now(), owner }, options);
+            createClaudeSwitchJournal({ v: 1, provider: 'anthropic', attemptId: attempt, from, to: input.to, trigger: input.trigger, by: deps.by, republish: input.republish === true, injected: switchWasInjected(deps, input), detail: input.republish ? 'republish' : null, decision: input.decision ?? noDecision(), outgoingKind: classified.kind, bindingJson: input.bindingJson ?? null, step: 6, stagedBlobService, stagedAccount: 'qlb', stagedWritten: false, keychainService: paths.keychainService, configPath: paths.globalConfigPath, configText: null, configWrittenHash: null, fromOauthAccount: null, credentialsWrittenHash: null, credentialsWriteStarted: false, credentialsWritten: false, configWriteStarted: false, configWritten: false, closed: null, startedAt: deps.now(), owner }, options);
             deps.crashAt?.('after-journal');
             await writeStagedRollback(live.backend, stagedBlobService, outgoingLive);
             journalUpdate(ownerHeld, { stagedWritten: true }, options);
@@ -549,7 +555,7 @@ async function switchClaudeAttempt(deps: ClaudeSwitchDeps, input: SwitchClaudeIn
           let switchId: number;
           try {
             await deps.hooks?.beforeStep9?.();
-            switchId = deps.store.commitClaudeSwitch({ now: deps.now(), fromAccount: from, toAccount: input.to, trigger: input.trigger, setBy: input.trigger === 'manual' ? 'manual' : 'auto', attempt, outgoingKind: classified.kind, bindingJson: input.bindingJson ?? null, stepsJson: JSON.stringify(state), publishedAt, injected: switchWasInjected(deps, input), detail: null, republish: false, decision: input.decision ?? noDecision(), beforeCommit: () => { if (deps.injectFailStep === 9) throw new InjectedFailStep(9); } });
+            switchId = deps.store.commitClaudeSwitch({ now: deps.now(), fromAccount: from, toAccount: input.to, trigger: input.trigger, setBy: input.trigger === 'manual' ? 'manual' : 'auto', attempt, outgoingKind: classified.kind, bindingJson: input.bindingJson ?? null, stepsJson: JSON.stringify(state), publishedAt, injected: switchWasInjected(deps, input), detail: input.republish ? 'republish' : null, republish: input.republish === true, decision: input.decision ?? noDecision(), beforeCommit: () => { if (deps.injectFailStep === 9) throw new InjectedFailStep(9); } });
             state.started.push(9); deps.crashAt?.('after-commit');
           } catch (error) {
             if (isCrash(error)) throw error;
