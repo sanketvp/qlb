@@ -2,11 +2,12 @@
 // Credential bytes live only in the Keychain and the 0600 baseline file.
 
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { execFileSync } from 'node:child_process';
 
 import { atomicWriteText } from './fsutil';
+import { parseCredentialBlob } from './anthropic-oauth';
 import { ADAPTER_ACCOUNT_IDS } from './migration';
 import { isCredentialNotFound } from './credential-backends';
 import { isNativeOpenRouterKeyNotFound, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, type KeychainBackend } from './keychain';
@@ -24,7 +25,7 @@ const JOURNAL_PHASES = ['started', 'baseline', 'credential-saved', 'consumption-
 type JournalPhase = (typeof JOURNAL_PHASES)[number];
 type CrashPoint = 'baseline' | 'credential-saved' | 'placeholder' | 'publishing' | 'owner-entry' | 'before-committed' | 'not-applicable' | 'phase-dropped' | 'consumption-recorded' | 'pool-moved' | 'migrated-at' | 'journal-cleared' | 'entry-restored' | 'pool-rewritten' | 'rows-deleted' | 'pool-dir-restored';
 
-export interface PiMigratePaths { authJsonPath: string; ownerPath: string; journalPath: string; baselineDir: string; }
+export interface PiMigratePaths { authJsonPath: string; ownerPath: string; journalPath: string; baselineDir: string; poolFilePath: string; poolLockDir: string; extensionsDir: string; disabledExtensionsDir: string; }
 export interface AuthLockTiming { staleMs?: number; retries?: number; retryMs?: number; now?: () => number; }
 export interface PiMigrateDeps {
   keychain: Pick<KeychainBackend, 'getSync' | 'setSync' | 'deleteSync'>;
@@ -51,17 +52,28 @@ function assertEnabledProvider(provider: PiMigrateProvider, enabled: ReadonlySet
 }
 function assertProviderImplemented(provider: PiMigrateProvider): void {
   // Anthropic remains gated until its no-import path lands. OpenAI Codex is
-  // implemented behind the enabledProviders test seam by P7-2.
+  // Anthropic migrate remains gated until P7-6; its rollback is available
+  // behind the enabledProviders test seam from P7-5.
   if (!isPiSingleProvider(provider) && provider !== 'openai-codex') throw refusal('provider-not-enabled');
 }
 function assertRollbackProviderImplemented(provider: PiMigrateProvider): void {
-  if (!isPiSingleProvider(provider) && provider !== 'openai-codex') throw refusal('provider-not-enabled');
+  if (!isPiSingleProvider(provider) && provider !== 'openai-codex' && provider !== 'anthropic') throw refusal('provider-not-enabled');
 }
 function requireStore(provider: PiMigrateProvider, deps: PiMigrateDeps): void { if (isNoImportProvider(provider) && !deps.store) throw refusal('store-required'); }
 
 /** authJsonPath may be overridden; QLB state always stays below qlbHome. */
-export function defaultPiMigratePaths(home: string = qlbHomeDir(), authJsonPath = join(home, '.pi', 'agent', 'auth.json')): PiMigratePaths {
-  return { authJsonPath, ownerPath: join(dirname(authJsonPath), 'qlb-owner.json'), journalPath: join(home, '.qlb', 'journal'), baselineDir: join(home, '.qlb', 'backups', 'pi-auth') };
+export function defaultPiMigratePaths(home: string = qlbHomeDir(), authJsonPath = join(home, '.pi', 'agent', 'auth.json'), poolFilePath = join(dirname(authJsonPath), 'anthropic-pool.json')): PiMigratePaths {
+  const extensionsDir = join(dirname(authJsonPath), 'extensions');
+  return {
+    authJsonPath,
+    ownerPath: join(dirname(authJsonPath), 'qlb-owner.json'),
+    journalPath: join(home, '.qlb', 'journal'),
+    baselineDir: join(home, '.qlb', 'backups', 'pi-auth'),
+    poolFilePath,
+    poolLockDir: join(dirname(poolFilePath), 'anthropic-pool.pool.lock'),
+    extensionsDir,
+    disabledExtensionsDir: join(dirname(extensionsDir), 'extensions-disabled-by-qlb'),
+  };
 }
 export function piPlaceholder(now = Date.now()): JsonObject { return { type: 'oauth', access: 'qlb-managed', refresh: '', expires: now + 10 * 365 * 24 * 60 * 60 * 1000 }; }
 function asObject(value: unknown, message: string): JsonObject { if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(message); return value as JsonObject; }
@@ -237,7 +249,21 @@ export function assertDirOutsideGitWorktree(dir: string, qlbHome: string): void 
   }
   try { const top = String(execFileSync('git', ['-C', probe, 'rev-parse', '--show-toplevel'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })).trim(); if (top) throw refusal('pi-path-in-git-worktree', `refusing Pi migration write inside git work tree: ${resolved}`); } catch (error) { if ((error as { code?: unknown }).code === 'pi-path-in-git-worktree') throw error; }
 }
-function checkPaths(paths: PiMigratePaths, deps: PiMigrateDeps): void { for (const path of [paths.authJsonPath, paths.ownerPath]) { deps.checkWritablePath?.(path); assertOutsideGitWorktree(path, qlbHomeDir()); } }
+function checkPaths(paths: PiMigratePaths, deps: PiMigrateDeps, provider?: PiMigrateProvider): void {
+  for (const path of [paths.authJsonPath, paths.ownerPath, ...(provider === 'anthropic' ? [paths.poolFilePath] : [])]) {
+    deps.checkWritablePath?.(path); assertOutsideGitWorktree(path, qlbHomeDir());
+  }
+  if (provider === 'anthropic') {
+    for (const dir of [paths.extensionsDir, paths.disabledExtensionsDir]) {
+      try { assertDirOutsideGitWorktree(dir, qlbHomeDir()); } catch (error) {
+        if ((error as { code?: unknown }).code === 'pi-path-in-git-worktree') {
+          throw refusal('pi-extensions-dir-in-git-worktree', '~/.pi/agent/extensions resolves into a git work tree; re-link it as a real directory of per-extension symlinks (P7-OQ-12), then re-run');
+        }
+        throw error;
+      }
+    }
+  }
+}
 export function isPiQlbOwnerEntry(entry: unknown): boolean {
   return !!entry && typeof entry === 'object' && !Array.isArray(entry) && (entry as JsonObject).mode === 'qlb';
 }
@@ -279,7 +305,8 @@ function genericMigrationPathFacts(
 
 /** S0.6: generic ownership must be quiescent before P7a may begin. */
 function genericMigrationAtRest(provider: PiMigrateProvider, paths: PiMigratePaths, deps: PiMigrateDeps, ownJournal: Journal | null): boolean {
-  const row = deps.store?.getMigration(`pi-${provider}`);
+  const genericName = provider === 'anthropic' ? 'pi-pool' : `pi-${provider}`;
+  const row = deps.store?.getMigration(genericName);
   let detail: JsonObject | undefined;
   if (row) {
     if (row.state !== 'NATIVE' && row.state !== 'VALIDATED') return false;
@@ -288,12 +315,17 @@ function genericMigrationAtRest(provider: PiMigrateProvider, paths: PiMigratePat
 
   const pathFacts = genericMigrationPathFacts(provider, paths, detail);
   let canonicalOwnerClaim = false;
-  try { canonicalOwnerClaim = isPiQlbOwnerEntry(readPiOwnerProviders(paths.ownerPath)[provider]); } catch { /* readPiOwnerProviders fails closed before publication */ }
+  try { canonicalOwnerClaim = isPiQlbOwnerEntry(readPiOwnerProviders(paths.ownerPath)[provider]); } catch { /* owner format is validated by the operation before writing */ }
   const ownPublishedClaim = ownJournal?.phase === 'publishing' || ownJournal?.phase === 'published' || ownJournal?.phase === 'committed'
     || deps.store?.getConfig(`pi.${provider}.state`) === 'migrated';
+  const anthropicPathFacts = provider === 'anthropic' && (
+    existsSync(join(dirname(paths.ownerPath), 'qlb-owner.json.staging'))
+    || existsSync(`${paths.poolFilePath}.pre-qlb`)
+  );
   return !pathFacts.hasStaging
     && !pathFacts.hasLegacySidecar
     && !pathFacts.hasCustomOwnerFile
+    && !anthropicPathFacts
     && (!canonicalOwnerClaim || ownPublishedClaim)
     && detail?.intent !== 'rollback'
     && detail?.rollbackDecision == null
@@ -586,6 +618,86 @@ export function migratePiSingleProvider(provider: PiMigrateProvider, paths: PiMi
   return { provider, state, resumed, wouldWrite };
 }
 
+function lstatPresent(path: string): boolean {
+  try { lstatSync(path); return true; } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw error;
+  }
+}
+
+/** S49's owner-first Anthropic rollback; P7-8 later adds pool-file rewriting. */
+function rollbackAnthropic(paths: PiMigratePaths, deps: PiMigrateDeps, refresh: () => void): string[] {
+  const store = deps.store!;
+  const journal = readJournal(paths, 'anthropic');
+  const state = store.getConfig('pi.anthropic.state');
+  if (state !== 'migrated' && !journal || state === 'not-applicable') throw refusal('pi-not-migrated');
+  if (!genericMigrationAtRest('anthropic', paths, deps, journal)) {
+    throw refusal('owned-by-generic-migrate', 'generic pool migration owns anthropic; run qlb migrate rollback --provider anthropic first');
+  }
+  // This deliberately happens after ownership evidence and the generic guard:
+  // v1 ownership is a conversion error, not evidence that P7 ran.
+  readPiOwnerProviders(paths.ownerPath);
+  const livePoolPath = join(paths.extensionsDir, 'anthropic-pool');
+  const disabledPoolPath = join(paths.disabledExtensionsDir, 'anthropic-pool');
+  const livePoolPresent = lstatPresent(livePoolPath);
+  const disabledPoolPresent = lstatPresent(disabledPoolPath);
+  if (livePoolPresent && disabledPoolPresent) throw refusal('anthropic-pool-dir-ambiguous');
+
+  const auth = readAuth(paths.authJsonPath);
+  const current = auth.anthropic;
+  const needsRestore = current === undefined || isPiPlaceholder(current);
+  let restore: JsonObject | undefined;
+  const warnings: string[] = [];
+  if (needsRestore) {
+    const consumer = store.getConfig('pi.anthropic.baselineConsumedBy') ?? '';
+    const consumerRecorded = !journal || phaseAtLeast(journal.phase, 'consumption-recorded');
+    if (consumer && consumerRecorded) {
+      const live = store.listAnthropicSlotLineageChains().some((slot) => slot.accountId === consumer);
+      if (!live) {
+        warnings.push(`consumer-slot-gone:anthropic:${consumer}`);
+      } else {
+        let raw: string | undefined;
+        try { raw = deps.keychain.getSync(qlbKeychainService('anthropic', consumer), QLB_KEYCHAIN_ACCOUNT); } catch (error) {
+          if (isCredentialNotFound(error)) throw refusal('claude-slot-unreadable');
+          throw refusal('claude-slot-unreadable');
+        }
+        const oauth = raw ? parseCredentialBlob(raw)?.oauth : null;
+        if (!oauth || typeof oauth.accessToken !== 'string' || !oauth.accessToken || typeof oauth.refreshToken !== 'string' || !oauth.refreshToken || typeof oauth.expiresAt !== 'number' || !Number.isFinite(oauth.expiresAt)) {
+          throw refusal('claude-slot-unreadable');
+        }
+        restore = { type: 'oauth', access: oauth.accessToken, refresh: oauth.refreshToken, expires: oauth.expiresAt };
+      }
+    }
+    if (!restore) {
+      const baselineCaptured = state === 'migrated' || !!journal && phaseAtLeast(journal.phase, 'baseline');
+      if (baselineCaptured) {
+        const file = baselinePath(paths, 'anthropic');
+        if (!existsSync(file)) throw refusal('no-restore-source');
+        try { restore = parseOAuth(JSON.parse(readFileSync(file, 'utf8')), 'anthropic'); } catch { throw refusal('baseline-unreadable'); }
+      } else if (isPiPlaceholder(current)) {
+        throw refusal('no-restore-source');
+      }
+    }
+  }
+
+  refresh(); writePiOwnerEntry(paths.ownerPath, 'anthropic', false); refresh(); deps.afterWrite?.('owner-entry');
+  if (needsRestore && restore) {
+    auth.anthropic = restore; refresh(); writeJson(paths.authJsonPath, auth); refresh();
+    if (JSON.stringify(readAuth(paths.authJsonPath).anthropic) !== JSON.stringify(restore)) throw new Error('Pi credential rollback verification failed');
+    deps.afterWrite?.('entry-restored');
+  }
+  if (disabledPoolPresent && !livePoolPresent) {
+    refresh(); mkdirSync(paths.extensionsDir, { recursive: true, mode: 0o700 }); renameSync(disabledPoolPath, livePoolPath); deps.afterWrite?.('pool-dir-restored');
+  } else {
+    deps.afterWrite?.('pool-dir-restored');
+  }
+  refresh(); store.setConfig('pi.anthropic.state', '');
+  refresh(); store.setConfig('pi.anthropic.migratedAt', '');
+  refresh(); store.setConfig('pi.anthropic.baselineConsumedBy', '');
+  refresh(); rmSync(journalPath(paths, 'anthropic'), { force: true });
+  return warnings;
+}
+
 /** S49 rollback for P7a's xai/kimi/openrouter subset. */
 export function rollbackPiSingleProvider(provider: PiMigrateProvider, paths: PiMigratePaths = defaultPiMigratePaths(), deps: PiMigrateDeps): PiMigrateResult {
   assertPiMigrateProvider(provider);
@@ -593,9 +705,14 @@ export function rollbackPiSingleProvider(provider: PiMigrateProvider, paths: PiM
   assertEnabledProvider(provider, enabled);
   requireStore(provider, deps);
   assertRollbackProviderImplemented(provider);
-  checkPaths(paths, deps);
+  checkPaths(paths, deps, provider);
   const lock = deps.withAuthLock ?? ((path, fn) => withPiAuthLock(path, fn, deps.authLockTiming));
+  let warnings: string[] | undefined;
   underAuthLock(lock, paths.authJsonPath, (refresh) => {
+    if (provider === 'anthropic') {
+      warnings = rollbackAnthropic(paths, deps, refresh);
+      return;
+    }
     if (provider === 'openai-codex') {
       const journal = readJournal(paths, provider);
       const stateMigrated = deps.store?.getConfig('pi.openai-codex.state') === 'migrated';
@@ -679,5 +796,5 @@ export function rollbackPiSingleProvider(provider: PiMigrateProvider, paths: PiM
     refresh(); deps.store?.setConfig(`pi.${provider}.state`, ''); refresh(); deps.store?.setConfig(`pi.${provider}.migratedAt`, '');
     refresh(); rmSync(journalPath(paths, provider), { force: true });
   });
-  return { provider, state: 'migrated', resumed: false, wouldWrite: [] };
+  return { provider, state: 'migrated', resumed: false, wouldWrite: [], ...(warnings?.length ? { warnings } : {}) };
 }
