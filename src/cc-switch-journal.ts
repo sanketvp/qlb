@@ -1,4 +1,5 @@
-import { chmodSync, lstatSync, mkdirSync, readFileSync, unlinkSync } from 'node:fs';
+import { chmodSync, closeSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync, unlinkSync, writeSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { type JsonObject } from './anthropic-oauth';
 import { type ClaudeSlotBackend } from './cc-slots';
@@ -73,6 +74,8 @@ export interface ClaudeSwitchJournalPathOptions {
 
 export interface ClaudeSwitchJournalOptions extends ClaudeSwitchJournalPathOptions, ClaudeSwitchJournalExpected {
   fsyncDirectory?: (path: string) => void;
+  /** Test seam run after the temporary journal is durable but before its exclusive link. */
+  beforeCreatePublish?: () => void;
   onOwnerLockCompromised?: (error: Error) => void;
 }
 
@@ -160,9 +163,24 @@ export function claudeSwitchJournalOwnerLockPath(options: ClaudeSwitchJournalPat
   return `${claudeSwitchJournalPath(options)}.lock`;
 }
 
-function ensureJournalDir(options: ClaudeSwitchJournalPathOptions): string {
+function assertJournalDirNotSymlink(options: ClaudeSwitchJournalPathOptions): string {
   const dir = claudeSwitchJournalDir(options);
+  try {
+    const stat = lstatSync(dir);
+    if (stat.isSymbolicLink()) throw new Error('Claude switch journal directory must not be a symlink');
+    if (!stat.isDirectory()) throw new Error('Claude switch journal directory is not a directory');
+  } catch (error) {
+    if (errno(error) !== 'ENOENT') throw error;
+  }
+  return dir;
+}
+
+function ensureJournalDir(options: ClaudeSwitchJournalPathOptions): string {
+  const dir = assertJournalDirNotSymlink(options);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const stat = lstatSync(dir);
+  if (stat.isSymbolicLink()) throw new Error('Claude switch journal directory must not be a symlink');
+  if (!stat.isDirectory()) throw new Error('Claude switch journal directory is not a directory');
   chmodSync(dir, 0o700);
   return dir;
 }
@@ -188,21 +206,37 @@ function persistClaudeSwitchJournal(journal: ClaudeSwitchJournal, options: Claud
 
 /** Create a new journal without ever replacing an existing entry. */
 export function createClaudeSwitchJournal(journal: ClaudeSwitchJournal, options: ClaudeSwitchJournalOptions): void {
-  const path = claudeSwitchJournalPath(options);
-  ensureJournalDir(options);
+  const parsed = parseClaudeSwitchJournal(journal, options);
+  if (parsed === null) throw new Error('Invalid Claude switch journal');
+  const dir = ensureJournalDir(options);
+  const path = claudeSwitchJournalPath({ ...options, journalDir: dir });
+  assertNotSymlink(path);
+  const temporary = join(dir, `.${JOURNAL_FILE}.${process.pid}.${randomUUID()}.tmp`);
+  const bytes = Buffer.from(`${JSON.stringify(parsed)}\n`);
+  let fd: number | undefined;
   try {
-    lstatSync(path);
-    throw new ClaudeSwitchJournalPresent();
+    fd = openSync(temporary, 'wx', 0o600);
+    let offset = 0;
+    while (offset < bytes.length) offset += writeSync(fd, bytes, offset, bytes.length - offset);
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = undefined;
+    options.beforeCreatePublish?.();
+    linkSync(temporary, path);
   } catch (error) {
-    if (error instanceof ClaudeSwitchJournalPresent) throw error;
-    if (errno(error) !== 'ENOENT') throw error;
+    if (errno(error) === 'EEXIST') throw new ClaudeSwitchJournalPresent();
+    throw error;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+    try { unlinkSync(temporary); } catch (error) { if (errno(error) !== 'ENOENT') throw error; }
   }
-  persistClaudeSwitchJournal(journal, options);
+  (options.fsyncDirectory ?? fsyncDirSync)(dirname(path));
 }
 
 /** Read a journal without treating corrupt, mismatched, or obsolete records as absent. */
 export function readClaudeSwitchJournal(options: ClaudeSwitchJournalOptions): ClaudeSwitchJournalRead {
   try {
+    assertJournalDirNotSymlink(options);
     const journal = parseClaudeSwitchJournal(JSON.parse(readFileSync(claudeSwitchJournalPath(options), 'utf8')), options);
     return journal === null ? { state: 'malformed' } : { state: 'ok', journal };
   } catch (error) {
@@ -239,8 +273,8 @@ export function updateClaudeSwitchJournal(
   const current = readClaudeSwitchJournal(options);
   if (current.state !== 'ok') throw new Error('Claude switch journal is missing or malformed');
   if (Object.prototype.hasOwnProperty.call(patch, 'fromOauthAccount')
-    && !Object.prototype.hasOwnProperty.call(patch, 'configText')) {
-    throw new Error('fromOauthAccount requires configText in the same journal update');
+    && (!Object.prototype.hasOwnProperty.call(patch, 'configText') || patch.configText === null)) {
+    throw new Error('fromOauthAccount requires non-null configText in the same journal update');
   }
   if (Object.prototype.hasOwnProperty.call(patch, 'closed') && current.journal.closed !== null
     && patch.closed !== current.journal.closed) throw new Error('Claude switch journal closed marker cannot be cleared or changed');
@@ -256,7 +290,17 @@ export function updateClaudeSwitchJournal(
 /** Delete is safe to retry and requires the same owner capability as an update. */
 export function deleteClaudeSwitchJournal(held: HeldClaudeSwitchJournalOwner, options: ClaudeSwitchJournalOptions): void {
   assertJournalOwner(held, options);
-  try { unlinkSync(claudeSwitchJournalPath(options)); } catch (error) { if (errno(error) !== 'ENOENT') throw error; }
+  assertJournalDirNotSymlink(options);
+  let deleted = false;
+  try {
+    unlinkSync(claudeSwitchJournalPath(options));
+    deleted = true;
+  } catch (error) {
+    if (errno(error) !== 'ENOENT') throw error;
+  }
+  if (deleted) {
+    try { (options.fsyncDirectory ?? fsyncDirSync)(claudeSwitchJournalDir(options)); } catch { /* best-effort durability */ }
+  }
 }
 
 /** Serialize journal mutations and fail closed if a stale holder was taken over. */
@@ -284,6 +328,7 @@ export async function withClaudeSwitchJournalOwner<T>(
 /** Observe an owner lock without acquiring or removing it. */
 export function probeClaudeSwitchJournalOwner(options: ClaudeSwitchJournalPathOptions = {}): 'held' | 'free' {
   try {
+    assertJournalDirNotSymlink(options);
     const stat = lstatSync(claudeSwitchJournalOwnerLockPath(options));
     return stat.isDirectory() && Date.now() - stat.mtimeMs < OWNER_LOCK_STALENESS_MS ? 'held' : 'free';
   } catch {

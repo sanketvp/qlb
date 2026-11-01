@@ -113,6 +113,7 @@ describe('Claude switch journal (K5-2)', () => {
       assert.equal((readClaudeSwitchJournal(h.options) as { journal: ClaudeSwitchJournal }).journal.fromOauthAccount, null);
       await withClaudeSwitchJournalOwner(h.options, (held) => {
         assert.throws(() => updateClaudeSwitchJournal(held, { fromOauthAccount: { accountUuid: 'from-account' } } as never, h.options));
+        assert.throws(() => updateClaudeSwitchJournal(held, { configText: null, fromOauthAccount: { accountUuid: 'from-account' } }, h.options));
         updateClaudeSwitchJournal(held, { configText: '{}\n', fromOauthAccount: { accountUuid: 'from-account' } }, h.options);
       });
       assert.deepEqual((readClaudeSwitchJournal(h.options) as { journal: ClaudeSwitchJournal }).journal.fromOauthAccount, { accountUuid: 'from-account' });
@@ -151,6 +152,22 @@ describe('Claude switch journal (K5-2)', () => {
     } finally { cleanup(h); }
   });
 
+  it('create refuses a journal created between preparation and exclusive publication, preserving the first bytes', () => {
+    const h = harness();
+    try {
+      let firstBytes = '';
+      const raceOptions = {
+        ...h.options,
+        beforeCreatePublish: () => {
+          createClaudeSwitchJournal(h.journal, h.options);
+          firstBytes = rawJournal(h);
+        },
+      };
+      assert.throws(() => createClaudeSwitchJournal(journalFixture(h.root, { attemptId: 'attempt-2' }), raceOptions), ClaudeSwitchJournalPresent);
+      assert.equal(rawJournal(h), firstBytes);
+    } finally { cleanup(h); }
+  });
+
   it('a journal path that is a symlink is not followed (create and update fail, the link target is untouched)', async () => {
     const h = harness();
     try {
@@ -161,6 +178,17 @@ describe('Claude switch journal (K5-2)', () => {
       await withClaudeSwitchJournalOwner(h.options, (held) => assert.throws(() => updateClaudeSwitchJournal(held, { stagedWritten: true }, h.options)));
       assert.equal(readFileSync(target, 'utf8'), 'unchanged');
       assert.ok(lstatSync(claudeSwitchJournalPath(h.options)).isSymbolicLink());
+    } finally { cleanup(h); }
+  });
+
+  it('a journal directory that is a symlink is not followed and its target is untouched', () => {
+    const h = harness();
+    try {
+      const target = join(h.root, 'journal-target'); mkdirSync(target);
+      symlinkSync(target, claudeSwitchJournalDir(h.options));
+      assert.throws(() => createClaudeSwitchJournal(h.journal, h.options));
+      assert.equal(lstatSync(claudeSwitchJournalDir(h.options)).isSymbolicLink(), true);
+      assert.throws(() => lstatSync(join(target, 'switch-anthropic.json')), { code: 'ENOENT' });
     } finally { cleanup(h); }
   });
 
@@ -228,6 +256,26 @@ describe('Claude switch journal (K5-2)', () => {
     try {
       createClaudeSwitchJournal(h.journal, h.options);
       await withClaudeSwitchJournalOwner(h.options, (held) => { deleteClaudeSwitchJournal(held, h.options); deleteClaudeSwitchJournal(held, h.options); });
+      assert.deepEqual(readClaudeSwitchJournal(h.options), { state: 'absent' });
+    } finally { cleanup(h); }
+  });
+
+  it('delete fsyncs the journal parent directory best-effort after unlink', async () => {
+    const h = harness();
+    try {
+      createClaudeSwitchJournal(h.journal, h.options);
+      let fsyncCalls = 0;
+      await withClaudeSwitchJournalOwner(h.options, (held) => {
+        assert.doesNotThrow(() => deleteClaudeSwitchJournal(held, {
+          ...h.options,
+          fsyncDirectory: (path) => {
+            fsyncCalls += 1;
+            assert.equal(path, claudeSwitchJournalDir(h.options));
+            throw new Error('fsync unavailable');
+          },
+        }));
+      });
+      assert.equal(fsyncCalls, 1);
       assert.deepEqual(readClaudeSwitchJournal(h.options), { state: 'absent' });
     } finally { cleanup(h); }
   });
