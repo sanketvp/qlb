@@ -7,7 +7,7 @@ import { describe, it } from 'node:test';
 import { claudePaths } from '../src/cc-paths';
 import { withClaudeSwitchLock } from '../src/cc-locks';
 import { ClaudeSlots, SqliteClaudeSlotRepository } from '../src/cc-slots';
-import { AdmissionRefused, switchClaude, type ClaudeSwitchDeps } from '../src/cc-switch';
+import { switchClaude, type ClaudeSwitchDeps } from '../src/cc-switch';
 import { createSwitchAnthropicCommand, type SwitchAnthropicCommandDeps } from '../src/commands/switch-anthropic';
 import { defaultConfig } from '../src/config';
 import { MockKeychain } from '../src/keychain';
@@ -161,32 +161,29 @@ describe('Claude switch lifecycle guards (K5-8)', () => {
   });
 
   it('switch anthropic manual is refused in undoing, rolled-back and aborted', async () => {
-    for (const state of ['undoing', 'rolled-back', 'aborted'] as const) {
+    const cases = [
+      ['undoing', 'undo-in-progress'],
+      ['rolled-back', 'phase=rolled-back'],
+      ['aborted', 'phase=aborted'],
+    ] as const;
+    for (const [state, code] of cases) {
       const subject = await fixture(state);
       assert.equal(await execute(subject), 3, state);
       assert.equal(subject.lockCalls(), 0, state);
+      assert.deepEqual(subject.stderr, [`qlb switch anthropic: refused: ${code}`], state);
     }
   });
 
   it('an admission refusal stops before journal reconciliation', async () => {
-    const events: string[] = [];
+    let reconcileCalls = 0;
     const subject = await fixture('cutting-over', {
       assertAdmitted: () => ({ ok: false, code: 'phase=pre-cutover' }),
-      bootstrap: async (hooks) => {
-        try {
-          await hooks?.assertAdmitted?.();
-        } catch (error) {
-          assert.ok(error instanceof AdmissionRefused);
-          events.push('admission-refused');
-          throw error;
-        }
-        await hooks?.reconcileJournals?.();
-      },
-      reconcileJournals: async () => { events.push('reconcile'); },
+      reconcileJournals: async () => { reconcileCalls += 1; },
     });
     assert.equal(await execute(subject), 3);
-    assert.deepEqual(events, ['admission-refused']);
+    assert.equal(reconcileCalls, 0);
     assert.equal(subject.lockCalls(), 0);
+    assert.deepEqual(subject.stderr, ['qlb switch anthropic: refused: phase=pre-cutover']);
   });
 
   it('admission precedes journal reconciliation', async () => {
