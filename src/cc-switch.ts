@@ -2,6 +2,7 @@
 
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
+import { dirname } from 'node:path';
 import {
   needsFreshenBeforeSwitch,
   parseCredentialBlob,
@@ -24,7 +25,7 @@ import {
   writeLiveClaudeCredentials,
   type ClaudeCredentialsOptions,
 } from './cc-credentials';
-import { ClaudeCodeLockTimeout, ProperLockfileCompromised, withClaudeConfigPathLock, withClaudeCredentialLocks, withClaudeSwitchLock } from './cc-locks';
+import { ClaudeCodeLockTimeout, ProperLockfileCompromised, assertClaudeConfigLockHeld, withClaudeConfigPathLock, withClaudeCredentialLocks, withClaudeSwitchLock, type HeldClaudeConfigLock, type HeldClaudeCredentialLocks } from './cc-locks';
 import { claudePaths } from './cc-paths';
 import { consumeClaudeSlot, defaultStashTimestamp, type ConsumeGateDeps } from './cc-consume';
 import {
@@ -38,7 +39,9 @@ import {
   updateClaudeSwitchJournal,
   withClaudeSwitchJournalOwner,
   writeStagedRollback,
+  readStagedRollback,
   type ClaudeSwitchDecision,
+  type ClaudeSwitchJournal,
   type ClaudeSwitchJournalOptions,
 } from './cc-switch-journal';
 import { resolveCswapCheck } from './cc-resync';
@@ -46,6 +49,7 @@ import { ClaudeSlots, type ClaudeSlot } from './cc-slots';
 import { isCredentialNotFound, isSecurityTimeout } from './credential-backends';
 import type { CswapProcess } from './cswap-processes';
 import { atomicWriteText } from './fsutil';
+import { injectionDetail } from './fault-injection';
 import { processLstart, stillTheSameProcess } from './codex-sessions';
 import type { Store } from './store';
 
@@ -85,6 +89,8 @@ export interface ClaudeSwitchDeps {
   journalOwner?: { pid: number; lstart: string };
   /** Test seam for journal mutations; production uses the real helpers. */
   journalOps?: {
+    /** Rollback-reader seam; production re-reads the on-disk journal. */
+    read?: typeof readClaudeSwitchJournal;
     update: typeof updateClaudeSwitchJournal;
     remove: typeof deleteClaudeSwitchJournal;
   };
@@ -93,6 +99,8 @@ export interface ClaudeSwitchDeps {
   stashTimestamp?: () => string;
   hooks?: { afterStep4?: () => void | Promise<void>; afterStep5?: () => void | Promise<void>; beforeStep7?: () => void | Promise<void>; afterStep7?: () => void | Promise<void>; afterStep8?: () => void | Promise<void>; beforeStep9?: () => void | Promise<void> };
   crashAt?: (checkpoint: 'before-step-6' | 'after-journal' | 'after-stage' | 'before-step-7-write' | 'after-step-7' | 'after-step-8' | 'after-commit') => void;
+  /** K8's deterministic post-write rollback seam. */
+  injectFailStep?: 7 | 8 | 9;
 }
 
 export interface SwitchClaudeInput {
@@ -119,7 +127,7 @@ export interface ClaudeSwitchResult {
   attempt: string;
   outgoingKind?: string;
   injected?: boolean;
-  steps?: { failedStep?: number; started: number[]; reversed: number[]; notLanded: number[]; restoreFailures: string[]; unclaimed?: string; cleanup: string[] };
+  steps?: { failedStep?: number; started: number[]; reversed: Array<number | 'config' | 'config:resplice'>; notLanded: Array<number | 'config'>; restoreFailures: string[]; unclaimed?: string; cleanup: string[] };
   exitCode: 0 | 1 | 3;
 }
 
@@ -202,8 +210,8 @@ export function classifySwitchError(error: unknown): string {
 
 function journalOptions(deps: ClaudeSwitchDeps, paths: ReturnType<typeof claudePaths>): ClaudeSwitchJournalOptions { return { journalDir: deps.journalDir, home: deps.home, env: deps.env, configPath: paths.globalConfigPath, keychainService: paths.keychainService }; }
 function refusal(deps: ClaudeSwitchDeps, input: SwitchClaudeInput, attempt: string, from: string | null, reason: string): ClaudeSwitchResult {
-  deps.store.recordClaudeSwitchRefusal({ from, to: input.to, trigger: input.trigger, reason, injected: input.injected === true, attempt, now: deps.now() });
-  return { outcome: 'refused', from, to: input.to, reason, attempt, injected: input.injected === true, exitCode: 3 };
+  deps.store.recordClaudeSwitchRefusal({ from, to: input.to, trigger: input.trigger, reason, injected: switchWasInjected(deps, input), attempt, now: deps.now() });
+  return { outcome: 'refused', from, to: input.to, reason, attempt, injected: switchWasInjected(deps, input), exitCode: 3 };
 }
 function writeError(error: unknown, fallback: 'keychain-write-failed' | 'config-write-failed'): string {
   const classified = classifySwitchError(error);
@@ -211,18 +219,160 @@ function writeError(error: unknown, fallback: 'keychain-write-failed' | 'config-
 }
 function failed(deps: ClaudeSwitchDeps, input: SwitchClaudeInput, attempt: string, from: string | null, reason: string, error?: string, state = steps(), failedStep?: number, publishedAt?: number | null): ClaudeSwitchResult {
   if (failedStep !== undefined) state.failedStep = failedStep;
-  const result: ClaudeSwitchResult = { outcome: 'failed', from, to: input.to, reason, ...(error ? { error } : {}), attempt, injected: input.injected === true, steps: state, exitCode: 1 };
+  const result: ClaudeSwitchResult = { outcome: 'failed', from, to: input.to, reason, ...(error ? { error } : {}), attempt, injected: switchWasInjected(deps, input), steps: state, exitCode: 1 };
   try {
     deps.store.recordSwitch({
       ts: deps.now(), provider: 'anthropic', fromAccount: from, toAccount: input.to, trigger: input.trigger,
-      outcome: 'failed', error: error ?? null, detail: reason, injected: input.injected === true,
+      outcome: 'failed', error: error ?? null, detail: reason, injected: switchWasInjected(deps, input),
       stepsJson: JSON.stringify({ ...state, attempt }), ...(publishedAt !== undefined ? { publishedAt } : {}),
     });
   } catch { warn(deps, 'could not record failed Claude switch'); }
   return result;
 }
 
-/** K5-5's non-rollback transaction. K8-2 replaces the step-7--9 failure return with rollback. */
+class InjectedFailStep extends Error {
+  constructor(readonly step: 7 | 8 | 9) { super(`fail-step-${step}`); this.name = 'InjectedFailStep'; }
+}
+
+function switchWasInjected(deps: ClaudeSwitchDeps, input: SwitchClaudeInput): boolean {
+  return input.injected === true || deps.injectFailStep !== undefined;
+}
+
+/**
+ * Restore a config write from the journal while the caller holds its matching
+ * config-path lock. The write-intent guard deliberately precedes every read:
+ * K14 may call this for a step-6/7 journal that has no config snapshot.
+ */
+type RollbackJournal = Pick<ClaudeSwitchJournal,
+  'configPath' | 'configText' | 'configWrittenHash' | 'fromOauthAccount' | 'configWriteStarted'
+  | 'credentialsWriteStarted' | 'stagedBlobService'>;
+
+export async function restoreConfigFromJournal(
+  deps: ClaudeSwitchDeps,
+  journal: Pick<ClaudeSwitchJournal, 'configPath' | 'configText' | 'configWrittenHash' | 'fromOauthAccount' | 'configWriteStarted'>,
+  heldConfigLock: HeldClaudeConfigLock,
+): Promise<'restored' | 'resplice' | 'not-landed'> {
+  if (!journal.configWriteStarted || journal.configText === null) return 'not-landed';
+  assertClaudeConfigLockHeld(heldConfigLock, { configDir: dirname(journal.configPath), env: {} });
+  const readText = deps.live.readText ?? ((path: string) => readFileSync(path, 'utf8'));
+  const current = readText(journal.configPath);
+  // Validate even a byte-equal file before classifying it. This keeps recovery
+  // from accepting a malformed config supplied by a journal fixture.
+  const config = readClaudeConfig(journal.configPath, () => current);
+  if (current === journal.configText) return 'not-landed';
+  if (journal.configWrittenHash !== null && sha256(current) === journal.configWrittenHash) {
+    (deps.live.writeText ?? ((path: string, text: string) => atomicWriteText(path, text, { mode: 0o600 })))(journal.configPath, journal.configText);
+    return 'restored';
+  }
+  if (journal.fromOauthAccount !== null) {
+    await spliceOauthAccount(journal.configPath, journal.fromOauthAccount, heldConfigLock, {
+      readText: () => current,
+      writeText: deps.live.writeText,
+    });
+    return 'resplice';
+  }
+  if (!Object.prototype.hasOwnProperty.call(config, 'oauthAccount')) return 'not-landed';
+  delete config.oauthAccount;
+  (deps.live.writeText ?? ((path: string, text: string) => atomicWriteText(path, text, { mode: 0o600 })))(journal.configPath, `${JSON.stringify(config, null, 2)}\n`);
+  return 'resplice';
+}
+
+/** K14 recovery seam: never overwrite a generation that no longer matches QLB's write. */
+export async function restoreLiveFromStaged(
+  deps: ClaudeSwitchDeps,
+  journal: ClaudeSwitchJournal,
+  heldCredentialLocks: HeldClaudeCredentialLocks,
+): Promise<'restored' | 'not-landed' | 'staged-unreadable' | 'live-moved'> {
+  let staged: string | null;
+  try { staged = await readStagedRollback(deps.live.backend, journal.stagedBlobService); } catch { return 'staged-unreadable'; }
+  if (staged === null) return 'staged-unreadable';
+  let live: string;
+  try { live = await readLiveClaudeCredentials(deps.live); } catch { return 'live-moved'; }
+  if (live === staged) return 'not-landed';
+  if (journal.credentialsWrittenHash === null || sha256(live) !== journal.credentialsWrittenHash) return 'live-moved';
+  await writeLiveClaudeCredentials(staged, deps.live, heldCredentialLocks);
+  return 'restored';
+}
+
+async function rollbackClaudeSwitch(
+  deps: ClaudeSwitchDeps,
+  input: SwitchClaudeInput,
+  from: string,
+  outgoingLive: string,
+  options: ClaudeSwitchJournalOptions,
+  ownerHeld: Parameters<typeof updateClaudeSwitchJournal>[0],
+  state: NonNullable<ClaudeSwitchResult['steps']>,
+  failedStep: 7 | 8 | 9,
+  failure: unknown,
+  publishedAt: number | null,
+  configLock: typeof withClaudeConfigPathLock,
+  credentialHeld: HeldClaudeCredentialLocks,
+  live: ClaudeCredentialsOptions,
+  inMemoryJournal: RollbackJournal | null,
+): Promise<ClaudeSwitchResult> {
+  state.failedStep = failedStep;
+  const read = (deps.journalOps?.read ?? readClaudeSwitchJournal)(options);
+  // The process already knows every rollback-relevant intent it wrote. A
+  // transient journal re-read failure must not turn that knowledge into a
+  // silent no-op restore.
+  const journal: RollbackJournal | null = read.state === 'ok' ? read.journal : inMemoryJournal;
+  const injected = switchWasInjected(deps, input) || failure instanceof InjectedFailStep;
+  const detail = failure instanceof InjectedFailStep
+    ? injectionDetail({ kind: 'fail-step', step: failure.step })
+    : `step-${failedStep}`;
+  const error = failure instanceof InjectedFailStep ? 'injected'
+    : failedStep === 7 ? writeError(failure, 'keychain-write-failed')
+      : failedStep === 8 ? writeError(failure, 'config-write-failed')
+        : classifySwitchError(failure);
+
+  // Reverse newest effect first. Each restore is independent, so a config
+  // failure never suppresses the live credential attempt (and vice versa).
+  if (journal === null) {
+    state.restoreFailures.push('journal-unreadable');
+  }
+  if (journal?.configWriteStarted) {
+    try {
+      const configResult = await configLock(journal.configPath, { env: deps.env }, (held) =>
+        restoreConfigFromJournal(deps, journal, held));
+      if (configResult === 'not-landed') state.notLanded.push('config');
+      else state.reversed.push(configResult === 'resplice' ? 'config:resplice' : 'config');
+    } catch { state.restoreFailures.push('config'); }
+  }
+  if (journal?.credentialsWriteStarted) {
+    try {
+      const current = await readLiveClaudeCredentials(live);
+      if (current === outgoingLive) state.notLanded.push(7);
+      else { await writeLiveClaudeCredentials(outgoingLive, live, credentialHeld); state.reversed.push(7); }
+    } catch { // A failed re-read is restored just like a moved live value.
+      try { await writeLiveClaudeCredentials(outgoingLive, live, credentialHeld); state.reversed.push(7); }
+      catch { state.restoreFailures.push('credentials'); }
+    }
+  }
+
+  try {
+    deps.store.recordSwitch({
+      ts: deps.now(), provider: 'anthropic', fromAccount: from, toAccount: input.to, trigger: input.trigger,
+      outcome: 'rolled-back', error, detail, injected,
+      stepsJson: JSON.stringify({ ...state, attempt: deps.attempt }), ...(publishedAt === null ? {} : { publishedAt }),
+    });
+  } catch { warn(deps, 'could not record rolled-back Claude switch'); }
+
+  if (state.restoreFailures.length === 0 && journal !== null) {
+    const journalUpdate = deps.journalOps?.update ?? updateClaudeSwitchJournal;
+    const journalRemove = deps.journalOps?.remove ?? deleteClaudeSwitchJournal;
+    try { journalUpdate(ownerHeld, { closed: 'rolled-back' }, options); } catch (cleanup) { state.cleanup.push(classifySwitchError(cleanup)); }
+    if (state.cleanup.length === 0) {
+      try { await deleteStagedRollback(live.backend, journal.stagedBlobService); } catch (cleanup) { state.cleanup.push(classifySwitchError(cleanup)); }
+    }
+    if (state.cleanup.length === 0) {
+      try { journalRemove(ownerHeld, options); } catch (cleanup) { state.cleanup.push(classifySwitchError(cleanup)); }
+    }
+  }
+  return { outcome: 'rolled-back', from, to: input.to, reason: detail, error, attempt: deps.attempt,
+    injected, steps: state, exitCode: 1 };
+}
+
+/** K5-5's transaction, with K8-2 rollback for pre-commit failures. */
 async function switchClaudeAttempt(deps: ClaudeSwitchDeps, input: SwitchClaudeInput, retriedPhaseA: boolean): Promise<ClaudeSwitchResult> {
   const attempt = deps.attempt;
   const paths = deps.live.paths ?? claudePaths({ home: deps.home, env: deps.env });
@@ -280,9 +430,9 @@ async function switchClaudeAttempt(deps: ClaudeSwitchDeps, input: SwitchClaudeIn
           const target = deps.slots.getSlot(input.to)!;
           if (from === input.to) {
             try {
-              deps.store.recordSwitch({ ts: deps.now(), provider: 'anthropic', fromAccount: from, toAccount: input.to, trigger: input.trigger, outcome: 'noop', injected: input.injected === true, stepsJson: JSON.stringify({ attempt }) });
+              deps.store.recordSwitch({ ts: deps.now(), provider: 'anthropic', fromAccount: from, toAccount: input.to, trigger: input.trigger, outcome: 'noop', injected: switchWasInjected(deps, input), stepsJson: JSON.stringify({ attempt }) });
             } catch { warn(deps, 'could not record noop Claude switch'); }
-            return { outcome: 'noop', from, to: input.to, attempt, injected: input.injected === true, steps: state, exitCode: 0 };
+            return { outcome: 'noop', from, to: input.to, attempt, injected: switchWasInjected(deps, input), steps: state, exitCode: 0 };
           }
           let outgoingLive: string;
           try { outgoingLive = await readLiveClaudeCredentials(live); } catch (error) { return refusal(deps, input, attempt, from, isCredentialNotFound(error) ? 'live-credential-empty' : 'live-credential-unreadable'); }
@@ -312,7 +462,7 @@ async function switchClaudeAttempt(deps: ClaudeSwitchDeps, input: SwitchClaudeIn
           const owner = deps.journalOwner ?? { pid: process.pid, lstart: await processLstart(process.pid) ?? '' };
           try {
             ownerHeld.assertHeld();
-            createClaudeSwitchJournal({ v: 1, provider: 'anthropic', attemptId: attempt, from, to: input.to, trigger: input.trigger, by: deps.by, republish: false, injected: input.injected === true, detail: null, decision: input.decision ?? noDecision(), outgoingKind: classified.kind, bindingJson: input.bindingJson ?? null, step: 6, stagedBlobService, stagedAccount: 'qlb', stagedWritten: false, keychainService: paths.keychainService, configPath: paths.globalConfigPath, configText: null, configWrittenHash: null, fromOauthAccount: null, credentialsWrittenHash: null, credentialsWriteStarted: false, credentialsWritten: false, configWriteStarted: false, configWritten: false, closed: null, startedAt: deps.now(), owner }, options);
+            createClaudeSwitchJournal({ v: 1, provider: 'anthropic', attemptId: attempt, from, to: input.to, trigger: input.trigger, by: deps.by, republish: false, injected: switchWasInjected(deps, input), detail: null, decision: input.decision ?? noDecision(), outgoingKind: classified.kind, bindingJson: input.bindingJson ?? null, step: 6, stagedBlobService, stagedAccount: 'qlb', stagedWritten: false, keychainService: paths.keychainService, configPath: paths.globalConfigPath, configText: null, configWrittenHash: null, fromOauthAccount: null, credentialsWrittenHash: null, credentialsWriteStarted: false, credentialsWritten: false, configWriteStarted: false, configWritten: false, closed: null, startedAt: deps.now(), owner }, options);
             deps.crashAt?.('after-journal');
             await writeStagedRollback(live.backend, stagedBlobService, outgoingLive);
             journalUpdate(ownerHeld, { stagedWritten: true }, options);
@@ -326,17 +476,28 @@ async function switchClaudeAttempt(deps: ClaudeSwitchDeps, input: SwitchClaudeIn
             return failed(deps, input, attempt, from, 'stage-failed', classifySwitchError(error), state, 6);
           }
           state.started.push(6); await deps.hooks?.beforeStep7?.();
+          // This process's rollback source remains usable even if a journal
+          // update succeeds on disk but its later re-read fails.
+          const rollbackJournal: RollbackJournal = {
+            configPath: paths.globalConfigPath, configText: null, configWrittenHash: null, fromOauthAccount: null,
+            configWriteStarted: false, credentialsWriteStarted: false, stagedBlobService,
+          };
           // Step 7: hash-before-effect live credentials write.
           let publishedAt: number | null = null;
           try {
             const composed = mergeSharedCredentialFields(targetCredential, sharedCredentialFields(outgoingLive) ?? {});
+            rollbackJournal.credentialsWriteStarted = true;
             journalUpdate(ownerHeld, { step: 7, credentialsWriteStarted: true, credentialsWrittenHash: sha256(composed) }, options);
             deps.crashAt?.('before-step-7-write');
             await writeLiveClaudeCredentials(composed, live, credentialHeld);
             publishedAt = deps.now();
             journalUpdate(ownerHeld, { credentialsWritten: true, publishedAt }, options);
-            state.started.push(7); await deps.hooks?.afterStep7?.(); deps.crashAt?.('after-step-7');
-          } catch (error) { if (isCrash(error)) throw error; return failed(deps, input, attempt, from, 'step-7', writeError(error, 'keychain-write-failed'), state, 7, publishedAt); }
+            state.started.push(7); if (deps.injectFailStep === 7) throw new InjectedFailStep(7);
+            await deps.hooks?.afterStep7?.(); deps.crashAt?.('after-step-7');
+          } catch (error) {
+            if (isCrash(error)) throw error;
+            return rollbackClaudeSwitch(deps, input, from, outgoingLive, options, ownerHeld, state, 7, error, publishedAt, configLock, credentialHeld, live, rollbackJournal);
+          }
           // Step 8: config lock covers raw read, planning splice, journal intent, and write only.
           try {
             await configLock(paths.globalConfigPath, { env: deps.env }, async (configHeld) => {
@@ -346,19 +507,31 @@ async function switchClaudeAttempt(deps: ClaudeSwitchDeps, input: SwitchClaudeIn
               let planned: string | undefined;
               await spliceOauthAccount(paths.globalConfigPath, targetOauth!, configHeld, { readText: () => raw, writeText: (_path, text) => { planned = text; } });
               if (planned === undefined) throw new ClaudeConfigFileError(paths.globalConfigPath, 'could not plan file');
-              journalUpdate(ownerHeld, { step: 8, configText: raw, fromOauthAccount, configWrittenHash: sha256(planned), configWriteStarted: true }, options);
+              rollbackJournal.configText = raw;
+              rollbackJournal.fromOauthAccount = fromOauthAccount;
+              rollbackJournal.configWrittenHash = sha256(planned);
+              rollbackJournal.configWriteStarted = true;
+              journalUpdate(ownerHeld, { step: 8, configText: raw, fromOauthAccount, configWrittenHash: rollbackJournal.configWrittenHash, configWriteStarted: true }, options);
               (live.writeText ?? ((path: string, text: string) => { atomicWriteText(path, text, { mode: 0o600 }); }))(paths.globalConfigPath, planned);
               journalUpdate(ownerHeld, { configWritten: true }, options);
+              state.started.push(8);
+              if (deps.injectFailStep === 8) throw new InjectedFailStep(8);
             });
-            state.started.push(8); await deps.hooks?.afterStep8?.(); deps.crashAt?.('after-step-8');
-          } catch (error) { if (isCrash(error)) throw error; return failed(deps, input, attempt, from, 'step-8', writeError(error, 'config-write-failed'), state, 8, publishedAt); }
+            await deps.hooks?.afterStep8?.(); deps.crashAt?.('after-step-8');
+          } catch (error) {
+            if (isCrash(error)) throw error;
+            return rollbackClaudeSwitch(deps, input, from, outgoingLive, options, ownerHeld, state, 8, error, publishedAt, configLock, credentialHeld, live, rollbackJournal);
+          }
           // Step 9 plus the finished-marker cleanup sequence.
           let switchId: number;
           try {
             await deps.hooks?.beforeStep9?.();
-            switchId = deps.store.commitClaudeSwitch({ now: deps.now(), fromAccount: from, toAccount: input.to, trigger: input.trigger, setBy: input.trigger === 'manual' ? 'manual' : 'auto', attempt, outgoingKind: classified.kind, bindingJson: input.bindingJson ?? null, stepsJson: JSON.stringify(state), publishedAt, injected: input.injected === true, detail: null, republish: false, decision: input.decision ?? noDecision() });
+            switchId = deps.store.commitClaudeSwitch({ now: deps.now(), fromAccount: from, toAccount: input.to, trigger: input.trigger, setBy: input.trigger === 'manual' ? 'manual' : 'auto', attempt, outgoingKind: classified.kind, bindingJson: input.bindingJson ?? null, stepsJson: JSON.stringify(state), publishedAt, injected: switchWasInjected(deps, input), detail: null, republish: false, decision: input.decision ?? noDecision(), beforeCommit: () => { if (deps.injectFailStep === 9) throw new InjectedFailStep(9); } });
             state.started.push(9); deps.crashAt?.('after-commit');
-          } catch (error) { if (isCrash(error)) throw error; return failed(deps, input, attempt, from, 'step-9', classifySwitchError(error), state, 9, publishedAt); }
+          } catch (error) {
+            if (isCrash(error)) throw error;
+            return rollbackClaudeSwitch(deps, input, from, outgoingLive, options, ownerHeld, state, 9, error, publishedAt, configLock, credentialHeld, live, rollbackJournal);
+          }
           try { journalUpdate(ownerHeld, { committed: deps.now() }, options); } catch (error) { state.cleanup.push(classifySwitchError(error)); }
           if (state.cleanup.length === 0) try { await deleteStagedRollback(live.backend, stagedBlobService); } catch (error) { state.cleanup.push(classifySwitchError(error)); }
           if (state.cleanup.length === 0) try { journalRemove(ownerHeld, options); } catch (error) { state.cleanup.push(classifySwitchError(error)); }
