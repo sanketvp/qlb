@@ -1235,6 +1235,7 @@ export class Migration {
     const prePresent =
       this.kind === 'static-key' ? false : existsSync(preQlbPath(this.poolFilePath));
     const intent = detail.intent === 'rollback';
+    const preCommitRollbackIntent = detail.intent === 'pre-commit-rollback';
     const rawHandback = isObjectRecord(detail.handback) && detail.handback.phase === 'cleanup-pending'
       ? detail.handback
       : undefined;
@@ -1272,6 +1273,8 @@ export class Migration {
     let resumeAction: string;
     if (rawHandback) {
       resumeAction = 'hand-back complete, cleanup pending — run `qlb migrate resume`';
+    } else if (preCommitRollbackIntent) {
+      resumeAction = 'before commit: roll back staging (native untouched)';
     } else if (intent) {
       resumeAction = staticKey
         ? 'continue rollback to VALIDATED (owner unlinked; native Keychain was never moved)'
@@ -1294,7 +1297,7 @@ export class Migration {
           : 'noop (already QLB_OWNED)';
     } else if (state === 'QLB_OWNED' && !ownerPresent && nativePresent) {
       resumeAction = 'post-RC hygiene: journal VALIDATED';
-    } else if (state === 'VALIDATED' && ownerStaging) {
+    } else if (state === 'VALIDATED' && ownerStaging && this.readStagingOwnerFile() !== null) {
       resumeAction = 'rehearsal succeeded; complete commit';
     } else if (state === 'MIRRORED' || ownerStaging) {
       resumeAction = 'before commit: roll back staging (native untouched)';
@@ -1573,6 +1576,9 @@ export class Migration {
     if (facts.rollbackInProgress) {
       return this.continueRollback();
     }
+    if (current.detail.intent === 'pre-commit-rollback') {
+      return this.preCommitRollback();
+    }
     // C5: a VALIDATED journal with this path's own commit evidence (`Gen`) is
     // a crash after the commit point. Finish the forward journal transition,
     // then take the ordinary post-commit hand-back path. The pool path is not
@@ -1604,7 +1610,7 @@ export class Migration {
    *   - rollback intent journaled            → continueRollback
    *   - owner file present (past C)          → finishHygiene (forward)
    *   - QLB_OWNED, owner gone, native back   → RH1 (journal VALIDATED)
-   *   - VALIDATED + staging present          → commit (rehearsal proved it)
+   *   - VALIDATED + readable staging         → commit (rehearsal proved it)
    *   - MIRRORED / staging leftovers         → preCommitRollback
    */
   resume(): MigrationStatus {
@@ -1630,6 +1636,9 @@ export class Migration {
     if (facts.rollbackInProgress) {
       return this.continueRollback();
     }
+    if (current.detail.intent === 'pre-commit-rollback') {
+      return this.preCommitRollback();
+    }
     this.assertNoOrphanOwnershipClaim();
     // Any claim, including a custom owner file (Oc), is past C: finish forward.
     if (this.claimPresent()) {
@@ -1641,7 +1650,11 @@ export class Migration {
     ) {
       return this.finishRollbackJournal();
     }
-    if (current.state === 'VALIDATED' && this.claimPathPresent(this.stagingPath())) {
+    if (
+      current.state === 'VALIDATED'
+      && this.claimPathPresent(this.stagingPath())
+      && this.readStagingOwnerFile() !== null
+    ) {
       return this.kind === 'single-grant' ? this.commitUnlocked() : this.commit();
     }
     if (current.state === 'MIRRORED' || this.claimPathPresent(this.stagingPath())) {
@@ -2113,14 +2126,40 @@ export class Migration {
     // Resolve (and validate) the journaled auth key before any cleanup, so a
     // conflicting key refuses with every staged artifact still in place.
     const authKey = this.kind === 'single-grant' ? this.singleGrantAuthKey() : undefined;
-    if (this.kind === 'single-grant' && (this.provider === 'xai' || this.provider === 'kimi-coding')) {
-      this.deleteJournalStagedKeychain(this.provider);
-    } else {
-      this.deleteStagedKeychain(this.readOwnerPayload()?.accounts);
+    const journaledSingleGrant = this.kind === 'single-grant' && (this.provider === 'xai' || this.provider === 'kimi-coding');
+    // Validate the delete authority before removing the staging evidence.
+    // `pre-commit-rollback` makes a crash after that removal resumable.
+    if (journaledSingleGrant) this.journalStagedKeychain(this.provider);
+    const stagedAccounts = journaledSingleGrant ? undefined : this.readOwnerPayload()?.accounts;
+    const staging = this.stagingPath();
+    const rollbackStaging = `${staging}.rollback`;
+    if (this.claimPathPresent(staging)) {
+      if (this.claimPathPresent(rollbackStaging)) {
+        throw new Error(`cannot roll back: staging recovery entry exists ${rollbackStaging}`);
+      }
+      this.journal(this.journalState(), { intent: 'pre-commit-rollback' });
+      // Rename proves the staging entry can leave its claim path before K_m is
+      // deleted. The marker lets resume complete a crash in this interval.
+      renameSync(staging, rollbackStaging);
     }
-    unlinkIfExists(this.stagingPath());
+    try {
+      if (journaledSingleGrant) {
+        this.deleteJournalStagedKeychain(this.provider);
+      } else {
+        this.deleteStagedKeychain(stagedAccounts);
+      }
+    } catch (error) {
+      // Keep the ordinary retry surface when the Keychain delete is refused.
+      if (this.claimPathPresent(rollbackStaging)) renameSync(rollbackStaging, staging);
+      throw error;
+    }
+    unlinkIfExists(rollbackStaging);
     if (authKey !== undefined) removePiAuthBackup(this.poolFilePath, authKey);
-    this.journal('NATIVE', { intent: undefined, rolledBackAt: Date.now(), rolledBackFrom: 'pre-commit' });
+    this.journal('NATIVE', {
+      intent: undefined,
+      rolledBackAt: Date.now(),
+      rolledBackFrom: 'pre-commit',
+    });
     return this.status();
   }
 

@@ -127,8 +127,10 @@ class RollbackDeleteKeychain extends MockKeychain {
 
 class DeleteTrackingKeychain extends MockKeychain {
   deleteCalls: Array<{ service: string; account: string }> = [];
+  beforeDelete: (() => void) | undefined;
 
   override deleteSync(service: string, account: string): void {
+    this.beforeDelete?.();
     this.deleteCalls.push({ service, account });
     super.deleteSync(service, account);
   }
@@ -742,6 +744,43 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
         assert.throws(() => kc.getSync(legacy.service, legacy.account), /item not found/);
       } finally {
         normal.cleanup();
+        h.cleanup();
+      }
+    });
+
+    it(`T-KC11i [${provider}] resume rolls back a dangling VALIDATED staging link before deleting its Keychain copy`, () => {
+      const legacy = legacyKmCoords(provider);
+      const kc = new DeleteTrackingKeychain();
+      const h = oldPreCommitFixture(provider, 'VALIDATED', kc);
+      try {
+        rmSync(h.staging);
+        symlinkSync(join(h.dir, 'missing-staging-owner'), h.staging);
+        assert.equal(
+          h.mig.status().resumeAction,
+          'before commit: roll back staging (native untouched)',
+          'status advises the recovery resume performs',
+        );
+        kc.deleteCalls.length = 0;
+        kc.beforeDelete = () => {
+          assert.throws(
+            () => lstatSync(h.staging),
+            (error: unknown) => (error as { code?: unknown }).code === 'ENOENT',
+            'the dangling staging link is removable before its Keychain copy is deleted',
+          );
+        };
+
+        const resumed = h.mig.resume();
+
+        assert.equal(resumed.state, 'NATIVE');
+        assert.equal(resumed.ownerFile, 'absent');
+        assert.equal(resumed.resumeAction, 'nothing to roll back');
+        assert.equal(kc.deleteCalls.length, 1, 'resume deletes the journaled staged copy');
+        assert.throws(
+          () => lstatSync(h.staging),
+          (error: unknown) => (error as { code?: unknown }).code === 'ENOENT',
+        );
+        assert.throws(() => kc.getSync(legacy.service, legacy.account), /item not found/);
+      } finally {
         h.cleanup();
       }
     });
