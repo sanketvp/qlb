@@ -9,6 +9,8 @@ import { describe, it } from 'node:test';
 import {
   attributeForPhase,
   checkCodexSwitchPreconditions,
+  codexOldAccountLine,
+  listCodexOldAccountSessions,
   classifyPostPublish,
   codexWatchTick,
   runDueCodexWatches,
@@ -4080,5 +4082,55 @@ describe('Codex watch tick — C6-21', () => {
       assert.deepEqual(await tick(h, { ...watch, trigger: 'manual' }, 30_000, { admitted, readLive }), { state: 'quiet' });
       assert.deepEqual(seen, ['auto', 'manual']);
     } finally { close(h); }
+  });
+});
+
+describe('Codex old-account sessions — C6-23', () => {
+  const old = 'a:account';
+  const current = 'b:account';
+  const switchedAt = Date.parse('Mon Nov 13 12:00:00 2023 UTC');
+  const addRevert = (h: ReturnType<typeof fixture>) => h.store.recordSwitch({
+    ts: switchedAt, provider: 'openai-codex', fromAccount: old, toAccount: current,
+    trigger: 'manual', outcome: 'reverted-by-codex', publishedAt: switchedAt,
+  });
+  const find = (h: ReturnType<typeof fixture>, processes: CodexProcess[], sameProcess = async () => true) =>
+    listCodexOldAccountSessions(h.deps({ dbPath: h.store.dbPath, journalDir: join(h.root, 'journal'),
+      list: async () => processes, sameProcess }), { from: old });
+
+  it('after a revert the holder pid of the old account is reported', async () => {
+    const h = fixture();
+    try {
+      addRevert(h);
+      const sessions = await find(h, [{ pid: 4401, lstart: 'Mon Nov 13 10:00:00 2023', host: 'Orca' }]);
+      assert.deepEqual(sessions, [{ pid: 4401, host: 'Orca', identities: [old], ambiguous: false }]);
+      assert.equal(codexOldAccountLine('old', sessions[0]!), 'Codex running on old account old: pid 4401 (Orca) — restart');
+    } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('a pid whose lstart changed is not reported', async () => {
+    const h = fixture();
+    try {
+      addRevert(h);
+      assert.deepEqual(await find(h, [{ pid: 4401, lstart: 'Mon Nov 13 10:00:00 2023', host: 'Orca' }], async () => false), []);
+    } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('an ambiguous holder set prints the restart-to-resolve text', async () => {
+    const h = fixture();
+    try {
+      addRevert(h);
+      const sessions = await find(h, [{ pid: 4402, lstart: 'Mon Nov 13 12:00:00 2023', host: 'Orca' }]);
+      assert.deepEqual(sessions, [{ pid: 4402, host: 'Orca', identities: [old, current], ambiguous: true }]);
+      assert.equal(codexOldAccountLine('old', sessions[0]!), 'Codex running on a:account or b:account (started during a switch): pid 4402 (Orca) — restart to resolve');
+    } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('a session only on the new account is not reported', async () => {
+    const h = fixture();
+    try {
+      h.store.recordSwitch({ ts: switchedAt, provider: 'openai-codex', fromAccount: old, toAccount: current,
+        trigger: 'manual', outcome: 'ok', publishedAt: switchedAt });
+      assert.deepEqual(await find(h, [{ pid: 4403, lstart: 'Mon Nov 13 13:00:00 2023', host: 'Orca' }]), []);
+    } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
   });
 });

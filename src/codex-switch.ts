@@ -82,6 +82,8 @@ export interface CodexSwitchDeps {
   observationBeforeSave?: AttributeLiveDocumentInput['beforeSave'];
   observationBeforeSaveCommit?: AttributeLiveDocumentInput['beforeSaveCommit'];
   list?: () => Promise<CodexProcess[]>;
+  /** C6-23 test seam; production verifies the pid/lstart pair with `ps`. */
+  sameProcess?: (recorded: Pick<CodexProcess, 'pid' | 'lstart'>) => Promise<boolean>;
   transport?: CodexConsumeOptions['transport'];
   journalDir?: string;
   /**
@@ -1605,6 +1607,62 @@ export async function runDueCodexWatches(deps: CodexSwitchDeps, now: number): Pr
     // An unresolved final tick remains due: it is retried in the grace period until X10b deletes it.
     if (nextAt !== undefined) deps.store.advanceCodexWatch(watch.switchId, nextAt);
   }
+}
+
+/** A completed switch row's outgoing account, used for the step-7 session report. */
+export interface CodexOldAccountSwitchRow {
+  from: string;
+}
+
+/** A still-running process whose conservative holder set includes the switched-away account. */
+export interface CodexOldAccountSession {
+  pid: number;
+  host: string;
+  identities: string[];
+  ambiguous: boolean;
+}
+
+function identitiesHeldAt(process: CodexProcess, sets: ReturnType<typeof holderSets>): string[] {
+  const startedAt = Date.parse(`${process.lstart} UTC`);
+  // An unparseable start time is conservatively ambiguous, just as renewers()
+  // treats it: do not suppress an old-account warning merely because the clock
+  // evidence cannot locate the process in a single holder interval.
+  const applicable = Number.isFinite(startedAt)
+    ? sets.filter((set) => (set.startsAt === null || startedAt >= set.startsAt)
+      && (set.endsAt === null || startedAt < set.endsAt))
+    : sets;
+  return [...new Set(applicable.flatMap((set) => set.identities))].sort();
+}
+
+/**
+ * Step 7: report only live processes whose conservative holder set still includes
+ * the account switched away from. A second pid/lstart read rejects PID reuse.
+ */
+export async function listCodexOldAccountSessions(
+  deps: Pick<CodexSwitchDeps, 'dbPath' | 'journalDir' | 'list' | 'sameProcess'>,
+  switchRow: CodexOldAccountSwitchRow,
+): Promise<CodexOldAccountSession[]> {
+  if (!deps.dbPath || !deps.list) throw new Error('Codex old-account session dependencies are required');
+  const history = readCodexSwitchHistory(deps.dbPath, { journalDir: deps.journalDir });
+  const sets = holderSets(history.rows, history.observations);
+  const sameProcess = deps.sameProcess ?? stillTheSameProcess;
+  const current = await deps.list();
+  const sessions = await Promise.all(current.map(async (process) => {
+    if (!await sameProcess(process)) return undefined;
+    const identities = identitiesHeldAt(process, sets);
+    if (!identities.includes(switchRow.from)) return undefined;
+    return { pid: process.pid, host: process.host, identities, ambiguous: identities.length > 1 } satisfies CodexOldAccountSession;
+  }));
+  return sessions.filter((session): session is CodexOldAccountSession => session !== undefined)
+    .sort((left, right) => left.pid - right.pid);
+}
+
+/** Exact §4.4.1 step-7 status/doctor text for a surviving old-account session. */
+export function codexOldAccountLine(oldAccountAlias: string, session: CodexOldAccountSession): string {
+  if (session.ambiguous) {
+    return `Codex running on ${session.identities.join(' or ')} (started during a switch): pid ${session.pid} (${session.host}) — restart to resolve`;
+  }
+  return `Codex running on old account ${oldAccountAlias}: pid ${session.pid} (${session.host}) — restart`;
 }
 
 /** C6-18: switch through the journaled publication; C6-20 supplies recovery. */
