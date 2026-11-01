@@ -1746,7 +1746,7 @@ export class Migration {
     // account names no old item, so there is nothing to delete. C9 (NATIVE)
     // keeps a kept legacy copy (OQ-8).
     if (
-      (current.state === 'MIRRORED' || (current.state === 'VALIDATED' && current.ownerFile === 'staging'))
+      (current.state === 'MIRRORED' || (current.state === 'VALIDATED' && this.claimPathPresent(this.stagingPath())))
       && (this.provider === 'xai' || this.provider === 'kimi-coding')
       && current.detail.accounts !== undefined
     ) {
@@ -1842,7 +1842,9 @@ export class Migration {
         return parsed as OwnerFile;
       }
     } catch {
-      // unreadable; fall back to the journal
+      // Stage callers that request refuseInvalidStagingFile fail closed when
+      // this path is present. Lenient readers, including rollback, intentionally
+      // fall back to the journal so recovery can delete its staged item.
     }
     return null;
   }
@@ -2045,6 +2047,9 @@ export class Migration {
    * The journal is the xai/kimi-coding pre-commit delete authority. It must
    * hold exactly one account, and a staging owner file that resolves to a
    * different Keychain item refuses, so every check runs before any delete.
+   * With refuseInvalidStagingFile, stage fails closed when a present staging
+   * file is invalid; rollback deliberately uses the lenient default so it can
+   * recover by deleting the journaled staged item.
    */
   private journalStagedKeychain(
     provider: SingleGrantKeychainProvider,
@@ -2057,7 +2062,7 @@ export class Migration {
     const meta = journalAccounts[0] as OwnerFile['accounts'][number];
     const coords = resolveSingleGrantKeychain(provider, meta);
     const staging = this.readStagingOwnerFile();
-    if (!staging && refuseInvalidStagingFile && existsSync(this.stagingPath())) {
+    if (!staging && refuseInvalidStagingFile && this.claimPathPresent(this.stagingPath())) {
       throw new JournalKeychainInvalidError();
     }
     if (staging) {

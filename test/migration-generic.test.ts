@@ -692,6 +692,93 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       }
     });
 
+    it(`T-KC11h [${provider}] a dangling staging symlink refuses before deleting the old staged copy`, () => {
+      const legacy = legacyKmCoords(provider);
+      const kc = new DeleteTrackingKeychain();
+      const h = oldPreCommitFixture(provider, 'VALIDATED', kc);
+      try {
+        rmSync(h.staging);
+        const target = join(h.dir, 'missing-staging-owner');
+        symlinkSync(target, h.staging);
+        const before = snapshotRestage(h, provider);
+        kc.deleteCalls.length = 0;
+
+        assert.throws(
+          () => h.mig.stage(),
+          (error: unknown) => (error as { code?: unknown }).code === 'journal-keychain-invalid'
+            && (error as { exitCode?: unknown }).exitCode === 3,
+        );
+        assert.deepEqual(kc.deleteCalls, []);
+        assert.deepEqual(snapshotRestage(h, provider), before);
+        assert.equal(readlinkSync(h.staging), target, 'the dangling staging symlink stays in place');
+        assert.ok(kc.getSync(legacy.service, legacy.account));
+      } finally {
+        h.cleanup();
+      }
+    });
+
+    it(`T-KC11f [${provider}] foreign-owner and unreadable staging files refuse before deleting the old staged copy`, () => {
+      const legacy = legacyKmCoords(provider);
+      const cases: Array<[string, (h: OldFixture) => (() => void) | undefined]> = [
+        ['foreign owner', (h) => {
+          const owner = JSON.parse(readFileSync(h.staging, 'utf8')) as Record<string, unknown>;
+          owner.owner = 'pi';
+          writeFileSync(h.staging, JSON.stringify(owner, null, 2) + '\n');
+          return undefined;
+        }],
+        ['unreadable file', (h) => {
+          chmodSync(h.staging, 0o000);
+          return () => chmodSync(h.staging, 0o600);
+        }],
+      ];
+      for (const [name, makeInvalid] of cases) {
+        const kc = new DeleteTrackingKeychain();
+        const h = oldPreCommitFixture(provider, 'MIRRORED', kc);
+        let restore: (() => void) | undefined;
+        try {
+          restore = makeInvalid(h);
+          kc.deleteCalls.length = 0;
+
+          assert.throws(
+            () => h.mig.stage(),
+            (error: unknown) => (error as { code?: unknown }).code === 'journal-keychain-invalid'
+              && (error as { exitCode?: unknown }).exitCode === 3,
+            name,
+          );
+          assert.deepEqual(kc.deleteCalls, [], `${name}: nothing deleted`);
+          assert.ok(kc.getSync(legacy.service, legacy.account), `${name}: legacy item stays`);
+        } finally {
+          restore?.();
+          h.cleanup();
+        }
+      }
+    });
+
+    it(`T-KC11g [${provider}] an unparseable auth.json refuses before deleting a VALIDATED journal's old staged copy`, () => {
+      const legacy = legacyKmCoords(provider);
+      const invalidAuthJson: Array<[string, string]> = [
+        ['not a JSON object', JSON.stringify('not an object')],
+        ['no importable grant', '{}'],
+        ['no access and refresh', JSON.stringify({ [provider]: { type: 'oauth' } })],
+      ];
+      for (const [name, authJson] of invalidAuthJson) {
+        const kc = new DeleteTrackingKeychain();
+        const h = oldPreCommitFixture(provider, 'VALIDATED', kc);
+        try {
+          writeFileSync(h.authPath, authJson + '\n');
+          const before = snapshotRestage(h, provider);
+          kc.deleteCalls.length = 0;
+
+          assert.throws(() => h.mig.stage(), Error, name);
+          assert.deepEqual(kc.deleteCalls, [], `${name}: nothing deleted`);
+          assert.deepEqual(snapshotRestage(h, provider), before, name);
+          assert.ok(kc.getSync(legacy.service, legacy.account), `${name}: legacy item stays`);
+        } finally {
+          h.cleanup();
+        }
+      }
+    });
+
     it(`T-KC11g [${provider}] a missing auth.json refuses before deleting a VALIDATED journal's old staged copy`, () => {
       const legacy = legacyKmCoords(provider);
       const kc = new DeleteTrackingKeychain();
