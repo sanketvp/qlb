@@ -185,9 +185,8 @@ describe('Pi migration S58 credential-first barrier', () => {
     }
   });
 
-  it('openai-codex migrate and both anthropic operations remain provider-not-enabled when the test seam enables them', () => {
+  it('both anthropic operations remain provider-not-enabled when the test seam enables it', () => {
     for (const [provider, operation] of [
-      ['openai-codex', migratePiSingleProvider],
       ['anthropic', migratePiSingleProvider],
       ['anthropic', rollbackPiSingleProvider],
     ] as const) {
@@ -1885,6 +1884,236 @@ describe('Pi migration S58 credential-first barrier', () => {
       assert.equal(placeholderPresent(h.paths, 'openai-codex'), true);
     } finally { h.cleanup(); }
   });
+
+  it('openai-codex: migrate writes baseline, placeholder and owner entry and records pi.openai-codex.state without any Keychain write', () => {
+    const h = setup();
+    try {
+      const native = { ...oauth('codex-native'), accountId: 'acct-codex' };
+      writeFileSync(h.paths.authJsonPath, JSON.stringify({ 'openai-codex': native }), { mode: 0o600 });
+      let sets = 0;
+      const keychain = {
+        getSync: h.keychain.getSync.bind(h.keychain),
+        setSync: (...args: Parameters<MockKeychain['setSync']>) => { sets += 1; h.keychain.setSync(...args); },
+        deleteSync: h.keychain.deleteSync.bind(h.keychain),
+      };
+      const result = migratePiSingleProvider('openai-codex', h.paths, { keychain, store: h.store, enabledProviders: ALL });
+      assert.deepEqual(result.wouldWrite, ['baseline:openai-codex', 'placeholder:openai-codex', 'owner:openai-codex']);
+      assert.equal(sets, 0);
+      const auth = JSON.parse(readFileSync(h.paths.authJsonPath, 'utf8')) as Record<string, unknown>;
+      assert.equal(placeholderPresent(h.paths, 'openai-codex'), true);
+      assert.deepEqual(JSON.parse(readFileSync(join(h.paths.baselineDir, 'openai-codex.json'), 'utf8')), native);
+      assert.equal((JSON.parse(readFileSync(h.paths.ownerPath, 'utf8')) as { providers: Record<string, { mode: string }> }).providers['openai-codex']?.mode, 'qlb');
+      assert.equal(h.store.getConfig('pi.openai-codex.state'), 'migrated');
+      assert.equal(h.store.listLineageTransitions('openai-codex', 'default').length, 0);
+      assert.equal(h.store.getAccount('openai-codex-default'), null);
+      assert.equal(auth['openai-codex'] !== undefined, true);
+    } finally { h.cleanup(); }
+  });
+
+  it('openai-codex: the publishing phase is journaled before the placeholder is written', () => {
+    const h = setup();
+    try {
+      writeFileSync(h.paths.authJsonPath, JSON.stringify({ 'openai-codex': oauth('native') }), { mode: 0o600 });
+      migratePiSingleProvider('openai-codex', h.paths, {
+        keychain: h.keychain, store: h.store, enabledProviders: ALL,
+        afterWrite: (point) => {
+          if (point !== 'publishing') return;
+          assert.equal(placeholderPresent(h.paths, 'openai-codex'), false);
+          assert.equal(JSON.parse(readFileSync(join(h.paths.journalPath, 'pi-migrate-openai-codex.json'), 'utf8')).phase, 'publishing');
+        },
+      });
+    } finally { h.cleanup(); }
+  });
+
+  it('openai-codex: dry-run lists baseline, placeholder and owner and changes nothing on disk or in the store', () => {
+    const h = setup();
+    try {
+      writeFileSync(h.paths.authJsonPath, JSON.stringify({ 'openai-codex': oauth('native') }), { mode: 0o600 });
+      const before = readFileSync(h.paths.authJsonPath, 'utf8');
+      const result = migratePiSingleProvider('openai-codex', h.paths, { keychain: h.keychain, store: h.store, enabledProviders: ALL }, { dryRun: true });
+      assert.deepEqual(result.wouldWrite, ['baseline:openai-codex', 'placeholder:openai-codex', 'owner:openai-codex']);
+      assert.equal(readFileSync(h.paths.authJsonPath, 'utf8'), before);
+      assert.equal(existsSync(h.paths.ownerPath), false);
+      assert.equal(h.store.getConfig('pi.openai-codex.state'), null);
+    } finally { h.cleanup(); }
+  });
+
+  it('openai-codex: writes not-applicable with reason no-pi-credential when auth.json has no entry and nothing owns the provider', () => {
+    const h = setup();
+    try {
+      writeFileSync(h.paths.authJsonPath, '{}', { mode: 0o600 });
+      const result = migratePiSingleProvider('openai-codex', h.paths, { keychain: h.keychain, store: h.store, enabledProviders: ALL });
+      assert.deepEqual(result, { provider: 'openai-codex', state: 'not-applicable', resumed: false, wouldWrite: ['baseline:openai-codex', 'placeholder:openai-codex', 'owner:openai-codex'], reason: 'no-pi-credential' });
+      assert.equal(existsSync(h.paths.ownerPath), false);
+      assert.equal(existsSync(join(h.paths.baselineDir, 'openai-codex.json')), false);
+      assert.equal(existsSync(join(h.paths.journalPath, 'pi-migrate-openai-codex.json')), false);
+      assert.equal(h.store.getConfig('pi.openai-codex.state'), 'not-applicable');
+    } finally { h.cleanup(); }
+  });
+
+  it('openai-codex: refuses native-entry-removed when state is migrated and the entry is gone, and rollback then restores the baseline', () => {
+    const h = setupCodexRollback();
+    try {
+      writeFileSync(h.paths.authJsonPath, '{}', { mode: 0o600 });
+      expectRefusal(h, 'openai-codex', 'native-entry-removed', () => migratePiSingleProvider('openai-codex', h.paths, { keychain: h.keychain, store: h.store, enabledProviders: ALL }));
+      rollbackPiSingleProvider('openai-codex', h.paths, { keychain: h.keychain, store: h.store, enabledProviders: ALL });
+      assert.deepEqual(JSON.parse(readFileSync(h.paths.authJsonPath, 'utf8'))['openai-codex'], h.baseline);
+    } finally { h.cleanup(); }
+  });
+
+  it('openai-codex: refuses native-entry-rewritten when state is migrated, no journal exists and the entry is not the placeholder', () => {
+    const h = setupCodexRollback();
+    try {
+      writeFileSync(h.paths.authJsonPath, JSON.stringify({ 'openai-codex': oauth('rewritten') }), { mode: 0o600 });
+      expectRefusal(h, 'openai-codex', 'native-entry-rewritten', () => migratePiSingleProvider('openai-codex', h.paths, { keychain: h.keychain, store: h.store, enabledProviders: ALL }));
+    } finally { h.cleanup(); }
+  });
+
+  it('openai-codex: refuses unless the generic migration is at rest', () => {
+    const h = setup();
+    try {
+      writeFileSync(h.paths.authJsonPath, JSON.stringify({ 'openai-codex': oauth('native') }), { mode: 0o600 });
+      h.store.upsertMigration('pi-openai-codex', 'MIRRORED', '{}');
+      expectRefusal(h, 'openai-codex', 'owned-by-generic-migrate', () => migratePiSingleProvider('openai-codex', h.paths, { keychain: h.keychain, store: h.store, enabledProviders: ALL }));
+    } finally { h.cleanup(); }
+  });
+
+  for (const point of ['baseline', 'publishing', 'placeholder', 'owner-entry', 'before-committed'] as const) {
+    it(`openai-codex: resumes and rolls back from ${point}`, () => {
+      const h = setup();
+      try {
+        const native = oauth('codex-native');
+        writeFileSync(h.paths.authJsonPath, JSON.stringify({ 'openai-codex': native }), { mode: 0o600 });
+        assert.throws(() => migratePiSingleProvider('openai-codex', h.paths, {
+          keychain: h.keychain, store: h.store, enabledProviders: ALL,
+          afterWrite: (written) => { if (written === point) throw new Error('injected crash'); },
+        }));
+        migratePiSingleProvider('openai-codex', h.paths, { keychain: h.keychain, store: h.store, enabledProviders: ALL });
+        rollbackPiSingleProvider('openai-codex', h.paths, { keychain: h.keychain, store: h.store, enabledProviders: ALL });
+        assert.equal(typeof (JSON.parse(readFileSync(h.paths.authJsonPath, 'utf8'))['openai-codex'] as { refresh?: unknown }).refresh, 'string');
+      } finally { h.cleanup(); }
+    });
+  }
+
+  it('openai-codex: a rotation between a crash at baseline and the resume lands in the baseline', () => {
+    const h = setup();
+    try {
+      writeFileSync(h.paths.authJsonPath, JSON.stringify({ 'openai-codex': oauth('old') }), { mode: 0o600 });
+      assert.throws(() => migratePiSingleProvider('openai-codex', h.paths, { keychain: h.keychain, store: h.store, enabledProviders: ALL, afterWrite: (point) => { if (point === 'baseline') throw new Error('crash'); } }));
+      const rotated = oauth('rotated');
+      writeFileSync(h.paths.authJsonPath, JSON.stringify({ 'openai-codex': rotated }), { mode: 0o600 });
+      migratePiSingleProvider('openai-codex', h.paths, { keychain: h.keychain, store: h.store, enabledProviders: ALL });
+      assert.deepEqual(JSON.parse(readFileSync(join(h.paths.baselineDir, 'openai-codex.json'), 'utf8')), rotated);
+      rollbackPiSingleProvider('openai-codex', h.paths, { keychain: h.keychain, store: h.store, enabledProviders: ALL });
+      assert.deepEqual(JSON.parse(readFileSync(h.paths.authJsonPath, 'utf8'))['openai-codex'], rotated);
+    } finally { h.cleanup(); }
+  });
+
+  it('openai-codex: a rotation after the publishing phase is journaled does not touch the baseline and refuses the resume', () => {
+    const h = setup();
+    try {
+      const native = oauth('native');
+      writeFileSync(h.paths.authJsonPath, JSON.stringify({ 'openai-codex': native }), { mode: 0o600 });
+      assert.throws(() => migratePiSingleProvider('openai-codex', h.paths, { keychain: h.keychain, store: h.store, enabledProviders: ALL, afterWrite: (point) => { if (point === 'publishing') throw new Error('crash'); } }));
+      const baseline = readFileSync(join(h.paths.baselineDir, 'openai-codex.json'));
+      writeFileSync(h.paths.authJsonPath, JSON.stringify({ 'openai-codex': oauth('rotated') }), { mode: 0o600 });
+      assert.throws(() => migratePiSingleProvider('openai-codex', h.paths, { keychain: h.keychain, store: h.store, enabledProviders: ALL }), /entry changed after publication/);
+      assert.equal(readFileSync(join(h.paths.baselineDir, 'openai-codex.json')).equals(baseline), true);
+    } finally { h.cleanup(); }
+  });
+
+  it('openai-codex: a resume from a journal at consumption-recorded decides its refusals before the phase-dropped write', () => {
+    const h = setup();
+    try {
+      const native = oauth('native');
+      writeFileSync(h.paths.authJsonPath, JSON.stringify({ 'openai-codex': native }), { mode: 0o600 });
+      mkdirSync(h.paths.baselineDir, { recursive: true, mode: 0o700 });
+      writeFileSync(join(h.paths.baselineDir, 'openai-codex.json'), JSON.stringify(native), { mode: 0o600 });
+      writePiJournal(h.paths, 'openai-codex', 'consumption-recorded', { priorBaselineConsumedBy: '' });
+      h.store.upsertMigration('pi-openai-codex', 'MIRRORED', '{}');
+      let writes = 0;
+      expectRefusal(h, 'openai-codex', 'owned-by-generic-migrate', () => migratePiSingleProvider('openai-codex', h.paths, { keychain: h.keychain, store: h.store, enabledProviders: ALL, afterWrite: () => { writes += 1; } }));
+      assert.equal(writes, 0);
+      h.store.upsertMigration('pi-openai-codex', 'NATIVE', '{}');
+      let first = '';
+      migratePiSingleProvider('openai-codex', h.paths, { keychain: h.keychain, store: h.store, enabledProviders: ALL, afterWrite: (point) => { if (!first) first = point; } });
+      assert.equal(first, 'phase-dropped');
+    } finally { h.cleanup(); }
+  });
+
+  it('openai-codex: dry-run reports the git-work-tree and generic-ownership refusals', () => {
+    const h = setup();
+    try {
+      writeFileSync(h.paths.authJsonPath, JSON.stringify({ 'openai-codex': oauth('native') }), { mode: 0o600 });
+      h.store.upsertMigration('pi-openai-codex', 'MIRRORED', '{}');
+      expectRefusal(h, 'openai-codex', 'owned-by-generic-migrate', () => migratePiSingleProvider('openai-codex', h.paths, { keychain: h.keychain, store: h.store, enabledProviders: ALL }, { dryRun: true }));
+      h.store.upsertMigration('pi-openai-codex', 'NATIVE', '{}');
+      gitInit(h.dir);
+      expectRefusal(h, 'openai-codex', 'pi-path-in-git-worktree', () => migratePiSingleProvider('openai-codex', h.paths, { keychain: h.keychain, store: h.store, enabledProviders: ALL }, { dryRun: true }));
+    } finally { h.cleanup(); }
+  });
+
+  it('openai-codex: refuses a placeholder entry with no journal before writing anything', () => {
+    const h = setup();
+    try {
+      writeFileSync(h.paths.authJsonPath, JSON.stringify({ 'openai-codex': { type: 'oauth', access: 'qlb-managed', refresh: '', expires: 1 } }), { mode: 0o600 });
+      const before = readFileSync(h.paths.authJsonPath, 'utf8');
+      assert.throws(() => migratePiSingleProvider('openai-codex', h.paths, { keychain: h.keychain, store: h.store, enabledProviders: ALL }), /baseline would be a placeholder/);
+      assert.equal(readFileSync(h.paths.authJsonPath, 'utf8'), before);
+      assert.equal(existsSync(join(h.paths.journalPath, 'pi-migrate-openai-codex.json')), false);
+    } finally { h.cleanup(); }
+  });
+
+  it('openai-codex: a crash between the publishing journal and the placeholder write resumes and writes the placeholder', () => {
+    const h = setup();
+    try {
+      const native = oauth('native');
+      writeFileSync(h.paths.authJsonPath, JSON.stringify({ 'openai-codex': native }), { mode: 0o600 });
+      assert.throws(() => migratePiSingleProvider('openai-codex', h.paths, { keychain: h.keychain, store: h.store, enabledProviders: ALL, afterWrite: (point) => { if (point === 'publishing') throw new Error('crash'); } }));
+      const baseline = readFileSync(join(h.paths.baselineDir, 'openai-codex.json'));
+      migratePiSingleProvider('openai-codex', h.paths, { keychain: h.keychain, store: h.store, enabledProviders: ALL });
+      assert.equal(placeholderPresent(h.paths, 'openai-codex'), true);
+      assert.equal(readFileSync(join(h.paths.baselineDir, 'openai-codex.json')).equals(baseline), true);
+    } finally { h.cleanup(); }
+  });
+
+  it('openai-codex: a completed migration re-run is idempotent', () => {
+    const h = setup();
+    try {
+      writeFileSync(h.paths.authJsonPath, JSON.stringify({ 'openai-codex': oauth('native') }), { mode: 0o600 });
+      migratePiSingleProvider('openai-codex', h.paths, { keychain: h.keychain, store: h.store, enabledProviders: ALL });
+      let writes = 0;
+      const result = migratePiSingleProvider('openai-codex', h.paths, { keychain: h.keychain, store: h.store, enabledProviders: ALL, afterWrite: () => { writes += 1; } });
+      assert.equal(result.state, 'migrated');
+      assert.equal(writes, 0);
+    } finally { h.cleanup(); }
+  });
+
+  it('openai-codex: a lock takeover before the baseline write exits 3 and writes nothing', () => {
+    const h = setup();
+    try {
+      writeFileSync(h.paths.authJsonPath, JSON.stringify({ 'openai-codex': oauth('native') }), { mode: 0o600 });
+      const takenOverOnEntry = <T,>(path: string, fn: (refresh: () => void) => T): T => withPiAuthLock(path, (refresh) => {
+        writeFileSync(join(`${path}.lock`, 'qlb-lock-owner.json'), JSON.stringify({ pid: process.pid, nonce: 'foreign' }));
+        return fn(refresh);
+      });
+      assert.throws(() => migratePiSingleProvider('openai-codex', h.paths, { keychain: h.keychain, store: h.store, enabledProviders: ALL, withAuthLock: takenOverOnEntry }), (error: unknown) => (error as { code?: unknown; exitCode?: unknown }).code === 'pi-auth-lock-lost' && (error as { exitCode?: unknown }).exitCode === 3);
+      assert.equal(existsSync(join(h.paths.baselineDir, 'openai-codex.json')), false);
+    } finally { h.cleanup(); }
+  });
+
+  for (const point of ['baseline', 'publishing', 'placeholder', 'owner-entry'] as const) {
+    it(`openai-codex: a lock takeover after ${point} stops migrate before the next write class`, () => {
+      const h = setup();
+      try {
+        writeFileSync(h.paths.authJsonPath, JSON.stringify({ 'openai-codex': oauth('native') }), { mode: 0o600 });
+        assert.throws(() => migratePiSingleProvider('openai-codex', h.paths, {
+          keychain: h.keychain, store: h.store, enabledProviders: ALL, withAuthLock: (path, fn) => withPiAuthLock(path, fn),
+          afterWrite: (written) => { if (written === point) writeFileSync(join(`${h.paths.authJsonPath}.lock`, 'qlb-lock-owner.json'), JSON.stringify({ pid: process.pid, nonce: 'foreign' })); },
+        }), (error: unknown) => (error as { code?: unknown; exitCode?: unknown }).code === 'pi-auth-lock-lost' && (error as { exitCode?: unknown }).exitCode === 1);
+      } finally { h.cleanup(); }
+    });
+  }
 
   it('resolves a symlinked auth target before the git worktree check', () => {
     const h = setup(); const target = mkdtempSync(join(tmpdir(), 'qlb-pi-target-'));

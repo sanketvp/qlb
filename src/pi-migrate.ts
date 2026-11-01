@@ -50,9 +50,9 @@ function assertEnabledProvider(provider: PiMigrateProvider, enabled: ReadonlySet
   if (!enabled.has(provider)) throw refusal('provider-not-enabled');
 }
 function assertProviderImplemented(provider: PiMigrateProvider): void {
-  // P7-1a implements only the legacy single-provider migration path. The test
-  // seam may enable future providers, but it must not expose that incomplete path.
-  if (!isPiSingleProvider(provider)) throw refusal('provider-not-enabled');
+  // Anthropic remains gated until its no-import path lands. OpenAI Codex is
+  // implemented behind the enabledProviders test seam by P7-2.
+  if (!isPiSingleProvider(provider) && provider !== 'openai-codex') throw refusal('provider-not-enabled');
 }
 function assertRollbackProviderImplemented(provider: PiMigrateProvider): void {
   if (!isPiSingleProvider(provider) && provider !== 'openai-codex') throw refusal('provider-not-enabled');
@@ -112,6 +112,14 @@ function updatePhase(paths: PiMigratePaths, provider: PiMigrateProvider, phase: 
   writeJournal(journalPath(paths, provider), { provider, phase, ownerPid: process.pid, updatedAt: Date.now(), ...(current?.priorBaselineConsumedBy !== undefined ? { priorBaselineConsumedBy: current.priorBaselineConsumedBy } : {}), ...fields }, refresh);
 }
 function fingerprint(value: string): string { return `sha256:${createHash('sha256').update(value, 'utf8').digest('hex')}`; }
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    const object = value as JsonObject;
+    return `{${Object.keys(object).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(object[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
 function managedService(provider: PiMigrateProvider): string { return qlbKeychainService(provider, 'default'); }
 function parseOAuth(entry: unknown, provider: OAuthProvider): JsonObject { const credential = asObject(entry, `Pi auth.json has no ${provider} credential`); if (typeof credential.access !== 'string' || !credential.access || typeof credential.refresh !== 'string' || !credential.refresh || typeof credential.expires !== 'number' || !Number.isFinite(credential.expires)) throw new Error(`Pi auth.json ${provider} credential is invalid`); return credential; }
 export function isPiPlaceholder(entry: unknown): boolean { return !!entry && typeof entry === 'object' && !Array.isArray(entry) && (entry as JsonObject).access === 'qlb-managed' && (entry as JsonObject).refresh === '' && (entry as JsonObject).type === 'oauth'; }
@@ -367,6 +375,128 @@ function stashKeptGenericCopy(
   }
 }
 
+interface CodexMigrationPreflight {
+  journal: Journal | null;
+  auth: JsonObject;
+  owner: JsonObject;
+  current: JsonObject | undefined;
+  baseline: JsonObject | undefined;
+  chosen: JsonObject | undefined;
+  alreadyMigrated: boolean;
+  notApplicable: boolean;
+}
+
+/** All P7-2 refusal decisions and refresh-rule reads happen before its first write. */
+function preflightCodexMigration(paths: PiMigratePaths, deps: PiMigrateDeps): CodexMigrationPreflight {
+  const journal = readJournal(paths, 'openai-codex');
+  if (!genericMigrationAtRest('openai-codex', paths, deps, journal)) throw genericMigrationOwnedError();
+  const auth = readAuth(paths.authJsonPath); const owner = readPiOwnerProviders(paths.ownerPath);
+  const rawCurrent = auth['openai-codex'];
+  const stateMigrated = deps.store!.getConfig('pi.openai-codex.state') === 'migrated';
+  const ownerPresent = isPiQlbOwnerEntry(owner['openai-codex']);
+  const alreadyMigrated = !journal && isPiPlaceholder(rawCurrent) && ownerPresent;
+  if (alreadyMigrated) return { journal, auth, owner, current: undefined, baseline: undefined, chosen: undefined, alreadyMigrated, notApplicable: false };
+  if (!journal && stateMigrated && rawCurrent !== undefined && !isPiPlaceholder(rawCurrent)) throw refusal('native-entry-rewritten');
+  if (rawCurrent === undefined && (stateMigrated || ownerPresent) && (!journal || !phaseAtLeast(journal.phase, 'baseline'))) {
+    throw refusal('native-entry-removed', 'run qlb pi rollback openai-codex, then re-run');
+  }
+  if (!journal && isPiPlaceholder(rawCurrent)) throw placeholderBaselineError('openai-codex');
+  const noEvidence = rawCurrent === undefined && !stateMigrated && !ownerPresent && (!journal || journal.phase === 'started');
+  if (noEvidence) return { journal, auth, owner, current: undefined, baseline: undefined, chosen: undefined, alreadyMigrated: false, notApplicable: true };
+
+  let baseline: JsonObject | undefined;
+  const file = baselinePath(paths, 'openai-codex');
+  if (existsSync(file)) {
+    try { baseline = parseOAuth(JSON.parse(readFileSync(file, 'utf8')), 'openai-codex'); } catch { throw new Error('Pi openai-codex baseline is invalid'); }
+  }
+  let current: JsonObject | undefined;
+  if (rawCurrent !== undefined && !isPiPlaceholder(rawCurrent)) current = parseOAuth(rawCurrent, 'openai-codex');
+  if (!current && !baseline) {
+    if (journal && phaseAtLeast(journal.phase, 'publishing')) throw new Error('Pi openai-codex entry changed after publication');
+    throw new Error('Pi auth.json has no openai-codex credential');
+  }
+  const chosen = current && (!baseline || canonicalJson(current) !== canonicalJson(baseline)) ? current : baseline!;
+  return { journal, auth, owner, current, baseline, chosen, alreadyMigrated: false, notApplicable: false };
+}
+
+/** S61's no-import OpenAI Codex migration. It never reads or writes Keychain. */
+function migrateOpenAiCodex(paths: PiMigratePaths, deps: PiMigrateDeps, options: { dryRun?: boolean }): PiMigrateResult {
+  const wouldWrite = ['baseline:openai-codex', 'placeholder:openai-codex', 'owner:openai-codex'];
+  if (options.dryRun) {
+    checkPaths(paths, deps);
+    const preflight = preflightCodexMigration(paths, deps);
+    return { provider: 'openai-codex', state: preflight.notApplicable ? 'not-applicable' : 'migrated', resumed: preflight.journal !== null, wouldWrite, ...(preflight.notApplicable ? { reason: 'no-pi-credential' as const } : {}) };
+  }
+  checkPaths(paths, deps);
+  const lock = deps.withAuthLock ?? ((path, fn) => withPiAuthLock(path, fn, deps.authLockTiming));
+  let resumed = false;
+  let state: PiMigrateResult['state'] = 'migrated';
+  let reason: PiMigrateResult['reason'];
+  underAuthLock(lock, paths.authJsonPath, (refresh) => {
+    const preflight = preflightCodexMigration(paths, deps);
+    resumed = preflight.journal !== null;
+    if (preflight.alreadyMigrated) return;
+    let journal = preflight.journal;
+    if (preflight.notApplicable) {
+      if (!journal) {
+        updatePhase(paths, 'openai-codex', 'started', refresh, { priorBaselineConsumedBy: deps.store!.getConfig('pi.openai-codex.baselineConsumedBy') ?? '' });
+        journal = readJournal(paths, 'openai-codex');
+      }
+      refresh(); deps.store!.setConfig('pi.openai-codex.state', 'not-applicable');
+      updatePhase(paths, 'openai-codex', 'committed', refresh); refresh(); rmSync(journalPath(paths, 'openai-codex'), { force: true });
+      state = 'not-applicable'; reason = 'no-pi-credential';
+      return;
+    }
+    if (!journal) {
+      updatePhase(paths, 'openai-codex', 'started', refresh, { priorBaselineConsumedBy: deps.store!.getConfig('pi.openai-codex.baselineConsumedBy') ?? '' });
+      journal = readJournal(paths, 'openai-codex')!;
+    }
+    // P7-4 adds its consumer computation immediately before this shared re-entry.
+    if (journal.phase === 'consumption-recorded') {
+      updatePhase(paths, 'openai-codex', 'baseline', refresh);
+      journal = readJournal(paths, 'openai-codex')!;
+      deps.afterWrite?.('phase-dropped');
+    }
+    let baseline = preflight.baseline;
+    const chosenIsCurrent = preflight.current !== undefined && preflight.chosen === preflight.current;
+    if (!phaseAtLeast(journal.phase, 'publishing') && chosenIsCurrent && (!baseline || canonicalJson(preflight.current) !== canonicalJson(baseline))) {
+      refresh(); writeJson(baselinePath(paths, 'openai-codex'), preflight.current);
+      baseline = preflight.current;
+      updatePhase(paths, 'openai-codex', 'baseline', refresh);
+      journal = readJournal(paths, 'openai-codex')!;
+      deps.afterWrite?.('baseline');
+    } else if (!phaseAtLeast(journal.phase, 'baseline')) {
+      updatePhase(paths, 'openai-codex', 'baseline', refresh);
+      journal = readJournal(paths, 'openai-codex')!;
+      deps.afterWrite?.('baseline');
+    }
+    if (!baseline) throw new Error('Pi auth.json has no openai-codex credential');
+    if (phaseAtLeast(journal.phase, 'publishing')) {
+      if (!isPiPlaceholder(preflight.auth['openai-codex'])) {
+        if (canonicalJson(preflight.auth['openai-codex']) !== canonicalJson(baseline)) throw new Error('Pi openai-codex entry changed after publication');
+        preflight.auth['openai-codex'] = piPlaceholder(); refresh(); writeJson(paths.authJsonPath, preflight.auth); deps.afterWrite?.('placeholder');
+      }
+    } else {
+      updatePhase(paths, 'openai-codex', 'publishing', refresh);
+      journal = readJournal(paths, 'openai-codex')!;
+      deps.afterWrite?.('publishing');
+      preflight.auth['openai-codex'] = piPlaceholder(); refresh(); writeJson(paths.authJsonPath, preflight.auth); deps.afterWrite?.('placeholder');
+    }
+    if (!isPiQlbOwnerEntry(readPiOwnerProviders(paths.ownerPath)['openai-codex'])) {
+      refresh(); writePiOwnerEntry(paths.ownerPath, 'openai-codex', true); deps.afterWrite?.('owner-entry');
+    }
+    if (!phaseAtLeast(journal.phase, 'published')) {
+      updatePhase(paths, 'openai-codex', 'published', refresh);
+      journal = readJournal(paths, 'openai-codex')!;
+    }
+    refresh(); deps.store!.setConfig('pi.openai-codex.state', 'migrated');
+    refresh(); deps.store!.setConfig('pi.openai-codex.migratedAt', String(Date.now()));
+    deps.afterWrite?.('before-committed');
+    updatePhase(paths, 'openai-codex', 'committed', refresh); refresh(); rmSync(journalPath(paths, 'openai-codex'), { force: true });
+  });
+  return { provider: 'openai-codex', state, resumed, wouldWrite, ...(reason ? { reason } : {}) };
+}
+
 /** P7a migration with S58's credential-first publication order. */
 export function migratePiSingleProvider(provider: PiMigrateProvider, paths: PiMigratePaths = defaultPiMigratePaths(), deps: PiMigrateDeps, options: { dryRun?: boolean } = {}): PiMigrateResult {
   assertPiMigrateProvider(provider);
@@ -374,6 +504,7 @@ export function migratePiSingleProvider(provider: PiMigrateProvider, paths: PiMi
   assertEnabledProvider(provider, enabled);
   requireStore(provider, deps);
   assertProviderImplemented(provider);
+  if (provider === 'openai-codex') return migrateOpenAiCodex(paths, deps, options);
   const existing = readJournal(paths, provider); const wouldWrite = [managedService(provider), `placeholder:${provider}`, `owner:${provider}`];
   if (options.dryRun) return { provider, state: 'migrated', resumed: existing !== null, wouldWrite };
   checkPaths(paths, deps);
