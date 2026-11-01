@@ -62,8 +62,12 @@ export function resolveQlbHome(home?: string): string {
   return resolvedHome;
 }
 
-function stashRoot(deps: Pick<SingleStashDeps, 'home'>): string {
-  return join(resolveQlbHome(deps.home), '.qlb', 'unclaimed');
+export function stashRootFor(home: string): string {
+  return join(home, '.qlb', 'unclaimed');
+}
+
+export function stashRoot(deps: Pick<SingleStashDeps, 'home'>): string {
+  return stashRootFor(resolveQlbHome(deps.home));
 }
 
 function stashService(provider: SingleStashProvider, stashId: string): string {
@@ -91,7 +95,7 @@ export function credentialLineage(credential: Pick<OAuthCredential, 'access' | '
   return `sha256:${createHash('sha256').update(credential.refresh || credential.access, 'utf8').digest('hex')}`;
 }
 
-function isMissingFile(error: unknown): boolean {
+export function isMissingFile(error: unknown): boolean {
   return !!error && typeof error === 'object' && (error as NodeJS.ErrnoException).code === 'ENOENT';
 }
 
@@ -218,7 +222,7 @@ interface ParsedStash {
   consumedFp: string;
 }
 
-function parseStash(text: string): ParsedStash | null {
+export function parseStash(text: string): ParsedStash | null {
   let value: unknown;
   try { value = JSON.parse(text); } catch { return null; }
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
