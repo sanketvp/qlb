@@ -609,7 +609,8 @@ print('SECOND_ACQUIRED')
     const fake = writeFakeClaude(dir);
     const env = envFor(dir, port, fake);
     const w = spawnTracked('/usr/bin/python3', [WRAPPER, '--exit', '0'], { env });
-    collect(w);
+    const out = collect(w);
+    await waitFor(() => out.stdout.includes('ANTHROPIC_BASE_URL='), 12_000, 'native launch');
     await waitExit(w, 12_000);
     assert.equal(existsSync(join(leases, '1')), false);
     await assertCaseQuiet(dir, port);
