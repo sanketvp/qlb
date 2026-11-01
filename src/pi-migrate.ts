@@ -89,7 +89,7 @@ export function isPiPlaceholder(entry: unknown): boolean { return !!entry && typ
 
 function sleepSync(ms: number): void { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); }
 function lockedError(): Error { return Object.assign(new Error('pi-auth-locked'), { code: 'pi-auth-locked', name: 'PiAuthLockedError' }); }
-function lockLostError(): Error { return Object.assign(new Error('pi-auth-lock-lost: another run took the auth.json lock over'), { code: 'pi-auth-lock-lost', name: 'PiAuthLockLostError' }); }
+function lockLostError(detail = '', cause?: Error): Error { return Object.assign(new Error(`pi-auth-lock-lost: another run took the auth.json lock over${detail}`, cause ? { cause } : undefined), { code: 'pi-auth-lock-lost', name: 'PiAuthLockLostError' }); }
 interface AuthLockOwner { pid: number; nonce: string; }
 function lockOwnerPath(lock: string): string { return join(lock, 'qlb-lock-owner.json'); }
 function readLockOwner(lock: string): AuthLockOwner | null {
@@ -303,7 +303,11 @@ function stashKeptGenericCopy(
   deps.keychain.setSync(stashService, QLB_KEYCHAIN_ACCOUNT, kept);
   if (readKeychainItem(deps, stashService, QLB_KEYCHAIN_ACCOUNT) !== kept) {
     // A stash that does not hold the kept copy must not read as "already preserved" on the next run.
-    assertLockHeld();
+    try { assertLockHeld(); } catch (error) {
+      // Lock lost: removing it now could delete the new holder's stash, so name what is left behind.
+      if ((error as { code?: unknown }).code !== 'pi-auth-lock-lost') throw error;
+      throw lockLostError(`; the unverified kept-copy stash ${stashService} (account ${QLB_KEYCHAIN_ACCOUNT}) was left in place`, keptCopyStashUnverifiedError());
+    }
     try { deps.keychain.deleteSync(stashService, QLB_KEYCHAIN_ACCOUNT); } catch (error) { if (!isCredentialNotFound(error)) throw error; }
     throw keptCopyStashUnverifiedError();
   }

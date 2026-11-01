@@ -1180,6 +1180,39 @@ describe('Pi migration S58 credential-first barrier', () => {
     } finally { h.cleanup(); }
   });
 
+  it('P7a-r: a lock lost before removing an unverified stash names the stash left behind', () => {
+    const h = setup();
+    try {
+      const kept = plantKeptGenericCopy(h, 'xai');
+      const lockOwner = join(`${h.paths.authJsonPath}.lock`, 'qlb-lock-owner.json');
+      const deletes: string[] = [];
+      let stashReads = 0;
+      const keychain = {
+        setSync: h.keychain.setSync.bind(h.keychain),
+        getSync(service: string, account: string) {
+          const value = h.keychain.getSync(service, account);
+          // The presence check throws not-found above, so the first stash value read is the verify read.
+          // Barrier: the read-back differs and holder B takes the lock over at the same moment.
+          if (service !== kept.stashService || ++stashReads !== 1) return value;
+          writeFileSync(lockOwner, JSON.stringify({ pid: process.pid, nonce: 'holder-b' }));
+          return value.slice(0, 10);
+        },
+        deleteSync(service: string, account: string) { deletes.push(`${service}/${account}`); h.keychain.deleteSync(service, account); },
+      };
+      assert.throws(
+        () => migratePiSingleProvider('xai', h.paths, { keychain, store: h.store }),
+        (error: unknown) => {
+          const e = error as { code?: unknown; message?: unknown; cause?: { code?: unknown } };
+          return e.code === 'pi-auth-lock-lost'
+            && String(e.message).includes('another run took the auth.json lock over')
+            && String(e.message).includes(`unverified kept-copy stash ${kept.stashService} (account ${QLB_KEYCHAIN_ACCOUNT})`)
+            && e.cause?.code === 'kept-copy-stash-unverified';
+        },
+      );
+      assert.deepEqual(deletes, [], 'holder A must not delete after the takeover');
+    } finally { h.cleanup(); }
+  });
+
   it('P7a-r: a lock moved aside between the owner check and the touch reports pi-auth-lock-lost', () => {
     const h = setup();
     try {
