@@ -634,6 +634,7 @@ print('SECOND_ACQUIRED')
     const env = envFor(dir, port, fake);
     const w = spawnTracked('/usr/bin/python3', [WRAPPER, '--exit', '0'], { env });
     const out = collect(w);
+    await waitFor(() => out.stdout.includes('ANTHROPIC_BASE_URL='), 12_000, 'native launch');
     await waitExit(w, 12_000);
     console.log(out.stdout.includes('PID_REUSE_REAP=1') ? 'PID_REUSE_REAP=1' : out.stdout);
     assert.match(out.stdout, /PID_REUSE_REAP=1/);
@@ -683,7 +684,8 @@ print('SECOND_ACQUIRED')
     w1.kill('SIGKILL');
     await waitExit(w1, 5_000).catch(() => undefined);
     const w2 = spawnTracked('/usr/bin/python3', [WRAPPER, '--exit', '0'], { env });
-    collect(w2);
+    const o2 = collect(w2);
+    await waitFor(() => o2.stdout.includes('ANTHROPIC_BASE_URL='), 12_000, 'native launch');
     const code = await waitExit(w2, 12_000);
     assert.equal(code, 0);
     await assertCaseQuiet(dir, port);
