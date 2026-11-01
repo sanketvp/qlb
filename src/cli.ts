@@ -1309,7 +1309,7 @@ async function runMigrate(opts: MigrateOpts): Promise<number> {
             opts.authJson,
             opts.ownerFile,
           )
-        : new Migration(store, platformKeychain, opts.poolFile, opts.ownerFile);
+        : new Migration(store, platformKeychain, opts.poolFile, opts.ownerFile, undefined, { authJsonPath: opts.authJson });
     let status;
     switch (opts.sub) {
       case 'stage':

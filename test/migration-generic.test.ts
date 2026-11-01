@@ -1875,7 +1875,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       const ownerPath = join(dir, 'qlb-owner.json');
       const store = openStore(join(dir, 'qlb.db'));
       const kc = new MockKeychain();
-      const mig = new Migration(store, kc, poolPath, ownerPath);
+      const mig = new Migration(store, kc, poolPath, ownerPath, undefined, { authJsonPath: join(dir, 'auth.json') });
       writeFileSync(poolPath, JSON.stringify({
         version: 1,
         accounts: [{

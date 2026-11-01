@@ -415,7 +415,7 @@ export function readOwnership(store: Store, provider: string): string {
             DEFAULT_AUTH_JSON,
             ownerFile,
           )
-        : new Migration(store, platformKeychain, DEFAULT_POOL_FILE, ownerFile);
+        : new Migration(store, platformKeychain, DEFAULT_POOL_FILE, ownerFile, undefined, { authJsonPath: DEFAULT_AUTH_JSON });
     return mig.status().state;
   } catch {
     return 'unknown';
