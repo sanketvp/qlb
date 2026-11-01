@@ -82,6 +82,13 @@ export interface CodexSlotsOptions {
 
 type CachedSlot = ReadCodexSlot & { expiresAt: number };
 
+const MALFORMED_SLOT_MESSAGE = 'stored Codex document is malformed';
+
+/** Whether a slot read failed because the stored Keychain document is malformed (not because Keychain failed). */
+export function isMalformedCodexSlot(error: unknown): boolean {
+  return error instanceof Error && error.message === MALFORMED_SLOT_MESSAGE;
+}
+
 /**
  * Keychain boundary for native Codex documents. Cached reads are exclusively
  * for display paths; every correctness boundary must use `{ fresh: true }`.
@@ -364,7 +371,7 @@ export class CodexSlots {
   private readService(service: string, fresh: boolean): ReadCodexSlot {
     const text = this.readText(service, fresh);
     const parsed = parseCodexAuth(text);
-    if (!parsed.ok) throw new Error('stored Codex document is malformed');
+    if (!parsed.ok) throw new Error(MALFORMED_SLOT_MESSAGE);
     return {
       document: parsed.doc,
       fingerprint: codexFingerprint(parsed.doc),

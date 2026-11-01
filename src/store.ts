@@ -2474,6 +2474,11 @@ export class Store {
     });
   }
 
+  /** Whether a watch row is still pending (not yet consumed by a terminal outcome). */
+  hasCodexWatch(switchId: number): boolean {
+    return this.db.prepare('SELECT 1 FROM codex_watch WHERE switch_id = ?').get(switchId) !== undefined;
+  }
+
   /** A terminal watch outcome that does not itself need a switch-log row. */
   deleteCodexWatch(switchId: number): void {
     this.db.prepare('DELETE FROM codex_watch WHERE switch_id = ?').run(switchId);

@@ -214,7 +214,10 @@ function switchHarness() {
   writeFileSync(authPath, JSON.stringify(a));
   const slots = {
     readSlot: (id: string) => {
-      const doc = JSON.parse(keychain.getSync(qlbKeychainService('openai-codex', id), QLB_KEYCHAIN_ACCOUNT)) as CodexAuthDocument;
+      const text = keychain.getSync(qlbKeychainService('openai-codex', id), QLB_KEYCHAIN_ACCOUNT);
+      // As CodexSlots.readService: an unparseable stored document is reported as malformed.
+      let doc: CodexAuthDocument;
+      try { doc = JSON.parse(text) as CodexAuthDocument; } catch { throw new Error('stored Codex document is malformed'); }
       return { document: doc, fingerprint: codexFingerprint(doc) };
     },
     writeSlot: (id: string, document: CodexAuthDocument) => {
@@ -3355,6 +3358,80 @@ describe('Codex watch tick — C6-21', () => {
         outcome: 'ok', stepsJson: 'not json', publishedAt: watch.publishedAt + 1 });
       assert.equal((h.db.prepare('SELECT steps_json FROM switch_log ORDER BY id DESC LIMIT 1').get() as { steps_json: string }).steps_json, 'not json');
       assert.deepEqual(await tick(h, watch, 30_000), { state: 'stopped', reason: 'superseded' });
+    } finally { close(h); }
+  });
+
+  it('a later publishing row whose steps_json is JSON but not an object supersedes the watch instead of failing the tick (C6-21 r2)', async () => {
+    for (const stepsJson of ['null', '1', '"text"', '[]']) {
+      const h = switchHarness();
+      try {
+        const watch = await committedWatch(h);
+        h.store.recordSwitch({ ts: watch.publishedAt + 1, provider: 'openai-codex', fromAccount: 'b:account', toAccount: 'a:account', trigger: 'manual',
+          outcome: 'ok', stepsJson, publishedAt: watch.publishedAt + 1 });
+        assert.deepEqual(await tick(h, watch, 30_000), { state: 'stopped', reason: 'superseded' }, stepsJson);
+      } finally { close(h); }
+    }
+  });
+
+  it('a tick whose slot B is unreadable also fences the live identity\'s managed slot, and every account when the live login has no identity (§3.1, C6-21 r2)', async () => {
+    const noIdentity = (() => { const doc = freshenDocument(1_700_100_000_000, 'no-identity'); return { ...doc, tokens: { ...doc.tokens, id_token: freshenJwt({}) } }; })();
+    const cases: Array<[string, CodexAuthDocument, string[] | '*']> = [
+      ['a managed third slot C', observedDocument('c', 'c-live'), ['a:account', 'b:account', 'c:account']],
+      ['an unmanaged identity', observedDocument('z', 'z-live'), ['a:account', 'b:account']],
+      ['no identity claims', noIdentity, '*'],
+    ];
+    for (const [label, live, involved] of cases) {
+      const h = switchHarness();
+      try {
+        importActiveCodexSlot(observedDocument('c', 'c0'), { store: h.store, keychain: h.keychain, now: () => 2 });
+        h.store.setActiveLogin('openai-codex', 'a:account', 'import', 3);
+        const watch = await committedWatch(h);
+        codexWrites(h, live);
+        h.keychain.deleteSync(qlbKeychainService('openai-codex', 'b:account'), QLB_KEYCHAIN_ACCOUNT);
+        assert.deepEqual(await tick(h, watch, 30_000), { state: 'unresolved', reason: 'slot-split' }, label);
+        assert.deepEqual((fence(h) as { involvedAccounts: unknown }).involvedAccounts, involved, label);
+        assert.equal(rows(h).length, 1, label);
+        assert.equal(watchRows(h), 1, label);
+        if (involved === '*' || involved.includes('c:account')) {
+          assert.deepEqual(await refresh(h, 'c:account'), { code: 3, posts: 0, writes: 0, errors: [recoveryMessage('slot-split')] }, label);
+        }
+      } finally { close(h); }
+    }
+  });
+
+  it('a Keychain error other than a missing or corrupt slot-B item propagates out of the tick with no fence, no row and the watch kept (C6-21 r2)', async () => {
+    const failures: Record<string, () => Error> = {
+      timeout: () => Object.assign(new Error('security find-generic-password timed out after 10s'), { code: 'ETIMEDOUT' }),
+      'access denied': () => new Error('keychain get failed: User interaction is not allowed.'),
+    };
+    for (const [label, failure] of Object.entries(failures)) {
+      const h = switchHarness();
+      try {
+        const watch = await committedWatch(h);
+        codexWrites(h, observedDocument('a', 'a-prime'));
+        const slots = { ...h.slots, readSlot: (id: string) => { if (id === 'b:account') throw failure(); return h.slots.readSlot(id); } };
+        const before = { rows: rows(h), active: activeLogin(h) };
+        await assert.rejects(tick(h, watch, 30_000, { slots: slots as never }), (error: Error) => error.message === failure().message, label);
+        assert.equal(fence(h), null, label);
+        assert.deepEqual({ rows: rows(h), active: activeLogin(h) }, before, label);
+        assert.equal(watchRows(h), 1, label);
+      } finally { close(h); }
+    }
+  });
+
+  it('two queued ticks that loaded the same watch over an unknown live identity commit one failed row and one stash write (C6-21 r2)', async () => {
+    const h = switchHarness();
+    try {
+      const watch = await committedWatch(h);
+      let stashes = 0;
+      const slots = { ...h.slots, ensureUnclaimedStash: async () => { stashes += 1; return { stashId: 'fixture-stash', created: stashes === 1 }; } };
+      codexWrites(h, observedDocument('z', 'z-live'));
+      // Both callers hold the watch as loaded before either took the lock; the second runs once the first releases it.
+      assert.deepEqual(await tick(h, watch, 5_000, { slots: slots as never }), { state: 'stopped', reason: 'unknown-live-identity' });
+      assert.deepEqual(await tick(h, watch, 5_001, { slots: slots as never }), { state: 'stopped', reason: 'superseded' });
+      assert.deepEqual(rows(h).slice(1), [viaWatch(watch, 'failed', 'unknown-live-identity', null)]);
+      assert.equal(stashes, 1);
+      assert.equal(watchRows(h), 0);
     } finally { close(h); }
   });
 

@@ -17,7 +17,8 @@ import {
   type CodexProcess,
 } from './codex-sessions';
 import type { CswapProcess } from './cswap-processes';
-import { CodexStashUnverifiable, type CodexSlots } from './codex-slots';
+import { CodexStashUnverifiable, isMalformedCodexSlot, type CodexSlots } from './codex-slots';
+import { isCredentialNotFound } from './credential-backends';
 import type { KeychainBackend } from './keychain';
 import type { Store } from './store';
 
@@ -47,7 +48,7 @@ export interface CodexSwitchDeps {
   store: Pick<Store, 'getCodexActiveLogin' | 'getCodexSlot' | 'getConfig' | 'hasConfig' | 'recordSwitch'
     | 'recordCodexObservation' | 'setActiveLogin' | 'commitCodexSwitch' | 'findCodexSwitchByAttempt'
     | 'setRecoveryFence' | 'clearRecoveryFence' | 'commitFenceResolution'
-    | 'codexPublishingRowsAfter' | 'commitCodexWatchRevert' | 'commitCodexWatchStop' | 'deleteCodexWatch'> & CodexAttributionStore;
+    | 'codexPublishingRowsAfter' | 'commitCodexWatchRevert' | 'commitCodexWatchStop' | 'deleteCodexWatch' | 'hasCodexWatch'> & CodexAttributionStore;
   readLive: () => Promise<CodexAuthStableWithStatResult>;
   cswapProcesses: () => CswapProcess[];
   now: () => number;
@@ -1344,9 +1345,12 @@ export async function codexWatchTick(deps: CodexSwitchDeps, watch: CodexWatch): 
   const settledByRows = (): CodexWatchTickResult | undefined => {
     const latest = deps.store.codexPublishingRowsAfter(watch.switchId).at(-1);
     if (!latest) return undefined;
-    let steps: { attempt?: unknown; via?: unknown } = {};
+    let steps: { attempt?: unknown; via?: unknown } | null = {};
     try { steps = latest.stepsJson ? JSON.parse(latest.stepsJson) as typeof steps : {}; } catch { /* not a fence resolution */ }
-    if (steps.via !== 'fence' || steps.attempt !== watch.attempt) return { state: 'stopped', reason: 'superseded' };
+    // Valid JSON that is not an object is no fence resolution either.
+    if (typeof steps !== 'object' || steps === null || steps.via !== 'fence' || steps.attempt !== watch.attempt) {
+      return { state: 'stopped', reason: 'superseded' };
+    }
     if (latest.outcome === 'reverted-by-codex') return { state: 'reverted' };
     return latest.outcome === 'ok' ? { state: 'quiet' } : { state: 'stopped', reason: latest.detail ?? latest.outcome };
   };
@@ -1365,6 +1369,8 @@ export async function codexWatchTick(deps: CodexSwitchDeps, watch: CodexWatch): 
     // A later switch's orphaned journal it committed supersedes the watch.
     const after = settledByRows();
     if (after) return after;
+    // A caller that loaded the same watch already consumed it (its stop row is unpublished, so the rows miss it).
+    if (!deps.store.hasCodexWatch(watch.switchId)) return { state: 'stopped', reason: 'superseded' };
     const observed = await deps.readLive();
     if (observed.status === 'missing') { assertHeld(); deps.store.deleteCodexWatch(watch.switchId); return { state: 'stopped', reason: 'logged-out' }; }
     if (observed.status === 'unstable' || observed.status === 'unreadable') {
@@ -1391,11 +1397,15 @@ export async function codexWatchTick(deps: CodexSwitchDeps, watch: CodexWatch): 
     if (typeof classified === 'object' && classified.status === 'external') {
       let target: CodexAuthDocument;
       try { target = slots.readSlot(watch.target, { fresh: true }).document; }
-      catch {
-        // C6-21-R1 (from C6-20d): B's row with no readable Keychain copy is a split; fence {A, B}, no other write.
+      catch (error) {
+        // C6-21-R1 (from C6-20d): only a missing or corrupt item is a split; any other Keychain failure propagates, writing nothing.
+        if (!isCredentialNotFound(error) && !isMalformedCodexSlot(error)) throw error;
+        // Fence {A, B} plus, per §3.1, the live identity's managed slot (as recovery's unreadable-B branch); '*' with no identity.
+        const involvedAccounts = liveIdentity === null ? '*'
+          : [...new Set([watch.outgoing, watch.target, ...(deps.store.getCodexSlot(liveIdentity) ? [liveIdentity] : [])])].sort();
         const reason = 'slot-split';
         assertHeld(); deps.store.setRecoveryFence({ v: 1, switchId: watch.switchId, attempt: watch.attempt, from: watch.outgoing, to: watch.target,
-          publishedAt: watch.publishedAt, reason, involvedAccounts: [watch.outgoing, watch.target].sort(), since: deps.now() });
+          publishedAt: watch.publishedAt, reason, involvedAccounts, since: deps.now() });
         return { state: 'unresolved', reason };
       }
       const history = deps.dbPath ? readCodexSwitchHistory(deps.dbPath, { journalDir: deps.journalDir }) : { rows: [], observations: [] };
