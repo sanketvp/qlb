@@ -2564,6 +2564,37 @@ export class Store {
       });
   }
 
+  /**
+   * The terminal row a watch wrote for one committed switch attempt.  The
+   * attempt is unique and is stored on both the committing and watch rows, so
+   * it remains a stable association after the watch row has been consumed.
+   */
+  findCodexWatchCompletion(switchId: number, attempt: string): { outcome: string; detail: string | null } | null {
+    const row = this.db.prepare(`SELECT outcome, detail FROM switch_log
+      WHERE provider = 'openai-codex' AND id > ?
+        AND CASE WHEN json_valid(steps_json) THEN json_extract(steps_json, '$.attempt') END = ?
+      ORDER BY id DESC LIMIT 1`).get(switchId, attempt) as { outcome: string; detail: string | null } | undefined;
+    return row ?? null;
+  }
+
+  /** Snapshot the durable effects a foreground watch may have left before losing its locks. */
+  readCodexWatchDurableResult(switchId: number, attempt: string): {
+    completion: { outcome: string; detail: string | null } | null;
+    hasWatch: boolean;
+    recoveryFence: CodexRecoveryFence | null;
+    hasSupersedingPublication: boolean;
+  } {
+    return this.runImmediate(() => {
+      const completion = this.findCodexWatchCompletion(switchId, attempt);
+      const hasWatch = this.hasCodexWatch(switchId);
+      const recoveryFence = parseCodexRecoveryFence(this.getConfig('codex.recoveryFence'));
+      const hasSupersedingPublication = this.db.prepare(`SELECT 1 FROM switch_log
+        WHERE provider = 'openai-codex' AND id > ?
+          AND (published_at IS NOT NULL OR outcome = 'reverted-by-codex') LIMIT 1`).get(switchId) !== undefined;
+      return { completion, hasWatch, recoveryFence, hasSupersedingPublication };
+    });
+  }
+
   /** Atomically record a watch reversion and consume its watch row. No committed_at: findCodexSwitchByAttempt still finds the ok commit. */
   commitCodexWatchRevert(input: {
     watch: { switchId: number; outgoing: string; target: string; trigger: string };
@@ -2595,6 +2626,37 @@ export class Store {
       this.db.prepare('DELETE FROM codex_watch WHERE switch_id = ?').run(input.watch.switchId);
       return switchId;
     });
+  }
+
+  /** Due watches carry their switch provenance from the committing switch row. */
+  listDueCodexWatches(now: number): Array<{
+    switchId: number; outgoing: string; target: string; nextAt: number; until: number;
+    trigger: string; attempt: string; publishedAt: number; openSessions: Array<{ pid: number; lstart: string; host: string }>;
+  }> {
+    return this.db.prepare(`SELECT w.switch_id, w.outgoing, w.target, w.next_at, w.until,
+      s.trigger, json_extract(s.steps_json, '$.attempt') AS attempt, s.published_at, s.open_sessions_json
+      FROM codex_watch w JOIN switch_log s ON s.id = w.switch_id
+      WHERE w.next_at <= ? ORDER BY w.next_at, w.switch_id`).all(now).map((row) => {
+      const typed = row as { switch_id: number; outgoing: string; target: string; next_at: number; until: number;
+        trigger: string; attempt: string; published_at: number; open_sessions_json: string | null };
+      let openSessions: Array<{ pid: number; lstart: string; host: string }> = [];
+      try {
+        const parsed = typed.open_sessions_json === null ? [] : JSON.parse(typed.open_sessions_json) as unknown;
+        if (Array.isArray(parsed)) openSessions = parsed.filter((entry): entry is { pid: number; lstart: string; host: string } =>
+          typeof entry === 'object' && entry !== null && typeof (entry as { pid?: unknown }).pid === 'number'
+          && typeof (entry as { lstart?: unknown }).lstart === 'string' && typeof (entry as { host?: unknown }).host === 'string');
+      } catch { /* committed switches write valid JSON; malformed legacy data has no holder evidence */ }
+      if (typeof typed.attempt !== 'string' || !Number.isFinite(typed.published_at)) {
+        throw new Error(`Codex watch ${typed.switch_id} has invalid committed switch provenance`);
+      }
+      return { switchId: typed.switch_id, outgoing: typed.outgoing, target: typed.target, nextAt: typed.next_at, until: typed.until,
+        trigger: typed.trigger, attempt: typed.attempt, publishedAt: typed.published_at, openSessions };
+    });
+  }
+
+  /** Move a non-terminal durable watch to its next fixed background tick. */
+  advanceCodexWatch(switchId: number, nextAt: number): void {
+    this.db.prepare('UPDATE codex_watch SET next_at = ? WHERE switch_id = ?').run(nextAt, switchId);
   }
 
   /** Whether a watch row is still pending (not yet consumed by a terminal outcome). */

@@ -64,7 +64,9 @@ export interface CodexSwitchDeps {
   store: Pick<Store, 'getCodexActiveLogin' | 'getCodexSlot' | 'getConfig' | 'hasConfig' | 'recordSwitch'
     | 'recordCodexObservation' | 'setActiveLogin' | 'commitCodexSwitch' | 'findCodexSwitchByAttempt'
     | 'setRecoveryFence' | 'clearRecoveryFence' | 'commitFenceResolution'
-    | 'codexPublishingRowsAfter' | 'commitCodexWatchRevert' | 'commitCodexWatchStop' | 'deleteCodexWatch' | 'hasCodexWatch'> & CodexAttributionStore;
+    | 'codexPublishingRowsAfter' | 'commitCodexWatchRevert' | 'commitCodexWatchStop'
+    | 'listDueCodexWatches' | 'advanceCodexWatch' | 'deleteCodexWatch' | 'hasCodexWatch' | 'findCodexWatchCompletion'
+    | 'readCodexWatchDurableResult'> & CodexAttributionStore;
   readLive: () => Promise<CodexAuthStableWithStatResult>;
   cswapProcesses: () => CswapProcess[];
   now: () => number;
@@ -90,10 +92,16 @@ export interface CodexSwitchDeps {
   /** Test seams for ordered switch phases; production leaves them unset. */
   hooks?: {
     afterPost?: () => void | Promise<void>;
+    /** Test-only seam after CAS and journalling, immediately before QLB renames the target. */
+    beforeRename?: () => void | Promise<void>;
     afterRename?: () => void | Promise<void>;
     beforeVerify?: () => void | Promise<void>;
     beforeFreshenLock?: () => void | Promise<void>;
+    /** Test-only seam after the watch's switch/auth locks are acquired. */
+    afterWatchLock?: () => void | Promise<void>;
   };
+  /** Foreground watch timer; injected so switch tests do not wait for wall-clock time. */
+  sleep?: (ms: number) => Promise<void>;
   /** Owner identity is injected by the command/test harness; a journal only needs it if it survives this attempt. */
   journalOwner?: Pick<CodexProcess, 'pid' | 'lstart'>;
   journalOptions?: CodexSwitchJournalOptions;
@@ -1049,7 +1057,9 @@ export async function probeCodexSwitchJournal<T = undefined>(options: CodexSwitc
 
 export type CodexSwitchResult = {
   outcome: 'ok' | 'noop' | 'failed' | 'refused' | 'reverted-by-codex'; reason?: string; message?: string;
-  switchId?: number; attemptId?: string; watch?: { state: 'pending'; until: number }; lockLostAfterCommit?: boolean;
+  switchId?: number; attemptId?: string;
+  watch?: { state: 'pending'; until: number } | { state: 'stopped' | 'unresolved'; reason: string };
+  lockLostAfterCommit?: boolean;
 };
 export interface SwitchCodexInput {
   target: string; trigger: string;
@@ -1355,6 +1365,7 @@ export interface CodexWatch {
   attempt: string;
   publishedAt: number;
   openSessions: CodexProcess[];
+  nextAt?: number;
   until: number;
 }
 
@@ -1391,6 +1402,7 @@ export async function codexWatchTick(deps: CodexSwitchDeps, watch: CodexWatch): 
     return latest.outcome === 'ok' ? { state: 'quiet' } : { state: 'stopped', reason: latest.detail ?? latest.outcome };
   };
   return withCodexSwitchLocks(deps, async (assertHeld): Promise<CodexWatchTickResult> => {
+    await deps.hooks?.afterWatchLock?.();
     // X10b: an overdue row is consumed without a verdict, even under a fence (the fence keeps its own context).
     if (deps.now() >= watch.until + CODEX_WATCH_OVERDUE_MS) {
       assertHeld(); deps.store.deleteCodexWatch(watch.switchId);
@@ -1501,6 +1513,88 @@ export async function codexWatchTick(deps: CodexSwitchDeps, watch: CodexWatch): 
   });
 }
 
+const foregroundWatchDelays = [1_000, 5_000, 30_000] as const;
+const sleepFor = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Reconstruct a foreground watch result after its lock finalizer reports a takeover. */
+function foregroundWatchResultFromDurable(
+  deps: CodexSwitchDeps,
+  result: CodexSwitchResult,
+  watch: CodexWatch,
+): CodexSwitchResult {
+  const durable = deps.store.readCodexWatchDurableResult(watch.switchId, watch.attempt);
+  if (durable.completion?.outcome === 'reverted-by-codex') {
+    return { ...result, outcome: 'reverted-by-codex', watch: { state: 'stopped', reason: 'reverted-by-codex' } };
+  }
+  if (!durable.hasWatch) {
+    return { ...result, watch: { state: 'stopped', reason: durable.completion?.detail ?? durable.completion?.outcome ?? 'watch-consumed' } };
+  }
+  if (durable.recoveryFence?.switchId === watch.switchId && durable.recoveryFence.attempt === watch.attempt) {
+    return { ...result, watch: { state: 'unresolved', reason: durable.recoveryFence.reason } };
+  }
+  if (durable.hasSupersedingPublication) {
+    return { ...result, watch: { state: 'stopped', reason: 'superseded' } };
+  }
+  return result;
+}
+
+/** Run the three short post-commit checks; durable C8 work starts at +2 minutes. */
+async function runForegroundCodexWatches(deps: CodexSwitchDeps, result: CodexSwitchResult, watch: CodexWatch): Promise<CodexSwitchResult> {
+  let previous = 0;
+  for (const at of foregroundWatchDelays) {
+    await (deps.sleep ?? sleepFor)(at - previous);
+    previous = at;
+    // A foreground check must not turn an already committed switch into a
+    // failure merely because another QLB operation owns the lock. Its durable
+    // watch remains for C8's later due pass.
+    let tick: CodexWatchTickResult;
+    try { tick = await codexWatchTick(deps, watch); }
+    catch (error) {
+      // Contention at one foreground point does not cancel the remaining
+      // scheduled checks; the durable row still covers C8 after this window.
+      if (error instanceof ClaudeCodeLockTimeout) continue;
+      throw error;
+    }
+    if (tick.state === 'reverted') return { ...result, outcome: 'reverted-by-codex', watch: { state: 'stopped', reason: 'reverted-by-codex' } };
+    // Consume foreground terminal results exactly as C8's durable consumer does.
+    // In particular, admission can change before C8 wakes, so a reported stop
+    // must never be resumed from its retained row.
+    if (tick.state === 'stopped') {
+      deps.store.deleteCodexWatch(watch.switchId);
+      return { ...result, watch: { state: 'stopped', reason: tick.reason } };
+    }
+    if (tick.state === 'unresolved') return { ...result, watch: { state: 'unresolved', reason: tick.reason } };
+    if (tick.state === 'inconclusive') {
+      deps.store.deleteCodexWatch(watch.switchId);
+      return { ...result, watch: { state: 'stopped', reason: 'inconclusive' } };
+    }
+  }
+  return result;
+}
+
+/** C8 consumer: process only due persisted watches; foreground switching never calls this. */
+export async function runDueCodexWatches(deps: CodexSwitchDeps, now: number): Promise<void> {
+  for (const watch of deps.store.listDueCodexWatches(now)) {
+    // The due query is intentionally one batch, but time-sensitive X10b
+    // decisions use the live clock for each row: lock waits can span a minute.
+    const tickNow = deps.now();
+    if (tickNow >= watch.until + CODEX_WATCH_OVERDUE_MS) {
+      deps.store.deleteCodexWatch(watch.switchId);
+      continue;
+    }
+    const tick = await codexWatchTick(deps, watch);
+    const afterTickNow = deps.now();
+    if (tick.state === 'reverted' || tick.state === 'stopped' || tick.state === 'inconclusive'
+      || (afterTickNow >= watch.until && tick.state !== 'unresolved')) {
+      deps.store.deleteCodexWatch(watch.switchId);
+      continue;
+    }
+    const nextAt = [watch.publishedAt + 120_000, watch.until].find((at) => at > afterTickNow);
+    // An unresolved final tick remains due: it is retried in the grace period until X10b deletes it.
+    if (nextAt !== undefined) deps.store.advanceCodexWatch(watch.switchId, nextAt);
+  }
+}
+
 /** C6-18: switch through the journaled publication; C6-20 supplies recovery. */
 export async function switchCodex(deps: CodexSwitchDeps, input: SwitchCodexInput): Promise<CodexSwitchResult> {
   const admitted = await deps.admitted?.(input.trigger) ?? { ok: true };
@@ -1523,6 +1617,8 @@ export async function switchCodex(deps: CodexSwitchDeps, input: SwitchCodexInput
     if (freshen.kind === 'refused') return switchRefusal(deps, input, freshen.reason);
     let journalExists = false; let released = false; let renamed = false; let commitFailed = false;
     let committed: CodexSwitchResult | undefined;
+    let committedWatch: CodexWatch | undefined;
+    let foregroundWatchesStarted = false;
     try {
       const result = await withCodexSwitchLocks(deps, async (assertHeld) => {
         const fence = codexRecoveryFenceState(deps.journalDir!, deps.store);
@@ -1573,6 +1669,7 @@ export async function switchCodex(deps: CodexSwitchDeps, input: SwitchCodexInput
             if (!journal.from) throw new Error('Codex switch outgoing identity is required');
             writeCodexSwitchJournal(journal, options); journalExists = true;
             try {
+              assertHeld(); held.assertHeld(); await deps.hooks?.beforeRename?.();
               assertHeld(); held.assertHeld();
               const publish = await publishCodexAuth(deps.authPath!, target.document); renamed = publish.stage === 'published';
               if (renamed) await deps.hooks?.afterRename?.();
@@ -1702,6 +1799,10 @@ export async function switchCodex(deps: CodexSwitchDeps, input: SwitchCodexInput
                   decision: { leftHeadroom: decision?.leftHeadroom ?? null, leftRecoveryAt: decision?.leftRecoveryAtMs ?? null,
                     leftTrigger: decision?.leftTrigger ?? null } });
               } catch (error) { commitFailed = true; throw error; }
+              if (outcome === 'ok') {
+                committedWatch = { switchId: id, outgoing: journal.from, target: input.target, trigger: input.trigger,
+                  attempt: deps.attempt, publishedAt, openSessions: sessions, nextAt: now + 120_000, until: now + 300_000 };
+              }
               committed = { outcome, switchId: id, attemptId: deps.attempt,
                 ...(outcome === 'ok' ? { watch: { state: 'pending' as const, until: now + 300_000 } } : {}) };
               assertHeld(); held.assertHeld(); deleteCodexSwitchJournalIf(deps.journalDir!, deps.attempt, held, options); journalExists = false;
@@ -1715,6 +1816,10 @@ export async function switchCodex(deps: CodexSwitchDeps, input: SwitchCodexInput
         }
       });
       if ('retryFreshen' in result) { freshenRound += 1; continue; }
+      if (committedWatch && result.result.outcome === 'ok') {
+        foregroundWatchesStarted = true;
+        return await runForegroundCodexWatches(deps, result.result, committedWatch);
+      }
       return result.result;
     } catch (error) {
       if (journalExists && !released) {
@@ -1722,7 +1827,10 @@ export async function switchCodex(deps: CodexSwitchDeps, input: SwitchCodexInput
       }
       if (error instanceof ClaudeCodeLockTimeout) return switchRefusal(deps, input, 'switch-busy');
       if (error instanceof ProperLockfileCompromised || error instanceof CodexAuthLockCompromised) {
-        if (committed) return { ...committed, lockLostAfterCommit: true };
+        if (committed) return {
+          ...(foregroundWatchesStarted && committedWatch ? foregroundWatchResultFromDurable(deps, committed, committedWatch) : committed),
+          lockLostAfterCommit: true,
+        };
         if (renamed) return { outcome: 'failed', reason: 'lock-lost-after-publish', attemptId: deps.attempt };
         return switchResult('lock-lost');
       }
