@@ -406,14 +406,17 @@ describe('codex add', () => {
     const root = mkdtempSync(join(tmpdir(), 'qlb-codex-add-signal-'));
     const fakeBin = join(root, 'bin');
     const marker = join(root, 'child.json');
+    const stopped = join(root, 'child-stopped');
     const helper = join(root, 'helper.cjs');
     try {
       mkdirSync(fakeBin);
       const fakeCodex = join(fakeBin, 'codex');
       writeFileSync(fakeCodex, `#!/usr/bin/env node
 const fs = require('node:fs');
-fs.writeFileSync(process.env.MARKER, JSON.stringify({ home: process.env.CODEX_HOME, pid: process.pid }));
+process.on('exit', () => fs.writeFileSync(process.env.STOPPED, 'stopped'));
 process.on('SIGTERM', () => {});
+// Signal readiness only after the handlers above are installed.
+fs.writeFileSync(process.env.MARKER, JSON.stringify({ home: process.env.CODEX_HOME }));
 setTimeout(() => {
   fs.mkdirSync(process.env.CODEX_HOME, { recursive: true });
   fs.writeFileSync(require('node:path').join(process.env.CODEX_HOME, 'auth.json'), '{}');
@@ -437,7 +440,7 @@ addCodexAccount({ home: process.env.HOME, nativeAuthPath: native }, productionCo
         env: {
           ...process.env,
           QLB_TEST_MODE: '1', QLB_HOME: root, HOME: root,
-          PATH: `${fakeBin}:${process.env.PATH ?? ''}`, MARKER: marker,
+          PATH: `${fakeBin}:${process.env.PATH ?? ''}`, MARKER: marker, STOPPED: stopped,
         },
         stdio: 'ignore',
       });
@@ -450,15 +453,15 @@ addCodexAccount({ home: process.env.HOME, nativeAuthPath: native }, productionCo
         };
         check();
       });
-      const childInfo = JSON.parse(markerText) as { home: string; pid: number };
+      const childInfo = JSON.parse(markerText) as { home: string };
       child.kill('SIGTERM');
       const result = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
         child.once('close', (code, signal) => resolve({ code, signal }));
       });
       assert.notEqual(result.code, 0);
       assert.equal(result.signal, 'SIGTERM');
+      assert.equal(existsSync(stopped), true);
       assert.equal(existsSync(childInfo.home), false);
-      assert.throws(() => process.kill(childInfo.pid, 0), { code: 'ESRCH' });
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
