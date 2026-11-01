@@ -270,7 +270,7 @@ function genericMigrationPathFacts(
 }
 
 /** S0.6: generic ownership must be quiescent before P7a may begin. */
-function genericMigrationAtRest(provider: PiMigrateProvider, paths: PiMigratePaths, deps: PiMigrateDeps, ownJournal: Journal | null, ownJournalClaimsOwner = false): boolean {
+function genericMigrationAtRest(provider: PiMigrateProvider, paths: PiMigratePaths, deps: PiMigrateDeps, ownJournal: Journal | null): boolean {
   const row = deps.store?.getMigration(`pi-${provider}`);
   let detail: JsonObject | undefined;
   if (row) {
@@ -281,8 +281,7 @@ function genericMigrationAtRest(provider: PiMigrateProvider, paths: PiMigratePat
   const pathFacts = genericMigrationPathFacts(provider, paths, detail);
   let canonicalOwnerClaim = false;
   try { canonicalOwnerClaim = isPiQlbOwnerEntry(readPiOwnerProviders(paths.ownerPath)[provider]); } catch { /* readPiOwnerProviders fails closed before publication */ }
-  const ownPublishedClaim = (ownJournalClaimsOwner && ownJournal !== null)
-    || ownJournal?.phase === 'publishing' || ownJournal?.phase === 'published' || ownJournal?.phase === 'committed'
+  const ownPublishedClaim = ownJournal?.phase === 'publishing' || ownJournal?.phase === 'published' || ownJournal?.phase === 'committed'
     || deps.store?.getConfig(`pi.${provider}.state`) === 'migrated';
   return !pathFacts.hasStaging
     && !pathFacts.hasLegacySidecar
@@ -460,7 +459,7 @@ export function rollbackPiSingleProvider(provider: PiMigrateProvider, paths: PiM
       const journal = readJournal(paths, provider);
       const stateMigrated = deps.store?.getConfig('pi.openai-codex.state') === 'migrated';
       if (!stateMigrated && !journal) throw refusal('pi-not-migrated');
-      if (!genericMigrationAtRest(provider, paths, deps, journal, true)) {
+      if (!genericMigrationAtRest(provider, paths, deps, journal)) {
         throw refusal('owned-by-generic-migrate', 'generic migration pi-openai-codex owns the provider; run qlb migrate rollback --provider openai-codex first');
       }
       // Validate the canonical owner document before the first write, rather
