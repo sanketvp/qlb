@@ -415,8 +415,10 @@ describe('codex add', () => {
 const fs = require('node:fs');
 process.on('exit', () => fs.writeFileSync(process.env.STOPPED, 'stopped'));
 process.on('SIGTERM', () => {});
-// Signal readiness only after the handlers above are installed.
-fs.writeFileSync(process.env.MARKER, JSON.stringify({ home: process.env.CODEX_HOME }));
+// Signal readiness only after the handlers above are installed. Publish it
+// atomically: existsSync alone can otherwise observe a newly-created, empty file.
+fs.writeFileSync(process.env.MARKER + '.tmp', JSON.stringify({ home: process.env.CODEX_HOME }));
+fs.renameSync(process.env.MARKER + '.tmp', process.env.MARKER);
 setTimeout(() => {
   fs.mkdirSync(process.env.CODEX_HOME, { recursive: true });
   fs.writeFileSync(require('node:path').join(process.env.CODEX_HOME, 'auth.json'), '{}');
