@@ -10,6 +10,7 @@ import { ClaudeSlots, SqliteClaudeSlotRepository } from '../cc-slots';
 import { AdmissionRefused, switchClaude, type ClaudeSwitchDeps, type ClaudeSwitchResult } from '../cc-switch';
 import { processLstart } from '../codex-sessions';
 import { qlbHomeDir } from '../home';
+import { parseInjectFlag } from '../fault-injection';
 import { platformKeychain } from '../keychain';
 import { assertAdmitted } from '../lifecycle';
 import type { CommandContext, CommandDefinition } from '../registry';
@@ -175,7 +176,12 @@ export function createSwitchAnthropicCommand(deps: SwitchAnthropicCommandDeps = 
   return {
     name: 'switch anthropic',
     async execute(args: string[], ctx: CommandContext): Promise<number> {
-      const parsed = parse(args);
+      const parsedInjection = parseInjectFlag(args, ctx.env);
+      if ('usage' in parsedInjection) {
+        ctx.stderr(parsedInjection.usage);
+        return 2;
+      }
+      const parsed = parse(parsedInjection.rest);
       if (!parsed) return usage(ctx);
 
       const store = (deps.openStore ?? openStore)(ctx.config.dbPath);
@@ -201,7 +207,12 @@ export function createSwitchAnthropicCommand(deps: SwitchAnthropicCommandDeps = 
         const warn = (message: string): void => ctx.stderr(`qlb switch anthropic: warning: ${message}`);
         const built = await (deps.makeSwitchDeps ?? ((commandCtx, commandStore, commandWarn) => defaultMakeSwitchDeps(deps, commandCtx, commandStore, commandWarn)))(ctx, store, warn);
         resources = 'deps' in built ? built : { deps: built };
-        const result = await (deps.switchClaude ?? switchClaude)(resources.deps, { to: parsed.accountId, trigger: 'manual' });
+        if (parsedInjection.inject !== null) resources.deps.injectFailStep = parsedInjection.inject.step;
+        const result = await (deps.switchClaude ?? switchClaude)(resources.deps, {
+          to: parsed.accountId,
+          trigger: 'manual',
+          ...(parsedInjection.inject === null ? {} : { injected: true }),
+        });
         if (parsed.json) ctx.stdout(JSON.stringify(receipt(result)));
         else if (result.outcome === 'refused') ctx.stderr(`qlb switch anthropic: refused: ${result.reason ?? 'unknown'}`);
         else ctx.stdout(`switched anthropic: ${result.from ?? '-'} → ${result.to} (${result.outcome})`);
