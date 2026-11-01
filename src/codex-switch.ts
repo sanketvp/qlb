@@ -44,6 +44,22 @@ export type CodexSwitchPreconditionsResult =
 type CodexObservationSlots = Pick<CodexSlots, 'readSlot' | 'ensureUnclaimedStash'>;
 type CodexObservationKeychain = Pick<KeychainBackend, 'getSync' | 'setSync' | 'deleteSync'>;
 
+type TargetSlotValidation =
+  | { state: 'available'; document: CodexAuthDocument; matchesHead: boolean; matchesIdentity: boolean }
+  | { state: 'unavailable' };
+
+/** Read B fresh and establish that its Keychain document still backs B's recorded identity and head. */
+function readValidatedTargetSlot(slots: Pick<CodexSlots, 'readSlot'>, accountId: string, expectedFingerprint: string): TargetSlotValidation {
+  try {
+    const slot = slots.readSlot(accountId, { fresh: true });
+    return { state: 'available', document: slot.document,
+      matchesHead: slot.fingerprint === expectedFingerprint, matchesIdentity: codexIdentity(slot.document) === accountId };
+  } catch (error) {
+    if (isCredentialNotFound(error) || isMalformedCodexSlot(error)) return { state: 'unavailable' };
+    throw error;
+  }
+}
+
 export interface CodexSwitchDeps {
   store: Pick<Store, 'getCodexActiveLogin' | 'getCodexSlot' | 'getConfig' | 'hasConfig' | 'recordSwitch'
     | 'recordCodexObservation' | 'setActiveLogin' | 'commitCodexSwitch' | 'findCodexSwitchByAttempt'
@@ -1234,22 +1250,36 @@ export async function reconcileCodexRecoveryLocked(
   const classified: CodexPostPublishClassification = fence.reason === 'target-changed' && !transient ? 'target-changed'
     : classifyPostPublish({ journal: pseudoJournal, observed, targetSlotFp: targetRow?.fingerprint ?? '' });
   const fencedAccounts = unionRecoveryAccounts([fence.from, fence.to], fence.involvedAccounts);
+  // A fence created from a watch-time split may classify ok from SQLite alone. It cannot
+  // resolve until B's fresh Keychain document backs that same head and identity.
+  const holdTargetSlotSplit = () => {
+    // §3.1: the live identity's managed slot is fenced whatever the attribution says.
+    if (liveIdentity && deps.store.getCodexSlot(liveIdentity) && fencedAccounts !== '*' && !fencedAccounts.has(liveIdentity)) {
+      assertHeld();
+      deps.store.setRecoveryFence({ ...fence, involvedAccounts: [liveIdentity] });
+      const stored = parseCodexRecoveryFence(deps.store.getConfig('codex.recoveryFence'));
+      return fenced(stored?.reason ?? fence.reason, unionRecoveryAccounts([fence.from, fence.to], stored?.involvedAccounts ?? '*'));
+    }
+    return fenced(fence.reason, fencedAccounts);
+  };
+  if (classified === 'ok') {
+    const targetValidation = readValidatedTargetSlot(slots, fence.to, targetRow?.fingerprint ?? '');
+    if (targetValidation.state === 'unavailable' || !targetValidation.matchesHead || !targetValidation.matchesIdentity) return holdTargetSlotSplit();
+  }
   let attribution: CodexPhaseAttribution | undefined;
-  const attribute = ((typeof classified === 'object' && classified.status === 'external') || classified === 'target-changed') && live && targetRow;
+  const external = typeof classified === 'object' && classified.status === 'external';
+  const attribute = (external || classified === 'target-changed') && live && targetRow;
+  // An external observation may only defer B's head check for an attribution that can
+  // repair/adopt B; a foreign identity is never eligible for that exception.
+  const externalTargetValidation = external && targetRow
+    ? readValidatedTargetSlot(slots, fence.to, targetRow.fingerprint ?? '') : undefined;
+  if (externalTargetValidation?.state === 'available' && !externalTargetValidation.matchesIdentity) return holdTargetSlotSplit();
   // An unreadable slot B makes attribution unavailable: B has no established head, and a fence
   // that needs attribution to resolve is kept as stored, with no write.
-  const target = attribute ? readTargetSlot(fence.to, true) : undefined;
+  const target = externalTargetValidation?.state === 'available' ? externalTargetValidation.document
+    : external ? undefined : attribute ? readTargetSlot(fence.to, true) : undefined;
   if (attribute && !target) {
-    if (classified !== 'target-changed') {
-      // §3.1: the live identity's managed slot is fenced whatever the attribution says.
-      if (liveIdentity && deps.store.getCodexSlot(liveIdentity) && fencedAccounts !== '*' && !fencedAccounts.has(liveIdentity)) {
-        assertHeld();
-        deps.store.setRecoveryFence({ ...fence, involvedAccounts: [liveIdentity] });
-        const stored = parseCodexRecoveryFence(deps.store.getConfig('codex.recoveryFence'));
-        return fenced(stored?.reason ?? fence.reason, unionRecoveryAccounts([fence.from, fence.to], stored?.involvedAccounts ?? '*'));
-      }
-      return fenced(fence.reason, fencedAccounts);
-    }
+    if (classified !== 'target-changed') return holdTargetSlotSplit();
     slotHeads.set(fence.to, null);
     verifySlotHeads(slotHeads);
   }
@@ -1271,6 +1301,12 @@ export async function reconcileCodexRecoveryLocked(
     }
     slotHeads.set(fence.to, deps.store.getCodexSlot(fence.to)?.fingerprint ?? null);
     if (liveIdentity) slotHeads.set(liveIdentity, deps.store.getCodexSlot(liveIdentity)?.fingerprint ?? null);
+  }
+  // An external observation may repair/adopt B during attribution. Every other
+  // external outcome must still leave B backed by its current head and identity.
+  if (external) {
+    const targetValidation = readValidatedTargetSlot(slots, fence.to, deps.store.getCodexSlot(fence.to)?.fingerprint ?? '');
+    if (targetValidation.state === 'unavailable' || !targetValidation.matchesHead || !targetValidation.matchesIdentity) return holdTargetSlotSplit();
   }
   const verdict = resolveRecoveryVerdict(classified, attribution, { phase: 'recovery', journal: pseudoJournal,
     targetSlotFingerprint: deps.store.getCodexSlot(fence.to)?.fingerprint ?? '', slotHeads, live });
@@ -1393,21 +1429,26 @@ export async function codexWatchTick(deps: CodexSwitchDeps, watch: CodexWatch): 
       [watch.target, targetRow.fingerprint],
     ]);
     if (liveIdentity) slotHeads.set(liveIdentity, deps.store.getCodexSlot(liveIdentity)?.fingerprint ?? null);
+    // C6-21b: B's Keychain copy must be the DB-recorded head, even when the
+    // live file equals that head; otherwise the DB/Keychain split is fenced.
+    const fenceTargetSlotSplit = (): CodexWatchTickResult => {
+      // Fence {A, B} plus, per §3.1, the live identity's managed slot (as recovery's unreadable-B branch); '*' with no identity.
+      const involvedAccounts = liveIdentity === null ? '*'
+        : [...new Set([watch.outgoing, watch.target, ...(deps.store.getCodexSlot(liveIdentity) ? [liveIdentity] : [])])].sort();
+      const reason = 'slot-split';
+      assertHeld(); deps.store.setRecoveryFence({ v: 1, switchId: watch.switchId, attempt: watch.attempt, from: watch.outgoing, to: watch.target,
+        publishedAt: watch.publishedAt, reason, involvedAccounts, since: deps.now() });
+      return { state: 'unresolved', reason };
+    };
+    const targetValidation = readValidatedTargetSlot(slots, watch.target, targetFp);
+    // C6-21-R1 (from C6-20d): a missing, corrupt, or wrong-identity B is a split.
+    // A non-head B may reach attribution only to repair/adopt B; every other
+    // external outcome is checked again below.
+    if (targetValidation.state === 'unavailable' || !targetValidation.matchesIdentity
+      || (classified === 'ok' && !targetValidation.matchesHead)) return fenceTargetSlotSplit();
+    const target = targetValidation.document;
     let attribution: CodexPhaseAttribution | undefined;
     if (typeof classified === 'object' && classified.status === 'external') {
-      let target: CodexAuthDocument;
-      try { target = slots.readSlot(watch.target, { fresh: true }).document; }
-      catch (error) {
-        // C6-21-R1 (from C6-20d): only a missing or corrupt item is a split; any other Keychain failure propagates, writing nothing.
-        if (!isCredentialNotFound(error) && !isMalformedCodexSlot(error)) throw error;
-        // Fence {A, B} plus, per §3.1, the live identity's managed slot (as recovery's unreadable-B branch); '*' with no identity.
-        const involvedAccounts = liveIdentity === null ? '*'
-          : [...new Set([watch.outgoing, watch.target, ...(deps.store.getCodexSlot(liveIdentity) ? [liveIdentity] : [])])].sort();
-        const reason = 'slot-split';
-        assertHeld(); deps.store.setRecoveryFence({ v: 1, switchId: watch.switchId, attempt: watch.attempt, from: watch.outgoing, to: watch.target,
-          publishedAt: watch.publishedAt, reason, involvedAccounts, since: deps.now() });
-        return { state: 'unresolved', reason };
-      }
       const history = deps.dbPath ? readCodexSwitchHistory(deps.dbPath, { journalDir: deps.journalDir }) : { rows: [], observations: [] };
       const current = await list();
       // After the committed switch, B is the active login.
@@ -1424,6 +1465,12 @@ export async function codexWatchTick(deps: CodexSwitchDeps, watch: CodexWatch): 
       }
       slotHeads.set(watch.target, deps.store.getCodexSlot(watch.target)?.fingerprint ?? null);
       if (liveIdentity) slotHeads.set(liveIdentity, deps.store.getCodexSlot(liveIdentity)?.fingerprint ?? null);
+    }
+    if (typeof classified === 'object' && classified.status === 'external') {
+      const freshTargetValidation = readValidatedTargetSlot(slots, watch.target, deps.store.getCodexSlot(watch.target)?.fingerprint ?? '');
+      if (freshTargetValidation.state === 'unavailable' || !freshTargetValidation.matchesHead || !freshTargetValidation.matchesIdentity) {
+        return fenceTargetSlotSplit();
+      }
     }
     assertHeld(); deps.store.recordCodexObservation({ identity: liveIdentity, lineageFp: codexFingerprint(live), by: 'qlb-watch', now: deps.now() });
     const journal: Pick<CodexSwitchJournal, 'from' | 'to' | 'target' | 'adoptingTarget'> = {

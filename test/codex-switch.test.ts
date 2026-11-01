@@ -3097,6 +3097,144 @@ describe('Codex watch tick — C6-21', () => {
     } finally { close(h); }
   });
 
+  it('a missing or corrupt slot-B Keychain item when live equals B\'s recorded head fences {A, B}, writes no row and keeps the watch (C6-21b)', async () => {
+    const service = qlbKeychainService('openai-codex', 'b:account');
+    const damage = {
+      missing: (h: Harness) => h.keychain.deleteSync(service, QLB_KEYCHAIN_ACCOUNT),
+      corrupt: (h: Harness) => h.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, '{not json'),
+    };
+    for (const [label, apply] of Object.entries(damage)) {
+      const h = switchHarness();
+      try {
+        const watch = await committedWatch(h);
+        const before = { rows: rows(h), active: activeLogin(h) };
+        apply(h);
+        assert.deepEqual(await tick(h, watch, 30_000), { state: 'unresolved', reason: 'slot-split' }, label);
+        assert.deepEqual(fence(h), { v: 1, switchId: watch.switchId, attempt: watch.attempt, from: 'a:account', to: 'b:account',
+          publishedAt: watch.publishedAt, reason: 'slot-split', involvedAccounts: ['a:account', 'b:account'], since: watch.publishedAt + 30_000 }, label);
+        assert.deepEqual({ rows: rows(h), active: activeLogin(h) }, before, label);
+        assert.equal(watchRows(h), 1, `${label}: the watch is kept`);
+        h.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(h.b));
+        assert.deepEqual(await refresh(h, 'b:account'), { code: 3, posts: 0, writes: 0, errors: [recoveryMessage('slot-split')] }, label);
+      } finally { close(h); }
+    }
+  });
+
+  it('a valid but non-head slot-B Keychain document fences {A, B}, writes no row and keeps the watch (C6-21b r1)', async () => {
+    const service = qlbKeychainService('openai-codex', 'b:account');
+    const mismatches = {
+      'another B version': observedDocument('b', 'b-other-version'),
+      'another account': observedDocument('c', 'c-other-account'),
+    };
+    for (const [label, document] of Object.entries(mismatches)) {
+      const h = switchHarness();
+      try {
+        const watch = await committedWatch(h);
+        const before = { rows: rows(h), active: activeLogin(h) };
+        h.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(document));
+        assert.deepEqual(await tick(h, watch, 30_000), { state: 'unresolved', reason: 'slot-split' }, label);
+        assert.deepEqual(fence(h), { v: 1, switchId: watch.switchId, attempt: watch.attempt, from: 'a:account', to: 'b:account',
+          publishedAt: watch.publishedAt, reason: 'slot-split', involvedAccounts: ['a:account', 'b:account'], since: watch.publishedAt + 30_000 }, label);
+        assert.deepEqual({ rows: rows(h), active: activeLogin(h) }, before, label);
+        assert.equal(watchRows(h), 1, `${label}: the watch is kept`);
+      } finally { close(h); }
+    }
+  });
+
+  it('a slot-B split fence remains until B\'s Keychain copy matches its recorded head (C6-21b r2)', async () => {
+    const h = switchHarness();
+    try {
+      const watch = await committedWatch(h);
+      splitSlot(h, 'b:account', 'b-killed');
+      assert.deepEqual(await tick(h, watch, 1_000), { state: 'unresolved', reason: 'slot-split' });
+      const beforeRetry = rows(h);
+      assert.deepEqual(await tick(h, watch, 5_000), { state: 'quiet' });
+      assert.deepEqual(fence(h), { v: 1, switchId: watch.switchId, attempt: watch.attempt, from: 'a:account', to: 'b:account',
+        publishedAt: watch.publishedAt, reason: 'slot-split', involvedAccounts: ['a:account', 'b:account'], since: watch.publishedAt + 1_000 });
+      assert.deepEqual(rows(h), beforeRetry, 'the unresolved fence writes no effect row');
+      assert.equal(watchRows(h), 1, 'the watch remains while B is split');
+      h.keychain.setSync(qlbKeychainService('openai-codex', 'b:account'), QLB_KEYCHAIN_ACCOUNT, JSON.stringify(h.b));
+      assert.deepEqual(await tick(h, watch, 30_000), { state: 'quiet' });
+      assert.deepEqual(lastRow(h), viaWatch(watch, 'ok', null, watch.publishedAt, 'fence'));
+      assert.equal(fence(h), null);
+      assert.equal(watchRows(h), 0);
+    } finally { close(h); }
+  });
+
+  it('an external reversion with a split B fences instead of logging reverted-by-codex (C6-21b r3a)', async () => {
+    const splitB = {
+      'a non-head B': () => observedDocument('b', 'b-non-head'),
+      'a wrong-identity B': () => {
+        const document = observedDocument('b', 'b-wrong-identity');
+        return { ...document, tokens: { ...document.tokens!, id_token: freshenJwt({ 'https://api.openai.com/auth': { chatgpt_user_id: 'c', chatgpt_account_id: 'account' } }) } };
+      },
+    };
+    for (const [label, makeDocument] of Object.entries(splitB)) {
+      const h = switchHarness();
+      try {
+        const watch = await committedWatch(h);
+        h.keychain.setSync(qlbKeychainService('openai-codex', 'b:account'), QLB_KEYCHAIN_ACCOUNT, JSON.stringify(makeDocument()));
+        codexWrites(h, h.a);
+        assert.deepEqual(await tick(h, watch, 30_000), { state: 'unresolved', reason: 'slot-split' }, label);
+        assert.equal((fence(h) as { reason: string }).reason, 'slot-split', label);
+        assert.equal(scalarCount(h.db, "SELECT COUNT(*) AS count FROM switch_log WHERE outcome IN ('ok', 'reverted-by-codex')"), 1, label);
+        assert.equal(watchRows(h), 1, `${label}: the watch is kept`);
+      } finally { close(h); }
+    }
+  });
+
+  it('an existing slot-split fence remains while an external reversion leaves B split (C6-21b r3a)', async () => {
+    const service = qlbKeychainService('openai-codex', 'b:account');
+    const damage = {
+      'a non-head B': (h: Harness) => splitSlot(h, 'b:account', 'b-non-head'),
+      'a missing B': (h: Harness) => h.keychain.deleteSync(service, QLB_KEYCHAIN_ACCOUNT),
+      'a corrupt B': (h: Harness) => h.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, '{not json'),
+    };
+    for (const [label, apply] of Object.entries(damage)) {
+      const h = switchHarness();
+      try {
+        const watch = await committedWatch(h);
+        apply(h);
+        assert.deepEqual(await tick(h, watch, 1_000), { state: 'unresolved', reason: 'slot-split' }, `${label}: creates the fence`);
+        const before = rows(h);
+        codexWrites(h, h.a);
+        assert.deepEqual(await tick(h, watch, 5_000), { state: 'quiet' }, label);
+        assert.equal((fence(h) as { reason: string }).reason, 'slot-split', label);
+        assert.deepEqual(rows(h), before, `${label}: no fence-resolution row`);
+        assert.equal(watchRows(h), 1, `${label}: the watch is kept`);
+      } finally { close(h); }
+    }
+  });
+
+  it('an external adopt-crash state repairs B instead of fencing it (C6-21b r2)', async () => {
+    const h = switchHarness();
+    try {
+      const watch = await committedWatch(h);
+      const bPrime = observedDocument('b', 'b-adopt-crash');
+      const service = qlbKeychainService('openai-codex', 'b:account');
+      // An adopt crashed after preserving B's predecessor and replacing its Keychain bytes, before its SQLite commit.
+      h.keychain.setSync(`${service}:prev`, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(h.b));
+      h.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(bPrime));
+      codexWrites(h, bPrime);
+      assert.deepEqual(await tick(h, watch, 30_000), { state: 'quiet' });
+      assert.deepEqual(slotFps(h, 'b:account'), { db: codexFingerprint(bPrime), keychain: codexFingerprint(bPrime) });
+      assert.equal(fence(h), null);
+      assert.equal(scalarCount(h.db, "SELECT COUNT(*) AS count FROM lineage_log WHERE cause = 'adopt' AND account_id = 'b:account'"), 1);
+    } finally { close(h); }
+  });
+
+  it('a same-refresh slot-B document with another identity fences the watch (C6-21b r2)', async () => {
+    const h = switchHarness();
+    try {
+      const watch = await committedWatch(h);
+      const otherIdentity = { ...h.b, tokens: { ...h.b.tokens!, id_token: freshenJwt({ 'https://api.openai.com/auth': { chatgpt_user_id: 'c', chatgpt_account_id: 'account' } }) } };
+      h.keychain.setSync(qlbKeychainService('openai-codex', 'b:account'), QLB_KEYCHAIN_ACCOUNT, JSON.stringify(otherIdentity));
+      assert.deepEqual(await tick(h, watch, 30_000), { state: 'unresolved', reason: 'slot-split' });
+      assert.equal((fence(h) as { reason: string }).reason, 'slot-split');
+      assert.equal(watchRows(h), 1);
+    } finally { close(h); }
+  });
+
   it('a quiet B continues with no row', async () => {
     const h = switchHarness();
     try {
