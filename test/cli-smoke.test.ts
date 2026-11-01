@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { describe, it } from 'node:test';
@@ -433,6 +433,27 @@ describe('CLI smoke — documented commands', () => {
     assert.match(result.stderr, /REAL Pi credential cutover/);
   });
 
+  it('refuses an Anthropic rollback whose symlinked auth.json targets the real Pi agent dir', () => {
+    const env = isolatedEnv();
+    const liveAgent = join(String(env.HOME), '.pi', 'agent');
+    mkdirSync(liveAgent, { recursive: true });
+    writeFileSync(join(liveAgent, 'auth.json'), '{}\n');
+    const migrateDir = mkdtempSync(join(tmpdir(), 'qlb-smoke-real-auth-symlink-'));
+    const linkedAuth = join(migrateDir, 'linked-auth.json');
+    symlinkSync(join(liveAgent, 'auth.json'), linkedAuth);
+
+    const result = runCli([
+      'migrate', 'rollback', '--provider', 'anthropic',
+      '--pool-file', join(migrateDir, 'pool.json'),
+      '--owner-file', join(migrateDir, 'qlb-owner.json'),
+      '--auth-json', linkedAuth,
+      '--json',
+    ], env);
+
+    assert.equal(result.status, 2, result.stderr);
+    assert.match(result.stderr, /REAL Pi credential cutover/);
+  });
+
   it('forward anthropic migration refuses while cswap consume is enabled; status and rollback do not', () => {
     const env = isolatedEnv();
     const enabled = runCli(['consume', 'enable', '--provider', 'anthropic', '--json'], env);
@@ -448,6 +469,7 @@ describe('CLI smoke — documented commands', () => {
     const paths = [
       '--pool-file', join(migrateDir, 'pool.json'),
       '--owner-file', join(migrateDir, 'qlb-owner.json'),
+      '--auth-json', join(migrateDir, 'auth.json'),
     ];
     const status = runCli(['migrate', 'status', '--provider', 'anthropic', ...paths, '--json'], env);
     assert.equal(status.status, 0, status.stderr);

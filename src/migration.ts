@@ -114,13 +114,14 @@ import {
   fsyncSync,
   lstatSync,
   openSync,
+  realpathSync,
   readFileSync,
   renameSync,
   rmSync,
   statSync,
   writeSync,
 } from 'node:fs';
-import { dirname, join, resolve, sep } from 'node:path';
+import { basename, dirname, join, resolve, sep } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { config } from './config';
 import { codexSlotIdFromAccessToken } from './codex-auth';
@@ -407,10 +408,23 @@ export function realPiAgentDir(): string {
   return resolve(dirname(config.piAuthJsonPath));
 }
 
+/** Resolve existing symlinks, retaining missing trailing segments for safe containment checks. */
+function realpathWithMissingTail(p: string): string {
+  let current = resolve(p);
+  const tail: string[] = [];
+  while (!existsSync(current)) {
+    const parent = dirname(current);
+    if (parent === current) break;
+    tail.unshift(basename(current));
+    current = parent;
+  }
+  return resolve(realpathSync(current), ...tail);
+}
+
 /** True if `p` is the live Pi agent dir or a file inside it. */
 export function isRealPiAgentPath(p: string): boolean {
-  const resolved = resolve(p);
-  const root = realPiAgentDir();
+  const resolved = realpathWithMissingTail(p);
+  const root = realpathWithMissingTail(realPiAgentDir());
   return resolved === root || resolved.startsWith(root + sep);
 }
 
@@ -1178,15 +1192,25 @@ export class Migration {
     return Object.assign(new Error(message), { exitCode: 3 });
   }
 
-  /** A v2 owner entry or backup is durable evidence that this rollback owns Pi auth.json. */
+  /** A v2 owner entry or durable backup is evidence that this rollback owns Pi auth.json. */
   private poolRollbackNeedsAuthReconciliation(): boolean {
     return this.ownerEntryPresentAt(this.ownerMapPath)
-      || readPiAuthBackup(this.authJsonPath, 'anthropic') !== null;
+      || existsSync(piAuthBackupPath(this.authJsonPath, 'anthropic'))
+      || existsSync(legacyPiAuthBackupPath(this.authJsonPath, 'anthropic'));
+  }
+
+  /** A malformed recorded rollback source is tampering and must retain ownership. */
+  private readPoolAnthropicBackup(): PiAuthBackup | null {
+    try {
+      return readPiAuthBackup(this.authJsonPath, 'anthropic');
+    } catch {
+      throw this.poolRollbackRefusal('rollback-source-tampered');
+    }
   }
 
   private restorePoolAnthropicAuthIfPlaceholder(): void {
-    const backup = readPiAuthBackup(this.authJsonPath, 'anthropic');
     if (!existsSync(this.authJsonPath)) {
+      const backup = this.readPoolAnthropicBackup();
       if (!backup) throw this.poolRollbackRefusal('no Anthropic auth backup');
       this.restorePoolAnthropicBackup(backup);
       return;
@@ -1198,21 +1222,22 @@ export class Migration {
       throw this.poolRollbackRefusal('Pi auth.json is malformed');
     }
     if (!isObjectRecord(auth)) throw this.poolRollbackRefusal('Pi auth.json is not an object');
+    const entryPresent = Object.prototype.hasOwnProperty.call(auth, 'anthropic');
     const entry = auth.anthropic;
-    if (!Object.prototype.hasOwnProperty.call(auth, 'anthropic') || isPiPlaceholder(entry)) {
-      if (!backup) throw this.poolRollbackRefusal('no Anthropic auth backup');
-      this.restorePoolAnthropicBackup(backup);
-      return;
-    }
-    // A newer valid Pi credential wins over an older QLB backup. Invalid
-    // non-placeholder data is neither a safe restore target nor a safe source.
-    if (!this.isValidSingleGrantRestoreEntry(entry, true)) {
+    // A valid newer Pi OAuth credential wins without parsing an old backup.
+    if (entryPresent && isValidEntry(entry)) return;
+    // An API-key entry is intentionally not treated as an Anthropic OAuth
+    // credential or replaced by a recorded OAuth backup.
+    if (entryPresent && isObjectRecord(entry) && entry.type === 'api-key') {
       throw this.poolRollbackRefusal('Anthropic auth entry is invalid');
     }
+    const backup = this.readPoolAnthropicBackup();
+    if (!backup) throw this.poolRollbackRefusal('no Anthropic auth backup');
+    this.restorePoolAnthropicBackup(backup);
   }
 
   private restorePoolAnthropicBackup(backup: PiAuthBackup): void {
-    if (!this.isValidSingleGrantRestoreEntry(backup.entry, backup.entryPresent)) {
+    if (backup.entryPresent && !isValidEntry(backup.entry)) {
       throw this.poolRollbackRefusal('Anthropic auth backup is invalid');
     }
     restorePiAuthEntryLocked(this.authJsonPath, 'anthropic', backup);
@@ -2566,9 +2591,9 @@ export class Migration {
     // or Pi backup, so they do not read or lock auth.json at all.
     if (existsSync(native)) {
       if (this.poolRollbackNeedsAuthReconciliation()) {
-        const backup = readPiAuthBackup(this.authJsonPath, 'anthropic');
         const authDir = dirname(this.authJsonPath);
         if (!existsSync(authDir) || !statSync(authDir).isDirectory()) {
+          const backup = this.readPoolAnthropicBackup();
           if (backup) throw this.poolRollbackRefusal('Pi auth.json directory is missing');
           throw this.poolRollbackRefusal('no Anthropic auth backup');
         }
