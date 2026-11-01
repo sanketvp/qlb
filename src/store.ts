@@ -2298,8 +2298,9 @@ export class Store {
         }
       };
 
+      const updated = this.db.prepare('UPDATE claude_slots SET last_active_at = ? WHERE account_id = ?').run(input.now, input.toAccount);
+      if (updated.changes !== 1) throw new Error('Claude switch target slot not found');
       this.setActiveLogin('anthropic', input.toAccount, input.setBy, input.now);
-      this.db.prepare('UPDATE claude_slots SET last_active_at = ? WHERE account_id = ?').run(input.now, input.toAccount);
       if (!input.republish) {
         this.setConfig('cooldown.anthropic', String(input.now + 300_000));
         this.setConfig('auto.anthropic.lastSwitchFrom', input.fromAccount);
@@ -2330,14 +2331,16 @@ export class Store {
 
   /** Write one refusal row before a Claude switch has changed any state. */
   recordClaudeSwitchRefusal(input: {
-    from: string;
+    from: string | null;
     to: string;
     trigger: string;
     reason: string;
     injected: boolean;
     attempt: string;
+    now: number;
   }): number {
     return this.recordSwitch({
+      ts: input.now,
       provider: 'anthropic',
       fromAccount: input.from,
       toAccount: input.to,

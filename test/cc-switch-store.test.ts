@@ -188,6 +188,28 @@ describe('Claude switch commit primitive', () => {
     }
   });
 
+  it('commitClaudeSwitch rejects a missing target slot and rolls back every switch effect', () => {
+    const store = openClaudeStore();
+    try {
+      insertSlots(store);
+      db(store).prepare('DELETE FROM claude_slots WHERE account_id = ?').run('to');
+      store.setActiveLogin('anthropic', 'from', 'manual', 10);
+      store.setConfig('sentinel', 'unchanged');
+      const beforeActive = store.getActiveLogin('anthropic');
+      const beforeConfig = configValues(store);
+      assert.throws(() => store.commitClaudeSwitch(input()), /Claude switch target slot not found/);
+      assert.equal(Number((db(store).prepare('SELECT COUNT(*) AS count FROM switch_log').get() as { count: number }).count), 0);
+      assert.deepEqual(store.getActiveLogin('anthropic'), beforeActive);
+      assert.deepEqual(configValues(store), beforeConfig);
+      assert.deepEqual(
+        (db(store).prepare('SELECT account_id, last_active_at FROM claude_slots ORDER BY account_id').all() as object[]).map((row) => ({ ...row })),
+        [{ account_id: 'from', last_active_at: null }],
+      );
+    } finally {
+      store.close();
+    }
+  });
+
   it('a failure inside the transaction writes none of it', () => {
     const store = openClaudeStore();
     try {
@@ -217,7 +239,7 @@ describe('Claude switch commit primitive', () => {
       insertSlots(store);
       const beforeConfig = configValues(store);
       const id = store.recordClaudeSwitchRefusal({
-        from: 'from', to: 'to', trigger: 'manual', reason: 'target-missing', injected: true, attempt: 'refused-attempt',
+        from: 'from', to: 'to', trigger: 'manual', reason: 'target-missing', injected: true, attempt: 'refused-attempt', now: 1_100,
       });
       assert.equal(id, 1);
       assert.deepEqual(
@@ -232,6 +254,22 @@ describe('Claude switch commit primitive', () => {
       assert.deepEqual(
         (db(store).prepare('SELECT account_id, last_active_at FROM claude_slots ORDER BY account_id').all() as object[]).map((row) => ({ ...row })),
         [{ account_id: 'from', last_active_at: null }, { account_id: 'to', last_active_at: null }],
+      );
+    } finally {
+      store.close();
+    }
+  });
+
+  it('recordClaudeSwitchRefusal round-trips active-login-unset with a null from account and its injected timestamp', () => {
+    const store = openClaudeStore();
+    try {
+      insertSlots(store);
+      store.recordClaudeSwitchRefusal({
+        from: null, to: 'to', trigger: 'manual', reason: 'active-login-unset', injected: false, attempt: 'unset-attempt', now: 1_234,
+      });
+      assert.deepEqual(
+        { ...(db(store).prepare('SELECT from_account, to_account, detail, ts FROM switch_log').get() as object) },
+        { from_account: null, to_account: 'to', detail: 'active-login-unset', ts: 1_234 },
       );
     } finally {
       store.close();
@@ -257,7 +295,7 @@ describe('Claude switch commit primitive', () => {
     try {
       insertSlots(store);
       store.recordClaudeSwitchRefusal({
-        from: 'from', to: 'to', trigger: 'manual', reason: 'refused', injected: false, attempt: 'refused-only',
+        from: 'from', to: 'to', trigger: 'manual', reason: 'refused', injected: false, attempt: 'refused-only', now: 2_100,
       });
       store.recordSwitch({
         ts: 2_000, provider: 'anthropic', fromAccount: 'from', toAccount: 'to', trigger: 'manual', outcome: 'rolled-back',
@@ -268,7 +306,7 @@ describe('Claude switch commit primitive', () => {
 
       const id = store.commitClaudeSwitch(input());
       store.recordClaudeSwitchRefusal({
-        from: 'from', to: 'to', trigger: 'manual', reason: 'later refusal', injected: false, attempt: 'attempt-1',
+        from: 'from', to: 'to', trigger: 'manual', reason: 'later refusal', injected: false, attempt: 'attempt-1', now: 3_100,
       });
       store.recordSwitch({
         ts: 3_000, provider: 'anthropic', fromAccount: 'from', toAccount: 'to', trigger: 'manual', outcome: 'rolled-back',
