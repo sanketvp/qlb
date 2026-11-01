@@ -103,10 +103,13 @@
 // strictly before unlinking the owner file.
 
 import { createHash } from 'node:crypto';
+import { constants } from 'node:fs';
 import { isCredentialNotFound } from './credential-backends';
 import {
   chmodSync,
   closeSync,
+  fchmodSync,
+  fstatSync,
   existsSync,
   fsyncSync,
   lstatSync,
@@ -139,6 +142,7 @@ import {
 } from './single-grant-ownership';
 import { parseGrant } from './refresh-lease';
 import { hasLegacyPiOwnerEntry, isPiPlaceholder, PiOwnerLegacyError, readPiOwnerProviders, withPiAuthLock, writePiOwnerEntry, type AuthLockTiming } from './pi-migrate';
+import { validatePiOwnerDocument } from './pi-owner-document';
 import { OPENROUTER_GATE_KEYCHAIN_SERVICE } from './token/openrouter';
 import { refreshLeaseName, type Store } from './store';
 import type { Grant } from './types';
@@ -339,6 +343,8 @@ export interface MigrationConfig {
   readNativeKey?: () => string;
   /** Test-only barrier after a pool takes the final owner-map lock. */
   beforePoolCommitLock?: () => void;
+  /** Test-only barrier after staging validation and immediately before the commit rename. */
+  beforeOwnerFileRename?: () => void;
   /** Test-only barrier immediately before single-grant stage takes Pi's auth lock. */
   beforeOwnershipLock?: () => void;
   /** Test-only directory durability seam for S6b cleanup. */
@@ -612,6 +618,16 @@ function isObjectRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+/** Bridge the shared Pi-gate document validator to migration's legacy v1 payload. */
+function validatedMigrationOwnerFile(value: unknown): OwnerFile | null {
+  try {
+    const owner = validatePiOwnerDocument(value);
+    return owner.owner === 'qlb' && Array.isArray(owner.accounts) ? owner as unknown as OwnerFile : null;
+  } catch {
+    return null;
+  }
+}
+
 function chatgptAccountIdFromJwt(token: string | undefined): string | undefined {
   if (!token) return undefined;
   try {
@@ -796,6 +812,7 @@ export class Migration {
   readonly authJsonKey: string | undefined;
   private readonly readNativeKey: (() => string) | undefined;
   private readonly beforePoolCommitLock: (() => void) | undefined;
+  private readonly beforeOwnerFileRename: (() => void) | undefined;
   private readonly beforeOwnershipLock: (() => void) | undefined;
   private readonly afterStep: ((point: MigrationCrashPoint) => void) | undefined;
   private readonly sleepSync: (ms: number) => void;
@@ -825,6 +842,7 @@ export class Migration {
     this.authJsonKey = config.authJsonKey ?? config.provider;
     this.readNativeKey = config.readNativeKey;
     this.beforePoolCommitLock = config.beforePoolCommitLock;
+    this.beforeOwnerFileRename = config.beforeOwnerFileRename;
     this.beforeOwnershipLock = config.beforeOwnershipLock;
     this.afterStep = config.afterStep;
     this.sleepSync = config.sleepSync ?? ((ms) => {
@@ -977,8 +995,11 @@ export class Migration {
     if (isObjectRecord(detail.handback) && detail.handback.phase === 'cleanup-pending') {
       throw new Error('handback-cleanup-pending: run `qlb migrate resume`');
     }
+    if (detail.intent === 'pre-commit-rollback') {
+      throw Object.assign(new Error('rollback-in-progress: run `qlb migrate resume`'), { exitCode: 3 });
+    }
     if (detail.intent === 'rollback' || Object.prototype.hasOwnProperty.call(detail, 'rollbackDecision')) {
-      throw new Error('rollback-in-progress: run `qlb migrate resume`');
+      throw Object.assign(new Error('rollback-in-progress: run `qlb migrate resume`'), { exitCode: 3 });
     }
   }
 
@@ -1235,6 +1256,7 @@ export class Migration {
     const prePresent =
       this.kind === 'static-key' ? false : existsSync(preQlbPath(this.poolFilePath));
     const intent = detail.intent === 'rollback';
+    const preCommitRollbackIntent = detail.intent === 'pre-commit-rollback';
     const rawHandback = isObjectRecord(detail.handback) && detail.handback.phase === 'cleanup-pending'
       ? detail.handback
       : undefined;
@@ -1278,6 +1300,13 @@ export class Migration {
         : retains
           ? 'continue rollback to NATIVE (owner unlinked; auth.json was never moved)'
           : 'continue rollback to VALIDATED (native restored, owner unlinked)';
+    } else if (
+      ownerPresent
+      && this.kind !== 'static-key'
+      && state === 'VALIDATED'
+      && !this.revalidateAndSecureCommittedOwnerFile()
+    ) {
+      resumeAction = 'invalid published owner; run `qlb migrate rollback`';
     } else if (ownerPresent && STATE_RANK[state] < STATE_RANK.QLB_OWNED) {
       resumeAction = staticKey
         ? 'already committed; finish hygiene (journal only; native Keychain retained) → QLB_OWNED'
@@ -1294,7 +1323,9 @@ export class Migration {
           : 'noop (already QLB_OWNED)';
     } else if (state === 'QLB_OWNED' && !ownerPresent && nativePresent) {
       resumeAction = 'post-RC hygiene: journal VALIDATED';
-    } else if (state === 'VALIDATED' && ownerStaging) {
+    } else if (preCommitRollbackIntent) {
+      resumeAction = 'before commit: roll back staging (native untouched)';
+    } else if (state === 'VALIDATED' && ownerStaging && this.readStagingOwnerFile() !== null) {
       resumeAction = 'rehearsal succeeded; complete commit';
     } else if (state === 'MIRRORED' || ownerStaging) {
       resumeAction = 'before commit: roll back staging (native untouched)';
@@ -1411,6 +1442,7 @@ export class Migration {
       throw new Error(`cannot rehearse from state ${current.state}`);
     }
     this.assertNoUnreadableOwnershipClaim();
+    this.assertNoActiveHandbackMarker();
     const staged = this.readStagedAccounts();
     if (staged.length === 0) {
       throw new Error('no staged Keychain credentials to rehearse');
@@ -1467,11 +1499,15 @@ export class Migration {
     // document. Read before checking or mutating any migration artifact.
     if (this.kind === 'static-key') readPiOwnerProviders(this.ownerMapPath);
     if (this.ownerEntryPresent()) {
+      this.assertCommittedOwnerFileRevalidated();
       return this.finishHygiene();
     }
     const staging = this.stagingPath();
-    if (!existsSync(staging)) {
+    if (!this.claimPathPresent(staging)) {
       throw new Error(`cannot commit: missing ${staging}`);
+    }
+    if (this.readStagingOwnerFile() === null) {
+      throw this.invalidStagingError(staging);
     }
     const current = this.status();
     if (current.state !== 'VALIDATED' && current.state !== 'QLB_OWNED') {
@@ -1519,16 +1555,19 @@ export class Migration {
         // until this final check and rename have completed.
         this.beforePoolCommitLock?.();
         this.refusePoolOwnerMap();
+        this.beforeOwnerFileRename?.();
         renameSync(staging, this.ownerFilePath);
       });
     } else {
       // C — THE ONLY COMMIT POINT (atomic rename on APFS/POSIX).
+      this.beforeOwnerFileRename?.();
       renameSync(staging, this.ownerFilePath);
     }
-    try {
-      chmodSync(this.ownerFilePath, 0o600);
-    } catch {
-      // best-effort
+    // The staging pathname is not covered by either migration lock. Re-open
+    // the newly published destination without following links, then validate
+    // the exact descriptor before its best-effort permission hardening.
+    if (!this.revalidateAndSecureCommittedOwnerFile()) {
+      throw this.invalidPublishedOwnerError();
     }
     return this.finishHygiene();
   }
@@ -1585,6 +1624,9 @@ export class Migration {
     if (ownerPresent || this.journalState() === 'QLB_OWNED') {
       return this.postCommitRollback();
     }
+    if (current.detail.intent === 'pre-commit-rollback') {
+      return this.preCommitRollback();
+    }
     // C7-C9: only an active pre-commit migration has rollback work. In
     // particular, a finished single-grant hand-back has no claim or staging
     // file but can intentionally retain K_m; deleting it here would destroy
@@ -1604,7 +1646,7 @@ export class Migration {
    *   - rollback intent journaled            → continueRollback
    *   - owner file present (past C)          → finishHygiene (forward)
    *   - QLB_OWNED, owner gone, native back   → RH1 (journal VALIDATED)
-   *   - VALIDATED + staging present          → commit (rehearsal proved it)
+   *   - VALIDATED + readable staging         → commit (rehearsal proved it)
    *   - MIRRORED / staging leftovers         → preCommitRollback
    */
   resume(): MigrationStatus {
@@ -1633,6 +1675,7 @@ export class Migration {
     this.assertNoOrphanOwnershipClaim();
     // Any claim, including a custom owner file (Oc), is past C: finish forward.
     if (this.claimPresent()) {
+      this.assertCommittedOwnerFileRevalidated();
       return this.finishHygiene();
     }
     if (
@@ -1641,7 +1684,17 @@ export class Migration {
     ) {
       return this.finishRollbackJournal();
     }
-    if (current.state === 'VALIDATED' && this.claimPathPresent(this.stagingPath())) {
+    if (current.detail.intent === 'pre-commit-rollback') {
+      return this.preCommitRollback();
+    }
+    if (this.invalidRegularStagingOwnerFile()) {
+      throw this.invalidStagingError(this.stagingPath());
+    }
+    if (
+      current.state === 'VALIDATED'
+      && this.claimPathPresent(this.stagingPath())
+      && this.readStagingOwnerFile() !== null
+    ) {
       return this.kind === 'single-grant' ? this.commitUnlocked() : this.commit();
     }
     if (current.state === 'MIRRORED' || this.claimPathPresent(this.stagingPath())) {
@@ -1839,20 +1892,93 @@ export class Migration {
     this.store.upsertMigration(this.storeName, state, JSON.stringify(detail));
   }
 
-  private readStagingOwnerFile(): OwnerFile | null {
-    const p = this.stagingPath();
-    if (!existsSync(p)) return null;
+  private ownerFileMatchesJournal(owner: OwnerFile): boolean {
+    const detail = parseDetail(this.store.getMigration(this.storeName)?.detail_json);
+    if (!Array.isArray(detail.accounts) || !owner.stores.includes(this.storeName)) return false;
+    const journalAccounts = detail.accounts;
+    if (journalAccounts.length !== owner.accounts.length) return false;
+    const journalIdentities = new Set<string>();
+    for (const account of journalAccounts) {
+      if (!isObjectRecord(account) || typeof account.provider !== 'string' || typeof account.id !== 'string') return false;
+      journalIdentities.add(`${account.provider}\u0000${account.id}`);
+    }
+    if (journalIdentities.size !== journalAccounts.length) return false;
+    return owner.accounts.every((account) => account.provider === this.ownerProvider()
+      && journalIdentities.has(`${account.provider}\u0000${account.id}`));
+  }
+
+  private readOwnerFileAt(path: string): OwnerFile | null {
     try {
-      const parsed: unknown = JSON.parse(readFileSync(p, 'utf8'));
-      if (parsed && typeof parsed === 'object' && (parsed as OwnerFile).owner === 'qlb') {
-        return parsed as OwnerFile;
+      if (!lstatSync(path).isFile()) return null;
+      const owner = validatedMigrationOwnerFile(JSON.parse(readFileSync(path, 'utf8')) as unknown);
+      return owner && this.ownerFileMatchesJournal(owner) ? owner : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private readStagingOwnerFile(): OwnerFile | null {
+    return this.readOwnerFileAt(this.stagingPath());
+  }
+
+  /** A malformed regular staging file must be explicitly rolled back, not silently deleted by resume. */
+  private invalidRegularStagingOwnerFile(): boolean {
+    try {
+      return lstatSync(this.stagingPath()).isFile() && this.readStagingOwnerFile() === null;
+    } catch {
+      return false;
+    }
+  }
+
+  private invalidStagingError(path: string): Error {
+    return Object.assign(
+      new Error(`cannot commit: invalid staging ${path}; run \`qlb migrate rollback\``),
+      { exitCode: 3 },
+    );
+  }
+
+  private invalidPublishedOwnerError(): Error {
+    return Object.assign(
+      new Error(`cannot commit: invalid published owner ${this.ownerFilePath}; run \`qlb migrate rollback\``),
+      { exitCode: 3 },
+    );
+  }
+
+  /** C5 retries must re-check the post-rename destination before hygiene. */
+  private assertCommittedOwnerFileRevalidated(): void {
+    if (
+      this.kind !== 'static-key'
+      && this.journalState() === 'VALIDATED'
+      && !this.revalidateAndSecureCommittedOwnerFile()
+    ) {
+      throw this.invalidPublishedOwnerError();
+    }
+  }
+
+  /** Re-open by descriptor so chmod cannot follow a staging-path swap after the commit rename. */
+  private revalidateAndSecureCommittedOwnerFile(): boolean {
+    try {
+      // lstat distinguishes a symlink before open; O_NOFOLLOW closes the
+      // remaining gap before fchmod operates on this descriptor.
+      if (!lstatSync(this.ownerFilePath).isFile()) return false;
+      const fd = openSync(this.ownerFilePath, constants.O_RDONLY | constants.O_NOFOLLOW);
+      try {
+        if (!fstatSync(fd).isFile()) return false;
+        const owner = validatedMigrationOwnerFile(JSON.parse(readFileSync(fd, 'utf8')) as unknown);
+        if (!owner || !this.ownerFileMatchesJournal(owner)) return false;
+        try {
+          fchmodSync(fd, 0o600);
+        } catch {
+          // Permission hardening remains best-effort, as it was before the
+          // descriptor-based revalidation.
+        }
+        return true;
+      } finally {
+        closeSync(fd);
       }
     } catch {
-      // Stage callers that request refuseInvalidStagingFile fail closed when
-      // this path is present. Lenient readers, including rollback, intentionally
-      // fall back to the journal so recovery can delete its staged item.
+      return false;
     }
-    return null;
   }
 
   private readOwnerPayload(): OwnerFile | null {
@@ -2113,14 +2239,58 @@ export class Migration {
     // Resolve (and validate) the journaled auth key before any cleanup, so a
     // conflicting key refuses with every staged artifact still in place.
     const authKey = this.kind === 'single-grant' ? this.singleGrantAuthKey() : undefined;
-    if (this.kind === 'single-grant' && (this.provider === 'xai' || this.provider === 'kimi-coding')) {
-      this.deleteJournalStagedKeychain(this.provider);
-    } else {
-      this.deleteStagedKeychain(this.readOwnerPayload()?.accounts);
+    const journaledSingleGrant = this.kind === 'single-grant' && (this.provider === 'xai' || this.provider === 'kimi-coding');
+    // Validate the delete authority before removing the staging evidence.
+    // `pre-commit-rollback` makes a crash after that removal resumable.
+    if (journaledSingleGrant) this.journalStagedKeychain(this.provider);
+    const stagedAccounts = journaledSingleGrant ? undefined : this.readOwnerPayload()?.accounts;
+    const staging = this.stagingPath();
+    const rollbackStaging = `${staging}.rollback`;
+    if (this.claimPathPresent(staging)) {
+      if (this.claimPathPresent(rollbackStaging)) {
+        throw Object.assign(
+          new Error(`cannot roll back: staging recovery entry exists ${rollbackStaging}`),
+          { exitCode: 3 },
+        );
+      }
+      let stagingEntry;
+      try {
+        stagingEntry = lstatSync(staging);
+      } catch {
+        throw Object.assign(
+          new Error(`cannot roll back: staging entry cannot be inspected ${staging}`),
+          { exitCode: 3 },
+        );
+      }
+      if (!stagingEntry.isFile() && !stagingEntry.isSymbolicLink()) {
+        throw Object.assign(
+          new Error(`cannot roll back: staging entry is not removable ${staging}`),
+          { exitCode: 3 },
+        );
+      }
+      this.journal(this.journalState(), { intent: 'pre-commit-rollback' });
+      // Rename proves the staging entry can leave its claim path before K_m is
+      // deleted. The marker lets resume complete a crash in this interval.
+      renameSync(staging, rollbackStaging);
     }
-    unlinkIfExists(this.stagingPath());
+    try {
+      if (journaledSingleGrant) {
+        this.deleteJournalStagedKeychain(this.provider);
+      } else {
+        this.deleteStagedKeychain(stagedAccounts);
+      }
+    } catch (error) {
+      // Keep the ordinary retry surface when the Keychain delete is refused.
+      if (this.claimPathPresent(rollbackStaging)) renameSync(rollbackStaging, staging);
+      throw error;
+    }
+    unlinkIfExists(rollbackStaging);
     if (authKey !== undefined) removePiAuthBackup(this.poolFilePath, authKey);
-    this.journal('NATIVE', { intent: undefined, rolledBackAt: Date.now(), rolledBackFrom: 'pre-commit' });
+    this.journal('NATIVE', {
+      intent: undefined,
+      rolledBackAt: Date.now(),
+      rolledBackFrom: 'pre-commit',
+    });
     return this.status();
   }
 
