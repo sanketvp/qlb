@@ -535,8 +535,21 @@ export function atomicWriteFile(targetPath: string, contents: string, mode = 0o6
   }
 }
 
+/** Only a definite ENOENT is absent; lstat-visible entries include dangling symlinks. */
+function claimPathPresent(path: string): boolean {
+  try {
+    lstatSync(path);
+    return true;
+  } catch (error: unknown) {
+    // Permission, path-shape, and other lookup errors remain ambiguous
+    // durable evidence, so recovery must not classify them as absent.
+    return !isObjectRecord(error) || error.code !== 'ENOENT';
+  }
+}
+
+/** Remove any lstat-visible staging entry, including a dangling symlink. */
 function unlinkIfExists(path: string): void {
-  if (!existsSync(path)) return;
+  if (!claimPathPresent(path)) return;
   rmSync(path);
 }
 
@@ -852,14 +865,7 @@ export class Migration {
   }
 
   private claimPathPresent(path: string): boolean {
-    try {
-      lstatSync(path);
-      return true;
-    } catch (error: unknown) {
-      // Only a definite absence is safe to classify as no claim. Permission,
-      // path-shape, and other lookup errors are ambiguous durable evidence.
-      return !isObjectRecord(error) || error.code !== 'ENOENT';
-    }
+    return claimPathPresent(path);
   }
 
   private unreadableOwnerMapAt(path: string): boolean {
@@ -1223,7 +1229,7 @@ export class Migration {
     const state = asState(row?.state);
     const detail = parseDetail(row?.detail_json);
     const ownerPresent = this.ownerEntryPresent();
-    const ownerStaging = existsSync(this.stagingPath());
+    const ownerStaging = this.claimPathPresent(this.stagingPath());
     const nativePresent =
       this.kind === 'static-key' ? true : existsSync(this.poolFilePath);
     const prePresent =
@@ -1586,7 +1592,7 @@ export class Migration {
     if (
       this.kind === 'single-grant'
       && this.journalState() !== 'MIRRORED'
-      && !existsSync(this.stagingPath())
+      && !this.claimPathPresent(this.stagingPath())
     ) {
       return this.status();
     }
@@ -1635,10 +1641,10 @@ export class Migration {
     ) {
       return this.finishRollbackJournal();
     }
-    if (current.state === 'VALIDATED' && existsSync(this.stagingPath())) {
+    if (current.state === 'VALIDATED' && this.claimPathPresent(this.stagingPath())) {
       return this.kind === 'single-grant' ? this.commitUnlocked() : this.commit();
     }
-    if (current.state === 'MIRRORED' || existsSync(this.stagingPath())) {
+    if (current.state === 'MIRRORED' || this.claimPathPresent(this.stagingPath())) {
       return this.preCommitRollback();
     }
     // C9: native and unstaged VALIDATED single-grant migrations are at rest.
@@ -2047,9 +2053,10 @@ export class Migration {
    * The journal is the xai/kimi-coding pre-commit delete authority. It must
    * hold exactly one account, and a staging owner file that resolves to a
    * different Keychain item refuses, so every check runs before any delete.
-   * With refuseInvalidStagingFile, stage fails closed when a present staging
-   * file is invalid; rollback deliberately uses the lenient default so it can
-   * recover by deleting the journaled staged item.
+   * With refuseInvalidStagingFile, stage fails closed when an lstat-visible
+   * staging entry is invalid. Rollback deliberately uses the lenient default:
+   * its lstat presence check reaches this journal fallback, deletes the
+   * journaled staged item, and removes that entry (including a dangling link).
    */
   private journalStagedKeychain(
     provider: SingleGrantKeychainProvider,

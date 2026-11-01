@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { describe, it, mock } from 'node:test';
@@ -692,10 +692,11 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       }
     });
 
-    it(`T-KC11h [${provider}] a dangling staging symlink refuses before deleting the old staged copy`, () => {
+    it(`T-KC11h [${provider}] a dangling staging symlink refuses re-stage but rolls back like present staging`, () => {
       const legacy = legacyKmCoords(provider);
       const kc = new DeleteTrackingKeychain();
       const h = oldPreCommitFixture(provider, 'VALIDATED', kc);
+      const normal = oldPreCommitFixture(provider, 'VALIDATED', new DeleteTrackingKeychain());
       try {
         rmSync(h.staging);
         const target = join(h.dir, 'missing-staging-owner');
@@ -710,9 +711,37 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
         );
         assert.deepEqual(kc.deleteCalls, []);
         assert.deepEqual(snapshotRestage(h, provider), before);
-        assert.equal(readlinkSync(h.staging), target, 'the dangling staging symlink stays in place');
+        assert.equal(readlinkSync(h.staging), target, 'the dangling staging symlink stays in place before recovery');
         assert.ok(kc.getSync(legacy.service, legacy.account));
+        assert.equal(h.mig.status().ownerFile, 'staging', 'status reports the dangling staging path');
+
+        const rolled = h.mig.rollback();
+        const normalRolled = normal.mig.rollback();
+        assert.deepEqual(
+          {
+            state: rolled.state,
+            ownerFile: rolled.ownerFile,
+            nativeStore: rolled.nativeStore,
+            piAtNextLaunch: rolled.piAtNextLaunch,
+            resumeAction: rolled.resumeAction,
+          },
+          {
+            state: normalRolled.state,
+            ownerFile: normalRolled.ownerFile,
+            nativeStore: normalRolled.nativeStore,
+            piAtNextLaunch: normalRolled.piAtNextLaunch,
+            resumeAction: normalRolled.resumeAction,
+          },
+          'dangling staging recovers to the normal pre-commit rollback state',
+        );
+        assert.throws(
+          () => lstatSync(h.staging),
+          (error: unknown) => (error as { code?: unknown }).code === 'ENOENT',
+          'rollback removes the dangling staging symlink',
+        );
+        assert.throws(() => kc.getSync(legacy.service, legacy.account), /item not found/);
       } finally {
+        normal.cleanup();
         h.cleanup();
       }
     });
@@ -756,12 +785,12 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
 
     it(`T-KC11g [${provider}] an unparseable auth.json refuses before deleting a VALIDATED journal's old staged copy`, () => {
       const legacy = legacyKmCoords(provider);
-      const invalidAuthJson: Array<[string, string]> = [
-        ['not a JSON object', JSON.stringify('not an object')],
-        ['no importable grant', '{}'],
-        ['no access and refresh', JSON.stringify({ [provider]: { type: 'oauth' } })],
+      const invalidAuthJson: Array<[string, string, RegExp]> = [
+        ['not a JSON object', JSON.stringify('not an object'), /auth\.json is not a JSON object/],
+        ['no importable grant', '{}', /missing importable OAuth grant under key/],
+        ['no access and refresh', JSON.stringify({ [provider]: { type: 'oauth' } }), /is missing access\/refresh/],
       ];
-      for (const [name, authJson] of invalidAuthJson) {
+      for (const [name, authJson, expected] of invalidAuthJson) {
         const kc = new DeleteTrackingKeychain();
         const h = oldPreCommitFixture(provider, 'VALIDATED', kc);
         try {
@@ -769,7 +798,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
           const before = snapshotRestage(h, provider);
           kc.deleteCalls.length = 0;
 
-          assert.throws(() => h.mig.stage(), Error, name);
+          assert.throws(() => h.mig.stage(), expected, name);
           assert.deepEqual(kc.deleteCalls, [], `${name}: nothing deleted`);
           assert.deepEqual(snapshotRestage(h, provider), before, name);
           assert.ok(kc.getSync(legacy.service, legacy.account), `${name}: legacy item stays`);
