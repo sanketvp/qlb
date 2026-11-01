@@ -2369,6 +2369,33 @@ describe('reconcileCodexRecovery — C6-20', () => {
     } finally { close(h); }
   });
 
+  it('a target-changed recovery keeps that fact through a later target-ancestor and never resolves ok after B is restored', async () => {
+    const h = switchHarness();
+    try {
+      const bImported = observedDocument('b', 'b-imported');
+      const bLive = observedDocument('b', 'b-live');
+      const j = install(h);
+      // Recovery first records the external change, adopts B″, and crashes before its terminal row.
+      importActiveCodexSlot(bImported, { store: h.store, keychain: h.keychain, now: () => 2 });
+      codexWrites(h, bLive);
+      await assert.rejects(h.recover({
+        crashAt: (checkpoint) => { if (checkpoint === 'recovery-before-commit') throw new Error('fixture crash'); },
+      }), /fixture crash/);
+      // Codex then writes B's known ancestor, so recovery fails closed instead of completing the attempt.
+      codexWrites(h, h.b);
+      assert.deepEqual(fenced(await h.recover()), { state: 'fenced', reason: 'target-ancestor', message: recoveryMessage('target-ancestor'),
+        accounts: ['a:account', 'b:account'] });
+      // The fail-closed reason must not replace the fact that B changed outside this attempt.
+      assert.deepEqual(unresolvedJournal(h), { attempt: j.attemptId, reason: 'target-changed', accounts: ['a:account', 'b:account'] });
+      // Restoring B to the journaled fingerprint must finish as failed(target-changed), never ok.
+      importActiveCodexSlot(h.b, { store: h.store, keychain: h.keychain, now: () => 3 });
+      assert.deepEqual(await h.recover(), { state: 'clear' });
+      assert.deepEqual(lastRow(h), viaJournal(j, 'failed', 'target-changed'));
+      assert.deepEqual(activeLogin(h), { account_id: 'b:account', set_by: 'adopt' });
+      assert.equal(onDisk(h).state, 'absent');
+    } finally { close(h); }
+  });
+
   it('a recorded holder that exits before recovery still counts as aliveBefore and writes no soft relogin row', async () => {
     const holder: CodexProcess = { pid: 44, lstart: 'Tue Oct 28 10:00:00 2026', host: 'codex' };
     const recover = async (openSessions: CodexProcess[]) => {
@@ -2416,7 +2443,8 @@ describe('reconcileCodexRecovery — C6-20', () => {
       assert.deepEqual(fenced(await h.recover()), { state: 'fenced', reason: 'target-ancestor', message: recoveryMessage('target-ancestor'),
         accounts: ['a:account', 'b:account'] });
       assert.deepEqual(switchRows(h.db), []);
-      assert.deepEqual(unresolvedJournal(h), { attempt: j.attemptId, reason: 'target-ancestor', accounts: ['a:account', 'b:account'] });
+      // The immediate fence reports target-ancestor; the journal retains target-changed so it cannot later resolve ok.
+      assert.deepEqual(unresolvedJournal(h), { attempt: j.attemptId, reason: 'target-changed', accounts: ['a:account', 'b:account'] });
       assert.deepEqual(slotFps(h, 'b:account'), { db: codexFingerprint(bReplacement), keychain: codexFingerprint(bReplacement) });
       assert.equal(liveFp(h), codexFingerprint(h.b));
       assert.deepEqual(activeLogin(h), active);

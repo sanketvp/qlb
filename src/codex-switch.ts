@@ -964,7 +964,7 @@ export function markCodexSwitchJournalUnresolved(held: HeldCodexSwitchJournalOwn
   const current = readCodexSwitchJournal(resolved);
   if (current.state !== 'ok' || current.journal.attemptId !== attemptId) return false;
   const previous = current.journal.unresolved;
-  persistCodexSwitchJournal({ ...current.journal, unresolved: { reason,
+  persistCodexSwitchJournal({ ...current.journal, unresolved: { reason: previous?.reason === 'target-changed' ? 'target-changed' : reason,
     involvedAccounts: unionAccounts(previous?.involvedAccounts ?? [], involvedAccounts),
     since: previous?.since ?? (options.now ?? Date.now)() } }, resolved);
   return true;
