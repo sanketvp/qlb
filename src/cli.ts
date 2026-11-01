@@ -995,7 +995,9 @@ function assertSafeMigratePaths(opts: MigrateOpts): void {
       ? opts.poolFile
       : opts.authJson;
   const real =
-    isRealPiAgentPath(nativePath) || isRealPiAgentPath(opts.ownerFile);
+    isRealPiAgentPath(nativePath)
+    || isRealPiAgentPath(opts.ownerFile)
+    || (opts.provider === 'anthropic' && isRealPiAgentPath(opts.authJson));
   if (real && !opts.confirmRealCutover) {
     console.error(
       'REFUSED: resolved native / owner path is inside ~/.pi/agent/.\n' +
@@ -1309,7 +1311,7 @@ async function runMigrate(opts: MigrateOpts): Promise<number> {
             opts.authJson,
             opts.ownerFile,
           )
-        : new Migration(store, platformKeychain, opts.poolFile, opts.ownerFile);
+        : new Migration(store, platformKeychain, opts.poolFile, opts.ownerFile, undefined, { authJsonPath: opts.authJson });
     let status;
     switch (opts.sub) {
       case 'stage':

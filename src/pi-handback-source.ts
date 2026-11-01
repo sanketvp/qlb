@@ -179,6 +179,7 @@ export function isValidEntry(entry: unknown): entry is ValidPiOAuthEntry {
     && !isPlaceholder(entry)
     && entry.type === 'oauth'
     && typeof entry.access === 'string'
+    && entry.access.length > 0
     && typeof entry.refresh === 'string'
     && entry.refresh.length > 0
     && typeof entry.expires === 'number'

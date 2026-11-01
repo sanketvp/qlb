@@ -6,6 +6,7 @@ import {
   fencedGeneration,
   handbackVerdict,
   keychainDigest,
+  isValidEntry,
   NoSingleGrantRestoreSourceError,
   rankSingleGrantSource,
   restoreRecordFor,
@@ -96,6 +97,17 @@ describe('T-FD — pure fence arithmetic and digests', () => {
     ]) {
       assert.notEqual(canonicalDigest(changed), digest);
     }
+  });
+});
+
+describe('T-VE — valid Pi OAuth entry validation', () => {
+  it('rejects an OAuth entry with an empty access token', () => {
+    assert.equal(isValidEntry({
+      type: 'oauth',
+      access: '',
+      refresh: 'refresh-fake',
+      expires: 4_102_444_800_000,
+    }), false);
   });
 });
 

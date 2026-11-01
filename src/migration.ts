@@ -114,13 +114,14 @@ import {
   fsyncSync,
   lstatSync,
   openSync,
+  realpathSync,
   readFileSync,
   renameSync,
   rmSync,
   statSync,
   writeSync,
 } from 'node:fs';
-import { dirname, join, resolve, sep } from 'node:path';
+import { basename, dirname, join, resolve, sep } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { config } from './config';
 import { codexSlotIdFromAccessToken } from './codex-auth';
@@ -328,6 +329,8 @@ export interface MigrationConfig {
   kind?: MigrationKind;
   provider?: string;
   authJsonKey?: string;
+  /** Anthropic pool rollback's Pi auth.json path; defaults to Pi's canonical path. */
+  authJsonPath?: string;
   /** S2 test seam; defaults to a real synchronous wall-clock sleep. */
   sleepSync?: (ms: number) => void;
   /** S2 test seam for lease liveness and its bounded wait clock; defaults to Date.now. */
@@ -405,10 +408,27 @@ export function realPiAgentDir(): string {
   return resolve(dirname(config.piAuthJsonPath));
 }
 
+/**
+ * Resolve existing symlinks, retaining missing trailing segments for safe containment checks.
+ * Known gap: `..` after a symlink and dangling symlinks are not resolved like the kernel;
+ * the restricted migrate-path design (contract rows P7g-*) replaces this.
+ */
+function realpathWithMissingTail(p: string): string {
+  let current = resolve(p);
+  const tail: string[] = [];
+  while (!existsSync(current)) {
+    const parent = dirname(current);
+    if (parent === current) break;
+    tail.unshift(basename(current));
+    current = parent;
+  }
+  return resolve(realpathSync(current), ...tail);
+}
+
 /** True if `p` is the live Pi agent dir or a file inside it. */
 export function isRealPiAgentPath(p: string): boolean {
-  const resolved = resolve(p);
-  const root = realPiAgentDir();
+  const resolved = realpathWithMissingTail(p);
+  const root = realpathWithMissingTail(realPiAgentDir());
   return resolved === root || resolved.startsWith(root + sep);
 }
 
@@ -818,6 +838,7 @@ export class Migration {
   readonly kind: MigrationKind;
   readonly provider: string | undefined;
   readonly authJsonKey: string | undefined;
+  private readonly authJsonPath: string;
   private readonly readNativeKey: (() => string) | undefined;
   private readonly beforePoolCommitLock: (() => void) | undefined;
   private readonly beforeOwnerFileRename: (() => void) | undefined;
@@ -849,6 +870,7 @@ export class Migration {
     this.kind = config.kind ?? 'pool';
     this.provider = config.provider;
     this.authJsonKey = config.authJsonKey ?? config.provider;
+    this.authJsonPath = config.authJsonPath ?? DEFAULT_AUTH_JSON;
     this.readNativeKey = config.readNativeKey;
     this.beforePoolCommitLock = config.beforePoolCommitLock;
     this.beforeOwnerFileRename = config.beforeOwnerFileRename;
@@ -1161,11 +1183,86 @@ export class Migration {
     return withPiAuthLock(join(dirname(this.ownerMapPath), 'auth.json'), () => fn());
   }
 
+  /** RC: called while the pool rollback holds Pi's configured auth.json lock. */
   private removePoolOwnerEntry(): void {
     if (hasLegacyPiOwnerEntry(this.ownerFilePath, 'anthropic')) {
       unlinkIfExists(this.ownerFilePath);
     } else if (this.ownerEntryPresentAt(this.ownerMapPath)) {
-      this.withOwnerMapLock(() => writePiOwnerEntry(this.ownerMapPath, 'anthropic', false));
+      this.withOwnerMapLockUnlessHeld(() => writePiOwnerEntry(this.ownerMapPath, 'anthropic', false));
+    }
+  }
+
+  private poolRollbackRefusal(message: string): Error {
+    return Object.assign(new Error(message), { exitCode: 3 });
+  }
+
+  /** A v2 owner entry or durable backup is evidence that this rollback owns Pi auth.json. */
+  private poolRollbackNeedsAuthReconciliation(): boolean {
+    return this.ownerEntryPresentAt(this.ownerMapPath)
+      || existsSync(piAuthBackupPath(this.authJsonPath, 'anthropic'))
+      || existsSync(legacyPiAuthBackupPath(this.authJsonPath, 'anthropic'));
+  }
+
+  /** A malformed recorded rollback source is tampering and must retain ownership. */
+  private readPoolAnthropicBackup(): PiAuthBackup | null {
+    try {
+      return readPiAuthBackup(this.authJsonPath, 'anthropic');
+    } catch {
+      throw this.poolRollbackRefusal('rollback-source-tampered');
+    }
+  }
+
+  private restorePoolAnthropicAuthIfPlaceholder(): void {
+    if (!existsSync(this.authJsonPath)) {
+      const backup = this.readPoolAnthropicBackup();
+      if (!backup) throw this.poolRollbackRefusal('no Anthropic auth backup');
+      this.restorePoolAnthropicBackup(backup);
+      return;
+    }
+    let auth: unknown;
+    try {
+      auth = JSON.parse(readFileSync(this.authJsonPath, 'utf8'));
+    } catch {
+      throw this.poolRollbackRefusal('Pi auth.json is malformed');
+    }
+    if (!isObjectRecord(auth)) throw this.poolRollbackRefusal('Pi auth.json is not an object');
+    const entryPresent = Object.prototype.hasOwnProperty.call(auth, 'anthropic');
+    const entry = auth.anthropic;
+    // A valid newer Pi OAuth credential wins without parsing an old backup.
+    if (entryPresent && isValidEntry(entry)) return;
+    // Only QLB's own complete placeholder is safe to replace. Preserve every
+    // other present shape for the user to repair or remove explicitly.
+    const placeholder = isObjectRecord(entry)
+      && isPiPlaceholder(entry)
+      && typeof entry.expires === 'number'
+      && Number.isFinite(entry.expires);
+    if (entryPresent && !placeholder) {
+      throw this.poolRollbackRefusal('Anthropic auth entry is invalid; fix or remove it before rollback');
+    }
+    const backup = this.readPoolAnthropicBackup();
+    if (!backup) throw this.poolRollbackRefusal('no Anthropic auth backup');
+    this.restorePoolAnthropicBackup(backup);
+  }
+
+  private restorePoolAnthropicBackup(backup: PiAuthBackup): void {
+    if (backup.entryPresent && !isValidEntry(backup.entry)) {
+      throw this.poolRollbackRefusal('Anthropic auth backup is invalid');
+    }
+    restorePiAuthEntryLocked(this.authJsonPath, 'anthropic', backup);
+    // The backup helper preserves unrelated keys. When this placeholder was
+    // the only key in a file that did not exist at backup time, remove the
+    // now-empty file as part of restoring that original absence.
+    if (!backup.filePresent && !backup.entryPresent && existsSync(this.authJsonPath)) {
+      const restoredAuth: unknown = JSON.parse(readFileSync(this.authJsonPath, 'utf8'));
+      if (!isObjectRecord(restoredAuth)) throw this.poolRollbackRefusal('Pi auth.json is not an object');
+      if (Object.keys(restoredAuth).length === 0) unlinkIfExists(this.authJsonPath);
+    }
+    const verified = existsSync(this.authJsonPath)
+      ? (JSON.parse(readFileSync(this.authJsonPath, 'utf8')) as Record<string, unknown>).anthropic
+      : undefined;
+    const expected = backup.entryPresent ? backup.entry : undefined;
+    if (!isDeepStrictEqual(verified, expected)) {
+      throw this.poolRollbackRefusal('Anthropic auth restore verification failed');
     }
   }
 
@@ -1176,7 +1273,8 @@ export class Migration {
    * exit 3, like a held auth lock.
    */
   private withOwnerMapLockUnlessHeld<T>(fn: () => T): T {
-    if (resolve(dirname(this.ownerMapPath), 'auth.json') === resolve(this.poolFilePath)) return fn();
+    const heldAuthPath = this.kind === 'pool' ? this.authJsonPath : this.poolFilePath;
+    if (resolve(dirname(this.ownerMapPath), 'auth.json') === resolve(heldAuthPath)) return fn();
     try {
       return this.withOwnerMapLock(fn);
     } catch (error: unknown) {
@@ -1620,22 +1718,30 @@ export class Migration {
     return this.finishHygiene();
   }
 
-  /** S3 precondition: a lock timeout refuses `pi-auth-locked` (exit 3) with the decision kept. */
-  private withSingleGrantRollbackAuthLock<T>(fn: () => T): T {
+  /** A pre-acquire lock timeout refuses with exit 3; errors from fn pass through unchanged. */
+  private withRollbackAuthLock<T>(authPath: string, fn: () => T): T {
     let acquired = false;
     try {
       return withPiAuthLock(
-        resolve(this.poolFilePath),
+        authPath,
         (refresh) => { acquired = true; return this.holdingPiAuthLock(refresh, fn); },
         this.authLockTiming,
       );
     } catch (error: unknown) {
-      // Only a failure to acquire the lock wrote nothing; errors from fn pass through unchanged.
       if (!acquired && error && typeof error === 'object' && (error as { code?: unknown }).code === 'pi-auth-locked') {
         throw Object.assign(error, { exitCode: 3 });
       }
       throw error;
     }
+  }
+
+  /** S3 precondition: a lock timeout refuses `pi-auth-locked` (exit 3) with the decision kept. */
+  private withSingleGrantRollbackAuthLock<T>(fn: () => T): T {
+    return this.withRollbackAuthLock(resolve(this.poolFilePath), fn);
+  }
+
+  private withPoolRollbackAuthLock<T>(fn: () => T): T {
+    return this.withRollbackAuthLock(this.authJsonPath, fn);
   }
 
   rollback(): MigrationStatus {
@@ -2488,9 +2594,25 @@ export class Migration {
       renameSync(retired, native);
     }
 
-    // RC — unlink owner only after native is present again.
+    // RC — restore any P7b8 Anthropic placeholder and only then unlink its
+    // owner claim. Legacy v1 pool documents never recorded a v2 owner entry
+    // or Pi backup, so they do not read or lock auth.json at all.
     if (existsSync(native)) {
-      this.removePoolOwnerEntry();
+      if (this.poolRollbackNeedsAuthReconciliation()) {
+        const authDir = dirname(this.authJsonPath);
+        if (!existsSync(authDir) || !statSync(authDir).isDirectory()) {
+          const backup = this.readPoolAnthropicBackup();
+          if (backup) throw this.poolRollbackRefusal('Pi auth.json directory is missing');
+          throw this.poolRollbackRefusal('no Anthropic auth backup');
+        }
+        this.withPoolRollbackAuthLock(() => {
+          this.restorePoolAnthropicAuthIfPlaceholder();
+          this.removePoolOwnerEntry();
+          removePiAuthBackup(this.authJsonPath, 'anthropic');
+        });
+      } else {
+        this.removePoolOwnerEntry();
+      }
       unlinkIfExists(this.stagingPath());
     } else {
       // Cannot yet drop the owner file — native is not restored. Leave it.

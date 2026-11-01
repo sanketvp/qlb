@@ -101,6 +101,8 @@ describe('qlb gate core (S30/S54)', () => {
         new MockKeychain(),
         join(anthropicAgent, 'anthropic-pool.json'),
         join(anthropicAgent, 'qlb-owner.json'),
+        undefined,
+        { authJsonPath: join(anthropicAgent, 'auth.json') },
       );
       writeFileSync(join(anthropicAgent, 'anthropic-pool.json'), JSON.stringify({
         accounts: [{ id: 'anthropic-a', name: 'Anthropic A', credentials: {
