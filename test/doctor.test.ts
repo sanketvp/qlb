@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -8,7 +8,8 @@ import { describe, it } from 'node:test';
 import { defaultConfig } from '../src/config';
 import { createCommandRunner, doctorQlb, inspectProviders, registeredDoctorChecks } from '../src/diagnostics';
 import { discoverChecks } from '../src/registry';
-import { MACOS_SECURITY_TIMEOUT_MS, MockKeychain } from '../src/keychain';
+import { MACOS_SECURITY_TIMEOUT_MS, MockKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, type KeychainBackend } from '../src/keychain';
+import { recordStash } from '../src/unclaimed-index';
 import { validatedAdvisoryMessage } from '../src/migration-health';
 import { openStore } from '../src/store';
 
@@ -27,6 +28,84 @@ async function doctorReport(
 }
 
 describe('qlb doctor', () => {
+  it('WARNs for each Linux libsecret stash reservation whose body is operationally unreadable', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-libsecret-stash-'));
+    const stashRoot = join(home, '.qlb', 'unclaimed');
+    const unreadableId = 'linux-operational';
+    const readableId = 'body-readable';
+    const fallbackReadableId = 'fallback-readable';
+    const fallbackMalformedId = 'fallback-malformed';
+    const credentialText = 'fixture-credential-must-not-appear';
+    class LinuxLibsecretFake extends MockKeychain {
+      override getSync(service: string, account: string): string {
+        if (service === qlbKeychainService('xai', `unclaimed:${unreadableId}`) ||
+          service === qlbKeychainService('xai', `unclaimed:${fallbackReadableId}`) ||
+          service === qlbKeychainService('xai', `unclaimed:${fallbackMalformedId}`)) {
+          throw new Error('secret-tool exit 1');
+        }
+        return super.getSync(service, account);
+      }
+    }
+    const keychain = Object.assign(new LinuxLibsecretFake(), { kind: 'linux-libsecret' }) as unknown as KeychainBackend;
+    try {
+      await recordStash(stashRoot, {
+        provider: 'xai', accountId: 'default', stashId: unreadableId, consumedFp: 'sha256:lineage', location: 'keychain', createdAt: 1,
+      });
+      await recordStash(stashRoot, {
+        provider: 'xai', accountId: 'default', stashId: readableId, consumedFp: 'sha256:lineage', location: 'keychain', createdAt: 2,
+      });
+      await recordStash(stashRoot, {
+        provider: 'xai', accountId: 'default', stashId: fallbackReadableId, consumedFp: 'sha256:lineage', location: 'file', createdAt: 3,
+      });
+      await recordStash(stashRoot, {
+        provider: 'xai', accountId: 'default', stashId: fallbackMalformedId, consumedFp: 'sha256:lineage', location: 'file', createdAt: 4,
+      });
+      keychain.setSync(qlbKeychainService('xai', `unclaimed:${readableId}`), QLB_KEYCHAIN_ACCOUNT, credentialText);
+      mkdirSync(join(stashRoot, 'xai'), { recursive: true });
+      writeFileSync(join(stashRoot, 'xai', `${fallbackReadableId}.json`), JSON.stringify({
+        credential: { access: credentialText, refresh: credentialText }, consumedFp: 'sha256:lineage',
+      }));
+      writeFileSync(join(stashRoot, 'xai', `${fallbackMalformedId}.json`), '{');
+
+      const report = await doctorQlb(defaultConfig(home), {
+        command: () => 'ok', hostCommand: () => '', hostPlatform: 'linux', keychain,
+      });
+      const warning = report.checks.find((check) => check.name.includes(unreadableId));
+      assert.equal(warning?.level, 'WARN');
+      assert.match(warning?.message ?? '', /xai/);
+      assert.match(warning?.message ?? '', new RegExp(unreadableId));
+      assert.match(warning?.message ?? '', /unlock your login keyring \(GNOME Keyring \/ KWallet\), then run qlb doctor again/);
+      assert.equal(report.checks.some((check) => check.name.includes(readableId)), false);
+      assert.equal(report.checks.some((check) => check.name.includes(fallbackReadableId)), false);
+      assert.equal(report.checks.find((check) => check.name.includes(fallbackMalformedId))?.level, 'WARN');
+      assert.doesNotMatch(JSON.stringify(report), new RegExp(credentialText));
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('WARNs when a Linux libsecret provider stash index cannot be read', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-libsecret-index-'));
+    const stashRoot = join(home, '.qlb', 'unclaimed');
+    const malformedIndexText = 'fixture-index-content-must-not-appear';
+    const keychain = Object.assign(new MockKeychain(), { kind: 'linux-libsecret' }) as unknown as KeychainBackend;
+    try {
+      mkdirSync(join(stashRoot, 'index', 'xai'), { recursive: true });
+      writeFileSync(join(stashRoot, 'index', 'xai', 'malformed.json'), malformedIndexText);
+
+      const report = await doctorQlb(defaultConfig(home), {
+        command: () => 'ok', hostCommand: () => '', hostPlatform: 'linux', keychain,
+      });
+      const warning = report.checks.find((check) => check.name === 'stash:libsecret:xai');
+      assert.equal(warning?.level, 'WARN');
+      assert.match(warning?.message ?? '', /stash index could not be read/);
+      assert.match(warning?.message ?? '', /xai/);
+      assert.doesNotMatch(JSON.stringify(report), new RegExp(malformedIndexText));
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it('qlb doctor lists kept copies without reading their bytes', async () => {
     const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-kept-copies-'));
     const service = 'qlb:xai:kept:2026-10-30T12:00:00.000Z';
