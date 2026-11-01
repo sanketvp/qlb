@@ -2441,7 +2441,7 @@ export class Store {
       });
   }
 
-  /** Atomically record a watch reversion and consume its watch row. */
+  /** Atomically record a watch reversion and consume its watch row. No committed_at: findCodexSwitchByAttempt still finds the ok commit. */
   commitCodexWatchRevert(input: {
     watch: { switchId: number; outgoing: string; target: string; trigger: string };
     setActive: string;
@@ -2452,7 +2452,23 @@ export class Store {
       this.setActiveLogin('openai-codex', input.setActive, 'adopt', input.now);
       const switchId = this.recordSwitch({ ts: input.now, provider: 'openai-codex', fromAccount: input.watch.outgoing,
         toAccount: input.watch.target, trigger: input.watch.trigger, outcome: 'reverted-by-codex',
-        stepsJson: JSON.stringify({ attempt: input.attempt, via: 'watch' }), publishedAt: null, committedAt: input.now });
+        stepsJson: JSON.stringify({ attempt: input.attempt, via: 'watch' }), publishedAt: null });
+      this.db.prepare('DELETE FROM codex_watch WHERE switch_id = ?').run(input.watch.switchId);
+      return switchId;
+    });
+  }
+
+  /** Atomically record a watch's unknown-live-identity stop: no active login, a failed row, the watch consumed. */
+  commitCodexWatchStop(input: {
+    watch: { switchId: number; outgoing: string; target: string; trigger: string };
+    attempt: string;
+    now: number;
+  }): number {
+    return this.runImmediate(() => {
+      this.setActiveLogin('openai-codex', null, 'adopt', input.now);
+      const switchId = this.recordSwitch({ ts: input.now, provider: 'openai-codex', fromAccount: input.watch.outgoing,
+        toAccount: input.watch.target, trigger: input.watch.trigger, outcome: 'failed', detail: 'unknown-live-identity',
+        stepsJson: JSON.stringify({ attempt: input.attempt, via: 'watch' }), publishedAt: null });
       this.db.prepare('DELETE FROM codex_watch WHERE switch_id = ?').run(input.watch.switchId);
       return switchId;
     });

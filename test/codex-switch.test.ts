@@ -3238,6 +3238,146 @@ describe('Codex watch tick — C6-21', () => {
     } finally { close(h); }
   });
 
+  it('an overdue watch (now ≥ until + 60 s) is deleted without reading, attributing or writing a row, even under a fence', async () => {
+    for (const fenced of [false, true]) {
+      const h = switchHarness();
+      try {
+        const watch = await committedWatch(h);
+        if (fenced) {
+          splitSlot(h, 'b:account', 'b-killed');
+          codexWrites(h, observedDocument('b', 'b-rotated'));
+          assert.deepEqual(await tick(h, watch, 5_000), { state: 'unresolved', reason: 'slot-split' });
+        }
+        const storedFence = fence(h);
+        const aPrime = observedDocument('a', 'a-late');
+        codexWrites(h, aPrime);
+        const before = { rows: rows(h), a: slotFps(h, 'a:account'), active: activeLogin(h),
+          observations: scalarCount(h.db, 'SELECT COUNT(*) AS count FROM codex_live_observations') };
+        let reads = 0;
+        const readLive = () => { reads += 1; return readCodexAuthStableWithStat(h.authPath, { delayMs: 0 }); };
+        const overdue = watch.until - watch.publishedAt + 60_000;
+        assert.deepEqual(await tick(h, watch, overdue, { readLive }), { state: 'stopped', reason: 'overdue' }, String(fenced));
+        assert.equal(reads, 0);
+        assert.deepEqual({ rows: rows(h), a: slotFps(h, 'a:account'), active: activeLogin(h),
+          observations: scalarCount(h.db, 'SELECT COUNT(*) AS count FROM codex_live_observations') }, before);
+        assert.equal(watchRows(h), 0);
+        assert.deepEqual(fence(h), storedFence, 'a fence is cleared only by recovery');
+      } finally { close(h); }
+    }
+    // Control: one millisecond earlier the tick still attributes the reversion.
+    const h = switchHarness();
+    try {
+      const watch = await committedWatch(h);
+      codexWrites(h, observedDocument('a', 'a-late'));
+      assert.deepEqual(await tick(h, watch, watch.until - watch.publishedAt + 59_999), { state: 'reverted' });
+    } finally { close(h); }
+  });
+
+  it('an unknown live identity during the watch stashes it and commits failed unknown-live-identity, active_login NULL and the watch delete in one transaction', async () => {
+    const unknownLogins = {
+      'an unmanaged identity': observedDocument('z', 'z-live'),
+      'no identity claims': (() => { const doc = freshenDocument(1_700_100_000_000, 'no-identity'); return { ...doc, tokens: { ...doc.tokens, id_token: freshenJwt({}) } }; })(),
+    };
+    for (const [label, unknown] of Object.entries(unknownLogins)) {
+      const h = switchHarness();
+      try {
+        const watch = await committedWatch(h);
+        const stashes: string[] = [];
+        const slots = { ...h.slots, ensureUnclaimedStash: async (doc: CodexAuthDocument) => {
+          stashes.push(codexFingerprint(doc)); return { stashId: 'fixture-stash', created: stashes.length === 1 };
+        } };
+        codexWrites(h, unknown);
+        // The watch delete fails inside the transaction: nothing of the stop may remain.
+        h.db.exec("CREATE TRIGGER fail_watch_delete BEFORE DELETE ON codex_watch BEGIN SELECT RAISE(ABORT, 'fixture delete failure'); END");
+        await assert.rejects(tick(h, watch, 5_000, { slots: slots as never }), /fixture delete failure/, label);
+        assert.equal(rows(h).length, 1, label);
+        assert.deepEqual(activeLogin(h), { account_id: 'b:account', set_by: 'manual' }, label);
+        assert.equal(watchRows(h), 1, label);
+        h.db.exec('DROP TRIGGER fail_watch_delete');
+        assert.deepEqual(await tick(h, watch, 30_000, { slots: slots as never }), { state: 'stopped', reason: 'unknown-live-identity' }, label);
+        assert.deepEqual(rows(h).slice(1), [viaWatch(watch, 'failed', 'unknown-live-identity', null)], label);
+        assert.deepEqual(activeLogin(h), { account_id: null, set_by: 'adopt' }, label);
+        assert.equal(watchRows(h), 0, label);
+        assert.deepEqual(stashes, [codexFingerprint(unknown), codexFingerprint(unknown)], `${label}: one body, ensured idempotently`);
+      } finally { close(h); }
+    }
+  });
+
+  it('a watch that lost its lock before the unknown-identity stash writes no stash', async () => {
+    const h = switchHarness();
+    try {
+      const watch = await committedWatch(h);
+      let stashes = 0;
+      const slots = { ...h.slots, ensureUnclaimedStash: async () => { stashes += 1; return { stashId: 'fixture-stash', created: true }; } };
+      codexWrites(h, observedDocument('z', 'z-live'));
+      const switchLock = codexLockPaths(h.store.dbPath, '').switch;
+      // Another holder takes the switch lock over while the tick lists Codex sessions.
+      const list = async () => {
+        for (const entry of readdirSync(switchLock)) if (entry.startsWith('.qlb-owner-')) rmSync(join(switchLock, entry));
+        return [];
+      };
+      await assert.rejects(tick(h, watch, 5_000, { slots: slots as never, list }));
+      assert.equal(stashes, 0);
+      assert.equal(rows(h).length, 1);
+      assert.equal(watchRows(h), 1);
+    } finally { close(h); }
+  });
+
+  it('a tick after its own fence resolved ok reports quiet, not superseded, whoever resolved it', async () => {
+    for (const resolver of ['the +5 s tick', 'another caller\'s recovery'] as const) {
+      const h = switchHarness();
+      try {
+        const watch = await committedWatch(h);
+        splitSlot(h, 'b:account', 'b-killed');
+        codexWrites(h, observedDocument('b', 'b-rotated'));
+        assert.deepEqual(await tick(h, watch, 1_000), { state: 'unresolved', reason: 'slot-split' }, resolver);
+        const bLogin = observedDocument('b', 'b-login');
+        codexWrites(h, bLogin);
+        importActiveCodexSlot(bLogin, { store: h.store, keychain: h.keychain, now: () => watch.publishedAt + 2_000 });
+        if (resolver === 'the +5 s tick') assert.deepEqual(await tick(h, watch, 5_000), { state: 'quiet' }, resolver);
+        else assert.deepEqual(await h.recover(), { state: 'clear' }, resolver);
+        const after = rows(h);
+        assert.deepEqual(after.at(-1), viaWatch(watch, 'ok', null, watch.publishedAt, 'fence'), resolver);
+        assert.deepEqual(await tick(h, watch, 30_000), { state: 'quiet' }, resolver);
+        assert.deepEqual(rows(h), after, resolver);
+        // A later publication still supersedes the watch.
+        assert.equal((await h.runWith({ attempt: 'switch-back' }, { target: 'a:account', trigger: 'manual' })).outcome, 'ok', resolver);
+        assert.deepEqual(await tick(h, watch, 60_000), { state: 'stopped', reason: 'superseded' }, resolver);
+      } finally { close(h); }
+    }
+  });
+
+  it('a later publishing row whose steps_json is not JSON supersedes the watch instead of failing the tick', async () => {
+    const h = switchHarness();
+    try {
+      const watch = await committedWatch(h);
+      h.store.recordSwitch({ ts: watch.publishedAt + 1, provider: 'openai-codex', fromAccount: 'b:account', toAccount: 'a:account', trigger: 'manual',
+        outcome: 'ok', stepsJson: 'not json', publishedAt: watch.publishedAt + 1 });
+      assert.equal((h.db.prepare('SELECT steps_json FROM switch_log ORDER BY id DESC LIMIT 1').get() as { steps_json: string }).steps_json, 'not json');
+      assert.deepEqual(await tick(h, watch, 30_000), { state: 'stopped', reason: 'superseded' });
+    } finally { close(h); }
+  });
+
+  it('a watch revert row leaves findCodexSwitchByAttempt on the switch\'s ok commit', async () => {
+    const h = switchHarness();
+    try {
+      const watch = await committedWatch(h, 'manual', async () => [holderOfA]);
+      codexWrites(h, observedDocument('a', 'a-prime'));
+      assert.deepEqual(await tick(h, watch, 30_000), { state: 'reverted' });
+      const found = h.store.findCodexSwitchByAttempt(watch.attempt);
+      assert.deepEqual([found?.id, found?.outcome], [watch.switchId, 'ok']);
+    } finally { close(h); }
+  });
+
+  it('switchCodex passes its trigger to admission', async () => {
+    const h = switchHarness();
+    try {
+      const seen: Array<string | undefined> = [];
+      assert.equal((await h.runWith({ admitted: (trigger?: string) => { seen.push(trigger); return { ok: true }; } })).outcome, 'ok');
+      assert.deepEqual(seen, ['manual']);
+    } finally { close(h); }
+  });
+
   it('a tick outside an admitting lifecycle state stops', async () => {
     const h = switchHarness();
     try {

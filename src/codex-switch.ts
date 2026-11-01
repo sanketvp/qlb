@@ -47,7 +47,7 @@ export interface CodexSwitchDeps {
   store: Pick<Store, 'getCodexActiveLogin' | 'getCodexSlot' | 'getConfig' | 'hasConfig' | 'recordSwitch'
     | 'recordCodexObservation' | 'setActiveLogin' | 'commitCodexSwitch' | 'findCodexSwitchByAttempt'
     | 'setRecoveryFence' | 'clearRecoveryFence' | 'commitFenceResolution'
-    | 'codexPublishingRowsAfter' | 'commitCodexWatchRevert' | 'deleteCodexWatch'> & CodexAttributionStore;
+    | 'codexPublishingRowsAfter' | 'commitCodexWatchRevert' | 'commitCodexWatchStop' | 'deleteCodexWatch'> & CodexAttributionStore;
   readLive: () => Promise<CodexAuthStableWithStatResult>;
   cswapProcesses: () => CswapProcess[];
   now: () => number;
@@ -1307,6 +1307,9 @@ export async function reconcileCodexRecovery(deps: CodexSwitchDeps): Promise<Awa
   return withCodexSwitchLocks(deps, (assertHeld) => reconcileCodexRecoveryLocked(deps, assertHeld));
 }
 
+/** X10b: a watch row consumed this long after its until is deleted without a verdict (C6 plan, C6-22 row). */
+export const CODEX_WATCH_OVERDUE_MS = 60_000;
+
 export interface CodexWatch {
   switchId: number;
   outgoing: string;
@@ -1333,24 +1336,35 @@ export async function codexWatchTick(deps: CodexSwitchDeps, watch: CodexWatch): 
   const slots = deps.slots;
   const keychain = deps.keychain;
   const list = deps.list;
-  return withCodexSwitchLocks(deps, async (assertHeld) => {
-    if (deps.store.codexPublishingRowsAfter(watch.switchId).length > 0) return { state: 'stopped', reason: 'superseded' };
-    const fence = parseCodexRecoveryFence(deps.store.getConfig('codex.recoveryFence'));
+  /**
+   * The generation guard (§3) with this watch's own fence resolution told apart: the row
+   * commitFenceResolution writes for this switch carries its attempt and via 'fence'
+   * (attempts are unique per switch). Latest row wins; an unparseable row supersedes.
+   */
+  const settledByRows = (): CodexWatchTickResult | undefined => {
+    const latest = deps.store.codexPublishingRowsAfter(watch.switchId).at(-1);
+    if (!latest) return undefined;
+    let steps: { attempt?: unknown; via?: unknown } = {};
+    try { steps = latest.stepsJson ? JSON.parse(latest.stepsJson) as typeof steps : {}; } catch { /* not a fence resolution */ }
+    if (steps.via !== 'fence' || steps.attempt !== watch.attempt) return { state: 'stopped', reason: 'superseded' };
+    if (latest.outcome === 'reverted-by-codex') return { state: 'reverted' };
+    return latest.outcome === 'ok' ? { state: 'quiet' } : { state: 'stopped', reason: latest.detail ?? latest.outcome };
+  };
+  return withCodexSwitchLocks(deps, async (assertHeld): Promise<CodexWatchTickResult> => {
+    // X10b: an overdue row is consumed without a verdict, even under a fence (the fence keeps its own context).
+    if (deps.now() >= watch.until + CODEX_WATCH_OVERDUE_MS) {
+      assertHeld(); deps.store.deleteCodexWatch(watch.switchId);
+      return { state: 'stopped', reason: 'overdue' };
+    }
+    const before = settledByRows();
+    if (before) return before;
     // The locked form: this tick already holds switch → auth (no re-entry).
     const recovery = await reconcileCodexRecoveryLocked(deps, assertHeld);
     if (recovery.state === 'fenced') return { state: 'quiet' };
-    const after = deps.store.codexPublishingRowsAfter(watch.switchId);
-    // A fence resolved by this tick's recovery already wrote its effect row: report it, never attribute again.
-    const resolution = fence && after.find((row) => {
-      const steps = row.stepsJson ? JSON.parse(row.stepsJson) as { attempt?: unknown; via?: unknown } : {};
-      return steps.via === 'fence' && steps.attempt === fence.attempt;
-    });
-    if (resolution) {
-      if (resolution.outcome === 'reverted-by-codex') return { state: 'reverted' };
-      return resolution.outcome === 'ok' ? { state: 'quiet' } : { state: 'stopped', reason: resolution.detail ?? resolution.outcome };
-    }
-    // Recovery may have committed a later switch's orphaned journal: the generation guard applies to it too.
-    if (after.length > 0) return { state: 'stopped', reason: 'superseded' };
+    // A fence this recovery resolved already wrote its effect row: report it, never attribute again.
+    // A later switch's orphaned journal it committed supersedes the watch.
+    const after = settledByRows();
+    if (after) return after;
     const observed = await deps.readLive();
     if (observed.status === 'missing') { assertHeld(); deps.store.deleteCodexWatch(watch.switchId); return { state: 'stopped', reason: 'logged-out' }; }
     if (observed.status === 'unstable' || observed.status === 'unreadable') {
@@ -1386,6 +1400,7 @@ export async function codexWatchTick(deps: CodexSwitchDeps, watch: CodexWatch): 
           aliveAfter: liveIdentity !== null && renewers(codexIdentityParts(liveIdentity), current, history.rows, history.observations).length > 0,
         }, l40Verified: deps.store.getConfig('codex.l40Verified') === '1', now: deps.now });
       if (attribution.action === 'unclaimed') {
+        assertHeld();
         try { await slots.ensureUnclaimedStash!(live, deps.now()); }
         catch (error) { if (error instanceof CodexStashUnverifiable) attribution = { action: 'stash-unverifiable' }; else throw error; }
       }
@@ -1398,7 +1413,8 @@ export async function codexWatchTick(deps: CodexSwitchDeps, watch: CodexWatch): 
     };
     const verdict = resolveRecoveryVerdict(classified, attribution, { phase: 'watch', watch: journal,
       targetSlotFingerprint: deps.store.getCodexSlot(watch.target)?.fingerprint ?? '', slotHeads, live });
-    if (verdict.class === 'pending') return deps.now() >= watch.until ? { state: 'inconclusive' } : { state: 'quiet' };
+    // classified is ok or external, so the verdict is never pending.
+    if (verdict.class === 'pending') throw new Error('Codex watch verdict cannot be pending');
     if (verdict.class === 'unresolved') {
       assertHeld(); deps.store.setRecoveryFence({ v: 1, switchId: watch.switchId, attempt: watch.attempt, from: watch.outgoing, to: watch.target,
         publishedAt: watch.publishedAt, reason: verdict.reason, involvedAccounts: verdict.involvedAccounts, since: deps.now() });
@@ -1411,23 +1427,18 @@ export async function codexWatchTick(deps: CodexSwitchDeps, watch: CodexWatch): 
       assertHeld(); deps.store.commitCodexWatchRevert({ watch, setActive: effect.accountId, attempt: watch.attempt, now: deps.now() });
       return { state: 'reverted' };
     }
-    if (effect.outcome === 'stopped' || effect.outcome === 'failed') {
-      assertHeld();
-      if (effect.outcome === 'stopped' && effect.reason === 'unknown-live-identity') {
-        deps.store.recordSwitch({ ts: deps.now(), provider: PROVIDER, fromAccount: watch.outgoing, toAccount: watch.target, trigger: watch.trigger,
-          outcome: 'failed', detail: 'unknown-live-identity', stepsJson: JSON.stringify({ attempt: watch.attempt, via: 'watch' }), publishedAt: null });
-        deps.store.setActiveLogin(PROVIDER, null, 'adopt', deps.now());
-      }
-      deps.store.deleteCodexWatch(watch.switchId);
-      return { state: 'stopped', reason: effect.outcome === 'stopped' ? effect.reason : effect.detail };
+    if (effect.outcome === 'stopped' && effect.reason === 'unknown-live-identity') {
+      assertHeld(); deps.store.commitCodexWatchStop({ watch, attempt: watch.attempt, now: deps.now() });
+      return { state: 'stopped', reason: 'unknown-live-identity' };
     }
-    return { state: 'quiet' };
+    // Missing and wiped returned above; failed/ok are post/recovery effects only.
+    throw new Error(`Codex watch cannot apply the ${effect.outcome} effect`);
   });
 }
 
 /** C6-18: switch through the journaled publication; C6-20 supplies recovery. */
 export async function switchCodex(deps: CodexSwitchDeps, input: SwitchCodexInput): Promise<CodexSwitchResult> {
-  const admitted = await deps.admitted?.() ?? { ok: true };
+  const admitted = await deps.admitted?.(input.trigger) ?? { ok: true };
   if (!admitted.ok) return switchResult(admitted.reason ?? 'not-admitted');
   const recovery = await reconcileCodexRecovery(deps);
   if (recovery.state === 'fenced') return switchResult(recovery.reason, recovery.message);
