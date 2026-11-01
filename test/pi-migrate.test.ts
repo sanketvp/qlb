@@ -9,6 +9,7 @@ import { MacosKeychainBackend, markFakeExecutor, MockKeychain, NativeOpenRouterK
 import { openStore } from '../src/store';
 import { ADAPTER_ACCOUNT_IDS } from '../src/migration';
 import { sharedSingleGrantCoords } from '../src/single-grant-ownership';
+import { exitCodeForError } from '../src/cli';
 import {
   defaultPiMigratePaths,
   hasLegacyPiOwnerEntry,
@@ -1211,6 +1212,66 @@ describe('Pi migration S58 credential-first barrier', () => {
       );
       assert.deepEqual(deletes, [], 'holder A must not delete after the takeover');
     } finally { h.cleanup(); }
+  });
+
+  describe('P7a-r-Q2: pi-auth-lock-lost exits 3 before the first write and 1 once a write has landed', () => {
+    // Barrier: holder B takes the lock over by rewriting its owner file.
+    const takeOver = (path: string) => writeFileSync(join(`${path}.lock`, 'qlb-lock-owner.json'), JSON.stringify({ pid: process.pid, nonce: 'holder-b' }));
+    // Lock wrapper that lets B take over after A acquires the lock and before A runs.
+    const takenOverOnEntry = <T>(path: string, fn: (refresh: () => void) => T): T => withPiAuthLock(path, (refresh) => { takeOver(path); return fn(refresh); });
+    const lockLostWithExit = (exit: number) => (error: unknown) => (error as { code?: unknown }).code === 'pi-auth-lock-lost' && exitCodeForError(error) === exit;
+    const snapshot = (h: ReturnType<typeof setup>) => ({
+      auth: readFileSync(h.paths.authJsonPath, 'utf8'),
+      owner: existsSync(h.paths.ownerPath) ? readFileSync(h.paths.ownerPath, 'utf8') : null,
+      journal: existsSync(join(h.paths.journalPath, 'pi-migrate-xai.json')),
+      baseline: existsSync(join(h.paths.baselineDir, 'xai.json')) ? readFileSync(join(h.paths.baselineDir, 'xai.json'), 'utf8') : null,
+      managed: hasManaged(h.keychain, 'xai') ? h.keychain.getSync(qlbKeychainService('xai', 'default'), QLB_KEYCHAIN_ACCOUNT) : null,
+      state: h.store.getConfig('pi.xai.state') ?? null,
+    });
+
+    it('pi migrate: lock lost before the first write exits 3 and writes nothing', () => {
+      const h = setup();
+      try {
+        const before = snapshot(h);
+        assert.throws(() => migratePiSingleProvider('xai', h.paths, { keychain: h.keychain, store: h.store, withAuthLock: takenOverOnEntry }), lockLostWithExit(3));
+        assert.deepEqual(snapshot(h), before, 'nothing written');
+      } finally { h.cleanup(); }
+    });
+
+    it('pi migrate: lock lost after a write exits 1', () => {
+      const h = setup();
+      try {
+        assert.throws(() => migratePiSingleProvider('xai', h.paths, {
+          keychain: h.keychain,
+          store: h.store,
+          afterWrite: (point) => { if (point === 'baseline') takeOver(h.paths.authJsonPath); },
+        }), lockLostWithExit(1));
+        assert.equal(existsSync(join(h.paths.baselineDir, 'xai.json')), true, 'the baseline write landed');
+      } finally { h.cleanup(); }
+    });
+
+    it('pi rollback: lock lost before the first write exits 3 and writes nothing', () => {
+      const h = setup();
+      try {
+        assert.equal(migratePiSingleProvider('xai', h.paths, { keychain: h.keychain, store: h.store }).state, 'migrated');
+        const before = snapshot(h);
+        assert.throws(() => rollbackPiSingleProvider('xai', h.paths, { keychain: h.keychain, store: h.store, withAuthLock: takenOverOnEntry }), lockLostWithExit(3));
+        assert.deepEqual(snapshot(h), before, 'nothing written');
+      } finally { h.cleanup(); }
+    });
+
+    it('pi rollback: lock lost after a write exits 1', () => {
+      const h = setup();
+      try {
+        assert.equal(migratePiSingleProvider('xai', h.paths, { keychain: h.keychain, store: h.store }).state, 'migrated');
+        assert.throws(() => rollbackPiSingleProvider('xai', h.paths, {
+          keychain: h.keychain,
+          store: h.store,
+          afterWrite: (point) => { if (point === 'owner-entry') takeOver(h.paths.authJsonPath); },
+        }), lockLostWithExit(1));
+        assert.equal(existsSync(h.paths.ownerPath), false, 'the owner-entry write landed');
+      } finally { h.cleanup(); }
+    });
   });
 
   it('P7a-r: a lock moved aside between the owner check and the touch reports pi-auth-lock-lost', () => {

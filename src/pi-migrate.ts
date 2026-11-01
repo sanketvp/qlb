@@ -90,6 +90,19 @@ export function isPiPlaceholder(entry: unknown): boolean { return !!entry && typ
 function sleepSync(ms: number): void { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); }
 function lockedError(): Error { return Object.assign(new Error('pi-auth-locked'), { code: 'pi-auth-locked', name: 'PiAuthLockedError' }); }
 function lockLostError(detail = '', cause?: Error): Error { return Object.assign(new Error(`pi-auth-lock-lost: another run took the auth.json lock over${detail}`, cause ? { cause } : undefined), { code: 'pi-auth-lock-lost', name: 'PiAuthLockLostError' }); }
+/**
+ * P7a-r-Q2: run fn under the auth lock; a lost lock exits 3 before the run's first write and 1 once a write may have landed.
+ * Every write is preceded by a passing refresh(), so "a refresh passed" over-reports writes, never under-reports them.
+ */
+function underAuthLock(lock: NonNullable<PiMigrateDeps['withAuthLock']>, authPath: string, fn: (refresh: () => void) => void): void {
+  let wrote = false;
+  try {
+    lock(authPath, (refresh) => fn(() => { refresh(); wrote = true; }));
+  } catch (error) {
+    if ((error as { code?: unknown }).code === 'pi-auth-lock-lost') Object.assign(error as object, { exitCode: wrote ? 1 : 3 });
+    throw error;
+  }
+}
 interface AuthLockOwner { pid: number; nonce: string; }
 function lockOwnerPath(lock: string): string { return join(lock, 'qlb-lock-owner.json'); }
 function readLockOwner(lock: string): AuthLockOwner | null {
@@ -322,7 +335,7 @@ export function migratePiSingleProvider(provider: PiSingleProvider, paths: PiMig
   let journal: Journal;
   let resumed = false;
   let state: PiMigrateResult['state'] = 'not-applicable';
-  lock(paths.authJsonPath, (refresh) => {
+  underAuthLock(lock, paths.authJsonPath, (refresh) => {
     const inLockJournal = readJournal(paths, provider);
     journal = inLockJournal ?? { provider, phase: 'started', ownerPid: process.pid, updatedAt: Date.now() };
     resumed = inLockJournal !== null;
@@ -390,7 +403,7 @@ export function migratePiSingleProvider(provider: PiSingleProvider, paths: PiMig
 export function rollbackPiSingleProvider(provider: PiSingleProvider, paths: PiMigratePaths = defaultPiMigratePaths(), deps: PiMigrateDeps): PiMigrateResult {
   assertPiSingleProvider(provider); checkPaths(paths, deps);
   const lock = deps.withAuthLock ?? ((path, fn) => withPiAuthLock(path, fn, deps.authLockTiming));
-  lock(paths.authJsonPath, (refresh) => {
+  underAuthLock(lock, paths.authJsonPath, (refresh) => {
     if (provider !== 'openrouter') {
       if (!deps.store) throw genericRollbackOwnershipUnreadableError(provider);
       const generic = deps.store.getMigration(`pi-${provider}`);
