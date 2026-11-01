@@ -89,6 +89,8 @@ export interface ClaudeSwitchDeps {
   journalOwner?: { pid: number; lstart: string };
   /** Test seam for journal mutations; production uses the real helpers. */
   journalOps?: {
+    /** Rollback-reader seam; production re-reads the on-disk journal. */
+    read?: typeof readClaudeSwitchJournal;
     update: typeof updateClaudeSwitchJournal;
     remove: typeof deleteClaudeSwitchJournal;
   };
@@ -125,7 +127,7 @@ export interface ClaudeSwitchResult {
   attempt: string;
   outgoingKind?: string;
   injected?: boolean;
-  steps?: { failedStep?: number; started: number[]; reversed: Array<number | 'config:resplice'>; notLanded: number[]; restoreFailures: string[]; unclaimed?: string; cleanup: string[] };
+  steps?: { failedStep?: number; started: number[]; reversed: Array<number | 'config' | 'config:resplice'>; notLanded: Array<number | 'config'>; restoreFailures: string[]; unclaimed?: string; cleanup: string[] };
   exitCode: 0 | 1 | 3;
 }
 
@@ -241,9 +243,13 @@ function switchWasInjected(deps: ClaudeSwitchDeps, input: SwitchClaudeInput): bo
  * config-path lock. The write-intent guard deliberately precedes every read:
  * K14 may call this for a step-6/7 journal that has no config snapshot.
  */
+type RollbackJournal = Pick<ClaudeSwitchJournal,
+  'configPath' | 'configText' | 'configWrittenHash' | 'fromOauthAccount' | 'configWriteStarted'
+  | 'credentialsWriteStarted' | 'stagedBlobService'>;
+
 export async function restoreConfigFromJournal(
   deps: ClaudeSwitchDeps,
-  journal: ClaudeSwitchJournal,
+  journal: Pick<ClaudeSwitchJournal, 'configPath' | 'configText' | 'configWrittenHash' | 'fromOauthAccount' | 'configWriteStarted'>,
   heldConfigLock: HeldClaudeConfigLock,
 ): Promise<'restored' | 'resplice' | 'not-landed'> {
   if (!journal.configWriteStarted || journal.configText === null) return 'not-landed';
@@ -255,7 +261,7 @@ export async function restoreConfigFromJournal(
   const config = readClaudeConfig(journal.configPath, () => current);
   if (current === journal.configText) return 'not-landed';
   if (journal.configWrittenHash !== null && sha256(current) === journal.configWrittenHash) {
-    atomicWriteText(journal.configPath, journal.configText, { mode: 0o600 });
+    (deps.live.writeText ?? ((path: string, text: string) => atomicWriteText(path, text, { mode: 0o600 })))(journal.configPath, journal.configText);
     return 'restored';
   }
   if (journal.fromOauthAccount !== null) {
@@ -267,7 +273,7 @@ export async function restoreConfigFromJournal(
   }
   if (!Object.prototype.hasOwnProperty.call(config, 'oauthAccount')) return 'not-landed';
   delete config.oauthAccount;
-  atomicWriteText(journal.configPath, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
+  (deps.live.writeText ?? ((path: string, text: string) => atomicWriteText(path, text, { mode: 0o600 })))(journal.configPath, `${JSON.stringify(config, null, 2)}\n`);
   return 'resplice';
 }
 
@@ -302,24 +308,34 @@ async function rollbackClaudeSwitch(
   configLock: typeof withClaudeConfigPathLock,
   credentialHeld: HeldClaudeCredentialLocks,
   live: ClaudeCredentialsOptions,
+  inMemoryJournal: RollbackJournal | null,
 ): Promise<ClaudeSwitchResult> {
   state.failedStep = failedStep;
-  const read = readClaudeSwitchJournal(options);
-  const journal = read.state === 'ok' ? read.journal : null;
+  const read = (deps.journalOps?.read ?? readClaudeSwitchJournal)(options);
+  // The process already knows every rollback-relevant intent it wrote. A
+  // transient journal re-read failure must not turn that knowledge into a
+  // silent no-op restore.
+  const journal: RollbackJournal | null = read.state === 'ok' ? read.journal : inMemoryJournal;
   const injected = switchWasInjected(deps, input) || failure instanceof InjectedFailStep;
   const detail = failure instanceof InjectedFailStep
     ? injectionDetail({ kind: 'fail-step', step: failure.step })
     : `step-${failedStep}`;
-  const error = failure instanceof InjectedFailStep ? 'injected' : classifySwitchError(failure);
+  const error = failure instanceof InjectedFailStep ? 'injected'
+    : failedStep === 7 ? writeError(failure, 'keychain-write-failed')
+      : failedStep === 8 ? writeError(failure, 'config-write-failed')
+        : classifySwitchError(failure);
 
   // Reverse newest effect first. Each restore is independent, so a config
   // failure never suppresses the live credential attempt (and vice versa).
+  if (journal === null) {
+    state.restoreFailures.push('journal-unreadable');
+  }
   if (journal?.configWriteStarted) {
     try {
       const configResult = await configLock(journal.configPath, { env: deps.env }, (held) =>
         restoreConfigFromJournal(deps, journal, held));
-      if (configResult === 'not-landed') state.notLanded.push(8);
-      else state.reversed.push(configResult === 'resplice' ? 'config:resplice' : 8);
+      if (configResult === 'not-landed') state.notLanded.push('config');
+      else state.reversed.push(configResult === 'resplice' ? 'config:resplice' : 'config');
     } catch { state.restoreFailures.push('config'); }
   }
   if (journal?.credentialsWriteStarted) {
@@ -460,10 +476,17 @@ async function switchClaudeAttempt(deps: ClaudeSwitchDeps, input: SwitchClaudeIn
             return failed(deps, input, attempt, from, 'stage-failed', classifySwitchError(error), state, 6);
           }
           state.started.push(6); await deps.hooks?.beforeStep7?.();
+          // This process's rollback source remains usable even if a journal
+          // update succeeds on disk but its later re-read fails.
+          const rollbackJournal: RollbackJournal = {
+            configPath: paths.globalConfigPath, configText: null, configWrittenHash: null, fromOauthAccount: null,
+            configWriteStarted: false, credentialsWriteStarted: false, stagedBlobService,
+          };
           // Step 7: hash-before-effect live credentials write.
           let publishedAt: number | null = null;
           try {
             const composed = mergeSharedCredentialFields(targetCredential, sharedCredentialFields(outgoingLive) ?? {});
+            rollbackJournal.credentialsWriteStarted = true;
             journalUpdate(ownerHeld, { step: 7, credentialsWriteStarted: true, credentialsWrittenHash: sha256(composed) }, options);
             deps.crashAt?.('before-step-7-write');
             await writeLiveClaudeCredentials(composed, live, credentialHeld);
@@ -473,7 +496,7 @@ async function switchClaudeAttempt(deps: ClaudeSwitchDeps, input: SwitchClaudeIn
             await deps.hooks?.afterStep7?.(); deps.crashAt?.('after-step-7');
           } catch (error) {
             if (isCrash(error)) throw error;
-            return rollbackClaudeSwitch(deps, input, from, outgoingLive, options, ownerHeld, state, 7, error, publishedAt, configLock, credentialHeld, live);
+            return rollbackClaudeSwitch(deps, input, from, outgoingLive, options, ownerHeld, state, 7, error, publishedAt, configLock, credentialHeld, live, rollbackJournal);
           }
           // Step 8: config lock covers raw read, planning splice, journal intent, and write only.
           try {
@@ -484,7 +507,11 @@ async function switchClaudeAttempt(deps: ClaudeSwitchDeps, input: SwitchClaudeIn
               let planned: string | undefined;
               await spliceOauthAccount(paths.globalConfigPath, targetOauth!, configHeld, { readText: () => raw, writeText: (_path, text) => { planned = text; } });
               if (planned === undefined) throw new ClaudeConfigFileError(paths.globalConfigPath, 'could not plan file');
-              journalUpdate(ownerHeld, { step: 8, configText: raw, fromOauthAccount, configWrittenHash: sha256(planned), configWriteStarted: true }, options);
+              rollbackJournal.configText = raw;
+              rollbackJournal.fromOauthAccount = fromOauthAccount;
+              rollbackJournal.configWrittenHash = sha256(planned);
+              rollbackJournal.configWriteStarted = true;
+              journalUpdate(ownerHeld, { step: 8, configText: raw, fromOauthAccount, configWrittenHash: rollbackJournal.configWrittenHash, configWriteStarted: true }, options);
               (live.writeText ?? ((path: string, text: string) => { atomicWriteText(path, text, { mode: 0o600 }); }))(paths.globalConfigPath, planned);
               journalUpdate(ownerHeld, { configWritten: true }, options);
               state.started.push(8);
@@ -493,7 +520,7 @@ async function switchClaudeAttempt(deps: ClaudeSwitchDeps, input: SwitchClaudeIn
             await deps.hooks?.afterStep8?.(); deps.crashAt?.('after-step-8');
           } catch (error) {
             if (isCrash(error)) throw error;
-            return rollbackClaudeSwitch(deps, input, from, outgoingLive, options, ownerHeld, state, 8, error, publishedAt, configLock, credentialHeld, live);
+            return rollbackClaudeSwitch(deps, input, from, outgoingLive, options, ownerHeld, state, 8, error, publishedAt, configLock, credentialHeld, live, rollbackJournal);
           }
           // Step 9 plus the finished-marker cleanup sequence.
           let switchId: number;
@@ -503,7 +530,7 @@ async function switchClaudeAttempt(deps: ClaudeSwitchDeps, input: SwitchClaudeIn
             state.started.push(9); deps.crashAt?.('after-commit');
           } catch (error) {
             if (isCrash(error)) throw error;
-            return rollbackClaudeSwitch(deps, input, from, outgoingLive, options, ownerHeld, state, 9, error, publishedAt, configLock, credentialHeld, live);
+            return rollbackClaudeSwitch(deps, input, from, outgoingLive, options, ownerHeld, state, 9, error, publishedAt, configLock, credentialHeld, live, rollbackJournal);
           }
           try { journalUpdate(ownerHeld, { committed: deps.now() }, options); } catch (error) { state.cleanup.push(classifySwitchError(error)); }
           if (state.cleanup.length === 0) try { await deleteStagedRollback(live.backend, stagedBlobService); } catch (error) { state.cleanup.push(classifySwitchError(error)); }

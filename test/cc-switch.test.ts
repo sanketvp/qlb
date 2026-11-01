@@ -1054,12 +1054,13 @@ describe('Claude switch transaction (K5-5)', () => {
     }]);
   });
 
-  it('a rolled-back step-8 switch_log row records the step-7 publishedAt time, exits 1, and clears the journal', async () => {
+  it('an EACCES step-8 rename records config-write-failed in the rolled-back switch_log row', async () => {
     const subject = await transactionFixture();
-    subject.deps.live.writeText = () => { throw new Error('config write failed'); };
+    subject.deps.live.writeText = () => { throw Object.assign(new Error('rename failed'), { code: 'EACCES' }); };
     const result = await switchClaude(subject.deps, manual);
-    assert.deepEqual({ outcome: result.outcome, reason: result.reason, exitCode: result.exitCode }, { outcome: 'rolled-back', reason: 'step-8', exitCode: 1 });
-    assert.equal((subject.rows[0] as { publishedAt?: number }).publishedAt, NOW);
+    assert.deepEqual({ outcome: result.outcome, reason: result.reason, error: result.error, exitCode: result.exitCode }, { outcome: 'rolled-back', reason: 'step-8', error: 'config-write-failed', exitCode: 1 });
+    assert.equal((subject.rows[0] as { publishedAt?: number; error?: string }).publishedAt, NOW);
+    assert.equal((subject.rows[0] as { error?: string }).error, 'config-write-failed');
     assert.equal(existsSync(join(subject.deps.journalDir!, 'switch-anthropic.json')), false);
   });
 
@@ -1067,7 +1068,7 @@ describe('Claude switch transaction (K5-5)', () => {
     const subject = await transactionFixture();
     subject.deps.live.backend = {
       kind: 'test-memory', get: (...args) => subject.backend.get(...args), delete: (...args) => subject.backend.delete(...args),
-      set: async (service, account, value) => service === subject.paths.keychainService ? Promise.reject(new Error('keychain write failure')) : subject.backend.set(service, account, value),
+      set: async (service, account, value) => service === subject.paths.keychainService ? Promise.reject(new Error('helper exited 1')) : subject.backend.set(service, account, value),
       setSync: (...args) => subject.backend.setSync(...args), getSync: (...args) => subject.backend.getSync(...args), deleteSync: (...args) => subject.backend.deleteSync(...args),
     };
     const result = await switchClaude(subject.deps, manual);

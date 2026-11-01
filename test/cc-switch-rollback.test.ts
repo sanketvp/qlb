@@ -1,14 +1,15 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
 import { claudePaths } from '../src/cc-paths';
+import { atomicWriteText } from '../src/fsutil';
 import { withClaudeConfigPathLock, withClaudeCredentialLocks } from '../src/cc-locks';
 import { ClaudeSlots, InMemoryClaudeSlotRepository } from '../src/cc-slots';
-import { readClaudeSwitchJournal, readStagedRollback, type ClaudeSwitchJournal } from '../src/cc-switch-journal';
+import { deleteClaudeSwitchJournal, readClaudeSwitchJournal, readStagedRollback, updateClaudeSwitchJournal, withClaudeSwitchJournalOwner, type ClaudeSwitchJournal } from '../src/cc-switch-journal';
 import { MockKeychain } from '../src/keychain';
 import {
   restoreConfigFromJournal,
@@ -219,11 +220,12 @@ describe('Claude switch rollback (K8-2)', () => {
     }
   });
 
-  it('a failed staged delete after rollback keeps a closed journal naming the staged item', async () => {
+  it('a rollback whose staged delete fails keeps a journal marked closed rolled-back and the next switch finishes it', async () => {
     const subject = await fixture();
     subject.deps.injectFailStep = 8;
+    let deletes = 0;
     subject.deps.live.backend = wrappedBackend(subject.backend, { delete: async (service: string, account: string) => {
-      if (service.startsWith('qlb:anthropic:staged-rollback:')) throw new Error('keychain delete failed');
+      if (service.startsWith('qlb:anthropic:staged-rollback:') && deletes++ === 0) throw new Error('keychain delete failed');
       return subject.backend.delete(service, account);
     } });
     const result = await switchClaude(subject.deps, { ...manual, injected: true });
@@ -235,5 +237,148 @@ describe('Claude switch rollback (K8-2)', () => {
       assert.equal(read.journal.closed, 'rolled-back');
       assert.notEqual(await readStagedRollback(subject.backend, read.journal.stagedBlobService), null);
     }
+    subject.deps.injectFailStep = undefined;
+    const next = await switchClaude(subject.deps, manual);
+    assert.equal(next.outcome, 'ok');
+    assert.equal(existsSync(join(subject.deps.journalDir!, 'switch-anthropic.json')), false);
+  });
+
+  it('a failing step 8 whose rename landed restores config by rename and the live item, and records rolled-back; a failing step 8 whose rename did not land restores only the live item', async () => {
+    const notLanded = await fixture();
+    notLanded.deps.live.writeText = () => { throw new Error('rename denied'); };
+    const first = await switchClaude(notLanded.deps, manual);
+    assert.equal(first.error, 'config-write-failed');
+    assert.deepEqual(first.steps?.notLanded, ['config']);
+    assert.equal(readFileSync(notLanded.paths.globalConfigPath, 'utf8'), notLanded.configText);
+    assert.equal(await notLanded.backend.get(notLanded.paths.keychainService, 'fixture-user'), notLanded.outgoing);
+
+    const landed = await fixture();
+    let writes = 0;
+    let landedInode = 0;
+    landed.deps.live.writeText = (path, text) => {
+      atomicWriteText(path, text, { mode: 0o600 });
+      if (writes++ === 0) {
+        landedInode = statSync(path).ino;
+        throw new Error('rename denied after landing');
+      }
+    };
+    const second = await switchClaude(landed.deps, manual);
+    assert.equal(second.error, 'config-write-failed');
+    assert.ok(second.steps?.reversed.includes('config'));
+    assert.equal(readFileSync(landed.paths.globalConfigPath, 'utf8'), landed.configText);
+    assert.notEqual(statSync(landed.paths.globalConfigPath).ino, landedInode);
+    assert.equal(await landed.backend.get(landed.paths.keychainService, 'fixture-user'), landed.outgoing);
+  });
+
+  it('X17c: a step-8 write that lands followed by a failing configWritten update is restored byte-for-byte by rename (inode changed), reversed lists config, not config:resplice', async () => {
+    const subject = await fixture();
+    let updates = 0;
+    subject.deps.journalOps = {
+      update: (...args) => {
+        updates += 1;
+        if (updates === 5) throw new Error('journal update failed');
+        return updateClaudeSwitchJournal(...args);
+      },
+      remove: deleteClaudeSwitchJournal,
+    };
+    const inode = statSync(subject.paths.globalConfigPath).ino;
+    const result = await switchClaude(subject.deps, manual);
+    assert.equal(result.outcome, 'rolled-back');
+    assert.equal(result.error, 'journal-io-failed');
+    assert.ok(result.steps?.reversed.includes('config'));
+    assert.equal(result.steps?.reversed.includes('config:resplice'), false);
+    assert.equal(readFileSync(subject.paths.globalConfigPath, 'utf8'), subject.configText);
+    assert.notEqual(statSync(subject.paths.globalConfigPath).ino, inode);
+  });
+
+  it('X17d: fromOauthAccount in the journal equals the oauthAccount of the text read under the step-8 lock, not the Phase-A text', async () => {
+    const subject = await fixture();
+    subject.deps.injectFailStep = 9;
+    subject.deps.hooks = {
+      afterStep4: () => writeFileSync(subject.paths.globalConfigPath, `${JSON.stringify({ oauthAccount: { accountUuid: 'step-8' }, retained: 'before-step-8' })}\n`),
+      afterStep8: () => writeFileSync(subject.paths.globalConfigPath, `${JSON.stringify({ oauthAccount: { accountUuid: 'b' }, retained: 'post-step-8' })}\n`),
+    };
+    const result = await switchClaude(subject.deps, { ...manual, injected: true });
+    assert.equal(result.outcome, 'rolled-back');
+    assert.deepEqual(JSON.parse(readFileSync(subject.paths.globalConfigPath, 'utf8')), { oauthAccount: { accountUuid: 'step-8' }, retained: 'post-step-8' });
+  });
+
+  it('after a failed restore the next switch refuses switch-journal-present and the staged item survives (the rolled-back row does not finish the journal)', async () => {
+    const subject = await fixture();
+    subject.deps.injectFailStep = 8;
+    subject.deps.live.backend = wrappedBackend(subject.backend, { set: async (service, account, value) => {
+      if (service === subject.paths.keychainService && value === subject.outgoing) throw new Error('restore failed');
+      return subject.backend.set(service, account, value);
+    } });
+    await switchClaude(subject.deps, { ...manual, injected: true });
+    const next = await switchClaude(subject.deps, manual);
+    assert.equal(next.outcome, 'refused');
+    assert.equal(next.reason, 'switch-journal-present');
+    const read = readClaudeSwitchJournal({ journalDir: subject.deps.journalDir, home: subject.home, env: subject.env, configPath: subject.paths.globalConfigPath, keychainService: subject.paths.keychainService });
+    assert.equal(read.state, 'ok');
+    if (read.state === 'ok') assert.notEqual(await readStagedRollback(subject.backend, read.journal.stagedBlobService), null);
+  });
+
+  it('an empty or absent live item under restoreLiveFromStaged is live-moved, not restored', async () => {
+    const subject = await fixture();
+    const j = journal(subject);
+    await subject.backend.set(j.stagedBlobService, 'qlb', subject.outgoing);
+    let writes = 0;
+    subject.deps.live.backend = wrappedBackend(subject.backend, { set: async (service, account, value) => {
+      if (service === subject.paths.keychainService) writes += 1;
+      return subject.backend.set(service, account, value);
+    } });
+    const underLocks = (fn: Parameters<typeof withClaudeCredentialLocks>[1]) => withClaudeCredentialLocks({ configDir: subject.paths.configHome, env: subject.env }, fn);
+    await subject.backend.delete(subject.paths.keychainService, 'fixture-user');
+    assert.equal(await underLocks((held) => restoreLiveFromStaged(subject.deps, j, held)), 'live-moved');
+    assert.equal(writes, 0);
+  });
+
+  it('a journal re-read failure during rollback restores live from in-memory write intent', async () => {
+    const subject = await fixture();
+    subject.deps.journalOps = {
+      read: () => ({ state: 'malformed' }),
+      update: updateClaudeSwitchJournal,
+      remove: deleteClaudeSwitchJournal,
+    };
+    subject.deps.injectFailStep = 7;
+    const result = await switchClaude(subject.deps, { ...manual, injected: true });
+    assert.equal(result.outcome, 'rolled-back');
+    assert.equal(await subject.backend.get(subject.paths.keychainService, 'fixture-user'), subject.outgoing);
+    assert.equal(result.steps?.restoreFailures.length, 0);
+  });
+
+  it('rollback holds the config lock only for the config re-read and restore, inside the owner lock (lock-order spy)', async () => {
+    const subject = await fixture();
+    subject.deps.injectFailStep = 9;
+    const events: string[] = [];
+    let ownerHeld = false;
+    subject.deps.locks = {
+      owner: (async (options: Parameters<typeof withClaudeSwitchJournalOwner>[0], fn: (held: unknown) => Promise<unknown>) => {
+        events.push('owner:start'); ownerHeld = true;
+        try { return await withClaudeSwitchJournalOwner(options, async (held) => fn(held)); }
+        finally { ownerHeld = false; events.push('owner:end'); }
+      }) as unknown as NonNullable<ClaudeSwitchDeps['locks']>['owner'],
+      configPath: (async (path: string, options: { env?: NodeJS.ProcessEnv }, fn: (held: unknown) => Promise<unknown>) => {
+        assert.equal(ownerHeld, true);
+        events.push('config:start');
+        try { return await withClaudeConfigPathLock(path, options, async (held) => fn(held)); }
+        finally { events.push('config:end'); }
+      }) as unknown as NonNullable<ClaudeSwitchDeps['locks']>['configPath'],
+    };
+    const result = await switchClaude(subject.deps, { ...manual, injected: true });
+    assert.equal(result.outcome, 'rolled-back');
+    assert.deepEqual(events, ['owner:start', 'config:start', 'config:end', 'config:start', 'config:end', 'owner:end']);
+  });
+
+  it('a rolled-back row carries error, stepsJson with attempt, failedStep, started, reversed, notLanded and restoreFailures, and no token value', async () => {
+    const subject = await fixture();
+    subject.deps.injectFailStep = 8;
+    await switchClaude(subject.deps, { ...manual, injected: true });
+    const row = subject.rows.at(-1) as { error: string; stepsJson: string };
+    assert.equal(row.error, 'injected');
+    const serialized = JSON.stringify(row);
+    for (const value of ['fixture-access-a', 'fixture-refresh-a', 'fixture-access-b', 'fixture-refresh-b']) assert.equal(serialized.includes(value), false);
+    assert.deepEqual(Object.keys(JSON.parse(row.stepsJson)).sort(), ['attempt', 'cleanup', 'failedStep', 'notLanded', 'restoreFailures', 'reversed', 'started']);
   });
 });
