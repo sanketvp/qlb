@@ -117,7 +117,7 @@ overrides targets the REAL ~/.pi/agent/ files (anthropic-pool.json for
 --provider anthropic, auth.json for xai|kimi-coding|openai-codex, plus the
 matching qlb-owner*.json). That is a REAL cutover and is refused unless
 --confirm-real-cutover is also passed. Tests and dry runs MUST pass
---pool-file / --auth-json / --owner-file (or --target-dir) pointing at a
+--pool-file / --auth-json (including the Anthropic Pi auth.json) / --owner-file (or --target-dir) pointing at a
 temp copy. Do NOT pass --confirm-real-cutover unless you intend to cut over
 live Pi. Default --provider is anthropic (backward compatible).
 Single-grant providers (xai, kimi-coding, openai-codex) shadow-retain the

@@ -312,15 +312,6 @@ export interface MigrationStatus {
   provider?: string;
 }
 
-export class OwnerMapPresentError extends Error {
-  readonly code = 'owner-map-present';
-
-  constructor() {
-    super('owner-map-present: anthropic pool migration waits for P7b8');
-    this.name = 'OwnerMapPresentError';
-  }
-}
-
 /** Named crash points for MigrationConfig.afterStep; later rows add their own. */
 export type MigrationCrashPoint = 'S1' | 'S1-stage' | 'S1-legacy-delete' | 'S1-legacy-unlink' | 'S2-reads' | 'S2' | 'S4a' | 'S5' | 'S6c1';
 export type MigrationWritePoint = 'backup' | 'owner-entry' | 'placeholder';
@@ -1123,19 +1114,78 @@ export class Migration {
     return this.ownerEntryPresentAt(this.ownerMapPath) || this.legacySidecarOwned();
   }
 
-  /** P7b8 alone may convert the pool's v1 document into the shared v2 map. */
-  private refusePoolOwnerMap(): void {
-    if (this.kind !== 'pool' || !existsSync(this.ownerMapPath)) return;
-    try {
-      const owner: unknown = JSON.parse(readFileSync(this.ownerMapPath, 'utf8'));
-      if (isObjectRecord(owner) && Object.prototype.hasOwnProperty.call(owner, 'providers')) {
-        throw new OwnerMapPresentError();
-      }
-    } catch (error) {
-      if (error instanceof OwnerMapPresentError) throw error;
-      // Preserve the pool path's existing v1/malformed-file behavior. Only a
-      // parseable document declaring `providers` is the P7b8-only v2 map.
+  private poolLegacyOwnerPresent(): boolean {
+    return this.kind === 'pool' && hasLegacyPiOwnerEntry(this.ownerFilePath, 'anthropic');
+  }
+
+  private poolPlaceholderPresent(): boolean {
+    if (!existsSync(this.authJsonPath)) return false;
+    const auth: unknown = JSON.parse(readFileSync(this.authJsonPath, 'utf8'));
+    if (!isObjectRecord(auth)) throw new Error('Pi auth.json is not an object');
+    return isPiPlaceholder(auth.anthropic);
+  }
+
+  /** Write only after B and O, while the configured Pi auth.json lock is held. */
+  private writePoolAnthropicPlaceholder(): void {
+    let auth: Record<string, unknown> = {};
+    if (existsSync(this.authJsonPath)) {
+      const parsed: unknown = JSON.parse(readFileSync(this.authJsonPath, 'utf8'));
+      if (!isObjectRecord(parsed)) throw new Error('Pi auth.json is not an object');
+      auth = parsed;
     }
+    auth.anthropic = piPlaceholder();
+    atomicWriteFile(this.authJsonPath, JSON.stringify(auth, null, 2) + '\n');
+  }
+
+  /** Whether resume must finish the only permitted v1-to-v2 conversion window. */
+  private poolNeedsV2Publication(current: MigrationStatus): boolean {
+    if (this.kind !== 'pool') return false;
+    if (this.poolLegacyOwnerPresent()) return current.state === 'QLB_OWNED';
+    return this.ownerEntryPresentAt(this.ownerMapPath)
+      && STATE_RANK[current.state] < STATE_RANK.QLB_OWNED;
+  }
+
+  /** P7b8's ordered pool publication: B → O → placeholder → hygiene. */
+  private commitPoolV2(current: MigrationStatus): MigrationStatus {
+    const staging = this.stagingPath();
+    const stagingPresent = this.claimPathPresent(staging);
+    const legacy = this.poolLegacyOwnerPresent();
+    const v2 = this.ownerEntryPresentAt(this.ownerMapPath);
+
+    if (stagingPresent) {
+      if (this.readStagingOwnerFile() === null) throw this.invalidStagingError(staging);
+      if (current.state !== 'VALIDATED' && current.state !== 'QLB_OWNED') {
+        throw new Error(`cannot commit from state ${current.state} (rehearse must succeed first)`);
+      }
+    } else if (legacy) {
+      if (current.state !== 'QLB_OWNED') {
+        throw new Error('cannot convert legacy Anthropic owner before QLB_OWNED');
+      }
+    } else if (v2) {
+      if (STATE_RANK[current.state] >= STATE_RANK.QLB_OWNED || this.poolPlaceholderPresent()) {
+        return this.finishHygiene();
+      }
+    } else {
+      throw new Error(`cannot commit: missing ${staging}`);
+    }
+
+    this.withPoolRollbackAuthLock(() => {
+      this.beforePoolCommitLock?.();
+      const cycle = this.ensureAuthBackupCycle();
+      writePiAuthBackup(this.authJsonPath, 'anthropic', cycle);
+      this.afterWrite?.('backup');
+      this.withOwnerMapLockUnlessHeld(() => writePiOwnerEntry(
+        this.ownerMapPath,
+        'anthropic',
+        true,
+        { replaceLegacyDocument: legacy },
+      ));
+      this.afterWrite?.('owner-entry');
+      this.writePoolAnthropicPlaceholder();
+      this.afterWrite?.('placeholder');
+    });
+    if (stagingPresent) unlinkIfExists(staging);
+    return this.finishHygiene();
   }
 
   private staticKeychainLocations(): Array<{ service: string; account: string }> {
@@ -1387,9 +1437,15 @@ export class Migration {
       : undefined;
     const staticCredential = this.staticKeychainCoords();
     const singleGrantV2Owner = this.kind === 'single-grant' && this.ownerEntryPresentAt(this.ownerMapPath);
+    const poolV2Owner = this.kind === 'pool' && this.ownerEntryPresentAt(this.ownerMapPath);
+    const poolLegacyOwner = this.poolLegacyOwnerPresent();
     let singleGrantPlaceholder = false;
+    let poolPlaceholder = false;
     if (this.kind === 'single-grant') {
       try { singleGrantPlaceholder = isPiPlaceholder(this.readSingleGrantAuth()[this.singleGrantAuthKey()]); } catch { /* status reports recovery without parsing credentials */ }
+    }
+    if (this.kind === 'pool') {
+      try { poolPlaceholder = this.poolPlaceholderPresent(); } catch { /* status reports recovery without parsing credentials */ }
     }
 
     let ownerFile: MigrationStatus['ownerFile'] = 'absent';
@@ -1405,7 +1461,7 @@ export class Migration {
     else if (prePresent) nativeStore = 'pre-qlb';
 
     let piAtNextLaunch: MigrationStatus['piAtNextLaunch'] = 'unknown';
-    if (ownerPresent && (this.kind !== 'static-key' || staticCredential)) piAtNextLaunch = 'QLB works';
+    if (ownerPresent && (this.kind !== 'static-key' || staticCredential) && (!poolV2Owner || poolPlaceholder)) piAtNextLaunch = 'QLB works';
     else if (nativePresent) piAtNextLaunch = 'native works';
 
     const retains = this.retainsNative();
@@ -1426,11 +1482,13 @@ export class Migration {
       && !this.revalidateAndSecureCommittedOwnerFile()
     ) {
       resumeAction = 'invalid published owner; run `qlb migrate rollback`';
+    } else if (poolLegacyOwner && state === 'QLB_OWNED') {
+      resumeAction = 'convert legacy Anthropic owner: back up Pi auth.json, publish v2 ownership, then write placeholder';
     } else if (ownerPresent && STATE_RANK[state] < STATE_RANK.QLB_OWNED) {
       resumeAction = staticKey
         ? 'already committed; finish hygiene (journal only; native Keychain retained) → QLB_OWNED'
-        : singleGrantV2Owner && !singleGrantPlaceholder
-          ? 'complete commit: write Pi auth.json placeholder → QLB_OWNED'
+        : (singleGrantV2Owner && !singleGrantPlaceholder) || (poolV2Owner && !poolPlaceholder)
+          ? 'complete commit: back up Pi auth.json, then write its placeholder → QLB_OWNED'
           : retains
             ? 'already committed; finish hygiene → QLB_OWNED'
             : 'already committed; finish hygiene (H1–H2) → QLB_OWNED';
@@ -1441,7 +1499,9 @@ export class Migration {
         ? 'noop (already QLB_OWNED; native Keychain retained)'
         : singleGrantV2Owner && !singleGrantPlaceholder
           ? `stale native writer: auth.json[${this.singleGrantAuthKey()}] is not the placeholder; rollback or re-stage`
-          : retains
+          : poolV2Owner && !poolPlaceholder
+            ? 'v2 Anthropic owner is missing its Pi auth.json placeholder; run `qlb migrate resume --provider anthropic`'
+            : retains
             ? 'noop (already QLB_OWNED; auth.json placeholder present)'
             : 'noop (already QLB_OWNED)';
     } else if (state === 'QLB_OWNED' && !ownerPresent && nativePresent) {
@@ -1496,9 +1556,6 @@ export class Migration {
     this.assertNoActiveHandbackMarker();
     this.assertNoUnreadableOwnershipClaim();
     this.assertNoOrphanOwnershipClaim();
-    // P7b8 alone may convert the pool's v1 owner document into the shared
-    // v2 map. Refuse before creating staging, Keychain, or journal state.
-    this.refusePoolOwnerMap();
     // OpenRouter publishes into the v2 map, so reject a v1 Anthropic
     // document before creating any staged Keychain or filesystem state.
     if (this.kind === 'static-key') readPiOwnerProviders(this.ownerMapPath);
@@ -1615,13 +1672,11 @@ export class Migration {
     this.assertNoActiveHandbackMarker();
     this.assertNoUnreadableOwnershipClaim();
     this.assertNoOrphanOwnershipClaim();
-    // P7b8 alone may convert the pool's v1 owner document into the shared
-    // v2 map. Refuse before any journal or native-pool write.
-    this.refusePoolOwnerMap();
     // OpenRouter must fail closed rather than add providers to a v1 Anthropic
     // document. Read before checking or mutating any migration artifact.
     if (this.kind === 'static-key') readPiOwnerProviders(this.ownerMapPath);
     const current = this.status();
+    if (this.kind === 'pool') return this.commitPoolV2(current);
     if (this.ownerEntryPresent()) {
       this.assertCommittedOwnerFileRevalidated();
       this.completeSingleGrantClaimForward(current);
@@ -1693,22 +1748,9 @@ export class Migration {
       return this.finishHygiene();
     }
 
-    if (this.kind === 'pool') {
-      // The map can have appeared after stage(). Hold the same lock as every
-      // v2 writer from the final P7b8 boundary check through the v1 rename.
-      this.withOwnerMapLock(() => {
-        // Test-only interleaving barrier: a v2 writer started here must wait
-        // until this final check and rename have completed.
-        this.beforePoolCommitLock?.();
-        this.refusePoolOwnerMap();
-        this.beforeOwnerFileRename?.();
-        renameSync(staging, this.ownerFilePath);
-      });
-    } else {
-      // C — THE ONLY COMMIT POINT (atomic rename on APFS/POSIX).
-      this.beforeOwnerFileRename?.();
-      renameSync(staging, this.ownerFilePath);
-    }
+    // C — THE ONLY COMMIT POINT (atomic rename on APFS/POSIX).
+    this.beforeOwnerFileRename?.();
+    renameSync(staging, this.ownerFilePath);
     // The staging pathname is not covered by either migration lock. Re-open
     // the newly published destination without following links, then validate
     // the exact descriptor before its best-effort permission hardening.
@@ -1827,6 +1869,12 @@ export class Migration {
       return this.continueRollback();
     }
     this.assertNoOrphanOwnershipClaim();
+    // P7b8 resumes only the Anthropic pool's v2 publication window, or the
+    // explicit QLB_OWNED v1-to-v2 conversion. Other ownership claims keep
+    // their existing forward-recovery path.
+    if (this.kind === 'pool' && this.poolNeedsV2Publication(current)) {
+      return this.commitPoolV2(current);
+    }
     // Any claim, including a custom owner file (Oc), is past C: finish forward.
     if (this.claimPresent()) {
       this.assertCommittedOwnerFileRevalidated();

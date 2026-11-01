@@ -100,9 +100,26 @@ export function hasLegacyPiOwnerEntry(path: string, provider: string): boolean {
     !!account && typeof account === 'object' && !Array.isArray(account) && (account as JsonObject).provider === provider,
   );
 }
+export interface WritePiOwnerEntryOptions {
+  /** P7b8 Anthropic conversion only: replace a legacy v1 owner document. */
+  replaceLegacyDocument?: boolean;
+}
+
 /** Atomic, caller-lock-protected mutation of the canonical v2 owner map. */
-export function writePiOwnerEntry(path: string, provider: string, owned: boolean): void {
-  const providers = { ...readPiOwnerProviders(path) };
+export function writePiOwnerEntry(
+  path: string,
+  provider: string,
+  owned: boolean,
+  options: WritePiOwnerEntryOptions = {},
+): void {
+  let current: JsonObject;
+  try {
+    current = readPiOwnerProviders(path);
+  } catch (error) {
+    if (!(error instanceof PiOwnerLegacyError) || !options.replaceLegacyDocument) throw error;
+    current = {};
+  }
+  const providers = { ...current };
   if (owned) providers[provider] = { mode: 'qlb', since: Date.now() };
   else delete providers[provider];
   if (Object.keys(providers).length === 0) { if (lstatPresent(path)) unlinkSync(path); return; }
