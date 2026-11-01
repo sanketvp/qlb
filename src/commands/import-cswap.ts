@@ -108,7 +108,10 @@ async function execute(args: string[], ctx: CommandContext): Promise<number> {
     // Credential values are never reflected in the importer's errors. Do not
     // render arbitrary backend errors, which may contain sensitive bytes.
     if (error instanceof CswapImportRefusalError) {
-      ctx.stderr(`import cswap refused: ${error.code}`);
+      // Slot numbers are credential-free; the message text is not rendered.
+      const detail = error.code === 'duplicate-login' && error.slots
+        ? ` (slots ${error.slots[0]} and ${error.slots[1]} hold the same login)` : '';
+      ctx.stderr(`import cswap refused: ${error.code}${detail}`);
       return 3;
     }
     ctx.stderr('import cswap failed');
