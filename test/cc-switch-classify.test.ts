@@ -88,33 +88,38 @@ describe('Claude switch classification routing (K9-1)', () => {
     assert.equal(result.outgoingKind, 'foreign');
     assert.equal(result.steps?.unclaimed, 'k9-unclaimed');
     assert.deepEqual(await slotCredentials(subject), before);
-    const stored = JSON.parse(await subject.backend.get(unclaimedService(), 'qlb')) as { accountId?: string };
+    const stored = JSON.parse(await subject.backend.get(unclaimedService(), 'qlb')) as { accountId?: string; credential: string };
     assert.equal(stored.accountId, 'account-b');
+    assert.equal(stored.credential, live);
     assert.equal(subject.active(), 'account-b');
   });
 
   it('alien ⇒ unclaimed written with no accountId', async () => {
-    const subject = await fixture({ live: credential('alien'), resolveProfile: async () => ({ uuid: 'other-account', email: 'other@example.test', organizationUuid: 'org-other' }) });
+    const live = credential('alien');
+    const subject = await fixture({ live, resolveProfile: async () => ({ uuid: 'other-account', email: 'other@example.test', organizationUuid: 'org-other' }) });
 
     const result = await switchClaude(subject.deps, subject.input);
 
     assert.equal(result.outcome, 'ok');
     assert.equal(result.outgoingKind, 'alien');
-    const stored = JSON.parse(await subject.backend.get(unclaimedService(), 'qlb')) as { accountId?: string };
+    const stored = JSON.parse(await subject.backend.get(unclaimedService(), 'qlb')) as { accountId?: string; credential: string };
     assert.equal(Object.hasOwn(stored, 'accountId'), false);
+    assert.equal(stored.credential, live);
   });
 
   it('known-foreign (input.probeVerdict false and the prefetch unresolved) ⇒ unclaimed written', async () => {
-    const subject = await fixture({ live: credential('known-foreign'), resolveProfile: async () => { throw new Error('fixture profile unavailable'); }, probeVerdict: false });
+    const live = credential('known-foreign');
+    const subject = await fixture({ live, resolveProfile: async () => { throw new Error('fixture profile unavailable'); }, probeVerdict: false });
 
     const result = await switchClaude(subject.deps, subject.input);
 
     assert.equal(result.outcome, 'ok');
     assert.equal(result.outgoingKind, 'known-foreign');
-    assert.notEqual(await subject.backend.get(unclaimedService(), 'qlb'), '');
+    const stored = JSON.parse(await subject.backend.get(unclaimedService(), 'qlb')) as { credential: string };
+    assert.equal(stored.credential, live);
   });
 
-  it('foreign-synced ⇒ nothing written to Keychain beyond the live item', async () => {
+  it('foreign-synced with byte-identical live bytes ⇒ nothing stashed', async () => {
     const subject = await fixture({ live: credential('b'), resolveProfile: async () => ({ uuid: 'account-b', email: 'b@example.test', organizationUuid: 'org-b' }) });
     const beforeServices = subject.backend.listServices().sort();
 
@@ -124,6 +129,22 @@ describe('Claude switch classification routing (K9-1)', () => {
     assert.equal(result.outgoingKind, 'foreign-synced');
     assert.deepEqual(subject.backend.listServices().sort(), beforeServices);
     await assert.rejects(() => subject.backend.get(unclaimedService(), 'qlb'));
+  });
+
+  it('foreign-synced with different access-token bytes ⇒ stashes live bytes and commits without a slot write', async () => {
+    const live = JSON.stringify({ claudeAiOauth: { accessToken: 'fixture-access-b-rotated', refreshToken: 'fixture-refresh-b', expiresAt: NOW + 3_600_001 } });
+    const subject = await fixture({ live, resolveProfile: async () => ({ uuid: 'account-b', email: 'b@example.test', organizationUuid: 'org-b' }) });
+    const before = await slotCredentials(subject);
+
+    const result = await switchClaude(subject.deps, subject.input);
+
+    assert.equal(result.outcome, 'ok');
+    assert.equal(result.outgoingKind, 'foreign-synced');
+    assert.equal(result.steps?.unclaimed, 'k9-unclaimed');
+    assert.deepEqual(await slotCredentials(subject), before);
+    const stored = JSON.parse(await subject.backend.get(unclaimedService(), 'qlb')) as { credential: string };
+    assert.equal(stored.credential, live);
+    assert.equal(subject.active(), 'account-b');
   });
 
   it('X21: the unclaimed stash written at step 5 survives an injected step-8 rollback', async () => {
@@ -136,7 +157,8 @@ describe('Claude switch classification routing (K9-1)', () => {
     assert.equal(result.outcome, 'rolled-back');
     assert.equal(result.outgoingKind, undefined);
     assert.deepEqual(await slotCredentials(subject), before);
-    assert.notEqual(await subject.backend.get(unclaimedService(), 'qlb'), '');
+    const stored = JSON.parse(await subject.backend.get(unclaimedService(), 'qlb')) as { credential: string };
+    assert.equal(stored.credential, live);
   });
 
   it('wiped is still refused outgoing-unrouted:wiped (until K9-2)', async () => {

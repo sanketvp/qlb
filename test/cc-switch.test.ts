@@ -482,16 +482,6 @@ describe('Claude switch transaction (K5-5)', () => {
     assert.equal(existsSync(join(subject.deps.journalDir!, 'switch-anthropic.json')), false);
   });
 
-  it('a foreign live credential is refused outgoing-unrouted:foreign before any write (K5 interim)', async () => {
-    const foreign = credential('foreign');
-    const subject = await transactionFixture({ live: foreign });
-    subject.deps.resolveProfile = async () => ({ uuid: 'account-b', email: 'b@example.test', organizationUuid: 'org-b' });
-    const result = await switchClaude(subject.deps, manual);
-    assert.equal(result.reason, 'outgoing-unrouted:foreign');
-    assert.equal(result.outcome, 'refused');
-    assert.equal(await subject.backend.get(subject.paths.keychainService, 'fixture-user'), foreign);
-  });
-
   it('a failure at step 7 rolls back with exit 1, clears the journal and does not throw', async () => {
     const subject = await transactionFixture();
     subject.deps.live.backend = {
