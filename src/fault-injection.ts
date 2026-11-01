@@ -9,21 +9,34 @@ export type ParseInjectFlagResult =
   | { rest: string[]; inject: FailStepInjection | null }
   | { usage: string };
 
-const INJECT_USAGE = 'usage: --inject fail-step <7|8|9> requires QLB_FAULT_INJECTION=1';
+const INJECT_ENV_USAGE = 'usage: --inject fail-step <7|8|9> requires QLB_FAULT_INJECTION=1';
+const INJECT_USAGE = 'usage: --inject fail-step <7|8|9>';
 
 export function faultInjectionEnabled(env: FaultInjectionEnvironment): boolean {
   return env.QLB_FAULT_INJECTION === '1';
 }
 
 export function parseInjectFlag(args: readonly string[], env: FaultInjectionEnvironment): ParseInjectFlagResult {
-  const flagIndex = args.indexOf('--inject');
-  if (flagIndex === -1) {
+  const flagIndexes = args.reduce<number[]>((indexes, arg, index) => {
+    if (arg === '--inject') indexes.push(index);
+    return indexes;
+  }, []);
+  const hasEqualsSpelling = args.some((arg) => arg.startsWith('--inject='));
+  if (flagIndexes.length === 0 && !hasEqualsSpelling) {
     return { rest: [...args], inject: null };
   }
 
+  if (!faultInjectionEnabled(env)) {
+    return { usage: INJECT_ENV_USAGE };
+  }
+  if (flagIndexes.length !== 1 || hasEqualsSpelling) {
+    return { usage: INJECT_USAGE };
+  }
+
+  const flagIndex = flagIndexes[0];
   const kind = args[flagIndex + 1];
   const step = args[flagIndex + 2];
-  if (!faultInjectionEnabled(env) || kind !== 'fail-step' || (step !== '7' && step !== '8' && step !== '9')) {
+  if (kind !== 'fail-step' || (step !== '7' && step !== '8' && step !== '9')) {
     return { usage: INJECT_USAGE };
   }
 

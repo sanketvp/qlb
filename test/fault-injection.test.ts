@@ -27,11 +27,24 @@ describe('fault injection flags', () => {
     assert.equal(faultInjectionEnabled({}), false);
   });
 
-  it('a step outside 7..9 is a usage error', () => {
-    assert.deepEqual(
-      parseInjectFlag(['--inject', 'fail-step', '6'], { QLB_FAULT_INJECTION: '1' }),
-      { usage: 'usage: --inject fail-step <7|8|9> requires QLB_FAULT_INJECTION=1' },
+  it('a bad step with the env set does not mention the env', () => {
+    const parsed = parseInjectFlag(['--inject', 'fail-step', '6'], { QLB_FAULT_INJECTION: '1' });
+
+    assert.ok('usage' in parsed);
+    assert.doesNotMatch(parsed.usage, /QLB_FAULT_INJECTION/);
+  });
+
+  it('a repeated --inject is a usage error', () => {
+    assert.ok(
+      'usage' in parseInjectFlag(
+        ['--inject', 'fail-step', '8', '--inject', 'fail-step', '9'],
+        { QLB_FAULT_INJECTION: '1' },
+      ),
     );
+  });
+
+  it('--inject=fail-step is a usage error', () => {
+    assert.ok('usage' in parseInjectFlag(['--inject=fail-step', '8'], { QLB_FAULT_INJECTION: '1' }));
   });
 
   it('no flag parses to null and leaves args unchanged', () => {
