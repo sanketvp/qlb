@@ -166,7 +166,9 @@ export async function prepareClaudeSwitch(deps: ClaudeSwitchDeps, input: SwitchC
     classifiedSlots.push({ accountId: slot.accountId, email: slot.email ?? null, orgUuid: slot.orgUuid ?? null, credential });
   }
   const prefetch = await prefetchLiveIdentity({ outgoing: classifiedSlots[0], readLive: async () => { try { return await readLiveClaudeCredentials(live); } catch { return null; } }, resolveProfile: deps.resolveProfile });
-  if (!input.republish && needsFreshenBeforeSwitch(parseCredentialBlob(targetCredential)?.oauth?.expiresAt, deps.now())) {
+  // A self-target resolves to the locked no-op path. Freshening it here would
+  // rotate the active credential and then discard the successor.
+  if (!input.republish && active !== input.to && needsFreshenBeforeSwitch(parseCredentialBlob(targetCredential)?.oauth?.expiresAt, deps.now())) {
     let consumed; try { consumed = await consumeClaudeSlot({ slots: deps.slots, postRefresh: deps.consume.postRefresh, now: deps.now, withConsumeLock: deps.consume.withConsumeLock, withSwitchLock: deps.consume.withSwitchLock, stashTimestamp: deps.stashTimestamp ?? deps.consume.stashTimestamp, warn: deps.warn }, { accountId: input.to, snapshot: targetCredential }); } catch { return { kind: 'refused', reason: 'freshen-transient' }; }
     if (consumed.kind !== 'refreshed' && consumed.kind !== 'current') return { kind: 'refused', reason: `freshen-${consumed.kind}` };
     targetCredential = consumed.credential ?? targetCredential; const target = classifiedSlots.find((slot) => slot.accountId === input.to); if (target) target.credential = targetCredential;
@@ -200,9 +202,17 @@ function writeError(error: unknown, fallback: 'keychain-write-failed' | 'config-
   const classified = classifySwitchError(error);
   return classified === 'switch-failed' ? fallback : classified;
 }
-function failed(input: SwitchClaudeInput, attempt: string, from: string | null, reason: string, error?: string, state = steps(), failedStep?: number): ClaudeSwitchResult {
+function failed(deps: ClaudeSwitchDeps, input: SwitchClaudeInput, attempt: string, from: string | null, reason: string, error?: string, state = steps(), failedStep?: number): ClaudeSwitchResult {
   if (failedStep !== undefined) state.failedStep = failedStep;
-  return { outcome: 'failed', from, to: input.to, reason, ...(error ? { error } : {}), attempt, injected: input.injected === true, steps: state, exitCode: 1 };
+  const result: ClaudeSwitchResult = { outcome: 'failed', from, to: input.to, reason, ...(error ? { error } : {}), attempt, injected: input.injected === true, steps: state, exitCode: 1 };
+  try {
+    deps.store.recordSwitch({
+      ts: deps.now(), provider: 'anthropic', fromAccount: from, toAccount: input.to, trigger: input.trigger,
+      outcome: 'failed', error: error ?? null, detail: reason, injected: input.injected === true,
+      stepsJson: JSON.stringify({ ...state, attempt }),
+    });
+  } catch { warn(deps, 'could not record failed Claude switch'); }
+  return result;
 }
 
 /** K5-5's non-rollback transaction. K8-2 replaces the step-7--9 failure return with rollback. */
@@ -225,17 +235,19 @@ export async function switchClaude(deps: ClaudeSwitchDeps, input: SwitchClaudeIn
   const prepared = await prepareClaudeSwitch(deps, input, true);
   if ('kind' in prepared) {
     if (prepared.kind === 'refused') return refusal(deps, input, attempt, activeAccount(deps), prepared.reason);
-    return failed(input, attempt, activeAccount(deps), prepared.reason);
+    return failed(deps, input, attempt, activeAccount(deps), prepared.reason);
   }
   const switchLock = deps.locks?.switch ?? withClaudeSwitchLock;
   const credentialLock = deps.locks?.credential ?? withClaudeCredentialLocks;
   const ownerLock = deps.locks?.owner ?? withClaudeSwitchJournalOwner;
   const configLock = deps.locks?.configPath ?? withClaudeConfigPathLock;
   const state = steps();
+  let ownerResult: ClaudeSwitchResult | undefined;
   try {
     const result: ClaudeSwitchResult = await switchLock<ClaudeSwitchResult>(async () => credentialLock<ClaudeSwitchResult>({ configDir: paths.configHome, env: deps.env }, async (credentialHeld) => {
       try {
         return await ownerLock(options, async (ownerHeld) => {
+          const outcome = await (async (): Promise<ClaudeSwitchResult> => {
           // Step 4: lock-authoritative journal cleanup and all mutable re-reads.
           const inside = readClaudeSwitchJournal(options);
           if (inside.state === 'malformed') return refusal(deps, input, attempt, activeAccount(deps), 'switch-journal-malformed');
@@ -246,32 +258,38 @@ export async function switchClaude(deps: ClaudeSwitchDeps, input: SwitchClaudeIn
           }
           const from = activeAccount(deps);
           if (from === null) return refusal(deps, input, attempt, null, 'active-login-unset');
-          const target = deps.slots.getSlot(input.to);
-          if (target === null) return refusal(deps, input, attempt, from, 'target-missing');
-          if (target.dead) return refusal(deps, input, attempt, from, 'target-dead');
-          if (target.archivedAt != null) return refusal(deps, input, attempt, from, 'target-archived');
-          if (from === input.to) return { outcome: 'noop', from, to: input.to, attempt, injected: input.injected === true, steps: state, exitCode: 0 };
+          // Phase A has already admitted immutable inputs. Re-check mutable
+          // breaker and C-swap admission while the transaction is serialized.
+          const lockedCheck = checkClaudeSwitchPreconditions(deps, input);
+          if (lockedCheck.kind === 'refused') return refusal(deps, input, attempt, from, lockedCheck.reason);
+          const target = deps.slots.getSlot(input.to)!;
+          if (from === input.to) {
+            deps.store.recordSwitch({ ts: deps.now(), provider: 'anthropic', fromAccount: from, toAccount: input.to, trigger: input.trigger, outcome: 'noop', injected: input.injected === true, stepsJson: JSON.stringify({ attempt }) });
+            return { outcome: 'noop', from, to: input.to, attempt, injected: input.injected === true, steps: state, exitCode: 0 };
+          }
           let outgoingLive: string;
           try { outgoingLive = await readLiveClaudeCredentials(live); } catch (error) { return refusal(deps, input, attempt, from, isCredentialNotFound(error) ? 'live-credential-empty' : 'live-credential-unreadable'); }
           if (!outgoingLive) return refusal(deps, input, attempt, from, 'live-credential-empty');
           state.started.push(4); await deps.hooks?.afterStep4?.();
 
           // Step 5: only own classifications can pass K5 interim routing.
-          const outgoing = { ...prepared.slots.find((slot) => slot.accountId === from)!, credential: await readSlotOrNull(deps, from) };
+          const outgoingSlot = deps.slots.getSlot(from);
+          if (outgoingSlot === null) return refusal(deps, input, attempt, from, 'active-login-unset');
+          const outgoing = { accountId: outgoingSlot.accountId, email: outgoingSlot.email ?? null, orgUuid: outgoingSlot.orgUuid ?? null, credential: await readSlotOrNull(deps, from) };
           let classified;
-          try { classified = classifyOutgoingCredential({ outgoing, slots: prepared.slots, liveCredential: outgoingLive, provenance: prepared.prefetch, probeVerdict: input.probeVerdict }); } catch (error) { return failed(input, attempt, from, 'outgoing-backup-failed', writeError(error, 'keychain-write-failed'), state, 5); }
+          try { classified = classifyOutgoingCredential({ outgoing, slots: prepared.slots, liveCredential: outgoingLive, provenance: prepared.prefetch, probeVerdict: input.probeVerdict }); } catch (error) { return failed(deps, input, attempt, from, 'outgoing-backup-failed', writeError(error, 'keychain-write-failed'), state, 5); }
           if (classified.kind === 'own-family' || classified.kind === 'own-rotated' || classified.kind === 'unresolved') {
-            try { await deps.slots.writeSlot(from, outgoingLive, { cause: 'adopt', by: deps.by, evidence: classified.kind === 'own-rotated' ? 'oracle' : classified.kind === 'unresolved' ? null : 'lineage' }); } catch (error) { return failed(input, attempt, from, 'outgoing-backup-failed', writeError(error, 'keychain-write-failed'), state, 5); }
+            try { await deps.slots.writeSlot(from, outgoingLive, { cause: 'adopt', by: deps.by, evidence: classified.kind === 'own-rotated' ? 'oracle' : classified.kind === 'unresolved' ? null : 'lineage' }); } catch (error) { return failed(deps, input, attempt, from, 'outgoing-backup-failed', writeError(error, 'keychain-write-failed'), state, 5); }
           } else if (classified.kind !== 'own-bytes') return refusal(deps, input, attempt, from, `outgoing-unrouted:${classified.kind}`);
           state.started.push(5); await deps.hooks?.afterStep5?.();
 
           // Step 6: write intent before the staged Keychain copy.
           deps.crashAt?.('before-step-6');
           let targetCredential: string;
-          try { targetCredential = (await deps.slots.readSlot(input.to, { fresh: true })).credential; } catch { return failed(input, attempt, from, 'target-unreadable', undefined, state, 6); }
+          try { targetCredential = (await deps.slots.readSlot(input.to, { fresh: true })).credential; } catch { return failed(deps, input, attempt, from, 'target-unreadable', undefined, state, 6); }
           let targetOauth: JsonObject | null = null;
           try { const config = JSON.parse(target.configJson ?? '') as { oauthAccount?: unknown }; if (config.oauthAccount && typeof config.oauthAccount === 'object' && !Array.isArray(config.oauthAccount) && (config.oauthAccount as Record<string, unknown>).accountUuid === input.to) targetOauth = config.oauthAccount as JsonObject; } catch { /* invalid below */ }
-          if (!parseCredentialBlob(targetCredential)?.oauth || targetOauth === null) return failed(input, attempt, from, 'target-invalid', undefined, state, 6);
+          if (!parseCredentialBlob(targetCredential)?.oauth || targetOauth === null) return failed(deps, input, attempt, from, 'target-invalid', undefined, state, 6);
           const timestamp = (deps.stashTimestamp ?? (() => defaultStashTimestamp(deps.now())))();
           const stagedBlobService = stagedRollbackService(timestamp);
           const owner = deps.journalOwner ?? { pid: process.pid, lstart: await processLstart(process.pid) ?? '' };
@@ -285,21 +303,23 @@ export async function switchClaude(deps: ClaudeSwitchDeps, input: SwitchClaudeIn
           } catch (error) {
             if (isCrash(error)) throw error;
             if (error instanceof ClaudeSwitchJournalPresent) return refusal(deps, input, attempt, from, 'switch-journal-present');
-            try { updateClaudeSwitchJournal(ownerHeld, { closed: 'stage-failed' }, options); } catch (cleanup) { state.cleanup.push(classifySwitchError(cleanup)); return failed(input, attempt, from, 'stage-failed', classifySwitchError(error), state, 6); }
-            try { await deleteStagedRollback(live.backend, stagedBlobService); } catch (cleanup) { state.cleanup.push(classifySwitchError(cleanup)); return failed(input, attempt, from, 'stage-failed', classifySwitchError(error), state, 6); }
+            try { updateClaudeSwitchJournal(ownerHeld, { closed: 'stage-failed' }, options); } catch (cleanup) { state.cleanup.push(classifySwitchError(cleanup)); return failed(deps, input, attempt, from, 'stage-failed', classifySwitchError(error), state, 6); }
+            try { await deleteStagedRollback(live.backend, stagedBlobService); } catch (cleanup) { state.cleanup.push(classifySwitchError(cleanup)); return failed(deps, input, attempt, from, 'stage-failed', classifySwitchError(error), state, 6); }
             try { deleteClaudeSwitchJournal(ownerHeld, options); } catch (cleanup) { state.cleanup.push(classifySwitchError(cleanup)); }
-            return failed(input, attempt, from, 'stage-failed', classifySwitchError(error), state, 6);
+            return failed(deps, input, attempt, from, 'stage-failed', classifySwitchError(error), state, 6);
           }
           state.started.push(6); await deps.hooks?.beforeStep7?.();
           // Step 7: hash-before-effect live credentials write.
+          let publishedAt: number | null = null;
           try {
             const composed = mergeSharedCredentialFields(targetCredential, sharedCredentialFields(outgoingLive) ?? {});
             updateClaudeSwitchJournal(ownerHeld, { step: 7, credentialsWriteStarted: true, credentialsWrittenHash: sha256(composed) }, options);
             deps.crashAt?.('before-step-7-write');
             await writeLiveClaudeCredentials(composed, live, credentialHeld);
-            updateClaudeSwitchJournal(ownerHeld, { credentialsWritten: true, publishedAt: deps.now() }, options);
+            publishedAt = deps.now();
+            updateClaudeSwitchJournal(ownerHeld, { credentialsWritten: true, publishedAt }, options);
             state.started.push(7); await deps.hooks?.afterStep7?.(); deps.crashAt?.('after-step-7');
-          } catch (error) { if (isCrash(error)) throw error; return failed(input, attempt, from, 'step-7', writeError(error, 'keychain-write-failed'), state, 7); }
+          } catch (error) { if (isCrash(error)) throw error; return failed(deps, input, attempt, from, 'step-7', writeError(error, 'keychain-write-failed'), state, 7); }
           // Step 8: config lock covers raw read, planning splice, journal intent, and write only.
           try {
             await configLock(paths.globalConfigPath, { env: deps.env }, async (configHeld) => {
@@ -314,28 +334,40 @@ export async function switchClaude(deps: ClaudeSwitchDeps, input: SwitchClaudeIn
               updateClaudeSwitchJournal(ownerHeld, { configWritten: true }, options);
             });
             state.started.push(8); await deps.hooks?.afterStep8?.(); deps.crashAt?.('after-step-8');
-          } catch (error) { if (isCrash(error)) throw error; return failed(input, attempt, from, 'step-8', writeError(error, 'config-write-failed'), state, 8); }
+          } catch (error) { if (isCrash(error)) throw error; return failed(deps, input, attempt, from, 'step-8', writeError(error, 'config-write-failed'), state, 8); }
           // Step 9 plus the finished-marker cleanup sequence.
           let switchId: number;
           try {
             await deps.hooks?.beforeStep9?.();
-            switchId = deps.store.commitClaudeSwitch({ now: deps.now(), fromAccount: from, toAccount: input.to, trigger: input.trigger, setBy: input.trigger === 'manual' ? 'manual' : 'auto', attempt, outgoingKind: classified.kind, bindingJson: input.bindingJson ?? null, stepsJson: JSON.stringify(state), publishedAt: deps.now(), injected: input.injected === true, detail: null, republish: false, decision: input.decision ?? noDecision() });
+            switchId = deps.store.commitClaudeSwitch({ now: deps.now(), fromAccount: from, toAccount: input.to, trigger: input.trigger, setBy: input.trigger === 'manual' ? 'manual' : 'auto', attempt, outgoingKind: classified.kind, bindingJson: input.bindingJson ?? null, stepsJson: JSON.stringify(state), publishedAt, injected: input.injected === true, detail: null, republish: false, decision: input.decision ?? noDecision() });
             state.started.push(9); deps.crashAt?.('after-commit');
-          } catch (error) { if (isCrash(error)) throw error; return failed(input, attempt, from, 'step-9', classifySwitchError(error), state, 9); }
+          } catch (error) { if (isCrash(error)) throw error; return failed(deps, input, attempt, from, 'step-9', classifySwitchError(error), state, 9); }
           try { updateClaudeSwitchJournal(ownerHeld, { committed: deps.now() }, options); } catch (error) { state.cleanup.push(classifySwitchError(error)); }
           if (state.cleanup.length === 0) try { await deleteStagedRollback(live.backend, stagedBlobService); } catch (error) { state.cleanup.push(classifySwitchError(error)); }
           if (state.cleanup.length === 0) try { deleteClaudeSwitchJournal(ownerHeld, options); } catch (error) { state.cleanup.push(classifySwitchError(error)); }
           return { outcome: 'ok', from, to: input.to, switchId, attempt, outgoingKind: classified.kind, injected: input.injected === true, steps: state, exitCode: 0 };
+          })();
+          ownerResult = outcome;
+          return outcome;
         });
       } catch (error) {
         if (isCrash(error)) throw error;
+        if ((error instanceof ClaudeCodeLockTimeout || error instanceof ProperLockfileCompromised) && ownerResult !== undefined) {
+          if (ownerResult.outcome === 'ok') {
+            ownerResult.steps?.cleanup.push('lock-timeout');
+          }
+          return ownerResult;
+        }
         const reason = error instanceof ClaudeCodeLockTimeout || error instanceof ProperLockfileCompromised
           ? (readClaudeSwitchJournal(options).state === 'absent' ? 'lock-timeout' : 'switch-journal-present') : undefined;
         if (reason) return refusal(deps, input, attempt, activeAccount(deps), reason);
         throw error;
       }
     }), { home: deps.home, env: deps.env });
-    if (result.outcome === 'ok') await deps.afterSwitch?.(input.to);
+    if (result.outcome === 'ok') {
+      if (result.steps?.cleanup.length) warn(deps, `Claude switch completed with cleanup warnings: ${result.steps.cleanup.join(', ')}`);
+      try { await deps.afterSwitch?.(input.to); } catch { warn(deps, 'Claude switch post-switch hook failed'); }
+    }
     return result;
   } catch (error) {
     if (isCrash(error)) throw error;
