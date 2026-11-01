@@ -65,8 +65,11 @@ export interface CodexSwitchDeps {
   list?: () => Promise<CodexProcess[]>;
   transport?: CodexConsumeOptions['transport'];
   journalDir?: string;
-  /** Command-owned lifecycle admission, checked once, before the preflight (§3 step 2). */
-  admitted?: () => { ok: boolean; reason?: string } | Promise<{ ok: boolean; reason?: string }>;
+  /**
+   * Command-owned lifecycle admission, checked once, before the preflight (§3 step 2).
+   * A watch tick passes its switch's trigger, so one binding serves manual and auto watches.
+   */
+  admitted?: (trigger?: string) => { ok: boolean; reason?: string } | Promise<{ ok: boolean; reason?: string }>;
   /** Test seams for ordered switch phases; production leaves them unset. */
   hooks?: {
     afterPost?: () => void | Promise<void>;
@@ -1324,7 +1327,7 @@ export type CodexWatchTickResult =
 
 /** One locked, phase-safe observation of a committed switch's live Codex file. */
 export async function codexWatchTick(deps: CodexSwitchDeps, watch: CodexWatch): Promise<CodexWatchTickResult> {
-  const admitted = await deps.admitted?.() ?? { ok: true };
+  const admitted = await deps.admitted?.(watch.trigger) ?? { ok: true };
   if (!admitted.ok) return { state: 'stopped', reason: 'not-admitted' };
   if (!deps.slots || !deps.keychain || !deps.list || !deps.journalDir) throw new Error('Codex watch dependencies are required');
   const slots = deps.slots;
@@ -1332,16 +1335,22 @@ export async function codexWatchTick(deps: CodexSwitchDeps, watch: CodexWatch): 
   const list = deps.list;
   return withCodexSwitchLocks(deps, async (assertHeld) => {
     if (deps.store.codexPublishingRowsAfter(watch.switchId).length > 0) return { state: 'stopped', reason: 'superseded' };
-    const hadFence = deps.store.hasConfig('codex.recoveryFence');
+    const fence = parseCodexRecoveryFence(deps.store.getConfig('codex.recoveryFence'));
+    // The locked form: this tick already holds switch → auth (no re-entry).
     const recovery = await reconcileCodexRecoveryLocked(deps, assertHeld);
     if (recovery.state === 'fenced') return { state: 'quiet' };
-    if (hadFence) {
-      const resolved = deps.store.codexPublishingRowsAfter(watch.switchId).at(-1);
-      if (resolved) {
-        if (resolved.outcome === 'reverted-by-codex') return { state: 'reverted' };
-        return resolved.outcome === 'ok' ? { state: 'quiet' } : { state: 'stopped', reason: resolved.detail ?? 'recovery-resolved' };
-      }
+    const after = deps.store.codexPublishingRowsAfter(watch.switchId);
+    // A fence resolved by this tick's recovery already wrote its effect row: report it, never attribute again.
+    const resolution = fence && after.find((row) => {
+      const steps = row.stepsJson ? JSON.parse(row.stepsJson) as { attempt?: unknown; via?: unknown } : {};
+      return steps.via === 'fence' && steps.attempt === fence.attempt;
+    });
+    if (resolution) {
+      if (resolution.outcome === 'reverted-by-codex') return { state: 'reverted' };
+      return resolution.outcome === 'ok' ? { state: 'quiet' } : { state: 'stopped', reason: resolution.detail ?? resolution.outcome };
     }
+    // Recovery may have committed a later switch's orphaned journal: the generation guard applies to it too.
+    if (after.length > 0) return { state: 'stopped', reason: 'superseded' };
     const observed = await deps.readLive();
     if (observed.status === 'missing') { assertHeld(); deps.store.deleteCodexWatch(watch.switchId); return { state: 'stopped', reason: 'logged-out' }; }
     if (observed.status === 'unstable' || observed.status === 'unreadable') {
@@ -1355,9 +1364,9 @@ export async function codexWatchTick(deps: CodexSwitchDeps, watch: CodexWatch): 
     const live = observed.doc;
     const liveIdentity = codexIdentity(live);
     const targetRow = deps.store.getCodexSlot(watch.target);
-    if (!targetRow) return { state: 'stopped', reason: 'target-missing' };
-    const target = slots.readSlot(watch.target, { fresh: true }).document;
-    const targetFp = codexFingerprint(target);
+    if (!targetRow?.fingerprint) throw new Error('Codex watch target slot is missing');
+    // Settled on target = live equals slot B's recorded head, as in recovery; anything else is attributed.
+    const targetFp = targetRow.fingerprint;
     const classified: CodexPostPublishClassification = codexFingerprint(live) === targetFp ? 'ok' : { status: 'external', doc: live };
     const slotHeads = new Map<string, string | null>([
       [watch.outgoing, deps.store.getCodexSlot(watch.outgoing)?.fingerprint ?? null],
@@ -1368,8 +1377,10 @@ export async function codexWatchTick(deps: CodexSwitchDeps, watch: CodexWatch): 
     if (typeof classified === 'object' && classified.status === 'external') {
       const history = deps.dbPath ? readCodexSwitchHistory(deps.dbPath, { journalDir: deps.journalDir }) : { rows: [], observations: [] };
       const current = await list();
+      const target = slots.readSlot(watch.target, { fresh: true }).document;
+      // After the committed switch, B is the active login.
       attribution = await attributeForPhase({ assertHeld }, 'watch', { store: deps.store, keychain,
-        slot: { accountId: watch.target, document: target, fingerprint: targetRow.fingerprint ?? undefined }, activeSlotId: watch.outgoing,
+        slot: { accountId: watch.target, document: target, fingerprint: targetFp }, activeSlotId: watch.target,
         activeSetBy: 'adopt', live, holderObservation: {
           aliveBefore: liveIdentity !== null && renewers(codexIdentityParts(liveIdentity), watch.openSessions, history.rows, history.observations).length > 0,
           aliveAfter: liveIdentity !== null && renewers(codexIdentityParts(liveIdentity), current, history.rows, history.observations).length > 0,
@@ -1396,6 +1407,7 @@ export async function codexWatchTick(deps: CodexSwitchDeps, watch: CodexWatch): 
     const effect = verdict.effect;
     if (effect.outcome === 'quiet') return { state: 'quiet' };
     if (effect.outcome === 'reverted-by-codex') {
+      deps.crashAt?.('watch-before-revert-commit');
       assertHeld(); deps.store.commitCodexWatchRevert({ watch, setActive: effect.accountId, attempt: watch.attempt, now: deps.now() });
       return { state: 'reverted' };
     }
