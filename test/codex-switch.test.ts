@@ -10,6 +10,7 @@ import {
   attributeForPhase,
   checkCodexSwitchPreconditions,
   classifyPostPublish,
+  codexWatchTick,
   resolveRecoveryVerdict,
   reconcileCodexRecovery,
   reconcileCodexRecoveryLocked,
@@ -2982,5 +2983,40 @@ describe('reconcileCodexRecovery — C6-20', () => {
       assert.deepEqual(await refresh(h, 'c:account'), refused('slot-split'));
       assert.deepEqual(switchRows(h.db).filter(({ steps_json }) => String(steps_json).includes('"fence"')), []);
     } finally { close(h); }
+  });
+});
+
+describe('Codex watch tick — C6-21', () => {
+  it('a quiet B continues with no row', async () => {
+    const h = switchHarness();
+    try {
+      const switchId = h.store.recordSwitch({ ts: 1, provider: 'openai-codex', fromAccount: 'a:account', toAccount: 'b:account',
+        trigger: 'manual', outcome: 'ok', stepsJson: JSON.stringify({ attempt: 'switch-watch', via: 'switch' }), publishedAt: 2, committedAt: 3 });
+      h.db.prepare("INSERT INTO codex_watch (switch_id, provider, outgoing, target, next_at, until) VALUES (?, 'openai-codex', 'a:account', 'b:account', 4, 5)").run(switchId);
+      writeFileSync(h.authPath, JSON.stringify(h.b));
+      assert.deepEqual(await codexWatchTick(h.deps({ authPath: h.authPath, dbPath: h.store.dbPath, journalDir: join(h.root, 'journal'),
+        keychain: h.keychain, slots: h.slots as never, list: async () => [], readLive: () => readCodexAuthStableWithStat(h.authPath, { delayMs: 0 }),
+      }), { switchId, outgoing: 'a:account', target: 'b:account', trigger: 'manual', attempt: 'switch-watch', publishedAt: 2, openSessions: [], until: 5 }), { state: 'quiet' });
+      assert.equal(scalarCount(h.db, 'SELECT COUNT(*) AS count FROM switch_log'), 1);
+    } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('a manual B→A committed during an A→B watch ⇒ the watcher stops without logging reverted-by-codex', async () => {
+    const h = switchHarness();
+    try {
+      const switchId = h.store.recordSwitch({ ts: 1, provider: 'openai-codex', fromAccount: 'a:account', toAccount: 'b:account', trigger: 'manual', outcome: 'ok', publishedAt: 2, committedAt: 3 });
+      h.store.recordSwitch({ ts: 4, provider: 'openai-codex', fromAccount: 'b:account', toAccount: 'a:account', trigger: 'manual', outcome: 'ok', publishedAt: 4, committedAt: 5 });
+      assert.deepEqual(await codexWatchTick(h.deps({ authPath: h.authPath, dbPath: h.store.dbPath, journalDir: join(h.root, 'journal'), keychain: h.keychain, slots: h.slots as never, list: async () => [] }),
+        { switchId, outgoing: 'a:account', target: 'b:account', trigger: 'manual', attempt: 'watch', publishedAt: 2, openSessions: [], until: 9 }), { state: 'stopped', reason: 'superseded' });
+      assert.equal(scalarCount(h.db, "SELECT COUNT(*) AS count FROM switch_log WHERE outcome = 'reverted-by-codex'"), 0);
+    } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('a tick outside an admitting lifecycle state stops', async () => {
+    const h = switchHarness();
+    try {
+      assert.deepEqual(await codexWatchTick(h.deps({ admitted: () => ({ ok: false, reason: 'not-admitted' }) }),
+        { switchId: 1, outgoing: 'a:account', target: 'b:account', trigger: 'manual', attempt: 'watch', publishedAt: 2, openSessions: [], until: 9 }), { state: 'stopped', reason: 'not-admitted' });
+    } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
   });
 });

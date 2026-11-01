@@ -2430,6 +2430,39 @@ export class Store {
     });
   }
 
+  /** Rows that supersede a watch: another publication or a recorded reversion. */
+  codexPublishingRowsAfter(switchId: number): Array<{ id: number; outcome: string; detail: string | null; stepsJson: string | null }> {
+    return this.db.prepare(`SELECT id, outcome, detail, steps_json FROM switch_log
+      WHERE provider = 'openai-codex' AND id > ?
+        AND (published_at IS NOT NULL OR outcome = 'reverted-by-codex') ORDER BY id`).all(switchId)
+      .map((row) => {
+        const typed = row as { id: number; outcome: string; detail: string | null; steps_json: string | null };
+        return { id: typed.id, outcome: typed.outcome, detail: typed.detail, stepsJson: typed.steps_json };
+      });
+  }
+
+  /** Atomically record a watch reversion and consume its watch row. */
+  commitCodexWatchRevert(input: {
+    watch: { switchId: number; outgoing: string; target: string; trigger: string };
+    setActive: string;
+    attempt: string;
+    now: number;
+  }): number {
+    return this.runImmediate(() => {
+      this.setActiveLogin('openai-codex', input.setActive, 'adopt', input.now);
+      const switchId = this.recordSwitch({ ts: input.now, provider: 'openai-codex', fromAccount: input.watch.outgoing,
+        toAccount: input.watch.target, trigger: input.watch.trigger, outcome: 'reverted-by-codex',
+        stepsJson: JSON.stringify({ attempt: input.attempt, via: 'watch' }), publishedAt: null, committedAt: input.now });
+      this.db.prepare('DELETE FROM codex_watch WHERE switch_id = ?').run(input.watch.switchId);
+      return switchId;
+    });
+  }
+
+  /** A terminal watch outcome that does not itself need a switch-log row. */
+  deleteCodexWatch(switchId: number): void {
+    this.db.prepare('DELETE FROM codex_watch WHERE switch_id = ?').run(switchId);
+  }
+
   /** S56 lookup by the composite identity; never exposes a credential document. */
   getCodexSlot(accountId: string): CodexSlotRecord | null {
     const row = this.db.prepare(`SELECT account_id, chatgpt_user_id, chatgpt_account_id, fingerprint, prev_fingerprint, dead, pending_adopt

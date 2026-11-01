@@ -46,7 +46,8 @@ type CodexObservationKeychain = Pick<KeychainBackend, 'getSync' | 'setSync' | 'd
 export interface CodexSwitchDeps {
   store: Pick<Store, 'getCodexActiveLogin' | 'getCodexSlot' | 'getConfig' | 'hasConfig' | 'recordSwitch'
     | 'recordCodexObservation' | 'setActiveLogin' | 'commitCodexSwitch' | 'findCodexSwitchByAttempt'
-    | 'setRecoveryFence' | 'clearRecoveryFence' | 'commitFenceResolution'> & CodexAttributionStore;
+    | 'setRecoveryFence' | 'clearRecoveryFence' | 'commitFenceResolution'
+    | 'codexPublishingRowsAfter' | 'commitCodexWatchRevert' | 'deleteCodexWatch'> & CodexAttributionStore;
   readLive: () => Promise<CodexAuthStableWithStatResult>;
   cswapProcesses: () => CswapProcess[];
   now: () => number;
@@ -1301,6 +1302,115 @@ export async function reconcileCodexRecovery(deps: CodexSwitchDeps): Promise<Awa
   // by freshen/phase L under the switch lock.
   if (deps.journalDir && codexRecoveryFenceState(deps.journalDir, deps.store).state === 'none') return { state: 'clear' };
   return withCodexSwitchLocks(deps, (assertHeld) => reconcileCodexRecoveryLocked(deps, assertHeld));
+}
+
+export interface CodexWatch {
+  switchId: number;
+  outgoing: string;
+  target: string;
+  trigger: string;
+  attempt: string;
+  publishedAt: number;
+  openSessions: CodexProcess[];
+  until: number;
+}
+
+export type CodexWatchTickResult =
+  | { state: 'quiet' }
+  | { state: 'reverted' }
+  | { state: 'stopped'; reason: string }
+  | { state: 'unresolved'; reason: string }
+  | { state: 'inconclusive' };
+
+/** One locked, phase-safe observation of a committed switch's live Codex file. */
+export async function codexWatchTick(deps: CodexSwitchDeps, watch: CodexWatch): Promise<CodexWatchTickResult> {
+  const admitted = await deps.admitted?.() ?? { ok: true };
+  if (!admitted.ok) return { state: 'stopped', reason: 'not-admitted' };
+  if (!deps.slots || !deps.keychain || !deps.list || !deps.journalDir) throw new Error('Codex watch dependencies are required');
+  const slots = deps.slots;
+  const keychain = deps.keychain;
+  const list = deps.list;
+  return withCodexSwitchLocks(deps, async (assertHeld) => {
+    if (deps.store.codexPublishingRowsAfter(watch.switchId).length > 0) return { state: 'stopped', reason: 'superseded' };
+    const hadFence = deps.store.hasConfig('codex.recoveryFence');
+    const recovery = await reconcileCodexRecoveryLocked(deps, assertHeld);
+    if (recovery.state === 'fenced') return { state: 'quiet' };
+    if (hadFence) {
+      const resolved = deps.store.codexPublishingRowsAfter(watch.switchId).at(-1);
+      if (resolved) {
+        if (resolved.outcome === 'reverted-by-codex') return { state: 'reverted' };
+        return resolved.outcome === 'ok' ? { state: 'quiet' } : { state: 'stopped', reason: resolved.detail ?? 'recovery-resolved' };
+      }
+    }
+    const observed = await deps.readLive();
+    if (observed.status === 'missing') { assertHeld(); deps.store.deleteCodexWatch(watch.switchId); return { state: 'stopped', reason: 'logged-out' }; }
+    if (observed.status === 'unstable' || observed.status === 'unreadable') {
+      return deps.now() >= watch.until ? { state: 'inconclusive' } : { state: 'quiet' };
+    }
+    if (observed.status === 'wiped') {
+      assertHeld(); deps.store.recordCodexObservation({ identity: null, lineageFp: null, by: 'qlb-watch', now: deps.now() });
+      deps.store.deleteCodexWatch(watch.switchId);
+      return { state: 'stopped', reason: 'wiped' };
+    }
+    const live = observed.doc;
+    const liveIdentity = codexIdentity(live);
+    const targetRow = deps.store.getCodexSlot(watch.target);
+    if (!targetRow) return { state: 'stopped', reason: 'target-missing' };
+    const target = slots.readSlot(watch.target, { fresh: true }).document;
+    const targetFp = codexFingerprint(target);
+    const classified: CodexPostPublishClassification = codexFingerprint(live) === targetFp ? 'ok' : { status: 'external', doc: live };
+    const slotHeads = new Map<string, string | null>([
+      [watch.outgoing, deps.store.getCodexSlot(watch.outgoing)?.fingerprint ?? null],
+      [watch.target, targetRow.fingerprint],
+    ]);
+    if (liveIdentity) slotHeads.set(liveIdentity, deps.store.getCodexSlot(liveIdentity)?.fingerprint ?? null);
+    let attribution: CodexPhaseAttribution | undefined;
+    if (typeof classified === 'object' && classified.status === 'external') {
+      const history = deps.dbPath ? readCodexSwitchHistory(deps.dbPath, { journalDir: deps.journalDir }) : { rows: [], observations: [] };
+      const current = await list();
+      attribution = await attributeForPhase({ assertHeld }, 'watch', { store: deps.store, keychain,
+        slot: { accountId: watch.target, document: target, fingerprint: targetRow.fingerprint ?? undefined }, activeSlotId: watch.outgoing,
+        activeSetBy: 'adopt', live, holderObservation: {
+          aliveBefore: liveIdentity !== null && renewers(codexIdentityParts(liveIdentity), watch.openSessions, history.rows, history.observations).length > 0,
+          aliveAfter: liveIdentity !== null && renewers(codexIdentityParts(liveIdentity), current, history.rows, history.observations).length > 0,
+        }, l40Verified: deps.store.getConfig('codex.l40Verified') === '1', now: deps.now });
+      if (attribution.action === 'unclaimed') {
+        try { await slots.ensureUnclaimedStash!(live, deps.now()); }
+        catch (error) { if (error instanceof CodexStashUnverifiable) attribution = { action: 'stash-unverifiable' }; else throw error; }
+      }
+      slotHeads.set(watch.target, deps.store.getCodexSlot(watch.target)?.fingerprint ?? null);
+      if (liveIdentity) slotHeads.set(liveIdentity, deps.store.getCodexSlot(liveIdentity)?.fingerprint ?? null);
+    }
+    assertHeld(); deps.store.recordCodexObservation({ identity: liveIdentity, lineageFp: codexFingerprint(live), by: 'qlb-watch', now: deps.now() });
+    const journal: Pick<CodexSwitchJournal, 'from' | 'to' | 'target' | 'adoptingTarget'> = {
+      from: watch.outgoing, to: watch.target, target: { identity: codexIdentityParts(watch.target), fingerprint: targetFp }, adoptingTarget: [],
+    };
+    const verdict = resolveRecoveryVerdict(classified, attribution, { phase: 'watch', watch: journal,
+      targetSlotFingerprint: deps.store.getCodexSlot(watch.target)?.fingerprint ?? '', slotHeads, live });
+    if (verdict.class === 'pending') return deps.now() >= watch.until ? { state: 'inconclusive' } : { state: 'quiet' };
+    if (verdict.class === 'unresolved') {
+      assertHeld(); deps.store.setRecoveryFence({ v: 1, switchId: watch.switchId, attempt: watch.attempt, from: watch.outgoing, to: watch.target,
+        publishedAt: watch.publishedAt, reason: verdict.reason, involvedAccounts: verdict.involvedAccounts, since: deps.now() });
+      return { state: 'unresolved', reason: verdict.reason };
+    }
+    const effect = verdict.effect;
+    if (effect.outcome === 'quiet') return { state: 'quiet' };
+    if (effect.outcome === 'reverted-by-codex') {
+      assertHeld(); deps.store.commitCodexWatchRevert({ watch, setActive: effect.accountId, attempt: watch.attempt, now: deps.now() });
+      return { state: 'reverted' };
+    }
+    if (effect.outcome === 'stopped' || effect.outcome === 'failed') {
+      assertHeld();
+      if (effect.outcome === 'stopped' && effect.reason === 'unknown-live-identity') {
+        deps.store.recordSwitch({ ts: deps.now(), provider: PROVIDER, fromAccount: watch.outgoing, toAccount: watch.target, trigger: watch.trigger,
+          outcome: 'failed', detail: 'unknown-live-identity', stepsJson: JSON.stringify({ attempt: watch.attempt, via: 'watch' }), publishedAt: null });
+        deps.store.setActiveLogin(PROVIDER, null, 'adopt', deps.now());
+      }
+      deps.store.deleteCodexWatch(watch.switchId);
+      return { state: 'stopped', reason: effect.outcome === 'stopped' ? effect.reason : effect.detail };
+    }
+    return { state: 'quiet' };
+  });
 }
 
 /** C6-18: switch through the journaled publication; C6-20 supplies recovery. */
