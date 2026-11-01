@@ -152,6 +152,23 @@ function setupAnthropicRollback(): ReturnType<typeof setup> & { baseline: Record
   return { ...h, baseline, livePool, disabledPool, tokens: [...h.tokens, 'access-anthropic-baseline', 'refresh-anthropic-baseline'] };
 }
 
+function assertAnthropicRollbackClean(h: ReturnType<typeof setupAnthropicRollback>): void {
+  assert.deepEqual(JSON.parse(readFileSync(h.paths.authJsonPath, 'utf8')).anthropic, h.baseline);
+  assert.equal(existsSync(h.livePool), true, 'pool entry restored');
+  assert.equal(lstatPresent(h.disabledPool), false, 'disabled pool entry removed');
+  assert.equal(h.store.getConfig('pi.anthropic.state'), '');
+  assert.equal(h.store.getConfig('pi.anthropic.migratedAt'), '');
+  assert.equal(h.store.getConfig('pi.anthropic.baselineConsumedBy'), '');
+  assert.equal(existsSync(join(h.paths.journalPath, 'pi-migrate-anthropic.json')), false, 'journal removed');
+}
+
+function lstatPresent(path: string): boolean {
+  try { lstatSync(path); return true; } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw error;
+  }
+}
+
 function singleGrantJournalAccount(provider: Exclude<PiSingleProvider, 'openrouter'>, shared = false): Record<string, unknown> {
   const account: Record<string, unknown> = { id: ADAPTER_ACCOUNT_IDS[provider], provider, label: provider };
   if (shared) account.keychain = sharedSingleGrantCoords(provider);
@@ -1946,32 +1963,59 @@ describe('Pi migration S58 credential-first barrier', () => {
   });
 
   it('anthropic: rollback restores the baseline with a consumer-slot-gone warning when the consuming slot is archived, dead or absent', () => {
-    const h = setupAnthropicRollback();
-    try {
-      h.store.setConfig('pi.anthropic.baselineConsumedBy', 'gone');
-      const result = rollbackPiSingleProvider('anthropic', h.paths, { keychain: h.keychain, store: h.store, enabledProviders: ALL });
-      assert.deepEqual(JSON.parse(readFileSync(h.paths.authJsonPath, 'utf8')).anthropic, h.baseline);
-      assert.deepEqual(result.warnings, ['consumer-slot-gone:anthropic:gone']);
-    } finally { h.cleanup(); }
+    for (const kind of ['absent', 'archived', 'dead'] as const) {
+      const h = setupAnthropicRollback();
+      try {
+        const accountId = `gone-${kind}`;
+        if (kind !== 'absent') {
+          const db = (h.store as unknown as { db: { prepare(sql: string): { run(...args: unknown[]): unknown } } }).db;
+          db.prepare("INSERT INTO claude_slots (account_id, config_json, dead, archived_at, added_at) VALUES (?, '{}', ?, ?, ?)").run(accountId, kind === 'dead' ? 1 : 0, kind === 'archived' ? 1 : null, 1);
+          h.keychain.setSync(qlbKeychainService('anthropic', accountId), QLB_KEYCHAIN_ACCOUNT, JSON.stringify({ claudeAiOauth: { accessToken: 'retired-access', refreshToken: 'retired-refresh', expiresAt: 42 } }));
+        }
+        h.store.setConfig('pi.anthropic.baselineConsumedBy', accountId);
+        let reads = 0;
+        const keychain = { getSync: (...args: Parameters<MockKeychain['getSync']>) => { reads += 1; return h.keychain.getSync(...args); }, setSync: h.keychain.setSync.bind(h.keychain), deleteSync: h.keychain.deleteSync.bind(h.keychain) };
+        const result = rollbackPiSingleProvider('anthropic', h.paths, { keychain, store: h.store, enabledProviders: ALL });
+        assert.deepEqual(JSON.parse(readFileSync(h.paths.authJsonPath, 'utf8')).anthropic, h.baseline, kind);
+        assert.deepEqual(result.warnings, [`consumer-slot-gone:anthropic:${accountId}`], kind);
+        assert.equal(reads, 0, kind);
+      } finally { h.cleanup(); }
+    }
   });
 
-  it('anthropic: rollback with a journal below consumption-recorded restores the baseline unchanged and never reads a slot item', () => {
+  it('anthropic: rollback with a journal below consumption-recorded restores the baseline unchanged and never reads a live slot item', () => {
     const h = setupAnthropicRollback();
     try {
+      const db = (h.store as unknown as { db: { prepare(sql: string): { run(...args: unknown[]): unknown } } }).db;
+      db.prepare("INSERT INTO claude_slots (account_id, config_json, dead, added_at) VALUES (?, '{}', 0, ?)").run('slot-a', 1);
+      h.keychain.setSync(qlbKeychainService('anthropic', 'slot-a'), QLB_KEYCHAIN_ACCOUNT, JSON.stringify({ claudeAiOauth: { accessToken: 'slot-access', refreshToken: 'slot-refresh', expiresAt: 42 } }));
       h.store.setConfig('pi.anthropic.baselineConsumedBy', 'slot-a'); writePiJournal(h.paths, 'anthropic', 'baseline');
       let reads = 0;
       const keychain = { getSync: (...args: Parameters<MockKeychain['getSync']>) => { reads += 1; return h.keychain.getSync(...args); }, setSync: h.keychain.setSync.bind(h.keychain), deleteSync: h.keychain.deleteSync.bind(h.keychain) };
-      rollbackPiSingleProvider('anthropic', h.paths, { keychain, store: h.store, enabledProviders: ALL });
+      const result = rollbackPiSingleProvider('anthropic', h.paths, { keychain, store: h.store, enabledProviders: ALL });
       assert.equal(reads, 0);
       assert.deepEqual(JSON.parse(readFileSync(h.paths.authJsonPath, 'utf8')).anthropic, h.baseline);
+      assert.equal(result.warnings, undefined);
+      assert.equal(h.store.getConfig('pi.anthropic.baselineConsumedBy'), '');
     } finally { h.cleanup(); }
   });
 
-  it('anthropic: rollback refuses owner-file-legacy-v1 with exitCode 3 and writes nothing', () => {
+  it('anthropic: rollback refuses a malformed live consuming slot item before un-owning', () => {
+    const h = setupAnthropicRollback();
+    try {
+      const db = (h.store as unknown as { db: { prepare(sql: string): { run(...args: unknown[]): unknown } } }).db;
+      db.prepare("INSERT INTO claude_slots (account_id, config_json, dead, added_at) VALUES (?, '{}', 0, ?)").run('slot-a', 1);
+      h.store.setConfig('pi.anthropic.baselineConsumedBy', 'slot-a');
+      h.keychain.setSync(qlbKeychainService('anthropic', 'slot-a'), QLB_KEYCHAIN_ACCOUNT, JSON.stringify({ claudeAiOauth: { accessToken: 'partial' } }));
+      expectRefusal(h, 'anthropic', 'claude-slot-unreadable', () => rollbackPiSingleProvider('anthropic', h.paths, { keychain: h.keychain, store: h.store, enabledProviders: ALL }));
+    } finally { h.cleanup(); }
+  });
+
+  it('anthropic: rollback refuses a legacy v1 owner claim as generic ownership before any write', () => {
     const h = setupAnthropicRollback();
     try {
       writeFileSync(h.paths.ownerPath, JSON.stringify({ owner: 'qlb', accounts: [{ provider: 'anthropic' }] }));
-      expectRefusal(h, 'anthropic', 'owner-file-legacy-v1', () => rollbackPiSingleProvider('anthropic', h.paths, { keychain: h.keychain, store: h.store, enabledProviders: ALL }));
+      expectRefusal(h, 'anthropic', 'owned-by-generic-migrate', () => rollbackPiSingleProvider('anthropic', h.paths, { keychain: h.keychain, store: h.store, enabledProviders: ALL }));
     } finally { h.cleanup(); }
   });
 
@@ -1986,12 +2030,16 @@ describe('Pi migration S58 credential-first barrier', () => {
     } finally { h.cleanup(); }
   });
 
-  it('anthropic: rollback refuses pi-extensions-dir-in-git-worktree when extensions is a symlink into a git work tree', () => {
-    const h = setupAnthropicRollback(); const repo = mkdtempSync(join(tmpdir(), 'qlb-pool-repo-'));
-    try {
-      gitInit(repo); rmSync(h.paths.extensionsDir, { recursive: true, force: true }); symlinkSync(repo, h.paths.extensionsDir);
-      expectRefusal(h, 'anthropic', 'pi-extensions-dir-in-git-worktree', () => rollbackPiSingleProvider('anthropic', h.paths, { keychain: h.keychain, store: h.store, enabledProviders: ALL }));
-    } finally { h.cleanup(); rmSync(repo, { recursive: true, force: true }); }
+  it('anthropic: rollback refuses pi-extensions-dir-in-git-worktree when either pool directory is a symlink into a git work tree', () => {
+    for (const which of ['extensions', 'disabled'] as const) {
+      const h = setupAnthropicRollback(); const repo = mkdtempSync(join(tmpdir(), 'qlb-pool-repo-'));
+      try {
+        gitInit(repo);
+        const path = which === 'extensions' ? h.paths.extensionsDir : h.paths.disabledExtensionsDir;
+        rmSync(path, { recursive: true, force: true }); symlinkSync(repo, path);
+        expectRefusal(h, 'anthropic', 'pi-extensions-dir-in-git-worktree', () => rollbackPiSingleProvider('anthropic', h.paths, { keychain: h.keychain, store: h.store, enabledProviders: ALL }));
+      } finally { h.cleanup(); rmSync(repo, { recursive: true, force: true }); }
+    }
   });
 
   it('anthropic: rollback refuses pi-not-migrated when only a generic v2 entry and placeholder exist', () => {
@@ -2009,11 +2057,20 @@ describe('Pi migration S58 credential-first barrier', () => {
     } finally { h.cleanup(); }
   });
 
-  it('anthropic: rollback refuses owned-by-generic-migrate while migrations.pi-pool is QLB_OWNED, MIRRORED, holds a .pre-qlb file or a rollback intent, and proceeds when it is absent or NATIVE', () => {
-    for (const [state, detail, sidecar] of [['QLB_OWNED', '{}', false], ['MIRRORED', '{}', false], ['NATIVE', JSON.stringify({ intent: 'rollback' }), false], ['NATIVE', JSON.stringify({ rollbackDecision: 'keep' }), false], ['NATIVE', JSON.stringify({ handback: true }), false], ['NATIVE', '{}', true]] as const) {
+  it('anthropic: rollback refuses owned-by-generic-migrate while migrations.pi-pool is QLB_OWNED, MIRRORED, has a v1 claim, holds a sidecar or rollback intent, including dangling symlink evidence', () => {
+    for (const kind of ['owned', 'mirrored', 'intent', 'decision', 'handback', 'sidecar', 'staging-link', 'pre-qlb-link', 'owner-link', 'legacy-owner'] as const) {
       const h = setupAnthropicRollback();
       try {
-        h.store.upsertMigration('pi-pool', state, detail); if (sidecar) writeFileSync(`${h.paths.poolFilePath}.pre-qlb`, 'x');
+        if (kind === 'owned') h.store.upsertMigration('pi-pool', 'QLB_OWNED', '{}');
+        if (kind === 'mirrored') h.store.upsertMigration('pi-pool', 'MIRRORED', '{}');
+        if (kind === 'intent') h.store.upsertMigration('pi-pool', 'NATIVE', JSON.stringify({ intent: 'rollback' }));
+        if (kind === 'decision') h.store.upsertMigration('pi-pool', 'NATIVE', JSON.stringify({ rollbackDecision: 'keep' }));
+        if (kind === 'handback') h.store.upsertMigration('pi-pool', 'NATIVE', JSON.stringify({ handback: true }));
+        if (kind === 'sidecar') { h.store.upsertMigration('pi-pool', 'NATIVE', '{}'); writeFileSync(`${h.paths.poolFilePath}.pre-qlb`, 'x'); }
+        if (kind === 'staging-link') symlinkSync(join(h.dir, 'missing-staging'), join(dirname(h.paths.ownerPath), 'qlb-owner.json.staging'));
+        if (kind === 'pre-qlb-link') symlinkSync(join(h.dir, 'missing-pre-qlb'), `${h.paths.poolFilePath}.pre-qlb`);
+        if (kind === 'owner-link') { rmSync(h.paths.ownerPath); symlinkSync(join(h.dir, 'missing-owner'), h.paths.ownerPath); }
+        if (kind === 'legacy-owner') writeFileSync(h.paths.ownerPath, JSON.stringify({ owner: 'qlb', accounts: [{ provider: 'anthropic' }] }));
         expectRefusal(h, 'anthropic', 'owned-by-generic-migrate', () => rollbackPiSingleProvider('anthropic', h.paths, { keychain: h.keychain, store: h.store, enabledProviders: ALL }));
       } finally { h.cleanup(); }
     }
@@ -2025,17 +2082,62 @@ describe('Pi migration S58 credential-first barrier', () => {
     try { rmSync(h.disabledPool, { recursive: true }); rollbackPiSingleProvider('anthropic', h.paths, { keychain: h.keychain, store: h.store, enabledProviders: ALL }); assert.deepEqual(JSON.parse(readFileSync(h.paths.authJsonPath, 'utf8')).anthropic, h.baseline); } finally { h.cleanup(); }
   });
 
-  it('anthropic: rollback keeps a newer native login', () => {
+  it('anthropic: rollback keeps a newer valid native login, restores the pool entry and clears markers', () => {
     const h = setupAnthropicRollback();
-    try { const newer = oauth('anthropic-new'); writeFileSync(h.paths.authJsonPath, JSON.stringify({ anthropic: newer })); rollbackPiSingleProvider('anthropic', h.paths, { keychain: h.keychain, store: h.store, enabledProviders: ALL }); assert.deepEqual(JSON.parse(readFileSync(h.paths.authJsonPath, 'utf8')).anthropic, newer); } finally { h.cleanup(); }
+    try {
+      const newer = oauth('anthropic-new'); writeFileSync(h.paths.authJsonPath, JSON.stringify({ anthropic: newer }));
+      rollbackPiSingleProvider('anthropic', h.paths, { keychain: h.keychain, store: h.store, enabledProviders: ALL });
+      assert.deepEqual(JSON.parse(readFileSync(h.paths.authJsonPath, 'utf8')).anthropic, newer);
+      assert.equal(existsSync(h.livePool), true);
+      assert.equal(lstatPresent(h.disabledPool), false);
+      assert.equal(h.store.getConfig('pi.anthropic.state'), '');
+      assert.equal(h.store.getConfig('pi.anthropic.migratedAt'), '');
+      assert.equal(h.store.getConfig('pi.anthropic.baselineConsumedBy'), '');
+      assert.equal(existsSync(join(h.paths.journalPath, 'pi-migrate-anthropic.json')), false);
+    } finally { h.cleanup(); }
   });
 
-  it('anthropic: rollback is re-runnable after a crash at each write point', () => {
-    for (const point of ['owner-entry', 'entry-restored', 'pool-dir-restored'] as const) {
-      const h = setupAnthropicRollback(); try {
-        assert.throws(() => rollbackPiSingleProvider('anthropic', h.paths, { keychain: h.keychain, store: h.store, enabledProviders: ALL, afterWrite: (actual) => { if (actual === point) throw new Error('crash'); } }), /crash/);
+  it('anthropic: malformed present entries are restored from a valid baseline, or refuse no-restore-source without cleanup when every source is invalid', () => {
+    for (const current of [{ type: 'oauth', access: 'partial' }, null, 'malformed']) {
+      const h = setupAnthropicRollback();
+      try {
+        writeFileSync(h.paths.authJsonPath, JSON.stringify({ anthropic: current }));
         rollbackPiSingleProvider('anthropic', h.paths, { keychain: h.keychain, store: h.store, enabledProviders: ALL });
-        assert.deepEqual(JSON.parse(readFileSync(h.paths.authJsonPath, 'utf8')).anthropic, h.baseline);
+        assertAnthropicRollbackClean(h);
+      } finally { h.cleanup(); }
+    }
+    const h = setupAnthropicRollback();
+    try {
+      writeFileSync(h.paths.authJsonPath, JSON.stringify({ anthropic: { type: 'oauth', access: 'partial' } }));
+      writeFileSync(join(h.paths.baselineDir, 'anthropic.json'), JSON.stringify({ ...h.baseline, type: 'api-key' }));
+      expectRefusal(h, 'anthropic', 'no-restore-source', () => rollbackPiSingleProvider('anthropic', h.paths, { keychain: h.keychain, store: h.store, enabledProviders: ALL }));
+    } finally { h.cleanup(); }
+  });
+
+  it('anthropic: rollback un-owns before restoring the auth entry', () => {
+    const h = setupAnthropicRollback();
+    try {
+      rollbackPiSingleProvider('anthropic', h.paths, {
+        keychain: h.keychain, store: h.store, enabledProviders: ALL,
+        afterWrite: (point) => {
+          if (point !== 'owner-entry') return;
+          assert.equal(placeholderPresent(h.paths, 'anthropic'), true);
+          assert.equal(existsSync(h.paths.ownerPath), false);
+        },
+      });
+    } finally { h.cleanup(); }
+  });
+
+  it('anthropic: rollback is re-runnable after a crash at each write and cleanup marker point', () => {
+    for (const point of ['owner-entry', 'entry-restored', 'pool-dir-restored', 'migrated-at', 'baseline-consumed-by', 'journal-cleared', 'state-cleared'] as const) {
+      const h = setupAnthropicRollback(); try {
+        assert.throws(() => rollbackPiSingleProvider('anthropic', h.paths, { keychain: h.keychain, store: h.store, enabledProviders: ALL, afterWrite: (actual: string) => { if (actual === point) throw new Error('crash'); } }), /crash/, point);
+        if (point === 'state-cleared') {
+          expectRefusal(h, 'anthropic', 'pi-not-migrated', () => rollbackPiSingleProvider('anthropic', h.paths, { keychain: h.keychain, store: h.store, enabledProviders: ALL }));
+        } else {
+          rollbackPiSingleProvider('anthropic', h.paths, { keychain: h.keychain, store: h.store, enabledProviders: ALL });
+        }
+        assertAnthropicRollbackClean(h);
       } finally { h.cleanup(); }
     }
   });
@@ -2047,6 +2149,12 @@ describe('Pi migration S58 credential-first barrier', () => {
           keychain: h.keychain, store: h.store, enabledProviders: ALL, withAuthLock: (path, fn) => withPiAuthLock(path, fn),
           afterWrite: (actual) => { if (actual === point) writeFileSync(join(`${h.paths.authJsonPath}.lock`, 'qlb-lock-owner.json'), JSON.stringify({ pid: process.pid, nonce: 'foreign' })); },
         }), (error: unknown) => (error as { code?: unknown; exitCode?: unknown }).code === 'pi-auth-lock-lost' && (error as { exitCode?: unknown }).exitCode === 1);
+        if (point === 'owner-entry') assert.equal(placeholderPresent(h.paths, 'anthropic'), true, point);
+        if (point === 'entry-restored') { assert.equal(lstatPresent(h.disabledPool), true, point); assert.equal(lstatPresent(h.livePool), false, point); }
+        if (point === 'pool-dir-restored') {
+          assert.equal(h.store.getConfig('pi.anthropic.state'), 'migrated', point);
+          assert.equal(h.store.getConfig('pi.anthropic.migratedAt'), '1', point);
+        }
       } finally { h.cleanup(); }
     }
   });
