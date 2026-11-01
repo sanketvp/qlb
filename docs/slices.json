@@ -77,13 +77,13 @@
     {"id":"P7","start":["P7a","P2","P3","P4","P5","P5b","P11","P12","P13","P5-live"],"files":["src/pi-migrate.ts","src/commands/pi-migrate.ts","src/commands/pi-rollback.ts","test/pi-migrate.test.ts"]},
     {"id":"P8","start":["P2","P3","P4","P5","P5b"],"files":["test/qlb-pi-fail-closed.test.ts"]},
 
-    {"id":"K5","start":["K1","K2","K3","K4","A1b","A2b","A14","K13","R0","R0c"],"files":["src/cc-switch.ts","src/commands/switch-anthropic.ts","test/cc-switch.test.ts","test/cc-switch-locks.test.ts","test/lifecycle-guards.test.ts"]},
+    {"id":"K5","start":["K1","K2","K3","K4","A1b","A2b","A14","K13","R0","R0c","K6","C5"],"files":["src/cc-switch.ts","src/commands/switch-anthropic.ts","test/cc-switch.test.ts","test/cc-switch-locks.test.ts","test/lifecycle-guards.test.ts","src/cc-switch-journal.ts","test/cc-switch-journal.test.ts","src/store.ts","test/cc-switch-store.test.ts","test/cc-switch-command.test.ts","test/wiring/commands.d/switch anthropic"]},
     {"id":"K6","start":["K1","K3","A4d","A13","P0","A14","P13"],"files":["src/cc-resync.ts","src/gate/anthropic.ts","test/cc-resync.test.ts","test/gate-refresh.test.ts","src/cc-slots.ts","test/cc-slots.test.ts","src/pi-gate.ts","src/commands/gate.ts","test/gate-guard.test.ts"]},
     {"id":"K6b","start":["K6","P1","P2"],"files":["src/commands/gate.ts","src/pi-gate.ts","src/gate/anthropic.ts","extensions/qlb-pi/index.ts","extensions/qlb-pi/providers/anthropic.ts","test/gate-anthropic-401.test.ts","test/qlb-pi-wiring.test.ts"]},
     {"id":"K10","start":["K1","K2","A5","A13","A14","R0","R0c"],"files":["src/cswap-import.ts","src/commands/import-cswap.ts","test/cswap-import.test.ts","test/wiring/commands.d/import cswap"]},
     {"id":"C6","start":["C3","C5b","C3b","A8","C10","K13","A13","R0","R0c","A14","C1c"],"files":["src/codex-switch.ts","src/commands/switch-openai-codex.ts","test/codex-switch.test.ts","src/codex-sessions.ts","src/commands/codex-refresh.ts","test/codex-sessions.test.ts","src/codex-consume.ts","test/codex-consume.test.ts","src/codex-slots.ts","test/codex-slots.test.ts"]},
 
-    {"id":"K8","start":["K5"],"files":["src/cc-switch.ts","test/cc-switch-rollback.test.ts"]},
+    {"id":"K8","start":["K5"],"files":["src/cc-switch.ts","test/cc-switch-rollback.test.ts","src/fault-injection.ts","test/fault-injection.test.ts","src/commands/switch-anthropic.ts","test/cc-switch-command.test.ts"]},
     {"id":"C6-10","start":["C6"],"files":["src/codex-switch.ts","test/codex-switch.test.ts"]},
     {"id":"C6b","start":["C6-10","C10","C5b","C3b","P3","P0","K6","R0","R0c"],"files":["src/codex-active.ts","src/gate/openai-codex.ts","src/commands/codex-verify-l13.ts","src/checks/codex-first-switch.ts","test/codex-active-refresh.test.ts","test/gate-refresh.test.ts","test/codex-verify-l13.test.ts"]},
     {"id":"P9","start":["P7","P12","R0"],"files":["src/checks/pi-provider.ts","src/checks/pi-anthropic.ts","test/pi-root.test.ts"]},
@@ -94,9 +94,9 @@
     {"id":"X4a","start":["K2","A2d","A13","K13","A7","R0","R0c"],"files":["src/cswap-retire.ts","src/commands/retire-cswap.ts","test/cswap-retire.test.ts"]},
 
     {"id":"K7","start":["A4d","A6b","K3","K5","K6","K8","K9","A7","K13","P13"],"files":["src/auto.ts","src/auto/anthropic.ts","test/autoswitch-loop.test.ts","test/auto-once-failover.test.ts","test/lifecycle-guards.test.ts"]},
-    {"id":"K5b","start":["K9","A2c"],"files":["src/cc-switch.ts","src/commands/keychain.ts","test/cc-switch-republish.test.ts"]},
+    {"id":"K5b","start":["K9","A2c"],"files":["src/cc-switch.ts","src/commands/keychain.ts","test/cc-switch-republish.test.ts","test/keychain-check-launchd-live.test.ts","src/commands/switch-anthropic.ts"]},
     {"id":"C8","start":["K7","C4-live","C6b","C10"],"files":["src/auto/openai-codex.ts","test/autoswitch-codex.test.ts"]},
-    {"id":"H2","start":["K7","A11","K13","R0","R0c"],"files":["src/commands/auto.ts","src/checks/auto-agent.ts","src/checks/cswap-agent.ts","src/checks/cswap-processes.ts","src/checks/auto-parked.ts","scripts/launchagents/com.modus.qlb-auto.plist","test/auto-once.test.ts","test/fault-injection.test.ts"]},
+    {"id":"H2","start":["K7","A11","K13","R0","R0c"],"files":["src/commands/auto.ts","src/checks/auto-agent.ts","src/checks/cswap-agent.ts","src/checks/cswap-processes.ts","src/checks/auto-parked.ts","scripts/launchagents/com.modus.qlb-auto.plist","test/auto-once.test.ts","test/fault-injection.test.ts","src/fault-injection.ts"]},
     {"id":"H3","start":["A7","C5","K7","C8","A5","K13","P9","P12","A12","R0","R0c"],"files":["src/dashboard.ts","src/commands/status.ts","src/commands/report-cutover.ts","src/commands/doctor.ts","src/checks/claude-active.ts","src/checks/claude-login-expiry.ts","src/checks/codex-active.ts","src/checks/codex-sessions.ts","src/checks/version-drift.ts","src/checks/fs-stray-temps.ts","src/checks/fs-plaintext-backups.ts","src/checks/fs-stale-codex-add.ts","src/checks/claude-unclaimed.ts","src/checks/claude-unpersisted-token.ts","src/checks/codex-active-refresh-race.ts","test/status-switches.test.ts","test/report-cutover.test.ts","test/status-json-fields.test.ts","test/doctor-phases.test.ts","test/doctor-sentinel.test.ts","test/redaction.test.ts"]},
     {"id":"D2","start":["H2","H3","K11","K12"],"files":["docs/CLI.md","docs/PROVIDERS.md","README.md"]},
 
