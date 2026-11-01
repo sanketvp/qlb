@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
@@ -9,7 +9,7 @@ import { claudePaths } from '../src/cc-paths';
 import { ClaudeSlots, SqliteClaudeSlotRepository } from '../src/cc-slots';
 import { MockKeychain } from '../src/keychain';
 import { discoverCommands, type CommandContext } from '../src/registry';
-import { openStore } from '../src/store';
+import { openStore, openStoreConnection } from '../src/store';
 import {
   createSwitchAnthropicCommand,
   type SwitchAnthropicCommandDeps,
@@ -18,7 +18,7 @@ import { switchClaude, type ClaudeSwitchDeps, type ClaudeSwitchResult } from '..
 
 const HOME = mkdtempSync(join(tmpdir(), 'qlb-switch-command-'));
 
-function context(): { ctx: CommandContext; stdout: string[]; stderr: string[] } {
+function context(home = HOME): { ctx: CommandContext; stdout: string[]; stderr: string[] } {
   const stdout: string[] = [];
   const stderr: string[] = [];
   return {
@@ -27,10 +27,10 @@ function context(): { ctx: CommandContext; stdout: string[]; stderr: string[] } 
     ctx: {
       stdout: (value) => stdout.push(value),
       stderr: (value) => stderr.push(value),
-      env: { QLB_TEST_MODE: '1', HOME, QLB_HOME: join(HOME, 'qlb') },
-      config: defaultConfig(HOME),
-      loadConfig: () => defaultConfig(HOME),
-      home: HOME,
+      env: { QLB_TEST_MODE: '1', HOME: home, QLB_HOME: join(home, 'qlb') },
+      config: defaultConfig(home),
+      loadConfig: () => defaultConfig(home),
+      home,
       registerSecret: () => {},
       deliverSecret: () => {},
       knownSecrets: () => [],
@@ -148,6 +148,72 @@ describe('qlb switch anthropic command (K5-6)', () => {
         assert.equal(verify.getConfig('auto.anthropic.leftRecoveryAt'), null);
         assert.equal(verify.getConfig('auto.anthropic.leftTrigger'), null);
       } finally { verify.close(); }
+    } finally {
+      repository.close();
+    }
+  });
+
+  it('X26: --inject fail-step without the env exits 2 before admission, and step 5 exits 2', async () => {
+    const events: string[] = [];
+    const command = subject({ bootstrap: async () => { events.push('admission'); } });
+    const disabled = context();
+    assert.equal(await command.execute!(['account-b', '--inject', 'fail-step', '8'], disabled.ctx), 2);
+    assert.deepEqual(events, []);
+    assert.match(disabled.stderr.join('\n'), /QLB_FAULT_INJECTION/);
+
+    const invalid = context();
+    invalid.ctx.env.QLB_FAULT_INJECTION = '1';
+    assert.equal(await command.execute!(['account-b', '--inject', 'fail-step', '5'], invalid.ctx), 2);
+    assert.deepEqual(events, []);
+  });
+
+  it('--inject fail-step 8 rolls back one injected row and emits the injected JSON receipt', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-switch-command-inject-'));
+    const run = context(home);
+    run.ctx.env.QLB_FAULT_INJECTION = '1';
+    mkdirSync(join(home, '.claude'), { recursive: true });
+    const paths = claudePaths({ home, env: run.ctx.env });
+    writeFileSync(paths.globalConfigPath, `${JSON.stringify({ oauthAccount: { accountUuid: 'account-a' } })}\n`);
+    const store = openStore(run.ctx.config.dbPath);
+    const repository = SqliteClaudeSlotRepository.open(run.ctx.config.dbPath);
+    const backend = new MockKeychain();
+    const slots = new ClaudeSlots({ backend, repository, stashDir: join(home, 'unclaimed'), now: () => 1 });
+    const credential = (tag: string) => JSON.stringify({ claudeAiOauth: { accessToken: `fixture-access-${tag}`, refreshToken: `fixture-refresh-${tag}`, expiresAt: 3_600_001 } });
+    try {
+      await slots.createSlot({ accountId: 'account-a', credential: credential('a'), email: 'a@example.test', orgUuid: 'org-a', configJson: JSON.stringify({ oauthAccount: { accountUuid: 'account-a' } }), source: 'cswap-import' });
+      await slots.createSlot({ accountId: 'account-b', credential: credential('b'), email: 'b@example.test', orgUuid: 'org-b', configJson: JSON.stringify({ oauthAccount: { accountUuid: 'account-b' } }), source: 'cswap-import' });
+      await backend.set(paths.keychainService, 'fixture-user', credential('a'));
+      store.setActiveLogin('anthropic', 'account-a', 'manual', 1);
+    } finally {
+      store.close();
+    }
+    const command = createSwitchAnthropicCommand({
+      openStore,
+      bootstrap: async () => {},
+      assertAdmitted: () => ({ ok: true }),
+      makeSwitchDeps: async (_ctx, commandStore, warn) => ({
+        deps: {
+          store: commandStore as ClaudeSwitchDeps['store'], slots, live: { backend, paths, account: 'fixture-user' },
+          readConfig: (path) => JSON.parse(readFileSync(path, 'utf8')),
+          resolveProfile: async () => null,
+          consume: { postRefresh: async () => ({ status: 500, body: '' }), withConsumeLock: async (fn) => fn(), withSwitchLock: async (fn) => fn() },
+          env: run.ctx.env, home, now: () => 1, by: 'qlb-cli', attempt: 'injected-command-attempt', journalOwner: { pid: process.pid, lstart: '' }, warn,
+        },
+      }),
+    });
+    try {
+      assert.equal(await command.execute!(['account-b', '--inject', 'fail-step', '8', '--json'], run.ctx), 1);
+      const receipt = JSON.parse(run.stdout[0]) as { error: string; injected: boolean; steps: { failedStep: number } };
+      assert.deepEqual(receipt, {
+        outcome: 'rolled-back', from: 'account-a', to: 'account-b', switchId: null, attempt: 'injected-command-attempt',
+        reason: 'fault-injection:fail-step-8', error: 'injected', outgoingKind: null,
+        steps: { failedStep: 8, started: [4, 5, 6, 7, 8], reversed: ['config', 7], notLanded: [], restoreFailures: [], cleanup: [] }, injected: true,
+      });
+      const db = openStoreConnection(run.ctx.config.dbPath, true);
+      try {
+        const rows = (db.prepare("SELECT outcome, injected, detail, error FROM switch_log WHERE provider = 'anthropic'").all() as Array<{ outcome: string; injected: number; detail: string; error: string }>).map((row) => ({ ...row }));
+        assert.deepEqual(rows, [{ outcome: 'rolled-back', injected: 1, detail: 'fault-injection:fail-step-8', error: 'injected' }]);
+      } finally { db.close(); }
     } finally {
       repository.close();
     }
