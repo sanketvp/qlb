@@ -155,7 +155,11 @@ export function withPiAuthLock<T>(authPath: string, fn: (refresh: () => void) =>
   if (!acquired) throw lockedError();
   const refresh = () => {
     if (!ownerMatches(lock, owner)) throw lockLostError();
-    utimesSync(lock, new Date(now()), new Date(now()));
+    // A taker may move the lock aside between the owner check and the touch.
+    try { utimesSync(lock, new Date(now()), new Date(now())); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw lockLostError();
+      throw error;
+    }
   };
   try { refresh(); return fn(refresh); } finally { if (ownerMatches(lock, owner)) rmSync(lock, { recursive: true, force: true }); }
 }
@@ -418,8 +422,9 @@ export function rollbackPiSingleProvider(provider: PiSingleProvider, paths: PiMi
     // Always release QLB's managed item once Pi has either retained its own
     // non-placeholder credential or verified a restored one. This makes a
     // retry converge after a prior delete failure.
-    refresh();
+    // The stash checks the lock before its own writes; the delete gets a fresh check after it.
     stashKeptGenericCopy(provider, deps, () => readJournal(paths, provider), refresh);
+    refresh();
     try { deps.keychain.deleteSync(managedService(provider), QLB_KEYCHAIN_ACCOUNT); } catch (error) {
       if (!isCredentialNotFound(error)) throw error;
     }

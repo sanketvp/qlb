@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { describe, it } from 'node:test';
@@ -1152,6 +1152,49 @@ describe('Pi migration S58 credential-first barrier', () => {
       assert.equal(bTookOver, true, 'holder B took over holder A\'s stale lock');
       assert.deepEqual(writes, [], 'holder A must make no write after the takeover');
       assert.throws(() => h.keychain.getSync(kept.stashService, QLB_KEYCHAIN_ACCOUNT), /item not found/);
+    } finally { h.cleanup(); }
+  });
+
+  it('P7a-r: pi rollback makes no managed-item delete after its lock is taken over during the kept-copy stash', () => {
+    const h = setup();
+    try {
+      const kept = plantKeptGenericCopy(h, 'xai');
+      const lockOwner = join(`${h.paths.authJsonPath}.lock`, 'qlb-lock-owner.json');
+      const deletes: string[] = [];
+      const keychain = {
+        setSync(service: string, account: string, value: string) {
+          h.keychain.setSync(service, account, value);
+          // Barrier: holder B takes the lock over right after A's stash write.
+          if (service === kept.stashService) writeFileSync(lockOwner, JSON.stringify({ pid: process.pid, nonce: 'holder-b' }));
+        },
+        getSync: h.keychain.getSync.bind(h.keychain),
+        deleteSync(service: string, account: string) { deletes.push(`${service}/${account}`); h.keychain.deleteSync(service, account); },
+      };
+      assert.throws(
+        () => rollbackPiSingleProvider('xai', h.paths, { keychain, store: h.store }),
+        (error: unknown) => (error as { code?: unknown }).code === 'pi-auth-lock-lost',
+      );
+      assert.deepEqual(deletes, [], 'holder A must not delete the managed item after the takeover');
+      assert.equal(h.keychain.getSync(kept.service, kept.account), kept.kept, 'the shared item is intact');
+      assert.deepEqual(JSON.parse(readFileSync(lockOwner, 'utf8')), { pid: process.pid, nonce: 'holder-b' }, 'B\'s lock is left intact');
+    } finally { h.cleanup(); }
+  });
+
+  it('P7a-r: a lock moved aside between the owner check and the touch reports pi-auth-lock-lost', () => {
+    const h = setup();
+    try {
+      const lock = `${h.paths.authJsonPath}.lock`;
+      let moveAside = false;
+      const now = () => {
+        // Barrier: refresh() reads now() after its owner check and before utimesSync.
+        if (moveAside) { moveAside = false; renameSync(lock, `${lock}.stale-taker`); }
+        return 10_000;
+      };
+      assert.throws(
+        () => withPiAuthLock(h.paths.authJsonPath, (refresh) => { moveAside = true; refresh(); }, { now }),
+        (error: unknown) => (error as { code?: unknown }).code === 'pi-auth-lock-lost',
+      );
+      assert.equal(existsSync(`${lock}.stale-taker`), true, 'the moved-aside lock is not removed by the old holder');
     } finally { h.cleanup(); }
   });
 
