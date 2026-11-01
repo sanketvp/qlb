@@ -255,6 +255,9 @@ function collect(child: ChildProcess): { stdout: string; stderr: string } {
 
 function waitExit(child: ChildProcess, timeoutMs = 15_000): Promise<number> {
   return new Promise((resolve, reject) => {
+    // The child may have exited before we were called; its 'exit' event is already gone.
+    if (child.exitCode !== null) { closePipes(child); resolve(child.exitCode); return; }
+    if (child.signalCode !== null) { closePipes(child); resolve(128); return; }
     const t = setTimeout(() => {
       try { child.kill('SIGKILL'); } catch { /* ignore */ }
       closePipes(child);
