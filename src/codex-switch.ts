@@ -45,7 +45,8 @@ type CodexObservationKeychain = Pick<KeychainBackend, 'getSync' | 'setSync' | 'd
 
 export interface CodexSwitchDeps {
   store: Pick<Store, 'getCodexActiveLogin' | 'getCodexSlot' | 'getConfig' | 'hasConfig' | 'recordSwitch'
-    | 'recordCodexObservation' | 'setActiveLogin' | 'commitCodexSwitch' | 'findCodexSwitchByAttempt'> & CodexAttributionStore;
+    | 'recordCodexObservation' | 'setActiveLogin' | 'commitCodexSwitch' | 'findCodexSwitchByAttempt'
+    | 'setRecoveryFence' | 'clearRecoveryFence' | 'commitFenceResolution'> & CodexAttributionStore;
   readLive: () => Promise<CodexAuthStableWithStatResult>;
   cswapProcesses: () => CswapProcess[];
   now: () => number;
@@ -75,6 +76,8 @@ export interface CodexSwitchDeps {
   /** Owner identity is injected by the command/test harness; a journal only needs it if it survives this attempt. */
   journalOwner?: Pick<CodexProcess, 'pid' | 'lstart'>;
   journalOptions?: CodexSwitchJournalOptions;
+  /** Fixture-only crash checkpoints in reconciliation. */
+  crashAt?: (checkpoint: string) => void;
 }
 
 /**
@@ -715,6 +718,20 @@ function codexRecoveryFenceMessage(reason: string): string {
   return `Codex switch recovery needs you (${reason}): log in to Codex with the account you want (codex login), then run qlb codex import-active. QLB finishes the recovery at its next check.`;
 }
 
+/** §3.1's "needs you" text is only for unresolved fences; an attempt still in flight finishes without the operator. */
+function codexInFlightMessage(reason: string): string {
+  return `codex refresh refused: ${reason} (a Codex switch involving this account has not finished)`;
+}
+
+/** The switch row's recorded `open_sessions_json` (§3 aliveBefore snapshot); an unreadable record names no holder. */
+function recordedOpenSessions(json: string | null | undefined): CodexProcess[] {
+  if (!json) return [];
+  try {
+    const value: unknown = JSON.parse(json);
+    return Array.isArray(value) ? value.filter(isCodexProcess).map(({ pid, lstart, host }) => ({ pid, lstart, host })) : [];
+  } catch { return []; }
+}
+
 function unionRecoveryAccounts(...accounts: Array<string[] | '*'>): Set<string> | '*' {
   if (accounts.includes('*')) return '*';
   return new Set(accounts.flat());
@@ -748,7 +765,7 @@ export function codexRecoveryFenceState(
       // §3.1's "needs you" text is for unresolved fences; a journal still in
       // flight finishes or is recovered without the operator.
       const reason = 'switch-in-flight';
-      return { state: 'fenced', accounts, reason, message: `codex refresh refused: ${reason} (a Codex switch involving this account has not finished)` };
+      return { state: 'fenced', accounts, reason, message: codexInFlightMessage(reason) };
     }
     return { state: 'fenced', accounts, reason: unresolved.reason, message: codexRecoveryFenceMessage(unresolved.reason) };
   }
@@ -1043,10 +1060,255 @@ function openSessionsJson(deps: CodexSwitchDeps, sessions: CodexProcess[]): stri
   }));
 }
 
+/** C6-20: roll a durable journal forward, but never guess through a fence. */
+export async function reconcileCodexRecoveryLocked(
+  deps: CodexSwitchDeps,
+  assertHeld: () => void,
+): Promise<{ state: 'clear' } | { state: 'fenced'; reason: string; message: string; accounts: Set<string> | '*'; retryAt?: number }> {
+  if (!deps.journalDir || !deps.slots || !deps.keychain || !deps.list) throw new Error('Codex recovery dependencies are required');
+  const slots = deps.slots;
+  const keychain = deps.keychain;
+  const list = deps.list;
+  const options: CodexSwitchJournalOptions = { ...deps.journalOptions, journalDir: deps.journalDir, now: deps.now };
+  const fenced = (reason: string, accounts: Set<string> | '*', retryAt?: number, message = codexRecoveryFenceMessage(reason)) => ({
+    state: 'fenced' as const, reason, accounts, message,
+    ...(retryAt === undefined ? {} : { retryAt }),
+  });
+  const accountSet = (journal: CodexSwitchJournal, involved: string[] | '*' = []): Set<string> | '*' =>
+    involved === '*' ? '*' : new Set([journal.from, journal.to, ...involved]);
+  /** Slot B's document, or undefined when `tolerate` and its Keychain item is missing or unreadable. */
+  const readTargetSlot = (accountId: string, tolerate: boolean): CodexAuthDocument | undefined => {
+    try { return slots.readSlot(accountId, { fresh: true }).document; }
+    catch (error) { if (tolerate) return undefined; throw error; }
+  };
+  /**
+   * Without attribution, a slot's SQLite head may only resolve recovery when its Keychain copy
+   * backs it (read fresh): a missing, unreadable or different copy is a split and maps to null.
+   */
+  const verifySlotHeads = (slotHeads: Map<string, string | null>): void => {
+    for (const [accountId, head] of slotHeads) {
+      if (head === null) continue;
+      let keychainFp: string | null;
+      try { keychainFp = codexFingerprint(slots.readSlot(accountId, { fresh: true }).document); } catch { keychainFp = null; }
+      if (keychainFp !== head) slotHeads.set(accountId, null);
+    }
+  };
+
+  const resolveJournal = async (journal: CodexSwitchJournal, held: HeldCodexSwitchJournalOwner): Promise<ReturnType<typeof fenced> | { state: 'clear' }> => {
+    assertHeld(); held.assertHeld();
+    if (deps.store.findCodexSwitchByAttempt(journal.attemptId)) {
+      deleteCodexSwitchJournalIf(deps.journalDir!, journal.attemptId, held, options);
+      return { state: 'clear' };
+    }
+    const observed = await deps.readLive();
+    const targetRow = deps.store.getCodexSlot(journal.to);
+    const classified = classifyPostPublish({ journal, observed, targetSlotFp: targetRow?.fingerprint ?? '' });
+    // §3.1: an unstable or unreadable read is pending, target-changed included; nothing is written.
+    if (classified === 'target-changed' && (observed.status === 'unstable' || observed.status === 'unreadable')) {
+      return fenced(`journal-verify-${observed.status}`, accountSet(journal, journal.unresolved?.involvedAccounts));
+    }
+    const live = observed.status === 'ok' ? observed.doc : undefined;
+    const liveIdentity = live ? codexIdentity(live) : null;
+    const slotHeads = new Map<string, string | null>();
+    for (const accountId of [journal.from, journal.to]) slotHeads.set(accountId, deps.store.getCodexSlot(accountId)?.fingerprint ?? null);
+    if (liveIdentity) slotHeads.set(liveIdentity, deps.store.getCodexSlot(liveIdentity)?.fingerprint ?? null);
+    let attribution: CodexPhaseAttribution | undefined;
+    // A classified ok with B moved by a recorded adoption is decided by its attribution (§3.1).
+    const targetMoved = (targetRow?.fingerprint ?? '') !== journal.target.fingerprint;
+    const attribute = (typeof classified === 'object' && classified.status === 'external') || classified === 'target-changed'
+      || (classified === 'ok' && targetMoved);
+    // With no live document (wiped, missing, unstable, unreadable) or no slot B there is nothing to
+    // attribute: the verdict fences, or is pending, without it.
+    // A target-changed attempt can resolve without attribution (§3.1), so an unreadable slot B
+    // only makes attribution unavailable: B then has no established head.
+    const target = attribute && live && targetRow ? readTargetSlot(journal.to, classified === 'target-changed') : undefined;
+    if (attribute && live && targetRow && !target) {
+      slotHeads.set(journal.to, null);
+      verifySlotHeads(slotHeads);
+    }
+    if (target && live && targetRow) {
+      const targetFp = codexFingerprint(target);
+      const history = deps.dbPath ? readCodexSwitchHistory(deps.dbPath, { journalDir: deps.journalDir }) : { rows: [], observations: [] };
+      const currentSessions = await list();
+      attribution = await attributeForPhase({ assertHeld }, 'recovery', {
+        store: deps.store, keychain, slot: { accountId: journal.to, document: target, fingerprint: targetRow?.fingerprint ?? undefined },
+        activeSlotId: journal.from, activeSetBy: 'adopt', live,
+        holderObservation: {
+          aliveBefore: liveIdentity !== null && renewers(codexIdentityParts(liveIdentity), journal.openSessions, history.rows, history.observations).length > 0,
+          aliveAfter: liveIdentity !== null && renewers(codexIdentityParts(liveIdentity), currentSessions, history.rows, history.observations).length > 0,
+        },
+        l40Verified: deps.store.getConfig('codex.l40Verified') === '1', now: deps.now,
+        beforeSave: (_db, _dbPath, slotId) => {
+          if (slotId !== journal.to || codexFingerprint(live) === targetFp) return undefined;
+          assertHeld(); held.assertHeld();
+          if (!markCodexSwitchJournalAdoptingTarget(held, journal.attemptId, codexFingerprint(live), options)) {
+            throw new Error('Codex switch journal changed before recovery target adoption');
+          }
+          return undefined;
+        },
+      });
+      if (attribution.action === 'unclaimed') {
+        try { await slots.ensureUnclaimedStash!(live, deps.now()); }
+        catch (error) {
+          if (error instanceof CodexStashUnverifiable) attribution = { action: 'stash-unverifiable' };
+          else throw error;
+        }
+      }
+      slotHeads.set(journal.to, deps.store.getCodexSlot(journal.to)?.fingerprint ?? null);
+      if (liveIdentity) slotHeads.set(liveIdentity, deps.store.getCodexSlot(liveIdentity)?.fingerprint ?? null);
+    }
+    const verdict = resolveRecoveryVerdict(classified, attribution, {
+      phase: 'recovery', journal, targetSlotFingerprint: deps.store.getCodexSlot(journal.to)?.fingerprint ?? '', slotHeads, live,
+    });
+    if (verdict.class === 'pending') return fenced(`journal-verify-${verdict.status}`, accountSet(journal, journal.unresolved?.involvedAccounts));
+    if (verdict.class === 'unresolved') {
+      assertHeld(); held.assertHeld();
+      if (!markCodexSwitchJournalUnresolved(held, journal.attemptId, verdict.reason, verdict.involvedAccounts, options)) {
+        throw new Error('Codex switch journal changed before recovery unresolved mark');
+      }
+      // §3.1: the fenced set is unioned and never shrinks until cleared.
+      return fenced(verdict.reason, unionRecoveryAccounts([journal.from, journal.to],
+        journal.unresolved?.involvedAccounts ?? [], verdict.involvedAccounts));
+    }
+    const effect = verdict.effect;
+    const activeAccountId = 'activeAccountId' in effect ? effect.activeAccountId : undefined;
+    // C6-Q2: a resolved target-changed records the slot whose head the live file equals.
+    const liveSlot = effect.outcome === 'failed' && effect.detail === 'target-changed' && live
+      ? [...slotHeads].find(([, head]) => head === codexFingerprint(live))?.[0] : undefined;
+    const accountId = effect.outcome === 'ok' ? journal.to : effect.outcome === 'reverted-by-codex' ? effect.accountId
+      : liveSlot ?? (activeAccountId === null ? null : journal.from);
+    const outcome: CodexSwitchResult['outcome'] = effect.outcome === 'quiet' ? 'ok' : effect.outcome === 'stopped' ? 'failed' : effect.outcome;
+    const detail = effect.outcome === 'failed' ? effect.detail : effect.outcome === 'stopped' ? effect.reason : null;
+    assertHeld(); held.assertHeld(); deps.crashAt?.('recovery-before-commit');
+    // §3.1: a revert moves active_login to the slot found in the file (`adopt`); C6-Q2 likewise.
+    const setBy = liveSlot || effect.outcome === 'reverted-by-codex' ? 'adopt' : 'journal';
+    deps.store.commitCodexSwitch({ now: deps.now(), accountId, setBy, fromAccount: journal.from, toAccount: journal.to,
+      trigger: journal.trigger, outcome, attempt: journal.attemptId, via: 'journal', openSessionsJson: openSessionsJson(deps, journal.openSessions),
+      publishedAt: detail === 'not-published' ? null : journal.publishedAt, committedAt: deps.now(), detail,
+      outgoing: journal.from, target: journal.to,
+      observation: live ? { identity: liveIdentity, lineageFp: codexFingerprint(live) } : { identity: null, lineageFp: null },
+      decision: { leftHeadroom: journal.decision?.leftHeadroom ?? null, leftRecoveryAt: journal.decision?.leftRecoveryAtMs ?? null,
+        leftTrigger: journal.decision?.leftTrigger ?? null } });
+    assertHeld(); held.assertHeld(); deps.crashAt?.('recovery-after-commit');
+    deleteCodexSwitchJournalIf(deps.journalDir!, journal.attemptId, held, options);
+    return { state: 'clear' };
+  };
+
+  const probe = await probeCodexSwitchJournal(options, ({ journal, held }) => resolveJournal(journal, held));
+  if (probe.state === 'malformed') return fenced('switch-recovery-malformed', '*');
+  if (probe.state === 'in-progress') {
+    return fenced('journal-in-progress', accountSet(probe.journal, probe.journal.unresolved?.involvedAccounts), undefined,
+      codexInFlightMessage('journal-in-progress'));
+  }
+  if (probe.state === 'owner-lock-not-yet-stale') {
+    return fenced('journal-owner-lock-not-yet-stale', accountSet(probe.journal, probe.journal.unresolved?.involvedAccounts), probe.retryAt,
+      codexInFlightMessage('journal-owner-lock-not-yet-stale'));
+  }
+  // A resolved journal does not clear a config fence that is also stored: go on to it.
+  if (probe.state === 'orphaned' && probe.result?.state === 'fenced') return probe.result;
+
+  const fence = parseCodexRecoveryFence(deps.store.getConfig('codex.recoveryFence'));
+  if (deps.store.hasConfig('codex.recoveryFence') && fence === null) return fenced('switch-recovery-malformed', '*');
+  if (fence === null) return { state: 'clear' };
+  // A config fence has no credential bytes. Its switch row supplies context;
+  // the current B head is deliberately re-read under these locks.
+  const targetRow = deps.store.getCodexSlot(fence.to);
+  const pseudoJournal: CodexSwitchJournal = { v: 2, attemptId: fence.attempt, from: fence.from, to: fence.to,
+    target: { identity: codexIdentityParts(fence.to), fingerprint: targetRow?.fingerprint ?? '' }, adoptingTarget: [], trigger: 'manual', decision: null,
+    openSessions: [], outgoing: { sha256: '', inode: -1 }, publishedAt: fence.publishedAt,
+    owner: { pid: 1, lstart: 'fence', state: 'released' } };
+  const observed = await deps.readLive();
+  const live = observed.status === 'ok' ? observed.doc : undefined;
+  const liveIdentity = live ? codexIdentity(live) : null;
+  const slotHeads = new Map<string, string | null>([[fence.from, deps.store.getCodexSlot(fence.from)?.fingerprint ?? null], [fence.to, targetRow?.fingerprint ?? null]]);
+  if (liveIdentity) slotHeads.set(liveIdentity, deps.store.getCodexSlot(liveIdentity)?.fingerprint ?? null);
+  // A fence has no journaled target fingerprint, so a target-changed fence stays target-changed:
+  // it resolves only once live equals a current slot head (§3.1, C6-Q2).
+  // An unstable or unreadable read stays pending even for a target-changed fence (§3.1).
+  const transient = observed.status === 'unstable' || observed.status === 'unreadable';
+  const classified: CodexPostPublishClassification = fence.reason === 'target-changed' && !transient ? 'target-changed'
+    : classifyPostPublish({ journal: pseudoJournal, observed, targetSlotFp: targetRow?.fingerprint ?? '' });
+  const fencedAccounts = unionRecoveryAccounts([fence.from, fence.to], fence.involvedAccounts);
+  let attribution: CodexPhaseAttribution | undefined;
+  const attribute = ((typeof classified === 'object' && classified.status === 'external') || classified === 'target-changed') && live && targetRow;
+  // An unreadable slot B makes attribution unavailable: B has no established head, and a fence
+  // that needs attribution to resolve is kept as stored, with no write.
+  const target = attribute ? readTargetSlot(fence.to, true) : undefined;
+  if (attribute && !target) {
+    if (classified !== 'target-changed') {
+      // §3.1: the live identity's managed slot is fenced whatever the attribution says.
+      if (liveIdentity && deps.store.getCodexSlot(liveIdentity) && fencedAccounts !== '*' && !fencedAccounts.has(liveIdentity)) {
+        assertHeld();
+        deps.store.setRecoveryFence({ ...fence, involvedAccounts: [liveIdentity] });
+        const stored = parseCodexRecoveryFence(deps.store.getConfig('codex.recoveryFence'));
+        return fenced(stored?.reason ?? fence.reason, unionRecoveryAccounts([fence.from, fence.to], stored?.involvedAccounts ?? '*'));
+      }
+      return fenced(fence.reason, fencedAccounts);
+    }
+    slotHeads.set(fence.to, null);
+    verifySlotHeads(slotHeads);
+  }
+  if (target && live && targetRow) {
+    // §3 holder evidence: aliveBefore from the fence's switch row snapshot, aliveAfter from the current list().
+    const history = deps.dbPath ? readCodexSwitchHistory(deps.dbPath, { journalDir: deps.journalDir }) : { rows: [], observations: [] };
+    const recorded = recordedOpenSessions(history.rows.find((row) => row.id === fence.switchId)?.open_sessions_json);
+    const currentSessions = await list();
+    attribution = await attributeForPhase({ assertHeld }, 'recovery', { store: deps.store, keychain,
+      slot: { accountId: fence.to, document: target, fingerprint: targetRow.fingerprint ?? undefined }, activeSlotId: fence.from,
+      activeSetBy: 'adopt', live, holderObservation: {
+        aliveBefore: liveIdentity !== null && renewers(codexIdentityParts(liveIdentity), recorded, history.rows, history.observations).length > 0,
+        aliveAfter: liveIdentity !== null && renewers(codexIdentityParts(liveIdentity), currentSessions, history.rows, history.observations).length > 0,
+      },
+      l40Verified: deps.store.getConfig('codex.l40Verified') === '1', now: deps.now });
+    if (attribution.action === 'unclaimed') {
+      try { await slots.ensureUnclaimedStash!(live, deps.now()); }
+      catch (error) { if (error instanceof CodexStashUnverifiable) attribution = { action: 'stash-unverifiable' }; else throw error; }
+    }
+    slotHeads.set(fence.to, deps.store.getCodexSlot(fence.to)?.fingerprint ?? null);
+    if (liveIdentity) slotHeads.set(liveIdentity, deps.store.getCodexSlot(liveIdentity)?.fingerprint ?? null);
+  }
+  const verdict = resolveRecoveryVerdict(classified, attribution, { phase: 'recovery', journal: pseudoJournal,
+    targetSlotFingerprint: deps.store.getCodexSlot(fence.to)?.fingerprint ?? '', slotHeads, live });
+  if (verdict.class === 'pending') {
+    return fenced(`journal-verify-${verdict.status}`, fencedAccounts);
+  }
+  if (verdict.class === 'unresolved') {
+    assertHeld();
+    deps.store.setRecoveryFence({ ...fence, reason: verdict.reason, involvedAccounts: verdict.involvedAccounts, since: fence.since });
+    // Report what was stored (the store keeps a target-changed reason and unions the set), so this
+    // call and later codexRecoveryFenceState reads agree.
+    const stored = parseCodexRecoveryFence(deps.store.getConfig('codex.recoveryFence'));
+    return fenced(stored?.reason ?? verdict.reason,
+      unionRecoveryAccounts([fence.from, fence.to], fence.involvedAccounts, verdict.involvedAccounts, stored?.involvedAccounts ?? []));
+  }
+  const effect = verdict.effect;
+  // C6-Q2: a resolved target-changed records the slot whose head the live file equals.
+  const liveSlot = effect.outcome === 'failed' && effect.detail === 'target-changed' && live
+    ? [...slotHeads].find(([, head]) => head === codexFingerprint(live))?.[0] : undefined;
+  const setActive = effect.outcome === 'reverted-by-codex' ? effect.accountId
+    : liveSlot ?? ('activeAccountId' in effect && effect.activeAccountId === null ? null : undefined);
+  deps.crashAt?.('recovery-before-fence-commit');
+  assertHeld();
+  deps.store.commitFenceResolution({ fence, effect: effect as Parameters<Store['commitFenceResolution']>[0]['effect'], setActive,
+    attempt: fence.attempt, now: deps.now() });
+  return { state: 'clear' };
+}
+
+/** Take switch → auth, then perform the sole journal/fence clearing path. */
+export async function reconcileCodexRecovery(deps: CodexSwitchDeps): Promise<Awaited<ReturnType<typeof reconcileCodexRecoveryLocked>>> {
+  // No durable artifact means there is nothing to clear. This fast read avoids
+  // serializing ordinary switches; a journal racing in after it is still seen
+  // by freshen/phase L under the switch lock.
+  if (deps.journalDir && codexRecoveryFenceState(deps.journalDir, deps.store).state === 'none') return { state: 'clear' };
+  return withCodexSwitchLocks(deps, (assertHeld) => reconcileCodexRecoveryLocked(deps, assertHeld));
+}
+
 /** C6-18: switch through the journaled publication; C6-20 supplies recovery. */
 export async function switchCodex(deps: CodexSwitchDeps, input: SwitchCodexInput): Promise<CodexSwitchResult> {
   const admitted = await deps.admitted?.() ?? { ok: true };
   if (!admitted.ok) return switchResult(admitted.reason ?? 'not-admitted');
+  const recovery = await reconcileCodexRecovery(deps);
+  if (recovery.state === 'fenced') return switchResult(recovery.reason, recovery.message);
   const preflight = await preflightCodexLive(deps);
   if (preflight.kind === 'refused') return switchResult(preflight.reason);
   const preconditions = checkCodexSwitchPreconditions(deps, input);

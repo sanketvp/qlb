@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { existsSync, fsyncSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { describe, it } from 'node:test';
 
@@ -10,6 +11,8 @@ import {
   checkCodexSwitchPreconditions,
   classifyPostPublish,
   resolveRecoveryVerdict,
+  reconcileCodexRecovery,
+  reconcileCodexRecoveryLocked,
   switchCodex,
   codexRecoveryFenceState,
   freshenCodexTarget,
@@ -38,7 +41,8 @@ import { codexLockPaths, consumeCodexSlot, withCodexSwitchLock } from '../src/co
 import { accessExpiry, codexFingerprint, codexIdentity, readCodexAuthStable, readCodexAuthStableWithStat, writeCodexAuthAtomic, type CodexAuthDocument } from '../src/codex-auth';
 import { CodexStashUnverifiable, importActiveCodexSlot } from '../src/codex-slots';
 import { MockKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from '../src/keychain';
-import { stillTheSameProcess, type CodexProcess } from '../src/codex-sessions';
+import { holderSets, readCodexSwitchHistory, stillTheSameProcess, type CodexProcess } from '../src/codex-sessions';
+import { consumeUnderCodexLocks, runCodexRefreshCommand } from '../src/commands/codex-refresh';
 import { runCodexImportActiveCommand } from '../src/commands/codex-import-active';
 import type { CommandContext } from '../src/registry';
 import { beginCutover } from '../src/lifecycle';
@@ -223,7 +227,14 @@ function switchHarness() {
     authLockOptions: { home: h.root, timeoutMs: 50, retryMinMs: 1, retryJitterMs: 1 }, keychain, slots: slots as never,
     list: async () => [], transport: async () => { throw new Error('unexpected transport'); }, readLive: () => readCodexAuthStableWithStat(authPath, { delayMs: 0 }), now: () => tick++,
     journalOwner: { pid: process.pid, lstart: 'fixture-owner' }, attempt: 'switch-attempt', ...overrides }), input);
-  return { ...h, authPath, a, b, keychain, slots, run: () => runWith(), runWith };
+  const recover = (overrides: Partial<CodexSwitchDeps> = {}) => reconcileCodexRecovery(h.deps({ authPath, dbPath: h.store.dbPath, journalDir: join(h.root, 'journal'),
+    authLockOptions: { home: h.root, timeoutMs: 50, retryMinMs: 1, retryJitterMs: 1 }, keychain, slots: slots as never,
+    list: async () => [], transport: async () => { throw new Error('unexpected transport'); }, readLive: () => readCodexAuthStableWithStat(authPath, { delayMs: 0 }), now: () => tick++,
+    journalOwner: { pid: process.pid, lstart: 'fixture-owner' }, attempt: 'recovery-attempt', ...overrides }));
+  const recoverLocked = (assertHeld: () => void, overrides: Partial<CodexSwitchDeps> = {}) => reconcileCodexRecoveryLocked(h.deps({ authPath,
+    dbPath: h.store.dbPath, journalDir: join(h.root, 'journal'), keychain, slots: slots as never, list: async () => [],
+    readLive: () => readCodexAuthStableWithStat(authPath, { delayMs: 0 }), now: () => tick++, attempt: 'recovery-attempt', ...overrides }), assertHeld);
+  return { ...h, authPath, a, b, keychain, slots, run: () => runWith(), runWith, recover, recoverLocked };
 }
 
 describe('Codex switch preflight and preconditions', () => {
@@ -2160,5 +2171,816 @@ describe('switchCodex landed and not-landed — C6-18', () => {
       assert.equal((await h.runWith({ attempt: 'switch-attempt-2' })).outcome, 'ok');
       assert.equal(liveIdentity(h.authPath), 'b:account');
     } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+});
+
+function recoveryJournal(h: ReturnType<typeof switchHarness>, attemptId = 'recovery-journal'): CodexSwitchJournal {
+  const bytes = readFileSync(h.authPath);
+  return { v: 2, attemptId, from: 'a:account', to: 'b:account', target: { identity: { chatgpt_user_id: 'b', account_id: 'account' }, fingerprint: codexFingerprint(h.b) }, adoptingTarget: [], trigger: 'manual', decision: null, openSessions: [], outgoing: { sha256: `sha256-file:${createHash('sha256').update(bytes).digest('hex')}`, inode: statSync(h.authPath).ino }, publishedAt: 1_700_000_000_100, owner: { pid: process.pid, lstart: 'fixture-owner', state: 'released' } };
+}
+
+describe('reconcileCodexRecovery — C6-20', () => {
+  type Harness = ReturnType<typeof switchHarness>;
+  const recoveryMessage = (reason: string) => `Codex switch recovery needs you (${reason}): log in to Codex with the account you want (codex login), then run qlb codex import-active. QLB finishes the recovery at its next check.`;
+  const journalDir = (h: Harness) => join(h.root, 'journal');
+  const install = (h: Harness, j = recoveryJournal(h)) => { writeCodexSwitchJournal(j, { journalDir: journalDir(h) }); return j; };
+  const close = (h: Harness) => { h.store.close(); rmSync(h.root, { recursive: true, force: true }); };
+  const onDisk = (h: Harness) => readCodexSwitchJournal({ journalDir: journalDir(h) });
+  const lastRow = (h: Harness) => ({ ...(h.db.prepare(`SELECT from_account, to_account, trigger, outcome, detail, published_at, steps_json
+    FROM switch_log ORDER BY id DESC LIMIT 1`).get() as object) });
+  const activeLogin = (h: Harness) => ({ ...(h.db.prepare("SELECT account_id, set_by FROM active_login WHERE provider = 'openai-codex'").get() as object) });
+  const liveFp = (h: Harness) => codexFingerprint(JSON.parse(readFileSync(h.authPath, 'utf8')) as CodexAuthDocument);
+  const slotFps = (h: Harness, id: string) => ({ db: h.store.getCodexSlot(id)?.fingerprint, keychain: h.slots.readSlot(id).fingerprint });
+  const fenced = (result: { state: string; accounts?: Set<string> | '*' }) =>
+    ({ ...result, accounts: result.accounts === '*' ? '*' : [...(result.accounts ?? [])].sort() });
+  const unresolvedJournal = (h: Harness) => {
+    const read = onDisk(h);
+    return read.state === 'ok'
+      ? { attempt: read.journal.attemptId, reason: read.journal.unresolved?.reason, accounts: read.journal.unresolved?.involvedAccounts }
+      : read;
+  };
+  /** Codex's own save: new bytes at a new inode. */
+  const codexWrites = (h: Harness, doc: CodexAuthDocument) => {
+    const temp = `${h.authPath}.codex-save`;
+    writeFileSync(temp, JSON.stringify(doc));
+    renameSync(temp, h.authPath);
+  };
+  /** `qlb codex refresh <id> --force` with the production fence read under the locks (C6-12), a fake slot and a counting transport. */
+  const refresh = async (h: Harness, accountId: string) => {
+    let posts = 0; let writes = 0; const errors: string[] = [];
+    const document = h.slots.readSlot(accountId).document;
+    const code = await runCodexRefreshCommand([accountId, '--force'], {
+      getConfig: h.store.getConfig.bind(h.store),
+      consume: async () => consumeUnderCodexLocks(h.store.dbPath, accountId, async (assertHeld) => {
+        const fence = codexRecoveryFenceState(journalDir(h), h.store);
+        const result = await consumeCodexSlot({
+          accountId, snapshot: document, trigger: 'force', force: true, assertHeld, holders: async () => [],
+          slots: { readSlot: () => ({ document, fingerprint: codexFingerprint(document) }), writeSlot: () => { writes += 1; }, stashUnclaimed: () => 'unused' },
+          inFlightSlots: fence.state === 'fenced' ? fence.accounts : undefined,
+          transport: async () => { posts += 1; return { status: 500, body: '{}' }; },
+        });
+        return result.status === 'switch-in-flight' && fence.state === 'fenced' ? { ...result, message: fence.message } : result;
+      }),
+      write: () => {}, error: (line) => { errors.push(line); },
+    });
+    return { code, posts, writes, errors };
+  };
+  const refused = (reason: string) => ({ code: 3, posts: 0, writes: 0, errors: [recoveryMessage(reason)] });
+  const viaJournal = (j: CodexSwitchJournal, outcome: string, detail: string | null, publishedAt: number | null = j.publishedAt) => ({
+    from_account: j.from, to_account: j.to, trigger: j.trigger, outcome, detail, published_at: publishedAt,
+    steps_json: JSON.stringify({ attempt: j.attemptId, via: 'journal' }),
+  });
+
+  it('kill before the rename ⇒ recovery records failed not-published and holderSets open no era for B', async () => {
+    const h = switchHarness();
+    const holdersOfB = () => {
+      const history = readCodexSwitchHistory(h.store.dbPath, { journalDir: journalDir(h) });
+      return holderSets(history.rows, history.observations).filter((set) => set.identities.includes('b:account'));
+    };
+    try {
+      const j = install(h);
+      // While the journal stands, B is a possible holder (I12).
+      assert.notEqual(holdersOfB().length, 0);
+      assert.deepEqual(await h.recover(), { state: 'clear' });
+      assert.equal(switchRows(h.db).length, 1);
+      assert.deepEqual(lastRow(h), viaJournal(j, 'failed', 'not-published', null));
+      assert.deepEqual(holdersOfB(), []);
+      assert.equal(onDisk(h).state, 'absent');
+      assert.equal(liveFp(h), codexFingerprint(h.a));
+      assert.equal((activeLogin(h) as { account_id: string }).account_id, 'a:account');
+    } finally { close(h); }
+  });
+
+  it('kill after the rename ⇒ recovery commits ok with the journaled published_at and attempt', async () => {
+    const h = switchHarness();
+    try {
+      const j = recoveryJournal(h);
+      writeFileSync(h.authPath, JSON.stringify(h.b));
+      install(h, j);
+      assert.deepEqual(await h.recover(), { state: 'clear' });
+      assert.equal(switchRows(h.db).length, 1);
+      assert.deepEqual(lastRow(h), viaJournal(j, 'ok', null));
+      assert.deepEqual(activeLogin(h), { account_id: 'b:account', set_by: 'journal' });
+      assert.equal(scalarCount(h.db, "SELECT COUNT(*) AS count FROM codex_watch WHERE outgoing = 'a:account' AND target = 'b:account'"), 1);
+      assert.equal(onDisk(h).state, 'absent');
+      assert.equal(liveFp(h), codexFingerprint(h.b));
+    } finally { close(h); }
+  });
+
+  it('kill after the rename then A′ ⇒ recovery records reverted-by-codex and the file holds A′', async () => {
+    const h = switchHarness();
+    try {
+      const aPrime = observedDocument('a', 'recovery-a');
+      const j = install(h);
+      writeFileSync(h.authPath, JSON.stringify(aPrime));
+      assert.deepEqual(await h.recover(), { state: 'clear' });
+      assert.deepEqual(lastRow(h), viaJournal(j, 'reverted-by-codex', null));
+      assert.equal(readFileSync(h.authPath, 'utf8'), JSON.stringify(aPrime));
+      assert.deepEqual(slotFps(h, 'a:account'), { db: codexFingerprint(aPrime), keychain: codexFingerprint(aPrime) });
+      assert.deepEqual(slotFps(h, 'b:account'), { db: codexFingerprint(h.b), keychain: codexFingerprint(h.b) });
+      assert.equal((activeLogin(h) as { account_id: string }).account_id, 'a:account');
+      assert.equal(onDisk(h).state, 'absent');
+    } finally { close(h); }
+  });
+
+  it('kill after commit ⇒ recovery deletes the journal and adds no row', async () => {
+    const h = switchHarness();
+    try {
+      const j = install(h);
+      h.store.commitCodexSwitch({ now: 2, accountId: j.to, setBy: 'journal', fromAccount: j.from, toAccount: j.to, trigger: j.trigger,
+        outcome: 'ok', attempt: j.attemptId, via: 'journal', openSessionsJson: '[]', publishedAt: j.publishedAt, committedAt: 2,
+        outgoing: j.from, target: j.to, observation: { identity: j.to, lineageFp: j.target.fingerprint },
+        decision: { leftHeadroom: null, leftRecoveryAt: null, leftTrigger: null } });
+      const rows = switchRows(h.db);
+      const active = activeLogin(h);
+      const observations = scalarCount(h.db, 'SELECT COUNT(*) AS count FROM codex_live_observations');
+      // The attempt row exists, so recovery only deletes: it does not read auth.json again.
+      const result = await h.recover({ readLive: async () => { throw new Error('a committed attempt is not re-verified'); } });
+      assert.deepEqual(result, { state: 'clear' });
+      assert.equal(onDisk(h).state, 'absent');
+      assert.deepEqual(switchRows(h.db), rows);
+      assert.deepEqual(activeLogin(h), active);
+      assert.equal(scalarCount(h.db, 'SELECT COUNT(*) AS count FROM codex_live_observations'), observations);
+    } finally { close(h); }
+  });
+
+  it('a crash inside the post-publish adopt is finished by recovery with one adopt row and is not target-changed', async () => {
+    const service = qlbKeychainService('openai-codex', 'b:account');
+    // The post-publish adopt marks adoptingTarget, writes the Keychain, then commits SQLite (C6-19).
+    for (const crash of ['after the Keychain write', 'after the SQLite commit'] as const) {
+      const h = switchHarness();
+      try {
+        const bPrime = observedDocument('b', 'b-rotated');
+        const j = recoveryJournal(h);
+        j.adoptingTarget = [codexFingerprint(bPrime)];
+        // Codex rotated the published B to B′ before the verify read.
+        writeFileSync(h.authPath, JSON.stringify(bPrime));
+        if (crash === 'after the Keychain write') {
+          h.keychain.setSync(`${service}:prev`, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(h.b));
+          h.keychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(bPrime));
+        } else {
+          await attributeForPhase({ assertHeld: () => undefined }, 'post', { store: h.store, keychain: h.keychain,
+            slot: { accountId: 'b:account', document: h.b, fingerprint: codexFingerprint(h.b) }, activeSlotId: 'a:account',
+            activeSetBy: 'adopt', live: bPrime, holderObservation: { aliveBefore: true, aliveAfter: false }, now: () => 3 });
+          // Slot B no longer equals the journaled target: only adoptingTarget keeps it from target-changed.
+          assert.equal(classifyPostPublish({ journal: { ...j, adoptingTarget: [] },
+            observed: await readCodexAuthStableWithStat(h.authPath, { delayMs: 0 }),
+            targetSlotFp: h.store.getCodexSlot('b:account')!.fingerprint! }), 'target-changed');
+        }
+        install(h, j);
+        assert.deepEqual(await h.recover(), { state: 'clear' }, crash);
+        assert.equal(scalarCount(h.db, "SELECT COUNT(*) AS count FROM lineage_log WHERE cause = 'adopt' AND account_id = 'b:account'"), 1, crash);
+        assert.deepEqual(lastRow(h), viaJournal(j, 'ok', null), crash);
+        assert.deepEqual(slotFps(h, 'b:account'), { db: codexFingerprint(bPrime), keychain: codexFingerprint(bPrime) }, crash);
+        assert.equal((activeLogin(h) as { account_id: string }).account_id, 'b:account', crash);
+        assert.equal(onDisk(h).state, 'absent', crash);
+      } finally { close(h); }
+    }
+  });
+
+  it('a recorded holder that exits before recovery still counts as aliveBefore and writes no soft relogin row', async () => {
+    const holder: CodexProcess = { pid: 44, lstart: 'Tue Oct 28 10:00:00 2026', host: 'codex' };
+    const recover = async (openSessions: CodexProcess[]) => {
+      const h = switchHarness();
+      try {
+        const j = recoveryJournal(h);
+        j.openSessions = openSessions;
+        install(h, j);
+        writeFileSync(h.authPath, JSON.stringify(observedDocument('a', 'holder')));
+        // The holder has exited: no Codex process is listed at recovery.
+        assert.deepEqual(await h.recover({ list: async () => [] }), { state: 'clear' });
+        assert.equal((lastRow(h) as { outcome: string }).outcome, 'reverted-by-codex');
+        const row = h.db.prepare('SELECT open_sessions_json FROM switch_log ORDER BY id DESC LIMIT 1').get() as { open_sessions_json: string };
+        return {
+          openSessions: (JSON.parse(row.open_sessions_json) as Array<{ pid: number; holderSet: string[] }>).map(({ pid, holderSet }) => ({ pid, holderSet })),
+          evidence: (h.db.prepare("SELECT evidence FROM lineage_log WHERE cause = 'adopt' AND account_id = 'a:account'").get() as { evidence: string }).evidence,
+          relogins: (h.db.prepare("SELECT kind, detail FROM relogin_events WHERE provider = 'openai-codex'").all() as object[]).map((r) => ({ ...r })),
+        };
+      } finally { close(h); }
+    };
+    const recorded = await recover([holder]);
+    // The committed row carries the journal's snapshot, and its holder of A is aliveBefore.
+    assert.deepEqual(recorded.openSessions, [{ pid: 44, holderSet: ['a:account', 'b:account'] }]);
+    assert.equal(recorded.evidence, 'holder');
+    assert.deepEqual(recorded.relogins, []);
+    // Control: without the recorded holder the same recovery writes the soft row.
+    const unrecorded = await recover([]);
+    assert.equal(unrecorded.evidence, 'identity');
+    assert.deepEqual(unrecorded.relogins, [{ kind: 'external-login', detail: 'unattributed-rotation' }]);
+  });
+
+  it('a target replaced after a crashed publish is not reconciled as ok and the journal is kept', async () => {
+    const h = switchHarness();
+    try {
+      const bReplacement = observedDocument('b', 'b-new');
+      const j = recoveryJournal(h);
+      writeFileSync(h.authPath, JSON.stringify(h.b));
+      install(h, j);
+      importActiveCodexSlot(bReplacement, { store: h.store, keychain: h.keychain, now: () => 2 });
+      const active = activeLogin(h);
+      // X5d: slot B changed after the swap, so the published bytes are no longer the target.
+      assert.equal(classifyPostPublish({ journal: j, observed: await readCodexAuthStableWithStat(h.authPath, { delayMs: 0 }),
+        targetSlotFp: h.store.getCodexSlot('b:account')!.fingerprint! }), 'target-changed');
+      // The live bytes are B's recorded predecessor, so the fail-closed known-ancestor row names the fence (C6-15).
+      assert.deepEqual(fenced(await h.recover()), { state: 'fenced', reason: 'target-ancestor', message: recoveryMessage('target-ancestor'),
+        accounts: ['a:account', 'b:account'] });
+      assert.deepEqual(switchRows(h.db), []);
+      assert.deepEqual(unresolvedJournal(h), { attempt: j.attemptId, reason: 'target-ancestor', accounts: ['a:account', 'b:account'] });
+      assert.deepEqual(slotFps(h, 'b:account'), { db: codexFingerprint(bReplacement), keychain: codexFingerprint(bReplacement) });
+      assert.equal(liveFp(h), codexFingerprint(h.b));
+      assert.deepEqual(activeLogin(h), active);
+    } finally { close(h); }
+  });
+
+  it('known-ancestor bytes of the target at recovery keep the journal and refuse with the message', async () => {
+    const h = switchHarness();
+    try {
+      const bHead = observedDocument('b', 'b-head');
+      importActiveCodexSlot(bHead, { store: h.store, keychain: h.keychain, now: () => 2 });
+      h.store.setActiveLogin('openai-codex', 'a:account', 'import', 3);
+      const j = recoveryJournal(h);
+      j.target = { ...j.target, fingerprint: codexFingerprint(bHead) };
+      install(h, j);
+      // After the rename Codex wrote B's older lineage over the published head.
+      codexWrites(h, h.b);
+      const expected = { state: 'fenced', reason: 'target-ancestor', message: recoveryMessage('target-ancestor'), accounts: ['a:account', 'b:account'] };
+      assert.deepEqual(fenced(await h.recover()), expected);
+      assert.deepEqual(unresolvedJournal(h), { attempt: j.attemptId, reason: 'target-ancestor', accounts: ['a:account', 'b:account'] });
+      // Republish is forbidden after the rename: auth.json and slot B are untouched.
+      assert.equal(readFileSync(h.authPath, 'utf8'), JSON.stringify(h.b));
+      assert.deepEqual(slotFps(h, 'b:account'), { db: codexFingerprint(bHead), keychain: codexFingerprint(bHead) });
+      assert.deepEqual(await h.run(), { outcome: 'refused', reason: 'target-ancestor', message: recoveryMessage('target-ancestor') });
+      assert.deepEqual(await refresh(h, 'b:account'), refused('target-ancestor'));
+      assert.deepEqual(switchRows(h.db), []);
+      assert.deepEqual(unresolvedJournal(h), { attempt: j.attemptId, reason: 'target-ancestor', accounts: ['a:account', 'b:account'] });
+    } finally { close(h); }
+  });
+
+  it('a split slot at recovery keeps the journal, refuses the next switch and refreshes of every involved account, and clears after import makes it resolvable', async () => {
+    const h = switchHarness();
+    try {
+      const j = install(h);
+      // A killed adopt left slot B's Keychain on other bytes than its SQLite row, with no :prev.
+      h.keychain.setSync(qlbKeychainService('openai-codex', 'b:account'), QLB_KEYCHAIN_ACCOUNT, JSON.stringify(observedDocument('b', 'b-killed')));
+      writeFileSync(h.authPath, JSON.stringify(observedDocument('b', 'b-rotated')));
+      assert.deepEqual(fenced(await h.recover()), { state: 'fenced', reason: 'slot-split', message: recoveryMessage('slot-split'),
+        accounts: ['a:account', 'b:account'] });
+      assert.deepEqual(unresolvedJournal(h), { attempt: j.attemptId, reason: 'slot-split', accounts: ['a:account', 'b:account'] });
+      assert.deepEqual(await h.run(), { outcome: 'refused', reason: 'slot-split', message: recoveryMessage('slot-split') });
+      for (const accountId of ['a:account', 'b:account']) {
+        assert.deepEqual(await refresh(h, accountId), refused('slot-split'), accountId);
+      }
+      assert.deepEqual(switchRows(h.db), []);
+      // The user logs in to B (codex login), then runs qlb codex import-active.
+      const bLogin = observedDocument('b', 'b-login');
+      codexWrites(h, bLogin);
+      importActiveCodexSlot(bLogin, { store: h.store, keychain: h.keychain, now: () => 4 });
+      assert.deepEqual(await h.recover(), { state: 'clear' });
+      // Slot B moved, so the resolution is target-changed with the publish time, never ok.
+      assert.deepEqual(lastRow(h), viaJournal(j, 'failed', 'target-changed'));
+      // C6-Q2: the login actually in the file is active.
+      assert.deepEqual(activeLogin(h), { account_id: 'b:account', set_by: 'adopt' });
+      assert.equal(onDisk(h).state, 'absent');
+      assert.deepEqual(codexRecoveryFenceState(journalDir(h), h.store), { state: 'none' });
+    } finally { close(h); }
+  });
+
+  it('a split third slot C at orphan recovery fences C and clears after import of C', async () => {
+    const h = switchHarness();
+    try {
+      importActiveCodexSlot(observedDocument('c', 'c0'), { store: h.store, keychain: h.keychain, now: () => 2 });
+      h.store.setActiveLogin('openai-codex', 'a:account', 'import', 3);
+      // An orphaned journal (released, not executing) whose recovery finds slot C split and Codex on C′.
+      const j = install(h);
+      h.keychain.setSync(qlbKeychainService('openai-codex', 'c:account'), QLB_KEYCHAIN_ACCOUNT, JSON.stringify(observedDocument('c', 'c-killed')));
+      writeFileSync(h.authPath, JSON.stringify(observedDocument('c', 'c-live')));
+      assert.deepEqual(fenced(await h.recover()), { state: 'fenced', reason: 'slot-split', message: recoveryMessage('slot-split'),
+        accounts: ['a:account', 'b:account', 'c:account'] });
+      assert.deepEqual(unresolvedJournal(h), { attempt: j.attemptId, reason: 'slot-split', accounts: ['a:account', 'b:account', 'c:account'] });
+      assert.deepEqual(await refresh(h, 'c:account'), refused('slot-split'));
+      assert.deepEqual(switchRows(h.db), []);
+      // The user logs in to C and imports it.
+      const cLogin = observedDocument('c', 'c-login');
+      codexWrites(h, cLogin);
+      importActiveCodexSlot(cLogin, { store: h.store, keychain: h.keychain, now: () => 4 });
+      assert.deepEqual(await h.recover(), { state: 'clear' });
+      assert.deepEqual(lastRow(h), viaJournal(j, 'reverted-by-codex', null));
+      assert.equal((activeLogin(h) as { account_id: string }).account_id, 'c:account');
+      assert.equal(onDisk(h).state, 'absent');
+      assert.deepEqual(codexRecoveryFenceState(journalDir(h), h.store), { state: 'none' });
+
+      // The same fence held as config (a watch verdict, C6-21): a narrower unresolved verdict keeps C.
+      const switchId = (h.db.prepare('SELECT MAX(id) AS id FROM switch_log').get() as { id: number }).id;
+      h.db.prepare("INSERT INTO codex_watch (switch_id, provider, outgoing, target, next_at, until) VALUES (?, 'openai-codex', 'a:account', 'b:account', 1, 2)").run(switchId);
+      importActiveCodexSlot(observedDocument('b', 'b-head'), { store: h.store, keychain: h.keychain, now: () => 5 });
+      h.store.setActiveLogin('openai-codex', 'a:account', 'import', 6);
+      const fence = { v: 1 as const, switchId, attempt: 'watch-fence', from: 'a:account', to: 'b:account', publishedAt: 1_700_000_000_500,
+        reason: 'slot-split', involvedAccounts: ['a:account', 'b:account', 'c:account'], since: 7 };
+      h.store.setRecoveryFence(fence);
+      codexWrites(h, h.b);
+      assert.deepEqual(fenced(await h.recover()), { state: 'fenced', reason: 'target-ancestor', message: recoveryMessage('target-ancestor'),
+        accounts: ['a:account', 'b:account', 'c:account'] });
+      assert.deepEqual(JSON.parse(h.store.getConfig('codex.recoveryFence')!), { ...fence, reason: 'target-ancestor' });
+      assert.deepEqual(await refresh(h, 'c:account'), refused('target-ancestor'));
+      const cLogin2 = observedDocument('c', 'c-login-2');
+      codexWrites(h, cLogin2);
+      importActiveCodexSlot(cLogin2, { store: h.store, keychain: h.keychain, now: () => 8 });
+      assert.deepEqual(await h.recover(), { state: 'clear' });
+      assert.deepEqual(lastRow(h), { from_account: 'a:account', to_account: 'b:account', trigger: 'manual', outcome: 'reverted-by-codex',
+        detail: null, published_at: fence.publishedAt, steps_json: JSON.stringify({ attempt: fence.attempt, via: 'fence' }) });
+      assert.deepEqual(activeLogin(h), { account_id: 'c:account', set_by: 'adopt' });
+      assert.equal(h.store.hasConfig('codex.recoveryFence'), false);
+      assert.equal(scalarCount(h.db, 'SELECT COUNT(*) AS count FROM codex_watch'), 0);
+      assert.deepEqual(codexRecoveryFenceState(journalDir(h), h.store), { state: 'none' });
+    } finally { close(h); }
+  });
+
+  it('an unresolved attempt returned by a still-running fake C8 owner is cleared by that same process\'s next reconcileCodexRecovery after user repair, without a restart', async () => {
+    const h = switchHarness();
+    try {
+      importActiveCodexSlot(observedDocument('b', 'b-head'), { store: h.store, keychain: h.keychain, now: () => 2 });
+      h.store.setActiveLogin('openai-codex', 'a:account', 'import', 3);
+      // The long-lived owner is still running: its pid and lstart match.
+      const stillRunning = { journalOptions: { sameProcess: async () => true } };
+      // Codex writes B's older lineage right after the rename: target-ancestor, unresolved.
+      const returned = await h.runWith({ ...stillRunning, hooks: { afterRename: () => { codexWrites(h, h.b); } } });
+      assert.deepEqual(returned, { outcome: 'failed', reason: 'target-ancestor', message: recoveryMessage('target-ancestor'), attemptId: 'switch-attempt' });
+      const kept = onDisk(h);
+      assert.ok(kept.state === 'ok');
+      assert.deepEqual({ attempt: kept.journal.attemptId, owner: kept.journal.owner, reason: kept.journal.unresolved?.reason },
+        { attempt: 'switch-attempt', owner: { pid: process.pid, lstart: 'fixture-owner', state: 'released' }, reason: 'target-ancestor' });
+      // Before the repair the same process sees the unresolved fence, not journal-in-progress.
+      const before = await h.recover(stillRunning);
+      assert.equal(before.state === 'fenced' && before.reason, 'target-ancestor');
+      assert.equal(onDisk(h).state, 'ok');
+      // The user logs in to B and imports it; the same process checks again.
+      const bLogin = observedDocument('b', 'b-login');
+      codexWrites(h, bLogin);
+      importActiveCodexSlot(bLogin, { store: h.store, keychain: h.keychain, now: () => 4 });
+      assert.deepEqual(await h.recover(stillRunning), { state: 'clear' });
+      assert.deepEqual(lastRow(h), viaJournal(kept.journal, 'failed', 'target-changed'));
+      // C6-Q2: the login actually in the file is active.
+      assert.deepEqual(activeLogin(h), { account_id: 'b:account', set_by: 'adopt' });
+      assert.equal(onDisk(h).state, 'absent');
+      assert.deepEqual(codexRecoveryFenceState(journalDir(h), h.store), { state: 'none' });
+    } finally { close(h); }
+  });
+
+  it('a narrower unresolved re-check of a journal returns the first fenced accounts', async () => {
+    const h = switchHarness();
+    try {
+      importActiveCodexSlot(observedDocument('c', 'c0'), { store: h.store, keychain: h.keychain, now: () => 2 });
+      const bHead = observedDocument('b', 'b-head');
+      importActiveCodexSlot(bHead, { store: h.store, keychain: h.keychain, now: () => 3 });
+      h.store.setActiveLogin('openai-codex', 'a:account', 'import', 4);
+      const j = recoveryJournal(h);
+      j.target = { ...j.target, fingerprint: codexFingerprint(bHead) };
+      install(h, j);
+      // First check: slot C is split and Codex is on C′ ⇒ slot-split {A, B, C}.
+      h.keychain.setSync(qlbKeychainService('openai-codex', 'c:account'), QLB_KEYCHAIN_ACCOUNT, JSON.stringify(observedDocument('c', 'c-killed')));
+      writeFileSync(h.authPath, JSON.stringify(observedDocument('c', 'c-live')));
+      assert.deepEqual(fenced(await h.recover()), { state: 'fenced', reason: 'slot-split', message: recoveryMessage('slot-split'),
+        accounts: ['a:account', 'b:account', 'c:account'] });
+      // Second check: Codex wrote B's older lineage ⇒ target-ancestor, whose own set is only {A, B}.
+      codexWrites(h, h.b);
+      assert.deepEqual(fenced(await h.recover()), { state: 'fenced', reason: 'target-ancestor', message: recoveryMessage('target-ancestor'),
+        accounts: ['a:account', 'b:account', 'c:account'] });
+      assert.deepEqual(unresolvedJournal(h), { attempt: j.attemptId, reason: 'target-ancestor', accounts: ['a:account', 'b:account', 'c:account'] });
+      assert.deepEqual(await refresh(h, 'c:account'), refused('target-ancestor'));
+      assert.deepEqual(switchRows(h.db), []);
+    } finally { close(h); }
+  });
+
+  it('a pending re-check of a journal keeps the earlier unresolved accounts', async () => {
+    const h = switchHarness();
+    try {
+      importActiveCodexSlot(observedDocument('c', 'c0'), { store: h.store, keychain: h.keychain, now: () => 2 });
+      h.store.setActiveLogin('openai-codex', 'a:account', 'import', 3);
+      const j = install(h);
+      // First check: slot C is split and Codex is on C′ ⇒ slot-split {A, B, C}.
+      h.keychain.setSync(qlbKeychainService('openai-codex', 'c:account'), QLB_KEYCHAIN_ACCOUNT, JSON.stringify(observedDocument('c', 'c-killed')));
+      writeFileSync(h.authPath, JSON.stringify(observedDocument('c', 'c-live')));
+      assert.deepEqual(fenced(await h.recover()), { state: 'fenced', reason: 'slot-split', message: recoveryMessage('slot-split'),
+        accounts: ['a:account', 'b:account', 'c:account'] });
+      // Second check: the verify read is unreadable ⇒ pending, which keeps the fence.
+      const pending = await h.recover({ readLive: async () => ({ status: 'unreadable', code: 'EACCES' }) });
+      assert.deepEqual(fenced(pending), { state: 'fenced', reason: 'journal-verify-unreadable', message: recoveryMessage('journal-verify-unreadable'),
+        accounts: ['a:account', 'b:account', 'c:account'] });
+      assert.deepEqual(unresolvedJournal(h), { attempt: j.attemptId, reason: 'slot-split', accounts: ['a:account', 'b:account', 'c:account'] });
+      assert.deepEqual(await refresh(h, 'c:account'), refused('slot-split'));
+      assert.deepEqual(switchRows(h.db), []);
+    } finally { close(h); }
+  });
+
+  it('a wiped auth.json at recovery records failed wiped and no active login', async () => {
+    const h = switchHarness();
+    try {
+      const j = install(h);
+      const wiped = { status: 'wiped', error: { ok: false, error: 'tokens-empty', status: 'wiped' } } as const;
+      assert.deepEqual(await h.recover({ readLive: async () => wiped }), { state: 'clear' });
+      assert.deepEqual(lastRow(h), viaJournal(j, 'failed', 'wiped'));
+      assert.equal((activeLogin(h) as { account_id: string | null }).account_id, null);
+      assert.equal(onDisk(h).state, 'absent');
+    } finally { close(h); }
+  });
+
+  it('known-ancestor bytes of the outgoing slot at recovery commit reverted-by-codex and delete the journal', async () => {
+    const h = switchHarness();
+    try {
+      const aHead = observedDocument('a', 'a-head');
+      importActiveCodexSlot(aHead, { store: h.store, keychain: h.keychain, now: () => 2 });
+      const j = install(h);
+      // After the rename Codex wrote A's older lineage back: A's original bytes at a new inode.
+      codexWrites(h, h.a);
+      assert.deepEqual(await h.recover(), { state: 'clear' });
+      assert.deepEqual(lastRow(h), viaJournal(j, 'reverted-by-codex', null));
+      assert.equal((activeLogin(h) as { account_id: string }).account_id, 'a:account');
+      // No file write: auth.json keeps A's older bytes and slot A keeps its newer head.
+      assert.equal(readFileSync(h.authPath, 'utf8'), JSON.stringify(h.a));
+      assert.deepEqual(slotFps(h, 'a:account'), { db: codexFingerprint(aHead), keychain: codexFingerprint(aHead) });
+      assert.equal(onDisk(h).state, 'absent');
+    } finally { close(h); }
+  });
+
+  it('two concurrent recoverers commit one row', async () => {
+    const h = switchHarness();
+    try {
+      const j = install(h);
+      writeFileSync(h.authPath, JSON.stringify(h.b));
+      assert.deepEqual(await Promise.all([h.recover(), h.recover()]), [{ state: 'clear' }, { state: 'clear' }]);
+      assert.deepEqual(switchRows(h.db).map(({ outcome, steps_json }) => ({ outcome, steps_json })),
+        [{ outcome: 'ok', steps_json: JSON.stringify({ attempt: j.attemptId, via: 'journal' }) }]);
+      assert.equal(onDisk(h).state, 'absent');
+    } finally { close(h); }
+  });
+
+  it('a journal replaced after the probe is not deleted', async () => {
+    const h = switchHarness();
+    try {
+      const j = install(h);
+      writeFileSync(h.authPath, JSON.stringify(h.b));
+      const successor = recoveryJournal(h, 'successor');
+      const result = await h.recover({ crashAt: (at) => {
+        if (at === 'recovery-after-commit') writeCodexSwitchJournal(successor, { journalDir: journalDir(h) });
+      } });
+      finishCodexSwitchAttempt(successor.attemptId);
+      assert.deepEqual(result, { state: 'clear' });
+      assert.deepEqual(switchRows(h.db).map(({ outcome, steps_json }) => ({ outcome, steps_json })),
+        [{ outcome: 'ok', steps_json: JSON.stringify({ attempt: j.attemptId, via: 'journal' }) }]);
+      assert.deepEqual(onDisk(h), { state: 'ok', journal: successor });
+    } finally { close(h); }
+  });
+
+  it('a malformed journal is left and the switch is refused', async () => {
+    const h = switchHarness();
+    try {
+      mkdirSync(journalDir(h), { recursive: true });
+      const path = codexSwitchJournalPath({ journalDir: journalDir(h) });
+      writeFileSync(path, '{');
+      assert.deepEqual(await h.recover(), { state: 'fenced', reason: 'switch-recovery-malformed',
+        message: recoveryMessage('switch-recovery-malformed'), accounts: '*' });
+      assert.deepEqual(await h.run(), { outcome: 'refused', reason: 'switch-recovery-malformed', message: recoveryMessage('switch-recovery-malformed') });
+      assert.equal(readFileSync(path, 'utf8'), '{');
+      assert.deepEqual(switchRows(h.db), []);
+      assert.equal(liveFp(h), codexFingerprint(h.a));
+    } finally { close(h); }
+  });
+
+  // ---- C6-20 review r1 ----
+  /** A config fence (as a watch verdict would write it, C6-21) on its own committed A→B switch row. */
+  const configFence = (h: Harness, reason = 'slot-split', involvedAccounts: string[] | '*' = ['a:account', 'b:account'], openSessions: CodexProcess[] = []) => {
+    const switchId = h.store.recordSwitch({ ts: 1_700_000_000_400, provider: 'openai-codex', fromAccount: 'a:account', toAccount: 'b:account',
+      trigger: 'manual', outcome: 'ok', detail: null, stepsJson: JSON.stringify({ attempt: 'watched-switch', via: 'switch' }),
+      openSessionsJson: JSON.stringify(openSessions), publishedAt: 1_700_000_000_500, committedAt: 1_700_000_000_600 });
+    const fence = { v: 1 as const, switchId, attempt: 'watch-fence', from: 'a:account', to: 'b:account', publishedAt: 1_700_000_000_500,
+      reason, involvedAccounts, since: 7 };
+    h.store.setRecoveryFence(fence);
+    return fence;
+  };
+  const viaFence = (fence: { attempt: string; publishedAt: number }, outcome: string, detail: string | null) => ({ from_account: 'a:account',
+    to_account: 'b:account', trigger: 'manual', outcome, detail, published_at: fence.publishedAt,
+    steps_json: JSON.stringify({ attempt: fence.attempt, via: 'fence' }) });
+  const inFlightMessage = (reason: string) => `codex refresh refused: ${reason} (a Codex switch involving this account has not finished)`;
+
+  it('a target-changed journal whose auth.json is wiped or missing is fenced, not thrown (C6-20 r1)', async () => {
+    const reads = {
+      wiped: { status: 'wiped', error: { ok: false, error: 'tokens-empty', status: 'wiped' } },
+      missing: { status: 'missing' },
+    } as const;
+    for (const [name, read] of Object.entries(reads)) {
+      const h = switchHarness();
+      try {
+        const j = recoveryJournal(h);
+        writeFileSync(h.authPath, JSON.stringify(h.b));
+        install(h, j);
+        // X5d: an import replaced slot B after the crashed publish.
+        importActiveCodexSlot(observedDocument('b', 'b-new'), { store: h.store, keychain: h.keychain, now: () => 2 });
+        const active = activeLogin(h);
+        // §3.1 target-changed "whatever the live file holds"; no live identity ⇒ every account.
+        assert.deepEqual(fenced(await h.recover({ readLive: async () => read })), { state: 'fenced', reason: 'target-changed',
+          message: recoveryMessage('target-changed'), accounts: '*' }, name);
+        assert.deepEqual(unresolvedJournal(h), { attempt: j.attemptId, reason: 'target-changed', accounts: '*' }, name);
+        assert.deepEqual(switchRows(h.db), [], name);
+        assert.deepEqual(activeLogin(h), active, name);
+      } finally { close(h); }
+    }
+  });
+
+  it('a classified ok whose slot B moved by a recorded adoption is attributed and fences target-ancestor, not thrown (C6-20 r1)', async () => {
+    const h = switchHarness();
+    try {
+      const bPrime = observedDocument('b', 'b-rotated');
+      const j = recoveryJournal(h);
+      j.adoptingTarget = [codexFingerprint(bPrime)];
+      // The post-publish adopt moved slot B to B′ (C6-19) ...
+      await attributeForPhase({ assertHeld: () => undefined }, 'post', { store: h.store, keychain: h.keychain,
+        slot: { accountId: 'b:account', document: h.b, fingerprint: codexFingerprint(h.b) }, activeSlotId: 'a:account',
+        activeSetBy: 'adopt', live: bPrime, holderObservation: { aliveBefore: true, aliveAfter: false }, now: () => 3 });
+      // ... and the file is back on B's published, older bytes.
+      writeFileSync(h.authPath, JSON.stringify(h.b));
+      install(h, j);
+      assert.equal(classifyPostPublish({ journal: j, observed: await readCodexAuthStableWithStat(h.authPath, { delayMs: 0 }),
+        targetSlotFp: h.store.getCodexSlot('b:account')!.fingerprint! }), 'ok');
+      assert.deepEqual(fenced(await h.recover()), { state: 'fenced', reason: 'target-ancestor', message: recoveryMessage('target-ancestor'),
+        accounts: ['a:account', 'b:account'] });
+      assert.deepEqual(unresolvedJournal(h), { attempt: j.attemptId, reason: 'target-ancestor', accounts: ['a:account', 'b:account'] });
+      assert.equal(readFileSync(h.authPath, 'utf8'), JSON.stringify(h.b));
+      assert.deepEqual(switchRows(h.db), []);
+    } finally { close(h); }
+  });
+
+  it('a reverted-by-codex resolved by journal recovery records active_login with set_by adopt (§3.1, C6-20 r1)', async () => {
+    const h = switchHarness();
+    try {
+      const j = install(h);
+      writeFileSync(h.authPath, JSON.stringify(observedDocument('a', 'recovery-a')));
+      assert.deepEqual(await h.recover(), { state: 'clear' });
+      assert.deepEqual(lastRow(h), viaJournal(j, 'reverted-by-codex', null));
+      assert.deepEqual(activeLogin(h), { account_id: 'a:account', set_by: 'adopt' });
+    } finally { close(h); }
+  });
+
+  it('an in-flight journal or a not-yet-stale owner lock refuses the switch with the in-flight text, not the log-in text (C6-20 r1)', async () => {
+    const h = switchHarness();
+    try {
+      const j = recoveryJournal(h);
+      j.owner = { pid: 4101, lstart: 'Tue Oct 28 10:00:00 2026', state: 'active' };
+      install(h, j);
+      // A live, active owner: the switch is still running.
+      assert.deepEqual(await h.runWith({ journalOptions: { sameProcess: async () => true } }),
+        { outcome: 'refused', reason: 'journal-in-progress', message: inFlightMessage('journal-in-progress') });
+      // A dead owner whose owner lock is still fresh: it goes stale on its own.
+      mkdirSync(codexSwitchJournalOwnerLockPath({ journalDir: journalDir(h) }), { recursive: true });
+      assert.deepEqual(await h.runWith({ journalOptions: { sameProcess: async () => false, ownerLockTimeoutMs: 20 } }),
+        { outcome: 'refused', reason: 'journal-owner-lock-not-yet-stale', message: inFlightMessage('journal-owner-lock-not-yet-stale') });
+      assert.deepEqual(switchRows(h.db), []);
+    } finally { executingCodexAttempts.clear(); close(h); }
+  });
+
+  it('an orphaned journal resolved in the same check as a config fence goes on to the fence (C6-20 r1)', async () => {
+    const h = switchHarness();
+    try {
+      const j = install(h);
+      writeFileSync(h.authPath, JSON.stringify(h.b));
+      const fence = configFence(h);
+      assert.deepEqual(await h.recover(), { state: 'clear' });
+      // Both were resolved by the one call: the journal as ok, then the fence (live = B's head ⇒ ok).
+      assert.deepEqual(switchRows(h.db).slice(-2).map(({ outcome, steps_json }) => ({ outcome, steps_json })), [
+        { outcome: 'ok', steps_json: JSON.stringify({ attempt: j.attemptId, via: 'journal' }) },
+        { outcome: 'ok', steps_json: JSON.stringify({ attempt: fence.attempt, via: 'fence' }) }]);
+      assert.equal(onDisk(h).state, 'absent');
+      assert.equal(h.store.hasConfig('codex.recoveryFence'), false);
+    } finally { close(h); }
+  });
+
+  it('a pending re-check of a config fence returns the fence\'s from and to with its involved accounts (C6-20 r1)', async () => {
+    const h = switchHarness();
+    try {
+      configFence(h, 'slot-split', ['c:account']);
+      const pending = await h.recover({ readLive: async () => ({ status: 'unreadable', code: 'EACCES' }) });
+      assert.deepEqual(fenced(pending).accounts, ['a:account', 'b:account', 'c:account']);
+      assert.deepEqual(fenced(pending).accounts, fenced(codexRecoveryFenceState(journalDir(h), h.store)).accounts);
+    } finally { close(h); }
+  });
+
+  it('a config-fence re-check that lost the switch lock writes neither a resolution nor a fence (C6-20 r1)', async () => {
+    for (const name of ['resolution', 'unresolved'] as const) {
+      const h = switchHarness();
+      try {
+        writeFileSync(h.authPath, JSON.stringify(h.b));
+        configFence(h);
+        // resolution: live = B's head ⇒ commitFenceResolution; unresolved: missing ⇒ logged-out ⇒ setRecoveryFence.
+        if (name === 'unresolved') rmSync(h.authPath);
+        const before = { fence: h.store.getConfig('codex.recoveryFence'), rows: switchRows(h.db), active: activeLogin(h) };
+        let lost = false;
+        const readLive = async () => { const read = await readCodexAuthStableWithStat(h.authPath, { delayMs: 0 }); lost = true; return read; };
+        await assert.rejects(h.recoverLocked(() => { if (lost) throw new Error('switch lock compromised'); }, { readLive }), /switch lock compromised/, name);
+        assert.deepEqual({ fence: h.store.getConfig('codex.recoveryFence'), rows: switchRows(h.db), active: activeLogin(h) }, before, name);
+      } finally { close(h); }
+    }
+  });
+
+  it('a config-fence re-check counts a holder recorded on the fence\'s switch row as aliveBefore (C6-20 r1)', async () => {
+    const holder: CodexProcess = { pid: 44, lstart: 'Tue Oct 28 10:00:00 2026', host: 'codex' };
+    const recover = async (openSessions: CodexProcess[]) => {
+      const h = switchHarness();
+      try {
+        configFence(h, 'slot-split', ['a:account', 'b:account'], openSessions);
+        writeFileSync(h.authPath, JSON.stringify(observedDocument('a', 'holder')));
+        // The holder has exited: no Codex process is listed at the re-check.
+        assert.deepEqual(await h.recover({ list: async () => [] }), { state: 'clear' });
+        assert.equal((lastRow(h) as { outcome: string }).outcome, 'reverted-by-codex');
+        return {
+          evidence: (h.db.prepare("SELECT evidence FROM lineage_log WHERE cause = 'adopt' AND account_id = 'a:account'").get() as { evidence: string }).evidence,
+          relogins: (h.db.prepare("SELECT kind, detail FROM relogin_events WHERE provider = 'openai-codex'").all() as object[]).map((r) => ({ ...r })),
+        };
+      } finally { close(h); }
+    };
+    const recorded = await recover([holder]);
+    assert.equal(recorded.evidence, 'holder');
+    assert.deepEqual(recorded.relogins, []);
+    // Control: without the recorded holder the same re-check writes the soft row.
+    const unrecorded = await recover([]);
+    assert.equal(unrecorded.evidence, 'identity');
+    assert.deepEqual(unrecorded.relogins, [{ kind: 'external-login', detail: 'unattributed-rotation' }]);
+  });
+
+  it('a target-changed config fence resolves as failed(target-changed) with the live slot active (C6-Q2, C6-20 r1)', async () => {
+    const h = switchHarness();
+    try {
+      writeFileSync(h.authPath, JSON.stringify(h.b));
+      const fence = configFence(h, 'target-changed');
+      assert.deepEqual(await h.recover(), { state: 'clear' });
+      assert.deepEqual(lastRow(h), viaFence(fence, 'failed', 'target-changed'));
+      assert.deepEqual(activeLogin(h), { account_id: 'b:account', set_by: 'adopt' });
+      assert.equal(h.store.hasConfig('codex.recoveryFence'), false);
+    } finally { close(h); }
+  });
+
+  it('a target-changed fence re-checked as slot-split keeps target-changed and later resolves as failed(target-changed), never ok', async () => {
+    const h = switchHarness();
+    try {
+      const fence = configFence(h, 'target-changed');
+      // A killed adopt left slot B's Keychain on other bytes than its SQLite row; Codex is on a rotated B.
+      h.keychain.setSync(qlbKeychainService('openai-codex', 'b:account'), QLB_KEYCHAIN_ACCOUNT, JSON.stringify(observedDocument('b', 'b-killed')));
+      codexWrites(h, observedDocument('b', 'b-rotated'));
+      // The returned reason is the stored one, so this call and later fence reads agree (C6-20 r2).
+      assert.deepEqual(fenced(await h.recover()), { state: 'fenced', reason: 'target-changed', message: recoveryMessage('target-changed'),
+        accounts: ['a:account', 'b:account'] });
+      assert.equal(codexRecoveryFenceState(journalDir(h), h.store).state === 'fenced'
+        && (codexRecoveryFenceState(journalDir(h), h.store) as { reason: string }).reason, 'target-changed');
+      // The fence is still target-changed (§3.1: never ok); only its account set is unioned.
+      assert.deepEqual(JSON.parse(h.store.getConfig('codex.recoveryFence')!), { ...fence, reason: 'target-changed' });
+      // The user logs in to B and imports it: live now equals B's current head.
+      const bLogin = observedDocument('b', 'b-login');
+      codexWrites(h, bLogin);
+      importActiveCodexSlot(bLogin, { store: h.store, keychain: h.keychain, now: () => 4 });
+      assert.deepEqual(await h.recover(), { state: 'clear' });
+      assert.deepEqual(lastRow(h), viaFence(fence, 'failed', 'target-changed'));
+      assert.deepEqual(activeLogin(h), { account_id: 'b:account', set_by: 'adopt' });
+      assert.equal(h.store.hasConfig('codex.recoveryFence'), false);
+    } finally { close(h); }
+  });
+
+  // ---- C6-20 review r2 ----
+  const breakSlot = (h: Harness, id: string) => h.keychain.setSync(qlbKeychainService('openai-codex', id), QLB_KEYCHAIN_ACCOUNT, '{');
+
+  it('a target-changed journal whose auth.json is unstable or unreadable stays pending and writes nothing (§3.1, C6-20 r2)', async () => {
+    const reads = { unstable: { status: 'unstable' }, unreadable: { status: 'unreadable', code: 'EACCES' } } as const;
+    for (const [name, read] of Object.entries(reads)) {
+      const h = switchHarness();
+      try {
+        const j = recoveryJournal(h);
+        writeFileSync(h.authPath, JSON.stringify(h.b));
+        install(h, j);
+        importActiveCodexSlot(observedDocument('b', 'b-new'), { store: h.store, keychain: h.keychain, now: () => 2 });
+        const before = { journal: onDisk(h), rows: switchRows(h.db), active: activeLogin(h) };
+        assert.deepEqual(fenced(await h.recover({ readLive: async () => read })), { state: 'fenced', reason: `journal-verify-${name}`,
+          message: recoveryMessage(`journal-verify-${name}`), accounts: ['a:account', 'b:account'] }, name);
+        assert.deepEqual({ journal: onDisk(h), rows: switchRows(h.db), active: activeLogin(h) }, before, name);
+      } finally { close(h); }
+    }
+  });
+
+  it('a target-changed fence whose auth.json is unstable or unreadable stays pending and writes nothing (§3.1, C6-20 r2)', async () => {
+    const reads = { unstable: { status: 'unstable' }, unreadable: { status: 'unreadable', code: 'EACCES' } } as const;
+    for (const [name, read] of Object.entries(reads)) {
+      const h = switchHarness();
+      try {
+        configFence(h, 'target-changed');
+        const before = { fence: h.store.getConfig('codex.recoveryFence'), rows: switchRows(h.db), active: activeLogin(h) };
+        assert.deepEqual(fenced(await h.recover({ readLive: async () => read })), { state: 'fenced', reason: `journal-verify-${name}`,
+          message: recoveryMessage(`journal-verify-${name}`), accounts: ['a:account', 'b:account'] }, name);
+        assert.deepEqual({ fence: h.store.getConfig('codex.recoveryFence'), rows: switchRows(h.db), active: activeLogin(h) }, before, name);
+      } finally { close(h); }
+    }
+  });
+
+  it('an unreadable target slot during a target-changed re-check keeps the fence and does not throw', async () => {
+    // A slot-split fence (external live, attribution needed) and a target-changed fence (live on no head).
+    for (const reason of ['target-changed', 'slot-split']) {
+      const h = switchHarness();
+      try {
+        const fence = configFence(h, reason);
+        breakSlot(h, 'b:account');
+        codexWrites(h, observedDocument('b', 'b-other'));
+        assert.deepEqual(fenced(await h.recover()), { state: 'fenced', reason, message: recoveryMessage(reason),
+          accounts: ['a:account', 'b:account'] }, reason);
+        assert.deepEqual(JSON.parse(h.store.getConfig('codex.recoveryFence')!), fence, reason);
+        assert.deepEqual(switchRows(h.db).filter(({ steps_json }) => String(steps_json).includes('"fence"')), [], reason);
+      } finally { close(h); }
+    }
+  });
+
+  it('an unreadable target slot does not stop a target-changed fence or journal resolving on another slot head (C6-20 r2)', async () => {
+    {
+      const h = switchHarness();
+      try {
+        const fence = configFence(h, 'target-changed');
+        breakSlot(h, 'b:account');
+        codexWrites(h, h.a);
+        assert.deepEqual(await h.recover(), { state: 'clear' });
+        assert.deepEqual(lastRow(h), viaFence(fence, 'failed', 'target-changed'));
+        assert.deepEqual(activeLogin(h), { account_id: 'a:account', set_by: 'adopt' });
+        assert.equal(h.store.hasConfig('codex.recoveryFence'), false);
+      } finally { close(h); }
+    }
+    {
+      const h = switchHarness();
+      try {
+        const j = recoveryJournal(h);
+        install(h, j);
+        importActiveCodexSlot(observedDocument('b', 'b-new'), { store: h.store, keychain: h.keychain, now: () => 2 });
+        h.store.setActiveLogin('openai-codex', 'a:account', 'import', 3);
+        breakSlot(h, 'b:account');
+        codexWrites(h, h.a);
+        assert.deepEqual(await h.recover(), { state: 'clear' });
+        assert.deepEqual(lastRow(h), viaJournal(j, 'failed', 'target-changed'));
+        assert.deepEqual(activeLogin(h), { account_id: 'a:account', set_by: 'adopt' });
+        assert.equal(onDisk(h).state, 'absent');
+      } finally { close(h); }
+    }
+  });
+
+  // ---- C6-20 review r3 ----
+  it('an unreadable target slot does not clear recovery on another slot whose Keychain copy is missing or different', async () => {
+    const serviceA = qlbKeychainService('openai-codex', 'a:account');
+    const damage = {
+      missing: (h: Harness) => h.keychain.deleteSync(serviceA, QLB_KEYCHAIN_ACCOUNT),
+      corrupt: (h: Harness) => h.keychain.setSync(serviceA, QLB_KEYCHAIN_ACCOUNT, '{'),
+      different: (h: Harness) => h.keychain.setSync(serviceA, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(observedDocument('a', 'a-other'))),
+    };
+    for (const [name, damageA] of Object.entries(damage)) {
+      // Fence: live equals A's SQLite head, but A's Keychain copy does not back it.
+      {
+        const h = switchHarness();
+        try {
+          const fence = configFence(h, 'target-changed');
+          breakSlot(h, 'b:account');
+          codexWrites(h, h.a);
+          damageA(h);
+          const active = activeLogin(h);
+          assert.deepEqual(fenced(await h.recover()), { state: 'fenced', reason: 'target-changed', message: recoveryMessage('target-changed'),
+            accounts: ['a:account', 'b:account'] }, `fence ${name}`);
+          assert.deepEqual(JSON.parse(h.store.getConfig('codex.recoveryFence')!), fence, `fence ${name}`);
+          assert.deepEqual(activeLogin(h), active, `fence ${name}`);
+          assert.deepEqual(switchRows(h.db).filter(({ steps_json }) => String(steps_json).includes('"fence"')), [], `fence ${name}`);
+        } finally { close(h); }
+      }
+      // Journal: the same, on an orphaned target-changed journal.
+      {
+        const h = switchHarness();
+        try {
+          const j = install(h);
+          importActiveCodexSlot(observedDocument('b', 'b-new'), { store: h.store, keychain: h.keychain, now: () => 2 });
+          h.store.setActiveLogin('openai-codex', 'a:account', 'import', 3);
+          breakSlot(h, 'b:account');
+          codexWrites(h, h.a);
+          damageA(h);
+          const active = activeLogin(h);
+          assert.deepEqual(fenced(await h.recover()), { state: 'fenced', reason: 'target-changed', message: recoveryMessage('target-changed'),
+            accounts: ['a:account', 'b:account'] }, `journal ${name}`);
+          assert.deepEqual(unresolvedJournal(h), { attempt: j.attemptId, reason: 'target-changed', accounts: ['a:account', 'b:account'] }, `journal ${name}`);
+          assert.deepEqual(activeLogin(h), active, `journal ${name}`);
+          assert.deepEqual(switchRows(h.db), [], `journal ${name}`);
+        } finally { close(h); }
+      }
+    }
+  });
+
+  it('a fence kept because slot B is unreadable still fences the live identity\'s managed slot (§3.1, C6-20 r3)', async () => {
+    const h = switchHarness();
+    try {
+      importActiveCodexSlot(observedDocument('c', 'c0'), { store: h.store, keychain: h.keychain, now: () => 2 });
+      h.store.setActiveLogin('openai-codex', 'a:account', 'import', 3);
+      const fence = configFence(h, 'slot-split');
+      breakSlot(h, 'b:account');
+      codexWrites(h, observedDocument('c', 'c-live'));
+      assert.deepEqual(fenced(await h.recover()), { state: 'fenced', reason: 'slot-split', message: recoveryMessage('slot-split'),
+        accounts: ['a:account', 'b:account', 'c:account'] });
+      assert.deepEqual(JSON.parse(h.store.getConfig('codex.recoveryFence')!), { ...fence, involvedAccounts: ['a:account', 'b:account', 'c:account'] });
+      assert.deepEqual(await refresh(h, 'c:account'), refused('slot-split'));
+      assert.deepEqual(switchRows(h.db).filter(({ steps_json }) => String(steps_json).includes('"fence"')), []);
+    } finally { close(h); }
   });
 });

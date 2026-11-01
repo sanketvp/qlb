@@ -485,3 +485,94 @@ describe('Codex switch commit primitive', () => {
     }
   });
 });
+
+describe('Codex recovery fence resolution — C6-20', () => {
+  function openFenceStore() { return openStore(join(mkdtempSync(join(tmpdir(), 'qlb-store-fence-')), 'qlb.db')); }
+  function fenceFor(store: ReturnType<typeof openStore>) {
+    const id = store.commitCodexSwitch({ now: 100, accountId: 'to:account', setBy: 'manual', fromAccount: 'from:account',
+      toAccount: 'to:account', trigger: 'manual', outcome: 'ok', attempt: 'switch-attempt', via: 'switch', openSessionsJson: '[]',
+      publishedAt: 90, committedAt: 100, outgoing: 'from:account', target: 'to:account',
+      observation: { identity: 'to:account', lineageFp: 'to-fp' }, decision: { leftHeadroom: null, leftRecoveryAt: null, leftTrigger: null } });
+    return { v: 1 as const, switchId: id, attempt: 'fence-attempt', from: 'from:account', to: 'to:account', publishedAt: 90,
+      reason: 'slot-split', involvedAccounts: ['from:account', 'to:account'], since: 101 };
+  }
+  function fenceState(store: ReturnType<typeof openStore>) {
+    const db = (store as unknown as { db: DatabaseSync }).db;
+    return {
+      fence: store.getConfig('codex.recoveryFence'),
+      active: { ...(db.prepare("SELECT account_id, set_by, since FROM active_login WHERE provider = 'openai-codex'").get() as object) },
+      watches: (db.prepare('SELECT switch_id FROM codex_watch ORDER BY switch_id').all() as Array<{ switch_id: number }>).map((row) => row.switch_id),
+      rows: (db.prepare(`SELECT ts, from_account, to_account, trigger, outcome, detail, published_at, committed_at, steps_json
+        FROM switch_log ORDER BY id`).all() as object[]).map((row) => ({ ...row })),
+    };
+  }
+
+  it('commitFenceResolution writes the effect row with the fence\'s published_at and via fence, deletes the fence and the codex_watch row, in one transaction', () => {
+    const store = openFenceStore();
+    try {
+      const fence = fenceFor(store); store.setRecoveryFence(fence);
+      const db = (store as unknown as { db: DatabaseSync }).db;
+      db.prepare("INSERT INTO codex_watch (switch_id, provider, outgoing, target, next_at, until) VALUES (999, 'openai-codex', 'x:account', 'y:account', 1, 2)").run();
+      const before = fenceState(store);
+      assert.deepEqual(before.watches, [fence.switchId, 999]);
+      const resolve = () => store.commitFenceResolution({ fence, effect: { outcome: 'reverted-by-codex', accountId: 'from:account' },
+        setActive: 'from:account', attempt: fence.attempt, now: 200 });
+      // One transaction: a failure in its last statement (the codex_watch delete) undoes every earlier write.
+      db.exec("CREATE TEMP TRIGGER fail_watch_delete BEFORE DELETE ON codex_watch BEGIN SELECT RAISE(ABORT, 'watch'); END");
+      assert.throws(resolve, /watch/);
+      assert.deepEqual(fenceState(store), before);
+      db.exec('DROP TRIGGER fail_watch_delete');
+
+      const id = resolve();
+      const after = fenceState(store);
+      assert.equal(after.fence, null);
+      assert.equal(store.hasConfig('codex.recoveryFence'), false);
+      assert.deepEqual(after.watches, [999]);
+      assert.deepEqual(after.active, { account_id: 'from:account', set_by: 'adopt', since: 200 });
+      assert.deepEqual(after.rows, [...before.rows, { ts: 200, from_account: 'from:account', to_account: 'to:account', trigger: 'manual',
+        outcome: 'reverted-by-codex', detail: null, published_at: 90, committed_at: 200, steps_json: '{"attempt":"fence-attempt","via":"fence"}' }]);
+      assert.equal((db.prepare('SELECT MAX(id) AS id FROM switch_log').get() as { id: number }).id, id);
+    } finally { store.close(); }
+  });
+
+  it('a failure inside commitFenceResolution leaves the fence', () => {
+    const store = openFenceStore();
+    try {
+      const fence = fenceFor(store); store.setRecoveryFence(fence);
+      const db = (store as unknown as { db: DatabaseSync }).db;
+      const before = fenceState(store);
+      db.exec("CREATE TEMP TRIGGER fail_fence_delete BEFORE DELETE ON config WHEN OLD.key = 'codex.recoveryFence' BEGIN SELECT RAISE(ABORT, 'fence'); END");
+      assert.throws(() => store.commitFenceResolution({ fence, effect: { outcome: 'failed', detail: 'wiped' },
+        setActive: null, attempt: fence.attempt, now: 200 }), /fence/);
+      // The fence, the active login, the watch row and switch_log are exactly as before.
+      assert.deepEqual(fenceState(store), before);
+      assert.deepEqual(JSON.parse(store.getConfig('codex.recoveryFence')!), fence);
+    } finally { store.close(); }
+  });
+
+  it('setRecoveryFence never narrows a stored \'*\' fence to an account list (C6-20 r1)', () => {
+    const store = openFenceStore();
+    try {
+      const fence = fenceFor(store);
+      store.setRecoveryFence({ ...fence, reason: 'logged-out', involvedAccounts: '*' });
+      store.setRecoveryFence({ ...fence, reason: 'target-ancestor', involvedAccounts: ['from:account', 'to:account'] });
+      assert.deepEqual(JSON.parse(store.getConfig('codex.recoveryFence')!), { ...fence, reason: 'target-ancestor', involvedAccounts: '*' });
+    } finally { store.close(); }
+  });
+
+  it('setRecoveryFence keeps a stored target-changed reason until the fence is cleared (C6-20 r2)', () => {
+    const store = openFenceStore();
+    try {
+      const fence = fenceFor(store);
+      store.setRecoveryFence({ ...fence, reason: 'target-changed' });
+      store.setRecoveryFence({ ...fence, reason: 'slot-split', involvedAccounts: ['from:account', 'to:account', 'c:account'] });
+      assert.deepEqual(JSON.parse(store.getConfig('codex.recoveryFence')!), { ...fence, reason: 'target-changed',
+        involvedAccounts: ['c:account', 'from:account', 'to:account'] });
+      // A non-target-changed reason still follows the latest verdict.
+      store.clearRecoveryFence();
+      store.setRecoveryFence({ ...fence, reason: 'slot-split' });
+      store.setRecoveryFence({ ...fence, reason: 'target-ancestor' });
+      assert.equal(JSON.parse(store.getConfig('codex.recoveryFence')!).reason, 'target-ancestor');
+    } finally { store.close(); }
+  });
+});
