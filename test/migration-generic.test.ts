@@ -4911,6 +4911,127 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     }
   });
 
+  it('T-OD6-13c a pre-commit rollback marker fences stage and commit after a denied Keychain delete', async () => {
+    const kc = new RollbackDeleteKeychain();
+    const h = setup('xai', kc);
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      kc.mode = 'denied';
+      assert.throws(() => h.mig.rollback(), /migration rollback failed to delete staged Keychain credential/);
+      assert.equal(h.mig.status().detail.intent, 'pre-commit-rollback', 'failed delete keeps the durable recovery marker');
+
+      for (const command of [() => h.mig.stage(), () => h.mig.commit()]) {
+        assert.throws(
+          command,
+          (error: unknown) => (error as { message?: unknown; exitCode?: unknown }).message === 'rollback-in-progress: run `qlb migrate resume`'
+            && (error as { exitCode?: unknown }).exitCode === 3,
+          'forward mutation is fenced until resume completes the marked rollback',
+        );
+      }
+
+      kc.mode = 'succeed';
+      assert.equal(h.mig.resume().state, 'NATIVE', 'resume completes the marked rollback');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('T-OD6-13c resume finishes a claim-rename crash before a pre-commit rollback marker and preserves K_m', async () => {
+    const kc = new DeleteTrackingKeychain();
+    const h = setup('xai', kc);
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      const staging = stagingOwnerPath(join(h.dir, 'qlb-owner.json'), 'xai');
+      const row = h.store.getMigration('pi-xai')!;
+      const detail = JSON.parse(row.detail_json) as Record<string, unknown>;
+      detail.commitGeneration = h.store.getGrantGeneration(expectedId('xai'));
+      detail.intent = 'pre-commit-rollback';
+      h.store.upsertMigration('pi-xai', 'VALIDATED', JSON.stringify(detail));
+      renameSync(staging, h.ownerPath);
+      kc.deleteCalls.length = 0;
+      assert.equal(
+        h.mig.status().resumeAction,
+        'already committed; finish hygiene (journal only; auth.json shadow-retained) → QLB_OWNED',
+        'status gives the live committed claim priority over the stale rollback marker',
+      );
+
+      const resumed = h.mig.resume();
+      assert.equal(resumed.state, 'QLB_OWNED', 'the committed claim wins over the stale rollback marker');
+      assert.equal(resumed.ownerFile, 'present');
+      assert.deepEqual(kc.deleteCalls, [], 'resume never deletes K_m under the live owner claim');
+      assert.equal(keychainHas(kc, 'xai'), true, 'K_m remains available to the committed owner');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('T-OD6-13c resume routes a readable staging symlink to pre-commit rollback instead of commit', async () => {
+    const kc = new DeleteTrackingKeychain();
+    const h = setup('xai', kc);
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      const staging = stagingOwnerPath(join(h.dir, 'qlb-owner.json'), 'xai');
+      const target = join(h.dir, 'readable-staging-target.json');
+      writeFileSync(target, readFileSync(staging));
+      rmSync(staging);
+      symlinkSync(target, staging);
+
+      assert.equal(h.mig.status().resumeAction, 'before commit: roll back staging (native untouched)');
+      const resumed = h.mig.resume();
+
+      assert.equal(resumed.state, 'NATIVE');
+      assert.equal(existsSync(h.ownerPath), false, 'the symlink is never published as the owner claim');
+      assert.equal(kc.deleteCalls.length, 1, 'the staged Keychain copy is removed only on rollback');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('T-OD6-13c resume refuses a directory staging entry before deleting its Keychain copy', async () => {
+    const kc = new DeleteTrackingKeychain();
+    const h = setup('xai', kc);
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      const staging = stagingOwnerPath(join(h.dir, 'qlb-owner.json'), 'xai');
+      rmSync(staging);
+      mkdirSync(staging);
+
+      assert.equal(h.mig.status().resumeAction, 'before commit: roll back staging (native untouched)');
+      assert.throws(
+        () => h.mig.resume(),
+        (error: unknown) => (error as { message?: unknown; exitCode?: unknown }).message === `cannot roll back: staging entry is not removable ${staging}`
+          && (error as { exitCode?: unknown }).exitCode === 3,
+      );
+      assert.deepEqual(kc.deleteCalls, [], 'the non-removable entry refuses before deleting K_m');
+      assert.equal(keychainHas(kc, 'xai'), true);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('T-OD6-13c recovery-entry refusal exits 3 and preserves the staged credential', () => {
+    const kc = new DeleteTrackingKeychain();
+    const h = setup('xai', kc);
+    try {
+      h.mig.stage();
+      const staging = stagingOwnerPath(join(h.dir, 'qlb-owner.json'), 'xai');
+      writeFileSync(`${staging}.rollback`, 'fixture recovery entry');
+      assert.throws(
+        () => h.mig.rollback(),
+        (error: unknown) => (error as { message?: unknown; exitCode?: unknown }).message === `cannot roll back: staging recovery entry exists ${staging}.rollback`
+          && (error as { exitCode?: unknown }).exitCode === 3,
+      );
+      assert.deepEqual(kc.deleteCalls, [], 'the refusal occurs before the staged Keychain credential is deleted');
+      assert.equal(keychainHas(kc, 'xai'), true);
+    } finally {
+      h.cleanup();
+    }
+  });
+
   it('pre-commit rollback keeps a staged migration retryable when its Keychain delete fails', () => {
     const kc = new RollbackDeleteKeychain();
     const h = setup('xai', kc);

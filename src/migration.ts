@@ -977,8 +977,12 @@ export class Migration {
     if (isObjectRecord(detail.handback) && detail.handback.phase === 'cleanup-pending') {
       throw new Error('handback-cleanup-pending: run `qlb migrate resume`');
     }
-    if (detail.intent === 'rollback' || Object.prototype.hasOwnProperty.call(detail, 'rollbackDecision')) {
-      throw new Error('rollback-in-progress: run `qlb migrate resume`');
+    if (
+      detail.intent === 'rollback'
+      || detail.intent === 'pre-commit-rollback'
+      || Object.prototype.hasOwnProperty.call(detail, 'rollbackDecision')
+    ) {
+      throw Object.assign(new Error('rollback-in-progress: run `qlb migrate resume`'), { exitCode: 3 });
     }
   }
 
@@ -1273,8 +1277,6 @@ export class Migration {
     let resumeAction: string;
     if (rawHandback) {
       resumeAction = 'hand-back complete, cleanup pending — run `qlb migrate resume`';
-    } else if (preCommitRollbackIntent) {
-      resumeAction = 'before commit: roll back staging (native untouched)';
     } else if (intent) {
       resumeAction = staticKey
         ? 'continue rollback to VALIDATED (owner unlinked; native Keychain was never moved)'
@@ -1297,6 +1299,8 @@ export class Migration {
           : 'noop (already QLB_OWNED)';
     } else if (state === 'QLB_OWNED' && !ownerPresent && nativePresent) {
       resumeAction = 'post-RC hygiene: journal VALIDATED';
+    } else if (preCommitRollbackIntent) {
+      resumeAction = 'before commit: roll back staging (native untouched)';
     } else if (state === 'VALIDATED' && ownerStaging && this.readStagingOwnerFile() !== null) {
       resumeAction = 'rehearsal succeeded; complete commit';
     } else if (state === 'MIRRORED' || ownerStaging) {
@@ -1473,8 +1477,11 @@ export class Migration {
       return this.finishHygiene();
     }
     const staging = this.stagingPath();
-    if (!existsSync(staging)) {
+    if (!this.claimPathPresent(staging)) {
       throw new Error(`cannot commit: missing ${staging}`);
+    }
+    if (this.readStagingOwnerFile() === null) {
+      throw Object.assign(new Error(`cannot commit: invalid staging ${staging}`), { exitCode: 3 });
     }
     const current = this.status();
     if (current.state !== 'VALIDATED' && current.state !== 'QLB_OWNED') {
@@ -1576,9 +1583,6 @@ export class Migration {
     if (facts.rollbackInProgress) {
       return this.continueRollback();
     }
-    if (current.detail.intent === 'pre-commit-rollback') {
-      return this.preCommitRollback();
-    }
     // C5: a VALIDATED journal with this path's own commit evidence (`Gen`) is
     // a crash after the commit point. Finish the forward journal transition,
     // then take the ordinary post-commit hand-back path. The pool path is not
@@ -1590,6 +1594,9 @@ export class Migration {
     const ownerPresent = this.claimPresent();
     if (ownerPresent || this.journalState() === 'QLB_OWNED') {
       return this.postCommitRollback();
+    }
+    if (current.detail.intent === 'pre-commit-rollback') {
+      return this.preCommitRollback();
     }
     // C7-C9: only an active pre-commit migration has rollback work. In
     // particular, a finished single-grant hand-back has no claim or staging
@@ -1636,9 +1643,6 @@ export class Migration {
     if (facts.rollbackInProgress) {
       return this.continueRollback();
     }
-    if (current.detail.intent === 'pre-commit-rollback') {
-      return this.preCommitRollback();
-    }
     this.assertNoOrphanOwnershipClaim();
     // Any claim, including a custom owner file (Oc), is past C: finish forward.
     if (this.claimPresent()) {
@@ -1649,6 +1653,9 @@ export class Migration {
       (this.kind === 'static-key' || existsSync(this.poolFilePath))
     ) {
       return this.finishRollbackJournal();
+    }
+    if (current.detail.intent === 'pre-commit-rollback') {
+      return this.preCommitRollback();
     }
     if (
       current.state === 'VALIDATED'
@@ -1856,6 +1863,7 @@ export class Migration {
     const p = this.stagingPath();
     if (!existsSync(p)) return null;
     try {
+      if (!lstatSync(p).isFile()) return null;
       const parsed: unknown = JSON.parse(readFileSync(p, 'utf8'));
       if (parsed && typeof parsed === 'object' && (parsed as OwnerFile).owner === 'qlb') {
         return parsed as OwnerFile;
@@ -2135,7 +2143,25 @@ export class Migration {
     const rollbackStaging = `${staging}.rollback`;
     if (this.claimPathPresent(staging)) {
       if (this.claimPathPresent(rollbackStaging)) {
-        throw new Error(`cannot roll back: staging recovery entry exists ${rollbackStaging}`);
+        throw Object.assign(
+          new Error(`cannot roll back: staging recovery entry exists ${rollbackStaging}`),
+          { exitCode: 3 },
+        );
+      }
+      let stagingEntry;
+      try {
+        stagingEntry = lstatSync(staging);
+      } catch {
+        throw Object.assign(
+          new Error(`cannot roll back: staging entry cannot be inspected ${staging}`),
+          { exitCode: 3 },
+        );
+      }
+      if (!stagingEntry.isFile() && !stagingEntry.isSymbolicLink()) {
+        throw Object.assign(
+          new Error(`cannot roll back: staging entry is not removable ${staging}`),
+          { exitCode: 3 },
+        );
       }
       this.journal(this.journalState(), { intent: 'pre-commit-rollback' });
       // Rename proves the staging entry can leave its claim path before K_m is
