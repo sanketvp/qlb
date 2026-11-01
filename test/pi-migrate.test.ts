@@ -330,12 +330,19 @@ describe('Pi migration S58 credential-first barrier', () => {
         } finally { h.cleanup(); }
       }
 
-      const admitted = [
+      const admitted: Array<{ name: string; state?: string; detail?: string; dual?: boolean; file?: string }> = [
         { name: 'no generic row' },
+        // With no row nothing names the shared item, so a stray owner file does not hold it.
+        { name: 'no generic row with a staging file', file: `qlb-owner.json.${provider}.staging` },
+        { name: 'no generic row with a legacy sidecar', file: `qlb-owner-${provider}.json` },
         { name: 'NATIVE', state: 'NATIVE', detail: JSON.stringify({ accounts: [shared] }) },
-        { name: 'MIRRORED', state: 'MIRRORED', detail: JSON.stringify({ accounts: [shared] }) },
-        { name: 'VALIDATED', state: 'VALIDATED', detail: JSON.stringify({ accounts: [shared] }) },
-        { name: 'RETIRED', state: 'RETIRED', detail: JSON.stringify({ accounts: [shared] }) },
+        // preCommitRollback leaves commitGeneration behind; NATIVE is still at rest.
+        {
+          name: 'NATIVE after a pre-commit rollback',
+          state: 'NATIVE',
+          detail: JSON.stringify({ accounts: [shared], commitGeneration: 3, rolledBackFrom: 'pre-commit' }),
+        },
+        { name: 'VALIDATED without staging', state: 'VALIDATED', detail: JSON.stringify({ accounts: [shared] }) },
         { name: 'QLB_OWNED legacy', state: 'QLB_OWNED', detail: JSON.stringify({ accounts: [singleGrantJournalAccount(provider)] }) },
         { name: 'OD-9 dual ownership with legacy generic journal', state: 'QLB_OWNED', detail: JSON.stringify({ accounts: [singleGrantJournalAccount(provider)] }), dual: true },
       ];
@@ -344,7 +351,91 @@ describe('Pi migration S58 credential-first barrier', () => {
         try {
           if (fixture.dual) migratePiSingleProvider(provider, h.paths, { keychain: h.keychain, store: h.store });
           if (fixture.state && fixture.detail) h.store.upsertMigration(`pi-${provider}`, fixture.state, fixture.detail);
+          if (fixture.file) writeFileSync(join(dirname(h.paths.ownerPath), fixture.file), '{}', { mode: 0o600 });
           assert.doesNotThrow(() => rollbackPiSingleProvider(provider, h.paths, { keychain: h.keychain, store: h.store }), fixture.name);
+        } finally { h.cleanup(); }
+      }
+    });
+
+    it(`${provider}: T-PR1c: pi rollback refuses while the generic migration stages or retires the shared item`, () => {
+      const shared = singleGrantJournalAccount(provider, true);
+      const cases: Array<{
+        name: string;
+        state: string;
+        detail: Record<string, unknown> | string;
+        staging?: boolean;
+      }> = [
+        { name: 'MIRRORED', state: 'MIRRORED', detail: { accounts: [shared] } },
+        { name: 'VALIDATED with staging', state: 'VALIDATED', detail: { accounts: [shared] }, staging: true },
+        { name: 'VALIDATED with commit generation', state: 'VALIDATED', detail: { accounts: [shared], commitGeneration: 1 } },
+        { name: 'RETIRED', state: 'RETIRED', detail: { accounts: [shared] } },
+        // Unreadable or ambiguous evidence is protected by the same S0.6 rules.
+        { name: 'VALIDATED with unparseable detail', state: 'VALIDATED', detail: '{' },
+        { name: 'NATIVE with unparseable detail', state: 'NATIVE', detail: '{' },
+        { name: 'VALIDATED with no accounts and commit generation', state: 'VALIDATED', detail: { accounts: [], commitGeneration: 1 } },
+        {
+          name: 'VALIDATED with two accounts and commit generation',
+          state: 'VALIDATED',
+          detail: { accounts: [shared, singleGrantJournalAccount(provider)], commitGeneration: 1 },
+        },
+      ];
+
+      for (const fixture of cases) {
+        const h = setup(provider);
+        try {
+          migratePiSingleProvider(provider, h.paths, { keychain: h.keychain, store: h.store });
+          h.store.upsertMigration(
+            `pi-${provider}`,
+            fixture.state,
+            typeof fixture.detail === 'string' ? fixture.detail : JSON.stringify(fixture.detail),
+          );
+          if (fixture.staging) {
+            writeFileSync(join(dirname(h.paths.ownerPath), `qlb-owner.json.${provider}.staging`), '{}', { mode: 0o600 });
+          }
+          const ownerBefore = readFileSync(h.paths.ownerPath);
+          const authBefore = readFileSync(h.paths.authJsonPath);
+          const { service, account } = sharedSingleGrantCoords(provider);
+          const itemBefore = h.keychain.getSync(service, account);
+          const stateBefore = h.store.getConfig(`pi.${provider}.state`);
+          const migratedAtBefore = h.store.getConfig(`pi.${provider}.migratedAt`);
+          const keychainWrites: string[] = [];
+          const storeWrites: string[] = [];
+          const keychain = {
+            getSync: h.keychain.getSync.bind(h.keychain),
+            setSync: (targetService: string, targetAccount: string, value: string) => {
+              keychainWrites.push(`set:${targetService}/${targetAccount}`);
+              h.keychain.setSync(targetService, targetAccount, value);
+            },
+            deleteSync: (targetService: string, targetAccount: string) => {
+              keychainWrites.push(`delete:${targetService}/${targetAccount}`);
+              h.keychain.deleteSync(targetService, targetAccount);
+            },
+          };
+          const setConfig = h.store.setConfig.bind(h.store);
+          h.store.setConfig = (key: string, value: string) => {
+            storeWrites.push(`${key}=${value}`);
+            setConfig(key, value);
+          };
+
+          assert.throws(
+            () => rollbackPiSingleProvider(provider, h.paths, { keychain, store: h.store }),
+            (error: unknown) => {
+              const refusal = error as { code?: unknown; exitCode?: unknown; message?: unknown };
+              return refusal.code === 'owned-by-generic-migrate'
+                && refusal.exitCode === 3
+                && typeof refusal.message === 'string'
+                && refusal.message.includes(`generic migration pi-${provider}`)
+                && refusal.message.includes(`qlb migrate rollback --provider ${provider}`);
+            },
+            fixture.name,
+          );
+          assert.equal(readFileSync(h.paths.ownerPath).equals(ownerBefore), true, `${fixture.name}: owner map changed`);
+          assert.equal(readFileSync(h.paths.authJsonPath).equals(authBefore), true, `${fixture.name}: auth.json changed`);
+          assert.equal(h.keychain.getSync(service, account), itemBefore, `${fixture.name}: shared item changed`);
+          assert.deepEqual(keychainWrites, [], `${fixture.name}: Keychain fake was written`);
+          assert.deepEqual(storeWrites, [], `${fixture.name}: store was written`);
+          assert.equal(h.store.getConfig(`pi.${provider}.state`), stateBefore, `${fixture.name}: state config changed`);
+          assert.equal(h.store.getConfig(`pi.${provider}.migratedAt`), migratedAtBefore, `${fixture.name}: migration time changed`);
         } finally { h.cleanup(); }
       }
     });

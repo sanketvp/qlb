@@ -102,35 +102,77 @@ export function resolveSingleGrantKeychain(
   return shared;
 }
 
-/** Durable generic migration facts used for the S66 shared-item guard. */
+/**
+ * Durable generic migration facts used for the S66 shared-item guard. The
+ * owner-file probes are required so that no caller can silently skip S0.6.
+ * `state` and `detailJson` are both null when there is no `migrations[pi-<p>]` row.
+ */
 export interface GenericSharedItemFacts {
   state: string | null;
   detailJson: string | null;
+  hasStaging: boolean;
+  hasLegacySidecar: boolean;
+  hasCustomOwnerFile: boolean;
 }
 
 /**
- * Returns whether S66 protects the shared item from a P7a rollback.
- * A QLB-owned journal protects the item when it records the shared coordinates;
- * unreadable or ambiguous journal evidence (anything but exactly one account)
- * fails closed. Legacy coordinates remain unheld.
+ * S0.6 at-rest test for the shared-item hold. Like `genericMigrationAtRest`, a
+ * row whose detail cannot be read is not at rest. Unlike it, a VALIDATED
+ * journal at a generic commit point (`commitGeneration`) is also not at rest
+ * here (OQ-10: the in-between stages are protected); `genericMigrationAtRest`
+ * does not read `commitGeneration`. NATIVE is at rest whatever it records.
+ */
+function genericSharedItemAtRest(
+  facts: GenericSharedItemFacts,
+  detail: Record<string, unknown> | null,
+): boolean {
+  if (detail == null) return false;
+  if (facts.state === 'VALIDATED' && detail.commitGeneration != null) return false;
+  return isSingleGrantAtRest({
+    p7aOwned: false,
+    state: facts.state as MigrationState | null,
+    handback: detail.handback == null ? null : {} as HandbackMarker,
+    rollbackIntent: detail.intent === 'rollback',
+    rollbackDecision: detail.rollbackDecision == null ? null : {} as RollbackDecision,
+    hasV2OwnerEntry: false,
+    hasLegacySidecar: facts.hasLegacySidecar,
+    hasCustomOwnerFile: facts.hasCustomOwnerFile,
+    commitGeneration: typeof detail.commitGeneration === 'number' ? detail.commitGeneration : null,
+    hasStaging: facts.hasStaging,
+  });
+}
+
+/**
+ * Returns whether S66 protects the shared item from a P7a rollback (OQ-10).
+ * With no generic row nothing names the item, so it is not held. A journal
+ * that resolves to the legacy item is not held (OQ-11). Otherwise, when the
+ * journal names the shared item or its evidence is ambiguous or unreadable,
+ * the item is held while the journal is QLB_OWNED, RETIRED or not at rest.
  */
 export function genericHoldsSharedItem(
   provider: SingleGrantKeychainProvider,
   facts: GenericSharedItemFacts,
 ): boolean {
-  if (facts.state !== 'QLB_OWNED') return false;
+  if (facts.state == null && facts.detailJson == null) return false;
 
+  let detail: Record<string, unknown> | null = null;
   try {
-    const detail: unknown = facts.detailJson == null ? null : JSON.parse(facts.detailJson);
-    if (!isRecord(detail) || !Array.isArray(detail.accounts) || detail.accounts.length !== 1) {
-      throw new JournalKeychainInvalidError();
-    }
-    const coords = resolveSingleGrantKeychain(provider, detail.accounts[0]);
-    const shared = sharedSingleGrantCoords(provider);
-    return coords.service === shared.service && coords.account === shared.account;
-  } catch {
-    return true;
+    const parsed: unknown = facts.detailJson == null ? null : JSON.parse(facts.detailJson);
+    if (isRecord(parsed)) detail = parsed;
+  } catch { /* unreadable: detail stays null */ }
+
+  if (detail != null) {
+    const account = singleJournalAccount(detail.accounts);
+    try {
+      const coords = resolveSingleGrantKeychain(provider, account);
+      const shared = sharedSingleGrantCoords(provider);
+      if (coords.service !== shared.service || coords.account !== shared.account) return false;
+    } catch { /* ambiguous: fail closed below */ }
   }
+
+  return facts.state === 'QLB_OWNED'
+    || facts.state === 'RETIRED'
+    || !genericSharedItemAtRest(facts, detail);
 }
 
 /** The complete durable S5 hand-back marker. */

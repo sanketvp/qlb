@@ -49,6 +49,9 @@ function facts(overrides: Partial<SingleGrantOwnershipFacts> = {}): SingleGrantO
 
 const providers = ['xai', 'kimi-coding'] as const;
 
+/** The S0.6 owner-file probes, all absent. */
+const noProbes = { hasStaging: false, hasLegacySidecar: false, hasCustomOwnerFile: false };
+
 function journalAccount(provider: (typeof providers)[number]): Record<string, unknown> {
   const id = provider === 'xai' ? 'xai-default' : 'kimi-default';
   const label = provider === 'xai' ? 'Grok (xAI)' : 'Kimi K3';
@@ -115,15 +118,18 @@ for (const provider of providers) {
       { handback: { phase: 'cleanup-pending' } },
     ]) {
       assert.equal(genericHoldsSharedItem(provider, {
+        ...noProbes,
         state: 'QLB_OWNED',
         detailJson: JSON.stringify({ accounts: [shared], ...marker }),
       }), true);
     }
     assert.equal(genericHoldsSharedItem(provider, {
+      ...noProbes,
       state: 'QLB_OWNED',
       detailJson: '{',
     }), true);
     assert.equal(genericHoldsSharedItem(provider, {
+      ...noProbes,
       state: 'QLB_OWNED',
       detailJson: detail({ ...account, keychain: { service: 'invalid', account: 'invalid' } }),
     }), true);
@@ -131,30 +137,164 @@ for (const provider of providers) {
     // ambiguous evidence and fails closed (§1).
     for (const accounts of [[], [account, shared], [account, { bogus: true }]]) {
       assert.equal(genericHoldsSharedItem(provider, {
+        ...noProbes,
         state: 'QLB_OWNED',
         detailJson: JSON.stringify({ accounts }),
       }), true, `${accounts.length} accounts`);
     }
 
     assert.equal(genericHoldsSharedItem(provider, {
+      ...noProbes,
       state: 'QLB_OWNED',
       detailJson: detail(account),
     }), false);
     assert.equal(genericHoldsSharedItem(provider, {
+      ...noProbes,
       state: 'QLB_OWNED',
       detailJson: detail({ ...account, keychain: undefined }),
     }), false);
 
-    for (const state of [null, 'NATIVE', 'MIRRORED', 'VALIDATED', 'RETIRED']) {
+    for (const state of [null, 'NATIVE', 'VALIDATED']) {
       assert.equal(genericHoldsSharedItem(provider, {
+        ...noProbes,
         state,
         detailJson: detail(shared),
       }), false, `${state ?? 'no row'} shared`);
       assert.equal(genericHoldsSharedItem(provider, {
+        ...noProbes,
         state,
         detailJson: detail(account),
       }), false, `${state ?? 'no row'} legacy`);
     }
+    // With no `migrations[pi-<p>]` row nothing names the shared item, so a
+    // stray owner file never holds it (OQ-10).
+    for (const probe of ['hasStaging', 'hasLegacySidecar', 'hasCustomOwnerFile'] as const) {
+      assert.equal(genericHoldsSharedItem(provider, {
+        ...noProbes,
+        state: null,
+        detailJson: null,
+        [probe]: true,
+      }), false, `no row with ${probe}`);
+    }
+
+    for (const state of ['MIRRORED', 'RETIRED']) {
+      assert.equal(genericHoldsSharedItem(provider, {
+        ...noProbes,
+        state,
+        detailJson: detail(account),
+      }), false, `${state} without keychain`);
+    }
+  });
+
+  it(`T-KC3b [${provider}] the shared item is also protected while the generic journal stages it or is retired`, () => {
+    const account = journalAccount(provider);
+    const shared = { ...account, keychain: sharedSingleGrantCoords(provider) };
+    const detail = (value: unknown, extra: Record<string, unknown> = {}) => JSON.stringify({ accounts: [value], ...extra });
+
+    for (const fixture of [
+      { name: 'MIRRORED', state: 'MIRRORED', facts: {} },
+      { name: 'VALIDATED with staging', state: 'VALIDATED', facts: { hasStaging: true } },
+      { name: 'VALIDATED with commit generation', state: 'VALIDATED', facts: {}, detail: { commitGeneration: 1 } },
+      { name: 'RETIRED', state: 'RETIRED', facts: {} },
+      { name: 'legacy sidecar', state: 'VALIDATED', facts: { hasLegacySidecar: true } },
+      { name: 'custom owner file', state: 'VALIDATED', facts: { hasCustomOwnerFile: true } },
+    ]) {
+      assert.equal(genericHoldsSharedItem(provider, {
+        ...noProbes,
+        state: fixture.state,
+        detailJson: detail(shared, fixture.detail),
+        ...fixture.facts,
+      }), true, fixture.name);
+    }
+
+    for (const fixture of [
+      { name: 'NATIVE', state: 'NATIVE', facts: {} },
+      { name: 'VALIDATED without staging', state: 'VALIDATED', facts: {} },
+      // preCommitRollback writes NATIVE without clearing commitGeneration;
+      // NATIVE is at rest (plan §OD-9, "NATIVE, or VALIDATED without St").
+      {
+        name: 'NATIVE after a pre-commit rollback',
+        state: 'NATIVE',
+        facts: {},
+        detail: { commitGeneration: 3, rolledBackFrom: 'pre-commit' },
+      },
+    ]) {
+      assert.equal(genericHoldsSharedItem(provider, {
+        ...noProbes,
+        state: fixture.state,
+        detailJson: detail(shared, fixture.detail),
+        ...fixture.facts,
+      }), false, fixture.name);
+    }
+
+    for (const fixture of [
+      { name: 'MIRRORED', state: 'MIRRORED', facts: {} },
+      { name: 'VALIDATED with staging', state: 'VALIDATED', facts: { hasStaging: true } },
+      { name: 'VALIDATED with commit generation', state: 'VALIDATED', facts: {}, detail: { commitGeneration: 1 } },
+      { name: 'RETIRED', state: 'RETIRED', facts: {} },
+      { name: 'legacy sidecar', state: 'VALIDATED', facts: { hasLegacySidecar: true } },
+      { name: 'custom owner file', state: 'VALIDATED', facts: { hasCustomOwnerFile: true } },
+    ]) {
+      assert.equal(genericHoldsSharedItem(provider, {
+        ...noProbes,
+        state: fixture.state,
+        detailJson: detail(account, fixture.detail),
+        ...fixture.facts,
+      }), false, `${fixture.name}: legacy journal`);
+    }
+  });
+
+  it(`T-KC3c [${provider}] an unreadable retired generic journal protects the shared item`, () => {
+    const account = journalAccount(provider);
+    const shared = { ...account, keychain: sharedSingleGrantCoords(provider) };
+    assert.equal(genericHoldsSharedItem(provider, {
+      ...noProbes,
+      state: 'RETIRED',
+      detailJson: '{',
+    }), true);
+
+    // S0.6 (genericMigrationAtRest) calls an unreadable NATIVE/VALIDATED
+    // journal not at rest, so it protects the shared item too.
+    for (const state of ['NATIVE', 'VALIDATED']) {
+      for (const detailJson of ['{', '[]', 'null']) {
+        assert.equal(genericHoldsSharedItem(provider, {
+          ...noProbes,
+          state,
+          detailJson,
+        }), true, `${state} ${detailJson}`);
+      }
+    }
+
+    // An ambiguous journal at a generic commit point is not at rest.
+    for (const accounts of [[], [shared, account], [{ bogus: true }]]) {
+      assert.equal(genericHoldsSharedItem(provider, {
+        ...noProbes,
+        state: 'VALIDATED',
+        detailJson: JSON.stringify({ accounts, commitGeneration: 1 }),
+      }), true, `VALIDATED ${accounts.length} accounts with commit generation`);
+    }
+
+    // Ambiguous evidence in a state that is at rest is not held.
+    for (const state of ['NATIVE', 'VALIDATED']) {
+      assert.equal(genericHoldsSharedItem(provider, {
+        ...noProbes,
+        state,
+        detailJson: JSON.stringify({ accounts: [] }),
+      }), false, `${state} ambiguous at rest`);
+    }
+    assert.equal(genericHoldsSharedItem(provider, {
+      ...noProbes,
+      state: 'NATIVE',
+      detailJson: JSON.stringify({ accounts: [], commitGeneration: 3, rolledBackFrom: 'pre-commit' }),
+    }), false, 'NATIVE ambiguous after a pre-commit rollback');
+  });
+
+  it(`T-KC3d [${provider}] the S0.6 owner-file facts are required`, () => {
+    // A compile-time check: the test build fails if the probes become optional.
+    const omitsProbes = (): boolean =>
+      // @ts-expect-error a caller that omits the owner-file probes must not compile
+      genericHoldsSharedItem(provider, { state: 'NATIVE', detailJson: null });
+    assert.equal(typeof omitsProbes, 'function');
   });
 }
 
