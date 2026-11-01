@@ -20,6 +20,7 @@ async function fixture(options: {
   resolveProfile: ClaudeSwitchDeps['resolveProfile'];
   probeVerdict?: boolean;
   injectFailStep?: 7 | 8 | 9;
+  recordRelogin?: (row: Record<string, unknown>) => number;
 }) {
   const root = mkdtempSync(join(tmpdir(), 'qlb-k9-classify-'));
   const home = join(root, 'home');
@@ -44,7 +45,7 @@ async function fixture(options: {
       getActiveLogin: () => ({ provider: 'anthropic', accountId: active, since: NOW, setBy: 'manual' }),
       getConfig: () => null,
       recordSwitch: (row: Record<string, unknown>) => { rows.push(row); return rows.length; },
-      recordRelogin: (row: Record<string, unknown>) => { relogins.push(row); return relogins.length; },
+      recordRelogin: (row: Record<string, unknown>) => options.recordRelogin?.(row) ?? (relogins.push(row), relogins.length),
       recordClaudeSwitchRefusal: (row: Record<string, unknown>) => { rows.push(row); return rows.length; },
       findClaudeSwitchByAttempt: () => null,
       commitClaudeSwitch: (row: { toAccount: string; beforeCommit?: () => void }) => { row.beforeCommit?.(); commits.push(row); active = row.toAccount; return commits.length; },
@@ -163,7 +164,7 @@ describe('Claude switch classification routing (K9)', () => {
     assert.equal(stored.credential, live);
   });
 
-  it('X22: the nine kinds route exactly as §4.1 step 5 (table-driven: expected slot write / stash / relogin / nothing per kind)', async () => {
+  it('wiped writes one relogin row and the switch commits ok', async () => {
     const wiped = JSON.stringify({ claudeAiOauth: { accessToken: '', refreshToken: '', expiresAt: NOW + 3_600_000 } });
     const ownFamily = JSON.stringify({ claudeAiOauth: { accessToken: 'fixture-access-a-rotated', refreshToken: 'fixture-refresh-a', expiresAt: NOW + 3_600_000 } });
     const cases = [
@@ -270,5 +271,57 @@ describe('Claude switch classification routing (K9)', () => {
       assert.equal(subject.commits.length, 1, scenario.kind);
       assert.equal(subject.commits[0]?.outgoingKind, scenario.kind, scenario.kind);
     }
+
+    const rolledBack = await fixture({
+      live: credential('foreign'),
+      resolveProfile: async () => ({ uuid: 'account-b', email: 'b@example.test', organizationUuid: 'org-b' }),
+      injectFailStep: 8,
+    });
+    const rollbackResult = await switchClaude(rolledBack.deps, { ...rolledBack.input, injected: true });
+    assert.equal(rollbackResult.outcome, 'rolled-back');
+    assert.equal(rolledBack.rows.length, 1);
+    assert.equal(rolledBack.rows[0]?.outgoingKind, 'foreign');
+
+    const failed = await fixture({ live: ownFamily, resolveProfile: async () => null });
+    failed.slots.writeSlot = async () => { throw new Error('fixture keychain write failure'); };
+    const failedResult = await switchClaude(failed.deps, failed.input);
+    assert.equal(failedResult.outcome, 'failed');
+    assert.equal(failed.rows.length, 1);
+    assert.equal(failed.rows[0]?.outgoingKind, 'own-family');
+  });
+
+  it('a wiped relogin write failure records failed without changing the live credential', async () => {
+    const wiped = JSON.stringify({ claudeAiOauth: { accessToken: '', refreshToken: '', expiresAt: NOW + 3_600_000 } });
+    const subject = await fixture({
+      live: wiped,
+      resolveProfile: async () => null,
+      recordRelogin: () => { throw new Error('SQLITE_FULL'); },
+    });
+    const before = await subject.backend.get(subject.paths.keychainService, 'fixture-user');
+
+    const result = await switchClaude(subject.deps, subject.input);
+
+    assert.deepEqual({ outcome: result.outcome, reason: result.reason, error: result.error, outgoingKind: result.outgoingKind }, {
+      outcome: 'failed', reason: 'outgoing-backup-failed', error: 'sqlite-error', outgoingKind: undefined,
+    });
+    assert.equal(subject.rows.length, 1);
+    assert.equal(subject.rows[0]?.outgoingKind, 'wiped');
+    assert.deepEqual(subject.commits, []);
+    assert.equal(await subject.backend.get(subject.paths.keychainService, 'fixture-user'), before);
+  });
+
+  it('refuses an unrecognised classified kind without preserving or replacing credentials', async () => {
+    const subject = await fixture({ live: credential('a'), resolveProfile: async () => null });
+    const before = await slotCredentials(subject);
+    (subject.deps as unknown as { classifyOutgoing: () => never }).classifyOutgoing = () => ({ kind: 'future-kind' } as never);
+
+    const result = await switchClaude(subject.deps, subject.input);
+
+    assert.deepEqual({ outcome: result.outcome, reason: result.reason }, { outcome: 'refused', reason: 'outgoing-unrouted:future-kind' });
+    assert.equal(subject.rows.length, 1);
+    assert.deepEqual(subject.commits, []);
+    assert.deepEqual(subject.relogins, []);
+    assert.deepEqual(await slotCredentials(subject), before);
+    assert.equal(await subject.backend.get(subject.paths.keychainService, 'fixture-user'), credential('a'));
   });
 });
