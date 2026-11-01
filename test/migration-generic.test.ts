@@ -1324,8 +1324,9 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
 
           assert.throws(
             () => h.mig[command](),
-            (error: Error) => {
+            (error: Error & { exitCode?: unknown }) => {
               assert.match(error.message, new RegExp(marker.code));
+              if (marker.code === 'rollback-in-progress') assert.equal(error.exitCode, 3);
               return true;
             },
             `${command}/${marker.name} refuses its active hand-back marker`,
@@ -4986,39 +4987,68 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     }
   });
 
-  it('T-OD6-13c refuses a staging-to-symlink swap after validation without chmod or hygiene', async () => {
-    let h: (Harness & { mig: Migration }) | undefined;
-    let journalAtSwap: ReturnType<ReturnType<typeof openStore>['getMigration']> | undefined;
-    const hConfig = {
-      beforeOwnerFileRename: () => {
-        const staging = stagingOwnerPath(join(h!.dir, 'qlb-owner.json'), 'xai');
-        const target = join(h!.dir, 'post-validation-target.json');
+  it('T-OD6-13c refuses every retry after post-rename owner revalidation fails', async () => {
+    const swaps: Array<[string, (staging: string, dir: string) => void]> = [
+      ['symlink swap', (staging, dir) => {
+        const target = join(dir, 'post-validation-target.json');
         writeFileSync(target, readFileSync(staging), { mode: 0o644 });
         chmodSync(target, 0o644);
         rmSync(staging);
         symlinkSync(target, staging);
-        journalAtSwap = h!.store.getMigration('pi-xai');
-      },
-    };
-    h = setup('xai', new MockKeychain(), hConfig);
-    try {
-      h.mig.stage();
-      await h.mig.rehearse(mockRehearse([]));
-      const target = join(h.dir, 'post-validation-target.json');
-      const nativeBefore = readFileSync(h.authPath);
+      }],
+      ['regular mismatched file', (staging) => {
+        const owner = JSON.parse(readFileSync(staging, 'utf8')) as { accounts: Array<Record<string, unknown>> };
+        owner.accounts[0]!.id = 'wrong-account';
+        writeFileSync(staging, JSON.stringify(owner, null, 2) + '\n');
+      }],
+    ];
 
-      assert.throws(
-        () => h!.mig.commit(),
-        (error: unknown) => (error as { message?: unknown; exitCode?: unknown }).message === `cannot commit: invalid published owner ${h!.ownerPath}; run \`qlb migrate rollback\``
-          && (error as { exitCode?: unknown }).exitCode === 3,
-      );
-      assert.equal(lstatSync(h.ownerPath).isSymbolicLink(), true, 'the swapped symlink is never chmodded through');
-      assert.equal(statSync(target).mode & 0o777, 0o644, 'target permissions remain unchanged');
-      assert.ok(journalAtSwap, 'the seam captured the pre-rename journal');
-      assert.deepEqual(h.store.getMigration('pi-xai'), journalAtSwap, 'finishHygiene does not advance the journal');
-      assert.deepEqual(readFileSync(h.authPath), nativeBefore, 'native auth stays untouched');
-    } finally {
-      h.cleanup();
+    for (const [swapName, swap] of swaps) {
+      let h: (Harness & { mig: Migration }) | undefined;
+      let journalAtSwap: ReturnType<ReturnType<typeof openStore>['getMigration']> | undefined;
+      h = setup('xai', new MockKeychain(), {
+        beforeOwnerFileRename: () => {
+          const staging = stagingOwnerPath(join(h!.dir, 'qlb-owner.json'), 'xai');
+          swap(staging, h!.dir);
+          journalAtSwap = h!.store.getMigration('pi-xai');
+        },
+      });
+      try {
+        h.mig.stage();
+        await h.mig.rehearse(mockRehearse([]));
+        const nativeBefore = readFileSync(h.authPath);
+        const assertRefusalPreservesState = (command: 'first commit' | 'commit retry' | 'resume retry', fn: () => unknown) => {
+          assert.throws(
+            fn,
+            (error: unknown) => (error as { message?: unknown; exitCode?: unknown }).message === `cannot commit: invalid published owner ${h!.ownerPath}; run \`qlb migrate rollback\``
+              && (error as { exitCode?: unknown }).exitCode === 3,
+            `${swapName}/${command} refuses the invalid published owner`,
+          );
+          assert.ok(journalAtSwap, `${swapName}/${command}: the seam captured the pre-rename journal`);
+          assert.equal(journalAtSwap.state, 'VALIDATED', `${swapName}/${command}: journal phase remains VALIDATED`);
+          assert.deepEqual(h!.store.getMigration('pi-xai'), journalAtSwap, `${swapName}/${command}: journal stays unchanged`);
+          assert.deepEqual(readFileSync(h!.authPath), nativeBefore, `${swapName}/${command}: native auth stays untouched`);
+        };
+
+        assertRefusalPreservesState('first commit', () => h!.mig.commit());
+        assert.equal(
+          h.mig.status().resumeAction,
+          'invalid published owner; run `qlb migrate rollback`',
+          `${swapName}/status advises rollback rather than resume`,
+        );
+        assert.deepEqual(h.store.getMigration('pi-xai'), journalAtSwap, `${swapName}/status: journal stays unchanged`);
+        assert.deepEqual(readFileSync(h.authPath), nativeBefore, `${swapName}/status: native auth stays untouched`);
+        assertRefusalPreservesState('commit retry', () => h!.mig.commit());
+        assertRefusalPreservesState('resume retry', () => h!.mig.resume());
+
+        if (swapName === 'symlink swap') {
+          const target = join(h.dir, 'post-validation-target.json');
+          assert.equal(lstatSync(h.ownerPath).isSymbolicLink(), true, 'the swapped symlink is never chmodded through');
+          assert.equal(statSync(target).mode & 0o777, 0o644, 'target permissions remain unchanged');
+        }
+      } finally {
+        h.cleanup();
+      }
     }
   });
 

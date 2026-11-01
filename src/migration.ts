@@ -999,7 +999,7 @@ export class Migration {
       throw Object.assign(new Error('rollback-in-progress: run `qlb migrate resume`'), { exitCode: 3 });
     }
     if (detail.intent === 'rollback' || Object.prototype.hasOwnProperty.call(detail, 'rollbackDecision')) {
-      throw new Error('rollback-in-progress: run `qlb migrate resume`');
+      throw Object.assign(new Error('rollback-in-progress: run `qlb migrate resume`'), { exitCode: 3 });
     }
   }
 
@@ -1300,6 +1300,13 @@ export class Migration {
         : retains
           ? 'continue rollback to NATIVE (owner unlinked; auth.json was never moved)'
           : 'continue rollback to VALIDATED (native restored, owner unlinked)';
+    } else if (
+      ownerPresent
+      && this.kind !== 'static-key'
+      && state === 'VALIDATED'
+      && !this.revalidateAndSecureCommittedOwnerFile()
+    ) {
+      resumeAction = 'invalid published owner; run `qlb migrate rollback`';
     } else if (ownerPresent && STATE_RANK[state] < STATE_RANK.QLB_OWNED) {
       resumeAction = staticKey
         ? 'already committed; finish hygiene (journal only; native Keychain retained) → QLB_OWNED'
@@ -1492,6 +1499,7 @@ export class Migration {
     // document. Read before checking or mutating any migration artifact.
     if (this.kind === 'static-key') readPiOwnerProviders(this.ownerMapPath);
     if (this.ownerEntryPresent()) {
+      this.assertCommittedOwnerFileRevalidated();
       return this.finishHygiene();
     }
     const staging = this.stagingPath();
@@ -1559,10 +1567,7 @@ export class Migration {
     // the newly published destination without following links, then validate
     // the exact descriptor before its best-effort permission hardening.
     if (!this.revalidateAndSecureCommittedOwnerFile()) {
-      throw Object.assign(
-        new Error(`cannot commit: invalid published owner ${this.ownerFilePath}; run \`qlb migrate rollback\``),
-        { exitCode: 3 },
-      );
+      throw this.invalidPublishedOwnerError();
     }
     return this.finishHygiene();
   }
@@ -1670,6 +1675,7 @@ export class Migration {
     this.assertNoOrphanOwnershipClaim();
     // Any claim, including a custom owner file (Oc), is past C: finish forward.
     if (this.claimPresent()) {
+      this.assertCommittedOwnerFileRevalidated();
       return this.finishHygiene();
     }
     if (
@@ -1929,6 +1935,24 @@ export class Migration {
       new Error(`cannot commit: invalid staging ${path}; run \`qlb migrate rollback\``),
       { exitCode: 3 },
     );
+  }
+
+  private invalidPublishedOwnerError(): Error {
+    return Object.assign(
+      new Error(`cannot commit: invalid published owner ${this.ownerFilePath}; run \`qlb migrate rollback\``),
+      { exitCode: 3 },
+    );
+  }
+
+  /** C5 retries must re-check the post-rename destination before hygiene. */
+  private assertCommittedOwnerFileRevalidated(): void {
+    if (
+      this.kind !== 'static-key'
+      && this.journalState() === 'VALIDATED'
+      && !this.revalidateAndSecureCommittedOwnerFile()
+    ) {
+      throw this.invalidPublishedOwnerError();
+    }
   }
 
   /** Re-open by descriptor so chmod cannot follow a staging-path swap after the commit rename. */
