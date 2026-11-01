@@ -20,7 +20,7 @@ import { runPiPoolInventoryCommand } from '../src/commands/pi-pool-inventory';
 import { beginCutover } from '../src/lifecycle';
 import type { CommandContext } from '../src/registry';
 import { DatabaseSync } from 'node:sqlite';
-import { openStore, type PiExportTargetRow } from '../src/store';
+import { openStore, type PiExportTargetInput, type PiExportTargetRow } from '../src/store';
 
 const NOW = 1_700_000_000_000;
 const FP_A = `sha256:${'a'.repeat(64)}`;
@@ -118,7 +118,7 @@ describe('anthropic-pool inventory (P11, AC52)', () => {
         provider: 'xai', target: 'unrelated', slotAccountId: 'default', lineageFp: FP_C, recordedAt: NOW,
       }]);
       const result = inventoryPool({ entries, lineages: sources, store, now: () => NOW });
-      assert.deepEqual(store.listPiExportTargets('anthropic').map((row) => ({ ...row })), result.targets);
+      assert.deepEqual(store.listPiExportTargets('anthropic').map((row) => ({ ...row })), result.targets.map((target) => ({ ...target, recordedBy: 'pool-inventory' })));
       assert.equal(store.listPiExportTargets('xai').length, 1);
     } finally {
       store.close();
@@ -164,7 +164,7 @@ describe('anthropic-pool inventory (P11, AC52)', () => {
     try {
       assert.deepEqual(check.listPiExportTargets('anthropic').map((row) => ({ ...row })), [{
         provider: 'anthropic', target: 'pool-a', slotAccountId: 'slot-a', lineageFp: fingerprint,
-        recordedAt: check.listPiExportTargets('anthropic')[0]!.recordedAt,
+        recordedAt: check.listPiExportTargets('anthropic')[0]!.recordedAt, recordedBy: 'pool-inventory',
       }]);
     } finally {
       check.close();
@@ -213,7 +213,7 @@ describe('anthropic-pool inventory (P11, AC52)', () => {
     try {
       assert.deepEqual(check.listAnthropicSlotLineageChains(), [{ accountId: 'slot-a', lineages: [FP_A] }]);
       assert.deepEqual(check.listPiExportTargets('anthropic').map((row) => ({ ...row })), [{
-        provider: 'anthropic', target: 'pool-a', slotAccountId: 'slot-a', lineageFp: FP_A, recordedAt: NOW,
+        provider: 'anthropic', target: 'pool-a', slotAccountId: 'slot-a', lineageFp: FP_A, recordedAt: NOW, recordedBy: 'pool-inventory',
       }]);
     } finally {
       check.close();
@@ -232,7 +232,7 @@ describe('anthropic-pool inventory (P11, AC52)', () => {
 
       const recordingStore = Object.create(store) as typeof store;
       recordingStore.close = () => {};
-      recordingStore.recordPiExportTargetsIfEmptyClassified = <T extends { targets: PiExportTargetRow[] }>(
+      recordingStore.recordPiExportTargetsIfEmptyClassified = <T extends { targets: PiExportTargetInput[] }>(
         provider: string,
         classifyInTransaction: () => T,
         admit: (db: DatabaseSync) => { ok: boolean; code?: string },
@@ -257,7 +257,7 @@ describe('anthropic-pool inventory (P11, AC52)', () => {
         now: () => NOW,
       }), 0);
       assert.deepEqual(store.listPiExportTargets('anthropic').map((row) => ({ ...row })), [{
-        provider: 'anthropic', target: 'pool-b', slotAccountId: 'slot-a', lineageFp: FP_B, recordedAt: NOW,
+        provider: 'anthropic', target: 'pool-b', slotAccountId: 'slot-a', lineageFp: FP_B, recordedAt: NOW, recordedBy: 'pool-inventory',
       }]);
     } finally {
       store.close();
