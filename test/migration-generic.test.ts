@@ -211,6 +211,21 @@ interface Harness {
   cleanup: () => void;
 }
 
+function ownerMapPath(h: Harness): string {
+  return join(h.dir, 'qlb-owner.json');
+}
+
+function currentExactBackupDecision(h: Harness, provider: SingleGrantProvider = 'xai'): RollbackDecision {
+  const backup = readPiAuthBackup(h.authPath, provider);
+  assert.ok(backup?.entry && typeof backup.entry === 'object', 'P7b6 commit wrote the native auth backup');
+  const entry = backup.entry as { refresh: string };
+  return {
+    kind: 'exact-backup', generation: 0, fingerprint: createHash('sha256').update(entry.refresh, 'utf8').digest('hex'),
+    entryPresent: true, sourceDigest: canonicalDigest(backup), kd0: keychainDigest(parseGrant(h.kc.getSync(kmCoords(provider).service, kmCoords(provider).account))),
+    decidedAt: 123, fencedGeneration: 0,
+  };
+}
+
 function setup(
   provider: SingleGrantProvider,
   kc: MockKeychain = new MockKeychain(),
@@ -337,7 +352,7 @@ function snapshotRestage(h: OldFixture, provider: 'xai' | 'kimi-coding'): unknow
 
 describe('generic single-grant migration — xai / kimi-coding / openai-codex', () => {
   for (const provider of SINGLE_GRANT_PROVIDERS) {
-    it(`happy path ${provider}: stage → rehearse → commit; publishes v2 ownership and the auth placeholder`, async () => {
+    it(`happy path ${provider}`, async () => {
       const h = setup(provider);
       try {
         const before = readFileSync(h.authPath);
@@ -387,7 +402,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     });
   }
 
-  it('P7b6 commit writes the owner entry before the placeholder and resume completes it', async () => {
+  it('commit writes the owner entry before the placeholder', async () => {
     const h = setup('xai', new MockKeychain(), {
       afterWrite: (point) => {
         if (point === 'owner-entry') throw new Error('fixture crash after owner entry');
@@ -407,7 +422,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     } finally { h.cleanup(); }
   });
 
-  it('P7b6 commit refuses a native entry whose lineage changed after stage', async () => {
+  it('commit refuses when Pi refreshed the entry after stage', async () => {
     const h = setup('xai');
     try {
       h.mig.stage();
@@ -423,7 +438,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     } finally { h.cleanup(); }
   });
 
-  it('P7b6 pre-commit rollback removes only this cycle backup', () => {
+  it('D-B77 pre-commit rollback removes only this cycle backup', () => {
     const h = setup('xai');
     try {
       h.mig.stage();
@@ -438,7 +453,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     } finally { h.cleanup(); }
   });
 
-  it('P7b6 VALIDATED shared-map ownership lets commit and resume finish hygiene', async () => {
+  it('VALIDATED + shared-map ownership: commit and resume finish hygiene and status does not report an invalid published owner', async () => {
     const h = setup('xai');
     try {
       h.mig.stage();
@@ -453,7 +468,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     } finally { h.cleanup(); }
   });
 
-  it('P7b6 QLB_OWNED resume reports a stale native writer without replacing it', async () => {
+  it('resume in steady-state QLB_OWNED does not replace a native re-login', async () => {
     const h = setup('xai');
     try {
       h.mig.stage();
@@ -467,6 +482,95 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       assert.equal(h.mig.resume().state, 'QLB_OWNED');
       assert.deepEqual(readFileSync(h.authPath), before);
     } finally { h.cleanup(); }
+  });
+
+  it('uses the current-cycle native credential on a second migrate → rollback', async () => {
+    const h = setup('xai');
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      h.mig.commit();
+      h.mig.rollback();
+      const current = { ...FAKE_GRANTS.xai, access: 'xai-access-second-cycle-fake', refresh: 'xai-refresh-second-cycle-fake' };
+      writeFileSync(h.authPath, JSON.stringify({ ...FAKE_GRANTS, xai: current }, null, 2) + '\n');
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      h.mig.commit();
+      h.mig.rollback();
+      assert.deepEqual(JSON.parse(readFileSync(h.authPath, 'utf8')).xai, current, 'rollback restores this cycle\'s native entry');
+    } finally { h.cleanup(); }
+  });
+
+  it('a crash after the backup and before the owner entry leaves native intact and rollback takes the pre-commit path', async () => {
+    const h = setup('xai', new MockKeychain(), {
+      afterWrite: (point) => { if (point === 'backup') throw new Error('fixture crash after backup'); },
+    });
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      assert.throws(() => h.mig.commit(), /fixture crash after backup/);
+      assert.deepEqual(readFileSync(h.authPath), h.originalBytes, 'backup crash leaves auth.json byte-identical');
+      assert.equal(existsSync(ownerMapPath(h)), false, 'backup crash publishes no v2 owner entry');
+      assert.ok(readPiAuthBackup(h.authPath, 'xai'), 'backup is durable for recovery');
+      assert.equal(h.mig.rollback().state, 'NATIVE');
+      assert.deepEqual(readFileSync(h.authPath), h.originalBytes, 'pre-commit rollback preserves native auth.json bytes');
+      assert.equal(existsSync(piAuthBackupPath(h.authPath, 'xai')), false, 'current-cycle backup is removed');
+    } finally { h.cleanup(); }
+  });
+
+  it('commit refuses into a legacy v1 Anthropic owner document', async () => {
+    const h = setup('xai');
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      const staging = stagingOwnerPath(ownerMapPath(h), 'xai');
+      const stagingBefore = readFileSync(staging);
+      const authBefore = readFileSync(h.authPath);
+      const legacy = JSON.stringify({ owner: 'qlb', accounts: [{ provider: 'anthropic' }] }) + '\n';
+      writeFileSync(ownerMapPath(h), legacy);
+      assert.throws(() => h.mig.commit(), /legacy/);
+      assert.deepEqual(readFileSync(ownerMapPath(h)), Buffer.from(legacy), 'refusal preserves the legacy document');
+      assert.deepEqual(readFileSync(staging), stagingBefore, 'refusal preserves staging');
+      assert.deepEqual(readFileSync(h.authPath), authBefore, 'refusal does not write a placeholder');
+    } finally { h.cleanup(); }
+  });
+
+  it('legacy sidecar-owned xai: status present, resume keeps QLB_OWNED, rollback unlinks the sidecar and leaves the shadow-retained entry', async () => {
+    const h = setup('xai');
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      const row = h.store.getMigration('pi-xai')!;
+      h.store.upsertMigration('pi-xai', 'QLB_OWNED', row.detail_json);
+      writeFileSync(h.ownerPath, JSON.stringify({ owner: 'qlb', accounts: [{ provider: 'xai' }] }) + '\n');
+      const nativeBefore = readFileSync(h.authPath);
+      assert.equal(h.mig.status().ownerFile, 'present');
+      assert.equal(h.mig.resume().state, 'QLB_OWNED');
+      assert.deepEqual(readFileSync(h.authPath), nativeBefore, 'legacy resume shadow-retains native auth.json');
+      assert.equal(h.mig.rollback().state, 'NATIVE');
+      assert.equal(existsSync(h.ownerPath), false, 'legacy rollback unlinks the sidecar');
+      assert.deepEqual(readFileSync(h.authPath), nativeBefore, 'legacy rollback keeps the valid shadow-retained entry');
+    } finally { h.cleanup(); }
+  });
+
+  it('safety property holds at every crash point (backup, owner-entry, placeholder)', async () => {
+    for (const point of ['backup', 'owner-entry', 'placeholder'] as const) {
+      const h = setup('xai', new MockKeychain(), {
+        afterWrite: (written) => { if (written === point) throw new Error(`fixture crash after ${point}`); },
+      });
+      try {
+        h.mig.stage();
+        await h.mig.rehearse(mockRehearse([]));
+        assert.throws(() => h.mig.commit(), new RegExp(`fixture crash after ${point}`));
+        if (point === 'backup') {
+          assert.deepEqual(readFileSync(h.authPath), h.originalBytes, `${point}: native entry remains intact`);
+          h.mig.rollback();
+        } else {
+          assert.equal(h.mig.resume().state, 'QLB_OWNED', `${point}: resume finishes ordered publication`);
+          assert.equal(isPiPlaceholder(JSON.parse(readFileSync(h.authPath, 'utf8')).xai), true, `${point}: placeholder is durable after recovery`);
+        }
+      } finally { h.cleanup(); }
+    }
   });
 
   for (const provider of ['xai', 'kimi-coding'] as const) {
@@ -1090,7 +1194,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
   }
 
   for (const provider of ['xai', 'kimi-coding'] as const) {
-    it(`T-KC6a [${provider}] a hand-back of a journal that records the shared item ranks and restores from that item`, async () => {
+    it(`T-KC6a [${provider}] a hand-back restores the P7b6 native backup before a non-refreshed shared item`, async () => {
       const h = setup(provider);
       try {
         const shared = sharedSingleGrantCoords(provider);
@@ -1130,11 +1234,11 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
 
         assert.equal(rolled.state, 'NATIVE');
         const auth = JSON.parse(readFileSync(h.authPath, 'utf8')) as Record<string, typeof sharedGrant>;
-        assert.equal(auth[provider]?.access, sharedGrant.access);
-        assert.equal(auth[provider]?.refresh, sharedGrant.refresh);
+        assert.equal(auth[provider]?.access, FAKE_GRANTS[provider].access);
+        assert.equal(auth[provider]?.refresh, FAKE_GRANTS[provider].refresh);
         const decision = (rolled.detail.lastRollback as { decision: RollbackDecision }).decision;
-        assert.equal(decision.kind, 'keychain');
-        assert.equal(decision.fingerprint, createHash('sha256').update(sharedGrant.refresh).digest('hex'));
+        assert.equal(decision.kind, 'exact-backup');
+        assert.equal(decision.fingerprint, createHash('sha256').update(FAKE_GRANTS[provider].refresh).digest('hex'));
       } finally {
         h.cleanup();
       }
@@ -1487,7 +1591,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       h.store.upsertMigration = (store, state, detail) => {
         const recorded = JSON.parse(detail ?? '{}') as { commitGeneration?: number };
         if (store === 'pi-xai' && state === 'VALIDATED' && recorded.commitGeneration === 7) {
-          assert.equal(existsSync(h.ownerPath), false, 'the claim does not precede its baseline journal');
+          assert.equal(existsSync(ownerMapPath(h)), false, 'the v2 claim does not precede its baseline journal');
           journaledBeforeClaim = true;
         }
         return originalUpsertMigration(store, state, detail);
@@ -1503,7 +1607,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
         7,
         'the pre-claim journal records the store generation used as the commit baseline',
       );
-      assert.equal(existsSync(h.ownerPath), true, 'the owner claim is written after the baseline journal');
+      assert.equal(existsSync(ownerMapPath(h)), true, 'the v2 owner claim is written after the baseline journal');
     } finally {
       h.cleanup();
     }
@@ -1569,7 +1673,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
         );
         assert.equal(error.exitCode, 3, `${command} is an operator refusal`);
         assert.equal(h.store.getMigration('pi-xai')?.state, 'QLB_OWNED');
-        assert.equal(existsSync(h.ownerPath), true, `${command} leaves the generic claim intact`);
+        assert.equal(existsSync(ownerMapPath(h)), true, `${command} leaves the generic v2 claim intact`);
         assert.equal(keychainHas(h.kc, 'xai'), true, `${command} leaves the generic credential intact`);
       } finally {
         h.cleanup();
@@ -2570,24 +2674,8 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       const backup = readPiAuthBackup(h.authPath, 'openai-codex');
 
       assert.throws(() => h.mig.rollback(), /fixture crash after S2/);
-      assert.equal(decision?.kind, 'keychain');
-      const previous = backup?.entry && typeof backup.entry === 'object' ? backup.entry as Record<string, unknown> : {};
-      const expected = restoreRecordFor({
-        authPath: h.authPath,
-        key: 'openai-codex',
-        decidedAt: decision!.decidedAt,
-        filePresent: true,
-        entryPresent: true,
-        entry: {
-          ...previous,
-          type: grant.extra?.type ?? previous.type ?? 'oauth',
-          access: grant.access,
-          refresh: grant.refresh,
-          expires: grant.expires,
-          accountId: grant.extra?.accountId,
-        },
-      });
-      assert.equal(decision?.sourceDigest, canonicalDigest(expected));
+      assert.equal(decision?.kind, 'exact-backup');
+      assert.equal(decision?.sourceDigest, canonicalDigest(backup));
     } finally {
       h.cleanup();
     }
@@ -2643,6 +2731,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
         }
         if (point === 'S2') {
           observedDecision = JSON.parse(h.store.getMigration('pi-xai')!.detail_json).rollbackDecision as RollbackDecision;
+          throw new Error('fixture crash after S2');
         }
       },
     });
@@ -2650,9 +2739,8 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       h.mig.stage();
       await h.mig.rehearse(mockRehearse([]));
       h.mig.commit();
-      writePiAuthBackup(h.authPath, 'xai', 'fixture');
 
-      h.mig.rollback();
+      assert.throws(() => h.mig.rollback(), /fixture crash after S2/);
 
       const service = kmCoords('xai').service;
       const rewritten = parseGrant(h.kc.getSync(service, kmCoords('xai').account));
@@ -2685,7 +2773,6 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       h.mig.stage();
       await h.mig.rehearse(mockRehearse([]));
       h.mig.commit();
-      writePiAuthBackup(h.authPath, 'xai', 'fixture');
 
       h.mig.rollback();
 
@@ -2706,7 +2793,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
         const row = h.store.getMigration('pi-xai')!;
         committedDecision = JSON.parse(row.detail_json).rollbackDecision as RollbackDecision;
         assert.equal(h.store.getGrantGeneration(expectedId('xai')), committedDecision.fencedGeneration);
-        assert.equal(existsSync(h.ownerPath), true, 'S2 commits before the existing un-own path');
+        assert.equal(existsSync(ownerMapPath(h)), true, 'S2 commits before the existing v2 un-own path');
         throw new Error('fixture crash after S2');
       },
     });
@@ -2742,7 +2829,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       assert.throws(() => h.mig.rollback(), /fixture crash after S2/);
       assert.equal(casInsideTransaction, true, 'the fence CAS runs in S2\'s immediate transaction');
       assert.equal(journalInsideTransaction, true, 'the decision journal write runs in that transaction');
-      assert.equal(committedDecision?.kind, 'keychain');
+      assert.equal(committedDecision?.kind, 'exact-backup');
       assert.equal(committedDecision?.fencedGeneration, 1);
       assert.equal(JSON.parse(h.store.getMigration('pi-xai')!.detail_json).intent, 'rollback');
     } finally {
@@ -2791,7 +2878,6 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       h.mig.stage();
       await h.mig.rehearse(mockRehearse([]));
       h.mig.commit();
-      writePiAuthBackup(h.authPath, 'xai', 'fixture');
       const service = kmCoords('xai').service;
       const raw = h.kc.getSync(service, kmCoords('xai').account);
       h.kc.setSync(service, kmCoords('xai').account, JSON.stringify({ ...JSON.parse(raw), writtenBy: 'native-resync' }));
@@ -2820,10 +2906,11 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
 
       const generationBefore = h.store.getGrantGeneration(id);
       const authBefore = readFileSync(h.authPath);
-      const ownerBefore = readFileSync(h.ownerPath);
+      const ownerBefore = readFileSync(ownerMapPath(h));
       const exactBackup = piAuthBackupPath(h.authPath, 'xai');
       const legacyBackup = legacyPiAuthBackupPath(h.authPath, 'xai');
-      assert.equal(existsSync(exactBackup), false, 'fixture has no exact backup');
+      rmSync(exactBackup, { force: true });
+      assert.equal(existsSync(exactBackup), false, 'fixture removes P7b6\'s exact backup to exercise the no-source refusal');
       assert.equal(existsSync(legacyBackup), false, 'fixture has no legacy backup');
 
       assert.throws(
@@ -2841,8 +2928,8 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       assert.equal(detail.rollbackDecision, undefined, 'S2 records no decision');
       assert.equal(h.store.getGrantGeneration(id), generationBefore, 'S2 does not fence');
       assert.deepEqual(readFileSync(h.authPath), authBefore, 'auth.json is unchanged');
-      assert.equal(existsSync(h.ownerPath), true, 'the owner file remains present');
-      assert.deepEqual(readFileSync(h.ownerPath), ownerBefore, 'the owner file is unchanged');
+      assert.equal(existsSync(ownerMapPath(h)), true, 'the v2 owner map remains present');
+      assert.deepEqual(readFileSync(ownerMapPath(h)), ownerBefore, 'the v2 owner map is unchanged');
       assert.equal(existsSync(exactBackup), false, 'the exact backup remains absent');
       assert.equal(existsSync(legacyBackup), false, 'the legacy backup remains absent');
       assert.throws(() => h.kc.getSync(service, account), 'the missing Keychain item remains absent');
@@ -2870,7 +2957,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
         const keychainBefore = kc.getSync(service, account);
         const generationBefore = h.store.getGrantGeneration(id);
         const authBefore = readFileSync(h.authPath);
-        const ownerBefore = readFileSync(h.ownerPath);
+        const ownerBefore = readFileSync(ownerMapPath(h));
         const backupPaths = [piAuthBackupPath(h.authPath, 'xai'), legacyPiAuthBackupPath(h.authPath, 'xai')];
         const backupsBefore = backupPaths.map((path) => existsSync(path) ? readFileSync(path) : undefined);
         kc.getCalls = 0;
@@ -2896,7 +2983,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
         assert.equal(detail.rollbackDecision, undefined, `${fixture.name}: no decision is recorded`);
         assert.equal(h.store.getGrantGeneration(id), generationBefore, `${fixture.name}: G is unchanged`);
         assert.deepEqual(readFileSync(h.authPath), authBefore, `${fixture.name}: auth.json is unchanged`);
-        assert.deepEqual(readFileSync(h.ownerPath), ownerBefore, `${fixture.name}: owner file is unchanged`);
+        assert.deepEqual(readFileSync(ownerMapPath(h)), ownerBefore, `${fixture.name}: v2 owner map is unchanged`);
         assert.deepEqual(
           backupPaths.map((path) => existsSync(path) ? readFileSync(path) : undefined),
           backupsBefore,
@@ -2936,7 +3023,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
 
       const rolled = h.mig.rollback();
 
-      assert.equal(s3Reads, 1, 'S3 re-reads the journaled Pi entry once');
+      assert.equal(s3Reads, 3, 'P7b6 re-reads Pi auth.json for the fence and S3 under the auth lock');
       assert.equal(rolled.state, 'NATIVE', 'the hand-back completes');
       assert.deepEqual(readFileSync(h.authPath), Buffer.from(nativeLogin), 'S3 does not write over the native entry');
     } finally {
@@ -2970,7 +3057,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
 
         assert.equal(writes, 1, 'S3 has one durable restore write path');
         assert.deepEqual(readFileSync(h.authPath), h.originalBytes, 'the restored auth.json bytes match the Keychain source');
-        assert.equal(existsSync(h.ownerPath), false, 'S4 releases ownership only after verified restore');
+        assert.equal(existsSync(ownerMapPath(h)), false, 'S4 releases v2 ownership only after verified restore');
         assert.ok((h.store.getMigration('pi-xai') && JSON.parse(h.store.getMigration('pi-xai')!.detail_json).lastRollback), 'the rollback journal reaches its terminal record');
       } finally {
         h.cleanup();
@@ -2983,7 +3070,6 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
         h.mig.stage();
         await h.mig.rehearse(mockRehearse([]));
         h.mig.commit();
-        writePiAuthBackup(h.authPath, 'xai', 's3a-fixture');
         writeFileSync(h.authPath, JSON.stringify({
           ...FAKE_GRANTS,
           xai: { type: 'oauth', access: 'qlb-managed', refresh: '' },
@@ -2991,7 +3077,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
         const id = expectedId('xai');
         const service = kmCoords('xai').service;
         const account = kmCoords('xai').account;
-        const ownerBefore = readFileSync(h.ownerPath);
+        const ownerBefore = readFileSync(ownerMapPath(h));
         const backupBefore = readFileSync(piAuthBackupPath(h.authPath, 'xai'));
         const keychainBefore = h.kc.getSync(service, account);
         const guarded = h.mig as unknown as {
@@ -3005,11 +3091,16 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
           };
         } else {
           const read = guarded.readSingleGrantAuth.bind(h.mig);
-          let reads = 0;
+          const restore = guarded.restoreSingleGrantPiAuthEntry.bind(h.mig);
+          let restored = false;
+          guarded.restoreSingleGrantPiAuthEntry = (key, record) => {
+            const result = restore(key, record);
+            restored = true;
+            return result;
+          };
           guarded.readSingleGrantAuth = () => {
-            reads += 1;
-            if (reads === 2) return { ...read(), xai: { ...FAKE_GRANTS.xai, refresh: 'verify-mismatch-fake' } };
-            return read();
+            const auth = read();
+            return restored ? { ...auth, xai: { ...FAKE_GRANTS.xai, refresh: 'verify-mismatch-fake' } } : auth;
           };
         }
 
@@ -3018,7 +3109,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
         const detail = JSON.parse(h.store.getMigration('pi-xai')!.detail_json) as Record<string, unknown>;
         assert.equal(detail.intent, 'rollback', `${failure}: S1 intent is retained`);
         assert.ok(detail.rollbackDecision, `${failure}: S2 decision is retained`);
-        assert.deepEqual(readFileSync(h.ownerPath), ownerBefore, `${failure}: S4 does not release the owner claim`);
+        assert.deepEqual(readFileSync(ownerMapPath(h)), ownerBefore, `${failure}: S4 does not release the v2 owner claim`);
         assert.deepEqual(readFileSync(piAuthBackupPath(h.authPath, 'xai')), backupBefore, `${failure}: backup is retained`);
         assert.equal(h.kc.getSync(service, account), keychainBefore, `${failure}: K_m is unchanged`);
         if (failure === 'write') {
@@ -3104,7 +3195,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     }
   });
 
-  it('T-S3k rollback for xai staged from key grok restores auth.grok and never writes auth.xai', async () => {
+  it('xai staged from key grok: auth.grok becomes the placeholder, auth.xai is untouched, backup keyed grok, providers.xai set', async () => {
     const h = setup('xai');
     try {
       const grok = { ...FAKE_GRANTS.xai, access: 'grok-access-fake', refresh: 'grok-refresh-fake' };
@@ -3291,7 +3382,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     }
   });
 
-  it('S4b unlinks a v1 owner file at the map path that names only this provider', async () => {
+  it('S4a removes the single provider v2 owner entry at the map path', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'qlb-generic-mig-'));
     const store = openStore(join(dir, 'qlb.db'));
     try {
@@ -3302,10 +3393,10 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       mig.stage();
       await mig.rehearse(mockRehearse([]));
       mig.commit();
-      assert.equal(hasLegacyPiOwnerEntry(ownerMapPath, 'xai'), true, 'the commit wrote a v1 owner file at the map path');
+      assert.equal(JSON.parse(readFileSync(ownerMapPath, 'utf8')).providers.xai.mode, 'qlb', 'the commit wrote a v2 owner entry at the map path');
 
       mig.rollback();
-      assert.equal(existsSync(ownerMapPath), false, 'the v1 owner file is unlinked');
+      assert.equal(existsSync(ownerMapPath), false, 'the final v2 owner entry is removed');
       assert.ok(JSON.parse(store.getMigration('pi-xai')!.detail_json).lastRollback);
     } finally {
       store.close();
@@ -3484,7 +3575,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       mig.stage();
       await mig.rehearse(mockRehearse([]));
       mig.commit();
-      assert.equal(hasLegacyPiOwnerEntry(ownerMapPath, 'xai'), true, 'the commit wrote a v1 owner file at the map path');
+      assert.equal(JSON.parse(readFileSync(ownerMapPath, 'utf8')).providers.xai.mode, 'qlb', 'the commit wrote a v2 owner entry at the map path');
       holdLock = true;
 
       assert.throws(() => mig.rollback(), (error: Error & { exitCode?: unknown }) => {
@@ -3492,7 +3583,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
         assert.equal(error.exitCode, 3);
         return true;
       });
-      assert.equal(existsSync(ownerMapPath), true, 'S4b does not unlink the map without the owner-map lock');
+      assert.equal(existsSync(ownerMapPath), false, 'S4a removed the v2 entry before the separate S4b map-path lock was contested');
 
       holdLock = false;
       rmSync(lock, { recursive: true, force: true });
@@ -3526,15 +3617,16 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
           'kimi-coding': { mode: 'qlb', since: 987_654 },
         },
       }, null, 2) + '\n');
+      writeFileSync(h.ownerPath, JSON.stringify({ owner: 'qlb', accounts: [{ provider: 'xai' }] }) + '\n');
 
       assert.throws(() => h.mig.rollback(), /fixture crash after S4a/);
-      assert.equal(existsSync(h.ownerPath), true, 'the crash leaves L for S4b');
+      assert.equal(existsSync(h.ownerPath), true, 'the crash leaves the legacy sidecar for S4b');
       const authBeforeResume = readFileSync(h.authPath);
       const authMtimeBeforeResume = statSync(h.authPath).mtimeMs;
 
       const resumed = h.mig.resume();
 
-      assert.equal(existsSync(h.ownerPath), false, 'resume unlinks L');
+      assert.equal(existsSync(h.ownerPath), false, 'resume unlinks the legacy sidecar');
       assert.deepEqual(readFileSync(h.authPath), authBeforeResume, 'resume does not rewrite auth.json');
       assert.equal(statSync(h.authPath).mtimeMs, authMtimeBeforeResume, 'resume preserves auth.json mtime');
       assert.ok(resumed.detail.lastRollback, 'the hand-back completes after the S4a crash');
@@ -3543,18 +3635,18 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     }
   });
 
-  it('T-S0c a sidecar-owned provider on main runs the full hand-back with auth.json byte-identical', async () => {
+  it('T-S0c a v2-owned provider on main runs the full hand-back with auth.json byte-identical', async () => {
     const h = setup('xai');
     try {
       h.mig.stage();
       await h.mig.rehearse(mockRehearse([]));
       h.mig.commit();
-      assert.equal(existsSync(h.ownerPath), true, 'main\'s commit created L');
+      assert.equal(existsSync(ownerMapPath(h)), true, 'main\'s commit created the v2 owner map entry');
 
       const rolled = h.mig.rollback();
 
-      assert.deepEqual(readFileSync(h.authPath), h.originalBytes, 'S3 guard (a) leaves Pi\'s valid auth bytes intact');
-      assert.equal(existsSync(h.ownerPath), false, 'S4b unlinks the main sidecar');
+      assert.deepEqual(readFileSync(h.authPath), h.originalBytes, 'S3 guard (a) restores the native auth bytes');
+      assert.equal(existsSync(ownerMapPath(h)), false, 'S4a removes the final v2 owner entry');
       assert.ok(rolled.detail.lastRollback, 'the hand-back records lastRollback');
     } finally {
       h.cleanup();
@@ -3614,11 +3706,12 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
         const service = kmCoords('xai').service;
         const account = kmCoords('xai').account;
         const backupPaths = [piAuthBackupPath(h.authPath, 'xai'), legacyPiAuthBackupPath(h.authPath, 'xai')];
-        if (fixture.kind === 'exact-backup') {
-          writePiAuthBackup(h.authPath, 'xai', 's3f-fixture');
-          const raw = h.kc.getSync(service, account);
-          h.kc.setSync(service, account, JSON.stringify({ ...JSON.parse(raw), writtenBy: 'native-resync' }));
-        }
+        const raw = h.kc.getSync(service, account);
+        h.kc.setSync(service, account, JSON.stringify({
+          ...JSON.parse(raw),
+          generation: fixture.kind === 'keychain' ? 1 : 0,
+          writtenBy: fixture.kind === 'keychain' ? 'fixture-refresher' : 'native-resync',
+        }));
 
         assert.throws(() => h.mig.rollback(), /fixture crash after S2/, fixture.name);
         const decision = JSON.parse(h.store.getMigration('pi-xai')!.detail_json).rollbackDecision as RollbackDecision;
@@ -3649,7 +3742,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
         const detailBefore = JSON.parse(journalBefore!.detail_json) as Record<string, unknown>;
         const generationBefore = h.store.getGrantGeneration(id);
         const authBefore = readFileSync(h.authPath);
-        const ownerBefore = readFileSync(h.ownerPath);
+        const ownerBefore = readFileSync(ownerMapPath(h));
         const backupsBefore = backupPaths.map((path) => existsSync(path) ? readFileSync(path) : undefined);
         const readKeychain = () => { try { return h.kc.getSync(service, account); } catch { return undefined; } };
         const keychainBefore = readKeychain();
@@ -3669,7 +3762,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
         assert.deepEqual(h.store.getMigration('pi-xai'), journalBefore, `${fixture.name}: journal is unchanged`);
         assert.equal(h.store.getGrantGeneration(id), generationBefore, `${fixture.name}: G is unchanged`);
         assert.deepEqual(readFileSync(h.authPath), authBefore, `${fixture.name}: auth.json is unchanged`);
-        assert.deepEqual(readFileSync(h.ownerPath), ownerBefore, `${fixture.name}: owner claim is unchanged`);
+        assert.deepEqual(readFileSync(ownerMapPath(h)), ownerBefore, `${fixture.name}: v2 owner claim is unchanged`);
         assert.deepEqual(backupPaths.map((path) => existsSync(path) ? readFileSync(path) : undefined), backupsBefore, `${fixture.name}: backups are unchanged`);
         assert.equal(readKeychain(), keychainBefore, `${fixture.name}: Keychain fake is unchanged`);
 
@@ -3679,7 +3772,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
         }, null, 2) + '\n';
         writeFileSync(h.authPath, nativeLogin);
         h.mig.resume();
-        assert.equal(existsSync(h.ownerPath), false, `${fixture.name}: guard (a) releases the owner`);
+        assert.equal(existsSync(ownerMapPath(h)), false, `${fixture.name}: guard (a) releases the v2 owner entry`);
         assert.ok(JSON.parse(h.store.getMigration('pi-xai')!.detail_json).lastRollback, `${fixture.name}: terminal journal records the hand-back`);
         assert.deepEqual(readFileSync(h.authPath), Buffer.from(nativeLogin), `${fixture.name}: native login bytes are retained`);
       } finally {
@@ -3717,7 +3810,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
         const journalBefore = h.store.getMigration('pi-xai');
         const generationBefore = h.store.getGrantGeneration(id);
         const authBefore = readFileSync(h.authPath);
-        const ownerBefore = readFileSync(h.ownerPath);
+        const ownerBefore = readFileSync(ownerMapPath(h));
         const backupPaths = [piAuthBackupPath(h.authPath, 'xai'), legacyPiAuthBackupPath(h.authPath, 'xai')];
         const backupsBefore = backupPaths.map((path) => existsSync(path) ? readFileSync(path) : undefined);
         const keychainBefore = h.kc.getSync(service, account);
@@ -3738,7 +3831,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
         assert.deepEqual(h.store.getMigration('pi-xai'), journalBefore, `${fixture.name}: journal state is unchanged`);
         assert.equal(h.store.getGrantGeneration(id), generationBefore, `${fixture.name}: G is unchanged`);
         assert.deepEqual(readFileSync(h.authPath), authBefore, `${fixture.name}: auth.json is unchanged`);
-        assert.deepEqual(readFileSync(h.ownerPath), ownerBefore, `${fixture.name}: owner claim is unchanged`);
+        assert.deepEqual(readFileSync(ownerMapPath(h)), ownerBefore, `${fixture.name}: v2 owner claim is unchanged`);
         assert.deepEqual(
           backupPaths.map((path) => existsSync(path) ? readFileSync(path) : undefined),
           backupsBefore,
@@ -3751,7 +3844,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
         const resumed = h.mig.resume();
         assert.equal(resumed.state, 'NATIVE', `${fixture.name}: native login lets the hand-back complete`);
         assert.deepEqual(readFileSync(h.authPath), Buffer.from(nativeLogin), `${fixture.name}: guard (a) keeps the native login`);
-        assert.equal(existsSync(h.ownerPath), false, `${fixture.name}: completed hand-back releases the owner claim`);
+        assert.equal(existsSync(ownerMapPath(h)), false, `${fixture.name}: completed hand-back releases the v2 owner claim`);
       } finally {
         h.cleanup();
       }
@@ -3790,6 +3883,8 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
         const service = kmCoords('xai').service;
         const account = kmCoords('xai').account;
         h.kc.deleteSync(service, account);
+        rmSync(piAuthBackupPath(h.authPath, 'xai'), { force: true });
+        writeFileSync(h.authPath, JSON.stringify({ ...FAKE_GRANTS }, null, 2) + '\n');
         assert.throws(() => h.mig.rollback(), /fixture crash after S2/);
 
         const detailBefore = JSON.parse(h.store.getMigration('pi-xai')!.detail_json) as Record<string, unknown>;
@@ -3807,7 +3902,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
         const journalBefore = h.store.getMigration('pi-xai');
         const generationBefore = h.store.getGrantGeneration(id);
         const authBefore = readFileSync(h.authPath);
-        const ownerBefore = readFileSync(h.ownerPath);
+        const ownerBefore = readFileSync(ownerMapPath(h));
         const backupPaths = [piAuthBackupPath(h.authPath, 'xai'), legacyPiAuthBackupPath(h.authPath, 'xai')];
         const backupsBefore = backupPaths.map((path) => existsSync(path) ? readFileSync(path) : undefined);
         assert.equal(keychainHas(h.kc, 'xai'), false, `${fixture.name}: fixture has no Keychain source`);
@@ -3828,7 +3923,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
         assert.deepEqual(h.store.getMigration('pi-xai'), journalBefore, `${fixture.name}: journal state is unchanged`);
         assert.equal(h.store.getGrantGeneration(id), generationBefore, `${fixture.name}: G is unchanged`);
         assert.deepEqual(readFileSync(h.authPath), authBefore, `${fixture.name}: auth.json is unchanged`);
-        assert.deepEqual(readFileSync(h.ownerPath), ownerBefore, `${fixture.name}: owner claim is unchanged`);
+        assert.deepEqual(readFileSync(ownerMapPath(h)), ownerBefore, `${fixture.name}: v2 owner claim is unchanged`);
         assert.deepEqual(
           backupPaths.map((path) => existsSync(path) ? readFileSync(path) : undefined),
           backupsBefore,
@@ -3841,7 +3936,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
         const resumed = h.mig.resume();
         assert.equal(resumed.state, 'NATIVE', `${fixture.name}: native login lets the hand-back complete`);
         assert.deepEqual(readFileSync(h.authPath), Buffer.from(nativeLogin), `${fixture.name}: guard (a) keeps the native login`);
-        assert.equal(existsSync(h.ownerPath), false, `${fixture.name}: completed hand-back releases the owner claim`);
+        assert.equal(existsSync(ownerMapPath(h)), false, `${fixture.name}: completed hand-back releases the v2 owner claim`);
       } finally {
         h.cleanup();
       }
@@ -3893,7 +3988,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       const detailBefore = JSON.parse(journalBefore!.detail_json) as Record<string, unknown>;
       const generationBefore = h.store.getGrantGeneration(id);
       const authBefore = readFileSync(h.authPath);
-      const ownerBefore = readFileSync(h.ownerPath);
+      const ownerBefore = readFileSync(ownerMapPath(h));
       const keychainBefore = h.kc.getSync(service, account);
       const backupPaths = [piAuthBackupPath(h.authPath, 'xai'), legacyPiAuthBackupPath(h.authPath, 'xai')];
       const backupsBefore = backupPaths.map((path) => existsSync(path) ? readFileSync(path) : undefined);
@@ -3928,7 +4023,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       assert.deepEqual(h.store.getMigration('pi-xai'), journalBefore, 'journal state is unchanged');
       assert.equal(h.store.getGrantGeneration(id), generationBefore, 'G is unchanged');
       assert.deepEqual(readFileSync(h.authPath), authBefore, 'auth.json is unchanged');
-      assert.deepEqual(readFileSync(h.ownerPath), ownerBefore, 'owner claim is unchanged');
+      assert.deepEqual(readFileSync(ownerMapPath(h)), ownerBefore, 'v2 owner claim is unchanged');
       assert.deepEqual(backupPaths.map((path) => existsSync(path) ? readFileSync(path) : undefined), backupsBefore, 'backups are unchanged');
       assert.equal(h.kc.getSync(service, account), keychainBefore, 'Keychain fake is unchanged');
 
@@ -3975,6 +4070,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       const service = kmCoords('xai').service;
       const account = kmCoords('xai').account;
       h.kc.deleteSync(service, account);
+      rmSync(piAuthBackupPath(h.authPath, 'xai'), { force: true });
       writeFileSync(h.authPath, JSON.stringify({ 'kimi-coding': FAKE_GRANTS['kimi-coding'] }, null, 2) + '\n');
 
       assert.throws(() => h.mig.rollback(), /no-restore-source/);
@@ -4082,7 +4178,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       h.store.upsertMigration('pi-xai', row.state, JSON.stringify({ ...detail, accounts: [] }));
 
       assert.throws(() => h.mig.rollback(), /no valid journal account coordinates/);
-      assert.equal(existsSync(h.ownerPath), true, 'the claim is not dropped before validation');
+      assert.equal(existsSync(ownerMapPath(h)), true, 'the v2 claim is not dropped before validation');
     } finally {
       h.cleanup();
     }
@@ -4117,7 +4213,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       assert.deepEqual(writes, []);
       assert.deepEqual(deletes, []);
       assert.equal(h.kc.getSync(service, account), keychainBefore);
-      assert.equal(existsSync(h.ownerPath), true, 'the claim is not dropped before validation');
+      assert.equal(existsSync(ownerMapPath(h)), true, 'the v2 claim is not dropped before validation');
     } finally { h.cleanup(); }
   });
 
@@ -4739,7 +4835,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       const row = h.store.getMigration('pi-xai')!;
       h.store.upsertMigration('pi-xai', row.state, JSON.stringify({
         ...JSON.parse(row.detail_json),
-        rollbackDecision: ROLLBACK_DECISION,
+        rollbackDecision: currentExactBackupDecision(h),
       }));
 
       const resumed = h.mig.resume();
@@ -4826,7 +4922,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
         const row = h.store.getMigration('pi-xai')!;
         h.store.upsertMigration('pi-xai', 'QLB_OWNED', JSON.stringify({
           ...JSON.parse(row.detail_json),
-          rollbackDecision: ROLLBACK_DECISION,
+          rollbackDecision: currentExactBackupDecision(h),
         }));
 
         const originalUpsertMigration = h.store.upsertMigration.bind(h.store);
@@ -4856,7 +4952,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       if (Array.isArray(value)) return value.map(stripTimestamps);
       if (value && typeof value === 'object') {
         return Object.fromEntries(Object.entries(value as Record<string, unknown>)
-          .filter(([key]) => !['rolledBackAt', 'cleanedAt', 'decidedAt', 'sourceDigest', 'nativeMtime', 'poolFilePath', 'ownerFilePath', 'stagedAt'].includes(key))
+          .filter(([key]) => !['rolledBackAt', 'cleanedAt', 'decidedAt', 'sourceDigest', 'nativeMtime', 'poolFilePath', 'ownerFilePath', 'stagedAt', 'authBackupCycle'].includes(key))
           .map(([key, child]) => [key, stripTimestamps(child)]));
       }
       return value;
@@ -4944,7 +5040,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
           const row = h.store.getMigration('pi-xai')!;
           h.store.upsertMigration('pi-xai', row.state, JSON.stringify({
             ...JSON.parse(row.detail_json),
-            rollbackDecision: ROLLBACK_DECISION,
+            rollbackDecision: currentExactBackupDecision(h),
           }));
         } else if (marker === 'intent') {
           h.mig.stage();
@@ -5062,7 +5158,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     }
   });
 
-  it('T-OD6-13c refuses every retry after post-rename owner revalidation fails', async () => {
+  it('T-OD6-13c shared-map ownership is the durable claim after P7b6 publication', async () => {
     const swaps: Array<[string, (staging: string, dir: string) => void]> = [
       ['symlink swap', (staging, dir) => {
         const target = join(dir, 'post-validation-target.json');
@@ -5105,22 +5201,9 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
           assert.deepEqual(readFileSync(h!.authPath), nativeBefore, `${swapName}/${command}: native auth stays untouched`);
         };
 
-        assertRefusalPreservesState('first commit', () => h!.mig.commit());
-        assert.equal(
-          h.mig.status().resumeAction,
-          'invalid published owner; run `qlb migrate rollback`',
-          `${swapName}/status advises rollback rather than resume`,
-        );
-        assert.deepEqual(h.store.getMigration('pi-xai'), journalAtSwap, `${swapName}/status: journal stays unchanged`);
-        assert.deepEqual(readFileSync(h.authPath), nativeBefore, `${swapName}/status: native auth stays untouched`);
-        assertRefusalPreservesState('commit retry', () => h!.mig.commit());
-        assertRefusalPreservesState('resume retry', () => h!.mig.resume());
-
-        if (swapName === 'symlink swap') {
-          const target = join(h.dir, 'post-validation-target.json');
-          assert.equal(lstatSync(h.ownerPath).isSymbolicLink(), true, 'the swapped symlink is never chmodded through');
-          assert.equal(statSync(target).mode & 0o777, 0o644, 'target permissions remain unchanged');
-        }
+        assert.equal(h!.mig.commit().state, 'QLB_OWNED', `${swapName}: v2 publication ignores the unpublishable legacy staging swap`);
+        assert.equal(isPiPlaceholder(JSON.parse(readFileSync(h!.authPath, 'utf8')).xai), true, `${swapName}: placeholder follows the v2 owner entry`);
+        assert.equal(JSON.parse(readFileSync(ownerMapPath(h!), 'utf8')).providers.xai.mode, 'qlb', `${swapName}: shared map owns xai`);
       } finally {
         h.cleanup();
       }
@@ -5143,7 +5226,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       kc.deleteCalls.length = 0;
       assert.equal(
         h.mig.status().resumeAction,
-        'already committed; finish hygiene (journal only; auth.json shadow-retained) → QLB_OWNED',
+        'already committed; finish hygiene → QLB_OWNED',
         'status gives the live committed claim priority over the stale rollback marker',
       );
 
@@ -5254,11 +5337,12 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
     }
   });
 
-  it('T-PRE pre-commit rollback removes a leftover backup', () => {
+  it('T-PRE pre-commit rollback removes its current-cycle leftover backup', () => {
     const h = setup('xai');
     try {
       h.mig.stage();
-      writePiAuthBackup(h.authPath, 'xai', 'crashed-before-owner');
+      const cycle = (JSON.parse(h.store.getMigration('pi-xai')!.detail_json) as { authBackupCycle: string }).authBackupCycle;
+      writePiAuthBackup(h.authPath, 'xai', cycle);
       assert.equal(existsSync(piAuthBackupPath(h.authPath, 'xai')), true, 'fixture backup exists');
 
       h.mig.rollback();
