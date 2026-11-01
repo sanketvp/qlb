@@ -1,13 +1,22 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
 import { ClaudeConfigFileError } from '../src/cc-credentials';
+import { ClaudeCodeLockTimeout, ProperLockfileCompromised, withClaudeConfigPathLock, withClaudeCredentialLocks, withClaudeSwitchLock } from '../src/cc-locks';
+import { deleteClaudeSwitchJournal, updateClaudeSwitchJournal, withClaudeSwitchJournalOwner } from '../src/cc-switch-journal';
 import { ClaudeSlots, InMemoryClaudeSlotRepository } from '../src/cc-slots';
 import { MockKeychain } from '../src/keychain';
 import { claudePaths } from '../src/cc-paths';
 import {
   checkClaudeSwitchPreconditions,
+  classifySwitchError,
+  CrashSignal,
   prepareClaudeSwitch,
+  switchClaude,
   type ClaudeSwitchDeps,
 } from '../src/cc-switch';
 
@@ -49,8 +58,8 @@ async function fixture(): Promise<Fixture> {
   const deps: ClaudeSwitchDeps = {
     store: {
       getActiveLogin: () => active === null ? { provider: 'anthropic', accountId: null, since: NOW, setBy: 'manual' } : { provider: 'anthropic', accountId: active, since: NOW, setBy: 'manual' },
-      getConfig: (key) => key === 'auto.anthropic.suspendedUntil' ? breaker : null,
-    },
+      getConfig: (key: string) => key === 'auto.anthropic.suspendedUntil' ? breaker : null,
+    } as unknown as ClaudeSwitchDeps['store'],
     slots,
     live: { backend, paths, account: 'fixture-user' },
     readConfig: () => config,
@@ -68,6 +77,7 @@ async function fixture(): Promise<Fixture> {
     home: HOME,
     now: () => NOW,
     by: 'qlb-cli',
+    attempt: 'phase-a-only',
     warn: (message) => warnings.push(message),
   };
   return {
@@ -236,5 +246,912 @@ describe('Claude switch Phase A (K5-4)', () => {
     assert.equal(reason(await checkClaudeSwitchPreconditions(subject.deps, manual)), undefined);
     assert.equal('active' in await prepareClaudeSwitch(subject.deps, manual), true);
     assert.deepEqual(subject.backend.listServices().sort(), before);
+  });
+});
+
+async function transactionFixture(options: { live?: string; target?: string; targetConfig?: unknown } = {}) {
+  const root = mkdtempSync(join(tmpdir(), 'qlb-cc-switch-'));
+  const home = join(root, 'home');
+  const env = { QLB_TEST_MODE: '1', HOME: home };
+  const paths = claudePaths({ home, env });
+  mkdirSync(paths.configHome, { recursive: true });
+  const backend = new MockKeychain();
+  const slots = new ClaudeSlots({ backend, repository: new InMemoryClaudeSlotRepository(), stashDir: join(root, 'unclaimed'), now: () => NOW });
+  const outgoing = JSON.stringify({ claudeAiOauth: { accessToken: 'outgoing-access', refreshToken: 'outgoing-refresh', expiresAt: NOW + 60 * 60_000 }, mcpOAuth: { shared: 'live' } });
+  const target = options.target ?? credential('b');
+  await slots.createSlot({ accountId: 'account-a', credential: outgoing, email: 'a@example.test', orgUuid: 'org-a', configJson: JSON.stringify({ oauthAccount: { accountUuid: 'account-a' } }), source: 'cswap-import' });
+  await slots.createSlot({ accountId: 'account-b', credential: target, email: 'b@example.test', orgUuid: 'org-b', configJson: JSON.stringify(options.targetConfig ?? { oauthAccount: { accountUuid: 'account-b' } }), source: 'cswap-import' });
+  await backend.set(paths.keychainService, 'fixture-user', options.live ?? outgoing);
+  writeFileSync(paths.globalConfigPath, JSON.stringify({ oauthAccount: { accountUuid: 'account-a' }, retained: 'yes' }));
+  let active = 'account-a';
+  let committed: Record<string, unknown> | null = null;
+  const rows: Record<string, unknown>[] = [];
+  const refusals: Record<string, unknown>[] = [];
+  const warnings: string[] = [];
+  const deps: ClaudeSwitchDeps = {
+    store: {
+      getActiveLogin: () => ({ provider: 'anthropic', accountId: active, since: NOW, setBy: 'manual' }),
+      getConfig: () => null,
+      setActiveLogin: (_provider, accountId) => { active = accountId ?? ''; },
+      recordSwitch: (row) => { rows.push(row); return rows.length; },
+      recordRelogin: () => 1,
+      recordClaudeSwitchRefusal: (row) => { refusals.push(row); rows.push({ ...row, outcome: 'refused' }); return refusals.length; },
+      findClaudeSwitchByAttempt: () => null,
+      commitClaudeSwitch: (row) => { committed = row; active = row.toAccount; return 42; },
+    },
+    slots, live: { backend, paths, account: 'fixture-user' },
+    readConfig: (path) => JSON.parse(readFileSync(path, 'utf8')),
+    resolveProfile: async () => null,
+    consume: { postRefresh: async () => ({ status: 500, body: '' }), withConsumeLock: async (fn) => fn(), withSwitchLock: async (fn) => fn() },
+    env, home, now: () => NOW, by: 'qlb-cli', attempt: 'attempt-k5-5', journalDir: join(root, 'journal'), journalOwner: { pid: process.pid, lstart: 'fixture' }, warn: (message) => warnings.push(message),
+  };
+  return { root, home, env, paths, backend, slots, deps, get active() { return active; }, get committed() { return committed; }, rows, refusals, warnings };
+}
+
+function seedJournal(subject: { deps: ClaudeSwitchDeps; paths: ReturnType<typeof claudePaths> }, patch: Record<string, unknown> = {}): string {
+  const path = join(subject.deps.journalDir!, 'switch-anthropic.json');
+  mkdirSync(subject.deps.journalDir!, { recursive: true });
+  writeFileSync(path, JSON.stringify({
+    v: 1, provider: 'anthropic', attemptId: 'older-attempt', from: 'account-a', to: 'account-b', trigger: 'manual', by: 'qlb-cli', republish: false, injected: false, detail: null,
+    decision: { leftHeadroom: null, leftRecoveryAt: null, leftTrigger: null }, outgoingKind: 'own-bytes', bindingJson: null, step: 6,
+    stagedBlobService: 'qlb:anthropic:staged-rollback:older', stagedAccount: 'qlb', stagedWritten: false, keychainService: subject.paths.keychainService,
+    configPath: subject.paths.globalConfigPath, configText: null, configWrittenHash: null, fromOauthAccount: null, credentialsWrittenHash: null,
+    credentialsWriteStarted: false, credentialsWritten: false, configWriteStarted: false, configWritten: false, closed: null, startedAt: NOW, owner: { pid: process.pid, lstart: 'old' }, ...patch,
+  }));
+  return path;
+}
+
+describe('Claude switch transaction (K5-5)', () => {
+  it('a manual switch A→B with own-bytes outgoing commits ok, writes B\'s blob composed with the live shared fields, replaces only oauthAccount, and sets active_login, last_active_at, cooldown and the S45 keys', async () => {
+    const subject = await transactionFixture();
+    const result = await switchClaude(subject.deps, manual);
+    assert.equal(result.outcome, 'ok');
+    assert.equal(result.from, 'account-a');
+    assert.equal(result.to, 'account-b');
+    assert.equal(subject.active, 'account-b');
+    assert.equal(result.switchId, 42);
+    assert.equal(result.outgoingKind, 'own-bytes');
+    const written = JSON.parse(await subject.backend.get(subject.paths.keychainService, 'fixture-user')) as Record<string, unknown>;
+    assert.deepEqual(written.mcpOAuth, { shared: 'live' });
+    assert.equal((written.claudeAiOauth as { refreshToken: string }).refreshToken, 'fixture-refresh-b');
+    const config = JSON.parse(readFileSync(subject.paths.globalConfigPath, 'utf8')) as Record<string, unknown>;
+    assert.deepEqual(config.oauthAccount, { accountUuid: 'account-b' });
+    assert.equal(config.retained, 'yes');
+    assert.equal((subject.committed as { decision: { leftHeadroom: null } }).decision.leftHeadroom, null);
+  });
+
+  it('a manual switch with no decision deletes all three auto.anthropic.left* keys and stores no \'undefined\'', async () => {
+    const subject = await transactionFixture();
+    const result = await switchClaude(subject.deps, manual);
+    assert.equal(result.outcome, 'ok');
+    assert.deepEqual((subject.committed as { decision: unknown }).decision, {
+      leftHeadroom: null, leftRecoveryAt: null, leftTrigger: null,
+    });
+    assert.equal(JSON.stringify(subject.committed).includes('undefined'), false);
+  });
+
+  it('the result carries from (read under the lock) and to', async () => {
+    const subject = await transactionFixture();
+    const result = await switchClaude(subject.deps, manual);
+    assert.deepEqual({ from: result.from, to: result.to }, { from: 'account-a', to: 'account-b' });
+  });
+
+  it('an unreadable target slot fails target-unreadable under the lock and records one failed row', async () => {
+    const subject = await transactionFixture();
+    const original = subject.slots.readSlot.bind(subject.slots);
+    subject.deps.locks = { switch: (async (fn: () => Promise<unknown>, options: unknown) => {
+      subject.slots.readSlot = async (id, readOptions) => id === 'account-b' ? Promise.reject(new Error('target gone')) : original(id, readOptions);
+      return withClaudeSwitchLock(fn, options as never);
+    }) as unknown as NonNullable<ClaudeSwitchDeps['locks']>['switch'] };
+    const result = await switchClaude(subject.deps, manual);
+    assert.deepEqual({ outcome: result.outcome, reason: result.reason, failedStep: result.steps?.failedStep }, { outcome: 'failed', reason: 'target-unreadable', failedStep: 6 });
+    assert.equal((subject.rows.at(-1) as { outcome: string; detail: string }).outcome, 'failed');
+    assert.equal((subject.rows.at(-1) as { outcome: string; detail: string }).detail, 'target-unreadable');
+  });
+
+  it('an owner lock held by a fixture with no journal file refuses lock-timeout at step 4 with one refused row and no step-5 write (injected owner lock throws ClaudeCodeLockTimeout; Keychain and slot spies see no write)', async () => {
+    const subject = await transactionFixture();
+    subject.deps.locks = { owner: async () => { throw new ClaudeCodeLockTimeout('/fixture/journal.lock'); } };
+    const result = await switchClaude(subject.deps, manual);
+    assert.deepEqual({ outcome: result.outcome, reason: result.reason, exitCode: result.exitCode }, { outcome: 'refused', reason: 'lock-timeout', exitCode: 3 });
+    assert.equal(subject.refusals.length, 1);
+    assert.equal(subject.backend.listServices().some((service) => service.startsWith('qlb:anthropic:staged-rollback:')), false);
+  });
+
+  it('a queued second switch to the same target records noop under the lock', async () => {
+    const subject = await transactionFixture();
+    const result = await switchClaude(subject.deps, { to: 'account-a', trigger: 'manual' });
+    assert.deepEqual({ outcome: result.outcome, from: result.from, to: result.to, exitCode: result.exitCode }, { outcome: 'noop', from: 'account-a', to: 'account-a', exitCode: 0 });
+  });
+
+  it('a target that becomes active while its Phase-A freshen is in flight is not reported noop: Phase A restarts once and the live credential and the slot agree', async () => {
+    const subject = await transactionFixture();
+    let transactionLocks = 0;
+    let consumeSwitchLocks = 0;
+    await subject.slots.writeSlot('account-b', credential('b', NOW + 10 * 60_000), { cause: 'post' });
+    subject.deps.consume.postRefresh = async () => ({ status: 200, body: JSON.stringify({ access_token: 'fixture-issued', refresh_token: 'fixture-refresh-issued', expires_in: 3600 }) });
+    subject.deps.consume.withSwitchLock = async (fn) => {
+      consumeSwitchLocks += 1;
+      if (consumeSwitchLocks === 3) {
+        subject.deps.store.setActiveLogin('anthropic', 'account-b', 'manual', NOW);
+        await subject.backend.set(subject.paths.keychainService, 'fixture-user', JSON.stringify({ claudeAiOauth: { accessToken: 'fixture-issued', refreshToken: 'fixture-refresh-issued', expiresAt: NOW + 60 * 60_000 } }));
+      }
+      return fn();
+    };
+    subject.deps.locks = {
+      switch: (async (fn: () => Promise<unknown>, options: unknown) => {
+        transactionLocks += 1;
+        return withClaudeSwitchLock(fn, options as never);
+      }) as unknown as NonNullable<ClaudeSwitchDeps['locks']>['switch'],
+    };
+
+    await switchClaude(subject.deps, manual);
+
+    assert.equal(transactionLocks, 2);
+    assert.equal(await subject.backend.get(subject.paths.keychainService, 'fixture-user'), (await subject.slots.readSlot('account-b', { fresh: true })).credential);
+  });
+
+  it('a target that was active in Phase A but is no longer active under the lock restarts Phase A once, freshens and commits', async () => {
+    const subject = await transactionFixture();
+    const events: string[] = [];
+    let inSwitch = false;
+    let inCredential = false;
+    let inOwner = false;
+    let switchCalls = 0;
+    subject.deps.store.setActiveLogin('anthropic', 'account-b', 'manual', NOW);
+    await subject.slots.writeSlot('account-b', credential('b', NOW + 10 * 60_000), { cause: 'post' });
+    subject.deps.consume.postRefresh = async () => {
+      assert.equal(inSwitch || inCredential || inOwner, false, 'freshening must happen after every transaction lock releases');
+      events.push('freshen');
+      return { status: 200, body: JSON.stringify({ access_token: 'fixture-issued', refresh_token: 'fixture-refresh-issued', expires_in: 3600 }) };
+    };
+    subject.deps.locks = {
+      switch: (async (fn: () => Promise<unknown>, options: unknown) => {
+        events.push('switch+'); inSwitch = true;
+        if (++switchCalls === 1) subject.deps.store.setActiveLogin('anthropic', 'account-a', 'manual', NOW);
+        try { return await withClaudeSwitchLock(fn, options as never); }
+        finally { inSwitch = false; events.push('switch-'); }
+      }) as unknown as NonNullable<ClaudeSwitchDeps['locks']>['switch'],
+      credential: (async (options: unknown, fn: (value: unknown) => Promise<unknown>) => {
+        events.push('credential+'); inCredential = true;
+        try { return await withClaudeCredentialLocks(options as never, fn as never); }
+        finally { inCredential = false; events.push('credential-'); }
+      }) as unknown as NonNullable<ClaudeSwitchDeps['locks']>['credential'],
+      owner: (async (options: unknown, fn: (value: unknown) => Promise<unknown>) => {
+        events.push('owner+'); inOwner = true;
+        try { return await withClaudeSwitchJournalOwner(options as never, fn as never); }
+        finally { inOwner = false; events.push('owner-'); }
+      }) as unknown as NonNullable<ClaudeSwitchDeps['locks']>['owner'],
+    };
+    const result = await switchClaude(subject.deps, manual);
+    assert.equal(result.outcome, 'ok');
+    assert.equal(switchCalls, 2);
+    assert.deepEqual(events, [
+      'switch+', 'credential+', 'owner+', 'owner-', 'credential-', 'switch-',
+      'freshen',
+      'switch+', 'credential+', 'owner+', 'owner-', 'credential-', 'switch-',
+    ]);
+  });
+
+  it('a second invalidation on the retry refuses active-changed with exit 3 and writes nothing but the refusal row', async () => {
+    const subject = await transactionFixture();
+    let switchCalls = 0;
+    subject.deps.store.setActiveLogin('anthropic', 'account-b', 'manual', NOW);
+    const liveBefore = await subject.backend.get(subject.paths.keychainService, 'fixture-user');
+    const configBefore = readFileSync(subject.paths.globalConfigPath, 'utf8');
+    subject.deps.locks = {
+      switch: (async (fn: () => Promise<unknown>, options: unknown) => {
+        switchCalls += 1;
+        if (switchCalls === 1) subject.deps.store.setActiveLogin('anthropic', 'account-a', 'manual', NOW);
+        if (switchCalls === 2) subject.deps.store.setActiveLogin('anthropic', 'account-a', 'manual', NOW);
+        try { return await withClaudeSwitchLock(fn, options as never); }
+        finally { if (switchCalls === 1) subject.deps.store.setActiveLogin('anthropic', 'account-b', 'manual', NOW); }
+      }) as unknown as NonNullable<ClaudeSwitchDeps['locks']>['switch'],
+    };
+    const result = await switchClaude(subject.deps, manual);
+    assert.deepEqual({ outcome: result.outcome, reason: result.reason, exitCode: result.exitCode }, { outcome: 'refused', reason: 'active-changed', exitCode: 3 });
+    assert.equal(switchCalls, 2);
+    assert.equal(await subject.backend.get(subject.paths.keychainService, 'fixture-user'), liveBefore);
+    assert.equal(readFileSync(subject.paths.globalConfigPath, 'utf8'), configBefore);
+    assert.equal(existsSync(join(subject.deps.journalDir!, 'switch-anthropic.json')), false);
+    assert.equal(subject.rows.length, 1);
+    assert.equal((subject.rows[0] as { outcome: string }).outcome, 'refused');
+  });
+
+  it('a noop row-write failure returns noop with a warning instead of throwing', async () => {
+    const subject = await transactionFixture();
+    subject.deps.store.recordSwitch = () => { throw new Error('sqlite write failed'); };
+    const result = await switchClaude(subject.deps, { to: 'account-a', trigger: 'manual' });
+    assert.equal(result.outcome, 'noop');
+    assert.equal(result.exitCode, 0);
+    assert.equal(subject.warnings.length, 1);
+  });
+
+  it('an empty live item refuses before classification and writes nothing', async () => {
+    const subject = await transactionFixture();
+    await subject.backend.delete(subject.paths.keychainService, 'fixture-user');
+    const result = await switchClaude(subject.deps, manual);
+    assert.deepEqual({ outcome: result.outcome, reason: result.reason }, { outcome: 'refused', reason: 'live-credential-empty' });
+    assert.equal(existsSync(join(subject.deps.journalDir!, 'switch-anthropic.json')), false);
+  });
+
+  it('republish is unavailable before any transaction write', async () => {
+    const subject = await transactionFixture();
+    const result = await switchClaude(subject.deps, { ...manual, republish: true });
+    assert.deepEqual({ outcome: result.outcome, reason: result.reason, exitCode: result.exitCode }, { outcome: 'refused', reason: 'republish-unavailable', exitCode: 3 });
+    assert.equal(existsSync(join(subject.deps.journalDir!, 'switch-anthropic.json')), false);
+  });
+
+  it('a foreign live credential is refused outgoing-unrouted:foreign before any write (K5 interim)', async () => {
+    const foreign = credential('foreign');
+    const subject = await transactionFixture({ live: foreign });
+    subject.deps.resolveProfile = async () => ({ uuid: 'account-b', email: 'b@example.test', organizationUuid: 'org-b' });
+    const result = await switchClaude(subject.deps, manual);
+    assert.equal(result.reason, 'outgoing-unrouted:foreign');
+    assert.equal(result.outcome, 'refused');
+    assert.equal(await subject.backend.get(subject.paths.keychainService, 'fixture-user'), foreign);
+  });
+
+  it('a failure at step 7 before K8-2 returns failed step-7 with exit 1, leaves the journal as written and does not throw', async () => {
+    const subject = await transactionFixture();
+    subject.deps.live.backend = {
+      kind: 'test-memory',
+      get: (...args) => subject.backend.get(...args),
+      delete: (...args) => subject.backend.delete(...args),
+      set: async (service, account, value) => {
+        if (service === subject.paths.keychainService) throw new Error('keychain write failure');
+        return subject.backend.set(service, account, value);
+      },
+      setSync: (...args) => subject.backend.setSync(...args),
+      getSync: (...args) => subject.backend.getSync(...args),
+      deleteSync: (...args) => subject.backend.deleteSync(...args),
+    };
+    const result = await switchClaude(subject.deps, manual);
+    assert.deepEqual({ outcome: result.outcome, reason: result.reason, exitCode: result.exitCode, failedStep: result.steps?.failedStep }, { outcome: 'failed', reason: 'step-7', exitCode: 1, failedStep: 7 });
+    assert.equal(existsSync(join(subject.deps.journalDir!, 'switch-anthropic.json')), true);
+  });
+
+  it("crashAt 'before-step-6' leaves no journal and the next switch commits ok", async () => {
+    const subject = await transactionFixture();
+    subject.deps.crashAt = (checkpoint) => { if (checkpoint === 'before-step-6') throw new CrashSignal(checkpoint); };
+    await assert.rejects(() => switchClaude(subject.deps, manual), CrashSignal);
+    assert.equal(existsSync(join(subject.deps.journalDir!, 'switch-anthropic.json')), false);
+    subject.deps.crashAt = undefined;
+    assert.equal((await switchClaude(subject.deps, manual)).outcome, 'ok');
+  });
+
+  it('.credentials.json is rewritten only when it already exists', async () => {
+    const subject = await transactionFixture();
+    assert.equal(existsSync(subject.paths.credentialsPath), false);
+    assert.equal((await switchClaude(subject.deps, manual)).outcome, 'ok');
+    assert.equal(existsSync(subject.paths.credentialsPath), false);
+  });
+
+  it('the staged item is deleted before the journal after a committed switch and both are gone', async () => {
+    const subject = await transactionFixture();
+    const result = await switchClaude(subject.deps, manual);
+    assert.equal(result.outcome, 'ok');
+    assert.equal(existsSync(join(subject.deps.journalDir!, 'switch-anthropic.json')), false);
+    assert.equal(subject.backend.listServices().some((service) => service.startsWith('qlb:anthropic:staged-rollback:')), false);
+  });
+
+  it('the journal exists with step 6, attempt, the commit inputs (decision, outgoingKind, bindingJson, injected, by, republish, detail), fromOauthAccount null and stagedWritten true, and the staged item holds the outgoing blob, before the step-7 write (beforeStep7 hook)', async () => {
+    const subject = await transactionFixture();
+    subject.deps.hooks = { beforeStep7: () => {
+      const journal = JSON.parse(readFileSync(join(subject.deps.journalDir!, 'switch-anthropic.json'), 'utf8')) as Record<string, unknown>;
+      assert.equal(journal.step, 6);
+      assert.equal(journal.attemptId, 'attempt-k5-5');
+      assert.equal(journal.outgoingKind, 'own-bytes');
+      assert.equal(journal.stagedWritten, true);
+      assert.equal(journal.fromOauthAccount, null);
+      assert.equal(journal.republish, false);
+      assert.equal(journal.detail, null);
+      assert.equal(typeof journal.stagedBlobService, 'string');
+    } };
+    assert.equal((await switchClaude(subject.deps, { ...manual, bindingJson: '{"safe":true}', injected: true })).outcome, 'ok');
+  });
+
+  it("crashAt 'after-journal' leaves a step-6 journal with stagedWritten false and no staged item", async () => {
+    const subject = await transactionFixture();
+    subject.deps.crashAt = (checkpoint) => { if (checkpoint === 'after-journal') throw new CrashSignal(checkpoint); };
+    await assert.rejects(() => switchClaude(subject.deps, manual), CrashSignal);
+    const journal = JSON.parse(readFileSync(join(subject.deps.journalDir!, 'switch-anthropic.json'), 'utf8')) as { step: number; stagedWritten: boolean; stagedBlobService: string };
+    assert.deepEqual({ step: journal.step, stagedWritten: journal.stagedWritten }, { step: 6, stagedWritten: false });
+    assert.equal(subject.backend.listServices().includes(journal.stagedBlobService), false);
+  });
+
+  it("crashAt 'after-stage' leaves the journal naming the staged item, live and config untouched", async () => {
+    const subject = await transactionFixture();
+    const before = await subject.backend.get(subject.paths.keychainService, 'fixture-user');
+    const config = readFileSync(subject.paths.globalConfigPath, 'utf8');
+    subject.deps.crashAt = (checkpoint) => { if (checkpoint === 'after-stage') throw new CrashSignal(checkpoint); };
+    await assert.rejects(() => switchClaude(subject.deps, manual), CrashSignal);
+    const journal = JSON.parse(readFileSync(join(subject.deps.journalDir!, 'switch-anthropic.json'), 'utf8')) as { stagedWritten: boolean; stagedBlobService: string };
+    assert.equal(journal.stagedWritten, true);
+    assert.equal(await subject.backend.get(subject.paths.keychainService, 'fixture-user'), before);
+    assert.equal(readFileSync(subject.paths.globalConfigPath, 'utf8'), config);
+    assert.equal(subject.backend.listServices().includes(journal.stagedBlobService), true);
+  });
+
+  it("crashAt 'before-step-7-write' leaves credentialsWriteStarted true and credentialsWritten false", async () => {
+    const subject = await transactionFixture();
+    subject.deps.crashAt = (checkpoint) => { if (checkpoint === 'before-step-7-write') throw new CrashSignal(checkpoint); };
+    await assert.rejects(() => switchClaude(subject.deps, manual), CrashSignal);
+    const journal = JSON.parse(readFileSync(join(subject.deps.journalDir!, 'switch-anthropic.json'), 'utf8')) as { credentialsWriteStarted: boolean; credentialsWritten: boolean };
+    assert.deepEqual({ credentialsWriteStarted: journal.credentialsWriteStarted, credentialsWritten: journal.credentialsWritten }, { credentialsWriteStarted: true, credentialsWritten: false });
+  });
+
+  it("crashAt 'after-step-7' leaves a step-7 journal with credentialsWritten and publishedAt", async () => {
+    const subject = await transactionFixture();
+    subject.deps.crashAt = (checkpoint) => { if (checkpoint === 'after-step-7') throw new CrashSignal(checkpoint); };
+    await assert.rejects(() => switchClaude(subject.deps, manual), CrashSignal);
+    const journal = JSON.parse(readFileSync(join(subject.deps.journalDir!, 'switch-anthropic.json'), 'utf8')) as { step: number; credentialsWritten: boolean; publishedAt?: number };
+    assert.deepEqual({ step: journal.step, credentialsWritten: journal.credentialsWritten, publishedAt: journal.publishedAt }, { step: 7, credentialsWritten: true, publishedAt: NOW });
+  });
+
+  it('configText in the journal equals the bytes read under the config lock, not the Phase-A text (fixture edits the config between Phase A and step 8), fromOauthAccount equals that text\'s oauthAccount, configWrittenHash equals sha256 of the spliced file, and all three are in the journal before the config write lands (writeText spy ordering)', async () => {
+    const subject = await transactionFixture();
+    const replacement = JSON.stringify({ oauthAccount: { accountUuid: 'account-a', source: 'step-8' }, retained: 'changed' });
+    subject.deps.hooks = { afterStep7: () => writeFileSync(subject.paths.globalConfigPath, replacement) };
+    subject.deps.crashAt = (checkpoint) => { if (checkpoint === 'after-step-8') throw new CrashSignal(checkpoint); };
+    await assert.rejects(() => switchClaude(subject.deps, manual), CrashSignal);
+    const journal = JSON.parse(readFileSync(join(subject.deps.journalDir!, 'switch-anthropic.json'), 'utf8')) as { configText: string; fromOauthAccount: unknown; configWrittenHash: string; configWriteStarted: boolean };
+    const planned = readFileSync(subject.paths.globalConfigPath, 'utf8');
+    assert.equal(journal.configText, replacement);
+    assert.deepEqual(journal.fromOauthAccount, { accountUuid: 'account-a', source: 'step-8' });
+    assert.equal(journal.configWrittenHash, createHash('sha256').update(planned).digest('hex'));
+    assert.equal(journal.configWriteStarted, true);
+  });
+
+  it("crashAt 'after-step-8' leaves a step-8 journal whose configText equals the pre-splice bytes and no switch_log row", async () => {
+    const subject = await transactionFixture();
+    const raw = readFileSync(subject.paths.globalConfigPath, 'utf8');
+    subject.deps.crashAt = (checkpoint) => { if (checkpoint === 'after-step-8') throw new CrashSignal(checkpoint); };
+    await assert.rejects(() => switchClaude(subject.deps, manual), CrashSignal);
+    const journal = JSON.parse(readFileSync(join(subject.deps.journalDir!, 'switch-anthropic.json'), 'utf8')) as { step: number; configText: string };
+    assert.deepEqual({ step: journal.step, configText: journal.configText }, { step: 8, configText: raw });
+    assert.equal(subject.committed, null);
+  });
+
+  it('an unparseable live blob reaches step 7 with no shared fields (?? {}) after its fail-open backup', async () => {
+    const subject = await transactionFixture({ live: 'not-json' });
+    const result = await switchClaude(subject.deps, manual);
+    assert.equal(result.outcome, 'ok');
+    const written = JSON.parse(await subject.backend.get(subject.paths.keychainService, 'fixture-user')) as Record<string, unknown>;
+    assert.equal('mcpOAuth' in written, false);
+  });
+
+  it('classifySwitchError maps a security timeout to keychain-timeout, a backend write error to keychain-write-failed, a ClaudeConfigFileError or writeText error at step 8 to config-write-failed, a SQLite error to sqlite-error, a journal I/O error to journal-io-failed and an owner-lock timeout or loss to lock-timeout', () => {
+    assert.equal(classifySwitchError(Object.assign(new Error('timeout'), { code: 'ETIMEDOUT' })), 'keychain-timeout');
+    assert.equal(classifySwitchError(new Error('keychain write failed')), 'keychain-write-failed');
+    assert.equal(classifySwitchError(new ClaudeConfigFileError('/fixture/config', 'bad')), 'config-write-failed');
+    assert.equal(classifySwitchError(new Error('SQLite database unavailable')), 'sqlite-error');
+    assert.equal(classifySwitchError(new Error('journal disk failure')), 'journal-io-failed');
+    assert.equal(classifySwitchError(new ClaudeCodeLockTimeout('/fixture/lock')), 'lock-timeout');
+  });
+
+  it('the config lock is taken only across step 8, the credential locks span steps 4–9, and the journal owner lock is taken right after the credential locks at step 4 and held to the journal delete (lock-order spy)', async () => {
+    const subject = await transactionFixture();
+    const events: string[] = [];
+    const held = { assertHeld: () => undefined };
+    subject.deps.locks = {
+      switch: (async (fn: () => Promise<unknown>, options: unknown) => { events.push('switch+'); try { return await withClaudeSwitchLock(fn, options as never); } finally { events.push('switch-'); } }) as unknown as NonNullable<ClaudeSwitchDeps['locks']>['switch'],
+      credential: (async (options: unknown, fn: (value: unknown) => Promise<unknown>) => { events.push('credential+'); try { return await withClaudeCredentialLocks(options as never, fn as never); } finally { events.push('credential-'); } }) as unknown as NonNullable<ClaudeSwitchDeps['locks']>['credential'],
+      owner: (async (options: unknown, fn: (value: unknown) => Promise<unknown>) => { events.push('owner+'); try { return await withClaudeSwitchJournalOwner(options as never, fn as never); } finally { events.push('owner-'); } }) as unknown as NonNullable<ClaudeSwitchDeps['locks']>['owner'],
+      configPath: (async (path: string, options: unknown, fn: (value: unknown) => Promise<unknown>) => { events.push('config+'); try { return await withClaudeConfigPathLock(path, options as never, fn as never); } finally { events.push('config-'); } }) as unknown as NonNullable<ClaudeSwitchDeps['locks']>['configPath'],
+    };
+    assert.equal((await switchClaude(subject.deps, manual)).outcome, 'ok');
+    assert.deepEqual(events, ['switch+', 'credential+', 'owner+', 'config+', 'config-', 'owner-', 'credential-', 'switch-']);
+  });
+
+  it('no network call and no consume lock inside the switch lock (spy)', async () => {
+    const subject = await transactionFixture();
+    let inSwitch = false;
+    let profileInside = false;
+    let consumeInside = false;
+    subject.deps.resolveProfile = async () => { profileInside ||= inSwitch; return null; };
+    subject.deps.consume.withConsumeLock = async (fn) => { consumeInside ||= inSwitch; return fn(); };
+    subject.deps.locks = { switch: (async (fn: () => Promise<unknown>) => { inSwitch = true; try { return await fn(); } finally { inSwitch = false; } }) as unknown as NonNullable<ClaudeSwitchDeps['locks']>['switch'] };
+    assert.equal((await switchClaude(subject.deps, manual)).outcome, 'ok');
+    assert.equal(profileInside, false); assert.equal(consumeInside, false);
+  });
+
+  it('the journal is created before the staged item (write-order spy)', async () => {
+    const subject = await transactionFixture();
+    subject.deps.crashAt = (checkpoint) => { if (checkpoint === 'after-journal') throw new CrashSignal(checkpoint); };
+    await assert.rejects(() => switchClaude(subject.deps, manual), CrashSignal);
+    assert.equal(existsSync(join(subject.deps.journalDir!, 'switch-anthropic.json')), true);
+    assert.equal(subject.backend.listServices().some((service) => service.startsWith('qlb:anthropic:staged-rollback:')), false);
+  });
+
+  it('credentialsWrittenHash equals sha256 of the composed blob and is in the journal before the helper write (write-order spy)', async () => {
+    const subject = await transactionFixture();
+    const originalSet = subject.backend.set.bind(subject.backend);
+    let checked = false;
+    subject.deps.live.backend = {
+      kind: 'test-memory', get: (...args) => subject.backend.get(...args), delete: (...args) => subject.backend.delete(...args),
+      setSync: (...args) => subject.backend.setSync(...args), getSync: (...args) => subject.backend.getSync(...args), deleteSync: (...args) => subject.backend.deleteSync(...args),
+      set: async (service, account, value) => {
+        if (service === subject.paths.keychainService) {
+          const journal = JSON.parse(readFileSync(join(subject.deps.journalDir!, 'switch-anthropic.json'), 'utf8')) as { credentialsWrittenHash: string };
+          assert.equal(journal.credentialsWrittenHash, createHash('sha256').update(value).digest('hex')); checked = true;
+        }
+        return originalSet(service, account, value);
+      },
+    };
+    assert.equal((await switchClaude(subject.deps, manual)).outcome, 'ok'); assert.equal(checked, true);
+  });
+
+  it('the capturing spliceOauthAccount call writes nothing and the bytes QLB then writes equal what spliceOauthAccount\'s default writer would have written (byte-compare against a reference splice on a copy)', async () => {
+    const subject = await transactionFixture();
+    const raw = readFileSync(subject.paths.globalConfigPath, 'utf8');
+    assert.equal((await switchClaude(subject.deps, manual)).outcome, 'ok');
+    const expected = `${JSON.stringify({ ...JSON.parse(raw), oauthAccount: { accountUuid: 'account-b' } }, null, 2)}\n`;
+    assert.equal(readFileSync(subject.paths.globalConfigPath, 'utf8'), expected);
+  });
+
+  it('TestClaudeCodeLockCooperation', async () => {
+    const subject = await transactionFixture();
+    let credentialsHeld = false;
+    subject.deps.locks = { credential: (async (options: unknown, fn: (value: unknown) => Promise<unknown>) => { credentialsHeld = true; try { return await withClaudeCredentialLocks(options as never, fn as never); } finally { credentialsHeld = false; } }) as unknown as NonNullable<ClaudeSwitchDeps['locks']>['credential'] };
+    subject.deps.hooks = { beforeStep7: () => assert.equal(credentialsHeld, true) };
+    assert.equal((await switchClaude(subject.deps, manual)).outcome, 'ok');
+  });
+
+  it('TestSharedOAuthCredentialPreservation', async () => {
+    const subject = await transactionFixture();
+    assert.equal((await switchClaude(subject.deps, manual)).outcome, 'ok');
+    const blob = JSON.parse(await subject.backend.get(subject.paths.keychainService, 'fixture-user')) as { mcpOAuth: unknown };
+    assert.deepEqual(blob.mcpOAuth, { shared: 'live' });
+  });
+
+  it('TestDirectActivationPreservation', async () => {
+    const subject = await transactionFixture();
+    const original = await subject.slots.readSlot('account-a', { fresh: true });
+    const family = JSON.stringify({ claudeAiOauth: { accessToken: 'outgoing-access-successor', refreshToken: 'outgoing-refresh', expiresAt: NOW + 60 * 60_000 } });
+    await subject.backend.set(subject.paths.keychainService, 'fixture-user', family);
+    assert.equal((await switchClaude(subject.deps, manual)).outgoingKind, 'own-family');
+    assert.equal((await subject.slots.readSlot('account-a', { fresh: true })).credential, family);
+    assert.notEqual(original.credential, family);
+    assert.equal(subject.backend.listServices().some((service) => service.endsWith(':prev')), true);
+  });
+
+  it('TestSwitchUnreadableBackup', async () => {
+    const live = credential('diverged'); const subject = await transactionFixture({ live });
+    const original = subject.slots.readSlot.bind(subject.slots);
+    subject.slots.readSlot = async (id, options) => id === 'account-a' ? Promise.reject(new Error('unreadable')) : original(id, options);
+    subject.deps.resolveProfile = async () => { throw new Error('profile unavailable'); };
+    assert.equal((await switchClaude(subject.deps, manual)).outgoingKind, 'unresolved');
+    subject.slots.readSlot = original;
+    assert.equal((await subject.slots.readSlot('account-a', { fresh: true })).credential, live);
+  });
+
+  it('TestSwitchSkipsBrokenSlots', async () => {
+    const subject = await transactionFixture(); const original = subject.slots.readSlot.bind(subject.slots);
+    await subject.slots.createSlot({ accountId: 'account-c', credential: credential('c'), email: 'c@example.test', orgUuid: 'org-c', configJson: JSON.stringify({ oauthAccount: { accountUuid: 'account-c' } }), source: 'cswap-import' });
+    subject.slots.readSlot = async (id, options) => id === 'account-c' ? Promise.reject(new Error('broken non-target')) : original(id, options);
+    assert.equal((await switchClaude(subject.deps, manual)).outcome, 'ok');
+    assert.equal(subject.warnings.length, 1);
+  });
+
+  it('X3b step 4 unreadable live credential is refused before writes', async () => {
+    const subject = await transactionFixture();
+    subject.deps.live.backend = { kind: 'test-memory', get: async () => { throw new Error('unreadable'); }, set: (...args) => subject.backend.set(...args), delete: (...args) => subject.backend.delete(...args), setSync: (...args) => subject.backend.setSync(...args), getSync: (...args) => subject.backend.getSync(...args), deleteSync: (...args) => subject.backend.deleteSync(...args) };
+    const result = await switchClaude(subject.deps, manual);
+    assert.deepEqual({ outcome: result.outcome, reason: result.reason }, { outcome: 'refused', reason: 'live-credential-unreadable' });
+  });
+
+  it('an owner lock held by a fixture beside an unfinished journal refuses switch-journal-present with nothing written', async () => {
+    const subject = await transactionFixture(); const journalPath = seedJournal(subject);
+    const before = await subject.backend.get(subject.paths.keychainService, 'fixture-user');
+    subject.deps.probeOwner = () => 'free'; subject.deps.stillTheSameProcess = async () => true;
+    subject.deps.locks = { owner: async () => { throw new ClaudeCodeLockTimeout('/fixture/journal.lock'); } };
+    const result = await switchClaude(subject.deps, manual);
+    assert.deepEqual({ outcome: result.outcome, reason: result.reason, exitCode: result.exitCode }, { outcome: 'refused', reason: 'switch-journal-present', exitCode: 3 });
+    assert.equal(subject.refusals.length, 1);
+    assert.equal(await subject.backend.get(subject.paths.keychainService, 'fixture-user'), before);
+    assert.equal(existsSync(journalPath), true);
+    assert.equal(subject.backend.listServices().some((service) => service.startsWith('qlb:anthropic:staged-rollback:')), false);
+  });
+
+  it('a target struck dead after Phase A is refused under the lock with nothing written', async () => {
+    const subject = await transactionFixture(); const original = subject.slots.getSlot.bind(subject.slots);
+    subject.deps.locks = { switch: (async (fn: () => Promise<unknown>, options: unknown) => {
+      subject.slots.getSlot = (id) => id === 'account-b' ? { ...original(id)!, dead: true } : original(id);
+      return withClaudeSwitchLock(fn, options as never);
+    }) as unknown as NonNullable<ClaudeSwitchDeps['locks']>['switch'] };
+    const result = await switchClaude(subject.deps, manual);
+    assert.deepEqual({ outcome: result.outcome, reason: result.reason }, { outcome: 'refused', reason: 'target-dead' });
+    assert.equal(existsSync(join(subject.deps.journalDir!, 'switch-anthropic.json')), false);
+  });
+
+  it('a live rotation after the prefetch is adopted into the outgoing slot by lineage', async () => {
+    const rotated = credential('lineage'); const subject = await transactionFixture({ live: rotated });
+    subject.deps.resolveProfile = async () => ({ uuid: 'account-a', email: 'a@example.test', organizationUuid: 'org-a' });
+    assert.equal((await switchClaude(subject.deps, manual)).outgoingKind, 'own-rotated');
+  });
+
+  it('moved bytes with no lineage link back up fail-open as unresolved', async () => {
+    const moved = credential('moved'); const subject = await transactionFixture({ live: moved }); subject.deps.resolveProfile = async () => null;
+    assert.equal((await switchClaude(subject.deps, manual)).outgoingKind, 'unresolved');
+  });
+
+  it('a failing step-5 adopt fails outgoing-backup-failed and writes nothing else', async () => {
+    const subject = await transactionFixture({ live: credential('moved') }); subject.deps.resolveProfile = async () => null;
+    subject.slots.writeSlot = async () => { throw new Error('keychain write failed'); };
+    const result = await switchClaude(subject.deps, manual);
+    assert.deepEqual({ outcome: result.outcome, reason: result.reason }, { outcome: 'failed', reason: 'outgoing-backup-failed' });
+  });
+
+  it('a malformed journal refuses and is left in place', async () => {
+    const subject = await transactionFixture(); mkdirSync(subject.deps.journalDir!, { recursive: true }); const path = join(subject.deps.journalDir!, 'switch-anthropic.json'); writeFileSync(path, '{}');
+    assert.equal((await switchClaude(subject.deps, manual)).reason, 'switch-journal-malformed'); assert.equal(existsSync(path), true);
+  });
+
+  it('an orphaned unfinished journal refuses before Phase A with zero writes', async () => {
+    const subject = await transactionFixture(); const path = seedJournal(subject);
+    subject.deps.probeOwner = () => 'free'; subject.deps.stillTheSameProcess = async () => false;
+    const result = await switchClaude(subject.deps, manual);
+    assert.equal(result.reason, 'switch-journal-present'); assert.equal(existsSync(path), true);
+  });
+
+  it('a journal whose committed attempt row exists is deleted with its staged item under the owner lock and the switch proceeds with one new row', async () => {
+    const subject = await transactionFixture(); const path = seedJournal(subject);
+    await subject.backend.set('qlb:anthropic:staged-rollback:older', 'qlb', credential('old'));
+    subject.deps.store.findClaudeSwitchByAttempt = (attempt) => attempt === 'older-attempt' ? { id: 1, outcome: 'ok', ts: NOW, committedAt: NOW } : null;
+    assert.equal((await switchClaude(subject.deps, manual)).outcome, 'ok');
+    assert.equal(existsSync(path), false); assert.equal(subject.backend.listServices().includes('qlb:anthropic:staged-rollback:older'), false);
+  });
+
+  it('a journal whose owner process is alive (stillTheSameProcess spy true) is left in place', async () => {
+    const subject = await transactionFixture(); const path = seedJournal(subject);
+    subject.deps.probeOwner = () => 'free'; subject.deps.stillTheSameProcess = async () => true;
+    subject.deps.locks = { owner: async () => { throw new ClaudeCodeLockTimeout('/fixture/owner'); } };
+    const result = await switchClaude(subject.deps, manual);
+    assert.equal(result.reason, 'switch-journal-present'); assert.equal(existsSync(path), true);
+  });
+
+  it('a failing staged write at step 6 fails stage-failed, marks the journal closed stage-failed, deletes the staged item by name and the journal, and leaves the live item, config and step-5 adopt in place (write-order spy: marker before the deletes)', async () => {
+    const subject = await transactionFixture(); const before = await subject.backend.get(subject.paths.keychainService, 'fixture-user');
+    subject.deps.live.backend = { kind: 'test-memory', get: (...args) => subject.backend.get(...args), delete: (...args) => subject.backend.delete(...args), setSync: (...args) => subject.backend.setSync(...args), getSync: (...args) => subject.backend.getSync(...args), deleteSync: (...args) => subject.backend.deleteSync(...args), set: async (service, account, value) => service.startsWith('qlb:anthropic:staged-rollback:') ? Promise.reject(new Error('keychain write failed')) : subject.backend.set(service, account, value) };
+    const result = await switchClaude(subject.deps, manual);
+    assert.deepEqual({ outcome: result.outcome, reason: result.reason, failedStep: result.steps?.failedStep }, { outcome: 'failed', reason: 'stage-failed', failedStep: 6 });
+    assert.equal(await subject.backend.get(subject.paths.keychainService, 'fixture-user'), before); assert.equal(existsSync(join(subject.deps.journalDir!, 'switch-anthropic.json')), false);
+  });
+
+  it('a step-6 staged delete that fails keeps a journal marked closed stage-failed still naming the item, lists cleanup, and the next switch deletes the item and the journal and commits ok', async () => {
+    const subject = await transactionFixture();
+    const originalSet = subject.backend.set.bind(subject.backend);
+    const originalDelete = subject.backend.delete.bind(subject.backend);
+    let failDelete = true;
+    subject.deps.live.backend = {
+      kind: 'test-memory', get: (...args) => subject.backend.get(...args),
+      set: async (service, account, value) => {
+        await originalSet(service, account, value);
+        if (service.startsWith('qlb:anthropic:staged-rollback:')) throw new Error('staged write timeout');
+      },
+      delete: async (service, account) => service.startsWith('qlb:anthropic:staged-rollback:') && failDelete ? Promise.reject(new Error('staged delete failed')) : originalDelete(service, account),
+      setSync: (...args) => subject.backend.setSync(...args), getSync: (...args) => subject.backend.getSync(...args), deleteSync: (...args) => subject.backend.deleteSync(...args),
+    };
+    const failed = await switchClaude(subject.deps, manual);
+    const journalPath = join(subject.deps.journalDir!, 'switch-anthropic.json');
+    assert.equal(failed.reason, 'stage-failed');
+    assert.equal(failed.steps?.cleanup.length, 1);
+    assert.equal((JSON.parse(readFileSync(journalPath, 'utf8')) as { closed: string }).closed, 'stage-failed');
+    assert.equal(subject.backend.listServices().some((service) => service.startsWith('qlb:anthropic:staged-rollback:')), true);
+    failDelete = false;
+    subject.deps.live.backend = subject.backend;
+    assert.equal((await switchClaude(subject.deps, manual)).outcome, 'ok');
+    assert.equal(existsSync(journalPath), false);
+  });
+
+  it('a staged write that times out after landing is deleted by name although stagedWritten is false', async () => {
+    const subject = await transactionFixture();
+    const originalSet = subject.backend.set.bind(subject.backend);
+    subject.deps.live.backend = {
+      kind: 'test-memory', get: (...args) => subject.backend.get(...args), delete: (...args) => subject.backend.delete(...args),
+      set: async (service, account, value) => {
+        await originalSet(service, account, value);
+        if (service.startsWith('qlb:anthropic:staged-rollback:')) throw new Error('timed out after landing');
+      },
+      setSync: (...args) => subject.backend.setSync(...args), getSync: (...args) => subject.backend.getSync(...args), deleteSync: (...args) => subject.backend.deleteSync(...args),
+    };
+    const result = await switchClaude(subject.deps, manual);
+    assert.deepEqual({ outcome: result.outcome, reason: result.reason }, { outcome: 'failed', reason: 'stage-failed' });
+    assert.equal(subject.backend.listServices().some((service) => service.startsWith('qlb:anthropic:staged-rollback:')), false);
+    assert.equal(existsSync(join(subject.deps.journalDir!, 'switch-anthropic.json')), false);
+  });
+
+  it('a failing stagedWritten update deletes the staged item and the journal', async () => {
+    const subject = await transactionFixture();
+    subject.deps.journalOps = {
+      update: (held, patch, options) => {
+        if (patch.stagedWritten === true) throw new Error('stagedWritten update failed');
+        return updateClaudeSwitchJournal(held, patch, options);
+      },
+      remove: deleteClaudeSwitchJournal,
+    };
+    const result = await switchClaude(subject.deps, manual);
+    assert.deepEqual({ outcome: result.outcome, reason: result.reason, failedStep: result.steps?.failedStep }, { outcome: 'failed', reason: 'stage-failed', failedStep: 6 });
+    assert.equal(subject.backend.listServices().some((service) => service.startsWith('qlb:anthropic:staged-rollback:')), false);
+    assert.equal(existsSync(join(subject.deps.journalDir!, 'switch-anthropic.json')), false);
+  });
+
+  it('a step-6 marker write that fails keeps the unmarked journal and the staged item, lists cleanup, and the next switch refuses switch-journal-present', async () => {
+    const subject = await transactionFixture();
+    const originalSet = subject.backend.set.bind(subject.backend);
+    subject.deps.live.backend = {
+      kind: 'test-memory', get: (...args) => subject.backend.get(...args), delete: (...args) => subject.backend.delete(...args),
+      set: async (service, account, value) => {
+        await originalSet(service, account, value);
+        if (service.startsWith('qlb:anthropic:staged-rollback:')) throw new Error('staged write failed');
+      },
+      setSync: (...args) => subject.backend.setSync(...args), getSync: (...args) => subject.backend.getSync(...args), deleteSync: (...args) => subject.backend.deleteSync(...args),
+    };
+    subject.deps.journalOps = {
+      update: (held, patch, options) => {
+        if (patch.closed === 'stage-failed') throw new Error('journal marker write failed');
+        return updateClaudeSwitchJournal(held, patch, options);
+      },
+      remove: deleteClaudeSwitchJournal,
+    };
+    const failed = await switchClaude(subject.deps, manual);
+    const journalPath = join(subject.deps.journalDir!, 'switch-anthropic.json');
+    assert.equal(failed.reason, 'stage-failed');
+    assert.deepEqual(failed.steps?.cleanup, ['journal-io-failed']);
+    assert.equal((JSON.parse(readFileSync(journalPath, 'utf8')) as { closed: null }).closed, null);
+    assert.equal(subject.backend.listServices().some((service) => service.startsWith('qlb:anthropic:staged-rollback:')), true);
+    subject.deps.journalOps = undefined;
+    subject.deps.live.backend = subject.backend;
+    subject.deps.probeOwner = () => 'free';
+    subject.deps.stillTheSameProcess = async () => false;
+    const next = await switchClaude(subject.deps, manual);
+    assert.deepEqual({ outcome: next.outcome, reason: next.reason }, { outcome: 'refused', reason: 'switch-journal-present' });
+  });
+
+  it('a step-6 journal delete that fails after the staged delete succeeded keeps a finished journal with no item, and the next switch deletes it and commits ok (the absent staged item is not an error)', async () => {
+    const subject = await transactionFixture();
+    const originalSet = subject.backend.set.bind(subject.backend);
+    let failJournalDelete = true;
+    subject.deps.live.backend = {
+      kind: 'test-memory', get: (...args) => subject.backend.get(...args), delete: (...args) => subject.backend.delete(...args),
+      set: async (service, account, value) => {
+        await originalSet(service, account, value);
+        if (service.startsWith('qlb:anthropic:staged-rollback:')) throw new Error('staged write failed');
+      },
+      setSync: (...args) => subject.backend.setSync(...args), getSync: (...args) => subject.backend.getSync(...args), deleteSync: (...args) => subject.backend.deleteSync(...args),
+    };
+    subject.deps.journalOps = {
+      update: updateClaudeSwitchJournal,
+      remove: (held, options) => {
+        if (failJournalDelete) throw new Error('journal delete failed');
+        deleteClaudeSwitchJournal(held, options);
+      },
+    };
+    const failed = await switchClaude(subject.deps, manual);
+    const journalPath = join(subject.deps.journalDir!, 'switch-anthropic.json');
+    assert.equal(failed.reason, 'stage-failed');
+    assert.deepEqual(failed.steps?.cleanup, ['journal-io-failed']);
+    assert.equal((JSON.parse(readFileSync(journalPath, 'utf8')) as { closed: string }).closed, 'stage-failed');
+    assert.equal(subject.backend.listServices().some((service) => service.startsWith('qlb:anthropic:staged-rollback:')), false);
+    failJournalDelete = false;
+    subject.deps.journalOps = undefined;
+    subject.deps.live.backend = subject.backend;
+    subject.deps.probeOwner = () => 'free';
+    subject.deps.stillTheSameProcess = async () => false;
+    const next = await switchClaude(subject.deps, manual);
+    assert.equal(next.outcome, 'ok');
+    assert.equal(existsSync(journalPath), false);
+  });
+
+  it('crashAt \'after-commit\' leaves one ok row and an uncommitted journal that the next switch\'s preflight deletes without a second row', async () => {
+    const subject = await transactionFixture();
+    const commit = subject.deps.store.commitClaudeSwitch.bind(subject.deps.store);
+    let commits = 0;
+    subject.deps.store.commitClaudeSwitch = (row) => { commits += 1; return commit(row); };
+    subject.deps.crashAt = (checkpoint) => { if (checkpoint === 'after-commit') throw new CrashSignal(checkpoint); };
+    await assert.rejects(() => switchClaude(subject.deps, manual), CrashSignal);
+    const journalPath = join(subject.deps.journalDir!, 'switch-anthropic.json');
+    assert.equal(subject.committed !== null, true);
+    assert.equal(existsSync(journalPath), true);
+    subject.deps.store.findClaudeSwitchByAttempt = (attempt) => attempt === 'attempt-k5-5'
+      ? { id: 42, outcome: 'ok', ts: NOW, committedAt: NOW } : null;
+    subject.deps.probeOwner = () => 'free';
+    subject.deps.stillTheSameProcess = async () => false;
+    subject.deps.crashAt = undefined;
+    const next = await switchClaude(subject.deps, manual);
+    assert.equal(next.outcome, 'noop');
+    assert.equal(existsSync(journalPath), false);
+    assert.equal(commits, 1);
+  });
+
+  it('a failing staged-item delete after the commit keeps outcome ok, lists cleanup, leaves the journal in place, and the next preflight (committed row found) deletes the item and then the journal', async () => {
+    const subject = await transactionFixture(); const originalDelete = subject.backend.delete.bind(subject.backend);
+    subject.deps.live.backend = { kind: 'test-memory', get: (...args) => subject.backend.get(...args), set: (...args) => subject.backend.set(...args), delete: async (service, account) => service.startsWith('qlb:anthropic:staged-rollback:') ? Promise.reject(new Error('journal delete failed')) : originalDelete(service, account), setSync: (...args) => subject.backend.setSync(...args), getSync: (...args) => subject.backend.getSync(...args), deleteSync: (...args) => subject.backend.deleteSync(...args) };
+    const result = await switchClaude(subject.deps, manual);
+    const path = join(subject.deps.journalDir!, 'switch-anthropic.json');
+    assert.equal(result.outcome, 'ok'); assert.equal(result.steps?.cleanup.length, 1); assert.equal(existsSync(path), true);
+    subject.deps.live.backend = subject.backend;
+    subject.deps.store.setActiveLogin('anthropic', 'account-a', 'manual', NOW);
+    const next = await switchClaude(subject.deps, manual);
+    assert.equal(next.outcome, 'ok');
+    assert.equal(existsSync(path), false);
+  });
+
+  it('a target that is active in Phase A and still active under the lock is a noop (a second switch starts while the first holds the journal owner lock)', async () => {
+    const subject = await transactionFixture();
+    const journalPath = seedJournal(subject);
+    let probes = 0;
+    subject.deps.probeOwner = () => { probes += 1; return 'held'; };
+    subject.deps.store.setActiveLogin('anthropic', 'account-b', 'manual', NOW);
+    subject.deps.locks = { owner: async (options, fn) => {
+      unlinkSync(journalPath);
+      return withClaudeSwitchJournalOwner(options, fn);
+    } };
+    const result = await switchClaude(subject.deps, manual);
+    assert.equal(result.outcome, 'noop');
+    assert.equal(probes, 1);
+    assert.equal((subject.rows.at(-1) as { outcome: string }).outcome, 'noop');
+  });
+
+  it('a journal created between the preflight and the lock is refused under the lock before step 5', async () => {
+    const subject = await transactionFixture();
+    subject.deps.locks = { owner: async (options, fn) => {
+      seedJournal(subject);
+      return withClaudeSwitchJournalOwner(options, fn);
+    } };
+    const result = await switchClaude(subject.deps, manual);
+    assert.equal(result.reason, 'switch-journal-present');
+    assert.equal(subject.backend.listServices().some((service) => service.startsWith('qlb:anthropic:staged-rollback:')), false);
+  });
+
+  it('a journal marked closed rolled-back whose staged item is already gone is deleted and the switch proceeds', async () => {
+    const subject = await transactionFixture(); const path = seedJournal(subject, { closed: 'rolled-back' });
+    subject.deps.probeOwner = () => 'free'; subject.deps.stillTheSameProcess = async () => false;
+    assert.equal((await switchClaude(subject.deps, manual)).outcome, 'ok');
+    assert.equal(existsSync(path), false);
+  });
+
+  it('a journal marked closed stage-failed that still names its staged item is deleted with the item and the switch proceeds', async () => {
+    const subject = await transactionFixture(); const path = seedJournal(subject, { closed: 'stage-failed' });
+    await subject.backend.set('qlb:anthropic:staged-rollback:older', 'qlb', credential('old'));
+    subject.deps.probeOwner = () => 'free'; subject.deps.stillTheSameProcess = async () => false;
+    assert.equal((await switchClaude(subject.deps, manual)).outcome, 'ok');
+    assert.equal(existsSync(path), false);
+    assert.equal(subject.backend.listServices().includes('qlb:anthropic:staged-rollback:older'), false);
+  });
+
+  it('a journal whose only row for the attempt is rolled-back or refused and that carries no marker is not finished: the switch refuses switch-journal-present and the staged item survives', async () => {
+    const subject = await transactionFixture(); const path = seedJournal(subject);
+    await subject.backend.set('qlb:anthropic:staged-rollback:older', 'qlb', credential('old'));
+    subject.deps.probeOwner = () => 'free'; subject.deps.stillTheSameProcess = async () => false;
+    subject.deps.store.findClaudeSwitchByAttempt = () => null;
+    assert.equal((await switchClaude(subject.deps, manual)).reason, 'switch-journal-present');
+    assert.equal(existsSync(path), true);
+    assert.equal(subject.backend.listServices().includes('qlb:anthropic:staged-rollback:older'), true);
+  });
+
+  it('does not freshen an already-active target before returning noop', async () => {
+    const subject = await transactionFixture();
+    let posts = 0;
+    await subject.slots.writeSlot('account-a', credential('a', NOW + 10 * 60_000), { cause: 'post' });
+    subject.deps.consume.postRefresh = async () => {
+      posts += 1;
+      return { status: 200, body: JSON.stringify({ access_token: 'fixture-issued', refresh_token: 'fixture-refresh-issued', expires_in: 3600 }) };
+    };
+    const result = await switchClaude(subject.deps, { to: 'account-a', trigger: 'manual' });
+    assert.equal(result.outcome, 'noop');
+    assert.equal(posts, 0);
+  });
+
+  it('a queued second switch to the same target records noop under the lock with one switch_log row', async () => {
+    const subject = await transactionFixture();
+    const result = await switchClaude(subject.deps, { to: 'account-a', trigger: 'manual' });
+    assert.equal(result.outcome, 'noop');
+    assert.deepEqual(subject.rows, [{
+      ts: NOW, provider: 'anthropic', fromAccount: 'account-a', toAccount: 'account-a', trigger: 'manual',
+      outcome: 'noop', injected: false, stepsJson: JSON.stringify({ attempt: 'attempt-k5-5' }),
+    }]);
+  });
+
+  it('a failed step-8 switch_log row records the step-7 publishedAt time', async () => {
+    const subject = await transactionFixture();
+    subject.deps.live.writeText = () => { throw new Error('config write failed'); };
+    const result = await switchClaude(subject.deps, manual);
+    assert.deepEqual({ outcome: result.outcome, reason: result.reason }, { outcome: 'failed', reason: 'step-8' });
+    assert.equal((subject.rows[0] as { publishedAt?: number }).publishedAt, NOW);
+  });
+
+  it('a failed step-7 writes one failed switch_log row', async () => {
+    const subject = await transactionFixture();
+    subject.deps.live.backend = {
+      kind: 'test-memory', get: (...args) => subject.backend.get(...args), delete: (...args) => subject.backend.delete(...args),
+      set: async (service, account, value) => service === subject.paths.keychainService ? Promise.reject(new Error('keychain write failure')) : subject.backend.set(service, account, value),
+      setSync: (...args) => subject.backend.setSync(...args), getSync: (...args) => subject.backend.getSync(...args), deleteSync: (...args) => subject.backend.deleteSync(...args),
+    };
+    const result = await switchClaude(subject.deps, manual);
+    assert.equal(result.outcome, 'failed');
+    assert.equal(subject.rows.length, 1);
+    assert.deepEqual(subject.rows[0], {
+      ts: NOW, provider: 'anthropic', fromAccount: 'account-a', toAccount: 'account-b', trigger: 'manual', outcome: 'failed',
+      error: 'keychain-write-failed', detail: 'step-7', injected: false, stepsJson: JSON.stringify({ ...result.steps, attempt: 'attempt-k5-5' }), publishedAt: null,
+    });
+  });
+
+  it('re-checks breaker-open and C-swap preconditions under the lock before step 5', async () => {
+    const subject = await transactionFixture();
+    let processCheck = 0;
+    let breakerReads = 0;
+    subject.deps.cswapProcesses = () => processCheck++ === 0 ? [] : [{ pid: 1 }];
+    subject.deps.store.getConfig = () => ++breakerReads === 1 ? null : String(NOW + 1);
+    subject.deps.locks = {
+      switch: (async (fn: () => Promise<unknown>, options: unknown) => withClaudeSwitchLock(fn, options as never)) as unknown as NonNullable<ClaudeSwitchDeps['locks']>['switch'],
+    };
+    const result = await switchClaude(subject.deps, automatic);
+    assert.deepEqual({ outcome: result.outcome, reason: result.reason }, { outcome: 'refused', reason: 'breaker-open' });
+    assert.equal(processCheck, 1);
+    assert.equal(breakerReads, 2);
+
+    const cswap = await transactionFixture();
+    let cswapChecks = 0;
+    cswap.deps.cswapProcesses = () => cswapChecks++ === 0 ? [] : [{ pid: 1 }];
+    const cswapResult = await switchClaude(cswap.deps, automatic);
+    assert.deepEqual({ outcome: cswapResult.outcome, reason: cswapResult.reason }, { outcome: 'refused', reason: 'cswap-process-alive' });
+    assert.equal(cswapChecks, 2);
+  });
+
+  it('a post-commit owner-lock compromise keeps the committed ok result and warns', async () => {
+    const subject = await transactionFixture();
+    const warnings: string[] = [];
+    subject.deps.warn = (message) => warnings.push(message);
+    subject.deps.locks = {
+      owner: async (options, fn) => {
+        await withClaudeSwitchJournalOwner(options, fn);
+        throw new ProperLockfileCompromised('/fixture/journal.lock');
+      },
+    };
+    const result = await switchClaude(subject.deps, manual);
+    assert.equal(result.outcome, 'ok', JSON.stringify(result));
+    assert.equal(result.switchId, 42);
+    assert.deepEqual(result.steps?.cleanup, ['lock-timeout']);
+    assert.equal(subject.refusals.length, 0);
+    assert.equal(warnings.length, 1);
+  });
+
+  it('dedupes lock-timeout when the post-commit journal update and owner-lock exit both report the compromise', async () => {
+    const subject = await transactionFixture();
+    subject.deps.journalOps = {
+      update: (held, patch, options) => {
+        if (patch.committed !== undefined) throw new ProperLockfileCompromised('/fixture/journal.lock');
+        return updateClaudeSwitchJournal(held, patch, options);
+      },
+      remove: deleteClaudeSwitchJournal,
+    };
+    subject.deps.locks = {
+      owner: async (options, fn) => {
+        await withClaudeSwitchJournalOwner(options, fn);
+        throw new ProperLockfileCompromised('/fixture/journal.lock');
+      },
+    };
+    const result = await switchClaude(subject.deps, manual);
+    assert.equal(result.outcome, 'ok');
+    assert.deepEqual(result.steps?.cleanup, ['lock-timeout']);
+  });
+
+  it('a Phase-C afterSwitch error is warned and does not replace the committed ok result', async () => {
+    const subject = await transactionFixture();
+    const warnings: string[] = [];
+    subject.deps.afterSwitch = async () => { throw new Error('usage unavailable'); };
+    subject.deps.warn = (message) => warnings.push(message);
+    const result = await switchClaude(subject.deps, manual);
+    assert.equal(result.outcome, 'ok');
+    assert.equal(result.switchId, 42);
+    assert.equal(warnings.length, 1);
+  });
+
+  it('result, rows and errors contain no token value', async () => {
+    const subject = await transactionFixture(); const result = await switchClaude(subject.deps, manual);
+    const serialised = JSON.stringify({ result, committed: subject.committed, refusals: subject.refusals });
+    assert.equal(serialised.includes('outgoing-access'), false); assert.equal(serialised.includes('fixture-access-b'), false);
   });
 });
