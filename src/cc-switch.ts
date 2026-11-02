@@ -216,7 +216,7 @@ export function classifySwitchError(error: unknown): string {
 
 function journalOptions(deps: ClaudeSwitchDeps, paths: ReturnType<typeof claudePaths>): ClaudeSwitchJournalOptions { return { journalDir: deps.journalDir, home: deps.home, env: deps.env, configPath: paths.globalConfigPath, keychainService: paths.keychainService }; }
 function refusal(deps: ClaudeSwitchDeps, input: SwitchClaudeInput, attempt: string, from: string | null, reason: string): ClaudeSwitchResult {
-  deps.store.recordClaudeSwitchRefusal({ from, to: input.to, trigger: input.trigger, reason, injected: switchWasInjected(deps, input), attempt, now: deps.now() });
+  deps.store.recordClaudeSwitchRefusal({ from, to: input.to, trigger: input.trigger, reason, republish: input.republish === true, injected: switchWasInjected(deps, input), attempt, now: deps.now() });
   return { outcome: 'refused', from, to: input.to, reason, attempt, injected: switchWasInjected(deps, input), exitCode: 3 };
 }
 function writeError(error: unknown, fallback: 'keychain-write-failed' | 'config-write-failed'): string {
@@ -229,7 +229,7 @@ function failed(deps: ClaudeSwitchDeps, input: SwitchClaudeInput, attempt: strin
   try {
     deps.store.recordSwitch({
       ts: deps.now(), provider: 'anthropic', fromAccount: from, toAccount: input.to, trigger: input.trigger,
-      outcome: 'failed', error: error ?? null, detail: reason, injected: switchWasInjected(deps, input),
+      outcome: 'failed', error: error ?? null, detail: input.republish ? `republish:${reason}` : reason, injected: switchWasInjected(deps, input),
       outgoingKind: outgoingKind ?? null, stepsJson: JSON.stringify({ ...state, attempt }), ...(publishedAt !== undefined ? { publishedAt } : {}),
     });
   } catch { warn(deps, 'could not record failed Claude switch'); }
@@ -359,7 +359,7 @@ async function rollbackClaudeSwitch(
   try {
     deps.store.recordSwitch({
       ts: deps.now(), provider: 'anthropic', fromAccount: from, toAccount: input.to, trigger: input.trigger,
-      outcome: 'rolled-back', error, detail, injected, outgoingKind,
+      outcome: 'rolled-back', error, detail: input.republish ? `republish:${detail}` : detail, injected, outgoingKind,
       stepsJson: JSON.stringify({ ...state, attempt: deps.attempt }), ...(publishedAt === null ? {} : { publishedAt }),
     });
   } catch { warn(deps, 'could not record rolled-back Claude switch'); }
@@ -454,9 +454,9 @@ async function switchClaudeAttempt(deps: ClaudeSwitchDeps, input: SwitchClaudeIn
           if (input.republish && classified.kind !== 'own-bytes' && classified.kind !== 'own-family' && classified.kind !== 'own-rotated') {
             return refusal(deps, input, attempt, from, 'republish-live-not-own');
           }
-          if (classified.kind === 'own-family' || classified.kind === 'own-rotated' || (!input.republish && classified.kind === 'unresolved')) {
+          if (classified.kind === 'own-family' || classified.kind === 'own-rotated' || classified.kind === 'unresolved') {
             try { await deps.slots.writeSlot(from, outgoingLive, { cause: 'adopt', by: deps.by, evidence: classified.kind === 'own-rotated' ? 'oracle' : classified.kind === 'unresolved' ? null : 'lineage' }); } catch (error) { return failed(deps, input, attempt, from, 'outgoing-backup-failed', writeError(error, 'keychain-write-failed'), state, 5, undefined, classified.kind); }
-          } else if (!input.republish && (classified.kind === 'foreign' || classified.kind === 'alien' || classified.kind === 'known-foreign' || (classified.kind === 'foreign-synced' && prepared.slots.find((slot) => slot.accountId === classified.foreignSlotId)?.credential !== outgoingLive))) {
+          } else if (classified.kind === 'foreign' || classified.kind === 'alien' || classified.kind === 'known-foreign' || (classified.kind === 'foreign-synced' && prepared.slots.find((slot) => slot.accountId === classified.foreignSlotId)?.credential !== outgoingLive)) {
             const stashId = (deps.stashTimestamp ?? (() => defaultStashTimestamp(deps.now())))();
             try {
               await deps.slots.stashUnclaimed(stashId, outgoingLive, undefined, classified.foreignSlotId ?? undefined);
@@ -472,10 +472,9 @@ async function switchClaudeAttempt(deps: ClaudeSwitchDeps, input: SwitchClaudeIn
             }
           } else if (classified.kind === 'own-bytes' || classified.kind === 'foreign-synced') {
             // These outgoing kinds are intentionally retained in place.
-          } else if (input.republish) {
-            return refusal(deps, input, attempt, from, 'republish-live-not-own');
           } else {
-            return refusal(deps, input, attempt, from, `outgoing-unrouted:${classified.kind}`);
+            const unexpectedKind: never = classified.kind;
+            return refusal(deps, input, attempt, from, `outgoing-unrouted:${unexpectedKind}`);
           }
           state.started.push(5); await deps.hooks?.afterStep5?.();
 

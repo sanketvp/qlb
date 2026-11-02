@@ -2315,10 +2315,11 @@ export class Store {
         }
       };
 
-      const updated = this.db.prepare('UPDATE claude_slots SET last_active_at = ? WHERE account_id = ?').run(input.now, input.toAccount);
-      if (updated.changes !== 1) throw new Error('Claude switch target slot not found');
-      this.setActiveLogin('anthropic', input.toAccount, input.setBy, input.now);
+      const targetExists = this.db.prepare('SELECT 1 FROM claude_slots WHERE account_id = ?').get(input.toAccount);
+      if (!targetExists) throw new Error('Claude switch target slot not found');
       if (!input.republish) {
+        this.db.prepare('UPDATE claude_slots SET last_active_at = ? WHERE account_id = ?').run(input.now, input.toAccount);
+        this.setActiveLogin('anthropic', input.toAccount, input.setBy, input.now);
         this.setConfig('cooldown.anthropic', String(input.now + 300_000));
         this.setConfig('auto.anthropic.lastSwitchFrom', input.fromAccount);
         setOrDelete('auto.anthropic.lastSwitchTo', input.trigger === 'manual' ? null : input.toAccount);
@@ -2352,6 +2353,7 @@ export class Store {
     to: string;
     trigger: string;
     reason: string;
+    republish?: boolean;
     injected: boolean;
     attempt: string;
     now: number;
@@ -2363,7 +2365,7 @@ export class Store {
       toAccount: input.to,
       trigger: input.trigger,
       outcome: 'refused',
-      detail: input.reason,
+      detail: input.republish ? `republish:${input.reason}` : input.reason,
       injected: input.injected,
       stepsJson: JSON.stringify({ attempt: input.attempt }),
     });

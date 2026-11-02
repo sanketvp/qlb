@@ -209,6 +209,14 @@ describe('Claude switch Phase A (K5-4)', () => {
     assert.equal(subject.posts(), 0);
   });
 
+  it('republish freshen guard prevents a POST even when a prechecked target changes before prepare', async () => {
+    const subject = await fixture();
+    await subject.slots.writeSlot('account-b', credential('b', NOW + 10 * 60_000), { cause: 'post' });
+    const result = await prepareClaudeSwitch(subject.deps, { to: 'account-b', trigger: 'manual', republish: true }, true);
+    assert.equal('active' in result, true);
+    assert.equal(subject.posts(), 0);
+  });
+
   it('continues after a profile error with unresolved provenance', async () => {
     const subject = await fixture();
     const paths = claudePaths({ home: HOME, env: ENV });
