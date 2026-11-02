@@ -21,7 +21,7 @@ import { MockKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from '../src/k
 import { readCodexSwitchHistory, type CodexProcess } from '../src/codex-sessions';
 import { openStore } from '../src/store';
 import { ClaudeCodeLockTimeout, codexAuthLockDir } from '../src/cc-locks';
-import { CodexLockLost, codexLockPaths } from '../src/codex-consume';
+import { codexLockPaths } from '../src/codex-consume';
 
 const NOW = Date.parse('2026-11-01T12:00:00.000Z');
 const A = 'user-a:account-a';
@@ -822,9 +822,20 @@ describe('codex active refresh helpers', () => {
       h.store.recordCodexObservation({ identity: B, lineageFp: 'sha256:b', by: 'qlb-active', now: NOW - 60_000 });
       h.deps.list = async () => [];
       h.deps.transport = async () => { h.deps.list = async () => [process(900, 1_000)]; writeFileSync(h.authPath, JSON.stringify(successor)); return { status: 400, body: JSON.stringify({ error: 'refresh_token_reused' }) }; };
+      const logs: string[] = [];
+      h.deps.autoLog = (line) => logs.push(line);
       const result = await refreshActiveCodexLogin(h.deps, { trigger: 'proactive-expiry' });
       assert.deepEqual(result, { status: 'codex-won', adopted: true, pids: [900], document: successor });
+      assert.equal(h.store.getCodexSlot(A)?.dead, false);
       assert.equal(h.store.getCodexSlot(A)?.pendingAdopt, false);
+      const db = new DatabaseSync(h.store.dbPath);
+      try {
+        assert.equal((db.prepare("SELECT COUNT(*) AS count FROM relogin_events WHERE provider = 'openai-codex'").get() as { count: number }).count, 0);
+        const lineage = db.prepare("SELECT cause, evidence FROM lineage_log WHERE provider = 'openai-codex' ORDER BY id DESC LIMIT 1").get() as { cause: string; evidence: string };
+        assert.equal(lineage.cause, 'adopt');
+        assert.equal(lineage.evidence, 'holder');
+      } finally { db.close(); }
+      assert.ok(logs.some((line) => line.startsWith('codex:codex-won provider=openai-codex account=user-a:account-a adopted=1 pids=900')));
     } finally { h.close(); }
   });
 
@@ -832,11 +843,25 @@ describe('codex active refresh helpers', () => {
     const h = activeHarness();
     try {
       h.store.recordCodexObservation({ identity: B, lineageFp: 'sha256:b', by: 'qlb-active', now: NOW - 60_000 });
+      // The locked observe may set this during its ordinary B3 pass; the
+      // post-reuse noop must leave it as-is.
+      h.store.setActiveLogin('openai-codex', A, 'adopt', NOW - 1);
       h.deps.list = async () => [];
       h.deps.transport = async () => { h.deps.list = async () => [process(901, 1_000)]; return { status: 400, body: JSON.stringify({ error: 'refresh_token_reused' }) }; };
       const before = readFileSync(h.authPath, 'utf8');
-      assert.equal((await refreshActiveCodexLogin(h.deps, { trigger: 'proactive-expiry' })).status, 'codex-won');
-      assert.equal(h.store.getCodexSlot(A)?.dead, false);
+      const db = new DatabaseSync(h.store.dbPath);
+      try {
+        const setBy = (db.prepare("SELECT set_by FROM active_login WHERE provider = 'openai-codex'").get() as { set_by: string }).set_by;
+        const logs: string[] = [];
+        h.deps.autoLog = (line) => logs.push(line);
+        assert.deepEqual(await refreshActiveCodexLogin(h.deps, { trigger: 'proactive-expiry' }), {
+          status: 'codex-won', adopted: false, pids: [901], document: h.a0,
+        });
+        assert.equal(h.store.getCodexSlot(A)?.dead, false);
+        assert.equal(h.store.getCodexSlot(A)?.pendingAdopt, true);
+        assert.equal((db.prepare("SELECT set_by FROM active_login WHERE provider = 'openai-codex'").get() as { set_by: string }).set_by, setBy);
+        assert.ok(logs.some((line) => line.startsWith('codex:codex-won provider=openai-codex account=user-a:account-a adopted=0 pids=901')));
+      } finally { db.close(); }
       assert.equal(readFileSync(h.authPath, 'utf8'), before);
     } finally { h.close(); }
   });
@@ -869,12 +894,88 @@ describe('codex active refresh helpers', () => {
     } finally { h.close(); }
   });
 
+  it('a codex-won re-read with an unclaimed identity is refused and clears ownership', async () => {
+    const h = activeHarness();
+    try {
+      const unknown = { ...document(NOW + 600_000, 'fixture-access-codex-won-unknown'), tokens: {
+        ...document(NOW + 600_000, 'fixture-access-codex-won-unknown').tokens,
+        id_token: jwt({ 'https://api.openai.com/auth': { chatgpt_user_id: 'user-c', chatgpt_account_id: 'account-c' } }),
+        account_id: 'account-c', refresh_token: 'fixture-refresh-codex-won-unknown',
+      } };
+      h.store.recordCodexObservation({ identity: B, lineageFp: 'sha256:b', by: 'qlb-active', now: NOW - 60_000 });
+      h.deps.list = async () => [];
+      h.deps.transport = async () => {
+        h.deps.list = async () => [process(903, 1_000)];
+        writeFileSync(h.authPath, JSON.stringify(unknown));
+        return { status: 400, body: JSON.stringify({ error: 'refresh_token_reused' }) };
+      };
+      assert.deepEqual(await refreshActiveCodexLogin(h.deps, { trigger: 'proactive-expiry' }), { status: 'refused', reason: 'unknown-live-identity' });
+      assert.equal(h.store.getCodexActiveLogin(), null);
+    } finally { h.close(); }
+  });
+
+  it('a codex-won wiped re-read is refused', async () => {
+    const h = activeHarness();
+    try {
+      const readLive = h.deps.readLive;
+      let reads = 0;
+      h.deps.readLive = async () => ++reads === 2
+        ? { status: 'wiped' as const, error: { ok: false as const, error: 'tokens-empty' as const, status: 'wiped' as const } }
+        : readLive();
+      h.store.recordCodexObservation({ identity: B, lineageFp: 'sha256:b', by: 'qlb-active', now: NOW - 60_000 });
+      h.deps.list = async () => [];
+      h.deps.transport = async () => {
+        h.deps.list = async () => [process(904, 1_000)];
+        return { status: 400, body: JSON.stringify({ error: 'refresh_token_reused' }) };
+      };
+      assert.deepEqual(await refreshActiveCodexLogin(h.deps, { trigger: 'proactive-expiry' }), { status: 'refused', reason: 'wiped' });
+    } finally { h.close(); }
+  });
+
+  it('a codex-won slot split is refused', async () => {
+    const h = activeHarness();
+    try {
+      const successor = { ...document(NOW + 600_000, 'fixture-access-codex-won-split'), tokens: { ...document(NOW + 600_000, 'fixture-access-codex-won-split').tokens, refresh_token: 'fixture-refresh-codex-won-split' } };
+      h.store.recordCodexObservation({ identity: B, lineageFp: 'sha256:b', by: 'qlb-active', now: NOW - 60_000 });
+      h.deps.list = async () => [];
+      h.deps.transport = async () => {
+        h.deps.list = async () => [process(905, 1_000)];
+        const slots = h.deps.slots;
+        h.deps.slots = { ...slots, readSlot: () => ({ document: successor, fingerprint: codexFingerprint(successor) }) } as never;
+        writeFileSync(h.authPath, JSON.stringify(successor));
+        return { status: 400, body: JSON.stringify({ error: 'refresh_token_reused' }) };
+      };
+      assert.deepEqual(await refreshActiveCodexLogin(h.deps, { trigger: 'proactive-expiry' }), { status: 'refused', reason: 'slot-split' });
+    } finally { h.close(); }
+  });
+
+  it('a post-publish observation write failure is transient rather than a rejected promise', async () => {
+    const h = activeHarness();
+    try {
+      const record = h.store.recordCodexObservation.bind(h.store);
+      let writes = 0;
+      h.store.recordCodexObservation = (input) => {
+        writes += 1;
+        if (writes === 2) throw new Error('fixture post observation write failure');
+        return record(input);
+      };
+      h.deps.transport = async () => ({ status: 200, body: JSON.stringify({
+        refresh_token: 'fixture-refresh-observation-failure', access_token: document(NOW + 600_000, 'fixture-access-observation-failure').tokens.access_token,
+      }) });
+      assert.deepEqual(await refreshActiveCodexLogin(h.deps, { trigger: 'proactive-expiry' }), { status: 'transient', reason: 'observation-write-failed' });
+    } finally { h.close(); }
+  });
+
   it('refresh_token_reused without a holder marks dead with a relogin row', async () => {
     const h = activeHarness();
     try {
       h.deps.transport = async () => ({ status: 400, body: JSON.stringify({ error: 'refresh_token_reused' }) });
       assert.equal((await refreshActiveCodexLogin(h.deps, { trigger: 'proactive-expiry' })).status, 'dead');
       assert.equal(h.store.getCodexSlot(A)?.dead, true);
+      const db = new DatabaseSync(h.store.dbPath);
+      try {
+        assert.equal((db.prepare("SELECT COUNT(*) AS count FROM relogin_events WHERE provider = 'openai-codex' AND kind = 'dead'").get() as { count: number }).count, 1);
+      } finally { db.close(); }
     } finally { h.close(); }
   });
 
@@ -1042,11 +1143,13 @@ describe('codex active refresh helpers', () => {
     try {
       const successor = document(NOW + 600_000, 'fixture-access-lock-lost');
       let posts = 0;
-      let compromised = false;
-      h.deps.withLocks = async (_accountId, fn) => fn(() => { if (compromised) throw new CodexLockLost('fixture lock compromised'); });
+      h.deps.withLocks = undefined;
+      h.deps.authLockOptions = { home: h.root, touchIntervalMs: 60_000 };
       h.deps.transport = async () => {
         posts += 1;
-        compromised = true;
+        // Exercise the production consume → switch → auth wrappers: losing
+        // the held auth lock after the 2xx makes them rethrow on finalization.
+        rmSync(codexAuthLockDir({ home: h.root }), { recursive: true, force: true });
         return { status: 200, body: JSON.stringify({ refresh_token: successor.tokens.refresh_token, access_token: successor.tokens.access_token }) };
       };
       const outcome = await refreshActiveCodexLogin(h.deps, { trigger: 'proactive-expiry' });
@@ -1085,6 +1188,15 @@ describe('codex active refresh helpers', () => {
         return true;
       });
       assert.equal(codexFingerprint((h.deps.slots as any).readSlot(A).document).includes(raw.refresh), false);
+
+      const thrown = activeHarness();
+      try {
+        writeFileSync(thrown.authPath, JSON.stringify(input));
+        thrown.deps.list = async () => { throw new Error(raw.refresh); };
+        const refused = await refreshActiveCodexLogin(thrown.deps, { trigger: 'proactive-expiry' });
+        assert.deepEqual(refused, { status: 'refused', reason: 'codex-process-check-failed' });
+        for (const secret of Object.values(raw)) assert.equal(render(refused).includes(secret), false);
+      } finally { thrown.close(); }
 
       const unknown = { ...input, tokens: {
         ...input.tokens,

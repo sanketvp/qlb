@@ -275,6 +275,40 @@ async function attributeSettledExternal(
 }
 
 /**
+ * C10 has already recorded `pending_adopt` for a reused grant.  Attribution
+ * is still needed to distinguish noop from an unsafe live identity, but a
+ * same-lineage noop must leave that C10 state (and active_login.set_by) alone.
+ */
+async function attributeCodexWon(
+  deps: CodexActiveDeps,
+  assertHeld: () => void,
+  accountId: string,
+  live: CodexAuthDocument,
+): Promise<CodexActiveExternalAction> {
+  const slot = deps.store.getCodexSlot(accountId);
+  if (!slot) throw new Error('Codex active slot disappeared during post-reuse verification');
+  const document = deps.slots.readSlot(accountId, { fresh: true }).document;
+  const store = Object.create(deps.store) as CodexSwitchDeps['store'];
+  // `attributeSameSlot` normally marks a noop imported/active.  Suppress only
+  // that mark: C10's pending_adopt is the durable watch hand-off here.
+  store.markCodexSlotImportedActive = (slotId, ...args) => slotId === accountId
+    ? true
+    : deps.store.markCodexSlotImportedActive(slotId, ...args);
+  const attribution = await attributeForPhase({ assertHeld }, 'post', {
+    store,
+    keychain: deps.keychain,
+    slot: { accountId, document, fingerprint: slot.fingerprint ?? undefined },
+    activeSlotId: deps.store.getCodexActiveLogin() ?? undefined,
+    activeSetBy: 'adopt',
+    live,
+    holderObservation: { aliveBefore: true, aliveAfter: true },
+    l40Verified: deps.store.getConfig('codex.l40Verified') === '1',
+    now: deps.now,
+  });
+  return attribution.action;
+}
+
+/**
  * Observe and reconcile the active Codex document under the three active
  * locks.  This is deliberately the pre-POST half of the refresh workflow.
  */
@@ -373,10 +407,17 @@ export async function refreshActiveCodexLogin(deps: CodexActiveDeps, input: Code
   }
   await deps.hooks?.afterCheck?.();
 
+  let postIssued = false;
+  let postOutcome: CodexActiveOutcome | undefined;
+  const finishPostOutcome = (outcome: CodexActiveOutcome): CodexActiveOutcome => {
+    if (postIssued) postOutcome = outcome;
+    return outcome;
+  };
   try {
     return await withActiveCodexLocks(deps, active, async (assertHeld) => {
       await deps.hooks?.afterLock?.();
       const fence = codexRecoveryFenceState(deps.journalDir, deps.store);
+      const inFlightSlots = fence.state === 'fenced' ? fence.accounts : undefined;
       if (isFence(fence)) {
         return { status: 'fenced', reason: fence.reason, message: fence.message, accounts: fence.accounts };
       }
@@ -451,10 +492,15 @@ export async function refreshActiveCodexLogin(deps: CodexActiveDeps, input: Code
       }
       const activeAfterObserve = deps.store.getCodexActiveLogin();
       if (settled.action === 'drift' || activeAfterObserve !== active || codexIdentity(settled.outgoing.document) !== active) {
+        if (republish !== undefined && republish !== 'ok') {
+          deps.autoLog?.(`codex:live-write-failed provider=openai-codex account=${active} cause=republish at=${deps.now()}`);
+        }
         return { status: 'drift', accountId: activeAfterObserve, ...(republish === undefined ? {} : { republish }) };
       }
       if (externalAction !== undefined) {
-        return { status: 'posted-live-external', document: settled.outgoing.document, action: externalAction, cause: 'republish' };
+        const outcome: CodexActiveOutcome = { status: 'posted-live-external', document: settled.outgoing.document, action: externalAction, cause: 'republish' };
+        logLiveWriteFailure(deps, active, outcome);
+        return outcome;
       }
       await deps.hooks?.afterObserve?.();
 
@@ -498,25 +544,26 @@ export async function refreshActiveCodexLogin(deps: CodexActiveDeps, input: Code
       let consumed: CodexConsumeResult;
       try {
         consumed = await (async () => {
-          let sent = false;
           const guardedTransport: CodexActiveDeps['transport'] = async (request) => {
-            sent = true;
+            postIssued = true;
             deps.signalWindow?.enter();
             await deps.hooks?.beforeSend?.();
-            return deps.transport(request);
+            const response = await deps.transport(request);
+            await deps.hooks?.afterPost?.();
+            return response;
           };
           const result = await consumeCodexSlot({
             accountId: active,
             snapshot: settled.outgoing.document,
             trigger: input.trigger,
             slots: deps.slots,
-            store: deps.store as unknown as Parameters<typeof consumeCodexSlot>[0]['store'],
+            store: { dbPath: deps.dbPath },
             transport: guardedTransport,
             now: deps.now,
             holders: holdersFor(deps, active),
+            inFlightSlots,
             assertHeld,
           });
-          if (sent) await deps.hooks?.afterPost?.();
           return result;
         })();
       } catch (error) {
@@ -527,51 +574,81 @@ export async function refreshActiveCodexLogin(deps: CodexActiveDeps, input: Code
         throw error;
       }
 
+      const finish = finishPostOutcome;
       switch (consumed.status) {
         case 'refreshed': {
           if (!consumed.document) throw new Error('refreshed Codex result omitted its successor');
           const outcome = await publishActiveDocument(deps, assertHeld, active, settled.outgoing, consumed.document, 'post');
           logLiveWriteFailure(deps, active, outcome);
-          return outcome;
+          return finish(outcome);
         }
         case 'fresh': {
           if (!consumed.document) throw new Error('fresh Codex result omitted its successor');
           const outcome = await publishActiveDocument(deps, assertHeld, active, settled.outgoing, consumed.document, 'republish');
           logLiveWriteFailure(deps, active, outcome);
-          return outcome;
+          return finish(outcome);
         }
         case 'held':
-          return { status: 'held', pids: consumed.holders ?? [], document: settled.outgoing.document, action: settled.action };
-        case 'dead': return { status: 'dead', reason: 'refresh-token-rejected' };
-        case 'superseded': return { status: 'superseded', document: consumed.document ?? settled.outgoing.document };
-        case 'transient': return { status: 'transient' };
+          return finish({ status: 'held', pids: consumed.holders ?? [], document: settled.outgoing.document, action: settled.action });
+        case 'dead': return finish({ status: 'dead', reason: 'refresh-token-rejected' });
+        case 'superseded': return finish({ status: 'superseded', document: consumed.document ?? settled.outgoing.document });
+        case 'transient': return finish({ status: 'transient' });
         case 'stashed':
-        case 'stashed-lock-lost': return { status: 'stashed', ...(consumed.stashId === undefined ? {} : { stashId: consumed.stashId }) };
+        case 'stashed-lock-lost': return finish({ status: 'stashed', ...(consumed.stashId === undefined ? {} : { stashId: consumed.stashId }) });
         case 'successor-unpersisted':
           deps.autoLog?.(`codex:unpersisted-token provider=openai-codex account=${active} at=${deps.now()}`);
-          return { status: 'unpersisted' };
-        case 'slot-removed': return { status: 'refused', reason: 'active-slot-missing' };
-        case 'slot-split': return { status: 'refused', reason: 'slot-split' };
-        case 'switch-in-flight': return { status: 'refused', reason: 'switch-in-flight' };
+          return finish({ status: 'unpersisted' });
+        case 'slot-removed': return finish({ status: 'refused', reason: 'active-slot-missing' });
+        case 'slot-split': return finish({ status: 'refused', reason: 'slot-split' });
+        case 'switch-in-flight': return finish({ status: 'refused', reason: 'switch-in-flight' });
         case 'codex-won-inactive': {
           const live = await deps.readLive();
           const pids = consumed.holders ?? [];
+          if (live.status === 'wiped') {
+            recordActiveObservation(deps, live);
+            return finish({ status: 'refused', reason: 'wiped' });
+          }
           if (live.status !== 'ok') {
             deps.autoLog?.(`codex:codex-won provider=openai-codex account=${active} adopted=0 pids=${pids.join(',')} at=${deps.now()}`);
-            return { status: 'codex-won', adopted: false, pids, document: settled.outgoing.document };
+            return finish({ status: 'codex-won', adopted: false, pids, document: settled.outgoing.document });
           }
           recordActiveObservation(deps, live);
-          const action = await attributeSettledExternal(deps, assertHeld, active, live.doc);
-          if (action === 'drift') return { status: 'drift', accountId: deps.store.getCodexActiveLogin() };
+          const action = await attributeCodexWon(deps, assertHeld, active, live.doc);
+          if (action === 'drift') return finish({ status: 'drift', accountId: deps.store.getCodexActiveLogin() });
+          if (action === 'unclaimed') {
+            assertHeld();
+            try {
+              await deps.slots.ensureUnclaimedStash!(live.doc, deps.now());
+            } catch (error) {
+              if (error instanceof CodexStashUnverifiable) return finish({ status: 'refused', reason: 'stash-unverifiable' });
+              throw error;
+            }
+            assertHeld();
+            deps.store.setActiveLogin('openai-codex', null, 'adopt');
+            return finish({ status: 'refused', reason: 'unknown-live-identity' });
+          }
+          if (action === 'wiped') return finish({ status: 'refused', reason: 'wiped' });
+          if (action === 'slot-split') return finish({ status: 'refused', reason: 'slot-split' });
+          if (action === 'stash-unverifiable') return finish({ status: 'refused', reason: 'stash-unverifiable' });
           const adopted = action === 'adopt';
           deps.autoLog?.(`codex:codex-won provider=openai-codex account=${active} adopted=${adopted ? 1 : 0} pids=${pids.join(',')} at=${deps.now()}`);
-          return { status: 'codex-won', adopted, pids, document: live.doc };
+          return finish({ status: 'codex-won', adopted, pids, document: live.doc });
         }
         case 'busy':
         case 'active-slot':
         case 'c9-unavailable':
           throw new Error(`unreachable consume status: ${consumed.status}`);
       }
+      } catch (error) {
+        if (error instanceof CodexObservationWriteFailed) return finishPostOutcome({ status: 'transient', reason: 'observation-write-failed' });
+        if (error instanceof CodexProcessCheckFailed) {
+          deps.autoLog?.(`codex:process-check-failed provider=openai-codex at=${deps.now()}`);
+          return finishPostOutcome({ status: 'refused', reason: 'codex-process-check-failed' });
+        }
+        // Once transport was invoked, callers receive the closed outcome union
+        // even if a later injected/file-side operation fails unexpectedly.
+        if (postIssued) return finishPostOutcome({ status: 'transient' });
+        throw error;
       } finally {
         // Covers persistence and post-publish verification, not only transport.
         deps.signalWindow?.exit();
@@ -579,7 +656,7 @@ export async function refreshActiveCodexLogin(deps: CodexActiveDeps, input: Code
     });
   } catch (error) {
     if (error instanceof ClaudeCodeLockTimeout || error instanceof ProperLockfileCompromised || error instanceof CodexAuthLockCompromised) {
-      return { status: 'deferred', reason: 'locks-held' };
+      return postOutcome ?? { status: 'deferred', reason: 'locks-held' };
     }
     throw error;
   }
