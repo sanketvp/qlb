@@ -1931,6 +1931,10 @@ function lifecycleOperationFor(command: string, args: string[]): LifecycleOperat
     if (args[0] === 'commit') return 'cutover-commit';
     if (args[0] === 'abort') return 'cutover-abort';
   }
+  if (command === 'undo cswap') {
+    if (args.includes('--dry-run')) return 'undo-cswap:dry-run';
+    return args.includes('--resume') ? 'undo-cswap:resume' : 'undo-cswap';
+  }
   if (command === 'lifecycle') {
     if (args[0] === 'drill-done') return 'lifecycle-drill-done';
     if (args[0] === 'close') return 'lifecycle-close';
@@ -1969,7 +1973,11 @@ export async function runExecutingCommand(
     if (operation != null) {
       const refusal = lifecycleAdmissionCode(context.config.dbPath, operation);
       if (refusal != null) {
-        const guidance = operation === 'lifecycle-close' && refusal === RETIREMENT_IN_PROGRESS ? `; ${FINISH_RETIREMENT_FIRST}` : '';
+        const guidance = operation === 'lifecycle-close' && refusal === RETIREMENT_IN_PROGRESS
+          ? `; ${FINISH_RETIREMENT_FIRST}`
+          : refusal === 'undo-in-progress'
+            ? '; run qlb undo cswap --resume'
+            : '';
         redactingContext.stderr(`qlb ${match.command.name}: refused: ${refusal}${guidance}`);
         return 3;
       }
