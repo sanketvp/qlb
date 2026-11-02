@@ -17,7 +17,7 @@ export interface CswapProcess {
 export type CswapLockRelease = (() => void | Promise<void>) & {
   /** Resolves if the owned flock helper disappears before release. */
   lost?: Promise<Error>;
-  /** Synchronously reports a helper loss observed by its process event handler. */
+  /** Synchronously reports loss recorded on helper exit, close or error, or when release() finds the helper already exited. */
   isLost?: () => Error | undefined;
 };
 
@@ -369,6 +369,7 @@ export function productionTryAcquireLock(path: string, startHelper: FlockHelperS
     let state: 'pending' | 'locked' | 'busy' = 'pending';
     let response = '';
     let releaseRequested = false;
+    let pendingExit: Error | undefined;
     let released: Promise<void> | undefined;
     let lostError: Error | undefined;
     let notifyLost: (error: Error) => void = () => {};
@@ -386,7 +387,9 @@ export function productionTryAcquireLock(path: string, startHelper: FlockHelperS
         rejectClose(error);
       });
       child.once('exit', (code, signal) => {
-        if (state === 'locked' && !releaseRequested) markLost(unexpectedExit(code, signal));
+        const error = unexpectedExit(code, signal);
+        if (state === 'pending') pendingExit = error;
+        else if (state === 'locked' && !releaseRequested) markLost(error);
       });
       child.once('close', (code, signal) => {
         if (state === 'locked') {
@@ -407,6 +410,14 @@ export function productionTryAcquireLock(path: string, startHelper: FlockHelperS
       const status = response.slice(0, newline);
       if (status === 'busy') state = 'busy';
       else if (status === 'locked') {
+        const exited = pendingExit
+          ?? (child.exitCode !== null || child.signalCode !== null
+            ? unexpectedExit(child.exitCode, child.signalCode)
+            : undefined);
+        if (exited !== undefined) {
+          rejectLock(exited);
+          return;
+        }
         state = 'locked';
         const release = Object.assign(() => {
           if (!released) {

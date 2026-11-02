@@ -92,6 +92,24 @@ test('production flock waits for a complete newline-delimited helper status', as
   }
 });
 
+test('production flock rejects a buffered locked result from an exited helper', async () => {
+  const helper = fakeFlockHelper();
+  const acquisition = productionTryAcquireLock('/fixture/auto.lock', () => helper.child);
+  let protectedWorkRan = false;
+  const protectedWork = acquisition.then(
+    (lease) => { if (lease !== null) protectedWorkRan = true; },
+    () => {},
+  );
+
+  helper.exit(17, null);
+  helper.stdout.emit('data', Buffer.from('locked\n'));
+  helper.close(17, null);
+
+  await assert.rejects(acquisition, /fcntl flock helper exited unexpectedly \(17\)/);
+  await protectedWork;
+  assert.equal(protectedWorkRan, false, 'an exited helper must not permit protected work');
+});
+
 test('production flock records loss when the helper exits before release and closes later', async () => {
   const helper = fakeFlockHelper();
   const acquisition = productionTryAcquireLock('/fixture/auto.lock', () => helper.child);
