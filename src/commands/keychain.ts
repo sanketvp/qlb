@@ -221,7 +221,7 @@ export interface LiveSwitchReceipt {
 }
 
 type LaunchdRunner = (args: string[]) => string | void;
-type LaunchdPrintState = 'running' | 'not-loaded' | 'unknown';
+type LaunchdPrintState = 'running' | 'stopped' | 'not-loaded' | 'unknown';
 
 export interface LaunchdLiveSwitchDependencies {
   /** Injectable so runner tests never invoke the host launchctl. */
@@ -531,11 +531,20 @@ export function runLaunchdLiveSwitch(
   const domain = `gui/${uid}`;
   const printState = (label: string): LaunchdPrintState => {
     try {
-      const detail = launchd(['print', `${domain}/${label}`]);
-      // Only the explicit running state proves this is an unfinished agent. A
-      // non-running loaded job is not a positive "not loaded" result, so fail
-      // closed rather than deleting its directory.
-      return typeof detail === 'string' && /\bstate = running\b/.test(detail) ? 'running' : 'unknown';
+      const service = `${domain}/${label}`;
+      const detail = launchd(['print', service]);
+      if (typeof detail !== 'string') return 'unknown';
+      const lines = detail.split(/\r?\n/);
+      const root = lines.findIndex((line) => line.trim() === `${service} = {`);
+      if (root < 0) return 'unknown';
+      const firstProperty = lines.slice(root + 1).find((line) => /\S/.test(line));
+      const indent = firstProperty?.match(/^([ \t]+)\S/)?.[1];
+      if (!indent) return 'unknown';
+      const statePattern = new RegExp(`^${indent.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}state = (running|not running|exited)\\s*$`);
+      const state = lines.slice(root + 1).find((line) => statePattern.test(line))?.match(statePattern)?.[1];
+      if (state === 'running') return 'running';
+      if (state === 'not running' || state === 'exited') return 'stopped';
+      return 'unknown';
     } catch (err) {
       // launchctl print uses exit 113 specifically for a missing service. Other
       // failures (including timeouts) must fail closed and preserve the run dir.
@@ -580,7 +589,7 @@ export function runLaunchdLiveSwitch(
     return JSON.parse(readFileSync(receiptPath, 'utf8')) as LiveSwitchReceipt;
   } finally {
     // On timeout the agent may still be running. Leave both it and its receipt for
-    // the next invocation's sweep; never boot out a process that has not finished.
+    // a later sweep, which boots out only a job launchctl confirms has stopped.
     if (receiptArrived || (!bootstrapped && printState(label) === 'not-loaded')) {
       try { launchd(['bootout', `${domain}/${label}`]); } catch { /* cleanup */ }
       rmSync(directory, { recursive: true, force: true });
