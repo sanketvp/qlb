@@ -125,6 +125,46 @@ describe('lifecycle (AC49)', () => {
     } finally { store.close(); }
   });
 
+  it('rolls back the deferred transition when its marker cannot be written', () => {
+    const store = fixtureStore();
+    try {
+      prepareDeferredCommit(store);
+      store.upsertMigration(CSWAP_ANTHROPIC_STORE, CONSUME_STATE, '{}', 20);
+      const db = new DatabaseSync(store.dbPath);
+      try {
+        db.exec(`CREATE TRIGGER reject_pi_deferred_marker BEFORE INSERT ON config
+          WHEN NEW.key = 'cutover.piDeferredAt'
+          BEGIN SELECT RAISE(ABORT, 'deferred marker failure'); END`);
+      } finally { db.close(); }
+
+      assert.throws(() => commitCutover(store, { now: 20, piDeferred: true }), /deferred marker failure/);
+      assert.equal(phase(store).state, 'cutting-over');
+      assert.equal(store.getConfig('cutover.piDeferredAt'), null);
+    } finally { store.close(); }
+  });
+
+  it('refuses when consume changes inside the deferred commit transaction', () => {
+    const store = fixtureStore();
+    try {
+      prepareDeferredCommit(store);
+      store.upsertMigration(CSWAP_ANTHROPIC_STORE, CONSUME_STATE, '{}', 20);
+      const runImmediate = store.runImmediate.bind(store);
+      let changedInsideTransaction = false;
+      store.runImmediate = function <T>(fn: () => T): T {
+        return runImmediate(() => {
+          changedInsideTransaction = true;
+          store.upsertMigration(CSWAP_ANTHROPIC_STORE, 'NATIVE', '{}', 21);
+          return fn();
+        });
+      };
+
+      assert.equal(commitCutover(store, { now: 20, piDeferred: true }).code, 'pi-deferred-needs-consume');
+      assert.equal(changedInsideTransaction, true);
+      assert.equal(phase(store).state, 'cutting-over');
+      assert.equal(store.getConfig('cutover.piDeferredAt'), null);
+    } finally { store.close(); }
+  });
+
   it('refuses with consume off', () => {
     const store = fixtureStore();
     try {

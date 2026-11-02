@@ -436,7 +436,7 @@ function stalePiSessions(db: DatabaseSync): 'stale' | 'clear' | 'unknown' {
 export function commitCutover(store: Store, opts: { now?: number; releaseSha?: string; piDeferred?: boolean } = {}): LifecycleResult {
   const admission = assertAdmitted(store, 'cutover-commit');
   if (!admission.ok) return admission;
-  return withDb(store, (db) => {
+  const commit = (db: DatabaseSync, transactional: boolean): LifecycleResult => {
     const current = db.prepare('SELECT note FROM lifecycle WHERE id = ? AND state = ?').get(admission.row!.id, 'cutting-over') as { note?: string | null } | undefined;
     if (current?.note === CUTOVER_BEGIN_IN_PROGRESS) return { ok: false, code: CUTOVER_BEGIN_IN_PROGRESS };
     if (!hasImportedClaudeSlot(db)) return { ok: false, code: 'import-not-complete' };
@@ -465,8 +465,13 @@ export function commitCutover(store: Store, opts: { now?: number; releaseSha?: s
       db.prepare(`INSERT INTO config (key, value) VALUES (?, ?)
         ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run('cutover.piDeferredAt', String(now));
     }
-    return { ok: true, row: phase(store) };
-  });
+    return { ok: true, row: transactional ? phaseForConnection(db) : phase(store) };
+  };
+
+  if (!opts.piDeferred) return withDb(store, (db) => commit(db, false));
+  // The consume proof, irreversible transition, and durable deferred marker
+  // must share one write lock: consume disable cannot interleave between them.
+  return store.runImmediate(() => commit((store as unknown as { db: DatabaseSync }).db, true));
 }
 
 /** S55 permits exactly one extension from the fixed +7d window to +14d. */
