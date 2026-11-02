@@ -82,7 +82,12 @@ function readAuth(path: string): JsonObject { return existsSync(path) ? asObject
 export class PiOwnerLegacyError extends Error {
   readonly code = 'owner-file-legacy-v1';
   readonly exitCode = 3;
-  constructor() { super('owner-file-legacy-v1: run `qlb migrate resume --provider anthropic` to convert it'); this.name = 'PiOwnerLegacyError'; }
+  constructor(otherProviders: readonly string[] = []) {
+    super(otherProviders.length > 0
+      ? `owner-file-legacy-v1: legacy owner document also claims ${otherProviders.join(', ')}; remove the other providers' entries before retrying`
+      : 'owner-file-legacy-v1: run `qlb migrate resume --provider anthropic` to convert it');
+    this.name = 'PiOwnerLegacyError';
+  }
 }
 /** Read only the canonical v2 provider map; v1 documents must be converted by the Anthropic path. */
 export function readPiOwnerProviders(path: string): JsonObject {
@@ -100,13 +105,62 @@ export function hasLegacyPiOwnerEntry(path: string, provider: string): boolean {
     !!account && typeof account === 'object' && !Array.isArray(account) && (account as JsonObject).provider === provider,
   );
 }
+export interface WritePiOwnerEntryOptions {
+  /** P7b8 Anthropic conversion only: replace a legacy v1 owner document. */
+  replaceLegacyDocument?: boolean;
+  /** The v1 document being converted when it is not at the canonical map path. */
+  legacyDocumentPath?: string;
+  /** Test seam after the v2 write and immediately before revalidating the v1 unlink. */
+  beforeLegacyUnlink?: () => void;
+}
+
+function legacyDocumentChangedDuringConversion(): Error {
+  return refusal('owner-file-orphan', 'legacy owner document changed during conversion; re-stage');
+}
+
+function assertLegacyDocumentClaimsOnly(path: string, provider: string): void {
+  const owner = asObject(JSON.parse(readFileSync(path, 'utf8')), 'Pi owner file is not an object');
+  if (Object.prototype.hasOwnProperty.call(owner, 'providers')) throw legacyDocumentChangedDuringConversion();
+  const accounts = owner.accounts;
+  if (owner.owner !== 'qlb' || !Array.isArray(accounts) || accounts.some((account) => !account || typeof account !== 'object'
+    || Array.isArray(account) || (account as JsonObject).provider !== provider)) {
+    throw new PiOwnerLegacyError();
+  }
+}
+
 /** Atomic, caller-lock-protected mutation of the canonical v2 owner map. */
-export function writePiOwnerEntry(path: string, provider: string, owned: boolean): void {
-  const providers = { ...readPiOwnerProviders(path) };
+export function writePiOwnerEntry(
+  path: string,
+  provider: string,
+  owned: boolean,
+  options: WritePiOwnerEntryOptions = {},
+): void {
+  const legacyPath = options.legacyDocumentPath ?? path;
+  if (options.replaceLegacyDocument && lstatPresent(legacyPath)) {
+    assertLegacyDocumentClaimsOnly(legacyPath, provider);
+  }
+  let current: JsonObject;
+  try {
+    current = readPiOwnerProviders(path);
+  } catch (error) {
+    if (!(error instanceof PiOwnerLegacyError) || !options.replaceLegacyDocument) throw error;
+    assertLegacyDocumentClaimsOnly(path, provider);
+    current = {};
+  }
+  const providers = { ...current };
   if (owned) providers[provider] = { mode: 'qlb', since: Date.now() };
   else delete providers[provider];
   if (Object.keys(providers).length === 0) { if (lstatPresent(path)) unlinkSync(path); return; }
   writeJson(path, { providers });
+  if (options.replaceLegacyDocument && resolve(legacyPath) !== resolve(path) && lstatPresent(legacyPath)) {
+    options.beforeLegacyUnlink?.();
+    // The custom document may be outside the canonical-map lock. Re-read it
+    // under the caller's auth lock so a concurrently published shared v2 map
+    // is never mistaken for the v1 document selected before locking.
+    assertLegacyDocumentClaimsOnly(legacyPath, provider);
+    // Accepted stable-namespace limit: Node has no descriptor-relative unlinkat.
+    unlinkSync(legacyPath);
+  }
 }
 function writeJson(path: string, value: unknown): void { mkdirSync(dirname(path), { recursive: true, mode: 0o700 }); atomicWriteText(path, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 }); }
 function writeJournal(path: string, journal: Journal, refresh?: () => void): void { refresh?.(); mkdirSync(dirname(path), { recursive: true, mode: 0o700 }); atomicWriteText(path, `${JSON.stringify(journal)}\n`, { mode: 0o600 }); }

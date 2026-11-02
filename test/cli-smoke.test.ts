@@ -222,6 +222,29 @@ describe('CLI smoke — documented commands', () => {
     assert.match(result.stdout, /owner:\s+present/);
   });
 
+  it('bare migrate resume leaves legacy Anthropic conversion untouched; explicit --provider anthropic is required', () => {
+    const env = isolatedEnv();
+    const target = join(env.QLB_HOME!, 'migrate');
+    const ownerPath = join(target, 'qlb-owner.json');
+    const authPath = join(target, 'auth.json');
+    const owner = JSON.stringify({ owner: 'qlb', accounts: [{ provider: 'anthropic' }] }) + '\n';
+    const auth = JSON.stringify({ anthropic: { type: 'oauth', access: 'native-access', refresh: 'native-refresh', expires: 1 } }, null, 2) + '\n';
+    writeFileSync(join(target, 'anthropic-pool.json'), JSON.stringify({ accounts: [] }) + '\n');
+    writeFileSync(ownerPath, owner);
+    writeFileSync(authPath, auth);
+    const store = openStore(env.QLB_DB_PATH!);
+    try {
+      store.upsertMigration('pi-pool', 'QLB_OWNED', '{}');
+    } finally {
+      store.close();
+    }
+
+    const result = runCli(['migrate', 'resume', '--target-dir', target, '--db', env.QLB_DB_PATH!, '--confirm-real-cutover'], env);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(readFileSync(ownerPath, 'utf8'), owner);
+    assert.equal(readFileSync(authPath, 'utf8'), auth);
+  });
+
   it('plain-text migrate status prints the hand-back record fields with null shown as not fenced', () => {
     const env = isolatedEnv();
     const store = openStore(env.QLB_DB_PATH!);

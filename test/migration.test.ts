@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { describe, it } from 'node:test';
 import { MockKeychain, qlbKeychainService } from '../src/keychain';
 import { beginCutover } from '../src/lifecycle';
-import { piPlaceholder, writePiOwnerEntry } from '../src/pi-migrate';
+import { isPiPlaceholder, piPlaceholder, PiOwnerLegacyError, writePiOwnerEntry } from '../src/pi-migrate';
 import { piAuthBackupPath, writePiAuthBackup } from '../src/pi-auth-backup';
 import { runPiGate } from '../src/pi-gate';
 import {
@@ -16,6 +16,7 @@ import {
   preQlbPath,
   sidecarPath,
   stagingOwnerPath,
+  type MigrationConfig,
   type RehearseFn,
   type StagedAccount,
 } from '../src/migration';
@@ -226,14 +227,26 @@ describe('migration state machine — §4.8.3 / §4.8.3a', () => {
 
       const retired = readFileSync(preQlbPath(h.poolPath));
       assert.deepEqual(retired, h.originalBytes, '.pre-qlb is byte-identical to original');
-      const owner = JSON.parse(readFileSync(h.ownerPath, 'utf8')) as { owner: string };
-      assert.equal(owner.owner, 'qlb');
+      const owner = JSON.parse(readFileSync(h.ownerPath, 'utf8')) as { providers: { anthropic?: { mode?: string } } };
+      assert.equal(owner.providers.anthropic?.mode, 'qlb');
+      const auth = JSON.parse(readFileSync(h.authPath, 'utf8')) as { anthropic?: unknown };
+      assert.equal(isPiPlaceholder(auth.anthropic), true);
+      beginCutover(h.store);
+      const output: string[] = [];
+      const gate = await runPiGate('anthropic', {
+        dbPath: join(h.dir, 'qlb.db'), env: { QLB_PI_TOKEN_CALL: '1' }, deliver: (value) => output.push(value),
+        guard: () => true, admitted: () => ({ ok: true }), piAgentDir: h.dir,
+        provider: { read: () => ({ token: 'anthropic-token', accountId: 'anthropic-default', source: 'fixture' }) },
+      });
+      assert.equal(gate, 0);
+      assert.equal(output.length, 1);
+      assert.equal(existsSync(join(h.dir, 'extensions', 'anthropic-pool')), false);
     } finally {
       h.cleanup();
     }
   });
 
-  it('refuses pool stage when OpenRouter has committed a v2 owner map, leaving it byte-identical', async () => {
+  it('pool stage retains an existing v2 owner map for another provider', async () => {
     const h = setup();
     try {
       const openrouter = createStaticKeyMigration(
@@ -248,11 +261,11 @@ describe('migration state machine — §4.8.3 / §4.8.3a', () => {
       openrouter.commit();
       const before = readFileSync(h.ownerPath);
 
-      assert.throws(() => h.mig.stage(), /owner-map-present: anthropic pool migration waits for P7b8/);
+      h.mig.stage();
 
       assert.deepEqual(readFileSync(h.ownerPath), before);
-      assert.equal(existsSync(stagingOwnerPath(h.ownerPath)), false, 'stage must not create staging');
-      assert.equal(qlbWorks(h.kc), false, 'stage must not write Keychain credentials');
+      assert.equal(existsSync(stagingOwnerPath(h.ownerPath)), true, 'stage creates only Anthropic staging');
+      assert.equal(qlbWorks(h.kc), true, 'stage writes the staged Anthropic credentials');
     } finally {
       h.cleanup();
     }
@@ -291,19 +304,20 @@ describe('migration state machine — §4.8.3 / §4.8.3a', () => {
       assert.ok(writer, 'pool barrier starts the concurrent v2 writer');
       assert.equal(
         await waitForChild(writer),
-        1,
-        'after commit releases its lock, the v2 writer sees the legacy pool owner document and refuses it',
+        0,
+        'after commit releases its lock, the v2 writer publishes alongside Anthropic',
       );
       assert.equal(existsSync(acquiredPath), true, 'the waiting v2 writer proceeds only after commit releases');
-      const owner = JSON.parse(readFileSync(h.ownerPath, 'utf8')) as { owner?: string };
-      assert.equal(owner.owner, 'qlb', 'the pool owner document remains authoritative');
+      const owner = JSON.parse(readFileSync(h.ownerPath, 'utf8')) as { providers: Record<string, { mode?: string }> };
+      assert.equal(owner.providers.anthropic?.mode, 'qlb');
+      assert.equal(owner.providers.openrouter?.mode, 'qlb');
       assert.equal(existsSync(stagingOwnerPath(h.ownerPath)), false, 'commit consumes staging');
     } finally {
       h.cleanup();
     }
   });
 
-  it('refuses pool commit when a v2 owner map appears after stage, leaving the map and staging intact', async () => {
+  it('pool commit publishes Anthropic into a v2 map that appeared after stage', async () => {
     const h = setup();
     try {
       h.mig.stage();
@@ -320,11 +334,14 @@ describe('migration state machine — §4.8.3 / §4.8.3a', () => {
       openrouter.commit();
       const before = readFileSync(h.ownerPath);
 
-      assert.throws(() => h.mig.commit(), /owner-map-present: anthropic pool migration waits for P7b8/);
+      h.mig.commit();
 
-      assert.deepEqual(readFileSync(h.ownerPath), before);
-      assert.equal(existsSync(stagingOwnerPath(h.ownerPath)), true, 'commit must leave staging for rollback');
-      assert.equal(existsSync(h.poolPath), true, 'commit must not retire the native pool');
+      const owner = JSON.parse(readFileSync(h.ownerPath, 'utf8')) as { providers: Record<string, { mode?: string }> };
+      assert.equal(owner.providers.openrouter?.mode, 'qlb');
+      assert.equal(owner.providers.anthropic?.mode, 'qlb');
+      assert.equal(existsSync(stagingOwnerPath(h.ownerPath)), false, 'commit consumes staging');
+      assert.equal(existsSync(h.poolPath), false, 'commit retires the native pool');
+      assert.notDeepEqual(readFileSync(h.ownerPath), before);
     } finally {
       h.cleanup();
     }
@@ -419,6 +436,457 @@ describe('migration state machine — §4.8.3 / §4.8.3a', () => {
     }
   });
 
+  it('backs up Pi auth.json before replacing Anthropic and restores it on rollback', async () => {
+    const h = setup();
+    try {
+      const original = JSON.stringify({
+        anthropic: { type: 'oauth', access: 'native-access', refresh: 'native-refresh', expires: 1, metadata: { kept: true } },
+        xai: { type: 'oauth', access: 'other-access', refresh: 'other-refresh', expires: 2 },
+      }, null, 2) + '\n';
+      writeFileSync(h.authPath, original, { mode: 0o600 });
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      h.mig.commit();
+      assert.equal(isPiPlaceholder(JSON.parse(readFileSync(h.authPath, 'utf8')).anthropic), true);
+      h.mig.rollback();
+      assert.deepEqual(readFileSync(h.authPath), Buffer.from(original));
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('commit with no auth.json records filePresent:false, creates the file with only the placeholder, rollback removes the file', async () => {
+    const h = setup();
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      h.mig.commit();
+      const backup = JSON.parse(readFileSync(piAuthBackupPath(h.authPath, 'anthropic'), 'utf8')) as { filePresent?: boolean };
+      assert.equal(backup.filePresent, false);
+      const auth = JSON.parse(readFileSync(h.authPath, 'utf8')) as Record<string, unknown>;
+      assert.deepEqual(Object.keys(auth), ['anthropic']);
+      assert.equal(isPiPlaceholder(auth.anthropic), true);
+      h.mig.rollback();
+      assert.equal(existsSync(h.authPath), false);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('crash after the v2 entry before the placeholder: gate refuses placeholder-missing, resume writes the placeholder, gate serves', async () => {
+    const h = setup();
+    try {
+      const crashing = new Migration(h.store, h.kc, h.poolPath, h.ownerPath, undefined, {
+        authJsonPath: h.authPath,
+        afterWrite: (point) => { if (point === 'owner-entry') throw new Error('fixture crash after owner entry'); },
+      });
+      crashing.stage();
+      await crashing.rehearse(mockRehearse([]));
+      assert.throws(() => crashing.commit(), /fixture crash after owner entry/);
+      beginCutover(h.store);
+      const stderr: string[] = [];
+      const refused = await runPiGate('anthropic', {
+        dbPath: join(h.dir, 'qlb.db'), env: { QLB_PI_TOKEN_CALL: '1' }, deliver: () => undefined, stderr: (line) => stderr.push(line),
+        guard: () => true, admitted: () => ({ ok: true }), piAgentDir: h.dir,
+        provider: { read: () => ({ token: 'anthropic-token', accountId: 'anthropic-default', source: 'fixture' }) },
+      });
+      assert.equal(refused, 1);
+      assert.deepEqual(stderr, ['placeholder-missing']);
+      h.mig.resume();
+      const output: string[] = [];
+      const served = await runPiGate('anthropic', {
+        dbPath: join(h.dir, 'qlb.db'), env: { QLB_PI_TOKEN_CALL: '1' }, deliver: (value) => output.push(value),
+        guard: () => true, admitted: () => ({ ok: true }), piAgentDir: h.dir,
+        provider: { read: () => ({ token: 'anthropic-token', accountId: 'anthropic-default', source: 'fixture' }) },
+      });
+      assert.equal(served, 0);
+      assert.equal(output.length, 1);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('safety property holds at every pool publication crash point (backup, owner-entry, placeholder)', async () => {
+    for (const point of ['backup', 'owner-entry', 'placeholder'] as const) {
+      const h = setup();
+      try {
+        const original = JSON.stringify({ anthropic: { type: 'oauth', access: `native-${point}`, refresh: `refresh-${point}`, expires: 1, extra: { kept: true } } }, null, 2) + '\n';
+        writeFileSync(h.authPath, original, { mode: 0o600 });
+        const crashing = new Migration(h.store, h.kc, h.poolPath, h.ownerPath, undefined, {
+          authJsonPath: h.authPath,
+          afterWrite: (actual) => { if (actual === point) throw new Error(`fixture crash after ${point}`); },
+        });
+        crashing.stage();
+        await crashing.rehearse(mockRehearse([]));
+        assert.throws(() => crashing.commit(), new RegExp(`fixture crash after ${point}`));
+        assertSafety(h.poolPath, h.kc);
+        h.mig.resume();
+        assert.equal(h.mig.status().state, 'QLB_OWNED');
+        const backup = JSON.parse(readFileSync(piAuthBackupPath(h.authPath, 'anthropic'), 'utf8')) as { entry?: unknown };
+        assert.deepEqual(backup.entry, JSON.parse(original).anthropic);
+        h.mig.rollback();
+        assert.deepEqual(readFileSync(h.authPath), Buffer.from(original));
+        assert.equal(existsSync(h.ownerPath), false);
+      } finally {
+        h.cleanup();
+      }
+    }
+  });
+
+  it('a crash after the pool rename preserves the backup for resume and rollback', async () => {
+    const h = setup();
+    try {
+      const original = JSON.stringify({ anthropic: { type: 'oauth', access: 'native-rename', refresh: 'refresh-rename', expires: 1 } }, null, 2) + '\n';
+      writeFileSync(h.authPath, original, { mode: 0o600 });
+      const crashing = new Migration(h.store, h.kc, h.poolPath, h.ownerPath, undefined, {
+        authJsonPath: h.authPath,
+        afterStep: (step) => { if (step === 'H1') throw new Error('fixture crash after pool rename'); },
+      });
+      crashing.stage();
+      await crashing.rehearse(mockRehearse([]));
+      assert.throws(() => crashing.commit(), /fixture crash after pool rename/);
+      h.mig.resume();
+      const backup = JSON.parse(readFileSync(piAuthBackupPath(h.authPath, 'anthropic'), 'utf8')) as { entry?: unknown };
+      assert.deepEqual(backup.entry, JSON.parse(original).anthropic);
+      h.mig.rollback();
+      assert.deepEqual(readFileSync(h.authPath), Buffer.from(original));
+      assert.equal(existsSync(h.ownerPath), false);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('conversion crash recovery preserves the original Anthropic backup and rollback round-trip', async () => {
+    for (const point of ['backup', 'owner-entry', 'placeholder'] as const) {
+      const h = setup();
+      try {
+        const original = JSON.stringify({ anthropic: { type: 'oauth', access: `native-${point}`, refresh: `refresh-${point}`, expires: 1, extra: { kept: true } } }, null, 2) + '\n';
+        writeFileSync(h.authPath, original, { mode: 0o600 });
+        writeFileSync(h.ownerPath, JSON.stringify({ owner: 'qlb', accounts: [{ provider: 'anthropic' }] }) + '\n', { mode: 0o600 });
+        h.store.upsertMigration(PI_POOL_STORE, 'QLB_OWNED', '{}');
+        const crashing = new Migration(h.store, h.kc, h.poolPath, h.ownerPath, undefined, {
+          authJsonPath: h.authPath,
+          allowPoolLegacyConversion: true,
+          afterWrite: (actual) => { if (actual === point) throw new Error(`fixture crash after ${point}`); },
+        });
+        assert.throws(() => crashing.resume(), new RegExp(`fixture crash after ${point}`));
+        if (point === 'owner-entry') {
+          assert.equal(crashing.status().resumeAction, 'v2 Anthropic owner is missing its Pi auth.json placeholder; run `qlb migrate resume --provider anthropic`');
+        }
+        const recovery = new Migration(h.store, h.kc, h.poolPath, h.ownerPath, undefined, {
+          authJsonPath: h.authPath,
+          allowPoolLegacyConversion: true,
+        });
+        recovery.resume();
+        const backup = JSON.parse(readFileSync(piAuthBackupPath(h.authPath, 'anthropic'), 'utf8')) as { entry?: unknown };
+        assert.deepEqual(backup.entry, JSON.parse(original).anthropic);
+        recovery.rollback();
+        assert.deepEqual(readFileSync(h.authPath), Buffer.from(original));
+        assert.equal(existsSync(h.ownerPath), false);
+      } finally {
+        h.cleanup();
+      }
+    }
+  });
+
+  it('converts a legacy Anthropic owner from VALIDATED when explicitly permitted', () => {
+    const h = setup();
+    try {
+      const original = JSON.stringify({ anthropic: { type: 'oauth', access: 'native-validated', refresh: 'refresh-validated', expires: 1 } }, null, 2) + '\n';
+      writeFileSync(h.authPath, original, { mode: 0o600 });
+      writeFileSync(h.ownerPath, JSON.stringify({ owner: 'qlb', accounts: [{ provider: 'anthropic' }] }) + '\n', { mode: 0o600 });
+      h.store.upsertMigration(PI_POOL_STORE, 'VALIDATED', '{}');
+      const migration = new Migration(h.store, h.kc, h.poolPath, h.ownerPath, undefined, {
+        authJsonPath: h.authPath,
+        allowPoolLegacyConversion: true,
+      });
+      migration.commit();
+      assert.equal(isPiPlaceholder(JSON.parse(readFileSync(h.authPath, 'utf8')).anthropic), true);
+      migration.rollback();
+      assert.deepEqual(readFileSync(h.authPath), Buffer.from(original));
+      assert.equal(existsSync(h.ownerPath), false);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('refuses an orphan v2 Anthropic owner without this migration’s staging or journal evidence', () => {
+    const h = setup();
+    try {
+      const original = JSON.stringify({ anthropic: { type: 'oauth', access: 'native-orphan', refresh: 'refresh-orphan', expires: 1 } }, null, 2) + '\n';
+      writeFileSync(h.authPath, original, { mode: 0o600 });
+      writePiOwnerEntry(h.ownerPath, 'anthropic', true);
+      const beforeOwner = readFileSync(h.ownerPath);
+      for (const operation of [() => h.mig.commit(), () => h.mig.resume()]) {
+        assert.throws(operation, (error: unknown) => (error as { exitCode?: unknown }).exitCode === 3);
+        assert.deepEqual(readFileSync(h.authPath), Buffer.from(original));
+        assert.deepEqual(readFileSync(h.ownerPath), beforeOwner);
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('refuses resume and commit rather than replacing a newer native Anthropic login', async () => {
+    const h = setup();
+    try {
+      const original = JSON.stringify({ anthropic: { type: 'oauth', access: 'native-original', refresh: 'refresh-original', expires: 1 } }, null, 2) + '\n';
+      const newer = JSON.stringify({ anthropic: { type: 'oauth', access: 'native-newer', refresh: 'refresh-newer', expires: 2 } }, null, 2) + '\n';
+      writeFileSync(h.authPath, original, { mode: 0o600 });
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      h.mig.commit();
+      writeFileSync(h.authPath, newer, { mode: 0o600 });
+      const beforeOwner = readFileSync(h.ownerPath);
+
+      for (const operation of [() => h.mig.resume(), () => h.mig.commit()]) {
+        assert.throws(operation, (error: unknown) => (error as { exitCode?: unknown }).exitCode === 3
+          && /native entry changed since stage/.test(String(error)));
+        assert.deepEqual(readFileSync(h.authPath), Buffer.from(newer));
+        assert.deepEqual(readFileSync(h.ownerPath), beforeOwner);
+      }
+      assert.equal(h.mig.status().resumeAction, 'stale native writer: auth.json[anthropic] is not the placeholder; run `qlb migrate rollback --provider anthropic`');
+      h.mig.rollback();
+      assert.deepEqual(readFileSync(h.authPath), Buffer.from(newer));
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('refuses a newer native login after backup and owner-entry crashes without changing auth.json', async () => {
+    for (const point of ['backup', 'owner-entry'] as const) {
+      const h = setup();
+      try {
+        const original = JSON.stringify({ anthropic: { type: 'oauth', access: `native-${point}`, refresh: `refresh-${point}`, expires: 1 } }, null, 2) + '\n';
+        const newer = JSON.stringify({ anthropic: { type: 'oauth', access: `newer-${point}`, refresh: `newer-refresh-${point}`, expires: 2 } }, null, 2) + '\n';
+        writeFileSync(h.authPath, original, { mode: 0o600 });
+        const crashing = new Migration(h.store, h.kc, h.poolPath, h.ownerPath, undefined, {
+          authJsonPath: h.authPath,
+          afterWrite: (actual) => { if (actual === point) throw new Error(`crash after ${point}`); },
+        });
+        crashing.stage();
+        await crashing.rehearse(mockRehearse([]));
+        assert.throws(() => crashing.commit(), new RegExp(`crash after ${point}`));
+        writeFileSync(h.authPath, newer, { mode: 0o600 });
+        for (const operation of [() => h.mig.resume(), () => h.mig.commit()]) {
+          assert.throws(operation, (error: unknown) => (error as { exitCode?: unknown }).exitCode === 3
+            && /native entry changed since stage/.test(String(error)));
+          assert.deepEqual(readFileSync(h.authPath), Buffer.from(newer));
+        }
+        h.mig.rollback();
+        assert.deepEqual(readFileSync(h.authPath), Buffer.from(newer));
+      } finally {
+        h.cleanup();
+      }
+    }
+  });
+
+  it('custom conversion crash between v2 write and v1 unlink rolls back both claims or resumes idempotently', () => {
+    for (const recovery of ['rollback', 'resume'] as const) {
+      const h = setup();
+      try {
+        const customOwnerPath = join(h.dir, `custom-owner-${recovery}.json`);
+        const original = JSON.stringify({ anthropic: { type: 'oauth', access: `native-${recovery}`, refresh: `refresh-${recovery}`, expires: 1 } }, null, 2) + '\n';
+        writeFileSync(h.authPath, original, { mode: 0o600 });
+        writeFileSync(customOwnerPath, JSON.stringify({ owner: 'qlb', accounts: [{ provider: 'anthropic' }] }) + '\n', { mode: 0o600 });
+        h.store.upsertMigration(PI_POOL_STORE, 'QLB_OWNED', '{}');
+        const crashing = new Migration(h.store, h.kc, h.poolPath, customOwnerPath, undefined, {
+          authJsonPath: h.authPath,
+          allowPoolLegacyConversion: true,
+          beforePoolLegacyUnlink: () => { throw new Error('crash before legacy unlink'); },
+        } as unknown as MigrationConfig);
+        assert.throws(() => crashing.resume(), /crash before legacy unlink/);
+        assert.ok(existsSync(customOwnerPath));
+        assert.ok(existsSync(h.ownerPath));
+
+        if (recovery === 'rollback') {
+          const rollback = new Migration(h.store, h.kc, h.poolPath, customOwnerPath, undefined, { authJsonPath: h.authPath });
+          rollback.rollback();
+          assert.equal(existsSync(customOwnerPath), false);
+          assert.equal(existsSync(h.ownerPath), false);
+          assert.deepEqual(readFileSync(h.authPath), Buffer.from(original));
+        } else {
+          const resumed = new Migration(h.store, h.kc, h.poolPath, customOwnerPath, undefined, {
+            authJsonPath: h.authPath,
+            allowPoolLegacyConversion: true,
+          });
+          resumed.resume();
+          assert.equal(existsSync(customOwnerPath), false);
+          assert.equal(isPiPlaceholder(JSON.parse(readFileSync(h.authPath, 'utf8')).anthropic), true);
+          resumed.rollback();
+          assert.equal(existsSync(h.ownerPath), false);
+          assert.deepEqual(readFileSync(h.authPath), Buffer.from(original));
+        }
+      } finally {
+        h.cleanup();
+      }
+    }
+  });
+
+  it('refuses to unlink a custom legacy owner path swapped to a v2 map during conversion', () => {
+    const h = setup();
+    try {
+      const customOwnerPath = join(h.dir, 'custom-owner-raced.json');
+      writeFileSync(h.authPath, JSON.stringify({ anthropic: { type: 'oauth', access: 'native-raced', refresh: 'refresh-raced', expires: 1 } }) + '\n', { mode: 0o600 });
+      writeFileSync(customOwnerPath, JSON.stringify({ owner: 'qlb', accounts: [{ provider: 'anthropic' }] }) + '\n', { mode: 0o600 });
+      h.store.upsertMigration(PI_POOL_STORE, 'QLB_OWNED', '{}');
+      const migration = new Migration(h.store, h.kc, h.poolPath, customOwnerPath, undefined, {
+        authJsonPath: h.authPath,
+        allowPoolLegacyConversion: true,
+        beforePoolLegacyUnlink: () => writeFileSync(customOwnerPath, JSON.stringify({ providers: { xai: { mode: 'qlb', since: 1 } } }) + '\n', { mode: 0o600 }),
+      } as unknown as MigrationConfig);
+
+      assert.throws(() => migration.resume(), (error: unknown) => (error as { exitCode?: unknown }).exitCode === 3);
+      const custom = JSON.parse(readFileSync(customOwnerPath, 'utf8')) as { providers: Record<string, unknown> };
+      assert.ok(custom.providers.xai);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('refuses rollback without changing anything when a raced custom v1 document still names another provider', () => {
+    const h = setup();
+    try {
+      const customOwnerPath = join(h.dir, 'custom-owner-mixed-race.json');
+      const original = JSON.stringify({ anthropic: { type: 'oauth', access: 'native-mixed-race', refresh: 'refresh-mixed-race', expires: 1 } }, null, 2) + '\n';
+      writeFileSync(h.authPath, original, { mode: 0o600 });
+      writeFileSync(customOwnerPath, JSON.stringify({ owner: 'qlb', accounts: [{ provider: 'anthropic' }] }) + '\n', { mode: 0o600 });
+      h.store.upsertMigration(PI_POOL_STORE, 'QLB_OWNED', '{}');
+      const migration = new Migration(h.store, h.kc, h.poolPath, customOwnerPath, undefined, {
+        authJsonPath: h.authPath,
+        allowPoolLegacyConversion: true,
+        beforePoolLegacyUnlink: () => writeFileSync(customOwnerPath, JSON.stringify({ owner: 'qlb', accounts: [{ provider: 'anthropic' }, { provider: 'xai' }] }) + '\n', { mode: 0o600 }),
+      } as unknown as MigrationConfig);
+
+      assert.throws(() => migration.resume(), PiOwnerLegacyError);
+      const customBeforeRollback = readFileSync(customOwnerPath);
+      const authBeforeRollback = readFileSync(h.authPath);
+      const backupBeforeRollback = readFileSync(piAuthBackupPath(h.authPath, 'anthropic'));
+      const journalBeforeRollback = JSON.stringify(h.store.getMigration(PI_POOL_STORE));
+      assert.throws(() => migration.rollback(), (error: unknown) => error instanceof PiOwnerLegacyError
+        && (error as Error).message.includes('xai'));
+      assert.deepEqual(readFileSync(customOwnerPath), customBeforeRollback);
+      assert.ok((JSON.parse(readFileSync(customOwnerPath, 'utf8')) as { accounts: Array<{ provider: string }> }).accounts.some(({ provider }) => provider === 'xai'));
+      assert.deepEqual(readFileSync(h.authPath), authBeforeRollback);
+      assert.deepEqual(readFileSync(piAuthBackupPath(h.authPath, 'anthropic')), backupBeforeRollback);
+      assert.equal(JSON.stringify(h.store.getMigration(PI_POOL_STORE)), journalBeforeRollback);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('status gives executable rollback-only or manual-repair advice for every post-publication refusal state', async () => {
+    const nativeChanged = setup();
+    try {
+      const original = JSON.stringify({ anthropic: { type: 'oauth', access: 'native-status', refresh: 'refresh-status', expires: 1 } }, null, 2) + '\n';
+      const newer = JSON.stringify({ anthropic: { type: 'oauth', access: 'newer-status', refresh: 'newer-refresh-status', expires: 2 } }, null, 2) + '\n';
+      writeFileSync(nativeChanged.authPath, original, { mode: 0o600 });
+      const crashing = new Migration(nativeChanged.store, nativeChanged.kc, nativeChanged.poolPath, nativeChanged.ownerPath, undefined, {
+        authJsonPath: nativeChanged.authPath,
+        afterWrite: (point) => { if (point === 'owner-entry') throw new Error('crash after owner-entry'); },
+      });
+      crashing.stage();
+      await crashing.rehearse(mockRehearse([]));
+      assert.throws(() => crashing.commit(), /crash after owner-entry/);
+      writeFileSync(nativeChanged.authPath, newer, { mode: 0o600 });
+      assert.equal(nativeChanged.mig.status().resumeAction, 'stale native writer: auth.json[anthropic] is not the placeholder; run `qlb migrate rollback --provider anthropic`');
+      assert.doesNotThrow(() => nativeChanged.mig.rollback());
+    } finally { nativeChanged.cleanup(); }
+
+    const raced = setup();
+    try {
+      const customOwnerPath = join(raced.dir, 'custom-owner-status-race.json');
+      writeFileSync(raced.authPath, JSON.stringify({ anthropic: { type: 'oauth', access: 'native-race-status', refresh: 'refresh-race-status', expires: 1 } }) + '\n', { mode: 0o600 });
+      writeFileSync(customOwnerPath, JSON.stringify({ owner: 'qlb', accounts: [{ provider: 'anthropic' }] }) + '\n', { mode: 0o600 });
+      raced.store.upsertMigration(PI_POOL_STORE, 'QLB_OWNED', '{}');
+      const migration = new Migration(raced.store, raced.kc, raced.poolPath, customOwnerPath, undefined, {
+        authJsonPath: raced.authPath,
+        allowPoolLegacyConversion: true,
+        beforePoolLegacyUnlink: () => writeFileSync(customOwnerPath, JSON.stringify({ providers: { xai: { mode: 'qlb', since: 1 } } }) + '\n', { mode: 0o600 }),
+      } as unknown as MigrationConfig);
+      assert.throws(() => migration.resume(), (error: unknown) => (error as { exitCode?: unknown }).exitCode === 3);
+      assert.equal(migration.status().resumeAction, 'owner-file-orphan: custom owner document changed during conversion; run `qlb migrate rollback --provider anthropic`');
+      assert.doesNotThrow(() => migration.rollback());
+    } finally { raced.cleanup(); }
+
+    const mixed = setup();
+    try {
+      const original = JSON.stringify({ anthropic: { type: 'oauth', access: 'native-mixed-status', refresh: 'refresh-mixed-status', expires: 1 } }, null, 2) + '\n';
+      writeFileSync(mixed.authPath, original, { mode: 0o600 });
+      writeFileSync(mixed.ownerPath, JSON.stringify({ owner: 'qlb', accounts: [{ provider: 'anthropic' }, { provider: 'xai' }] }) + '\n', { mode: 0o600 });
+      mixed.store.upsertMigration(PI_POOL_STORE, 'QLB_OWNED', '{}');
+      const explicit = new Migration(mixed.store, mixed.kc, mixed.poolPath, mixed.ownerPath, undefined, {
+        authJsonPath: mixed.authPath,
+        allowPoolLegacyConversion: true,
+      });
+      assert.equal(explicit.status().resumeAction, `mixed v1 owner document: remove the other providers' entries from ${mixed.ownerPath}, then re-run`);
+      writeFileSync(mixed.ownerPath, JSON.stringify({ owner: 'qlb', accounts: [{ provider: 'anthropic' }] }) + '\n', { mode: 0o600 });
+      assert.doesNotThrow(() => explicit.resume());
+    } finally { mixed.cleanup(); }
+  });
+
+  it('status gives executable advice for mixed v1, bare conversion, orphan v2, and malformed auth', () => {
+    const mixed = setup();
+    try {
+      writeFileSync(mixed.ownerPath, JSON.stringify({ owner: 'qlb', accounts: [{ provider: 'anthropic' }, { provider: 'xai' }] }) + '\n', { mode: 0o600 });
+      mixed.store.upsertMigration(PI_POOL_STORE, 'QLB_OWNED', '{}');
+      const explicit = new Migration(mixed.store, mixed.kc, mixed.poolPath, mixed.ownerPath, undefined, {
+        authJsonPath: mixed.authPath,
+        allowPoolLegacyConversion: true,
+      });
+      assert.equal(explicit.status().resumeAction, `mixed v1 owner document: remove the other providers' entries from ${mixed.ownerPath}, then re-run`);
+    } finally { mixed.cleanup(); }
+
+    const legacy = setup();
+    try {
+      writeFileSync(legacy.ownerPath, JSON.stringify({ owner: 'qlb', accounts: [{ provider: 'anthropic' }] }) + '\n', { mode: 0o600 });
+      legacy.store.upsertMigration(PI_POOL_STORE, 'QLB_OWNED', '{}');
+      assert.equal(legacy.mig.status().resumeAction, 'legacy Anthropic conversion requires `qlb migrate resume --provider anthropic`');
+    } finally { legacy.cleanup(); }
+
+    const orphan = setup();
+    try {
+      writePiOwnerEntry(orphan.ownerPath, 'anthropic', true);
+      orphan.store.upsertMigration(PI_POOL_STORE, 'VALIDATED', '{}');
+      assert.equal(orphan.mig.status().resumeAction, 'owner-file-orphan: v2 Anthropic ownership has no staging file or pool publication journal; remove its Anthropic claim before retrying');
+    } finally { orphan.cleanup(); }
+
+    const malformed = setup();
+    try {
+      writePiOwnerEntry(malformed.ownerPath, 'anthropic', true);
+      malformed.store.upsertMigration(PI_POOL_STORE, 'QLB_OWNED', JSON.stringify({ poolV2PublicationStarted: true }));
+      writeFileSync(malformed.authPath, '{not-json\n', { mode: 0o600 });
+      assert.equal(malformed.mig.status().resumeAction, 'Pi auth.json is malformed; repair it before resuming');
+      assert.throws(() => malformed.mig.resume(), (error: unknown) => (error as { exitCode?: unknown }).exitCode === 3
+        && /Pi auth\.json is malformed/.test(String(error)));
+    } finally { malformed.cleanup(); }
+  });
+
+  it('custom owner-file conversion retires its v1 document and is idempotent', () => {
+    const h = setup();
+    try {
+      const customOwnerPath = join(h.dir, 'custom-owner.json');
+      const original = JSON.stringify({ anthropic: { type: 'oauth', access: 'native-custom', refresh: 'refresh-custom', expires: 1 } }, null, 2) + '\n';
+      writeFileSync(h.authPath, original, { mode: 0o600 });
+      writeFileSync(customOwnerPath, JSON.stringify({ owner: 'qlb', accounts: [{ provider: 'anthropic' }] }) + '\n', { mode: 0o600 });
+      h.store.upsertMigration(PI_POOL_STORE, 'QLB_OWNED', '{}');
+      const migration = new Migration(h.store, h.kc, h.poolPath, customOwnerPath, undefined, {
+        authJsonPath: h.authPath,
+        allowPoolLegacyConversion: true,
+      });
+      migration.resume();
+      assert.equal(existsSync(customOwnerPath), false);
+      migration.resume();
+      const backup = JSON.parse(readFileSync(piAuthBackupPath(h.authPath, 'anthropic'), 'utf8')) as { entry?: unknown };
+      assert.deepEqual(backup.entry, JSON.parse(original).anthropic);
+      migration.rollback();
+      assert.deepEqual(readFileSync(h.authPath), Buffer.from(original));
+      assert.equal(existsSync(h.ownerPath), false);
+    } finally {
+      h.cleanup();
+    }
+  });
+
   it('rollback after full commit restores native byte-identical and removes owner file', async () => {
     const h = setup();
     try {
@@ -465,7 +933,7 @@ describe('migration state machine — §4.8.3 / §4.8.3a', () => {
     }
   });
 
-  it('rolls back a pre-P7b v1 document without reading malformed auth.json', async () => {
+  it('refuses rollback when a v2-owned Anthropic placeholder was replaced with malformed auth.json', async () => {
     const h = setup();
     try {
       h.mig.stage();
@@ -474,10 +942,10 @@ describe('migration state machine — §4.8.3 / §4.8.3a', () => {
       const malformed = '{not-json\n';
       writeFileSync(h.authPath, malformed, { mode: 0o600 });
 
-      const rolled = h.mig.rollback();
-      assert.equal(rolled.state, 'VALIDATED');
-      assert.equal(existsSync(h.ownerPath), false);
+      assert.throws(() => h.mig.rollback(), /Pi auth\.json is malformed/);
       assert.equal(readFileSync(h.authPath, 'utf8'), malformed);
+      const owner = JSON.parse(readFileSync(h.ownerPath, 'utf8')) as { providers: Record<string, unknown> };
+      assert.ok(owner.providers.anthropic);
     } finally {
       h.cleanup();
     }
@@ -487,6 +955,7 @@ describe('migration state machine — §4.8.3 / §4.8.3a', () => {
     const h = setup();
     try {
       const absentAuthPath = join(h.dir, 'missing-agent', 'auth.json');
+      mkdirSync(join(h.dir, 'missing-agent'), { mode: 0o700 });
       const migration = new Migration(h.store, h.kc, h.poolPath, h.ownerPath, undefined, { authJsonPath: absentAuthPath });
       migration.stage();
       await migration.rehearse(mockRehearse([]));

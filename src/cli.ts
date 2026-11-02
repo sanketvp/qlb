@@ -125,7 +125,7 @@ overrides targets the REAL ~/.pi/agent/ files (anthropic-pool.json for
 --provider anthropic, auth.json for xai|kimi-coding|openai-codex, plus the
 matching qlb-owner*.json). That is a REAL cutover and is refused unless
 --confirm-real-cutover is also passed. Tests and dry runs MUST pass
---pool-file / --auth-json / --owner-file (or --target-dir) pointing at a
+--pool-file / --auth-json (including the Anthropic Pi auth.json) / --owner-file (or --target-dir) pointing at a
 temp copy. Do NOT pass --confirm-real-cutover unless you intend to cut over
 live Pi. Default --provider is anthropic (backward compatible).
 Single-grant providers (xai, kimi-coding, openai-codex) shadow-retain the
@@ -217,6 +217,7 @@ type MigrateOpts = {
   sub: MigrateSub;
   json: boolean;
   provider: MigrateProvider;
+  providerExplicit: boolean;
   poolFile: string;
   ownerFile: string;
   authJson: string;
@@ -449,6 +450,7 @@ function parseMigrateArgs(args: string[]): MigrateOpts {
     sub: subRaw,
     json,
     provider,
+    providerExplicit: providerRaw !== undefined,
     poolFile: validateCliMigratePath(poolFile ?? DEFAULT_POOL_FILE, '--pool-file', 'file', cwd),
     ownerFile: validateCliMigratePath(ownerFile ?? defaultOwnerFileFor(provider), '--owner-file', 'file', cwd),
     authJson: validateCliMigratePath(authJson ?? DEFAULT_AUTH_JSON, '--auth-json', 'file', cwd),
@@ -1398,7 +1400,10 @@ async function runMigrate(opts: MigrateOpts): Promise<number> {
             opts.authJson,
             opts.ownerFile,
           )
-        : new Migration(store, platformKeychain, opts.poolFile, opts.ownerFile, undefined, { authJsonPath: opts.authJson });
+        : new Migration(store, platformKeychain, opts.poolFile, opts.ownerFile, undefined, {
+          authJsonPath: opts.authJson,
+          allowPoolLegacyConversion: opts.provider === 'anthropic' && opts.providerExplicit,
+        });
     let status;
     switch (opts.sub) {
       case 'stage':
