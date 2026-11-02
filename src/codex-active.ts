@@ -549,7 +549,11 @@ export async function refreshActiveCodexLogin(deps: CodexActiveDeps, input: Code
             deps.signalWindow?.enter();
             await deps.hooks?.beforeSend?.();
             const response = await deps.transport(request);
-            await deps.hooks?.afterPost?.();
+            try {
+              await deps.hooks?.afterPost?.();
+            } catch {
+              deps.autoLog?.(`codex:after-post-hook-failed provider=openai-codex at=${deps.now()}`);
+            }
             return response;
           };
           const result = await consumeCodexSlot({
@@ -632,7 +636,7 @@ export async function refreshActiveCodexLogin(deps: CodexActiveDeps, input: Code
           if (action === 'stash-unverifiable') return finish({ status: 'refused', reason: 'stash-unverifiable' });
           const adopted = action === 'adopt';
           deps.autoLog?.(`codex:codex-won provider=openai-codex account=${active} adopted=${adopted ? 1 : 0} pids=${pids.join(',')} at=${deps.now()}`);
-          return finish({ status: 'codex-won', adopted, pids, document: live.doc });
+          return finish({ status: 'codex-won', adopted, pids, document: action === 'republish-forbidden' ? settled.outgoing.document : live.doc });
         }
         case 'busy':
         case 'active-slot':

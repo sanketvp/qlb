@@ -735,6 +735,24 @@ describe('codex active refresh helpers', () => {
     } finally { h.close(); }
   });
 
+  it('afterPost failure after a 2xx preserves the refreshed successor and logs the hook failure', async () => {
+    const h = activeHarness();
+    try {
+      const logs: string[] = [];
+      h.deps.autoLog = (line) => logs.push(line);
+      h.deps.hooks = { afterPost: () => { throw new Error('fixture afterPost failure'); } };
+      h.deps.transport = async () => ({ status: 200, body: JSON.stringify({
+        refresh_token: 'fixture-refresh-after-post-failure', access_token: document(NOW + 600_000, 'fixture-access-after-post-failure').tokens.access_token,
+      }) });
+      const outcome = await refreshActiveCodexLogin(h.deps, { trigger: 'proactive-expiry' });
+      assert.equal(outcome.status, 'posted');
+      if (outcome.status === 'posted') {
+        assert.equal(codexFingerprint((h.deps.slots as any).readSlot(A).document), codexFingerprint(outcome.document));
+      }
+      assert.ok(logs.includes(`codex:after-post-hook-failed provider=openai-codex at=${NOW}`));
+    } finally { h.close(); }
+  });
+
   it('a posted outcome records a qlb-active observation of the successor', async () => {
     const h = activeHarness();
     try {
@@ -863,6 +881,39 @@ describe('codex active refresh helpers', () => {
         assert.ok(logs.some((line) => line.startsWith('codex:codex-won provider=openai-codex account=user-a:account-a adopted=0 pids=901')));
       } finally { db.close(); }
       assert.equal(readFileSync(h.authPath, 'utf8'), before);
+    } finally { h.close(); }
+  });
+
+  it('a codex-won re-read of an older lineage from another known slot returns the active document', async () => {
+    const h = activeHarness();
+    try {
+      const b0 = { ...document(NOW + 600_000, 'fixture-access-codex-won-b0'), tokens: {
+        ...document(NOW + 600_000, 'fixture-access-codex-won-b0').tokens,
+        id_token: jwt({ 'https://api.openai.com/auth': { chatgpt_user_id: 'user-b', chatgpt_account_id: 'account-b' } }),
+        account_id: 'account-b', refresh_token: 'fixture-refresh-codex-won-b0',
+      } };
+      const b1 = { ...b0, tokens: {
+        ...b0.tokens, access_token: document(NOW + 600_000, 'fixture-access-codex-won-b1').tokens.access_token,
+        refresh_token: 'fixture-refresh-codex-won-b1',
+      } };
+      importActiveCodexSlot(b0, { store: h.store, keychain: h.keychain, now: () => NOW + 1 });
+      (h.deps.slots as any).writeSlot(B, b1, b0);
+      const db = new DatabaseSync(h.store.dbPath);
+      try {
+        db.prepare('UPDATE codex_slots SET fingerprint = ?, prev_fingerprint = ? WHERE account_id = ?')
+          .run(codexFingerprint(b1), codexFingerprint(b0), B);
+      } finally { db.close(); }
+      h.store.setActiveLogin('openai-codex', A, 'import', NOW + 2);
+      h.store.recordCodexObservation({ identity: B, lineageFp: codexFingerprint(b0), by: 'qlb-active', now: NOW - 60_000 });
+      h.deps.list = async () => [];
+      h.deps.transport = async () => {
+        h.deps.list = async () => [process(902, 1_000)];
+        writeFileSync(h.authPath, JSON.stringify(b0));
+        return { status: 400, body: JSON.stringify({ error: 'refresh_token_reused' }) };
+      };
+      assert.deepEqual(await refreshActiveCodexLogin(h.deps, { trigger: 'proactive-expiry' }), {
+        status: 'codex-won', adopted: false, pids: [902], document: h.a0,
+      });
     } finally { h.close(); }
   });
 
