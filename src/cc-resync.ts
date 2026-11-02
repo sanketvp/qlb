@@ -810,6 +810,26 @@ export function resolvedMatchesSlotIdentity(
   return true;
 }
 
+/**
+ * Attribute a live credential to its registered slot with the profile oracle.
+ * A partial or unsuccessful response is deliberately not memoized.
+ */
+export async function cacheProfileVerdict(
+  deps: Pick<ResyncRotatedBackupDeps, 'getProfile' | 'verdicts'>,
+  input: ResyncRotatedBackupInput,
+): Promise<boolean | null> {
+  const servedFp = credentialLineage(input.creds);
+  const accessToken = extractAccessToken(input.creds);
+  if (!servedFp || !accessToken) return null;
+  const response = await deps.getProfile(buildProfileRequest(accessToken));
+  if (response.status < 200 || response.status >= 300) return null;
+  const resolved = parseProfileResponse(JSON.parse(response.body));
+  const matches = resolvedMatchesSlotIdentity(resolved, input);
+  if (matches === null) return null;
+  deps.verdicts.set(input.accountId, input.email, servedFp, input.orgUuid, { match: matches, source: 'oracle' });
+  return matches;
+}
+
 function livePairWithLineage(live: string | null, fingerprint: string): live is string {
   return live !== null && hasUsablePair(live) && credentialLineage(live) === fingerprint;
 }
@@ -906,15 +926,8 @@ export async function resyncRotatedBackup(
     || isSuccessor(deps.store, 'anthropic', input.accountId, input.slot.fingerprint, servedFp);
   if (!attributed) {
     try {
-      const accessToken = extractAccessToken(input.creds);
-      if (!accessToken) return;
-      const response = await deps.getProfile(buildProfileRequest(accessToken));
-      if (response.status < 200 || response.status >= 300) return;
-      const resolved = parseProfileResponse(JSON.parse(response.body));
-      const matches = resolvedMatchesSlotIdentity(resolved, input);
-      // A partial profile is neither affirming nor condemning, so do not cache it.
+      const matches = await cacheProfileVerdict(deps, input);
       if (matches === null) return;
-      deps.verdicts.set(input.accountId, input.email, servedFp, input.orgUuid, { match: matches, source: 'oracle' });
       if (!matches) {
         if (deps.verdicts.warnOnce(input.accountId, input.email, 'resync-foreign')) {
           resyncWarn(deps, 'Claude rotated backup resync left foreign credential untouched');
