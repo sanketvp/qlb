@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
+import { AutoAdmissionRefused, runAuto } from '../src/auto';
 import { claudePaths } from '../src/cc-paths';
 import { withClaudeSwitchLock } from '../src/cc-locks';
 import { ClaudeSlots, SqliteClaudeSlotRepository } from '../src/cc-slots';
@@ -139,6 +140,29 @@ async function execute(subject: Fixture, args = ['account-b']): Promise<number> 
 }
 
 describe('Claude switch lifecycle guards (K5-8)', () => {
+  it('auto refused outside cutover and retired', async () => {
+    for (const code of ['phase=pre-cutover', 'phase=rolled-back'] as const) {
+      let bindingOpened = false;
+      const lines: string[] = [];
+      await assert.rejects(runAuto({ once: true }, {
+        makeLiveBinding: () => {
+          bindingOpened = true;
+          return {
+            store: { setConfig: () => { throw new Error('heartbeat must not write'); } }, close: () => {},
+            reconcile: async () => { throw new Error('reconcile must not run'); },
+            poll: async () => { throw new Error('poll must not run'); },
+            tick: async () => { throw new Error('tick must not run'); },
+          };
+        },
+        assertAdmitted: () => ({ ok: false, code }),
+        listCswapProcesses: () => [],
+        log: (line) => lines.push(line),
+      }), (error: unknown) => error instanceof AutoAdmissionRefused && error.code === code);
+      assert.equal(bindingOpened, true);
+      assert.deepEqual(lines, []);
+    }
+  });
+
   it('switch anthropic is refused in pre-cutover before any lock', async () => {
     const subject = await fixture('pre-cutover');
     assert.equal(await execute(subject), 3);
