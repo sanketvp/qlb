@@ -85,7 +85,7 @@
 
     {"id":"K8","start":["K5"],"files":["src/cc-switch.ts","test/cc-switch-rollback.test.ts","src/fault-injection.ts","test/fault-injection.test.ts","src/commands/switch-anthropic.ts","test/cc-switch-command.test.ts"]},
     {"id":"C6-10","start":["C6"],"files":["src/codex-switch.ts","test/codex-switch.test.ts"]},
-    {"id":"C6b","start":["C6-10","C10","C5b","C3b","P3","P0","K6","R0","R0c"],"files":["src/codex-active.ts","src/gate/openai-codex.ts","src/commands/codex-verify-l13.ts","src/checks/codex-first-switch.ts","test/codex-active-refresh.test.ts","test/gate-refresh.test.ts","test/codex-verify-l13.test.ts"]},
+    {"id":"C6b","start":["C6-10","C10","C5b","C3b","P3","P0","K6","R0","R0c","C6","K5"],"files":["src/codex-active.ts","src/gate/openai-codex.ts","src/commands/codex-verify-l13.ts","src/checks/codex-first-switch.ts","test/codex-active-refresh.test.ts","test/gate-refresh.test.ts","test/codex-verify-l13.test.ts","src/store.ts","test/store.test.ts","src/codex-switch.ts","test/codex-switch.test.ts","src/codex-consume.ts","test/codex-consume.test.ts","src/commands/codex-refresh.ts","src/diagnostics.ts","test/wiring/commands.d/codex verify-l13","test/wiring/checks.d/codex:first-switch"]},
     {"id":"P9","start":["P7","P12","R0"],"files":["src/checks/pi-provider.ts","src/checks/pi-anthropic.ts","test/pi-root.test.ts"]},
     {"id":"K12","start":["K2","K10","A2d","P7","A14","K13b","A13","C3b","C6","K6","R0","R0c"],"files":["src/cswap-undo.ts","src/commands/undo-cswap.ts","src/checks/undo-lineage-match.ts","src/checks/undo-incomplete.ts","src/commands/cutover.ts","test/cswap-undo.test.ts","test/pi-migrate.test.ts"]},
 

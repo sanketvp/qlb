@@ -206,6 +206,24 @@ describe('Codex observations', () => {
     }
   });
 
+  it('recordCodexObservation accepts by=qlb-active, qlb-gate and qlb-verify-l13 and appends on an identity change', () => {
+    const store = openObservationStore();
+    try {
+      const active = store.recordCodexObservation({ identity: 'active:account', lineageFp: 'lineage-a', by: 'qlb-active', now: 100 });
+      const gate = store.recordCodexObservation({ identity: 'gate:account', lineageFp: 'lineage-a', by: 'qlb-gate', now: 200 });
+      const verify = store.recordCodexObservation({ identity: 'verify:account', lineageFp: 'lineage-a', by: 'qlb-verify-l13', now: 300 });
+
+      assert.deepEqual([active, gate, verify], [
+        { appended: true, wipedEvent: false },
+        { appended: true, wipedEvent: false },
+        { appended: true, wipedEvent: false },
+      ]);
+      assert.equal(observationCount(store), 3);
+    } finally {
+      store.close();
+    }
+  });
+
   it('a changed lineage appends one row', () => {
     const store = openObservationStore();
     try {
@@ -420,6 +438,51 @@ describe('Codex switch commit primitive', () => {
       } finally {
         store.close();
       }
+    }
+  });
+
+  it("listCodexWatches returns every codex_watch row as a CodexWatch with the switch row's attempt, trigger, publishedAt and openSessions", () => {
+    const store = openCommitStore();
+    try {
+      const firstId = store.commitCodexSwitch(commitInput({
+        openSessionsJson: '[{"pid":44,"lstart":"2026-01-01 00:00:00","host":"first"}]',
+      }));
+      const secondId = store.commitCodexSwitch(commitInput({
+        now: 2_000,
+        attempt: 'attempt-2',
+        fromAccount: 'to:account',
+        toAccount: 'third:account',
+        outgoing: 'to:account',
+        target: 'third:account',
+        trigger: 'manual',
+        publishedAt: 1_900,
+        openSessionsJson: '[{"pid":45,"lstart":"2026-01-02 00:00:00","host":"second"}]',
+      }));
+
+      assert.deepEqual(store.listCodexWatches(), [
+        {
+          switchId: firstId,
+          outgoing: 'from:account',
+          target: 'to:account',
+          until: 301_000,
+          trigger: 'proactive',
+          publishedAt: 900,
+          attempt: 'attempt-1',
+          openSessions: [{ pid: 44, lstart: '2026-01-01 00:00:00', host: 'first' }],
+        },
+        {
+          switchId: secondId,
+          outgoing: 'to:account',
+          target: 'third:account',
+          until: 302_000,
+          trigger: 'manual',
+          publishedAt: 1_900,
+          attempt: 'attempt-2',
+          openSessions: [{ pid: 45, lstart: '2026-01-02 00:00:00', host: 'second' }],
+        },
+      ]);
+    } finally {
+      store.close();
     }
   });
 
