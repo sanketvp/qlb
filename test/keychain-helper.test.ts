@@ -23,8 +23,8 @@ import type { CommandContext } from '../src/registry';
 import { defaultConfig } from '../src/config';
 import { openStore } from '../src/store';
 
-describe('Swift Keychain helper write path', () => {
-  it('writes a large payload through security with both required trusted applications', () => {
+describe('Swift Keychain helper trust path', () => {
+  it('creates a large payload through security with both required trusted applications', () => {
     const calls: Array<{ file: string; args: string[]; input?: string; stdio?: unknown }> = [];
     const exec: ExecFileSyncFn = (file, args, options) => {
       calls.push({
@@ -41,7 +41,7 @@ describe('Swift Keychain helper write path', () => {
 
     assert.equal(calls[0]?.file, '/usr/bin/security');
     assert.deepEqual(calls[0]?.args, [
-      'add-generic-password', '-U', '-a', 'qlb', '-s', 'qlb-test-helper',
+      'add-generic-password', '-a', 'qlb', '-s', 'qlb-test-helper',
       '-X', Buffer.from(payload, 'utf8').toString('hex'),
       '-T', helper, '-T', '/usr/bin/security',
     ]);
@@ -179,7 +179,7 @@ describe('Swift Keychain helper write path', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
-  it('verifies a trusted helper immediately before every credential write', () => {
+  it('verifies a trusted helper immediately before every credential write that grants it access', () => {
     const dir = mkdtempSync(join(tmpdir(), 'qlb-helper-trusted-'));
     const helper = join(dir, 'qlb-keychain-helper');
     writeFileSync(helper, 'fixture helper');
@@ -507,7 +507,7 @@ describe('Swift Keychain helper write path', () => {
     const account = 'qlb';
     const payload = randomBytes(8 * 1024).toString('hex');
     try {
-      execFileSync(helper, ['set', service, account], { input: payload, encoding: 'utf8', timeout: 5_000 });
+      new MacosKeychainBackend({ helperPath: helper }).setSync(service, account, payload);
       const read = execFileSync('/usr/bin/security', [
         'find-generic-password', '-a', account, '-s', service, '-w',
       ], { encoding: 'utf8', timeout: 5_000 }).replace(/\n$/, '');

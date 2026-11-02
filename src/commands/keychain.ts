@@ -370,7 +370,7 @@ function writeAuthorizationConfig(dbPath: string, key: string, value: string | n
   try { store.setConfig(key, String(value)); } finally { store.close(); }
 }
 
-/** Production probes and CAS writes use the same pinned helper trust boundary as normal writes. */
+/** Production probes and CAS writes use the pinned helper trust boundary retained for helper access. */
 function assertAuthorizationHelper(path: string, dbPath: string, dependencies: KeychainCommandDependencies): HelperSigningState | null {
   // A runner-only injection cannot inspect a real helper; it is a hermetic test double.
   if (dependencies.helperRunner && !dependencies.helperSigning && !dependencies.helperIdentityVerifier && !dependencies.helperConfigReader) return null;
@@ -675,7 +675,7 @@ function runLiveLaunchdCheck(options: { json: boolean }, ctx: CommandContext, de
     if (result.outcome === 'rolled-back' && result.steps?.failedStep === 7
       && (result.error === 'keychain-write-failed' || result.error === 'keychain-timeout')
       && !(result.steps.restoreFailures?.length)) {
-      const hint = 'the helper could not write the live item under launchd (a Keychain prompt or denied access is the usual cause): run `qlb keychain authorize` in a GUI session, then retry';
+      const hint = 'a stored login that lost its Keychain permission must be read once in a GUI session with the password and Always Allow, then retry';
       ctx.stdout(options.json
         ? JSON.stringify({ command: 'check-launchd --live', liveItemsAuthorized: false, reason: 'launchd-write-not-authorized' })
         : hint);

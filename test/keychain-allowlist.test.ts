@@ -196,7 +196,7 @@ describe('Keychain access allowlist', () => {
     }
   });
 
-  it('writes through security with the helper and security trusted applications', () => {
+  it('creates a new item through security with both trusted applications', () => {
     const service = 'qlb:anthropic:acct-1';
     const account = 'account';
     const calls: Array<{ file: string; args: string[]; input?: string; stdio?: unknown }> = [];
@@ -215,13 +215,50 @@ describe('Keychain access allowlist', () => {
     assert.deepEqual(calls, [{
       file: MACOS_SECURITY_BIN,
       args: [
-        'add-generic-password', '-U', '-a', account, '-s', service,
+        'add-generic-password', '-a', account, '-s', service,
         '-X', Buffer.from(payload, 'utf8').toString('hex'),
         '-T', defaultKeychainHelperPath(), '-T', MACOS_SECURITY_BIN,
       ],
       input: undefined,
       stdio: 'ignore',
     }]);
+  });
+
+  it('updates an existing item after the create reports a duplicate', () => {
+    const service = 'qlb:anthropic:acct-1';
+    const account = 'account';
+    const payload = 'safe-value';
+    const calls: Array<{ file: string; args: string[] }> = [];
+    const duplicate = Object.assign(new Error('duplicate item'), { status: 45 });
+    const exec: ExecFileSyncFn = (file, args) => {
+      calls.push({ file, args: [...args] });
+      if (calls.length === 1) throw duplicate;
+      return '';
+    };
+    const backend = withServiceGuard(new MacosKeychainBackend({ execFileSync: markFakeExecutor(exec) }), {
+      macosUserName: () => MACOS_USER, env: {},
+    });
+
+    backend.setSync(service, account, payload);
+
+    assert.deepEqual(calls, [
+      {
+        file: MACOS_SECURITY_BIN,
+        args: [
+          'add-generic-password', '-a', account, '-s', service,
+          '-X', Buffer.from(payload, 'utf8').toString('hex'),
+          '-T', defaultKeychainHelperPath(), '-T', MACOS_SECURITY_BIN,
+        ],
+      },
+      {
+        file: MACOS_SECURITY_BIN,
+        args: [
+          'add-generic-password', '-U', '-a', account, '-s', service,
+          '-X', Buffer.from(payload, 'utf8').toString('hex'),
+        ],
+      },
+    ]);
+    assert.equal(calls[1]!.args.includes('-T'), false);
   });
 
   it('passes unusual fields as security argv values without constructing an interactive command', () => {
@@ -233,7 +270,7 @@ describe('Keychain access allowlist', () => {
     assert.deepEqual(calls[0], {
       file: MACOS_SECURITY_BIN,
       args: [
-        'add-generic-password', '-U', '-a', account, '-s', service,
+        'add-generic-password', '-a', account, '-s', service,
         '-X', Buffer.from(payload, 'utf8').toString('hex'),
         '-T', defaultKeychainHelperPath(), '-T', MACOS_SECURITY_BIN,
       ],
@@ -265,11 +302,14 @@ describe('Keychain access allowlist', () => {
     assert.deepEqual(calls.map((call) => call.timeout), [5000, 5000, 5000]);
   });
 
-  it('redacts both plaintext and hex payloads from every write-error property', () => {
+  it('does not update when create fails for a status other than duplicate and redacts the error', () => {
     const secret = 'UNIQUE_SYNTHETIC_SECRET';
     const hex = Buffer.from(secret).toString('hex');
+    let calls = 0;
     const exec: ExecFileSyncFn = () => {
+      calls += 1;
       throw Object.assign(new Error(`security rejected ${secret} (${hex})`), {
+        status: 36,
         cmd: `${MACOS_SECURITY_BIN} add-generic-password -X ${hex}`,
         spawnargs: ['-X', hex],
         stdout: secret,
@@ -297,5 +337,40 @@ describe('Keychain access allowlist', () => {
         return true;
       },
     );
+    assert.equal(calls, 1);
   });
+
+  for (const stage of ['create', 'update'] as const) {
+    it(`redacts a timed-out ${stage} write`, () => {
+      const secret = 'UNIQUE_SYNTHETIC_TIMEOUT_SECRET';
+      const hex = Buffer.from(secret).toString('hex');
+      let calls = 0;
+      const timeout = Object.assign(new Error(`security timed out ${secret} (${hex})`), {
+        code: 'ETIMEDOUT', cmd: `${MACOS_SECURITY_BIN} add-generic-password -X ${hex}`,
+      });
+      const exec: ExecFileSyncFn = () => {
+        calls += 1;
+        if (stage === 'update' && calls === 1) throw Object.assign(new Error('duplicate item'), { status: 45 });
+        throw timeout;
+      };
+      const backend = withServiceGuard(new MacosKeychainBackend({ execFileSync: markFakeExecutor(exec) }), {
+        macosUserName: () => MACOS_USER, env: {},
+      });
+
+      assert.throws(() => backend.setSync('Claude Code-credentials', MACOS_USER, secret), (err: Error) => {
+        assert.equal(err.message, 'security add-generic-password timed out after 5s');
+        assert.equal(err.message.includes(secret), false);
+        assert.equal(err.message.includes(hex), false);
+        assert.equal(err.stack?.includes(secret) ?? false, false);
+        assert.equal(err.stack?.includes(hex) ?? false, false);
+        for (const key of Reflect.ownKeys(err)) {
+          const value = Object.getOwnPropertyDescriptor(err, key)?.value;
+          assert.equal(String(value).includes(secret), false);
+          assert.equal(String(value).includes(hex), false);
+        }
+        return true;
+      });
+      assert.equal(calls, stage === 'create' ? 1 : 2);
+    });
+  }
 });
