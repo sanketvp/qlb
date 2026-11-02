@@ -15,13 +15,13 @@ import {
   refreshActiveCodexLogin,
   type CodexActiveDeps,
 } from '../src/codex-active';
-import { codexAuthFileSha256, codexAuthFileText, codexFingerprint, readCodexAuthStableWithStat, type CodexAuthDocument } from '../src/codex-auth';
+import { codexAuthFileSha256, codexAuthFileText, codexFingerprint, codexIdentity, readCodexAuthStableWithStat, type CodexAuthDocument } from '../src/codex-auth';
 import { CodexSlots, CodexStashUnverifiable, importActiveCodexSlot } from '../src/codex-slots';
 import { MockKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from '../src/keychain';
 import { readCodexSwitchHistory, type CodexProcess } from '../src/codex-sessions';
 import { openStore } from '../src/store';
-import { codexAuthLockDir } from '../src/cc-locks';
-import { codexLockPaths } from '../src/codex-consume';
+import { ClaudeCodeLockTimeout, codexAuthLockDir } from '../src/cc-locks';
+import { CodexLockLost, codexLockPaths } from '../src/codex-consume';
 
 const NOW = Date.parse('2026-11-01T12:00:00.000Z');
 const A = 'user-a:account-a';
@@ -800,7 +800,15 @@ describe('codex active refresh helpers', () => {
       h.deps.transport = async () => { order.push('transport'); return { status: 200, body: JSON.stringify({ refresh_token: 'fixture-refresh-window', access_token: document(NOW + 600_000, 'fixture-access-window').tokens.access_token }) }; };
       assert.equal((await refreshActiveCodexLogin(h.deps, { trigger: 'proactive-expiry' })).status, 'posted');
       assert.deepEqual(order, ['afterObserve', 'enter', 'beforeSend', 'transport', 'beforeVerify', 'exit']);
-      h.deps.transport = async () => { throw new Error('fixture transport failure'); };
+      const failing = activeHarness();
+      try {
+        const failureOrder: string[] = [];
+        failing.deps.signalWindow = { enter: () => { failureOrder.push('enter'); }, exit: () => { failureOrder.push('exit'); } };
+        failing.deps.hooks = { afterObserve: () => { failureOrder.push('afterObserve'); }, beforeSend: () => { failureOrder.push('beforeSend'); } };
+        failing.deps.transport = async () => { failureOrder.push('transport'); throw new Error('fixture transport failure'); };
+        assert.equal((await refreshActiveCodexLogin(failing.deps, { trigger: 'proactive-expiry' })).status, 'transient');
+        assert.deepEqual(failureOrder, ['afterObserve', 'enter', 'beforeSend', 'transport', 'exit']);
+      } finally { failing.close(); }
       order.length = 0;
       assert.equal((await refreshActiveCodexLogin(h.deps, { trigger: 'proactive-expiry' })).status, 'noop');
       assert.equal(order.includes('enter'), false);
@@ -833,7 +841,33 @@ describe('codex active refresh helpers', () => {
     } finally { h.close(); }
   });
 
-  it('a codex-won re-read showing another known slot is drift', async () => { assert.equal(typeof refreshActiveCodexLogin, 'function'); });
+  it('a codex-won re-read showing another known slot is drift', async () => {
+    const h = activeHarness();
+    try {
+      const b0 = { ...document(NOW + 600_000, 'fixture-access-codex-won-b'), tokens: {
+        ...document(NOW + 600_000, 'fixture-access-codex-won-b').tokens,
+        id_token: jwt({ 'https://api.openai.com/auth': { chatgpt_user_id: 'user-b', chatgpt_account_id: 'account-b' } }),
+        account_id: 'account-b', refresh_token: 'fixture-refresh-codex-won-b',
+      } };
+      assert.equal(codexIdentity(b0), B);
+      importActiveCodexSlot(b0, { store: h.store, keychain: h.keychain, now: () => NOW + 1 });
+      h.store.setActiveLogin('openai-codex', A, 'import', NOW + 2);
+      h.store.recordCodexObservation({ identity: B, lineageFp: codexFingerprint(b0), by: 'qlb-active', now: NOW - 60_000 });
+      let posts = 0;
+      h.deps.list = async () => [];
+      h.deps.transport = async () => {
+        posts += 1;
+        h.deps.list = async () => [process(902, 1_000)];
+        writeFileSync(h.authPath, JSON.stringify(b0));
+        return { status: 400, body: JSON.stringify({ error: 'refresh_token_reused' }) };
+      };
+      assert.deepEqual(await refreshActiveCodexLogin(h.deps, { trigger: 'proactive-expiry' }), { status: 'drift', accountId: B });
+      assert.equal(posts, 1);
+      assert.equal(h.store.getCodexActiveLogin(), B);
+      assert.equal(codexFingerprint((await readCodexAuthStableWithStat(h.authPath, { delayMs: 0 }) as any).doc), codexFingerprint(b0));
+      assert.equal(readCodexSwitchHistory(h.store.dbPath, { journalDir: h.deps.journalDir }).observations.at(-1)?.by, 'qlb-active');
+    } finally { h.close(); }
+  });
 
   it('refresh_token_reused without a holder marks dead with a relogin row', async () => {
     const h = activeHarness();
@@ -844,15 +878,248 @@ describe('codex active refresh helpers', () => {
     } finally { h.close(); }
   });
 
-  it('a fresh consume republishes the slot document without a POST', async () => { assert.equal(refreshActiveCodexLogin.name, 'refreshActiveCodexLogin'); });
-  it('a write landing before the rename is never overwritten (beforeRename barrier, posted-live-external)', async () => { assert.equal(refreshActiveCodexLogin.length, 2); });
-  it('a fresh republish re-reads before the rename and stops on a changed file', async () => { assert.equal(typeof refreshActiveCodexLogin, 'function'); });
-  it('a rename failure after 2xx keeps the successor in the slot, logs codex:live-write-failed, and the next pass republishes it', async () => { assert.equal(typeof refreshActiveCodexLogin, 'function'); });
-  it('an external write after the rename is never overwritten (posted-live-external)', async () => { assert.equal(typeof refreshActiveCodexLogin, 'function'); });
-  it('an unstable or wiped file after the rename returns posted-live-unverified without throwing', async () => { assert.equal(typeof refreshActiveCodexLogin, 'function'); });
-  it('lock contention defers locks-held with 0 POSTs', async () => { assert.equal(typeof refreshActiveCodexLogin, 'function'); });
-  it('a lock compromise after the POST surfaces the stash', async () => { assert.equal(typeof refreshActiveCodexLogin, 'function'); });
-  it('no token value reaches autoLog, a thrown error or an outcome’s reason', async () => { assert.equal(typeof refreshActiveCodexLogin, 'function'); });
+  it('a fresh consume republishes the slot document without a POST', async () => {
+    const h = activeHarness();
+    try {
+      const fresh = document(NOW + 600_000, 'fixture-access-fresh-consume');
+      let posts = 0;
+      h.deps.hooks = { afterObserve: () => (h.deps.slots as any).writeSlot(A, fresh, h.a0) };
+      h.deps.transport = async () => { posts += 1; throw new Error('transport must not run'); };
+      const outcome = await refreshActiveCodexLogin(h.deps, { trigger: 'proactive-expiry' });
+      assert.deepEqual(outcome, { status: 'republished', document: fresh });
+      assert.equal(posts, 0);
+      assert.equal(codexFingerprint((h.deps.slots as any).readSlot(A).document), codexFingerprint(fresh));
+      const live = await readCodexAuthStableWithStat(h.authPath, { delayMs: 0 });
+      assert.equal(live.status, 'ok');
+      if (live.status === 'ok') assert.equal(codexFingerprint(live.doc), codexFingerprint(fresh));
+      assert.equal(readCodexSwitchHistory(h.store.dbPath, { journalDir: h.deps.journalDir }).observations.at(-1)?.by, 'qlb-active');
+    } finally { h.close(); }
+  });
+
+  it('a write landing before the rename is never overwritten (beforeRename barrier, posted-live-external)', async () => {
+    const h = activeHarness();
+    try {
+      const external = { ...document(NOW + 600_000, 'fixture-access-before-rename'), tokens: {
+        ...document(NOW + 600_000, 'fixture-access-before-rename').tokens, refresh_token: 'fixture-refresh-before-rename',
+      } };
+      let posts = 0;
+      h.deps.transport = async () => { posts += 1; return { status: 200, body: JSON.stringify({
+        refresh_token: 'fixture-refresh-issued-before-rename', access_token: document(NOW + 600_000, 'fixture-access-issued-before-rename').tokens.access_token,
+      }) }; };
+      h.deps.hooks = { beforeRename: () => writeFileSync(h.authPath, JSON.stringify(external)) };
+      const outcome = await refreshActiveCodexLogin(h.deps, { trigger: 'proactive-expiry' });
+      assert.equal(outcome.status, 'posted-live-external');
+      if (outcome.status === 'posted-live-external') assert.equal(outcome.cause, 'post');
+      assert.equal(posts, 1);
+      assert.equal(readFileSync(h.authPath, 'utf8'), JSON.stringify(external));
+      assert.equal(codexFingerprint((h.deps.slots as any).readSlot(A).document), codexFingerprint(external));
+      assert.equal(readCodexSwitchHistory(h.store.dbPath, { journalDir: h.deps.journalDir }).observations.at(-1)?.by, 'qlb-active');
+    } finally { h.close(); }
+  });
+
+  it('a fresh republish re-reads before the rename and stops on a changed file', async () => {
+    const h = activeHarness();
+    try {
+      const fresh = document(NOW + 600_000, 'fixture-access-fresh-race');
+      const external = { ...document(NOW + 600_000, 'fixture-access-fresh-external'), tokens: {
+        ...document(NOW + 600_000, 'fixture-access-fresh-external').tokens, refresh_token: 'fixture-refresh-fresh-external',
+      } };
+      let posts = 0;
+      h.deps.hooks = {
+        afterObserve: () => (h.deps.slots as any).writeSlot(A, fresh, h.a0),
+        beforeRename: () => writeFileSync(h.authPath, JSON.stringify(external)),
+      };
+      h.deps.transport = async () => { posts += 1; throw new Error('fresh must not POST'); };
+      const outcome = await refreshActiveCodexLogin(h.deps, { trigger: 'proactive-expiry' });
+      assert.equal(outcome.status, 'posted-live-external');
+      if (outcome.status === 'posted-live-external') assert.equal(outcome.cause, 'republish');
+      assert.equal(posts, 0);
+      assert.equal(readFileSync(h.authPath, 'utf8'), JSON.stringify(external));
+      assert.equal(codexFingerprint((h.deps.slots as any).readSlot(A).document), codexFingerprint(external));
+      assert.equal(readCodexSwitchHistory(h.store.dbPath, { journalDir: h.deps.journalDir }).observations.at(-1)?.by, 'qlb-active');
+    } finally { h.close(); }
+  });
+
+  it('a rename failure after 2xx keeps the successor in the slot, logs codex:live-write-failed, and the next pass republishes it', async () => {
+    const h = activeHarness();
+    try {
+      const successor = document(NOW + 600_000, 'fixture-access-rename-retry');
+      const logs: string[] = [];
+      const originalPath = h.deps.authPath;
+      const blockedPath = join(h.root, 'blocked-auth.json');
+      mkdirSync(blockedPath);
+      let posts = 0;
+      h.deps.autoLog = (line) => logs.push(line);
+      h.deps.authPath = blockedPath;
+      h.deps.transport = async () => { posts += 1; return { status: 200, body: JSON.stringify({
+        refresh_token: successor.tokens.refresh_token, access_token: successor.tokens.access_token,
+      }) }; };
+      const failed = await refreshActiveCodexLogin(h.deps, { trigger: 'proactive-expiry' });
+      assert.equal(failed.status, 'posted-live-unwritten');
+      if (failed.status === 'posted-live-unwritten') assert.equal(failed.cause, 'post');
+      assert.equal(posts, 1);
+      assert.equal(codexFingerprint((h.deps.slots as any).readSlot(A).document), codexFingerprint(successor));
+      assert.ok(logs.some((line) => line.startsWith('codex:live-write-failed provider=openai-codex account=user-a:account-a cause=post')));
+      h.deps.authPath = originalPath;
+      const restored = await refreshActiveCodexLogin(h.deps, { trigger: 'proactive-expiry' });
+      assert.equal(restored.status, 'republished');
+      assert.equal(posts, 1);
+      assert.equal(codexFingerprint((await readCodexAuthStableWithStat(originalPath, { delayMs: 0 }) as any).doc), codexFingerprint(successor));
+      assert.equal(readCodexSwitchHistory(h.store.dbPath, { journalDir: h.deps.journalDir }).observations.at(-1)?.by, 'qlb-active');
+    } finally { h.close(); }
+  });
+
+  it('an external write after the rename is never overwritten (posted-live-external)', async () => {
+    const h = activeHarness();
+    try {
+      const external = { ...document(NOW + 600_000, 'fixture-access-after-rename'), tokens: {
+        ...document(NOW + 600_000, 'fixture-access-after-rename').tokens, refresh_token: 'fixture-refresh-after-rename',
+      } };
+      let posts = 0;
+      h.deps.transport = async () => { posts += 1; return { status: 200, body: JSON.stringify({
+        refresh_token: 'fixture-refresh-issued-after-rename', access_token: document(NOW + 600_000, 'fixture-access-issued-after-rename').tokens.access_token,
+      }) }; };
+      h.deps.hooks = { afterRename: () => writeFileSync(h.authPath, JSON.stringify(external)) };
+      const outcome = await refreshActiveCodexLogin(h.deps, { trigger: 'proactive-expiry' });
+      assert.equal(outcome.status, 'posted-live-external');
+      if (outcome.status === 'posted-live-external') assert.equal(outcome.cause, 'post');
+      assert.equal(posts, 1);
+      assert.equal(readFileSync(h.authPath, 'utf8'), JSON.stringify(external));
+      assert.equal(codexFingerprint((h.deps.slots as any).readSlot(A).document), codexFingerprint(external));
+      assert.equal(readCodexSwitchHistory(h.store.dbPath, { journalDir: h.deps.journalDir }).observations.at(-1)?.by, 'qlb-active');
+    } finally { h.close(); }
+  });
+
+  it('an unstable or wiped file after the rename returns posted-live-unverified without throwing', async () => {
+    for (const read of ['unstable', 'wiped'] as const) {
+      const h = activeHarness();
+      try {
+        const successor = document(NOW + 600_000, `fixture-access-${read}-verify`);
+        let posts = 0;
+        const realRead = h.deps.readLive;
+        let reads = 0;
+        h.deps.readLive = async () => {
+          reads += 1;
+          if (reads === 3) return read === 'unstable'
+            ? { status: 'unstable' as const }
+            : { status: 'wiped' as const, error: { ok: false as const, error: 'tokens-empty' as const, status: 'wiped' as const } };
+          return realRead();
+        };
+        h.deps.transport = async () => { posts += 1; return { status: 200, body: JSON.stringify({
+          refresh_token: successor.tokens.refresh_token, access_token: successor.tokens.access_token,
+        }) }; };
+        const outcome = await refreshActiveCodexLogin(h.deps, { trigger: 'proactive-expiry' });
+        assert.equal(outcome.status, 'posted-live-unverified');
+        if (outcome.status === 'posted-live-unverified') {
+          assert.equal(outcome.read, read);
+          assert.equal(outcome.cause, 'post');
+        }
+        assert.equal(posts, 1);
+        assert.equal(codexFingerprint((h.deps.slots as any).readSlot(A).document), codexFingerprint(successor));
+        const observation = readCodexSwitchHistory(h.store.dbPath, { journalDir: h.deps.journalDir }).observations.at(-1);
+        assert.equal(observation?.by, 'qlb-active');
+        if (read === 'wiped') assert.equal(observation?.identity, null);
+      } finally { h.close(); }
+    }
+  });
+
+  it('lock contention defers locks-held with 0 POSTs', async () => {
+    const h = activeHarness();
+    try {
+      let posts = 0;
+      h.deps.transport = async () => { posts += 1; throw new Error('must not POST'); };
+      h.deps.withLocks = async () => { throw new ClaudeCodeLockTimeout(join(h.root, 'fixture-lock')); };
+      assert.deepEqual(await refreshActiveCodexLogin(h.deps, { trigger: 'proactive-expiry' }), { status: 'deferred', reason: 'locks-held' });
+      assert.equal(posts, 0);
+      assert.equal(readFileSync(h.authPath, 'utf8'), JSON.stringify(h.a0));
+      assert.equal(codexFingerprint((h.deps.slots as any).readSlot(A).document), codexFingerprint(h.a0));
+      assert.equal(readCodexSwitchHistory(h.store.dbPath, { journalDir: h.deps.journalDir }).observations.length, 0);
+    } finally { h.close(); }
+  });
+
+  it('a lock compromise after the POST surfaces the stash', async () => {
+    const h = activeHarness();
+    try {
+      const successor = document(NOW + 600_000, 'fixture-access-lock-lost');
+      let posts = 0;
+      let compromised = false;
+      h.deps.withLocks = async (_accountId, fn) => fn(() => { if (compromised) throw new CodexLockLost('fixture lock compromised'); });
+      h.deps.transport = async () => {
+        posts += 1;
+        compromised = true;
+        return { status: 200, body: JSON.stringify({ refresh_token: successor.tokens.refresh_token, access_token: successor.tokens.access_token }) };
+      };
+      const outcome = await refreshActiveCodexLogin(h.deps, { trigger: 'proactive-expiry' });
+      assert.equal(outcome.status, 'stashed');
+      assert.equal(posts, 1);
+      assert.notEqual(outcome.status === 'stashed' ? outcome.stashId : undefined, undefined);
+      assert.equal(readFileSync(h.authPath, 'utf8'), JSON.stringify(h.a0));
+      assert.equal(codexFingerprint((h.deps.slots as any).readSlot(A).document), codexFingerprint(h.a0));
+      assert.equal(readCodexSwitchHistory(h.store.dbPath, { journalDir: h.deps.journalDir }).observations.at(-1)?.by, 'qlb-active');
+    } finally { h.close(); }
+  });
+
+  it('no token value reaches autoLog, a thrown error or an outcome’s reason', async () => {
+    const h = activeHarness();
+    try {
+      const raw = {
+        access: 'raw-access-token-refresh-redaction', refresh: 'raw-refresh-token-refresh-redaction', id: h.a0.tokens.id_token,
+      };
+      const input = { ...h.a0, tokens: { ...h.a0.tokens, access_token: raw.access, refresh_token: raw.refresh, id_token: raw.id } };
+      const logs: string[] = [];
+      h.deps.autoLog = (line) => logs.push(line);
+      writeFileSync(h.authPath, JSON.stringify(input));
+      h.deps.authPath = join(h.root, 'blocked-redaction-auth.json');
+      mkdirSync(h.deps.authPath);
+      h.deps.transport = async () => ({ status: 200, body: JSON.stringify({ refresh_token: raw.refresh, access_token: raw.access }) });
+      const outcome = await refreshActiveCodexLogin(h.deps, { trigger: 'proactive-expiry' });
+      assert.equal(outcome.status, 'posted-live-unwritten');
+      const render = (value: unknown) => typeof value === 'string' ? value : JSON.stringify(value);
+      for (const secret of Object.values(raw)) {
+        assert.equal(render({ status: outcome.status, ...('reason' in outcome ? { reason: outcome.reason } : {}) }).includes(secret), false);
+        assert.equal(logs.join('\n').includes(secret), false);
+      }
+      await assert.rejects(listOrFail(async () => { throw new Error(raw.access); })(), (error: unknown) => {
+        assert.ok(error instanceof CodexProcessCheckFailed);
+        for (const secret of Object.values(raw)) assert.equal(error.message.includes(secret), false);
+        return true;
+      });
+      assert.equal(codexFingerprint((h.deps.slots as any).readSlot(A).document).includes(raw.refresh), false);
+
+      const unknown = { ...input, tokens: {
+        ...input.tokens,
+        id_token: jwt({ 'https://api.openai.com/auth': { chatgpt_user_id: 'user-c', chatgpt_account_id: 'account-c' } }),
+        account_id: 'account-c',
+      } };
+      const stashDir = join(h.root, 'redaction-stash');
+      const stashKeychain = {
+        getSync: h.keychain.getSync.bind(h.keychain),
+        setSync: (service: string, account: string, value: string) => {
+          if (service.includes(':unclaimed:')) throw new Error('fixture forces a file-backed stash');
+          h.keychain.setSync(service, account, value);
+        },
+        deleteSync: h.keychain.deleteSync.bind(h.keychain),
+      };
+      const stashSlots = new CodexSlots({ keychain: stashKeychain, stashDir });
+      const ensureUnclaimedStash = stashSlots.ensureUnclaimedStash.bind(stashSlots);
+      let stashPath: string | undefined;
+      stashSlots.ensureUnclaimedStash = async (doc, now) => {
+        const result = await ensureUnclaimedStash(doc, now);
+        stashPath = join(stashDir, `${result.stashId}.json`);
+        return result;
+      };
+      h.deps.slots = stashSlots as never;
+      writeFileSync(h.authPath, JSON.stringify(unknown));
+      const stashed = await refreshActiveCodexLogin(h.deps, { trigger: 'proactive-expiry' });
+      assert.deepEqual(stashed, { status: 'refused', reason: 'unknown-live-identity' });
+      assert.ok(stashPath);
+      assert.equal(existsSync(stashPath), true);
+      for (const secret of [...Object.values(raw), unknown.tokens.id_token]) {
+        assert.equal(render(stashed).includes(secret), false);
+        assert.equal(stashPath.includes(secret), false);
+      }
+    } finally { h.close(); }
+  });
 
   it('no token value reaches an outcome’s reason, the fence message pass-through, a stash path or a thrown error', async () => {
     const h = activeHarness();
