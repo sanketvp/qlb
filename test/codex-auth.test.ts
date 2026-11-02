@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { lstat, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { lstat, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
@@ -315,6 +316,101 @@ describe('codex auth.json helpers', () => {
       }
     } finally {
       await rm(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  it('record-l40-verified writes codex.l40Verified when auth_time is present', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'qlb-l40-receipt-'));
+    const codexHome = join(root, 'codex');
+    const qlbHome = join(root, 'qlb');
+    const dbPath = join(qlbHome, '.qlb', 'qlb.db');
+    try {
+      await mkdir(codexHome, { recursive: true });
+      await writeFile(join(codexHome, 'auth.json'), JSON.stringify(validDocument({
+        tokens: {
+          id_token: jwt({ auth_time: 1_710_000_000 }),
+          access_token: jwt({ exp: 2_000_000_000 }),
+          refresh_token: 'test-refresh-token',
+        },
+      })), 'utf8');
+      const result = spawnSync(process.execPath, ['--disable-warning=ExperimentalWarning', join(__dirname, '..', 'src', 'cli.js'), 'codex', 'probe-claims', '--record-l40-verified'], {
+        encoding: 'utf8',
+        env: { CODEX_HOME: codexHome, HOME: qlbHome, QLB_HOME: qlbHome, QLB_TEST_MODE: '1' },
+      });
+      assert.equal(result.error, undefined);
+      assert.equal(result.status, 0, result.stderr);
+      assert.equal(result.stdout, '{"recorded":true}\n');
+      assert.equal(result.stderr, '');
+      const { openStore } = require('../src/store') as typeof import('../src/store');
+      const store = openStore(dbPath);
+      try {
+        assert.equal(store.getConfig('codex.l40Verified'), '1');
+      } finally {
+        store.close();
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('record-l40-verified refuses and writes nothing without auth_time or on a missing file', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'qlb-l40-refusal-'));
+    try {
+      for (const fixture of ['no-auth-time', 'missing'] as const) {
+        const codexHome = join(root, fixture, 'codex');
+        const qlbHome = join(root, fixture, 'qlb');
+        const dbPath = join(qlbHome, '.qlb', 'qlb.db');
+        if (fixture === 'no-auth-time') {
+          await mkdir(codexHome, { recursive: true });
+          await writeFile(join(codexHome, 'auth.json'), JSON.stringify(validDocument({
+            tokens: {
+              id_token: jwt({ email: 'fixture-operator@example.test' }),
+              access_token: jwt({ exp: 2_000_000_000 }),
+              refresh_token: 'test-refresh-token',
+            },
+          })), 'utf8');
+        }
+        const result = spawnSync(process.execPath, ['--disable-warning=ExperimentalWarning', join(__dirname, '..', 'src', 'cli.js'), 'codex', 'probe-claims', '--record-l40-verified'], {
+          encoding: 'utf8',
+          env: { CODEX_HOME: codexHome, HOME: qlbHome, QLB_HOME: qlbHome, QLB_TEST_MODE: '1' },
+        });
+        assert.equal(result.error, undefined);
+        assert.equal(result.status, 3, result.stderr);
+        assert.equal(result.stdout, JSON.stringify({ recorded: false, reason: fixture === 'no-auth-time' ? 'no-auth-time' : 'missing' }) + '\n');
+        assert.equal(result.stderr, '');
+        assert.equal(existsSync(dbPath), false, `${fixture} receipt attempt created a database`);
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('no claim value is printed', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'qlb-l40-output-'));
+    const codexHome = join(root, 'codex');
+    const qlbHome = join(root, 'qlb');
+    const marker = 'distinctive-claim-marker-do-not-print';
+    const authTimeValue = 1_710_000_001;
+    try {
+      await mkdir(codexHome, { recursive: true });
+      await writeFile(join(codexHome, 'auth.json'), JSON.stringify(validDocument({
+        tokens: {
+          id_token: jwt({ auth_time: authTimeValue, marker }),
+          access_token: jwt({ exp: 2_000_000_000 }),
+          refresh_token: 'test-refresh-token',
+        },
+      })), 'utf8');
+      const result = spawnSync(process.execPath, ['--disable-warning=ExperimentalWarning', join(__dirname, '..', 'src', 'cli.js'), 'codex', 'probe-claims', '--record-l40-verified'], {
+        encoding: 'utf8',
+        env: { CODEX_HOME: codexHome, HOME: qlbHome, QLB_HOME: qlbHome, QLB_TEST_MODE: '1' },
+      });
+      assert.equal(result.status, 0, result.stderr);
+      assert.equal(result.stdout, '{"recorded":true}\n');
+      assert.equal(result.stderr, '');
+      assert.equal(`${result.stdout}${result.stderr}`.includes(marker), false);
+      assert.equal(`${result.stdout}${result.stderr}`.includes(String(authTimeValue)), false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
     }
   });
 
