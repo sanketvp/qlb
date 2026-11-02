@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { describe, it } from 'node:test';
 
-import { runKeychainCommand, type KeychainCommandDependencies, type LiveSwitchReceipt } from '../src/commands/keychain';
+import { liveSwitchEnvironment, runKeychainCommand, runLaunchdLiveSwitch, type KeychainCommandDependencies, type LiveSwitchReceipt } from '../src/commands/keychain';
 import { defaultConfig } from '../src/config';
 import { beginCutover } from '../src/lifecycle';
 import type { CommandContext } from '../src/registry';
@@ -15,7 +15,7 @@ const OK_RECEIPT: LiveSwitchReceipt = {
   reason: null, error: null, outgoingKind: 'own-bytes', steps: { cleanup: [] }, injected: false,
 };
 
-function fixture(cuttingOver = true): { context: CommandContext; output: string[]; errors: string[]; cleanup(): void } {
+function fixture(cuttingOver = true): { home: string; context: CommandContext; output: string[]; errors: string[]; cleanup(): void } {
   const home = mkdtempSync(join(tmpdir(), 'qlb-launchd-live-'));
   const config = defaultConfig(home);
   const output: string[] = [];
@@ -25,8 +25,10 @@ function fixture(cuttingOver = true): { context: CommandContext; output: string[
     if (cuttingOver) beginCutover(store);
     store.setActiveLogin('anthropic', 'a', 'manual', 1);
     store.setConfig('keychain.liveItemsReadAuthorizedAt', '1');
+    store.setConfig('keychain.liveItemsReadAuthorizedIdentityHash', 'pinned-identity');
   } finally { store.close(); }
   return {
+    home,
     context: {
       config,
       env: { QLB_TEST_MODE: '1', QLB_HOME: home, HOME: home },
@@ -80,7 +82,7 @@ describe('keychain check-launchd --live (K5b-2)', () => {
     try {
       const receipt = { ...OK_RECEIPT, outcome: 'rolled-back' as const, error: 'keychain-write-failed', steps: { failedStep: 7 } };
       assert.equal(await runKeychainCommand(['check-launchd', '--live'], f.context, liveDeps(receipt)), 1);
-      assert.match(f.errors.join('\n'), /re-authorize in the GUI/);
+      assert.match(f.output.join('\n'), /run `qlb keychain authorize` in a GUI session, then retry/);
       const store = openStore(f.context.config.dbPath);
       try { assert.equal(store.getConfig('keychain.liveItemsAuthorizedAt'), null); } finally { store.close(); }
     } finally { f.cleanup(); }
@@ -91,9 +93,13 @@ describe('keychain check-launchd --live (K5b-2)', () => {
     try {
       const wrongStep = { ...OK_RECEIPT, outcome: 'rolled-back' as const, error: 'keychain-write-failed', steps: { failedStep: 8 } };
       assert.equal(await runKeychainCommand(['check-launchd', '--live'], f.context, liveDeps(wrongStep)), 1);
+      assert.match(f.errors.join('\n'), /rolled-back: none/);
       assert.equal(await runKeychainCommand(['check-launchd', '--live'], f.context, liveDeps({ timeout: true })), 1);
       const store = openStore(f.context.config.dbPath);
-      try { assert.equal(store.getConfig('keychain.liveItemsAuthorizedAt'), null); } finally { store.close(); }
+      try {
+        assert.equal(store.getConfig('keychain.liveItemsAuthorizedAt'), null);
+        assert.equal(store.getConfig('keychain.liveItemsAuthorizedIdentityHash'), null);
+      } finally { store.close(); }
     } finally { f.cleanup(); }
   });
 
@@ -114,12 +120,170 @@ describe('keychain check-launchd --live (K5b-2)', () => {
     }
   });
 
+  it('refuses a receipt for another account and read authorization for another helper identity', async () => {
+    const f = fixture();
+    try {
+      assert.equal(await runKeychainCommand(['check-launchd', '--live'], f.context, liveDeps({ ...OK_RECEIPT, from: 'b', to: 'b' })), 1);
+      assert.match(f.errors.join('\n'), /ok: receipt account mismatch/);
+      const store = openStore(f.context.config.dbPath);
+      try {
+        assert.equal(store.getConfig('keychain.liveItemsAuthorizedAt'), null);
+        store.setConfig('keychain.liveItemsReadAuthorizedIdentityHash', 'other-identity');
+      } finally { store.close(); }
+      const launched: string[] = [];
+      assert.equal(await runKeychainCommand(['check-launchd', '--live'], f.context, liveDeps(OK_RECEIPT, launched)), 3);
+      assert.deepEqual(launched, []);
+      assert.match(f.errors.join('\n'), /live-items-read-authorization-identity-mismatch/);
+    } finally { f.cleanup(); }
+  });
+
+  it('keeps the generic outcome message when a step-7 restore kept its journal', async () => {
+    const f = fixture();
+    try {
+      const receipt = {
+        ...OK_RECEIPT, outcome: 'rolled-back' as const, reason: 'restore-incomplete', error: 'keychain-write-failed',
+        steps: { failedStep: 7, restoreFailures: ['credentials'] },
+      };
+      assert.equal(await runKeychainCommand(['check-launchd', '--live'], f.context, liveDeps(receipt)), 1);
+      assert.equal(f.output.length, 0);
+      assert.match(f.errors.join('\n'), /rolled-back: restore-incomplete/);
+      assert.doesNotMatch(f.errors.join('\n'), /then retry/);
+    } finally { f.cleanup(); }
+  });
+
   it('accepts --json and rejects malformed live command flags', async () => {
     const f = fixture();
     try {
       assert.equal(await runKeychainCommand(['check-launchd', '--live', '--json'], f.context, liveDeps(OK_RECEIPT)), 0);
       assert.deepEqual(JSON.parse(f.output[0]!), { command: 'check-launchd --live', liveItemsAuthorized: true });
       assert.equal(await runKeychainCommand(['matrix', '--live'], f.context, liveDeps(OK_RECEIPT)), 2);
+    } finally { f.cleanup(); }
+  });
+});
+
+describe('runLaunchdLiveSwitch runner seam (K5b-2)', () => {
+  function completeOnBootstrap(calls: string[][]): (args: string[]) => void {
+    return (args) => {
+      calls.push(args);
+      if (args[0] === 'bootstrap') {
+        const directory = dirname(args[2]!);
+        writeFileSync(join(directory, 'receipt.json'), JSON.stringify(OK_RECEIPT));
+        writeFileSync(join(directory, 'status'), '0');
+      }
+    };
+  }
+
+  it('copies QLB_HOME only when inherited and makes the required plist arguments and environment', () => {
+    const f = fixture();
+    const calls: string[][] = [];
+    let plist = '';
+    try {
+      f.context.env.CLAUDE_CONFIG_DIR = '/fixture/claude';
+      const complete = completeOnBootstrap(calls);
+      const result = runLaunchdLiveSwitch('a', f.context, {
+        platform: 'darwin',
+        launchdRunner: (args) => {
+          if (args[0] === 'bootstrap') plist = readFileSync(args[2]!, 'utf8');
+          complete(args);
+        },
+      });
+      assert.deepEqual(result, OK_RECEIPT);
+      assert.match(plist, /com\.modus\.qlb-livecheck\./);
+      assert.match(plist, /<string>\/bin\/sh<\/string>[\s\S]*<string>-c<\/string>[\s\S]*<string>r="\$1"; s="\$2"; shift 2;/);
+      assert.match(plist, /<string>--<\/string>[\s\S]*<string>switch<\/string>[\s\S]*<string>anthropic<\/string>[\s\S]*<string>a<\/string>[\s\S]*<string>--republish<\/string>/);
+      assert.match(plist, /<key>QLB_DB_PATH<\/key><string>/);
+      assert.match(plist, /<key>QLB_HOME<\/key><string>/);
+      assert.match(plist, /<key>CLAUDE_CONFIG_DIR<\/key><string>\/fixture\/claude<\/string>/);
+      assert.ok(calls.some(([verb]) => verb === 'bootout'));
+
+      const withoutTestHome = { ...f.context, env: { HOME: f.home, PATH: '/usr/bin:/bin' } };
+      assert.equal(liveSwitchEnvironment(withoutTestHome).QLB_HOME, undefined);
+    } finally { f.cleanup(); }
+  });
+
+  it('sweeps an exited prior run and refuses without launching when launchd says it is running', () => {
+    const exited = fixture();
+    const stopped = fixture();
+    const running = fixture();
+    try {
+      const oldLabel = 'com.modus.qlb-livecheck.old';
+      const exitedDirectory = join(exited.home, '.qlb', 'launchd-live', oldLabel);
+      mkdirSync(exitedDirectory, { recursive: true });
+      const exitedCalls: string[][] = [];
+      const exitedResult = runLaunchdLiveSwitch('a', exited.context, {
+        platform: 'darwin',
+        launchdRunner: (args) => {
+          exitedCalls.push(args);
+          if (args[0] === 'print') throw new Error('not loaded');
+          completeOnBootstrap(exitedCalls)(args);
+        },
+      });
+      assert.deepEqual(exitedResult, OK_RECEIPT);
+      assert.equal(existsSync(exitedDirectory), false);
+      assert.deepEqual(exitedCalls.slice(0, 2).map(([verb]) => verb), ['print', 'bootout']);
+
+      const stoppedDirectory = join(stopped.home, '.qlb', 'launchd-live', oldLabel);
+      mkdirSync(stoppedDirectory, { recursive: true });
+      const stoppedCalls: string[][] = [];
+      assert.deepEqual(runLaunchdLiveSwitch('a', stopped.context, {
+        platform: 'darwin',
+        launchdRunner: (args) => {
+          stoppedCalls.push(args);
+          if (args[0] === 'print') return 'state = exited';
+          completeOnBootstrap(stoppedCalls)(args);
+        },
+      }), OK_RECEIPT);
+      assert.equal(existsSync(stoppedDirectory), false);
+      assert.deepEqual(stoppedCalls.slice(0, 2).map(([verb]) => verb), ['print', 'bootout']);
+
+      const runningDirectory = join(running.home, '.qlb', 'launchd-live', oldLabel);
+      mkdirSync(runningDirectory, { recursive: true });
+      const runningCalls: string[][] = [];
+      assert.deepEqual(runLaunchdLiveSwitch('a', running.context, {
+        platform: 'darwin', launchdRunner: (args) => { runningCalls.push(args); },
+      }), { inProgress: oldLabel });
+      assert.deepEqual(runningCalls.map(([verb]) => verb), ['print']);
+    } finally {
+      exited.cleanup();
+      stopped.cleanup();
+      running.cleanup();
+    }
+  });
+
+  it('times out without reading a receipt or booting out the still-running agent', () => {
+    const f = fixture();
+    const calls: string[][] = [];
+    try {
+      const result = runLaunchdLiveSwitch('a', f.context, {
+        platform: 'darwin',
+        now: (() => { let call = 0; return () => call++ === 0 ? 0 : 90_000; })(),
+        launchdRunner: (args) => {
+          calls.push(args);
+          if (args[0] === 'bootstrap') {
+            writeFileSync(join(dirname(args[2]!), 'receipt.json'), 'not read without status');
+          }
+        },
+      });
+      assert.deepEqual(result, { timeout: true });
+      assert.deepEqual(calls.map(([verb]) => verb), ['bootstrap']);
+      assert.equal(readdirSync(join(f.home, '.qlb', 'launchd-live')).length, 1);
+    } finally { f.cleanup(); }
+  });
+
+  it('removes the run directory when bootstrap fails without invoking host launchctl', () => {
+    const f = fixture();
+    const calls: string[][] = [];
+    try {
+      assert.throws(() => runLaunchdLiveSwitch('a', f.context, {
+        platform: 'darwin',
+        launchdRunner: (args) => {
+          calls.push(args);
+          if (args[0] === 'bootstrap') throw new Error('bootstrap failed');
+        },
+      }), /bootstrap failed/);
+      const root = join(f.home, '.qlb', 'launchd-live');
+      assert.deepEqual(existsSync(root) ? readdirSync(root) : [], []);
+      assert.deepEqual(calls.map(([verb]) => verb), ['bootstrap', 'bootout']);
     } finally { f.cleanup(); }
   });
 });
