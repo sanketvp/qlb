@@ -48,6 +48,24 @@ export interface UsagePollRow {
   heldUntil: number | null;
 }
 
+export interface AnthropicAutoswitchBreakerRow {
+  ts: number;
+  trigger: string;
+  outcome: string;
+  automatic: boolean;
+  injected: boolean;
+}
+
+/** Shared by Store and read-only consumers so breaker state has one projection. */
+export function listAnthropicAutoswitchBreakerRows(db: DatabaseSync): AnthropicAutoswitchBreakerRow[] {
+  return (db.prepare(`SELECT committed_at AS ts, trigger, outcome,
+    CASE WHEN trigger = 'manual' THEN 0 ELSE 1 END AS automatic, injected
+    FROM switch_log
+    WHERE provider = 'anthropic' AND committed_at IS NOT NULL`).all() as Array<{
+    ts: number; trigger: string; outcome: string; automatic: number; injected: number;
+  }>).map((row) => ({ ...row, automatic: row.automatic !== 0, injected: row.injected !== 0 }));
+}
+
 export interface UsagePollResult {
   attemptedAt: number;
   status: string;
@@ -2456,19 +2474,8 @@ export class Store {
   }
 
   /** S14's read-only automatic Claude switch-history projection. */
-  listAnthropicAutoswitchBreakerRows(): Array<{
-    ts: number;
-    trigger: string;
-    outcome: string;
-    automatic: boolean;
-    injected: boolean;
-  }> {
-    return (this.db.prepare(`SELECT committed_at AS ts, trigger, outcome,
-      CASE WHEN trigger = 'manual' THEN 0 ELSE 1 END AS automatic, injected
-      FROM switch_log
-      WHERE provider = 'anthropic' AND committed_at IS NOT NULL`).all() as Array<{
-      ts: number; trigger: string; outcome: string; automatic: number; injected: number;
-    }>).map((row) => ({ ...row, automatic: row.automatic !== 0, injected: row.injected !== 0 }));
+  listAnthropicAutoswitchBreakerRows(): AnthropicAutoswitchBreakerRow[] {
+    return listAnthropicAutoswitchBreakerRows(this.db);
   }
 
   /** Recovery for a completed auto switch whose config timestamp did not land. */
