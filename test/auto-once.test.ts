@@ -6,8 +6,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
+import { runAuto } from '../src/auto';
 import { runAutoCommand } from '../src/commands/auto';
+import { claudePaths } from '../src/cc-paths';
+import { claudeSwitchJournalPath, createClaudeSwitchJournal, type ClaudeSwitchJournal } from '../src/cc-switch-journal';
+import type { ClaudeSwitchDeps } from '../src/cc-switch';
 import { defaultConfig } from '../src/config';
+import { MockKeychain } from '../src/keychain';
+import { reconcileClaudeSwitch } from '../src/journal';
 import { runExecutingCommand } from '../src/cli';
 import type { CommandContext } from '../src/registry';
 import { beginCutover, transition } from '../src/lifecycle';
@@ -21,8 +27,8 @@ function testEnv(home: string, extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv
   return { ...process.env, ...extra, QLB_TEST_MODE: '1', QLB_HOME: home, HOME: home };
 }
 
-function start(args: string[], env: NodeJS.ProcessEnv): ChildProcess {
-  return spawn(process.execPath, [CLI, ...args], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+function start(args: string[], env: NodeJS.ProcessEnv, cwd?: string): ChildProcess {
+  return spawn(process.execPath, [CLI, ...args], { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
 }
 
 function collect(child: ChildProcess): Promise<ProcessResult> {
@@ -112,12 +118,25 @@ describe('qlb auto --once (G12)', () => {
   it('the whole dry-run command on an orphan-journal fixture changes no file under QLB_HOME and makes no HTTP call', async () => {
     const root = mkdtempSync(join(tmpdir(), 'qlb-auto-dry-command-'));
     const home = join(root, 'home');
+    const env = testEnv(home);
     const config = defaultConfig(home);
     const store = openStore(config.dbPath);
     store.close();
-    const orphan = join(home, '.qlb', 'journals', 'switch-anthropic.json');
+    const paths = claudePaths({ home, env });
+    const orphan = claudeSwitchJournalPath({ home });
+    const journal: ClaudeSwitchJournal = {
+      v: 1, provider: 'anthropic', attemptId: 'orphaned-fixture', from: 'from', to: 'to', trigger: 'auto', by: 'fixture',
+      republish: false, injected: false, detail: null, decision: { leftHeadroom: null, leftRecoveryAt: null, leftTrigger: null },
+      outgoingKind: null, bindingJson: null, step: 6, stagedBlobService: 'qlb:anthropic:staged-rollback:fixture',
+      stagedAccount: 'qlb', stagedWritten: false, keychainService: paths.keychainService, configPath: paths.globalConfigPath,
+      configText: null, configWrittenHash: null, fromOauthAccount: null, credentialsWrittenHash: null,
+      credentialsWriteStarted: false, credentialsWritten: false, configWriteStarted: false, configWritten: false,
+      closed: null, startedAt: 1, owner: { pid: 999_999, lstart: 'dead fixture owner' },
+    };
     mkdirSync(join(orphan, '..'), { recursive: true });
-    writeFileSync(orphan, '{"orphaned":true}\n');
+    writeFileSync(orphan, `${JSON.stringify(journal)}\n`);
+    writeFileSync(`${config.dbPath}-wal`, 'fixture WAL without shared memory');
+    assert.equal(existsSync(`${config.dbPath}-shm`), false);
     const probe = join(root, 'fetch-probe.cjs');
     const called = join(root, 'fetch-called');
     writeFileSync(probe, `const fs = require('node:fs'); global.fetch = () => { fs.writeFileSync(${JSON.stringify(called)}, 'called'); throw new Error('fetch must not run'); };\n`);
@@ -132,10 +151,90 @@ describe('qlb auto --once (G12)', () => {
       assert.equal(Array.isArray(receipt.decisions), true);
       assert.deepEqual(receipt.executed, []);
       assert.equal(existsSync(called), false, 'dry run must not make an HTTP request');
+      assert.equal(existsSync(`${config.dbPath}-shm`), false, 'partial WAL state must use immutable mode');
       assert.deepEqual(snapshot(home), before, 'dry run must not create, change, or remove a QLB_HOME file');
     } finally {
       close(root);
     }
+  });
+
+  it('dry run never reconciles an unfinished journal', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-auto-dry-no-reconcile-'));
+    const home = join(root, 'home');
+    const env = testEnv(home);
+    const paths = claudePaths({ home, env });
+    const journalPath = claudeSwitchJournalPath({ home });
+    const journal: ClaudeSwitchJournal = {
+      v: 1, provider: 'anthropic', attemptId: 'dry-orphan-fixture', from: 'from', to: 'to', trigger: 'auto', by: 'fixture',
+      republish: false, injected: false, detail: null, decision: { leftHeadroom: null, leftRecoveryAt: null, leftTrigger: null },
+      outgoingKind: null, bindingJson: null, step: 6, stagedBlobService: 'qlb:anthropic:staged-rollback:dry-fixture',
+      stagedAccount: 'qlb', stagedWritten: false, keychainService: paths.keychainService, configPath: paths.globalConfigPath,
+      configText: null, configWrittenHash: null, fromOauthAccount: null, credentialsWrittenHash: null,
+      credentialsWriteStarted: false, credentialsWritten: false, configWriteStarted: false, configWritten: false,
+      closed: null, startedAt: 1, owner: { pid: 999_999, lstart: 'dead fixture owner' },
+    };
+    createClaudeSwitchJournal(journal, { home, env, configPath: paths.globalConfigPath, keychainService: paths.keychainService });
+    const deps: ClaudeSwitchDeps = {
+      store: { findClaudeSwitchByAttempt: () => null, recordSwitch: () => 1 } as unknown as ClaudeSwitchDeps['store'],
+      slots: {} as ClaudeSwitchDeps['slots'], live: { backend: new MockKeychain(), paths, account: 'fixture' },
+      readConfig: () => ({}), resolveProfile: async () => null,
+      consume: { postRefresh: async () => ({ status: 500, body: '' }) }, cswapProcesses: () => [], env, home,
+      now: () => 1, by: 'qlb-auto', attempt: 'fixture', stillTheSameProcess: async () => false,
+    };
+    try {
+      const output = await runAuto({ once: true, dryRun: true }, {
+        makeDryBinding: () => ({
+          close: () => {}, admit: () => ({ ok: true }), reconcile: () => reconcileClaudeSwitch(deps),
+          tick: async () => ({ decision: { kind: 'stay', reason: 'unknown', unhealthyTicks: 0 } }),
+        }),
+        log: () => {},
+      });
+      assert.equal(output.ticks, 1);
+      assert.equal(existsSync(journalPath), true, 'dry run must not reconcile an unfinished journal');
+    } finally {
+      close(root);
+    }
+  });
+
+  it('isolates the shared flock helper from a fcntl.py in the caller cwd', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-auto-flock-isolated-'));
+    const home = join(root, 'home');
+    const cwd = join(root, 'caller');
+    const marker = join(root, 'planted-fcntl-ran');
+    mkdirSync(cwd, { recursive: true });
+    writeFileSync(join(cwd, 'fcntl.py'), `from pathlib import Path\nPath(${JSON.stringify(marker)}).write_text('ran')\n`);
+    const config = defaultConfig(home);
+    const store = openStore(config.dbPath);
+    beginCutover(store, 1);
+    assert.equal(transition(store, 'cutover', 2).ok, true);
+    store.close();
+    try {
+      const result = await collect(start(['auto', '--once'], testEnv(home), cwd));
+      assert.equal(result.code, 0, result.stderr);
+      assert.equal(existsSync(marker), false, 'the planted fcntl module must not run');
+    } finally {
+      close(root);
+    }
+  });
+
+  it('stops after the current tick when the held lock helper disappears', async () => {
+    let loseLock: (error: Error) => void = () => {};
+    const lost = new Promise<Error>((resolve) => { loseLock = resolve; });
+    let ticks = 0;
+    await assert.rejects(runAuto({}, {
+      stopWhen: lost,
+      makeLiveBinding: () => ({
+        store: { setConfig: () => {} }, close: () => {}, reconcile: async () => {}, poll: async () => [],
+        tick: async () => {
+          loseLock(new Error('fcntl flock helper exited unexpectedly (SIGTERM)'));
+          await Promise.resolve();
+          ticks += 1;
+          return { decision: { kind: 'stay', reason: 'unknown', unhealthyTicks: 0 } };
+        },
+      }),
+      assertAdmitted: () => ({ ok: true }), listCswapProcesses: () => [], log: () => {},
+    }), /flock helper exited unexpectedly/);
+    assert.equal(ticks, 1, 'the in-flight tick completes before the loop stops');
   });
 
   it('no token-shaped string reaches stdout or stderr', async () => {

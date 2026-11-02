@@ -76,6 +76,8 @@ export interface AutoDependencies {
   setTimeout?: (callback: () => void, ms: number) => ReturnType<typeof setTimeout>;
   clearTimeout?: (timer: ReturnType<typeof setTimeout>) => void;
   signals?: { on(signal: 'SIGTERM', listener: () => void): unknown; removeListener(signal: 'SIGTERM', listener: () => void): unknown };
+  /** Stops the loop after its current tick when an owned external resource is lost. */
+  stopWhen?: Promise<Error>;
 }
 
 function redactedLog(log: (line: string) => void, line: string): void {
@@ -235,10 +237,10 @@ function readOnlySlots(db: DatabaseSync): Pick<ClaudeSlots, 'listSlots'> {
 }
 
 function productionDryBinding(config: QlbConfig, now: () => number): DryBinding {
-  // SQLite may create -wal/-shm sidecars even for a read-only open.  A live
-  // WAL must remain visible, but an immutable URI avoids creating sidecars
-  // when there is no WAL to read.
-  const connectionPath = existsSync(`${config.dbPath}-wal`)
+  // SQLite may create -wal/-shm sidecars even for a read-only open. A live
+  // WAL is readable only with its shared-memory companion; otherwise immutable
+  // mode avoids creating the missing sidecar.
+  const connectionPath = existsSync(`${config.dbPath}-wal`) && existsSync(`${config.dbPath}-shm`)
     ? config.dbPath
     : `${pathToFileURL(config.dbPath).href}?immutable=1`;
   const db = openStoreConnection(connectionPath, true);
@@ -290,6 +292,11 @@ export async function runAuto(options: RunAutoOptions = {}, dependencies: AutoDe
       wakeSleep = undefined;
     }
   };
+  let stopError: Error | undefined;
+  dependencies.stopWhen?.then((error) => {
+    stopError = error;
+    onTerm();
+  });
   const signals = dependencies.signals ?? process;
   signals.on('SIGTERM', onTerm);
   try {
@@ -327,6 +334,7 @@ export async function runAuto(options: RunAutoOptions = {}, dependencies: AutoDe
         }, INTERVAL_MS) as ReturnType<typeof setTimeout>;
       });
     } while (!stopping);
+    if (stopError !== undefined) throw stopError;
     return result;
   } finally {
     signals.removeListener('SIGTERM', onTerm);
