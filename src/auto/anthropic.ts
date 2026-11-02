@@ -372,7 +372,9 @@ function persistTickState(store: Store, input: AutoswitchInput, decision: Autosw
   // change/switch.
   const idleHoldSince = decision.kind === 'stay'
     ? decision.idleHoldSinceMs ?? (input.activeCredentialExpired ? input.idleHoldSinceMs ?? undefined : undefined)
-    : undefined;
+    : decision.kind === 'switch' && !switched
+      ? input.idleHoldSinceMs ?? undefined
+      : undefined;
   const health = decision.unhealthyTicks > 0 || idleHoldSince !== undefined;
   const { activeAccountId, nowMs } = input;
   if (health && activeAccountId !== null) {
@@ -386,12 +388,11 @@ function persistTickState(store: Store, input: AutoswitchInput, decision: Autosw
 
   if (decision.kind === 'parked') {
     setOrDelete(store, `${AUTO_PREFIX}parkedUntil`, decision.parkedUntilMs);
-  } else if (decision.kind === 'switch') {
+  } else if (decision.kind === 'switch' && decision.reason === 'parked' && !switched) {
     // A failed parked operation has not consumed this reset; retaining the
     // prior value makes the engine retry it on the next tick.
-    if (switched) setOrDelete(store, `${AUTO_PREFIX}parkedUntil`, decision.parkedUntilMs);
   } else {
-    setOrDelete(store, `${AUTO_PREFIX}parkedUntil`, undefined);
+    setOrDelete(store, `${AUTO_PREFIX}parkedUntil`, decision.kind === 'switch' && switched ? decision.parkedUntilMs : undefined);
   }
   const suspendedUntil = decision.kind === 'stay' ? decision.suspendedUntilMs : undefined;
   if (suspendedUntil !== undefined) store.setConfig(`${AUTO_PREFIX}suspendedUntil`, String(suspendedUntil));

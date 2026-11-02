@@ -139,8 +139,10 @@ describe('autoswitch loop (G9)', () => {
     assert.equal(f.store.getConfig('auto.anthropic.lastSwitchAt'), null);
   });
 
-  it('a refused parked switch stays and retries next tick', async () => {
+  it('a failed parked switch keeps its previous marker and retries next tick', async () => {
     const f = await fixture([100, 100], [20, 10]);
+    const previous = NOW + 5 * 60_000;
+    f.store.setConfig('auto.anthropic.parkedUntil', String(previous));
     let calls = 0;
     const deps = tickDeps(f, async () => { calls += 1; return result('refused'); });
     const first = await anthropicTick(deps);
@@ -148,10 +150,35 @@ describe('autoswitch loop (G9)', () => {
     assert.equal(first.decision.kind === 'switch' ? first.decision.reason : null, 'parked');
     assert.equal(second.decision.kind === 'switch' ? second.decision.reason : null, 'parked');
     assert.equal(calls, 2);
-    assert.equal(f.store.getConfig('auto.anthropic.parkedUntil'), null);
+    assert.equal(f.store.getConfig('auto.anthropic.parkedUntil'), String(previous));
   });
 
-  it('keeps an expired active credential hold through unknown ticks then fails over exactly once', async () => {
+  it('clears a parked marker after a failed non-parked switch so its reset account can be selected', async () => {
+    const f = await fixture([100, 10], [20, 10]);
+    const parkedUntil = NOW + 10 * 60_000;
+    f.store.setConfig('auto.anthropic.parkedUntil', String(parkedUntil));
+    const accounts: AutoswitchAccount[] = [
+      { accountId: '1', buckets: { '5h': { usedPct: 100, resetAt: NOW + 20 * 60_000 } }, slotNum: 1 },
+      { accountId: '2', buckets: { '5h': { usedPct: 10, resetAt: parkedUntil } }, slotNum: 2 },
+    ];
+    let calls = 0;
+    const deps = tickDeps(f, async () => {
+      calls += 1;
+      return calls === 1 ? result('refused') : result('ok');
+    }, { accounts });
+
+    const failed = await anthropicTick(deps);
+    assert.equal(failed.decision.kind === 'switch' ? failed.decision.reason : null, 'at-limit');
+    assert.equal(f.store.getConfig('auto.anthropic.parkedUntil'), '');
+
+    accounts[1].buckets['5h'].usedPct = 100;
+    const parked = await anthropicTick(deps);
+    assert.equal(parked.decision.kind === 'switch' ? parked.decision.reason : null, 'parked');
+    assert.equal(parked.decision.kind === 'switch' ? parked.decision.targetId : null, '2');
+    assert.equal(calls, 2);
+  });
+
+  it('retries an expired active credential failover on the next tick after one refusal', async () => {
     const f = await fixture([10, 20]);
     let clock = NOW;
     const accounts: AutoswitchAccount[] = [
@@ -159,18 +186,20 @@ describe('autoswitch loop (G9)', () => {
       { accountId: '2', buckets: { '5h': { usedPct: 20 } }, slotNum: 2 },
     ];
     f.store.recordUsagePollResult('anthropic', '1', { attemptedAt: Math.floor(clock / 1000), status: 'token-expired' });
-    let calls = 0;
+    const attempts: number[] = [];
     const deps = tickDeps(f, async (_deps, input) => {
-      calls += 1;
-      return switchRow(f.store, { from: '1', to: input.to, trigger: input.trigger, now: clock });
+      attempts.push(clock);
+      return attempts.length === 1
+        ? result('refused')
+        : switchRow(f.store, { from: '1', to: input.to, trigger: input.trigger, now: clock });
     }, { now: () => clock, accounts });
 
-    for (let tick = 0; tick < 33; tick += 1) {
+    for (let tick = 0; tick < 34; tick += 1) {
       const output = await anthropicTick(deps);
       if (tick < 32) assert.notEqual(output.decision.kind, 'switch', `tick ${tick}`);
       clock += 60_000;
     }
-    assert.equal(calls, 1);
+    assert.deepEqual(attempts, [NOW + 32 * 60_000, NOW + 33 * 60_000]);
     assert.equal(f.store.getConfig('auto.anthropic.idleHoldSince'), '');
   });
 
