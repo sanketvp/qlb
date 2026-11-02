@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { performance } from 'node:perf_hooks';
 import { DatabaseSync } from 'node:sqlite';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
@@ -14,7 +15,7 @@ import {
   type CodexActiveDeps,
 } from '../src/codex-active';
 import { codexAuthFileSha256, codexAuthFileText, codexFingerprint, readCodexAuthStableWithStat, type CodexAuthDocument } from '../src/codex-auth';
-import { importActiveCodexSlot } from '../src/codex-slots';
+import { CodexSlots, CodexStashUnverifiable, importActiveCodexSlot } from '../src/codex-slots';
 import { MockKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from '../src/keychain';
 import { readCodexSwitchHistory, type CodexProcess } from '../src/codex-sessions';
 import { openStore } from '../src/store';
@@ -527,20 +528,80 @@ describe('codex active refresh helpers', () => {
 
       const assertContendedTimeout = async (lock: string, expectedMs: number) => {
         mkdirSync(lock, { recursive: true });
-        const started = performance.now();
-        const result = await reconcileActiveCodexLive(h.deps);
-        const elapsed = performance.now() - started;
-        rmSync(lock, { recursive: true, force: true });
-        assert.deepEqual(result, { status: 'deferred', reason: 'locks-held' });
-        assert.ok(elapsed >= expectedMs - 20 && elapsed < expectedMs + 400,
-          `lock timeout was ${Math.round(elapsed)}ms, expected ${expectedMs}ms`);
+        const originalMkdir = fsSpy.mkdir;
+        const originalNow = performance.now;
+        let attempts = 0;
+        let clock = 0;
+        fsSpy.mkdir = async (...args) => {
+          if (args[0] === lock) {
+            attempts += 1;
+            // A correct timeout gets one retry (expectedMs - 1, then expectedMs + 1).
+            // A smaller timeout fails on the first attempt; an omitted timeout reaches
+            // the third clock value, which is beyond the 10 s default.
+            clock = [expectedMs - 1, expectedMs + 1, 10_001][Math.min(attempts - 1, 2)];
+          }
+          return originalMkdir(...args);
+        };
+        performance.now = () => clock;
+        try {
+          assert.deepEqual(await reconcileActiveCodexLive(h.deps), { status: 'deferred', reason: 'locks-held' });
+        } finally {
+          performance.now = originalNow;
+          fsSpy.mkdir = originalMkdir;
+          rmSync(lock, { recursive: true, force: true });
+        }
+        assert.equal(attempts, 2, `${lock} did not receive timeoutMs=${expectedMs}`);
       };
       await assertContendedTimeout(locks.consume, 80);
       await assertContendedTimeout(locks.switch, 80);
       await assertContendedTimeout(locks.auth, 80);
-
       h.deps.lockTimeoutMs = undefined;
       await assertContendedTimeout(locks.auth, 40);
+    } finally { h.close(); }
+  });
+
+  it('a process-list failure while attributing a settled external document is refused', async () => {
+    const h = activeHarness();
+    try {
+      const a1 = { ...document(NOW + 120_000, 'fixture-access-a1'), tokens: {
+        ...document(NOW + 120_000, 'fixture-access-a1').tokens, refresh_token: 'fixture-refresh-a1',
+      } };
+      const rewrite = { ...a1, last_refresh: '2026-10-31T12:00:00.000Z' };
+      importActiveCodexSlot(a1, { store: h.store, keychain: h.keychain, now: () => NOW + 1 });
+      let reads = 0;
+      const readLive = h.deps.readLive;
+      h.deps.readLive = async () => ++reads === 3
+        ? { status: 'ok' as const, doc: rewrite, sha256: codexAuthFileSha256(codexAuthFileText(rewrite)), inode: 999 }
+        : readLive();
+      let lists = 0;
+      h.deps.list = async () => {
+        if (++lists === 5) throw new Error('fixture process listing unavailable');
+        return [];
+      };
+      assert.deepEqual(await reconcileActiveCodexLive(h.deps), { status: 'refused', reason: 'codex-process-check-failed' });
+      assert.equal(lists, 5);
+    } finally { h.close(); }
+  });
+
+  it('an unverifiable stash after a settled external document is refused without clearing ownership', async () => {
+    const h = activeHarness();
+    try {
+      const a1 = { ...document(NOW + 120_000, 'fixture-access-a1'), tokens: {
+        ...document(NOW + 120_000, 'fixture-access-a1').tokens, refresh_token: 'fixture-refresh-a1',
+      } };
+      const c0 = { ...document(NOW + 60_000, 'fixture-access-c0'), tokens: {
+        ...document(NOW + 60_000, 'fixture-access-c0').tokens,
+        id_token: jwt({ 'https://api.openai.com/auth': { chatgpt_user_id: 'user-c', chatgpt_account_id: 'account-c' } }), account_id: 'account-c',
+      } };
+      importActiveCodexSlot(a1, { store: h.store, keychain: h.keychain, now: () => NOW + 1 });
+      h.deps.slots = { ...h.deps.slots, ensureUnclaimedStash: async () => { throw new CodexStashUnverifiable(); } } as never;
+      let reads = 0;
+      const readLive = h.deps.readLive;
+      h.deps.readLive = async () => ++reads === 3
+        ? { status: 'ok' as const, doc: c0, sha256: codexAuthFileSha256(codexAuthFileText(c0)), inode: 999 }
+        : readLive();
+      assert.deepEqual(await reconcileActiveCodexLive(h.deps), { status: 'refused', reason: 'stash-unverifiable' });
+      assert.equal(h.store.getCodexActiveLogin(), A);
     } finally { h.close(); }
   });
 
@@ -665,15 +726,31 @@ describe('codex active refresh helpers', () => {
         id_token: jwt({ 'https://api.openai.com/auth': { chatgpt_user_id: 'user-c', chatgpt_account_id: 'account-c' } }),
         account_id: 'account-c',
       } };
+      tokenValues.push(unknown.tokens.id_token);
+      const stashDir = join(h.root, 'stash');
+      const stashKeychain = {
+        getSync: h.keychain.getSync.bind(h.keychain),
+        setSync: (service: string, account: string, value: string) => {
+          if (service.includes(':unclaimed:')) throw new Error('fixture forces a file-backed stash');
+          h.keychain.setSync(service, account, value);
+        },
+        deleteSync: h.keychain.deleteSync.bind(h.keychain),
+      };
+      const slots = new CodexSlots({ keychain: stashKeychain, stashDir });
+      const ensureUnclaimedStash = slots.ensureUnclaimedStash.bind(slots);
       let stashPath: string | undefined;
-      h.deps.slots = { ...h.deps.slots, ensureUnclaimedStash: async (doc: CodexAuthDocument) => {
-        stashPath = join(h.root, `stash-${codexFingerprint(doc)}`);
-        return { stashId: 'fixture-stash', created: true };
-      } } as never;
+      slots.ensureUnclaimedStash = async (doc, now) => {
+        const result = await ensureUnclaimedStash(doc, now);
+        stashPath = join(stashDir, `${result.stashId}.json`);
+        return result;
+      };
+      h.deps.slots = slots as never;
       writeFileSync(h.authPath, JSON.stringify(unknown));
       const refused = await reconcileActiveCodexLive(h.deps);
       assert.deepEqual(refused, { status: 'refused', reason: 'unknown-live-identity' });
       assertRedacted(refused);
+      assert.ok(stashPath);
+      assert.equal(existsSync(stashPath), true);
       assertRedacted(stashPath);
 
       h.store.setActiveLogin('openai-codex', A, 'import', NOW);
@@ -695,11 +772,11 @@ describe('codex active refresh helpers', () => {
 
       const throwing = activeHarness();
       try {
-        throwing.deps.slots = { ...throwing.deps.slots, readSlot: () => {
-          throw new Error('fixture slot read failure');
-        } } as never;
-        await assert.rejects(reconcileActiveCodexLive(throwing.deps), (error: unknown) => {
-          assertRedacted(error instanceof Error ? error.message : String(error));
+        await assert.rejects(listOrFail(async () => {
+          throw new Error(throwing.a0.tokens.access_token);
+        })(), (error: unknown) => {
+          assert.ok(error instanceof CodexProcessCheckFailed);
+          assertRedacted(error.message);
           return true;
         });
       } finally { throwing.close(); }
