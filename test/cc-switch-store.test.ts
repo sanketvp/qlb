@@ -159,8 +159,12 @@ describe('Claude switch commit primitive', () => {
         'auto.anthropic.leftTrigger': 'old-trigger',
       };
       for (const [key, value] of Object.entries(seeded)) store.setConfig(key, value);
+      store.setActiveLogin('anthropic', 'to', 'manual', 900);
+      db(store).prepare('UPDATE claude_slots SET last_active_at = ? WHERE account_id = ?').run(800, 'to');
       store.commitClaudeSwitch(input({ fromAccount: 'to', toAccount: 'to', republish: true, detail: 'not-used' }));
       for (const [key, value] of Object.entries(seeded)) assert.equal(store.getConfig(key), value, key);
+      assert.deepEqual(store.getActiveLogin('anthropic'), { provider: 'anthropic', accountId: 'to', since: 900, setBy: 'manual' });
+      assert.equal((db(store).prepare("SELECT last_active_at FROM claude_slots WHERE account_id = 'to'").get() as { last_active_at: number }).last_active_at, 800);
       assert.deepEqual(
         { ...(db(store).prepare('SELECT from_account, to_account, detail FROM switch_log').get() as object) },
         { from_account: 'to', to_account: 'to', detail: 'republish' },

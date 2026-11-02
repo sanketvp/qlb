@@ -302,7 +302,7 @@ describe('codex auth.json helpers', () => {
         })), 'utf8');
         const result = spawnSync(process.execPath, ['--disable-warning=ExperimentalWarning', join(__dirname, '..', 'src', 'cli.js'), 'codex', 'probe-claims', '--json'], {
           encoding: 'utf8',
-          env: { ...process.env, CODEX_HOME: codexHome, HOME: codexHome },
+          env: { CODEX_HOME: codexHome, HOME: codexHome, QLB_HOME: codexHome, QLB_TEST_MODE: '1' },
         });
         assert.equal(result.error, undefined);
         assert.equal(result.status, 0, result.stderr);
@@ -316,6 +316,58 @@ describe('codex auth.json helpers', () => {
       }
     } finally {
       await rm(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  it('fails loudly on missing, unreadable, and unstable auth files; uses the configured path; has help but no alias', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'qlb-codex-probe-'));
+    const qlbHome = join(root, 'qlb');
+    const run = (args: string[], env: NodeJS.ProcessEnv = {}) => spawnSync(
+      process.execPath,
+      ['--disable-warning=ExperimentalWarning', join(__dirname, '..', 'src', 'cli.js'), ...args],
+      { encoding: 'utf8', env: { HOME: qlbHome, QLB_HOME: qlbHome, QLB_TEST_MODE: '1', ...env } },
+    );
+    try {
+      const configuredPath = join(root, 'configured-auth.json');
+      await writeFile(configuredPath, JSON.stringify(validDocument({
+        tokens: {
+          id_token: jwt({ auth_time: 1_710_000_000 }),
+          access_token: jwt({ exp: 2_000_000_000 }),
+          refresh_token: 'test-refresh-token',
+        },
+      })), 'utf8');
+      const configured = run(['codex', 'probe-claims', '--json'], { QLB_CODEX_AUTH_JSON_PATH: configuredPath });
+      assert.equal(configured.status, 0, configured.stderr);
+      assert.equal(configured.stdout, '{"claimNames":["auth_time"],"hasAuthTime":true}\n');
+      assert.equal(configured.stderr, '');
+
+      const cases: Array<{ name: string; setup: (authPath: string) => Promise<void> }> = [
+        { name: 'missing', setup: async () => {} },
+        { name: 'unreadable', setup: async (authPath) => { await mkdir(authPath, { recursive: true }); } },
+        { name: 'unstable', setup: async (authPath) => { await mkdir(join(authPath, '..'), { recursive: true }); await writeFile(authPath, '{', 'utf8'); } },
+      ];
+      for (const fixture of cases) {
+        const codexHome = join(root, fixture.name);
+        const authPath = join(codexHome, 'auth.json');
+        await fixture.setup(authPath);
+        const result = run(['codex', 'probe-claims', '--json'], { CODEX_HOME: codexHome });
+        assert.equal(result.status, 1, `${fixture.name}: ${result.stderr}`);
+        assert.equal(result.stdout, '', `${fixture.name} must not emit a false probe result`);
+        assert.match(result.stderr, new RegExp(`error: auth file (?:is )?${fixture.name}`));
+        assert.equal(result.stderr.includes('hasAuthTime'), false);
+      }
+
+      const help = run(['codex', 'probe-claims', '--help']);
+      assert.equal(help.status, 0, help.stderr);
+      assert.equal(help.stderr, '');
+      assert.match(help.stdout, /qlb codex probe-claims/);
+
+      const alias = run(['codex-probe-claims', '--json'], { QLB_CODEX_AUTH_JSON_PATH: configuredPath });
+      assert.equal(alias.status, 1);
+      assert.equal(alias.stdout, '');
+      assert.match(alias.stderr, /codex-probe-claims is not a command/);
+    } finally {
+      await rm(root, { recursive: true, force: true });
     }
   });
 

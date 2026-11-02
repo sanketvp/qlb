@@ -1522,8 +1522,11 @@ describe('Codex switch journal v2', () => {
       const fresh = await probeCodexSwitchJournal(h.options);
       assert.equal(fresh.state, 'owner-lock-not-yet-stale');
       if (fresh.state === 'owner-lock-not-yet-stale') assert.ok(fresh.retryAt > Date.now());
-      utimesSync(codexSwitchJournalOwnerLockPath(h.options), new Date(Date.now() - 300_001), new Date(Date.now() - 300_001));
-      assert.equal((await probeCodexSwitchJournal(h.options)).state, 'orphaned');
+      utimesSync(codexSwitchJournalOwnerLockPath(h.options), new Date(Date.now() - 301_000), new Date(Date.now() - 301_000));
+      // The fresh assertion above deliberately has a short refusal budget. A
+      // stale takeover needs time for its async mkdir → stat → sidecar protocol,
+      // which CPU contention can delay beyond that budget before it inspects mtime.
+      assert.equal((await probeCodexSwitchJournal({ ...h.options, ownerLockTimeoutMs: 30_000 })).state, 'orphaned');
     } finally { executingCodexAttempts.clear(); rmSync(h.root, { recursive: true, force: true }); }
   });
 
@@ -1532,8 +1535,10 @@ describe('Codex switch journal v2', () => {
     try {
       writeCodexSwitchJournal(journalFixture(h.root), h.options);
       mkdirSync(codexSwitchJournalOwnerLockPath(h.options), { recursive: true });
-      utimesSync(codexSwitchJournalOwnerLockPath(h.options), new Date(Date.now() - 300_001), new Date(Date.now() - 300_001));
-      assert.equal((await probeCodexSwitchJournal(h.options)).state, 'orphaned');
+      utimesSync(codexSwitchJournalOwnerLockPath(h.options), new Date(Date.now() - 301_000), new Date(Date.now() - 301_000));
+      // This is a takeover deadline, not the fresh-lock refusal budget used by
+      // journalHarness: it must cover the async stale-lock inspection under load.
+      assert.equal((await probeCodexSwitchJournal({ ...h.options, ownerLockTimeoutMs: 30_000 })).state, 'orphaned');
     } finally { executingCodexAttempts.clear(); rmSync(h.root, { recursive: true, force: true }); }
   });
 

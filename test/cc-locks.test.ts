@@ -327,9 +327,13 @@ describe('Claude Code proper-lockfile locks', () => {
     let lockRemovals = 0;
     let inside = 0;
     let mostInside = 0;
+    let secondWaiterBlocked = false;
     try {
       await mkdir(lock, { recursive: true });
-      const old = new Date(Date.now() - 200);
+      // Leave ample lease time once the first contender owns the replacement:
+      // under CPU contention, a 100ms lease can expire before the other waiter
+      // receives its scheduled EEXIST retry.
+      const old = new Date(Date.now() - 120_000);
       await utimes(lock, old, old);
 
       // Force #420's interleaving: both waiters see the dead directory, then the
@@ -344,9 +348,14 @@ describe('Claude Code proper-lockfile locks', () => {
         return result;
       };
       fsPromises.mkdir = async (...args: any[]) => {
-        const result = await originalMkdir(...args);
-        if (String(args[0]) === lock) releaseRetaken();
-        return result;
+        try {
+          const result = await originalMkdir(...args);
+          if (String(args[0]) === lock) releaseRetaken();
+          return result;
+        } catch (error) {
+          if (String(args[0]) === lock && inside === 1) secondWaiterBlocked = true;
+          throw error;
+        }
       };
       fsPromises.rmdir = async (...args: any[]) => {
         if (String(args[0]) === lock && ++lockRemovals === 2) await retaken;
@@ -355,12 +364,18 @@ describe('Claude Code proper-lockfile locks', () => {
 
       await Promise.all([0, 1].map(() => withProperLockfile(
         lock,
-        { stalenessMs: 100, timeoutMs: 2_000, retryMinMs: 5, retryJitterMs: 0 },
+        { stalenessMs: 60_000, timeoutMs: 30_000, retryMinMs: 5, retryJitterMs: 0 },
         async () => {
           inside += 1;
           mostInside = Math.max(mostInside, inside);
-          await sleep(100);
-          inside -= 1;
+          try {
+            // Hold the winner until the other contender has actually observed it.
+            // This barrier exercises contention without a sleep that can overrun
+            // the deliberately short stale lease under CPU load.
+            await waitFor(() => secondWaiterBlocked, 30_000, 'second stale-lock waiter to block');
+          } finally {
+            inside -= 1;
+          }
         },
       )));
       assert.equal(mostInside, 1, 'only one waiter may hold a taken-over lock at once');
@@ -415,22 +430,31 @@ describe('Claude Code proper-lockfile locks', () => {
   it('touches and releases a replacement lock by pathname, matching upstream', async () => {
     const home = await tempHome();
     const lock = join(home, 'replacement.lock');
+    const fsPromises = require('node:fs/promises') as Record<string, (...args: any[]) => Promise<any>>;
+    const originalUtimes = fsPromises.utimes;
+    let replacementTouched = false;
     try {
+      fsPromises.utimes = async (...args: any[]) => {
+        const result = await originalUtimes(...args);
+        if (String(args[0]) === lock) replacementTouched = true;
+        return result;
+      };
       await withProperLockfile(lock, { touchIntervalMs: 10 }, async () => {
         await rm(lock, { recursive: true });
         await mkdir(join(home, 'spacer'));
         await mkdir(lock);
         const old = new Date(Date.now() - 60_000);
         await utimes(lock, old, old);
+        replacementTouched = false;
         const replacementMtime = (await stat(lock)).mtimeMs;
-        const deadline = Date.now() + 2_000;
-        while ((await stat(lock)).mtimeMs <= replacementMtime && Date.now() < deadline) {
-          await sleep(10);
-        }
+        // Observe the actual pathname touch instead of requiring a 10ms timer to
+        // run inside a fixed two-second wall-clock window under CPU saturation.
+        await waitFor(() => replacementTouched, 30_000, 'replacement lock pathname touch');
         assert.ok((await stat(lock)).mtimeMs > replacementMtime, 'upstream toucher refreshes by pathname');
       });
       assert.equal(existsSync(lock), false, 'upstream release removes by pathname');
     } finally {
+      fsPromises.utimes = originalUtimes;
       await rm(home, { recursive: true, force: true });
     }
   });
