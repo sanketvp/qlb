@@ -106,7 +106,7 @@ describe('keychain check-launchd --live (K5b-2)', () => {
     try {
       const receipt = { ...OK_RECEIPT, outcome: 'rolled-back' as const, error: 'keychain-write-failed', steps: { failedStep: 7 } };
       assert.equal(await runKeychainCommand(['check-launchd', '--live'], f.context, liveDeps(receipt)), 1);
-      assert.match(f.output.join('\n'), /run `qlb keychain authorize` in a GUI session, then retry/);
+      assert.match(f.output.join('\n'), /read once in a GUI session with the password and Always Allow, then retry/);
       assert.equal(await runKeychainCommand(['check-launchd', '--live', '--json'], f.context, liveDeps(receipt)), 1);
       assert.deepEqual(JSON.parse(f.output[1]!), {
         command: 'check-launchd --live', liveItemsAuthorized: false, reason: 'launchd-write-not-authorized',
