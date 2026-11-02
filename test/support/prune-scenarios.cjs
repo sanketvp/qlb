@@ -269,7 +269,9 @@ async function createWriterFixture(kind) {
         },
       }],
     }));
-    migration = new Migration(store, keychain, nativePath, ownerPath);
+    // Pool publication runs under the Pi auth lock beside auth.json (P7b8), so the
+    // fixture gives the pool its own temp auth.json, as test/migration.test.ts does.
+    migration = new Migration(store, keychain, nativePath, ownerPath, undefined, { authJsonPath: path.join(dir, 'auth.json') });
     account = 'victim';
   } else if (kind === 'single-grant') {
     const nativePath = path.join(dir, 'auth.json');
