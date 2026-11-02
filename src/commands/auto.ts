@@ -1,4 +1,4 @@
-import { chmodSync, closeSync, existsSync, mkdirSync, openSync } from 'node:fs';
+import { chmodSync, closeSync, mkdirSync, openSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
 import { AutoAdmissionRefused, runAuto, type AutoDependencies, type AutoRunResult, type RunAutoOptions } from '../auto';
@@ -7,7 +7,7 @@ import { productionTryAcquireLock, type CswapLockRelease } from '../cswap-agent'
 import { atomicWriteText } from '../fsutil';
 import type { CommandContext, CommandDefinition } from '../registry';
 
-type AutoCommandOptions = RunAutoOptions & { json: boolean; agent: boolean };
+type AutoCommandOptions = RunAutoOptions & { json: boolean };
 
 export interface AutoCommandDeps {
   runAuto: (options: RunAutoOptions, dependencies: AutoDependencies) => Promise<AutoRunResult>;
@@ -17,10 +17,10 @@ export interface AutoCommandDeps {
 const defaultDeps: AutoCommandDeps = { runAuto, acquireFlock: productionTryAcquireLock };
 
 function parse(args: string[]): AutoCommandOptions | null {
-  const known = new Set(['--once', '--dry-run', '--json', '--agent']);
+  const known = new Set(['--once', '--dry-run', '--json']);
   if (args.some((arg) => !known.has(arg)) || new Set(args).size !== args.length) return null;
   return {
-    once: args.includes('--once'), dryRun: args.includes('--dry-run'), json: args.includes('--json'), agent: args.includes('--agent'),
+    once: args.includes('--once'), dryRun: args.includes('--dry-run'), json: args.includes('--json'),
   };
 }
 
@@ -44,7 +44,6 @@ export function renderAutoLaunchAgent(nodePath: string, home: string, cliPath: s
     <string>${xmlText(nodePath)}</string>
     <string>${xmlText(cliPath)}</string>
     <string>auto</string>
-    <string>--agent</string>
   </array>
   <key>RunAtLoad</key>
   <true/>
@@ -82,7 +81,13 @@ function installAutoLaunchAgent(ctx: CommandContext): string {
   mkdirSync(dirname(target), { recursive: true, mode: 0o700 });
   mkdirSync(qlbDir, { recursive: true, mode: 0o700 });
   chmodSync(qlbDir, 0o700);
-  if (!existsSync(logPath)) closeSync(openSync(logPath, 'wx', 0o600));
+  try {
+    closeSync(openSync(logPath, 'a', 0o600));
+    chmodSync(logPath, 0o600);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`unable to secure auto.log: ${detail}`);
+  }
   atomicWriteText(target, renderAutoLaunchAgent(process.execPath, home, cliPath), { mode: 0o600 });
   return target;
 }
@@ -93,7 +98,7 @@ function receipt(result: AutoRunResult, json: boolean): string {
     : `ticks=${result.ticks} decisions=${JSON.stringify(result.decisions)} executed=${JSON.stringify(result.executed)}`;
 }
 
-/** `qlb auto [--once] [--dry-run] [--json] [--agent]` runs the loop; `install-agent` installs its LaunchAgent. */
+/** `qlb auto [--once] [--dry-run] [--json]` runs the loop; `install-agent` installs its LaunchAgent. */
 export async function runAutoCommand(
   args: string[],
   ctx: CommandContext,
@@ -108,14 +113,20 @@ export async function runAutoCommand(
       ctx.stderr('qlb auto install-agent: QLB_HOME is required when QLB_TEST_MODE=1');
       return 2;
     }
-    const target = installAutoLaunchAgent(ctx);
-    ctx.stdout(`installed ${target}`);
-    return 0;
+    try {
+      const target = installAutoLaunchAgent(ctx);
+      ctx.stdout(`installed ${target}`);
+      return 0;
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      ctx.stderr(`qlb auto install-agent: ${detail}`);
+      return 1;
+    }
   }
 
   const options = parse(args);
   if (!options) {
-    ctx.stderr('usage: qlb auto [--once] [--dry-run] [--json] [--agent] | qlb auto install-agent');
+    ctx.stderr('usage: qlb auto [--once] [--dry-run] [--json] | qlb auto install-agent');
     return 2;
   }
 
@@ -124,7 +135,7 @@ export async function runAutoCommand(
   const lease = options.dryRun ? null : await deps.acquireFlock(lockPath);
   if (!options.dryRun && lease === null) {
     ctx.stderr('qlb auto: auto-already-running');
-    return options.agent ? 0 : 3;
+    return 3;
   }
 
   try {
@@ -137,7 +148,7 @@ export async function runAutoCommand(
   } catch (error) {
     if (error instanceof AutoAdmissionRefused) {
       ctx.stderr(`qlb auto: refused: ${error.code}`);
-      return options.agent ? 0 : 3;
+      return 3;
     }
     throw error;
   } finally {
