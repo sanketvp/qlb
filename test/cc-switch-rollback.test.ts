@@ -273,22 +273,25 @@ describe('Claude switch rollback (K8-2)', () => {
   it('X17c: a step-8 write that lands followed by a failing configWritten update is restored byte-for-byte by rename (inode changed), reversed lists config, not config:resplice', async () => {
     const subject = await fixture();
     let updates = 0;
+    let landedInode = 0;
     subject.deps.journalOps = {
       update: (...args) => {
         updates += 1;
-        if (updates === 5) throw new Error('journal update failed');
+        if (updates === 5) {
+          landedInode = statSync(subject.paths.globalConfigPath).ino;
+          throw new Error('journal update failed');
+        }
         return updateClaudeSwitchJournal(...args);
       },
       remove: deleteClaudeSwitchJournal,
     };
-    const inode = statSync(subject.paths.globalConfigPath).ino;
     const result = await switchClaude(subject.deps, manual);
     assert.equal(result.outcome, 'rolled-back');
     assert.equal(result.error, 'journal-io-failed');
     assert.ok(result.steps?.reversed.includes('config'));
     assert.equal(result.steps?.reversed.includes('config:resplice'), false);
     assert.equal(readFileSync(subject.paths.globalConfigPath, 'utf8'), subject.configText);
-    assert.notEqual(statSync(subject.paths.globalConfigPath).ino, inode);
+    assert.notEqual(statSync(subject.paths.globalConfigPath).ino, landedInode);
   });
 
   it('X17d: fromOauthAccount in the journal equals the oauthAccount of the text read under the step-8 lock, not the Phase-A text', async () => {
