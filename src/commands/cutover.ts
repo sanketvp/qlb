@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { productionLaunchctlCswapAgent, unavailableCswapAgent, type CswapAgent } from '../cswap-agent';
@@ -10,10 +11,11 @@ import {
   commitCutover,
   CUTOVER_BEGIN_IN_PROGRESS,
   phase,
+  phaseForConnection,
 } from '../lifecycle';
 import { qlbHomeDir } from '../home';
 import { currentReleaseSha, readReleaseManifest } from '../release';
-import { openStore } from '../store';
+import { openStore, openStoreConnection, readOnlySchemaRefusal } from '../store';
 import type { CommandContext, CommandDefinition } from '../registry';
 
 function json(ctx: CommandContext, value: unknown): void {
@@ -117,14 +119,27 @@ async function execute(args: string[], ctx: CommandContext, deps: CutoverCommand
   const beginArgs = subcommand === 'begin' ? parseBeginArgs(rest) : null;
   if (subcommand === 'begin' && beginArgs) {
     if (beginArgs.dryRun) {
-      const store = openStore(ctx.config.dbPath);
-      try {
-        const current = phase(store);
-        const result = { ok: current.state === 'pre-cutover', phase: current.state, wouldBegin: current.state === 'pre-cutover' };
-        if (beginArgs.json) json(ctx, result);
-        else ctx.stderr(result.ok ? 'cutover begin dry-run: preconditions pending later slices' : `cutover begin refused: phase=${current.state}`);
-        return result.ok ? 0 : 3;
-      } finally { store.close(); }
+      // A missing store is the default lifecycle state, but dry-run must not
+      // create it. Existing stores are opened only for the shared schema gate
+      // and lifecycle reader used by CLI admission.
+      const current = existsSync(ctx.config.dbPath)
+        ? (() => {
+            const db = openStoreConnection(ctx.config.dbPath, true);
+            try {
+              const schemaRefusal = readOnlySchemaRefusal(db);
+              if (schemaRefusal) return null;
+              return phaseForConnection(db);
+            } finally { db.close(); }
+          })()
+        : { state: 'pre-cutover' as const };
+      if (current === null) {
+        ctx.stderr('cutover begin refused: schema-migration-required');
+        return 3;
+      }
+      const result = { ok: current.state === 'pre-cutover', phase: current.state, wouldBegin: current.state === 'pre-cutover' };
+      if (beginArgs.json) json(ctx, result);
+      else ctx.stderr(result.ok ? 'cutover begin dry-run: preconditions pending later slices' : `cutover begin refused: phase=${current.state}`);
+      return result.ok ? 0 : 3;
     }
     const result = await cutoverBegin(ctx.config.dbPath, (deps.makeAgent ?? defaultMakeAgent)(ctx));
     if (beginArgs.json) json(ctx, result);

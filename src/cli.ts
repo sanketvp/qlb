@@ -85,6 +85,7 @@ import {
   openDecisionsReader,
   openStore,
   openStoreConnection,
+  readOnlySchemaRefusal,
   WAL_SIDECAR_UNREADABLE,
   walSidecarUnreadableMessage,
   type Store,
@@ -1920,12 +1921,10 @@ function lifecycleAdmissionCode(dbPath: string, operation: LifecycleOperation): 
     if (!existsSync(dbPath)) return null;
     const db = openStoreConnection(dbPath, true);
     try {
-      const version = db.prepare('PRAGMA user_version').get() as { user_version?: unknown } | number | undefined;
-      const userVersion = typeof version === 'number' ? version : version?.user_version;
-      // Lifecycle rows arrived with the current schema. Do not let an admission
-      // check upgrade an old store just to discover its lifecycle state.
-      const lifecycleTable = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'lifecycle'").get();
-      if (typeof userVersion !== 'number' || userVersion < 5 || !lifecycleTable) return 'schema-migration-required';
+      // Do not let an admission check upgrade or repair an old store just to
+      // discover its lifecycle state.
+      const schemaRefusal = readOnlySchemaRefusal(db);
+      if (schemaRefusal) return schemaRefusal;
       const result = assertAdmittedInConnection(db, operation);
       return result.ok ? null : result.code ?? 'lifecycle-refused';
     } finally { db.close(); }

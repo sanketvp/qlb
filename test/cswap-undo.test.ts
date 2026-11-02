@@ -342,13 +342,18 @@ describe('qlb undo cswap --dry-run', () => {
     }
   });
 
-  it('the lifecycle admission leaves a missing dry-run store absent', async () => {
+  it('the real command returns an empty plan for a missing store without creating it', async () => {
     const f = fixture();
     try {
       unlinkSync(f.dbPath);
-      const result = await admitOnly(f, 'undo cswap', ['--dry-run']);
-      assert.deepEqual(result, { code: 0, executed: true });
+      const match = resolveCommand(['undo', 'cswap', '--dry-run', '--json'], discoverCommands());
+      assert.ok(match);
+
+      assert.equal(await runExecutingCommand(match, context(f)), 0);
       assert.equal(existsSync(f.dbPath), false);
+      assert.deepEqual(JSON.parse(f.output[0]!), {
+        slots: [], deleteEnc: [], activeAccountNumber: null, dryRun: true,
+      });
     } finally { close(f); }
   });
 
@@ -366,6 +371,19 @@ describe('qlb undo cswap --dry-run', () => {
       assert.deepEqual(readFileSync(f.dbPath), before);
       assert.equal(statSync(f.dbPath).mtimeMs, beforeMtime);
       assert.deepEqual(f.output, ['ERR:qlb undo cswap: refused: schema-migration-required']);
+    } finally { close(f); }
+  });
+
+  it('the lifecycle admission refuses a newer schema with Store\'s upgrade guidance', async () => {
+    const f = fixture();
+    try {
+      const db = openStoreConnection(f.dbPath);
+      try { db.exec('PRAGMA user_version = 6'); } finally { db.close(); }
+
+      const result = await admitOnly(f, 'undo cswap', ['--dry-run']);
+
+      assert.deepEqual(result, { code: 1, executed: false });
+      assert.match(f.output[0]!, /qlb\.db schema user_version=6 is newer than this binary \(5\); upgrade qlb/);
     } finally { close(f); }
   });
 
