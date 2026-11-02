@@ -182,6 +182,16 @@ export function codexFingerprint(doc: CodexAuthDocument): string {
   return `sha256:${createHash('sha256').update(doc.tokens.refresh_token, 'utf8').digest('hex')}`;
 }
 
+/** The exact UTF-8 text written to Codex's auth.json for a document. */
+export function codexAuthFileText(doc: CodexAuthDocument): string {
+  return `${JSON.stringify(doc, null, 2)}\n`;
+}
+
+/** A file-byte digest in the namespace used by stable auth.json reads. */
+export function codexAuthFileSha256(text: string): string {
+  return `sha256-file:${createHash('sha256').update(text, 'utf8').digest('hex')}`;
+}
+
 function errorCode(error: unknown): string | undefined {
   if (typeof error !== 'object' || error === null || !('code' in error)) return undefined;
   const { code } = error as { code?: unknown };
@@ -199,7 +209,7 @@ function errorCode(error: unknown): string | undefined {
  * publication completes.
  */
 export async function writeCodexAuthAtomic(path: string, doc: CodexAuthDocument): Promise<number> {
-  return atomicWriteText(path, `${JSON.stringify(doc, null, 2)}\n`, { mode: 0o600 });
+  return atomicWriteText(path, codexAuthFileText(doc), { mode: 0o600 });
 }
 
 function defaultSleep(ms: number): Promise<void> {
@@ -324,7 +334,7 @@ export async function readCodexAuthStableWithStat(
     return {
       status: 'ok',
       doc: first.parsed.doc,
-      sha256: `sha256-file:${createHash('sha256').update(first.text, 'utf8').digest('hex')}`,
+      sha256: codexAuthFileSha256(first.text),
       inode: first.ino,
     };
   }
