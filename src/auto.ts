@@ -1,5 +1,7 @@
+import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { pathToFileURL } from 'node:url';
 
 import { buildUsageRequest, type HttpRequestDescription } from './anthropic-oauth';
 import { anthropicTick, pollAnthropic, type AnthropicPollDeps, type AnthropicTickDeps, type AnthropicTickResult } from './auto/anthropic';
@@ -233,7 +235,13 @@ function readOnlySlots(db: DatabaseSync): Pick<ClaudeSlots, 'listSlots'> {
 }
 
 function productionDryBinding(config: QlbConfig, now: () => number): DryBinding {
-  const db = openStoreConnection(config.dbPath, true);
+  // SQLite may create -wal/-shm sidecars even for a read-only open.  A live
+  // WAL must remain visible, but an immutable URI avoids creating sidecars
+  // when there is no WAL to read.
+  const connectionPath = existsSync(`${config.dbPath}-wal`)
+    ? config.dbPath
+    : `${pathToFileURL(config.dbPath).href}?immutable=1`;
+  const db = openStoreConnection(connectionPath, true);
   const store = readOnlyStore(db, config.dbPath);
   const slots = readOnlySlots(db);
   return {
