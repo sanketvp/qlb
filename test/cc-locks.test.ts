@@ -35,9 +35,9 @@ async function tempHome(): Promise<string> {
   return mkdtemp(join(tmpdir(), 'qlb-cc-locks-'));
 }
 
-async function waitFor(predicate: () => boolean, timeoutMs = 1_000, description = 'lock state'): Promise<void> {
+async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs = 1_000, description = 'lock state'): Promise<void> {
   const started = Date.now();
-  while (!predicate()) {
+  while (!(await predicate())) {
     if (Date.now() - started > timeoutMs) throw new Error(`timed out waiting for ${description} within ${timeoutMs}ms`);
     await sleep(5);
   }
@@ -432,11 +432,14 @@ describe('Claude Code proper-lockfile locks', () => {
     const lock = join(home, 'replacement.lock');
     const fsPromises = require('node:fs/promises') as Record<string, (...args: any[]) => Promise<any>>;
     const originalUtimes = fsPromises.utimes;
-    let replacementTouched = false;
+    let replacementTouchCompletedAfterReset = false;
+    let observeReplacementTouches = false;
     try {
       fsPromises.utimes = async (...args: any[]) => {
+        const touchesReplacement = String(args[0]) === lock;
+        const startedAfterReset = touchesReplacement && observeReplacementTouches;
         const result = await originalUtimes(...args);
-        if (String(args[0]) === lock) replacementTouched = true;
+        if (startedAfterReset) replacementTouchCompletedAfterReset = true;
         return result;
       };
       await withProperLockfile(lock, { touchIntervalMs: 10 }, async () => {
@@ -445,11 +448,16 @@ describe('Claude Code proper-lockfile locks', () => {
         await mkdir(lock);
         const old = new Date(Date.now() - 60_000);
         await utimes(lock, old, old);
-        replacementTouched = false;
+        replacementTouchCompletedAfterReset = false;
         const replacementMtime = (await stat(lock)).mtimeMs;
-        // Observe the actual pathname touch instead of requiring a 10ms timer to
-        // run inside a fixed two-second wall-clock window under CPU saturation.
-        await waitFor(() => replacementTouched, 30_000, 'replacement lock pathname touch');
+        observeReplacementTouches = true;
+        // An earlier in-flight touch can complete after the reset; require either
+        // the replacement's observed mtime to advance or a touch started after it.
+        await waitFor(
+          async () => (await stat(lock)).mtimeMs > replacementMtime || replacementTouchCompletedAfterReset,
+          30_000,
+          'replacement lock pathname touch',
+        );
         assert.ok((await stat(lock)).mtimeMs > replacementMtime, 'upstream toucher refreshes by pathname');
       });
       assert.equal(existsSync(lock), false, 'upstream release removes by pathname');
