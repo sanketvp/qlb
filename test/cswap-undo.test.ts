@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { describe, it } from 'node:test';
 
 import { defaultHeldLocks, isQlbProcessCommand, restoreCswap, runUndoCswapCommand, type TerminalHandBack } from '../src/commands/undo-cswap';
@@ -20,6 +21,12 @@ import {
 } from '../src/lifecycle';
 import { recordStash } from '../src/unclaimed-index';
 import { productionTryAcquireLock } from '../src/cswap-agent';
+
+const support = join(__dirname, '..', '..', 'test', 'support');
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const { buildV4Store } = require(join(support, 'v4-fixture.cjs')) as {
+  buildV4Store: (path: string, rows?: Array<Record<string, unknown>>) => string;
+};
 
 function credential(account: string, refresh: string): string {
   return JSON.stringify({ claudeAiOauth: { accessToken: `access-${account}`, refreshToken: refresh, expiresAt: 1_800_000_000_000 } });
@@ -123,6 +130,23 @@ async function dryRun(f: Fixture): Promise<number> {
 
 function close(f: Fixture): void {
   rmSync(f.root, { recursive: true, force: true });
+}
+
+function userVersion(path: string): number {
+  const db = new DatabaseSync(path, { readOnly: true });
+  try {
+    const row = db.prepare('PRAGMA user_version').get() as { user_version?: number } | number | undefined;
+    return typeof row === 'number' ? row : row?.user_version ?? 0;
+  } finally { db.close(); }
+}
+
+async function admitOnly(f: Fixture, command: string, args: string[]): Promise<{ code: number; executed: boolean }> {
+  let executed = false;
+  const code = await runExecutingCommand({
+    command: { name: command, execute: async () => { executed = true; return 0; } },
+    args,
+  }, context(f));
+  return { code, executed };
 }
 
 function beginUndo(f: Fixture): void {
@@ -316,6 +340,80 @@ describe('qlb undo cswap --dry-run', () => {
     } finally {
       close(f);
     }
+  });
+
+  it('the real command returns an empty plan for a missing store without creating it', async () => {
+    const f = fixture();
+    try {
+      unlinkSync(f.dbPath);
+      const match = resolveCommand(['undo', 'cswap', '--dry-run', '--json'], discoverCommands());
+      assert.ok(match);
+
+      assert.equal(await runExecutingCommand(match, context(f)), 0);
+      assert.equal(existsSync(f.dbPath), false);
+      assert.deepEqual(JSON.parse(f.output[0]!), {
+        slots: [], deleteEnc: [], activeAccountNumber: null, dryRun: true,
+      });
+    } finally { close(f); }
+  });
+
+  it('the lifecycle admission refuses an old schema without changing its bytes or mtime', async () => {
+    const f = fixture();
+    try {
+      unlinkSync(f.dbPath);
+      buildV4Store(f.dbPath);
+      const before = readFileSync(f.dbPath);
+      const beforeMtime = statSync(f.dbPath).mtimeMs;
+
+      const result = await admitOnly(f, 'undo cswap', ['--dry-run']);
+
+      assert.deepEqual(result, { code: 3, executed: false });
+      assert.deepEqual(readFileSync(f.dbPath), before);
+      assert.equal(statSync(f.dbPath).mtimeMs, beforeMtime);
+      assert.deepEqual(f.output, ['ERR:qlb undo cswap: refused: schema-migration-required']);
+    } finally { close(f); }
+  });
+
+  it('the lifecycle admission refuses a newer schema with Store\'s upgrade guidance', async () => {
+    const f = fixture();
+    try {
+      const db = openStoreConnection(f.dbPath);
+      try { db.exec('PRAGMA user_version = 6'); } finally { db.close(); }
+
+      const result = await admitOnly(f, 'undo cswap', ['--dry-run']);
+
+      assert.deepEqual(result, { code: 1, executed: false });
+      assert.match(f.output[0]!, /qlb\.db schema user_version=6 is newer than this binary \(5\); upgrade qlb/);
+    } finally { close(f); }
+  });
+
+  it('write lifecycle admission still opens old schemas read-write and migrates', async () => {
+    const f = fixture();
+    try {
+      unlinkSync(f.dbPath);
+      buildV4Store(f.dbPath);
+      assert.equal(userVersion(f.dbPath), 4);
+
+      const result = await admitOnly(f, 'cutover', ['begin']);
+
+      assert.deepEqual(result, { code: 0, executed: true });
+      assert.equal(userVersion(f.dbPath), 5);
+    } finally { close(f); }
+  });
+
+  it('doctor lifecycle admission still opens old schemas read-write and migrates', async () => {
+    const f = fixture();
+    try {
+      unlinkSync(f.dbPath);
+      buildV4Store(f.dbPath);
+      assert.equal(userVersion(f.dbPath), 4);
+
+      const result = await admitOnly(f, 'doctor', []);
+
+      assert.deepEqual(result, { code: 0, executed: true });
+      assert.equal(userVersion(f.dbPath), 5);
+      assert.doesNotMatch(f.output.join('\n'), /schema-migration-required/);
+    } finally { close(f); }
   });
 
   it('the registered resolver admits the exact undo cswap dry-run command', async () => {

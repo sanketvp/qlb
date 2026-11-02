@@ -17,6 +17,8 @@ import { parseCodexRecoveryFence, type CodexRecoveryFence } from './codex-sessio
 import type { CodexWatch } from './codex-switch';
 
 export const DEFAULT_DB_PATH = config.dbPath;
+/** The only schema version supported by this binary. */
+export const SCHEMA_VERSION = 5;
 
 export interface AccountRow {
   id: string;
@@ -646,6 +648,20 @@ function schemaNeedsV5Correction(db: DatabaseSync): boolean {
   return !lifecycleOneOpenIndexMatches(db);
 }
 
+/**
+ * Validate a connection that must remain read-only. Read-only callers cannot
+ * migrate or repair an old v5-shaped store, so they share this exact gate.
+ */
+export function readOnlySchemaRefusal(db: DatabaseSync): 'schema-migration-required' | null {
+  const version = readUserVersion(db);
+  if (version > SCHEMA_VERSION) {
+    throw new Error(`qlb.db schema user_version=${version} is newer than this binary (${SCHEMA_VERSION}); upgrade qlb`);
+  }
+  return version !== SCHEMA_VERSION || schemaNeedsV5Correction(db)
+    ? 'schema-migration-required'
+    : null;
+}
+
 function sqlWithoutLiteralsOrComments(sql: string, keepQuotedIdentifiers = false): string {
   let result = '';
   for (let index = 0; index < sql.length;) {
@@ -1074,7 +1090,7 @@ function redactJsonText(value: string): string {
 
 function migrationNeeded(db: DatabaseSync): boolean {
   const version = readUserVersion(db);
-  return version < 5 || (version === 5 && schemaNeedsV5Correction(db));
+  return version < SCHEMA_VERSION || (version === SCHEMA_VERSION && schemaNeedsV5Correction(db));
 }
 
 function normalizedSql(sql: string): string {
@@ -1427,7 +1443,6 @@ export class Store {
 
   /** Additive migration through the §3.2 v5 schema (including pre-release v5 correction). */
   private migrateIfNeeded(): void {
-    const SCHEMA_VERSION = 5;
     const version = readUserVersion(this.db);
     if (version > SCHEMA_VERSION) {
       throw new Error(`qlb.db schema user_version=${version} is newer than this binary (${SCHEMA_VERSION}); upgrade qlb`);

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -8,17 +8,26 @@ import test from 'node:test';
 import { defaultConfig } from '../src/config';
 import { credentialFingerprint } from '../src/anthropic-oauth';
 import { createCutoverCommand } from '../src/commands/cutover';
+import { runExecutingCommand } from '../src/cli';
 import { CSWAP_ANTHROPIC_STORE, CONSUME_STATE } from '../src/cswap-consume';
 import { CUTOVER_BEGIN_IN_PROGRESS, beginCutover, phase } from '../src/lifecycle';
 import type { CswapAgent } from '../src/cswap-agent';
 import type { CommandContext } from '../src/registry';
 import { openStore } from '../src/store';
 
-function fixture(): { root: string; dbPath: string; context: CommandContext; output: string[]; cleanup(): void } {
+const support = join(__dirname, '..', '..', 'test', 'support');
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const { buildV4Store } = require(join(support, 'v4-fixture.cjs')) as {
+  buildV4Store: (path: string, rows?: Array<Record<string, unknown>>) => string;
+};
+
+function fixture(createStore = true): { root: string; dbPath: string; context: CommandContext; output: string[]; cleanup(): void } {
   const root = mkdtempSync(join(tmpdir(), 'qlb-cutover-command-'));
   const dbPath = join(root, 'qlb.db');
-  const store = openStore(dbPath);
-  store.close();
+  if (createStore) {
+    const store = openStore(dbPath);
+    store.close();
+  }
   const config = { ...defaultConfig(root), dbPath };
   const output: string[] = [];
   return {
@@ -73,6 +82,30 @@ function prepareDeferredCommit(dbPath: string): void {
     store.upsertMigration(CSWAP_ANTHROPIC_STORE, CONSUME_STATE, '{}', 20);
   } finally { store.close(); }
 }
+
+test('begin dry-run is read-only for missing and v4 stores', async () => {
+  const missing = fixture(false);
+  try {
+    const code = await runExecutingCommand({ command: createCutoverCommand(), args: ['begin', '--dry-run', '--json'] }, missing.context);
+    assert.equal(code, 0);
+    assert.equal(existsSync(missing.dbPath), false);
+    assert.deepEqual(JSON.parse(missing.output[0]!), { ok: true, phase: 'pre-cutover', wouldBegin: true });
+  } finally { missing.cleanup(); }
+
+  const v4 = fixture(false);
+  try {
+    buildV4Store(v4.dbPath);
+    const before = readFileSync(v4.dbPath);
+    const beforeMtime = statSync(v4.dbPath).mtimeMs;
+
+    const code = await runExecutingCommand({ command: createCutoverCommand(), args: ['begin', '--dry-run', '--json'] }, v4.context);
+
+    assert.equal(code, 3);
+    assert.deepEqual(readFileSync(v4.dbPath), before);
+    assert.equal(statSync(v4.dbPath).mtimeMs, beforeMtime);
+    assert.deepEqual(v4.output, ['qlb cutover: refused: schema-migration-required']);
+  } finally { v4.cleanup(); }
+});
 
 test('begin calls the injected agent in S57 order', async () => {
   const f = fixture();
