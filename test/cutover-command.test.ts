@@ -65,6 +65,23 @@ test('begin calls the injected agent in S57 order', async () => {
   }
 });
 
+test('a test process stays guarded when the command context lacks the flag', async () => {
+  const f = fixture();
+  const saved = process.env.QLB_TEST_MODE;
+  process.env.QLB_TEST_MODE = '1';
+  try {
+    const { QLB_TEST_MODE: _dropped, ...env } = f.context.env;
+    const command = createCutoverCommand();
+
+    assert.equal(await command.execute!(['begin', '--json'], { ...f.context, env }), 3);
+    assert.equal(JSON.parse(f.output[0]!).code, 'cswap-restore-failed');
+  } finally {
+    if (saved === undefined) delete process.env.QLB_TEST_MODE;
+    else process.env.QLB_TEST_MODE = saved;
+    f.cleanup();
+  }
+});
+
 test('test mode without an injected agent never reaches launchctl', async () => {
   const f = fixture();
   try {

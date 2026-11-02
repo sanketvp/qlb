@@ -88,7 +88,7 @@ export interface CutoverCommandDeps {
 
 function defaultMakeAgent(ctx: CommandContext): CswapAgent {
   // Tests must never construct the adapter that can invoke launchctl.
-  if (ctx.env.QLB_TEST_MODE === '1') return unavailableCswapAgent;
+  if (process.env.QLB_TEST_MODE === '1' || ctx.env.QLB_TEST_MODE === '1') return unavailableCswapAgent;
   return productionLaunchctlCswapAgent(ctx.home, qlbHomeDir(ctx.env), ctx.config.cswapSequencePath);
 }
 
