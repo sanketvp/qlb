@@ -1,3 +1,5 @@
+import { join } from 'node:path';
+
 import { productionLaunchctlCswapAgent, unavailableCswapAgent, type CswapAgent } from '../cswap-agent';
 import {
   abortCutoverBegin,
@@ -9,6 +11,7 @@ import {
   phase,
 } from '../lifecycle';
 import { qlbHomeDir } from '../home';
+import { currentReleaseSha, readReleaseManifest } from '../release';
 import { openStore } from '../store';
 import type { CommandContext, CommandDefinition } from '../registry';
 
@@ -24,6 +27,20 @@ function parseBeginArgs(args: string[]): { json: boolean; dryRun: boolean } | nu
 
 function parseJson(args: string[]): boolean {
   return args.length === 1 && args[0] === '--json';
+}
+
+function parseCommitArgs(args: string[]): { json: boolean; piDeferred: boolean } | null {
+  const allowed = new Set(['--json', '--pi-deferred']);
+  if (args.some((arg) => !allowed.has(arg)) || new Set(args).size !== args.length) return null;
+  return { json: args.includes('--json'), piDeferred: args.includes('--pi-deferred') };
+}
+
+function currentReleaseManifestSha(ctx: CommandContext): string | undefined {
+  const appDir = ctx.env.QLB_TEST_MODE === '1' && ctx.env.QLB_HOME
+    ? join(ctx.env.QLB_HOME, 'app')
+    : join(ctx.home, '.qlb', 'app');
+  const current = currentReleaseSha(appDir);
+  return current == null ? undefined : readReleaseManifest(join(appDir, current))?.sha;
 }
 
 /** Exported for AC49's injected C-swap-agent fake. */
@@ -111,11 +128,15 @@ async function execute(args: string[], ctx: CommandContext, deps: CutoverCommand
     else ctx.stderr(result.ok ? 'cutover begin admitted' : `cutover begin refused: ${result.code}`);
     return result.ok ? 0 : 3;
   }
-  if (subcommand === 'commit' && (rest.length === 0 || parseJson(rest))) {
+  const commitArgs = subcommand === 'commit' ? parseCommitArgs(rest) : null;
+  if (subcommand === 'commit' && commitArgs) {
     const store = openStore(ctx.config.dbPath);
     try {
-      const result = commitCutover(store);
-      if (rest[0] === '--json') json(ctx, { ...result, state: phase(store).state });
+      const result = commitCutover(store, {
+        piDeferred: commitArgs.piDeferred,
+        releaseSha: currentReleaseManifestSha(ctx),
+      });
+      if (commitArgs.json) json(ctx, { ...result, state: phase(store).state });
       else ctx.stderr(result.ok ? 'cutover committed' : `cutover commit refused: ${result.code}`);
       return result.ok ? 0 : 3;
     } finally { store.close(); }
@@ -135,7 +156,7 @@ async function execute(args: string[], ctx: CommandContext, deps: CutoverCommand
       return 3;
     } finally { store.close(); }
   }
-  ctx.stderr('usage: qlb cutover begin|commit|abort [--json]');
+  ctx.stderr('usage: qlb cutover begin|commit [--pi-deferred] [--json]|abort [--json]');
   return 2;
 }
 

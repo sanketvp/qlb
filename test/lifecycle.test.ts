@@ -25,6 +25,8 @@ import {
   closeLifecycle,
 } from '../src/lifecycle';
 import { cutoverBegin } from '../src/commands/cutover';
+import { CSWAP_ANTHROPIC_STORE, CONSUME_STATE } from '../src/cswap-consume';
+import { evaluateRetirementGates, type CswapRetireDependencies } from '../src/cswap-retire';
 import lifecycleCommand from '../src/commands/lifecycle';
 import type { CommandContext } from '../src/registry';
 import { openStore } from '../src/store';
@@ -72,6 +74,34 @@ function insertClaudeImport(store: ReturnType<typeof openStore>): void {
   } finally { db.close(); }
 }
 
+function prepareDeferredCommit(store: ReturnType<typeof openStore>): void {
+  beginCutover(store, 10);
+  insertClaudeImport(store);
+  store.recordSwitch({ provider: 'anthropic', fromAccount: 'claude-a', toAccount: 'claude-b', trigger: 'manual', outcome: 'ok' });
+  store.recordSwitch({ provider: 'anthropic', fromAccount: 'claude-b', toAccount: 'claude-a', trigger: 'manual', outcome: 'ok' });
+  store.setConfig('keychain.liveItemsAuthorizedAt', '19');
+}
+
+function retirementGateDeps(now: number): CswapRetireDependencies {
+  return {
+    now: () => now,
+    stateDir: '/fixture', backupsDir: '/fixture/backups', journalDir: '/fixture/journal',
+    doctor: () => ({ overall: 'PASS', autoAgent: 'PASS' }),
+    reportReceiptPasses: () => true,
+    hasFourInjectedDrillRows: () => true,
+    hasUnadoptedStash: () => false,
+    claudeSlotsPass: () => true,
+    slots: () => [],
+    cswapItems: () => [],
+    readSlotFingerprint: () => 'fixture',
+    effects: {
+      drainCswap: () => ({ ok: true }),
+      archiveCswap: () => {}, deleteCswapItems: () => {}, uninstallCswap: () => {},
+      removeCswapLaunchArtifacts: () => {}, deletePiBaselines: () => {}, archiveExpiredStash: () => {},
+    },
+  };
+}
+
 describe('lifecycle (AC49)', () => {
   it('starts one durable cutover and SQLite itself rejects a second open row', () => {
     const store = fixtureStore();
@@ -80,6 +110,96 @@ describe('lifecycle (AC49)', () => {
       assert.equal(started.state, 'cutting-over');
       assert.equal(phase(store).state, 'cutting-over');
       assert.throws(() => beginCutover(store, 2_000), /SQLITE_CONSTRAINT/);
+    } finally { store.close(); }
+  });
+
+  it('commit --pi-deferred succeeds with consume on', () => {
+    const store = fixtureStore();
+    try {
+      prepareDeferredCommit(store);
+      store.upsertMigration(CSWAP_ANTHROPIC_STORE, CONSUME_STATE, '{}', 20);
+
+      assert.equal(commitCutover(store, { now: 20, piDeferred: true, releaseSha: 'fixture-release' }).ok, true);
+      assert.equal(phase(store).releaseSha, 'fixture-release');
+      assert.equal(store.getConfig('cutover.piDeferredAt'), '20');
+    } finally { store.close(); }
+  });
+
+  it('rolls back the deferred transition when its marker cannot be written', () => {
+    const store = fixtureStore();
+    try {
+      prepareDeferredCommit(store);
+      store.upsertMigration(CSWAP_ANTHROPIC_STORE, CONSUME_STATE, '{}', 20);
+      const db = new DatabaseSync(store.dbPath);
+      try {
+        db.exec(`CREATE TRIGGER reject_pi_deferred_marker BEFORE INSERT ON config
+          WHEN NEW.key = 'cutover.piDeferredAt'
+          BEGIN SELECT RAISE(ABORT, 'deferred marker failure'); END`);
+      } finally { db.close(); }
+
+      assert.throws(() => commitCutover(store, { now: 20, piDeferred: true }), /deferred marker failure/);
+      assert.equal(phase(store).state, 'cutting-over');
+      assert.equal(store.getConfig('cutover.piDeferredAt'), null);
+    } finally { store.close(); }
+  });
+
+  it('refuses when consume changes inside the deferred commit transaction', () => {
+    const store = fixtureStore();
+    try {
+      prepareDeferredCommit(store);
+      store.upsertMigration(CSWAP_ANTHROPIC_STORE, CONSUME_STATE, '{}', 20);
+      const runImmediate = store.runImmediate.bind(store);
+      let changedInsideTransaction = false;
+      store.runImmediate = function <T>(fn: () => T): T {
+        return runImmediate(() => {
+          changedInsideTransaction = true;
+          store.upsertMigration(CSWAP_ANTHROPIC_STORE, 'NATIVE', '{}', 21);
+          return fn();
+        });
+      };
+
+      assert.equal(commitCutover(store, { now: 20, piDeferred: true }).code, 'pi-deferred-needs-consume');
+      assert.equal(changedInsideTransaction, true);
+      assert.equal(phase(store).state, 'cutting-over');
+      assert.equal(store.getConfig('cutover.piDeferredAt'), null);
+    } finally { store.close(); }
+  });
+
+  it('refuses with consume off', () => {
+    const store = fixtureStore();
+    try {
+      prepareDeferredCommit(store);
+      store.upsertMigration(CSWAP_ANTHROPIC_STORE, 'MIRRORED', '{}', 20);
+
+      assert.equal(commitCutover(store, { now: 20, piDeferred: true }).code, 'pi-deferred-needs-consume');
+      assert.equal(phase(store).state, 'cutting-over');
+      assert.equal(store.getConfig('cutover.piDeferredAt'), null);
+    } finally { store.close(); }
+  });
+
+  it('plain commit still refuses pi-state-missing', () => {
+    const store = fixtureStore();
+    try {
+      prepareDeferredCommit(store);
+      store.upsertMigration(CSWAP_ANTHROPIC_STORE, CONSUME_STATE, '{}', 20);
+
+      assert.equal(commitCutover(store, { now: 20 }).code, 'pi-state-missing:anthropic');
+      assert.equal(phase(store).state, 'cutting-over');
+    } finally { store.close(); }
+  });
+
+  it('retire still refuses pi-state-invalid after a deferred commit', async () => {
+    const store = fixtureStore();
+    try {
+      prepareDeferredCommit(store);
+      store.upsertMigration(CSWAP_ANTHROPIC_STORE, CONSUME_STATE, '{}', 20);
+      assert.equal(commitCutover(store, { now: 20, piDeferred: true }).ok, true);
+      store.setConfig('report.receiptAt', '20');
+
+      assert.deepEqual(await evaluateRetirementGates(store, retirementGateDeps(20)), {
+        ok: false,
+        code: 'pi-state-invalid:anthropic',
+      });
     } finally { store.close(); }
   });
 
