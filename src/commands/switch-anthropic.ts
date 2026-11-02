@@ -17,7 +17,7 @@ import type { CommandContext, CommandDefinition } from '../registry';
 import { openStore, type Store } from '../store';
 
 type ParsedArgs = { accountId: string; json: boolean; republish: boolean };
-type SwitchResources = { deps: ClaudeSwitchDeps; close?: () => void };
+export type SwitchResources = { deps: ClaudeSwitchDeps; close?: () => void };
 
 type FetchLike = (input: string, init: {
   method: string;
@@ -112,7 +112,12 @@ async function request(fetchFn: FetchLike, description: HttpRequestDescription):
   return { status: response.status, body: await response.text() };
 }
 
-function defaultMakeSwitchDeps(commandDeps: SwitchAnthropicCommandDeps, ctx: CommandContext, store: Store, warn: (message: string) => void): Promise<SwitchResources> {
+/**
+ * Production composition root shared by the manual command and auto loop.
+ * Callers own the per-attempt lifecycle, including closing the returned slot
+ * repository after the switch attempt.
+ */
+export function makeProductionSwitchDeps(commandDeps: Pick<SwitchAnthropicCommandDeps, 'claudePaths' | 'fetchFn' | 'fetchActiveUsage' | 'now' | 'randomUUID' | 'processLstart'>, ctx: CommandContext, store: Store, warn: (message: string) => void): Promise<SwitchResources> {
   const paths = (commandDeps.claudePaths ?? claudePaths)({ home: ctx.home, env: ctx.env });
   const repository = SqliteClaudeSlotRepository.open(ctx.config.dbPath);
   const slots = new ClaudeSlots({
@@ -210,7 +215,7 @@ export function createSwitchAnthropicCommand(deps: SwitchAnthropicCommandDeps = 
         }
 
         const warn = (message: string): void => ctx.stderr(`qlb switch anthropic: warning: ${message}`);
-        const built = await (deps.makeSwitchDeps ?? ((commandCtx, commandStore, commandWarn) => defaultMakeSwitchDeps(deps, commandCtx, commandStore, commandWarn)))(ctx, store, warn);
+        const built = await (deps.makeSwitchDeps ?? ((commandCtx, commandStore, commandWarn) => makeProductionSwitchDeps(deps, commandCtx, commandStore, commandWarn)))(ctx, store, warn);
         resources = 'deps' in built ? built : { deps: built };
         if (parsedInjection.inject !== null) resources.deps.injectFailStep = parsedInjection.inject.step;
         const result = await (deps.switchClaude ?? switchClaude)(resources.deps, {

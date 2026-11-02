@@ -18,7 +18,8 @@ import {
 import { readLiveClaudeCredentials } from '../cc-credentials';
 import { isCredentialNotFound } from '../credential-backends';
 import { ClaudeSlots } from '../cc-slots';
-import { type AutoswitchAccount } from '../autoswitch';
+import { decideAutoswitch, type AutoswitchAccount, type AutoswitchDecision, type AutoswitchInput } from '../autoswitch';
+import { switchClaude, type ClaudeSwitchDeps, type ClaudeSwitchResult } from '../cc-switch';
 import { dueCandidate, planAfterFetch, RECENT_429_WINDOW_S, type Usage } from '../poll-policy';
 import { redactSecrets } from '../redact';
 import { Store, type UsagePollRow } from '../store';
@@ -123,7 +124,7 @@ function pollingState(slots: ReturnType<ClaudeSlots['listSlots']>, polls: Record
   ]));
 }
 
-function freshAccounts(slots: ReturnType<ClaudeSlots['listSlots']>, store: Store, polls: Record<string, UsagePollRow>, nowS: number, models: readonly string[], unknownThisTick = new Set<string>()): AutoswitchAccount[] {
+export function freshAnthropicAccounts(slots: ReturnType<ClaudeSlots['listSlots']>, store: Store, polls: Record<string, UsagePollRow>, nowS: number, models: readonly string[], unknownThisTick = new Set<string>()): AutoswitchAccount[] {
   const configuredModels = new Set(models.map((model) => model.toLowerCase()));
   const scopedEnabled = configuredModels.size > 0;
   const allScoped = configuredModels.has('all');
@@ -198,7 +199,7 @@ export async function pollAnthropic(deps: AnthropicPollDeps): Promise<Autoswitch
       // A switch can commit while the usage request is in flight. The reading
       // has no safe owner then, so leave both accounts' poll rows untouched.
       if (deps.store.getActiveLogin(PROVIDER)?.accountId !== activeId) {
-        return freshAccounts(deps.slots.listSlots(), deps.store, pollingState(deps.slots.listSlots(), deps.store.listUsagePolls(PROVIDER)), nowS, models, unknownThisTick);
+        return freshAnthropicAccounts(deps.slots.listSlots(), deps.store, pollingState(deps.slots.listSlots(), deps.store.listUsagePolls(PROVIDER)), nowS, models, unknownThisTick);
       }
       if (result.usage && typeof result.usage === 'object' && 'buckets' in result.usage) {
         const parsed = result.usage as ParsedUsageResponse;
@@ -277,5 +278,140 @@ export async function pollAnthropic(deps: AnthropicPollDeps): Promise<Autoswitch
       }
     }
   }
-  return freshAccounts(deps.slots.listSlots(), deps.store, pollingState(deps.slots.listSlots(), deps.store.listUsagePolls(PROVIDER)), nowS, models, unknownThisTick);
+  return freshAnthropicAccounts(deps.slots.listSlots(), deps.store, pollingState(deps.slots.listSlots(), deps.store.listUsagePolls(PROVIDER)), nowS, models, unknownThisTick);
+}
+
+export interface AnthropicTickDeps {
+  store: Store;
+  slots: ClaudeSlots;
+  /** Epoch milliseconds, matching the switch journal and autoswitch engine. */
+  now: () => number;
+  models?: readonly string[];
+  /** A just-polled projection is accepted so a live loop does not re-read it. */
+  accounts?: readonly AutoswitchAccount[];
+  /** Dry runs are strictly decision-only and must not mutate or switch. */
+  dryRun?: boolean;
+  /** Test seam for S14's already-filtered switch history. */
+  breakerRows?: AutoswitchInput['breakerRows'];
+  switchDeps?: ClaudeSwitchDeps;
+  switchClaude?: typeof switchClaude;
+}
+
+export interface AnthropicTickResult {
+  decision: AutoswitchDecision;
+  switchResult?: ClaudeSwitchResult;
+}
+
+const AUTO_PREFIX = 'auto.anthropic.';
+
+function configNumber(store: Store, key: string): number | undefined {
+  const value = store.getConfig(key);
+  if (value === null || value === '') return undefined;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function configString(store: Store, key: string): string | null {
+  const value = store.getConfig(key);
+  return value === '' ? null : value;
+}
+
+// Store deliberately exposes only an upsert config API. Empty values retain
+// the same absence semantics for all numeric/string readers in this module.
+function setOrDelete(store: Store, key: string, value: number | string | undefined): void {
+  store.setConfig(key, value === undefined ? '' : String(value));
+}
+
+function decisionInput(deps: AnthropicTickDeps): AutoswitchInput {
+  const nowMs = deps.now();
+  const nowS = Math.floor(nowMs / 1000);
+  const settings = deps.store.getAutoswitchSettings();
+  const activeAccountId = deps.store.getActiveLogin(PROVIDER)?.accountId ?? null;
+  const polls = pollingState(deps.slots.listSlots(), deps.store.listUsagePolls(PROVIDER));
+  const healthTickAt = configNumber(deps.store, `${AUTO_PREFIX}healthTickAt`);
+  const healthIsFresh = activeAccountId !== null
+    && configString(deps.store, `${AUTO_PREFIX}healthAccount`) === activeAccountId
+    && healthTickAt !== undefined
+    && nowMs - healthTickAt >= 0
+    && nowMs - healthTickAt <= 60 * 60_000;
+  const accounts = deps.accounts ?? freshAnthropicAccounts(
+    deps.slots.listSlots(), deps.store, polls, nowS, deps.models ?? [],
+  );
+  // Only successful automatic switches participate in proactive cooldown.
+  // Manual switches deliberately leave this timestamp unset.
+  const lastSwitchAtMs = configNumber(deps.store, `${AUTO_PREFIX}lastSwitchAt`);
+  return {
+    accounts,
+    activeAccountId,
+    nowMs,
+    settings,
+    lastSwitchAtMs,
+    activeCredentialExpired: polls[activeAccountId ?? '']?.lastStatus === 'token-expired',
+    unhealthyTicks: healthIsFresh ? configNumber(deps.store, `${AUTO_PREFIX}unhealthyTicks`) : undefined,
+    idleHoldSinceMs: healthIsFresh ? configNumber(deps.store, `${AUTO_PREFIX}idleHoldSince`) : undefined,
+    parkedUntilMs: configNumber(deps.store, `${AUTO_PREFIX}parkedUntil`),
+    lastSwitchFrom: configString(deps.store, `${AUTO_PREFIX}lastSwitchFrom`),
+    lastSwitchTo: configString(deps.store, `${AUTO_PREFIX}lastSwitchTo`),
+    leftHeadroom: configNumber(deps.store, `${AUTO_PREFIX}leftHeadroom`) ?? null,
+    leftRecoveryAtMs: configNumber(deps.store, `${AUTO_PREFIX}leftRecoveryAt`) ?? null,
+    leftTrigger: configString(deps.store, `${AUTO_PREFIX}leftTrigger`) as AutoswitchInput['leftTrigger'],
+    suspendedUntilMs: configNumber(deps.store, `${AUTO_PREFIX}suspendedUntil`) ?? null,
+    lastSuspensionEndMs: configNumber(deps.store, `${AUTO_PREFIX}lastSuspensionEnd`) ?? null,
+    lastResumeAtMs: configNumber(deps.store, `${AUTO_PREFIX}lastResumeAt`) ?? null,
+    breakerRows: deps.breakerRows,
+    provider: 'anthropic',
+  };
+}
+
+function persistTickState(store: Store, activeAccountId: string | null, nowMs: number, decision: AutoswitchDecision, switched: boolean): void {
+  const idleHoldSince = decision.kind === 'stay' ? decision.idleHoldSinceMs : undefined;
+  const health = decision.unhealthyTicks > 0 || idleHoldSince !== undefined;
+  if (health && activeAccountId !== null) {
+    store.setConfig(`${AUTO_PREFIX}unhealthyTicks`, String(decision.unhealthyTicks));
+    store.setConfig(`${AUTO_PREFIX}healthAccount`, activeAccountId);
+    store.setConfig(`${AUTO_PREFIX}healthTickAt`, String(nowMs));
+    setOrDelete(store, `${AUTO_PREFIX}idleHoldSince`, idleHoldSince);
+  } else {
+    for (const key of ['unhealthyTicks', 'idleHoldSince', 'healthAccount', 'healthTickAt']) setOrDelete(store, `${AUTO_PREFIX}${key}`, undefined);
+  }
+
+  const parkedUntil = decision.kind === 'parked' || decision.kind === 'switch' ? decision.parkedUntilMs : undefined;
+  setOrDelete(store, `${AUTO_PREFIX}parkedUntil`, parkedUntil);
+  const suspendedUntil = decision.kind === 'stay' ? decision.suspendedUntilMs : undefined;
+  if (suspendedUntil !== undefined) store.setConfig(`${AUTO_PREFIX}suspendedUntil`, String(suspendedUntil));
+  else if (configNumber(store, `${AUTO_PREFIX}suspendedUntil`) !== undefined && configNumber(store, `${AUTO_PREFIX}suspendedUntil`)! <= nowMs) {
+    setOrDelete(store, `${AUTO_PREFIX}suspendedUntil`, undefined);
+    store.setConfig(`${AUTO_PREFIX}lastSuspensionEnd`, String(nowMs));
+  }
+  if (switched) store.setConfig(`${AUTO_PREFIX}lastSwitchAt`, String(nowMs));
+}
+
+/**
+ * Make exactly one Claude auto-switch decision. Polling is deliberately owned
+ * by G8/G11; this function consumes only its supplied or stored readings.
+ */
+export async function anthropicTick(deps: AnthropicTickDeps): Promise<AnthropicTickResult> {
+  const input = decisionInput(deps);
+  const decision = decideAutoswitch(input);
+  if (deps.dryRun) return { decision };
+
+  if (decision.kind !== 'switch') {
+    persistTickState(deps.store, input.activeAccountId, input.nowMs, decision, false);
+    return { decision };
+  }
+
+  if (!deps.switchDeps) throw new Error('anthropic tick requires switch dependencies to execute a switch');
+  const result = await (deps.switchClaude ?? switchClaude)(deps.switchDeps, {
+    to: decision.targetId,
+    trigger: decision.reason,
+    decision: {
+      leftHeadroom: decision.leftHeadroom,
+      leftRecoveryAt: decision.leftRecoveryAtMs,
+      leftTrigger: decision.leftTrigger,
+    },
+  });
+  // A refused/failed target is not tried again in this tick. Its durable switch
+  // row is the retry authority for the following tick.
+  persistTickState(deps.store, input.activeAccountId, input.nowMs, decision, result.outcome === 'ok');
+  return { decision, switchResult: result };
 }
