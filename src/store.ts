@@ -14,6 +14,7 @@ import { config } from './config';
 import { redactJson, redactKeyValueText, redactSecrets } from './redact';
 import type { BucketReading, Confidence } from './types';
 import { parseCodexRecoveryFence, type CodexRecoveryFence } from './codex-sessions';
+import type { CodexWatch } from './codex-switch';
 
 export const DEFAULT_DB_PATH = config.dbPath;
 
@@ -31,6 +32,38 @@ export interface PollClaimRow {
   holder_id: string;
   claimed_at: number;
   until: number;
+}
+
+/** Scheduler and outcome state for one provider/account usage poll. Times are epoch seconds. */
+export interface UsagePollRow {
+  accountId: string;
+  lastFetchAt: number | null;
+  lastAttemptAt: number | null;
+  nextDueAt: number | null;
+  pollIntervalS: number | null;
+  lastStatus: string | null;
+  consecutiveFailures: number;
+  backoffUntil: number | null;
+  last429At: number | null;
+  heldUntil: number | null;
+}
+
+export interface UsagePollResult {
+  attemptedAt: number;
+  status: string;
+  readings?: Record<string, BucketReading>;
+  http429?: boolean;
+  /** Provider Retry-After, in seconds, for a failed usage fetch. */
+  retryAfterS?: number;
+}
+
+function usageFailureBackoffS(failures: number, retryAfterS: number | undefined, rateLimited: boolean): number {
+  const computed = Math.min(30 * (2 ** Math.min(Math.max(0, failures - 1), 32)), 600);
+  if (typeof retryAfterS !== 'number' || !Number.isFinite(retryAfterS)) return computed;
+  if (retryAfterS === 0) return rateLimited ? Math.min(Math.max(computed, 300), 600) : computed;
+  let asked = Math.max(0, retryAfterS);
+  if (asked > 600 && rateLimited) asked += 900;
+  return Math.max(computed, Math.min(asked, rateLimited ? 4500 : 3600));
 }
 
 /** Credential-refresh lease (§4.7 / §4.8.2). De-duplication only — not a correctness fence. */
@@ -1726,6 +1759,57 @@ export class Store {
     }
   }
 
+  listUsagePolls(provider: string): Record<string, UsagePollRow> {
+    const rows = this.db.prepare(`SELECT account_id, last_fetch_at, last_attempt_at, next_due_at,
+      poll_interval_s, last_status, consecutive_failures, backoff_until, last_429_at, held_until
+      FROM usage_polls WHERE provider = ?`).all(provider) as Array<Record<string, unknown>>;
+    const out: Record<string, UsagePollRow> = {};
+    for (const row of rows) {
+      const value = (key: string): number | null => typeof row[key] === 'number' ? row[key] : null;
+      const accountId = String(row.account_id);
+      out[accountId] = {
+        accountId,
+        lastFetchAt: value('last_fetch_at'), lastAttemptAt: value('last_attempt_at'),
+        nextDueAt: value('next_due_at'), pollIntervalS: value('poll_interval_s'),
+        lastStatus: typeof row.last_status === 'string' ? row.last_status : null,
+        consecutiveFailures: typeof row.consecutive_failures === 'number' ? row.consecutive_failures : 0,
+        backoffUntil: value('backoff_until'), last429At: value('last_429_at'), heldUntil: value('held_until'),
+      };
+    }
+    return out;
+  }
+
+  /** Atomically retain accepted readings or record a redacted failed attempt. */
+  recordUsagePollResult(provider: string, accountId: string, result: UsagePollResult): void {
+    const status = redactSecrets(result.status, []);
+    this.runImmediate(() => {
+      if (result.readings) {
+        for (const [bucket, reading] of Object.entries(result.readings)) this.upsertSnapStmt.run(
+          accountId, bucket, reading.usedPct, reading.used ?? null, reading.limit ?? null,
+          reading.remaining ?? null, reading.resetAt ?? null, reading.fetchedAt, reading.source, reading.confidence,
+        );
+        this.db.prepare(`INSERT INTO usage_polls (provider, account_id, last_fetch_at, last_attempt_at, last_status, consecutive_failures, backoff_until, last_429_at)
+          VALUES (?, ?, ?, ?, ?, 0, NULL, NULL)
+          ON CONFLICT(provider, account_id) DO UPDATE SET last_fetch_at = excluded.last_fetch_at,
+            last_attempt_at = excluded.last_attempt_at, last_status = excluded.last_status,
+            consecutive_failures = 0, backoff_until = NULL,
+            last_429_at = usage_polls.last_429_at`).run(provider, accountId, result.attemptedAt, result.attemptedAt, status);
+      } else {
+        const prior = this.db.prepare('SELECT consecutive_failures FROM usage_polls WHERE provider = ? AND account_id = ?')
+          .get(provider, accountId) as { consecutive_failures: number } | undefined;
+        const failures = (prior?.consecutive_failures ?? 0) + 1;
+        const backoffUntil = result.attemptedAt + usageFailureBackoffS(failures, result.retryAfterS, result.http429 === true);
+        this.db.prepare(`INSERT INTO usage_polls (provider, account_id, last_attempt_at, last_status, consecutive_failures, backoff_until, last_429_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(provider, account_id) DO UPDATE SET last_attempt_at = excluded.last_attempt_at,
+            last_status = excluded.last_status, consecutive_failures = excluded.consecutive_failures,
+            backoff_until = excluded.backoff_until,
+            last_429_at = CASE WHEN excluded.last_429_at IS NULL THEN usage_polls.last_429_at ELSE excluded.last_429_at END`)
+          .run(provider, accountId, result.attemptedAt, status, failures, backoffUntil, result.http429 ? result.attemptedAt : null);
+      }
+    });
+  }
+
   /**
    * Persist next-poll plans as one short write transaction.  This deliberately
    * does not alter fetch, attempt, hold, or failure state, so the policy can
@@ -1756,9 +1840,9 @@ export class Store {
         UPDATE usage_polls SET next_due_at = ?, poll_interval_s = ?
         WHERE provider = ? AND account_id = ?
           AND next_due_at IS ? AND poll_interval_s IS ?
-          AND last_status IS NOT 'token_dead'
           AND (backoff_until IS NULL OR backoff_until <= ?)
           AND (held_until IS NULL OR held_until <= ?)
+          AND last_status IS NOT 'token_dead'
       `);
       for (const [accountId, plan] of rows) {
         const isRepair = now !== undefined
@@ -2185,7 +2269,7 @@ export class Store {
   recordCodexObservation(input: {
     identity: string | null;
     lineageFp: string | null;
-    by: 'qlb-switch' | 'qlb-watch' | 'qlb-reconcile';
+    by: 'qlb-switch' | 'qlb-watch' | 'qlb-reconcile' | 'qlb-active' | 'qlb-gate' | 'qlb-verify-l13';
     now: number;
   }): { appended: boolean; wipedEvent: boolean } {
     return this.runImmediate(() => this.recordCodexObservationInTransaction(input));
@@ -2195,7 +2279,7 @@ export class Store {
   private recordCodexObservationInTransaction(input: {
     identity: string | null;
     lineageFp: string | null;
-    by: 'qlb-switch' | 'qlb-watch' | 'qlb-reconcile';
+    by: 'qlb-switch' | 'qlb-watch' | 'qlb-reconcile' | 'qlb-active' | 'qlb-gate' | 'qlb-verify-l13';
     now: number;
   }): { appended: boolean; wipedEvent: boolean } {
     this.setConfig('codex.lastObservedAt', String(input.now));
@@ -2315,10 +2399,11 @@ export class Store {
         }
       };
 
-      const updated = this.db.prepare('UPDATE claude_slots SET last_active_at = ? WHERE account_id = ?').run(input.now, input.toAccount);
-      if (updated.changes !== 1) throw new Error('Claude switch target slot not found');
-      this.setActiveLogin('anthropic', input.toAccount, input.setBy, input.now);
+      const targetExists = this.db.prepare('SELECT 1 FROM claude_slots WHERE account_id = ?').get(input.toAccount);
+      if (!targetExists) throw new Error('Claude switch target slot not found');
       if (!input.republish) {
+        this.db.prepare('UPDATE claude_slots SET last_active_at = ? WHERE account_id = ?').run(input.now, input.toAccount);
+        this.setActiveLogin('anthropic', input.toAccount, input.setBy, input.now);
         this.setConfig('cooldown.anthropic', String(input.now + 300_000));
         this.setConfig('auto.anthropic.lastSwitchFrom', input.fromAccount);
         setOrDelete('auto.anthropic.lastSwitchTo', input.trigger === 'manual' ? null : input.toAccount);
@@ -2352,6 +2437,7 @@ export class Store {
     to: string;
     trigger: string;
     reason: string;
+    republish?: boolean;
     injected: boolean;
     attempt: string;
     now: number;
@@ -2363,7 +2449,7 @@ export class Store {
       toAccount: input.to,
       trigger: input.trigger,
       outcome: 'refused',
-      detail: input.reason,
+      detail: input.republish ? `republish:${input.reason}` : input.reason,
       injected: input.injected,
       stepsJson: JSON.stringify({ attempt: input.attempt }),
     });
@@ -2661,6 +2747,31 @@ export class Store {
       }
       return { switchId: typed.switch_id, outgoing: typed.outgoing, target: typed.target, nextAt: typed.next_at, until: typed.until,
         trigger: typed.trigger, attempt: typed.attempt, publishedAt: typed.published_at, openSessions };
+    });
+  }
+
+  /** Every pending watch with its committed-switch provenance, for the foreground C9 watcher. */
+  listCodexWatches(): CodexWatch[] {
+    return this.db.prepare(`SELECT w.switch_id, w.outgoing, w.target, w.until,
+      s.trigger, s.steps_json, s.published_at, s.open_sessions_json
+      FROM codex_watch w JOIN switch_log s ON s.id = w.switch_id
+      ORDER BY w.switch_id`).all().map((row) => {
+      const typed = row as {
+        switch_id: number; outgoing: string; target: string; until: number;
+        trigger: string; steps_json: string; published_at: number; open_sessions_json: string;
+      };
+      const attempt = (JSON.parse(typed.steps_json) as { attempt: string }).attempt;
+      const openSessions = JSON.parse(typed.open_sessions_json) as CodexWatch['openSessions'];
+      return {
+        switchId: typed.switch_id,
+        outgoing: typed.outgoing,
+        target: typed.target,
+        until: typed.until,
+        trigger: typed.trigger,
+        publishedAt: typed.published_at,
+        attempt,
+        openSessions,
+      };
     });
   }
 

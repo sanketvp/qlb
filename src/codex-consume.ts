@@ -73,10 +73,11 @@ export async function withCodexConsumeThenSwitchLocks<T>(
   dbPath: string,
   id: string,
   fn: (heldConsume: HeldProperLockfile, heldSwitch: HeldProperLockfile) => Promise<T> | T,
+  { timeoutMs = 10_000 }: CodexSwitchLockOptions = {},
 ): Promise<T> {
   const paths = codexLockPaths(dbPath, id);
   return withCodexOwnerTokenLock(paths.consume, (heldConsume) =>
-    withCodexOwnerTokenLock(paths.switch, (heldSwitch) => fn(heldConsume, heldSwitch), 10_000), 10_000);
+    withCodexOwnerTokenLock(paths.switch, (heldSwitch) => fn(heldConsume, heldSwitch), timeoutMs), timeoutMs);
 }
 
 type SqlStore = Pick<Store, 'dbPath'>;
@@ -460,9 +461,13 @@ async function persistTransition(
       VALUES (?, ?, ?, ?, ?, ?, 'qlb-cli', 'post')`)
       .run(now, PROVIDER, options.accountId, current.fingerprint, successorFp, cause);
     if (c9) {
-      const receipt = db.prepare(`INSERT INTO config (key, value) VALUES ('codex.l13VerifiedAt', ?)
-        ON CONFLICT(key) DO UPDATE SET value = excluded.value WHERE config.value IS NULL`).run(String(now));
+      const receipt = db.prepare(`INSERT INTO config (key, value) VALUES ('codex.l13.aForcedRefresh', 'ok')
+        ON CONFLICT(key) DO NOTHING`).run();
       if (Number(receipt.changes) !== 1) throw new Error('C9 receipt is no longer available');
+      db.prepare(`INSERT INTO config (key, value) VALUES ('codex.l13.aForcedRefreshAt', ?)
+        ON CONFLICT(key) DO NOTHING`).run(String(now));
+      db.prepare(`INSERT INTO config (key, value) VALUES ('codex.l13.aForcedRefreshSlot', ?)
+        ON CONFLICT(key) DO NOTHING`).run(options.accountId);
     }
     // The Keychain write above can block; re-check authority before COMMIT.
     assertHeld(options);

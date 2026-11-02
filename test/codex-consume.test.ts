@@ -121,6 +121,25 @@ describe('Codex consume lock helpers — C6-2', () => {
     }
   });
 
+  it('withCodexConsumeThenSwitchLocks honours options.timeoutMs on both locks and defaults to 10 s', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-codex-lock-timeout-'));
+    const dbPath = join(home, 'qlb.db');
+    const paths = codexLockPaths(dbPath, 'user:account');
+    try {
+      for (const lockPath of [paths.consume, paths.switch]) {
+        mkdirSync(lockPath, { recursive: true });
+        await assert.rejects(
+          withCodexConsumeThenSwitchLocks(dbPath, 'user:account', async () => assert.fail('must not acquire a held lock'), { timeoutMs: 20 }),
+          ClaudeCodeLockTimeout,
+        );
+        rmSync(lockPath, { recursive: true, force: true });
+      }
+      await withCodexConsumeThenSwitchLocks(dbPath, 'user:account', async () => {});
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it('a switch lock younger than five minutes is not taken over', async () => {
     const home = mkdtempSync(join(tmpdir(), 'qlb-codex-lock-stale-'));
     const dbPath = join(home, 'qlb.db');
@@ -469,6 +488,9 @@ describe('Codex consume gate — AC34', () => {
         transport: async () => ({ status: 200, body: JSON.stringify({ refresh_token: 'refresh-b', access_token: 'access-b' }) }),
       });
       assert.equal(result.status, 'stashed');
+      assert.equal(h.store.getConfig('codex.l13.aForcedRefresh'), null);
+      assert.equal(h.store.getConfig('codex.l13.aForcedRefreshAt'), null);
+      assert.equal(h.store.getConfig('codex.l13.aForcedRefreshSlot'), null);
       assert.equal(h.store.getConfig('codex.l13VerifiedAt'), null);
       assert.equal(codexFingerprint(h.slots.readSlot(h.plan.slotId, { fresh: true }).document), codexFingerprint(h.initial));
     } finally {
@@ -826,6 +848,43 @@ describe('Codex consume gate — AC34', () => {
     }
   });
 
+  it('a --c9 2xx writes codex.l13.aForcedRefresh=ok, aForcedRefreshAt and aForcedRefreshSlot in the POST transaction and never writes codex.l13VerifiedAt', async () => {
+    const h = managedFixture();
+    try {
+      const result = await consumeCodexSlot({
+        accountId: h.plan.slotId, snapshot: h.initial, trigger: 'force', force: true, allowHeld: true,
+        slots: h.slots, store: h.store, holders: async () => [], now: () => 2,
+        transport: async () => ({ status: 200, body: JSON.stringify({ refresh_token: 'refresh-b', access_token: 'access-b' }) }),
+      });
+      assert.equal(result.status, 'refreshed');
+      assert.equal(h.store.getConfig('codex.l13.aForcedRefresh'), 'ok');
+      assert.equal(h.store.getConfig('codex.l13.aForcedRefreshAt'), '2');
+      assert.equal(h.store.getConfig('codex.l13.aForcedRefreshSlot'), h.plan.slotId);
+      assert.equal(h.store.getConfig('codex.l13VerifiedAt'), null);
+    } finally {
+      h.store.close();
+      rmSync(h.home, { recursive: true, force: true });
+    }
+  });
+
+  it('a second forced POST racing the receipt rolls back and stashes the successor', async () => {
+    const h = managedFixture();
+    try {
+      h.store.setConfig('codex.l13.aForcedRefresh', 'ok');
+      const result = await consumeCodexSlot({
+        accountId: h.plan.slotId, snapshot: h.initial, trigger: 'force', force: true, allowHeld: true,
+        slots: h.slots, store: h.store, holders: async () => [], now: () => 2,
+        transport: async () => ({ status: 200, body: JSON.stringify({ refresh_token: 'refresh-b', access_token: 'access-b' }) }),
+      });
+      assert.equal(result.status, 'stashed');
+      assert.equal(codexFingerprint(h.slots.readSlot(h.plan.slotId, { fresh: true }).document), codexFingerprint(h.initial));
+      assert.equal((await listStashes(join(h.home, 'unclaimed'), 'openai-codex', h.plan.slotId)).length, 1);
+    } finally {
+      h.store.close();
+      rmSync(h.home, { recursive: true, force: true });
+    }
+  });
+
   it('refuses a forced refresh of the active Codex slot', async () => {
     let called = 0;
     const errors: string[] = [];
@@ -850,9 +909,17 @@ describe('Codex consume gate — AC34', () => {
       return { status: 'refreshed' as const };
     };
     const output: string[] = [];
+    const receiptWindow = new Map([
+      ['codex.l13.aJwtExp', '1700000000000'],
+      ['codex.l13.aSlot', 'user-a:account-a'],
+      ['codex.l13.messageAfterExpAt', '1700000000001'],
+      ['codex.l13.piServedFp', 'sha256:fixture'],
+      ['codex.l13.bSlot', 'user-b:account-b'],
+    ]);
 
     const code = await runCodexRefreshCommand(['user-a:account-a', '--force', '--c9', '--json'], {
-      getConfig: (key) => key === 'codex.l13.aJwtExp' ? '1700000000000' : null,
+      getConfig: (key) => receiptWindow.get(key) ?? null,
+      isActive: (accountId) => accountId === 'user-b:account-b',
       consume,
       write: (line) => output.push(line),
       error: () => assert.fail('unexpected command error'),
@@ -863,6 +930,7 @@ describe('Codex consume gate — AC34', () => {
 
     const rejected = await runCodexRefreshCommand(['user-a:account-a', '--force', '--c9'], {
       getConfig: () => null,
+      isActive: () => false,
       consume,
       write: () => assert.fail('must not write success'),
       error: (line) => output.push(line),
@@ -870,5 +938,74 @@ describe('Codex consume gate — AC34', () => {
     assert.equal(rejected, 3);
     assert.equal(posts, 1);
     assert.match(output.at(-1) ?? '', /c9-unavailable/);
+  });
+
+  it('--c9 is refused c9-unavailable once codex.l13.aForcedRefresh is set, with 0 POSTs', async () => {
+    const config = new Map([
+      ['codex.l13.aJwtExp', '1700000000000'],
+      ['codex.l13.aSlot', 'user-a:account-a'],
+      ['codex.l13.messageAfterExpAt', '1700000000001'],
+      ['codex.l13.piServedFp', 'sha256:fixture'],
+      ['codex.l13.bSlot', 'user-b:account-b'],
+      ['codex.l13.aForcedRefresh', 'ok'],
+    ]);
+    let posts = 0;
+    const code = await runCodexRefreshCommand(['user-a:account-a', '--force', '--c9'], {
+      getConfig: (key) => config.get(key) ?? null,
+      isActive: (accountId) => accountId === 'user-b:account-b',
+      consume: async () => { posts += 1; return { status: 'refreshed' }; },
+      write: () => assert.fail('must not write success'),
+      error: (line) => assert.match(line, /c9-unavailable/),
+    });
+    assert.equal(code, 3);
+    assert.equal(posts, 0);
+  });
+
+  it('--c9 on a slot other than codex.l13.aSlot is refused c9-unavailable with 0 POSTs', async () => {
+    const config = new Map([
+      ['codex.l13.aJwtExp', '1700000000000'],
+      ['codex.l13.aSlot', 'user-a:account-a'],
+      ['codex.l13.messageAfterExpAt', '1700000000001'],
+      ['codex.l13.piServedFp', 'sha256:fixture'],
+      ['codex.l13.bSlot', 'user-b:account-b'],
+    ]);
+    let posts = 0;
+    const code = await runCodexRefreshCommand(['other:account', '--force', '--c9'], {
+      getConfig: (key) => config.get(key) ?? null,
+      isActive: (accountId) => accountId === 'user-b:account-b',
+      consume: async () => { posts += 1; return { status: 'refreshed' }; },
+      write: () => assert.fail('must not write success'),
+      error: (line) => assert.match(line, /c9-unavailable/),
+    });
+    assert.equal(code, 3);
+    assert.equal(posts, 0);
+  });
+
+  it('--c9 before messageAfterExpAt, without piServedFp, or while bSlot is not active is refused c9-unavailable with 0 POSTs', async () => {
+    const base = new Map([
+      ['codex.l13.aJwtExp', '1700000000000'],
+      ['codex.l13.aSlot', 'user-a:account-a'],
+      ['codex.l13.messageAfterExpAt', '1700000000001'],
+      ['codex.l13.piServedFp', 'sha256:fixture'],
+      ['codex.l13.bSlot', 'user-b:account-b'],
+    ]);
+    for (const [key, value, active] of [
+      ['codex.l13.messageAfterExpAt', '1700000000000', true],
+      ['codex.l13.piServedFp', null, true],
+      ['codex.l13.bSlot', 'user-b:account-b', false],
+    ] as const) {
+      const config = new Map(base);
+      if (value === null) config.delete(key); else config.set(key, value);
+      let posts = 0;
+      const code = await runCodexRefreshCommand(['user-a:account-a', '--force', '--c9'], {
+        getConfig: (configKey) => config.get(configKey) ?? null,
+        isActive: (accountId) => active && accountId === 'user-b:account-b',
+        consume: async () => { posts += 1; return { status: 'refreshed' }; },
+        write: () => assert.fail('must not write success'),
+        error: (line) => assert.match(line, /c9-unavailable/),
+      });
+      assert.equal(code, 3);
+      assert.equal(posts, 0);
+    }
   });
 });

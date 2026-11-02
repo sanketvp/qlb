@@ -1,0 +1,382 @@
+import assert from 'node:assert/strict';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { describe, it } from 'node:test';
+
+import { pollAnthropic } from '../src/auto/anthropic';
+import { claudePaths } from '../src/cc-paths';
+import { credentialLineage, ProbeVerdictMemo, type LiveIdentity } from '../src/cc-resync';
+import { ClaudeSlots, InMemoryClaudeSlotRepository } from '../src/cc-slots';
+import { MockKeychain } from '../src/keychain';
+import { openStore } from '../src/store';
+
+const NOW = 1_700_000_000;
+
+function credential(tag: string, expiresAt = (NOW + 60 * 60) * 1000): string {
+  return JSON.stringify({ claudeAiOauth: { accessToken: `access-${tag}`, refreshToken: `refresh-${tag}`, expiresAt } });
+}
+
+async function fixture() {
+  const home = mkdtempSync(join(tmpdir(), 'qlb-auto-anthropic-'));
+  const env = { QLB_TEST_MODE: '1', QLB_HOME: home, HOME: home };
+  const store = openStore(':memory:');
+  const backend = new MockKeychain();
+  let now = NOW;
+  const slots = new ClaudeSlots({ backend, repository: new InMemoryClaudeSlotRepository(), stashDir: join(home, 'unclaimed'), now: () => now * 1000 });
+  await slots.createSlot({ accountId: 'active', credential: credential('active'), email: 'active@example.test', orgUuid: 'active-org', slotNum: 1, source: 'fixture' });
+  await slots.createSlot({ accountId: 'inactive', credential: credential('inactive'), email: 'inactive@example.test', orgUuid: 'inactive-org', slotNum: 2, source: 'fixture' });
+  store.setActiveLogin('anthropic', 'active', 'fixture', NOW);
+  let gets = 0;
+  let posts = 0;
+  let response: { status: number; body: string; retryAfterS?: number } = { status: 200, body: JSON.stringify({ five_hour: { utilization: 20 }, seven_day: { utilization: 10 } }) };
+  const paths = claudePaths({ home, env });
+  const deps = () => ({
+    store, slots, now: () => now, rng: () => 0.5,
+    fetchActiveDeps: {
+      live: { backend, paths, account: 'fixture', home, env }, env, now: () => now * 1000,
+      verdicts: new ProbeVerdictMemo(), by: 'qlb-auto' as const, postRefresh: async () => { posts += 1; return { status: 500, body: '' }; },
+    },
+    resyncDeps: {
+      live: { backend, paths, account: 'fixture', home, env }, env, now: () => now * 1000,
+      getProfile: async () => ({ status: 500, body: '' }), readLiveIdentity: (): LiveIdentity | null => null, by: 'qlb-auto' as const,
+    },
+    consumeDeps: {
+      postRefresh: async () => { posts += 1; return { status: 200, body: JSON.stringify({ access_token: 'access-refreshed', refresh_token: 'refresh-refreshed', expires_in: 3600 }) }; },
+    },
+    getUsage: async (_accessToken: string) => { gets += 1; return response; },
+  });
+  return {
+    store, slots, backend, paths, deps, calls: () => ({ gets, posts }),
+    now: (value: number) => { now = value; },
+    response: (value: typeof response) => { response = value; },
+  };
+}
+
+function skipActive(f: Awaited<ReturnType<typeof fixture>>) {
+  f.store.writeUsagePollPlans('anthropic', { active: { nextDueAt: NOW + 300, pollIntervalS: 300 } });
+}
+
+describe('auto anthropic poll (G8)', () => {
+  it('an expired inactive slot is refreshed through the consume gate once', async () => {
+    const f = await fixture();
+    await f.slots.writeSlot('inactive', credential('expired', (NOW - 1) * 1000), { cause: 'fixture' });
+    skipActive(f);
+    await pollAnthropic(f.deps());
+    assert.deepEqual(f.calls(), { gets: 1, posts: 1 });
+  });
+
+  it('a poll failure counts as unknown and keeps the last reading within 180 s', async () => {
+    const f = await fixture();
+    skipActive(f);
+    f.store.upsertSnapshot('inactive', '5h', { usedPct: 42, fetchedAt: NOW * 1000, source: 'poll', confidence: 'authoritative' });
+    f.response({ status: 500, body: 'unavailable' });
+    const accounts = await pollAnthropic(f.deps());
+    assert.equal(f.store.getAllSnapshots('inactive')['5h']?.usedPct, 42);
+    assert.equal(accounts.find((account) => account.accountId === 'inactive')?.buckets['5h']?.usedPct, 42);
+    assert.equal(f.store.listUsagePolls('anthropic').inactive?.lastStatus, 'http-500');
+  });
+
+  it('the active slot is never POSTed while it has more than 5 minutes left', async () => {
+    const f = await fixture();
+    f.store.writeUsagePollPlans('anthropic', { inactive: { nextDueAt: NOW + 300, pollIntervalS: 300 } });
+    await pollAnthropic(f.deps());
+    assert.deepEqual(f.calls(), { gets: 1, posts: 0 });
+  });
+
+  it('a tick before next_due_at makes no HTTP call', async () => {
+    const f = await fixture();
+    f.store.writeUsagePollPlans('anthropic', {
+      active: { nextDueAt: NOW + 1, pollIntervalS: 300 }, inactive: { nextDueAt: NOW + 1, pollIntervalS: 300 },
+    });
+    await pollAnthropic(f.deps());
+    assert.deepEqual(f.calls(), { gets: 0, posts: 0 });
+  });
+
+  it('a recent 429 lengthens the next poll', async () => {
+    const f = await fixture();
+    skipActive(f);
+    f.response({ status: 429, body: 'rate limited' });
+    await pollAnthropic(f.deps());
+    assert.ok((f.store.listUsagePolls('anthropic').inactive?.pollIntervalS ?? 0) > 300);
+  });
+
+  it('token-shaped text in a usage body never reaches usage_polls.last_status', async () => {
+    const f = await fixture();
+    skipActive(f);
+    const secret = 'sk-abcdefghijklmnopqrstuvwxyz123456';
+    f.response({ status: 200, body: `{not-json ${secret}}` });
+    await pollAnthropic(f.deps());
+    const status = f.store.listUsagePolls('anthropic').inactive?.lastStatus ?? '';
+    assert.equal(status.includes(secret), false);
+    assert.equal(status, 'usage-unreadable');
+  });
+
+  it('keeps scheduled readings known across steady 60-second ticks', async () => {
+    const f = await fixture();
+    await f.slots.writeSlot('active', credential('active-long', (NOW + 7200) * 1000), { cause: 'fixture' });
+    for (let tick = 0; tick < 60; tick += 1) {
+      f.now(NOW + tick * 60);
+      const accounts = await pollAnthropic(f.deps());
+      assert.ok(accounts.every((account) => account.buckets['5h']?.usedPct !== undefined));
+    }
+  });
+
+  it('strikes a dead inactive token and never posts it again', async () => {
+    const f = await fixture();
+    await f.slots.writeSlot('inactive', credential('expired', (NOW - 1) * 1000), { cause: 'fixture' });
+    skipActive(f);
+    const deps = f.deps();
+    let deadPosts = 0;
+    deps.consumeDeps.postRefresh = async () => { deadPosts += 1; return { status: 400, body: '{"error":"invalid_grant"}' }; };
+    await pollAnthropic(deps);
+    assert.equal(f.store.listUsagePolls('anthropic').inactive?.lastStatus, 'consume-dead');
+    assert.equal(f.slots.getSlot('inactive')?.dead, true);
+    await pollAnthropic(deps);
+    assert.equal(deadPosts, 1);
+  });
+
+  it('a lineage-moved dead strike does not quarantine an inactive slot', async () => {
+    const f = await fixture();
+    await f.slots.writeSlot('inactive', credential('expired', (NOW - 1) * 1000), { cause: 'fixture' });
+    skipActive(f);
+    const deps = f.deps();
+    deps.consumeDeps.postRefresh = async () => ({ status: 400, body: '{"error":"invalid_grant"}' });
+    (f.slots as unknown as { strikeDead: () => Promise<'lineage-moved'> }).strikeDead = async () => 'lineage-moved';
+    await pollAnthropic(deps);
+    assert.equal(f.slots.getSlot('inactive')?.dead, false);
+    assert.equal(f.store.listUsagePolls('anthropic').inactive?.lastStatus, 'consume-dead');
+  });
+
+  it('records an unpersisted inactive successor as a failed consume without using it', async () => {
+    const f = await fixture();
+    await f.slots.writeSlot('inactive', credential('expired', (NOW - 1) * 1000), { cause: 'fixture' });
+    skipActive(f);
+    (f.slots as unknown as { writeSlot: () => Promise<void> }).writeSlot = async () => { throw new Error('fixture write failure'); };
+    (f.slots as unknown as { stashUnclaimed: () => Promise<void> }).stashUnclaimed = async () => { throw new Error('fixture stash failure'); };
+    await pollAnthropic(f.deps());
+    const row = f.store.listUsagePolls('anthropic').inactive;
+    assert.equal(row?.lastStatus, 'consume-consume-gate-unpersisted');
+    assert.ok((row?.backoffUntil ?? 0) >= NOW + 3600);
+    const db = (f.store as unknown as { db: { prepare: (sql: string) => { get: () => { detail: string } | undefined } } }).db;
+    assert.equal(db.prepare("SELECT detail FROM switch_log WHERE detail = 'freshen-consume-gate-unpersisted'").get()?.detail, 'freshen-consume-gate-unpersisted');
+    f.now(NOW + 3599);
+    await pollAnthropic(f.deps());
+    assert.equal(f.calls().posts, 1);
+  });
+
+  it('drops unconfigured scoped windows from returned accounts', async () => {
+    const f = await fixture();
+    f.store.writeUsagePollPlans('anthropic', {
+      active: { nextDueAt: NOW + 300, pollIntervalS: 300 }, inactive: { nextDueAt: NOW + 300, pollIntervalS: 300 },
+    });
+    f.store.upsertSnapshot('active', '5h', { usedPct: 20, fetchedAt: NOW * 1000, source: 'poll', confidence: 'authoritative' });
+    f.store.upsertSnapshot('active', '7d:Fable', { usedPct: 100, fetchedAt: NOW * 1000, source: 'poll', confidence: 'authoritative' });
+    const accounts = await pollAnthropic({ ...f.deps(), models: [] });
+    assert.equal(accounts.find((account) => account.accountId === 'active')?.buckets['7d:Fable'], undefined);
+  });
+
+  it('rechecks active ownership before refreshing an inactive candidate', async () => {
+    const f = await fixture();
+    await f.slots.writeSlot('inactive', credential('expired', (NOW - 1) * 1000), { cause: 'fixture' });
+    skipActive(f);
+    const readSlot = f.slots.readSlot.bind(f.slots);
+    let switched = false;
+    (f.slots as unknown as { readSlot: typeof f.slots.readSlot }).readSlot = async (accountId, options) => {
+      const read = await readSlot(accountId, options);
+      if (accountId === 'inactive' && !switched) {
+        switched = true;
+        f.store.setActiveLogin('anthropic', 'inactive', 'fixture', NOW);
+      }
+      return read;
+    };
+    await pollAnthropic(f.deps());
+    assert.deepEqual(f.calls(), { gets: 0, posts: 0 });
+  });
+
+  it('never refreshes an inactive slot that shares Claude Code live lineage', async () => {
+    const f = await fixture();
+    const expired = credential('shared', (NOW - 1) * 1000);
+    await f.slots.writeSlot('inactive', expired, { cause: 'fixture' });
+    await f.backend.set(f.paths.keychainService, 'fixture', expired);
+    skipActive(f);
+    await pollAnthropic(f.deps());
+    assert.deepEqual(f.calls(), { gets: 0, posts: 0 });
+  });
+
+  it('uses the live credential for an active usage poll', async () => {
+    const f = await fixture();
+    await f.backend.set(f.paths.keychainService, 'fixture', credential('live'));
+    f.store.writeUsagePollPlans('anthropic', { inactive: { nextDueAt: NOW + 300, pollIntervalS: 300 } });
+    let servedLive = false;
+    const deps = f.deps();
+    deps.getUsage = async (accessToken) => {
+      servedLive = accessToken === 'access-live';
+      return { status: 200, body: JSON.stringify({ five_hour: { utilization: 20 }, seven_day: { utilization: 10 } }) };
+    };
+    await pollAnthropic(deps);
+    assert.equal(servedLive, true);
+  });
+
+  it('a re-logged-in slot is polled again', async () => {
+    const f = await fixture();
+    await f.slots.writeSlot('inactive', credential('expired', (NOW - 1) * 1000), { cause: 'fixture' });
+    skipActive(f);
+    const deps = f.deps();
+    deps.consumeDeps.postRefresh = async () => ({ status: 400, body: '{"error":"invalid_grant"}' });
+    await pollAnthropic(deps);
+    assert.equal(f.slots.getSlot('inactive')?.dead, true);
+    await f.slots.writeSlot('inactive', credential('relogged'), { cause: 'fixture-relogin' });
+    const dueAt = f.store.listUsagePolls('anthropic').inactive?.nextDueAt;
+    assert.ok(dueAt !== undefined);
+    f.now(dueAt!);
+    await pollAnthropic(deps);
+    assert.equal(f.store.listUsagePolls('anthropic').inactive?.lastStatus, 'ok');
+  });
+
+  it('a throttled healthy active does not fail over during a 4500 s block', async () => {
+    const f = await fixture();
+    f.store.writeUsagePollPlans('anthropic', { inactive: { nextDueAt: NOW + 10_000, pollIntervalS: 300 } });
+    await pollAnthropic(f.deps());
+    const dueAt = f.store.listUsagePolls('anthropic').active?.nextDueAt;
+    assert.ok(dueAt !== undefined);
+    f.now(dueAt!);
+    f.response({ status: 429, body: 'rate limited', retryAfterS: 3600 });
+    await pollAnthropic(f.deps());
+    const blockUntil = f.store.listUsagePolls('anthropic').active?.backoffUntil;
+    assert.ok(blockUntil !== undefined);
+    f.now(blockUntil! - 1);
+    const accounts = await pollAnthropic(f.deps());
+    assert.equal(accounts.find((account) => account.accountId === 'active')?.buckets['5h']?.usedPct, 20);
+  });
+
+  it('an active hard sentinel does not extend the last reading past 180 s', async () => {
+    const f = await fixture();
+    f.store.writeUsagePollPlans('anthropic', { inactive: { nextDueAt: NOW + 10_000, pollIntervalS: 300 } });
+    await pollAnthropic(f.deps());
+    const dueAt = f.store.listUsagePolls('anthropic').active?.nextDueAt;
+    assert.ok(dueAt !== undefined);
+    await f.slots.writeSlot('active', credential('expired-active', (NOW - 1) * 1000), { cause: 'fixture' });
+    f.now(dueAt!);
+    await pollAnthropic(f.deps());
+    f.now(dueAt! + 181);
+    const accounts = await pollAnthropic(f.deps());
+    assert.equal(accounts.find((account) => account.accountId === 'active')?.buckets['5h'], undefined);
+  });
+
+  it('keeps polling and repairs a same-account Claude Code rotation across many ticks', async () => {
+    const f = await fixture();
+    const rotated = credential('active-rotated', (NOW + 7_200) * 1000);
+    await f.backend.set(f.paths.keychainService, 'fixture', rotated);
+    f.store.writeUsagePollPlans('anthropic', { inactive: { nextDueAt: NOW + 10_000, pollIntervalS: 300 } });
+    const deps = f.deps();
+    deps.resyncDeps.readLiveIdentity = () => ({ accountId: 'active', email: 'active@example.test', orgUuid: 'active-org' });
+    deps.resyncDeps.getProfile = async () => ({ status: 200, body: JSON.stringify({ account: { uuid: 'active' }, organization: { uuid: 'active-org' } }) });
+    for (let tick = 0; tick < 45; tick += 1) {
+      f.now(NOW + tick * 60);
+      const accounts = await pollAnthropic(deps);
+      assert.equal(f.store.getActiveLogin('anthropic')?.accountId, 'active');
+      assert.equal(accounts.find((account) => account.accountId === 'active')?.buckets['5h']?.usedPct, 20);
+    }
+    assert.ok(f.calls().gets > 1);
+    assert.equal(f.calls().posts, 0);
+    assert.equal(f.slots.getSlot('active')?.fingerprint, credentialLineage(rotated));
+  });
+
+  it('discards an active reading when the active account changes during its poll', async () => {
+    const f = await fixture();
+    const deps = f.deps();
+    let requests = 0;
+    deps.getUsage = async () => {
+      requests += 1;
+      f.store.setActiveLogin('anthropic', 'inactive', 'fixture', NOW);
+      return { status: 200, body: JSON.stringify({ five_hour: { utilization: 20 }, seven_day: { utilization: 10 } }) };
+    };
+    await pollAnthropic(deps);
+    assert.equal(requests, 1);
+    assert.deepEqual(f.store.listUsagePolls('anthropic'), {});
+    assert.deepEqual(f.store.getAllSnapshots('active'), {});
+    assert.deepEqual(f.store.getAllSnapshots('inactive'), {});
+  });
+
+  it('a spend-guard skip yields to the next inactive candidate', async () => {
+    const f = await fixture();
+    const shared = credential('shared', (NOW - 1) * 1000);
+    await f.slots.writeSlot('inactive', shared, { cause: 'fixture' });
+    await f.backend.set(f.paths.keychainService, 'fixture', shared);
+    await f.slots.createSlot({ accountId: 'other', credential: credential('other'), email: 'other@example.test', orgUuid: 'other-org', slotNum: 3, source: 'fixture' });
+    skipActive(f);
+    await pollAnthropic(f.deps());
+    f.now(NOW + 1);
+    await pollAnthropic(f.deps());
+    assert.equal(f.store.listUsagePolls('anthropic').other?.lastStatus, 'ok');
+  });
+
+  it('an unreadable live credential fails closed before inactive spend', async () => {
+    const f = await fixture();
+    await f.slots.writeSlot('inactive', credential('expired', (NOW - 1) * 1000), { cause: 'fixture' });
+    skipActive(f);
+    const deps = f.deps();
+    deps.fetchActiveDeps.live.backend.get = async () => { throw new Error('fixture unreadable'); };
+    await pollAnthropic(deps);
+    assert.equal(f.calls().posts, 0);
+  });
+
+  it('does not spend an expired inactive slot when no active row exists', async () => {
+    const f = await fixture();
+    await f.slots.writeSlot('inactive', credential('expired', (NOW - 1) * 1000), { cause: 'fixture' });
+    await f.backend.set(f.paths.keychainService, 'fixture', credential('rotated-live'));
+    f.store.setActiveLogin('anthropic', null, 'fixture', NOW);
+    f.store.writeUsagePollPlans('anthropic', { active: { nextDueAt: NOW + 300, pollIntervalS: 300 } });
+    await pollAnthropic(f.deps());
+    assert.deepEqual(f.calls(), { gets: 0, posts: 0 });
+  });
+
+  it('records inactive invalid_client for the doctor check', async () => {
+    const f = await fixture();
+    await f.slots.writeSlot('inactive', credential('expired', (NOW - 1) * 1000), { cause: 'fixture' });
+    skipActive(f);
+    const deps = f.deps();
+    deps.consumeDeps.postRefresh = async () => ({ status: 400, body: '{"error":"invalid_client"}' });
+    await pollAnthropic(deps);
+    assert.equal(f.store.listUsagePolls('anthropic').inactive?.lastStatus, 'invalid_client');
+  });
+
+  it('drops a 429 snapshot at its earliest window reset', async () => {
+    const f = await fixture();
+    f.store.writeUsagePollPlans('anthropic', {
+      active: { nextDueAt: NOW + 10_000, pollIntervalS: 10_000 }, inactive: { nextDueAt: NOW + 10_000, pollIntervalS: 10_000 },
+    });
+    f.store.upsertSnapshot('active', '5h', { usedPct: 20, fetchedAt: (NOW - 301) * 1000, resetAt: NOW * 1000 - 1, source: 'poll', confidence: 'authoritative' });
+    f.store.upsertSnapshot('active', '7d', { usedPct: 10, fetchedAt: (NOW - 301) * 1000, resetAt: (NOW + 86_400) * 1000, source: 'poll', confidence: 'authoritative' });
+    f.store.recordUsagePollResult('anthropic', 'active', { attemptedAt: NOW - 301, status: 'http-429', http429: true });
+    const accounts = await pollAnthropic(f.deps());
+    assert.deepEqual(accounts.find((account) => account.accountId === 'active')?.buckets, {});
+  });
+
+  it('keeps last_429_at after a later successful poll', async () => {
+    const f = await fixture();
+    skipActive(f);
+    f.response({ status: 429, body: 'rate limited' });
+    await pollAnthropic(f.deps());
+    const dueAt = f.store.listUsagePolls('anthropic').inactive?.nextDueAt;
+    assert.ok(dueAt !== undefined);
+    f.now(dueAt!);
+    f.response({ status: 200, body: JSON.stringify({ five_hour: { utilization: 20 }, seven_day: { utilization: 10 } }) });
+    await pollAnthropic(f.deps());
+    assert.equal(f.store.listUsagePolls('anthropic').inactive?.last429At, NOW);
+  });
+
+  it('persists Retry-After as a due-candidate backoff', async () => {
+    const f = await fixture();
+    skipActive(f);
+    f.response({ status: 429, body: 'rate limited', retryAfterS: 3000 });
+    await pollAnthropic(f.deps());
+    const row = f.store.listUsagePolls('anthropic').inactive;
+    assert.ok((row?.backoffUntil ?? 0) >= NOW + 3000);
+    f.now(NOW + 2999);
+    f.store.writeUsagePollPlans('anthropic', { active: { nextDueAt: NOW + 3299, pollIntervalS: 300 } });
+    await pollAnthropic(f.deps());
+    assert.equal(f.calls().gets, 1);
+  });
+});

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
-import { existsSync, fsyncSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, fsyncSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
 import { createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { describe, it } from 'node:test';
@@ -25,6 +25,7 @@ import {
   publishCodexAuth,
   type CodexSwitchDeps,
   type CodexSwitchJournal,
+  type SwitchCodexInput,
   codexSwitchJournalOwnerLockPath,
   codexSwitchJournalPath,
   deleteCodexSwitchJournalIf,
@@ -49,7 +50,9 @@ import { MockKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from '../src/k
 import { holderSets, readCodexSwitchHistory, stillTheSameProcess, type CodexProcess, type CodexRecoveryFence } from '../src/codex-sessions';
 import { consumeUnderCodexLocks, runCodexRefreshCommand } from '../src/commands/codex-refresh';
 import { runCodexImportActiveCommand } from '../src/commands/codex-import-active';
-import type { CommandContext } from '../src/registry';
+import { createSwitchOpenAiCodexCommand } from '../src/commands/switch-openai-codex';
+import { defaultConfig } from '../src/config';
+import { discoverCommands, type CommandContext } from '../src/registry';
 import { assertAdmitted, beginCutover, type LifecycleOperation } from '../src/lifecycle';
 import { openStore } from '../src/store';
 
@@ -179,7 +182,11 @@ function observeHarness() {
       return { stashId: `fixture-stash-${fingerprint}`, created };
     },
   };
-  const run = (overrides: Partial<CodexSwitchDeps> = {}, assertHeld: () => void = () => undefined) => observeLiveCodex(h.deps({
+  const run = (
+    overrides: Partial<CodexSwitchDeps> = {},
+    assertHeld: () => void = () => undefined,
+    options?: Parameters<typeof observeLiveCodex>[2],
+  ) => observeLiveCodex(h.deps({
     dbPath: h.store.dbPath,
     authPath,
     keychain,
@@ -187,7 +194,7 @@ function observeHarness() {
     list: async () => [],
     readLive: () => readCodexAuthStableWithStat(authPath, { delayMs: 0 }),
     ...overrides,
-  }), assertHeld);
+  }), assertHeld, options);
   return {
     ...h, keychain, authPath, a0, plan, slots, run,
     stashes: () => stashed.size,
@@ -197,6 +204,41 @@ function observeHarness() {
 
 function scalarCount(db: DatabaseSync, sql: string): number {
   return (db.prepare(sql).get() as { count: number }).count;
+}
+
+type TreeSnapshotEntry =
+  | { path: string; type: 'file'; mode: number; bytes: Buffer }
+  | { path: string; type: 'dir'; mode: number }
+  | { path: string; type: 'symlink'; mode: number; target: string }
+  | { path: string; type: 'other'; mode: number };
+
+function snapshotFiles(root: string): TreeSnapshotEntry[] {
+  if (!existsSync(root)) return [];
+  const entries: TreeSnapshotEntry[] = [];
+  const visit = (directory: string): void => {
+    for (const entry of readdirSync(directory, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+      const path = join(directory, entry.name);
+      const stat = lstatSync(path);
+      const snapshot = { path: relative(root, path), mode: stat.mode };
+      if (stat.isDirectory()) {
+        entries.push({ ...snapshot, type: 'dir' });
+        visit(path);
+      } else if (stat.isFile()) {
+        entries.push({ ...snapshot, type: 'file', bytes: readFileSync(path) });
+      } else if (stat.isSymbolicLink()) {
+        entries.push({ ...snapshot, type: 'symlink', target: readlinkSync(path) });
+      } else {
+        entries.push({ ...snapshot, type: 'other' });
+      }
+    }
+  };
+  visit(root);
+  return entries;
+}
+
+function snapshotDatabase(db: DatabaseSync): Array<[string, unknown[]]> {
+  return (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").all() as Array<{ name: string }>)
+    .map(({ name }) => [name, db.prepare(`SELECT * FROM "${name}"`).all()] as [string, unknown[]]);
 }
 
 function switchRows(db: DatabaseSync): Array<Record<string, unknown>> {
@@ -904,7 +946,7 @@ describe('Codex locked observe step — C6-16', () => {
         calls += 1;
         if (calls === 2) writeFileSync(h.authPath, JSON.stringify(codexWrite));
         return readCodexAuthStableWithStat(h.authPath, { delayMs: 0 });
-      } }), CodexLiveChanged);
+      } }, () => undefined, { onRepublish: 'settle' }), CodexLiveChanged);
       assert.equal(codexFingerprint(JSON.parse(readFileSync(h.authPath, 'utf8')) as CodexAuthDocument), codexFingerprint(codexWrite));
     } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
   });
@@ -1117,6 +1159,210 @@ describe('Codex locked observe step — C6-16', () => {
       assert.equal(h.stashes(), 0);
       assert.equal(h.store.getCodexActiveLogin(), active);
     } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('observeLiveCodex reports noop, republish-slot, adopt and drift as its action', async () => {
+    const noop = observeHarness();
+    const republish = observeHarness();
+    const adopt = observeHarness();
+    const drift = observeHarness();
+    try {
+      const nooped = await noop.run();
+      assert.equal(nooped.outcome, 'settled');
+      assert.equal(nooped.outcome === 'settled' && nooped.action, 'noop');
+
+      const a1 = observedDocument('a', 'a1');
+      importActiveCodexSlot(a1, { store: republish.store, keychain: republish.keychain, now: () => 2 });
+      const republished = await republish.run({}, () => undefined, { onRepublish: 'settle' });
+      assert.equal(republished.outcome, 'settled');
+      assert.equal(republished.outcome === 'settled' && republished.action, 'republish-slot');
+
+      const adopted = observedDocument('a', 'adopted');
+      writeFileSync(adopt.authPath, JSON.stringify(adopted));
+      const adoptedResult = await adopt.run();
+      assert.equal(adoptedResult.outcome, 'settled');
+      assert.equal(adoptedResult.outcome === 'settled' && adoptedResult.action, 'adopt');
+
+      const b = observedDocument('b', 'b0');
+      const bPlan = importActiveCodexSlot(b, { store: drift.store, keychain: drift.keychain, now: () => 2 });
+      drift.store.setActiveLogin('openai-codex', drift.plan.slotId, 'import');
+      writeFileSync(drift.authPath, JSON.stringify(b));
+      const drifted = await drift.run();
+      assert.equal(drifted.outcome, 'settled');
+      assert.equal(drifted.outcome === 'settled' && drifted.action, 'drift');
+      if (drifted.outcome !== 'settled' || drifted.action !== 'drift') assert.fail('expected drift');
+      assert.equal(drifted.accountId, bPlan.slotId);
+    } finally {
+      for (const h of [noop, republish, adopt, drift]) {
+        h.store.close();
+        rmSync(h.root, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it('observeLiveCodex records the observation with the caller\'s by (qlb-active) and defaults to qlb-switch', async () => {
+    const active = observeHarness();
+    const fallback = observeHarness();
+    try {
+      await active.run({}, () => undefined, { by: 'qlb-active' });
+      await fallback.run();
+      assert.equal((active.db.prepare('SELECT by FROM codex_live_observations ORDER BY id DESC LIMIT 1').get() as { by: string }).by, 'qlb-active');
+      assert.equal((fallback.db.prepare('SELECT by FROM codex_live_observations ORDER BY id DESC LIMIT 1').get() as { by: string }).by, 'qlb-switch');
+    } finally {
+      for (const h of [active, fallback]) {
+        h.store.close();
+        rmSync(h.root, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it('onRepublish=settle returns the republished slot document with the post-publish read instead of throwing', async () => {
+    const h = observeHarness();
+    const a1 = observedDocument('a', 'a1');
+    try {
+      importActiveCodexSlot(a1, { store: h.store, keychain: h.keychain, now: () => 2 });
+      const result = await h.run({}, () => undefined, { onRepublish: 'settle' });
+      assert.equal(result.outcome, 'settled');
+      assert.equal(result.outcome === 'settled' && result.action, 'republish-slot');
+      if (result.outcome !== 'settled' || result.action !== 'republish-slot') assert.fail('expected republish');
+      assert.equal(codexFingerprint(result.outgoing.document), codexFingerprint(a1));
+      assert.equal(result.postPublish.status, 'ok');
+    } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('onRepublish=settle uses the published file-byte hash when its post-publish read is not ok', async () => {
+    const h = observeHarness();
+    const a1 = observedDocument('a', 'a1');
+    try {
+      importActiveCodexSlot(a1, { store: h.store, keychain: h.keychain, now: () => 2 });
+      let reads = 0;
+      const result = await h.run({ readLive: async () => {
+        reads += 1;
+        if (reads === 3) return { status: 'unstable' };
+        return readCodexAuthStableWithStat(h.authPath, { delayMs: 0 });
+      } }, () => undefined, { onRepublish: 'settle' });
+      assert.equal(result.outcome, 'settled');
+      assert.equal(result.outcome === 'settled' && result.action, 'republish-slot');
+      if (result.outcome !== 'settled' || result.action !== 'republish-slot') assert.fail('expected republish');
+      const published = await readCodexAuthStableWithStat(h.authPath, { delayMs: 0 });
+      assert.equal(published.status, 'ok');
+      if (published.status !== 'ok') assert.fail('expected stable published file');
+      assert.equal(result.postPublish.status, 'unstable');
+      assert.equal(result.outgoing.sha256, published.sha256);
+    } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('onRepublish=settle returns a drifted republish with its post-publish read instead of throwing', async () => {
+    const h = observeHarness();
+    const b0 = observedDocument('b', 'b0');
+    const b1 = observedDocument('b', 'b1');
+    try {
+      const b = importActiveCodexSlot(b0, { store: h.store, keychain: h.keychain, now: () => 2 });
+      importActiveCodexSlot(b1, { store: h.store, keychain: h.keychain, now: () => 3 });
+      h.store.setActiveLogin('openai-codex', h.plan.slotId, 'import');
+      writeFileSync(h.authPath, JSON.stringify(b0));
+      const result = await h.run({}, () => undefined, { onRepublish: 'settle' });
+      assert.equal(result.outcome, 'settled');
+      assert.equal(result.outcome === 'settled' && result.action, 'drift');
+      if (result.outcome !== 'settled' || result.action !== 'drift') assert.fail('expected drift');
+      assert.equal(result.disposition, 'republish-slot');
+      assert.equal(result.accountId, b.slotId);
+      assert.equal(codexFingerprint(result.outgoing.document), codexFingerprint(b1));
+      assert.equal(result.postPublish?.status, 'ok');
+    } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('onRepublish defaults to throw: a republish and a drifted republish still throw CodexLiveChanged', async () => {
+    const republish = observeHarness();
+    const drift = observeHarness();
+    try {
+      importActiveCodexSlot(observedDocument('a', 'a1'), { store: republish.store, keychain: republish.keychain, now: () => 2 });
+      await assert.rejects(republish.run(), CodexLiveChanged);
+
+      const b0 = observedDocument('b', 'b0');
+      importActiveCodexSlot(b0, { store: drift.store, keychain: drift.keychain, now: () => 2 });
+      importActiveCodexSlot(observedDocument('b', 'b1'), { store: drift.store, keychain: drift.keychain, now: () => 3 });
+      drift.store.setActiveLogin('openai-codex', drift.plan.slotId, 'import');
+      writeFileSync(drift.authPath, JSON.stringify(b0));
+      await assert.rejects(drift.run(), CodexLiveChanged);
+    } finally {
+      for (const h of [republish, drift]) {
+        h.store.close();
+        rmSync(h.root, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it('settled outgoing and postPublish documents never reach a thrown error\'s message or a log line', async () => {
+    const republish = observeHarness();
+    const drift = observeHarness();
+    const failing = observeHarness();
+    const output = { log: [] as string[], error: [] as string[], stdout: [] as string[], stderr: [] as string[] };
+    const originalLog = console.log;
+    const originalError = console.error;
+    const originalStdoutWrite = process.stdout.write;
+    const originalStderrWrite = process.stderr.write;
+    const a1 = observedDocument('a', 'a1');
+    const b0 = observedDocument('b', 'b0');
+    const b1 = observedDocument('b', 'b1');
+    const failedPublish = observedDocument('a', 'failed-publish');
+    try {
+      console.log = (...values: unknown[]) => { output.log.push(values.map(String).join(' ')); };
+      console.error = (...values: unknown[]) => { output.error.push(values.map(String).join(' ')); };
+      process.stdout.write = ((chunk: string | Uint8Array) => { output.stdout.push(String(chunk)); return true; }) as typeof process.stdout.write;
+      process.stderr.write = ((chunk: string | Uint8Array) => { output.stderr.push(String(chunk)); return true; }) as typeof process.stderr.write;
+
+      importActiveCodexSlot(a1, { store: republish.store, keychain: republish.keychain, now: () => 2 });
+      const republished = await republish.run({}, () => undefined, { onRepublish: 'settle' });
+      assert.equal(republished.outcome, 'settled');
+      assert.equal(republished.outcome === 'settled' && republished.action, 'republish-slot');
+      assert.equal(republished.outcome === 'settled' && republished.action === 'republish-slot' && republished.postPublish.status, 'ok');
+
+      const b = importActiveCodexSlot(b0, { store: drift.store, keychain: drift.keychain, now: () => 2 });
+      importActiveCodexSlot(b1, { store: drift.store, keychain: drift.keychain, now: () => 3 });
+      drift.store.setActiveLogin('openai-codex', drift.plan.slotId, 'import');
+      writeFileSync(drift.authPath, JSON.stringify(b0));
+      const drifted = await drift.run({}, () => undefined, { onRepublish: 'settle' });
+      assert.equal(drifted.outcome, 'settled');
+      assert.equal(drifted.outcome === 'settled' && drifted.action, 'drift');
+      assert.equal(drifted.outcome === 'settled' && drifted.action === 'drift' && drifted.accountId, b.slotId);
+      assert.equal(drifted.outcome === 'settled' && drifted.action === 'drift' && drifted.postPublish?.status, 'ok');
+
+      importActiveCodexSlot(failedPublish, { store: failing.store, keychain: failing.keychain, now: () => 2 });
+      let reads = 0;
+      let thrown: Error | undefined;
+      try {
+        await failing.run({ readLive: async () => {
+          reads += 1;
+          if (reads === 3) throw new Error('fixture post-publish read failure');
+          return readCodexAuthStableWithStat(failing.authPath, { delayMs: 0 });
+        } }, () => undefined, { onRepublish: 'settle' });
+      } catch (error) {
+        thrown = error as Error;
+      }
+      assert.equal(reads, 3);
+      assert.ok(thrown instanceof Error);
+      assert.equal(thrown?.message, 'fixture post-publish read failure');
+
+      const rawTokens = [a1, b1, failedPublish].flatMap((document) => [
+        document.tokens.access_token, document.tokens.refresh_token, document.tokens.id_token,
+      ]);
+      for (const token of rawTokens) {
+        assert.equal(thrown?.message.includes(token), false);
+        for (const lines of Object.values(output)) {
+          for (const line of lines) assert.equal(line.includes(token), false);
+        }
+      }
+    } finally {
+      console.log = originalLog;
+      console.error = originalError;
+      process.stdout.write = originalStdoutWrite;
+      process.stderr.write = originalStderrWrite;
+      for (const h of [republish, drift, failing]) {
+        h.store.close();
+        rmSync(h.root, { recursive: true, force: true });
+      }
+    }
   });
 
   it('keeps switch and auth locks held through the observe callback', async () => {
@@ -1484,8 +1730,11 @@ describe('Codex switch journal v2', () => {
       const fresh = await probeCodexSwitchJournal(h.options);
       assert.equal(fresh.state, 'owner-lock-not-yet-stale');
       if (fresh.state === 'owner-lock-not-yet-stale') assert.ok(fresh.retryAt > Date.now());
-      utimesSync(codexSwitchJournalOwnerLockPath(h.options), new Date(Date.now() - 300_001), new Date(Date.now() - 300_001));
-      assert.equal((await probeCodexSwitchJournal(h.options)).state, 'orphaned');
+      utimesSync(codexSwitchJournalOwnerLockPath(h.options), new Date(Date.now() - 301_000), new Date(Date.now() - 301_000));
+      // The fresh assertion above deliberately has a short refusal budget. A
+      // stale takeover needs time for its async mkdir → stat → sidecar protocol,
+      // which CPU contention can delay beyond that budget before it inspects mtime.
+      assert.equal((await probeCodexSwitchJournal({ ...h.options, ownerLockTimeoutMs: 30_000 })).state, 'orphaned');
     } finally { executingCodexAttempts.clear(); rmSync(h.root, { recursive: true, force: true }); }
   });
 
@@ -1494,8 +1743,10 @@ describe('Codex switch journal v2', () => {
     try {
       writeCodexSwitchJournal(journalFixture(h.root), h.options);
       mkdirSync(codexSwitchJournalOwnerLockPath(h.options), { recursive: true });
-      utimesSync(codexSwitchJournalOwnerLockPath(h.options), new Date(Date.now() - 300_001), new Date(Date.now() - 300_001));
-      assert.equal((await probeCodexSwitchJournal(h.options)).state, 'orphaned');
+      utimesSync(codexSwitchJournalOwnerLockPath(h.options), new Date(Date.now() - 301_000), new Date(Date.now() - 301_000));
+      // This is a takeover deadline, not the fresh-lock refusal budget used by
+      // journalHarness: it must cover the async stale-lock inspection under load.
+      assert.equal((await probeCodexSwitchJournal({ ...h.options, ownerLockTimeoutMs: 30_000 })).state, 'orphaned');
     } finally { executingCodexAttempts.clear(); rmSync(h.root, { recursive: true, force: true }); }
   });
 
@@ -4140,5 +4391,180 @@ describe('Codex old-account sessions — C6-23', () => {
         trigger: 'manual', outcome: 'ok', publishedAt: switchedAt });
       assert.deepEqual(await find(h, [{ pid: 4403, lstart: 'Mon Nov 13 13:00:00 2023', host: 'Orca' }]), []);
     } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+});
+
+describe('scenario 6 end to end and command contract — C6-26', () => {
+  const close = (h: SwitchHarness) => { h.store.close(); rmSync(h.root, { recursive: true, force: true }); };
+
+  it('scenario 6 reverts A at 92%, names pid 4411, then switches quietly to B after the pane exits', async () => {
+    const h = switchHarness();
+    try {
+      const aPrime = observedDocument('a', 'scenario-6-a-prime');
+      const aPrimeFingerprint = codexFingerprint(aPrime);
+      const holder: CodexProcess = { pid: 4411, lstart: 'Tue Nov 14 21:00:00 2023', host: 'codex' };
+      const beforeB = h.slots.readSlot('b:account').document;
+      const decision = { leftHeadroom: 8, leftRecoveryAt: 1_700_000_360_000, leftTrigger: 'proactive' };
+      const input: SwitchCodexInput = { target: 'b:account', trigger: 'proactive', decision };
+      h.store.setConfig('codex.l13VerifiedAt', '1');
+      const revertStdout: string[] = [];
+      const revertStderr: string[] = [];
+      const scenarioDeps = () => h.deps({ authPath: h.authPath, dbPath: h.store.dbPath, journalDir: join(h.root, 'journal'), keychain: h.keychain,
+        slots: h.slots as never, list: async () => [holder], sameProcess: async () => true, readLive: () => readCodexAuthStableWithStat(h.authPath, { delayMs: 0 }),
+        transport: async () => { throw new Error('unexpected transport'); }, authLockOptions: { home: h.root, timeoutMs: 50, retryMinMs: 1, retryJitterMs: 1 },
+        journalOwner: { pid: process.pid, lstart: 'fixture-owner' }, hooks: { afterRename: () => {
+          const journal = readCodexSwitchJournal({ journalDir: join(h.root, 'journal') });
+          assert.deepEqual(journal.state === 'ok' ? journal.journal.decision : undefined, {
+            leftHeadroom: 8, leftRecoveryAtMs: 1_700_000_360_000, leftTrigger: 'proactive',
+          });
+          writeFileSync(h.authPath, JSON.stringify(aPrime));
+        } },
+      });
+      const revertCommand = createSwitchOpenAiCodexCommand({
+        enabled: true, now: () => 1_700_000_000_000, openStore: () => ({ close: () => undefined }) as never,
+        makeSwitchDeps: () => scenarioDeps(), switchCodex: (deps) => switchCodex(deps, input),
+      });
+      const revertContext: CommandContext = {
+        stdout: (line) => revertStdout.push(line), stderr: (line) => revertStderr.push(line),
+        env: { QLB_TEST_MODE: '1', HOME: h.root, QLB_HOME: join(h.root, 'qlb') },
+        config: defaultConfig(h.root), loadConfig: () => defaultConfig(h.root), home: h.root,
+        registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
+      };
+
+      assert.equal(await revertCommand.execute!(['b:account'], revertContext), 1);
+      assert.deepEqual(revertStderr, []);
+      assert.deepEqual(revertStdout, [
+        'Codex switch a:account → b:account: reverted-by-codex',
+        'Codex reverted the switch at 2023-11-14T22:13:20.000Z; 1 sessions on old account',
+        'Codex running on old account a:account: pid 4411 (codex) — restart',
+      ]);
+      assert.deepEqual(h.slots.readSlot('a:account').document, aPrime);
+      assert.deepEqual(h.slots.readSlot('b:account').document, beforeB);
+      assert.deepEqual(JSON.parse(readFileSync(h.authPath, 'utf8')), aPrime);
+      assert.deepEqual({ ...(h.db.prepare("SELECT account_id, set_by FROM active_login WHERE provider = 'openai-codex'").get() as object) },
+        { account_id: 'a:account', set_by: 'adopt' });
+      assert.deepEqual({ ...(h.db.prepare("SELECT provider, cause, evidence, to_fp FROM lineage_log WHERE account_id = 'a:account' ORDER BY id DESC LIMIT 1").get() as object) },
+        { provider: 'openai-codex', cause: 'adopt', evidence: 'holder', to_fp: aPrimeFingerprint });
+      assert.equal(h.store.getCodexSlot('a:account')?.fingerprint, aPrimeFingerprint);
+      assert.equal(scalarCount(h.db, "SELECT COUNT(*) AS count FROM codex_slots WHERE account_id = 'a:account' AND dead != 0"), 0);
+      assert.equal(scalarCount(h.db, "SELECT COUNT(*) AS count FROM relogin_events WHERE provider = 'openai-codex'"), 0);
+
+      const switchTime = 1_700_000_600_000;
+      let clock = switchTime;
+      const waits: number[] = [];
+      const engineDeps = () => h.deps({
+        authPath: h.authPath, dbPath: h.store.dbPath, journalDir: join(h.root, 'journal'), keychain: h.keychain,
+        slots: h.slots as never, list: async () => [], readLive: () => readCodexAuthStableWithStat(h.authPath, { delayMs: 0 }),
+        transport: async () => { throw new Error('unexpected transport'); },
+        authLockOptions: { home: h.root, timeoutMs: 50, retryMinMs: 1, retryJitterMs: 1 }, now: () => clock,
+        sleep: async (ms) => { waits.push(ms); clock += ms; }, journalOwner: { pid: process.pid, lstart: 'fixture-owner' },
+      });
+      const stdout: string[] = [];
+      const stderr: string[] = [];
+      const command = createSwitchOpenAiCodexCommand({
+        enabled: true,
+        openStore: () => ({ close: () => undefined }) as never,
+        makeSwitchDeps: () => engineDeps(),
+      });
+      const context: CommandContext = {
+        stdout: (line) => stdout.push(line), stderr: (line) => stderr.push(line),
+        env: { QLB_TEST_MODE: '1', HOME: h.root, QLB_HOME: join(h.root, 'qlb') },
+        config: defaultConfig(h.root), loadConfig: () => defaultConfig(h.root), home: h.root,
+        registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
+      };
+
+      assert.equal(await command.execute!(['b:account'], context), 0);
+      assert.deepEqual(stderr, []);
+      assert.deepEqual(waits, [1_000, 4_000, 25_000]);
+      assert.deepEqual(stdout, ['Codex switch a:account → b:account: ok', 'QLB keeps checking until 2023-11-14T22:28:20.000Z']);
+      assert.deepEqual({ ...(h.db.prepare("SELECT account_id FROM active_login WHERE provider = 'openai-codex'").get() as object) }, { account_id: 'b:account' });
+      assert.deepEqual(h.slots.readSlot('b:account').document, beforeB);
+      assert.deepEqual(JSON.parse(readFileSync(h.authPath, 'utf8')), beforeB);
+      const due = h.db.prepare('SELECT next_at, until FROM codex_watch').get() as { next_at: number; until: number };
+      assert.deepEqual({ ...due }, { next_at: switchTime + 120_000, until: switchTime + 300_000 });
+      clock = switchTime + 120_000;
+      await runDueCodexWatches(engineDeps(), clock);
+      assert.deepEqual({ ...(h.db.prepare('SELECT next_at, until FROM codex_watch').get() as object) },
+        { next_at: switchTime + 300_000, until: switchTime + 300_000 });
+      clock = switchTime + 300_000;
+      await runDueCodexWatches(engineDeps(), clock);
+      assert.equal(scalarCount(h.db, 'SELECT COUNT(*) AS count FROM codex_watch'), 0);
+    } finally { close(h); }
+  });
+
+  it('registered command wiring refuses before store opening or dependency construction', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-c6-26-disabled-wiring-'));
+    const home = join(root, 'home');
+    const qlbHome = join(root, 'qlb');
+    mkdirSync(home); mkdirSync(qlbHome);
+    let opened = 0;
+    let built = 0;
+    const command = discoverCommands(undefined, undefined, (id) => id.endsWith('switch-openai-codex.js')
+      ? { default: createSwitchOpenAiCodexCommand({
+        openStore: () => { opened += 1; throw new Error('disabled command must not open a store'); },
+        makeSwitchDeps: () => { built += 1; throw new Error('disabled command must not build dependencies'); },
+      }) }
+      : require(id),
+    ).find(({ name }) => name === 'switch openai-codex');
+    assert.ok(command?.execute, 'registered command is discoverable through its production wiring');
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const config = defaultConfig(home);
+    const context: CommandContext = {
+      stdout: (line) => stdout.push(line), stderr: (line) => stderr.push(line),
+      env: { QLB_TEST_MODE: '1', HOME: home, QLB_HOME: qlbHome },
+      config, loadConfig: () => config, home,
+      registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
+    };
+    try {
+      assert.equal(await command.execute(['b:account'], context), 3);
+      assert.equal(opened, 0);
+      assert.equal(built, 0);
+      assert.deepEqual(stdout, []);
+      assert.deepEqual(stderr, ['qlb switch openai-codex is not enabled yet: it turns on together with QLB\'s background checks (C8).']);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('the registered production command default refuses with a byte-for-byte unchanged state', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-c6-26-disabled-'));
+    const home = join(root, 'home');
+    const qlbHome = join(root, 'qlb');
+    mkdirSync(home); mkdirSync(qlbHome);
+    const config = defaultConfig(home);
+    const store = openStore(config.dbPath);
+    const db = (store as unknown as { db: DatabaseSync }).db;
+    try {
+      store.setConfig('c6-26.fixture', 'baseline');
+      const switchId = store.recordSwitch({ ts: 1, provider: 'openai-codex', fromAccount: 'a:account', toAccount: 'b:account', trigger: 'manual', outcome: 'ok' });
+      db.prepare("INSERT INTO codex_watch (switch_id, provider, outgoing, target, next_at, until) VALUES (?, 'openai-codex', 'a:account', 'b:account', 2, 3)").run(switchId);
+      const journalDir = join(qlbHome, '.qlb', 'journal');
+      mkdirSync(journalDir, { recursive: true });
+      writeFileSync(join(journalDir, 'switch-openai-codex.json'), '{"fixture":"baseline"}');
+      const before = {
+        store: snapshotDatabase(db), config: db.prepare('SELECT key, value FROM config ORDER BY key').all(),
+        journal: snapshotFiles(journalDir), watch: db.prepare('SELECT * FROM codex_watch ORDER BY switch_id').all(),
+        files: { home: snapshotFiles(home), qlbHome: snapshotFiles(qlbHome) },
+      };
+      const stdout: string[] = [];
+      const stderr: string[] = [];
+      const command = discoverCommands().find(({ name }) => name === 'switch openai-codex');
+      assert.ok(command?.execute, 'registered production command is discoverable');
+      const context: CommandContext = {
+        stdout: (line) => stdout.push(line), stderr: (line) => stderr.push(line),
+        env: { QLB_TEST_MODE: '1', HOME: home, QLB_HOME: qlbHome },
+        config, loadConfig: () => config, home,
+        registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
+      };
+
+      assert.equal(await command.execute(['b:account'], context), 3);
+      assert.deepEqual(stdout, []);
+      assert.deepEqual(stderr, ['qlb switch openai-codex is not enabled yet: it turns on together with QLB\'s background checks (C8).']);
+      const after = {
+        store: snapshotDatabase(db), config: db.prepare('SELECT key, value FROM config ORDER BY key').all(),
+        journal: snapshotFiles(journalDir), watch: db.prepare('SELECT * FROM codex_watch ORDER BY switch_id').all(),
+        files: { home: snapshotFiles(home), qlbHome: snapshotFiles(qlbHome) },
+      };
+      assert.deepEqual(after, before);
+    } finally { store.close(); rmSync(root, { recursive: true, force: true }); }
   });
 });

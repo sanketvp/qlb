@@ -216,23 +216,32 @@ export function resolveMigratePath(abs: string, options: ResolveMigratePathOptio
   }));
   let expansions = 0;
   let leafWasSymlink = false;
+  const result = (resolved: ResolvedMigratePath): ResolvedMigratePath => {
+    // Physical output must itself remain in the accepted migration grammar.
+    const acceptedPhysical = validateRawMigratePath(resolved.physical, { flag, kind, cwd: '/', platform });
+    if (acceptedPhysical !== resolved.physical) pathError(flag, 'resolved physical path changed during validation');
+    return resolved;
+  };
 
   while (pending.length > 0) {
     const pendingComponent = pending.shift()!;
     const { component } = pendingComponent;
+    if (platform === 'darwin' && current === '/' && component.startsWith('.')) {
+      pathError(flag, 'reserved root entry');
+    }
     const candidate = childPath(current, component);
     let metadata: ReturnType<MigratePathFs['lstatSync']>;
     try {
       metadata = fs.lstatSync(candidate);
     } catch (error) {
       if (errorCode(error) === 'ENOENT') {
-        return {
+        return result({
           physical: [candidate, ...pending.map(({ component: suffix }) => suffix)].join('/'),
           anchor: current,
           missingSuffix: [component, ...pending.map(({ component: suffix }) => suffix)],
           endpoint: 'missing',
           leafWasSymlink,
-        };
+        });
       }
       return lookupFailure(flag, error);
     }
@@ -262,15 +271,15 @@ export function resolveMigratePath(abs: string, options: ResolveMigratePathOptio
 
     if (kind === 'dir') {
       if (!metadata.isDirectory()) pathError(flag, 'ENOTDIR: expected directory');
-      return { physical: candidate, anchor: candidate, missingSuffix: [], endpoint: 'dir', leafWasSymlink };
+      return result({ physical: candidate, anchor: candidate, missingSuffix: [], endpoint: 'dir', leafWasSymlink });
     }
     if (!metadata.isFile()) pathError(flag, 'endpoint is not a regular file');
-    return { physical: candidate, anchor: current, missingSuffix: [], endpoint: 'file', leafWasSymlink };
+    return result({ physical: candidate, anchor: current, missingSuffix: [], endpoint: 'file', leafWasSymlink });
   }
 
   // The only absolute pathname with no components is the filesystem root.
   if (kind !== 'dir') pathError(flag, 'ENOTDIR: expected regular file');
-  return { physical: '/', anchor: '/', missingSuffix: [], endpoint: 'dir', leafWasSymlink: false };
+  return result({ physical: '/', anchor: '/', missingSuffix: [], endpoint: 'dir', leafWasSymlink: false });
 }
 
 function identityOf(path: string, fs: MigratePathFs, flag: string): DirectoryIdentity {

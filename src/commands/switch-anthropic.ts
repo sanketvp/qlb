@@ -16,7 +16,7 @@ import { assertAdmitted } from '../lifecycle';
 import type { CommandContext, CommandDefinition } from '../registry';
 import { openStore, type Store } from '../store';
 
-type ParsedArgs = { accountId: string; json: boolean };
+type ParsedArgs = { accountId: string; json: boolean; republish: boolean };
 type SwitchResources = { deps: ClaudeSwitchDeps; close?: () => void };
 
 type FetchLike = (input: string, init: {
@@ -50,11 +50,16 @@ function parse(args: string[]): ParsedArgs | null {
   if (!args[0] || args[0].startsWith('-')) return null;
   const accountId = args[0];
   let json = false;
+  let republish = false;
   let triggerSeen = false;
   for (let index = 1; index < args.length; index += 1) {
     const arg = args[index];
     if (arg === '--json' && !json) {
       json = true;
+      continue;
+    }
+    if (arg === '--republish' && !republish) {
+      republish = true;
       continue;
     }
     if (arg === '--trigger' && !triggerSeen && args[index + 1] === 'manual') {
@@ -64,11 +69,11 @@ function parse(args: string[]): ParsedArgs | null {
     }
     return null;
   }
-  return { accountId, json };
+  return { accountId, json, republish };
 }
 
 function usage(ctx: CommandContext): number {
-  ctx.stderr('usage: qlb switch anthropic <account_id> [--trigger manual] [--json]');
+  ctx.stderr('usage: qlb switch anthropic <account_id> [--trigger manual] [--republish] [--json]');
   return 2;
 }
 
@@ -171,7 +176,7 @@ function defaultMakeSwitchDeps(commandDeps: SwitchAnthropicCommandDeps, ctx: Com
   });
 }
 
-/** `qlb switch anthropic <account_id> [--trigger manual] [--json]` (K5-6). */
+/** `qlb switch anthropic <account_id> [--trigger manual] [--republish] [--json]` (K5-6). */
 export function createSwitchAnthropicCommand(deps: SwitchAnthropicCommandDeps = {}): CommandDefinition {
   return {
     name: 'switch anthropic',
@@ -211,6 +216,7 @@ export function createSwitchAnthropicCommand(deps: SwitchAnthropicCommandDeps = 
         const result = await (deps.switchClaude ?? switchClaude)(resources.deps, {
           to: parsed.accountId,
           trigger: 'manual',
+          ...(parsed.republish ? { republish: true } : {}),
           ...(parsedInjection.inject === null ? {} : { injected: true }),
         });
         if (parsed.json) ctx.stdout(JSON.stringify(receipt(result)));
