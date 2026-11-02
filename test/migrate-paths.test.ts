@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import {
   lstatSync,
   mkdtempSync,
+  readFileSync,
   mkdirSync,
   readlinkSync,
   realpathSync,
@@ -322,6 +323,13 @@ describe('migrate path admission primitives', () => {
         flag: '--auth-json', kind: 'file', cwd: safe,
       }), resolved.physical);
     });
+  });
+
+  it('P7g-1r residual: resolver result grammar post-condition remains', () => {
+    const source = readFileSync(join(__dirname, '..', '..', 'src', 'migrate-paths.ts'), 'utf8');
+    assert.match(source, /const result = \(resolved: ResolvedMigratePath\): ResolvedMigratePath => \{/);
+    assert.match(source, /const acceptedPhysical = validateRawMigratePath\(resolved\.physical,/);
+    assert.match(source, /if \(acceptedPhysical !== resolved\.physical\) pathError\(flag, 'resolved physical path changed during validation'\);/);
   });
 
   it('38 migrate protects both a dangling symlinked auth leaf directory and its target anchor directory', () => withFixture((root) => {
