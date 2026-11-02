@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
@@ -23,9 +23,14 @@ function childEnv(home: string, testMode: boolean): NodeJS.ProcessEnv {
   return env;
 }
 
-function runChild(args: string[], testMode: boolean): { status: number | null; stdout: string; stderr: string } {
+function runChild(
+  args: string[],
+  testMode: boolean,
+  setup?: (home: string) => void,
+): { status: number | null; stdout: string; stderr: string } {
   const home = mkdtempSync(join(tmpdir(), 'qlb-cli-subprocess-'));
   try {
+    setup?.(home);
     const result = spawnSync(
       process.execPath,
       [cliPath, ...args.map((arg) => arg.replaceAll('<temp-home>', home))],
@@ -51,7 +56,9 @@ describe('compiled CLI test-mode subprocess guard', () => {
     const result = runChild([
       'migrate', 'stage', '--provider', 'openrouter', '--owner-file',
       '<temp-home>/owner', '--json',
-    ], true);
+    // migrate refuses before reaching the Keychain when the protected Pi directory is
+    // missing (P7g-0 decision 1), so give the child home one.
+    ], true, (home) => mkdirSync(join(home, '.pi', 'agent'), { recursive: true }));
     assert.equal(result.status, 1, result.stderr);
     assert.match(result.stderr, /native macOS Keychain access is disabled while QLB_TEST_MODE=1/);
   });
