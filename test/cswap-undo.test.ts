@@ -9,6 +9,7 @@ import { runUndoCswapCommand } from '../src/commands/undo-cswap';
 import { discoverCommands, resolveCommand, type CommandContext } from '../src/registry';
 import { openStore, openStoreConnection } from '../src/store';
 import { runExecutingCommand } from '../src/cli';
+import { beginCutover, phase, transition } from '../src/lifecycle';
 
 function credential(account: string, refresh: string): string {
   return JSON.stringify({ claudeAiOauth: { accessToken: `access-${account}`, refreshToken: refresh, expiresAt: 1_800_000_000_000 } });
@@ -24,9 +25,11 @@ function prefix(refresh: string): string {
 
 class ReadOnlyKeychain {
   readonly reads: Array<{ service: string; account: string }> = [];
+  readonly writes: Array<{ service: string; account: string }> = [];
   private readonly values = new Map<string, string>();
 
-  set(service: string, account: string, value: string): void {
+  async set(service: string, account: string, value: string): Promise<void> {
+    this.writes.push({ service, account });
     this.values.set(`${service}\0${account}`, value);
   }
 
@@ -79,6 +82,7 @@ function addSlot(f: Fixture, input: { accountId: string; number: number; email: 
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(
       input.accountId, input.number, input.email, '{}', lineage(input.refresh), 1, input.source ?? 'cswap-import', input.dead ? 1 : 0,
     );
+    f.keychain.set(`qlb:anthropic:${input.accountId}`, 'qlb', credential(input.accountId, input.refresh));
     if (input.active) {
       db.prepare("INSERT INTO active_login (provider, account_id, since, set_by) VALUES ('anthropic', ?, 1, 'test')")
         .run(input.accountId);
@@ -109,6 +113,33 @@ async function dryRun(f: Fixture): Promise<number> {
 
 function close(f: Fixture): void {
   rmSync(f.root, { recursive: true, force: true });
+}
+
+function beginUndo(f: Fixture): void {
+  const store = openStore(f.dbPath);
+  try {
+    beginCutover(store, 1);
+    assert.equal(transition(store, 'cutover', 2).ok, true);
+  } finally { store.close(); }
+}
+
+type UndoFakes = Partial<NonNullable<Parameters<typeof runUndoCswapCommand>[2]>>;
+
+async function undo(f: Fixture, fakes: UndoFakes = {}, args: string[] = []): Promise<number> {
+  let now = 0;
+  return runUndoCswapCommand(args, context(f), {
+    keychain: f.keychain,
+    bootoutQlbAgent: () => ({ ok: true }),
+    listQlbPids: () => [],
+    listHeldLocks: () => [],
+    pendingStash: () => null,
+    now: () => now,
+    sleep: async (ms) => { now += ms; },
+    deleteEnc: (path) => rmSync(path, { force: true }),
+    withActiveLocks: async (fn) => fn(),
+    readActiveCredential: async () => ({ credential: await f.keychain.get('qlb:anthropic:account-a', 'qlb'), accountId: 'account-a' }),
+    ...fakes,
+  });
 }
 
 describe('qlb undo cswap --dry-run', () => {
@@ -204,7 +235,7 @@ describe('qlb undo cswap --dry-run', () => {
         addSlot(f, { accountId: `account-${email.length}`, number: 1, email, refresh: 'refresh-current', active: true });
 
         assert.equal(await dryRun(f), 1);
-        assert.deepEqual(f.output, ['ERR:qlb undo cswap: plan unavailable']);
+        assert.deepEqual(f.output, ['ERR:qlb undo cswap: hand-back failed']);
       } finally {
         close(f);
       }
@@ -262,6 +293,7 @@ describe('qlb undo cswap --dry-run', () => {
 
       assert.deepEqual(snapshot(f.root), before);
       assert.deepEqual(f.keychain.reads.map(({ service, account }) => `${service}/${account}`), [
+        'qlb:anthropic:account-a/qlb',
         'claude-swap/account-1-a@example.test',
       ]);
     } finally {
@@ -290,5 +322,169 @@ describe('qlb undo cswap --dry-run', () => {
     } finally {
       close(f);
     }
+  });
+});
+
+describe('qlb undo cswap hand-back', () => {
+  it('undo during an in-flight refresh waits and hands back the successor', async () => {
+    const f = fixture();
+    try {
+      beginUndo(f);
+      addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-before', active: true });
+      f.keychain.set('claude-swap', 'account-1-a@example.test', credential('old', 'refresh-old'));
+      let held = true;
+      f.keychain.writes.length = 0;
+      assert.equal(await undo(f, {
+        listHeldLocks: () => held ? ['consume-anthropic-account-a.lock'] : [],
+        sleep: async () => {
+          held = false;
+          await f.keychain.set('qlb:anthropic:account-a', 'qlb', credential('account-a', 'refresh-successor'));
+        },
+        readActiveCredential: async () => ({ credential: credential('account-a', 'refresh-successor'), accountId: 'account-a' }),
+      }), 0);
+      assert.equal(await f.keychain.get('claude-swap', 'account-1-a@example.test'), credential('account-a', 'refresh-successor'));
+      assert.equal(f.keychain.writes.filter(({ service }) => service === 'claude-swap').length, 2);
+    } finally { close(f); }
+  });
+
+  it('a failed drain writes nothing, keeps undoing and leaves C-swap stopped', async () => {
+    const f = fixture();
+    try {
+      beginUndo(f);
+      addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-current', active: true });
+      const calls: string[] = [];
+      f.keychain.writes.length = 0;
+      assert.equal(await undo(f, {
+        bootoutQlbAgent: () => { calls.push('bootout'); return { ok: true }; },
+        listQlbPids: () => [4321],
+      }), 3);
+      assert.deepEqual(calls, ['bootout']);
+      assert.equal(f.keychain.writes.length, 0);
+      const store = openStore(f.dbPath);
+      try { assert.equal(phase(store).state, 'undoing'); } finally { store.close(); }
+    } finally { close(f); }
+  });
+
+  it('no Keychain write precedes the confirmed drain (call order spy)', async () => {
+    const f = fixture();
+    try {
+      beginUndo(f);
+      addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-current', active: true });
+      const calls: string[] = [];
+      let held = true;
+      f.keychain.writes.length = 0;
+      const keychain = {
+        get: f.keychain.get.bind(f.keychain),
+        set: async (service: string, account: string, value: string) => {
+          calls.push('keychain-write');
+          await f.keychain.set(service, account, value);
+        },
+      };
+      assert.equal(await undo(f, {
+        keychain,
+        listHeldLocks: () => {
+          if (held) { calls.push('held'); return ['switch-anthropic.lock']; }
+          calls.push('drain-confirmed');
+          return [];
+        },
+        sleep: async () => { held = false; },
+      }), 0);
+      assert.ok(calls.indexOf('drain-confirmed') >= 0);
+      assert.ok(calls.indexOf('keychain-write') > calls.indexOf('drain-confirmed'), calls.join(','));
+    } finally { close(f); }
+  });
+
+  it('each slot gets its current lineage', async () => {
+    const f = fixture();
+    try {
+      beginUndo(f);
+      addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-active', active: true });
+      addSlot(f, { accountId: 'account-b', number: 2, email: 'b@example.test', refresh: 'refresh-before' });
+      f.keychain.set('claude-swap', 'account-2-b@example.test', credential('old', 'refresh-old'));
+      assert.equal(await undo(f, {
+        plan: async (deps) => {
+          const { planHandBack: freshPlan } = await import('../src/cswap-undo');
+          const plan = await freshPlan(deps);
+          await f.keychain.set('qlb:anthropic:account-b', 'qlb', credential('account-b', 'refresh-successor'));
+          return plan;
+        },
+      }), 0);
+      assert.equal(await f.keychain.get('claude-swap', 'account-2-b@example.test'), credential('account-b', 'refresh-successor'));
+    } finally { close(f); }
+  });
+
+  it('the active slot is re-read under the locks', async () => {
+    const f = fixture();
+    try {
+      beginUndo(f);
+      addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-before', active: true });
+      let underLock = false;
+      const reads: string[] = [];
+      const keychain = {
+        get: async (service: string, account: string) => {
+          if (service === 'qlb:anthropic:account-a') reads.push(underLock ? 'locked' : 'unlocked');
+          return f.keychain.get(service, account);
+        },
+        set: f.keychain.set.bind(f.keychain),
+      };
+      assert.equal(await undo(f, {
+        keychain,
+        withActiveLocks: async (fn) => { underLock = true; try { return await fn(); } finally { underLock = false; } },
+        readActiveCredential: async () => ({ credential: credential('account-a', 'refresh-before'), accountId: 'account-a' }),
+      }), 0);
+      assert.ok(reads.includes('locked'), `active slot reads: ${reads.join(',')}`);
+    } finally { close(f); }
+  });
+
+  it('resume after a crash writes 0 duplicates', async () => {
+    const f = fixture();
+    try {
+      beginUndo(f);
+      addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-current', active: true });
+      assert.equal(await undo(f), 0);
+      f.keychain.writes.length = 0;
+      f.output.length = 0;
+      assert.equal(await undo(f, {}, ['--resume', '--json']), 0);
+      assert.equal(f.keychain.writes.length, 0);
+      assert.equal(JSON.parse(f.output[0]!).skipped, 1);
+    } finally { close(f); }
+  });
+
+  it('a read-back mismatch exits 1 and keeps undoing', async () => {
+    const f = fixture();
+    try {
+      beginUndo(f);
+      addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-current', active: true });
+      assert.equal(await undo(f, { readBack: async () => credential('wrong', 'refresh-wrong') }), 1);
+      const store = openStore(f.dbPath);
+      try { assert.equal(phase(store).state, 'undoing'); } finally { store.close(); }
+    } finally { close(f); }
+  });
+
+  it('a dead qlb-add slot does not refuse the plan, while a qlb-add slot with no email names its account number', async () => {
+    const f = fixture();
+    try {
+      addSlot(f, { accountId: 'dead-add', number: 1, email: 'dead@example.test', refresh: 'refresh-dead', source: 'qlb-add', active: true, dead: true });
+      addSlot(f, { accountId: 'healthy', number: 2, email: 'healthy@example.test', refresh: 'refresh-healthy' });
+      assert.equal(await dryRun(f), 0);
+      const db = openStoreConnection(f.dbPath);
+      try {
+        db.prepare(`INSERT INTO claude_slots (account_id, slot_num, email, config_json, fingerprint, added_at, source, dead)
+          VALUES ('missing-email', 3, NULL, '{}', ?, 1, 'qlb-add', 0)`).run(lineage('refresh-added'));
+      } finally { db.close(); }
+      f.output.length = 0;
+      assert.equal(await runUndoCswapCommand(['--dry-run'], context(f), { keychain: f.keychain, backupDir: f.backup }), 3);
+      assert.match(f.output[0]!, /3 \(no email\)/);
+    } finally { close(f); }
+  });
+
+  it('refuses encrypted credential names containing control characters', async () => {
+    const f = fixture();
+    try {
+      addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-current', active: true });
+      writeFileSync(join(f.backup, 'credentials', '.creds-1-bad\u0007.enc'), 'fixture');
+      assert.equal(await dryRun(f), 1);
+      assert.deepEqual(f.output, ['ERR:qlb undo cswap: hand-back failed']);
+    } finally { close(f); }
   });
 });
