@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { describe, it } from 'node:test';
-import { enrichAccounts, formatDashboard } from '../src/dashboard';
+import { activeAnthropicMarker, enrichAccounts, formatDashboard } from '../src/dashboard';
 import { openStore } from '../src/store';
 
 type ClaudeDecision = {
@@ -136,9 +136,11 @@ describe('Claude switch commit primitive', () => {
       ], {
         ownershipForProvider: () => 'QLB_OWNED',
         overrideForAccount: () => null,
-        activeAccountForProvider: (provider) => {
-          const active = store.getActiveLogin(provider)?.accountId ?? null;
-          return active === null ? null : store.getAnthropicSlotOrgUuid(active) ?? active;
+        activeAccountForProvider: (provider, accounts) => {
+          const active = store.getActiveLogin(provider)?.accountId;
+          return active === null || active === undefined
+            ? undefined
+            : activeAnthropicMarker(store.getAnthropicSlotStatusIdentity(active), accounts);
         },
       }));
 

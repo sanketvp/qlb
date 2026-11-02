@@ -30,11 +30,26 @@ export interface DashboardAccount extends AccountSnapshot {
   healthGlyph: HealthGlyph;
 }
 
+export interface ActiveAccountMarker {
+  accountId: string;
+  /** Required when an account ID alone identifies more than one cache row. */
+  label?: string;
+}
+
+export interface AnthropicSlotIdentity {
+  orgUuid: string | null;
+  email: string | null;
+  orgUuidSlotCount: number;
+}
+
 export interface DashboardLookups {
   ownershipForProvider: (provider: string) => string;
   overrideForAccount: (accountId: string) => AccountOverrideView | null;
   /** The provider-owned login is authoritative over any legacy cache marker. */
-  activeAccountForProvider?: (provider: string) => string | null;
+  activeAccountForProvider?: (
+    provider: string,
+    accounts: AccountSnapshot[],
+  ) => ActiveAccountMarker | string | null | undefined;
 }
 
 export function formatRelative(resetAt?: number, now: number = Date.now()): string {
@@ -445,20 +460,78 @@ export function overrideFromStore(store: Store, accountId: string): AccountOverr
   }
 }
 
+function withoutCacheMarker(label: string): string {
+  return label.startsWith('● ') ? label.slice(2) : label;
+}
+
+/**
+ * C-swap cache identifies Claude rows by organization UUID plus its email
+ * label. An organization UUID is not necessarily unique among QLB slots, so
+ * use it alone only when both stores have exactly one matching row; otherwise
+ * use a unique cache email match. An ambiguous or missing match deliberately
+ * leaves C-swap's marker intact.
+ */
+export function activeAnthropicMarker(
+  activeSlot: AnthropicSlotIdentity | null,
+  accounts: AccountSnapshot[],
+): ActiveAccountMarker | undefined {
+  if (!activeSlot) return undefined;
+  const orgMatches = activeSlot.orgUuid === null
+    ? []
+    : accounts.filter((account) => account.accountId === activeSlot.orgUuid);
+  if (activeSlot.orgUuidSlotCount === 1 && orgMatches.length === 1) {
+    return { accountId: orgMatches[0].accountId };
+  }
+  const emailMatches = activeSlot.email === null
+    ? []
+    : accounts.filter((account) => withoutCacheMarker(account.label) === activeSlot.email);
+  if (emailMatches.length !== 1) return undefined;
+  return { accountId: emailMatches[0].accountId, label: withoutCacheMarker(emailMatches[0].label) };
+}
+
+function matchesActiveMarker(
+  snap: AccountSnapshot,
+  marker: ActiveAccountMarker | string | null | undefined,
+): boolean {
+  if (!marker || snap.accountId !== (typeof marker === 'string' ? marker : marker.accountId)) return false;
+  return typeof marker === 'string' || marker.label === undefined || withoutCacheMarker(snap.label) === marker.label;
+}
+
 export function enrichAccounts(
   accounts: AccountSnapshot[],
   lookups: DashboardLookups,
 ): DashboardAccount[] {
+  const byProvider = new Map<string, AccountSnapshot[]>();
+  for (const account of accounts) {
+    const providerAccounts = byProvider.get(account.provider) ?? [];
+    providerAccounts.push(account);
+    byProvider.set(account.provider, providerAccounts);
+  }
+  const providerState = new Map<string, {
+    ownership: string;
+    activeMarker: ActiveAccountMarker | string | null | undefined;
+  }>();
+  for (const [provider, providerAccounts] of byProvider) {
+    const ownership = lookups.ownershipForProvider(provider);
+    providerState.set(provider, {
+      ownership,
+      activeMarker: ownership === 'QLB_OWNED'
+        ? lookups.activeAccountForProvider?.(provider, providerAccounts)
+        : undefined,
+    });
+  }
   return accounts.map((snap) => {
     const { health, healthGlyph } = accountHealth(snap);
-    const activeAccount = lookups.activeAccountForProvider?.(snap.provider);
-    const label = activeAccount === undefined
+    const state = providerState.get(snap.provider)!;
+    const label = state.activeMarker === undefined
       ? snap.label
-      : snap.label.startsWith('● ') ? snap.label.slice(2) : snap.label;
+      : withoutCacheMarker(snap.label);
     return {
       ...snap,
-      label: activeAccount === undefined ? label : activeAccount === snap.accountId ? `● ${label}` : label,
-      ownership: lookups.ownershipForProvider(snap.provider),
+      label: state.activeMarker === undefined
+        ? label
+        : matchesActiveMarker(snap, state.activeMarker) ? `● ${label}` : label,
+      ownership: state.ownership,
       override: lookups.overrideForAccount(snap.accountId),
       health,
       healthGlyph,

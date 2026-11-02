@@ -64,6 +64,7 @@ import {
 } from './retire';
 import { pruneAccount, PruneRefusedError } from './accounts-prune';
 import {
+  activeAnthropicMarker,
   decorateStatusJson,
   enrichAccounts,
   formatDashboard,
@@ -1139,13 +1140,17 @@ async function runStatus(opts: StatusOpts): Promise<void> {
     return snaps;
   }));
   const accounts = nested.flat();
+  const ownershipForProvider = makeOwnershipReader(store);
   const enriched = enrichAccounts(accounts, {
-    ownershipForProvider: makeOwnershipReader(store),
+    ownershipForProvider,
     overrideForAccount: (id) => overrideFromStore(store, id),
-    activeAccountForProvider: (provider) => {
-      const accountId = store.getActiveLogin(provider)?.accountId ?? null;
-      return provider === 'anthropic' && accountId !== null
-        ? store.getAnthropicSlotOrgUuid(accountId) ?? accountId
+    activeAccountForProvider: (provider, providerAccounts) => {
+      // enrichAccounts invokes this once per QLB-owned provider, so a status
+      // render takes one active_login snapshot rather than one per cache row.
+      const accountId = store.getActiveLogin(provider)?.accountId;
+      if (!accountId) return undefined;
+      return provider === 'anthropic'
+        ? activeAnthropicMarker(store.getAnthropicSlotStatusIdentity(accountId), providerAccounts)
         : accountId;
     },
   });
