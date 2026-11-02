@@ -1,4 +1,4 @@
-import { unavailableCswapAgent, type CswapAgent } from '../cswap-agent';
+import { productionLaunchctlCswapAgent, unavailableCswapAgent, type CswapAgent } from '../cswap-agent';
 import {
   abortCutoverBegin,
   assertAdmitted,
@@ -8,6 +8,7 @@ import {
   CUTOVER_BEGIN_IN_PROGRESS,
   phase,
 } from '../lifecycle';
+import { qlbHomeDir } from '../home';
 import { openStore } from '../store';
 import type { CommandContext, CommandDefinition } from '../registry';
 
@@ -80,7 +81,18 @@ export async function cutoverBegin(storePath: string, agent: CswapAgent = unavai
   } finally { store.close(); }
 }
 
-async function execute(args: string[], ctx: CommandContext): Promise<number> {
+export interface CutoverCommandDeps {
+  /** Tests replace the S57 C-swap agent before the command begins its transaction. */
+  makeAgent?: (ctx: CommandContext) => CswapAgent;
+}
+
+function defaultMakeAgent(ctx: CommandContext): CswapAgent {
+  // Tests must never construct the adapter that can invoke launchctl.
+  if (ctx.env.QLB_TEST_MODE === '1') return unavailableCswapAgent;
+  return productionLaunchctlCswapAgent(ctx.home, qlbHomeDir(ctx.env), ctx.config.cswapSequencePath);
+}
+
+async function execute(args: string[], ctx: CommandContext, deps: CutoverCommandDeps): Promise<number> {
   const [subcommand, ...rest] = args;
   const beginArgs = subcommand === 'begin' ? parseBeginArgs(rest) : null;
   if (subcommand === 'begin' && beginArgs) {
@@ -94,7 +106,7 @@ async function execute(args: string[], ctx: CommandContext): Promise<number> {
         return result.ok ? 0 : 3;
       } finally { store.close(); }
     }
-    const result = await cutoverBegin(ctx.config.dbPath);
+    const result = await cutoverBegin(ctx.config.dbPath, (deps.makeAgent ?? defaultMakeAgent)(ctx));
     if (beginArgs.json) json(ctx, result);
     else ctx.stderr(result.ok ? 'cutover begin admitted' : `cutover begin refused: ${result.code}`);
     return result.ok ? 0 : 3;
@@ -127,5 +139,10 @@ async function execute(args: string[], ctx: CommandContext): Promise<number> {
   return 2;
 }
 
-const command: CommandDefinition = { name: 'cutover', execute };
+/** `qlb cutover begin|commit|abort [--json]` (AC49). */
+export function createCutoverCommand(deps: CutoverCommandDeps = {}): CommandDefinition {
+  return { name: 'cutover', execute: (args, ctx) => execute(args, ctx, deps) };
+}
+
+const command = createCutoverCommand();
 export default command;
