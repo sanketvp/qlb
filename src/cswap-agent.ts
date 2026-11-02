@@ -212,8 +212,11 @@ export interface CswapAgentStatusDependencies {
 
 function missingAgent(error: unknown): boolean {
   const code = errorCode(error);
+  const status = typeof (error as { status?: unknown })?.status === 'number'
+    ? (error as { status: number }).status
+    : undefined;
   const message = error instanceof Error ? error.message : '';
-  return code === 'ESRCH' || /(?:not found|could not find service|no such process)/i.test(message);
+  return code === 'ESRCH' || status === 113 || /(?:not found|could not find service|no such process)/i.test(message);
 }
 
 /**

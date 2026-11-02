@@ -12,7 +12,7 @@ export interface CswapProcessesCheckOptions {
   env?: NodeJS.ProcessEnv;
 }
 
-/** H2: after cutover, any C-swap process is a blocking split-brain condition. */
+/** H2: during cutover or retirement, any C-swap process is a blocking split-brain condition. */
 export function cswapProcessesCheck(
   lifecycle: LifecyclePhaseResult,
   options: CswapProcessesCheckOptions = {},
@@ -23,7 +23,7 @@ export function cswapProcessesCheck(
   if (!isLifecycleState(lifecycle.phase)) {
     return { name: 'cswap:processes', level: 'WARN', message: 'cannot evaluate: unknown lifecycle state' };
   }
-  if (lifecycle.phase !== 'cutover') {
+  if (lifecycle.phase !== 'cutover' && lifecycle.phase !== 'retired') {
     return { name: 'cswap:processes', level: 'N/A', message: `not applicable in phase=${lifecycle.phase}` };
   }
 

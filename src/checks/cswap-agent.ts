@@ -15,7 +15,7 @@ export interface CswapAgentCheckOptions {
 
 function productionStatus(): CswapAgentStatus {
   return inspectCswapAgent({
-    exec: (file, args) => String(execFileSync(file, [...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5_000 })),
+    exec: (file, args) => String(execFileSync(file, [...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 5_000 })),
     uid: () => process.getuid?.() ?? 0,
   });
 }
@@ -31,7 +31,7 @@ export function cswapAgentCheck(
   if (!isLifecycleState(lifecycle.phase)) {
     return { name: 'cswap:agent', level: 'WARN', message: 'cannot evaluate: unknown lifecycle state' };
   }
-  if (lifecycle.phase !== 'cutover') {
+  if (lifecycle.phase !== 'cutover' && lifecycle.phase !== 'retired') {
     return { name: 'cswap:agent', level: 'N/A', message: `not applicable in phase=${lifecycle.phase}` };
   }
 

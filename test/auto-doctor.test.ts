@@ -16,6 +16,7 @@ import { openStore } from '../src/store';
 
 const NOW = 1_800_000_000_000;
 const CUTOVER = { available: true, phase: 'cutover' } as const;
+const RETIRED = { available: true, phase: 'retired' } as const;
 const PRE_CUTOVER = { available: true, phase: 'pre-cutover' } as const;
 
 function cutoverFixture() {
@@ -63,6 +64,23 @@ describe('auto doctor (G14)', () => {
     assert.match(result.message, /older than 5 minutes/);
   });
 
+  it('a heartbeat more than 60 seconds in the future fails auto:agent', () => {
+    const config = cutoverFixture();
+    const result = autoAgentCheck(config.dbPath, CUTOVER, NOW - 6 * 60 * 1_000 - 1);
+    assert.equal(result.level, 'FAIL');
+    assert.match(result.message, /more than 60 seconds in the future/);
+  });
+
+  it('evaluates all H2 checks in retired', () => {
+    const config = cutoverFixture();
+    const rows = [
+      autoAgentCheck(config.dbPath, RETIRED, NOW),
+      cswapAgentCheck(RETIRED, { status: () => 'not-loaded' }),
+      cswapProcessesCheck(RETIRED, { list: () => [], env: { QLB_TEST_MODE: '1' } }),
+    ];
+    assert.deepEqual(rows.map((row) => row.level), ['PASS', 'PASS', 'PASS']);
+  });
+
   it('pre-cutover is N/A', () => {
     let inspected = false;
     const rows = [
@@ -81,13 +99,28 @@ describe('auto doctor (G14)', () => {
     }).level, 'FAIL');
   });
 
-  it('inspects the C-swap agent through an injected launchctl seam', () => {
+  it('classifies real launchctl missing-service error shapes through an injected seam', () => {
     assert.equal(inspectCswapAgent({ exec: () => '', uid: () => 501 }), 'loaded');
     assert.equal(inspectCswapAgent({
-      exec: () => { throw Object.assign(new Error('missing'), { code: 'ESRCH' }); }, uid: () => 501,
+      exec: () => {
+        throw Object.assign(new Error('Command failed: /bin/launchctl print gui/501/com.cswap.auto'), {
+          status: 113, code: undefined,
+        });
+      }, uid: () => 501,
     }), 'not-loaded');
     assert.equal(inspectCswapAgent({
-      exec: () => { throw new Error('permission denied'); }, uid: () => 501,
+      exec: () => {
+        throw Object.assign(new Error('Command failed: /bin/launchctl print gui/501/com.cswap.auto\nCould not find service'), {
+          status: 113, code: undefined,
+        });
+      }, uid: () => 501,
+    }), 'not-loaded');
+    assert.equal(inspectCswapAgent({
+      exec: () => {
+        throw Object.assign(new Error('Command failed: /bin/launchctl print gui/501/com.cswap.auto\npermission denied'), {
+          status: 1, code: undefined,
+        });
+      }, uid: () => 501,
     }), 'unknown');
   });
 });

@@ -6,8 +6,9 @@ import { isLifecycleState, type LifecyclePhaseResult } from './lifecycle-phase';
 export default check('auto:agent');
 
 export const AUTO_HEARTBEAT_MAX_AGE_MS = 5 * 60 * 1_000;
+export const AUTO_HEARTBEAT_FUTURE_SKEW_MS = 60 * 1_000;
 
-/** H2 only applies once QLB owns cutover; all other phases leave the agent alone. */
+/** H2 applies while QLB owns cutover or retired; all other phases leave the agent alone. */
 export function autoAgentCheck(
   dbPath: string,
   lifecycle: LifecyclePhaseResult,
@@ -19,7 +20,7 @@ export function autoAgentCheck(
   if (!isLifecycleState(lifecycle.phase)) {
     return { name: 'auto:agent', level: 'WARN', message: 'cannot evaluate: unknown lifecycle state' };
   }
-  if (lifecycle.phase !== 'cutover') {
+  if (lifecycle.phase !== 'cutover' && lifecycle.phase !== 'retired') {
     return { name: 'auto:agent', level: 'N/A', message: `not applicable in phase=${lifecycle.phase}` };
   }
 
@@ -30,6 +31,14 @@ export function autoAgentCheck(
       const heartbeatAt = typeof row?.value === 'string' && /^\d+$/.test(row.value) ? Number(row.value) : NaN;
       if (!Number.isSafeInteger(heartbeatAt) || heartbeatAt < 0) {
         return { name: 'auto:agent', level: 'FAIL', message: 'automatic agent heartbeat is missing or invalid' };
+      }
+      if (heartbeatAt > now + AUTO_HEARTBEAT_FUTURE_SKEW_MS) {
+        return {
+          name: 'auto:agent',
+          level: 'FAIL',
+          message: 'automatic agent heartbeat is more than 60 seconds in the future',
+          detail: { heartbeatAt },
+        };
       }
       if (now - heartbeatAt > AUTO_HEARTBEAT_MAX_AGE_MS) {
         return {
