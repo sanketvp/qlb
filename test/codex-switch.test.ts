@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { existsSync, fsyncSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
 import { createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { describe, it } from 'node:test';
@@ -52,7 +52,7 @@ import { consumeUnderCodexLocks, runCodexRefreshCommand } from '../src/commands/
 import { runCodexImportActiveCommand } from '../src/commands/codex-import-active';
 import { createSwitchOpenAiCodexCommand } from '../src/commands/switch-openai-codex';
 import { defaultConfig } from '../src/config';
-import type { CommandContext } from '../src/registry';
+import { discoverCommands, type CommandContext } from '../src/registry';
 import { assertAdmitted, beginCutover, type LifecycleOperation } from '../src/lifecycle';
 import { openStore } from '../src/store';
 
@@ -200,6 +200,25 @@ function observeHarness() {
 
 function scalarCount(db: DatabaseSync, sql: string): number {
   return (db.prepare(sql).get() as { count: number }).count;
+}
+
+function snapshotFiles(root: string): Array<{ path: string; bytes: Buffer }> {
+  if (!existsSync(root)) return [];
+  const files: Array<{ path: string; bytes: Buffer }> = [];
+  const visit = (directory: string): void => {
+    for (const entry of readdirSync(directory, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) visit(path);
+      else if (entry.isFile()) files.push({ path: relative(root, path), bytes: readFileSync(path) });
+    }
+  };
+  visit(root);
+  return files;
+}
+
+function snapshotDatabase(db: DatabaseSync): Array<[string, unknown[]]> {
+  return (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").all() as Array<{ name: string }>)
+    .map(({ name }) => [name, db.prepare(`SELECT * FROM "${name}"`).all()] as [string, unknown[]]);
 }
 
 function switchRows(db: DatabaseSync): Array<Record<string, unknown>> {
@@ -4153,34 +4172,56 @@ describe('scenario 6 end to end and command contract — C6-26', () => {
     const h = switchHarness();
     try {
       const aPrime = observedDocument('a', 'scenario-6-a-prime');
+      const aPrimeFingerprint = codexFingerprint(aPrime);
       const holder: CodexProcess = { pid: 4411, lstart: 'Tue Nov 14 21:00:00 2023', host: 'codex' };
       const beforeB = h.slots.readSlot('b:account').document;
       const decision = { leftHeadroom: 8, leftRecoveryAt: 1_700_000_360_000, leftTrigger: 'proactive' };
       const input: SwitchCodexInput = { target: 'b:account', trigger: 'proactive', decision };
       h.store.setConfig('codex.l13VerifiedAt', '1');
-      const result = await h.runWith({ list: async () => [holder], hooks: { afterRename: () => {
-        const journal = readCodexSwitchJournal({ journalDir: join(h.root, 'journal') });
-        assert.deepEqual(journal.state === 'ok' ? journal.journal.decision : undefined, {
-          leftHeadroom: 8, leftRecoveryAtMs: 1_700_000_360_000, leftTrigger: 'proactive',
-        });
-        writeFileSync(h.authPath, JSON.stringify(aPrime));
-      } } }, input);
+      const revertStdout: string[] = [];
+      const revertStderr: string[] = [];
+      const scenarioDeps = () => h.deps({ authPath: h.authPath, dbPath: h.store.dbPath, journalDir: join(h.root, 'journal'), keychain: h.keychain,
+        slots: h.slots as never, list: async () => [holder], sameProcess: async () => true, readLive: () => readCodexAuthStableWithStat(h.authPath, { delayMs: 0 }),
+        transport: async () => { throw new Error('unexpected transport'); }, authLockOptions: { home: h.root, timeoutMs: 50, retryMinMs: 1, retryJitterMs: 1 },
+        journalOwner: { pid: process.pid, lstart: 'fixture-owner' }, hooks: { afterRename: () => {
+          const journal = readCodexSwitchJournal({ journalDir: join(h.root, 'journal') });
+          assert.deepEqual(journal.state === 'ok' ? journal.journal.decision : undefined, {
+            leftHeadroom: 8, leftRecoveryAtMs: 1_700_000_360_000, leftTrigger: 'proactive',
+          });
+          writeFileSync(h.authPath, JSON.stringify(aPrime));
+        } },
+      });
+      const revertCommand = createSwitchOpenAiCodexCommand({
+        enabled: true, now: () => 1_700_000_000_000, openStore: () => ({ close: () => undefined }) as never,
+        makeSwitchDeps: () => scenarioDeps(), switchCodex: (deps) => switchCodex(deps, input),
+      });
+      const revertContext: CommandContext = {
+        stdout: (line) => revertStdout.push(line), stderr: (line) => revertStderr.push(line),
+        env: { QLB_TEST_MODE: '1', HOME: h.root, QLB_HOME: join(h.root, 'qlb') },
+        config: defaultConfig(h.root), loadConfig: () => defaultConfig(h.root), home: h.root,
+        registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
+      };
 
-      assert.equal(result.outcome, 'reverted-by-codex');
+      assert.equal(await revertCommand.execute!(['b:account'], revertContext), 1);
+      assert.deepEqual(revertStderr, []);
+      assert.deepEqual(revertStdout, [
+        'Codex switch a:account → b:account: reverted-by-codex',
+        'Codex reverted the switch at 2023-11-14T22:13:20.000Z; 1 sessions on old account',
+        'Codex running on old account a:account: pid 4411 (codex) — restart',
+      ]);
       assert.deepEqual(h.slots.readSlot('a:account').document, aPrime);
       assert.deepEqual(h.slots.readSlot('b:account').document, beforeB);
       assert.deepEqual(JSON.parse(readFileSync(h.authPath, 'utf8')), aPrime);
       assert.deepEqual({ ...(h.db.prepare("SELECT account_id, set_by FROM active_login WHERE provider = 'openai-codex'").get() as object) },
         { account_id: 'a:account', set_by: 'adopt' });
-      assert.deepEqual({ ...(h.db.prepare("SELECT cause, evidence FROM lineage_log WHERE account_id = 'a:account' ORDER BY id DESC LIMIT 1").get() as object) },
-        { cause: 'adopt', evidence: 'holder' });
+      assert.deepEqual({ ...(h.db.prepare("SELECT provider, cause, evidence, to_fp FROM lineage_log WHERE account_id = 'a:account' ORDER BY id DESC LIMIT 1").get() as object) },
+        { provider: 'openai-codex', cause: 'adopt', evidence: 'holder', to_fp: aPrimeFingerprint });
+      assert.equal(h.store.getCodexSlot('a:account')?.fingerprint, aPrimeFingerprint);
       assert.equal(scalarCount(h.db, "SELECT COUNT(*) AS count FROM codex_slots WHERE account_id = 'a:account' AND dead != 0"), 0);
       assert.equal(scalarCount(h.db, "SELECT COUNT(*) AS count FROM relogin_events WHERE provider = 'openai-codex'"), 0);
-      assert.deepEqual(await listCodexOldAccountSessions(h.deps({ dbPath: h.store.dbPath, journalDir: join(h.root, 'journal'),
-        list: async () => [holder], sameProcess: async () => true }), { from: 'a:account' }),
-      [{ pid: 4411, host: 'codex', identities: ['a:account'], ambiguous: false }]);
 
-      let clock = 1_700_000_600_000;
+      const switchTime = 1_700_000_600_000;
+      let clock = switchTime;
       const waits: number[] = [];
       const engineDeps = () => h.deps({
         authPath: h.authPath, dbPath: h.store.dbPath, journalDir: join(h.root, 'journal'), keychain: h.keychain,
@@ -4190,50 +4231,78 @@ describe('scenario 6 end to end and command contract — C6-26', () => {
         sleep: async (ms) => { waits.push(ms); clock += ms; }, journalOwner: { pid: process.pid, lstart: 'fixture-owner' },
       });
       const stdout: string[] = [];
+      const stderr: string[] = [];
       const command = createSwitchOpenAiCodexCommand({
         enabled: true,
         openStore: () => ({ close: () => undefined }) as never,
         makeSwitchDeps: () => engineDeps(),
       });
       const context: CommandContext = {
-        stdout: (line) => stdout.push(line), stderr: () => {},
+        stdout: (line) => stdout.push(line), stderr: (line) => stderr.push(line),
         env: { QLB_TEST_MODE: '1', HOME: h.root, QLB_HOME: join(h.root, 'qlb') },
         config: defaultConfig(h.root), loadConfig: () => defaultConfig(h.root), home: h.root,
         registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
       };
 
       assert.equal(await command.execute!(['b:account'], context), 0);
+      assert.deepEqual(stderr, []);
       assert.deepEqual(waits, [1_000, 4_000, 25_000]);
       assert.deepEqual(stdout, ['Codex switch a:account → b:account: ok', 'QLB keeps checking until 2023-11-14T22:28:20.000Z']);
+      assert.deepEqual({ ...(h.db.prepare("SELECT account_id FROM active_login WHERE provider = 'openai-codex'").get() as object) }, { account_id: 'b:account' });
+      assert.deepEqual(h.slots.readSlot('b:account').document, beforeB);
+      assert.deepEqual(JSON.parse(readFileSync(h.authPath, 'utf8')), beforeB);
       const due = h.db.prepare('SELECT next_at, until FROM codex_watch').get() as { next_at: number; until: number };
-      clock = due.next_at;
-      await runDueCodexWatches(engineDeps(), due.next_at);
-      assert.equal((h.db.prepare('SELECT next_at FROM codex_watch').get() as { next_at: number }).next_at, due.until);
-      clock = due.until;
-      await runDueCodexWatches(engineDeps(), due.until);
+      assert.deepEqual({ ...due }, { next_at: switchTime + 120_000, until: switchTime + 300_000 });
+      clock = switchTime + 120_000;
+      await runDueCodexWatches(engineDeps(), clock);
+      assert.deepEqual({ ...(h.db.prepare('SELECT next_at, until FROM codex_watch').get() as object) },
+        { next_at: switchTime + 300_000, until: switchTime + 300_000 });
+      clock = switchTime + 300_000;
+      await runDueCodexWatches(engineDeps(), clock);
       assert.equal(scalarCount(h.db, 'SELECT COUNT(*) AS count FROM codex_watch'), 0);
     } finally { close(h); }
   });
 
-  it('the production command default refuses before opening a store or building engine dependencies', async () => {
-    let opened = 0;
-    let built = 0;
-    const stderr: string[] = [];
-    const command = createSwitchOpenAiCodexCommand({
-      openStore: () => { opened += 1; throw new Error('must not open'); },
-      makeSwitchDeps: () => { built += 1; throw new Error('must not build'); },
-    });
-    const home = join(tmpdir(), 'qlb-c6-26-disabled');
-    const context: CommandContext = {
-      stdout: () => {}, stderr: (line) => stderr.push(line),
-      env: { QLB_TEST_MODE: '1', HOME: home, QLB_HOME: join(home, 'qlb') },
-      config: defaultConfig(home), loadConfig: () => defaultConfig(home), home,
-      registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
-    };
+  it('the registered production command default refuses with a byte-for-byte unchanged state', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-c6-26-disabled-'));
+    const home = join(root, 'home');
+    const qlbHome = join(root, 'qlb');
+    mkdirSync(home); mkdirSync(qlbHome);
+    const config = defaultConfig(home);
+    const store = openStore(config.dbPath);
+    const db = (store as unknown as { db: DatabaseSync }).db;
+    try {
+      store.setConfig('c6-26.fixture', 'baseline');
+      const switchId = store.recordSwitch({ ts: 1, provider: 'openai-codex', fromAccount: 'a:account', toAccount: 'b:account', trigger: 'manual', outcome: 'ok' });
+      db.prepare("INSERT INTO codex_watch (switch_id, provider, outgoing, target, next_at, until) VALUES (?, 'openai-codex', 'a:account', 'b:account', 2, 3)").run(switchId);
+      const journalDir = join(qlbHome, '.qlb', 'journal');
+      mkdirSync(journalDir, { recursive: true });
+      writeFileSync(join(journalDir, 'switch-openai-codex.json'), '{"fixture":"baseline"}');
+      const before = {
+        store: snapshotDatabase(db), config: db.prepare('SELECT key, value FROM config ORDER BY key').all(),
+        journal: snapshotFiles(journalDir), watch: db.prepare('SELECT * FROM codex_watch ORDER BY switch_id').all(),
+        files: { home: snapshotFiles(home), qlbHome: snapshotFiles(qlbHome) },
+      };
+      const stdout: string[] = [];
+      const stderr: string[] = [];
+      const command = discoverCommands().find(({ name }) => name === 'switch openai-codex');
+      assert.ok(command?.execute, 'registered production command is discoverable');
+      const context: CommandContext = {
+        stdout: (line) => stdout.push(line), stderr: (line) => stderr.push(line),
+        env: { QLB_TEST_MODE: '1', HOME: home, QLB_HOME: qlbHome },
+        config, loadConfig: () => config, home,
+        registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
+      };
 
-    assert.equal(await command.execute!(['b:account'], context), 3);
-    assert.equal(opened, 0);
-    assert.equal(built, 0);
-    assert.deepEqual(stderr, ['qlb switch openai-codex is not enabled yet: it turns on together with QLB\'s background checks (C8).']);
+      assert.equal(await command.execute(['b:account'], context), 3);
+      assert.deepEqual(stdout, []);
+      assert.deepEqual(stderr, ['qlb switch openai-codex is not enabled yet: it turns on together with QLB\'s background checks (C8).']);
+      const after = {
+        store: snapshotDatabase(db), config: db.prepare('SELECT key, value FROM config ORDER BY key').all(),
+        journal: snapshotFiles(journalDir), watch: db.prepare('SELECT * FROM codex_watch ORDER BY switch_id').all(),
+        files: { home: snapshotFiles(home), qlbHome: snapshotFiles(qlbHome) },
+      };
+      assert.deepEqual(after, before);
+    } finally { store.close(); rmSync(root, { recursive: true, force: true }); }
   });
 });
