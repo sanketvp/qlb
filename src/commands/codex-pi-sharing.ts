@@ -1,15 +1,13 @@
-import { existsSync, readFileSync } from 'node:fs';
-import { DatabaseSync } from 'node:sqlite';
-import { pathToFileURL } from 'node:url';
+import { lstatSync, readFileSync } from 'node:fs';
 
-import { codexFingerprint, readCodexAuthStable, type CodexAuthDocument } from '../codex-auth';
+import { codexFingerprint, codexIdentity, codexSlotIdFromAccessToken, readCodexAuthStable, type CodexAuthDocument } from '../codex-auth';
 import { resolveCodexAuthPath } from './codex-import-active';
 import type { CommandContext, CommandDefinition } from '../registry';
-import type { CodexSlotLineageChainRow } from '../store';
+import { openStoreConnection, type CodexSlotLineageChainRow } from '../store';
 
 const FINGERPRINT_PREFIX_LENGTH = 'sha256:'.length + 12;
 
-type PiSharingStatus = 'shared' | 'separate' | 'no-pi-entry';
+type PiSharingStatus = 'shared' | 'separate' | 'cannot-tell' | 'no-pi-entry';
 
 type PiSharingReport = {
   status: PiSharingStatus;
@@ -26,14 +24,32 @@ function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-/** Reads only the Pi entry's refresh token long enough to derive its fingerprint. */
-function readPiFingerprint(path: string): string | null {
+type PiCredential = { access: string; refresh: string };
+type PiCredentialRead = { text: string; credential: PiCredential } | null;
+
+/** Read one Pi credential without ever exposing its parsed contents in an error. */
+function readPiCredentialOnce(path: string): PiCredentialRead {
+  let text: string;
+  try {
+    text = readFileSync(path, 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    // A dangling symlink also reports ENOENT from readFileSync. It is an
+    // unavailable input, not an absent Pi entry.
+    try {
+      lstatSync(path);
+    } catch (statError) {
+      if ((statError as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw statError;
+    }
+    throw error;
+  }
+
   let root: unknown;
   try {
-    root = JSON.parse(readFileSync(path, 'utf8')) as unknown;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
-    throw error;
+    root = JSON.parse(text) as unknown;
+  } catch {
+    throw new Error('Pi auth is invalid');
   }
   if (!isObject(root)) throw new Error('Pi auth is invalid');
   const entry = root['openai-codex'];
@@ -44,9 +60,22 @@ function readPiFingerprint(path: string): string | null {
     || typeof entry.expires !== 'number' || !Number.isFinite(entry.expires)) {
     throw new Error('Pi OpenAI Codex entry is invalid');
   }
+  return { text, credential: { access: entry.access, refresh: entry.refresh } };
+}
+
+/** Fails closed if the Pi credential changes between observations. */
+function readPiCredentialStable(path: string): PiCredential | null {
+  const first = readPiCredentialOnce(path);
+  if (first === null) return null;
+  const second = readPiCredentialOnce(path);
+  if (second === null || first.text !== second.text) throw new Error('Pi auth is unstable');
+  return first.credential;
+}
+
+function fingerprintPiCredential(credential: PiCredential): string {
   // codexFingerprint intentionally hashes only this field. Supplying no other
   // token value ensures this command never retains or formats credential text.
-  return codexFingerprint({ tokens: { refresh_token: entry.refresh } } as CodexAuthDocument);
+  return codexFingerprint({ tokens: { refresh_token: credential.refresh } } as CodexAuthDocument);
 }
 
 /**
@@ -55,14 +84,12 @@ function readPiFingerprint(path: string): string | null {
  * and the same lineage traversal rather than risking a QLB_HOME mutation.
  */
 function listCodexSlotLineageChains(dbPath: string): CodexSlotLineageChainRow[] {
-  if (!existsSync(dbPath)) return [];
-  // immutable=1 prevents SQLite from creating WAL/SHM sidecars for this
-  // inspection. The probe deliberately takes no lock and never writes.
-  const db = new DatabaseSync(`${pathToFileURL(dbPath).href}?immutable=1`, { readOnly: true });
+  // This must see committed rows still in SQLite's WAL. The shared store
+  // opener uses a read-only connection and performs no migrations or writes.
+  const db = openStoreConnection(dbPath, true);
   try {
-    db.exec('PRAGMA busy_timeout = 5000');
     const slots = db.prepare(`SELECT account_id AS accountId, source, fingerprint, prev_fingerprint AS prevFingerprint
-      FROM codex_slots WHERE archived_at IS NULL AND dead = 0 ORDER BY account_id`).all() as Array<{
+      FROM codex_slots ORDER BY account_id`).all() as Array<{
       accountId: string; source: string | null; fingerprint: string | null; prevFingerprint: string | null;
     }>;
     const transitions = db.prepare(`SELECT account_id AS accountId, from_fp AS fromFp, to_fp AS toFp
@@ -121,8 +148,8 @@ export async function runCodexPiSharingCommand(args: string[], ctx: CommandConte
   }
 
   try {
-    const piFingerprint = readPiFingerprint(ctx.config.piAuthJsonPath);
-    if (piFingerprint === null) {
+    const piCredential = readPiCredentialStable(ctx.config.piAuthJsonPath);
+    if (piCredential === null) {
       const result = report('no-pi-entry');
       ctx.stdout(options.json ? JSON.stringify(result) : formatHuman(result));
       return 0;
@@ -130,10 +157,19 @@ export async function runCodexPiSharingCommand(args: string[], ctx: CommandConte
 
     const live = await readCodexAuthStable(resolveCodexAuthPath(ctx.env, ctx.config));
     if (live.status !== 'ok') throw new Error('live Codex auth is unavailable');
+    const piFingerprint = fingerprintPiCredential(piCredential);
     const liveFingerprint = codexFingerprint(live.doc);
-    const shared = piFingerprint === liveFingerprint || listCodexSlotLineageChains(ctx.config.dbPath)
+    const chains = listCodexSlotLineageChains(ctx.config.dbPath);
+    const shared = piFingerprint === liveFingerprint || chains
       .some((slot) => slot.lineages.includes(piFingerprint) && slot.lineages.includes(liveFingerprint));
-    const result = report(shared ? 'shared' : 'separate', piFingerprint, liveFingerprint);
+    const piAccountId = codexSlotIdFromAccessToken(piCredential.access);
+    const liveAccountId = codexIdentity(live.doc);
+    const status = shared
+      ? 'shared'
+      : piAccountId !== null && liveAccountId !== null && piAccountId !== liveAccountId
+        ? 'separate'
+        : 'cannot-tell';
+    const result = report(status, piFingerprint, liveFingerprint);
     ctx.stdout(options.json ? JSON.stringify(result) : formatHuman(result));
     return 0;
   } catch {
