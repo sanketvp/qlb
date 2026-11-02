@@ -182,7 +182,11 @@ function observeHarness() {
       return { stashId: `fixture-stash-${fingerprint}`, created };
     },
   };
-  const run = (overrides: Partial<CodexSwitchDeps> = {}, assertHeld: () => void = () => undefined) => observeLiveCodex(h.deps({
+  const run = (
+    overrides: Partial<CodexSwitchDeps> = {},
+    assertHeld: () => void = () => undefined,
+    options?: Parameters<typeof observeLiveCodex>[2],
+  ) => observeLiveCodex(h.deps({
     dbPath: h.store.dbPath,
     authPath,
     keychain,
@@ -190,7 +194,7 @@ function observeHarness() {
     list: async () => [],
     readLive: () => readCodexAuthStableWithStat(authPath, { delayMs: 0 }),
     ...overrides,
-  }), assertHeld);
+  }), assertHeld, options);
   return {
     ...h, keychain, authPath, a0, plan, slots, run,
     stashes: () => stashed.size,
@@ -1155,6 +1159,143 @@ describe('Codex locked observe step — C6-16', () => {
       assert.equal(h.stashes(), 0);
       assert.equal(h.store.getCodexActiveLogin(), active);
     } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('observeLiveCodex reports noop, republish-slot, adopt and drift as its action', async () => {
+    const noop = observeHarness();
+    const republish = observeHarness();
+    const adopt = observeHarness();
+    const drift = observeHarness();
+    try {
+      const nooped = await noop.run();
+      assert.equal(nooped.outcome, 'settled');
+      assert.equal(nooped.outcome === 'settled' && nooped.action, 'noop');
+
+      const a1 = observedDocument('a', 'a1');
+      importActiveCodexSlot(a1, { store: republish.store, keychain: republish.keychain, now: () => 2 });
+      const republished = await republish.run({}, () => undefined, { onRepublish: 'settle' });
+      assert.equal(republished.outcome, 'settled');
+      assert.equal(republished.outcome === 'settled' && republished.action, 'republish-slot');
+
+      const adopted = observedDocument('a', 'adopted');
+      writeFileSync(adopt.authPath, JSON.stringify(adopted));
+      const adoptedResult = await adopt.run();
+      assert.equal(adoptedResult.outcome, 'settled');
+      assert.equal(adoptedResult.outcome === 'settled' && adoptedResult.action, 'adopt');
+
+      const b = observedDocument('b', 'b0');
+      const bPlan = importActiveCodexSlot(b, { store: drift.store, keychain: drift.keychain, now: () => 2 });
+      drift.store.setActiveLogin('openai-codex', drift.plan.slotId, 'import');
+      writeFileSync(drift.authPath, JSON.stringify(b));
+      const drifted = await drift.run();
+      assert.equal(drifted.outcome, 'settled');
+      assert.equal(drifted.outcome === 'settled' && drifted.action, 'drift');
+      if (drifted.outcome !== 'settled' || drifted.action !== 'drift') assert.fail('expected drift');
+      assert.equal(drifted.accountId, bPlan.slotId);
+    } finally {
+      for (const h of [noop, republish, adopt, drift]) {
+        h.store.close();
+        rmSync(h.root, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it('observeLiveCodex records the observation with the caller\'s by (qlb-active) and defaults to qlb-switch', async () => {
+    const active = observeHarness();
+    const fallback = observeHarness();
+    try {
+      await active.run({}, () => undefined, { by: 'qlb-active' });
+      await fallback.run();
+      assert.equal((active.db.prepare('SELECT by FROM codex_live_observations ORDER BY id DESC LIMIT 1').get() as { by: string }).by, 'qlb-active');
+      assert.equal((fallback.db.prepare('SELECT by FROM codex_live_observations ORDER BY id DESC LIMIT 1').get() as { by: string }).by, 'qlb-switch');
+    } finally {
+      for (const h of [active, fallback]) {
+        h.store.close();
+        rmSync(h.root, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it('onRepublish=settle returns the republished slot document with the post-publish read instead of throwing', async () => {
+    const h = observeHarness();
+    const a1 = observedDocument('a', 'a1');
+    try {
+      importActiveCodexSlot(a1, { store: h.store, keychain: h.keychain, now: () => 2 });
+      const result = await h.run({}, () => undefined, { onRepublish: 'settle' });
+      assert.equal(result.outcome, 'settled');
+      assert.equal(result.outcome === 'settled' && result.action, 'republish-slot');
+      if (result.outcome !== 'settled' || result.action !== 'republish-slot') assert.fail('expected republish');
+      assert.equal(codexFingerprint(result.outgoing.document), codexFingerprint(a1));
+      assert.equal(result.postPublish.status, 'ok');
+    } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('onRepublish=settle returns a drifted republish with its post-publish read instead of throwing', async () => {
+    const h = observeHarness();
+    const b0 = observedDocument('b', 'b0');
+    const b1 = observedDocument('b', 'b1');
+    try {
+      const b = importActiveCodexSlot(b0, { store: h.store, keychain: h.keychain, now: () => 2 });
+      importActiveCodexSlot(b1, { store: h.store, keychain: h.keychain, now: () => 3 });
+      h.store.setActiveLogin('openai-codex', h.plan.slotId, 'import');
+      writeFileSync(h.authPath, JSON.stringify(b0));
+      const result = await h.run({}, () => undefined, { onRepublish: 'settle' });
+      assert.equal(result.outcome, 'settled');
+      assert.equal(result.outcome === 'settled' && result.action, 'drift');
+      if (result.outcome !== 'settled' || result.action !== 'drift') assert.fail('expected drift');
+      assert.equal(result.disposition, 'republish-slot');
+      assert.equal(result.accountId, b.slotId);
+      assert.equal(codexFingerprint(result.outgoing.document), codexFingerprint(b1));
+      assert.equal(result.postPublish?.status, 'ok');
+    } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it('onRepublish defaults to throw: a republish and a drifted republish still throw CodexLiveChanged', async () => {
+    const republish = observeHarness();
+    const drift = observeHarness();
+    try {
+      importActiveCodexSlot(observedDocument('a', 'a1'), { store: republish.store, keychain: republish.keychain, now: () => 2 });
+      await assert.rejects(republish.run(), CodexLiveChanged);
+
+      const b0 = observedDocument('b', 'b0');
+      importActiveCodexSlot(b0, { store: drift.store, keychain: drift.keychain, now: () => 2 });
+      importActiveCodexSlot(observedDocument('b', 'b1'), { store: drift.store, keychain: drift.keychain, now: () => 3 });
+      drift.store.setActiveLogin('openai-codex', drift.plan.slotId, 'import');
+      writeFileSync(drift.authPath, JSON.stringify(b0));
+      await assert.rejects(drift.run(), CodexLiveChanged);
+    } finally {
+      for (const h of [republish, drift]) {
+        h.store.close();
+        rmSync(h.root, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it('settled outgoing and postPublish documents never reach a thrown error\'s message or a log line', async () => {
+    const h = observeHarness();
+    const changed = observedDocument('a', 'external');
+    const output: string[] = [];
+    const originalError = console.error;
+    try {
+      importActiveCodexSlot(observedDocument('a', 'a1'), { store: h.store, keychain: h.keychain, now: () => 2 });
+      let reads = 0;
+      console.error = (...values: unknown[]) => { output.push(values.map(String).join(' ')); };
+      await assert.rejects(h.run({ readLive: async () => {
+        reads += 1;
+        if (reads === 2) writeFileSync(h.authPath, JSON.stringify(changed));
+        return readCodexAuthStableWithStat(h.authPath, { delayMs: 0 });
+      } }), (error: Error) => {
+        assert.ok(error instanceof CodexLiveChanged);
+        assert.equal(error.message.includes(codexFingerprint(h.a0)), false);
+        assert.equal(error.message.includes(codexFingerprint(changed)), false);
+        return true;
+      });
+      assert.deepEqual(output, []);
+    } finally {
+      console.error = originalError;
+      h.store.close();
+      rmSync(h.root, { recursive: true, force: true });
+    }
   });
 
   it('keeps switch and auth locks held through the observe callback', async () => {

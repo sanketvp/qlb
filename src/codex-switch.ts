@@ -199,8 +199,17 @@ export type CodexLiveOutgoing = {
   inode: number;
 };
 
+export type ObserveLiveCodexOptions = {
+  by?: 'qlb-switch' | 'qlb-active' | 'qlb-gate' | 'qlb-verify-l13';
+  onRepublish?: 'throw' | 'settle';
+};
+
+type ObserveLiveCodexDriftDisposition = Exclude<CodexAttributionResult['disposition'], undefined>;
+
 export type ObserveLiveCodexResult =
-  | { outcome: 'settled'; outgoing: CodexLiveOutgoing }
+  | { outcome: 'settled'; action: 'noop' | 'adopt'; outgoing: CodexLiveOutgoing }
+  | { outcome: 'settled'; action: 'republish-slot'; outgoing: CodexLiveOutgoing; postPublish: CodexAuthStableWithStatResult }
+  | { outcome: 'settled'; action: 'drift'; disposition: ObserveLiveCodexDriftDisposition; accountId: string; outgoing: CodexLiveOutgoing; postPublish?: CodexAuthStableWithStatResult }
   | { outcome: 'refused'; reason: 'codex-writing' | 'codex-logged-out' | 'codex-auth-unreadable' | 'wiped' | 'republish-failed' | 'unknown-live-identity' | 'stash-unverifiable' | 'slot-split' };
 
 function observationDeps(deps: CodexSwitchDeps): {
@@ -247,8 +256,11 @@ export async function withCodexSwitchLocks<T>(
 export async function observeLiveCodex(
   deps: CodexSwitchDeps,
   assertHeld: () => void,
+  options: ObserveLiveCodexOptions = {},
 ): Promise<ObserveLiveCodexResult> {
   const configured = observationDeps(deps);
+  const by = options.by ?? 'qlb-switch';
+  const onRepublish = options.onRepublish ?? 'throw';
   const p0 = await configured.list();
   const live = await deps.readLive();
   const p1 = await configured.list();
@@ -258,7 +270,7 @@ export async function observeLiveCodex(
   if (live.status === 'unreadable') return { outcome: 'refused', reason: 'codex-auth-unreadable' };
   if (live.status === 'wiped') {
     assertHeld();
-    deps.store.recordCodexObservation({ identity: null, lineageFp: null, by: 'qlb-switch', now: deps.now() });
+    deps.store.recordCodexObservation({ identity: null, lineageFp: null, by, now: deps.now() });
     return { outcome: 'refused', reason: 'wiped' };
   }
 
@@ -281,11 +293,12 @@ export async function observeLiveCodex(
   deps.store.recordCodexObservation({
     identity: liveIdentity,
     lineageFp: codexFingerprint(live.doc),
-    by: 'qlb-switch',
+    by,
     now: deps.now(),
   });
 
   try {
+    let republished: { document: CodexAuthDocument; result: Extract<CodexAuthPublishResult, { stage: 'published' }> } | undefined;
     // With no active slot and no managed slot for the live identity, there is
     // nothing S56 could attribute against: the live identity is unknown or
     // unparseable, which is step 2's unclaimed path.
@@ -317,11 +330,27 @@ export async function observeLiveCodex(
         assertHeld();
         const published = await publishCodexAuth(deps.authPath, document);
         if (published.stage === 'rename-threw') throw new CodexRepublishFailed();
+        republished = { document, result: published };
       },
     });
     if (attribution.action === 'republish-slot'
       || (attribution.action === 'drift' && attribution.disposition === 'republish-slot')) {
-      throw new CodexLiveChanged();
+      if (onRepublish === 'throw') throw new CodexLiveChanged();
+      if (!republished) throw new Error('Codex republish did not produce a publication result');
+      const postPublish = await deps.readLive();
+      const outgoing = {
+        document: republished.document,
+        sha256: postPublish.status === 'ok' ? postPublish.sha256 : codexFingerprint(republished.document),
+        inode: postPublish.status === 'ok' ? postPublish.inode : republished.result.inode,
+      };
+      if (attribution.action === 'republish-slot') {
+        return { outcome: 'settled', action: 'republish-slot', outgoing, postPublish };
+      }
+      if (!attribution.accountId || !attribution.disposition) throw new Error('Codex drift republish is missing its slot identity');
+      return {
+        outcome: 'settled', action: 'drift', disposition: attribution.disposition,
+        accountId: attribution.accountId, outgoing, postPublish,
+      };
     }
     if (attribution.action === 'unclaimed') {
       assertHeld();
@@ -339,7 +368,15 @@ export async function observeLiveCodex(
       || (attribution.action === 'drift' && attribution.disposition === 'slot-split')) {
       return { outcome: 'refused', reason: 'slot-split' };
     }
-    return { outcome: 'settled', outgoing: { document: live.doc, sha256: live.sha256, inode: live.inode } };
+    const outgoing = { document: live.doc, sha256: live.sha256, inode: live.inode };
+    if (attribution.action === 'noop' || attribution.action === 'adopt') {
+      return { outcome: 'settled', action: attribution.action, outgoing };
+    }
+    if (attribution.action === 'drift') {
+      if (!attribution.accountId || !attribution.disposition) throw new Error('Codex drift is missing its slot identity');
+      return { outcome: 'settled', action: 'drift', disposition: attribution.disposition, accountId: attribution.accountId, outgoing };
+    }
+    throw new Error('Unexpected Codex live observation attribution');
   } catch (error) {
     if (error instanceof CodexRepublishFailed) return { outcome: 'refused', reason: 'republish-failed' };
     throw error;
