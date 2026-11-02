@@ -6,6 +6,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { describe, it } from 'node:test';
 
 import {
+  CSWAP_RESTORE_PENDING,
   CUTOVER_BEGIN_IN_PROGRESS,
   PHASE_RULES,
   RETIREMENT_IN_PROGRESS,
@@ -286,6 +287,32 @@ describe('lifecycle (AC49)', () => {
       for (const operation of ['undo-cswap', 'undo-cswap:resume', 'pi-rollback', 'retire-cswap', 'lifecycle-close'] as const) {
         assert.equal(assertAdmitted(store, operation).code, RETIREMENT_IN_PROGRESS, operation);
       }
+    } finally { store.close(); }
+  });
+
+  it('lifecycle close is refused until C-swap restore clears its terminal fence', async () => {
+    const store = fixtureStore();
+    try {
+      beginCutover(store);
+      const db = new DatabaseSync(store.dbPath);
+      try { db.prepare("UPDATE lifecycle SET state = 'cutover'").run(); } finally { db.close(); }
+      assert.equal(transition(store, 'undoing', 20).ok, true);
+      assert.equal(transition(store, 'rolled-back', 30, CSWAP_RESTORE_PENDING).ok, true);
+      const pending = phase(store);
+      assert.equal(assertAdmitted(store, 'lifecycle-close').code, CSWAP_RESTORE_PENDING);
+      assert.equal(closeLifecycle(store, pending.id, 'fixture', 40).code, CSWAP_RESTORE_PENDING);
+
+      const home = mkdtempSync(join(tmpdir(), 'qlb-lifecycle-close-'));
+      const config = { ...defaultConfig(home), dbPath: store.dbPath };
+      const output: string[] = [];
+      const code = await runExecutingCommand({ command: lifecycleCommand, args: ['close', String(pending.id), '--note', 'fixture'] }, {
+        config, env: {}, home, stdout: (line: string) => output.push(line), stderr: (line: string) => output.push(line),
+        loadConfig: () => config, registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
+      } as unknown as CommandContext);
+      assert.equal(code, 3);
+      assert.match(output.join('\n'), /qlb undo cswap --resume/);
+      assert.equal(phase(store).state, 'rolled-back');
+      assert.equal(phase(store).note, CSWAP_RESTORE_PENDING);
     } finally { store.close(); }
   });
 

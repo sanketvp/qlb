@@ -9,7 +9,7 @@ import { defaultConfig } from '../src/config';
 import { credentialFingerprint } from '../src/anthropic-oauth';
 import { createCutoverCommand } from '../src/commands/cutover';
 import { CSWAP_ANTHROPIC_STORE, CONSUME_STATE } from '../src/cswap-consume';
-import { beginCutover, phase } from '../src/lifecycle';
+import { CUTOVER_BEGIN_IN_PROGRESS, beginCutover, phase } from '../src/lifecycle';
 import type { CswapAgent } from '../src/cswap-agent';
 import type { CommandContext } from '../src/registry';
 import { openStore } from '../src/store';
@@ -156,14 +156,15 @@ test('test mode without an injected agent never reaches launchctl', async () => 
   }
 });
 
-test('abort before import restores C-swap only', async () => {
+test('cutover begin then abort with no QLB agent installed ends aborted with C-swap restored', async () => {
   const f = fixture();
   try {
-    const store = openStore(f.dbPath);
-    try { beginCutover(store, 10); } finally { store.close(); }
     const calls: string[] = [];
     const agent: CswapAgent = {
-      bootout: () => ({ ok: true }), disable: () => ({ ok: true }), movePlist: () => ({ ok: true }), drain: () => ({ ok: true }),
+      bootout: () => { calls.push('cswap-bootout'); return { ok: true }; },
+      disable: () => { calls.push('cswap-disable'); return { ok: true }; },
+      movePlist: () => { calls.push('cswap-move'); return { ok: true }; },
+      drain: () => { calls.push('cswap-drain'); return { ok: true }; },
       restorePlist: () => { calls.push('restore-cswap'); return { ok: true }; },
     };
     const command = createCutoverCommand({
@@ -171,15 +172,39 @@ test('abort before import restores C-swap only', async () => {
       undoCswap: {
         bootoutQlbAgent: () => { calls.push('bootout-qlb'); return { ok: true }; },
         listQlbPids: () => [], listHeldLocks: () => [], pendingStash: () => null,
-        moveQlbPlist: () => { calls.push('move-qlb-plist'); return { ok: true }; },
       },
     });
+    // The production mover is intentionally selected: no test-mode marker and
+    // no injected QLB plist mover. The temporary HOME has no LaunchAgent.
+    const productionContext = { ...f.context, env: { QLB_HOME: f.root, HOME: f.root } };
 
-    assert.equal(await command.execute!(['abort'], f.context), 0);
-    assert.deepEqual(calls, ['bootout-qlb', 'move-qlb-plist', 'restore-cswap']);
+    assert.equal(await command.execute!(['begin'], productionContext), 0);
+    assert.equal(await command.execute!(['abort'], productionContext), 0);
+    assert.deepEqual(calls, ['cswap-bootout', 'cswap-disable', 'cswap-move', 'cswap-drain', 'bootout-qlb', 'restore-cswap']);
     const completed = openStore(f.dbPath);
-    try { assert.equal(phase(completed).state, 'aborted'); } finally { completed.close(); }
-    assert.match(f.output[0]!, /qlb lifecycle close \d+/);
+    try {
+      assert.equal(phase(completed).state, 'aborted');
+      assert.equal(phase(completed).note, null);
+    } finally { completed.close(); }
+    assert.match(f.output.at(-1)!, /qlb lifecycle close \d+/);
+  } finally { f.cleanup(); }
+});
+
+test('direct cutover abort observes the cutover-begin in-progress fence', async () => {
+  const f = fixture();
+  try {
+    const store = openStore(f.dbPath);
+    try {
+      beginCutover(store, 10);
+      const db = new DatabaseSync(f.dbPath);
+      try { db.prepare('UPDATE lifecycle SET note = ?').run(CUTOVER_BEGIN_IN_PROGRESS); } finally { db.close(); }
+    } finally { store.close(); }
+    const command = createCutoverCommand();
+
+    assert.equal(await command.execute!(['abort', '--json'], f.context), 3);
+    assert.deepEqual(JSON.parse(f.output[0]!), { ok: false, code: CUTOVER_BEGIN_IN_PROGRESS });
+    const current = openStore(f.dbPath);
+    try { assert.equal(phase(current).state, 'cutting-over'); } finally { current.close(); }
   } finally { f.cleanup(); }
 });
 

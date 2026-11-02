@@ -127,9 +127,9 @@ function beginUndo(f: Fixture): void {
 
 type UndoFakes = Partial<NonNullable<Parameters<typeof runUndoCswapCommand>[2]>>;
 
-async function undo(f: Fixture, fakes: UndoFakes = {}, args: string[] = []): Promise<number> {
+async function undo(f: Fixture, fakes: UndoFakes = {}, args: string[] = [], ctx: CommandContext = context(f)): Promise<number> {
   let now = 0;
-  return runUndoCswapCommand(args, context(f), {
+  return runUndoCswapCommand(args, ctx, {
     keychain: f.keychain,
     bootoutQlbAgent: () => ({ ok: true }),
     listQlbPids: () => [],
@@ -612,6 +612,40 @@ describe('qlb undo cswap hand-back', () => {
     } finally { close(f); }
   });
 
+  it('the production plist mover treats a missing QLB agent as nothing to move', async () => {
+    const f = fixture();
+    try {
+      beginUndo(f);
+      const productionContext = { ...context(f), env: { QLB_HOME: f.home, HOME: f.home } };
+      let restored = 0;
+      assert.equal(await undo(f, {
+        moveQlbPlist: undefined,
+        cswapAgent: { restorePlist: () => { restored += 1; return { ok: true }; } },
+      }, [], productionContext), 0);
+      assert.equal(restored, 1);
+      const store = openStore(f.dbPath);
+      try {
+        assert.equal(phase(store).state, 'rolled-back');
+        assert.equal(phase(store).note, null);
+      } finally { store.close(); }
+    } finally { close(f); }
+  });
+
+  it('the production plist mover accepts a plist already in its backup', async () => {
+    const f = fixture();
+    try {
+      beginUndo(f);
+      const target = join(f.home, '.qlb', 'backups', 'qlb-plist', 'com.modus.qlb-auto.plist');
+      mkdirSync(join(f.home, '.qlb', 'backups', 'qlb-plist'), { recursive: true });
+      writeFileSync(target, 'fixture plist');
+      const productionContext = { ...context(f), env: { QLB_HOME: f.home, HOME: f.home } };
+      assert.equal(await undo(f, { moveQlbPlist: undefined }, [], productionContext), 0);
+      assert.equal(readFileSync(target, 'utf8'), 'fixture plist');
+      const store = openStore(f.dbPath);
+      try { assert.equal(phase(store).state, 'rolled-back'); } finally { store.close(); }
+    } finally { close(f); }
+  });
+
   it('undo ends rolled-back with the agent stopped and C-swap restored', async () => {
     const f = fixture();
     try {
@@ -627,6 +661,17 @@ describe('qlb undo cswap hand-back', () => {
       const store = openStore(f.dbPath);
       try { assert.equal(phase(store).state, 'rolled-back'); } finally { store.close(); }
       assert.match(f.output.at(-1)!, /qlb lifecycle close \d+/);
+    } finally { close(f); }
+  });
+
+  it('a failed plist move reports the fenced state and resume hint', async () => {
+    const f = fixture();
+    try {
+      beginUndo(f);
+      assert.equal(await undo(f, { moveQlbPlist: () => ({ ok: false, code: 'fixture-move-failed' }) }), 1);
+      assert.match(f.output.at(-1)!, /state=undoing; run qlb undo cswap --resume/);
+      const store = openStore(f.dbPath);
+      try { assert.equal(phase(store).state, 'undoing'); } finally { store.close(); }
     } finally { close(f); }
   });
 
@@ -664,13 +709,19 @@ describe('qlb undo cswap hand-back', () => {
       assert.equal(await undo(f, fakes), 1);
       const writesAfterFailure = f.keychain.writes.length;
       const store = openStore(f.dbPath);
-      try { assert.equal(phase(store).state, 'rolled-back'); } finally { store.close(); }
+      try {
+        assert.equal(phase(store).state, 'rolled-back');
+        assert.equal(phase(store).note, 'cswap-restore-pending');
+      } finally { store.close(); }
+      assert.match(f.output.at(-1)!, /state=rolled-back; run qlb undo cswap --resume/);
       f.output.length = 0;
       assert.equal(await undo(f, fakes, ['--resume']), 0);
       assert.equal(bootouts, 1);
       assert.equal(moves, 1);
       assert.equal(restores, 2);
       assert.equal(f.keychain.writes.length, writesAfterFailure);
+      const resumed = openStore(f.dbPath);
+      try { assert.equal(phase(resumed).note, null); } finally { resumed.close(); }
       assert.match(f.output[0]!, /qlb lifecycle close \d+/);
     } finally { close(f); }
   });
