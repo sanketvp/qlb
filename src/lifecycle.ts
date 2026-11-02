@@ -21,6 +21,10 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 const OPEN_STATES = ['cutting-over', 'cutover', 'undoing', 'rolled-back', 'retired', 'aborted'];
 const PI_PROVIDERS = ['anthropic', 'openai-codex', 'xai', 'kimi-coding', 'openrouter'] as const;
 export const CUTOVER_BEGIN_IN_PROGRESS = 'cutover-begin-in-progress';
+/** The terminal hand-back state is durable, but C-swap has not been restored yet. */
+export const CSWAP_RESTORE_PENDING = 'cswap-restore-pending';
+/** Operator guidance when lifecycle close meets the C-swap restore fence. */
+export const FINISH_CSWAP_RESTORE_FIRST = 'finish the C-swap restore first: run qlb undo cswap --resume';
 /** Set only after retire-cswap has durably recorded its journal. */
 export const RETIREMENT_IN_PROGRESS = 'retirement-in-progress';
 /** Operator guidance when lifecycle close meets the retirement fence (user decision X4a-r). */
@@ -142,6 +146,10 @@ function assertAdmittedForPhase(current: LifecycleRow, operation: LifecycleOpera
   if (current.note === CUTOVER_BEGIN_IN_PROGRESS && operation !== 'doctor' && operation !== 'status') {
     return { ok: false, code: CUTOVER_BEGIN_IN_PROGRESS, row: current };
   }
+  // The terminal hand-back row is not closeable until C-swap is restored.
+  if (current.note === CSWAP_RESTORE_PENDING && operation === 'lifecycle-close') {
+    return { ok: false, code: CSWAP_RESTORE_PENDING, row: current };
+  }
   // Retirement fences only actions which could reverse or restart a partial
   // retirement; normal service and its reporting remain available.
   if (current.note === RETIREMENT_IN_PROGRESS && (
@@ -170,7 +178,7 @@ const TRANSITIONS: Partial<Record<LifecycleState, LifecycleState[]>> = {
 };
 
 /** Durable state transition primitive for K12/X4a; each edge is §4.15-only. */
-export function transition(store: Store, to: LifecycleState, now: number = Date.now()): LifecycleResult {
+export function transition(store: Store, to: LifecycleState, now: number = Date.now(), note?: string | null): LifecycleResult {
   const current = phase(store);
   if (!TRANSITIONS[current.state]?.includes(to)) {
     return { ok: false, code: `transition=${current.state}->${to}`, row: current };
@@ -188,6 +196,10 @@ export function transition(store: Store, to: LifecycleState, now: number = Date.
   if (to === 'rolled-back' || to === 'aborted') {
     fields.push('rollback_at = ?');
     values.push(now);
+  }
+  if (note !== undefined) {
+    fields.push('note = ?');
+    values.push(note);
   }
   if (to === 'retired') {
     fields.push('retired_at = ?');
@@ -230,6 +242,20 @@ export function beginRetirementFence(store: Store): LifecycleResult {
   return changed === 1
     ? { ok: true, row: phase(store) }
     : { ok: false, code: 'retirement-fence-state-lost', row: phase(store) };
+}
+
+/** Clear the C-swap restore fence only after the plist is restored. */
+export function clearCswapRestorePending(store: Store): LifecycleResult {
+  const current = phase(store);
+  if (!['rolled-back', 'aborted'].includes(current.state) || current.note !== CSWAP_RESTORE_PENDING) {
+    return { ok: false, code: 'cswap-restore-state-lost', row: current };
+  }
+  const changed = withDb(store, (db) => db.prepare(
+    "UPDATE lifecycle SET note = NULL WHERE id = ? AND state IN ('rolled-back', 'aborted') AND note = ?",
+  ).run(current.id, CSWAP_RESTORE_PENDING).changes);
+  return changed === 1
+    ? { ok: true, row: phase(store) }
+    : { ok: false, code: 'cswap-restore-state-lost', row: phase(store) };
 }
 
 /** The retirement journal is durable before this terminal fence is cleared. */
@@ -505,14 +531,17 @@ export function closeLifecycle(store: Store, id: number, note: string, now: numb
   if (!['rolled-back', 'aborted', 'retired'].includes(current.state) || current.id !== id) {
     return { ok: false, code: `phase=${current.state}`, row: current };
   }
-  // Closing would overwrite the fence and strand the retirement's journal (user decision X4a-r).
-  if (current.note === RETIREMENT_IN_PROGRESS) return { ok: false, code: RETIREMENT_IN_PROGRESS, row: current };
+  // Closing would overwrite an incomplete recovery fence.
+  if (current.note === RETIREMENT_IN_PROGRESS || current.note === CSWAP_RESTORE_PENDING) {
+    return { ok: false, code: current.note, row: current };
+  }
   const changed = withDb(store, (db) => db.prepare(
-    "UPDATE lifecycle SET state = 'closed', closed_at = ?, note = ? WHERE id = ? AND state IN ('rolled-back', 'aborted', 'retired') AND note IS NOT ?",
-  ).run(now, note, id, RETIREMENT_IN_PROGRESS).changes);
+    "UPDATE lifecycle SET state = 'closed', closed_at = ?, note = ? WHERE id = ? AND state IN ('rolled-back', 'aborted', 'retired') AND (note IS NULL OR note NOT IN (?, ?))",
+  ).run(now, note, id, RETIREMENT_IN_PROGRESS, CSWAP_RESTORE_PENDING).changes);
   if (changed === 1) return { ok: true, row: phase(store) };
   const after = phase(store);
-  return { ok: false, code: after.note === RETIREMENT_IN_PROGRESS ? RETIREMENT_IN_PROGRESS : `phase=${after.state}`, row: after };
+  return { ok: false, code: after.note === RETIREMENT_IN_PROGRESS || after.note === CSWAP_RESTORE_PENDING
+    ? after.note : `phase=${after.state}`, row: after };
 }
 
 export function lifecycleCheck(store: Pick<Store, 'dbPath'>, kind: 'window' | 'drill', now: number = Date.now()): { level: 'PASS' | 'WARN' | 'FAIL'; message: string } {

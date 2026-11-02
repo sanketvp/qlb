@@ -1,4 +1,4 @@
-import { FINISH_RETIREMENT_FIRST, RETIREMENT_IN_PROGRESS, closeLifecycle, markDrillDone, phase } from '../lifecycle';
+import { CSWAP_RESTORE_PENDING, FINISH_CSWAP_RESTORE_FIRST, FINISH_RETIREMENT_FIRST, RETIREMENT_IN_PROGRESS, closeLifecycle, markDrillDone, phase } from '../lifecycle';
 import { openStore } from '../store';
 import type { CommandContext, CommandDefinition } from '../registry';
 
@@ -31,7 +31,9 @@ async function execute(args: string[], ctx: CommandContext): Promise<number> {
       const result = closeLifecycle(store, id, note);
       const refusal = result.code === RETIREMENT_IN_PROGRESS
         ? `lifecycle close refused: ${result.code}; ${FINISH_RETIREMENT_FIRST}`
-        : `lifecycle close refused: ${result.code}`;
+        : result.code === CSWAP_RESTORE_PENDING
+          ? `lifecycle close refused: ${result.code}; ${FINISH_CSWAP_RESTORE_FIRST}`
+          : `lifecycle close refused: ${result.code}`;
       emit(ctx, parsed.json, result, result.ok ? 'lifecycle closed' : refusal);
       return result.ok ? 0 : 3;
     }

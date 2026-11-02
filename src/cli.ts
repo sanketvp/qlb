@@ -4,7 +4,7 @@ import * as net from 'node:net';
 import { dirname, join, resolve } from 'node:path';
 import { adapters } from './adapters';
 import { assertTestHomeIsIsolated } from './bootstrap';
-import { FINISH_RETIREMENT_FIRST, RETIREMENT_IN_PROGRESS, assertAdmitted, type LifecycleOperation } from './lifecycle';
+import { CSWAP_RESTORE_PENDING, FINISH_CSWAP_RESTORE_FIRST, FINISH_RETIREMENT_FIRST, RETIREMENT_IN_PROGRESS, assertAdmitted, type LifecycleOperation } from './lifecycle';
 import { createDefaultCodexGateDeps, runCodexGate } from './codex-gate';
 import { config, resolveConfig, stripConfigArgs } from './config';
 import { qlbHomeDir } from './home';
@@ -1975,9 +1975,11 @@ export async function runExecutingCommand(
       if (refusal != null) {
         const guidance = operation === 'lifecycle-close' && refusal === RETIREMENT_IN_PROGRESS
           ? `; ${FINISH_RETIREMENT_FIRST}`
-          : refusal === 'undo-in-progress'
-            ? '; run qlb undo cswap --resume'
-            : '';
+          : operation === 'lifecycle-close' && refusal === CSWAP_RESTORE_PENDING
+            ? `; ${FINISH_CSWAP_RESTORE_FIRST}`
+            : refusal === 'undo-in-progress'
+              ? '; run qlb undo cswap --resume'
+              : '';
         redactingContext.stderr(`qlb ${match.command.name}: refused: ${refusal}${guidance}`);
         return 3;
       }

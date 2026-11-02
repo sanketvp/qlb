@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { credentialFingerprint, type HttpRequestDescription } from '../anthropic-oauth';
-import { existsSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 
 import {
@@ -20,14 +20,14 @@ import { claudePaths } from '../cc-paths';
 import { ClaudeSlots, SqliteClaudeSlotRepository, type ClaudeSlotBackend } from '../cc-slots';
 import { CREDENTIALS_STALENESS_MS, withClaudeCredentialLocks, withClaudeSwitchLock } from '../cc-locks';
 import { cacheProfileVerdict, credentialLineage, liveIdentity, ProbeVerdictMemo, resyncUnderHeldLocks, type ResyncProfileResponse } from '../cc-resync';
-import { productionTryAcquireLock } from '../cswap-agent';
+import { productionLaunchctlCswapAgent, productionTryAcquireLock, unavailableCswapAgent, type CswapAgent } from '../cswap-agent';
 import type { CredentialBackend } from '../credential-backends';
 import { qlbHomeDir } from '../home';
 import { withUndoCapability } from '../keychain-allowlist';
 import { isSuccessor } from '../lineage-log';
 import { listUnclaimedKeychainServices, macosKeychainAccountName, platformKeychain } from '../keychain';
 import { listStashes } from '../unclaimed-index';
-import { transition } from '../lifecycle';
+import { CSWAP_RESTORE_PENDING, clearCswapRestorePending, phase, transition } from '../lifecycle';
 import { openStoreConnection, openStore } from '../store';
 import type { CommandContext, CommandDefinition } from '../registry';
 
@@ -52,6 +52,10 @@ export interface UndoCswapCommandDependencies {
   readBack?: ExecuteHandBackDependencies['readBack'];
   validateActiveSequence?: ExecuteHandBackDependencies['validateActiveSequence'];
   setActiveAccountNumber?: ExecuteHandBackDependencies['setActiveAccountNumber'];
+  /** The C-swap agent owns launchctl and its own plist restoration. */
+  cswapAgent?: Pick<CswapAgent, 'restorePlist'>;
+  /** Moves QLB's agent plist only after a verified hand-back. */
+  moveQlbPlist?: () => { ok: boolean; code?: string } | Promise<{ ok: boolean; code?: string }>;
   /** Test seam for the active-login ownership oracle. */
   getProfile?: (request: HttpRequestDescription) => Promise<ResyncProfileResponse>;
 }
@@ -223,30 +227,58 @@ async function defaultResyncActive(
     const registered = slots.getSlot(accountId);
     if (!registered) return;
     const paths = claudePaths({ home, env });
+    const observed = (() => {
+      try { return liveIdentity(paths.globalConfigPath); } catch { return null; }
+    })();
+    // UUID is the identity authority. Email and organization only corroborate
+    // when QLB recorded them; an old import with either field absent is valid.
+    const knownIdentityMatches = observed !== null
+      && observed.accountId === accountId
+      && (registered.email == null || observed.email === registered.email)
+      && (registered.orgUuid == null || observed.orgUuid === registered.orgUuid);
+    if (!knownIdentityMatches) throw new CswapUndoActiveLoginError(registered.slotNum ?? 0);
+
     const verdicts = new ProbeVerdictMemo();
     const input = {
       accountId, email: registered.email ?? '', orgUuid: registered.orgUuid ?? '',
       creds: credential, slot: current,
     };
     const liveFp = credentialLineage(credential);
+    if (liveFp === current.fingerprint) {
+      // Refreshes can retain their refresh token while changing access/expiry
+      // bytes. Persist those exact locked live bytes before exporting them.
+      if (current.credential !== credential) {
+        await slots.writeSlot(accountId, credential, { cause: 'adopt', by: 'qlb-cli', evidence: 'lineage' });
+      }
+      return;
+    }
+
     const slotAhead = liveFp !== null && current.fingerprint !== null
-      && (liveFp === current.fingerprint || liveFp === registered.prevFingerprint
+      && (liveFp === registered.prevFingerprint
         || isSuccessor(store, 'anthropic', accountId, liveFp, current.fingerprint));
     // A native Claude Code rotation has no QLB lineage edge. Attribute that
     // locked live credential through the same profile oracle as resync before
     // asking resyncUnderHeldLocks to promote it.
+    let profileMatch: boolean | null = null;
     if (!slotAhead) {
-      try { await cacheProfileVerdict({ getProfile, verdicts }, input); } catch { /* fail closed below */ }
+      try { profileMatch = await cacheProfileVerdict({ getProfile, verdicts }, input); } catch { /* fail closed below */ }
     }
-    await resyncUnderHeldLocks({
-      slots, store, live: { backend: keychain as unknown as CredentialBackend, paths, env }, env,
-      verdicts, now: Date.now,
-      readLiveIdentity: () => {
-        try { return liveIdentity(paths.globalConfigPath); } catch { return null; }
-      },
-      getProfile,
-      by: 'qlb-cli',
-    }, input);
+    if (registered.email == null || registered.orgUuid == null) {
+      // resyncUnderHeldLocks deliberately requires exact stored identity. An
+      // old imported slot may lack corroborating fields, so the same UUID
+      // profile oracle is the authority for this one locked adoption.
+      if (!slotAhead && profileMatch === true) {
+        await slots.writeSlot(accountId, credential, { cause: 'resync', by: 'qlb-cli', evidence: 'oracle' });
+      }
+    } else {
+      await resyncUnderHeldLocks({
+        slots, store, live: { backend: keychain as unknown as CredentialBackend, paths, env }, env,
+        verdicts, now: Date.now,
+        readLiveIdentity: () => observed,
+        getProfile,
+        by: 'qlb-cli',
+      }, input);
+    }
     const after = await slots.readSlot(accountId, { fresh: true });
     if (liveFp === null || (after.fingerprint !== liveFp
       && !isSuccessor(store, 'anthropic', accountId, liveFp, after.fingerprint))) {
@@ -308,7 +340,125 @@ function defaultSetActiveAccountNumber(sequencePath: string): ExecuteHandBackDep
   };
 }
 
-/** `qlb undo cswap [--dry-run | --resume]`: G16 plan and G17 hand-back. */
+function defaultCswapAgent(ctx: CommandContext): Pick<CswapAgent, 'restorePlist'> {
+  if (ctx.env.QLB_TEST_MODE === '1' || process.env.QLB_TEST_MODE === '1') return unavailableCswapAgent;
+  return productionLaunchctlCswapAgent(ctx.home, qlbHomeDir(ctx.env), ctx.config.cswapSequencePath);
+}
+
+function defaultMoveQlbPlist(ctx: CommandContext): { ok: boolean; code?: string } {
+  if (ctx.env.QLB_TEST_MODE === '1' || process.env.QLB_TEST_MODE === '1') return { ok: false, code: 'qlb-plist-mover-not-injected' };
+  const source = join(ctx.home, 'Library', 'LaunchAgents', 'com.modus.qlb-auto.plist');
+  // CommandContext.home is the authority for the active user's QLB paths.
+  // Keeping both mover paths beneath it also keeps direct command tests hermetic.
+  const backupDir = join(ctx.home, '.qlb', 'backups', 'qlb-plist');
+  const target = join(backupDir, 'com.modus.qlb-auto.plist');
+  try {
+    if (!existsSync(source)) {
+      // A previous successful move leaves the backup behind. Before commit,
+      // however, the QLB agent was never installed, so both paths are absent.
+      if (existsSync(target)) return { ok: true };
+      const store = openStore(ctx.config.dbPath);
+      try {
+        if (phase(store).preFenceState === 'cutting-over') return { ok: true };
+      } finally { store.close(); }
+      return { ok: false, code: 'qlb-plist-missing' };
+    }
+    mkdirSync(backupDir, { recursive: true, mode: 0o700 });
+    renameSync(source, target);
+    return { ok: true };
+  } catch {
+    return { ok: false, code: 'qlb-plist-move-failed' };
+  }
+}
+
+/** The terminal row may need a restore, and its new durable fence may need clearing. */
+type TerminalHandBack = {
+  state: 'rolled-back' | 'aborted';
+  lifecycleId: number;
+  restorePending: boolean;
+  needsRestore: boolean;
+};
+
+class CswapUndoFinalizationError extends Error {
+  constructor(readonly state: string, readonly code?: string) {
+    super('hand-back finalization failed');
+    this.name = 'CswapUndoFinalizationError';
+  }
+}
+
+function clearRestorePending(ctx: CommandContext): void {
+  const store = openStore(ctx.config.dbPath);
+  try {
+    if (!clearCswapRestorePending(store).ok) throw new CswapUndoFinalizationError(phase(store).state);
+  } finally { store.close(); }
+}
+
+async function restoreCswap(ctx: CommandContext, dependencies: UndoCswapCommandDependencies, final: TerminalHandBack): Promise<void> {
+  const restored = await (dependencies.cswapAgent ?? defaultCswapAgent(ctx)).restorePlist();
+  if (!restored.ok) throw new CswapUndoFinalizationError(final.state, restored.code);
+  // Only new rows have this fence. Legacy terminal rows had no note to clear.
+  if (final.restorePending) clearRestorePending(ctx);
+}
+
+async function finishHandBack(
+  ctx: CommandContext,
+  dependencies: UndoCswapCommandDependencies,
+  now: number,
+): Promise<TerminalHandBack> {
+  const moved = await (dependencies.moveQlbPlist ?? (() => defaultMoveQlbPlist(ctx)))();
+  if (!moved.ok) throw new CswapUndoFinalizationError(terminalHandBackPhase(ctx)?.state ?? 'undoing', moved.code);
+  const store = openStore(ctx.config.dbPath);
+  let final: TerminalHandBack;
+  try {
+    const current = phase(store);
+    const target = current.preFenceState === 'cutover' ? 'rolled-back'
+      : current.preFenceState === 'cutting-over' ? 'aborted' : null;
+    if (current.state !== 'undoing' || target === null) throw new CswapUndoFinalizationError(current.state);
+    // State and fence share one compare-and-set write, so a crash leaves a
+    // terminal row that only the restore-only resume path can finish.
+    const transitioned = transition(store, target, now, CSWAP_RESTORE_PENDING);
+    if (!transitioned.ok) throw new CswapUndoFinalizationError(phase(store).state);
+    final = { state: target, lifecycleId: transitioned.row!.id, restorePending: true, needsRestore: true };
+  } finally { store.close(); }
+  await restoreCswap(ctx, dependencies, final);
+  return { ...final, restorePending: false, needsRestore: false };
+}
+
+function legacyCswapRestoreNeeded(ctx: CommandContext): boolean {
+  const source = join(ctx.home, 'Library', 'LaunchAgents', 'com.cswap.auto.plist');
+  const backup = join(ctx.home, '.qlb', 'backups', 'cswap-plist', 'com.cswap.auto.plist');
+  return existsSync(backup) || !existsSync(source);
+}
+
+function terminalHandBackPhase(ctx: CommandContext): TerminalHandBack | null {
+  const store = openStore(ctx.config.dbPath);
+  try {
+    const current = phase(store);
+    if (current.state !== 'rolled-back' && current.state !== 'aborted') return null;
+    const restorePending = current.note === CSWAP_RESTORE_PENDING;
+    return {
+      state: current.state,
+      lifecycleId: current.id,
+      restorePending,
+      // Rows written before G18 had no durable note. Detect their unfinished
+      // C-swap hand-back from the plist locations before allowing resume to end.
+      needsRestore: restorePending || (current.note === null && legacyCswapRestoreNeeded(ctx)),
+    };
+  } finally { store.close(); }
+}
+
+function reportComplete(ctx: CommandContext, options: Options, result: HandBackPlan | null, skipped: number, state: 'rolled-back' | 'aborted', lifecycleId: number): void {
+  const nextStep = `qlb lifecycle close ${lifecycleId}`;
+  if (options.json) {
+    ctx.stdout(JSON.stringify(result === null
+      ? { resumed: true, state, nextStep }
+      : { ...result, skipped, resumed: options.resume, state, nextStep }));
+  } else {
+    ctx.stdout(`qlb undo cswap: restored; next: ${nextStep}`);
+  }
+}
+
+/** `qlb undo cswap [--dry-run | --resume]`: G16–G18 hand-back. */
 export async function runUndoCswapCommand(
   args: string[],
   ctx: CommandContext,
@@ -343,6 +493,14 @@ export async function runUndoCswapCommand(
       return 1;
     }
     const now = dependencies.now ?? Date.now;
+    // A failed C-swap restore happens after the durable terminal transition.
+    // Its one resume must not fence, drain, write slots, or move QLB again.
+    const terminal = options.resume ? terminalHandBackPhase(ctx) : null;
+    if (terminal) {
+      if (terminal.needsRestore) await restoreCswap(ctx, dependencies, terminal);
+      reportComplete(ctx, options, null, 0, terminal.state, terminal.lifecycleId);
+      return 0;
+    }
     const result = await executeHandBack({
       ...base,
       keychain: keychain as ExecuteHandBackDependencies['keychain'],
@@ -383,8 +541,8 @@ export async function runUndoCswapCommand(
       validateActiveSequence: dependencies.validateActiveSequence ?? defaultValidateActiveSequence(ctx.config.cswapSequencePath),
       setActiveAccountNumber: dependencies.setActiveAccountNumber ?? defaultSetActiveAccountNumber(ctx.config.cswapSequencePath),
     }, options.resume);
-    if (options.json) ctx.stdout(JSON.stringify({ ...result.plan, skipped: result.skipped, resumed: options.resume }));
-    else ctx.stdout(`qlb undo cswap: verified; skipped=${result.skipped}`);
+    const finished = await finishHandBack(ctx, dependencies, now());
+    reportComplete(ctx, options, result.plan, result.skipped, finished.state, finished.lifecycleId);
     return 0;
   } catch (error) {
     if (error instanceof CswapUndoRefusalError) return refusal(ctx, options, error);
@@ -406,6 +564,11 @@ export async function runUndoCswapCommand(
     }
     if (error instanceof CswapUndoActiveLoginError) {
       ctx.stderr(`qlb undo cswap: active account ${error.accountNumber}: ${error.reason}`);
+      return 1;
+    }
+    if (error instanceof CswapUndoFinalizationError) {
+      const detail = error.code ? `: ${error.code}` : '';
+      ctx.stderr(`qlb undo cswap: hand-back failed${detail}; state=${error.state}; run qlb undo cswap --resume`);
       return 1;
     }
     // Backend/process messages can contain credentials or command lines.

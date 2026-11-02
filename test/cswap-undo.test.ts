@@ -1,15 +1,15 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { describe, it } from 'node:test';
 
 import { isQlbProcessCommand, runUndoCswapCommand } from '../src/commands/undo-cswap';
 import { discoverCommands, resolveCommand, type CommandContext } from '../src/registry';
 import { openStore, openStoreConnection } from '../src/store';
 import { runExecutingCommand } from '../src/cli';
-import { beginCutover, phase, transition } from '../src/lifecycle';
+import { beginCutover, closeLifecycle, phase, transition } from '../src/lifecycle';
 import { recordStash } from '../src/unclaimed-index';
 import { productionTryAcquireLock } from '../src/cswap-agent';
 
@@ -127,9 +127,9 @@ function beginUndo(f: Fixture): void {
 
 type UndoFakes = Partial<NonNullable<Parameters<typeof runUndoCswapCommand>[2]>>;
 
-async function undo(f: Fixture, fakes: UndoFakes = {}, args: string[] = []): Promise<number> {
+async function undo(f: Fixture, fakes: UndoFakes = {}, args: string[] = [], ctx: CommandContext = context(f)): Promise<number> {
   let now = 0;
-  return runUndoCswapCommand(args, context(f), {
+  return runUndoCswapCommand(args, ctx, {
     keychain: f.keychain,
     bootoutQlbAgent: () => ({ ok: true }),
     listQlbPids: () => [],
@@ -142,6 +142,11 @@ async function undo(f: Fixture, fakes: UndoFakes = {}, args: string[] = []): Pro
     readActiveCredential: async () => ({ credential: await f.keychain.get('qlb:anthropic:account-a', 'qlb'), accountId: 'account-a' }),
     validateActiveSequence: async () => undefined,
     setActiveAccountNumber: async () => undefined,
+    // Most G17 cases isolate the ordered hand-back. Native-resync cases below
+    // explicitly opt back into the production resync path.
+    resyncActive: async () => undefined,
+    moveQlbPlist: () => ({ ok: true }),
+    cswapAgent: { restorePlist: () => ({ ok: true }) },
     ...fakes,
   });
 }
@@ -371,6 +376,7 @@ describe('qlb undo cswap hand-back', () => {
       let profiles = 0;
       assert.equal(await undo(f, {
         readActiveCredential: async () => ({ credential: rotated, accountId: 'account-a' }),
+        resyncActive: undefined,
         getProfile: async () => {
           profiles += 1;
           return { status: 200, body: JSON.stringify({ account: { uuid: 'account-a', email: 'a@example.test' } }) };
@@ -378,6 +384,65 @@ describe('qlb undo cswap hand-back', () => {
       }), 0);
       assert.equal(profiles, 1);
       assert.equal(await f.keychain.get('claude-swap', 'account-1-a@example.test'), rotated);
+    } finally { close(f); }
+  });
+
+  it('writes same-lineage live bytes to the active slot before exporting them', async () => {
+    const f = fixture();
+    try {
+      beginUndo(f);
+      addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-shared', active: true });
+      const live = credential('live-access', 'refresh-shared');
+      await f.keychain.set('qlb:anthropic:account-a', 'qlb', credential('slot-access', 'refresh-shared'));
+      writeFileSync(join(f.home, '.claude.json'), JSON.stringify({ oauthAccount: { accountUuid: 'account-a', emailAddress: 'a@example.test' } }));
+      await f.keychain.set('Claude Code-credentials', 'fixture-user', live);
+      assert.equal(await undo(f, {
+        readActiveCredential: async () => ({ credential: live, accountId: 'account-a' }),
+        resyncActive: undefined,
+      }), 0);
+      assert.equal(await f.keychain.get('qlb:anthropic:account-a', 'qlb'), live);
+      assert.equal(await f.keychain.get('claude-swap', 'account-1-a@example.test'), live);
+    } finally { close(f); }
+  });
+
+  it('allows a missing stored email or org when the locked account id matches', async () => {
+    const f = fixture();
+    try {
+      beginUndo(f);
+      addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-slot', active: true });
+      const live = credential('account-a', 'refresh-live');
+      writeFileSync(join(f.home, '.claude.json'), JSON.stringify({ oauthAccount: { accountUuid: 'account-a', emailAddress: 'live@example.test', organizationUuid: 'live-org' } }));
+      await f.keychain.set('Claude Code-credentials', 'fixture-user', live);
+      assert.equal(await undo(f, {
+        plan: async (deps) => {
+          const plan = await import('../src/cswap-undo').then(({ planHandBack }) => planHandBack(deps));
+          const db = openStoreConnection(f.dbPath);
+          try { db.prepare('UPDATE claude_slots SET email = NULL, org_uuid = NULL WHERE account_id = ?').run('account-a'); } finally { db.close(); }
+          return plan;
+        },
+        readActiveCredential: async () => ({ credential: live, accountId: 'account-a' }),
+        resyncActive: undefined,
+        getProfile: async () => ({ status: 200, body: JSON.stringify({ account: { uuid: 'account-a', organization_uuid: 'live-org' } }) }),
+      }), 0);
+      assert.equal(await f.keychain.get('claude-swap', 'account-1-a@example.test'), live);
+    } finally { close(f); }
+  });
+
+  it('fails closed when a known active identity value differs', async () => {
+    const f = fixture();
+    try {
+      beginUndo(f);
+      addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-slot', active: true });
+      const live = credential('account-a', 'refresh-live');
+      writeFileSync(join(f.home, '.claude.json'), JSON.stringify({ oauthAccount: { accountUuid: 'account-a', emailAddress: 'other@example.test' } }));
+      await f.keychain.set('Claude Code-credentials', 'fixture-user', live);
+      f.keychain.writes.length = 0;
+      assert.equal(await undo(f, {
+        readActiveCredential: async () => ({ credential: live, accountId: 'account-a' }),
+        resyncActive: undefined,
+      }), 1);
+      assert.match(f.output.at(-1)!, /active account 1: active-login-unattributed/);
+      assert.equal(f.keychain.writes.filter(({ service }) => service === 'claude-swap').length, 0);
     } finally { close(f); }
   });
 
@@ -392,6 +457,7 @@ describe('qlb undo cswap hand-back', () => {
       f.keychain.writes.length = 0;
       assert.equal(await undo(f, {
         readActiveCredential: async () => ({ credential: rotated, accountId: 'account-a' }),
+        resyncActive: undefined,
         getProfile: async () => { throw new Error('fixture oracle failure'); },
       }), 1);
       assert.match(f.output.at(-1)!, /active account 1: active-login-unattributed/);
@@ -538,7 +604,199 @@ describe('qlb undo cswap hand-back', () => {
       f.output.length = 0;
       assert.equal(await undo(f, {}, ['--resume', '--json']), 0);
       assert.equal(f.keychain.writes.length, 0);
-      assert.equal(JSON.parse(f.output[0]!).skipped, 1);
+      assert.deepEqual(JSON.parse(f.output[0]!), {
+        resumed: true,
+        state: 'rolled-back',
+        nextStep: 'qlb lifecycle close 1',
+      });
+    } finally { close(f); }
+  });
+
+  it('the production plist mover treats a missing QLB agent as nothing to move', async () => {
+    const f = fixture();
+    const savedTestMode = process.env.QLB_TEST_MODE;
+    delete process.env.QLB_TEST_MODE;
+    try {
+      const store = openStore(f.dbPath);
+      try { beginCutover(store, 1); } finally { store.close(); }
+      const source = join(f.home, 'Library', 'LaunchAgents', 'com.modus.qlb-auto.plist');
+      const target = join(f.home, '.qlb', 'backups', 'qlb-plist', 'com.modus.qlb-auto.plist');
+      assert.ok(source.startsWith(`${f.home}/`));
+      assert.ok(target.startsWith(`${f.home}/`));
+      const productionContext = { ...context(f), env: { QLB_HOME: f.home, HOME: f.home } };
+      let restored = 0;
+      assert.equal(await undo(f, {
+        moveQlbPlist: undefined,
+        cswapAgent: { restorePlist: () => { restored += 1; return { ok: true }; } },
+      }, [], productionContext), 0);
+      assert.equal(restored, 1);
+      const completed = openStore(f.dbPath);
+      try {
+        assert.equal(phase(completed).state, 'aborted');
+        assert.equal(phase(completed).note, null);
+      } finally { completed.close(); }
+    } finally {
+      if (savedTestMode === undefined) delete process.env.QLB_TEST_MODE;
+      else process.env.QLB_TEST_MODE = savedTestMode;
+      close(f);
+    }
+  });
+
+  it('the production plist mover accepts a plist already in its backup', async () => {
+    const f = fixture();
+    const savedTestMode = process.env.QLB_TEST_MODE;
+    delete process.env.QLB_TEST_MODE;
+    try {
+      beginUndo(f);
+      const source = join(f.home, 'Library', 'LaunchAgents', 'com.modus.qlb-auto.plist');
+      const target = join(f.home, '.qlb', 'backups', 'qlb-plist', 'com.modus.qlb-auto.plist');
+      assert.ok(source.startsWith(`${f.home}/`));
+      assert.ok(target.startsWith(`${f.home}/`));
+      mkdirSync(join(f.home, '.qlb', 'backups', 'qlb-plist'), { recursive: true });
+      writeFileSync(target, 'fixture plist');
+      const productionContext = { ...context(f), env: { QLB_HOME: f.home, HOME: f.home } };
+      assert.equal(await undo(f, { moveQlbPlist: undefined }, [], productionContext), 0);
+      assert.equal(readFileSync(target, 'utf8'), 'fixture plist');
+      const store = openStore(f.dbPath);
+      try { assert.equal(phase(store).state, 'rolled-back'); } finally { store.close(); }
+    } finally {
+      if (savedTestMode === undefined) delete process.env.QLB_TEST_MODE;
+      else process.env.QLB_TEST_MODE = savedTestMode;
+      close(f);
+    }
+  });
+
+  it('the production plist mover refuses both missing paths after a committed cutover', async () => {
+    const f = fixture();
+    const savedTestMode = process.env.QLB_TEST_MODE;
+    delete process.env.QLB_TEST_MODE;
+    try {
+      beginUndo(f);
+      const productionContext = { ...context(f), env: { QLB_HOME: f.home, HOME: f.home } };
+      assert.equal(await undo(f, { moveQlbPlist: undefined }, [], productionContext), 1);
+      assert.match(f.output.at(-1)!, /qlb-plist-missing; state=undoing/);
+      const store = openStore(f.dbPath);
+      try { assert.equal(phase(store).state, 'undoing'); } finally { store.close(); }
+    } finally {
+      if (savedTestMode === undefined) delete process.env.QLB_TEST_MODE;
+      else process.env.QLB_TEST_MODE = savedTestMode;
+      close(f);
+    }
+  });
+
+  it('undo ends rolled-back with the agent stopped and C-swap restored', async () => {
+    const f = fixture();
+    try {
+      beginUndo(f);
+      addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-current', active: true });
+      const calls: string[] = [];
+      assert.equal(await undo(f, {
+        bootoutQlbAgent: () => { calls.push('bootout-qlb'); return { ok: true }; },
+        moveQlbPlist: () => { calls.push('move-qlb-plist'); return { ok: true }; },
+        cswapAgent: { restorePlist: () => { calls.push('restore-cswap'); return { ok: true }; } },
+      }), 0);
+      assert.deepEqual(calls, ['bootout-qlb', 'move-qlb-plist', 'restore-cswap']);
+      const store = openStore(f.dbPath);
+      try { assert.equal(phase(store).state, 'rolled-back'); } finally { store.close(); }
+      assert.match(f.output.at(-1)!, /qlb lifecycle close \d+/);
+    } finally { close(f); }
+  });
+
+  it('a failed plist move reports the fenced state and resume hint', async () => {
+    const f = fixture();
+    try {
+      beginUndo(f);
+      assert.equal(await undo(f, { moveQlbPlist: () => ({ ok: false, code: 'fixture-move-failed' }) }), 1);
+      assert.match(f.output.at(-1)!, /state=undoing; run qlb undo cswap --resume/);
+      const store = openStore(f.dbPath);
+      try { assert.equal(phase(store).state, 'undoing'); } finally { store.close(); }
+    } finally { close(f); }
+  });
+
+  it('C-swap is restored only after verify succeeds', async () => {
+    const f = fixture();
+    try {
+      beginUndo(f);
+      addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-current', active: true });
+      const calls: string[] = [];
+      assert.equal(await undo(f, {
+        readBack: async (slot) => {
+          calls.push('verify');
+          return f.keychain.get('claude-swap', slot.item);
+        },
+        moveQlbPlist: () => { calls.push('move-qlb-plist'); return { ok: true }; },
+        cswapAgent: { restorePlist: () => { calls.push('restore-cswap'); return { ok: true }; } },
+      }), 0);
+      assert.deepEqual(calls, ['verify', 'move-qlb-plist', 'restore-cswap']);
+    } finally { close(f); }
+  });
+
+  it('resume restores a legacy terminal row with C-swap still in its backup before close', async () => {
+    const f = fixture();
+    try {
+      beginUndo(f);
+      const store = openStore(f.dbPath);
+      let lifecycleId = 0;
+      try {
+        assert.equal(transition(store, 'undoing', 20).ok, true);
+        assert.equal(transition(store, 'rolled-back', 30).ok, true);
+        lifecycleId = phase(store).id;
+      } finally { store.close(); }
+      const source = join(f.home, 'Library', 'LaunchAgents', 'com.cswap.auto.plist');
+      const backup = join(f.home, '.qlb', 'backups', 'cswap-plist', 'com.cswap.auto.plist');
+      assert.ok(source.startsWith(`${f.home}/`));
+      assert.ok(backup.startsWith(`${f.home}/`));
+      mkdirSync(dirname(source), { recursive: true });
+      mkdirSync(dirname(backup), { recursive: true });
+      writeFileSync(backup, 'fixture C-swap plist');
+      let restores = 0;
+      assert.equal(await undo(f, {
+        cswapAgent: { restorePlist: () => {
+          restores += 1;
+          renameSync(backup, source);
+          return { ok: true };
+        } },
+      }, ['--resume']), 0);
+      assert.equal(restores, 1);
+      assert.equal(existsSync(backup), false);
+      assert.equal(readFileSync(source, 'utf8'), 'fixture C-swap plist');
+      const completed = openStore(f.dbPath);
+      try {
+        assert.equal(closeLifecycle(completed, lifecycleId, 'fixture', 40).ok, true);
+      } finally { completed.close(); }
+    } finally { close(f); }
+  });
+
+  it('resume after a failed restore retries only the restore', async () => {
+    const f = fixture();
+    try {
+      beginUndo(f);
+      addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-current', active: true });
+      let bootouts = 0;
+      let moves = 0;
+      let restores = 0;
+      const fakes = {
+        bootoutQlbAgent: () => { bootouts += 1; return { ok: true }; },
+        moveQlbPlist: () => { moves += 1; return { ok: true }; },
+        cswapAgent: { restorePlist: () => ({ ok: ++restores > 1, code: 'fixture-restore-failed' }) },
+      };
+      assert.equal(await undo(f, fakes), 1);
+      const writesAfterFailure = f.keychain.writes.length;
+      const store = openStore(f.dbPath);
+      try {
+        assert.equal(phase(store).state, 'rolled-back');
+        assert.equal(phase(store).note, 'cswap-restore-pending');
+      } finally { store.close(); }
+      assert.match(f.output.at(-1)!, /state=rolled-back; run qlb undo cswap --resume/);
+      f.output.length = 0;
+      assert.equal(await undo(f, fakes, ['--resume']), 0);
+      assert.equal(bootouts, 1);
+      assert.equal(moves, 1);
+      assert.equal(restores, 2);
+      assert.equal(f.keychain.writes.length, writesAfterFailure);
+      const resumed = openStore(f.dbPath);
+      try { assert.equal(phase(resumed).note, null); } finally { resumed.close(); }
+      assert.match(f.output[0]!, /qlb lifecycle close \d+/);
     } finally { close(f); }
   });
 
@@ -691,20 +949,17 @@ describe('qlb undo cswap hand-back', () => {
     } finally { close(f); }
   });
 
-  it('a dead qlb-add slot does not refuse the plan, while a qlb-add slot with no email names its account number', async () => {
+  it('a dead qlb-add active slot refuses by name before the fence', async () => {
     const f = fixture();
     try {
+      beginUndo(f);
       addSlot(f, { accountId: 'dead-add', number: 1, email: 'dead@example.test', refresh: 'refresh-dead', source: 'qlb-add', active: true, dead: true });
-      addSlot(f, { accountId: 'healthy', number: 2, email: 'healthy@example.test', refresh: 'refresh-healthy' });
-      assert.equal(await dryRun(f), 0);
-      const db = openStoreConnection(f.dbPath);
-      try {
-        db.prepare(`INSERT INTO claude_slots (account_id, slot_num, email, config_json, fingerprint, added_at, source, dead)
-          VALUES ('missing-email', 3, NULL, '{}', ?, 1, 'qlb-add', 0)`).run(lineage('refresh-added'));
-      } finally { db.close(); }
-      f.output.length = 0;
-      assert.equal(await runUndoCswapCommand(['--dry-run'], context(f), { keychain: f.keychain, backupDir: f.backup }), 3);
-      assert.match(f.output[0]!, /3 \(no email\)/);
+      let bootouts = 0;
+      assert.equal(await undo(f, { bootoutQlbAgent: () => { bootouts += 1; return { ok: true }; } }), 3);
+      assert.match(f.output[0]!, /qlb-add slots 1 \(dead@example\.test\)/);
+      assert.equal(bootouts, 0);
+      const store = openStore(f.dbPath);
+      try { assert.equal(phase(store).state, 'cutover'); } finally { store.close(); }
     } finally { close(f); }
   });
 
