@@ -307,7 +307,7 @@ const FLOCK_HELPER = [
 ].join('\n');
 
 /** Keeps a real fcntl flock in a tiny helper process until its release seam. */
-function productionTryAcquireLock(path: string): Promise<CswapLockRelease | null> {
+export function productionTryAcquireLock(path: string): Promise<CswapLockRelease | null> {
   return new Promise((resolve, reject) => {
     const child = spawn('/usr/bin/python3', ['-c', FLOCK_HELPER, path], { stdio: ['pipe', 'pipe', 'ignore'] });
     let state: 'pending' | 'locked' | 'busy' = 'pending';

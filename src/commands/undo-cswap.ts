@@ -1,10 +1,13 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, readdirSync, rmSync } from 'node:fs';
+import { credentialFingerprint } from '../anthropic-oauth';
+import { existsSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
 import {
   CswapUndoDrainError,
+  CswapUndoPendingStashError,
   CswapUndoRefusalError,
+  CswapUndoSequenceError,
   CswapUndoVerificationError,
   executeHandBack,
   planHandBack,
@@ -14,11 +17,14 @@ import {
 } from '../cswap-undo';
 import { claudePaths } from '../cc-paths';
 import { ClaudeSlots, SqliteClaudeSlotRepository, type ClaudeSlotBackend } from '../cc-slots';
-import { withClaudeCredentialLocks, withClaudeSwitchLock } from '../cc-locks';
-import { liveIdentity } from '../cc-resync';
+import { CREDENTIALS_STALENESS_MS, withClaudeCredentialLocks, withClaudeSwitchLock } from '../cc-locks';
+import { liveIdentity, ProbeVerdictMemo, resyncUnderHeldLocks } from '../cc-resync';
+import { productionTryAcquireLock } from '../cswap-agent';
+import type { CredentialBackend } from '../credential-backends';
 import { qlbHomeDir } from '../home';
 import { withUndoCapability } from '../keychain-allowlist';
 import { listUnclaimedKeychainServices, macosKeychainAccountName, platformKeychain } from '../keychain';
+import { listStashes } from '../unclaimed-index';
 import { transition } from '../lifecycle';
 import { openStoreConnection, openStore } from '../store';
 import type { CommandContext, CommandDefinition } from '../registry';
@@ -42,6 +48,8 @@ export interface UndoCswapCommandDependencies {
   readActiveCredential?: ExecuteHandBackDependencies['readActiveCredential'];
   resyncActive?: ExecuteHandBackDependencies['resyncActive'];
   readBack?: ExecuteHandBackDependencies['readBack'];
+  validateActiveSequence?: ExecuteHandBackDependencies['validateActiveSequence'];
+  setActiveAccountNumber?: ExecuteHandBackDependencies['setActiveAccountNumber'];
 }
 
 type Options = { json: boolean; dryRun: boolean; resume: boolean };
@@ -94,39 +102,61 @@ function defaultBootout(): { ok: boolean; code?: string } {
     execFileSync('/bin/launchctl', ['bootout', `gui/${uid}/com.modus.qlb-auto`], { stdio: ['ignore', 'pipe', 'ignore'], timeout: 5_000 });
     return { ok: true };
   } catch (error) {
-    const code = error && typeof error === 'object' && 'code' in error && typeof (error as { code?: unknown }).code === 'string'
-      ? (error as { code: string }).code : 'launchctl-failed';
-    // bootout is idempotent: an already-unloaded auto agent is stopped.
-    if (code === 'ESRCH') return { ok: true };
+    const record = error as { code?: unknown; status?: unknown } | undefined;
+    const code = typeof record?.code === 'string' ? record.code : 'launchctl-failed';
+    // execFileSync reports launchctl's status separately from its OS error
+    // code. A missing job is therefore status 3, not code ESRCH.
+    if (code === 'ESRCH' || record?.status === 3) return { ok: true };
     return { ok: false, code };
   }
 }
 
 function defaultQlbPids(): number[] {
-  const output = String(execFileSync('/bin/ps', ['-axo', 'pid=,command='], {
+  const output = String(execFileSync('/bin/ps', ['-axo', 'pid=,ppid=,command='], {
     encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5_000,
   }));
-  const pids: number[] = [];
+  const rows = new Map<number, { parent: number; command: string }>();
   for (const line of output.split(/\r?\n/)) {
-    const match = /^\s*(\d+)\s+(.+)$/.exec(line);
-    if (!match) continue;
-    const pid = Number(match[1]);
-    // This command itself is necessarily a qlb process. Only another CLI/agent
-    // instance blocks hand-back; process command lines are never retained.
-    if (pid !== process.pid && /(?:^|[\\/\s])qlb(?:\s|$)|qlb-auto|dist[\\/]cli\.js\s+auto(?:\s|$)/.test(match[2])) pids.push(pid);
+    const match = /^\s*(\d+)\s+(\d+)\s+(.+)$/.exec(line);
+    if (match) rows.set(Number(match[1]), { parent: Number(match[2]), command: match[3] });
   }
-  return pids;
+  const ignored = new Set<number>();
+  for (let pid: number | undefined = process.pid; pid && !ignored.has(pid); pid = rows.get(pid)?.parent) ignored.add(pid);
+  // Match the actual executable/script position only. Arguments mentioning
+  // qlb (or this command's shell wrapper) do not represent a QLB process.
+  const isQlb = (command: string): boolean => /^(?:\S*\/)?qlb(?:\s|$)/.test(command)
+    || /^(?:\S*\/)?node(?:\s+--\S+)*\s+\S*\/dist\/cli\.js(?:\s|$)/.test(command);
+  return [...rows].filter(([pid, row]) => !ignored.has(pid) && isQlb(row.command)).map(([pid]) => pid).sort((a, b) => a - b);
 }
 
-function defaultHeldLocks(home: string): string[] {
+async function defaultHeldLocks(home: string, now: () => number): Promise<string[]> {
   const directory = join(home, '.qlb', 'locks');
   if (!existsSync(directory)) return [];
-  return readdirSync(directory)
-    .filter((name) => name === 'auto.lock' || /^consume-.*\.lock$/.test(name) || /^switch-.*\.lock$/.test(name))
-    .sort();
+  const held: string[] = [];
+  for (const name of readdirSync(directory).sort()) {
+    const path = join(directory, name);
+    if (name === 'auto.lock') {
+      // flock ownership, rather than the persistent lock-file's existence,
+      // determines whether the auto tick is still running.
+      const release = await productionTryAcquireLock(path);
+      if (release === null) held.push(name);
+      else await release();
+    } else if (/^(?:consume|switch)-.*\.lock$/.test(name)) {
+      try {
+        // proper-lockfile directories left by a dead owner are stale after
+        // the same lease used by the credential lock implementation.
+        if (now() - statSync(path).mtimeMs <= CREDENTIALS_STALENESS_MS) held.push(name);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
+    }
+  }
+  return held;
 }
 
-function defaultPendingStash(home: string): string | null {
+async function defaultPendingStash(home: string): Promise<string | null> {
+  const indexed = await listStashes(join(home, '.qlb', 'unclaimed'), 'anthropic');
+  if (indexed.length > 0) return indexed[0]!.stashId;
   const directory = join(home, '.qlb', 'unclaimed');
   try {
     const file = readdirSync(directory).sort().find((name) => name.endsWith('.json'));
@@ -134,7 +164,7 @@ function defaultPendingStash(home: string): string | null {
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
   }
-  const service = listUnclaimedKeychainServices().sort()[0];
+  const service = listUnclaimedKeychainServices().filter((name) => name.startsWith('qlb:anthropic:unclaimed:')).sort()[0];
   return service ?? null;
 }
 
@@ -159,16 +189,85 @@ function drainMessage(error: CswapUndoDrainError): string {
 async function defaultResyncActive(
   dbPath: string,
   home: string,
+  env: NodeJS.ProcessEnv,
   keychain: ExecuteHandBackDependencies['keychain'],
   accountId: string,
   credential: string,
 ): Promise<void> {
   const repository = SqliteClaudeSlotRepository.open(dbPath);
+  const store = openStore(dbPath);
   try {
     const slots = new ClaudeSlots({ backend: keychain as unknown as ClaudeSlotBackend, repository, stashDir: join(home, '.qlb', 'unclaimed') });
     const current = await slots.readSlot(accountId, { fresh: true });
-    if (current.credential !== credential) await slots.writeSlot(accountId, credential, { cause: 'resync', by: 'qlb-cli', evidence: 'lineage' });
-  } finally { repository.close(); }
+    const registered = slots.getSlot(accountId);
+    if (!registered) return;
+    const paths = claudePaths({ home, env });
+    await resyncUnderHeldLocks({
+      slots, store, live: { backend: keychain as unknown as CredentialBackend, paths, env }, env,
+      verdicts: new ProbeVerdictMemo(), now: Date.now,
+      readLiveIdentity: () => {
+        try { return liveIdentity(paths.globalConfigPath); } catch { return null; }
+      },
+      // The undo path must never make an attribution network request. Known
+      // lineage can still be repaired, while unknown credentials stay put.
+      getProfile: async () => { throw new Error('network unavailable during undo'); },
+      by: 'qlb-cli',
+    }, {
+      accountId, email: registered.email ?? '', orgUuid: registered.orgUuid ?? '',
+      creds: credential, slot: current,
+    });
+  } finally { store.close(); repository.close(); }
+}
+
+function defaultReadBack(backupDir: string, keychain: ExecuteHandBackDependencies['keychain']): ExecuteHandBackDependencies['readBack'] {
+  return async (slot) => {
+    const path = join(backupDir, 'credentials', `.creds-${slot.accountNumber}-${slot.email}.enc`);
+    if (existsSync(path)) {
+      try {
+        const value = Buffer.from(readFileSync(path, 'utf8').trim(), 'base64').toString('utf8');
+        if (credentialFingerprint(value)) return value;
+      } catch { /* corrupt .enc falls through to Keychain */ }
+    }
+    try { return await keychain.get('claude-swap', slot.item); } catch { return null; }
+  };
+}
+
+function defaultValidateActiveSequence(sequencePath: string): ExecuteHandBackDependencies['validateActiveSequence'] {
+  return async (accountNumber) => {
+    if (accountNumber === null) return;
+    if (!existsSync(sequencePath)) throw new CswapUndoSequenceError('missing');
+    try {
+      const parsed: unknown = JSON.parse(readFileSync(sequencePath, 'utf8'));
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('not an object');
+    } catch { throw new CswapUndoSequenceError('malformed'); }
+  };
+}
+
+function defaultSetActiveAccountNumber(sequencePath: string): ExecuteHandBackDependencies['setActiveAccountNumber'] {
+  return async (accountNumber) => {
+    if (accountNumber === null) return;
+    await defaultValidateActiveSequence(sequencePath)!(accountNumber);
+    let sequence: Record<string, unknown>;
+    try {
+      sequence = JSON.parse(readFileSync(sequencePath, 'utf8')) as Record<string, unknown>;
+    } catch { throw new CswapUndoSequenceError('malformed'); }
+    if (sequence.activeAccountNumber === accountNumber) return;
+    const release = await productionTryAcquireLock(join(dirname(sequencePath), '.lock'));
+    if (release === null) throw new Error('C-swap sequence lock is held');
+    try {
+      // Re-read beneath C-swap's own flock so no concurrent writer is lost.
+      let current: Record<string, unknown>;
+      try {
+        const parsed: unknown = JSON.parse(readFileSync(sequencePath, 'utf8'));
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('not an object');
+        current = parsed as Record<string, unknown>;
+      } catch { throw new CswapUndoSequenceError('malformed'); }
+      if (current.activeAccountNumber === accountNumber) return;
+      const temporary = `${sequencePath}.tmp.${process.pid}`;
+      writeFileSync(temporary, `${JSON.stringify({ ...current, activeAccountNumber: accountNumber })}\n`, { mode: 0o600 });
+      renameSync(temporary, sequencePath);
+    } finally { await release(); }
+  };
 }
 
 /** `qlb undo cswap [--dry-run | --resume]`: G16 plan and G17 hand-back. */
@@ -217,7 +316,7 @@ export async function runUndoCswapCommand(
       bootoutQlbAgent: dependencies.bootoutQlbAgent ?? defaultBootout,
       drainState: async () => ({
         pids: await (dependencies.listQlbPids ?? defaultQlbPids)(),
-        locks: await (dependencies.listHeldLocks ?? (() => defaultHeldLocks(home)))(),
+        locks: await (dependencies.listHeldLocks ?? (() => defaultHeldLocks(home, now)))(),
       }),
       now,
       sleep: dependencies.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms))),
@@ -236,11 +335,14 @@ export async function runUndoCswapCommand(
       resyncActive: dependencies.resyncActive ?? ((accountId, credential) => defaultResyncActive(
         ctx.config.dbPath,
         ctx.home,
+        ctx.env,
         keychain as ExecuteHandBackDependencies['keychain'],
         accountId,
         credential,
       )),
-      readBack: dependencies.readBack,
+      readBack: dependencies.readBack ?? defaultReadBack(dependencies.backupDir ?? dirname(ctx.config.cswapSequencePath), keychain as ExecuteHandBackDependencies['keychain']),
+      validateActiveSequence: dependencies.validateActiveSequence ?? defaultValidateActiveSequence(ctx.config.cswapSequencePath),
+      setActiveAccountNumber: dependencies.setActiveAccountNumber ?? defaultSetActiveAccountNumber(ctx.config.cswapSequencePath),
     }, options.resume);
     if (options.json) ctx.stdout(JSON.stringify({ ...result.plan, skipped: result.skipped, resumed: options.resume }));
     else ctx.stdout(`qlb undo cswap: verified; skipped=${result.skipped}`);
@@ -249,6 +351,14 @@ export async function runUndoCswapCommand(
     if (error instanceof CswapUndoRefusalError) return refusal(ctx, options, error);
     if (error instanceof CswapUndoDrainError) {
       ctx.stderr(`qlb undo cswap: refused: drain timeout (${drainMessage(error)})`);
+      return 3;
+    }
+    if (error instanceof CswapUndoPendingStashError) {
+      ctx.stderr(`qlb undo cswap: refused: pending Claude stash ${error.stash}`);
+      return 3;
+    }
+    if (error instanceof CswapUndoSequenceError) {
+      ctx.stderr(`qlb undo cswap: refused: C-swap sequence.json is ${error.reason}`);
       return 3;
     }
     if (error instanceof CswapUndoVerificationError) {

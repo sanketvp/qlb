@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
@@ -10,6 +10,8 @@ import { discoverCommands, resolveCommand, type CommandContext } from '../src/re
 import { openStore, openStoreConnection } from '../src/store';
 import { runExecutingCommand } from '../src/cli';
 import { beginCutover, phase, transition } from '../src/lifecycle';
+import { recordStash } from '../src/unclaimed-index';
+import { productionTryAcquireLock } from '../src/cswap-agent';
 
 function credential(account: string, refresh: string): string {
   return JSON.stringify({ claudeAiOauth: { accessToken: `access-${account}`, refreshToken: refresh, expiresAt: 1_800_000_000_000 } });
@@ -138,6 +140,8 @@ async function undo(f: Fixture, fakes: UndoFakes = {}, args: string[] = []): Pro
     deleteEnc: (path) => rmSync(path, { force: true }),
     withActiveLocks: async (fn) => fn(),
     readActiveCredential: async () => ({ credential: await f.keychain.get('qlb:anthropic:account-a', 'qlb'), accountId: 'account-a' }),
+    validateActiveSequence: async () => undefined,
+    setActiveAccountNumber: async () => undefined,
     ...fakes,
   });
 }
@@ -347,6 +351,20 @@ describe('qlb undo cswap hand-back', () => {
     } finally { close(f); }
   });
 
+  it('refuses structural blockers before fencing or booting out the agent', async () => {
+    const f = fixture();
+    try {
+      beginUndo(f);
+      addSlot(f, { accountId: 'added', number: 1, email: 'added@example.test', refresh: 'refresh-added', source: 'qlb-add', active: true });
+      let bootouts = 0;
+      assert.equal(await undo(f, { bootoutQlbAgent: () => { bootouts += 1; return { ok: true }; } }), 3);
+      assert.equal(bootouts, 0);
+      assert.equal(f.keychain.writes.length, 1, 'fixture setup only');
+      const store = openStore(f.dbPath);
+      try { assert.equal(phase(store).state, 'cutover'); } finally { store.close(); }
+    } finally { close(f); }
+  });
+
   it('a failed drain writes nothing, keeps undoing and leaves C-swap stopped', async () => {
     const f = fixture();
     try {
@@ -362,6 +380,30 @@ describe('qlb undo cswap hand-back', () => {
       assert.equal(f.keychain.writes.length, 0);
       const store = openStore(f.dbPath);
       try { assert.equal(phase(store).state, 'undoing'); } finally { store.close(); }
+    } finally { close(f); }
+  });
+
+  it('drains a real flock but ignores its released file and stale lock directory', async () => {
+    const f = fixture();
+    try {
+      beginUndo(f);
+      addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-current', active: true });
+      const locks = join(f.home, '.qlb', 'locks');
+      mkdirSync(locks, { recursive: true });
+      const auto = join(locks, 'auto.lock');
+      const release = await productionTryAcquireLock(auto);
+      assert.ok(release, 'test flock acquired');
+      const stale = join(locks, 'consume-anthropic-account-a.lock');
+      mkdirSync(stale);
+      utimesSync(stale, new Date(1), new Date(1));
+      let released = false;
+      assert.equal(await undo(f, {
+        listHeldLocks: undefined,
+        now: Date.now,
+        sleep: async () => { if (!released) { released = true; await release(); } },
+      }), 0);
+      assert.ok(existsSync(auto), 'flock file remains after release');
+      assert.ok(existsSync(stale), 'observation never deletes stale lock directories');
     } finally { close(f); }
   });
 
@@ -447,6 +489,89 @@ describe('qlb undo cswap hand-back', () => {
       assert.equal(await undo(f, {}, ['--resume', '--json']), 0);
       assert.equal(f.keychain.writes.length, 0);
       assert.equal(JSON.parse(f.output[0]!).skipped, 1);
+    } finally { close(f); }
+  });
+
+  it('a pending indexed stash exits 3 by name with the fence kept', async () => {
+    const f = fixture();
+    try {
+      beginUndo(f);
+      addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-current', active: true });
+      await recordStash(join(f.home, '.qlb', 'unclaimed'), {
+        provider: 'anthropic', accountId: 'account-a', stashId: 'pending-stash', consumedFp: 'sha256:pending', location: 'keychain', createdAt: 1, pending: 1,
+      });
+      f.keychain.writes.length = 0;
+      assert.equal(await undo(f, { pendingStash: undefined }), 3);
+      assert.match(f.output.at(-1)!, /pending-stash/);
+      assert.equal(f.keychain.writes.length, 0);
+      const store = openStore(f.dbPath);
+      try { assert.equal(phase(store).state, 'undoing'); } finally { store.close(); }
+    } finally { close(f); }
+  });
+
+  it('preserves a slot successor when live still has its spent ancestor', async () => {
+    const f = fixture();
+    try {
+      beginUndo(f);
+      addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-successor', active: true });
+      assert.equal(await undo(f, {
+        readActiveCredential: async () => ({ credential: credential('account-a', 'refresh-spent'), accountId: 'account-a' }),
+      }), 0);
+      assert.equal(await f.keychain.get('claude-swap', 'account-1-a@example.test'), credential('account-a', 'refresh-successor'));
+    } finally { close(f); }
+  });
+
+  it('replaces a malformed C-swap item and retains its readable bytes as prev', async () => {
+    const f = fixture();
+    try {
+      beginUndo(f);
+      addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-current', active: true });
+      f.keychain.set('claude-swap', 'account-1-a@example.test', 'malformed fixture');
+      assert.equal(await undo(f), 0);
+      assert.equal(await f.keychain.get('claude-swap', 'account-1-a@example.test'), credential('account-a', 'refresh-current'));
+      assert.equal(await f.keychain.get('claude-swap', 'account-1-a@example.test.prev'), 'malformed fixture');
+    } finally { close(f); }
+  });
+
+  it('updates sequence.json atomically after the active export and leaves it unchanged on resume', async () => {
+    const f = fixture();
+    try {
+      beginUndo(f);
+      addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-current', active: true });
+      const sequence = join(f.backup, 'sequence.json');
+      writeFileSync(sequence, JSON.stringify({ accounts: { 1: { email: 'a@example.test' } }, activeAccountNumber: 2, preserved: true }));
+      assert.equal(await undo(f, { validateActiveSequence: undefined, setActiveAccountNumber: undefined }), 0);
+      assert.deepEqual(JSON.parse(readFileSync(sequence, 'utf8')), { accounts: { 1: { email: 'a@example.test' } }, activeAccountNumber: 1, preserved: true });
+      const before = readFileSync(sequence, 'utf8');
+      f.output.length = 0;
+      assert.equal(await undo(f, { validateActiveSequence: undefined, setActiveAccountNumber: undefined }, ['--resume']), 0);
+      assert.equal(readFileSync(sequence, 'utf8'), before);
+    } finally { close(f); }
+  });
+
+  it('refuses a missing sequence.json before fencing or writes', async () => {
+    const f = fixture();
+    try {
+      beginUndo(f);
+      addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-current', active: true });
+      f.keychain.writes.length = 0;
+      assert.equal(await undo(f, { validateActiveSequence: undefined, setActiveAccountNumber: undefined }), 3);
+      assert.match(f.output.at(-1)!, /sequence\.json is missing/);
+      assert.equal(f.keychain.writes.length, 0);
+      const store = openStore(f.dbPath);
+      try { assert.equal(phase(store).state, 'cutover'); } finally { store.close(); }
+    } finally { close(f); }
+  });
+
+  it('the production reader rejects a valid stale .enc before its Keychain fallback', async () => {
+    const f = fixture();
+    try {
+      beginUndo(f);
+      addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-current', active: true });
+      writeFileSync(join(f.backup, 'credentials', '.creds-1-a@example.test.enc'), Buffer.from(credential('old', 'refresh-stale')).toString('base64'));
+      assert.equal(await undo(f, { deleteEnc: () => undefined }), 1);
+      const store = openStore(f.dbPath);
+      try { assert.equal(phase(store).state, 'undoing'); } finally { store.close(); }
     } finally { close(f); }
   });
 

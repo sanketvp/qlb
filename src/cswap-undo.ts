@@ -77,6 +77,20 @@ export class CswapUndoVerificationError extends Error {
   }
 }
 
+export class CswapUndoPendingStashError extends Error {
+  constructor(readonly stash: string) {
+    super('pending Claude stash');
+    this.name = 'CswapUndoPendingStashError';
+  }
+}
+
+export class CswapUndoSequenceError extends Error {
+  constructor(readonly reason: 'missing' | 'malformed') {
+    super(`C-swap sequence is ${reason}`);
+    this.name = 'CswapUndoSequenceError';
+  }
+}
+
 function requireSlotCoordinate(slot: HandBackSlot, requireEmail = true): { accountNumber: number; email: string } {
   if (!Number.isSafeInteger(slot.slotNum) || slot.slotNum == null || slot.slotNum < 1) {
     throw new Error('Claude hand-back slot coordinates are invalid');
@@ -145,7 +159,7 @@ async function sourceCredential(deps: PlanHandBackDependencies, accountId: strin
  * lineage comparison because `claude_slots.fingerprint` is metadata that can
  * lag an in-flight refresh successor.
  */
-export async function planHandBack(deps: PlanHandBackDependencies): Promise<HandBackPlan> {
+export function validateHandBackStructure(deps: Pick<PlanHandBackDependencies, 'slots' | 'activeAccountId' | 'migratedPiProviders'>): void {
   const allSlots = deps.slots();
   const qlbAdd = allSlots
     .filter((slot) => slot.source === 'qlb-add' && !slot.dead)
@@ -164,6 +178,16 @@ export async function planHandBack(deps: PlanHandBackDependencies): Promise<Hand
     throw new CswapUndoRefusalError('active-slot-missing');
   }
 
+  for (const slot of slots) requireSlotCoordinate(slot);
+  if (active) requireSlotCoordinate(active);
+}
+
+export async function planHandBack(deps: PlanHandBackDependencies): Promise<HandBackPlan> {
+  validateHandBackStructure(deps);
+  const allSlots = deps.slots();
+  const slots = allSlots.filter((slot) => slot.source !== 'qlb-add' && !slot.dead);
+  const activeAccountId = deps.activeAccountId();
+  const active = activeAccountId === null ? null : allSlots.find((slot) => slot.accountId === activeAccountId);
   const listCredentials = deps.listCredentials ?? readdirSync;
   const plans: HandBackSlotPlan[] = [];
   const deleteEnc: string[] = [];
@@ -173,9 +197,13 @@ export async function planHandBack(deps: PlanHandBackDependencies): Promise<Hand
     const currentCredential = await sourceCredential(deps, slot.accountId);
     const currentLineage = credentialLineage(currentCredential, accountNumber);
     const destination = await optionalCswapCredential(deps.keychain, item);
-    const action: HandBackAction = destination !== null && credentialLineage(destination, accountNumber) === currentLineage
-      ? 'noop'
-      : 'update';
+    // A corrupt fallback must not prevent recovery: the current credential
+    // replaces it and the readable bytes are retained as .prev by writeSlot.
+    let destinationLineage: string | null = null;
+    if (destination !== null) {
+      try { destinationLineage = credentialLineage(destination, accountNumber); } catch { /* replace malformed destination */ }
+    }
+    const action: HandBackAction = destinationLineage === currentLineage ? 'noop' : 'update';
     plans.push({
       accountId: slot.accountId,
       accountNumber,
@@ -218,6 +246,10 @@ export interface ExecuteHandBackDependencies extends PlanHandBackDependencies {
   resyncActive?: (accountId: string, credential: string) => Promise<void>;
   /** C-swap 0.26.0 precedence reader (valid .enc first, then Keychain). */
   readBack?: (slot: HandBackSlotPlan) => Promise<string | null>;
+  /** Refuses a missing or malformed C-swap sequence before any hand-back write. */
+  validateActiveSequence?: (accountNumber: number | null) => Promise<void>;
+  /** Validates and atomically advances C-swap's activeAccountNumber. */
+  setActiveAccountNumber?: (accountNumber: number | null) => Promise<void>;
 }
 
 export interface HandBackResult {
@@ -228,7 +260,11 @@ export interface HandBackResult {
 async function writeSlot(deps: ExecuteHandBackDependencies, slot: HandBackSlotPlan): Promise<boolean> {
   const current = await sourceCredential(deps, slot.accountId);
   const destination = await optionalCswapCredential(deps.keychain, slot.item);
-  if (destination !== null && credentialLineage(destination, slot.accountNumber) === credentialLineage(current, slot.accountNumber)) return false;
+  let sameLineage = false;
+  if (destination !== null) {
+    try { sameLineage = credentialLineage(destination, slot.accountNumber) === credentialLineage(current, slot.accountNumber); } catch { /* replace malformed destination */ }
+  }
+  if (sameLineage) return false;
   if (destination !== null) await deps.keychain.set('claude-swap', `${slot.item}.prev`, destination);
   await deps.keychain.set('claude-swap', slot.item, current);
   return true;
@@ -261,14 +297,26 @@ async function waitForDrain(deps: ExecuteHandBackDependencies): Promise<void> {
  * C-swap or complete the lifecycle transition; G18 owns those effects.
  */
 export async function executeHandBack(deps: ExecuteHandBackDependencies, resume = false): Promise<HandBackResult> {
+  // Structural refusals are evaluated before fencing so ordinary recovery work
+  // remains possible. The fresh plan below is still authoritative for writes.
+  if (!resume) {
+    validateHandBackStructure(deps);
+    const active = deps.activeAccountId();
+    if (active !== null) {
+      const slot = deps.slots().find((candidate) => candidate.accountId === active);
+      if (slot) await deps.validateActiveSequence?.(requireSlotCoordinate(slot).accountNumber);
+    }
+  }
   if (!resume && !await deps.transitionUndoing()) throw new Error('undo lifecycle fence refused');
   const stopped = await deps.bootoutQlbAgent();
   if (!stopped.ok) throw new Error(`QLB agent bootout failed${stopped.code ? `: ${stopped.code}` : ''}`);
   await waitForDrain(deps);
-  const stash = await deps.pendingStash();
-  if (stash !== null) throw new Error(`pending Claude stash: ${stash}`);
-
+  // Resume repeats these checks only after the agent is stopped and the drain
+  // has cleared; the plan always obtains fresh readonly state.
   const plan = await (deps.plan ?? (() => planHandBack(deps)))();
+  await deps.validateActiveSequence?.(plan.activeAccountNumber);
+  const stash = await deps.pendingStash();
+  if (stash !== null) throw new CswapUndoPendingStashError(stash);
   let skipped = 0;
   const encFor = (slot: HandBackSlotPlan): string[] => plan.deleteEnc.filter((path) =>
     basename(path).startsWith(`.creds-${slot.accountNumber}-`));
@@ -290,6 +338,7 @@ export async function executeHandBack(deps: ExecuteHandBackDependencies, resume 
       if (live) await deps.resyncActive?.(active.accountId, live.credential);
       if (!await writeSlot(deps, active)) skipped += 1;
       for (const path of encFor(active)) await deps.deleteEnc(path);
+      await deps.setActiveAccountNumber?.(plan.activeAccountNumber);
     }));
   }
   await verifyPlan(deps, plan);
