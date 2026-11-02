@@ -1142,6 +1142,12 @@ async function runStatus(opts: StatusOpts): Promise<void> {
   const enriched = enrichAccounts(accounts, {
     ownershipForProvider: makeOwnershipReader(store),
     overrideForAccount: (id) => overrideFromStore(store, id),
+    activeAccountForProvider: (provider) => {
+      const accountId = store.getActiveLogin(provider)?.accountId ?? null;
+      return provider === 'anthropic' && accountId !== null
+        ? store.getAnthropicSlotOrgUuid(accountId) ?? accountId
+        : accountId;
+    },
   });
   if (opts.json) {
     console.log(JSON.stringify({ fetchedAt: Date.now(), accounts: decorateStatusJson(enriched) }, null, 2));

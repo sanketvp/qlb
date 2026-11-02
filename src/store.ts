@@ -1600,6 +1600,14 @@ export class Store {
     return row ? { provider: row.provider, accountId: row.account_id, since: row.since, setBy: row.set_by } : null;
   }
 
+  /** Resolve the active Claude slot ID to C-swap cache's organization UUID. */
+  getAnthropicSlotOrgUuid(accountId: string): string | null {
+    const row = this.db.prepare('SELECT org_uuid FROM claude_slots WHERE account_id = ?').get(accountId) as
+      | { org_uuid: string | null }
+      | undefined;
+    return row?.org_uuid ?? null;
+  }
+
   /** Additive active-login upsert used by provider-specific adoption paths. */
   setActiveLogin(provider: string, accountId: string | null, setBy: string, since: number = Date.now()): void {
     this.db.prepare(`INSERT INTO active_login (provider, account_id, since, set_by) VALUES (?, ?, ?, ?)

@@ -33,6 +33,8 @@ export interface DashboardAccount extends AccountSnapshot {
 export interface DashboardLookups {
   ownershipForProvider: (provider: string) => string;
   overrideForAccount: (accountId: string) => AccountOverrideView | null;
+  /** The provider-owned login is authoritative over any legacy cache marker. */
+  activeAccountForProvider?: (provider: string) => string | null;
 }
 
 export function formatRelative(resetAt?: number, now: number = Date.now()): string {
@@ -449,8 +451,13 @@ export function enrichAccounts(
 ): DashboardAccount[] {
   return accounts.map((snap) => {
     const { health, healthGlyph } = accountHealth(snap);
+    const activeAccount = lookups.activeAccountForProvider?.(snap.provider);
+    const label = activeAccount === undefined
+      ? snap.label
+      : snap.label.startsWith('● ') ? snap.label.slice(2) : snap.label;
     return {
       ...snap,
+      label: activeAccount === undefined ? label : activeAccount === snap.accountId ? `● ${label}` : label,
       ownership: lookups.ownershipForProvider(snap.provider),
       override: lookups.overrideForAccount(snap.accountId),
       health,

@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { describe, it } from 'node:test';
+import { enrichAccounts, formatDashboard } from '../src/dashboard';
 import { openStore } from '../src/store';
 
 type ClaudeDecision = {
@@ -41,8 +42,8 @@ function db(store: ClaudeStore): DatabaseSync {
 }
 
 function insertSlots(store: ClaudeStore): void {
-  db(store).prepare(`INSERT INTO claude_slots (account_id, slot_num, config_json, added_at)
-    VALUES ('from', 1, '{}', 1), ('to', 2, '{}', 1)`).run();
+  db(store).prepare(`INSERT INTO claude_slots (account_id, slot_num, org_uuid, config_json, added_at)
+    VALUES ('from', 1, 'org-modustech', '{}', 1), ('to', 2, 'org-tiyopay', '{}', 1)`).run();
 }
 
 function input(overrides: Partial<ClaudeSwitchInput> = {}): ClaudeSwitchInput {
@@ -114,6 +115,38 @@ describe('Claude switch commit primitive', () => {
       store.setConfig('auto.anthropic.lastSwitchTo', 'stale');
       store.commitClaudeSwitch(input({ trigger: 'manual', setBy: 'manual' }));
       assert.equal(store.getConfig('auto.anthropic.lastSwitchTo'), null);
+    } finally {
+      store.close();
+    }
+  });
+
+  it('dashboard keeps B marked after a successful switch to B and a failed switch back', () => {
+    const store = openClaudeStore();
+    try {
+      insertSlots(store);
+      store.setActiveLogin('anthropic', 'from', 'manual', 10);
+      store.commitClaudeSwitch(input({ trigger: 'manual', setBy: 'manual' }));
+      store.recordSwitch({
+        ts: 1_100, provider: 'anthropic', fromAccount: 'to', toAccount: 'from', trigger: 'manual', outcome: 'failed', detail: 'fixture failure',
+      });
+
+      const dashboard = formatDashboard(enrichAccounts([
+        { accountId: 'org-modustech', provider: 'anthropic', label: '● modustech', buckets: {} },
+        { accountId: 'org-tiyopay', provider: 'anthropic', label: 'tiyopay', buckets: {} },
+      ], {
+        ownershipForProvider: () => 'QLB_OWNED',
+        overrideForAccount: () => null,
+        activeAccountForProvider: (provider) => {
+          const active = store.getActiveLogin(provider)?.accountId ?? null;
+          return active === null ? null : store.getAnthropicSlotOrgUuid(active) ?? active;
+        },
+      }));
+
+      assert.match(dashboard, /^✓  modustech  anthropic/m);
+      assert.match(dashboard, /^✓  ● tiyopay  anthropic/m);
+      assert.deepEqual(store.getActiveLogin('anthropic'), {
+        provider: 'anthropic', accountId: 'to', since: 1_000, setBy: 'manual',
+      });
     } finally {
       store.close();
     }
