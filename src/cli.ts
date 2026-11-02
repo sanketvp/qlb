@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { existsSync, mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, realpathSync, unlinkSync, writeFileSync } from 'node:fs';
 import * as net from 'node:net';
 import { dirname, join, resolve } from 'node:path';
 import { adapters } from './adapters';
@@ -34,7 +34,6 @@ import {
   defaultOwnerFileFor,
   defaultRehearseFn,
   isMigrateProvider,
-  isRealPiAgentPath,
   isSingleGrantProvider,
   isStaticKeyProvider,
   PI_POOL_STORE,
@@ -44,6 +43,15 @@ import {
 import { listPolicies, setPolicy } from './policy';
 import { LoopbackProxy } from './proxy';
 import { parseUntil } from './overrides';
+import {
+  MigratePathError,
+  assertSupportedPlatform,
+  isInsideProtectedRoot,
+  resolveMigratePath,
+  resolveProtectedRoot,
+  validateRawMigratePath,
+  type MigratePathKind,
+} from './migrate-paths';
 import { resolveFromSnapshots, providerForModel } from './resolve';
 import { isStrategy, STRATEGIES, type Strategy } from './scoring';
 import {
@@ -309,6 +317,24 @@ function isMigrateSub(s: string | undefined): s is MigrateSub {
   return !!s && (MIGRATE_SUBS as readonly string[]).includes(s);
 }
 
+function physicalCwd(): string {
+  return realpathSync.native(process.cwd());
+}
+
+function validateCliMigratePath(
+  raw: string | undefined,
+  flag: string,
+  kind: MigratePathKind,
+  cwd: string,
+): string {
+  if (raw === undefined) throw new MigratePathError(flag, 'path must be a string');
+  return validateRawMigratePath(raw, { flag, kind, cwd });
+}
+
+function targetChild(dir: string, name: string): string {
+  return dir === '/' ? `/${name}` : `${dir}/${name}`;
+}
+
 function parseMigrateArgs(args: string[]): MigrateOpts {
   const subRaw = args[0];
   if (subRaw === '-h' || subRaw === '--help' || subRaw === undefined) {
@@ -321,6 +347,7 @@ function parseMigrateArgs(args: string[]): MigrateOpts {
     process.exit(1);
   }
   const rest = args.slice(1);
+  const cwd = physicalCwd();
   let json = false;
   let poolFile: string | undefined;
   let ownerFile: string | undefined;
@@ -341,15 +368,15 @@ function parseMigrateArgs(args: string[]): MigrateOpts {
       continue;
     }
     if (arg === '--pool-file') {
-      poolFile = rest[++i];
+      poolFile = validateCliMigratePath(rest[++i], '--pool-file', 'file', cwd);
       continue;
     }
     if (arg === '--owner-file') {
-      ownerFile = rest[++i];
+      ownerFile = validateCliMigratePath(rest[++i], '--owner-file', 'file', cwd);
       continue;
     }
     if (arg === '--auth-json') {
-      authJson = rest[++i];
+      authJson = validateCliMigratePath(rest[++i], '--auth-json', 'file', cwd);
       continue;
     }
     if (arg === '--provider') {
@@ -357,7 +384,7 @@ function parseMigrateArgs(args: string[]): MigrateOpts {
       continue;
     }
     if (arg === '--target-dir') {
-      targetDir = rest[++i];
+      targetDir = validateCliMigratePath(rest[++i], '--target-dir', 'dir', cwd);
       continue;
     }
     if (arg === '--db') {
@@ -383,11 +410,17 @@ function parseMigrateArgs(args: string[]): MigrateOpts {
   }
   const provider: MigrateProvider = providerRawOrDefault;
 
-  if (targetDir) {
-    const dir = targetDir.replace(/[/\\]+$/, '');
-    if (!ownerFile) ownerFile = join(dir, 'qlb-owner.json');
-    if (!poolFile) poolFile = join(dir, 'anthropic-pool.json');
-    if (!authJson) authJson = join(dir, 'auth.json');
+  // config.ts normalizes environment values during module initialization. Check
+  // the raw override here so a hostile segment cannot be erased before migrate
+  // admission sees it.
+  if (process.env.QLB_PI_AUTH_JSON_PATH !== undefined) {
+    validateCliMigratePath(process.env.QLB_PI_AUTH_JSON_PATH, 'QLB_PI_AUTH_JSON_PATH', 'file', cwd);
+  }
+
+  if (targetDir !== undefined) {
+    if (!ownerFile) ownerFile = targetChild(targetDir, 'qlb-owner.json');
+    if (!poolFile) poolFile = targetChild(targetDir, 'anthropic-pool.json');
+    if (!authJson) authJson = targetChild(targetDir, 'auth.json');
   }
 
   return {
@@ -395,9 +428,9 @@ function parseMigrateArgs(args: string[]): MigrateOpts {
     sub: subRaw,
     json,
     provider,
-    poolFile: poolFile ?? DEFAULT_POOL_FILE,
-    ownerFile: ownerFile ?? defaultOwnerFileFor(provider),
-    authJson: authJson ?? DEFAULT_AUTH_JSON,
+    poolFile: validateCliMigratePath(poolFile ?? DEFAULT_POOL_FILE, '--pool-file', 'file', cwd),
+    ownerFile: validateCliMigratePath(ownerFile ?? defaultOwnerFileFor(provider), '--owner-file', 'file', cwd),
+    authJson: validateCliMigratePath(authJson ?? DEFAULT_AUTH_JSON, '--auth-json', 'file', cwd),
     db,
     confirmRealCutover,
   };
@@ -989,15 +1022,27 @@ export function parseArgs(argv: string[]): Opts {
 
 function assertSafeMigratePaths(opts: MigrateOpts): void {
   if (opts.sub === 'status') return;
-  const nativePath = isStaticKeyProvider(opts.provider)
-    ? opts.ownerFile
+  assertSupportedPlatform();
+  const cwd = physicalCwd();
+  const protectedRoot = resolveProtectedRoot(config.piAuthJsonPath, {
+    flag: 'QLB_PI_AUTH_JSON_PATH', cwd,
+  });
+  const pool = resolveMigratePath(opts.poolFile, {
+    flag: '--pool-file', kind: 'file', entryLeaf: true,
+  });
+  const owner = resolveMigratePath(opts.ownerFile, {
+    flag: '--owner-file', kind: 'file', entryLeaf: true,
+  });
+  const auth = resolveMigratePath(opts.authJson, { flag: '--auth-json', kind: 'file' });
+  const native = isStaticKeyProvider(opts.provider)
+    ? owner
     : opts.provider === 'anthropic'
-      ? opts.poolFile
-      : opts.authJson;
+      ? pool
+      : auth;
   const real =
-    isRealPiAgentPath(nativePath)
-    || isRealPiAgentPath(opts.ownerFile)
-    || (opts.provider === 'anthropic' && isRealPiAgentPath(opts.authJson));
+    isInsideProtectedRoot(native, protectedRoot)
+    || isInsideProtectedRoot(owner, protectedRoot)
+    || (opts.provider === 'anthropic' && isInsideProtectedRoot(auth, protectedRoot));
   if (real && !opts.confirmRealCutover) {
     console.error(
       'REFUSED: resolved native / owner path is inside ~/.pi/agent/.\n' +
@@ -1812,6 +1857,7 @@ export async function dispatchCommand(
 }
 
 export function exitCodeForError(err: unknown): number {
+  if (err instanceof MigratePathError) return 2;
   return typeof err === 'object' && err !== null && (err as { exitCode?: unknown }).exitCode === 3 ? 3 : 1;
 }
 
@@ -1915,7 +1961,17 @@ async function main(): Promise<void> {
     const context = createCommandContext();
     process.exit(await runExecutingCommand(command, context));
   }
-  const opts = parseArgs(prepareCommandArgv(process.argv, commands));
+  let opts: Opts;
+  try {
+    opts = parseArgs(prepareCommandArgv(process.argv, commands));
+  } catch (err) {
+    if (raw[0] === 'migrate') {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`qlb migrate ${raw[1] ?? ''}: ${msg}`);
+      process.exit(exitCodeForError(err));
+    }
+    throw err;
+  }
   if (opts.cmd === 'init') {
     const report = initializeQlb(config);
     printInit(report, opts.json);
