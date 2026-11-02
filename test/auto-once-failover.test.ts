@@ -1,14 +1,20 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
-import { AUTO_BINDINGS, runAuto } from '../src/auto';
+import { buildUsageRequest } from '../src/anthropic-oauth';
+import { AUTO_BINDINGS, autoReconcileStillTheSameProcess, productionRequest, runAuto } from '../src/auto';
 import { anthropicTick, type AnthropicTickResult } from '../src/auto/anthropic';
+import { claudePaths } from '../src/cc-paths';
+import { type ClaudeSwitchDeps } from '../src/cc-switch';
+import { createClaudeSwitchJournal, type ClaudeSwitchJournal } from '../src/cc-switch-journal';
 import { SqliteClaudeSlotRepository, type ClaudeSlot } from '../src/cc-slots';
 import { defaultConfig } from '../src/config';
+import { MockKeychain } from '../src/keychain';
+import { reconcileClaudeSwitch } from '../src/journal';
 import { openStore, openStoreConnection } from '../src/store';
 
 const decision = { kind: 'stay', reason: 'unknown', unhealthyTicks: 0 } as const;
@@ -27,6 +33,57 @@ function liveBinding(overrides: Partial<{
     tick: overrides.tick ?? (async () => ({ decision })),
     writes,
   };
+}
+
+function productionUsageResponse(retryAfter: string) {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response('fixture rate limited', {
+    status: 429, headers: { 'Retry-After': retryAfter },
+  });
+  return productionRequest(buildUsageRequest('fixture')).finally(() => { globalThis.fetch = originalFetch; });
+}
+
+async function reconcileFixture(owner: ClaudeSwitchJournal['owner'], sameProcess: ClaudeSwitchDeps['stillTheSameProcess']) {
+  const root = mkdtempSync(join(tmpdir(), 'qlb-auto-reconcile-'));
+  const home = join(root, 'home');
+  const env = { QLB_TEST_MODE: '1', QLB_HOME: join(root, 'qlb-home'), HOME: home };
+  const paths = claudePaths({ home, env });
+  mkdirSync(paths.configHome, { recursive: true });
+  const rows: Array<Record<string, unknown>> = [];
+  const journalDir = join(root, 'journal');
+  const deps: ClaudeSwitchDeps = {
+    store: {
+      findClaudeSwitchByAttempt: () => null,
+      recordSwitch: (row: Record<string, unknown>) => { rows.push(row); return rows.length; },
+    } as unknown as ClaudeSwitchDeps['store'],
+
+    slots: {} as ClaudeSwitchDeps['slots'],
+    live: { backend: new MockKeychain(), paths, account: 'fixture' },
+    readConfig: () => ({}), resolveProfile: async () => null,
+    consume: { postRefresh: async () => ({ status: 500, body: '' }) },
+    cswapProcesses: () => [], env, home, now: () => 1_000_000, by: 'qlb-auto', attempt: 'fixture',
+    journalDir, journalOwner: owner, stillTheSameProcess: sameProcess,
+  };
+  const journal: ClaudeSwitchJournal = {
+    v: 1, provider: 'anthropic', attemptId: 'orphaned-attempt', from: 'a', to: 'b', trigger: 'manual', by: 'qlb-auto', republish: false, injected: false, detail: null,
+    decision: { leftHeadroom: null, leftRecoveryAt: null, leftTrigger: null }, outgoingKind: null, bindingJson: null,
+    step: 6, stagedBlobService: 'qlb:anthropic:staged-rollback:orphaned', stagedAccount: 'qlb', stagedWritten: false,
+    keychainService: paths.keychainService, configPath: paths.globalConfigPath, configText: null, configWrittenHash: null,
+    fromOauthAccount: null, credentialsWrittenHash: null, credentialsWriteStarted: false, credentialsWritten: false,
+    configWriteStarted: false, configWritten: false, closed: null, startedAt: 1_000_000, owner,
+  };
+  createClaudeSwitchJournal(journal, { journalDir: deps.journalDir, home, env, configPath: paths.globalConfigPath, keychainService: paths.keychainService });
+  return { deps, journalPath: join(journalDir, 'switch-anthropic.json'), rows };
+}
+
+async function reconcileOnNextTick(deps: ClaudeSwitchDeps): Promise<void> {
+  await runAuto({ once: true }, {
+    makeLiveBinding: () => ({
+      store: { setConfig: () => {} }, close: () => {}, reconcile: () => reconcileClaudeSwitch(deps),
+      poll: async () => [], tick: async () => ({ decision }),
+    }),
+    assertAdmitted: () => ({ ok: true }), listCswapProcesses: () => [], log: () => {},
+  });
 }
 
 function signals() {
@@ -193,6 +250,49 @@ describe('auto once failover (G11)', () => {
       listCswapProcesses: () => [], log: () => {},
     });
     assert.deepEqual(okResult.executed, ['next']);
+  });
+
+  it('maps production Retry-After headers into the usage-poll backoff', async () => {
+    const store = openStore(':memory:');
+    try {
+      const delayed = await productionUsageResponse('3600');
+      store.recordUsagePollResult('anthropic', 'delayed', {
+        attemptedAt: 100, status: `http-${delayed.status}`, http429: true, retryAfterS: delayed.retryAfterS,
+      });
+      assert.equal(store.listUsagePolls('anthropic').delayed?.backoffUntil, 4_600);
+
+      const fallback = await productionUsageResponse('later');
+      store.recordUsagePollResult('anthropic', 'fallback', {
+        attemptedAt: 100, status: `http-${fallback.status}`, http429: true, retryAfterS: fallback.retryAfterS,
+      });
+      assert.equal(store.listUsagePolls('anthropic').fallback?.backoffUntil, 130);
+    } finally { store.close(); }
+  });
+
+  it('the auto reconcile process check recovers this process journal but leaves another live owner', async () => {
+    const ownLstart = 'Tue Oct 28 10:00:00 2026';
+    const checked: ClaudeSwitchJournal['owner'][] = [];
+    const fallback: NonNullable<ClaudeSwitchDeps['stillTheSameProcess']> = async (owner) => {
+      checked.push(owner);
+      return owner.pid === 4242;
+    };
+    const own = await reconcileFixture(
+      { pid: process.pid, lstart: ownLstart },
+      autoReconcileStillTheSameProcess(ownLstart, fallback),
+    );
+    await reconcileOnNextTick(own.deps);
+    assert.equal(existsSync(own.journalPath), false);
+    assert.deepEqual(own.rows.map((row) => row.detail), ['crash-reconcile']);
+    assert.deepEqual(checked, []);
+
+    const other = await reconcileFixture(
+      { pid: 4242, lstart: 'another live process' },
+      autoReconcileStillTheSameProcess(ownLstart, fallback),
+    );
+    await reconcileOnNextTick(other.deps);
+    assert.equal(existsSync(other.journalPath), true);
+    assert.deepEqual(other.rows, []);
+    assert.deepEqual(checked, [{ pid: 4242, lstart: 'another live process' }]);
   });
 
   it('xai and kimi bindings are never called', async () => {

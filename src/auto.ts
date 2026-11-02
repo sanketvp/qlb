@@ -92,13 +92,13 @@ function decisionText(result: AnthropicTickResult): string {
   }
 }
 
-function retryAfterSeconds(value: string | null): number | undefined {
+export function retryAfterSeconds(value: string | null): number | undefined {
   if (value === null || !/^\d+$/.test(value.trim())) return undefined;
   const seconds = Number(value);
   return Number.isSafeInteger(seconds) ? seconds : undefined;
 }
 
-function request(description: HttpRequestDescription): Promise<RefreshHttpResponse & { retryAfterS?: number }> {
+export function productionRequest(description: HttpRequestDescription): Promise<RefreshHttpResponse & { retryAfterS?: number }> {
   return fetch(description.url, {
     method: description.method,
     headers: description.headers,
@@ -108,6 +108,15 @@ function request(description: HttpRequestDescription): Promise<RefreshHttpRespon
     const retryAfterS = retryAfterSeconds(response.headers.get('Retry-After'));
     return { status: response.status, body: await response.text(), ...(retryAfterS === undefined ? {} : { retryAfterS }) };
   });
+}
+
+export function autoReconcileStillTheSameProcess(
+  ownLstart: string | null,
+  realStillTheSameProcess: NonNullable<import('./cc-switch').ClaudeSwitchDeps['stillTheSameProcess']>,
+): NonNullable<import('./cc-switch').ClaudeSwitchDeps['stillTheSameProcess']> {
+  return async (owner) => owner.pid === process.pid && ownLstart !== null && owner.lstart.replace(/\s+/g, ' ') === ownLstart
+    ? false
+    : realStillTheSameProcess(owner);
 }
 
 function productionLiveBinding(deps: Required<Pick<AutoDependencies, 'env' | 'home' | 'config' | 'now' | 'log'>>): LiveBinding {
@@ -124,12 +133,12 @@ function productionLiveBinding(deps: Required<Pick<AutoDependencies, 'env' | 'ho
     now: () => Math.floor(deps.now() / 1000),
     fetchActiveDeps: {
       live, env: deps.env, now: deps.now, verdicts, by: 'qlb-auto',
-      postRefresh: request,
+      postRefresh: productionRequest,
       warn,
     },
-    resyncDeps: { live, env: deps.env, now: deps.now, getProfile: request, by: 'qlb-auto', warn },
-    consumeDeps: { postRefresh: request, warn },
-    getUsage: async (accessToken) => request(buildUsageRequest(accessToken)),
+    resyncDeps: { live, env: deps.env, now: deps.now, getProfile: productionRequest, by: 'qlb-auto', warn },
+    consumeDeps: { postRefresh: productionRequest, warn },
+    getUsage: async (accessToken) => productionRequest(buildUsageRequest(accessToken)),
   });
   const tickDeps = (accounts: Awaited<ReturnType<typeof pollAnthropic>>): AnthropicTickDeps => ({
     store, slots, now: deps.now, accounts,
@@ -148,10 +157,7 @@ function productionLiveBinding(deps: Required<Pick<AutoDependencies, 'env' | 'ho
       }, store, warn, 'qlb-auto');
       const ownLstart = await processLstart(process.pid);
       const realStillTheSameProcess = resources.deps.stillTheSameProcess ?? stillTheSameProcess;
-      resources.deps.stillTheSameProcess = async (owner) =>
-        owner.pid === process.pid && ownLstart !== null && owner.lstart.replace(/\s+/g, ' ') === ownLstart
-          ? false
-          : realStillTheSameProcess(owner);
+      resources.deps.stillTheSameProcess = autoReconcileStillTheSameProcess(ownLstart, realStillTheSameProcess);
       try { await reconcileClaudeSwitch(resources.deps); } finally { resources.close?.(); }
     },
     poll: () => pollAnthropic(pollDeps()),
