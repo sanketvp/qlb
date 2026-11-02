@@ -322,14 +322,24 @@ export function launchctlCswapAgent(deps: LaunchctlCswapAgentDependencies): Cswa
           deps.fs.mkdir(join(deps.home(), 'Library', 'LaunchAgents'));
           deps.fs.rename(target, source);
         } else if (!deps.fs.exists(source)) {
-          return { ok: false, code: 'cswap-plist-unavailable' };
+          return { ok: false, code: 'cswap-plist-missing' };
         }
       } catch (error) {
         return { ok: false, code: commandErrorCode(error) };
       }
       const enable = operation(deps, ['enable', `${domain()}/${CSWAP_AGENT_LABEL}`], true);
       if (!enable.ok) return enable;
-      return operation(deps, ['bootstrap', domain(), source]);
+      // bootstrap reports an opaque EIO when an already-loaded job is supplied.
+      // Ask launchd directly instead of interpreting its error text.
+      if (inspectCswapAgent(deps) === 'loaded') return { ok: true };
+      try {
+        deps.exec('/bin/launchctl', ['bootstrap', domain(), source]);
+        return { ok: true };
+      } catch (error) {
+        return inspectCswapAgent(deps) === 'loaded'
+          ? { ok: true }
+          : { ok: false, code: commandErrorCode(error) };
+      }
     },
     drain: async () => cooperativeDrain({
       listProcesses: () => deps.listProcesses ? deps.listProcesses() : listCswapProcesses(),
