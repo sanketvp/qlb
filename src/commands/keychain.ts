@@ -221,6 +221,7 @@ export interface LiveSwitchReceipt {
 }
 
 type LaunchdRunner = (args: string[]) => string | void;
+type LaunchdPrintState = 'running' | 'not-loaded' | 'unknown';
 
 export interface LaunchdLiveSwitchDependencies {
   /** Injectable so runner tests never invoke the host launchctl. */
@@ -525,20 +526,30 @@ export function runLaunchdLiveSwitch(
   const uid = process.getuid?.();
   if (uid === undefined) throw new Error('could not determine the macOS user id');
   const launchd = dependencies.launchdRunner ?? ((args: string[]) => (
-    execFileSync('/bin/launchctl', args, { encoding: 'utf8', timeout: MACOS_SECURITY_TIMEOUT_MS }) as string
+    execFileSync('/bin/launchctl', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: MACOS_SECURITY_TIMEOUT_MS }) as string
   ));
   const domain = `gui/${uid}`;
+  const printState = (label: string): LaunchdPrintState => {
+    try {
+      const detail = launchd(['print', `${domain}/${label}`]);
+      // Only the explicit running state proves this is an unfinished agent. A
+      // non-running loaded job is not a positive "not loaded" result, so fail
+      // closed rather than deleting its directory.
+      return typeof detail === 'string' && /\bstate = running\b/.test(detail) ? 'running' : 'unknown';
+    } catch (err) {
+      // launchctl print uses exit 113 specifically for a missing service. Other
+      // failures (including timeouts) must fail closed and preserve the run dir.
+      return (err as { status?: unknown }).status === 113 ? 'not-loaded' : 'unknown';
+    }
+  };
   const root = join(qlbHomeDir(ctx.env), '.qlb', 'launchd-live');
   mkdirSync(root, { recursive: true, mode: 0o700 });
   for (const entry of readdirSync(root, { withFileTypes: true })) {
-    if (!entry.isDirectory() || !entry.name.startsWith('com.modus.qlb-livecheck.')) continue;
+    if (!entry.isDirectory() || !['com.modus.qlb-livecheck.', 'com.modus.qlb.live-switch.'].some((prefix) => entry.name.startsWith(prefix))) continue;
     const previous = join(root, entry.name);
-    try {
-      const detail = launchd(['print', `${domain}/${entry.name}`]);
-      // `print` can succeed for a loaded but exited one-shot job. Only a
-      // positively running agent is left in place; all other prior jobs sweep.
-      if (detail === undefined || /\bstate = running\b/.test(detail)) return { inProgress: entry.name };
-    } catch { /* not loaded */ }
+    const prior = printState(entry.name);
+    if (prior === 'running') return { inProgress: entry.name };
+    if (prior === 'unknown') throw new Error('could not determine prior live check status');
     try { launchd(['bootout', `${domain}/${entry.name}`]); } catch { /* already unloaded */ }
     rmSync(previous, { recursive: true, force: true });
   }
@@ -570,7 +581,7 @@ export function runLaunchdLiveSwitch(
   } finally {
     // On timeout the agent may still be running. Leave both it and its receipt for
     // the next invocation's sweep; never boot out a process that has not finished.
-    if (receiptArrived || !bootstrapped) {
+    if (receiptArrived || (!bootstrapped && printState(label) === 'not-loaded')) {
       try { launchd(['bootout', `${domain}/${label}`]); } catch { /* cleanup */ }
       rmSync(directory, { recursive: true, force: true });
     }
@@ -655,7 +666,10 @@ function runLiveLaunchdCheck(options: { json: boolean }, ctx: CommandContext, de
     if (result.outcome === 'rolled-back' && result.steps?.failedStep === 7
       && (result.error === 'keychain-write-failed' || result.error === 'keychain-timeout')
       && !(result.steps.restoreFailures?.length)) {
-      ctx.stdout('the helper could not write the live item under launchd (a Keychain prompt or denied access is the usual cause): run `qlb keychain authorize` in a GUI session, then retry');
+      const hint = 'the helper could not write the live item under launchd (a Keychain prompt or denied access is the usual cause): run `qlb keychain authorize` in a GUI session, then retry';
+      ctx.stdout(options.json
+        ? JSON.stringify({ command: 'check-launchd --live', liveItemsAuthorized: false, reason: 'launchd-write-not-authorized' })
+        : hint);
       return 1;
     }
     const reason = result.outcome === 'ok' && (result.from !== activeId || result.to !== activeId)
@@ -675,7 +689,7 @@ export async function runKeychainCommand(
   if (!options) return usage(ctx);
   // Tests may exercise the receipt handler only through its injected runner;
   // production launchctl/keychain access remains disabled in test mode.
-  if (ctx.env.QLB_TEST_MODE === '1' && !(options.subcommand === 'check-launchd' && options.live && dependencies.runLaunchdLiveSwitch)) {
+  if (ctx.env.QLB_TEST_MODE === '1' && !(options.subcommand === 'check-launchd' && options.live && (dependencies.runLaunchdLiveSwitch || dependencies.launchdRunner))) {
     ctx.stderr('qlb keychain: native helper commands are disabled in test mode');
     return 2;
   }
