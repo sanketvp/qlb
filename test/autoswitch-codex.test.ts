@@ -241,6 +241,41 @@ describe('C8 Codex poll and refresh', () => {
     assert.equal(h.records.at(-1)?.result.readings, undefined);
   });
 
+  it('keeps a held renewer lease across scheduler ticks until it expires', async () => {
+    let probes = 0;
+    let refreshes = 0;
+    const h = autoHarness({
+      probeUsage: async () => {
+        probes += 1;
+        return probes === 1
+          ? { status: 401, source: 'unknown', keys: [] }
+          : { status: 200, source: 'wham', keys: [] };
+      },
+      refreshActive: async () => {
+        refreshes += 1;
+        return { status: 'held', pids: [42], document: document(NOW + 3 * 60 * 60_000), action: 'noop' };
+      },
+    });
+    h.setLiveDocument(document(NOW + 3 * 60 * 60_000));
+    h.polls['user-a:account-a'] = { pollIntervalS: 600 };
+
+    await codexAutoTick(h.deps);
+    for (let minute = 1; minute < 10; minute += 1) {
+      h.setNow(NOW + minute * 60_000);
+      await codexAutoTick(h.deps);
+    }
+
+    assert.equal(h.polls['user-a:account-a']?.heldUntil, NOW / 1_000 + 600);
+    assert.equal(probes, 1);
+    assert.equal(refreshes, 1);
+
+    h.setNow(NOW + 10 * 60_000);
+    await codexAutoTick(h.deps);
+
+    assert.equal(probes, 2);
+    assert.equal(refreshes, 1);
+  });
+
   it('reconciles recovery and runs due watches on every tick', async () => {
     const calls: string[] = [];
     const h = autoHarness({
@@ -393,6 +428,26 @@ describe('C8 Codex poll and refresh', () => {
     assert.equal(h.configs['auto.openai-codex.idleHoldSince'], undefined);
   });
 
+  it('accepts a legacy numeric idle hold and treats garbage as absent', async () => {
+    const since = NOW - 60_000;
+    const legacy = autoHarness({ activeRenewers: async () => [{ pid: 1 }] });
+    legacy.configs['auto.openai-codex.idleHoldSince'] = String(since);
+    legacy.setLiveDocument(document(NOW - 1));
+
+    const legacyResult = await codexAutoTick(legacy.deps);
+
+    assert.equal(legacyResult.idleHoldSinceMs, since);
+    assert.deepEqual(JSON.parse(legacy.configs['auto.openai-codex.idleHoldSince'] ?? '{}'), { accountId: 'user-a:account-a', sinceMs: since });
+
+    const garbage = autoHarness({ activeRenewers: async () => [{ pid: 1 }] });
+    garbage.configs['auto.openai-codex.idleHoldSince'] = 'not-json';
+    garbage.setLiveDocument(document(NOW - 1));
+
+    const garbageResult = await codexAutoTick(garbage.deps);
+
+    assert.equal(garbageResult.idleHoldSinceMs, NOW);
+  });
+
   it('retains the idle hold start across ticks until the engine cap expires', async () => {
     const h = autoHarness({ activeRenewers: async () => [{ pid: 1 }] });
     h.setLiveDocument(document(NOW - 1));
@@ -459,6 +514,30 @@ describe('C8 Codex poll and refresh', () => {
     assert.equal(result.activeCredentialExpired, true);
     assert.equal(result.idleHoldSinceMs, NOW);
     assert.deepEqual(JSON.parse(h.configs['auto.openai-codex.idleHoldSince'] ?? '{}'), { accountId: 'user-a:account-b', sinceMs: NOW });
+  });
+
+  it('does not count codex-won as a failed usage poll', () => {
+    const store = openStore(':memory:');
+    try {
+      store.recordUsagePollResult('openai-codex', 'user-a:account-a', {
+        attemptedAt: 10, status: 'ok', readings: {
+          primary: { usedPct: 20, fetchedAt: 10_000, source: 'poll', confidence: 'authoritative' },
+        },
+      });
+      store.recordUsagePollResult('openai-codex', 'user-a:account-a', { attemptedAt: 20, status: 'usage-unknown' });
+      const before = store.listUsagePolls('openai-codex')['user-a:account-a'];
+
+      store.recordUsagePollResult('openai-codex', 'user-a:account-a', { attemptedAt: 30, status: 'codex-won' });
+      const after = store.listUsagePolls('openai-codex')['user-a:account-a'];
+
+      assert.equal(after?.consecutiveFailures, before?.consecutiveFailures);
+      assert.equal(after?.backoffUntil, before?.backoffUntil);
+      assert.deepEqual(store.getAllSnapshots('user-a:account-a'), {
+        primary: { usedPct: 20, fetchedAt: 10_000, source: 'poll', confidence: 'authoritative' },
+      });
+    } finally {
+      store.close();
+    }
   });
 
   it('updates only held_until when storing a Codex renewer hold', () => {
