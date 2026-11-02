@@ -164,15 +164,22 @@ export function assertAdmitted(store: Store, operation: LifecycleOperation): Lif
 }
 
 const TRANSITIONS: Partial<Record<LifecycleState, LifecycleState[]>> = {
-  'cutting-over': ['cutover', 'aborted'],
+  'cutting-over': ['cutover', 'undoing', 'aborted'],
   cutover: ['undoing', 'retired'],
-  undoing: ['rolled-back'],
+  undoing: ['rolled-back', 'aborted'],
 };
 
 /** Durable state transition primitive for K12/X4a; each edge is §4.15-only. */
 export function transition(store: Store, to: LifecycleState, now: number = Date.now()): LifecycleResult {
   const current = phase(store);
   if (!TRANSITIONS[current.state]?.includes(to)) {
+    return { ok: false, code: `transition=${current.state}->${to}`, row: current };
+  }
+  if (
+    current.state === 'undoing'
+    && ((to === 'aborted' && current.preFenceState !== 'cutting-over')
+      || (to === 'rolled-back' && current.preFenceState !== 'cutover'))
+  ) {
     return { ok: false, code: `transition=${current.state}->${to}`, row: current };
   }
   const fields: string[] = ['state = ?'];
