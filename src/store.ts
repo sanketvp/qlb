@@ -14,6 +14,7 @@ import { config } from './config';
 import { redactJson, redactKeyValueText, redactSecrets } from './redact';
 import type { BucketReading, Confidence } from './types';
 import { parseCodexRecoveryFence, type CodexRecoveryFence } from './codex-sessions';
+import type { CodexWatch } from './codex-switch';
 
 export const DEFAULT_DB_PATH = config.dbPath;
 
@@ -2185,7 +2186,7 @@ export class Store {
   recordCodexObservation(input: {
     identity: string | null;
     lineageFp: string | null;
-    by: 'qlb-switch' | 'qlb-watch' | 'qlb-reconcile';
+    by: 'qlb-switch' | 'qlb-watch' | 'qlb-reconcile' | 'qlb-active' | 'qlb-gate' | 'qlb-verify-l13';
     now: number;
   }): { appended: boolean; wipedEvent: boolean } {
     return this.runImmediate(() => this.recordCodexObservationInTransaction(input));
@@ -2195,7 +2196,7 @@ export class Store {
   private recordCodexObservationInTransaction(input: {
     identity: string | null;
     lineageFp: string | null;
-    by: 'qlb-switch' | 'qlb-watch' | 'qlb-reconcile';
+    by: 'qlb-switch' | 'qlb-watch' | 'qlb-reconcile' | 'qlb-active' | 'qlb-gate' | 'qlb-verify-l13';
     now: number;
   }): { appended: boolean; wipedEvent: boolean } {
     this.setConfig('codex.lastObservedAt', String(input.now));
@@ -2663,6 +2664,31 @@ export class Store {
       }
       return { switchId: typed.switch_id, outgoing: typed.outgoing, target: typed.target, nextAt: typed.next_at, until: typed.until,
         trigger: typed.trigger, attempt: typed.attempt, publishedAt: typed.published_at, openSessions };
+    });
+  }
+
+  /** Every pending watch with its committed-switch provenance, for the foreground C9 watcher. */
+  listCodexWatches(): CodexWatch[] {
+    return this.db.prepare(`SELECT w.switch_id, w.outgoing, w.target, w.until,
+      s.trigger, s.steps_json, s.published_at, s.open_sessions_json
+      FROM codex_watch w JOIN switch_log s ON s.id = w.switch_id
+      ORDER BY w.switch_id`).all().map((row) => {
+      const typed = row as {
+        switch_id: number; outgoing: string; target: string; until: number;
+        trigger: string; steps_json: string; published_at: number; open_sessions_json: string;
+      };
+      const attempt = (JSON.parse(typed.steps_json) as { attempt: string }).attempt;
+      const openSessions = JSON.parse(typed.open_sessions_json) as CodexWatch['openSessions'];
+      return {
+        switchId: typed.switch_id,
+        outgoing: typed.outgoing,
+        target: typed.target,
+        until: typed.until,
+        trigger: typed.trigger,
+        publishedAt: typed.published_at,
+        attempt,
+        openSessions,
+      };
     });
   }
 
