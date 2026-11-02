@@ -14,6 +14,7 @@ import { assertAdmitted, beginCutover, transition } from '../src/lifecycle';
 import type { CommandContext } from '../src/registry';
 import { openStore, openStoreConnection } from '../src/store';
 import { switchClaude, type ClaudeSwitchDeps, type SwitchClaudeInput } from '../src/cc-switch';
+import { claudeSwitchJournalDir } from '../src/cc-switch-journal';
 
 const NOW = 1_000_000;
 const credential = (tag: string, expiresAt = NOW + 3_600_000) => JSON.stringify({ claudeAiOauth: { accessToken: `fixture-access-${tag}`, refreshToken: `fixture-refresh-${tag}`, expiresAt } });
@@ -73,6 +74,12 @@ function backendWithHooks(subject: Subject, hooks: {
   };
 }
 
+// The same directory switchClaude writes its journal and lock into (journalOptions in src/cc-switch.ts).
+function journalEntries(subject: Subject): string[] {
+  const dir = claudeSwitchJournalDir({ journalDir: subject.deps.journalDir, home: subject.deps.home, env: subject.deps.env });
+  return existsSync(dir) ? readdirSync(dir).sort() : [];
+}
+
 async function stableState(subject: Subject): Promise<object> {
   const db = openStoreConnection(join(subject.root, 'qlb.sqlite'), true);
   try {
@@ -85,7 +92,7 @@ async function stableState(subject: Subject): Promise<object> {
       configText: readFileSync(subject.paths.globalConfigPath, 'utf8'),
       services: subject.backend.listServices().sort(),
       stash: existsSync(join(subject.root, 'unclaimed')) ? readdirSync(join(subject.root, 'unclaimed')).sort() : [],
-      journal: existsSync(join(subject.root, 'journal', 'switch-anthropic.json')),
+      journal: journalEntries(subject),
     };
   } finally { db.close(); }
 }
@@ -244,8 +251,14 @@ describe('Claude self-republish (K5b-1)', () => {
     try {
       const own = (await subject.slots.readSlot('a', { fresh: true })).credential;
       await subject.backend.set(subject.paths.keychainService, 'fixture-user', own);
-      assert.equal((await switchClaude(subject.deps, republish)).outcome, 'ok');
+      assert.deepEqual(journalEntries(subject), []);
+      // While a real republish writes the credential, its journal sits in the directory the
+      // zero-write refusal tests watch, so their 'no journal' check can fail.
+      const seenAtWrite: string[][] = [];
+      const deps = { ...subject.deps, live: { ...subject.deps.live, backend: backendWithHooks(subject, { set: () => { seenAtWrite.push(journalEntries(subject)); } }) } };
+      assert.equal((await switchClaude(deps, republish)).outcome, 'ok');
       assert.equal(await subject.backend.get(subject.paths.keychainService, 'fixture-user'), own);
+      assert.ok(seenAtWrite.length > 0 && seenAtWrite.every((entries) => entries.includes('switch-anthropic.json')));
     } finally { await close(subject); }
   });
 
