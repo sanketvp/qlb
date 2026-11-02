@@ -1,6 +1,6 @@
 import { mkdirSync, readFileSync, statSync, unlinkSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { accessExpiry, codexFingerprint, codexIdentity, writeCodexAuthAtomic, type CodexAuthDocument, type CodexAuthStableWithStatResult, type CodexIdentity } from './codex-auth';
+import { accessExpiry, codexAuthFileSha256, codexAuthFileText, codexFingerprint, codexIdentity, writeCodexAuthAtomic, type CodexAuthDocument, type CodexAuthStableWithStatResult, type CodexIdentity } from './codex-auth';
 import { attributeLiveDocument, type AttributeLiveDocumentInput, type CodexAttributionResult, type CodexAttributionStore } from './codex-attribution';
 import { ClaudeCodeLockTimeout, CodexAuthLockCompromised, ProperLockfileCompromised, withCodexAuthLock, type CodexAuthLockOptions, type HeldProperLockfile, withProperLockfile } from './cc-locks';
 import { consumeCodexSlot, hasCodexSlotIdentity, withCodexConsumeThenSwitchLocks, withCodexSwitchLock, type CodexConsumeOptions, type CodexConsumeResult } from './codex-consume';
@@ -340,7 +340,7 @@ export async function observeLiveCodex(
       const postPublish = await deps.readLive();
       const outgoing = {
         document: republished.document,
-        sha256: postPublish.status === 'ok' ? postPublish.sha256 : codexFingerprint(republished.document),
+        sha256: postPublish.status === 'ok' ? postPublish.sha256 : codexAuthFileSha256(codexAuthFileText(republished.document)),
         inode: postPublish.status === 'ok' ? postPublish.inode : republished.result.inode,
       };
       if (attribution.action === 'republish-slot') {

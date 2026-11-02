@@ -946,7 +946,7 @@ describe('Codex locked observe step — C6-16', () => {
         calls += 1;
         if (calls === 2) writeFileSync(h.authPath, JSON.stringify(codexWrite));
         return readCodexAuthStableWithStat(h.authPath, { delayMs: 0 });
-      } }), CodexLiveChanged);
+      } }, () => undefined, { onRepublish: 'settle' }), CodexLiveChanged);
       assert.equal(codexFingerprint(JSON.parse(readFileSync(h.authPath, 'utf8')) as CodexAuthDocument), codexFingerprint(codexWrite));
     } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
   });
@@ -1230,6 +1230,28 @@ describe('Codex locked observe step — C6-16', () => {
     } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
   });
 
+  it('onRepublish=settle uses the published file-byte hash when its post-publish read is not ok', async () => {
+    const h = observeHarness();
+    const a1 = observedDocument('a', 'a1');
+    try {
+      importActiveCodexSlot(a1, { store: h.store, keychain: h.keychain, now: () => 2 });
+      let reads = 0;
+      const result = await h.run({ readLive: async () => {
+        reads += 1;
+        if (reads === 3) return { status: 'unstable' };
+        return readCodexAuthStableWithStat(h.authPath, { delayMs: 0 });
+      } }, () => undefined, { onRepublish: 'settle' });
+      assert.equal(result.outcome, 'settled');
+      assert.equal(result.outcome === 'settled' && result.action, 'republish-slot');
+      if (result.outcome !== 'settled' || result.action !== 'republish-slot') assert.fail('expected republish');
+      const published = await readCodexAuthStableWithStat(h.authPath, { delayMs: 0 });
+      assert.equal(published.status, 'ok');
+      if (published.status !== 'ok') assert.fail('expected stable published file');
+      assert.equal(result.postPublish.status, 'unstable');
+      assert.equal(result.outgoing.sha256, published.sha256);
+    } finally { h.store.close(); rmSync(h.root, { recursive: true, force: true }); }
+  });
+
   it('onRepublish=settle returns a drifted republish with its post-publish read instead of throwing', async () => {
     const h = observeHarness();
     const b0 = observedDocument('b', 'b0');
@@ -1272,29 +1294,74 @@ describe('Codex locked observe step — C6-16', () => {
   });
 
   it('settled outgoing and postPublish documents never reach a thrown error\'s message or a log line', async () => {
-    const h = observeHarness();
-    const changed = observedDocument('a', 'external');
-    const output: string[] = [];
+    const republish = observeHarness();
+    const drift = observeHarness();
+    const failing = observeHarness();
+    const output = { log: [] as string[], error: [] as string[], stdout: [] as string[], stderr: [] as string[] };
+    const originalLog = console.log;
     const originalError = console.error;
+    const originalStdoutWrite = process.stdout.write;
+    const originalStderrWrite = process.stderr.write;
+    const a1 = observedDocument('a', 'a1');
+    const b0 = observedDocument('b', 'b0');
+    const b1 = observedDocument('b', 'b1');
+    const failedPublish = observedDocument('a', 'failed-publish');
     try {
-      importActiveCodexSlot(observedDocument('a', 'a1'), { store: h.store, keychain: h.keychain, now: () => 2 });
+      console.log = (...values: unknown[]) => { output.log.push(values.map(String).join(' ')); };
+      console.error = (...values: unknown[]) => { output.error.push(values.map(String).join(' ')); };
+      process.stdout.write = ((chunk: string | Uint8Array) => { output.stdout.push(String(chunk)); return true; }) as typeof process.stdout.write;
+      process.stderr.write = ((chunk: string | Uint8Array) => { output.stderr.push(String(chunk)); return true; }) as typeof process.stderr.write;
+
+      importActiveCodexSlot(a1, { store: republish.store, keychain: republish.keychain, now: () => 2 });
+      const republished = await republish.run({}, () => undefined, { onRepublish: 'settle' });
+      assert.equal(republished.outcome, 'settled');
+      assert.equal(republished.outcome === 'settled' && republished.action, 'republish-slot');
+      assert.equal(republished.outcome === 'settled' && republished.action === 'republish-slot' && republished.postPublish.status, 'ok');
+
+      const b = importActiveCodexSlot(b0, { store: drift.store, keychain: drift.keychain, now: () => 2 });
+      importActiveCodexSlot(b1, { store: drift.store, keychain: drift.keychain, now: () => 3 });
+      drift.store.setActiveLogin('openai-codex', drift.plan.slotId, 'import');
+      writeFileSync(drift.authPath, JSON.stringify(b0));
+      const drifted = await drift.run({}, () => undefined, { onRepublish: 'settle' });
+      assert.equal(drifted.outcome, 'settled');
+      assert.equal(drifted.outcome === 'settled' && drifted.action, 'drift');
+      assert.equal(drifted.outcome === 'settled' && drifted.action === 'drift' && drifted.accountId, b.slotId);
+      assert.equal(drifted.outcome === 'settled' && drifted.action === 'drift' && drifted.postPublish?.status, 'ok');
+
+      importActiveCodexSlot(failedPublish, { store: failing.store, keychain: failing.keychain, now: () => 2 });
       let reads = 0;
-      console.error = (...values: unknown[]) => { output.push(values.map(String).join(' ')); };
-      await assert.rejects(h.run({ readLive: async () => {
-        reads += 1;
-        if (reads === 2) writeFileSync(h.authPath, JSON.stringify(changed));
-        return readCodexAuthStableWithStat(h.authPath, { delayMs: 0 });
-      } }), (error: Error) => {
-        assert.ok(error instanceof CodexLiveChanged);
-        assert.equal(error.message.includes(codexFingerprint(h.a0)), false);
-        assert.equal(error.message.includes(codexFingerprint(changed)), false);
-        return true;
-      });
-      assert.deepEqual(output, []);
+      let thrown: Error | undefined;
+      try {
+        await failing.run({ readLive: async () => {
+          reads += 1;
+          if (reads === 3) throw new Error('fixture post-publish read failure');
+          return readCodexAuthStableWithStat(failing.authPath, { delayMs: 0 });
+        } }, () => undefined, { onRepublish: 'settle' });
+      } catch (error) {
+        thrown = error as Error;
+      }
+      assert.equal(reads, 3);
+      assert.ok(thrown instanceof Error);
+      assert.equal(thrown?.message, 'fixture post-publish read failure');
+
+      const rawTokens = [a1, b1, failedPublish].flatMap((document) => [
+        document.tokens.access_token, document.tokens.refresh_token, document.tokens.id_token,
+      ]);
+      for (const token of rawTokens) {
+        assert.equal(thrown?.message.includes(token), false);
+        for (const lines of Object.values(output)) {
+          for (const line of lines) assert.equal(line.includes(token), false);
+        }
+      }
     } finally {
+      console.log = originalLog;
       console.error = originalError;
-      h.store.close();
-      rmSync(h.root, { recursive: true, force: true });
+      process.stdout.write = originalStdoutWrite;
+      process.stderr.write = originalStderrWrite;
+      for (const h of [republish, drift, failing]) {
+        h.store.close();
+        rmSync(h.root, { recursive: true, force: true });
+      }
     }
   });
 
