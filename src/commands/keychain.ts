@@ -1,9 +1,11 @@
 import { execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, closeSync, copyFileSync, existsSync, fstatSync, mkdtempSync, openSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, closeSync, copyFileSync, existsSync, fstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { defaultKeychainHelperPath, KeychainHelperMissingError, MACOS_SECURITY_TIMEOUT_MS } from '../keychain';
+import { CONFIG_ENV_VARS } from '../config';
+import { qlbHomeDir } from '../home';
 import { assertKeychainAccess, macosKeychainAccountName } from '../keychain-allowlist';
 import { listCswapProcesses } from '../cswap-processes';
 import { assertAdmitted } from '../lifecycle';
@@ -42,20 +44,22 @@ function helperPath(): string {
 type KeychainSubcommand = 'matrix' | 'check-launchd' | 'authorize';
 
 function usage(ctx: CommandContext): number {
-  ctx.stderr('usage: qlb keychain matrix|check-launchd [--json] | authorize [cswap] [--json]');
+  ctx.stderr('usage: qlb keychain matrix|check-launchd [--json]|check-launchd --live [--json] | authorize [cswap] [--json]');
   return 2;
 }
 
-function parse(args: string[]): { subcommand: KeychainSubcommand; json: boolean; cswap: boolean } | null {
+function parse(args: string[]): { subcommand: KeychainSubcommand; json: boolean; cswap: boolean; live: boolean } | null {
   const [subcommand, ...flags] = args;
   if (subcommand === 'matrix' || subcommand === 'check-launchd') {
-    if (flags.some((flag) => flag !== '--json')) return null;
-    return { subcommand, json: flags.includes('--json'), cswap: false };
+    const live = flags.filter((flag) => flag === '--live').length === 1;
+    if (flags.some((flag) => flag !== '--json' && flag !== '--live') || flags.filter((flag) => flag === '--json').length > 1 || flags.filter((flag) => flag === '--live').length > 1) return null;
+    if (subcommand !== 'check-launchd' && live) return null;
+    return { subcommand, json: flags.includes('--json'), cswap: false, live };
   }
   if (subcommand === 'authorize') {
     const cswap = flags.filter((flag) => flag === 'cswap').length === 1;
     if (flags.some((flag) => flag !== '--json' && flag !== 'cswap') || flags.filter((flag) => flag === '--json').length > 1 || flags.filter((flag) => flag === 'cswap').length > 1) return null;
-    return { subcommand, json: flags.includes('--json'), cswap };
+    return { subcommand, json: flags.includes('--json'), cswap, live: false };
   }
   return null;
 }
@@ -203,9 +207,24 @@ function writeMatrixConfig(
 type HelperRunner = (path: string, args: string[], input?: Buffer, verifiedFd?: number, expectedSigning?: HelperSigningState | null) => void | Promise<void>;
 type CswapItemReader = (service: string, account: string) => Buffer;
 
+export interface LiveSwitchReceipt {
+  outcome: 'ok' | 'noop' | 'refused' | 'failed' | 'rolled-back';
+  from: string | null;
+  to: string;
+  switchId: number | null;
+  attempt: string;
+  reason: string | null;
+  error: string | null;
+  outgoingKind: string | null;
+  steps: { failedStep?: number; cleanup?: string[] } | null;
+  injected: boolean;
+}
+
 export interface KeychainCommandDependencies {
   runMatrix?: () => HelperMatrixResult;
   runLaunchdMatrix?: () => HelperMatrixResult;
+  /** Runs the self-republish in a one-shot LaunchAgent. */
+  runLaunchdLiveSwitch?: (activeId: string, env: NodeJS.ProcessEnv) => LiveSwitchReceipt | { timeout: true } | { inProgress: string };
   /** Injectable so receipt handling can be tested without codesign. */
   helperSigning?: (path: string) => HelperSigningState | null;
   /** Injectable config lookup for the matrix-recorded leaf certificate pin. */
@@ -461,6 +480,154 @@ async function authorize(options: { cswap: boolean; json: boolean }, ctx: Comman
   }
 }
 
+function liveSwitchEnvironment(ctx: CommandContext): Record<string, string> {
+  const inherited = ctx.env;
+  const environment: Record<string, string> = {
+    HOME: inherited.HOME ?? ctx.home,
+    PATH: inherited.PATH ?? '/usr/bin:/bin:/usr/sbin:/sbin',
+    QLB_HOME: inherited.QLB_HOME ?? qlbHomeDir(inherited),
+    QLB_CONFIG_PATH: ctx.config.configPath,
+  };
+  for (const key of ['QLB_TEST_MODE', 'CLAUDE_CONFIG_DIR', 'CLAUDE_SECURESTORAGE_CONFIG_DIR'] as const) {
+    if (inherited[key] !== undefined) environment[key] = inherited[key]!;
+  }
+  for (const [field, variable] of Object.entries(CONFIG_ENV_VARS)) environment[variable] = ctx.config[field as keyof typeof CONFIG_ENV_VARS];
+  return environment;
+}
+
+function plistDictionary(values: Record<string, string>): string {
+  return Object.entries(values).map(([key, value]) => `  <key>${xml(key)}</key><string>${xml(value)}</string>`).join('\n');
+}
+
+function requestedConfigPath(): string | null {
+  const index = process.argv.indexOf('--config');
+  return index >= 0 && typeof process.argv[index + 1] === 'string' ? process.argv[index + 1]! : null;
+}
+
+/** Runs a self-republish under launchd so macOS records the prompt provenance. */
+export function runLaunchdLiveSwitch(activeId: string, ctx: CommandContext): LiveSwitchReceipt | { timeout: true } | { inProgress: string } {
+  if (process.platform !== 'darwin') throw new Error('live launchd check is available only on macOS');
+  const uid = process.getuid?.();
+  if (uid === undefined) throw new Error('could not determine the macOS user id');
+  const root = join(qlbHomeDir(ctx.env), '.qlb', 'launchd-live');
+  mkdirSync(root, { recursive: true, mode: 0o700 });
+  for (const entry of readdirSync(root, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const previous = join(root, entry.name);
+    if (!existsSync(join(previous, 'status'))) return { inProgress: entry.name };
+    try { execFileSync('/bin/launchctl', ['bootout', `gui/${uid}/${entry.name}`], { encoding: 'utf8', timeout: MACOS_SECURITY_TIMEOUT_MS }); } catch { /* exited jobs may already be unloaded */ }
+    rmSync(previous, { recursive: true, force: true });
+  }
+
+  const label = `com.modus.qlb.live-switch.${process.pid}.${Date.now()}`;
+  const directory = join(root, label);
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const receiptPath = join(directory, 'receipt.json');
+  const statusPath = join(directory, 'status');
+  const plistPath = join(directory, `${label}.plist`);
+  const shell = 'r="$1"; s="$2"; shift 2; "$@" > "$r"; rc=$?; printf "%s" "$rc" > "$s.tmp" && mv "$s.tmp" "$s"';
+  const args = ['/bin/sh', '-c', shell, '--', receiptPath, statusPath, process.execPath, process.argv[1]!, 'switch', 'anthropic', activeId, '--trigger', 'manual', '--republish', '--json'];
+  if (requestedConfigPath() !== null) args.push('--config', ctx.config.configPath);
+  const values = args.map((arg) => `      <string>${xml(arg)}</string>`).join('\n');
+  writeFileSync(plistPath, `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>\n  <key>Label</key><string>${label}</string>\n  <key>ProgramArguments</key><array>\n${values}\n  </array>\n  <key>EnvironmentVariables</key><dict>\n${plistDictionary(liveSwitchEnvironment(ctx))}\n  </dict>\n  <key>RunAtLoad</key><true/>\n</dict></plist>\n`, { mode: 0o600 });
+
+  let receiptArrived = false;
+  try {
+    execFileSync('/bin/launchctl', ['bootstrap', `gui/${uid}`, plistPath], { encoding: 'utf8', timeout: MACOS_SECURITY_TIMEOUT_MS });
+    const deadline = Date.now() + 90_000;
+    while (!existsSync(statusPath) && Date.now() < deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+    if (!existsSync(statusPath)) return { timeout: true };
+    receiptArrived = true;
+    return JSON.parse(readFileSync(receiptPath, 'utf8')) as LiveSwitchReceipt;
+  } finally {
+    // On timeout the agent may still be running. Leave both it and its receipt for
+    // the next invocation's sweep; never boot out a process that has not finished.
+    if (receiptArrived) {
+      try { execFileSync('/bin/launchctl', ['bootout', `gui/${uid}/${label}`], { encoding: 'utf8', timeout: MACOS_SECURITY_TIMEOUT_MS }); } catch { /* cleanup */ }
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }
+}
+
+function recordLiveAuthorization(store: ReturnType<typeof openStore>, identityHash: string): void {
+  store.runImmediate(() => {
+    store.setConfig('keychain.liveItemsAuthorizedIdentityHash', identityHash);
+    store.setConfig('keychain.liveItemsAuthorizedAt', String(Date.now()));
+  });
+}
+
+function validLiveReceipt(value: unknown): value is LiveSwitchReceipt {
+  if (!value || typeof value !== 'object') return false;
+  const receipt = value as Partial<LiveSwitchReceipt>;
+  return (receipt.outcome === 'ok' || receipt.outcome === 'noop' || receipt.outcome === 'refused' || receipt.outcome === 'failed' || receipt.outcome === 'rolled-back')
+    && typeof receipt.to === 'string' && typeof receipt.attempt === 'string' && typeof receipt.injected === 'boolean'
+    && (receipt.from === null || typeof receipt.from === 'string')
+    && (receipt.switchId === null || typeof receipt.switchId === 'number')
+    && (receipt.reason === null || typeof receipt.reason === 'string')
+    && (receipt.error === null || typeof receipt.error === 'string')
+    && (receipt.outgoingKind === null || typeof receipt.outgoingKind === 'string')
+    && (receipt.steps === null || (typeof receipt.steps === 'object' && receipt.steps !== undefined
+      && (receipt.steps.failedStep === undefined || typeof receipt.steps.failedStep === 'number')
+      && (receipt.steps.cleanup === undefined || Array.isArray(receipt.steps.cleanup))));
+}
+
+function runLiveLaunchdCheck(options: { json: boolean }, ctx: CommandContext, dependencies: KeychainCommandDependencies): number {
+  const store = openStore(ctx.config.dbPath);
+  try {
+    const admission = assertAdmitted(store, 'keychain-check-launchd-live');
+    if (!admission.ok) {
+      ctx.stderr(`qlb keychain: refused: ${admission.code}`);
+      return 3;
+    }
+    const activeId = store.getActiveLogin('anthropic')?.accountId;
+    if (!activeId) {
+      ctx.stderr('qlb keychain: refused: active-login-unset');
+      return 3;
+    }
+    if (!store.getConfig('keychain.liveItemsReadAuthorizedAt')) {
+      ctx.stderr('qlb keychain: refused: live-items-read-not-authorized');
+      return 3;
+    }
+    const pin = (dependencies.helperConfigReader ?? ((key: string) => store.getConfig(key)))('keychain.helperCheckIdentityHash');
+    const path = dependencies.helperPath?.() ?? helperPath();
+    if (!pin || !(dependencies.helperIdentityVerifier ?? verifyHelperIdentity)(path, pin).trusted) {
+      ctx.stderr('qlb keychain: refused: helper identity is not trusted');
+      return 3;
+    }
+
+    let result: LiveSwitchReceipt | { timeout: true } | { inProgress: string };
+    try {
+      result = (dependencies.runLaunchdLiveSwitch ?? ((id, _env) => runLaunchdLiveSwitch(id, ctx)))(activeId, ctx.env);
+    } catch {
+      ctx.stderr('qlb keychain: live check failed');
+      return 1;
+    }
+    if ('inProgress' in result) {
+      ctx.stderr('qlb keychain: refused: live-check-in-progress');
+      return 3;
+    }
+    if ('timeout' in result) {
+      ctx.stderr('qlb keychain: live check timed out');
+      return 1;
+    }
+    if (!validLiveReceipt(result)) {
+      ctx.stderr('qlb keychain: live check failed');
+      return 1;
+    }
+    if (result.outcome === 'ok') {
+      recordLiveAuthorization(store, pin);
+      ctx.stdout(options.json ? JSON.stringify({ command: 'check-launchd --live', liveItemsAuthorized: true }) : 'Keychain live item write-authorized under launchd');
+      return 0;
+    }
+    if (result.outcome === 'rolled-back' && result.steps?.failedStep === 7 && (result.error === 'keychain-write-failed' || result.error === 'keychain-timeout')) {
+      ctx.stderr('qlb keychain: live Keychain write was denied; re-authorize in the GUI and re-run');
+      return 1;
+    }
+    ctx.stderr('qlb keychain: live check failed');
+    return 1;
+  } finally { store.close(); }
+}
+
 export async function runKeychainCommand(
   args: string[],
   ctx: CommandContext,
@@ -468,10 +635,13 @@ export async function runKeychainCommand(
 ): Promise<number> {
   const options = parse(args);
   if (!options) return usage(ctx);
-  if (ctx.env.QLB_TEST_MODE === '1') {
+  // Tests may exercise the receipt handler only through its injected runner;
+  // production launchctl/keychain access remains disabled in test mode.
+  if (ctx.env.QLB_TEST_MODE === '1' && !(options.subcommand === 'check-launchd' && options.live && dependencies.runLaunchdLiveSwitch)) {
     ctx.stderr('qlb keychain: native helper commands are disabled in test mode');
     return 2;
   }
+  if (options.subcommand === 'check-launchd' && options.live) return runLiveLaunchdCheck(options, ctx, dependencies);
   if (options.subcommand === 'authorize') return authorize(options, ctx, dependencies);
 
   let result: HelperMatrixResult | null = null;
