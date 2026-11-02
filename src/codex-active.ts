@@ -386,6 +386,11 @@ function logLiveWriteFailure(deps: CodexActiveDeps, accountId: string, outcome: 
   }
 }
 
+function processCheckFailure(deps: CodexActiveDeps): { status: 'refused'; reason: 'codex-process-check-failed' } {
+  deps.autoLog?.(`codex:process-check-failed provider=openai-codex at=${deps.now()}`);
+  return { status: 'refused', reason: 'codex-process-check-failed' };
+}
+
 /** Refreshes a due active login after completing the locked live reconciliation. */
 export async function refreshActiveCodexLogin(deps: CodexActiveDeps, input: CodexActiveInput): Promise<CodexActiveOutcome> {
   try {
@@ -402,7 +407,7 @@ export async function refreshActiveCodexLogin(deps: CodexActiveDeps, input: Code
   try {
     pids1 = await activeCodexRenewers(deps, active);
   } catch (error) {
-    if (error instanceof CodexProcessCheckFailed) return { status: 'refused', reason: 'codex-process-check-failed' };
+    if (error instanceof CodexProcessCheckFailed) return processCheckFailure(deps);
     throw error;
   }
   await deps.hooks?.afterCheck?.();
@@ -426,7 +431,7 @@ export async function refreshActiveCodexLogin(deps: CodexActiveDeps, input: Code
       try {
         pids3 = await activeCodexRenewers(deps, active);
       } catch (error) {
-        if (error instanceof CodexProcessCheckFailed) return { status: 'refused', reason: 'codex-process-check-failed' };
+        if (error instanceof CodexProcessCheckFailed) return processCheckFailure(deps);
         throw error;
       }
 
@@ -446,7 +451,7 @@ export async function refreshActiveCodexLogin(deps: CodexActiveDeps, input: Code
           break;
         } catch (error) {
           if (error instanceof CodexObservationWriteFailed) return { status: 'transient', reason: 'observation-write-failed' };
-          if (error instanceof CodexProcessCheckFailed) return { status: 'refused', reason: 'codex-process-check-failed' };
+          if (error instanceof CodexProcessCheckFailed) return processCheckFailure(deps);
           if (error instanceof CodexLiveChanged) continue;
           throw error;
         }
@@ -474,7 +479,7 @@ export async function refreshActiveCodexLogin(deps: CodexActiveDeps, input: Code
           externalAction = await attributeSettledExternal(deps, assertHeld,
             settled.action === 'drift' ? settled.accountId : active, postPublish.doc);
         } catch (error) {
-          if (error instanceof CodexProcessCheckFailed) return { status: 'refused', reason: 'codex-process-check-failed' };
+          if (error instanceof CodexProcessCheckFailed) return processCheckFailure(deps);
           throw error;
         }
         if (externalAction === 'unclaimed') {
@@ -508,7 +513,7 @@ export async function refreshActiveCodexLogin(deps: CodexActiveDeps, input: Code
       try {
         pids3b = await activeCodexRenewers(deps, active);
       } catch (error) {
-        if (error instanceof CodexProcessCheckFailed) return { status: 'refused', reason: 'codex-process-check-failed' };
+        if (error instanceof CodexProcessCheckFailed) return processCheckFailure(deps);
         throw error;
       }
       const pids = uniquePids(pids1, pids3, pids3b);
@@ -571,10 +576,7 @@ export async function refreshActiveCodexLogin(deps: CodexActiveDeps, input: Code
           return result;
         })();
       } catch (error) {
-        if (error instanceof CodexProcessCheckFailed) {
-          deps.autoLog?.(`codex:process-check-failed provider=openai-codex at=${deps.now()}`);
-          return { status: 'refused', reason: 'codex-process-check-failed' };
-        }
+        if (error instanceof CodexProcessCheckFailed) return processCheckFailure(deps);
         throw error;
       }
 
@@ -645,10 +647,7 @@ export async function refreshActiveCodexLogin(deps: CodexActiveDeps, input: Code
       }
       } catch (error) {
         if (error instanceof CodexObservationWriteFailed) return finishPostOutcome({ status: 'transient', reason: 'observation-write-failed' });
-        if (error instanceof CodexProcessCheckFailed) {
-          deps.autoLog?.(`codex:process-check-failed provider=openai-codex at=${deps.now()}`);
-          return finishPostOutcome({ status: 'refused', reason: 'codex-process-check-failed' });
-        }
+        if (error instanceof CodexProcessCheckFailed) return finishPostOutcome(processCheckFailure(deps));
         // Once transport was invoked, callers receive the closed outcome union
         // even if a later injected/file-side operation fails unexpectedly.
         if (postIssued) return finishPostOutcome({ status: 'transient' });

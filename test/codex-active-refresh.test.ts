@@ -1213,6 +1213,154 @@ describe('codex active refresh helpers', () => {
     } finally { h.close(); }
   });
 
+  it('no renewer + fresh-looking token + 401 ⇒ one POST under consume → switch → auth', async () => {
+    const h = activeHarness();
+    try {
+      const fresh = document(NOW + 10 * 60_000, 'fixture-access-401-current');
+      importActiveCodexSlot(fresh, { store: h.store, keychain: h.keychain, now: () => NOW + 1 });
+      writeFileSync(h.authPath, JSON.stringify(fresh));
+      delete (h.deps as Partial<CodexActiveDeps>).withLocks;
+      h.deps.authLockOptions = { home: h.root, retryMinMs: 1, retryJitterMs: 0 };
+      const paths = { ...codexLockPaths(h.store.dbPath, A), auth: codexAuthLockDir(h.deps.authLockOptions) };
+      const acquired: string[] = [];
+      const fsSpy = require('node:fs/promises') as { mkdir: (...args: any[]) => Promise<unknown> };
+      const mkdir = fsSpy.mkdir;
+      fsSpy.mkdir = async (...args) => {
+        const result = await mkdir(...args);
+        if (args[0] === paths.consume) acquired.push('consume');
+        if (args[0] === paths.switch) acquired.push('switch');
+        if (args[0] === paths.auth) acquired.push('auth');
+        return result;
+      };
+      let posts = 0;
+      try {
+        h.deps.transport = async (request) => {
+          posts += 1;
+          assert.match(request.body ?? '', /"refresh_reason":"unauthorized_recovery"/);
+          return { status: 200, body: JSON.stringify({
+            refresh_token: 'fixture-refresh-401-successor', access_token: document(NOW + 600_000, 'fixture-access-401-successor').tokens.access_token,
+          }) };
+        };
+        assert.equal((await refreshActiveCodexLogin(h.deps, {
+          trigger: 'unauthorized', accessFp: accessFingerprint(fresh),
+        })).status, 'posted');
+      } finally {
+        fsSpy.mkdir = mkdir;
+      }
+      assert.equal(posts, 1);
+      assert.deepEqual(acquired, ['consume', 'switch', 'auth']);
+    } finally { h.close(); }
+  });
+
+  it('a 401 on a changed access fingerprint never POSTs (rotated)', async () => {
+    const h = activeHarness();
+    try {
+      let posts = 0;
+      h.deps.transport = async () => { posts += 1; throw new Error('must not POST'); };
+      const result = await refreshActiveCodexLogin(h.deps, {
+        trigger: 'unauthorized', accessFp: accessFingerprint(document(NOW + 60_000, 'fixture-access-before-rotation')),
+      });
+      assert.deepEqual(result, { status: 'rotated', document: h.a0 });
+      assert.equal(posts, 0);
+    } finally { h.close(); }
+  });
+
+  it('a renewer appearing between check and re-check ⇒ 0 POSTs', async () => {
+    const h = activeHarness();
+    try {
+      let posts = 0;
+      h.deps.transport = async () => { posts += 1; throw new Error('must not POST'); };
+      h.deps.hooks = { afterCheck: () => { h.deps.list = async () => [process(1001, -30_000)]; } };
+      const result = await refreshActiveCodexLogin(h.deps, { trigger: 'proactive-expiry' });
+      assert.deepEqual(result, { status: 'held', pids: [1001], document: h.a0, action: 'noop' });
+      assert.equal(posts, 0);
+    } finally { h.close(); }
+  });
+
+  it('no switch rows and no observations + a running codex ⇒ held with 0 POSTs', async () => {
+    const h = activeHarness();
+    try {
+      let posts = 0;
+      h.deps.list = async () => [process(1002, -30_000)];
+      h.deps.transport = async () => { posts += 1; throw new Error('must not POST'); };
+      assert.deepEqual(await refreshActiveCodexLogin(h.deps, { trigger: 'proactive-expiry' }), {
+        status: 'held', pids: [1002], document: h.a0, action: 'noop',
+      });
+      assert.equal(posts, 0);
+    } finally { h.close(); }
+  });
+
+  it('with a prior observation of another identity, the observation recorded by observe makes step 3b return held (0 POSTs)', async () => {
+    const h = activeHarness();
+    try {
+      h.store.recordCodexObservation({ identity: B, lineageFp: 'sha256:prior-b', by: 'qlb-active', now: NOW - 60_000 });
+      let posts = 0;
+      h.deps.list = async () => [process(1003, -30_000)];
+      h.deps.transport = async () => { posts += 1; throw new Error('must not POST'); };
+      assert.deepEqual(await refreshActiveCodexLogin(h.deps, { trigger: 'proactive-expiry' }), {
+        status: 'held', pids: [1003], document: h.a0, action: 'noop',
+      });
+      assert.equal(posts, 0);
+    } finally { h.close(); }
+  });
+
+  it('last_refresh older than 8 days ⇒ one POST with refresh_reason scheduled', async () => {
+    const h = activeHarness();
+    try {
+      const scheduled = { ...document(NOW + 10 * 60_000, 'fixture-access-scheduled'), last_refresh: '2026-10-23T11:59:59.999Z' };
+      importActiveCodexSlot(scheduled, { store: h.store, keychain: h.keychain, now: () => NOW + 1 });
+      writeFileSync(h.authPath, JSON.stringify(scheduled));
+      let posts = 0;
+      h.deps.transport = async (request) => {
+        posts += 1;
+        assert.match(request.body ?? '', /"refresh_reason":"scheduled"/);
+        return { status: 200, body: JSON.stringify({
+          refresh_token: 'fixture-refresh-scheduled-successor', access_token: document(NOW + 600_000, 'fixture-access-scheduled-successor').tokens.access_token,
+        }) };
+      };
+      assert.equal((await refreshActiveCodexLogin(h.deps, { trigger: 'scheduled' })).status, 'posted');
+      assert.equal(posts, 1);
+    } finally { h.close(); }
+  });
+
+  it('a process list failure refuses with 0 POSTs and no mark at every one of the seven check points', async () => {
+    for (let failureAt = 1; failureAt <= 7; failureAt += 1) {
+      const h = activeHarness();
+      try {
+        const logs: string[] = [];
+        const raw = { access: `fixture-access-list-${failureAt}`, refresh: `fixture-refresh-list-${failureAt}` };
+        const live = { ...h.a0, tokens: { ...h.a0.tokens, access_token: raw.access, refresh_token: raw.refresh } };
+        importActiveCodexSlot(live, { store: h.store, keychain: h.keychain, now: () => NOW + 1 });
+        writeFileSync(h.authPath, JSON.stringify(live));
+        let calls = 0;
+        let posts = 0;
+        h.deps.autoLog = (line) => logs.push(line);
+        h.deps.list = async () => {
+          calls += 1;
+          if (calls === failureAt) throw new Error('fixture process-list failure');
+          return [];
+        };
+        h.deps.transport = async () => {
+          posts += 1;
+          return { status: 400, body: JSON.stringify({ error: 'refresh_token_reused' }) };
+        };
+        assert.deepEqual(await refreshActiveCodexLogin(h.deps, { trigger: 'proactive-expiry' }), {
+          status: 'refused', reason: 'codex-process-check-failed',
+        }, `failure point ${failureAt}`);
+        assert.equal(posts, failureAt === 7 ? 1 : 0, `transport count at failure point ${failureAt}`);
+        assert.equal(h.store.getCodexSlot(A)?.dead, false, `dead mark at failure point ${failureAt}`);
+        assert.ok(logs.includes(`codex:process-check-failed provider=openai-codex at=${NOW}`));
+        if (failureAt === 3 || failureAt === 4) {
+          const observations = readCodexSwitchHistory(h.store.dbPath, { journalDir: h.deps.journalDir }).observations;
+          assert.equal(observations.some(({ by }) => by === 'qlb-active'), false, `observation at p${failureAt - 3}`);
+        }
+        const rendered = `${JSON.stringify({ status: 'refused', reason: 'codex-process-check-failed' })}\n${logs.join('\n')}`;
+        assert.equal(rendered.includes(raw.access), false);
+        assert.equal(rendered.includes(raw.refresh), false);
+      } finally { h.close(); }
+    }
+  });
+
   it('no token value reaches autoLog, a thrown error or an outcome’s reason', async () => {
     const h = activeHarness();
     try {
