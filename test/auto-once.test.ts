@@ -237,6 +237,90 @@ describe('qlb auto --once (G12)', () => {
     assert.equal(ticks, 1, 'the in-flight tick completes before the loop stops');
   });
 
+  it('does not begin a tick when the lease was already lost before runAuto starts', async () => {
+    const lost = new Error('fcntl flock helper exited unexpectedly (SIGTERM)');
+    let reconciles = 0;
+    let ticks = 0;
+    await assert.rejects(runAuto({ once: true }, {
+      stopWhen: Promise.resolve(lost), stopIf: () => lost,
+      makeLiveBinding: () => ({
+        store: { setConfig: () => {} }, close: () => {},
+        reconcile: async () => { reconciles += 1; }, poll: async () => [],
+        tick: async () => {
+          ticks += 1;
+          return { decision: { kind: 'stay', reason: 'unknown', unhealthyTicks: 0 } };
+        },
+      }),
+      assertAdmitted: () => ({ ok: true }), listCswapProcesses: () => [], log: () => {},
+    }), /flock helper exited unexpectedly/);
+    assert.equal(reconciles, 0);
+    assert.equal(ticks, 0);
+  });
+
+  it('does not switch when the lease is lost after polling and before the tick', async () => {
+    const lostError = new Error('fcntl flock helper exited unexpectedly (SIGTERM)');
+    let loseLock: (error: Error) => void = () => {};
+    const lost = new Promise<Error>((resolve) => { loseLock = resolve; });
+    let currentLoss: Error | undefined;
+    let ticks = 0;
+    await assert.rejects(runAuto({ once: true }, {
+      stopWhen: lost, stopIf: () => currentLoss,
+      makeLiveBinding: () => ({
+        store: { setConfig: () => {} }, close: () => {}, reconcile: async () => {},
+        poll: async () => {
+          currentLoss = lostError;
+          loseLock(lostError);
+          return [];
+        },
+        tick: async () => {
+          ticks += 1;
+          return { decision: { kind: 'stay', reason: 'unknown', unhealthyTicks: 0 } };
+        },
+      }),
+      assertAdmitted: () => ({ ok: true }), listCswapProcesses: () => [], log: () => {},
+    }), /flock helper exited unexpectedly/);
+    assert.equal(ticks, 0);
+  });
+
+  it('passes a synchronously lost lease to runAuto and returns exit 1', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-auto-command-lost-'));
+    const home = join(root, 'home');
+    const loss = new Error('fcntl flock helper exited unexpectedly (SIGTERM)');
+    const lease = Object.assign(async () => {}, { lost: Promise.resolve(loss), isLost: () => loss });
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const ctx: CommandContext = {
+      stdout: (line) => stdout.push(line), stderr: (line) => stderr.push(line), env: testEnv(home),
+      config: {} as CommandContext['config'], loadConfig: () => { throw new Error('not used'); }, home,
+      registerSecret: () => undefined, deliverSecret: () => undefined, knownSecrets: () => [],
+    };
+    let ticks = 0;
+    try {
+      const code = await runExecutingCommand({ command: {
+        name: 'auto', execute: (args, context) => runAutoCommand(args, context, {
+          acquireFlock: async () => lease,
+          runAuto: (options, dependencies) => runAuto(options, {
+            ...dependencies,
+            makeLiveBinding: () => ({
+              store: { setConfig: () => {} }, close: () => {}, reconcile: async () => {}, poll: async () => [],
+              tick: async () => {
+                ticks += 1;
+                return { decision: { kind: 'stay', reason: 'unknown', unhealthyTicks: 0 } };
+              },
+            }),
+            assertAdmitted: () => ({ ok: true }), listCswapProcesses: () => [],
+          }),
+        }),
+      }, args: ['--once'] }, ctx);
+      assert.equal(code, 1);
+      assert.equal(ticks, 0);
+      assert.deepEqual(stdout, []);
+      assert.match(stderr.join('\n'), /flock helper exited unexpectedly/);
+    } finally {
+      close(root);
+    }
+  });
+
   it('no token-shaped string reaches stdout or stderr', async () => {
     const secret = 'sk-abcdefghijklmnopqrstuvwxyz123456';
     const stdout: string[] = [];

@@ -1,4 +1,4 @@
-import { execFileSync, spawn } from 'node:child_process';
+import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, renameSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 
@@ -17,6 +17,8 @@ export interface CswapProcess {
 export type CswapLockRelease = (() => void | Promise<void>) & {
   /** Resolves if the owned flock helper disappears before release. */
   lost?: Promise<Error>;
+  /** Synchronously reports a helper loss observed by its process event handler. */
+  isLost?: () => Error | undefined;
 };
 
 /** Every effect used by the S57 drain is supplied by its caller. */
@@ -342,29 +344,47 @@ const FLOCK_HELPER = [
   'os.close(fd)',
 ].join('\n');
 
+export type FlockHelperSpawner = (lockPath: string, lockDirectory: string) => ChildProcess;
+
+function spawnFlockHelper(lockPath: string, lockDirectory: string): ChildProcess {
+  return spawn('/usr/bin/python3', ['-I', '-c', FLOCK_HELPER, lockPath], {
+    cwd: lockDirectory,
+    stdio: ['pipe', 'pipe', 'ignore'],
+  });
+}
+
 /** Keeps a real fcntl flock in a tiny helper process until its release seam. */
-export function productionTryAcquireLock(path: string): Promise<CswapLockRelease | null> {
+export function productionTryAcquireLock(path: string, startHelper: FlockHelperSpawner = spawnFlockHelper): Promise<CswapLockRelease | null> {
   const lockPath = resolve(path);
   const lockDirectory = dirname(lockPath);
-  mkdirSync(lockDirectory, { recursive: true, mode: 0o700 });
   return new Promise((resolveLock, rejectLock) => {
-    const child = spawn('/usr/bin/python3', ['-I', '-c', FLOCK_HELPER, lockPath], {
-      cwd: lockDirectory,
-      stdio: ['pipe', 'pipe', 'ignore'],
-    });
+    const child = startHelper(lockPath, lockDirectory);
+    const stdout = child.stdout;
+    const stdin = child.stdin;
+    if (stdout === null || stdin === null) {
+      rejectLock(new Error('fcntl flock helper must use piped stdin and stdout'));
+      return;
+    }
     let state: 'pending' | 'locked' | 'busy' = 'pending';
+    let response = '';
     let releaseRequested = false;
     let released: Promise<void> | undefined;
+    let lostError: Error | undefined;
     let notifyLost: (error: Error) => void = () => {};
     const lost = new Promise<Error>((resolveLoss) => { notifyLost = resolveLoss; });
+    const markLost = (error: Error): void => {
+      if (lostError !== undefined) return;
+      lostError = error;
+      notifyLost(error);
+    };
     const closed = new Promise<void>((resolveClose, rejectClose) => {
       child.once('error', (error) => {
-        if (state === 'locked') notifyLost(new Error(`fcntl flock helper exited unexpectedly (${error.message})`));
+        if (state === 'locked') markLost(new Error(`fcntl flock helper exited unexpectedly (${error.message})`));
         rejectClose(error);
       });
       child.once('close', (code, signal) => {
         if (state === 'locked') {
-          if (!releaseRequested) notifyLost(new Error(`fcntl flock helper exited unexpectedly (${code ?? signal ?? 'unknown'})`));
+          if (!releaseRequested) markLost(new Error(`fcntl flock helper exited unexpectedly (${code ?? signal ?? 'unknown'})`));
           resolveClose();
         } else if (state === 'busy' || code === 0) {
           resolveClose();
@@ -373,23 +393,26 @@ export function productionTryAcquireLock(path: string): Promise<CswapLockRelease
         }
       });
     });
-    child.stdout.on('data', (chunk: Buffer) => {
-      const line = String(chunk).trim();
+    stdout.on('data', (chunk: Buffer) => {
       if (state !== 'pending') return;
-      if (line === 'busy') state = 'busy';
-      else if (line === 'locked') {
+      response += String(chunk);
+      const newline = response.indexOf('\n');
+      if (newline === -1) return;
+      const status = response.slice(0, newline);
+      if (status === 'busy') state = 'busy';
+      else if (status === 'locked') {
         state = 'locked';
         const release = Object.assign(() => {
           if (!released) {
             releaseRequested = true;
             if (child.exitCode !== null || child.signalCode !== null) released = Promise.resolve();
             else {
-              child.stdin.end();
+              stdin.end();
               released = closed.catch(() => undefined);
             }
           }
           return released;
-        }, { lost });
+        }, { lost, isLost: () => lostError });
         resolveLock(release);
       }
     });

@@ -1,5 +1,7 @@
+import { mkdirSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+
 import { AutoAdmissionRefused, runAuto, type AutoDependencies, type AutoRunResult, type RunAutoOptions } from '../auto';
-import { join } from 'node:path';
 
 import { productionTryAcquireLock, type CswapLockRelease } from '../cswap-agent';
 import type { CommandContext, CommandDefinition } from '../registry';
@@ -38,6 +40,7 @@ export async function runAutoCommand(
   }
 
   const lockPath = join(ctx.home, '.qlb', 'locks', 'auto.lock');
+  if (!options.dryRun) mkdirSync(dirname(lockPath), { recursive: true, mode: 0o700 });
   const lease = options.dryRun ? null : await deps.acquireFlock(lockPath);
   if (!options.dryRun && lease === null) {
     ctx.stderr('qlb auto: auto-already-running');
@@ -47,7 +50,7 @@ export async function runAutoCommand(
   try {
     const result = await deps.runAuto(options, {
       env: ctx.env, home: ctx.home, config: ctx.config, log: ctx.stderr,
-      stopWhen: lease?.lost,
+      stopWhen: lease?.lost, stopIf: lease?.isLost,
     });
     ctx.stdout(receipt(result, options.json));
     return 0;

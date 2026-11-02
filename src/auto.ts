@@ -76,8 +76,10 @@ export interface AutoDependencies {
   setTimeout?: (callback: () => void, ms: number) => ReturnType<typeof setTimeout>;
   clearTimeout?: (timer: ReturnType<typeof setTimeout>) => void;
   signals?: { on(signal: 'SIGTERM', listener: () => void): unknown; removeListener(signal: 'SIGTERM', listener: () => void): unknown };
-  /** Stops the loop after its current tick when an owned external resource is lost. */
+  /** Resolves when an owned external resource is lost, including during a running tick. */
   stopWhen?: Promise<Error>;
+  /** Synchronously observes a loss so no new or switching tick can start after it. */
+  stopIf?: () => Error | undefined;
 }
 
 function redactedLog(log: (line: string) => void, line: string): void {
@@ -293,14 +295,25 @@ export async function runAuto(options: RunAutoOptions = {}, dependencies: AutoDe
     }
   };
   let stopError: Error | undefined;
+  const observeStop = (): Error | undefined => {
+    const error = dependencies.stopIf?.();
+    if (error !== undefined) {
+      stopError ??= error;
+      onTerm();
+    }
+    return stopError;
+  };
   dependencies.stopWhen?.then((error) => {
-    stopError = error;
+    stopError ??= error;
     onTerm();
   });
   const signals = dependencies.signals ?? process;
   signals.on('SIGTERM', onTerm);
   try {
+    // Let an already-resolved stop promise run before the first loop iteration.
+    await Promise.resolve();
     do {
+      if (observeStop() !== undefined) break;
       try {
         const admission = (dependencies.assertAdmitted ?? assertAdmitted)(binding.store as Store, 'switch:auto');
         if (!admission.ok) throw new AutoAdmissionRefused(admission.code ?? 'not-admitted');
@@ -312,7 +325,10 @@ export async function runAuto(options: RunAutoOptions = {}, dependencies: AutoDe
           redactedLog(log, 'auto: stay(cswap-alive)');
         } else {
           await binding.reconcile();
+          if (observeStop() !== undefined) break;
           const accounts = await binding.poll();
+          // This is the final point before a tick that can switch credentials.
+          if (observeStop() !== undefined) break;
           const tick = await binding.tick(accounts);
           binding.store.setConfig('auto.heartbeatAt', String(now()));
           result.ticks += 1;
