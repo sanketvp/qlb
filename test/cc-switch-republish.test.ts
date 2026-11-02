@@ -255,10 +255,11 @@ describe('Claude self-republish (K5b-1)', () => {
       // While a real republish writes the credential, its journal sits in the directory the
       // zero-write refusal tests watch, so their 'no journal' check can fail.
       const seenAtWrite: string[][] = [];
-      const deps = { ...subject.deps, live: { ...subject.deps.live, backend: backendWithHooks(subject, { set: () => { seenAtWrite.push(journalEntries(subject)); } }) } };
+      const deps = { ...subject.deps, live: { ...subject.deps.live, backend: backendWithHooks(subject, { set: (service, account) => { if (service === subject.paths.keychainService && account === 'fixture-user') seenAtWrite.push(journalEntries(subject)); } }) } };
       assert.equal((await switchClaude(deps, republish)).outcome, 'ok');
       assert.equal(await subject.backend.get(subject.paths.keychainService, 'fixture-user'), own);
-      assert.ok(seenAtWrite.length > 0 && seenAtWrite.every((entries) => entries.includes('switch-anthropic.json')));
+      // Exactly one live credential write (step 7), with the journal present while it happens.
+      assert.deepEqual(seenAtWrite.map((entries) => entries.includes('switch-anthropic.json')), [true]);
     } finally { await close(subject); }
   });
 
