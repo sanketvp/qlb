@@ -104,11 +104,22 @@ test("rejects the unordered A10 and K13 bootstrap pair", () => {
   assert.match(result.stderr, /shared file src\/bootstrap\.ts: A10 and K13/i);
 });
 
-test("X1 closure includes every required pre-cutover slice", () => {
+test("X1 retains its happy-path prerequisites and X3 holds the deferred gates", () => {
   const document = JSON.parse(readFileSync("docs/slices.json", "utf8")) as Document;
   const x1Closure = closure(document, "X1");
-  for (const id of ["A0b", "A0c", "H1", "D1", "D3", "C1c", "A10b", "P6b", "A2c", "C7", "P10", "P8", "K14", "K5b"]) {
+  for (const id of ["A0b", "A0c", "H1", "D1", "D3", "C1c", "A10b", "P6b", "A2c", "C7", "P10", "P8"]) {
     assert.ok(x1Closure.has(id), `X1 closure must include ${id}`);
+  }
+
+  const x3Closure = closure(document, "X3");
+  for (const id of ["K5b", "K7", "H2", "H3", "K12", "K14", "P7", "P9", "C8", "C6b", "D2"]) {
+    assert.ok(x3Closure.has(id), `X3 closure must include ${id}`);
+    assert.ok(!x1Closure.has(id), `X1 closure must not include ${id}`);
+  }
+
+  const c9Closure = closure(document, "C9");
+  for (const id of ["X2", "C8", "C6b", "C4-live", "K7"]) {
+    assert.ok(c9Closure.has(id), `C9 closure must include ${id}`);
   }
 });
 
