@@ -40,7 +40,11 @@ async function ownerIsLive(deps: ClaudeSwitchDeps, journal: ClaudeSwitchJournal)
  */
 export async function reconcileClaudeSwitch(deps: ClaudeSwitchDeps): Promise<void> {
   // S24 must prevent recovery from acquiring any Claude Code lock too.
-  if (checkClaudeCswapProcessPrecondition(deps) !== null) return;
+  const initialCswapProcessReason = checkClaudeCswapProcessPrecondition(deps);
+  if (initialCswapProcessReason !== null) {
+    deps.warn?.(initialCswapProcessReason);
+    return;
+  }
 
   const options = optionsFor(deps);
   const initial = readClaudeSwitchJournal(options);
@@ -64,6 +68,11 @@ export async function reconcileClaudeSwitch(deps: ClaudeSwitchDeps): Promise<voi
         const reread = readClaudeSwitchJournal(options);
         if (reread.state !== 'ok' || finished(deps, reread.journal) || await ownerIsLive(deps, reread.journal)) return;
         const journal = reread.journal;
+        const lockedCswapProcessReason = checkClaudeCswapProcessPrecondition(deps);
+        if (lockedCswapProcessReason !== null) {
+          deps.warn?.(lockedCswapProcessReason);
+          return;
+        }
 
         if (journal.credentialsWriteStarted) {
           const liveResult = await restoreLiveFromStaged(deps, journal, credentialHeld);

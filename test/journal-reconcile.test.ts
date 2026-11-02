@@ -198,6 +198,7 @@ describe('Claude switch journal reconciliation (G10)', () => {
       staged: await readStagedRollback(subject.backend, entry.stagedBlobService),
     }, before);
     assert.equal(locks, 0);
+    assert.deepEqual(subject.warnings, ['cswap-process-alive']);
   });
 
   it('a failed C-swap process check leaves live, config, journal, and staged state untouched without taking a lock', async () => {
@@ -223,6 +224,62 @@ describe('Claude switch journal reconciliation (G10)', () => {
       staged: await readStagedRollback(subject.backend, entry.stagedBlobService),
     }, before);
     assert.equal(locks, 0);
+    assert.deepEqual(subject.warnings, ['cswap-process-check-failed']);
+  });
+
+  it('a C-swap process appearing under the owner lock leaves recovery untouched and switch refuses', async () => {
+    const subject = await fixture();
+    const entry = await install(subject);
+    await subject.backend.set(subject.paths.keychainService, 'fixture-user', subject.target);
+    let checks = 0;
+    subject.deps.cswapProcesses = () => {
+      checks += 1;
+      return checks === 1 ? [] : [{ pid: 123 }];
+    };
+    const before = {
+      live: await subject.backend.get(subject.paths.keychainService, 'fixture-user'),
+      config: readFileSync(subject.paths.globalConfigPath, 'utf8'),
+      journal: readFileSync(claudeSwitchJournalPath({ journalDir: subject.deps.journalDir }), 'utf8'),
+      staged: await readStagedRollback(subject.backend, entry.stagedBlobService),
+    };
+    await reconcileClaudeSwitch(subject.deps);
+    assert.deepEqual({
+      live: await subject.backend.get(subject.paths.keychainService, 'fixture-user'),
+      config: readFileSync(subject.paths.globalConfigPath, 'utf8'),
+      journal: readFileSync(claudeSwitchJournalPath({ journalDir: subject.deps.journalDir }), 'utf8'),
+      staged: await readStagedRollback(subject.backend, entry.stagedBlobService),
+    }, before);
+    assert.equal(checks, 2);
+    assert.deepEqual(subject.warnings, ['cswap-process-alive']);
+    assert.equal((await switchClaude(subject.deps, { to: 'b', trigger: 'manual' })).outcome, 'refused');
+  });
+
+  it('a failed C-swap check under the owner lock leaves recovery untouched and switch refuses', async () => {
+    const subject = await fixture();
+    const entry = await install(subject);
+    await subject.backend.set(subject.paths.keychainService, 'fixture-user', subject.target);
+    let checks = 0;
+    subject.deps.cswapProcesses = () => {
+      checks += 1;
+      if (checks === 1) return [];
+      throw new Error('process table unavailable');
+    };
+    const before = {
+      live: await subject.backend.get(subject.paths.keychainService, 'fixture-user'),
+      config: readFileSync(subject.paths.globalConfigPath, 'utf8'),
+      journal: readFileSync(claudeSwitchJournalPath({ journalDir: subject.deps.journalDir }), 'utf8'),
+      staged: await readStagedRollback(subject.backend, entry.stagedBlobService),
+    };
+    await reconcileClaudeSwitch(subject.deps);
+    assert.deepEqual({
+      live: await subject.backend.get(subject.paths.keychainService, 'fixture-user'),
+      config: readFileSync(subject.paths.globalConfigPath, 'utf8'),
+      journal: readFileSync(claudeSwitchJournalPath({ journalDir: subject.deps.journalDir }), 'utf8'),
+      staged: await readStagedRollback(subject.backend, entry.stagedBlobService),
+    }, before);
+    assert.equal(checks, 2);
+    assert.deepEqual(subject.warnings, ['cswap-process-check-failed']);
+    assert.equal((await switchClaude(subject.deps, { to: 'b', trigger: 'manual' })).outcome, 'refused');
   });
 
   it('a crash before the live write needs no staged item', async () => {
