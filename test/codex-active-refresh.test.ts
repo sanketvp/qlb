@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 import {
@@ -12,11 +12,13 @@ import {
   reconcileActiveCodexLive,
   type CodexActiveDeps,
 } from '../src/codex-active';
-import { codexFingerprint, readCodexAuthStableWithStat, type CodexAuthDocument } from '../src/codex-auth';
+import { codexAuthFileSha256, codexAuthFileText, codexFingerprint, readCodexAuthStableWithStat, type CodexAuthDocument } from '../src/codex-auth';
 import { importActiveCodexSlot } from '../src/codex-slots';
 import { MockKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from '../src/keychain';
-import type { CodexProcess } from '../src/codex-sessions';
+import { readCodexSwitchHistory, type CodexProcess } from '../src/codex-sessions';
 import { openStore } from '../src/store';
+import { codexAuthLockDir } from '../src/cc-locks';
+import { codexLockPaths } from '../src/codex-consume';
 
 const NOW = Date.parse('2026-11-01T12:00:00.000Z');
 const A = 'user-a:account-a';
@@ -322,7 +324,246 @@ describe('codex active refresh helpers', () => {
         return readLive();
       };
       assert.deepEqual(await reconcileActiveCodexLive(h.deps), {
-        status: 'posted-live-external', document: a1, action: 'republish-slot', cause: 'republish',
+        status: 'posted-live-external', document: a1, action: 'unclaimed', cause: 'republish',
+      });
+    } finally { h.close(); }
+  });
+
+  it('a fenced active account returns fenced with the fence message under the switch lock', async () => {
+    const h = activeHarness();
+    try {
+      h.store.setConfig('codex.recoveryFence', JSON.stringify({
+        v: 1, switchId: 1, attempt: 'fixture-fence', from: B, to: C, publishedAt: NOW,
+        reason: 'target-changed', involvedAccounts: [B, C], since: NOW,
+      }));
+      const result = await reconcileActiveCodexLive(h.deps);
+      assert.equal(result.status, 'fenced');
+      if (result.status !== 'fenced') return;
+      assert.equal(result.reason, 'target-changed');
+      assert.match(result.message, /target-changed/);
+      assert.deepEqual([...result.accounts], [B, C]);
+    } finally { h.close(); }
+  });
+
+  it('slot newer than live with a renewer ⇒ held{action: republish-slot}, file republished, 0 POSTs', async () => {
+    const h = activeHarness();
+    try {
+      const a1 = { ...document(NOW + 120_000, 'fixture-access-a1'), tokens: {
+        ...document(NOW + 120_000, 'fixture-access-a1').tokens, refresh_token: 'fixture-refresh-a1',
+      } };
+      importActiveCodexSlot(a1, { store: h.store, keychain: h.keychain, now: () => NOW + 1 });
+      h.deps.list = async () => [process(702, -30_000)];
+      assert.deepEqual(await reconcileActiveCodexLive(h.deps), {
+        status: 'held', pids: [702], document: a1, action: 'republish-slot',
+      });
+      const live = await readCodexAuthStableWithStat(h.authPath, { delayMs: 0 });
+      assert.equal(live.status, 'ok');
+      if (live.status === 'ok') assert.equal(codexFingerprint(live.doc), codexFingerprint(a1));
+    } finally { h.close(); }
+  });
+
+  it('a drift whose slot was republished stops with drift{republish} and 0 POSTs, never consuming A', async () => {
+    const h = activeHarness();
+    try {
+      const b0 = { ...document(NOW + 60_000, 'fixture-access-b0'), tokens: {
+        ...document(NOW + 60_000, 'fixture-access-b0').tokens,
+        id_token: jwt({ 'https://api.openai.com/auth': { chatgpt_user_id: 'user-b', chatgpt_account_id: 'account-b' } }),
+        account_id: 'account-b', refresh_token: 'fixture-refresh-b0',
+      } };
+      const b1 = { ...b0, tokens: { ...b0.tokens, refresh_token: 'fixture-refresh-b1' } };
+      importActiveCodexSlot(b0, { store: h.store, keychain: h.keychain, now: () => NOW + 1 });
+      importActiveCodexSlot(b1, { store: h.store, keychain: h.keychain, now: () => NOW + 2 });
+      h.store.setActiveLogin('openai-codex', A, 'import', NOW + 3);
+      writeFileSync(h.authPath, JSON.stringify(b0));
+      assert.deepEqual(await reconcileActiveCodexLive(h.deps), { status: 'drift', accountId: B, republish: 'ok' });
+    } finally { h.close(); }
+  });
+
+  it('a restarted observe that lands on another slot stops with drift and 0 POSTs', async () => {
+    const h = activeHarness();
+    try {
+      const a1 = { ...document(NOW + 120_000, 'fixture-access-a1'), tokens: {
+        ...document(NOW + 120_000, 'fixture-access-a1').tokens, refresh_token: 'fixture-refresh-a1',
+      } };
+      const b0 = { ...document(NOW + 60_000, 'fixture-access-b0'), tokens: {
+        ...document(NOW + 60_000, 'fixture-access-b0').tokens,
+        id_token: jwt({ 'https://api.openai.com/auth': { chatgpt_user_id: 'user-b', chatgpt_account_id: 'account-b' } }), account_id: 'account-b',
+      } };
+      importActiveCodexSlot(a1, { store: h.store, keychain: h.keychain, now: () => NOW + 1 });
+      importActiveCodexSlot(b0, { store: h.store, keychain: h.keychain, now: () => NOW + 2 });
+      h.store.setActiveLogin('openai-codex', A, 'import', NOW + 3);
+      let reads = 0;
+      const readLive = h.deps.readLive;
+      h.deps.readLive = async () => {
+        reads += 1;
+        return reads === 2 || reads === 3 ? { status: 'ok' as const, doc: b0, sha256: codexAuthFileSha256(codexAuthFileText(b0)), inode: 99 } : readLive();
+      };
+      assert.deepEqual(await reconcileActiveCodexLive(h.deps), { status: 'drift', accountId: B });
+      assert.equal(reads, 3);
+    } finally { h.close(); }
+  });
+
+  it('an unknown live identity is stashed and refused', async () => {
+    const h = activeHarness();
+    try {
+      const c0 = { ...document(NOW + 60_000, 'fixture-access-c0'), tokens: {
+        ...document(NOW + 60_000, 'fixture-access-c0').tokens,
+        id_token: jwt({ 'https://api.openai.com/auth': { chatgpt_user_id: 'user-c', chatgpt_account_id: 'account-c' } }), account_id: 'account-c',
+      } };
+      let stashed = false;
+      h.deps.slots = { ...h.deps.slots, ensureUnclaimedStash: async () => { stashed = true; return { stashId: 'fixture-stash', created: true }; } } as never;
+      writeFileSync(h.authPath, JSON.stringify(c0));
+      assert.deepEqual(await reconcileActiveCodexLive(h.deps), { status: 'refused', reason: 'unknown-live-identity' });
+      assert.equal(stashed, true);
+      assert.equal(h.store.getCodexActiveLogin(), null);
+    } finally { h.close(); }
+  });
+
+  it('a wiped file is refused with an observation by qlb-active', async () => {
+    const h = activeHarness();
+    try {
+      writeFileSync(h.authPath, JSON.stringify({ tokens: {} }));
+      assert.deepEqual(await reconcileActiveCodexLive(h.deps), { status: 'refused', reason: 'wiped' });
+      const history = readCodexSwitchHistory(h.store.dbPath, { journalDir: h.deps.journalDir });
+      assert.deepEqual(history.observations.at(-1), { identity: null, lineageFp: null, by: 'qlb-active', ts: NOW });
+    } finally { h.close(); }
+  });
+
+  it('an unstable file defers codex-writing', async () => {
+    const h = activeHarness();
+    try {
+      h.deps.readLive = async () => ({ status: 'unstable' });
+      assert.deepEqual(await reconcileActiveCodexLive(h.deps), { status: 'deferred', reason: 'codex-writing' });
+    } finally { h.close(); }
+  });
+
+  it('a file change during the republish re-read restarts the observe; six changes defer codex-writing', async () => {
+    const h = activeHarness();
+    try {
+      const a1 = { ...document(NOW + 120_000, 'fixture-access-a1'), tokens: {
+        ...document(NOW + 120_000, 'fixture-access-a1').tokens, refresh_token: 'fixture-refresh-a1',
+      } };
+      const changed = { ...document(NOW + 60_000, 'fixture-access-changed'), tokens: {
+        ...document(NOW + 60_000, 'fixture-access-changed').tokens, refresh_token: 'fixture-refresh-changed',
+      } };
+      importActiveCodexSlot(a1, { store: h.store, keychain: h.keychain, now: () => NOW + 1 });
+      let reads = 0;
+      h.deps.readLive = async () => {
+        reads += 1;
+        const doc = reads % 2 === 0 ? changed : h.a0;
+        return { status: 'ok', doc, sha256: codexAuthFileSha256(codexAuthFileText(doc)), inode: reads };
+      };
+      assert.deepEqual(await reconcileActiveCodexLive(h.deps), { status: 'deferred', reason: 'codex-writing' });
+      assert.equal(reads, 12);
+    } finally { h.close(); }
+  });
+
+  it('lock order is consume → switch → auth (lock spy) and lockTimeoutMs reaches all three', async () => {
+    const h = activeHarness();
+    try {
+      delete (h.deps as Partial<CodexActiveDeps>).withLocks;
+      h.deps.lockTimeoutMs = 37;
+      h.deps.authLockOptions = { home: h.root, timeoutMs: 19, retryMinMs: 1, retryJitterMs: 0 };
+      const locks = codexLockPaths(h.store.dbPath, A);
+      let checked = false;
+      h.deps.hooks = { afterLock: () => {
+        checked = true;
+        assert.equal(existsSync(locks.consume), true);
+        assert.equal(existsSync(locks.switch), true);
+        assert.equal(existsSync(codexAuthLockDir(h.deps.authLockOptions)), true);
+      } };
+      assert.equal((await reconcileActiveCodexLive(h.deps)).status, 'noop');
+      assert.equal(checked, true);
+    } finally { h.close(); }
+  });
+
+  it('a same-account rewrite retaining refresh_token but changing other auth bytes is external and records its post-publish observation', async () => {
+    const h = activeHarness();
+    try {
+      const a1 = { ...document(NOW + 120_000, 'fixture-access-a1'), tokens: {
+        ...document(NOW + 120_000, 'fixture-access-a1').tokens, refresh_token: 'fixture-refresh-a1',
+      } };
+      const rewrite = { ...a1, last_refresh: '2026-10-31T12:00:00.000Z' };
+      importActiveCodexSlot(a1, { store: h.store, keychain: h.keychain, now: () => NOW + 1 });
+      let reads = 0;
+      const readLive = h.deps.readLive;
+      h.deps.readLive = async () => {
+        reads += 1;
+        return reads === 3
+          ? { status: 'ok' as const, doc: rewrite, sha256: codexAuthFileSha256(codexAuthFileText(rewrite)), inode: 999 }
+          : readLive();
+      };
+      assert.deepEqual(await reconcileActiveCodexLive(h.deps), {
+        status: 'posted-live-external', document: a1, action: 'noop', cause: 'republish',
+      });
+      const history = readCodexSwitchHistory(h.store.dbPath, { journalDir: h.deps.journalDir });
+      assert.equal(history.observations.at(-1)?.lineageFp, codexFingerprint(rewrite));
+      assert.equal(history.observations.at(-1)?.by, 'qlb-active');
+    } finally { h.close(); }
+  });
+
+  it('a wiped post-publish read records a qlb-active observation and an observation write failure is transient', async () => {
+    const h = activeHarness();
+    try {
+      const a1 = { ...document(NOW + 120_000, 'fixture-access-a1'), tokens: {
+        ...document(NOW + 120_000, 'fixture-access-a1').tokens, refresh_token: 'fixture-refresh-a1',
+      } };
+      importActiveCodexSlot(a1, { store: h.store, keychain: h.keychain, now: () => NOW + 1 });
+      let reads = 0;
+      const readLive = h.deps.readLive;
+      h.deps.readLive = async () => ++reads === 3
+        ? { status: 'wiped' as const, error: { ok: false as const, error: 'tokens-empty' as const, status: 'wiped' as const } }
+        : readLive();
+      assert.deepEqual(await reconcileActiveCodexLive(h.deps), {
+        status: 'posted-live-unverified', document: a1, read: 'wiped', cause: 'republish',
+      });
+      assert.equal(readCodexSwitchHistory(h.store.dbPath, { journalDir: h.deps.journalDir }).observations.at(-1)?.identity, null);
+    } finally { h.close(); }
+  });
+
+  it('an observation write failure after a settled republish is transient', async () => {
+    const h = activeHarness();
+    try {
+      const a1 = { ...document(NOW + 120_000, 'fixture-access-a1'), tokens: {
+        ...document(NOW + 120_000, 'fixture-access-a1').tokens, refresh_token: 'fixture-refresh-a1',
+      } };
+      importActiveCodexSlot(a1, { store: h.store, keychain: h.keychain, now: () => NOW + 1 });
+      const record = h.store.recordCodexObservation.bind(h.store);
+      let writes = 0;
+      h.store.recordCodexObservation = (input) => {
+        writes += 1;
+        if (writes === 2) throw new Error('fixture observation write failure');
+        return record(input);
+      };
+      assert.deepEqual(await reconcileActiveCodexLive(h.deps), { status: 'transient', reason: 'observation-write-failed' });
+    } finally { h.close(); }
+  });
+
+  it('non-observation errors from observeLiveCodex propagate', async () => {
+    const h = activeHarness();
+    try {
+      h.deps.slots = { ...h.deps.slots, readSlot: () => { throw new Error('fixture slot read failure'); } } as never;
+      await assert.rejects(reconcileActiveCodexLive(h.deps), /fixture slot read failure/);
+    } finally { h.close(); }
+  });
+
+  it('no token value reaches an outcome’s reason, the fence message pass-through, a stash path or a thrown error', async () => {
+    const h = activeHarness();
+    try {
+      const tokenValues = [h.a0.tokens.access_token, h.a0.tokens.refresh_token, h.a0.tokens.id_token];
+      h.store.setConfig('codex.recoveryFence', JSON.stringify({
+        v: 1, switchId: 1, attempt: 'fixture-fence', from: B, to: C, publishedAt: NOW,
+        reason: 'target-changed', involvedAccounts: [B, C], since: NOW,
+      }));
+      const fenced = await reconcileActiveCodexLive(h.deps);
+      assert.equal(fenced.status, 'fenced');
+      const rendered = JSON.stringify(fenced);
+      for (const token of tokenValues) assert.equal(rendered.includes(token), false);
+
+      h.store.setConfig('codex.recoveryFence', '');
+      await assert.rejects(listOrFail(async () => { throw new Error('fixture failure'); })(), (error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        return tokenValues.every((token) => !message.includes(token));
       });
     } finally { h.close(); }
   });

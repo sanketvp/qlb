@@ -1,10 +1,10 @@
 import { createHash } from 'node:crypto';
 
-import { accessExpiry, codexFingerprint, codexIdentity, needsRefresh, type CodexAuthDocument, type CodexAuthStableWithStatResult } from './codex-auth';
+import { accessExpiry, codexAuthFileSha256, codexAuthFileText, codexFingerprint, codexIdentity, needsRefresh, type CodexAuthDocument, type CodexAuthStableWithStatResult } from './codex-auth';
 import { ClaudeCodeLockTimeout, CodexAuthLockCompromised, ProperLockfileCompromised, withCodexAuthLock } from './cc-locks';
 import { withCodexConsumeThenSwitchLocks } from './codex-consume';
 import { codexIdentityParts, holderSets, readCodexSwitchHistory, renewers, type CodexProcess } from './codex-sessions';
-import { CodexLiveChanged, codexRecoveryFenceState, observeLiveCodex, type CodexRecoveryFenceState, type CodexSwitchDeps } from './codex-switch';
+import { CodexLiveChanged, attributeForPhase, codexRecoveryFenceState, observeLiveCodex, type CodexPhaseAttribution, type CodexRecoveryFenceState, type CodexSwitchDeps } from './codex-switch';
 
 const NEAR_EXPIRY_MS = 5 * 60_000;
 
@@ -58,7 +58,7 @@ export type CodexActiveRefusalReason =
   | 'slot-split'
   | 'switch-in-flight';
 
-export type CodexActiveAction = 'noop' | 'adopt' | 'republish-slot';
+export type CodexActiveAction = CodexPhaseAttribution['action'];
 export type CodexLiveWriteCause = 'post' | 'republish';
 export type CodexLiveReadFailure = 'unstable' | 'missing' | 'wiped' | 'unreadable';
 export type CodexRepublishResult = 'ok' | 'unwritten' | 'external' | 'unverified';
@@ -161,7 +161,7 @@ export async function withActiveCodexLocks<T>(
 ): Promise<T> {
   if (deps.withLocks) return deps.withLocks(accountId, fn);
   return withCodexConsumeThenSwitchLocks(deps.dbPath, accountId, (consumeLock, switchLock) =>
-    withCodexAuthLock({ ...deps.authLockOptions, timeoutMs: deps.lockTimeoutMs }, (authLock) => fn(() => {
+    withCodexAuthLock({ ...deps.authLockOptions, ...(deps.lockTimeoutMs === undefined ? {} : { timeoutMs: deps.lockTimeoutMs }) }, (authLock) => fn(() => {
       consumeLock.assertNotCompromised();
       switchLock.assertNotCompromised();
       authLock.assertNotCompromised();
@@ -180,9 +180,7 @@ function classifySettledRepublish(
   postPublish: CodexAuthStableWithStatResult | undefined,
 ): SettledRepublishClass {
   if (!postPublish || postPublish.status !== 'ok') return 'unverified';
-  if (codexIdentity(postPublish.doc) !== codexIdentity(outgoing)
-    || codexFingerprint(postPublish.doc) !== codexFingerprint(outgoing)) return 'external';
-  return 'ok';
+  return postPublish.sha256 === codexAuthFileSha256(codexAuthFileText(outgoing)) ? 'ok' : 'external';
 }
 
 function republishFailureOutcome(
@@ -201,11 +199,55 @@ function uniquePids(...groups: CodexProcess[][]): number[] {
   return [...new Set(groups.flatMap((group) => group.map(({ pid }) => pid)))];
 }
 
-function isActiveFence(
+function isFence(
   fence: CodexRecoveryFenceState,
-  accountId: string,
 ): fence is Extract<CodexRecoveryFenceState, { state: 'fenced' }> {
-  return fence.state === 'fenced' && (fence.accounts === '*' || fence.accounts.has(accountId));
+  return fence.state === 'fenced';
+}
+
+/**
+ * The stable post-publish read is a fresh live observation, rather than a
+ * confirmation of the observation made before the rename.  A write failure is
+ * intentionally distinguishable from failures in the surrounding observation.
+ */
+function recordSettledRepublishObservation(
+  deps: CodexActiveDeps,
+  assertHeld: () => void,
+  postPublish: CodexAuthStableWithStatResult | undefined,
+): boolean {
+  if (!postPublish || (postPublish.status !== 'ok' && postPublish.status !== 'wiped')) return true;
+  assertHeld();
+  const input = postPublish.status === 'ok'
+    ? { identity: codexIdentity(postPublish.doc), lineageFp: codexFingerprint(postPublish.doc), by: 'qlb-active' as const, now: deps.now() }
+    : { identity: null, lineageFp: null, by: 'qlb-active' as const, now: deps.now() };
+  try {
+    deps.store.recordCodexObservation(input);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function attributeSettledExternal(
+  deps: CodexActiveDeps,
+  assertHeld: () => void,
+  accountId: string,
+  live: CodexAuthDocument,
+): Promise<CodexActiveAction> {
+  const slot = deps.store.getCodexSlot(accountId);
+  if (!slot) throw new Error('Codex active slot disappeared during post-publish verification');
+  const document = deps.slots.readSlot(accountId, { fresh: true }).document;
+  const attribution = await attributeForPhase({ assertHeld }, 'post', {
+    store: deps.store,
+    keychain: deps.keychain,
+    slot: { accountId, document, fingerprint: slot.fingerprint ?? undefined },
+    activeSlotId: deps.store.getCodexActiveLogin() ?? undefined,
+    activeSetBy: 'adopt',
+    live,
+    l40Verified: deps.store.getConfig('codex.l40Verified') === '1',
+    now: deps.now,
+  });
+  return attribution.action;
 }
 
 /**
@@ -236,7 +278,7 @@ export async function reconcileActiveCodexLive(deps: CodexActiveDeps): Promise<C
     return await withActiveCodexLocks(deps, active, async (assertHeld) => {
       await deps.hooks?.afterLock?.();
       const fence = codexRecoveryFenceState(deps.journalDir, deps.store);
-      if (isActiveFence(fence, active)) {
+      if (isFence(fence)) {
         return { status: 'fenced', reason: fence.reason, message: fence.message, accounts: fence.accounts };
       }
 
@@ -263,23 +305,33 @@ export async function reconcileActiveCodexLive(deps: CodexActiveDeps): Promise<C
         } catch (error) {
           if (error instanceof CodexProcessCheckFailed) return { status: 'refused', reason: 'codex-process-check-failed' };
           if (error instanceof CodexLiveChanged) continue;
-          // The observation has already crossed the write-eligible boundary;
-          // preserve the slot and make its failed persistence retryable.
-          return { status: 'transient', reason: 'observation-write-failed' };
+          throw error;
         }
       }
       if (!settled) return { status: 'deferred', reason: 'codex-writing' };
 
       // I4 is evaluated before any use of settled.outgoing beyond this
       // classification: its stat pair can describe an external successor.
-      const republish = settled.action === 'republish-slot'
-        || (settled.action === 'drift' && settled.disposition === 'republish-slot')
-        ? classifySettledRepublish(settled.outgoing.document, settled.postPublish)
+      const isRepublish = settled.action === 'republish-slot'
+        || (settled.action === 'drift' && settled.disposition === 'republish-slot');
+      const postPublish = 'postPublish' in settled ? settled.postPublish : undefined;
+      if (isRepublish && !recordSettledRepublishObservation(deps, assertHeld, postPublish)) {
+        return { status: 'transient', reason: 'observation-write-failed' };
+      }
+      const republish = isRepublish
+        ? classifySettledRepublish(settled.outgoing.document, postPublish)
         : undefined;
 
+      const externalAction = republish === 'external' && postPublish?.status === 'ok'
+        ? await attributeSettledExternal(deps, assertHeld,
+          settled.action === 'drift' ? settled.accountId : active, postPublish.doc)
+        : undefined;
       const activeAfterObserve = deps.store.getCodexActiveLogin();
       if (settled.action === 'drift' || activeAfterObserve !== active || codexIdentity(settled.outgoing.document) !== active) {
         return { status: 'drift', accountId: activeAfterObserve, ...(republish === undefined ? {} : { republish }) };
+      }
+      if (externalAction !== undefined) {
+        return { status: 'posted-live-external', document: settled.outgoing.document, action: externalAction, cause: 'republish' };
       }
       await deps.hooks?.afterObserve?.();
 
@@ -294,7 +346,7 @@ export async function reconcileActiveCodexLive(deps: CodexActiveDeps): Promise<C
       const held = pids.length > 0;
 
       if (settled.action === 'republish-slot') {
-        if (republish !== 'ok') return republishFailureOutcome(settled.outgoing.document, republish!, settled.postPublish);
+        if (republish !== 'ok') return republishFailureOutcome(settled.outgoing.document, republish!, postPublish);
         return held
           ? { status: 'held', pids, document: settled.outgoing.document, action: 'republish-slot' }
           : { status: 'republished', document: settled.outgoing.document };
