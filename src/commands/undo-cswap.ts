@@ -387,8 +387,11 @@ function defaultMoveQlbPlist(ctx: CommandContext): { ok: boolean; code?: string 
   }
 }
 
-/** The terminal row must stay fenced until its C-swap restore succeeds. */
-type TerminalHandBack = {
+/**
+ * The terminal row must stay fenced until its C-swap restore succeeds.
+ * @internal Test seam for a stale terminal-phase observation.
+ */
+export type TerminalHandBack = {
   state: 'rolled-back' | 'aborted';
   lifecycleId: number;
   restorePending: boolean;
@@ -424,7 +427,7 @@ function markRestorePending(ctx: CommandContext, final: TerminalHandBack): Termi
     const row = db.prepare('SELECT note FROM lifecycle WHERE id = ? AND state = ?')
       .get(final.lifecycleId, final.state) as { note?: unknown } | undefined;
     const previousNote = typeof row?.note === 'string' ? row.note : row?.note === null ? null : undefined;
-    if (previousNote !== undefined && previousNote !== CUTOVER_BEGIN_IN_PROGRESS && previousNote !== RETIREMENT_IN_PROGRESS) {
+    if (previousNote !== undefined && previousNote !== CUTOVER_BEGIN_IN_PROGRESS && previousNote !== RETIREMENT_IN_PROGRESS && previousNote !== CSWAP_RESTORE_PENDING) {
       const changed = db.prepare(`UPDATE lifecycle SET note = ?
         WHERE id = ? AND state = ? AND note IS ?`)
         .run(CSWAP_RESTORE_PENDING, final.lifecycleId, final.state, previousNote).changes;
@@ -435,7 +438,8 @@ function markRestorePending(ctx: CommandContext, final: TerminalHandBack): Termi
   try { throw new CswapUndoFinalizationError(phase(store).state); } finally { store.close(); }
 }
 
-async function restoreCswap(ctx: CommandContext, dependencies: UndoCswapCommandDependencies, final: TerminalHandBack): Promise<void> {
+/** @internal test seam for restore fencing races. */
+export async function restoreCswap(ctx: CommandContext, dependencies: UndoCswapCommandDependencies, final: TerminalHandBack): Promise<void> {
   const pending = markRestorePending(ctx, final);
   const restored = await (dependencies.cswapAgent ?? defaultCswapAgent(ctx)).restorePlist();
   if (!restored.ok) throw new CswapUndoFinalizationError(pending.state, restored.code);
