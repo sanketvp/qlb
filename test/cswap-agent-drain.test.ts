@@ -370,6 +370,47 @@ test('launchctlCswapAgent issues bootout, disable and plist move with the exact 
   ]);
 });
 
+test('restorePlist is repeat-safe when bootstrap reports an already-loaded service', async () => {
+  const root = '/fixture-home';
+  const source = `${root}/Library/LaunchAgents/com.cswap.auto.plist`;
+  const backup = `${root}/.qlb/backups/cswap-plist/com.cswap.auto.plist`;
+  let backupExists = true;
+  const calls: string[][] = [];
+  const agent = launchctlCswapAgent({
+    exec: (_file, args) => {
+      calls.push([...args]);
+      if (args[0] === 'bootstrap' && !backupExists) throw new Error('service already loaded');
+    },
+    fs: {
+      exists: (path) => path === backup ? backupExists : path === source ? !backupExists : false,
+      mkdir: () => {}, readFile: () => JSON.stringify({ sequence: [] }),
+      rename: () => { backupExists = false; },
+    },
+    uid: () => 501, home: () => root, qlbHome: () => root,
+    tryAcquireLock: () => () => {}, kill: () => {}, now: () => 0, sleep: async () => {},
+  });
+
+  assert.deepEqual(await agent.restorePlist(), { ok: true });
+  assert.deepEqual(await agent.restorePlist(), { ok: true });
+  assert.deepEqual(calls, [
+    ['enable', 'gui/501/com.cswap.auto'],
+    ['bootstrap', 'gui/501', source],
+    ['enable', 'gui/501/com.cswap.auto'],
+    ['bootstrap', 'gui/501', source],
+  ]);
+});
+
+test('restorePlist reports a terminal code when neither plist copy exists', async () => {
+  const agent = launchctlCswapAgent({
+    exec: () => { throw new Error('must not invoke launchctl'); },
+    fs: { exists: () => false, mkdir: () => {}, readFile: () => JSON.stringify({ sequence: [] }), rename: () => {} },
+    uid: () => 501, home: () => '/fixture-home', qlbHome: () => '/fixture-qlb-home',
+    tryAcquireLock: () => () => {}, kill: () => {}, now: () => 0, sleep: async () => {},
+  });
+
+  assert.deepEqual(await agent.restorePlist(), { ok: false, code: 'cswap-plist-missing' });
+});
+
 test('an already booted-out agent is treated as drained', async () => {
   const agent = launchctlCswapAgent({
     exec: (file) => {

@@ -264,6 +264,11 @@ function alreadyInactive(error: unknown): boolean {
   return /(?:not found|no such process|could not find service|already disabled)/i.test(message);
 }
 
+function alreadyLoaded(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : '';
+  return /already loaded/i.test(message);
+}
+
 function operation(
   deps: LaunchctlCswapAgentDependencies,
   args: string[],
@@ -322,14 +327,20 @@ export function launchctlCswapAgent(deps: LaunchctlCswapAgentDependencies): Cswa
           deps.fs.mkdir(join(deps.home(), 'Library', 'LaunchAgents'));
           deps.fs.rename(target, source);
         } else if (!deps.fs.exists(source)) {
-          return { ok: false, code: 'cswap-plist-unavailable' };
+          return { ok: false, code: 'cswap-plist-missing' };
         }
       } catch (error) {
         return { ok: false, code: commandErrorCode(error) };
       }
       const enable = operation(deps, ['enable', `${domain()}/${CSWAP_AGENT_LABEL}`], true);
       if (!enable.ok) return enable;
-      return operation(deps, ['bootstrap', domain(), source]);
+      try {
+        deps.exec('/bin/launchctl', ['bootstrap', domain(), source]);
+        return { ok: true };
+      } catch (error) {
+        // A repeated resume finds the plist live and its service already loaded.
+        return alreadyLoaded(error) ? { ok: true } : { ok: false, code: commandErrorCode(error) };
+      }
     },
     drain: async () => cooperativeDrain({
       listProcesses: () => deps.listProcesses ? deps.listProcesses() : listCswapProcesses(),

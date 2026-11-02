@@ -381,12 +381,11 @@ function defaultMoveQlbPlist(ctx: CommandContext): { ok: boolean; code?: string 
   }
 }
 
-/** The terminal row may need a restore, and its new durable fence may need clearing. */
+/** The terminal row must stay fenced until its C-swap restore succeeds. */
 type TerminalHandBack = {
   state: 'rolled-back' | 'aborted';
   lifecycleId: number;
   restorePending: boolean;
-  needsRestore: boolean;
 };
 
 class CswapUndoFinalizationError extends Error {
@@ -403,11 +402,25 @@ function clearRestorePending(ctx: CommandContext): void {
   } finally { store.close(); }
 }
 
+function markRestorePending(ctx: CommandContext, final: TerminalHandBack): TerminalHandBack {
+  if (final.restorePending) return final;
+  // Legacy terminal rows predate the restore fence. Claim the row with a CAS
+  // before touching C-swap so lifecycle close cannot race the restoration.
+  const db = openStoreConnection(ctx.config.dbPath);
+  try {
+    const changed = db.prepare("UPDATE lifecycle SET note = ? WHERE id = ? AND state = ? AND note IS NULL")
+      .run(CSWAP_RESTORE_PENDING, final.lifecycleId, final.state).changes;
+    if (changed === 1) return { ...final, restorePending: true };
+  } finally { db.close(); }
+  const store = openStore(ctx.config.dbPath);
+  try { throw new CswapUndoFinalizationError(phase(store).state); } finally { store.close(); }
+}
+
 async function restoreCswap(ctx: CommandContext, dependencies: UndoCswapCommandDependencies, final: TerminalHandBack): Promise<void> {
+  const pending = markRestorePending(ctx, final);
   const restored = await (dependencies.cswapAgent ?? defaultCswapAgent(ctx)).restorePlist();
-  if (!restored.ok) throw new CswapUndoFinalizationError(final.state, restored.code);
-  // Only new rows have this fence. Legacy terminal rows had no note to clear.
-  if (final.restorePending) clearRestorePending(ctx);
+  if (!restored.ok) throw new CswapUndoFinalizationError(pending.state, restored.code);
+  clearRestorePending(ctx);
 }
 
 async function finishHandBack(
@@ -428,16 +441,10 @@ async function finishHandBack(
     // terminal row that only the restore-only resume path can finish.
     const transitioned = transition(store, target, now, CSWAP_RESTORE_PENDING);
     if (!transitioned.ok) throw new CswapUndoFinalizationError(phase(store).state);
-    final = { state: target, lifecycleId: transitioned.row!.id, restorePending: true, needsRestore: true };
+    final = { state: target, lifecycleId: transitioned.row!.id, restorePending: true };
   } finally { store.close(); }
   await restoreCswap(ctx, dependencies, final);
-  return { ...final, restorePending: false, needsRestore: false };
-}
-
-function legacyCswapRestoreNeeded(ctx: CommandContext): boolean {
-  const source = join(ctx.home, 'Library', 'LaunchAgents', 'com.cswap.auto.plist');
-  const backup = join(ctx.home, '.qlb', 'backups', 'cswap-plist', 'com.cswap.auto.plist');
-  return existsSync(backup) || !existsSync(source);
+  return { ...final, restorePending: false };
 }
 
 function terminalHandBackPhase(ctx: CommandContext): TerminalHandBack | null {
@@ -450,9 +457,6 @@ function terminalHandBackPhase(ctx: CommandContext): TerminalHandBack | null {
       state: current.state,
       lifecycleId: current.id,
       restorePending,
-      // Rows written before G18 had no durable note. Detect their unfinished
-      // C-swap hand-back from the plist locations before allowing resume to end.
-      needsRestore: restorePending || (current.note === null && legacyCswapRestoreNeeded(ctx)),
     };
   } finally { store.close(); }
 }
@@ -507,7 +511,9 @@ export async function runUndoCswapCommand(
     // Its one resume must not fence, drain, write slots, or move QLB again.
     const terminal = options.resume ? terminalHandBackPhase(ctx) : null;
     if (terminal) {
-      if (terminal.needsRestore) await restoreCswap(ctx, dependencies, terminal);
+      // A terminal row may be from before the durable fence existed. Restore
+      // every terminal resume; restorePlist is deliberately repeat-safe.
+      await restoreCswap(ctx, dependencies, terminal);
       reportComplete(ctx, options, null, 0, terminal.state, terminal.lifecycleId);
       return 0;
     }
@@ -577,6 +583,10 @@ export async function runUndoCswapCommand(
       return 1;
     }
     if (error instanceof CswapUndoFinalizationError) {
+      if (error.code === 'cswap-plist-missing') {
+        ctx.stderr('qlb undo cswap: hand-back failed: cswap-plist-missing; reinstall C-swap by hand');
+        return 1;
+      }
       const detail = error.code ? `: ${error.code}` : '';
       ctx.stderr(`qlb undo cswap: hand-back failed${detail}; state=${error.state}; run qlb undo cswap --resume`);
       return 1;

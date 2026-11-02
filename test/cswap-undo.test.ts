@@ -9,7 +9,7 @@ import { defaultHeldLocks, isQlbProcessCommand, runUndoCswapCommand } from '../s
 import { discoverCommands, resolveCommand, type CommandContext } from '../src/registry';
 import { openStore, openStoreConnection } from '../src/store';
 import { runExecutingCommand } from '../src/cli';
-import { beginCutover, closeLifecycle, phase, transition } from '../src/lifecycle';
+import { CSWAP_RESTORE_PENDING, beginCutover, closeLifecycle, phase, transition } from '../src/lifecycle';
 import { recordStash } from '../src/unclaimed-index';
 import { productionTryAcquireLock } from '../src/cswap-agent';
 
@@ -744,7 +744,7 @@ describe('qlb undo cswap hand-back', () => {
     } finally { close(f); }
   });
 
-  it('resume restores a legacy terminal row with C-swap still in its backup before close', async () => {
+  it('resume restores a legacy terminal row with its plist already live before allowing close', async () => {
     const f = fixture();
     try {
       beginUndo(f);
@@ -755,28 +755,72 @@ describe('qlb undo cswap hand-back', () => {
         assert.equal(transition(store, 'rolled-back', 30).ok, true);
         lifecycleId = phase(store).id;
       } finally { store.close(); }
+      // The old row has no fence and its plist is already live, but its agent
+      // is unloaded. Resume must still run the injected restore operation.
       const source = join(f.home, 'Library', 'LaunchAgents', 'com.cswap.auto.plist');
-      const backup = join(f.home, '.qlb', 'backups', 'cswap-plist', 'com.cswap.auto.plist');
-      assert.ok(source.startsWith(`${f.home}/`));
-      assert.ok(backup.startsWith(`${f.home}/`));
       mkdirSync(dirname(source), { recursive: true });
-      mkdirSync(dirname(backup), { recursive: true });
-      writeFileSync(backup, 'fixture C-swap plist');
+      writeFileSync(source, 'fixture C-swap plist');
       let restores = 0;
       assert.equal(await undo(f, {
         cswapAgent: { restorePlist: () => {
           restores += 1;
-          renameSync(backup, source);
+          const duringRestore = openStore(f.dbPath);
+          try {
+            assert.equal(phase(duringRestore).note, CSWAP_RESTORE_PENDING);
+            assert.equal(closeLifecycle(duringRestore, lifecycleId, 'fixture', 40).code, CSWAP_RESTORE_PENDING);
+          } finally { duringRestore.close(); }
           return { ok: true };
         } },
       }, ['--resume']), 0);
       assert.equal(restores, 1);
-      assert.equal(existsSync(backup), false);
-      assert.equal(readFileSync(source, 'utf8'), 'fixture C-swap plist');
       const completed = openStore(f.dbPath);
       try {
         assert.equal(closeLifecycle(completed, lifecycleId, 'fixture', 40).ok, true);
       } finally { completed.close(); }
+    } finally { close(f); }
+  });
+
+  it('keeps a newly written restore fence when a legacy terminal resume fails', async () => {
+    const f = fixture();
+    try {
+      beginUndo(f);
+      const store = openStore(f.dbPath);
+      let lifecycleId = 0;
+      try {
+        assert.equal(transition(store, 'undoing', 20).ok, true);
+        assert.equal(transition(store, 'rolled-back', 30).ok, true);
+        lifecycleId = phase(store).id;
+      } finally { store.close(); }
+      assert.equal(await undo(f, {
+        cswapAgent: { restorePlist: () => {
+          const duringRestore = openStore(f.dbPath);
+          try {
+            assert.equal(closeLifecycle(duringRestore, lifecycleId, 'fixture', 40).code, CSWAP_RESTORE_PENDING);
+          } finally { duringRestore.close(); }
+          return { ok: false, code: 'fixture-restore-failed' };
+        } },
+      }, ['--resume']), 1);
+      const pending = openStore(f.dbPath);
+      try { assert.equal(phase(pending).note, CSWAP_RESTORE_PENDING); } finally { pending.close(); }
+    } finally { close(f); }
+  });
+
+  it('reports a missing C-swap plist without a resume hint and keeps the fence', async () => {
+    const f = fixture();
+    try {
+      beginUndo(f);
+      const store = openStore(f.dbPath);
+      try {
+        assert.equal(transition(store, 'undoing', 20).ok, true);
+        assert.equal(transition(store, 'rolled-back', 30).ok, true);
+      } finally { store.close(); }
+      assert.equal(await undo(f, {
+        cswapAgent: { restorePlist: () => ({ ok: false, code: 'cswap-plist-missing' }) },
+      }, ['--resume']), 1);
+      assert.match(f.output.at(-1)!, /cswap-plist-missing; reinstall C-swap by hand/);
+      assert.doesNotMatch(f.output.at(-1)!, /undo cswap --resume/);
+      const pending = openStore(f.dbPath);
+      try { assert.equal(phase(pending).note, CSWAP_RESTORE_PENDING); } finally { pending.close(); }
     } finally { close(f); }
   });
 
