@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { describe, it } from 'node:test';
 
-import { defaultHeldLocks, isQlbProcessCommand, runUndoCswapCommand } from '../src/commands/undo-cswap';
+import { defaultHeldLocks, isQlbProcessCommand, restoreCswap, runUndoCswapCommand, type TerminalHandBack } from '../src/commands/undo-cswap';
 import { discoverCommands, resolveCommand, type CommandContext } from '../src/registry';
 import { openStore, openStoreConnection } from '../src/store';
 import { runExecutingCommand } from '../src/cli';
@@ -811,6 +811,32 @@ describe('qlb undo cswap hand-back', () => {
         assert.equal(phase(completed).id, lifecycleId);
         assert.equal(phase(completed).note, 'cutover begin failed: drain-timeout');
       } finally { completed.close(); }
+    } finally { close(f); }
+  });
+
+  it('refuses to reclaim a restore fence observed after a stale terminal phase read', async () => {
+    const f = fixture();
+    try {
+      beginUndo(f);
+      const store = openStore(f.dbPath);
+      let staleTerminal: TerminalHandBack;
+      try {
+        assert.equal(transition(store, 'undoing', 20).ok, true);
+        assert.equal(transition(store, 'rolled-back', 30).ok, true);
+        const current = phase(store);
+        staleTerminal = { state: 'rolled-back', lifecycleId: current.id, restorePending: false, previousNote: current.note };
+      } finally { store.close(); }
+      const raced = openStoreConnection(f.dbPath);
+      try { raced.prepare('UPDATE lifecycle SET note = ? WHERE id = ?').run(CSWAP_RESTORE_PENDING, staleTerminal!.lifecycleId); } finally { raced.close(); }
+
+      let restores = 0;
+      await assert.rejects(
+        restoreCswap(context(f), { cswapAgent: { restorePlist: () => { restores += 1; return { ok: true }; } } }, staleTerminal!),
+        { name: 'CswapUndoFinalizationError', message: 'hand-back finalization failed' },
+      );
+      assert.equal(restores, 0);
+      const pending = openStore(f.dbPath);
+      try { assert.equal(phase(pending).note, CSWAP_RESTORE_PENDING); } finally { pending.close(); }
     } finally { close(f); }
   });
 
