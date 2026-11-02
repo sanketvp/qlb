@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
-import { runAuto } from '../src/auto';
+import { AutoAdmissionRefused, runAuto } from '../src/auto';
 import { runAutoCommand } from '../src/commands/auto';
 import { claudePaths } from '../src/cc-paths';
 import { claudeSwitchJournalPath, createClaudeSwitchJournal, type ClaudeSwitchJournal } from '../src/cc-switch-journal';
@@ -89,6 +89,33 @@ function close(root: string): void {
 }
 
 describe('qlb auto --once (G12)', () => {
+  it('returns exit 3 for lock and admission refusals', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-auto-agent-refusal-'));
+    const home = join(root, 'home');
+    const context = (stderr: string[]): CommandContext => ({
+      stdout: () => undefined, stderr: (line) => stderr.push(line), env: testEnv(home),
+      config: {} as CommandContext['config'], loadConfig: () => { throw new Error('not used'); }, home,
+      registerSecret: () => undefined, deliverSecret: () => undefined, knownSecrets: () => [],
+    });
+    try {
+      const lockStderr: string[] = [];
+      assert.equal(await runAutoCommand(['--once'], context(lockStderr), {
+        acquireFlock: async () => null,
+        runAuto: async () => { throw new Error('runAuto must not run without a lock'); },
+      }), 3);
+      assert.deepEqual(lockStderr, ['qlb auto: auto-already-running']);
+
+      const admissionStderr: string[] = [];
+      assert.equal(await runAutoCommand(['--once', '--dry-run'], context(admissionStderr), {
+        acquireFlock: async () => { throw new Error('dry run must not lock'); },
+        runAuto: async () => { throw new AutoAdmissionRefused('cutover-not-ready'); },
+      }), 3);
+      assert.deepEqual(admissionStderr, ['qlb auto: refused: cutover-not-ready']);
+    } finally {
+      close(root);
+    }
+  });
+
   it('a second loop exits 3', async () => {
     const root = mkdtempSync(join(tmpdir(), 'qlb-auto-lock-'));
     const home = join(root, 'home');

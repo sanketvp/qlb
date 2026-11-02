@@ -1,4 +1,4 @@
-import { mkdirSync } from 'node:fs';
+import { chmodSync, closeSync, constants, fchmodSync, lstatSync, mkdirSync, openSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
 import { AutoAdmissionRefused, runAuto, type AutoDependencies, type AutoRunResult, type RunAutoOptions } from '../auto';
@@ -19,7 +19,9 @@ const defaultDeps: AutoCommandDeps = { runAuto, acquireFlock: productionTryAcqui
 function parse(args: string[]): AutoCommandOptions | null {
   const known = new Set(['--once', '--dry-run', '--json']);
   if (args.some((arg) => !known.has(arg)) || new Set(args).size !== args.length) return null;
-  return { once: args.includes('--once'), dryRun: args.includes('--dry-run'), json: args.includes('--json') };
+  return {
+    once: args.includes('--once'), dryRun: args.includes('--dry-run'), json: args.includes('--json'),
+  };
 }
 
 function xmlText(value: string): string {
@@ -50,6 +52,8 @@ export function renderAutoLaunchAgent(nodePath: string, home: string, cliPath: s
     <key>SuccessfulExit</key>
     <false/>
   </dict>
+  <key>ThrottleInterval</key>
+  <integer>60</integer>
   <key>ExitTimeOut</key>
   <integer>60</integer>
   <key>StandardOutPath</key>
@@ -68,9 +72,39 @@ function launchAgentPath(ctx: CommandContext): string {
 
 function installAutoLaunchAgent(ctx: CommandContext): string {
   const target = launchAgentPath(ctx);
-  const home = ctx.env.QLB_TEST_MODE === '1' && ctx.env.QLB_HOME ? ctx.env.QLB_HOME : ctx.home;
-  const cliPath = join(home, '.qlb', 'app', 'current', 'dist', 'cli.js');
+  const home = ctx.env.QLB_TEST_MODE === '1' ? ctx.env.QLB_HOME! : ctx.home;
+  const qlbDir = join(home, '.qlb');
+  const cliPath = ctx.env.QLB_TEST_MODE === '1'
+    ? join(home, 'app', 'current', 'dist', 'cli.js')
+    : join(qlbDir, 'app', 'current', 'dist', 'cli.js');
+  const logPath = join(qlbDir, 'auto.log');
   mkdirSync(dirname(target), { recursive: true, mode: 0o700 });
+  mkdirSync(qlbDir, { recursive: true, mode: 0o700 });
+  chmodSync(qlbDir, 0o700);
+  try {
+    let descriptor: number;
+    try {
+      const logStats = lstatSync(logPath);
+      if (!logStats.isFile()) throw new Error('auto.log must be a regular file');
+      descriptor = openSync(logPath, constants.O_WRONLY | constants.O_APPEND | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+      try {
+        fchmodSync(descriptor, 0o600);
+      } finally {
+        closeSync(descriptor);
+      }
+    } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      descriptor = openSync(
+        logPath,
+        constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_APPEND | constants.O_NOFOLLOW,
+        0o600,
+      );
+      closeSync(descriptor);
+    }
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`unable to secure auto.log: ${detail}`);
+  }
   atomicWriteText(target, renderAutoLaunchAgent(process.execPath, home, cliPath), { mode: 0o600 });
   return target;
 }
@@ -92,9 +126,19 @@ export async function runAutoCommand(
       ctx.stderr('usage: qlb auto install-agent');
       return 2;
     }
-    const target = installAutoLaunchAgent(ctx);
-    ctx.stdout(`installed ${target}`);
-    return 0;
+    if (ctx.env.QLB_TEST_MODE === '1' && !ctx.env.QLB_HOME) {
+      ctx.stderr('qlb auto install-agent: QLB_HOME is required when QLB_TEST_MODE=1');
+      return 2;
+    }
+    try {
+      const target = installAutoLaunchAgent(ctx);
+      ctx.stdout(`installed ${target}`);
+      return 0;
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      ctx.stderr(`qlb auto install-agent: ${detail}`);
+      return 1;
+    }
   }
 
   const options = parse(args);
