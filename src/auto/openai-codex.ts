@@ -75,15 +75,24 @@ function refreshReceipt(outcome: CodexActiveOutcome): CodexAutoRefreshResult {
     : { status: outcome.status };
 }
 
-function configNumber(store: PollStore, key: string): number | undefined {
-  const value = store.getConfig(key);
-  if (value === null || value === '') return undefined;
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : undefined;
+interface IdleHold {
+  accountId: string;
+  sinceMs: number;
 }
 
-function setIdleHold(store: PollStore, since: number | undefined): void {
-  store.setConfig(`${AUTO_PREFIX}idleHoldSince`, since === undefined ? '' : String(since));
+function idleHold(store: PollStore, accountId: string): number | undefined {
+  const value = store.getConfig(`${AUTO_PREFIX}idleHoldSince`);
+  if (value === null || value === '') return undefined;
+  try {
+    const parsed = JSON.parse(value) as Partial<IdleHold>;
+    return parsed.accountId === accountId && Number.isFinite(parsed.sinceMs) ? parsed.sinceMs : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function setIdleHold(store: PollStore, accountId: string, since: number | undefined): void {
+  store.setConfig(`${AUTO_PREFIX}idleHoldSince`, since === undefined ? '' : JSON.stringify({ accountId, sinceMs: since }));
 }
 
 function recent429(row: UsagePollRow | undefined, nowS: number): boolean {
@@ -124,12 +133,24 @@ export async function pollOpenAiCodex(deps: CodexAutoDeps): Promise<CodexAutoPol
   const nowMs = deps.now();
   const nowS = Math.floor(nowMs / 1000);
   const polls = store.listUsagePolls(PROVIDER);
-  if (dueCandidate([accountId], polls, nowS) !== accountId) {
-    return { accountId, readings: currentReadings(store, accountId), activeCredentialExpired: false, idleHoldSinceMs: null };
-  }
-
   const previous = usageFrom(currentReadings(store, accountId));
-  const record = (status: string, readings?: Record<string, BucketReading>, http429 = false, retryAfterS?: number): void => {
+  const base = (activeCredentialExpired = false, idleHoldSinceMs: number | null = null, refresh?: CodexActiveOutcome): CodexAutoPollResult => ({
+    accountId,
+    readings: currentReadings(store, accountId),
+    activeCredentialExpired,
+    idleHoldSinceMs,
+    ...(refresh ? { refresh: refreshReceipt(refresh) } : {}),
+  });
+  const stillOwns = async (): Promise<{ doc: CodexAuthDocument } | null> => {
+    if (store.getCodexActiveLogin() !== accountId) return null;
+    const current = await deps.active.readLive();
+    // readLive is external state: ownership must be checked again afterwards.
+    if (store.getCodexActiveLogin() !== accountId || current.status !== 'ok' || codexIdentity(current.doc) !== accountId) return null;
+    return { doc: current.doc };
+  };
+  const record = async (status: string, readings?: Record<string, BucketReading>, http429 = false, retryAfterS?: number): Promise<boolean> => {
+    // Do not let a changed active account receive this tick's poll state.
+    if (!(await stillOwns())) return false;
     store.recordUsagePollResult(PROVIDER, accountId, { attemptedAt: nowS, status, readings, http429, retryAfterS });
     const settings = store.getAutoswitchSettings();
     const [nextDueAt, pollIntervalS] = planAfterFetch({
@@ -145,37 +166,44 @@ export async function pollOpenAiCodex(deps: CodexAutoDeps): Promise<CodexAutoPol
       rng: deps.rng,
     });
     store.writeUsagePollPlans(PROVIDER, { [accountId]: { nextDueAt, pollIntervalS } });
+    return true;
   };
-  const stopped = (refresh: CodexActiveOutcome): CodexAutoPollResult | undefined => {
+  const setHold = async (since: number | undefined): Promise<boolean> => {
+    if (!(await stillOwns())) return false;
+    setIdleHold(store, accountId, since);
+    return true;
+  };
+  const setRenewerLease = async (heldUntilS: number | null): Promise<boolean> => {
+    if (!(await stillOwns())) return false;
+    store.setUsagePollHeldUntil(PROVIDER, accountId, heldUntilS);
+    return true;
+  };
+  const stopped = async (refresh: CodexActiveOutcome): Promise<CodexAutoPollResult | undefined> => {
     const receipt = refreshReceipt(refresh);
     if (refresh.status === 'held') {
       const interval = polls[accountId]?.pollIntervalS ?? 60;
-      store.setUsagePollHeldUntil(PROVIDER, accountId, nowS + Math.max(60, interval));
+      if (!(await setRenewerLease(nowS + Math.max(60, interval)))) return base(false, null, refresh);
       logRefreshStop(deps, refresh);
-      return { accountId, readings: currentReadings(store, accountId), activeCredentialExpired: false, idleHoldSinceMs: null, refresh: receipt };
+      return { ...base(), refresh: receipt };
     }
     if (refresh.status === 'codex-won') {
-      const readings = currentReadings(store, accountId);
-      record('codex-won', readings);
-      return { accountId, readings, activeCredentialExpired: false, idleHoldSinceMs: null, refresh: receipt };
+      // This is not a fetch. Recording without readings preserves that distinction.
+      if (!(await record('codex-won'))) return base(false, null, refresh);
+      return { ...base(), refresh: receipt };
     }
     if (shouldStopAfterRefresh(refresh)) {
       logRefreshStop(deps, refresh);
-      return { accountId, readings: currentReadings(store, accountId), activeCredentialExpired: false, idleHoldSinceMs: null, refresh: receipt };
+      return { ...base(), refresh: receipt };
     }
     return undefined;
   };
-  const stillOwns = async (): Promise<{ doc: CodexAuthDocument } | null> => {
-    if (store.getCodexActiveLogin() !== accountId) return null;
-    const current = await deps.active.readLive();
-    if (current.status !== 'ok' || codexIdentity(current.doc) !== accountId) return null;
-    return { doc: current.doc };
-  };
 
+  // Credential maintenance deliberately precedes the usage schedule gate.
   let live = await stillOwns();
-  if (!live) return { accountId, readings: currentReadings(store, accountId), activeCredentialExpired: false, idleHoldSinceMs: null };
+  if (!live) return base();
+  let expiry = classifyActiveCodexExpiry(live.doc, nowMs);
+  let heldSinceMs = idleHold(store, accountId);
 
-  const expiry = classifyActiveCodexExpiry(live.doc, nowMs);
   if (expiry.state === 'expired') {
     let renewers: unknown[];
     try {
@@ -183,30 +211,46 @@ export async function pollOpenAiCodex(deps: CodexAutoDeps): Promise<CodexAutoPol
     } catch (error) {
       if (error instanceof CodexProcessCheckFailed) {
         try { deps.active.autoLog?.('codex:poll-ended status=refused reason=codex-process-check-failed'); } catch { /* diagnostic only */ }
-        return { accountId, readings: currentReadings(store, accountId), activeCredentialExpired: false, idleHoldSinceMs: null };
+        // The credential is known expired even though discovery failed; retain its own hold.
+        return base(true, heldSinceMs ?? null);
       }
       throw error;
     }
-    if (renewers.length > 0) {
-      const idleHoldSinceMs = configNumber(store, `${AUTO_PREFIX}idleHoldSince`) ?? nowMs;
-      setIdleHold(store, idleHoldSinceMs);
-      record('usage-unknown');
-      return { accountId, readings: {}, activeCredentialExpired: true, idleHoldSinceMs };
+    // activeRenewers is external state too. Do not mutate after an account switch.
+    live = await stillOwns();
+    if (!live) return base();
+    expiry = classifyActiveCodexExpiry(live.doc, nowMs);
+    if (renewers.length > 0 && expiry.state === 'expired') {
+      heldSinceMs ??= nowMs;
+      if (!(await setHold(heldSinceMs))) return base();
+      if (dueCandidate([accountId], polls, nowS) === accountId) {
+        if (!(await record('usage-unknown'))) return base();
+        return { accountId, readings: {}, activeCredentialExpired: true, idleHoldSinceMs: heldSinceMs };
+      }
+      // Usage backoff never suppresses the active expired/renewer safety signal.
+      return base(true, heldSinceMs);
     }
   }
-  setIdleHold(store, undefined);
-  store.setUsagePollHeldUntil(PROVIDER, accountId, null);
+
+  // A healthy/new active credential supersedes any hold (including another account's).
+  if (!(await setHold(undefined))) return base();
+  heldSinceMs = undefined;
+  if (!(await setRenewerLease(null))) return base();
 
   let refresh: CodexActiveOutcome | undefined;
   if (isDueForRefresh(live.doc, nowMs, 'scheduled')) {
     const trigger = expiry.state === 'near-expiry' || expiry.state === 'expired' ? 'proactive-expiry' : 'scheduled';
     refresh = await (deps.refreshActive ?? refreshActiveCodexLogin)(deps.active, { trigger });
     const afterRefresh = await stillOwns();
-    if (!afterRefresh) return { accountId, readings: currentReadings(store, accountId), activeCredentialExpired: false, idleHoldSinceMs: null, refresh: refreshReceipt(refresh) };
+    if (!afterRefresh) return base(false, null, refresh);
     live = afterRefresh;
-    const result = stopped(refresh);
+    expiry = classifyActiveCodexExpiry(live.doc, nowMs);
+    const result = await stopped(refresh);
     if (result) return result;
   }
+
+  // The schedule/backoff gate applies only to the outbound usage probe.
+  if (dueCandidate([accountId], polls, nowS) !== accountId) return base(expiry.state === 'expired', heldSinceMs ?? null, refresh);
 
   const usage = await (deps.probeUsage ?? probeCodexUsage)({ auth: live.doc, authPath: deps.active.authPath });
   // A 401 is authoritative even when a passive rollout snapshot has windows.
@@ -215,26 +259,33 @@ export async function pollOpenAiCodex(deps: CodexAutoDeps): Promise<CodexAutoPol
       trigger: 'unauthorized', accessFp: accessFingerprint(live.doc),
     });
     const afterRefresh = await stillOwns();
-    if (!afterRefresh) return { accountId, readings: currentReadings(store, accountId), activeCredentialExpired: false, idleHoldSinceMs: null, refresh: refreshReceipt(refresh) };
-    const result = stopped(refresh);
+    if (!afterRefresh) return base(false, null, refresh);
+    const result = await stopped(refresh);
     if (result) return result;
-    record('usage-unknown');
-    return { accountId, readings: currentReadings(store, accountId), activeCredentialExpired: false, idleHoldSinceMs: null, refresh: refreshReceipt(refresh) };
+    if (!(await record('usage-unknown'))) return base(false, null, refresh);
+    return base(false, null, refresh);
   }
 
-  // A switch/adopt may finish while the HTTP request is pending.  The response
+  // A switch/adopt may finish while the HTTP request is pending. The response
   // has no safe owner then, so do not mutate either account's poll state.
-  if (!(await stillOwns())) {
-    return { accountId, readings: currentReadings(store, accountId), activeCredentialExpired: false, idleHoldSinceMs: null, ...(refresh ? { refresh: refreshReceipt(refresh) } : {}) };
+  if (!(await stillOwns())) return base(false, null, refresh);
+  // A rate limit remains a rate limit even if rollout snapshots provide readings.
+  if (usage.status === 429) {
+    const readings = usage.windows && usage.windows.length > 0 ? readingsFrom(usage, nowMs) : undefined;
+    // Preserve rate-limit backoff; rollout readings are advisory for this tick only.
+    if (!(await record('http-429', undefined, true, usage.retryAfterS))) return base(false, null, refresh);
+    return readings
+      ? { accountId, readings, activeCredentialExpired: false, idleHoldSinceMs: null, ...(refresh ? { refresh: refreshReceipt(refresh) } : {}) }
+      : base(false, null, refresh);
   }
   if (usage.windows && usage.windows.length > 0) {
     const readings = readingsFrom(usage, nowMs);
-    record('ok', readings);
+    if (!(await record('ok', readings))) return base(false, null, refresh);
     return { accountId, readings, activeCredentialExpired: false, idleHoldSinceMs: null, ...(refresh ? { refresh: refreshReceipt(refresh) } : {}) };
   }
 
-  record(usage.status === 429 ? 'http-429' : 'usage-unknown', undefined, usage.status === 429, usage.retryAfterS);
-  return { accountId, readings: currentReadings(store, accountId), activeCredentialExpired: false, idleHoldSinceMs: null, ...(refresh ? { refresh: refreshReceipt(refresh) } : {}) };
+  if (!(await record('usage-unknown', undefined, false, usage.retryAfterS))) return base(false, null, refresh);
+  return base(false, null, refresh);
 }
 
 /** C8 maintenance ordering: settle recovery, consume due watches, then poll. */

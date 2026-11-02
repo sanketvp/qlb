@@ -96,11 +96,11 @@ function jwt(exp: number, claims: Record<string, unknown> = {}): string {
   return `eyJhbGciOiJub25lIn0.${Buffer.from(JSON.stringify({ exp, ...claims })).toString('base64url')}.sig`;
 }
 
-function document(expiresAt: number, lastRefresh = NOW): CodexAuthDocument {
+function document(expiresAt: number, lastRefresh = NOW, account = 'account-a'): CodexAuthDocument {
   return {
     tokens: {
-      id_token: jwt(Math.floor(expiresAt / 1_000), { 'https://api.openai.com/auth': { chatgpt_user_id: 'user-a', chatgpt_account_id: 'account-a' } }), access_token: jwt(Math.floor(expiresAt / 1_000)),
-      refresh_token: 'fixture-refresh-token', account_id: 'account-a',
+      id_token: jwt(Math.floor(expiresAt / 1_000), { 'https://api.openai.com/auth': { chatgpt_user_id: 'user-a', chatgpt_account_id: account } }), access_token: jwt(Math.floor(expiresAt / 1_000)),
+      refresh_token: 'fixture-refresh-token', account_id: account,
     },
     last_refresh: new Date(lastRefresh).toISOString(),
   };
@@ -238,6 +238,7 @@ describe('C8 Codex poll and refresh', () => {
 
     assert.equal(result.refresh?.status, 'codex-won');
     assert.equal(h.records.at(-1)?.result.status, 'codex-won');
+    assert.equal(h.records.at(-1)?.result.readings, undefined);
   });
 
   it('reconciles recovery and runs due watches on every tick', async () => {
@@ -316,15 +317,80 @@ describe('C8 Codex poll and refresh', () => {
     });
   }
 
-  it('treats a process-list failure as no action this tick', async () => {
+  it('reports an expired credential and preserves its hold when the process check fails', async () => {
     const h = autoHarness({
       activeRenewers: async () => { throw new CodexProcessCheckFailed(); },
+    });
+    h.configs['auto.openai-codex.idleHoldSince'] = JSON.stringify({ accountId: 'user-a:account-a', sinceMs: NOW - 1_000 });
+    h.setLiveDocument(document(NOW - 1));
+
+    const result = await codexAutoTick(h.deps);
+
+    assert.equal(h.records.length, 0);
+    assert.equal(result.activeCredentialExpired, true);
+    assert.equal(result.idleHoldSinceMs, NOW - 1_000);
+  });
+
+  it('maintains an expired renewer hold on a not-due tick without recording or probing', async () => {
+    let probes = 0;
+    const h = autoHarness({
+      activeRenewers: async () => [{ pid: 1 }],
+      probeUsage: async () => { probes += 1; return { status: 200, source: 'wham', keys: [] }; },
+    });
+    h.setLiveDocument(document(NOW - 1));
+    const first = await codexAutoTick(h.deps);
+    const records = h.records.length;
+
+    const second = await codexAutoTick(h.deps);
+
+    assert.equal(probes, 0);
+    assert.equal(h.records.length, records);
+    assert.equal(second.activeCredentialExpired, true);
+    assert.equal(second.idleHoldSinceMs, first.idleHoldSinceMs);
+  });
+
+  it('runs proactive credential refresh despite a not-due usage poll', async () => {
+    let probes = 0;
+    const calls: CodexActiveInput[] = [];
+    const h = autoHarness({
+      probeUsage: async () => { probes += 1; return { status: 200, source: 'wham', keys: [] }; },
+      refreshActive: async (_deps, input) => { calls.push(input); return { status: 'noop', document: document(NOW + 10 * 60_000) }; },
+    });
+    h.polls['user-a:account-a'] = { nextDueAt: NOW / 1_000 + 60, pollIntervalS: 300 };
+    h.setLiveDocument(document(NOW + 3 * 60_000));
+
+    await codexAutoTick(h.deps);
+
+    assert.deepEqual(calls, [{ trigger: 'proactive-expiry' }]);
+    assert.equal(probes, 0);
+  });
+
+  it('does not write after renewer discovery observes a different active account', async () => {
+    const h = autoHarness({
+      activeRenewers: async () => {
+        h.setActiveId('user-a:account-b');
+        return [{ pid: 1 }];
+      },
     });
     h.setLiveDocument(document(NOW - 1));
 
     await codexAutoTick(h.deps);
 
     assert.equal(h.records.length, 0);
+    assert.equal(h.configs['auto.openai-codex.idleHoldSince'], undefined);
+  });
+
+  it('does not write when the active account changes while reading live auth', async () => {
+    const h = autoHarness();
+    h.deps.active.readLive = async () => {
+      h.setActiveId('user-a:account-b');
+      return { status: 'ok', doc: document(NOW + 10 * 60_000), sha256: 'fixture', inode: 1 };
+    };
+
+    await codexAutoTick(h.deps);
+
+    assert.equal(h.records.length, 0);
+    assert.equal(h.configs['auto.openai-codex.idleHoldSince'], undefined);
   });
 
   it('retains the idle hold start across ticks until the engine cap expires', async () => {
@@ -363,6 +429,36 @@ describe('C8 Codex poll and refresh', () => {
     assert.equal(h.records.at(-1)?.result.http429, true);
     assert.equal(h.records.at(-1)?.result.retryAfterS, 120);
     assert.ok((h.polls['user-a:account-a']?.backoffUntil ?? 0) > NOW / 1000);
+  });
+
+  it('keeps rollout readings but records a 429 outcome and Retry-After backoff', async () => {
+    const h = autoHarness({
+      probeUsage: async () => ({
+        status: 429, source: 'codex-rollout', keys: ['rate_limits'], retryAfterS: 120,
+        windows: [{ bucket: 'primary', usedPct: 20 }],
+      }),
+    });
+
+    const result = await codexAutoTick(h.deps);
+
+    assert.equal(result.readings.primary?.usedPct, 20);
+    assert.equal(h.records.at(-1)?.result.status, 'http-429');
+    assert.equal(h.records.at(-1)?.result.http429, true);
+    assert.equal(h.records.at(-1)?.result.retryAfterS, 120);
+    assert.equal(h.records.at(-1)?.result.readings, undefined);
+  });
+
+  it('replaces another account’s persisted idle hold instead of inheriting it', async () => {
+    const h = autoHarness({ activeRenewers: async () => [{ pid: 1 }] });
+    h.configs['auto.openai-codex.idleHoldSince'] = JSON.stringify({ accountId: 'user-a:account-a', sinceMs: NOW - 60_000 });
+    h.setActiveId('user-a:account-b');
+    h.setLiveDocument(document(NOW - 1, NOW, 'account-b'));
+
+    const result = await codexAutoTick(h.deps);
+
+    assert.equal(result.activeCredentialExpired, true);
+    assert.equal(result.idleHoldSinceMs, NOW);
+    assert.deepEqual(JSON.parse(h.configs['auto.openai-codex.idleHoldSince'] ?? '{}'), { accountId: 'user-a:account-b', sinceMs: NOW });
   });
 
   it('updates only held_until when storing a Codex renewer hold', () => {

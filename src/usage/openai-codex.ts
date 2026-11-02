@@ -260,9 +260,13 @@ export async function probeCodexUsage(deps: CodexUsageProbeDeps = {}): Promise<C
   for (const snapshot of rollouts) {
     if (snapshot.accountId !== activeAccountId) continue;
     const windows = rolloutWindows(snapshot);
-    if (windows) return { status: last.status, source: 'codex-rollout', keys: ['rate_limits'], windows, retryAfterS: retryAfterS(last) };
+    if (windows) {
+      const retryAfter = retryAfterS(last);
+      return { status: last.status, source: 'codex-rollout', keys: ['rate_limits'], windows, ...(retryAfter === undefined ? {} : { retryAfterS: retryAfter }) };
+    }
   }
-  return { status: last.status, source: 'unknown', keys: last.keys, retryAfterS: retryAfterS(last) };
+  const retryAfter = retryAfterS(last);
+  return { status: last.status, source: 'unknown', keys: last.keys, ...(retryAfter === undefined ? {} : { retryAfterS: retryAfter }) };
 }
 
 /** Registry-loaded usage adapter entry point used by later provider bindings. */
