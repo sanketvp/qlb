@@ -24,26 +24,29 @@ import { defaultConfig } from '../src/config';
 import { openStore } from '../src/store';
 
 describe('Swift Keychain helper write path', () => {
-  it('sends a large payload only on helper stdin', () => {
-    const calls: Array<{ file: string; args: string[]; input?: string }> = [];
+  it('writes a large payload through security with both required trusted applications', () => {
+    const calls: Array<{ file: string; args: string[]; input?: string; stdio?: unknown }> = [];
     const exec: ExecFileSyncFn = (file, args, options) => {
-      calls.push({ file, args: [...args], input: typeof options?.input === 'string' ? options.input : undefined });
+      calls.push({
+        file, args: [...args], input: typeof options?.input === 'string' ? options.input : undefined,
+        stdio: options?.stdio,
+      });
       return '';
     };
     const payload = 'x'.repeat(16 * 1024);
-    const backend = new MacosKeychainBackend({
-      execFileSync: markFakeExecutor(exec),
-      helperPath: '/fixture/qlb-keychain-helper',
-    });
+    const helper = '/fixture/qlb-keychain-helper';
+    const backend = new MacosKeychainBackend({ execFileSync: markFakeExecutor(exec), helperPath: helper });
 
     backend.setSync('qlb-test-helper', 'qlb', payload);
 
-    assert.deepEqual(calls, [{
-      file: '/fixture/qlb-keychain-helper',
-      args: ['set', 'qlb-test-helper', 'qlb'],
-      input: payload,
-    }]);
-    assert.equal(calls[0]!.args.some((arg) => arg.includes(payload)), false);
+    assert.equal(calls[0]?.file, '/usr/bin/security');
+    assert.deepEqual(calls[0]?.args, [
+      'add-generic-password', '-U', '-a', 'qlb', '-s', 'qlb-test-helper',
+      '-X', Buffer.from(payload, 'utf8').toString('hex'),
+      '-T', helper, '-T', '/usr/bin/security',
+    ]);
+    assert.equal(calls[0]?.input, undefined);
+    assert.equal(calls[0]?.stdio, 'ignore');
   });
 
   it('uses the repository helper build location by default', () => {

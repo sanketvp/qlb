@@ -387,13 +387,17 @@ export class MacosKeychainBackend extends SyncCredentialBackend {
     const helper = this.helperPath ?? defaultKeychainHelperPath();
     this.assertHelperUsable();
     try {
-      // Every write, including test doubles, follows the helper's stdin protocol.
-      this.exec(helper, ['set', service, account], {
-        encoding: 'utf8', input: jsonValue, timeout: MACOS_SECURITY_TIMEOUT_MS,
+      // Use security directly so writes retain its apple-tool: Keychain permission.
+      this.exec(MACOS_SECURITY_BIN, [
+        'add-generic-password', '-U', '-a', account, '-s', service,
+        '-X', Buffer.from(jsonValue, 'utf8').toString('hex'),
+        '-T', helper, '-T', MACOS_SECURITY_BIN,
+      ], {
+        encoding: 'utf8', stdio: 'ignore', timeout: MACOS_SECURITY_TIMEOUT_MS,
       });
     } catch (err) {
       if (err instanceof KeychainHelperMissingError) throw err;
-      if (isSecurityTimeout(err)) throw securityTimeoutError('keychain helper set');
+      if (isSecurityTimeout(err)) throw securityTimeoutError('add-generic-password');
       // Child-process errors can include stdin payload material, so never keep
       // their message.
       throw new Error(`keychain set failed for service=${service} account=${account}`);
