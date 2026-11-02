@@ -1,14 +1,19 @@
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import test from 'node:test';
 
-import { cooperativeDrain, launchctlCswapAgent, runRetirementDrain, type CswapAgent, type LaunchctlCswapAgentDependencies } from '../src/cswap-agent';
+import { cooperativeDrain, launchctlCswapAgent, productionTryAcquireLock, runRetirementDrain, type CswapAgent, type LaunchctlCswapAgentDependencies } from '../src/cswap-agent';
 import { listCswapProcesses, listCswapProcessesToSignal } from '../src/cswap-processes';
 import { cutoverBegin } from '../src/commands/cutover';
 import { phase } from '../src/lifecycle';
 import { openStore } from '../src/store';
 import { join } from 'node:path';
-import { mkdtempSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+
+function helperEnv(home: string): NodeJS.ProcessEnv {
+  return { QLB_TEST_MODE: '1', QLB_HOME: home, HOME: home };
+}
 
 function fixtureStore() {
   return openStore(join(mkdtempSync(join(tmpdir(), 'qlb-cswap-drain-')), 'qlb.db'));
@@ -31,6 +36,44 @@ function drainingAgent(drain: CswapAgent['drain']): { agent: CswapAgent; calls: 
 function assertNoSignalBeforeConsumeLock(killsWhenConsumeLockBecameAvailable: number | undefined): void {
   assert.equal(killsWhenConsumeLockBecameAvailable, 0, 'QLB must not signal while the fixture consume lock is held');
 }
+
+test('production flock waits for a complete newline-delimited helper status', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'qlb-flock-split-status-'));
+  const lockDirectory = join(root, 'locks');
+  mkdirSync(lockDirectory, { recursive: true });
+  try {
+    const lease = await productionTryAcquireLock(join(lockDirectory, 'auto.lock'), (_lockPath, cwd) => {
+      return spawn(process.execPath, ['-e', [
+        "process.stdout.write('loc');",
+        "setImmediate(() => { process.stdout.write('ked\\n'); setImmediate(() => process.exit(0)); });",
+      ].join(' ')], { cwd, env: helperEnv(root), stdio: ['pipe', 'pipe', 'ignore'] });
+    });
+    assert.ok(lease, 'a status split across stdout chunks must still acquire the lease');
+    await lease();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('production flock exposes helper loss synchronously and through its lost promise', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'qlb-flock-lost-'));
+  const lockDirectory = join(root, 'locks');
+  mkdirSync(lockDirectory, { recursive: true });
+  try {
+    const lease = await productionTryAcquireLock(join(lockDirectory, 'auto.lock'), (_lockPath, cwd) => {
+      return spawn(process.execPath, ['-e', "process.stdout.write('locked\\n'); setImmediate(() => process.exit(17));"], {
+        cwd, env: helperEnv(root), stdio: ['pipe', 'pipe', 'ignore'],
+      });
+    });
+    if (lease === null || lease.lost === undefined) throw new Error('expected a lease with loss reporting');
+    const lost = await lease.lost;
+    assert.match(lost.message, /flock helper exited unexpectedly/);
+    assert.equal(lease.isLost?.(), lost);
+    await lease();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test('waits for a held C-swap consume lock before signaling, then drains cooperatively', async () => {
   let now = 0;

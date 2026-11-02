@@ -1,6 +1,6 @@
-import { execFileSync, spawn } from 'node:child_process';
+import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, renameSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 
 import { listCswapProcesses, listCswapProcessesToSignal } from './cswap-processes';
 
@@ -14,7 +14,12 @@ export interface CswapProcess {
   pid: number;
 }
 
-export type CswapLockRelease = () => void | Promise<void>;
+export type CswapLockRelease = (() => void | Promise<void>) & {
+  /** Resolves if the owned flock helper disappears before release. */
+  lost?: Promise<Error>;
+  /** Synchronously reports a helper loss observed by its process event handler. */
+  isLost?: () => Error | undefined;
+};
 
 /** Every effect used by the S57 drain is supplied by its caller. */
 export interface CswapDrainOptions {
@@ -339,36 +344,83 @@ const FLOCK_HELPER = [
   'os.close(fd)',
 ].join('\n');
 
+export type FlockHelperSpawner = (lockPath: string, lockDirectory: string) => ChildProcess;
+
+function spawnFlockHelper(lockPath: string, lockDirectory: string): ChildProcess {
+  return spawn('/usr/bin/python3', ['-I', '-c', FLOCK_HELPER, lockPath], {
+    cwd: lockDirectory,
+    stdio: ['pipe', 'pipe', 'ignore'],
+  });
+}
+
 /** Keeps a real fcntl flock in a tiny helper process until its release seam. */
-export function productionTryAcquireLock(path: string): Promise<CswapLockRelease | null> {
-  return new Promise((resolve, reject) => {
-    const child = spawn('/usr/bin/python3', ['-c', FLOCK_HELPER, path], { stdio: ['pipe', 'pipe', 'ignore'] });
+export function productionTryAcquireLock(path: string, startHelper: FlockHelperSpawner = spawnFlockHelper): Promise<CswapLockRelease | null> {
+  const lockPath = resolve(path);
+  const lockDirectory = dirname(lockPath);
+  return new Promise((resolveLock, rejectLock) => {
+    const child = startHelper(lockPath, lockDirectory);
+    const stdout = child.stdout;
+    const stdin = child.stdin;
+    if (stdout === null || stdin === null) {
+      rejectLock(new Error('fcntl flock helper must use piped stdin and stdout'));
+      return;
+    }
     let state: 'pending' | 'locked' | 'busy' = 'pending';
+    let response = '';
+    let releaseRequested = false;
     let released: Promise<void> | undefined;
+    let lostError: Error | undefined;
+    let notifyLost: (error: Error) => void = () => {};
+    const lost = new Promise<Error>((resolveLoss) => { notifyLost = resolveLoss; });
+    const markLost = (error: Error): void => {
+      if (lostError !== undefined) return;
+      lostError = error;
+      notifyLost(error);
+    };
     const closed = new Promise<void>((resolveClose, rejectClose) => {
-      child.once('error', rejectClose);
-      child.once('close', (code) => code === 0 ? resolveClose() : rejectClose(new Error('fcntl flock helper failed')));
+      child.once('error', (error) => {
+        if (state === 'locked') markLost(new Error(`fcntl flock helper exited unexpectedly (${error.message})`));
+        rejectClose(error);
+      });
+      child.once('close', (code, signal) => {
+        if (state === 'locked') {
+          if (!releaseRequested) markLost(new Error(`fcntl flock helper exited unexpectedly (${code ?? signal ?? 'unknown'})`));
+          resolveClose();
+        } else if (state === 'busy' || code === 0) {
+          resolveClose();
+        } else {
+          rejectClose(new Error('fcntl flock helper failed'));
+        }
+      });
     });
-    child.stdout.on('data', (chunk: Buffer) => {
-      const line = String(chunk).trim();
+    stdout.on('data', (chunk: Buffer) => {
       if (state !== 'pending') return;
-      if (line === 'busy') state = 'busy';
-      else if (line === 'locked') {
+      response += String(chunk);
+      const newline = response.indexOf('\n');
+      if (newline === -1) return;
+      const status = response.slice(0, newline);
+      if (status === 'busy') state = 'busy';
+      else if (status === 'locked') {
         state = 'locked';
-        resolve(() => {
+        const release = Object.assign(() => {
           if (!released) {
-            child.stdin.end();
-            released = closed;
+            releaseRequested = true;
+            if (child.exitCode !== null || child.signalCode !== null) released = Promise.resolve();
+            else {
+              stdin.end();
+              released = closed.catch(() => undefined);
+            }
           }
           return released;
-        });
+        }, { lost, isLost: () => lostError });
+        resolveLock(release);
       }
     });
     closed.then(() => {
-      if (state === 'busy') resolve(null);
-      else if (state === 'pending') reject(new Error('fcntl flock helper failed'));
+      if (state === 'busy') resolveLock(null);
+      else if (state === 'pending') rejectLock(new Error('fcntl flock helper failed'));
     }, (error) => {
-      if (state !== 'locked') reject(error);
+      if (state !== 'locked') rejectLock(error);
     });
   });
 }

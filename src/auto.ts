@@ -1,5 +1,7 @@
+import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { pathToFileURL } from 'node:url';
 
 import { buildUsageRequest, type HttpRequestDescription } from './anthropic-oauth';
 import { anthropicTick, pollAnthropic, type AnthropicPollDeps, type AnthropicTickDeps, type AnthropicTickResult } from './auto/anthropic';
@@ -74,6 +76,10 @@ export interface AutoDependencies {
   setTimeout?: (callback: () => void, ms: number) => ReturnType<typeof setTimeout>;
   clearTimeout?: (timer: ReturnType<typeof setTimeout>) => void;
   signals?: { on(signal: 'SIGTERM', listener: () => void): unknown; removeListener(signal: 'SIGTERM', listener: () => void): unknown };
+  /** Resolves when an owned external resource is lost, including during a running tick. */
+  stopWhen?: Promise<Error>;
+  /** Synchronously observes a loss so no new or switching tick can start after it. */
+  stopIf?: () => Error | undefined;
 }
 
 function redactedLog(log: (line: string) => void, line: string): void {
@@ -233,7 +239,13 @@ function readOnlySlots(db: DatabaseSync): Pick<ClaudeSlots, 'listSlots'> {
 }
 
 function productionDryBinding(config: QlbConfig, now: () => number): DryBinding {
-  const db = openStoreConnection(config.dbPath, true);
+  // SQLite may create -wal/-shm sidecars even for a read-only open. A live
+  // WAL is readable only with its shared-memory companion; otherwise immutable
+  // mode avoids creating the missing sidecar.
+  const connectionPath = existsSync(`${config.dbPath}-wal`) && existsSync(`${config.dbPath}-shm`)
+    ? config.dbPath
+    : `${pathToFileURL(config.dbPath).href}?immutable=1`;
+  const db = openStoreConnection(connectionPath, true);
   const store = readOnlyStore(db, config.dbPath);
   const slots = readOnlySlots(db);
   return {
@@ -282,10 +294,26 @@ export async function runAuto(options: RunAutoOptions = {}, dependencies: AutoDe
       wakeSleep = undefined;
     }
   };
+  let stopError: Error | undefined;
+  const observeStop = (): Error | undefined => {
+    const error = dependencies.stopIf?.();
+    if (error !== undefined) {
+      stopError ??= error;
+      onTerm();
+    }
+    return stopError;
+  };
+  dependencies.stopWhen?.then((error) => {
+    stopError ??= error;
+    onTerm();
+  });
   const signals = dependencies.signals ?? process;
   signals.on('SIGTERM', onTerm);
   try {
+    // Let an already-resolved stop promise run before the first loop iteration.
+    await Promise.resolve();
     do {
+      if (observeStop() !== undefined) break;
       try {
         const admission = (dependencies.assertAdmitted ?? assertAdmitted)(binding.store as Store, 'switch:auto');
         if (!admission.ok) throw new AutoAdmissionRefused(admission.code ?? 'not-admitted');
@@ -297,7 +325,10 @@ export async function runAuto(options: RunAutoOptions = {}, dependencies: AutoDe
           redactedLog(log, 'auto: stay(cswap-alive)');
         } else {
           await binding.reconcile();
+          if (observeStop() !== undefined) break;
           const accounts = await binding.poll();
+          // This is the final point before a tick that can switch credentials.
+          if (observeStop() !== undefined) break;
           const tick = await binding.tick(accounts);
           binding.store.setConfig('auto.heartbeatAt', String(now()));
           result.ticks += 1;
@@ -319,6 +350,7 @@ export async function runAuto(options: RunAutoOptions = {}, dependencies: AutoDe
         }, INTERVAL_MS) as ReturnType<typeof setTimeout>;
       });
     } while (!stopping);
+    if (stopError !== undefined) throw stopError;
     return result;
   } finally {
     signals.removeListener('SIGTERM', onTerm);
