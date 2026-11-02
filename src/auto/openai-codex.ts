@@ -84,8 +84,11 @@ function idleHold(store: PollStore, accountId: string): number | undefined {
   const value = store.getConfig(`${AUTO_PREFIX}idleHoldSince`);
   if (value === null || value === '') return undefined;
   try {
-    const parsed = JSON.parse(value) as Partial<IdleHold>;
-    return parsed.accountId === accountId && Number.isFinite(parsed.sinceMs) ? parsed.sinceMs : undefined;
+    const parsed: unknown = JSON.parse(value);
+    if (typeof parsed === 'number' && Number.isFinite(parsed)) return parsed;
+    if (typeof parsed !== 'object' || parsed === null) return undefined;
+    const hold = parsed as Partial<IdleHold>;
+    return hold.accountId === accountId && Number.isFinite(hold.sinceMs) ? hold.sinceMs : undefined;
   } catch {
     return undefined;
   }
@@ -235,7 +238,8 @@ export async function pollOpenAiCodex(deps: CodexAutoDeps): Promise<CodexAutoPol
   // A healthy/new active credential supersedes any hold (including another account's).
   if (!(await setHold(undefined))) return base();
   heldSinceMs = undefined;
-  if (!(await setRenewerLease(null))) return base();
+  // A live Codex renewer owns this lease until it expires or refresh sets a new one.
+  if ((polls[accountId]?.heldUntil ?? 0) <= nowS && !(await setRenewerLease(null))) return base();
 
   let refresh: CodexActiveOutcome | undefined;
   if (isDueForRefresh(live.doc, nowMs, 'scheduled')) {

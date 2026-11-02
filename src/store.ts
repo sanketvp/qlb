@@ -1816,7 +1816,14 @@ export class Store {
   recordUsagePollResult(provider: string, accountId: string, result: UsagePollResult): void {
     const status = redactSecrets(result.status, []);
     this.runImmediate(() => {
-      if (result.readings) {
+      if (result.status === 'codex-won') {
+        // A Codex holder refreshed the credential; this coordination receipt is neither a usage fetch nor a failure.
+        this.db.prepare(`INSERT INTO usage_polls (provider, account_id, last_attempt_at, last_status)
+          VALUES (?, ?, ?, ?)
+          ON CONFLICT(provider, account_id) DO UPDATE SET last_attempt_at = excluded.last_attempt_at,
+            last_status = excluded.last_status`)
+          .run(provider, accountId, result.attemptedAt, status);
+      } else if (result.readings) {
         for (const [bucket, reading] of Object.entries(result.readings)) this.upsertSnapStmt.run(
           accountId, bucket, reading.usedPct, reading.used ?? null, reading.limit ?? null,
           reading.remaining ?? null, reading.resetAt ?? null, reading.fetchedAt, reading.source, reading.confidence,
