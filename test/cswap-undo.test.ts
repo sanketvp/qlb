@@ -9,7 +9,15 @@ import { defaultHeldLocks, isQlbProcessCommand, runUndoCswapCommand } from '../s
 import { discoverCommands, resolveCommand, type CommandContext } from '../src/registry';
 import { openStore, openStoreConnection } from '../src/store';
 import { runExecutingCommand } from '../src/cli';
-import { CSWAP_RESTORE_PENDING, beginCutover, closeLifecycle, phase, transition } from '../src/lifecycle';
+import {
+  CSWAP_RESTORE_PENDING,
+  CUTOVER_BEGIN_IN_PROGRESS,
+  abortCutoverBegin,
+  beginCutover,
+  closeLifecycle,
+  phase,
+  transition,
+} from '../src/lifecycle';
 import { recordStash } from '../src/unclaimed-index';
 import { productionTryAcquireLock } from '../src/cswap-agent';
 
@@ -776,6 +784,32 @@ describe('qlb undo cswap hand-back', () => {
       const completed = openStore(f.dbPath);
       try {
         assert.equal(closeLifecycle(completed, lifecycleId, 'fixture', 40).ok, true);
+      } finally { completed.close(); }
+    } finally { close(f); }
+  });
+
+  it('resume restores an aborted cutover-begin failure and preserves its note', async () => {
+    const f = fixture();
+    try {
+      const store = openStore(f.dbPath);
+      let lifecycleId = 0;
+      try {
+        const begun = beginCutover(store, 1, CUTOVER_BEGIN_IN_PROGRESS);
+        assert.equal(abortCutoverBegin(store, begun.id, 'drain-timeout', 2).ok, true);
+        lifecycleId = phase(store).id;
+      } finally { store.close(); }
+
+      assert.equal(await undo(f, {
+        cswapAgent: { restorePlist: () => {
+          const duringRestore = openStore(f.dbPath);
+          try { assert.equal(phase(duringRestore).note, CSWAP_RESTORE_PENDING); } finally { duringRestore.close(); }
+          return { ok: true };
+        } },
+      }, ['--resume']), 0);
+      const completed = openStore(f.dbPath);
+      try {
+        assert.equal(phase(completed).id, lifecycleId);
+        assert.equal(phase(completed).note, 'cutover begin failed: drain-timeout');
       } finally { completed.close(); }
     } finally { close(f); }
   });

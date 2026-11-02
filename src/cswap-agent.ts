@@ -264,11 +264,6 @@ function alreadyInactive(error: unknown): boolean {
   return /(?:not found|no such process|could not find service|already disabled)/i.test(message);
 }
 
-function alreadyLoaded(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : '';
-  return /already loaded/i.test(message);
-}
-
 function operation(
   deps: LaunchctlCswapAgentDependencies,
   args: string[],
@@ -334,12 +329,16 @@ export function launchctlCswapAgent(deps: LaunchctlCswapAgentDependencies): Cswa
       }
       const enable = operation(deps, ['enable', `${domain()}/${CSWAP_AGENT_LABEL}`], true);
       if (!enable.ok) return enable;
+      // bootstrap reports an opaque EIO when an already-loaded job is supplied.
+      // Ask launchd directly instead of interpreting its error text.
+      if (inspectCswapAgent(deps) === 'loaded') return { ok: true };
       try {
         deps.exec('/bin/launchctl', ['bootstrap', domain(), source]);
         return { ok: true };
       } catch (error) {
-        // A repeated resume finds the plist live and its service already loaded.
-        return alreadyLoaded(error) ? { ok: true } : { ok: false, code: commandErrorCode(error) };
+        return inspectCswapAgent(deps) === 'loaded'
+          ? { ok: true }
+          : { ok: false, code: commandErrorCode(error) };
       }
     },
     drain: async () => cooperativeDrain({

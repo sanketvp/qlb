@@ -27,7 +27,13 @@ import { withUndoCapability } from '../keychain-allowlist';
 import { isSuccessor } from '../lineage-log';
 import { listUnclaimedKeychainServices, macosKeychainAccountName, platformKeychain } from '../keychain';
 import { listStashes } from '../unclaimed-index';
-import { CSWAP_RESTORE_PENDING, clearCswapRestorePending, phase, transition } from '../lifecycle';
+import {
+  CSWAP_RESTORE_PENDING,
+  CUTOVER_BEGIN_IN_PROGRESS,
+  RETIREMENT_IN_PROGRESS,
+  phase,
+  transition,
+} from '../lifecycle';
 import { openStoreConnection, openStore } from '../store';
 import type { CommandContext, CommandDefinition } from '../registry';
 
@@ -386,6 +392,8 @@ type TerminalHandBack = {
   state: 'rolled-back' | 'aborted';
   lifecycleId: number;
   restorePending: boolean;
+  /** Preserved across the in-process restore fence; pending rows from a prior process use null. */
+  previousNote: string | null;
 };
 
 class CswapUndoFinalizationError extends Error {
@@ -395,22 +403,33 @@ class CswapUndoFinalizationError extends Error {
   }
 }
 
-function clearRestorePending(ctx: CommandContext): void {
-  const store = openStore(ctx.config.dbPath);
+function clearRestorePending(ctx: CommandContext, pending: TerminalHandBack): void {
+  const db = openStoreConnection(ctx.config.dbPath);
   try {
-    if (!clearCswapRestorePending(store).ok) throw new CswapUndoFinalizationError(phase(store).state);
-  } finally { store.close(); }
+    const changed = db.prepare(`UPDATE lifecycle SET note = ?
+      WHERE id = ? AND state = ? AND note = ?`)
+      .run(pending.previousNote, pending.lifecycleId, pending.state, CSWAP_RESTORE_PENDING).changes;
+    if (changed === 1) return;
+  } finally { db.close(); }
+  const store = openStore(ctx.config.dbPath);
+  try { throw new CswapUndoFinalizationError(phase(store).state); } finally { store.close(); }
 }
 
 function markRestorePending(ctx: CommandContext, final: TerminalHandBack): TerminalHandBack {
   if (final.restorePending) return final;
-  // Legacy terminal rows predate the restore fence. Claim the row with a CAS
-  // before touching C-swap so lifecycle close cannot race the restoration.
+  // Legacy terminal rows predate the restore fence. Claim every non-fence note
+  // with a CAS before touching C-swap so lifecycle close cannot race restoration.
   const db = openStoreConnection(ctx.config.dbPath);
   try {
-    const changed = db.prepare("UPDATE lifecycle SET note = ? WHERE id = ? AND state = ? AND note IS NULL")
-      .run(CSWAP_RESTORE_PENDING, final.lifecycleId, final.state).changes;
-    if (changed === 1) return { ...final, restorePending: true };
+    const row = db.prepare('SELECT note FROM lifecycle WHERE id = ? AND state = ?')
+      .get(final.lifecycleId, final.state) as { note?: unknown } | undefined;
+    const previousNote = typeof row?.note === 'string' ? row.note : row?.note === null ? null : undefined;
+    if (previousNote !== undefined && previousNote !== CUTOVER_BEGIN_IN_PROGRESS && previousNote !== RETIREMENT_IN_PROGRESS) {
+      const changed = db.prepare(`UPDATE lifecycle SET note = ?
+        WHERE id = ? AND state = ? AND note IS ?`)
+        .run(CSWAP_RESTORE_PENDING, final.lifecycleId, final.state, previousNote).changes;
+      if (changed === 1) return { ...final, restorePending: true, previousNote };
+    }
   } finally { db.close(); }
   const store = openStore(ctx.config.dbPath);
   try { throw new CswapUndoFinalizationError(phase(store).state); } finally { store.close(); }
@@ -420,7 +439,7 @@ async function restoreCswap(ctx: CommandContext, dependencies: UndoCswapCommandD
   const pending = markRestorePending(ctx, final);
   const restored = await (dependencies.cswapAgent ?? defaultCswapAgent(ctx)).restorePlist();
   if (!restored.ok) throw new CswapUndoFinalizationError(pending.state, restored.code);
-  clearRestorePending(ctx);
+  clearRestorePending(ctx, pending);
 }
 
 async function finishHandBack(
@@ -441,7 +460,7 @@ async function finishHandBack(
     // terminal row that only the restore-only resume path can finish.
     const transitioned = transition(store, target, now, CSWAP_RESTORE_PENDING);
     if (!transitioned.ok) throw new CswapUndoFinalizationError(phase(store).state);
-    final = { state: target, lifecycleId: transitioned.row!.id, restorePending: true };
+    final = { state: target, lifecycleId: transitioned.row!.id, restorePending: true, previousNote: null };
   } finally { store.close(); }
   await restoreCswap(ctx, dependencies, final);
   return { ...final, restorePending: false };
@@ -457,6 +476,7 @@ function terminalHandBackPhase(ctx: CommandContext): TerminalHandBack | null {
       state: current.state,
       lifecycleId: current.id,
       restorePending,
+      previousNote: restorePending ? null : current.note,
     };
   } finally { store.close(); }
 }

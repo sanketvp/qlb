@@ -370,34 +370,64 @@ test('launchctlCswapAgent issues bootout, disable and plist move with the exact 
   ]);
 });
 
-test('restorePlist is repeat-safe when bootstrap reports an already-loaded service', async () => {
+test('restorePlist accepts a bootstrap EIO only when launchd reports the service loaded', async () => {
   const root = '/fixture-home';
   const source = `${root}/Library/LaunchAgents/com.cswap.auto.plist`;
-  const backup = `${root}/.qlb/backups/cswap-plist/com.cswap.auto.plist`;
-  let backupExists = true;
   const calls: string[][] = [];
+  let prints = 0;
   const agent = launchctlCswapAgent({
     exec: (_file, args) => {
       calls.push([...args]);
-      if (args[0] === 'bootstrap' && !backupExists) throw new Error('service already loaded');
+      if (args[0] === 'print' && ++prints === 1) throw Object.assign(new Error('Could not find service'), { code: 'ESRCH' });
+      if (args[0] === 'bootstrap') throw new Error('Bootstrap failed: 5: Input/output error');
     },
-    fs: {
-      exists: (path) => path === backup ? backupExists : path === source ? !backupExists : false,
-      mkdir: () => {}, readFile: () => JSON.stringify({ sequence: [] }),
-      rename: () => { backupExists = false; },
+    fs: { exists: (path) => path === source, mkdir: () => {}, readFile: () => JSON.stringify({ sequence: [] }), rename: () => {} },
+    uid: () => 501, home: () => root, qlbHome: () => root,
+    tryAcquireLock: () => () => {}, kill: () => {}, now: () => 0, sleep: async () => {},
+  });
+
+  assert.deepEqual(await agent.restorePlist(), { ok: true });
+  assert.deepEqual(calls, [
+    ['enable', 'gui/501/com.cswap.auto'],
+    ['print', 'gui/501/com.cswap.auto'],
+    ['bootstrap', 'gui/501', source],
+    ['print', 'gui/501/com.cswap.auto'],
+  ]);
+});
+
+test('restorePlist leaves bootstrap failure fatal when launchd reports the service not loaded', async () => {
+  const root = '/fixture-home';
+  const source = `${root}/Library/LaunchAgents/com.cswap.auto.plist`;
+  const agent = launchctlCswapAgent({
+    exec: (_file, args) => {
+      if (args[0] === 'print') throw Object.assign(new Error('Could not find service'), { code: 'ESRCH' });
+      if (args[0] === 'bootstrap') throw new Error('Bootstrap failed: 5: Input/output error');
     },
+    fs: { exists: (path) => path === source, mkdir: () => {}, readFile: () => JSON.stringify({ sequence: [] }), rename: () => {} },
+    uid: () => 501, home: () => root, qlbHome: () => root,
+    tryAcquireLock: () => () => {}, kill: () => {}, now: () => 0, sleep: async () => {},
+  });
+
+  assert.deepEqual(await agent.restorePlist(), { ok: false, code: 'cswap-agent-error' });
+});
+
+test('a repeat restore sees the loaded service and does not bootstrap it again', async () => {
+  const root = '/fixture-home';
+  const source = `${root}/Library/LaunchAgents/com.cswap.auto.plist`;
+  let bootstraps = 0;
+  const agent = launchctlCswapAgent({
+    exec: (_file, args) => {
+      if (args[0] === 'print' && bootstraps === 0) throw Object.assign(new Error('Could not find service'), { code: 'ESRCH' });
+      if (args[0] === 'bootstrap') bootstraps += 1;
+    },
+    fs: { exists: (path) => path === source, mkdir: () => {}, readFile: () => JSON.stringify({ sequence: [] }), rename: () => {} },
     uid: () => 501, home: () => root, qlbHome: () => root,
     tryAcquireLock: () => () => {}, kill: () => {}, now: () => 0, sleep: async () => {},
   });
 
   assert.deepEqual(await agent.restorePlist(), { ok: true });
   assert.deepEqual(await agent.restorePlist(), { ok: true });
-  assert.deepEqual(calls, [
-    ['enable', 'gui/501/com.cswap.auto'],
-    ['bootstrap', 'gui/501', source],
-    ['enable', 'gui/501/com.cswap.auto'],
-    ['bootstrap', 'gui/501', source],
-  ]);
+  assert.equal(bootstraps, 1);
 });
 
 test('restorePlist reports a terminal code when neither plist copy exists', async () => {
