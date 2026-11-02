@@ -5,6 +5,7 @@ import { mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
 import { atomicWriteText, fsyncDirSync } from './fsutil';
+import { codexL13ReceiptAt } from './codex-l13-receipt';
 import { isSuccessor } from './lineage-log';
 import type { CswapAgentResult } from './cswap-agent';
 import {
@@ -127,12 +128,6 @@ export type RetirementGateResult =
   | { ok: true; gates: RetireGateRecord }
   | { ok: false; code: string };
 
-function validTimestamp(value: string | null): number | null {
-  if (value == null || !/^\d+$/.test(value)) return null;
-  const timestamp = Number(value);
-  return Number.isSafeInteger(timestamp) && timestamp >= 0 ? timestamp : null;
-}
-
 function refusal(code: string): RetirementGateResult {
   return { ok: false, code };
 }
@@ -215,7 +210,7 @@ function checkpoint(
 }
 
 function passesReceiptHealth(store: Store, now: number): string | null {
-  const receiptId = validTimestamp(store.getConfig('report.receiptHealthLogId'));
+  const receiptId = codexL13ReceiptAt(store.getConfig('report.receiptHealthLogId'));
   if (receiptId == null || receiptId === 0) return 'report-receipt-health-log-missing';
   const db = openStoreConnection(store.dbPath, true);
   try {
@@ -240,7 +235,7 @@ function passesS64(
   if (doctor.autoAgent !== 'PASS') return 'doctor-auto-agent-not-pass';
   for (const provider of PI_PROVIDERS) {
     if (store.getConfig(`pi.${provider}.state`) !== 'migrated') continue;
-    const servedAt = validTimestamp(store.getConfig(`pi.${provider}.lastServedAt`));
+    const servedAt = codexL13ReceiptAt(store.getConfig(`pi.${provider}.lastServedAt`));
     if (servedAt == null || servedAt > now || now - servedAt > DAY_MS) return `pi-last-served-stale:${provider}`;
   }
   return passesReceiptHealth(store, now);
@@ -268,7 +263,7 @@ export async function evaluateRetirementGates(
   const admission = assertAdmitted(store, 'retire-cswap');
   if (!admission.ok) return refusal(admission.code ?? 'not-admitted');
 
-  const receiptAt = validTimestamp(store.getConfig('report.receiptAt'));
+  const receiptAt = codexL13ReceiptAt(store.getConfig('report.receiptAt'));
   if (receiptAt == null) return refusal('report-receipt-missing');
   if (!dependencies.reportReceiptPasses()) return refusal('report-not-pass');
   const doctor = await dependencies.doctor();
@@ -281,7 +276,7 @@ export async function evaluateRetirementGates(
   }
   if (current.drillDoneAt == null) return refusal('drill-not-recorded');
   if (!dependencies.hasFourInjectedDrillRows()) return refusal('drill-rows-missing');
-  if (validTimestamp(store.getConfig('codex.l13VerifiedAt')) == null) return refusal('codex-l13-missing');
+  if (codexL13ReceiptAt(store.getConfig('codex.l13VerifiedAt')) == null) return refusal('codex-l13-missing');
   try {
     if (dependencies.hasUnadoptedStash()) return refusal('unadopted-stash');
   } catch {

@@ -147,7 +147,11 @@ describe('qlb retire cswap (AC22 retire)', () => {
       try { db.prepare('UPDATE lifecycle SET drill_done_at = NULL').run(); } finally { db.close(); }
     }, 'drill-not-recorded');
     await refusal('drill rows missing', (f) => { f.deps.hasFourInjectedDrillRows = () => false; }, 'drill-rows-missing');
-    await refusal('l13 missing', (f) => f.store.setConfig('codex.l13VerifiedAt', ''), 'codex-l13-missing');
+    await refusal('l13 absent', (f) => {
+      const db = new DatabaseSync(f.store.dbPath);
+      try { db.prepare("DELETE FROM config WHERE key = 'codex.l13VerifiedAt'").run(); } finally { db.close(); }
+    }, 'codex-l13-missing');
+    await refusal('l13 empty', (f) => f.store.setConfig('codex.l13VerifiedAt', ''), 'codex-l13-missing');
     await refusal('unadopted stash', (f) => { f.deps.hasUnadoptedStash = () => true; }, 'unadopted-stash');
     await refusal('unadopted stash unavailable', (f) => { f.deps.hasUnadoptedStash = () => { throw new Error('fixture read failure'); }; }, 'unadopted-stash-unavailable');
     await refusal('slot check failed', (f) => { f.deps.claudeSlotsPass = () => false; }, 'claude-slots-not-pass');

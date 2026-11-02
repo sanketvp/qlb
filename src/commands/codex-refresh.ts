@@ -7,6 +7,7 @@ import {
   type CodexRefreshResponse,
 } from '../codex-consume';
 import { codexIdentity } from '../codex-auth';
+import { codexL13ReceiptAt } from '../codex-l13-receipt';
 import { codexIdentityParts, list, readCodexSwitchHistory, renewers } from '../codex-sessions';
 import { CodexSlots } from '../codex-slots';
 import { codexRecoveryFenceState, codexSwitchJournalDir } from '../codex-switch';
@@ -58,7 +59,7 @@ function c9Allowed(
   const piServedFp = getConfig('codex.l13.piServedFp');
   const bSlot = getConfig('codex.l13.bSlot');
   return aJwtExp !== null && aJwtExp.length > 0
-    && getConfig('codex.l13VerifiedAt') === null
+    && codexL13ReceiptAt(getConfig('codex.l13VerifiedAt')) === null
     && getConfig('codex.l13.aForcedRefresh') === null
     && aSlot === accountId
     && messageAfterExpAt !== null && Number(messageAfterExpAt) > Number(aJwtExp)

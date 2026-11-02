@@ -118,6 +118,33 @@ describe('C6b-4 codex:first-switch', () => {
     }
   });
 
+  it('codex:first-switch warns for invalid persisted C9 receipts without throwing', () => {
+    for (const value of ['', 'abc']) {
+      const subject = check('cutover', NOW - (4 * DAY_MS));
+      try {
+        const db = openStoreConnection(subject.dbPath);
+        try {
+          db.prepare("INSERT INTO config (key, value) VALUES ('codex.l13VerifiedAt', ?)").run(value);
+        } finally {
+          db.close();
+        }
+        assert.deepEqual(codexFirstSwitchCheck(subject.dbPath, { available: true, phase: 'cutover' }, NOW), {
+          name: 'codex:first-switch', level: 'WARN', message: 'C9 receipt invalid',
+        });
+      } finally {
+        rmSync(subject.home, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it('codex:first-switch does not echo an unsafe unknown lifecycle phase', () => {
+    assert.deepEqual(codexFirstSwitchCheck('unused.db', {
+      available: true, phase: 'bad\nphase',
+    }, NOW), {
+      name: 'codex:first-switch', level: 'N/A', message: 'not applicable in phase=unknown',
+    });
+  });
+
   it('codex:first-switch is PASS in retired', () => {
     const subject = check('retired');
     try {

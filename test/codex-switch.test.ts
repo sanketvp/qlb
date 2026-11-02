@@ -362,16 +362,24 @@ describe('Codex switch preflight and preconditions', () => {
     }
   });
 
-  it('an automatic trigger without codex.l13VerifiedAt is refused codex-l13-unverified', () => {
-    const h = fixture();
-    try {
-      insertSlot(h.db, 'target:account');
-      const result = checkCodexSwitchPreconditions(h.deps(), { target: 'target:account', trigger: 'proactive' });
-      assert.deepEqual(result.kind === 'refused' ? result.reason : result.kind, 'codex-l13-unverified');
-      assert.deepEqual(switchRows(h.db).map((row) => row.detail), ['codex-l13-unverified']);
-    } finally {
-      h.store.close();
-      rmSync(h.root, { recursive: true, force: true });
+  it('an automatic trigger requires a valid codex.l13VerifiedAt receipt', () => {
+    for (const [receipt, expected] of [
+      [null, 'codex-l13-unverified'],
+      ['', 'codex-l13-unverified'],
+      ['abc', 'codex-l13-unverified'],
+      ['1', 'go'],
+    ] as const) {
+      const h = fixture();
+      try {
+        insertSlot(h.db, 'target:account');
+        if (receipt !== null) h.store.setConfig('codex.l13VerifiedAt', receipt);
+        const result = checkCodexSwitchPreconditions(h.deps(), { target: 'target:account', trigger: 'proactive' });
+        assert.deepEqual(result.kind === 'refused' ? result.reason : result.kind, expected);
+        assert.deepEqual(switchRows(h.db).map((row) => row.detail), expected === 'go' ? [] : [expected]);
+      } finally {
+        h.store.close();
+        rmSync(h.root, { recursive: true, force: true });
+      }
     }
   });
 
