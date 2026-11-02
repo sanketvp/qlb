@@ -114,6 +114,12 @@ test("X1 retains its happy-path prerequisites and X3 holds the deferred gates", 
   const x3Closure = closure(document, "X3");
   for (const id of ["K5b", "K7", "H2", "H3", "K12", "K14", "P7", "P9", "C8", "C6b", "D2"]) {
     assert.ok(x3Closure.has(id), `X3 closure must include ${id}`);
+    assert.ok(!x1Closure.has(id), `X1 closure must not include ${id}`);
+  }
+
+  const c9Closure = closure(document, "C9");
+  for (const id of ["X2", "C8", "C6b", "C4-live", "K7"]) {
+    assert.ok(c9Closure.has(id), `C9 closure must include ${id}`);
   }
 });
 
