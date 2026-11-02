@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
+import { EventEmitter } from 'node:events';
 import test from 'node:test';
 
 import { cooperativeDrain, launchctlCswapAgent, productionTryAcquireLock, runRetirementDrain, type CswapAgent, type LaunchctlCswapAgentDependencies } from '../src/cswap-agent';
@@ -13,6 +14,42 @@ import { tmpdir } from 'node:os';
 
 function helperEnv(home: string): NodeJS.ProcessEnv {
   return { QLB_TEST_MODE: '1', QLB_HOME: home, HOME: home };
+}
+
+type FakeFlockHelper = {
+  child: ChildProcess;
+  stdout: EventEmitter;
+  readonly killCalls: number;
+  exit(code: number | null, signal: NodeJS.Signals | null): void;
+  close(code: number | null, signal: NodeJS.Signals | null): void;
+};
+
+function fakeFlockHelper(piped = true): FakeFlockHelper {
+  const stdout = new EventEmitter();
+  let killCalls = 0;
+  const child = new EventEmitter() as EventEmitter & {
+    stdout: EventEmitter | null;
+    stdin: { end(): void } | null;
+    exitCode: number | null;
+    signalCode: NodeJS.Signals | null;
+    kill(): boolean;
+  };
+  child.stdout = piped ? stdout : null;
+  child.stdin = piped ? { end: () => {} } : null;
+  child.exitCode = null;
+  child.signalCode = null;
+  child.kill = () => { killCalls += 1; return true; };
+  return {
+    child: child as unknown as ChildProcess,
+    stdout,
+    get killCalls() { return killCalls; },
+    exit: (code, signal) => {
+      child.exitCode = code;
+      child.signalCode = signal;
+      child.emit('exit', code, signal);
+    },
+    close: (code, signal) => { child.emit('close', code, signal); },
+  };
 }
 
 function fixtureStore() {
@@ -53,6 +90,46 @@ test('production flock waits for a complete newline-delimited helper status', as
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test('production flock records loss when the helper exits before release and closes later', async () => {
+  const helper = fakeFlockHelper();
+  const acquisition = productionTryAcquireLock('/fixture/auto.lock', () => helper.child);
+  helper.stdout.emit('data', Buffer.from('locked\n'));
+  const lease = await acquisition;
+  if (lease === null || lease.lost === undefined) throw new Error('expected a lease with loss reporting');
+
+  helper.exit(17, null);
+  const observed = lease.isLost?.();
+  assert.ok(observed, 'helper exit before release must report a lost lease');
+  await lease();
+  helper.close(17, null);
+  const lost = await lease.lost;
+  assert.match(lost.message, /flock helper exited unexpectedly/);
+  assert.equal(observed, lost);
+});
+
+test('production flock keeps a release requested before helper exit clean', async () => {
+  const helper = fakeFlockHelper();
+  const acquisition = productionTryAcquireLock('/fixture/auto.lock', () => helper.child);
+  helper.stdout.emit('data', Buffer.from('locked\n'));
+  const lease = await acquisition;
+  if (lease === null) throw new Error('expected a lease');
+
+  const released = lease();
+  helper.exit(0, null);
+  helper.close(0, null);
+  await released;
+  assert.equal(lease.isLost?.(), undefined);
+});
+
+test('production flock kills a helper with missing pipes before rejecting', async () => {
+  const helper = fakeFlockHelper(false);
+  await assert.rejects(
+    productionTryAcquireLock('/fixture/auto.lock', () => helper.child),
+    /fcntl flock helper must use piped stdin and stdout/,
+  );
+  assert.equal(helper.killCalls, 1);
 });
 
 test('production flock exposes helper loss synchronously and through its lost promise', async () => {

@@ -362,6 +362,7 @@ export function productionTryAcquireLock(path: string, startHelper: FlockHelperS
     const stdout = child.stdout;
     const stdin = child.stdin;
     if (stdout === null || stdin === null) {
+      child.kill();
       rejectLock(new Error('fcntl flock helper must use piped stdin and stdout'));
       return;
     }
@@ -377,14 +378,19 @@ export function productionTryAcquireLock(path: string, startHelper: FlockHelperS
       lostError = error;
       notifyLost(error);
     };
+    const unexpectedExit = (code: number | null, signal: NodeJS.Signals | null): Error =>
+      new Error(`fcntl flock helper exited unexpectedly (${code ?? signal ?? 'unknown'})`);
     const closed = new Promise<void>((resolveClose, rejectClose) => {
       child.once('error', (error) => {
         if (state === 'locked') markLost(new Error(`fcntl flock helper exited unexpectedly (${error.message})`));
         rejectClose(error);
       });
+      child.once('exit', (code, signal) => {
+        if (state === 'locked' && !releaseRequested) markLost(unexpectedExit(code, signal));
+      });
       child.once('close', (code, signal) => {
         if (state === 'locked') {
-          if (!releaseRequested) markLost(new Error(`fcntl flock helper exited unexpectedly (${code ?? signal ?? 'unknown'})`));
+          if (!releaseRequested) markLost(unexpectedExit(code, signal));
           resolveClose();
         } else if (state === 'busy' || code === 0) {
           resolveClose();
@@ -404,8 +410,10 @@ export function productionTryAcquireLock(path: string, startHelper: FlockHelperS
         state = 'locked';
         const release = Object.assign(() => {
           if (!released) {
+            const exited = child.exitCode !== null || child.signalCode !== null;
+            if (exited && !releaseRequested) markLost(unexpectedExit(child.exitCode, child.signalCode));
             releaseRequested = true;
-            if (child.exitCode !== null || child.signalCode !== null) released = Promise.resolve();
+            if (exited) released = Promise.resolve();
             else {
               stdin.end();
               released = closed.catch(() => undefined);
