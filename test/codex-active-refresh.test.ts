@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 import {
@@ -9,8 +9,12 @@ import {
   classifyActiveCodexExpiry,
   holdersFor,
   listOrFail,
+  reconcileActiveCodexLive,
+  type CodexActiveDeps,
 } from '../src/codex-active';
-import type { CodexAuthDocument } from '../src/codex-auth';
+import { codexFingerprint, readCodexAuthStableWithStat, type CodexAuthDocument } from '../src/codex-auth';
+import { importActiveCodexSlot } from '../src/codex-slots';
+import { MockKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from '../src/keychain';
 import type { CodexProcess } from '../src/codex-sessions';
 import { openStore } from '../src/store';
 
@@ -52,6 +56,38 @@ function harness(list: () => Promise<CodexProcess[]>) {
   return {
     store,
     deps,
+    close: () => { store.close(); rmSync(root, { recursive: true, force: true }); },
+  };
+}
+
+function activeHarness() {
+  const root = mkdtempSync('/tmp/qlb-codex-active-live-');
+  const journalDir = join(root, 'journal');
+  mkdirSync(journalDir);
+  const store = openStore(join(root, 'qlb.db'));
+  const keychain = new MockKeychain();
+  const authPath = join(root, 'auth.json');
+  const a0 = document(NOW + 60_000, 'fixture-access-a0');
+  importActiveCodexSlot(a0, { store, keychain, now: () => NOW - 1 });
+  store.setActiveLogin('openai-codex', A, 'import', NOW);
+  writeFileSync(authPath, JSON.stringify(a0));
+  const slots = {
+    readSlot: (accountId: string) => {
+      const text = keychain.getSync(qlbKeychainService('openai-codex', accountId), QLB_KEYCHAIN_ACCOUNT);
+      const slot = JSON.parse(text) as CodexAuthDocument;
+      return { document: slot, fingerprint: codexFingerprint(slot) };
+    },
+    ensureUnclaimedStash: async () => ({ stashId: 'fixture-stash', created: true }),
+  };
+  const deps: CodexActiveDeps = {
+    store, dbPath: store.dbPath, journalDir, authPath, keychain, slots: slots as never,
+    readLive: () => readCodexAuthStableWithStat(authPath, { delayMs: 0 }),
+    cswapProcesses: () => [], now: () => NOW, attempt: 'active-fixture', list: async () => [],
+    transport: async () => { throw new Error('unexpected transport'); },
+    withLocks: async (_accountId, fn) => fn(() => undefined),
+  };
+  return {
+    root, store, keychain, authPath, a0, deps,
     close: () => { store.close(); rmSync(root, { recursive: true, force: true }); },
   };
 }
@@ -199,5 +235,95 @@ describe('codex active refresh helpers', () => {
     assert.notEqual(first, second);
     assert.equal(first.includes('fixture-access-one'), false);
     assert.equal(second.includes('fixture-access-two'), false);
+  });
+
+  it('active-login-unset and a missing slot are refused before any read', async () => {
+    const unset = activeHarness();
+    const missing = activeHarness();
+    try {
+      unset.store.setActiveLogin('openai-codex', null, 'import', NOW);
+      unset.deps.readLive = async () => { throw new Error('must not read'); };
+      assert.deepEqual(await reconcileActiveCodexLive(unset.deps), { status: 'refused', reason: 'active-login-unset' });
+
+      missing.store.setActiveLogin('openai-codex', 'missing:slot', 'import', NOW);
+      missing.deps.readLive = async () => { throw new Error('must not read'); };
+      assert.deepEqual(await reconcileActiveCodexLive(missing.deps), { status: 'refused', reason: 'active-slot-missing' });
+    } finally { unset.close(); missing.close(); }
+  });
+
+  it('reconcile mode with an equal lineage is noop and reads the file once', async () => {
+    const h = activeHarness();
+    try {
+      let reads = 0;
+      const readLive = h.deps.readLive;
+      h.deps.readLive = async () => { reads += 1; return readLive(); };
+      const result = await reconcileActiveCodexLive(h.deps);
+      assert.equal(result.status, 'noop');
+      assert.equal(reads, 1);
+    } finally { h.close(); }
+  });
+
+  it('slot newer than live ⇒ publish without POST (republished)', async () => {
+    const h = activeHarness();
+    try {
+      const a1 = { ...document(NOW + 120_000, 'fixture-access-a1'), tokens: {
+        ...document(NOW + 120_000, 'fixture-access-a1').tokens, refresh_token: 'fixture-refresh-a1',
+      } };
+      importActiveCodexSlot(a1, { store: h.store, keychain: h.keychain, now: () => NOW + 1 });
+      assert.deepEqual(await reconcileActiveCodexLive(h.deps), { status: 'republished', document: a1 });
+      const live = await readCodexAuthStableWithStat(h.authPath, { delayMs: 0 });
+      assert.equal(live.status, 'ok');
+      if (live.status === 'ok') assert.equal(codexFingerprint(live.doc), codexFingerprint(a1));
+    } finally { h.close(); }
+  });
+
+  it('a renewer at step 1 still reconciles under the locks and returns held with its pids and the live document, 0 POSTs', async () => {
+    const h = activeHarness();
+    try {
+      h.deps.list = async () => [process(701, -30_000)];
+      const result = await reconcileActiveCodexLive(h.deps);
+      assert.deepEqual(result, { status: 'held', pids: [701], document: h.a0, action: 'noop' });
+    } finally { h.close(); }
+  });
+
+  it('drift to a known slot stops with 0 POSTs and moves active_login', async () => {
+    const h = activeHarness();
+    try {
+      const b0 = { ...document(NOW + 60_000, 'fixture-access-b0'), tokens: {
+        ...document(NOW + 60_000, 'fixture-access-b0').tokens,
+        id_token: jwt({ 'https://api.openai.com/auth': { chatgpt_user_id: 'user-b', chatgpt_account_id: 'account-b' } }),
+        account_id: 'account-b',
+      } };
+      importActiveCodexSlot(b0, { store: h.store, keychain: h.keychain, now: () => NOW + 1 });
+      h.store.setActiveLogin('openai-codex', A, 'import', NOW + 2);
+      writeFileSync(h.authPath, JSON.stringify(b0));
+      assert.deepEqual(await reconcileActiveCodexLive(h.deps), { status: 'drift', accountId: B });
+      assert.equal(h.store.getCodexActiveLogin(), B);
+    } finally { h.close(); }
+  });
+
+  it('classifies a settled post-publish race before using outgoing when its stat pair describes a newer external file', async () => {
+    const h = activeHarness();
+    try {
+      const a1 = { ...document(NOW + 120_000, 'fixture-access-a1'), tokens: {
+        ...document(NOW + 120_000, 'fixture-access-a1').tokens, refresh_token: 'fixture-refresh-a1',
+      } };
+      const b0 = { ...document(NOW + 60_000, 'fixture-access-b0'), tokens: {
+        ...document(NOW + 60_000, 'fixture-access-b0').tokens,
+        id_token: jwt({ 'https://api.openai.com/auth': { chatgpt_user_id: 'user-b', chatgpt_account_id: 'account-b' } }),
+        account_id: 'account-b',
+      } };
+      importActiveCodexSlot(a1, { store: h.store, keychain: h.keychain, now: () => NOW + 1 });
+      let reads = 0;
+      const readLive = h.deps.readLive;
+      h.deps.readLive = async () => {
+        reads += 1;
+        if (reads === 3) return { status: 'ok' as const, doc: b0, sha256: 'sha256:newer-file', inode: 999 };
+        return readLive();
+      };
+      assert.deepEqual(await reconcileActiveCodexLive(h.deps), {
+        status: 'posted-live-external', document: a1, action: 'republish-slot', cause: 'republish',
+      });
+    } finally { h.close(); }
   });
 });
