@@ -47,9 +47,23 @@ function parse(args: string[]): Parsed | null {
 }
 
 /** S47 permits its holder bypass only for the outstanding, recorded C9 proof. */
-function c9Allowed(getConfig: (key: string) => string | null): boolean {
+function c9Allowed(
+  getConfig: (key: string) => string | null,
+  accountId: string,
+  isActive: (accountId: string) => boolean,
+): boolean {
   const aJwtExp = getConfig('codex.l13.aJwtExp');
-  return aJwtExp !== null && aJwtExp.length > 0 && getConfig('codex.l13VerifiedAt') === null;
+  const messageAfterExpAt = getConfig('codex.l13.messageAfterExpAt');
+  const aSlot = getConfig('codex.l13.aSlot');
+  const piServedFp = getConfig('codex.l13.piServedFp');
+  const bSlot = getConfig('codex.l13.bSlot');
+  return aJwtExp !== null && aJwtExp.length > 0
+    && getConfig('codex.l13VerifiedAt') === null
+    && getConfig('codex.l13.aForcedRefresh') === null
+    && aSlot === accountId
+    && messageAfterExpAt !== null && Number(messageAfterExpAt) > Number(aJwtExp)
+    && piServedFp !== null && piServedFp.length > 0
+    && bSlot !== null && bSlot.length > 0 && isActive(bSlot);
 }
 
 /** Testable command boundary; output deliberately contains no credential material. */
@@ -65,7 +79,7 @@ export async function runCodexRefreshCommand(args: string[], deps: CodexRefreshC
     error('codex refresh refused: active-slot');
     return 3;
   }
-  if (parsed.c9 && !c9Allowed(deps.getConfig)) {
+  if (parsed.c9 && !c9Allowed(deps.getConfig, parsed.accountId, deps.isActive ?? (() => false))) {
     error('codex refresh refused: c9-unavailable');
     return 3;
   }
@@ -130,7 +144,9 @@ async function execute(args: string[], ctx: CommandContext): Promise<number> {
         return consumeUnderCodexLocks(store.dbPath, accountId, async (assertHeld) => {
           // Re-check every mutable receipt and active state after lock acquisition.
           if (activeCodexSlot(store) === accountId) return { status: 'active-slot' as const };
-          if (c9 && !c9Allowed(store.getConfig.bind(store))) return { status: 'c9-unavailable' as const };
+          if (c9 && !c9Allowed(store.getConfig.bind(store), accountId, (id) => activeCodexSlot(store) === id)) {
+            return { status: 'c9-unavailable' as const };
+          }
           const recoveryFence = codexRecoveryFenceState(codexSwitchJournalDir({ env: ctx.env }), store);
           let snapshot;
           try { snapshot = slots.readSlot(accountId, { fresh: true }).document; } catch { return { status: 'slot-removed' as const }; }
