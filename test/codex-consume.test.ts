@@ -940,6 +940,37 @@ describe('Codex consume gate — AC34', () => {
     assert.match(output.at(-1) ?? '', /c9-unavailable/);
   });
 
+  it('--c9 considers only a valid l13 receipt verified', async () => {
+    const base = new Map([
+      ['codex.l13.aJwtExp', '1700000000000'],
+      ['codex.l13.aSlot', 'user-a:account-a'],
+      ['codex.l13.messageAfterExpAt', '1700000000001'],
+      ['codex.l13.piServedFp', 'sha256:fixture'],
+      ['codex.l13.bSlot', 'user-b:account-b'],
+    ]);
+    for (const [receipt, expectedCode] of [
+      [null, 0],
+      ['', 0],
+      ['abc', 0],
+      ['8640000000000001', 0],
+      ['8640000000000000', 3],
+      ['1', 3],
+    ] as const) {
+      const config = new Map(base);
+      if (receipt !== null) config.set('codex.l13VerifiedAt', receipt);
+      let calls = 0;
+      const code = await runCodexRefreshCommand(['user-a:account-a', '--force', '--c9'], {
+        getConfig: (key) => config.get(key) ?? null,
+        isActive: (accountId) => accountId === 'user-b:account-b',
+        consume: async () => { calls += 1; return { status: 'refreshed' }; },
+        write: () => undefined,
+        error: () => undefined,
+      });
+      assert.equal(code, expectedCode);
+      assert.equal(calls, expectedCode === 0 ? 1 : 0);
+    }
+  });
+
   it('--c9 is refused c9-unavailable once codex.l13.aForcedRefresh is set, with 0 POSTs', async () => {
     const config = new Map([
       ['codex.l13.aJwtExp', '1700000000000'],

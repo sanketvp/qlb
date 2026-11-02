@@ -147,7 +147,11 @@ describe('qlb retire cswap (AC22 retire)', () => {
       try { db.prepare('UPDATE lifecycle SET drill_done_at = NULL').run(); } finally { db.close(); }
     }, 'drill-not-recorded');
     await refusal('drill rows missing', (f) => { f.deps.hasFourInjectedDrillRows = () => false; }, 'drill-rows-missing');
-    await refusal('l13 missing', (f) => f.store.setConfig('codex.l13VerifiedAt', ''), 'codex-l13-missing');
+    await refusal('l13 absent', (f) => {
+      const db = new DatabaseSync(f.store.dbPath);
+      try { db.prepare("DELETE FROM config WHERE key = 'codex.l13VerifiedAt'").run(); } finally { db.close(); }
+    }, 'codex-l13-missing');
+    await refusal('l13 empty', (f) => f.store.setConfig('codex.l13VerifiedAt', ''), 'codex-l13-missing');
     await refusal('unadopted stash', (f) => { f.deps.hasUnadoptedStash = () => true; }, 'unadopted-stash');
     await refusal('unadopted stash unavailable', (f) => { f.deps.hasUnadoptedStash = () => { throw new Error('fixture read failure'); }; }, 'unadopted-stash-unavailable');
     await refusal('slot check failed', (f) => { f.deps.claudeSlotsPass = () => false; }, 'claude-slots-not-pass');
@@ -159,6 +163,19 @@ describe('qlb retire cswap (AC22 retire)', () => {
       f.deps.slots = () => [{ accountId: 'slot-a', source: 'cswap-import', sourceFingerprint: 'unrelated', currentFingerprint: 'current-a' }];
     }, 'slot-lineage-unprovable:slot-a');
     await refusal('receipt stale', (f) => f.store.setConfig('report.receiptAt', String(NOW - 10 * 60 * 1000 - 1)), 'report-receipt-stale');
+  });
+
+  it('keeps non-C9 retirement fields on the generic safe-integer contract', async () => {
+    const largeSafeInteger = '9000000000000000';
+    await refusal('large report receipt remains parsed', (f) => {
+      f.store.setConfig('report.receiptAt', largeSafeInteger);
+    }, 'report-receipt-stale');
+    await refusal('large Pi last-served timestamp remains parsed', (f) => {
+      f.store.setConfig('pi.kimi-coding.lastServedAt', largeSafeInteger);
+    }, 'pi-last-served-stale:kimi-coding');
+    await refusal('large receipt health row id remains parsed', (f) => {
+      f.store.setConfig('report.receiptHealthLogId', largeSafeInteger);
+    }, 'report-receipt-health-log-invalid');
   });
 
   it('pi rollback proceeds in pre-cutover and refuses only under retirement or cutover-begin fences', async () => {

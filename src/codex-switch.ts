@@ -1,6 +1,7 @@
 import { mkdirSync, readFileSync, statSync, unlinkSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { accessExpiry, codexAuthFileSha256, codexAuthFileText, codexFingerprint, codexIdentity, writeCodexAuthAtomic, type CodexAuthDocument, type CodexAuthStableWithStatResult, type CodexIdentity } from './codex-auth';
+import { codexL13ReceiptAt } from './codex-l13-receipt';
 import { attributeLiveDocument, type AttributeLiveDocumentInput, type CodexAttributionResult, type CodexAttributionStore } from './codex-attribution';
 import { ClaudeCodeLockTimeout, CodexAuthLockCompromised, ProperLockfileCompromised, withCodexAuthLock, type CodexAuthLockOptions, type HeldProperLockfile, withProperLockfile } from './cc-locks';
 import { consumeCodexSlot, hasCodexSlotIdentity, withCodexConsumeThenSwitchLocks, withCodexSwitchLock, type CodexConsumeOptions, type CodexConsumeResult } from './codex-consume';
@@ -171,7 +172,7 @@ export function checkCodexSwitchPreconditions(
   if (target === null) return refuse('target-missing');
   if (target.dead) return refuse('target-dead');
   if (target.pendingAdopt) return refuse('target-pending-adopt');
-  if (input.trigger !== 'manual' && deps.store.getConfig('codex.l13VerifiedAt') === null) {
+  if (input.trigger !== 'manual' && codexL13ReceiptAt(deps.store.getConfig('codex.l13VerifiedAt')) == null) {
     return refuse('codex-l13-unverified');
   }
   return { kind: 'go' };

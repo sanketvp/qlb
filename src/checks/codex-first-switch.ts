@@ -1,3 +1,4 @@
+import { codexL13ReceiptAt } from '../codex-l13-receipt';
 import { openStoreConnection } from '../store';
 import { check, guardCheck } from './_check';
 import type { HealthCheck } from './claude-slots';
@@ -6,6 +7,10 @@ import type { LifecyclePhaseResult } from './lifecycle-phase';
 export default check('codex:first-switch');
 
 const THREE_DAYS_MS = 3 * 24 * 60 * 60 * 1_000;
+
+function printableUnknownLifecyclePhase(phase: string): string {
+  return /^[a-z-]+$/.test(phase) ? phase : 'unknown';
+}
 
 export function codexFirstSwitchCheck(
   dbPath: string,
@@ -39,7 +44,7 @@ export function codexFirstSwitchCheck(
       case 'cutover':
         break;
       default:
-        return { name: 'codex:first-switch', level: 'N/A', message: `not applicable in phase=${lifecycle.phase}` };
+        return { name: 'codex:first-switch', level: 'N/A', message: `not applicable in phase=${printableUnknownLifecyclePhase(lifecycle.phase)}` };
     }
 
     const db = openStoreConnection(dbPath, true);
@@ -48,11 +53,19 @@ export function codexFirstSwitchCheck(
         SELECT cutover_at AS cutoverAt FROM lifecycle WHERE closed_at IS NULL ORDER BY id DESC LIMIT 1
       `).get() as { cutoverAt: number | null } | undefined;
       const receipt = db.prepare("SELECT value FROM config WHERE key = 'codex.l13VerifiedAt'").get() as { value: string } | undefined;
-      if (receipt !== undefined) {
+      const receiptAt = codexL13ReceiptAt(receipt?.value ?? null);
+      if (receiptAt != null) {
         return {
           name: 'codex:first-switch',
           level: 'PASS',
-          message: `C9 receipt recorded at ${new Date(Number(receipt.value)).toISOString()}`,
+          message: `C9 receipt recorded at ${new Date(receiptAt).toISOString()}`,
+        };
+      }
+      if (receipt !== undefined) {
+        return {
+          name: 'codex:first-switch',
+          level: 'WARN',
+          message: 'C9 receipt invalid',
         };
       }
 
