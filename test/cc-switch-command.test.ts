@@ -253,12 +253,12 @@ describe('qlb switch anthropic command (K5-6)', () => {
     assert.match(run.stderr.join('\n'), /warning/i);
   });
 
-  it('the command passes reconcileJournals through unchanged: undefined when not injected (bootstrap spy receives undefined), and an injected one runs exactly once, after admission and before preconditions (call-count and call-order spy)', async () => {
-    let absent: unknown = 'unset';
-    const first = subject({ bootstrap: async (hooks) => { absent = hooks?.reconcileJournals; await hooks?.assertAdmitted?.(); } });
+  it('the command installs its default reconcileJournals hook, and an injected one runs exactly once, after admission and before preconditions (call-count and call-order spy)', async () => {
+    let defaultHook: unknown = 'unset';
+    const first = subject({ bootstrap: async (hooks) => { defaultHook = hooks?.reconcileJournals; await hooks?.assertAdmitted?.(); } });
     const firstRun = context();
     assert.equal(await first.execute!(['account-b'], firstRun.ctx), 0);
-    assert.equal(absent, undefined);
+    assert.equal(typeof defaultHook, 'function');
 
     const events: string[] = [];
     const second = subject({
