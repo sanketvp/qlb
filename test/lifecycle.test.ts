@@ -28,7 +28,7 @@ import { cutoverBegin } from '../src/commands/cutover';
 import { CSWAP_ANTHROPIC_STORE, CONSUME_STATE } from '../src/cswap-consume';
 import { evaluateRetirementGates, type CswapRetireDependencies } from '../src/cswap-retire';
 import lifecycleCommand from '../src/commands/lifecycle';
-import type { CommandContext } from '../src/registry';
+import { resolveCommand, type CommandContext } from '../src/registry';
 import { openStore } from '../src/store';
 import { defaultConfig } from '../src/config';
 import { doctorQlb } from '../src/diagnostics';
@@ -37,6 +37,15 @@ import type { CswapAgent } from '../src/cswap-agent';
 
 function fixtureStore() {
   return openStore(join(mkdtempSync(join(tmpdir(), 'qlb-lifecycle-')), 'qlb.db'));
+}
+
+function resolveUndoCswap(
+  args: string[],
+  execute: (args: string[], context: CommandContext) => Promise<number> | number,
+) {
+  const match = resolveCommand(['undo', 'cswap', ...args], [{ name: 'undo cswap', execute }]);
+  assert.ok(match);
+  return match;
 }
 
 const testRetirementLockFs = {
@@ -587,10 +596,7 @@ describe('lifecycle (AC49)', () => {
       assert.equal(transition(store, 'undoing', 20).ok, true);
       const stderr: string[] = [];
       let executed = false;
-      const code = await runExecutingCommand({
-        command: { name: 'undo', execute: async () => { executed = true; return 0; } },
-        args: ['cswap'],
-      }, {
+      const code = await runExecutingCommand(resolveUndoCswap([], async () => { executed = true; return 0; }), {
         config, env: {}, home, stdout: () => {}, stderr: (message) => stderr.push(message),
         loadConfig: () => config, registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
       } as CommandContext);
@@ -629,10 +635,10 @@ describe('lifecycle (AC49)', () => {
     const home = mkdtempSync(join(tmpdir(), 'qlb-lifecycle-undo-resume-'));
     const config = { ...defaultConfig(home), dbPath: store.dbPath };
     let executions = 0;
-    const executeResume = async () => runExecutingCommand({
-      command: { name: 'undo', execute: async () => { executions++; return 0; } },
-      args: ['cswap', '--resume'],
-    }, {
+    const executeResume = async () => runExecutingCommand(resolveUndoCswap(['--resume'], async () => {
+      executions++;
+      return 0;
+    }), {
       config, env: {}, home, stdout: () => {}, stderr: () => {},
       loadConfig: () => config, registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
     } as CommandContext);
@@ -654,6 +660,52 @@ describe('lifecycle (AC49)', () => {
         assert.equal(await executeResume(), 0);
       } finally { abortedStore.close(); }
       assert.equal(executions, 3);
+    } finally { store.close(); }
+  });
+
+  it('undo --resume is refused in cutting-over and retired', async () => {
+    const store = fixtureStore();
+    const home = mkdtempSync(join(tmpdir(), 'qlb-lifecycle-undo-resume-refused-'));
+    const config = { ...defaultConfig(home), dbPath: store.dbPath };
+    const stderr: string[] = [];
+    let executions = 0;
+    const executeResume = async () => runExecutingCommand(resolveUndoCswap(['--resume'], async () => {
+      executions++;
+      return 0;
+    }), {
+      config, env: {}, home, stdout: () => {}, stderr: (message) => stderr.push(message),
+      loadConfig: () => config, registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
+    } as CommandContext);
+    try {
+      beginCutover(store, 10);
+      assert.equal(assertAdmitted(store, 'undo-cswap:resume').code, 'phase=cutting-over');
+      assert.equal(await executeResume(), 3);
+      const db = new DatabaseSync(store.dbPath);
+      try { db.prepare("UPDATE lifecycle SET state = 'retired'").run(); } finally { db.close(); }
+      assert.equal(assertAdmitted(store, 'undo-cswap:resume').code, 'phase=retired');
+      assert.equal(await executeResume(), 3);
+      assert.equal(executions, 0);
+      assert.match(stderr.join('\n'), /phase=cutting-over/);
+      assert.match(stderr.join('\n'), /phase=retired/);
+    } finally { store.close(); }
+  });
+
+  it('plain undo is refused in cutting-over when the admission table disallows it', async () => {
+    const store = fixtureStore();
+    const home = mkdtempSync(join(tmpdir(), 'qlb-lifecycle-undo-cutting-over-'));
+    const config = { ...defaultConfig(home), dbPath: store.dbPath };
+    const stderr: string[] = [];
+    let executed = false;
+    try {
+      beginCutover(store, 10);
+      assert.equal(assertAdmitted(store, 'undo-cswap').code, 'phase=cutting-over');
+      const code = await runExecutingCommand(resolveUndoCswap([], async () => { executed = true; return 0; }), {
+        config, env: {}, home, stdout: () => {}, stderr: (message) => stderr.push(message),
+        loadConfig: () => config, registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
+      } as CommandContext);
+      assert.equal(code, 3);
+      assert.equal(executed, false);
+      assert.match(stderr.join('\n'), /phase=cutting-over/);
     } finally { store.close(); }
   });
 

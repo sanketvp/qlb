@@ -1931,7 +1931,7 @@ function lifecycleOperationFor(command: string, args: string[]): LifecycleOperat
     if (args[0] === 'commit') return 'cutover-commit';
     if (args[0] === 'abort') return 'cutover-abort';
   }
-  if (command === 'undo' && args[0] === 'cswap') {
+  if (command === 'undo cswap') {
     if (args.includes('--dry-run')) return 'undo-cswap:dry-run';
     return args.includes('--resume') ? 'undo-cswap:resume' : 'undo-cswap';
   }
