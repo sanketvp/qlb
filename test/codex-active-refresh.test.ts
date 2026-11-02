@@ -555,6 +555,8 @@ describe('codex active refresh helpers', () => {
       await assertContendedTimeout(locks.consume, 80);
       await assertContendedTimeout(locks.switch, 80);
       await assertContendedTimeout(locks.auth, 80);
+      h.deps.lockTimeoutMs = undefined;
+      await assertContendedTimeout(locks.auth, 40);
     } finally { h.close(); }
   });
 
@@ -573,11 +575,11 @@ describe('codex active refresh helpers', () => {
         : readLive();
       let lists = 0;
       h.deps.list = async () => {
-        if (++lists === 3) throw new Error('fixture process listing unavailable');
+        if (++lists === 5) throw new Error('fixture process listing unavailable');
         return [];
       };
       assert.deepEqual(await reconcileActiveCodexLive(h.deps), { status: 'refused', reason: 'codex-process-check-failed' });
-      assert.equal(lists, 3);
+      assert.equal(lists, 5);
     } finally { h.close(); }
   });
 
