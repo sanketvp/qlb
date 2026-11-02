@@ -4,7 +4,7 @@ import * as net from 'node:net';
 import { dirname, join, resolve } from 'node:path';
 import { adapters } from './adapters';
 import { assertTestHomeIsIsolated } from './bootstrap';
-import { CSWAP_RESTORE_PENDING, FINISH_CSWAP_RESTORE_FIRST, FINISH_RETIREMENT_FIRST, RETIREMENT_IN_PROGRESS, assertAdmitted, type LifecycleOperation } from './lifecycle';
+import { CSWAP_RESTORE_PENDING, FINISH_CSWAP_RESTORE_FIRST, FINISH_RETIREMENT_FIRST, RETIREMENT_IN_PROGRESS, assertAdmitted, assertAdmittedInConnection, type LifecycleOperation } from './lifecycle';
 import { createDefaultCodexGateDeps, runCodexGate } from './codex-gate';
 import { config, resolveConfig, stripConfigArgs } from './config';
 import { qlbHomeDir } from './home';
@@ -84,6 +84,7 @@ import {
   isWalSidecarUnreadableError,
   openDecisionsReader,
   openStore,
+  openStoreConnection,
   WAL_SIDECAR_UNREADABLE,
   walSidecarUnreadableMessage,
   type Store,
@@ -1908,7 +1909,28 @@ export function exitCodeForError(err: unknown): number {
   return typeof err === 'object' && err !== null && (err as { exitCode?: unknown }).exitCode === 3 ? 3 : 1;
 }
 
+function readOnlyLifecycleOperation(operation: LifecycleOperation): boolean {
+  return operation.endsWith(':dry-run') || operation === 'doctor' || operation === 'status';
+}
+
 function lifecycleAdmissionCode(dbPath: string, operation: LifecycleOperation): string | null {
+  if (readOnlyLifecycleOperation(operation)) {
+    // A missing store has the same pre-cutover lifecycle state that openStore()
+    // would have created for a dry run, but creating it would violate dry-run.
+    if (!existsSync(dbPath)) return null;
+    const db = openStoreConnection(dbPath, true);
+    try {
+      const version = db.prepare('PRAGMA user_version').get() as { user_version?: unknown } | number | undefined;
+      const userVersion = typeof version === 'number' ? version : version?.user_version;
+      // Lifecycle rows arrived with the current schema. Do not let an admission
+      // check upgrade an old store just to discover its lifecycle state.
+      const lifecycleTable = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'lifecycle'").get();
+      if (typeof userVersion !== 'number' || userVersion < 5 || !lifecycleTable) return 'schema-migration-required';
+      const result = assertAdmittedInConnection(db, operation);
+      return result.ok ? null : result.code ?? 'lifecycle-refused';
+    } finally { db.close(); }
+  }
+
   const store = openStore(dbPath);
   try {
     const result = assertAdmitted(store, operation);
