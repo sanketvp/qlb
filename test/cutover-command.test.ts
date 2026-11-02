@@ -6,6 +6,7 @@ import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 
 import { defaultConfig } from '../src/config';
+import { credentialFingerprint } from '../src/anthropic-oauth';
 import { createCutoverCommand } from '../src/commands/cutover';
 import { CSWAP_ANTHROPIC_STORE, CONSUME_STATE } from '../src/cswap-consume';
 import { beginCutover, phase } from '../src/lifecycle';
@@ -27,7 +28,7 @@ function fixture(): { root: string; dbPath: string; context: CommandContext; out
     context: {
       stdout: (line) => output.push(line),
       stderr: (line) => output.push(line),
-      env: { QLB_TEST_MODE: '1', QLB_HOME: root },
+      env: { QLB_TEST_MODE: '1', QLB_HOME: root, HOME: root },
       config,
       loadConfig: () => config,
       home: root,
@@ -37,6 +38,24 @@ function fixture(): { root: string; dbPath: string; context: CommandContext; out
     },
     cleanup: () => rmSync(root, { recursive: true, force: true }),
   };
+}
+
+class TestKeychain {
+  private readonly values = new Map<string, string>();
+
+  async get(service: string, account: string): Promise<string> {
+    const value = this.values.get(`${service}\0${account}`);
+    if (value === undefined) throw new Error('item not found');
+    return value;
+  }
+
+  async set(service: string, account: string, value: string): Promise<void> {
+    this.values.set(`${service}\0${account}`, value);
+  }
+}
+
+function credential(account: string, refresh: string): string {
+  return JSON.stringify({ claudeAiOauth: { accessToken: `access-${account}`, refreshToken: refresh, expiresAt: 1_800_000_000_000 } });
 }
 
 function prepareDeferredCommit(dbPath: string): void {
@@ -135,4 +154,72 @@ test('test mode without an injected agent never reaches launchctl', async () => 
   } finally {
     f.cleanup();
   }
+});
+
+test('abort before import restores C-swap only', async () => {
+  const f = fixture();
+  try {
+    const store = openStore(f.dbPath);
+    try { beginCutover(store, 10); } finally { store.close(); }
+    const calls: string[] = [];
+    const agent: CswapAgent = {
+      bootout: () => ({ ok: true }), disable: () => ({ ok: true }), movePlist: () => ({ ok: true }), drain: () => ({ ok: true }),
+      restorePlist: () => { calls.push('restore-cswap'); return { ok: true }; },
+    };
+    const command = createCutoverCommand({
+      makeAgent: () => agent,
+      undoCswap: {
+        bootoutQlbAgent: () => { calls.push('bootout-qlb'); return { ok: true }; },
+        listQlbPids: () => [], listHeldLocks: () => [], pendingStash: () => null,
+        moveQlbPlist: () => { calls.push('move-qlb-plist'); return { ok: true }; },
+      },
+    });
+
+    assert.equal(await command.execute!(['abort'], f.context), 0);
+    assert.deepEqual(calls, ['bootout-qlb', 'move-qlb-plist', 'restore-cswap']);
+    const completed = openStore(f.dbPath);
+    try { assert.equal(phase(completed).state, 'aborted'); } finally { completed.close(); }
+    assert.match(f.output[0]!, /qlb lifecycle close \d+/);
+  } finally { f.cleanup(); }
+});
+
+test('abort after import hands back and ends aborted', async () => {
+  const f = fixture();
+  try {
+    const keychain = new TestKeychain();
+    const active = credential('account-a', 'refresh-current');
+    await keychain.set('qlb:anthropic:account-a', 'qlb', active);
+    const store = openStore(f.dbPath);
+    try {
+      beginCutover(store, 10);
+      const db = new DatabaseSync(f.dbPath);
+      try {
+        db.prepare(`INSERT INTO claude_slots (account_id, slot_num, email, config_json, fingerprint, added_at, source, dead)
+          VALUES (?, ?, ?, '{}', ?, ?, 'cswap-import', 0)`).run('account-a', 1, 'a@example.test', credentialFingerprint(active), 10);
+        db.prepare("INSERT INTO active_login (provider, account_id, since, set_by) VALUES ('anthropic', 'account-a', 10, 'test')").run();
+      } finally { db.close(); }
+    } finally { store.close(); }
+    const agent: CswapAgent = {
+      bootout: () => ({ ok: true }), disable: () => ({ ok: true }), movePlist: () => ({ ok: true }), drain: () => ({ ok: true }), restorePlist: () => ({ ok: true }),
+    };
+    const command = createCutoverCommand({
+      makeAgent: () => agent,
+      undoCswap: {
+        keychain,
+        backupDir: f.root,
+        bootoutQlbAgent: () => ({ ok: true }), listQlbPids: () => [], listHeldLocks: () => [], pendingStash: () => null,
+        withActiveLocks: async (fn) => fn(),
+        readActiveCredential: async () => ({ credential: active, accountId: 'account-a' }),
+        resyncActive: async () => undefined,
+        validateActiveSequence: async () => undefined,
+        setActiveAccountNumber: async () => undefined,
+        moveQlbPlist: () => ({ ok: true }),
+      },
+    });
+
+    assert.equal(await command.execute!(['abort'], f.context), 0);
+    assert.equal(await keychain.get('claude-swap', 'account-1-a@example.test'), active);
+    const completed = openStore(f.dbPath);
+    try { assert.equal(phase(completed).state, 'aborted'); } finally { completed.close(); }
+  } finally { f.cleanup(); }
 });

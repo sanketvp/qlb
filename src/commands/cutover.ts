@@ -1,6 +1,7 @@
 import { join } from 'node:path';
 
 import { productionLaunchctlCswapAgent, unavailableCswapAgent, type CswapAgent } from '../cswap-agent';
+import { runUndoCswapCommand, type UndoCswapCommandDependencies } from './undo-cswap';
 import {
   abortCutoverBegin,
   assertAdmitted,
@@ -101,6 +102,8 @@ export async function cutoverBegin(storePath: string, agent: CswapAgent = unavai
 export interface CutoverCommandDeps {
   /** Tests replace the S57 C-swap agent before the command begins its transaction. */
   makeAgent?: (ctx: CommandContext) => CswapAgent;
+  /** G18's hand-back seams; tests inject every process and plist effect. */
+  undoCswap?: UndoCswapCommandDependencies;
 }
 
 function defaultMakeAgent(ctx: CommandContext): CswapAgent {
@@ -142,6 +145,8 @@ async function execute(args: string[], ctx: CommandContext, deps: CutoverCommand
     } finally { store.close(); }
   }
   if (subcommand === 'abort' && (rest.length === 0 || parseJson(rest))) {
+    // The CLI admission normally owns this guard; retain it for direct command
+    // callers before entering G18's shared fence/drain/write/verify engine.
     const store = openStore(ctx.config.dbPath);
     try {
       const current = phase(store);
@@ -150,11 +155,11 @@ async function execute(args: string[], ctx: CommandContext, deps: CutoverCommand
         else ctx.stderr(`cutover abort refused: phase=${current.state}`);
         return 3;
       }
-      // K12 owns the fence/drain/undo engine; refusing is safer than a partial abort.
-      if (rest[0] === '--json') json(ctx, { ok: false, code: 'not-yet-available' });
-      else ctx.stderr('cutover abort refused: not-yet-available');
-      return 3;
     } finally { store.close(); }
+    return runUndoCswapCommand(rest, ctx, {
+      ...deps.undoCswap,
+      cswapAgent: deps.undoCswap?.cswapAgent ?? (deps.makeAgent ?? defaultMakeAgent)(ctx),
+    });
   }
   ctx.stderr('usage: qlb cutover begin|commit [--pi-deferred] [--json]|abort [--json]');
   return 2;

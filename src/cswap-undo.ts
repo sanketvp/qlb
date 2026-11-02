@@ -170,8 +170,11 @@ async function sourceCredential(deps: PlanHandBackDependencies, accountId: strin
  */
 export function validateHandBackStructure(deps: Pick<PlanHandBackDependencies, 'slots' | 'activeAccountId' | 'migratedPiProviders'>): void {
   const allSlots = deps.slots();
+  const activeAccountId = deps.activeAccountId();
   const qlbAdd = allSlots
-    .filter((slot) => slot.source === 'qlb-add' && !slot.dead)
+    // A dead imported slot can be left alone, but a dead qlb-add slot cannot
+    // become C-swap's active account: it has no C-swap provenance to restore.
+    .filter((slot) => slot.source === 'qlb-add' && (!slot.dead || slot.accountId === activeAccountId))
     .map((slot) => requireSlotCoordinate(slot, false))
     .map(({ accountNumber, email }) => ({ accountNumber, email }))
     .sort((left, right) => left.accountNumber - right.accountNumber);
@@ -181,7 +184,6 @@ export function validateHandBackStructure(deps: Pick<PlanHandBackDependencies, '
   const migrated = deps.migratedPiProviders().sort();
   if (migrated.length > 0) throw new CswapUndoRefusalError('pi-migrated', migrated[0]);
 
-  const activeAccountId = deps.activeAccountId();
   const active = activeAccountId === null ? null : allSlots.find((slot) => slot.accountId === activeAccountId);
   if ((slots.length > 0 && activeAccountId === null) || (activeAccountId !== null && !active)) {
     throw new CswapUndoRefusalError('active-slot-missing');
