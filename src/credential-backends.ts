@@ -84,6 +84,9 @@ export type ExecFileSyncFn = (
 
 const FAKE_EXECUTOR = Symbol('qlbFakeExecutor');
 
+/** `security add-generic-password` exit status for an already-existing item. */
+export const MACOS_SECURITY_DUPLICATE_ITEM_EXIT_STATUS = 45;
+
 type FakeExecutor = ExecFileSyncFn & { [FAKE_EXECUTOR]?: true };
 
 /** Brand an injected executor as a test double permitted in QLB test mode. */
@@ -386,17 +389,35 @@ export class MacosKeychainBackend extends SyncCredentialBackend {
     this.assertNativeAccessEnabled();
     const helper = this.helperPath ?? defaultKeychainHelperPath();
     this.assertHelperUsable();
-    try {
-      // Every write, including test doubles, follows the helper's stdin protocol.
-      this.exec(helper, ['set', service, account], {
-        encoding: 'utf8', input: jsonValue, timeout: MACOS_SECURITY_TIMEOUT_MS,
-      });
-    } catch (err) {
-      if (err instanceof KeychainHelperMissingError) throw err;
-      if (isSecurityTimeout(err)) throw securityTimeoutError('keychain helper set');
-      // Child-process errors can include stdin payload material, so never keep
-      // their message.
+    const valueHex = Buffer.from(jsonValue, 'utf8').toString('hex');
+    const options = {
+      encoding: 'utf8' as const, stdio: 'ignore' as const, timeout: MACOS_SECURITY_TIMEOUT_MS,
+    };
+    const fail = () => {
+      // Child-process errors can include payload material, so never keep their message.
       throw new Error(`keychain set failed for service=${service} account=${account}`);
+    };
+
+    try {
+      // Creation must grant both trusted applications; updates retain those permissions.
+      this.exec(MACOS_SECURITY_BIN, [
+        'add-generic-password', '-a', account, '-s', service, '-X', valueHex,
+        '-T', helper, '-T', MACOS_SECURITY_BIN,
+      ], options);
+      return;
+    } catch (err) {
+      if (isSecurityTimeout(err)) throw securityTimeoutError('add-generic-password');
+      if (!(err && typeof err === 'object'
+        && (err as { status?: unknown }).status === MACOS_SECURITY_DUPLICATE_ITEM_EXIT_STATUS)) fail();
+    }
+
+    try {
+      this.exec(MACOS_SECURITY_BIN, [
+        'add-generic-password', '-U', '-a', account, '-s', service, '-X', valueHex,
+      ], options);
+    } catch (err) {
+      if (isSecurityTimeout(err)) throw securityTimeoutError('add-generic-password');
+      fail();
     }
   }
 
