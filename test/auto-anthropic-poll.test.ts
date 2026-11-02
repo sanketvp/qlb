@@ -114,6 +114,7 @@ describe('auto anthropic poll (G8)', () => {
 
   it('keeps scheduled readings known across steady 60-second ticks', async () => {
     const f = await fixture();
+    await f.slots.writeSlot('active', credential('active-long', (NOW + 7200) * 1000), { cause: 'fixture' });
     for (let tick = 0; tick < 60; tick += 1) {
       f.now(NOW + tick * 60);
       const accounts = await pollAnthropic(f.deps());
@@ -129,10 +130,22 @@ describe('auto anthropic poll (G8)', () => {
     let deadPosts = 0;
     deps.consumeDeps.postRefresh = async () => { deadPosts += 1; return { status: 400, body: '{"error":"invalid_grant"}' }; };
     await pollAnthropic(deps);
-    assert.equal(f.store.listUsagePolls('anthropic').inactive?.lastStatus, 'token_dead');
+    assert.equal(f.store.listUsagePolls('anthropic').inactive?.lastStatus, 'consume-dead');
     assert.equal(f.slots.getSlot('inactive')?.dead, true);
     await pollAnthropic(deps);
     assert.equal(deadPosts, 1);
+  });
+
+  it('a lineage-moved dead strike does not quarantine an inactive slot', async () => {
+    const f = await fixture();
+    await f.slots.writeSlot('inactive', credential('expired', (NOW - 1) * 1000), { cause: 'fixture' });
+    skipActive(f);
+    const deps = f.deps();
+    deps.consumeDeps.postRefresh = async () => ({ status: 400, body: '{"error":"invalid_grant"}' });
+    (f.slots as unknown as { strikeDead: () => Promise<'lineage-moved'> }).strikeDead = async () => 'lineage-moved';
+    await pollAnthropic(deps);
+    assert.equal(f.slots.getSlot('inactive')?.dead, false);
+    assert.equal(f.store.listUsagePolls('anthropic').inactive?.lastStatus, 'consume-dead');
   });
 
   it('records an unpersisted inactive successor as a failed consume without using it', async () => {
@@ -142,8 +155,14 @@ describe('auto anthropic poll (G8)', () => {
     (f.slots as unknown as { writeSlot: () => Promise<void> }).writeSlot = async () => { throw new Error('fixture write failure'); };
     (f.slots as unknown as { stashUnclaimed: () => Promise<void> }).stashUnclaimed = async () => { throw new Error('fixture stash failure'); };
     await pollAnthropic(f.deps());
-    assert.equal(f.store.listUsagePolls('anthropic').inactive?.lastStatus, 'consume-consume-gate-unpersisted');
-    assert.deepEqual(f.calls(), { gets: 0, posts: 1 });
+    const row = f.store.listUsagePolls('anthropic').inactive;
+    assert.equal(row?.lastStatus, 'consume-consume-gate-unpersisted');
+    assert.ok((row?.backoffUntil ?? 0) >= NOW + 3600);
+    const db = (f.store as unknown as { db: { prepare: (sql: string) => { get: () => { detail: string } | undefined } } }).db;
+    assert.equal(db.prepare("SELECT detail FROM switch_log WHERE detail = 'freshen-consume-gate-unpersisted'").get()?.detail, 'freshen-consume-gate-unpersisted');
+    f.now(NOW + 3599);
+    await pollAnthropic(f.deps());
+    assert.equal(f.calls().posts, 1);
   });
 
   it('drops unconfigured scoped windows from returned accounts', async () => {
@@ -187,16 +206,105 @@ describe('auto anthropic poll (G8)', () => {
 
   it('uses the live credential for an active usage poll', async () => {
     const f = await fixture();
-    await f.backend.set(f.paths.keychainService, 'fixture', credential('live'));
+    await f.backend.set(f.paths.keychainService, 'fixture', credential('active'));
     f.store.writeUsagePollPlans('anthropic', { inactive: { nextDueAt: NOW + 300, pollIntervalS: 300 } });
     let servedLive = false;
     const deps = f.deps();
     deps.getUsage = async (accessToken) => {
-      servedLive = accessToken === 'access-live';
+      servedLive = accessToken === 'access-active';
       return { status: 200, body: JSON.stringify({ five_hour: { utilization: 20 }, seven_day: { utilization: 10 } }) };
     };
     await pollAnthropic(deps);
     assert.equal(servedLive, true);
+  });
+
+  it('a re-logged-in slot is polled again', async () => {
+    const f = await fixture();
+    await f.slots.writeSlot('inactive', credential('expired', (NOW - 1) * 1000), { cause: 'fixture' });
+    skipActive(f);
+    const deps = f.deps();
+    deps.consumeDeps.postRefresh = async () => ({ status: 400, body: '{"error":"invalid_grant"}' });
+    await pollAnthropic(deps);
+    assert.equal(f.slots.getSlot('inactive')?.dead, true);
+    await f.slots.writeSlot('inactive', credential('relogged'), { cause: 'fixture-relogin' });
+    const dueAt = f.store.listUsagePolls('anthropic').inactive?.nextDueAt;
+    assert.ok(dueAt !== undefined);
+    f.now(dueAt!);
+    await pollAnthropic(deps);
+    assert.equal(f.store.listUsagePolls('anthropic').inactive?.lastStatus, 'ok');
+  });
+
+  it('a throttled healthy active does not fail over during a 4500 s block', async () => {
+    const f = await fixture();
+    f.store.writeUsagePollPlans('anthropic', { inactive: { nextDueAt: NOW + 10_000, pollIntervalS: 300 } });
+    await pollAnthropic(f.deps());
+    const dueAt = f.store.listUsagePolls('anthropic').active?.nextDueAt;
+    assert.ok(dueAt !== undefined);
+    f.now(dueAt!);
+    f.response({ status: 429, body: 'rate limited', retryAfterS: 3600 });
+    await pollAnthropic(f.deps());
+    const blockUntil = f.store.listUsagePolls('anthropic').active?.backoffUntil;
+    assert.ok(blockUntil !== undefined);
+    f.now(blockUntil! - 1);
+    const accounts = await pollAnthropic(f.deps());
+    assert.equal(accounts.find((account) => account.accountId === 'active')?.buckets['5h']?.usedPct, 20);
+  });
+
+  it('an active hard sentinel does not extend the last reading past 180 s', async () => {
+    const f = await fixture();
+    f.store.writeUsagePollPlans('anthropic', { inactive: { nextDueAt: NOW + 10_000, pollIntervalS: 300 } });
+    await pollAnthropic(f.deps());
+    const dueAt = f.store.listUsagePolls('anthropic').active?.nextDueAt;
+    assert.ok(dueAt !== undefined);
+    await f.slots.writeSlot('active', credential('expired-active', (NOW - 1) * 1000), { cause: 'fixture' });
+    f.now(dueAt!);
+    await pollAnthropic(f.deps());
+    f.now(dueAt! + 181);
+    const accounts = await pollAnthropic(f.deps());
+    assert.equal(accounts.find((account) => account.accountId === 'active')?.buckets['5h'], undefined);
+  });
+
+  it('a mismatched live credential makes no active GET', async () => {
+    const f = await fixture();
+    await f.backend.set(f.paths.keychainService, 'fixture', credential('other-account'));
+    f.store.writeUsagePollPlans('anthropic', { inactive: { nextDueAt: NOW + 300, pollIntervalS: 300 } });
+    const accounts = await pollAnthropic(f.deps());
+    assert.equal(f.calls().gets, 0);
+    assert.equal(accounts.find((account) => account.accountId === 'active')?.buckets['5h'], undefined);
+    assert.equal(f.store.listUsagePolls('anthropic').active, undefined);
+  });
+
+  it('a spend-guard skip yields to the next inactive candidate', async () => {
+    const f = await fixture();
+    const shared = credential('shared', (NOW - 1) * 1000);
+    await f.slots.writeSlot('inactive', shared, { cause: 'fixture' });
+    await f.backend.set(f.paths.keychainService, 'fixture', shared);
+    await f.slots.createSlot({ accountId: 'other', credential: credential('other'), email: 'other@example.test', orgUuid: 'other-org', slotNum: 3, source: 'fixture' });
+    skipActive(f);
+    await pollAnthropic(f.deps());
+    f.now(NOW + 1);
+    await pollAnthropic(f.deps());
+    assert.equal(f.store.listUsagePolls('anthropic').other?.lastStatus, 'ok');
+  });
+
+  it('an unreadable live credential fails closed before inactive spend', async () => {
+    const f = await fixture();
+    await f.slots.writeSlot('inactive', credential('expired', (NOW - 1) * 1000), { cause: 'fixture' });
+    skipActive(f);
+    const deps = f.deps();
+    deps.fetchActiveDeps.live.backend.get = async () => { throw new Error('fixture unreadable'); };
+    await pollAnthropic(deps);
+    assert.equal(f.calls().posts, 0);
+  });
+
+  it('records inactive invalid_client for the doctor check', async () => {
+    const f = await fixture();
+    await f.slots.writeSlot('inactive', credential('expired', (NOW - 1) * 1000), { cause: 'fixture' });
+    skipActive(f);
+    const deps = f.deps();
+    deps.consumeDeps.postRefresh = async () => ({ status: 400, body: '{"error":"invalid_client"}' });
+    await pollAnthropic(deps);
+    assert.equal(f.store.listUsagePolls('anthropic').inactive?.lastStatus, 'invalid_client');
   });
 
   it('keeps last_429_at after a later successful poll', async () => {

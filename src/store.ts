@@ -1840,7 +1840,6 @@ export class Store {
         UPDATE usage_polls SET next_due_at = ?, poll_interval_s = ?
         WHERE provider = ? AND account_id = ?
           AND next_due_at IS ? AND poll_interval_s IS ?
-          AND last_status IS NOT 'token_dead'
           AND (backoff_until IS NULL OR backoff_until <= ?)
           AND (held_until IS NULL OR held_until <= ?)
       `);

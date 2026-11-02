@@ -16,6 +16,7 @@ import {
   type ResyncRotatedBackupDeps,
 } from '../cc-resync';
 import { readLiveClaudeCredentials } from '../cc-credentials';
+import { isCredentialNotFound } from '../credential-backends';
 import { ClaudeSlots } from '../cc-slots';
 import { type AutoswitchAccount } from '../autoswitch';
 import { dueCandidate, planAfterFetch, RECENT_429_WINDOW_S, type Usage } from '../poll-policy';
@@ -96,24 +97,40 @@ function recent429(row: UsagePollRow | undefined, nowS: number): boolean {
 
 const STALE_OK_S = 300;
 const TRUST_MAX_AGE_S = 3600;
+const RATE_LIMIT_TRUST_MAX_AGE_S = 7200;
+const HARD_SENTINEL_STATUSES = new Set(['token-expired', 'foreign-credential', 'keychain-unavailable', 'no-credentials', 'relogin-needed']);
 
-function decisionTrusts(row: UsagePollRow | undefined, fetchedAt: number, nowS: number): boolean {
+function decisionTrusts(row: UsagePollRow | undefined, fetchedAt: number, resetAt: number | undefined, nowS: number): boolean {
   const ageS = nowS - fetchedAt / 1000;
+  if (HARD_SENTINEL_STATUSES.has(row?.lastStatus ?? '')) return ageS <= 180;
+  if (row?.lastStatus === 'http-429') {
+    if (resetAt !== undefined && nowS * 1000 > resetAt) return false;
+    if (ageS <= STALE_OK_S) return true;
+    return ageS <= RATE_LIMIT_TRUST_MAX_AGE_S;
+  }
   if (ageS <= STALE_OK_S) return true;
-  if (ageS > TRUST_MAX_AGE_S || !row) return false;
+  if (!row || ageS > TRUST_MAX_AGE_S) return false;
   return row.consecutiveFailures > 0
     || (row.nextDueAt !== null && row.nextDueAt !== undefined && nowS < row.nextDueAt)
     || (row.heldUntil !== null && row.heldUntil !== undefined && nowS < row.heldUntil);
 }
 
-function freshAccounts(slots: ReturnType<ClaudeSlots['listSlots']>, store: Store, polls: Record<string, UsagePollRow>, nowS: number, models: readonly string[]): AutoswitchAccount[] {
+/** The slot's live dead flag supersedes a legacy sticky poll status. */
+function pollingState(slots: ReturnType<ClaudeSlots['listSlots']>, polls: Record<string, UsagePollRow>): Record<string, UsagePollRow> {
+  const liveIds = new Set(slots.filter((slot) => !slot.dead).map((slot) => slot.accountId));
+  return Object.fromEntries(Object.entries(polls).map(([accountId, row]) => [accountId,
+    liveIds.has(accountId) && row.lastStatus === 'token_dead' ? { ...row, lastStatus: null } : row,
+  ]));
+}
+
+function freshAccounts(slots: ReturnType<ClaudeSlots['listSlots']>, store: Store, polls: Record<string, UsagePollRow>, nowS: number, models: readonly string[], unknownThisTick = new Set<string>()): AutoswitchAccount[] {
   const configuredModels = new Set(models.map((model) => model.toLowerCase()));
   const scopedEnabled = configuredModels.size > 0;
   const allScoped = configuredModels.has('all');
   return slots.filter((slot) => slot.archivedAt == null).map((slot) => {
     const row = polls[slot.accountId];
-    const buckets = Object.fromEntries(Object.entries(store.getAllSnapshots(slot.accountId))
-      .filter(([label, reading]) => decisionTrusts(row, reading.fetchedAt, nowS)
+    const buckets = unknownThisTick.has(slot.accountId) ? {} : Object.fromEntries(Object.entries(store.getAllSnapshots(slot.accountId))
+      .filter(([label, reading]) => decisionTrusts(row, reading.fetchedAt, reading.resetAt, nowS)
         && (!label.startsWith('7d:') || (scopedEnabled && (allScoped || configuredModels.has(label.slice(3).toLowerCase())))))
       .map(([label, reading]) => [label, { usedPct: reading.usedPct, ...(reading.resetAt === undefined ? {} : { resetAt: reading.resetAt }) }]));
     return {
@@ -134,8 +151,9 @@ export async function pollAnthropic(deps: AnthropicPollDeps): Promise<Autoswitch
   const nowS = deps.now();
   const slots = deps.slots.listSlots().filter((slot) => slot.archivedAt == null);
   const activeId = deps.store.getActiveLogin(PROVIDER)?.accountId ?? null;
-  const polls = deps.store.listUsagePolls(PROVIDER);
+  const polls = pollingState(slots, deps.store.listUsagePolls(PROVIDER));
   const settings = deps.store.getAutoswitchSettings();
+  const unknownThisTick = new Set<string>();
   const models = deps.models ?? [];
 
   const record = (accountId: string, previous: Usage | null, next: Usage | null, success: Record<string, BucketReading> | undefined, status: string, isActive: boolean, http429 = false, retryAfterS?: number): void => {
@@ -153,7 +171,7 @@ export async function pollAnthropic(deps: AnthropicPollDeps): Promise<Autoswitch
   };
 
   const active = activeId === null ? null : slots.find((slot) => slot.accountId === activeId) ?? null;
-  if (active && due(active.accountId, polls, nowS)) {
+  if (active && !active.dead && due(active.accountId, polls, nowS)) {
     let current: Awaited<ReturnType<ClaudeSlots['readSlot']>> | null = null;
     try { current = await deps.slots.readSlot(active.accountId, { fresh: true }); } catch { /* unknown below */ }
     const previous = readUsage(deps.store.getAllSnapshots(active.accountId));
@@ -162,20 +180,27 @@ export async function pollAnthropic(deps: AnthropicPollDeps): Promise<Autoswitch
       let creds = current.credential;
       let degraded = false;
       try {
-        creds = await readLiveClaudeCredentials({ ...deps.fetchActiveDeps.live, env: deps.fetchActiveDeps.live.env ?? deps.fetchActiveDeps.env });
+        const live = await readLiveClaudeCredentials({ ...deps.fetchActiveDeps.live, env: deps.fetchActiveDeps.live.env ?? deps.fetchActiveDeps.env });
+        if (credentialLineage(live) !== credentialLineage(current.credential)) {
+          // A switch may have published a successor before active_login commits.
+          // Do not attribute its usage to the outgoing account.
+          unknownThisTick.add(active.accountId);
+        } else creds = live;
       } catch {
         // The slot is only a degraded fallback; do not run the resync hook on it.
         degraded = true;
       }
-      const result = await fetchActiveUsage({
-        ...deps.fetchActiveDeps, slots: deps.slots, store: deps.store, getUsage: deps.getUsage,
-        afterAcceptedUsage: resyncHook({ ...deps.resyncDeps, slots: deps.slots, store: deps.store, verdicts: deps.fetchActiveDeps.verdicts }),
-      }, { accountId: active.accountId, email: active.email ?? '', orgUuid: active.orgUuid ?? '', creds, degraded });
-      if (result.usage && typeof result.usage === 'object' && 'buckets' in result.usage) {
-        const parsed = result.usage as ParsedUsageResponse;
-        const readings = readingsFrom(parsed, nowS);
-        record(active.accountId, previous, parsedUsage(parsed), readings, 'ok', true);
-      } else record(active.accountId, previous, null, undefined, statusFor(result), true, result.error === 'http-429', result.retryAfterS);
+      if (!unknownThisTick.has(active.accountId)) {
+        const result = await fetchActiveUsage({
+          ...deps.fetchActiveDeps, slots: deps.slots, store: deps.store, getUsage: deps.getUsage,
+          afterAcceptedUsage: resyncHook({ ...deps.resyncDeps, slots: deps.slots, store: deps.store, verdicts: deps.fetchActiveDeps.verdicts }),
+        }, { accountId: active.accountId, email: active.email ?? '', orgUuid: active.orgUuid ?? '', creds, degraded });
+        if (result.usage && typeof result.usage === 'object' && 'buckets' in result.usage) {
+          const parsed = result.usage as ParsedUsageResponse;
+          const readings = readingsFrom(parsed, nowS);
+          record(active.accountId, previous, parsedUsage(parsed), readings, 'ok', true);
+        } else record(active.accountId, previous, null, undefined, statusFor(result), true, result.error === 'http-429', result.retryAfterS);
+      }
     }
   }
 
@@ -194,27 +219,32 @@ export async function pollAnthropic(deps: AnthropicPollDeps): Promise<Autoswitch
         // candidate selection above and a refresh POST. Re-check both at spend time.
         const activeNow = deps.store.getActiveLogin(PROVIDER)?.accountId ?? null;
         let live: string | null = null;
-        try { live = await readLiveClaudeCredentials({ ...deps.fetchActiveDeps.live, env: deps.fetchActiveDeps.live.env ?? deps.fetchActiveDeps.env }); } catch { /* no live lineage to compare */ }
-        if (activeNow === inactiveId || (live !== null && credentialLineage(live) === credentialLineage(credential))) {
+        let liveUnreadable = false;
+        try { live = await readLiveClaudeCredentials({ ...deps.fetchActiveDeps.live, env: deps.fetchActiveDeps.live.env ?? deps.fetchActiveDeps.env }); } catch (error) { liveUnreadable = !isCredentialNotFound(error); }
+        if (activeNow === inactiveId || liveUnreadable || (live !== null && credentialLineage(live) === credentialLineage(credential))) {
+          // Yield this candidate so another inactive account can be polled.
+          deps.store.writeUsagePollPlans(PROVIDER, { [inactiveId]: { nextDueAt: nowS + (polls[inactiveId]?.pollIntervalS ?? 300), pollIntervalS: polls[inactiveId]?.pollIntervalS ?? 300 } });
           skipped = true;
         } else {
           const consumed = await consumeClaudeSlot({ ...deps.consumeDeps, slots: deps.slots, now: () => nowS * 1000 }, { accountId: inactiveId, snapshot: credential });
           if (consumed.kind === 'dead') {
+            let strike: 'struck' | 'already-dead' | 'lineage-moved' = 'lineage-moved';
             if (consumed.consumedFp) {
               try {
-                await deps.slots.strikeDead(inactiveId, { reason: parseCredentialBlob(credential)?.oauth?.refreshToken ? 'invalid_grant' : 'no_refresh_token', struckFp: consumed.consumedFp, ts: nowS * 1000 });
-              } catch { /* preserve the terminal poll status even if the strike write fails */ }
+                strike = await deps.slots.strikeDead(inactiveId, { reason: parseCredentialBlob(credential)?.oauth?.refreshToken ? 'invalid_grant' : 'no_refresh_token', struckFp: consumed.consumedFp, ts: nowS * 1000 });
+              } catch { /* a failed strike is not a durable dead mark */ }
             }
-            record(inactiveId, previous, null, undefined, 'token_dead', false);
+            record(inactiveId, previous, null, undefined, 'consume-dead', false);
             skipped = true;
+            if (strike === 'lineage-moved') { /* keep the slot eligible after ordinary failure backoff */ }
           } else if (consumed.kind === 'consume-gate-unpersisted') {
-            // prepareClaudeSwitch refuses this unsafe result; do the same rather
-            // than spending or discarding its only successor copy.
+            // Like cc-switch, the successor is lost; refuse durably and never reuse its spent predecessor.
+            deps.store.recordClaudeSwitchRefusal({ from: activeId, to: inactiveId, trigger: 'auto', reason: 'freshen-consume-gate-unpersisted', injected: false, attempt: `poll-freshen-${inactiveId}-${nowS}`, now: nowS * 1000 });
             try { deps.consumeDeps.warn?.('Claude refresh successor was not persisted; inactive poll stopped'); } catch { /* diagnostic only */ }
-            record(inactiveId, previous, null, undefined, `consume-${consumed.kind}`, false);
+            record(inactiveId, previous, null, undefined, `consume-${consumed.kind}`, false, false, 3600);
             skipped = true;
           } else if (consumed.kind !== 'refreshed' && consumed.kind !== 'current') {
-            record(inactiveId, previous, null, undefined, `consume-${consumed.kind}`, false);
+            record(inactiveId, previous, null, undefined, consumed.kind === 'systemic' ? 'invalid_client' : `consume-${consumed.kind}`, false);
             skipped = true;
           } else {
             credential = consumed.credential ?? null;
@@ -243,5 +273,5 @@ export async function pollAnthropic(deps: AnthropicPollDeps): Promise<Autoswitch
       }
     }
   }
-  return freshAccounts(deps.slots.listSlots(), deps.store, deps.store.listUsagePolls(PROVIDER), nowS, models);
+  return freshAccounts(deps.slots.listSlots(), deps.store, pollingState(deps.slots.listSlots(), deps.store.listUsagePolls(PROVIDER)), nowS, models, unknownThisTick);
 }
