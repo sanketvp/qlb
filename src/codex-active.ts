@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 
 import { accessExpiry, needsRefresh, type CodexAuthDocument } from './codex-auth';
-import { codexIdentityParts, readCodexSwitchHistory, renewers, type CodexProcess } from './codex-sessions';
+import { codexIdentityParts, holderSets, readCodexSwitchHistory, renewers, type CodexProcess } from './codex-sessions';
 import type { CodexRecoveryFenceState, CodexSwitchDeps } from './codex-switch';
 
 const NEAR_EXPIRY_MS = 5 * 60_000;
@@ -118,17 +118,14 @@ export function classifyActiveCodexExpiry(doc: CodexAuthDocument, now: number): 
   return { state: 'usable', expiresAt, leftMs };
 }
 
-/**
- * Returns processes capable of renewing an active identity. Before QLB has any
- * durable history, every listed Codex process is conservatively a renewer.
- */
+/** Returns processes capable of renewing an active identity, conservatively treating every listed process as a renewer when history has no holder identity evidence. */
 export async function activeCodexRenewers(
   deps: Pick<CodexActiveDeps, 'dbPath' | 'journalDir' | 'list'>,
   accountId: string,
 ): Promise<CodexProcess[]> {
   const history = readCodexSwitchHistory(deps.dbPath, { journalDir: deps.journalDir });
   const processes = await listOrFail(deps.list)();
-  if (history.rows.length === 0 && history.observations.length === 0) return processes;
+  if (!holderSets(history.rows, history.observations).some((set) => set.identities.length > 0)) return processes;
   return renewers(codexIdentityParts(accountId), processes, history.rows, history.observations);
 }
 

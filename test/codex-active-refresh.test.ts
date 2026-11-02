@@ -90,6 +90,47 @@ describe('codex active refresh helpers', () => {
     } finally { h.close(); }
   });
 
+  it('only a not-published failed row ⇒ every process is a renewer', async () => {
+    const processes = [process(111, -30_000), process(112, 30_000)];
+    const h = harness(async () => processes);
+    try {
+      h.store.recordSwitch({
+        provider: 'openai-codex', fromAccount: A, toAccount: B, trigger: 'manual', outcome: 'failed',
+        detail: 'not-published', ts: NOW, publishedAt: null,
+      });
+      assert.deepEqual(await activeCodexRenewers(h.deps, A), processes);
+    } finally { h.close(); }
+  });
+
+  it('only a refused row with no source account ⇒ every process is a renewer', async () => {
+    const processes = [process(121, -30_000), process(122, 30_000)];
+    const h = harness(async () => processes);
+    try {
+      h.store.recordSwitch({
+        provider: 'openai-codex', fromAccount: null, toAccount: B, trigger: 'manual', outcome: 'refused', ts: NOW,
+      });
+      assert.deepEqual(await activeCodexRenewers(h.deps, A), processes);
+    } finally { h.close(); }
+  });
+
+  it('only a null-identity observation ⇒ every process is a renewer', async () => {
+    const processes = [process(131, -30_000), process(132, 30_000)];
+    const h = harness(async () => processes);
+    try {
+      h.store.recordCodexObservation({ identity: null, lineageFp: null, by: 'qlb-active', now: NOW });
+      assert.deepEqual(await activeCodexRenewers(h.deps, A), processes);
+    } finally { h.close(); }
+  });
+
+  it('history naming a different account uses renewers instead of the fallback', async () => {
+    const processes = [process(141, -30_000), process(142, 30_000)];
+    const h = harness(async () => processes);
+    try {
+      observe(h, B, NOW);
+      assert.deepEqual(await activeCodexRenewers(h.deps, A), []);
+    } finally { h.close(); }
+  });
+
   it('one observation and no switch rows ⇒ processes started before it renew the observed identity', async () => {
     const before = process(201, -20_000);
     const after = process(202, 20_000);
