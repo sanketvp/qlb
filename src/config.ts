@@ -51,7 +51,7 @@ export const CONFIG_ENV_VARS = Object.fromEntries(
 export function defaultConfig(home: string = qlbHomeDir()): QlbConfig {
   const qlbDir = join(home, '.qlb');
   // Keep this literal spelling: join() would erase a hostile segment in HOME.
-  const piAuthJsonPathRaw = home === '/' ? '/.pi/agent/auth.json' : `${home}/.pi/agent/auth.json`;
+  const piAuthJsonPathRaw = `${home.replace(/\/+$/, '')}/.pi/agent/auth.json`;
   return {
     anthropicPoolPath: join(home, '.pi', 'agent', 'anthropic-pool.json'),
     piAuthJsonPath: join(home, '.pi', 'agent', 'auth.json'),

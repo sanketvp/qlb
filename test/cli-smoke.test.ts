@@ -697,6 +697,20 @@ describe('CLI smoke — documented commands', () => {
     assertNoMigrateStore(root);
   });
 
+  it('migrate accepts a home spelling with a trailing slash', () => {
+    const env = isolatedEnv();
+    const root = String(env.HOME);
+    const home = join(root, 'home');
+    mkdirSync(join(home, '.pi', 'agent'), { recursive: true });
+    env.QLB_HOME = `${home}/`;
+    delete env.QLB_PI_AUTH_JSON_PATH;
+
+    const result = runCli([
+      'migrate', 'status', '--provider', 'openrouter', '--owner-file', join(root, 'owner.json'),
+    ], env);
+    assert.doesNotMatch(result.stderr, /unsafe-migrate-path/);
+  });
+
   it('10 migrate rejects dot segments in every guarded flag', () => {
     const { env, safe } = migrateFixture();
     const flags = ['--pool-file', '--owner-file', '--auth-json'] as const;
