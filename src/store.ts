@@ -2455,6 +2455,39 @@ export class Store {
     });
   }
 
+  /** S14's read-only automatic Claude switch-history projection. */
+  listAnthropicAutoswitchBreakerRows(): Array<{
+    ts: number;
+    trigger: string;
+    outcome: string;
+    automatic: boolean;
+    injected: boolean;
+  }> {
+    return (this.db.prepare(`SELECT committed_at AS ts, trigger, outcome,
+      CASE WHEN trigger = 'manual' THEN 0 ELSE 1 END AS automatic, injected
+      FROM switch_log
+      WHERE provider = 'anthropic' AND committed_at IS NOT NULL`).all() as Array<{
+      ts: number; trigger: string; outcome: string; automatic: number; injected: number;
+    }>).map((row) => ({ ...row, automatic: row.automatic !== 0, injected: row.injected !== 0 }));
+  }
+
+  /** Recovery for a completed auto switch whose config timestamp did not land. */
+  latestCommittedAnthropicAutoswitchAt(): number | undefined {
+    const row = this.db.prepare(`SELECT committed_at FROM switch_log
+      WHERE provider = 'anthropic' AND outcome = 'ok' AND trigger <> 'manual'
+        AND committed_at IS NOT NULL
+      ORDER BY committed_at DESC, id DESC LIMIT 1`).get() as { committed_at: number } | undefined;
+    return row?.committed_at;
+  }
+
+  /** The actual transaction commit time for one successful Claude switch. */
+  committedAnthropicSwitchAt(switchId: number): number | undefined {
+    const row = this.db.prepare(`SELECT committed_at FROM switch_log
+      WHERE id = ? AND provider = 'anthropic' AND outcome = 'ok'
+        AND committed_at IS NOT NULL`).get(switchId) as { committed_at: number } | undefined;
+    return row?.committed_at;
+  }
+
   /** Find the committed Claude switch for an attempt; refusals and rollbacks do not finish one. */
   findClaudeSwitchByAttempt(attempt: string): {
     id: number;
