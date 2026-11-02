@@ -24,9 +24,9 @@ function parse(args: string[]): Options | null {
 function readPlanState(dbPath: string): Pick<PlanHandBackDependencies, 'slots' | 'activeAccountId' | 'migratedPiProviders'> {
   const db = openStoreConnection(dbPath, true);
   try {
-    const slots = db.prepare(`SELECT account_id AS accountId, slot_num AS slotNum, email, fingerprint, source
-      FROM claude_slots WHERE archived_at IS NULL AND dead = 0 ORDER BY slot_num, account_id`).all() as Array<{
-      accountId: string; slotNum: number | null; email: string | null; fingerprint: string | null; source: string | null;
+    const slots = db.prepare(`SELECT account_id AS accountId, slot_num AS slotNum, email, fingerprint, source, dead
+      FROM claude_slots WHERE archived_at IS NULL ORDER BY slot_num, account_id`).all() as Array<{
+      accountId: string; slotNum: number | null; email: string | null; fingerprint: string | null; source: string | null; dead: number;
     }>;
     const active = db.prepare("SELECT account_id AS accountId FROM active_login WHERE provider = 'anthropic'").get() as { accountId: string | null } | undefined;
     const migrated = db.prepare("SELECT key FROM config WHERE key LIKE 'pi.%.state' AND value = 'migrated' ORDER BY key").all() as Array<{ key: string }>;
@@ -80,11 +80,23 @@ export async function runUndoCswapCommand(
     return 0;
   } catch (error) {
     if (error instanceof CswapUndoRefusalError) {
-      const detail = error.code === 'qlb-add-slot'
-        ? 'qlb-add slot'
-        : error.code === 'pi-migrated'
-          ? `migrated Pi provider ${error.provider ?? 'unknown'}`
-          : 'active Claude slot';
+      if (error.code === 'qlb-add-slot') {
+        if (options.json) {
+          ctx.stdout(JSON.stringify({
+            dryRun: true,
+            refused: error.code,
+            slots: error.slots,
+          }));
+        } else {
+          ctx.stderr(`qlb undo cswap: refused: qlb-add slots ${error.slots
+            .map((slot) => `${slot.accountNumber} (${slot.email})`)
+            .join(', ')}`);
+        }
+        return 3;
+      }
+      const detail = error.code === 'pi-migrated'
+        ? `migrated Pi provider ${error.provider ?? 'unknown'}`
+        : 'active Claude slot';
       ctx.stderr(`qlb undo cswap: refused: ${detail}`);
       return 3;
     }

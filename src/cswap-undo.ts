@@ -1,7 +1,7 @@
 // Read-only planning for the Claude C-swap hand-back. Credential bytes remain
 // inside injected readers; plans expose only refresh-token fingerprint prefixes.
 
-import { existsSync } from 'node:fs';
+import { readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { credentialFingerprint } from './anthropic-oauth';
@@ -16,6 +16,7 @@ export interface HandBackSlot {
   email: string | null;
   fingerprint: string | null;
   source: string | null;
+  dead: number;
 }
 
 export type HandBackAction = 'update' | 'noop';
@@ -41,13 +42,19 @@ export interface PlanHandBackDependencies {
   migratedPiProviders: () => string[];
   backupDir: string;
   keychain: Pick<ClaudeSlotBackend, 'get'>;
-  encExists?: (path: string) => boolean;
+  listCredentials?: (path: string) => string[];
+}
+
+export interface CswapUndoRefusalSlot {
+  accountNumber: number;
+  email: string;
 }
 
 export class CswapUndoRefusalError extends Error {
   constructor(
     readonly code: 'qlb-add-slot' | 'pi-migrated' | 'active-slot-missing',
     readonly provider?: string,
+    readonly slots: CswapUndoRefusalSlot[] = [],
   ) {
     super(code);
     this.name = 'CswapUndoRefusalError';
@@ -55,7 +62,7 @@ export class CswapUndoRefusalError extends Error {
 }
 
 function requireSlotCoordinate(slot: HandBackSlot): { accountNumber: number; email: string } {
-  if (!Number.isSafeInteger(slot.slotNum) || slot.slotNum == null || slot.slotNum < 1 || !slot.email || /[\\/\0:]/.test(slot.email)) {
+  if (!Number.isSafeInteger(slot.slotNum) || slot.slotNum == null || slot.slotNum < 1 || !slot.email || /[\x00-\x1f\x7f\\/:]/.test(slot.email)) {
     throw new Error('Claude hand-back slot coordinates are invalid');
   }
   return { accountNumber: slot.slotNum, email: slot.email };
@@ -90,6 +97,26 @@ async function optionalCswapCredential(
   }
 }
 
+function encryptedCredentials(
+  listCredentials: (path: string) => string[],
+  backupDir: string,
+  accountNumber: number,
+): string[] {
+  const directory = join(backupDir, 'credentials');
+  let names: string[];
+  try {
+    names = listCredentials(directory);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw error;
+  }
+  const prefix = `.creds-${accountNumber}-`;
+  return names
+    .filter((name) => name.startsWith(prefix) && name.endsWith('.enc'))
+    .sort()
+    .map((name) => join(directory, name));
+}
+
 /**
  * Builds the read-only G16 hand-back plan. `update` means C-swap does not
  * currently hold the slot's persisted refresh-token lineage; access-token-only
@@ -97,20 +124,23 @@ async function optionalCswapCredential(
  */
 export async function planHandBack(deps: PlanHandBackDependencies): Promise<HandBackPlan> {
   const allSlots = deps.slots();
-  const slots = allSlots.filter((slot) => slot.source !== 'qlb-add');
-  const qlbAdd = allSlots.find((slot) => slot.source === 'qlb-add');
-  if (qlbAdd) throw new CswapUndoRefusalError('qlb-add-slot');
+  const qlbAdd = allSlots
+    .filter((slot) => slot.source === 'qlb-add')
+    .map((slot) => requireSlotCoordinate(slot))
+    .sort((left, right) => left.accountNumber - right.accountNumber);
+  if (qlbAdd.length > 0) throw new CswapUndoRefusalError('qlb-add-slot', undefined, qlbAdd);
+  const slots = allSlots.filter((slot) => slot.source !== 'qlb-add' && !slot.dead);
 
   const migrated = deps.migratedPiProviders().sort();
   if (migrated.length > 0) throw new CswapUndoRefusalError('pi-migrated', migrated[0]);
 
   const activeAccountId = deps.activeAccountId();
-  const active = activeAccountId === null ? null : slots.find((slot) => slot.accountId === activeAccountId);
+  const active = activeAccountId === null ? null : allSlots.find((slot) => slot.accountId === activeAccountId);
   if ((slots.length > 0 && activeAccountId === null) || (activeAccountId !== null && !active)) {
     throw new CswapUndoRefusalError('active-slot-missing');
   }
 
-  const encExists = deps.encExists ?? existsSync;
+  const listCredentials = deps.listCredentials ?? readdirSync;
   const plans: HandBackSlotPlan[] = [];
   const deleteEnc: string[] = [];
   for (const slot of [...slots].sort((left, right) => (left.slotNum ?? Number.MAX_SAFE_INTEGER) - (right.slotNum ?? Number.MAX_SAFE_INTEGER))) {
@@ -129,8 +159,7 @@ export async function planHandBack(deps: PlanHandBackDependencies): Promise<Hand
       action,
       fingerprint: fingerprintPrefix(sourceFingerprint),
     });
-    const enc = join(deps.backupDir, 'credentials', `.creds-${accountNumber}-${email}.enc`);
-    if (encExists(enc)) deleteEnc.push(enc);
+    deleteEnc.push(...encryptedCredentials(listCredentials, deps.backupDir, accountNumber));
   }
 
   return {

@@ -72,12 +72,12 @@ function context(f: Fixture): CommandContext {
   };
 }
 
-function addSlot(f: Fixture, input: { accountId: string; number: number; email: string; refresh: string; source?: string; active?: boolean }): void {
+function addSlot(f: Fixture, input: { accountId: string; number: number; email: string; refresh: string; source?: string; active?: boolean; dead?: boolean }): void {
   const db = openStoreConnection(f.dbPath);
   try {
-    db.prepare(`INSERT INTO claude_slots (account_id, slot_num, email, config_json, fingerprint, added_at, source)
-      VALUES (?, ?, ?, ?, ?, ?, ?)`).run(
-      input.accountId, input.number, input.email, '{}', lineage(input.refresh), 1, input.source ?? 'cswap-import',
+    db.prepare(`INSERT INTO claude_slots (account_id, slot_num, email, config_json, fingerprint, added_at, source, dead)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      input.accountId, input.number, input.email, '{}', lineage(input.refresh), 1, input.source ?? 'cswap-import', input.dead ? 1 : 0,
     );
     if (input.active) {
       db.prepare("INSERT INTO active_login (provider, account_id, since, set_by) VALUES ('anthropic', ?, 1, 'test')")
@@ -152,13 +152,83 @@ describe('qlb undo cswap --dry-run', () => {
     }
   });
 
+  it('a dead active slot still plans healthy slots', async () => {
+    const f = fixture();
+    try {
+      addSlot(f, { accountId: 'account-dead', number: 1, email: 'dead@example.test', refresh: 'refresh-dead', active: true, dead: true });
+      addSlot(f, { accountId: 'account-healthy', number: 2, email: 'healthy@example.test', refresh: 'refresh-healthy' });
+      f.keychain.set('claude-swap', 'account-2-healthy@example.test', credential('account-healthy', 'refresh-healthy'));
+
+      assert.equal(await dryRun(f), 0);
+      const plan = JSON.parse(f.output[0]!);
+      assert.equal(plan.activeAccountNumber, 1);
+      assert.deepEqual(plan.slots.map((slot: { accountNumber: number; action: string }) => [slot.accountNumber, slot.action]), [[2, 'noop']]);
+    } finally {
+      close(f);
+    }
+  });
+
+  it('lists a stale encrypted credential after its slot email changes', async () => {
+    const f = fixture();
+    try {
+      addSlot(f, { accountId: 'account-a', number: 1, email: 'new@example.test', refresh: 'refresh-current', active: true });
+      f.keychain.set('claude-swap', 'account-1-new@example.test', credential('account-a', 'refresh-current'));
+      const oldEnc = join(f.backup, 'credentials', '.creds-1-old@example.test.enc');
+      writeFileSync(oldEnc, 'stale encrypted fixture');
+
+      assert.equal(await dryRun(f), 0);
+      assert.deepEqual(JSON.parse(f.output[0]!).deleteEnc, [oldEnc]);
+    } finally {
+      close(f);
+    }
+  });
+
+  it('does not list slot 11 encrypted credentials for slot 1', async () => {
+    const f = fixture();
+    try {
+      addSlot(f, { accountId: 'account-one', number: 1, email: 'one@example.test', refresh: 'refresh-one', active: true });
+      f.keychain.set('claude-swap', 'account-1-one@example.test', credential('account-one', 'refresh-one'));
+      writeFileSync(join(f.backup, 'credentials', '.creds-11-eleven@example.test.enc'), 'other slot fixture');
+
+      assert.equal(await dryRun(f), 0);
+      assert.deepEqual(JSON.parse(f.output[0]!).deleteEnc, []);
+    } finally {
+      close(f);
+    }
+  });
+
+  it('refuses emails with terminal control characters', async () => {
+    for (const email of ['newline\n@example.test', 'escape\u001b@example.test']) {
+      const f = fixture();
+      try {
+        addSlot(f, { accountId: `account-${email.length}`, number: 1, email, refresh: 'refresh-current', active: true });
+
+        assert.equal(await dryRun(f), 1);
+        assert.deepEqual(f.output, ['ERR:qlb undo cswap: plan unavailable']);
+      } finally {
+        close(f);
+      }
+    }
+  });
+
   it('a qlb-add slot is refused by name', async () => {
     const f = fixture();
     try {
       addSlot(f, { accountId: 'account-added', number: 2, email: 'added@example.test', refresh: 'refresh-added', source: 'qlb-add', active: true });
+      addSlot(f, { accountId: 'account-added-too', number: 3, email: 'also-added@example.test', refresh: 'refresh-added-too', source: 'qlb-add' });
 
+      assert.equal(await runUndoCswapCommand(['--dry-run'], context(f), { keychain: f.keychain, backupDir: f.backup }), 3);
+      assert.deepEqual(f.output, ['ERR:qlb undo cswap: refused: qlb-add slots 2 (added@example.test), 3 (also-added@example.test)']);
+      f.output.length = 0;
       assert.equal(await dryRun(f), 3);
-      assert.deepEqual(f.output, ['ERR:qlb undo cswap: refused: qlb-add slot']);
+      assert.deepEqual(JSON.parse(f.output[0]!), {
+        dryRun: true,
+        refused: 'qlb-add-slot',
+        slots: [
+          { accountNumber: 2, email: 'added@example.test' },
+          { accountNumber: 3, email: 'also-added@example.test' },
+        ],
+      });
       assert.equal(f.keychain.reads.length, 0, 'a refused qlb-add slot must not read credentials');
     } finally {
       close(f);
