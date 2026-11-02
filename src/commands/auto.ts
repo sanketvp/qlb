@@ -1,4 +1,4 @@
-import { chmodSync, closeSync, mkdirSync, openSync } from 'node:fs';
+import { chmodSync, closeSync, constants, fchmodSync, lstatSync, mkdirSync, openSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
 import { AutoAdmissionRefused, runAuto, type AutoDependencies, type AutoRunResult, type RunAutoOptions } from '../auto';
@@ -82,8 +82,25 @@ function installAutoLaunchAgent(ctx: CommandContext): string {
   mkdirSync(qlbDir, { recursive: true, mode: 0o700 });
   chmodSync(qlbDir, 0o700);
   try {
-    closeSync(openSync(logPath, 'a', 0o600));
-    chmodSync(logPath, 0o600);
+    let descriptor: number;
+    try {
+      const logStats = lstatSync(logPath);
+      if (!logStats.isFile()) throw new Error('auto.log must be a regular file');
+      descriptor = openSync(logPath, constants.O_WRONLY | constants.O_APPEND | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+      try {
+        fchmodSync(descriptor, 0o600);
+      } finally {
+        closeSync(descriptor);
+      }
+    } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      descriptor = openSync(
+        logPath,
+        constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_APPEND | constants.O_NOFOLLOW,
+        0o600,
+      );
+      closeSync(descriptor);
+    }
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
     throw new Error(`unable to secure auto.log: ${detail}`);

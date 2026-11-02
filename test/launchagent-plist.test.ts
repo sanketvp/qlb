@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import { describe, it } from 'node:test';
@@ -129,6 +129,50 @@ describe('QLB auto LaunchAgent template (AC45)', () => {
       assert.equal(statSync(logPath).mode & 0o777, 0o644);
       assert.equal(await runAutoCommand(['install-agent'], ctx), 0);
       assert.equal(statSync(logPath).mode & 0o777, 0o600);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses an auto.log directory without writing an agent plist', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-launchagent-log-directory-'));
+    const home = join(root, 'home');
+    const stderr: string[] = [];
+    const ctx: CommandContext = {
+      stdout: () => undefined, stderr: (line) => stderr.push(line),
+      env: { QLB_TEST_MODE: '1', QLB_HOME: home, HOME: home }, config: defaultConfig(home),
+      loadConfig: () => defaultConfig(home), home,
+      registerSecret: () => undefined, deliverSecret: () => undefined, knownSecrets: () => [],
+    };
+    try {
+      mkdirSync(join(home, '.qlb', 'auto.log'), { recursive: true, mode: 0o700 });
+      assert.equal(await runAutoCommand(['install-agent'], ctx), 1);
+      assert.match(stderr.join('\n'), /unable to secure auto\.log/);
+      assert.equal(existsSync(join(home, 'Library', 'LaunchAgents', agentName)), false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses an auto.log symlink without changing its target', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-launchagent-log-symlink-'));
+    const home = join(root, 'home');
+    const logPath = join(home, '.qlb', 'auto.log');
+    const targetPath = join(root, 'symlink-target');
+    const stderr: string[] = [];
+    const ctx: CommandContext = {
+      stdout: () => undefined, stderr: (line) => stderr.push(line),
+      env: { QLB_TEST_MODE: '1', QLB_HOME: home, HOME: home }, config: defaultConfig(home),
+      loadConfig: () => defaultConfig(home), home,
+      registerSecret: () => undefined, deliverSecret: () => undefined, knownSecrets: () => [],
+    };
+    try {
+      mkdirSync(join(home, '.qlb'), { recursive: true, mode: 0o700 });
+      writeFileSync(targetPath, 'target must remain unchanged');
+      symlinkSync(targetPath, logPath);
+      assert.equal(await runAutoCommand(['install-agent'], ctx), 1);
+      assert.match(stderr.join('\n'), /unable to secure auto\.log: auto\.log must be a regular file/);
+      assert.equal(readFileSync(targetPath, 'utf8'), 'target must remain unchanged');
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
