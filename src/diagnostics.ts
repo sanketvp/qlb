@@ -58,7 +58,12 @@ import { piEvidenceGapCheck } from './checks/pi-evidence-gap';
 import { qlbHomeDir } from './home';
 import { piReleaseAppDir } from './pi-deploy';
 import { probeHostEnvironment, type HostCommandRunner } from './checks/hosts-env';
+import { autoAgentCheck } from './checks/auto-agent';
 import { autoBreakerCheck } from './checks/auto-breaker';
+import { cswapAgentCheck } from './checks/cswap-agent';
+import { cswapProcessesCheck } from './checks/cswap-processes';
+import type { CswapAgentStatus } from './cswap-agent';
+import type { CswapProcess } from './cswap-processes';
 import { claudeOauthClientCheck } from './checks/claude-oauth-client';
 import { claudeSlotsCheck } from './checks/claude-slots';
 import { codexSlotsCheck } from './checks/codex-slots';
@@ -544,6 +549,10 @@ export async function doctorQlb(
     piProcessList?: () => string;
     /** Tests inject a stable read; production reads lifecycle once per report. */
     readLifecyclePhase?: (dbPath: string) => LifecyclePhaseResult;
+    /** H2 process-table seam; production uses the shared S24 resolver. */
+    cswapProcesses?: () => CswapProcess[];
+    /** H2 LaunchAgent seam; production runs `launchctl print` only outside test mode. */
+    cswapAgentStatus?: () => CswapAgentStatus;
   } = {},
 ): Promise<DoctorReport> {
   const checks: DoctorCheck[] = [];
@@ -748,6 +757,9 @@ export async function doctorQlb(
     claudeConfigFileCheck(),
     claudeLocksCheck(),
     autoBreakerCheck(config.dbPath, 'anthropic', lifecycle),
+    autoAgentCheck(config.dbPath, lifecycle, options.now?.() ?? Date.now()),
+    cswapAgentCheck(lifecycle, { status: options.cswapAgentStatus }),
+    cswapProcessesCheck(lifecycle, { list: options.cswapProcesses, env: process.env }),
     claudeOauthClientCheck(config.dbPath, lifecycle),
     claudeSlotsCheck(config.dbPath, phase),
     codexSlotsCheck(config.dbPath, phase),

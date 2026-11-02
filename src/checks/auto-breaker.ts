@@ -3,7 +3,7 @@ import { check, guardCheck } from './_check';
 import type { HealthCheck } from './claude-slots';
 import { lifecyclePhase, type LifecyclePhaseResult } from './lifecycle-phase';
 
-export default check('auto', 'auto');
+export default check('auto:anthropic:breaker');
 
 /** S14: an unexpired suspension is a doctor failure and is never extended by doctor. */
 export function autoBreakerCheck(dbPath: string, provider: string, now?: number): HealthCheck;

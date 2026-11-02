@@ -199,8 +199,38 @@ export interface LaunchctlCswapAgentDependencies {
   sleep(ms: number): Promise<void>;
 }
 
-const CSWAP_LABEL = 'com.cswap.auto';
-const CSWAP_PLIST = `${CSWAP_LABEL}.plist`;
+export const CSWAP_AGENT_LABEL = 'com.cswap.auto';
+const CSWAP_PLIST = `${CSWAP_AGENT_LABEL}.plist`;
+
+export type CswapAgentStatus = 'loaded' | 'not-loaded' | 'unknown';
+
+export interface CswapAgentStatusDependencies {
+  /** `launchctl print` is an inspection only; callers inject this in tests. */
+  exec(file: string, args: readonly string[]): string | void;
+  uid(): number;
+}
+
+function missingAgent(error: unknown): boolean {
+  const code = errorCode(error);
+  const message = error instanceof Error ? error.message : '';
+  return code === 'ESRCH' || /(?:not found|could not find service|no such process)/i.test(message);
+}
+
+/**
+ * Read the C-swap LaunchAgent state without changing it. Unknown command
+ * failures remain distinct from an unloaded service so doctor can warn rather
+ * than claim the hand-off is safe.
+ */
+export function inspectCswapAgent(
+  deps: CswapAgentStatusDependencies,
+): CswapAgentStatus {
+  try {
+    deps.exec('/bin/launchctl', ['print', `gui/${deps.uid()}/${CSWAP_AGENT_LABEL}`]);
+    return 'loaded';
+  } catch (error) {
+    return missingAgent(error) ? 'not-loaded' : 'unknown';
+  }
+}
 
 function commandErrorCode(error: unknown): string {
   const code = errorCode(error);
@@ -249,8 +279,8 @@ export function launchctlCswapAgent(deps: LaunchctlCswapAgentDependencies): Cswa
   const plist = () => join(deps.home(), 'Library', 'LaunchAgents', CSWAP_PLIST);
   const backup = () => join(deps.qlbHome(), '.qlb', 'backups', 'cswap-plist', CSWAP_PLIST);
   return {
-    bootout: () => operation(deps, ['bootout', `${domain()}/${CSWAP_LABEL}`], true),
-    disable: () => operation(deps, ['disable', `${domain()}/${CSWAP_LABEL}`], true),
+    bootout: () => operation(deps, ['bootout', `${domain()}/${CSWAP_AGENT_LABEL}`], true),
+    disable: () => operation(deps, ['disable', `${domain()}/${CSWAP_AGENT_LABEL}`], true),
     movePlist: () => {
       const source = plist();
       const target = backup();
@@ -276,7 +306,7 @@ export function launchctlCswapAgent(deps: LaunchctlCswapAgentDependencies): Cswa
       } catch (error) {
         return { ok: false, code: commandErrorCode(error) };
       }
-      const enable = operation(deps, ['enable', `${domain()}/${CSWAP_LABEL}`], true);
+      const enable = operation(deps, ['enable', `${domain()}/${CSWAP_AGENT_LABEL}`], true);
       if (!enable.ok) return enable;
       return operation(deps, ['bootstrap', domain(), source]);
     },
