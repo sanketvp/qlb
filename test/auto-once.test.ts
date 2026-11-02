@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
-import { runAuto } from '../src/auto';
+import { AutoAdmissionRefused, runAuto } from '../src/auto';
 import { runAutoCommand } from '../src/commands/auto';
 import { claudePaths } from '../src/cc-paths';
 import { claudeSwitchJournalPath, createClaudeSwitchJournal, type ClaudeSwitchJournal } from '../src/cc-switch-journal';
@@ -89,6 +89,44 @@ function close(root: string): void {
 }
 
 describe('qlb auto --once (G12)', () => {
+  it('keeps interactive refusal exits while the LaunchAgent acknowledges them', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-auto-agent-refusal-'));
+    const home = join(root, 'home');
+    const context = (stderr: string[]): CommandContext => ({
+      stdout: () => undefined, stderr: (line) => stderr.push(line), env: testEnv(home),
+      config: {} as CommandContext['config'], loadConfig: () => { throw new Error('not used'); }, home,
+      registerSecret: () => undefined, deliverSecret: () => undefined, knownSecrets: () => [],
+    });
+    try {
+      const lockRefusalCases: Array<[string[], number]> = [
+        [['--once'], 3],
+        [['--once', '--agent'], 0],
+      ];
+      for (const [args, expected] of lockRefusalCases) {
+        const stderr: string[] = [];
+        assert.equal(await runAutoCommand(args, context(stderr), {
+          acquireFlock: async () => null,
+          runAuto: async () => { throw new Error('runAuto must not run without a lock'); },
+        }), expected);
+        assert.deepEqual(stderr, ['qlb auto: auto-already-running']);
+      }
+      const admissionRefusalCases: Array<[string[], number]> = [
+        [['--once', '--dry-run'], 3],
+        [['--once', '--dry-run', '--agent'], 0],
+      ];
+      for (const [args, expected] of admissionRefusalCases) {
+        const stderr: string[] = [];
+        assert.equal(await runAutoCommand(args, context(stderr), {
+          acquireFlock: async () => { throw new Error('dry run must not lock'); },
+          runAuto: async () => { throw new AutoAdmissionRefused('cutover-not-ready'); },
+        }), expected);
+        assert.deepEqual(stderr, ['qlb auto: refused: cutover-not-ready']);
+      }
+    } finally {
+      close(root);
+    }
+  });
+
   it('a second loop exits 3', async () => {
     const root = mkdtempSync(join(tmpdir(), 'qlb-auto-lock-'));
     const home = join(root, 'home');
@@ -311,7 +349,7 @@ describe('qlb auto --once (G12)', () => {
             assertAdmitted: () => ({ ok: true }), listCswapProcesses: () => [],
           }),
         }),
-      }, args: ['--once'] }, ctx);
+      }, args: ['--once', '--agent'] }, ctx);
       assert.equal(code, 1);
       assert.equal(ticks, 0);
       assert.deepEqual(stdout, []);
