@@ -126,6 +126,8 @@ const AUDIT_DIR = join(homedir(), ".qlb");
 const AUDIT_FILE = join(AUDIT_DIR, "outcomes.jsonl");
 // Covers 9s + 9s credential locks and a 10s refresh POST, with margin.
 const ANTHROPIC_GATE_TIMEOUT_MS = 45_000;
+// Doctor scans the login Keychain, so concurrent Pi footers must refresh sparingly.
+const DOCTOR_REFRESH_MS = 15 * 60_000;
 
 function accessFingerprint(token: string): string {
   return `sha256-at:${createHash("sha256").update(token, "utf8").digest("hex")}`;
@@ -865,7 +867,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
           if (footerExpanded) {
             refreshExpand();
           }
-          if (Date.now() - healthFetchedAt > 60_000) {
+          if (Date.now() - healthFetchedAt > DOCTOR_REFRESH_MS) {
             refreshDoctor();
           }
           let usagePct = "";
