@@ -1875,6 +1875,17 @@ export class Store {
     return written;
   }
 
+  /** Update only the Codex-renewer lease, retaining all other poll state. */
+  setUsagePollHeldUntil(provider: string, accountId: string, heldUntilMs: number | null): void {
+    this.runImmediate(() => {
+      this.db.prepare(`
+        INSERT INTO usage_polls (provider, account_id, held_until)
+        VALUES (?, ?, ?)
+        ON CONFLICT(provider, account_id) DO UPDATE SET held_until = excluded.held_until
+      `).run(provider, accountId, heldUntilMs);
+    });
+  }
+
   /**
    * Rule W + release in one BEGIN IMMEDIATE (spec §4.3.3 P3).
    * Writes snapshots only if poll_claims still shows (holderId, claimedAt).

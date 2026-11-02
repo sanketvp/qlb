@@ -20,6 +20,8 @@ export interface CodexUsageProbeResult {
   source: CodexUsageSource;
   keys: string[];
   windows?: UsageWindow[];
+  /** Retry-After in seconds when the usage endpoint rate-limits the request. */
+  retryAfterS?: number;
 }
 
 export interface RolloutSnapshot {
@@ -64,6 +66,12 @@ function isUsable(parsed: UsageParseResult | undefined): parsed is UsageWindow[]
 
 function isUnparseable(parsed: UsageParseResult | undefined): boolean {
   return parsed !== undefined && !Array.isArray(parsed) && parsed.kind === 'unknown';
+}
+
+function retryAfterS(attempt: Attempt): number | undefined {
+  return attempt.parsed !== undefined && !Array.isArray(attempt.parsed) && attempt.parsed.kind === 'rate-limited'
+    ? attempt.parsed.retryAfter
+    : undefined;
 }
 
 function accountId(doc: CodexAuthDocument): string | null {
@@ -252,9 +260,9 @@ export async function probeCodexUsage(deps: CodexUsageProbeDeps = {}): Promise<C
   for (const snapshot of rollouts) {
     if (snapshot.accountId !== activeAccountId) continue;
     const windows = rolloutWindows(snapshot);
-    if (windows) return { status: last.status, source: 'codex-rollout', keys: ['rate_limits'], windows };
+    if (windows) return { status: last.status, source: 'codex-rollout', keys: ['rate_limits'], windows, retryAfterS: retryAfterS(last) };
   }
-  return { status: last.status, source: 'unknown', keys: last.keys };
+  return { status: last.status, source: 'unknown', keys: last.keys, retryAfterS: retryAfterS(last) };
 }
 
 /** Registry-loaded usage adapter entry point used by later provider bindings. */
