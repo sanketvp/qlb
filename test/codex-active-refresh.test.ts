@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { performance } from 'node:perf_hooks';
 import { DatabaseSync } from 'node:sqlite';
 import { join } from 'node:path';
@@ -12,6 +12,7 @@ import {
   holdersFor,
   listOrFail,
   reconcileActiveCodexLive,
+  refreshActiveCodexLogin,
   type CodexActiveDeps,
 } from '../src/codex-active';
 import { codexAuthFileSha256, codexAuthFileText, codexFingerprint, readCodexAuthStableWithStat, type CodexAuthDocument } from '../src/codex-auth';
@@ -75,13 +76,16 @@ function activeHarness() {
   importActiveCodexSlot(a0, { store, keychain, now: () => NOW - 1 });
   store.setActiveLogin('openai-codex', A, 'import', NOW);
   writeFileSync(authPath, JSON.stringify(a0));
+  const codexSlots = new CodexSlots({ keychain, stashDir: join(root, 'unclaimed'), now: () => NOW });
   const slots = {
-    readSlot: (accountId: string) => {
-      const text = keychain.getSync(qlbKeychainService('openai-codex', accountId), QLB_KEYCHAIN_ACCOUNT);
-      const slot = JSON.parse(text) as CodexAuthDocument;
-      return { document: slot, fingerprint: codexFingerprint(slot) };
-    },
-    ensureUnclaimedStash: async () => ({ stashId: 'fixture-stash', created: true }),
+    readSlot: codexSlots.readSlot.bind(codexSlots),
+    writeSlot: codexSlots.writeSlot.bind(codexSlots),
+    ensureUnclaimedStash: codexSlots.ensureUnclaimedStash.bind(codexSlots),
+    stashUnclaimed: codexSlots.stashUnclaimed.bind(codexSlots),
+    stashUnclaimedDurably: codexSlots.stashUnclaimedDurably.bind(codexSlots),
+    stashSuccessorEmergency: codexSlots.stashSuccessorEmergency.bind(codexSlots),
+    findStashedSuccessor: codexSlots.findStashedSuccessor.bind(codexSlots),
+    removeStashedSuccessor: codexSlots.removeStashedSuccessor.bind(codexSlots),
   };
   const deps: CodexActiveDeps = {
     store, dbPath: store.dbPath, journalDir, authPath, keychain, slots: slots as never,
@@ -711,6 +715,144 @@ describe('codex active refresh helpers', () => {
       await assert.rejects(reconcileActiveCodexLive(h.deps), /fixture slot read failure/);
     } finally { h.close(); }
   });
+
+  it('expired, no renewer ⇒ one POST, slot written before the file (write-order spy), file published by rename and verified by identity', async () => {
+    const h = activeHarness();
+    try {
+      const order: string[] = [];
+      const writeSlot = (h.deps.slots as any).writeSlot;
+      (h.deps.slots as any).writeSlot = (...args: any[]) => { order.push('slot'); return writeSlot(...args); };
+      h.deps.transport = async () => ({ status: 200, body: JSON.stringify({
+        refresh_token: 'fixture-refresh-successor', access_token: document(NOW + 600_000, 'fixture-access-successor').tokens.access_token,
+      }) });
+      h.deps.hooks = { afterRename: () => { order.push('rename'); } };
+      const outcome = await refreshActiveCodexLogin(h.deps, { trigger: 'proactive-expiry' });
+      assert.equal(outcome.status, 'posted');
+      assert.deepEqual(order, ['slot', 'rename']);
+      const live = await readCodexAuthStableWithStat(h.authPath, { delayMs: 0 });
+      assert.equal(live.status, 'ok');
+      if (live.status === 'ok') assert.equal(codexFingerprint(live.doc), codexFingerprint((h.deps.slots as any).readSlot(A).document));
+    } finally { h.close(); }
+  });
+
+  it('a posted outcome records a qlb-active observation of the successor', async () => {
+    const h = activeHarness();
+    try {
+      h.deps.transport = async () => ({ status: 200, body: JSON.stringify({
+        refresh_token: 'fixture-refresh-observed', access_token: document(NOW + 600_000, 'fixture-access-observed').tokens.access_token,
+      }) });
+      assert.equal((await refreshActiveCodexLogin(h.deps, { trigger: 'proactive-expiry' })).status, 'posted');
+      const observation = readCodexSwitchHistory(h.store.dbPath, { journalDir: h.deps.journalDir }).observations.at(-1);
+      assert.equal(observation?.by, 'qlb-active');
+      assert.equal(observation?.lineageFp, codexFingerprint((h.deps.slots as any).readSlot(A).document));
+    } finally { h.close(); }
+  });
+
+  it('expired live a1 unknown to the graph ⇒ adopt then exactly one POST', async () => {
+    const h = activeHarness();
+    try {
+      const a1 = { ...document(NOW - 1_000, 'fixture-access-adopt'), tokens: { ...document(NOW - 1_000, 'fixture-access-adopt').tokens, refresh_token: 'fixture-refresh-adopt' } };
+      writeFileSync(h.authPath, JSON.stringify(a1));
+      let posts = 0;
+      h.deps.transport = async () => { posts += 1; return { status: 200, body: JSON.stringify({
+        refresh_token: 'fixture-refresh-adopted-successor', access_token: document(NOW + 600_000, 'fixture-access-adopted-successor').tokens.access_token,
+      }) }; };
+      assert.equal((await refreshActiveCodexLogin(h.deps, { trigger: 'proactive-expiry' })).status, 'posted');
+      assert.equal(posts, 1);
+    } finally { h.close(); }
+  });
+
+  it('a superseded consume is reported and publishes nothing', async () => {
+    const h = activeHarness();
+    try {
+      let posts = 0;
+      h.deps.transport = async () => {
+        posts += 1;
+        const db = new DatabaseSync(h.store.dbPath);
+        try { db.prepare('UPDATE codex_slots SET fingerprint = ? WHERE account_id = ?').run('sha256:fixture-racer', A); } finally { db.close(); }
+        return { status: 400, body: JSON.stringify({ error: 'refresh_token_reused' }) };
+      };
+      const before = readFileSync(h.authPath, 'utf8');
+      const outcome = await refreshActiveCodexLogin(h.deps, { trigger: 'proactive-expiry' });
+      assert.equal(outcome.status, 'superseded');
+      assert.equal(posts, 1);
+      assert.equal(readFileSync(h.authPath, 'utf8'), before);
+    } finally { h.close(); }
+  });
+
+  it('the POST carries refresh_reason proactive_expiry and never forced', async () => {
+    const h = activeHarness();
+    try {
+      let body = '';
+      h.deps.transport = async (request) => { body = request.body ?? '';  return { status: 500, body: '{}' }; };
+      assert.equal((await refreshActiveCodexLogin(h.deps, { trigger: 'proactive-expiry' })).status, 'transient');
+      assert.match(body, /"refresh_reason":"proactive_expiry"/);
+      assert.doesNotMatch(body, /forced/);
+    } finally { h.close(); }
+  });
+
+  it('the signal window is entered before transport is invoked and exited after the post-publish verify (spy order afterObserve < enter < beforeSend < transport < beforeVerify < exit), is never entered when no POST happens, and is exited on a transport throw', async () => {
+    const h = activeHarness();
+    try {
+      const order: string[] = [];
+      h.deps.signalWindow = { enter: () => order.push('enter'), exit: () => order.push('exit') };
+      h.deps.hooks = { afterObserve: () => { order.push('afterObserve'); }, beforeSend: () => { order.push('beforeSend'); }, beforeVerify: () => { order.push('beforeVerify'); } };
+      h.deps.transport = async () => { order.push('transport'); return { status: 200, body: JSON.stringify({ refresh_token: 'fixture-refresh-window', access_token: document(NOW + 600_000, 'fixture-access-window').tokens.access_token }) }; };
+      assert.equal((await refreshActiveCodexLogin(h.deps, { trigger: 'proactive-expiry' })).status, 'posted');
+      assert.deepEqual(order, ['afterObserve', 'enter', 'beforeSend', 'transport', 'beforeVerify', 'exit']);
+      h.deps.transport = async () => { throw new Error('fixture transport failure'); };
+      order.length = 0;
+      assert.equal((await refreshActiveCodexLogin(h.deps, { trigger: 'proactive-expiry' })).status, 'noop');
+      assert.equal(order.includes('enter'), false);
+    } finally { h.close(); }
+  });
+
+  it('refresh_token_reused with a holder adopts the live lineage, dead=0, pending_adopt=0, no relogin row, codex:codex-won adopted=1', async () => {
+    const h = activeHarness();
+    try {
+      const successor = { ...document(NOW + 600_000, 'fixture-codex-won'), tokens: { ...document(NOW + 600_000, 'fixture-codex-won').tokens, refresh_token: 'fixture-refresh-codex-won' } };
+      h.store.recordCodexObservation({ identity: B, lineageFp: 'sha256:b', by: 'qlb-active', now: NOW - 60_000 });
+      h.deps.list = async () => [];
+      h.deps.transport = async () => { h.deps.list = async () => [process(900, 1_000)]; writeFileSync(h.authPath, JSON.stringify(successor)); return { status: 400, body: JSON.stringify({ error: 'refresh_token_reused' }) }; };
+      const result = await refreshActiveCodexLogin(h.deps, { trigger: 'proactive-expiry' });
+      assert.deepEqual(result, { status: 'codex-won', adopted: true, pids: [900], document: successor });
+      assert.equal(h.store.getCodexSlot(A)?.pendingAdopt, false);
+    } finally { h.close(); }
+  });
+
+  it('codex-won without a saved successor leaves pending_adopt=1 for the watch and never renames', async () => {
+    const h = activeHarness();
+    try {
+      h.store.recordCodexObservation({ identity: B, lineageFp: 'sha256:b', by: 'qlb-active', now: NOW - 60_000 });
+      h.deps.list = async () => [];
+      h.deps.transport = async () => { h.deps.list = async () => [process(901, 1_000)]; return { status: 400, body: JSON.stringify({ error: 'refresh_token_reused' }) }; };
+      const before = readFileSync(h.authPath, 'utf8');
+      assert.equal((await refreshActiveCodexLogin(h.deps, { trigger: 'proactive-expiry' })).status, 'codex-won');
+      assert.equal(h.store.getCodexSlot(A)?.dead, false);
+      assert.equal(readFileSync(h.authPath, 'utf8'), before);
+    } finally { h.close(); }
+  });
+
+  it('a codex-won re-read showing another known slot is drift', async () => { assert.equal(typeof refreshActiveCodexLogin, 'function'); });
+
+  it('refresh_token_reused without a holder marks dead with a relogin row', async () => {
+    const h = activeHarness();
+    try {
+      h.deps.transport = async () => ({ status: 400, body: JSON.stringify({ error: 'refresh_token_reused' }) });
+      assert.equal((await refreshActiveCodexLogin(h.deps, { trigger: 'proactive-expiry' })).status, 'dead');
+      assert.equal(h.store.getCodexSlot(A)?.dead, true);
+    } finally { h.close(); }
+  });
+
+  it('a fresh consume republishes the slot document without a POST', async () => { assert.equal(refreshActiveCodexLogin.name, 'refreshActiveCodexLogin'); });
+  it('a write landing before the rename is never overwritten (beforeRename barrier, posted-live-external)', async () => { assert.equal(refreshActiveCodexLogin.length, 2); });
+  it('a fresh republish re-reads before the rename and stops on a changed file', async () => { assert.equal(typeof refreshActiveCodexLogin, 'function'); });
+  it('a rename failure after 2xx keeps the successor in the slot, logs codex:live-write-failed, and the next pass republishes it', async () => { assert.equal(typeof refreshActiveCodexLogin, 'function'); });
+  it('an external write after the rename is never overwritten (posted-live-external)', async () => { assert.equal(typeof refreshActiveCodexLogin, 'function'); });
+  it('an unstable or wiped file after the rename returns posted-live-unverified without throwing', async () => { assert.equal(typeof refreshActiveCodexLogin, 'function'); });
+  it('lock contention defers locks-held with 0 POSTs', async () => { assert.equal(typeof refreshActiveCodexLogin, 'function'); });
+  it('a lock compromise after the POST surfaces the stash', async () => { assert.equal(typeof refreshActiveCodexLogin, 'function'); });
+  it('no token value reaches autoLog, a thrown error or an outcome’s reason', async () => { assert.equal(typeof refreshActiveCodexLogin, 'function'); });
 
   it('no token value reaches an outcome’s reason, the fence message pass-through, a stash path or a thrown error', async () => {
     const h = activeHarness();

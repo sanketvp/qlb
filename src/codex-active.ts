@@ -2,9 +2,9 @@ import { createHash } from 'node:crypto';
 
 import { accessExpiry, codexAuthFileSha256, codexAuthFileText, codexFingerprint, codexIdentity, needsRefresh, type CodexAuthDocument, type CodexAuthStableWithStatResult } from './codex-auth';
 import { ClaudeCodeLockTimeout, CodexAuthLockCompromised, ProperLockfileCompromised, withCodexAuthLock } from './cc-locks';
-import { withCodexConsumeThenSwitchLocks } from './codex-consume';
+import { consumeCodexSlot, withCodexConsumeThenSwitchLocks, type CodexConsumeResult } from './codex-consume';
 import { codexIdentityParts, holderSets, readCodexSwitchHistory, renewers, type CodexProcess } from './codex-sessions';
-import { CodexLiveChanged, attributeForPhase, codexRecoveryFenceState, observeLiveCodex, type CodexPhaseAttribution, type CodexRecoveryFenceState, type CodexSwitchDeps } from './codex-switch';
+import { CodexLiveChanged, attributeForPhase, codexRecoveryFenceState, observeLiveCodex, publishCodexAuth, type CodexPhaseAttribution, type CodexRecoveryFenceState, type CodexSwitchDeps } from './codex-switch';
 import { CodexStashUnverifiable } from './codex-slots';
 
 const NEAR_EXPIRY_MS = 5 * 60_000;
@@ -279,6 +279,81 @@ async function attributeSettledExternal(
  * locks.  This is deliberately the pre-POST half of the refresh workflow.
  */
 export async function reconcileActiveCodexLive(deps: CodexActiveDeps): Promise<CodexActiveOutcome> {
+  return refreshActiveCodexLogin(deps, { trigger: 'proactive-expiry', mode: 'reconcile' });
+}
+
+function recordActiveObservation(
+  deps: Pick<CodexActiveDeps, 'store' | 'now'>,
+  live: CodexAuthStableWithStatResult,
+): void {
+  if (live.status !== 'ok' && live.status !== 'wiped') return;
+  try {
+    deps.store.recordCodexObservation(live.status === 'ok'
+      ? { identity: codexIdentity(live.doc), lineageFp: codexFingerprint(live.doc), by: 'qlb-active', now: deps.now() }
+      : { identity: null, lineageFp: null, by: 'qlb-active', now: deps.now() });
+  } catch {
+    throw new CodexObservationWriteFailed();
+  }
+}
+
+function liveReadFailure(live: CodexAuthStableWithStatResult): CodexLiveReadFailure {
+  return live.status === 'unstable' || live.status === 'missing' || live.status === 'wiped' || live.status === 'unreadable'
+    ? live.status
+    : 'unreadable';
+}
+
+async function publishActiveDocument(
+  deps: CodexActiveDeps,
+  assertHeld: () => void,
+  accountId: string,
+  outgoing: { document: CodexAuthDocument; sha256: string; inode: number },
+  document: CodexAuthDocument,
+  cause: CodexLiveWriteCause,
+): Promise<CodexActiveOutcome> {
+  await deps.hooks?.beforeRename?.();
+  assertHeld();
+  const cas = await deps.readLive();
+  if (cas.status !== 'ok' || cas.sha256 !== outgoing.sha256 || cas.inode !== outgoing.inode) {
+    if (cas.status === 'ok') {
+      recordActiveObservation(deps, cas);
+      const action = await attributeSettledExternal(deps, assertHeld, accountId, cas.doc);
+      return { status: 'posted-live-external', document, action, cause };
+    }
+    if (cas.status === 'wiped') recordActiveObservation(deps, cas);
+    return { status: 'posted-live-unverified', document, read: liveReadFailure(cas), cause };
+  }
+
+  assertHeld();
+  const publish = await publishCodexAuth(deps.authPath, document);
+  if (publish.stage === 'rename-threw') return { status: 'posted-live-unwritten', document, cause };
+  await deps.hooks?.afterRename?.();
+  await deps.hooks?.beforeVerify?.();
+  assertHeld();
+  const verified = await deps.readLive();
+  if (verified.status !== 'ok') {
+    if (verified.status === 'wiped') recordActiveObservation(deps, verified);
+    return { status: 'posted-live-unverified', document, read: liveReadFailure(verified), cause };
+  }
+  if (codexIdentity(verified.doc) === accountId && codexFingerprint(verified.doc) === codexFingerprint(document)) {
+    recordActiveObservation(deps, verified);
+    return cause === 'post' ? { status: 'posted', document } : { status: 'republished', document };
+  }
+  if (verified.sha256 === outgoing.sha256 && verified.inode === outgoing.inode) {
+    return { status: 'posted-live-unwritten', document, cause };
+  }
+  recordActiveObservation(deps, verified);
+  const action = await attributeSettledExternal(deps, assertHeld, accountId, verified.doc);
+  return { status: 'posted-live-external', document, action, cause };
+}
+
+function logLiveWriteFailure(deps: CodexActiveDeps, accountId: string, outcome: CodexActiveOutcome): void {
+  if (outcome.status === 'posted-live-unwritten' || outcome.status === 'posted-live-external' || outcome.status === 'posted-live-unverified') {
+    deps.autoLog?.(`codex:live-write-failed provider=openai-codex account=${accountId} cause=${outcome.cause} at=${deps.now()}`);
+  }
+}
+
+/** Refreshes a due active login after completing the locked live reconciliation. */
+export async function refreshActiveCodexLogin(deps: CodexActiveDeps, input: CodexActiveInput): Promise<CodexActiveOutcome> {
   try {
     if (deps.cswapProcesses().length > 0) return { status: 'refused', reason: 'cswap-process-alive' };
   } catch {
@@ -394,15 +469,113 @@ export async function reconcileActiveCodexLive(deps: CodexActiveDeps): Promise<C
       const held = pids.length > 0;
 
       if (settled.action === 'republish-slot') {
-        if (republish !== 'ok') return republishFailureOutcome(settled.outgoing.document, republish as Exclude<SettledRepublishClass, 'ok' | 'external'>, postPublish);
+        if (republish !== 'ok') {
+          const outcome = republishFailureOutcome(settled.outgoing.document, republish as Exclude<SettledRepublishClass, 'ok' | 'external'>, postPublish);
+          logLiveWriteFailure(deps, active, outcome);
+          return outcome;
+        }
         return held
           ? { status: 'held', pids, document: settled.outgoing.document, action: 'republish-slot' }
           : { status: 'republished', document: settled.outgoing.document };
       }
+      if (input.mode === 'reconcile') {
+        if (held) return { status: 'held', pids, document: settled.outgoing.document, action: settled.action };
+        return settled.action === 'adopt'
+          ? { status: 'adopted', document: settled.outgoing.document }
+          : { status: 'noop', document: settled.outgoing.document };
+      }
       if (held) return { status: 'held', pids, document: settled.outgoing.document, action: settled.action };
-      return settled.action === 'adopt'
-        ? { status: 'adopted', document: settled.outgoing.document }
-        : { status: 'noop', document: settled.outgoing.document };
+      if (input.trigger === 'unauthorized' && input.accessFp !== accessFingerprint(settled.outgoing.document)) {
+        return { status: 'rotated', document: settled.outgoing.document };
+      }
+      if (!isDueForRefresh(settled.outgoing.document, deps.now(), input.trigger)) {
+        return settled.action === 'adopt'
+          ? { status: 'adopted', document: settled.outgoing.document }
+          : { status: 'noop', document: settled.outgoing.document };
+      }
+
+      try {
+      let consumed: CodexConsumeResult;
+      try {
+        consumed = await (async () => {
+          let sent = false;
+          const guardedTransport: CodexActiveDeps['transport'] = async (request) => {
+            sent = true;
+            deps.signalWindow?.enter();
+            await deps.hooks?.beforeSend?.();
+            return deps.transport(request);
+          };
+          const result = await consumeCodexSlot({
+            accountId: active,
+            snapshot: settled.outgoing.document,
+            trigger: input.trigger,
+            slots: deps.slots,
+            store: deps.store as unknown as Parameters<typeof consumeCodexSlot>[0]['store'],
+            transport: guardedTransport,
+            now: deps.now,
+            holders: holdersFor(deps, active),
+            assertHeld,
+          });
+          if (sent) await deps.hooks?.afterPost?.();
+          return result;
+        })();
+      } catch (error) {
+        if (error instanceof CodexProcessCheckFailed) {
+          deps.autoLog?.(`codex:process-check-failed provider=openai-codex at=${deps.now()}`);
+          return { status: 'refused', reason: 'codex-process-check-failed' };
+        }
+        throw error;
+      }
+
+      switch (consumed.status) {
+        case 'refreshed': {
+          if (!consumed.document) throw new Error('refreshed Codex result omitted its successor');
+          const outcome = await publishActiveDocument(deps, assertHeld, active, settled.outgoing, consumed.document, 'post');
+          logLiveWriteFailure(deps, active, outcome);
+          return outcome;
+        }
+        case 'fresh': {
+          if (!consumed.document) throw new Error('fresh Codex result omitted its successor');
+          const outcome = await publishActiveDocument(deps, assertHeld, active, settled.outgoing, consumed.document, 'republish');
+          logLiveWriteFailure(deps, active, outcome);
+          return outcome;
+        }
+        case 'held':
+          return { status: 'held', pids: consumed.holders ?? [], document: settled.outgoing.document, action: settled.action };
+        case 'dead': return { status: 'dead', reason: 'refresh-token-rejected' };
+        case 'superseded': return { status: 'superseded', document: consumed.document ?? settled.outgoing.document };
+        case 'transient': return { status: 'transient' };
+        case 'stashed':
+        case 'stashed-lock-lost': return { status: 'stashed', ...(consumed.stashId === undefined ? {} : { stashId: consumed.stashId }) };
+        case 'successor-unpersisted':
+          deps.autoLog?.(`codex:unpersisted-token provider=openai-codex account=${active} at=${deps.now()}`);
+          return { status: 'unpersisted' };
+        case 'slot-removed': return { status: 'refused', reason: 'active-slot-missing' };
+        case 'slot-split': return { status: 'refused', reason: 'slot-split' };
+        case 'switch-in-flight': return { status: 'refused', reason: 'switch-in-flight' };
+        case 'codex-won-inactive': {
+          const live = await deps.readLive();
+          const pids = consumed.holders ?? [];
+          if (live.status !== 'ok') {
+            deps.autoLog?.(`codex:codex-won provider=openai-codex account=${active} adopted=0 pids=${pids.join(',')} at=${deps.now()}`);
+            return { status: 'codex-won', adopted: false, pids, document: settled.outgoing.document };
+          }
+          recordActiveObservation(deps, live);
+          const action = await attributeSettledExternal(deps, assertHeld, active, live.doc);
+          if (action === 'drift') return { status: 'drift', accountId: deps.store.getCodexActiveLogin() };
+          const adopted = action === 'adopt';
+          deps.autoLog?.(`codex:codex-won provider=openai-codex account=${active} adopted=${adopted ? 1 : 0} pids=${pids.join(',')} at=${deps.now()}`);
+          return { status: 'codex-won', adopted, pids, document: live.doc };
+        }
+        case 'busy':
+        case 'active-slot':
+        case 'c9-unavailable':
+          throw new Error(`unreachable consume status: ${consumed.status}`);
+      }
+      } finally {
+        // Covers persistence and post-publish verification, not only transport.
+        deps.signalWindow?.exit();
+      }
     });
   } catch (error) {
     if (error instanceof ClaudeCodeLockTimeout || error instanceof ProperLockfileCompromised || error instanceof CodexAuthLockCompromised) {
