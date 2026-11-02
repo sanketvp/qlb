@@ -67,6 +67,7 @@ import type { CswapProcess } from './cswap-processes';
 import { claudeOauthClientCheck } from './checks/claude-oauth-client';
 import { claudeSlotsCheck } from './checks/claude-slots';
 import { codexSlotsCheck } from './checks/codex-slots';
+import { codexFirstSwitchCheck } from './checks/codex-first-switch';
 import { guardCheck } from './checks/_check';
 import { lifecyclePhase, lifecyclePhaseCheck, type LifecyclePhaseResult } from './checks/lifecycle-phase';
 import { relogin7dCheck } from './checks/relogin-7d';
@@ -763,6 +764,7 @@ export async function doctorQlb(
     claudeOauthClientCheck(config.dbPath, lifecycle),
     claudeSlotsCheck(config.dbPath, phase),
     codexSlotsCheck(config.dbPath, phase),
+    codexFirstSwitchCheck(config.dbPath, lifecycle, options.now?.() ?? Date.now()),
     lifecyclePhaseCheck(lifecycle),
     relogin7dCheck(config.dbPath, phase),
   );
