@@ -158,6 +158,8 @@ test('test mode without an injected agent never reaches launchctl', async () => 
 
 test('cutover begin then abort with no QLB agent installed ends aborted with C-swap restored', async () => {
   const f = fixture();
+  const savedTestMode = process.env.QLB_TEST_MODE;
+  delete process.env.QLB_TEST_MODE;
   try {
     const calls: string[] = [];
     const agent: CswapAgent = {
@@ -175,7 +177,12 @@ test('cutover begin then abort with no QLB agent installed ends aborted with C-s
       },
     });
     // The production mover is intentionally selected: no test-mode marker and
-    // no injected QLB plist mover. The temporary HOME has no LaunchAgent.
+    // no injected QLB plist mover. Every path it can touch remains under this
+    // test's temporary HOME.
+    const source = join(f.root, 'Library', 'LaunchAgents', 'com.modus.qlb-auto.plist');
+    const target = join(f.root, '.qlb', 'backups', 'qlb-plist', 'com.modus.qlb-auto.plist');
+    assert.ok(source.startsWith(`${f.root}/`));
+    assert.ok(target.startsWith(`${f.root}/`));
     const productionContext = { ...f.context, env: { QLB_HOME: f.root, HOME: f.root } };
 
     assert.equal(await command.execute!(['begin'], productionContext), 0);
@@ -187,7 +194,11 @@ test('cutover begin then abort with no QLB agent installed ends aborted with C-s
       assert.equal(phase(completed).note, null);
     } finally { completed.close(); }
     assert.match(f.output.at(-1)!, /qlb lifecycle close \d+/);
-  } finally { f.cleanup(); }
+  } finally {
+    if (savedTestMode === undefined) delete process.env.QLB_TEST_MODE;
+    else process.env.QLB_TEST_MODE = savedTestMode;
+    f.cleanup();
+  }
 });
 
 test('direct cutover abort observes the cutover-begin in-progress fence', async () => {

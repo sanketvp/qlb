@@ -348,13 +348,21 @@ function defaultCswapAgent(ctx: CommandContext): Pick<CswapAgent, 'restorePlist'
 function defaultMoveQlbPlist(ctx: CommandContext): { ok: boolean; code?: string } {
   if (ctx.env.QLB_TEST_MODE === '1' || process.env.QLB_TEST_MODE === '1') return { ok: false, code: 'qlb-plist-mover-not-injected' };
   const source = join(ctx.home, 'Library', 'LaunchAgents', 'com.modus.qlb-auto.plist');
-  const backupDir = join(qlbHomeDir(ctx.env), '.qlb', 'backups', 'qlb-plist');
+  // CommandContext.home is the authority for the active user's QLB paths.
+  // Keeping both mover paths beneath it also keeps direct command tests hermetic.
+  const backupDir = join(ctx.home, '.qlb', 'backups', 'qlb-plist');
   const target = join(backupDir, 'com.modus.qlb-auto.plist');
   try {
-    // Before cutover commit the QLB agent has not been installed, so no plist
-    // is normal. A prior move followed by a failed C-swap restore is likewise
-    // already complete from this mover's perspective.
-    if (!existsSync(source)) return { ok: true };
+    if (!existsSync(source)) {
+      // A previous successful move leaves the backup behind. Before commit,
+      // however, the QLB agent was never installed, so both paths are absent.
+      if (existsSync(target)) return { ok: true };
+      const store = openStore(ctx.config.dbPath);
+      try {
+        if (phase(store).preFenceState === 'cutting-over') return { ok: true };
+      } finally { store.close(); }
+      return { ok: false, code: 'qlb-plist-missing' };
+    }
     mkdirSync(backupDir, { recursive: true, mode: 0o700 });
     renameSync(source, target);
     return { ok: true };
@@ -363,10 +371,16 @@ function defaultMoveQlbPlist(ctx: CommandContext): { ok: boolean; code?: string 
   }
 }
 
-type TerminalHandBack = { state: 'rolled-back' | 'aborted'; lifecycleId: number; restorePending: boolean };
+/** The terminal row may need a restore, and its new durable fence may need clearing. */
+type TerminalHandBack = {
+  state: 'rolled-back' | 'aborted';
+  lifecycleId: number;
+  restorePending: boolean;
+  needsRestore: boolean;
+};
 
 class CswapUndoFinalizationError extends Error {
-  constructor(readonly state: string) {
+  constructor(readonly state: string, readonly code?: string) {
     super('hand-back finalization failed');
     this.name = 'CswapUndoFinalizationError';
   }
@@ -381,9 +395,9 @@ function clearRestorePending(ctx: CommandContext): void {
 
 async function restoreCswap(ctx: CommandContext, dependencies: UndoCswapCommandDependencies, final: TerminalHandBack): Promise<void> {
   const restored = await (dependencies.cswapAgent ?? defaultCswapAgent(ctx)).restorePlist();
-  if (!restored.ok) throw new CswapUndoFinalizationError(final.state);
-  // Leave the durable fence in place until the agent confirms its plist is restored.
-  clearRestorePending(ctx);
+  if (!restored.ok) throw new CswapUndoFinalizationError(final.state, restored.code);
+  // Only new rows have this fence. Legacy terminal rows had no note to clear.
+  if (final.restorePending) clearRestorePending(ctx);
 }
 
 async function finishHandBack(
@@ -392,7 +406,7 @@ async function finishHandBack(
   now: number,
 ): Promise<TerminalHandBack> {
   const moved = await (dependencies.moveQlbPlist ?? (() => defaultMoveQlbPlist(ctx)))();
-  if (!moved.ok) throw new CswapUndoFinalizationError(terminalHandBackPhase(ctx)?.state ?? 'undoing');
+  if (!moved.ok) throw new CswapUndoFinalizationError(terminalHandBackPhase(ctx)?.state ?? 'undoing', moved.code);
   const store = openStore(ctx.config.dbPath);
   let final: TerminalHandBack;
   try {
@@ -404,18 +418,32 @@ async function finishHandBack(
     // terminal row that only the restore-only resume path can finish.
     const transitioned = transition(store, target, now, CSWAP_RESTORE_PENDING);
     if (!transitioned.ok) throw new CswapUndoFinalizationError(phase(store).state);
-    final = { state: target, lifecycleId: transitioned.row!.id, restorePending: true };
+    final = { state: target, lifecycleId: transitioned.row!.id, restorePending: true, needsRestore: true };
   } finally { store.close(); }
   await restoreCswap(ctx, dependencies, final);
-  return { ...final, restorePending: false };
+  return { ...final, restorePending: false, needsRestore: false };
+}
+
+function legacyCswapRestoreNeeded(ctx: CommandContext): boolean {
+  const source = join(ctx.home, 'Library', 'LaunchAgents', 'com.cswap.auto.plist');
+  const backup = join(ctx.home, '.qlb', 'backups', 'cswap-plist', 'com.cswap.auto.plist');
+  return existsSync(backup) || !existsSync(source);
 }
 
 function terminalHandBackPhase(ctx: CommandContext): TerminalHandBack | null {
   const store = openStore(ctx.config.dbPath);
   try {
     const current = phase(store);
-    return current.state === 'rolled-back' || current.state === 'aborted'
-      ? { state: current.state, lifecycleId: current.id, restorePending: current.note === CSWAP_RESTORE_PENDING } : null;
+    if (current.state !== 'rolled-back' && current.state !== 'aborted') return null;
+    const restorePending = current.note === CSWAP_RESTORE_PENDING;
+    return {
+      state: current.state,
+      lifecycleId: current.id,
+      restorePending,
+      // Rows written before G18 had no durable note. Detect their unfinished
+      // C-swap hand-back from the plist locations before allowing resume to end.
+      needsRestore: restorePending || (current.note === null && legacyCswapRestoreNeeded(ctx)),
+    };
   } finally { store.close(); }
 }
 
@@ -469,7 +497,7 @@ export async function runUndoCswapCommand(
     // Its one resume must not fence, drain, write slots, or move QLB again.
     const terminal = options.resume ? terminalHandBackPhase(ctx) : null;
     if (terminal) {
-      if (terminal.restorePending) await restoreCswap(ctx, dependencies, terminal);
+      if (terminal.needsRestore) await restoreCswap(ctx, dependencies, terminal);
       reportComplete(ctx, options, null, 0, terminal.state, terminal.lifecycleId);
       return 0;
     }
@@ -539,7 +567,8 @@ export async function runUndoCswapCommand(
       return 1;
     }
     if (error instanceof CswapUndoFinalizationError) {
-      ctx.stderr(`qlb undo cswap: hand-back failed; state=${error.state}; run qlb undo cswap --resume`);
+      const detail = error.code ? `: ${error.code}` : '';
+      ctx.stderr(`qlb undo cswap: hand-back failed${detail}; state=${error.state}; run qlb undo cswap --resume`);
       return 1;
     }
     // Backend/process messages can contain credentials or command lines.

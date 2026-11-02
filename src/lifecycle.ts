@@ -244,7 +244,7 @@ export function beginRetirementFence(store: Store): LifecycleResult {
     : { ok: false, code: 'retirement-fence-state-lost', row: phase(store) };
 }
 
-/** The retirement journal is durable before this terminal fence is cleared. */
+/** Clear the C-swap restore fence only after the plist is restored. */
 export function clearCswapRestorePending(store: Store): LifecycleResult {
   const current = phase(store);
   if (!['rolled-back', 'aborted'].includes(current.state) || current.note !== CSWAP_RESTORE_PENDING) {
@@ -258,6 +258,7 @@ export function clearCswapRestorePending(store: Store): LifecycleResult {
     : { ok: false, code: 'cswap-restore-state-lost', row: phase(store) };
 }
 
+/** The retirement journal is durable before this terminal fence is cleared. */
 export function clearRetirementFence(store: Store): LifecycleResult {
   const current = phase(store);
   if (current.state !== 'retired' || current.note !== RETIREMENT_IN_PROGRESS) {
