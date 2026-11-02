@@ -101,25 +101,27 @@ describe('C6b-4 codex:first-switch', () => {
     }
   });
 
-  it('codex:first-switch is PASS once codex.l13VerifiedAt is set', () => {
-    const subject = check('cutover', NOW - (4 * DAY_MS));
-    try {
-      const db = openStoreConnection(subject.dbPath);
+  it('codex:first-switch is PASS for valid C9 receipt timestamps, including the Date boundary', () => {
+    for (const timestamp of [NOW - DAY_MS, 8_640_000_000_000_000]) {
+      const subject = check('cutover', NOW - (4 * DAY_MS));
       try {
-        db.prepare("INSERT INTO config (key, value) VALUES ('codex.l13VerifiedAt', ?)").run(String(NOW - DAY_MS));
+        const db = openStoreConnection(subject.dbPath);
+        try {
+          db.prepare("INSERT INTO config (key, value) VALUES ('codex.l13VerifiedAt', ?)").run(String(timestamp));
+        } finally {
+          db.close();
+        }
+        assert.deepEqual(codexFirstSwitchCheck(subject.dbPath, { available: true, phase: 'cutover' }, NOW), {
+          name: 'codex:first-switch', level: 'PASS', message: `C9 receipt recorded at ${new Date(timestamp).toISOString()}`,
+        });
       } finally {
-        db.close();
+        rmSync(subject.home, { recursive: true, force: true });
       }
-      assert.deepEqual(codexFirstSwitchCheck(subject.dbPath, { available: true, phase: 'cutover' }, NOW), {
-        name: 'codex:first-switch', level: 'PASS', message: `C9 receipt recorded at ${new Date(NOW - DAY_MS).toISOString()}`,
-      });
-    } finally {
-      rmSync(subject.home, { recursive: true, force: true });
     }
   });
 
   it('codex:first-switch warns for invalid persisted C9 receipts without throwing', () => {
-    for (const value of ['', 'abc']) {
+    for (const value of ['', 'abc', '8640000000000001']) {
       const subject = check('cutover', NOW - (4 * DAY_MS));
       try {
         const db = openStoreConnection(subject.dbPath);

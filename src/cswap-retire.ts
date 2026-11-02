@@ -5,7 +5,7 @@ import { mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
 import { atomicWriteText, fsyncDirSync } from './fsutil';
-import { codexL13ReceiptAt } from './codex-l13-receipt';
+import { codexL13ReceiptAt, safeNonNegativeInt } from './codex-l13-receipt';
 import { isSuccessor } from './lineage-log';
 import type { CswapAgentResult } from './cswap-agent';
 import {
@@ -210,7 +210,7 @@ function checkpoint(
 }
 
 function passesReceiptHealth(store: Store, now: number): string | null {
-  const receiptId = codexL13ReceiptAt(store.getConfig('report.receiptHealthLogId'));
+  const receiptId = safeNonNegativeInt(store.getConfig('report.receiptHealthLogId'));
   if (receiptId == null || receiptId === 0) return 'report-receipt-health-log-missing';
   const db = openStoreConnection(store.dbPath, true);
   try {
@@ -235,7 +235,7 @@ function passesS64(
   if (doctor.autoAgent !== 'PASS') return 'doctor-auto-agent-not-pass';
   for (const provider of PI_PROVIDERS) {
     if (store.getConfig(`pi.${provider}.state`) !== 'migrated') continue;
-    const servedAt = codexL13ReceiptAt(store.getConfig(`pi.${provider}.lastServedAt`));
+    const servedAt = safeNonNegativeInt(store.getConfig(`pi.${provider}.lastServedAt`));
     if (servedAt == null || servedAt > now || now - servedAt > DAY_MS) return `pi-last-served-stale:${provider}`;
   }
   return passesReceiptHealth(store, now);
@@ -263,7 +263,7 @@ export async function evaluateRetirementGates(
   const admission = assertAdmitted(store, 'retire-cswap');
   if (!admission.ok) return refusal(admission.code ?? 'not-admitted');
 
-  const receiptAt = codexL13ReceiptAt(store.getConfig('report.receiptAt'));
+  const receiptAt = safeNonNegativeInt(store.getConfig('report.receiptAt'));
   if (receiptAt == null) return refusal('report-receipt-missing');
   if (!dependencies.reportReceiptPasses()) return refusal('report-not-pass');
   const doctor = await dependencies.doctor();

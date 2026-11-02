@@ -165,6 +165,19 @@ describe('qlb retire cswap (AC22 retire)', () => {
     await refusal('receipt stale', (f) => f.store.setConfig('report.receiptAt', String(NOW - 10 * 60 * 1000 - 1)), 'report-receipt-stale');
   });
 
+  it('keeps non-C9 retirement fields on the generic safe-integer contract', async () => {
+    const largeSafeInteger = '9000000000000000';
+    await refusal('large report receipt remains parsed', (f) => {
+      f.store.setConfig('report.receiptAt', largeSafeInteger);
+    }, 'report-receipt-stale');
+    await refusal('large Pi last-served timestamp remains parsed', (f) => {
+      f.store.setConfig('pi.kimi-coding.lastServedAt', largeSafeInteger);
+    }, 'pi-last-served-stale:kimi-coding');
+    await refusal('large receipt health row id remains parsed', (f) => {
+      f.store.setConfig('report.receiptHealthLogId', largeSafeInteger);
+    }, 'report-receipt-health-log-invalid');
+  });
+
   it('pi rollback proceeds in pre-cutover and refuses only under retirement or cutover-begin fences', async () => {
     const f = fixture();
     try {

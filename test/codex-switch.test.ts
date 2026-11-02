@@ -367,6 +367,8 @@ describe('Codex switch preflight and preconditions', () => {
       [null, 'codex-l13-unverified'],
       ['', 'codex-l13-unverified'],
       ['abc', 'codex-l13-unverified'],
+      ['8640000000000001', 'codex-l13-unverified'],
+      ['8640000000000000', 'go'],
       ['1', 'go'],
     ] as const) {
       const h = fixture();

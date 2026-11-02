@@ -952,6 +952,8 @@ describe('Codex consume gate — AC34', () => {
       [null, 0],
       ['', 0],
       ['abc', 0],
+      ['8640000000000001', 0],
+      ['8640000000000000', 3],
       ['1', 3],
     ] as const) {
       const config = new Map(base);
