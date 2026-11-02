@@ -136,6 +136,7 @@ describe('Claude switch commit primitive', () => {
       ], {
         ownershipForProvider: () => 'QLB_OWNED',
         overrideForAccount: () => null,
+        claudeCutoverPhase: 'cutover',
         activeAccountForProvider: (provider, accounts) => {
           const active = store.getActiveLogin(provider)?.accountId;
           return active === null || active === undefined

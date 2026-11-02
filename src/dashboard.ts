@@ -45,6 +45,8 @@ export interface AnthropicSlotIdentity {
 export interface DashboardLookups {
   ownershipForProvider: (provider: string) => string;
   overrideForAccount: (accountId: string) => AccountOverrideView | null;
+  /** Lifecycle state read by `qlb cutover`; only an active Claude cutover may replace C-swap's marker. */
+  claudeCutoverPhase?: string;
   /** The provider-owned login is authoritative over any legacy cache marker. */
   activeAccountForProvider?: (
     provider: string,
@@ -465,28 +467,34 @@ function withoutCacheMarker(label: string): string {
 }
 
 /**
- * C-swap cache identifies Claude rows by organization UUID plus its email
- * label. An organization UUID is not necessarily unique among QLB slots, so
- * use it alone only when both stores have exactly one matching row; otherwise
- * use a unique cache email match. An ambiguous or missing match deliberately
+ * C-swap cache identifies Claude rows by organization UUID and, for a shared
+ * organization, its email label. An ambiguous or missing match deliberately
  * leaves C-swap's marker intact.
  */
 export function activeAnthropicMarker(
   activeSlot: AnthropicSlotIdentity | null,
   accounts: AccountSnapshot[],
 ): ActiveAccountMarker | undefined {
-  if (!activeSlot) return undefined;
-  const orgMatches = activeSlot.orgUuid === null
-    ? []
-    : accounts.filter((account) => account.accountId === activeSlot.orgUuid);
-  if (activeSlot.orgUuidSlotCount === 1 && orgMatches.length === 1) {
-    return { accountId: orgMatches[0].accountId };
-  }
-  const emailMatches = activeSlot.email === null
-    ? []
-    : accounts.filter((account) => withoutCacheMarker(account.label) === activeSlot.email);
-  if (emailMatches.length !== 1) return undefined;
-  return { accountId: emailMatches[0].accountId, label: withoutCacheMarker(emailMatches[0].label) };
+  if (!activeSlot || activeSlot.orgUuid === null) return undefined;
+  const orgMatches = accounts.filter((account) => account.accountId === activeSlot.orgUuid);
+  const matches = activeSlot.orgUuidSlotCount > 1
+    ? activeSlot.email === null
+      ? []
+      : orgMatches.filter((account) => withoutCacheMarker(account.label) === activeSlot.email)
+    : orgMatches;
+  if (matches.length !== 1) return undefined;
+  const match = matches[0];
+  return activeSlot.orgUuidSlotCount > 1
+    ? { accountId: match.accountId, label: withoutCacheMarker(match.label) }
+    : { accountId: match.accountId };
+}
+
+function shouldApplyAnthropicActiveLoginOverride(
+  provider: string,
+  claudeCutoverPhase: string | undefined,
+): boolean {
+  return provider === 'anthropic'
+    && (claudeCutoverPhase === 'cutting-over' || claudeCutoverPhase === 'cutover');
 }
 
 function matchesActiveMarker(
@@ -515,7 +523,7 @@ export function enrichAccounts(
     const ownership = lookups.ownershipForProvider(provider);
     providerState.set(provider, {
       ownership,
-      activeMarker: ownership === 'QLB_OWNED'
+      activeMarker: shouldApplyAnthropicActiveLoginOverride(provider, lookups.claudeCutoverPhase)
         ? lookups.activeAccountForProvider?.(provider, providerAccounts)
         : undefined,
     });

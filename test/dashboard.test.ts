@@ -96,16 +96,60 @@ describe('dashboard formatting', () => {
     assert.match(formatDashboard(accounts), /override=pin/);
   });
 
-  it('preserves the cache dot before the QLB Claude cutover with no active login', () => {
+  it('uses Claude active_login during cutting-over and committed cutover even with NATIVE Pi ownership', () => {
+    for (const claudeCutoverPhase of ['cutting-over', 'cutover']) {
+      let activeReads = 0;
+      const accounts = enrichAccounts(
+        [
+          snap({ accountId: 'org-a', label: '● stale-cache-active' }),
+          snap({ accountId: 'org-b', label: 'active-login' }),
+        ],
+        {
+          ownershipForProvider: () => 'NATIVE',
+          overrideForAccount: () => null,
+          claudeCutoverPhase,
+          activeAccountForProvider: () => {
+            activeReads += 1;
+            return { accountId: 'org-b' };
+          },
+        },
+      );
+      assert.equal(activeReads, 1, claudeCutoverPhase);
+      assert.deepEqual(accounts.map((account) => account.label), ['stale-cache-active', '● active-login'], claudeCutoverPhase);
+    }
+  });
+
+  it('keeps the stale cache label before cutover and after an abort', () => {
+    for (const claudeCutoverPhase of ['pre-cutover', 'aborted']) {
+      let activeReads = 0;
+      const accounts = enrichAccounts(
+        [snap({ accountId: 'org-a', label: '● cache-active' })],
+        {
+          ownershipForProvider: () => 'NATIVE',
+          overrideForAccount: () => null,
+          claudeCutoverPhase,
+          activeAccountForProvider: () => {
+            activeReads += 1;
+            return { accountId: 'org-stale' };
+          },
+        },
+      );
+      assert.equal(activeReads, 0, claudeCutoverPhase);
+      assert.equal(accounts[0].label, '● cache-active', claudeCutoverPhase);
+    }
+  });
+
+  it('leaves non-Anthropic provider labels unchanged', () => {
     let activeReads = 0;
     const accounts = enrichAccounts(
-      [snap({ accountId: 'org-a', label: '● cache-active' })],
+      [snap({ accountId: 'codex-a', provider: 'openai-codex', label: '● cache-active' })],
       {
-        ownershipForProvider: () => 'NATIVE',
+        ownershipForProvider: () => 'QLB_OWNED',
         overrideForAccount: () => null,
+        claudeCutoverPhase: 'cutover',
         activeAccountForProvider: () => {
           activeReads += 1;
-          return undefined;
+          return { accountId: 'codex-a' };
         },
       },
     );
@@ -113,32 +157,16 @@ describe('dashboard formatting', () => {
     assert.equal(accounts[0].label, '● cache-active');
   });
 
-  it('preserves the cache dot when C-swap owns Claude despite a stale active login', () => {
-    let activeReads = 0;
-    const accounts = enrichAccounts(
-      [snap({ accountId: 'org-a', label: '● cache-active' })],
-      {
-        ownershipForProvider: () => 'NATIVE',
-        overrideForAccount: () => null,
-        activeAccountForProvider: () => {
-          activeReads += 1;
-          return 'org-stale';
-        },
-      },
-    );
-    assert.equal(activeReads, 0);
-    assert.equal(accounts[0].label, '● cache-active');
-  });
-
-  it('uses a unique cache email for shared-org Claude slots and reads the active login once', () => {
+  it('uses both org and email for shared-org Claude slots and reads active_login once', () => {
     let activeReads = 0;
     const snapshots = [
       snap({ accountId: 'shared-org', label: '● first@example.test' }),
       snap({ accountId: 'shared-org', label: 'second@example.test' }),
     ];
     const accounts = enrichAccounts(snapshots, {
-      ownershipForProvider: () => 'QLB_OWNED',
+      ownershipForProvider: () => 'NATIVE',
       overrideForAccount: () => null,
+      claudeCutoverPhase: 'cutover',
       activeAccountForProvider: (_provider, providerAccounts) => {
         activeReads += 1;
         return activeAnthropicMarker({
@@ -154,17 +182,36 @@ describe('dashboard formatting', () => {
     ]);
   });
 
-  it('leaves the cache label unchanged when no one-to-one active Claude cache match exists', () => {
+  it('leaves cache labels unchanged when shared-org matching is ambiguous', () => {
     const accounts = enrichAccounts(
-      [snap({ accountId: 'org-a', label: '● cache-active' })],
+      [
+        snap({ accountId: 'shared-org', label: '● duplicate@example.test' }),
+        snap({ accountId: 'shared-org', label: 'duplicate@example.test' }),
+      ],
       {
-        ownershipForProvider: () => 'QLB_OWNED',
+        ownershipForProvider: () => 'NATIVE',
         overrideForAccount: () => null,
+        claudeCutoverPhase: 'cutover',
         activeAccountForProvider: (_provider, providerAccounts) => activeAnthropicMarker({
-          orgUuid: 'missing-org', email: 'missing@example.test', orgUuidSlotCount: 1,
+          orgUuid: 'shared-org', email: 'duplicate@example.test', orgUuidSlotCount: 2,
         }, providerAccounts),
       },
     );
-    assert.equal(accounts[0].label, '● cache-active');
+    assert.deepEqual(accounts.map((account) => account.label), ['● duplicate@example.test', 'duplicate@example.test']);
+  });
+
+  it('does not fall back to an email match in another organization', () => {
+    const accounts = enrichAccounts(
+      [snap({ accountId: 'other-org', label: '● target@example.test' })],
+      {
+        ownershipForProvider: () => 'NATIVE',
+        overrideForAccount: () => null,
+        claudeCutoverPhase: 'cutover',
+        activeAccountForProvider: (_provider, providerAccounts) => activeAnthropicMarker({
+          orgUuid: 'expected-org', email: 'target@example.test', orgUuidSlotCount: 2,
+        }, providerAccounts),
+      },
+    );
+    assert.equal(accounts[0].label, '● target@example.test');
   });
 });

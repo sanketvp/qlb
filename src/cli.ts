@@ -4,7 +4,7 @@ import * as net from 'node:net';
 import { dirname, join, resolve } from 'node:path';
 import { adapters } from './adapters';
 import { assertTestHomeIsIsolated } from './bootstrap';
-import { CSWAP_RESTORE_PENDING, FINISH_CSWAP_RESTORE_FIRST, FINISH_RETIREMENT_FIRST, RETIREMENT_IN_PROGRESS, assertAdmitted, assertAdmittedInConnection, type LifecycleOperation } from './lifecycle';
+import { CSWAP_RESTORE_PENDING, FINISH_CSWAP_RESTORE_FIRST, FINISH_RETIREMENT_FIRST, RETIREMENT_IN_PROGRESS, assertAdmitted, assertAdmittedInConnection, phase, type LifecycleOperation } from './lifecycle';
 import { createDefaultCodexGateDeps, runCodexGate } from './codex-gate';
 import { config, resolveConfig, stripConfigArgs } from './config';
 import { qlbHomeDir } from './home';
@@ -1141,17 +1141,19 @@ async function runStatus(opts: StatusOpts): Promise<void> {
   }));
   const accounts = nested.flat();
   const ownershipForProvider = makeOwnershipReader(store);
+  // Use the lifecycle reader shared with `qlb cutover`, rather than Pi's
+  // ownership journal, to decide whether Claude's active_login is authoritative.
+  const claudeCutoverPhase = phase(store).state;
   const enriched = enrichAccounts(accounts, {
     ownershipForProvider,
     overrideForAccount: (id) => overrideFromStore(store, id),
+    claudeCutoverPhase,
     activeAccountForProvider: (provider, providerAccounts) => {
-      // enrichAccounts invokes this once per QLB-owned provider, so a status
-      // render takes one active_login snapshot rather than one per cache row.
+      // The dashboard invokes this once for eligible Anthropic rows, so a
+      // status render takes one active_login snapshot rather than one per row.
       const accountId = store.getActiveLogin(provider)?.accountId;
       if (!accountId) return undefined;
-      return provider === 'anthropic'
-        ? activeAnthropicMarker(store.getAnthropicSlotStatusIdentity(accountId), providerAccounts)
-        : accountId;
+      return activeAnthropicMarker(store.getAnthropicSlotStatusIdentity(accountId), providerAccounts);
     },
   });
   if (opts.json) {
