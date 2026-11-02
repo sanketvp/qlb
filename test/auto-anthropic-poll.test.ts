@@ -6,7 +6,7 @@ import { describe, it } from 'node:test';
 
 import { pollAnthropic } from '../src/auto/anthropic';
 import { claudePaths } from '../src/cc-paths';
-import { ProbeVerdictMemo } from '../src/cc-resync';
+import { credentialLineage, ProbeVerdictMemo, type LiveIdentity } from '../src/cc-resync';
 import { ClaudeSlots, InMemoryClaudeSlotRepository } from '../src/cc-slots';
 import { MockKeychain } from '../src/keychain';
 import { openStore } from '../src/store';
@@ -39,7 +39,7 @@ async function fixture() {
     },
     resyncDeps: {
       live: { backend, paths, account: 'fixture', home, env }, env, now: () => now * 1000,
-      getProfile: async () => ({ status: 500, body: '' }), by: 'qlb-auto' as const,
+      getProfile: async () => ({ status: 500, body: '' }), readLiveIdentity: (): LiveIdentity | null => null, by: 'qlb-auto' as const,
     },
     consumeDeps: {
       postRefresh: async () => { posts += 1; return { status: 200, body: JSON.stringify({ access_token: 'access-refreshed', refresh_token: 'refresh-refreshed', expires_in: 3600 }) }; },
@@ -206,12 +206,12 @@ describe('auto anthropic poll (G8)', () => {
 
   it('uses the live credential for an active usage poll', async () => {
     const f = await fixture();
-    await f.backend.set(f.paths.keychainService, 'fixture', credential('active'));
+    await f.backend.set(f.paths.keychainService, 'fixture', credential('live'));
     f.store.writeUsagePollPlans('anthropic', { inactive: { nextDueAt: NOW + 300, pollIntervalS: 300 } });
     let servedLive = false;
     const deps = f.deps();
     deps.getUsage = async (accessToken) => {
-      servedLive = accessToken === 'access-active';
+      servedLive = accessToken === 'access-live';
       return { status: 200, body: JSON.stringify({ five_hour: { utilization: 20 }, seven_day: { utilization: 10 } }) };
     };
     await pollAnthropic(deps);
@@ -264,14 +264,39 @@ describe('auto anthropic poll (G8)', () => {
     assert.equal(accounts.find((account) => account.accountId === 'active')?.buckets['5h'], undefined);
   });
 
-  it('a mismatched live credential makes no active GET', async () => {
+  it('keeps polling and repairs a same-account Claude Code rotation across many ticks', async () => {
     const f = await fixture();
-    await f.backend.set(f.paths.keychainService, 'fixture', credential('other-account'));
-    f.store.writeUsagePollPlans('anthropic', { inactive: { nextDueAt: NOW + 300, pollIntervalS: 300 } });
-    const accounts = await pollAnthropic(f.deps());
-    assert.equal(f.calls().gets, 0);
-    assert.equal(accounts.find((account) => account.accountId === 'active')?.buckets['5h'], undefined);
-    assert.equal(f.store.listUsagePolls('anthropic').active, undefined);
+    const rotated = credential('active-rotated', (NOW + 7_200) * 1000);
+    await f.backend.set(f.paths.keychainService, 'fixture', rotated);
+    f.store.writeUsagePollPlans('anthropic', { inactive: { nextDueAt: NOW + 10_000, pollIntervalS: 300 } });
+    const deps = f.deps();
+    deps.resyncDeps.readLiveIdentity = () => ({ accountId: 'active', email: 'active@example.test', orgUuid: 'active-org' });
+    deps.resyncDeps.getProfile = async () => ({ status: 200, body: JSON.stringify({ account: { uuid: 'active' }, organization: { uuid: 'active-org' } }) });
+    for (let tick = 0; tick < 45; tick += 1) {
+      f.now(NOW + tick * 60);
+      const accounts = await pollAnthropic(deps);
+      assert.equal(f.store.getActiveLogin('anthropic')?.accountId, 'active');
+      assert.equal(accounts.find((account) => account.accountId === 'active')?.buckets['5h']?.usedPct, 20);
+    }
+    assert.ok(f.calls().gets > 1);
+    assert.equal(f.calls().posts, 0);
+    assert.equal(f.slots.getSlot('active')?.fingerprint, credentialLineage(rotated));
+  });
+
+  it('discards an active reading when the active account changes during its poll', async () => {
+    const f = await fixture();
+    const deps = f.deps();
+    let requests = 0;
+    deps.getUsage = async () => {
+      requests += 1;
+      f.store.setActiveLogin('anthropic', 'inactive', 'fixture', NOW);
+      return { status: 200, body: JSON.stringify({ five_hour: { utilization: 20 }, seven_day: { utilization: 10 } }) };
+    };
+    await pollAnthropic(deps);
+    assert.equal(requests, 1);
+    assert.deepEqual(f.store.listUsagePolls('anthropic'), {});
+    assert.deepEqual(f.store.getAllSnapshots('active'), {});
+    assert.deepEqual(f.store.getAllSnapshots('inactive'), {});
   });
 
   it('a spend-guard skip yields to the next inactive candidate', async () => {
@@ -297,6 +322,16 @@ describe('auto anthropic poll (G8)', () => {
     assert.equal(f.calls().posts, 0);
   });
 
+  it('does not spend an expired inactive slot when no active row exists', async () => {
+    const f = await fixture();
+    await f.slots.writeSlot('inactive', credential('expired', (NOW - 1) * 1000), { cause: 'fixture' });
+    await f.backend.set(f.paths.keychainService, 'fixture', credential('rotated-live'));
+    f.store.setActiveLogin('anthropic', null, 'fixture', NOW);
+    f.store.writeUsagePollPlans('anthropic', { active: { nextDueAt: NOW + 300, pollIntervalS: 300 } });
+    await pollAnthropic(f.deps());
+    assert.deepEqual(f.calls(), { gets: 0, posts: 0 });
+  });
+
   it('records inactive invalid_client for the doctor check', async () => {
     const f = await fixture();
     await f.slots.writeSlot('inactive', credential('expired', (NOW - 1) * 1000), { cause: 'fixture' });
@@ -305,6 +340,18 @@ describe('auto anthropic poll (G8)', () => {
     deps.consumeDeps.postRefresh = async () => ({ status: 400, body: '{"error":"invalid_client"}' });
     await pollAnthropic(deps);
     assert.equal(f.store.listUsagePolls('anthropic').inactive?.lastStatus, 'invalid_client');
+  });
+
+  it('drops a 429 snapshot at its earliest window reset', async () => {
+    const f = await fixture();
+    f.store.writeUsagePollPlans('anthropic', {
+      active: { nextDueAt: NOW + 10_000, pollIntervalS: 10_000 }, inactive: { nextDueAt: NOW + 10_000, pollIntervalS: 10_000 },
+    });
+    f.store.upsertSnapshot('active', '5h', { usedPct: 20, fetchedAt: (NOW - 301) * 1000, resetAt: NOW * 1000 - 1, source: 'poll', confidence: 'authoritative' });
+    f.store.upsertSnapshot('active', '7d', { usedPct: 10, fetchedAt: (NOW - 301) * 1000, resetAt: (NOW + 86_400) * 1000, source: 'poll', confidence: 'authoritative' });
+    f.store.recordUsagePollResult('anthropic', 'active', { attemptedAt: NOW - 301, status: 'http-429', http429: true });
+    const accounts = await pollAnthropic(f.deps());
+    assert.deepEqual(accounts.find((account) => account.accountId === 'active')?.buckets, {});
   });
 
   it('keeps last_429_at after a later successful poll', async () => {

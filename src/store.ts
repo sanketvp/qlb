@@ -1842,6 +1842,7 @@ export class Store {
           AND next_due_at IS ? AND poll_interval_s IS ?
           AND (backoff_until IS NULL OR backoff_until <= ?)
           AND (held_until IS NULL OR held_until <= ?)
+          AND last_status IS NOT 'token_dead'
       `);
       for (const [accountId, plan] of rows) {
         const isRepair = now !== undefined

@@ -100,11 +100,11 @@ const TRUST_MAX_AGE_S = 3600;
 const RATE_LIMIT_TRUST_MAX_AGE_S = 7200;
 const HARD_SENTINEL_STATUSES = new Set(['token-expired', 'foreign-credential', 'keychain-unavailable', 'no-credentials', 'relogin-needed']);
 
-function decisionTrusts(row: UsagePollRow | undefined, fetchedAt: number, resetAt: number | undefined, nowS: number): boolean {
+function decisionTrusts(row: UsagePollRow | undefined, fetchedAt: number, snapshotResetAt: number | undefined, nowS: number): boolean {
   const ageS = nowS - fetchedAt / 1000;
   if (HARD_SENTINEL_STATUSES.has(row?.lastStatus ?? '')) return ageS <= 180;
   if (row?.lastStatus === 'http-429') {
-    if (resetAt !== undefined && nowS * 1000 > resetAt) return false;
+    if (snapshotResetAt !== undefined && nowS * 1000 > snapshotResetAt) return false;
     if (ageS <= STALE_OK_S) return true;
     return ageS <= RATE_LIMIT_TRUST_MAX_AGE_S;
   }
@@ -129,8 +129,13 @@ function freshAccounts(slots: ReturnType<ClaudeSlots['listSlots']>, store: Store
   const allScoped = configuredModels.has('all');
   return slots.filter((slot) => slot.archivedAt == null).map((slot) => {
     const row = polls[slot.accountId];
-    const buckets = unknownThisTick.has(slot.accountId) ? {} : Object.fromEntries(Object.entries(store.getAllSnapshots(slot.accountId))
-      .filter(([label, reading]) => decisionTrusts(row, reading.fetchedAt, reading.resetAt, nowS)
+    const snapshot = store.getAllSnapshots(slot.accountId);
+    // During a 429 hold the oracle expires the entire snapshot at its first
+    // window reset; a later window must not keep the account trusted alone.
+    const snapshotResetAt = Object.values(snapshot).reduce<number | undefined>((earliest, reading) =>
+      reading.resetAt === undefined ? earliest : earliest === undefined ? reading.resetAt : Math.min(earliest, reading.resetAt), undefined);
+    const buckets = unknownThisTick.has(slot.accountId) ? {} : Object.fromEntries(Object.entries(snapshot)
+      .filter(([label, reading]) => decisionTrusts(row, reading.fetchedAt, snapshotResetAt, nowS)
         && (!label.startsWith('7d:') || (scopedEnabled && (allScoped || configuredModels.has(label.slice(3).toLowerCase())))))
       .map(([label, reading]) => [label, { usedPct: reading.usedPct, ...(reading.resetAt === undefined ? {} : { resetAt: reading.resetAt }) }]));
     return {
@@ -181,26 +186,25 @@ export async function pollAnthropic(deps: AnthropicPollDeps): Promise<Autoswitch
       let degraded = false;
       try {
         const live = await readLiveClaudeCredentials({ ...deps.fetchActiveDeps.live, env: deps.fetchActiveDeps.live.env ?? deps.fetchActiveDeps.env });
-        if (credentialLineage(live) !== credentialLineage(current.credential)) {
-          // A switch may have published a successor before active_login commits.
-          // Do not attribute its usage to the outgoing account.
-          unknownThisTick.add(active.accountId);
-        } else creds = live;
+        creds = live;
       } catch {
         // The slot is only a degraded fallback; do not run the resync hook on it.
         degraded = true;
       }
-      if (!unknownThisTick.has(active.accountId)) {
-        const result = await fetchActiveUsage({
-          ...deps.fetchActiveDeps, slots: deps.slots, store: deps.store, getUsage: deps.getUsage,
-          afterAcceptedUsage: resyncHook({ ...deps.resyncDeps, slots: deps.slots, store: deps.store, verdicts: deps.fetchActiveDeps.verdicts }),
-        }, { accountId: active.accountId, email: active.email ?? '', orgUuid: active.orgUuid ?? '', creds, degraded });
-        if (result.usage && typeof result.usage === 'object' && 'buckets' in result.usage) {
-          const parsed = result.usage as ParsedUsageResponse;
-          const readings = readingsFrom(parsed, nowS);
-          record(active.accountId, previous, parsedUsage(parsed), readings, 'ok', true);
-        } else record(active.accountId, previous, null, undefined, statusFor(result), true, result.error === 'http-429', result.retryAfterS);
+      const result = await fetchActiveUsage({
+        ...deps.fetchActiveDeps, slots: deps.slots, store: deps.store, getUsage: deps.getUsage,
+        afterAcceptedUsage: resyncHook({ ...deps.resyncDeps, slots: deps.slots, store: deps.store, verdicts: deps.fetchActiveDeps.verdicts }),
+      }, { accountId: active.accountId, email: active.email ?? '', orgUuid: active.orgUuid ?? '', creds, degraded });
+      // A switch can commit while the usage request is in flight. The reading
+      // has no safe owner then, so leave both accounts' poll rows untouched.
+      if (deps.store.getActiveLogin(PROVIDER)?.accountId !== activeId) {
+        return freshAccounts(deps.slots.listSlots(), deps.store, pollingState(deps.slots.listSlots(), deps.store.listUsagePolls(PROVIDER)), nowS, models, unknownThisTick);
       }
+      if (result.usage && typeof result.usage === 'object' && 'buckets' in result.usage) {
+        const parsed = result.usage as ParsedUsageResponse;
+        const readings = readingsFrom(parsed, nowS);
+        record(active.accountId, previous, parsedUsage(parsed), readings, 'ok', true);
+      } else record(active.accountId, previous, null, undefined, statusFor(result), true, result.error === 'http-429', result.retryAfterS);
     }
   }
 
@@ -221,7 +225,7 @@ export async function pollAnthropic(deps: AnthropicPollDeps): Promise<Autoswitch
         let live: string | null = null;
         let liveUnreadable = false;
         try { live = await readLiveClaudeCredentials({ ...deps.fetchActiveDeps.live, env: deps.fetchActiveDeps.live.env ?? deps.fetchActiveDeps.env }); } catch (error) { liveUnreadable = !isCredentialNotFound(error); }
-        if (activeNow === inactiveId || liveUnreadable || (live !== null && credentialLineage(live) === credentialLineage(credential))) {
+        if (activeNow === null || activeNow === inactiveId || liveUnreadable || (live !== null && credentialLineage(live) === credentialLineage(credential))) {
           // Yield this candidate so another inactive account can be polled.
           deps.store.writeUsagePollPlans(PROVIDER, { [inactiveId]: { nextDueAt: nowS + (polls[inactiveId]?.pollIntervalS ?? 300), pollIntervalS: polls[inactiveId]?.pollIntervalS ?? 300 } });
           skipped = true;
@@ -238,7 +242,7 @@ export async function pollAnthropic(deps: AnthropicPollDeps): Promise<Autoswitch
             skipped = true;
             if (strike === 'lineage-moved') { /* keep the slot eligible after ordinary failure backoff */ }
           } else if (consumed.kind === 'consume-gate-unpersisted') {
-            // Like cc-switch, the successor is lost; refuse durably and never reuse its spent predecessor.
+            // Like cc-switch, the successor is lost; refuse durably and defer retrying its spent predecessor until the hold ends.
             deps.store.recordClaudeSwitchRefusal({ from: activeId, to: inactiveId, trigger: 'auto', reason: 'freshen-consume-gate-unpersisted', injected: false, attempt: `poll-freshen-${inactiveId}-${nowS}`, now: nowS * 1000 });
             try { deps.consumeDeps.warn?.('Claude refresh successor was not persisted; inactive poll stopped'); } catch { /* diagnostic only */ }
             record(inactiveId, previous, null, undefined, `consume-${consumed.kind}`, false, false, 3600);
