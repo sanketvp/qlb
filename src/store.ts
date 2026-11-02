@@ -53,6 +53,17 @@ export interface UsagePollResult {
   status: string;
   readings?: Record<string, BucketReading>;
   http429?: boolean;
+  /** Provider Retry-After, in seconds, for a failed usage fetch. */
+  retryAfterS?: number;
+}
+
+function usageFailureBackoffS(failures: number, retryAfterS: number | undefined, rateLimited: boolean): number {
+  const computed = Math.min(30 * (2 ** Math.min(Math.max(0, failures - 1), 32)), 600);
+  if (typeof retryAfterS !== 'number' || !Number.isFinite(retryAfterS)) return computed;
+  if (retryAfterS === 0) return rateLimited ? Math.min(Math.max(computed, 300), 600) : computed;
+  let asked = Math.max(0, retryAfterS);
+  if (asked > 600 && rateLimited) asked += 900;
+  return Math.max(computed, Math.min(asked, rateLimited ? 4500 : 3600));
 }
 
 /** Credential-refresh lease (§4.7 / §4.8.2). De-duplication only — not a correctness fence. */
@@ -1777,18 +1788,24 @@ export class Store {
           accountId, bucket, reading.usedPct, reading.used ?? null, reading.limit ?? null,
           reading.remaining ?? null, reading.resetAt ?? null, reading.fetchedAt, reading.source, reading.confidence,
         );
-        this.db.prepare(`INSERT INTO usage_polls (provider, account_id, last_fetch_at, last_attempt_at, last_status, consecutive_failures, last_429_at)
-          VALUES (?, ?, ?, ?, ?, 0, NULL)
+        this.db.prepare(`INSERT INTO usage_polls (provider, account_id, last_fetch_at, last_attempt_at, last_status, consecutive_failures, backoff_until, last_429_at)
+          VALUES (?, ?, ?, ?, ?, 0, NULL, NULL)
           ON CONFLICT(provider, account_id) DO UPDATE SET last_fetch_at = excluded.last_fetch_at,
             last_attempt_at = excluded.last_attempt_at, last_status = excluded.last_status,
-            consecutive_failures = 0, last_429_at = NULL`).run(provider, accountId, result.attemptedAt, result.attemptedAt, status);
+            consecutive_failures = 0, backoff_until = NULL,
+            last_429_at = usage_polls.last_429_at`).run(provider, accountId, result.attemptedAt, result.attemptedAt, status);
       } else {
-        this.db.prepare(`INSERT INTO usage_polls (provider, account_id, last_attempt_at, last_status, consecutive_failures, last_429_at)
-          VALUES (?, ?, ?, ?, 1, ?)
+        const prior = this.db.prepare('SELECT consecutive_failures FROM usage_polls WHERE provider = ? AND account_id = ?')
+          .get(provider, accountId) as { consecutive_failures: number } | undefined;
+        const failures = (prior?.consecutive_failures ?? 0) + 1;
+        const backoffUntil = result.attemptedAt + usageFailureBackoffS(failures, result.retryAfterS, result.http429 === true);
+        this.db.prepare(`INSERT INTO usage_polls (provider, account_id, last_attempt_at, last_status, consecutive_failures, backoff_until, last_429_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?)
           ON CONFLICT(provider, account_id) DO UPDATE SET last_attempt_at = excluded.last_attempt_at,
-            last_status = excluded.last_status, consecutive_failures = usage_polls.consecutive_failures + 1,
+            last_status = excluded.last_status, consecutive_failures = excluded.consecutive_failures,
+            backoff_until = excluded.backoff_until,
             last_429_at = CASE WHEN excluded.last_429_at IS NULL THEN usage_polls.last_429_at ELSE excluded.last_429_at END`)
-          .run(provider, accountId, result.attemptedAt, status, result.http429 ? result.attemptedAt : null);
+          .run(provider, accountId, result.attemptedAt, status, failures, backoffUntil, result.http429 ? result.attemptedAt : null);
       }
     });
   }
