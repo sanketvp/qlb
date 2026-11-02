@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { describe, it } from 'node:test';
 
-import { isQlbProcessCommand, runUndoCswapCommand } from '../src/commands/undo-cswap';
+import { defaultHeldLocks, isQlbProcessCommand, runUndoCswapCommand } from '../src/commands/undo-cswap';
 import { discoverCommands, resolveCommand, type CommandContext } from '../src/registry';
 import { openStore, openStoreConnection } from '../src/store';
 import { runExecutingCommand } from '../src/cli';
@@ -496,6 +496,19 @@ describe('qlb undo cswap hand-back', () => {
       assert.equal(f.keychain.writes.length, 0);
       const store = openStore(f.dbPath);
       try { assert.equal(phase(store).state, 'undoing'); } finally { store.close(); }
+    } finally { close(f); }
+  });
+
+  it('treats an exited auto flock probe as not held', async () => {
+    const f = fixture();
+    try {
+      const locks = join(f.home, '.qlb', 'locks');
+      mkdirSync(locks, { recursive: true });
+      writeFileSync(join(locks, 'auto.lock'), '');
+
+      assert.deepEqual(await defaultHeldLocks(f.home, () => 0, async () => {
+        throw new Error('fcntl flock helper exited unexpectedly (17)');
+      }), []);
     } finally { close(f); }
   });
 

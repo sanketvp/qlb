@@ -17,7 +17,7 @@ export interface CswapProcess {
 export type CswapLockRelease = (() => void | Promise<void>) & {
   /** Resolves if the owned flock helper disappears before release. */
   lost?: Promise<Error>;
-  /** Synchronously reports a helper loss observed by its process event handler. */
+  /** Synchronously reports loss recorded on helper exit, close or error, or when release() finds the helper already exited. */
   isLost?: () => Error | undefined;
 };
 
@@ -88,6 +88,10 @@ async function releaseAll(locks: CswapLockRelease[]): Promise<void> {
   }
 }
 
+function lostLockError(locks: CswapLockRelease[]): Error | undefined {
+  return locks.map((release) => release.isLost?.()).find((error): error is Error => error !== undefined);
+}
+
 async function acquireAllLocks(options: CswapDrainOptions, paths: string[], deadline: number, survivor: CswapProcess[]): Promise<CswapLockRelease[] | CswapAgentResult> {
   const pollMs = options.pollMs ?? POLL_MS;
   for (;;) {
@@ -102,7 +106,14 @@ async function acquireAllLocks(options: CswapDrainOptions, paths: string[], dead
     } catch {
       complete = false;
     }
-    if (complete) return locks;
+    if (complete) {
+      const lost = lostLockError(locks);
+      if (lost !== undefined) {
+        await releaseAll(locks);
+        return { ok: false, code: drainErrorCode(lost) };
+      }
+      return locks;
+    }
     await releaseAll(locks);
     if (options.now() >= deadline) return { ok: false, code: survivorCode(survivor) };
     await options.sleep(pollMs);
@@ -142,6 +153,8 @@ export async function cooperativeDrain(options: CswapDrainOptions): Promise<Cswa
       }
       const exited = new Set<number>();
       for (const process of survivors) {
+        const lost = lostLockError(acquired);
+        if (lost !== undefined) return { ok: false, code: drainErrorCode(lost) };
         try {
           await options.kill(process.pid, 'SIGTERM');
         } catch (error) {
@@ -362,12 +375,14 @@ export function productionTryAcquireLock(path: string, startHelper: FlockHelperS
     const stdout = child.stdout;
     const stdin = child.stdin;
     if (stdout === null || stdin === null) {
+      child.kill();
       rejectLock(new Error('fcntl flock helper must use piped stdin and stdout'));
       return;
     }
     let state: 'pending' | 'locked' | 'busy' = 'pending';
     let response = '';
     let releaseRequested = false;
+    let pendingExit: Error | undefined;
     let released: Promise<void> | undefined;
     let lostError: Error | undefined;
     let notifyLost: (error: Error) => void = () => {};
@@ -377,14 +392,21 @@ export function productionTryAcquireLock(path: string, startHelper: FlockHelperS
       lostError = error;
       notifyLost(error);
     };
+    const unexpectedExit = (code: number | null, signal: NodeJS.Signals | null): Error =>
+      new Error(`fcntl flock helper exited unexpectedly (${code ?? signal ?? 'unknown'})`);
     const closed = new Promise<void>((resolveClose, rejectClose) => {
       child.once('error', (error) => {
         if (state === 'locked') markLost(new Error(`fcntl flock helper exited unexpectedly (${error.message})`));
         rejectClose(error);
       });
+      child.once('exit', (code, signal) => {
+        const error = unexpectedExit(code, signal);
+        if (state === 'pending') pendingExit = error;
+        else if (state === 'locked' && !releaseRequested) markLost(error);
+      });
       child.once('close', (code, signal) => {
         if (state === 'locked') {
-          if (!releaseRequested) markLost(new Error(`fcntl flock helper exited unexpectedly (${code ?? signal ?? 'unknown'})`));
+          if (!releaseRequested) markLost(unexpectedExit(code, signal));
           resolveClose();
         } else if (state === 'busy' || code === 0) {
           resolveClose();
@@ -401,11 +423,21 @@ export function productionTryAcquireLock(path: string, startHelper: FlockHelperS
       const status = response.slice(0, newline);
       if (status === 'busy') state = 'busy';
       else if (status === 'locked') {
+        const exited = pendingExit
+          ?? (child.exitCode !== null || child.signalCode !== null
+            ? unexpectedExit(child.exitCode, child.signalCode)
+            : undefined);
+        if (exited !== undefined) {
+          rejectLock(exited);
+          return;
+        }
         state = 'locked';
         const release = Object.assign(() => {
           if (!released) {
+            const exited = child.exitCode !== null || child.signalCode !== null;
+            if (exited && !releaseRequested) markLost(unexpectedExit(child.exitCode, child.signalCode));
             releaseRequested = true;
-            if (child.exitCode !== null || child.signalCode !== null) released = Promise.resolve();
+            if (exited) released = Promise.resolve();
             else {
               stdin.end();
               released = closed.catch(() => undefined);
