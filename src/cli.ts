@@ -220,6 +220,8 @@ type MigrateOpts = {
   poolFile: string;
   ownerFile: string;
   authJson: string;
+  /** Raw winning config spelling, admitted before config normalization. */
+  protectedPiAuthJsonPath: string;
   db?: string;
   confirmRealCutover: boolean;
 };
@@ -335,6 +337,15 @@ function targetChild(dir: string, name: string): string {
   return dir === '/' ? `/${name}` : `${dir}/${name}`;
 }
 
+/** Expand only a leading home marker by literal concatenation; never normalize it. */
+function expandRawPiAuthJsonPath(raw: string, home: string): string {
+  if (raw === '~') return home;
+  if (raw.startsWith('~/') || raw.startsWith('~\\')) {
+    return home === '/' ? `/${raw.slice(2)}` : `${home}/${raw.slice(2)}`;
+  }
+  return raw;
+}
+
 function parseMigrateArgs(args: string[]): MigrateOpts {
   const subRaw = args[0];
   if (subRaw === '-h' || subRaw === '--help' || subRaw === undefined) {
@@ -410,12 +421,22 @@ function parseMigrateArgs(args: string[]): MigrateOpts {
   }
   const provider: MigrateProvider = providerRawOrDefault;
 
-  // config.ts normalizes environment values during module initialization. Check
-  // the raw override here so a hostile segment cannot be erased before migrate
+  // config.ts retains the actual winning spelling (flag, env, config file, or
+  // default) so normalization cannot erase a hostile segment before migration
   // admission sees it.
-  if (process.env.QLB_PI_AUTH_JSON_PATH !== undefined) {
-    validateCliMigratePath(process.env.QLB_PI_AUTH_JSON_PATH, 'QLB_PI_AUTH_JSON_PATH', 'file', cwd);
-  }
+  const piAuthJsonFlag = config.piAuthJsonPathSource === 'flag'
+    ? '--pi-auth-json-path'
+    : config.piAuthJsonPathSource === 'env'
+      ? 'QLB_PI_AUTH_JSON_PATH'
+      : config.piAuthJsonPathSource === 'config-file'
+        ? 'config piAuthJsonPath'
+        : 'default piAuthJsonPath';
+  const protectedPiAuthJsonPath = validateCliMigratePath(
+    expandRawPiAuthJsonPath(config.piAuthJsonPathRaw, qlbHomeDir()),
+    piAuthJsonFlag,
+    'file',
+    cwd,
+  );
 
   if (targetDir !== undefined) {
     if (!ownerFile) ownerFile = targetChild(targetDir, 'qlb-owner.json');
@@ -431,6 +452,7 @@ function parseMigrateArgs(args: string[]): MigrateOpts {
     poolFile: validateCliMigratePath(poolFile ?? DEFAULT_POOL_FILE, '--pool-file', 'file', cwd),
     ownerFile: validateCliMigratePath(ownerFile ?? defaultOwnerFileFor(provider), '--owner-file', 'file', cwd),
     authJson: validateCliMigratePath(authJson ?? DEFAULT_AUTH_JSON, '--auth-json', 'file', cwd),
+    protectedPiAuthJsonPath,
     db,
     confirmRealCutover,
   };
@@ -1020,29 +1042,48 @@ export function parseArgs(argv: string[]): Opts {
   return { cmd: 'status', json, view };
 }
 
-function assertSafeMigratePaths(opts: MigrateOpts): void {
-  if (opts.sub === 'status') return;
+type MigratePathAdmission = {
+  protectedRoot: ReturnType<typeof resolveProtectedRoot>;
+  native: ReturnType<typeof resolveMigratePath>;
+  owner: ReturnType<typeof resolveMigratePath>;
+  auth?: ReturnType<typeof resolveMigratePath>;
+};
+
+/**
+ * Resolve only paths this provider can touch, before opening the store. This
+ * keeps structural refusals from creating a database or migration backup.
+ */
+function prepareMigratePathAdmission(opts: MigrateOpts): MigratePathAdmission | undefined {
+  if (opts.sub === 'status') return undefined;
   assertSupportedPlatform();
   const cwd = physicalCwd();
-  const protectedRoot = resolveProtectedRoot(config.piAuthJsonPath, {
+  const protectedRoot = resolveProtectedRoot(opts.protectedPiAuthJsonPath, {
     flag: 'QLB_PI_AUTH_JSON_PATH', cwd,
-  });
-  const pool = resolveMigratePath(opts.poolFile, {
-    flag: '--pool-file', kind: 'file', entryLeaf: true,
   });
   const owner = resolveMigratePath(opts.ownerFile, {
     flag: '--owner-file', kind: 'file', entryLeaf: true,
   });
-  const auth = resolveMigratePath(opts.authJson, { flag: '--auth-json', kind: 'file' });
-  const native = isStaticKeyProvider(opts.provider)
-    ? owner
-    : opts.provider === 'anthropic'
-      ? pool
-      : auth;
+  if (opts.provider === 'anthropic') {
+    const pool = resolveMigratePath(opts.poolFile, {
+      flag: '--pool-file', kind: 'file', entryLeaf: true,
+    });
+    const auth = resolveMigratePath(opts.authJson, { flag: '--auth-json', kind: 'file' });
+    return { protectedRoot, native: pool, owner, auth };
+  }
+  if (isSingleGrantProvider(opts.provider)) {
+    const auth = resolveMigratePath(opts.authJson, { flag: '--auth-json', kind: 'file' });
+    return { protectedRoot, native: auth, owner };
+  }
+  return { protectedRoot, native: owner, owner };
+}
+
+/** Keep the cswap ownership refusal ahead of the explicit real-cutover policy. */
+function assertNoUnconfirmedRealCutover(opts: MigrateOpts, paths: MigratePathAdmission | undefined): void {
+  if (paths === undefined) return;
   const real =
-    isInsideProtectedRoot(native, protectedRoot)
-    || isInsideProtectedRoot(owner, protectedRoot)
-    || (opts.provider === 'anthropic' && isInsideProtectedRoot(auth, protectedRoot));
+    isInsideProtectedRoot(paths.native, paths.protectedRoot)
+    || isInsideProtectedRoot(paths.owner, paths.protectedRoot)
+    || (paths.auth !== undefined && isInsideProtectedRoot(paths.auth, paths.protectedRoot));
   if (real && !opts.confirmRealCutover) {
     console.error(
       'REFUSED: resolved native / owner path is inside ~/.pi/agent/.\n' +
@@ -1316,6 +1357,7 @@ function piOwnerClaimsAnthropic(path: string): boolean {
 const FORWARD_MIGRATE_SUBS = new Set(['stage', 'rehearse', 'commit', 'resume']);
 
 async function runMigrate(opts: MigrateOpts): Promise<number> {
+  const paths = prepareMigratePathAdmission(opts);
   let store: Store;
   let opened = false;
   if (opts.db) {
@@ -1339,7 +1381,7 @@ async function runMigrate(opts: MigrateOpts): Promise<number> {
     // After the ownership guard (which needs the store) so a CONSUMED journal
     // reports DUAL_OWNERSHIP_REFUSED even on default (live) paths; still before
     // any migration object is built or any native/owner file is touched.
-    assertSafeMigratePaths(opts);
+    assertNoUnconfirmedRealCutover(opts, paths);
     const mig = isStaticKeyProvider(opts.provider)
       ? createStaticKeyMigration(
           store,

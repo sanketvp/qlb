@@ -34,11 +34,13 @@ function isolatedEnv(): NodeJS.ProcessEnv {
 function runCli(
   args: string[],
   env: NodeJS.ProcessEnv = isolatedEnv(),
+  cwd?: string,
 ): { status: number; stdout: string; stderr: string } {
   try {
     const stdout = execFileSync(process.execPath, [cliPath, ...args], {
       encoding: 'utf8',
       env,
+      cwd,
       timeout: 60_000,
     });
     return { status: 0, stdout, stderr: '' };
@@ -82,6 +84,11 @@ function expectUnsafeMigrate(
   assert.equal(result.status, 2, result.stderr);
   assert.match(result.stderr, /unsafe-migrate-path/);
   assert.match(result.stderr, detail);
+}
+
+function assertNoMigrateStore(root: string): void {
+  assert.equal(existsSync(join(root, 'qlb.db')), false);
+  assert.equal(existsSync(join(root, 'backups')), false);
 }
 
 describe('CLI smoke — documented commands', () => {
@@ -535,8 +542,8 @@ describe('CLI smoke — documented commands', () => {
     expectUnsafeMigrate(runCli([
       'migrate', 'rollback', '--provider', 'anthropic',
       '--pool-file', join(safe, 'pool.json'), '--owner-file', join(safe, 'owner.json'),
-      '--auth-json', `${link}/../auth.json`,
-    ], env), /dot segments/);
+      '--auth-json', 'link/../auth.json',
+    ], env, safe), /dot segments/);
   });
 
   it('3 migrate refuses a dangling auth-json symlink into the protected Pi directory', () => {
@@ -563,8 +570,8 @@ describe('CLI smoke — documented commands', () => {
     expectUnsafeMigrate(runCli([
       'migrate', 'rollback', '--provider', 'anthropic',
       '--pool-file', join(safe, 'pool.json'), '--owner-file', join(safe, 'owner.json'),
-      '--auth-json', `${safe}/missing/../link/auth.json`,
-    ], env), /dot segments/);
+      '--auth-json', 'missing/../link/auth.json',
+    ], env, safe), /dot segments/);
     assert.equal(existsSync(join(safe, 'missing')), false);
   });
 
@@ -574,13 +581,13 @@ describe('CLI smoke — documented commands', () => {
     mkdirSync(join(elsewhere, 'sub'), { recursive: true });
     symlinkSync(join(elsewhere, 'sub'), join(safe, 'link2'));
     symlinkSync(live, join(safe, 'link'));
-    const ownerFile = `${join(safe, 'link2')}/../link/owner.json`;
+    const ownerFile = 'link2/../link/owner.json';
 
     expectUnsafeMigrate(runCli([
       'migrate', 'rollback', '--provider', 'anthropic',
       '--pool-file', join(safe, 'pool.json'), '--owner-file', ownerFile,
       '--auth-json', join(safe, 'auth.json'),
-    ], env), /dot segments/);
+    ], env, safe), /dot segments/);
     assert.equal(existsSync(join(live, 'qlb-owner.json')), false);
   });
 
@@ -592,8 +599,8 @@ describe('CLI smoke — documented commands', () => {
     expectUnsafeMigrate(runCli([
       'migrate', 'rollback', '--provider', 'anthropic',
       '--pool-file', join(safe, 'pool.json'), '--owner-file', join(safe, 'owner.json'),
-      '--auth-json', `${join(safe, 'file')}/../victim`,
-    ], env), /dot segments/);
+      '--auth-json', 'file/../victim',
+    ], env, safe), /dot segments/);
     assert.equal(readFileSync(join(safe, 'victim'), 'utf8'), 'unchanged\n');
   });
 
@@ -631,7 +638,8 @@ describe('CLI smoke — documented commands', () => {
       '--auth-json', join(relative.safe, 'auth.json'),
     ];
     relative.env.QLB_PI_AUTH_JSON_PATH = 'link/../auth.json';
-    expectUnsafeMigrate(runCli(args, relative.env), /dot segments/);
+    expectUnsafeMigrate(runCli(args, relative.env, relative.safe), /dot segments/);
+    assertNoMigrateStore(relative.root);
 
     const absolute = migrateFixture();
     symlinkSync(absolute.live, join(absolute.safe, 'link'));
@@ -641,6 +649,52 @@ describe('CLI smoke — documented commands', () => {
       '--pool-file', join(absolute.safe, 'pool.json'), '--owner-file', join(absolute.safe, 'owner.json'),
       '--auth-json', join(absolute.safe, 'auth.json'),
     ], absolute.env), /dot segments/);
+    assertNoMigrateStore(absolute.root);
+  });
+
+  it('migrate validates the raw Pi auth flag that wins over a safe environment value', () => {
+    const { env, root, safe, live } = migrateFixture();
+    symlinkSync(live, join(safe, 'link'));
+    const raw = 'link/../auth.json';
+    env.QLB_PI_AUTH_JSON_PATH = join(live, 'auth.json');
+
+    expectUnsafeMigrate(runCli([
+      '--pi-auth-json-path', raw,
+      'migrate', 'rollback', '--provider', 'anthropic',
+      '--pool-file', join(safe, 'pool.json'), '--owner-file', join(safe, 'owner.json'),
+      '--auth-json', join(safe, 'auth.json'),
+    ], env, safe), /dot segments/);
+    assertNoMigrateStore(root);
+  });
+
+  it('migrate validates the raw Pi auth config-file value before config normalization', () => {
+    const { env, root, safe, live } = migrateFixture();
+    symlinkSync(live, join(safe, 'link'));
+    delete env.QLB_PI_AUTH_JSON_PATH;
+    writeFileSync(env.QLB_CONFIG_PATH!, JSON.stringify({
+      piAuthJsonPath: '~/safe/link/../auth.json',
+    }));
+
+    expectUnsafeMigrate(runCli([
+      'migrate', 'rollback', '--provider', 'anthropic',
+      '--pool-file', join(safe, 'pool.json'), '--owner-file', join(safe, 'owner.json'),
+      '--auth-json', join(safe, 'auth.json'),
+    ], env), /dot segments/);
+    assertNoMigrateStore(root);
+  });
+
+  it('migrate validates a default Pi auth path built from a home spelling with dot segments', () => {
+    const env = isolatedEnv();
+    const root = String(env.HOME);
+    const home = join(root, 'home');
+    mkdirSync(home);
+    env.QLB_HOME = `${home}/../home`;
+    delete env.QLB_PI_AUTH_JSON_PATH;
+
+    expectUnsafeMigrate(runCli([
+      'migrate', 'rollback', '--provider', 'openrouter', '--owner-file', join(root, 'owner.json'),
+    ], env), /dot segments/);
+    assertNoMigrateStore(root);
   });
 
   it('10 migrate rejects dot segments in every guarded flag', () => {
@@ -651,26 +705,88 @@ describe('CLI smoke — documented commands', () => {
         'migrate', 'rollback', '--provider', 'anthropic',
         '--pool-file', join(safe, 'pool.json'), '--owner-file', join(safe, 'owner.json'),
         '--auth-json', join(safe, 'auth.json'),
-        flag, `${safe}/./x`,
-      ], env);
+        flag, './x',
+      ], env, safe);
       expectUnsafeMigrate(result, /dot segments/);
     }
   });
 
   it('30 confirm-real-cutover allows only structurally valid protected targets', () => {
     const { env, safe, live } = migrateFixture();
-    const valid = runCli([
-      'migrate', 'rollback', '--provider', 'anthropic', '--confirm-real-cutover',
+    const base = [
+      'migrate', 'rollback', '--provider', 'anthropic',
       '--pool-file', join(safe, 'pool.json'), '--owner-file', join(safe, 'owner.json'),
       '--auth-json', join(live, 'auth.json'),
-    ], env);
+    ];
+    const unconfirmed = runCli(base, env);
+    assert.equal(unconfirmed.status, 2, unconfirmed.stderr);
+    assert.match(unconfirmed.stderr, /REAL Pi credential cutover/);
+
+    const valid = runCli([...base, '--confirm-real-cutover'], env);
     assert.equal(valid.status, 0, valid.stderr);
 
     expectUnsafeMigrate(runCli([
       'migrate', 'rollback', '--provider', 'anthropic', '--confirm-real-cutover',
       '--pool-file', join(safe, 'pool.json'), '--owner-file', join(safe, 'owner.json'),
-      '--auth-json', `${safe}/./auth.json`,
-    ], env), /dot segments/);
+      '--auth-json', './auth.json',
+    ], env, safe), /dot segments/);
+  });
+
+  it('migrate refuses structural path errors before creating a store or backup', () => {
+    const cases: Array<{ name: string; setup: (fixture: MigrateFixture) => string[]; detail: RegExp }> = [
+      {
+        name: 'missing protected directory',
+        setup: ({ env, root, safe }) => {
+          env.QLB_PI_AUTH_JSON_PATH = join(root, 'missing', 'auth.json');
+          return ['migrate', 'rollback', '--provider', 'anthropic', '--pool-file', join(safe, 'pool.json'), '--owner-file', join(safe, 'owner.json'), '--auth-json', join(safe, 'auth.json')];
+        },
+        detail: /protected Pi directory is missing/,
+      },
+      {
+        name: 'non-directory protected path component',
+        setup: ({ env, safe }) => {
+          writeFileSync(join(safe, 'file'), 'not a directory\n');
+          env.QLB_PI_AUTH_JSON_PATH = join(safe, 'file', 'auth.json');
+          return ['migrate', 'rollback', '--provider', 'anthropic', '--pool-file', join(safe, 'pool.json'), '--owner-file', join(safe, 'owner.json'), '--auth-json', join(safe, 'auth.json')];
+        },
+        detail: /ENOTDIR/,
+      },
+      {
+        name: 'symlinked owner entry leaf',
+        setup: ({ safe }) => {
+          writeFileSync(join(safe, 'owner-target.json'), '{}\n');
+          symlinkSync('owner-target.json', join(safe, 'owner.json'));
+          return ['migrate', 'rollback', '--provider', 'anthropic', '--pool-file', join(safe, 'pool.json'), '--owner-file', join(safe, 'owner.json'), '--auth-json', join(safe, 'auth.json')];
+        },
+        detail: /symlinked entry path/,
+      },
+      {
+        name: 'unsafe symlink target',
+        setup: ({ safe, live }) => {
+          symlinkSync('../live-agent', join(safe, 'link'));
+          return ['migrate', 'rollback', '--provider', 'anthropic', '--pool-file', join(safe, 'pool.json'), '--owner-file', join(safe, 'owner.json'), '--auth-json', join(safe, 'link', 'auth.json')];
+        },
+        detail: /symlink target contains dot segments/,
+      },
+    ];
+    for (const testCase of cases) {
+      const fixture = migrateFixture();
+      expectUnsafeMigrate(runCli(testCase.setup(fixture), fixture.env), testCase.detail);
+      assertNoMigrateStore(fixture.root);
+    }
+  });
+
+  it('migrate ignores structurally unsafe paths the selected provider never touches', () => {
+    const { env, safe } = migrateFixture();
+    writeFileSync(join(safe, 'pool-target.json'), '{}\n');
+    symlinkSync('pool-target.json', join(safe, 'pool.json'));
+
+    const result = runCli([
+      'migrate', 'rollback', '--provider', 'xai',
+      '--pool-file', join(safe, 'pool.json'), '--owner-file', join(safe, 'owner.json'),
+      '--auth-json', join(safe, 'auth.json'),
+    ], env);
+    assert.equal(result.status, 0, result.stderr);
   });
 
   it('install.ps1 encodes the documented Windows installer steps', () => {

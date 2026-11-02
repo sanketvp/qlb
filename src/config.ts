@@ -2,9 +2,14 @@ import { existsSync, readFileSync } from 'node:fs';
 import { isAbsolute, join, resolve } from 'node:path';
 import { qlbHomeDir } from './home';
 
+export type PiAuthJsonPathSource = 'flag' | 'env' | 'config-file' | 'default';
+
 export interface QlbConfig {
   anthropicPoolPath: string;
   piAuthJsonPath: string;
+  /** Winning spelling retained so migrate can validate it before normalization. */
+  piAuthJsonPathRaw: string;
+  piAuthJsonPathSource: PiAuthJsonPathSource;
   codexAuthJsonPath: string;
   kimiCredentialsFile: string;
   /** Always `pi-openrouter`; retained only to diagnose deprecated overrides. */
@@ -19,7 +24,7 @@ export interface QlbConfig {
   configPath: string;
 }
 
-type ConfigField = Exclude<keyof QlbConfig, 'configPath'>;
+type ConfigField = Exclude<keyof QlbConfig, 'configPath' | 'piAuthJsonPathRaw' | 'piAuthJsonPathSource'>;
 
 /** Fixed native source: no arbitrary Keychain service is ever read for OpenRouter. */
 export const OPENROUTER_KEYCHAIN_SERVICE = 'pi-openrouter';
@@ -45,9 +50,13 @@ export const CONFIG_ENV_VARS = Object.fromEntries(
 
 export function defaultConfig(home: string = qlbHomeDir()): QlbConfig {
   const qlbDir = join(home, '.qlb');
+  // Keep this literal spelling: join() would erase a hostile segment in HOME.
+  const piAuthJsonPathRaw = home === '/' ? '/.pi/agent/auth.json' : `${home}/.pi/agent/auth.json`;
   return {
     anthropicPoolPath: join(home, '.pi', 'agent', 'anthropic-pool.json'),
     piAuthJsonPath: join(home, '.pi', 'agent', 'auth.json'),
+    piAuthJsonPathRaw,
+    piAuthJsonPathSource: 'default',
     codexAuthJsonPath: join(home, '.codex', 'auth.json'),
     kimiCredentialsFile: join(home, 'DEV_vault', '04-Security', 'kimi-code-credentials.md'),
     openrouterKeychainService: OPENROUTER_KEYCHAIN_SERVICE,
@@ -114,7 +123,11 @@ export function resolveConfig(options: ResolveConfigOptions = {}): QlbConfig {
     ConfigField,
     { env: string; flag: string },
   ]>) {
-    const raw = cliValue(argv, meta.flag) ?? env[meta.env] ?? fileConfig[field] ?? defaults[field];
+    const flagValue = cliValue(argv, meta.flag);
+    const envValue = env[meta.env];
+    const fileValue = fileConfig[field];
+    const defaultRaw = field === 'piAuthJsonPath' ? defaults.piAuthJsonPathRaw : defaults[field];
+    const raw = flagValue ?? envValue ?? fileValue ?? defaultRaw;
     if (typeof raw !== 'string' || raw.length === 0) continue;
     if (field === 'defaultStrategy') {
       const allowed = new Set(['headroom', 'spread', 'round-robin', 'failover']);
@@ -132,6 +145,16 @@ export function resolveConfig(options: ResolveConfigOptions = {}): QlbConfig {
       warn(`qlb: ${meta.env}/${meta.flag}/${field} '${raw}' is relative and resolves to ${resolve(raw)}; use an absolute path`);
     }
     result[field] = isPath ? expandPath(raw, home) : raw;
+    if (field === 'piAuthJsonPath') {
+      result.piAuthJsonPathRaw = raw;
+      result.piAuthJsonPathSource = flagValue !== undefined
+        ? 'flag'
+        : envValue !== undefined
+          ? 'env'
+          : fileValue !== undefined
+            ? 'config-file'
+            : 'default';
+    }
   }
   return result;
 }
