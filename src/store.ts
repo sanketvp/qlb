@@ -34,6 +34,27 @@ export interface PollClaimRow {
   until: number;
 }
 
+/** Scheduler and outcome state for one provider/account usage poll. Times are epoch seconds. */
+export interface UsagePollRow {
+  accountId: string;
+  lastFetchAt: number | null;
+  lastAttemptAt: number | null;
+  nextDueAt: number | null;
+  pollIntervalS: number | null;
+  lastStatus: string | null;
+  consecutiveFailures: number;
+  backoffUntil: number | null;
+  last429At: number | null;
+  heldUntil: number | null;
+}
+
+export interface UsagePollResult {
+  attemptedAt: number;
+  status: string;
+  readings?: Record<string, BucketReading>;
+  http429?: boolean;
+}
+
 /** Credential-refresh lease (§4.7 / §4.8.2). De-duplication only — not a correctness fence. */
 export interface LeaseRow {
   name: string;
@@ -1725,6 +1746,51 @@ export class Store {
       this.db.exec('ROLLBACK');
       throw err;
     }
+  }
+
+  listUsagePolls(provider: string): Record<string, UsagePollRow> {
+    const rows = this.db.prepare(`SELECT account_id, last_fetch_at, last_attempt_at, next_due_at,
+      poll_interval_s, last_status, consecutive_failures, backoff_until, last_429_at, held_until
+      FROM usage_polls WHERE provider = ?`).all(provider) as Array<Record<string, unknown>>;
+    const out: Record<string, UsagePollRow> = {};
+    for (const row of rows) {
+      const value = (key: string): number | null => typeof row[key] === 'number' ? row[key] : null;
+      const accountId = String(row.account_id);
+      out[accountId] = {
+        accountId,
+        lastFetchAt: value('last_fetch_at'), lastAttemptAt: value('last_attempt_at'),
+        nextDueAt: value('next_due_at'), pollIntervalS: value('poll_interval_s'),
+        lastStatus: typeof row.last_status === 'string' ? row.last_status : null,
+        consecutiveFailures: typeof row.consecutive_failures === 'number' ? row.consecutive_failures : 0,
+        backoffUntil: value('backoff_until'), last429At: value('last_429_at'), heldUntil: value('held_until'),
+      };
+    }
+    return out;
+  }
+
+  /** Atomically retain accepted readings or record a redacted failed attempt. */
+  recordUsagePollResult(provider: string, accountId: string, result: UsagePollResult): void {
+    const status = redactSecrets(result.status, []);
+    this.runImmediate(() => {
+      if (result.readings) {
+        for (const [bucket, reading] of Object.entries(result.readings)) this.upsertSnapStmt.run(
+          accountId, bucket, reading.usedPct, reading.used ?? null, reading.limit ?? null,
+          reading.remaining ?? null, reading.resetAt ?? null, reading.fetchedAt, reading.source, reading.confidence,
+        );
+        this.db.prepare(`INSERT INTO usage_polls (provider, account_id, last_fetch_at, last_attempt_at, last_status, consecutive_failures, last_429_at)
+          VALUES (?, ?, ?, ?, ?, 0, NULL)
+          ON CONFLICT(provider, account_id) DO UPDATE SET last_fetch_at = excluded.last_fetch_at,
+            last_attempt_at = excluded.last_attempt_at, last_status = excluded.last_status,
+            consecutive_failures = 0, last_429_at = NULL`).run(provider, accountId, result.attemptedAt, result.attemptedAt, status);
+      } else {
+        this.db.prepare(`INSERT INTO usage_polls (provider, account_id, last_attempt_at, last_status, consecutive_failures, last_429_at)
+          VALUES (?, ?, ?, ?, 1, ?)
+          ON CONFLICT(provider, account_id) DO UPDATE SET last_attempt_at = excluded.last_attempt_at,
+            last_status = excluded.last_status, consecutive_failures = usage_polls.consecutive_failures + 1,
+            last_429_at = CASE WHEN excluded.last_429_at IS NULL THEN usage_polls.last_429_at ELSE excluded.last_429_at END`)
+          .run(provider, accountId, result.attemptedAt, status, result.http429 ? result.attemptedAt : null);
+      }
+    });
   }
 
   /**
