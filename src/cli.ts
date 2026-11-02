@@ -1910,7 +1910,7 @@ export function exitCodeForError(err: unknown): number {
 }
 
 function readOnlyLifecycleOperation(operation: LifecycleOperation): boolean {
-  return operation.endsWith(':dry-run') || operation === 'doctor' || operation === 'status';
+  return operation.endsWith(':dry-run');
 }
 
 function lifecycleAdmissionCode(dbPath: string, operation: LifecycleOperation): string | null {

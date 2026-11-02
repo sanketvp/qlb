@@ -369,17 +369,18 @@ describe('qlb undo cswap --dry-run', () => {
     } finally { close(f); }
   });
 
-  it('write lifecycle admission still opens old schemas read-write and migrates', async () => {
+  it('doctor lifecycle admission still opens old schemas read-write and migrates', async () => {
     const f = fixture();
     try {
       unlinkSync(f.dbPath);
       buildV4Store(f.dbPath);
       assert.equal(userVersion(f.dbPath), 4);
 
-      const result = await admitOnly(f, 'cutover', ['begin']);
+      const result = await admitOnly(f, 'doctor', []);
 
       assert.deepEqual(result, { code: 0, executed: true });
       assert.equal(userVersion(f.dbPath), 5);
+      assert.doesNotMatch(f.output.join('\n'), /schema-migration-required/);
     } finally { close(f); }
   });
 
