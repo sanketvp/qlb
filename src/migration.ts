@@ -1200,11 +1200,28 @@ export class Migration {
     );
   }
 
+  private poolLegacyOwnerProviders(): string[] | null {
+    if (!existsSync(this.ownerFilePath)) return null;
+    const parsed: unknown = JSON.parse(readFileSync(this.ownerFilePath, 'utf8'));
+    if (!isObjectRecord(parsed) || Object.prototype.hasOwnProperty.call(parsed, 'providers')) return null;
+    if (parsed.owner !== 'qlb' || !Array.isArray(parsed.accounts)) throw new PiOwnerLegacyError();
+    const providers: string[] = [];
+    for (const account of parsed.accounts) {
+      if (!isObjectRecord(account) || typeof account.provider !== 'string') throw new PiOwnerLegacyError();
+      providers.push(account.provider);
+    }
+    return providers;
+  }
+
+  private poolLegacyOwnerOtherProviders(): string[] {
+    const providers = this.poolLegacyOwnerProviders();
+    return [...new Set((providers ?? []).filter((provider) => provider !== 'anthropic'))];
+  }
+
   private poolLegacyOwnerClaimsOnlyAnthropic(): boolean {
     try {
-      const parsed: unknown = JSON.parse(readFileSync(this.ownerFilePath, 'utf8'));
-      return isObjectRecord(parsed) && parsed.owner === 'qlb' && Array.isArray(parsed.accounts)
-        && parsed.accounts.every((account) => isObjectRecord(account) && account.provider === 'anthropic');
+      const providers = this.poolLegacyOwnerProviders();
+      return providers !== null && providers.length > 0 && providers.every((provider) => provider === 'anthropic');
     } catch {
       return false;
     }
@@ -1212,7 +1229,18 @@ export class Migration {
 
   private assertPoolLegacyOwnerClaimsOnlyAnthropic(): void {
     if (!this.poolLegacyOwnerPresent()) return;
-    if (!this.poolLegacyOwnerClaimsOnlyAnthropic()) throw new PiOwnerLegacyError();
+    const others = this.poolLegacyOwnerOtherProviders();
+    if (!this.poolLegacyOwnerClaimsOnlyAnthropic()) throw new PiOwnerLegacyError(others);
+  }
+
+  private poolCustomOwnerDocumentChangedDuringConversion(): boolean {
+    if (this.ownerFilePath === this.ownerMapPath || !existsSync(this.ownerFilePath)) return false;
+    try {
+      readPiOwnerProviders(this.ownerFilePath);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   /** A placeholder may only be resumed from the current cycle's valid backup. */
@@ -1372,10 +1400,22 @@ export class Migration {
   }
 
   /** RC: called while the pool rollback holds Pi's configured auth.json lock. */
+  private assertPoolRollbackOwnerDocumentSafe(): void {
+    const legacyProviders = this.poolLegacyOwnerProviders();
+    if (!legacyProviders?.includes('anthropic')) return;
+    const others = [...new Set(legacyProviders.filter((provider) => provider !== 'anthropic'))];
+    if (others.length > 0) throw new PiOwnerLegacyError(others);
+  }
+
   private removePoolOwnerEntry(): void {
     // A crash after publishing v2 but before retiring a custom v1 document
     // leaves both claims. Rollback owns and removes both, never just the v1.
-    if (hasLegacyPiOwnerEntry(this.ownerFilePath, 'anthropic')) {
+    // Re-read the legacy document under the rollback auth lock immediately
+    // before unlinking: foreign provider claims must survive unchanged.
+    const legacyProviders = this.poolLegacyOwnerProviders();
+    if (legacyProviders?.includes('anthropic')) {
+      const others = [...new Set(legacyProviders.filter((provider) => provider !== 'anthropic'))];
+      if (others.length > 0) throw new PiOwnerLegacyError(others);
       unlinkIfExists(this.ownerFilePath);
     }
     if (this.ownerEntryPresentAt(this.ownerMapPath)) {
@@ -1630,12 +1670,18 @@ export class Migration {
       resumeAction = 'owner-file-orphan: v2 Anthropic ownership has no staging file or pool publication journal; remove its Anthropic claim before retrying';
     } else if (poolV2Owner && poolAuthMalformed) {
       resumeAction = 'Pi auth.json is malformed; repair it before resuming';
+    } else if (poolLegacyOwner && state === 'QLB_OWNED' && !this.poolLegacyOwnerClaimsOnlyAnthropic()) {
+      resumeAction = `mixed v1 owner document: remove the other providers' entries from ${this.ownerFilePath}, then re-run`;
+    } else if (poolV2Owner && !poolPlaceholder && this.poolCustomOwnerDocumentChangedDuringConversion()) {
+      resumeAction = 'owner-file-orphan: custom owner document changed during conversion; run `qlb migrate rollback --provider anthropic`';
+    } else if (this.kind === 'pool' && !poolPlaceholder && this.poolNativeEntryChangedSinceStage()) {
+      resumeAction = ownerPresent
+        ? 'stale native writer: auth.json[anthropic] is not the placeholder; run `qlb migrate rollback --provider anthropic`'
+        : 'stale native writer: auth.json[anthropic] is not the placeholder; run `qlb migrate rollback --provider anthropic` or re-stage';
     } else if (poolLegacyOwner && state === 'QLB_OWNED') {
-      resumeAction = !this.poolLegacyOwnerClaimsOnlyAnthropic()
-        ? 'mixed v1 owner document: remove other providers’ claims or run `qlb pi rollback` for them'
-        : !this.allowPoolLegacyConversion
-          ? 'legacy Anthropic conversion requires `qlb migrate resume --provider anthropic`'
-          : 'convert legacy Anthropic owner: back up Pi auth.json, publish v2 ownership, then write placeholder';
+      resumeAction = !this.allowPoolLegacyConversion
+        ? 'legacy Anthropic conversion requires `qlb migrate resume --provider anthropic`'
+        : 'convert legacy Anthropic owner: back up Pi auth.json, publish v2 ownership, then write placeholder';
     } else if (ownerPresent && STATE_RANK[state] < STATE_RANK.QLB_OWNED) {
       resumeAction = staticKey
         ? 'already committed; finish hygiene (journal only; native Keychain retained) → QLB_OWNED'
@@ -2725,6 +2771,19 @@ export class Migration {
   }
 
   private postCommitRollback(): MigrationStatus {
+    // For ordinary pool paths, keep the auth lock across the foreign-claim
+    // check, rollback intent and RC. A missing/non-directory parent retains
+    // the existing RC refusal instead of trying to create its lock directory.
+    const authDir = dirname(this.authJsonPath);
+    if (this.kind === 'pool' && existsSync(authDir) && statSync(authDir).isDirectory()) {
+      return this.withPoolRollbackAuthLock(() => this.postCommitRollbackLocked());
+    }
+    return this.postCommitRollbackLocked();
+  }
+
+  private postCommitRollbackLocked(): MigrationStatus {
+    // Refuse foreign legacy claims before writing the rollback intent.
+    if (this.kind === 'pool') this.assertPoolRollbackOwnerDocumentSafe();
     this.journal(this.journalState(), {
       intent: 'rollback',
     });
@@ -2811,11 +2870,13 @@ export class Migration {
           if (backup) throw this.poolRollbackRefusal('Pi auth.json directory is missing');
           throw this.poolRollbackRefusal('no Anthropic auth backup');
         }
-        this.withPoolRollbackAuthLock(() => {
+        const reconcile = () => {
           this.restorePoolAnthropicAuthIfPlaceholder();
           this.removePoolOwnerEntry();
           removePiAuthBackup(this.authJsonPath, 'anthropic');
-        });
+        };
+        if (this.piAuthLockRefresh) reconcile();
+        else this.withPoolRollbackAuthLock(reconcile);
       } else {
         this.removePoolOwnerEntry();
       }

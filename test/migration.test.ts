@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { describe, it } from 'node:test';
 import { MockKeychain, qlbKeychainService } from '../src/keychain';
 import { beginCutover } from '../src/lifecycle';
-import { isPiPlaceholder, piPlaceholder, writePiOwnerEntry } from '../src/pi-migrate';
+import { isPiPlaceholder, piPlaceholder, PiOwnerLegacyError, writePiOwnerEntry } from '../src/pi-migrate';
 import { piAuthBackupPath, writePiAuthBackup } from '../src/pi-auth-backup';
 import { runPiGate } from '../src/pi-gate';
 import {
@@ -645,7 +645,7 @@ describe('migration state machine — §4.8.3 / §4.8.3a', () => {
         assert.deepEqual(readFileSync(h.authPath), Buffer.from(newer));
         assert.deepEqual(readFileSync(h.ownerPath), beforeOwner);
       }
-      assert.equal(h.mig.status().resumeAction, 'stale native writer: auth.json[anthropic] is not the placeholder; rollback or re-stage');
+      assert.equal(h.mig.status().resumeAction, 'stale native writer: auth.json[anthropic] is not the placeholder; run `qlb migrate rollback --provider anthropic`');
       h.mig.rollback();
       assert.deepEqual(readFileSync(h.authPath), Buffer.from(newer));
     } finally {
@@ -744,6 +744,87 @@ describe('migration state machine — §4.8.3 / §4.8.3a', () => {
     }
   });
 
+  it('refuses rollback without changing anything when a raced custom v1 document still names another provider', () => {
+    const h = setup();
+    try {
+      const customOwnerPath = join(h.dir, 'custom-owner-mixed-race.json');
+      const original = JSON.stringify({ anthropic: { type: 'oauth', access: 'native-mixed-race', refresh: 'refresh-mixed-race', expires: 1 } }, null, 2) + '\n';
+      writeFileSync(h.authPath, original, { mode: 0o600 });
+      writeFileSync(customOwnerPath, JSON.stringify({ owner: 'qlb', accounts: [{ provider: 'anthropic' }] }) + '\n', { mode: 0o600 });
+      h.store.upsertMigration(PI_POOL_STORE, 'QLB_OWNED', '{}');
+      const migration = new Migration(h.store, h.kc, h.poolPath, customOwnerPath, undefined, {
+        authJsonPath: h.authPath,
+        allowPoolLegacyConversion: true,
+        beforePoolLegacyUnlink: () => writeFileSync(customOwnerPath, JSON.stringify({ owner: 'qlb', accounts: [{ provider: 'anthropic' }, { provider: 'xai' }] }) + '\n', { mode: 0o600 }),
+      } as unknown as MigrationConfig);
+
+      assert.throws(() => migration.resume(), PiOwnerLegacyError);
+      const customBeforeRollback = readFileSync(customOwnerPath);
+      const authBeforeRollback = readFileSync(h.authPath);
+      const backupBeforeRollback = readFileSync(piAuthBackupPath(h.authPath, 'anthropic'));
+      const journalBeforeRollback = JSON.stringify(h.store.getMigration(PI_POOL_STORE));
+      assert.throws(() => migration.rollback(), (error: unknown) => error instanceof PiOwnerLegacyError
+        && (error as Error).message.includes('xai'));
+      assert.deepEqual(readFileSync(customOwnerPath), customBeforeRollback);
+      assert.ok((JSON.parse(readFileSync(customOwnerPath, 'utf8')) as { accounts: Array<{ provider: string }> }).accounts.some(({ provider }) => provider === 'xai'));
+      assert.deepEqual(readFileSync(h.authPath), authBeforeRollback);
+      assert.deepEqual(readFileSync(piAuthBackupPath(h.authPath, 'anthropic')), backupBeforeRollback);
+      assert.equal(JSON.stringify(h.store.getMigration(PI_POOL_STORE)), journalBeforeRollback);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('status gives executable rollback-only or manual-repair advice for every post-publication refusal state', async () => {
+    const nativeChanged = setup();
+    try {
+      const original = JSON.stringify({ anthropic: { type: 'oauth', access: 'native-status', refresh: 'refresh-status', expires: 1 } }, null, 2) + '\n';
+      const newer = JSON.stringify({ anthropic: { type: 'oauth', access: 'newer-status', refresh: 'newer-refresh-status', expires: 2 } }, null, 2) + '\n';
+      writeFileSync(nativeChanged.authPath, original, { mode: 0o600 });
+      const crashing = new Migration(nativeChanged.store, nativeChanged.kc, nativeChanged.poolPath, nativeChanged.ownerPath, undefined, {
+        authJsonPath: nativeChanged.authPath,
+        afterWrite: (point) => { if (point === 'owner-entry') throw new Error('crash after owner-entry'); },
+      });
+      crashing.stage();
+      await crashing.rehearse(mockRehearse([]));
+      assert.throws(() => crashing.commit(), /crash after owner-entry/);
+      writeFileSync(nativeChanged.authPath, newer, { mode: 0o600 });
+      assert.equal(nativeChanged.mig.status().resumeAction, 'stale native writer: auth.json[anthropic] is not the placeholder; run `qlb migrate rollback --provider anthropic`');
+      assert.doesNotThrow(() => nativeChanged.mig.rollback());
+    } finally { nativeChanged.cleanup(); }
+
+    const raced = setup();
+    try {
+      const customOwnerPath = join(raced.dir, 'custom-owner-status-race.json');
+      writeFileSync(raced.authPath, JSON.stringify({ anthropic: { type: 'oauth', access: 'native-race-status', refresh: 'refresh-race-status', expires: 1 } }) + '\n', { mode: 0o600 });
+      writeFileSync(customOwnerPath, JSON.stringify({ owner: 'qlb', accounts: [{ provider: 'anthropic' }] }) + '\n', { mode: 0o600 });
+      raced.store.upsertMigration(PI_POOL_STORE, 'QLB_OWNED', '{}');
+      const migration = new Migration(raced.store, raced.kc, raced.poolPath, customOwnerPath, undefined, {
+        authJsonPath: raced.authPath,
+        allowPoolLegacyConversion: true,
+        beforePoolLegacyUnlink: () => writeFileSync(customOwnerPath, JSON.stringify({ providers: { xai: { mode: 'qlb', since: 1 } } }) + '\n', { mode: 0o600 }),
+      } as unknown as MigrationConfig);
+      assert.throws(() => migration.resume(), (error: unknown) => (error as { exitCode?: unknown }).exitCode === 3);
+      assert.equal(migration.status().resumeAction, 'owner-file-orphan: custom owner document changed during conversion; run `qlb migrate rollback --provider anthropic`');
+      assert.doesNotThrow(() => migration.rollback());
+    } finally { raced.cleanup(); }
+
+    const mixed = setup();
+    try {
+      const original = JSON.stringify({ anthropic: { type: 'oauth', access: 'native-mixed-status', refresh: 'refresh-mixed-status', expires: 1 } }, null, 2) + '\n';
+      writeFileSync(mixed.authPath, original, { mode: 0o600 });
+      writeFileSync(mixed.ownerPath, JSON.stringify({ owner: 'qlb', accounts: [{ provider: 'anthropic' }, { provider: 'xai' }] }) + '\n', { mode: 0o600 });
+      mixed.store.upsertMigration(PI_POOL_STORE, 'QLB_OWNED', '{}');
+      const explicit = new Migration(mixed.store, mixed.kc, mixed.poolPath, mixed.ownerPath, undefined, {
+        authJsonPath: mixed.authPath,
+        allowPoolLegacyConversion: true,
+      });
+      assert.equal(explicit.status().resumeAction, `mixed v1 owner document: remove the other providers' entries from ${mixed.ownerPath}, then re-run`);
+      writeFileSync(mixed.ownerPath, JSON.stringify({ owner: 'qlb', accounts: [{ provider: 'anthropic' }] }) + '\n', { mode: 0o600 });
+      assert.doesNotThrow(() => explicit.resume());
+    } finally { mixed.cleanup(); }
+  });
+
   it('status gives executable advice for mixed v1, bare conversion, orphan v2, and malformed auth', () => {
     const mixed = setup();
     try {
@@ -753,7 +834,7 @@ describe('migration state machine — §4.8.3 / §4.8.3a', () => {
         authJsonPath: mixed.authPath,
         allowPoolLegacyConversion: true,
       });
-      assert.equal(explicit.status().resumeAction, 'mixed v1 owner document: remove other providers’ claims or run `qlb pi rollback` for them');
+      assert.equal(explicit.status().resumeAction, `mixed v1 owner document: remove the other providers' entries from ${mixed.ownerPath}, then re-run`);
     } finally { mixed.cleanup(); }
 
     const legacy = setup();

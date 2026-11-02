@@ -82,7 +82,12 @@ function readAuth(path: string): JsonObject { return existsSync(path) ? asObject
 export class PiOwnerLegacyError extends Error {
   readonly code = 'owner-file-legacy-v1';
   readonly exitCode = 3;
-  constructor() { super('owner-file-legacy-v1: run `qlb migrate resume --provider anthropic` to convert it'); this.name = 'PiOwnerLegacyError'; }
+  constructor(otherProviders: readonly string[] = []) {
+    super(otherProviders.length > 0
+      ? `owner-file-legacy-v1: legacy owner document also claims ${otherProviders.join(', ')}; remove the other providers' entries before retrying`
+      : 'owner-file-legacy-v1: run `qlb migrate resume --provider anthropic` to convert it');
+    this.name = 'PiOwnerLegacyError';
+  }
 }
 /** Read only the canonical v2 provider map; v1 documents must be converted by the Anthropic path. */
 export function readPiOwnerProviders(path: string): JsonObject {
@@ -153,6 +158,7 @@ export function writePiOwnerEntry(
     // under the caller's auth lock so a concurrently published shared v2 map
     // is never mistaken for the v1 document selected before locking.
     assertLegacyDocumentClaimsOnly(legacyPath, provider);
+    // Accepted stable-namespace limit: Node has no descriptor-relative unlinkat.
     unlinkSync(legacyPath);
   }
 }
