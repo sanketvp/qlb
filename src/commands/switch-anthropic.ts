@@ -117,7 +117,7 @@ async function request(fetchFn: FetchLike, description: HttpRequestDescription):
  * Callers own the per-attempt lifecycle, including closing the returned slot
  * repository after the switch attempt.
  */
-export function makeProductionSwitchDeps(commandDeps: Pick<SwitchAnthropicCommandDeps, 'claudePaths' | 'fetchFn' | 'fetchActiveUsage' | 'now' | 'randomUUID' | 'processLstart'>, ctx: CommandContext, store: Store, warn: (message: string) => void): Promise<SwitchResources> {
+export function makeProductionSwitchDeps(commandDeps: Pick<SwitchAnthropicCommandDeps, 'claudePaths' | 'fetchFn' | 'fetchActiveUsage' | 'now' | 'randomUUID' | 'processLstart'>, ctx: CommandContext, store: Store, warn: (message: string) => void, by: ClaudeSwitchDeps['by'] = 'qlb-cli'): Promise<SwitchResources> {
   const paths = (commandDeps.claudePaths ?? claudePaths)({ home: ctx.home, env: ctx.env });
   const repository = SqliteClaudeSlotRepository.open(ctx.config.dbPath);
   const slots = new ClaudeSlots({
@@ -144,7 +144,7 @@ export function makeProductionSwitchDeps(commandDeps: Pick<SwitchAnthropicComman
     env: ctx.env,
     home: ctx.home,
     now,
-    by: 'qlb-cli',
+    by,
     attempt: (commandDeps.randomUUID ?? randomUUID)(),
     journalOwner: { pid: process.pid, lstart: '' },
     warn,
@@ -160,7 +160,7 @@ export function makeProductionSwitchDeps(commandDeps: Pick<SwitchAnthropicComman
         now,
         verdicts: new ProbeVerdictMemo(),
         env: ctx.env,
-        by: 'qlb-cli',
+        by,
         getUsage: async (accessToken) => request(fetchFn, buildUsageRequest(accessToken)),
       }, {
         accountId,

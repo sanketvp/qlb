@@ -291,9 +291,10 @@ export interface AnthropicTickDeps {
   accounts?: readonly AutoswitchAccount[];
   /** Dry runs are strictly decision-only and must not mutate or switch. */
   dryRun?: boolean;
-  /** Test seam for S14's already-filtered switch history. */
+  /** Optional test override; production defaults to the Store projection. */
   breakerRows?: AutoswitchInput['breakerRows'];
-  switchDeps?: ClaudeSwitchDeps;
+  /** Called only for a switch, so every attempt gets fresh resources and ID. */
+  makeSwitchDeps?: (by: 'qlb-auto') => Promise<{ deps: ClaudeSwitchDeps; close?: () => void } | ClaudeSwitchDeps>;
   switchClaude?: typeof switchClaude;
 }
 
@@ -337,9 +338,10 @@ function decisionInput(deps: AnthropicTickDeps): AutoswitchInput {
   const accounts = deps.accounts ?? freshAnthropicAccounts(
     deps.slots.listSlots(), deps.store, polls, nowS, deps.models ?? [],
   );
-  // Only successful automatic switches participate in proactive cooldown.
-  // Manual switches deliberately leave this timestamp unset.
-  const lastSwitchAtMs = configNumber(deps.store, `${AUTO_PREFIX}lastSwitchAt`);
+  // The switch journal's committed row is authoritative. The config value is
+  // retained only for legacy/test rows that predate this reader.
+  const lastSwitchAtMs = deps.store.latestCommittedAnthropicAutoswitchAt()
+    ?? configNumber(deps.store, `${AUTO_PREFIX}lastSwitchAt`);
   return {
     accounts,
     activeAccountId,
@@ -358,14 +360,21 @@ function decisionInput(deps: AnthropicTickDeps): AutoswitchInput {
     suspendedUntilMs: configNumber(deps.store, `${AUTO_PREFIX}suspendedUntil`) ?? null,
     lastSuspensionEndMs: configNumber(deps.store, `${AUTO_PREFIX}lastSuspensionEnd`) ?? null,
     lastResumeAtMs: configNumber(deps.store, `${AUTO_PREFIX}lastResumeAt`) ?? null,
-    breakerRows: deps.breakerRows,
+    breakerRows: deps.breakerRows ?? deps.store.listAnthropicAutoswitchBreakerRows(),
     provider: 'anthropic',
   };
 }
 
-function persistTickState(store: Store, activeAccountId: string | null, nowMs: number, decision: AutoswitchDecision, switched: boolean): void {
-  const idleHoldSince = decision.kind === 'stay' ? decision.idleHoldSinceMs : undefined;
+function persistTickState(store: Store, input: AutoswitchInput, decision: AutoswitchDecision, switched: boolean, committedAtMs?: number): void {
+  // After the idle hold, the engine deliberately returns `unknown` without
+  // repeating the start time. Keep that start while this same active
+  // credential remains expired, then clear it on a known reading/account
+  // change/switch.
+  const idleHoldSince = decision.kind === 'stay'
+    ? decision.idleHoldSinceMs ?? (input.activeCredentialExpired ? input.idleHoldSinceMs ?? undefined : undefined)
+    : undefined;
   const health = decision.unhealthyTicks > 0 || idleHoldSince !== undefined;
+  const { activeAccountId, nowMs } = input;
   if (health && activeAccountId !== null) {
     store.setConfig(`${AUTO_PREFIX}unhealthyTicks`, String(decision.unhealthyTicks));
     store.setConfig(`${AUTO_PREFIX}healthAccount`, activeAccountId);
@@ -375,15 +384,22 @@ function persistTickState(store: Store, activeAccountId: string | null, nowMs: n
     for (const key of ['unhealthyTicks', 'idleHoldSince', 'healthAccount', 'healthTickAt']) setOrDelete(store, `${AUTO_PREFIX}${key}`, undefined);
   }
 
-  const parkedUntil = decision.kind === 'parked' || decision.kind === 'switch' ? decision.parkedUntilMs : undefined;
-  setOrDelete(store, `${AUTO_PREFIX}parkedUntil`, parkedUntil);
+  if (decision.kind === 'parked') {
+    setOrDelete(store, `${AUTO_PREFIX}parkedUntil`, decision.parkedUntilMs);
+  } else if (decision.kind === 'switch') {
+    // A failed parked operation has not consumed this reset; retaining the
+    // prior value makes the engine retry it on the next tick.
+    if (switched) setOrDelete(store, `${AUTO_PREFIX}parkedUntil`, decision.parkedUntilMs);
+  } else {
+    setOrDelete(store, `${AUTO_PREFIX}parkedUntil`, undefined);
+  }
   const suspendedUntil = decision.kind === 'stay' ? decision.suspendedUntilMs : undefined;
   if (suspendedUntil !== undefined) store.setConfig(`${AUTO_PREFIX}suspendedUntil`, String(suspendedUntil));
   else if (configNumber(store, `${AUTO_PREFIX}suspendedUntil`) !== undefined && configNumber(store, `${AUTO_PREFIX}suspendedUntil`)! <= nowMs) {
     setOrDelete(store, `${AUTO_PREFIX}suspendedUntil`, undefined);
     store.setConfig(`${AUTO_PREFIX}lastSuspensionEnd`, String(nowMs));
   }
-  if (switched) store.setConfig(`${AUTO_PREFIX}lastSwitchAt`, String(nowMs));
+  if (switched) store.setConfig(`${AUTO_PREFIX}lastSwitchAt`, String(committedAtMs ?? nowMs));
 }
 
 /**
@@ -396,22 +412,32 @@ export async function anthropicTick(deps: AnthropicTickDeps): Promise<AnthropicT
   if (deps.dryRun) return { decision };
 
   if (decision.kind !== 'switch') {
-    persistTickState(deps.store, input.activeAccountId, input.nowMs, decision, false);
+    persistTickState(deps.store, input, decision, false);
     return { decision };
   }
 
-  if (!deps.switchDeps) throw new Error('anthropic tick requires switch dependencies to execute a switch');
-  const result = await (deps.switchClaude ?? switchClaude)(deps.switchDeps, {
-    to: decision.targetId,
-    trigger: decision.reason,
-    decision: {
-      leftHeadroom: decision.leftHeadroom,
-      leftRecoveryAt: decision.leftRecoveryAtMs,
-      leftTrigger: decision.leftTrigger,
-    },
-  });
+  if (!deps.makeSwitchDeps) throw new Error('anthropic tick requires a fresh switch-dependency factory to execute a switch');
+  const built = await deps.makeSwitchDeps('qlb-auto');
+  const resources = 'deps' in built ? built : { deps: built };
+  const result = await (async (): Promise<ClaudeSwitchResult> => {
+    try {
+      return await (deps.switchClaude ?? switchClaude)(resources.deps, {
+        to: decision.targetId,
+        trigger: decision.reason,
+        decision: {
+          leftHeadroom: decision.leftHeadroom,
+          leftRecoveryAt: decision.leftRecoveryAtMs,
+          leftTrigger: decision.leftTrigger,
+        },
+      });
+    } finally {
+      resources.close?.();
+    }
+  })();
   // A refused/failed target is not tried again in this tick. Its durable switch
   // row is the retry authority for the following tick.
-  persistTickState(deps.store, input.activeAccountId, input.nowMs, decision, result.outcome === 'ok');
+  const switched = result.outcome === 'ok';
+  persistTickState(deps.store, input, decision, switched,
+    switched && result.switchId !== undefined ? deps.store.committedAnthropicSwitchAt(result.switchId) : undefined);
   return { decision, switchResult: result };
 }
