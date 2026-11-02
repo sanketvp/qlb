@@ -8,10 +8,17 @@
   <array>
     <string>/usr/local/bin/node</string>
     <string>/Users/REPLACE_WITH_YOUR_USERNAME/.qlb/app/current/dist/cli.js</string>
-    <string>doctor</string>
+    <string>auto</string>
   </array>
   <key>RunAtLoad</key>
   <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ExitTimeOut</key>
+  <integer>60</integer>
   <key>StandardOutPath</key>
   <string>/Users/REPLACE_WITH_YOUR_USERNAME/.qlb/auto.log</string>
   <key>StandardErrorPath</key>
