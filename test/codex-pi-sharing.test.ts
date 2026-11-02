@@ -37,8 +37,15 @@ function document(refresh: string, identity: Identity = FIXTURE_IDENTITY): Recor
   };
 }
 
-function piDocument(refresh: string, identity: Identity = FIXTURE_IDENTITY): Record<string, unknown> {
-  return { 'openai-codex': { access: jwt(identity), refresh, expires: 1 } };
+function piDocument(refresh: string, identity: Identity = FIXTURE_IDENTITY, accountId?: string): Record<string, unknown> {
+  return {
+    'openai-codex': {
+      access: jwt(identity),
+      refresh,
+      expires: 1,
+      ...(accountId === undefined ? {} : { accountId }),
+    },
+  };
 }
 
 function snapshot(path: string, prefix = ''): Map<string, Buffer> {
@@ -192,7 +199,7 @@ describe('qlb codex pi-sharing', () => {
     }
   });
 
-  it('different accounts are separate', async () => {
+  it('different lineage is separate', async () => {
     const f = fixture();
     try {
       writeFileSync(f.piPath, JSON.stringify(piDocument('pi-refresh-separate', { userId: 'pi-user', accountId: 'pi-account' })));
@@ -201,6 +208,25 @@ describe('qlb codex pi-sharing', () => {
 
       assert.equal(await runCodexPiSharingCommand([], context(f)), 0);
       assert.match(f.output[0]!, /^separate pi=sha256:[a-f0-9]{12} codex=sha256:[a-f0-9]{12}$/);
+    } finally {
+      close(f);
+    }
+  });
+
+  it('a Pi stored account ID matching live identity cannot-tell despite a differing JWT claim', async () => {
+    const f = fixture();
+    try {
+      writeFileSync(f.piPath, JSON.stringify(piDocument(
+        'pi-refresh-stored-account',
+        { userId: FIXTURE_IDENTITY.userId, accountId: 'pi-jwt-account' },
+        FIXTURE_IDENTITY.accountId,
+      )));
+      writeFileSync(f.codexPath, JSON.stringify(document('live-refresh-stored-account')));
+      seedEmptyDatabase(f);
+
+      assert.equal(await runCodexPiSharingCommand([], context(f)), 0);
+      assert.match(f.output[0]!, /^cannot-tell pi=sha256:[a-f0-9]{12} codex=sha256:[a-f0-9]{12}$/);
+      assert.doesNotMatch(f.output.join('\n'), /separate/);
     } finally {
       close(f);
     }
@@ -251,6 +277,20 @@ describe('qlb codex pi-sharing', () => {
     const f = fixture();
     try {
       symlinkSync(join(f.root, 'missing-pi-auth.json'), f.piPath);
+
+      assert.equal(await runCodexPiSharingCommand([], context(f)), 1);
+      assert.deepEqual(f.output, ['ERR:qlb codex pi-sharing: input unavailable']);
+    } finally {
+      close(f);
+    }
+  });
+
+  it('a dangling Pi auth parent-directory symlink exits 1', async () => {
+    const f = fixture();
+    try {
+      const agentDir = join(f.home, '.pi', 'agent');
+      rmSync(agentDir, { recursive: true, force: true });
+      symlinkSync(join(f.root, 'missing-pi-agent'), agentDir);
 
       assert.equal(await runCodexPiSharingCommand([], context(f)), 1);
       assert.deepEqual(f.output, ['ERR:qlb codex pi-sharing: input unavailable']);

@@ -1,4 +1,5 @@
-import { lstatSync, readFileSync } from 'node:fs';
+import { lstatSync, readFileSync, statSync } from 'node:fs';
+import { dirname } from 'node:path';
 
 import { codexFingerprint, codexIdentity, codexSlotIdFromAccessToken, readCodexAuthStable, type CodexAuthDocument } from '../codex-auth';
 import { resolveCodexAuthPath } from './codex-import-active';
@@ -24,25 +25,41 @@ function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-type PiCredential = { access: string; refresh: string };
+type PiCredential = { access: string; refresh: string; accountId?: string };
 type PiCredentialRead = { text: string; credential: PiCredential } | null;
 
 /** Read one Pi credential without ever exposing its parsed contents in an error. */
+function hasDanglingSymlinkComponent(path: string): boolean {
+  for (let current = path; ;) {
+    try {
+      const status = lstatSync(current);
+      if (!status.isSymbolicLink()) return false;
+      try {
+        statSync(current);
+        return false;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return true;
+        throw error;
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      const parent = dirname(current);
+      if (parent === current) return false;
+      current = parent;
+    }
+  }
+}
+
 function readPiCredentialOnce(path: string): PiCredentialRead {
   let text: string;
   try {
     text = readFileSync(path, 'utf8');
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-    // A dangling symlink also reports ENOENT from readFileSync. It is an
-    // unavailable input, not an absent Pi entry.
-    try {
-      lstatSync(path);
-    } catch (statError) {
-      if ((statError as NodeJS.ErrnoException).code === 'ENOENT') return null;
-      throw statError;
-    }
-    throw error;
+    // A dangling symlink, including one on a parent directory, also reports
+    // ENOENT from readFileSync. It is unavailable input, not an absent entry.
+    if (hasDanglingSymlinkComponent(path)) throw error;
+    return null;
   }
 
   let root: unknown;
@@ -60,15 +77,22 @@ function readPiCredentialOnce(path: string): PiCredentialRead {
     || typeof entry.expires !== 'number' || !Number.isFinite(entry.expires)) {
     throw new Error('Pi OpenAI Codex entry is invalid');
   }
-  return { text, credential: { access: entry.access, refresh: entry.refresh } };
+  return {
+    text,
+    credential: {
+      access: entry.access,
+      refresh: entry.refresh,
+      ...(typeof entry.accountId === 'string' ? { accountId: entry.accountId } : {}),
+    },
+  };
 }
 
 /** Fails closed if the Pi credential changes between observations. */
 function readPiCredentialStable(path: string): PiCredential | null {
   const first = readPiCredentialOnce(path);
-  if (first === null) return null;
   const second = readPiCredentialOnce(path);
-  if (second === null || first.text !== second.text) throw new Error('Pi auth is unstable');
+  if (first === null && second === null) return null;
+  if (first === null || second === null || first.text !== second.text) throw new Error('Pi auth is unstable');
   return first.credential;
 }
 
@@ -162,7 +186,7 @@ export async function runCodexPiSharingCommand(args: string[], ctx: CommandConte
     const chains = listCodexSlotLineageChains(ctx.config.dbPath);
     const shared = piFingerprint === liveFingerprint || chains
       .some((slot) => slot.lineages.includes(piFingerprint) && slot.lineages.includes(liveFingerprint));
-    const piAccountId = codexSlotIdFromAccessToken(piCredential.access);
+    const piAccountId = codexSlotIdFromAccessToken(piCredential.access, piCredential.accountId);
     const liveAccountId = codexIdentity(live.doc);
     const status = shared
       ? 'shared'
