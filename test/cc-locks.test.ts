@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
-import { chmod, mkdtemp, mkdir, readFile, readdir, rm, stat, utimes, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, mkdir, readFile, readdir, rename, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
@@ -443,9 +443,9 @@ describe('Claude Code proper-lockfile locks', () => {
         return result;
       };
       await withProperLockfile(lock, { touchIntervalMs: 10 }, async () => {
-        await rm(lock, { recursive: true });
-        await mkdir(join(home, 'spacer'));
-        await mkdir(lock);
+        const replacement = join(home, 'replacement.new');
+        await mkdir(replacement);
+        await rename(replacement, lock);
         const old = new Date(Date.now() - 60_000);
         await utimes(lock, old, old);
         replacementTouchCompletedAfterReset = false;
