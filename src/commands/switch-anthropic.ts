@@ -12,6 +12,7 @@ import { processLstart } from '../codex-sessions';
 import { qlbHomeDir } from '../home';
 import { parseInjectFlag } from '../fault-injection';
 import { platformKeychain } from '../keychain';
+import { reconcileClaudeSwitch } from '../journal';
 import { assertAdmitted } from '../lifecycle';
 import type { CommandContext, CommandDefinition } from '../registry';
 import { openStore, type Store } from '../store';
@@ -196,6 +197,13 @@ export function createSwitchAnthropicCommand(deps: SwitchAnthropicCommandDeps = 
 
       const store = (deps.openStore ?? openStore)(ctx.config.dbPath);
       let resources: SwitchResources | undefined;
+      const warn = (message: string): void => ctx.stderr(`qlb switch anthropic: warning: ${message}`);
+      const ensureResources = async (): Promise<SwitchResources> => {
+        if (resources) return resources;
+        const built = await (deps.makeSwitchDeps ?? ((commandCtx, commandStore, commandWarn) => makeProductionSwitchDeps(deps, commandCtx, commandStore, commandWarn)))(ctx, store, warn);
+        resources = 'deps' in built ? built : { deps: built };
+        return resources;
+      };
       try {
         try {
           await (deps.bootstrap ?? bootstrap)({
@@ -203,8 +211,9 @@ export function createSwitchAnthropicCommand(deps: SwitchAnthropicCommandDeps = 
               const admission = (deps.assertAdmitted ?? assertAdmitted)(store, 'switch:manual');
               if (!admission.ok) throw new AdmissionRefused(admission.code ?? 'not-admitted');
             },
-            // Intentionally passed through unchanged: K14 owns bootstrap's default.
-            reconcileJournals: deps.reconcileJournals,
+            reconcileJournals: deps.reconcileJournals ?? (async () => {
+              await reconcileClaudeSwitch((await ensureResources()).deps);
+            }),
           }, ctx.env);
         } catch (error) {
           if (error instanceof AdmissionRefused) {
@@ -214,9 +223,7 @@ export function createSwitchAnthropicCommand(deps: SwitchAnthropicCommandDeps = 
           throw error;
         }
 
-        const warn = (message: string): void => ctx.stderr(`qlb switch anthropic: warning: ${message}`);
-        const built = await (deps.makeSwitchDeps ?? ((commandCtx, commandStore, commandWarn) => makeProductionSwitchDeps(deps, commandCtx, commandStore, commandWarn)))(ctx, store, warn);
-        resources = 'deps' in built ? built : { deps: built };
+        resources = await ensureResources();
         if (parsedInjection.inject !== null) resources.deps.injectFailStep = parsedInjection.inject.step;
         const result = await (deps.switchClaude ?? switchClaude)(resources.deps, {
           to: parsed.accountId,
