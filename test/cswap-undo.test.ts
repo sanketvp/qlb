@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
-import { runUndoCswapCommand } from '../src/commands/undo-cswap';
+import { isQlbProcessCommand, runUndoCswapCommand } from '../src/commands/undo-cswap';
 import { discoverCommands, resolveCommand, type CommandContext } from '../src/registry';
 import { openStore, openStoreConnection } from '../src/store';
 import { runExecutingCommand } from '../src/cli';
@@ -67,7 +67,7 @@ function context(f: Fixture): CommandContext {
   return {
     stdout: (line) => f.output.push(line),
     stderr: (line) => f.output.push(`ERR:${line}`),
-    env: { QLB_TEST_MODE: '1', QLB_HOME: f.home, HOME: f.home },
+    env: { QLB_TEST_MODE: '1', QLB_HOME: f.home, HOME: f.home, USER: 'fixture-user' },
     config: { dbPath: f.dbPath, cswapSequencePath: join(f.backup, 'sequence.json') } as CommandContext['config'],
     loadConfig: () => { throw new Error('not used'); },
     home: f.home,
@@ -329,6 +329,15 @@ describe('qlb undo cswap --dry-run', () => {
   });
 });
 
+describe('QLB process matching', () => {
+  it('matches only the executable or Node script position', () => {
+    assert.equal(isQlbProcessCommand('node /x/bin/qlb proxy'), true);
+    assert.equal(isQlbProcessCommand('node dist/cli.js auto'), true);
+    assert.equal(isQlbProcessCommand('/usr/local/bin/qlb auto'), true);
+    assert.equal(isQlbProcessCommand('node /x/qlbtool.js'), false);
+  });
+});
+
 describe('qlb undo cswap hand-back', () => {
   it('undo during an in-flight refresh waits and hands back the successor', async () => {
     const f = fixture();
@@ -348,6 +357,47 @@ describe('qlb undo cswap hand-back', () => {
       }), 0);
       assert.equal(await f.keychain.get('claude-swap', 'account-1-a@example.test'), credential('account-a', 'refresh-successor'));
       assert.equal(f.keychain.writes.filter(({ service }) => service === 'claude-swap').length, 2);
+    } finally { close(f); }
+  });
+
+  it('hands back a native live rotation attributed by the injected profile oracle', async () => {
+    const f = fixture();
+    try {
+      beginUndo(f);
+      addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-slot', active: true });
+      const rotated = credential('account-a', 'refresh-native');
+      writeFileSync(join(f.home, '.claude.json'), JSON.stringify({ oauthAccount: { accountUuid: 'account-a', emailAddress: 'a@example.test' } }));
+      await f.keychain.set('Claude Code-credentials', 'fixture-user', rotated);
+      let profiles = 0;
+      assert.equal(await undo(f, {
+        readActiveCredential: async () => ({ credential: rotated, accountId: 'account-a' }),
+        getProfile: async () => {
+          profiles += 1;
+          return { status: 200, body: JSON.stringify({ account: { uuid: 'account-a', email: 'a@example.test' } }) };
+        },
+      }), 0);
+      assert.equal(profiles, 1);
+      assert.equal(await f.keychain.get('claude-swap', 'account-1-a@example.test'), rotated);
+    } finally { close(f); }
+  });
+
+  it('fails closed when the native live rotation cannot be attributed', async () => {
+    const f = fixture();
+    try {
+      beginUndo(f);
+      addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-slot', active: true });
+      const rotated = credential('account-a', 'refresh-native');
+      writeFileSync(join(f.home, '.claude.json'), JSON.stringify({ oauthAccount: { accountUuid: 'account-a', emailAddress: 'a@example.test' } }));
+      await f.keychain.set('Claude Code-credentials', 'fixture-user', rotated);
+      f.keychain.writes.length = 0;
+      assert.equal(await undo(f, {
+        readActiveCredential: async () => ({ credential: rotated, accountId: 'account-a' }),
+        getProfile: async () => { throw new Error('fixture oracle failure'); },
+      }), 1);
+      assert.match(f.output.at(-1)!, /active account 1: active-login-unattributed/);
+      assert.equal(f.keychain.writes.filter(({ service }) => service === 'claude-swap').length, 0);
+      const store = openStore(f.dbPath);
+      try { assert.equal(phase(store).state, 'undoing'); } finally { store.close(); }
     } finally { close(f); }
   });
 
@@ -514,6 +564,10 @@ describe('qlb undo cswap hand-back', () => {
     try {
       beginUndo(f);
       addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-successor', active: true });
+      const store = openStore(f.dbPath);
+      try {
+        store.recordLineage({ provider: 'anthropic', accountId: 'account-a', fromFp: lineage('refresh-spent'), toFp: lineage('refresh-successor'), cause: 'resync', by: 'test', evidence: 'lineage' });
+      } finally { store.close(); }
       assert.equal(await undo(f, {
         readActiveCredential: async () => ({ credential: credential('account-a', 'refresh-spent'), accountId: 'account-a' }),
       }), 0);
@@ -549,18 +603,69 @@ describe('qlb undo cswap hand-back', () => {
     } finally { close(f); }
   });
 
-  it('refuses a missing sequence.json before fencing or writes', async () => {
+  it('updates sequence.json for a dead active slot before verification', async () => {
+    const f = fixture();
+    try {
+      beginUndo(f);
+      addSlot(f, { accountId: 'account-dead', number: 1, email: 'dead@example.test', refresh: 'refresh-dead', active: true, dead: true });
+      addSlot(f, { accountId: 'account-healthy', number: 2, email: 'healthy@example.test', refresh: 'refresh-healthy' });
+      const sequence = join(f.backup, 'sequence.json');
+      writeFileSync(sequence, JSON.stringify({ accounts: { 1: {}, 2: {} }, activeAccountNumber: 2 }));
+      assert.equal(await undo(f, { validateActiveSequence: undefined, setActiveAccountNumber: undefined }), 0);
+      assert.equal(JSON.parse(readFileSync(sequence, 'utf8')).activeAccountNumber, 1);
+    } finally { close(f); }
+  });
+
+  it('rejects a sequence account removed after pre-fence validation at write time', async () => {
     const f = fixture();
     try {
       beginUndo(f);
       addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-current', active: true });
-      f.keychain.writes.length = 0;
-      assert.equal(await undo(f, { validateActiveSequence: undefined, setActiveAccountNumber: undefined }), 3);
-      assert.match(f.output.at(-1)!, /sequence\.json is missing/);
-      assert.equal(f.keychain.writes.length, 0);
-      const store = openStore(f.dbPath);
-      try { assert.equal(phase(store).state, 'cutover'); } finally { store.close(); }
+      const sequence = join(f.backup, 'sequence.json');
+      writeFileSync(sequence, JSON.stringify({ accounts: { 1: {} }, activeAccountNumber: 2 }));
+      assert.equal(await undo(f, {
+        validateActiveSequence: undefined,
+        setActiveAccountNumber: undefined,
+        withActiveLocks: async (fn) => {
+          writeFileSync(sequence, JSON.stringify({ accounts: {}, activeAccountNumber: 2 }));
+          return fn();
+        },
+      }), 3);
+      assert.match(f.output.at(-1)!, /sequence\.json is malformed/);
+      assert.deepEqual(JSON.parse(readFileSync(sequence, 'utf8')), { accounts: {}, activeAccountNumber: 2 });
     } finally { close(f); }
+  });
+
+  it('revalidates sequence.json under its write lock', async () => {
+    const f = fixture();
+    try {
+      beginUndo(f);
+      addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-current', active: true });
+      const sequence = join(f.backup, 'sequence.json');
+      writeFileSync(sequence, JSON.stringify({ accounts: { 1: {} }, activeAccountNumber: 1 }));
+      const release = await productionTryAcquireLock(join(f.backup, '.lock'));
+      assert.ok(release, 'test sequence lock acquired');
+      try {
+        assert.equal(await undo(f, { validateActiveSequence: undefined, setActiveAccountNumber: undefined }), 1);
+      } finally { await release(); }
+    } finally { close(f); }
+  });
+
+  it('refuses missing, malformed, or wrong-account sequence.json before fencing or writes', async () => {
+    for (const contents of [undefined, '[]', JSON.stringify({ accounts: {} }), JSON.stringify({ accounts: [] })]) {
+      const f = fixture();
+      try {
+        beginUndo(f);
+        addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-current', active: true });
+        if (contents !== undefined) writeFileSync(join(f.backup, 'sequence.json'), contents);
+        f.keychain.writes.length = 0;
+        assert.equal(await undo(f, { validateActiveSequence: undefined, setActiveAccountNumber: undefined }), 3);
+        assert.match(f.output.at(-1)!, /sequence\.json is (missing|malformed)/);
+        assert.equal(f.keychain.writes.length, 0);
+        const store = openStore(f.dbPath);
+        try { assert.equal(phase(store).state, 'cutover'); } finally { store.close(); }
+      } finally { close(f); }
+    }
   });
 
   it('the production reader rejects a valid stale .enc before its Keychain fallback', async () => {

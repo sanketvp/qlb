@@ -70,6 +70,15 @@ export class CswapUndoDrainError extends Error {
   }
 }
 
+export class CswapUndoActiveLoginError extends Error {
+  readonly reason = 'active-login-unattributed';
+
+  constructor(readonly accountNumber: number) {
+    super('active login could not be attributed');
+    this.name = 'CswapUndoActiveLoginError';
+  }
+}
+
 export class CswapUndoVerificationError extends Error {
   constructor(readonly accountNumber: number) {
     super('undo read-back mismatch');
@@ -333,13 +342,17 @@ export async function executeHandBack(deps: ExecuteHandBackDependencies, resume 
     await deps.withActiveLocks(async () => deps.withUndoCapability(async () => {
       const live = await deps.readActiveCredential?.();
       if (live && live.accountId !== active.accountId) throw new Error('active Claude identity mismatch');
-      // Re-read the QLB slot beneath the lock hold. If Claude refreshed before
-      // SIGTERM completed, this is the successor handed back to C-swap.
+      // Attribute any locked live rotation before exporting. If it cannot be
+      // attributed, resyncActive fails closed rather than handing back a spent slot.
       if (live) await deps.resyncActive?.(active.accountId, live.credential);
       if (!await writeSlot(deps, active)) skipped += 1;
       for (const path of encFor(active)) await deps.deleteEnc(path);
       await deps.setActiveAccountNumber?.(plan.activeAccountNumber);
     }));
+  } else if (plan.activeAccountNumber !== null) {
+    // A dead active slot has no export row, but C-swap must still receive its
+    // authoritative active account number before the healthy-slot verification.
+    await deps.setActiveAccountNumber?.(plan.activeAccountNumber);
   }
   await verifyPlan(deps, plan);
   return { plan, skipped };

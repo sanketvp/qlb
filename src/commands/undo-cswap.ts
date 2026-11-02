@@ -1,9 +1,10 @@
 import { execFileSync } from 'node:child_process';
-import { credentialFingerprint } from '../anthropic-oauth';
+import { credentialFingerprint, type HttpRequestDescription } from '../anthropic-oauth';
 import { existsSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 
 import {
+  CswapUndoActiveLoginError,
   CswapUndoDrainError,
   CswapUndoPendingStashError,
   CswapUndoRefusalError,
@@ -18,11 +19,12 @@ import {
 import { claudePaths } from '../cc-paths';
 import { ClaudeSlots, SqliteClaudeSlotRepository, type ClaudeSlotBackend } from '../cc-slots';
 import { CREDENTIALS_STALENESS_MS, withClaudeCredentialLocks, withClaudeSwitchLock } from '../cc-locks';
-import { liveIdentity, ProbeVerdictMemo, resyncUnderHeldLocks } from '../cc-resync';
+import { cacheProfileVerdict, credentialLineage, liveIdentity, ProbeVerdictMemo, resyncUnderHeldLocks, type ResyncProfileResponse } from '../cc-resync';
 import { productionTryAcquireLock } from '../cswap-agent';
 import type { CredentialBackend } from '../credential-backends';
 import { qlbHomeDir } from '../home';
 import { withUndoCapability } from '../keychain-allowlist';
+import { isSuccessor } from '../lineage-log';
 import { listUnclaimedKeychainServices, macosKeychainAccountName, platformKeychain } from '../keychain';
 import { listStashes } from '../unclaimed-index';
 import { transition } from '../lifecycle';
@@ -50,6 +52,8 @@ export interface UndoCswapCommandDependencies {
   readBack?: ExecuteHandBackDependencies['readBack'];
   validateActiveSequence?: ExecuteHandBackDependencies['validateActiveSequence'];
   setActiveAccountNumber?: ExecuteHandBackDependencies['setActiveAccountNumber'];
+  /** Test seam for the active-login ownership oracle. */
+  getProfile?: (request: HttpRequestDescription) => Promise<ResyncProfileResponse>;
 }
 
 type Options = { json: boolean; dryRun: boolean; resume: boolean };
@@ -122,11 +126,17 @@ function defaultQlbPids(): number[] {
   }
   const ignored = new Set<number>();
   for (let pid: number | undefined = process.pid; pid && !ignored.has(pid); pid = rows.get(pid)?.parent) ignored.add(pid);
-  // Match the actual executable/script position only. Arguments mentioning
-  // qlb (or this command's shell wrapper) do not represent a QLB process.
-  const isQlb = (command: string): boolean => /^(?:\S*\/)?qlb(?:\s|$)/.test(command)
-    || /^(?:\S*\/)?node(?:\s+--\S+)*\s+\S*\/dist\/cli\.js(?:\s|$)/.test(command);
-  return [...rows].filter(([pid, row]) => !ignored.has(pid) && isQlb(row.command)).map(([pid]) => pid).sort((a, b) => a - b);
+  return [...rows].filter(([pid, row]) => !ignored.has(pid) && isQlbProcessCommand(row.command)).map(([pid]) => pid).sort((a, b) => a - b);
+}
+
+/** Match only QLB's executable or Node script position, never ordinary arguments. */
+export function isQlbProcessCommand(command: string): boolean {
+  const [executable, ...args] = command.trim().split(/\s+/);
+  if (!executable) return false;
+  if (basename(executable) === 'qlb') return true;
+  if (basename(executable) !== 'node') return false;
+  const script = args.find((arg) => !arg.startsWith('-'));
+  return script !== undefined && (basename(script) === 'qlb' || /(?:^|[\\/])dist[\\/]cli\.js$/.test(script));
 }
 
 async function defaultHeldLocks(home: string, now: () => number): Promise<string[]> {
@@ -185,12 +195,23 @@ function drainMessage(error: CswapUndoDrainError): string {
   return [pids, locks].filter(Boolean).join('; ') || 'drain did not clear';
 }
 
+async function productionProfileRequest(request: HttpRequestDescription): Promise<ResyncProfileResponse> {
+  const response = await fetch(request.url, {
+    method: request.method,
+    headers: request.headers,
+    ...(request.body === undefined ? {} : { body: request.body }),
+    signal: AbortSignal.timeout(request.timeoutMs),
+  });
+  return { status: response.status, body: await response.text() };
+}
+
 /** Called only inside the active switch + credential lock hold. */
 async function defaultResyncActive(
   dbPath: string,
   home: string,
   env: NodeJS.ProcessEnv,
   keychain: ExecuteHandBackDependencies['keychain'],
+  getProfile: (request: HttpRequestDescription) => Promise<ResyncProfileResponse>,
   accountId: string,
   credential: string,
 ): Promise<void> {
@@ -202,20 +223,35 @@ async function defaultResyncActive(
     const registered = slots.getSlot(accountId);
     if (!registered) return;
     const paths = claudePaths({ home, env });
+    const verdicts = new ProbeVerdictMemo();
+    const input = {
+      accountId, email: registered.email ?? '', orgUuid: registered.orgUuid ?? '',
+      creds: credential, slot: current,
+    };
+    const liveFp = credentialLineage(credential);
+    const slotAhead = liveFp !== null && current.fingerprint !== null
+      && (liveFp === current.fingerprint || liveFp === registered.prevFingerprint
+        || isSuccessor(store, 'anthropic', accountId, liveFp, current.fingerprint));
+    // A native Claude Code rotation has no QLB lineage edge. Attribute that
+    // locked live credential through the same profile oracle as resync before
+    // asking resyncUnderHeldLocks to promote it.
+    if (!slotAhead) {
+      try { await cacheProfileVerdict({ getProfile, verdicts }, input); } catch { /* fail closed below */ }
+    }
     await resyncUnderHeldLocks({
       slots, store, live: { backend: keychain as unknown as CredentialBackend, paths, env }, env,
-      verdicts: new ProbeVerdictMemo(), now: Date.now,
+      verdicts, now: Date.now,
       readLiveIdentity: () => {
         try { return liveIdentity(paths.globalConfigPath); } catch { return null; }
       },
-      // The undo path must never make an attribution network request. Known
-      // lineage can still be repaired, while unknown credentials stay put.
-      getProfile: async () => { throw new Error('network unavailable during undo'); },
+      getProfile,
       by: 'qlb-cli',
-    }, {
-      accountId, email: registered.email ?? '', orgUuid: registered.orgUuid ?? '',
-      creds: credential, slot: current,
-    });
+    }, input);
+    const after = await slots.readSlot(accountId, { fresh: true });
+    if (liveFp === null || (after.fingerprint !== liveFp
+      && !isSuccessor(store, 'anthropic', accountId, liveFp, after.fingerprint))) {
+      throw new CswapUndoActiveLoginError(registered.slotNum ?? 0);
+    }
   } finally { store.close(); repository.close(); }
 }
 
@@ -232,14 +268,25 @@ function defaultReadBack(backupDir: string, keychain: ExecuteHandBackDependencie
   };
 }
 
+function readActiveSequence(sequencePath: string, accountNumber: number): Record<string, unknown> {
+  if (!existsSync(sequencePath)) throw new CswapUndoSequenceError('missing');
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(sequencePath, 'utf8'));
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('not an object');
+    const sequence = parsed as Record<string, unknown>;
+    const accounts = sequence.accounts;
+    if (!accounts || typeof accounts !== 'object' || Array.isArray(accounts)
+      || !(String(accountNumber) in accounts)) throw new Error('account missing');
+    return sequence;
+  } catch (error) {
+    if (error instanceof CswapUndoSequenceError) throw error;
+    throw new CswapUndoSequenceError('malformed');
+  }
+}
+
 function defaultValidateActiveSequence(sequencePath: string): ExecuteHandBackDependencies['validateActiveSequence'] {
   return async (accountNumber) => {
-    if (accountNumber === null) return;
-    if (!existsSync(sequencePath)) throw new CswapUndoSequenceError('missing');
-    try {
-      const parsed: unknown = JSON.parse(readFileSync(sequencePath, 'utf8'));
-      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('not an object');
-    } catch { throw new CswapUndoSequenceError('malformed'); }
+    if (accountNumber !== null) readActiveSequence(sequencePath, accountNumber);
   };
 }
 
@@ -247,21 +294,12 @@ function defaultSetActiveAccountNumber(sequencePath: string): ExecuteHandBackDep
   return async (accountNumber) => {
     if (accountNumber === null) return;
     await defaultValidateActiveSequence(sequencePath)!(accountNumber);
-    let sequence: Record<string, unknown>;
-    try {
-      sequence = JSON.parse(readFileSync(sequencePath, 'utf8')) as Record<string, unknown>;
-    } catch { throw new CswapUndoSequenceError('malformed'); }
-    if (sequence.activeAccountNumber === accountNumber) return;
     const release = await productionTryAcquireLock(join(dirname(sequencePath), '.lock'));
     if (release === null) throw new Error('C-swap sequence lock is held');
     try {
-      // Re-read beneath C-swap's own flock so no concurrent writer is lost.
-      let current: Record<string, unknown>;
-      try {
-        const parsed: unknown = JSON.parse(readFileSync(sequencePath, 'utf8'));
-        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('not an object');
-        current = parsed as Record<string, unknown>;
-      } catch { throw new CswapUndoSequenceError('malformed'); }
+      // Re-read and decide equality beneath C-swap's own flock so no
+      // concurrent writer can invalidate an unlocked observation.
+      const current = readActiveSequence(sequencePath, accountNumber);
       if (current.activeAccountNumber === accountNumber) return;
       const temporary = `${sequencePath}.tmp.${process.pid}`;
       writeFileSync(temporary, `${JSON.stringify({ ...current, activeAccountNumber: accountNumber })}\n`, { mode: 0o600 });
@@ -337,6 +375,7 @@ export async function runUndoCswapCommand(
         ctx.home,
         ctx.env,
         keychain as ExecuteHandBackDependencies['keychain'],
+        dependencies.getProfile ?? productionProfileRequest,
         accountId,
         credential,
       )),
@@ -363,6 +402,10 @@ export async function runUndoCswapCommand(
     }
     if (error instanceof CswapUndoVerificationError) {
       ctx.stderr(`qlb undo cswap: verification failed for slot ${error.accountNumber}`);
+      return 1;
+    }
+    if (error instanceof CswapUndoActiveLoginError) {
+      ctx.stderr(`qlb undo cswap: active account ${error.accountNumber}: ${error.reason}`);
       return 1;
     }
     // Backend/process messages can contain credentials or command lines.
