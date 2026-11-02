@@ -298,6 +298,32 @@ describe('migrate path admission primitives', () => {
     }), /reserved root entry/);
   }));
 
+  it('37 migrate refuses a root-level relative symlink into a reserved Darwin root entry and accepts only grammatically valid physical results', () => {
+    const unexpectedLookup = Object.assign(new Error('unexpected lookup'), { code: 'EIO' });
+    const fakeFs = {
+      lstatSync(path: string) {
+        if (path === '/root-link') return { isSymbolicLink: () => true };
+        throw unexpectedLookup;
+      },
+      readlinkSync(path: string) {
+        assert.equal(path, '/root-link');
+        return Buffer.from('.vol/1/2');
+      },
+      statSync() { throw unexpectedLookup; },
+    };
+    unsafe(() => paths.resolveMigratePath('/root-link/auth.json', {
+      flag: '--auth-json', kind: 'file', fs: fakeFs as unknown as paths.MigratePathFs, platform: 'darwin',
+    }), /reserved root entry/);
+
+    withFixture((root) => {
+      const safe = join(root, 'safe');
+      const resolved = paths.resolveMigratePath(file('auth.json', safe), { flag: '--auth-json', kind: 'file' });
+      assert.equal(paths.validateRawMigratePath(resolved.physical, {
+        flag: '--auth-json', kind: 'file', cwd: safe,
+      }), resolved.physical);
+    });
+  });
+
   it('38 migrate protects both a dangling symlinked auth leaf directory and its target anchor directory', () => withFixture((root) => {
     const live = join(root, 'live-agent');
     const safe = join(root, 'safe');
@@ -311,7 +337,19 @@ describe('migrate path admission primitives', () => {
     assert.equal(paths.isInsideProtectedRoot(targetDirectoryCandidate, protectedRoot), true);
   }));
 
-  it('37 migrate finds a protected ancestor identity for deep existing and missing candidates', () => withFixture((root) => {
+  it('39 migrate protects an existing symlinked auth leaf target directory', () => withFixture((root) => {
+    const live = join(root, 'live-agent');
+    const safe = join(root, 'safe');
+    const elsewhere = join(root, 'elsewhere');
+    mkdirSync(elsewhere);
+    writeFileSync(join(elsewhere, 'real-auth.json'), '{}');
+    symlinkSync(join(elsewhere, 'real-auth.json'), join(live, 'auth.json'));
+    const protectedRoot = paths.resolveProtectedRoot(join(live, 'auth.json'), { flag: 'QLB_PI_AUTH_JSON_PATH', cwd: safe });
+    const targetDirectoryCandidate = paths.resolveMigratePath(file(join(elsewhere, 'new.json'), safe), { flag: '--auth-json', kind: 'file' });
+    assert.equal(paths.isInsideProtectedRoot(targetDirectoryCandidate, protectedRoot), true);
+  }));
+
+  it('40 migrate finds a protected ancestor identity for deep existing and missing candidates', () => withFixture((root) => {
     const live = join(root, 'live-agent');
     const safe = join(root, 'safe');
     mkdirSync(join(live, 'sub'));
