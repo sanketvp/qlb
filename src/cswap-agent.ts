@@ -88,6 +88,10 @@ async function releaseAll(locks: CswapLockRelease[]): Promise<void> {
   }
 }
 
+function lostLockError(locks: CswapLockRelease[]): Error | undefined {
+  return locks.map((release) => release.isLost?.()).find((error): error is Error => error !== undefined);
+}
+
 async function acquireAllLocks(options: CswapDrainOptions, paths: string[], deadline: number, survivor: CswapProcess[]): Promise<CswapLockRelease[] | CswapAgentResult> {
   const pollMs = options.pollMs ?? POLL_MS;
   for (;;) {
@@ -102,7 +106,14 @@ async function acquireAllLocks(options: CswapDrainOptions, paths: string[], dead
     } catch {
       complete = false;
     }
-    if (complete) return locks;
+    if (complete) {
+      const lost = lostLockError(locks);
+      if (lost !== undefined) {
+        await releaseAll(locks);
+        return { ok: false, code: drainErrorCode(lost) };
+      }
+      return locks;
+    }
     await releaseAll(locks);
     if (options.now() >= deadline) return { ok: false, code: survivorCode(survivor) };
     await options.sleep(pollMs);
@@ -142,6 +153,8 @@ export async function cooperativeDrain(options: CswapDrainOptions): Promise<Cswa
       }
       const exited = new Set<number>();
       for (const process of survivors) {
+        const lost = lostLockError(acquired);
+        if (lost !== undefined) return { ok: false, code: drainErrorCode(lost) };
         try {
           await options.kill(process.pid, 'SIGTERM');
         } catch (error) {

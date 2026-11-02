@@ -143,7 +143,11 @@ export function isQlbProcessCommand(command: string): boolean {
   return script !== undefined && (basename(script) === 'qlb' || /(?:^|[\\/])dist[\\/]cli\.js$/.test(script));
 }
 
-async function defaultHeldLocks(home: string, now: () => number): Promise<string[]> {
+export async function defaultHeldLocks(
+  home: string,
+  now: () => number,
+  tryAcquireLock: typeof productionTryAcquireLock = productionTryAcquireLock,
+): Promise<string[]> {
   const directory = join(home, '.qlb', 'locks');
   if (!existsSync(directory)) return [];
   const held: string[] = [];
@@ -152,7 +156,13 @@ async function defaultHeldLocks(home: string, now: () => number): Promise<string
     if (name === 'auto.lock') {
       // flock ownership, rather than the persistent lock-file's existence,
       // determines whether the auto tick is still running.
-      const release = await productionTryAcquireLock(path);
+      let release;
+      try {
+        release = await tryAcquireLock(path);
+      } catch (error) {
+        if (error instanceof Error && error.message.startsWith('fcntl flock helper exited unexpectedly')) continue;
+        throw error;
+      }
       if (release === null) held.push(name);
       else await release();
     } else if (/^(?:consume|switch)-.*\.lock$/.test(name)) {

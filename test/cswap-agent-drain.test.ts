@@ -9,7 +9,7 @@ import { cutoverBegin } from '../src/commands/cutover';
 import { phase } from '../src/lifecycle';
 import { openStore } from '../src/store';
 import { join } from 'node:path';
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 
 function helperEnv(home: string): NodeJS.ProcessEnv {
@@ -166,6 +166,103 @@ test('production flock exposes helper loss synchronously and through its lost pr
     assert.equal(lease.isLost?.(), lost);
     await lease();
   } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('refuses a lock lost before the drain can signal', async () => {
+  const helper = fakeFlockHelper();
+  const acquisition = productionTryAcquireLock('/fixture/auto.lock', () => helper.child);
+  helper.stdout.emit('data', Buffer.from('locked\n'));
+  const kills: Array<{ pid: number; signal: 'SIGTERM' }> = [];
+  let processLists = 0;
+
+  const result = await cooperativeDrain({
+    listProcesses: () => {
+      processLists += 1;
+      if (processLists === 2) helper.exit(17, null);
+      return [{ pid: 17 }];
+    },
+    listSignalTargets: () => [{ pid: 17 }],
+    lockPaths: () => ['/fixture/auto.lock'],
+    tryAcquireLock: () => acquisition,
+    kill: (pid, signal) => { kills.push({ pid, signal }); },
+    now: () => 0,
+    sleep: async () => {},
+    cooperativeWaitMs: 0,
+    termWaitMs: 0,
+  });
+
+  assert.deepEqual(result, { ok: false, code: 'cswap-drain-error fcntl flock helper exited unexpectedly (17)' });
+  assert.deepEqual(kills, [], 'a lost lease must prevent the first protected step');
+});
+
+test('refuses a lease lost between protected signals', async () => {
+  const loss = new Error('fcntl flock helper exited unexpectedly (17)');
+  let lost: Error | undefined;
+  const lease = Object.assign(() => {}, { isLost: () => lost });
+  const kills: number[] = [];
+
+  const result = await cooperativeDrain({
+    listProcesses: () => [{ pid: 17 }, { pid: 18 }],
+    listSignalTargets: () => [{ pid: 17 }, { pid: 18 }],
+    lockPaths: () => ['/fixture/auto.lock'],
+    tryAcquireLock: () => lease,
+    kill: (pid) => { kills.push(pid); lost = loss; },
+    now: () => 0,
+    sleep: async () => {},
+    cooperativeWaitMs: 0,
+    termWaitMs: 0,
+  });
+
+  assert.deepEqual(result, { ok: false, code: 'cswap-drain-error fcntl flock helper exited unexpectedly (17)' });
+  assert.deepEqual(kills, [17], 'the second protected signal must not run after loss');
+});
+
+test('a real exited helper cannot permit drain protected work', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'qlb-flock-drain-exited-'));
+  const lockDirectory = join(root, 'locks');
+  const script = join(root, 'exited-helper.js');
+  const survivor = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1_000)'], {
+    env: helperEnv(root), stdio: 'ignore',
+  });
+  mkdirSync(lockDirectory, { recursive: true });
+  writeFileSync(script, "process.stdout.write('locked\\n');");
+  let resolveHelperExit: () => void = () => {};
+  const helperExited = new Promise<void>((resolve) => { resolveHelperExit = resolve; });
+  let processLists = 0;
+  let acquired = false;
+  const kills: number[] = [];
+  try {
+    const result = await cooperativeDrain({
+      listProcesses: async () => {
+        processLists += 1;
+        if (processLists > 1) await helperExited;
+        return [{ pid: survivor.pid! }];
+      },
+      listSignalTargets: () => [{ pid: survivor.pid! }],
+      lockPaths: () => [join(lockDirectory, 'auto.lock')],
+      tryAcquireLock: (path) => productionTryAcquireLock(path, (_lockPath, cwd) => {
+        const helper = spawn(process.execPath, [script], { cwd, env: helperEnv(root), stdio: ['pipe', 'pipe', 'ignore'] });
+        helper.once('exit', () => resolveHelperExit());
+        return helper;
+      }).then((lease) => {
+        acquired = lease !== null;
+        return lease;
+      }),
+      kill: (pid) => { kills.push(pid); },
+      now: () => 0,
+      sleep: async () => {},
+      cooperativeWaitMs: 0,
+      lockWaitMs: 0,
+      termWaitMs: 0,
+    });
+
+    assert.equal(acquired, true, 'the immediate helper status must have produced a lease before exit observation');
+    assert.match(result.code ?? '', /^cswap-drain-error fcntl flock helper exited unexpectedly/);
+    assert.deepEqual(kills, [], 'an exited helper must not permit any protected signal');
+  } finally {
+    survivor.kill();
     rmSync(root, { recursive: true, force: true });
   }
 });
