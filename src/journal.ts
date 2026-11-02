@@ -4,12 +4,13 @@ import {
   deleteClaudeSwitchJournal,
   deleteStagedRollback,
   probeClaudeSwitchJournalOwner,
+  updateClaudeSwitchJournal,
   readClaudeSwitchJournal,
   withClaudeSwitchJournalOwner,
   type ClaudeSwitchJournal,
   type ClaudeSwitchJournalOptions,
 } from './cc-switch-journal';
-import { restoreConfigFromJournal, restoreLiveFromStaged, type ClaudeSwitchDeps } from './cc-switch';
+import { checkClaudeCswapProcessPrecondition, restoreConfigFromJournal, restoreLiveFromStaged, type ClaudeSwitchDeps } from './cc-switch';
 import { stillTheSameProcess } from './codex-sessions';
 
 function optionsFor(deps: ClaudeSwitchDeps): ClaudeSwitchJournalOptions {
@@ -38,6 +39,9 @@ async function ownerIsLive(deps: ClaudeSwitchDeps, journal: ClaudeSwitchJournal)
  * back. This deliberately never completes a switch forward.
  */
 export async function reconcileClaudeSwitch(deps: ClaudeSwitchDeps): Promise<void> {
+  // S24 must prevent recovery from acquiring any Claude Code lock too.
+  if (checkClaudeCswapProcessPrecondition(deps) !== null) return;
+
   const options = optionsFor(deps);
   const initial = readClaudeSwitchJournal(options);
   // An absent, malformed, completed, or live-owned journal is left for the
@@ -51,6 +55,8 @@ export async function reconcileClaudeSwitch(deps: ClaudeSwitchDeps): Promise<voi
   const credentialLock = deps.locks?.credential ?? withClaudeCredentialLocks;
   const ownerLock = deps.locks?.owner ?? withClaudeSwitchJournalOwner;
   const configLock = deps.locks?.configPath ?? withClaudeConfigPathLock;
+  const journalUpdate = deps.journalOps?.update ?? updateClaudeSwitchJournal;
+  const journalRemove = deps.journalOps?.remove ?? deleteClaudeSwitchJournal;
 
   await switchLock(async () => {
     await credentialLock({ configDir: paths.configHome, env: deps.env }, async (credentialHeld) => {
@@ -74,8 +80,11 @@ export async function reconcileClaudeSwitch(deps: ClaudeSwitchDeps): Promise<voi
           trigger: 'journal', outcome: 'rolled-back', detail: 'crash-reconcile',
           stepsJson: JSON.stringify({ attempt: journal.attemptId }),
         });
+        // Durable completion must precede cleanup: a cleanup failure then
+        // leaves a finished journal for switchClaude's existing step-4 cleanup.
+        journalUpdate(ownerHeld, { closed: 'rolled-back' }, options);
         await deleteStagedRollback(deps.live.backend, journal.stagedBlobService);
-        deleteClaudeSwitchJournal(ownerHeld, options);
+        journalRemove(ownerHeld, options);
       });
     });
   }, { home: deps.home, env: deps.env });

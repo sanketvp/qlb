@@ -147,6 +147,17 @@ class RestartPhaseA extends Error { constructor() { super('restart Phase A'); th
 function refused(reason: ClaudeSwitchPreconditionReason): Extract<ClaudeSwitchPreconditionsResult, { kind: 'refused' }> { return { kind: 'refused', reason }; }
 function activeAccount(deps: ClaudeSwitchDeps): string | null { const accountId = deps.store.getActiveLogin('anthropic')?.accountId; return accountId && deps.slots.getSlot(accountId) ? accountId : null; }
 
+/** S24: share the C-swap admission check with recovery before it takes any Claude Code lock. */
+export function checkClaudeCswapProcessPrecondition(
+  deps: Pick<ClaudeSwitchDeps, 'cswapProcesses' | 'env'>,
+): Extract<ClaudeSwitchPreconditionReason, 'cswap-process-alive' | 'cswap-process-check-failed'> | null {
+  try {
+    return resolveCswapCheck(deps.cswapProcesses, deps.env)().length > 0 ? 'cswap-process-alive' : null;
+  } catch {
+    return 'cswap-process-check-failed';
+  }
+}
+
 export function checkClaudeSwitchPreconditions(deps: ClaudeSwitchDeps, input: SwitchClaudeInput): ClaudeSwitchPreconditionsResult {
   const active = activeAccount(deps);
   if (active === null) return refused('active-login-unset');
@@ -159,7 +170,8 @@ export function checkClaudeSwitchPreconditions(deps: ClaudeSwitchDeps, input: Sw
     const suspendedUntil = deps.store.getConfig('auto.anthropic.suspendedUntil');
     if (suspendedUntil !== null) { const timestamp = Number(suspendedUntil); if (!Number.isFinite(timestamp) || timestamp > deps.now()) return refused('breaker-open'); }
   }
-  try { if (resolveCswapCheck(deps.cswapProcesses, deps.env)().length > 0) return refused('cswap-process-alive'); } catch { return refused('cswap-process-check-failed'); }
+  const cswapProcessReason = checkClaudeCswapProcessPrecondition(deps);
+  if (cswapProcessReason !== null) return refused(cswapProcessReason);
   return { kind: 'go' };
 }
 function warn(deps: ClaudeSwitchDeps, message: string): void { try { deps.warn?.(message); } catch { /* diagnostics are never transaction effects */ } }

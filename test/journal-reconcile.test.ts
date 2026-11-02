@@ -10,7 +10,10 @@ import { ClaudeSlots, InMemoryClaudeSlotRepository } from '../src/cc-slots';
 import {
   claudeSwitchJournalPath,
   createClaudeSwitchJournal,
+  deleteClaudeSwitchJournal,
+  readClaudeSwitchJournal,
   readStagedRollback,
+  updateClaudeSwitchJournal,
   writeStagedRollback,
   type ClaudeSwitchJournal,
 } from '../src/cc-switch-journal';
@@ -91,11 +94,28 @@ function journalExists(subject: Subject): boolean {
   return existsSync(join(subject.deps.journalDir!, 'switch-anthropic.json'));
 }
 
+function wrappedBackend(backend: MockKeychain, overrides: Partial<ClaudeSwitchDeps['live']['backend']>): ClaudeSwitchDeps['live']['backend'] {
+  return {
+    kind: 'test-memory',
+    get: overrides.get ?? ((service, account) => backend.get(service, account)),
+    set: overrides.set ?? ((service, account, value) => backend.set(service, account, value)),
+    delete: overrides.delete ?? ((service, account) => backend.delete(service, account)),
+    setSync: overrides.setSync ?? ((service, account, value) => backend.setSync(service, account, value)),
+    getSync: overrides.getSync ?? ((service, account) => backend.getSync(service, account)),
+    deleteSync: overrides.deleteSync ?? ((service, account) => backend.deleteSync(service, account)),
+  };
+}
+
 describe('Claude switch journal reconciliation (G10)', () => {
   it('a crash after step 7 restores live and config byte-equal, then a new switch succeeds', async () => {
     const subject = await fixture();
-    const entry = await install(subject);
+    const changedConfig = `${JSON.stringify({ oauthAccount: { accountUuid: 'b' }, retained: 'yes' })}\n`;
+    const entry = await install(subject, journal(subject, {
+      step: 8, configText: subject.configText, configWrittenHash: digest(changedConfig),
+      fromOauthAccount: { accountUuid: 'a' }, configWriteStarted: true, configWritten: true,
+    }));
     await subject.backend.set(subject.paths.keychainService, 'fixture-user', subject.target);
+    writeFileSync(subject.paths.globalConfigPath, changedConfig);
     await reconcileClaudeSwitch(subject.deps);
     assert.equal(await subject.backend.get(subject.paths.keychainService, 'fixture-user'), subject.outgoing);
     assert.equal(readFileSync(subject.paths.globalConfigPath, 'utf8'), subject.configText);
@@ -103,6 +123,106 @@ describe('Claude switch journal reconciliation (G10)', () => {
     assert.equal(await readStagedRollback(subject.backend, entry.stagedBlobService), null);
     assert.deepEqual(subject.rows.map((row) => [row.outcome, row.detail]), [['rolled-back', 'crash-reconcile']]);
     assert.equal((await switchClaude(subject.deps, { to: 'b', trigger: 'manual' })).outcome, 'ok');
+  });
+
+  it('a staged delete failure leaves a finished journal for the next switch cleanup', async () => {
+    const subject = await fixture();
+    const entry = await install(subject);
+    await subject.backend.set(subject.paths.keychainService, 'fixture-user', subject.target);
+    let failOnce = true;
+    subject.deps.live.backend = wrappedBackend(subject.backend, {
+      delete: async (service, account) => {
+        if (service === entry.stagedBlobService && failOnce) {
+          failOnce = false;
+          throw new Error('staged delete failed');
+        }
+        await subject.backend.delete(service, account);
+      },
+    });
+    await assert.rejects(reconcileClaudeSwitch(subject.deps), /staged delete failed/);
+    const afterFailure = readClaudeSwitchJournal({ journalDir: subject.deps.journalDir, home: subject.home, env: subject.env, configPath: subject.paths.globalConfigPath, keychainService: subject.paths.keychainService });
+    assert.equal(afterFailure.state, 'ok');
+    if (afterFailure.state === 'ok') assert.equal(afterFailure.journal.closed, 'rolled-back');
+    assert.equal(await readStagedRollback(subject.backend, entry.stagedBlobService), subject.outgoing);
+    assert.equal((await switchClaude(subject.deps, { to: 'b', trigger: 'manual' })).outcome, 'ok');
+    assert.equal(journalExists(subject), false);
+    assert.equal(await readStagedRollback(subject.backend, entry.stagedBlobService), null);
+    assert.equal(subject.rows.filter((row) => row.outcome === 'rolled-back').length, 1);
+  });
+
+  it('a journal delete failure leaves a finished journal for the next switch cleanup', async () => {
+    const subject = await fixture();
+    const entry = await install(subject);
+    await subject.backend.set(subject.paths.keychainService, 'fixture-user', subject.target);
+    let failOnce = true;
+    subject.deps.journalOps = {
+      update: updateClaudeSwitchJournal,
+      remove: (...args) => {
+        if (failOnce) {
+          failOnce = false;
+          throw new Error('journal delete failed');
+        }
+        deleteClaudeSwitchJournal(...args);
+      },
+    };
+    await assert.rejects(reconcileClaudeSwitch(subject.deps), /journal delete failed/);
+    const afterFailure = readClaudeSwitchJournal({ journalDir: subject.deps.journalDir, home: subject.home, env: subject.env, configPath: subject.paths.globalConfigPath, keychainService: subject.paths.keychainService });
+    assert.equal(afterFailure.state, 'ok');
+    if (afterFailure.state === 'ok') assert.equal(afterFailure.journal.closed, 'rolled-back');
+    assert.equal(await readStagedRollback(subject.backend, entry.stagedBlobService), null);
+    assert.equal((await switchClaude(subject.deps, { to: 'b', trigger: 'manual' })).outcome, 'ok');
+    assert.equal(journalExists(subject), false);
+    assert.equal(subject.rows.filter((row) => row.outcome === 'rolled-back').length, 1);
+  });
+
+  it('a C-swap process leaves live, config, journal, and staged state untouched without taking a lock', async () => {
+    const subject = await fixture();
+    const entry = await install(subject);
+    await subject.backend.set(subject.paths.keychainService, 'fixture-user', subject.target);
+    subject.deps.cswapProcesses = () => [{ pid: 123 }];
+    let locks = 0;
+    subject.deps.locks = {
+      switch: async () => { locks += 1; throw new Error('must not lock'); },
+    };
+    const before = {
+      live: await subject.backend.get(subject.paths.keychainService, 'fixture-user'),
+      config: readFileSync(subject.paths.globalConfigPath, 'utf8'),
+      journal: readFileSync(claudeSwitchJournalPath({ journalDir: subject.deps.journalDir }), 'utf8'),
+      staged: await readStagedRollback(subject.backend, entry.stagedBlobService),
+    };
+    await reconcileClaudeSwitch(subject.deps);
+    assert.deepEqual({
+      live: await subject.backend.get(subject.paths.keychainService, 'fixture-user'),
+      config: readFileSync(subject.paths.globalConfigPath, 'utf8'),
+      journal: readFileSync(claudeSwitchJournalPath({ journalDir: subject.deps.journalDir }), 'utf8'),
+      staged: await readStagedRollback(subject.backend, entry.stagedBlobService),
+    }, before);
+    assert.equal(locks, 0);
+  });
+
+  it('a failed C-swap process check leaves live, config, journal, and staged state untouched without taking a lock', async () => {
+    const subject = await fixture();
+    const entry = await install(subject);
+    await subject.backend.set(subject.paths.keychainService, 'fixture-user', subject.target);
+    subject.deps.cswapProcesses = () => { throw new Error('process table unavailable'); };
+    let locks = 0;
+    subject.deps.locks = {
+      switch: async () => { locks += 1; throw new Error('must not lock'); },
+    };
+    const before = {
+      live: await subject.backend.get(subject.paths.keychainService, 'fixture-user'),
+      config: readFileSync(subject.paths.globalConfigPath, 'utf8'),
+      journal: readFileSync(claudeSwitchJournalPath({ journalDir: subject.deps.journalDir }), 'utf8'),
+      staged: await readStagedRollback(subject.backend, entry.stagedBlobService),
+    };
+    await reconcileClaudeSwitch(subject.deps);
+    assert.deepEqual({
+      live: await subject.backend.get(subject.paths.keychainService, 'fixture-user'),
+      config: readFileSync(subject.paths.globalConfigPath, 'utf8'),
+      journal: readFileSync(claudeSwitchJournalPath({ journalDir: subject.deps.journalDir }), 'utf8'),
+      staged: await readStagedRollback(subject.backend, entry.stagedBlobService),
+    }, before);
+    assert.equal(locks, 0);
   });
 
   it('a crash before the live write needs no staged item', async () => {
