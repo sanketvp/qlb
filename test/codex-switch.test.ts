@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync, fsyncSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, fsyncSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -202,18 +202,34 @@ function scalarCount(db: DatabaseSync, sql: string): number {
   return (db.prepare(sql).get() as { count: number }).count;
 }
 
-function snapshotFiles(root: string): Array<{ path: string; bytes: Buffer }> {
+type TreeSnapshotEntry =
+  | { path: string; type: 'file'; mode: number; bytes: Buffer }
+  | { path: string; type: 'dir'; mode: number }
+  | { path: string; type: 'symlink'; mode: number; target: string }
+  | { path: string; type: 'other'; mode: number };
+
+function snapshotFiles(root: string): TreeSnapshotEntry[] {
   if (!existsSync(root)) return [];
-  const files: Array<{ path: string; bytes: Buffer }> = [];
+  const entries: TreeSnapshotEntry[] = [];
   const visit = (directory: string): void => {
     for (const entry of readdirSync(directory, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
       const path = join(directory, entry.name);
-      if (entry.isDirectory()) visit(path);
-      else if (entry.isFile()) files.push({ path: relative(root, path), bytes: readFileSync(path) });
+      const stat = lstatSync(path);
+      const snapshot = { path: relative(root, path), mode: stat.mode };
+      if (stat.isDirectory()) {
+        entries.push({ ...snapshot, type: 'dir' });
+        visit(path);
+      } else if (stat.isFile()) {
+        entries.push({ ...snapshot, type: 'file', bytes: readFileSync(path) });
+      } else if (stat.isSymbolicLink()) {
+        entries.push({ ...snapshot, type: 'symlink', target: readlinkSync(path) });
+      } else {
+        entries.push({ ...snapshot, type: 'other' });
+      }
     }
   };
   visit(root);
-  return files;
+  return entries;
 }
 
 function snapshotDatabase(db: DatabaseSync): Array<[string, unknown[]]> {
@@ -4261,6 +4277,39 @@ describe('scenario 6 end to end and command contract — C6-26', () => {
       await runDueCodexWatches(engineDeps(), clock);
       assert.equal(scalarCount(h.db, 'SELECT COUNT(*) AS count FROM codex_watch'), 0);
     } finally { close(h); }
+  });
+
+  it('registered command wiring refuses before store opening or dependency construction', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-c6-26-disabled-wiring-'));
+    const home = join(root, 'home');
+    const qlbHome = join(root, 'qlb');
+    mkdirSync(home); mkdirSync(qlbHome);
+    let opened = 0;
+    let built = 0;
+    const command = discoverCommands(undefined, undefined, (id) => id.endsWith('switch-openai-codex.js')
+      ? { default: createSwitchOpenAiCodexCommand({
+        openStore: () => { opened += 1; throw new Error('disabled command must not open a store'); },
+        makeSwitchDeps: () => { built += 1; throw new Error('disabled command must not build dependencies'); },
+      }) }
+      : require(id),
+    ).find(({ name }) => name === 'switch openai-codex');
+    assert.ok(command?.execute, 'registered command is discoverable through its production wiring');
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const config = defaultConfig(home);
+    const context: CommandContext = {
+      stdout: (line) => stdout.push(line), stderr: (line) => stderr.push(line),
+      env: { QLB_TEST_MODE: '1', HOME: home, QLB_HOME: qlbHome },
+      config, loadConfig: () => config, home,
+      registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
+    };
+    try {
+      assert.equal(await command.execute(['b:account'], context), 3);
+      assert.equal(opened, 0);
+      assert.equal(built, 0);
+      assert.deepEqual(stdout, []);
+      assert.deepEqual(stderr, ['qlb switch openai-codex is not enabled yet: it turns on together with QLB\'s background checks (C8).']);
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
   it('the registered production command default refuses with a byte-for-byte unchanged state', async () => {
