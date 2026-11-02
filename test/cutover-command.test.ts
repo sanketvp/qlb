@@ -1,11 +1,14 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 
 import { defaultConfig } from '../src/config';
 import { createCutoverCommand } from '../src/commands/cutover';
+import { CSWAP_ANTHROPIC_STORE, CONSUME_STATE } from '../src/cswap-consume';
+import { beginCutover, phase } from '../src/lifecycle';
 import type { CswapAgent } from '../src/cswap-agent';
 import type { CommandContext } from '../src/registry';
 import { openStore } from '../src/store';
@@ -36,6 +39,22 @@ function fixture(): { root: string; dbPath: string; context: CommandContext; out
   };
 }
 
+function prepareDeferredCommit(dbPath: string): void {
+  const store = openStore(dbPath);
+  try {
+    beginCutover(store, 10);
+    const db = new DatabaseSync(dbPath);
+    try {
+      db.prepare(`INSERT INTO claude_slots (account_id, slot_num, config_json, added_at)
+        VALUES (?, ?, ?, ?)`).run('claude-a', 1, '{}', 10);
+    } finally { db.close(); }
+    store.recordSwitch({ provider: 'anthropic', fromAccount: 'claude-a', toAccount: 'claude-b', trigger: 'manual', outcome: 'ok' });
+    store.recordSwitch({ provider: 'anthropic', fromAccount: 'claude-b', toAccount: 'claude-a', trigger: 'manual', outcome: 'ok' });
+    store.setConfig('keychain.liveItemsAuthorizedAt', '19');
+    store.upsertMigration(CSWAP_ANTHROPIC_STORE, CONSUME_STATE, '{}', 20);
+  } finally { store.close(); }
+}
+
 test('begin calls the injected agent in S57 order', async () => {
   const f = fixture();
   try {
@@ -60,6 +79,26 @@ test('begin calls the injected agent in S57 order', async () => {
     assert.equal(factoryCalls, 1);
     assert.deepEqual(calls, ['bootout', 'disable', 'movePlist', 'drain']);
     assert.deepEqual(JSON.parse(f.output[0]!), { ok: true, state: 'cutting-over' });
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('commit records release_sha', async () => {
+  const f = fixture();
+  try {
+    const sha = 'a'.repeat(40);
+    const releaseDir = join(f.root, 'app', sha);
+    mkdirSync(releaseDir, { recursive: true });
+    writeFileSync(join(releaseDir, 'release.json'), JSON.stringify({ sha, digest: 'b'.repeat(64) }));
+    symlinkSync(sha, join(f.root, 'app', 'current'));
+    prepareDeferredCommit(f.dbPath);
+
+    const command = createCutoverCommand();
+    assert.equal(await command.execute!(['commit', '--pi-deferred', '--json'], f.context), 0);
+    assert.equal(JSON.parse(f.output[0]!).row.releaseSha, sha);
+    const store = openStore(f.dbPath);
+    try { assert.equal(phase(store).releaseSha, sha); } finally { store.close(); }
   } finally {
     f.cleanup();
   }

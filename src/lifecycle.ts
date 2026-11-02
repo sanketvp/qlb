@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
+import { CSWAP_ANTHROPIC_STORE, CONSUME_STATE } from './cswap-consume';
 import { atomicWriteText } from './fsutil';
 import type { Store } from './store';
 
@@ -432,7 +433,7 @@ function stalePiSessions(db: DatabaseSync): 'stale' | 'clear' | 'unknown' {
 }
 
 /** Commit gates from S50, S61, and S63. */
-export function commitCutover(store: Store, opts: { now?: number; releaseSha?: string } = {}): LifecycleResult {
+export function commitCutover(store: Store, opts: { now?: number; releaseSha?: string; piDeferred?: boolean } = {}): LifecycleResult {
   const admission = assertAdmitted(store, 'cutover-commit');
   if (!admission.ok) return admission;
   return withDb(store, (db) => {
@@ -441,9 +442,14 @@ export function commitCutover(store: Store, opts: { now?: number; releaseSha?: s
     if (!hasImportedClaudeSlot(db)) return { ok: false, code: 'import-not-complete' };
     if (!manualRoundTripDone(db)) return { ok: false, code: 'manual-round-trip-required' };
     if (configValue(db, 'keychain.liveItemsAuthorizedAt') == null) return { ok: false, code: 'keychain-live-items-not-authorized' };
-    for (const provider of PI_PROVIDERS) {
-      const state = configValue(db, `pi.${provider}.state`);
-      if (state !== 'migrated' && state !== 'not-applicable') return { ok: false, code: `pi-state-missing:${provider}` };
+    if (opts.piDeferred) {
+      const migration = db.prepare('SELECT state FROM migrations WHERE store = ?').get(CSWAP_ANTHROPIC_STORE) as { state?: string } | undefined;
+      if (migration?.state !== CONSUME_STATE) return { ok: false, code: 'pi-deferred-needs-consume' };
+    } else {
+      for (const provider of PI_PROVIDERS) {
+        const state = configValue(db, `pi.${provider}.state`);
+        if (state !== 'migrated' && state !== 'not-applicable') return { ok: false, code: `pi-state-missing:${provider}` };
+      }
     }
     if (hasSharedAnthropicTarget(db)) {
       const sessions = stalePiSessions(db);
@@ -455,6 +461,10 @@ export function commitCutover(store: Store, opts: { now?: number; releaseSha?: s
       WHERE id = ? AND state = 'cutting-over'`)
       .run(now, now + 7 * DAY_MS, opts.releaseSha ?? null, admission.row!.id).changes;
     if (changed !== 1) return { ok: false, code: 'transition=cutting-over->cutover' };
+    if (opts.piDeferred) {
+      db.prepare(`INSERT INTO config (key, value) VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run('cutover.piDeferredAt', String(now));
+    }
     return { ok: true, row: phase(store) };
   });
 }
