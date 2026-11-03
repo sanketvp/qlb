@@ -9,6 +9,7 @@ import { claudePaths } from '../src/cc-paths';
 import { withClaudeSwitchLock } from '../src/cc-locks';
 import { ClaudeSlots, SqliteClaudeSlotRepository } from '../src/cc-slots';
 import { switchClaude, type ClaudeSwitchDeps } from '../src/cc-switch';
+import { runAutoCommand } from '../src/commands/auto';
 import { createSwitchAnthropicCommand, type SwitchAnthropicCommandDeps } from '../src/commands/switch-anthropic';
 import { defaultConfig } from '../src/config';
 import { MockKeychain } from '../src/keychain';
@@ -160,6 +161,20 @@ describe('Claude switch lifecycle guards (K5-8)', () => {
       }), (error: unknown) => error instanceof AutoAdmissionRefused && error.code === code);
       assert.equal(bindingOpened, true);
       assert.deepEqual(lines, []);
+    }
+  });
+
+  it('auto resume is refused in pre-cutover, cutting-over and undoing', async () => {
+    const cases = [
+      ['pre-cutover', 'phase=pre-cutover'],
+      ['cutting-over', 'phase=cutting-over'],
+      ['undoing', 'undo-in-progress'],
+    ] as const;
+    for (const [state, code] of cases) {
+      const subject = await fixture(state);
+      assert.equal(await runAutoCommand(['resume', 'anthropic'], subject.ctx), 3, state);
+      assert.deepEqual(subject.stderr, [`qlb auto resume: refused: ${code}`], state);
+      assert.equal(subject.lockCalls(), 0, state);
     }
   });
 

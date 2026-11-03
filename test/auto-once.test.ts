@@ -116,6 +116,80 @@ describe('qlb auto --once (G12)', () => {
     }
   });
 
+  it('auto resume anthropic clears suspendedUntil and writes lastResumeAt', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-auto-resume-'));
+    const home = join(root, 'home');
+    const config = defaultConfig(home);
+    const suspendedUntil = 1_000_000;
+    const store = openStore(config.dbPath);
+    beginCutover(store, 1);
+    assert.equal(transition(store, 'cutover', 2).ok, true);
+    store.setConfig('auto.anthropic.suspendedUntil', String(suspendedUntil));
+    store.close();
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const ctx: CommandContext = {
+      stdout: (line) => stdout.push(line), stderr: (line) => stderr.push(line), env: testEnv(home), config,
+      loadConfig: () => config, home, registerSecret: () => undefined, deliverSecret: () => undefined, knownSecrets: () => [],
+    };
+    try {
+      assert.equal(await runAutoCommand(['resume', 'anthropic'], ctx), 0);
+      assert.deepEqual(stderr, []);
+      assert.deepEqual(stdout, [`resumed anthropic (suspended until ${new Date(suspendedUntil).toISOString()} cleared)`]);
+      const reopened = openStore(config.dbPath);
+      try {
+        assert.equal(reopened.getConfig('auto.anthropic.suspendedUntil'), '');
+        assert.equal(Number.isFinite(Number(reopened.getConfig('auto.anthropic.lastResumeAt'))), true);
+      } finally { reopened.close(); }
+    } finally {
+      close(root);
+    }
+  });
+
+  it('auto resume with no suspension exits 0 and writes only lastResumeAt', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-auto-resume-empty-'));
+    const home = join(root, 'home');
+    const config = defaultConfig(home);
+    const store = openStore(config.dbPath);
+    beginCutover(store, 1);
+    assert.equal(transition(store, 'cutover', 2).ok, true);
+    store.close();
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const ctx: CommandContext = {
+      stdout: (line) => stdout.push(line), stderr: (line) => stderr.push(line), env: testEnv(home), config,
+      loadConfig: () => config, home, registerSecret: () => undefined, deliverSecret: () => undefined, knownSecrets: () => [],
+    };
+    try {
+      assert.equal(await runAutoCommand(['resume', 'anthropic'], ctx), 0);
+      assert.deepEqual(stdout, ['nothing to resume']);
+      assert.deepEqual(stderr, []);
+      const reopened = openStore(config.dbPath);
+      try {
+        assert.equal(reopened.hasConfig('auto.anthropic.suspendedUntil'), false);
+        assert.equal(Number.isFinite(Number(reopened.getConfig('auto.anthropic.lastResumeAt'))), true);
+      } finally { reopened.close(); }
+    } finally {
+      close(root);
+    }
+  });
+
+  it('auto resume kimi-coding exits 2', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-auto-resume-provider-'));
+    const home = join(root, 'home');
+    const stderr: string[] = [];
+    const ctx: CommandContext = {
+      stdout: () => undefined, stderr: (line) => stderr.push(line), env: testEnv(home), config: defaultConfig(home),
+      loadConfig: () => defaultConfig(home), home, registerSecret: () => undefined, deliverSecret: () => undefined, knownSecrets: () => [],
+    };
+    try {
+      assert.equal(await runAutoCommand(['resume', 'kimi-coding'], ctx), 2);
+      assert.deepEqual(stderr, ['qlb auto resume: provider-not-enabled']);
+    } finally {
+      close(root);
+    }
+  });
+
   it('a second loop exits 3', async () => {
     const root = mkdtempSync(join(tmpdir(), 'qlb-auto-lock-'));
     const home = join(root, 'home');

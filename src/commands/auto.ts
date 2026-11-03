@@ -5,7 +5,9 @@ import { AutoAdmissionRefused, runAuto, type AutoDependencies, type AutoRunResul
 
 import { productionTryAcquireLock, type CswapLockRelease } from '../cswap-agent';
 import { atomicWriteText } from '../fsutil';
+import { assertAdmitted } from '../lifecycle';
 import type { CommandContext, CommandDefinition } from '../registry';
+import { openStore } from '../store';
 
 type AutoCommandOptions = RunAutoOptions & { json: boolean };
 
@@ -22,6 +24,51 @@ function parse(args: string[]): AutoCommandOptions | null {
   return {
     once: args.includes('--once'), dryRun: args.includes('--dry-run'), json: args.includes('--json'),
   };
+}
+
+function parseResume(args: string[]): { provider: string; json: boolean } | null {
+  const [provider, ...flags] = args;
+  if (!provider || flags.some((flag) => flag !== '--json') || new Set(flags).size !== flags.length) return null;
+  return { provider, json: flags.includes('--json') };
+}
+
+function resumeAnthropic(ctx: CommandContext, args: string[]): number {
+  const options = parseResume(args);
+  if (!options) {
+    ctx.stderr('usage: qlb auto resume anthropic [--json]');
+    return 2;
+  }
+  if (options.provider !== 'anthropic') {
+    ctx.stderr('qlb auto resume: provider-not-enabled');
+    return 2;
+  }
+
+  const store = openStore(ctx.config.dbPath);
+  try {
+    const admission = assertAdmitted(store, 'auto:resume');
+    if (!admission.ok) {
+      ctx.stderr(`qlb auto resume: refused: ${admission.code}`);
+      return 3;
+    }
+    const resumed = store.runImmediate(() => {
+      const suspendedUntil = store.getConfig('auto.anthropic.suspendedUntil');
+      store.setConfig('auto.anthropic.lastResumeAt', String(Date.now()));
+      if (suspendedUntil !== null && suspendedUntil !== '') store.setConfig('auto.anthropic.suspendedUntil', '');
+      return suspendedUntil;
+    });
+    const cleared = resumed !== null && resumed !== '';
+    const suspendedUntil = cleared ? new Date(Number(resumed)).toISOString() : null;
+    if (options.json) {
+      ctx.stdout(JSON.stringify({ provider: 'anthropic', resumed: cleared, suspendedUntil }));
+    } else if (cleared) {
+      ctx.stdout(`resumed anthropic (suspended until ${suspendedUntil} cleared)`);
+    } else {
+      ctx.stdout('nothing to resume');
+    }
+    return 0;
+  } finally {
+    store.close();
+  }
 }
 
 function xmlText(value: string): string {
@@ -121,6 +168,8 @@ export async function runAutoCommand(
   ctx: CommandContext,
   deps: AutoCommandDeps = defaultDeps,
 ): Promise<number> {
+  if (args[0] === 'resume') return resumeAnthropic(ctx, args.slice(1));
+
   if (args[0] === 'install-agent') {
     if (args.length !== 1) {
       ctx.stderr('usage: qlb auto install-agent');
@@ -143,7 +192,7 @@ export async function runAutoCommand(
 
   const options = parse(args);
   if (!options) {
-    ctx.stderr('usage: qlb auto [--once] [--dry-run] [--json] | qlb auto install-agent');
+    ctx.stderr('usage: qlb auto [--once] [--dry-run] [--json] | qlb auto install-agent | qlb auto resume anthropic [--json]');
     return 2;
   }
 
