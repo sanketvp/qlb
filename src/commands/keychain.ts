@@ -9,10 +9,15 @@ import { qlbHomeDir } from '../home';
 import { assertKeychainAccess, macosKeychainAccountName } from '../keychain-allowlist';
 import { listCswapProcesses } from '../cswap-processes';
 import {
+  assertKeychainClientAllowed,
   isKeychainClientNotStarted,
   isKeychainStillWaiting,
+  KEYCHAIN_UNBOUNDED_DEADLINE,
   KeychainClientNotStarted,
+  keychainClientEnv,
+  keychainLockForService,
   keychainRequestFromArgv,
+  keychainWrapperOutcome,
   runKeychainClientSync,
   type KeychainKind,
 } from '../keychain-client';
@@ -503,11 +508,13 @@ function writeMatrixConfig(
   }
 }
 
-/**
- * `verifiedFd` identifies the staged inode observed before verification; the default
- * runner compares it with the spawned path before opening stdin for input.
- */
-type HelperRunner = (path: string, args: string[], input?: Buffer, verifiedFd?: number, expectedSigning?: HelperSigningState | null) => void | Promise<void>;
+/** `verifiedFd` identifies the staged inode observed before authorization. */
+export interface HelperRunnerSeams {
+  /** Test-only portable lockf executable; production always uses /usr/bin/lockf. */
+  lockfPath?: string;
+}
+
+type HelperRunner = (path: string, args: string[], input?: Buffer, verifiedFd?: number, expectedSigning?: HelperSigningState | null, seams?: HelperRunnerSeams) => void | Promise<void>;
 type CswapItemReader = (service: string, account: string) => Buffer;
 
 export interface LiveSwitchReceipt {
@@ -593,62 +600,95 @@ function cswapItems(sequencePath: string): Array<{ service: 'claude-swap'; accou
   return items;
 }
 
-async function defaultHelperRunner(
+export async function defaultHelperRunner(
   path: string,
   args: string[],
   input?: Buffer,
   verifiedFd?: number,
   expectedSigning?: HelperSigningState | null,
+  seams?: HelperRunnerSeams,
 ): Promise<void> {
+  const service = args[args.length - 2] ?? 'unknown';
+  const isSet = args[0] === 'set';
+  const changed = (): Error => new Error('keychain helper changed after verification');
+  const matchesVerifiedInode = (rejectSymlink: boolean): boolean => {
+    if (verifiedFd === undefined) return true;
+    const verified = fstatSync(verifiedFd);
+    const executed = rejectSymlink ? lstatSync(path) : statSync(path);
+    return (!rejectSymlink || !executed.isSymbolicLink()) && verified.dev === executed.dev && verified.ino === executed.ino;
+  };
+
+  const verifyInode = (rejectSymlink: boolean): void => {
+    try {
+      if (!matchesVerifiedInode(rejectSymlink)) throw changed();
+    } catch (err) {
+      if (err instanceof Error && err.message === 'keychain helper changed after verification') throw err;
+      throw changed();
+    }
+  };
+
+  // Keep checks through spawn synchronous: no helper runs after a failed check.
+  verifyInode(false);
+  assertKeychainClientAllowed(path, 'helper');
+  const lock = keychainLockForService(service, { lockfPath: seams?.lockfPath });
+  if (expectedSigning) {
+    try {
+      const after = helperSigningState(path);
+      if (!after || after.binaryHash !== expectedSigning.binaryHash || after.identityHash !== expectedSigning.identityHash) throw changed();
+    } catch (err) {
+      if (err instanceof Error && err.message === 'keychain helper changed after verification') throw err;
+      throw changed();
+    }
+  }
+  verifyInode(true);
+
   await new Promise<void>((resolve, reject) => {
     let settled = false;
-    let timeout: ReturnType<typeof setTimeout> | undefined;
-    const child = spawn(path, args, { stdio: ['pipe', 'ignore', 'ignore'] });
-    const fail = (error: Error): void => {
-      if (settled) return;
-      settled = true;
-      if (timeout) clearTimeout(timeout);
-      child.stdin?.end();
-      child.kill();
-      reject(error);
+    let fd3: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+    let stderr: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+    const appendTail = (prior: Buffer<ArrayBufferLike>, chunk: Buffer | string, limit: number): Buffer<ArrayBufferLike> => {
+      const combined = Buffer.concat([prior, Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)]);
+      return combined.length > limit ? combined.subarray(combined.length - limit) : combined;
     };
-    timeout = setTimeout(() => fail(new Error('keychain helper failed')), MACOS_SECURITY_TIMEOUT_MS);
-    child.once('error', () => fail(new Error('keychain helper failed')));
-    child.once('spawn', () => {
-      try {
-        if (verifiedFd !== undefined) {
-          const verified = fstatSync(verifiedFd);
-          const executed = statSync(path);
-          // The child is spawned before this check; Node documents `spawn` as the
-          // successful child-process creation event. Its executable cannot change
-          // afterwards, and stdin remains unopened until this inode check passes.
-          // https://nodejs.org/api/child_process.html#event-spawn
-          if (verified.dev !== executed.dev || verified.ino !== executed.ino) {
-            fail(new Error('keychain helper changed after verification'));
-            return;
-          }
-        }
-        if (expectedSigning) {
-          const after = helperSigningState(path);
-          if (!after || after.binaryHash !== expectedSigning.binaryHash || after.identityHash !== expectedSigning.identityHash) {
-            fail(new Error('keychain helper changed after verification'));
-            return;
-          }
-        }
-        child.stdin?.end(input);
-      } catch {
-        fail(new Error('keychain helper changed after verification'));
-      }
-    });
-    child.once('close', (status) => {
+    const settle = (result: () => void): void => {
       if (settled) return;
       settled = true;
-      if (timeout) clearTimeout(timeout);
-      if (status === 0) resolve();
-      else if (status === 3) reject(Object.assign(new Error('keychain item changed'), { exitCode: 3 }));
-      else if (status === 4) reject(Object.assign(new Error('keychain item not found'), { exitCode: 4 }));
-      else reject(new Error('keychain helper failed'));
-    });
+      result();
+    };
+    let child;
+    try {
+      child = spawn(lock.outerFile, [...lock.outerArgsPrefix, isSet ? 'p' : 'r', KEYCHAIN_UNBOUNDED_DEADLINE, path, ...args], {
+        detached: true,
+        stdio: [isSet ? 'pipe' : 'ignore', 'ignore', 'pipe', 'pipe'],
+        env: keychainClientEnv(),
+      });
+    } catch {
+      reject(new KeychainClientNotStarted(service, 'Keychain wrapper could not be started'));
+      return;
+    }
+    const fd3Pipe = child.stdio[3];
+    fd3Pipe?.on('data', (chunk: Buffer | string) => { fd3 = appendTail(fd3, chunk, 64); });
+    child.stderr?.on('data', (chunk: Buffer | string) => { stderr = appendTail(stderr, chunk, 4096); });
+    child.once('error', () => settle(() => reject(new KeychainClientNotStarted(service, 'Keychain wrapper could not be started'))));
+    if (isSet && child.stdin) {
+      // A busy lock can close stdin before this same-tick write; EPIPE is expected.
+      child.stdin.on('error', () => {});
+      child.stdin.end(input);
+    }
+    child.once('close', (status, signal) => settle(() => {
+      try {
+        const outcome = keychainWrapperOutcome(service, {
+          status,
+          signal,
+          fd3,
+          stderr: stderr.toString('utf8'),
+        }, isSet);
+        if (outcome === 0) resolve();
+        else if (outcome === 3) reject(Object.assign(new Error('keychain item changed'), { exitCode: 3 }));
+        else if (outcome === 4) reject(Object.assign(new Error('keychain item not found'), { exitCode: 4 }));
+        else reject(new Error('keychain helper failed'));
+      } catch (err) { reject(err); }
+    }));
   });
 }
 
@@ -703,13 +743,10 @@ function assertAuthorizationHelper(path: string, dbPath: string, dependencies: K
 }
 
 /**
- * Residual risk (D-B38): the post-spawn check inspects the pathname, so a same-user process
- * that swaps the file before exec and restores it before 'spawn' is not detected. Such a
- * process can already read these items through /usr/bin/security, so this gives it no new access.
- * Verify the opened staged inode, then spawn by path and compare that pathname's
- * inode before the child receives stdin. Node emits `spawn` only after creating the
- * child (https://nodejs.org/api/child_process.html#event-spawn), so a one-way replacement
- * is detected before any secret bytes are written to the replacement process.
+ * Residual risk (D-B38): the staged inode and signature are checked before spawn.
+ * A same-user process can still replace or rewrite the pathname after that final check
+ * and before the lockf wrapper execs it. Such a process already has access to the same
+ * user Keychain; QLB never signals the lockf process or its helper child.
  */
 async function withAuthorizedHelper<T>(
   path: string,
@@ -727,7 +764,7 @@ async function withAuthorizedHelper<T>(
     copyFileSync(path, staged);
     chmodSync(staged, 0o500);
     fd = openSync(staged, 'r');
-    // Keep the pre-verification inode open; it is compared after spawn before stdin.
+    // Keep the pre-verification inode open for the runner's pre-spawn checks.
     const signing = assertAuthorizationHelper(staged, dbPath, dependencies);
     dependencies.afterAuthorizedHelperVerified?.(staged);
     return await action(staged, signing, fd);
