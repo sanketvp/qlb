@@ -167,6 +167,17 @@ describe('qlb switch anthropic command (K5-6)', () => {
     assert.deepEqual(events, []);
   });
 
+  it('switch anthropic --inject usage-5xx anthropic exits 2 before admission', async () => {
+    const events: string[] = [];
+    const command = subject({ bootstrap: async () => { events.push('admission'); } });
+    const run = context();
+    run.ctx.env.QLB_FAULT_INJECTION = '1';
+
+    assert.equal(await command.execute!(['account-b', '--inject', 'usage-5xx', 'anthropic'], run.ctx), 2);
+    assert.deepEqual(events, []);
+    assert.match(run.stderr.join('\n'), /^usage:/);
+  });
+
   it('--inject fail-step 8 rolls back one injected row and emits the injected JSON receipt', async () => {
     const home = mkdtempSync(join(tmpdir(), 'qlb-switch-command-inject-'));
     const run = context(home);

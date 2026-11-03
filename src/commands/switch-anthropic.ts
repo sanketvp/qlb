@@ -193,7 +193,7 @@ export function createSwitchAnthropicCommand(deps: SwitchAnthropicCommandDeps = 
         return 2;
       }
       const parsed = parse(parsedInjection.rest);
-      if (!parsed) return usage(ctx);
+      if (!parsed || (parsedInjection.inject !== null && parsedInjection.inject.kind !== 'fail-step')) return usage(ctx);
 
       const store = (deps.openStore ?? openStore)(ctx.config.dbPath);
       let resources: SwitchResources | undefined;
@@ -224,7 +224,7 @@ export function createSwitchAnthropicCommand(deps: SwitchAnthropicCommandDeps = 
         }
 
         resources = await ensureResources();
-        if (parsedInjection.inject !== null) resources.deps.injectFailStep = parsedInjection.inject.step;
+        if (parsedInjection.inject?.kind === 'fail-step') resources.deps.injectFailStep = parsedInjection.inject.step;
         const result = await (deps.switchClaude ?? switchClaude)(resources.deps, {
           to: parsed.accountId,
           trigger: 'manual',
