@@ -293,6 +293,23 @@ describe('Claude switch Phase A (K5-4)', () => {
     assert.equal('active' in await prepareClaudeSwitch(subject.deps, manual), true);
     assert.deepEqual(subject.backend.listServices().sort(), before);
   });
+
+  it('a CLAUDE_CONFIG_DIR supplied only through deps.live.env selects that config path and Keychain service in Phase A', async () => {
+    const subject = await fixture();
+    const liveEnv = { ...ENV, CLAUDE_CONFIG_DIR: '/fixture/live-env-config' };
+    const defaultPaths = claudePaths({ home: HOME, env: ENV });
+    const livePaths = claudePaths({ home: HOME, env: liveEnv });
+    await subject.backend.delete(defaultPaths.keychainService, 'fixture-user');
+    await subject.backend.set(livePaths.keychainService, 'fixture-user', credential('a'));
+    subject.deps.live = { backend: subject.backend, account: 'fixture-user', env: liveEnv };
+    let configPath: string | null = null;
+    subject.deps.readConfig = (path) => { configPath = path; return subject.config; };
+
+    const result = await prepareClaudeSwitch(subject.deps, manual);
+
+    assert.equal('active' in result, true);
+    assert.equal(configPath, livePaths.globalConfigPath);
+  });
 });
 
 async function transactionFixture(options: { live?: string; target?: string; targetConfig?: unknown } = {}) {

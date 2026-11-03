@@ -186,7 +186,7 @@ export async function prepareClaudeSwitch(deps: ClaudeSwitchDeps, input: SwitchC
   const outgoingSlot = deps.slots.getSlot(active); const targetSlot = deps.slots.getSlot(input.to);
   if (outgoingSlot === null) return { kind: 'refused', reason: 'active-login-unset' };
   if (targetSlot === null) return { kind: 'refused', reason: 'target-missing' };
-  const paths = deps.live.paths ?? claudePaths({ home: deps.home, env: deps.env }); const live = deps.live.paths ? deps.live : { ...deps.live, paths };
+  const paths = deps.live.paths ?? claudePaths({ home: deps.live.home ?? deps.home, env: deps.live.env ?? deps.env }); const live = deps.live.paths ? deps.live : { ...deps.live, paths };
   let config: JsonObject; try { config = deps.readConfig(paths.globalConfigPath); } catch { return { kind: 'failed', reason: 'claude:config-file' }; }
   let liveCredential: string; try { liveCredential = await readLiveClaudeCredentials(live); } catch (error) { return isCredentialNotFound(error) ? { kind: 'refused', reason: 'live-credential-empty' } : { kind: 'refused', reason: 'live-credential-unreadable' }; }
   if (!liveCredential) return { kind: 'refused', reason: 'live-credential-empty' };
@@ -429,7 +429,7 @@ async function rollbackClaudeSwitch(
 /** K5-5's transaction, with K8-2 rollback for pre-commit failures. */
 async function switchClaudeAttempt(deps: ClaudeSwitchDeps, input: SwitchClaudeInput, retriedPhaseA: boolean): Promise<ClaudeSwitchResult> {
   const attempt = deps.attempt;
-  const paths = deps.live.paths ?? claudePaths({ home: deps.home, env: deps.env });
+  const paths = deps.live.paths ?? claudePaths({ home: deps.live.home ?? deps.home, env: deps.live.env ?? deps.env });
   const live = deps.live.paths ? deps.live : { ...deps.live, paths };
   const options = journalOptions(deps, paths);
   const before = readClaudeSwitchJournal(options);
