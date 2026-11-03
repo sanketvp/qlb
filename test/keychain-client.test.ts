@@ -531,6 +531,57 @@ describe('S2r write outcome classification', () => {
     });
   });
 
+  it('classifies EPIPE from an exited wrapper without reporting a write success', () => {
+    const payload = 'ab'.repeat(8);
+    const epipe = () => Object.assign(new Error('write EPIPE'), { code: 'EPIPE' });
+
+    assert.throws(() => keychainWrapperOutcome('svc-no-sentinel', { error: epipe(), status: 0, signal: null, stderr: '' }, true), (err: unknown) => {
+      const error = err as Error & { code?: unknown; writeOutcome?: unknown };
+      assert.equal(error.code, 'EQLBKEYCHAINWRAPPERNOPROOF');
+      assert.equal(error.writeOutcome, 'unknown');
+      assert.doesNotMatch(error.message, new RegExp(payload));
+      return true;
+    });
+    assert.throws(() => keychainWrapperOutcome('svc-started', { error: epipe(), status: 0, signal: null, fd3: Buffer.from('qlb-keychain-client-started\n'), stderr: '' }, true), (err: unknown) => {
+      const error = err as Error & { code?: unknown; writeOutcome?: unknown };
+      assert.equal(error.code, 'EQLBKEYCHAINWRAPPERNOPROOF');
+      assert.equal(error.writeOutcome, 'unknown');
+      return true;
+    });
+    assert.throws(() => keychainWrapperOutcome('svc-waiting', { error: epipe(), status: 75, signal: null, stderr: '' }, true), KeychainRequestStillWaiting);
+
+    const noStatus = epipe();
+    assert.throws(() => keychainWrapperOutcome('svc-no-status', { error: noStatus, status: null, signal: null, stderr: '' }, true), (err: unknown) => {
+      assert.strictEqual(err, noStatus);
+      assert.equal((err as { writeOutcome?: unknown }).writeOutcome, 'unknown');
+      return true;
+    });
+    const nonEpipe = Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' });
+    assert.throws(() => keychainWrapperOutcome('svc-enoent', { error: nonEpipe, status: 0, signal: null, stderr: '' }, true), (err: unknown) => {
+      assert.strictEqual(err, nonEpipe);
+      assert.equal((err as { writeOutcome?: unknown }).writeOutcome, 'unknown');
+      return true;
+    });
+  });
+
+  it('turns a large write whose lockf exits before reading stdin into no-proof', () => {
+    const s = state();
+    withState(s, () => {
+      const client = fake(s, 'echo unexpected > "$d/epipe-client-ran"');
+      const exitingLockf = fake(s, 'exit 0', 'exiting-lockf');
+      const secretHex = 'ab'.repeat(100_000);
+      const write = keychainRequestFromArgv('security', client, ['add-generic-password', '-a', 'a', '-s', 'svc-epipe', '-X', secretHex], { timeoutMs: 2_000, lockfPath: exitingLockf });
+      assert.throws(() => runKeychainClientSync(write), (err: unknown) => {
+        const error = err as Error & { code?: unknown; writeOutcome?: unknown };
+        assert.equal(error.code, 'EQLBKEYCHAINWRAPPERNOPROOF');
+        assert.equal(error.writeOutcome, 'unknown');
+        assert.notEqual(error.code, 'EPIPE');
+        return true;
+      });
+      assert.equal(existsSync(join(s.dir, 'epipe-client-ran')), false);
+    });
+  });
+
   it('labels signalled, spawn-error, and no-proof write outcomes unknown but never labels reads', () => {
     const started = Buffer.from('qlb-keychain-client-started\n');
     const outcomes = [

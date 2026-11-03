@@ -432,12 +432,15 @@ export function keychainWrapperOutcome(
   if (result.status === 125 && result.stderr.includes(DEADLINE_MARKER)) {
     throw new KeychainClientNotStarted(service, 'client was not started before the deadline');
   }
-  // A busy lock has no inner shell, so an EPIPE from its already-closed stdin
-  // is not evidence that a write client ran.
+  // A busy lock has no inner shell, so its already-closed stdin EPIPE still
+  // takes the status-75 waiting classification rather than proving a write client ran.
   if (result.status === 75 && !started) throw new KeychainRequestStillWaiting(service);
-  if (result.error) throw (isWrite ? Object.assign(result.error, { writeOutcome: 'unknown' }) : result.error);
+  const exitedWithEpipe = (result.error as NodeJS.ErrnoException | undefined)?.code === 'EPIPE' && result.status !== null;
+  // An EPIPE after a wrapper exit only proves its stdin closed; classify that wrapper result instead.
+  if (result.error && !exitedWithEpipe) throw (isWrite ? Object.assign(result.error, { writeOutcome: 'unknown' }) : result.error);
   if (result.signal && result.status === null) throw (isWrite ? Object.assign(resultError('EQLBKEYCHAINWRAPPERSIGNALLED', { signal: result.signal }), { writeOutcome: 'unknown' }) : resultError('EQLBKEYCHAINWRAPPERSIGNALLED', { signal: result.signal }));
   if (result.status === null || !started) throw (isWrite ? Object.assign(resultError('EQLBKEYCHAINWRAPPERNOPROOF', { status: result.status }), { writeOutcome: 'unknown' }) : resultError('EQLBKEYCHAINWRAPPERNOPROOF', { status: result.status }));
+  if (exitedWithEpipe && isWrite) throw Object.assign(resultError('EQLBKEYCHAINWRAPPERNOPROOF', { status: result.status }), { writeOutcome: 'unknown' });
   return result.status;
 }
 
