@@ -131,8 +131,8 @@ export function freshAnthropicAccounts(slots: ReturnType<ClaudeSlots['listSlots'
 
 /**
  * Poll the scheduled active Claude slot and at most one scheduled inactive slot.
- * A due failure records unknown state but deliberately leaves the prior snapshot
- * intact for the policy's 180-second serving window.
+ * A due failure records unknown state and leaves the prior snapshot subject to
+ * the resulting status's serving policy.
  */
 export async function pollAnthropic(deps: AnthropicPollDeps): Promise<AutoswitchAccount[]> {
   const nowS = deps.now();
@@ -164,12 +164,10 @@ export async function pollAnthropic(deps: AnthropicPollDeps): Promise<Autoswitch
     const previous = readUsage(deps.store.getAllSnapshots(active.accountId));
     if (!current) record(active.accountId, previous, null, undefined, 'slot-unreadable', true);
     else {
-      let live = current.credential;
-      let creds = live;
+      let creds = current.credential;
       let degraded = false;
       try {
-        live = await readLiveClaudeCredentials({ ...deps.fetchActiveDeps.live, env: deps.fetchActiveDeps.live.env ?? deps.fetchActiveDeps.env });
-        creds = live;
+        creds = await readLiveClaudeCredentials({ ...deps.fetchActiveDeps.live, env: deps.fetchActiveDeps.live.env ?? deps.fetchActiveDeps.env });
       } catch {
         // The slot is only a degraded fallback; do not run the resync hook on it.
         degraded = true;
@@ -184,9 +182,10 @@ export async function pollAnthropic(deps: AnthropicPollDeps): Promise<Autoswitch
         return freshAnthropicAccounts(deps.slots.listSlots(), deps.store, pollingState(deps.slots.listSlots(), deps.store.listUsagePolls(PROVIDER)), nowS, models, unknownThisTick);
       }
       if (result.usage && typeof result.usage === 'object' && 'buckets' in result.usage) {
-        const lineage = credentialLineage(live);
+        const lineage = result.servedLineage ?? null;
         // The accepted-usage hook can adopt a same-account live rotation, so
-        // read the slot after it returns rather than trusting the pre-fetch row.
+        // read the slot after it returns and attribute the credential that
+        // actually served usage rather than the pre-fetch live read.
         const activeAfterFetch = deps.slots.getSlot(active.accountId);
         const attributed = (lineage !== null && (lineage === activeAfterFetch?.fingerprint || lineage === activeAfterFetch?.prevFingerprint))
           || (lineage !== null && deps.fetchActiveDeps.verdicts.get(active.accountId, active.email ?? '', lineage, active.orgUuid ?? '')?.match === true);
