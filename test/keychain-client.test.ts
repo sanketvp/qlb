@@ -11,14 +11,17 @@ import { portableLockf } from './support/portable-lockf';
 
 import {
   KEYCHAIN_LOCKF_BIN,
+  KEYCHAIN_UNBOUNDED_DEADLINE,
   KEYCHAIN_WAIT_SCRIPT,
   KeychainClientDisabledInTests,
   KeychainClientNotStarted,
   KeychainRequestStillWaiting,
   isKeychainServiceBusy,
+  keychainClientEnv,
   keychainClientExec,
   keychainLockForService,
   keychainRequestFromArgv,
+  keychainWrapperOutcome,
   keychainWaitKey,
   runKeychainClientSync,
   validateRequest,
@@ -46,9 +49,20 @@ function state(): { home: string; dir: string; lockfPath: string } {
 
 function withState<T>(s: ReturnType<typeof state>, fn: () => T): T {
   const old = { QLB_TEST_MODE: process.env.QLB_TEST_MODE, QLB_HOME: process.env.QLB_HOME, HOME: process.env.HOME };
-  Object.assign(process.env, { QLB_TEST_MODE: '1', QLB_HOME: s.home, HOME: s.home });
-  try { return fn(); } finally {
+  const restore = () => {
     for (const [key, value] of Object.entries(old)) value === undefined ? delete process.env[key] : process.env[key] = value;
+  };
+  Object.assign(process.env, { QLB_TEST_MODE: '1', QLB_HOME: s.home, HOME: s.home });
+  try {
+    const value = fn();
+    if (value && typeof (value as { finally?: unknown }).finally === 'function') {
+      return (value as unknown as Promise<unknown>).finally(restore) as T;
+    }
+    restore();
+    return value;
+  } catch (err) {
+    restore();
+    throw err;
   }
 }
 
@@ -85,6 +99,26 @@ function killOwn(path: string): void {
   if (existsSync(path)) {
     try { process.kill(Number(readFileSync(path, 'utf8')), 'SIGKILL'); } catch { /* process already exited */ }
   }
+}
+
+function spawnPassThrough(lock: ReturnType<typeof keychainLockForService>, file: string, args: string[], input: string): Promise<{ status: number | null; signal: NodeJS.Signals | null; fd3: Buffer; stderr: string }> {
+  const child = spawn(lock.outerFile, [...lock.outerArgsPrefix, 'p', KEYCHAIN_UNBOUNDED_DEADLINE, file, ...args], {
+    detached: true,
+    stdio: ['pipe', 'ignore', 'pipe', 'pipe'],
+    env: keychainClientEnv(),
+  });
+  const fd3: Buffer[] = [];
+  const stderr: Buffer[] = [];
+  child.stdio[3]!.on('data', (chunk: Buffer) => fd3.push(chunk));
+  child.stderr!.on('data', (chunk: Buffer) => stderr.push(chunk));
+  child.stdin!.on('error', () => {});
+  child.stdin!.end(input);
+  return new Promise((resolve) => child.once('close', (status, signal) => resolve({
+    status,
+    signal,
+    fd3: Buffer.concat(fd3),
+    stderr: Buffer.concat(stderr).toString('utf8'),
+  })));
 }
 
 
@@ -471,6 +505,97 @@ sleep 20`);
         assert.throws(() => runKeychainClientSync(invalid), (err: unknown) => err instanceof KeychainClientNotStarted && /dump-keychain takes no arguments/.test((err as Error).message));
       }
       assert.equal(existsSync(join(s.dir, 'dump-with-args-runs')), false);
+    });
+  });
+});
+
+describe('S4a async pass-through lock shape', () => {
+  it('(a,e) passes helper stdin through mode p without exposing it in wrapper argv', async () => {
+    const s = state();
+    await withState(s, async () => {
+      const marker = `pass-through-${'left'}-${'right'}`;
+      const client = fake(s, `ps -o args= -p "$PPID" > "$d/inner-args"
+outer=$(ps -o ppid= -p "$PPID" | tr -d " ")
+ps -o args= -p "$outer" > "$d/outer-args"
+cat > "$d/stdin-copy"`);
+      const outcome = await spawnPassThrough(keychainLockForService('svc-p', { lockfPath: s.lockfPath }), client, ['set', '--if-sha256', 'd', 'svc-p', 'a'], `${marker.slice(0, 12)}${marker.slice(12)}`);
+      assert.equal(keychainWrapperOutcome('svc-p', outcome, true), 0);
+      assert.equal(readFileSync(join(s.dir, 'stdin-copy'), 'utf8'), marker);
+      assert.doesNotMatch(readFileSync(join(s.dir, 'inner-args'), 'utf8'), new RegExp(marker));
+      assert.doesNotMatch(readFileSync(join(s.dir, 'outer-args'), 'utf8'), new RegExp(marker));
+    });
+  });
+
+  it('(b) rejects a second pass-through client while the first lock holder is alive', { timeout: 30_000 }, async () => {
+    const s = state();
+    await withState(s, async () => {
+      const holder = fake(s, 'echo $$ > "$d/pass-pid"\ncat > "$d/first-input"\necho first >> "$d/first-runs"\nsleep 8', 'pass-holder');
+      const second = fake(s, 'echo second >> "$d/second-runs"', 'pass-second');
+      const first = spawnPassThrough(keychainLockForService('svc-p-b', { lockfPath: s.lockfPath }), holder, ['set', '--if-sha256', 'd', 'svc-p-b', 'a'], 'first');
+      waitFor(join(s.dir, 'pass-pid'));
+      const began = Date.now();
+      const duplicate = await spawnPassThrough(keychainLockForService('svc-p-b', { lockfPath: s.lockfPath }), second, ['set', '--if-sha256', 'd', 'svc-p-b', 'a'], 'second');
+      assert.ok(Date.now() - began < 2_000);
+      assert.throws(() => keychainWrapperOutcome('svc-p-b', duplicate, true), KeychainRequestStillWaiting);
+      assert.equal(existsSync(join(s.dir, 'second-runs')), false);
+      assert.equal(keychainWrapperOutcome('svc-p-b', await first, true), 0);
+    });
+  });
+
+  it('(c,d,f) classifies a busy large sync write before EPIPE, keeps helper writes async-only, and gates lockf overrides', { timeout: 30_000 }, () => {
+    const s = state();
+    withState(s, () => {
+      const holder = fake(s, 'echo $$ > "$d/write-pid"\nsleep 8', 'busy-holder');
+      const writer = fake(s, 'echo unexpected > "$d/busy-writer-ran"', 'busy-writer');
+      try {
+        const hold = request(s, holder, 'svc-w', 300);
+        assert.throws(() => runKeychainClientSync(hold), (err: unknown) => (err as { code?: unknown }).code === 'ETIMEDOUT');
+        waitFor(join(s.dir, 'write-pid'));
+        const began = Date.now();
+        const write = keychainRequestFromArgv('security', writer, ['add-generic-password', '-a', 'a', '-s', 'svc-w', '-X', 'ab'.repeat(100_000)], { timeoutMs: 2_000, lockfPath: s.lockfPath });
+        assert.throws(() => runKeychainClientSync(write), (err: unknown) => {
+          assert.ok(err instanceof KeychainRequestStillWaiting);
+          assert.equal((err as { writeOutcome?: unknown }).writeOutcome, undefined);
+          return true;
+        });
+        assert.ok(Date.now() - began < 2_000);
+        assert.equal(existsSync(join(s.dir, 'busy-writer-ran')), false);
+        assert.throws(() => runKeychainClientSync({ kind: 'helper', file: writer, args: ['set', 'svc-w', 'a'], item: { service: 'svc-w', account: 'a' }, timeoutMs: 100, encoding: 'utf8' }), (err: unknown) => err instanceof KeychainClientNotStarted && /helper writes require the async runner/.test((err as Error).message));
+        assert.throws(() => keychainLockForService('s', { lockfPath: '/usr/local/bin/lockf' }), (err: unknown) => (err as { code?: unknown }).code === 'EQLBKEYCHAINNOTSTARTED');
+        waitForFree(s, 'svc-w', 20_000);
+      } finally {
+        // The fake has its own bounded lifetime; this only avoids retaining it if an assertion fails.
+        killOwn(join(s.dir, 'write-pid'));
+      }
+    });
+  });
+
+  it('(5) converts a regular-file or broken-symlink lock directory to not-started', () => {
+    for (const kind of ['file', 'broken-link'] as const) {
+      const s = state();
+      withState(s, () => {
+        mkdirSync(join(s.home, '.qlb'), { mode: 0o700 });
+        const directory = join(s.home, '.qlb', 'keychain-locks');
+        if (kind === 'file') writeFileSync(directory, 'not a directory');
+        else symlinkSync(join(s.dir, 'missing-lock-directory'), directory);
+        assert.throws(() => keychainLockForService('svc-dir', { lockfPath: s.lockfPath }), (err: unknown) => {
+          assert.equal((err as Error).message, 'Keychain request for svc-dir was not started: lock directory is not private');
+          return true;
+        });
+      });
+    }
+  });
+
+  it('(5) converts a symlinked lock file to not-started through keychainLockForService', () => {
+    const s = state();
+    withState(s, () => {
+      const directory = join(s.home, '.qlb', 'keychain-locks');
+      mkdirSync(directory, { recursive: true, mode: 0o700 });
+      symlinkSync('/dev/null', lockPath(s.home, 'svc-link-file'));
+      assert.throws(() => keychainLockForService('svc-link-file', { lockfPath: s.lockfPath }), (err: unknown) => {
+        assert.equal((err as Error).message, 'Keychain request for svc-link-file was not started: lock file could not be opened');
+        return true;
+      });
     });
   });
 });
