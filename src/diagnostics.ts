@@ -62,6 +62,7 @@ import { piReleaseAppDir } from './pi-deploy';
 import { probeHostEnvironment, type HostCommandRunner } from './checks/hosts-env';
 import { autoAgentCheck } from './checks/auto-agent';
 import { autoBreakerCheck } from './checks/auto-breaker';
+import { autoParkedCheck } from './checks/auto-parked';
 import { cswapAgentCheck } from './checks/cswap-agent';
 import { cswapProcessesCheck } from './checks/cswap-processes';
 import type { CswapAgentStatus } from './cswap-agent';
@@ -807,6 +808,7 @@ export async function doctorQlb(
     claudeConfigFileCheck(),
     claudeLocksCheck(),
     autoBreakerCheck(config.dbPath, 'anthropic', lifecycle),
+    autoParkedCheck(config.dbPath, lifecycle, options.now?.() ?? Date.now()),
     autoAgentCheck(config.dbPath, lifecycle, options.now?.() ?? Date.now()),
     cswapAgentCheck(lifecycle, { status: options.cswapAgentStatus }),
     cswapProcessesCheck(lifecycle, { list: options.cswapProcesses, env: process.env }),
