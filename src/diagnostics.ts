@@ -20,7 +20,7 @@ import {
   securityTimeoutError,
   type ExecFileSyncFn,
 } from './credential-backends';
-import { isKeychainClientNotStarted, isKeychainStillWaiting } from './keychain-client';
+import { isKeychainClientNotStarted, isKeychainStillWaiting, KeychainClientDisabledInTests } from './keychain-client';
 import {
   defaultCommandExists,
   defaultKeychainHelperPath,
@@ -362,7 +362,7 @@ export function inspectProviders(
       ? unsupportedOpenRouterService(config.openrouterKeychainService)
       : openrouterOk
         ? found('openrouter', openrouterSource, CONFIG_ENV_VARS.openrouterKeychainService, `export ${CONFIG_ENV_VARS.openrouterKeychainService}=pi-openrouter`)
-        : isKeychainStillWaiting(openrouterKeychainError) || isKeychainClientNotStarted(openrouterKeychainError)
+        : isKeychainStillWaiting(openrouterKeychainError) || isKeychainClientNotStarted(openrouterKeychainError) || openrouterKeychainError instanceof KeychainClientDisabledInTests
           ? failedFixedOpenRouter(openrouterSource, openrouterKeychainError)
           : openrouterTimedOut
             ? timedOutFixedOpenRouter(openrouterSource)

@@ -357,6 +357,8 @@ export function readNativeOpenRouterKey(
         ['find-generic-password', '-s', service, '-w'],
         {
           encoding: 'utf8',
+          // Honoured only by injected executors; the default keychain-client
+          // runner ignores `stdio`, pipes stderr, and puts it in a failure's message.
           stdio: ['ignore', 'pipe', 'ignore'],
           timeout: MACOS_SECURITY_TIMEOUT_MS,
           keychainKind: 'security',
@@ -367,9 +369,9 @@ export function readNativeOpenRouterKey(
     } catch (err) {
       if (isKeychainStillWaiting(err) || isKeychainClientNotStarted(err)) throw err;
       if (isSecurityTimeout(err)) throw securityTimeoutError('find-generic-password');
-      // `security` uses errSecItemNotFound (44) for a missing item. stderr is
-      // intentionally discarded here, so its stable wording is only a
-      // secondary signal; a denial or other failure must remain operational.
+      // `security` uses errSecItemNotFound (44) for a missing item. stderr wording
+      // (in the runner's error message, or absent with an injected executor) is
+      // only a secondary signal; a denial or other failure must remain operational.
       if (!isCredentialNotFound(err)) throw err;
     }
     throw new NativeOpenRouterKeyNotFoundError(service);

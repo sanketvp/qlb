@@ -414,6 +414,15 @@ function resultError(code: string, props: Record<string, unknown>): Error {
   return Object.assign(new Error('Keychain wrapper did not prove client exit'), { code, ...props });
 }
 
+/** Commands that can change Keychain state and therefore need an unknown outcome on loss of proof. */
+function isWriteRequest(request: KeychainRequest): boolean {
+  return (request.kind === 'security' && (
+    request.args[0] === 'add-generic-password' || request.args[0] === 'delete-generic-password'
+  )) || (request.kind === 'helper' && (
+    request.args[0] === 'delete' || request.args[0] === 'set'
+  ));
+}
+
 export function keychainWrapperOutcome(
   service: string,
   result: { error?: Error; status: number | null; signal: NodeJS.Signals | null; fd3?: Buffer; stderr: string },
@@ -472,7 +481,7 @@ export function runKeychainClientSync(request: KeychainRequest): string | Buffer
   } as Parameters<typeof spawnSync>[2]);
   const fd3 = Buffer.isBuffer(result.output?.[3]) ? result.output[3] : undefined;
   const stderr = Buffer.isBuffer(result.stderr) ? result.stderr.toString('utf8') : String(result.stderr ?? '');
-  const status = keychainWrapperOutcome(service, { error: result.error, status: result.status, signal: result.signal, fd3, stderr }, request.secretHex !== undefined);
+  const status = keychainWrapperOutcome(service, { error: result.error, status: result.status, signal: result.signal, fd3, stderr }, isWriteRequest(request));
   if (status === 0) {
     const stdout = Buffer.isBuffer(result.stdout) ? result.stdout : Buffer.from(result.stdout ?? '');
     if (request.encoding === 'buffer') return stdout;

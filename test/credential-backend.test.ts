@@ -32,6 +32,7 @@ import {
   type ExecFileSyncFn,
 } from '../src/keychain';
 import {
+  KeychainClientDisabledInTests,
   KeychainRequestStillWaiting,
   isKeychainStillWaiting,
   keychainRequestFromArgv,
@@ -218,6 +219,7 @@ describe('MacosKeychainBackend no-kill wiring', () => {
           return true;
         });
         assert.ok(Date.now() - started >= 4_500);
+        const waitingStarted = Date.now();
         assert.throws(() => backend.getSync('svc-d', 'a2'), (err: unknown) => {
           const error = err as Error & { reason?: unknown };
           assert.match(error.message, /is still waiting for an answer/);
@@ -226,6 +228,7 @@ describe('MacosKeychainBackend no-kill wiring', () => {
           assert.equal(error.reason, 'still-waiting');
           return true;
         });
+        assert.ok(Date.now() - waitingStarted < 2_000);
         assert.throws(() => backend.setSync('svc-d', 'a3', '{}'), (err: unknown) => {
           assert.equal((err as { writeOutcome?: unknown }).writeOutcome, 'not-started');
           assert.match((err as Error).message, /is still waiting for an answer/);
@@ -280,6 +283,48 @@ describe('MacosKeychainBackend no-kill wiring', () => {
         assert.equal(error.writeOutcome, 'unknown');
         return true;
       });
+    });
+  });
+
+  it('keeps a set payload out of wrapper argv while delivering it to the security client', () => {
+    withNoKillState((state) => {
+      const fake = noKillFake(state.dir, `printf '%s\\n' "$@" > "$d/set-argv"
+ps -o args= -p "$PPID" > "$d/set-parent-args"
+outer=$(ps -o ppid= -p "$PPID" | tr -d ' ')
+ps -o args= -p "$outer" > "$d/set-grandparent-args"`, 'set-argv-fake');
+      const backend = new MacosKeychainBackend({ execFileSync: noKillExecutor(fake, state.lockfPath) });
+      const value = '{}';
+      const valueHex = Buffer.from(value, 'utf8').toString('hex');
+      backend.setSync('svc-argv', 'acct', value);
+      const argv = readFileSync(join(state.dir, 'set-argv'), 'utf8').trim().split('\n');
+      assert.deepEqual(argv.slice(-2), ['-X', valueHex]);
+      assert.doesNotMatch(readFileSync(join(state.dir, 'set-parent-args'), 'utf8'), new RegExp(valueHex));
+      assert.doesNotMatch(readFileSync(join(state.dir, 'set-grandparent-args'), 'utf8'), new RegExp(valueHex));
+    });
+  });
+
+  it('treats disabled clients as pre-spawn and does not dereference non-object executor errors', () => {
+    withNoKillState(() => {
+      const disabled = new MacosKeychainBackend({
+        execFileSync: markFakeExecutor(() => { throw new KeychainClientDisabledInTests(); }),
+      });
+      assert.throws(() => disabled.setSync('svc-disabled', 'a', '{}'), (err: unknown) => {
+        assert.ok(err instanceof KeychainClientDisabledInTests);
+        assert.equal((err as { writeOutcome?: unknown }).writeOutcome, 'not-started');
+        return true;
+      });
+
+      let calls = 0;
+      const nullOnUpdate = new MacosKeychainBackend({
+        execFileSync: markFakeExecutor(() => {
+          calls += 1;
+          throw calls === 1 ? { status: 45 } : null;
+        }),
+      });
+      assert.throws(
+        () => nullOnUpdate.setSync('svc-null', 'a', '{}'),
+        (err: unknown) => err instanceof Error && err.message === 'keychain set failed for service=svc-null account=a',
+      );
     });
   });
 
