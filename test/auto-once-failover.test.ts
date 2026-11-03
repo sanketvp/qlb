@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, mkdirSync, readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
 import { buildUsageRequest } from '../src/anthropic-oauth';
-import { AUTO_BINDINGS, autoReconcileStillTheSameProcess, productionRequest, runAuto } from '../src/auto';
+import { AUTO_BINDINGS, anthropicModelScope, autoReconcileStillTheSameProcess, productionRequest, runAuto } from '../src/auto';
 import { anthropicTick, type AnthropicTickResult } from '../src/auto/anthropic';
 import { claudePaths } from '../src/cc-paths';
 import { type ClaudeSwitchDeps } from '../src/cc-switch';
@@ -15,6 +15,7 @@ import { SqliteClaudeSlotRepository, type ClaudeSlot } from '../src/cc-slots';
 import { defaultConfig } from '../src/config';
 import { MockKeychain } from '../src/keychain';
 import { reconcileClaudeSwitch } from '../src/journal';
+import { beginCutover, transition } from '../src/lifecycle';
 import { openStore, openStoreConnection } from '../src/store';
 
 const decision = { kind: 'stay', reason: 'unknown', unhealthyTicks: 0 } as const;
@@ -33,6 +34,48 @@ function liveBinding(overrides: Partial<{
     tick: overrides.tick ?? (async () => ({ decision })),
     writes,
   };
+}
+
+const AUTO_NOW = 1_000_000;
+
+function weeklyUsageFixture(fablePct: number, modelConfig: string | null = null) {
+  const root = mkdtempSync(join(tmpdir(), 'qlb-auto-model-scope-'));
+  const home = join(root, 'home');
+  const config = defaultConfig(home);
+  const store = openStore(config.dbPath);
+  beginCutover(store, 1);
+  assert.equal(transition(store, 'cutover', 2).ok, true);
+  const slots: ClaudeSlot[] = ['active', 'next'].map((accountId, index) => ({
+    accountId, slotNum: index + 1, email: null, alias: null, orgUuid: null, configJson: '{}', fingerprint: null,
+    prevFingerprint: null, threshold: null, dead: false, deadReason: null, deadAt: null, healedAt: null,
+    addedAt: AUTO_NOW, lastActiveAt: null, source: 'fixture', archivedAt: null,
+  }));
+  const repository = SqliteClaudeSlotRepository.open(config.dbPath);
+  try { for (const slot of slots) repository.createSlot(slot); } finally { repository.close(); }
+  store.setActiveLogin('anthropic', 'active', 'fixture', AUTO_NOW);
+  const fetchedAt = Date.now();
+  for (const [accountId, pct] of [['active', fablePct], ['next', 10]] as const) {
+    store.upsertSnapshot(accountId, '7d', { usedPct: accountId === 'active' ? 85 : 10, fetchedAt, source: 'poll', confidence: 'authoritative' });
+    store.upsertSnapshot(accountId, '7d:Fable', { usedPct: pct, fetchedAt, source: 'poll', confidence: 'authoritative' });
+  }
+  if (modelConfig !== null) store.setConfig('auto.anthropic.models', modelConfig);
+  return { root, home, config, store, slots };
+}
+
+async function dryRunCli(home: string): Promise<{ code: number | null; stdout: string; stderr: string }> {
+  const child = spawn(process.execPath, [join(__dirname, '..', 'src', 'cli.js'), 'auto', '--once', '--dry-run', '--json'], {
+    env: { QLB_TEST_MODE: '1', QLB_HOME: home, HOME: home }, stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  return new Promise((resolve, reject) => {
+    let stdout = '';
+    let stderr = '';
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk: string) => { stdout += chunk; });
+    child.stderr.on('data', (chunk: string) => { stderr += chunk; });
+    child.on('error', reject);
+    child.on('exit', (code) => resolve({ code, stdout, stderr }));
+  });
 }
 
 function productionUsageResponse(retryAfter: string) {
@@ -96,6 +139,77 @@ function signals() {
 }
 
 describe('auto once failover (G11)', () => {
+  it('the live binding counts a 7d:Fable window over threshold and proposes a proactive switch', async () => {
+    const fixture = weeklyUsageFixture(92);
+    try {
+      const live = await anthropicTick({
+        store: fixture.store, slots: { listSlots: () => fixture.slots } as unknown as import('../src/cc-slots').ClaudeSlots,
+        now: () => AUTO_NOW, models: anthropicModelScope(fixture.store), dryRun: true,
+      });
+      assert.deepEqual(live.decision, {
+        kind: 'switch', targetId: 'next', reason: 'proactive', unhealthyTicks: 0, parkedUntilMs: undefined,
+        leftHeadroom: 8, leftRecoveryAtMs: null, leftTrigger: 'proactive',
+      });
+      fixture.store.close();
+      const cli = await dryRunCli(fixture.home);
+      assert.equal(cli.code, 0, cli.stderr);
+      const receipt = JSON.parse(cli.stdout) as { decisions: Array<{ kind: string; reason: string }> };
+      assert.equal(receipt.decisions[0]?.kind, 'switch');
+      assert.equal(receipt.decisions[0]?.reason, 'proactive');
+    } finally {
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it('a 7d:Fable window at 100% is at-limit', async () => {
+    const fixture = weeklyUsageFixture(100);
+    try {
+      const result = await anthropicTick({
+        store: fixture.store, slots: { listSlots: () => fixture.slots } as unknown as import('../src/cc-slots').ClaudeSlots,
+        now: () => AUTO_NOW, models: anthropicModelScope(fixture.store), dryRun: true,
+      });
+      assert.equal(result.decision.kind, 'switch');
+      assert.equal(result.decision.reason, 'at-limit');
+    } finally {
+      fixture.store.close();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it('auto.anthropic.models=opus excludes 7d:Fable', async () => {
+    const fixture = weeklyUsageFixture(92, ' OpUs ');
+    try {
+      assert.deepEqual(anthropicModelScope(fixture.store), ['opus']);
+      assert.deepEqual(anthropicModelScope({ getConfig: () => 'opus,,fable' }), ['all']);
+      const result = await anthropicTick({
+        store: fixture.store, slots: { listSlots: () => fixture.slots } as unknown as import('../src/cc-slots').ClaudeSlots,
+        now: () => AUTO_NOW, models: anthropicModelScope(fixture.store), dryRun: true,
+      });
+      assert.deepEqual(result.decision, { kind: 'stay', reason: 'below-threshold', unhealthyTicks: 0 });
+    } finally {
+      fixture.store.close();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it('dry-run uses the same model scope as the live tick', async () => {
+    const fixture = weeklyUsageFixture(92, ' fAbLe ');
+    try {
+      const live = await anthropicTick({
+        store: fixture.store, slots: { listSlots: () => fixture.slots } as unknown as import('../src/cc-slots').ClaudeSlots,
+        now: () => AUTO_NOW, models: anthropicModelScope(fixture.store), dryRun: true,
+      });
+      fixture.store.close();
+      const dry = await runAuto({ once: true, dryRun: true }, {
+        config: fixture.config, home: fixture.home,
+        env: { QLB_TEST_MODE: '1', QLB_HOME: fixture.home, HOME: fixture.home }, now: () => AUTO_NOW, log: () => {},
+      });
+      assert.deepEqual(dry.decisions, [live.decision]);
+    } finally {
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+
   it('a live C-swap process stays', async () => {
     const binding = liveBinding({
       reconcile: async () => { throw new Error('reconcile must not run'); },
