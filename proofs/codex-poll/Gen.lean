@@ -18,9 +18,10 @@ private def stateJson (state : PollState) : String :=
   ",\"readings\":" ++ readingsJson state.readings ++ ",\"lastStatus\":\"" ++ escape state.lastStatus ++
   "\",\"lastAttemptAt\":" ++ toString state.lastAttemptAt ++ "}"
 
+/-- Held refresh cases alternate between the 60-second floor and a longer plan. -/
 private def r1Case (index : Nat) : String :=
   let now := 1_700_000_000 + index * 17
-  let interval := if index % 2 = 0 then 15 + index % 45 else 61 + index % 700
+  let interval := if index % 20 = 0 then 15 + index % 45 else 61 + index % 700
   if index % 10 = 0 then
     let expected := leaseForHeld now interval
     "{\"rule\":\"r1\",\"input\":{\"kind\":\"held\",\"now\":" ++ toString now ++
@@ -43,9 +44,10 @@ private def r1Case (index : Nat) : String :=
       ",\"heldUntil\":" ++ toString held ++ ",\"interval\":" ++ toString interval ++
       "},\"expected\":{\"probe\":" ++ boolJson expected.probe ++ ",\"heldUntil\":" ++ natOptionJson expected.heldUntil ++ "}}"
 
+/-- Six neighboring cases enumerate each result/readings combination per failure count. -/
 private def r2Case (index : Nat) : String :=
-  let failures := index % 6
-  let hasReadings := index % 2 = 0
+  let failures := index / 6
+  let hasReadings := (index / 3) % 2 = 0
   let seedAt := 20_000 + index * 20
   let priorAttempt := if failures = 0 then seedAt else seedAt + failures
   let priorBackoff := if failures = 0 then none else some (priorAttempt + failureBackoff failures)
@@ -66,7 +68,7 @@ private def r2Case (index : Nat) : String :=
     ",\"attemptedAt\":" ++ toString attempted ++ "},\"expected\":" ++ stateJson expected ++ "}"
 
 private def r3Raw (index : Nat) (active : String) : String :=
-  match index % 6 with
+  match index % 7 with
   | 0 => serialiseIdleHold {
     accountId := active
     sinceMs := 1_700_000_000_000 + index
@@ -75,7 +77,11 @@ private def r3Raw (index : Nat) (active : String) : String :=
   | 2 => ""
   | 3 => "not-a-number"
   | 4 => "garbage"
-  | _ => "999999999999999"
+  | 5 => "999999999999999"
+  | _ => serialiseIdleHold {
+    accountId := "other-user:other-account"
+    sinceMs := 1_700_000_000_000 + index
+  }
 
 private def r3Case (index : Nat) : String :=
   let active := "fixture-user:fixture-account"

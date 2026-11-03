@@ -8,10 +8,15 @@ theorem lease_blocks_until_expiry (now held : Nat) (state : PollState)
     tickGate now state = { probe := false, heldUntil := some held } := by
   simp [tickGate, hasLease, before]
 
-/-- A held refresh installs at least a 60-second lease. -/
-theorem lease_set_on_held (now interval : Nat) :
-    leaseForHeld now interval = now + max 60 interval := by
-  rfl
+/-- A held refresh installs the floor when the plan interval is no longer than it. -/
+theorem lease_set_on_held_floor (now interval : Nat) (atMostFloor : interval ≤ 60) :
+    leaseForHeld now interval = now + 60 := by
+  simp [leaseForHeld, Nat.max_eq_left atMostFloor]
+
+/-- A held refresh instead preserves a longer planned interval. -/
+theorem lease_set_on_held_interval (now interval : Nat) (aboveFloor : 60 ≤ interval) :
+    leaseForHeld now interval = now + interval := by
+  simp [leaseForHeld, Nat.max_eq_right aboveFloor]
 
 /-- Expired leases are cleared, allowing the polling scheduler to decide normally. -/
 theorem lease_cleared_after_expiry (now held : Nat) (state : PollState)
@@ -35,6 +40,11 @@ theorem failure_increments (attemptedAt : Nat) (state : PollState) :
 theorem parse_serialise_roundtrip :
     parseIdleHold "active-account" "{\"accountId\":\"active-account\",\"sinceMs\":123}" =
       some { accountId := "active-account", sinceMs := 123 } := by
+  decide
+
+/-- JSON holds from a different active account cannot suppress this account's poll. -/
+theorem foreign_json_hold_parses_to_none :
+    parseIdleHold "active-account" "{\"accountId\":\"other-account\",\"sinceMs\":42}" = none := by
   decide
 
 /-- Legacy decimal values attach to the active account. -/

@@ -104,10 +104,10 @@ private def parseJsonHold (raw : String) : Option IdleHold := do
   let since ← parseNatural (String.ofList reversedDigits)
   return { accountId := String.ofList account, sinceMs := since }
 
-/-- Models idleHold in `pollOpenAiCodex`: JSON first, then a legacy integer for the active account. -/
+/-- Models idleHold in `pollOpenAiCodex`: JSON holds belong only to their active account. -/
 def parseIdleHold (activeAccount : String) (raw : String) : Option IdleHold :=
   match parseJsonHold raw with
-  | some hold => some hold
+  | some hold => if hold.accountId = activeAccount then some hold else none
   | none => match parseNatural raw with
     | some since => some { accountId := activeAccount, sinceMs := since }
     | none => none

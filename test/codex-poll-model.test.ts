@@ -122,12 +122,24 @@ async function runR3(item: R3Case) {
 
 test('Lean Codex poll model agrees with production seams', async () => {
   const counts: Record<string, number> = { r1: 0, r2: 0, r3: 0 };
+  const coverage = { heldLeaseFloor: 0, heldLeaseInterval: 0, firstFailure: 0, cappedBackoff: 0, codexWonNewRow: 0, foreignAccountHold: 0 };
   const mismatches: Array<{ item: Case; actual: unknown }> = [];
   for (const item of cases) {
     counts[item.rule] += 1;
+    if (item.rule === 'r1' && item.input.kind === 'held') {
+      if (item.input.interval <= 60) coverage.heldLeaseFloor += 1;
+      else coverage.heldLeaseInterval += 1;
+    }
+    if (item.rule === 'r2') {
+      if (item.input.kind === 'failure' && item.input.failures === 0 && !item.input.readings) coverage.firstFailure += 1;
+      if (item.input.kind === 'failure' && item.input.failures + 1 >= 6) coverage.cappedBackoff += 1;
+      if (item.input.kind === 'codex-won' && item.input.failures === 0 && !item.input.readings) coverage.codexWonNewRow += 1;
+    }
+    if (item.rule === 'r3' && item.input.raw.includes('other-user:other-account')) coverage.foreignAccountHold += 1;
     const actual = item.rule === 'r1' ? await runR1(item) : item.rule === 'r2' ? runR2(item) : await runR3(item);
     if (JSON.stringify(actual) !== JSON.stringify(item.expected)) mismatches.push({ item, actual });
   }
-  console.log(`codex-poll Lean differential: r1=${counts.r1} r2=${counts.r2} r3=${counts.r3} mismatches=${mismatches.length}`);
+  console.log(`codex-poll Lean differential: r1=${counts.r1} r2=${counts.r2} r3=${counts.r3} mismatches=${mismatches.length} coverage=${JSON.stringify(coverage)}`);
+  assert.deepEqual(coverage, { heldLeaseFloor: 40, heldLeaseInterval: 40, firstFailure: 1, cappedBackoff: 190, codexWonNewRow: 1, foreignAccountHold: 85 });
   assert.deepEqual(mismatches.slice(0, 5), [], JSON.stringify(mismatches.slice(0, 5), null, 2));
 });
