@@ -33,6 +33,12 @@ import {
   type HelperIdentityVerification,
   type HelperSigningState,
 } from './helper-signing';
+import {
+  isKeychainClientNotStarted,
+  isKeychainStillWaiting,
+  keychainClientExec,
+  type KeychainKind,
+} from './keychain-client';
 
 export interface CredentialBackend {
   readonly kind?: CredentialBackendKind;
@@ -79,7 +85,7 @@ export function execFileUtf8(
 export type ExecFileSyncFn = (
   file: string,
   args: readonly string[],
-  options?: ExecFileSyncOptions,
+  options?: ExecFileSyncOptions & { keychainKind?: KeychainKind },
 ) => string;
 
 const FAKE_EXECUTOR = Symbol('qlbFakeExecutor');
@@ -137,6 +143,19 @@ export function defaultCredentialBackendHost(): CredentialBackendHost {
   };
 }
 
+/** Adapts the restricted Keychain runner to the legacy backend executor seam. */
+export const keychainClientExecFileSync: ExecFileSyncFn = (file, args, options) => String(keychainClientExec(file, args, {
+  keychainKind: options?.keychainKind as KeychainKind,
+  timeout: options?.timeout as number,
+  maxBuffer: options?.maxBuffer,
+  encoding: 'utf8',
+}));
+
+/** Production macOS uses the no-kill client; marked fakes retain their test seam. */
+export function macosKeychainExec(host: CredentialBackendHost): ExecFileSyncFn {
+  return isFakeExecutor(host.execFileSync) ? host.execFileSync : keychainClientExecFileSync;
+}
+
 export function wrapCredentialError(
   op: string,
   service: string,
@@ -148,10 +167,14 @@ export function wrapCredentialError(
   if (msg.startsWith(prefix) && err instanceof Error) return err;
   const wrapped = new Error(msg.startsWith(prefix) ? msg : `${prefix}${msg}`);
   if (err && typeof err === 'object') {
-    const { status, code } = err as { status?: unknown; code?: unknown };
+    const { status, code, reason, writeOutcome } = err as {
+      status?: unknown; code?: unknown; reason?: unknown; writeOutcome?: unknown;
+    };
     if (status !== undefined) Object.assign(wrapped, { status });
     // Keep `code` so callers such as qlb doctor still recognise a timeout (ETIMEDOUT).
     if (code !== undefined) Object.assign(wrapped, { code });
+    if (reason !== undefined) Object.assign(wrapped, { reason });
+    if (writeOutcome !== undefined) Object.assign(wrapped, { writeOutcome });
     Object.assign(wrapped, { cause: err });
   }
   return wrapped;
@@ -376,7 +399,7 @@ export class MacosKeychainBackend extends SyncCredentialBackend {
     helperSigningInspector?: HelperSigningInspector;
   } = {}) {
     super();
-    this.exec = opts.execFileSync ?? execFileUtf8;
+    this.exec = opts.execFileSync ?? keychainClientExecFileSync;
     this.fakeExecutor = isFakeExecutor(this.exec);
     this.helperPath = opts.helperPath;
     this.helperConfigReader = opts.helperConfigReader;
@@ -392,6 +415,7 @@ export class MacosKeychainBackend extends SyncCredentialBackend {
     const valueHex = Buffer.from(jsonValue, 'utf8').toString('hex');
     const options = {
       encoding: 'utf8' as const, stdio: 'ignore' as const, timeout: MACOS_SECURITY_TIMEOUT_MS,
+      keychainKind: 'security' as const,
     };
     const fail = () => {
       // Child-process errors can include payload material, so never keep their message.
@@ -406,7 +430,18 @@ export class MacosKeychainBackend extends SyncCredentialBackend {
       ], options);
       return;
     } catch (err) {
-      if (isSecurityTimeout(err)) throw securityTimeoutError('add-generic-password');
+      if (isKeychainStillWaiting(err) || isKeychainClientNotStarted(err)) {
+        throw Object.assign(err as object, { writeOutcome: 'not-started' });
+      }
+      if (isSecurityTimeout(err)) {
+        throw Object.assign(securityTimeoutError('add-generic-password'), { writeOutcome: 'unknown' });
+      }
+      if ((err as { writeOutcome?: unknown }).writeOutcome === 'unknown') {
+        throw Object.assign(new Error(`keychain set failed for service=${service} account=${account}`), {
+          code: (err as { code?: unknown }).code,
+          writeOutcome: 'unknown',
+        });
+      }
       if (!(err && typeof err === 'object'
         && (err as { status?: unknown }).status === MACOS_SECURITY_DUPLICATE_ITEM_EXIT_STATUS)) fail();
     }
@@ -416,7 +451,18 @@ export class MacosKeychainBackend extends SyncCredentialBackend {
         'add-generic-password', '-U', '-a', account, '-s', service, '-X', valueHex,
       ], options);
     } catch (err) {
-      if (isSecurityTimeout(err)) throw securityTimeoutError('add-generic-password');
+      if (isKeychainStillWaiting(err) || isKeychainClientNotStarted(err)) {
+        throw Object.assign(err as object, { writeOutcome: 'not-started' });
+      }
+      if (isSecurityTimeout(err)) {
+        throw Object.assign(securityTimeoutError('add-generic-password'), { writeOutcome: 'unknown' });
+      }
+      if ((err as { writeOutcome?: unknown }).writeOutcome === 'unknown') {
+        throw Object.assign(new Error(`keychain set failed for service=${service} account=${account}`), {
+          code: (err as { code?: unknown }).code,
+          writeOutcome: 'unknown',
+        });
+      }
       fail();
     }
   }
@@ -427,10 +473,13 @@ export class MacosKeychainBackend extends SyncCredentialBackend {
       const stdout = this.exec(
         MACOS_SECURITY_BIN,
         ['find-generic-password', '-a', account, '-w', '-s', service],
-        { encoding: 'utf8', timeout: MACOS_SECURITY_TIMEOUT_MS },
+        { encoding: 'utf8', timeout: MACOS_SECURITY_TIMEOUT_MS, keychainKind: 'security' },
       );
       return stdout.replace(/\n$/, '');
     } catch (err) {
+      if (isKeychainStillWaiting(err) || isKeychainClientNotStarted(err)) {
+        throw wrapCredentialError('get', service, account, err);
+      }
       if (isSecurityTimeout(err)) {
         throw wrapCredentialError('get', service, account, securityTimeoutError('find-generic-password'));
       }
@@ -444,12 +493,17 @@ export class MacosKeychainBackend extends SyncCredentialBackend {
     this.assertHelperUsable();
     try {
       this.exec(helper, ['delete', service, account], {
-        encoding: 'utf8', timeout: MACOS_SECURITY_TIMEOUT_MS,
+        encoding: 'utf8', timeout: MACOS_SECURITY_TIMEOUT_MS, keychainKind: 'helper',
       });
     } catch (err) {
       if (err instanceof KeychainHelperMissingError) throw err;
+      if (isKeychainStillWaiting(err) || isKeychainClientNotStarted(err)) {
+        throw wrapCredentialError('delete', service, account, Object.assign(err as object, { writeOutcome: 'not-started' }));
+      }
       if (isSecurityTimeout(err)) {
-        throw wrapCredentialError('delete', service, account, securityTimeoutError('keychain helper delete'));
+        throw wrapCredentialError('delete', service, account, Object.assign(
+          securityTimeoutError('keychain helper delete'), { writeOutcome: 'unknown' },
+        ));
       }
       throw wrapCredentialError('delete', service, account, err);
     }
@@ -899,7 +953,7 @@ export function createRawCredentialBackend(
     case 'test-memory':
       return new InMemoryCredentialBackend();
     case 'macos-keychain':
-      return new MacosKeychainBackend({ execFileSync: host.execFileSync });
+      return new MacosKeychainBackend({ execFileSync: macosKeychainExec(host) });
     case 'linux-libsecret':
       return new LinuxLibsecretBackend({ execFileSync: host.execFileSync });
     case 'linux-file':

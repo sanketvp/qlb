@@ -13,6 +13,7 @@ import { listStashes, recordStash } from '../src/unclaimed-index';
 import { persistStash } from '../src/single-stash';
 import { validatedAdvisoryMessage } from '../src/migration-health';
 import { openStore } from '../src/store';
+import { KeychainClientNotStarted, KeychainRequestStillWaiting } from '../src/keychain-client';
 
 async function doctorReport(
   home: string,
@@ -465,6 +466,18 @@ describe('qlb doctor', () => {
     assert.equal(stale?.source, staleConfig.dbPath);
     assert.match(stale?.message ?? '', /QLB usage readings are stale; qlb auto refreshes them/);
     assert.doesNotMatch(stale?.message ?? '', /credential source not found/);
+  });
+
+  it('surfaces waiting and not-started Keychain errors for the fixed OpenRouter row', () => {
+    const config = defaultConfig(mkdtempSync(join(tmpdir(), 'qlb-doctor-openrouter-errors-')));
+    for (const error of [
+      new KeychainRequestStillWaiting('pi-openrouter'),
+      new KeychainClientNotStarted('pi-openrouter', 'lock directory is not private'),
+    ]) {
+      const openrouter = inspectProviders(config, () => { throw error; })
+        .find((provider) => provider.provider === 'openrouter');
+      assert.equal(openrouter?.message, error.message);
+    }
   });
 
   it('uses the C-swap cache again after Claude rolls back', () => {
