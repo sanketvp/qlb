@@ -1600,6 +1600,23 @@ export class Store {
     return row ? { provider: row.provider, accountId: row.account_id, since: row.since, setBy: row.set_by } : null;
   }
 
+  /** Identity needed to match a QLB Claude slot back to a C-swap cache row. */
+  getAnthropicSlotStatusIdentity(accountId: string): {
+    orgUuid: string | null;
+    email: string | null;
+    orgUuidSlotCount: number;
+  } | null {
+    const row = this.db.prepare('SELECT org_uuid, email FROM claude_slots WHERE account_id = ?').get(accountId) as
+      | { org_uuid: string | null; email: string | null }
+      | undefined;
+    if (!row) return null;
+    const orgUuidSlotCount = row.org_uuid === null
+      ? 0
+      : (this.db.prepare('SELECT COUNT(*) AS count FROM claude_slots WHERE org_uuid = ? AND archived_at IS NULL')
+        .get(row.org_uuid) as { count: number }).count;
+    return { orgUuid: row.org_uuid, email: row.email, orgUuidSlotCount };
+  }
+
   /** Additive active-login upsert used by provider-specific adoption paths. */
   setActiveLogin(provider: string, accountId: string | null, setBy: string, since: number = Date.now()): void {
     this.db.prepare(`INSERT INTO active_login (provider, account_id, since, set_by) VALUES (?, ?, ?, ?)

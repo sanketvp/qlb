@@ -30,9 +30,28 @@ export interface DashboardAccount extends AccountSnapshot {
   healthGlyph: HealthGlyph;
 }
 
+export interface ActiveAccountMarker {
+  accountId: string;
+  /** Required when an account ID alone identifies more than one cache row. */
+  label?: string;
+}
+
+export interface AnthropicSlotIdentity {
+  orgUuid: string | null;
+  email: string | null;
+  orgUuidSlotCount: number;
+}
+
 export interface DashboardLookups {
   ownershipForProvider: (provider: string) => string;
   overrideForAccount: (accountId: string) => AccountOverrideView | null;
+  /** Lifecycle state read by `qlb cutover`; only an active Claude cutover may replace C-swap's marker. */
+  claudeCutoverPhase?: string;
+  /** The provider-owned login is authoritative over any legacy cache marker. */
+  activeAccountForProvider?: (
+    provider: string,
+    accounts: AccountSnapshot[],
+  ) => ActiveAccountMarker | string | null | undefined;
 }
 
 export function formatRelative(resetAt?: number, now: number = Date.now()): string {
@@ -443,15 +462,84 @@ export function overrideFromStore(store: Store, accountId: string): AccountOverr
   }
 }
 
+function withoutCacheMarker(label: string): string {
+  return label.startsWith('● ') ? label.slice(2) : label;
+}
+
+/**
+ * C-swap cache identifies Claude rows by organization UUID and, for a shared
+ * organization, its email label. An ambiguous or missing match deliberately
+ * leaves C-swap's marker intact.
+ */
+export function activeAnthropicMarker(
+  activeSlot: AnthropicSlotIdentity | null,
+  accounts: AccountSnapshot[],
+): ActiveAccountMarker | undefined {
+  if (!activeSlot || activeSlot.orgUuid === null) return undefined;
+  const orgMatches = accounts.filter((account) => account.accountId === activeSlot.orgUuid);
+  const matches = activeSlot.orgUuidSlotCount > 1
+    ? activeSlot.email === null
+      ? []
+      : orgMatches.filter((account) => withoutCacheMarker(account.label) === activeSlot.email)
+    : orgMatches;
+  if (matches.length !== 1) return undefined;
+  const match = matches[0];
+  return activeSlot.orgUuidSlotCount > 1
+    ? { accountId: match.accountId, label: withoutCacheMarker(match.label) }
+    : { accountId: match.accountId };
+}
+
+function shouldApplyAnthropicActiveLoginOverride(
+  provider: string,
+  claudeCutoverPhase: string | undefined,
+): boolean {
+  return provider === 'anthropic'
+    && (claudeCutoverPhase === 'cutting-over' || claudeCutoverPhase === 'cutover');
+}
+
+function matchesActiveMarker(
+  snap: AccountSnapshot,
+  marker: ActiveAccountMarker | string | null | undefined,
+): boolean {
+  if (!marker || snap.accountId !== (typeof marker === 'string' ? marker : marker.accountId)) return false;
+  return typeof marker === 'string' || marker.label === undefined || withoutCacheMarker(snap.label) === marker.label;
+}
+
 export function enrichAccounts(
   accounts: AccountSnapshot[],
   lookups: DashboardLookups,
 ): DashboardAccount[] {
+  const byProvider = new Map<string, AccountSnapshot[]>();
+  for (const account of accounts) {
+    const providerAccounts = byProvider.get(account.provider) ?? [];
+    providerAccounts.push(account);
+    byProvider.set(account.provider, providerAccounts);
+  }
+  const providerState = new Map<string, {
+    ownership: string;
+    activeMarker: ActiveAccountMarker | string | null | undefined;
+  }>();
+  for (const [provider, providerAccounts] of byProvider) {
+    const ownership = lookups.ownershipForProvider(provider);
+    providerState.set(provider, {
+      ownership,
+      activeMarker: shouldApplyAnthropicActiveLoginOverride(provider, lookups.claudeCutoverPhase)
+        ? lookups.activeAccountForProvider?.(provider, providerAccounts)
+        : undefined,
+    });
+  }
   return accounts.map((snap) => {
     const { health, healthGlyph } = accountHealth(snap);
+    const state = providerState.get(snap.provider)!;
+    const label = state.activeMarker === undefined
+      ? snap.label
+      : withoutCacheMarker(snap.label);
     return {
       ...snap,
-      ownership: lookups.ownershipForProvider(snap.provider),
+      label: state.activeMarker === undefined
+        ? label
+        : matchesActiveMarker(snap, state.activeMarker) ? `● ${label}` : label,
+      ownership: state.ownership,
       override: lookups.overrideForAccount(snap.accountId),
       health,
       healthGlyph,
