@@ -33,6 +33,22 @@ def tickGate (now : Nat) (state : PollState) : TickResult :=
 /-- Models the `refresh.status === 'held'` arm in `pollOpenAiCodex`. -/
 def leaseForHeld (now interval : Nat) : Nat := now + max 60 interval
 
+/--
+A holder receipt may replace a lease only after the prior deadline. Receipts at
+or before that deadline are stale, and an expiry tick clears the old lease.
+-/
+def heldLeaseStep (now interval : Nat) (heldUntil : Option Nat) (held : Bool) : Option Nat :=
+  match heldUntil with
+  | none => if held then some (leaseForHeld now interval) else none
+  | some previous =>
+    if previous < now then if held then some (leaseForHeld now interval) else none
+    else if previous = now then none
+    else some previous
+
+/-- Models the store's compare-and-set clear against a tick-start lease value. -/
+def clearLeaseIfSame (observed : Option Nat) (current : Option Nat) : Option Nat :=
+  if current = observed then none else current
+
 inductive ResultKind where
   | codexWon | failure | success
   deriving Repr, DecidableEq

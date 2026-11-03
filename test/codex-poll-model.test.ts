@@ -10,10 +10,12 @@ import { openStore } from '../src/store';
 import type { BucketReading } from '../src/types';
 
 type R1Case = { rule: 'r1'; input: { kind: 'held' | 'tick'; now: number; heldUntil: number | null; interval: number }; expected: { probe: boolean; heldUntil: number | null } };
+type R4Step = { now: number; held: boolean };
+type R4Case = { rule: 'r4'; input: { initialHeldUntil: number | null; interval: number; steps: R4Step[] }; expected: { heldUntil: number | null } };
 type R2Case = { rule: 'r2'; input: { kind: 'codex-won' | 'failure' | 'success'; failures: number; readings: boolean; seedAt: number; attemptedAt: number }; expected: { failures: number; backoffUntil: number | null; readings: boolean; lastStatus: string; lastAttemptAt: number } };
 type Hold = { accountId: string; sinceMs: number };
 type R3Case = { rule: 'r3'; input: { activeAccount: string; raw: string }; expected: { parsed: Hold | null } };
-type Case = R1Case | R2Case | R3Case;
+type Case = R1Case | R2Case | R3Case | R4Case;
 
 const cases = JSON.parse(readFileSync(join(process.cwd(), 'test/fixtures/codex-poll-model-cases.json'), 'utf8')) as Case[];
 const PROVIDER = 'openai-codex';
@@ -41,7 +43,12 @@ function autoHarness(nowMs: number, raw = '') {
     recordUsagePollResult: () => {},
     listUsagePolls: () => polls,
     writeUsagePollPlans: () => 0,
-    setUsagePollHeldUntil: (_provider: string, accountId: string, heldUntil: number | null) => { polls[accountId] = { ...polls[accountId], heldUntil }; },
+    compareAndSetUsagePollHeldUntil: (_provider: string, accountId: string, expectedHeldUntil: number | null, heldUntil: number | null) => {
+      const current = polls[accountId]?.heldUntil ?? null;
+      if (current !== expectedHeldUntil) return false;
+      polls[accountId] = { ...polls[accountId], heldUntil };
+      return true;
+    },
     getAutoswitchSettings: () => ({ threshold: 90, weeklyThreshold: null }),
     getConfig: (key: string) => configs[key] ?? null,
     setConfig: (key: string, value: string) => { configs[key] = value; },
@@ -73,6 +80,24 @@ async function runR1(item: R1Case) {
   }
   await pollOpenAiCodex(h.deps);
   return { probe: h.probes() > 0, heldUntil: h.polls[ACCOUNT]?.heldUntil ?? null };
+}
+
+async function runR4(item: R4Case) {
+  const h = autoHarness(item.input.steps[0]!.now * 1_000);
+  h.polls[ACCOUNT] = { pollIntervalS: item.input.interval, heldUntil: item.input.initialHeldUntil };
+  h.setNearExpiry();
+  h.setHeldRefresh();
+  for (const step of item.input.steps) {
+    h.deps.now = () => step.now * 1_000;
+    if (step.held) await pollOpenAiCodex(h.deps);
+    else {
+      h.deps.refreshActive = async () => ({ status: 'noop', document: document(step.now * 1_000, step.now * 1_000 + 10 * 60_000) });
+      await pollOpenAiCodex(h.deps);
+      h.setHeldRefresh();
+      h.setNearExpiry();
+    }
+  }
+  return { heldUntil: h.polls[ACCOUNT]?.heldUntil ?? null };
 }
 
 function reading(at: number): Record<string, BucketReading> {
@@ -121,8 +146,8 @@ async function runR3(item: R3Case) {
 }
 
 test('Lean Codex poll model agrees with production seams', async () => {
-  const counts: Record<string, number> = { r1: 0, r2: 0, r3: 0 };
-  const coverage = { heldLeaseFloor: 0, heldLeaseInterval: 0, firstFailure: 0, cappedBackoff: 0, codexWonNewRow: 0, foreignAccountHold: 0 };
+  const counts: Record<string, number> = { r1: 0, r2: 0, r3: 0, r4: 0 };
+  const coverage = { heldLeaseFloor: 0, heldLeaseInterval: 0, firstFailure: 0, cappedBackoff: 0, codexWonNewRow: 0, foreignAccountHold: 0, multiTickStaleHold: 0, multiTickExpiry: 0 };
   const mismatches: Array<{ item: Case; actual: unknown }> = [];
   for (const item of cases) {
     counts[item.rule] += 1;
@@ -136,10 +161,14 @@ test('Lean Codex poll model agrees with production seams', async () => {
       if (item.input.kind === 'codex-won' && item.input.failures === 0 && !item.input.readings) coverage.codexWonNewRow += 1;
     }
     if (item.rule === 'r3' && item.input.raw.includes('other-user:other-account')) coverage.foreignAccountHold += 1;
-    const actual = item.rule === 'r1' ? await runR1(item) : item.rule === 'r2' ? runR2(item) : await runR3(item);
+    if (item.rule === 'r4') {
+      if (item.input.steps.some((step) => step.held && item.input.initialHeldUntil !== null && step.now < item.input.initialHeldUntil)) coverage.multiTickStaleHold += 1;
+      if (item.input.steps.some((step) => step.now === item.input.initialHeldUntil)) coverage.multiTickExpiry += 1;
+    }
+    const actual = item.rule === 'r1' ? await runR1(item) : item.rule === 'r2' ? runR2(item) : item.rule === 'r3' ? await runR3(item) : await runR4(item);
     if (JSON.stringify(actual) !== JSON.stringify(item.expected)) mismatches.push({ item, actual });
   }
-  console.log(`codex-poll Lean differential: r1=${counts.r1} r2=${counts.r2} r3=${counts.r3} mismatches=${mismatches.length} coverage=${JSON.stringify(coverage)}`);
-  assert.deepEqual(coverage, { heldLeaseFloor: 40, heldLeaseInterval: 40, firstFailure: 1, cappedBackoff: 190, codexWonNewRow: 1, foreignAccountHold: 85 });
+  console.log(`codex-poll Lean differential: r1=${counts.r1} r2=${counts.r2} r3=${counts.r3} r4=${counts.r4} mismatches=${mismatches.length} coverage=${JSON.stringify(coverage)}`);
+  assert.deepEqual(coverage, { heldLeaseFloor: 40, heldLeaseInterval: 40, firstFailure: 1, cappedBackoff: 190, codexWonNewRow: 1, foreignAccountHold: 85, multiTickStaleHold: 80, multiTickExpiry: 80 });
   assert.deepEqual(mismatches.slice(0, 5), [], JSON.stringify(mismatches.slice(0, 5), null, 2));
 });

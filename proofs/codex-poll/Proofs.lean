@@ -24,6 +24,24 @@ theorem lease_cleared_after_expiry (now held : Nat) (state : PollState)
     tickGate now state = { probe := true, heldUntil := none } := by
   simp [tickGate, hasLease, Nat.not_lt_of_ge expired]
 
+/-- With no fresh holder receipt, the lease is gone at its deadline. -/
+theorem held_lease_expires_at_deadline (deadline interval : Nat) :
+    heldLeaseStep deadline interval (some deadline) false = none := by
+  simp [heldLeaseStep]
+
+/-- A replacement lease from an existing lease requires a strictly newer receipt. -/
+theorem held_lease_renews_only_after_expiry (now interval previous next : Nat)
+    (renewed : heldLeaseStep now interval (some previous) true = some next)
+    (changed : next ≠ previous) :
+    previous < now := by
+  simp only [heldLeaseStep] at renewed
+  split at renewed <;> simp_all
+
+/-- A clear based on an older snapshot leaves a concurrent newer lease intact. -/
+theorem clear_lease_preserves_newer_value (observed current : Option Nat)
+    (changed : current ≠ observed) : clearLeaseIfSame observed current = current := by
+  simp [clearLeaseIfSame, changed]
+
 /-- A Codex holder receipt is coordination metadata rather than a failed fetch. -/
 theorem codex_won_preserves_failures_backoff_readings (attemptedAt : Nat) (state : PollState) :
     (recordResult attemptedAt .codexWon state).failures = state.failures ∧

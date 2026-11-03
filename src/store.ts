@@ -1927,6 +1927,30 @@ export class Store {
   }
 
   /**
+   * Replace a Codex-renewer lease only if it is still the value observed by
+   * the caller. A null expectation also permits inserting a previously absent
+   * row, but never replaces a concurrently installed lease.
+   */
+  compareAndSetUsagePollHeldUntil(provider: string, accountId: string, expectedHeldUntilS: number | null, heldUntilS: number | null): boolean {
+    return this.runImmediate(() => {
+      if (expectedHeldUntilS === null) {
+        const result = this.db.prepare(`
+          INSERT INTO usage_polls (provider, account_id, held_until)
+          VALUES (?, ?, ?)
+          ON CONFLICT(provider, account_id) DO UPDATE SET held_until = excluded.held_until
+          WHERE usage_polls.held_until IS NULL
+        `).run(provider, accountId, heldUntilS);
+        return result.changes > 0;
+      }
+      const result = this.db.prepare(`
+        UPDATE usage_polls SET held_until = ?
+        WHERE provider = ? AND account_id = ? AND held_until = ?
+      `).run(heldUntilS, provider, accountId, expectedHeldUntilS);
+      return result.changes > 0;
+    });
+  }
+
+  /**
    * Rule W + release in one BEGIN IMMEDIATE (spec §4.3.3 P3).
    * Writes snapshots only if poll_claims still shows (holderId, claimedAt).
    * Always deletes our claim row (no-op if taken over).

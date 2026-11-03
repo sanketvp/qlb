@@ -13,7 +13,7 @@ const AUTO_PREFIX = 'auto.openai-codex.';
 
 type PollStore = Pick<Store,
   'getCodexActiveLogin' | 'getAllSnapshots' | 'recordUsagePollResult' | 'listUsagePolls'
-  | 'writeUsagePollPlans' | 'getAutoswitchSettings' | 'setUsagePollHeldUntil' | 'getConfig' | 'setConfig'>;
+  | 'writeUsagePollPlans' | 'getAutoswitchSettings' | 'compareAndSetUsagePollHeldUntil' | 'getConfig' | 'setConfig'>;
 
 export interface CodexAutoDeps {
   /** The live active-refresh binding; it also provides the stable auth-file read. */
@@ -176,16 +176,27 @@ export async function pollOpenAiCodex(deps: CodexAutoDeps): Promise<CodexAutoPol
     setIdleHold(store, accountId, since);
     return true;
   };
-  const setRenewerLease = async (heldUntilS: number | null): Promise<boolean> => {
+  const compareAndSetRenewerLease = async (expectedHeldUntilS: number | null, heldUntilS: number | null): Promise<boolean> => {
     if (!(await stillOwns())) return false;
-    store.setUsagePollHeldUntil(PROVIDER, accountId, heldUntilS);
-    return true;
+    return store.compareAndSetUsagePollHeldUntil(PROVIDER, accountId, expectedHeldUntilS, heldUntilS);
+  };
+  const expiredLeaseAtTick = polls[accountId]?.heldUntil ?? null;
+  const clearExpiredLease = async (): Promise<boolean> => {
+    if (expiredLeaseAtTick === null || nowS < expiredLeaseAtTick) return true;
+    return compareAndSetRenewerLease(expiredLeaseAtTick, null);
   };
   const stopped = async (refresh: CodexActiveOutcome): Promise<CodexAutoPollResult | undefined> => {
     const receipt = refreshReceipt(refresh);
     if (refresh.status === 'held') {
-      const interval = polls[accountId]?.pollIntervalS ?? 60;
-      if (!(await setRenewerLease(nowS + Math.max(60, interval)))) return base(false, null, refresh);
+      // A holder receipt observed before this lease expires is not new evidence.
+      // It must not prolong the existing deadline; only a post-expiry signal can
+      // replace the exact lease this tick read.
+      if (expiredLeaseAtTick !== null && nowS <= expiredLeaseAtTick) {
+        if (!(await clearExpiredLease())) return base(false, null, refresh);
+      } else {
+        const interval = polls[accountId]?.pollIntervalS ?? 60;
+        if (!(await compareAndSetRenewerLease(expiredLeaseAtTick, nowS + Math.max(60, interval)))) return base(false, null, refresh);
+      }
       logRefreshStop(deps, refresh);
       return { ...base(), refresh: receipt };
     }
@@ -238,9 +249,6 @@ export async function pollOpenAiCodex(deps: CodexAutoDeps): Promise<CodexAutoPol
   // A healthy/new active credential supersedes any hold (including another account's).
   if (!(await setHold(undefined))) return base();
   heldSinceMs = undefined;
-  // A live Codex renewer owns this lease until it expires or refresh sets a new one.
-  if ((polls[accountId]?.heldUntil ?? 0) <= nowS && !(await setRenewerLease(null))) return base();
-
   let refresh: CodexActiveOutcome | undefined;
   if (isDueForRefresh(live.doc, nowMs, 'scheduled')) {
     const trigger = expiry.state === 'near-expiry' || expiry.state === 'expired' ? 'proactive-expiry' : 'scheduled';
@@ -253,8 +261,12 @@ export async function pollOpenAiCodex(deps: CodexAutoDeps): Promise<CodexAutoPol
     if (result) return result;
   }
 
+  // An expired lease may be removed only when the row still has the precise
+  // tick-start value. A concurrent tick's newer lease must survive.
+  if (!(await clearExpiredLease())) return base(expiry.state === 'expired', heldSinceMs ?? null, refresh);
+
   // The schedule/backoff gate applies only to the outbound usage probe.
-  if (dueCandidate([accountId], polls, nowS) !== accountId) return base(expiry.state === 'expired', heldSinceMs ?? null, refresh);
+  if (dueCandidate([accountId], store.listUsagePolls(PROVIDER), nowS) !== accountId) return base(expiry.state === 'expired', heldSinceMs ?? null, refresh);
 
   const usage = await (deps.probeUsage ?? probeCodexUsage)({ auth: live.doc, authPath: deps.active.authPath });
   // A 401 is authoritative even when a passive rollout snapshot has windows.

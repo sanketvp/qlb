@@ -45,6 +45,26 @@ private def r1Case (index : Nat) : String :=
       "},\"expected\":{\"probe\":" ++ boolJson expected.probe ++ ",\"heldUntil\":" ++ natOptionJson expected.heldUntil ++ "}}"
 
 /-- Six neighboring cases enumerate each result/readings combination per failure count. -/
+private def r4StepJson (now : Nat) (held : Bool) : String :=
+  "{\"now\":" ++ toString now ++ ",\"held\":" ++ boolJson held ++ "}"
+
+/-- Multi-tick lease traces cover stale holder receipts, expiry, and post-expiry renewal. -/
+private def r4Case (index : Nat) : String :=
+  let start := 1_710_000_000 + index * 101
+  let interval := if index % 2 = 0 then 15 + index % 45 else 61 + index % 120
+  let initial := leaseForHeld start interval
+  let stale := heldLeaseStep (start + 1) interval (some initial) true
+  let expired := heldLeaseStep initial interval stale false
+  let renew := heldLeaseStep (initial + 1) interval expired true
+  let steps := if index % 2 = 0 then
+    [r4StepJson (start + 1) true, r4StepJson initial false]
+  else
+    [r4StepJson (start + 1) true, r4StepJson initial false, r4StepJson (initial + 1) true]
+  let expected := if index % 2 = 0 then expired else renew
+  "{\"rule\":\"r4\",\"input\":{\"initialHeldUntil\":" ++ toString initial ++
+    ",\"interval\":" ++ toString interval ++ ",\"steps\":[" ++ String.intercalate "," steps ++
+    "]},\"expected\":{\"heldUntil\":" ++ natOptionJson expected ++ "}}"
+
 private def r2Case (index : Nat) : String :=
   let failures := index / 6
   let hasReadings := (index / 3) % 2 = 0
@@ -91,7 +111,7 @@ private def r3Case (index : Nat) : String :=
     "\"},\"expected\":{\"parsed\":" ++ holdJson expected ++ "}}"
 
 private def cases : List String :=
-  (List.range 800).map r1Case ++ (List.range 600).map r2Case ++ (List.range 600).map r3Case
+  (List.range 800).map r1Case ++ (List.range 600).map r2Case ++ (List.range 600).map r3Case ++ (List.range 80).map r4Case
 
 private def fixture : String := "[\n" ++ String.intercalate ",\n" cases ++ "\n]\n"
 
