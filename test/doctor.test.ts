@@ -13,7 +13,7 @@ import { listStashes, recordStash } from '../src/unclaimed-index';
 import { persistStash } from '../src/single-stash';
 import { validatedAdvisoryMessage } from '../src/migration-health';
 import { openStore } from '../src/store';
-import { KeychainClientNotStarted, KeychainRequestStillWaiting } from '../src/keychain-client';
+import { KeychainClientDisabledInTests, KeychainClientNotStarted, KeychainRequestStillWaiting } from '../src/keychain-client';
 
 async function doctorReport(
   home: string,
@@ -473,6 +473,7 @@ describe('qlb doctor', () => {
     for (const error of [
       new KeychainRequestStillWaiting('pi-openrouter'),
       new KeychainClientNotStarted('pi-openrouter', 'lock directory is not private'),
+      new KeychainClientDisabledInTests(),
     ]) {
       const openrouter = inspectProviders(config, () => { throw error; })
         .find((provider) => provider.provider === 'openrouter');

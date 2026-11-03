@@ -509,6 +509,48 @@ sleep 20`);
   });
 });
 
+describe('S2r write outcome classification', () => {
+  it('marks every synchronous write subcommand unknown when the wrapper cannot prove exit', () => {
+    const s = state();
+    withState(s, () => {
+      const client = fake(s, 'echo unexpected > "$d/write-ran"');
+      const noProofLockf = fake(s, 'exit 0', 'no-proof-lockf');
+      const writes = [
+        keychainRequestFromArgv('security', client, ['add-generic-password', '-a', 'a', '-s', 'svc-add', '-X', '6869'], { timeoutMs: 2_000, lockfPath: noProofLockf }),
+        keychainRequestFromArgv('security', client, ['delete-generic-password', '-a', 'a', '-s', 'svc-delete'], { timeoutMs: 2_000, lockfPath: noProofLockf }),
+        keychainRequestFromArgv('helper', client, ['delete', 'svc-helper-delete', 'a'], { timeoutMs: 2_000, lockfPath: noProofLockf }),
+      ];
+      for (const write of writes) {
+        assert.throws(() => runKeychainClientSync(write), (err: unknown) => {
+          assert.equal((err as { code?: unknown }).code, 'EQLBKEYCHAINWRAPPERNOPROOF');
+          assert.equal((err as { writeOutcome?: unknown }).writeOutcome, 'unknown');
+          return true;
+        });
+      }
+      assert.equal(existsSync(join(s.dir, 'write-ran')), false);
+    });
+  });
+
+  it('labels signalled, spawn-error, and no-proof write outcomes unknown but never labels reads', () => {
+    const started = Buffer.from('qlb-keychain-client-started\n');
+    const outcomes = [
+      { error: new Error('spawn failed after start'), status: null, signal: null, fd3: started, stderr: '' },
+      { status: null, signal: 'SIGKILL' as NodeJS.Signals, fd3: started, stderr: '' },
+      { status: null, signal: null, fd3: undefined, stderr: '' },
+    ];
+    for (const outcome of outcomes) {
+      assert.throws(() => keychainWrapperOutcome('svc-read', outcome, false), (err: unknown) => {
+        assert.equal((err as { writeOutcome?: unknown }).writeOutcome, undefined);
+        return true;
+      });
+      assert.throws(() => keychainWrapperOutcome('svc-write', outcome, true), (err: unknown) => {
+        assert.equal((err as { writeOutcome?: unknown }).writeOutcome, 'unknown');
+        return true;
+      });
+    }
+  });
+});
+
 describe('S4a async pass-through lock shape', () => {
   it('(a,e) passes helper stdin through mode p without exposing it in wrapper argv', async () => {
     const s = state();

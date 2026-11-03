@@ -36,6 +36,7 @@ import {
 import {
   isKeychainClientNotStarted,
   isKeychainStillWaiting,
+  KeychainClientDisabledInTests,
   keychainClientExec,
   type KeychainKind,
 } from './keychain-client';
@@ -430,13 +431,13 @@ export class MacosKeychainBackend extends SyncCredentialBackend {
       ], options);
       return;
     } catch (err) {
-      if (isKeychainStillWaiting(err) || isKeychainClientNotStarted(err)) {
+      if (isKeychainStillWaiting(err) || isKeychainClientNotStarted(err) || err instanceof KeychainClientDisabledInTests) {
         throw Object.assign(err as object, { writeOutcome: 'not-started' });
       }
       if (isSecurityTimeout(err)) {
         throw Object.assign(securityTimeoutError('add-generic-password'), { writeOutcome: 'unknown' });
       }
-      if ((err as { writeOutcome?: unknown }).writeOutcome === 'unknown') {
+      if (err && typeof err === 'object' && (err as { writeOutcome?: unknown }).writeOutcome === 'unknown') {
         throw Object.assign(new Error(`keychain set failed for service=${service} account=${account}`), {
           code: (err as { code?: unknown }).code,
           writeOutcome: 'unknown',
@@ -451,13 +452,13 @@ export class MacosKeychainBackend extends SyncCredentialBackend {
         'add-generic-password', '-U', '-a', account, '-s', service, '-X', valueHex,
       ], options);
     } catch (err) {
-      if (isKeychainStillWaiting(err) || isKeychainClientNotStarted(err)) {
+      if (isKeychainStillWaiting(err) || isKeychainClientNotStarted(err) || err instanceof KeychainClientDisabledInTests) {
         throw Object.assign(err as object, { writeOutcome: 'not-started' });
       }
       if (isSecurityTimeout(err)) {
         throw Object.assign(securityTimeoutError('add-generic-password'), { writeOutcome: 'unknown' });
       }
-      if ((err as { writeOutcome?: unknown }).writeOutcome === 'unknown') {
+      if (err && typeof err === 'object' && (err as { writeOutcome?: unknown }).writeOutcome === 'unknown') {
         throw Object.assign(new Error(`keychain set failed for service=${service} account=${account}`), {
           code: (err as { code?: unknown }).code,
           writeOutcome: 'unknown',
