@@ -72,7 +72,7 @@ export type CodexActiveOutcome =
   | { status: 'adopted'; document: CodexAuthDocument }
   | { status: 'noop'; document: CodexAuthDocument }
   | { status: 'rotated'; document: CodexAuthDocument }
-  | { status: 'held'; pids: number[]; document: CodexAuthDocument; action: CodexActiveAction }
+  | { status: 'held'; pids: number[]; document: CodexAuthDocument; action: CodexActiveAction; /** True only when this refresh performed a renewer-process scan. */ fresh?: true }
   | { status: 'codex-won'; adopted: boolean; pids: number[]; document: CodexAuthDocument }
   | { status: 'dead'; reason: string }
   | { status: 'superseded'; document: CodexAuthDocument }
@@ -86,6 +86,13 @@ export type CodexActiveOutcome =
   | { status: 'drift'; accountId: string | null; republish?: CodexRepublishResult }
   | { status: 'fenced'; reason: string; message: string; accounts: Extract<CodexRecoveryFenceState, { state: 'fenced' }>['accounts'] }
   | { status: 'refused'; reason: CodexActiveRefusalReason };
+
+/** Marks a held result as a live scan without changing the established JSON receipt shape. */
+function freshHeld(pids: number[], document: CodexAuthDocument, action: CodexActiveAction): Extract<CodexActiveOutcome, { status: 'held' }> {
+  const outcome: Extract<CodexActiveOutcome, { status: 'held' }> = { status: 'held', pids, document, action };
+  Object.defineProperty(outcome, 'fresh', { value: true });
+  return outcome;
+}
 
 /** A process-list failure, deliberately without the underlying error or any credential document. */
 export class CodexProcessCheckFailed extends Error {
@@ -526,16 +533,16 @@ export async function refreshActiveCodexLogin(deps: CodexActiveDeps, input: Code
           return outcome;
         }
         return held
-          ? { status: 'held', pids, document: settled.outgoing.document, action: 'republish-slot' }
+          ? freshHeld(pids, settled.outgoing.document, 'republish-slot')
           : { status: 'republished', document: settled.outgoing.document };
       }
       if (input.mode === 'reconcile') {
-        if (held) return { status: 'held', pids, document: settled.outgoing.document, action: settled.action };
+        if (held) return freshHeld(pids, settled.outgoing.document, settled.action);
         return settled.action === 'adopt'
           ? { status: 'adopted', document: settled.outgoing.document }
           : { status: 'noop', document: settled.outgoing.document };
       }
-      if (held) return { status: 'held', pids, document: settled.outgoing.document, action: settled.action };
+      if (held) return freshHeld(pids, settled.outgoing.document, settled.action);
       if (input.trigger === 'unauthorized' && input.accessFp !== accessFingerprint(settled.outgoing.document)) {
         return { status: 'rotated', document: settled.outgoing.document };
       }

@@ -126,7 +126,12 @@ function autoHarness(overrides: Partial<CodexAutoDeps> = {}) {
       for (const [accountId, plan] of Object.entries(plans)) polls[accountId] = { ...polls[accountId], ...plan };
       return Object.keys(plans).length;
     },
-    setUsagePollHeldUntil: (_provider: string, accountId: string, heldUntil: number | null) => { polls[accountId] = { ...polls[accountId], heldUntil }; },
+    compareAndSetUsagePollHeldUntil: (_provider: string, accountId: string, expectedHeldUntil: number | null, heldUntil: number | null) => {
+      const current = polls[accountId]?.heldUntil ?? null;
+      if (current !== expectedHeldUntil) return false;
+      polls[accountId] = { ...polls[accountId], heldUntil };
+      return true;
+    },
     getAutoswitchSettings: () => ({ threshold: 90, weeklyThreshold: null }),
     getConfig: (key: string) => configs[key] ?? null,
     setConfig: (key: string, value: string) => { configs[key] = value; },
@@ -226,6 +231,28 @@ describe('C8 Codex poll and refresh', () => {
     assert.equal(typeof (calls[0] as Extract<CodexActiveInput, { trigger: 'unauthorized' }>).accessFp, 'string');
   });
 
+  for (const [name, lease] of [
+    ['after expiry', NOW / 1_000 - 1],
+    ['at expiry', NOW / 1_000],
+  ] as const) {
+    it(`renews a fresh held lease after a 401 ${name}`, async () => {
+      let refreshes = 0;
+      const h = autoHarness({
+        probeUsage: async () => ({ status: 401, source: 'unknown', keys: [] }),
+        refreshActive: async () => {
+          refreshes += 1;
+          return { status: 'held', pids: [42], document: document(NOW + 10 * 60_000), action: 'noop', fresh: true };
+        },
+      });
+      h.polls['user-a:account-a'] = { pollIntervalS: 600, heldUntil: lease };
+
+      await codexAutoTick(h.deps);
+
+      assert.equal(refreshes, 1);
+      assert.equal(h.polls['user-a:account-a']?.heldUntil, NOW / 1_000 + 600);
+    });
+  }
+
   it('records codex-won without treating the active slot as dead', async () => {
     const h = autoHarness({
       refreshActive: async () => ({
@@ -253,7 +280,7 @@ describe('C8 Codex poll and refresh', () => {
       },
       refreshActive: async () => {
         refreshes += 1;
-        return { status: 'held', pids: [42], document: document(NOW + 3 * 60 * 60_000), action: 'noop' };
+        return { status: 'held', pids: [42], document: document(NOW + 3 * 60 * 60_000), action: 'noop', fresh: true };
       },
     });
     h.setLiveDocument(document(NOW + 3 * 60 * 60_000));
@@ -274,6 +301,28 @@ describe('C8 Codex poll and refresh', () => {
 
     assert.equal(probes, 2);
     assert.equal(refreshes, 1);
+  });
+
+  it('renews a lease from each fresh pre-expiry holder receipt, including at its deadline', async () => {
+    let refreshes = 0;
+    const h = autoHarness({
+      refreshActive: async () => {
+        refreshes += 1;
+        return { status: 'held', pids: [42], document: document(NOW + 3 * 60_000), action: 'noop', fresh: true };
+      },
+    });
+    h.setLiveDocument(document(NOW + 3 * 60_000));
+    h.polls['user-a:account-a'] = { pollIntervalS: 600 };
+
+    await codexAutoTick(h.deps);
+    h.setNow(NOW + 60_000);
+    await codexAutoTick(h.deps);
+    assert.equal(h.polls['user-a:account-a']?.heldUntil, NOW / 1_000 + 660);
+
+    h.setNow(NOW + 660_000);
+    await codexAutoTick(h.deps);
+    assert.equal(h.polls['user-a:account-a']?.heldUntil, NOW / 1_000 + 1_260);
+    assert.equal(refreshes, 3);
   });
 
   it('reconciles recovery and runs due watches on every tick', async () => {
@@ -332,7 +381,7 @@ describe('C8 Codex poll and refresh', () => {
   });
 
   const stoppedOutcomes: CodexActiveOutcome[] = [
-    { status: 'held', pids: [1], document: document(NOW + 10 * 60_000), action: 'noop' },
+    { status: 'held', pids: [1], document: document(NOW + 10 * 60_000), action: 'noop', fresh: true },
     { status: 'dead', reason: 'refresh-token-rejected' },
     { status: 'drift', accountId: 'user-b:account-b' },
   ];
@@ -535,6 +584,22 @@ describe('C8 Codex poll and refresh', () => {
       assert.deepEqual(store.getAllSnapshots('user-a:account-a'), {
         primary: { usedPct: 20, fetchedAt: 10_000, source: 'poll', confidence: 'authoritative' },
       });
+    } finally {
+      store.close();
+    }
+  });
+
+  it('does not clear or renew over a concurrent newer Codex renewer lease', () => {
+    const store = openStore(':memory:');
+    try {
+      store.setUsagePollHeldUntil('openai-codex', 'user-a:account-a', 40);
+      const tickStartLease = store.listUsagePolls('openai-codex')['user-a:account-a']?.heldUntil;
+      store.setUsagePollHeldUntil('openai-codex', 'user-a:account-a', 80);
+
+      assert.equal(store.compareAndSetUsagePollHeldUntil('openai-codex', 'user-a:account-a', tickStartLease ?? null, null), false);
+      assert.equal(store.listUsagePolls('openai-codex')['user-a:account-a']?.heldUntil, 80);
+      assert.equal(store.compareAndSetUsagePollHeldUntil('openai-codex', 'user-a:account-a', tickStartLease ?? null, 120), false);
+      assert.equal(store.listUsagePolls('openai-codex')['user-a:account-a']?.heldUntil, 80);
     } finally {
       store.close();
     }

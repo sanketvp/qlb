@@ -45,6 +45,29 @@ private def r1Case (index : Nat) : String :=
       "},\"expected\":{\"probe\":" ++ boolJson expected.probe ++ ",\"heldUntil\":" ++ natOptionJson expected.heldUntil ++ "}}"
 
 /-- Six neighboring cases enumerate each result/readings combination per failure count. -/
+private def r4StepJson (now : Nat) (held fresh via401 : Bool) : String :=
+  "{\"now\":" ++ toString now ++ ",\"held\":" ++ boolJson held ++
+    ",\"fresh\":" ++ boolJson fresh ++ ",\"via401\":" ++ boolJson via401 ++ "}"
+
+/--
+Lease traces cover fresh pre-expiry and deadline renewals, non-fresh receipts,
+and the 401 clear-then-renew order.  A scheduled deadline renewal exercises a
+CAS replacement of a non-null expired lease.
+-/
+private def r4Case (index : Nat) : String :=
+  let start := 1_710_000_000 + index * 101
+  let interval := if index % 2 = 0 then 15 + index % 45 else 61 + index % 120
+  let initial := leaseForHeld start interval
+  let kind := index % 5
+  let now := if kind = 0 || kind = 2 then start + 1 else initial
+  let fresh := kind = 0 || kind = 1 || kind = 4
+  let via401 := kind = 4
+  let expected := tickLeaseStep now interval (some initial) true fresh via401
+  let steps := [r4StepJson now true fresh via401]
+  "{\"rule\":\"r4\",\"input\":{\"initialHeldUntil\":" ++ toString initial ++
+    ",\"interval\":" ++ toString interval ++ ",\"steps\":[" ++ String.intercalate "," steps ++
+    "]},\"expected\":{\"heldUntil\":" ++ natOptionJson expected ++ "}}"
+
 private def r2Case (index : Nat) : String :=
   let failures := index / 6
   let hasReadings := (index / 3) % 2 = 0
@@ -91,7 +114,7 @@ private def r3Case (index : Nat) : String :=
     "\"},\"expected\":{\"parsed\":" ++ holdJson expected ++ "}}"
 
 private def cases : List String :=
-  (List.range 800).map r1Case ++ (List.range 600).map r2Case ++ (List.range 600).map r3Case
+  (List.range 800).map r1Case ++ (List.range 600).map r2Case ++ (List.range 600).map r3Case ++ (List.range 80).map r4Case
 
 private def fixture : String := "[\n" ++ String.intercalate ",\n" cases ++ "\n]\n"
 

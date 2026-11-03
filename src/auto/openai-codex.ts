@@ -13,7 +13,7 @@ const AUTO_PREFIX = 'auto.openai-codex.';
 
 type PollStore = Pick<Store,
   'getCodexActiveLogin' | 'getAllSnapshots' | 'recordUsagePollResult' | 'listUsagePolls'
-  | 'writeUsagePollPlans' | 'getAutoswitchSettings' | 'setUsagePollHeldUntil' | 'getConfig' | 'setConfig'>;
+  | 'writeUsagePollPlans' | 'getAutoswitchSettings' | 'compareAndSetUsagePollHeldUntil' | 'getConfig' | 'setConfig'>;
 
 export interface CodexAutoDeps {
   /** The live active-refresh binding; it also provides the stable auth-file read. */
@@ -176,16 +176,37 @@ export async function pollOpenAiCodex(deps: CodexAutoDeps): Promise<CodexAutoPol
     setIdleHold(store, accountId, since);
     return true;
   };
-  const setRenewerLease = async (heldUntilS: number | null): Promise<boolean> => {
+  const compareAndSetRenewerLease = async (expectedHeldUntilS: number | null, heldUntilS: number | null): Promise<boolean> => {
     if (!(await stillOwns())) return false;
-    store.setUsagePollHeldUntil(PROVIDER, accountId, heldUntilS);
+    return store.compareAndSetUsagePollHeldUntil(PROVIDER, accountId, expectedHeldUntilS, heldUntilS);
+  };
+  // This expected value follows this tick's successful CAS writes.  A 401 can
+  // clear an expired lease before its refresh observes a fresh renewer, so a
+  // later renewal must compare against NULL rather than the tick-start lease.
+  let leaseExpected = polls[accountId]?.heldUntil ?? null;
+  const clearExpiredLease = async (): Promise<boolean> => {
+    if (leaseExpected === null || nowS < leaseExpected) return true;
+    if (!(await compareAndSetRenewerLease(leaseExpected, null))) return false;
+    leaseExpected = null;
     return true;
   };
   const stopped = async (refresh: CodexActiveOutcome): Promise<CodexAutoPollResult | undefined> => {
     const receipt = refreshReceipt(refresh);
     if (refresh.status === 'held') {
+      // Only a process scan made by this refresh can renew a lease.  A held
+      // result carried from consume-time holders is not fresh evidence.
+      if (refresh.fresh !== true) {
+        if (!(await clearExpiredLease())) return base(false, null, refresh);
+        logRefreshStop(deps, refresh);
+        return { ...base(), refresh: receipt };
+      }
       const interval = polls[accountId]?.pollIntervalS ?? 60;
-      if (!(await setRenewerLease(nowS + Math.max(60, interval)))) return base(false, null, refresh);
+      const heldUntil = Math.max(leaseExpected ?? 0, nowS + Math.max(60, interval));
+      // A later lease already protects this account; never shorten or replace it.
+      if (heldUntil !== leaseExpected) {
+        if (!(await compareAndSetRenewerLease(leaseExpected, heldUntil))) return base(false, null, refresh);
+        leaseExpected = heldUntil;
+      }
       logRefreshStop(deps, refresh);
       return { ...base(), refresh: receipt };
     }
@@ -238,9 +259,6 @@ export async function pollOpenAiCodex(deps: CodexAutoDeps): Promise<CodexAutoPol
   // A healthy/new active credential supersedes any hold (including another account's).
   if (!(await setHold(undefined))) return base();
   heldSinceMs = undefined;
-  // A live Codex renewer owns this lease until it expires or refresh sets a new one.
-  if ((polls[accountId]?.heldUntil ?? 0) <= nowS && !(await setRenewerLease(null))) return base();
-
   let refresh: CodexActiveOutcome | undefined;
   if (isDueForRefresh(live.doc, nowMs, 'scheduled')) {
     const trigger = expiry.state === 'near-expiry' || expiry.state === 'expired' ? 'proactive-expiry' : 'scheduled';
@@ -253,8 +271,12 @@ export async function pollOpenAiCodex(deps: CodexAutoDeps): Promise<CodexAutoPol
     if (result) return result;
   }
 
+  // An expired lease may be removed only when the row still has the precise
+  // tick-start value. A concurrent tick's newer lease must survive.
+  if (!(await clearExpiredLease())) return base(expiry.state === 'expired', heldSinceMs ?? null, refresh);
+
   // The schedule/backoff gate applies only to the outbound usage probe.
-  if (dueCandidate([accountId], polls, nowS) !== accountId) return base(expiry.state === 'expired', heldSinceMs ?? null, refresh);
+  if (dueCandidate([accountId], store.listUsagePolls(PROVIDER), nowS) !== accountId) return base(expiry.state === 'expired', heldSinceMs ?? null, refresh);
 
   const usage = await (deps.probeUsage ?? probeCodexUsage)({ auth: live.doc, authPath: deps.active.authPath });
   // A 401 is authoritative even when a passive rollout snapshot has windows.
