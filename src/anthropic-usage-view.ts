@@ -116,7 +116,14 @@ export function anthropicStoreSnapshots(
   const liveSlots = slots.filter((slot) => slot.archivedAt == null);
   const polls = store.listUsagePolls('anthropic');
   const hasPolls = hasPollsForLiveSlots(slots, polls);
-  if (!hasPolls) return { hasPolls, snapshots: [] };
+  if (liveSlots.length === 0) {
+    return {
+      hasPolls,
+      snapshots: [{
+        accountId: 'anthropic', provider: 'anthropic', label: 'Claude (Anthropic)', buckets: {}, error: 'unavailable',
+      }],
+    };
+  }
   return {
     hasPolls,
     snapshots: liveSlots.map((slot) => {

@@ -6,6 +6,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
+import { CSWAP_RESTORE_PENDING } from '../src/lifecycle';
 import { openStore } from '../src/store';
 
 function runAdapterScript(script: string, extraEnv: NodeJS.ProcessEnv = {}): {
@@ -147,6 +148,20 @@ describe('adapter empty-cache probe attachment', () => {
     }
   });
 
+  it('shows unavailable QLB slots rather than an empty list when owned slots have no polls', () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-anthropic-no-polls-'));
+    const { sequence, usage } = writeCswapCache(root);
+    const dbPath = join(root, 'qlb.db');
+    const store = openStore(dbPath);
+    store.close();
+    seedLifecycle(dbPath, 'cutover');
+
+    const snapshots = adapterSnapshots(dbPath, sequence, usage);
+    assert.equal(snapshots.length, 1);
+    assert.equal(snapshots[0]?.buckets['5h'], undefined);
+    assert.equal(snapshots[0]?.error, 'unavailable');
+  });
+
   it('returns an error snapshot instead of C-swap data when the QLB-owned store cannot be read', () => {
     const root = mkdtempSync(join(tmpdir(), 'qlb-anthropic-store-error-'));
     const { sequence, usage } = writeCswapCache(root);
@@ -163,6 +178,47 @@ describe('adapter empty-cache probe attachment', () => {
     assert.equal(snapshots.length, 1);
     assert.equal(snapshots[0]?.buckets['5h'], undefined);
     assert.equal(snapshots[0]?.error, 'QLB usage store unavailable');
+  });
+
+  it('does not fall back to C-swap when an existing QLB lifecycle is unreadable', () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-anthropic-lifecycle-error-'));
+    const { sequence, usage } = writeCswapCache(root);
+    const dbPath = join(root, 'qlb.db');
+    const store = openStore(dbPath);
+    store.close();
+    const db = new DatabaseSync(dbPath);
+    try {
+      db.exec('DROP TABLE lifecycle');
+    } finally {
+      db.close();
+    }
+
+    const snapshots = adapterSnapshots(dbPath, sequence, usage);
+    assert.equal(snapshots.length, 1);
+    assert.equal(snapshots[0]?.buckets['5h'], undefined);
+    assert.equal(snapshots[0]?.error, 'QLB lifecycle unavailable');
+  });
+
+  it('uses the C-swap cache while the C-swap restore fence is set', () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-anthropic-restore-fence-'));
+    const { sequence, usage } = writeCswapCache(root);
+    const dbPath = join(root, 'qlb.db');
+    const store = openStore(dbPath);
+    store.recordUsagePollResult('anthropic', 'account', {
+      attemptedAt: Math.floor(Date.now() / 1000), status: 'ok',
+      readings: { '5h': { usedPct: 99, fetchedAt: Date.now(), source: 'poll', confidence: 'authoritative' } },
+    });
+    store.close();
+    seedLifecycle(dbPath, 'cutover');
+    const db = new DatabaseSync(dbPath);
+    try {
+      db.prepare('UPDATE lifecycle SET note = ?').run(CSWAP_RESTORE_PENDING);
+    } finally {
+      db.close();
+    }
+
+    const snapshots = adapterSnapshots(dbPath, sequence, usage);
+    assert.equal(snapshots[0]?.buckets['5h']?.usedPct, 11);
   });
 
   it('kimi empty cache + rejected fetch stamps cached-after-failure with accurate detail', () => {

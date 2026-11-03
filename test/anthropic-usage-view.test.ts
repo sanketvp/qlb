@@ -97,24 +97,29 @@ describe('QLB-owned Anthropic store projection', () => {
     }
   });
 
-  it('reports no store projection when Anthropic has no poll rows', () => {
+  it('marks every live slot unavailable when Anthropic has no poll rows', () => {
     const store = openStore(':memory:');
     try {
-      const result = anthropicStoreSnapshots([slot('empty')], store, NOW_S);
+      const result = anthropicStoreSnapshots([slot('empty'), slot('also-empty')], store, NOW_S);
       assert.equal(result.hasPolls, false);
-      assert.deepEqual(result.snapshots, []);
+      assert.deepEqual(result.snapshots.map(({ accountId, error }) => ({ accountId, error })), [
+        { accountId: 'empty', error: 'unavailable' },
+        { accountId: 'also-empty', error: 'unavailable' },
+      ]);
     } finally {
       store.close();
     }
   });
 
-  it('ignores poll rows belonging only to archived slots', () => {
+  it('returns an unavailable snapshot when every slot is archived', () => {
     const store = openStore(':memory:');
     try {
       record(store, 'archived', NOW_S);
       const result = anthropicStoreSnapshots([slot('archived', { archivedAt: 1 })], store, NOW_S);
       assert.equal(result.hasPolls, false);
-      assert.deepEqual(result.snapshots, []);
+      assert.deepEqual(result.snapshots.map(({ accountId, error }) => ({ accountId, error })), [
+        { accountId: 'anthropic', error: 'unavailable' },
+      ]);
     } finally {
       store.close();
     }
