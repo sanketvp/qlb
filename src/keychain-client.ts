@@ -1,6 +1,6 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join, relative } from 'node:path';
 import { qlbHomeDir } from './home';
@@ -57,7 +57,8 @@ const PS_POLL_MS = 50;
  * A security lookup without -a can resolve the same item as an account
  * qualified lookup.  Therefore one service has one waiting slot.
  */
-export function keychainItemKey(service: string, _account: string): string {
+/** Registry-only key: a wait for one service blocks every account on it. */
+export function keychainWaitKey(service: string): string {
   return service;
 }
 
@@ -66,7 +67,7 @@ function registryDir(): string {
 }
 
 function registryPath(item: KeychainItem): string {
-  return join(registryDir(), `${createHash('sha256').update(keychainItemKey(item.service, item.account)).digest('hex')}.json`);
+  return join(registryDir(), `${createHash('sha256').update(keychainWaitKey(item.service)).digest('hex')}.json`);
 }
 
 function validLstart(value: unknown): value is string {
@@ -74,7 +75,9 @@ function validLstart(value: unknown): value is string {
 }
 
 function normalLstart(value: string): string | null {
-  const normalized = value.trim();
+  // Preserve leading spaces: lstart identity is compared byte-for-byte with
+  // ps output, while command substitution removes only its final newlines.
+  const normalized = value.replace(/[\r\n]+$/, '');
   return validLstart(normalized) ? normalized : null;
 }
 
@@ -155,23 +158,42 @@ function writePrivateAtomic(path: string, value: string): void {
   }
 }
 
-interface ClientRecord { pid: number; lstart: string | null }
+interface ClientRecord {
+  pid: number;
+  lstart: string | null;
+  state?: 'reserving';
+}
+
+function recordText(record: ClientRecord): string {
+  return JSON.stringify(record);
+}
 
 function parseRecord(path: string): ClientRecord | null {
   try {
     const parsed: unknown = JSON.parse(readFileSync(path, 'utf8'));
     if (!parsed || typeof parsed !== 'object') return null;
-    const { pid, lstart } = parsed as { pid?: unknown; lstart?: unknown };
+    const { pid, lstart, state } = parsed as { pid?: unknown; lstart?: unknown; state?: unknown };
     if (!Number.isSafeInteger(pid) || typeof pid !== 'number' || pid <= 0) return null;
     if (lstart !== null && !validLstart(lstart)) return null;
-    return { pid, lstart: lstart === null ? null : normalLstart(lstart) };
+    if (state !== undefined && state !== 'reserving') return null;
+    return { pid, lstart: lstart === null ? null : normalLstart(lstart), ...(state === 'reserving' ? { state } : {}) };
   } catch {
     return null;
   }
 }
 
-function remove(path: string): void {
+/**
+ * Compare before unlinking.  Registry records are ownership claims, never
+ * disposable scratch files: a later owner must not lose its claim.
+ */
+function removeRecordIfMatches(path: string, expected: ClientRecord): void {
+  const current = parseRecord(path);
+  if (!current || current.pid !== expected.pid || current.lstart !== expected.lstart || current.state !== expected.state) return;
   try { unlinkSync(path); } catch { /* a racing cleaner is harmless */ }
+}
+
+function remove(path: string): void {
+  try { unlinkSync(path); } catch { /* only used for private probe/temp files */ }
 }
 
 function usablePsPath(requested: string | undefined): string {
@@ -201,19 +223,22 @@ export function assertNoWaitingClient(item: KeychainItem, deps: { psPath?: strin
   if (!existsSync(path)) return;
   const record = parseRecord(path);
   if (!record) {
-    remove(path);
+    // Corruption is not an ownership claim, but do not unlink a replacement.
+    try { unlinkSync(path); } catch { /* a racing cleaner is harmless */ }
     return;
   }
+  // A reservation records its QLB owner identity, so a dead owner is cleaned
+  // by the same fail-closed liveness proof as a filled client record.
   try {
     const lstart = normalLstart(readPs(record.pid, deps.psPath));
     if (record.lstart === null || lstart === record.lstart) {
       throw new KeychainRequestStillWaiting(item.service);
     }
-    remove(path); // pid reuse, or ps gave no start time
+    removeRecordIfMatches(path, record); // pid reuse, or ps gave no start time
   } catch (err) {
     if (err instanceof KeychainRequestStillWaiting) throw err;
     if ((err as { status?: unknown } | undefined)?.status === 1) {
-      remove(path);
+      removeRecordIfMatches(path, record);
       return;
     }
     // ps uncertainty is fail-closed.
@@ -230,6 +255,29 @@ export function ensureRegistryWritable(): void {
     chmodSync(path, 0o600);
   } finally {
     remove(path);
+  }
+}
+
+/** Claim the service slot before any wrapper process can exist. */
+function reserveClientSlot(item: KeychainItem): ClientRecord {
+  let lstart: string | null;
+  try { lstart = normalLstart(readPs(process.pid)); } catch {
+    throw new KeychainClientNotStarted(item.service, 'could not identify waiting-process owner');
+  }
+  if (!lstart) throw new KeychainClientNotStarted(item.service, 'could not identify waiting-process owner');
+  const record: ClientRecord = { pid: process.pid, lstart, state: 'reserving' };
+  const path = registryPath(item);
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, 'wx', 0o600);
+    writeFileSync(fd, recordText(record), { encoding: 'utf8' });
+    chmodSync(path, 0o600);
+    return record;
+  } catch (err) {
+    if (errorCode(err) === 'EEXIST') throw new KeychainRequestStillWaiting(item.service);
+    throw new KeychainClientNotStarted(item.service, 'waiting registry is not writable');
+  } finally {
+    if (fd !== undefined) closeSync(fd);
   }
 }
 
@@ -257,10 +305,14 @@ export function fillClientLstart(item: KeychainItem, pid: number, deps: { psPath
 }
 
 /** Remove only the record still belonging to this client. */
-export function removeClientRecordIf(item: KeychainItem, pid: number): void {
+export function removeClientRecordIf(item: KeychainItem, pid: number, lstart?: string | null): void {
   const path = registryPath(item);
   const current = parseRecord(path);
-  if (current?.pid === pid) remove(path);
+  if (!current || current.pid !== pid) return;
+  // S4 passes the lstart it recorded.  The optional form retains the leaf's
+  // compatibility while still snapshots both identity fields before removal.
+  if (lstart !== undefined && current.lstart !== lstart) return;
+  removeRecordIfMatches(path, current);
 }
 
 function itemFromSecurity(args: readonly string[]): KeychainItem {
@@ -280,7 +332,7 @@ function notStartedForArgs(args: readonly string[], detail: string): KeychainCli
 function parseSecurityWrite(args: readonly string[]): { args: string[]; secretHex: string; item: KeychainItem } {
   const out = [args[0]];
   let secretHex: string | undefined;
-  let service = '';
+  let service = `cmd:${args[0] ?? 'unknown'}`;
   let account = '';
   for (let index = 1; index < args.length; index += 1) {
     const token = args[index];
@@ -337,16 +389,29 @@ export function keychainRequestFromArgv(
   };
 }
 
-function testClientAllowed(file: string): boolean {
-  if (process.env.QLB_TEST_MODE !== '1') return true;
+function isUnderTmp(candidate: string): boolean {
   try {
     const root = realpathSync(tmpdir());
-    const candidate = realpathSync(file);
-    const rel = relative(root, candidate);
-    return rel === '' || (!rel.startsWith(`..${join('', '')}`) && rel !== '..' && !rel.startsWith('../'));
+    // A TMPDIR of / would turn every executable into a test fake.
+    if (root === '/') return false;
+    const rel = relative(root, realpathSync(candidate));
+    return rel === '' || (rel !== '..' && !rel.startsWith('../'));
   } catch {
     return false;
   }
+}
+
+function testClientAllowed(file: string): boolean {
+  if (process.env.QLB_TEST_MODE !== '1') return true;
+  try {
+    const candidate = realpathSync(file);
+    // These denials do not depend on TMPDIR being sane (and security is not
+    // installed on Linux CI, so do not require resolving it here).
+    if (file === KEYCHAIN_SECURITY_BIN || candidate === KEYCHAIN_SECURITY_BIN || basename(candidate) === 'qlb-keychain-helper') return false;
+  } catch {
+    return false;
+  }
+  return isUnderTmp(file);
 }
 
 /**
@@ -357,24 +422,50 @@ export const KEYCHAIN_WAIT_SCRIPT = `umask 077
 trap '' PIPE
 exec 4<&0 0</dev/null
 /bin/sh -c '
-  m=$1; r=$2; ps=$3; shift 3
+  m=$1; r=$2; ps=$3; deadline=$4; owner=$5; ownerstart=$6; shift 6
   bound=\${QLB_KEYCHAIN_PS_BOUND_MS:-2000}
   case "$bound" in *[!0-9]*|"") bound=2000;; esac
+  before_deadline() {
+    # GNU date supplies milliseconds in CI. On macOS, use its bundled perl
+    # HiRes clock; only if neither is available use a one-second-margin clock.
+    now=$(date +%s%3N 2>/dev/null || true)
+    case "$now" in
+      ""|*[!0-9]*) now=$(/usr/bin/perl -MTime::HiRes=time -e "printf qq(%.0f), time*1000" 2>/dev/null || true);;
+    esac
+    case "$now" in
+      ""|*[!0-9]*) now=$(date +%s); [ "$now" -lt $((deadline / 1000 - 1)) ];;
+      *) [ "$now" -lt $((deadline - 100)) ];;
+    esac
+  }
+  before_deadline || { echo "qlb-keychain-wait: record-failed" >&2; exit 125; }
   ticks=$((bound / ${PS_POLL_MS}))
   [ "$ticks" -gt 0 ] || ticks=1
   po="$r.ps.$$"
   "$ps" -p $$ -o lstart= >"$po" 2>/dev/null &
   p=$!
   while kill -0 "$p" 2>/dev/null; do
-    [ "$ticks" -gt 0 ] || { kill "$p" 2>/dev/null; wait "$p" 2>/dev/null; rm -f "$po"; echo "qlb-keychain-wait: record-failed" >&2; exit 125; }
+    [ "$ticks" -gt 0 ] || {
+      # p is the ps child we just started; reap it immediately after signalling.
+      kill -TERM "$p" 2>/dev/null; wait "$p" 2>/dev/null
+      rm -f "$po"; echo "qlb-keychain-wait: record-failed" >&2; exit 125
+    }
     sleep 0.05
     ticks=$((ticks - 1))
   done
   wait "$p" || { rm -f "$po"; echo "qlb-keychain-wait: record-failed" >&2; exit 125; }
   l=$(cat "$po"); rm -f "$po"
   case "$l" in ""|*[!A-Za-z0-9:\\ ]*) echo "qlb-keychain-wait: record-failed" >&2; exit 125;; esac
-  printf "{\\"pid\\":%s,\\"lstart\\":\\"%s\\"}\\n" "$$" "$l" > "$r.tmp.$$" && mv -f "$r.tmp.$$" "$r" ||
-    { echo "qlb-keychain-wait: record-failed" >&2; exit 125; }
+  before_deadline || { echo "qlb-keychain-wait: record-failed" >&2; exit 125; }
+  expected=$(printf "{\\"pid\\":%s,\\"lstart\\":\\"%s\\",\\"state\\":\\"reserving\\"}" "$owner" "$ownerstart")
+  current=$(cat "$r" 2>/dev/null || :)
+  [ "$current" = "$expected" ] || { echo "qlb-keychain-wait: record-failed" >&2; exit 125; }
+  tmp="$r.client.$$"
+  printf "{\\"pid\\":%s,\\"lstart\\":\\"%s\\"}" "$$" "$l" > "$tmp" || { echo "qlb-keychain-wait: record-failed" >&2; exit 125; }
+  # Do not mv over a newer owner: link our completed private record only into
+  # the empty slot after removing the matching reservation.
+  rm "$r" || { rm -f "$tmp"; echo "qlb-keychain-wait: record-failed" >&2; exit 125; }
+  ln "$tmp" "$r" && rm -f "$tmp" || { rm -f "$tmp"; echo "qlb-keychain-wait: record-failed" >&2; exit 125; }
+  before_deadline || { echo "qlb-keychain-wait: record-failed" >&2; exit 125; }
   if [ "$m" = w ]; then
     IFS= read -r hex || { echo "qlb-keychain-wait: no-secret" >&2; exit 125; }
     exec 0</dev/null
@@ -393,8 +484,41 @@ function resultError(code: string, props: Record<string, unknown>): Error {
   return Object.assign(new Error('Keychain wrapper did not prove client exit'), { code, ...props });
 }
 
+function validateRequest(request: KeychainRequest): void {
+  const service = typeof request?.item?.service === 'string' ? request.item.service : 'unknown';
+  if (!request || (request.kind !== 'security' && request.kind !== 'helper')) {
+    throw new KeychainClientNotStarted(service, 'unsupported Keychain command kind');
+  }
+  if (!Number.isFinite(request.timeoutMs) || request.timeoutMs <= 0) {
+    throw new KeychainClientNotStarted(service, 'invalid timeout');
+  }
+  if (request.encoding !== 'utf8' && request.encoding !== 'buffer') {
+    throw new KeychainClientNotStarted(service, 'invalid output encoding');
+  }
+  if (typeof request.file !== 'string' || !Array.isArray(request.args) || !request.args.every((arg) => typeof arg === 'string')) {
+    throw new KeychainClientNotStarted(service, 'invalid Keychain request');
+  }
+  if (!request.item || typeof request.item.service !== 'string' || typeof request.item.account !== 'string') {
+    throw new KeychainClientNotStarted(service, 'invalid Keychain item');
+  }
+  if (request.secretHex !== undefined && (typeof request.secretHex !== 'string' || !/^(?:[0-9a-f]{2})*$/.test(request.secretHex))) {
+    throw new KeychainClientNotStarted(service, 'invalid write value');
+  }
+  if (request.args.some((arg) => arg.startsWith('-X')) || (request.secretHex !== undefined && request.secretHex !== '' && request.args.includes(request.secretHex))) {
+    throw new KeychainClientNotStarted(service, 'unstructured write arguments');
+  }
+  if (request.kind === 'helper' && request.args[0] === 'set') {
+    throw new KeychainClientNotStarted(service, 'helper writes require the async runner');
+  }
+}
+
+function removeCurrentRecord(path: string): void {
+  const current = parseRecord(path);
+  if (current) removeRecordIfMatches(path, current);
+}
+
 export function runKeychainClientSync(request: KeychainRequest): string | Buffer {
-  if (request.args.includes('-X')) throw new KeychainClientNotStarted(request.item.service, 'unstructured write arguments');
+  validateRequest(request);
   assertNoWaitingClient(request.item, { psPath: request.psPath });
   if (!testClientAllowed(request.file)) throw new KeychainClientDisabledInTests();
   try {
@@ -402,11 +526,17 @@ export function runKeychainClientSync(request: KeychainRequest): string | Buffer
   } catch {
     throw new KeychainClientNotStarted(request.item.service, 'waiting registry is not writable');
   }
-
+  const reservation = reserveClientSlot(request.item);
+  const path = registryPath(request.item);
   const mode = request.secretHex === undefined ? 'r' : 'w';
-  // Keep a margin before Node's timeout so a stalled ps reports not-started.
-  const psBound = Math.max(1, Math.min(PS_TIMEOUT_MS, Math.floor(request.timeoutMs / 2)));
-  const result = spawnSync('/bin/sh', ['-c', KEYCHAIN_WAIT_SCRIPT, 'qlb-keychain-wait', mode, registryPath(request.item), usablePsPath(request.psPath), request.file, ...request.args], {
+  const deadlineMs = Date.now() + request.timeoutMs;
+  // The shell also checks deadlineMs immediately before exec.  This bound only
+  // limits its ps probe; it is not the correctness clock.
+  const psBound = Math.max(1, Math.min(PS_TIMEOUT_MS, Math.max(1, request.timeoutMs - 100)));
+  const result = spawnSync('/bin/sh', [
+    '-c', KEYCHAIN_WAIT_SCRIPT, 'qlb-keychain-wait', mode, path, usablePsPath(request.psPath),
+    String(deadlineMs), String(reservation.pid), reservation.lstart ?? '', request.file, ...request.args,
+  ], {
     detached: true,
     stdio: [mode === 'w' ? 'pipe' : 'ignore', 'pipe', 'pipe', 'pipe'],
     input: mode === 'w' ? `${request.secretHex}\n` : undefined,
@@ -419,7 +549,7 @@ export function runKeychainClientSync(request: KeychainRequest): string | Buffer
   const fd3 = result.output?.[3];
   const proved = result.error === undefined && result.status !== null && Buffer.isBuffer(fd3) && /^qlb-keychain-wait-exit \d+\n$/.test(fd3.toString('utf8'));
   if (proved) {
-    remove(registryPath(request.item));
+    removeCurrentRecord(path);
     const stderr = Buffer.isBuffer(result.stderr) ? result.stderr.toString('utf8') : String(result.stderr ?? '');
     if (result.status === 125 && stderr.includes('qlb-keychain-wait:')) {
       throw new KeychainClientNotStarted(request.item.service, 'client record was not created');
@@ -433,6 +563,9 @@ export function runKeychainClientSync(request: KeychainRequest): string | Buffer
     }
     throw Object.assign(new Error(`Command failed: ${basename(request.file)} ${request.args[0]}\n${stderr}`), { status: result.status });
   }
+  // Once Node has abandoned the outer wrapper, only its own reservation may be
+  // removed.  A filled client record remains the durable waiting claim.
+  removeRecordIfMatches(path, reservation);
   if (result.error) throw result.error;
   if (result.signal && result.status === null) {
     throw resultError('EQLBKEYCHAINWRAPPERSIGNALLED', { signal: result.signal, writeOutcome: 'unknown' });
