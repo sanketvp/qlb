@@ -218,6 +218,50 @@ describe('auto anthropic poll (G8)', () => {
     assert.equal(servedLive, true);
   });
 
+  it('a foreign live credential with a profile 500 records live-unattributed and no usage under the active account', async () => {
+    const f = await fixture();
+    await f.backend.set(f.paths.keychainService, 'fixture', credential('foreign'));
+    f.store.writeUsagePollPlans('anthropic', { inactive: { nextDueAt: NOW + 300, pollIntervalS: 300 } });
+    const deps = f.deps();
+    deps.resyncDeps.readLiveIdentity = () => ({ accountId: 'active', email: 'active@example.test', orgUuid: 'active-org' });
+    deps.resyncDeps.getProfile = async () => ({ status: 500, body: '' });
+
+    await pollAnthropic(deps);
+
+    assert.equal(f.store.listUsagePolls('anthropic').active?.lastStatus, 'live-unattributed');
+    assert.deepEqual(f.store.getAllSnapshots('active'), {});
+  });
+
+  it('a foreign live credential with a mismatching profile records foreign-credential and 0 POSTs', async () => {
+    const f = await fixture();
+    await f.backend.set(f.paths.keychainService, 'fixture', credential('foreign'));
+    f.store.writeUsagePollPlans('anthropic', { inactive: { nextDueAt: NOW + 300, pollIntervalS: 300 } });
+    const deps = f.deps();
+    deps.resyncDeps.readLiveIdentity = () => ({ accountId: 'active', email: 'active@example.test', orgUuid: 'active-org' });
+    deps.resyncDeps.getProfile = async () => ({ status: 200, body: JSON.stringify({ account: { uuid: 'other-account' } }) });
+
+    await pollAnthropic(deps);
+
+    assert.equal(f.store.listUsagePolls('anthropic').active?.lastStatus, 'foreign-credential');
+    assert.equal(f.calls().posts, 0);
+  });
+
+  it('a same-account rotation attributed by the probe in the same pass records usage', async () => {
+    const f = await fixture();
+    const rotated = credential('active-rotated');
+    await f.backend.set(f.paths.keychainService, 'fixture', rotated);
+    f.store.writeUsagePollPlans('anthropic', { inactive: { nextDueAt: NOW + 300, pollIntervalS: 300 } });
+    const deps = f.deps();
+    deps.resyncDeps.readLiveIdentity = () => ({ accountId: 'active', email: 'active@example.test', orgUuid: 'active-org' });
+    deps.resyncDeps.getProfile = async () => ({ status: 200, body: JSON.stringify({ account: { uuid: 'active' }, organization: { uuid: 'active-org' } }) });
+
+    await pollAnthropic(deps);
+
+    assert.equal(f.store.listUsagePolls('anthropic').active?.lastStatus, 'ok');
+    assert.equal(f.store.getAllSnapshots('active')['5h']?.usedPct, 20);
+    assert.equal(f.slots.getSlot('active')?.fingerprint, credentialLineage(rotated));
+  });
+
   it('a re-logged-in slot is polled again', async () => {
     const f = await fixture();
     await f.slots.writeSlot('inactive', credential('expired', (NOW - 1) * 1000), { cause: 'fixture' });
