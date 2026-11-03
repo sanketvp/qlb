@@ -23,7 +23,7 @@ import {
   KeychainBackedOff,
   KeychainHelperMissingError,
   KeychainReadBackoff,
-  execFileUtf8,
+  keychainClientExecFileSync,
   isCredentialNotFound,
   isFakeExecutor,
   isQlbTestMode,
@@ -35,6 +35,7 @@ import {
   type CredentialBackend,
   type ExecFileSyncFn,
 } from './credential-backends';
+import { isKeychainClientNotStarted, isKeychainStillWaiting } from './keychain-client';
 
 export type {
   CredentialBackend,
@@ -72,6 +73,7 @@ export {
   KeychainBackedOff,
   KeychainHelperMissingError,
   KeychainReadBackoff,
+  keychainClientExecFileSync,
   MACOS_SECURITY_BIN,
   MACOS_SECURITY_TIMEOUT_MS,
 } from './credential-backends';
@@ -266,13 +268,15 @@ function listKeychainServices(
   }
   let output: string;
   try {
-    output = String((dependencies.exec ?? execFileUtf8)(MACOS_SECURITY_BIN, ['dump-keychain'], {
+    output = String((dependencies.exec ?? keychainClientExecFileSync)(MACOS_SECURITY_BIN, ['dump-keychain'], {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: MACOS_SECURITY_TIMEOUT_MS,
       maxBuffer: KEYCHAIN_DUMP_MAX_BUFFER,
+      keychainKind: 'security',
     }));
   } catch (error) {
+    if (isKeychainStillWaiting(error) || isKeychainClientNotStarted(error)) throw error;
     if (isSecurityTimeout(error)) throw securityTimeoutError('dump-keychain');
     throw enumerationError(error);
   }
@@ -341,7 +345,7 @@ export function assertNativeOpenRouterService(
 
 export function readNativeOpenRouterKey(
   service: string,
-  exec: ExecFileSyncFn = execFileUtf8,
+  exec: ExecFileSyncFn = keychainClientExecFileSync,
   platform: NodeJS.Platform = process.platform,
 ): string {
   if (isQlbTestMode() && !isFakeExecutor(exec)) throw new NativeKeychainDisabled();
@@ -355,11 +359,13 @@ export function readNativeOpenRouterKey(
           encoding: 'utf8',
           stdio: ['ignore', 'pipe', 'ignore'],
           timeout: MACOS_SECURITY_TIMEOUT_MS,
+          keychainKind: 'security',
         },
       );
       const key = String(stdout).replace(/\n$/, '').trim();
       if (key.length > 0) return key;
     } catch (err) {
+      if (isKeychainStillWaiting(err) || isKeychainClientNotStarted(err)) throw err;
       if (isSecurityTimeout(err)) throw securityTimeoutError('find-generic-password');
       // `security` uses errSecItemNotFound (44) for a missing item. stderr is
       // intentionally discarded here, so its stable wording is only a

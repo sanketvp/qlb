@@ -1,11 +1,18 @@
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
-import { mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import childProcess = require('node:child_process');
+import { chmodSync, existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, it } from 'node:test';
+import { describe, it, mock } from 'node:test';
 
-import { isCredentialNotFound, isSecurityTimeout } from '../src/credential-backends';
+import {
+  isCredentialNotFound,
+  isSecurityTimeout,
+  keychainClientExecFileSync,
+  macosKeychainExec,
+  wrapCredentialError,
+} from '../src/credential-backends';
 import {
   DPAPI_DECRYPT_SCRIPT,
   DPAPI_ENCRYPT_SCRIPT,
@@ -16,6 +23,7 @@ import {
   WINDOWS_POWERSHELL_EXE,
   WindowsDpapiBackend,
   createRawCredentialBackend,
+  defaultCredentialBackendHost,
   linuxSecretToolClearArgs,
   linuxSecretToolLookupArgs,
   linuxSecretToolStoreArgs,
@@ -23,6 +31,13 @@ import {
   selectBackendKind,
   type ExecFileSyncFn,
 } from '../src/keychain';
+import {
+  KeychainRequestStillWaiting,
+  isKeychainStillWaiting,
+  keychainRequestFromArgv,
+  runKeychainClientSync,
+} from '../src/keychain-client';
+import { portableLockf } from './support/portable-lockf';
 
 describe('isCredentialNotFound', () => {
   it('accepts only definitive absent-item errors, including wrapped causes', () => {
@@ -46,6 +61,55 @@ describe('isCredentialNotFound', () => {
     assert.equal(isCredentialNotFound('item not found'), false);
   });
 });
+
+function withNoKillState<T>(fn: (state: { home: string; dir: string; lockfPath: string }) => T): T {
+  const state = {
+    home: mkdtempSync(join(tmpdir(), 'qlb-nokill-home-')),
+    dir: mkdtempSync(join(tmpdir(), 'qlb-nokill-fake-')),
+    lockfPath: '',
+  };
+  state.lockfPath = portableLockf(state.dir);
+  const before = { QLB_TEST_MODE: process.env.QLB_TEST_MODE, QLB_HOME: process.env.QLB_HOME, HOME: process.env.HOME };
+  Object.assign(process.env, { QLB_TEST_MODE: '1', QLB_HOME: state.home, HOME: state.home });
+  try { return fn(state); } finally {
+    for (const [key, value] of Object.entries(before)) value === undefined ? delete process.env[key] : process.env[key] = value;
+  }
+}
+
+function noKillFake(dir: string, body: string, name = 'security-fake'): string {
+  const path = join(dir, name);
+  writeFileSync(path, `#!/bin/sh\nset -eu\nd=$(dirname "$0")\n${body}\n`, { mode: 0o700 });
+  chmodSync(path, 0o700);
+  return path;
+}
+
+function waitForOwnExit(path: string, timeoutMs = 20_000): void {
+  if (!existsSync(path)) return;
+  const pid = Number(readFileSync(path, 'utf8'));
+  const until = Date.now() + timeoutMs;
+  while (Date.now() < until) {
+    try { process.kill(pid, 0); } catch { return; }
+    childProcess.spawnSync('/bin/sh', ['-c', 'sleep 0.05'], {
+      env: { ...process.env, QLB_TEST_MODE: '1', QLB_HOME: process.env.QLB_HOME!, HOME: process.env.HOME! },
+    });
+  }
+  assert.fail('own fake did not exit in time');
+}
+
+function stopOwnFake(pidPath: string): void {
+  if (!existsSync(pidPath)) return;
+  try { process.kill(Number(readFileSync(pidPath, 'utf8')), 'SIGKILL'); } catch { /* own fake already exited */ }
+}
+
+function noKillExecutor(fake: string, lockfPath: string): ExecFileSyncFn {
+  return markFakeExecutor((_file, args, options) => String(runKeychainClientSync({
+    ...keychainRequestFromArgv(options!.keychainKind!, fake, args, {
+      timeoutMs: options!.timeout as number,
+      lockfPath,
+    }),
+    lockfPath,
+  })));
+}
 
 describe('CredentialBackend dispatch', () => {
   it('selects macos-keychain on darwin regardless of secret-tool', () => {
@@ -117,6 +181,114 @@ describe('CredentialBackend dispatch', () => {
     }, { env: {} });
     assert.equal(backend.kind, 'windows-dpapi');
     assert.ok(backend instanceof WindowsDpapiBackend);
+  });
+
+  it('uses the no-kill adapter for production macOS and retains marked test executors', () => {
+    const host = defaultCredentialBackendHost();
+    assert.equal(macosKeychainExec(host), keychainClientExecFileSync);
+    const marked = markFakeExecutor(() => '');
+    assert.equal(macosKeychainExec({ ...host, execFileSync: marked }), marked);
+  });
+
+  it('refuses an adapter call without a Keychain kind before spawning', () => {
+    const spawnMock = mock.method(childProcess, 'spawnSync');
+    try {
+      assert.throws(
+        () => keychainClientExecFileSync('/usr/bin/security', ['find-generic-password', '-s', 'x', '-w'], { timeout: 1_000 }),
+        (err: unknown) => (err as { code?: unknown }).code === 'EQLBKEYCHAINNOTSTARTED',
+      );
+      assert.equal(spawnMock.mock.callCount(), 0);
+    } finally {
+      spawnMock.mock.restore();
+    }
+  });
+});
+
+describe('MacosKeychainBackend no-kill wiring', () => {
+  it('preserves waiting, timeout and unknown-write outcomes through the runner', { timeout: 30_000 }, () => {
+    withNoKillState((state) => {
+      const get = noKillFake(state.dir, 'echo $$ > "$d/get.pid"\nsleep 15', 'get-fake');
+      const backend = new MacosKeychainBackend({ execFileSync: noKillExecutor(get, state.lockfPath) });
+      const started = Date.now();
+      try {
+        assert.throws(() => backend.getSync('svc-d', 'a1'), (err: unknown) => {
+          const error = err as Error & { code?: unknown };
+          assert.equal(error.message, 'keychain get failed for service=svc-d account=a1: security find-generic-password timed out after 5s');
+          assert.equal(error.code, 'ETIMEDOUT');
+          return true;
+        });
+        assert.ok(Date.now() - started >= 4_500);
+        assert.throws(() => backend.getSync('svc-d', 'a2'), (err: unknown) => {
+          const error = err as Error & { reason?: unknown };
+          assert.match(error.message, /is still waiting for an answer/);
+          assert.equal(isSecurityTimeout(error), true);
+          assert.equal(isKeychainStillWaiting(error), true);
+          assert.equal(error.reason, 'still-waiting');
+          return true;
+        });
+        assert.throws(() => backend.setSync('svc-d', 'a3', '{}'), (err: unknown) => {
+          assert.equal((err as { writeOutcome?: unknown }).writeOutcome, 'not-started');
+          assert.match((err as Error).message, /is still waiting for an answer/);
+          return true;
+        });
+      } finally {
+        stopOwnFake(join(state.dir, 'get.pid'));
+        waitForOwnExit(join(state.dir, 'get.pid'));
+      }
+
+      const set = noKillFake(state.dir, 'echo $$ > "$d/set.pid"\nsleep 15', 'set-fake');
+      const timedSet = new MacosKeychainBackend({ execFileSync: noKillExecutor(set, state.lockfPath) });
+      try {
+        assert.throws(() => timedSet.setSync('svc-set', 'a', '{}'), (err: unknown) => {
+          const error = err as Error & { code?: unknown; writeOutcome?: unknown };
+          assert.equal(error.message, 'security add-generic-password timed out after 5s');
+          assert.equal(error.code, 'ETIMEDOUT');
+          assert.equal(error.writeOutcome, 'unknown');
+          return true;
+        });
+      } finally {
+        stopOwnFake(join(state.dir, 'set.pid'));
+        waitForOwnExit(join(state.dir, 'set.pid'));
+      }
+
+      const del = noKillFake(state.dir, 'echo $$ > "$d/delete.pid"\nsleep 15', 'delete-fake');
+      const timedDelete = new MacosKeychainBackend({ execFileSync: noKillExecutor(del, state.lockfPath) });
+      try {
+        assert.throws(() => timedDelete.deleteSync('svc-delete', 'a'), (err: unknown) => {
+          const error = err as Error & { code?: unknown; writeOutcome?: unknown };
+          assert.match(error.message, /^keychain delete failed for service=svc-delete account=a:/);
+          assert.equal(error.code, 'ETIMEDOUT');
+          assert.equal(error.writeOutcome, 'unknown');
+          return true;
+        });
+      } finally {
+        stopOwnFake(join(state.dir, 'delete.pid'));
+        waitForOwnExit(join(state.dir, 'delete.pid'));
+      }
+    });
+  });
+
+  it('turns a no-proof write into a content-free unknown outcome', () => {
+    withNoKillState((state) => {
+      const fake = noKillFake(state.dir, 'exit 0');
+      const noProofLockf = noKillFake(state.dir, 'exit 0', 'no-proof-lockf');
+      const backend = new MacosKeychainBackend({ execFileSync: noKillExecutor(fake, noProofLockf) });
+      assert.throws(() => backend.setSync('svc-i', 'a', '{}'), (err: unknown) => {
+        const error = err as Error & { code?: unknown; writeOutcome?: unknown };
+        assert.equal(error.message, 'keychain set failed for service=svc-i account=a');
+        assert.equal(error.code, 'EQLBKEYCHAINWRAPPERNOPROOF');
+        assert.equal(error.writeOutcome, 'unknown');
+        return true;
+      });
+    });
+  });
+
+  it('wrapCredentialError retains reason and write outcome', () => {
+    const wrapped = wrapCredentialError('delete', 'svc', 'a', Object.assign(
+      new KeychainRequestStillWaiting('svc'), { writeOutcome: 'not-started' },
+    ));
+    assert.equal((wrapped as { reason?: unknown }).reason, 'still-waiting');
+    assert.equal((wrapped as { writeOutcome?: unknown }).writeOutcome, 'not-started');
   });
 });
 

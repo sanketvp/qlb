@@ -20,6 +20,7 @@ import {
   securityTimeoutError,
   type ExecFileSyncFn,
 } from './credential-backends';
+import { isKeychainClientNotStarted, isKeychainStillWaiting } from './keychain-client';
 import {
   defaultCommandExists,
   defaultKeychainHelperPath,
@@ -321,6 +322,7 @@ export function inspectProviders(
   const openrouterSupported = config.openrouterKeychainService === OPENROUTER_KEYCHAIN_SERVICE;
   let openrouterOk = false;
   let openrouterTimedOut = false;
+  let openrouterKeychainError: unknown;
   if (openrouterSupported) {
     try {
       if (command === runCommand) {
@@ -331,6 +333,7 @@ export function inspectProviders(
         ]).trim().length > 0;
       }
     } catch (err) {
+      openrouterKeychainError = err;
       openrouterTimedOut = isSecurityTimeout(err);
     }
   }
@@ -359,9 +362,11 @@ export function inspectProviders(
       ? unsupportedOpenRouterService(config.openrouterKeychainService)
       : openrouterOk
         ? found('openrouter', openrouterSource, CONFIG_ENV_VARS.openrouterKeychainService, `export ${CONFIG_ENV_VARS.openrouterKeychainService}=pi-openrouter`)
-        : openrouterTimedOut
-          ? timedOutFixedOpenRouter(openrouterSource)
-          : missingFixedOpenRouter(openrouterSource, openrouterExample),
+        : isKeychainStillWaiting(openrouterKeychainError) || isKeychainClientNotStarted(openrouterKeychainError)
+          ? failedFixedOpenRouter(openrouterSource, openrouterKeychainError)
+          : openrouterTimedOut
+            ? timedOutFixedOpenRouter(openrouterSource)
+            : missingFixedOpenRouter(openrouterSource, openrouterExample),
   ];
 }
 
@@ -374,6 +379,17 @@ function openRouterSourceLabel(service: string): string {
   });
   if (kind === 'linux-libsecret') return `libsecret service ${service}`;
   return `encrypted credential file service ${service}`;
+}
+
+function failedFixedOpenRouter(source: string, error: unknown): ProviderDiagnostic {
+  return {
+    provider: 'openrouter',
+    level: 'WARN',
+    source,
+    envVar: CONFIG_ENV_VARS.openrouterKeychainService,
+    example: '',
+    message: error instanceof Error ? error.message : String(error),
+  };
 }
 
 function timedOutFixedOpenRouter(source: string): ProviderDiagnostic {
