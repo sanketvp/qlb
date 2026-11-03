@@ -7,7 +7,7 @@ import {
   type CodexGateHttpResponse,
   type G0Capture,
 } from '../src/codex-gate';
-import { parseArgs, prepareCommandArgv } from '../src/cli';
+import { parseArgs, prepareCommandArgv } from '../src/app';
 import { openStore } from '../src/store';
 
 /**

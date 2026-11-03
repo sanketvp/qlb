@@ -8,7 +8,7 @@ import test from 'node:test';
 import { defaultConfig } from '../src/config';
 import { credentialFingerprint } from '../src/anthropic-oauth';
 import { createCutoverCommand } from '../src/commands/cutover';
-import { runExecutingCommand } from '../src/cli';
+import { runExecutingCommand } from '../src/app';
 import { CSWAP_ANTHROPIC_STORE, CONSUME_STATE } from '../src/cswap-consume';
 import { CUTOVER_BEGIN_IN_PROGRESS, beginCutover, phase } from '../src/lifecycle';
 import type { CswapAgent } from '../src/cswap-agent';

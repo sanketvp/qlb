@@ -10,7 +10,7 @@ import { openStore } from '../src/store';
 import { ADAPTER_ACCOUNT_IDS, Migration, PI_POOL_STORE } from '../src/migration';
 import { sharedSingleGrantCoords } from '../src/single-grant-ownership';
 import { piAuthBackupPath } from '../src/pi-auth-backup';
-import { exitCodeForError, runExecutingCommand } from '../src/cli';
+import { exitCodeForError, runExecutingCommand } from '../src/app';
 import { executePiRollback } from '../src/commands/pi-rollback';
 import {
   assertDirOutsideGitWorktree,

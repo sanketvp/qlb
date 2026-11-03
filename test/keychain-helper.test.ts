@@ -17,7 +17,7 @@ import {
   HELPER_MATRIX_CASE_TIMEOUT_MS, HELPER_MATRIX_LAUNCHD_TIMEOUT_MS, helperMatrixConfig, helperMatrixIsOk, helperSigningState,
   parseHelperMatrixResult, parseLaunchdMatrixReceipt, runHelperMatrix, runHelperMatrixUnderLaunchd, runKeychainCommand,
 } from '../src/commands/keychain';
-import { exitCodeForError, runExecutingCommand } from '../src/cli';
+import { exitCodeForError, runExecutingCommand } from '../src/app';
 import { KeychainHelperUntrustedError } from '../src/credential-backends';
 import { inspectHelperSigning, verifyHelperIdentity } from '../src/diagnostics';
 import type { CommandContext } from '../src/registry';

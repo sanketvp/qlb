@@ -9,7 +9,7 @@ import tokenCommand, {
   tokenCallAllowed,
   type TokenCommandDeps,
 } from '../src/commands/token';
-import { createCommandContext, runExecutingCommand } from '../src/cli';
+import { createCommandContext, runExecutingCommand } from '../src/app';
 import { MockKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from '../src/keychain';
 import { resolve as resolveKimi } from '../src/token/kimi-coding';
 import { resolve as resolveOpenRouter } from '../src/token/openrouter';
