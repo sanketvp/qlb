@@ -121,8 +121,9 @@ describe('cache-only export', () => {
     writeFileSync(guard, `
 const Module = require('node:module');
 const load = Module._load;
+const allowed = new Set(['./export', './config', './home', './schema-version', './usage-freshness']);
 Module._load = function(request, parent, isMain) {
-  if (/(^|\\/)(adapters|credentials|credential-backends|keychain)(\\/|$)/.test(request)) {
+  if (!request.startsWith('node:') && !allowed.has(request)) {
     throw new Error('forbidden module loaded: ' + request);
   }
   return load.call(this, request, parent, isMain);
@@ -136,7 +137,9 @@ Module._load = function(request, parent, isMain) {
     const guard = join(mkdtempSync(join(tmpdir(), 'qlb-cli-guard-')), 'guard.cjs');
     writeFileSync(guard, `
 const childProcess = require('node:child_process');
-childProcess.spawnSync = () => { throw new Error('unexpected child process'); };
+for (const name of ['spawn', 'spawnSync', 'exec', 'execSync', 'execFile', 'execFileSync', 'fork']) {
+  childProcess[name] = () => { throw new Error('unexpected child process'); };
+}
 `);
     const output = execFileSync(process.execPath, [`--require=${guard}`, cliPath, '--list-commands', '--json'], {
       encoding: 'utf8',
