@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { describe, it } from 'node:test';
 
 import { recordRelogin } from '../src/relogin';
@@ -141,5 +142,77 @@ describe('status switch and relogin history', () => {
     assert.equal(result.status, 0, result.stderr);
     assert.doesNotMatch(result.stdout, new RegExp(token));
     assert.match(result.stdout, /\[redacted\]/);
+  });
+
+  it('scrubs legacy relogin detail on read when the scrub marker is absent', () => {
+    const f = fixture();
+    const store = seedStore(f);
+    store.close();
+    const sensitiveDetail = 'legacy customer recovery note';
+    const db = new DatabaseSync(f.dbPath);
+    try {
+      db.prepare("DELETE FROM config WHERE key = 'relogin.scrubbedAt'").run();
+      db.prepare(`INSERT INTO relogin_events (ts, provider, account_id, kind, detail, evidence)
+        VALUES (?, ?, ?, ?, ?, ?)`).run(START, 'anthropic', 'account-a', 'external-login', sensitiveDetail, 'invalid');
+    } finally {
+      db.close();
+    }
+
+    const result = runCli(['status', '--relogins', '--json'], f.env);
+    assert.equal(result.status, 0, result.stderr);
+    assert.doesNotMatch(result.stdout, new RegExp(sensitiveDetail));
+    const body = JSON.parse(result.stdout) as { relogins: Array<{ detail: string | null; evidence: string | null }> };
+    assert.match(body.relogins[0]?.detail ?? '', /^sha256:[0-9a-f]{16}$/);
+    assert.equal(body.relogins[0]?.evidence, null);
+    const after = new DatabaseSync(f.dbPath, { readOnly: true });
+    try {
+      assert.equal(after.prepare("SELECT 1 FROM config WHERE key = 'relogin.scrubbedAt'").get(), undefined);
+      assert.equal((after.prepare('SELECT detail FROM relogin_events').get() as { detail: string }).detail, sensitiveDetail);
+    } finally {
+      after.close();
+    }
+  });
+
+  it('refuses history on a schema that requires migration', () => {
+    const f = fixture();
+    const store = seedStore(f);
+    store.close();
+    const db = new DatabaseSync(f.dbPath);
+    try {
+      db.exec('PRAGMA user_version = 4');
+    } finally {
+      db.close();
+    }
+
+    const result = runCli(['status', '--switches', '--json'], f.env);
+    assert.equal(result.status, 3, result.stderr);
+    assert.equal(result.stderr, 'qlb status: refused: schema-migration-required\n');
+  });
+
+  it('returns empty unwindowed history for a missing store and no-cutover-window when windowed', () => {
+    const f = fixture();
+    for (const history of ['--switches', '--relogins']) {
+      const unwindowed = runCli(['status', history, '--json'], f.env);
+      assert.equal(unwindowed.status, 0, unwindowed.stderr);
+      assert.deepEqual(JSON.parse(unwindowed.stdout), history === '--switches' ? { switches: [] } : { relogins: [] });
+    }
+    const windowed = runCli(['status', '--switches', '--window', '--json'], f.env);
+    assert.equal(windowed.status, 3, windowed.stderr);
+    assert.match(windowed.stderr, /no-cutover-window/);
+  });
+
+  it('resolve rejects history flags before writing a routing decision', () => {
+    const f = fixture();
+    const result = runCli(['resolve', '--model', 'claude-opus-4', '--switches'], f.env);
+    assert.equal(result.status, 2, result.stderr);
+    assert.match(result.stderr, /only valid with status/);
+    assert.equal(existsSync(f.dbPath), false);
+  });
+
+  it('rejects --dashboard with history output', () => {
+    const f = fixture();
+    const result = runCli(['status', '--dashboard', '--switches'], f.env);
+    assert.equal(result.status, 2, result.stderr);
+    assert.match(result.stderr, /--dashboard and --flat cannot be used with history output/);
   });
 });
