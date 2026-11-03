@@ -60,6 +60,8 @@ export type ActiveFetchSentinel =
 /** The value-free result handed to the usage collector by later K6 slices. */
 export interface ActiveFetchRecord {
   usage?: unknown;
+  /** Lineage of the credential that produced accepted usage; never credential content. */
+  servedLineage?: string | null;
   error?: string;
   sentinel?: ActiveFetchSentinel;
   retryAfterS?: number;
@@ -461,7 +463,7 @@ async function fetchUsageRecord(
   if (deps.verdicts.get(input.accountId, input.email, credentialLineage(creds) ?? '', input.orgUuid)?.match === false) {
     return { sentinel: 'foreign-credential' };
   }
-  return { usage };
+  return { usage, servedLineage: credentialLineage(creds) };
 }
 
 export type RefreshOutcomeMapping = ActiveFetchRecord | { working: string };

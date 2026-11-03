@@ -518,10 +518,11 @@ describe('Claude active usage fetch (K6-4)', () => {
   it('the rotated token is used for the usage fetch after the refresh', async () => {
     const fixture = await refreshFixture();
     const used: string[] = [];
-    await fetch(fixture, async (token) => { used.push(token); return { status: 200, body: usageBody() }; }, {
+    const result = await fetch(fixture, async (token) => { used.push(token); return { status: 200, body: usageBody() }; }, {
       postRefresh: async () => ({ status: 200, body: JSON.stringify({ access_token: 'access-rotated', refresh_token: 'refresh-rotated', expires_in: 3600 }) }),
     });
     assert.deepEqual(used, ['access-rotated']);
+    assert.equal(result.servedLineage, credentialLineage(credential('rotated', NOW + 60 * 60_000)));
   });
 
   it('a stashed or unpersisted successor yields token-expired and no usage GET', async () => {

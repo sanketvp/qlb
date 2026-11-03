@@ -7,7 +7,7 @@ export { STALE_OK_S };
 export const TRUST_MAX_AGE_S = 3600;
 export const RATE_LIMIT_TRUST_MAX_AGE_S = 7200;
 const QLB_USAGE_PHASES = new Set(['cutting-over', 'cutover', 'retired']);
-const HARD_SENTINEL_STATUSES = new Set(['token-expired', 'foreign-credential', 'keychain-unavailable', 'no-credentials', 'relogin-needed']);
+const HARD_SENTINEL_STATUSES = new Set(['token-expired', 'foreign-credential', 'live-unattributed', 'keychain-unavailable', 'no-credentials', 'relogin-needed']);
 
 /** The read-only slot fields required to render persisted Anthropic usage. */
 export interface AnthropicUsageSlot {
