@@ -83,8 +83,12 @@ function killOwn(path: string): void {
   }
 }
 
+// lockf(1) is macOS-only; CI runs on Linux, where these runner tests cannot execute.
+const needsLockf = { skip: existsSync(KEYCHAIN_LOCKF_BIN) ? false : 'requires macOS /usr/bin/lockf' };
+
+
 describe('keychain client lockf runner', () => {
-  it('(a,b,s) returns fast output, preserves client status, and creates a permanent private lock file', () => {
+  it('(a,b,s) returns fast output, preserves client status, and creates a permanent private lock file', needsLockf, () => {
     const s = state();
     withState(s, () => {
       const good = fake(s, 'printf "v\\n"');
@@ -141,7 +145,7 @@ describe('keychain client lockf runner', () => {
     });
   });
 
-  it('distinguishes lockf exit 75 from a real client exit 75 by the fd-3 sentinel', () => {
+  it('distinguishes lockf exit 75 from a real client exit 75 by the fd-3 sentinel', needsLockf, () => {
     const s = state();
     withState(s, () => {
       const status75 = fake(s, 'exit 75');
@@ -159,7 +163,7 @@ describe('keychain client lockf runner', () => {
     });
   });
 
-  it('classifies a pre-start deadline as not-started and preserves unknown timeout writes', () => {
+  it('classifies a pre-start deadline as not-started and preserves unknown timeout writes', needsLockf, () => {
     const s = state();
     withState(s, () => {
       const client = fake(s, 'echo client-ran > "$d/client-ran"');
@@ -203,7 +207,7 @@ exec "$shell" "$flag" "$script" "$name" "$mode" 0 "$@"`, 'expired-lockf');
     });
   });
 
-  it('closes the fd-3 sentinel pipe before execing the client', () => {
+  it('closes the fd-3 sentinel pipe before execing the client', needsLockf, () => {
     const s = state();
     withState(s, () => {
       const client = fake(s, `if ( : >&3 ) 2>/dev/null; then echo open > "$d/fd3"; else echo closed > "$d/fd3"; fi`);
@@ -212,7 +216,7 @@ exec "$shell" "$flag" "$script" "$name" "$mode" 0 "$@"`, 'expired-lockf');
     });
   });
 
-  it('(c,d,e,f) times out without signalling the client, blocks only its service, and releases after its exit', () => {
+  it('(c,d,e,f) times out without signalling the client, blocks only its service, and releases after its exit', needsLockf, () => {
     const s = state();
     withState(s, () => {
       const hold = fake(s, `trap 'echo signal > "$d/signalled"' TERM HUP INT
@@ -238,7 +242,7 @@ sleep 20`);
     });
   });
 
-  it('uses one service lock for service-only and account-qualified requests in both directions', () => {
+  it('uses one service lock for service-only and account-qualified requests in both directions', needsLockf, () => {
     const s = state();
     withState(s, () => {
       const hold = fake(s, 'echo $$ > "$d/pid"\nsleep 20');
@@ -254,7 +258,7 @@ sleep 20`);
     });
   });
 
-  it('(g,h,i,j,k) refuses real clients and keeps the write hex off lockf and shell argv', () => {
+  it('(g,h,i,j,k) refuses real clients and keeps the write hex off lockf and shell argv', needsLockf, () => {
     const s = state();
     withState(s, () => {
       assert.throws(() => runKeychainClientSync(request('/usr/bin/security', 'svc-disabled')), KeychainClientDisabledInTests);
@@ -276,7 +280,7 @@ sleep 20`);
     });
   });
 
-  it('(j) consumes only the write hex line and gives the client /dev/null stdin', () => {
+  it('(j) consumes only the write hex line and gives the client /dev/null stdin', needsLockf, () => {
     const s = state();
     withState(s, () => {
       const writer = fake(s, 'cat > "$d/stdin-rest"');
@@ -287,7 +291,7 @@ sleep 20`);
     });
   });
 
-  it('atomically allows exactly one of two concurrent QLB processes to start a service client', async () => {
+  it('atomically allows exactly one of two concurrent QLB processes to start a service client', needsLockf, async () => {
     const s = state();
     const runner = fake(s, 'echo started >> "$d/started"\nsleep 0.5');
     const caller = join(s.dir, 'caller.cjs');
@@ -300,7 +304,7 @@ sleep 20`);
     assert.equal(readFileSync(join(s.dir, 'started'), 'utf8').trim().split('\n').length, 1);
   });
 
-  it('(q) keeps lockf holding the service lock after the QLB process is SIGKILLed, then releases it', async () => {
+  it('(q) keeps lockf holding the service lock after the QLB process is SIGKILLed, then releases it', needsLockf, async () => {
     const s = state();
     const runner = fake(s, 'echo $$ > "$d/pid"\necho started > "$d/started"\nsleep 20');
     const caller = join(s.dir, 'die.cjs');
@@ -317,7 +321,7 @@ sleep 20`);
     } finally { killOwn(join(s.dir, 'pid')); }
   });
 
-  it('(r) retains the lock after a foreign outer-wrapper SIGKILL until the client exits', async () => {
+  it('(r) retains the lock after a foreign outer-wrapper SIGKILL until the client exits', needsLockf, async () => {
     const s = state();
     const runner = fake(s, 'outer=$(ps -o ppid= -p "$PPID" | tr -d " ")\necho "$outer" > "$d/outer"\nsleep 1');
     const caller = join(s.dir, 'foreign.cjs');
@@ -332,7 +336,7 @@ sleep 20`);
     withState(s, () => waitForFree('svc-foreign', 2_500));
   });
 
-  it('returns within timeout while a fake holds stdout open, leaving it unsignalled', () => {
+  it('returns within timeout while a fake holds stdout open, leaving it unsignalled', needsLockf, () => {
     const s = state();
     withState(s, () => {
       const hold = fake(s, `trap 'echo signal > "$d/signalled"' TERM HUP INT
