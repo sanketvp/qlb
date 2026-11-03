@@ -130,13 +130,64 @@ describe('keychain client lockf runner', () => {
     });
   });
 
-  it('puts locks under .qlb and refuses a symlinked lock directory', () => {
+  it('(S1b a) reports a non-private lock directory as not-started without running a client', () => {
     const s = state();
     withState(s, () => {
+      const client = fake(s, 'echo ran > "$d/non-private-ran"');
+      const directory = join(s.home, '.qlb', 'keychain-locks');
+      mkdirSync(directory, { recursive: true, mode: 0o700 });
+      chmodSync(directory, 0o755);
+      const expected = 'Keychain request for svc-a was not started: lock directory is not private';
+      for (const action of [
+        () => runKeychainClientSync(request(s, client, 'svc-a')),
+        () => keychainLockForService('svc-a'),
+      ]) {
+        assert.throws(action, (err: unknown) => {
+          assert.equal((err as { code?: unknown }).code, 'EQLBKEYCHAINNOTSTARTED');
+          assert.equal((err as Error).message, expected);
+          return true;
+        });
+      }
+      assert.equal(existsSync(join(s.dir, 'non-private-ran')), false);
+    });
+  });
+
+  it('(S1b b) reports a symlinked lock directory as not-started without running a client', () => {
+    const s = state();
+    withState(s, () => {
+      const client = fake(s, 'echo ran > "$d/symlink-ran"');
       mkdirSync(join(s.home, '.qlb'), { mode: 0o700 });
       symlinkSync(s.dir, join(s.home, '.qlb', 'keychain-locks'));
-      assert.throws(() => keychainLockForService('svc-link'), (err: unknown) => (err as { code?: unknown }).code === 'EQLBKEYCHAINDISABLED');
+      const expected = 'Keychain request for svc-link was not started: lock directory is not private';
+      for (const action of [
+        () => runKeychainClientSync(request(s, client, 'svc-link')),
+        () => keychainLockForService('svc-link'),
+      ]) {
+        assert.throws(action, (err: unknown) => {
+          assert.equal((err as { code?: unknown }).code, 'EQLBKEYCHAINNOTSTARTED');
+          assert.equal((err as Error).message, expected);
+          return true;
+        });
+      }
+      assert.equal(existsSync(join(s.dir, 'symlink-ran')), false);
       assert.equal(isKeychainServiceBusy('svc-link', { lockfPath: s.lockfPath }), true, 'the display probe fails closed');
+    });
+  });
+
+  it('(S1b c) reports a lock-file open failure as not-started without running a client', () => {
+    const s = state();
+    withState(s, () => {
+      const client = fake(s, 'echo ran > "$d/open-failure-ran"');
+      const directory = join(s.home, '.qlb', 'keychain-locks');
+      mkdirSync(directory, { recursive: true, mode: 0o700 });
+      chmodSync(directory, 0o700);
+      symlinkSync('/dev/null', lockPath(s.home, 'svc-c'));
+      assert.throws(() => runKeychainClientSync(request(s, client, 'svc-c')), (err: unknown) => {
+        assert.equal((err as { code?: unknown }).code, 'EQLBKEYCHAINNOTSTARTED');
+        assert.equal((err as Error).message, 'Keychain request for svc-c was not started: lock file could not be opened');
+        return true;
+      });
+      assert.equal(existsSync(join(s.dir, 'open-failure-ran')), false);
     });
   });
 
