@@ -1,8 +1,8 @@
 import { execFileSync, spawn } from 'node:child_process';
-import { createHash } from 'node:crypto';
-import { chmodSync, closeSync, copyFileSync, existsSync, fstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
+import { chmodSync, closeSync, copyFileSync, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { isAbsolute, join, relative, resolve } from 'node:path';
 import { defaultKeychainHelperPath, KeychainHelperMissingError, MACOS_SECURITY_TIMEOUT_MS } from '../keychain';
 import { CONFIG_ENV_VARS } from '../config';
 import { qlbHomeDir } from '../home';
@@ -15,25 +15,35 @@ import {
   type HelperIdentityVerification,
   type HelperSigningState,
 } from '../diagnostics';
-import { openStore } from '../store';
+import { openStore, openStoreConnection } from '../store';
 import type { CommandDefinition, CommandContext } from '../registry';
 
-export type HelperMatrixCase = 'pass' | 'fail' | 'not-applicable';
-type HelperMatrixCaseName = 'securityCreated' | 'securityUntrusted' | 'previousHelper' | 'helperCreated';
+export type HelperMatrixCase = 'pass' | 'fail';
+type HelperMatrixCaseName = 'securityCreated' | 'securityUpdated' | 'helperDeleted';
 export interface HelperMatrixResult {
   cases: Record<HelperMatrixCaseName, HelperMatrixCase>;
   /** S50 prompt evidence retained separately for each disposable case. */
   casePrompted: Record<HelperMatrixCaseName, boolean>;
-  /** A first install has no previous helper, so that one case is not applicable. */
+  /** Stable, payload-free operational reason for a failed disposable case. */
   caseReasons: Record<HelperMatrixCaseName, string | null>;
   prompted: boolean;
 }
 
-type MatrixRunner = (path: string, args: string[]) => string;
+export type MatrixCommandRunner = (path: string, args: readonly string[]) => void;
+
+export interface HelperMatrixDependencies {
+  /** Injectable so matrix tests use fakes and never invoke the real Keychain. */
+  run?: MatrixCommandRunner;
+  now?: () => number;
+  randomId?: () => string;
+  platform?: NodeJS.Platform;
+  /** Private LaunchAgent handoff: written before any disposable item exists. */
+  cleanupManifestPath?: string;
+}
 
 class MatrixReceiptError extends Error {
-  constructor(readonly result: HelperMatrixResult | null) {
-    super('helper matrix receipt is not green');
+  constructor(readonly result: HelperMatrixResult | null, message = 'helper matrix receipt is not green') {
+    super(message);
   }
 }
 
@@ -48,23 +58,34 @@ function usage(ctx: CommandContext): number {
   return 2;
 }
 
-function parse(args: string[]): { subcommand: KeychainSubcommand; json: boolean; cswap: boolean; live: boolean } | null {
+function parse(args: string[]): { subcommand: KeychainSubcommand; json: boolean; cswap: boolean; live: boolean; internalMatrix: boolean; internalHelperPath: string | null; cleanupManifestPath: string | null; privateRunDirectory: string | null } | null {
   const [subcommand, ...flags] = args;
   if (subcommand === 'matrix' || subcommand === 'check-launchd') {
+    const internalMatrix = subcommand === 'matrix' && flags[0] === '--internal';
+    if (internalMatrix) {
+      const helperFlag = flags[1];
+      const manifestFlag = flags[2];
+      const runDirectoryFlag = flags[3];
+      const helperPath = helperFlag?.startsWith('--helper-path=') ? helperFlag.slice('--helper-path='.length) : null;
+      const cleanupManifestPath = manifestFlag?.startsWith('--cleanup-manifest=') ? manifestFlag.slice('--cleanup-manifest='.length) : null;
+      const privateRunDirectory = runDirectoryFlag?.startsWith('--run-directory=') ? runDirectoryFlag.slice('--run-directory='.length) : null;
+      if (flags.length !== 4 || !helperPath || !cleanupManifestPath || !privateRunDirectory || !isAbsolute(helperPath) || !isAbsolute(cleanupManifestPath) || !isAbsolute(privateRunDirectory)) return null;
+      return { subcommand, json: false, cswap: false, live: false, internalMatrix: true, internalHelperPath: helperPath, cleanupManifestPath, privateRunDirectory };
+    }
     const live = flags.filter((flag) => flag === '--live').length === 1;
     if (flags.some((flag) => flag !== '--json' && flag !== '--live') || flags.filter((flag) => flag === '--json').length > 1 || flags.filter((flag) => flag === '--live').length > 1) return null;
     if (subcommand !== 'check-launchd' && live) return null;
-    return { subcommand, json: flags.includes('--json'), cswap: false, live };
+    return { subcommand, json: flags.includes('--json'), cswap: false, live, internalMatrix: false, internalHelperPath: null, cleanupManifestPath: null, privateRunDirectory: null };
   }
   if (subcommand === 'authorize') {
     const cswap = flags.filter((flag) => flag === 'cswap').length === 1;
     if (flags.some((flag) => flag !== '--json' && flag !== 'cswap') || flags.filter((flag) => flag === '--json').length > 1 || flags.filter((flag) => flag === 'cswap').length > 1) return null;
-    return { subcommand, json: flags.includes('--json'), cswap, live: false };
+    return { subcommand, json: flags.includes('--json'), cswap, live: false, internalMatrix: false, internalHelperPath: null, cleanupManifestPath: null, privateRunDirectory: null };
   }
   return null;
 }
 
-/** Parses the native helper's deliberately payload-free matrix receipt. */
+/** Parses QLB's deliberately payload-free matrix receipt. */
 export function parseHelperMatrixResult(text: string): HelperMatrixResult {
   const value = JSON.parse(text) as {
     cases?: Record<string, unknown>;
@@ -73,14 +94,11 @@ export function parseHelperMatrixResult(text: string): HelperMatrixResult {
     prompted?: unknown;
   };
   const { cases, casePrompted, caseReasons } = value;
-  const keys = ['securityCreated', 'securityUntrusted', 'previousHelper', 'helperCreated'] as const;
+  const keys = ['securityCreated', 'securityUpdated', 'helperDeleted'] as const;
   if (!cases || !casePrompted || !caseReasons || typeof cases !== 'object' || typeof casePrompted !== 'object' || typeof caseReasons !== 'object' || typeof value.prompted !== 'boolean') throw new Error('invalid helper matrix receipt');
   for (const key of keys) {
     const outcome = cases[key];
-    if ((outcome !== 'pass' && outcome !== 'fail' && outcome !== 'not-applicable') || typeof casePrompted[key] !== 'boolean' || (caseReasons[key] !== null && typeof caseReasons[key] !== 'string')) {
-      throw new Error('invalid helper matrix receipt');
-    }
-    if (outcome === 'not-applicable' && (key !== 'previousHelper' || caseReasons[key] !== 'no previous helper')) {
+    if ((outcome !== 'pass' && outcome !== 'fail') || typeof casePrompted[key] !== 'boolean' || (caseReasons[key] !== null && typeof caseReasons[key] !== 'string')) {
       throw new Error('invalid helper matrix receipt');
     }
   }
@@ -95,71 +113,323 @@ export function parseHelperMatrixResult(text: string): HelperMatrixResult {
 export function helperMatrixIsOk(result: HelperMatrixResult): boolean {
   return !result.prompted &&
     result.cases.securityCreated === 'pass' &&
-    result.cases.securityUntrusted === 'pass' &&
-    result.cases.helperCreated === 'pass' &&
-    (result.cases.previousHelper === 'pass' || result.cases.previousHelper === 'not-applicable');
+    result.cases.securityUpdated === 'pass' &&
+    result.cases.helperDeleted === 'pass';
 }
 
-function assertHelperReady(path: string): void {
-  if (process.platform !== 'darwin') throw new Error('Keychain helper matrix is available only on macOS');
+export const HELPER_MATRIX_CASE_TIMEOUT_MS = 20_000;
+/** Security/helper operations exceeding this cannot establish a prompt-free result. */
+export const HELPER_MATRIX_PROMPT_SIGNAL_MS = 1_000;
+// Two create/read steps, three create/update/read steps, three create/delete/read
+// steps, and three cleanup steps all run serially in the LaunchAgent.
+const HELPER_MATRIX_STEP_COUNT = 11;
+// Reserve a minute for LaunchAgent scheduling beyond every bounded serial step.
+export const HELPER_MATRIX_LAUNCHD_TIMEOUT_MS = HELPER_MATRIX_STEP_COUNT * HELPER_MATRIX_CASE_TIMEOUT_MS + 60_000;
+
+function assertHelperReady(path: string, platform: NodeJS.Platform = process.platform): void {
+  if (platform !== 'darwin') throw new Error('Keychain helper matrix is available only on macOS');
   if (!existsSync(path)) throw new KeychainHelperMissingError(path);
 }
 
-function executeMatrix(path: string, args: string[]): string {
-  try {
-    return execFileSync(path, args, {
-      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: MACOS_SECURITY_TIMEOUT_MS,
-    });
-  } catch (err) {
-    // The helper prints its payload-free receipt before returning a failing exit code.
-    const stdout = (err as { stdout?: unknown }).stdout;
-    if (typeof stdout === 'string' && stdout.length > 0) return stdout;
-    if (Buffer.isBuffer(stdout)) return stdout.toString('utf8');
-    throw err;
-  }
+function executeMatrixCommand(path: string, args: readonly string[]): void {
+  // Never collect stdout/stderr: the matrix neither needs nor may expose values.
+  execFileSync(path, args, {
+    encoding: 'utf8', stdio: 'ignore', timeout: HELPER_MATRIX_CASE_TIMEOUT_MS,
+  });
 }
 
-/** Executes only the disposable four-case helper matrix; no credential bytes are accepted here. */
-export function runHelperMatrix(path: string = helperPath(), runner: MatrixRunner = executeMatrix): HelperMatrixResult {
-  assertHelperReady(path);
-  return parseHelperMatrixResult(runner(path, ['matrix', 'qlb-test-matrix-', join(process.env.HOME ?? '', '.qlb/helper-prev/qlb-keychain-helper')]));
+function isMissingItem(err: unknown): boolean {
+  return !!err && typeof err === 'object' && (err as { status?: unknown }).status === 44;
+}
+
+/**
+ * Runs only prompt-free disposable cases. QLB itself owns creation and reads;
+ * the helper is exercised solely for its retained delete capability.
+ */
+export function runHelperMatrix(path: string = helperPath(), dependencies: HelperMatrixDependencies = {}): HelperMatrixResult {
+  assertHelperReady(path, dependencies.platform);
+  const run = dependencies.run ?? executeMatrixCommand;
+  const now = dependencies.now ?? Date.now;
+  const suffix = (dependencies.randomId ?? randomUUID)().toLowerCase();
+  const account = 'qlb';
+  const services: Record<HelperMatrixCaseName, string> = {
+    securityCreated: `qlb-test-matrix-${suffix}-create`,
+    securityUpdated: `qlb-test-matrix-${suffix}-update`,
+    helperDeleted: `qlb-test-matrix-${suffix}-delete`,
+  };
+  const cases: Record<HelperMatrixCaseName, HelperMatrixCase> = {
+    securityCreated: 'fail', securityUpdated: 'fail', helperDeleted: 'fail',
+  };
+  const casePrompted: Record<HelperMatrixCaseName, boolean> = {
+    securityCreated: false, securityUpdated: false, helperDeleted: false,
+  };
+  const caseReasons: Record<HelperMatrixCaseName, string | null> = {
+    securityCreated: null, securityUpdated: null, helperDeleted: null,
+  };
+  // The parent reads this only if the one-shot LaunchAgent fails or times out.
+  // Write before the first create so it can remove only our disposable services.
+  if (dependencies.cleanupManifestPath) {
+    writeFileSync(dependencies.cleanupManifestPath, JSON.stringify(Object.values(services)), { mode: 0o600 });
+  }
+  const payloadHex = Buffer.from('qlb-matrix-disposable', 'utf8').toString('hex');
+  const updatedPayloadHex = Buffer.from('qlb-matrix-disposable-updated', 'utf8').toString('hex');
+  const createArgs = (service: string) => [
+    'add-generic-password', '-a', account, '-s', service, '-X', payloadHex,
+    '-T', path, '-T', '/usr/bin/security',
+  ];
+  const readArgs = (service: string) => ['find-generic-password', '-a', account, '-w', '-s', service];
+  const updateArgs = (service: string) => ['add-generic-password', '-U', '-a', account, '-s', service, '-X', updatedPayloadHex];
+  const runStep = (caseName: HelperMatrixCaseName, executable: string, args: readonly string[]): boolean => {
+    const started = now();
+    try {
+      run(executable, args);
+      return true;
+    } catch {
+      return false;
+    } finally {
+      if (now() - started > HELPER_MATRIX_PROMPT_SIGNAL_MS) casePrompted[caseName] = true;
+    }
+  };
+
+  try {
+    const created = runStep('securityCreated', '/usr/bin/security', createArgs(services.securityCreated));
+    const read = created && runStep('securityCreated', '/usr/bin/security', readArgs(services.securityCreated));
+    if (created && read) cases.securityCreated = 'pass'; else caseReasons.securityCreated = 'security create or read failed';
+
+    const updateCreated = runStep('securityUpdated', '/usr/bin/security', createArgs(services.securityUpdated));
+    const updated = updateCreated && runStep('securityUpdated', '/usr/bin/security', updateArgs(services.securityUpdated));
+    const updateRead = updated && runStep('securityUpdated', '/usr/bin/security', readArgs(services.securityUpdated));
+    if (updateCreated && updated && updateRead) cases.securityUpdated = 'pass'; else caseReasons.securityUpdated = 'security update or read failed';
+
+    const deleteCreated = runStep('helperDeleted', '/usr/bin/security', createArgs(services.helperDeleted));
+    const deleted = deleteCreated && runStep('helperDeleted', path, ['delete', services.helperDeleted, account]);
+    let absent = false;
+    if (deleted) {
+      const started = now();
+      try { run('/usr/bin/security', readArgs(services.helperDeleted)); } catch (err) { absent = isMissingItem(err); }
+      finally { if (now() - started > HELPER_MATRIX_PROMPT_SIGNAL_MS) casePrompted.helperDeleted = true; }
+    }
+    if (deleteCreated && deleted && absent) cases.helperDeleted = 'pass'; else caseReasons.helperDeleted = 'helper delete did not remove item';
+  } finally {
+    for (const [caseName, service] of Object.entries(services) as Array<[HelperMatrixCaseName, string]>) {
+      const started = now();
+      let cleaned = false;
+      try {
+        run('/usr/bin/security', ['delete-generic-password', '-a', account, '-s', service]);
+        cleaned = true;
+      } catch (err) {
+        // A successful helper-delete leaves no item for security to remove.
+        cleaned = isMissingItem(err);
+      } finally {
+        if (now() - started > HELPER_MATRIX_PROMPT_SIGNAL_MS) casePrompted[caseName] = true;
+      }
+      if (!cleaned) {
+        cases[caseName] = 'fail';
+        caseReasons[caseName] = caseReasons[caseName]
+          ? `${caseReasons[caseName]}; cleanup failed`
+          : 'cleanup failed';
+      }
+    }
+  }
+  for (const caseName of Object.keys(cases) as HelperMatrixCaseName[]) {
+    if (casePrompted[caseName]) {
+      cases[caseName] = 'fail';
+      caseReasons[caseName] = caseReasons[caseName]
+        ? `${caseReasons[caseName]}; prompt-free deadline exceeded`
+        : 'prompt-free deadline exceeded';
+    }
+  }
+  const prompted = Object.values(casePrompted).some(Boolean);
+  return { cases, casePrompted, caseReasons, prompted };
 }
 
 function xml(value: string): string {
   return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
-/** Runs the disposable four-case helper matrix in a temporary one-shot LaunchAgent. */
-export function runHelperMatrixUnderLaunchd(path: string = helperPath()): HelperMatrixResult {
-  assertHelperReady(path);
-  const uid = process.getuid?.();
+/** Validates the receipt/status pair published by the one-shot LaunchAgent. */
+export function parseLaunchdMatrixReceipt(receipt: string, status: string): HelperMatrixResult {
+  const result = parseHelperMatrixResult(receipt);
+  if (status.trim() !== '0' || !helperMatrixIsOk(result)) throw new MatrixReceiptError(result);
+  return result;
+}
+
+export interface LaunchdMatrixDependencies {
+  /** Injectable so launchd matrix tests never invoke launchctl or security. */
+  run?: MatrixCommandRunner;
+  now?: () => number;
+  wait?: () => void;
+  platform?: NodeJS.Platform;
+  uid?: number;
+  /** Resolved parent configuration passed to the one-shot child. */
+  environment?: Record<string, string>;
+  /** Test seam for confirming a booted-out child has exited. */
+  jobExited?: () => boolean;
+}
+
+function executeLaunchdMatrixCommand(executable: string, args: readonly string[]): void {
+  execFileSync(executable, args, { encoding: 'utf8', stdio: 'ignore', timeout: MACOS_SECURITY_TIMEOUT_MS });
+}
+
+function cleanupLaunchdMatrixManifest(manifest: string, run: MatrixCommandRunner): string[] {
+  let names: unknown;
+  try { names = JSON.parse(readFileSync(manifest, 'utf8')); } catch { return []; }
+  if (!Array.isArray(names)) return [];
+  const failures: string[] = [];
+  for (const name of names) {
+    // The child-controlled manifest is a cleanup capability boundary.
+    if (typeof name !== 'string' || !name.startsWith('qlb-test-matrix-')) continue;
+    try {
+      run('/usr/bin/security', ['delete-generic-password', '-a', 'qlb', '-s', name]);
+    } catch (err) {
+      if (!isMissingItem(err)) failures.push(name);
+    }
+  }
+  return failures;
+}
+
+function failedLaunchdMatrixResult(code: string): HelperMatrixResult {
+  return {
+    cases: { securityCreated: 'fail', securityUpdated: 'fail', helperDeleted: 'fail' },
+    casePrompted: { securityCreated: false, securityUpdated: false, helperDeleted: false },
+    caseReasons: { securityCreated: code, securityUpdated: code, helperDeleted: code },
+    prompted: false,
+  };
+}
+
+function recordLaunchdCleanupFailures(result: HelperMatrixResult, failures: string[]): void {
+  if (failures.length === 0) return;
+  const caseName = (Object.keys(result.cases) as HelperMatrixCaseName[])
+    .find((name) => result.cases[name] === 'fail') ?? 'helperDeleted';
+  result.cases[caseName] = 'fail';
+  result.caseReasons[caseName] = result.caseReasons[caseName]
+    ? `${result.caseReasons[caseName]}; parent-cleanup-failed`
+    : 'parent-cleanup-failed';
+}
+
+function recordLaunchdCleanupSkipped(result: HelperMatrixResult): void {
+  const caseName = (Object.keys(result.cases) as HelperMatrixCaseName[])
+    .find((name) => result.cases[name] === 'fail') ?? 'helperDeleted';
+  result.cases[caseName] = 'fail';
+  result.caseReasons[caseName] = result.caseReasons[caseName]
+    ? `${result.caseReasons[caseName]}; parent-cleanup-skipped-child-running`
+    : 'parent-cleanup-skipped-child-running';
+}
+
+function isPrivateRunPath(runDirectory: string, path: string, uid: number): boolean {
+  try {
+    const directoryStat = lstatSync(runDirectory);
+    if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink() || directoryStat.uid !== uid || (directoryStat.mode & 0o077) !== 0) return false;
+    // Check lexical containment before resolving the run directory. macOS /tmp
+    // may itself resolve through /private, but that does not make its child paths
+    // escapes. Every existing component is then checked for a symlink.
+    const child = relative(resolve(runDirectory), resolve(path));
+    if (!child || child === '..' || child.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`) || isAbsolute(child)) return false;
+    let current = runDirectory;
+    for (const segment of child.split(/[\\/]/).slice(0, -1)) {
+      current = join(current, segment);
+      const stat = lstatSync(current);
+      if (!stat.isDirectory() || stat.isSymbolicLink() || stat.uid !== uid) return false;
+    }
+    if (existsSync(path)) {
+      const pathStat = lstatSync(path);
+      if (pathStat.isSymbolicLink() || pathStat.uid !== uid) return false;
+    }
+    // Resolve after the component checks so a symlinked /tmp cannot make an
+    // outside path look like a child of the private run directory.
+    realpathSync(runDirectory);
+    return true;
+  } catch { return false; }
+}
+
+function readHelperConfigReadOnly(dbPath: string, key: string): string | null {
+  // The hidden child is a verifier only. It must never create or migrate a store.
+  const db = openStoreConnection(dbPath, true);
+  try {
+    const row = db.prepare('SELECT value FROM config WHERE key = ?').get(key) as { value?: unknown } | undefined;
+    return typeof row?.value === 'string' ? row.value : null;
+  } finally { db.close(); }
+}
+
+/** Runs the disposable QLB-side matrix in a temporary one-shot LaunchAgent. */
+export function runHelperMatrixUnderLaunchd(
+  path: string = helperPath(),
+  cliPath: string | undefined = process.argv[1],
+  dependencies: LaunchdMatrixDependencies = {},
+): HelperMatrixResult {
+  assertHelperReady(path, dependencies.platform);
+  if (!cliPath) throw new Error('could not determine QLB CLI path');
+  const uid = dependencies.uid ?? process.getuid?.();
   if (uid === undefined) throw new Error('could not determine the macOS user id');
+  const run = dependencies.run ?? executeLaunchdMatrixCommand;
+  const now = dependencies.now ?? Date.now;
+  const wait = dependencies.wait ?? (() => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50));
   const dir = mkdtempSync(join(tmpdir(), 'qlb-helpercheck-'));
-  const label = `com.modus.qlb-helpercheck.${process.pid}.${Date.now()}`;
+  chmodSync(dir, 0o700);
+  const label = `com.modus.qlb-helpercheck.${process.pid}.${now()}`;
   const plist = join(dir, `${label}.plist`);
   const status = join(dir, 'status');
   const receipt = join(dir, 'receipt.json');
+  const manifest = join(dir, 'disposable-items.json');
   const domain = `gui/${uid}`;
-  const previous = join(process.env.HOME ?? '', '.qlb/helper-prev/qlb-keychain-helper');
+  let succeeded = false;
+  let timedOut = false;
+  let failedResult: HelperMatrixResult | null = null;
+  if (![plist, status, receipt, manifest].every((candidate) => isPrivateRunPath(dir, candidate, process.getuid?.() ?? -1))) {
+    throw new Error('invalid private launchd run path');
+  }
   // Publish status atomically so the polling side never observes an empty file.
-  const shell = '"$1" matrix "$2" "$3" > "$4"; rc=$?; printf "%s" "$rc" > "$5.tmp" && mv "$5.tmp" "$5"';
-  const args = ['/bin/sh', '-c', shell, '--', path, 'qlb-test-matrix-', previous, receipt, status];
+  // The helper path and private run directory are passed explicitly so the child
+  // tests the parent-verified binary and cannot redirect its cleanup capability.
+  const shell = '"$1" "$2" keychain matrix --internal "--helper-path=$3" "--cleanup-manifest=$4" "--run-directory=$5" > "$6"; rc=$?; printf "%s" "$rc" > "$7.tmp" && mv "$7.tmp" "$7"';
+  const args = ['/bin/sh', '-c', shell, '--', process.execPath, resolve(cliPath), path, manifest, dir, receipt, status];
   const values = args.map((arg) => `      <string>${xml(arg)}</string>`).join('\n');
-  writeFileSync(plist, `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>\n  <key>Label</key><string>${label}</string>\n  <key>ProgramArguments</key><array>\n${values}\n  </array>\n  <key>RunAtLoad</key><true/>\n</dict></plist>\n`, { mode: 0o600 });
+  const environment = dependencies.environment ? `\n  <key>EnvironmentVariables</key><dict>\n${plistDictionary(dependencies.environment)}\n  </dict>` : '';
+  writeFileSync(plist, `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>\n  <key>Label</key><string>${label}</string>\n  <key>ProgramArguments</key><array>\n${values}\n  </array>${environment}\n  <key>RunAtLoad</key><true/>\n</dict></plist>\n`, { mode: 0o600 });
   try {
-    execFileSync('/bin/launchctl', ['bootstrap', domain, plist], { encoding: 'utf8', timeout: MACOS_SECURITY_TIMEOUT_MS });
-    const deadline = Date.now() + MACOS_SECURITY_TIMEOUT_MS;
-    while (!existsSync(status) && Date.now() < deadline) {
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+    run('/bin/launchctl', ['bootstrap', domain, plist]);
+    const deadline = now() + HELPER_MATRIX_LAUNCHD_TIMEOUT_MS;
+    while (!existsSync(status) && now() < deadline) wait();
+    if (!existsSync(status)) {
+      timedOut = true;
+      failedResult = failedLaunchdMatrixResult('launchd-timeout');
+      throw new MatrixReceiptError(failedResult, 'helper matrix timed out under launchd');
     }
-    if (!existsSync(status)) throw new Error('helper matrix timed out under launchd');
-    const result = parseHelperMatrixResult(readFileSync(receipt, 'utf8'));
-    if (readFileSync(status, 'utf8').trim() !== '0' || !helperMatrixIsOk(result)) {
-      throw new MatrixReceiptError(result);
+    try {
+      const result = parseLaunchdMatrixReceipt(readFileSync(receipt, 'utf8'), readFileSync(status, 'utf8'));
+      succeeded = true;
+      return result;
+    } catch (err) {
+      if (err instanceof MatrixReceiptError) {
+        failedResult = err.result ?? failedLaunchdMatrixResult('launchd-receipt-failed');
+        throw err;
+      }
+      failedResult = failedLaunchdMatrixResult('launchd-receipt-unreadable');
+      throw new MatrixReceiptError(failedResult, 'helper matrix receipt unreadable under launchd');
     }
-    return result;
   } finally {
-    try { execFileSync('/bin/launchctl', ['bootout', domain, plist], { encoding: 'utf8', timeout: MACOS_SECURITY_TIMEOUT_MS }); } catch { /* cleanup */ }
+    try { run('/bin/launchctl', ['bootout', domain, plist]); } catch { /* cleanup */ }
+    if (!succeeded) {
+      // A timeout means the child could still be using its disposable items. Do
+      // not race it: cleanup is permitted only after launchd confirms it exited.
+      let childExited = !timedOut;
+      if (timedOut) {
+        const exited = dependencies.jobExited ?? (() => {
+          if (dependencies.run) return false;
+          try {
+            execFileSync('/bin/launchctl', ['print', `${domain}/${label}`], { encoding: 'utf8', stdio: 'ignore', timeout: MACOS_SECURITY_TIMEOUT_MS });
+            return false;
+          } catch (err) { return (err as { status?: unknown }).status === 113; }
+        });
+        for (let attempt = 0; attempt < 20 && !childExited; attempt++) {
+          childExited = exited();
+          if (!childExited) wait();
+        }
+      }
+      const result = failedResult ?? failedLaunchdMatrixResult('launchd-receipt-unavailable');
+      if (childExited) recordLaunchdCleanupFailures(result, cleanupLaunchdMatrixManifest(manifest, run));
+      else recordLaunchdCleanupSkipped(result);
+    }
     rmSync(dir, { recursive: true, force: true });
   }
 }
@@ -167,6 +437,15 @@ export function runHelperMatrixUnderLaunchd(path: string = helperPath()): Helper
 /** Re-export the sole signing inspector used by diagnostics and release installation. */
 export type { HelperSigningState };
 export const helperSigningState = inspectHelperSigning;
+
+function helperMatrixFailureCode(result: HelperMatrixResult | null): string {
+  if (!result) return 'helper-matrix-failed';
+  const reason = Object.values(result.caseReasons).find((value) => typeof value === 'string') ?? '';
+  for (const code of ['parent-cleanup-failed', 'parent-cleanup-skipped-child-running', 'launchd-timeout', 'launchd-receipt-unreadable', 'launchd-receipt-failed', 'launchd-child-failed']) {
+    if (reason.includes(code)) return code;
+  }
+  return 'helper-matrix-failed';
+}
 
 export function helperMatrixConfig(
   result: HelperMatrixResult | null,
@@ -176,6 +455,7 @@ export function helperMatrixConfig(
   const config: Record<string, string> = {
     'keychain.helperCheckAt': String(Date.now()),
     'keychain.helperCheckResult': passed ? 'ok' : 'failed',
+    'keychain.helperCheckError': passed ? '' : helperMatrixFailureCode(result),
     'keychain.helperCheckPrompted': String(result?.prompted === true),
     'keychain.helperCheckCasePrompted': JSON.stringify(result?.casePrompted ?? {}),
   };
@@ -235,7 +515,7 @@ export interface LaunchdLiveSwitchDependencies {
 
 export interface KeychainCommandDependencies {
   runMatrix?: () => HelperMatrixResult;
-  runLaunchdMatrix?: () => HelperMatrixResult;
+  runLaunchdMatrix?: (path: string, environment?: Record<string, string>) => HelperMatrixResult;
   /** Runs the self-republish in a one-shot LaunchAgent. */
   runLaunchdLiveSwitch?: (activeId: string, env: NodeJS.ProcessEnv) => LiveSwitchReceipt | { timeout: true } | { inProgress: string };
   /** Test seam for the production runner's launchctl effect. */
@@ -697,7 +977,8 @@ export async function runKeychainCommand(
   const options = parse(args);
   if (!options) return usage(ctx);
   // Tests may exercise the receipt handler only through its injected runner;
-  // production launchctl/keychain access remains disabled in test mode.
+  // production launchctl/keychain access remains disabled in test mode, including
+  // the hidden LaunchAgent child command.
   if (ctx.env.QLB_TEST_MODE === '1' && !(options.subcommand === 'check-launchd' && options.live && (dependencies.runLaunchdLiveSwitch || dependencies.launchdRunner))) {
     ctx.stderr('qlb keychain: native helper commands are disabled in test mode');
     return 2;
@@ -705,24 +986,57 @@ export async function runKeychainCommand(
   if (options.subcommand === 'check-launchd' && options.live) return runLiveLaunchdCheck(options, ctx, dependencies);
   if (options.subcommand === 'authorize') return authorize(options, ctx, dependencies);
 
-  let result: HelperMatrixResult | null = null;
-  const path = helperPath();
-  let signing: HelperSigningState | null = null;
-  try {
-    const inspect = dependencies.helperSigning ?? helperSigningState;
-    const configReader = dependencies.helperConfigReader ?? (() => {
-      const store = openStore(ctx.config.dbPath);
-      try { return store.getConfig('keychain.helperCheckIdentityHash'); } finally { store.close(); }
-    });
+  const path = options.internalHelperPath ?? dependencies.helperPath?.() ?? helperPath();
+  const inspect = dependencies.helperSigning ?? helperSigningState;
+  const configReader = dependencies.helperConfigReader ?? ((key: string) => {
+    if (options.internalMatrix) return readHelperConfigReadOnly(ctx.config.dbPath, key);
+    const store = openStore(ctx.config.dbPath);
+    try { return store.getConfig(key); } finally { store.close(); }
+  });
+  const verify = dependencies.helperIdentityVerifier ?? verifyHelperIdentity;
+  const trustedSigning = (): HelperSigningState => {
     const pin = configReader('keychain.helperCheckIdentityHash');
-    const verify = dependencies.helperIdentityVerifier ?? verifyHelperIdentity;
-    signing = inspect(path);
+    const signing = inspect(path);
     if (!signing || signing.authority !== 'QLB Keychain Helper') throw new MatrixReceiptError(null);
     if (pin && !verify(path, pin).trusted) throw new MatrixReceiptError(null);
+    return signing;
+  };
+
+  // This hidden subcommand is used only by the one-shot LaunchAgent. It writes a
+  // payload-free receipt, but is not a trust bypass: it verifies the parent-pinned
+  // helper before it can invoke the helper or security.
+  if (options.internalMatrix) {
+    if (!isPrivateRunPath(options.privateRunDirectory!, options.cleanupManifestPath!, process.getuid?.() ?? -1)) return 2;
+    let result = failedLaunchdMatrixResult('launchd-child-failed');
+    try {
+      const signing = trustedSigning();
+      result = dependencies.runMatrix
+        ? dependencies.runMatrix()
+        : runHelperMatrix(path, { cleanupManifestPath: options.cleanupManifestPath! });
+      const after = inspect(path);
+      if (!helperMatrixIsOk(result) || !after || after.authority !== 'QLB Keychain Helper'
+        || after.binaryHash !== signing.binaryHash) throw new MatrixReceiptError(result);
+      ctx.stdout(JSON.stringify(result));
+      return 0;
+    } catch (err) {
+      if (err instanceof MatrixReceiptError && err.result) result = err.result;
+      // launchd captures stdout as receipt.json: publish a payload-free failed
+      // receipt even when helper verification itself failed.
+      ctx.stdout(JSON.stringify(result));
+      return 1;
+    }
+  }
+
+  let result: HelperMatrixResult | null = null;
+  let signing: HelperSigningState | null = null;
+  try {
+    signing = trustedSigning();
 
     result = options.subcommand === 'check-launchd'
-      ? (dependencies.runLaunchdMatrix ?? runHelperMatrixUnderLaunchd)()
-      : (dependencies.runMatrix ?? runHelperMatrix)();
+      ? (dependencies.runLaunchdMatrix
+        ? dependencies.runLaunchdMatrix(path, liveSwitchEnvironment(ctx))
+        : runHelperMatrixUnderLaunchd(path, undefined, { environment: liveSwitchEnvironment(ctx) }))
+      : (dependencies.runMatrix ? dependencies.runMatrix() : runHelperMatrix(path));
     const after = inspect(path);
     if (!helperMatrixIsOk(result) || !after || after.authority !== 'QLB Keychain Helper'
       || after.binaryHash !== signing.binaryHash) {
