@@ -1,7 +1,7 @@
 import { existsSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { config } from './config';
-import { SCHEMA_VERSION } from './schema-version';
+import { newerSchemaMessage, readUserVersion, SCHEMA_VERSION } from './schema-version';
 import { STALE_OK_S } from './usage-freshness';
 
 const CACHE_EXPORT_BUSY_TIMEOUT_MS = 150;
@@ -48,11 +48,6 @@ function exportDbPath(): string {
   return config.dbPath;
 }
 
-function readUserVersion(db: DatabaseSync): number {
-  const row = db.prepare('PRAGMA user_version').get() as { user_version?: number } | number | undefined;
-  return typeof row === 'number' ? row : row?.user_version ?? 0;
-}
-
 function parseArgs(args: string[]): boolean {
   return args.length === 2 && args.includes('--cache-only') && args.includes('--json');
 }
@@ -70,7 +65,7 @@ export function cacheOnlyExport(now = Date.now(), dbPath = exportDbPath()): Cach
     db.exec(`PRAGMA busy_timeout = ${CACHE_EXPORT_BUSY_TIMEOUT_MS}`);
     const version = readUserVersion(db);
     if (version > SCHEMA_VERSION) {
-      throw new Error(`qlb export: qlb.db schema user_version=${version} is newer than this binary (${SCHEMA_VERSION}); upgrade qlb`);
+      throw new Error(`qlb export: ${newerSchemaMessage(version)}`);
     }
     const rows = db.prepare(`
       SELECT s.account_id, a.provider, a.label, a.status, s.bucket, s.used_pct, s.used,

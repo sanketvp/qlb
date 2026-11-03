@@ -123,7 +123,7 @@ const Module = require('node:module');
 const load = Module._load;
 const allowed = new Set(['./export', './config', './home', './schema-version', './usage-freshness']);
 Module._load = function(request, parent, isMain) {
-  if (!request.startsWith('node:') && !allowed.has(request)) {
+  if (!isMain && !request.startsWith('node:') && !allowed.has(request)) {
     throw new Error('forbidden module loaded: ' + request);
   }
   return load.call(this, request, parent, isMain);
