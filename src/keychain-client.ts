@@ -88,28 +88,28 @@ function lockPathForService(service: string): string {
   return join(lockDir(), `${createHash('sha256').update(keychainWaitKey(service)).digest('hex')}.lock`);
 }
 
-function lockDirectory(): string {
+function lockDirectory(service: string): string {
   const dir = lockDir();
   // This never changes an existing directory's mode.
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   const stat = lstatSync(dir);
   const uid = process.getuid?.();
   if (stat.isSymbolicLink() || !stat.isDirectory() || (uid !== undefined && stat.uid !== uid)) {
-    throw new KeychainClientDisabledInTests();
+    throw new KeychainClientNotStarted(service, 'lock directory is not private');
   }
   // mkdir mode 0700 is sufficient under a normal umask; never chmod a
   // pre-existing directory.  Refuse a mode that cannot protect the locks.
-  if ((lstatSync(dir).mode & 0o777) !== 0o700) throw new KeychainClientDisabledInTests();
+  if ((lstatSync(dir).mode & 0o777) !== 0o700) throw new KeychainClientNotStarted(service, 'lock directory is not private');
   return dir;
 }
 
 function ensureLockFile(service: string): string {
-  lockDirectory();
+  lockDirectory(service);
   const path = lockPathForService(service);
   let fd: number;
   try {
     fd = openSync(path, constants.O_CREAT | constants.O_RDWR | constants.O_NOFOLLOW, 0o600);
-  } catch { throw new KeychainClientDisabledInTests(); }
+  } catch { throw new KeychainClientNotStarted(service, 'lock file could not be opened'); }
   closeSync(fd);
   return path;
 }
@@ -401,7 +401,7 @@ export function runKeychainClientSync(request: KeychainRequest): string | Buffer
   const lockfPath = request.lockfPath ?? KEYCHAIN_LOCKF_BIN;
   let lockPath: string;
   try { lockPath = ensureLockFile(service); } catch (err) {
-    if (err instanceof KeychainClientDisabledInTests) throw err;
+    if (err instanceof KeychainClientNotStarted) throw err;
     throw new KeychainClientNotStarted(service, 'lock directory is not writable');
   }
   const mode = request.secretHex === undefined ? 'r' : 'w';
