@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync, execFileSync as runFile, spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
@@ -14,7 +14,8 @@ import {
   type ExecFileSyncFn,
 } from '../src/keychain';
 import {
-  helperMatrixConfig, helperMatrixIsOk, helperSigningState, parseHelperMatrixResult, runKeychainCommand,
+  helperMatrixConfig, helperMatrixIsOk, helperSigningState, parseHelperMatrixResult, parseLaunchdMatrixReceipt,
+  runHelperMatrix, runKeychainCommand,
 } from '../src/commands/keychain';
 import { exitCodeForError, runExecutingCommand } from '../src/cli';
 import { KeychainHelperUntrustedError } from '../src/credential-backends';
@@ -53,37 +54,90 @@ describe('Swift Keychain helper trust path', () => {
     assert.match(defaultKeychainHelperPath(), /native\/keychain-helper\/build\/qlb-keychain-helper$/);
   });
 
-  it('requires a clean refusal for the untrusted security-created matrix item', () => {
-    const receipt = '{"cases":{"securityCreated":"pass","securityUntrusted":"pass","previousHelper":"pass","helperCreated":"pass"},"casePrompted":{"securityCreated":false,"securityUntrusted":true,"previousHelper":false,"helperCreated":false},"caseReasons":{"securityCreated":null,"securityUntrusted":null,"previousHelper":null,"helperCreated":null},"prompted":false}';
+  it('parses only the three prompt-free QLB-side matrix cases', () => {
+    const receipt = '{"cases":{"securityCreated":"pass","securityUpdated":"pass","helperDeleted":"pass"},"casePrompted":{"securityCreated":false,"securityUpdated":false,"helperDeleted":false},"caseReasons":{"securityCreated":null,"securityUpdated":null,"helperDeleted":null},"prompted":false}';
     const green = parseHelperMatrixResult(receipt);
     assert.equal(helperMatrixIsOk(green), true);
     const signing = { authority: 'QLB Keychain Helper', binaryHash: 'a'.repeat(40), identityHash: 'b'.repeat(40) };
     assert.equal(helperMatrixConfig(green, signing)['keychain.helperCheckResult'], 'ok');
-    assert.throws(() => parseHelperMatrixResult(receipt.replace(',"securityUntrusted":"pass"', '')),
-      /invalid helper matrix receipt/);
-    const untrustedFailed = parseHelperMatrixResult(receipt.replace('"securityUntrusted":"pass"', '"securityUntrusted":"fail"'));
-    assert.equal(helperMatrixIsOk(untrustedFailed), false);
-    const prompted = { ...green, prompted: true };
-    assert.equal(helperMatrixIsOk(prompted), false);
-    const firstInstall = {
-      ...green,
-      cases: { ...green.cases, previousHelper: 'not-applicable' as const },
-      caseReasons: { ...green.caseReasons, previousHelper: 'no previous helper' },
-    };
-    assert.equal(helperMatrixIsOk(firstInstall), true);
-    const recorded = helperMatrixConfig(prompted);
-    assert.equal(recorded['keychain.helperCheckResult'], 'failed');
-    assert.equal(recorded['keychain.helperCheckPrompted'], 'true');
+    assert.throws(() => parseHelperMatrixResult(receipt.replace(',"securityUpdated":"pass"', '')), /invalid helper matrix receipt/);
+    const failed = parseHelperMatrixResult(receipt.replace('"helperDeleted":"pass"', '"helperDeleted":"fail"'));
+    assert.equal(helperMatrixIsOk(failed), false);
+    assert.equal(helperMatrixIsOk({ ...green, prompted: true }), false);
+    assert.throws(() => parseLaunchdMatrixReceipt(receipt, '1'), /helper matrix receipt is not green/);
+    assert.deepEqual(parseLaunchdMatrixReceipt(receipt, '0'), green);
   });
 
-  it('models post-Always-Allow and user-cancelled matrix behavior in the helper source', () => {
-    const source = readFileSync('native/keychain-helper/main.swift', 'utf8');
-    assert.match(source, /add-generic-password", "-a", account, "-s", services\[0\], "-w",[^\n]+"-T", helperExecutablePath\(\)/);
-    assert.match(source, /promptFailure[\s\S]*errSecUserCanceled[\s\S]*status -25293[\s\S]*status -25308[\s\S]*status -128/);
-    assert.match(source, /private func modificationDate[\s\S]*find-generic-password", "-a", account, "-s", service\]\)/);
-    assert.match(source, /untrustedMdatBefore[\s\S]*untrustedMdatAfter[\s\S]*untrustedUpdate\.status != 0[\s\S]*untrustedMdatBefore\.value == untrustedMdatAfter\.value/);
-    assert.doesNotMatch(source, /let untrustedRead =/);
-    assert.doesNotMatch(source, /prompted = prompted \|\| casePrompted\["securityUntrusted"\]!/);
+  it('emits a receipt without touching signing metadata for the launchd-only subcommand', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-matrix-internal-'));
+    const config = defaultConfig(home);
+    const output: string[] = [];
+    const green = {
+      cases: { securityCreated: 'pass' as const, securityUpdated: 'pass' as const, helperDeleted: 'pass' as const },
+      casePrompted: { securityCreated: false, securityUpdated: false, helperDeleted: false },
+      caseReasons: { securityCreated: null, securityUpdated: null, helperDeleted: null },
+      prompted: false,
+    };
+    try {
+      const exit = await runKeychainCommand(['matrix', '--internal'], {
+        config, env: { QLB_TEST_MODE: '1' }, home, stdout: (message) => output.push(message), stderr: () => {},
+        loadConfig: () => config, registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
+      }, { runMatrix: () => green, helperSigning: () => { throw new Error('not used'); } });
+      assert.equal(exit, 0);
+      assert.deepEqual(parseHelperMatrixResult(output[0]!), green);
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
+
+  it('runs only security create/update/read and helper delete, then cleans every disposable item', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-matrix-helper-'));
+    const helper = join(dir, 'qlb-keychain-helper');
+    writeFileSync(helper, 'fixture helper');
+    const calls: Array<{ file: string; args: readonly string[] }> = [];
+    const existing = new Set<string>();
+    try {
+      const result = runHelperMatrix(helper, {
+        platform: 'darwin', randomId: () => 'fixture',
+        run: (file, args) => {
+          calls.push({ file, args });
+          const service = args[args.indexOf('-s') + 1];
+          if (args[0] === 'add-generic-password') existing.add(service!);
+          if (args[0] === 'delete' && file === helper) existing.delete(args[1]!);
+          if (args[0] === 'delete-generic-password') existing.delete(service!);
+          if (args[0] === 'find-generic-password' && !existing.has(service!)) throw Object.assign(new Error('missing'), { status: 44 });
+        },
+      });
+      assert.equal(helperMatrixIsOk(result), true);
+      assert.deepEqual(result.cases, { securityCreated: 'pass', securityUpdated: 'pass', helperDeleted: 'pass' });
+      assert.ok(calls.some(({ file, args }) => file === helper && args[0] === 'delete'));
+      assert.equal(calls.some(({ file, args }) => file === helper && (args[0] === 'set' || args[0] === 'probe-read')), false);
+      assert.equal(calls.filter(({ args }) => args[0] === 'delete-generic-password').length, 3);
+      for (const { file, args } of calls.filter(({ args }) => args[0] === 'add-generic-password' && args[1] !== '-U')) {
+        assert.equal(file, '/usr/bin/security');
+        assert.deepEqual(args.slice(-4), ['-T', helper, '-T', '/usr/bin/security']);
+      }
+      assert.ok(calls.some(({ args }) => args[0] === 'add-generic-password' && args[1] === '-U' && !args.includes('-T')));
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('marks a slow matrix step prompted and still cleans up after a failed case', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-matrix-slow-'));
+    const helper = join(dir, 'qlb-keychain-helper');
+    writeFileSync(helper, 'fixture helper');
+    let clock = 0;
+    const calls: string[][] = [];
+    try {
+      const result = runHelperMatrix(helper, {
+        platform: 'darwin', now: () => clock, randomId: () => 'slow',
+        run: (_file, args) => {
+          calls.push([...args]);
+          clock += 5_001;
+          if (args[0] === 'add-generic-password') throw new Error('fixture failure');
+        },
+      });
+      assert.equal(result.prompted, true);
+      assert.equal(result.cases.securityCreated, 'fail');
+      assert.equal(calls.filter((args) => args[0] === 'delete-generic-password').length, 3);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
   it('stores an injected failing matrix receipt and returns a non-zero exit', async () => {
@@ -96,9 +150,9 @@ describe('Swift Keychain helper trust path', () => {
       loadConfig: () => config, registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
     }, {
       runMatrix: () => ({
-        cases: { securityCreated: 'fail', securityUntrusted: 'pass', previousHelper: 'fail', helperCreated: 'pass' },
-        casePrompted: { securityCreated: true, securityUntrusted: false, previousHelper: false, helperCreated: false },
-        caseReasons: { securityCreated: null, securityUntrusted: null, previousHelper: null, helperCreated: null },
+        cases: { securityCreated: 'fail', securityUpdated: 'pass', helperDeleted: 'pass' },
+        casePrompted: { securityCreated: true, securityUpdated: false, helperDeleted: false },
+        caseReasons: { securityCreated: null, securityUpdated: null, helperDeleted: null },
         prompted: true,
       }),
       helperSigning: () => ({ authority: 'QLB Keychain Helper', binaryHash: 'a'.repeat(40), identityHash: 'b'.repeat(40) }),
@@ -372,9 +426,9 @@ describe('Swift Keychain helper trust path', () => {
       loadConfig: () => config, registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
     }, {
       runMatrix: () => ({
-        cases: { securityCreated: 'pass', securityUntrusted: 'pass', previousHelper: 'pass', helperCreated: 'pass' },
-        casePrompted: { securityCreated: false, securityUntrusted: false, previousHelper: false, helperCreated: false },
-        caseReasons: { securityCreated: null, securityUntrusted: null, previousHelper: null, helperCreated: null },
+        cases: { securityCreated: 'pass', securityUpdated: 'pass', helperDeleted: 'pass' },
+        casePrompted: { securityCreated: false, securityUpdated: false, helperDeleted: false },
+        caseReasons: { securityCreated: null, securityUpdated: null, helperDeleted: null },
         prompted: false,
       }),
       helperSigning: () => null,
@@ -406,9 +460,9 @@ describe('Swift Keychain helper trust path', () => {
     let inspections = 0;
     let matrixCalls = 0;
     const green = {
-      cases: { securityCreated: 'pass' as const, securityUntrusted: 'pass' as const, previousHelper: 'pass' as const, helperCreated: 'pass' as const },
-      casePrompted: { securityCreated: false, securityUntrusted: false, previousHelper: false, helperCreated: false },
-      caseReasons: { securityCreated: null, securityUntrusted: null, previousHelper: null, helperCreated: null },
+      cases: { securityCreated: 'pass' as const, securityUpdated: 'pass' as const, helperDeleted: 'pass' as const },
+      casePrompted: { securityCreated: false, securityUpdated: false, helperDeleted: false },
+      caseReasons: { securityCreated: null, securityUpdated: null, helperDeleted: null },
       prompted: false,
     };
     const exit = await runKeychainCommand(['matrix'], {
@@ -450,7 +504,8 @@ describe('Swift Keychain helper trust path', () => {
   });
 
   it('compiles the helper and self-tests only a disposable Keychain', {
-    skip: !existsSync('/usr/bin/swiftc'),
+    // Opt-in only: ordinary test runs must not access any real Keychain.
+    skip: process.env.QLB_REAL_KEYCHAIN_TESTS !== '1' || !existsSync('/usr/bin/swiftc'),
   }, () => {
     const dir = mkdtempSync(join(tmpdir(), 'qlb-keychain-helper-selftest-'));
     const keychain = join(dir, 't.keychain-db');
