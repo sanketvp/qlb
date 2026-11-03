@@ -2346,6 +2346,14 @@ export class Store {
     this.setConfigStmt.run(key, value);
   }
 
+  private setOrDeleteConfig(key: string, value: number | string | null): void {
+    if (value === null) {
+      this.db.prepare('DELETE FROM config WHERE key = ?').run(key);
+    } else {
+      this.setConfig(key, String(value));
+    }
+  }
+
   /** Record one de-duplicated, credential-free observation of the live Codex login. */
   recordCodexObservation(input: {
     identity: string | null;
@@ -2472,13 +2480,6 @@ export class Store {
         steps = parsed as Record<string, unknown>;
       }
       const stepsJson = JSON.stringify({ ...steps, attempt: input.attempt });
-      const setOrDelete = (key: string, value: number | string | null): void => {
-        if (value === null) {
-          this.db.prepare('DELETE FROM config WHERE key = ?').run(key);
-        } else {
-          this.setConfig(key, String(value));
-        }
-      };
 
       const targetExists = this.db.prepare('SELECT 1 FROM claude_slots WHERE account_id = ?').get(input.toAccount);
       if (!targetExists) throw new Error('Claude switch target slot not found');
@@ -2487,10 +2488,10 @@ export class Store {
         this.setActiveLogin('anthropic', input.toAccount, input.setBy, input.now);
         this.setConfig('cooldown.anthropic', String(input.now + 300_000));
         this.setConfig('auto.anthropic.lastSwitchFrom', input.fromAccount);
-        setOrDelete('auto.anthropic.lastSwitchTo', input.trigger === 'manual' ? null : input.toAccount);
-        setOrDelete('auto.anthropic.leftHeadroom', input.decision.leftHeadroom);
-        setOrDelete('auto.anthropic.leftRecoveryAt', input.decision.leftRecoveryAt);
-        setOrDelete('auto.anthropic.leftTrigger', input.decision.leftTrigger);
+        this.setOrDeleteConfig('auto.anthropic.lastSwitchTo', input.trigger === 'manual' ? null : input.toAccount);
+        this.setOrDeleteConfig('auto.anthropic.leftHeadroom', input.decision.leftHeadroom);
+        this.setOrDeleteConfig('auto.anthropic.leftRecoveryAt', input.decision.leftRecoveryAt);
+        this.setOrDeleteConfig('auto.anthropic.leftTrigger', input.decision.leftTrigger);
       }
       const switchId = this.recordSwitch({
         ts: input.now,
@@ -2609,21 +2610,14 @@ export class Store {
       this.setConfig('cooldown.openai-codex', String(input.now + 300_000));
 
       if (input.outcome === 'ok') {
-        const setOrDelete = (key: string, value: number | string | null): void => {
-          if (value === null) {
-            this.db.prepare('DELETE FROM config WHERE key = ?').run(key);
-          } else {
-            this.setConfig(key, String(value));
-          }
-        };
         this.setConfig('auto.openai-codex.lastSwitchFrom', input.fromAccount);
-        setOrDelete(
+        this.setOrDeleteConfig(
           'auto.openai-codex.lastSwitchTo',
           input.trigger === 'manual' ? null : input.toAccount,
         );
-        setOrDelete('auto.openai-codex.leftHeadroom', input.decision.leftHeadroom);
-        setOrDelete('auto.openai-codex.leftRecoveryAt', input.decision.leftRecoveryAt);
-        setOrDelete('auto.openai-codex.leftTrigger', input.decision.leftTrigger);
+        this.setOrDeleteConfig('auto.openai-codex.leftHeadroom', input.decision.leftHeadroom);
+        this.setOrDeleteConfig('auto.openai-codex.leftRecoveryAt', input.decision.leftRecoveryAt);
+        this.setOrDeleteConfig('auto.openai-codex.leftTrigger', input.decision.leftTrigger);
       }
 
       const switchId = this.recordSwitch({
