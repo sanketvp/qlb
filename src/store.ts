@@ -1600,8 +1600,9 @@ export class Store {
     return row ? { provider: row.provider, accountId: row.account_id, since: row.since, setBy: row.set_by } : null;
   }
 
-  /** Identity needed to match a QLB Claude slot back to a C-swap cache row. */
+  /** Identity needed to match a QLB slot row or a legacy C-swap cache row. */
   getAnthropicSlotStatusIdentity(accountId: string): {
+    accountId: string;
     orgUuid: string | null;
     email: string | null;
     orgUuidSlotCount: number;
@@ -1614,7 +1615,7 @@ export class Store {
       ? 0
       : (this.db.prepare('SELECT COUNT(*) AS count FROM claude_slots WHERE org_uuid = ? AND archived_at IS NULL')
         .get(row.org_uuid) as { count: number }).count;
-    return { orgUuid: row.org_uuid, email: row.email, orgUuidSlotCount };
+    return { accountId, orgUuid: row.org_uuid, email: row.email, orgUuidSlotCount };
   }
 
   /** Additive active-login upsert used by provider-specific adoption paths. */

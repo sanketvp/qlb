@@ -12,7 +12,7 @@ import { consumeMarkerPathFor, CSWAP_ANTHROPIC_STORE } from './cswap-consume';
 import { builtInAdapters } from './adapters';
 import { CONFIG_ENV_VARS, OPENROUTER_KEYCHAIN_SERVICE, type QlbConfig } from './config';
 import { cswapCachePresent } from './cswap-usage';
-import { hasFreshAnthropicUsagePoll } from './anthropic-usage-view';
+import { readAnthropicUsagePollFreshness } from './anthropic-usage-view';
 import {
   execFileUtf8,
   isSecurityTimeout,
@@ -72,7 +72,7 @@ import { codexFirstSwitchCheck } from './checks/codex-first-switch';
 import { guardCheck } from './checks/_check';
 import { lifecyclePhase, lifecyclePhaseCheck, type LifecyclePhaseResult } from './checks/lifecycle-phase';
 import { relogin7dCheck } from './checks/relogin-7d';
-import { openStore, openStoreConnection } from './store';
+import { openStoreConnection } from './store';
 import { discoverChecks, type CheckDefinition } from './registry';
 import { lifecycleWindowCheck } from './checks/lifecycle-window';
 import { lifecycleDrillCheck } from './checks/lifecycle-drill';
@@ -266,16 +266,8 @@ function missing(
 
 function anthropicPollFreshness(dbPath: string): { hasPolls: boolean; fresh: boolean } | null {
   if (!existsSync(dbPath)) return null;
-  let store: ReturnType<typeof openStore> | null = null;
-  try {
-    store = openStore(dbPath);
-    if (Object.keys(store.listUsagePolls('anthropic')).length === 0) return null;
-    return { hasPolls: true, fresh: hasFreshAnthropicUsagePoll(store, Math.floor(Date.now() / 1000)) };
-  } catch {
-    return null;
-  } finally {
-    store?.close();
-  }
+  const freshness = readAnthropicUsagePollFreshness(dbPath, Math.floor(Date.now() / 1000));
+  return freshness?.hasPolls ? freshness : null;
 }
 
 export function inspectProviders(

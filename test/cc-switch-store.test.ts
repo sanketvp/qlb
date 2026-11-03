@@ -120,6 +120,33 @@ describe('Claude switch commit primitive', () => {
     }
   });
 
+  it('marks the active QLB slot ID directly during cutover', () => {
+    const store = openClaudeStore();
+    try {
+      insertSlots(store);
+      store.commitClaudeSwitch(input());
+      const dashboard = formatDashboard(enrichAccounts([
+        { accountId: 'from', provider: 'anthropic', label: '● stale-cache-active', buckets: {} },
+        { accountId: 'to', provider: 'anthropic', label: 'active-slot', buckets: {} },
+      ], {
+        ownershipForProvider: () => 'QLB_OWNED',
+        overrideForAccount: () => null,
+        claudeCutoverPhase: 'cutover',
+        activeAccountForProvider: (provider, accounts) => {
+          const active = store.getActiveLogin(provider)?.accountId;
+          return active === null || active === undefined
+            ? undefined
+            : activeAnthropicMarker(store.getAnthropicSlotStatusIdentity(active), accounts);
+        },
+      }));
+
+      assert.match(dashboard, /^✓  stale-cache-active  anthropic/m);
+      assert.match(dashboard, /^✓  ● active-slot  anthropic/m);
+    } finally {
+      store.close();
+    }
+  });
+
   it('dashboard keeps B marked after a successful switch to B and a failed switch back', () => {
     const store = openClaudeStore();
     try {

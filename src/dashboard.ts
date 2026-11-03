@@ -37,6 +37,9 @@ export interface ActiveAccountMarker {
 }
 
 export interface AnthropicSlotIdentity {
+  /** QLB slot identity used by QLB's persisted usage rows. */
+  accountId: string;
+  /** Legacy C-swap cache identity used only when no QLB usage row matches. */
   orgUuid: string | null;
   email: string | null;
   orgUuidSlotCount: number;
@@ -467,15 +470,18 @@ function withoutCacheMarker(label: string): string {
 }
 
 /**
- * C-swap cache identifies Claude rows by organization UUID and, for a shared
- * organization, its email label. An ambiguous or missing match deliberately
- * leaves C-swap's marker intact.
+ * QLB usage rows use the slot account ID directly. Legacy C-swap cache rows
+ * use organization UUID and, for a shared organization, an email label. An
+ * ambiguous or missing cache match deliberately leaves C-swap's marker intact.
  */
 export function activeAnthropicMarker(
   activeSlot: AnthropicSlotIdentity | null,
   accounts: AccountSnapshot[],
 ): ActiveAccountMarker | undefined {
-  if (!activeSlot || activeSlot.orgUuid === null) return undefined;
+  if (!activeSlot) return undefined;
+  const slotMatches = accounts.filter((account) => account.accountId === activeSlot.accountId);
+  if (slotMatches.length === 1) return { accountId: activeSlot.accountId };
+  if (activeSlot.orgUuid === null) return undefined;
   const orgMatches = accounts.filter((account) => account.accountId === activeSlot.orgUuid);
   const matches = activeSlot.orgUuidSlotCount > 1
     ? activeSlot.email === null
