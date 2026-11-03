@@ -483,6 +483,28 @@ describe('qlb doctor', () => {
     assert.equal(provider?.source, `${config.cswapSequencePath} + ${config.cswapUsagePath}`);
   });
 
+  it('does not treat C-swap cache as fresh when the existing QLB lifecycle is unreadable', () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-anthropic-lifecycle-error-'));
+    const config = defaultConfig(home);
+    mkdirSync(join(home, '.claude-swap-backup', 'cache'), { recursive: true });
+    writeFileSync(config.cswapSequencePath, JSON.stringify({ sequence: [1], activeAccountNumber: 1, accounts: { 1: {} } }));
+    writeFileSync(config.cswapUsagePath, JSON.stringify({ schemaVersion: 2, accounts: { 1: { lastGood: { five_hour: { pct: 1 } } } } }));
+    const store = openStore(config.dbPath);
+    store.close();
+    const db = new DatabaseSync(config.dbPath);
+    try {
+      db.exec('DROP TABLE lifecycle');
+    } finally {
+      db.close();
+    }
+
+    const provider = inspectProviders(config, () => 'ok').find((entry) => entry.provider === 'anthropic');
+    assert.equal(provider?.level, 'WARN');
+    assert.equal(provider?.source, config.dbPath);
+    assert.match(provider?.message ?? '', /QLB usage store unavailable/);
+    assert.doesNotMatch(provider?.message ?? '', /credential source not found/);
+  });
+
   it('reports an unreadable QLB-owned usage store instead of checking C-swap', () => {
     const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-anthropic-store-error-'));
     const config = defaultConfig(home);

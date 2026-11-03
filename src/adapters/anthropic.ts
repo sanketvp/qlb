@@ -1,3 +1,5 @@
+import { existsSync } from 'node:fs';
+
 import { config } from '../config';
 import { loadCswapUsageSnapshots } from '../cswap-usage';
 import { qlbOwnsAnthropicUsage, readAnthropicStoreSnapshots } from '../anthropic-usage-view';
@@ -28,7 +30,12 @@ export const anthropicAdapter: Adapter = {
       // Match status's read-only lifecycle gate: after the Claude hand-back,
       // retained QLB rows must not override C-swap's cache.
       const lifecycle = lifecyclePhase(config.dbPath);
-      if (lifecycle.available && qlbOwnsAnthropicUsage(lifecycle.phase)) {
+      if (!lifecycle.available && existsSync(config.dbPath)) {
+        // An existing QLB store with an unreadable lifecycle cannot safely
+        // delegate to C-swap: QLB may still own the active credentials.
+        return errorSnap('QLB lifecycle unavailable');
+      }
+      if (lifecycle.available && !lifecycle.restorePending && qlbOwnsAnthropicUsage(lifecycle.phase)) {
         const stored = readAnthropicStoreSnapshots(config.dbPath, Math.floor(Date.now() / 1000));
         // QLB owns this phase, so an unreadable store is a status error rather
         // than permission to serve stale C-swap data.

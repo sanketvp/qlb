@@ -289,11 +289,17 @@ export function inspectProviders(
   // Use the same read-only lifecycle gate as status: QLB polling owns usage
   // only through cutover/retirement; rollback and closed states return to C-swap.
   const claudeLifecycle = lifecyclePhase(config.dbPath);
-  const qlbOwnsAnthropic = claudeLifecycle.available && qlbOwnsAnthropicUsage(claudeLifecycle.phase);
+  // An existing store whose lifecycle cannot be read may still own Claude;
+  // fail closed rather than reporting the C-swap cache as current.
+  const qlbLifecycleUnavailable = !claudeLifecycle.available && existsSync(config.dbPath);
+  const qlbOwnsAnthropic = claudeLifecycle.available && !claudeLifecycle.restorePending
+    && qlbOwnsAnthropicUsage(claudeLifecycle.phase);
   const anthropicPolls = qlbOwnsAnthropic ? anthropicPollFreshness(config.dbPath) : null;
-  const anthropicOk = qlbOwnsAnthropic
-    ? anthropicPolls?.fresh === true
-    : cswapCachePresent({ sequencePath: config.cswapSequencePath, usagePath: config.cswapUsagePath });
+  const anthropicOk = qlbLifecycleUnavailable
+    ? false
+    : qlbOwnsAnthropic
+      ? anthropicPolls?.fresh === true
+      : cswapCachePresent({ sequencePath: config.cswapSequencePath, usagePath: config.cswapUsagePath });
 
   const piAuth = readJson(config.piAuthJsonPath);
   const xai = piAuth?.xai;
@@ -335,9 +341,11 @@ export function inspectProviders(
   return [
     anthropicOk
       ? found('anthropic', qlbOwnsAnthropic ? config.dbPath : `${config.cswapSequencePath} + ${config.cswapUsagePath}`, qlbOwnsAnthropic ? CONFIG_ENV_VARS.dbPath : CONFIG_ENV_VARS.cswapSequencePath, qlbOwnsAnthropic ? `export ${CONFIG_ENV_VARS.dbPath}=~/.qlb/qlb.db` : `export ${CONFIG_ENV_VARS.cswapSequencePath}=~/.claude-swap-backup/sequence.json`)
-      : qlbOwnsAnthropic
-        ? staleAnthropicUsage(config.dbPath, anthropicPolls === null)
-        : missing('anthropic', `${config.cswapSequencePath} + ${config.cswapUsagePath}`, CONFIG_ENV_VARS.cswapSequencePath, `export ${CONFIG_ENV_VARS.cswapSequencePath}=~/.claude-swap-backup/sequence.json`),
+      : qlbLifecycleUnavailable
+        ? staleAnthropicUsage(config.dbPath, true)
+        : qlbOwnsAnthropic
+          ? staleAnthropicUsage(config.dbPath, anthropicPolls === null)
+          : missing('anthropic', `${config.cswapSequencePath} + ${config.cswapUsagePath}`, CONFIG_ENV_VARS.cswapSequencePath, `export ${CONFIG_ENV_VARS.cswapSequencePath}=~/.claude-swap-backup/sequence.json`),
     xaiOk
       ? found('xai', `${config.piAuthJsonPath} (xai entry)`, CONFIG_ENV_VARS.piAuthJsonPath, `export ${CONFIG_ENV_VARS.piAuthJsonPath}=~/.pi/agent/auth.json`)
       : missing('xai', `${config.piAuthJsonPath} (xai entry)`, CONFIG_ENV_VARS.piAuthJsonPath, `export ${CONFIG_ENV_VARS.piAuthJsonPath}=~/path/to/pi-auth.json`),
