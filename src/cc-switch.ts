@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import {
+  credentialFingerprint,
   needsFreshenBeforeSwitch,
   parseCredentialBlob,
   type JsonObject,
@@ -12,7 +13,6 @@ import {
 import {
   classifyOutgoingCredential,
   prefetchLiveIdentity,
-  sameCredentialLineage,
   type ClassifyClaudeSlot,
   type PrefetchedLiveIdentity,
 } from './cc-classify';
@@ -22,6 +22,7 @@ import {
   readClaudeConfig,
   readLiveClaudeCredentials,
   sharedCredentialFields,
+  SHARED_CREDENTIAL_KEYS,
   spliceOauthAccount,
   writeLiveClaudeCredentials,
   type ClaudeCredentialsOptions,
@@ -209,10 +210,10 @@ export async function prepareClaudeSwitch(deps: ClaudeSwitchDeps, input: SwitchC
     let consumed; try { consumed = await consumeClaudeSlot({ slots: deps.slots, postRefresh: deps.consume.postRefresh, now: deps.now, withConsumeLock: deps.consume.withConsumeLock, withSwitchLock: deps.consume.withSwitchLock, stashTimestamp: deps.stashTimestamp ?? deps.consume.stashTimestamp, warn: deps.warn }, { accountId: input.to, snapshot: targetCredential }); } catch { return { kind: 'refused', reason: 'freshen-transient' }; }
     if (consumed.kind !== 'refreshed' && consumed.kind !== 'current') return { kind: 'refused', reason: `freshen-${consumed.kind}` };
     targetCredential = consumed.credential ?? targetCredential;
-    // A `current` result can follow a successful POST whose successor was
-    // stashed after a CAS race. Its predecessor was still spent, so preserve
-    // the freshen marker for the locked self-target decision below.
-    if (consumed.kind === 'refreshed' || consumed.kind === 'current') {
+    // `current` can be returned before any POST when cc-consume observes an
+    // already-current slot. Only a refreshed result, or a current result with
+    // a stashed successor, proves this run made the refresh POST.
+    if (consumed.kind === 'refreshed' || (consumed.kind === 'current' && consumed.stashed === true)) {
       preFreshenTargetCredential = beforeFreshen;
       targetFreshened = true;
     }
@@ -222,6 +223,29 @@ export async function prepareClaudeSwitch(deps: ClaudeSwitchDeps, input: SwitchC
 }
 
 function sha256(value: string): string { return createHash('sha256').update(value, 'utf8').digest('hex'); }
+
+function canonicalAccountCredential(value: unknown, removeSharedFields = false): unknown {
+  if (Array.isArray(value)) return value.map((item) => canonicalAccountCredential(item));
+  if (value !== null && typeof value === 'object') {
+    const canonical: JsonObject = {};
+    for (const key of Object.keys(value).sort()) {
+      if (!removeSharedFields || !(SHARED_CREDENTIAL_KEYS as readonly string[]).includes(key)) {
+        canonical[key] = canonicalAccountCredential((value as JsonObject)[key]);
+      }
+    }
+    return canonical;
+  }
+  return value;
+}
+
+/** Compare account-owned credential data, ignoring machine-shared fields and JSON key order. */
+export function sameAccountCredential(left: string | null, right: string | null): boolean {
+  const leftCredential = left === null ? null : parseCredentialBlob(left)?.data ?? null;
+  const rightCredential = right === null ? null : parseCredentialBlob(right)?.data ?? null;
+  return leftCredential !== null && rightCredential !== null
+    && JSON.stringify(canonicalAccountCredential(leftCredential, true)) === JSON.stringify(canonicalAccountCredential(rightCredential, true));
+}
+
 function noDecision(): ClaudeSwitchDecision { return { leftHeadroom: null, leftRecoveryAt: null, leftTrigger: null }; }
 function steps(): NonNullable<ClaudeSwitchResult['steps']> { return { started: [], reversed: [], notLanded: [], restoreFailures: [], cleanup: [] }; }
 function isCrash(error: unknown): error is CrashSignal { return error instanceof CrashSignal; }
@@ -459,7 +483,7 @@ async function switchClaudeAttempt(deps: ClaudeSwitchDeps, input: SwitchClaudeIn
           if (lockedCheck.kind === 'refused') return refusal(deps, input, attempt, from, lockedCheck.reason);
           const target = deps.slots.getSlot(input.to)!;
           let transactionInput = input;
-          let republishFreshenedHead = false;
+          let republishSlotHead = false;
           let verifiedPredecessor: string | null = null;
           if (!input.republish && from === input.to) {
             let liveHead: string;
@@ -471,25 +495,37 @@ async function switchClaudeAttempt(deps: ClaudeSwitchDeps, input: SwitchClaudeIn
               return refusal(deps, input, attempt, from, 'active-changed');
             }
             if (!liveHead) return refusal(deps, input, attempt, from, 'active-changed');
-            // This is precisely Step 5's own-family comparison
-            // (cc-classify.ts:sameCredentialLineage): it ignores QLB's
-            // machine-shared fields and JSON serialization order.
-            if (!sameCredentialLineage(slotHead, liveHead)) {
+            if (!sameAccountCredential(slotHead, liveHead)) {
               if (prepared.targetFreshened && prepared.preFreshenTargetCredential !== null
-                && sameCredentialLineage(prepared.preFreshenTargetCredential, liveHead)) {
-                // Reuse K5b-1's self-republish transaction to restore the
-                // current slot head; never let normal adoption replace it.
+                && sameAccountCredential(prepared.preFreshenTargetCredential, liveHead)) {
                 verifiedPredecessor = liveHead;
-                republishFreshenedHead = true;
+                republishSlotHead = true;
+                transactionInput = { ...input, republish: true };
+              } else if (target.prevFingerprint !== null && credentialFingerprint(liveHead) === target.prevFingerprint) {
+                // ClaudeSlots.writeSlot records the immediate predecessor in
+                // prevFingerprint. Its matching lineage means this live
+                // value is a known older head, not a newer own rotation.
+                verifiedPredecessor = liveHead;
+                republishSlotHead = true;
                 transactionInput = { ...input, republish: true };
               } else {
-                // Without this run's freshen record there is no established
-                // ordering between two rotating credentials. Refuse rather
-                // than call a divergent self-target a noop.
-                return refusal(deps, input, attempt, from, 'active-changed');
+                const selfClassification = classifyOutgoingCredential({
+                  outgoing: { accountId: target.accountId, email: target.email ?? null, orgUuid: target.orgUuid ?? null, credential: slotHead },
+                  slots: prepared.slots,
+                  liveCredential: liveHead,
+                  provenance: prepared.prefetch,
+                  probeVerdict: input.probeVerdict,
+                });
+                // Account ownership comes from profile/identity classification,
+                // never from credential equality. Unknown and own rotations
+                // retain the normal self-target no-op and are not adopted here.
+                if (selfClassification.kind === 'foreign' || selfClassification.kind === 'foreign-synced'
+                  || selfClassification.kind === 'alien' || selfClassification.kind === 'known-foreign') {
+                  return refusal(deps, input, attempt, from, 'active-changed');
+                }
               }
             }
-            if (!republishFreshenedHead) {
+            if (!republishSlotHead) {
               try {
                 deps.store.recordSwitch({ ts: deps.now(), provider: 'anthropic', fromAccount: from, toAccount: input.to, trigger: input.trigger, outcome: 'noop', injected: switchWasInjected(deps, input), stepsJson: JSON.stringify({ attempt }) });
               } catch { warn(deps, 'could not record noop Claude switch'); }
@@ -499,7 +535,7 @@ async function switchClaudeAttempt(deps: ClaudeSwitchDeps, input: SwitchClaudeIn
           let outgoingLive: string;
           try { outgoingLive = await readLiveClaudeCredentials(live); } catch (error) { return refusal(deps, transactionInput, attempt, from, isCredentialNotFound(error) ? 'live-credential-empty' : 'live-credential-unreadable'); }
           if (!outgoingLive) return refusal(deps, transactionInput, attempt, from, 'live-credential-empty');
-          if (republishFreshenedHead && (verifiedPredecessor === null || !sameCredentialLineage(verifiedPredecessor, outgoingLive))) {
+          if (republishSlotHead && (verifiedPredecessor === null || !sameAccountCredential(verifiedPredecessor, outgoingLive))) {
             return refusal(deps, transactionInput, attempt, from, 'active-changed');
           }
           state.started.push(4); await deps.hooks?.afterStep4?.();
@@ -512,7 +548,7 @@ async function switchClaudeAttempt(deps: ClaudeSwitchDeps, input: SwitchClaudeIn
           try { classified = (deps.classifyOutgoing ?? classifyOutgoingCredential)({ outgoing, slots: prepared.slots, liveCredential: outgoingLive, provenance: prepared.prefetch, probeVerdict: transactionInput.probeVerdict }); } catch (error) { return failed(deps, transactionInput, attempt, from, 'outgoing-backup-failed', writeError(error, 'keychain-write-failed'), state, 5); }
           // The stale predecessor is known to be the exact pre-refresh target.
           // Keep the refreshed slot head as K5b-1's publication source.
-          if (republishFreshenedHead) classified = { kind: 'own-bytes' as const, foreignSlotId: null };
+          if (republishSlotHead) classified = { kind: 'own-bytes' as const, foreignSlotId: null };
           if (transactionInput.republish && classified.kind !== 'own-bytes' && classified.kind !== 'own-family' && classified.kind !== 'own-rotated') {
             return refusal(deps, transactionInput, attempt, from, 'republish-live-not-own');
           }

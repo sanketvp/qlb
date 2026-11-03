@@ -16,6 +16,7 @@ import {
   classifySwitchError,
   CrashSignal,
   prepareClaudeSwitch,
+  sameAccountCredential,
   switchClaude,
   type ClaudeSwitchDeps,
 } from '../src/cc-switch';
@@ -30,10 +31,17 @@ function credential(tag: string, expiresAt = NOW + 60 * 60_000): string {
 
 /** Deliberately differs from Step 7's serialize-then-append shared-field order. */
 function credentialWithSharedFields(tag: string, expiresAt = NOW + 60 * 60_000): string {
+  return credentialWithOauth(tag, tag, expiresAt);
+}
+
+function credentialWithOauth(accessTag: string, refreshTag: string, expiresAt = NOW + 60 * 60_000): string {
   return JSON.stringify({
-    mcpOAuth: { shared: `slot-${tag}` },
-    pluginSecrets: { plugin: `slot-${tag}` },
-    claudeAiOauth: { accessToken: `fixture-access-${tag}`, refreshToken: `fixture-refresh-${tag}`, expiresAt },
+    mcpOAuth: { shared: `slot-${refreshTag}` },
+    mcpOAuthClientConfig: { client: `slot-${refreshTag}` },
+    mcpXaaIdp: { idp: `slot-${refreshTag}` },
+    mcpXaaIdpConfig: { config: `slot-${refreshTag}` },
+    pluginSecrets: { plugin: `slot-${refreshTag}` },
+    claudeAiOauth: { accessToken: `fixture-access-${accessTag}`, refreshToken: `fixture-refresh-${refreshTag}`, expiresAt },
   });
 }
 
@@ -214,6 +222,23 @@ describe('Claude switch Phase A (K5-4)', () => {
     assert.equal(subject.posts(), 0);
   });
 
+  it('does not mark a target freshened when consume returns current without this run making a POST', async () => {
+    const subject = await fixture();
+    await subject.slots.writeSlot('account-b', credentialWithSharedFields('b-before', NOW + 10 * 60_000), { cause: 'post' });
+    let switchLocks = 0;
+    subject.deps.consume.withSwitchLock = async (fn) => {
+      switchLocks += 1;
+      if (switchLocks === 2) await subject.slots.writeSlot('account-b', credentialWithSharedFields('b-racer'), { cause: 'post' });
+      return fn();
+    };
+
+    const result = await prepareClaudeSwitch(subject.deps, manual);
+
+    assert.equal('active' in result, true);
+    if ('active' in result) assert.equal(result.targetFreshened, false);
+    assert.equal(subject.posts(), 0);
+  });
+
   it('skips Phase-A freshening for republish', async () => {
     const subject = await fixture();
     await subject.slots.writeSlot('account-a', credential('a', NOW + 10 * 60_000), { cause: 'post' });
@@ -379,13 +404,23 @@ describe('Claude switch transaction (K5-5)', () => {
     assert.equal(subject.backend.listServices().some((service) => service.startsWith('qlb:anthropic:staged-rollback:')), false);
   });
 
-  it('a queued second switch to the same target records noop under the lock', async () => {
+  it('T7 true noop: identical account credentials with production shared fields remain a noop', async () => {
     const subject = await transactionFixture();
+    const head = credentialWithSharedFields('a');
+    const live = mergeSharedCredentialFields(head, {
+      mcpOAuth: { shared: 'live' }, mcpOAuthClientConfig: { client: 'live' },
+      mcpXaaIdp: { idp: 'live' }, mcpXaaIdpConfig: { config: 'live' }, pluginSecrets: { plugin: 'live' },
+    });
+    await subject.slots.writeSlot('account-a', head, { cause: 'post' });
+    await subject.backend.set(subject.paths.keychainService, 'fixture-user', live);
+
     const result = await switchClaude(subject.deps, { to: 'account-a', trigger: 'manual' });
+
     assert.deepEqual({ outcome: result.outcome, from: result.from, to: result.to, exitCode: result.exitCode }, { outcome: 'noop', from: 'account-a', to: 'account-a', exitCode: 0 });
+    assert.equal(await subject.backend.get(subject.paths.keychainService, 'fixture-user'), live);
   });
 
-  it('republishes the issued freshened head when a concurrent publisher writes the predecessor with live shared fields', async () => {
+  it('T3 r4 race: republishes the issued freshened head when a concurrent publisher writes the predecessor with live shared fields', async () => {
     const predecessor = credentialWithSharedFields('b', NOW + 10 * 60_000);
     const subject = await transactionFixture({ target: predecessor });
     let consumeSwitchLocks = 0;
@@ -407,11 +442,12 @@ describe('Claude switch transaction (K5-5)', () => {
     assert.deepEqual({ outcome: result.outcome, exitCode: result.exitCode, outgoingKind: result.outgoingKind }, { outcome: 'ok', exitCode: 0, outgoingKind: 'own-bytes' });
     assert.equal(refreshToken(head), 'fixture-refresh-issued');
     assert.equal(refreshToken(live), 'fixture-refresh-issued');
+    assert.equal(sameAccountCredential(live, head), true);
     assert.deepEqual((JSON.parse(live) as { mcpOAuth: unknown }).mcpOAuth, { shared: 'live' });
     assert.notEqual(live, head, 'Step 7 preserves live shared fields and therefore may serialize different bytes');
   });
 
-  it('keeps a concurrent publisher\'s shared-field-composed fresh slot head as a true noop', async () => {
+  it('does not overwrite a concurrent divergent live credential that is neither the predecessor nor a known older head', async () => {
     const predecessor = credentialWithSharedFields('b', NOW + 10 * 60_000);
     const subject = await transactionFixture({ target: predecessor });
     let consumeSwitchLocks = 0;
@@ -432,18 +468,16 @@ describe('Claude switch transaction (K5-5)', () => {
     assert.deepEqual({ outcome: result.outcome, exitCode: result.exitCode }, { outcome: 'noop', exitCode: 0 });
   });
 
-  it('refuses active-changed when a freshened self-target has a different account live', async () => {
-    const subject = await transactionFixture();
-    const foreign = credential('c');
+  it('T6 refuses active-changed when a self-target live credential resolves to a different account', async () => {
+    const foreign = credentialWithSharedFields('c');
+    const subject = await transactionFixture({ live: foreign });
     let consumeSwitchLocks = 0;
-    await subject.slots.writeSlot('account-b', credential('b', NOW + 10 * 60_000), { cause: 'post' });
+    await subject.slots.writeSlot('account-b', credentialWithSharedFields('b', NOW + 10 * 60_000), { cause: 'post' });
+    subject.deps.resolveProfile = async () => ({ uuid: 'account-c', email: 'c@example.test', organizationUuid: 'org-c' });
     subject.deps.consume.postRefresh = async () => ({ status: 200, body: JSON.stringify({ access_token: 'fixture-issued', refresh_token: 'fixture-refresh-issued', expires_in: 3600 }) });
     subject.deps.consume.withSwitchLock = async (fn) => {
       consumeSwitchLocks += 1;
-      if (consumeSwitchLocks === 3) {
-        subject.deps.store.setActiveLogin('anthropic', 'account-b', 'manual', NOW);
-        await subject.backend.set(subject.paths.keychainService, 'fixture-user', foreign);
-      }
+      if (consumeSwitchLocks === 3) subject.deps.store.setActiveLogin('anthropic', 'account-b', 'manual', NOW);
       return fn();
     };
 
@@ -453,10 +487,27 @@ describe('Claude switch transaction (K5-5)', () => {
     assert.equal(await subject.backend.get(subject.paths.keychainService, 'fixture-user'), foreign);
   });
 
-  it('refuses a non-freshened self-target whose live credential is an older same-account rotation, rather than reporting noop', async () => {
+  it('T1 newer Claude Code rotation on a non-freshened self-target remains a noop and preserves live', async () => {
+    const head = credentialWithSharedFields('b-old');
+    const newerLive = credentialWithSharedFields('b-new');
+    const subject = await transactionFixture({ target: head });
+    subject.deps.store.setActiveLogin('anthropic', 'account-b', 'manual', NOW);
+    const liveBefore = await subject.backend.get(subject.paths.keychainService, 'fixture-user');
+    const publishedNewerLive = mergeSharedCredentialFields(newerLive, sharedCredentialFields(liveBefore) ?? {});
+    await subject.backend.set(subject.paths.keychainService, 'fixture-user', publishedNewerLive);
+    subject.deps.resolveProfile = async () => ({ uuid: 'account-b', email: 'b@example.test', organizationUuid: 'org-b' });
+
+    const result = await switchClaude(subject.deps, manual);
+
+    assert.deepEqual({ outcome: result.outcome, exitCode: result.exitCode }, { outcome: 'noop', exitCode: 0 });
+    assert.equal(await subject.backend.get(subject.paths.keychainService, 'fixture-user'), publishedNewerLive);
+  });
+
+  it('T2 republishes a non-freshened self-target when live is the slot\'s recorded prevFingerprint', async () => {
     const predecessor = credentialWithSharedFields('b-old');
     const head = credentialWithSharedFields('b-new');
-    const subject = await transactionFixture({ target: head });
+    const subject = await transactionFixture({ target: predecessor });
+    await subject.slots.writeSlot('account-b', head, { cause: 'post' });
     subject.deps.store.setActiveLogin('anthropic', 'account-b', 'manual', NOW);
     const liveBefore = await subject.backend.get(subject.paths.keychainService, 'fixture-user');
     const publishedPredecessor = mergeSharedCredentialFields(predecessor, sharedCredentialFields(liveBefore) ?? {});
@@ -464,15 +515,41 @@ describe('Claude switch transaction (K5-5)', () => {
     subject.deps.resolveProfile = async () => ({ uuid: 'account-b', email: 'b@example.test', organizationUuid: 'org-b' });
 
     const result = await switchClaude(subject.deps, manual);
+    const publishedHead = await subject.backend.get(subject.paths.keychainService, 'fixture-user');
 
-    assert.deepEqual({ outcome: result.outcome, reason: result.reason, exitCode: result.exitCode }, { outcome: 'refused', reason: 'active-changed', exitCode: 3 });
-    assert.equal(await subject.backend.get(subject.paths.keychainService, 'fixture-user'), publishedPredecessor);
+    assert.deepEqual({ outcome: result.outcome, exitCode: result.exitCode, outgoingKind: result.outgoingKind }, { outcome: 'ok', exitCode: 0, outgoingKind: 'own-bytes' });
+    assert.equal(sameAccountCredential(publishedHead, head), true);
   });
 
-  it('refuses if live rotates between the verified predecessor read and Step 4, without forcing own-bytes', async () => {
+  it('T4 republishes when the pre-freshen predecessor shares a refresh token but has a stale access token', async () => {
     const predecessor = credentialWithSharedFields('b', NOW + 10 * 60_000);
-    const newerLive = mergeSharedCredentialFields(credentialWithSharedFields('b-concurrent'), {
-      mcpOAuth: { shared: 'concurrent' }, pluginSecrets: { plugin: 'concurrent' },
+    const stalePredecessor = credentialWithOauth('b-stale-access', 'b', NOW + 10 * 60_000);
+    const subject = await transactionFixture({ target: predecessor });
+    let consumeSwitchLocks = 0;
+    subject.deps.consume.postRefresh = async () => ({ status: 200, body: JSON.stringify({ access_token: 'fixture-issued', expires_in: 3600 }) });
+    subject.deps.consume.withSwitchLock = async (fn) => {
+      consumeSwitchLocks += 1;
+      if (consumeSwitchLocks === 3) {
+        subject.deps.store.setActiveLogin('anthropic', 'account-b', 'manual', NOW);
+        const liveBefore = await subject.backend.get(subject.paths.keychainService, 'fixture-user');
+        await subject.backend.set(subject.paths.keychainService, 'fixture-user', mergeSharedCredentialFields(stalePredecessor, sharedCredentialFields(liveBefore) ?? {}));
+      }
+      return fn();
+    };
+
+    const result = await switchClaude(subject.deps, manual);
+    const head = (await subject.slots.readSlot('account-b', { fresh: true })).credential;
+    const live = await subject.backend.get(subject.paths.keychainService, 'fixture-user');
+
+    assert.deepEqual({ outcome: result.outcome, exitCode: result.exitCode }, { outcome: 'ok', exitCode: 0 });
+    assert.equal(sameAccountCredential(live, head), true);
+  });
+
+  it('T5 refuses when live changes only its access token between the verified predecessor and Step 4', async () => {
+    const predecessor = credentialWithSharedFields('b', NOW + 10 * 60_000);
+    const newerLive = mergeSharedCredentialFields(credentialWithOauth('b-concurrent-access', 'b'), {
+      mcpOAuth: { shared: 'concurrent' }, mcpOAuthClientConfig: { client: 'concurrent' },
+      mcpXaaIdp: { idp: 'concurrent' }, mcpXaaIdpConfig: { config: 'concurrent' }, pluginSecrets: { plugin: 'concurrent' },
     });
     const subject = await transactionFixture({ target: predecessor });
     const originalGet = subject.backend.get.bind(subject.backend);
@@ -1135,7 +1212,9 @@ describe('Claude switch transaction (K5-5)', () => {
   it('does not freshen an already-active target before returning noop', async () => {
     const subject = await transactionFixture();
     let posts = 0;
-    await subject.slots.writeSlot('account-a', JSON.stringify({ claudeAiOauth: { accessToken: 'outgoing-access', refreshToken: 'outgoing-refresh', expiresAt: NOW + 10 * 60_000 }, mcpOAuth: { shared: 'live' } }), { cause: 'post' });
+    const active = credentialWithOauth('a', 'a', NOW + 10 * 60_000);
+    await subject.slots.writeSlot('account-a', active, { cause: 'post' });
+    await subject.backend.set(subject.paths.keychainService, 'fixture-user', mergeSharedCredentialFields(active, { mcpOAuth: { shared: 'live' } }));
     subject.deps.consume.postRefresh = async () => {
       posts += 1;
       return { status: 200, body: JSON.stringify({ access_token: 'fixture-issued', refresh_token: 'fixture-refresh-issued', expires_in: 3600 }) };
