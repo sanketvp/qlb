@@ -23,6 +23,7 @@ import { switchClaude, type ClaudeSwitchDeps, type ClaudeSwitchResult } from '..
 import { dueCandidate, planAfterFetch, RECENT_429_WINDOW_S, type Usage } from '../poll-policy';
 import { redactSecrets } from '../redact';
 import { Store, type UsagePollRow } from '../store';
+import { projectAnthropicUsageReadings } from '../anthropic-usage-view';
 import type { BucketReading } from '../types';
 
 const PROVIDER = 'anthropic';
@@ -96,26 +97,6 @@ function recent429(row: UsagePollRow | undefined, nowS: number): boolean {
   return row?.last429At !== null && row?.last429At !== undefined && nowS - row.last429At <= RECENT_429_WINDOW_S;
 }
 
-const STALE_OK_S = 300;
-const TRUST_MAX_AGE_S = 3600;
-const RATE_LIMIT_TRUST_MAX_AGE_S = 7200;
-const HARD_SENTINEL_STATUSES = new Set(['token-expired', 'foreign-credential', 'keychain-unavailable', 'no-credentials', 'relogin-needed']);
-
-function decisionTrusts(row: UsagePollRow | undefined, fetchedAt: number, snapshotResetAt: number | undefined, nowS: number): boolean {
-  const ageS = nowS - fetchedAt / 1000;
-  if (HARD_SENTINEL_STATUSES.has(row?.lastStatus ?? '')) return ageS <= 180;
-  if (row?.lastStatus === 'http-429') {
-    if (snapshotResetAt !== undefined && nowS * 1000 > snapshotResetAt) return false;
-    if (ageS <= STALE_OK_S) return true;
-    return ageS <= RATE_LIMIT_TRUST_MAX_AGE_S;
-  }
-  if (ageS <= STALE_OK_S) return true;
-  if (!row || ageS > TRUST_MAX_AGE_S) return false;
-  return row.consecutiveFailures > 0
-    || (row.nextDueAt !== null && row.nextDueAt !== undefined && nowS < row.nextDueAt)
-    || (row.heldUntil !== null && row.heldUntil !== undefined && nowS < row.heldUntil);
-}
-
 /** The slot's live dead flag supersedes a legacy sticky poll status. */
 function pollingState(slots: ReturnType<ClaudeSlots['listSlots']>, polls: Record<string, UsagePollRow>): Record<string, UsagePollRow> {
   const liveIds = new Set(slots.filter((slot) => !slot.dead).map((slot) => slot.accountId));
@@ -131,14 +112,14 @@ export function freshAnthropicAccounts(slots: ReturnType<ClaudeSlots['listSlots'
   return slots.filter((slot) => slot.archivedAt == null).map((slot) => {
     const row = polls[slot.accountId];
     const snapshot = store.getAllSnapshots(slot.accountId);
-    // During a 429 hold the oracle expires the entire snapshot at its first
-    // window reset; a later window must not keep the account trusted alone.
-    const snapshotResetAt = Object.values(snapshot).reduce<number | undefined>((earliest, reading) =>
-      reading.resetAt === undefined ? earliest : earliest === undefined ? reading.resetAt : Math.min(earliest, reading.resetAt), undefined);
-    const buckets = unknownThisTick.has(slot.accountId) ? {} : Object.fromEntries(Object.entries(snapshot)
-      .filter(([label, reading]) => decisionTrusts(row, reading.fetchedAt, snapshotResetAt, nowS)
-        && (!label.startsWith('7d:') || (scopedEnabled && (allScoped || configuredModels.has(label.slice(3).toLowerCase())))))
-      .map(([label, reading]) => [label, { usedPct: reading.usedPct, ...(reading.resetAt === undefined ? {} : { resetAt: reading.resetAt }) }]));
+    const trusted = unknownThisTick.has(slot.accountId) ? {} : projectAnthropicUsageReadings(
+      snapshot, row, nowS,
+      (label) => !label.startsWith('7d:') || (scopedEnabled && (allScoped || configuredModels.has(label.slice(3).toLowerCase()))),
+    );
+    const buckets = Object.fromEntries(Object.entries(trusted).map(([label, reading]) => [label, {
+      usedPct: reading.usedPct,
+      ...(reading.resetAt === undefined ? {} : { resetAt: reading.resetAt }),
+    }]));
     return {
       accountId: slot.accountId, buckets, dead: slot.dead,
       ...(slot.threshold == null ? {} : { threshold: slot.threshold }),

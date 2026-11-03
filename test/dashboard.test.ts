@@ -97,7 +97,7 @@ describe('dashboard formatting', () => {
   });
 
   it('uses Claude active_login during cutting-over and committed cutover even with NATIVE Pi ownership', () => {
-    for (const claudeCutoverPhase of ['cutting-over', 'cutover']) {
+    for (const claudeCutoverPhase of ['cutting-over', 'cutover', 'retired']) {
       let activeReads = 0;
       const accounts = enrichAccounts(
         [
@@ -170,7 +170,7 @@ describe('dashboard formatting', () => {
       activeAccountForProvider: (_provider, providerAccounts) => {
         activeReads += 1;
         return activeAnthropicMarker({
-          orgUuid: 'shared-org', email: 'second@example.test', orgUuidSlotCount: 2,
+          accountId: 'slot-second', orgUuid: 'shared-org', email: 'second@example.test', orgUuidSlotCount: 2,
         }, providerAccounts);
       },
     });
@@ -193,7 +193,7 @@ describe('dashboard formatting', () => {
         overrideForAccount: () => null,
         claudeCutoverPhase: 'cutover',
         activeAccountForProvider: (_provider, providerAccounts) => activeAnthropicMarker({
-          orgUuid: 'shared-org', email: 'duplicate@example.test', orgUuidSlotCount: 2,
+          accountId: 'slot-duplicate', orgUuid: 'shared-org', email: 'duplicate@example.test', orgUuidSlotCount: 2,
         }, providerAccounts),
       },
     );
@@ -208,7 +208,7 @@ describe('dashboard formatting', () => {
         overrideForAccount: () => null,
         claudeCutoverPhase: 'cutover',
         activeAccountForProvider: (_provider, providerAccounts) => activeAnthropicMarker({
-          orgUuid: 'expected-org', email: 'target@example.test', orgUuidSlotCount: 2,
+          accountId: 'slot-target', orgUuid: 'expected-org', email: 'target@example.test', orgUuidSlotCount: 2,
         }, providerAccounts),
       },
     );
