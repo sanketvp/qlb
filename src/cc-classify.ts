@@ -72,7 +72,8 @@ export interface CredentialReadProvenance {
   degraded: boolean;
 }
 
-function sameLineage(left: string | null, right: string): boolean {
+/** The Step-5 own-family identity: refresh-token lineage, independent of shared fields or JSON order. */
+export function sameCredentialLineage(left: string | null, right: string): boolean {
   if (left == null) return false;
   return credentialFingerprint(left) === credentialFingerprint(right);
 }
@@ -145,7 +146,7 @@ export async function prefetchLiveIdentity(
   } catch {
     return { liveCredential: null, resolved: null };
   }
-  if (!liveCredential || options.outgoing.credential === liveCredential || sameLineage(options.outgoing.credential, liveCredential)) {
+  if (!liveCredential || options.outgoing.credential === liveCredential || sameCredentialLineage(options.outgoing.credential, liveCredential)) {
     return { liveCredential, resolved: null };
   }
 
@@ -169,7 +170,7 @@ export function classifyOutgoingCredential(
   const { outgoing, liveCredential, provenance } = input;
   if (!liveCredential) throw new TypeError('live credential must be non-empty');
   if (outgoing.credential === liveCredential) return { kind: 'own-bytes', foreignSlotId: null };
-  if (sameLineage(outgoing.credential, liveCredential)) return { kind: 'own-family', foreignSlotId: null };
+  if (sameCredentialLineage(outgoing.credential, liveCredential)) return { kind: 'own-family', foreignSlotId: null };
   if (isWipedOauthBlob(liveCredential)) return { kind: 'wiped', foreignSlotId: null };
 
   // The cached false verdict remains a safety boundary even if the new probe
@@ -210,7 +211,7 @@ export function classifyOutgoingCredential(
       ? { kind: 'alien', foreignSlotId: null }
       : { kind: 'unresolved', foreignSlotId: null };
   }
-  if (slot.credential === liveCredential || sameLineage(slot.credential, liveCredential)) {
+  if (slot.credential === liveCredential || sameCredentialLineage(slot.credential, liveCredential)) {
     return { kind: 'foreign-synced', foreignSlotId: slot.accountId };
   }
   return { kind: 'foreign', foreignSlotId: slot.accountId };
@@ -228,7 +229,7 @@ export function decideSelfSwitchAction(input: {
 }): 'noop' | 'noop-diverged' | 'reconcile' {
   // The upstream keeps an unreadable or empty live store as a no-op rather
   // than overwriting it with an unverified backup.
-  if (!input.liveCredential || input.outgoing.credential === input.liveCredential || sameLineage(input.outgoing.credential, input.liveCredential)) {
+  if (!input.liveCredential || input.outgoing.credential === input.liveCredential || sameCredentialLineage(input.outgoing.credential, input.liveCredential)) {
     return 'noop';
   }
   return input.provenance.resolved === null || input.provenance.liveCredential !== input.liveCredential
