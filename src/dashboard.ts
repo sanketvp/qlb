@@ -500,7 +500,7 @@ function shouldApplyAnthropicActiveLoginOverride(
   claudeCutoverPhase: string | undefined,
 ): boolean {
   return provider === 'anthropic'
-    && (claudeCutoverPhase === 'cutting-over' || claudeCutoverPhase === 'cutover');
+    && (claudeCutoverPhase === 'cutting-over' || claudeCutoverPhase === 'cutover' || claudeCutoverPhase === 'retired');
 }
 
 function matchesActiveMarker(

@@ -12,7 +12,7 @@ import { consumeMarkerPathFor, CSWAP_ANTHROPIC_STORE } from './cswap-consume';
 import { builtInAdapters } from './adapters';
 import { CONFIG_ENV_VARS, OPENROUTER_KEYCHAIN_SERVICE, type QlbConfig } from './config';
 import { cswapCachePresent } from './cswap-usage';
-import { readAnthropicUsagePollFreshness } from './anthropic-usage-view';
+import { qlbOwnsAnthropicUsage, readAnthropicUsagePollFreshness } from './anthropic-usage-view';
 import {
   execFileUtf8,
   isSecurityTimeout,
@@ -266,17 +266,33 @@ function missing(
 
 function anthropicPollFreshness(dbPath: string): { hasPolls: boolean; fresh: boolean } | null {
   if (!existsSync(dbPath)) return null;
-  const freshness = readAnthropicUsagePollFreshness(dbPath, Math.floor(Date.now() / 1000));
-  return freshness?.hasPolls ? freshness : null;
+  return readAnthropicUsagePollFreshness(dbPath, Math.floor(Date.now() / 1000));
+}
+
+function staleAnthropicUsage(source: string, unavailable = false): ProviderDiagnostic {
+  return {
+    provider: 'anthropic',
+    level: 'WARN',
+    source,
+    envVar: CONFIG_ENV_VARS.dbPath,
+    example: 'qlb auto refreshes QLB usage readings',
+    message: unavailable
+      ? 'QLB usage store unavailable; cannot read QLB usage readings'
+      : 'QLB usage readings are stale; qlb auto refreshes them',
+  };
 }
 
 export function inspectProviders(
   config: QlbConfig,
   command: CommandRunner = runCommand,
 ): ProviderDiagnostic[] {
-  const anthropicPolls = anthropicPollFreshness(config.dbPath);
-  const anthropicOk = anthropicPolls
-    ? anthropicPolls.fresh
+  // Use the same read-only lifecycle gate as status: QLB polling owns usage
+  // only through cutover/retirement; rollback and closed states return to C-swap.
+  const claudeLifecycle = lifecyclePhase(config.dbPath);
+  const qlbOwnsAnthropic = claudeLifecycle.available && qlbOwnsAnthropicUsage(claudeLifecycle.phase);
+  const anthropicPolls = qlbOwnsAnthropic ? anthropicPollFreshness(config.dbPath) : null;
+  const anthropicOk = qlbOwnsAnthropic
+    ? anthropicPolls?.fresh === true
     : cswapCachePresent({ sequencePath: config.cswapSequencePath, usagePath: config.cswapUsagePath });
 
   const piAuth = readJson(config.piAuthJsonPath);
@@ -318,8 +334,10 @@ export function inspectProviders(
 
   return [
     anthropicOk
-      ? found('anthropic', anthropicPolls ? config.dbPath : `${config.cswapSequencePath} + ${config.cswapUsagePath}`, anthropicPolls ? CONFIG_ENV_VARS.dbPath : CONFIG_ENV_VARS.cswapSequencePath, anthropicPolls ? `export ${CONFIG_ENV_VARS.dbPath}=~/.qlb/qlb.db` : `export ${CONFIG_ENV_VARS.cswapSequencePath}=~/.claude-swap-backup/sequence.json`)
-      : missing('anthropic', anthropicPolls ? config.dbPath : `${config.cswapSequencePath} + ${config.cswapUsagePath}`, anthropicPolls ? CONFIG_ENV_VARS.dbPath : CONFIG_ENV_VARS.cswapSequencePath, anthropicPolls ? `QLB usage polls are stale; run qlb auto` : `export ${CONFIG_ENV_VARS.cswapSequencePath}=~/.claude-swap-backup/sequence.json`),
+      ? found('anthropic', qlbOwnsAnthropic ? config.dbPath : `${config.cswapSequencePath} + ${config.cswapUsagePath}`, qlbOwnsAnthropic ? CONFIG_ENV_VARS.dbPath : CONFIG_ENV_VARS.cswapSequencePath, qlbOwnsAnthropic ? `export ${CONFIG_ENV_VARS.dbPath}=~/.qlb/qlb.db` : `export ${CONFIG_ENV_VARS.cswapSequencePath}=~/.claude-swap-backup/sequence.json`)
+      : qlbOwnsAnthropic
+        ? staleAnthropicUsage(config.dbPath, anthropicPolls === null)
+        : missing('anthropic', `${config.cswapSequencePath} + ${config.cswapUsagePath}`, CONFIG_ENV_VARS.cswapSequencePath, `export ${CONFIG_ENV_VARS.cswapSequencePath}=~/.claude-swap-backup/sequence.json`),
     xaiOk
       ? found('xai', `${config.piAuthJsonPath} (xai entry)`, CONFIG_ENV_VARS.piAuthJsonPath, `export ${CONFIG_ENV_VARS.piAuthJsonPath}=~/.pi/agent/auth.json`)
       : missing('xai', `${config.piAuthJsonPath} (xai entry)`, CONFIG_ENV_VARS.piAuthJsonPath, `export ${CONFIG_ENV_VARS.piAuthJsonPath}=~/path/to/pi-auth.json`),

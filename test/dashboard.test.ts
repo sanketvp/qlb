@@ -97,7 +97,7 @@ describe('dashboard formatting', () => {
   });
 
   it('uses Claude active_login during cutting-over and committed cutover even with NATIVE Pi ownership', () => {
-    for (const claudeCutoverPhase of ['cutting-over', 'cutover']) {
+    for (const claudeCutoverPhase of ['cutting-over', 'cutover', 'retired']) {
       let activeReads = 0;
       const accounts = enrichAccounts(
         [

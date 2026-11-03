@@ -1,7 +1,11 @@
 import assert from 'node:assert/strict';
+import { mkdtempSync } from 'node:fs';
+import { DatabaseSync } from 'node:sqlite';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
-import { anthropicStoreSnapshots } from '../src/anthropic-usage-view';
+import { anthropicStoreSnapshots, readAnthropicStoreSnapshots, readAnthropicUsagePollFreshness } from '../src/anthropic-usage-view';
 import type { ClaudeSlot } from '../src/cc-slots';
 import { openStore } from '../src/store';
 
@@ -102,5 +106,44 @@ describe('QLB-owned Anthropic store projection', () => {
     } finally {
       store.close();
     }
+  });
+
+  it('ignores poll rows belonging only to archived slots', () => {
+    const store = openStore(':memory:');
+    try {
+      record(store, 'archived', NOW_S);
+      const result = anthropicStoreSnapshots([slot('archived', { archivedAt: 1 })], store, NOW_S);
+      assert.equal(result.hasPolls, false);
+      assert.deepEqual(result.snapshots, []);
+    } finally {
+      store.close();
+    }
+  });
+
+  it('excludes archived polls and C-swap import snapshots from persisted projections', () => {
+    const dbPath = join(mkdtempSync(join(tmpdir(), 'qlb-anthropic-view-')), 'qlb.db');
+    const store = openStore(dbPath);
+    try {
+      record(store, 'archived', NOW_S);
+      record(store, 'imported', NOW_S);
+    } finally {
+      store.close();
+    }
+    const db = new DatabaseSync(dbPath);
+    try {
+      db.prepare(`INSERT INTO claude_slots (account_id, slot_num, config_json, fingerprint, added_at, archived_at)
+        VALUES ('archived', 1, '{}', 'fp-a', 1, 1), ('imported', 2, '{}', 'fp-b', 1, NULL)`).run();
+      db.prepare("UPDATE snapshots SET source = 'cswap-import' WHERE account_id = 'imported'").run();
+    } finally {
+      db.close();
+    }
+
+    const projected = readAnthropicStoreSnapshots(dbPath, NOW_S);
+    const freshness = readAnthropicUsagePollFreshness(dbPath, NOW_S);
+    assert.equal(projected?.hasPolls, true);
+    assert.equal(projected?.snapshots[0]?.accountId, 'imported');
+    assert.equal(projected?.snapshots[0]?.error, 'unavailable');
+    assert.equal(freshness?.hasPolls, true);
+    assert.equal(freshness?.fresh, false);
   });
 });

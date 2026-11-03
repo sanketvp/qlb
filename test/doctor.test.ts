@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { describe, it } from 'node:test';
 
 import { defaultConfig } from '../src/config';
@@ -26,6 +26,25 @@ async function doctorReport(
     command: (_command, args) => args[0] === 'list-keychains' ? 'ok' : '',
     hostCommand: () => '',
   });
+}
+
+function setClaudeLifecycle(dbPath: string, state: string): void {
+  const db = new DatabaseSync(dbPath);
+  try {
+    db.prepare('INSERT INTO lifecycle (state, began_at) VALUES (?, ?)').run(state, 1);
+  } finally {
+    db.close();
+  }
+}
+
+function addClaudeSlot(dbPath: string, accountId = 'account'): void {
+  const db = new DatabaseSync(dbPath);
+  try {
+    db.prepare(`INSERT INTO claude_slots (account_id, slot_num, config_json, fingerprint, added_at)
+      VALUES (?, 1, '{}', 'fixture', 1)`).run(accountId);
+  } finally {
+    db.close();
+  }
 }
 
 async function withTestQlbHome<T>(home: string, operation: () => Promise<T>): Promise<T> {
@@ -420,6 +439,8 @@ describe('qlb doctor', () => {
       },
     });
     store.close();
+    addClaudeSlot(config.dbPath);
+    setClaudeLifecycle(config.dbPath, 'cutover');
 
     const fresh = inspectProviders(config, () => 'ok').find((provider) => provider.provider === 'anthropic');
     assert.equal(fresh?.level, 'PASS');
@@ -436,11 +457,49 @@ describe('qlb doctor', () => {
     });
     staleStore.recordUsagePollResult('anthropic', 'account', { attemptedAt: nowS, status: 'usage-fetch-failed' });
     staleStore.close();
+    addClaudeSlot(staleConfig.dbPath);
+    setClaudeLifecycle(staleConfig.dbPath, 'retired');
 
     const stale = inspectProviders(staleConfig, () => 'ok').find((provider) => provider.provider === 'anthropic');
     assert.equal(stale?.level, 'WARN');
     assert.equal(stale?.source, staleConfig.dbPath);
-    assert.match(stale?.message ?? '', /stale/);
+    assert.match(stale?.message ?? '', /QLB usage readings are stale; qlb auto refreshes them/);
+    assert.doesNotMatch(stale?.message ?? '', /credential source not found/);
+  });
+
+  it('uses the C-swap cache again after Claude rolls back', () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-anthropic-rollback-'));
+    const config = defaultConfig(home);
+    mkdirSync(join(home, '.claude-swap-backup', 'cache'), { recursive: true });
+    writeFileSync(config.cswapSequencePath, JSON.stringify({ sequence: [1], activeAccountNumber: 1, accounts: { 1: {} } }));
+    writeFileSync(config.cswapUsagePath, JSON.stringify({ schemaVersion: 2, accounts: { 1: { lastGood: { five_hour: { pct: 1 } } } } }));
+    const store = openStore(config.dbPath);
+    store.recordUsagePollResult('anthropic', 'account', { attemptedAt: Math.floor(Date.now() / 1000), status: 'ok' });
+    store.close();
+    setClaudeLifecycle(config.dbPath, 'rolled-back');
+
+    const provider = inspectProviders(config, () => 'ok').find((entry) => entry.provider === 'anthropic');
+    assert.equal(provider?.level, 'PASS');
+    assert.equal(provider?.source, `${config.cswapSequencePath} + ${config.cswapUsagePath}`);
+  });
+
+  it('reports an unreadable QLB-owned usage store instead of checking C-swap', () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-anthropic-store-error-'));
+    const config = defaultConfig(home);
+    mkdirSync(dirname(config.dbPath), { recursive: true });
+    const db = new DatabaseSync(config.dbPath);
+    try {
+      db.exec('CREATE TABLE lifecycle (id INTEGER PRIMARY KEY, state TEXT NOT NULL, began_at INTEGER NOT NULL, closed_at INTEGER)');
+      db.prepare("INSERT INTO lifecycle (state, began_at) VALUES ('retired', 1)").run();
+    } finally {
+      db.close();
+    }
+
+    const provider = inspectProviders(config, () => 'ok').find((entry) => entry.provider === 'anthropic');
+    assert.equal(provider?.level, 'WARN');
+    assert.equal(provider?.source, config.dbPath);
+    assert.match(provider?.message ?? '', /QLB usage store unavailable/);
+    assert.doesNotMatch(provider?.message ?? '', /credential source not found/);
   });
 
   it('reports the fixed pi-openrouter source and pinned security binary', () => {

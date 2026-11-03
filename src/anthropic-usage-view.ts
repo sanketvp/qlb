@@ -6,6 +6,7 @@ import type { AccountSnapshot, BucketReading, Confidence } from './types';
 export const STALE_OK_S = 300;
 export const TRUST_MAX_AGE_S = 3600;
 export const RATE_LIMIT_TRUST_MAX_AGE_S = 7200;
+const QLB_USAGE_PHASES = new Set(['cutting-over', 'cutover', 'retired']);
 const HARD_SENTINEL_STATUSES = new Set(['token-expired', 'foreign-credential', 'keychain-unavailable', 'no-credentials', 'relogin-needed']);
 
 /** The read-only slot fields required to render persisted Anthropic usage. */
@@ -28,6 +29,11 @@ export interface AnthropicUsagePollRow {
   backoffUntil: number | null;
   last429At: number | null;
   heldUntil: number | null;
+}
+
+/** QLB owns Anthropic usage only while its Claude cutover is active or retired. */
+export function qlbOwnsAnthropicUsage(phase: string): boolean {
+  return QLB_USAGE_PHASES.has(phase);
 }
 
 export function decisionTrusts(
@@ -78,7 +84,7 @@ export function projectAnthropicUsageReadings(
 ): Record<string, BucketReading> {
   const snapshotResetAt = earliestResetAt(snapshot);
   return Object.fromEntries(Object.entries(snapshot).flatMap(([label, reading]) => {
-    if (!include(label)) return [];
+    if (reading.source !== 'poll' || !include(label)) return [];
     const confidence = anthropicUsageConfidence(row, reading, snapshotResetAt, nowS);
     return confidence === 'unknown' ? [] : [[label, { ...reading, confidence }]];
   }));
@@ -94,18 +100,26 @@ export interface AnthropicStoreSnapshots {
   snapshots: AccountSnapshot[];
 }
 
+function hasPollsForLiveSlots(
+  slots: readonly AnthropicUsageSlot[],
+  polls: Record<string, AnthropicUsagePollRow>,
+): boolean {
+  return slots.some((slot) => slot.archivedAt == null && polls[slot.accountId] !== undefined);
+}
+
 /** Read-only status projection of QLB-owned slots and stored poll results. */
 export function anthropicStoreSnapshots(
   slots: readonly AnthropicUsageSlot[],
   store: AnthropicUsageStoreReader,
   nowS: number,
 ): AnthropicStoreSnapshots {
+  const liveSlots = slots.filter((slot) => slot.archivedAt == null);
   const polls = store.listUsagePolls('anthropic');
-  const hasPolls = Object.keys(polls).length > 0;
+  const hasPolls = hasPollsForLiveSlots(slots, polls);
   if (!hasPolls) return { hasPolls, snapshots: [] };
   return {
     hasPolls,
-    snapshots: slots.filter((slot) => slot.archivedAt == null).map((slot) => {
+    snapshots: liveSlots.map((slot) => {
       const label = slot.email ?? slot.accountId;
       if (slot.dead) {
         return { accountId: slot.accountId, provider: 'anthropic', label, buckets: {}, error: 'token_dead' };
@@ -121,11 +135,17 @@ export function anthropicStoreSnapshots(
 }
 
 /** Whether any persisted Anthropic poll has a currently usable reading. */
-export function hasFreshAnthropicUsagePoll(store: AnthropicUsageStoreReader, nowS: number): boolean {
+export function hasFreshAnthropicUsagePoll(
+  slots: readonly AnthropicUsageSlot[],
+  store: AnthropicUsageStoreReader,
+  nowS: number,
+): boolean {
   const polls = store.listUsagePolls('anthropic');
-  return Object.entries(polls).some(([accountId, row]) =>
-    Object.keys(projectAnthropicUsageReadings(store.getAllSnapshots(accountId), row, nowS)).length > 0,
-  );
+  return slots.filter((slot) => slot.archivedAt == null).some((slot) => {
+    const row = polls[slot.accountId];
+    return row !== undefined
+      && Object.keys(projectAnthropicUsageReadings(store.getAllSnapshots(slot.accountId), row, nowS)).length > 0;
+  });
 }
 
 function numberOrNull(value: unknown): number | null {
@@ -159,7 +179,7 @@ function readOnlyStoreData(dbPath: string): {
       FROM claude_slots`).all() as Array<Record<string, unknown>>;
     const snapshots = new Map<string, Record<string, BucketReading>>();
     const snapshotRows = db.prepare(`SELECT account_id, bucket, used_pct, used, limit_val, remaining,
-      reset_at, fetched_at, source, confidence FROM snapshots`).all() as Array<Record<string, unknown>>;
+      reset_at, fetched_at, source, confidence FROM snapshots WHERE source = 'poll'`).all() as Array<Record<string, unknown>>;
     for (const row of snapshotRows) {
       const accountId = String(row.account_id);
       const reading: BucketReading = {
@@ -210,10 +230,10 @@ export function readAnthropicUsagePollFreshness(
 ): { hasPolls: boolean; fresh: boolean } | null {
   const data = readOnlyStoreData(dbPath);
   if (!data) return null;
-  const hasPolls = Object.keys(data.polls).length > 0;
+  const hasPolls = hasPollsForLiveSlots(data.slots, data.polls);
   return {
     hasPolls,
-    fresh: hasFreshAnthropicUsagePoll({
+    fresh: hasFreshAnthropicUsagePoll(data.slots, {
       listUsagePolls: () => data.polls,
       getAllSnapshots: (accountId) => data.snapshots.get(accountId) ?? {},
     }, nowS),
