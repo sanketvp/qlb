@@ -4,7 +4,6 @@ import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import {
-  credentialFingerprint,
   needsFreshenBeforeSwitch,
   parseCredentialBlob,
   type JsonObject,
@@ -486,25 +485,21 @@ async function switchClaudeAttempt(deps: ClaudeSwitchDeps, input: SwitchClaudeIn
           let republishSlotHead = false;
           let verifiedPredecessor: string | null = null;
           if (!input.republish && from === input.to) {
-            let liveHead: string;
-            let slotHead: string;
+            // An empty or unreadable live store (or slot) keeps origin/main's
+            // self-target noop, as decideSelfSwitchAction does.
+            let liveHead: string | null = null;
+            let slotHead: string | null = null;
             try {
               liveHead = await readLiveClaudeCredentials(live);
               slotHead = (await deps.slots.readSlot(input.to, { fresh: true })).credential;
-            } catch {
-              return refusal(deps, input, attempt, from, 'active-changed');
-            }
-            if (!liveHead) return refusal(deps, input, attempt, from, 'active-changed');
-            if (!sameAccountCredential(slotHead, liveHead)) {
+            } catch { /* noop below */ }
+            if (liveHead && slotHead && !sameAccountCredential(slotHead, liveHead)) {
+              // Only this run's own freshen record proves live is older than
+              // the slot head. prevFingerprint is not used: it hashes only the
+              // refresh token and can equal the head's own fingerprint, so it
+              // cannot tell an older head from a newer own rotation.
               if (prepared.targetFreshened && prepared.preFreshenTargetCredential !== null
                 && sameAccountCredential(prepared.preFreshenTargetCredential, liveHead)) {
-                verifiedPredecessor = liveHead;
-                republishSlotHead = true;
-                transactionInput = { ...input, republish: true };
-              } else if (target.prevFingerprint !== null && credentialFingerprint(liveHead) === target.prevFingerprint) {
-                // ClaudeSlots.writeSlot records the immediate predecessor in
-                // prevFingerprint. Its matching lineage means this live
-                // value is a known older head, not a newer own rotation.
                 verifiedPredecessor = liveHead;
                 republishSlotHead = true;
                 transactionInput = { ...input, republish: true };

@@ -503,7 +503,7 @@ describe('Claude switch transaction (K5-5)', () => {
     assert.equal(await subject.backend.get(subject.paths.keychainService, 'fixture-user'), publishedNewerLive);
   });
 
-  it('T2 republishes a non-freshened self-target when live is the slot\'s recorded prevFingerprint', async () => {
+  it('T2 a non-freshened self-target does not trust prevFingerprint: live matching it stays a noop and is preserved', async () => {
     const predecessor = credentialWithSharedFields('b-old');
     const head = credentialWithSharedFields('b-new');
     const subject = await transactionFixture({ target: predecessor });
@@ -515,15 +515,50 @@ describe('Claude switch transaction (K5-5)', () => {
     subject.deps.resolveProfile = async () => ({ uuid: 'account-b', email: 'b@example.test', organizationUuid: 'org-b' });
 
     const result = await switchClaude(subject.deps, manual);
-    const publishedHead = await subject.backend.get(subject.paths.keychainService, 'fixture-user');
 
-    assert.deepEqual({ outcome: result.outcome, exitCode: result.exitCode, outgoingKind: result.outgoingKind }, { outcome: 'ok', exitCode: 0, outgoingKind: 'own-bytes' });
-    assert.equal(sameAccountCredential(publishedHead, head), true);
+    assert.deepEqual({ outcome: result.outcome, exitCode: result.exitCode }, { outcome: 'noop', exitCode: 0 });
+    assert.equal(await subject.backend.get(subject.paths.keychainService, 'fixture-user'), publishedPredecessor);
   });
 
-  it('T4 republishes when the pre-freshen predecessor shares a refresh token but has a stale access token', async () => {
+  it('T8 a newer access-token-only live rotation stays a noop when prevFingerprint equals the head fingerprint', async () => {
+    const first = credentialWithOauth('b-access-1', 'b');
+    const head = credentialWithOauth('b-access-2', 'b');
+    const subject = await transactionFixture({ target: first });
+    await subject.slots.writeSlot('account-b', head, { cause: 'post' });
+    assert.equal(subject.slots.getSlot('account-b')!.prevFingerprint, subject.slots.getSlot('account-b')!.fingerprint);
+    subject.deps.store.setActiveLogin('anthropic', 'account-b', 'manual', NOW);
+    const liveBefore = await subject.backend.get(subject.paths.keychainService, 'fixture-user');
+    const newerLive = mergeSharedCredentialFields(credentialWithOauth('b-access-3', 'b'), sharedCredentialFields(liveBefore) ?? {});
+    await subject.backend.set(subject.paths.keychainService, 'fixture-user', newerLive);
+    subject.deps.resolveProfile = async () => ({ uuid: 'account-b', email: 'b@example.test', organizationUuid: 'org-b' });
+
+    const result = await switchClaude(subject.deps, manual);
+
+    assert.deepEqual({ outcome: result.outcome, exitCode: result.exitCode }, { outcome: 'noop', exitCode: 0 });
+    assert.equal(await subject.backend.get(subject.paths.keychainService, 'fixture-user'), newerLive);
+  });
+
+  it('T9 a self-target whose live store empties after Phase A stays a noop under the lock, as on origin/main', async () => {
+    const subject = await transactionFixture({ target: credentialWithSharedFields('b', NOW + 10 * 60_000) });
+    let consumeSwitchLocks = 0;
+    subject.deps.consume.postRefresh = async () => ({ status: 200, body: JSON.stringify({ access_token: 'fixture-issued', refresh_token: 'fixture-refresh-issued', expires_in: 3600 }) });
+    subject.deps.consume.withSwitchLock = async (fn) => {
+      consumeSwitchLocks += 1;
+      if (consumeSwitchLocks === 3) {
+        subject.deps.store.setActiveLogin('anthropic', 'account-b', 'manual', NOW);
+        await subject.backend.set(subject.paths.keychainService, 'fixture-user', '');
+      }
+      return fn();
+    };
+
+    const result = await switchClaude(subject.deps, manual);
+
+    assert.deepEqual({ outcome: result.outcome, exitCode: result.exitCode }, { outcome: 'noop', exitCode: 0 });
+  });
+
+  it('T4 republishes when an access-token-only refresh\'s exact predecessor is published concurrently', async () => {
     const predecessor = credentialWithSharedFields('b', NOW + 10 * 60_000);
-    const stalePredecessor = credentialWithOauth('b-stale-access', 'b', NOW + 10 * 60_000);
+    const stalePredecessor = predecessor;
     const subject = await transactionFixture({ target: predecessor });
     let consumeSwitchLocks = 0;
     subject.deps.consume.postRefresh = async () => ({ status: 200, body: JSON.stringify({ access_token: 'fixture-issued', expires_in: 3600 }) });
