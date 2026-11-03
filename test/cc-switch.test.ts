@@ -372,9 +372,31 @@ describe('Claude switch transaction (K5-5)', () => {
     assert.deepEqual({ outcome: result.outcome, from: result.from, to: result.to, exitCode: result.exitCode }, { outcome: 'noop', from: 'account-a', to: 'account-a', exitCode: 0 });
   });
 
-  it('a target that becomes active while its Phase-A freshen is in flight is not reported noop: Phase A restarts once and the live credential and the slot agree', async () => {
+  it('republishes a freshened slot head rather than reporting noop when a concurrent actor makes its pre-refresh credential live', async () => {
     const subject = await transactionFixture();
-    let transactionLocks = 0;
+    const predecessor = credential('b', NOW + 10 * 60_000);
+    let consumeSwitchLocks = 0;
+    await subject.slots.writeSlot('account-b', predecessor, { cause: 'post' });
+    subject.deps.consume.postRefresh = async () => ({ status: 200, body: JSON.stringify({ access_token: 'fixture-issued', refresh_token: 'fixture-refresh-issued', expires_in: 3600 }) });
+    subject.deps.consume.withSwitchLock = async (fn) => {
+      consumeSwitchLocks += 1;
+      if (consumeSwitchLocks === 3) {
+        subject.deps.store.setActiveLogin('anthropic', 'account-b', 'manual', NOW);
+        await subject.backend.set(subject.paths.keychainService, 'fixture-user', predecessor);
+      }
+      return fn();
+    };
+
+    const result = await switchClaude(subject.deps, manual);
+    const head = (await subject.slots.readSlot('account-b', { fresh: true })).credential;
+
+    assert.notEqual(result.outcome, 'noop');
+    assert.deepEqual({ outcome: result.outcome, exitCode: result.exitCode }, { outcome: 'ok', exitCode: 0 });
+    assert.equal(await subject.backend.get(subject.paths.keychainService, 'fixture-user'), head);
+  });
+
+  it('keeps a self-target with the freshened slot head live as a true noop', async () => {
+    const subject = await transactionFixture();
     let consumeSwitchLocks = 0;
     await subject.slots.writeSlot('account-b', credential('b', NOW + 10 * 60_000), { cause: 'post' });
     subject.deps.consume.postRefresh = async () => ({ status: 200, body: JSON.stringify({ access_token: 'fixture-issued', refresh_token: 'fixture-refresh-issued', expires_in: 3600 }) });
@@ -386,17 +408,31 @@ describe('Claude switch transaction (K5-5)', () => {
       }
       return fn();
     };
-    subject.deps.locks = {
-      switch: (async (fn: () => Promise<unknown>, options: unknown) => {
-        transactionLocks += 1;
-        return withClaudeSwitchLock(fn, options as never);
-      }) as unknown as NonNullable<ClaudeSwitchDeps['locks']>['switch'],
+
+    const result = await switchClaude(subject.deps, manual);
+
+    assert.deepEqual({ outcome: result.outcome, exitCode: result.exitCode }, { outcome: 'noop', exitCode: 0 });
+  });
+
+  it('refuses active-changed when a freshened self-target has a different account live', async () => {
+    const subject = await transactionFixture();
+    const foreign = credential('c');
+    let consumeSwitchLocks = 0;
+    await subject.slots.writeSlot('account-b', credential('b', NOW + 10 * 60_000), { cause: 'post' });
+    subject.deps.consume.postRefresh = async () => ({ status: 200, body: JSON.stringify({ access_token: 'fixture-issued', refresh_token: 'fixture-refresh-issued', expires_in: 3600 }) });
+    subject.deps.consume.withSwitchLock = async (fn) => {
+      consumeSwitchLocks += 1;
+      if (consumeSwitchLocks === 3) {
+        subject.deps.store.setActiveLogin('anthropic', 'account-b', 'manual', NOW);
+        await subject.backend.set(subject.paths.keychainService, 'fixture-user', foreign);
+      }
+      return fn();
     };
 
-    await switchClaude(subject.deps, manual);
+    const result = await switchClaude(subject.deps, manual);
 
-    assert.equal(transactionLocks, 2);
-    assert.equal(await subject.backend.get(subject.paths.keychainService, 'fixture-user'), (await subject.slots.readSlot('account-b', { fresh: true })).credential);
+    assert.deepEqual({ outcome: result.outcome, reason: result.reason, exitCode: result.exitCode }, { outcome: 'refused', reason: 'active-changed', exitCode: 3 });
+    assert.equal(await subject.backend.get(subject.paths.keychainService, 'fixture-user'), foreign);
   });
 
   it('a target that was active in Phase A but is no longer active under the lock restarts Phase A once, freshens and commits', async () => {
