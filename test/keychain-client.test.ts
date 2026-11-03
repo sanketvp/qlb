@@ -373,4 +373,53 @@ sleep 20`);
       } finally { killOwn(join(s.dir, 'pid')); }
     });
   });
+
+  it('(S1a a) runs dump-keychain under its command lock key', () => {
+    const s = state();
+    withState(s, () => {
+      const client = fake(s, 'printf "dump output"');
+      const dump = keychainRequestFromArgv('security', client, ['dump-keychain'], { timeoutMs: 2_000, lockfPath: s.lockfPath });
+      assert.equal(runKeychainClientSync(dump), 'dump output');
+    });
+  });
+
+  it('(S1a b) fails a concurrent dump-keychain request quickly without starting it', { timeout: 30_000 }, () => {
+    const s = state();
+    withState(s, () => {
+      const holder = fake(s, 'echo $$ > "$d/dump-pid"\necho run >> "$d/dump-runs"\nsleep 8', 'dump-holder');
+      const second = fake(s, 'echo run >> "$d/second-dump-runs"\nprintf unexpected', 'dump-second');
+      const service = 'cmd:dump-keychain';
+      try {
+        const began = Date.now();
+        const first = keychainRequestFromArgv('security', holder, ['dump-keychain'], { timeoutMs: 300, lockfPath: s.lockfPath });
+        assert.throws(() => runKeychainClientSync(first), (err: unknown) => (err as { code?: unknown }).code === 'ETIMEDOUT');
+        const timedOutIn = Date.now() - began;
+        assert.ok(timedOutIn >= 200 && timedOutIn < 3_300);
+        waitFor(join(s.dir, 'dump-pid'));
+        const retry = Date.now();
+        const duplicate = keychainRequestFromArgv('security', second, ['dump-keychain'], { timeoutMs: 2_000, lockfPath: s.lockfPath });
+        assert.throws(() => runKeychainClientSync(duplicate), (err: unknown) => {
+          assert.ok(err instanceof KeychainRequestStillWaiting);
+          assert.equal(err.message, 'a Keychain request for cmd:dump-keychain is still waiting for an answer');
+          return true;
+        });
+        assert.ok(Date.now() - retry < 2_000);
+        assert.equal(existsSync(join(s.dir, 'second-dump-runs')), false);
+        waitForFree(s, service, 20_000);
+      } finally { killOwn(join(s.dir, 'dump-pid')); }
+    });
+  });
+
+  it('(S1a c) rejects any dump-keychain argument before starting the client', () => {
+    const s = state();
+    withState(s, () => {
+      const client = fake(s, 'echo run >> "$d/dump-with-args-runs"');
+      for (const extra of [['-s', 'x'], ['-d'], ['-i'], ['/tmp/other.keychain']]) {
+        const invalid = keychainRequestFromArgv('security', client, ['dump-keychain', ...extra], { timeoutMs: 2_000, lockfPath: s.lockfPath });
+        // The message proves the dump-keychain branch refused it, not the later item/service mismatch check.
+        assert.throws(() => runKeychainClientSync(invalid), (err: unknown) => err instanceof KeychainClientNotStarted && /dump-keychain takes no arguments/.test((err as Error).message));
+      }
+      assert.equal(existsSync(join(s.dir, 'dump-with-args-runs')), false);
+    });
+  });
 });
