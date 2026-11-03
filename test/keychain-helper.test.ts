@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
+import childProcess = require('node:child_process');
 import { execFileSync, execFileSync as runFile, spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { describe, it } from 'node:test';
+import { describe, it, mock } from 'node:test';
 
 import {
   MacosKeychainBackend,
@@ -14,6 +15,7 @@ import {
   type ExecFileSyncFn,
 } from '../src/keychain';
 import {
+  defaultCswapItemReader, executeLaunchdMatrixCommand, executeMatrixCommand,
   HELPER_MATRIX_CASE_TIMEOUT_MS, HELPER_MATRIX_LAUNCHD_TIMEOUT_MS, helperMatrixConfig, helperMatrixIsOk, helperSigningState,
   parseHelperMatrixResult, parseLaunchdMatrixReceipt, runHelperMatrix, runHelperMatrixUnderLaunchd, runKeychainCommand,
 } from '../src/commands/keychain';
@@ -23,6 +25,8 @@ import { inspectHelperSigning, verifyHelperIdentity } from '../src/diagnostics';
 import type { CommandContext } from '../src/registry';
 import { defaultConfig } from '../src/config';
 import { openStore } from '../src/store';
+import { KeychainClientNotStarted, KeychainRequestStillWaiting, keychainRequestFromArgv, runKeychainClientSync } from '../src/keychain-client';
+import { portableLockf } from './support/portable-lockf';
 
 describe('Swift Keychain helper trust path', () => {
   it('creates a large payload through security with both required trusted applications', () => {
@@ -637,6 +641,93 @@ describe('Swift Keychain helper trust path', () => {
 
   it('uses the diagnostics signing inspector as the keychain signing inspector', () => {
     assert.equal(helperSigningState, inspectHelperSigning);
+  });
+
+  it('keeps a timed-out matrix client alive and rejects a second command on its service', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-s3-matrix-'));
+    const lockfPath = portableLockf(dir);
+    const hold = join(dir, 'hold-security');
+    const second = join(dir, 'second-security');
+    const waitFor = (path: string, timeoutMs = 1_500): void => {
+      const deadline = Date.now() + timeoutMs;
+      while (!existsSync(path) && Date.now() < deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+      assert.equal(existsSync(path), true, `expected ${path}`);
+    };
+    writeFileSync(hold, `#!/bin/sh
+trap 'echo signal > "${join(dir, 'signalled')}"' TERM HUP
+echo $$ > "${join(dir, 'pid')}"
+sleep 8
+`, { mode: 0o700 });
+    writeFileSync(second, `#!/bin/sh
+echo ran >> "${join(dir, 'second-runs')}"
+`, { mode: 0o700 });
+    chmodSync(hold, 0o700);
+    chmodSync(second, 0o700);
+    try {
+      const firstStarted = Date.now();
+      assert.throws(() => executeMatrixCommand(hold, [
+        'add-generic-password', '-a', 'qlb', '-s', 'qlb-test-matrix-x-create', '-X', '6869', '-T', hold, '-T', '/usr/bin/security',
+      ], 'security', 300, lockfPath), (err: unknown) => (err as { code?: unknown }).code === 'ETIMEDOUT');
+      assert.ok(Date.now() - firstStarted < 3_300);
+      waitFor(join(dir, 'pid'));
+      assert.equal(existsSync(join(dir, 'signalled')), false);
+
+      const secondStarted = Date.now();
+      assert.throws(() => executeMatrixCommand(second, [
+        'delete-generic-password', '-a', 'qlb', '-s', 'qlb-test-matrix-x-create',
+      ], 'security', 5_000, lockfPath), KeychainRequestStillWaiting);
+      assert.ok(Date.now() - secondStarted < 2_000);
+      assert.equal(existsSync(join(dir, 'second-runs')), false);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('routes C-swap reads through the lock-aware buffer runner and clears its raw buffer', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-s3-cswap-'));
+    const lockfPath = portableLockf(dir);
+    const fake = (name: string, body: string): string => {
+      const path = join(dir, name);
+      writeFileSync(path, `#!/bin/sh\n${body}\n`, { mode: 0o700 });
+      chmodSync(path, 0o700);
+      return path;
+    };
+    const newline = fake('newline', 'printf "R0\\n"');
+    const plain = fake('plain', 'printf "R0"');
+    const failing = fake('failing', 'exit 44');
+    const hold = fake('hold', `trap 'echo signal > "${join(dir, 'signalled')}"' TERM HUP
+echo $$ > "${join(dir, 'pid')}"
+sleep 8`);
+    let raw: Buffer | undefined;
+    const seams = { securityPath: newline, lockfPath, onRawOutput: (value: Buffer) => { raw = value; } };
+    const waitFor = (path: string, timeoutMs = 1_500): void => {
+      const deadline = Date.now() + timeoutMs;
+      while (!existsSync(path) && Date.now() < deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+      assert.equal(existsSync(path), true, `expected ${path}`);
+    };
+    try {
+      assert.deepEqual(defaultCswapItemReader('claude-swap', 'account-1-a@b', {}, seams), Buffer.from('R0'));
+      assert.ok(raw);
+      assert.ok(raw.every((byte) => byte === 0));
+      assert.deepEqual(defaultCswapItemReader('claude-swap', 'account-1-a@b', {}, { securityPath: plain, lockfPath }), Buffer.from('R0'));
+      assert.throws(() => defaultCswapItemReader('claude-swap', 'account-1-a@b', {}, { securityPath: failing, lockfPath }), /C-swap item could not be read/);
+
+      assert.throws(() => runKeychainClientSync(keychainRequestFromArgv('security', hold, [
+        'find-generic-password', '-a', 'account-1-a@b', '-w', '-s', 'claude-swap',
+      ], { timeoutMs: 300, lockfPath })), (err: unknown) => (err as { code?: unknown }).code === 'ETIMEDOUT');
+      waitFor(join(dir, 'pid'));
+      const started = Date.now();
+      assert.throws(() => defaultCswapItemReader('claude-swap', 'account-1-a@b', {}, { securityPath: newline, lockfPath }), KeychainRequestStillWaiting);
+      assert.ok(Date.now() - started < 2_000);
+      assert.equal(existsSync(join(dir, 'signalled')), false);
+      assert.throws(() => defaultCswapItemReader('claude-swap', 'account-1-a@b', {}, { securityPath: newline, lockfPath: '/usr/local/bin/lockf' }), KeychainClientNotStarted);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('allows a kind-less launchd call only for launchctl', () => {
+    const exec = mock.method(childProcess, 'execFileSync');
+    try {
+      assert.throws(() => executeLaunchdMatrixCommand('/usr/bin/security', ['delete-generic-password', '-a', 'qlb', '-s', 'qlb-test-matrix-y']), KeychainClientNotStarted);
+      assert.equal(exec.mock.callCount(), 0);
+    } finally { exec.mock.restore(); }
   });
 
   it('records a green matrix with null signing as failed and returns non-zero', async () => {

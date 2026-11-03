@@ -8,6 +8,14 @@ import { CONFIG_ENV_VARS } from '../config';
 import { qlbHomeDir } from '../home';
 import { assertKeychainAccess, macosKeychainAccountName } from '../keychain-allowlist';
 import { listCswapProcesses } from '../cswap-processes';
+import {
+  isKeychainClientNotStarted,
+  isKeychainStillWaiting,
+  KeychainClientNotStarted,
+  keychainRequestFromArgv,
+  runKeychainClientSync,
+  type KeychainKind,
+} from '../keychain-client';
 import { assertAdmitted } from '../lifecycle';
 import {
   inspectHelperSigning,
@@ -29,7 +37,7 @@ export interface HelperMatrixResult {
   prompted: boolean;
 }
 
-export type MatrixCommandRunner = (path: string, args: readonly string[]) => void;
+export type MatrixCommandRunner = (path: string, args: readonly string[], kind?: KeychainKind) => void;
 
 export interface HelperMatrixDependencies {
   /** Injectable so matrix tests use fakes and never invoke the real Keychain. */
@@ -131,11 +139,16 @@ function assertHelperReady(path: string, platform: NodeJS.Platform = process.pla
   if (!existsSync(path)) throw new KeychainHelperMissingError(path);
 }
 
-function executeMatrixCommand(path: string, args: readonly string[]): void {
+export function executeMatrixCommand(
+  path: string,
+  args: readonly string[],
+  kind?: KeychainKind,
+  timeoutMs = HELPER_MATRIX_CASE_TIMEOUT_MS,
+  lockfPath?: string,
+): void {
+  if (!kind) throw new KeychainClientNotStarted('unknown', 'missing Keychain command kind');
   // Never collect stdout/stderr: the matrix neither needs nor may expose values.
-  execFileSync(path, args, {
-    encoding: 'utf8', stdio: 'ignore', timeout: HELPER_MATRIX_CASE_TIMEOUT_MS,
-  });
+  runKeychainClientSync(keychainRequestFromArgv(kind, path, args, { timeoutMs, encoding: 'utf8', lockfPath }));
 }
 
 function isMissingItem(err: unknown): boolean {
@@ -179,10 +192,10 @@ export function runHelperMatrix(path: string = helperPath(), dependencies: Helpe
   ];
   const readArgs = (service: string) => ['find-generic-password', '-a', account, '-w', '-s', service];
   const updateArgs = (service: string) => ['add-generic-password', '-U', '-a', account, '-s', service, '-X', updatedPayloadHex];
-  const runStep = (caseName: HelperMatrixCaseName, executable: string, args: readonly string[]): boolean => {
+  const runStep = (caseName: HelperMatrixCaseName, executable: string, args: readonly string[], kind: KeychainKind): boolean => {
     const started = now();
     try {
-      run(executable, args);
+      run(executable, args, kind);
       return true;
     } catch {
       return false;
@@ -192,21 +205,21 @@ export function runHelperMatrix(path: string = helperPath(), dependencies: Helpe
   };
 
   try {
-    const created = runStep('securityCreated', '/usr/bin/security', createArgs(services.securityCreated));
-    const read = created && runStep('securityCreated', '/usr/bin/security', readArgs(services.securityCreated));
+    const created = runStep('securityCreated', '/usr/bin/security', createArgs(services.securityCreated), 'security');
+    const read = created && runStep('securityCreated', '/usr/bin/security', readArgs(services.securityCreated), 'security');
     if (created && read) cases.securityCreated = 'pass'; else caseReasons.securityCreated = 'security create or read failed';
 
-    const updateCreated = runStep('securityUpdated', '/usr/bin/security', createArgs(services.securityUpdated));
-    const updated = updateCreated && runStep('securityUpdated', '/usr/bin/security', updateArgs(services.securityUpdated));
-    const updateRead = updated && runStep('securityUpdated', '/usr/bin/security', readArgs(services.securityUpdated));
+    const updateCreated = runStep('securityUpdated', '/usr/bin/security', createArgs(services.securityUpdated), 'security');
+    const updated = updateCreated && runStep('securityUpdated', '/usr/bin/security', updateArgs(services.securityUpdated), 'security');
+    const updateRead = updated && runStep('securityUpdated', '/usr/bin/security', readArgs(services.securityUpdated), 'security');
     if (updateCreated && updated && updateRead) cases.securityUpdated = 'pass'; else caseReasons.securityUpdated = 'security update or read failed';
 
-    const deleteCreated = runStep('helperDeleted', '/usr/bin/security', createArgs(services.helperDeleted));
-    const deleted = deleteCreated && runStep('helperDeleted', path, ['delete', services.helperDeleted, account]);
+    const deleteCreated = runStep('helperDeleted', '/usr/bin/security', createArgs(services.helperDeleted), 'security');
+    const deleted = deleteCreated && runStep('helperDeleted', path, ['delete', services.helperDeleted, account], 'helper');
     let absent = false;
     if (deleted) {
       const started = now();
-      try { run('/usr/bin/security', readArgs(services.helperDeleted)); } catch (err) { absent = isMissingItem(err); }
+      try { run('/usr/bin/security', readArgs(services.helperDeleted), 'security'); } catch (err) { absent = isMissingItem(err); }
       finally { if (now() - started > HELPER_MATRIX_PROMPT_SIGNAL_MS) casePrompted.helperDeleted = true; }
     }
     if (deleteCreated && deleted && absent) cases.helperDeleted = 'pass'; else caseReasons.helperDeleted = 'helper delete did not remove item';
@@ -215,7 +228,7 @@ export function runHelperMatrix(path: string = helperPath(), dependencies: Helpe
       const started = now();
       let cleaned = false;
       try {
-        run('/usr/bin/security', ['delete-generic-password', '-a', account, '-s', service]);
+        run('/usr/bin/security', ['delete-generic-password', '-a', account, '-s', service], 'security');
         cleaned = true;
       } catch (err) {
         // A successful helper-delete leaves no item for security to remove.
@@ -267,7 +280,17 @@ export interface LaunchdMatrixDependencies {
   jobExited?: () => boolean;
 }
 
-function executeLaunchdMatrixCommand(executable: string, args: readonly string[]): void {
+export function executeLaunchdMatrixCommand(
+  executable: string,
+  args: readonly string[],
+  kind?: KeychainKind,
+  lockfPath?: string,
+): void {
+  if (kind) {
+    executeMatrixCommand(executable, args, kind, MACOS_SECURITY_TIMEOUT_MS, lockfPath);
+    return;
+  }
+  if (executable !== '/bin/launchctl') throw new KeychainClientNotStarted('unknown', 'missing Keychain command kind');
   execFileSync(executable, args, { encoding: 'utf8', stdio: 'ignore', timeout: MACOS_SECURITY_TIMEOUT_MS });
 }
 
@@ -280,7 +303,7 @@ function cleanupLaunchdMatrixManifest(manifest: string, run: MatrixCommandRunner
     // The child-controlled manifest is a cleanup capability boundary.
     if (typeof name !== 'string' || !name.startsWith('qlb-test-matrix-')) continue;
     try {
-      run('/usr/bin/security', ['delete-generic-password', '-a', 'qlb', '-s', name]);
+      run('/usr/bin/security', ['delete-generic-password', '-a', 'qlb', '-s', name], 'security');
     } catch (err) {
       if (!isMissingItem(err)) failures.push(name);
     }
@@ -629,17 +652,29 @@ async function defaultHelperRunner(
   });
 }
 
-function defaultCswapItemReader(service: string, account: string, env: NodeJS.ProcessEnv): Buffer {
+export interface CswapItemReaderSeams {
+  securityPath?: string;
+  lockfPath?: string;
+  onRawOutput?: (raw: Buffer) => void;
+}
+
+export function defaultCswapItemReader(service: string, account: string, env: NodeJS.ProcessEnv, seams?: CswapItemReaderSeams): Buffer {
   assertKeychainAccess(service, account, 'read', { env });
+  const securityPath = process.env.QLB_TEST_MODE === '1' ? seams?.securityPath ?? '/usr/bin/security' : '/usr/bin/security';
   let output: Buffer;
   try {
-    output = execFileSync('/usr/bin/security', ['find-generic-password', '-a', account, '-w', '-s', service], {
-      encoding: 'buffer', stdio: ['ignore', 'pipe', 'ignore'], timeout: MACOS_SECURITY_TIMEOUT_MS,
+    output = runKeychainClientSync({
+      ...keychainRequestFromArgv('security', securityPath, ['find-generic-password', '-a', account, '-w', '-s', service], {
+        timeoutMs: MACOS_SECURITY_TIMEOUT_MS, encoding: 'buffer',
+      }),
+      lockfPath: process.env.QLB_TEST_MODE === '1' ? seams?.lockfPath : undefined,
     }) as Buffer;
-  } catch {
+  } catch (err) {
+    if (isKeychainStillWaiting(err) || isKeychainClientNotStarted(err)) throw err;
     throw new Error('C-swap item could not be read');
   }
   try {
+    if (process.env.QLB_TEST_MODE === '1') seams?.onRawOutput?.(output);
     const end = output[output.length - 1] === 0x0a ? output.length - 1 : output.length;
     return Buffer.from(output.subarray(0, end));
   } finally { output.fill(0); }
@@ -769,6 +804,10 @@ async function authorize(options: { cswap: boolean; json: boolean }, ctx: Comman
     ctx.stdout(options.json ? JSON.stringify({ command: 'authorize cswap', authorized: items.length }) : 'C-swap items CAS-authorized');
     return 0;
   } catch (err) {
+    if (isKeychainStillWaiting(err) || isKeychainClientNotStarted(err)) {
+      ctx.stderr(`qlb keychain: ${(err as Error).message}`);
+      return 1;
+    }
     const changed = (err as { exitCode?: unknown }).exitCode === 3;
     ctx.stderr(changed ? 'qlb keychain: authorization changed; nothing was written' : 'qlb keychain: authorization failed');
     return changed ? 3 : 1;
