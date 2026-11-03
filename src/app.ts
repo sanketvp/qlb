@@ -4,7 +4,7 @@ import * as net from 'node:net';
 import { dirname, join, resolve } from 'node:path';
 import { adapters } from './adapters';
 import { assertTestHomeIsIsolated } from './bootstrap';
-import { CSWAP_RESTORE_PENDING, FINISH_CSWAP_RESTORE_FIRST, FINISH_RETIREMENT_FIRST, RETIREMENT_IN_PROGRESS, assertAdmitted, assertAdmittedInConnection, phase, type LifecycleOperation } from './lifecycle';
+import { CSWAP_RESTORE_PENDING, FINISH_CSWAP_RESTORE_FIRST, FINISH_RETIREMENT_FIRST, RETIREMENT_IN_PROGRESS, assertAdmitted, assertAdmittedInConnection, phase, phaseForConnection, type LifecycleOperation } from './lifecycle';
 import { createDefaultCodexGateDeps, runCodexGate } from './codex-gate';
 import { config, resolveConfig, stripConfigArgs } from './config';
 import { qlbHomeDir } from './home';
@@ -12,6 +12,7 @@ import { hasLegacyPiOwnerEntry, readPiOwnerProviders } from './pi-migrate';
 import { discoverCommands, resolveCommand, type CommandContext, type CommandDefinition } from './registry';
 import { runCodexProbeClaims } from './commands/codex-probe-claims';
 import { redactError, redactSecrets } from './redact';
+import { reloginsInWindow, type ReloginEvent } from './relogin';
 import { doctorQlb, initializeQlb, listCheckNames, type DoctorReport, type InitReport } from './diagnostics';
 import { platformKeychain } from './keychain';
 import { createOwnedCredentialSource } from './credentials';
@@ -98,6 +99,7 @@ const USAGE = `Usage:
   qlb refresh [--allow-probe] [--json]
   qlb native-resync --provider anthropic|xai|kimi-coding|openai-codex|openrouter --account <id> [--json] [--db <path>]
   qlb status [--json] [--dashboard|--flat]
+  qlb status --switches|--relogins [--window] [--json]
   qlb export --cache-only --json
   qlb setup pi|claude-code|codex-cli|generic|hermes [--json]
   qlb resolve --model <modelId> [--fallback m1,m2,...] [--session <id>] [--harness pi|claude-code|codex|dispatch] [--effort <lvl>] [--strategy headroom|spread|round-robin|failover] [--json]
@@ -159,7 +161,14 @@ drain-first biases selection toward an account.
 qlb audit is read-only: last N routing decisions (default 20, newest first).
 Empty store prints "no decisions" or [].`;
 
-type StatusOpts = { cmd: 'status'; json: boolean; view: 'dashboard' | 'flat' };
+type StatusHistoryKind = 'switches' | 'relogins';
+type StatusOpts = {
+  cmd: 'status';
+  json: boolean;
+  view: 'dashboard' | 'flat';
+  history?: StatusHistoryKind;
+  window: boolean;
+};
 type SetupOpts = { cmd: 'setup'; json: boolean; harness: SetupHarness | 'hermes' };
 type InitOpts = { cmd: 'init'; json: boolean };
 type DoctorOpts = { cmd: 'doctor'; json: boolean; live: boolean };
@@ -973,6 +982,8 @@ export function parseArgs(argv: string[]): Opts {
 
   let json = false;
   let view: 'dashboard' | 'flat' = 'dashboard';
+  let history: StatusHistoryKind | undefined;
+  let window = false;
   let model: string | undefined;
   let fallback: string[] = [];
   let session: string | undefined;
@@ -988,6 +999,18 @@ export function parseArgs(argv: string[]): Opts {
     }
     if (arg === '--dashboard') {
       view = 'dashboard';
+      continue;
+    }
+    if (arg === '--switches' || arg === '--relogins') {
+      if (history !== undefined) {
+        console.error('qlb status: choose only one of --switches or --relogins');
+        process.exit(1);
+      }
+      history = arg.slice(2) as StatusHistoryKind;
+      continue;
+    }
+    if (arg === '--window') {
+      window = true;
       continue;
     }
     if (arg === '--flat') {
@@ -1045,7 +1068,15 @@ export function parseArgs(argv: string[]): Opts {
     }
     return { cmd, json, model, fallback, session, harness, effort, strategy: strategyCandidate };
   }
-  return { cmd: 'status', json, view };
+  if (window && history === undefined) {
+    console.error('qlb status: --window requires --switches or --relogins');
+    process.exit(1);
+  }
+  if (history !== undefined && view !== 'dashboard') {
+    console.error('qlb status: --dashboard and --flat cannot be used with history output');
+    process.exit(1);
+  }
+  return { cmd: 'status', json, view, history, window };
 }
 
 type MigratePathAdmission = {
@@ -1128,7 +1159,97 @@ function printDoctor(report: DoctorReport, json: boolean): void {
   console.log(`Overall: ${report.overall}`);
 }
 
-async function runStatus(opts: StatusOpts): Promise<void> {
+type StatusSwitch = {
+  ts: string;
+  provider: string;
+  from: string | null;
+  to: string;
+  trigger: string;
+  outcome: string;
+  detail: string | null;
+  injected: boolean;
+};
+
+type StatusRelogin = Omit<ReloginEvent, 'ts' | 'provider' | 'accountId' | 'kind' | 'detail' | 'evidence' | 'userDeniedAt'> & {
+  ts: string;
+  provider: string;
+  accountId: string | null;
+  kind: string;
+  detail: string | null;
+  evidence: string | null;
+  userDeniedAt: string | null;
+};
+
+function redactedStatusString(value: string | null): string | null {
+  return value === null ? null : redactSecrets(value, []);
+}
+
+function isoStatusTimestamp(value: number): string {
+  return new Date(value).toISOString();
+}
+
+function statusWindow(): { start: number; end: number } | null {
+  if (!existsSync(config.dbPath)) return null;
+  const db = openStoreConnection(config.dbPath, true);
+  try {
+    const current = phaseForConnection(db);
+    if (current.id === 0 || current.cutoverAt === null || current.windowEnd === null) return null;
+    return { start: current.cutoverAt, end: current.windowEnd };
+  } finally {
+    db.close();
+  }
+}
+
+function listStatusSwitches(window: { start: number; end: number } | undefined): StatusSwitch[] {
+  const db = openStoreConnection(config.dbPath, true);
+  try {
+    const range = window ? 'WHERE ts >= ? AND ts <= ?' : '';
+    const rows = db.prepare(`SELECT ts, provider, from_account AS fromAccount, to_account AS toAccount,
+      trigger, outcome, detail, injected FROM switch_log ${range} ORDER BY ts DESC, id DESC`)
+      .all(...(window ? [window.start, window.end] : [])) as Array<{
+        ts: number; provider: string; fromAccount: string | null; toAccount: string; trigger: string;
+        outcome: string; detail: string | null; injected: number;
+      }>;
+    return rows.map((row) => ({
+      ts: isoStatusTimestamp(row.ts), provider: redactedStatusString(row.provider)!,
+      from: redactedStatusString(row.fromAccount), to: redactedStatusString(row.toAccount)!,
+      trigger: redactedStatusString(row.trigger)!, outcome: redactedStatusString(row.outcome)!,
+      detail: redactedStatusString(row.detail), injected: row.injected !== 0,
+    }));
+  } finally {
+    db.close();
+  }
+}
+
+function formatStatusRelogin(row: ReloginEvent): StatusRelogin {
+  return {
+    id: row.id, ts: isoStatusTimestamp(row.ts), provider: redactedStatusString(row.provider)!,
+    accountId: redactedStatusString(row.accountId), kind: redactedStatusString(row.kind)!,
+    detail: redactedStatusString(row.detail), evidence: redactedStatusString(row.evidence),
+    userDeniedAt: row.userDeniedAt === null ? null : isoStatusTimestamp(row.userDeniedAt),
+  };
+}
+
+async function runStatus(opts: StatusOpts): Promise<number> {
+  if (opts.history !== undefined) {
+    const window = opts.window ? statusWindow() : undefined;
+    if (opts.window && window === null) {
+      console.error('qlb status: no-cutover-window');
+      return 3;
+    }
+    if (!opts.window) console.error('qlb status: warning: history is not restricted to the cutover window');
+    const activeWindow = window ?? undefined;
+    const rows = opts.history === 'switches'
+      ? listStatusSwitches(activeWindow)
+      : reloginsInWindow(config.dbPath, activeWindow ?? { start: 0, end: Number.MAX_SAFE_INTEGER }).map(formatStatusRelogin);
+    if (opts.json) {
+      console.log(JSON.stringify({ [opts.history]: rows }));
+    } else {
+      for (const row of rows) console.log(JSON.stringify(row));
+    }
+    return 0;
+  }
+
   const store = getStore();
   const nested = await Promise.all(adapters.map(async (adapter) => {
     const snaps = await safeFetch(adapter);
@@ -1159,13 +1280,14 @@ async function runStatus(opts: StatusOpts): Promise<void> {
   });
   if (opts.json) {
     console.log(JSON.stringify({ fetchedAt: Date.now(), accounts: decorateStatusJson(enriched) }, null, 2));
-    return;
+    return 0;
   }
   if (opts.view === 'flat') {
     console.log(formatFlatTable(enriched));
-    return;
+    return 0;
   }
   console.log(formatDashboard(enriched));
+  return 0;
 }
 
 function printResolveHuman(decision: ReturnType<typeof resolveFromSnapshots>): void {
@@ -2159,8 +2281,7 @@ export async function main(): Promise<void> {
     process.exit(0);
   }
   if (opts.cmd === 'status') {
-    await runStatus(opts);
-    process.exit(0);
+    process.exit(await runStatus(opts));
   }
   if (opts.cmd === 'audit') {
     try {
