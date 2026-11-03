@@ -14,7 +14,7 @@ import { checkClaudeCswapProcessPrecondition, restoreConfigFromJournal, restoreL
 import { stillTheSameProcess } from './codex-sessions';
 
 function optionsFor(deps: ClaudeSwitchDeps): ClaudeSwitchJournalOptions {
-  const paths = deps.live.paths ?? claudePaths({ home: deps.home, env: deps.env });
+  const paths = deps.live.paths ?? claudePaths({ home: deps.live.home ?? deps.home, env: deps.live.env ?? deps.env });
   return {
     journalDir: deps.journalDir,
     home: deps.home,
@@ -54,7 +54,7 @@ export async function reconcileClaudeSwitch(deps: ClaudeSwitchDeps): Promise<voi
     || probeClaudeSwitchJournalOwner(options) === 'held'
     || await ownerIsLive(deps, initial.journal)) return;
 
-  const paths = deps.live.paths ?? claudePaths({ home: deps.home, env: deps.env });
+  const paths = deps.live.paths ?? claudePaths({ home: deps.live.home ?? deps.home, env: deps.live.env ?? deps.env });
   const switchLock = deps.locks?.switch ?? withClaudeSwitchLock;
   const credentialLock = deps.locks?.credential ?? withClaudeCredentialLocks;
   const ownerLock = deps.locks?.owner ?? withClaudeSwitchJournalOwner;
