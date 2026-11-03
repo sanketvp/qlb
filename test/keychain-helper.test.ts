@@ -71,10 +71,13 @@ describe('Swift Keychain helper trust path', () => {
   it('refuses the hidden matrix path in test mode before helper trust or execution', async () => {
     const home = mkdtempSync(join(tmpdir(), 'qlb-matrix-internal-'));
     const config = defaultConfig(home);
+    const runDirectory = join(home, 'run');
+    const manifest = join(runDirectory, 'manifest.json');
+    mkdirSync(runDirectory, { mode: 0o700 });
     let signingCalls = 0;
     let matrixCalls = 0;
     try {
-      const exit = await runKeychainCommand(['matrix', '--internal', '--helper-path=/fixture/helper', '--cleanup-manifest=/tmp/manifest'], {
+      const exit = await runKeychainCommand(['matrix', '--internal', '--helper-path=/fixture/helper', `--cleanup-manifest=${manifest}`, `--run-directory=${runDirectory}`], {
         config, env: { QLB_TEST_MODE: '1' }, home, stdout: () => {}, stderr: () => {},
         loadConfig: () => config, registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
       }, { runMatrix: () => { matrixCalls += 1; throw new Error('not used'); }, helperSigning: () => { signingCalls += 1; return null; } });
@@ -87,7 +90,8 @@ describe('Swift Keychain helper trust path', () => {
   it('verifies the forwarded helper and existing pin before hidden matrix execution', async () => {
     const home = mkdtempSync(join(tmpdir(), 'qlb-matrix-internal-trust-'));
     const helper = join(home, 'qlb-keychain-helper');
-    const manifest = join(home, 'manifest.json');
+    const runDirectory = join(home, 'run');
+    const manifest = join(runDirectory, 'manifest.json');
     const config = defaultConfig(home);
     const output: string[] = [];
     const green = {
@@ -99,8 +103,9 @@ describe('Swift Keychain helper trust path', () => {
     let matrixCalls = 0;
     let verifiedPath: string | null = null;
     writeFileSync(helper, 'fixture helper');
+    mkdirSync(runDirectory, { mode: 0o700 });
     try {
-      const exit = await runKeychainCommand(['matrix', '--internal', `--helper-path=${helper}`, `--cleanup-manifest=${manifest}`], {
+      const exit = await runKeychainCommand(['matrix', '--internal', `--helper-path=${helper}`, `--cleanup-manifest=${manifest}`, `--run-directory=${runDirectory}`], {
         config, env: {}, home, stdout: (message) => output.push(message), stderr: () => {},
         loadConfig: () => config, registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
       }, {
@@ -116,6 +121,45 @@ describe('Swift Keychain helper trust path', () => {
       assert.equal(matrixCalls, 1);
       assert.equal(verifiedPath, helper);
       assert.deepEqual(parseHelperMatrixResult(output[0]!), green);
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
+
+  it('always publishes a payload-free failed child receipt without creating a store', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-matrix-internal-failed-'));
+    const runDirectory = join(home, 'run');
+    const helper = join(home, 'qlb-keychain-helper');
+    const manifest = join(runDirectory, 'manifest.json');
+    const config = defaultConfig(home);
+    const output: string[] = [];
+    mkdirSync(runDirectory, { mode: 0o700 });
+    writeFileSync(helper, 'fixture helper');
+    try {
+      const exit = await runKeychainCommand(['matrix', '--internal', `--helper-path=${helper}`, `--cleanup-manifest=${manifest}`, `--run-directory=${runDirectory}`], {
+        config, env: {}, home, stdout: (message) => output.push(message), stderr: () => {},
+        loadConfig: () => config, registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
+      }, { helperSigning: () => null });
+      assert.equal(exit, 1);
+      assert.equal(output.length, 1);
+      assert.equal(helperMatrixIsOk(parseHelperMatrixResult(output[0]!)), false);
+      assert.equal(existsSync(config.dbPath), false);
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
+
+  it('rejects child cleanup paths outside the private parent run directory', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-matrix-internal-path-'));
+    const runDirectory = join(home, 'run');
+    const helper = join(home, 'qlb-keychain-helper');
+    const config = defaultConfig(home);
+    let signingCalls = 0;
+    mkdirSync(runDirectory, { mode: 0o700 });
+    writeFileSync(helper, 'fixture helper');
+    try {
+      const exit = await runKeychainCommand(['matrix', '--internal', `--helper-path=${helper}`, `--cleanup-manifest=${join(home, 'outside.json')}`, `--run-directory=${runDirectory}`], {
+        config, env: {}, home, stdout: () => {}, stderr: () => {},
+        loadConfig: () => config, registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
+      }, { helperSigning: () => { signingCalls += 1; return null; } });
+      assert.equal(exit, 2);
+      assert.equal(signingCalls, 0);
     } finally { rmSync(home, { recursive: true, force: true }); }
   });
 
@@ -180,6 +224,7 @@ describe('Swift Keychain helper trust path', () => {
     try {
       assert.throws(() => runHelperMatrixUnderLaunchd(helper, '/fixture/qlb-cli.js', {
         platform: 'darwin', uid: 501,
+        jobExited: () => true,
         run: (file, args) => {
           if (file === '/bin/launchctl' && args[0] === 'bootstrap') {
             const plist = readFileSync(args[2]!, 'utf8');
@@ -191,9 +236,9 @@ describe('Swift Keychain helper trust path', () => {
             writeFileSync(manifest!, JSON.stringify(['qlb-test-matrix-failed', 'Claude Code-credentials']));
             writeFileSync(join(dirname(manifest!), 'receipt.json'), JSON.stringify({
               cases: { securityCreated: 'fail', securityUpdated: 'pass', helperDeleted: 'pass' },
-              casePrompted: { securityCreated: false, securityUpdated: false, helperDeleted: false },
+              casePrompted: { securityCreated: true, securityUpdated: false, helperDeleted: false },
               caseReasons: { securityCreated: 'security create or read failed', securityUpdated: null, helperDeleted: null },
-              prompted: false,
+              prompted: true,
             }));
             writeFileSync(join(dirname(manifest!), 'status'), '1');
           } else if (file === '/usr/bin/security') {
@@ -202,13 +247,38 @@ describe('Swift Keychain helper trust path', () => {
           }
         },
       }), (err: unknown) => {
-        const result = (err as { result?: { caseReasons: Record<string, string | null> } }).result;
+        const result = (err as { result?: { prompted: boolean; caseReasons: Record<string, string | null> } }).result;
         assert.ok(result, String(err));
-        assert.match(result.caseReasons.securityCreated ?? '', /parent cleanup failed/);
+        assert.equal(result.prompted, true);
+        assert.match(result.caseReasons.securityCreated ?? '', /parent-cleanup-failed/);
         return true;
       });
       assert.deepEqual(cleaned, ['qlb-test-matrix-failed']);
     } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('forwards the parent resolved database selection to the launchd child', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-launchd-matrix-config-'));
+    const config = { ...defaultConfig(home), dbPath: join(home, 'configured', 'qlb.db') };
+    const green = {
+      cases: { securityCreated: 'pass' as const, securityUpdated: 'pass' as const, helperDeleted: 'pass' as const },
+      casePrompted: { securityCreated: false, securityUpdated: false, helperDeleted: false },
+      caseReasons: { securityCreated: null, securityUpdated: null, helperDeleted: null },
+      prompted: false,
+    };
+    let childEnvironment: Record<string, string> | undefined;
+    try {
+      assert.equal(await runKeychainCommand(['check-launchd'], {
+        config, env: { HOME: home }, home, stdout: () => {}, stderr: () => {},
+        loadConfig: () => config, registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
+      }, {
+        helperPath: () => '/fixture/helper',
+        helperSigning: () => ({ authority: 'QLB Keychain Helper', binaryHash: 'a'.repeat(40), identityHash: 'b'.repeat(40) }),
+        runLaunchdMatrix: (_path, environment) => { childEnvironment = environment; return green; },
+      }), 0);
+      assert.equal(childEnvironment?.QLB_DB_PATH, config.dbPath);
+      assert.equal(childEnvironment?.QLB_CONFIG_PATH, config.configPath);
+    } finally { rmSync(home, { recursive: true, force: true }); }
   });
 
   it('uses three 20-second case budgets plus launchd grace and cleans a timed-out child manifest', () => {
@@ -221,7 +291,7 @@ describe('Swift Keychain helper trust path', () => {
       assert.equal(HELPER_MATRIX_CASE_TIMEOUT_MS, 20_000);
       assert.equal(HELPER_MATRIX_LAUNCHD_TIMEOUT_MS, 11 * HELPER_MATRIX_CASE_TIMEOUT_MS + 60_000);
       assert.throws(() => runHelperMatrixUnderLaunchd(helper, '/fixture/qlb-cli.js', {
-        platform: 'darwin', uid: 501, now: () => clock, wait: () => { clock = HELPER_MATRIX_LAUNCHD_TIMEOUT_MS; },
+        platform: 'darwin', uid: 501, now: () => clock, wait: () => { clock = HELPER_MATRIX_LAUNCHD_TIMEOUT_MS; }, jobExited: () => true,
         run: (file, args) => {
           if (file === '/bin/launchctl' && args[0] === 'bootstrap') {
             const plist = readFileSync(args[2]!, 'utf8');
@@ -235,6 +305,60 @@ describe('Swift Keychain helper trust path', () => {
         },
       }), /timed out under launchd/);
       assert.deepEqual(cleaned, ['qlb-test-matrix-timeout']);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('skips parent cleanup after a timeout until launchd confirms the child exited', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-launchd-matrix-timeout-running-'));
+    const helper = join(dir, 'qlb-keychain-helper');
+    const cleaned: string[] = [];
+    let clock = 0;
+    writeFileSync(helper, 'fixture helper');
+    try {
+      assert.throws(() => runHelperMatrixUnderLaunchd(helper, '/fixture/qlb-cli.js', {
+        platform: 'darwin', uid: 501, now: () => clock, wait: () => { clock = HELPER_MATRIX_LAUNCHD_TIMEOUT_MS; }, jobExited: () => false,
+        run: (file, args) => {
+          if (file === '/bin/launchctl' && args[0] === 'bootstrap') {
+            const plist = readFileSync(args[2]!, 'utf8');
+            const manifest = [...plist.matchAll(/<string>([^<]+)<\/string>/g)].map((match) => match[1])
+              .find((value) => value.endsWith('/disposable-items.json'));
+            assert.ok(manifest);
+            writeFileSync(manifest!, JSON.stringify(['qlb-test-matrix-still-running']));
+          } else if (file === '/usr/bin/security') cleaned.push(args[args.indexOf('-s') + 1]!);
+        },
+      }), (err: unknown) => {
+        const result = (err as { result?: { caseReasons: Record<string, string | null> } }).result;
+        assert.match(result?.caseReasons.securityCreated ?? '', /parent-cleanup-skipped-child-running/);
+        return true;
+      });
+      assert.deepEqual(cleaned, []);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('retains an unreadable launchd receipt and parent cleanup failure as a stored error code', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-launchd-matrix-unreadable-'));
+    const helper = join(dir, 'qlb-keychain-helper');
+    writeFileSync(helper, 'fixture helper');
+    try {
+      assert.throws(() => runHelperMatrixUnderLaunchd(helper, '/fixture/qlb-cli.js', {
+        platform: 'darwin', uid: 501,
+        run: (file, args) => {
+          if (file === '/bin/launchctl' && args[0] === 'bootstrap') {
+            const plist = readFileSync(args[2]!, 'utf8');
+            const manifest = [...plist.matchAll(/<string>([^<]+)<\/string>/g)].map((match) => match[1])
+              .find((value) => value.endsWith('/disposable-items.json'));
+            assert.ok(manifest);
+            writeFileSync(manifest!, JSON.stringify(['qlb-test-matrix-unreadable']));
+            writeFileSync(join(dirname(manifest!), 'receipt.json'), '{not-json');
+            writeFileSync(join(dirname(manifest!), 'status'), '1');
+          } else if (file === '/usr/bin/security') throw new Error('fixture cleanup failure');
+        },
+      }), (err: unknown) => {
+        const result = (err as { result?: Parameters<typeof helperMatrixConfig>[0] }).result;
+        assert.ok(result);
+        assert.equal(helperMatrixConfig(result)['keychain.helperCheckError'], 'parent-cleanup-failed');
+        return true;
+      });
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
