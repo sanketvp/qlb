@@ -10,9 +10,10 @@ function runAdapterScript(script: string, extraEnv: NodeJS.ProcessEnv = {}): {
   stdout: string;
   stderr: string;
 } {
+  const home = mkdtempSync(join(tmpdir(), 'qlb-adapter-probe-home-'));
   const result = spawnSync(process.execPath, ['-e', script], {
     encoding: 'utf8',
-    env: { ...process.env, ...extraEnv },
+    env: { ...process.env, QLB_TEST_MODE: '1', QLB_HOME: home, HOME: home, ...extraEnv },
     timeout: 20_000,
   });
   return {
@@ -23,7 +24,7 @@ function runAdapterScript(script: string, extraEnv: NodeJS.ProcessEnv = {}): {
 }
 
 describe('adapter empty-cache probe attachment', () => {
-  it('anthropic cache-only status does not call fetch even when fetch would reject', () => {
+  it('anthropic falls back to the cache when QLB has no usage poll rows and does not call fetch', () => {
     const root = mkdtempSync(join(tmpdir(), 'qlb-anth-probe-'));
     mkdirSync(join(root, 'migrate'), { recursive: true });
     mkdirSync(join(root, 'cswap', 'cache'), { recursive: true });

@@ -407,6 +407,42 @@ describe('qlb doctor', () => {
     assert.doesNotMatch(openrouter?.example ?? '', /security add-generic-password/);
   });
 
+  it('uses fresh QLB Anthropic polls instead of the legacy cache and warns when they age out', () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-anthropic-polls-'));
+    const config = defaultConfig(home);
+    const store = openStore(config.dbPath);
+    const nowS = Math.floor(Date.now() / 1000);
+    store.recordUsagePollResult('anthropic', 'account', {
+      attemptedAt: nowS,
+      status: 'ok',
+      readings: {
+        '5h': { usedPct: 1, fetchedAt: nowS * 1000, source: 'poll', confidence: 'authoritative' },
+      },
+    });
+    store.close();
+
+    const fresh = inspectProviders(config, () => 'ok').find((provider) => provider.provider === 'anthropic');
+    assert.equal(fresh?.level, 'PASS');
+    assert.equal(fresh?.source, config.dbPath);
+
+    const staleConfig = defaultConfig(mkdtempSync(join(tmpdir(), 'qlb-doctor-anthropic-stale-')));
+    const staleStore = openStore(staleConfig.dbPath);
+    staleStore.recordUsagePollResult('anthropic', 'account', {
+      attemptedAt: nowS - 3601,
+      status: 'ok',
+      readings: {
+        '5h': { usedPct: 1, fetchedAt: (nowS - 3601) * 1000, source: 'poll', confidence: 'authoritative' },
+      },
+    });
+    staleStore.recordUsagePollResult('anthropic', 'account', { attemptedAt: nowS, status: 'usage-fetch-failed' });
+    staleStore.close();
+
+    const stale = inspectProviders(staleConfig, () => 'ok').find((provider) => provider.provider === 'anthropic');
+    assert.equal(stale?.level, 'WARN');
+    assert.equal(stale?.source, staleConfig.dbPath);
+    assert.match(stale?.message ?? '', /stale/);
+  });
+
   it('reports the fixed pi-openrouter source and pinned security binary', () => {
     const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-openrouter-default-'));
     const config = defaultConfig(home);

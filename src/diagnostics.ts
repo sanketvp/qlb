@@ -12,6 +12,7 @@ import { consumeMarkerPathFor, CSWAP_ANTHROPIC_STORE } from './cswap-consume';
 import { builtInAdapters } from './adapters';
 import { CONFIG_ENV_VARS, OPENROUTER_KEYCHAIN_SERVICE, type QlbConfig } from './config';
 import { cswapCachePresent } from './cswap-usage';
+import { hasFreshAnthropicUsagePoll } from './anthropic-usage-view';
 import {
   execFileUtf8,
   isSecurityTimeout,
@@ -71,7 +72,7 @@ import { codexFirstSwitchCheck } from './checks/codex-first-switch';
 import { guardCheck } from './checks/_check';
 import { lifecyclePhase, lifecyclePhaseCheck, type LifecyclePhaseResult } from './checks/lifecycle-phase';
 import { relogin7dCheck } from './checks/relogin-7d';
-import { openStoreConnection } from './store';
+import { openStore, openStoreConnection } from './store';
 import { discoverChecks, type CheckDefinition } from './registry';
 import { lifecycleWindowCheck } from './checks/lifecycle-window';
 import { lifecycleDrillCheck } from './checks/lifecycle-drill';
@@ -263,14 +264,28 @@ function missing(
   };
 }
 
+function anthropicPollFreshness(dbPath: string): { hasPolls: boolean; fresh: boolean } | null {
+  if (!existsSync(dbPath)) return null;
+  let store: ReturnType<typeof openStore> | null = null;
+  try {
+    store = openStore(dbPath);
+    if (Object.keys(store.listUsagePolls('anthropic')).length === 0) return null;
+    return { hasPolls: true, fresh: hasFreshAnthropicUsagePoll(store, Math.floor(Date.now() / 1000)) };
+  } catch {
+    return null;
+  } finally {
+    store?.close();
+  }
+}
+
 export function inspectProviders(
   config: QlbConfig,
   command: CommandRunner = runCommand,
 ): ProviderDiagnostic[] {
-  const anthropicOk = cswapCachePresent({
-    sequencePath: config.cswapSequencePath,
-    usagePath: config.cswapUsagePath,
-  });
+  const anthropicPolls = anthropicPollFreshness(config.dbPath);
+  const anthropicOk = anthropicPolls
+    ? anthropicPolls.fresh
+    : cswapCachePresent({ sequencePath: config.cswapSequencePath, usagePath: config.cswapUsagePath });
 
   const piAuth = readJson(config.piAuthJsonPath);
   const xai = piAuth?.xai;
@@ -311,8 +326,8 @@ export function inspectProviders(
 
   return [
     anthropicOk
-      ? found('anthropic', `${config.cswapSequencePath} + ${config.cswapUsagePath}`, CONFIG_ENV_VARS.cswapSequencePath, `export ${CONFIG_ENV_VARS.cswapSequencePath}=~/.claude-swap-backup/sequence.json`)
-      : missing('anthropic', `${config.cswapSequencePath} + ${config.cswapUsagePath}`, CONFIG_ENV_VARS.cswapSequencePath, `export ${CONFIG_ENV_VARS.cswapSequencePath}=~/.claude-swap-backup/sequence.json`),
+      ? found('anthropic', anthropicPolls ? config.dbPath : `${config.cswapSequencePath} + ${config.cswapUsagePath}`, anthropicPolls ? CONFIG_ENV_VARS.dbPath : CONFIG_ENV_VARS.cswapSequencePath, anthropicPolls ? `export ${CONFIG_ENV_VARS.dbPath}=~/.qlb/qlb.db` : `export ${CONFIG_ENV_VARS.cswapSequencePath}=~/.claude-swap-backup/sequence.json`)
+      : missing('anthropic', anthropicPolls ? config.dbPath : `${config.cswapSequencePath} + ${config.cswapUsagePath}`, anthropicPolls ? CONFIG_ENV_VARS.dbPath : CONFIG_ENV_VARS.cswapSequencePath, anthropicPolls ? `QLB usage polls are stale; run qlb auto` : `export ${CONFIG_ENV_VARS.cswapSequencePath}=~/.claude-swap-backup/sequence.json`),
     xaiOk
       ? found('xai', `${config.piAuthJsonPath} (xai entry)`, CONFIG_ENV_VARS.piAuthJsonPath, `export ${CONFIG_ENV_VARS.piAuthJsonPath}=~/.pi/agent/auth.json`)
       : missing('xai', `${config.piAuthJsonPath} (xai entry)`, CONFIG_ENV_VARS.piAuthJsonPath, `export ${CONFIG_ENV_VARS.piAuthJsonPath}=~/path/to/pi-auth.json`),
