@@ -10,6 +10,7 @@ import { beginCutover } from '../src/lifecycle';
 import { runKeychainCommand } from '../src/commands/keychain';
 import { openStore } from '../src/store';
 import type { CommandContext } from '../src/registry';
+import { KeychainClientNotStarted, KeychainRequestStillWaiting } from '../src/keychain-client';
 
 function fixture(): { home: string; context: CommandContext; cleanup(): void } {
   const home = mkdtempSync(join(tmpdir(), 'qlb-keychain-authorize-'));
@@ -233,4 +234,28 @@ describe('keychain authorize (AC55)', () => {
     assert.match(cas, /developer\.apple\.com\/documentation\/security\/ksecattrmodificationdate/);
     assert.match(source, /case \(5, "set"\) where args\[1\] == "--if-sha256"/);
   });
+});
+
+describe('keychain authorize S3 error messages', () => {
+  for (const [name, error, message] of [
+    ['still waiting', new KeychainRequestStillWaiting('claude-swap'), 'qlb keychain: a Keychain request for claude-swap is still waiting for an answer'],
+    ['not started', new KeychainClientNotStarted('claude-swap', 'x'), 'qlb keychain: Keychain request for claude-swap was not started: x'],
+  ] as const) {
+    it(`prints the C-swap ${name} message`, async () => {
+      const f = fixture();
+      const errors: string[] = [];
+      f.context.stderr = (line) => errors.push(line);
+      try {
+        const store = openStore(f.context.config.dbPath);
+        beginCutover(store);
+        store.close();
+        const exit = await runKeychainCommand(['authorize', 'cswap'], f.context, {
+          readCswapItem: () => { throw error; },
+          listCswapProcesses: () => [],
+        });
+        assert.equal(exit, 1);
+        assert.deepEqual(errors, [message]);
+      } finally { f.cleanup(); }
+    });
+  }
 });
