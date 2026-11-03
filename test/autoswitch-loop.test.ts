@@ -107,6 +107,60 @@ describe('autoswitch loop (G9)', () => {
     assert.equal(calls, 1);
   });
 
+  it('consume-first moves to the earlier weekly reset and records trigger consume-first', async () => {
+    const f = await fixture();
+    f.store.setConfig('autoswitch.strategy', 'consume-first');
+    const accounts: AutoswitchAccount[] = [
+      { accountId: '1', slotNum: 1, buckets: { '5h': { usedPct: 20 }, '7d': { usedPct: 20, resetAt: NOW + 20 * 60 * 60_000 } } },
+      { accountId: '2', slotNum: 2, buckets: { '5h': { usedPct: 10 }, '7d': { usedPct: 10, resetAt: NOW + 2 * 60 * 60_000 } } },
+    ];
+    const output = await anthropicTick(tickDeps(f, async (_deps, input) =>
+      switchRow(f.store, { from: '1', to: input.to, trigger: input.trigger, now: NOW }), { accounts }));
+
+    assert.equal(output.decision.kind === 'switch' ? output.decision.reason : null, 'consume-first');
+    const db = f.store as unknown as { db: { prepare: (sql: string) => { get: () => { trigger: string; outcome: string } | undefined } } };
+    const row = db.db.prepare("SELECT trigger, outcome FROM switch_log ORDER BY id DESC LIMIT 1").get();
+    assert.equal(row?.trigger, 'consume-first');
+    assert.equal(row?.outcome, 'ok');
+  });
+
+  it('cooldown holds a second consume-first switch', async () => {
+    const f = await fixture();
+    f.store.setConfig('autoswitch.strategy', 'consume-first');
+    const accounts: AutoswitchAccount[] = [
+      { accountId: '1', slotNum: 1, buckets: { '5h': { usedPct: 20 }, '7d': { usedPct: 20, resetAt: NOW + 20 * 60 * 60_000 } } },
+      { accountId: '2', slotNum: 2, buckets: { '5h': { usedPct: 10 }, '7d': { usedPct: 10, resetAt: NOW + 2 * 60 * 60_000 } } },
+    ];
+    let calls = 0;
+    const deps = tickDeps(f, async (_deps, input) => {
+      calls += 1;
+      return switchRow(f.store, { from: '1', to: input.to, trigger: input.trigger, now: NOW });
+    }, { accounts });
+
+    const first = await anthropicTick(deps);
+    const second = await anthropicTick(deps);
+    assert.equal(first.decision.kind === 'switch' ? first.decision.reason : null, 'consume-first');
+    assert.deepEqual(second.decision, { kind: 'stay', reason: 'cooldown', unhealthyTicks: 0 });
+    assert.equal(calls, 1);
+  });
+
+  it('strategy best does not consume-first on the same fixture', async () => {
+    const f = await fixture();
+    f.store.setConfig('autoswitch.strategy', 'best');
+    const accounts: AutoswitchAccount[] = [
+      { accountId: '1', slotNum: 1, buckets: { '5h': { usedPct: 20 }, '7d': { usedPct: 20, resetAt: NOW + 20 * 60 * 60_000 } } },
+      { accountId: '2', slotNum: 2, buckets: { '5h': { usedPct: 10 }, '7d': { usedPct: 10, resetAt: NOW + 2 * 60 * 60_000 } } },
+    ];
+    let calls = 0;
+    const output = await anthropicTick(tickDeps(f, async () => {
+      calls += 1;
+      throw new Error('best must not switch');
+    }, { accounts }));
+
+    assert.deepEqual(output.decision, { kind: 'stay', reason: 'below-threshold', unhealthyTicks: 0 });
+    assert.equal(calls, 0);
+  });
+
   it('uses the committed switch time for cooldown and recovers it from switch_log', async () => {
     const f = await fixture();
     f.store.recordSwitch({ provider: 'anthropic', fromAccount: '2', toAccount: '1', trigger: 'proactive', outcome: 'ok', ts: NOW - 10_000, committedAt: NOW - 10_000 });
