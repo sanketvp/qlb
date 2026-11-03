@@ -586,6 +586,23 @@ cat > "$d/stdin-copy"`);
     }
   });
 
+  it('(5) reports a non-privacy fs fault (~/.qlb is a file) as not writable, not as not private', () => {
+    const s = state();
+    withState(s, () => {
+      writeFileSync(join(s.home, '.qlb'), 'not a directory');
+      for (const attempt of [
+        () => keychainLockForService('svc-ro', { lockfPath: s.lockfPath }),
+        () => runKeychainClientSync(keychainRequestFromArgv('security', fake(s, 'echo run >> "$d/ro-runs"'), ['find-generic-password', '-s', 'svc-ro', '-w'], { timeoutMs: 2_000, lockfPath: s.lockfPath })),
+      ]) {
+        assert.throws(attempt, (err: unknown) => {
+          assert.equal((err as Error).message, 'Keychain request for svc-ro was not started: lock directory is not writable');
+          return true;
+        });
+      }
+      assert.equal(existsSync(join(s.dir, 'ro-runs')), false);
+    });
+  });
+
   it('(5) converts a symlinked lock file to not-started through keychainLockForService', () => {
     const s = state();
     withState(s, () => {

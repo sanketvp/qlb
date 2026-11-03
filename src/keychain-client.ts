@@ -90,8 +90,9 @@ function lockPathForService(service: string): string {
 }
 
 function lockDirectory(service: string): string {
-  const dir = lockDir();
+  let dir: string | undefined;
   try {
+    dir = lockDir();
     // This never changes an existing directory's mode.
     mkdirSync(dir, { recursive: true, mode: 0o700 });
     const stat = lstatSync(dir);
@@ -105,15 +106,28 @@ function lockDirectory(service: string): string {
     return dir;
   } catch (err) {
     if (err instanceof KeychainClientNotStarted) throw err;
-    throw new KeychainClientNotStarted(service, 'lock directory is not private');
+    // Something other than a real directory in the lock path is a privacy fault;
+    // any other fs error (EACCES, EROFS, ENOSPC, ENOTDIR above it) is not.
+    throw new KeychainClientNotStarted(service, occupiedByNonDirectory(dir) ? 'lock directory is not private' : 'lock directory is not writable');
+  }
+}
+
+function occupiedByNonDirectory(path: string | undefined): boolean {
+  if (path === undefined) return false;
+  try {
+    const stat = lstatSync(path);
+    return stat.isSymbolicLink() || !stat.isDirectory();
+  } catch {
+    return false;
   }
 }
 
 function ensureLockFile(service: string): string {
   lockDirectory(service);
-  const path = lockPathForService(service);
   let fd: number;
+  let path: string;
   try {
+    path = lockPathForService(service);
     fd = openSync(path, constants.O_CREAT | constants.O_RDWR | constants.O_NOFOLLOW, 0o600);
   } catch {
     throw new KeychainClientNotStarted(service, 'lock file could not be opened');
@@ -121,7 +135,7 @@ function ensureLockFile(service: string): string {
   try {
     closeSync(fd);
   } catch {
-    throw new KeychainClientNotStarted(service, 'lock directory is not private');
+    throw new KeychainClientNotStarted(service, 'lock file could not be closed');
   }
   return path;
 }
