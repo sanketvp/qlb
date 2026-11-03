@@ -5,6 +5,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
+import childProcess = require('node:child_process');
+import { closeSync, existsSync, openSync, symlinkSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { mock } from 'node:test';
+import { defaultHelperRunner } from '../src/commands/keychain';
+import { keychainRequestFromArgv, runKeychainClientSync } from '../src/keychain-client';
+import { portableLockf } from './support/portable-lockf';
+
 import { defaultConfig } from '../src/config';
 import { beginCutover } from '../src/lifecycle';
 import { runKeychainCommand } from '../src/commands/keychain';
@@ -258,4 +266,137 @@ describe('keychain authorize S3 error messages', () => {
       } finally { f.cleanup(); }
     });
   }
+});
+
+function s4State(): { dir: string; lockfPath: string; cleanup(): void } {
+  const dir = mkdtempSync(join(tmpdir(), 'qlb-s4-helper-'));
+  return { dir, lockfPath: portableLockf(dir), cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+}
+
+function s4Fake(dir: string, name: string, body: string): string {
+  const path = join(dir, name);
+  writeFileSync(path, `#!/bin/sh\nset -eu\n${body}\n`, { mode: 0o700 });
+  chmodSync(path, 0o700);
+  return path;
+}
+
+function boundedPoll(path: string, timeoutMs: number): void {
+  const deadline = Date.now() + timeoutMs;
+  while (!existsSync(path) && Date.now() < deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+  assert.ok(existsSync(path), `expected ${path}`);
+}
+
+describe('keychain authorize S4 async helper runner', () => {
+  it('holds the service lock without signalling a long probe', { timeout: 30_000 }, async () => {
+    const s = s4State();
+    const signalled = join(s.dir, 'signalled');
+    const fake = s4Fake(s.dir, 'slow-probe', `trap 'echo signal > "${signalled}"' TERM HUP
+sleep 7`);
+    try {
+      const started = Date.now();
+      await defaultHelperRunner(fake, ['probe-read', 'svc-s4-long', 'a'], undefined, undefined, null, { lockfPath: s.lockfPath });
+      const elapsed = Date.now() - started;
+      assert.ok(elapsed >= 6_500 && elapsed < 20_000, `elapsed ${elapsed}ms`);
+      assert.equal(existsSync(signalled), false);
+    } finally { s.cleanup(); }
+  });
+
+  it('passes set payload on stdin after the pre-spawn checks', { timeout: 30_000 }, async () => {
+    const s = s4State();
+    const copied = join(s.dir, 'stdin-copy');
+    const fake = s4Fake(s.dir, 'stdin-helper', `cat > "${copied}"`);
+    const payload = Buffer.from('s4-fixture-payload');
+    try {
+      await defaultHelperRunner(fake, ['set', '--if-sha256', 'd', 'svc-s4-payload', 'a'], payload, undefined, null, { lockfPath: s.lockfPath });
+      assert.deepEqual(readFileSync(copied), payload);
+    } finally { s.cleanup(); }
+  });
+
+  it('rejects replacement, signing, and symlink mismatches before spawning', async () => {
+    const s = s4State();
+    const trusted = s4Fake(s.dir, 'trusted', 'exit 0');
+    const replacementRuns = join(s.dir, 'replacement-runs');
+    const replacement = s4Fake(s.dir, 'replacement', `echo ran > "${replacementRuns}"`);
+    const fd = openSync(trusted, 'r');
+    const spawnMock = mock.method(childProcess, 'spawn');
+    try {
+      await assert.rejects(defaultHelperRunner(replacement, ['probe-read', 'svc-s4-mismatch', 'a'], undefined, fd, null, { lockfPath: s.lockfPath }), /keychain helper changed after verification/);
+      await assert.rejects(defaultHelperRunner(trusted, ['probe-read', 'svc-s4-signing', 'a'], undefined, fd, { authority: 'x', binaryHash: 'x', identityHash: 'x' }, { lockfPath: s.lockfPath }), /keychain helper changed after verification/);
+      const linked = join(s.dir, 'linked');
+      symlinkSync(trusted, linked);
+      await assert.rejects(defaultHelperRunner(linked, ['probe-read', 'svc-s4-link', 'a'], undefined, fd, null, { lockfPath: s.lockfPath }), /keychain helper changed after verification/);
+      assert.equal(existsSync(replacementRuns), false);
+      assert.equal(spawnMock.mock.callCount(), 0);
+    } finally {
+      spawnMock.mock.restore();
+      closeSync(fd);
+      s.cleanup();
+    }
+  });
+
+  it('shares the sync lock and fails fast while a sync client remains alive', { timeout: 30_000 }, async () => {
+    const s = s4State();
+    const startedFile = join(s.dir, 'started');
+    const secondRuns = join(s.dir, 'second-runs');
+    const hold = s4Fake(s.dir, 'hold', `echo started > "${startedFile}"
+sleep 8`);
+    const second = s4Fake(s.dir, 'second', `echo ran > "${secondRuns}"`);
+    try {
+      assert.throws(() => runKeychainClientSync(keychainRequestFromArgv('security', hold, ['find-generic-password', '-a', 'a', '-w', '-s', 'svc-s4-shared'], { timeoutMs: 300, lockfPath: s.lockfPath })), (err: unknown) => (err as { code?: unknown }).code === 'ETIMEDOUT');
+      boundedPoll(startedFile, 5_000);
+      const began = Date.now();
+      await assert.rejects(defaultHelperRunner(second, ['probe-read', 'svc-s4-shared', 'a'], undefined, undefined, null, { lockfPath: s.lockfPath }), KeychainRequestStillWaiting);
+      assert.ok(Date.now() - began < 2_000);
+      assert.equal(existsSync(secondRuns), false);
+    } finally { s.cleanup(); }
+  });
+
+  it('keeps a detached helper lock after its QLB parent dies', { timeout: 30_000 }, async () => {
+    const s = s4State();
+    const ran = join(s.dir, 'ran');
+    const after = join(s.dir, 'after');
+    const hold = s4Fake(s.dir, 'death-hold', `echo ran > "${ran}"
+sleep 6
+echo after > "${after}"`);
+    const next = s4Fake(s.dir, 'death-next', 'exit 0');
+    const caller = join(s.dir, 'caller.cjs');
+    writeFileSync(caller, `const { defaultHelperRunner } = require(process.argv[2]);
+defaultHelperRunner(process.argv[3], ['probe-read', 'svc-s4-death', 'a'], undefined, undefined, null, { lockfPath: process.argv[4] }).catch(() => {});\n`);
+    const child = childProcess.spawn(process.execPath, [caller, resolve('dist-test/src/commands/keychain.js'), hold, s.lockfPath], {
+      env: { ...process.env, QLB_TEST_MODE: '1', QLB_HOME: process.env.QLB_HOME!, HOME: process.env.HOME! }, stdio: 'ignore',
+    });
+    try {
+      boundedPoll(ran, 5_000);
+      child.kill('SIGKILL');
+      const began = Date.now();
+      await assert.rejects(defaultHelperRunner(next, ['probe-read', 'svc-s4-death', 'a'], undefined, undefined, null, { lockfPath: s.lockfPath }), KeychainRequestStillWaiting);
+      assert.ok(Date.now() - began < 2_000);
+      boundedPoll(after, 15_000);
+      await defaultHelperRunner(next, ['probe-read', 'svc-s4-death', 'a'], undefined, undefined, null, { lockfPath: s.lockfPath });
+    } finally { s.cleanup(); }
+  });
+
+  it('surfaces a waiting authorize probe and preserves helper exit mappings', async () => {
+    const f = fixture();
+    const errors: string[] = [];
+    f.context.stderr = (line) => errors.push(line);
+    const s = s4State();
+    try {
+      const exit = await runKeychainCommand(['authorize'], f.context, {
+        helperPath: () => '/fixture/qlb-keychain-helper',
+        helperRunner: () => Promise.reject(new KeychainRequestStillWaiting('Claude Code-credentials')),
+      });
+      assert.equal(exit, 1);
+      assert.deepEqual(errors, ['qlb keychain: a Keychain request for Claude Code-credentials is still waiting for an answer']);
+      for (const [name, status, expected] of [['exit-3', 3, 3], ['exit-4', 4, 4]] as const) {
+        const fake = s4Fake(s.dir, name, `exit ${status}`);
+        await assert.rejects(defaultHelperRunner(fake, ['probe-read', `svc-s4-${name}`, 'a'], undefined, undefined, null, { lockfPath: s.lockfPath }), (err: unknown) => (err as { exitCode?: unknown }).exitCode === expected);
+      }
+      const exit75 = s4Fake(s.dir, 'exit-75', 'exit 75');
+      await assert.rejects(defaultHelperRunner(exit75, ['probe-read', 'svc-s4-exit-75', 'a'], undefined, undefined, null, { lockfPath: s.lockfPath }), /keychain helper failed/);
+    } finally {
+      f.cleanup();
+      s.cleanup();
+    }
+  });
 });
