@@ -9,7 +9,7 @@ import { describe, it } from 'node:test';
 import { defaultHeldLocks, isQlbProcessCommand, restoreCswap, runUndoCswapCommand, type TerminalHandBack } from '../src/commands/undo-cswap';
 import { discoverCommands, resolveCommand, type CommandContext } from '../src/registry';
 import { openStore, openStoreConnection } from '../src/store';
-import { runExecutingCommand } from '../src/cli';
+import { runExecutingCommand } from '../src/app';
 import {
   CSWAP_RESTORE_PENDING,
   CUTOVER_BEGIN_IN_PROGRESS,

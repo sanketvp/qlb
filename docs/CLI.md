@@ -135,6 +135,19 @@ $ qlb native-resync --provider kimi-coding --account acct-kimi --json
 
 Flags: `--provider <anthropic|xai|kimi-coding|openai-codex|openrouter>` (required), `--account <id>` (required), `[--db <path>]`, `[--json]`.
 
+## `qlb export`
+
+Emit the last persisted usage readings as JSON without loading provider adapters or credential stores, making network requests, or migrating the database. The SQLite database is opened read-only and is never created when absent. This is the cache-only interface for status consumers; unlike `qlb status`, it does not refresh readings.
+
+```console
+$ qlb export --cache-only --json
+{"exportedAt":1788844834325,"readings":[{"accountId":"acct-a","provider":"anthropic","label":"alice@example.com","bucket":"5h","usedPct":2,"used":null,"limit":null,"remaining":null,"resetAt":1788846834100,"fetchedAt":1788844834100,"source":"poll","confidence":"authoritative","status":"active","stale":false}]}
+```
+
+`exportedAt`, `fetchedAt`, and `resetAt` are Unix timestamps in milliseconds; `fetchedAt` and `resetAt` may be `null`. A reading is `stale: true` when its `fetchedAt` is more than 300 seconds old, including a missing timestamp. The remaining reading fields are the stored account and snapshot values. A missing database succeeds with `{"exportedAt":...,"readings":[]}`. A database with a schema newer than this QLB binary is refused without emitting rows; upgrade QLB before retrying.
+
+The command accepts exactly `qlb export --cache-only --json` (the two flags may be ordered either way). It resolves the database through `QLB_DB_PATH`, config `dbPath`, or the default path; it does not accept per-invocation configuration flags such as `--db-path` or `--config`.
+
 ## `qlb status`
 
 The dashboard view (default): one block per account with a health glyph, credential-ownership state, and any active override, then indented bucket rows.

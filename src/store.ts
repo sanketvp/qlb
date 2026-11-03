@@ -15,10 +15,10 @@ import { redactJson, redactKeyValueText, redactSecrets } from './redact';
 import type { BucketReading, Confidence } from './types';
 import { parseCodexRecoveryFence, type CodexRecoveryFence } from './codex-sessions';
 import type { CodexWatch } from './codex-switch';
+import { newerSchemaMessage, readUserVersion, SCHEMA_VERSION } from './schema-version';
+export { SCHEMA_VERSION };
 
 export const DEFAULT_DB_PATH = config.dbPath;
-/** The only schema version supported by this binary. */
-export const SCHEMA_VERSION = 5;
 
 export interface AccountRow {
   id: string;
@@ -206,16 +206,6 @@ function clampedConfigNumber(raw: string | null, fallback: number, minimum: numb
   return integer ? Math.trunc(bounded) : bounded;
 }
 
-function readUserVersion(db: DatabaseSync): number {
-  const row = db.prepare('PRAGMA user_version').get() as
-    | { user_version?: number }
-    | number
-    | undefined;
-  if (typeof row === 'number') return row;
-  if (row && typeof row.user_version === 'number') return row.user_version;
-  return 0;
-}
-
 export interface OverrideRow {
   kind: string;
   account_id: string;
@@ -343,10 +333,8 @@ export function openDecisionsReader(path: string): DecisionsReader | null {
   try {
     db.exec('PRAGMA busy_timeout = 5000');
     const version = readUserVersion(db);
-    if (version > 5) {
-      throw new Error(
-        `qlb.db schema user_version=${version} is newer than this binary (5); upgrade qlb`,
-      );
+    if (version > SCHEMA_VERSION) {
+      throw new Error(newerSchemaMessage(version));
     }
     const strategySelect = hasColumn(db, 'decisions', 'strategy')
       ? 'strategy, provider'
@@ -655,7 +643,7 @@ function schemaNeedsV5Correction(db: DatabaseSync): boolean {
 export function readOnlySchemaRefusal(db: DatabaseSync): 'schema-migration-required' | null {
   const version = readUserVersion(db);
   if (version > SCHEMA_VERSION) {
-    throw new Error(`qlb.db schema user_version=${version} is newer than this binary (${SCHEMA_VERSION}); upgrade qlb`);
+    throw new Error(newerSchemaMessage(version));
   }
   return version !== SCHEMA_VERSION || schemaNeedsV5Correction(db)
     ? 'schema-migration-required'
@@ -1445,7 +1433,7 @@ export class Store {
   private migrateIfNeeded(): void {
     const version = readUserVersion(this.db);
     if (version > SCHEMA_VERSION) {
-      throw new Error(`qlb.db schema user_version=${version} is newer than this binary (${SCHEMA_VERSION}); upgrade qlb`);
+      throw new Error(newerSchemaMessage(version));
     }
     this.db.exec('BEGIN IMMEDIATE');
     try {

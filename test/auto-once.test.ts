@@ -14,7 +14,7 @@ import type { ClaudeSwitchDeps } from '../src/cc-switch';
 import { defaultConfig } from '../src/config';
 import { MockKeychain } from '../src/keychain';
 import { reconcileClaudeSwitch } from '../src/journal';
-import { runExecutingCommand } from '../src/cli';
+import { runExecutingCommand } from '../src/app';
 import type { CommandContext } from '../src/registry';
 import { beginCutover, transition } from '../src/lifecycle';
 import { openStore } from '../src/store';

@@ -2,8 +2,8 @@
 
 import { DatabaseSync } from 'node:sqlite';
 import type { AccountSnapshot, BucketReading, Confidence } from './types';
-
-export const STALE_OK_S = 300;
+import { STALE_OK_S } from './usage-freshness';
+export { STALE_OK_S };
 export const TRUST_MAX_AGE_S = 3600;
 export const RATE_LIMIT_TRUST_MAX_AGE_S = 7200;
 const QLB_USAGE_PHASES = new Set(['cutting-over', 'cutover', 'retired']);

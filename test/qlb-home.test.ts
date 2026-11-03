@@ -5,7 +5,7 @@ import { homedir, tmpdir } from 'node:os';
 import { isAbsolute, join, relative } from 'node:path';
 import { describe, it } from 'node:test';
 
-import { createCommandContext, dispatchCommand } from '../src/cli';
+import { createCommandContext, dispatchCommand } from '../src/app';
 import { defaultConfig, resolveConfig } from '../src/config';
 import { qlbHomeDir } from '../src/home';
 

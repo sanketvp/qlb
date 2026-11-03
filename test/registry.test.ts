@@ -18,7 +18,7 @@ import {
   listCommandNames,
   prepareCommandArgv,
   runExecutingCommand,
-} from '../src/cli';
+} from '../src/app';
 
 describe('registries', () => {
   it('loads source modules when discovery is explicitly given the ts-node extension', () => {

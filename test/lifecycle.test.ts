@@ -33,7 +33,7 @@ import { resolveCommand, type CommandContext } from '../src/registry';
 import { openStore } from '../src/store';
 import { defaultConfig } from '../src/config';
 import { doctorQlb } from '../src/diagnostics';
-import { gateLifecycleAdmissionCode, runExecutingCommand } from '../src/cli';
+import { gateLifecycleAdmissionCode, runExecutingCommand } from '../src/app';
 import type { CswapAgent } from '../src/cswap-agent';
 
 function fixtureStore() {
