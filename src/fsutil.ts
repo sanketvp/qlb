@@ -37,7 +37,7 @@ export type AtomicWriteOptions = {
   followSymlinks?: boolean;
 };
 
-function errno(error: unknown): string | undefined {
+export function errno(error: unknown): string | undefined {
   return typeof error === 'object' && error !== null && 'code' in error
     ? (error as NodeJS.ErrnoException).code
     : undefined;
