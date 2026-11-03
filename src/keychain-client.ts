@@ -326,7 +326,8 @@ function serviceFromRequest(request: KeychainRequest): string {
   const fallback = typeof request?.item?.service === 'string' ? request.item.service : 'unknown';
   if (request.kind === 'security') {
     if (request.args[0] === 'dump-keychain') {
-      if (request.args.includes('-s')) throw new KeychainClientNotStarted(fallback, 'dump-keychain must not specify a service');
+      // Only the bare form QLB sends (src/keychain.ts) may run: options such as -d would print decrypted items.
+      if (request.args.length !== 1) throw new KeychainClientNotStarted(fallback, 'dump-keychain takes no arguments');
       return 'cmd:dump-keychain';
     }
     const services = request.args.flatMap((arg, index) => arg === '-s' && typeof request.args[index + 1] === 'string' ? [request.args[index + 1]] : []);

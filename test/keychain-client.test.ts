@@ -410,13 +410,16 @@ sleep 20`);
     });
   });
 
-  it('(S1a c) rejects a dump-keychain service argument before starting the client', () => {
+  it('(S1a c) rejects any dump-keychain argument before starting the client', () => {
     const s = state();
     withState(s, () => {
-      const client = fake(s, 'echo run >> "$d/dump-with-service-runs"');
-      const invalid = keychainRequestFromArgv('security', client, ['dump-keychain', '-s', 'x'], { timeoutMs: 2_000, lockfPath: s.lockfPath });
-      assert.throws(() => runKeychainClientSync(invalid), KeychainClientNotStarted);
-      assert.equal(existsSync(join(s.dir, 'dump-with-service-runs')), false);
+      const client = fake(s, 'echo run >> "$d/dump-with-args-runs"');
+      for (const extra of [['-s', 'x'], ['-d'], ['-i'], ['/tmp/other.keychain']]) {
+        const invalid = keychainRequestFromArgv('security', client, ['dump-keychain', ...extra], { timeoutMs: 2_000, lockfPath: s.lockfPath });
+        // The message proves the dump-keychain branch refused it, not the later item/service mismatch check.
+        assert.throws(() => runKeychainClientSync(invalid), (err: unknown) => err instanceof KeychainClientNotStarted && /dump-keychain takes no arguments/.test((err as Error).message));
+      }
+      assert.equal(existsSync(join(s.dir, 'dump-with-args-runs')), false);
     });
   });
 });
