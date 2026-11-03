@@ -31,6 +31,13 @@ jobs:
       - run: npm run build
       - run: npm run typecheck:pi
       - run: npm test
+      - name: Keychain-client suite must run, not skip
+        shell: bash
+        run: |
+          export QLB_TEST_MODE=1 QLB_HOME="$(mktemp -d)"
+          node --test dist-test/test/keychain-client.test.js | tee kc.log
+          grep -Eq '^(ℹ|#) skipped 0$' kc.log
+          grep -Eq '^(ℹ|#) fail 0$' kc.log
       - name: Pi suites must run, not skip
         shell: bash
         run: |

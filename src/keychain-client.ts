@@ -377,10 +377,12 @@ function resultError(code: string, props: Record<string, unknown>): Error {
  * /usr/bin/true runs, so no write path may use it as a gate.  Errors fail
  * closed because an unavailable probe must not permit a duplicate prompt.
  */
-export function isKeychainServiceBusy(service: string): boolean {
+export function isKeychainServiceBusy(service: string, opts?: { lockfPath?: string }): boolean {
+  const lockfPath = opts?.lockfPath ?? KEYCHAIN_LOCKF_BIN;
+  if (!lockfAllowed(lockfPath)) return true;
   try {
     const lockPath = ensureLockFile(service);
-    const result = spawnSync(KEYCHAIN_LOCKF_BIN, ['-k', '-t', '0', lockPath, '/usr/bin/true'], { stdio: 'ignore' });
+    const result = spawnSync(lockfPath, ['-k', '-t', '0', lockPath, '/usr/bin/true'], { stdio: 'ignore' });
     return result.status !== 0;
   } catch {
     return true;
