@@ -104,6 +104,15 @@ export function retryAfterSeconds(value: string | null): number | undefined {
   return Number.isSafeInteger(seconds) ? seconds : undefined;
 }
 
+export function anthropicModelScope(store: Pick<Store, 'getConfig'>): readonly string[] {
+  const raw = store.getConfig('auto.anthropic.models');
+  if (typeof raw !== 'string' || raw.trim() === '') return ['all'];
+  const models = raw.split(',').map((model) => model.trim().toLowerCase());
+  return models.length > 0 && models.every((model) => /^[a-z0-9][a-z0-9._-]*$/i.test(model))
+    ? [...new Set(models)]
+    : ['all'];
+}
+
 export function productionRequest(description: HttpRequestDescription): Promise<RefreshHttpResponse & { retryAfterS?: number }> {
   return fetch(description.url, {
     method: description.method,
@@ -133,7 +142,9 @@ function productionLiveBinding(deps: Required<Pick<AutoDependencies, 'env' | 'ho
   const warn = (message: string): void => redactedLog(deps.log, `auto: warning: ${message}`);
   const live = { backend: platformKeychain, paths, env: deps.env };
   const verdicts = new ProbeVerdictMemo();
+  const models = anthropicModelScope(store);
   const pollDeps = (): AnthropicPollDeps => ({
+    models,
     store,
     slots,
     now: () => Math.floor(deps.now() / 1000),
@@ -147,7 +158,7 @@ function productionLiveBinding(deps: Required<Pick<AutoDependencies, 'env' | 'ho
     getUsage: async (accessToken) => productionRequest(buildUsageRequest(accessToken)),
   });
   const tickDeps = (accounts: Awaited<ReturnType<typeof pollAnthropic>>): AnthropicTickDeps => ({
-    store, slots, now: deps.now, accounts,
+    store, slots, now: deps.now, accounts, models,
     makeSwitchDeps: async (by) => makeProductionSwitchDeps({}, {
       stdout: () => {}, stderr: warn, env: deps.env, config: deps.config, loadConfig: () => deps.config,
       home: deps.home, registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
@@ -248,10 +259,11 @@ function productionDryBinding(config: QlbConfig, now: () => number): DryBinding 
   const db = openStoreConnection(connectionPath, true);
   const store = readOnlyStore(db, config.dbPath);
   const slots = readOnlySlots(db);
+  const models = anthropicModelScope(store);
   return {
     close: () => db.close(),
     admit: () => assertAdmittedInConnection(db, 'auto:dry-run'),
-    tick: () => anthropicTick({ store, slots: slots as ClaudeSlots, now, dryRun: true }),
+    tick: () => anthropicTick({ store, slots: slots as ClaudeSlots, now, models, dryRun: true }),
   };
 }
 
