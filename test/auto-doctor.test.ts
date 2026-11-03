@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
 import { autoAgentCheck } from '../src/checks/auto-agent';
+import { autoParkedCheck } from '../src/checks/auto-parked';
 import { cswapAgentCheck } from '../src/checks/cswap-agent';
 import { cswapProcessesCheck } from '../src/checks/cswap-processes';
 import { consumeMarkerPathFor } from '../src/cswap-consume';
@@ -55,6 +56,47 @@ describe('auto doctor (G14)', () => {
       { name: 'cswap:processes', level: 'PASS' },
     ]);
     assert.equal(h2Rows.some((row) => row.level === 'FAIL'), false);
+  });
+
+  it('auto:parked warns while parkedUntil is in the future', () => {
+    const config = cutoverFixture();
+    const parkedUntil = NOW + 60_000;
+    const store = openStore(config.dbPath);
+    store.setConfig('auto.anthropic.parkedUntil', String(parkedUntil));
+    store.close();
+
+    const result = autoParkedCheck(config.dbPath, CUTOVER, NOW);
+    assert.equal(result.level, 'WARN');
+    assert.equal(result.message, `automatic anthropic switching is parked until ${new Date(parkedUntil).toISOString()}`);
+  });
+
+  it('auto:parked passes on an expired or empty marker', () => {
+    const config = cutoverFixture();
+    const store = openStore(config.dbPath);
+    store.setConfig('auto.anthropic.parkedUntil', String(NOW - 1));
+    store.close();
+    assert.equal(autoParkedCheck(config.dbPath, CUTOVER, NOW).level, 'PASS');
+
+    const empty = openStore(config.dbPath);
+    empty.setConfig('auto.anthropic.parkedUntil', '');
+    empty.close();
+    assert.equal(autoParkedCheck(config.dbPath, CUTOVER, NOW).level, 'PASS');
+  });
+
+  it('auto:parked warns on an unreadable marker', () => {
+    const config = cutoverFixture();
+    const store = openStore(config.dbPath);
+    store.setConfig('auto.anthropic.parkedUntil', 'not-a-timestamp');
+    store.close();
+
+    const result = autoParkedCheck(config.dbPath, CUTOVER, NOW);
+    assert.equal(result.level, 'WARN');
+    assert.equal(result.message, 'parked marker unreadable');
+  });
+
+  it('auto:parked is N/A before cutover', () => {
+    const result = autoParkedCheck(join(tmpdir(), 'missing-auto-parked.db'), PRE_CUTOVER, NOW);
+    assert.equal(result.level, 'N/A');
   });
 
   it('a stale heartbeat fails auto:agent', () => {
