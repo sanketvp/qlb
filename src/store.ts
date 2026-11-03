@@ -15,10 +15,10 @@ import { redactJson, redactKeyValueText, redactSecrets } from './redact';
 import type { BucketReading, Confidence } from './types';
 import { parseCodexRecoveryFence, type CodexRecoveryFence } from './codex-sessions';
 import type { CodexWatch } from './codex-switch';
+import { SCHEMA_VERSION } from './schema-version';
+export { SCHEMA_VERSION };
 
 export const DEFAULT_DB_PATH = config.dbPath;
-/** The only schema version supported by this binary. */
-export const SCHEMA_VERSION = 5;
 
 export interface AccountRow {
   id: string;

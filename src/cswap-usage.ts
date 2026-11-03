@@ -5,9 +5,10 @@ import { existsSync, readFileSync } from 'node:fs';
 
 import { config } from './config';
 import type { AccountSnapshot, BucketReading, Confidence } from './types';
+import { STALE_OK_S } from './usage-freshness';
+export { STALE_OK_S };
 
 export const TRUST_MAX_AGE_S = 3600;
-export const STALE_OK_S = 300;
 export const WINDOW_5H_MIN = 5 * 60;
 export const WINDOW_7D_MIN = 7 * 24 * 60;
 

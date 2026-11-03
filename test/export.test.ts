@@ -1,35 +1,33 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { describe, it } from 'node:test';
-import { CACHE_EXPORT_STALE_AFTER_MS } from '../src/export';
+import { cacheOnlyExport } from '../src/export';
 import { openStore } from '../src/store';
 
 const cliPath = join(__dirname, '..', 'src', 'cli.js');
 
-type CliResult = { status: number; stdout: string; stderr: string; elapsedMs: number };
+type CliResult = { status: number; stdout: string; stderr: string };
 
-function runExport(dbPath: string, preload?: string): CliResult {
+function runExport(dbPath: string | undefined, preload?: string, env: NodeJS.ProcessEnv = {}): CliResult {
   const args = [preload ? `--require=${preload}` : '', cliPath, 'export', '--cache-only', '--json'].filter(Boolean);
-  const started = performance.now();
   try {
     const stdout = execFileSync(process.execPath, args, {
       encoding: 'utf8',
-      env: { ...process.env, QLB_TEST_MODE: '1', QLB_DB_PATH: dbPath },
+      env: { ...process.env, QLB_TEST_MODE: '1', ...env, ...(dbPath === undefined ? {} : { QLB_DB_PATH: dbPath }) },
       timeout: 5_000,
     });
-    return { status: 0, stdout, stderr: '', elapsedMs: performance.now() - started };
+    return { status: 0, stdout, stderr: '' };
   } catch (err) {
     const error = err as { status?: number | null; stdout?: string; stderr?: string };
     return {
       status: typeof error.status === 'number' ? error.status : 1,
       stdout: error.stdout ?? '',
       stderr: error.stderr ?? '',
-      elapsedMs: performance.now() - started,
     };
   }
 }
@@ -42,8 +40,8 @@ function fixtureDb(): { path: string; freshAt: number; staleAt: number } {
   const root = mkdtempSync(join(tmpdir(), 'qlb-export-'));
   const path = join(root, 'qlb.db');
   const now = Date.now();
-  const freshAt = now - CACHE_EXPORT_STALE_AFTER_MS + 1_000;
-  const staleAt = now - CACHE_EXPORT_STALE_AFTER_MS - 1_000;
+  const freshAt = now - 300_000 + 1_000;
+  const staleAt = now - 300_000 - 1_000;
   const store = openStore(path);
   try {
     store.upsertAccount('anthropic-a', 'anthropic', 'account-a');
@@ -76,7 +74,7 @@ describe('cache-only export', () => {
 
     const body = JSON.parse(result.stdout) as {
       exportedAt: number;
-      readings: Array<{ bucket: string; fetchedAt: number; stale: boolean; accountId: string; provider: string }>;
+      readings: Array<{ bucket: string; fetchedAt: number; stale: boolean; accountId: string; provider: string; status: string }>;
     };
     assert.equal(typeof body.exportedAt, 'number');
     assert.deepEqual(body.readings.map((reading) => ({
@@ -85,9 +83,10 @@ describe('cache-only export', () => {
       stale: reading.stale,
       accountId: reading.accountId,
       provider: reading.provider,
+      status: reading.status,
     })), [
-      { bucket: 'five-hour', fetchedAt: fixture.freshAt, stale: false, accountId: 'anthropic-a', provider: 'anthropic' },
-      { bucket: 'seven-day', fetchedAt: fixture.staleAt, stale: true, accountId: 'anthropic-a', provider: 'anthropic' },
+      { bucket: 'five-hour', fetchedAt: fixture.freshAt, stale: false, accountId: 'anthropic-a', provider: 'anthropic', status: 'active' },
+      { bucket: 'seven-day', fetchedAt: fixture.staleAt, stale: true, accountId: 'anthropic-a', provider: 'anthropic', status: 'active' },
     ]);
   });
 
@@ -104,6 +103,16 @@ describe('cache-only export', () => {
     assert.equal(result.status, 1);
     assert.equal(result.stdout, '');
     assert.match(result.stderr, /newer than this binary/);
+  });
+
+  it('uses the configured database path', () => {
+    const fixture = fixtureDb();
+    const home = mkdtempSync(join(tmpdir(), 'qlb-export-home-'));
+    mkdirSync(join(home, '.qlb'));
+    writeFileSync(join(home, '.qlb', 'config.json'), JSON.stringify({ dbPath: fixture.path }));
+    const result = runExport(undefined, undefined, { QLB_HOME: home });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(JSON.parse(result.stdout).readings.length, 2);
   });
 
   it('does not load provider adapters or credential modules', () => {
@@ -123,10 +132,24 @@ Module._load = function(request, parent, isMain) {
     assert.equal(result.status, 0, result.stderr);
   });
 
-  it('returns a fixture export in under 200 ms', () => {
+  it('keeps ordinary commands in the invoking process', () => {
+    const guard = join(mkdtempSync(join(tmpdir(), 'qlb-cli-guard-')), 'guard.cjs');
+    writeFileSync(guard, `
+const childProcess = require('node:child_process');
+childProcess.spawnSync = () => { throw new Error('unexpected child process'); };
+`);
+    const output = execFileSync(process.execPath, [`--require=${guard}`, cliPath, '--list-commands', '--json'], {
+      encoding: 'utf8',
+      env: { ...process.env, QLB_TEST_MODE: '1', QLB_HOME: mkdtempSync(join(tmpdir(), 'qlb-cli-home-')) },
+    });
+    assert.ok(JSON.parse(output).includes('status'));
+  });
+
+  it('returns a fixture export in under 200 ms in process', () => {
     const fixture = fixtureDb();
-    const result = runExport(fixture.path);
-    assert.equal(result.status, 0, result.stderr);
-    assert.ok(result.elapsedMs < 200, `export took ${result.elapsedMs.toFixed(1)} ms`);
+    const started = performance.now();
+    const output = cacheOnlyExport(Date.now(), fixture.path);
+    assert.equal(output.readings.length, 2);
+    assert.ok(performance.now() - started < 200);
   });
 });

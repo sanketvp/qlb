@@ -1,14 +1,10 @@
 import { existsSync } from 'node:fs';
-import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { qlbHomeDir } from './home';
+import { config } from './config';
+import { SCHEMA_VERSION } from './schema-version';
+import { STALE_OK_S } from './usage-freshness';
 
-/**
- * A reading older than this has not been refreshed recently enough for consumers
- * to treat it as current. Export remains cache-only regardless of freshness.
- */
-export const CACHE_EXPORT_STALE_AFTER_MS = 15 * 60 * 1000;
-const SUPPORTED_SCHEMA_VERSION = 5;
+const CACHE_EXPORT_BUSY_TIMEOUT_MS = 150;
 
 type SnapshotRow = {
   account_id: string;
@@ -23,6 +19,7 @@ type SnapshotRow = {
   fetched_at: number;
   source: 'poll' | 'headers' | 'error';
   confidence: 'authoritative' | 'advisory' | 'stale' | 'unknown';
+  status: string;
 };
 
 export type CacheExportReading = {
@@ -38,6 +35,7 @@ export type CacheExportReading = {
   fetchedAt: number;
   source: 'poll' | 'headers' | 'error';
   confidence: 'authoritative' | 'advisory' | 'stale' | 'unknown';
+  status: string;
   stale: boolean;
 };
 
@@ -46,9 +44,8 @@ export type CacheExport = {
   readings: CacheExportReading[];
 };
 
-function exportDbPath(env: NodeJS.ProcessEnv = process.env): string {
-  if (env.QLB_DB_PATH) return env.QLB_DB_PATH;
-  return join(qlbHomeDir(env), '.qlb', 'qlb.db');
+function exportDbPath(): string {
+  return config.dbPath;
 }
 
 function readUserVersion(db: DatabaseSync): number {
@@ -57,9 +54,7 @@ function readUserVersion(db: DatabaseSync): number {
 }
 
 function parseArgs(args: string[]): boolean {
-  if (args.length === 1 && args[0] === '--cache-only') return true;
-  if (args.length === 2 && args.includes('--cache-only') && args.includes('--json')) return true;
-  return false;
+  return args.length === 2 && args.includes('--cache-only') && args.includes('--json');
 }
 
 /**
@@ -72,12 +67,13 @@ export function cacheOnlyExport(now = Date.now(), dbPath = exportDbPath()): Cach
 
   const db = new DatabaseSync(dbPath, { readOnly: true });
   try {
+    db.exec(`PRAGMA busy_timeout = ${CACHE_EXPORT_BUSY_TIMEOUT_MS}`);
     const version = readUserVersion(db);
-    if (version > SUPPORTED_SCHEMA_VERSION) {
-      throw new Error(`qlb export: qlb.db schema user_version=${version} is newer than this binary (${SUPPORTED_SCHEMA_VERSION}); upgrade qlb`);
+    if (version > SCHEMA_VERSION) {
+      throw new Error(`qlb export: qlb.db schema user_version=${version} is newer than this binary (${SCHEMA_VERSION}); upgrade qlb`);
     }
     const rows = db.prepare(`
-      SELECT s.account_id, a.provider, a.label, s.bucket, s.used_pct, s.used,
+      SELECT s.account_id, a.provider, a.label, a.status, s.bucket, s.used_pct, s.used,
              s.limit_val, s.remaining, s.reset_at, s.fetched_at, s.source, s.confidence
       FROM snapshots AS s
       JOIN accounts AS a ON a.id = s.account_id
@@ -98,7 +94,8 @@ export function cacheOnlyExport(now = Date.now(), dbPath = exportDbPath()): Cach
         fetchedAt: row.fetched_at,
         source: row.source,
         confidence: row.confidence,
-        stale: now - row.fetched_at > CACHE_EXPORT_STALE_AFTER_MS,
+        status: row.status,
+        stale: now - row.fetched_at > STALE_OK_S * 1000,
       })),
     };
   } finally {
@@ -107,7 +104,7 @@ export function cacheOnlyExport(now = Date.now(), dbPath = exportDbPath()): Cach
 }
 
 export function runCacheOnlyExport(args: string[]): number {
-  if (!parseArgs(args) || !args.includes('--json')) {
+  if (!parseArgs(args)) {
     console.error('Usage: qlb export --cache-only --json');
     return 1;
   }
