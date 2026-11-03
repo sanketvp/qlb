@@ -64,8 +64,8 @@ export interface KeychainLock {
   readonly lockPath: string;
   /**
    * S4 must spawn this detached outer shell, never lockf directly.  Append
-   * mode, deadline, helper path and helper args to outerArgsPrefix.  S4 must
-   * never child.kill anything that could be lockf.
+   * `p` or `r`, deadline, helper path and helper args to outerArgsPrefix. S4
+   * must never child.kill anything that could be lockf.
    */
   readonly outerFile: '/bin/sh';
   readonly outerArgsPrefix: readonly string[];
@@ -74,6 +74,7 @@ export interface KeychainLock {
 const LOCK_DIR = 'keychain-locks';
 const STARTED_SENTINEL = 'qlb-keychain-client-started\n';
 const DEADLINE_MARKER = 'qlb-keychain-wait: deadline-expired';
+export const KEYCHAIN_UNBOUNDED_DEADLINE = String(Number.MAX_SAFE_INTEGER);
 
 /** Registry-only key: a wait for one service blocks every account on it. */
 export function keychainWaitKey(service: string): string {
@@ -89,28 +90,53 @@ function lockPathForService(service: string): string {
 }
 
 function lockDirectory(service: string): string {
-  const dir = lockDir();
-  // This never changes an existing directory's mode.
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
-  const stat = lstatSync(dir);
-  const uid = process.getuid?.();
-  if (stat.isSymbolicLink() || !stat.isDirectory() || (uid !== undefined && stat.uid !== uid)) {
-    throw new KeychainClientNotStarted(service, 'lock directory is not private');
+  let dir: string | undefined;
+  try {
+    dir = lockDir();
+    // This never changes an existing directory's mode.
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const stat = lstatSync(dir);
+    const uid = process.getuid?.();
+    if (stat.isSymbolicLink() || !stat.isDirectory() || (uid !== undefined && stat.uid !== uid)) {
+      throw new KeychainClientNotStarted(service, 'lock directory is not private');
+    }
+    // mkdir mode 0700 is sufficient under a normal umask; never chmod a
+    // pre-existing directory.  Refuse a mode that cannot protect the locks.
+    if ((lstatSync(dir).mode & 0o777) !== 0o700) throw new KeychainClientNotStarted(service, 'lock directory is not private');
+    return dir;
+  } catch (err) {
+    if (err instanceof KeychainClientNotStarted) throw err;
+    // Something other than a real directory in the lock path is a privacy fault;
+    // any other fs error (EACCES, EROFS, ENOSPC, ENOTDIR above it) is not.
+    throw new KeychainClientNotStarted(service, occupiedByNonDirectory(dir) ? 'lock directory is not private' : 'lock directory is not writable');
   }
-  // mkdir mode 0700 is sufficient under a normal umask; never chmod a
-  // pre-existing directory.  Refuse a mode that cannot protect the locks.
-  if ((lstatSync(dir).mode & 0o777) !== 0o700) throw new KeychainClientNotStarted(service, 'lock directory is not private');
-  return dir;
+}
+
+function occupiedByNonDirectory(path: string | undefined): boolean {
+  if (path === undefined) return false;
+  try {
+    const stat = lstatSync(path);
+    return stat.isSymbolicLink() || !stat.isDirectory();
+  } catch {
+    return false;
+  }
 }
 
 function ensureLockFile(service: string): string {
   lockDirectory(service);
-  const path = lockPathForService(service);
   let fd: number;
+  let path: string;
   try {
+    path = lockPathForService(service);
     fd = openSync(path, constants.O_CREAT | constants.O_RDWR | constants.O_NOFOLLOW, 0o600);
-  } catch { throw new KeychainClientNotStarted(service, 'lock file could not be opened'); }
-  closeSync(fd);
+  } catch {
+    throw new KeychainClientNotStarted(service, 'lock file could not be opened');
+  }
+  try {
+    closeSync(fd);
+  } catch {
+    throw new KeychainClientNotStarted(service, 'lock file could not be closed');
+  }
   return path;
 }
 
@@ -118,12 +144,14 @@ function ensureLockFile(service: string): string {
  * S4 uses this to put its helper under exactly the same per-service kernel
  * lock.  The lock file is permanent; only the advisory lock is transient.
  */
-export function keychainLockForService(service: string): KeychainLock {
+export function keychainLockForService(service: string, opts?: { lockfPath?: string }): KeychainLock {
+  const lockfPath = opts?.lockfPath ?? KEYCHAIN_LOCKF_BIN;
+  if (!lockfAllowed(lockfPath)) throw new KeychainClientNotStarted(service, 'unsupported lockf executable');
   const lockPath = ensureLockFile(service);
   return {
     lockPath,
     outerFile: '/bin/sh',
-    outerArgsPrefix: ['-c', KEYCHAIN_WAIT_SCRIPT, 'qlb-keychain-wait', KEYCHAIN_LOCKF_BIN, lockPath],
+    outerArgsPrefix: ['-c', KEYCHAIN_WAIT_SCRIPT, 'qlb-keychain-wait', lockfPath, lockPath],
   };
 }
 
@@ -271,9 +299,18 @@ function clientAllowed(file: string, kind: KeychainKind): boolean {
   return isUnderTmp(file);
 }
 
+/** Refuse a real Keychain client whenever a test invokes the leaf. */
+export function assertKeychainClientAllowed(file: string, kind: KeychainKind): void {
+  if (!clientAllowed(file, kind)) throw new KeychainClientDisabledInTests();
+}
+
 function lockfAllowed(path: string): boolean {
   if (process.env.QLB_TEST_MODE !== '1') return path === KEYCHAIN_LOCKF_BIN;
   return path === KEYCHAIN_LOCKF_BIN || isUnderTmp(path);
+}
+
+export function keychainClientEnv(): NodeJS.ProcessEnv {
+  return { PATH: '/usr/bin:/bin:/usr/sbin:/sbin', LC_ALL: 'C', TZ: 'UTC', HOME: qlbHomeDir({}) };
 }
 
 /**
@@ -305,6 +342,10 @@ lockf=$1; lock=$2; mode=$3; deadline=$4; shift 4
     before_deadline || { echo "qlb-keychain-wait: deadline-expired" >&2; exit 125; }
     printf "qlb-keychain-client-started\\n" >&3
     exec 3>&-
+    if [ "$mode" = p ]; then
+      before_deadline || { echo "qlb-keychain-wait: deadline-expired" >&2; exit 125; }
+      exec "$@"
+    fi
     if [ "$mode" = w ]; then
       IFS= read -r hex || { echo "qlb-keychain-wait: no-secret" >&2; exit 125; }
       before_deadline || { echo "qlb-keychain-wait: deadline-expired" >&2; exit 125; }
@@ -369,12 +410,26 @@ export function validateRequest(request: KeychainRequest): void {
   if (typeof lockfPath !== 'string' || lockfPath.includes('\0') || !lockfAllowed(lockfPath)) throw new KeychainClientNotStarted(service, 'unsupported lockf executable');
 }
 
-function unknownOutcome(error: Error, request: KeychainRequest): Error {
-  return request.secretHex === undefined ? error : Object.assign(error, { writeOutcome: 'unknown' });
-}
-
 function resultError(code: string, props: Record<string, unknown>): Error {
   return Object.assign(new Error('Keychain wrapper did not prove client exit'), { code, ...props });
+}
+
+export function keychainWrapperOutcome(
+  service: string,
+  result: { error?: Error; status: number | null; signal: NodeJS.Signals | null; fd3?: Buffer; stderr: string },
+  isWrite: boolean,
+): number {
+  const started = Buffer.isBuffer(result.fd3) && result.fd3.toString('utf8') === STARTED_SENTINEL;
+  if (result.status === 125 && result.stderr.includes(DEADLINE_MARKER)) {
+    throw new KeychainClientNotStarted(service, 'client was not started before the deadline');
+  }
+  // A busy lock has no inner shell, so an EPIPE from its already-closed stdin
+  // is not evidence that a write client ran.
+  if (result.status === 75 && !started) throw new KeychainRequestStillWaiting(service);
+  if (result.error) throw (isWrite ? Object.assign(result.error, { writeOutcome: 'unknown' }) : result.error);
+  if (result.signal && result.status === null) throw (isWrite ? Object.assign(resultError('EQLBKEYCHAINWRAPPERSIGNALLED', { signal: result.signal }), { writeOutcome: 'unknown' }) : resultError('EQLBKEYCHAINWRAPPERSIGNALLED', { signal: result.signal }));
+  if (result.status === null || !started) throw (isWrite ? Object.assign(resultError('EQLBKEYCHAINWRAPPERNOPROOF', { status: result.status }), { writeOutcome: 'unknown' }) : resultError('EQLBKEYCHAINWRAPPERNOPROOF', { status: result.status }));
+  return result.status;
 }
 
 /**
@@ -397,7 +452,7 @@ export function isKeychainServiceBusy(service: string, opts?: { lockfPath?: stri
 export function runKeychainClientSync(request: KeychainRequest): string | Buffer {
   validateRequest(request);
   const service = serviceFromRequest(request);
-  if (!clientAllowed(request.file, request.kind)) throw new KeychainClientDisabledInTests();
+  assertKeychainClientAllowed(request.file, request.kind);
   const lockfPath = request.lockfPath ?? KEYCHAIN_LOCKF_BIN;
   let lockPath: string;
   try { lockPath = ensureLockFile(service); } catch (err) {
@@ -413,28 +468,19 @@ export function runKeychainClientSync(request: KeychainRequest): string | Buffer
     killSignal: 'SIGKILL',
     maxBuffer: request.maxBuffer ?? 1024 * 1024,
     encoding: null,
-    env: { PATH: '/usr/bin:/bin:/usr/sbin:/sbin', LC_ALL: 'C', TZ: 'UTC', HOME: qlbHomeDir({}) },
+    env: keychainClientEnv(),
   } as Parameters<typeof spawnSync>[2]);
-  const fd3 = result.output?.[3];
-  const started = Buffer.isBuffer(fd3) && fd3.toString('utf8') === STARTED_SENTINEL;
+  const fd3 = Buffer.isBuffer(result.output?.[3]) ? result.output[3] : undefined;
   const stderr = Buffer.isBuffer(result.stderr) ? result.stderr.toString('utf8') : String(result.stderr ?? '');
-  // This marker proves the inner shell refused to exec the client, even when
-  // it happened before the fd-3 start sentinel was emitted.
-  if (result.status === 125 && stderr.includes(DEADLINE_MARKER)) {
-    throw new KeychainClientNotStarted(service, 'client was not started before the deadline');
-  }
-  if (result.error) throw unknownOutcome(result.error, request);
-  if (result.status === 75 && !started) throw new KeychainRequestStillWaiting(service);
-  if (result.signal && result.status === null) throw unknownOutcome(resultError('EQLBKEYCHAINWRAPPERSIGNALLED', { signal: result.signal }), request);
-  if (result.status === null || !started) throw unknownOutcome(resultError('EQLBKEYCHAINWRAPPERNOPROOF', { status: result.status }), request);
-  if (result.status === 0) {
+  const status = keychainWrapperOutcome(service, { error: result.error, status: result.status, signal: result.signal, fd3, stderr }, request.secretHex !== undefined);
+  if (status === 0) {
     const stdout = Buffer.isBuffer(result.stdout) ? result.stdout : Buffer.from(result.stdout ?? '');
     if (request.encoding === 'buffer') return stdout;
     const text = stdout.toString('utf8');
     stdout.fill(0);
     return text;
   }
-  throw Object.assign(new Error(`Command failed: ${basename(request.file)} ${request.args[0]}\n${stderr}`), { status: result.status });
+  throw Object.assign(new Error(`Command failed: ${basename(request.file)} ${request.args[0]}\n${stderr}`), { status });
 }
 
 export const keychainClientExec: KeychainExecFn = ((file: string, args: readonly string[], options: KeychainExecOptions) => {
