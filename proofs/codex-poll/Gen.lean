@@ -45,22 +45,25 @@ private def r1Case (index : Nat) : String :=
       "},\"expected\":{\"probe\":" ++ boolJson expected.probe ++ ",\"heldUntil\":" ++ natOptionJson expected.heldUntil ++ "}}"
 
 /-- Six neighboring cases enumerate each result/readings combination per failure count. -/
-private def r4StepJson (now : Nat) (held : Bool) : String :=
-  "{\"now\":" ++ toString now ++ ",\"held\":" ++ boolJson held ++ "}"
+private def r4StepJson (now : Nat) (held fresh via401 : Bool) : String :=
+  "{\"now\":" ++ toString now ++ ",\"held\":" ++ boolJson held ++
+    ",\"fresh\":" ++ boolJson fresh ++ ",\"via401\":" ++ boolJson via401 ++ "}"
 
-/-- Multi-tick lease traces cover stale holder receipts, expiry, and post-expiry renewal. -/
+/--
+Lease traces cover fresh pre-expiry and deadline renewals, non-fresh receipts,
+and the 401 clear-then-renew order.  A scheduled deadline renewal exercises a
+CAS replacement of a non-null expired lease.
+-/
 private def r4Case (index : Nat) : String :=
   let start := 1_710_000_000 + index * 101
   let interval := if index % 2 = 0 then 15 + index % 45 else 61 + index % 120
   let initial := leaseForHeld start interval
-  let stale := heldLeaseStep (start + 1) interval (some initial) true
-  let expired := heldLeaseStep initial interval stale false
-  let renew := heldLeaseStep (initial + 1) interval expired true
-  let steps := if index % 2 = 0 then
-    [r4StepJson (start + 1) true, r4StepJson initial false]
-  else
-    [r4StepJson (start + 1) true, r4StepJson initial false, r4StepJson (initial + 1) true]
-  let expected := if index % 2 = 0 then expired else renew
+  let kind := index % 5
+  let now := if kind = 0 || kind = 2 then start + 1 else initial
+  let fresh := kind = 0 || kind = 1 || kind = 4
+  let via401 := kind = 4
+  let expected := tickLeaseStep now interval (some initial) true fresh via401
+  let steps := [r4StepJson now true fresh via401]
   "{\"rule\":\"r4\",\"input\":{\"initialHeldUntil\":" ++ toString initial ++
     ",\"interval\":" ++ toString interval ++ ",\"steps\":[" ++ String.intercalate "," steps ++
     "]},\"expected\":{\"heldUntil\":" ++ natOptionJson expected ++ "}}"

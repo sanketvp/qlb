@@ -26,16 +26,24 @@ theorem lease_cleared_after_expiry (now held : Nat) (state : PollState)
 
 /-- With no fresh holder receipt, the lease is gone at its deadline. -/
 theorem held_lease_expires_at_deadline (deadline interval : Nat) :
-    heldLeaseStep deadline interval (some deadline) false = none := by
+    heldLeaseStep deadline interval (some deadline) true false = none := by
   simp [heldLeaseStep]
 
-/-- A replacement lease from an existing lease requires a strictly newer receipt. -/
-theorem held_lease_renews_only_after_expiry (now interval previous next : Nat)
-    (renewed : heldLeaseStep now interval (some previous) true = some next)
-    (changed : next ≠ previous) :
-    previous < now := by
-  simp only [heldLeaseStep] at renewed
-  split at renewed <;> simp_all
+/-- A fresh receipt extends a lease even before its old deadline, never shortening it. -/
+theorem fresh_held_lease_renews (now interval previous : Nat) :
+    heldLeaseStep now interval (some previous) true true =
+      some (max previous (leaseForHeld now interval)) := by
+  simp [heldLeaseStep]
+
+/-- A non-fresh held result never extends a live lease. -/
+theorem nonfresh_held_keeps_live_lease (now interval previous : Nat) (live : now < previous) :
+    heldLeaseStep now interval (some previous) true false = some previous := by
+  simp [heldLeaseStep, Nat.not_le_of_gt live]
+
+/-- A 401 clear followed by a fresh holder receipt installs a new lease. -/
+theorem clear_then_fresh_held_renews (now interval previous : Nat) (expired : previous ≤ now) :
+    tickLeaseStep now interval (some previous) true true true = some (leaseForHeld now interval) := by
+  simp [tickLeaseStep, heldLeaseStep, expired]
 
 /-- A clear based on an older snapshot leaves a concurrent newer lease intact. -/
 theorem clear_lease_preserves_newer_value (observed current : Option Nat)

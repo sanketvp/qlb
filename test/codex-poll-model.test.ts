@@ -10,7 +10,7 @@ import { openStore } from '../src/store';
 import type { BucketReading } from '../src/types';
 
 type R1Case = { rule: 'r1'; input: { kind: 'held' | 'tick'; now: number; heldUntil: number | null; interval: number }; expected: { probe: boolean; heldUntil: number | null } };
-type R4Step = { now: number; held: boolean };
+type R4Step = { now: number; held: boolean; fresh: boolean; via401: boolean };
 type R4Case = { rule: 'r4'; input: { initialHeldUntil: number | null; interval: number; steps: R4Step[] }; expected: { heldUntil: number | null } };
 type R2Case = { rule: 'r2'; input: { kind: 'codex-won' | 'failure' | 'success'; failures: number; readings: boolean; seedAt: number; attemptedAt: number }; expected: { failures: number; backoffUntil: number | null; readings: boolean; lastStatus: string; lastAttemptAt: number } };
 type Hold = { accountId: string; sinceMs: number };
@@ -32,11 +32,13 @@ function document(nowMs: number, expiresAtMs: number): CodexAuthDocument {
   };
 }
 
-function autoHarness(nowMs: number, raw = '') {
+function autoHarness(initialNowMs: number, raw = '') {
   const polls: Record<string, { pollIntervalS?: number; heldUntil?: number | null; nextDueAt?: number }> = {};
   const configs: Record<string, string> = { 'auto.openai-codex.idleHoldSince': raw };
   const snapshots: Record<string, Record<string, BucketReading>> = { [ACCOUNT]: {} };
+  let nowMs = initialNowMs;
   let probes = 0;
+  let expiry: 'healthy' | 'near' | 'expired' = 'healthy';
   const store = {
     getCodexActiveLogin: () => ACCOUNT,
     getAllSnapshots: (accountId: string) => snapshots[accountId] ?? {},
@@ -56,7 +58,7 @@ function autoHarness(nowMs: number, raw = '') {
   const active = {
     store,
     authPath: '/fixture/auth.json',
-    readLive: async () => ({ status: 'ok' as const, doc: document(nowMs, nowMs + 10 * 60_000), sha256: 'fixture', inode: 1 }),
+    readLive: async () => ({ status: 'ok' as const, doc: document(nowMs, nowMs + (expiry === 'expired' ? -1 : expiry === 'near' ? 3 * 60_000 : 10 * 60_000)), sha256: 'fixture', inode: 1 }),
   } as unknown as CodexAutoDeps['active'];
   const deps: CodexAutoDeps = {
     active,
@@ -68,7 +70,20 @@ function autoHarness(nowMs: number, raw = '') {
     reconcileRecovery: async () => undefined,
     runDueWatches: async () => undefined,
   };
-  return { deps, polls, configs, setExpired: () => { active.readLive = async () => ({ status: 'ok', doc: document(nowMs, nowMs - 1), sha256: 'fixture', inode: 1 }); }, setNearExpiry: () => { active.readLive = async () => ({ status: 'ok', doc: document(nowMs, nowMs + 3 * 60_000), sha256: 'fixture', inode: 1 }); }, setRenewer: () => { deps.activeRenewers = async () => [{ pid: 1 }]; }, setHeldRefresh: () => { deps.refreshActive = async () => ({ status: 'held', pids: [1], document: document(nowMs, nowMs + 10 * 60_000), action: 'noop' }); }, probes: () => probes };
+  return {
+    deps, polls, configs,
+    setNow: (next: number) => { nowMs = next; },
+    setExpired: () => { expiry = 'expired'; },
+    setNearExpiry: () => { expiry = 'near'; },
+    setHealthy: () => { expiry = 'healthy'; },
+    setRenewer: () => { deps.activeRenewers = async () => [{ pid: 1 }]; },
+    setHeldRefresh: (fresh = true) => { deps.refreshActive = async () => ({ status: 'held', pids: [1], document: document(nowMs, nowMs + 10 * 60_000), action: 'noop', ...(fresh ? { fresh: true as const } : {}) }); },
+    setUnauthorizedHeldRefresh: (fresh = true) => {
+      deps.probeUsage = async () => { probes += 1; return { status: 401, source: 'unknown', keys: [] }; };
+      deps.refreshActive = async () => ({ status: 'held', pids: [1], document: document(nowMs, nowMs + 10 * 60_000), action: 'noop', ...(fresh ? { fresh: true as const } : {}) });
+    },
+    probes: () => probes,
+  };
 }
 
 async function runR1(item: R1Case) {
@@ -85,17 +100,17 @@ async function runR1(item: R1Case) {
 async function runR4(item: R4Case) {
   const h = autoHarness(item.input.steps[0]!.now * 1_000);
   h.polls[ACCOUNT] = { pollIntervalS: item.input.interval, heldUntil: item.input.initialHeldUntil };
-  h.setNearExpiry();
-  h.setHeldRefresh();
   for (const step of item.input.steps) {
-    h.deps.now = () => step.now * 1_000;
-    if (step.held) await pollOpenAiCodex(h.deps);
-    else {
-      h.deps.refreshActive = async () => ({ status: 'noop', document: document(step.now * 1_000, step.now * 1_000 + 10 * 60_000) });
-      await pollOpenAiCodex(h.deps);
-      h.setHeldRefresh();
+    h.setNow(step.now * 1_000);
+    if (step.via401) {
+      h.setHealthy();
+      h.setUnauthorizedHeldRefresh(step.fresh);
+    } else {
       h.setNearExpiry();
+      if (step.held) h.setHeldRefresh(step.fresh);
+      else h.deps.refreshActive = async () => ({ status: 'noop', document: document(step.now * 1_000, step.now * 1_000 + 10 * 60_000) });
     }
+    await pollOpenAiCodex(h.deps);
   }
   return { heldUntil: h.polls[ACCOUNT]?.heldUntil ?? null };
 }
@@ -147,7 +162,7 @@ async function runR3(item: R3Case) {
 
 test('Lean Codex poll model agrees with production seams', async () => {
   const counts: Record<string, number> = { r1: 0, r2: 0, r3: 0, r4: 0 };
-  const coverage = { heldLeaseFloor: 0, heldLeaseInterval: 0, firstFailure: 0, cappedBackoff: 0, codexWonNewRow: 0, foreignAccountHold: 0, multiTickStaleHold: 0, multiTickExpiry: 0 };
+  const coverage = { heldLeaseFloor: 0, heldLeaseInterval: 0, firstFailure: 0, cappedBackoff: 0, codexWonNewRow: 0, foreignAccountHold: 0, freshPreExpiry: 0, freshAtDeadline: 0, nonfreshHeld: 0, clearThenRenew401: 0, casReplaceExpired: 0 };
   const mismatches: Array<{ item: Case; actual: unknown }> = [];
   for (const item of cases) {
     counts[item.rule] += 1;
@@ -162,13 +177,16 @@ test('Lean Codex poll model agrees with production seams', async () => {
     }
     if (item.rule === 'r3' && item.input.raw.includes('other-user:other-account')) coverage.foreignAccountHold += 1;
     if (item.rule === 'r4') {
-      if (item.input.steps.some((step) => step.held && item.input.initialHeldUntil !== null && step.now < item.input.initialHeldUntil)) coverage.multiTickStaleHold += 1;
-      if (item.input.steps.some((step) => step.now === item.input.initialHeldUntil)) coverage.multiTickExpiry += 1;
+      if (item.input.steps.some((step) => step.held && step.fresh && !step.via401 && item.input.initialHeldUntil !== null && step.now < item.input.initialHeldUntil)) coverage.freshPreExpiry += 1;
+      if (item.input.steps.some((step) => step.held && step.fresh && !step.via401 && step.now === item.input.initialHeldUntil)) coverage.freshAtDeadline += 1;
+      if (item.input.steps.some((step) => step.held && !step.fresh)) coverage.nonfreshHeld += 1;
+      if (item.input.steps.some((step) => step.held && step.fresh && step.via401)) coverage.clearThenRenew401 += 1;
+      if (item.input.steps.some((step) => step.held && step.fresh && !step.via401 && step.now === item.input.initialHeldUntil)) coverage.casReplaceExpired += 1;
     }
     const actual = item.rule === 'r1' ? await runR1(item) : item.rule === 'r2' ? runR2(item) : item.rule === 'r3' ? await runR3(item) : await runR4(item);
     if (JSON.stringify(actual) !== JSON.stringify(item.expected)) mismatches.push({ item, actual });
   }
   console.log(`codex-poll Lean differential: r1=${counts.r1} r2=${counts.r2} r3=${counts.r3} r4=${counts.r4} mismatches=${mismatches.length} coverage=${JSON.stringify(coverage)}`);
-  assert.deepEqual(coverage, { heldLeaseFloor: 40, heldLeaseInterval: 40, firstFailure: 1, cappedBackoff: 190, codexWonNewRow: 1, foreignAccountHold: 85, multiTickStaleHold: 80, multiTickExpiry: 80 });
+  assert.deepEqual(coverage, { heldLeaseFloor: 40, heldLeaseInterval: 40, firstFailure: 1, cappedBackoff: 190, codexWonNewRow: 1, foreignAccountHold: 85, freshPreExpiry: 16, freshAtDeadline: 16, nonfreshHeld: 32, clearThenRenew401: 16, casReplaceExpired: 16 });
   assert.deepEqual(mismatches.slice(0, 5), [], JSON.stringify(mismatches.slice(0, 5), null, 2));
 });

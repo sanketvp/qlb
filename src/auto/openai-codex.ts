@@ -180,22 +180,32 @@ export async function pollOpenAiCodex(deps: CodexAutoDeps): Promise<CodexAutoPol
     if (!(await stillOwns())) return false;
     return store.compareAndSetUsagePollHeldUntil(PROVIDER, accountId, expectedHeldUntilS, heldUntilS);
   };
-  const expiredLeaseAtTick = polls[accountId]?.heldUntil ?? null;
+  // This expected value follows this tick's successful CAS writes.  A 401 can
+  // clear an expired lease before its refresh observes a fresh renewer, so a
+  // later renewal must compare against NULL rather than the tick-start lease.
+  let leaseExpected = polls[accountId]?.heldUntil ?? null;
   const clearExpiredLease = async (): Promise<boolean> => {
-    if (expiredLeaseAtTick === null || nowS < expiredLeaseAtTick) return true;
-    return compareAndSetRenewerLease(expiredLeaseAtTick, null);
+    if (leaseExpected === null || nowS < leaseExpected) return true;
+    if (!(await compareAndSetRenewerLease(leaseExpected, null))) return false;
+    leaseExpected = null;
+    return true;
   };
   const stopped = async (refresh: CodexActiveOutcome): Promise<CodexAutoPollResult | undefined> => {
     const receipt = refreshReceipt(refresh);
     if (refresh.status === 'held') {
-      // A holder receipt observed before this lease expires is not new evidence.
-      // It must not prolong the existing deadline; only a post-expiry signal can
-      // replace the exact lease this tick read.
-      if (expiredLeaseAtTick !== null && nowS <= expiredLeaseAtTick) {
+      // Only a process scan made by this refresh can renew a lease.  A held
+      // result carried from consume-time holders is not fresh evidence.
+      if (refresh.fresh !== true) {
         if (!(await clearExpiredLease())) return base(false, null, refresh);
-      } else {
-        const interval = polls[accountId]?.pollIntervalS ?? 60;
-        if (!(await compareAndSetRenewerLease(expiredLeaseAtTick, nowS + Math.max(60, interval)))) return base(false, null, refresh);
+        logRefreshStop(deps, refresh);
+        return { ...base(), refresh: receipt };
+      }
+      const interval = polls[accountId]?.pollIntervalS ?? 60;
+      const heldUntil = Math.max(leaseExpected ?? 0, nowS + Math.max(60, interval));
+      // A later lease already protects this account; never shorten or replace it.
+      if (heldUntil !== leaseExpected) {
+        if (!(await compareAndSetRenewerLease(leaseExpected, heldUntil))) return base(false, null, refresh);
+        leaseExpected = heldUntil;
       }
       logRefreshStop(deps, refresh);
       return { ...base(), refresh: receipt };

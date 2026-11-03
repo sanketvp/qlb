@@ -34,16 +34,30 @@ def tickGate (now : Nat) (state : PollState) : TickResult :=
 def leaseForHeld (now interval : Nat) : Nat := now + max 60 interval
 
 /--
-A holder receipt may replace a lease only after the prior deadline. Receipts at
-or before that deadline are stale, and an expiry tick clears the old lease.
+A fresh holder receipt extends the lease from the current observation, without
+shortening a later lease. A held result without a scan receipt cannot renew;
+it merely lets the existing lease expire at its deadline.
 -/
-def heldLeaseStep (now interval : Nat) (heldUntil : Option Nat) (held : Bool) : Option Nat :=
-  match heldUntil with
-  | none => if held then some (leaseForHeld now interval) else none
-  | some previous =>
-    if previous < now then if held then some (leaseForHeld now interval) else none
-    else if previous = now then none
-    else some previous
+def heldLeaseStep (now interval : Nat) (heldUntil : Option Nat) (held fresh : Bool) : Option Nat :=
+  if held && fresh then
+    some (max (heldUntil.getD 0) (leaseForHeld now interval))
+  else
+    match heldUntil with
+    | none => none
+    | some previous => if previous ≤ now then none else some previous
+
+/--
+Models a tick which may clear an expired lease before a 401-triggered refresh.
+The cleared value is threaded to heldLeaseStep, so a fresh receipt renews from
+NULL rather than the stale tick-start value.
+-/
+def tickLeaseStep (now interval : Nat) (heldUntil : Option Nat) (held fresh clearBeforeRefresh : Bool) : Option Nat :=
+  let afterClear := if clearBeforeRefresh then
+    match heldUntil with
+    | some previous => if previous ≤ now then none else some previous
+    | none => none
+  else heldUntil
+  heldLeaseStep now interval afterClear held fresh
 
 /-- Models the store's compare-and-set clear against a tick-start lease value. -/
 def clearLeaseIfSame (observed : Option Nat) (current : Option Nat) : Option Nat :=
