@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { credentialFingerprint, type JsonObject } from './anthropic-oauth';
 import { readClaudeConfig, readLiveClaudeCredentials, spliceOauthAccount, writeLiveClaudeCredentials } from './cc-credentials';
-import { withClaudeConfigPathLock, withClaudeCredentialLocks, withClaudeSwitchLock } from './cc-locks';
+import { ClaudeCodeLockTimeout, ProperLockfileCompromised, withClaudeConfigPathLock, withClaudeCredentialLocks, withClaudeSwitchLock } from './cc-locks';
 import { claudePaths } from './cc-paths';
 import {
   deleteClaudeSwitchJournal,
@@ -79,7 +79,9 @@ export async function resolveClaudeSwitchJournal(
   const configLock = deps.locks?.configPath ?? withClaudeConfigPathLock;
   const update = deps.journalOps?.update ?? updateClaudeSwitchJournal;
   const remove = deps.journalOps?.remove ?? deleteClaudeSwitchJournal;
-  return switchLock(() => credentialLock({ configDir: paths.configHome, env: deps.env }, async (credentialHeld) => ownerLock(options, async (ownerHeld) => {
+  let resolved: ClaudeJournalResolveResult | undefined;
+  try {
+    return await switchLock(() => credentialLock({ configDir: paths.configHome, env: deps.env }, async (credentialHeld) => ownerLock(options, async (ownerHeld) => {
     const reread = readClaudeSwitchJournal(options);
     if (reread.state !== 'ok') return { outcome: 'refused', reason: reread.state === 'absent' ? 'journal-absent' : 'journal-malformed' };
     const journal = reread.journal;
@@ -115,7 +117,8 @@ export async function resolveClaudeSwitchJournal(
         () => deleteStagedRollback(deps.live.backend, journal.stagedBlobService),
         () => remove(ownerHeld, options),
       );
-      return { outcome: 'resolved', fingerprints: [prefix(outgoing?.fingerprint), prefix(outgoing?.prevFingerprint)].filter((value): value is string => value !== null), cleanup };
+      resolved = { outcome: 'resolved', fingerprints: [prefix(outgoing?.fingerprint), prefix(outgoing?.prevFingerprint)].filter((value): value is string => value !== null), cleanup };
+      return resolved;
     }
 
     if (!journal.credentialsWritten) return { outcome: 'refused', reason: 'credentials-not-written' };
@@ -157,8 +160,15 @@ export async function resolveClaudeSwitchJournal(
       () => deleteStagedRollback(deps.live.backend, journal.stagedBlobService),
       () => remove(ownerHeld, options),
     );
-    return { outcome: 'resolved', fingerprints: [prefix(credentialFingerprint(live))].filter((value): value is string => value !== null), cleanup };
-  })), { home: deps.home, env: deps.env });
+    resolved = { outcome: 'resolved', fingerprints: [prefix(credentialFingerprint(live))].filter((value): value is string => value !== null), cleanup };
+    return resolved;
+    })), { home: deps.home, env: deps.env });
+  } catch (error) {
+    if (resolved !== undefined && (error instanceof ClaudeCodeLockTimeout || error instanceof ProperLockfileCompromised)) {
+      return { ...resolved, cleanup: [...(resolved.cleanup ?? []), ...(resolved.cleanup?.includes('lock-timeout') ? [] : ['lock-timeout'])] };
+    }
+    throw error;
+  }
 }
 
 /**

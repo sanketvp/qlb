@@ -22,7 +22,7 @@ import { reconcileClaudeSwitch, resolveClaudeSwitchJournal } from '../src/journa
 import { switchClaude, type ClaudeSwitchDeps } from '../src/cc-switch';
 import { createSwitchAnthropicCommand } from '../src/commands/switch-anthropic';
 import { createClaudeJournalResolveCommand } from '../src/commands/claude-journal-resolve';
-import { ClaudeCodeLockTimeout } from '../src/cc-locks';
+import { ClaudeCodeLockTimeout, ProperLockfileCompromised } from '../src/cc-locks';
 import type { CommandContext } from '../src/registry';
 
 const NOW = 1_000_000;
@@ -202,6 +202,38 @@ describe('Claude switch journal reconciliation (G10)', () => {
     assert.deepEqual(result.cleanup, ['journal']);
     assert.equal(subject.active(), 'b');
     assert.equal(journalExists(subject), true);
+  });
+
+  it('forward remains resolved when the owner lock is compromised after commit', async () => {
+    const subject = await fixture();
+    await install(subject);
+    await subject.backend.set(subject.paths.keychainService, 'fixture-user', subject.target);
+    subject.deps.journalOps = { update: () => journal(subject), remove: () => {} };
+    subject.deps.locks = {
+      owner: async (_options, callback) => {
+        await callback({} as never);
+        throw new ProperLockfileCompromised(join(subject.root, 'journal.lock'));
+      },
+    };
+
+    const result = await resolveClaudeSwitchJournal(subject.deps, 'forward');
+    assert.equal(result.outcome, 'resolved');
+    assert.deepEqual(result.cleanup, ['lock-timeout']);
+    assert.equal(subject.active(), 'b');
+
+    const stderr: string[] = [];
+    const stdout: string[] = [];
+    const command = createClaudeJournalResolveCommand({
+      openStore: () => ({ close: () => {} }) as never,
+      assertAdmitted: () => ({ ok: true }),
+      makeSwitchDeps: async () => subject.deps,
+      resolve: async () => result,
+    });
+    const ctx = { ...({} as CommandContext), stderr: (line: string) => stderr.push(line), stdout: (line: string) => stdout.push(line), env: subject.env, home: subject.home,
+      config: { dbPath: join(subject.root, 'unused.sqlite') } };
+    assert.equal(await command.execute!(['--forward'], ctx), 0);
+    assert.deepEqual(stderr, ['qlb claude journal resolve: warning: completed with cleanup warnings: lock-timeout']);
+    assert.equal(stdout.length, 1);
   });
 
   it('operator forward preserves a step-8 snapshot if commit fails, so back restores the outgoing config', async () => {
