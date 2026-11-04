@@ -41,7 +41,8 @@ function fixture(): Fixture {
 }
 
 function runCli(args: string[], env: NodeJS.ProcessEnv): CliResult {
-  const result = spawnSync(process.execPath, [cliPath, ...args], {
+  // Node <26 prints an ExperimentalWarning for node:sqlite on stderr; keep stderr assertions exact.
+  const result = spawnSync(process.execPath, ['--disable-warning=ExperimentalWarning', cliPath, ...args], {
     encoding: 'utf8', env, timeout: 60_000,
   });
   return {
