@@ -547,9 +547,12 @@ async function switchClaudeAttempt(deps: ClaudeSwitchDeps, input: SwitchClaudeIn
           if (transactionInput.republish && classified.kind !== 'own-bytes' && classified.kind !== 'own-family' && classified.kind !== 'own-rotated') {
             return refusal(deps, transactionInput, attempt, from, 'republish-live-not-own');
           }
+          const foreignSlot = prepared.slots.find((slot) => slot.accountId === classified.foreignSlotId);
+          // K9-2 kinds: own-bytes, own-family, own-rotated, foreign, foreign-synced, wiped, alien, known-foreign, unresolved.
+          const needsUnclaimedStash = classified.kind === 'foreign' || classified.kind === 'alien' || classified.kind === 'known-foreign' || (classified.kind === 'foreign-synced' && foreignSlot?.credential !== outgoingLive);
           if (classified.kind === 'own-family' || classified.kind === 'own-rotated' || classified.kind === 'unresolved') {
             try { await deps.slots.writeSlot(from, outgoingLive, { cause: 'adopt', by: deps.by, evidence: classified.kind === 'own-rotated' ? 'oracle' : classified.kind === 'unresolved' ? null : 'lineage' }); } catch (error) { return failed(deps, transactionInput, attempt, from, 'outgoing-backup-failed', writeError(error, 'keychain-write-failed'), state, 5, undefined, classified.kind); }
-          } else if (classified.kind === 'foreign' || classified.kind === 'alien' || classified.kind === 'known-foreign' || (classified.kind === 'foreign-synced' && prepared.slots.find((slot) => slot.accountId === classified.foreignSlotId)?.credential !== outgoingLive)) {
+          } else if (needsUnclaimedStash) {
             const stashId = (deps.stashTimestamp ?? (() => defaultStashTimestamp(deps.now())))();
             try {
               await deps.slots.stashUnclaimed(stashId, outgoingLive, undefined, classified.foreignSlotId ?? undefined);
@@ -565,6 +568,8 @@ async function switchClaudeAttempt(deps: ClaudeSwitchDeps, input: SwitchClaudeIn
             }
           } else if (classified.kind === 'own-bytes' || classified.kind === 'foreign-synced') {
             // These outgoing kinds are intentionally retained in place.
+          } else if (classified.kind === 'foreign' || classified.kind === 'alien' || classified.kind === 'known-foreign') {
+            return refusal(deps, transactionInput, attempt, from, `outgoing-unrouted:${classified.kind}`);
           } else {
             const unexpectedKind: never = classified.kind;
             return refusal(deps, transactionInput, attempt, from, `outgoing-unrouted:${unexpectedKind}`);
