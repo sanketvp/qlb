@@ -107,7 +107,7 @@ As with the Pi extension, this **registers** the plugin — it does not install 
 
 ## Status views
 
-`qlb status` (default human view) is a **dashboard**: one block per account with a health glyph, credential-ownership state, and any active override, then indented bucket rows.
+`qlb status` (default human view) is a **dashboard**: one block per account with a health glyph, credential-ownership state, and any active override; QLB-owned Anthropic accounts can also show login-expiry or unavailable-usage details before their indented bucket rows.
 
 | Glyph | Meaning |
 |---|---|
@@ -121,7 +121,7 @@ Ownership is `NATIVE` / `MIRRORED` / `VALIDATED` / `QLB_OWNED` / `RETIRED` from 
 qlb status                 # dashboard (default)
 qlb status --dashboard     # same as default
 qlb status --flat          # original provider | account | bucket table
-qlb status --json          # additive JSON: existing fields kept; adds ownership, override, health, healthGlyph
+qlb status --json          # additive machine-readable status; see docs/CLI.md#qlb-status
 ```
 
 `--json` does not remove or rename fields, so existing parsers of `qlb status --json` keep working.
