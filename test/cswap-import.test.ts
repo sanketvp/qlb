@@ -184,6 +184,28 @@ describe('C-swap import (K10 / AC16)', () => {
     assert.equal(h.repo.getSlot('account-a')?.fingerprint, credentialFingerprint(newer));
   });
 
+  it('refuses recovery when an admitted slot update moved the destination', async () => {
+    const h = fixture();
+    const journalDir = join(h.root, 'journals');
+    const original = credential('account-a', 'refresh-a');
+    await importCswap({ backupDir: h.backup, journalDir, keychain: h.keychain, repository: h.repo, runId: 'base-run' });
+    await assert.rejects(importCswap({
+      backupDir: h.backup, journalDir, keychain: h.keychain, repository: h.repo, replace: true, runId: 'moved-slot',
+      afterPromotionWrite: () => { throw new CswapImportInjectedCrash(); },
+    }), CswapImportInjectedCrash);
+    const moved = credential('account-a', 'refresh-a-moved');
+    h.repo.updateCredentialWithLineage('account-a', credentialFingerprint(original), credentialFingerprint(moved), credentialFingerprint(original), null);
+    await h.keychain.set('qlb:anthropic:account-a', QLB_KEYCHAIN_ACCOUNT, moved);
+    const options = { backupDir: h.backup, journalDir, keychain: h.keychain, repository: h.repo };
+    assert.deepEqual(classifyCswapImportJournals(options).find((journal) => journal.runId === 'moved-slot')?.action, 'unclassifiable');
+    await assert.rejects(recoverUncommittedCswapImport(options, 'moved-slot'), (error: unknown) =>
+      error instanceof CswapImportRefusalError && error.code === 'import-journal-unclassifiable' && error.runId === 'moved-slot');
+    await assert.rejects(reconcileCswapImportJournals(options), (error: unknown) =>
+      error instanceof CswapImportRefusalError && error.code === 'import-journal-unclassifiable' && error.runId === 'moved-slot');
+    assert.equal(await h.keychain.get('qlb:anthropic:account-a', QLB_KEYCHAIN_ACCOUNT), moved);
+    assert.equal(h.repo.getSlot('account-a')?.fingerprint, credentialFingerprint(moved));
+  });
+
   it('prints orphaned journals in text dry-run output', async () => {
     const h = fixture();
     const home = join(h.root, 'home');
@@ -230,6 +252,9 @@ describe('C-swap import (K10 / AC16)', () => {
     assert.deepEqual(output.journals.map(({ runId, action }) => ({ runId, action })), [{ runId: 'preview-run', action: 'purge-staging' }]);
     assert.equal(output.journals[0].sha256, createHash('sha256').update(before).digest('hex'));
     assert.equal(readFileSync(journalPath, 'utf8'), before);
+    stdout.length = 0;
+    assert.equal(await importCswapCommand.execute!(['--reconcile', '--preview'], context), 0);
+    assert.deepEqual(stdout, ['journals=1; preview-run:purge-staging']);
   });
 
   it('refuses an orphaned journal before writing a new staging item', async () => {

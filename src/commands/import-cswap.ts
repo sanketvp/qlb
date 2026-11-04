@@ -41,7 +41,10 @@ function print(ctx: CommandContext, value: unknown, json: boolean): void {
       const suffix = orphaned.length ? `; journals=${output.journals?.length}; orphaned=${orphaned.map((journal) => journal.runId).join(',')}` : '';
       ctx.stdout(`slots=${output.slots.length}; keychainItems=${output.keychainItems}; encFiles=${output.encFiles}${suffix}`);
     }
-    else ctx.stdout(`journals=${output.journals?.length ?? 0}`);
+    else {
+      const journals = output.journals ?? [];
+      ctx.stdout(`journals=${journals.length}${journals.length ? `; ${journals.map((journal) => `${journal.runId}:${journal.action}`).join(',')}` : ''}`);
+    }
   }
 }
 

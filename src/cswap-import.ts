@@ -542,6 +542,29 @@ export function probeCswapImportLock(options: CswapImportOptions): CswapImportLo
   }
 }
 
+function recoveryMatchesSlotState(options: CswapImportOptions, journal: Journal): boolean {
+  try {
+    for (const entry of journal.slots) {
+      if (entry.reached === 'unreached' || entry.restored) continue;
+      const slot = options.repository.getSlot(entry.accountId);
+      if (entry.destinationExisted) {
+        if (!entry.priorDestinationFingerprint || slot?.fingerprint !== entry.priorDestinationFingerprint) return false;
+      } else if (entry.destinationExisted === false) {
+        if (slot) return false;
+      } else return false;
+      if (entry.reached !== 'previous') continue;
+      if (entry.previousDestinationExisted) {
+        if (!entry.priorPreviousFingerprint || slot?.prevFingerprint !== entry.priorPreviousFingerprint) return false;
+      } else if (entry.previousDestinationExisted === false) {
+        if (slot?.prevFingerprint != null) return false;
+      } else return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** Classify every existing journal without reading source credentials or mutating state. */
 export function classifyCswapImportJournals(options: CswapImportOptions): CswapImportJournalStatus[] {
   const journals: Array<{ journal: Journal | null; status: CswapImportJournalStatus }> = readCswapImportJournalFiles(options).map(({ runId, text }) => {
@@ -558,30 +581,14 @@ export function classifyCswapImportJournals(options: CswapImportOptions): CswapI
       // A journal may say `committed` only after the SQLite authority commit.
       // Missing authority is contradictory, not permission to delete backups.
       if (journal.phase === 'committed' && !committed) return { journal, status: { runId, phase: journal.phase, action: 'unclassifiable' as const, sha256 } };
+      if (!committed && !recoveryMatchesSlotState(options, journal)) {
+        return { journal, status: { runId, phase: journal.phase, action: 'unclassifiable' as const, sha256 } };
+      }
       return { journal, status: { runId, phase: journal.phase, action: committed ? 'finish-cleanup' as const : 'recover' as const, sha256 } };
     } catch {
       return { journal: null, status: { runId, phase: 'invalid' as const, action: 'unclassifiable' as const, sha256 } };
     }
   });
-  for (let index = 0; index < journals.length; index += 1) {
-    const current = journals[index];
-    if (current.status.action !== 'recover' || !current.journal) continue;
-    const accounts = new Set(current.journal.slots.map((entry) => entry.accountId));
-    for (const newer of journals) {
-      if (!newer.journal || newer.journal.startedAt < current.journal.startedAt ||
-        (newer.journal.startedAt === current.journal.startedAt && newer.status.runId <= current.status.runId)) continue;
-      if (!newer.journal.slots.some((entry) => accounts.has(entry.accountId))) continue;
-      try {
-        if (options.repository.getImportRun(newer.status.runId)?.committedAt != null) {
-          current.status = { ...current.status, action: 'unclassifiable' };
-          break;
-        }
-      } catch {
-        current.status = { ...current.status, action: 'unclassifiable' };
-        break;
-      }
-    }
-  }
   return journals.map(({ status }) => status);
 }
 
@@ -918,6 +925,9 @@ async function recoverUncommittedCswapImportLocked(options: CswapImportOptions, 
     journal.phase = 'cleaned';
     writeJournal(options, journal);
     return 'cleaned';
+  }
+  if (!recoveryMatchesSlotState(options, journal)) {
+    throw new CswapImportRefusalError('import-journal-unclassifiable', 'C-swap import journal is unclassifiable', undefined, runId);
   }
   if (journal.phase === 'promoting' || journal.phase === 'commit-unknown') {
     for (const entry of [...journal.slots].reverse()) {
