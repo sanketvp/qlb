@@ -18,6 +18,7 @@ import {
   extendWindow,
   isOperational,
   lifecycleCheck,
+  markDrillBegan,
   markDrillDone,
   phase,
   retirementLockPath,
@@ -120,6 +121,16 @@ describe('lifecycle (AC49)', () => {
       assert.equal(started.state, 'cutting-over');
       assert.equal(phase(store).state, 'cutting-over');
       assert.throws(() => beginCutover(store, 2_000), /SQLITE_CONSTRAINT/);
+    } finally { store.close(); }
+  });
+
+  it('phase() exposes drillBeganAt', () => {
+    const store = fixtureStore();
+    try {
+      beginCutover(store, 1);
+      assert.equal(transition(store, 'cutover', 2).ok, true);
+      assert.equal(markDrillBegan(store, 3).ok, true);
+      assert.equal(phase(store).drillBeganAt, 3);
     } finally { store.close(); }
   });
 

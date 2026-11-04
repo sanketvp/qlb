@@ -9,7 +9,7 @@ import type { Store } from './store';
 
 export type LifecycleState = 'pre-cutover' | 'cutting-over' | 'cutover' | 'undoing' | 'rolled-back' | 'retired' | 'aborted';
 export type LifecycleOperation =
-  | 'gate' | 'switch:manual' | 'switch:auto' | 'auto' | 'auto:dry-run' | 'auto:resume'
+  | 'gate' | 'switch:manual' | 'switch:auto' | 'auto' | 'auto:dry-run' | 'auto:resume' | 'auto:drill-begin'
   | 'import-cswap' | 'undo-cswap' | 'undo-cswap:resume' | 'retire-cswap' | 'retire-cswap:resume'
   | 'pi-migrate' | 'pi-rollback' | 'codex-import-active' | 'codex-add' | 'claude-add'
   | 'cutover-begin' | 'cutover-commit' | 'cutover-abort' | 'keychain-authorize-cswap'
@@ -45,6 +45,7 @@ export interface LifecycleRow {
   retiredAt: number | null;
   closedAt: number | null;
   releaseSha: string | null;
+  drillBeganAt: number | null;
   drillDoneAt: number | null;
   note: string | null;
   preFenceState: LifecycleState | null;
@@ -69,7 +70,7 @@ export const PHASE_RULES: Record<LifecycleState, Set<LifecycleOperation>> = {
     'cutover-abort', 'keychain-authorize-cswap', 'keychain-check-launchd-live',
   ),
   cutover: rules(
-    'doctor', 'status', 'switch:manual', 'switch:auto', 'auto', 'auto:dry-run', 'auto:resume', 'gate',
+    'doctor', 'status', 'switch:manual', 'switch:auto', 'auto', 'auto:dry-run', 'auto:resume', 'auto:drill-begin', 'gate',
     'codex-import-active', 'codex-add', 'claude-add', 'pi-migrate', 'pi-rollback',
     'verify-l13', 'report-cutover', 'undo-cswap', 'retire-cswap', 'retire-cswap:resume', 'lifecycle-drill-done',
   ),
@@ -105,7 +106,7 @@ function rowFromSql(row: Record<string, unknown>): LifecycleRow {
     extendedAt: numberOrNull(row.extended_at), undoBeganAt: numberOrNull(row.undo_began_at),
     rollbackAt: numberOrNull(row.rollback_at), retiredAt: numberOrNull(row.retired_at),
     closedAt: numberOrNull(row.closed_at), releaseSha: stringOrNull(row.release_sha),
-    drillDoneAt: numberOrNull(row.drill_done_at), note: stringOrNull(row.note),
+    drillBeganAt: numberOrNull(row.drill_began_at), drillDoneAt: numberOrNull(row.drill_done_at), note: stringOrNull(row.note),
     preFenceState: stringOrNull(row.pre_fence_state) as LifecycleState | null,
   };
 }
@@ -124,7 +125,7 @@ export function phaseForConnection(db: DatabaseSync): LifecycleRow {
   return row ? rowFromSql(row) : {
     id: 0, state: 'pre-cutover', beganAt: 0, cutoverAt: null, windowEnd: null, extendedAt: null,
     undoBeganAt: null, rollbackAt: null, retiredAt: null, closedAt: null, releaseSha: null,
-    drillDoneAt: null, note: null, preFenceState: null,
+    drillBeganAt: null, drillDoneAt: null, note: null, preFenceState: null,
   };
 }
 
@@ -516,6 +517,23 @@ export function extendWindow(store: Store, now: number = Date.now()): LifecycleR
     db.prepare('UPDATE lifecycle SET window_end = ?, extended_at = ? WHERE id = ?')
       .run((current.cutoverAt ?? now) + 14 * DAY_MS, now, current.id);
     return { ok: true, row: phase(store) };
+  });
+}
+
+/** Record a new fire-drill window after the auto agent is fully stopped. */
+export function markDrillBegan(store: Store, now: number = Date.now()): LifecycleResult {
+  return store.runImmediate(() => {
+    const db = (store as unknown as { db: DatabaseSync }).db;
+    const admission = assertAdmittedInConnection(db, 'auto:drill-begin');
+    if (!admission.ok) return admission;
+    const current = admission.row!;
+    if (current.drillBeganAt != null && current.drillDoneAt == null) {
+      return { ok: false, code: 'drill-already-begun', row: current };
+    }
+    const changed = db.prepare('UPDATE lifecycle SET drill_began_at = ?, drill_done_at = NULL WHERE id = ? AND state = ?')
+      .run(now, current.id, current.state).changes;
+    if (changed !== 1) return { ok: false, code: 'drill-state-lost', row: phaseForConnection(db) };
+    return { ok: true, row: phaseForConnection(db) };
   });
 }
 

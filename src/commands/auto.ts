@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import { chmodSync, closeSync, constants, fchmodSync, lstatSync, mkdirSync, openSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
@@ -5,7 +6,7 @@ import { AutoAdmissionRefused, runAuto, type AutoDependencies, type AutoRunResul
 
 import { productionTryAcquireLock, type CswapLockRelease } from '../cswap-agent';
 import { atomicWriteText } from '../fsutil';
-import { assertAdmitted } from '../lifecycle';
+import { assertAdmitted, markDrillBegan } from '../lifecycle';
 import type { CommandContext, CommandDefinition } from '../registry';
 import { openStore } from '../store';
 
@@ -14,6 +15,10 @@ type AutoCommandOptions = RunAutoOptions & { json: boolean };
 export interface AutoCommandDeps {
   runAuto: (options: RunAutoOptions, dependencies: AutoDependencies) => Promise<AutoRunResult>;
   acquireFlock(lockPath: string): Promise<CswapLockRelease | null>;
+  /** Platform seam for drill-begin; absent in test mode so tests cannot boot the real agent. */
+  exec?: (file: string, args: string[], options: { stdio: ['ignore', 'pipe', 'ignore']; timeout: number }) => void;
+  now?: () => number;
+  sleep?: (ms: number) => Promise<void>;
 }
 
 const defaultDeps: AutoCommandDeps = { runAuto, acquireFlock: productionTryAcquireLock };
@@ -162,6 +167,98 @@ function receipt(result: AutoRunResult, json: boolean): string {
     : `ticks=${result.ticks} decisions=${JSON.stringify(result.decisions)} executed=${JSON.stringify(result.executed)}`;
 }
 
+type BootoutResult = { ok: true } | { ok: false; code: string };
+
+function bootoutAutoAgent(ctx: CommandContext, deps: AutoCommandDeps): BootoutResult {
+  const exec = deps.exec ?? (ctx.env.QLB_TEST_MODE === '1' ? undefined : execFileSync);
+  if (!exec) return { ok: false, code: 'exec-seam-required' };
+  try {
+    const uid = process.getuid?.() ?? 0;
+    exec('/bin/launchctl', ['bootout', `gui/${uid}/com.modus.qlb-auto`], {
+      stdio: ['ignore', 'pipe', 'ignore'], timeout: 5_000,
+    });
+    return { ok: true };
+  } catch (error) {
+    const record = error as { code?: unknown; status?: unknown } | undefined;
+    const code = typeof record?.code === 'string' ? record.code : 'bootout-failed';
+    // launchctl reports a missing job as status 3; some exec seams surface it
+    // as ESRCH or ENOENT instead. All mean the agent is already out.
+    if (code === 'ESRCH' || code === 'ENOENT' || record?.status === 3) return { ok: true };
+    if (code === 'ETIMEDOUT') return { ok: false, code: 'bootout-timeout' };
+    return { ok: false, code };
+  }
+}
+
+async function autoLockIsFree(lockPath: string, deps: AutoCommandDeps): Promise<boolean> {
+  const now = deps.now ?? Date.now;
+  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const deadline = now() + 60_000;
+  for (;;) {
+    try {
+      const lease = await deps.acquireFlock(lockPath);
+      if (lease !== null) {
+        await lease();
+        return true;
+      }
+    } catch {
+      // A failed probe is indeterminate, so fail closed as if the lock were held.
+    }
+    const remaining = deadline - now();
+    if (remaining <= 0) return false;
+    await sleep(Math.min(1_000, remaining));
+  }
+}
+
+async function drillBegin(ctx: CommandContext, args: string[], deps: AutoCommandDeps): Promise<number> {
+  if (args.length > 1 || (args.length === 1 && args[0] !== '--json')) {
+    ctx.stderr('usage: qlb auto drill-begin [--json]');
+    return 2;
+  }
+  // This must precede even opening the store: test-mode command paths must
+  // never accidentally reach a real platform process.
+  if (ctx.env.QLB_TEST_MODE === '1' && !deps.exec) {
+    ctx.stderr('qlb auto drill-begin: refused: exec-seam-required');
+    return 3;
+  }
+
+  const store = openStore(ctx.config.dbPath);
+  try {
+    const admission = assertAdmitted(store, 'auto:drill-begin');
+    if (!admission.ok) {
+      ctx.stderr(`qlb auto drill-begin: refused: ${admission.code}`);
+      return 3;
+    }
+    if (admission.row!.drillBeganAt != null && admission.row!.drillDoneAt == null) {
+      ctx.stderr('qlb auto drill-begin: refused: drill-already-begun');
+      return 3;
+    }
+
+    const bootout = bootoutAutoAgent(ctx, deps);
+    if (!bootout.ok) {
+      ctx.stderr(`qlb auto drill-begin: refused: ${bootout.code}`);
+      return 3;
+    }
+
+    const lockPath = join(ctx.home, '.qlb', 'locks', 'auto.lock');
+    mkdirSync(dirname(lockPath), { recursive: true, mode: 0o700 });
+    if (!await autoLockIsFree(lockPath, deps)) {
+      ctx.stderr('qlb auto drill-begin: refused: auto-lock-still-held');
+      return 3;
+    }
+
+    const result = markDrillBegan(store, (deps.now ?? Date.now)());
+    if (!result.ok) {
+      ctx.stderr(`qlb auto drill-begin: refused: ${result.code}`);
+      return 3;
+    }
+    if (args[0] === '--json') ctx.stdout(JSON.stringify(result.row));
+    else ctx.stdout('auto drill began');
+    return 0;
+  } finally {
+    store.close();
+  }
+}
+
 /** `qlb auto [--once] [--dry-run] [--json]` runs the loop; `install-agent` installs its LaunchAgent. */
 export async function runAutoCommand(
   args: string[],
@@ -169,6 +266,7 @@ export async function runAutoCommand(
   deps: AutoCommandDeps = defaultDeps,
 ): Promise<number> {
   if (args[0] === 'resume') return resumeAnthropic(ctx, args.slice(1));
+  if (args[0] === 'drill-begin') return drillBegin(ctx, args.slice(1), deps);
 
   if (args[0] === 'install-agent') {
     if (args.length !== 1) {
@@ -192,7 +290,7 @@ export async function runAutoCommand(
 
   const options = parse(args);
   if (!options) {
-    ctx.stderr('usage: qlb auto [--once] [--dry-run] [--json] | qlb auto install-agent | qlb auto resume anthropic [--json]');
+    ctx.stderr('usage: qlb auto [--once] [--dry-run] [--json] | qlb auto install-agent | qlb auto resume anthropic [--json] | qlb auto drill-begin [--json]');
     return 2;
   }
 

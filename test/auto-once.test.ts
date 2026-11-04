@@ -16,7 +16,7 @@ import { MockKeychain } from '../src/keychain';
 import { reconcileClaudeSwitch } from '../src/journal';
 import { runExecutingCommand } from '../src/app';
 import type { CommandContext } from '../src/registry';
-import { beginCutover, transition } from '../src/lifecycle';
+import { beginCutover, markDrillDone, phase, transition } from '../src/lifecycle';
 import { openStore } from '../src/store';
 
 const CLI = join(__dirname, '..', 'src', 'cli.js');
@@ -114,6 +114,144 @@ describe('qlb auto --once (G12)', () => {
     } finally {
       close(root);
     }
+  });
+
+  it('drill-begin issues the exact /bin/launchctl bootout argv with a 5 s timeout, waits for auto.lock and records drill_began_at', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-auto-drill-begin-'));
+    const home = join(root, 'home');
+    const config = defaultConfig(home);
+    const store = openStore(config.dbPath);
+    beginCutover(store, 1);
+    assert.equal(transition(store, 'cutover', 2).ok, true);
+    store.close();
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const ctx: CommandContext = {
+      stdout: (line) => stdout.push(line), stderr: (line) => stderr.push(line), env: testEnv(home), config,
+      loadConfig: () => config, home, registerSecret: () => undefined, deliverSecret: () => undefined, knownSecrets: () => [],
+    };
+    const execCalls: Array<{ file: string; args: string[]; options: unknown }> = [];
+    let probes = 0;
+    let now = 10;
+    try {
+      assert.equal(await runAutoCommand(['drill-begin'], ctx, {
+        runAuto: async () => { throw new Error('not used'); },
+        exec: (file, args, options) => { execCalls.push({ file, args, options }); },
+        acquireFlock: async () => {
+          probes += 1;
+          return probes === 1 ? null : Object.assign(async () => undefined, {});
+        },
+        now: () => now,
+        sleep: async () => { now += 1_000; },
+      }), 0);
+      assert.deepEqual(execCalls, [{
+        file: '/bin/launchctl', args: ['bootout', `gui/${process.getuid?.() ?? 0}/com.modus.qlb-auto`],
+        options: { stdio: ['ignore', 'pipe', 'ignore'], timeout: 5_000 },
+      }]);
+      assert.equal(probes, 2);
+      assert.deepEqual(stdout, ['auto drill began']);
+      assert.deepEqual(stderr, []);
+      const reopened = openStore(config.dbPath);
+      try { assert.equal(phase(reopened).drillBeganAt, 1_010); } finally { reopened.close(); }
+    } finally { close(root); }
+  });
+
+  it('drill-begin refuses when the lock stays held and writes nothing', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-auto-drill-held-'));
+    const home = join(root, 'home');
+    const config = defaultConfig(home);
+    const store = openStore(config.dbPath);
+    beginCutover(store, 1);
+    assert.equal(transition(store, 'cutover', 2).ok, true);
+    store.close();
+    const stderr: string[] = [];
+    const ctx: CommandContext = {
+      stdout: () => undefined, stderr: (line) => stderr.push(line), env: testEnv(home), config,
+      loadConfig: () => config, home, registerSecret: () => undefined, deliverSecret: () => undefined, knownSecrets: () => [],
+    };
+    let now = 0;
+    try {
+      assert.equal(await runAutoCommand(['drill-begin'], ctx, {
+        runAuto: async () => { throw new Error('not used'); }, exec: () => undefined,
+        acquireFlock: async () => null, now: () => now, sleep: async () => { now += 1_000; },
+      }), 3);
+      assert.deepEqual(stderr, ['qlb auto drill-begin: refused: auto-lock-still-held']);
+      const reopened = openStore(config.dbPath);
+      try {
+        assert.equal(phase(reopened).drillBeganAt, null);
+        assert.equal(phase(reopened).drillDoneAt, null);
+      } finally { reopened.close(); }
+    } finally { close(root); }
+  });
+
+  it('drill-begin treats a throwing auto.lock probe as held and refuses at the deadline with nothing written', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-auto-drill-probe-throw-'));
+    const home = join(root, 'home');
+    const config = defaultConfig(home);
+    const store = openStore(config.dbPath);
+    beginCutover(store, 1);
+    assert.equal(transition(store, 'cutover', 2).ok, true);
+    store.close();
+    const stderr: string[] = [];
+    const ctx: CommandContext = {
+      stdout: () => undefined, stderr: (line) => stderr.push(line), env: testEnv(home), config,
+      loadConfig: () => config, home, registerSecret: () => undefined, deliverSecret: () => undefined, knownSecrets: () => [],
+    };
+    let now = 0;
+    try {
+      assert.equal(await runAutoCommand(['drill-begin'], ctx, {
+        runAuto: async () => { throw new Error('not used'); }, exec: () => undefined,
+        acquireFlock: async () => { throw new Error('probe failed'); }, now: () => now, sleep: async () => { now += 1_000; },
+      }), 3);
+      assert.deepEqual(stderr, ['qlb auto drill-begin: refused: auto-lock-still-held']);
+      const reopened = openStore(config.dbPath);
+      try { assert.equal(phase(reopened).drillBeganAt, null); } finally { reopened.close(); }
+    } finally { close(root); }
+  });
+
+  it('drill-begin after a completed drill clears drill_done_at in the same transaction', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-auto-drill-repeat-'));
+    const home = join(root, 'home');
+    const config = defaultConfig(home);
+    const store = openStore(config.dbPath);
+    beginCutover(store, 1);
+    assert.equal(transition(store, 'cutover', 2).ok, true);
+    assert.equal(markDrillDone(store, 3).ok, true);
+    store.close();
+    const ctx: CommandContext = {
+      stdout: () => undefined, stderr: () => undefined, env: testEnv(home), config,
+      loadConfig: () => config, home, registerSecret: () => undefined, deliverSecret: () => undefined, knownSecrets: () => [],
+    };
+    try {
+      assert.equal(await runAutoCommand(['drill-begin'], ctx, {
+        runAuto: async () => { throw new Error('not used'); }, exec: () => undefined,
+        acquireFlock: async () => Object.assign(async () => undefined, {}), now: () => 4,
+      }), 0);
+      const reopened = openStore(config.dbPath);
+      try {
+        assert.equal(phase(reopened).drillBeganAt, 4);
+        assert.equal(phase(reopened).drillDoneAt, null);
+      } finally { reopened.close(); }
+    } finally { close(root); }
+  });
+
+  it('drill-begin in test mode without an exec seam never reaches launchctl', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-auto-drill-no-exec-'));
+    const home = join(root, 'home');
+    const config = defaultConfig(home);
+    const stderr: string[] = [];
+    const ctx: CommandContext = {
+      stdout: () => undefined, stderr: (line) => stderr.push(line), env: testEnv(home), config,
+      loadConfig: () => config, home, registerSecret: () => undefined, deliverSecret: () => undefined, knownSecrets: () => [],
+    };
+    let probes = 0;
+    try {
+      assert.equal(await runAutoCommand(['drill-begin'], ctx, {
+        runAuto: async () => { throw new Error('not used'); }, acquireFlock: async () => { probes += 1; return null; },
+      }), 3);
+      assert.deepEqual(stderr, ['qlb auto drill-begin: refused: exec-seam-required']);
+      assert.equal(probes, 0);
+    } finally { close(root); }
   });
 
   it('auto resume anthropic clears suspendedUntil and writes lastResumeAt', async () => {
