@@ -1,12 +1,13 @@
 // C-swap hand-back planning and execution. Credential bytes stay inside injected
 // readers/writers; plans and results expose only non-secret identities.
 
-import { readdirSync } from 'node:fs';
+import { existsSync, readdirSync } from 'node:fs';
 import { basename, join } from 'node:path';
 
 import { credentialFingerprint } from './anthropic-oauth';
 import type { ClaudeSlotBackend } from './cc-slots';
 import { isCredentialNotFound } from './credential-backends';
+import { openStoreConnection, readOnlySchemaRefusal } from './store';
 
 const FINGERPRINT_PREFIX_LENGTH = 'sha256:'.length + 12;
 
@@ -45,6 +46,33 @@ export interface PlanHandBackDependencies {
   /** Fresh QLB slot read. Its lineage, not the SQLite cache, is authoritative. */
   readSlotCredential?: (accountId: string) => Promise<string>;
   listCredentials?: (path: string) => string[];
+}
+
+/** Fresh readonly lifecycle state shared by undo admission and doctor checks. */
+export function readPlanState(dbPath: string, missingIsEmpty = false): Pick<PlanHandBackDependencies, 'slots' | 'activeAccountId' | 'migratedPiProviders'> {
+  if (missingIsEmpty && !existsSync(dbPath)) {
+    return { slots: () => [], activeAccountId: () => null, migratedPiProviders: () => [] };
+  }
+  const read = <T>(fn: (db: ReturnType<typeof openStoreConnection>) => T): T => {
+    const db = openStoreConnection(dbPath, true);
+    try {
+      const schemaRefusal = readOnlySchemaRefusal(db);
+      if (schemaRefusal) throw new Error(schemaRefusal);
+      return fn(db);
+    } finally { db.close(); }
+  };
+  return {
+    slots: () => read((db) => db.prepare(`SELECT account_id AS accountId, slot_num AS slotNum, email, fingerprint, source, dead
+      FROM claude_slots WHERE archived_at IS NULL ORDER BY slot_num, account_id`).all() as unknown as ReturnType<PlanHandBackDependencies['slots']>),
+    activeAccountId: () => read((db) => {
+      const active = db.prepare("SELECT account_id AS accountId FROM active_login WHERE provider = 'anthropic'").get() as { accountId: string | null } | undefined;
+      return active?.accountId ?? null;
+    }),
+    migratedPiProviders: () => read((db) => {
+      const migrated = db.prepare("SELECT key FROM config WHERE key LIKE 'pi.%.state' AND value = 'migrated' ORDER BY key").all() as Array<{ key: string }>;
+      return migrated.map(({ key }) => key.slice('pi.'.length, -'.state'.length));
+    }),
+  };
 }
 
 export interface CswapUndoRefusalSlot {

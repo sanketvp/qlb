@@ -73,6 +73,7 @@ import { claudeSwitchJournalCheck } from './checks/claude-switch-journal';
 import { codexSlotsCheck } from './checks/codex-slots';
 import { codexFirstSwitchCheck } from './checks/codex-first-switch';
 import { undoIncompleteCheck } from './checks/undo-incomplete';
+import { undoLineageMatchCheck } from './checks/undo-lineage-match';
 import { guardCheck } from './checks/_check';
 import { lifecyclePhase, lifecyclePhaseCheck, type LifecyclePhaseResult } from './checks/lifecycle-phase';
 import { relogin7dCheck } from './checks/relogin-7d';
@@ -854,6 +855,7 @@ export async function doctorQlb(
     codexSlotsCheck(config.dbPath, phase),
     codexFirstSwitchCheck(config.dbPath, lifecycle, options.now?.() ?? Date.now()),
     undoIncompleteCheck(config.dbPath, lifecycle),
+    await undoLineageMatchCheck(config.dbPath, lifecycle, options.keychain ?? platformKeychain, dirname(config.cswapSequencePath)),
     lifecyclePhaseCheck(lifecycle),
     relogin7dCheck(config.dbPath, phase),
   );
