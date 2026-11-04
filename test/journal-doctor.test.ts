@@ -68,6 +68,22 @@ describe('journal doctor rows (HP-K14-3)', () => {
     }
   });
 
+  it('does not report a database-committed Claude switch journal as in progress', async () => {
+    const h = fixture();
+    const store = openStore(h.dbPath);
+    try {
+      store.recordSwitch({ provider: 'anthropic', toAccount: 'after', trigger: 'manual', outcome: 'ok', stepsJson: JSON.stringify({ attempt: 'fixture-attempt' }), committedAt: 1 });
+    } finally {
+      store.close();
+    }
+    createClaudeSwitchJournal(switchJournal(h.switchOptions), h.switchOptions);
+    await withClaudeSwitchJournalOwner(h.switchOptions, async () => {
+      assert.deepEqual(await journalInProgressCheck(h.dbPath, 'cutover', { journal: h.switchOptions, journalDir: h.journalDir }), {
+        name: 'journal:in-progress', level: 'PASS', message: 'no journal in progress',
+      });
+    });
+  });
+
   it('reports a fresh C-swap import lock and its journal phases as in progress', async () => {
     const h = fixture(); writeImportJournal(h.journalDir, 'fresh-import', 'staged'); mkdirSync(join(h.journalDir, 'cswap-import.lock'));
     assert.deepEqual(await journalInProgressCheck(h.dbPath, 'cutting-over', { journalDir: h.journalDir }), {

@@ -9,6 +9,7 @@ import { qlbHomeDir } from '../home';
 import { platformKeychain } from '../keychain';
 import { openStoreConnection } from '../store';
 import { check } from './_check';
+import { isClaudeSwitchJournalCommitted } from './claude-switch-journal';
 import { isLifecycleState, LIFECYCLE_STATES } from './lifecycle-phase';
 import type { HealthCheck } from './claude-slots';
 
@@ -58,7 +59,7 @@ export async function journalInProgressCheck(dbPath: string, phase: string, opti
   let switchHeld = false;
   try {
     const switchRead = readClaudeSwitchJournal(journal);
-    switchHeld = switchRead.state === 'ok' && switchRead.journal.committed === undefined && switchRead.journal.closed === null && (
+    switchHeld = switchRead.state === 'ok' && switchRead.journal.committed === undefined && switchRead.journal.closed === null && !isClaudeSwitchJournalCommitted(dbPath, switchRead.journal.attemptId) && (
       probeClaudeSwitchJournalOwner(journal) === 'held' || await stillTheSameProcess(switchRead.journal.owner)
     );
   } catch {
