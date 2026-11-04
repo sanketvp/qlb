@@ -118,7 +118,8 @@ export interface SwitchClaudeInput {
   probeVerdict?: boolean;
 }
 
-export type ClaudeSwitchPreconditionsResult = { kind: 'go' } | { kind: 'refused'; reason: ClaudeSwitchPreconditionReason };
+export type ClaudeSwitchPreconditionsResult = { kind: 'go'; active: string; outgoingSlot: ClaudeSlot; targetSlot: ClaudeSlot } | { kind: 'refused'; reason: ClaudeSwitchPreconditionReason };
+type ClaudeSwitchPreconditionsGo = Extract<ClaudeSwitchPreconditionsResult, { kind: 'go' }>;
 export interface ClaudeSwitchPhaseA { active: string; outgoingSlot: ClaudeSlot; targetSlot: ClaudeSlot; liveCredential: string; config: JsonObject; prefetch: PrefetchedLiveIdentity; targetCredential: string; preFreshenTargetCredential: string | null; targetFreshened: boolean; slots: ClassifyClaudeSlot[]; }
 export type PrepareClaudeSwitchResult = ClaudeSwitchPhaseA | { kind: 'refused'; reason: ClaudeSwitchPhaseAReason } | { kind: 'failed'; reason: ClaudeSwitchPhaseAReason };
 
@@ -160,8 +161,10 @@ export function checkClaudeCswapProcessPrecondition(
 }
 
 export function checkClaudeSwitchPreconditions(deps: ClaudeSwitchDeps, input: SwitchClaudeInput): ClaudeSwitchPreconditionsResult {
-  const active = activeAccount(deps);
-  if (active === null) return refused('active-login-unset');
+  const active = deps.store.getActiveLogin('anthropic')?.accountId;
+  if (!active) return refused('active-login-unset');
+  const outgoingSlot = deps.slots.getSlot(active);
+  if (outgoingSlot === null) return refused('active-login-unset');
   if (input.republish && input.to !== active) return refused('republish-not-active');
   const target = deps.slots.getSlot(input.to);
   if (target === null) return refused('target-missing');
@@ -173,19 +176,16 @@ export function checkClaudeSwitchPreconditions(deps: ClaudeSwitchDeps, input: Sw
   }
   const cswapProcessReason = checkClaudeCswapProcessPrecondition(deps);
   if (cswapProcessReason !== null) return refused(cswapProcessReason);
-  return { kind: 'go' };
+  return { kind: 'go', active, outgoingSlot, targetSlot: target };
 }
 function warn(deps: ClaudeSwitchDeps, message: string): void { try { deps.warn?.(message); } catch { /* diagnostics are never transaction effects */ } }
 async function readSlotOrNull(deps: ClaudeSwitchDeps, accountId: string): Promise<string | null> { try { return (await deps.slots.readSlot(accountId, { fresh: true })).credential; } catch { return null; } }
 
 /** Build the lock-free, network-permitted Phase-A snapshot. */
-export async function prepareClaudeSwitch(deps: ClaudeSwitchDeps, input: SwitchClaudeInput, prechecked = false): Promise<PrepareClaudeSwitchResult> {
-  if (!prechecked) { const checked = checkClaudeSwitchPreconditions(deps, input); if (checked.kind === 'refused') return checked; }
-  const active = activeAccount(deps);
-  if (active === null) return { kind: 'refused', reason: 'active-login-unset' };
-  const outgoingSlot = deps.slots.getSlot(active); const targetSlot = deps.slots.getSlot(input.to);
-  if (outgoingSlot === null) return { kind: 'refused', reason: 'active-login-unset' };
-  if (targetSlot === null) return { kind: 'refused', reason: 'target-missing' };
+export async function prepareClaudeSwitch(deps: ClaudeSwitchDeps, input: SwitchClaudeInput, prechecked: ClaudeSwitchPreconditionsGo | false = false): Promise<PrepareClaudeSwitchResult> {
+  const checked = prechecked || checkClaudeSwitchPreconditions(deps, input);
+  if (checked.kind === 'refused') return checked;
+  const { active, outgoingSlot, targetSlot } = checked;
   const paths = deps.live.paths ?? claudePaths({ home: deps.live.home ?? deps.home, env: deps.live.env ?? deps.env }); const live = deps.live.paths ? deps.live : { ...deps.live, paths };
   let config: JsonObject; try { config = deps.readConfig(paths.globalConfigPath); } catch { return { kind: 'failed', reason: 'claude:config-file' }; }
   let liveCredential: string; try { liveCredential = await readLiveClaudeCredentials(live); } catch (error) { return isCredentialNotFound(error) ? { kind: 'refused', reason: 'live-credential-empty' } : { kind: 'refused', reason: 'live-credential-unreadable' }; }
@@ -442,7 +442,7 @@ async function switchClaudeAttempt(deps: ClaudeSwitchDeps, input: SwitchClaudeIn
   }
   const checked = checkClaudeSwitchPreconditions(deps, input);
   if (checked.kind === 'refused') return refusal(deps, input, attempt, activeAccount(deps), checked.reason);
-  const prepared = await prepareClaudeSwitch(deps, input, true);
+  const prepared = await prepareClaudeSwitch(deps, input, checked);
   if ('kind' in prepared) {
     if (prepared.kind === 'refused') return refusal(deps, input, attempt, activeAccount(deps), prepared.reason);
     return failed(deps, input, attempt, activeAccount(deps), prepared.reason);
