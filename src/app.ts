@@ -1216,11 +1216,15 @@ function statusConfigTimestamp(store: Store, key: string): string | null {
   return isoStatusTimestampOrNull(Number(raw));
 }
 
-function statusAnthropicLoginExpiry(accountId: string): string | null {
+export type StatusCredentialReader = (accountId: string) => string;
+
+export function statusAnthropicLoginExpiry(
+  accountId: string,
+  readCredential: StatusCredentialReader = (id) =>
+    platformKeychain.getSync(qlbKeychainService('anthropic', id), QLB_KEYCHAIN_ACCOUNT),
+): string | null {
   try {
-    return loginExpiresAtIso(
-      platformKeychain.getSync(qlbKeychainService('anthropic', accountId), QLB_KEYCHAIN_ACCOUNT),
-    );
+    return loginExpiresAtIso(readCredential(accountId));
   } catch {
     return null;
   }

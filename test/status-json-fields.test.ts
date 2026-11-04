@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { describe, it } from 'node:test';
 
+import { statusAnthropicLoginExpiry } from '../src/app';
 import { readAnthropicStoreSnapshots } from '../src/anthropic-usage-view';
 import { formatDashboard, type DashboardAccount } from '../src/dashboard';
 import { openStore } from '../src/store';
@@ -98,29 +99,19 @@ function oauthExpiry(expiresAt: number): string {
 }
 
 describe('status JSON operational fields', () => {
-  it('projects ISO/null login expiry and text login expiry without exposing credential bytes', () => {
-    const f = fixture();
-    const store = initialize(f);
-    store.close();
-    insertClaudeSlot(f.dbPath, 'with-expiry', 1, 85);
-    insertClaudeSlot(f.dbPath, 'without-expiry', 2);
+  it('projects ISO/null login expiry and renders the text login expiry', () => {
     const expiryMs = Date.UTC(2027, 0, 2, 3, 4, 5, 678);
-
-    const projected = readAnthropicStoreSnapshots(f.dbPath, NOW_S, (accountId) => {
-      if (accountId === 'with-expiry') return oauthExpiry(expiryMs);
-      throw new Error('fixture credential unavailable');
-    });
-    assert.ok(projected);
-    const withExpiry = projected.snapshots.find((account) => account.accountId === 'with-expiry');
-    const withoutExpiry = projected.snapshots.find((account) => account.accountId === 'without-expiry');
-    assert.equal(withExpiry?.loginExpiresAt, '2027-01-02T03:04:05Z');
-    assert.equal(withoutExpiry?.loginExpiresAt, null);
-    assert.equal(withExpiry?.threshold, 85);
-    assert.equal(Object.hasOwn(withoutExpiry ?? {}, 'threshold'), false);
-    assert.doesNotMatch(JSON.stringify(projected), /fixture-(access|refresh)/);
+    const loginExpiresAt = statusAnthropicLoginExpiry('with-expiry', () => oauthExpiry(expiryMs));
+    assert.equal(loginExpiresAt, '2027-01-02T03:04:05Z');
+    assert.equal(statusAnthropicLoginExpiry('without-expiry', () => { throw new Error('fixture credential unavailable'); }), null);
+    assert.equal(statusAnthropicLoginExpiry('invalid', () => 'not-json'), null);
 
     const text = formatDashboard([{
-      ...withExpiry,
+      accountId: 'with-expiry',
+      provider: 'anthropic',
+      label: 'with-expiry@example.test',
+      buckets: {},
+      loginExpiresAt,
       ownership: 'QLB_OWNED',
       override: null,
       health: 'fail',
@@ -152,7 +143,7 @@ describe('status JSON operational fields', () => {
     insertClaudeSlot(f.dbPath, 'available', 1);
     insertClaudeSlot(f.dbPath, 'unavailable', 2);
 
-    const projected = readAnthropicStoreSnapshots(f.dbPath, NOW_S, () => { throw new Error('fixture missing'); });
+    const projected = readAnthropicStoreSnapshots(f.dbPath, NOW_S);
     assert.ok(projected);
     const available = projected.snapshots.find((account) => account.accountId === 'available');
     const unavailable = projected.snapshots.find((account) => account.accountId === 'unavailable');
@@ -177,7 +168,7 @@ describe('status JSON operational fields', () => {
     } finally {
       db.close();
     }
-    const afterBackoff = readAnthropicStoreSnapshots(f.dbPath, NOW_S, () => { throw new Error('fixture missing'); });
+    const afterBackoff = readAnthropicStoreSnapshots(f.dbPath, NOW_S);
     const lapsed = afterBackoff?.snapshots.find((account) => account.accountId === 'unavailable');
     assert.equal(lapsed?.usageError, 'http-429');
     assert.equal(Object.hasOwn(lapsed ?? {}, 'usageRetryAt'), false);

@@ -1,7 +1,6 @@
 // Read-only Anthropic usage projection shared by auto, status, and doctor.
 
 import { DatabaseSync } from 'node:sqlite';
-import { loginExpiresAtIso } from './anthropic-oauth';
 import { redactSecrets } from './redact';
 import type { AccountSnapshot, BucketReading, Confidence } from './types';
 import { STALE_OK_S } from './usage-freshness';
@@ -21,11 +20,8 @@ export interface AnthropicUsageSlot {
 }
 
 export interface AnthropicStatusSnapshot extends AccountSnapshot {
-  loginExpiresAt: string | null;
   threshold?: number;
 }
-
-export type AnthropicCredentialReader = (accountId: string) => string;
 
 /** The read-only poll fields required to decide whether a retained reading is usable. */
 export interface AnthropicUsagePollRow {
@@ -135,15 +131,6 @@ function isoSeconds(value: number | null | undefined): string | null {
   }
 }
 
-function loginExpiry(accountId: string, readCredential?: AnthropicCredentialReader): string | null {
-  if (!readCredential) return null;
-  try {
-    return loginExpiresAtIso(readCredential(accountId));
-  } catch {
-    return null;
-  }
-}
-
 function unavailableUsageFields(
   row: AnthropicUsagePollRow | undefined,
   nowS: number,
@@ -166,12 +153,10 @@ function statusSnapshot(
   snapshot: AccountSnapshot,
   row: AnthropicUsagePollRow | undefined,
   nowS: number,
-  readCredential?: AnthropicCredentialReader,
 ): AnthropicStatusSnapshot {
   const usageUnavailable = snapshot.error === 'unavailable';
   return {
     ...snapshot,
-    loginExpiresAt: loginExpiry(slot.accountId, readCredential),
     ...(slot.threshold == null || !Number.isFinite(slot.threshold) ? {} : { threshold: slot.threshold }),
     ...(usageUnavailable ? unavailableUsageFields(row, nowS) : {}),
   };
@@ -189,7 +174,6 @@ export function anthropicStoreSnapshots(
   slots: readonly AnthropicUsageSlot[],
   store: AnthropicUsageStoreReader,
   nowS: number,
-  readCredential?: AnthropicCredentialReader,
 ): AnthropicStoreSnapshots {
   const liveSlots = slots.filter((slot) => slot.archivedAt == null);
   const polls = store.listUsagePolls('anthropic');
@@ -199,7 +183,6 @@ export function anthropicStoreSnapshots(
       hasPolls,
       snapshots: [{
         accountId: 'anthropic', provider: 'anthropic', label: 'Claude (Anthropic)', buckets: {}, error: 'unavailable',
-        loginExpiresAt: null,
       }],
     };
   }
@@ -214,7 +197,6 @@ export function anthropicStoreSnapshots(
           { accountId: slot.accountId, provider: 'anthropic', label, buckets: {}, error: 'token_dead' },
           row,
           nowS,
-          readCredential,
         );
       }
       const buckets = projectAnthropicUsageReadings(
@@ -227,7 +209,6 @@ export function anthropicStoreSnapshots(
           : { accountId: slot.accountId, provider: 'anthropic', label, buckets: {}, error: 'unavailable' },
         row,
         nowS,
-        readCredential,
       );
     }),
   };
@@ -317,14 +298,13 @@ function readOnlyStoreData(dbPath: string): {
 export function readAnthropicStoreSnapshots(
   dbPath: string,
   nowS: number,
-  readCredential?: AnthropicCredentialReader,
 ): AnthropicStoreSnapshots | null {
   const data = readOnlyStoreData(dbPath);
   if (!data) return null;
   return anthropicStoreSnapshots(data.slots, {
     listUsagePolls: () => data.polls,
     getAllSnapshots: (accountId) => data.snapshots.get(accountId) ?? {},
-  }, nowS, readCredential);
+  }, nowS);
 }
 
 /** Reads persisted poll freshness through a SQLite read-only handle. */
