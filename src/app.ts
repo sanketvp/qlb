@@ -14,7 +14,8 @@ import { runCodexProbeClaims } from './commands/codex-probe-claims';
 import { redactError, redactSecrets } from './redact';
 import { reloginsInWindow, type ReloginEvent } from './relogin';
 import { doctorQlb, initializeQlb, listCheckNames, type DoctorReport, type InitReport } from './diagnostics';
-import { platformKeychain } from './keychain';
+import { loginExpiresAtIso } from './anthropic-oauth';
+import { platformKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from './keychain';
 import { createOwnedCredentialSource } from './credentials';
 import {
   CSWAP_ANTHROPIC_STORE,
@@ -1215,6 +1216,16 @@ function statusConfigTimestamp(store: Store, key: string): string | null {
   return isoStatusTimestampOrNull(Number(raw));
 }
 
+function statusAnthropicLoginExpiry(accountId: string): string | null {
+  try {
+    return loginExpiresAtIso(
+      platformKeychain.getSync(qlbKeychainService('anthropic', accountId), QLB_KEYCHAIN_ACCOUNT),
+    );
+  } catch {
+    return null;
+  }
+}
+
 function statusActiveLogins(dbPath: string): Record<string, string | null> {
   const db = openStoreConnection(dbPath, true);
   try {
@@ -1317,8 +1328,8 @@ async function runStatus(opts: StatusOpts): Promise<number> {
     return snaps;
   }));
   const accounts = nested.flat().map((account) =>
-    account.provider === 'anthropic' && !Object.hasOwn(account, 'loginExpiresAt')
-      ? { ...account, loginExpiresAt: null }
+    account.provider === 'anthropic'
+      ? { ...account, loginExpiresAt: statusAnthropicLoginExpiry(account.accountId) }
       : account,
   );
   const ownershipForProvider = makeOwnershipReader(store);

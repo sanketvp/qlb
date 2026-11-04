@@ -2,7 +2,6 @@
 
 import { DatabaseSync } from 'node:sqlite';
 import { loginExpiresAtIso } from './anthropic-oauth';
-import { platformKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from './keychain';
 import { redactSecrets } from './redact';
 import type { AccountSnapshot, BucketReading, Confidence } from './types';
 import { STALE_OK_S } from './usage-freshness';
@@ -23,8 +22,6 @@ export interface AnthropicUsageSlot {
 
 export interface AnthropicStatusSnapshot extends AccountSnapshot {
   loginExpiresAt: string | null;
-  usageError?: string;
-  usageRetryAt?: string;
   threshold?: number;
 }
 
@@ -316,12 +313,11 @@ function readOnlyStoreData(dbPath: string): {
   }
 }
 
-/** Reads the status projection through read-only SQLite and credential handles; it never migrates, scrubs, or writes secrets. */
+/** Reads the status projection through a read-only SQLite handle; it never migrates or scrubs. */
 export function readAnthropicStoreSnapshots(
   dbPath: string,
   nowS: number,
-  readCredential: AnthropicCredentialReader = (accountId) =>
-    platformKeychain.getSync(qlbKeychainService('anthropic', accountId), QLB_KEYCHAIN_ACCOUNT),
+  readCredential?: AnthropicCredentialReader,
 ): AnthropicStoreSnapshots | null {
   const data = readOnlyStoreData(dbPath);
   if (!data) return null;

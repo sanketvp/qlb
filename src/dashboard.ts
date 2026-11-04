@@ -561,18 +561,11 @@ function overrideLabel(override: AccountOverrideView | null): string {
   return bits.join(' ');
 }
 
-type StatusAccountDetails = {
-  loginExpiresAt?: string | null;
-  usageError?: string;
-  usageRetryAt?: string;
-};
-
 function formatAccountStatusLines(account: DashboardAccount): string[] {
-  const details = account as DashboardAccount & StatusAccountDetails;
   const lines: string[] = [];
-  if (details.loginExpiresAt) lines.push(`     login expires ${details.loginExpiresAt}`);
-  if (details.usageError) {
-    lines.push(`     usage: ${details.usageError}${details.usageRetryAt ? `, retry ${details.usageRetryAt}` : ''}`);
+  if (account.loginExpiresAt) lines.push(`     login expires ${account.loginExpiresAt}`);
+  if (account.usageError) {
+    lines.push(`     usage: ${account.usageError}${account.usageRetryAt ? `, retry ${account.usageRetryAt}` : ''}`);
   }
   return lines;
 }
