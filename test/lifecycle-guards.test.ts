@@ -242,4 +242,22 @@ describe('Claude switch lifecycle guards (K5-8)', () => {
     assert.equal(await execute(subject), 0, `${subject.stdout.join('\n')}\n${subject.stderr.join('\n')}`);
     assert.deepEqual(events, ['admitted', 'reconcile']);
   });
+
+  it('auto admission precedes reconciliation before polling or switching', async () => {
+    const events: string[] = [];
+    await runAuto({ once: true }, {
+      makeLiveBinding: () => ({
+        store: { setConfig: () => {} }, close: () => {},
+        reconcile: async () => { events.push('reconcile'); },
+        poll: async () => { events.push('poll'); return []; },
+        tick: async () => {
+          events.push('switch');
+          return { decision: { kind: 'stay', reason: 'unknown', unhealthyTicks: 0 } };
+        },
+      }),
+      assertAdmitted: () => { events.push('admitted'); return { ok: true }; },
+      listCswapProcesses: () => [], log: () => {},
+    });
+    assert.deepEqual(events, ['admitted', 'reconcile', 'poll', 'switch']);
+  });
 });

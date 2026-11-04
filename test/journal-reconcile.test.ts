@@ -26,6 +26,8 @@ import { createSwitchAnthropicCommand } from '../src/commands/switch-anthropic';
 import { createClaudeJournalResolveCommand } from '../src/commands/claude-journal-resolve';
 import { ClaudeCodeLockTimeout, ProperLockfileCompromised } from '../src/cc-locks';
 import { claudeSwitchJournalCheck } from '../src/checks/claude-switch-journal';
+import { journalInProgressCheck } from '../src/checks/journal-in-progress';
+import { runPiGate } from '../src/pi-gate';
 import type { CommandContext } from '../src/registry';
 import { openStore } from '../src/store';
 
@@ -706,6 +708,67 @@ describe('Claude switch journal reconciliation (G10)', () => {
     } as unknown as CommandContext;
     assert.equal(await command.execute!(['b'], ctx), 0);
     assert.deepEqual(events, ['bootstrap', 'admission', 'admitted', 'make', 'reconciled', 'switch']);
+    assert.equal(journalExists(subject), false);
+  });
+
+  it('gate and doctor diagnostics leave a held Claude switch journal byte-identical', async () => {
+    const subject = await fixture();
+    await install(subject);
+    const path = claudeSwitchJournalPath({ journalDir: subject.deps.journalDir });
+    const before = createHash('sha256').update(readFileSync(path)).digest('hex');
+    const dbPath = join(subject.root, 'qlb.sqlite');
+    const store = openStore(dbPath);
+    try { store.close(); } catch { /* test cleanup only */ }
+    const options = {
+      journal: { journalDir: subject.deps.journalDir, home: subject.home, env: subject.env, configPath: subject.paths.globalConfigPath, keychainService: subject.paths.keychainService },
+      ownerIsLive: async () => false,
+    };
+
+    await withClaudeSwitchJournalOwner(options.journal, async () => {
+      assert.equal(await runPiGate('anthropic', {
+        dbPath, env: subject.env, guard: () => true, admitted: () => ({ ok: true }),
+        cswapProcesses: () => [], prerequisites: async () => {}, deliver: () => {},
+        provider: { read: async () => undefined as never },
+      }), 1);
+      assert.deepEqual(await journalInProgressCheck(dbPath, 'cutover', { ...options, journalDir: join(subject.root, 'backups') }), {
+        name: 'journal:in-progress', level: 'INFO', message: `Claude switch journal ${path} is held`,
+      });
+      assert.equal(createHash('sha256').update(readFileSync(path)).digest('hex'), before);
+    });
+  });
+
+  it('only an admitted switch reconciliation clears a free orphaned journal', async () => {
+    const subject = await fixture();
+    await install(subject);
+    await subject.backend.set(subject.paths.keychainService, 'fixture-user', subject.target);
+    const path = claudeSwitchJournalPath({ journalDir: subject.deps.journalDir });
+    const before = createHash('sha256').update(readFileSync(path)).digest('hex');
+    const dbPath = join(subject.root, 'qlb.sqlite');
+    const store = openStore(dbPath);
+    store.close();
+
+    assert.equal(await runPiGate('anthropic', {
+      dbPath, env: subject.env, guard: () => true, admitted: () => ({ ok: true }),
+      cswapProcesses: () => [], prerequisites: async () => {}, deliver: () => {},
+      provider: { read: async () => undefined as never },
+    }), 1);
+    assert.equal(createHash('sha256').update(readFileSync(path)).digest('hex'), before);
+    assert.equal((await claudeSwitchJournalCheck(dbPath, 'cutover', {
+      journal: { journalDir: subject.deps.journalDir, home: subject.home, env: subject.env, configPath: subject.paths.globalConfigPath, keychainService: subject.paths.keychainService },
+      ownerIsLive: async () => false,
+    })).level, 'FAIL');
+    assert.equal(createHash('sha256').update(readFileSync(path)).digest('hex'), before);
+
+    const command = createSwitchAnthropicCommand({
+      openStore: () => ({ close: () => {} }) as never,
+      bootstrap: async (hooks) => { await hooks?.assertAdmitted?.(); await hooks?.reconcileJournals?.(); },
+      assertAdmitted: () => ({ ok: true }),
+      makeSwitchDeps: async () => ({ deps: subject.deps }),
+      switchClaude: async () => ({ outcome: 'noop', from: 'a', to: 'b', attempt: 'next-switch', exitCode: 0 }),
+    });
+    const ctx = { ...({} as CommandContext), stdout: () => {}, stderr: () => {}, env: subject.env, home: subject.home,
+      config: { ...defaultConfig(subject.root), dbPath } };
+    assert.equal(await command.execute!(['b'], ctx), 0);
     assert.equal(journalExists(subject), false);
   });
 
