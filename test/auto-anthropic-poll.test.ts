@@ -10,6 +10,7 @@ import { claudePaths } from '../src/cc-paths';
 import { credentialLineage, ProbeVerdictMemo, type LiveIdentity } from '../src/cc-resync';
 import { ClaudeSlots, InMemoryClaudeSlotRepository } from '../src/cc-slots';
 import { MockKeychain } from '../src/keychain';
+import { CANDIDATE_DEFAULT_INTERVAL_S, JITTER_FRAC, MIN_INTERVAL_S } from '../src/poll-policy';
 import { openStore } from '../src/store';
 
 const NOW = 1_700_000_000;
@@ -29,6 +30,7 @@ async function fixture() {
   await slots.createSlot({ accountId: 'inactive', credential: credential('inactive'), email: 'inactive@example.test', orgUuid: 'inactive-org', slotNum: 2, source: 'fixture' });
   store.setActiveLogin('anthropic', 'active', 'fixture', NOW);
   let gets = 0;
+  const usageGets = new Map<string, number>();
   let posts = 0;
   let response: { status: number; body: string; retryAfterS?: number } = { status: 200, body: JSON.stringify({ five_hour: { utilization: 20 }, seven_day: { utilization: 10 } }) };
   const paths = claudePaths({ home, env });
@@ -45,10 +47,14 @@ async function fixture() {
     consumeDeps: {
       postRefresh: async () => { posts += 1; return { status: 200, body: JSON.stringify({ access_token: 'access-refreshed', refresh_token: 'refresh-refreshed', expires_in: 3600 }) }; },
     },
-    getUsage: async (_accessToken: string) => { gets += 1; return response; },
+    getUsage: async (accessToken: string) => {
+      gets += 1;
+      usageGets.set(accessToken, (usageGets.get(accessToken) ?? 0) + 1);
+      return response;
+    },
   });
   return {
-    store, slots, backend, paths, deps, calls: () => ({ gets, posts }),
+    store, slots, backend, paths, deps, calls: () => ({ gets, posts }), usageGets: (accessToken: string) => usageGets.get(accessToken) ?? 0,
     now: (value: number) => { now = value; },
     response: (value: typeof response) => { response = value; },
   };
@@ -125,6 +131,7 @@ describe('auto anthropic poll (G8)', () => {
 
   it('two simulated hours with fresh tokens make 0 POSTs and poll only on schedule', async () => {
     const f = await fixture();
+    const durationS = 120 * 60;
     for (const accountId of ['active', 'inactive']) {
       await f.slots.writeSlot(accountId, credential(`${accountId}-long`, (NOW + 10_800) * 1000), { cause: 'fixture' });
     }
@@ -150,6 +157,8 @@ describe('auto anthropic poll (G8)', () => {
       }
     }
     assert.equal(f.calls().posts, 0);
+    assert.ok(f.usageGets('access-active-long') <= Math.ceil(durationS / (MIN_INTERVAL_S * (1 - JITTER_FRAC))) + 1);
+    assert.ok(f.usageGets('access-inactive-long') <= Math.ceil(durationS / (CANDIDATE_DEFAULT_INTERVAL_S * (1 - JITTER_FRAC))) + 1);
   });
 
   it('strikes a dead inactive token and never posts it again', async () => {
