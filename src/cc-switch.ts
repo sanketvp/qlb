@@ -539,11 +539,13 @@ async function switchClaudeAttempt(deps: ClaudeSwitchDeps, input: SwitchClaudeIn
           const outgoingSlot = deps.slots.getSlot(from);
           if (outgoingSlot === null) return refusal(deps, transactionInput, attempt, from, 'active-login-unset');
           const outgoing = { accountId: outgoingSlot.accountId, email: outgoingSlot.email ?? null, orgUuid: outgoingSlot.orgUuid ?? null, credential: await readSlotOrNull(deps, from) };
-          let classified;
-          try { classified = (deps.classifyOutgoing ?? classifyOutgoingCredential)({ outgoing, slots: prepared.slots, liveCredential: outgoingLive, provenance: prepared.prefetch, probeVerdict: transactionInput.probeVerdict }); } catch (error) { return failed(deps, transactionInput, attempt, from, 'outgoing-backup-failed', writeError(error, 'keychain-write-failed'), state, 5); }
+          let rawClassification: ReturnType<typeof classifyOutgoingCredential>;
+          try { rawClassification = (deps.classifyOutgoing ?? classifyOutgoingCredential)({ outgoing, slots: prepared.slots, liveCredential: outgoingLive, provenance: prepared.prefetch, probeVerdict: transactionInput.probeVerdict }); } catch (error) { return failed(deps, transactionInput, attempt, from, 'outgoing-backup-failed', writeError(error, 'keychain-write-failed'), state, 5); }
           // The stale predecessor is known to be the exact pre-refresh target.
           // Keep the refreshed slot head as K5b-1's publication source.
-          if (republishSlotHead) classified = { kind: 'own-bytes' as const, foreignSlotId: null };
+          const classified = republishSlotHead
+            ? { kind: 'own-bytes' as const, foreignSlotId: null }
+            : rawClassification;
           if (transactionInput.republish && classified.kind !== 'own-bytes' && classified.kind !== 'own-family' && classified.kind !== 'own-rotated') {
             return refusal(deps, transactionInput, attempt, from, 'republish-live-not-own');
           }
@@ -568,8 +570,6 @@ async function switchClaudeAttempt(deps: ClaudeSwitchDeps, input: SwitchClaudeIn
             }
           } else if (classified.kind === 'own-bytes' || classified.kind === 'foreign-synced') {
             // These outgoing kinds are intentionally retained in place.
-          } else if (classified.kind === 'foreign' || classified.kind === 'alien' || classified.kind === 'known-foreign') {
-            return refusal(deps, transactionInput, attempt, from, `outgoing-unrouted:${classified.kind}`);
           } else {
             const unexpectedKind: never = classified.kind;
             return refusal(deps, transactionInput, attempt, from, `outgoing-unrouted:${unexpectedKind}`);
