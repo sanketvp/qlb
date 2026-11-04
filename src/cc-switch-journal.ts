@@ -159,12 +159,19 @@ export function claudeSwitchJournalOwnerLockPath(options: ClaudeSwitchJournalPat
   return `${claudeSwitchJournalPath(options)}.lock`;
 }
 
+function assertNotSymlink(path: string, what: string): void {
+  try {
+    if (lstatSync(path).isSymbolicLink()) throw new Error(`${what} must not be a symlink`);
+  } catch (error) {
+    if (errno(error) !== 'ENOENT') throw error;
+  }
+}
+
 function assertJournalDirNotSymlink(options: ClaudeSwitchJournalPathOptions): string {
   const dir = claudeSwitchJournalDir(options);
+  assertNotSymlink(dir, 'Claude switch journal directory');
   try {
-    const stat = lstatSync(dir);
-    if (stat.isSymbolicLink()) throw new Error('Claude switch journal directory must not be a symlink');
-    if (!stat.isDirectory()) throw new Error('Claude switch journal directory is not a directory');
+    if (!lstatSync(dir).isDirectory()) throw new Error('Claude switch journal directory is not a directory');
   } catch (error) {
     if (errno(error) !== 'ENOENT') throw error;
   }
@@ -174,19 +181,10 @@ function assertJournalDirNotSymlink(options: ClaudeSwitchJournalPathOptions): st
 function ensureJournalDir(options: ClaudeSwitchJournalPathOptions): string {
   const dir = assertJournalDirNotSymlink(options);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
-  const stat = lstatSync(dir);
-  if (stat.isSymbolicLink()) throw new Error('Claude switch journal directory must not be a symlink');
-  if (!stat.isDirectory()) throw new Error('Claude switch journal directory is not a directory');
+  assertNotSymlink(dir, 'Claude switch journal directory');
+  if (!lstatSync(dir).isDirectory()) throw new Error('Claude switch journal directory is not a directory');
   chmodSync(dir, 0o700);
   return dir;
-}
-
-function assertNotSymlink(path: string): void {
-  try {
-    if (lstatSync(path).isSymbolicLink()) throw new Error('Claude switch journal path must not be a symlink');
-  } catch (error) {
-    if (errno(error) !== 'ENOENT') throw error;
-  }
 }
 
 /** Persist only parsed fields. All writes reject symlink paths and are followed by a directory fsync. */
@@ -195,7 +193,7 @@ function persistClaudeSwitchJournal(journal: ClaudeSwitchJournal, options: Claud
   if (parsed === null) throw new Error('Invalid Claude switch journal');
   const dir = ensureJournalDir(options);
   const path = claudeSwitchJournalPath({ ...options, journalDir: dir });
-  assertNotSymlink(path);
+  assertNotSymlink(path, 'Claude switch journal path');
   atomicWriteText(path, `${JSON.stringify(parsed)}\n`, { mode: 0o600, followSymlinks: false });
   (options.fsyncDirectory ?? fsyncDirSync)(dirname(path));
 }
@@ -206,7 +204,7 @@ export function createClaudeSwitchJournal(journal: ClaudeSwitchJournal, options:
   if (parsed === null) throw new Error('Invalid Claude switch journal');
   const dir = ensureJournalDir(options);
   const path = claudeSwitchJournalPath({ ...options, journalDir: dir });
-  assertNotSymlink(path);
+  assertNotSymlink(path, 'Claude switch journal path');
   const temporary = join(dir, `.${JOURNAL_FILE}.${process.pid}.${randomUUID()}.tmp`);
   const bytes = Buffer.from(`${JSON.stringify(parsed)}\n`);
   let fd: number | undefined;
