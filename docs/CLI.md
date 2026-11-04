@@ -105,7 +105,9 @@ qlb auto --once --inject usage-5xx anthropic
 
 This synthetic active-usage failure records `http-500`, retains the prior usage snapshot, and makes the active reading unknown for that tick so the normal unknown-grace/failover policy is exercised. It does not read a Claude slot or live credentials, and does not make a usage request. The injection is accepted only with live `--once`; it is rejected for `--dry-run`, the continuous loop, and other `qlb auto` subcommands.
 
-Flags: `[--once] [--dry-run] [--json]`. Fault injection additionally requires `QLB_FAULT_INJECTION=1` and exactly `--once --inject usage-5xx anthropic`.
+The credential-free breaker drill is `qlb auto --once --inject breaker-rows anthropic`. It does not poll, and refuses when a Claude switch journal exists or C-swap is alive. It leaves `auto.anthropic.suspendedUntil` set for one hour; run `qlb auto resume anthropic` to resume normal switching sooner.
+
+Flags: `[--once] [--dry-run] [--json]`. Fault injection additionally requires `QLB_FAULT_INJECTION=1` and exactly `--once --inject <usage-5xx|breaker-rows> anthropic`.
 
 ## `qlb refresh`
 

@@ -112,7 +112,7 @@ export function productionDependencies(
     hasFourInjectedDrillRows: () => {
       const db = openStoreConnection(store.dbPath, true);
       try {
-        const row = db.prepare("SELECT count(*) AS count FROM switch_log WHERE injected = 1 AND outcome = 'ok'").get() as { count: number };
+        const row = db.prepare("SELECT count(*) AS count FROM switch_log WHERE injected = 1 AND outcome = 'ok' AND (detail IS NULL OR detail <> 'fault-injection:breaker-rows:seed')").get() as { count: number };
         return row.count >= 4;
       } finally { db.close(); }
     },

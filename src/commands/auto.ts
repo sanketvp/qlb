@@ -278,11 +278,11 @@ export async function runAutoCommand(
   const inject = parsedInjection.inject;
   args = parsedInjection.rest;
   if (args[0] === 'resume') {
-    if (inject !== null) { ctx.stderr('usage: qlb auto --once [--json] --inject usage-5xx anthropic'); return 2; }
+    if (inject !== null) { ctx.stderr('usage: qlb auto --once [--json] --inject <usage-5xx|breaker-rows> anthropic'); return 2; }
     return resumeAnthropic(ctx, args.slice(1));
   }
   if (args[0] === 'drill-begin') {
-    if (inject !== null) { ctx.stderr('usage: qlb auto --once [--json] --inject usage-5xx anthropic'); return 2; }
+    if (inject !== null) { ctx.stderr('usage: qlb auto --once [--json] --inject <usage-5xx|breaker-rows> anthropic'); return 2; }
     return drillBegin(ctx, args.slice(1), deps);
   }
 
@@ -307,8 +307,8 @@ export async function runAutoCommand(
   }
 
   const options = parse(args);
-  if (!options || (inject !== null && (inject.kind !== 'usage-5xx' || !options.once || options.dryRun))) {
-    ctx.stderr('usage: qlb auto [--once] [--dry-run] [--json] | qlb auto --once [--json] --inject usage-5xx anthropic | qlb auto install-agent | qlb auto resume anthropic [--json] | qlb auto drill-begin [--json]');
+  if (!options || (inject !== null && ((inject.kind !== 'usage-5xx' && inject.kind !== 'breaker-rows') || !options.once || options.dryRun))) {
+    ctx.stderr('usage: qlb auto [--once] [--dry-run] [--json] | qlb auto --once [--json] --inject <usage-5xx|breaker-rows> anthropic | qlb auto install-agent | qlb auto resume anthropic [--json] | qlb auto drill-begin [--json]');
     return 2;
   }
 

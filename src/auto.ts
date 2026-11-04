@@ -4,9 +4,10 @@ import { DatabaseSync } from 'node:sqlite';
 import { pathToFileURL } from 'node:url';
 
 import { buildUsageRequest, type HttpRequestDescription } from './anthropic-oauth';
-import { anthropicTick, pollAnthropic, type AnthropicPollDeps, type AnthropicTickDeps, type AnthropicTickResult } from './auto/anthropic';
-import { injectionDetail, type UsageInjection } from './fault-injection';
+import { anthropicBreakerRowsDrill, anthropicTick, pollAnthropic, type AnthropicPollDeps, type AnthropicTickDeps, type AnthropicTickResult } from './auto/anthropic';
+import { injectionDetail, type BreakerRowsInjection, type UsageInjection } from './fault-injection';
 import { claudePaths } from './cc-paths';
+import { claudeSwitchJournalPath } from './cc-switch-journal';
 import { ClaudeSlots, SqliteClaudeSlotRepository, type ClaudeSlot } from './cc-slots';
 import { ProbeVerdictMemo, resolveCswapCheck, type RefreshHttpResponse } from './cc-resync';
 import { processLstart, stillTheSameProcess } from './codex-sessions';
@@ -34,7 +35,7 @@ export interface RunAutoOptions {
   once?: boolean;
   dryRun?: boolean;
   /** A fault-only seam accepted by `auto --once`; never a production transport. */
-  inject?: UsageInjection;
+  inject?: UsageInjection | BreakerRowsInjection;
 }
 
 export class AutoAdmissionRefused extends Error {
@@ -57,6 +58,8 @@ export type LiveBinding = {
   reconcile(): Promise<void>;
   poll(inject?: UsageInjection): Promise<Awaited<ReturnType<typeof pollAnthropic>>>;
   tick(accounts: Awaited<ReturnType<typeof pollAnthropic>>, inject?: UsageInjection): Promise<AnthropicTickResult>;
+  /** Credential-free, no-poll breaker drill. */
+  breakerRowsDrill?(): Promise<AnthropicTickResult>;
 };
 
 export type DryBinding = {
@@ -193,6 +196,7 @@ function productionLiveBinding(deps: Required<Pick<AutoDependencies, 'env' | 'ho
         injectionDetail: inject === undefined ? undefined : injectionDetail(inject),
       });
     },
+    breakerRowsDrill: async () => anthropicBreakerRowsDrill({ store, slots, now: deps.now, models }),
   };
 }
 
@@ -247,7 +251,7 @@ function readOnlyStore(db: DatabaseSync, dbPath: string): Store {
       }]));
     },
     latestCommittedAnthropicAutoswitchAt: (): number | undefined => {
-      const row = db.prepare("SELECT committed_at FROM switch_log WHERE provider = 'anthropic' AND trigger != 'manual' AND outcome = 'ok' AND committed_at IS NOT NULL ORDER BY committed_at DESC LIMIT 1").get() as { committed_at?: number } | undefined;
+      const row = db.prepare("SELECT committed_at FROM switch_log WHERE provider = 'anthropic' AND trigger != 'manual' AND outcome = 'ok' AND committed_at IS NOT NULL AND (detail IS NULL OR detail <> 'fault-injection:breaker-rows:seed') ORDER BY committed_at DESC LIMIT 1").get() as { committed_at?: number } | undefined;
       return row?.committed_at;
     },
     listAnthropicAutoswitchBreakerRows: () => listAnthropicAutoswitchBreakerRows(db),
@@ -349,24 +353,43 @@ export async function runAuto(options: RunAutoOptions = {}, dependencies: AutoDe
         if (!options.once && admission.row !== undefined && drillActive(admission.row)) {
           throw new AutoAdmissionRefused('drill-active');
         }
+        const breakerRowsDrill = options.inject?.kind === 'breaker-rows';
+        if (breakerRowsDrill && existsSync(claudeSwitchJournalPath({ home, env }))) {
+          throw new AutoAdmissionRefused('claude-switch-journal-present');
+        }
         let cswapAlive = false;
         try { cswapAlive = resolveCswapCheck(dependencies.listCswapProcesses, env)().length > 0; } catch { cswapAlive = true; }
-        if (cswapAlive) {
-          binding.store.setConfig('auto.heartbeatAt', String(now()));
-          result.ticks += 1;
-          redactedLog(log, 'auto: stay(cswap-alive)');
-        } else {
-          await binding.reconcile();
-          if (observeStop() !== undefined) break;
-          const accounts = await binding.poll(options.inject);
-          // This is the final point before a tick that can switch credentials.
-          if (observeStop() !== undefined) break;
-          const tick = await binding.tick(accounts, options.inject);
-          binding.store.setConfig('auto.heartbeatAt', String(now()));
-          result.ticks += 1;
+        if (breakerRowsDrill) {
+          // This branch is deliberately before C-swap reconciliation, polling,
+          // and heartbeat writes. A journal means reconciliation might mutate.
+          if (cswapAlive) throw new AutoAdmissionRefused('cswap-alive');
+          if (!binding.breakerRowsDrill) throw new Error('breaker drill binding unavailable');
+          const tick = await binding.breakerRowsDrill();
+          if (tick.decision.kind !== 'stay' || tick.decision.reason !== 'breaker') {
+            throw new AutoAdmissionRefused('drill-breaker-not-reached');
+          }
+          result.ticks = 1;
           result.decisions = [tick.decision];
-          if (tick.switchResult?.outcome === 'ok') result.executed.push(tick.switchResult.to);
           redactedLog(log, `auto: ${decisionText(tick)}`);
+        } else {
+          const usageInjection = options.inject?.kind === 'usage-5xx' ? options.inject : undefined;
+          if (cswapAlive) {
+            binding.store.setConfig('auto.heartbeatAt', String(now()));
+            result.ticks += 1;
+            redactedLog(log, 'auto: stay(cswap-alive)');
+          } else {
+            await binding.reconcile();
+            if (observeStop() !== undefined) break;
+            const accounts = await binding.poll(usageInjection);
+            // This is the final point before a tick that can switch credentials.
+            if (observeStop() !== undefined) break;
+            const tick = await binding.tick(accounts, usageInjection);
+            binding.store.setConfig('auto.heartbeatAt', String(now()));
+            result.ticks += 1;
+            result.decisions = [tick.decision];
+            if (tick.switchResult?.outcome === 'ok') result.executed.push(tick.switchResult.to);
+            redactedLog(log, `auto: ${decisionText(tick)}`);
+          }
         }
       } catch (error) {
         if (error instanceof AutoAdmissionRefused) throw error;
