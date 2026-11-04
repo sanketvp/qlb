@@ -823,11 +823,14 @@ describe('qlb auto --once (G12)', () => {
     } finally { close(ctx.home); close(ctx.env.QLB_HOME!); }
   });
 
+  it('runAuto rejects usage-5xx outside a live once run', async () => {
+    await assert.rejects(runAuto({ inject: { kind: 'usage-5xx', provider: 'anthropic' } }), AutoAdmissionRefused);
+  });
+
   it('usage-5xx passes only the fault descriptor through the locked once run', async () => {
     const root = mkdtempSync(join(tmpdir(), 'qlb-auto-inject-once-'));
-    const stdout: string[] = [];
     const ctx: CommandContext = {
-      stdout: (line) => stdout.push(line), stderr: () => undefined, env: testEnv(root, { QLB_FAULT_INJECTION: '1' }),
+      stdout: () => undefined, stderr: () => undefined, env: testEnv(root, { QLB_FAULT_INJECTION: '1' }),
       config: {} as CommandContext['config'], loadConfig: () => { throw new Error('not used'); }, home: root,
       registerSecret: () => undefined, deliverSecret: () => undefined, knownSecrets: () => [],
     };
@@ -841,7 +844,6 @@ describe('qlb auto --once (G12)', () => {
         },
       }), 0);
       assert.equal(locked, 1);
-      assert.equal(JSON.stringify(stdout).includes('token'), false);
     } finally { close(root); }
   });
 

@@ -180,13 +180,19 @@ function productionLiveBinding(deps: Required<Pick<AutoDependencies, 'env' | 'ho
       resources.deps.stillTheSameProcess = autoReconcileStillTheSameProcess(ownLstart, realStillTheSameProcess);
       try { await reconcileClaudeSwitch(resources.deps); } finally { resources.close?.(); }
     },
-    poll: (inject) => pollAnthropic({ ...pollDeps(), injectUsage5xx: inject?.kind === 'usage-5xx' }),
-    tick: (accounts, inject) => anthropicTick({
-      ...tickDeps(accounts),
-      activeUsageUnknown: inject?.kind === 'usage-5xx',
-      injected: inject?.kind === 'usage-5xx',
-      injectionDetail: inject === undefined ? undefined : injectionDetail(inject),
-    }),
+    poll: (inject) => {
+      const injected = inject !== undefined;
+      return pollAnthropic({ ...pollDeps(), injectUsage5xx: injected });
+    },
+    tick: (accounts, inject) => {
+      const injected = inject !== undefined;
+      return anthropicTick({
+        ...tickDeps(accounts),
+        activeUsageUnknown: injected,
+        injected,
+        injectionDetail: inject === undefined ? undefined : injectionDetail(inject),
+      });
+    },
   };
 }
 
@@ -284,8 +290,10 @@ export async function runAuto(options: RunAutoOptions = {}, dependencies: AutoDe
   const log = dependencies.log ?? ((line: string) => console.error(line));
   const result: AutoRunResult = { ticks: 0, decisions: [], executed: [] };
 
+  if (options.inject !== undefined && (!options.once || options.dryRun)) {
+    throw new AutoAdmissionRefused('fault-injection-requires-live-once');
+  }
   if (options.dryRun) {
-    if (options.inject !== undefined) throw new AutoAdmissionRefused('fault-injection-requires-live-once');
     const binding = await (dependencies.makeDryBinding?.() ?? productionDryBinding(config, now));
     try {
       const admissionStore = { dbPath: config.dbPath } as Store;
