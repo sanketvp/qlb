@@ -177,11 +177,13 @@ describe('status JSON operational fields', () => {
   it('includes lifecycle state/windowEnd, active login, parked, and breaker fields', () => {
     const f = fixture();
     const store = initialize(f);
+    const parkedUntil = Date.now() + 300_000;
+    const breakerUntil = Date.now() + 600_000;
     try {
       store.setActiveLogin('anthropic', 'claude-a', 'fixture', NOW_MS);
       store.setActiveLogin('openai-codex', 'codex-a', 'fixture', NOW_MS);
-      store.setConfig('auto.anthropic.parkedUntil', String(NOW_MS + 60_000));
-      store.setConfig('auto.anthropic.suspendedUntil', String(NOW_MS + 120_000));
+      store.setConfig('auto.anthropic.parkedUntil', String(parkedUntil));
+      store.setConfig('auto.anthropic.suspendedUntil', String(breakerUntil));
     } finally {
       store.close();
     }
@@ -200,8 +202,8 @@ describe('status JSON operational fields', () => {
     assert.deepEqual(body.lifecycle, { state: 'cutover', windowEnd: new Date(WINDOW_END).toISOString() });
     assert.equal(body.activeLogin.anthropic, 'claude-a');
     assert.equal(body.activeLogin['openai-codex'], 'codex-a');
-    assert.equal(body.parked, new Date(NOW_MS + 60_000).toISOString());
-    assert.equal(body.breaker, new Date(NOW_MS + 120_000).toISOString());
+    assert.equal(body.parked, new Date(parkedUntil).toISOString());
+    assert.equal(body.breaker, new Date(breakerUntil).toISOString());
     const claude = body.accounts.find((account) => account.accountId === 'claude-a');
     assert.equal(claude?.loginExpiresAt, null);
     assert.equal(claude?.threshold, 82);
