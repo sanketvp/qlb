@@ -1,6 +1,7 @@
 import { ClaudeSlots } from '../cc-slots';
 import { check } from './_check';
 import type { HealthCheck } from './claude-slots';
+import { isLifecycleState } from './lifecycle-phase';
 
 export default check('claude:unclaimed');
 
@@ -16,6 +17,12 @@ export async function claudeUnclaimedCheck(
   phase: string,
   now = Date.now(),
 ): Promise<HealthCheck> {
+  if (phase === 'unknown') {
+    return { name: 'claude:unclaimed', level: 'WARN', message: 'lifecycle phase unavailable; unclaimed Claude stashes cannot be evaluated' };
+  }
+  if (!isLifecycleState(phase)) {
+    return { name: 'claude:unclaimed', level: 'WARN', message: 'cannot evaluate: unknown lifecycle state' };
+  }
   if (!APPLICABLE_PHASES.has(phase)) {
     return { name: 'claude:unclaimed', level: 'N/A', message: `not applicable in phase=${phase}` };
   }

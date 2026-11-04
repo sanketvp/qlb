@@ -7,7 +7,7 @@ import {
   type HelperSigningState,
 } from './helper-signing';
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname } from 'node:path';
 import { consumeMarkerPathFor, CSWAP_ANTHROPIC_STORE } from './cswap-consume';
 import { builtInAdapters } from './adapters';
 import { CONFIG_ENV_VARS, OPENROUTER_KEYCHAIN_SERVICE, type QlbConfig } from './config';
@@ -855,7 +855,7 @@ export async function doctorQlb(
   checks.push(await journalInProgressCheck(config.dbPath, phase));
   checks.push(journalOrphanedCheck(config.dbPath, phase));
   checks.push(await claudeUnclaimedCheck(
-    options.claudeUnclaimedStashDir ?? join(qlbHomeDir(), '.qlb', 'unclaimed'),
+    options.claudeUnclaimedStashDir ?? stashRootFor(qlbHomeDir()),
     phase,
     options.now?.() ?? Date.now(),
   ));

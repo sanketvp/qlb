@@ -16,6 +16,21 @@ import { recordStash } from '../src/unclaimed-index';
 
 const NOW = Date.UTC(2026, 0, 1, 0, 0, 0);
 
+async function withTestQlbHome<T>(home: string, operation: () => Promise<T>): Promise<T> {
+  const previousTestMode = process.env.QLB_TEST_MODE;
+  const previousQlbHome = process.env.QLB_HOME;
+  process.env.QLB_TEST_MODE = '1';
+  process.env.QLB_HOME = home;
+  try {
+    return await operation();
+  } finally {
+    if (previousTestMode === undefined) delete process.env.QLB_TEST_MODE;
+    else process.env.QLB_TEST_MODE = previousTestMode;
+    if (previousQlbHome === undefined) delete process.env.QLB_HOME;
+    else process.env.QLB_HOME = previousQlbHome;
+  }
+}
+
 function fixture(): string {
   const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-phases-'));
   const dbPath = join(home, 'qlb.db');
@@ -184,22 +199,48 @@ describe('claude:unclaimed doctor check', () => {
     });
   });
 
-  it('is wired into doctor and is N/A outside cutover and retired', async () => {
+  it('WARNs when the lifecycle phase is unavailable or invalid, and is N/A before cutover', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-doctor-unclaimed-unavailable-'));
+    assert.deepEqual(await claudeUnclaimedCheck(root, 'unknown', NOW), {
+      name: 'claude:unclaimed', level: 'WARN', message: 'lifecycle phase unavailable; unclaimed Claude stashes cannot be evaluated',
+    });
+    assert.deepEqual(await claudeUnclaimedCheck(root, 'invalid-phase', NOW), {
+      name: 'claude:unclaimed', level: 'WARN', message: 'cannot evaluate: unknown lifecycle state',
+    });
+    assert.deepEqual(await claudeUnclaimedCheck(root, 'pre-cutover', NOW), {
+      name: 'claude:unclaimed', level: 'N/A', message: 'not applicable in phase=pre-cutover',
+    });
+  });
+
+  it('uses the production stash root and the injected stash-root seam in cutover', async () => {
     const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-unclaimed-wiring-'));
     const config = defaultConfig(home);
     const store = openStore(config.dbPath);
     store.close();
     const db = new DatabaseSync(config.dbPath);
     try {
-      db.prepare('INSERT INTO lifecycle (state, began_at) VALUES (?, ?)').run('pre-cutover', NOW);
+      db.prepare('INSERT INTO lifecycle (state, began_at) VALUES (?, ?)').run('cutover', NOW);
     } finally {
       db.close();
     }
-    const report = await doctorQlb(config, {
-      command: () => '', hostCommand: () => '', now: () => NOW, claudeUnclaimedStashDir: join(home, '.qlb', 'unclaimed'),
+    const productionRoot = join(home, '.qlb', 'unclaimed');
+    const seamRoot = mkdtempSync(join(tmpdir(), 'qlb-doctor-unclaimed-seam-'));
+    await stash(productionRoot, NOW - 30 * 24 * 60 * 60 * 1_000 - 1);
+    await stash(seamRoot, NOW - 1);
+    await withTestQlbHome(home, async () => {
+      const productionReport = await doctorQlb(config, {
+        command: () => '', hostCommand: () => '', now: () => NOW,
+      });
+      assert.deepEqual(productionReport.checks.find((row) => row.name === 'claude:unclaimed'), {
+        name: 'claude:unclaimed', level: 'WARN',
+        message: `1 unclaimed Claude stash(es) older than 30 days: qlb claude restore-unclaimed ${stashId} slot-1`,
+      });
     });
-    assert.deepEqual(report.checks.find((row) => row.name === 'claude:unclaimed'), {
-      name: 'claude:unclaimed', level: 'N/A', message: 'not applicable in phase=pre-cutover',
+    const seamReport = await doctorQlb(config, {
+      command: () => '', hostCommand: () => '', now: () => NOW, claudeUnclaimedStashDir: seamRoot,
+    });
+    assert.deepEqual(seamReport.checks.find((row) => row.name === 'claude:unclaimed'), {
+      name: 'claude:unclaimed', level: 'INFO', message: '1 unclaimed Claude stash(es) younger than 30 days',
     });
   });
 });
