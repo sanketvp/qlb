@@ -349,7 +349,9 @@ describe('Claude switch commit primitive', () => {
       insertSlots(store);
       const id = store.commitClaudeSwitch(input());
       assert.deepEqual(store.findCommittedSwitchByAttempt('anthropic', 'attempt-1'), {
-        id, outcome: 'ok', ts: 1_000, committedAt: 1_000,
+        id, ts: 1_000, provider: 'anthropic', fromAccount: 'from', toAccount: 'to', trigger: 'proactive', outcome: 'ok',
+        detail: 'fixture detail', stepsJson: '{"started":[6,7,8],"attempt":"attempt-1"}', openSessionsJson: null,
+        publishedAt: 900, committedAt: 1_000,
       });
       assert.equal(store.findCommittedSwitchByAttempt('anthropic', 'unknown'), null);
     } finally {
@@ -380,7 +382,9 @@ describe('Claude switch commit primitive', () => {
         stepsJson: JSON.stringify({ attempt: 'attempt-1' }),
       });
       assert.deepEqual(store.findCommittedSwitchByAttempt('anthropic', 'attempt-1'), {
-        id, outcome: 'ok', ts: 1_000, committedAt: 1_000,
+        id, ts: 1_000, provider: 'anthropic', fromAccount: 'from', toAccount: 'to', trigger: 'proactive', outcome: 'ok',
+        detail: 'fixture detail', stepsJson: '{"started":[6,7,8],"attempt":"attempt-1"}', openSessionsJson: null,
+        publishedAt: 900, committedAt: 1_000,
       });
     } finally {
       store.close();

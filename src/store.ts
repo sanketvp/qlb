@@ -2670,21 +2670,20 @@ export class Store {
    * committed_at, so refusals, rollbacks, watch rows, and C6-20e fence rows do
    * not finish an attempt; malformed steps_json has no attempt.
    */
-  findCommittedSwitchByAttempt(provider: 'anthropic' | 'openai-codex', attempt: string): ({
+  findCommittedSwitchByAttempt(provider: 'anthropic' | 'openai-codex', attempt: string): {
     id: number;
-    outcome: string;
     ts: number;
-    committedAt: number | null;
-  } & Partial<{
     provider: string;
     fromAccount: string | null;
     toAccount: string;
     trigger: string;
+    outcome: string;
     detail: string | null;
     stepsJson: string | null;
     openSessionsJson: string | null;
     publishedAt: number | null;
-  }>) | null {
+    committedAt: number | null;
+  } | null {
     const row = this.db.prepare(`SELECT id, ts, provider, from_account, to_account, trigger, outcome, detail,
       steps_json, open_sessions_json, published_at, committed_at
       FROM switch_log
@@ -2696,9 +2695,6 @@ export class Store {
       open_sessions_json: string | null; published_at: number | null; committed_at: number | null;
     } | undefined;
     if (!row) return null;
-    if (provider === 'anthropic') {
-      return { id: row.id, outcome: row.outcome, ts: row.ts, committedAt: row.committed_at };
-    }
     return {
       id: row.id,
       ts: row.ts,
