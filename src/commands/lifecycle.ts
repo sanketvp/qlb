@@ -18,7 +18,10 @@ async function execute(args: string[], ctx: CommandContext): Promise<number> {
   try {
     if (subcommand === 'drill-done' && rest.length === 0) {
       const result = markDrillDone(store);
-      emit(ctx, parsed.json, result, result.ok ? 'lifecycle drill recorded' : `lifecycle drill refused: ${result.code}`);
+      const refusal = result.code === 'drill-rows-missing'
+        ? `lifecycle drill refused: ${result.code}: ${result.missing?.join(',') ?? ''}`
+        : `lifecycle drill refused: ${result.code}`;
+      emit(ctx, parsed.json, result, result.ok ? 'lifecycle drill recorded' : refusal);
       return result.ok ? 0 : 3;
     }
     if (subcommand === 'close' && rest.length >= 3 && rest[1] === '--note') {

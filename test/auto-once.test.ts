@@ -89,6 +89,13 @@ function close(root: string): void {
   rmSync(root, { recursive: true, force: true });
 }
 
+function recordDrillFacts(store: ReturnType<typeof openStore>, ts: number): void {
+  store.recordSwitch({ ts, provider: 'anthropic', toAccount: 'fixture', trigger: 'failover', outcome: 'ok', injected: true, detail: 'fault-injection:usage-5xx' });
+  store.recordSwitch({ ts, provider: 'anthropic', toAccount: 'fixture', trigger: 'manual', outcome: 'rolled-back', injected: true, detail: 'fault-injection:fail-step-8' });
+  store.recordSwitch({ ts, provider: 'anthropic', toAccount: 'fixture', trigger: 'failover', outcome: 'refused', injected: true, detail: 'fault-injection:breaker-rows', error: 'breaker' });
+  store.setConfig('drill.undoDryRunAt', String(ts));
+}
+
 describe('qlb auto --once (G12)', () => {
   it('returns exit 3 for lock and admission refusals', async () => {
     const root = mkdtempSync(join(tmpdir(), 'qlb-auto-agent-refusal-'));
@@ -154,7 +161,10 @@ describe('qlb auto --once (G12)', () => {
       }
 
       const reopened = openStore(config.dbPath);
-      try { assert.equal(markDrillDone(reopened, 4).ok, true); } finally { reopened.close(); }
+      try {
+        recordDrillFacts(reopened, 4);
+        assert.equal(markDrillDone(reopened, 4).ok, true);
+      } finally { reopened.close(); }
       let normalRuns = 0;
       assert.equal(await runAutoCommand([], ctx, {
         acquireFlock: async () => lease,
@@ -418,6 +428,7 @@ describe('qlb auto --once (G12)', () => {
     const store = openStore(config.dbPath);
     beginCutover(store, 1);
     assert.equal(transition(store, 'cutover', 2).ok, true);
+    recordDrillFacts(store, 3);
     assert.equal(markDrillDone(store, 3).ok, true);
     store.close();
     const ctx: CommandContext = {

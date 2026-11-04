@@ -32,6 +32,7 @@ import {
   CSWAP_RESTORE_PENDING,
   CUTOVER_BEGIN_IN_PROGRESS,
   RETIREMENT_IN_PROGRESS,
+  assertAdmittedInConnection,
   phase,
   transition,
 } from '../lifecycle';
@@ -67,12 +68,15 @@ export interface UndoCswapCommandDependencies {
   getProfile?: (request: HttpRequestDescription) => Promise<ResyncProfileResponse>;
 }
 
-type Options = { json: boolean; dryRun: boolean; resume: boolean };
+type Options = { json: boolean; dryRun: boolean; resume: boolean; recordDrill: boolean };
 
 function parse(args: string[]): Options | null {
-  const allowed = new Set(['--dry-run', '--resume', '--json']);
-  if (args.some((arg) => !allowed.has(arg)) || new Set(args).size !== args.length || (args.includes('--dry-run') && args.includes('--resume'))) return null;
-  return { json: args.includes('--json'), dryRun: args.includes('--dry-run'), resume: args.includes('--resume') };
+  const allowed = new Set(['--dry-run', '--resume', '--record-drill', '--json']);
+  if (args.some((arg) => !allowed.has(arg)) || new Set(args).size !== args.length
+    || (args.includes('--dry-run') && args.includes('--resume')) || (args.includes('--record-drill') && !args.includes('--dry-run'))) return null;
+  return {
+    json: args.includes('--json'), dryRun: args.includes('--dry-run'), resume: args.includes('--resume'), recordDrill: args.includes('--record-drill'),
+  };
 }
 
 function formatHuman(plan: HandBackPlan): string[] {
@@ -468,7 +472,7 @@ function reportComplete(ctx: CommandContext, options: Options, result: HandBackP
   }
 }
 
-/** `qlb undo cswap [--dry-run | --resume]`: G16–G18 hand-back. */
+/** `qlb undo cswap [--dry-run [--record-drill] | --resume]`: G16–G18 hand-back. */
 export async function runUndoCswapCommand(
   args: string[],
   ctx: CommandContext,
@@ -476,7 +480,11 @@ export async function runUndoCswapCommand(
 ): Promise<number> {
   const options = parse(args);
   if (!options) {
-    ctx.stderr('usage: qlb undo cswap [--dry-run | --resume] [--json]');
+    ctx.stderr('usage: qlb undo cswap [--dry-run [--record-drill] | --resume] [--json]');
+    return 2;
+  }
+  if (options.recordDrill && ctx.env.QLB_FAULT_INJECTION !== '1') {
+    ctx.stderr('qlb undo cswap: --record-drill requires QLB_FAULT_INJECTION=1');
     return 2;
   }
 
@@ -492,6 +500,24 @@ export async function runUndoCswapCommand(
   try {
     if (options.dryRun) {
       const plan = await (dependencies.plan ?? planHandBack)(base);
+      if (options.recordDrill) {
+        const store = openStore(ctx.config.dbPath);
+        let admissionRefusal: string | null = null;
+        try {
+          store.runImmediate(() => {
+            const admission = assertAdmittedInConnection((store as unknown as { db: import('node:sqlite').DatabaseSync }).db, 'undo-cswap:dry-run-record');
+            if (!admission.ok) {
+              admissionRefusal = admission.code ?? 'lifecycle-refused';
+              return;
+            }
+            store.setConfig('drill.undoDryRunAt', String((dependencies.now ?? Date.now)()));
+          });
+        } finally { store.close(); }
+        if (admissionRefusal !== null) {
+          ctx.stderr(`qlb undo cswap: refused: ${admissionRefusal}`);
+          return 3;
+        }
+      }
       if (options.json) ctx.stdout(JSON.stringify({ ...plan, dryRun: true }));
       else for (const line of formatHuman(plan)) ctx.stdout(line);
       return 0;
