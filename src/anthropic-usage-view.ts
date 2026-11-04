@@ -1,6 +1,9 @@
 // Read-only Anthropic usage projection shared by auto, status, and doctor.
 
 import { DatabaseSync } from 'node:sqlite';
+import { loginExpiresAtIso } from './anthropic-oauth';
+import { platformKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from './keychain';
+import { redactSecrets } from './redact';
 import type { AccountSnapshot, BucketReading, Confidence } from './types';
 import { STALE_OK_S } from './usage-freshness';
 export { STALE_OK_S };
@@ -13,9 +16,19 @@ const HARD_SENTINEL_STATUSES = new Set(['token-expired', 'foreign-credential', '
 export interface AnthropicUsageSlot {
   accountId: string;
   email?: string | null;
+  threshold?: number | null;
   dead?: boolean;
   archivedAt?: number | null;
 }
+
+export interface AnthropicStatusSnapshot extends AccountSnapshot {
+  loginExpiresAt: string | null;
+  usageError?: string;
+  usageRetryAt?: string;
+  threshold?: number;
+}
+
+export type AnthropicCredentialReader = (accountId: string) => string;
 
 /** The read-only poll fields required to decide whether a retained reading is usable. */
 export interface AnthropicUsagePollRow {
@@ -113,7 +126,58 @@ export interface AnthropicUsageStoreReader {
 
 export interface AnthropicStoreSnapshots {
   hasPolls: boolean;
-  snapshots: AccountSnapshot[];
+  snapshots: AnthropicStatusSnapshot[];
+}
+
+function isoSeconds(value: number | null | undefined): string | null {
+  if (value == null || !Number.isFinite(value)) return null;
+  try {
+    return new Date(value * 1000).toISOString();
+  } catch {
+    return null;
+  }
+}
+
+function loginExpiry(accountId: string, readCredential?: AnthropicCredentialReader): string | null {
+  if (!readCredential) return null;
+  try {
+    return loginExpiresAtIso(readCredential(accountId));
+  } catch {
+    return null;
+  }
+}
+
+function unavailableUsageFields(
+  row: AnthropicUsagePollRow | undefined,
+  nowS: number,
+): Pick<AnthropicStatusSnapshot, 'usageError' | 'usageRetryAt'> {
+  if (!row) return {};
+  const usageError = row.lastStatus && row.lastStatus !== 'ok' && row.lastStatus !== 'codex-won'
+    ? redactSecrets(row.lastStatus, [])
+    : undefined;
+  const usageRetryAt = row.backoffUntil != null && row.backoffUntil > nowS
+    ? isoSeconds(row.backoffUntil) ?? undefined
+    : undefined;
+  return {
+    ...(usageError === undefined ? {} : { usageError }),
+    ...(usageRetryAt === undefined ? {} : { usageRetryAt }),
+  };
+}
+
+function statusSnapshot(
+  slot: AnthropicUsageSlot,
+  snapshot: AccountSnapshot,
+  row: AnthropicUsagePollRow | undefined,
+  nowS: number,
+  readCredential?: AnthropicCredentialReader,
+): AnthropicStatusSnapshot {
+  const usageUnavailable = snapshot.error === 'unavailable';
+  return {
+    ...snapshot,
+    loginExpiresAt: loginExpiry(slot.accountId, readCredential),
+    ...(slot.threshold == null || !Number.isFinite(slot.threshold) ? {} : { threshold: slot.threshold }),
+    ...(usageUnavailable ? unavailableUsageFields(row, nowS) : {}),
+  };
 }
 
 function hasPollsForLiveSlots(
@@ -128,6 +192,7 @@ export function anthropicStoreSnapshots(
   slots: readonly AnthropicUsageSlot[],
   store: AnthropicUsageStoreReader,
   nowS: number,
+  readCredential?: AnthropicCredentialReader,
 ): AnthropicStoreSnapshots {
   const liveSlots = slots.filter((slot) => slot.archivedAt == null);
   const polls = store.listUsagePolls('anthropic');
@@ -137,6 +202,7 @@ export function anthropicStoreSnapshots(
       hasPolls,
       snapshots: [{
         accountId: 'anthropic', provider: 'anthropic', label: 'Claude (Anthropic)', buckets: {}, error: 'unavailable',
+        loginExpiresAt: null,
       }],
     };
   }
@@ -144,15 +210,28 @@ export function anthropicStoreSnapshots(
     hasPolls,
     snapshots: liveSlots.map((slot) => {
       const label = slot.email ?? slot.accountId;
+      const row = polls[slot.accountId];
       if (slot.dead) {
-        return { accountId: slot.accountId, provider: 'anthropic', label, buckets: {}, error: 'token_dead' };
+        return statusSnapshot(
+          slot,
+          { accountId: slot.accountId, provider: 'anthropic', label, buckets: {}, error: 'token_dead' },
+          row,
+          nowS,
+          readCredential,
+        );
       }
       const buckets = projectAnthropicUsageReadings(
-        store.getAllSnapshots(slot.accountId), polls[slot.accountId], nowS,
+        store.getAllSnapshots(slot.accountId), row, nowS,
       );
-      return Object.keys(buckets).length > 0
-        ? { accountId: slot.accountId, provider: 'anthropic', label, buckets }
-        : { accountId: slot.accountId, provider: 'anthropic', label, buckets: {}, error: 'unavailable' };
+      return statusSnapshot(
+        slot,
+        Object.keys(buckets).length > 0
+          ? { accountId: slot.accountId, provider: 'anthropic', label, buckets }
+          : { accountId: slot.accountId, provider: 'anthropic', label, buckets: {}, error: 'unavailable' },
+        row,
+        nowS,
+        readCredential,
+      );
     }),
   };
 }
@@ -198,7 +277,7 @@ function readOnlyStoreData(dbPath: string): {
         backoffUntil: numberOrNull(row.backoff_until), last429At: numberOrNull(row.last_429_at), heldUntil: numberOrNull(row.held_until),
       };
     }
-    const slots = db.prepare(`SELECT account_id, email, dead, archived_at
+    const slots = db.prepare(`SELECT account_id, email, threshold, dead, archived_at
       FROM claude_slots`).all() as Array<Record<string, unknown>>;
     const snapshots = new Map<string, Record<string, BucketReading>>();
     const snapshotRows = db.prepare(`SELECT account_id, bucket, used_pct, used, limit_val, remaining,
@@ -223,6 +302,7 @@ function readOnlyStoreData(dbPath: string): {
       slots: slots.map((row) => ({
         accountId: String(row.account_id),
         email: typeof row.email === 'string' ? row.email : null,
+        threshold: numberOrNull(row.threshold),
         dead: Number(row.dead) !== 0,
         archivedAt: numberOrNull(row.archived_at),
       })),
@@ -236,14 +316,19 @@ function readOnlyStoreData(dbPath: string): {
   }
 }
 
-/** Reads the status projection through a SQLite read-only handle; it never migrates or scrubs. */
-export function readAnthropicStoreSnapshots(dbPath: string, nowS: number): AnthropicStoreSnapshots | null {
+/** Reads the status projection through read-only SQLite and credential handles; it never migrates, scrubs, or writes secrets. */
+export function readAnthropicStoreSnapshots(
+  dbPath: string,
+  nowS: number,
+  readCredential: AnthropicCredentialReader = (accountId) =>
+    platformKeychain.getSync(qlbKeychainService('anthropic', accountId), QLB_KEYCHAIN_ACCOUNT),
+): AnthropicStoreSnapshots | null {
   const data = readOnlyStoreData(dbPath);
   if (!data) return null;
   return anthropicStoreSnapshots(data.slots, {
     listUsagePolls: () => data.polls,
     getAllSnapshots: (accountId) => data.snapshots.get(accountId) ?? {},
-  }, nowS);
+  }, nowS, readCredential);
 }
 
 /** Reads persisted poll freshness through a SQLite read-only handle. */
