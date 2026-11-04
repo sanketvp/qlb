@@ -35,7 +35,7 @@ export interface AnthropicPollDeps {
   now: () => number;
   /** Kept injectable because jitter must be deterministic in collector tests. */
   rng?: () => number;
-  /** Scoped model names; no writer exists yet, so the production caller supplies none. */
+  /** Scoped model names passed from the production live binding's configured scope. */
   models?: readonly string[];
   fetchActiveDeps: Omit<FetchActiveUsageDeps, 'slots' | 'store' | 'getUsage' | 'afterAcceptedUsage'>;
   /** The active-fetch memo is deliberately shared with this resync hook. */
