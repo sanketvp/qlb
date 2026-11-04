@@ -34,7 +34,7 @@ function fixture() {
   const slots = { listSlots: () => [
     { accountId: 'active', dead: false }, { accountId: 'next', dead: false },
   ] } as unknown as import('../src/cc-slots').ClaudeSlots;
-  return { root, store, slots };
+  return { root, config, store, slots };
 }
 
 function rows(store: ReturnType<typeof openStore>) {
