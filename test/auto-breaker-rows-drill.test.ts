@@ -114,7 +114,9 @@ describe('auto breaker-rows fault drill', () => {
   it('excludes synthetic seeds from later normal breaker and cooldown clocks', async () => {
     const { root, store, slots } = fixture();
     try {
-      anthropicBreakerRowsDrill({ store, slots, now: () => NOW });
+      const drill = anthropicBreakerRowsDrill({ store, slots, now: () => NOW });
+      assert.equal(drill.decision.kind, 'stay');
+      assert.equal(drill.decision.reason, 'breaker');
       assert.equal(store.latestCommittedAnthropicAutoswitchAt(), undefined);
       store.setConfig('auto.anthropic.suspendedUntil', '');
       store.setConfig('auto.anthropic.unhealthyTicks', '2');
@@ -133,7 +135,9 @@ describe('auto breaker-rows fault drill', () => {
   it('does not start a production dry-run cooldown from seed rows', async () => {
     const { root, config, store, slots } = fixture();
     try {
-      anthropicBreakerRowsDrill({ store, slots, now: () => NOW });
+      const drill = anthropicBreakerRowsDrill({ store, slots, now: () => NOW });
+      assert.equal(drill.decision.kind, 'stay');
+      assert.equal(drill.decision.reason, 'breaker');
       store.setConfig('auto.anthropic.suspendedUntil', '');
       store.upsertSnapshot('active', '5h', { usedPct: 95, fetchedAt: NOW, source: 'poll', confidence: 'authoritative' });
       const output = await runAuto({ once: true, dryRun: true }, {

@@ -129,7 +129,9 @@ describe('qlb retire cswap (AC22 retire)', () => {
         f.store.upsertSnapshot(accountId, '5h', { usedPct, fetchedAt: NOW, source: 'poll', confidence: 'authoritative' });
       }
       const slots = { listSlots: () => [{ accountId: 'active', dead: false }, { accountId: 'next', dead: false }] } as unknown as ClaudeSlots;
-      anthropicBreakerRowsDrill({ store: f.store, slots, now: () => NOW });
+      const drill = anthropicBreakerRowsDrill({ store: f.store, slots, now: () => NOW });
+      assert.equal(drill.decision.kind, 'stay');
+      assert.equal(drill.decision.reason, 'breaker');
       f.store.recordSwitch({ provider: 'anthropic', toAccount: 'next', trigger: 'proactive', outcome: 'ok', injected: true, detail: 'fault-injection:usage-5xx', committedAt: NOW });
       const context = {
         env: { QLB_TEST_MODE: '1', QLB_HOME: f.root }, home: f.root,
