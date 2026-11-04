@@ -1335,7 +1335,9 @@ async function runStatus(opts: StatusOpts): Promise<number> {
   }));
   const lifecycle = phase(store);
   const accounts = nested.flat().map((account) =>
-    account.provider === 'anthropic' && qlbOwnsAnthropicUsage(lifecycle.state)
+    account.provider === 'anthropic'
+      && qlbOwnsAnthropicUsage(lifecycle.state)
+      && !(account.accountId === account.provider && account.error !== undefined)
       ? { ...account, loginExpiresAt: statusAnthropicLoginExpiry(account.accountId) }
       : account,
   );

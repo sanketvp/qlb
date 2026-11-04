@@ -224,6 +224,20 @@ describe('status JSON operational fields', () => {
     assert.equal(body.breaker, null);
   });
 
+  it('does not add login expiry to an unavailable Anthropic placeholder', () => {
+    const f = fixture();
+    const store = initialize(f);
+    store.close();
+    insertLifecycle(f.dbPath);
+
+    const result = runCli(['status', '--json'], f.env);
+    assert.equal(result.status, 0, result.stderr);
+    const body = JSON.parse(result.stdout) as { accounts: Array<Record<string, unknown>> };
+    const placeholder = body.accounts.find((account) => account.accountId === 'anthropic');
+    assert.equal(placeholder?.error, 'unavailable');
+    assert.equal(Object.hasOwn(placeholder ?? {}, 'loginExpiresAt'), false);
+  });
+
   it('keeps warnings only on stderr while stdout remains one parseable JSON object', () => {
     const f = fixture();
     const store = initialize(f);
