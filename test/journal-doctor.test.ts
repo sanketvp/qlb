@@ -75,11 +75,11 @@ describe('journal doctor rows (HP-K14-3)', () => {
     });
   });
 
-  it('fails a stale promoting import journal with its recovery action', () => {
+  it('reports that retired import journals cannot be reconciled', () => {
     const h = fixture(); writeImportJournal(h.journalDir, 'stale-promoting', 'promoting'); mkdirSync(join(h.journalDir, 'cswap-import.lock'));
     const stale = new Date(Date.now() - 61_000); utimesSync(join(h.journalDir, 'cswap-import.lock'), stale, stale);
     assert.deepEqual(journalOrphanedCheck(h.dbPath, 'retired', { journalDir: h.journalDir }), {
-      name: 'journal:orphaned', level: 'FAIL', message: 'runId=stale-promoting phase=promoting action=recover; run qlb import cswap --reconcile',
+      name: 'journal:orphaned', level: 'FAIL', message: 'runId=stale-promoting phase=promoting action=recover; reconciliation is available only during cutting-over or cutover',
     });
   });
 
@@ -90,10 +90,10 @@ describe('journal doctor rows (HP-K14-3)', () => {
     });
   });
 
-  it('fails an unreadable import journal as unclassifiable', () => {
+  it('directs unclassifiable import journals to manual inspection', () => {
     const h = fixture(); const path = join(h.journalDir, 'cswap-import-unreadable'); mkdirSync(path, { recursive: true }); writeFileSync(join(path, 'journal.json'), '{bad');
     assert.deepEqual(journalOrphanedCheck(h.dbPath, 'cutover', { journalDir: h.journalDir }), {
-      name: 'journal:orphaned', level: 'FAIL', message: 'runId=unreadable phase=invalid action=unclassifiable; run qlb import cswap --reconcile',
+      name: 'journal:orphaned', level: 'FAIL', message: 'runId=unreadable phase=invalid action=unclassifiable; inspect unclassifiable import journals manually',
     });
   });
 

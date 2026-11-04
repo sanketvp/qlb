@@ -1,9 +1,16 @@
-import { classifyCswapImportJournals, probeCswapImportLock } from '../cswap-import';
+import { classifyCswapImportJournals, probeCswapImportLock, type CswapImportJournalStatus } from '../cswap-import';
+import { redactError } from '../redact';
 import { check } from './_check';
 import type { HealthCheck } from './claude-slots';
 import { importOptions, unavailable, type JournalDoctorOptions } from './journal-in-progress';
 
 export default check('journal:orphaned');
+
+function recoveryAdvice(phase: string, orphans: CswapImportJournalStatus[]): string {
+  if (orphans.some((journal) => journal.action === 'unclassifiable')) return '; inspect unclassifiable import journals manually';
+  if (phase === 'retired') return '; reconciliation is available only during cutting-over or cutover';
+  return '; run qlb import cswap --reconcile';
+}
 
 /** Report import journals which need explicit reconciliation without advancing them. */
 export function journalOrphanedCheck(dbPath: string, phase: string, options: JournalDoctorOptions = {}): HealthCheck {
@@ -18,10 +25,10 @@ export function journalOrphanedCheck(dbPath: string, phase: string, options: Jou
     return {
       name: 'journal:orphaned',
       level: 'FAIL',
-      message: `${orphans.map((journal) => `runId=${journal.runId} phase=${journal.phase} action=${journal.action}`).join('; ')}; run qlb import cswap --reconcile`,
+      message: `${orphans.map((journal) => `runId=${journal.runId} phase=${journal.phase} action=${journal.action}`).join('; ')}${recoveryAdvice(phase, orphans)}`,
     };
-  } catch {
-    return { name: 'journal:orphaned', level: 'FAIL', message: 'runId=journal-root-unreadable phase=invalid action=unclassifiable; run qlb import cswap --reconcile' };
+  } catch (error) {
+    return { name: 'journal:orphaned', level: 'FAIL', message: `unable to inspect C-swap import journals: ${redactError(error, [])}` };
   } finally {
     imports.repository.close();
   }
