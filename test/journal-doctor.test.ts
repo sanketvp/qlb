@@ -56,6 +56,18 @@ describe('journal doctor rows (HP-K14-3)', () => {
     });
   });
 
+  it('does not report finished Claude switch journals as in progress', async () => {
+    for (const patch of [{ committed: 1 }, { closed: 'rolled-back' as const }]) {
+      const h = fixture();
+      createClaudeSwitchJournal({ ...switchJournal(h.switchOptions), ...patch }, h.switchOptions);
+      await withClaudeSwitchJournalOwner(h.switchOptions, async () => {
+        assert.deepEqual(await journalInProgressCheck(h.dbPath, 'cutover', { journal: h.switchOptions, journalDir: h.journalDir }), {
+          name: 'journal:in-progress', level: 'PASS', message: 'no journal in progress',
+        });
+      });
+    }
+  });
+
   it('reports a fresh C-swap import lock and its journal phases as in progress', async () => {
     const h = fixture(); writeImportJournal(h.journalDir, 'fresh-import', 'staged'); mkdirSync(join(h.journalDir, 'cswap-import.lock'));
     assert.deepEqual(await journalInProgressCheck(h.dbPath, 'cutting-over', { journalDir: h.journalDir }), {
@@ -87,6 +99,13 @@ describe('journal doctor rows (HP-K14-3)', () => {
 
   it('passes a cleaned import journal', () => {
     const h = fixture(); writeImportJournal(h.journalDir, 'cleaned', 'cleaned');
+    assert.deepEqual(journalOrphanedCheck(h.dbPath, 'cutover', { journalDir: h.journalDir }), {
+      name: 'journal:orphaned', level: 'PASS', message: 'no orphaned import journals',
+    });
+  });
+
+  it('passes an aborted import journal', () => {
+    const h = fixture(); writeImportJournal(h.journalDir, 'aborted', 'aborted');
     assert.deepEqual(journalOrphanedCheck(h.dbPath, 'cutover', { journalDir: h.journalDir }), {
       name: 'journal:orphaned', level: 'PASS', message: 'no orphaned import journals',
     });

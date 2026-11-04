@@ -24,14 +24,14 @@ export interface JournalDoctorOptions {
   now?: () => number;
 }
 
-function unavailable(phase: string, name: string): HealthCheck | null {
+export function unavailable(phase: string, name: string): HealthCheck | null {
   if (phase === 'unknown') return { name, level: 'WARN', message: 'lifecycle phase unavailable; journals cannot be evaluated' };
   if (!isLifecycleState(phase)) return { name, level: 'WARN', message: 'cannot evaluate: unknown lifecycle state' };
   if (!APPLICABLE_PHASES.has(phase)) return { name, level: 'N/A', message: `not applicable in phase=${phase}` };
   return null;
 }
 
-function importOptions(dbPath: string, options: JournalDoctorOptions) {
+export function importOptions(dbPath: string, options: JournalDoctorOptions) {
   // The classifier never reads Keychain; this read-only repository prevents a
   // doctor invocation from creating a WAL file or otherwise advancing state.
   return {
@@ -58,7 +58,7 @@ export async function journalInProgressCheck(dbPath: string, phase: string, opti
   let switchHeld = false;
   try {
     const switchRead = readClaudeSwitchJournal(journal);
-    switchHeld = switchRead.state === 'ok' && (
+    switchHeld = switchRead.state === 'ok' && switchRead.journal.committed === undefined && switchRead.journal.closed === null && (
       probeClaudeSwitchJournalOwner(journal) === 'held' || await stillTheSameProcess(switchRead.journal.owner)
     );
   } catch {
