@@ -58,6 +58,7 @@ export function claudeLoginExpiryCheck(
     const expired = observations.filter((item) => item.kind === 'expired');
     const unreadable = observations.filter((item) => item.kind === 'unreadable');
     const expiring = observations.filter((item) => item.kind === 'expiring');
+    const notReported = observations.filter((item) => item.kind === 'not-reported');
     const message = [
       expired.length > 0 && `expired Claude login: ${expired.map((item) => `${item.accountId} (${item.expiresAt})`).join(', ')}`,
       unreadable.length > 0 && `Claude credential unreadable for slot ${unreadable.map((item) => item.accountId).join(', ')}`,
@@ -65,10 +66,13 @@ export function claudeLoginExpiryCheck(
     ].filter((item): item is string => Boolean(item)).join('; ');
     const level = expired.length > 0 ? 'FAIL' : unreadable.length > 0 || expiring.length > 0 ? 'WARN' : undefined;
     if (level !== undefined) return { name: 'claude:login-expiry', level, message };
-    if (observations.every((item) => item.kind === 'not-reported')) {
+    if (notReported.length === observations.length) {
       return { name: 'claude:login-expiry', level: 'PASS', message: 'expiry not reported' };
     }
-    return { name: 'claude:login-expiry', level: 'PASS', message: 'Claude login expiry is valid' };
+    const detail = notReported.length > 0
+      ? `; expiry not reported for slot ${notReported.map((item) => item.accountId).join(', ')}`
+      : '';
+    return { name: 'claude:login-expiry', level: 'PASS', message: `Claude login expiry is valid${detail}` };
   }, (error) => ({
     name: 'claude:login-expiry', level: 'WARN',
     message: `Claude login expiry cannot be evaluated: ${redactError(error, [])}`,

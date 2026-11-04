@@ -79,6 +79,19 @@ describe('claude:login-expiry doctor check', () => {
     });
   });
 
+  it('keeps missing expiry observations visible alongside valid logins', () => {
+    const dbPath = fixture();
+    insertSlot(dbPath, 'valid');
+    insertSlot(dbPath, 'unreported');
+    assert.deepEqual(claudeLoginExpiryCheck(dbPath, keychain(
+      ['valid', credential(NOW + 8 * 24 * 60 * 60 * 1_000)],
+      ['unreported', credential(0)],
+    ), NOW), {
+      name: 'claude:login-expiry', level: 'PASS',
+      message: 'Claude login expiry is valid; expiry not reported for slot unreported',
+    });
+  });
+
   it('warns when a live slot credential is not parseable', () => {
     const dbPath = fixture();
     insertSlot(dbPath, 'slot');
