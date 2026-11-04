@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
-import { anthropicStoreSnapshots, readAnthropicStoreSnapshots, readAnthropicUsagePollFreshness } from '../src/anthropic-usage-view';
+import { anthropicStoreSnapshots, projectAnthropicUsageReadings, readAnthropicStoreSnapshots, readAnthropicUsagePollFreshness } from '../src/anthropic-usage-view';
 import type { ClaudeSlot } from '../src/cc-slots';
 import { openStore } from '../src/store';
 
@@ -123,6 +123,33 @@ describe('QLB-owned Anthropic store projection', () => {
     } finally {
       store.close();
     }
+  });
+
+  it('non-poll readings never set the 429 reset', () => {
+    const buckets = projectAnthropicUsageReadings({
+      '5h': { usedPct: 12, fetchedAt: (NOW_S - 301) * 1000, resetAt: (NOW_S + 1) * 1000, source: 'poll', confidence: 'authoritative' },
+      headers: { usedPct: 12, fetchedAt: NOW_S * 1000, resetAt: NOW_S * 1000 - 1, source: 'headers', confidence: 'authoritative' },
+    }, {
+      accountId: 'active', lastFetchAt: NOW_S - 301, lastAttemptAt: NOW_S,
+      nextDueAt: null, pollIntervalS: null, lastStatus: 'http-429', consecutiveFailures: 0,
+      backoffUntil: null, last429At: NOW_S, heldUntil: null,
+    }, NOW_S);
+    assert.equal(buckets['5h']?.usedPct, 12);
+  });
+
+  it('withholds a reading whose own window reset, including the newest cohort', () => {
+    const buckets = projectAnthropicUsageReadings({
+      '5h': { usedPct: 20, fetchedAt: NOW_S * 1000, resetAt: (NOW_S + 86_400) * 1000, source: 'poll', confidence: 'authoritative' },
+      '7d:Fable': { usedPct: 100, fetchedAt: NOW_S * 1000, resetAt: (NOW_S - 1) * 1000, source: 'poll', confidence: 'authoritative' },
+      '7d:Sonnet': { usedPct: 50, fetchedAt: NOW_S * 1000, source: 'poll', confidence: 'authoritative' },
+    }, {
+      accountId: 'active', lastFetchAt: NOW_S, lastAttemptAt: NOW_S,
+      nextDueAt: null, pollIntervalS: null, lastStatus: 'ok', consecutiveFailures: 0,
+      backoffUntil: null, last429At: null, heldUntil: null,
+    }, NOW_S);
+    assert.equal(buckets['5h']?.usedPct, 20);
+    assert.equal(buckets['7d:Fable'], undefined);
+    assert.equal(buckets['7d:Sonnet']?.usedPct, 50);
   });
 
   it('excludes archived polls and C-swap import snapshots from persisted projections', () => {
