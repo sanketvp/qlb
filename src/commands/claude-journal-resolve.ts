@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 
 import { makeProductionSwitchDeps, type SwitchResources } from './switch-anthropic';
 import type { ClaudeSwitchDeps } from '../cc-switch';
+import { ClaudeCodeLockTimeout, ProperLockfileCompromised } from '../cc-locks';
 import { resolveClaudeSwitchJournal, type ClaudeJournalResolveDirection } from '../journal';
 import { assertAdmitted } from '../lifecycle';
 import type { CommandContext, CommandDefinition } from '../registry';
@@ -30,9 +31,10 @@ export function createClaudeJournalResolveCommand(deps: ClaudeJournalResolveComm
         ctx.stderr('usage: qlb claude journal resolve --forward|--back');
         return 2;
       }
-      const store = (deps.openStore ?? openStore)(ctx.config.dbPath);
+      let store: Store | undefined;
       let resources: SwitchResources | undefined;
       try {
+        store = (deps.openStore ?? openStore)(ctx.config.dbPath);
         const admission = (deps.assertAdmitted ?? assertAdmitted)(store, 'claude-journal-resolve');
         if (!admission.ok) {
           ctx.stderr(`qlb claude journal resolve: refused: ${admission.code}`);
@@ -48,8 +50,15 @@ export function createClaudeJournalResolveCommand(deps: ClaudeJournalResolveComm
         }
         ctx.stdout(`Claude journal resolved ${direction}${result.fingerprints?.length ? ` (${result.fingerprints.join(', ')})` : ''}`);
         return 0;
+      } catch (error) {
+        if (error instanceof ClaudeCodeLockTimeout || error instanceof ProperLockfileCompromised) {
+          ctx.stderr('qlb claude journal resolve: refused: lock-timeout');
+          return 3;
+        }
+        ctx.stderr('qlb claude journal resolve: failed');
+        return 1;
       } finally {
-        try { resources?.close?.(); } finally { store.close(); }
+        try { resources?.close?.(); } finally { store?.close(); }
       }
     },
   };

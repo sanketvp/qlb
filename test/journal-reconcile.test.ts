@@ -18,9 +18,11 @@ import {
   type ClaudeSwitchJournal,
 } from '../src/cc-switch-journal';
 import { MockKeychain } from '../src/keychain';
-import { reconcileClaudeSwitch } from '../src/journal';
+import { reconcileClaudeSwitch, resolveClaudeSwitchJournal } from '../src/journal';
 import { switchClaude, type ClaudeSwitchDeps } from '../src/cc-switch';
 import { createSwitchAnthropicCommand } from '../src/commands/switch-anthropic';
+import { createClaudeJournalResolveCommand } from '../src/commands/claude-journal-resolve';
+import { ClaudeCodeLockTimeout } from '../src/cc-locks';
 import type { CommandContext } from '../src/registry';
 
 const NOW = 1_000_000;
@@ -46,6 +48,7 @@ async function fixture() {
   await slots.createSlot({ accountId: 'b', credential: target, email: 'b@example.test', orgUuid: 'org-b', configJson: JSON.stringify({ oauthAccount: { accountUuid: 'b' } }), source: 'cswap-import' });
   let active = 'a';
   const rows: Array<Record<string, unknown>> = [];
+  const commits: Array<Record<string, unknown>> = [];
   const committed = new Set<string>();
   const warnings: string[] = [];
   const deps: ClaudeSwitchDeps = {
@@ -57,7 +60,7 @@ async function fixture() {
       recordSwitch: (row: Record<string, unknown>) => { rows.push(row); return rows.length; },
       recordClaudeSwitchRefusal: (row: Record<string, unknown>) => { rows.push(row); return rows.length; },
       findClaudeSwitchByAttempt: (attempt: string) => committed.has(attempt) ? { id: 1, outcome: 'ok', ts: NOW, committedAt: NOW } : null,
-      commitClaudeSwitch: (row: { toAccount: string; beforeCommit?: () => void }) => { row.beforeCommit?.(); active = row.toAccount; return 1; },
+      commitClaudeSwitch: (row: { toAccount: string; beforeCommit?: () => void }) => { row.beforeCommit?.(); commits.push(row); active = row.toAccount; return 1; },
     } as unknown as ClaudeSwitchDeps['store'],
     slots,
     live: { backend, paths, account: 'fixture-user' },
@@ -69,7 +72,7 @@ async function fixture() {
     stillTheSameProcess: async () => false,
     warn: (message) => warnings.push(message),
   };
-  return { root, home, env, paths, backend, slots, outgoing, target, configText, deps, rows, committed, warnings, active: () => active };
+  return { root, home, env, paths, backend, slots, outgoing, target, configText, deps, rows, commits, committed, warnings, active: () => active };
 }
 
 function journal(subject: Subject, patch: Partial<ClaudeSwitchJournal> = {}): ClaudeSwitchJournal {
@@ -107,6 +110,90 @@ function wrappedBackend(backend: MockKeychain, overrides: Partial<ClaudeSwitchDe
 }
 
 describe('Claude switch journal reconciliation (G10)', () => {
+  it('journal resolve reports lock contention as a refusal instead of usage failure', async () => {
+    const subject = await fixture();
+    const stderr: string[] = [];
+    const command = createClaudeJournalResolveCommand({
+      openStore: () => ({ close: () => {} }) as never,
+      assertAdmitted: () => ({ ok: true }),
+      makeSwitchDeps: async () => subject.deps,
+      resolve: async () => { throw new ClaudeCodeLockTimeout(join(subject.root, 'fixture.lock')); },
+    });
+    const ctx = { ...({} as CommandContext), stderr: (line: string) => stderr.push(line), stdout: () => {}, env: subject.env, home: subject.home,
+      config: { dbPath: join(subject.root, 'unused.sqlite') } };
+
+    assert.equal(await command.execute!(['--forward'], ctx), 3);
+    assert.deepEqual(stderr, ['qlb claude journal resolve: refused: lock-timeout']);
+  });
+
+  it('journal resolve reports unexpected failures without exposing their message', async () => {
+    const subject = await fixture();
+    const stderr: string[] = [];
+    const command = createClaudeJournalResolveCommand({
+      openStore: () => ({ close: () => {} }) as never,
+      assertAdmitted: () => ({ ok: true }),
+      makeSwitchDeps: async () => subject.deps,
+      resolve: async () => { throw new Error('sensitive backend detail'); },
+    });
+    const ctx = { ...({} as CommandContext), stderr: (line: string) => stderr.push(line), stdout: () => {}, env: subject.env, home: subject.home,
+      config: { dbPath: join(subject.root, 'unused.sqlite') } };
+
+    assert.equal(await command.execute!(['--back'], ctx), 1);
+    assert.deepEqual(stderr, ['qlb claude journal resolve: failed']);
+  });
+
+  it('operator forward completes a step-7 journal with journal provenance', async () => {
+    const subject = await fixture();
+    await install(subject);
+    await subject.backend.set(subject.paths.keychainService, 'fixture-user', subject.target);
+
+    const result = await resolveClaudeSwitchJournal(subject.deps, 'forward');
+
+    assert.equal(result.outcome, 'resolved');
+    assert.equal(subject.active(), 'b');
+    assert.equal(JSON.parse(readFileSync(subject.paths.globalConfigPath, 'utf8')).oauthAccount.accountUuid, 'b');
+    assert.equal(subject.commits[0]?.setBy, 'journal');
+    assert.equal(subject.commits[0]?.detail, 'journal-forward');
+    assert.equal(journalExists(subject), false);
+  });
+
+  it('operator forward preserves a step-8 snapshot if commit fails, so back restores the outgoing config', async () => {
+    const subject = await fixture();
+    const changedConfig = `${JSON.stringify({ oauthAccount: { accountUuid: 'b' }, retained: 'yes' })}\n`;
+    await install(subject, journal(subject, {
+      step: 8, configText: subject.configText, configWrittenHash: digest(changedConfig),
+      fromOauthAccount: { accountUuid: 'a' }, configWriteStarted: true, configWritten: true,
+    }));
+    await subject.backend.set(subject.paths.keychainService, 'fixture-user', subject.target);
+    writeFileSync(subject.paths.globalConfigPath, changedConfig);
+    subject.deps.store.commitClaudeSwitch = () => { throw new Error('sqlite failure'); };
+
+    await assert.rejects(resolveClaudeSwitchJournal(subject.deps, 'forward'), /sqlite failure/);
+    const afterForward = readClaudeSwitchJournal({ journalDir: subject.deps.journalDir, home: subject.home, env: subject.env, configPath: subject.paths.globalConfigPath, keychainService: subject.paths.keychainService });
+    assert.equal(afterForward.state, 'ok');
+    if (afterForward.state === 'ok') assert.equal(afterForward.journal.configText, subject.configText);
+
+    const back = await resolveClaudeSwitchJournal(subject.deps, 'back');
+    assert.equal(back.outcome, 'resolved');
+    assert.equal(readFileSync(subject.paths.globalConfigPath, 'utf8'), subject.configText);
+    assert.equal(await subject.backend.get(subject.paths.keychainService, 'fixture-user'), subject.outgoing);
+  });
+
+  it('operator forward refuses a step-8 journal after an unrelated config edit', async () => {
+    const subject = await fixture();
+    const written = `${JSON.stringify({ oauthAccount: { accountUuid: 'b' }, retained: 'yes' })}\n`;
+    await install(subject, journal(subject, {
+      step: 8, configText: subject.configText, configWrittenHash: digest(written),
+      fromOauthAccount: { accountUuid: 'a' }, configWriteStarted: true, configWritten: true,
+    }));
+    await subject.backend.set(subject.paths.keychainService, 'fixture-user', subject.target);
+    const edited = `${JSON.stringify({ oauthAccount: { accountUuid: 'b' }, retained: 'operator edit' })}\n`;
+    writeFileSync(subject.paths.globalConfigPath, edited);
+
+    assert.deepEqual(await resolveClaudeSwitchJournal(subject.deps, 'forward'), { outcome: 'refused', reason: 'config-moved' });
+    assert.equal(readFileSync(subject.paths.globalConfigPath, 'utf8'), edited);
+    assert.equal(journalExists(subject), true);
+  });
   it('a crash after step 7 restores live and config byte-equal, then a new switch succeeds', async () => {
     const subject = await fixture();
     const changedConfig = `${JSON.stringify({ oauthAccount: { accountUuid: 'b' }, retained: 'yes' })}\n`;

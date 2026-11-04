@@ -43,10 +43,6 @@ async function ownerIsLive(deps: ClaudeSwitchDeps, journal: ClaudeSwitchJournal)
   return (deps.stillTheSameProcess ?? stillTheSameProcess)(journal.owner);
 }
 
-/**
- * Recover an orphaned, unfinished Claude switch by rolling its live effects
- * back. This deliberately never completes a switch forward.
- */
 export type ClaudeJournalResolveDirection = 'forward' | 'back';
 export type ClaudeJournalResolveResult = { outcome: 'resolved' | 'refused'; reason?: string; fingerprints?: string[] };
 
@@ -62,7 +58,10 @@ function targetOauth(journal: ClaudeSwitchJournal, deps: ClaudeSwitchDeps): Json
   } catch { return null; }
 }
 
-/** Resolve a dead owner's unfinished journal only on explicit operator request. */
+/**
+ * Resolve a dead owner's unfinished journal only on explicit operator request;
+ * forward completes it while automatic reconciliation remains rollback-only.
+ */
 export async function resolveClaudeSwitchJournal(
   deps: ClaudeSwitchDeps,
   direction: ClaudeJournalResolveDirection,
@@ -126,21 +125,31 @@ export async function resolveClaudeSwitchJournal(
     if (!sameAccountCredential(target, live)) return { outcome: 'refused', reason: 'target-lineage-missing' };
     const oauth = targetOauth(journal, deps);
     if (oauth === null) return { outcome: 'refused', reason: 'target-invalid' };
-    await configLock(journal.configPath, { env: deps.env }, async (held) => {
+    const configResult = await configLock(journal.configPath, { env: deps.env }, async (held): Promise<string | null> => {
       const raw = (deps.live.readText ?? ((path: string) => readFileSync(path, 'utf8')))(journal.configPath);
       readClaudeConfig(journal.configPath, () => raw);
+      if (journal.configWriteStarted) {
+        if (journal.configWrittenHash !== null && sha256(raw) === journal.configWrittenHash) return null;
+        if (journal.configText === null || raw !== journal.configText) return 'config-moved';
+      }
       let planned: string | undefined;
       await spliceOauthAccount(journal.configPath, oauth, held, { readText: () => raw, writeText: (_path, text) => { planned = text; } });
       if (planned === undefined) throw new Error('config-plan-failed');
-      update(ownerHeld, { step: 8, configText: raw, fromOauthAccount: journal.fromOauthAccount, configWrittenHash: sha256(planned), configWriteStarted: true }, options);
+      if (journal.configWriteStarted) {
+        if (journal.configWrittenHash === null || sha256(planned) !== journal.configWrittenHash) return 'config-moved';
+      } else {
+        update(ownerHeld, { step: 8, configText: raw, fromOauthAccount: journal.fromOauthAccount, configWrittenHash: sha256(planned), configWriteStarted: true }, options);
+      }
       (deps.live.writeText ?? ((path: string, text: string) => { atomicWriteText(path, text, { mode: 0o600 }); }))(journal.configPath, planned);
       update(ownerHeld, { configWritten: true }, options);
+      return null;
     });
+    if (configResult !== null) return { outcome: 'refused', reason: configResult };
     deps.store.commitClaudeSwitch({ now: deps.now(), fromAccount: journal.from, toAccount: journal.to, trigger: journal.trigger,
-      setBy: journal.trigger === 'manual' ? 'manual' : 'auto', attempt: journal.attemptId, outgoingKind: journal.outgoingKind,
+      setBy: 'journal', attempt: journal.attemptId, outgoingKind: journal.outgoingKind,
       bindingJson: journal.bindingJson, stepsJson: JSON.stringify({ attempt: journal.attemptId, started: [8, 9] }),
       publishedAt: journal.publishedAt ?? null, injected: journal.injected,
-      detail: journal.republish ? 'republish' : journal.detail ?? 'journal-forward', republish: journal.republish, decision: journal.decision });
+      detail: journal.republish ? 'republish' : 'journal-forward', republish: journal.republish, decision: journal.decision });
     update(ownerHeld, { committed: deps.now() }, options);
     await deleteStagedRollback(deps.live.backend, journal.stagedBlobService);
     remove(ownerHeld, options);
@@ -148,6 +157,10 @@ export async function resolveClaudeSwitchJournal(
   })), { home: deps.home, env: deps.env });
 }
 
+/**
+ * Recover an orphaned, unfinished Claude switch by rolling its live effects
+ * back. This deliberately never completes a switch forward.
+ */
 export async function reconcileClaudeSwitch(deps: ClaudeSwitchDeps): Promise<void> {
   // S24 must prevent recovery from acquiring any Claude Code lock too.
   const initialCswapProcessReason = checkClaudeCswapProcessPrecondition(deps);
