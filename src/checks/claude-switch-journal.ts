@@ -22,7 +22,6 @@ const APPLICABLE_PHASES = new Set<string>(LIFECYCLE_STATES.filter((phase) => (
 export interface ClaudeSwitchJournalCheckOptions {
   journal?: ClaudeSwitchJournalOptions;
   ownerIsLive?: (owner: ClaudeSwitchJournal['owner']) => Promise<boolean>;
-  committed?: (attemptId: string) => boolean;
 }
 
 function journalOptions(options: ClaudeSwitchJournalCheckOptions): ClaudeSwitchJournalOptions {
@@ -67,8 +66,7 @@ export async function claudeSwitchJournalCheck(
   if (read.state === 'malformed') return { name: 'claude:switch-journal', level: 'FAIL', message: 'malformed' };
 
   try {
-    const committed = options.committed ?? ((attemptId: string) => isCommitted(dbPath, attemptId));
-    if (read.journal.committed !== undefined || read.journal.closed !== null || committed(read.journal.attemptId)) {
+    if (read.journal.committed !== undefined || read.journal.closed !== null || isCommitted(dbPath, read.journal.attemptId)) {
       return { name: 'claude:switch-journal', level: 'PASS', message: 'finished' };
     }
     const ownerIsLive = options.ownerIsLive ?? stillTheSameProcess;

@@ -118,7 +118,6 @@ describe('Claude switch journal reconciliation (G10)', () => {
     const subject = await fixture();
     const options = {
       journal: { journalDir: subject.deps.journalDir, home: subject.home, env: subject.env, configPath: subject.paths.globalConfigPath, keychainService: subject.paths.keychainService },
-      committed: () => false,
     };
     for (const phase of ['pre-cutover', 'undoing', 'rolled-back', 'aborted'] as const) {
       assert.deepEqual(await claudeSwitchJournalCheck('unused.sqlite', phase, options), {
@@ -135,13 +134,15 @@ describe('Claude switch journal reconciliation (G10)', () => {
   it('doctor passes an unfinished switch journal while its owner lock is held', async () => {
     const subject = await fixture();
     await install(subject);
+    const dbPath = join(subject.root, 'qlb.sqlite');
+    const store = openStore(dbPath);
+    store.close();
     const options = {
       journal: { journalDir: subject.deps.journalDir, home: subject.home, env: subject.env, configPath: subject.paths.globalConfigPath, keychainService: subject.paths.keychainService },
-      committed: () => false,
       ownerIsLive: async () => false,
     };
     await withClaudeSwitchJournalOwner(options.journal, async () => {
-      assert.deepEqual(await claudeSwitchJournalCheck('unused.sqlite', 'cutover', options), {
+      assert.deepEqual(await claudeSwitchJournalCheck(dbPath, 'cutover', options), {
         name: 'claude:switch-journal', level: 'PASS', message: 'in progress',
       });
     });
@@ -150,12 +151,14 @@ describe('Claude switch journal reconciliation (G10)', () => {
   it('doctor passes an unfinished switch journal while its owner process is alive', async () => {
     const subject = await fixture();
     await install(subject);
+    const dbPath = join(subject.root, 'qlb.sqlite');
+    const store = openStore(dbPath);
+    store.close();
     const options = {
       journal: { journalDir: subject.deps.journalDir, home: subject.home, env: subject.env, configPath: subject.paths.globalConfigPath, keychainService: subject.paths.keychainService },
-      committed: () => false,
       ownerIsLive: async () => true,
     };
-    assert.deepEqual(await claudeSwitchJournalCheck('unused.sqlite', 'cutover', options), {
+    assert.deepEqual(await claudeSwitchJournalCheck(dbPath, 'cutover', options), {
       name: 'claude:switch-journal', level: 'PASS', message: 'in progress',
     });
   });
@@ -186,17 +189,31 @@ describe('Claude switch journal reconciliation (G10)', () => {
     });
   });
 
-  it('doctor fails an orphaned unfinished journal with only reconciliation metadata and leaves its sha256 byte-identical', async () => {
+  it('doctor fails an orphaned journal with a matching refused switch and leaves its sha256 byte-identical', async () => {
     const subject = await fixture();
     const entry = await install(subject);
+    const dbPath = join(subject.root, 'qlb.sqlite');
+    const store = openStore(dbPath);
+    try {
+      store.recordClaudeSwitchRefusal({
+        from: entry.from,
+        to: entry.to,
+        trigger: entry.trigger,
+        reason: 'fixture-refusal',
+        injected: false,
+        attempt: entry.attemptId,
+        now: NOW,
+      });
+    } finally {
+      store.close();
+    }
     const path = claudeSwitchJournalPath({ journalDir: subject.deps.journalDir });
     const before = createHash('sha256').update(readFileSync(path)).digest('hex');
     const options = {
       journal: { journalDir: subject.deps.journalDir, home: subject.home, env: subject.env, configPath: subject.paths.globalConfigPath, keychainService: subject.paths.keychainService },
-      committed: () => false,
       ownerIsLive: async () => false,
     };
-    const result = await claudeSwitchJournalCheck('unused.sqlite', 'cutover', options);
+    const result = await claudeSwitchJournalCheck(dbPath, 'cutover', options);
     assert.equal(result.level, 'FAIL');
     assert.equal(result.message, `unfinished Claude switch journal ${path}: attemptId=${entry.attemptId} step=${entry.step} from=${entry.from} to=${entry.to}; run qlb claude journal resolve --forward or qlb claude journal resolve --back`);
     assert.equal(createHash('sha256').update(readFileSync(path)).digest('hex'), before);
