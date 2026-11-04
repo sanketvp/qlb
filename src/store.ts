@@ -650,6 +650,44 @@ export function readOnlySchemaRefusal(db: DatabaseSync): 'schema-migration-requi
     : null;
 }
 
+/** Applies the one-time legacy relogin scrub without writing the store. */
+export function scrubReloginFields(row: { detail: unknown; evidence: unknown }): {
+  detail: string | null;
+  evidence: string | null;
+} {
+  return {
+    detail: row.detail == null
+      ? null
+      : typeof row.detail === 'string'
+        ? reloginDetailValue(row.detail)
+        : reloginDetailFingerprint(String(row.detail)),
+    evidence: isReloginEvidenceClass(row.evidence) ? row.evidence : null,
+  };
+}
+
+/**
+ * Sanitizes relogin fields for read-only output without relying on the
+ * one-time scrub marker. Canonical stored values remain stable on every read.
+ */
+export function sanitizeReloginFieldsForRead(row: { detail: unknown; evidence: unknown }): {
+  detail: string | null;
+  evidence: string | null;
+} {
+  const storedDetail = row.detail === null ? null : String(row.detail);
+  if (storedDetail === null) {
+    return { detail: null, evidence: isReloginEvidenceClass(row.evidence) ? row.evidence : null };
+  }
+  try {
+    assertStoredReloginFields(storedDetail, null);
+    return { detail: storedDetail, evidence: isReloginEvidenceClass(row.evidence) ? row.evidence : null };
+  } catch {
+    return {
+      detail: reloginDetailFingerprint(storedDetail),
+      evidence: isReloginEvidenceClass(row.evidence) ? row.evidence : null,
+    };
+  }
+}
+
 function sqlWithoutLiteralsOrComments(sql: string, keepQuotedIdentifiers = false): string {
   let result = '';
   for (let index = 0; index < sql.length;) {
@@ -1485,12 +1523,7 @@ export class Store {
     }>;
     const update = this.db.prepare('UPDATE relogin_events SET detail = ?, evidence = ? WHERE id = ?');
     for (const row of rows) {
-      const detail = row.detail == null
-        ? null
-        : typeof row.detail === 'string'
-          ? reloginDetailValue(row.detail)
-          : reloginDetailFingerprint(String(row.detail));
-      const evidence = isReloginEvidenceClass(row.evidence) ? row.evidence : null;
+      const { detail, evidence } = scrubReloginFields(row);
       if (detail !== row.detail || evidence !== row.evidence) update.run(detail, evidence, row.id);
     }
     this.db.prepare("INSERT INTO config (key, value) VALUES ('relogin.scrubbedAt', ?)").run(String(Date.now()));
