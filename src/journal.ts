@@ -95,9 +95,11 @@ export async function resolveClaudeSwitchJournal(
       let live: string | null = null;
       const outgoing = deps.slots.getSlot(journal.from);
       if (journal.credentialsWriteStarted) {
-        try { staged = await readStagedRollback(deps.live.backend, journal.stagedBlobService); live = await readLiveClaudeCredentials(deps.live); }
+        try { staged = await readStagedRollback(deps.live.backend, journal.stagedBlobService); }
         catch { return { outcome: 'refused', reason: 'staged-unreadable' }; }
         if (staged === null) return { outcome: 'refused', reason: 'staged-unreadable' };
+        try { live = await readLiveClaudeCredentials(deps.live); }
+        catch { return { outcome: 'refused', reason: 'live-unreadable' }; }
         const liveFingerprint = credentialFingerprint(live);
         if (journal.credentialsWrittenHash === null) return { outcome: 'refused', reason: 'live-not-outgoing' };
         if (live !== staged && sha256(live) !== journal.credentialsWrittenHash
@@ -124,14 +126,20 @@ export async function resolveClaudeSwitchJournal(
     if (!journal.credentialsWritten) return { outcome: 'refused', reason: 'credentials-not-written' };
     let live: string;
     let target: string;
-    try { live = await readLiveClaudeCredentials(deps.live); target = (await deps.slots.readSlot(journal.to, { fresh: true })).credential; }
-    catch { return { outcome: 'refused', reason: 'target-lineage-missing' }; }
+    try { live = await readLiveClaudeCredentials(deps.live); }
+    catch { return { outcome: 'refused', reason: 'live-unreadable' }; }
+    try { target = (await deps.slots.readSlot(journal.to, { fresh: true })).credential; }
+    catch { return { outcome: 'refused', reason: 'target-unreadable' }; }
     if (!sameAccountCredential(target, live)) return { outcome: 'refused', reason: 'target-lineage-missing' };
     const oauth = targetOauthAccount(deps.slots.getSlot(journal.to)?.configJson, journal.to);
     if (oauth === null) return { outcome: 'refused', reason: 'target-invalid' };
     const configResult = await configLock(journal.configPath, { env: deps.env }, async (held): Promise<string | null> => {
-      const raw = (deps.live.readText ?? ((path: string) => readFileSync(path, 'utf8')))(journal.configPath);
-      const original = readClaudeConfig(journal.configPath, () => raw).oauthAccount;
+      let raw: string;
+      let original: JsonObject['oauthAccount'];
+      try {
+        raw = (deps.live.readText ?? ((path: string) => readFileSync(path, 'utf8')))(journal.configPath);
+        original = readClaudeConfig(journal.configPath, () => raw).oauthAccount;
+      } catch { return 'config-invalid'; }
       const fromOauthAccount = original && typeof original === 'object' && !Array.isArray(original) ? original as JsonObject : null;
       if (journal.configWriteStarted) {
         if (journal.configWrittenHash !== null && sha256(raw) === journal.configWrittenHash) return null;

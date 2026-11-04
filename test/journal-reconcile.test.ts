@@ -185,6 +185,29 @@ describe('Claude switch journal reconciliation (G10)', () => {
     assert.equal(journalExists(subject), false);
   });
 
+  it('back reports an unreadable live credential separately from staged rollback data', async () => {
+    const subject = await fixture();
+    await install(subject);
+    subject.deps.live.backend = wrappedBackend(subject.backend, { get: async () => { throw new Error('keychain unavailable'); } });
+
+    assert.deepEqual(await resolveClaudeSwitchJournal(subject.deps, 'back'), { outcome: 'refused', reason: 'live-unreadable' });
+    assert.equal(journalExists(subject), true);
+  });
+
+  it('forward distinguishes unreadable target and invalid config refusals', async () => {
+    const subject = await fixture();
+    await install(subject);
+    await subject.backend.set(subject.paths.keychainService, 'fixture-user', subject.target);
+    const readSlot = subject.deps.slots.readSlot.bind(subject.deps.slots);
+    subject.deps.slots.readSlot = async () => { throw new Error('slot unavailable'); };
+    assert.deepEqual(await resolveClaudeSwitchJournal(subject.deps, 'forward'), { outcome: 'refused', reason: 'target-unreadable' });
+
+    subject.deps.slots.readSlot = readSlot;
+    writeFileSync(subject.paths.globalConfigPath, '{invalid');
+    assert.deepEqual(await resolveClaudeSwitchJournal(subject.deps, 'forward'), { outcome: 'refused', reason: 'config-invalid' });
+    assert.equal(journalExists(subject), true);
+  });
+
   it('forward reports resolved when journal cleanup fails after commit', async () => {
     const subject = await fixture();
     await install(subject);
