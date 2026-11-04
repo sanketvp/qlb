@@ -251,7 +251,7 @@ function readOnlyStore(db: DatabaseSync, dbPath: string): Store {
       }]));
     },
     latestCommittedAnthropicAutoswitchAt: (): number | undefined => {
-      const row = db.prepare("SELECT committed_at FROM switch_log WHERE provider = 'anthropic' AND trigger != 'manual' AND outcome = 'ok' AND committed_at IS NOT NULL ORDER BY committed_at DESC LIMIT 1").get() as { committed_at?: number } | undefined;
+      const row = db.prepare("SELECT committed_at FROM switch_log WHERE provider = 'anthropic' AND trigger != 'manual' AND outcome = 'ok' AND committed_at IS NOT NULL AND (detail IS NULL OR detail <> 'fault-injection:breaker-rows:seed') ORDER BY committed_at DESC LIMIT 1").get() as { committed_at?: number } | undefined;
       return row?.committed_at;
     },
     listAnthropicAutoswitchBreakerRows: () => listAnthropicAutoswitchBreakerRows(db),

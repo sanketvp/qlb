@@ -108,8 +108,14 @@ describe('auto breaker-rows fault drill', () => {
       anthropicBreakerRowsDrill({ store, slots, now: () => NOW });
       assert.equal(store.latestCommittedAnthropicAutoswitchAt(), undefined);
       store.setConfig('auto.anthropic.suspendedUntil', '');
+      store.setConfig('auto.anthropic.unhealthyTicks', '2');
+      store.setConfig('auto.anthropic.healthAccount', 'active');
+      store.setConfig('auto.anthropic.healthTickAt', String(NOW + 1));
       const normal = await anthropicTick({ store, slots, now: () => NOW + 1, dryRun: true, activeUsageUnknown: true });
-      assert.notEqual(normal.decision.kind === 'stay' && normal.decision.reason, 'breaker');
+      assert.deepEqual(normal.decision, {
+        kind: 'switch', targetId: 'next', reason: 'failover', unhealthyTicks: 3, parkedUntilMs: undefined,
+        leftHeadroom: null, leftRecoveryAtMs: null, leftTrigger: 'failover',
+      });
       store.recordSwitch({ provider: 'anthropic', toAccount: 'next', trigger: 'proactive', outcome: 'ok', injected: true, detail: 'fault-injection:usage-5xx', committedAt: NOW });
       assert.equal(store.latestCommittedAnthropicAutoswitchAt(), NOW);
     } finally { store.close(); rmSync(root, { recursive: true, force: true }); }
