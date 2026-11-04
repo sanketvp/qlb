@@ -46,7 +46,9 @@ async function ownerIsLive(deps: ClaudeSwitchDeps, journal: ClaudeSwitchJournal)
 export type ClaudeJournalResolveDirection = 'forward' | 'back';
 export type ClaudeJournalResolveResult = { outcome: 'resolved' | 'refused'; reason?: string; fingerprints?: string[] };
 
-function prefix(fingerprint: string | null | undefined): string | null { return fingerprint == null ? null : fingerprint.slice(0, 12); }
+function prefix(fingerprint: string | null | undefined): string | null {
+  return fingerprint == null ? null : fingerprint.replace(/^sha256(?:-full)?:/, '').slice(0, 12);
+}
 
 function targetOauth(journal: ClaudeSwitchJournal, deps: ClaudeSwitchDeps): JsonObject | null {
   const slot = deps.slots.getSlot(journal.to);
@@ -127,7 +129,8 @@ export async function resolveClaudeSwitchJournal(
     if (oauth === null) return { outcome: 'refused', reason: 'target-invalid' };
     const configResult = await configLock(journal.configPath, { env: deps.env }, async (held): Promise<string | null> => {
       const raw = (deps.live.readText ?? ((path: string) => readFileSync(path, 'utf8')))(journal.configPath);
-      readClaudeConfig(journal.configPath, () => raw);
+      const original = readClaudeConfig(journal.configPath, () => raw).oauthAccount;
+      const fromOauthAccount = original && typeof original === 'object' && !Array.isArray(original) ? original as JsonObject : null;
       if (journal.configWriteStarted) {
         if (journal.configWrittenHash !== null && sha256(raw) === journal.configWrittenHash) return null;
         if (journal.configText === null || raw !== journal.configText) return 'config-moved';
@@ -138,7 +141,7 @@ export async function resolveClaudeSwitchJournal(
       if (journal.configWriteStarted) {
         if (journal.configWrittenHash === null || sha256(planned) !== journal.configWrittenHash) return 'config-moved';
       } else {
-        update(ownerHeld, { step: 8, configText: raw, fromOauthAccount: journal.fromOauthAccount, configWrittenHash: sha256(planned), configWriteStarted: true }, options);
+        update(ownerHeld, { step: 8, configText: raw, fromOauthAccount, configWrittenHash: sha256(planned), configWriteStarted: true }, options);
       }
       (deps.live.writeText ?? ((path: string, text: string) => { atomicWriteText(path, text, { mode: 0o600 }); }))(journal.configPath, planned);
       update(ownerHeld, { configWritten: true }, options);

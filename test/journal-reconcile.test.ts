@@ -150,11 +150,27 @@ describe('Claude switch journal reconciliation (G10)', () => {
     const result = await resolveClaudeSwitchJournal(subject.deps, 'forward');
 
     assert.equal(result.outcome, 'resolved');
+    assert.deepEqual(result.fingerprints, [digest('fixture-refresh-b').slice(0, 12)]);
     assert.equal(subject.active(), 'b');
     assert.equal(JSON.parse(readFileSync(subject.paths.globalConfigPath, 'utf8')).oauthAccount.accountUuid, 'b');
     assert.equal(subject.commits[0]?.setBy, 'journal');
     assert.equal(subject.commits[0]?.detail, 'journal-forward');
     assert.equal(journalExists(subject), false);
+  });
+
+  it('a failed step-7 forward preserves the outgoing account for a later resplice', async () => {
+    const subject = await fixture();
+    await install(subject);
+    await subject.backend.set(subject.paths.keychainService, 'fixture-user', subject.target);
+    subject.deps.store.commitClaudeSwitch = () => { throw new Error('sqlite failure'); };
+
+    await assert.rejects(resolveClaudeSwitchJournal(subject.deps, 'forward'), /sqlite failure/);
+    writeFileSync(subject.paths.globalConfigPath, `${JSON.stringify({ oauthAccount: { accountUuid: 'b' }, retained: 'operator edit' })}\n`);
+
+    assert.equal((await resolveClaudeSwitchJournal(subject.deps, 'back')).outcome, 'resolved');
+    assert.deepEqual(JSON.parse(readFileSync(subject.paths.globalConfigPath, 'utf8')), {
+      oauthAccount: { accountUuid: 'a' }, retained: 'operator edit',
+    });
   });
 
   it('operator forward preserves a step-8 snapshot if commit fails, so back restores the outgoing config', async () => {
