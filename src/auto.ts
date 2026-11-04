@@ -353,14 +353,15 @@ export async function runAuto(options: RunAutoOptions = {}, dependencies: AutoDe
         if (!options.once && admission.row !== undefined && drillActive(admission.row)) {
           throw new AutoAdmissionRefused('drill-active');
         }
-        if (options.inject?.kind === 'breaker-rows') {
+        const breakerRowsDrill = options.inject?.kind === 'breaker-rows';
+        if (breakerRowsDrill && existsSync(claudeSwitchJournalPath({ home, env }))) {
+          throw new AutoAdmissionRefused('claude-switch-journal-present');
+        }
+        let cswapAlive = false;
+        try { cswapAlive = resolveCswapCheck(dependencies.listCswapProcesses, env)().length > 0; } catch { cswapAlive = true; }
+        if (breakerRowsDrill) {
           // This branch is deliberately before C-swap reconciliation, polling,
           // and heartbeat writes. A journal means reconciliation might mutate.
-          if (existsSync(claudeSwitchJournalPath({ home, env }))) {
-            throw new AutoAdmissionRefused('claude-switch-journal-present');
-          }
-          let cswapAlive = false;
-          try { cswapAlive = resolveCswapCheck(dependencies.listCswapProcesses, env)().length > 0; } catch { cswapAlive = true; }
           if (cswapAlive) throw new AutoAdmissionRefused('cswap-alive');
           if (!binding.breakerRowsDrill) throw new Error('breaker drill binding unavailable');
           const tick = await binding.breakerRowsDrill();
@@ -371,8 +372,6 @@ export async function runAuto(options: RunAutoOptions = {}, dependencies: AutoDe
           result.decisions = [tick.decision];
           redactedLog(log, `auto: ${decisionText(tick)}`);
         } else {
-          let cswapAlive = false;
-          try { cswapAlive = resolveCswapCheck(dependencies.listCswapProcesses, env)().length > 0; } catch { cswapAlive = true; }
           if (cswapAlive) {
           binding.store.setConfig('auto.heartbeatAt', String(now()));
           result.ticks += 1;

@@ -6,6 +6,7 @@ import { describe, it } from 'node:test';
 
 import { runAuto, AutoAdmissionRefused } from '../src/auto';
 import { anthropicBreakerRowsDrill, anthropicTick } from '../src/auto/anthropic';
+import { SqliteClaudeSlotRepository, type ClaudeSlot } from '../src/cc-slots';
 import { defaultConfig } from '../src/config';
 import { beginCutover, transition } from '../src/lifecycle';
 import { openStore } from '../src/store';
@@ -22,6 +23,14 @@ function fixture() {
   for (const [accountId, pct] of [['active', 20], ['next', 10]] as const) {
     store.upsertSnapshot(accountId, '5h', { usedPct: pct, fetchedAt: NOW, source: 'poll', confidence: 'authoritative' });
   }
+  const repository = SqliteClaudeSlotRepository.open(config.dbPath);
+  try {
+    for (const [accountId, slotNum] of [['active', 1], ['next', 2]] as const) {
+      repository.createSlot({ accountId, slotNum, email: null, alias: null, orgUuid: null, configJson: '{}', fingerprint: null,
+        prevFingerprint: null, threshold: null, dead: false, deadReason: null, deadAt: null, healedAt: null,
+        addedAt: NOW, lastActiveAt: null, source: 'fixture', archivedAt: null } satisfies ClaudeSlot);
+    }
+  } finally { repository.close(); }
   const slots = { listSlots: () => [
     { accountId: 'active', dead: false }, { accountId: 'next', dead: false },
   ] } as unknown as import('../src/cc-slots').ClaudeSlots;
@@ -118,6 +127,22 @@ describe('auto breaker-rows fault drill', () => {
       });
       store.recordSwitch({ provider: 'anthropic', toAccount: 'next', trigger: 'proactive', outcome: 'ok', injected: true, detail: 'fault-injection:usage-5xx', committedAt: NOW });
       assert.equal(store.latestCommittedAnthropicAutoswitchAt(), NOW);
+    } finally { store.close(); rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('does not start a production dry-run cooldown from seed rows', async () => {
+    const { root, config, store, slots } = fixture();
+    try {
+      anthropicBreakerRowsDrill({ store, slots, now: () => NOW });
+      store.setConfig('auto.anthropic.suspendedUntil', '');
+      store.upsertSnapshot('active', '5h', { usedPct: 95, fetchedAt: NOW, source: 'poll', confidence: 'authoritative' });
+      const output = await runAuto({ once: true, dryRun: true }, {
+        config, home: root, env: { QLB_TEST_MODE: '1', QLB_HOME: root, HOME: root }, now: () => NOW + 1, log: () => {},
+      });
+      assert.deepEqual(output.decisions, [{
+        kind: 'switch', targetId: 'next', reason: 'proactive', unhealthyTicks: 0, parkedUntilMs: undefined,
+        leftHeadroom: 5, leftRecoveryAtMs: null, leftTrigger: 'proactive',
+      }]);
     } finally { store.close(); rmSync(root, { recursive: true, force: true }); }
   });
 });

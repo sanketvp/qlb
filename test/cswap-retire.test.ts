@@ -6,6 +6,8 @@ import { DatabaseSync } from 'node:sqlite';
 import { describe, it } from 'node:test';
 
 import { credentialFingerprint } from '../src/anthropic-oauth';
+import { anthropicBreakerRowsDrill } from '../src/auto/anthropic';
+import type { ClaudeSlots } from '../src/cc-slots';
 import { runRetireCswapCommand, productionDependencies, s64DoctorVerdict } from '../src/commands/retire-cswap';
 import { productionLaunchctlCswapAgent, unavailableCswapAgent } from '../src/cswap-agent';
 import { evaluateRetirementGates, retireCswap, type CswapRetireDependencies, type CswapRetireItem } from '../src/cswap-retire';
@@ -119,6 +121,29 @@ async function refusal(name: string, mutate: (f: Fixture) => void, expected: str
 }
 
 describe('qlb retire cswap (AC22 retire)', () => {
+  it('requires four real injected switches despite breaker drill seeds', () => {
+    const f = fixture();
+    try {
+      f.store.setActiveLogin('anthropic', 'active', 'fixture', NOW);
+      for (const [accountId, usedPct] of [['active', 20], ['next', 10]] as const) {
+        f.store.upsertSnapshot(accountId, '5h', { usedPct, fetchedAt: NOW, source: 'poll', confidence: 'authoritative' });
+      }
+      const slots = { listSlots: () => [{ accountId: 'active', dead: false }, { accountId: 'next', dead: false }] } as unknown as ClaudeSlots;
+      anthropicBreakerRowsDrill({ store: f.store, slots, now: () => NOW });
+      f.store.recordSwitch({ provider: 'anthropic', toAccount: 'next', trigger: 'proactive', outcome: 'ok', injected: true, detail: 'fault-injection:usage-5xx', committedAt: NOW });
+      const context = {
+        env: { QLB_TEST_MODE: '1', QLB_HOME: f.root }, home: f.root,
+        config: { dbPath: f.store.dbPath, cswapSequencePath: join(f.root, 'sequence.json') },
+      } as never;
+      const deps = productionDependencies(f.store, context, unavailableCswapAgent, () => []);
+      assert.equal(deps.hasFourInjectedDrillRows(), false);
+      for (let index = 1; index <= 3; index += 1) {
+        f.store.recordSwitch({ provider: 'anthropic', toAccount: 'next', trigger: 'proactive', outcome: 'ok', injected: true, detail: 'fault-injection:usage-5xx', committedAt: NOW + index });
+      }
+      assert.equal(deps.hasFourInjectedDrillRows(), true);
+    } finally { f.cleanup(); }
+  });
+
   it('refuses each retirement bar and writes nothing', async () => {
     await refusal('lifecycle admission', (f) => {
       const db = new DatabaseSync(f.store.dbPath);
