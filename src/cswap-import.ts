@@ -524,7 +524,7 @@ function readCswapImportJournalFiles(options: CswapImportOptions): Array<{ runId
   const root = journalRoot(options);
   if (!io.exists(root)) return [];
   let names: string[];
-  try { names = io.readdir(root); } catch { return []; }
+  try { names = io.readdir(root); } catch { return [{ runId: 'journal-root-unreadable', text: '' }]; }
   return names.filter((name) => name.startsWith('cswap-import-')).sort().flatMap((name) => {
     const runId = name.slice('cswap-import-'.length);
     try { return [{ runId, text: io.readText(join(root, name, 'journal.json')) }]; } catch { return [{ runId, text: '' }]; }
@@ -542,7 +542,7 @@ export function probeCswapImportLock(options: CswapImportOptions): CswapImportLo
   }
 }
 
-function recoveryMatchesSlotState(options: CswapImportOptions, journal: Journal): boolean {
+async function recoveryMatchesSlotState(options: CswapImportOptions, journal: Journal): Promise<boolean> {
   try {
     for (const entry of journal.slots) {
       if (entry.reached === 'unreached' || entry.restored) continue;
@@ -553,10 +553,11 @@ function recoveryMatchesSlotState(options: CswapImportOptions, journal: Journal)
         if (slot) return false;
       } else return false;
       if (entry.reached !== 'previous') continue;
+      const previous = await optionalGet(options.keychain, previousDestination(entry.accountId));
       if (entry.previousDestinationExisted) {
-        if (!entry.priorPreviousFingerprint || slot?.prevFingerprint !== entry.priorPreviousFingerprint) return false;
+        if (!entry.priorPreviousFingerprint || previous == null || credentialFingerprint(previous) !== entry.priorPreviousFingerprint) return false;
       } else if (entry.previousDestinationExisted === false) {
-        if (slot?.prevFingerprint != null) return false;
+        if (previous != null) return false;
       } else return false;
     }
     return true;
@@ -566,34 +567,49 @@ function recoveryMatchesSlotState(options: CswapImportOptions, journal: Journal)
 }
 
 /** Classify every existing journal without reading source credentials or mutating state. */
-export function classifyCswapImportJournals(options: CswapImportOptions): CswapImportJournalStatus[] {
-  const journals: Array<{ journal: Journal | null; status: CswapImportJournalStatus }> = readCswapImportJournalFiles(options).map(({ runId, text }) => {
+export async function classifyCswapImportJournals(options: CswapImportOptions): Promise<CswapImportJournalStatus[]> {
+  const journals: Array<{ journal: Journal | null; status: CswapImportJournalStatus }> = [];
+  for (const { runId, text } of readCswapImportJournalFiles(options)) {
     const sha256 = createHash('sha256').update(text).digest('hex');
     try {
       const journal = JSON.parse(text) as Partial<Journal>;
-      if (!isSafeJournal(journal, runId)) return { journal: null, status: { runId, phase: 'invalid' as const, action: 'unclassifiable' as const, sha256 } };
-      if (journal.phase === 'staged') return { journal, status: { runId, phase: journal.phase, action: 'purge-staging' as const, sha256 } };
-      if (journal.phase === 'cleaned' || journal.phase === 'aborted') return { journal, status: { runId, phase: journal.phase, action: 'none' as const, sha256 } };
+      if (!isSafeJournal(journal, runId)) {
+        journals.push({ journal: null, status: { runId, phase: 'invalid', action: 'unclassifiable', sha256 } });
+        continue;
+      }
+      if (journal.phase === 'staged') {
+        journals.push({ journal, status: { runId, phase: journal.phase, action: 'purge-staging', sha256 } });
+        continue;
+      }
+      if (journal.phase === 'cleaned' || journal.phase === 'aborted') {
+        journals.push({ journal, status: { runId, phase: journal.phase, action: 'none', sha256 } });
+        continue;
+      }
       let committed: boolean;
       try { committed = options.repository.getImportRun(runId)?.committedAt != null; } catch {
-        return { journal, status: { runId, phase: journal.phase, action: 'unclassifiable' as const, sha256 } };
+        journals.push({ journal, status: { runId, phase: journal.phase, action: 'unclassifiable', sha256 } });
+        continue;
       }
       // A journal may say `committed` only after the SQLite authority commit.
       // Missing authority is contradictory, not permission to delete backups.
-      if (journal.phase === 'committed' && !committed) return { journal, status: { runId, phase: journal.phase, action: 'unclassifiable' as const, sha256 } };
-      if (!committed && !recoveryMatchesSlotState(options, journal)) {
-        return { journal, status: { runId, phase: journal.phase, action: 'unclassifiable' as const, sha256 } };
+      if (journal.phase === 'committed' && !committed) {
+        journals.push({ journal, status: { runId, phase: journal.phase, action: 'unclassifiable', sha256 } });
+        continue;
       }
-      return { journal, status: { runId, phase: journal.phase, action: committed ? 'finish-cleanup' as const : 'recover' as const, sha256 } };
+      if (!committed && !await recoveryMatchesSlotState(options, journal)) {
+        journals.push({ journal, status: { runId, phase: journal.phase, action: 'unclassifiable', sha256 } });
+        continue;
+      }
+      journals.push({ journal, status: { runId, phase: journal.phase, action: committed ? 'finish-cleanup' : 'recover', sha256 } });
     } catch {
-      return { journal: null, status: { runId, phase: 'invalid' as const, action: 'unclassifiable' as const, sha256 } };
+      journals.push({ journal: null, status: { runId, phase: 'invalid', action: 'unclassifiable', sha256 } });
     }
-  });
+  }
   return journals.map(({ status }) => status);
 }
 
-function assertNoOrphanedCswapImportJournals(options: CswapImportOptions): void {
-  const orphan = classifyCswapImportJournals(options).find((journal) => journal.action !== 'none');
+async function assertNoOrphanedCswapImportJournals(options: CswapImportOptions): Promise<void> {
+  const orphan = (await classifyCswapImportJournals(options)).find((journal) => journal.action !== 'none');
   if (orphan) throw new CswapImportRefusalError('import-journal-orphaned', 'C-swap import refused: import journal requires reconciliation', undefined, orphan.runId);
 }
 
@@ -612,7 +628,7 @@ export async function reconcileCswapImportJournals(options: CswapImportOptions):
   const lock = join(journalRoot(options), 'cswap-import.lock');
   try {
     return await withCswapImportLock(lock, async () => {
-      const journals = classifyCswapImportJournals(options);
+      const journals = await classifyCswapImportJournals(options);
       const unclassifiable = journals.find((journal) => journal.action === 'unclassifiable');
       if (unclassifiable) {
         throw new CswapImportRefusalError('import-journal-unclassifiable', 'C-swap import journal is unclassifiable', undefined, unclassifiable.runId);
@@ -731,7 +747,7 @@ async function importCswapLocked(options: CswapImportOptions): Promise<{ runId: 
   // This is intentionally before any source-tree or credential read and before
   // a new journal is written. A second check under the import lock closes the
   // classify-to-stage race.
-  assertNoOrphanedCswapImportJournals(options);
+  await assertNoOrphanedCswapImportJournals(options);
   const { slots: sourceSlots, sessionProfiles } = await readSourceSlots(options);
   if (sessionProfiles > 0) throw new CswapImportRefusalError('session-profiles', `C-swap import refused: ${sessionProfiles} session profiles present`);
   await assertDestination(options, sourceSlots);
@@ -926,7 +942,7 @@ async function recoverUncommittedCswapImportLocked(options: CswapImportOptions, 
     writeJournal(options, journal);
     return 'cleaned';
   }
-  if (!recoveryMatchesSlotState(options, journal)) {
+  if (!await recoveryMatchesSlotState(options, journal)) {
     throw new CswapImportRefusalError('import-journal-unclassifiable', 'C-swap import journal is unclassifiable', undefined, runId);
   }
   if (journal.phase === 'promoting' || journal.phase === 'commit-unknown') {
