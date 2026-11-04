@@ -2593,23 +2593,6 @@ export class Store {
     return row?.committed_at;
   }
 
-  /** Find the committed Claude switch for an attempt; refusals and rollbacks do not finish one. */
-  findClaudeSwitchByAttempt(attempt: string): {
-    id: number;
-    outcome: string;
-    ts: number;
-    committedAt: number | null;
-  } | null {
-    const row = this.db.prepare(`SELECT id, outcome, ts, committed_at
-      FROM switch_log
-      WHERE provider = 'anthropic' AND committed_at IS NOT NULL
-        AND CASE WHEN json_valid(steps_json) THEN json_extract(steps_json, '$.attempt') END = ?
-      ORDER BY id DESC LIMIT 1`).get(attempt) as {
-      id: number; outcome: string; ts: number; committed_at: number | null;
-    } | undefined;
-    if (!row) return null;
-    return { id: row.id, outcome: row.outcome, ts: row.ts, committedAt: row.committed_at };
-  }
 
   /**
    * Step 5: atomically make a fully classified Codex switch observable.
@@ -2683,35 +2666,39 @@ export class Store {
   }
 
   /**
-   * Find the committed Codex switch for a durable attempt id. Only rows written
-   * by commitCodexSwitch carry committed_at, so a refusal row with the same
-   * attempt is skipped; rows whose steps_json is not JSON have no attempt.
+   * Find a committed switch for a durable attempt id. Only commit helpers write
+   * committed_at, so refusals, rollbacks, watch rows, and C6-20e fence rows do
+   * not finish an attempt; malformed steps_json has no attempt.
    */
-  findCodexSwitchByAttempt(attemptId: string): {
+  findCommittedSwitchByAttempt(provider: 'anthropic' | 'openai-codex', attempt: string): ({
     id: number;
+    outcome: string;
     ts: number;
+    committedAt: number | null;
+  } & Partial<{
     provider: string;
     fromAccount: string | null;
     toAccount: string;
     trigger: string;
-    outcome: string;
     detail: string | null;
     stepsJson: string | null;
     openSessionsJson: string | null;
     publishedAt: number | null;
-    committedAt: number | null;
-  } | null {
+  }>) | null {
     const row = this.db.prepare(`SELECT id, ts, provider, from_account, to_account, trigger, outcome, detail,
       steps_json, open_sessions_json, published_at, committed_at
       FROM switch_log
-      WHERE provider = 'openai-codex' AND committed_at IS NOT NULL
+      WHERE provider = ? AND committed_at IS NOT NULL
         AND CASE WHEN json_valid(steps_json) THEN json_extract(steps_json, '$.attempt') END = ?
-      ORDER BY id DESC LIMIT 1`).get(attemptId) as {
+      ORDER BY id DESC LIMIT 1`).get(provider, attempt) as {
       id: number; ts: number; provider: string; from_account: string | null; to_account: string;
       trigger: string; outcome: string; detail: string | null; steps_json: string | null;
       open_sessions_json: string | null; published_at: number | null; committed_at: number | null;
     } | undefined;
     if (!row) return null;
+    if (provider === 'anthropic') {
+      return { id: row.id, outcome: row.outcome, ts: row.ts, committedAt: row.committed_at };
+    }
     return {
       id: row.id,
       ts: row.ts,
@@ -2822,7 +2809,7 @@ export class Store {
     });
   }
 
-  /** Atomically record a watch reversion and consume its watch row. No committed_at: findCodexSwitchByAttempt still finds the ok commit. */
+  /** Atomically record a watch reversion and consume its watch row. No committed_at: the committed switch remains findable. */
   commitCodexWatchRevert(input: {
     watch: { switchId: number; outgoing: string; target: string; trigger: string };
     setActive: string;

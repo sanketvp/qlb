@@ -343,15 +343,15 @@ describe('Claude switch commit primitive', () => {
     }
   });
 
-  it('findClaudeSwitchByAttempt finds the committed row and returns null for an unknown attempt', () => {
+  it('findCommittedSwitchByAttempt finds the committed row and returns null for an unknown attempt', () => {
     const store = openClaudeStore();
     try {
       insertSlots(store);
       const id = store.commitClaudeSwitch(input());
-      assert.deepEqual(store.findClaudeSwitchByAttempt('attempt-1'), {
+      assert.deepEqual(store.findCommittedSwitchByAttempt('anthropic', 'attempt-1'), {
         id, outcome: 'ok', ts: 1_000, committedAt: 1_000,
       });
-      assert.equal(store.findClaudeSwitchByAttempt('unknown'), null);
+      assert.equal(store.findCommittedSwitchByAttempt('anthropic', 'unknown'), null);
     } finally {
       store.close();
     }
@@ -368,8 +368,8 @@ describe('Claude switch commit primitive', () => {
         ts: 2_000, provider: 'anthropic', fromAccount: 'from', toAccount: 'to', trigger: 'manual', outcome: 'rolled-back',
         stepsJson: JSON.stringify({ attempt: 'rolled-back-only' }),
       });
-      assert.equal(store.findClaudeSwitchByAttempt('refused-only'), null);
-      assert.equal(store.findClaudeSwitchByAttempt('rolled-back-only'), null);
+      assert.equal(store.findCommittedSwitchByAttempt('anthropic', 'refused-only'), null);
+      assert.equal(store.findCommittedSwitchByAttempt('anthropic', 'rolled-back-only'), null);
 
       const id = store.commitClaudeSwitch(input());
       store.recordClaudeSwitchRefusal({
@@ -379,7 +379,7 @@ describe('Claude switch commit primitive', () => {
         ts: 3_000, provider: 'anthropic', fromAccount: 'from', toAccount: 'to', trigger: 'manual', outcome: 'rolled-back',
         stepsJson: JSON.stringify({ attempt: 'attempt-1' }),
       });
-      assert.deepEqual(store.findClaudeSwitchByAttempt('attempt-1'), {
+      assert.deepEqual(store.findCommittedSwitchByAttempt('anthropic', 'attempt-1'), {
         id, outcome: 'ok', ts: 1_000, committedAt: 1_000,
       });
     } finally {

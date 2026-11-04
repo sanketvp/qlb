@@ -503,35 +503,35 @@ describe('Codex switch commit primitive', () => {
     }
   });
 
-  it('findCodexSwitchByAttempt finds the committed row', () => {
+  it('findCommittedSwitchByAttempt finds the committed row', () => {
     const store = openCommitStore();
     try {
       const id = store.commitCodexSwitch(commitInput());
-      assert.deepEqual(store.findCodexSwitchByAttempt('attempt-1'), {
+      assert.deepEqual(store.findCommittedSwitchByAttempt('openai-codex', 'attempt-1'), {
         id, ts: 1_000, provider: 'openai-codex', fromAccount: 'from:account', toAccount: 'to:account',
         trigger: 'proactive', outcome: 'ok', detail: 'verified',
         stepsJson: '{"attempt":"attempt-1","via":"switch"}', openSessionsJson: '[{"pid":44}]',
         publishedAt: 900, committedAt: 1_000,
       });
-      assert.equal(store.findCodexSwitchByAttempt('missing'), null);
+      assert.equal(store.findCommittedSwitchByAttempt('openai-codex', 'missing'), null);
     } finally {
       store.close();
     }
   });
-  it('findCodexSwitchByAttempt ignores a malformed steps_json row and still finds the committed row', () => {
+  it('findCommittedSwitchByAttempt ignores a malformed steps_json row and still finds the committed row', () => {
     const store = openCommitStore();
     try {
       const id = store.commitCodexSwitch(commitInput());
       commitDb(store).prepare(`INSERT INTO switch_log (ts, provider, to_account, trigger, outcome, steps_json)
         VALUES (2000, 'openai-codex', 'to:account', 'manual', 'refused', 'not json')`).run();
-      assert.equal(store.findCodexSwitchByAttempt('attempt-1')?.id, id);
-      assert.equal(store.findCodexSwitchByAttempt('missing'), null);
+      assert.equal(store.findCommittedSwitchByAttempt('openai-codex', 'attempt-1')?.id, id);
+      assert.equal(store.findCommittedSwitchByAttempt('openai-codex', 'missing'), null);
     } finally {
       store.close();
     }
   });
 
-  it('findCodexSwitchByAttempt skips a refusal row with the same attempt', () => {
+  it('findCommittedSwitchByAttempt skips a refusal row with the same attempt', () => {
     const store = openCommitStore();
     try {
       const id = store.commitCodexSwitch(commitInput());
@@ -540,13 +540,13 @@ describe('Codex switch commit primitive', () => {
         trigger: 'manual', outcome: 'refused', detail: 'switch-busy',
         stepsJson: JSON.stringify({ attempt: 'attempt-1', via: 'switch' }), publishedAt: null,
       });
-      assert.equal(store.findCodexSwitchByAttempt('attempt-1')?.id, id);
+      assert.equal(store.findCommittedSwitchByAttempt('openai-codex', 'attempt-1')?.id, id);
       store.recordSwitch({
         ts: 3_000, provider: 'openai-codex', fromAccount: 'from:account', toAccount: 'to:account',
         trigger: 'manual', outcome: 'refused', detail: 'switch-busy',
         stepsJson: JSON.stringify({ attempt: 'attempt-only-refused', via: 'switch' }), publishedAt: null,
       });
-      assert.equal(store.findCodexSwitchByAttempt('attempt-only-refused'), null);
+      assert.equal(store.findCommittedSwitchByAttempt('openai-codex', 'attempt-only-refused'), null);
     } finally {
       store.close();
     }

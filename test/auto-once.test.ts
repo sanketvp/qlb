@@ -634,7 +634,7 @@ describe('qlb auto --once (G12)', () => {
     };
     createClaudeSwitchJournal(journal, { home, env, configPath: paths.globalConfigPath, keychainService: paths.keychainService });
     const deps: ClaudeSwitchDeps = {
-      store: { findClaudeSwitchByAttempt: () => null, recordSwitch: () => 1 } as unknown as ClaudeSwitchDeps['store'],
+      store: { findCommittedSwitchByAttempt: () => null, recordSwitch: () => 1 } as unknown as ClaudeSwitchDeps['store'],
       slots: {} as ClaudeSwitchDeps['slots'], live: { backend: new MockKeychain(), paths, account: 'fixture' },
       readConfig: () => ({}), resolveProfile: async () => null,
       consume: { postRefresh: async () => ({ status: 500, body: '' }) }, cswapProcesses: () => [], env, home,

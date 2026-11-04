@@ -36,7 +36,7 @@ function sha256(value: string): string { return createHash('sha256').update(valu
 function finished(deps: ClaudeSwitchDeps, journal: ClaudeSwitchJournal): boolean {
   return journal.committed !== undefined
     || journal.closed !== null
-    || deps.store.findClaudeSwitchByAttempt(journal.attemptId) !== null;
+    || deps.store.findCommittedSwitchByAttempt('anthropic', journal.attemptId) !== null;
 }
 
 async function ownerIsLive(deps: ClaudeSwitchDeps, journal: ClaudeSwitchJournal): Promise<boolean> {

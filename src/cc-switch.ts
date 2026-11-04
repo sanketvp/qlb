@@ -64,7 +64,7 @@ export type ClaudeSwitchPhaseAReason = ClaudeSwitchPreconditionReason | 'claude:
   | 'live-credential-empty' | 'live-credential-unreadable' | 'target-unreadable' | `freshen-${string}`;
 
 type ClaudeSwitchStore = Pick<Store, 'getActiveLogin' | 'getConfig' | 'setActiveLogin' | 'recordSwitch'
-  | 'recordRelogin' | 'commitClaudeSwitch' | 'recordClaudeSwitchRefusal' | 'findClaudeSwitchByAttempt'>;
+  | 'recordRelogin' | 'commitClaudeSwitch' | 'recordClaudeSwitchRefusal' | 'findCommittedSwitchByAttempt'>;
 
 export interface ClaudeSwitchDeps {
   store: ClaudeSwitchStore;
@@ -448,7 +448,7 @@ async function switchClaudeAttempt(deps: ClaudeSwitchDeps, input: SwitchClaudeIn
   if (before.state === 'ok') {
     const probe = (deps.probeOwner ?? probeClaudeSwitchJournalOwner)({ journalDir: deps.journalDir, home: deps.home, env: deps.env });
     const same = probe === 'held' ? true : await (deps.stillTheSameProcess ?? stillTheSameProcess)(before.journal.owner);
-    const finished = before.journal.committed !== undefined || before.journal.closed !== null || deps.store.findClaudeSwitchByAttempt(before.journal.attemptId) !== null;
+    const finished = before.journal.committed !== undefined || before.journal.closed !== null || deps.store.findCommittedSwitchByAttempt('anthropic', before.journal.attemptId) !== null;
     if (!same && !finished) return refusal(deps, input, attempt, activeAccount(deps), 'switch-journal-present');
   }
   const checked = checkClaudeSwitchPreconditions(deps, input);
@@ -475,7 +475,7 @@ async function switchClaudeAttempt(deps: ClaudeSwitchDeps, input: SwitchClaudeIn
           const inside = readClaudeSwitchJournal(options);
           if (inside.state === 'malformed') return refusal(deps, input, attempt, activeAccount(deps), 'switch-journal-malformed');
           if (inside.state === 'ok') {
-            const done = inside.journal.committed !== undefined || inside.journal.closed !== null || deps.store.findClaudeSwitchByAttempt(inside.journal.attemptId) !== null;
+            const done = inside.journal.committed !== undefined || inside.journal.closed !== null || deps.store.findCommittedSwitchByAttempt('anthropic', inside.journal.attemptId) !== null;
             if (!done) return refusal(deps, input, attempt, activeAccount(deps), 'switch-journal-present');
             try { await deleteStagedRollback(live.backend, inside.journal.stagedBlobService); journalRemove(ownerHeld, options); } catch { return refusal(deps, input, attempt, activeAccount(deps), 'switch-journal-present'); }
           }
