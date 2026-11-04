@@ -1274,7 +1274,7 @@ describe('qlb undo cswap doctor diagnostic', () => {
         assert.equal(transition(store, 'undoing', 123).ok, true);
         assert.equal(transition(store, 'rolled-back', 124, CSWAP_RESTORE_PENDING).ok, true);
       } finally { store.close(); }
-      assert.deepEqual(undoIncompleteCheck(f.dbPath, { available: true, phase: 'rolled-back' }), {
+      assert.deepEqual(undoIncompleteCheck(f.dbPath, { available: true, phase: 'rolled-back', restorePending: true }), {
         name: 'undo:incomplete',
         level: 'FAIL',
         message: 'cswap-restore-pending: run qlb undo cswap --resume',
@@ -1282,7 +1282,7 @@ describe('qlb undo cswap doctor diagnostic', () => {
     } finally { close(f); }
   });
 
-  it('passes after a completed rollback', () => {
+  it('reports no incomplete undo after a completed rollback', () => {
     const f = fixture();
     try {
       beginUndo(f);
@@ -1292,7 +1292,16 @@ describe('qlb undo cswap doctor diagnostic', () => {
         assert.equal(transition(store, 'rolled-back', 124).ok, true);
       } finally { store.close(); }
       assert.deepEqual(undoIncompleteCheck(f.dbPath, { available: true, phase: 'rolled-back' }), {
-        name: 'undo:incomplete', level: 'PASS', message: 'undo completed',
+        name: 'undo:incomplete', level: 'PASS', message: 'no incomplete undo',
+      });
+    } finally { close(f); }
+  });
+
+  it('reports no incomplete undo after an aborted cutover setup', () => {
+    const f = fixture();
+    try {
+      assert.deepEqual(undoIncompleteCheck(f.dbPath, { available: true, phase: 'aborted' }), {
+        name: 'undo:incomplete', level: 'PASS', message: 'no incomplete undo',
       });
     } finally { close(f); }
   });
