@@ -83,6 +83,23 @@ describe('store decision columns', () => {
     }
   });
 
+  it('v-next adds drill_began_at once', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-store-drill-began-'));
+    const path = join(dir, 'qlb.db');
+    const initial = openStore(path);
+    initial.close();
+    const db = new DatabaseSync(path);
+    db.exec('ALTER TABLE lifecycle DROP COLUMN drill_began_at');
+    db.close();
+
+    const repaired = openStore(path);
+    repaired.close();
+    const reopened = openStore(path);
+    reopened.close();
+
+    assert.equal(columns(path, 'lifecycle').filter((column) => column === 'drill_began_at').length, 1);
+  });
+
   it('v4 writer process holding a prepared insert keeps inserting after another process migrates', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'qlb-store-xproc-'));
     const dbPath = join(dir, 'qlb.db');

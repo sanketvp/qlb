@@ -41,7 +41,7 @@ describe('store v5 schema (AC38)', () => {
     try {
       assert.equal((db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 5);
       assert.deepEqual(columns(db, 'lineage_log'), ['id', 'ts', 'provider', 'account_id', 'from_fp', 'to_fp', 'cause', 'by', 'evidence']);
-      assert.deepEqual(columns(db, 'lifecycle'), ['id', 'state', 'began_at', 'cutover_at', 'window_end', 'extended_at', 'undo_began_at', 'rollback_at', 'retired_at', 'closed_at', 'release_sha', 'drill_done_at', 'note', 'pre_fence_state']);
+      assert.deepEqual(columns(db, 'lifecycle'), ['id', 'state', 'began_at', 'cutover_at', 'window_end', 'extended_at', 'undo_began_at', 'rollback_at', 'retired_at', 'closed_at', 'release_sha', 'drill_began_at', 'drill_done_at', 'note', 'pre_fence_state']);
       assert.ok(columns(db, 'switch_log').includes('injected'));
       assert.ok(columns(db, 'switch_log').includes('detail'));
       assert.ok(columns(db, 'switch_log').includes('published_at'));
