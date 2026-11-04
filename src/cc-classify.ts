@@ -61,11 +61,16 @@ export interface ClassifyOutgoingCredentialInput {
   probeVerdict?: boolean;
 }
 
-export interface ClassifiedOutgoingCredential {
-  kind: ClaudeCredentialClassificationKind;
-  /** Only `foreign` and `foreign-synced` may identify another managed slot. */
-  foreignSlotId: string | null;
-}
+export type ClassifiedOutgoingCredential =
+  | {
+    kind: 'foreign' | 'foreign-synced';
+    /** Only cross-slot classifications identify another managed slot. */
+    foreignSlotId: string;
+  }
+  | {
+    kind: Exclude<ClaudeCredentialClassificationKind, 'foreign' | 'foreign-synced'>;
+    foreignSlotId: null;
+  };
 
 export interface CredentialReadProvenance {
   /** A Keychain-fallback read may be a consumed predecessor and cannot be spent. */

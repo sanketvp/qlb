@@ -551,17 +551,25 @@ async function switchClaudeAttempt(deps: ClaudeSwitchDeps, input: SwitchClaudeIn
           }
           const foreignSlot = prepared.slots.find((slot) => slot.accountId === classified.foreignSlotId);
           // K9-2 kinds: own-bytes, own-family, own-rotated, foreign, foreign-synced, wiped, alien, known-foreign, unresolved.
-          const needsUnclaimedStash = classified.kind === 'foreign' || classified.kind === 'alien' || classified.kind === 'known-foreign' || (classified.kind === 'foreign-synced' && foreignSlot?.credential !== outgoingLive);
-          if (classified.kind === 'own-family' || classified.kind === 'own-rotated' || classified.kind === 'unresolved') {
-            try { await deps.slots.writeSlot(from, outgoingLive, { cause: 'adopt', by: deps.by, evidence: classified.kind === 'own-rotated' ? 'oracle' : classified.kind === 'unresolved' ? null : 'lineage' }); } catch (error) { return failed(deps, transactionInput, attempt, from, 'outgoing-backup-failed', writeError(error, 'keychain-write-failed'), state, 5, undefined, classified.kind); }
-          } else if (needsUnclaimedStash) {
+          const needsUnclaimedStash = classified.kind === 'foreign-synced' && foreignSlot?.credential !== outgoingLive;
+          const stashOutgoing = async (): Promise<ClaudeSwitchResult | null> => {
             const stashId = (deps.stashTimestamp ?? (() => defaultStashTimestamp(deps.now())))();
             try {
               await deps.slots.stashUnclaimed(stashId, outgoingLive, undefined, classified.foreignSlotId ?? undefined);
               state.unclaimed = stashId;
+              return null;
             } catch (error) {
               return failed(deps, transactionInput, attempt, from, 'outgoing-backup-failed', writeError(error, 'keychain-write-failed'), state, 5, undefined, classified.kind);
             }
+          };
+          if (classified.kind === 'own-family' || classified.kind === 'own-rotated' || classified.kind === 'unresolved') {
+            try { await deps.slots.writeSlot(from, outgoingLive, { cause: 'adopt', by: deps.by, evidence: classified.kind === 'own-rotated' ? 'oracle' : classified.kind === 'unresolved' ? null : 'lineage' }); } catch (error) { return failed(deps, transactionInput, attempt, from, 'outgoing-backup-failed', writeError(error, 'keychain-write-failed'), state, 5, undefined, classified.kind); }
+          } else if (classified.kind === 'foreign' || classified.kind === 'alien' || classified.kind === 'known-foreign') {
+            const stashFailure = await stashOutgoing();
+            if (stashFailure) return stashFailure;
+          } else if (needsUnclaimedStash) {
+            const stashFailure = await stashOutgoing();
+            if (stashFailure) return stashFailure;
           } else if (classified.kind === 'wiped') {
             try {
               recordRelogin(deps.store, { ts: deps.now(), provider: 'anthropic', accountId: from, kind: 'wiped', evidence: 'wiped' });
