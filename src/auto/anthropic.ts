@@ -306,6 +306,30 @@ export interface AnthropicTickResult {
   switchResult?: ClaudeSwitchResult;
 }
 
+/** A credential-free breaker drill: its rows affect this decision only. */
+export function anthropicBreakerRowsDrill(deps: Pick<AnthropicTickDeps, 'store' | 'slots' | 'now' | 'models'>): AnthropicTickResult {
+  const input = decisionInput(deps);
+  const activeAccountId = input.activeAccountId;
+  const seedRows = [1, 2, 3].map((offset) => ({
+    ts: input.nowMs - offset, trigger: 'failover', outcome: 'ok', automatic: true, injected: false,
+  }));
+  const decision = decideAutoswitch({
+    ...input,
+    // Project one final unknown reading without persisting an unhealthy tick.
+    activeUsageUnknown: true,
+    unhealthyTicks: (input.settings?.unhealthyTicks ?? 3) - 1,
+    // The durable seed rows remain injected; only this dry projection counts them.
+    breakerRows: [...(input.breakerRows ?? []), ...seedRows],
+  });
+  if (decision.kind !== 'stay' || decision.reason !== 'breaker' || activeAccountId === null || decision.suspendedUntilMs === undefined) {
+    return { decision };
+  }
+  deps.store.recordAnthropicBreakerRowsDrill({
+    now: input.nowMs, activeAccountId, suspendedUntil: decision.suspendedUntilMs,
+  });
+  return { decision };
+}
+
 const AUTO_PREFIX = 'auto.anthropic.';
 
 function configNumber(store: Store, key: string): number | undefined {

@@ -4,9 +4,10 @@ import { DatabaseSync } from 'node:sqlite';
 import { pathToFileURL } from 'node:url';
 
 import { buildUsageRequest, type HttpRequestDescription } from './anthropic-oauth';
-import { anthropicTick, pollAnthropic, type AnthropicPollDeps, type AnthropicTickDeps, type AnthropicTickResult } from './auto/anthropic';
-import { injectionDetail, type UsageInjection } from './fault-injection';
+import { anthropicBreakerRowsDrill, anthropicTick, pollAnthropic, type AnthropicPollDeps, type AnthropicTickDeps, type AnthropicTickResult } from './auto/anthropic';
+import { injectionDetail, type BreakerRowsInjection, type UsageInjection } from './fault-injection';
 import { claudePaths } from './cc-paths';
+import { claudeSwitchJournalPath } from './cc-switch-journal';
 import { ClaudeSlots, SqliteClaudeSlotRepository, type ClaudeSlot } from './cc-slots';
 import { ProbeVerdictMemo, resolveCswapCheck, type RefreshHttpResponse } from './cc-resync';
 import { processLstart, stillTheSameProcess } from './codex-sessions';
@@ -34,7 +35,7 @@ export interface RunAutoOptions {
   once?: boolean;
   dryRun?: boolean;
   /** A fault-only seam accepted by `auto --once`; never a production transport. */
-  inject?: UsageInjection;
+  inject?: UsageInjection | BreakerRowsInjection;
 }
 
 export class AutoAdmissionRefused extends Error {
@@ -57,6 +58,8 @@ export type LiveBinding = {
   reconcile(): Promise<void>;
   poll(inject?: UsageInjection): Promise<Awaited<ReturnType<typeof pollAnthropic>>>;
   tick(accounts: Awaited<ReturnType<typeof pollAnthropic>>, inject?: UsageInjection): Promise<AnthropicTickResult>;
+  /** Credential-free, no-poll breaker drill. */
+  breakerRowsDrill?(): Promise<AnthropicTickResult>;
 };
 
 export type DryBinding = {
@@ -193,6 +196,7 @@ function productionLiveBinding(deps: Required<Pick<AutoDependencies, 'env' | 'ho
         injectionDetail: inject === undefined ? undefined : injectionDetail(inject),
       });
     },
+    breakerRowsDrill: async () => anthropicBreakerRowsDrill({ store, slots, now: deps.now, models }),
   };
 }
 
@@ -349,9 +353,27 @@ export async function runAuto(options: RunAutoOptions = {}, dependencies: AutoDe
         if (!options.once && admission.row !== undefined && drillActive(admission.row)) {
           throw new AutoAdmissionRefused('drill-active');
         }
-        let cswapAlive = false;
-        try { cswapAlive = resolveCswapCheck(dependencies.listCswapProcesses, env)().length > 0; } catch { cswapAlive = true; }
-        if (cswapAlive) {
+        if (options.inject?.kind === 'breaker-rows') {
+          // This branch is deliberately before C-swap reconciliation, polling,
+          // and heartbeat writes. A journal means reconciliation might mutate.
+          if (existsSync(claudeSwitchJournalPath({ home, env }))) {
+            throw new AutoAdmissionRefused('claude-switch-journal-present');
+          }
+          let cswapAlive = false;
+          try { cswapAlive = resolveCswapCheck(dependencies.listCswapProcesses, env)().length > 0; } catch { cswapAlive = true; }
+          if (cswapAlive) throw new AutoAdmissionRefused('cswap-alive');
+          if (!binding.breakerRowsDrill) throw new Error('breaker drill binding unavailable');
+          const tick = await binding.breakerRowsDrill();
+          if (tick.decision.kind !== 'stay' || tick.decision.reason !== 'breaker') {
+            throw new AutoAdmissionRefused('drill-breaker-not-reached');
+          }
+          result.ticks = 1;
+          result.decisions = [tick.decision];
+          redactedLog(log, `auto: ${decisionText(tick)}`);
+        } else {
+          let cswapAlive = false;
+          try { cswapAlive = resolveCswapCheck(dependencies.listCswapProcesses, env)().length > 0; } catch { cswapAlive = true; }
+          if (cswapAlive) {
           binding.store.setConfig('auto.heartbeatAt', String(now()));
           result.ticks += 1;
           redactedLog(log, 'auto: stay(cswap-alive)');
@@ -367,6 +389,7 @@ export async function runAuto(options: RunAutoOptions = {}, dependencies: AutoDe
           result.decisions = [tick.decision];
           if (tick.switchResult?.outcome === 'ok') result.executed.push(tick.switchResult.to);
           redactedLog(log, `auto: ${decisionText(tick)}`);
+          }
         }
       } catch (error) {
         if (error instanceof AutoAdmissionRefused) throw error;

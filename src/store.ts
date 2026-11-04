@@ -2571,6 +2571,26 @@ export class Store {
     });
   }
 
+  /** Persist the breaker drill's synthetic evidence without touching credential state. */
+  recordAnthropicBreakerRowsDrill(input: { now: number; activeAccountId: string; suspendedUntil: number }): void {
+    this.runImmediate(() => {
+      for (let offset = 3; offset > 0; offset -= 1) {
+        const at = input.now - offset;
+        this.recordSwitch({
+          ts: at, provider: 'anthropic', fromAccount: input.activeAccountId, toAccount: input.activeAccountId,
+          trigger: 'failover', outcome: 'ok', injected: true,
+          detail: 'fault-injection:breaker-rows:seed', committedAt: at,
+        });
+      }
+      this.recordSwitch({
+        ts: input.now, provider: 'anthropic', fromAccount: input.activeAccountId, toAccount: input.activeAccountId,
+        trigger: 'failover', outcome: 'refused', error: 'breaker', injected: true,
+        detail: 'fault-injection:breaker-rows',
+      });
+      this.setConfig('auto.anthropic.suspendedUntil', String(input.suspendedUntil));
+    });
+  }
+
   /** S14's read-only automatic Claude switch-history projection. */
   listAnthropicAutoswitchBreakerRows(): AnthropicAutoswitchBreakerRow[] {
     return listAnthropicAutoswitchBreakerRows(this.db);
@@ -2581,6 +2601,7 @@ export class Store {
     const row = this.db.prepare(`SELECT committed_at FROM switch_log
       WHERE provider = 'anthropic' AND outcome = 'ok' AND trigger <> 'manual'
         AND committed_at IS NOT NULL
+        AND (detail IS NULL OR detail <> 'fault-injection:breaker-rows:seed')
       ORDER BY committed_at DESC, id DESC LIMIT 1`).get() as { committed_at: number } | undefined;
     return row?.committed_at;
   }
