@@ -136,6 +136,7 @@ export const S64_BLOCKING_WARN = [
   'claude:slots',
   'codex:slots',
   'relogin:7d',
+  'recovery',
 ] as const;
 
 function isS64BlockingRow(row: Pick<DoctorCheck, 'name' | 'level'> | ProviderDiagnostic): boolean {
@@ -955,6 +956,7 @@ export async function doctorQlb(
     const detail = check.detail === undefined ? undefined : JSON.parse(redactJson(check.detail, []));
     return {
       ...check,
+      name: redactSecrets(check.name, []),
       message: redactSecrets(check.message, []),
       ...(detail === undefined ? {} : { detail }),
     };
@@ -962,7 +964,10 @@ export async function doctorQlb(
   registeredChecks = registeredChecks.map(redactCheck);
   const redactedProviders = providers.map((provider) => ({
     ...provider,
+    source: redactSecrets(provider.source, []),
     message: redactSecrets(provider.message, []),
+    envVar: redactSecrets(provider.envVar, []),
+    example: redactSecrets(provider.example, []),
     ...(provider.live ? { live: { ...provider.live, message: redactSecrets(provider.live.message, []) } } : {}),
   }));
   const report: DoctorReport = {

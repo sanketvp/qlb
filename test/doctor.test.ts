@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { describe, it } from 'node:test';
 
-import { defaultConfig } from '../src/config';
+import { CONFIG_ENV_VARS, defaultConfig } from '../src/config';
 import { createCommandRunner, doctorQlb, inspectProviders, registeredDoctorChecks } from '../src/diagnostics';
 import { discoverChecks } from '../src/registry';
 import { MACOS_SECURITY_TIMEOUT_MS, MockKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, type KeychainBackend } from '../src/keychain';
@@ -346,6 +346,23 @@ describe('qlb doctor', () => {
       recovery?.message,
       'recovery marker present — destructive maintenance refused until reconciled',
     );
+  });
+
+  it('a pending recovery makes the S64 verdict FAIL and is listed in failing', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-recovery-s64-'));
+    const config = defaultConfig(home);
+    const store = openStore(config.dbPath);
+    store.setConfig('migrations.recovery_pending', '1');
+    store.close();
+
+    const report = await doctorQlb(config, {
+      appendHealthLog: true, command: () => 'ok', hostCommand: () => '', hostPlatform: 'linux', piProcessList: () => '',
+    });
+    const [row] = listHealthLog(config.dbPath);
+    assert.equal(report.checks.find((check) => check.name === 'recovery')?.name, 'recovery');
+    assert.equal(report.s64.overall, 'FAIL');
+    assert.equal(row?.overall, 'FAIL');
+    assert.equal((JSON.parse(row!.failingJson) as Array<{ name: string }>).some((entry) => entry.name === 'recovery'), true);
   });
 
   it('emits recorded Keychain matrix and live-item authorization results on darwin', async () => {
@@ -853,6 +870,46 @@ describe('qlb doctor', () => {
       const output = run(args);
       assert.match(output, /\[redacted\]/);
       assert.doesNotMatch(output, new RegExp(token));
+    }
+  });
+
+  it('doctor redacts a token-shaped value in a check name and in provider source, envVar and example', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-field-redact-'));
+    const config = defaultConfig(home);
+    const token = 'sk-abcdefghijklmnopqr';
+    const store = openStore(config.dbPath);
+    store.upsertAccount(token, 'xai', 'fixture');
+    store.upsertMigration('pi-xai', 'QLB_OWNED', JSON.stringify({ accounts: [{ id: token }] }));
+    store.close();
+
+    const originalEnvVar = CONFIG_ENV_VARS.piAuthJsonPath;
+    try {
+      CONFIG_ENV_VARS.piAuthJsonPath = token;
+      const report = await doctorQlb({ ...config, piAuthJsonPath: token }, {
+        command: () => 'ok', hostCommand: () => '', hostPlatform: 'linux', piProcessList: () => '',
+      });
+      const check = report.checks.find((entry) => entry.name.startsWith('native-sync:'));
+      const provider = report.providers.find((entry) => entry.provider === 'xai');
+      assert.equal(check?.name, 'native-sync:[redacted]');
+      assert.equal(provider?.source, '[redacted] (xai entry)');
+      assert.equal(provider?.envVar, '[redacted]');
+      assert.match(provider?.example ?? '', /\[redacted\]/);
+      assert.doesNotMatch(JSON.stringify(report), new RegExp(token));
+    } finally {
+      CONFIG_ENV_VARS.piAuthJsonPath = originalEnvVar;
+    }
+
+    const cli = join(__dirname, '..', 'src', 'cli.js');
+    const env = {
+      ...process.env,
+      QLB_TEST_MODE: '1', QLB_HOME: home, HOME: home, QLB_DB_PATH: config.dbPath,
+      QLB_PI_AUTH_JSON_PATH: join(home, `${token}.json`),
+    };
+    for (const args of [['doctor'], ['doctor', '--json']]) {
+      const result = spawnSync(process.execPath, [cli, ...args], { encoding: 'utf8', env, timeout: 60_000 });
+      assert.ok(result.status === 0 || result.status === 1, result.stderr);
+      assert.match(result.stdout, /\[redacted\]/);
+      assert.doesNotMatch(result.stdout, new RegExp(token));
     }
   });
 
