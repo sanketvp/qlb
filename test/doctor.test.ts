@@ -785,7 +785,8 @@ describe('qlb doctor', () => {
       db.exec('DROP TABLE health_log');
     } finally { db.close(); }
 
-    const result = spawnSync(process.execPath, [join(__dirname, '..', 'src', 'cli.js'), 'doctor', '--json'], {
+    // Node <26 prints an ExperimentalWarning for node:sqlite on stderr; keep stderr assertions exact.
+    const result = spawnSync(process.execPath, ['--disable-warning=ExperimentalWarning', join(__dirname, '..', 'src', 'cli.js'), 'doctor', '--json'], {
       encoding: 'utf8',
       env: { ...process.env, QLB_TEST_MODE: '1', QLB_HOME: home, HOME: home, QLB_DB_PATH: config.dbPath },
     });
@@ -813,7 +814,7 @@ describe('qlb doctor', () => {
     });
     assert.equal(missing.healthLogId, undefined);
     assert.equal(missing.healthLogError, undefined);
-    const missingCli = spawnSync(process.execPath, [join(__dirname, '..', 'src', 'cli.js'), 'doctor', '--json'], {
+    const missingCli = spawnSync(process.execPath, ['--disable-warning=ExperimentalWarning', join(__dirname, '..', 'src', 'cli.js'), 'doctor', '--json'], {
       encoding: 'utf8',
       env: { ...process.env, QLB_TEST_MODE: '1', QLB_HOME: missingHome, HOME: missingHome, QLB_DB_PATH: defaultConfig(missingHome).dbPath },
     });
@@ -832,7 +833,7 @@ describe('qlb doctor', () => {
     });
     assert.equal(legacy.healthLogId, undefined);
     assert.equal(legacy.healthLogError, undefined);
-    const legacyCli = spawnSync(process.execPath, [join(__dirname, '..', 'src', 'cli.js'), 'doctor', '--json'], {
+    const legacyCli = spawnSync(process.execPath, ['--disable-warning=ExperimentalWarning', join(__dirname, '..', 'src', 'cli.js'), 'doctor', '--json'], {
       encoding: 'utf8',
       env: { ...process.env, QLB_TEST_MODE: '1', QLB_HOME: legacyHome, HOME: legacyHome, QLB_DB_PATH: legacyConfig.dbPath },
     });
