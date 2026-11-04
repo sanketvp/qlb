@@ -567,6 +567,22 @@ REFUSED: protected:QLB_OWNED (store 'pi-pool')
 
 Flags: `--account <id>` (required), `--confirm` (required), `[--db <path>]`, `[--json]`.
 
+## `qlb auto resume anthropic`
+
+Clears the Anthropic automatic-switch breaker hold and records the resume so a
+concurrent auto tick cannot restore the cleared hold. It is admitted only in a
+lifecycle state that permits auto operations; a refusal exits `3` without
+changing the stored suspension or resume marker.
+
+With `--json`, a normal cleared hold reports
+`{"provider":"anthropic","resumed":true,"suspendedUntil":"<ISO-8601>"}`;
+when no hold was present it reports `resumed: false` and `suspendedUntil: null`.
+If an older or hand-edited hold contains an invalid timestamp, the command
+still clears it and reports `resumed: "cleared-invalid"` with
+`suspendedUntil: null` instead of failing after the write.
+
+Flags: `[--json]`.
+
 ## `qlb setup`
 
 Non-destructive harness wiring: prints copy-paste snippets only, never edits files outside this repo.

@@ -424,6 +424,9 @@ function persistTickState(store: Store, input: AutoswitchInput, decision: Autosw
       setOrDelete(store, `${AUTO_PREFIX}parkedUntil`, decision.kind === 'switch' && switched ? decision.parkedUntilMs : undefined);
     }
     const suspendedUntil = decision.kind === 'stay' ? decision.suspendedUntilMs : undefined;
+    // A resume can commit after this tick derived a breaker decision. Re-read
+    // both keys while holding the write transaction so this tick never puts
+    // back a suspension that the operator has just cleared.
     const suspensionStateUnchanged = configNumber(store, `${AUTO_PREFIX}suspendedUntil`) === (input.suspendedUntilMs ?? undefined)
       && configNumber(store, `${AUTO_PREFIX}lastResumeAt`) === (input.lastResumeAtMs ?? undefined);
     if (suspendedUntil !== undefined && suspensionStateUnchanged) store.setConfig(`${AUTO_PREFIX}suspendedUntil`, String(suspendedUntil));
