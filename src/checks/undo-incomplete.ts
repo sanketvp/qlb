@@ -1,4 +1,4 @@
-import { openStoreConnection } from '../store';
+import { readUndoBeganAt } from '../lifecycle-read';
 import { check, guardCheck } from './_check';
 import type { HealthCheck } from './claude-slots';
 import { isLifecycleState, type LifecyclePhaseResult } from './lifecycle-phase';
@@ -21,20 +21,12 @@ export function undoIncompleteCheck(dbPath: string, lifecycle: LifecyclePhaseRes
     }
 
     if (lifecycle.phase === 'undoing') {
-      const db = openStoreConnection(dbPath, true);
-      try {
-        const row = db.prepare(`
-          SELECT undo_began_at AS undoBeganAt
-          FROM lifecycle WHERE closed_at IS NULL ORDER BY id DESC LIMIT 1
-        `).get() as { undoBeganAt: number | null } | undefined;
-        return {
-          name: 'undo:incomplete',
-          level: 'FAIL',
-          message: `undo-unfinished: undo_began_at=${row?.undoBeganAt ?? 'missing'}; run ${RESUME_COMMAND}`,
-        };
-      } finally {
-        db.close();
-      }
+      const undoBeganAt = readUndoBeganAt(dbPath);
+      return {
+        name: 'undo:incomplete',
+        level: 'FAIL',
+        message: `undo-unfinished: undo_began_at=${undoBeganAt ?? 'missing'}; run ${RESUME_COMMAND}`,
+      };
     }
 
     if (lifecycle.restorePending === true) {

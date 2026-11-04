@@ -8,6 +8,7 @@ import { describe, it } from 'node:test';
 
 import { defaultHeldLocks, isQlbProcessCommand, restoreCswap, runUndoCswapCommand, type TerminalHandBack } from '../src/commands/undo-cswap';
 import { undoIncompleteCheck } from '../src/checks/undo-incomplete';
+import { undoLineageMatchCheck } from '../src/checks/undo-lineage-match';
 import { discoverCommands, resolveCommand, type CommandContext } from '../src/registry';
 import { openStore, openStoreConnection } from '../src/store';
 import { runExecutingCommand } from '../src/app';
@@ -197,7 +198,7 @@ describe('qlb undo cswap --dry-run', () => {
       assert.deepEqual(plan, {
         slots: [{
           accountId: 'account-a', accountNumber: 1, email: 'a@example.test', item: 'account-1-a@example.test',
-          action: 'update', fingerprint: prefix('refresh-current'),
+          action: 'update', destinationState: 'rotated', fingerprint: prefix('refresh-current'),
         }],
         deleteEnc: [join(f.backup, 'credentials', '.creds-1-a@example.test.enc')],
         activeAccountNumber: 1,
@@ -219,6 +220,7 @@ describe('qlb undo cswap --dry-run', () => {
       assert.equal(await dryRun(f), 0);
       const plan = JSON.parse(f.output[0]!);
       assert.equal(plan.slots[0].action, 'noop');
+      assert.equal(plan.slots[0].destinationState, 'match');
       assert.equal(plan.slots[0].fingerprint, prefix('refresh-equal'));
     } finally {
       close(f);
@@ -1312,6 +1314,163 @@ describe('qlb undo cswap doctor diagnostic', () => {
       beginUndo(f);
       assert.deepEqual(undoIncompleteCheck(f.dbPath, { available: true, phase: 'cutover' }), {
         name: 'undo:incomplete', level: 'N/A', message: 'not applicable in phase=cutover',
+      });
+    } finally { close(f); }
+  });
+});
+
+describe('qlb undo lineage-match doctor diagnostic', () => {
+  function completedUndo(f: Fixture): void {
+    beginUndo(f);
+    const store = openStore(f.dbPath);
+    try {
+      assert.equal(transition(store, 'undoing', 123).ok, true);
+      assert.equal(transition(store, 'rolled-back', 124).ok, true);
+    } finally { store.close(); }
+  }
+
+  it('is N/A before undo begins', async () => {
+    const f = fixture();
+    try {
+      assert.deepEqual(await undoLineageMatchCheck(f.dbPath, { available: true, phase: 'rolled-back' }, f.keychain, f.backup), {
+        name: 'undo:lineage-match', level: 'N/A', message: 'not applicable: lifecycle row was not produced by undo',
+      });
+    } finally { close(f); }
+  });
+
+  it('is N/A while the post-undo C-swap restore is pending', async () => {
+    const f = fixture();
+    try {
+      completedUndo(f);
+      assert.deepEqual(await undoLineageMatchCheck(f.dbPath, { available: true, phase: 'rolled-back', restorePending: true }, f.keychain, f.backup), {
+        name: 'undo:lineage-match', level: 'N/A', message: 'not applicable in phase=rolled-back',
+      });
+    } finally { close(f); }
+  });
+
+  it('is N/A for abortCutoverBegin rows', async () => {
+    const f = fixture();
+    try {
+      const store = openStore(f.dbPath);
+      try {
+        const begun = beginCutover(store, 1, CUTOVER_BEGIN_IN_PROGRESS);
+        assert.equal(abortCutoverBegin(store, begun.id, 'fixture', 123).ok, true);
+      } finally { store.close(); }
+      assert.deepEqual(await undoLineageMatchCheck(f.dbPath, { available: true, phase: 'aborted' }, f.keychain, f.backup), {
+        name: 'undo:lineage-match', level: 'N/A', message: 'not applicable: lifecycle row was not produced by undo',
+      });
+    } finally { close(f); }
+  });
+
+  it('passes only when all slots are noop and no encrypted fallback remains', async () => {
+    const f = fixture();
+    try {
+      completedUndo(f);
+      addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-equal', active: true });
+      f.keychain.set('claude-swap', 'account-1-a@example.test', credential('different-access', 'refresh-equal'));
+      assert.deepEqual(await undoLineageMatchCheck(f.dbPath, { available: true, phase: 'rolled-back' }, f.keychain, f.backup), {
+        name: 'undo:lineage-match', level: 'PASS', message: 'all undo credential lineages match',
+      });
+      assert.deepEqual(f.keychain.writes, [
+        { service: 'qlb:anthropic:account-a', account: 'qlb' },
+        { service: 'claude-swap', account: 'account-1-a@example.test' },
+      ]);
+    } finally { close(f); }
+  });
+
+  it('warns when a C-swap credential rotates after hand-back', async () => {
+    const f = fixture();
+    try {
+      completedUndo(f);
+      addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-current', active: true });
+      f.keychain.set('claude-swap', 'account-1-a@example.test', credential('account-a', 'refresh-stale'));
+      assert.deepEqual(await undoLineageMatchCheck(f.dbPath, { available: true, phase: 'rolled-back' }, f.keychain, f.backup), {
+        name: 'undo:lineage-match', level: 'WARN', message: 'slot 1: credential lineage changed after hand-back',
+      });
+    } finally { close(f); }
+  });
+
+  it('fails when a C-swap credential is missing after hand-back', async () => {
+    const f = fixture();
+    try {
+      completedUndo(f);
+      addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-current', active: true });
+      assert.deepEqual(await undoLineageMatchCheck(f.dbPath, { available: true, phase: 'rolled-back' }, f.keychain, f.backup), {
+        name: 'undo:lineage-match', level: 'FAIL', message: 'slot 1: C-swap credential missing',
+      });
+    } finally { close(f); }
+  });
+
+  it('fails when a C-swap credential is malformed after hand-back', async () => {
+    const f = fixture();
+    try {
+      completedUndo(f);
+      addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-current', active: true });
+      f.keychain.set('claude-swap', 'account-1-a@example.test', 'not a credential');
+      assert.deepEqual(await undoLineageMatchCheck(f.dbPath, { available: true, phase: 'rolled-back' }, f.keychain, f.backup), {
+        name: 'undo:lineage-match', level: 'FAIL', message: 'slot 1: C-swap credential malformed',
+      });
+    } finally { close(f); }
+  });
+
+  it('warns when a parsed C-swap credential has no refresh token', async () => {
+    const f = fixture();
+    try {
+      completedUndo(f);
+      addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-current', active: true });
+      f.keychain.set('claude-swap', 'account-1-a@example.test', '{}');
+      assert.deepEqual(await undoLineageMatchCheck(f.dbPath, { available: true, phase: 'rolled-back' }, f.keychain, f.backup), {
+        name: 'undo:lineage-match', level: 'WARN', message: 'slot 1: credential lineage changed after hand-back',
+      });
+    } finally { close(f); }
+  });
+
+  it('fails a remaining encrypted fallback without revealing its path', async () => {
+    const f = fixture();
+    try {
+      completedUndo(f);
+      addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-equal', active: true });
+      f.keychain.set('claude-swap', 'account-1-a@example.test', credential('account-a', 'refresh-equal'));
+      writeFileSync(join(f.backup, 'credentials', '.creds-1-a@example.test.enc'), 'fixture');
+      assert.deepEqual(await undoLineageMatchCheck(f.dbPath, { available: true, phase: 'rolled-back' }, f.keychain, f.backup), {
+        name: 'undo:lineage-match', level: 'FAIL', message: 'slot 1: encrypted credential remains',
+      });
+    } finally { close(f); }
+  });
+
+  it('fails an encrypted fallback even when a credential lineage changed', async () => {
+    const f = fixture();
+    try {
+      completedUndo(f);
+      addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-current', active: true });
+      f.keychain.set('claude-swap', 'account-1-a@example.test', credential('account-a', 'refresh-stale'));
+      writeFileSync(join(f.backup, 'credentials', '.creds-1-a@example.test.enc'), 'fixture');
+      assert.deepEqual(await undoLineageMatchCheck(f.dbPath, { available: true, phase: 'rolled-back' }, f.keychain, f.backup), {
+        name: 'undo:lineage-match', level: 'FAIL', message: 'slot 1: encrypted credential remains',
+      });
+    } finally { close(f); }
+  });
+
+  it('reports redacted backend inspection failures', async () => {
+    const f = fixture();
+    try {
+      completedUndo(f);
+      addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-current', active: true });
+      const secret = 'sk-1234567890abcdefghij';
+      const keychain = { get: async (): Promise<string> => { throw new Error(`keychain unavailable: ${secret}`); } };
+      assert.deepEqual(await undoLineageMatchCheck(f.dbPath, { available: true, phase: 'rolled-back' }, keychain, f.backup), {
+        name: 'undo:lineage-match', level: 'FAIL', message: 'unable to inspect undo credential lineage: keychain unavailable: [redacted]',
+      });
+    } finally { close(f); }
+  });
+
+  it('fails structural refusals with their refusal code', async () => {
+    const f = fixture();
+    try {
+      completedUndo(f);
+      addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-current', source: 'qlb-add', active: true });
+      assert.deepEqual(await undoLineageMatchCheck(f.dbPath, { available: true, phase: 'rolled-back' }, f.keychain, f.backup), {
+        name: 'undo:lineage-match', level: 'FAIL', message: 'refused: qlb-add-slot',
       });
     } finally { close(f); }
   });

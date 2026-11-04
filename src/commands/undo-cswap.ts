@@ -12,6 +12,7 @@ import {
   CswapUndoVerificationError,
   executeHandBack,
   planHandBack,
+  readPlanState,
   type ExecuteHandBackDependencies,
   type HandBackPlan,
   type PlanHandBackDependencies,
@@ -34,7 +35,7 @@ import {
   phase,
   transition,
 } from '../lifecycle';
-import { openStoreConnection, openStore, readOnlySchemaRefusal } from '../store';
+import { openStoreConnection, openStore } from '../store';
 import type { CommandContext, CommandDefinition } from '../registry';
 
 export interface UndoCswapCommandDependencies {
@@ -72,35 +73,6 @@ function parse(args: string[]): Options | null {
   const allowed = new Set(['--dry-run', '--resume', '--json']);
   if (args.some((arg) => !allowed.has(arg)) || new Set(args).size !== args.length || (args.includes('--dry-run') && args.includes('--resume'))) return null;
   return { json: args.includes('--json'), dryRun: args.includes('--dry-run'), resume: args.includes('--resume') };
-}
-
-/** Every callback opens a fresh readonly connection so a post-drain plan cannot reuse stale metadata. */
-function readPlanState(dbPath: string, missingIsEmpty = false): Pick<PlanHandBackDependencies, 'slots' | 'activeAccountId' | 'migratedPiProviders'> {
-  // CLI admission gives a missing dry-run store the default pre-cutover state.
-  // Preserve that plan without opening SQLite (which would fail read-only).
-  if (missingIsEmpty && !existsSync(dbPath)) {
-    return { slots: () => [], activeAccountId: () => null, migratedPiProviders: () => [] };
-  }
-  const read = <T>(fn: (db: ReturnType<typeof openStoreConnection>) => T): T => {
-    const db = openStoreConnection(dbPath, true);
-    try {
-      const schemaRefusal = readOnlySchemaRefusal(db);
-      if (schemaRefusal) throw new Error(schemaRefusal);
-      return fn(db);
-    } finally { db.close(); }
-  };
-  return {
-    slots: () => read((db) => db.prepare(`SELECT account_id AS accountId, slot_num AS slotNum, email, fingerprint, source, dead
-      FROM claude_slots WHERE archived_at IS NULL ORDER BY slot_num, account_id`).all() as unknown as ReturnType<PlanHandBackDependencies['slots']>),
-    activeAccountId: () => read((db) => {
-      const active = db.prepare("SELECT account_id AS accountId FROM active_login WHERE provider = 'anthropic'").get() as { accountId: string | null } | undefined;
-      return active?.accountId ?? null;
-    }),
-    migratedPiProviders: () => read((db) => {
-      const migrated = db.prepare("SELECT key FROM config WHERE key LIKE 'pi.%.state' AND value = 'migrated' ORDER BY key").all() as Array<{ key: string }>;
-      return migrated.map(({ key }) => key.slice('pi.'.length, -'.state'.length));
-    }),
-  };
 }
 
 function formatHuman(plan: HandBackPlan): string[] {
