@@ -12,6 +12,7 @@ import {
   claudeSwitchJournalPath,
   createClaudeSwitchJournal,
   deleteClaudeSwitchJournal,
+  withClaudeSwitchJournalOwner,
   readClaudeSwitchJournal,
   readStagedRollback,
   updateClaudeSwitchJournal,
@@ -24,7 +25,9 @@ import { switchClaude, type ClaudeSwitchDeps } from '../src/cc-switch';
 import { createSwitchAnthropicCommand } from '../src/commands/switch-anthropic';
 import { createClaudeJournalResolveCommand } from '../src/commands/claude-journal-resolve';
 import { ClaudeCodeLockTimeout, ProperLockfileCompromised } from '../src/cc-locks';
+import { claudeSwitchJournalCheck } from '../src/checks/claude-switch-journal';
 import type { CommandContext } from '../src/registry';
+import { openStore } from '../src/store';
 
 const NOW = 1_000_000;
 const digest = (value: string) => createHash('sha256').update(value, 'utf8').digest('hex');
@@ -111,6 +114,121 @@ function wrappedBackend(backend: MockKeychain, overrides: Partial<ClaudeSwitchDe
 }
 
 describe('Claude switch journal reconciliation (G10)', () => {
+  it('doctor makes the switch journal applicable only during Claude cutover phases and passes without one', async () => {
+    const subject = await fixture();
+    const options = {
+      journal: { journalDir: subject.deps.journalDir, home: subject.home, env: subject.env, configPath: subject.paths.globalConfigPath, keychainService: subject.paths.keychainService },
+    };
+    for (const phase of ['pre-cutover', 'undoing', 'rolled-back', 'aborted'] as const) {
+      assert.deepEqual(await claudeSwitchJournalCheck('unused.sqlite', phase, options), {
+        name: 'claude:switch-journal', level: 'N/A', message: `not applicable in phase=${phase}`,
+      });
+    }
+    for (const phase of ['cutting-over', 'cutover', 'retired'] as const) {
+      assert.deepEqual(await claudeSwitchJournalCheck('unused.sqlite', phase, options), {
+        name: 'claude:switch-journal', level: 'PASS', message: 'no Claude switch journal',
+      });
+    }
+  });
+
+  it('doctor passes an unfinished switch journal while its owner lock is held', async () => {
+    const subject = await fixture();
+    await install(subject);
+    const dbPath = join(subject.root, 'qlb.sqlite');
+    const store = openStore(dbPath);
+    store.close();
+    const options = {
+      journal: { journalDir: subject.deps.journalDir, home: subject.home, env: subject.env, configPath: subject.paths.globalConfigPath, keychainService: subject.paths.keychainService },
+      ownerIsLive: async () => false,
+    };
+    await withClaudeSwitchJournalOwner(options.journal, async () => {
+      assert.deepEqual(await claudeSwitchJournalCheck(dbPath, 'cutover', options), {
+        name: 'claude:switch-journal', level: 'PASS', message: 'in progress',
+      });
+    });
+  });
+
+  it('doctor passes an unfinished switch journal while its owner process is alive', async () => {
+    const subject = await fixture();
+    await install(subject);
+    const dbPath = join(subject.root, 'qlb.sqlite');
+    const store = openStore(dbPath);
+    store.close();
+    const options = {
+      journal: { journalDir: subject.deps.journalDir, home: subject.home, env: subject.env, configPath: subject.paths.globalConfigPath, keychainService: subject.paths.keychainService },
+      ownerIsLive: async () => true,
+    };
+    assert.deepEqual(await claudeSwitchJournalCheck(dbPath, 'cutover', options), {
+      name: 'claude:switch-journal', level: 'PASS', message: 'in progress',
+    });
+  });
+
+  it('doctor passes a journal whose matching switch was committed', async () => {
+    const subject = await fixture();
+    const entry = await install(subject);
+    const dbPath = join(subject.root, 'qlb.sqlite');
+    const store = openStore(dbPath);
+    try {
+      store.recordSwitch({
+        ts: NOW,
+        provider: 'anthropic',
+        fromAccount: entry.from,
+        toAccount: entry.to,
+        trigger: entry.trigger,
+        outcome: 'ok',
+        stepsJson: JSON.stringify({ attempt: entry.attemptId }),
+        committedAt: NOW,
+      });
+    } finally {
+      store.close();
+    }
+    assert.deepEqual(await claudeSwitchJournalCheck(dbPath, 'cutover', {
+      journal: { journalDir: subject.deps.journalDir, home: subject.home, env: subject.env, configPath: subject.paths.globalConfigPath, keychainService: subject.paths.keychainService },
+    }), {
+      name: 'claude:switch-journal', level: 'PASS', message: 'finished',
+    });
+  });
+
+  it('doctor fails an orphaned journal with a matching refused switch and leaves its sha256 byte-identical', async () => {
+    const subject = await fixture();
+    const entry = await install(subject);
+    const dbPath = join(subject.root, 'qlb.sqlite');
+    const store = openStore(dbPath);
+    try {
+      store.recordClaudeSwitchRefusal({
+        from: entry.from,
+        to: entry.to,
+        trigger: entry.trigger,
+        reason: 'fixture-refusal',
+        injected: false,
+        attempt: entry.attemptId,
+        now: NOW,
+      });
+    } finally {
+      store.close();
+    }
+    const path = claudeSwitchJournalPath({ journalDir: subject.deps.journalDir });
+    const before = createHash('sha256').update(readFileSync(path)).digest('hex');
+    const options = {
+      journal: { journalDir: subject.deps.journalDir, home: subject.home, env: subject.env, configPath: subject.paths.globalConfigPath, keychainService: subject.paths.keychainService },
+      ownerIsLive: async () => false,
+    };
+    const result = await claudeSwitchJournalCheck(dbPath, 'cutover', options);
+    assert.equal(result.level, 'FAIL');
+    assert.equal(result.message, `unfinished Claude switch journal ${path}: attemptId=${entry.attemptId} step=${entry.step} from=${entry.from} to=${entry.to}; run qlb claude journal resolve --forward or qlb claude journal resolve --back`);
+    assert.equal(createHash('sha256').update(readFileSync(path)).digest('hex'), before);
+  });
+
+  it('doctor fails a malformed switch journal without inspecting its contents', async () => {
+    const subject = await fixture();
+    mkdirSync(subject.deps.journalDir!, { recursive: true });
+    writeFileSync(claudeSwitchJournalPath({ journalDir: subject.deps.journalDir }), '{malformed');
+    const result = await claudeSwitchJournalCheck('unused.sqlite', 'cutover', {
+      journal: { journalDir: subject.deps.journalDir, home: subject.home, env: subject.env, configPath: subject.paths.globalConfigPath, keychainService: subject.paths.keychainService },
+    });
+    assert.deepEqual(result, { name: 'claude:switch-journal', level: 'FAIL', message: 'malformed' });
+  });
+
   it('journal resolve reports lock contention as a refusal instead of usage failure', async () => {
     const subject = await fixture();
     const stderr: string[] = [];
