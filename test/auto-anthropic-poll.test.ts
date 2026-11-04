@@ -123,6 +123,35 @@ describe('auto anthropic poll (G8)', () => {
     }
   });
 
+  it('two simulated hours with fresh tokens make 0 POSTs and poll only on schedule', async () => {
+    const f = await fixture();
+    for (const accountId of ['active', 'inactive']) {
+      await f.slots.writeSlot(accountId, credential(`${accountId}-long`, (NOW + 10_800) * 1000), { cause: 'fixture' });
+    }
+    f.store.writeUsagePollPlans('anthropic', {
+      active: { nextDueAt: NOW, pollIntervalS: 300 },
+      inactive: { nextDueAt: NOW, pollIntervalS: 300 },
+    });
+
+    for (let tick = 0; tick < 120; tick += 1) {
+      const now = NOW + tick * 60;
+      f.now(now);
+      const before = f.calls().gets;
+      const dueOrOverdue = Object.values(f.store.listUsagePolls('anthropic'))
+        .filter((plan) => plan.nextDueAt !== null && plan.nextDueAt <= now).length;
+      await pollAnthropic(f.deps());
+      assert.equal(f.calls().gets - before, dueOrOverdue, `tick ${tick} polled once on the first tick at or after next_due_at`);
+
+      const snapshots = anthropicStoreSnapshots(f.slots.listSlots(), f.store, now).snapshots;
+      assert.equal(snapshots.length, 2);
+      for (const snapshot of snapshots) {
+        assert.equal(Object.keys(snapshot.buckets).length, 2, `tick ${tick} has no unknown gap for ${snapshot.accountId}`);
+        assert.ok(Object.values(snapshot.buckets).every((reading) => reading.confidence === 'authoritative' || reading.confidence === 'stale'));
+      }
+    }
+    assert.equal(f.calls().posts, 0);
+  });
+
   it('strikes a dead inactive token and never posts it again', async () => {
     const f = await fixture();
     await f.slots.writeSlot('inactive', credential('expired', (NOW - 1) * 1000), { cause: 'fixture' });
