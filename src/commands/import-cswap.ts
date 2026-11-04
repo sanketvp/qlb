@@ -3,7 +3,10 @@ import { dirname, join } from 'node:path';
 import { claudePaths } from '../cc-paths';
 import { withClaudeConfigPathLock, withClaudeCredentialLocks } from '../cc-locks';
 import { SqliteClaudeSlotRepository } from '../cc-slots';
-import { CswapImportRefusalError, importCswap, planCswapImport } from '../cswap-import';
+import {
+  classifyCswapImportJournals, CswapImportRefusalError, importCswap, planCswapImport,
+  probeCswapImportLock, reconcileCswapImportJournals,
+} from '../cswap-import';
 import { readClaudeConfig, readLiveClaudeCredentials } from '../cc-credentials';
 import { assertAdmitted } from '../lifecycle';
 import { isSuccessor } from '../lineage-log';
@@ -11,10 +14,14 @@ import { platformKeychain } from '../keychain';
 import { openStore } from '../store';
 import type { CommandContext, CommandDefinition } from '../registry';
 
-function parse(args: string[]): { dryRun: boolean; replace: boolean; json: boolean } | null {
-  const allowed = new Set(['--dry-run', '--replace', '--json']);
+function parse(args: string[]): { dryRun: boolean; replace: boolean; reconcile: boolean; preview: boolean; json: boolean } | null {
+  const allowed = new Set(['--dry-run', '--replace', '--reconcile', '--preview', '--json']);
   if (args.some((arg) => !allowed.has(arg)) || new Set(args).size !== args.length) return null;
-  return { dryRun: args.includes('--dry-run'), replace: args.includes('--replace'), json: args.includes('--json') };
+  const reconcile = args.includes('--reconcile');
+  const preview = args.includes('--preview');
+  if (preview && !reconcile) return null;
+  if (reconcile && (args.includes('--dry-run') || args.includes('--replace'))) return null;
+  return { dryRun: args.includes('--dry-run'), replace: args.includes('--replace'), reconcile, preview, json: args.includes('--json') };
 }
 
 function configuredOauthAccountId(path: string): string | null {
@@ -28,20 +35,24 @@ function configuredOauthAccountId(path: string): string | null {
 function print(ctx: CommandContext, value: unknown, json: boolean): void {
   if (json) ctx.stdout(JSON.stringify(value));
   else {
-    const plan = value as { slots: unknown[]; keychainItems: number; encFiles: number };
-    ctx.stdout(`slots=${plan.slots.length}; keychainItems=${plan.keychainItems}; encFiles=${plan.encFiles}`);
+    const output = value as { slots?: unknown[]; keychainItems?: number; encFiles?: number; journals?: unknown[] };
+    if (output.slots) ctx.stdout(`slots=${output.slots.length}; keychainItems=${output.keychainItems}; encFiles=${output.encFiles}`);
+    else ctx.stdout(`journals=${output.journals?.length ?? 0}`);
   }
 }
 
 async function execute(args: string[], ctx: CommandContext): Promise<number> {
   const opts = parse(args);
   if (!opts) {
-    ctx.stderr('usage: qlb import cswap [--dry-run] [--replace] [--json]');
+    ctx.stderr('usage: qlb import cswap [--dry-run] [--replace] [--json] | --reconcile [--preview] [--json]');
     return 2;
   }
 
   const store = openStore(ctx.config.dbPath);
-  const admission = assertAdmitted(store, opts.dryRun ? 'import-cswap:dry-run' : 'import-cswap');
+  const operation = opts.reconcile
+    ? (opts.preview ? 'import-cswap:reconcile-preview' : 'import-cswap:reconcile')
+    : (opts.dryRun ? 'import-cswap:dry-run' : 'import-cswap');
+  const admission = assertAdmitted(store, operation);
   if (!admission.ok) {
     store.close();
     ctx.stderr(`import cswap refused: ${admission.code}`);
@@ -66,10 +77,36 @@ async function execute(args: string[], ctx: CommandContext): Promise<number> {
       isSuccessor: (accountId: string, ancestor: string, descendant: string) =>
         isSuccessor(store, 'anthropic', accountId, ancestor, descendant),
     };
+    // Probe is read-only. A stale lock is deliberately not a refusal: the
+    // mutation primitive owns the guarded stale takeover protocol.
+    if (probeCswapImportLock(base).held) {
+      ctx.stderr('import cswap refused: import-in-progress');
+      return 3;
+    }
+    const journals = classifyCswapImportJournals(base);
+    const unclassifiable = journals.find((journal) => journal.action === 'unclassifiable');
+    if (unclassifiable) {
+      ctx.stderr(`import cswap refused: import-journal-unclassifiable ${unclassifiable.runId}`);
+      return 3;
+    }
+    if (opts.reconcile) {
+      if (opts.preview) {
+        print(ctx, { journals, preview: true }, opts.json);
+        return 0;
+      }
+      await reconcileCswapImportJournals(base);
+      print(ctx, { journals: classifyCswapImportJournals(base), reconciled: true }, opts.json);
+      return 0;
+    }
     if (opts.dryRun) {
       const plan = await planCswapImport(base);
-      print(ctx, { ...plan, dryRun: true }, opts.json);
+      print(ctx, { ...plan, journals, dryRun: true }, opts.json);
       return 0;
+    }
+    const orphan = journals.find((journal) => journal.action !== 'none');
+    if (orphan) {
+      ctx.stderr(`import cswap refused: import-journal-orphaned ${orphan.runId}`);
+      return 3;
     }
     let livePaths: ReturnType<typeof claudePaths> | undefined;
     const withLiveStateLocks = <T,>(fn: () => Promise<T> | T) => withClaudeCredentialLocks({ home: ctx.home, env: ctx.env }, async () => {
@@ -110,7 +147,8 @@ async function execute(args: string[], ctx: CommandContext): Promise<number> {
     if (error instanceof CswapImportRefusalError) {
       // Slot numbers are credential-free; the message text is not rendered.
       const detail = error.code === 'duplicate-login' && error.slots
-        ? ` (slots ${error.slots[0]} and ${error.slots[1]} hold the same login)` : '';
+        ? ` (slots ${error.slots[0]} and ${error.slots[1]} hold the same login)`
+        : error.code === 'import-journal-orphaned' && error.runId ? ` ${error.runId}` : '';
       ctx.stderr(`import cswap refused: ${error.code}${detail}`);
       return 3;
     }

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
@@ -10,12 +11,13 @@ import { withClaudeConfigPathLock, withClaudeCredentialLocks } from '../src/cc-l
 import { claudePaths } from '../src/cc-paths';
 import { macosKeychainAccountName, MockKeychain, platformKeychain, QLB_KEYCHAIN_ACCOUNT } from '../src/keychain';
 import importCswapCommand from '../src/commands/import-cswap';
-import { beginCutover } from '../src/lifecycle';
+import { beginCutover, transition } from '../src/lifecycle';
 import { openStore } from '../src/store';
 import type { CommandContext } from '../src/registry';
 import {
   CswapImportCommitUnknown, CswapImportInjectedCrash, CswapImportRefusalError,
-  importCswap, planCswapImport, recoverUncommittedCswapImport,
+  classifyCswapImportJournals, importCswap, planCswapImport, probeCswapImportLock,
+  reconcileCswapImportJournals, recoverUncommittedCswapImport,
 } from '../src/cswap-import';
 
 function credential(id: string, refresh: string): string {
@@ -45,7 +47,96 @@ function fixture(): { root: string; backup: string; keychain: MockKeychain; repo
   return { root, backup, keychain, repo: new InMemoryClaudeSlotRepository() };
 }
 
+function stagedJournal(root: string, runId: string, accountId = 'account-a', journalDir = join(root, 'journals')): { journalDir: string; staging: string } {
+  const staging = `qlb:anthropic:staging:${runId}:${accountId}`;
+  mkdirSync(join(journalDir, `cswap-import-${runId}`), { recursive: true });
+  writeFileSync(join(journalDir, `cswap-import-${runId}`, 'journal.json'), JSON.stringify({
+    runId, phase: 'staged', startedAt: 1,
+    slots: [{
+      accountId, staging, destination: `qlb:anthropic:${accountId}`,
+      importPrevious: `qlb:anthropic:import-prev:${runId}:${accountId}`,
+      importPreviousPrevious: `qlb:anthropic:import-prev-prev:${runId}:${accountId}`,
+      fingerprint: 'sha256:fixture', previousFingerprint: null, promotedFingerprint: null,
+      destinationExisted: null, priorDestinationFingerprint: null, priorDestinationLineage: null,
+      previousDestinationExisted: null, priorPreviousFingerprint: null,
+      prevSaved: false, previousSaved: false, reached: 'unreached', restored: false,
+    }],
+  }));
+  return { journalDir, staging };
+}
+
 describe('C-swap import (K10 / AC16)', () => {
+  it('classifies journals read-only without creating a journal root, and treats stale import locks as reclaimable', () => {
+    const h = fixture();
+    const journalDir = join(h.root, 'absent-journals');
+    const options = { backupDir: h.backup, journalDir, keychain: h.keychain, repository: h.repo };
+    assert.deepEqual(classifyCswapImportJournals(options), []);
+    assert.equal(existsSync(journalDir), false, 'read-only classification creates no directory');
+    mkdirSync(join(journalDir, 'cswap-import.lock'), { recursive: true });
+    assert.equal(probeCswapImportLock(options).held, true);
+    const stale = new Date(Date.now() - 61_000);
+    utimesSync(join(journalDir, 'cswap-import.lock'), stale, stale);
+    assert.equal(probeCswapImportLock(options).held, false);
+  });
+
+  it('purges only staged services named by a valid staged journal and records an inert terminal journal', async () => {
+    const h = fixture();
+    const { journalDir, staging } = stagedJournal(h.root, 'staged-purge');
+    await h.keychain.set(staging, QLB_KEYCHAIN_ACCOUNT, credential('account-a', 'fixture-refresh'));
+    await h.keychain.set('qlb:anthropic:unrelated', QLB_KEYCHAIN_ACCOUNT, credential('unrelated', 'unrelated-refresh'));
+    const options = { backupDir: h.backup, journalDir, keychain: h.keychain, repository: h.repo };
+    const before = classifyCswapImportJournals(options);
+    assert.deepEqual(before.map(({ runId, phase, action }) => ({ runId, phase, action })), [{ runId: 'staged-purge', phase: 'staged', action: 'purge-staging' }]);
+    await reconcileCswapImportJournals(options);
+    await assert.rejects(h.keychain.get(staging, QLB_KEYCHAIN_ACCOUNT), /item not found/);
+    await assert.doesNotReject(h.keychain.get('qlb:anthropic:unrelated', QLB_KEYCHAIN_ACCOUNT));
+    assert.deepEqual(classifyCswapImportJournals(options).map((journal) => journal.action), ['none']);
+  });
+
+  it('prints a credential-free reconcile preview and leaves its journal byte-identical', async () => {
+    const h = fixture();
+    const home = join(h.root, 'home');
+    const { journalDir } = stagedJournal(home, 'preview-run', 'account-a', join(home, '.qlb', 'backups'));
+    const journalPath = join(journalDir, 'cswap-import-preview-run', 'journal.json');
+    const before = readFileSync(journalPath, 'utf8');
+    const dbPath = join(h.root, 'preview.db');
+    const store = openStore(dbPath);
+    beginCutover(store);
+    assert.equal(transition(store, 'cutover').ok, true);
+    store.close();
+    const stdout: string[] = [];
+    const context: CommandContext = {
+      stdout: (line) => stdout.push(line), stderr: () => {},
+      env: { QLB_TEST_MODE: '1', QLB_HOME: join(h.root, 'qlb-home'), HOME: home, USER: macosKeychainAccountName() },
+      config: { dbPath, cswapSequencePath: join(h.backup, 'sequence.json') } as CommandContext['config'],
+      loadConfig: () => { throw new Error('not used'); }, home,
+      registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
+    };
+    assert.equal(await importCswapCommand.execute!(['--reconcile', '--preview', '--json'], context), 0);
+    const output = JSON.parse(stdout[0]) as { preview: boolean; journals: Array<{ runId: string; action: string; sha256: string }> };
+    assert.equal(output.preview, true);
+    assert.deepEqual(output.journals.map(({ runId, action }) => ({ runId, action })), [{ runId: 'preview-run', action: 'purge-staging' }]);
+    assert.equal(output.journals[0].sha256, createHash('sha256').update(before).digest('hex'));
+    assert.equal(readFileSync(journalPath, 'utf8'), before);
+  });
+
+  it('refuses an orphaned journal before writing a new staging item', async () => {
+    const h = fixture();
+    const { journalDir } = stagedJournal(h.root, 'blocks-new-import');
+    let writes = 0;
+    const keychain = {
+      get: h.keychain.get.bind(h.keychain), delete: h.keychain.delete.bind(h.keychain),
+      set: async (service: string, account: string, value: string) => { writes += 1; await h.keychain.set(service, account, value); },
+    };
+    await assert.rejects(importCswap({ backupDir: h.backup, journalDir, keychain, repository: h.repo }), (error: unknown) => {
+      assert.ok(error instanceof CswapImportRefusalError);
+      assert.equal(error.code, 'import-journal-orphaned');
+      assert.equal(error.runId, 'blocks-new-import');
+      return true;
+    });
+    assert.equal(writes, 0);
+  });
+
   it('plans .enc-wins input without mutating a destination', async () => {
     const h = fixture();
     const plan = await planCswapImport({ backupDir: h.backup, keychain: h.keychain, repository: h.repo });

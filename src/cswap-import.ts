@@ -7,8 +7,8 @@
 // K10: staging-only C-swap import. Source credentials are never returned in a
 // plan/result and journal records contain fingerprints and service names only.
 
-import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { credentialFingerprint, parseCredentialBlob } from './anthropic-oauth';
 import type { ClaudeSlot, ClaudeSlotBackend, ClaudeSlotRepository } from './cc-slots';
@@ -29,7 +29,8 @@ export type CswapImportRefusalCode =
   | 'live-changed'
   | 'api-key-source'
   | 'session-profiles'
-  | 'duplicate-login';
+  | 'duplicate-login'
+  | 'import-journal-orphaned';
 
 /** A credential-free, operator-actionable refusal (command exit 3). */
 export class CswapImportRefusalError extends Error {
@@ -38,6 +39,8 @@ export class CswapImportRefusalError extends Error {
     message: string,
     /** The two source slot numbers of a 'duplicate-login' refusal. */
     readonly slots?: readonly [number, number],
+    /** The credential-free journal run identifier for an orphaned-journal refusal. */
+    readonly runId?: string,
   ) {
     super(message);
     this.name = 'CswapImportRefusalError';
@@ -171,6 +174,21 @@ interface Journal {
   phase: 'staged' | 'promoting' | 'committed' | 'commit-unknown' | 'cleaned' | 'aborted';
   startedAt: number;
   slots: JournalSlot[];
+}
+
+export type CswapImportJournalAction = 'recover' | 'finish-cleanup' | 'purge-staging' | 'none' | 'unclassifiable';
+
+/** Credential-free journal inventory suitable for CLI output and operator review. */
+export interface CswapImportJournalStatus {
+  runId: string;
+  phase: Journal['phase'] | 'invalid';
+  action: CswapImportJournalAction;
+  sha256: string;
+}
+
+export interface CswapImportLockStatus {
+  /** True only for a non-stale lock holder. Stale locks are reclaimable by the mutation primitive. */
+  held: boolean;
 }
 
 interface PromotionEffect {
@@ -477,6 +495,115 @@ function readJournal(options: CswapImportOptions, runId: string): Journal {
   }
 }
 
+const JOURNAL_PHASES = new Set<Journal['phase']>(['staged', 'promoting', 'committed', 'commit-unknown', 'cleaned', 'aborted']);
+
+/** A classifier must never turn malformed disk data into Keychain target names. */
+function isSafeJournal(journal: Partial<Journal>, runId: string): journal is Journal {
+  if (journal.runId !== runId || !JOURNAL_PHASES.has(journal.phase as Journal['phase']) || !Array.isArray(journal.slots) || journal.slots.length === 0) return false;
+  const accounts = new Set<string>();
+  return typeof journal.startedAt === 'number' && Number.isFinite(journal.startedAt) && journal.slots.every((entry) => {
+    if (!entry || typeof entry !== 'object' || typeof entry.accountId !== 'string' || accounts.has(entry.accountId)) return false;
+    accounts.add(entry.accountId);
+    try {
+      return entry.staging === service(runId, entry.accountId, 'staging')
+        && entry.destination === destination(entry.accountId)
+        && entry.importPrevious === service(runId, entry.accountId, 'import-prev')
+        && entry.importPreviousPrevious === service(runId, entry.accountId, 'import-prev-prev')
+        && ['unreached', 'destination', 'previous'].includes(entry.reached)
+        && typeof entry.restored === 'boolean';
+    } catch {
+      return false;
+    }
+  });
+}
+
+/** Read the QLB-owned journal root without creating it or consulting Keychain. */
+function readCswapImportJournalFiles(options: CswapImportOptions): Array<{ runId: string; text: string }> {
+  const io = options.files ?? files;
+  const root = journalRoot(options);
+  if (!io.exists(root)) return [];
+  let names: string[];
+  try { names = io.readdir(root); } catch { return []; }
+  return names.filter((name) => name.startsWith('cswap-import-')).sort().flatMap((name) => {
+    const runId = name.slice('cswap-import-'.length);
+    try { return [{ runId, text: io.readText(join(root, name, 'journal.json')) }]; } catch { return [{ runId, text: '' }]; }
+  });
+}
+
+/** Probe only: a stale import lock is not a holder because mutation can safely reclaim it. */
+export function probeCswapImportLock(options: CswapImportOptions): CswapImportLockStatus {
+  const lock = join(journalRoot(options), 'cswap-import.lock');
+  try {
+    return { held: existsSync(lock) && Date.now() - statSync(lock).mtimeMs <= 60_000 };
+  } catch {
+    return { held: true };
+  }
+}
+
+/** Classify every existing journal without reading source credentials or mutating state. */
+export function classifyCswapImportJournals(options: CswapImportOptions): CswapImportJournalStatus[] {
+  return readCswapImportJournalFiles(options).map(({ runId, text }) => {
+    const sha256 = createHash('sha256').update(text).digest('hex');
+    try {
+      const journal = JSON.parse(text) as Partial<Journal>;
+      if (!isSafeJournal(journal, runId)) return { runId, phase: 'invalid', action: 'unclassifiable', sha256 };
+      if (journal.phase === 'staged') return { runId, phase: journal.phase, action: 'purge-staging', sha256 };
+      if (journal.phase === 'cleaned' || journal.phase === 'aborted') return { runId, phase: journal.phase, action: 'none', sha256 };
+      let committed: boolean;
+      try { committed = options.repository.getImportRun(runId)?.committedAt != null; } catch {
+        return { runId, phase: journal.phase, action: 'unclassifiable', sha256 };
+      }
+      // A journal may say `committed` only after the SQLite authority commit.
+      // Missing authority is contradictory, not permission to delete backups.
+      if (journal.phase === 'committed' && !committed) return { runId, phase: journal.phase, action: 'unclassifiable', sha256 };
+      return { runId, phase: journal.phase, action: committed ? 'finish-cleanup' : 'recover', sha256 };
+    } catch {
+      return { runId, phase: 'invalid', action: 'unclassifiable', sha256 };
+    }
+  });
+}
+
+/** Credential-free read-only import-journal listing. */
+export function listCswapImportJournals(options: CswapImportOptions): CswapImportJournalStatus[] {
+  return classifyCswapImportJournals(options);
+}
+
+function assertNoOrphanedCswapImportJournals(options: CswapImportOptions): void {
+  const orphan = classifyCswapImportJournals(options).find((journal) => journal.action !== 'none');
+  if (orphan) throw new CswapImportRefusalError('import-journal-orphaned', 'C-swap import refused: import journal requires reconciliation', undefined, orphan.runId);
+}
+
+/** Purge only staging services authenticated by a structurally valid staged journal. */
+async function purgeStagedCswapImportLocked(options: CswapImportOptions, runId: string): Promise<'aborted'> {
+  const journal = readJournal(options, runId);
+  if (!isSafeJournal(journal, runId) || journal.phase !== 'staged') throw new Error('C-swap import journal is unreadable');
+  for (const entry of journal.slots) await deleteIfPresent(options.keychain, entry.staging);
+  journal.phase = 'aborted';
+  writeJournal(options, journal);
+  return 'aborted';
+}
+
+/** Execute only the action selected by the read-only classifier while holding the import lock. */
+export async function reconcileCswapImportJournals(options: CswapImportOptions): Promise<CswapImportJournalStatus[]> {
+  const lock = join(journalRoot(options), 'cswap-import.lock');
+  try {
+    return await withCswapImportLock(lock, async () => {
+      const journals = classifyCswapImportJournals(options);
+      if (journals.some((journal) => journal.action === 'unclassifiable')) {
+        throw new Error('C-swap import journal is unclassifiable');
+      }
+      for (const journal of journals) {
+        if (journal.action === 'recover' || journal.action === 'finish-cleanup') await recoverUncommittedCswapImportLocked(options, journal.runId);
+        else if (journal.action === 'purge-staging') await purgeStagedCswapImportLocked(options, journal.runId);
+      }
+      return classifyCswapImportJournals(options);
+    });
+  } catch (error) {
+    if (error instanceof CswapImportInProgress) throw new CswapImportRefusalError('import-in-progress', 'C-swap import refused: import already in progress');
+    throw error;
+  }
+}
+
 async function rollbackEffects(
   keychain: ClaudeSlotBackend,
   effects: PromotionEffect[],
@@ -576,6 +703,10 @@ export async function importCswap(options: CswapImportOptions): Promise<{ runId:
 }
 
 async function importCswapLocked(options: CswapImportOptions): Promise<{ runId: string; phase: 'cleaned'; plan: CswapImportPlan }> {
+  // This is intentionally before any source-tree or credential read and before
+  // a new journal is written. A second check under the import lock closes the
+  // classify-to-stage race.
+  assertNoOrphanedCswapImportJournals(options);
   const { slots: sourceSlots, sessionProfiles } = await readSourceSlots(options);
   if (sessionProfiles > 0) throw new CswapImportRefusalError('session-profiles', `C-swap import refused: ${sessionProfiles} session profiles present`);
   await assertDestination(options, sourceSlots);

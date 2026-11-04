@@ -10,7 +10,8 @@ import type { Store } from './store';
 export type LifecycleState = 'pre-cutover' | 'cutting-over' | 'cutover' | 'undoing' | 'rolled-back' | 'retired' | 'aborted';
 export type LifecycleOperation =
   | 'gate' | 'switch:manual' | 'switch:auto' | 'auto' | 'auto:dry-run' | 'auto:resume' | 'auto:drill-begin'
-  | 'import-cswap' | 'undo-cswap' | 'undo-cswap:resume' | 'retire-cswap' | 'retire-cswap:resume'
+  | 'import-cswap' | 'import-cswap:reconcile' | 'import-cswap:reconcile-preview'
+  | 'undo-cswap' | 'undo-cswap:resume' | 'retire-cswap' | 'retire-cswap:resume'
   | 'pi-migrate' | 'pi-rollback' | 'codex-import-active' | 'codex-add' | 'claude-add'
   | 'cutover-begin' | 'cutover-commit' | 'cutover-abort' | 'keychain-authorize-cswap'
   | 'keychain-check-launchd-live' | 'verify-l13' | 'report-cutover' | 'doctor' | 'status'
@@ -70,12 +71,14 @@ function rules(...operations: LifecycleOperation[]): Set<LifecycleOperation> {
 export const PHASE_RULES: Record<LifecycleState, Set<LifecycleOperation>> = {
   'pre-cutover': rules('doctor', 'status', 'cutover-begin'),
   'cutting-over': rules(
-    'doctor', 'status', 'import-cswap', 'codex-import-active', 'codex-add', 'claude-add', 'claude-journal-resolve',
+    'doctor', 'status', 'import-cswap', 'import-cswap:reconcile', 'import-cswap:reconcile-preview',
+    'codex-import-active', 'codex-add', 'claude-add', 'claude-journal-resolve',
     'pi-migrate', 'pi-rollback', 'switch:manual', 'gate', 'auto:dry-run', 'cutover-commit',
     'cutover-abort', 'keychain-authorize-cswap', 'keychain-check-launchd-live',
   ),
   cutover: rules(
     'doctor', 'status', 'switch:manual', 'switch:auto', 'auto', 'auto:dry-run', 'auto:resume', 'auto:drill-begin', 'gate',
+    'import-cswap:reconcile', 'import-cswap:reconcile-preview',
     'codex-import-active', 'codex-add', 'claude-add', 'claude-journal-resolve', 'pi-migrate', 'pi-rollback',
     'verify-l13', 'report-cutover', 'undo-cswap', 'retire-cswap', 'retire-cswap:resume', 'lifecycle-drill-done',
   ),

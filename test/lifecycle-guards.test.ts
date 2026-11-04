@@ -13,7 +13,7 @@ import { runAutoCommand } from '../src/commands/auto';
 import { createSwitchAnthropicCommand, type SwitchAnthropicCommandDeps } from '../src/commands/switch-anthropic';
 import { defaultConfig } from '../src/config';
 import { MockKeychain } from '../src/keychain';
-import { beginCutover, transition, type LifecycleState } from '../src/lifecycle';
+import { assertAdmitted, beginCutover, transition, type LifecycleState } from '../src/lifecycle';
 import type { CommandContext, CommandDefinition } from '../src/registry';
 import { openStore } from '../src/store';
 
@@ -141,6 +141,20 @@ async function execute(subject: Fixture, args = ['account-b']): Promise<number> 
 }
 
 describe('Claude switch lifecycle guards (K5-8)', () => {
+  it('admits import-journal reconcile and its non-dry-run preview only during cutting-over or cutover', () => {
+    for (const state of ['pre-cutover', 'cutting-over', 'cutover', 'undoing', 'rolled-back', 'retired', 'aborted'] as const) {
+      const store = openStore(':memory:');
+      try {
+        setLifecycle(store, state);
+        for (const operation of ['import-cswap:reconcile', 'import-cswap:reconcile-preview'] as const) {
+          assert.equal(assertAdmitted(store, operation).ok, state === 'cutting-over' || state === 'cutover', `${state} ${operation}`);
+        }
+      } finally {
+        store.close();
+      }
+    }
+  });
+
   it('auto refused outside cutover and retired', async () => {
     for (const code of ['phase=pre-cutover', 'phase=rolled-back'] as const) {
       let bindingOpened = false;
