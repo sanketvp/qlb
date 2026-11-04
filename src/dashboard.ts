@@ -561,6 +561,15 @@ function overrideLabel(override: AccountOverrideView | null): string {
   return bits.join(' ');
 }
 
+function formatAccountStatusLines(account: DashboardAccount): string[] {
+  const lines: string[] = [];
+  if (account.loginExpiresAt) lines.push(`     login expires ${account.loginExpiresAt}`);
+  if (account.usageError) {
+    lines.push(`     usage: ${account.usageError}${account.usageRetryAt ? `, retry ${account.usageRetryAt}` : ''}`);
+  }
+  return lines;
+}
+
 export function formatDashboard(accounts: DashboardAccount[], now: number = Date.now()): string {
   if (accounts.length === 0) return '(no accounts)';
   const lines: string[] = [];
@@ -569,6 +578,7 @@ export function formatDashboard(accounts: DashboardAccount[], now: number = Date
     lines.push(
       `${snap.healthGlyph}  ${snap.label}  ${snap.provider}  ${snap.ownership}  override=${overrideLabel(snap.override)}${accountCapacitySuffix(rows)}`,
     );
+    lines.push(...formatAccountStatusLines(snap));
     if (snap.error) {
       lines.push(`     error: ${snap.error}`);
     }

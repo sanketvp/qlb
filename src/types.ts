@@ -23,6 +23,9 @@ export interface AccountSnapshot {
   error?: string;
   failed?: boolean;
   probe?: { outcome: FetchOutcome; detail?: string };
+  loginExpiresAt?: string | null;
+  usageError?: string;
+  usageRetryAt?: string;
 }
 
 export interface Adapter {

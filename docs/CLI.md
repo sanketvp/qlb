@@ -150,9 +150,11 @@ The command accepts exactly `qlb export --cache-only --json` (the two flags may 
 
 ## `qlb status`
 
-The dashboard view (default): one block per account with a health glyph, credential-ownership state, and any active override, then indented bucket rows.
+The dashboard view (default): one block per account with a health glyph, credential-ownership state, and any active override, followed by optional Anthropic operational details and indented bucket rows.
 
 **`qlb status` reaches the provider adapters** (`runStatus` → `safeFetch` → `adapter.fetchSnapshots()`), so consecutive runs can show usage moving. It is not a cache-only read — unlike `qlb why`, which is non-probing. Do not treat `status` as free.
+
+For QLB-owned Anthropic slots, the dashboard shows `login expires <ISO timestamp>` when the stored OAuth credential has an expiry. When persisted usage is unavailable, it shows `usage: <error>` and, while a retry backoff is active, `, retry <ISO timestamp>`.
 
 Each bucket row reports capacity **both ways** — consumed and remaining — because "81%" alone is ambiguous when you are scanning for headroom:
 
@@ -226,7 +228,7 @@ An account with a problem shows an `error` row with the reason in the resets col
 anthropic    | bob@example.com   | - | - | error | resets auth expired or invalid — needs re-login
 ```
 
-`--json` keeps `{fetchedAt, accounts}` and adds `ownership`, `override`, `health`, `healthGlyph` per account, plus per bucket `leftPct` (rounded to 1 decimal), `window` (normalized label, e.g. kimi `weekly` → `7d`), `resetInMs` and `resetAtLocal`. All additive — existing fields (`usedPct`, `source`, `confidence`, `fetchedAt`, `resetAt`) keep their names, types and raw precision, and raw bucket keys such as `weekly` are preserved:
+`--json` is additive. Its top-level object includes `fetchedAt`, `accounts`, `lifecycle` (`state` and ISO-8601-or-`null` `windowEnd`), `activeLogin` (provider-to-account map), and ISO-8601-or-`null` `parked` and `breaker` timestamps for currently active Anthropic holds. Per account it adds `ownership`, `override`, `health`, and `healthGlyph`; Anthropic slots QLB owns may additionally include ISO-8601-or-`null` `loginExpiresAt`, numeric `threshold`, and, when persisted usage is unavailable, `usageError` and a future ISO-8601 `usageRetryAt`. Per bucket it adds `leftPct` (rounded to 1 decimal), `window` (normalized label, e.g. kimi `weekly` → `7d`), `resetInMs`, and `resetAtLocal`. Existing fields (`usedPct`, `source`, `confidence`, `fetchedAt`, `resetAt`) keep their names, types, and raw precision, and raw bucket keys such as `weekly` are preserved:
 
 ```json
 {

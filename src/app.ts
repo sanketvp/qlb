@@ -14,7 +14,9 @@ import { runCodexProbeClaims } from './commands/codex-probe-claims';
 import { redactError, redactSecrets } from './redact';
 import { reloginsInWindow, type ReloginEvent } from './relogin';
 import { doctorQlb, initializeQlb, listCheckNames, type DoctorReport, type InitReport } from './diagnostics';
-import { platformKeychain } from './keychain';
+import { loginExpiresAtIso } from './anthropic-oauth';
+import { qlbOwnsAnthropicUsage } from './anthropic-usage-view';
+import { platformKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from './keychain';
 import { createOwnedCredentialSource } from './credentials';
 import {
   CSWAP_ANTHROPIC_STORE,
@@ -1200,6 +1202,52 @@ function isoStatusTimestamp(value: number): string {
   return new Date(value).toISOString();
 }
 
+function isoStatusTimestampOrNull(value: number | null): string | null {
+  if (value === null || !Number.isFinite(value)) return null;
+  try {
+    return isoStatusTimestamp(value);
+  } catch {
+    return null;
+  }
+}
+
+function statusConfigTimestamp(store: Store, key: string): string | null {
+  const raw = store.getConfig(key);
+  if (raw === null || raw.trim() === '') return null;
+  const value = Number(raw);
+  return value > Date.now() ? isoStatusTimestampOrNull(value) : null;
+}
+
+export type StatusCredentialReader = (accountId: string) => string;
+
+export function statusAnthropicLoginExpiry(
+  accountId: string,
+  readCredential: StatusCredentialReader = (id) =>
+    platformKeychain.getSync(qlbKeychainService('anthropic', id), QLB_KEYCHAIN_ACCOUNT),
+): string | null {
+  try {
+    return loginExpiresAtIso(readCredential(accountId));
+  } catch {
+    return null;
+  }
+}
+
+function statusActiveLogins(dbPath: string): Record<string, string | null> {
+  const db = openStoreConnection(dbPath, true);
+  try {
+    const rows = db.prepare('SELECT provider, account_id AS accountId FROM active_login ORDER BY provider').all() as Array<{
+      provider: string;
+      accountId: string | null;
+    }>;
+    return Object.fromEntries(rows.map((row) => [
+      redactedStatusString(row.provider) ?? '[redacted]',
+      redactedStatusString(row.accountId),
+    ]));
+  } finally {
+    db.close();
+  }
+}
+
 function statusWindow(db: ReturnType<typeof openStoreConnection>): { start: number; end: number } | null {
   const current = phaseForConnection(db);
   if (current.id === 0 || current.cutoverAt === null || current.windowEnd === null) return null;
@@ -1285,11 +1333,18 @@ async function runStatus(opts: StatusOpts): Promise<number> {
     );
     return snaps;
   }));
-  const accounts = nested.flat();
+  const lifecycle = phase(store);
+  const accounts = nested.flat().map((account) =>
+    account.provider === 'anthropic'
+      && qlbOwnsAnthropicUsage(lifecycle.state)
+      && !(account.accountId === account.provider && account.error !== undefined)
+      ? { ...account, loginExpiresAt: statusAnthropicLoginExpiry(account.accountId) }
+      : account,
+  );
   const ownershipForProvider = makeOwnershipReader(store);
   // Use the lifecycle reader shared with `qlb cutover`, rather than Pi's
   // ownership journal, to decide whether Claude's active_login is authoritative.
-  const claudeCutoverPhase = phase(store).state;
+  const claudeCutoverPhase = lifecycle.state;
   const enriched = enrichAccounts(accounts, {
     ownershipForProvider,
     overrideForAccount: (id) => overrideFromStore(store, id),
@@ -1303,7 +1358,17 @@ async function runStatus(opts: StatusOpts): Promise<number> {
     },
   });
   if (opts.json) {
-    console.log(JSON.stringify({ fetchedAt: Date.now(), accounts: decorateStatusJson(enriched) }, null, 2));
+    console.log(JSON.stringify({
+      fetchedAt: Date.now(),
+      lifecycle: {
+        state: lifecycle.state,
+        windowEnd: isoStatusTimestampOrNull(lifecycle.windowEnd),
+      },
+      activeLogin: statusActiveLogins(config.dbPath),
+      parked: statusConfigTimestamp(store, 'auto.anthropic.parkedUntil'),
+      breaker: statusConfigTimestamp(store, 'auto.anthropic.suspendedUntil'),
+      accounts: decorateStatusJson(enriched),
+    }, null, 2));
     return 0;
   }
   if (opts.view === 'flat') {
