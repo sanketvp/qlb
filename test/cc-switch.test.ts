@@ -247,6 +247,23 @@ describe('Claude switch Phase A (K5-4)', () => {
     assert.equal(subject.posts(), 0);
   });
 
+  it('republish freshen guard prevents a POST when the resolved target is not active', async () => {
+    const subject = await fixture();
+    await subject.slots.writeSlot('account-b', credential('b', NOW + 10 * 60_000), { cause: 'post' });
+    const outgoingSlot = subject.slots.getSlot('account-a');
+    const targetSlot = subject.slots.getSlot('account-b');
+    if (!outgoingSlot || !targetSlot) throw new Error('expected fixture slots');
+
+    const result = await prepareClaudeSwitch(
+      subject.deps,
+      { to: 'account-b', trigger: 'manual', republish: true },
+      { kind: 'go', active: 'account-a', outgoingSlot, targetSlot },
+    );
+
+    assert.equal('active' in result, true);
+    assert.equal(subject.posts(), 0);
+  });
+
   it('uses the slots resolved by preconditions without re-checking them in Phase A', async () => {
     const subject = await fixture();
     const input = { to: 'account-a', trigger: 'manual' as const, republish: true };
