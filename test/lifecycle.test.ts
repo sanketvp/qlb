@@ -125,10 +125,11 @@ describe('lifecycle (AC49)', () => {
     } finally { store.close(); }
   });
 
-  it('drillActive is true only after beginning and before completion', () => {
-    assert.equal(drillActive({ drillBeganAt: null, drillDoneAt: null }), false);
-    assert.equal(drillActive({ drillBeganAt: 1, drillDoneAt: null }), true);
-    assert.equal(drillActive({ drillBeganAt: 1, drillDoneAt: 2 }), false);
+  it('drillActive is true only in cutover after beginning and before completion', () => {
+    assert.equal(drillActive({ state: 'cutover', drillBeganAt: null, drillDoneAt: null }), false);
+    assert.equal(drillActive({ state: 'cutover', drillBeganAt: 1, drillDoneAt: null }), true);
+    assert.equal(drillActive({ state: 'cutover', drillBeganAt: 1, drillDoneAt: 2 }), false);
+    assert.equal(drillActive({ state: 'retired', drillBeganAt: 1, drillDoneAt: null }), false);
   });
 
   it('phase() exposes drillBeganAt', () => {

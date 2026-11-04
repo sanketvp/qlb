@@ -58,8 +58,8 @@ export interface LifecycleResult {
 }
 
 /** A drill is in progress until its completion is durably recorded. */
-export function drillActive(row: Pick<LifecycleRow, 'drillBeganAt' | 'drillDoneAt'>): boolean {
-  return row.drillBeganAt != null && row.drillDoneAt == null;
+export function drillActive(row: Pick<LifecycleRow, 'state' | 'drillBeganAt' | 'drillDoneAt'>): boolean {
+  return row.state === 'cutover' && row.drillBeganAt != null && row.drillDoneAt == null;
 }
 
 function rules(...operations: LifecycleOperation[]): Set<LifecycleOperation> {

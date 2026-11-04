@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { EventEmitter } from 'node:events';
 import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -166,7 +167,33 @@ describe('qlb auto --once (G12)', () => {
     } finally { close(root); }
   });
 
-  it('stops the continuous loop before the next tick when a drill begins while it sleeps', async () => {
+  it('plain --dry-run runs during an active drill', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-auto-dry-active-drill-'));
+    const home = join(root, 'home');
+    const config = defaultConfig(home);
+    const store = openStore(config.dbPath);
+    beginCutover(store, 1);
+    assert.equal(transition(store, 'cutover', 2).ok, true);
+    assert.equal(markDrillBegan(store, 3).ok, true);
+    store.close();
+    const ctx: CommandContext = {
+      stdout: () => undefined, stderr: () => undefined, env: testEnv(home), config,
+      loadConfig: () => config, home, registerSecret: () => undefined, deliverSecret: () => undefined, knownSecrets: () => [],
+    };
+    let runs = 0;
+    try {
+      assert.equal(await runAutoCommand(['--dry-run'], ctx, {
+        acquireFlock: async () => { throw new Error('dry run must not lock'); },
+        runAuto: async () => {
+          runs += 1;
+          return { ticks: 1, decisions: [], executed: [] };
+        },
+      }), 0);
+      assert.equal(runs, 1);
+    } finally { close(root); }
+  });
+
+  it('a drill-begin that commits while holding auto.lock stops a concurrent continuous loop before its next tick', async () => {
     const root = mkdtempSync(join(tmpdir(), 'qlb-auto-drill-mid-loop-'));
     const home = join(root, 'home');
     const config = defaultConfig(home);
@@ -184,7 +211,6 @@ describe('qlb auto --once (G12)', () => {
           store, close: () => {}, reconcile: async () => {}, poll: async () => [],
           tick: async () => {
             ticks += 1;
-            assert.equal(markDrillBegan(store, 3).ok, true);
             return { decision: { kind: 'stay', reason: 'unknown', unhealthyTicks: 0 } };
           },
         }),
@@ -198,8 +224,66 @@ describe('qlb auto --once (G12)', () => {
         },
       });
       await sleepScheduled;
+
+      let leaseHeld = false;
+      let markRanWhileLeaseHeld = false;
+      const lease = Object.assign(async () => {
+        const reopened = openStore(config.dbPath);
+        try {
+          markRanWhileLeaseHeld = leaseHeld && phase(reopened).drillBeganAt === 3;
+        } finally {
+          reopened.close();
+          leaseHeld = false;
+        }
+      }, {});
+      const ctx: CommandContext = {
+        stdout: () => undefined, stderr: () => undefined, env: testEnv(home), config,
+        loadConfig: () => config, home, registerSecret: () => undefined, deliverSecret: () => undefined, knownSecrets: () => [],
+      };
+      assert.equal(await runAutoCommand(['drill-begin'], ctx, {
+        runAuto: async () => { throw new Error('not used'); }, exec: () => undefined,
+        acquireFlock: async () => { leaseHeld = true; return lease; }, now: () => 3,
+      }), 0);
+      assert.equal(markRanWhileLeaseHeld, true, 'markDrillBegan must run while auto.lock is held');
+      assert.equal(leaseHeld, false, 'drill-begin releases auto.lock after marking');
+
       wakeSleep();
       await assert.rejects(loop, (error: unknown) => (error as AutoAdmissionRefused).code === 'drill-active');
+      assert.equal(ticks, 1);
+    } finally {
+      store.close();
+      close(root);
+    }
+  });
+
+  it('continuous auto runs in retired with an open drill row', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-auto-retired-drill-'));
+    const home = join(root, 'home');
+    const config = defaultConfig(home);
+    const store = openStore(config.dbPath);
+    beginCutover(store, 1);
+    assert.equal(transition(store, 'cutover', 2).ok, true);
+    assert.equal(markDrillBegan(store, 3).ok, true);
+    assert.equal(transition(store, 'retired', 4).ok, true);
+    const signals = new EventEmitter();
+    let ticks = 0;
+    try {
+      const result = await runAuto({}, {
+        makeLiveBinding: () => ({
+          store, close: () => {}, reconcile: async () => {}, poll: async () => [],
+          tick: async () => {
+            ticks += 1;
+            return { decision: { kind: 'stay', reason: 'unknown', unhealthyTicks: 0 } };
+          },
+        }),
+        listCswapProcesses: () => [], log: () => {}, signals: signals as unknown as NodeJS.Process,
+        setTimeout: (callback) => {
+          signals.emit('SIGTERM');
+          callback();
+          return undefined as unknown as ReturnType<typeof setTimeout>;
+        },
+      });
+      assert.equal(result.ticks, 1);
       assert.equal(ticks, 1);
     } finally {
       store.close();
@@ -470,6 +554,24 @@ describe('qlb auto --once (G12)', () => {
       assert.equal(existsSync(join(home, '.qlb', 'locks', 'auto.lock')), true, 'release retains the lock file');
       close(root);
     }
+  });
+
+  it('plain --dry-run on an empty QLB_HOME creates no qlb.db and no backups', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-auto-dry-empty-'));
+    const home = join(root, 'home');
+    const config = defaultConfig(home);
+    const ctx: CommandContext = {
+      stdout: () => undefined, stderr: () => undefined, env: testEnv(home), config,
+      loadConfig: () => config, home, registerSecret: () => undefined, deliverSecret: () => undefined, knownSecrets: () => [],
+    };
+    try {
+      assert.equal(await runAutoCommand(['--dry-run'], ctx, {
+        acquireFlock: async () => { throw new Error('dry run must not lock'); },
+        runAuto: async () => ({ ticks: 1, decisions: [], executed: [] }),
+      }), 0);
+      assert.equal(existsSync(config.dbPath), false, 'dry run must not create qlb.db');
+      assert.equal(existsSync(join(home, '.qlb', 'backups')), false, 'dry run must not create backups');
+    } finally { close(root); }
   });
 
   it('the whole dry-run command on an orphan-journal fixture changes no file under QLB_HOME and makes no HTTP call', async () => {

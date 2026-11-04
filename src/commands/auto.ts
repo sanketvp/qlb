@@ -189,22 +189,19 @@ function bootoutAutoAgent(ctx: CommandContext, deps: AutoCommandDeps): BootoutRe
   }
 }
 
-async function autoLockIsFree(lockPath: string, deps: AutoCommandDeps): Promise<boolean> {
+async function autoLockIsFree(lockPath: string, deps: AutoCommandDeps): Promise<CswapLockRelease | null> {
   const now = deps.now ?? Date.now;
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const deadline = now() + 60_000;
   for (;;) {
     try {
       const lease = await deps.acquireFlock(lockPath);
-      if (lease !== null) {
-        await lease();
-        return true;
-      }
+      if (lease !== null) return lease;
     } catch {
       // A failed probe is indeterminate, so fail closed as if the lock were held.
     }
     const remaining = deadline - now();
-    if (remaining <= 0) return false;
+    if (remaining <= 0) return null;
     await sleep(Math.min(1_000, remaining));
   }
 }
@@ -241,19 +238,24 @@ async function drillBegin(ctx: CommandContext, args: string[], deps: AutoCommand
 
     const lockPath = join(ctx.home, '.qlb', 'locks', 'auto.lock');
     mkdirSync(dirname(lockPath), { recursive: true, mode: 0o700 });
-    if (!await autoLockIsFree(lockPath, deps)) {
+    const lease = await autoLockIsFree(lockPath, deps);
+    if (lease === null) {
       ctx.stderr('qlb auto drill-begin: refused: auto-lock-still-held');
       return 3;
     }
 
-    const result = markDrillBegan(store, (deps.now ?? Date.now)());
-    if (!result.ok) {
-      ctx.stderr(`qlb auto drill-begin: refused: ${result.code}`);
-      return 3;
+    try {
+      const result = markDrillBegan(store, (deps.now ?? Date.now)());
+      if (!result.ok) {
+        ctx.stderr(`qlb auto drill-begin: refused: ${result.code}`);
+        return 3;
+      }
+      if (args[0] === '--json') ctx.stdout(JSON.stringify(result.row));
+      else ctx.stdout('auto drill began');
+      return 0;
+    } finally {
+      await lease();
     }
-    if (args[0] === '--json') ctx.stdout(JSON.stringify(result.row));
-    else ctx.stdout('auto drill began');
-    return 0;
   } finally {
     store.close();
   }
@@ -294,7 +296,7 @@ export async function runAutoCommand(
     return 2;
   }
 
-  if (!options.once) {
+  if (!(options.once || options.dryRun)) {
     const store = openStore(ctx.config.dbPath);
     try {
       if (drillActive(phase(store))) {
