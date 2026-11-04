@@ -58,13 +58,17 @@ function resumeAnthropic(ctx: CommandContext, args: string[], deps: AutoCommandD
         (store as unknown as { db: Parameters<typeof assertAdmittedInConnection>[0] }).db,
         'auto:resume',
       );
-      if (!admission.ok) return { admission, cleared: false, invalidMarker: false, parsedUntil: null } as const;
+      if (!admission.ok) return { admission, cleared: false, invalidMarker: false, suspendedUntilIso: null } as const;
       const marker = store.getConfig('auto.anthropic.suspendedUntil');
       const parsedUntil = marker === null || marker === '' ? null : Number(marker);
-      const invalidMarker = marker !== null && marker !== '' && !Number.isFinite(parsedUntil);
+      const suspendedUntil = parsedUntil === null ? null : new Date(parsedUntil);
+      const suspendedUntilIso = suspendedUntil !== null && !Number.isNaN(suspendedUntil.getTime())
+        ? suspendedUntil.toISOString()
+        : null;
+      const invalidMarker = marker !== null && marker !== '' && suspendedUntilIso === null;
       store.setConfig('auto.anthropic.lastResumeAt', String(Date.now()));
       if (marker !== null && marker !== '') store.setConfig('auto.anthropic.suspendedUntil', '');
-      return { admission, cleared: marker !== null && marker !== '', invalidMarker, parsedUntil } as const;
+      return { admission, cleared: marker !== null && marker !== '', invalidMarker, suspendedUntilIso } as const;
     });
     if (!resumed.admission.ok) {
       ctx.stderr(`qlb auto resume: refused: ${resumed.admission.code}`);
@@ -74,7 +78,7 @@ function resumeAnthropic(ctx: CommandContext, args: string[], deps: AutoCommandD
       if (options.json) ctx.stdout(JSON.stringify({ provider: 'anthropic', resumed: 'cleared-invalid', suspendedUntil: null }));
       else ctx.stdout('cleared-invalid');
     } else if (resumed.cleared) {
-      const suspendedUntil = new Date(resumed.parsedUntil!).toISOString();
+      const suspendedUntil = resumed.suspendedUntilIso!;
       if (options.json) ctx.stdout(JSON.stringify({ provider: 'anthropic', resumed: true, suspendedUntil }));
       else ctx.stdout(`resumed anthropic (suspended until ${suspendedUntil} cleared)`);
     } else if (options.json) {

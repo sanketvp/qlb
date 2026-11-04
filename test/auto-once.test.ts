@@ -512,6 +512,32 @@ describe('qlb auto --once (G12)', () => {
     } finally { close(root); }
   });
 
+  it('auto resume clears an out-of-range suspension marker without throwing', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-auto-resume-out-of-range-'));
+    const home = join(root, 'home');
+    const config = defaultConfig(home);
+    const store = openStore(config.dbPath);
+    beginCutover(store, 1);
+    assert.equal(transition(store, 'cutover', 2).ok, true);
+    store.setConfig('auto.anthropic.suspendedUntil', '1e300');
+    store.close();
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const ctx: CommandContext = {
+      stdout: (line) => stdout.push(line), stderr: (line) => stderr.push(line), env: testEnv(home), config,
+      loadConfig: () => config, home, registerSecret: () => undefined, deliverSecret: () => undefined, knownSecrets: () => [],
+    };
+    try {
+      assert.equal(await runAutoCommand(['resume', 'anthropic'], ctx), 0);
+      assert.deepEqual(stdout, ['cleared-invalid']);
+      assert.deepEqual(stderr, []);
+      const reopened = openStore(config.dbPath);
+      try {
+        assert.equal(reopened.getConfig('auto.anthropic.suspendedUntil'), '');
+      } finally { reopened.close(); }
+    } finally { close(root); }
+  });
+
   it('auto resume admission runs inside the write transaction', async () => {
     const home = mkdtempSync(join(tmpdir(), 'qlb-auto-resume-transaction-'));
     const config = defaultConfig(home);

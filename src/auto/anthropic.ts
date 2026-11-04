@@ -424,8 +424,9 @@ function persistTickState(store: Store, input: AutoswitchInput, decision: Autosw
       setOrDelete(store, `${AUTO_PREFIX}parkedUntil`, decision.kind === 'switch' && switched ? decision.parkedUntilMs : undefined);
     }
     const suspendedUntil = decision.kind === 'stay' ? decision.suspendedUntilMs : undefined;
-    const resumedAfterTickStarted = (configNumber(store, `${AUTO_PREFIX}lastResumeAt`) ?? Number.NEGATIVE_INFINITY) >= input.nowMs;
-    if (suspendedUntil !== undefined && !resumedAfterTickStarted) store.setConfig(`${AUTO_PREFIX}suspendedUntil`, String(suspendedUntil));
+    const suspensionStateUnchanged = configNumber(store, `${AUTO_PREFIX}suspendedUntil`) === (input.suspendedUntilMs ?? undefined)
+      && configNumber(store, `${AUTO_PREFIX}lastResumeAt`) === (input.lastResumeAtMs ?? undefined);
+    if (suspendedUntil !== undefined && suspensionStateUnchanged) store.setConfig(`${AUTO_PREFIX}suspendedUntil`, String(suspendedUntil));
     else if (configNumber(store, `${AUTO_PREFIX}suspendedUntil`) !== undefined && configNumber(store, `${AUTO_PREFIX}suspendedUntil`)! <= nowMs) {
       setOrDelete(store, `${AUTO_PREFIX}suspendedUntil`, undefined);
       store.setConfig(`${AUTO_PREFIX}lastSuspensionEnd`, String(nowMs));

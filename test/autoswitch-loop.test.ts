@@ -329,15 +329,17 @@ describe('autoswitch loop (G9)', () => {
       switchRow(f.store, { from: '1', to: '2', trigger: 'at-limit', now: NOW + index * 60_000 });
     }
     f.store.setActiveLogin('anthropic', '1', 'fixture', clock);
+    f.store.setConfig('auto.anthropic.suspendedUntil', String(clock + 3_600_000));
     const originalBreakerRows = f.store.listAnthropicAutoswitchBreakerRows.bind(f.store);
     f.store.listAnthropicAutoswitchBreakerRows = () => {
       // decisionInput has already read lastResumeAt when the concurrent resume commits.
-      f.store.setConfig('auto.anthropic.lastResumeAt', String(clock));
+      f.store.setConfig('auto.anthropic.lastResumeAt', String(clock - 1));
+      f.store.setConfig('auto.anthropic.suspendedUntil', '');
       return originalBreakerRows();
     };
     const output = await anthropicTick(tickDeps(f, async () => result('refused'), { now: () => clock, accounts }));
     assert.deepEqual(output.decision, { kind: 'stay', reason: 'breaker', unhealthyTicks: 0, suspendedUntilMs: clock + 3_600_000 });
-    assert.equal(f.store.getConfig('auto.anthropic.suspendedUntil'), null);
+    assert.equal(f.store.getConfig('auto.anthropic.suspendedUntil'), '');
   });
 
   it('production switch deps preserve manual provenance and accept qlb-auto', async () => {
