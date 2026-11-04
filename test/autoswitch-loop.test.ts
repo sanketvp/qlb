@@ -332,7 +332,7 @@ describe('autoswitch loop (G9)', () => {
     const originalBreakerRows = f.store.listAnthropicAutoswitchBreakerRows.bind(f.store);
     f.store.listAnthropicAutoswitchBreakerRows = () => {
       // decisionInput has already read lastResumeAt when the concurrent resume commits.
-      f.store.setConfig('auto.anthropic.lastResumeAt', String(clock + 1));
+      f.store.setConfig('auto.anthropic.lastResumeAt', String(clock));
       return originalBreakerRows();
     };
     const output = await anthropicTick(tickDeps(f, async () => result('refused'), { now: () => clock, accounts }));

@@ -53,20 +53,18 @@ function resumeAnthropic(ctx: CommandContext, args: string[], deps: AutoCommandD
 
   const store = (deps.openStore ?? openStore)(ctx.config.dbPath);
   try {
-    // Validate before opening the write transaction so a malformed legacy
-    // marker can never make the post-commit receipt throw.
-    const marker = store.getConfig('auto.anthropic.suspendedUntil');
-    const parsedUntil = marker === null || marker === '' ? null : Number(marker);
-    const invalidMarker = marker !== null && marker !== '' && !Number.isFinite(parsedUntil);
     const resumed = store.runImmediate(() => {
       const admission = assertAdmittedInConnection(
         (store as unknown as { db: Parameters<typeof assertAdmittedInConnection>[0] }).db,
         'auto:resume',
       );
-      if (!admission.ok) return { admission } as const;
+      if (!admission.ok) return { admission, cleared: false, invalidMarker: false, parsedUntil: null } as const;
+      const marker = store.getConfig('auto.anthropic.suspendedUntil');
+      const parsedUntil = marker === null || marker === '' ? null : Number(marker);
+      const invalidMarker = marker !== null && marker !== '' && !Number.isFinite(parsedUntil);
       store.setConfig('auto.anthropic.lastResumeAt', String(Date.now()));
       if (marker !== null && marker !== '') store.setConfig('auto.anthropic.suspendedUntil', '');
-      return { admission, cleared: marker !== null && marker !== '', invalidMarker } as const;
+      return { admission, cleared: marker !== null && marker !== '', invalidMarker, parsedUntil } as const;
     });
     if (!resumed.admission.ok) {
       ctx.stderr(`qlb auto resume: refused: ${resumed.admission.code}`);
@@ -76,7 +74,7 @@ function resumeAnthropic(ctx: CommandContext, args: string[], deps: AutoCommandD
       if (options.json) ctx.stdout(JSON.stringify({ provider: 'anthropic', resumed: 'cleared-invalid', suspendedUntil: null }));
       else ctx.stdout('cleared-invalid');
     } else if (resumed.cleared) {
-      const suspendedUntil = new Date(parsedUntil!).toISOString();
+      const suspendedUntil = new Date(resumed.parsedUntil!).toISOString();
       if (options.json) ctx.stdout(JSON.stringify({ provider: 'anthropic', resumed: true, suspendedUntil }));
       else ctx.stdout(`resumed anthropic (suspended until ${suspendedUntil} cleared)`);
     } else if (options.json) {
