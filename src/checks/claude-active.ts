@@ -1,6 +1,7 @@
 import { openStoreConnection } from '../store';
 import { check, guardCheck } from './_check';
 import type { HealthCheck } from './claude-slots';
+import { isLifecycleState } from './lifecycle-phase';
 
 export default check('claude:active');
 
@@ -8,11 +9,16 @@ const ACTIVE_APPLICABLE_PHASES = new Set(['cutting-over', 'cutover', 'retired'])
 const RELOGIN_STATUSES = new Set(['token-expired', 'relogin-needed']);
 
 export function claudeActiveCheck(dbPath: string, phase: string): HealthCheck {
-  if (!ACTIVE_APPLICABLE_PHASES.has(phase)) {
-    return { name: 'claude:active', level: 'N/A', message: `not applicable in phase=${phase}` };
-  }
-
   return guardCheck('claude:active', () => {
+    if (phase === 'unknown') {
+      return { name: 'claude:active', level: 'WARN', message: 'lifecycle phase unavailable; Claude active login cannot be evaluated' };
+    }
+    if (!isLifecycleState(phase)) {
+      return { name: 'claude:active', level: 'WARN', message: 'cannot evaluate: unknown lifecycle state' };
+    }
+    if (!ACTIVE_APPLICABLE_PHASES.has(phase)) {
+      return { name: 'claude:active', level: 'N/A', message: `not applicable in phase=${phase}` };
+    }
     const db = openStoreConnection(dbPath, true);
     try {
       const hasSlot = db.prepare('SELECT 1 FROM claude_slots LIMIT 1').get() !== undefined;

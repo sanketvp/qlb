@@ -130,8 +130,9 @@ describe('A7 doctor health primitives', () => {
       message: 'unknown lifecycle state: cutvoer',
     });
     assert.deepEqual(
-      [claudeSlotsCheck(unknownDbPath, unknownPhase.phase), relogin7dCheck(unknownDbPath, unknownPhase.phase)].map((check) => check),
+      [claudeActiveCheck(unknownDbPath, unknownPhase.phase), claudeSlotsCheck(unknownDbPath, unknownPhase.phase), relogin7dCheck(unknownDbPath, unknownPhase.phase)],
       [
+        { name: 'claude:active', level: 'WARN', message: 'cannot evaluate: unknown lifecycle state' },
         { name: 'claude:slots', level: 'WARN', message: 'cannot evaluate: unknown lifecycle state' },
         { name: 'relogin:7d', level: 'WARN', message: 'cannot evaluate: unknown lifecycle state' },
       ],
@@ -144,6 +145,11 @@ describe('A7 doctor health primitives', () => {
       level: 'FAIL',
       message: 'unknown lifecycle state: <unprintable>',
     });
+    assert.deepEqual(claudeActiveCheck(unprintableDbPath, lifecyclePhase(unprintableDbPath).phase), {
+      name: 'claude:active',
+      level: 'WARN',
+      message: 'cannot evaluate: unknown lifecycle state',
+    });
 
     for (const state of LIFECYCLE_STATES) {
       const dbPath = fixture();
@@ -151,6 +157,7 @@ describe('A7 doctor health primitives', () => {
       const phase = lifecyclePhase(dbPath);
       assert.equal(lifecyclePhaseCheck(phase).level, 'PASS');
       const dependentLevel = ['cutting-over', 'cutover', 'retired'].includes(state) ? 'PASS' : 'N/A';
+      assert.equal(claudeActiveCheck(dbPath, phase.phase).level, dependentLevel, state);
       assert.equal(claudeSlotsCheck(dbPath, phase.phase).level, dependentLevel, state);
       assert.equal(relogin7dCheck(dbPath, phase.phase).level, dependentLevel, state);
     }
@@ -160,6 +167,7 @@ describe('A7 doctor health primitives', () => {
     const dbPath = join(mkdtempSync(join(tmpdir(), 'qlb-doctor-missing-')), 'missing.db');
     assert.doesNotThrow(() => {
       const results = [
+        claudeActiveCheck(dbPath, 'cutover'),
         claudeSlotsCheck(dbPath, 'cutover'),
         codexSlotsCheck(dbPath, 'cutover'),
         claudeOauthClientCheck(dbPath),
@@ -167,7 +175,7 @@ describe('A7 doctor health primitives', () => {
         lifecyclePhaseCheck(lifecyclePhase(dbPath)),
         relogin7dCheck(dbPath, 'cutover'),
       ];
-      assert.deepEqual(results.map((result) => result.level), ['FAIL', 'FAIL', 'WARN', 'WARN', 'WARN', 'FAIL']);
+      assert.deepEqual(results.map((result) => result.level), ['FAIL', 'FAIL', 'FAIL', 'WARN', 'WARN', 'WARN', 'FAIL']);
     });
   });
 
@@ -196,7 +204,7 @@ describe('A7 doctor health primitives', () => {
     write(config.dbPath, "INSERT INTO claude_slots (account_id, config_json, dead, dead_reason, added_at) VALUES (?, '{}', 1, 'invalid_grant', ?)", 'claude-dead', Date.now());
 
     const report = await doctorQlb(config, { command: () => '', hostCommand: () => '' });
-    const a7Rows = ['auto:anthropic:breaker', 'claude:oauth-client', 'claude:slots', 'codex:slots', 'lifecycle:phase', 'relogin:7d']
+    const a7Rows = ['auto:anthropic:breaker', 'claude:active', 'claude:oauth-client', 'claude:slots', 'codex:slots', 'lifecycle:phase', 'relogin:7d']
       .map((name) => report.checks.find((check) => check.name === name));
     assert.ok(a7Rows.every((check) => check != null));
     assert.ok(a7Rows.every((check) => check?.message !== 'not applicable on this host'));
@@ -215,6 +223,9 @@ describe('A7 doctor health primitives', () => {
       assert.equal(check?.level, 'PASS');
       assert.notEqual(check?.message, 'not applicable on this host');
     }
+    assert.deepEqual(healthy.checks.find((row) => row.name === 'claude:active'), {
+      name: 'claude:active', level: 'N/A', message: 'no Claude slots exist',
+    });
   });
 
   it('uses one lifecycle read so every A7 row has a consistent phase', async () => {
@@ -237,8 +248,8 @@ describe('A7 doctor health primitives', () => {
     assert.equal(reads, 1);
     assert.equal(report.checks.find((row) => row.name === 'lifecycle:phase')?.message, 'phase=pre-cutover');
     assert.deepEqual(
-      ['claude:slots', 'codex:slots', 'relogin:7d'].map((name) => report.checks.find((row) => row.name === name)?.level),
-      ['N/A', 'N/A', 'N/A'],
+      ['claude:active', 'claude:slots', 'codex:slots', 'relogin:7d'].map((name) => report.checks.find((row) => row.name === name)?.level),
+      ['N/A', 'N/A', 'N/A', 'N/A'],
     );
   });
 
@@ -272,7 +283,7 @@ describe('A7 doctor health primitives', () => {
   });
 
   it('reports all A7 checks as WARN when the store is missing or real v4', async () => {
-    const a7Names = ['auto:anthropic:breaker', 'claude:oauth-client', 'claude:slots', 'codex:slots', 'lifecycle:phase', 'relogin:7d'];
+    const a7Names = ['auto:anthropic:breaker', 'claude:active', 'claude:oauth-client', 'claude:slots', 'codex:slots', 'lifecycle:phase', 'relogin:7d'];
     for (const makeConfig of [
       () => defaultConfig(mkdtempSync(join(tmpdir(), 'qlb-doctor-a7-missing-'))),
       () => {
