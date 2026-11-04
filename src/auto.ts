@@ -372,22 +372,23 @@ export async function runAuto(options: RunAutoOptions = {}, dependencies: AutoDe
           result.decisions = [tick.decision];
           redactedLog(log, `auto: ${decisionText(tick)}`);
         } else {
+          const usageInjection = options.inject?.kind === 'usage-5xx' ? options.inject : undefined;
           if (cswapAlive) {
-          binding.store.setConfig('auto.heartbeatAt', String(now()));
-          result.ticks += 1;
-          redactedLog(log, 'auto: stay(cswap-alive)');
-        } else {
-          await binding.reconcile();
-          if (observeStop() !== undefined) break;
-          const accounts = await binding.poll(options.inject);
-          // This is the final point before a tick that can switch credentials.
-          if (observeStop() !== undefined) break;
-          const tick = await binding.tick(accounts, options.inject);
-          binding.store.setConfig('auto.heartbeatAt', String(now()));
-          result.ticks += 1;
-          result.decisions = [tick.decision];
-          if (tick.switchResult?.outcome === 'ok') result.executed.push(tick.switchResult.to);
-          redactedLog(log, `auto: ${decisionText(tick)}`);
+            binding.store.setConfig('auto.heartbeatAt', String(now()));
+            result.ticks += 1;
+            redactedLog(log, 'auto: stay(cswap-alive)');
+          } else {
+            await binding.reconcile();
+            if (observeStop() !== undefined) break;
+            const accounts = await binding.poll(usageInjection);
+            // This is the final point before a tick that can switch credentials.
+            if (observeStop() !== undefined) break;
+            const tick = await binding.tick(accounts, usageInjection);
+            binding.store.setConfig('auto.heartbeatAt', String(now()));
+            result.ticks += 1;
+            result.decisions = [tick.decision];
+            if (tick.switchResult?.outcome === 'ok') result.executed.push(tick.switchResult.to);
+            redactedLog(log, `auto: ${decisionText(tick)}`);
           }
         }
       } catch (error) {

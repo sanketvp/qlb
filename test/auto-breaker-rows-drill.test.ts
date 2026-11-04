@@ -134,12 +134,17 @@ describe('auto breaker-rows fault drill', () => {
 
   it('does not start a production dry-run cooldown from seed rows', async () => {
     const { root, config, store, slots } = fixture();
+    let closed = false;
     try {
       const drill = anthropicBreakerRowsDrill({ store, slots, now: () => NOW });
       assert.equal(drill.decision.kind, 'stay');
       assert.equal(drill.decision.reason, 'breaker');
       store.setConfig('auto.anthropic.suspendedUntil', '');
-      store.upsertSnapshot('active', '5h', { usedPct: 95, fetchedAt: NOW, source: 'poll', confidence: 'authoritative' });
+      store.upsertSnapshot('active', '5h', { usedPct: 95, fetchedAt: NOW + 1, source: 'poll', confidence: 'authoritative' });
+      // The production dry-run binding is immutable when no live WAL exists;
+      // close the fixture writer so its committed state is checkpointed first.
+      store.close();
+      closed = true;
       const output = await runAuto({ once: true, dryRun: true }, {
         config, home: root, env: { QLB_TEST_MODE: '1', QLB_HOME: root, HOME: root }, now: () => NOW + 1, log: () => {},
       });
@@ -147,6 +152,6 @@ describe('auto breaker-rows fault drill', () => {
         kind: 'switch', targetId: 'next', reason: 'proactive', unhealthyTicks: 0, parkedUntilMs: undefined,
         leftHeadroom: 5, leftRecoveryAtMs: null, leftTrigger: 'proactive',
       }]);
-    } finally { store.close(); rmSync(root, { recursive: true, force: true }); }
+    } finally { if (!closed) store.close(); rmSync(root, { recursive: true, force: true }); }
   });
 });
