@@ -542,7 +542,7 @@ export function probeCswapImportLock(options: CswapImportOptions): CswapImportLo
   }
 }
 
-async function recoveryMatchesSlotState(options: CswapImportOptions, journal: Journal): Promise<boolean> {
+function recoveryMatchesSlotState(options: CswapImportOptions, journal: Journal): boolean {
   try {
     for (const entry of journal.slots) {
       if (entry.reached === 'unreached' || entry.restored) continue;
@@ -552,13 +552,6 @@ async function recoveryMatchesSlotState(options: CswapImportOptions, journal: Jo
       } else if (entry.destinationExisted === false) {
         if (slot) return false;
       } else return false;
-      if (entry.reached !== 'previous') continue;
-      const previous = await optionalGet(options.keychain, previousDestination(entry.accountId));
-      if (entry.previousDestinationExisted) {
-        if (!entry.priorPreviousFingerprint || previous == null || credentialFingerprint(previous) !== entry.priorPreviousFingerprint) return false;
-      } else if (entry.previousDestinationExisted === false) {
-        if (previous != null) return false;
-      } else return false;
     }
     return true;
   } catch {
@@ -567,7 +560,7 @@ async function recoveryMatchesSlotState(options: CswapImportOptions, journal: Jo
 }
 
 /** Classify every existing journal without reading source credentials or mutating state. */
-export async function classifyCswapImportJournals(options: CswapImportOptions): Promise<CswapImportJournalStatus[]> {
+export function classifyCswapImportJournals(options: CswapImportOptions): CswapImportJournalStatus[] {
   const journals: Array<{ journal: Journal | null; status: CswapImportJournalStatus }> = [];
   for (const { runId, text } of readCswapImportJournalFiles(options)) {
     const sha256 = createHash('sha256').update(text).digest('hex');
@@ -596,7 +589,7 @@ export async function classifyCswapImportJournals(options: CswapImportOptions): 
         journals.push({ journal, status: { runId, phase: journal.phase, action: 'unclassifiable', sha256 } });
         continue;
       }
-      if (!committed && !await recoveryMatchesSlotState(options, journal)) {
+      if (!committed && !recoveryMatchesSlotState(options, journal)) {
         journals.push({ journal, status: { runId, phase: journal.phase, action: 'unclassifiable', sha256 } });
         continue;
       }
@@ -608,8 +601,8 @@ export async function classifyCswapImportJournals(options: CswapImportOptions): 
   return journals.map(({ status }) => status);
 }
 
-async function assertNoOrphanedCswapImportJournals(options: CswapImportOptions): Promise<void> {
-  const orphan = (await classifyCswapImportJournals(options)).find((journal) => journal.action !== 'none');
+function assertNoOrphanedCswapImportJournals(options: CswapImportOptions): void {
+  const orphan = classifyCswapImportJournals(options).find((journal) => journal.action !== 'none');
   if (orphan) throw new CswapImportRefusalError('import-journal-orphaned', 'C-swap import refused: import journal requires reconciliation', undefined, orphan.runId);
 }
 
@@ -628,7 +621,7 @@ export async function reconcileCswapImportJournals(options: CswapImportOptions):
   const lock = join(journalRoot(options), 'cswap-import.lock');
   try {
     return await withCswapImportLock(lock, async () => {
-      const journals = await classifyCswapImportJournals(options);
+      const journals = classifyCswapImportJournals(options);
       const unclassifiable = journals.find((journal) => journal.action === 'unclassifiable');
       if (unclassifiable) {
         throw new CswapImportRefusalError('import-journal-unclassifiable', 'C-swap import journal is unclassifiable', undefined, unclassifiable.runId);
@@ -747,7 +740,7 @@ async function importCswapLocked(options: CswapImportOptions): Promise<{ runId: 
   // This is intentionally before any source-tree or credential read and before
   // a new journal is written. A second check under the import lock closes the
   // classify-to-stage race.
-  await assertNoOrphanedCswapImportJournals(options);
+  assertNoOrphanedCswapImportJournals(options);
   const { slots: sourceSlots, sessionProfiles } = await readSourceSlots(options);
   if (sessionProfiles > 0) throw new CswapImportRefusalError('session-profiles', `C-swap import refused: ${sessionProfiles} session profiles present`);
   await assertDestination(options, sourceSlots);
@@ -942,7 +935,7 @@ async function recoverUncommittedCswapImportLocked(options: CswapImportOptions, 
     writeJournal(options, journal);
     return 'cleaned';
   }
-  if (!await recoveryMatchesSlotState(options, journal)) {
+  if (!recoveryMatchesSlotState(options, journal)) {
     throw new CswapImportRefusalError('import-journal-unclassifiable', 'C-swap import journal is unclassifiable', undefined, runId);
   }
   if (journal.phase === 'promoting' || journal.phase === 'commit-unknown') {

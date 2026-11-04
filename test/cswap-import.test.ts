@@ -610,7 +610,10 @@ describe('C-swap import (K10 / AC16)', () => {
       await assert.rejects(importCswap(options), CswapImportInjectedCrash);
       const before = JSON.parse(readFileSync(join(h.root, 'journals', `cswap-import-${runId}`, 'journal.json'), 'utf8')) as { phase: string; slots: Array<{ reached: string }> };
       assert.equal(before.phase, 'promoting');
-      await assert.doesNotReject(recoverUncommittedCswapImport(options, runId));
+      if (crashAfter === 2) {
+        assert.deepEqual(classifyCswapImportJournals(options).map((journal) => journal.action), ['recover']);
+        await assert.doesNotReject(reconcileCswapImportJournals(options));
+      } else await assert.doesNotReject(recoverUncommittedCswapImport(options, runId));
       assert.equal(h.repo.listSlots().length, 0);
       await assert.rejects(h.keychain.get('qlb:anthropic:account-a', QLB_KEYCHAIN_ACCOUNT), /item not found/);
       await assert.rejects(h.keychain.get('qlb:anthropic:account-b', QLB_KEYCHAIN_ACCOUNT), /item not found/);

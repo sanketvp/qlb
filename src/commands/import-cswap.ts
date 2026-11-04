@@ -90,7 +90,7 @@ async function execute(args: string[], ctx: CommandContext): Promise<number> {
       ctx.stderr('import cswap refused: import-in-progress');
       return 3;
     }
-    const journals = await classifyCswapImportJournals(base);
+    const journals = classifyCswapImportJournals(base);
     const unclassifiable = journals.find((journal) => journal.action === 'unclassifiable');
     if (unclassifiable) {
       ctx.stderr(`import cswap refused: import-journal-unclassifiable ${unclassifiable.runId}`);
