@@ -1377,14 +1377,14 @@ describe('qlb undo lineage-match doctor diagnostic', () => {
     } finally { close(f); }
   });
 
-  it('fails an update using only the fingerprint prefix', async () => {
+  it('warns when a C-swap credential rotates after hand-back', async () => {
     const f = fixture();
     try {
       completedUndo(f);
       addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-current', active: true });
       f.keychain.set('claude-swap', 'account-1-a@example.test', credential('account-a', 'refresh-stale'));
       assert.deepEqual(await undoLineageMatchCheck(f.dbPath, { available: true, phase: 'rolled-back' }, f.keychain, f.backup), {
-        name: 'undo:lineage-match', level: 'FAIL', message: `slot 1: update required fingerprint=${prefix('refresh-current')}`,
+        name: 'undo:lineage-match', level: 'WARN', message: 'slot 1: credential lineage changed after hand-back',
       });
     } finally { close(f); }
   });
@@ -1398,6 +1398,32 @@ describe('qlb undo lineage-match doctor diagnostic', () => {
       writeFileSync(join(f.backup, 'credentials', '.creds-1-a@example.test.enc'), 'fixture');
       assert.deepEqual(await undoLineageMatchCheck(f.dbPath, { available: true, phase: 'rolled-back' }, f.keychain, f.backup), {
         name: 'undo:lineage-match', level: 'FAIL', message: 'slot 1: encrypted credential remains',
+      });
+    } finally { close(f); }
+  });
+
+  it('fails an encrypted fallback even when a credential lineage changed', async () => {
+    const f = fixture();
+    try {
+      completedUndo(f);
+      addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-current', active: true });
+      f.keychain.set('claude-swap', 'account-1-a@example.test', credential('account-a', 'refresh-stale'));
+      writeFileSync(join(f.backup, 'credentials', '.creds-1-a@example.test.enc'), 'fixture');
+      assert.deepEqual(await undoLineageMatchCheck(f.dbPath, { available: true, phase: 'rolled-back' }, f.keychain, f.backup), {
+        name: 'undo:lineage-match', level: 'FAIL', message: 'slot 1: encrypted credential remains',
+      });
+    } finally { close(f); }
+  });
+
+  it('reports redacted backend inspection failures', async () => {
+    const f = fixture();
+    try {
+      completedUndo(f);
+      addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-current', active: true });
+      const secret = 'sk-1234567890abcdefghij';
+      const keychain = { get: async (): Promise<string> => { throw new Error(`keychain unavailable: ${secret}`); } };
+      assert.deepEqual(await undoLineageMatchCheck(f.dbPath, { available: true, phase: 'rolled-back' }, keychain, f.backup), {
+        name: 'undo:lineage-match', level: 'FAIL', message: 'unable to inspect undo credential lineage: keychain unavailable: [redacted]',
       });
     } finally { close(f); }
   });

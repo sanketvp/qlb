@@ -37,3 +37,17 @@ export function lifecyclePhase(dbPath: string): LifecyclePhaseResult {
     try { db?.close(); } catch { /* unavailable connection has no close path */ }
   }
 }
+
+export function readUndoBeganAt(dbPath: string): number | null {
+  const db = new DatabaseSync(dbPath, { readOnly: true });
+  try {
+    db.exec('PRAGMA busy_timeout = 5000');
+    const row = db.prepare(`
+      SELECT undo_began_at AS undoBeganAt
+      FROM lifecycle WHERE closed_at IS NULL ORDER BY id DESC LIMIT 1
+    `).get() as { undoBeganAt: number | null } | undefined;
+    return row?.undoBeganAt ?? null;
+  } finally {
+    db.close();
+  }
+}
