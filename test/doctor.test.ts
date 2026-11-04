@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { tmpdir } from 'node:os';
@@ -758,11 +758,69 @@ describe('qlb doctor', () => {
     assert.deepEqual(JSON.parse(listHealthLog(config.dbPath)[0]!.deadSlotsJson), []);
   });
 
-  it('qlb doctor on a missing store appends nothing', async () => {
-    const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-health-missing-'));
-    const report = await doctorQlb(defaultConfig(home), { appendHealthLog: true, command: () => 'ok', hostCommand: () => '', hostPlatform: 'linux', piProcessList: () => '' });
-    assert.equal(report.healthLogId, undefined);
-    assert.equal(report.checks.find((check) => check.name === 'health-log')?.level, 'WARN');
+  it('reports a failed health-log append on stderr without adding a check row', () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-health-log-failure-'));
+    const config = defaultConfig(home);
+    const store = openStore(config.dbPath);
+    store.close();
+    const db = new DatabaseSync(config.dbPath);
+    try {
+      db.exec('DROP TABLE health_log');
+    } finally { db.close(); }
+
+    const result = spawnSync(process.execPath, [join(__dirname, '..', 'src', 'cli.js'), 'doctor', '--json'], {
+      encoding: 'utf8',
+      env: { ...process.env, QLB_TEST_MODE: '1', QLB_HOME: home, HOME: home, QLB_DB_PATH: config.dbPath },
+    });
+    assert.ok(result.status === 0 || result.status === 1, result.stderr);
+    const report = JSON.parse(result.stdout) as {
+      overall: string;
+      checks: Array<{ name: string; level: string }>;
+      providers: Array<{ level: string }>;
+      healthLogError?: string;
+    };
+    assert.match(report.healthLogError ?? '', /no such table: health_log/);
+    assert.equal(report.checks.some((check) => check.name === 'health-log'), false);
+    const expectedOverall = [...report.checks, ...report.providers].some((row) => row.level === 'FAIL')
+      ? 'FAIL'
+      : [...report.checks, ...report.providers].some((row) => row.level === 'WARN') ? 'WARN' : 'PASS';
+    assert.equal(report.overall, expectedOverall);
+    assert.equal(result.stderr.trim().split('\n').length, 1);
+    assert.match(result.stderr, /^qlb doctor: warning: health log was not appended: no such table: health_log\n$/);
+  });
+
+  it('qlb doctor silently skips health history for missing and non-v5 stores', async () => {
+    const missingHome = mkdtempSync(join(tmpdir(), 'qlb-doctor-health-missing-'));
+    const missing = await doctorQlb(defaultConfig(missingHome), {
+      appendHealthLog: true, command: () => 'ok', hostCommand: () => '', hostPlatform: 'linux', piProcessList: () => '',
+    });
+    assert.equal(missing.healthLogId, undefined);
+    assert.equal(missing.healthLogError, undefined);
+    const missingCli = spawnSync(process.execPath, [join(__dirname, '..', 'src', 'cli.js'), 'doctor', '--json'], {
+      encoding: 'utf8',
+      env: { ...process.env, QLB_TEST_MODE: '1', QLB_HOME: missingHome, HOME: missingHome, QLB_DB_PATH: defaultConfig(missingHome).dbPath },
+    });
+    assert.ok(missingCli.status === 0 || missingCli.status === 1, missingCli.stderr);
+    assert.equal(missingCli.stderr, '');
+
+    const legacyHome = mkdtempSync(join(tmpdir(), 'qlb-doctor-health-legacy-'));
+    const legacyConfig = defaultConfig(legacyHome);
+    mkdirSync(dirname(legacyConfig.dbPath), { recursive: true });
+    const legacyDb = new DatabaseSync(legacyConfig.dbPath);
+    try {
+      legacyDb.exec('PRAGMA user_version = 4');
+    } finally { legacyDb.close(); }
+    const legacy = await doctorQlb(legacyConfig, {
+      appendHealthLog: true, command: () => 'ok', hostCommand: () => '', hostPlatform: 'linux', piProcessList: () => '',
+    });
+    assert.equal(legacy.healthLogId, undefined);
+    assert.equal(legacy.healthLogError, undefined);
+    const legacyCli = spawnSync(process.execPath, [join(__dirname, '..', 'src', 'cli.js'), 'doctor', '--json'], {
+      encoding: 'utf8',
+      env: { ...process.env, QLB_TEST_MODE: '1', QLB_HOME: legacyHome, HOME: legacyHome, QLB_DB_PATH: legacyConfig.dbPath },
+    });
+    assert.ok(legacyCli.status === 0 || legacyCli.status === 1, legacyCli.stderr);
+    assert.equal(legacyCli.stderr, '');
   });
 
   it('doctorQlb without appendHealthLog writes no row', async () => {

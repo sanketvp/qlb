@@ -2217,6 +2217,7 @@ export async function main(): Promise<void> {
   }
   if (opts.cmd === 'doctor') {
     const report = await doctorQlb(config, { live: opts.live, appendHealthLog: true });
+    if (report.healthLogError) console.error(`qlb doctor: warning: health log was not appended: ${report.healthLogError}`);
     printDoctor(report, opts.json);
     process.exit(report.overall === 'FAIL' ? 1 : 0);
   }

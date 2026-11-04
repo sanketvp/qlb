@@ -122,6 +122,8 @@ export interface DoctorReport {
   providers: ProviderDiagnostic[];
   s64: { overall: 'PASS' | 'FAIL'; autoAgent: 'PASS' | 'FAIL' };
   healthLogId?: number;
+  /** Health history append failure, redacted and separate from registered check rows. */
+  healthLogError?: string;
 }
 
 /** WARN rows that block S64; every other WARN and every INFO is advisory. */
@@ -971,32 +973,35 @@ export async function doctorQlb(
     s64: s64DoctorVerdict({ checks: registeredChecks, providers: redactedProviders }),
   };
 
-  if (options.appendHealthLog) {
+  // Health history is available only to initialized v5 stores. Missing and older
+  // stores are expected during setup, so they are deliberately silent no-ops.
+  if (options.appendHealthLog && existsSync(config.dbPath)) {
     let db: ReturnType<typeof openStoreConnection> | undefined;
     try {
-      if (!existsSync(config.dbPath)) throw new Error('store does not exist');
       db = openStoreConnection(config.dbPath, true);
-      if (readUserVersion(db) !== SCHEMA_VERSION) throw new Error('store is not yet v5');
-      const deadSlots = (db.prepare('SELECT account_id AS accountId FROM claude_slots WHERE dead = 1 AND archived_at IS NULL')
-        .all() as Array<{ accountId: string }>).map((row) => row.accountId);
-      const releaseRow = db.prepare('SELECT release_sha AS releaseSha FROM lifecycle WHERE closed_at IS NULL ORDER BY id DESC LIMIT 1')
-        .get() as { releaseSha?: string | null } | undefined;
-      db.close();
-      db = undefined;
-      const failing = [...report.checks, ...report.providers].filter(isS64BlockingRow);
-      report.healthLogId = appendHealthLog(config.dbPath, {
-        ts: options.now?.() ?? Date.now(),
-        phase: lifecycle.phase,
-        overall: report.s64.overall,
-        failing,
-        deadSlots,
-        releaseSha: releaseRow?.releaseSha ?? null,
-      });
+      if (readUserVersion(db) !== SCHEMA_VERSION) {
+        db.close();
+        db = undefined;
+      } else {
+        const deadSlots = (db.prepare('SELECT account_id AS accountId FROM claude_slots WHERE dead = 1 AND archived_at IS NULL')
+          .all() as Array<{ accountId: string }>).map((row) => row.accountId);
+        const releaseRow = db.prepare('SELECT release_sha AS releaseSha FROM lifecycle WHERE closed_at IS NULL ORDER BY id DESC LIMIT 1')
+          .get() as { releaseSha?: string | null } | undefined;
+        db.close();
+        db = undefined;
+        const failing = [...report.checks, ...report.providers].filter(isS64BlockingRow);
+        report.healthLogId = appendHealthLog(config.dbPath, {
+          ts: options.now?.() ?? Date.now(),
+          phase: lifecycle.phase,
+          overall: report.s64.overall,
+          failing,
+          deadSlots,
+          releaseSha: releaseRow?.releaseSha ?? null,
+        });
+      }
     } catch (error) {
       try { db?.close(); } catch { /* preserve the doctor report */ }
-      const reason = error instanceof Error ? redactSecrets(error.message, []) : 'unknown store error';
-      report.checks.push({ name: 'health-log', level: 'WARN', message: `health log was not appended: ${reason}` });
-      report.overall = combineOverall([...report.checks, ...report.providers]);
+      report.healthLogError = error instanceof Error ? redactSecrets(error.message, []) : 'unknown store error';
     }
   }
 
