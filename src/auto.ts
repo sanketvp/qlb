@@ -283,6 +283,9 @@ function productionDryBinding(config: QlbConfig, now: () => number): DryBinding 
 
 /** Runs the single Anthropic binding. Per-tick failures are intentionally logged and retried. */
 export async function runAuto(options: RunAutoOptions = {}, dependencies: AutoDependencies = {}): Promise<AutoRunResult> {
+  if (options.inject !== undefined && (!options.once || options.dryRun)) {
+    throw new AutoAdmissionRefused('fault-injection-requires-live-once');
+  }
   const env = dependencies.env ?? process.env;
   const home = dependencies.home ?? qlbHomeDir(env);
   const config = dependencies.config ?? resolveConfig({ env, home });
@@ -290,9 +293,6 @@ export async function runAuto(options: RunAutoOptions = {}, dependencies: AutoDe
   const log = dependencies.log ?? ((line: string) => console.error(line));
   const result: AutoRunResult = { ticks: 0, decisions: [], executed: [] };
 
-  if (options.inject !== undefined && (!options.once || options.dryRun)) {
-    throw new AutoAdmissionRefused('fault-injection-requires-live-once');
-  }
   if (options.dryRun) {
     const binding = await (dependencies.makeDryBinding?.() ?? productionDryBinding(config, now));
     try {

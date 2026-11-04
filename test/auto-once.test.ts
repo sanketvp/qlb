@@ -824,7 +824,8 @@ describe('qlb auto --once (G12)', () => {
   });
 
   it('runAuto rejects usage-5xx outside a live once run', async () => {
-    await assert.rejects(runAuto({ inject: { kind: 'usage-5xx', provider: 'anthropic' } }), AutoAdmissionRefused);
+    const env = new Proxy({}, { get: () => { throw new Error('must not resolve environment'); } }) as NodeJS.ProcessEnv;
+    await assert.rejects(runAuto({ inject: { kind: 'usage-5xx', provider: 'anthropic' } }, { env }), AutoAdmissionRefused);
   });
 
   it('usage-5xx passes only the fault descriptor through the locked once run', async () => {
