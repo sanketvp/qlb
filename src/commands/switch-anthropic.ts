@@ -9,8 +9,8 @@ import { ProbeVerdictMemo, fetchActiveUsage, type RefreshHttpResponse } from '..
 import { ClaudeSlots, SqliteClaudeSlotRepository } from '../cc-slots';
 import { AdmissionRefused, switchClaude, type ClaudeSwitchDeps, type ClaudeSwitchResult } from '../cc-switch';
 import { processLstart } from '../codex-sessions';
-import { qlbHomeDir } from '../home';
 import { parseInjectFlag } from '../fault-injection';
+import { qlbHomeDir } from '../home';
 import { platformKeychain } from '../keychain';
 import { reconcileClaudeSwitch } from '../journal';
 import { assertAdmitted } from '../lifecycle';
@@ -192,8 +192,9 @@ export function createSwitchAnthropicCommand(deps: SwitchAnthropicCommandDeps = 
         ctx.stderr(parsedInjection.usage);
         return 2;
       }
+      const inject = parsedInjection.inject;
       const parsed = parse(parsedInjection.rest);
-      if (!parsed || (parsedInjection.inject !== null && parsedInjection.inject.kind !== 'fail-step')) return usage(ctx);
+      if (!parsed || (inject !== null && inject.kind !== 'fail-step')) return usage(ctx);
 
       const store = (deps.openStore ?? openStore)(ctx.config.dbPath);
       let resources: SwitchResources | undefined;
@@ -224,12 +225,12 @@ export function createSwitchAnthropicCommand(deps: SwitchAnthropicCommandDeps = 
         }
 
         resources = await ensureResources();
-        if (parsedInjection.inject?.kind === 'fail-step') resources.deps.injectFailStep = parsedInjection.inject.step;
+        if (inject?.kind === 'fail-step') resources.deps.injectFailStep = inject.step;
         const result = await (deps.switchClaude ?? switchClaude)(resources.deps, {
           to: parsed.accountId,
           trigger: 'manual',
           ...(parsed.republish ? { republish: true } : {}),
-          ...(parsedInjection.inject === null ? {} : { injected: true }),
+          ...(inject === null ? {} : { injected: true }),
         });
         if (parsed.json) ctx.stdout(JSON.stringify(receipt(result)));
         else if (result.outcome === 'refused') ctx.stderr(`qlb switch anthropic: refused: ${result.reason ?? 'unknown'}`);
