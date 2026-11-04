@@ -77,6 +77,17 @@ describe('claude:login-expiry doctor check', () => {
     });
   });
 
+  it('warns when a live slot credential is not parseable', () => {
+    const dbPath = fixture();
+    insertSlot(dbPath, 'slot');
+    const row = claudeLoginExpiryCheck(dbPath, keychain(['slot', 'not-json']), NOW);
+    assert.deepEqual(row, {
+      name: 'claude:login-expiry', level: 'WARN',
+      message: 'Claude credential unreadable for slot slot',
+    });
+    assert.doesNotMatch(JSON.stringify(row), /not-json/);
+  });
+
   it('reports every non-passing login expiry observation together', () => {
     const dbPath = fixture();
     insertSlot(dbPath, 'expired');

@@ -1,4 +1,4 @@
-import { loginExpiresAtIso } from '../anthropic-oauth';
+import { loginExpiryField, parseCredentialBlob } from '../anthropic-oauth';
 import { QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, type KeychainBackend } from '../keychain';
 import { redactError } from '../redact';
 import { openStoreConnection } from '../store';
@@ -42,7 +42,9 @@ export function claudeLoginExpiryCheck(
         return { accountId, kind: 'unreadable' };
       }
       try {
-        const expiry = loginExpiresAtIso(credential);
+        const parsed = parseCredentialBlob(credential);
+        if (parsed === null) return { accountId, kind: 'unreadable' };
+        const expiry = loginExpiryField(parsed).iso;
         if (expiry === null) return { accountId, kind: 'not-reported' };
         const expiresAt = new Date(expiry).getTime();
         if (expiresAt <= now) return { accountId, kind: 'expired', expiresAt: expiry };
