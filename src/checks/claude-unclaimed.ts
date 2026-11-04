@@ -10,7 +10,8 @@ const STALE_AFTER_MS = 30 * 24 * 60 * 60 * 1_000;
 
 /**
  * Read-only visibility for retained Claude successor stashes. The index holds
- * metadata only; this check never opens a Keychain item or fallback body.
+ * metadata only; this check never opens a Keychain item or fallback body. An
+ * unavailable or malformed index deliberately blocks S64 retirement.
  */
 export async function claudeUnclaimedCheck(
   stashDir: string,
@@ -30,8 +31,11 @@ export async function claudeUnclaimedCheck(
   let entries: Awaited<ReturnType<typeof ClaudeSlots.listUnclaimedStashIndex>>;
   try {
     entries = await ClaudeSlots.listUnclaimedStashIndex(stashDir);
-  } catch {
-    return { name: 'claude:unclaimed', level: 'FAIL', message: 'unclaimed stash index unavailable' };
+  } catch (error) {
+    const message = error instanceof Error && error.message === 'unclaimed index entry is malformed'
+      ? 'unclaimed stash index contains malformed metadata'
+      : 'unclaimed stash index unavailable';
+    return { name: 'claude:unclaimed', level: 'FAIL', message };
   }
 
   const stale = entries.filter((entry) => entry.createdAt < now - STALE_AFTER_MS);

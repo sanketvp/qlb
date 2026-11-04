@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
-import { mkdtempSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
@@ -196,6 +196,27 @@ describe('claude:unclaimed doctor check', () => {
     const root = mkdtempSync(join(tmpdir(), 'qlb-doctor-unclaimed-none-'));
     assert.deepEqual(await claudeUnclaimedCheck(root, 'cutover', NOW), {
       name: 'claude:unclaimed', level: 'PASS', message: 'no unclaimed Claude stashes',
+    });
+  });
+
+  it('FAILs closed for unavailable or malformed index metadata', async () => {
+    const unavailableRoot = mkdtempSync(join(tmpdir(), 'qlb-doctor-unclaimed-index-unavailable-'));
+    mkdirSync(join(unavailableRoot, 'index'), { recursive: true });
+    writeFileSync(join(unavailableRoot, 'index', 'anthropic'), 'not a directory');
+    const unavailable = await claudeUnclaimedCheck(unavailableRoot, 'cutover', NOW);
+    assert.deepEqual(unavailable, {
+      name: 'claude:unclaimed', level: 'FAIL', message: 'unclaimed stash index unavailable',
+    });
+
+    const malformedRoot = mkdtempSync(join(tmpdir(), 'qlb-doctor-unclaimed-index-malformed-'));
+    mkdirSync(join(malformedRoot, 'index', 'anthropic'), { recursive: true });
+    writeFileSync(join(malformedRoot, 'index', 'anthropic', `${stashId}.json`), 'not JSON');
+    const malformed = await claudeUnclaimedCheck(malformedRoot, 'cutover', NOW);
+    assert.deepEqual(malformed, {
+      name: 'claude:unclaimed', level: 'FAIL', message: 'unclaimed stash index contains malformed metadata',
+    });
+    assert.deepEqual(s64DoctorVerdict({ checks: [unavailable, malformed], providers: [] }), {
+      overall: 'FAIL', autoAgent: 'FAIL',
     });
   });
 
