@@ -11,10 +11,7 @@ import {
   type ClassifyClaudeSlot,
   type PrefetchedLiveIdentity,
 } from '../src/cc-classify';
-
-function credential(tag: string, refresh = tag): string {
-  return JSON.stringify({ claudeAiOauth: { accessToken: `access-${tag}`, refreshToken: `refresh-${refresh}` } });
-}
+import { credential } from './support/claude-fixtures';
 
 const accountA: ClassifyClaudeSlot = {
   accountId: 'uuid-a', email: 'a@example.test', orgUuid: 'org-a', credential: credential('a'),
@@ -47,7 +44,7 @@ describe('Claude outgoing credential classification (K4 / AC5)', () => {
   });
 
   it('classifies an access-token-only rotation as own family', () => {
-    const live = credential('a-rotated-access', 'a');
+    const live = credential('a-rotated-access', { refreshToken: 'refresh-a' });
     assert.deepEqual(classify(live, prefetch(live, null)), { kind: 'own-family', foreignSlotId: null });
   });
 

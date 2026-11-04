@@ -11,18 +11,11 @@ import { MockKeychain, qlbKeychainService } from '../src/keychain';
 import { listStashes, recordStash } from '../src/unclaimed-index';
 import { openStore } from '../src/store';
 import type { CommandContext } from '../src/registry';
+import { credential as buildCredential } from './support/claude-fixtures';
 
-function credential(tag: string, expiresAt = tag === 'issued' ? 2_000 : 1_000): string {
-  return JSON.stringify({ claudeAiOauth: { accessToken: `access-${tag}`, refreshToken: `refresh-${tag}`, expiresAt } });
-}
-
-function credentialWithRefresh(tag: string, refreshToken: string, expiresAt: number): string {
-  return JSON.stringify({ claudeAiOauth: { accessToken: `access-${tag}`, refreshToken, expiresAt } });
-}
-
-function credentialWithoutExpiry(tag: string): string {
-  return JSON.stringify({ claudeAiOauth: { accessToken: `access-${tag}`, refreshToken: `refresh-${tag}` } });
-}
+const credential = (tag: string, expiresAt = tag === 'issued' ? 2_000 : 1_000): string => buildCredential(tag, { expiresAt });
+const credentialWithRefresh = (tag: string, refreshToken: string, expiresAt: number): string => buildCredential(tag, { refreshToken, expiresAt });
+const credentialWithoutExpiry = (tag: string): string => buildCredential(tag);
 
 function failNextCommit(repository: SqliteClaudeSlotRepository): void {
   const db = (repository as unknown as { db: { exec(sql: string): void } }).db;

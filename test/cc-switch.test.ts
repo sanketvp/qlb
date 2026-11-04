@@ -20,14 +20,17 @@ import {
   switchClaude,
   type ClaudeSwitchDeps,
 } from '../src/cc-switch';
+import { credential as buildCredential } from './support/claude-fixtures';
 
 const NOW = 1_000_000;
 const HOME = '/fixture/home';
 const ENV = { QLB_TEST_MODE: '1', HOME };
 
-function credential(tag: string, expiresAt = NOW + 60 * 60_000): string {
-  return JSON.stringify({ claudeAiOauth: { accessToken: `fixture-access-${tag}`, refreshToken: `fixture-refresh-${tag}`, expiresAt } });
-}
+const credential = (tag: string, expiresAt = NOW + 60 * 60_000): string => buildCredential(tag, {
+  accessToken: `fixture-access-${tag}`,
+  refreshToken: `fixture-refresh-${tag}`,
+  expiresAt,
+});
 
 /** Deliberately differs from Step 7's serialize-then-append shared-field order. */
 function credentialWithSharedFields(tag: string, expiresAt = NOW + 60 * 60_000): string {

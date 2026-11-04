@@ -16,6 +16,7 @@ import { MockKeychain } from '../src/keychain';
 import { assertAdmitted, beginCutover, transition, type LifecycleState } from '../src/lifecycle';
 import type { CommandContext, CommandDefinition } from '../src/registry';
 import { openStore } from '../src/store';
+import { credential as buildCredential, twoSlotFixture } from './support/claude-fixtures';
 
 const NOW = 1_000_000;
 
@@ -27,13 +28,11 @@ type Fixture = {
   lockCalls: () => number;
 };
 
-function credential(tag: string): string {
-  return JSON.stringify({ claudeAiOauth: {
-    accessToken: `fixture-access-${tag}`,
-    refreshToken: `fixture-refresh-${tag}`,
-    expiresAt: NOW + 60 * 60_000,
-  } });
-}
+const credential = (tag: string): string => buildCredential(tag, {
+  accessToken: `fixture-access-${tag}`,
+  refreshToken: `fixture-refresh-${tag}`,
+  expiresAt: NOW + 60 * 60_000,
+});
 
 function setLifecycle(store: ReturnType<typeof openStore>, state: LifecycleState): void {
   if (state === 'pre-cutover') return;
@@ -98,14 +97,9 @@ async function fixture(
       const repository = SqliteClaudeSlotRepository.open(commandStore.dbPath);
       const slots = new ClaudeSlots({ backend, repository, stashDir: join(root, 'unclaimed'), now: () => NOW });
       try {
-        await slots.createSlot({
-          accountId: 'account-a', credential: outgoing, email: 'a@example.test', orgUuid: 'org-a',
-          configJson: JSON.stringify({ oauthAccount: { accountUuid: 'account-a' } }), source: 'cswap-import',
-        });
-        await slots.createSlot({
-          accountId: 'account-b', credential: credential('b'), email: 'b@example.test', orgUuid: 'org-b',
-          configJson: JSON.stringify({ oauthAccount: { accountUuid: 'account-b' } }), source: 'cswap-import',
-        });
+        const [first, second] = twoSlotFixture(outgoing, credential('b'));
+        await slots.createSlot(first);
+        await slots.createSlot(second);
         return {
           deps: {
             store: commandStore as ClaudeSwitchDeps['store'],
