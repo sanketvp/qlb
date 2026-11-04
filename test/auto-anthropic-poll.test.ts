@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
 import { pollAnthropic } from '../src/auto/anthropic';
+import { anthropicStoreSnapshots } from '../src/anthropic-usage-view';
 import { claudePaths } from '../src/cc-paths';
 import { credentialLineage, ProbeVerdictMemo, type LiveIdentity } from '../src/cc-resync';
 import { ClaudeSlots, InMemoryClaudeSlotRepository } from '../src/cc-slots';
@@ -449,7 +450,41 @@ describe('auto anthropic poll (G8)', () => {
     assert.equal(f.store.listUsagePolls('anthropic').inactive?.lastStatus, 'invalid_client');
   });
 
-  it('drops a 429 snapshot at its earliest window reset', async () => {
+  it('an unconfigured 7d:<model> row resetting during a 429 hold does not drop 5h and 7d for auto', async () => {
+    const f = await fixture();
+    f.store.writeUsagePollPlans('anthropic', {
+      active: { nextDueAt: NOW + 10_000, pollIntervalS: 10_000 }, inactive: { nextDueAt: NOW + 10_000, pollIntervalS: 10_000 },
+    });
+    for (const [label, resetAt] of [['5h', NOW + 86_400], ['7d', NOW + 172_800], ['7d:Fable', NOW - 1]] as const) {
+      f.store.upsertSnapshot('active', label, { usedPct: 20, fetchedAt: (NOW - 301) * 1000, resetAt: resetAt * 1000, source: 'poll', confidence: 'authoritative' });
+    }
+    f.store.recordUsagePollResult('anthropic', 'active', { attemptedAt: NOW, status: 'http-429', http429: true });
+
+    const active = (await pollAnthropic({ ...f.deps(), models: [] })).find((account) => account.accountId === 'active');
+    assert.equal(active?.buckets['5h']?.usedPct, 20);
+    assert.equal(active?.buckets['7d']?.usedPct, 20);
+  });
+
+  it('a stale scoped row with a past resetAt does not drop fresh 5h and 7d for auto or status', async () => {
+    const f = await fixture();
+    f.store.writeUsagePollPlans('anthropic', {
+      active: { nextDueAt: NOW + 10_000, pollIntervalS: 10_000 }, inactive: { nextDueAt: NOW + 10_000, pollIntervalS: 10_000 },
+    });
+    f.store.upsertSnapshot('active', '5h', { usedPct: 20, fetchedAt: NOW * 1000, resetAt: (NOW + 86_400) * 1000, source: 'poll', confidence: 'authoritative' });
+    f.store.upsertSnapshot('active', '7d', { usedPct: 10, fetchedAt: NOW * 1000, resetAt: (NOW + 172_800) * 1000, source: 'poll', confidence: 'authoritative' });
+    f.store.upsertSnapshot('active', '7d:Fable', { usedPct: 100, fetchedAt: (NOW - 301) * 1000, resetAt: (NOW - 1) * 1000, source: 'poll', confidence: 'authoritative' });
+    f.store.recordUsagePollResult('anthropic', 'active', { attemptedAt: NOW, status: 'http-429', http429: true });
+
+    const auto = (await pollAnthropic({ ...f.deps(), models: [] })).find((account) => account.accountId === 'active');
+    const status = anthropicStoreSnapshots(f.slots.listSlots(), f.store, NOW).snapshots.find((snapshot) => snapshot.accountId === 'active');
+    assert.equal(auto?.buckets['5h']?.usedPct, 20);
+    assert.equal(auto?.buckets['7d']?.usedPct, 10);
+    assert.equal(status?.buckets['5h']?.usedPct, 20);
+    assert.equal(status?.buckets['7d']?.usedPct, 10);
+    assert.equal(status?.buckets['7d:Fable']?.usedPct, 100);
+  });
+
+  it('a 5h reset during a 429 hold still drops the snapshot', async () => {
     const f = await fixture();
     f.store.writeUsagePollPlans('anthropic', {
       active: { nextDueAt: NOW + 10_000, pollIntervalS: 10_000 }, inactive: { nextDueAt: NOW + 10_000, pollIntervalS: 10_000 },

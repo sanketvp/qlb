@@ -56,9 +56,23 @@ export function decisionTrusts(
     || (row.heldUntil !== null && row.heldUntil !== undefined && nowS < row.heldUntil);
 }
 
-function earliestResetAt(snapshot: Record<string, BucketReading>): number | undefined {
-  return Object.values(snapshot).reduce<number | undefined>((earliest, reading) =>
-    reading.resetAt === undefined ? earliest : earliest === undefined ? reading.resetAt : Math.min(earliest, reading.resetAt), undefined);
+function newestFetchedAt(
+  snapshot: Record<string, BucketReading>,
+  include: (label: string) => boolean,
+): number | undefined {
+  return Object.entries(snapshot).reduce<number | undefined>((newest, [label, reading]) =>
+    reading.source !== 'poll' || !include(label) ? newest : newest === undefined ? reading.fetchedAt : Math.max(newest, reading.fetchedAt), undefined);
+}
+
+function earliestResetAt(
+  snapshot: Record<string, BucketReading>,
+  include: (label: string) => boolean,
+  newest: number | undefined,
+): number | undefined {
+  return Object.entries(snapshot).reduce<number | undefined>((earliest, [label, reading]) =>
+    reading.source !== 'poll' || !include(label) || reading.fetchedAt !== newest || reading.resetAt === undefined
+      ? earliest
+      : earliest === undefined ? reading.resetAt : Math.min(earliest, reading.resetAt), undefined);
 }
 
 /** Confidence for a retained reading; `unknown` means it must not be served. */
@@ -82,7 +96,8 @@ export function projectAnthropicUsageReadings(
   nowS: number,
   include: (label: string) => boolean = () => true,
 ): Record<string, BucketReading> {
-  const snapshotResetAt = earliestResetAt(snapshot);
+  const newest = newestFetchedAt(snapshot, include);
+  const snapshotResetAt = earliestResetAt(snapshot, include, newest);
   return Object.fromEntries(Object.entries(snapshot).flatMap(([label, reading]) => {
     if (reading.source !== 'poll' || !include(label)) return [];
     const confidence = anthropicUsageConfidence(row, reading, snapshotResetAt, nowS);
