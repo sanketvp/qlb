@@ -7,6 +7,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { describe, it } from 'node:test';
 
 import { defaultHeldLocks, isQlbProcessCommand, restoreCswap, runUndoCswapCommand, type TerminalHandBack } from '../src/commands/undo-cswap';
+import { undoIncompleteCheck } from '../src/checks/undo-incomplete';
 import { discoverCommands, resolveCommand, type CommandContext } from '../src/registry';
 import { openStore, openStoreConnection } from '../src/store';
 import { runExecutingCommand } from '../src/app';
@@ -1245,6 +1246,73 @@ describe('qlb undo cswap hand-back', () => {
       writeFileSync(join(f.backup, 'credentials', '.creds-1-bad\u0007.enc'), 'fixture');
       assert.equal(await dryRun(f), 1);
       assert.deepEqual(f.output, ['ERR:qlb undo cswap: hand-back failed']);
+    } finally { close(f); }
+  });
+});
+
+describe('qlb undo cswap doctor diagnostic', () => {
+  it('reports an undoing lifecycle as undo-unfinished with its start time and resume command', () => {
+    const f = fixture();
+    try {
+      beginUndo(f);
+      const store = openStore(f.dbPath);
+      try { assert.equal(transition(store, 'undoing', 123).ok, true); } finally { store.close(); }
+      assert.deepEqual(undoIncompleteCheck(f.dbPath, { available: true, phase: 'undoing' }), {
+        name: 'undo:incomplete',
+        level: 'FAIL',
+        message: 'undo-unfinished: undo_began_at=123; run qlb undo cswap --resume',
+      });
+    } finally { close(f); }
+  });
+
+  it('reports a restore-pending rollback with the resume command', () => {
+    const f = fixture();
+    try {
+      beginUndo(f);
+      const store = openStore(f.dbPath);
+      try {
+        assert.equal(transition(store, 'undoing', 123).ok, true);
+        assert.equal(transition(store, 'rolled-back', 124, CSWAP_RESTORE_PENDING).ok, true);
+      } finally { store.close(); }
+      assert.deepEqual(undoIncompleteCheck(f.dbPath, { available: true, phase: 'rolled-back', restorePending: true }), {
+        name: 'undo:incomplete',
+        level: 'FAIL',
+        message: 'cswap-restore-pending: run qlb undo cswap --resume',
+      });
+    } finally { close(f); }
+  });
+
+  it('reports no incomplete undo after a completed rollback', () => {
+    const f = fixture();
+    try {
+      beginUndo(f);
+      const store = openStore(f.dbPath);
+      try {
+        assert.equal(transition(store, 'undoing', 123).ok, true);
+        assert.equal(transition(store, 'rolled-back', 124).ok, true);
+      } finally { store.close(); }
+      assert.deepEqual(undoIncompleteCheck(f.dbPath, { available: true, phase: 'rolled-back' }), {
+        name: 'undo:incomplete', level: 'PASS', message: 'no incomplete undo',
+      });
+    } finally { close(f); }
+  });
+
+  it('reports no incomplete undo after an aborted cutover setup', () => {
+    const f = fixture();
+    try {
+      assert.deepEqual(undoIncompleteCheck(f.dbPath, { available: true, phase: 'aborted' }), {
+        name: 'undo:incomplete', level: 'PASS', message: 'no incomplete undo',
+      });
+    } finally { close(f); }
+  });
+
+  it('is not applicable during cutover', () => {
+    const f = fixture();
+    try {
+      beginUndo(f);
+      assert.deepEqual(undoIncompleteCheck(f.dbPath, { available: true, phase: 'cutover' }), {
+        name: 'undo:incomplete', level: 'N/A', message: 'not applicable in phase=cutover',
+      });
     } finally { close(f); }
   });
 });
