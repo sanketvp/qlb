@@ -225,7 +225,11 @@ describe('C-swap import (K10 / AC16)', () => {
       afterPromotionWrite: () => { throw new CswapImportInjectedCrash(); },
     }), CswapImportInjectedCrash);
     const moved = credential('account-a', 'refresh-a-moved');
-    h.repo.updateCredentialWithLineage('account-a', credentialFingerprint(original), credentialFingerprint(moved), credentialFingerprint(original), null);
+    const originalFingerprint = credentialFingerprint(original);
+    const movedFingerprint = credentialFingerprint(moved);
+    assert.ok(originalFingerprint, 'fixture credential has a fingerprint');
+    assert.ok(movedFingerprint, 'fixture credential has a fingerprint');
+    h.repo.updateCredentialWithLineage('account-a', originalFingerprint, movedFingerprint, originalFingerprint, null);
     await h.keychain.set('qlb:anthropic:account-a', QLB_KEYCHAIN_ACCOUNT, moved);
     const options = { backupDir: h.backup, journalDir, keychain: h.keychain, repository: h.repo };
     assert.deepEqual((await classifyCswapImportJournals(options)).find((journal) => journal.runId === 'moved-slot')?.action, 'unclassifiable');
@@ -234,7 +238,7 @@ describe('C-swap import (K10 / AC16)', () => {
     await assert.rejects(reconcileCswapImportJournals(options), (error: unknown) =>
       error instanceof CswapImportRefusalError && error.code === 'import-journal-unclassifiable' && error.runId === 'moved-slot');
     assert.equal(await h.keychain.get('qlb:anthropic:account-a', QLB_KEYCHAIN_ACCOUNT), moved);
-    assert.equal(h.repo.getSlot('account-a')?.fingerprint, credentialFingerprint(moved));
+    assert.equal(h.repo.getSlot('account-a')?.fingerprint, movedFingerprint);
   });
 
   it('prints orphaned journals in text dry-run output', async () => {

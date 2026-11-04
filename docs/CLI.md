@@ -136,6 +136,21 @@ $ qlb native-resync --provider kimi-coding --account acct-kimi --json
 
 Flags: `--provider <anthropic|xai|kimi-coding|openai-codex|openrouter>` (required), `--account <id>` (required), `[--db <path>]`, `[--json]`.
 
+## `qlb import cswap`
+
+An interrupted C-swap import leaves a QLB-owned journal in `~/.qlb/backups`. A normal import refuses while a journal needs attention, before it reads source credentials or writes new staging data. Reconcile those journals explicitly:
+
+```console
+$ qlb import cswap --reconcile --preview
+journals=1; import-run-123:recover
+```
+
+`--preview` is read-only and reports each credential-free `runId:action` pair. With `--json`, each journal also includes its `phase` and SHA-256 digest. Run `qlb import cswap --reconcile` to perform the reported action: `recover` restores an uncommitted promotion, `finish-cleanup` removes leftover import staging and backup services after the SQLite commit, and `purge-staging` removes staging services from an import that never began promotion. `unclassifiable` is fail-closed: QLB refuses to reconcile or begin another import until the journal is made safe to classify.
+
+Reconciliation and preview are admitted only while the lifecycle is `cutting-over` or `cutover`. A non-stale import lock also refuses the command as `import-in-progress`; a stale lock is left for the guarded mutation to reclaim. `--preview` requires `--reconcile`; `--reconcile` cannot be combined with `--dry-run` or `--replace`.
+
+Flags: `[--dry-run] [--replace] [--json]`, or `--reconcile [--preview] [--json]`.
+
 ## `qlb export`
 
 Emit the last persisted usage readings as JSON without loading provider adapters or credential stores, making network requests, or migrating the database. The SQLite database is opened read-only and is never created when absent. This is the cache-only interface for status consumers; unlike `qlb status`, it does not refresh readings.
