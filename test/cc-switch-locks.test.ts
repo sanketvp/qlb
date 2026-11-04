@@ -128,9 +128,11 @@ describe('Claude switch credential lock timing (K5-7 / AC3)', () => {
     }
   });
 
-  it('X5b: two contenders deterministically take over one stale .oauth_refresh.lock once, then both acquire without overlap', async () => {
+  it('X5b: two contenders deterministically take over one stale .oauth_refresh.lock once, then both acquire without overlap', { timeout: 30_000 }, async () => {
     const subject = await switchFixture();
     const fsPromises = require('node:fs/promises') as Record<string, (...args: any[]) => Promise<any>>;
+    let switchRun!: ReturnType<typeof switchClaude>;
+    let waiterRun!: ReturnType<typeof withClaudeCredentialLocks>;
     const originalMkdir = fsPromises.mkdir;
     const originalRmdir = fsPromises.rmdir;
     const originalStat = fsPromises.stat;
@@ -186,8 +188,8 @@ describe('Claude switch credential lock timing (K5-7 / AC3)', () => {
       };
 
       const started = performance.now();
-      const switchRun = contender.run('switch', () => switchClaude(subject.deps, { to: 'account-b', trigger: 'manual' }));
-      const waiterRun = contender.run('waiter', () => withClaudeCredentialLocks(
+      switchRun = contender.run('switch', () => switchClaude(subject.deps, { to: 'account-b', trigger: 'manual' }));
+      waiterRun = contender.run('waiter', () => withClaudeCredentialLocks(
         { configDir: subject.paths.configHome, env: subject.env },
         async () => {
           waiterAcquired = true;
@@ -197,7 +199,10 @@ describe('Claude switch credential lock timing (K5-7 / AC3)', () => {
         },
       ));
       switchRun.then(releaseWaiterAfterRetake, releaseWaiterAfterRetake);
-      await switchEntered;
+      await Promise.race([switchEntered, switchRun.then(
+        (r) => { throw new Error('switch settled before step 4: ' + r.outcome + '/' + r.reason); },
+        () => { throw new Error('switch settled before step 4: rejected'); },
+      )]);
       const elapsed = performance.now() - started;
 
       assert.equal(staleStats, 2, 'both contenders must observe the stale lock before takeover');
@@ -213,6 +218,9 @@ describe('Claude switch credential lock timing (K5-7 / AC3)', () => {
     } finally {
       releaseSwitch?.();
       releaseWaiterAfterRetake?.();
+      releaseBothStaleStats?.();
+      releaseSwitchEntered?.();
+      await Promise.allSettled([switchRun, waiterRun]);
       fsPromises.mkdir = originalMkdir;
       fsPromises.rmdir = originalRmdir;
       fsPromises.stat = originalStat;
