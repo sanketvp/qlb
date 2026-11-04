@@ -67,6 +67,7 @@ import { cswapAgentCheck } from './checks/cswap-agent';
 import { cswapProcessesCheck } from './checks/cswap-processes';
 import type { CswapAgentStatus } from './cswap-agent';
 import type { CswapProcess } from './cswap-processes';
+import { claudeActiveCheck } from './checks/claude-active';
 import { claudeOauthClientCheck } from './checks/claude-oauth-client';
 import { claudeSlotsCheck } from './checks/claude-slots';
 import { claudeSwitchJournalCheck } from './checks/claude-switch-journal';
@@ -850,6 +851,7 @@ export async function doctorQlb(
     cswapAgentCheck(lifecycle, { status: options.cswapAgentStatus }),
     cswapProcessesCheck(lifecycle, { list: options.cswapProcesses, env: process.env }),
     claudeOauthClientCheck(config.dbPath, lifecycle),
+    claudeActiveCheck(config.dbPath, phase),
     claudeSlotsCheck(config.dbPath, phase),
     codexSlotsCheck(config.dbPath, phase),
     codexFirstSwitchCheck(config.dbPath, lifecycle, options.now?.() ?? Date.now()),
