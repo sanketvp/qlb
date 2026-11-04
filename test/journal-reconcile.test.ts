@@ -27,6 +27,7 @@ import { createClaudeJournalResolveCommand } from '../src/commands/claude-journa
 import { ClaudeCodeLockTimeout, ProperLockfileCompromised } from '../src/cc-locks';
 import { claudeSwitchJournalCheck } from '../src/checks/claude-switch-journal';
 import type { CommandContext } from '../src/registry';
+import { openStore } from '../src/store';
 
 const NOW = 1_000_000;
 const digest = (value: string) => createHash('sha256').update(value, 'utf8').digest('hex');
@@ -156,6 +157,32 @@ describe('Claude switch journal reconciliation (G10)', () => {
     };
     assert.deepEqual(await claudeSwitchJournalCheck('unused.sqlite', 'cutover', options), {
       name: 'claude:switch-journal', level: 'PASS', message: 'in progress',
+    });
+  });
+
+  it('doctor passes a journal whose matching switch was committed', async () => {
+    const subject = await fixture();
+    const entry = await install(subject);
+    const dbPath = join(subject.root, 'qlb.sqlite');
+    const store = openStore(dbPath);
+    try {
+      store.recordSwitch({
+        ts: NOW,
+        provider: 'anthropic',
+        fromAccount: entry.from,
+        toAccount: entry.to,
+        trigger: entry.trigger,
+        outcome: 'ok',
+        stepsJson: JSON.stringify({ attempt: entry.attemptId }),
+        committedAt: NOW,
+      });
+    } finally {
+      store.close();
+    }
+    assert.deepEqual(await claudeSwitchJournalCheck(dbPath, 'cutover', {
+      journal: { journalDir: subject.deps.journalDir, home: subject.home, env: subject.env, configPath: subject.paths.globalConfigPath, keychainService: subject.paths.keychainService },
+    }), {
+      name: 'claude:switch-journal', level: 'PASS', message: 'finished',
     });
   });
 

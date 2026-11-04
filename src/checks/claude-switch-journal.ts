@@ -7,6 +7,7 @@ import {
   type ClaudeSwitchJournalOptions,
 } from '../cc-switch-journal';
 import { stillTheSameProcess } from '../codex-sessions';
+import { redactError } from '../redact';
 import { openStoreConnection } from '../store';
 import { isLifecycleState, LIFECYCLE_STATES } from './lifecycle-phase';
 import { check } from './_check';
@@ -20,7 +21,6 @@ const APPLICABLE_PHASES = new Set<string>(LIFECYCLE_STATES.filter((phase) => (
 
 export interface ClaudeSwitchJournalCheckOptions {
   journal?: ClaudeSwitchJournalOptions;
-  ownerLock?: (options: ClaudeSwitchJournalOptions) => 'held' | 'free';
   ownerIsLive?: (owner: ClaudeSwitchJournal['owner']) => Promise<boolean>;
   committed?: (attemptId: string) => boolean;
 }
@@ -71,13 +71,12 @@ export async function claudeSwitchJournalCheck(
     if (read.journal.committed !== undefined || read.journal.closed !== null || committed(read.journal.attemptId)) {
       return { name: 'claude:switch-journal', level: 'PASS', message: 'finished' };
     }
-    const ownerLock = options.ownerLock ?? probeClaudeSwitchJournalOwner;
     const ownerIsLive = options.ownerIsLive ?? stillTheSameProcess;
-    if (ownerLock(journal) === 'held' || await ownerIsLive(read.journal.owner)) {
+    if (probeClaudeSwitchJournalOwner(journal) === 'held' || await ownerIsLive(read.journal.owner)) {
       return { name: 'claude:switch-journal', level: 'PASS', message: 'in progress' };
     }
-  } catch {
-    return { name: 'claude:switch-journal', level: 'FAIL', message: 'unable to inspect Claude switch journal' };
+  } catch (error) {
+    return { name: 'claude:switch-journal', level: 'FAIL', message: `unable to inspect Claude switch journal: ${redactError(error, [])}` };
   }
 
   return {
