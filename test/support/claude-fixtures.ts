@@ -23,20 +23,18 @@ export interface ClaudeSlotFixture {
   source: 'cswap-import';
 }
 
-export interface TwoSlotFixtureOverrides {
-  first?: Partial<ClaudeSlotFixture>;
-  second?: Partial<ClaudeSlotFixture>;
-}
-
 /** Returns the standard pair of imported Claude slots used by switch fixtures. */
-export function twoSlotFixture(overrides: TwoSlotFixtureOverrides = {}): [ClaudeSlotFixture, ClaudeSlotFixture] {
+export function twoSlotFixture(
+  firstCredential = credential('a'),
+  secondCredential = credential('b'),
+): [ClaudeSlotFixture, ClaudeSlotFixture] {
   const slot = (tag: 'a' | 'b'): ClaudeSlotFixture => ({
     accountId: `account-${tag}`,
-    credential: credential(tag),
+    credential: tag === 'a' ? firstCredential : secondCredential,
     email: `${tag}@example.test`,
     orgUuid: `org-${tag}`,
     configJson: JSON.stringify({ oauthAccount: { accountUuid: `account-${tag}` } }),
     source: 'cswap-import',
   });
-  return [{ ...slot('a'), ...overrides.first }, { ...slot('b'), ...overrides.second }];
+  return [slot('a'), slot('b')];
 }

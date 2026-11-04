@@ -46,10 +46,7 @@ async function switchFixture() {
     now: () => SLOT_NOW,
   });
   const outgoing = credential('a');
-  const [first, second] = twoSlotFixture({
-    first: { credential: outgoing },
-    second: { credential: credential('b') },
-  });
+  const [first, second] = twoSlotFixture(outgoing, credential('b'));
   await slots.createSlot(first);
   await slots.createSlot(second);
   await backend.set(paths.keychainService, ACCOUNT, outgoing);

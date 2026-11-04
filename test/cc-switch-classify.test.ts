@@ -32,12 +32,9 @@ async function fixture(options: {
   mkdirSync(paths.configHome, { recursive: true });
   const backend = new MockKeychain();
   const slots = new ClaudeSlots({ backend, repository: new InMemoryClaudeSlotRepository(), stashDir: join(root, 'unclaimed'), now: () => NOW });
-  const [accountA, accountB] = twoSlotFixture({
-    first: { credential: credential('a') },
-    second: { credential: credential('b') },
-  });
-  await slots.createSlot(accountA);
-  await slots.createSlot(accountB);
+  const [first, second] = twoSlotFixture(credential('a'), credential('b'));
+  await slots.createSlot(first);
+  await slots.createSlot(second);
   await backend.set(paths.keychainService, 'fixture-user', options.live);
   writeFileSync(paths.globalConfigPath, `${JSON.stringify({ oauthAccount: { accountUuid: 'account-a' } })}\n`);
 
@@ -70,7 +67,7 @@ async function fixture(options: {
     stashTimestamp: () => 'k9-unclaimed',
     injectFailStep: options.injectFailStep,
   };
-  return { backend, slots, paths, deps, accountA, accountB, rows, relogins, commits, active: () => active, input: { to: 'account-b', trigger: 'manual', probeVerdict: options.probeVerdict } };
+  return { backend, slots, paths, deps, rows, relogins, commits, active: () => active, input: { to: 'account-b', trigger: 'manual', probeVerdict: options.probeVerdict } };
 }
 
 async function slotCredentials(subject: Awaited<ReturnType<typeof fixture>>) {

@@ -97,10 +97,7 @@ async function fixture(
       const repository = SqliteClaudeSlotRepository.open(commandStore.dbPath);
       const slots = new ClaudeSlots({ backend, repository, stashDir: join(root, 'unclaimed'), now: () => NOW });
       try {
-        const [first, second] = twoSlotFixture({
-          first: { credential: outgoing },
-          second: { credential: credential('b') },
-        });
+        const [first, second] = twoSlotFixture(outgoing, credential('b'));
         await slots.createSlot(first);
         await slots.createSlot(second);
         return {
