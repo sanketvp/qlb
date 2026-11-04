@@ -151,17 +151,25 @@ describe('Claude switch credential lock timing (K5-7 / AC3)', () => {
     let mostInside = 0;
     let waiterAcquired = false;
     let switchAcquired = false;
-    t.after(() => {
+    t.after(async () => {
       releaseSwitch?.();
       releaseWaiterAfterRetake?.();
       releaseBothStaleStats?.();
       releaseSwitchEntered?.();
+      let settleTimer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          Promise.allSettled([switchRun, waiterRun]),
+          new Promise<void>((resolve) => { settleTimer = setTimeout(resolve, 5_000); }),
+        ]);
+      } finally {
+        clearTimeout(settleTimer);
+      }
       fsPromises.mkdir = originalMkdir;
       fsPromises.rmdir = originalRmdir;
       fsPromises.stat = originalStat;
       subject.store.close();
       rmSync(subject.root, { recursive: true, force: true });
-      void Promise.allSettled([switchRun, waiterRun]);
     });
     try {
       stale(subject.lockPaths.oauthRefreshLockDir, 61_000);
