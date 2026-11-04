@@ -61,6 +61,10 @@ function pythonArguments(args: string): string | undefined {
 function isCswapModuleOption(args: string): boolean {
   const moduleOption = /^-([A-Za-z]*)m\s*claude_swap(\.|\s|$)/.exec(args);
   if (moduleOption === null) return false;
+
+  // CPython's interface options make -W and -X consume the rest of their
+  // cluster as their value, so neither can precede -m here.
+  // https://docs.python.org/3/using/cmdline.html#interface-options
   return !/[WX]/.test(moduleOption[1]);
 }
 
@@ -76,6 +80,9 @@ function hasClusteredCswapModule(args: string): boolean {
 function firstPythonScriptIsCswap(args: string): boolean {
   let remaining = pythonArguments(args);
   if (remaining === undefined) return false;
+
+  // Avoid tokenizing paths containing spaces. Check -m before the generic
+  // option skip; the listed value-taking options consume their value.
   let option: RegExpExecArray | null;
   while (true) {
     if (isCswapModuleOption(remaining)) return true;
@@ -89,7 +96,11 @@ function firstPythonScriptIsCswap(args: string): boolean {
 
 function isCswapCommand(args: string): boolean {
   if (args.includes('/claude-swap/')) return true;
+
+  // ps renders arguments as a space-delimited string, so do not split paths
+  // containing spaces. This intentionally over-detects a script argument.
   if (/(^|\/)(cswap|claude-swap)(\s|$)/.test(args)) return true;
+
   const hasPythonInterpreter = pythonArguments(args) !== undefined;
   const hasCswapModule = /(^|\s)-m\s*claude_swap(\.|\s|$)/.test(args)
     || hasClusteredCswapModule(args);
@@ -99,6 +110,9 @@ function isCswapCommand(args: string): boolean {
 function strictFirstPythonScriptIsCswap(args: string): boolean {
   let remaining = pythonArguments(args);
   if (remaining === undefined) return false;
+
+  // Match the liveness classifier's option handling, but inspect only the
+  // first script token. A later argument named cswap is never a signal target.
   let option: RegExpExecArray | null;
   while (true) {
     if (isCswapModuleOption(remaining)) return true;
@@ -118,7 +132,13 @@ function executableToken(args: string): string {
 /** A positive, argv-position-aware classifier for processes safe to signal. */
 export function isCswapCommandToSignal(args: string): boolean {
   const executable = executableToken(args);
+  // Exact basename only: a /claude-swap/ install directory can hold other
+  // executables (its venv python, helpers) that must never be signalled.
   if (/(^|\/)(cswap|claude-swap)$/.test(executable)) return true;
+
+  // pythonArguments is deliberately also used here so interpreter recognition
+  // stays consistent with the liveness guard. Requiring it on argv[0] avoids
+  // mistaking a later argument or script path for the interpreter.
   return pythonArguments(executable) !== undefined && strictFirstPythonScriptIsCswap(args);
 }
 
@@ -164,12 +184,20 @@ async function listCswapProcessesMatchingAsync(opts: CswapProcessAsyncOptions, m
   }
 }
 
-/** List running C-swap processes without retaining their command lines. */
+/**
+ * List running C-swap processes without retaining their command lines.
+ * Callers MUST treat a CswapProcessCheckError as "C-swap may be alive" and
+ * refuse the guarded operation.
+ */
 export function listCswapProcesses(opts: CswapProcessOptions = {}): CswapProcess[] {
   return listCswapProcessesMatching(opts, isCswapCommand);
 }
 
-/** Async equivalent of listCswapProcesses, with the same classifiers and errors. */
+/**
+ * Async equivalent of listCswapProcesses, with the same classifiers and errors.
+ * Callers MUST treat a CswapProcessCheckError as "C-swap may be alive" and
+ * refuse the guarded operation.
+ */
 export function listCswapProcessesAsync(opts: CswapProcessAsyncOptions = {}): Promise<CswapProcess[]> {
   return listCswapProcessesMatchingAsync(opts, isCswapCommand);
 }
@@ -179,7 +207,11 @@ export function listCswapProcessesToSignal(opts: CswapProcessOptions = {}): Cswa
   return listCswapProcessesMatching(opts, isCswapCommandToSignal);
 }
 
-/** Async equivalent of listCswapProcessesToSignal, with the same classifiers and errors. */
+/**
+ * Async equivalent of listCswapProcessesToSignal, with the same classifiers and errors.
+ * Callers MUST treat a CswapProcessCheckError as "C-swap may be alive" and
+ * refuse the guarded operation.
+ */
 export function listCswapProcessesToSignalAsync(opts: CswapProcessAsyncOptions = {}): Promise<CswapProcess[]> {
   return listCswapProcessesMatchingAsync(opts, isCswapCommandToSignal);
 }

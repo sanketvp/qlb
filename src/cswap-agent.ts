@@ -205,7 +205,7 @@ async function acquireAllLocks(options: CswapDrainOptions, paths: string[], dead
       const lost = lostLease(locks, paths);
       if (lost !== undefined) {
         const releaseFailure = await releaseAll(locks, paths);
-        return releaseFailure === undefined ? leaseLostResult(lost) : releaseUnconfirmedResult(releaseFailure);
+        return releaseFailure === undefined ? leaseLostResult(lost) : releaseUnconfirmedResult(releaseFailure, leaseLostResult(lost));
       }
       return locks;
     }

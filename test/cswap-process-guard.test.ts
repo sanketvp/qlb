@@ -151,12 +151,35 @@ test('strict signal lister throws CswapProcessCheckError when ps returns an empt
 });
 
 test('async scans classify, time out and fail closed like the sync scans', async () => {
-  const fixture = ' 101 /usr/local/bin/cswap auto\n 102 node /tmp/nope';
-  assert.deepEqual(await listCswapProcessesAsync({ platform: supportedPlatform, runPs: async () => fixture }), [{ pid: 101 }]);
-  assert.deepEqual(await listCswapProcessesToSignalAsync({ platform: supportedPlatform, runPs: async () => fixture }), [{ pid: 101 }]);
-  await assert.rejects(
-    listCswapProcessesAsync({ platform: supportedPlatform, runPs: async () => { throw Object.assign(new Error('timeout'), { code: 'ETIMEDOUT' }); } }),
+  const fixture = [
+    ' 101 /usr/local/bin/cswap',
+    ' 102 claude-swap --daemon',
+    ' 103 python3 /opt/claude-swap/bin/cswap',
+    ' 104 python3 -m claude_swap.daemon',
+    ' 201 python3 worker.py /tmp/cswap',
+    ' 202 vim /tmp/cswap',
+    ' 203 tail -f ~/cswap',
+    ' 204 python3 -u worker.py cswap',
+    ' 205 /opt/claude-swap/bin/python /srv/unrelated.py',
+    ' 206 /opt/claude-swap/bin/worker',
+  ].join('\n');
+  const syncLiveness = listCswapProcesses({ platform: supportedPlatform, runPs: () => fixture });
+  const syncTargets = listCswapProcessesToSignal({ platform: supportedPlatform, runPs: () => fixture });
+  assert.deepEqual(await listCswapProcessesAsync({ platform: supportedPlatform, runPs: async () => fixture }), syncLiveness);
+  assert.deepEqual(await listCswapProcessesToSignalAsync({ platform: supportedPlatform, runPs: async () => fixture }), syncTargets);
+
+  const timedOut = () => { throw Object.assign(new Error('timeout'), { code: 'ETIMEDOUT' }); };
+  assert.throws(
+    () => listCswapProcesses({ platform: supportedPlatform, runPs: timedOut }),
     (error: Error) => error instanceof CswapProcessCheckError && error.message === 'failed to inspect the process table',
+  );
+  await assert.rejects(
+    listCswapProcessesAsync({ platform: supportedPlatform, runPs: async () => timedOut() }),
+    (error: Error) => error instanceof CswapProcessCheckError && error.message === 'failed to inspect the process table',
+  );
+  assert.throws(
+    () => listCswapProcessesToSignal({ platform: supportedPlatform, runPs: () => '' }),
+    (error: Error) => error instanceof CswapProcessCheckError && error.message === 'process table was empty',
   );
   await assert.rejects(
     listCswapProcessesToSignalAsync({ platform: supportedPlatform, runPs: async () => '' }),

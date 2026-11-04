@@ -4,7 +4,7 @@ import { EventEmitter } from 'node:events';
 import test from 'node:test';
 
 import { cooperativeDrain as runCooperativeDrain, FLOCK_HELPER, launchctlCswapAgent, productionTryAcquireLock, runRetirementDrain, type CswapAgent, type CswapDrainOptions, type LaunchctlCswapAgentDependencies } from '../src/cswap-agent';
-import { listCswapProcesses, listCswapProcessesToSignal } from '../src/cswap-processes';
+import { listCswapProcesses, listCswapProcessesAsync, listCswapProcessesToSignal, listCswapProcessesToSignalAsync } from '../src/cswap-processes';
 import { cutoverBegin } from '../src/commands/cutover';
 import { phase } from '../src/lifecycle';
 import { openStore } from '../src/store';
@@ -461,7 +461,9 @@ test('signals immediately after the final sweep with no intervening scan', async
     assert.deepEqual(result, { ok: true });
     assert.ok(order.lastIndexOf('pings', kill) < order.lastIndexOf('targets', kill), 'pings must precede target identity');
     assert.ok(order.lastIndexOf('targets', kill) < order.lastIndexOf('sweep', kill), 'target identity must precede the final sweep');
-    assert.ok(order.lastIndexOf('sweep', kill) < kill, 'the final lease sweep must precede SIGTERM');
+    const finalSweep = order.lastIndexOf('sweep', kill);
+    assert.ok(finalSweep < kill, 'the final lease sweep must precede SIGTERM');
+    assert.equal(order.slice(finalSweep + 1, kill).some((event) => event === 'processes' || event === 'targets'), false, 'no lister call may fall between the final sweep and SIGTERM');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -617,6 +619,20 @@ test('fails closed when releasing a partial acquisition times out', async () => 
   assert.deepEqual(kills, []);
 });
 
+test('step 3b release failure after a lease loss keeps the lease-lost code', async () => {
+  const first = Object.assign(() => {}, { releaseTimedOut: () => new Error('first release timed out') });
+  const second = Object.assign(() => {}, { isLost: () => new Error('second helper exited') });
+  const result = await cooperativeDrain({
+    listProcesses: () => [{ pid: 66 }], listSignalTargets: () => [{ pid: 66 }], lockPaths: () => ['first.lock', 'second.lock'],
+    tryAcquireLock: (path) => path === 'first.lock' ? first : second,
+    kill: () => { throw new Error('must not signal after a 3b lease loss'); }, now: () => 0, sleep: async () => {}, cooperativeWaitMs: 0,
+  });
+  assert.deepEqual(result, {
+    ok: false,
+    code: 'cswap-drain-error lease-release-unconfirmed first.lock: first release timed out; after cswap-drain-error lease-lost second.lock: second helper exited',
+  });
+});
+
 test('a lock path replaced during the per-target strict scan fails closed before SIGTERM', async () => {
   const root = mkdtempSync(join(tmpdir(), 'qlb-final-sweep-scan-'));
   const lock = join(root, 'auto.lock');
@@ -624,16 +640,25 @@ test('a lock path replaced during the per-target strict scan fails closed before
   writeFileSync(lock, 'original');
   const inode = lstatSync(lock).ino;
   const kills: number[] = [];
+  let targetCalls = 0;
+  let confirmations = 0;
   try {
     const result = await cooperativeDrain({
       listProcesses: () => [{ pid: 70 }],
-      listSignalTargets: (() => { let calls = 0; return () => {
-        if (++calls === 2) { writeFileSync(replacement, 'replacement'); renameSync(replacement, lock); }
+      listSignalTargets: () => {
+        targetCalls += 1;
+        if (targetCalls === 2) {
+          assert.equal(confirmations, 1, 'the leaseIntact inode check must pass before the per-target scan');
+          assert.equal(lstatSync(lock).ino, inode, 'the original inode must still be present before replacement');
+          writeFileSync(replacement, 'replacement');
+          renameSync(replacement, lock);
+        }
         return [{ pid: 70 }];
-      }; })(),
-      lockPaths: () => [lock], tryAcquireLock: () => Object.assign(() => {}, { confirmHeld: async () => inode }),
+      },
+      lockPaths: () => [lock], tryAcquireLock: () => Object.assign(() => {}, { confirmHeld: async () => { confirmations += 1; return inode; } }),
       kill: (pid) => { kills.push(pid); }, now: () => 0, sleep: async () => {}, cooperativeWaitMs: 0, termWaitMs: 0,
     });
+    assert.equal(targetCalls, 2, 'the per-target strict scan must be reached');
     assert.match(result.code ?? '', new RegExp(`lease-lost ${lock}`));
     assert.deepEqual(kills, []);
   } finally { rmSync(root, { recursive: true, force: true }); }
@@ -681,6 +706,33 @@ test('an empty survivor set under two locks fails closed when the first lock is 
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test('step 8 finalSweep catches a first lock replaced during the second final ping', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'qlb-step-8-final-sweep-'));
+  const firstPath = join(root, 'first.lock'); const secondPath = join(root, 'second.lock'); const replacement = join(root, 'replacement.lock');
+  writeFileSync(firstPath, 'first'); writeFileSync(secondPath, 'second');
+  const firstInode = lstatSync(firstPath).ino; const secondInode = lstatSync(secondPath).ino;
+  const first = Object.assign(() => {}, { confirmHeld: async () => firstInode });
+  let secondPings = 0;
+  const second = Object.assign(() => {}, { confirmHeld: async () => {
+    secondPings += 1;
+    if (secondPings === 3) { writeFileSync(replacement, 'replacement'); renameSync(replacement, firstPath); }
+    return secondInode;
+  } });
+  let now = 0;
+  const kills: number[] = [];
+  try {
+    const result = await cooperativeDrain({
+      listProcesses: (() => { let lists = 0; return () => ++lists <= 2 ? [{ pid: 73 }] : []; })(),
+      listSignalTargets: () => [{ pid: 73 }], lockPaths: () => [firstPath, secondPath],
+      tryAcquireLock: (path) => path === firstPath ? first : second,
+      kill: (pid) => { kills.push(pid); }, now: () => now, sleep: async () => { now += 1; }, cooperativeWaitMs: 0, termWaitMs: 1, pollMs: 1,
+    });
+    assert.equal(secondPings, 3, 'replacement must occur only during the step-8 lease check');
+    assert.deepEqual(kills, [73]);
+    assert.match(result.code ?? '', new RegExp(`lease-lost ${firstPath}`));
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test('refuses before any SIGTERM when one of several survivors is absent from the strict preflight', async () => {
   const kills: number[] = []; let postLockLists = 0;
   const result = await cooperativeDrain({ listProcesses: () => { postLockLists += 1; return [{ pid: 74 }, { pid: 75 }]; }, listSignalTargets: () => [{ pid: 74 }], lockPaths: () => ['a'], tryAcquireLock: () => () => {}, kill: (pid) => { kills.push(pid); }, now: () => 0, sleep: async () => {}, cooperativeWaitMs: 0 });
@@ -688,12 +740,36 @@ test('refuses before any SIGTERM when one of several survivors is absent from th
 });
 
 test('a helper exit queued during the per-target scan is seen before SIGTERM', async () => {
-  const root = mkdtempSync(join(tmpdir(), 'qlb-queued-exit-')); const lock = join(root, 'auto.lock'); writeFileSync(lock, 'lock');
-  let lost: Error | undefined; let targetCalls = 0; const kills: number[] = [];
-  const lease = Object.assign(() => {}, { confirmHeld: async () => lstatSync(lock).ino, isLost: () => lost });
+  const root = mkdtempSync(join(tmpdir(), 'qlb-queued-exit-'));
+  const lock = join(root, 'auto.lock');
+  writeFileSync(lock, 'lock');
+  const inode = lstatSync(lock).ino;
+  const helper = fakeFlockHelper();
+  const acquisition = productionTryAcquireLock(lock, () => helper.child);
+  helper.stdout.emit('data', Buffer.from('locked\n'));
+  const lease = await acquisition;
+  if (lease === null || helper.child.stdin === null) throw new Error('expected a production-style lease with stdin');
+  const stdin = helper.child.stdin as unknown as { write(chunk: string, callback?: (error?: Error | null) => void): boolean };
+  stdin.write = (chunk, callback) => {
+    callback?.();
+    const sequence = /^p ([0-9]+)\n$/.exec(chunk)?.[1];
+    if (sequence !== undefined) setImmediate(() => helper.stdout.emit('data', Buffer.from(`held ${sequence} ${inode}\n`)));
+    return true;
+  };
+  let targetCalls = 0;
+  const kills: number[] = [];
   try {
-    const result = await cooperativeDrain({ listProcesses: () => [{ pid: 76 }], listSignalTargets: () => { if (++targetCalls === 2) setImmediate(() => { lost = new Error('helper exited'); }); return [{ pid: 76 }]; }, lockPaths: () => [lock], tryAcquireLock: () => lease, kill: (pid) => { kills.push(pid); }, now: () => 0, sleep: async () => {}, cooperativeWaitMs: 0, termWaitMs: 0 });
-    assert.match(result.code ?? '', /lease-lost .*helper exited/); assert.deepEqual(kills, []);
+    const result = await cooperativeDrain({
+      listProcesses: () => [{ pid: 76 }],
+      listSignalTargets: () => {
+        if (++targetCalls === 2) setImmediate(() => helper.exit(17, null));
+        return [{ pid: 76 }];
+      },
+      lockPaths: () => [lock], tryAcquireLock: () => lease,
+      kill: (pid) => { kills.push(pid); }, now: () => 0, sleep: async () => {}, cooperativeWaitMs: 0, termWaitMs: 0,
+    });
+    assert.match(result.code ?? '', /lease-lost .*flock helper exited unexpectedly \(17\)/);
+    assert.deepEqual(kills, []);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -715,11 +791,51 @@ test('an injected requireConfirmHeld refuses a lease without confirmHeld as leas
   const result = await agent.drain(); assert.match(result.code ?? '', /lease-lost .*no confirmHeld/); assert.deepEqual(kills, []);
 });
 
-test('the production factory supplies requireConfirmHeld true', () => {
+test('requireConfirmHeld refuses a lease without confirmHeld at step 4', async () => {
+  let lists = 0;
+  const result = await cooperativeDrain({
+    listProcesses: () => ++lists === 1 ? [{ pid: 79 }] : [], listSignalTargets: () => [], lockPaths: () => ['a'],
+    tryAcquireLock: () => () => {}, kill: () => { throw new Error('must not signal'); }, now: () => 0, sleep: async () => {},
+    cooperativeWaitMs: 0, requireConfirmHeld: true,
+  });
+  assert.deepEqual(result, { ok: false, code: 'cswap-drain-error lease-lost a: no confirmHeld' });
+});
+
+test('requireConfirmHeld refuses a lease without confirmHeld at step 8', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'qlb-require-confirm-final-'));
+  const lock = join(root, 'auto.lock');
+  writeFileSync(lock, 'locked');
+  const inode = lstatSync(lock).ino;
+  const lease: (() => void) & { confirmHeld?: () => Promise<number> } = () => {};
+  lease.confirmHeld = async () => inode;
+  let now = 0;
+  let processCalls = 0;
+  const kills: number[] = [];
+  try {
+    const result = await cooperativeDrain({
+      listProcesses: () => {
+        processCalls += 1;
+        if (processCalls <= 2) return [{ pid: 79 }];
+        delete lease.confirmHeld;
+        return [];
+      },
+      listSignalTargets: () => [{ pid: 79 }], lockPaths: () => [lock], tryAcquireLock: () => lease,
+      kill: (pid) => { kills.push(pid); }, now: () => now, sleep: async () => { now += 1; },
+      cooperativeWaitMs: 0, termWaitMs: 1, pollMs: 1, requireConfirmHeld: true,
+    });
+    assert.equal(processCalls, 3, 'the missing confirmHeld must be introduced after the step-7 check');
+    assert.deepEqual(kills, [79]);
+    assert.deepEqual(result, { ok: false, code: `cswap-drain-error lease-lost ${lock}: no confirmHeld` });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('the production factory supplies requireConfirmHeld true and async process scans', () => {
   let captured: LaunchctlCswapAgentDependencies | undefined;
   const { productionLaunchctlCswapAgent } = require('../src/cswap-agent') as typeof import('../src/cswap-agent');
   productionLaunchctlCswapAgent('/fixture', '/fixture', undefined, (deps) => { captured = deps; return unavailableAgent; });
   assert.equal(captured?.requireConfirmHeld, true);
+  assert.equal(captured?.listProcesses, listCswapProcessesAsync);
+  assert.equal(captured?.listSignalTargets, listCswapProcessesToSignalAsync);
 });
 
 const unavailableAgent: CswapAgent = { bootout: () => ({ ok: true }), disable: () => ({ ok: true }), movePlist: () => ({ ok: true }), restorePlist: () => ({ ok: true }), drain: () => ({ ok: true }) };
