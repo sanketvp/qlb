@@ -105,14 +105,14 @@ function pollingState(slots: ReturnType<ClaudeSlots['listSlots']>, polls: Record
   ]));
 }
 
-export function freshAnthropicAccounts(slots: ReturnType<ClaudeSlots['listSlots']>, store: Store, polls: Record<string, UsagePollRow>, nowS: number, models: readonly string[], unknownThisTick = new Set<string>()): AutoswitchAccount[] {
+export function freshAnthropicAccounts(slots: ReturnType<ClaudeSlots['listSlots']>, store: Store, polls: Record<string, UsagePollRow>, nowS: number, models: readonly string[]): AutoswitchAccount[] {
   const configuredModels = new Set(models.map((model) => model.toLowerCase()));
   const scopedEnabled = configuredModels.size > 0;
   const allScoped = configuredModels.has('all');
   return slots.filter((slot) => slot.archivedAt == null).map((slot) => {
     const row = polls[slot.accountId];
     const snapshot = store.getAllSnapshots(slot.accountId);
-    const trusted = unknownThisTick.has(slot.accountId) ? {} : projectAnthropicUsageReadings(
+    const trusted = projectAnthropicUsageReadings(
       snapshot, row, nowS,
       (label) => !label.startsWith('7d:') || (scopedEnabled && (allScoped || configuredModels.has(label.slice(3).toLowerCase()))),
     );
@@ -140,7 +140,6 @@ export async function pollAnthropic(deps: AnthropicPollDeps): Promise<Autoswitch
   const activeId = deps.store.getActiveLogin(PROVIDER)?.accountId ?? null;
   const polls = pollingState(slots, deps.store.listUsagePolls(PROVIDER));
   const settings = deps.store.getAutoswitchSettings();
-  const unknownThisTick = new Set<string>();
   const models = deps.models ?? [];
 
   const record = (accountId: string, previous: Usage | null, next: Usage | null, success: Record<string, BucketReading> | undefined, status: string, isActive: boolean, http429 = false, retryAfterS?: number): void => {
@@ -179,7 +178,7 @@ export async function pollAnthropic(deps: AnthropicPollDeps): Promise<Autoswitch
       // A switch can commit while the usage request is in flight. The reading
       // has no safe owner then, so leave both accounts' poll rows untouched.
       if (deps.store.getActiveLogin(PROVIDER)?.accountId !== activeId) {
-        return freshAnthropicAccounts(deps.slots.listSlots(), deps.store, pollingState(deps.slots.listSlots(), deps.store.listUsagePolls(PROVIDER)), nowS, models, unknownThisTick);
+        return freshAnthropicAccounts(deps.slots.listSlots(), deps.store, pollingState(deps.slots.listSlots(), deps.store.listUsagePolls(PROVIDER)), nowS, models);
       }
       if (result.usage && typeof result.usage === 'object' && 'buckets' in result.usage) {
         const lineage = result.servedLineage ?? null;
@@ -269,7 +268,7 @@ export async function pollAnthropic(deps: AnthropicPollDeps): Promise<Autoswitch
       }
     }
   }
-  return freshAnthropicAccounts(deps.slots.listSlots(), deps.store, pollingState(deps.slots.listSlots(), deps.store.listUsagePolls(PROVIDER)), nowS, models, unknownThisTick);
+  return freshAnthropicAccounts(deps.slots.listSlots(), deps.store, pollingState(deps.slots.listSlots(), deps.store.listUsagePolls(PROVIDER)), nowS, models);
 }
 
 export interface AnthropicTickDeps {
