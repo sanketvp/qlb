@@ -72,6 +72,8 @@ import { claudeLoginExpiryCheck } from './checks/claude-login-expiry';
 import { claudeOauthClientCheck } from './checks/claude-oauth-client';
 import { claudeSlotsCheck } from './checks/claude-slots';
 import { claudeSwitchJournalCheck } from './checks/claude-switch-journal';
+import { journalInProgressCheck } from './checks/journal-in-progress';
+import { journalOrphanedCheck } from './checks/journal-orphaned';
 import { codexSlotsCheck } from './checks/codex-slots';
 import { codexFirstSwitchCheck } from './checks/codex-first-switch';
 import { undoIncompleteCheck } from './checks/undo-incomplete';
@@ -847,6 +849,8 @@ export async function doctorQlb(
 
   const phase = lifecycle.phase;
   checks.push(await claudeSwitchJournalCheck(config.dbPath, phase));
+  checks.push(await journalInProgressCheck(config.dbPath, phase));
+  checks.push(journalOrphanedCheck(config.dbPath, phase));
   checks.push(
     claudeConfigPathCheck(),
     claudeConfigFileCheck(),

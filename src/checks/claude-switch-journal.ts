@@ -30,7 +30,7 @@ function journalOptions(options: ClaudeSwitchJournalCheckOptions): ClaudeSwitchJ
   return { configPath: paths.globalConfigPath, keychainService: paths.keychainService };
 }
 
-function isCommitted(dbPath: string, attemptId: string): boolean {
+export function isClaudeSwitchJournalCommitted(dbPath: string, attemptId: string): boolean {
   const db = openStoreConnection(dbPath, true);
   try {
     return db.prepare(`SELECT 1
@@ -66,7 +66,7 @@ export async function claudeSwitchJournalCheck(
   if (read.state === 'malformed') return { name: 'claude:switch-journal', level: 'FAIL', message: 'malformed' };
 
   try {
-    if (read.journal.committed !== undefined || read.journal.closed !== null || isCommitted(dbPath, read.journal.attemptId)) {
+    if (read.journal.committed !== undefined || read.journal.closed !== null || isClaudeSwitchJournalCommitted(dbPath, read.journal.attemptId)) {
       return { name: 'claude:switch-journal', level: 'PASS', message: 'finished' };
     }
     const ownerIsLive = options.ownerIsLive ?? stillTheSameProcess;
