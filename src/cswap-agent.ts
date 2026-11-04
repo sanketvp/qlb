@@ -10,6 +10,15 @@ export interface CswapAgentResult {
   code?: string;
 }
 
+export class FlockHelperExitedError extends Error {
+  readonly code = 'flock-helper-exited' as const;
+
+  constructor(detail: string | number) {
+    super(`fcntl flock helper exited unexpectedly (${detail})`);
+    this.name = 'FlockHelperExitedError';
+  }
+}
+
 export interface CswapProcess {
   pid: number;
 }
@@ -616,11 +625,11 @@ export function productionTryAcquireLock(path: string, startHelper: FlockHelperS
       confirmationQueue = confirmation.then(() => undefined, () => undefined);
       return confirmation;
     };
-    const unexpectedExit = (code: number | null, signal: NodeJS.Signals | null): Error =>
-      new Error(`fcntl flock helper exited unexpectedly (${code ?? signal ?? 'unknown'})`);
+    const unexpectedExit = (code: number | null, signal: NodeJS.Signals | null): FlockHelperExitedError =>
+      new FlockHelperExitedError(code ?? signal ?? 'unknown');
     const closed = new Promise<void>((resolveClose, rejectClose) => {
       child.once('error', (error) => {
-        if (state === 'locked') markLost(new Error(`fcntl flock helper exited unexpectedly (${error.message})`));
+        if (state === 'locked') markLost(new FlockHelperExitedError(error.message));
         completeConfirmation(undefined);
         rejectClose(error);
       });

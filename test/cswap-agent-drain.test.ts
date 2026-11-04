@@ -3,7 +3,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import test from 'node:test';
 
-import { cooperativeDrain as runCooperativeDrain, FLOCK_HELPER, launchctlCswapAgent, productionTryAcquireLock, runRetirementDrain, type CswapAgent, type CswapDrainOptions, type LaunchctlCswapAgentDependencies } from '../src/cswap-agent';
+import { cooperativeDrain as runCooperativeDrain, FLOCK_HELPER, FlockHelperExitedError, launchctlCswapAgent, productionTryAcquireLock, runRetirementDrain, type CswapAgent, type CswapDrainOptions, type LaunchctlCswapAgentDependencies } from '../src/cswap-agent';
 import { listCswapProcesses, listCswapProcessesAsync, listCswapProcessesToSignal, listCswapProcessesToSignalAsync } from '../src/cswap-processes';
 import { cutoverBegin } from '../src/commands/cutover';
 import { phase } from '../src/lifecycle';
@@ -119,7 +119,7 @@ test('production flock rejects a buffered locked result from an exited helper', 
   assert.equal(protectedWorkRan, false, 'an exited helper must not permit protected work');
 });
 
-test('production flock records loss when the helper exits before release and closes later', async () => {
+test('helper loss is reported with code flock-helper-exited', async () => {
   const helper = fakeFlockHelper();
   const acquisition = productionTryAcquireLock('/fixture/auto.lock', () => helper.child);
   helper.stdout.emit('data', Buffer.from('locked\n'));
@@ -129,9 +129,13 @@ test('production flock records loss when the helper exits before release and clo
   helper.exit(17, null);
   const observed = lease.isLost?.();
   assert.ok(observed, 'helper exit before release must report a lost lease');
+  assert.ok(observed instanceof FlockHelperExitedError);
+  assert.equal(observed.code, 'flock-helper-exited');
   await lease();
   helper.close(17, null);
   const lost = await lease.lost;
+  assert.ok(lost instanceof FlockHelperExitedError);
+  assert.equal(lost.code, 'flock-helper-exited');
   assert.match(lost.message, /flock helper exited unexpectedly/);
   assert.equal(observed, lost);
 });

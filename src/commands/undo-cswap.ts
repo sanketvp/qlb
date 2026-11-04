@@ -164,15 +164,13 @@ export async function defaultHeldLocks(
     if (name === 'auto.lock') {
       // flock ownership, rather than the persistent lock-file's existence,
       // determines whether the auto tick is still running.
-      let release;
       try {
-        release = await tryAcquireLock(path);
-      } catch (error) {
-        if (error instanceof Error && error.message.startsWith('fcntl flock helper exited unexpectedly')) continue;
-        throw error;
+        const release = await tryAcquireLock(path);
+        if (release === null) held.push(name);
+        else await release();
+      } catch {
+        held.push(name);
       }
-      if (release === null) held.push(name);
-      else await release();
     } else if (/^(?:consume|switch)-.*\.lock$/.test(name)) {
       try {
         // proper-lockfile directories left by a dead owner are stale after
