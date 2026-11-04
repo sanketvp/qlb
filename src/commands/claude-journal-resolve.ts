@@ -1,0 +1,59 @@
+import { randomUUID } from 'node:crypto';
+
+import { makeProductionSwitchDeps, type SwitchResources } from './switch-anthropic';
+import type { ClaudeSwitchDeps } from '../cc-switch';
+import { resolveClaudeSwitchJournal, type ClaudeJournalResolveDirection } from '../journal';
+import { assertAdmitted } from '../lifecycle';
+import type { CommandContext, CommandDefinition } from '../registry';
+import { openStore, type Store } from '../store';
+
+export interface ClaudeJournalResolveCommandDeps {
+  openStore?: typeof openStore;
+  assertAdmitted?: typeof assertAdmitted;
+  makeSwitchDeps?: (ctx: CommandContext, store: Store, warn: (message: string) => void) => Promise<SwitchResources | ClaudeSwitchDeps>;
+  resolve?: typeof resolveClaudeSwitchJournal;
+  randomUUID?: () => string;
+}
+
+function parse(args: string[]): ClaudeJournalResolveDirection | null {
+  return args.length === 1 && args[0] === '--forward' ? 'forward'
+    : args.length === 1 && args[0] === '--back' ? 'back' : null;
+}
+
+/** `qlb claude journal resolve --forward|--back` resolves a dead switch owner. */
+export function createClaudeJournalResolveCommand(deps: ClaudeJournalResolveCommandDeps = {}): CommandDefinition {
+  return {
+    name: 'claude journal resolve',
+    async execute(args: string[], ctx: CommandContext): Promise<number> {
+      const direction = parse(args);
+      if (direction === null) {
+        ctx.stderr('usage: qlb claude journal resolve --forward|--back');
+        return 2;
+      }
+      const store = (deps.openStore ?? openStore)(ctx.config.dbPath);
+      let resources: SwitchResources | undefined;
+      try {
+        const admission = (deps.assertAdmitted ?? assertAdmitted)(store, 'claude-journal-resolve');
+        if (!admission.ok) {
+          ctx.stderr(`qlb claude journal resolve: refused: ${admission.code}`);
+          return 3;
+        }
+        const built = await (deps.makeSwitchDeps ?? ((commandCtx, commandStore, warn) =>
+          makeProductionSwitchDeps({ randomUUID: deps.randomUUID ?? randomUUID }, commandCtx, commandStore, warn)))(ctx, store, () => {});
+        resources = 'deps' in built ? built : { deps: built };
+        const result = await (deps.resolve ?? resolveClaudeSwitchJournal)(resources.deps, direction);
+        if (result.outcome === 'refused') {
+          ctx.stderr(`qlb claude journal resolve: refused: ${result.reason}`);
+          return 3;
+        }
+        ctx.stdout(`Claude journal resolved ${direction}${result.fingerprints?.length ? ` (${result.fingerprints.join(', ')})` : ''}`);
+        return 0;
+      } finally {
+        try { resources?.close?.(); } finally { store.close(); }
+      }
+    },
+  };
+}
+
+const command = createClaudeJournalResolveCommand();
+export default command;
