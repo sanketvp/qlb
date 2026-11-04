@@ -7,7 +7,8 @@ import { describe, it } from 'node:test';
 
 import { buildUsageRequest } from '../src/anthropic-oauth';
 import { AUTO_BINDINGS, anthropicModelScope, autoReconcileStillTheSameProcess, productionRequest, runAuto } from '../src/auto';
-import { anthropicTick, type AnthropicTickResult } from '../src/auto/anthropic';
+import { anthropicTick, pollAnthropic, type AnthropicTickResult } from '../src/auto/anthropic';
+import * as autoAnthropicModule from '../src/auto/anthropic';
 import { claudePaths } from '../src/cc-paths';
 import { type ClaudeSwitchDeps } from '../src/cc-switch';
 import { createClaudeSwitchJournal, type ClaudeSwitchJournal } from '../src/cc-switch-journal';
@@ -38,14 +39,14 @@ function liveBinding(overrides: Partial<{
 
 const AUTO_NOW = 1_000_000;
 
-function weeklyUsageFixture(fablePct: number, modelConfig: string | null = null) {
+function weeklyUsageFixture(fablePct: number, modelConfig: string | null = null, nextFablePct = 10, fallbackFablePct?: number) {
   const root = mkdtempSync(join(tmpdir(), 'qlb-auto-model-scope-'));
   const home = join(root, 'home');
   const config = defaultConfig(home);
   const store = openStore(config.dbPath);
   beginCutover(store, 1);
   assert.equal(transition(store, 'cutover', 2).ok, true);
-  const slots: ClaudeSlot[] = ['active', 'next'].map((accountId, index) => ({
+  const slots: ClaudeSlot[] = ['active', 'next', ...(fallbackFablePct === undefined ? [] : ['fallback'])].map((accountId, index) => ({
     accountId, slotNum: index + 1, email: null, alias: null, orgUuid: null, configJson: '{}', fingerprint: null,
     prevFingerprint: null, threshold: null, dead: false, deadReason: null, deadAt: null, healedAt: null,
     addedAt: AUTO_NOW, lastActiveAt: null, source: 'fixture', archivedAt: null,
@@ -54,9 +55,10 @@ function weeklyUsageFixture(fablePct: number, modelConfig: string | null = null)
   try { for (const slot of slots) repository.createSlot(slot); } finally { repository.close(); }
   store.setActiveLogin('anthropic', 'active', 'fixture', AUTO_NOW);
   const fetchedAt = Date.now();
-  for (const [accountId, pct] of [['active', fablePct], ['next', 10]] as const) {
-    store.upsertSnapshot(accountId, '7d', { usedPct: accountId === 'active' ? 85 : 10, fetchedAt, source: 'poll', confidence: 'authoritative' });
-    store.upsertSnapshot(accountId, '7d:Fable', { usedPct: pct, fetchedAt, source: 'poll', confidence: 'authoritative' });
+  for (const slot of slots) {
+    const pct = slot.accountId === 'active' ? fablePct : slot.accountId === 'next' ? nextFablePct : fallbackFablePct!;
+    store.upsertSnapshot(slot.accountId, '7d', { usedPct: slot.accountId === 'active' ? 85 : 10, fetchedAt, source: 'poll', confidence: 'authoritative' });
+    store.upsertSnapshot(slot.accountId, '7d:Fable', { usedPct: pct, fetchedAt, source: 'poll', confidence: 'authoritative' });
   }
   if (modelConfig !== null) store.setConfig('auto.anthropic.models', modelConfig);
   return { root, home, config, store, slots };
@@ -157,6 +159,56 @@ describe('auto once failover (G11)', () => {
       assert.equal(receipt.decisions[0]?.kind, 'switch');
       assert.equal(receipt.decisions[0]?.reason, 'proactive');
     } finally {
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it('live binding passes the configured model scope', async () => {
+    const fixture = weeklyUsageFixture(10, ' fAbLe ');
+    const autoAnthropic = autoAnthropicModule as {
+      pollAnthropic: typeof pollAnthropic;
+      anthropicTick: typeof anthropicTick;
+    };
+    const originalPoll = autoAnthropic.pollAnthropic;
+    const originalTick = autoAnthropic.anthropicTick;
+    let pollModels: readonly string[] | undefined;
+    let tickModels: readonly string[] | undefined;
+    try {
+      autoAnthropic.pollAnthropic = async (deps) => {
+        pollModels = deps.models;
+        return [];
+      };
+      autoAnthropic.anthropicTick = async (deps) => {
+        tickModels = deps.models;
+        return { decision };
+      };
+      const output = await runAuto({ once: true }, {
+        config: fixture.config, home: fixture.home,
+        env: { QLB_TEST_MODE: '1', QLB_HOME: fixture.home, HOME: fixture.home }, now: () => AUTO_NOW,
+        listCswapProcesses: () => [], log: () => {},
+      });
+      assert.equal(output.ticks, 1);
+      assert.deepEqual(pollModels, ['fable']);
+      assert.deepEqual(tickModels, ['fable']);
+    } finally {
+      autoAnthropic.pollAnthropic = originalPoll;
+      autoAnthropic.anthropicTick = originalTick;
+      fixture.store.close();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it('exhausted 7d:fable target is not chosen', async () => {
+    const fixture = weeklyUsageFixture(100, 'fable', 100, 10);
+    try {
+      const result = await anthropicTick({
+        store: fixture.store, slots: { listSlots: () => fixture.slots } as unknown as import('../src/cc-slots').ClaudeSlots,
+        now: () => AUTO_NOW, models: anthropicModelScope(fixture.store), dryRun: true,
+      });
+      assert.equal(result.decision.kind, 'switch');
+      assert.equal(result.decision.targetId, 'fallback');
+    } finally {
+      fixture.store.close();
       rmSync(fixture.root, { recursive: true, force: true });
     }
   });
