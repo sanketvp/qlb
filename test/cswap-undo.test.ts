@@ -20,7 +20,7 @@ import {
   transition,
 } from '../src/lifecycle';
 import { recordStash } from '../src/unclaimed-index';
-import { productionTryAcquireLock } from '../src/cswap-agent';
+import { FlockHelperExitedError, productionTryAcquireLock } from '../src/cswap-agent';
 
 const support = join(__dirname, '..', '..', 'test', 'support');
 // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -605,16 +605,76 @@ describe('qlb undo cswap hand-back', () => {
     } finally { close(f); }
   });
 
-  it('treats an exited auto flock probe as not held', async () => {
+  it('an exited auto flock probe counts auto.lock as held and the drain retries', async () => {
     const f = fixture();
     try {
+      beginUndo(f);
+      addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-current', active: true });
       const locks = join(f.home, '.qlb', 'locks');
       mkdirSync(locks, { recursive: true });
       writeFileSync(join(locks, 'auto.lock'), '');
+      const calls: string[] = [];
+      const failures: unknown[] = [
+        new FlockHelperExitedError(17),
+        { code: 'flock-helper-exited' },
+        new Error('generic probe failure'),
+      ];
+      let probes = 0;
 
-      assert.deepEqual(await defaultHeldLocks(f.home, () => 0, async () => {
-        throw new Error('fcntl flock helper exited unexpectedly (17)');
-      }), []);
+      assert.equal(await undo(f, {
+        bootoutQlbAgent: () => { calls.push('bootout'); return { ok: true }; },
+        listHeldLocks: () => defaultHeldLocks(f.home, () => 0, async () => {
+          calls.push(`probe-${++probes}`);
+          const failure = failures.shift();
+          if (failure !== undefined) throw failure;
+          if (probes === 4) return async () => {
+            calls.push('release-failed');
+            throw new Error('generic probe release failure');
+          };
+          return async () => { calls.push('release'); };
+        }),
+        sleep: async (ms) => { calls.push(`sleep-${ms}`); },
+      }), 0);
+      assert.deepEqual(calls, [
+        'bootout',
+        'probe-1', 'sleep-1000',
+        'probe-2', 'sleep-1000',
+        'probe-3', 'sleep-1000',
+        'probe-4', 'release-failed', 'sleep-1000',
+        'probe-5', 'release',
+      ]);
+    } finally { close(f); }
+  });
+
+  it('a drain whose auto.lock probe keeps failing exits 3 naming auto.lock with the fence kept', async () => {
+    const f = fixture();
+    try {
+      beginUndo(f);
+      addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-current', active: true });
+      const locks = join(f.home, '.qlb', 'locks');
+      mkdirSync(locks, { recursive: true });
+      writeFileSync(join(locks, 'auto.lock'), '');
+      f.keychain.writes.length = 0;
+      const calls: string[] = [];
+      let now = 0;
+      let probes = 0;
+
+      assert.equal(await undo(f, {
+        bootoutQlbAgent: () => { calls.push('bootout'); return { ok: true }; },
+        listHeldLocks: () => defaultHeldLocks(f.home, () => now, async () => {
+          calls.push(`probe-${++probes}`);
+          throw new FlockHelperExitedError(17);
+        }),
+        now: () => now,
+        sleep: async (ms) => { calls.push(`sleep-${ms}`); now += ms; },
+      }), 3);
+      assert.equal(calls[0], 'bootout');
+      assert.equal(probes, 61);
+      assert.equal(calls.filter((call) => call === 'sleep-1000').length, 60);
+      assert.match(f.output.at(-1)!, /drain timeout \(locks auto\.lock\)/);
+      assert.equal(f.keychain.writes.length, 0);
+      const store = openStore(f.dbPath);
+      try { assert.equal(phase(store).state, 'undoing'); } finally { store.close(); }
     } finally { close(f); }
   });
 
