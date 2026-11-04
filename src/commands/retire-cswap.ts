@@ -5,7 +5,8 @@ import { basename, dirname, join } from 'node:path';
 import { credentialFingerprint } from '../anthropic-oauth';
 import { productionLaunchctlCswapAgent, runRetirementDrain, type CswapAgent } from '../cswap-agent';
 import { retireCswap, type CswapRetireDependencies, type CswapRetireResult } from '../cswap-retire';
-import { doctorQlb, type DoctorReport } from '../diagnostics';
+import { doctorQlb, s64DoctorVerdict } from '../diagnostics';
+export { s64DoctorVerdict } from '../diagnostics';
 import { qlbHomeDir } from '../home';
 import { withUndoCapability } from '../keychain-allowlist';
 import { listUnclaimedKeychainServices, platformKeychain } from '../keychain';
@@ -44,15 +45,6 @@ function cswapAccounts(sequencePath: string): string[] {
     }
     return `account-${number}-${(entry as { email: string }).email}`;
   });
-}
-
-/** S64 maps the complete production report, not its already-WARN aggregate. */
-export function s64DoctorVerdict(report: DoctorReport): { overall: 'PASS' | 'FAIL'; autoAgent: 'PASS' | 'FAIL' } {
-  const blockingCheck = report.checks.some((check) => check.level === 'FAIL'
-    || (check.level === 'WARN' && check.name !== 'lifecycle:window'));
-  const blockingProvider = report.providers.some((provider) => provider.level === 'FAIL' || provider.level === 'WARN');
-  const autoAgent = report.checks.find((check) => check.name === 'auto:agent')?.level === 'PASS' ? 'PASS' : 'FAIL';
-  return { overall: blockingCheck || blockingProvider ? 'FAIL' : 'PASS', autoAgent };
 }
 
 /** Exported for adapter tests; callers must not invoke effects in test mode. */

@@ -127,6 +127,11 @@ describe('qlb retire cswap (AC22 retire)', () => {
     await refusal('receipt missing', (f) => f.store.setConfig('report.receiptAt', ''), 'report-receipt-missing');
     await refusal('report did not pass', (f) => { f.deps.reportReceiptPasses = () => false; }, 'report-not-pass');
     await refusal('doctor overall', (f) => { f.deps.doctor = async () => ({ overall: 'FAIL', autoAgent: 'PASS' }); }, 'doctor-not-pass');
+    await refusal('pending recovery', (f) => {
+      f.deps.doctor = async () => s64DoctorVerdict({
+        checks: [{ name: 'recovery', level: 'WARN', message: 'reconcile before retirement' }], providers: [],
+      });
+    }, 'doctor-not-pass');
     await refusal('auto agent', (f) => { f.deps.doctor = async () => ({ overall: 'PASS', autoAgent: 'FAIL' }); }, 'doctor-auto-agent-not-pass');
     await refusal('fresh Pi use', (f) => f.store.setConfig('pi.kimi-coding.lastServedAt', String(NOW - DAY_MS - 1)), 'pi-last-served-stale:kimi-coding');
     await refusal('health failure after receipt pass', (f) => {
@@ -794,15 +799,25 @@ describe('qlb retire cswap (AC22 retire)', () => {
     } finally { f.cleanup(); }
   });
 
-  it('s64DoctorVerdict tolerates only the lifecycle:window WARN and fails on a provider WARN', () => {
+  it('s64DoctorVerdict treats only its explicit nine-entry WARN list as blocking', () => {
     const report = {
       command: 'doctor' as const,
       overall: 'WARN' as const,
-      checks: [{ name: 'lifecycle:window', level: 'WARN' as const, message: 'expected after window' }],
-      providers: [],
+      checks: [
+        { name: 'lifecycle:window', level: 'WARN' as const, message: 'expected after window' },
+        { name: 'lifecycle:drill', level: 'WARN' as const, message: 'drill pending' },
+        { name: 'auto:parked', level: 'WARN' as const, message: 'parked' },
+      ],
+      providers: [{ provider: 'xai', level: 'WARN' as const, message: 'usage delayed', source: 'fixture', envVar: 'FIXTURE', example: 'fixture' }],
     };
     assert.deepEqual(s64DoctorVerdict(report), { overall: 'PASS', autoAgent: 'FAIL' });
-    assert.deepEqual(s64DoctorVerdict({ ...report, providers: [{ provider: 'xai', level: 'WARN', message: 'broken', source: 'fixture', envVar: 'FIXTURE', example: 'fixture' }] }), { overall: 'FAIL', autoAgent: 'FAIL' });
+    for (const name of [
+      'auto:agent', 'keychain:helper', 'keychain:live-items-authorized', 'sqlite', 'migrations',
+      'claude:slots', 'codex:slots', 'relogin:7d', 'recovery',
+    ]) {
+      assert.deepEqual(s64DoctorVerdict({ ...report, checks: [...report.checks, { name, level: 'WARN', message: `${name} warning` }] }),
+        { overall: 'FAIL', autoAgent: 'FAIL' }, `${name} WARN blocks S64`);
+    }
   });
 
   it('s64DoctorVerdict reports autoAgent FAIL when no auto:agent check exists and PASS when it is PASS', () => {
