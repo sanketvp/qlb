@@ -74,6 +74,7 @@ import { claudeSlotsCheck } from './checks/claude-slots';
 import { claudeSwitchJournalCheck } from './checks/claude-switch-journal';
 import { journalInProgressCheck } from './checks/journal-in-progress';
 import { journalOrphanedCheck } from './checks/journal-orphaned';
+import { claudeUnclaimedCheck } from './checks/claude-unclaimed';
 import { codexSlotsCheck } from './checks/codex-slots';
 import { codexFirstSwitchCheck } from './checks/codex-first-switch';
 import { undoIncompleteCheck } from './checks/undo-incomplete';
@@ -642,6 +643,8 @@ export async function doctorQlb(
     piProcessList?: () => string;
     /** Tests inject a stable read; production reads lifecycle once per report. */
     readLifecyclePhase?: (dbPath: string) => LifecyclePhaseResult;
+    /** Test seam for the non-secret Claude unclaimed-stash index root. */
+    claudeUnclaimedStashDir?: string;
     /** H2 process-table seam; production uses the shared S24 resolver. */
     cswapProcesses?: () => CswapProcess[];
     /** H2 LaunchAgent seam; production runs `launchctl print` only outside test mode. */
@@ -851,6 +854,11 @@ export async function doctorQlb(
   checks.push(await claudeSwitchJournalCheck(config.dbPath, phase));
   checks.push(await journalInProgressCheck(config.dbPath, phase));
   checks.push(journalOrphanedCheck(config.dbPath, phase));
+  checks.push(await claudeUnclaimedCheck(
+    options.claudeUnclaimedStashDir ?? stashRootFor(qlbHomeDir()),
+    phase,
+    options.now?.() ?? Date.now(),
+  ));
   checks.push(
     claudeConfigPathCheck(),
     claudeConfigFileCheck(),

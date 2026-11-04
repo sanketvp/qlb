@@ -817,6 +817,11 @@ export class ClaudeSlots {
     this.switchLock = options.withSwitchLock ?? ((fn) => withClaudeSwitchLock(fn));
   }
 
+  /** Read only non-secret Anthropic stash metadata from the durable index. */
+  static async listUnclaimedStashIndex(stashDir: string): Promise<UnclaimedIndexEntry[]> {
+    return listStashes(stashDir, ANTHROPIC_PROVIDER);
+  }
+
   listSlots(): ClaudeSlot[] {
     return this.options.repository.listSlots();
   }
