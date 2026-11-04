@@ -128,7 +128,7 @@ describe('Claude switch credential lock timing (K5-7 / AC3)', () => {
     }
   });
 
-  it('X5b: two contenders deterministically take over one stale .oauth_refresh.lock once, then both acquire without overlap', { timeout: 30_000 }, async () => {
+  it('X5b: two contenders deterministically take over one stale .oauth_refresh.lock once, then both acquire without overlap', { timeout: 30_000 }, async (t) => {
     const subject = await switchFixture();
     const fsPromises = require('node:fs/promises') as Record<string, (...args: any[]) => Promise<any>>;
     let switchRun!: ReturnType<typeof switchClaude>;
@@ -151,6 +151,18 @@ describe('Claude switch credential lock timing (K5-7 / AC3)', () => {
     let mostInside = 0;
     let waiterAcquired = false;
     let switchAcquired = false;
+    t.after(() => {
+      releaseSwitch?.();
+      releaseWaiterAfterRetake?.();
+      releaseBothStaleStats?.();
+      releaseSwitchEntered?.();
+      fsPromises.mkdir = originalMkdir;
+      fsPromises.rmdir = originalRmdir;
+      fsPromises.stat = originalStat;
+      subject.store.close();
+      rmSync(subject.root, { recursive: true, force: true });
+      void Promise.allSettled([switchRun, waiterRun]);
+    });
     try {
       stale(subject.lockPaths.oauthRefreshLockDir, 61_000);
       subject.deps.hooks = {
@@ -202,6 +214,9 @@ describe('Claude switch credential lock timing (K5-7 / AC3)', () => {
       await Promise.race([switchEntered, switchRun.then(
         (r) => { throw new Error('switch settled before step 4: ' + r.outcome + '/' + r.reason); },
         () => { throw new Error('switch settled before step 4: rejected'); },
+      ), waiterRun.then(
+        () => { throw new Error('waiter settled before switch reached step 4'); },
+        () => { throw new Error('waiter settled before switch reached step 4: rejected'); },
       )]);
       const elapsed = performance.now() - started;
 
@@ -220,12 +235,6 @@ describe('Claude switch credential lock timing (K5-7 / AC3)', () => {
       releaseWaiterAfterRetake?.();
       releaseBothStaleStats?.();
       releaseSwitchEntered?.();
-      await Promise.allSettled([switchRun, waiterRun]);
-      fsPromises.mkdir = originalMkdir;
-      fsPromises.rmdir = originalRmdir;
-      fsPromises.stat = originalStat;
-      subject.store.close();
-      rmSync(subject.root, { recursive: true, force: true });
     }
   });
 
