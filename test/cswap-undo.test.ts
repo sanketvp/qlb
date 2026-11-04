@@ -198,7 +198,7 @@ describe('qlb undo cswap --dry-run', () => {
       assert.deepEqual(plan, {
         slots: [{
           accountId: 'account-a', accountNumber: 1, email: 'a@example.test', item: 'account-1-a@example.test',
-          action: 'update', fingerprint: prefix('refresh-current'),
+          action: 'update', destinationState: 'rotated', fingerprint: prefix('refresh-current'),
         }],
         deleteEnc: [join(f.backup, 'credentials', '.creds-1-a@example.test.enc')],
         activeAccountNumber: 1,
@@ -220,6 +220,7 @@ describe('qlb undo cswap --dry-run', () => {
       assert.equal(await dryRun(f), 0);
       const plan = JSON.parse(f.output[0]!);
       assert.equal(plan.slots[0].action, 'noop');
+      assert.equal(plan.slots[0].destinationState, 'match');
       assert.equal(plan.slots[0].fingerprint, prefix('refresh-equal'));
     } finally {
       close(f);
@@ -1385,6 +1386,29 @@ describe('qlb undo lineage-match doctor diagnostic', () => {
       f.keychain.set('claude-swap', 'account-1-a@example.test', credential('account-a', 'refresh-stale'));
       assert.deepEqual(await undoLineageMatchCheck(f.dbPath, { available: true, phase: 'rolled-back' }, f.keychain, f.backup), {
         name: 'undo:lineage-match', level: 'WARN', message: 'slot 1: credential lineage changed after hand-back',
+      });
+    } finally { close(f); }
+  });
+
+  it('fails when a C-swap credential is missing after hand-back', async () => {
+    const f = fixture();
+    try {
+      completedUndo(f);
+      addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-current', active: true });
+      assert.deepEqual(await undoLineageMatchCheck(f.dbPath, { available: true, phase: 'rolled-back' }, f.keychain, f.backup), {
+        name: 'undo:lineage-match', level: 'FAIL', message: 'slot 1: C-swap credential missing',
+      });
+    } finally { close(f); }
+  });
+
+  it('fails when a C-swap credential is malformed after hand-back', async () => {
+    const f = fixture();
+    try {
+      completedUndo(f);
+      addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-current', active: true });
+      f.keychain.set('claude-swap', 'account-1-a@example.test', 'not a credential');
+      assert.deepEqual(await undoLineageMatchCheck(f.dbPath, { available: true, phase: 'rolled-back' }, f.keychain, f.backup), {
+        name: 'undo:lineage-match', level: 'FAIL', message: 'slot 1: C-swap credential malformed',
       });
     } finally { close(f); }
   });

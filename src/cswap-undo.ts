@@ -21,6 +21,7 @@ export interface HandBackSlot {
 }
 
 export type HandBackAction = 'update' | 'noop';
+export type HandBackDestinationState = 'match' | 'rotated' | 'missing' | 'malformed';
 
 export interface HandBackSlotPlan {
   accountId: string;
@@ -28,6 +29,7 @@ export interface HandBackSlotPlan {
   email: string;
   item: string;
   action: HandBackAction;
+  destinationState: HandBackDestinationState;
   fingerprint: string;
 }
 
@@ -238,17 +240,22 @@ export async function planHandBack(deps: PlanHandBackDependencies): Promise<Hand
     const destination = await optionalCswapCredential(deps.keychain, item);
     // A corrupt fallback must not prevent recovery: the current credential
     // replaces it and the readable bytes are retained as .prev by writeSlot.
-    let destinationLineage: string | null = null;
+    let destinationState: HandBackDestinationState = 'missing';
     if (destination !== null) {
-      try { destinationLineage = credentialLineage(destination, accountNumber); } catch { /* replace malformed destination */ }
+      try {
+        destinationState = credentialLineage(destination, accountNumber) === currentLineage ? 'match' : 'rotated';
+      } catch {
+        destinationState = 'malformed';
+      }
     }
-    const action: HandBackAction = destinationLineage === currentLineage ? 'noop' : 'update';
+    const action: HandBackAction = destinationState === 'match' ? 'noop' : 'update';
     plans.push({
       accountId: slot.accountId,
       accountNumber,
       email,
       item,
       action,
+      destinationState,
       fingerprint: fingerprintPrefix(currentLineage),
     });
     deleteEnc.push(...encryptedCredentials(listCredentials, deps.backupDir, accountNumber));

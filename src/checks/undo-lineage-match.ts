@@ -31,8 +31,12 @@ export async function undoLineageMatchCheck(
     const plan = await planHandBack({ ...readPlanState(dbPath), backupDir, keychain });
     const encrypted = plan.deleteEnc[0];
     if (encrypted) return { name, level: 'FAIL', message: `slot ${encryptedSlot(encrypted)}: encrypted credential remains` };
-    const update = plan.slots.find((slot) => slot.action !== 'noop');
-    if (update) return { name, level: 'WARN', message: `slot ${update.accountNumber}: credential lineage changed after hand-back` };
+    const missing = plan.slots.find((slot) => slot.destinationState === 'missing');
+    if (missing) return { name, level: 'FAIL', message: `slot ${missing.accountNumber}: C-swap credential missing` };
+    const malformed = plan.slots.find((slot) => slot.destinationState === 'malformed');
+    if (malformed) return { name, level: 'FAIL', message: `slot ${malformed.accountNumber}: C-swap credential malformed` };
+    const rotated = plan.slots.find((slot) => slot.destinationState === 'rotated');
+    if (rotated) return { name, level: 'WARN', message: `slot ${rotated.accountNumber}: credential lineage changed after hand-back` };
     return { name, level: 'PASS', message: 'all undo credential lineages match' };
   } catch (error) {
     if (error instanceof CswapUndoRefusalError) return { name, level: 'FAIL', message: `refused: ${error.code}` };
