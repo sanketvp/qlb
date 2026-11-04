@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
+import { defaultConfig } from '../src/config';
 import { claudePaths } from '../src/cc-paths';
 import { ClaudeSlots, InMemoryClaudeSlotRepository } from '../src/cc-slots';
 import {
@@ -120,7 +121,7 @@ describe('Claude switch journal reconciliation (G10)', () => {
       resolve: async () => { throw new ClaudeCodeLockTimeout(join(subject.root, 'fixture.lock')); },
     });
     const ctx = { ...({} as CommandContext), stderr: (line: string) => stderr.push(line), stdout: () => {}, env: subject.env, home: subject.home,
-      config: { dbPath: join(subject.root, 'unused.sqlite') } };
+      config: { ...defaultConfig(subject.root), dbPath: join(subject.root, 'unused.sqlite') } };
 
     assert.equal(await command.execute!(['--forward'], ctx), 3);
     assert.deepEqual(stderr, ['qlb claude journal resolve: refused: lock-timeout']);
@@ -136,7 +137,7 @@ describe('Claude switch journal reconciliation (G10)', () => {
       resolve: async () => { throw new Error('sensitive backend detail'); },
     });
     const ctx = { ...({} as CommandContext), stderr: (line: string) => stderr.push(line), stdout: () => {}, env: subject.env, home: subject.home,
-      config: { dbPath: join(subject.root, 'unused.sqlite') } };
+      config: { ...defaultConfig(subject.root), dbPath: join(subject.root, 'unused.sqlite') } };
 
     assert.equal(await command.execute!(['--back'], ctx), 1);
     assert.deepEqual(stderr, ['qlb claude journal resolve: failed']);
@@ -188,7 +189,12 @@ describe('Claude switch journal reconciliation (G10)', () => {
   it('back reports an unreadable live credential separately from staged rollback data', async () => {
     const subject = await fixture();
     await install(subject);
-    subject.deps.live.backend = wrappedBackend(subject.backend, { get: async () => { throw new Error('keychain unavailable'); } });
+    subject.deps.live.backend = wrappedBackend(subject.backend, {
+      get: async (service, account) => {
+        if (service === subject.paths.keychainService) throw new Error('keychain unavailable');
+        return subject.backend.get(service, account);
+      },
+    });
 
     assert.deepEqual(await resolveClaudeSwitchJournal(subject.deps, 'back'), { outcome: 'refused', reason: 'live-unreadable' });
     assert.equal(journalExists(subject), true);
@@ -215,7 +221,7 @@ describe('Claude switch journal reconciliation (G10)', () => {
     subject.deps.journalOps = {
       update: (_held, patch, options) => {
         if (patch.committed !== undefined) throw new Error('journal disk failure');
-        updateClaudeSwitchJournal(_held, patch, options);
+        return updateClaudeSwitchJournal(_held, patch, options);
       },
       remove: deleteClaudeSwitchJournal,
     };
@@ -253,7 +259,7 @@ describe('Claude switch journal reconciliation (G10)', () => {
       resolve: async () => result,
     });
     const ctx = { ...({} as CommandContext), stderr: (line: string) => stderr.push(line), stdout: (line: string) => stdout.push(line), env: subject.env, home: subject.home,
-      config: { dbPath: join(subject.root, 'unused.sqlite') } };
+      config: { ...defaultConfig(subject.root), dbPath: join(subject.root, 'unused.sqlite') } };
     assert.equal(await command.execute!(['--forward'], ctx), 0);
     assert.deepEqual(stderr, ['qlb claude journal resolve: warning: completed with cleanup warnings: lock-timeout']);
     assert.equal(stdout.length, 1);
