@@ -116,7 +116,7 @@ describe('Claude switch journal reconciliation (G10)', () => {
     const command = createClaudeJournalResolveCommand({
       openStore: () => ({ close: () => {} }) as never,
       assertAdmitted: () => ({ ok: true }),
-      makeSwitchDeps: async () => subject.deps,
+      makeSwitchDeps: async () => ({ deps: subject.deps }),
       resolve: async () => { throw new ClaudeCodeLockTimeout(join(subject.root, 'fixture.lock')); },
     });
     const ctx = { ...({} as CommandContext), stderr: (line: string) => stderr.push(line), stdout: () => {}, env: subject.env, home: subject.home,
@@ -132,7 +132,7 @@ describe('Claude switch journal reconciliation (G10)', () => {
     const command = createClaudeJournalResolveCommand({
       openStore: () => ({ close: () => {} }) as never,
       assertAdmitted: () => ({ ok: true }),
-      makeSwitchDeps: async () => subject.deps,
+      makeSwitchDeps: async () => ({ deps: subject.deps }),
       resolve: async () => { throw new Error('sensitive backend detail'); },
     });
     const ctx = { ...({} as CommandContext), stderr: (line: string) => stderr.push(line), stdout: () => {}, env: subject.env, home: subject.home,
@@ -249,7 +249,7 @@ describe('Claude switch journal reconciliation (G10)', () => {
     const command = createClaudeJournalResolveCommand({
       openStore: () => ({ close: () => {} }) as never,
       assertAdmitted: () => ({ ok: true }),
-      makeSwitchDeps: async () => subject.deps,
+      makeSwitchDeps: async () => ({ deps: subject.deps }),
       resolve: async () => result,
     });
     const ctx = { ...({} as CommandContext), stderr: (line: string) => stderr.push(line), stdout: (line: string) => stdout.push(line), env: subject.env, home: subject.home,
@@ -573,7 +573,7 @@ describe('Claude switch journal reconciliation (G10)', () => {
         events.push('reconciled');
       },
       assertAdmitted: () => { events.push('admission'); return { ok: true }; },
-      makeSwitchDeps: async () => { events.push('make'); return subject.deps; },
+      makeSwitchDeps: async () => { events.push('make'); return { deps: subject.deps }; },
       switchClaude: async () => { events.push('switch'); return { outcome: 'noop', from: 'a', to: 'b', attempt: 'next-switch', exitCode: 0 }; },
     });
     const ctx: CommandContext = {

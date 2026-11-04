@@ -1,7 +1,6 @@
 import { randomUUID } from 'node:crypto';
 
 import { makeProductionSwitchDeps, type SwitchResources } from './switch-anthropic';
-import type { ClaudeSwitchDeps } from '../cc-switch';
 import { ClaudeCodeLockTimeout, ProperLockfileCompromised } from '../cc-locks';
 import { resolveClaudeSwitchJournal, type ClaudeJournalResolveDirection } from '../journal';
 import { assertAdmitted } from '../lifecycle';
@@ -11,7 +10,7 @@ import { openStore, type Store } from '../store';
 export interface ClaudeJournalResolveCommandDeps {
   openStore?: typeof openStore;
   assertAdmitted?: typeof assertAdmitted;
-  makeSwitchDeps?: (ctx: CommandContext, store: Store, warn: (message: string) => void) => Promise<SwitchResources | ClaudeSwitchDeps>;
+  makeSwitchDeps?: (ctx: CommandContext, store: Store, warn: (message: string) => void) => Promise<SwitchResources>;
   resolve?: typeof resolveClaudeSwitchJournal;
   randomUUID?: () => string;
 }
@@ -41,9 +40,8 @@ export function createClaudeJournalResolveCommand(deps: ClaudeJournalResolveComm
           return 3;
         }
         const warn = (message: string): void => ctx.stderr(`qlb claude journal resolve: warning: ${message}`);
-        const built = await (deps.makeSwitchDeps ?? ((commandCtx, commandStore, commandWarn) =>
+        resources = await (deps.makeSwitchDeps ?? ((commandCtx, commandStore, commandWarn) =>
           makeProductionSwitchDeps({ randomUUID: deps.randomUUID ?? randomUUID }, commandCtx, commandStore, commandWarn)))(ctx, store, warn);
-        resources = 'deps' in built ? built : { deps: built };
         const result = await (deps.resolve ?? resolveClaudeSwitchJournal)(resources.deps, direction);
         if (result.outcome === 'refused') {
           ctx.stderr(`qlb claude journal resolve: refused: ${result.reason}`);
