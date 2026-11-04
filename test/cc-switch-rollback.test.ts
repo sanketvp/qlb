@@ -46,7 +46,7 @@ async function fixture() {
       recordSwitch: (row: Record<string, unknown>) => { rows.push(row); return rows.length; },
       recordRelogin: () => 1,
       recordClaudeSwitchRefusal: (row: Record<string, unknown>) => { rows.push(row); return rows.length; },
-      findClaudeSwitchByAttempt: () => null,
+      findCommittedSwitchByAttempt: () => null,
       commitClaudeSwitch: (row: { toAccount: string; beforeCommit?: () => void }) => { row.beforeCommit?.(); active = row.toAccount; return 12; },
     } as unknown as ClaudeSwitchDeps['store'],
     slots,

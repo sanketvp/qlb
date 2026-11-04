@@ -98,7 +98,7 @@ async function reconcileFixture(owner: ClaudeSwitchJournal['owner'], sameProcess
   const journalDir = join(root, 'journal');
   const deps: ClaudeSwitchDeps = {
     store: {
-      findClaudeSwitchByAttempt: () => null,
+      findCommittedSwitchByAttempt: () => null,
       recordSwitch: (row: Record<string, unknown>) => { rows.push(row); return rows.length; },
     } as unknown as ClaudeSwitchDeps['store'],
 

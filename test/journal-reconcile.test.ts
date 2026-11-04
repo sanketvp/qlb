@@ -65,7 +65,7 @@ async function fixture() {
       recordRelogin: () => 1,
       recordSwitch: (row: Record<string, unknown>) => { rows.push(row); return rows.length; },
       recordClaudeSwitchRefusal: (row: Record<string, unknown>) => { rows.push(row); return rows.length; },
-      findClaudeSwitchByAttempt: (attempt: string) => committed.has(attempt) ? { id: 1, outcome: 'ok', ts: NOW, committedAt: NOW } : null,
+      findCommittedSwitchByAttempt: (_provider: 'anthropic' | 'openai-codex', attempt: string) => committed.has(attempt) ? { id: 1, outcome: 'ok', ts: NOW, committedAt: NOW } : null,
       commitClaudeSwitch: (row: { toAccount: string; beforeCommit?: () => void }) => { row.beforeCommit?.(); commits.push(row); active = row.toAccount; return 1; },
     } as unknown as ClaudeSwitchDeps['store'],
     slots,

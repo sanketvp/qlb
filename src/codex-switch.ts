@@ -66,7 +66,7 @@ function readValidatedTargetSlot(slots: Pick<CodexSlots, 'readSlot'>, accountId:
 
 export interface CodexSwitchDeps {
   store: Pick<Store, 'getCodexActiveLogin' | 'getCodexSlot' | 'getConfig' | 'hasConfig' | 'recordSwitch'
-    | 'recordCodexObservation' | 'setActiveLogin' | 'commitCodexSwitch' | 'findCodexSwitchByAttempt'
+    | 'recordCodexObservation' | 'setActiveLogin' | 'commitCodexSwitch' | 'findCommittedSwitchByAttempt'
     | 'setRecoveryFence' | 'clearRecoveryFence' | 'commitFenceResolution'
     | 'codexPublishingRowsAfter' | 'commitCodexWatchRevert' | 'commitCodexWatchStop'
     | 'listDueCodexWatches' | 'advanceCodexWatch' | 'deleteCodexWatch' | 'hasCodexWatch' | 'findCodexWatchCompletion'
@@ -1183,7 +1183,7 @@ export async function reconcileCodexRecoveryLocked(
 
   const resolveJournal = async (journal: CodexSwitchJournal, held: HeldCodexSwitchJournalOwner): Promise<ReturnType<typeof fenced> | { state: 'clear' }> => {
     assertHeld(); held.assertHeld();
-    if (deps.store.findCodexSwitchByAttempt(journal.attemptId)) {
+    if (deps.store.findCommittedSwitchByAttempt('openai-codex', journal.attemptId)) {
       deleteCodexSwitchJournalIf(deps.journalDir!, journal.attemptId, held, options);
       return { state: 'clear' };
     }

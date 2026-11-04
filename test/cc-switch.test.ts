@@ -368,7 +368,7 @@ async function transactionFixture(options: { live?: string; target?: string; tar
       recordSwitch: (row) => { rows.push(row); return rows.length; },
       recordRelogin: () => 1,
       recordClaudeSwitchRefusal: (row) => { refusals.push(row); rows.push({ ...row, outcome: 'refused' }); return refusals.length; },
-      findClaudeSwitchByAttempt: () => null,
+      findCommittedSwitchByAttempt: () => null,
       commitClaudeSwitch: (row) => { committed = row; active = row.toAccount; return 42; },
     },
     slots, live: { backend, paths, account: 'fixture-user' },
@@ -378,6 +378,13 @@ async function transactionFixture(options: { live?: string; target?: string; tar
     env, home, now: () => NOW, by: 'qlb-cli', attempt: 'attempt-k5-5', journalDir: join(root, 'journal'), journalOwner: { pid: process.pid, lstart: 'fixture' }, warn: (message) => warnings.push(message),
   };
   return { root, home, env, paths, backend, slots, deps, get active() { return active; }, get committed() { return committed; }, rows, refusals, warnings };
+}
+
+function committedRow(id: number) {
+  return {
+    id, ts: NOW, provider: 'anthropic', fromAccount: 'account-a', toAccount: 'account-b', trigger: 'manual', outcome: 'ok',
+    detail: null, stepsJson: null, openSessionsJson: null, publishedAt: null, committedAt: NOW,
+  };
 }
 
 function seedJournal(subject: { deps: ClaudeSwitchDeps; paths: ReturnType<typeof claudePaths> }, patch: Record<string, unknown> = {}): string {
@@ -1057,7 +1064,7 @@ describe('Claude switch transaction (K5-5)', () => {
   it('a journal whose committed attempt row exists is deleted with its staged item under the owner lock and the switch proceeds with one new row', async () => {
     const subject = await transactionFixture(); const path = seedJournal(subject);
     await subject.backend.set('qlb:anthropic:staged-rollback:older', 'qlb', credential('old'));
-    subject.deps.store.findClaudeSwitchByAttempt = (attempt) => attempt === 'older-attempt' ? { id: 1, outcome: 'ok', ts: NOW, committedAt: NOW } : null;
+    subject.deps.store.findCommittedSwitchByAttempt = (_provider, attempt) => attempt === 'older-attempt' ? committedRow(1) : null;
     assert.equal((await switchClaude(subject.deps, manual)).outcome, 'ok');
     assert.equal(existsSync(path), false); assert.equal(subject.backend.listServices().includes('qlb:anthropic:staged-rollback:older'), false);
   });
@@ -1213,8 +1220,8 @@ describe('Claude switch transaction (K5-5)', () => {
     const journalPath = join(subject.deps.journalDir!, 'switch-anthropic.json');
     assert.equal(subject.committed !== null, true);
     assert.equal(existsSync(journalPath), true);
-    subject.deps.store.findClaudeSwitchByAttempt = (attempt) => attempt === 'attempt-k5-5'
-      ? { id: 42, outcome: 'ok', ts: NOW, committedAt: NOW } : null;
+    subject.deps.store.findCommittedSwitchByAttempt = (_provider, attempt) => attempt === 'attempt-k5-5'
+      ? committedRow(42) : null;
     subject.deps.probeOwner = () => 'free';
     subject.deps.stillTheSameProcess = async () => false;
     subject.deps.crashAt = undefined;
@@ -1285,7 +1292,7 @@ describe('Claude switch transaction (K5-5)', () => {
     const subject = await transactionFixture(); const path = seedJournal(subject);
     await subject.backend.set('qlb:anthropic:staged-rollback:older', 'qlb', credential('old'));
     subject.deps.probeOwner = () => 'free'; subject.deps.stillTheSameProcess = async () => false;
-    subject.deps.store.findClaudeSwitchByAttempt = () => null;
+    subject.deps.store.findCommittedSwitchByAttempt = () => null;
     assert.equal((await switchClaude(subject.deps, manual)).reason, 'switch-journal-present');
     assert.equal(existsSync(path), true);
     assert.equal(subject.backend.listServices().includes('qlb:anthropic:staged-rollback:older'), true);

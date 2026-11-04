@@ -3896,18 +3896,18 @@ describe('Codex watch tick — C6-21', () => {
     } finally { close(h); }
   });
 
-  it('a watch revert row leaves findCodexSwitchByAttempt on the switch\'s ok commit', async () => {
+  it('a watch revert row leaves findCommittedSwitchByAttempt on the switch\'s ok commit', async () => {
     const h = switchHarness();
     try {
       const watch = await committedWatch(h, 'manual', async () => [holderOfA]);
       codexWrites(h, observedDocument('a', 'a-prime'));
       assert.deepEqual(await tick(h, watch, 30_000), { state: 'reverted' });
-      const found = h.store.findCodexSwitchByAttempt(watch.attempt);
+      const found = h.store.findCommittedSwitchByAttempt('openai-codex', watch.attempt);
       assert.deepEqual([found?.id, found?.outcome], [watch.switchId, 'ok']);
     } finally { close(h); }
   });
 
-  it('after a fence resolution, findCodexSwitchByAttempt returns the ok commit', async () => {
+  it('after a fence resolution, findCommittedSwitchByAttempt returns the ok commit', async () => {
     const h = switchHarness();
     try {
       const watch = await committedWatch(h);
@@ -3918,7 +3918,7 @@ describe('Codex watch tick — C6-21', () => {
       codexWrites(h, bLogin);
       importActiveCodexSlot(bLogin, { store: h.store, keychain: h.keychain, now: () => watch.publishedAt + 6_000 });
       assert.deepEqual(await h.recover(), { state: 'clear' });
-      const found = h.store.findCodexSwitchByAttempt(watch.attempt);
+      const found = h.store.findCommittedSwitchByAttempt('openai-codex', watch.attempt);
       assert.deepEqual([found?.id, found?.outcome], [watch.switchId, 'ok']);
     } finally { close(h); }
   });
