@@ -4,7 +4,7 @@
 import { existsSync, readdirSync } from 'node:fs';
 import { basename, join } from 'node:path';
 
-import { credentialFingerprint } from './anthropic-oauth';
+import { credentialFingerprint, parseCredentialBlob } from './anthropic-oauth';
 import type { ClaudeSlotBackend } from './cc-slots';
 import { isCredentialNotFound } from './credential-backends';
 import { openStoreConnection, readOnlySchemaRefusal } from './store';
@@ -242,11 +242,9 @@ export async function planHandBack(deps: PlanHandBackDependencies): Promise<Hand
     // replaces it and the readable bytes are retained as .prev by writeSlot.
     let destinationState: HandBackDestinationState = 'missing';
     if (destination !== null) {
-      try {
-        destinationState = credentialLineage(destination, accountNumber) === currentLineage ? 'match' : 'rotated';
-      } catch {
-        destinationState = 'malformed';
-      }
+      destinationState = parseCredentialBlob(destination) === null
+        ? 'malformed'
+        : credentialLineage(destination, accountNumber) === currentLineage ? 'match' : 'rotated';
     }
     const action: HandBackAction = destinationState === 'match' ? 'noop' : 'update';
     plans.push({

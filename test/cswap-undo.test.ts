@@ -1413,6 +1413,18 @@ describe('qlb undo lineage-match doctor diagnostic', () => {
     } finally { close(f); }
   });
 
+  it('warns when a parsed C-swap credential has no refresh token', async () => {
+    const f = fixture();
+    try {
+      completedUndo(f);
+      addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-current', active: true });
+      f.keychain.set('claude-swap', 'account-1-a@example.test', '{}');
+      assert.deepEqual(await undoLineageMatchCheck(f.dbPath, { available: true, phase: 'rolled-back' }, f.keychain, f.backup), {
+        name: 'undo:lineage-match', level: 'WARN', message: 'slot 1: credential lineage changed after hand-back',
+      });
+    } finally { close(f); }
+  });
+
   it('fails a remaining encrypted fallback without revealing its path', async () => {
     const f = fixture();
     try {
