@@ -245,6 +245,15 @@ export function sameAccountCredential(left: string | null, right: string | null)
     && JSON.stringify(canonicalAccountCredential(leftCredential, true)) === JSON.stringify(canonicalAccountCredential(rightCredential, true));
 }
 
+export function targetOauthAccount(configJson: string | null | undefined, accountId: string): JsonObject | null {
+  try {
+    const config = JSON.parse(configJson ?? '') as { oauthAccount?: unknown };
+    const oauth = config.oauthAccount;
+    return oauth && typeof oauth === 'object' && !Array.isArray(oauth)
+      && (oauth as { accountUuid?: unknown }).accountUuid === accountId ? oauth as JsonObject : null;
+  } catch { return null; }
+}
+
 function noDecision(): ClaudeSwitchDecision { return { leftHeadroom: null, leftRecoveryAt: null, leftTrigger: null }; }
 function steps(): NonNullable<ClaudeSwitchResult['steps']> { return { started: [], reversed: [], notLanded: [], restoreFailures: [], cleanup: [] }; }
 function isCrash(error: unknown): error is CrashSignal { return error instanceof CrashSignal; }
@@ -588,8 +597,7 @@ async function switchClaudeAttempt(deps: ClaudeSwitchDeps, input: SwitchClaudeIn
           deps.crashAt?.('before-step-6');
           let targetCredential: string;
           try { targetCredential = (await deps.slots.readSlot(transactionInput.to, { fresh: true })).credential; } catch { return failed(deps, transactionInput, attempt, from, 'target-unreadable', undefined, state, 6, undefined, classified.kind); }
-          let targetOauth: JsonObject | null = null;
-          try { const config = JSON.parse(target.configJson ?? '') as { oauthAccount?: unknown }; if (config.oauthAccount && typeof config.oauthAccount === 'object' && !Array.isArray(config.oauthAccount) && (config.oauthAccount as Record<string, unknown>).accountUuid === transactionInput.to) targetOauth = config.oauthAccount as JsonObject; } catch { /* invalid below */ }
+          const targetOauth = targetOauthAccount(target.configJson, transactionInput.to);
           if (!parseCredentialBlob(targetCredential)?.oauth || targetOauth === null) return failed(deps, transactionInput, attempt, from, 'target-invalid', undefined, state, 6, undefined, classified.kind);
           const timestamp = (deps.stashTimestamp ?? (() => defaultStashTimestamp(deps.now())))();
           const stagedBlobService = stagedRollbackService(timestamp);
