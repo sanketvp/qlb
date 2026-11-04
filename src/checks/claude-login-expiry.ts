@@ -1,4 +1,6 @@
-import { loginExpiryField, parseCredentialBlob } from '../anthropic-oauth';
+import { loginExpiresAtIso } from '../anthropic-oauth';
+import { QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, type KeychainBackend } from '../keychain';
+import { redactError } from '../redact';
 import { openStoreConnection } from '../store';
 import { check, guardCheck } from './_check';
 import type { HealthCheck } from './claude-slots';
@@ -7,21 +9,15 @@ export default check('claude:login-expiry');
 
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1_000;
 
-export type ClaudeCredentialProjection = (accountId: string) => string;
-
 interface ExpiryObservation {
   accountId: string;
   kind: 'unreadable' | 'not-reported' | 'expired' | 'expiring' | 'valid';
   expiresAt?: string;
 }
 
-/**
- * Advisory-only login-expiry inspection. The supplied projection must only read
- * the already-managed slot credential; this check never refreshes or writes it.
- */
 export function claudeLoginExpiryCheck(
   dbPath: string,
-  readCredential: ClaudeCredentialProjection,
+  keychain: Pick<KeychainBackend, 'getSync'>,
   now = Date.now(),
 ): HealthCheck {
   return guardCheck('claude:login-expiry', () => {
@@ -29,7 +25,7 @@ export function claudeLoginExpiryCheck(
     let accountIds: string[];
     try {
       accountIds = (db.prepare(`SELECT account_id AS accountId FROM claude_slots
-        WHERE archived_at IS NULL ORDER BY account_id`).all() as Array<{ accountId: string }>)
+        WHERE dead = 0 AND archived_at IS NULL ORDER BY account_id`).all() as Array<{ accountId: string }>)
         .map((row) => row.accountId);
     } finally {
       db.close();
@@ -41,14 +37,12 @@ export function claudeLoginExpiryCheck(
     const observations = accountIds.map((accountId): ExpiryObservation => {
       let credential: string;
       try {
-        credential = readCredential(accountId);
+        credential = keychain.getSync(qlbKeychainService('anthropic', accountId), QLB_KEYCHAIN_ACCOUNT);
       } catch {
         return { accountId, kind: 'unreadable' };
       }
       try {
-        const parsed = parseCredentialBlob(credential);
-        if (parsed === null || parsed.oauth === null) return { accountId, kind: 'unreadable' };
-        const expiry = loginExpiryField(parsed).iso;
+        const expiry = loginExpiresAtIso(credential);
         if (expiry === null) return { accountId, kind: 'not-reported' };
         const expiresAt = new Date(expiry).getTime();
         if (expiresAt <= now) return { accountId, kind: 'expired', expiresAt: expiry };
@@ -60,32 +54,37 @@ export function claudeLoginExpiryCheck(
     });
 
     const expired = observations.filter((item) => item.kind === 'expired');
+    const unreadable = observations.filter((item) => item.kind === 'unreadable');
+    const expiring = observations.filter((item) => item.kind === 'expiring');
+    const message = [
+      expired.length > 0 && `expired Claude login: ${expired.map((item) => `${item.accountId} (${item.expiresAt})`).join(', ')}`,
+      unreadable.length > 0 && `Claude credential unreadable for slot ${unreadable.map((item) => item.accountId).join(', ')}`,
+      expiring.length > 0 && `Claude login expires within 7 days: ${expiring.map((item) => `${item.accountId} (${item.expiresAt})`).join(', ')}`,
+    ].filter((item): item is string => Boolean(item)).join('; ');
     if (expired.length > 0) {
       return {
         name: 'claude:login-expiry', level: 'FAIL',
-        message: `expired Claude login: ${expired.map((item) => `${item.accountId} (${item.expiresAt})`).join(', ')}`,
+        message,
       };
     }
-    const unreadable = observations.filter((item) => item.kind === 'unreadable');
     if (unreadable.length > 0) {
       return {
         name: 'claude:login-expiry', level: 'WARN',
-        message: `Claude credential unreadable for slot ${unreadable.map((item) => item.accountId).join(', ')}`,
+        message,
       };
     }
-    const expiring = observations.filter((item) => item.kind === 'expiring');
     if (expiring.length > 0) {
       return {
         name: 'claude:login-expiry', level: 'WARN',
-        message: `Claude login expires within 7 days: ${expiring.map((item) => `${item.accountId} (${item.expiresAt})`).join(', ')}`,
+        message,
       };
     }
     if (observations.every((item) => item.kind === 'not-reported')) {
       return { name: 'claude:login-expiry', level: 'PASS', message: 'expiry not reported' };
     }
     return { name: 'claude:login-expiry', level: 'PASS', message: 'Claude login expiry is valid' };
-  }, () => ({
+  }, (error) => ({
     name: 'claude:login-expiry', level: 'WARN',
-    message: 'Claude login expiry cannot be evaluated',
+    message: `Claude login expiry cannot be evaluated: ${redactError(error, [])}`,
   }));
 }

@@ -27,8 +27,6 @@ import {
   listKeptKeychainServices,
   MACOS_SECURITY_BIN,
   platformKeychain,
-  qlbKeychainService,
-  QLB_KEYCHAIN_ACCOUNT,
   readNativeOpenRouterKey,
   selectBackendKind,
   type KeychainBackend,
@@ -70,7 +68,7 @@ import { cswapProcessesCheck } from './checks/cswap-processes';
 import type { CswapAgentStatus } from './cswap-agent';
 import type { CswapProcess } from './cswap-processes';
 import { claudeActiveCheck } from './checks/claude-active';
-import { claudeLoginExpiryCheck, type ClaudeCredentialProjection } from './checks/claude-login-expiry';
+import { claudeLoginExpiryCheck } from './checks/claude-login-expiry';
 import { claudeOauthClientCheck } from './checks/claude-oauth-client';
 import { claudeSlotsCheck } from './checks/claude-slots';
 import { claudeSwitchJournalCheck } from './checks/claude-switch-journal';
@@ -641,8 +639,6 @@ export async function doctorQlb(
     piProcessList?: () => string;
     /** Tests inject a stable read; production reads lifecycle once per report. */
     readLifecyclePhase?: (dbPath: string) => LifecyclePhaseResult;
-    /** Test seam for the advisory, read-only Claude credential projection. */
-    readClaudeCredential?: ClaudeCredentialProjection;
     /** H2 process-table seam; production uses the shared S24 resolver. */
     cswapProcesses?: () => CswapProcess[];
     /** H2 LaunchAgent seam; production runs `launchctl print` only outside test mode. */
@@ -652,6 +648,7 @@ export async function doctorQlb(
   } = {},
 ): Promise<DoctorReport> {
   const checks: DoctorCheck[] = [];
+  const keychain = options.keychain ?? platformKeychain;
   let migrations: Array<{ store: string; state: string; detail_json?: string }> = [];
   let accounts: Array<{ id: string; provider: string; label: string }> = [];
   let recoveryPending = false;
@@ -862,8 +859,7 @@ export async function doctorQlb(
     claudeActiveCheck(config.dbPath, phase),
     claudeLoginExpiryCheck(
       config.dbPath,
-      options.readClaudeCredential ?? ((accountId) =>
-        platformKeychain.getSync(qlbKeychainService('anthropic', accountId), QLB_KEYCHAIN_ACCOUNT)),
+      keychain,
       options.now?.() ?? Date.now(),
     ),
     claudeSlotsCheck(config.dbPath, phase),
@@ -876,7 +872,6 @@ export async function doctorQlb(
 
   const owned = migrations.filter((m) => m.state === 'QLB_OWNED' || m.state === 'RETIRED');
   if (owned.length > 0 && accounts.length > 0) {
-    const keychain = options.keychain ?? platformKeychain;
     const readNative =
       options.readNativeCredential ??
       createNativeCredentialReader({
