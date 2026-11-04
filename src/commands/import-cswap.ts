@@ -94,8 +94,7 @@ async function execute(args: string[], ctx: CommandContext): Promise<number> {
         print(ctx, { journals, preview: true }, opts.json);
         return 0;
       }
-      await reconcileCswapImportJournals(base);
-      print(ctx, { journals: classifyCswapImportJournals(base), reconciled: true }, opts.json);
+      print(ctx, { journals: await reconcileCswapImportJournals(base), reconciled: true }, opts.json);
       return 0;
     }
     if (opts.dryRun) {
@@ -148,7 +147,7 @@ async function execute(args: string[], ctx: CommandContext): Promise<number> {
       // Slot numbers are credential-free; the message text is not rendered.
       const detail = error.code === 'duplicate-login' && error.slots
         ? ` (slots ${error.slots[0]} and ${error.slots[1]} hold the same login)`
-        : error.code === 'import-journal-orphaned' && error.runId ? ` ${error.runId}` : '';
+        : (error.code === 'import-journal-orphaned' || error.code === 'import-journal-unclassifiable') && error.runId ? ` ${error.runId}` : '';
       ctx.stderr(`import cswap refused: ${error.code}${detail}`);
       return 3;
     }

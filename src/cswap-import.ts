@@ -12,7 +12,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSy
 import { dirname, join } from 'node:path';
 import { credentialFingerprint, parseCredentialBlob } from './anthropic-oauth';
 import type { ClaudeSlot, ClaudeSlotBackend, ClaudeSlotRepository } from './cc-slots';
-import { CswapImportInProgress, withCswapImportLock } from './cc-locks';
+import { CREDENTIALS_STALENESS_MS, CswapImportInProgress, withCswapImportLock } from './cc-locks';
 import { looksLikeApiKey } from './cc-credentials';
 import { isCredentialNotFound } from './credential-backends';
 import { QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from './keychain';
@@ -30,7 +30,8 @@ export type CswapImportRefusalCode =
   | 'api-key-source'
   | 'session-profiles'
   | 'duplicate-login'
-  | 'import-journal-orphaned';
+  | 'import-journal-orphaned'
+  | 'import-journal-unclassifiable';
 
 /** A credential-free, operator-actionable refusal (command exit 3). */
 export class CswapImportRefusalError extends Error {
@@ -534,8 +535,9 @@ function readCswapImportJournalFiles(options: CswapImportOptions): Array<{ runId
 export function probeCswapImportLock(options: CswapImportOptions): CswapImportLockStatus {
   const lock = join(journalRoot(options), 'cswap-import.lock');
   try {
-    return { held: existsSync(lock) && Date.now() - statSync(lock).mtimeMs <= 60_000 };
-  } catch {
+    return { held: existsSync(lock) && Date.now() - statSync(lock).mtimeMs <= CREDENTIALS_STALENESS_MS };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { held: false };
     return { held: true };
   }
 }
@@ -563,11 +565,6 @@ export function classifyCswapImportJournals(options: CswapImportOptions): CswapI
   });
 }
 
-/** Credential-free read-only import-journal listing. */
-export function listCswapImportJournals(options: CswapImportOptions): CswapImportJournalStatus[] {
-  return classifyCswapImportJournals(options);
-}
-
 function assertNoOrphanedCswapImportJournals(options: CswapImportOptions): void {
   const orphan = classifyCswapImportJournals(options).find((journal) => journal.action !== 'none');
   if (orphan) throw new CswapImportRefusalError('import-journal-orphaned', 'C-swap import refused: import journal requires reconciliation', undefined, orphan.runId);
@@ -589,10 +586,11 @@ export async function reconcileCswapImportJournals(options: CswapImportOptions):
   try {
     return await withCswapImportLock(lock, async () => {
       const journals = classifyCswapImportJournals(options);
-      if (journals.some((journal) => journal.action === 'unclassifiable')) {
-        throw new Error('C-swap import journal is unclassifiable');
+      const unclassifiable = journals.find((journal) => journal.action === 'unclassifiable');
+      if (unclassifiable) {
+        throw new CswapImportRefusalError('import-journal-unclassifiable', 'C-swap import journal is unclassifiable', undefined, unclassifiable.runId);
       }
-      for (const journal of journals) {
+      for (const journal of [...journals].reverse()) {
         if (journal.action === 'recover' || journal.action === 'finish-cleanup') await recoverUncommittedCswapImportLocked(options, journal.runId);
         else if (journal.action === 'purge-staging') await purgeStagedCswapImportLocked(options, journal.runId);
       }
