@@ -68,6 +68,7 @@ import { cswapProcessesCheck } from './checks/cswap-processes';
 import type { CswapAgentStatus } from './cswap-agent';
 import type { CswapProcess } from './cswap-processes';
 import { claudeActiveCheck } from './checks/claude-active';
+import { claudeLoginExpiryCheck } from './checks/claude-login-expiry';
 import { claudeOauthClientCheck } from './checks/claude-oauth-client';
 import { claudeSlotsCheck } from './checks/claude-slots';
 import { claudeSwitchJournalCheck } from './checks/claude-switch-journal';
@@ -144,6 +145,9 @@ export const S64_BLOCKING_WARN = [
 ] as const;
 
 function isS64BlockingRow(row: Pick<DoctorCheck, 'name' | 'level'> | ProviderDiagnostic): boolean {
+  // Credential expiry is advisory: a user needs time to re-login before it
+  // becomes operationally relevant, so it must never block an S64 lifecycle gate.
+  if ('name' in row && row.name === 'claude:login-expiry') return false;
   if (row.level === 'FAIL') return true;
   return 'name' in row && row.level === 'WARN' && (S64_BLOCKING_WARN as readonly string[]).includes(row.name);
 }
@@ -645,6 +649,7 @@ export async function doctorQlb(
   } = {},
 ): Promise<DoctorReport> {
   const checks: DoctorCheck[] = [];
+  const keychain = options.keychain ?? platformKeychain;
   let migrations: Array<{ store: string; state: string; detail_json?: string }> = [];
   let accounts: Array<{ id: string; provider: string; label: string }> = [];
   let recoveryPending = false;
@@ -853,6 +858,11 @@ export async function doctorQlb(
     cswapProcessesCheck(lifecycle, { list: options.cswapProcesses, env: process.env }),
     claudeOauthClientCheck(config.dbPath, lifecycle),
     claudeActiveCheck(config.dbPath, phase),
+    claudeLoginExpiryCheck(
+      config.dbPath,
+      keychain,
+      options.now?.() ?? Date.now(),
+    ),
     claudeSlotsCheck(config.dbPath, phase),
     codexSlotsCheck(config.dbPath, phase),
     codexFirstSwitchCheck(config.dbPath, lifecycle, options.now?.() ?? Date.now()),
@@ -864,7 +874,6 @@ export async function doctorQlb(
 
   const owned = migrations.filter((m) => m.state === 'QLB_OWNED' || m.state === 'RETIRED');
   if (owned.length > 0 && accounts.length > 0) {
-    const keychain = options.keychain ?? platformKeychain;
     const readNative =
       options.readNativeCredential ??
       createNativeCredentialReader({
