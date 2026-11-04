@@ -27,6 +27,8 @@ import {
   listKeptKeychainServices,
   MACOS_SECURITY_BIN,
   platformKeychain,
+  qlbKeychainService,
+  QLB_KEYCHAIN_ACCOUNT,
   readNativeOpenRouterKey,
   selectBackendKind,
   type KeychainBackend,
@@ -68,6 +70,7 @@ import { cswapProcessesCheck } from './checks/cswap-processes';
 import type { CswapAgentStatus } from './cswap-agent';
 import type { CswapProcess } from './cswap-processes';
 import { claudeActiveCheck } from './checks/claude-active';
+import { claudeLoginExpiryCheck, type ClaudeCredentialProjection } from './checks/claude-login-expiry';
 import { claudeOauthClientCheck } from './checks/claude-oauth-client';
 import { claudeSlotsCheck } from './checks/claude-slots';
 import { claudeSwitchJournalCheck } from './checks/claude-switch-journal';
@@ -143,6 +146,9 @@ export const S64_BLOCKING_WARN = [
 ] as const;
 
 function isS64BlockingRow(row: Pick<DoctorCheck, 'name' | 'level'> | ProviderDiagnostic): boolean {
+  // Credential expiry is advisory: a user needs time to re-login before it
+  // becomes operationally relevant, so it must never block an S64 lifecycle gate.
+  if ('name' in row && row.name === 'claude:login-expiry') return false;
   if (row.level === 'FAIL') return true;
   return 'name' in row && row.level === 'WARN' && (S64_BLOCKING_WARN as readonly string[]).includes(row.name);
 }
@@ -635,6 +641,8 @@ export async function doctorQlb(
     piProcessList?: () => string;
     /** Tests inject a stable read; production reads lifecycle once per report. */
     readLifecyclePhase?: (dbPath: string) => LifecyclePhaseResult;
+    /** Test seam for the advisory, read-only Claude credential projection. */
+    readClaudeCredential?: ClaudeCredentialProjection;
     /** H2 process-table seam; production uses the shared S24 resolver. */
     cswapProcesses?: () => CswapProcess[];
     /** H2 LaunchAgent seam; production runs `launchctl print` only outside test mode. */
@@ -852,6 +860,12 @@ export async function doctorQlb(
     cswapProcessesCheck(lifecycle, { list: options.cswapProcesses, env: process.env }),
     claudeOauthClientCheck(config.dbPath, lifecycle),
     claudeActiveCheck(config.dbPath, phase),
+    claudeLoginExpiryCheck(
+      config.dbPath,
+      options.readClaudeCredential ?? ((accountId) =>
+        platformKeychain.getSync(qlbKeychainService('anthropic', accountId), QLB_KEYCHAIN_ACCOUNT)),
+      options.now?.() ?? Date.now(),
+    ),
     claudeSlotsCheck(config.dbPath, phase),
     codexSlotsCheck(config.dbPath, phase),
     codexFirstSwitchCheck(config.dbPath, lifecycle, options.now?.() ?? Date.now()),
