@@ -6,11 +6,13 @@ import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
 import { claudeLoginExpiryCheck } from '../src/checks/claude-login-expiry';
+import { claudeUnclaimedCheck } from '../src/checks/claude-unclaimed';
 import { defaultConfig } from '../src/config';
 import { doctorQlb, s64DoctorVerdict } from '../src/diagnostics';
 import { LIFECYCLE_STATES } from '../src/checks/lifecycle-phase';
 import { MockKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from '../src/keychain';
 import { openStore } from '../src/store';
+import { recordStash } from '../src/unclaimed-index';
 
 const NOW = Date.UTC(2026, 0, 1, 0, 0, 0);
 
@@ -145,6 +147,59 @@ describe('claude:login-expiry doctor check', () => {
   it('passes when there are no live Claude slots', () => {
     assert.deepEqual(claudeLoginExpiryCheck(fixture(), keychain(), NOW), {
       name: 'claude:login-expiry', level: 'PASS', message: 'no live Claude slots',
+    });
+  });
+});
+
+describe('claude:unclaimed doctor check', () => {
+  const stashId = '2025-11-30T00-00-00.000Z-fixture';
+
+  async function stash(root: string, createdAt: number): Promise<void> {
+    await recordStash(root, {
+      provider: 'anthropic', accountId: 'slot-1', stashId, consumedFp: 'fixture-lineage', location: 'keychain', createdAt,
+    });
+  }
+
+  it('WARNs for an older stash and names the restore command without reading credentials', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-doctor-unclaimed-old-'));
+    await stash(root, NOW - 30 * 24 * 60 * 60 * 1_000 - 1);
+    assert.deepEqual(await claudeUnclaimedCheck(root, 'cutover', NOW), {
+      name: 'claude:unclaimed', level: 'WARN',
+      message: `1 unclaimed Claude stash(es) older than 30 days: qlb claude restore-unclaimed ${stashId} slot-1`,
+    });
+  });
+
+  it('reports an INFO count for younger stashes', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-doctor-unclaimed-young-'));
+    await stash(root, NOW - 1);
+    assert.deepEqual(await claudeUnclaimedCheck(root, 'retired', NOW), {
+      name: 'claude:unclaimed', level: 'INFO', message: '1 unclaimed Claude stash(es) younger than 30 days',
+    });
+  });
+
+  it('PASSes when no stashes exist', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-doctor-unclaimed-none-'));
+    assert.deepEqual(await claudeUnclaimedCheck(root, 'cutover', NOW), {
+      name: 'claude:unclaimed', level: 'PASS', message: 'no unclaimed Claude stashes',
+    });
+  });
+
+  it('is wired into doctor and is N/A outside cutover and retired', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-unclaimed-wiring-'));
+    const config = defaultConfig(home);
+    const store = openStore(config.dbPath);
+    store.close();
+    const db = new DatabaseSync(config.dbPath);
+    try {
+      db.prepare('INSERT INTO lifecycle (state, began_at) VALUES (?, ?)').run('pre-cutover', NOW);
+    } finally {
+      db.close();
+    }
+    const report = await doctorQlb(config, {
+      command: () => '', hostCommand: () => '', now: () => NOW, claudeUnclaimedStashDir: join(home, '.qlb', 'unclaimed'),
+    });
+    assert.deepEqual(report.checks.find((row) => row.name === 'claude:unclaimed'), {
+      name: 'claude:unclaimed', level: 'N/A', message: 'not applicable in phase=pre-cutover',
     });
   });
 });
