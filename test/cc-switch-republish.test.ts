@@ -476,20 +476,24 @@ describe('Claude self-republish (K5b-1)', () => {
       }), 0);
       assert.equal(receiptErrors.length, 0);
 
-      const liveBeforeInjection = await subject.backend.get(subject.paths.keychainService, 'fixture-user');
-      const configBeforeInjection = readFileSync(subject.paths.globalConfigPath, 'utf8');
+      const beforeInjection = await stableState(subject);
       subject.env.QLB_FAULT_INJECTION = '1';
       const injected = await run('a', '--inject', 'fail-step', '8');
       assert.deepEqual({ outcome: injected.outcome, reason: injected.reason, injected: injected.injected }, { outcome: 'rolled-back', reason: 'fault-injection:fail-step-8', injected: true });
-      assert.equal(await subject.backend.get(subject.paths.keychainService, 'fixture-user'), liveBeforeInjection);
-      assert.equal(readFileSync(subject.paths.globalConfigPath, 'utf8'), configBeforeInjection);
-      assert.equal(subject.store.getActiveLogin('anthropic')?.accountId, 'b');
+      assert.deepEqual(await stableState(subject), beforeInjection);
       delete subject.env.QLB_FAULT_INJECTION;
 
-      await subject.backend.set(subject.paths.keychainService, 'fixture-user', credential('c-foreign'));
+      const stashBeforeForeignWrite = subject.backend.listServices().filter((service) => service.startsWith('qlb:anthropic:unclaimed:'));
+      const foreignLive = credential('c-foreign');
+      await subject.backend.set(subject.paths.keychainService, 'fixture-user', foreignLive);
       assert.equal((await run('a')).outcome, 'ok');
-      assert.equal(subject.backend.listServices().some((service) => service.startsWith('qlb:anthropic:unclaimed:')), true);
+      const newStashes = subject.backend.listServices()
+        .filter((service) => service.startsWith('qlb:anthropic:unclaimed:') && !stashBeforeForeignWrite.includes(service));
+      assert.equal(newStashes.length, 1);
+      const stashed = JSON.parse(await subject.backend.get(newStashes[0]!, 'qlb')) as { credential: string };
+      assert.equal(stashed.credential, foreignLive);
 
+      subject.store.recordSwitch({ ts: NOW, provider: 'anthropic', fromAccount: 'a', toAccount: 'a', trigger: 'manual', outcome: 'ok', injected: true });
       const db = openStoreConnection(config.dbPath, true);
       try {
         const row = db.prepare("SELECT COUNT(*) AS count FROM switch_log WHERE outcome = 'ok' AND injected = 0 AND detail IS NOT 'republish'").get() as { count: number };
