@@ -157,7 +157,7 @@ describe('A7 doctor health primitives', () => {
       const phase = lifecyclePhase(dbPath);
       assert.equal(lifecyclePhaseCheck(phase).level, 'PASS');
       const dependentLevel = ['cutting-over', 'cutover', 'retired'].includes(state) ? 'PASS' : 'N/A';
-      assert.equal(claudeActiveCheck(dbPath, phase.phase).level, dependentLevel, state);
+      assert.equal(claudeActiveCheck(dbPath, phase.phase).level, 'N/A', state);
       assert.equal(claudeSlotsCheck(dbPath, phase.phase).level, dependentLevel, state);
       assert.equal(relogin7dCheck(dbPath, phase.phase).level, dependentLevel, state);
     }
@@ -309,7 +309,7 @@ describe('A7 doctor health primitives', () => {
       );
       assert.deepEqual(
         a7Names.map((name) => report.checks.find((row) => row.name === name)?.level),
-        ['WARN', 'WARN', 'WARN', 'WARN', 'WARN', 'WARN'],
+        ['WARN', 'WARN', 'WARN', 'WARN', 'WARN', 'WARN', 'WARN'],
       );
     }
   });
