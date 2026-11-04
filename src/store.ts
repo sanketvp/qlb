@@ -665,6 +665,29 @@ export function scrubReloginFields(row: { detail: unknown; evidence: unknown }):
   };
 }
 
+/**
+ * Sanitizes relogin fields for read-only output without relying on the
+ * one-time scrub marker. Canonical stored values remain stable on every read.
+ */
+export function sanitizeReloginFieldsForRead(row: { detail: unknown; evidence: unknown }): {
+  detail: string | null;
+  evidence: string | null;
+} {
+  const storedDetail = row.detail === null ? null : String(row.detail);
+  if (storedDetail === null) {
+    return { detail: null, evidence: isReloginEvidenceClass(row.evidence) ? row.evidence : null };
+  }
+  try {
+    assertStoredReloginFields(storedDetail, null);
+    return { detail: storedDetail, evidence: isReloginEvidenceClass(row.evidence) ? row.evidence : null };
+  } catch {
+    return {
+      detail: reloginDetailFingerprint(storedDetail),
+      evidence: isReloginEvidenceClass(row.evidence) ? row.evidence : null,
+    };
+  }
+}
+
 function sqlWithoutLiteralsOrComments(sql: string, keepQuotedIdentifiers = false): string {
   let result = '';
   for (let index = 0; index < sql.length;) {

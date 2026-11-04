@@ -1,5 +1,6 @@
+import type { DatabaseSync } from 'node:sqlite';
 import { assertStoredReloginFields, reloginDetailValue } from './relogin-fields';
-import { openStoreConnection } from './store';
+import { openStoreConnection, sanitizeReloginFieldsForRead } from './store';
 
 export const RELOGIN_KINDS = ['dead', 'healed', 'wiped', 'identity-replaced', 'external-login'] as const;
 export type ReloginKind = (typeof RELOGIN_KINDS)[number];
@@ -59,18 +60,25 @@ export function recordRelogin(
 }
 
 /** Read-only window report used by doctor/status/report cutover. */
-export function reloginsInWindow(dbPath: string, window: ReloginWindow): ReloginEvent[] {
-  if (!Number.isFinite(window.start) || !Number.isFinite(window.end) || window.end < window.start) {
+export function reloginsInWindow(dbPath: string, window: ReloginWindow): ReloginEvent[];
+export function reloginsInWindow(db: DatabaseSync, window?: ReloginWindow): ReloginEvent[];
+export function reloginsInWindow(dbOrPath: string | DatabaseSync, window?: ReloginWindow): ReloginEvent[] {
+  if (window !== undefined && (!Number.isFinite(window.start) || !Number.isFinite(window.end) || window.end < window.start)) {
     throw new Error('invalid relogin window');
   }
-  const db = openStoreConnection(dbPath, true);
+  if (typeof dbOrPath === 'string' && window === undefined) {
+    throw new Error('invalid relogin window');
+  }
+  const db = typeof dbOrPath === 'string' ? openStoreConnection(dbOrPath, true) : dbOrPath;
   try {
-    return db.prepare(`
+    const range = window ? 'WHERE ts >= ? AND ts <= ?' : '';
+    const rows = db.prepare(`
       SELECT id, ts, provider, account_id AS accountId, kind, detail, evidence, user_denied_at AS userDeniedAt
-      FROM relogin_events WHERE ts >= ? AND ts <= ? ORDER BY ts ASC, id ASC
-    `).all(window.start, window.end) as unknown as ReloginEvent[];
+      FROM relogin_events ${range} ORDER BY ts ASC, id ASC
+    `).all(...(window ? [window.start, window.end] : [])) as unknown as ReloginEvent[];
+    return rows.map((row) => ({ ...row, ...sanitizeReloginFieldsForRead(row) }));
   } finally {
-    db.close();
+    if (typeof dbOrPath === 'string') db.close();
   }
 }
 

@@ -12,7 +12,7 @@ import { hasLegacyPiOwnerEntry, readPiOwnerProviders } from './pi-migrate';
 import { discoverCommands, resolveCommand, type CommandContext, type CommandDefinition } from './registry';
 import { runCodexProbeClaims } from './commands/codex-probe-claims';
 import { redactError, redactSecrets } from './redact';
-import type { ReloginEvent } from './relogin';
+import { reloginsInWindow, type ReloginEvent } from './relogin';
 import { doctorQlb, initializeQlb, listCheckNames, type DoctorReport, type InitReport } from './diagnostics';
 import { platformKeychain } from './keychain';
 import { createOwnedCredentialSource } from './credentials';
@@ -88,7 +88,6 @@ import {
   openStore,
   openStoreConnection,
   readOnlySchemaRefusal,
-  scrubReloginFields,
   WAL_SIDECAR_UNREADABLE,
   walSidecarUnreadableMessage,
   type Store,
@@ -1009,7 +1008,7 @@ export function parseArgs(argv: string[]): Opts {
         if (cmd === 'resolve') {
           console.error('qlb resolve: --switches, --relogins, and --window are only valid with status');
           console.error(USAGE);
-          process.exit(2);
+          process.exit(1);
         }
         console.error('qlb status: choose only one of --switches or --relogins');
         process.exit(1);
@@ -1064,7 +1063,7 @@ export function parseArgs(argv: string[]): Opts {
     if (history !== undefined || window) {
       console.error('qlb resolve: --switches, --relogins, and --window are only valid with status');
       console.error(USAGE);
-      process.exit(2);
+      process.exit(1);
     }
     if (!model) {
       console.error('qlb resolve: --model is required');
@@ -1087,7 +1086,7 @@ export function parseArgs(argv: string[]): Opts {
   }
   if (history !== undefined && (dashboard || view !== 'dashboard')) {
     console.error('qlb status: --dashboard and --flat cannot be used with history output');
-    process.exit(2);
+    process.exit(1);
   }
   return { cmd: 'status', json, view, history, window };
 }
@@ -1226,18 +1225,6 @@ function listStatusSwitches(
   }));
 }
 
-function listStatusRelogins(
-  db: ReturnType<typeof openStoreConnection>,
-  window: { start: number; end: number } | undefined,
-  scrubbed: boolean,
-): ReloginEvent[] {
-  const range = window ? 'WHERE ts >= ? AND ts <= ?' : '';
-  const rows = db.prepare(`SELECT id, ts, provider, account_id AS accountId, kind, detail, evidence,
-    user_denied_at AS userDeniedAt FROM relogin_events ${range} ORDER BY ts ASC, id ASC`)
-    .all(...(window ? [window.start, window.end] : [])) as unknown as ReloginEvent[];
-  return scrubbed ? rows : rows.map((row) => ({ ...row, ...scrubReloginFields(row) }));
-}
-
 function formatStatusRelogin(row: ReloginEvent): StatusRelogin {
   return {
     id: row.id, ts: isoStatusTimestamp(row.ts), provider: redactedStatusString(row.provider)!,
@@ -1275,11 +1262,7 @@ async function runStatus(opts: StatusOpts): Promise<number> {
       const activeWindow = window ?? undefined;
       const rows = opts.history === 'switches'
         ? listStatusSwitches(db, activeWindow)
-        : listStatusRelogins(
-          db,
-          activeWindow,
-          db.prepare("SELECT 1 FROM config WHERE key = 'relogin.scrubbedAt'").get() !== undefined,
-        ).map(formatStatusRelogin);
+        : reloginsInWindow(db, activeWindow).map(formatStatusRelogin);
       if (opts.json) {
         console.log(JSON.stringify({ [opts.history]: rows }));
       } else {

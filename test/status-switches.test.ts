@@ -7,7 +7,8 @@ import { DatabaseSync } from 'node:sqlite';
 import { describe, it } from 'node:test';
 
 import { recordRelogin } from '../src/relogin';
-import { openStore, openStoreConnection } from '../src/store';
+import { reloginDetailFingerprint } from '../src/relogin-fields';
+import { openStore, openStoreConnection, sanitizeReloginFieldsForRead } from '../src/store';
 
 const cliPath = join(__dirname, '..', 'src', 'cli.js');
 const START = Date.UTC(2026, 10, 1, 12, 0, 0);
@@ -173,6 +174,56 @@ describe('status switch and relogin history', () => {
     }
   });
 
+  it('sanitizes unsafe rows inserted after the scrub marker', () => {
+    const f = fixture();
+    const store = seedStore(f);
+    store.close();
+    const sensitiveDetail = 'legacy customer recovery note after marker';
+    const db = new DatabaseSync(f.dbPath);
+    try {
+      db.prepare(`INSERT INTO relogin_events (ts, provider, account_id, kind, detail, evidence)
+        VALUES (?, ?, ?, ?, ?, ?)`).run(START, 'anthropic', 'account-a', 'external-login', sensitiveDetail, 'invalid');
+    } finally {
+      db.close();
+    }
+
+    const result = runCli(['status', '--relogins', '--json'], f.env);
+    assert.equal(result.status, 0, result.stderr);
+    assert.doesNotMatch(result.stdout, new RegExp(sensitiveDetail));
+    const body = JSON.parse(result.stdout) as { relogins: Array<{ detail: string | null; evidence: string | null }> };
+    assert.equal(body.relogins[0]?.detail, reloginDetailFingerprint(sensitiveDetail));
+    assert.equal(body.relogins[0]?.evidence, null);
+  });
+
+  it('preserves canonical relogin fingerprints with and without the scrub marker', () => {
+    const fingerprint = 'sha256:0123456789abcdef';
+    for (const marker of [true, false]) {
+      const f = fixture();
+      const store = seedStore(f);
+      store.close();
+      const db = new DatabaseSync(f.dbPath);
+      try {
+        if (!marker) db.prepare("DELETE FROM config WHERE key = 'relogin.scrubbedAt'").run();
+        db.prepare(`INSERT INTO relogin_events (ts, provider, account_id, kind, detail, evidence)
+          VALUES (?, ?, ?, ?, ?, ?)`).run(START, 'anthropic', 'account-a', 'external-login', fingerprint, 'dead');
+      } finally {
+        db.close();
+      }
+
+      const result = runCli(['status', '--relogins', '--json'], f.env);
+      assert.equal(result.status, 0, result.stderr);
+      const body = JSON.parse(result.stdout) as { relogins: Array<{ detail: string | null }> };
+      assert.equal(body.relogins[0]?.detail, fingerprint);
+    }
+  });
+
+  it('sanitizes relogin fields idempotently', () => {
+    for (const detail of ['legacy customer recovery note', 'sha256:0123456789abcdef', 'dead', null]) {
+      const once = sanitizeReloginFieldsForRead({ detail, evidence: 'invalid' });
+      assert.deepEqual(sanitizeReloginFieldsForRead(once), once);
+    }
+  });
+
   it('refuses history on a schema that requires migration', () => {
     const f = fixture();
     const store = seedStore(f);
@@ -201,18 +252,25 @@ describe('status switch and relogin history', () => {
     assert.match(windowed.stderr, /no-cutover-window/);
   });
 
-  it('resolve rejects history flags before writing a routing decision', () => {
-    const f = fixture();
-    const result = runCli(['resolve', '--model', 'claude-opus-4', '--switches'], f.env);
-    assert.equal(result.status, 2, result.stderr);
-    assert.match(result.stderr, /only valid with status/);
-    assert.equal(existsSync(f.dbPath), false);
+  it('resolve rejects history flags with the usage exit code before writing a routing decision', () => {
+    for (const flag of ['--switches', '--relogins', '--window']) {
+      const f = fixture();
+      const result = runCli(['resolve', '--model', 'claude-opus-4', flag], f.env);
+      assert.equal(result.status, 1, result.stderr);
+      assert.match(result.stderr, /only valid with status/);
+      assert.equal(existsSync(f.dbPath), false);
+    }
   });
 
-  it('rejects --dashboard with history output', () => {
+  it('uses the usage exit code for history flag conflicts', () => {
     const f = fixture();
-    const result = runCli(['status', '--dashboard', '--switches'], f.env);
-    assert.equal(result.status, 2, result.stderr);
-    assert.match(result.stderr, /--dashboard and --flat cannot be used with history output/);
+    for (const args of [
+      ['status', '--dashboard', '--switches'],
+      ['status', '--flat', '--switches'],
+      ['status', '--window'],
+    ]) {
+      const result = runCli(args, f.env);
+      assert.equal(result.status, 1, result.stderr);
+    }
   });
 });
