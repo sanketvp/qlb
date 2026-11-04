@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
+import { runKeychainCommand, type LiveSwitchReceipt } from '../src/commands/keychain';
 import { createSwitchAnthropicCommand } from '../src/commands/switch-anthropic';
 import { defaultConfig } from '../src/config';
 import { claudePaths } from '../src/cc-paths';
@@ -418,6 +419,82 @@ describe('Claude self-republish (K5b-1)', () => {
     try {
       assert.equal((await switchClaude(subject.deps, republish)).outcome, 'ok');
       assertRepublishNeverCounts(subject);
+    } finally { await close(subject); }
+  });
+
+  it('K5b-3 chain close counts exactly two non-republish non-injected ok rows', async () => {
+    const subject = await fixture();
+    try {
+      beginCutover(subject.store, NOW);
+      const config = { ...defaultConfig(subject.home), dbPath: join(subject.root, 'qlb.sqlite') };
+      const stdout: string[] = [];
+      const stderr: string[] = [];
+      const ctx: CommandContext = {
+        stdout: (line) => stdout.push(line), stderr: (line) => stderr.push(line), env: subject.env,
+        config, loadConfig: () => config, home: subject.home,
+        registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
+      };
+      let attempt = 0;
+      const command = createSwitchAnthropicCommand({
+        openStore: () => openStore(config.dbPath),
+        makeSwitchDeps: async (_ctx, store) => ({
+          deps: { ...subject.deps, store, attempt: `k5b-3-${++attempt}` },
+        }),
+      });
+      const run = async (...args: string[]): Promise<LiveSwitchReceipt> => {
+        stdout.length = 0;
+        stderr.length = 0;
+        const exitCode = await command.execute!([...args, '--json'], ctx);
+        assert.equal(stdout.length, 1);
+        const result = JSON.parse(stdout[0]!) as LiveSwitchReceipt;
+        assert.equal(exitCode, result.outcome === 'ok' ? 0 : result.outcome === 'refused' ? 3 : 1);
+        return result;
+      };
+
+      const slotA = (await subject.slots.readSlot('a', { fresh: true })).credential;
+      await subject.backend.set(subject.paths.keychainService, 'fixture-user', slotA);
+
+      assert.equal((await run('b')).outcome, 'ok');
+      const notActive = await run('a', '--republish');
+      assert.deepEqual({ outcome: notActive.outcome, reason: notActive.reason }, { outcome: 'refused', reason: 'republish-not-active' });
+
+      const republished = await run('b', '--republish');
+      assert.deepEqual({ outcome: republished.outcome, from: republished.from, to: republished.to, injected: republished.injected }, { outcome: 'ok', from: 'b', to: 'b', injected: false });
+      const republishedRow = republishRows(subject).at(-1);
+      assert.deepEqual(republishedRow, { outcome: 'ok', detail: 'republish' });
+
+      subject.store.setConfig('keychain.liveItemsReadAuthorizedAt', '1');
+      subject.store.setConfig('keychain.liveItemsReadAuthorizedIdentityHash', 'fixture-pin');
+      const receiptOutput: string[] = [];
+      const receiptErrors: string[] = [];
+      const receiptContext: CommandContext = { ...ctx, stdout: (line) => receiptOutput.push(line), stderr: (line) => receiptErrors.push(line) };
+      assert.equal(await runKeychainCommand(['check-launchd', '--live'], receiptContext, {
+        helperPath: () => '/fixture/qlb-keychain-helper',
+        helperConfigReader: (key) => key === 'keychain.helperCheckIdentityHash' ? 'fixture-pin' : null,
+        helperIdentityVerifier: () => ({ trusted: true }),
+        runLaunchdLiveSwitch: () => republished,
+      }), 0);
+      assert.equal(receiptErrors.length, 0);
+
+      const liveBeforeInjection = await subject.backend.get(subject.paths.keychainService, 'fixture-user');
+      const configBeforeInjection = readFileSync(subject.paths.globalConfigPath, 'utf8');
+      subject.env.QLB_FAULT_INJECTION = '1';
+      const injected = await run('a', '--inject', 'fail-step', '8');
+      assert.deepEqual({ outcome: injected.outcome, reason: injected.reason, injected: injected.injected }, { outcome: 'rolled-back', reason: 'fault-injection:fail-step-8', injected: true });
+      assert.equal(await subject.backend.get(subject.paths.keychainService, 'fixture-user'), liveBeforeInjection);
+      assert.equal(readFileSync(subject.paths.globalConfigPath, 'utf8'), configBeforeInjection);
+      assert.equal(subject.store.getActiveLogin('anthropic')?.accountId, 'b');
+      delete subject.env.QLB_FAULT_INJECTION;
+
+      await subject.backend.set(subject.paths.keychainService, 'fixture-user', credential('c-foreign'));
+      assert.equal((await run('a')).outcome, 'ok');
+      assert.equal(subject.backend.listServices().some((service) => service.startsWith('qlb:anthropic:unclaimed:')), true);
+
+      const db = openStoreConnection(config.dbPath, true);
+      try {
+        const row = db.prepare("SELECT COUNT(*) AS count FROM switch_log WHERE outcome = 'ok' AND injected = 0 AND detail IS NOT 'republish'").get() as { count: number };
+        assert.equal(row.count, 2);
+      } finally { db.close(); }
     } finally { await close(subject); }
   });
 });
