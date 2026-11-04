@@ -1,6 +1,7 @@
 // QLB's C-swap process detection; process-table failures fail closed per spec S24.
 
-import { execFileSync } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
+import { promisify } from 'node:util';
 
 export interface CswapProcess {
   pid: number;
@@ -8,6 +9,11 @@ export interface CswapProcess {
 
 export interface CswapProcessOptions {
   runPs?: () => string;
+  platform?: NodeJS.Platform;
+}
+
+export interface CswapProcessAsyncOptions {
+  runPs?: () => Promise<string>;
   platform?: NodeJS.Platform;
 }
 
@@ -20,17 +26,30 @@ export class CswapProcessCheckError extends Error {
 }
 
 const PROCESS_TABLE_MAX_BUFFER = 64 * 1024 * 1024;
+const execFileAsync = promisify(execFile);
 
-function defaultRunPs(platform: NodeJS.Platform): string {
-  const args = platform === 'linux'
+function psArgs(platform: NodeJS.Platform): string[] {
+  return platform === 'linux'
     ? ['-ww', '-ax', '-o', 'pid=,args=']
     : ['-ax', '-o', 'pid=,args='];
-  return execFileSync('/bin/ps', args, {
+}
+
+function defaultRunPs(platform: NodeJS.Platform): string {
+  return execFileSync('/bin/ps', psArgs(platform), {
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'ignore'],
     timeout: 5_000,
     maxBuffer: PROCESS_TABLE_MAX_BUFFER,
   });
+}
+
+async function defaultRunPsAsync(platform: NodeJS.Platform): Promise<string> {
+  const result = await execFileAsync('/bin/ps', psArgs(platform), {
+    encoding: 'utf8',
+    timeout: 5_000,
+    maxBuffer: PROCESS_TABLE_MAX_BUFFER,
+  });
+  return result.stdout;
 }
 
 function pythonArguments(args: string): string | undefined {
@@ -42,10 +61,6 @@ function pythonArguments(args: string): string | undefined {
 function isCswapModuleOption(args: string): boolean {
   const moduleOption = /^-([A-Za-z]*)m\s*claude_swap(\.|\s|$)/.exec(args);
   if (moduleOption === null) return false;
-
-  // CPython's interface options make -W and -X consume the rest of their
-  // cluster as their value, so neither can precede -m here.
-  // https://docs.python.org/3/using/cmdline.html#interface-options
   return !/[WX]/.test(moduleOption[1]);
 }
 
@@ -61,9 +76,6 @@ function hasClusteredCswapModule(args: string): boolean {
 function firstPythonScriptIsCswap(args: string): boolean {
   let remaining = pythonArguments(args);
   if (remaining === undefined) return false;
-
-  // Avoid tokenizing paths containing spaces. Check -m before the generic
-  // option skip; the listed value-taking options consume their value.
   let option: RegExpExecArray | null;
   while (true) {
     if (isCswapModuleOption(remaining)) return true;
@@ -77,11 +89,7 @@ function firstPythonScriptIsCswap(args: string): boolean {
 
 function isCswapCommand(args: string): boolean {
   if (args.includes('/claude-swap/')) return true;
-
-  // ps renders arguments as a space-delimited string, so do not split paths
-  // containing spaces. This intentionally over-detects a script argument.
   if (/(^|\/)(cswap|claude-swap)(\s|$)/.test(args)) return true;
-
   const hasPythonInterpreter = pythonArguments(args) !== undefined;
   const hasCswapModule = /(^|\s)-m\s*claude_swap(\.|\s|$)/.test(args)
     || hasClusteredCswapModule(args);
@@ -91,9 +99,6 @@ function isCswapCommand(args: string): boolean {
 function strictFirstPythonScriptIsCswap(args: string): boolean {
   let remaining = pythonArguments(args);
   if (remaining === undefined) return false;
-
-  // Match the liveness classifier's option handling, but inspect only the
-  // first script token. A later argument named cswap is never a signal target.
   let option: RegExpExecArray | null;
   while (true) {
     if (isCswapModuleOption(remaining)) return true;
@@ -113,65 +118,68 @@ function executableToken(args: string): string {
 /** A positive, argv-position-aware classifier for processes safe to signal. */
 export function isCswapCommandToSignal(args: string): boolean {
   const executable = executableToken(args);
-  // Exact basename only: a /claude-swap/ install directory can hold other
-  // executables (its venv python, helpers) that must never be signalled.
   if (/(^|\/)(cswap|claude-swap)$/.test(executable)) return true;
-
-  // pythonArguments is deliberately also used here so interpreter recognition
-  // stays consistent with the liveness guard. Requiring it on argv[0] avoids
-  // mistaking a later argument or script path for the interpreter.
   return pythonArguments(executable) !== undefined && strictFirstPythonScriptIsCswap(args);
 }
 
-function listCswapProcessesMatching(
-  opts: CswapProcessOptions,
-  matches: (args: string) => boolean,
-): CswapProcess[] {
-  const platform = opts.platform ?? process.platform;
-  if (platform !== 'darwin' && platform !== 'linux') {
-    throw new CswapProcessCheckError(`cannot inspect C-swap processes on ${platform}`);
-  }
-
-  let output: string;
-  try {
-    output = opts.runPs ? opts.runPs() : defaultRunPs(platform);
-  } catch {
-    throw new CswapProcessCheckError('failed to inspect the process table');
-  }
-
+function parseProcesses(output: string, matches: (args: string) => boolean): CswapProcess[] {
   const processes: CswapProcess[] = [];
   let parsedProcessCount = 0;
   for (const line of output.split(/\r?\n/)) {
     const match = /^\s*(\d+)\s+(.+)$/.exec(line);
     if (!match) continue;
-
     parsedProcessCount += 1;
     const pid = Number(match[1]);
-    if (Number.isSafeInteger(pid) && pid > 0 && matches(match[2])) {
-      processes.push({ pid });
-    }
+    if (Number.isSafeInteger(pid) && pid > 0 && matches(match[2])) processes.push({ pid });
   }
-
-  if (parsedProcessCount === 0) {
-    throw new CswapProcessCheckError('process table was empty');
-  }
-
+  if (parsedProcessCount === 0) throw new CswapProcessCheckError('process table was empty');
   return processes;
 }
 
-/**
- * List running C-swap processes without retaining their command lines.
- * Callers MUST treat a CswapProcessCheckError as "C-swap may be alive" and
- * refuse the guarded operation.
- */
+function platformFor(opts: { platform?: NodeJS.Platform }): NodeJS.Platform {
+  const platform = opts.platform ?? process.platform;
+  if (platform !== 'darwin' && platform !== 'linux') {
+    throw new CswapProcessCheckError(`cannot inspect C-swap processes on ${platform}`);
+  }
+  return platform;
+}
+
+function listCswapProcessesMatching(opts: CswapProcessOptions, matches: (args: string) => boolean): CswapProcess[] {
+  const platform = platformFor(opts);
+  try {
+    return parseProcesses(opts.runPs ? opts.runPs() : defaultRunPs(platform), matches);
+  } catch (error) {
+    if (error instanceof CswapProcessCheckError) throw error;
+    throw new CswapProcessCheckError('failed to inspect the process table');
+  }
+}
+
+async function listCswapProcessesMatchingAsync(opts: CswapProcessAsyncOptions, matches: (args: string) => boolean): Promise<CswapProcess[]> {
+  const platform = platformFor(opts);
+  try {
+    return parseProcesses(await (opts.runPs ? opts.runPs() : defaultRunPsAsync(platform)), matches);
+  } catch (error) {
+    if (error instanceof CswapProcessCheckError) throw error;
+    throw new CswapProcessCheckError('failed to inspect the process table');
+  }
+}
+
+/** List running C-swap processes without retaining their command lines. */
 export function listCswapProcesses(opts: CswapProcessOptions = {}): CswapProcess[] {
   return listCswapProcessesMatching(opts, isCswapCommand);
 }
 
-/**
- * List only C-swap processes positively identified as safe SIGTERM targets.
- * Like listCswapProcesses, command lines remain local to this scan.
- */
+/** Async equivalent of listCswapProcesses, with the same classifiers and errors. */
+export function listCswapProcessesAsync(opts: CswapProcessAsyncOptions = {}): Promise<CswapProcess[]> {
+  return listCswapProcessesMatchingAsync(opts, isCswapCommand);
+}
+
+/** List only C-swap processes positively identified as safe SIGTERM targets. */
 export function listCswapProcessesToSignal(opts: CswapProcessOptions = {}): CswapProcess[] {
   return listCswapProcessesMatching(opts, isCswapCommandToSignal);
+}
+
+/** Async equivalent of listCswapProcessesToSignal, with the same classifiers and errors. */
+export function listCswapProcessesToSignalAsync(opts: CswapProcessAsyncOptions = {}): Promise<CswapProcess[]> {
+  return listCswapProcessesMatchingAsync(opts, isCswapCommandToSignal);
 }

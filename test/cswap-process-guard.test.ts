@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import type { execFileSync as ExecFileSync } from 'node:child_process';
 import test from 'node:test';
 
-import { CswapProcessCheckError, listCswapProcesses, listCswapProcessesToSignal } from '../src/cswap-processes';
+import { CswapProcessCheckError, listCswapProcesses, listCswapProcessesAsync, listCswapProcessesToSignal, listCswapProcessesToSignalAsync } from '../src/cswap-processes';
 
 const childProcess = require('node:child_process') as { execFileSync: typeof ExecFileSync };
 const supportedPlatform: NodeJS.Platform = 'darwin';
@@ -147,6 +147,20 @@ test('strict signal lister throws CswapProcessCheckError when ps returns an empt
   assert.throws(
     () => listCswapProcessesToSignal({ platform: supportedPlatform, runPs: () => '' }),
     CswapProcessCheckError,
+  );
+});
+
+test('async scans classify, time out and fail closed like the sync scans', async () => {
+  const fixture = ' 101 /usr/local/bin/cswap auto\n 102 node /tmp/nope';
+  assert.deepEqual(await listCswapProcessesAsync({ platform: supportedPlatform, runPs: async () => fixture }), [{ pid: 101 }]);
+  assert.deepEqual(await listCswapProcessesToSignalAsync({ platform: supportedPlatform, runPs: async () => fixture }), [{ pid: 101 }]);
+  await assert.rejects(
+    listCswapProcessesAsync({ platform: supportedPlatform, runPs: async () => { throw Object.assign(new Error('timeout'), { code: 'ETIMEDOUT' }); } }),
+    (error: Error) => error instanceof CswapProcessCheckError && error.message === 'failed to inspect the process table',
+  );
+  await assert.rejects(
+    listCswapProcessesToSignalAsync({ platform: supportedPlatform, runPs: async () => '' }),
+    (error: Error) => error instanceof CswapProcessCheckError && error.message === 'process table was empty',
   );
 });
 
