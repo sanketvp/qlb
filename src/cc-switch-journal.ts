@@ -5,7 +5,7 @@ import { type JsonObject } from './anthropic-oauth';
 import { type ClaudeSlotBackend } from './cc-slots';
 import { withProperLockfile, type HeldProperLockfile } from './cc-locks';
 import { isCredentialNotFound } from './credential-backends';
-import { atomicWriteText, fsyncDirSync } from './fsutil';
+import { atomicWriteText, errno, fsyncDirSync } from './fsutil';
 import { qlbHomeDir } from './home';
 import { QLB_KEYCHAIN_ACCOUNT } from './keychain';
 
@@ -101,10 +101,6 @@ function finiteNumber(value: unknown): value is number { return typeof value ===
 function nullableString(value: unknown): value is string | null { return value === null || isString(value); }
 function nullableFiniteNumber(value: unknown): value is number | null { return value === null || finiteNumber(value); }
 function isJsonObject(value: unknown): value is JsonObject { return isRecord(value); }
-function errno(error: unknown): string | undefined {
-  return typeof error === 'object' && error !== null ? (error as NodeJS.ErrnoException).code : undefined;
-}
-
 function parsedDecision(value: unknown): ClaudeSwitchDecision | null {
   if (!isRecord(value) || !nullableFiniteNumber(value.leftHeadroom)
     || !nullableFiniteNumber(value.leftRecoveryAt) || !nullableString(value.leftTrigger)) return null;
