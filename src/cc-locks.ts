@@ -21,7 +21,7 @@ export const CREDENTIALS_STALENESS_MS = 60_000;
 export const CONFIG_STALENESS_MS = 10_000;
 /** Refresh lock directory mtime more often than Claude Code's five-second cadence. */
 export const TOUCH_INTERVAL_MS = 3_000;
-/** Maximum time spent waiting for each individual lock directory; X4 pins DEFAULT_TIMEOUT_MS. */
+/** Maximum time spent waiting for each individual lock directory. */
 export const DEFAULT_TIMEOUT_MS = 9_000;
 const RETRY_MIN_MS = 250;
 const RETRY_JITTER_MS = 250;

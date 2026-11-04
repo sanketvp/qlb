@@ -89,7 +89,7 @@ function switchLogRows(store: ReturnType<typeof openStore>): Array<{ outcome: st
 }
 
 describe('Claude switch credential lock timing (K5-7 / AC3)', () => {
-  it('X4: a credential lock aged 30 s refuses between 8 s and 20 s with nothing written (AC3 9 s budget relaxed for load; the 9 s constant is pinned by cc-locks)', async () => {
+  it('X4: a credential lock aged 30 s refuses between 8 s and 20 s with nothing written', async () => {
     const subject = await switchFixture();
     try {
       stale(subject.lockPaths.oauthRefreshLockDir, 30_000);
@@ -100,7 +100,7 @@ describe('Claude switch credential lock timing (K5-7 / AC3)', () => {
       const elapsed = performance.now() - started;
 
       assert.deepEqual({ outcome: result.outcome, reason: result.reason, exitCode: result.exitCode }, { outcome: 'refused', reason: 'lock-timeout', exitCode: 3 });
-      assert.ok(elapsed >= 8_000 && elapsed <= 20_000, `credential-lock wait was ${elapsed.toFixed(0)}ms, expected 9–20 s`);
+      assert.ok(elapsed >= 8_000 && elapsed <= 20_000, `credential-lock wait was ${elapsed.toFixed(0)}ms, expected 8–20 s`);
       assert.equal(fingerprint(await subject.backend.get(subject.paths.keychainService, ACCOUNT)), liveBefore);
       assert.equal(fingerprint(readFileSync(subject.paths.globalConfigPath, 'utf8')), configBefore);
       assert.equal(existsSync(join(subject.deps.journalDir!, 'switch-anthropic.json')), false);
