@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, renameSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
@@ -143,6 +143,66 @@ describe('C-swap import (K10 / AC16)', () => {
       assert.equal(error.runId, 'missing-commit');
       return true;
     });
+  });
+
+  it('refuses an older recovery journal when a newer committed import owns its account', async () => {
+    const h = fixture();
+    const journalDir = join(h.root, 'journals');
+    await importCswap({ backupDir: h.backup, journalDir, keychain: h.keychain, repository: h.repo, runId: 'base-run', now: () => 1 });
+    await assert.rejects(importCswap({
+      backupDir: h.backup, journalDir, keychain: h.keychain, repository: h.repo, replace: true, runId: 'a-old',
+      now: () => 2, afterPromotionWrite: () => { throw new CswapImportInjectedCrash(); },
+    }), CswapImportInjectedCrash);
+    renameSync(join(journalDir, 'cswap-import-a-old'), join(journalDir, 'held-old'));
+    const newer = credential('account-a', 'refresh-a-newer');
+    writeFileSync(join(h.backup, 'credentials', '.creds-1-a@example.test.enc'), Buffer.from(newer).toString('base64'));
+    writeFileSync(join(h.backup, 'credentials', '.creds-1-a@example.test.enc.prev'), Buffer.from(credential('account-a', 'refresh-a')).toString('base64'));
+    let cleanupFailed = false;
+    const failingKeychain = {
+      get: h.keychain.get.bind(h.keychain), set: h.keychain.set.bind(h.keychain),
+      delete: async (service: string, account: string) => {
+        if (!cleanupFailed && service.includes(':staging:')) {
+          cleanupFailed = true;
+          throw new Error('injected cleanup failure');
+        }
+        await h.keychain.delete(service, account);
+      },
+    };
+    await assert.rejects(importCswap({
+      backupDir: h.backup, journalDir, keychain: failingKeychain, repository: h.repo, replace: true, runId: 'z-new', now: () => 3,
+    }), /cleanup failure/);
+    renameSync(join(journalDir, 'held-old'), join(journalDir, 'cswap-import-a-old'));
+    const options = { backupDir: h.backup, journalDir, keychain: h.keychain, repository: h.repo };
+    assert.deepEqual(classifyCswapImportJournals(options).map((journal) => ({ runId: journal.runId, action: journal.action })), [
+      { runId: 'a-old', action: 'unclassifiable' },
+      { runId: 'base-run', action: 'none' },
+      { runId: 'z-new', action: 'finish-cleanup' },
+    ]);
+    await assert.rejects(reconcileCswapImportJournals(options), (error: unknown) =>
+      error instanceof CswapImportRefusalError && error.code === 'import-journal-unclassifiable' && error.runId === 'a-old');
+    assert.equal(await h.keychain.get('qlb:anthropic:account-a', QLB_KEYCHAIN_ACCOUNT), newer);
+    assert.equal(h.repo.getSlot('account-a')?.fingerprint, credentialFingerprint(newer));
+  });
+
+  it('prints orphaned journals in text dry-run output', async () => {
+    const h = fixture();
+    const home = join(h.root, 'home');
+    stagedJournal(home, 'dry-run-orphan', 'account-a', join(home, '.qlb', 'backups'));
+    writeFileSync(join(h.backup, 'credentials', '.creds-2-b@example.test.enc'), Buffer.from(credential('account-b', 'refresh-b')).toString('base64'));
+    const dbPath = join(h.root, 'dry-run.db');
+    const store = openStore(dbPath);
+    beginCutover(store);
+    store.close();
+    const stdout: string[] = [];
+    const context: CommandContext = {
+      stdout: (line) => stdout.push(line), stderr: () => {},
+      env: { QLB_TEST_MODE: '1', QLB_HOME: join(h.root, 'qlb-home'), HOME: home, USER: macosKeychainAccountName() },
+      config: { dbPath, cswapSequencePath: join(h.backup, 'sequence.json') } as CommandContext['config'],
+      loadConfig: () => { throw new Error('not used'); }, home,
+      registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
+    };
+    assert.equal(await importCswapCommand.execute!(['--dry-run'], context), 0);
+    assert.match(stdout[0], /journals=1; orphaned=dry-run-orphan$/);
   });
 
   it('prints a credential-free reconcile preview and leaves its journal byte-identical', async () => {

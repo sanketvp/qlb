@@ -544,25 +544,45 @@ export function probeCswapImportLock(options: CswapImportOptions): CswapImportLo
 
 /** Classify every existing journal without reading source credentials or mutating state. */
 export function classifyCswapImportJournals(options: CswapImportOptions): CswapImportJournalStatus[] {
-  return readCswapImportJournalFiles(options).map(({ runId, text }) => {
+  const journals: Array<{ journal: Journal | null; status: CswapImportJournalStatus }> = readCswapImportJournalFiles(options).map(({ runId, text }) => {
     const sha256 = createHash('sha256').update(text).digest('hex');
     try {
       const journal = JSON.parse(text) as Partial<Journal>;
-      if (!isSafeJournal(journal, runId)) return { runId, phase: 'invalid', action: 'unclassifiable', sha256 };
-      if (journal.phase === 'staged') return { runId, phase: journal.phase, action: 'purge-staging', sha256 };
-      if (journal.phase === 'cleaned' || journal.phase === 'aborted') return { runId, phase: journal.phase, action: 'none', sha256 };
+      if (!isSafeJournal(journal, runId)) return { journal: null, status: { runId, phase: 'invalid' as const, action: 'unclassifiable' as const, sha256 } };
+      if (journal.phase === 'staged') return { journal, status: { runId, phase: journal.phase, action: 'purge-staging' as const, sha256 } };
+      if (journal.phase === 'cleaned' || journal.phase === 'aborted') return { journal, status: { runId, phase: journal.phase, action: 'none' as const, sha256 } };
       let committed: boolean;
       try { committed = options.repository.getImportRun(runId)?.committedAt != null; } catch {
-        return { runId, phase: journal.phase, action: 'unclassifiable', sha256 };
+        return { journal, status: { runId, phase: journal.phase, action: 'unclassifiable' as const, sha256 } };
       }
       // A journal may say `committed` only after the SQLite authority commit.
       // Missing authority is contradictory, not permission to delete backups.
-      if (journal.phase === 'committed' && !committed) return { runId, phase: journal.phase, action: 'unclassifiable', sha256 };
-      return { runId, phase: journal.phase, action: committed ? 'finish-cleanup' : 'recover', sha256 };
+      if (journal.phase === 'committed' && !committed) return { journal, status: { runId, phase: journal.phase, action: 'unclassifiable' as const, sha256 } };
+      return { journal, status: { runId, phase: journal.phase, action: committed ? 'finish-cleanup' as const : 'recover' as const, sha256 } };
     } catch {
-      return { runId, phase: 'invalid', action: 'unclassifiable', sha256 };
+      return { journal: null, status: { runId, phase: 'invalid' as const, action: 'unclassifiable' as const, sha256 } };
     }
   });
+  for (let index = 0; index < journals.length; index += 1) {
+    const current = journals[index];
+    if (current.status.action !== 'recover' || !current.journal) continue;
+    const accounts = new Set(current.journal.slots.map((entry) => entry.accountId));
+    for (const newer of journals) {
+      if (!newer.journal || newer.journal.startedAt < current.journal.startedAt ||
+        (newer.journal.startedAt === current.journal.startedAt && newer.status.runId <= current.status.runId)) continue;
+      if (!newer.journal.slots.some((entry) => accounts.has(entry.accountId))) continue;
+      try {
+        if (options.repository.getImportRun(newer.status.runId)?.committedAt != null) {
+          current.status = { ...current.status, action: 'unclassifiable' };
+          break;
+        }
+      } catch {
+        current.status = { ...current.status, action: 'unclassifiable' };
+        break;
+      }
+    }
+  }
+  return journals.map(({ status }) => status);
 }
 
 function assertNoOrphanedCswapImportJournals(options: CswapImportOptions): void {

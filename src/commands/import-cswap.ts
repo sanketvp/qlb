@@ -35,8 +35,12 @@ function configuredOauthAccountId(path: string): string | null {
 function print(ctx: CommandContext, value: unknown, json: boolean): void {
   if (json) ctx.stdout(JSON.stringify(value));
   else {
-    const output = value as { slots?: unknown[]; keychainItems?: number; encFiles?: number; journals?: unknown[] };
-    if (output.slots) ctx.stdout(`slots=${output.slots.length}; keychainItems=${output.keychainItems}; encFiles=${output.encFiles}`);
+    const output = value as { slots?: unknown[]; keychainItems?: number; encFiles?: number; journals?: Array<{ runId: string; action: string }> };
+    if (output.slots) {
+      const orphaned = output.journals?.filter((journal) => journal.action !== 'none') ?? [];
+      const suffix = orphaned.length ? `; journals=${output.journals?.length}; orphaned=${orphaned.map((journal) => journal.runId).join(',')}` : '';
+      ctx.stdout(`slots=${output.slots.length}; keychainItems=${output.keychainItems}; encFiles=${output.encFiles}${suffix}`);
+    }
     else ctx.stdout(`journals=${output.journals?.length ?? 0}`);
   }
 }
