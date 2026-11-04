@@ -303,6 +303,35 @@ describe('qlb retire cswap (AC22 retire)', () => {
     } finally { f.cleanup(); }
   });
 
+  it('a recovery marker set after the first doctor read still blocks retirement', async () => {
+    const f = fixture();
+    try {
+      let recoveryMarker = false;
+      let doctorReads = 0;
+      f.deps.doctor = async () => {
+        doctorReads++;
+        return recoveryMarker
+          ? s64DoctorVerdict({
+            checks: [
+              { name: 'auto:agent', level: 'PASS', message: 'healthy' },
+              { name: 'recovery', level: 'WARN', message: 'reconcile before retirement' },
+            ],
+            providers: [],
+          })
+          : { overall: 'PASS', autoAgent: 'PASS' };
+      };
+      f.deps.readSlotFingerprint = async () => {
+        recoveryMarker = true;
+        return 'current-a';
+      };
+
+      assert.deepEqual(await retireCswap(f.store, f.deps), { ok: false, code: 'doctor-not-pass' });
+      assert.equal(doctorReads, 2);
+      assert.equal(existsSync(join(f.deps.journalDir, 'retire-cswap.json')), false);
+      assert.equal(phase(f.store).note, null);
+    } finally { f.cleanup(); }
+  });
+
   it('returns a gate record with the captured slot and item fingerprints and the destructive clock', async () => {
     const f = fixture();
     try {

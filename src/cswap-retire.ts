@@ -330,6 +330,12 @@ export async function evaluateRetirementGates(
   const s64 = passesS64(store, doctor, destructiveAt);
   if (s64) return refusal(s64);
 
+  // Re-read the doctor verdict adjacent to approval so a recovery marker set
+  // during the credential and inventory checks cannot escape into the journal.
+  const freshDoctor = await dependencies.doctor();
+  if (freshDoctor.overall !== 'PASS') return refusal('doctor-not-pass');
+  if (freshDoctor.autoAgent !== 'PASS') return refusal('doctor-auto-agent-not-pass');
+
   return {
     ok: true,
     gates: {
