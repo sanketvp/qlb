@@ -32,8 +32,8 @@ function insertSlot(dbPath: string, accountId: string, archivedAt: number | null
   }
 }
 
-function credential(expiresAt: unknown): string {
-  return JSON.stringify({ claudeAiOauth: { refreshTokenExpiresAt: expiresAt } });
+function credential(expiresAt: unknown, tokens: Record<string, string> = {}): string {
+  return JSON.stringify({ claudeAiOauth: { refreshTokenExpiresAt: expiresAt, ...tokens } });
 }
 
 function keychain(...entries: Array<[string, string]>): MockKeychain {
@@ -50,16 +50,18 @@ describe('claude:login-expiry doctor check', () => {
     insertSlot(dbPath, 'expired');
     insertSlot(dbPath, 'archived', NOW);
     insertSlot(dbPath, 'dead', null, 1);
-    const row = claudeLoginExpiryCheck(dbPath, keychain(['expired', credential(NOW - 1)]), NOW);
+    const row = claudeLoginExpiryCheck(dbPath, keychain(['expired', credential(NOW - 1, {
+      refreshToken: 'refresh-token-value', accessToken: 'access-token-value',
+    })]), NOW);
     assert.deepEqual(row, {
       name: 'claude:login-expiry', level: 'FAIL',
       message: 'expired Claude login: expired (2025-12-31T23:59:59Z)',
     });
+    assert.doesNotMatch(JSON.stringify(row), /refresh-token-value|access-token-value/);
 
     const unreadable = claudeLoginExpiryCheck(dbPath, keychain(), NOW);
     assert.equal(unreadable.level, 'WARN');
     assert.equal(unreadable.message, 'Claude credential unreadable for slot expired');
-    assert.doesNotMatch(JSON.stringify(unreadable), /refresh-token-value/);
   });
 
   it('reports missing expiry, near expiry, and valid expiry without refresh or writes', () => {

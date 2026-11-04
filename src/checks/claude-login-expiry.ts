@@ -63,24 +63,8 @@ export function claudeLoginExpiryCheck(
       unreadable.length > 0 && `Claude credential unreadable for slot ${unreadable.map((item) => item.accountId).join(', ')}`,
       expiring.length > 0 && `Claude login expires within 7 days: ${expiring.map((item) => `${item.accountId} (${item.expiresAt})`).join(', ')}`,
     ].filter((item): item is string => Boolean(item)).join('; ');
-    if (expired.length > 0) {
-      return {
-        name: 'claude:login-expiry', level: 'FAIL',
-        message,
-      };
-    }
-    if (unreadable.length > 0) {
-      return {
-        name: 'claude:login-expiry', level: 'WARN',
-        message,
-      };
-    }
-    if (expiring.length > 0) {
-      return {
-        name: 'claude:login-expiry', level: 'WARN',
-        message,
-      };
-    }
+    const level = expired.length > 0 ? 'FAIL' : unreadable.length > 0 || expiring.length > 0 ? 'WARN' : undefined;
+    if (level !== undefined) return { name: 'claude:login-expiry', level, message };
     if (observations.every((item) => item.kind === 'not-reported')) {
       return { name: 'claude:login-expiry', level: 'PASS', message: 'expiry not reported' };
     }
