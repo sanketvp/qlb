@@ -16,7 +16,7 @@ import {
   type ClaudeSwitchJournal,
   type ClaudeSwitchJournalOptions,
 } from './cc-switch-journal';
-import { checkClaudeCswapProcessPrecondition, restoreConfigFromJournal, restoreLiveFromStaged, sameAccountCredential, type ClaudeSwitchDeps } from './cc-switch';
+import { checkClaudeCswapProcessPrecondition, restoreConfigFromJournal, restoreLiveFromStaged, sameAccountCredential, targetOauthAccount, type ClaudeSwitchDeps } from './cc-switch';
 import { stillTheSameProcess } from './codex-sessions';
 import { atomicWriteText } from './fsutil';
 
@@ -44,20 +44,17 @@ async function ownerIsLive(deps: ClaudeSwitchDeps, journal: ClaudeSwitchJournal)
 }
 
 export type ClaudeJournalResolveDirection = 'forward' | 'back';
-export type ClaudeJournalResolveResult = { outcome: 'resolved' | 'refused'; reason?: string; fingerprints?: string[] };
+export type ClaudeJournalResolveResult = { outcome: 'resolved' | 'refused'; reason?: string; fingerprints?: string[]; cleanup?: string[] };
 
 function prefix(fingerprint: string | null | undefined): string | null {
   return fingerprint == null ? null : fingerprint.replace(/^sha256(?:-full)?:/, '').slice(0, 12);
 }
 
-function targetOauth(journal: ClaudeSwitchJournal, deps: ClaudeSwitchDeps): JsonObject | null {
-  const slot = deps.slots.getSlot(journal.to);
-  try {
-    const value = JSON.parse(slot?.configJson ?? '') as { oauthAccount?: unknown };
-    return value.oauthAccount && typeof value.oauthAccount === 'object' && !Array.isArray(value.oauthAccount)
-      && (value.oauthAccount as { accountUuid?: unknown }).accountUuid === journal.to
-      ? value.oauthAccount as JsonObject : null;
-  } catch { return null; }
+async function cleanupResolvedJournal(close: () => void, stage: () => Promise<void>, remove: () => void): Promise<string[]> {
+  try { close(); } catch { return ['journal']; }
+  try { await stage(); } catch { return ['staged']; }
+  try { remove(); } catch { return ['journal']; }
+  return [];
 }
 
 /**
@@ -101,7 +98,7 @@ export async function resolveClaudeSwitchJournal(
         if (staged === null) return { outcome: 'refused', reason: 'staged-unreadable' };
         const liveFingerprint = credentialFingerprint(live);
         if (journal.credentialsWrittenHash === null) return { outcome: 'refused', reason: 'live-not-outgoing' };
-        if (sha256(live) !== journal.credentialsWrittenHash
+        if (live !== staged && sha256(live) !== journal.credentialsWrittenHash
           && liveFingerprint !== outgoing?.fingerprint && liveFingerprint !== outgoing?.prevFingerprint) {
           return { outcome: 'refused', reason: 'live-not-outgoing' };
         }
@@ -113,10 +110,12 @@ export async function resolveClaudeSwitchJournal(
       deps.store.recordSwitch({ ts: deps.now(), provider: 'anthropic', fromAccount: journal.from, toAccount: journal.to,
         trigger: journal.trigger, outcome: 'rolled-back', detail: 'journal-back', injected: journal.injected,
         stepsJson: JSON.stringify({ attempt: journal.attemptId }) });
-      update(ownerHeld, { closed: 'rolled-back' }, options);
-      await deleteStagedRollback(deps.live.backend, journal.stagedBlobService);
-      remove(ownerHeld, options);
-      return { outcome: 'resolved', fingerprints: [prefix(outgoing?.fingerprint), prefix(outgoing?.prevFingerprint)].filter((value): value is string => value !== null) };
+      const cleanup = await cleanupResolvedJournal(
+        () => update(ownerHeld, { closed: 'rolled-back' }, options),
+        () => deleteStagedRollback(deps.live.backend, journal.stagedBlobService),
+        () => remove(ownerHeld, options),
+      );
+      return { outcome: 'resolved', fingerprints: [prefix(outgoing?.fingerprint), prefix(outgoing?.prevFingerprint)].filter((value): value is string => value !== null), cleanup };
     }
 
     if (!journal.credentialsWritten) return { outcome: 'refused', reason: 'credentials-not-written' };
@@ -125,7 +124,7 @@ export async function resolveClaudeSwitchJournal(
     try { live = await readLiveClaudeCredentials(deps.live); target = (await deps.slots.readSlot(journal.to, { fresh: true })).credential; }
     catch { return { outcome: 'refused', reason: 'target-lineage-missing' }; }
     if (!sameAccountCredential(target, live)) return { outcome: 'refused', reason: 'target-lineage-missing' };
-    const oauth = targetOauth(journal, deps);
+    const oauth = targetOauthAccount(deps.slots.getSlot(journal.to)?.configJson, journal.to);
     if (oauth === null) return { outcome: 'refused', reason: 'target-invalid' };
     const configResult = await configLock(journal.configPath, { env: deps.env }, async (held): Promise<string | null> => {
       const raw = (deps.live.readText ?? ((path: string) => readFileSync(path, 'utf8')))(journal.configPath);
@@ -153,10 +152,12 @@ export async function resolveClaudeSwitchJournal(
       bindingJson: journal.bindingJson, stepsJson: JSON.stringify({ attempt: journal.attemptId, started: [8, 9] }),
       publishedAt: journal.publishedAt ?? null, injected: journal.injected,
       detail: journal.republish ? 'republish' : 'journal-forward', republish: journal.republish, decision: journal.decision });
-    update(ownerHeld, { committed: deps.now() }, options);
-    await deleteStagedRollback(deps.live.backend, journal.stagedBlobService);
-    remove(ownerHeld, options);
-    return { outcome: 'resolved', fingerprints: [prefix(credentialFingerprint(live))].filter((value): value is string => value !== null) };
+    const cleanup = await cleanupResolvedJournal(
+      () => update(ownerHeld, { committed: deps.now() }, options),
+      () => deleteStagedRollback(deps.live.backend, journal.stagedBlobService),
+      () => remove(ownerHeld, options),
+    );
+    return { outcome: 'resolved', fingerprints: [prefix(credentialFingerprint(live))].filter((value): value is string => value !== null), cleanup };
   })), { home: deps.home, env: deps.env });
 }
 

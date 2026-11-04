@@ -173,6 +173,37 @@ describe('Claude switch journal reconciliation (G10)', () => {
     });
   });
 
+  it('back resolves a not-landed foreign credential without changing it', async () => {
+    const subject = await fixture();
+    const foreign = credential('foreign');
+    const entry = await install(subject, journal(subject, { credentialsWritten: false }));
+    await writeStagedRollback(subject.backend, entry.stagedBlobService, foreign);
+    await subject.backend.set(subject.paths.keychainService, 'fixture-user', foreign);
+
+    assert.equal((await resolveClaudeSwitchJournal(subject.deps, 'back')).outcome, 'resolved');
+    assert.equal(await subject.backend.get(subject.paths.keychainService, 'fixture-user'), foreign);
+    assert.equal(journalExists(subject), false);
+  });
+
+  it('forward reports resolved when journal cleanup fails after commit', async () => {
+    const subject = await fixture();
+    await install(subject);
+    await subject.backend.set(subject.paths.keychainService, 'fixture-user', subject.target);
+    subject.deps.journalOps = {
+      update: (_held, patch, options) => {
+        if (patch.committed !== undefined) throw new Error('journal disk failure');
+        updateClaudeSwitchJournal(_held, patch, options);
+      },
+      remove: deleteClaudeSwitchJournal,
+    };
+
+    const result = await resolveClaudeSwitchJournal(subject.deps, 'forward');
+    assert.equal(result.outcome, 'resolved');
+    assert.deepEqual(result.cleanup, ['journal']);
+    assert.equal(subject.active(), 'b');
+    assert.equal(journalExists(subject), true);
+  });
+
   it('operator forward preserves a step-8 snapshot if commit fails, so back restores the outgoing config', async () => {
     const subject = await fixture();
     const changedConfig = `${JSON.stringify({ oauthAccount: { accountUuid: 'b' }, retained: 'yes' })}\n`;

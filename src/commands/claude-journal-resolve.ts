@@ -40,14 +40,16 @@ export function createClaudeJournalResolveCommand(deps: ClaudeJournalResolveComm
           ctx.stderr(`qlb claude journal resolve: refused: ${admission.code}`);
           return 3;
         }
-        const built = await (deps.makeSwitchDeps ?? ((commandCtx, commandStore, warn) =>
-          makeProductionSwitchDeps({ randomUUID: deps.randomUUID ?? randomUUID }, commandCtx, commandStore, warn)))(ctx, store, () => {});
+        const warn = (message: string): void => ctx.stderr(`qlb claude journal resolve: warning: ${message}`);
+        const built = await (deps.makeSwitchDeps ?? ((commandCtx, commandStore, commandWarn) =>
+          makeProductionSwitchDeps({ randomUUID: deps.randomUUID ?? randomUUID }, commandCtx, commandStore, commandWarn)))(ctx, store, warn);
         resources = 'deps' in built ? built : { deps: built };
         const result = await (deps.resolve ?? resolveClaudeSwitchJournal)(resources.deps, direction);
         if (result.outcome === 'refused') {
           ctx.stderr(`qlb claude journal resolve: refused: ${result.reason}`);
           return 3;
         }
+        if (result.cleanup?.length) warn(`completed with cleanup warnings: ${result.cleanup.join(', ')}`);
         ctx.stdout(`Claude journal resolved ${direction}${result.fingerprints?.length ? ` (${result.fingerprints.join(', ')})` : ''}`);
         return 0;
       } catch (error) {
