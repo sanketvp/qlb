@@ -83,6 +83,9 @@ import { claudeConfigFileCheck } from './checks/claude-config-file';
 import { claudeLocksCheck } from './checks/claude-locks';
 import { libsecretStashChecks } from './checks/stash-libsecret';
 import { stashRootFor } from './single-stash';
+import { appendHealthLog } from './health-log';
+import { redactJson, redactSecrets } from './redact';
+import { readUserVersion, SCHEMA_VERSION } from './schema-version';
 
 export type CheckLevel = 'PASS' | 'WARN' | 'FAIL' | 'INFO' | 'N/A';
 
@@ -117,6 +120,32 @@ export interface DoctorReport {
   overall: CheckLevel;
   checks: DoctorCheck[];
   providers: ProviderDiagnostic[];
+  s64: { overall: 'PASS' | 'FAIL'; autoAgent: 'PASS' | 'FAIL' };
+  healthLogId?: number;
+}
+
+/** WARN rows that block S64; every other WARN and every INFO is advisory. */
+export const S64_BLOCKING_WARN = [
+  'auto:agent',
+  'keychain:helper',
+  'keychain:live-items-authorized',
+  'sqlite',
+  'migrations',
+  'claude:slots',
+  'codex:slots',
+  'relogin:7d',
+] as const;
+
+function isS64BlockingRow(row: Pick<DoctorCheck, 'name' | 'level'> | ProviderDiagnostic): boolean {
+  if (row.level === 'FAIL') return true;
+  return 'name' in row && row.level === 'WARN' && (S64_BLOCKING_WARN as readonly string[]).includes(row.name);
+}
+
+/** S64 maps the complete production report, not its already-WARN aggregate. */
+export function s64DoctorVerdict(report: Pick<DoctorReport, 'checks' | 'providers'>): { overall: 'PASS' | 'FAIL'; autoAgent: 'PASS' | 'FAIL' } {
+  const overall = [...report.checks, ...report.providers].some(isS64BlockingRow) ? 'FAIL' : 'PASS';
+  const autoAgent = report.checks.find((check) => check.name === 'auto:agent')?.level === 'PASS' ? 'PASS' : 'FAIL';
+  return { overall, autoAgent };
 }
 
 type CommandRunner = (command: string, args: string[]) => string;
@@ -604,6 +633,8 @@ export async function doctorQlb(
     cswapProcesses?: () => CswapProcess[];
     /** H2 LaunchAgent seam; production runs `launchctl print` only outside test mode. */
     cswapAgentStatus?: () => CswapAgentStatus;
+    /** The CLI enables the append-only v5 health history; library callers default read-only. */
+    appendHealthLog?: boolean;
   } = {},
 ): Promise<DoctorReport> {
   const checks: DoctorCheck[] = [];
@@ -917,11 +948,57 @@ export async function doctorQlb(
     }));
   }
 
-  const registeredChecks = registeredDoctorChecks(checks);
-  return {
-    command: 'doctor',
-    overall: combineOverall([...registeredChecks, ...providers]),
-    checks: registeredChecks,
-    providers,
+  let registeredChecks = registeredDoctorChecks(checks);
+  const redactCheck = (check: DoctorCheck): DoctorCheck => {
+    const detail = check.detail === undefined ? undefined : JSON.parse(redactJson(check.detail, []));
+    return {
+      ...check,
+      message: redactSecrets(check.message, []),
+      ...(detail === undefined ? {} : { detail }),
+    };
   };
+  registeredChecks = registeredChecks.map(redactCheck);
+  const redactedProviders = providers.map((provider) => ({
+    ...provider,
+    message: redactSecrets(provider.message, []),
+    ...(provider.live ? { live: { ...provider.live, message: redactSecrets(provider.live.message, []) } } : {}),
+  }));
+  const report: DoctorReport = {
+    command: 'doctor',
+    overall: combineOverall([...registeredChecks, ...redactedProviders]),
+    checks: registeredChecks,
+    providers: redactedProviders,
+    s64: s64DoctorVerdict({ checks: registeredChecks, providers: redactedProviders }),
+  };
+
+  if (options.appendHealthLog) {
+    let db: ReturnType<typeof openStoreConnection> | undefined;
+    try {
+      if (!existsSync(config.dbPath)) throw new Error('store does not exist');
+      db = openStoreConnection(config.dbPath, true);
+      if (readUserVersion(db) !== SCHEMA_VERSION) throw new Error('store is not yet v5');
+      const deadSlots = (db.prepare('SELECT account_id AS accountId FROM claude_slots WHERE dead = 1 AND archived_at IS NULL')
+        .all() as Array<{ accountId: string }>).map((row) => row.accountId);
+      const releaseRow = db.prepare('SELECT release_sha AS releaseSha FROM lifecycle WHERE closed_at IS NULL ORDER BY id DESC LIMIT 1')
+        .get() as { releaseSha?: string | null } | undefined;
+      db.close();
+      db = undefined;
+      const failing = [...report.checks, ...report.providers].filter(isS64BlockingRow);
+      report.healthLogId = appendHealthLog(config.dbPath, {
+        ts: options.now?.() ?? Date.now(),
+        phase: lifecycle.phase,
+        overall: report.s64.overall,
+        failing,
+        deadSlots,
+        releaseSha: releaseRow?.releaseSha ?? null,
+      });
+    } catch (error) {
+      try { db?.close(); } catch { /* preserve the doctor report */ }
+      const reason = error instanceof Error ? redactSecrets(error.message, []) : 'unknown store error';
+      report.checks.push({ name: 'health-log', level: 'WARN', message: `health log was not appended: ${reason}` });
+      report.overall = combineOverall([...report.checks, ...report.providers]);
+    }
+  }
+
+  return report;
 }

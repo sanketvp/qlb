@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { tmpdir } from 'node:os';
@@ -13,6 +14,7 @@ import { listStashes, recordStash } from '../src/unclaimed-index';
 import { persistStash } from '../src/single-stash';
 import { validatedAdvisoryMessage } from '../src/migration-health';
 import { openStore } from '../src/store';
+import { listHealthLog } from '../src/health-log';
 import { KeychainClientDisabledInTests, KeychainClientNotStarted, KeychainRequestStillWaiting } from '../src/keychain-client';
 
 async function doctorReport(
@@ -641,6 +643,159 @@ describe('qlb doctor', () => {
     assert.equal(registry?.name, 'doctor:registry');
     assert.equal(registry?.level, 'FAIL');
     assert.match(registry?.message ?? '', /ENOENT/);
+  });
+
+  it('qlb doctor appends exactly one health_log row per run with the S64 overall and the blocking rows', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-health-log-'));
+    const config = defaultConfig(home);
+    const store = openStore(config.dbPath);
+    store.close();
+    const now = 1_700_000_000_000;
+    const db = new DatabaseSync(config.dbPath);
+    try {
+      db.prepare(`INSERT INTO lifecycle (state, began_at, cutover_at, window_end, release_sha, drill_done_at)
+        VALUES ('cutover', ?, ?, ?, 'fixture-release', ?)`)
+        .run(now - 2, now - 1, now + 1, now);
+    } finally { db.close(); }
+
+    const report = await doctorQlb(config, {
+      appendHealthLog: true, now: () => now, command: () => 'ok', hostCommand: () => '', hostPlatform: 'linux', piProcessList: () => '',
+    });
+    const rows = listHealthLog(config.dbPath);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0]?.id, report.healthLogId);
+    assert.equal(rows[0]?.overall, report.s64.overall);
+    assert.equal(rows[0]?.phase, 'cutover');
+    assert.equal(rows[0]?.releaseSha, 'fixture-release');
+    const failing = JSON.parse(rows[0]!.failingJson) as Array<{ name?: string; provider?: string }>;
+    assert.deepEqual(failing.map((row) => row.name ?? row.provider).sort(), ['auto:agent']);
+  });
+
+  it('inside the window lifecycle:drill and auto:parked WARNs append a PASS health row', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-health-advisory-'));
+    const config = defaultConfig(home);
+    const store = openStore(config.dbPath);
+    store.setConfig('auto.anthropic.parkedUntil', String(1_700_000_100_000));
+    store.setConfig('auto.heartbeatAt', String(1_700_000_000_000));
+    store.close();
+    const now = 1_700_000_000_000;
+    const db = new DatabaseSync(config.dbPath);
+    try {
+      db.prepare(`INSERT INTO lifecycle (state, began_at, cutover_at, window_end)
+        VALUES ('cutover', ?, ?, ?)`).run(now - 2, now - 1, now + 1);
+    } finally { db.close(); }
+
+    const report = await doctorQlb(config, {
+      appendHealthLog: true, now: () => now, command: () => 'ok', hostCommand: () => '', hostPlatform: 'linux', piProcessList: () => '',
+    });
+    assert.equal(report.checks.find((check) => check.name === 'lifecycle:drill')?.level, 'WARN');
+    assert.equal(report.checks.find((check) => check.name === 'auto:parked')?.level, 'WARN');
+    assert.equal(listHealthLog(config.dbPath)[0]?.overall, 'PASS');
+  });
+
+  it('after window_end a lifecycle:window WARN appends a PASS health row', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-health-window-'));
+    const config = defaultConfig(home);
+    const store = openStore(config.dbPath);
+    store.setConfig('auto.heartbeatAt', String(1_700_000_000_000));
+    store.close();
+    const now = 1_700_000_000_000;
+    const db = new DatabaseSync(config.dbPath);
+    try {
+      db.prepare(`INSERT INTO lifecycle (state, began_at, cutover_at, window_end, drill_done_at)
+        VALUES ('cutover', ?, ?, ?, ?)`).run(now - 3, now - 2, now - 1, now - 1);
+    } finally { db.close(); }
+
+    const report = await doctorQlb(config, {
+      appendHealthLog: true, now: () => now, command: () => 'ok', hostCommand: () => '', hostPlatform: 'linux', piProcessList: () => '',
+    });
+    assert.equal(report.checks.find((check) => check.name === 'lifecycle:window')?.level, 'WARN');
+    assert.equal(listHealthLog(config.dbPath)[0]?.overall, 'PASS');
+  });
+
+  it('a keychain:helper WARN appends a FAIL health row', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-health-helper-'));
+    const config = defaultConfig(home);
+    const store = openStore(config.dbPath);
+    store.close();
+    const report = await doctorQlb(config, {
+      appendHealthLog: true,
+      command: () => 'ok', hostCommand: () => '', hostPlatform: 'darwin', piProcessList: () => '',
+      configReader: () => null,
+      helperSigning: () => ({ authority: 'QLB Keychain Helper', binaryHash: 'fixture', identityHash: 'fixture' }),
+    });
+    assert.equal(report.checks.find((check) => check.name === 'keychain:helper')?.level, 'WARN');
+    const [row] = listHealthLog(config.dbPath);
+    assert.equal(row?.overall, 'FAIL');
+    assert.equal((JSON.parse(row!.failingJson) as Array<{ name: string }>).some((entry) => entry.name === 'keychain:helper'), true);
+  });
+
+  it('a run with a dead slot appends FAIL with that slot in dead_slots_json', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-health-dead-'));
+    const config = defaultConfig(home);
+    const store = openStore(config.dbPath);
+    store.close();
+    const now = 1_700_000_000_000;
+    const db = new DatabaseSync(config.dbPath);
+    try {
+      db.prepare(`INSERT INTO lifecycle (state, began_at, cutover_at, window_end, drill_done_at)
+        VALUES ('cutover', ?, ?, ?, ?)`).run(now - 2, now - 1, now + 1, now);
+      db.prepare(`INSERT INTO claude_slots (account_id, slot_num, config_json, dead, added_at)
+        VALUES ('dead-slot', 1, '{}', 1, ?)`).run(now);
+    } finally { db.close(); }
+    await doctorQlb(config, { appendHealthLog: true, now: () => now, command: () => 'ok', hostCommand: () => '', hostPlatform: 'linux', piProcessList: () => '' });
+    const [row] = listHealthLog(config.dbPath);
+    assert.equal(row?.overall, 'FAIL');
+    assert.deepEqual(JSON.parse(row!.deadSlotsJson), ['dead-slot']);
+  });
+
+  it('a clean run stores dead_slots_json []', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-health-clean-'));
+    const config = defaultConfig(home);
+    const store = openStore(config.dbPath);
+    store.close();
+    await doctorQlb(config, { appendHealthLog: true, command: () => 'ok', hostCommand: () => '', hostPlatform: 'linux', piProcessList: () => '' });
+    assert.deepEqual(JSON.parse(listHealthLog(config.dbPath)[0]!.deadSlotsJson), []);
+  });
+
+  it('qlb doctor on a missing store appends nothing', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-health-missing-'));
+    const report = await doctorQlb(defaultConfig(home), { appendHealthLog: true, command: () => 'ok', hostCommand: () => '', hostPlatform: 'linux', piProcessList: () => '' });
+    assert.equal(report.healthLogId, undefined);
+    assert.equal(report.checks.find((check) => check.name === 'health-log')?.level, 'WARN');
+  });
+
+  it('doctorQlb without appendHealthLog writes no row', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-health-readonly-'));
+    const config = defaultConfig(home);
+    const store = openStore(config.dbPath);
+    store.close();
+    const report = await doctorQlb(config, { command: () => 'ok', hostCommand: () => '', hostPlatform: 'linux', piProcessList: () => '' });
+    assert.equal(report.healthLogId, undefined);
+    assert.deepEqual(listHealthLog(config.dbPath), []);
+  });
+
+  it('doctor stdout and --json redact a token-shaped check message', () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-cli-redact-'));
+    const token = 'sk-abcdefghijklmnopqr';
+    const env = {
+      ...process.env,
+      QLB_TEST_MODE: '1', QLB_HOME: home, HOME: home,
+      QLB_DB_PATH: join(home, `${token}.sqlite`),
+    };
+    const cli = join(__dirname, '..', 'src', 'cli.js');
+    const run = (args: string[]): string => {
+      try {
+        return execFileSync(process.execPath, [cli, ...args], { encoding: 'utf8', env, timeout: 60_000 });
+      } catch (error) {
+        return String((error as { stdout?: string }).stdout ?? '');
+      }
+    };
+    for (const args of [['doctor'], ['doctor', '--json']]) {
+      const output = run(args);
+      assert.match(output, /\[redacted\]/);
+      assert.doesNotMatch(output, new RegExp(token));
+    }
   });
 
   it('returns a report with a registry WARN for unregistered and duplicate check names', () => {

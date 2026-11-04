@@ -2216,7 +2216,7 @@ export async function main(): Promise<void> {
     process.exit(0);
   }
   if (opts.cmd === 'doctor') {
-    const report = await doctorQlb(config, { live: opts.live });
+    const report = await doctorQlb(config, { live: opts.live, appendHealthLog: true });
     printDoctor(report, opts.json);
     process.exit(report.overall === 'FAIL' ? 1 : 0);
   }

@@ -794,15 +794,19 @@ describe('qlb retire cswap (AC22 retire)', () => {
     } finally { f.cleanup(); }
   });
 
-  it('s64DoctorVerdict tolerates only the lifecycle:window WARN and fails on a provider WARN', () => {
+  it('s64DoctorVerdict treats only its explicit WARN list as blocking', () => {
     const report = {
       command: 'doctor' as const,
       overall: 'WARN' as const,
-      checks: [{ name: 'lifecycle:window', level: 'WARN' as const, message: 'expected after window' }],
-      providers: [],
+      checks: [
+        { name: 'lifecycle:window', level: 'WARN' as const, message: 'expected after window' },
+        { name: 'lifecycle:drill', level: 'WARN' as const, message: 'drill pending' },
+        { name: 'auto:parked', level: 'WARN' as const, message: 'parked' },
+      ],
+      providers: [{ provider: 'xai', level: 'WARN' as const, message: 'usage delayed', source: 'fixture', envVar: 'FIXTURE', example: 'fixture' }],
     };
     assert.deepEqual(s64DoctorVerdict(report), { overall: 'PASS', autoAgent: 'FAIL' });
-    assert.deepEqual(s64DoctorVerdict({ ...report, providers: [{ provider: 'xai', level: 'WARN', message: 'broken', source: 'fixture', envVar: 'FIXTURE', example: 'fixture' }] }), { overall: 'FAIL', autoAgent: 'FAIL' });
+    assert.deepEqual(s64DoctorVerdict({ ...report, checks: [...report.checks, { name: 'keychain:helper', level: 'WARN', message: 'matrix stale' }] }), { overall: 'FAIL', autoAgent: 'FAIL' });
   });
 
   it('s64DoctorVerdict reports autoAgent FAIL when no auto:agent check exists and PASS when it is PASS', () => {
