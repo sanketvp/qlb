@@ -8,6 +8,11 @@ import { describe, it } from 'node:test';
 
 import { defaultHeldLocks, isQlbProcessCommand, restoreCswap, runUndoCswapCommand, type TerminalHandBack } from '../src/commands/undo-cswap';
 import { undoIncompleteCheck } from '../src/checks/undo-incomplete';
+import { runAutoCommand } from '../src/commands/auto';
+import { defaultConfig } from '../src/config';
+import { doctorQlb } from '../src/diagnostics';
+import { MockKeychain } from '../src/keychain';
+import { runPiGate } from '../src/pi-gate';
 import { undoLineageMatchCheck } from '../src/checks/undo-lineage-match';
 import { discoverCommands, resolveCommand, type CommandContext } from '../src/registry';
 import { openStore, openStoreConnection } from '../src/store';
@@ -19,6 +24,7 @@ import {
   beginCutover,
   closeLifecycle,
   phase,
+  assertAdmitted,
   transition,
 } from '../src/lifecycle';
 import { recordStash } from '../src/unclaimed-index';
@@ -58,6 +64,7 @@ class ReadOnlyKeychain {
     if (value === undefined) throw new Error('item not found');
     return value;
   }
+
 }
 
 interface Fixture {
@@ -440,6 +447,83 @@ describe('qlb undo cswap --dry-run', () => {
     } finally {
       close(f);
     }
+  });
+});
+
+describe('undo hand-back admission fence (HP-K12-3)', () => {
+  it('qlb gate anthropic started 10 ms after the fence exits 3 undo-in-progress with zero POSTs', async () => {
+    const f = fixture();
+    try {
+      beginUndo(f);
+      const store = openStore(f.dbPath);
+      try { assert.equal(transition(store, 'undoing', 10).ok, true); } finally { store.close(); }
+      let posts = 0;
+      const errors: string[] = [];
+      assert.equal(await runPiGate('anthropic', {
+        dbPath: f.dbPath, env: context(f).env, deliver: () => assert.fail('credential delivery must not run'),
+        stderr: (line) => errors.push(line), guard: () => true,
+        admitted: () => {
+          const admissionStore = openStore(f.dbPath);
+          try { return assertAdmitted(admissionStore, 'gate'); } finally { admissionStore.close(); }
+        },
+        prerequisites: () => assert.fail('gate prerequisites must not run'),
+        provider: { read: async () => { posts += 1; throw new Error('unexpected POST'); } },
+        now: () => 20,
+      }), 3);
+      assert.deepEqual(errors, ['undo-in-progress']);
+      assert.equal(posts, 0);
+    } finally { close(f); }
+  });
+
+  it('qlb auto --once started between the fence and verify exits 3 undo-in-progress with no usage_polls write', async () => {
+    const f = fixture();
+    try {
+      beginUndo(f);
+      const store = openStore(f.dbPath);
+      try { assert.equal(transition(store, 'undoing', 10).ok, true); } finally { store.close(); }
+      const before = new DatabaseSync(f.dbPath, { readOnly: true });
+      const count = () => Number((before.prepare('SELECT count(*) AS count FROM usage_polls').get() as { count: number }).count);
+      assert.equal(count(), 0);
+      assert.equal(await runAutoCommand(['--once'], context(f), {
+        acquireFlock: async () => async () => undefined,
+        runAuto: async (options, deps) => {
+          const binding = { store: openStore(f.dbPath), close: () => undefined, reconcile: async () => assert.fail('reconcile must not run'), poll: async () => assert.fail('poll must not run'), tick: async () => assert.fail('tick must not run') };
+          try {
+            return await (await import('../src/auto')).runAuto(options, { ...deps, makeLiveBinding: async () => binding });
+          } finally { binding.store.close(); }
+        },
+      }), 3);
+      before.close();
+      const after = new DatabaseSync(f.dbPath, { readOnly: true });
+      try { assert.equal(Number((after.prepare('SELECT count(*) AS count FROM usage_polls').get() as { count: number }).count), 0); } finally { after.close(); }
+      assert.deepEqual(f.output, ['ERR:qlb auto: refused: undo-in-progress']);
+    } finally { close(f); }
+  });
+
+  it('doctorQlb defaults to read-only during the fence and reports undo:incomplete FAIL', async () => {
+    const f = fixture();
+    try {
+      beginUndo(f);
+      const store = openStore(f.dbPath);
+      try { assert.equal(transition(store, 'undoing', 10).ok, true); } finally { store.close(); }
+      const before = new DatabaseSync(f.dbPath, { readOnly: true });
+      const lifecycle = before.prepare('SELECT * FROM lifecycle ORDER BY id').all();
+      const config = before.prepare('SELECT key, value FROM config ORDER BY key').all();
+      before.close();
+      const keychain = new MockKeychain();
+      keychain.setSync('fixture-keychain-item', 'fixture-account', 'fixture-value');
+      const fakeItems = keychain.listServices();
+      const report = await doctorQlb(defaultConfig(f.home), { keychain, command: () => '', hostCommand: () => '', hostPlatform: 'linux', piProcessList: () => '' });
+      assert.deepEqual(report.checks.find((check) => check.name === 'undo:incomplete'), {
+        name: 'undo:incomplete', level: 'FAIL', message: 'undo-unfinished: undo_began_at=10; run qlb undo cswap --resume',
+      });
+      const after = new DatabaseSync(f.dbPath, { readOnly: true });
+      try {
+        assert.deepEqual(after.prepare('SELECT * FROM lifecycle ORDER BY id').all(), lifecycle);
+        assert.deepEqual(after.prepare('SELECT key, value FROM config ORDER BY key').all(), config);
+      } finally { after.close(); }
+      assert.deepEqual(keychain.listServices(), fakeItems);
+    } finally { close(f); }
   });
 });
 
