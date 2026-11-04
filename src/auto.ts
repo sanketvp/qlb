@@ -5,6 +5,7 @@ import { pathToFileURL } from 'node:url';
 
 import { buildUsageRequest, type HttpRequestDescription } from './anthropic-oauth';
 import { anthropicTick, pollAnthropic, type AnthropicPollDeps, type AnthropicTickDeps, type AnthropicTickResult } from './auto/anthropic';
+import { injectionDetail, type UsageInjection } from './fault-injection';
 import { claudePaths } from './cc-paths';
 import { ClaudeSlots, SqliteClaudeSlotRepository, type ClaudeSlot } from './cc-slots';
 import { ProbeVerdictMemo, resolveCswapCheck, type RefreshHttpResponse } from './cc-resync';
@@ -32,6 +33,8 @@ export function loadAutoProvider(provider: string): unknown {
 export interface RunAutoOptions {
   once?: boolean;
   dryRun?: boolean;
+  /** A fault-only seam accepted by `auto --once`; never a production transport. */
+  inject?: UsageInjection;
 }
 
 export class AutoAdmissionRefused extends Error {
@@ -52,8 +55,8 @@ export type LiveBinding = {
   store: Pick<Store, 'setConfig'>;
   close(): void;
   reconcile(): Promise<void>;
-  poll(): Promise<Awaited<ReturnType<typeof pollAnthropic>>>;
-  tick(accounts: Awaited<ReturnType<typeof pollAnthropic>>): Promise<AnthropicTickResult>;
+  poll(inject?: UsageInjection): Promise<Awaited<ReturnType<typeof pollAnthropic>>>;
+  tick(accounts: Awaited<ReturnType<typeof pollAnthropic>>, inject?: UsageInjection): Promise<AnthropicTickResult>;
 };
 
 export type DryBinding = {
@@ -177,8 +180,13 @@ function productionLiveBinding(deps: Required<Pick<AutoDependencies, 'env' | 'ho
       resources.deps.stillTheSameProcess = autoReconcileStillTheSameProcess(ownLstart, realStillTheSameProcess);
       try { await reconcileClaudeSwitch(resources.deps); } finally { resources.close?.(); }
     },
-    poll: () => pollAnthropic(pollDeps()),
-    tick: (accounts) => anthropicTick(tickDeps(accounts)),
+    poll: (inject) => pollAnthropic({ ...pollDeps(), injectUsage5xx: inject?.kind === 'usage-5xx' }),
+    tick: (accounts, inject) => anthropicTick({
+      ...tickDeps(accounts),
+      activeUsageUnknown: inject?.kind === 'usage-5xx',
+      injected: inject?.kind === 'usage-5xx',
+      injectionDetail: inject === undefined ? undefined : injectionDetail(inject),
+    }),
   };
 }
 
@@ -277,6 +285,7 @@ export async function runAuto(options: RunAutoOptions = {}, dependencies: AutoDe
   const result: AutoRunResult = { ticks: 0, decisions: [], executed: [] };
 
   if (options.dryRun) {
+    if (options.inject !== undefined) throw new AutoAdmissionRefused('fault-injection-requires-live-once');
     const binding = await (dependencies.makeDryBinding?.() ?? productionDryBinding(config, now));
     try {
       const admissionStore = { dbPath: config.dbPath } as Store;
@@ -341,10 +350,10 @@ export async function runAuto(options: RunAutoOptions = {}, dependencies: AutoDe
         } else {
           await binding.reconcile();
           if (observeStop() !== undefined) break;
-          const accounts = await binding.poll();
+          const accounts = await binding.poll(options.inject);
           // This is the final point before a tick that can switch credentials.
           if (observeStop() !== undefined) break;
-          const tick = await binding.tick(accounts);
+          const tick = await binding.tick(accounts, options.inject);
           binding.store.setConfig('auto.heartbeatAt', String(now()));
           result.ticks += 1;
           result.decisions = [tick.decision];

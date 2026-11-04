@@ -780,6 +780,86 @@ describe('qlb auto --once (G12)', () => {
     }
   });
 
+  it('usage-5xx requires the fault-injection environment before admission or locking', async () => {
+    const stderr: string[] = [];
+    const ctx: CommandContext = {
+      stdout: () => undefined, stderr: (line) => stderr.push(line), env: testEnv(mkdtempSync(join(tmpdir(), 'qlb-auto-inject-env-'))),
+      config: {} as CommandContext['config'], loadConfig: () => { throw new Error('not used'); }, home: mkdtempSync(join(tmpdir(), 'qlb-auto-inject-env-home-')),
+      registerSecret: () => undefined, deliverSecret: () => undefined, knownSecrets: () => [],
+    };
+    try {
+      assert.equal(await runAutoCommand(['--once', '--inject', 'usage-5xx', 'anthropic'], ctx, {
+        acquireFlock: async () => { throw new Error('must not lock'); }, runAuto: async () => { throw new Error('must not admit'); },
+      }), 2);
+      assert.match(stderr.join('\n'), /requires QLB_FAULT_INJECTION=1/);
+    } finally { close(ctx.home); close(ctx.env.QLB_HOME!); }
+  });
+
+  it('usage-5xx rejects dry-run placement before admission or locking', async () => {
+    const stderr: string[] = [];
+    const ctx: CommandContext = {
+      stdout: () => undefined, stderr: (line) => stderr.push(line), env: testEnv(mkdtempSync(join(tmpdir(), 'qlb-auto-inject-dry-')), { QLB_FAULT_INJECTION: '1' }),
+      config: {} as CommandContext['config'], loadConfig: () => { throw new Error('not used'); }, home: mkdtempSync(join(tmpdir(), 'qlb-auto-inject-dry-home-')),
+      registerSecret: () => undefined, deliverSecret: () => undefined, knownSecrets: () => [],
+    };
+    try {
+      assert.equal(await runAutoCommand(['--once', '--dry-run', '--inject', 'usage-5xx', 'anthropic'], ctx, {
+        acquireFlock: async () => { throw new Error('must not lock'); }, runAuto: async () => { throw new Error('must not admit'); },
+      }), 2);
+      assert.match(stderr.join('\n'), /usage: qlb auto/);
+    } finally { close(ctx.home); close(ctx.env.QLB_HOME!); }
+  });
+
+  it('usage-5xx rejects a continuous-loop placement before locking', async () => {
+    const ctx: CommandContext = {
+      stdout: () => undefined, stderr: () => undefined, env: testEnv(mkdtempSync(join(tmpdir(), 'qlb-auto-inject-loop-')), { QLB_FAULT_INJECTION: '1' }),
+      config: {} as CommandContext['config'], loadConfig: () => { throw new Error('not used'); }, home: mkdtempSync(join(tmpdir(), 'qlb-auto-inject-loop-home-')),
+      registerSecret: () => undefined, deliverSecret: () => undefined, knownSecrets: () => [],
+    };
+    try {
+      assert.equal(await runAutoCommand(['--inject', 'usage-5xx', 'anthropic'], ctx, {
+        acquireFlock: async () => { throw new Error('must not lock'); }, runAuto: async () => { throw new Error('must not admit'); },
+      }), 2);
+    } finally { close(ctx.home); close(ctx.env.QLB_HOME!); }
+  });
+
+  it('usage-5xx passes only the fault descriptor through the locked once run', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-auto-inject-once-'));
+    const stdout: string[] = [];
+    const ctx: CommandContext = {
+      stdout: (line) => stdout.push(line), stderr: () => undefined, env: testEnv(root, { QLB_FAULT_INJECTION: '1' }),
+      config: {} as CommandContext['config'], loadConfig: () => { throw new Error('not used'); }, home: root,
+      registerSecret: () => undefined, deliverSecret: () => undefined, knownSecrets: () => [],
+    };
+    let locked = 0;
+    try {
+      assert.equal(await runAutoCommand(['--once', '--inject', 'usage-5xx', 'anthropic', '--json'], ctx, {
+        acquireFlock: async () => { locked += 1; return async () => undefined; },
+        runAuto: async (options) => {
+          assert.deepEqual(options.inject, { kind: 'usage-5xx', provider: 'anthropic' });
+          return { ticks: 1, decisions: [], executed: [] };
+        },
+      }), 0);
+      assert.equal(locked, 1);
+      assert.equal(JSON.stringify(stdout).includes('token'), false);
+    } finally { close(root); }
+  });
+
+  it('usage-5xx reaches the poll and tick seams without a credential payload', async () => {
+    let pollInject: unknown;
+    let tickInject: unknown;
+    await runAuto({ once: true, inject: { kind: 'usage-5xx', provider: 'anthropic' } }, {
+      makeLiveBinding: () => ({
+        store: { setConfig: () => {} }, close: () => {}, reconcile: async () => {},
+        poll: async (inject) => { pollInject = inject; return []; },
+        tick: async (_accounts, inject) => { tickInject = inject; return { decision: { kind: 'stay', reason: 'unknown', unhealthyTicks: 1 } }; },
+      }),
+      assertAdmitted: () => ({ ok: true }), listCswapProcesses: () => [], log: () => {},
+    });
+    assert.deepEqual(pollInject, { kind: 'usage-5xx', provider: 'anthropic' });
+    assert.deepEqual(tickInject, { kind: 'usage-5xx', provider: 'anthropic' });
+  });
+
   it('no token-shaped string reaches stdout or stderr', async () => {
     const secret = 'sk-abcdefghijklmnopqrstuvwxyz123456';
     const stdout: string[] = [];

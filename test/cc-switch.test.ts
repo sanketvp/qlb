@@ -800,10 +800,11 @@ describe('Claude switch transaction (K5-5)', () => {
       assert.equal(journal.stagedWritten, true);
       assert.equal(journal.fromOauthAccount, null);
       assert.equal(journal.republish, false);
-      assert.equal(journal.detail, null);
+      assert.equal(journal.detail, 'fault-injection:usage-5xx');
       assert.equal(typeof journal.stagedBlobService, 'string');
     } };
-    assert.equal((await switchClaude(subject.deps, { ...manual, bindingJson: '{"safe":true}', injected: true })).outcome, 'ok');
+    assert.equal((await switchClaude(subject.deps, { ...manual, bindingJson: '{"safe":true}', injected: true, detail: 'fault-injection:usage-5xx' })).outcome, 'ok');
+    assert.deepEqual({ injected: subject.committed?.injected, detail: subject.committed?.detail }, { injected: true, detail: 'fault-injection:usage-5xx' });
   });
 
   it("crashAt 'after-journal' leaves a step-6 journal with stagedWritten false and no staged item", async () => {

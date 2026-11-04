@@ -42,6 +42,8 @@ export interface AnthropicPollDeps {
   resyncDeps: Omit<ResyncRotatedBackupDeps, 'slots' | 'store' | 'verdicts'>;
   consumeDeps: Omit<ConsumeGateDeps, 'slots' | 'now'>;
   getUsage: FetchActiveUsageDeps['getUsage'];
+  /** Fault-only active poll: records a synthetic 500 without reading credentials or using network. */
+  injectUsage5xx?: boolean;
 }
 
 function statusFor(record: { error?: string; sentinel?: string }): string {
@@ -157,12 +159,17 @@ export async function pollAnthropic(deps: AnthropicPollDeps): Promise<Autoswitch
   };
 
   const active = activeId === null ? null : slots.find((slot) => slot.accountId === activeId) ?? null;
-  if (active && !active.dead && due(active.accountId, polls, nowS)) {
-    let current: Awaited<ReturnType<ClaudeSlots['readSlot']>> | null = null;
-    try { current = await deps.slots.readSlot(active.accountId, { fresh: true }); } catch { /* unknown below */ }
+  if (active && !active.dead && (deps.injectUsage5xx === true || due(active.accountId, polls, nowS))) {
     const previous = readUsage(deps.store.getAllSnapshots(active.accountId));
-    if (!current) record(active.accountId, previous, null, undefined, 'slot-unreadable', true);
-    else {
+    if (deps.injectUsage5xx === true) {
+      // Deliberately do not read a slot, live credentials, or a token: this
+      // fault models an active usage endpoint failure only.
+      record(active.accountId, previous, null, undefined, 'http-500', true);
+    } else {
+      let current: Awaited<ReturnType<ClaudeSlots['readSlot']>> | null = null;
+      try { current = await deps.slots.readSlot(active.accountId, { fresh: true }); } catch { /* unknown below */ }
+      if (!current) record(active.accountId, previous, null, undefined, 'slot-unreadable', true);
+      else {
       let creds = current.credential;
       let degraded = false;
       try {
@@ -196,6 +203,7 @@ export async function pollAnthropic(deps: AnthropicPollDeps): Promise<Autoswitch
           record(active.accountId, previous, parsedUsage(parsed), readings, 'ok', true);
         }
       } else record(active.accountId, previous, null, undefined, statusFor(result), true, result.error === 'http-429', result.retryAfterS);
+      }
     }
   }
 
@@ -283,6 +291,11 @@ export interface AnthropicTickDeps {
   dryRun?: boolean;
   /** Optional test override; production defaults to the Store projection. */
   breakerRows?: AutoswitchInput['breakerRows'];
+  /** The active reading for this tick is explicitly unknown (fault-injection seam). */
+  activeUsageUnknown?: boolean;
+  /** Propagates the fault marker into the switch journal and commit row. */
+  injected?: boolean;
+  injectionDetail?: string;
   /** Called only for a switch, so every attempt gets fresh resources and ID. */
   makeSwitchDeps?: (by: 'qlb-auto') => Promise<{ deps: ClaudeSwitchDeps; close?: () => void } | ClaudeSwitchDeps>;
   switchClaude?: typeof switchClaude;
@@ -339,6 +352,7 @@ function decisionInput(deps: AnthropicTickDeps): AutoswitchInput {
     settings,
     lastSwitchAtMs,
     activeCredentialExpired: polls[activeAccountId ?? '']?.lastStatus === 'token-expired',
+    activeUsageUnknown: deps.activeUsageUnknown === true,
     unhealthyTicks: healthIsFresh ? configNumber(deps.store, `${AUTO_PREFIX}unhealthyTicks`) : undefined,
     idleHoldSinceMs: healthIsFresh ? configNumber(deps.store, `${AUTO_PREFIX}idleHoldSince`) : undefined,
     parkedUntilMs: configNumber(deps.store, `${AUTO_PREFIX}parkedUntil`),
@@ -415,6 +429,8 @@ export async function anthropicTick(deps: AnthropicTickDeps): Promise<AnthropicT
       return await (deps.switchClaude ?? switchClaude)(resources.deps, {
         to: decision.targetId,
         trigger: decision.reason,
+        ...(deps.injected === true ? { injected: true } : {}),
+        ...(deps.injectionDetail === undefined ? {} : { detail: deps.injectionDetail }),
         decision: {
           leftHeadroom: decision.leftHeadroom,
           leftRecoveryAt: decision.leftRecoveryAtMs,
