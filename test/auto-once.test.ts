@@ -486,6 +486,69 @@ describe('qlb auto --once (G12)', () => {
     }
   });
 
+  it('auto resume clears an invalid suspension marker without throwing', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-auto-resume-invalid-'));
+    const home = join(root, 'home');
+    const config = defaultConfig(home);
+    const store = openStore(config.dbPath);
+    beginCutover(store, 1);
+    assert.equal(transition(store, 'cutover', 2).ok, true);
+    store.setConfig('auto.anthropic.suspendedUntil', 'not-a-timestamp');
+    store.close();
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const ctx: CommandContext = {
+      stdout: (line) => stdout.push(line), stderr: (line) => stderr.push(line), env: testEnv(home), config,
+      loadConfig: () => config, home, registerSecret: () => undefined, deliverSecret: () => undefined, knownSecrets: () => [],
+    };
+    try {
+      assert.equal(await runAutoCommand(['resume', 'anthropic'], ctx), 0);
+      assert.deepEqual(stdout, ['cleared-invalid']);
+      assert.deepEqual(stderr, []);
+      const reopened = openStore(config.dbPath);
+      try {
+        assert.equal(reopened.getConfig('auto.anthropic.suspendedUntil'), '');
+      } finally { reopened.close(); }
+    } finally { close(root); }
+  });
+
+  it('auto resume admission runs inside the write transaction', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-auto-resume-transaction-'));
+    const config = defaultConfig(home);
+    let inTransaction = false;
+    let admissionObservedInTransaction = false;
+    const values = new Map<string, string>([['auto.anthropic.suspendedUntil', '1000000']]);
+    const store = {
+      getConfig: (key: string) => values.get(key) ?? null,
+      setConfig: (key: string, value: string) => values.set(key, value),
+      runImmediate: <T>(fn: () => T) => {
+        inTransaction = true;
+        try { return fn(); } finally { inTransaction = false; }
+      },
+      close: () => undefined,
+      db: {
+        prepare: () => ({ get: () => {
+          admissionObservedInTransaction = inTransaction;
+          return { id: 1, state: 'cutover', began_at: 1, cutover_at: 2, window_end: null, extended_at: null,
+            undo_began_at: null, rollback_at: null, retired_at: null, closed_at: null, release_sha: null,
+            drill_began_at: null, drill_done_at: null, note: null, pre_fence_state: null };
+        } }),
+      },
+    };
+    const ctx: CommandContext = {
+      stdout: () => undefined, stderr: () => undefined, env: testEnv(home), config,
+      loadConfig: () => config, home, registerSecret: () => undefined, deliverSecret: () => undefined, knownSecrets: () => [],
+    };
+    assert.equal(await runAutoCommand(['resume', 'anthropic'], ctx, {
+      openStore: () => store as unknown as ReturnType<typeof openStore>,
+      runAuto: async () => { throw new Error('not used'); }, acquireFlock: async () => null,
+    }), 0);
+    assert.equal(admissionObservedInTransaction, true);
+    assert.equal(values.get('auto.anthropic.suspendedUntil'), '');
+    assert.ok(values.get('auto.anthropic.lastResumeAt'));
+    close(home);
+  });
+
   it('auto resume with no suspension exits 0 and writes only lastResumeAt', async () => {
     const root = mkdtempSync(join(tmpdir(), 'qlb-auto-resume-empty-'));
     const home = join(root, 'home');

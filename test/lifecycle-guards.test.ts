@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -26,6 +27,7 @@ type Fixture = {
   stdout: string[];
   stderr: string[];
   lockCalls: () => number;
+  storeChecksum: () => string;
 };
 
 const credential = (tag: string): string => buildCredential(tag, {
@@ -127,7 +129,10 @@ async function fixture(
     switchClaude,
     ...overrides,
   });
-  return { command, ctx, stdout, stderr, lockCalls: () => calls };
+  return {
+    command, ctx, stdout, stderr, lockCalls: () => calls,
+    storeChecksum: () => createHash('sha256').update(readFileSync(config.dbPath)).digest('hex'),
+  };
 }
 
 async function execute(subject: Fixture, args = ['account-b']): Promise<number> {
@@ -180,9 +185,11 @@ describe('Claude switch lifecycle guards (K5-8)', () => {
     ] as const;
     for (const [state, code] of cases) {
       const subject = await fixture(state);
+      const before = subject.storeChecksum();
       assert.equal(await runAutoCommand(['resume', 'anthropic'], subject.ctx), 3, state);
       assert.deepEqual(subject.stderr, [`qlb auto resume: refused: ${code}`], state);
       assert.equal(subject.lockCalls(), 0, state);
+      assert.equal(subject.storeChecksum(), before, state);
     }
   });
 

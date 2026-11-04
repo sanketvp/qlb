@@ -423,7 +423,10 @@ function persistTickState(store: Store, input: AutoswitchInput, decision: Autosw
     setOrDelete(store, `${AUTO_PREFIX}parkedUntil`, decision.kind === 'switch' && switched ? decision.parkedUntilMs : undefined);
   }
   const suspendedUntil = decision.kind === 'stay' ? decision.suspendedUntilMs : undefined;
-  if (suspendedUntil !== undefined) store.setConfig(`${AUTO_PREFIX}suspendedUntil`, String(suspendedUntil));
+  // A resume may commit after this tick made its decision. Do not let this
+  // stale tick republish the breaker marker that resume deliberately cleared.
+  const resumedAfterTickStarted = (configNumber(store, `${AUTO_PREFIX}lastResumeAt`) ?? Number.NEGATIVE_INFINITY) > input.nowMs;
+  if (suspendedUntil !== undefined && !resumedAfterTickStarted) store.setConfig(`${AUTO_PREFIX}suspendedUntil`, String(suspendedUntil));
   else if (configNumber(store, `${AUTO_PREFIX}suspendedUntil`) !== undefined && configNumber(store, `${AUTO_PREFIX}suspendedUntil`)! <= nowMs) {
     setOrDelete(store, `${AUTO_PREFIX}suspendedUntil`, undefined);
     store.setConfig(`${AUTO_PREFIX}lastSuspensionEnd`, String(nowMs));

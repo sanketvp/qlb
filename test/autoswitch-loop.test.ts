@@ -318,6 +318,28 @@ describe('autoswitch loop (G9)', () => {
     assert.equal(f.store.getConfig('auto.anthropic.suspendedUntil'), String(clock + 3_600_000));
   });
 
+  it('a tick that started before resume does not restore the cleared suspension', async () => {
+    const f = await fixture([100, 20]);
+    const clock = NOW + 3 * 60_000;
+    const accounts: AutoswitchAccount[] = [
+      { accountId: '1', buckets: { '5h': { usedPct: 100 } }, slotNum: 1 },
+      { accountId: '2', buckets: { '5h': { usedPct: 20 } }, slotNum: 2 },
+    ];
+    for (let index = 0; index < 3; index += 1) {
+      switchRow(f.store, { from: '1', to: '2', trigger: 'at-limit', now: NOW + index * 60_000 });
+    }
+    f.store.setActiveLogin('anthropic', '1', 'fixture', clock);
+    const originalBreakerRows = f.store.listAnthropicAutoswitchBreakerRows.bind(f.store);
+    f.store.listAnthropicAutoswitchBreakerRows = () => {
+      // decisionInput has already read lastResumeAt when the concurrent resume commits.
+      f.store.setConfig('auto.anthropic.lastResumeAt', String(clock + 1));
+      return originalBreakerRows();
+    };
+    const output = await anthropicTick(tickDeps(f, async () => result('refused'), { now: () => clock, accounts }));
+    assert.deepEqual(output.decision, { kind: 'stay', reason: 'breaker', unhealthyTicks: 0, suspendedUntilMs: clock + 3_600_000 });
+    assert.equal(f.store.getConfig('auto.anthropic.suspendedUntil'), null);
+  });
+
   it('production switch deps preserve manual provenance and accept qlb-auto', async () => {
     const home = mkdtempSync(join(tmpdir(), 'qlb-switch-deps-'));
     const store = openStore(join(home, 'qlb.db'));
