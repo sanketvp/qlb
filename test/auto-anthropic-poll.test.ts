@@ -460,7 +460,7 @@ describe('auto anthropic poll (G8)', () => {
     }
     f.store.recordUsagePollResult('anthropic', 'active', { attemptedAt: NOW, status: 'http-429', http429: true });
 
-    const active = (await pollAnthropic({ ...f.deps(), models: [] })).find((account) => account.accountId === 'active');
+    const active = (await pollAnthropic({ ...f.deps(), models: ['opus'] })).find((account) => account.accountId === 'active');
     assert.equal(active?.buckets['5h']?.usedPct, 20);
     assert.equal(active?.buckets['7d']?.usedPct, 20);
   });
@@ -475,13 +475,14 @@ describe('auto anthropic poll (G8)', () => {
     f.store.upsertSnapshot('active', '7d:Fable', { usedPct: 100, fetchedAt: (NOW - 301) * 1000, resetAt: (NOW - 1) * 1000, source: 'poll', confidence: 'authoritative' });
     f.store.recordUsagePollResult('anthropic', 'active', { attemptedAt: NOW, status: 'http-429', http429: true });
 
-    const auto = (await pollAnthropic({ ...f.deps(), models: [] })).find((account) => account.accountId === 'active');
+    const auto = (await pollAnthropic({ ...f.deps(), models: ['all'] })).find((account) => account.accountId === 'active');
     const status = anthropicStoreSnapshots(f.slots.listSlots(), f.store, NOW).snapshots.find((snapshot) => snapshot.accountId === 'active');
     assert.equal(auto?.buckets['5h']?.usedPct, 20);
     assert.equal(auto?.buckets['7d']?.usedPct, 10);
+    assert.equal(auto?.buckets['7d:Fable'], undefined);
     assert.equal(status?.buckets['5h']?.usedPct, 20);
     assert.equal(status?.buckets['7d']?.usedPct, 10);
-    assert.equal(status?.buckets['7d:Fable']?.usedPct, 100);
+    assert.equal(status?.buckets['7d:Fable'], undefined);
   });
 
   it('a 5h reset during a 429 hold still drops the snapshot', async () => {

@@ -137,6 +137,21 @@ describe('QLB-owned Anthropic store projection', () => {
     assert.equal(buckets['5h']?.usedPct, 12);
   });
 
+  it('withholds a reading whose own window reset, including the newest cohort', () => {
+    const buckets = projectAnthropicUsageReadings({
+      '5h': { usedPct: 20, fetchedAt: NOW_S * 1000, resetAt: (NOW_S + 86_400) * 1000, source: 'poll', confidence: 'authoritative' },
+      '7d:Fable': { usedPct: 100, fetchedAt: NOW_S * 1000, resetAt: (NOW_S - 1) * 1000, source: 'poll', confidence: 'authoritative' },
+      '7d:Sonnet': { usedPct: 50, fetchedAt: NOW_S * 1000, source: 'poll', confidence: 'authoritative' },
+    }, {
+      accountId: 'active', lastFetchAt: NOW_S, lastAttemptAt: NOW_S,
+      nextDueAt: null, pollIntervalS: null, lastStatus: 'ok', consecutiveFailures: 0,
+      backoffUntil: null, last429At: null, heldUntil: null,
+    }, NOW_S);
+    assert.equal(buckets['5h']?.usedPct, 20);
+    assert.equal(buckets['7d:Fable'], undefined);
+    assert.equal(buckets['7d:Sonnet']?.usedPct, 50);
+  });
+
   it('excludes archived polls and C-swap import snapshots from persisted projections', () => {
     const dbPath = join(mkdtempSync(join(tmpdir(), 'qlb-anthropic-view-')), 'qlb.db');
     const store = openStore(dbPath);

@@ -82,6 +82,7 @@ export function anthropicUsageConfidence(
   snapshotResetAt: number | undefined,
   nowS: number,
 ): Confidence {
+  if (reading.resetAt !== undefined && nowS * 1000 > reading.resetAt) return 'unknown';
   if (!decisionTrusts(row, reading.fetchedAt, snapshotResetAt, nowS)) return 'unknown';
   return nowS - reading.fetchedAt / 1000 <= STALE_OK_S ? 'authoritative' : 'stale';
 }
