@@ -20,10 +20,7 @@ import { listReloginEvents } from '../src/relogin';
 import { reloginDetailFingerprint } from '../src/relogin-fields';
 import { beginCutover } from '../src/lifecycle';
 import { openStore } from '../src/store';
-
-function credential(tag: string): string {
-  return JSON.stringify({ claudeAiOauth: { accessToken: `access-${tag}`, refreshToken: `refresh-${tag}` } });
-}
+import { credential } from './support/claude-fixtures';
 
 function failNextCommit(repository: SqliteClaudeSlotRepository): void {
   const db = (repository as unknown as { db: { exec(sql: string): void } }).db;

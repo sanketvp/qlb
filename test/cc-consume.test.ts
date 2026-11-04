@@ -9,12 +9,11 @@ import { describe, it } from 'node:test';
 import { consumeClaudeSlot, defaultStashTimestamp, type ConsumeGateDeps } from '../src/cc-consume';
 import { ClaudeSlots, InMemoryClaudeSlotRepository, type ClaudeSlotBackend } from '../src/cc-slots';
 import { MockKeychain } from '../src/keychain';
+import { credential as buildCredential } from './support/claude-fixtures';
 
 const NOW = 1_000_000;
 
-function credential(tag: string, expiresAt = NOW - 1): string {
-  return JSON.stringify({ claudeAiOauth: { accessToken: `access-${tag}`, refreshToken: `refresh-${tag}`, expiresAt } });
-}
+const credential = (tag: string, expiresAt = NOW - 1): string => buildCredential(tag, { expiresAt });
 
 function fixture(): { slots: ClaudeSlots; backend: MockKeychain; deps: ConsumeGateDeps; posts: () => number } {
   const backend = new MockKeychain();

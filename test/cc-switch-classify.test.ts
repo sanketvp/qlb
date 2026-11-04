@@ -8,12 +8,15 @@ import { claudePaths } from '../src/cc-paths';
 import { ClaudeSlots, InMemoryClaudeSlotRepository } from '../src/cc-slots';
 import { MockKeychain } from '../src/keychain';
 import { switchClaude, type ClaudeSwitchDeps } from '../src/cc-switch';
+import { credential as buildCredential, twoSlotFixture } from './support/claude-fixtures';
 
 const NOW = 1_000_000;
 
-function credential(tag: string): string {
-  return JSON.stringify({ claudeAiOauth: { accessToken: `fixture-access-${tag}`, refreshToken: `fixture-refresh-${tag}`, expiresAt: NOW + 3_600_000 } });
-}
+const credential = (tag: string): string => buildCredential(tag, {
+  accessToken: `fixture-access-${tag}`,
+  refreshToken: `fixture-refresh-${tag}`,
+  expiresAt: NOW + 3_600_000,
+});
 
 async function fixture(options: {
   live: string;
@@ -29,10 +32,12 @@ async function fixture(options: {
   mkdirSync(paths.configHome, { recursive: true });
   const backend = new MockKeychain();
   const slots = new ClaudeSlots({ backend, repository: new InMemoryClaudeSlotRepository(), stashDir: join(root, 'unclaimed'), now: () => NOW });
-  const accountA = credential('a');
-  const accountB = credential('b');
-  await slots.createSlot({ accountId: 'account-a', credential: accountA, email: 'a@example.test', orgUuid: 'org-a', configJson: JSON.stringify({ oauthAccount: { accountUuid: 'account-a' } }), source: 'cswap-import' });
-  await slots.createSlot({ accountId: 'account-b', credential: accountB, email: 'b@example.test', orgUuid: 'org-b', configJson: JSON.stringify({ oauthAccount: { accountUuid: 'account-b' } }), source: 'cswap-import' });
+  const [accountA, accountB] = twoSlotFixture({
+    first: { credential: credential('a') },
+    second: { credential: credential('b') },
+  });
+  await slots.createSlot(accountA);
+  await slots.createSlot(accountB);
   await backend.set(paths.keychainService, 'fixture-user', options.live);
   writeFileSync(paths.globalConfigPath, `${JSON.stringify({ oauthAccount: { accountUuid: 'account-a' } })}\n`);
 

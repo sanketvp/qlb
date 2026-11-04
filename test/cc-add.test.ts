@@ -13,10 +13,7 @@ import { MockKeychain } from '../src/keychain';
 import { beginCutover, transition } from '../src/lifecycle';
 import { openStore } from '../src/store';
 import type { CommandContext } from '../src/registry';
-
-function credential(tag: string): string {
-  return JSON.stringify({ claudeAiOauth: { accessToken: `access-${tag}`, refreshToken: `refresh-${tag}` } });
-}
+import { credential } from './support/claude-fixtures';
 
 function config(accountId: string, email = `${accountId}@example.test`): Record<string, unknown> {
   return { oauthAccount: { accountUuid: accountId, emailAddress: email, organizationUuid: 'org-1' } };

@@ -13,13 +13,16 @@ import { ClaudeSlots, InMemoryClaudeSlotRepository } from '../src/cc-slots';
 import { switchClaude, type ClaudeSwitchDeps } from '../src/cc-switch';
 import { MockKeychain } from '../src/keychain';
 import { openStore } from '../src/store';
+import { credential as buildCredential, twoSlotFixture } from './support/claude-fixtures';
 
 const SLOT_NOW = 1_000_000;
 const ACCOUNT = 'fixture-user';
 
-function credential(tag: string): string {
-  return JSON.stringify({ claudeAiOauth: { accessToken: `fixture-access-${tag}`, refreshToken: `fixture-refresh-${tag}`, expiresAt: Date.now() + 60 * 60_000 } });
-}
+const credential = (tag: string): string => buildCredential(tag, {
+  accessToken: `fixture-access-${tag}`,
+  refreshToken: `fixture-refresh-${tag}`,
+  expiresAt: Date.now() + 60 * 60_000,
+});
 
 function fingerprint(value: string): string {
   return createHash('sha256').update(value, 'utf8').digest('hex');
@@ -43,8 +46,12 @@ async function switchFixture() {
     now: () => SLOT_NOW,
   });
   const outgoing = credential('a');
-  await slots.createSlot({ accountId: 'account-a', credential: outgoing, email: 'a@example.test', orgUuid: 'org-a', configJson: JSON.stringify({ oauthAccount: { accountUuid: 'account-a' } }), source: 'cswap-import' });
-  await slots.createSlot({ accountId: 'account-b', credential: credential('b'), email: 'b@example.test', orgUuid: 'org-b', configJson: JSON.stringify({ oauthAccount: { accountUuid: 'account-b' } }), source: 'cswap-import' });
+  const [first, second] = twoSlotFixture({
+    first: { credential: outgoing },
+    second: { credential: credential('b') },
+  });
+  await slots.createSlot(first);
+  await slots.createSlot(second);
   await backend.set(paths.keychainService, ACCOUNT, outgoing);
   writeFileSync(paths.globalConfigPath, JSON.stringify({ oauthAccount: { accountUuid: 'account-a' }, retained: 'yes' }));
 

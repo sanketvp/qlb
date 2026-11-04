@@ -27,16 +27,11 @@ import { claudePaths } from '../src/cc-paths';
 import { ClaudeSlots, SqliteClaudeSlotRepository } from '../src/cc-slots';
 import { openStore } from '../src/store';
 import { listReloginEvents } from '../src/relogin';
+import { credential as buildCredential } from './support/claude-fixtures';
 
 const NOW = 1_700_000_000_000;
 
-function credential(tag: string, expiresAt = NOW - 1): string {
-  return JSON.stringify({ claudeAiOauth: {
-    accessToken: `access-${tag}`,
-    refreshToken: `refresh-${tag}`,
-    expiresAt,
-  } });
-}
+const credential = (tag: string, expiresAt = NOW - 1): string => buildCredential(tag, { expiresAt });
 
 function outcomeIsExhaustive(outcome: RefreshOutcome): string {
   switch (outcome.outcome) {
