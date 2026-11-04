@@ -15,6 +15,7 @@ import { redactError, redactSecrets } from './redact';
 import { reloginsInWindow, type ReloginEvent } from './relogin';
 import { doctorQlb, initializeQlb, listCheckNames, type DoctorReport, type InitReport } from './diagnostics';
 import { loginExpiresAtIso } from './anthropic-oauth';
+import { qlbOwnsAnthropicUsage } from './anthropic-usage-view';
 import { platformKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from './keychain';
 import { createOwnedCredentialSource } from './credentials';
 import {
@@ -1213,7 +1214,8 @@ function isoStatusTimestampOrNull(value: number | null): string | null {
 function statusConfigTimestamp(store: Store, key: string): string | null {
   const raw = store.getConfig(key);
   if (raw === null || raw.trim() === '') return null;
-  return isoStatusTimestampOrNull(Number(raw));
+  const value = Number(raw);
+  return value > Date.now() ? isoStatusTimestampOrNull(value) : null;
 }
 
 export type StatusCredentialReader = (accountId: string) => string;
@@ -1331,15 +1333,15 @@ async function runStatus(opts: StatusOpts): Promise<number> {
     );
     return snaps;
   }));
+  const lifecycle = phase(store);
   const accounts = nested.flat().map((account) =>
-    account.provider === 'anthropic'
+    account.provider === 'anthropic' && qlbOwnsAnthropicUsage(lifecycle.state)
       ? { ...account, loginExpiresAt: statusAnthropicLoginExpiry(account.accountId) }
       : account,
   );
   const ownershipForProvider = makeOwnershipReader(store);
   // Use the lifecycle reader shared with `qlb cutover`, rather than Pi's
   // ownership journal, to decide whether Claude's active_login is authoritative.
-  const lifecycle = phase(store);
   const claudeCutoverPhase = lifecycle.state;
   const enriched = enrichAccounts(accounts, {
     ownershipForProvider,

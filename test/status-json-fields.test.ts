@@ -207,6 +207,23 @@ describe('status JSON operational fields', () => {
     assert.equal(claude?.threshold, 82);
   });
 
+  it('omits expired parked and breaker holds from status JSON', () => {
+    const f = fixture();
+    const store = initialize(f);
+    try {
+      store.setConfig('auto.anthropic.parkedUntil', String(Date.now() - 60_000));
+      store.setConfig('auto.anthropic.suspendedUntil', String(Date.now() - 60_000));
+    } finally {
+      store.close();
+    }
+
+    const result = runCli(['status', '--json'], f.env);
+    assert.equal(result.status, 0, result.stderr);
+    const body = JSON.parse(result.stdout) as { parked: string | null; breaker: string | null };
+    assert.equal(body.parked, null);
+    assert.equal(body.breaker, null);
+  });
+
   it('keeps warnings only on stderr while stdout remains one parseable JSON object', () => {
     const f = fixture();
     const store = initialize(f);
@@ -214,9 +231,11 @@ describe('status JSON operational fields', () => {
     const result = runCli(['status', '--json'], { ...f.env, QLB_CONFIG_PATH: 'relative-status-config.json' });
     assert.equal(result.status, 0, result.stderr);
     assert.doesNotMatch(result.stdout, /warning|relative-status-config/);
-    const parsed = JSON.parse(result.stdout) as { fetchedAt: number; accounts: unknown[] };
+    const parsed = JSON.parse(result.stdout) as { fetchedAt: number; accounts: Array<Record<string, unknown>> };
     assert.equal(typeof parsed.fetchedAt, 'number');
     assert.ok(Array.isArray(parsed.accounts));
+    const anthropic = parsed.accounts.find((account) => account.provider === 'anthropic');
+    assert.equal(Object.hasOwn(anthropic ?? {}, 'loginExpiresAt'), false);
     assert.match(result.stderr, /relative-status-config\.json.*relative/);
   });
 
