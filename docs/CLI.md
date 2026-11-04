@@ -90,6 +90,20 @@ Beyond the core and per-provider lines, doctor adds integration checks when the 
 
 For QLB-owned accounts, doctor also runs the `native-sync` credential-drift check, with per-account results in its detail — see [CREDENTIAL-SAFETY.md](CREDENTIAL-SAFETY.md#native-credential-drift-the-shadow-retain-tradeoff).
 
+## `qlb auto`
+
+Run QLB's Anthropic autoswitch loop. `--once` performs one live tick; `--dry-run` makes a decision without mutating state or switching credentials. The normal loop refuses to run while an active lifecycle drill is in progress.
+
+For an authorized fault-injection drill, set `QLB_FAULT_INJECTION=1` and run:
+
+```bash
+qlb auto --once --inject usage-5xx anthropic
+```
+
+This synthetic active-usage failure records `http-500`, retains the prior usage snapshot, and makes the active reading unknown for that tick so the normal unknown-grace/failover policy is exercised. It does not read a Claude slot or live credentials, and does not make a usage request. The injection is accepted only with live `--once`; it is rejected for `--dry-run`, the continuous loop, and other `qlb auto` subcommands.
+
+Flags: `[--once] [--dry-run] [--json]`. Fault injection additionally requires `QLB_FAULT_INJECTION=1` and exactly `--once --inject usage-5xx anthropic`.
+
 ## `qlb refresh`
 
 Poll every enabled adapter for a fresh gauge reading. Without `--allow-probe` this is a no-network no-op (exit 0). Pass `--allow-probe` to invoke each adapter's `fetchSnapshots()` — network reads go through the existing single-flight cache.

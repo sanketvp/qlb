@@ -65,6 +65,34 @@ function skipActive(f: Awaited<ReturnType<typeof fixture>>) {
 }
 
 describe('auto anthropic poll (G8)', () => {
+  it('records an injected active 500 without reading credentials or usage', async () => {
+    const f = await fixture();
+    f.store.writeUsagePollPlans('anthropic', {
+      active: { nextDueAt: NOW + 300, pollIntervalS: 300 },
+      inactive: { nextDueAt: NOW + 300, pollIntervalS: 300 },
+    });
+    f.store.upsertSnapshot('active', '5h', { usedPct: 42, fetchedAt: NOW * 1000, source: 'poll', confidence: 'authoritative' });
+    let readSlot = false;
+    let getUsage = false;
+    (f.slots as unknown as { readSlot: typeof f.slots.readSlot }).readSlot = async () => {
+      readSlot = true;
+      throw new Error('must not read a slot');
+    };
+    const deps = f.deps();
+    deps.getUsage = async () => {
+      getUsage = true;
+      throw new Error('must not fetch usage');
+    };
+
+    const accounts = await pollAnthropic({ ...deps, injectUsage5xx: true });
+
+    assert.equal(readSlot, false);
+    assert.equal(getUsage, false);
+    assert.equal(f.store.listUsagePolls('anthropic').active?.lastStatus, 'http-500');
+    assert.equal(f.store.getAllSnapshots('active')['5h']?.usedPct, 42);
+    assert.equal(accounts.find((account) => account.accountId === 'active')?.buckets['5h']?.usedPct, 42);
+  });
+
   it('an expired inactive slot is refreshed through the consume gate once', async () => {
     const f = await fixture();
     await f.slots.writeSlot('inactive', credential('expired', (NOW - 1) * 1000), { cause: 'fixture' });

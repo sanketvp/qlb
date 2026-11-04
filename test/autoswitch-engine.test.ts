@@ -101,6 +101,25 @@ describe('autoswitch decision engine — upstream decision table', () => {
     assertSwitch(decideAutoswitch({ ...base, unhealthyTicks: 2 }), '2', 'failover');
   });
 
+  it('forces an injected active poll failure through unknown grace and failover', () => {
+    const base = input({
+      accounts: [account('1', 20), account('2', 80)],
+      activeUsageUnknown: true,
+    });
+    assert.deepEqual(decideAutoswitch(base), { kind: 'stay', reason: 'unknown', unhealthyTicks: 1 });
+    assert.deepEqual(decideAutoswitch({ ...base, unhealthyTicks: 1 }), { kind: 'stay', reason: 'unknown', unhealthyTicks: 2 });
+    assertSwitch(decideAutoswitch({ ...base, unhealthyTicks: 2 }), '2', 'failover');
+  });
+
+  it('does not treat a forced-unknown active as fleet exhausted', () => {
+    const result = decideAutoswitch(input({
+      activeUsageUnknown: true,
+      unhealthyTicks: 2,
+      accounts: [account('1', 20), account('2', 100)],
+    }));
+    assert.deepEqual(result, { kind: 'stay', reason: 'no-qualifying-candidate', unhealthyTicks: 3 });
+  });
+
   it('uses provider hard-limit only with known usage for exhausted parking', () => {
     const reset = NOW + 10 * 60 * 1000;
     const result = decideAutoswitch(input({

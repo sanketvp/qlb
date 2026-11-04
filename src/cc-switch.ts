@@ -115,6 +115,8 @@ export interface SwitchClaudeInput {
   bindingJson?: string;
   republish?: boolean;
   injected?: boolean;
+  /** Content-free fault provenance persisted in the journal and commit row. */
+  detail?: string;
   probeVerdict?: boolean;
 }
 
@@ -604,7 +606,7 @@ async function switchClaudeAttempt(deps: ClaudeSwitchDeps, input: SwitchClaudeIn
           const owner = deps.journalOwner ?? { pid: process.pid, lstart: await processLstart(process.pid) ?? '' };
           try {
             ownerHeld.assertHeld();
-            createClaudeSwitchJournal({ v: 1, provider: 'anthropic', attemptId: attempt, from, to: transactionInput.to, trigger: transactionInput.trigger, by: deps.by, republish: transactionInput.republish === true, injected: switchWasInjected(deps, transactionInput), detail: transactionInput.republish ? 'republish' : null, decision: transactionInput.decision ?? noDecision(), outgoingKind: classified.kind, bindingJson: transactionInput.bindingJson ?? null, step: 6, stagedBlobService, stagedAccount: 'qlb', stagedWritten: false, keychainService: paths.keychainService, configPath: paths.globalConfigPath, configText: null, configWrittenHash: null, fromOauthAccount: null, credentialsWrittenHash: null, credentialsWriteStarted: false, credentialsWritten: false, configWriteStarted: false, configWritten: false, closed: null, startedAt: deps.now(), owner }, options);
+            createClaudeSwitchJournal({ v: 1, provider: 'anthropic', attemptId: attempt, from, to: transactionInput.to, trigger: transactionInput.trigger, by: deps.by, republish: transactionInput.republish === true, injected: switchWasInjected(deps, transactionInput), detail: transactionInput.detail ?? (transactionInput.republish ? 'republish' : null), decision: transactionInput.decision ?? noDecision(), outgoingKind: classified.kind, bindingJson: transactionInput.bindingJson ?? null, step: 6, stagedBlobService, stagedAccount: 'qlb', stagedWritten: false, keychainService: paths.keychainService, configPath: paths.globalConfigPath, configText: null, configWrittenHash: null, fromOauthAccount: null, credentialsWrittenHash: null, credentialsWriteStarted: false, credentialsWritten: false, configWriteStarted: false, configWritten: false, closed: null, startedAt: deps.now(), owner }, options);
             deps.crashAt?.('after-journal');
             await writeStagedRollback(live.backend, stagedBlobService, outgoingLive);
             journalUpdate(ownerHeld, { stagedWritten: true }, options);
@@ -668,7 +670,7 @@ async function switchClaudeAttempt(deps: ClaudeSwitchDeps, input: SwitchClaudeIn
           let switchId: number;
           try {
             await deps.hooks?.beforeStep9?.();
-            switchId = deps.store.commitClaudeSwitch({ now: deps.now(), fromAccount: from, toAccount: transactionInput.to, trigger: transactionInput.trigger, setBy: transactionInput.trigger === 'manual' ? 'manual' : 'auto', attempt, outgoingKind: classified.kind, bindingJson: transactionInput.bindingJson ?? null, stepsJson: JSON.stringify(state), publishedAt, injected: switchWasInjected(deps, transactionInput), detail: transactionInput.republish ? 'republish' : null, republish: transactionInput.republish === true, decision: transactionInput.decision ?? noDecision(), beforeCommit: () => { if (deps.injectFailStep === 9) throw new InjectedFailStep(9); } });
+            switchId = deps.store.commitClaudeSwitch({ now: deps.now(), fromAccount: from, toAccount: transactionInput.to, trigger: transactionInput.trigger, setBy: transactionInput.trigger === 'manual' ? 'manual' : 'auto', attempt, outgoingKind: classified.kind, bindingJson: transactionInput.bindingJson ?? null, stepsJson: JSON.stringify(state), publishedAt, injected: switchWasInjected(deps, transactionInput), detail: transactionInput.detail ?? (transactionInput.republish ? 'republish' : null), republish: transactionInput.republish === true, decision: transactionInput.decision ?? noDecision(), beforeCommit: () => { if (deps.injectFailStep === 9) throw new InjectedFailStep(9); } });
             state.started.push(9); deps.crashAt?.('after-commit');
           } catch (error) {
             if (isCrash(error)) throw error;

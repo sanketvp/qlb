@@ -7,7 +7,7 @@ import { describe, it } from 'node:test';
 import { anthropicTick } from '../src/auto/anthropic';
 import type { AutoswitchAccount } from '../src/autoswitch';
 import { makeProductionSwitchDeps } from '../src/commands/switch-anthropic';
-import { switchClaude, type ClaudeSwitchDeps, type ClaudeSwitchResult } from '../src/cc-switch';
+import { switchClaude, type ClaudeSwitchDeps, type ClaudeSwitchResult, type SwitchClaudeInput } from '../src/cc-switch';
 import { ClaudeSlots, InMemoryClaudeSlotRepository, SqliteClaudeSlotRepository } from '../src/cc-slots';
 import { claudePaths } from '../src/cc-paths';
 import { MockKeychain } from '../src/keychain';
@@ -15,7 +15,7 @@ import { openStore } from '../src/store';
 
 const NOW = 1_700_000_000_000;
 
-type Switcher = (deps: ClaudeSwitchDeps, input: { to: string; trigger: string }) => Promise<ClaudeSwitchResult>;
+type Switcher = (deps: ClaudeSwitchDeps, input: SwitchClaudeInput) => Promise<ClaudeSwitchResult>;
 
 function result(outcome: ClaudeSwitchResult['outcome'], overrides: Partial<ClaudeSwitchResult> = {}): ClaudeSwitchResult {
   return { outcome, from: '1', to: '3', attempt: 'fixture', exitCode: outcome === 'refused' ? 3 : outcome === 'ok' ? 0 : 1, ...overrides };
@@ -102,6 +102,27 @@ describe('autoswitch loop (G9)', () => {
     assert.equal(output.decision.kind, 'switch');
     assert.deepEqual(calls, [{ to: '3', trigger: 'proactive', decision: { leftHeadroom: 5, leftRecoveryAt: NOW + 60 * 60_000, leftTrigger: 'proactive' } }]);
     assert.equal(f.store.getConfig('auto.anthropic.lastSwitchAt'), String(NOW));
+  });
+
+  it('passes injected usage-failure provenance to a failover switch', async () => {
+    const f = await fixture([20, 80]);
+    f.store.setConfig('auto.anthropic.unhealthyTicks', '2');
+    f.store.setConfig('auto.anthropic.healthAccount', '1');
+    f.store.setConfig('auto.anthropic.healthTickAt', String(NOW));
+    let received: SwitchClaudeInput | undefined;
+    const output = await anthropicTick({
+      ...tickDeps(f, async (_deps, input) => {
+        received = input;
+        return result('ok', { to: input.to });
+      }),
+      activeUsageUnknown: true,
+      injected: true,
+      injectionDetail: 'fault-injection:usage-5xx',
+    });
+    assert.equal(output.decision.kind, 'switch');
+    assert.deepEqual(received && { injected: received.injected, detail: received.detail, trigger: received.trigger }, {
+      injected: true, detail: 'fault-injection:usage-5xx', trigger: 'failover',
+    });
   });
 
   it('cooldown holds a second proactive switch', async () => {

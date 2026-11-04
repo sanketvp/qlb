@@ -6,6 +6,7 @@ import { AutoAdmissionRefused, runAuto, type AutoDependencies, type AutoRunResul
 
 import { productionTryAcquireLock, type CswapLockRelease } from '../cswap-agent';
 import { atomicWriteText } from '../fsutil';
+import { parseInjectFlag } from '../fault-injection';
 import { assertAdmitted, drillActive, markDrillBegan, phase } from '../lifecycle';
 import type { CommandContext, CommandDefinition } from '../registry';
 import { openStore } from '../store';
@@ -267,11 +268,26 @@ export async function runAutoCommand(
   ctx: CommandContext,
   deps: AutoCommandDeps = defaultDeps,
 ): Promise<number> {
-  if (args[0] === 'resume') return resumeAnthropic(ctx, args.slice(1));
-  if (args[0] === 'drill-begin') return drillBegin(ctx, args.slice(1), deps);
+  // Parse before subcommand dispatch, admission, or lock acquisition: a
+  // fault flag is never silently accepted by a different auto operation.
+  const parsedInjection = parseInjectFlag(args, ctx.env);
+  if ('usage' in parsedInjection) {
+    ctx.stderr(parsedInjection.usage);
+    return 2;
+  }
+  const inject = parsedInjection.inject;
+  args = parsedInjection.rest;
+  if (args[0] === 'resume') {
+    if (inject !== null) { ctx.stderr('usage: qlb auto --once [--json] --inject usage-5xx anthropic'); return 2; }
+    return resumeAnthropic(ctx, args.slice(1));
+  }
+  if (args[0] === 'drill-begin') {
+    if (inject !== null) { ctx.stderr('usage: qlb auto --once [--json] --inject usage-5xx anthropic'); return 2; }
+    return drillBegin(ctx, args.slice(1), deps);
+  }
 
   if (args[0] === 'install-agent') {
-    if (args.length !== 1) {
+    if (inject !== null || args.length !== 1) {
       ctx.stderr('usage: qlb auto install-agent');
       return 2;
     }
@@ -291,8 +307,8 @@ export async function runAutoCommand(
   }
 
   const options = parse(args);
-  if (!options) {
-    ctx.stderr('usage: qlb auto [--once] [--dry-run] [--json] | qlb auto install-agent | qlb auto resume anthropic [--json] | qlb auto drill-begin [--json]');
+  if (!options || (inject !== null && (inject.kind !== 'usage-5xx' || !options.once || options.dryRun))) {
+    ctx.stderr('usage: qlb auto [--once] [--dry-run] [--json] | qlb auto --once [--json] --inject usage-5xx anthropic | qlb auto install-agent | qlb auto resume anthropic [--json] | qlb auto drill-begin [--json]');
     return 2;
   }
 
@@ -317,7 +333,7 @@ export async function runAutoCommand(
   }
 
   try {
-    const result = await deps.runAuto(options, {
+    const result = await deps.runAuto({ ...options, ...(inject === null ? {} : { inject }) }, {
       env: ctx.env, home: ctx.home, config: ctx.config, log: ctx.stderr,
       stopWhen: lease?.lost, stopIf: lease?.isLost,
     });

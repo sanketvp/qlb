@@ -57,6 +57,8 @@ export interface AutoswitchInput {
   providerReportedLimit?: boolean;
   /** An active credential that Claude Code/Codex may renew while idle. */
   activeCredentialExpired?: boolean;
+  /** A forced poll failure makes the active reading unknown for this tick. */
+  activeUsageUnknown?: boolean;
   idleHoldSinceMs?: number | null;
   /** Timestamp of the prior successful automatic switch. */
   lastSwitchAtMs?: number;
@@ -403,7 +405,7 @@ export function decideAutoswitch(input: AutoswitchInput): AutoswitchDecision {
   // S38 and §4.3 step 1 require known usage before provider-limit can change
   // the verdict or the fleet-exhausted proof. A dead active also follows the
   // ordinary unknown grace: upstream has no immediate-dead-active escape.
-  const rawActive = activeAccount.dead || expiredPastIdleHold ? null : bindingPct(activeAccount);
+  const rawActive = activeAccount.dead || expiredPastIdleHold || input.activeUsageUnknown === true ? null : bindingPct(activeAccount);
   let unhealthyTicks = input.unhealthyTicks ?? 0;
   let trigger: Trigger;
   if (rawActive === null) {
@@ -431,7 +433,7 @@ export function decideAutoswitch(input: AutoswitchInput): AutoswitchDecision {
     input.nowMs,
     activeAccount.accountId,
     input.providerReportedLimit === true && rawActive !== null,
-    expiredPastIdleHold,
+    expiredPastIdleHold || input.activeUsageUnknown === true,
   );
   const active = all.find((item) => item.account.accountId === activeAccount.accountId);
   if (!active) {
