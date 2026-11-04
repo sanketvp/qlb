@@ -6,7 +6,7 @@ import { AutoAdmissionRefused, runAuto, type AutoDependencies, type AutoRunResul
 
 import { productionTryAcquireLock, type CswapLockRelease } from '../cswap-agent';
 import { atomicWriteText } from '../fsutil';
-import { assertAdmitted, markDrillBegan } from '../lifecycle';
+import { assertAdmitted, drillActive, markDrillBegan, phase } from '../lifecycle';
 import type { CommandContext, CommandDefinition } from '../registry';
 import { openStore } from '../store';
 
@@ -181,9 +181,9 @@ function bootoutAutoAgent(ctx: CommandContext, deps: AutoCommandDeps): BootoutRe
   } catch (error) {
     const record = error as { code?: unknown; status?: unknown } | undefined;
     const code = typeof record?.code === 'string' ? record.code : 'bootout-failed';
-    // launchctl reports a missing job as status 3; some exec seams surface it
-    // as ESRCH or ENOENT instead. All mean the agent is already out.
-    if (code === 'ESRCH' || code === 'ENOENT' || record?.status === 3) return { ok: true };
+    // execFileSync reports launchctl's status separately from its OS error
+    // code. A missing job is therefore status 3, not an ENOENT spawn failure.
+    if (code === 'ESRCH' || record?.status === 3) return { ok: true };
     if (code === 'ETIMEDOUT') return { ok: false, code: 'bootout-timeout' };
     return { ok: false, code };
   }
@@ -294,6 +294,18 @@ export async function runAutoCommand(
     return 2;
   }
 
+  if (!options.once) {
+    const store = openStore(ctx.config.dbPath);
+    try {
+      if (drillActive(phase(store))) {
+        ctx.stderr('qlb auto: refused: drill-active; finish with qlb lifecycle drill-done');
+        return 3;
+      }
+    } finally {
+      store.close();
+    }
+  }
+
   const lockPath = join(ctx.home, '.qlb', 'locks', 'auto.lock');
   if (!options.dryRun) mkdirSync(dirname(lockPath), { recursive: true, mode: 0o700 });
   const lease = options.dryRun ? null : await deps.acquireFlock(lockPath);
@@ -311,7 +323,9 @@ export async function runAutoCommand(
     return 0;
   } catch (error) {
     if (error instanceof AutoAdmissionRefused) {
-      ctx.stderr(`qlb auto: refused: ${error.code}`);
+      ctx.stderr(error.code === 'drill-active'
+        ? 'qlb auto: refused: drill-active; finish with qlb lifecycle drill-done'
+        : `qlb auto: refused: ${error.code}`);
       return 3;
     }
     throw error;

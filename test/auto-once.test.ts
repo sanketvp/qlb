@@ -16,7 +16,7 @@ import { MockKeychain } from '../src/keychain';
 import { reconcileClaudeSwitch } from '../src/journal';
 import { runExecutingCommand } from '../src/app';
 import type { CommandContext } from '../src/registry';
-import { beginCutover, markDrillDone, phase, transition } from '../src/lifecycle';
+import { beginCutover, markDrillBegan, markDrillDone, phase, transition } from '../src/lifecycle';
 import { openStore } from '../src/store';
 
 const CLI = join(__dirname, '..', 'src', 'cli.js');
@@ -116,6 +116,97 @@ describe('qlb auto --once (G12)', () => {
     }
   });
 
+  it('continuous auto refuses an active drill, while --once remains allowed and a completed drill runs normally', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-auto-active-drill-'));
+    const home = join(root, 'home');
+    const config = defaultConfig(home);
+    const store = openStore(config.dbPath);
+    beginCutover(store, 1);
+    assert.equal(transition(store, 'cutover', 2).ok, true);
+    assert.equal(markDrillBegan(store, 3).ok, true);
+    store.close();
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const ctx: CommandContext = {
+      stdout: (line) => stdout.push(line), stderr: (line) => stderr.push(line), env: testEnv(home), config,
+      loadConfig: () => config, home, registerSecret: () => undefined, deliverSecret: () => undefined, knownSecrets: () => [],
+    };
+    const lease = Object.assign(async () => undefined, {});
+    try {
+      assert.equal(await runAutoCommand([], ctx, {
+        acquireFlock: async () => { throw new Error('must not lock an active drill'); },
+        runAuto: async () => { throw new Error('must not tick an active drill'); },
+      }), 3);
+      assert.deepEqual(stderr, ['qlb auto: refused: drill-active; finish with qlb lifecycle drill-done']);
+      assert.deepEqual(stdout, []);
+
+      for (const args of [['--once'], ['--once', '--dry-run']]) {
+        let runs = 0;
+        assert.equal(await runAutoCommand(args, ctx, {
+          acquireFlock: async () => lease,
+          runAuto: async () => {
+            runs += 1;
+            return { ticks: 1, decisions: [], executed: [] };
+          },
+        }), 0, args.join(' '));
+        assert.equal(runs, 1, args.join(' '));
+      }
+
+      const reopened = openStore(config.dbPath);
+      try { assert.equal(markDrillDone(reopened, 4).ok, true); } finally { reopened.close(); }
+      let normalRuns = 0;
+      assert.equal(await runAutoCommand([], ctx, {
+        acquireFlock: async () => lease,
+        runAuto: async () => {
+          normalRuns += 1;
+          return { ticks: 1, decisions: [], executed: [] };
+        },
+      }), 0);
+      assert.equal(normalRuns, 1);
+    } finally { close(root); }
+  });
+
+  it('stops the continuous loop before the next tick when a drill begins while it sleeps', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-auto-drill-mid-loop-'));
+    const home = join(root, 'home');
+    const config = defaultConfig(home);
+    const store = openStore(config.dbPath);
+    beginCutover(store, 1);
+    assert.equal(transition(store, 'cutover', 2).ok, true);
+    let ticks = 0;
+    let sleeps = 0;
+    let wakeSleep!: () => void;
+    let scheduled!: () => void;
+    const sleepScheduled = new Promise<void>((resolve) => { scheduled = resolve; });
+    try {
+      const loop = runAuto({}, {
+        makeLiveBinding: () => ({
+          store, close: () => {}, reconcile: async () => {}, poll: async () => [],
+          tick: async () => {
+            ticks += 1;
+            assert.equal(markDrillBegan(store, 3).ok, true);
+            return { decision: { kind: 'stay', reason: 'unknown', unhealthyTicks: 0 } };
+          },
+        }),
+        listCswapProcesses: () => [], log: () => {},
+        setTimeout: (callback) => {
+          sleeps += 1;
+          if (sleeps > 1) throw new Error('second loop iteration started');
+          wakeSleep = callback;
+          scheduled();
+          return undefined as unknown as ReturnType<typeof setTimeout>;
+        },
+      });
+      await sleepScheduled;
+      wakeSleep();
+      await assert.rejects(loop, (error: unknown) => (error as AutoAdmissionRefused).code === 'drill-active');
+      assert.equal(ticks, 1);
+    } finally {
+      store.close();
+      close(root);
+    }
+  });
+
   it('drill-begin issues the exact /bin/launchctl bootout argv with a 5 s timeout, waits for auto.lock and records drill_began_at', async () => {
     const root = mkdtempSync(join(tmpdir(), 'qlb-auto-drill-begin-'));
     const home = join(root, 'home');
@@ -153,6 +244,33 @@ describe('qlb auto --once (G12)', () => {
       assert.deepEqual(stderr, []);
       const reopened = openStore(config.dbPath);
       try { assert.equal(phase(reopened).drillBeganAt, 1_010); } finally { reopened.close(); }
+    } finally { close(root); }
+  });
+
+  it('drill-begin refuses an ENOENT launchctl spawn failure and writes nothing', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-auto-drill-enoent-'));
+    const home = join(root, 'home');
+    const config = defaultConfig(home);
+    const store = openStore(config.dbPath);
+    beginCutover(store, 1);
+    assert.equal(transition(store, 'cutover', 2).ok, true);
+    store.close();
+    const stderr: string[] = [];
+    const ctx: CommandContext = {
+      stdout: () => undefined, stderr: (line) => stderr.push(line), env: testEnv(home), config,
+      loadConfig: () => config, home, registerSecret: () => undefined, deliverSecret: () => undefined, knownSecrets: () => [],
+    };
+    let probes = 0;
+    try {
+      assert.equal(await runAutoCommand(['drill-begin'], ctx, {
+        runAuto: async () => { throw new Error('not used'); },
+        exec: () => { throw Object.assign(new Error('launchctl unavailable'), { code: 'ENOENT' }); },
+        acquireFlock: async () => { probes += 1; return null; },
+      }), 3);
+      assert.deepEqual(stderr, ['qlb auto drill-begin: refused: ENOENT']);
+      assert.equal(probes, 0);
+      const reopened = openStore(config.dbPath);
+      try { assert.equal(phase(reopened).drillBeganAt, null); } finally { reopened.close(); }
     } finally { close(root); }
   });
 

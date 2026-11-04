@@ -15,7 +15,7 @@ import type { CswapProcess } from './cswap-processes';
 import { qlbHomeDir } from './home';
 import { reconcileClaudeSwitch } from './journal';
 import { platformKeychain } from './keychain';
-import { assertAdmitted, assertAdmittedInConnection, type LifecycleResult } from './lifecycle';
+import { assertAdmitted, assertAdmittedInConnection, drillActive, type LifecycleResult } from './lifecycle';
 import { loadProviderStub } from './provider-loader';
 import { redactError, redactSecrets } from './redact';
 import { listAnthropicAutoswitchBreakerRows, openStore, openStoreConnection, Store, type AutoswitchSettings, type UsagePollRow } from './store';
@@ -329,6 +329,9 @@ export async function runAuto(options: RunAutoOptions = {}, dependencies: AutoDe
       try {
         const admission = (dependencies.assertAdmitted ?? assertAdmitted)(binding.store as Store, 'switch:auto');
         if (!admission.ok) throw new AutoAdmissionRefused(admission.code ?? 'not-admitted');
+        if (!options.once && admission.row !== undefined && drillActive(admission.row)) {
+          throw new AutoAdmissionRefused('drill-active');
+        }
         let cswapAlive = false;
         try { cswapAlive = resolveCswapCheck(dependencies.listCswapProcesses, env)().length > 0; } catch { cswapAlive = true; }
         if (cswapAlive) {

@@ -14,6 +14,7 @@ import {
   beginCutover,
   beginRetirementFence,
   clearRetirementFence,
+  drillActive,
   commitCutover,
   extendWindow,
   isOperational,
@@ -122,6 +123,12 @@ describe('lifecycle (AC49)', () => {
       assert.equal(phase(store).state, 'cutting-over');
       assert.throws(() => beginCutover(store, 2_000), /SQLITE_CONSTRAINT/);
     } finally { store.close(); }
+  });
+
+  it('drillActive is true only after beginning and before completion', () => {
+    assert.equal(drillActive({ drillBeganAt: null, drillDoneAt: null }), false);
+    assert.equal(drillActive({ drillBeganAt: 1, drillDoneAt: null }), true);
+    assert.equal(drillActive({ drillBeganAt: 1, drillDoneAt: 2 }), false);
   });
 
   it('phase() exposes drillBeganAt', () => {
