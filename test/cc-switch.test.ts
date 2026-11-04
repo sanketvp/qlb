@@ -247,10 +247,36 @@ describe('Claude switch Phase A (K5-4)', () => {
     assert.equal(subject.posts(), 0);
   });
 
-  it('republish freshen guard prevents a POST even when a prechecked target changes before prepare', async () => {
+  it('republish freshen guard prevents a POST when the resolved target is not active', async () => {
     const subject = await fixture();
     await subject.slots.writeSlot('account-b', credential('b', NOW + 10 * 60_000), { cause: 'post' });
-    const result = await prepareClaudeSwitch(subject.deps, { to: 'account-b', trigger: 'manual', republish: true }, true);
+    const outgoingSlot = subject.slots.getSlot('account-a');
+    const targetSlot = subject.slots.getSlot('account-b');
+    if (!outgoingSlot || !targetSlot) throw new Error('expected fixture slots');
+
+    const result = await prepareClaudeSwitch(
+      subject.deps,
+      { to: 'account-b', trigger: 'manual', republish: true },
+      { kind: 'go', active: 'account-a', outgoingSlot, targetSlot },
+    );
+
+    assert.equal('active' in result, true);
+    assert.equal(subject.posts(), 0);
+  });
+
+  it('uses the slots resolved by preconditions without re-checking them in Phase A', async () => {
+    const subject = await fixture();
+    const input = { to: 'account-a', trigger: 'manual' as const, republish: true };
+    const checked = checkClaudeSwitchPreconditions(subject.deps, input);
+    assert.equal(checked.kind, 'go');
+    if (checked.kind !== 'go') throw new Error('expected switch preconditions to pass');
+    assert.equal(checked.active, 'account-a');
+    assert.equal(checked.outgoingSlot.accountId, 'account-a');
+    assert.equal(checked.targetSlot.accountId, 'account-a');
+    subject.slots.getSlot = () => { throw new Error('Phase A must use resolved slots'); };
+
+    const result = await prepareClaudeSwitch(subject.deps, input, checked);
+
     assert.equal('active' in result, true);
     assert.equal(subject.posts(), 0);
   });
