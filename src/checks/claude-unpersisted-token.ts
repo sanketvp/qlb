@@ -20,8 +20,8 @@ interface Evidence {
 
 /**
  * Read-only evidence for a Claude refresh successor which could not be persisted.
- * Only a later successful poll or a non-injected successful switch into the slot
- * clears the evidence; neither seeded drill rows nor noops are recoveries.
+ * Only a later credential-lineage change or real non-injected switch into the
+ * slot clears the evidence; polls, republish rows, and noops are not recoveries.
  */
 export function claudeUnpersistedTokenCheck(
   dbPath: string,
@@ -68,14 +68,14 @@ export function claudeUnpersistedTokenCheck(
       const unresolved = new Set<string>();
       const isLiveSlot = db.prepare(`SELECT 1 FROM claude_slots
         WHERE account_id = ? AND dead = 0 AND archived_at IS NULL`);
-      const laterOkPoll = db.prepare(`SELECT 1 FROM usage_polls
-        WHERE provider = 'anthropic' AND account_id = ?
-          AND COALESCE(last_fetch_at, 0) * 1000 > ?`);
+      const laterLineage = db.prepare(`SELECT 1 FROM lineage_log
+        WHERE provider = 'anthropic' AND account_id = ? AND ts > ?`);
       const laterSwitch = db.prepare(`SELECT 1 FROM switch_log
-        WHERE provider = 'anthropic' AND to_account = ? AND outcome = 'ok' AND injected = 0 AND ts > ?`);
+        WHERE provider = 'anthropic' AND to_account = ? AND outcome = 'ok' AND injected = 0
+          AND detail IS NOT 'republish' AND from_account IS NOT NULL AND from_account <> to_account AND ts > ?`);
       for (const item of evidence) {
         if (!Number.isFinite(item.at) || !isLiveSlot.get(item.accountId)) continue;
-        if (!laterOkPoll.get(item.accountId, item.at) && !laterSwitch.get(item.accountId, item.at)) {
+        if (!laterLineage.get(item.accountId, item.at) && !laterSwitch.get(item.accountId, item.at)) {
           unresolved.add(item.accountId);
         }
       }

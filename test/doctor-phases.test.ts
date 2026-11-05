@@ -283,11 +283,21 @@ describe('claude:unpersisted-token doctor check', () => {
     }
   }
 
-  function insertSwitch(dbPath: string, accountId: string, outcome: string, at: number, injected: number, detail: string | null): void {
+  function insertSwitch(dbPath: string, accountId: string, outcome: string, at: number, injected: number, detail: string | null, fromAccount: string | null = null): void {
     const db = new DatabaseSync(dbPath);
     try {
-      db.prepare(`INSERT INTO switch_log (ts, provider, to_account, trigger, outcome, injected, detail)
-        VALUES (?, 'anthropic', ?, 'manual', ?, ?, ?)`).run(at, accountId, outcome, injected, detail);
+      db.prepare(`INSERT INTO switch_log (ts, provider, from_account, to_account, trigger, outcome, injected, detail)
+        VALUES (?, 'anthropic', ?, ?, 'manual', ?, ?, ?)`).run(at, fromAccount, accountId, outcome, injected, detail);
+    } finally {
+      db.close();
+    }
+  }
+
+  function insertLineage(dbPath: string, accountId: string, at: number): void {
+    const db = new DatabaseSync(dbPath);
+    try {
+      db.prepare(`INSERT INTO lineage_log (ts, provider, account_id, to_fp, cause, by)
+        VALUES (?, 'anthropic', ?, 'replacement', 'replace', 'test')`).run(at, accountId);
     } finally {
       db.close();
     }
@@ -313,23 +323,27 @@ describe('claude:unpersisted-token doctor check', () => {
     assert.match(row.message, /active/);
   });
 
-  it('claude:unpersisted-token passes once the slot polls ok again after the auto.log line', () => {
+  it('claude:unpersisted-token does not clear after a successful poll', () => {
     const dbPath = fixture();
     insertSlot(dbPath, 'active');
     writeFileSync(join(dirname(dbPath), 'auto.log'), `claude:unpersisted-token provider=anthropic account=active at=${NOW}`);
     recordUsage(dbPath, 'active', 'ok', Math.floor(NOW / 1000) + 1, true);
-    assert.deepEqual(claudeUnpersistedTokenCheck(dbPath, 'cutover'), {
-      name: 'claude:unpersisted-token', level: 'PASS', message: 'no unrecovered Claude unpersisted-token evidence',
-    });
+    assert.equal(claudeUnpersistedTokenCheck(dbPath, 'cutover').level, 'FAIL');
   });
 
-  it('claude:unpersisted-token still fails after seeded breaker-rows and a noop', () => {
-    const dbPath = fixture();
-    insertSlot(dbPath, 'active');
-    recordUsage(dbPath, 'active', 'consume-consume-gate-unpersisted', Math.floor(NOW / 1000));
-    insertSwitch(dbPath, 'active', 'ok', NOW + 1, 1, 'fault-injection:breaker-rows:seed');
-    insertSwitch(dbPath, 'active', 'noop', NOW + 2, 0, null);
-    assert.equal(claudeUnpersistedTokenCheck(dbPath, 'cutover').level, 'FAIL');
+  it('claude:unpersisted-token rejects injected, self-target, noop, and republish switch rows', () => {
+    for (const [outcome, injected, detail, fromAccount] of [
+      ['ok', 1, 'fault-injection:breaker-rows:seed', 'other'],
+      ['ok', 0, null, 'active'],
+      ['noop', 0, null, 'active'],
+      ['ok', 0, 'republish', 'active'],
+    ] as const) {
+      const dbPath = fixture();
+      insertSlot(dbPath, 'active');
+      insertSwitch(dbPath, 'active', 'refused', NOW, 0, 'freshen-consume-gate-unpersisted');
+      insertSwitch(dbPath, 'active', outcome, NOW + 1, injected, detail, fromAccount);
+      assert.equal(claudeUnpersistedTokenCheck(dbPath, 'cutover').level, 'FAIL');
+    }
   });
 
   it('claude:unpersisted-token does not let an earlier switch recover later poll evidence', () => {
@@ -340,14 +354,33 @@ describe('claude:unpersisted-token doctor check', () => {
     assert.equal(claudeUnpersistedTokenCheck(dbPath, 'cutover').level, 'FAIL');
   });
 
-  it('claude:unpersisted-token retains successful-poll recovery after a later failure', () => {
+  it('claude:unpersisted-token passes after a later lineage replacement despite failed polls', () => {
     const dbPath = fixture();
     insertSlot(dbPath, 'active');
     writeFileSync(join(dirname(dbPath), 'auto.log'), `claude:unpersisted-token provider=anthropic account=active at=${NOW}`);
-    const recoveredAt = Math.floor(NOW / 1000) + 1;
-    recordUsage(dbPath, 'active', 'ok', recoveredAt, true);
-    recordUsage(dbPath, 'active', 'http-500', recoveredAt + 1);
+    insertLineage(dbPath, 'active', NOW + 1);
+    recordUsage(dbPath, 'active', 'http-500', Math.floor(NOW / 1000) + 2);
     assert.equal(claudeUnpersistedTokenCheck(dbPath, 'cutover').level, 'PASS');
+  });
+
+  it('claude:unpersisted-token passes after a real later switch into the slot', () => {
+    const dbPath = fixture();
+    insertSlot(dbPath, 'inactive');
+    insertSwitch(dbPath, 'inactive', 'refused', NOW, 0, 'freshen-consume-gate-unpersisted');
+    insertSwitch(dbPath, 'inactive', 'ok', NOW + 1, 0, null, 'active');
+    assert.equal(claudeUnpersistedTokenCheck(dbPath, 'cutover').level, 'PASS');
+  });
+
+  it('claude:unpersisted-token ignores dead and archived slot evidence', () => {
+    for (const [accountId, archivedAt, dead] of [
+      ['dead', null, 1],
+      ['archived', NOW, 0],
+    ] as const) {
+      const dbPath = fixture();
+      insertSlot(dbPath, accountId, archivedAt, dead);
+      insertSwitch(dbPath, accountId, 'refused', NOW, 0, 'freshen-consume-gate-unpersisted');
+      assert.equal(claudeUnpersistedTokenCheck(dbPath, 'cutover').level, 'PASS');
+    }
   });
 
   it('claude:unpersisted-token warns when auto.log is unreadable', () => {
