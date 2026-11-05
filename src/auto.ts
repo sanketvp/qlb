@@ -157,9 +157,8 @@ function productionLiveBinding(deps: Required<Pick<AutoDependencies, 'env' | 'ho
   const warn = (message: string): void => redactedLog(deps.log, `auto: warning: ${message}`);
   const live = { backend: platformKeychain, paths, env: deps.env };
   const verdicts = new ProbeVerdictMemo();
-  const models = anthropicModelScope(store);
   const pollDeps = (): AnthropicPollDeps => ({
-    models,
+    models: anthropicModelScope(store),
     store,
     slots,
     now: () => Math.floor(deps.now() / 1000),
@@ -173,7 +172,7 @@ function productionLiveBinding(deps: Required<Pick<AutoDependencies, 'env' | 'ho
     getUsage: async (accessToken) => productionRequest(buildUsageRequest(accessToken)),
   });
   const tickDeps = (accounts: Awaited<ReturnType<typeof pollAnthropic>>): AnthropicTickDeps => ({
-    store, slots, now: deps.now, accounts, models,
+    store, slots, now: deps.now, accounts, models: anthropicModelScope(store),
     makeSwitchDeps: async (by) => makeProductionSwitchDeps({}, {
       stdout: () => {}, stderr: warn, env: deps.env, config: deps.config, loadConfig: () => deps.config,
       home: deps.home, registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
@@ -205,7 +204,7 @@ function productionLiveBinding(deps: Required<Pick<AutoDependencies, 'env' | 'ho
         injectionDetail: inject === undefined ? undefined : injectionDetail(inject),
       });
     },
-    breakerRowsDrill: async () => anthropicBreakerRowsDrill({ store, slots, now: deps.now, models }),
+    breakerRowsDrill: async () => anthropicBreakerRowsDrill({ store, slots, now: deps.now, models: anthropicModelScope(store) }),
   };
 }
 

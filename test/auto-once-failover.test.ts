@@ -167,33 +167,42 @@ describe('auto once failover (G11)', () => {
     }
   });
 
-  it('live binding passes the configured model scope', async () => {
-    const fixture = weeklyUsageFixture(10, ' fAbLe ');
+  it('a running live binding adopts a CLI scope change on its next tick', async () => {
+    const fixture = weeklyUsageFixture(92);
     const autoAnthropic = autoAnthropicModule as {
       pollAnthropic: typeof pollAnthropic;
       anthropicTick: typeof anthropicTick;
     };
     const originalPoll = autoAnthropic.pollAnthropic;
     const originalTick = autoAnthropic.anthropicTick;
-    let pollModels: readonly string[] | undefined;
-    let tickModels: readonly string[] | undefined;
+    const pollModels: Array<readonly string[]> = [];
+    const tickModels: Array<readonly string[]> = [];
+    const term = signals();
+    let ticks = 0;
     try {
       autoAnthropic.pollAnthropic = async (deps) => {
-        pollModels = deps.models;
+        pollModels.push(deps.models);
         return [];
       };
       autoAnthropic.anthropicTick = async (deps) => {
-        tickModels = deps.models;
+        tickModels.push(deps.models);
+        ticks += 1;
+        if (ticks === 1) {
+          const set = await autoCli(fixture.home, ['scope', 'anthropic', 'opus', '--json']);
+          assert.equal(set.code, 0, set.stderr);
+          assert.deepEqual(JSON.parse(set.stdout), { provider: 'anthropic', scope: 'opus', changed: true, parkedCleared: false });
+        } else term.emit();
         return { decision };
       };
-      const output = await runAuto({ once: true }, {
+      const output = await runAuto({}, {
         config: fixture.config, home: fixture.home,
         env: { QLB_TEST_MODE: '1', QLB_HOME: fixture.home, HOME: fixture.home }, now: () => AUTO_NOW,
-        listCswapProcesses: () => [], log: () => {},
+        listCswapProcesses: () => [], log: () => {}, signals: term,
+        setTimeout: (callback) => { callback(); return {} as ReturnType<typeof setTimeout>; },
       });
-      assert.equal(output.ticks, 1);
-      assert.deepEqual(pollModels, ['fable']);
-      assert.deepEqual(tickModels, ['fable']);
+      assert.equal(output.ticks, 2);
+      assert.deepEqual(pollModels, [['all'], ['opus']]);
+      assert.deepEqual(tickModels, [['all'], ['opus']]);
     } finally {
       autoAnthropic.pollAnthropic = originalPoll;
       autoAnthropic.anthropicTick = originalTick;
