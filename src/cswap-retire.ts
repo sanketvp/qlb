@@ -78,7 +78,7 @@ export interface CswapRetireDependencies {
   journalDir: string;
   doctor(): Promise<{ overall: 'PASS' | 'FAIL'; autoAgent: 'PASS' | 'FAIL' }> | { overall: 'PASS' | 'FAIL'; autoAgent: 'PASS' | 'FAIL' };
   reportReceiptPasses(): boolean;
-  hasFourInjectedDrillRows(): boolean;
+  drillRowsPresent(): boolean;
   hasUnadoptedStash(): boolean;
   claudeSlotsPass(): boolean;
   slots(): RetireSlot[];
@@ -275,7 +275,7 @@ export async function evaluateRetirementGates(
     if (state !== 'migrated' && state !== 'not-applicable') return refusal(`pi-state-invalid:${provider}`);
   }
   if (current.drillDoneAt == null) return refusal('drill-not-recorded');
-  if (!dependencies.hasFourInjectedDrillRows()) return refusal('drill-rows-missing');
+  if (!dependencies.drillRowsPresent()) return refusal('drill-rows-missing');
   if (codexL13ReceiptAt(store.getConfig('codex.l13VerifiedAt')) == null) return refusal('codex-l13-missing');
   try {
     if (dependencies.hasUnadoptedStash()) return refusal('unadopted-stash');

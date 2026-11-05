@@ -66,7 +66,7 @@ function fixture(): {
     journalDir: join(root, 'journal'),
     doctor: async () => ({ overall: 'PASS', autoAgent: 'PASS' }),
     reportReceiptPasses: () => true,
-    hasFourInjectedDrillRows: () => true,
+    drillRowsPresent: () => true,
     hasUnadoptedStash: () => false,
     claudeSlotsPass: () => true,
     slots: () => [{ accountId: 'slot-a', source: 'cswap-import', sourceFingerprint: 'source-a', currentFingerprint: 'current-a' }],
@@ -121,9 +121,11 @@ async function refusal(name: string, mutate: (f: Fixture) => void, expected: str
 }
 
 describe('qlb retire cswap (AC22 retire)', () => {
-  it('requires four real injected switches despite breaker drill seeds', () => {
+  it('three seed rows plus one usage-5xx row do not pass the drill gate', () => {
     const f = fixture();
     try {
+      const db = new DatabaseSync(f.store.dbPath);
+      try { db.prepare('UPDATE lifecycle SET drill_began_at = ?').run(NOW - 10); } finally { db.close(); }
       f.store.setActiveLogin('anthropic', 'active', 'fixture', NOW);
       for (const [accountId, usedPct] of [['active', 20], ['next', 10]] as const) {
         f.store.upsertSnapshot(accountId, '5h', { usedPct, fetchedAt: NOW, source: 'poll', confidence: 'authoritative' });
@@ -132,17 +134,46 @@ describe('qlb retire cswap (AC22 retire)', () => {
       const drill = anthropicBreakerRowsDrill({ store: f.store, slots, now: () => NOW });
       assert.equal(drill.decision.kind, 'stay');
       assert.equal(drill.decision.reason, 'breaker');
-      f.store.recordSwitch({ provider: 'anthropic', toAccount: 'next', trigger: 'proactive', outcome: 'ok', injected: true, detail: 'fault-injection:usage-5xx', committedAt: NOW });
+      f.store.recordSwitch({ ts: NOW, provider: 'anthropic', toAccount: 'next', trigger: 'failover', outcome: 'ok', injected: true, detail: 'fault-injection:usage-5xx', committedAt: NOW });
       const context = {
         env: { QLB_TEST_MODE: '1', QLB_HOME: f.root }, home: f.root,
         config: { dbPath: f.store.dbPath, cswapSequencePath: join(f.root, 'sequence.json') },
       } as never;
-      const deps = productionDependencies(f.store, context, unavailableCswapAgent, () => []);
-      assert.equal(deps.hasFourInjectedDrillRows(), false);
-      for (let index = 1; index <= 3; index += 1) {
-        f.store.recordSwitch({ provider: 'anthropic', toAccount: 'next', trigger: 'proactive', outcome: 'ok', injected: true, detail: 'fault-injection:usage-5xx', committedAt: NOW + index });
-      }
-      assert.equal(deps.hasFourInjectedDrillRows(), true);
+      assert.equal(productionDependencies(f.store, context, unavailableCswapAgent, () => []).drillRowsPresent(), false);
+    } finally { f.cleanup(); }
+  });
+
+  it('the four drill facts inside the window pass the drill gate', () => {
+    const f = fixture();
+    try {
+      const db = new DatabaseSync(f.store.dbPath);
+      try { db.prepare('UPDATE lifecycle SET drill_began_at = ?').run(NOW - 10); } finally { db.close(); }
+      f.store.recordSwitch({ ts: NOW - 3, provider: 'anthropic', toAccount: 'next', trigger: 'failover', outcome: 'ok', injected: true, detail: 'fault-injection:usage-5xx' });
+      f.store.recordSwitch({ ts: NOW - 2, provider: 'anthropic', toAccount: 'next', trigger: 'manual', outcome: 'rolled-back', injected: true, detail: 'fault-injection:fail-step-8' });
+      f.store.recordSwitch({ ts: NOW - 1, provider: 'anthropic', toAccount: 'next', trigger: 'failover', outcome: 'refused', injected: true, detail: 'fault-injection:breaker-rows', error: 'breaker' });
+      f.store.setConfig('drill.undoDryRunAt', String(NOW));
+      const context = {
+        env: { QLB_TEST_MODE: '1', QLB_HOME: f.root }, home: f.root,
+        config: { dbPath: f.store.dbPath, cswapSequencePath: join(f.root, 'sequence.json') },
+      } as never;
+      assert.equal(productionDependencies(f.store, context, unavailableCswapAgent, () => []).drillRowsPresent(), true);
+    } finally { f.cleanup(); }
+  });
+
+  it('drill rows before drill_began_at do not count', () => {
+    const f = fixture();
+    try {
+      const db = new DatabaseSync(f.store.dbPath);
+      try { db.prepare('UPDATE lifecycle SET drill_began_at = ?').run(NOW); } finally { db.close(); }
+      f.store.recordSwitch({ ts: NOW - 3, provider: 'anthropic', toAccount: 'next', trigger: 'failover', outcome: 'ok', injected: true, detail: 'fault-injection:usage-5xx' });
+      f.store.recordSwitch({ ts: NOW - 2, provider: 'anthropic', toAccount: 'next', trigger: 'manual', outcome: 'rolled-back', injected: true, detail: 'fault-injection:fail-step-8' });
+      f.store.recordSwitch({ ts: NOW - 1, provider: 'anthropic', toAccount: 'next', trigger: 'failover', outcome: 'refused', injected: true, detail: 'fault-injection:breaker-rows', error: 'breaker' });
+      f.store.setConfig('drill.undoDryRunAt', String(NOW - 1));
+      const context = {
+        env: { QLB_TEST_MODE: '1', QLB_HOME: f.root }, home: f.root,
+        config: { dbPath: f.store.dbPath, cswapSequencePath: join(f.root, 'sequence.json') },
+      } as never;
+      assert.equal(productionDependencies(f.store, context, unavailableCswapAgent, () => []).drillRowsPresent(), false);
     } finally { f.cleanup(); }
   });
 
@@ -178,7 +209,7 @@ describe('qlb retire cswap (AC22 retire)', () => {
       const db = new DatabaseSync(f.store.dbPath);
       try { db.prepare('UPDATE lifecycle SET drill_done_at = NULL').run(); } finally { db.close(); }
     }, 'drill-not-recorded');
-    await refusal('drill rows missing', (f) => { f.deps.hasFourInjectedDrillRows = () => false; }, 'drill-rows-missing');
+    await refusal('drill rows missing', (f) => { f.deps.drillRowsPresent = () => false; }, 'drill-rows-missing');
     await refusal('l13 absent', (f) => {
       const db = new DatabaseSync(f.store.dbPath);
       try { db.prepare("DELETE FROM config WHERE key = 'codex.l13VerifiedAt'").run(); } finally { db.close(); }
