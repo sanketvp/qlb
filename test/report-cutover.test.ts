@@ -8,6 +8,8 @@ import test from 'node:test';
 import { defaultConfig } from '../src/config';
 import { createReportCutoverCommand, type ReportCutoverCommandDeps } from '../src/commands/report-cutover';
 import { runExecutingCommand } from '../src/app';
+import { evaluateRetirementGates, type CswapRetireDependencies } from '../src/cswap-retire';
+import { doctorQlb } from '../src/diagnostics';
 import type { CommandContext } from '../src/registry';
 import { MockKeychain } from '../src/keychain';
 import { openStore } from '../src/store';
@@ -77,19 +79,38 @@ function runText(subject: ReturnType<typeof fixture>): Promise<number | null> {
   return runExecutingCommand({ command: createReportCutoverCommand({ now: () => NOW, doctor: passingDoctor(subject.dbPath) }), args: [] }, subject.context);
 }
 
-async function runProduction(subject: ReturnType<typeof fixture>, doctorOptions: NonNullable<ReportCutoverCommandDeps['doctorOptions']>): Promise<number | null> {
+async function runProduction(subject: ReturnType<typeof fixture>, doctorOptions: Omit<Parameters<typeof doctorQlb>[1], 'appendHealthLog' | 'now'>): Promise<number | null> {
   const priorTestMode = process.env.QLB_TEST_MODE;
   const priorHome = process.env.QLB_HOME;
   process.env.QLB_TEST_MODE = '1';
   process.env.QLB_HOME = subject.root;
   try {
-    return await runExecutingCommand({ command: createReportCutoverCommand({ now: () => NOW, doctorOptions }), args: ['--json'] }, subject.context);
+    return await runExecutingCommand({ command: createReportCutoverCommand({
+      now: () => NOW,
+      doctor: (config, options) => doctorQlb(config, { ...options, ...doctorOptions }),
+    }), args: ['--json'] }, subject.context);
   } finally {
     if (priorTestMode === undefined) delete process.env.QLB_TEST_MODE;
     else process.env.QLB_TEST_MODE = priorTestMode;
     if (priorHome === undefined) delete process.env.QLB_HOME;
     else process.env.QLB_HOME = priorHome;
   }
+}
+
+async function retirementGates(subject: ReturnType<typeof fixture>) {
+  const store = openStore(subject.dbPath);
+  try {
+    store.recordLineage({ provider: 'anthropic', accountId: 'slot-a', fromFp: 'source-a', toFp: 'current-a', cause: 'post', by: 'qlb' });
+    const deps: CswapRetireDependencies = {
+      now: () => NOW, stateDir: subject.root, backupsDir: join(subject.root, 'backups'), journalDir: join(subject.root, 'journal'),
+      doctor: async () => ({ overall: 'PASS', autoAgent: 'PASS' }), reportReceiptPasses: () => true, drillRowsPresent: () => true,
+      hasUnadoptedStash: () => false, claudeSlotsPass: () => true,
+      slots: () => [{ accountId: 'slot-a', source: 'cswap-import', sourceFingerprint: 'source-a', currentFingerprint: 'current-a' }],
+      cswapItems: () => [{ id: 'cswap-a', fingerprint: 'source-a' }], readSlotFingerprint: async () => 'current-a',
+      effects: { drainCswap: () => ({ ok: true }), archiveCswap: () => {}, deleteCswapItems: () => {}, uninstallCswap: () => {}, removeCswapLaunchArtifacts: () => {}, deletePiBaselines: () => {}, archiveExpiredStash: () => {} },
+    };
+    return await evaluateRetirementGates(store, deps);
+  } finally { store.close(); }
 }
 
 function setPiMigrated(db: DatabaseSync, lastServedAt?: number): void {
@@ -240,6 +261,7 @@ test('a receipt is created for lifecycle-bound deferred Pi/Codex coverage when d
     assert.equal(receiptAt.value, String(NOW));
     assert.equal(health.overall, 'PASS');
     assert.equal(deferred.value, '1');
+    assert.deepEqual(await retirementGates(subject), { ok: false, code: 'report-receipt-deferred' });
   } finally { subject.close(); }
 });
 
@@ -251,6 +273,7 @@ test('a deferred receipt becomes an all-PASS receipt after real post-window evid
     subject.output.length = 0;
     const db = new DatabaseSync(subject.dbPath);
     setPiMigrated(db, NOW);
+    db.prepare('UPDATE lifecycle SET drill_done_at = ?').run(NOW);
     db.prepare("INSERT INTO config (key, value) VALUES ('codex.l13VerifiedAt', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(String(NOW));
     db.prepare(`INSERT INTO switch_log (ts, provider, from_account, to_account, trigger, outcome, injected)
       VALUES (?, 'openai-codex', 'from', 'to', 'proactive', 'ok', 0)`).run(NOW);
@@ -261,6 +284,7 @@ test('a deferred receipt becomes an all-PASS receipt after real post-window evid
     const after = new DatabaseSync(subject.dbPath, { readOnly: true });
     assert.equal((after.prepare("SELECT value FROM config WHERE key = 'report.receiptDeferred'").get() as { value: string }).value, '');
     after.close();
+    assert.equal((await retirementGates(subject)).ok, true);
   } finally { subject.close(); }
 });
 
@@ -293,11 +317,33 @@ test('a production keychain-helper warning prevents a receipt', async () => {
     db.close();
     assert.equal(await runProduction(subject, {
       command: () => '', hostCommand: () => '', hostPlatform: 'darwin', piProcessList: () => '',
-      cswapAgentStatus: () => 'not-loaded', cswapProcesses: () => [], keychain: new MockKeychain(), configReader: () => null,
+      cswapAgentStatus: () => 'not-loaded', cswapProcesses: () => [], keychain: new MockKeychain(),
+      configReader: (key) => key === 'keychain.liveItemsReadAuthorizedAt'
+        ? String(NOW)
+        : key === 'keychain.liveItemsReadAuthorizedIdentityHash' ? 'fixture' : null,
       helperSigning: () => ({ authority: 'QLB Keychain Helper', binaryHash: 'fixture', identityHash: 'fixture' }),
     }), 1);
     const report = JSON.parse(subject.output[0]!);
     assert.equal(report.rows.find((value: { name: string }) => value.name === 'doctor:S64').code, 'doctor-s64-failed');
+    const after = new DatabaseSync(subject.dbPath, { readOnly: true });
+    assert.equal((after.prepare("SELECT value FROM config WHERE key = 'report.receiptAt'").get() as { value: string }).value, '');
+    after.close();
+  } finally { subject.close(); }
+});
+
+test('a production stale automatic-agent verdict prevents a receipt', async () => {
+  const subject = fixture();
+  try {
+    seed(subject, { piDeferred: true, drill: true });
+    const db = new DatabaseSync(subject.dbPath);
+    db.prepare("INSERT INTO config (key, value) VALUES ('auto.heartbeatAt', ?)").run(String(NOW - 5 * 60 * 1000 - 1));
+    db.close();
+    assert.equal(await runProduction(subject, {
+      command: () => '', hostCommand: () => '', hostPlatform: 'linux', piProcessList: () => '',
+      cswapAgentStatus: () => 'not-loaded', cswapProcesses: () => [], keychain: new MockKeychain(),
+    }), 1);
+    const report = JSON.parse(subject.output[0]!);
+    assert.equal(report.rows.find((value: { name: string }) => value.name === 'doctor:auto-agent').code, 'doctor-auto-agent-failed');
     const after = new DatabaseSync(subject.dbPath, { readOnly: true });
     assert.equal((after.prepare("SELECT value FROM config WHERE key = 'report.receiptAt'").get() as { value: string }).value, '');
     after.close();

@@ -4,6 +4,7 @@ import { codexL13ReceiptAt } from '../codex-l13-receipt';
 import { doctorQlb, type DoctorReport } from '../diagnostics';
 import { configValue, drillRowsPresent, extendWindow, phase, PI_PROVIDERS, type LifecycleRow } from '../lifecycle';
 import { redactSecrets } from '../redact';
+import { hasRecentPiService, receiptHealthHistory } from '../receipt-gates';
 import { reloginsInWindow } from '../relogin';
 import { openStore, type Store } from '../store';
 import type { CommandContext, CommandDefinition } from '../registry';
@@ -24,9 +25,7 @@ export interface CutoverReport {
 
 export interface ReportCutoverCommandDeps {
   now?: () => number;
-  /** Test seam; production appends the doctor health-log row itself. */
-  doctor?: (config: CommandContext['config']) => Promise<DoctorReport>;
-  doctorOptions?: Omit<Parameters<typeof doctorQlb>[1], 'appendHealthLog' | 'now'>;
+  doctor?: (config: CommandContext['config'], options: Parameters<typeof doctorQlb>[1]) => Promise<DoctorReport>;
 }
 
 function row(group: CutoverReportRow['group'], name: string, status: CutoverReportStatus, message: string, code?: string): CutoverReportRow {
@@ -113,23 +112,13 @@ function reportRows(db: DatabaseSync, lifecycle: LifecycleRow, now: number): Cut
   return rows;
 }
 
-export function buildCutoverReport(db: DatabaseSync, lifecycle: LifecycleRow, now: number, receiptRows: CutoverReportRow[] = []): CutoverReport {
+export function buildCutoverReport(db: DatabaseSync, lifecycle: LifecycleRow, now: number, receiptRows: CutoverReportRow[]): CutoverReport {
   const rows = [...reportRows(db, lifecycle, now), ...receiptRows];
   return {
     ok: reportPasses(rows),
     lifecycle: { id: lifecycle.id, state: lifecycle.state, cutoverAt: lifecycle.cutoverAt!, windowEnd: lifecycle.windowEnd!, extendedAt: lifecycle.extendedAt },
     rows,
   };
-}
-
-function recentHealthHistoryPasses(db: DatabaseSync, now: number): boolean {
-  const since = now - 24 * 60 * 60 * 1000;
-  const lastPass = db.prepare("SELECT ts, id FROM health_log WHERE overall = 'PASS' AND ts >= ? AND ts <= ? ORDER BY ts DESC, id DESC LIMIT 1")
-    .get(since, now) as { ts: number; id: number } | undefined;
-  if (lastPass == null) return true;
-  const laterFailure = db.prepare("SELECT 1 FROM health_log WHERE overall = 'FAIL' AND ts >= ? AND ts <= ? AND (ts > ? OR (ts = ? AND id > ?)) LIMIT 1")
-    .get(since, now, lastPass.ts, lastPass.ts, lastPass.id);
-  return laterFailure == null;
 }
 
 function appendReceiptRows(rows: CutoverReportRow[], db: DatabaseSync, now: number, doctor: DoctorReport, historyPasses: boolean): void {
@@ -145,8 +134,7 @@ function appendReceiptRows(rows: CutoverReportRow[], db: DatabaseSync, now: numb
   if (doctor.healthLogId == null) rows.push(row('coverage', 'doctor:health-log', 'FAIL', doctor.healthLogError ?? 'doctor health log was not appended', 'doctor-health-log-missing'));
   for (const provider of PI_PROVIDERS) {
     if (configValue(db, `pi.${provider}.state`) !== 'migrated') continue;
-    const servedAt = Number(configValue(db, `pi.${provider}.lastServedAt`));
-    const recent = Number.isSafeInteger(servedAt) && servedAt >= now - 24 * 60 * 60 * 1000 && servedAt <= now;
+    const recent = hasRecentPiService(configValue(db, `pi.${provider}.lastServedAt`), now);
     rows.push(recent
       ? row('coverage', `pi:${provider}:recent-service`, 'PASS', `Pi ${provider} served within the final 24 hours`)
       : row('coverage', `pi:${provider}:recent-service`, 'FAIL', `Pi ${provider} has no service record in the final 24 hours`, 'no-recent-pi-service'));
@@ -189,10 +177,8 @@ async function execute(args: string[], ctx: CommandContext, deps: ReportCutoverC
     const now = (deps.now ?? Date.now)();
     if (now < lifecycle.windowEnd) { ctx.stderr(`report cutover refused: window-not-ended; windowEnd=${new Date(lifecycle.windowEnd).toISOString()}`); return 3; }
     const db = (store as unknown as { db: DatabaseSync }).db;
-    const historyPasses = recentHealthHistoryPasses(db, now);
-    const doctor = deps.doctor == null
-      ? await doctorQlb(ctx.config, { ...deps.doctorOptions, appendHealthLog: true, now: () => now })
-      : await deps.doctor(ctx.config);
+    const historyPasses = receiptHealthHistory(db, now).passes;
+    const doctor = await (deps.doctor ?? doctorQlb)(ctx.config, { appendHealthLog: true, now: () => now });
     const receiptRows: CutoverReportRow[] = [];
     appendReceiptRows(receiptRows, db, now, doctor, historyPasses);
     const report = buildCutoverReport(db, lifecycle, now, receiptRows);
@@ -207,8 +193,8 @@ async function execute(args: string[], ctx: CommandContext, deps: ReportCutoverC
     if (json) ctx.stdout(JSON.stringify(redacted));
     else for (const line of formatText(redacted)) ctx.stdout(line);
     if (!redacted.ok) {
-      const failure = redacted.rows.find((value) => value.status === 'FAIL' || value.status === 'EXTEND');
-      if (failure) ctx.stderr(`no receipt (${failure.name})`);
+      const failure = redacted.rows.find((value) => value.status === 'FAIL' || value.status === 'EXTEND')!;
+      ctx.stderr(`no receipt (${failure.name})`);
     }
     return redacted.ok ? 0 : 1;
   } finally { store.close(); }
