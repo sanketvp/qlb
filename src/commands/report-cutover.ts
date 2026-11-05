@@ -61,7 +61,8 @@ function reportRows(db: DatabaseSync, lifecycle: LifecycleRow, now: number): Cut
     : row('correctness', 'AC18:relogins', 'FAIL', `relogin events: ${relogins.map((value) => `#${value.id}@${value.ts} ${value.provider}:${value.kind}${value.detail ? `:${value.detail}` : ''}${value.evidence ? ` [${value.evidence}]` : ''}`).join(', ')}`, 'relogin-in-window'));
 
   const automatic = db.prepare(`SELECT count(*) AS count FROM switch_log WHERE provider = 'anthropic' AND outcome = 'ok'
-    AND injected = 0 AND trigger <> 'manual' AND ts >= ? AND ts <= ?`).get(...inWindow) as { count: number };
+    AND injected = 0 AND trigger <> 'manual' AND (detail IS NULL OR detail NOT LIKE 'republish%')
+    AND ts >= ? AND ts <= ?`).get(...inWindow) as { count: number };
   const correctnessPass = rows.every((value) => value.group !== 'correctness' || value.status === 'PASS');
   if (automatic.count >= 10) rows.push(row('coverage', 'anthropic:automatic-switches', 'PASS', `${automatic.count} non-injected automatic Anthropic switches`));
   else if (lifecycle.extendedAt == null && correctnessPass) rows.push(row('coverage', 'anthropic:automatic-switches', 'EXTEND', `${automatic.count}/10 non-injected automatic Anthropic switches; cutover window extended once`, 'insufficient-anthropic-coverage'));
@@ -128,10 +129,10 @@ async function execute(args: string[], ctx: CommandContext, deps: ReportCutoverC
   const store = openStore(ctx.config.dbPath);
   try {
     const lifecycle = phase(store);
-    if (lifecycle.id === 0 || lifecycle.cutoverAt == null || lifecycle.windowEnd == null) {
+    if (lifecycle.rollbackAt != null) { ctx.stderr('report cutover refused: rollback-recorded'); return 3; }
+    if (lifecycle.cutoverAt == null || lifecycle.windowEnd == null) {
       ctx.stderr('report cutover refused: no-open-lifecycle'); return 3;
     }
-    if (lifecycle.rollbackAt != null) { ctx.stderr('report cutover refused: rollback-recorded'); return 3; }
     const now = (deps.now ?? Date.now)();
     if (now < lifecycle.windowEnd) { ctx.stderr(`report cutover refused: window-not-ended; windowEnd=${new Date(lifecycle.windowEnd).toISOString()}`); return 3; }
     const db = (store as unknown as { db: DatabaseSync }).db;

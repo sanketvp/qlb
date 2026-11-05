@@ -117,6 +117,8 @@ test('nine rows extend once, and a later miss fails extended-once', async () => 
       .run(NOW - 9 * DAY);
     db.prepare(`INSERT INTO switch_log (ts, provider, to_account, trigger, outcome, injected) VALUES (?, 'anthropic', 'manual', 'manual', 'ok', 0)`)
       .run(NOW - 9 * DAY);
+    db.prepare(`INSERT INTO switch_log (ts, provider, to_account, trigger, outcome, injected, detail) VALUES (?, 'anthropic', 'republish', 'proactive', 'ok', 0, 'republish')`)
+      .run(NOW - 9 * DAY);
     db.close();
     assert.equal(await run(subject), 1);
     let report = JSON.parse(subject.output[0]!);
@@ -152,6 +154,18 @@ test('a deferred marker from another lifecycle does not soften strict coverage',
     const report = JSON.parse(subject.output[0]!);
     assert.equal(report.rows.find((value: { name: string }) => value.name === 'codex:L13-switch').code, 'codex-coverage-missing');
     assert.equal(report.rows.filter((value: { name: string }) => value.name.startsWith('pi:')).every((value: { status: string }) => value.status === 'FAIL'), true);
+  } finally { subject.close(); }
+});
+
+test('an aborted lifecycle reports its recorded rollback', async () => {
+  const subject = fixture();
+  try {
+    seed(subject, { drill: true });
+    const db = new DatabaseSync(subject.dbPath);
+    db.prepare("UPDATE lifecycle SET state = 'aborted', cutover_at = NULL, window_end = NULL, rollback_at = ?").run(NOW);
+    db.close();
+    assert.equal(await run(subject), 3);
+    assert.match(subject.output[0]!, /rollback-recorded/);
   } finally { subject.close(); }
 });
 
@@ -350,6 +364,10 @@ test('post-window automatic switches do not satisfy Anthropic coverage', async (
     const db = new DatabaseSync(subject.dbPath);
     db.prepare(`INSERT INTO switch_log (ts, provider, to_account, trigger, outcome, injected)
       VALUES (?, 'anthropic', 'outside', 'proactive', 'ok', 0)`).run(NOW - 8 * DAY + 1);
+    db.prepare(`INSERT INTO switch_log (ts, provider, to_account, trigger, outcome, injected)
+      VALUES (?, 'anthropic', 'before', 'proactive', 'ok', 0)`).run(NOW - 15 * DAY - 1);
+    db.prepare(`INSERT INTO switch_log (ts, provider, to_account, trigger, outcome, injected)
+      VALUES (?, 'xai', 'other', 'proactive', 'ok', 0)`).run(NOW - 9 * DAY);
     db.close();
     assert.equal(await run(subject), 1);
     const report = JSON.parse(subject.output[0]!);
@@ -370,6 +388,10 @@ test('only a successful non-injected Codex account change satisfies AC20', async
       ['from', 'other', 'failed', 0],
     ]) db.prepare(`INSERT INTO switch_log (ts, provider, from_account, to_account, trigger, outcome, injected)
       VALUES (?, 'openai-codex', ?, ?, 'proactive', ?, ?)`).run(NOW - 9 * DAY, from, to, outcome, injected);
+    db.prepare(`INSERT INTO switch_log (ts, provider, from_account, to_account, trigger, outcome, injected)
+      VALUES (?, 'openai-codex', 'before', 'after', 'proactive', 'ok', 0)`).run(NOW - 15 * DAY - 1);
+    db.prepare(`INSERT INTO switch_log (ts, provider, from_account, to_account, trigger, outcome, injected)
+      VALUES (?, 'openai-codex', 'after', 'later', 'proactive', 'ok', 0)`).run(NOW - 8 * DAY + 1);
     db.close();
     assert.equal(await run(subject), 1);
     const report = JSON.parse(subject.output[0]!);
