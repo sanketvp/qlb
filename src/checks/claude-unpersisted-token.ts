@@ -53,6 +53,7 @@ export function claudeUnpersistedTokenCheck(
       });
 
       const autoLogPath = join(dirname(dbPath), 'auto.log');
+      let autoLogUnreadable = false;
       if (existsSync(autoLogPath)) {
         try {
           for (const line of readFileSync(autoLogPath, 'utf8').split(/\r?\n/)) {
@@ -60,7 +61,7 @@ export function claudeUnpersistedTokenCheck(
             if (match) evidence.push({ accountId: match[1]!, at: Number(match[2]) });
           }
         } catch {
-          return { name: 'claude:unpersisted-token', level: 'WARN', message: 'auto.log unreadable' };
+          autoLogUnreadable = true;
         }
       }
 
@@ -68,8 +69,8 @@ export function claudeUnpersistedTokenCheck(
       const isLiveSlot = db.prepare(`SELECT 1 FROM claude_slots
         WHERE account_id = ? AND dead = 0 AND archived_at IS NULL`);
       const laterOkPoll = db.prepare(`SELECT 1 FROM usage_polls
-        WHERE provider = 'anthropic' AND account_id = ? AND last_status = 'ok'
-          AND COALESCE(last_attempt_at, 0) * 1000 > ?`);
+        WHERE provider = 'anthropic' AND account_id = ?
+          AND COALESCE(last_fetch_at, 0) * 1000 > ?`);
       const laterSwitch = db.prepare(`SELECT 1 FROM switch_log
         WHERE provider = 'anthropic' AND to_account = ? AND outcome = 'ok' AND injected = 0 AND ts > ?`);
       for (const item of evidence) {
@@ -80,12 +81,14 @@ export function claudeUnpersistedTokenCheck(
       }
 
       if (unresolved.size === 0) {
-        return { name: 'claude:unpersisted-token', level: 'PASS', message: 'no unrecovered Claude unpersisted-token evidence' };
+        return autoLogUnreadable
+          ? { name: 'claude:unpersisted-token', level: 'WARN', message: 'auto.log unreadable' }
+          : { name: 'claude:unpersisted-token', level: 'PASS', message: 'no unrecovered Claude unpersisted-token evidence' };
       }
       const slots = [...unresolved].sort();
       return {
         name: 'claude:unpersisted-token', level: 'FAIL',
-        message: `unpersisted Claude token evidence without later recovery: ${slots.join(', ')}; re-login affected slot(s)`,
+        message: `unpersisted Claude token evidence without later recovery: ${slots.join(', ')}${autoLogUnreadable ? '; auto.log unreadable' : ''}; re-login affected slot(s)`,
       };
     } finally {
       db.close();

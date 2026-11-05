@@ -268,10 +268,16 @@ describe('claude:unclaimed doctor check', () => {
 });
 
 describe('claude:unpersisted-token doctor check', () => {
-  function recordUsage(dbPath: string, accountId: string, status: string, attemptedAt: number): void {
+  function recordUsage(dbPath: string, accountId: string, status: string, attemptedAt: number, succeeded = false): void {
     const store = openStore(dbPath);
     try {
-      store.recordUsagePollResult('anthropic', accountId, { attemptedAt, status });
+      store.recordUsagePollResult('anthropic', accountId, {
+        attemptedAt,
+        status,
+        readings: succeeded ? {
+          '5h': { usedPct: 1, fetchedAt: attemptedAt * 1000, source: 'poll', confidence: 'authoritative' },
+        } : undefined,
+      });
     } finally {
       store.close();
     }
@@ -311,7 +317,7 @@ describe('claude:unpersisted-token doctor check', () => {
     const dbPath = fixture();
     insertSlot(dbPath, 'active');
     writeFileSync(join(dirname(dbPath), 'auto.log'), `claude:unpersisted-token provider=anthropic account=active at=${NOW}`);
-    recordUsage(dbPath, 'active', 'ok', Math.floor(NOW / 1000) + 1);
+    recordUsage(dbPath, 'active', 'ok', Math.floor(NOW / 1000) + 1, true);
     assert.deepEqual(claudeUnpersistedTokenCheck(dbPath, 'cutover'), {
       name: 'claude:unpersisted-token', level: 'PASS', message: 'no unrecovered Claude unpersisted-token evidence',
     });
@@ -334,6 +340,16 @@ describe('claude:unpersisted-token doctor check', () => {
     assert.equal(claudeUnpersistedTokenCheck(dbPath, 'cutover').level, 'FAIL');
   });
 
+  it('claude:unpersisted-token retains successful-poll recovery after a later failure', () => {
+    const dbPath = fixture();
+    insertSlot(dbPath, 'active');
+    writeFileSync(join(dirname(dbPath), 'auto.log'), `claude:unpersisted-token provider=anthropic account=active at=${NOW}`);
+    const recoveredAt = Math.floor(NOW / 1000) + 1;
+    recordUsage(dbPath, 'active', 'ok', recoveredAt, true);
+    recordUsage(dbPath, 'active', 'http-500', recoveredAt + 1);
+    assert.equal(claudeUnpersistedTokenCheck(dbPath, 'cutover').level, 'PASS');
+  });
+
   it('claude:unpersisted-token warns when auto.log is unreadable', () => {
     const dbPath = fixture();
     const log = join(dirname(dbPath), 'auto.log');
@@ -341,6 +357,16 @@ describe('claude:unpersisted-token doctor check', () => {
     assert.deepEqual(claudeUnpersistedTokenCheck(dbPath, 'cutover'), {
       name: 'claude:unpersisted-token', level: 'WARN', message: 'auto.log unreadable',
     });
+  });
+
+  it('claude:unpersisted-token fails on database evidence when auto.log is unreadable', () => {
+    const dbPath = fixture();
+    insertSlot(dbPath, 'inactive');
+    insertSwitch(dbPath, 'inactive', 'refused', NOW, 0, 'freshen-consume-gate-unpersisted');
+    mkdirSync(join(dirname(dbPath), 'auto.log'));
+    const row = claudeUnpersistedTokenCheck(dbPath, 'cutover');
+    assert.equal(row.level, 'FAIL');
+    assert.match(row.message, /auto\.log unreadable/);
   });
 
   it('claude:unpersisted-token is N/A pre-cutover', () => {
