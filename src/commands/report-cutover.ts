@@ -1,7 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
 
 import { codexL13ReceiptAt } from '../codex-l13-receipt';
-import { drillRowsPresent, extendWindow, phase, PI_PROVIDERS, type LifecycleRow } from '../lifecycle';
+import { configValue, drillRowsPresent, extendWindow, phase, PI_PROVIDERS, type LifecycleRow } from '../lifecycle';
 import { redactSecrets } from '../redact';
 import { reloginsInWindow } from '../relogin';
 import { openStore } from '../store';
@@ -22,10 +22,6 @@ export interface CutoverReport {
 }
 
 export interface ReportCutoverCommandDeps { now?: () => number; }
-
-function configValue(db: DatabaseSync, key: string): string | null {
-  return (db.prepare('SELECT value FROM config WHERE key = ?').get(key) as { value?: string } | undefined)?.value ?? null;
-}
 
 function row(group: CutoverReportRow['group'], name: string, status: CutoverReportStatus, message: string, code?: string): CutoverReportRow {
   return { group, name, status, ...(code ? { code } : {}), message };
@@ -60,10 +56,9 @@ function reportRows(db: DatabaseSync, lifecycle: LifecycleRow, now: number): Cut
 
   const relogins = reloginsInWindow(db, { start, end })
     .filter((value) => value.provider === 'anthropic' || value.provider === 'openai-codex');
-  const soft = relogins.filter((value) => value.evidence === 'unattributed-rotation');
   rows.push(relogins.length === 0
     ? row('correctness', 'AC18:relogins', 'PASS', 'no Anthropic or Codex relogin events')
-    : row('correctness', 'AC18:relogins', 'FAIL', `relogin events: ${relogins.map((value) => `${value.provider}:${value.kind}${value.detail ? `:${value.detail}` : ''}`).join(', ')}${soft.length ? ` (soft unattributed-rotation: ${soft.length})` : ''}`, 'relogin-in-window'));
+    : row('correctness', 'AC18:relogins', 'FAIL', `relogin events: ${relogins.map((value) => `#${value.id}@${value.ts} ${value.provider}:${value.kind}${value.detail ? `:${value.detail}` : ''}${value.evidence ? ` [${value.evidence}]` : ''}`).join(', ')}`, 'relogin-in-window'));
 
   const automatic = db.prepare(`SELECT count(*) AS count FROM switch_log WHERE provider = 'anthropic' AND outcome = 'ok'
     AND injected = 0 AND trigger <> 'manual' AND ts >= ? AND ts <= ?`).get(...inWindow) as { count: number };
@@ -122,7 +117,7 @@ function parse(args: string[]): boolean | null {
 
 function formatText(report: CutoverReport): string[] {
   return [
-    `lifecycle cutoverAt=${report.lifecycle.cutoverAt} windowEnd=${report.lifecycle.windowEnd} extendedAt=${report.lifecycle.extendedAt ?? 'none'}`,
+    `lifecycle cutoverAt=${new Date(report.lifecycle.cutoverAt).toISOString()} windowEnd=${new Date(report.lifecycle.windowEnd).toISOString()} extendedAt=${report.lifecycle.extendedAt === null ? 'none' : new Date(report.lifecycle.extendedAt).toISOString()}`,
     ...report.rows.map((value) => `${value.status} ${value.group} ${value.name}${value.code ? ` [${value.code}]` : ''}: ${value.message}`),
   ];
 }
@@ -138,7 +133,7 @@ async function execute(args: string[], ctx: CommandContext, deps: ReportCutoverC
     }
     if (lifecycle.rollbackAt != null) { ctx.stderr('report cutover refused: rollback-recorded'); return 3; }
     const now = (deps.now ?? Date.now)();
-    if (now < lifecycle.windowEnd) { ctx.stderr('report cutover refused: window-not-ended'); return 3; }
+    if (now < lifecycle.windowEnd) { ctx.stderr(`report cutover refused: window-not-ended; windowEnd=${new Date(lifecycle.windowEnd).toISOString()}`); return 3; }
     const db = (store as unknown as { db: DatabaseSync }).db;
     const report = buildCutoverReport(db, lifecycle, now);
     if (report.rows.some((value) => value.status === 'EXTEND')) {

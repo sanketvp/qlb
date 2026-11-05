@@ -440,6 +440,20 @@ describe('Claude switch journal reconciliation (G10)', () => {
     assert.equal((await switchClaude(subject.deps, { to: 'b', trigger: 'manual' })).outcome, 'ok');
   });
 
+  it('marks recovered republish rollbacks so they never count as switches', async () => {
+    const subject = await fixture();
+    await install(subject, journal(subject, { republish: true }));
+    await reconcileClaudeSwitch(subject.deps);
+    assert.deepEqual(subject.rows.map((row) => [row.outcome, row.detail]), [['rolled-back', 'republish:crash-reconcile']]);
+  });
+
+  it('marks operator republish rollbacks so they never count as switches', async () => {
+    const subject = await fixture();
+    await install(subject, journal(subject, { republish: true }));
+    assert.equal((await resolveClaudeSwitchJournal(subject.deps, 'back')).outcome, 'resolved');
+    assert.deepEqual(subject.rows.map((row) => [row.outcome, row.detail]), [['rolled-back', 'republish:journal-back']]);
+  });
+
   it('a staged delete failure leaves a finished journal for the next switch cleanup', async () => {
     const subject = await fixture();
     const entry = await install(subject);

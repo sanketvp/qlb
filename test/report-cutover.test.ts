@@ -77,6 +77,7 @@ test('refuses before the window ends and when a rollback is recorded', async () 
     db.close();
     assert.equal(await run(subject), 3);
     assert.match(subject.output[0]!, /window-not-ended/);
+    assert.match(subject.output[0]!, new RegExp(new Date(NOW + 1).toISOString()));
     subject.output.length = 0;
     const db2 = new DatabaseSync(subject.dbPath);
     db2.prepare('UPDATE lifecycle SET window_end = ?, rollback_at = ?').run(NOW - 1, NOW);
@@ -240,6 +241,11 @@ test('correctness failures prevent consuming the one permitted coverage extensio
     assert.equal(report.rows.find((value: { name: string }) => value.name === 'anthropic:automatic-switches').code, 'insufficient-anthropic-coverage');
     assert.equal(report.lifecycle.windowEnd, NOW - 8 * DAY);
     assert.equal(report.lifecycle.extendedAt, null);
+    const after = new DatabaseSync(subject.dbPath, { readOnly: true });
+    const lifecycle = after.prepare('SELECT window_end, extended_at FROM lifecycle').get() as { window_end: number; extended_at: number | null };
+    after.close();
+    assert.equal(lifecycle.window_end, NOW - 8 * DAY);
+    assert.equal(lifecycle.extended_at, null);
   } finally { subject.close(); }
 });
 
@@ -287,8 +293,8 @@ test('relogin evidence fails only for Anthropic and Codex events', async () => {
     seed(subject, { piDeferred: true, drill: true });
     const db = new DatabaseSync(subject.dbPath);
     for (const [provider, kind, detail, evidence] of [
-      ['anthropic', 'dead', 'dead', 'dead'],
-      ['openai-codex', 'external-login', 'unattributed-rotation', 'unattributed-rotation'],
+      ['anthropic', 'external-login', 'sha256:1111111111111111', 'login-expiry-jump'],
+      ['anthropic', 'external-login', 'sha256:2222222222222222', 'unattributed-rotation'],
       ['xai', 'dead', 'dead', 'dead'],
     ]) db.prepare(`INSERT INTO relogin_events (ts, provider, kind, detail, evidence) VALUES (?, ?, ?, ?, ?)`)
       .run(NOW - 9 * DAY, provider, kind, detail, evidence);
@@ -297,9 +303,8 @@ test('relogin evidence fails only for Anthropic and Codex events', async () => {
     const report = JSON.parse(subject.output[0]!);
     const relogins = report.rows.find((value: { name: string }) => value.name === 'AC18:relogins');
     assert.equal(relogins.code, 'relogin-in-window');
-    assert.match(relogins.message, /anthropic:dead:dead/);
-    assert.match(relogins.message, /openai-codex:external-login:unattributed-rotation/);
-    assert.match(relogins.message, /soft unattributed-rotation: 1/);
+    assert.match(relogins.message, /#1@.*anthropic:external-login:sha256:1111111111111111 \[login-expiry-jump\]/);
+    assert.match(relogins.message, /#2@.*anthropic:external-login:sha256:2222222222222222 \[unattributed-rotation\]/);
     assert.doesNotMatch(relogins.message, /xai/);
   } finally { subject.close(); }
 });
@@ -309,9 +314,96 @@ test('text output includes lifecycle dates and report codes', async () => {
   try {
     seed(subject, { switches: 9, piDeferred: true, drill: true });
     assert.equal(await runText(subject), 1);
-    assert.match(subject.output[0]!, new RegExp(`windowEnd=${NOW - DAY}`));
-    assert.match(subject.output[0]!, new RegExp(`extendedAt=${NOW}`));
+    assert.match(subject.output[0]!, new RegExp(`windowEnd=${new Date(NOW - DAY).toISOString()}`));
+    assert.match(subject.output[0]!, new RegExp(`extendedAt=${new Date(NOW).toISOString()}`));
     assert.equal(subject.output.some((line) => line.includes('[insufficient-anthropic-coverage]')), true);
     assert.equal(subject.output.some((line) => line.includes('[codex-deferred]')), true);
+  } finally { subject.close(); }
+});
+
+test('pre-window and post-window correctness rows do not affect the report', async () => {
+  const subject = fixture();
+  try {
+    seed(subject, { piDeferred: true, drill: true });
+    const db = new DatabaseSync(subject.dbPath);
+    const cutoverAt = NOW - 15 * DAY;
+    const windowEnd = NOW - 8 * DAY;
+    for (const ts of [cutoverAt - 1, windowEnd + 1]) {
+      db.prepare(`INSERT INTO switch_log (ts, provider, to_account, trigger, outcome, injected)
+        VALUES (?, 'anthropic', 'outside', 'proactive', 'rolled-back', 0)`).run(ts);
+      db.prepare(`INSERT INTO health_log (ts, phase, overall, failing_json, dead_slots_json)
+        VALUES (?, 'cutover', 'FAIL', '[]', '["outside"]')`).run(ts);
+      db.prepare(`INSERT INTO relogin_events (ts, provider, kind, detail, evidence)
+        VALUES (?, 'anthropic', 'external-login', 'dead', 'dead')`).run(ts);
+    }
+    db.close();
+    assert.equal(await run(subject), 0);
+    const report = JSON.parse(subject.output[0]!);
+    assert.equal(report.rows.filter((value: { group: string }) => value.group === 'correctness').every((value: { status: string }) => value.status === 'PASS'), true);
+  } finally { subject.close(); }
+});
+
+test('post-window automatic switches do not satisfy Anthropic coverage', async () => {
+  const subject = fixture();
+  try {
+    seed(subject, { piDeferred: true, drill: true, switches: 9 });
+    const db = new DatabaseSync(subject.dbPath);
+    db.prepare(`INSERT INTO switch_log (ts, provider, to_account, trigger, outcome, injected)
+      VALUES (?, 'anthropic', 'outside', 'proactive', 'ok', 0)`).run(NOW - 8 * DAY + 1);
+    db.close();
+    assert.equal(await run(subject), 1);
+    const report = JSON.parse(subject.output[0]!);
+    assert.equal(report.rows.find((value: { name: string }) => value.name === 'anthropic:automatic-switches').status, 'EXTEND');
+  } finally { subject.close(); }
+});
+
+test('only a successful non-injected Codex account change satisfies AC20', async () => {
+  const subject = fixture();
+  try {
+    seed(subject, { drill: true });
+    const db = new DatabaseSync(subject.dbPath);
+    setPiMigrated(db);
+    db.prepare("INSERT INTO config (key, value) VALUES ('codex.l13VerifiedAt', ?)").run(String(NOW));
+    for (const [from, to, outcome, injected] of [
+      ['same', 'same', 'ok', 0],
+      ['from', 'to', 'ok', 1],
+      ['from', 'other', 'failed', 0],
+    ]) db.prepare(`INSERT INTO switch_log (ts, provider, from_account, to_account, trigger, outcome, injected)
+      VALUES (?, 'openai-codex', ?, ?, 'proactive', ?, ?)`).run(NOW - 9 * DAY, from, to, outcome, injected);
+    db.close();
+    assert.equal(await run(subject), 1);
+    const report = JSON.parse(subject.output[0]!);
+    assert.equal(report.rows.find((value: { name: string }) => value.name === 'codex:L13-switch').code, 'codex-coverage-missing');
+  } finally { subject.close(); }
+});
+
+test('AC19 includes failed Anthropic rows but not other providers', async () => {
+  for (const [provider, outcome, expected] of [
+    ['anthropic', 'failed', 'FAIL'],
+    ['xai', 'failed', 'PASS'],
+  ]) {
+    const subject = fixture();
+    try {
+      seed(subject, { piDeferred: true, drill: true });
+      const db = new DatabaseSync(subject.dbPath);
+      db.prepare(`INSERT INTO switch_log (ts, provider, to_account, trigger, outcome, injected)
+        VALUES (?, ?, 'row', 'proactive', ?, 0)`).run(NOW - 9 * DAY, provider, outcome);
+      db.close();
+      assert.equal(await run(subject), expected === 'FAIL' ? 1 : 0);
+      const report = JSON.parse(subject.output[0]!);
+      assert.equal(report.rows.find((value: { name: string }) => value.name === 'AC19:anthropic-switches').status, expected);
+    } finally { subject.close(); }
+  }
+});
+
+test('report cutover is refused while undo is in progress', async () => {
+  const subject = fixture();
+  try {
+    seed(subject, { piDeferred: true, drill: true });
+    const db = new DatabaseSync(subject.dbPath);
+    db.prepare("UPDATE lifecycle SET state = 'undoing'").run();
+    db.close();
+    assert.equal(await run(subject), 3);
+    assert.match(subject.output[0]!, /undo-in-progress/);
   } finally { subject.close(); }
 });

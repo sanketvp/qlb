@@ -451,7 +451,7 @@ function manualRoundTripDone(db: DatabaseSync): boolean {
     first.from_account === second.to_account && first.to_account === second.from_account));
 }
 
-function configValue(db: DatabaseSync, key: string): string | null {
+export function configValue(db: DatabaseSync, key: string): string | null {
   const row = db.prepare('SELECT value FROM config WHERE key = ?').get(key) as { value?: string } | undefined;
   return row?.value ?? null;
 }
