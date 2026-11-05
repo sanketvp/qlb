@@ -268,13 +268,12 @@ describe('claude:unclaimed doctor check', () => {
 });
 
 describe('claude:unpersisted-token doctor check', () => {
-  function insertUsage(dbPath: string, accountId: string, status: string, at: number): void {
-    const db = new DatabaseSync(dbPath);
+  function recordUsage(dbPath: string, accountId: string, status: string, attemptedAt: number): void {
+    const store = openStore(dbPath);
     try {
-      db.prepare(`INSERT INTO usage_polls (provider, account_id, last_attempt_at, last_status, consecutive_failures)
-        VALUES ('anthropic', ?, ?, ?, 0)`).run(accountId, at, status);
+      store.recordUsagePollResult('anthropic', accountId, { attemptedAt, status });
     } finally {
-      db.close();
+      store.close();
     }
   }
 
@@ -295,7 +294,7 @@ describe('claude:unpersisted-token doctor check', () => {
     const row = claudeUnpersistedTokenCheck(dbPath, 'cutover');
     assert.equal(row.level, 'FAIL');
     assert.match(row.message, /successor/);
-    assert.match(row.message, /qlb claude restore-unclaimed/);
+    assert.match(row.message, /re-login affected slot/);
   });
 
   it('claude:unpersisted-token fails on an auto.log unpersisted line for the active slot with no later ok poll', () => {
@@ -312,7 +311,7 @@ describe('claude:unpersisted-token doctor check', () => {
     const dbPath = fixture();
     insertSlot(dbPath, 'active');
     writeFileSync(join(dirname(dbPath), 'auto.log'), `claude:unpersisted-token provider=anthropic account=active at=${NOW}`);
-    insertUsage(dbPath, 'active', 'ok', NOW + 1);
+    recordUsage(dbPath, 'active', 'ok', Math.floor(NOW / 1000) + 1);
     assert.deepEqual(claudeUnpersistedTokenCheck(dbPath, 'cutover'), {
       name: 'claude:unpersisted-token', level: 'PASS', message: 'no unrecovered Claude unpersisted-token evidence',
     });
@@ -321,9 +320,17 @@ describe('claude:unpersisted-token doctor check', () => {
   it('claude:unpersisted-token still fails after seeded breaker-rows and a noop', () => {
     const dbPath = fixture();
     insertSlot(dbPath, 'active');
-    insertUsage(dbPath, 'active', 'consume-consume-gate-unpersisted', NOW);
+    recordUsage(dbPath, 'active', 'consume-consume-gate-unpersisted', Math.floor(NOW / 1000));
     insertSwitch(dbPath, 'active', 'ok', NOW + 1, 1, 'fault-injection:breaker-rows:seed');
     insertSwitch(dbPath, 'active', 'noop', NOW + 2, 0, null);
+    assert.equal(claudeUnpersistedTokenCheck(dbPath, 'cutover').level, 'FAIL');
+  });
+
+  it('claude:unpersisted-token does not let an earlier switch recover later poll evidence', () => {
+    const dbPath = fixture();
+    insertSlot(dbPath, 'inactive');
+    insertSwitch(dbPath, 'inactive', 'ok', NOW - 1, 0, null);
+    recordUsage(dbPath, 'inactive', 'consume-consume-gate-unpersisted', Math.floor(NOW / 1000));
     assert.equal(claudeUnpersistedTokenCheck(dbPath, 'cutover').level, 'FAIL');
   });
 
