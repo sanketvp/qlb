@@ -98,7 +98,7 @@ import {
 const USAGE = `Usage:
   qlb init [--json]
   qlb doctor [--json] [--live]
-  qlb refresh [--allow-probe] [--json]
+  qlb refresh [--provider kimi-coding] [--allow-probe] [--json]
   qlb native-resync --provider anthropic|xai|kimi-coding|openai-codex|openrouter --account <id> [--json] [--db <path>]
   qlb status [--json] [--dashboard|--flat]
   qlb status --switches|--relogins [--window] [--json]
@@ -175,7 +175,11 @@ type StatusOpts = {
 type SetupOpts = { cmd: 'setup'; json: boolean; harness: SetupHarness | 'hermes' };
 type InitOpts = { cmd: 'init'; json: boolean };
 type DoctorOpts = { cmd: 'doctor'; json: boolean; live: boolean };
-type RefreshOpts = { cmd: 'refresh'; json: boolean; allowProbe: boolean };
+type RefreshOpts = { cmd: 'refresh'; json: boolean; allowProbe: boolean; provider?: 'kimi-coding' };
+
+export function filterRefreshAdapters<T extends { id: string }>(adapters: T[], provider?: string): T[] {
+  return provider === undefined ? adapters : adapters.filter((adapter) => adapter.id === provider);
+}
 type WhyOpts = {
   cmd: 'why';
   json: boolean;
@@ -931,11 +935,18 @@ export function parseArgs(argv: string[]): Opts {
     if (json) rest.splice(rest.indexOf('--json'), 1);
     const allowProbe = rest.includes('--allow-probe');
     if (allowProbe) rest.splice(rest.indexOf('--allow-probe'), 1);
+    const hasProvider = rest.includes('--provider');
+    const provider = takeFlag(rest, '--provider');
+    if (hasProvider && provider !== 'kimi-coding') {
+      console.error(`qlb refresh: --provider must be kimi-coding (got '${provider ?? ''}')`);
+      console.error(USAGE);
+      process.exit(1);
+    }
     if (rest.length > 0) {
       console.error(`qlb refresh: unknown argument ${rest[0]}`);
       process.exit(1);
     }
-    return { cmd: 'refresh', json, allowProbe };
+    return { cmd: 'refresh', json, allowProbe, provider: provider as RefreshOpts['provider'] };
   }
   if (raw[0] === 'why') {
     return parseWhyArgs(raw.slice(1));
@@ -2296,11 +2307,12 @@ export async function main(): Promise<void> {
   }
   if (opts.cmd === 'refresh') {
     try {
+      const refreshAdapters = filterRefreshAdapters(adapters, opts.provider);
       if (opts.allowProbe) {
         const store = getStore();
-        const report = await runRefresh(adapters, { allowProbe: true });
+        const report = await runRefresh(refreshAdapters, { allowProbe: true });
         for (const result of report.results) {
-          const adapter = adapters.find((a) => a.id === result.provider);
+          const adapter = refreshAdapters.find((a) => a.id === result.provider);
           const input = {
             provider: result.provider,
             persistsSnapshots: adapter?.persistsSnapshots,
@@ -2339,7 +2351,7 @@ export async function main(): Promise<void> {
         console.log(opts.json ? JSON.stringify(report, null, 2) : formatRefresh(report));
         process.exit(0);
       }
-      process.exit(await refreshCommand(adapters, { allowProbe: false, json: opts.json }));
+      process.exit(await refreshCommand(refreshAdapters, { allowProbe: false, json: opts.json }));
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`qlb refresh: ${msg}`);

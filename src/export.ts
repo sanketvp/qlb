@@ -39,9 +39,22 @@ export type CacheExportReading = {
   stale: boolean;
 };
 
+export type CacheExportSurfaceMember = {
+  target: string;
+  accountId: string;
+  recordedAt: number;
+  readings: CacheExportReading[];
+};
+
+export type CacheExportSurface = {
+  id: 'anthropic-pi-pool';
+  members: CacheExportSurfaceMember[];
+};
+
 export type CacheExport = {
   exportedAt: number;
   readings: CacheExportReading[];
+  surfaces: CacheExportSurface[];
 };
 
 function exportDbPath(): string {
@@ -58,7 +71,7 @@ function parseArgs(args: string[]): boolean {
  * is read-only and is closed before returning.
  */
 export function cacheOnlyExport(now = Date.now(), dbPath = exportDbPath()): CacheExport {
-  if (!existsSync(dbPath)) return { exportedAt: now, readings: [] };
+  if (!existsSync(dbPath)) return { exportedAt: now, readings: [], surfaces: [] };
 
   const db = new DatabaseSync(dbPath, { readOnly: true });
   try {
@@ -74,25 +87,41 @@ export function cacheOnlyExport(now = Date.now(), dbPath = exportDbPath()): Cach
       JOIN accounts AS a ON a.id = s.account_id
       ORDER BY a.provider, a.id, s.bucket
     `).all() as SnapshotRow[];
-    return {
-      exportedAt: now,
-      readings: rows.map((row) => ({
-        accountId: row.account_id,
-        provider: row.provider,
-        label: row.label,
-        bucket: row.bucket,
-        usedPct: row.used_pct,
-        used: row.used,
-        limit: row.limit_val,
-        remaining: row.remaining,
-        resetAt: row.reset_at,
-        fetchedAt: row.fetched_at,
-        source: row.source,
-        confidence: row.confidence,
-        status: row.status,
-        stale: now - row.fetched_at > STALE_OK_S * 1000,
-      })),
-    };
+    const readings = rows.map((row) => ({
+      accountId: row.account_id,
+      provider: row.provider,
+      label: row.label,
+      bucket: row.bucket,
+      usedPct: row.used_pct,
+      used: row.used,
+      limit: row.limit_val,
+      remaining: row.remaining,
+      resetAt: row.reset_at,
+      fetchedAt: row.fetched_at,
+      source: row.source,
+      confidence: row.confidence,
+      status: row.status,
+      stale: now - row.fetched_at > STALE_OK_S * 1000,
+    }));
+    const targets = db.prepare(`
+      SELECT target, slot_account_id, recorded_at
+      FROM pi_export_targets
+      WHERE provider = 'anthropic'
+      ORDER BY target
+    `).all() as Array<{ target: string; slot_account_id: string; recorded_at: number }>;
+    const surfaces: CacheExportSurface[] = targets.length === 0
+      ? []
+      : [{
+        id: 'anthropic-pi-pool',
+        members: targets.map((target) => ({
+          target: target.target,
+          accountId: target.slot_account_id,
+          recordedAt: target.recorded_at,
+          readings: readings.filter((reading) =>
+            reading.provider === 'anthropic' && reading.accountId === target.slot_account_id),
+        })),
+      }];
+    return { exportedAt: now, readings, surfaces };
   } finally {
     db.close();
   }

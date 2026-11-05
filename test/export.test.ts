@@ -36,15 +36,21 @@ function hash(path: string): string {
   return createHash('sha256').update(readFileSync(path)).digest('hex');
 }
 
-function fixtureDb(): { path: string; freshAt: number; staleAt: number } {
+function fixtureDb(): { path: string; freshAt: number; staleAt: number; poolRecordedAt: number } {
   const root = mkdtempSync(join(tmpdir(), 'qlb-export-'));
   const path = join(root, 'qlb.db');
   const now = Date.now();
   const freshAt = now - 300_000 + 1_000;
   const staleAt = now - 300_000 - 1_000;
+  const poolRecordedAt = now - 60_000;
   const store = openStore(path);
   try {
     store.upsertAccount('anthropic-a', 'anthropic', 'account-a');
+    store.upsertAccount('anthropic-b', 'anthropic', 'account-b');
+    store.replacePiExportTargets('anthropic', [
+      { provider: 'anthropic', target: 'pi-a', slotAccountId: 'anthropic-a', lineageFp: 'not-exported-a', recordedAt: poolRecordedAt },
+      { provider: 'anthropic', target: 'pi-b', slotAccountId: 'anthropic-b', lineageFp: 'not-exported-b', recordedAt: poolRecordedAt },
+    ]);
     store.upsertSnapshot('anthropic-a', 'five-hour', {
       usedPct: 12,
       remaining: 88,
@@ -61,7 +67,7 @@ function fixtureDb(): { path: string; freshAt: number; staleAt: number } {
   } finally {
     store.close();
   }
-  return { path, freshAt, staleAt };
+  return { path, freshAt, staleAt, poolRecordedAt };
 }
 
 describe('cache-only export', () => {
@@ -75,6 +81,7 @@ describe('cache-only export', () => {
     const body = JSON.parse(result.stdout) as {
       exportedAt: number;
       readings: Array<{ bucket: string; fetchedAt: number; stale: boolean; accountId: string; provider: string; status: string }>;
+      surfaces: Array<{ id: string; members: Array<{ target: string; accountId: string; recordedAt: number; readings: unknown[] }> }>;
     };
     assert.equal(typeof body.exportedAt, 'number');
     assert.deepEqual(body.readings.map((reading) => ({
@@ -88,6 +95,22 @@ describe('cache-only export', () => {
       { bucket: 'five-hour', fetchedAt: fixture.freshAt, stale: false, accountId: 'anthropic-a', provider: 'anthropic', status: 'active' },
       { bucket: 'seven-day', fetchedAt: fixture.staleAt, stale: true, accountId: 'anthropic-a', provider: 'anthropic', status: 'active' },
     ]);
+    assert.deepEqual(body.surfaces, [{
+      id: 'anthropic-pi-pool',
+      members: [
+        { target: 'pi-a', accountId: 'anthropic-a', recordedAt: fixture.poolRecordedAt, readings: body.readings },
+        { target: 'pi-b', accountId: 'anthropic-b', recordedAt: fixture.poolRecordedAt, readings: [] },
+      ],
+    }]);
+    assert.doesNotMatch(result.stdout, /lineage/i);
+  });
+
+  it('omits surfaces when no persisted Anthropic Pi targets exist', () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-export-empty-'));
+    const path = join(root, 'qlb.db');
+    const store = openStore(path);
+    store.close();
+    assert.deepEqual(cacheOnlyExport(Date.now(), path).surfaces, []);
   });
 
   it('refuses a database schema newer than this build without output rows', () => {

@@ -160,7 +160,7 @@ Flags: `[--json]`.
 
 ## `qlb refresh`
 
-Poll every enabled adapter for a fresh gauge reading. Without `--allow-probe` this is a no-network no-op (exit 0). Pass `--allow-probe` to invoke each adapter's `fetchSnapshots()` — network reads go through the existing single-flight cache.
+Poll every enabled adapter for a fresh gauge reading. Without `--allow-probe` this is a no-network no-op (exit 0). Pass `--allow-probe` to invoke each adapter's `fetchSnapshots()` — network reads go through the existing single-flight cache. Use `--provider kimi-coding` to explicitly probe only Kimi; this is the only supported provider-scoped refresh and still requires `--allow-probe` before it makes a request.
 
 `--allow-probe` makes **real provider requests** with your stored credentials. For xAI that is a 1-token completion that consumes quota. Codex has no probe (`probes: false`): it only reads the local auth file and is reported as `no-probe` (readings come from the proxy's header parsing). Invalid/missing Codex credentials are `error`, not `no-probe`.
 
@@ -169,6 +169,12 @@ A fetch that fails inside the single-flight TTL keeps cached buckets and is clas
 ```console
 $ qlb refresh
 refresh: no probes run (pass --allow-probe to poll providers)
+
+$ qlb refresh --provider kimi-coding --allow-probe --json
+{
+  "probed": true,
+  "results": [{ "provider": "kimi-coding", "status": "ok" }]
+}
 
 $ qlb refresh --allow-probe
 [OK]   xai (xAI): 1 account(s)
@@ -228,10 +234,10 @@ Emit the last persisted usage readings as JSON without loading provider adapters
 
 ```console
 $ qlb export --cache-only --json
-{"exportedAt":1788844834325,"readings":[{"accountId":"acct-a","provider":"anthropic","label":"alice@example.com","bucket":"5h","usedPct":2,"used":null,"limit":null,"remaining":null,"resetAt":1788846834100,"fetchedAt":1788844834100,"source":"poll","confidence":"authoritative","status":"active","stale":false}]}
+{"exportedAt":1788844834325,"readings":[{"accountId":"acct-a","provider":"anthropic","label":"alice@example.com","bucket":"5h","usedPct":2,"used":null,"limit":null,"remaining":null,"resetAt":1788846834100,"fetchedAt":1788844834100,"source":"poll","confidence":"authoritative","status":"active","stale":false}],"surfaces":[{"id":"anthropic-pi-pool","members":[{"target":"pi-slot-a","accountId":"acct-a","recordedAt":1788844000000,"readings":[{"accountId":"acct-a","provider":"anthropic","label":"alice@example.com","bucket":"5h","usedPct":2,"used":null,"limit":null,"remaining":null,"resetAt":1788846834100,"fetchedAt":1788844834100,"source":"poll","confidence":"authoritative","status":"active","stale":false}]}]}]}
 ```
 
-`exportedAt`, `fetchedAt`, and `resetAt` are Unix timestamps in milliseconds; `fetchedAt` and `resetAt` may be `null`. A reading is `stale: true` when its `fetchedAt` is more than 300 seconds old, including a missing timestamp. The remaining reading fields are the stored account and snapshot values. A missing database succeeds with `{"exportedAt":...,"readings":[]}`. A database with a schema newer than this QLB binary is refused without emitting rows; upgrade QLB before retrying.
+`exportedAt`, `fetchedAt`, `resetAt`, and surface-member `recordedAt` are Unix timestamps in milliseconds; `fetchedAt` and `resetAt` may be `null`. A reading is `stale: true` when its `fetchedAt` is more than 300 seconds old, including a missing timestamp. The remaining reading fields are the stored account and snapshot values. `surfaces` is additive: `anthropic-pi-pool` appears only for persisted non-secret Pi Anthropic target records, with exact historical target/account membership and each member's existing Anthropic readings. `recordedAt` is membership-inventory time, not quota freshness; a member without a persisted quota has `readings: []`. The surface never includes credential data or lineage fingerprints. A missing database succeeds with `{"exportedAt":...,"readings":[],"surfaces":[]}`. A database with a schema newer than this QLB binary is refused without emitting rows; upgrade QLB before retrying.
 
 The command accepts exactly `qlb export --cache-only --json` (the two flags may be ordered either way). It resolves the database through `QLB_DB_PATH`, config `dbPath`, or the default path; it does not accept per-invocation configuration flags such as `--db-path` or `--config`.
 

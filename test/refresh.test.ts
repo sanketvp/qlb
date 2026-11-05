@@ -6,6 +6,8 @@ import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
 import { collectCandidates } from '../src/candidates';
+import { cacheOnlyExport } from '../src/export';
+import { filterRefreshAdapters } from '../src/app';
 import { loadPlugins } from '../src/plugins';
 import { formatRefresh, refreshCommand, runRefresh } from '../src/refresh';
 import { openStore } from '../src/store';
@@ -40,6 +42,26 @@ function goodAdapter(id: string, displayName: string, counter: { n: number }) {
 }
 
 describe('qlb refresh', () => {
+  it('filters a scoped refresh to Kimi and keeps unscoped refreshes unchanged', async () => {
+    const kimi = { n: 0 };
+    const xai = { n: 0 };
+    const adapters = [
+      goodAdapter('kimi-coding', 'Kimi', kimi),
+      goodAdapter('xai', 'xAI', xai),
+    ];
+
+    const scoped = filterRefreshAdapters(adapters, 'kimi-coding');
+    assert.deepEqual(scoped.map((adapter) => adapter.id), ['kimi-coding']);
+    await runRefresh(scoped, { allowProbe: true });
+    assert.equal(kimi.n, 1);
+    assert.equal(xai.n, 0);
+
+    assert.equal(filterRefreshAdapters(adapters), adapters);
+    await runRefresh(filterRefreshAdapters(adapters), { allowProbe: true });
+    assert.equal(kimi.n, 2);
+    assert.equal(xai.n, 1);
+  });
+
   it('T1: without --allow-probe does not call adapters', async () => {
     const counter = { n: 0 };
     const spy = goodAdapter('spy', 'Spy', counter);
@@ -513,6 +535,55 @@ function runCli(
 }
 
 describe('qlb refresh observation recording', () => {
+  it('refuses provider-scoped refreshes other than Kimi', () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-refresh-provider-'));
+    const result = runCli(['refresh', '--provider', 'xai', '--allow-probe', '--json'],
+      isolatedEnv(root, join(root, 'qlb.db'), join(root, 'plugins')));
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /--provider must be kimi-coding/);
+  });
+
+  it('Kimi scoped refresh retains stale cache rows when its probe fails', () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-refresh-kimi-failure-'));
+    const pluginsDir = join(root, 'plugins');
+    mkdirSync(pluginsDir);
+    writeFileSync(join(pluginsDir, 'fetch-hook.js'), `
+      globalThis.fetch = async () => { throw new Error('network intentionally disabled'); };
+      module.exports = { id: 'test-fetch-hook', displayName: 'Fetch hook', async fetchSnapshots() { return []; } };
+    `);
+    const dbPath = join(root, 'qlb.db');
+    const staleAt = Date.now() - 301_000;
+    const store = openStore(dbPath);
+    try {
+      store.upsertAccount('kimi-default', 'kimi-coding', 'Kimi K3');
+      for (const bucket of ['5h', 'weekly']) {
+        store.upsertSnapshot('kimi-default', bucket, {
+          usedPct: 42,
+          fetchedAt: staleAt,
+          source: 'poll',
+          confidence: 'authoritative',
+        });
+      }
+    } finally {
+      store.close();
+    }
+    const keyFile = join(root, 'kimi.md');
+    writeFileSync(keyFile, 'sk-kimi-TESTKEY123');
+    const env = { ...isolatedEnv(root, dbPath, pluginsDir), QLB_KIMI_CREDENTIALS_FILE: keyFile };
+
+    const result = runCli(['refresh', '--provider', 'kimi-coding', '--allow-probe', '--json'], env);
+    assert.equal(result.status, 0, result.stderr);
+    const report = JSON.parse(result.stdout) as { results: Array<{ provider: string; status: string }> };
+    assert.deepEqual(report.results.map((entry) => entry.provider), ['kimi-coding']);
+    assert.equal(report.results[0]?.status, 'error');
+
+    const readings = cacheOnlyExport(Date.now(), dbPath).readings.filter((reading) => reading.provider === 'kimi-coding');
+    assert.deepEqual(readings.map((reading) => ({ bucket: reading.bucket, fetchedAt: reading.fetchedAt, stale: reading.stale })), [
+      { bucket: '5h', fetchedAt: staleAt, stale: true },
+      { bucket: 'weekly', fetchedAt: staleAt, stale: true },
+    ]);
+  });
+
   it('empty probe records a failed observation so why does not keep the stale winner', () => {
     const root = mkdtempSync(join(tmpdir(), 'qlb-refresh-obs-'));
     const pluginsDir = join(root, 'plugins');
