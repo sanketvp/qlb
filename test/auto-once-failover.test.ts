@@ -64,8 +64,8 @@ function weeklyUsageFixture(fablePct: number, modelConfig: string | null = null,
   return { root, home, config, store, slots };
 }
 
-async function dryRunCli(home: string): Promise<{ code: number | null; stdout: string; stderr: string }> {
-  const child = spawn(process.execPath, [join(__dirname, '..', 'src', 'cli.js'), 'auto', '--once', '--dry-run', '--json'], {
+async function autoCli(home: string, args: string[]): Promise<{ code: number | null; stdout: string; stderr: string }> {
+  const child = spawn(process.execPath, [join(__dirname, '..', 'src', 'cli.js'), 'auto', ...args], {
     env: { QLB_TEST_MODE: '1', QLB_HOME: home, HOME: home }, stdio: ['ignore', 'pipe', 'pipe'],
   });
   return new Promise((resolve, reject) => {
@@ -78,6 +78,10 @@ async function dryRunCli(home: string): Promise<{ code: number | null; stdout: s
     child.on('error', reject);
     child.on('exit', (code) => resolve({ code, stdout, stderr }));
   });
+}
+
+async function dryRunCli(home: string): Promise<{ code: number | null; stdout: string; stderr: string }> {
+  return autoCli(home, ['--once', '--dry-run', '--json']);
 }
 
 function productionUsageResponse(retryAfter: string) {
@@ -257,6 +261,44 @@ describe('auto once failover (G11)', () => {
         env: { QLB_TEST_MODE: '1', QLB_HOME: fixture.home, HOME: fixture.home }, now: () => AUTO_NOW, log: () => {},
       });
       assert.deepEqual(dry.decisions, [live.decision]);
+    } finally {
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it('configures an Anthropic scope through the CLI, clears only its stale park, and dry-runs under the new scope', async () => {
+    const fixture = weeklyUsageFixture(92);
+    try {
+      fixture.store.setConfig('auto.anthropic.parkedUntil', String(AUTO_NOW + 60_000));
+      fixture.store.setConfig('auto.anthropic.suspendedUntil', String(AUTO_NOW + 120_000));
+      fixture.store.close();
+
+      const set = await autoCli(fixture.home, ['scope', 'anthropic', 'OpUs', '--json']);
+      assert.equal(set.code, 0, set.stderr);
+      assert.deepEqual(JSON.parse(set.stdout), { provider: 'anthropic', scope: 'opus', changed: true, parkedCleared: true });
+      const repeat = await autoCli(fixture.home, ['scope', 'anthropic', 'opus', '--json']);
+      assert.equal(repeat.code, 0, repeat.stderr);
+      assert.deepEqual(JSON.parse(repeat.stdout), { provider: 'anthropic', scope: 'opus', changed: false, parkedCleared: false });
+      const inspect = await autoCli(fixture.home, ['scope', 'anthropic']);
+      assert.equal(inspect.code, 0, inspect.stderr);
+      assert.equal(inspect.stdout, 'anthropic automatic model scope: opus (unchanged)\n');
+
+      const dry = await dryRunCli(fixture.home);
+      assert.equal(dry.code, 0, dry.stderr);
+      assert.deepEqual(JSON.parse(dry.stdout).decisions, [{ kind: 'stay', reason: 'below-threshold', unhealthyTicks: 0 }]);
+      const reopened = openStore(fixture.config.dbPath);
+      try {
+        assert.equal(reopened.getConfig('auto.anthropic.models'), 'opus');
+        assert.equal(reopened.getConfig('auto.anthropic.parkedUntil'), '');
+        assert.equal(reopened.getConfig('auto.anthropic.suspendedUntil'), String(AUTO_NOW + 120_000));
+      } finally { reopened.close(); }
+
+      const reset = await autoCli(fixture.home, ['scope', 'anthropic', 'all']);
+      assert.equal(reset.code, 0, reset.stderr);
+      assert.equal(reset.stdout, 'anthropic automatic model scope: all (updated)\n');
+      const invalid = await autoCli(fixture.home, ['scope', 'anthropic', 'opus!']);
+      assert.equal(invalid.code, 2);
+      assert.equal(invalid.stderr, 'qlb auto scope: invalid-model-name\n');
     } finally {
       rmSync(fixture.root, { recursive: true, force: true });
     }
