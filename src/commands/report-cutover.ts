@@ -26,10 +26,15 @@ export interface ReportCutoverCommandDeps {
   now?: () => number;
   /** Test seam; production appends the doctor health-log row itself. */
   doctor?: (config: CommandContext['config']) => Promise<DoctorReport>;
+  doctorOptions?: Omit<Parameters<typeof doctorQlb>[1], 'appendHealthLog' | 'now'>;
 }
 
 function row(group: CutoverReportRow['group'], name: string, status: CutoverReportStatus, message: string, code?: string): CutoverReportRow {
   return { group, name, status, ...(code ? { code } : {}), message };
+}
+
+function reportPasses(rows: CutoverReportRow[]): boolean {
+  return rows.every((value) => value.status === 'PASS' || value.status === 'DEFERRED');
 }
 
 function reportRows(db: DatabaseSync, lifecycle: LifecycleRow, now: number): CutoverReportRow[] {
@@ -74,11 +79,11 @@ function reportRows(db: DatabaseSync, lifecycle: LifecycleRow, now: number): Cut
   else if (lifecycle.extendedAt == null) rows.push(row('coverage', 'anthropic:automatic-switches', 'FAIL', `${automatic.count}/10 non-injected automatic Anthropic switches; correctness checks must pass before extending the cutover window`, 'insufficient-anthropic-coverage'));
   else rows.push(row('coverage', 'anthropic:automatic-switches', 'FAIL', `${automatic.count}/10 non-injected automatic Anthropic switches after the one extension`, 'extended-once'));
 
+  const piDeferred = configValue(db, 'cutover.piDeferredAt') === String(lifecycle.cutoverAt);
   const codexVerified = codexL13ReceiptAt(configValue(db, 'codex.l13VerifiedAt')) != null;
   const codexSwitches = db.prepare(`SELECT count(*) AS count FROM switch_log WHERE provider = 'openai-codex' AND outcome = 'ok'
-    AND injected = 0 AND from_account IS NOT NULL AND from_account <> to_account AND ts >= ? AND ts <= ?`).get(...inWindow) as { count: number };
+    AND injected = 0 AND from_account IS NOT NULL AND from_account <> to_account AND ts >= ? AND ts <= ?`).get(start, piDeferred ? now : end) as { count: number };
   const codexPass = codexVerified && codexSwitches.count >= 1;
-  const piDeferred = configValue(db, 'cutover.piDeferredAt') === String(lifecycle.cutoverAt);
   rows.push(codexPass
     ? row('coverage', 'codex:L13-switch', 'PASS', 'L13 verification and a non-injected Codex switch are recorded')
     : piDeferred
@@ -108,10 +113,10 @@ function reportRows(db: DatabaseSync, lifecycle: LifecycleRow, now: number): Cut
   return rows;
 }
 
-export function buildCutoverReport(db: DatabaseSync, lifecycle: LifecycleRow, now: number): CutoverReport {
-  const rows = reportRows(db, lifecycle, now);
+export function buildCutoverReport(db: DatabaseSync, lifecycle: LifecycleRow, now: number, receiptRows: CutoverReportRow[] = []): CutoverReport {
+  const rows = [...reportRows(db, lifecycle, now), ...receiptRows];
   return {
-    ok: rows.every((value) => value.status === 'PASS' || value.status === 'DEFERRED'),
+    ok: reportPasses(rows),
     lifecycle: { id: lifecycle.id, state: lifecycle.state, cutoverAt: lifecycle.cutoverAt!, windowEnd: lifecycle.windowEnd!, extendedAt: lifecycle.extendedAt },
     rows,
   };
@@ -152,11 +157,11 @@ function receiptIsDeferred(report: CutoverReport): boolean {
   return report.rows.some((value) => value.status === 'DEFERRED');
 }
 
-function writeOrClearReceipt(store: Store, now: number, healthLogId: number | undefined, eligible: boolean, deferred: boolean): void {
+function writeOrClearReceipt(store: Store, now: number, healthLogId: number | undefined, ok: boolean, deferred: boolean): void {
   store.runImmediate(() => {
-    store.setConfig('report.receiptAt', eligible ? String(now) : '');
-    store.setConfig('report.receiptHealthLogId', eligible && healthLogId != null ? String(healthLogId) : '');
-    store.setConfig('report.receiptDeferred', eligible && deferred ? '1' : '');
+    store.setConfig('report.receiptAt', ok ? String(now) : '');
+    store.setConfig('report.receiptHealthLogId', ok ? String(healthLogId) : '');
+    store.setConfig('report.receiptDeferred', ok && deferred ? '1' : '');
   });
 }
 
@@ -186,23 +191,25 @@ async function execute(args: string[], ctx: CommandContext, deps: ReportCutoverC
     const db = (store as unknown as { db: DatabaseSync }).db;
     const historyPasses = recentHealthHistoryPasses(db, now);
     const doctor = deps.doctor == null
-      ? await doctorQlb(ctx.config, { appendHealthLog: true, now: () => now })
+      ? await doctorQlb(ctx.config, { ...deps.doctorOptions, appendHealthLog: true, now: () => now })
       : await deps.doctor(ctx.config);
-    const report = buildCutoverReport(db, lifecycle, now);
-    appendReceiptRows(report.rows, db, now, doctor, historyPasses);
-    report.ok = report.rows.every((value) => value.status === 'PASS' || value.status === 'DEFERRED');
+    const receiptRows: CutoverReportRow[] = [];
+    appendReceiptRows(receiptRows, db, now, doctor, historyPasses);
+    const report = buildCutoverReport(db, lifecycle, now, receiptRows);
     if (report.rows.some((value) => value.status === 'EXTEND')) {
       const extended = extendWindow(store, now);
       if (!extended.ok) { ctx.stderr(`report cutover refused: ${extended.code}`); return 3; }
       report.lifecycle.windowEnd = extended.row!.windowEnd!;
       report.lifecycle.extendedAt = extended.row!.extendedAt;
     }
-    const eligible = report.ok && doctor.healthLogId != null;
-    writeOrClearReceipt(store, now, doctor.healthLogId, eligible, receiptIsDeferred(report));
+    writeOrClearReceipt(store, now, doctor.healthLogId, report.ok, receiptIsDeferred(report));
     const redacted = JSON.parse(redactSecrets(JSON.stringify(report), ctx.knownSecrets())) as CutoverReport;
     if (json) ctx.stdout(JSON.stringify(redacted));
     else for (const line of formatText(redacted)) ctx.stdout(line);
-    if (!eligible) ctx.stderr(`no receipt (${redacted.rows.find((value) => value.status === 'FAIL' || value.status === 'EXTEND')?.name ?? 'doctor-health-log-missing'})`);
+    if (!redacted.ok) {
+      const failure = redacted.rows.find((value) => value.status === 'FAIL' || value.status === 'EXTEND');
+      if (failure) ctx.stderr(`no receipt (${failure.name})`);
+    }
     return redacted.ok ? 0 : 1;
   } finally { store.close(); }
 }
