@@ -15,6 +15,7 @@ import {
   beginRetirementFence,
   clearRetirementFence,
   drillActive,
+  drillRowsPresent,
   commitCutover,
   extendWindow,
   isOperational,
@@ -840,8 +841,72 @@ describe('lifecycle (AC49)', () => {
       assert.equal(extendWindow(store, initial).ok, true);
       assert.equal(phase(store).windowEnd, 1 + 14 * 24 * 60 * 60 * 1000);
       assert.equal(extendWindow(store, initial).code, 'window-already-extended');
+      store.recordSwitch({ ts: initial, provider: 'anthropic', toAccount: 'claude-b', trigger: 'failover', outcome: 'ok', injected: true, detail: 'fault-injection:usage-5xx' });
+      store.recordSwitch({ ts: initial, provider: 'anthropic', toAccount: 'claude-b', trigger: 'manual', outcome: 'rolled-back', injected: true, detail: 'fault-injection:fail-step-8' });
+      store.recordSwitch({ ts: initial, provider: 'anthropic', toAccount: 'claude-b', trigger: 'failover', outcome: 'refused', injected: true, detail: 'fault-injection:breaker-rows', error: 'breaker' });
+      store.setConfig('drill.undoDryRunAt', String(initial));
       assert.equal(markDrillDone(store, initial).ok, true);
       assert.equal(lifecycleCheck(store, 'drill').level, 'PASS');
+    } finally { store.close(); }
+  });
+
+  it('drill-done refuses and names the missing facts', () => {
+    const store = fixtureStore();
+    try {
+      beginCutover(store, 10);
+      assert.equal(transition(store, 'cutover', 20).ok, true);
+      const before = phase(store);
+      assert.deepEqual(markDrillDone(store, 30), {
+        ok: false, code: 'drill-rows-missing', missing: ['usage-5xx', 'fail-step-8', 'breaker-rows', 'undo-dry-run'], row: before,
+      });
+      assert.equal(phase(store).drillDoneAt, null);
+    } finally { store.close(); }
+  });
+
+  it('drill-done succeeds with the three rows and the undo dry-run marker inside the drill window', () => {
+    const store = fixtureStore();
+    try {
+      beginCutover(store, 10);
+      assert.equal(transition(store, 'cutover', 20).ok, true);
+      assert.equal(markDrillBegan(store, 40).ok, true);
+      store.recordSwitch({ ts: 50, provider: 'anthropic', toAccount: 'b', trigger: 'failover', outcome: 'ok', injected: true, detail: 'fault-injection:usage-5xx' });
+      store.recordSwitch({ ts: 50, provider: 'anthropic', toAccount: 'b', trigger: 'manual', outcome: 'rolled-back', injected: true, detail: 'fault-injection:fail-step-8' });
+      store.recordSwitch({ ts: 50, provider: 'anthropic', toAccount: 'b', trigger: 'failover', outcome: 'refused', injected: true, detail: 'fault-injection:breaker-rows', error: 'breaker' });
+      store.setConfig('drill.undoDryRunAt', '50');
+      assert.equal(markDrillDone(store, 60).ok, true);
+    } finally { store.close(); }
+  });
+
+  it('drill-done ignores rows before drill_began_at', () => {
+    const store = fixtureStore();
+    try {
+      beginCutover(store, 10);
+      assert.equal(transition(store, 'cutover', 20).ok, true);
+      assert.equal(markDrillBegan(store, 40).ok, true);
+      store.recordSwitch({ ts: 39, provider: 'anthropic', toAccount: 'b', trigger: 'failover', outcome: 'ok', injected: true, detail: 'fault-injection:usage-5xx' });
+      const result = drillRowsPresent((store as unknown as { db: DatabaseSync }).db, 40, 60);
+      assert.ok(result.missing.includes('usage-5xx'));
+    } finally { store.close(); }
+  });
+
+  it('seed rows satisfy neither the usage-5xx nor the breaker fact', () => {
+    const store = fixtureStore();
+    try {
+      store.recordSwitch({ ts: 50, provider: 'anthropic', toAccount: 'b', trigger: 'failover', outcome: 'ok', injected: true, detail: 'fault-injection:breaker-rows:seed' });
+      const result = drillRowsPresent((store as unknown as { db: DatabaseSync }).db, 40, 60);
+      assert.ok(result.missing.includes('usage-5xx'));
+      assert.ok(result.missing.includes('breaker-rows'));
+    } finally { store.close(); }
+  });
+
+  it('the predicate filters refused and rolled-back rows on ts', () => {
+    const store = fixtureStore();
+    try {
+      store.recordSwitch({ ts: 50, provider: 'anthropic', toAccount: 'b', trigger: 'manual', outcome: 'rolled-back', injected: true, detail: 'fault-injection:fail-step-8', committedAt: 1 });
+      store.recordSwitch({ ts: 50, provider: 'anthropic', toAccount: 'b', trigger: 'failover', outcome: 'refused', injected: true, detail: 'fault-injection:breaker-rows', error: 'breaker', committedAt: 1 });
+      const result = drillRowsPresent((store as unknown as { db: DatabaseSync }).db, 40, 60);
+      assert.ok(!result.missing.includes('fail-step-8'));
+      assert.ok(!result.missing.includes('breaker-rows'));
     } finally { store.close(); }
   });
 });

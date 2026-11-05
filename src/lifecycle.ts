@@ -11,7 +11,7 @@ export type LifecycleState = 'pre-cutover' | 'cutting-over' | 'cutover' | 'undoi
 export type LifecycleOperation =
   | 'gate' | 'switch:manual' | 'switch:auto' | 'auto' | 'auto:dry-run' | 'auto:resume' | 'auto:drill-begin'
   | 'import-cswap' | 'import-cswap:reconcile' | 'import-cswap:reconcile-preview'
-  | 'undo-cswap' | 'undo-cswap:resume' | 'retire-cswap' | 'retire-cswap:resume'
+  | 'undo-cswap' | 'undo-cswap:resume' | 'undo-cswap:dry-run-record' | 'retire-cswap' | 'retire-cswap:resume'
   | 'pi-migrate' | 'pi-rollback' | 'codex-import-active' | 'codex-add' | 'claude-add'
   | 'cutover-begin' | 'cutover-commit' | 'cutover-abort' | 'keychain-authorize-cswap'
   | 'keychain-check-launchd-live' | 'verify-l13' | 'report-cutover' | 'doctor' | 'status'
@@ -55,6 +55,7 @@ export interface LifecycleRow {
 export interface LifecycleResult {
   ok: boolean;
   code?: string;
+  missing?: string[];
   row?: LifecycleRow;
 }
 
@@ -80,7 +81,7 @@ export const PHASE_RULES: Record<LifecycleState, Set<LifecycleOperation>> = {
     'doctor', 'status', 'switch:manual', 'switch:auto', 'auto', 'auto:dry-run', 'auto:resume', 'auto:drill-begin', 'gate',
     'import-cswap:reconcile', 'import-cswap:reconcile-preview',
     'codex-import-active', 'codex-add', 'claude-add', 'claude-journal-resolve', 'pi-migrate', 'pi-rollback',
-    'verify-l13', 'report-cutover', 'undo-cswap', 'retire-cswap', 'retire-cswap:resume', 'lifecycle-drill-done',
+    'verify-l13', 'report-cutover', 'undo-cswap', 'undo-cswap:dry-run-record', 'retire-cswap', 'retire-cswap:resume', 'lifecycle-drill-done',
   ),
   undoing: rules('doctor', 'status', 'undo-cswap:resume', 'pi-rollback'),
   'rolled-back': rules('doctor', 'status', 'report-cutover', 'undo-cswap:resume', 'pi-rollback', 'lifecycle-close'),
@@ -545,11 +546,35 @@ export function markDrillBegan(store: Store, now: number = Date.now()): Lifecycl
   });
 }
 
+export function drillRowsPresent(db: DatabaseSync, windowStartMs: number, nowMs: number): { ok: boolean; missing: string[] } {
+  const facts = db.prepare(`SELECT trigger, outcome, injected, detail, error FROM switch_log
+    WHERE ts >= ? AND ts <= ?`).all(windowStartMs, nowMs) as Array<{
+      trigger: string; outcome: string; injected: number; detail: string | null; error: string | null;
+    }>;
+  const has = (predicate: (row: typeof facts[number]) => boolean) => facts.some(predicate);
+  const marker = db.prepare('SELECT value FROM config WHERE key = ?').get('drill.undoDryRunAt') as { value: string } | undefined;
+  const undoDryRunAt = marker && /^\d+$/.test(marker.value) ? Number(marker.value) : NaN;
+  const missing = [
+    has((row) => row.trigger === 'failover' && row.outcome === 'ok' && row.injected === 1 && row.detail === 'fault-injection:usage-5xx') ? null : 'usage-5xx',
+    has((row) => row.outcome === 'rolled-back' && row.injected === 1 && row.detail === 'fault-injection:fail-step-8') ? null : 'fail-step-8',
+    has((row) => row.trigger === 'failover' && row.outcome === 'refused' && row.injected === 1 && row.detail === 'fault-injection:breaker-rows' && row.error === 'breaker') ? null : 'breaker-rows',
+    Number.isFinite(undoDryRunAt) && undoDryRunAt >= windowStartMs && undoDryRunAt <= nowMs ? null : 'undo-dry-run',
+  ].filter((fact): fact is string => fact !== null);
+  return { ok: missing.length === 0, missing };
+}
+
 export function markDrillDone(store: Store, now: number = Date.now()): LifecycleResult {
-  const current = phase(store);
-  if (current.state !== 'cutover') return { ok: false, code: `phase=${current.state}`, row: current };
-  withDb(store, (db) => db.prepare('UPDATE lifecycle SET drill_done_at = ? WHERE id = ?').run(now, current.id));
-  return { ok: true, row: phase(store) };
+  return store.runImmediate(() => {
+    const db = (store as unknown as { db: DatabaseSync }).db;
+    const admission = assertAdmittedInConnection(db, 'lifecycle-drill-done');
+    if (!admission.ok) return admission;
+    const current = admission.row!;
+    const drill = drillRowsPresent(db, current.drillBeganAt ?? current.cutoverAt ?? now, now);
+    if (!drill.ok) return { ok: false, code: 'drill-rows-missing', missing: drill.missing, row: current };
+    const changed = db.prepare('UPDATE lifecycle SET drill_done_at = ? WHERE id = ? AND state = ?').run(now, current.id, current.state).changes;
+    if (changed !== 1) return { ok: false, code: 'drill-state-lost', row: phaseForConnection(db) };
+    return { ok: true, row: phaseForConnection(db) };
+  });
 }
 
 export function closeLifecycle(store: Store, id: number, note: string, now: number = Date.now()): LifecycleResult {

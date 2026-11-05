@@ -2178,6 +2178,7 @@ function lifecycleOperationFor(command: string, args: string[]): LifecycleOperat
     if (args[0] === 'abort') return 'cutover-abort';
   }
   if (command === 'undo cswap') {
+    if (args.includes('--record-drill')) return 'undo-cswap:dry-run-record';
     if (args.includes('--dry-run')) return 'undo-cswap:dry-run';
     return args.includes('--resume') ? 'undo-cswap:resume' : 'undo-cswap';
   }
@@ -2215,6 +2216,11 @@ export async function runExecutingCommand(
     },
   };
   try {
+    // Fault-injection capability errors are usage errors, before lifecycle
+    // admission can create or migrate a store.
+    if (match.command.name === 'undo cswap' && match.args.includes('--record-drill') && context.env.QLB_FAULT_INJECTION !== '1') {
+      return match.command.execute!(match.args, redactingContext);
+    }
     const operation = lifecycleOperationFor(match.command.name, match.args);
     if (operation != null) {
       const refusal = lifecycleAdmissionCode(context.config.dbPath, operation);

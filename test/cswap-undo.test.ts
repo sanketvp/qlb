@@ -352,6 +352,35 @@ describe('qlb undo cswap --dry-run', () => {
     }
   });
 
+  it('--dry-run --record-drill writes only drill.undoDryRunAt after a successful plan', async () => {
+    const f = fixture();
+    try {
+      beginUndo(f);
+      const recordContext = { ...context(f), env: { ...context(f).env, QLB_FAULT_INJECTION: '1' } };
+      assert.equal(await runUndoCswapCommand(['--dry-run', '--record-drill'], recordContext, {
+        keychain: f.keychain, backupDir: f.backup, plan: async () => ({ slots: [], deleteEnc: [], activeAccountNumber: null }), now: () => 123,
+      }), 0);
+      const db = openStoreConnection(f.dbPath, true);
+      try {
+        assert.equal((db.prepare("SELECT value FROM config WHERE key = 'drill.undoDryRunAt'").get() as { value: string }).value, '123');
+        assert.equal((db.prepare('SELECT count(*) AS count FROM switch_log').get() as { count: number }).count, 0);
+        assert.equal((db.prepare('SELECT count(*) AS count FROM active_login').get() as { count: number }).count, 0);
+      } finally { db.close(); }
+    } finally { close(f); }
+  });
+
+  it('--record-drill without QLB_FAULT_INJECTION exits 2', async () => {
+    const f = fixture();
+    try {
+      const before = snapshot(f.root);
+      const match = resolveCommand(['undo', 'cswap', '--dry-run', '--record-drill'], discoverCommands());
+      assert.ok(match);
+      assert.equal(await runExecutingCommand(match, context(f)), 2);
+      assert.deepEqual(snapshot(f.root), before);
+      assert.deepEqual(f.output, ['ERR:qlb undo cswap: --record-drill requires QLB_FAULT_INJECTION=1']);
+    } finally { close(f); }
+  });
+
   it('the real command returns an empty plan for a missing store without creating it', async () => {
     const f = fixture();
     try {

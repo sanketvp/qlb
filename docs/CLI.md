@@ -108,6 +108,8 @@ This synthetic active-usage failure records `http-500`, retains the prior usage 
 
 The credential-free breaker drill is `qlb auto --once --inject breaker-rows anthropic`. It does not poll, and refuses when a Claude switch journal exists or C-swap is alive. It leaves `auto.anthropic.suspendedUntil` set for one hour; run `qlb auto resume anthropic` to resume normal switching sooner.
 
+An active fire drill can finish with `qlb lifecycle drill-done` only after all four facts were recorded after the drill began: an injected `usage-5xx` failover, a rolled-back `qlb switch anthropic <account_id> --inject fail-step 8`, the injected `breaker-rows` refusal, and an undo hand-back plan. Record the last fact without changing credentials with `QLB_FAULT_INJECTION=1 qlb undo cswap --dry-run --record-drill`; `--record-drill` is accepted only with `--dry-run`. If any fact is missing, `drill-done` exits 3 and names the missing facts.
+
 Flags: `[--once] [--dry-run] [--json]`. Fault injection additionally requires `QLB_FAULT_INJECTION=1` and exactly `--once --inject <usage-5xx|breaker-rows> anthropic`.
 
 ## `qlb refresh`
