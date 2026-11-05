@@ -112,7 +112,7 @@ export async function resolveClaudeSwitchJournal(
         await writeLiveClaudeCredentials(staged, deps.live, credentialHeld);
       }
       deps.store.recordSwitch({ ts: deps.now(), provider: 'anthropic', fromAccount: journal.from, toAccount: journal.to,
-        trigger: journal.trigger, outcome: 'rolled-back', detail: 'journal-back', injected: journal.injected,
+        trigger: journal.trigger, outcome: 'rolled-back', detail: journal.republish ? 'republish:journal-back' : 'journal-back', injected: journal.injected,
         stepsJson: JSON.stringify({ attempt: journal.attemptId }) });
       const cleanup = await cleanupResolvedJournal(
         () => update(ownerHeld, { closed: 'rolled-back' }, options),
@@ -231,7 +231,7 @@ export async function reconcileClaudeSwitch(deps: ClaudeSwitchDeps): Promise<voi
           restoreConfigFromJournal(deps, journal, heldConfigLock));
         deps.store.recordSwitch({
           ts: deps.now(), provider: 'anthropic', fromAccount: journal.from, toAccount: journal.to,
-          trigger: journal.trigger, outcome: 'rolled-back', detail: 'crash-reconcile', injected: journal.injected,
+          trigger: journal.trigger, outcome: 'rolled-back', detail: journal.republish ? 'republish:crash-reconcile' : 'crash-reconcile', injected: journal.injected,
           stepsJson: JSON.stringify({ attempt: journal.attemptId }),
         });
         // Durable completion must precede cleanup: a cleanup failure then

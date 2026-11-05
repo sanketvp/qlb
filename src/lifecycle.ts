@@ -20,7 +20,7 @@ export type LifecycleOperation =
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const OPEN_STATES = ['cutting-over', 'cutover', 'undoing', 'rolled-back', 'retired', 'aborted'];
-const PI_PROVIDERS = ['anthropic', 'openai-codex', 'xai', 'kimi-coding', 'openrouter'] as const;
+export const PI_PROVIDERS = ['anthropic', 'openai-codex', 'xai', 'kimi-coding', 'openrouter'] as const;
 export const CUTOVER_BEGIN_IN_PROGRESS = 'cutover-begin-in-progress';
 /** The terminal hand-back state is durable, but C-swap has not been restored yet. */
 export const CSWAP_RESTORE_PENDING = 'cswap-restore-pending';
@@ -451,7 +451,7 @@ function manualRoundTripDone(db: DatabaseSync): boolean {
     first.from_account === second.to_account && first.to_account === second.from_account));
 }
 
-function configValue(db: DatabaseSync, key: string): string | null {
+export function configValue(db: DatabaseSync, key: string): string | null {
   const row = db.prepare('SELECT value FROM config WHERE key = ?').get(key) as { value?: string } | undefined;
   return row?.value ?? null;
 }
