@@ -98,7 +98,7 @@ import {
 const USAGE = `Usage:
   qlb init [--json]
   qlb doctor [--json] [--live]
-  qlb refresh [--provider kimi-coding] [--allow-probe] [--json]
+  qlb refresh [--provider kimi-coding|openai-codex] [--allow-probe] [--json]
   qlb native-resync --provider anthropic|xai|kimi-coding|openai-codex|openrouter --account <id> [--json] [--db <path>]
   qlb status [--json] [--dashboard|--flat]
   qlb status --switches|--relogins [--window] [--json]
@@ -175,7 +175,8 @@ type StatusOpts = {
 type SetupOpts = { cmd: 'setup'; json: boolean; harness: SetupHarness | 'hermes' };
 type InitOpts = { cmd: 'init'; json: boolean };
 type DoctorOpts = { cmd: 'doctor'; json: boolean; live: boolean };
-type RefreshOpts = { cmd: 'refresh'; json: boolean; allowProbe: boolean; provider?: 'kimi-coding' };
+type RefreshProvider = 'kimi-coding' | 'openai-codex';
+type RefreshOpts = { cmd: 'refresh'; json: boolean; allowProbe: boolean; provider?: RefreshProvider };
 
 export function filterRefreshAdapters<T extends { id: string }>(adapters: T[], provider?: string): T[] {
   return provider === undefined ? adapters : adapters.filter((adapter) => adapter.id === provider);
@@ -937,8 +938,8 @@ export function parseArgs(argv: string[]): Opts {
     if (allowProbe) rest.splice(rest.indexOf('--allow-probe'), 1);
     const hasProvider = rest.includes('--provider');
     const provider = takeFlag(rest, '--provider');
-    if (hasProvider && provider !== 'kimi-coding') {
-      console.error(`qlb refresh: --provider must be kimi-coding (got '${provider ?? ''}')`);
+    if (hasProvider && provider !== 'kimi-coding' && provider !== 'openai-codex') {
+      console.error(`qlb refresh: --provider must be kimi-coding|openai-codex (got '${provider ?? ''}')`);
       console.error(USAGE);
       process.exit(1);
     }
@@ -946,7 +947,7 @@ export function parseArgs(argv: string[]): Opts {
       console.error(`qlb refresh: unknown argument ${rest[0]}`);
       process.exit(1);
     }
-    return { cmd: 'refresh', json, allowProbe, provider: provider as RefreshOpts['provider'] };
+    return { cmd: 'refresh', json, allowProbe, provider: provider as RefreshProvider | undefined };
   }
   if (raw[0] === 'why') {
     return parseWhyArgs(raw.slice(1));

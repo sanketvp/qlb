@@ -1,11 +1,11 @@
 import { readFile } from 'node:fs/promises';
 import { config } from '../config';
 import { codexIdentity, type CodexAuthDocument } from '../codex-auth';
-import type { Adapter } from '../types';
+import { getStore, type Store } from '../store';
+import { probeCodexUsage, type CodexUsageProbeDeps, type CodexUsageProbeResult } from '../usage/openai-codex';
+import type { Adapter, BucketReading } from '../types';
 
-// Codex exposes quota only in response headers from real, quota-consuming requests.
-// Phase 0 therefore reports an authenticated account with no buckets and never probes;
-// Phase 1+ can populate buckets from response headers observed by qlb-pi/qlb-proxy traffic.
+const PROVIDER = 'openai-codex';
 const AUTH_PATH = config.codexAuthJsonPath;
 const INVALID_CREDENTIALS_ERROR = `no valid Codex credentials found in ${AUTH_PATH}`;
 
@@ -42,19 +42,41 @@ function stringClaim(payload: JsonObject | undefined, name: string): string | un
   return undefined;
 }
 
+type CodexStore = Pick<Store, 'upsertAccount' | 'recordUsagePollResult'>;
+type ProbeUsage = (deps: CodexUsageProbeDeps) => Promise<CodexUsageProbeResult>;
+
 export interface CodexAdapterDeps {
   authPath?: string;
   readAuth?: (path: string) => Promise<string>;
+  /** Supplying this opt-in seam enables the authenticated provider usage probe. */
+  probeUsage?: ProbeUsage;
+  store?: CodexStore;
+  getStore?: () => CodexStore;
+  now?: () => number;
+}
+
+function readingsFrom(result: CodexUsageProbeResult, fetchedAt: number): Record<string, BucketReading> {
+  if (result.source !== 'wham' && result.source !== 'codex-api') return {};
+  return Object.fromEntries((result.windows ?? []).map((window) => [window.bucket, {
+    usedPct: window.usedPct,
+    ...(window.resetAt === undefined ? {} : { resetAt: window.resetAt }),
+    ...(window.windowMin === undefined ? {} : { windowMin: window.windowMin }),
+    fetchedAt,
+    source: 'poll' as const,
+    confidence: 'authoritative' as const,
+  }]));
 }
 
 export function createCodexAdapter(deps: CodexAdapterDeps = {}): Adapter {
   const authPath = deps.authPath ?? AUTH_PATH;
   const readAuth = deps.readAuth ?? ((path: string) => readFile(path, 'utf8'));
+  const now = deps.now ?? (() => Date.now());
 
   return {
-    id: 'openai-codex',
+    id: PROVIDER,
     displayName: 'Codex (ChatGPT Pro)',
-    probes: false,
+    probes: deps.probeUsage !== undefined,
+    persistsSnapshots: deps.probeUsage !== undefined,
     fetchSnapshots: async () => {
       try {
         const auth = JSON.parse(await readAuth(authPath)) as unknown;
@@ -92,12 +114,26 @@ export function createCodexAdapter(deps: CodexAdapterDeps = {}): Adapter {
           }];
         }
         const label = stringClaim(payload, 'email') ?? accountId;
-        return [{
-          accountId,
-          provider: 'openai-codex',
-          label,
-          buckets: {},
-        }];
+        const store = deps.store ?? deps.getStore?.();
+        if (!deps.probeUsage || !store) {
+          return [{ accountId, provider: PROVIDER, label, buckets: {} }];
+        }
+
+        const attemptedAt = Math.floor(now() / 1_000);
+        store.upsertAccount(accountId, PROVIDER, label);
+        try {
+          const result = await deps.probeUsage({ auth: auth as CodexAuthDocument, authPath });
+          const buckets = readingsFrom(result, now());
+          if (Object.keys(buckets).length === 0) {
+            store.recordUsagePollResult(PROVIDER, accountId, { attemptedAt, status: 'usage-unknown' });
+            return [{ accountId, provider: PROVIDER, label, buckets: {}, error: 'Codex usage probe returned no live provider reading' }];
+          }
+          store.recordUsagePollResult(PROVIDER, accountId, { attemptedAt, status: 'ok', readings: buckets });
+          return [{ accountId, provider: PROVIDER, label, buckets }];
+        } catch {
+          store.recordUsagePollResult(PROVIDER, accountId, { attemptedAt, status: 'usage-unknown' });
+          return [{ accountId, provider: PROVIDER, label, buckets: {}, error: 'Codex usage probe failed' }];
+        }
       } catch {
         return [{
           accountId: 'codex-default',
@@ -111,4 +147,4 @@ export function createCodexAdapter(deps: CodexAdapterDeps = {}): Adapter {
   };
 }
 
-export const codexAdapter = createCodexAdapter();
+export const codexAdapter = createCodexAdapter({ probeUsage: probeCodexUsage, getStore });

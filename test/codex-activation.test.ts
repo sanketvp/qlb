@@ -129,6 +129,61 @@ describe('Codex S29 activation', () => {
     }]);
   });
 
+  it('persists only live provider primary and secondary quota windows', async () => {
+    const store = openStore(':memory:');
+    try {
+      const adapter = createCodexAdapter({
+        readAuth: async () => JSON.stringify(document()),
+        store,
+        now: () => 1_700_000_000_000,
+        probeUsage: async () => ({
+          status: 200,
+          source: 'wham',
+          keys: ['primary', 'secondary'],
+          windows: [
+            { bucket: 'primary', usedPct: 12, resetAt: 1_700_000_300_000, windowMin: 300 },
+            { bucket: 'secondary', usedPct: 34, resetAt: 1_700_100_000_000 },
+          ],
+        }),
+      });
+
+      const [snapshot] = await adapter.fetchSnapshots();
+      assert.deepEqual(snapshot?.buckets, {
+        primary: { usedPct: 12, resetAt: 1_700_000_300_000, windowMin: 300, fetchedAt: 1_700_000_000_000, source: 'poll', confidence: 'authoritative' },
+        secondary: { usedPct: 34, resetAt: 1_700_100_000_000, fetchedAt: 1_700_000_000_000, source: 'poll', confidence: 'authoritative' },
+      });
+      assert.deepEqual(store.getAllSnapshots('fixture-user:fixture-account'), {
+        primary: { usedPct: 12, resetAt: 1_700_000_300_000, fetchedAt: 1_700_000_000_000, source: 'poll', confidence: 'authoritative' },
+        secondary: { usedPct: 34, resetAt: 1_700_100_000_000, fetchedAt: 1_700_000_000_000, source: 'poll', confidence: 'authoritative' },
+      });
+    } finally {
+      store.close();
+    }
+  });
+
+  it('redacts Codex probe failures and retains existing snapshots', async () => {
+    const store = openStore(':memory:');
+    const secret = 'Bearer fixture-secret-token request-body-fixture';
+    try {
+      store.upsertAccount('fixture-user:fixture-account', 'openai-codex', 'fixture');
+      store.upsertSnapshot('fixture-user:fixture-account', 'primary', {
+        usedPct: 55, fetchedAt: 1, source: 'poll', confidence: 'authoritative',
+      });
+      const adapter = createCodexAdapter({
+        readAuth: async () => JSON.stringify(document()),
+        store,
+        probeUsage: async () => { throw new Error(secret); },
+      });
+
+      const [snapshot] = await adapter.fetchSnapshots();
+      assert.equal(snapshot?.error, 'Codex usage probe failed');
+      assert.equal(JSON.stringify(snapshot).includes(secret), false);
+      assert.equal(store.getAllSnapshots('fixture-user:fixture-account').primary?.usedPct, 55);
+    } finally {
+      store.close();
+    }
+  });
+
   it('a login without chatgpt_user_id: adapter error result; import and add write nothing', async () => {
     const home = mkdtempSync(join(tmpdir(), 'qlb-codex-activation-'));
     const store = openStore(join(home, 'qlb.db'));

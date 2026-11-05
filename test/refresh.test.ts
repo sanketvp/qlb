@@ -535,7 +535,15 @@ function runCli(
 }
 
 describe('qlb refresh observation recording', () => {
-  it('refuses provider-scoped refreshes other than Kimi', () => {
+  it('accepts a scoped Codex refresh without probing until --allow-probe is supplied', () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-refresh-codex-provider-'));
+    const result = runCli(['refresh', '--provider', 'openai-codex', '--json'],
+      isolatedEnv(root, join(root, 'qlb.db'), join(root, 'plugins')));
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout), { probed: false, results: [] });
+  });
+
+  it('refuses provider-scoped refreshes other than Kimi or Codex', () => {
     const root = mkdtempSync(join(tmpdir(), 'qlb-refresh-provider-'));
     const result = runCli(['refresh', '--provider', 'xai', '--allow-probe', '--json'],
       isolatedEnv(root, join(root, 'qlb.db'), join(root, 'plugins')));

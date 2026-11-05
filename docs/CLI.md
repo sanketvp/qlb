@@ -160,9 +160,9 @@ Flags: `[--json]`.
 
 ## `qlb refresh`
 
-Poll every enabled adapter for a fresh gauge reading. Without `--allow-probe` this is a no-network no-op (exit 0). Pass `--allow-probe` to invoke each adapter's `fetchSnapshots()` — network reads go through the existing single-flight cache. Use `--provider kimi-coding` to explicitly probe only Kimi; this is the only supported provider-scoped refresh and still requires `--allow-probe` before it makes a request.
+Poll every enabled adapter for a fresh gauge reading. Without `--allow-probe` this is a no-network no-op (exit 0). Pass `--allow-probe` to invoke each adapter's `fetchSnapshots()` — network reads go through the existing single-flight cache. Use `--provider kimi-coding` or `--provider openai-codex` to explicitly probe only that provider; scoped refresh still requires `--allow-probe` before it makes a request.
 
-`--allow-probe` makes **real provider requests** with your stored credentials. For xAI that is a 1-token completion that consumes quota. Codex has no probe (`probes: false`): it only reads the local auth file and is reported as `no-probe` (readings come from the proxy's header parsing). Invalid/missing Codex credentials are `error`, not `no-probe`.
+`--allow-probe` makes **real provider requests** with your stored credentials. For xAI that is a 1-token completion that consumes quota. Codex's explicit scoped refresh calls its supported usage endpoint and persists only provider-reported `primary` and `secondary` quota windows; it never logs request headers, tokens, or response bodies. Invalid/missing Codex credentials and unavailable usage readings are `error`.
 
 A fetch that fails inside the single-flight TTL keeps cached buckets and is classified **failed** (`probe.outcome = cached-after-failure`). Mixed ok + failed accounts on one provider are `partial` (`ok: false`).
 
