@@ -181,11 +181,11 @@ describe('auto once failover (G11)', () => {
     let ticks = 0;
     try {
       autoAnthropic.pollAnthropic = async (deps) => {
-        pollModels.push(deps.models);
+        pollModels.push(deps.models ?? []);
         return [];
       };
       autoAnthropic.anthropicTick = async (deps) => {
-        tickModels.push(deps.models);
+        tickModels.push(deps.models ?? []);
         ticks += 1;
         if (ticks === 1) {
           const set = await autoCli(fixture.home, ['scope', 'anthropic', 'opus', '--json']);

@@ -140,7 +140,7 @@ anthropic automatic model scope: all (updated)
 ```
 
 Setting the current scope is idempotent.
-Changing the scope clears only a parked automatic-switch marker calculated from the old candidate set, so the next normally admitted tick can evaluate the new scope without being held by stale parking.
+Changing the scope clears only a parked automatic-switch marker calculated from the old candidate set, so the next normally admitted tick can evaluate the new scope without being held by stale parking. Active auto loops read the setting on every tick, so no agent restart is needed.
 It does not clear a breaker hold or start a tick.
 `all` restores the default scope.
 A model name must contain only letters, digits, dots, underscores, or hyphens and must start with a letter or digit.
