@@ -1,11 +1,9 @@
 import { DatabaseSync } from 'node:sqlite';
 
-import { drillRowsPresent, extendWindow, phase, type LifecycleRow } from '../lifecycle';
+import { drillRowsPresent, extendWindow, phase, PI_PROVIDERS, type LifecycleRow } from '../lifecycle';
 import { redactSecrets } from '../redact';
 import { openStore } from '../store';
 import type { CommandContext, CommandDefinition } from '../registry';
-
-const PI_PROVIDERS = ['anthropic', 'openai-codex', 'xai', 'kimi-coding', 'openrouter'] as const;
 
 export type CutoverReportStatus = 'PASS' | 'FAIL' | 'EXTEND' | 'DEFERRED';
 export interface CutoverReportRow {
@@ -141,7 +139,7 @@ async function execute(args: string[], ctx: CommandContext, deps: ReportCutoverC
     const redacted = JSON.parse(redactSecrets(JSON.stringify(report), ctx.knownSecrets())) as CutoverReport;
     if (json) ctx.stdout(JSON.stringify(redacted));
     else for (const line of formatText(redacted)) ctx.stdout(line);
-    return redacted.rows.some((value) => value.status === 'FAIL') ? 1 : 0;
+    return redacted.ok ? 0 : 1;
   } finally { store.close(); }
 }
 

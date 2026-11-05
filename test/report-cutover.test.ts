@@ -32,7 +32,7 @@ function seed(subject: ReturnType<typeof fixture>, options: { piDeferred?: boole
   const db = new DatabaseSync(subject.dbPath);
   try {
     const cutoverAt = NOW - 15 * DAY;
-    const windowEnd = NOW - DAY;
+    const windowEnd = cutoverAt + 7 * DAY;
     db.prepare(`INSERT INTO lifecycle (state, began_at, cutover_at, window_end, drill_began_at) VALUES ('cutover', ?, ?, ?, ?)`)
       .run(cutoverAt, cutoverAt, windowEnd, cutoverAt);
     db.prepare(`INSERT INTO health_log (ts, phase, overall, failing_json, dead_slots_json) VALUES (?, 'cutover', ?, '[]', ?)`)
@@ -94,7 +94,7 @@ test('nine rows extend once, and a later miss fails extended-once', async () => 
   const subject = fixture();
   try {
     seed(subject, { switches: 9, drill: true, piDeferred: true });
-    assert.equal(await run(subject), 0);
+    assert.equal(await run(subject), 1);
     let report = JSON.parse(subject.output[0]!);
     assert.equal(report.rows.find((value: { name: string }) => value.name === 'anthropic:automatic-switches').status, 'EXTEND');
     assert.equal(report.lifecycle.windowEnd, NOW - 15 * DAY + 14 * DAY);
@@ -166,7 +166,7 @@ test('correctness failures prevent consuming the one permitted coverage extensio
     const report = JSON.parse(subject.output[0]!);
     assert.equal(report.rows.find((value: { name: string }) => value.name === 'anthropic:automatic-switches').status, 'FAIL');
     assert.equal(report.rows.find((value: { name: string }) => value.name === 'anthropic:automatic-switches').code, 'insufficient-anthropic-coverage');
-    assert.equal(report.lifecycle.windowEnd, NOW - DAY);
+    assert.equal(report.lifecycle.windowEnd, NOW - 8 * DAY);
     assert.equal(report.lifecycle.extendedAt, null);
   } finally { subject.close(); }
 });
