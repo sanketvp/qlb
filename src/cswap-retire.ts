@@ -6,6 +6,7 @@ import { dirname, join } from 'node:path';
 
 import { atomicWriteText, fsyncDirSync } from './fsutil';
 import { codexL13ReceiptAt, safeNonNegativeInt } from './codex-l13-receipt';
+import { hasRecentPiService, receiptHealthHistory } from './receipt-gates';
 import { isSuccessor } from './lineage-log';
 import type { CswapAgentResult } from './cswap-agent';
 import {
@@ -20,7 +21,6 @@ import {
 import { openStoreConnection, type Store } from './store';
 
 const RECEIPT_MAX_AGE_MS = 10 * 60 * 1000;
-const DAY_MS = 24 * 60 * 60 * 1000;
 const PI_PROVIDERS = ['anthropic', 'openai-codex', 'xai', 'kimi-coding', 'openrouter'] as const;
 const PHASES = ['started', 'drain-cswap', 'archive', 'delete-cswap-items', 'uninstall-cswap', 'remove-launch-artifacts', 'delete-pi-baselines', 'archive-stash', 'committed'] as const;
 type RetirePhase = (typeof PHASES)[number];
@@ -216,11 +216,9 @@ function passesReceiptHealth(store: Store, now: number): string | null {
   try {
     const receipt = db.prepare('SELECT id, overall FROM health_log WHERE id = ?').get(receiptId) as { id: number; overall: string } | undefined;
     if (receipt?.overall !== 'PASS') return 'report-receipt-health-log-invalid';
-    const since = now - DAY_MS;
-    const lastPass = db.prepare("SELECT id FROM health_log WHERE overall = 'PASS' AND ts >= ? ORDER BY id DESC LIMIT 1").get(since) as { id: number } | undefined;
-    if (!lastPass) return 'health-log-pass-missing';
-    const failed = db.prepare("SELECT 1 FROM health_log WHERE overall = 'FAIL' AND ts >= ? AND id > ? LIMIT 1").get(since, lastPass.id);
-    return failed ? 'health-log-fail-after-pass' : null;
+    const history = receiptHealthHistory(db, now);
+    if (!history.hasPass) return 'health-log-pass-missing';
+    return history.passes ? null : 'health-log-fail-after-pass';
   } finally {
     db.close();
   }
@@ -235,8 +233,7 @@ function passesS64(
   if (doctor.autoAgent !== 'PASS') return 'doctor-auto-agent-not-pass';
   for (const provider of PI_PROVIDERS) {
     if (store.getConfig(`pi.${provider}.state`) !== 'migrated') continue;
-    const servedAt = safeNonNegativeInt(store.getConfig(`pi.${provider}.lastServedAt`));
-    if (servedAt == null || servedAt > now || now - servedAt > DAY_MS) return `pi-last-served-stale:${provider}`;
+    if (!hasRecentPiService(store.getConfig(`pi.${provider}.lastServedAt`), now)) return `pi-last-served-stale:${provider}`;
   }
   return passesReceiptHealth(store, now);
 }
@@ -265,6 +262,7 @@ export async function evaluateRetirementGates(
 
   const receiptAt = safeNonNegativeInt(store.getConfig('report.receiptAt'));
   if (receiptAt == null) return refusal('report-receipt-missing');
+  if (store.getConfig('report.receiptDeferred') === '1') return refusal('report-receipt-deferred');
   if (!dependencies.reportReceiptPasses()) return refusal('report-not-pass');
   const doctor = await dependencies.doctor();
 

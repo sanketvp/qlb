@@ -1,10 +1,12 @@
 import { DatabaseSync } from 'node:sqlite';
 
 import { codexL13ReceiptAt } from '../codex-l13-receipt';
+import { doctorQlb, type DoctorReport } from '../diagnostics';
 import { configValue, drillRowsPresent, extendWindow, phase, PI_PROVIDERS, type LifecycleRow } from '../lifecycle';
 import { redactSecrets } from '../redact';
+import { hasRecentPiService, receiptHealthHistory } from '../receipt-gates';
 import { reloginsInWindow } from '../relogin';
-import { openStore } from '../store';
+import { openStore, type Store } from '../store';
 import type { CommandContext, CommandDefinition } from '../registry';
 
 export type CutoverReportStatus = 'PASS' | 'FAIL' | 'EXTEND' | 'DEFERRED';
@@ -21,10 +23,17 @@ export interface CutoverReport {
   rows: CutoverReportRow[];
 }
 
-export interface ReportCutoverCommandDeps { now?: () => number; }
+export interface ReportCutoverCommandDeps {
+  now?: () => number;
+  doctor?: (config: CommandContext['config'], options: Parameters<typeof doctorQlb>[1]) => Promise<DoctorReport>;
+}
 
 function row(group: CutoverReportRow['group'], name: string, status: CutoverReportStatus, message: string, code?: string): CutoverReportRow {
   return { group, name, status, ...(code ? { code } : {}), message };
+}
+
+function reportPasses(rows: CutoverReportRow[]): boolean {
+  return rows.every((value) => value.status === 'PASS' || value.status === 'DEFERRED');
 }
 
 function reportRows(db: DatabaseSync, lifecycle: LifecycleRow, now: number): CutoverReportRow[] {
@@ -69,11 +78,11 @@ function reportRows(db: DatabaseSync, lifecycle: LifecycleRow, now: number): Cut
   else if (lifecycle.extendedAt == null) rows.push(row('coverage', 'anthropic:automatic-switches', 'FAIL', `${automatic.count}/10 non-injected automatic Anthropic switches; correctness checks must pass before extending the cutover window`, 'insufficient-anthropic-coverage'));
   else rows.push(row('coverage', 'anthropic:automatic-switches', 'FAIL', `${automatic.count}/10 non-injected automatic Anthropic switches after the one extension`, 'extended-once'));
 
+  const piDeferred = configValue(db, 'cutover.piDeferredAt') === String(lifecycle.cutoverAt);
   const codexVerified = codexL13ReceiptAt(configValue(db, 'codex.l13VerifiedAt')) != null;
   const codexSwitches = db.prepare(`SELECT count(*) AS count FROM switch_log WHERE provider = 'openai-codex' AND outcome = 'ok'
-    AND injected = 0 AND from_account IS NOT NULL AND from_account <> to_account AND ts >= ? AND ts <= ?`).get(...inWindow) as { count: number };
+    AND injected = 0 AND from_account IS NOT NULL AND from_account <> to_account AND ts >= ? AND ts <= ?`).get(start, piDeferred ? now : end) as { count: number };
   const codexPass = codexVerified && codexSwitches.count >= 1;
-  const piDeferred = configValue(db, 'cutover.piDeferredAt') === String(lifecycle.cutoverAt);
   rows.push(codexPass
     ? row('coverage', 'codex:L13-switch', 'PASS', 'L13 verification and a non-injected Codex switch are recorded')
     : piDeferred
@@ -103,13 +112,45 @@ function reportRows(db: DatabaseSync, lifecycle: LifecycleRow, now: number): Cut
   return rows;
 }
 
-export function buildCutoverReport(db: DatabaseSync, lifecycle: LifecycleRow, now: number): CutoverReport {
-  const rows = reportRows(db, lifecycle, now);
+export function buildCutoverReport(db: DatabaseSync, lifecycle: LifecycleRow, now: number, receiptRows: CutoverReportRow[]): CutoverReport {
+  const rows = [...reportRows(db, lifecycle, now), ...receiptRows];
   return {
-    ok: rows.every((value) => value.status === 'PASS' || value.status === 'DEFERRED'),
+    ok: reportPasses(rows),
     lifecycle: { id: lifecycle.id, state: lifecycle.state, cutoverAt: lifecycle.cutoverAt!, windowEnd: lifecycle.windowEnd!, extendedAt: lifecycle.extendedAt },
     rows,
   };
+}
+
+function appendReceiptRows(rows: CutoverReportRow[], db: DatabaseSync, now: number, doctor: DoctorReport, historyPasses: boolean, piLastServedAt: Map<string, string | null>): void {
+  rows.push(historyPasses
+    ? row('coverage', 'health:final-24h', 'PASS', 'no health-log FAIL follows the last PASS in the final 24 hours')
+    : row('coverage', 'health:final-24h', 'FAIL', 'a health-log FAIL follows the last PASS in the final 24 hours', 'health-history-failed'));
+  rows.push(doctor.s64.overall === 'PASS'
+    ? row('coverage', 'doctor:S64', 'PASS', 'doctor S64 verdict passed')
+    : row('coverage', 'doctor:S64', 'FAIL', 'doctor S64 verdict failed', 'doctor-s64-failed'));
+  rows.push(doctor.s64.autoAgent === 'PASS'
+    ? row('coverage', 'doctor:auto-agent', 'PASS', 'doctor automatic-agent verdict passed')
+    : row('coverage', 'doctor:auto-agent', 'FAIL', 'doctor automatic-agent verdict failed', 'doctor-auto-agent-failed'));
+  if (doctor.healthLogId == null) rows.push(row('coverage', 'doctor:health-log', 'FAIL', doctor.healthLogError ?? 'doctor health log was not appended', 'doctor-health-log-missing'));
+  for (const provider of PI_PROVIDERS) {
+    if (configValue(db, `pi.${provider}.state`) !== 'migrated') continue;
+    const recent = hasRecentPiService(piLastServedAt.get(provider) ?? null, now);
+    rows.push(recent
+      ? row('coverage', `pi:${provider}:recent-service`, 'PASS', `Pi ${provider} served within the final 24 hours`)
+      : row('coverage', `pi:${provider}:recent-service`, 'FAIL', `Pi ${provider} has no service record in the final 24 hours`, 'no-recent-pi-service'));
+  }
+}
+
+function receiptIsDeferred(report: CutoverReport): boolean {
+  return report.rows.some((value) => value.status === 'DEFERRED');
+}
+
+function writeOrClearReceipt(store: Store, now: number, healthLogId: number | undefined, ok: boolean, deferred: boolean): void {
+  store.runImmediate(() => {
+    store.setConfig('report.receiptAt', ok ? String(now) : '');
+    store.setConfig('report.receiptHealthLogId', ok ? String(healthLogId) : '');
+    store.setConfig('report.receiptDeferred', ok && deferred ? '1' : '');
+  });
 }
 
 function parse(args: string[]): boolean | null {
@@ -136,16 +177,26 @@ async function execute(args: string[], ctx: CommandContext, deps: ReportCutoverC
     const now = (deps.now ?? Date.now)();
     if (now < lifecycle.windowEnd) { ctx.stderr(`report cutover refused: window-not-ended; windowEnd=${new Date(lifecycle.windowEnd).toISOString()}`); return 3; }
     const db = (store as unknown as { db: DatabaseSync }).db;
-    const report = buildCutoverReport(db, lifecycle, now);
+    const historyPasses = receiptHealthHistory(db, now).passes;
+    const piLastServedAt = new Map(PI_PROVIDERS.map((provider) => [provider, configValue(db, `pi.${provider}.lastServedAt`)]));
+    const doctor = await (deps.doctor ?? doctorQlb)(ctx.config, { appendHealthLog: true, now: () => now });
+    const receiptRows: CutoverReportRow[] = [];
+    appendReceiptRows(receiptRows, db, now, doctor, historyPasses, piLastServedAt);
+    const report = buildCutoverReport(db, lifecycle, now, receiptRows);
     if (report.rows.some((value) => value.status === 'EXTEND')) {
       const extended = extendWindow(store, now);
       if (!extended.ok) { ctx.stderr(`report cutover refused: ${extended.code}`); return 3; }
       report.lifecycle.windowEnd = extended.row!.windowEnd!;
       report.lifecycle.extendedAt = extended.row!.extendedAt;
     }
+    writeOrClearReceipt(store, now, doctor.healthLogId, report.ok, receiptIsDeferred(report));
     const redacted = JSON.parse(redactSecrets(JSON.stringify(report), ctx.knownSecrets())) as CutoverReport;
     if (json) ctx.stdout(JSON.stringify(redacted));
     else for (const line of formatText(redacted)) ctx.stdout(line);
+    if (!redacted.ok) {
+      const failure = redacted.rows.find((value) => value.status === 'FAIL' || value.status === 'EXTEND')!;
+      ctx.stderr(`no receipt (${failure.name})`);
+    }
     return redacted.ok ? 0 : 1;
   } finally { store.close(); }
 }

@@ -96,9 +96,9 @@ For QLB-owned accounts, doctor also runs the `native-sync` credential-drift chec
 
 ## `qlb report cutover`
 
-Reports the completed Stage-1 cutover window. It lists correctness, coverage, fire-drill, and injected-switch evidence; Pi and Codex rows marked `DEFERRED` are deliberate Stage-1 deferrals and do not prevent an otherwise complete report.
+Reports the completed Stage-1 cutover window. It lists correctness, coverage, fire-drill, injected-switch, final-24-hour health-history, doctor S64/automatic-agent, and migrated-Pi recent-service evidence; Pi and Codex rows marked `DEFERRED` are deliberate Stage-1 deferrals and do not prevent an otherwise complete Stage-1 report.
 
-This command is normally read-only, except for its one-time S55 coverage extension: when fewer than ten qualifying Anthropic automatic switches are recorded and every correctness row passes, the first report after the initial seven-day window extends `window_end` to `cutover_at + 14 days`. The report prints `EXTEND`; collect the remaining coverage and run it again after the extended window ends.
+When doctor runs, the command appends its health-log row and atomically writes or clears the Stage-1 receipt (`report.receiptAt`, `report.receiptHealthLogId`, and its deferred marker). A failed health-log append adds a failing report row and emits `no receipt (...)` on stderr. A receipt with deliberate deferrals completes Stage 1 but cannot authorize C-swap retirement; retirement requires a later all-PASS receipt. For that deferred lifecycle only, a real Codex switch recorded after `window_end` can satisfy the deferred Codex coverage on the later report. The command may also perform its one-time S55 coverage extension: when fewer than ten qualifying Anthropic automatic switches are recorded and every correctness row passes, the first report after the initial seven-day window extends `window_end` to `cutover_at + 14 days`. The report prints `EXTEND`; collect the remaining coverage and run it again after the extended window ends.
 
 Exit `0` only when every row is `PASS` or `DEFERRED`; exit `1` for `FAIL` or `EXTEND`; exit `3` when the report is refused (for example, before `window_end` or after a rollback). Flags: `[--json]`.
 

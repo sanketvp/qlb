@@ -6,9 +6,12 @@ import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 
 import { defaultConfig } from '../src/config';
-import { createReportCutoverCommand } from '../src/commands/report-cutover';
+import { createReportCutoverCommand, type ReportCutoverCommandDeps } from '../src/commands/report-cutover';
 import { runExecutingCommand } from '../src/app';
+import { evaluateRetirementGates, type CswapRetireDependencies } from '../src/cswap-retire';
+import { doctorQlb } from '../src/diagnostics';
 import type { CommandContext } from '../src/registry';
+import { MockKeychain } from '../src/keychain';
 import { openStore } from '../src/store';
 
 const DAY = 24 * 60 * 60 * 1000;
@@ -53,18 +56,69 @@ function seed(subject: ReturnType<typeof fixture>, options: { piDeferred?: boole
   } finally { db.close(); }
 }
 
-function run(subject: ReturnType<typeof fixture>): Promise<number | null> {
-  return runExecutingCommand({ command: createReportCutoverCommand({ now: () => NOW }), args: ['--json'] }, subject.context);
+function passingDoctor(dbPath: string, options: { overall?: 'PASS' | 'FAIL'; autoAgent?: 'PASS' | 'FAIL' } = {}): ReportCutoverCommandDeps['doctor'] {
+  return async () => {
+    const db = new DatabaseSync(dbPath);
+    try {
+      const result = db.prepare(`INSERT INTO health_log (ts, phase, overall, failing_json, dead_slots_json)
+        VALUES (?, 'cutover', ?, '[]', '[]')`).run(NOW, options.overall ?? 'PASS');
+      return {
+        command: 'doctor', overall: options.overall ?? 'PASS', checks: [], providers: [],
+        s64: { overall: options.overall ?? 'PASS', autoAgent: options.autoAgent ?? 'PASS' },
+        healthLogId: Number(result.lastInsertRowid),
+      };
+    } finally { db.close(); }
+  };
+}
+
+function run(subject: ReturnType<typeof fixture>, deps: ReportCutoverCommandDeps = {}): Promise<number | null> {
+  return runExecutingCommand({ command: createReportCutoverCommand({ now: () => NOW, doctor: passingDoctor(subject.dbPath), ...deps }), args: ['--json'] }, subject.context);
 }
 
 function runText(subject: ReturnType<typeof fixture>): Promise<number | null> {
-  return runExecutingCommand({ command: createReportCutoverCommand({ now: () => NOW }), args: [] }, subject.context);
+  return runExecutingCommand({ command: createReportCutoverCommand({ now: () => NOW, doctor: passingDoctor(subject.dbPath) }), args: [] }, subject.context);
 }
 
-function setPiMigrated(db: DatabaseSync): void {
+async function runProduction(subject: ReturnType<typeof fixture>, doctorOptions: Omit<Parameters<typeof doctorQlb>[1], 'appendHealthLog' | 'now'>): Promise<number | null> {
+  const priorTestMode = process.env.QLB_TEST_MODE;
+  const priorHome = process.env.QLB_HOME;
+  process.env.QLB_TEST_MODE = '1';
+  process.env.QLB_HOME = subject.root;
+  try {
+    return await runExecutingCommand({ command: createReportCutoverCommand({
+      now: () => NOW,
+      doctor: (config, options) => doctorQlb(config, { ...options, ...doctorOptions }),
+    }), args: ['--json'] }, subject.context);
+  } finally {
+    if (priorTestMode === undefined) delete process.env.QLB_TEST_MODE;
+    else process.env.QLB_TEST_MODE = priorTestMode;
+    if (priorHome === undefined) delete process.env.QLB_HOME;
+    else process.env.QLB_HOME = priorHome;
+  }
+}
+
+async function retirementGates(subject: ReturnType<typeof fixture>) {
+  const store = openStore(subject.dbPath);
+  try {
+    store.recordLineage({ provider: 'anthropic', accountId: 'slot-a', fromFp: 'source-a', toFp: 'current-a', cause: 'post', by: 'qlb' });
+    const deps: CswapRetireDependencies = {
+      now: () => NOW, stateDir: subject.root, backupsDir: join(subject.root, 'backups'), journalDir: join(subject.root, 'journal'),
+      doctor: async () => ({ overall: 'PASS', autoAgent: 'PASS' }), reportReceiptPasses: () => true, drillRowsPresent: () => true,
+      hasUnadoptedStash: () => false, claudeSlotsPass: () => true,
+      slots: () => [{ accountId: 'slot-a', source: 'cswap-import', sourceFingerprint: 'source-a', currentFingerprint: 'current-a' }],
+      cswapItems: () => [{ id: 'cswap-a', fingerprint: 'source-a' }], readSlotFingerprint: async () => 'current-a',
+      effects: { drainCswap: () => ({ ok: true }), archiveCswap: () => {}, deleteCswapItems: () => {}, uninstallCswap: () => {}, removeCswapLaunchArtifacts: () => {}, deletePiBaselines: () => {}, archiveExpiredStash: () => {} },
+    };
+    return await evaluateRetirementGates(store, deps);
+  } finally { store.close(); }
+}
+
+function setPiMigrated(db: DatabaseSync, lastServedAt?: number): void {
   for (const provider of ['anthropic', 'openai-codex', 'xai', 'kimi-coding', 'openrouter']) {
     db.prepare(`INSERT INTO config (key, value) VALUES (?, 'migrated')
       ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(`pi.${provider}.state`);
+    if (lastServedAt != null) db.prepare(`INSERT INTO config (key, value) VALUES (?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(`pi.${provider}.lastServedAt`, String(lastServedAt));
   }
 }
 
@@ -129,6 +183,9 @@ test('nine rows extend once, and a later miss fails extended-once', async () => 
     assert.equal(await run(subject), 1);
     report = JSON.parse(subject.output[0]!);
     assert.equal(report.rows.find((value: { name: string }) => value.name === 'anthropic:automatic-switches').code, 'extended-once');
+    const after = new DatabaseSync(subject.dbPath, { readOnly: true });
+    assert.equal((after.prepare("SELECT value FROM config WHERE key = 'report.receiptAt'").get() as { value: string }).value, '');
+    after.close();
   } finally { subject.close(); }
 });
 
@@ -174,8 +231,9 @@ test('strict Pi and Codex coverage passes only with a valid L13 receipt and real
   try {
     seed(subject, { drill: true });
     const db = new DatabaseSync(subject.dbPath);
-    setPiMigrated(db);
+    setPiMigrated(db, NOW);
     db.prepare("INSERT INTO config (key, value) VALUES ('codex.l13VerifiedAt', ?)").run(String(NOW));
+    db.prepare("INSERT INTO config (key, value) VALUES ('report.receiptDeferred', '1')").run();
     db.prepare(`INSERT INTO switch_log (ts, provider, from_account, to_account, trigger, outcome, injected)
       VALUES (?, 'openai-codex', 'from', 'to', 'proactive', 'ok', 0)`).run(NOW - 9 * DAY);
     db.close();
@@ -183,6 +241,239 @@ test('strict Pi and Codex coverage passes only with a valid L13 receipt and real
     const report = JSON.parse(subject.output[0]!);
     assert.equal(report.rows.find((value: { name: string }) => value.name === 'codex:L13-switch').status, 'PASS');
     assert.equal(report.rows.filter((value: { name: string }) => value.name.startsWith('pi:')).every((value: { status: string }) => value.status === 'PASS'), true);
+    const after = new DatabaseSync(subject.dbPath, { readOnly: true });
+    assert.equal((after.prepare("SELECT value FROM config WHERE key = 'report.receiptDeferred'").get() as { value: string }).value, '');
+    after.close();
+  } finally { subject.close(); }
+});
+
+test('a receipt is created for lifecycle-bound deferred Pi/Codex coverage when doctor passes', async () => {
+  const subject = fixture();
+  try {
+    seed(subject, { piDeferred: true, drill: true });
+    assert.equal(await run(subject, { doctor: passingDoctor(subject.dbPath) }), 0);
+    const db = new DatabaseSync(subject.dbPath, { readOnly: true });
+    const receiptAt = db.prepare("SELECT value FROM config WHERE key = 'report.receiptAt'").get() as { value: string };
+    const receiptId = db.prepare("SELECT value FROM config WHERE key = 'report.receiptHealthLogId'").get() as { value: string };
+    const deferred = db.prepare("SELECT value FROM config WHERE key = 'report.receiptDeferred'").get() as { value: string };
+    const health = db.prepare('SELECT overall FROM health_log WHERE id = ?').get(Number(receiptId.value)) as { overall: string };
+    db.close();
+    assert.equal(receiptAt.value, String(NOW));
+    assert.equal(health.overall, 'PASS');
+    assert.equal(deferred.value, '1');
+    assert.deepEqual(await retirementGates(subject), { ok: false, code: 'report-receipt-deferred' });
+  } finally { subject.close(); }
+});
+
+test('a deferred receipt becomes an all-PASS receipt after real post-window evidence', async () => {
+  const subject = fixture();
+  try {
+    seed(subject, { piDeferred: true, drill: true });
+    assert.equal(await run(subject), 0);
+    subject.output.length = 0;
+    const db = new DatabaseSync(subject.dbPath);
+    setPiMigrated(db, NOW);
+    db.prepare('UPDATE lifecycle SET drill_done_at = ?').run(NOW);
+    db.prepare("INSERT INTO config (key, value) VALUES ('codex.l13VerifiedAt', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(String(NOW));
+    db.prepare(`INSERT INTO switch_log (ts, provider, from_account, to_account, trigger, outcome, injected)
+      VALUES (?, 'openai-codex', 'from', 'to', 'proactive', 'ok', 0)`).run(NOW);
+    db.close();
+    assert.equal(await run(subject), 0);
+    const report = JSON.parse(subject.output[0]!);
+    assert.equal(report.rows.every((value: { status: string }) => value.status === 'PASS'), true);
+    const after = new DatabaseSync(subject.dbPath, { readOnly: true });
+    assert.equal((after.prepare("SELECT value FROM config WHERE key = 'report.receiptDeferred'").get() as { value: string }).value, '');
+    after.close();
+    assert.equal((await retirementGates(subject)).ok, true);
+  } finally { subject.close(); }
+});
+
+test('the production doctor call writes a receipt for advisory window and parked rows', async () => {
+  const subject = fixture();
+  try {
+    seed(subject, { piDeferred: true, drill: true });
+    const db = new DatabaseSync(subject.dbPath);
+    db.prepare("INSERT INTO config (key, value) VALUES ('auto.heartbeatAt', ?)").run(String(NOW));
+    db.prepare("INSERT INTO config (key, value) VALUES ('auto.anthropic.parkedUntil', ?)").run(String(NOW + 60_000));
+    db.close();
+    assert.equal(await runProduction(subject, {
+      command: () => '', hostCommand: () => '', hostPlatform: 'linux', piProcessList: () => '',
+      cswapAgentStatus: () => 'not-loaded', cswapProcesses: () => [], keychain: new MockKeychain(),
+    }), 0);
+    const report = JSON.parse(subject.output[0]!);
+    assert.equal(report.rows.find((value: { name: string }) => value.name === 'doctor:S64').status, 'PASS');
+    const after = new DatabaseSync(subject.dbPath, { readOnly: true });
+    assert.notEqual((after.prepare("SELECT value FROM config WHERE key = 'report.receiptHealthLogId'").get() as { value: string }).value, '');
+    after.close();
+  } finally { subject.close(); }
+});
+
+test('a production keychain-helper warning prevents a receipt', async () => {
+  const subject = fixture();
+  try {
+    seed(subject, { piDeferred: true, drill: true });
+    const db = new DatabaseSync(subject.dbPath);
+    db.prepare("INSERT INTO config (key, value) VALUES ('auto.heartbeatAt', ?)").run(String(NOW));
+    db.close();
+    assert.equal(await runProduction(subject, {
+      command: () => '', hostCommand: () => '', hostPlatform: 'darwin', piProcessList: () => '',
+      cswapAgentStatus: () => 'not-loaded', cswapProcesses: () => [], keychain: new MockKeychain(),
+      configReader: (key: string) => key === 'keychain.liveItemsReadAuthorizedAt'
+        ? String(NOW)
+        : key === 'keychain.liveItemsReadAuthorizedIdentityHash' ? 'fixture' : null,
+      helperSigning: () => ({ authority: 'QLB Keychain Helper', binaryHash: 'fixture', identityHash: 'fixture' }),
+    }), 1);
+    const report = JSON.parse(subject.output[0]!);
+    assert.equal(report.rows.find((value: { name: string }) => value.name === 'doctor:S64').code, 'doctor-s64-failed');
+    const after = new DatabaseSync(subject.dbPath, { readOnly: true });
+    assert.equal((after.prepare("SELECT value FROM config WHERE key = 'report.receiptAt'").get() as { value: string }).value, '');
+    after.close();
+  } finally { subject.close(); }
+});
+
+test('a production stale automatic-agent verdict prevents a receipt', async () => {
+  const subject = fixture();
+  try {
+    seed(subject, { piDeferred: true, drill: true });
+    const db = new DatabaseSync(subject.dbPath);
+    db.prepare("INSERT INTO config (key, value) VALUES ('auto.heartbeatAt', ?)").run(String(NOW - 5 * 60 * 1000 - 1));
+    db.close();
+    assert.equal(await runProduction(subject, {
+      command: () => '', hostCommand: () => '', hostPlatform: 'linux', piProcessList: () => '',
+      cswapAgentStatus: () => 'not-loaded', cswapProcesses: () => [], keychain: new MockKeychain(),
+    }), 1);
+    const report = JSON.parse(subject.output[0]!);
+    assert.equal(report.rows.find((value: { name: string }) => value.name === 'doctor:auto-agent').code, 'doctor-auto-agent-failed');
+    const after = new DatabaseSync(subject.dbPath, { readOnly: true });
+    assert.equal((after.prepare("SELECT value FROM config WHERE key = 'report.receiptAt'").get() as { value: string }).value, '');
+    after.close();
+  } finally { subject.close(); }
+});
+
+test('strict missing Pi or Codex evidence remains receipt-ineligible without the lifecycle deferred marker', async () => {
+  const subject = fixture();
+  try {
+    seed(subject, { drill: true });
+    assert.equal(await run(subject, { doctor: passingDoctor(subject.dbPath) }), 1);
+    const db = new DatabaseSync(subject.dbPath, { readOnly: true });
+    assert.equal((db.prepare("SELECT value FROM config WHERE key = 'report.receiptAt'").get() as { value: string }).value, '');
+    db.close();
+  } finally { subject.close(); }
+});
+
+test('a missing doctor health-log receipt fails the report and clears the receipt', async () => {
+  const subject = fixture();
+  try {
+    seed(subject, { piDeferred: true, drill: true });
+    const doctor: ReportCutoverCommandDeps['doctor'] = async () => ({
+      command: 'doctor', overall: 'PASS', checks: [], providers: [],
+      s64: { overall: 'PASS', autoAgent: 'PASS' }, healthLogError: 'fixture append failed',
+    });
+    assert.equal(await run(subject, { doctor }), 1);
+    const report = JSON.parse(subject.output[0]!);
+    const healthLog = report.rows.find((value: { name: string }) => value.name === 'doctor:health-log');
+    assert.equal(healthLog.code, 'doctor-health-log-missing');
+    assert.equal(healthLog.message, 'fixture append failed');
+    const after = new DatabaseSync(subject.dbPath, { readOnly: true });
+    assert.equal((after.prepare("SELECT value FROM config WHERE key = 'report.receiptAt'").get() as { value: string }).value, '');
+    assert.equal((after.prepare("SELECT value FROM config WHERE key = 'report.receiptHealthLogId'").get() as { value: string }).value, '');
+    assert.equal((after.prepare("SELECT value FROM config WHERE key = 'report.receiptDeferred'").get() as { value: string }).value, '');
+    after.close();
+  } finally { subject.close(); }
+});
+
+test('a FAIL after the final-24-hour PASS prevents a receipt even when the report doctor passes', async () => {
+  const subject = fixture();
+  try {
+    seed(subject, { piDeferred: true, drill: true });
+    const db = new DatabaseSync(subject.dbPath);
+    db.prepare(`INSERT INTO health_log (ts, phase, overall, failing_json, dead_slots_json) VALUES (?, 'cutover', ?, '[]', '[]')`).run(NOW - 3 * 60 * 60 * 1000, 'PASS');
+    db.prepare(`INSERT INTO health_log (ts, phase, overall, failing_json, dead_slots_json) VALUES (?, 'cutover', ?, '[]', '[]')`).run(NOW - 2 * 60 * 60 * 1000, 'FAIL');
+    db.close();
+    assert.equal(await run(subject, { doctor: passingDoctor(subject.dbPath) }), 1);
+    const report = JSON.parse(subject.output[0]!);
+    assert.equal(report.rows.find((value: { name: string }) => value.name === 'health:final-24h').code, 'health-history-failed');
+    const after = new DatabaseSync(subject.dbPath, { readOnly: true });
+    assert.equal((after.prepare("SELECT value FROM config WHERE key = 'report.receiptAt'").get() as { value: string }).value, '');
+    assert.equal((after.prepare("SELECT value FROM config WHERE key = 'report.receiptHealthLogId'").get() as { value: string }).value, '');
+    after.close();
+  } finally { subject.close(); }
+});
+
+test('a failing doctor clears a prior receipt and a later passing run replaces it', async () => {
+  const subject = fixture();
+  try {
+    seed(subject, { piDeferred: true, drill: true });
+    assert.equal(await run(subject, { doctor: passingDoctor(subject.dbPath) }), 0);
+    let db = new DatabaseSync(subject.dbPath, { readOnly: true });
+    const originalId = (db.prepare("SELECT value FROM config WHERE key = 'report.receiptHealthLogId'").get() as { value: string }).value;
+    db.close();
+    assert.equal(await run(subject, { doctor: passingDoctor(subject.dbPath, { overall: 'FAIL', autoAgent: 'FAIL' }) }), 1);
+    db = new DatabaseSync(subject.dbPath, { readOnly: true });
+    assert.equal((db.prepare("SELECT value FROM config WHERE key = 'report.receiptAt'").get() as { value: string }).value, '');
+    assert.equal((db.prepare("SELECT value FROM config WHERE key = 'report.receiptHealthLogId'").get() as { value: string }).value, '');
+    db.close();
+    assert.equal(await run(subject, { doctor: passingDoctor(subject.dbPath) }), 1);
+    db = new DatabaseSync(subject.dbPath, { readOnly: true });
+    assert.equal((db.prepare("SELECT value FROM config WHERE key = 'report.receiptAt'").get() as { value: string }).value, '');
+    db.close();
+    assert.equal(await run(subject, { doctor: passingDoctor(subject.dbPath) }), 0);
+    db = new DatabaseSync(subject.dbPath, { readOnly: true });
+    assert.equal((db.prepare("SELECT value FROM config WHERE key = 'report.receiptAt'").get() as { value: string }).value, String(NOW));
+    assert.notEqual((db.prepare("SELECT value FROM config WHERE key = 'report.receiptHealthLogId'").get() as { value: string }).value, originalId);
+    db.close();
+  } finally { subject.close(); }
+});
+
+test('a migrated Pi provider requires service in the final 24 hours for a receipt', async () => {
+  const subject = fixture();
+  try {
+    seed(subject, { piDeferred: true, drill: true });
+    const db = new DatabaseSync(subject.dbPath);
+    db.prepare(`INSERT INTO config (key, value) VALUES ('pi.anthropic.state', 'migrated')`).run();
+    db.close();
+    assert.equal(await run(subject, { doctor: passingDoctor(subject.dbPath) }), 1);
+    let report = JSON.parse(subject.output[0]!);
+    assert.equal(report.rows.find((value: { name: string }) => value.name === 'pi:anthropic:recent-service').code, 'no-recent-pi-service');
+    let receipt = new DatabaseSync(subject.dbPath, { readOnly: true });
+    assert.equal((receipt.prepare("SELECT value FROM config WHERE key = 'report.receiptAt'").get() as { value: string }).value, '');
+    assert.equal((receipt.prepare("SELECT value FROM config WHERE key = 'report.receiptHealthLogId'").get() as { value: string }).value, '');
+    receipt.close();
+    subject.output.length = 0;
+    const db2 = new DatabaseSync(subject.dbPath);
+    db2.prepare("INSERT INTO config (key, value) VALUES ('pi.anthropic.lastServedAt', ?)").run(String(NOW));
+    db2.close();
+    assert.equal(await run(subject, { doctor: passingDoctor(subject.dbPath) }), 0);
+    report = JSON.parse(subject.output[0]!);
+    assert.equal(report.rows.find((value: { name: string }) => value.name === 'pi:anthropic:recent-service').status, 'PASS');
+    receipt = new DatabaseSync(subject.dbPath, { readOnly: true });
+    assert.equal((receipt.prepare("SELECT value FROM config WHERE key = 'report.receiptAt'").get() as { value: string }).value, String(NOW));
+    assert.notEqual((receipt.prepare("SELECT value FROM config WHERE key = 'report.receiptHealthLogId'").get() as { value: string }).value, '');
+    receipt.close();
+  } finally { subject.close(); }
+});
+
+test('a Pi service recorded during doctor does not invalidate the receipt snapshot', async () => {
+  const subject = fixture();
+  try {
+    seed(subject, { piDeferred: true, drill: true });
+    const db = new DatabaseSync(subject.dbPath);
+    setPiMigrated(db, NOW - 1);
+    db.close();
+    const baseDoctor = passingDoctor(subject.dbPath)!;
+    const doctor: ReportCutoverCommandDeps['doctor'] = async (config, options) => {
+      const result = await baseDoctor(config, options);
+      const duringDoctor = new DatabaseSync(subject.dbPath);
+      duringDoctor.prepare("UPDATE config SET value = ? WHERE key = 'pi.anthropic.lastServedAt'").run(String(NOW + 1));
+      duringDoctor.close();
+      return result;
+    };
+    assert.equal(await run(subject, { doctor }), 0);
+    const report = JSON.parse(subject.output[0]!);
+    assert.equal(report.rows.find((value: { name: string }) => value.name === 'pi:anthropic:recent-service').status, 'PASS');
+    const receipt = new DatabaseSync(subject.dbPath, { readOnly: true });
+    assert.equal((receipt.prepare("SELECT value FROM config WHERE key = 'report.receiptAt'").get() as { value: string }).value, String(NOW));
+    receipt.close();
   } finally { subject.close(); }
 });
 
@@ -223,7 +514,7 @@ test('text and JSON report output redact token-shaped values', async () => {
     assert.equal(await run(subject), 1);
     assert.doesNotMatch(subject.output.join('\n'), new RegExp(secret));
     subject.output.length = 0;
-    const code = await runExecutingCommand({ command: createReportCutoverCommand({ now: () => NOW }), args: [] }, subject.context);
+    const code = await runText(subject);
     assert.equal(code, 1);
     assert.doesNotMatch(subject.output.join('\n'), new RegExp(secret));
   } finally { subject.close(); }
