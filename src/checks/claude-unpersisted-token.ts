@@ -20,8 +20,8 @@ interface Evidence {
 
 /**
  * Read-only evidence for a Claude refresh successor which could not be persisted.
- * Only a later credential-lineage change or real non-injected switch into the
- * slot clears the evidence; polls, republish rows, and noops are not recoveries.
+ * Only a later credential-lineage change clears the evidence; polls and
+ * switch rows are not recoveries.
  */
 export function claudeUnpersistedTokenCheck(
   dbPath: string,
@@ -42,15 +42,11 @@ export function claudeUnpersistedTokenCheck(
     try {
       const switchEvidence = db.prepare(`SELECT to_account AS accountId, ts AS at
         FROM switch_log
-        WHERE provider = 'anthropic' AND outcome = 'refused' AND detail = ?`).all(SWITCH_REFUSAL_DETAIL);
-      const pollEvidence = db.prepare(`SELECT account_id AS accountId, COALESCE(last_attempt_at, 0) * 1000 AS at
+        WHERE provider = 'anthropic' AND outcome = 'refused' AND detail = ?`).all(SWITCH_REFUSAL_DETAIL) as Evidence[];
+      const pollEvidence = db.prepare(`SELECT account_id AS accountId, last_attempt_at * 1000 AS at
         FROM usage_polls
-        WHERE provider = 'anthropic' AND last_status = ?`).all(USAGE_STATUS);
-      const evidence: Evidence[] = [...switchEvidence, ...pollEvidence].flatMap((row) => {
-        const accountId = typeof row.accountId === 'string' ? row.accountId : null;
-        const at = typeof row.at === 'number' ? row.at : null;
-        return accountId !== null && at !== null ? [{ accountId, at }] : [];
-      });
+        WHERE provider = 'anthropic' AND last_status = ?`).all(USAGE_STATUS) as Evidence[];
+      const evidence: Evidence[] = [...switchEvidence, ...pollEvidence];
 
       const autoLogPath = join(dirname(dbPath), 'auto.log');
       let autoLogUnreadable = false;
@@ -70,12 +66,9 @@ export function claudeUnpersistedTokenCheck(
         WHERE account_id = ? AND dead = 0 AND archived_at IS NULL`);
       const laterLineage = db.prepare(`SELECT 1 FROM lineage_log
         WHERE provider = 'anthropic' AND account_id = ? AND ts > ?`);
-      const laterSwitch = db.prepare(`SELECT 1 FROM switch_log
-        WHERE provider = 'anthropic' AND to_account = ? AND outcome = 'ok' AND injected = 0
-          AND detail IS NOT 'republish' AND from_account IS NOT NULL AND from_account <> to_account AND ts > ?`);
       for (const item of evidence) {
-        if (!Number.isFinite(item.at) || !isLiveSlot.get(item.accountId)) continue;
-        if (!laterLineage.get(item.accountId, item.at) && !laterSwitch.get(item.accountId, item.at)) {
+        if (!isLiveSlot.get(item.accountId)) continue;
+        if (!laterLineage.get(item.accountId, item.at)) {
           unresolved.add(item.accountId);
         }
       }
