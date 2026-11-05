@@ -2,7 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { chmodSync, closeSync, constants, fchmodSync, lstatSync, mkdirSync, openSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
-import { AutoAdmissionRefused, runAuto, type AutoDependencies, type AutoRunResult, type RunAutoOptions } from '../auto';
+import { anthropicModelScope, AutoAdmissionRefused, operatorAnthropicModelScope, runAuto, type AutoDependencies, type AutoRunResult, type RunAutoOptions } from '../auto';
 
 import { productionTryAcquireLock, type CswapLockRelease } from '../cswap-agent';
 import { atomicWriteText } from '../fsutil';
@@ -38,6 +38,62 @@ function parseResume(args: string[]): { provider: string; json: boolean } | null
   const [provider, ...flags] = args;
   if (!provider || flags.some((flag) => flag !== '--json') || new Set(flags).size !== flags.length) return null;
   return { provider, json: flags.includes('--json') };
+}
+
+function parseScope(args: string[]): { provider: string; model?: string; json: boolean } | null {
+  const flags = args.filter((arg) => arg.startsWith('--'));
+  const positionals = args.filter((arg) => !arg.startsWith('--'));
+  if (flags.some((flag) => flag !== '--json') || new Set(flags).size !== flags.length || positionals.length < 1 || positionals.length > 2) return null;
+  return { provider: positionals[0]!, ...(positionals[1] === undefined ? {} : { model: positionals[1] }), json: flags.includes('--json') };
+}
+
+function scopeName(models: readonly string[]): string {
+  return models.includes('all') ? 'all' : models.join(',');
+}
+
+/**
+ * Inspect or change the automatic Anthropic model scope without touching
+ * credentials. A changed scope invalidates only the parked decision derived
+ * from the old candidate set; the next admitted tick still owns all switching.
+ */
+function anthropicScope(ctx: CommandContext, args: string[], deps: AutoCommandDeps): number {
+  const options = parseScope(args);
+  if (!options) {
+    ctx.stderr('usage: qlb auto scope anthropic [all|<model>] [--json]');
+    return 2;
+  }
+  if (options.provider !== 'anthropic') {
+    ctx.stderr('qlb auto scope: provider-not-enabled');
+    return 2;
+  }
+
+  const store = (deps.openStore ?? openStore)(ctx.config.dbPath);
+  try {
+    const result = store.runImmediate(() => {
+      const before = scopeName(anthropicModelScope(store));
+      if (options.model === undefined) return { scope: before, changed: false, parkedCleared: false };
+      const requested = operatorAnthropicModelScope(options.model);
+      if (requested === null) return null;
+      const scope = scopeName(requested);
+      if (scope === before) return { scope, changed: false, parkedCleared: false };
+      // An auto park has no independent operator intent. It was calculated
+      // from the old scoped candidate set, so clear it but retain breaker and
+      // admission state. This never invokes a tick or a switch.
+      const parked = store.getConfig('auto.anthropic.parkedUntil');
+      store.setConfig('auto.anthropic.models', scope === 'all' ? '' : scope);
+      if (parked !== null && parked !== '') store.setConfig('auto.anthropic.parkedUntil', '');
+      return { scope, changed: true, parkedCleared: parked !== null && parked !== '' };
+    });
+    if (result === null) {
+      ctx.stderr('qlb auto scope: invalid-model-name');
+      return 2;
+    }
+    if (options.json) ctx.stdout(JSON.stringify({ provider: 'anthropic', ...result }));
+    else ctx.stdout(`anthropic automatic model scope: ${result.scope}${result.changed ? ' (updated)' : ' (unchanged)'}${result.parkedCleared ? '; cleared scoped parked state' : ''}`);
+    return 0;
+  } finally {
+    store.close();
+  }
 }
 
 function resumeAnthropic(ctx: CommandContext, args: string[], deps: AutoCommandDeps): number {
@@ -296,6 +352,10 @@ export async function runAutoCommand(
     if (inject !== null) { ctx.stderr('usage: qlb auto --once [--json] --inject <usage-5xx|breaker-rows> anthropic'); return 2; }
     return resumeAnthropic(ctx, args.slice(1), deps);
   }
+  if (args[0] === 'scope') {
+    if (inject !== null) { ctx.stderr('usage: qlb auto scope anthropic [all|<model>] [--json]'); return 2; }
+    return anthropicScope(ctx, args.slice(1), deps);
+  }
   if (args[0] === 'drill-begin') {
     if (inject !== null) { ctx.stderr('usage: qlb auto --once [--json] --inject <usage-5xx|breaker-rows> anthropic'); return 2; }
     return drillBegin(ctx, args.slice(1), deps);
@@ -323,7 +383,7 @@ export async function runAutoCommand(
 
   const options = parse(args);
   if (!options || (inject !== null && ((inject.kind !== 'usage-5xx' && inject.kind !== 'breaker-rows') || !options.once || options.dryRun))) {
-    ctx.stderr('usage: qlb auto [--once] [--dry-run] [--json] | qlb auto --once [--json] --inject <usage-5xx|breaker-rows> anthropic | qlb auto install-agent | qlb auto resume anthropic [--json] | qlb auto drill-begin [--json]');
+    ctx.stderr('usage: qlb auto [--once] [--dry-run] [--json] | qlb auto --once [--json] --inject <usage-5xx|breaker-rows> anthropic | qlb auto install-agent | qlb auto resume anthropic [--json] | qlb auto scope anthropic [all|<model>] [--json] | qlb auto drill-begin [--json]');
     return 2;
   }
 

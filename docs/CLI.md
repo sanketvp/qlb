@@ -120,6 +120,44 @@ An active fire drill can finish with `qlb lifecycle drill-done` only after all f
 
 Flags: `[--once] [--dry-run] [--json]`. Fault injection additionally requires `QLB_FAULT_INJECTION=1` and exactly `--once --inject <usage-5xx|breaker-rows> anthropic`.
 
+## `qlb auto scope anthropic`
+
+Inspect or configure which Anthropic model-scoped usage windows participate in automatic switching.
+The default `all` scope is fail-safe: every reported scoped window, including `7d:Fable`, can make an account ineligible.
+For Opus work, use `opus` so an exhausted `7d:Fable` window does not disqualify an account that still has Opus headroom.
+This command changes only QLB's non-secret local configuration.
+It never reads credentials, forces a switch, changes account ownership, or bypasses lifecycle admission or the automatic-switch breaker.
+
+```console
+$ qlb auto scope anthropic
+anthropic automatic model scope: all (unchanged)
+
+$ qlb auto scope anthropic opus --json
+{"provider":"anthropic","scope":"opus","changed":true,"parkedCleared":false}
+
+$ qlb auto scope anthropic all
+anthropic automatic model scope: all (updated)
+```
+
+Setting the current scope is idempotent.
+Changing the scope clears only a parked automatic-switch marker calculated from the old candidate set, so the next normally admitted tick can evaluate the new scope without being held by stale parking. Active auto loops read the setting on every tick, so no agent restart is needed.
+It does not clear a breaker hold or start a tick.
+`all` restores the default scope.
+A model name must contain only letters, digits, dots, underscores, or hyphens and must start with a letter or digit.
+
+Apply the same setting independently on both hosts:
+
+```bash
+# MacBook Pro
+qlb auto scope anthropic opus
+
+# Mac Mini
+qlb auto scope anthropic opus
+```
+
+Use `qlb auto scope anthropic all` on either host to restore the default/all scope there.
+Flags: `[--json]`.
+
 ## `qlb refresh`
 
 Poll every enabled adapter for a fresh gauge reading. Without `--allow-probe` this is a no-network no-op (exit 0). Pass `--allow-probe` to invoke each adapter's `fetchSnapshots()` — network reads go through the existing single-flight cache.

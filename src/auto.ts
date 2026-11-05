@@ -110,13 +110,22 @@ export function retryAfterSeconds(value: string | null): number | undefined {
   return Number.isSafeInteger(seconds) ? seconds : undefined;
 }
 
+const ANTHROPIC_MODEL_NAME = /^[a-z0-9][a-z0-9._-]*$/i;
+
+/** Fail closed to every model-scoped window when persisted scope is absent or malformed. */
 export function anthropicModelScope(store: Pick<Store, 'getConfig'>): readonly string[] {
   const raw = store.getConfig('auto.anthropic.models');
   if (typeof raw !== 'string' || raw.trim() === '') return ['all'];
   const models = raw.split(',').map((model) => model.trim().toLowerCase());
-  return models.length > 0 && models.every((model) => /^[a-z0-9][a-z0-9._-]*$/i.test(model))
+  return models.length > 0 && models.every((model) => ANTHROPIC_MODEL_NAME.test(model))
     ? [...new Set(models)]
     : ['all'];
+}
+
+/** Validate the one model name accepted by the operator-facing scope command. */
+export function operatorAnthropicModelScope(value: string): readonly string[] | null {
+  const model = value.trim().toLowerCase();
+  return ANTHROPIC_MODEL_NAME.test(model) ? [model] : null;
 }
 
 export function productionRequest(description: HttpRequestDescription): Promise<RefreshHttpResponse & { retryAfterS?: number }> {
@@ -148,9 +157,8 @@ function productionLiveBinding(deps: Required<Pick<AutoDependencies, 'env' | 'ho
   const warn = (message: string): void => redactedLog(deps.log, `auto: warning: ${message}`);
   const live = { backend: platformKeychain, paths, env: deps.env };
   const verdicts = new ProbeVerdictMemo();
-  const models = anthropicModelScope(store);
   const pollDeps = (): AnthropicPollDeps => ({
-    models,
+    models: anthropicModelScope(store),
     store,
     slots,
     now: () => Math.floor(deps.now() / 1000),
@@ -164,7 +172,7 @@ function productionLiveBinding(deps: Required<Pick<AutoDependencies, 'env' | 'ho
     getUsage: async (accessToken) => productionRequest(buildUsageRequest(accessToken)),
   });
   const tickDeps = (accounts: Awaited<ReturnType<typeof pollAnthropic>>): AnthropicTickDeps => ({
-    store, slots, now: deps.now, accounts, models,
+    store, slots, now: deps.now, accounts, models: anthropicModelScope(store),
     makeSwitchDeps: async (by) => makeProductionSwitchDeps({}, {
       stdout: () => {}, stderr: warn, env: deps.env, config: deps.config, loadConfig: () => deps.config,
       home: deps.home, registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
@@ -196,7 +204,7 @@ function productionLiveBinding(deps: Required<Pick<AutoDependencies, 'env' | 'ho
         injectionDetail: inject === undefined ? undefined : injectionDetail(inject),
       });
     },
-    breakerRowsDrill: async () => anthropicBreakerRowsDrill({ store, slots, now: deps.now, models }),
+    breakerRowsDrill: async () => anthropicBreakerRowsDrill({ store, slots, now: deps.now, models: anthropicModelScope(store) }),
   };
 }
 
