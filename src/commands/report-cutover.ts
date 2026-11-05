@@ -1,7 +1,9 @@
 import { DatabaseSync } from 'node:sqlite';
 
+import { codexL13ReceiptAt } from '../codex-l13-receipt';
 import { drillRowsPresent, extendWindow, phase, PI_PROVIDERS, type LifecycleRow } from '../lifecycle';
 import { redactSecrets } from '../redact';
+import { reloginsInWindow } from '../relogin';
 import { openStore } from '../store';
 import type { CommandContext, CommandDefinition } from '../registry';
 
@@ -36,7 +38,8 @@ function reportRows(db: DatabaseSync, lifecycle: LifecycleRow, now: number): Cut
   const rows: CutoverReportRow[] = [];
 
   const badSwitches = db.prepare(`SELECT id, outcome FROM switch_log WHERE provider = 'anthropic' AND injected = 0
-    AND outcome IN ('rolled-back', 'failed') AND ts >= ? AND ts <= ? ORDER BY ts, id`).all(...inWindow) as Array<{ id: number; outcome: string }>;
+    AND outcome IN ('rolled-back', 'failed') AND (detail IS NULL OR detail NOT LIKE 'republish%')
+    AND ts >= ? AND ts <= ? ORDER BY ts, id`).all(...inWindow) as Array<{ id: number; outcome: string }>;
   rows.push(badSwitches.length === 0
     ? row('correctness', 'AC19:anthropic-switches', 'PASS', 'no non-injected failed or rolled-back Anthropic switches')
     : row('correctness', 'AC19:anthropic-switches', 'FAIL', `non-injected failed or rolled-back Anthropic switches: ${badSwitches.map((value) => `${value.outcome}#${value.id}`).join(', ')}`, 'anthropic-switch-failed'));
@@ -55,8 +58,8 @@ function reportRows(db: DatabaseSync, lifecycle: LifecycleRow, now: number): Cut
     ? row('correctness', 'AC21:dead-slots', 'PASS', 'no health log row records a dead slot')
     : row('correctness', 'AC21:dead-slots', 'FAIL', `dead slot in window: ${dead.map((value) => `${value.slot}@${value.ts}`).join(', ')}`, 'dead-slot-in-window'));
 
-  const relogins = db.prepare(`SELECT id, provider, kind, detail, evidence FROM relogin_events
-    WHERE provider IN ('anthropic', 'openai-codex') AND ts >= ? AND ts <= ? ORDER BY ts, id`).all(...inWindow) as Array<{ id: number; provider: string; kind: string; detail: string | null; evidence: string | null }>;
+  const relogins = reloginsInWindow(db, { start, end })
+    .filter((value) => value.provider === 'anthropic' || value.provider === 'openai-codex');
   const soft = relogins.filter((value) => value.evidence === 'unattributed-rotation');
   rows.push(relogins.length === 0
     ? row('correctness', 'AC18:relogins', 'PASS', 'no Anthropic or Codex relogin events')
@@ -70,11 +73,11 @@ function reportRows(db: DatabaseSync, lifecycle: LifecycleRow, now: number): Cut
   else if (lifecycle.extendedAt == null) rows.push(row('coverage', 'anthropic:automatic-switches', 'FAIL', `${automatic.count}/10 non-injected automatic Anthropic switches; correctness checks must pass before extending the cutover window`, 'insufficient-anthropic-coverage'));
   else rows.push(row('coverage', 'anthropic:automatic-switches', 'FAIL', `${automatic.count}/10 non-injected automatic Anthropic switches after the one extension`, 'extended-once'));
 
-  const codexVerified = configValue(db, 'codex.l13VerifiedAt') != null;
+  const codexVerified = codexL13ReceiptAt(configValue(db, 'codex.l13VerifiedAt')) != null;
   const codexSwitches = db.prepare(`SELECT count(*) AS count FROM switch_log WHERE provider = 'openai-codex' AND outcome = 'ok'
     AND injected = 0 AND from_account IS NOT NULL AND from_account <> to_account AND ts >= ? AND ts <= ?`).get(...inWindow) as { count: number };
   const codexPass = codexVerified && codexSwitches.count >= 1;
-  const piDeferred = configValue(db, 'cutover.piDeferredAt') != null;
+  const piDeferred = configValue(db, 'cutover.piDeferredAt') === String(lifecycle.cutoverAt);
   rows.push(codexPass
     ? row('coverage', 'codex:L13-switch', 'PASS', 'L13 verification and a non-injected Codex switch are recorded')
     : piDeferred
@@ -85,6 +88,12 @@ function reportRows(db: DatabaseSync, lifecycle: LifecycleRow, now: number): Cut
   rows.push(drill.ok
     ? row('coverage', 'drill:four-facts', 'PASS', 'all four fire-drill facts are present')
     : row('coverage', 'drill:four-facts', 'FAIL', `missing fire-drill facts: ${drill.missing.join(', ')}`, 'drill-rows-missing'));
+
+  const injected = db.prepare(`SELECT id, outcome, detail FROM switch_log
+    WHERE injected = 1 AND ts >= ? AND ts <= ? ORDER BY ts, id`).all(start, now) as Array<{ id: number; outcome: string; detail: string | null }>;
+  rows.push(row('coverage', 'injected:switches', 'PASS', injected.length === 0
+    ? 'no injected switch rows'
+    : `injected switch rows: ${injected.map((value) => `${value.outcome}#${value.id}${value.detail ? `:${value.detail}` : ''}`).join(', ')}`));
 
   for (const provider of PI_PROVIDERS) {
     const state = configValue(db, `pi.${provider}.state`);
@@ -112,7 +121,10 @@ function parse(args: string[]): boolean | null {
 }
 
 function formatText(report: CutoverReport): string[] {
-  return report.rows.map((value) => `${value.status} ${value.group} ${value.name}: ${value.message}`);
+  return [
+    `lifecycle cutoverAt=${report.lifecycle.cutoverAt} windowEnd=${report.lifecycle.windowEnd} extendedAt=${report.lifecycle.extendedAt ?? 'none'}`,
+    ...report.rows.map((value) => `${value.status} ${value.group} ${value.name}${value.code ? ` [${value.code}]` : ''}: ${value.message}`),
+  ];
 }
 
 async function execute(args: string[], ctx: CommandContext, deps: ReportCutoverCommandDeps): Promise<number> {
@@ -128,13 +140,12 @@ async function execute(args: string[], ctx: CommandContext, deps: ReportCutoverC
     const now = (deps.now ?? Date.now)();
     if (now < lifecycle.windowEnd) { ctx.stderr('report cutover refused: window-not-ended'); return 3; }
     const db = (store as unknown as { db: DatabaseSync }).db;
-    let report = buildCutoverReport(db, lifecycle, now);
+    const report = buildCutoverReport(db, lifecycle, now);
     if (report.rows.some((value) => value.status === 'EXTEND')) {
       const extended = extendWindow(store, now);
       if (!extended.ok) { ctx.stderr(`report cutover refused: ${extended.code}`); return 3; }
       report.lifecycle.windowEnd = extended.row!.windowEnd!;
       report.lifecycle.extendedAt = extended.row!.extendedAt;
-      report.ok = false;
     }
     const redacted = JSON.parse(redactSecrets(JSON.stringify(report), ctx.knownSecrets())) as CutoverReport;
     if (json) ctx.stdout(JSON.stringify(redacted));

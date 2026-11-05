@@ -38,7 +38,7 @@ function seed(subject: ReturnType<typeof fixture>, options: { piDeferred?: boole
     db.prepare(`INSERT INTO health_log (ts, phase, overall, failing_json, dead_slots_json) VALUES (?, 'cutover', ?, '[]', ?)`)
       .run(cutoverAt + 1, options.healthOverall ?? 'PASS', JSON.stringify(options.deadSlots ?? []));
     for (let index = 0; index < (options.switches ?? 10); index++) {
-      db.prepare(`INSERT INTO switch_log (ts, provider, to_account, trigger, outcome, injected) VALUES (?, 'anthropic', ?, 'auto', 'ok', 0)`)
+      db.prepare(`INSERT INTO switch_log (ts, provider, to_account, trigger, outcome, injected) VALUES (?, 'anthropic', ?, 'proactive', 'ok', 0)`)
         .run(cutoverAt + 2 + index, `a-${index}`);
     }
     if (options.drill) {
@@ -55,6 +55,17 @@ function seed(subject: ReturnType<typeof fixture>, options: { piDeferred?: boole
 
 function run(subject: ReturnType<typeof fixture>): Promise<number | null> {
   return runExecutingCommand({ command: createReportCutoverCommand({ now: () => NOW }), args: ['--json'] }, subject.context);
+}
+
+function runText(subject: ReturnType<typeof fixture>): Promise<number | null> {
+  return runExecutingCommand({ command: createReportCutoverCommand({ now: () => NOW }), args: [] }, subject.context);
+}
+
+function setPiMigrated(db: DatabaseSync): void {
+  for (const provider of ['anthropic', 'openai-codex', 'xai', 'kimi-coding', 'openrouter']) {
+    db.prepare(`INSERT INTO config (key, value) VALUES (?, 'migrated')
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(`pi.${provider}.state`);
+  }
 }
 
 test('refuses before the window ends and when a rollback is recorded', async () => {
@@ -82,11 +93,17 @@ test('ten non-injected automatic rows pass AC19 despite an injected rollback in 
     const db = new DatabaseSync(subject.dbPath);
     db.prepare(`INSERT INTO switch_log (ts, provider, to_account, trigger, outcome, injected) VALUES (?, 'anthropic', 'drill', 'failover', 'rolled-back', 1)`)
       .run(NOW - 14 * DAY);
+    const injected = db.prepare('SELECT id FROM switch_log ORDER BY id DESC LIMIT 1').get() as { id: number };
     db.close();
     assert.equal(await run(subject), 1, 'strict Pi/Codex rows still fail without the marker');
     const report = JSON.parse(subject.output[0]!);
     assert.equal(report.rows.find((value: { name: string }) => value.name === 'anthropic:automatic-switches').status, 'PASS');
     assert.equal(report.rows.find((value: { name: string }) => value.name === 'AC19:anthropic-switches').status, 'PASS');
+    const injectedRow = report.rows.find((value: { name: string }) => value.name === 'injected:switches');
+    assert.equal(injectedRow.status, 'PASS');
+    assert.match(injectedRow.message, new RegExp(`rolled-back#${injected.id}`));
+    assert.equal(report.rows.find((value: { name: string }) => value.name === 'codex:L13-switch').code, 'codex-coverage-missing');
+    assert.equal(report.rows.filter((value: { name: string }) => value.name.startsWith('pi:')).every((value: { status: string; code: string }) => value.status === 'FAIL' && value.code === 'pi-deferred'), true);
   } finally { subject.close(); }
 });
 
@@ -94,6 +111,12 @@ test('nine rows extend once, and a later miss fails extended-once', async () => 
   const subject = fixture();
   try {
     seed(subject, { switches: 9, drill: true, piDeferred: true });
+    const db = new DatabaseSync(subject.dbPath);
+    db.prepare(`INSERT INTO switch_log (ts, provider, to_account, trigger, outcome, injected) VALUES (?, 'anthropic', 'injected', 'proactive', 'ok', 1)`)
+      .run(NOW - 9 * DAY);
+    db.prepare(`INSERT INTO switch_log (ts, provider, to_account, trigger, outcome, injected) VALUES (?, 'anthropic', 'manual', 'manual', 'ok', 0)`)
+      .run(NOW - 9 * DAY);
+    db.close();
     assert.equal(await run(subject), 1);
     let report = JSON.parse(subject.output[0]!);
     assert.equal(report.rows.find((value: { name: string }) => value.name === 'anthropic:automatic-switches').status, 'EXTEND');
@@ -114,6 +137,53 @@ test('the deferred marker makes missing Pi and Codex coverage advisory but not d
     const report = JSON.parse(subject.output[0]!);
     assert.equal(report.rows.find((value: { name: string }) => value.name === 'codex:L13-switch').status, 'DEFERRED');
     assert.equal(report.rows.filter((value: { name: string }) => value.name.startsWith('pi:')).every((value: { status: string }) => value.status === 'DEFERRED'), true);
+  } finally { subject.close(); }
+});
+
+test('a deferred marker from another lifecycle does not soften strict coverage', async () => {
+  const subject = fixture();
+  try {
+    seed(subject, { piDeferred: true, drill: true });
+    const db = new DatabaseSync(subject.dbPath);
+    db.prepare("UPDATE config SET value = ? WHERE key = 'cutover.piDeferredAt'").run(String(NOW - 16 * DAY));
+    db.close();
+    assert.equal(await run(subject), 1);
+    const report = JSON.parse(subject.output[0]!);
+    assert.equal(report.rows.find((value: { name: string }) => value.name === 'codex:L13-switch').code, 'codex-coverage-missing');
+    assert.equal(report.rows.filter((value: { name: string }) => value.name.startsWith('pi:')).every((value: { status: string }) => value.status === 'FAIL'), true);
+  } finally { subject.close(); }
+});
+
+test('strict Pi and Codex coverage passes only with a valid L13 receipt and real switch', async () => {
+  const subject = fixture();
+  try {
+    seed(subject, { drill: true });
+    const db = new DatabaseSync(subject.dbPath);
+    setPiMigrated(db);
+    db.prepare("INSERT INTO config (key, value) VALUES ('codex.l13VerifiedAt', ?)").run(String(NOW));
+    db.prepare(`INSERT INTO switch_log (ts, provider, from_account, to_account, trigger, outcome, injected)
+      VALUES (?, 'openai-codex', 'from', 'to', 'proactive', 'ok', 0)`).run(NOW - 9 * DAY);
+    db.close();
+    assert.equal(await run(subject), 0);
+    const report = JSON.parse(subject.output[0]!);
+    assert.equal(report.rows.find((value: { name: string }) => value.name === 'codex:L13-switch').status, 'PASS');
+    assert.equal(report.rows.filter((value: { name: string }) => value.name.startsWith('pi:')).every((value: { status: string }) => value.status === 'PASS'), true);
+  } finally { subject.close(); }
+});
+
+test('an invalid L13 receipt does not satisfy strict Codex coverage', async () => {
+  const subject = fixture();
+  try {
+    seed(subject, { drill: true });
+    const db = new DatabaseSync(subject.dbPath);
+    setPiMigrated(db);
+    db.prepare("INSERT INTO config (key, value) VALUES ('codex.l13VerifiedAt', '')").run();
+    db.prepare(`INSERT INTO switch_log (ts, provider, from_account, to_account, trigger, outcome, injected)
+      VALUES (?, 'openai-codex', 'from', 'to', 'proactive', 'ok', 0)`).run(NOW - 9 * DAY);
+    db.close();
+    assert.equal(await run(subject), 1);
+    const report = JSON.parse(subject.output[0]!);
+    assert.equal(report.rows.find((value: { name: string }) => value.name === 'codex:L13-switch').code, 'codex-coverage-missing');
   } finally { subject.close(); }
 });
 
@@ -150,7 +220,9 @@ test('a dead health-log slot fails AC21 even when its overall is FAIL for anothe
     seed(subject, { piDeferred: true, deadSlots: ['dead-slot'], drill: true, healthOverall: 'FAIL' });
     assert.equal(await run(subject), 1);
     const report = JSON.parse(subject.output[0]!);
-    assert.equal(report.rows.find((value: { name: string }) => value.name === 'AC21:dead-slots').code, 'dead-slot-in-window');
+    const deadSlots = report.rows.find((value: { name: string }) => value.name === 'AC21:dead-slots');
+    assert.equal(deadSlots.code, 'dead-slot-in-window');
+    assert.match(deadSlots.message, new RegExp(`dead-slot@${NOW - 15 * DAY + 1}`));
   } finally { subject.close(); }
 });
 
@@ -192,5 +264,54 @@ test('breaker seed rows do not satisfy the fire-drill breaker fact', async () =>
     assert.equal(await run(subject), 1);
     const report = JSON.parse(subject.output[0]!);
     assert.equal(report.rows.find((value: { name: string }) => value.name === 'drill:four-facts').code, 'drill-rows-missing');
+  } finally { subject.close(); }
+});
+
+test('republish failures do not count against AC19', async () => {
+  const subject = fixture();
+  try {
+    seed(subject, { piDeferred: true, drill: true });
+    const db = new DatabaseSync(subject.dbPath);
+    db.prepare(`INSERT INTO switch_log (ts, provider, to_account, trigger, outcome, injected, detail)
+      VALUES (?, 'anthropic', 'republish', 'manual', 'rolled-back', 0, 'republish:step-7')`).run(NOW - 9 * DAY);
+    db.close();
+    assert.equal(await run(subject), 0);
+    const report = JSON.parse(subject.output[0]!);
+    assert.equal(report.rows.find((value: { name: string }) => value.name === 'AC19:anthropic-switches').status, 'PASS');
+  } finally { subject.close(); }
+});
+
+test('relogin evidence fails only for Anthropic and Codex events', async () => {
+  const subject = fixture();
+  try {
+    seed(subject, { piDeferred: true, drill: true });
+    const db = new DatabaseSync(subject.dbPath);
+    for (const [provider, kind, detail, evidence] of [
+      ['anthropic', 'dead', 'dead', 'dead'],
+      ['openai-codex', 'external-login', 'unattributed-rotation', 'unattributed-rotation'],
+      ['xai', 'dead', 'dead', 'dead'],
+    ]) db.prepare(`INSERT INTO relogin_events (ts, provider, kind, detail, evidence) VALUES (?, ?, ?, ?, ?)`)
+      .run(NOW - 9 * DAY, provider, kind, detail, evidence);
+    db.close();
+    assert.equal(await run(subject), 1);
+    const report = JSON.parse(subject.output[0]!);
+    const relogins = report.rows.find((value: { name: string }) => value.name === 'AC18:relogins');
+    assert.equal(relogins.code, 'relogin-in-window');
+    assert.match(relogins.message, /anthropic:dead:dead/);
+    assert.match(relogins.message, /openai-codex:external-login:unattributed-rotation/);
+    assert.match(relogins.message, /soft unattributed-rotation: 1/);
+    assert.doesNotMatch(relogins.message, /xai/);
+  } finally { subject.close(); }
+});
+
+test('text output includes lifecycle dates and report codes', async () => {
+  const subject = fixture();
+  try {
+    seed(subject, { switches: 9, piDeferred: true, drill: true });
+    assert.equal(await runText(subject), 1);
+    assert.match(subject.output[0]!, new RegExp(`windowEnd=${NOW - DAY}`));
+    assert.match(subject.output[0]!, new RegExp(`extendedAt=${NOW}`));
+    assert.equal(subject.output.some((line) => line.includes('[insufficient-anthropic-coverage]')), true);
+    assert.equal(subject.output.some((line) => line.includes('[codex-deferred]')), true);
   } finally { subject.close(); }
 });
