@@ -183,6 +183,7 @@ describe('qlb retire cswap (AC22 retire)', () => {
       try { db.prepare("UPDATE lifecycle SET state = 'pre-cutover'").run(); } finally { db.close(); }
     }, 'phase=pre-cutover');
     await refusal('receipt missing', (f) => f.store.setConfig('report.receiptAt', ''), 'report-receipt-missing');
+    await refusal('receipt has deliberate Stage-1 deferrals', (f) => f.store.setConfig('report.receiptDeferred', '1'), 'report-receipt-deferred');
     await refusal('report did not pass', (f) => { f.deps.reportReceiptPasses = () => false; }, 'report-not-pass');
     await refusal('doctor overall', (f) => { f.deps.doctor = async () => ({ overall: 'FAIL', autoAgent: 'PASS' }); }, 'doctor-not-pass');
     await refusal('pending recovery', (f) => {

@@ -5,7 +5,7 @@ import { doctorQlb, type DoctorReport } from '../diagnostics';
 import { configValue, drillRowsPresent, extendWindow, phase, PI_PROVIDERS, type LifecycleRow } from '../lifecycle';
 import { redactSecrets } from '../redact';
 import { reloginsInWindow } from '../relogin';
-import { openStore } from '../store';
+import { openStore, type Store } from '../store';
 import type { CommandContext, CommandDefinition } from '../registry';
 
 export type CutoverReportStatus = 'PASS' | 'FAIL' | 'EXTEND' | 'DEFERRED';
@@ -137,6 +137,7 @@ function appendReceiptRows(rows: CutoverReportRow[], db: DatabaseSync, now: numb
   rows.push(doctor.s64.autoAgent === 'PASS'
     ? row('coverage', 'doctor:auto-agent', 'PASS', 'doctor automatic-agent verdict passed')
     : row('coverage', 'doctor:auto-agent', 'FAIL', 'doctor automatic-agent verdict failed', 'doctor-auto-agent-failed'));
+  if (doctor.healthLogId == null) rows.push(row('coverage', 'doctor:health-log', 'FAIL', doctor.healthLogError ?? 'doctor health log was not appended', 'doctor-health-log-missing'));
   for (const provider of PI_PROVIDERS) {
     if (configValue(db, `pi.${provider}.state`) !== 'migrated') continue;
     const servedAt = Number(configValue(db, `pi.${provider}.lastServedAt`));
@@ -147,34 +148,16 @@ function appendReceiptRows(rows: CutoverReportRow[], db: DatabaseSync, now: numb
   }
 }
 
-function receiptEligible(report: CutoverReport, lifecycle: LifecycleRow, db: DatabaseSync): boolean {
-  const lifecycleDeferred = configValue(db, 'cutover.piDeferredAt') === String(lifecycle.cutoverAt);
-  const deferredIsLifecycleBound = (value: CutoverReportRow): boolean => lifecycleDeferred
-    && value.status === 'DEFERRED'
-    && ((value.code === 'pi-deferred' && value.name.startsWith('pi:')) || (value.code === 'codex-deferred' && value.name === 'codex:L13-switch'))
-    && value.group === 'coverage';
-  return report.rows.every((value) => value.status === 'PASS' || deferredIsLifecycleBound(value));
+function receiptIsDeferred(report: CutoverReport): boolean {
+  return report.rows.some((value) => value.status === 'DEFERRED');
 }
 
-function writeOrClearReceipt(db: DatabaseSync, now: number, healthLogId: number | undefined, eligible: boolean): void {
-  db.exec('BEGIN IMMEDIATE');
-  try {
-    if (eligible && healthLogId != null) {
-      db.prepare(`INSERT INTO config (key, value) VALUES (?, ?)
-        ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run('report.receiptAt', String(now));
-      db.prepare(`INSERT INTO config (key, value) VALUES (?, ?)
-        ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run('report.receiptHealthLogId', String(healthLogId));
-    } else {
-      db.prepare(`INSERT INTO config (key, value) VALUES (?, '')
-        ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run('report.receiptAt');
-      db.prepare(`INSERT INTO config (key, value) VALUES (?, '')
-        ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run('report.receiptHealthLogId');
-    }
-    db.exec('COMMIT');
-  } catch (error) {
-    db.exec('ROLLBACK');
-    throw error;
-  }
+function writeOrClearReceipt(store: Store, now: number, healthLogId: number | undefined, eligible: boolean, deferred: boolean): void {
+  store.runImmediate(() => {
+    store.setConfig('report.receiptAt', eligible ? String(now) : '');
+    store.setConfig('report.receiptHealthLogId', eligible && healthLogId != null ? String(healthLogId) : '');
+    store.setConfig('report.receiptDeferred', eligible && deferred ? '1' : '');
+  });
 }
 
 function parse(args: string[]): boolean | null {
@@ -207,14 +190,15 @@ async function execute(args: string[], ctx: CommandContext, deps: ReportCutoverC
       : await deps.doctor(ctx.config);
     const report = buildCutoverReport(db, lifecycle, now);
     appendReceiptRows(report.rows, db, now, doctor, historyPasses);
+    report.ok = report.rows.every((value) => value.status === 'PASS' || value.status === 'DEFERRED');
     if (report.rows.some((value) => value.status === 'EXTEND')) {
       const extended = extendWindow(store, now);
       if (!extended.ok) { ctx.stderr(`report cutover refused: ${extended.code}`); return 3; }
       report.lifecycle.windowEnd = extended.row!.windowEnd!;
       report.lifecycle.extendedAt = extended.row!.extendedAt;
     }
-    const eligible = receiptEligible(report, lifecycle, db) && doctor.healthLogId != null;
-    writeOrClearReceipt(db, now, doctor.healthLogId, eligible);
+    const eligible = report.ok && doctor.healthLogId != null;
+    writeOrClearReceipt(store, now, doctor.healthLogId, eligible, receiptIsDeferred(report));
     const redacted = JSON.parse(redactSecrets(JSON.stringify(report), ctx.knownSecrets())) as CutoverReport;
     if (json) ctx.stdout(JSON.stringify(redacted));
     else for (const line of formatText(redacted)) ctx.stdout(line);

@@ -109,7 +109,7 @@ export function productionDependencies(
     backupsDir: join(stateDir, 'backups'),
     journalDir: join(stateDir, 'journal'),
     doctor: async () => s64DoctorVerdict(await doctorQlb(ctx.config)),
-    reportReceiptPasses: () => store.getConfig('report.receiptAt') != null,
+    reportReceiptPasses: () => store.getConfig('report.receiptAt') != null && store.getConfig('report.receiptDeferred') !== '1',
     drillRowsPresent: () => {
       const db = openStoreConnection(store.dbPath, true);
       try {

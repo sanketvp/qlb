@@ -265,6 +265,7 @@ export async function evaluateRetirementGates(
 
   const receiptAt = safeNonNegativeInt(store.getConfig('report.receiptAt'));
   if (receiptAt == null) return refusal('report-receipt-missing');
+  if (store.getConfig('report.receiptDeferred') === '1') return refusal('report-receipt-deferred');
   if (!dependencies.reportReceiptPasses()) return refusal('report-not-pass');
   const doctor = await dependencies.doctor();
 

@@ -60,7 +60,7 @@ function passingDoctor(dbPath: string, options: { overall?: 'PASS' | 'FAIL'; aut
       const result = db.prepare(`INSERT INTO health_log (ts, phase, overall, failing_json, dead_slots_json)
         VALUES (?, 'cutover', ?, '[]', '[]')`).run(NOW, options.overall ?? 'PASS');
       return {
-        command: 'doctor', overall: 'PASS', checks: [], providers: [],
+        command: 'doctor', overall: options.overall ?? 'PASS', checks: [], providers: [],
         s64: { overall: options.overall ?? 'PASS', autoAgent: options.autoAgent ?? 'PASS' },
         healthLogId: Number(result.lastInsertRowid),
       };
@@ -69,11 +69,11 @@ function passingDoctor(dbPath: string, options: { overall?: 'PASS' | 'FAIL'; aut
 }
 
 function run(subject: ReturnType<typeof fixture>, deps: ReportCutoverCommandDeps = {}): Promise<number | null> {
-  return runExecutingCommand({ command: createReportCutoverCommand({ now: () => NOW, ...deps }), args: ['--json'] }, subject.context);
+  return runExecutingCommand({ command: createReportCutoverCommand({ now: () => NOW, doctor: passingDoctor(subject.dbPath), ...deps }), args: ['--json'] }, subject.context);
 }
 
 function runText(subject: ReturnType<typeof fixture>): Promise<number | null> {
-  return runExecutingCommand({ command: createReportCutoverCommand({ now: () => NOW }), args: [] }, subject.context);
+  return runExecutingCommand({ command: createReportCutoverCommand({ now: () => NOW, doctor: passingDoctor(subject.dbPath) }), args: [] }, subject.context);
 }
 
 function setPiMigrated(db: DatabaseSync, lastServedAt?: number): void {
@@ -193,6 +193,7 @@ test('strict Pi and Codex coverage passes only with a valid L13 receipt and real
     const db = new DatabaseSync(subject.dbPath);
     setPiMigrated(db, NOW);
     db.prepare("INSERT INTO config (key, value) VALUES ('codex.l13VerifiedAt', ?)").run(String(NOW));
+    db.prepare("INSERT INTO config (key, value) VALUES ('report.receiptDeferred', '1')").run();
     db.prepare(`INSERT INTO switch_log (ts, provider, from_account, to_account, trigger, outcome, injected)
       VALUES (?, 'openai-codex', 'from', 'to', 'proactive', 'ok', 0)`).run(NOW - 9 * DAY);
     db.close();
@@ -200,6 +201,9 @@ test('strict Pi and Codex coverage passes only with a valid L13 receipt and real
     const report = JSON.parse(subject.output[0]!);
     assert.equal(report.rows.find((value: { name: string }) => value.name === 'codex:L13-switch').status, 'PASS');
     assert.equal(report.rows.filter((value: { name: string }) => value.name.startsWith('pi:')).every((value: { status: string }) => value.status === 'PASS'), true);
+    const after = new DatabaseSync(subject.dbPath, { readOnly: true });
+    assert.equal((after.prepare("SELECT value FROM config WHERE key = 'report.receiptDeferred'").get() as { value: string }).value, '');
+    after.close();
   } finally { subject.close(); }
 });
 
@@ -211,10 +215,12 @@ test('a receipt is created for lifecycle-bound deferred Pi/Codex coverage when d
     const db = new DatabaseSync(subject.dbPath, { readOnly: true });
     const receiptAt = db.prepare("SELECT value FROM config WHERE key = 'report.receiptAt'").get() as { value: string };
     const receiptId = db.prepare("SELECT value FROM config WHERE key = 'report.receiptHealthLogId'").get() as { value: string };
+    const deferred = db.prepare("SELECT value FROM config WHERE key = 'report.receiptDeferred'").get() as { value: string };
     const health = db.prepare('SELECT overall FROM health_log WHERE id = ?').get(Number(receiptId.value)) as { overall: string };
     db.close();
     assert.equal(receiptAt.value, String(NOW));
     assert.equal(health.overall, 'PASS');
+    assert.equal(deferred.value, '1');
   } finally { subject.close(); }
 });
 
@@ -229,6 +235,25 @@ test('strict missing Pi or Codex evidence remains receipt-ineligible without the
   } finally { subject.close(); }
 });
 
+test('a missing doctor health-log receipt fails the report and clears the receipt', async () => {
+  const subject = fixture();
+  try {
+    seed(subject, { piDeferred: true, drill: true });
+    const doctor: ReportCutoverCommandDeps['doctor'] = async () => ({
+      command: 'doctor', overall: 'PASS', checks: [], providers: [],
+      s64: { overall: 'PASS', autoAgent: 'PASS' }, healthLogError: 'fixture append failed',
+    });
+    assert.equal(await run(subject, { doctor }), 1);
+    const report = JSON.parse(subject.output[0]!);
+    assert.equal(report.rows.find((value: { name: string }) => value.name === 'doctor:health-log').code, 'doctor-health-log-missing');
+    const after = new DatabaseSync(subject.dbPath, { readOnly: true });
+    assert.equal((after.prepare("SELECT value FROM config WHERE key = 'report.receiptAt'").get() as { value: string }).value, '');
+    assert.equal((after.prepare("SELECT value FROM config WHERE key = 'report.receiptHealthLogId'").get() as { value: string }).value, '');
+    assert.equal((after.prepare("SELECT value FROM config WHERE key = 'report.receiptDeferred'").get() as { value: string }).value, '');
+    after.close();
+  } finally { subject.close(); }
+});
+
 test('a FAIL after the final-24-hour PASS prevents a receipt even when the report doctor passes', async () => {
   const subject = fixture();
   try {
@@ -237,9 +262,13 @@ test('a FAIL after the final-24-hour PASS prevents a receipt even when the repor
     db.prepare(`INSERT INTO health_log (ts, phase, overall, failing_json, dead_slots_json) VALUES (?, 'cutover', ?, '[]', '[]')`).run(NOW - 3 * 60 * 60 * 1000, 'PASS');
     db.prepare(`INSERT INTO health_log (ts, phase, overall, failing_json, dead_slots_json) VALUES (?, 'cutover', ?, '[]', '[]')`).run(NOW - 2 * 60 * 60 * 1000, 'FAIL');
     db.close();
-    assert.equal(await run(subject, { doctor: passingDoctor(subject.dbPath) }), 0);
+    assert.equal(await run(subject, { doctor: passingDoctor(subject.dbPath) }), 1);
     const report = JSON.parse(subject.output[0]!);
     assert.equal(report.rows.find((value: { name: string }) => value.name === 'health:final-24h').code, 'health-history-failed');
+    const after = new DatabaseSync(subject.dbPath, { readOnly: true });
+    assert.equal((after.prepare("SELECT value FROM config WHERE key = 'report.receiptAt'").get() as { value: string }).value, '');
+    assert.equal((after.prepare("SELECT value FROM config WHERE key = 'report.receiptHealthLogId'").get() as { value: string }).value, '');
+    after.close();
   } finally { subject.close(); }
 });
 
@@ -248,8 +277,12 @@ test('a failing doctor clears a prior receipt and a later passing run replaces i
   try {
     seed(subject, { piDeferred: true, drill: true });
     assert.equal(await run(subject, { doctor: passingDoctor(subject.dbPath) }), 0);
-    assert.equal(await run(subject, { doctor: passingDoctor(subject.dbPath, { autoAgent: 'FAIL' }) }), 0);
+    assert.equal(await run(subject, { doctor: passingDoctor(subject.dbPath, { overall: 'FAIL', autoAgent: 'FAIL' }) }), 1);
     let db = new DatabaseSync(subject.dbPath, { readOnly: true });
+    assert.equal((db.prepare("SELECT value FROM config WHERE key = 'report.receiptAt'").get() as { value: string }).value, '');
+    db.close();
+    assert.equal(await run(subject, { doctor: passingDoctor(subject.dbPath) }), 1);
+    db = new DatabaseSync(subject.dbPath, { readOnly: true });
     assert.equal((db.prepare("SELECT value FROM config WHERE key = 'report.receiptAt'").get() as { value: string }).value, '');
     db.close();
     assert.equal(await run(subject, { doctor: passingDoctor(subject.dbPath) }), 0);
@@ -266,7 +299,7 @@ test('a migrated Pi provider requires service in the final 24 hours for a receip
     const db = new DatabaseSync(subject.dbPath);
     db.prepare(`INSERT INTO config (key, value) VALUES ('pi.anthropic.state', 'migrated')`).run();
     db.close();
-    assert.equal(await run(subject, { doctor: passingDoctor(subject.dbPath) }), 0);
+    assert.equal(await run(subject, { doctor: passingDoctor(subject.dbPath) }), 1);
     let report = JSON.parse(subject.output[0]!);
     assert.equal(report.rows.find((value: { name: string }) => value.name === 'pi:anthropic:recent-service').code, 'no-recent-pi-service');
     subject.output.length = 0;
@@ -316,7 +349,7 @@ test('text and JSON report output redact token-shaped values', async () => {
     assert.equal(await run(subject), 1);
     assert.doesNotMatch(subject.output.join('\n'), new RegExp(secret));
     subject.output.length = 0;
-    const code = await runExecutingCommand({ command: createReportCutoverCommand({ now: () => NOW }), args: [] }, subject.context);
+    const code = await runText(subject);
     assert.equal(code, 1);
     assert.doesNotMatch(subject.output.join('\n'), new RegExp(secret));
   } finally { subject.close(); }
