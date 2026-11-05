@@ -101,7 +101,7 @@ function retirementGateDeps(now: number): CswapRetireDependencies {
     stateDir: '/fixture', backupsDir: '/fixture/backups', journalDir: '/fixture/journal',
     doctor: () => ({ overall: 'PASS', autoAgent: 'PASS' }),
     reportReceiptPasses: () => true,
-    hasFourInjectedDrillRows: () => true,
+    drillRowsPresent: () => true,
     hasUnadoptedStash: () => false,
     claudeSlotsPass: () => true,
     slots: () => [],

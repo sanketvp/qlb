@@ -13,6 +13,7 @@ import { listUnclaimedKeychainServices, platformKeychain } from '../keychain';
 import { isCredentialNotFound } from '../credential-backends';
 import { defaultPiMigratePaths } from '../pi-migrate';
 import { fsyncDirSync } from '../fsutil';
+import { drillRowsPresent, phase } from '../lifecycle';
 import { openStore, openStoreConnection, type Store } from '../store';
 import type { CommandContext, CommandDefinition } from '../registry';
 
@@ -109,11 +110,12 @@ export function productionDependencies(
     journalDir: join(stateDir, 'journal'),
     doctor: async () => s64DoctorVerdict(await doctorQlb(ctx.config)),
     reportReceiptPasses: () => store.getConfig('report.receiptAt') != null,
-    hasFourInjectedDrillRows: () => {
+    drillRowsPresent: () => {
       const db = openStoreConnection(store.dbPath, true);
       try {
-        const row = db.prepare("SELECT count(*) AS count FROM switch_log WHERE injected = 1 AND outcome = 'ok' AND (detail IS NULL OR detail <> 'fault-injection:breaker-rows:seed')").get() as { count: number };
-        return row.count >= 4;
+        const row = phase(store);
+        const now = Date.now();
+        return drillRowsPresent(db, row.drillBeganAt ?? row.cutoverAt ?? now, now).ok;
       } finally { db.close(); }
     },
     hasUnadoptedStash,
