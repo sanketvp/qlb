@@ -28,15 +28,15 @@ function fixture(): { root: string; dbPath: string; output: string[]; context: C
   };
 }
 
-function seed(subject: ReturnType<typeof fixture>, options: { piDeferred?: boolean; switches?: number; deadSlots?: string[]; drill?: boolean } = {}): void {
+function seed(subject: ReturnType<typeof fixture>, options: { piDeferred?: boolean; switches?: number; deadSlots?: string[]; drill?: boolean; healthOverall?: 'PASS' | 'FAIL' } = {}): void {
   const db = new DatabaseSync(subject.dbPath);
   try {
     const cutoverAt = NOW - 15 * DAY;
     const windowEnd = NOW - DAY;
     db.prepare(`INSERT INTO lifecycle (state, began_at, cutover_at, window_end, drill_began_at) VALUES ('cutover', ?, ?, ?, ?)`)
       .run(cutoverAt, cutoverAt, windowEnd, cutoverAt);
-    db.prepare(`INSERT INTO health_log (ts, phase, overall, failing_json, dead_slots_json) VALUES (?, 'cutover', 'PASS', '[]', ?)`)
-      .run(cutoverAt + 1, JSON.stringify(options.deadSlots ?? []));
+    db.prepare(`INSERT INTO health_log (ts, phase, overall, failing_json, dead_slots_json) VALUES (?, 'cutover', ?, '[]', ?)`)
+      .run(cutoverAt + 1, options.healthOverall ?? 'PASS', JSON.stringify(options.deadSlots ?? []));
     for (let index = 0; index < (options.switches ?? 10); index++) {
       db.prepare(`INSERT INTO switch_log (ts, provider, to_account, trigger, outcome, injected) VALUES (?, 'anthropic', ?, 'auto', 'ok', 0)`)
         .run(cutoverAt + 2 + index, `a-${index}`);
@@ -75,11 +75,15 @@ test('refuses before the window ends and when a rollback is recorded', async () 
   } finally { subject.close(); }
 });
 
-test('ten non-injected automatic rows pass coverage while injected rows do not satisfy AC19', async () => {
+test('ten non-injected automatic rows pass AC19 despite an injected rollback in the window', async () => {
   const subject = fixture();
   try {
     seed(subject, { drill: true });
-    assert.equal(await run(subject), 3, 'strict Pi/Codex rows still fail without the marker');
+    const db = new DatabaseSync(subject.dbPath);
+    db.prepare(`INSERT INTO switch_log (ts, provider, to_account, trigger, outcome, injected) VALUES (?, 'anthropic', 'drill', 'failover', 'rolled-back', 1)`)
+      .run(NOW - 14 * DAY);
+    db.close();
+    assert.equal(await run(subject), 1, 'strict Pi/Codex rows still fail without the marker');
     const report = JSON.parse(subject.output[0]!);
     assert.equal(report.rows.find((value: { name: string }) => value.name === 'anthropic:automatic-switches').status, 'PASS');
     assert.equal(report.rows.find((value: { name: string }) => value.name === 'AC19:anthropic-switches').status, 'PASS');
@@ -93,8 +97,10 @@ test('nine rows extend once, and a later miss fails extended-once', async () => 
     assert.equal(await run(subject), 0);
     let report = JSON.parse(subject.output[0]!);
     assert.equal(report.rows.find((value: { name: string }) => value.name === 'anthropic:automatic-switches').status, 'EXTEND');
+    assert.equal(report.lifecycle.windowEnd, NOW - 15 * DAY + 14 * DAY);
+    assert.equal(report.lifecycle.extendedAt, NOW);
     subject.output.length = 0;
-    assert.equal(await run(subject), 3);
+    assert.equal(await run(subject), 1);
     report = JSON.parse(subject.output[0]!);
     assert.equal(report.rows.find((value: { name: string }) => value.name === 'anthropic:automatic-switches').code, 'extended-once');
   } finally { subject.close(); }
@@ -118,7 +124,7 @@ test('no health log in the window fails AC21 rather than passing', async () => {
     const db = new DatabaseSync(subject.dbPath);
     db.exec('DELETE FROM health_log');
     db.close();
-    assert.equal(await run(subject), 3);
+    assert.equal(await run(subject), 1);
     const report = JSON.parse(subject.output[0]!);
     assert.equal(report.rows.find((value: { name: string }) => value.name === 'AC21:health-log').code, 'no-health-log');
   } finally { subject.close(); }
@@ -129,11 +135,11 @@ test('text and JSON report output redact token-shaped values', async () => {
   const secret = 'sk-ant-oat01-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
   try {
     seed(subject, { piDeferred: true, deadSlots: [secret], drill: true });
-    assert.equal(await run(subject), 3);
+    assert.equal(await run(subject), 1);
     assert.doesNotMatch(subject.output.join('\n'), new RegExp(secret));
     subject.output.length = 0;
     const code = await runExecutingCommand({ command: createReportCutoverCommand({ now: () => NOW }), args: [] }, subject.context);
-    assert.equal(code, 3);
+    assert.equal(code, 1);
     assert.doesNotMatch(subject.output.join('\n'), new RegExp(secret));
   } finally { subject.close(); }
 });
@@ -141,9 +147,50 @@ test('text and JSON report output redact token-shaped values', async () => {
 test('a dead health-log slot fails AC21 even when its overall is FAIL for another reason', async () => {
   const subject = fixture();
   try {
-    seed(subject, { piDeferred: true, deadSlots: ['dead-slot'], drill: true });
-    assert.equal(await run(subject), 3);
+    seed(subject, { piDeferred: true, deadSlots: ['dead-slot'], drill: true, healthOverall: 'FAIL' });
+    assert.equal(await run(subject), 1);
     const report = JSON.parse(subject.output[0]!);
     assert.equal(report.rows.find((value: { name: string }) => value.name === 'AC21:dead-slots').code, 'dead-slot-in-window');
+  } finally { subject.close(); }
+});
+
+test('correctness failures prevent consuming the one permitted coverage extension', async () => {
+  const subject = fixture();
+  try {
+    seed(subject, { piDeferred: true, switches: 9, drill: true });
+    const db = new DatabaseSync(subject.dbPath);
+    db.prepare(`INSERT INTO switch_log (ts, provider, to_account, trigger, outcome, injected) VALUES (?, 'anthropic', 'failed', 'auto', 'rolled-back', 0)`)
+      .run(NOW - 14 * DAY);
+    db.close();
+    assert.equal(await run(subject), 1);
+    const report = JSON.parse(subject.output[0]!);
+    assert.equal(report.rows.find((value: { name: string }) => value.name === 'anthropic:automatic-switches').status, 'FAIL');
+    assert.equal(report.rows.find((value: { name: string }) => value.name === 'anthropic:automatic-switches').code, 'insufficient-anthropic-coverage');
+    assert.equal(report.lifecycle.windowEnd, NOW - DAY);
+    assert.equal(report.lifecycle.extendedAt, null);
+  } finally { subject.close(); }
+});
+
+test('missing fire-drill facts fail the report', async () => {
+  const subject = fixture();
+  try {
+    seed(subject, { piDeferred: true });
+    assert.equal(await run(subject), 1);
+    const report = JSON.parse(subject.output[0]!);
+    assert.equal(report.rows.find((value: { name: string }) => value.name === 'drill:four-facts').code, 'drill-rows-missing');
+  } finally { subject.close(); }
+});
+
+test('breaker seed rows do not satisfy the fire-drill breaker fact', async () => {
+  const subject = fixture();
+  try {
+    seed(subject, { piDeferred: true, drill: true });
+    const db = new DatabaseSync(subject.dbPath);
+    db.prepare(`UPDATE switch_log SET detail = 'fault-injection:breaker-rows:seed' WHERE detail = 'fault-injection:breaker-rows'`)
+      .run();
+    db.close();
+    assert.equal(await run(subject), 1);
+    const report = JSON.parse(subject.output[0]!);
+    assert.equal(report.rows.find((value: { name: string }) => value.name === 'drill:four-facts').code, 'drill-rows-missing');
   } finally { subject.close(); }
 });

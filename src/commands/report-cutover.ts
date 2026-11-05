@@ -66,8 +66,10 @@ function reportRows(db: DatabaseSync, lifecycle: LifecycleRow, now: number): Cut
 
   const automatic = db.prepare(`SELECT count(*) AS count FROM switch_log WHERE provider = 'anthropic' AND outcome = 'ok'
     AND injected = 0 AND trigger <> 'manual' AND ts >= ? AND ts <= ?`).get(...inWindow) as { count: number };
+  const correctnessPass = rows.every((value) => value.group !== 'correctness' || value.status === 'PASS');
   if (automatic.count >= 10) rows.push(row('coverage', 'anthropic:automatic-switches', 'PASS', `${automatic.count} non-injected automatic Anthropic switches`));
-  else if (lifecycle.extendedAt == null) rows.push(row('coverage', 'anthropic:automatic-switches', 'EXTEND', `${automatic.count}/10 non-injected automatic Anthropic switches; cutover window extended once`, 'insufficient-anthropic-coverage'));
+  else if (lifecycle.extendedAt == null && correctnessPass) rows.push(row('coverage', 'anthropic:automatic-switches', 'EXTEND', `${automatic.count}/10 non-injected automatic Anthropic switches; cutover window extended once`, 'insufficient-anthropic-coverage'));
+  else if (lifecycle.extendedAt == null) rows.push(row('coverage', 'anthropic:automatic-switches', 'FAIL', `${automatic.count}/10 non-injected automatic Anthropic switches; correctness checks must pass before extending the cutover window`, 'insufficient-anthropic-coverage'));
   else rows.push(row('coverage', 'anthropic:automatic-switches', 'FAIL', `${automatic.count}/10 non-injected automatic Anthropic switches after the one extension`, 'extended-once'));
 
   const codexVerified = configValue(db, 'codex.l13VerifiedAt') != null;
@@ -132,11 +134,6 @@ async function execute(args: string[], ctx: CommandContext, deps: ReportCutoverC
     if (report.rows.some((value) => value.status === 'EXTEND')) {
       const extended = extendWindow(store, now);
       if (!extended.ok) { ctx.stderr(`report cutover refused: ${extended.code}`); return 3; }
-      report = buildCutoverReport(db, extended.row!, now);
-      // The extension is intentionally reported as EXTEND, even though the
-      // new window now covers more history for the next report.
-      report.rows = report.rows.map((value) => value.name === 'anthropic:automatic-switches'
-        ? row(value.group, value.name, 'EXTEND', 'cutover window extended once; collect remaining Anthropic coverage', 'insufficient-anthropic-coverage') : value);
       report.lifecycle.windowEnd = extended.row!.windowEnd!;
       report.lifecycle.extendedAt = extended.row!.extendedAt;
       report.ok = false;
@@ -144,7 +141,7 @@ async function execute(args: string[], ctx: CommandContext, deps: ReportCutoverC
     const redacted = JSON.parse(redactSecrets(JSON.stringify(report), ctx.knownSecrets())) as CutoverReport;
     if (json) ctx.stdout(JSON.stringify(redacted));
     else for (const line of formatText(redacted)) ctx.stdout(line);
-    return redacted.rows.some((value) => value.status === 'FAIL') ? 3 : 0;
+    return redacted.rows.some((value) => value.status === 'FAIL') ? 1 : 0;
   } finally { store.close(); }
 }
 
