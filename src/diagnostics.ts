@@ -75,6 +75,7 @@ import { claudeSwitchJournalCheck } from './checks/claude-switch-journal';
 import { journalInProgressCheck } from './checks/journal-in-progress';
 import { journalOrphanedCheck } from './checks/journal-orphaned';
 import { claudeUnclaimedCheck } from './checks/claude-unclaimed';
+import { claudeUnpersistedTokenCheck } from './checks/claude-unpersisted-token';
 import { codexSlotsCheck } from './checks/codex-slots';
 import { codexFirstSwitchCheck } from './checks/codex-first-switch';
 import { undoIncompleteCheck } from './checks/undo-incomplete';
@@ -645,6 +646,8 @@ export async function doctorQlb(
     readLifecyclePhase?: (dbPath: string) => LifecyclePhaseResult;
     /** Test seam for the non-secret Claude unclaimed-stash index root. */
     claudeUnclaimedStashDir?: string;
+    /** Test seam for the database-adjacent, value-free automatic-agent log. */
+    claudeUnpersistedTokenAutoLogPath?: string;
     /** H2 process-table seam; production uses the shared S24 resolver. */
     cswapProcesses?: () => CswapProcess[];
     /** H2 LaunchAgent seam; production runs `launchctl print` only outside test mode. */
@@ -859,6 +862,9 @@ export async function doctorQlb(
     phase,
     options.now?.() ?? Date.now(),
   ));
+  checks.push(claudeUnpersistedTokenCheck(config.dbPath, phase, {
+    autoLogPath: options.claudeUnpersistedTokenAutoLogPath,
+  }));
   checks.push(
     claudeConfigPathCheck(),
     claudeConfigFileCheck(),
