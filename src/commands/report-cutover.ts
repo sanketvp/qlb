@@ -121,7 +121,7 @@ export function buildCutoverReport(db: DatabaseSync, lifecycle: LifecycleRow, no
   };
 }
 
-function appendReceiptRows(rows: CutoverReportRow[], db: DatabaseSync, now: number, doctor: DoctorReport, historyPasses: boolean): void {
+function appendReceiptRows(rows: CutoverReportRow[], db: DatabaseSync, now: number, doctor: DoctorReport, historyPasses: boolean, piLastServedAt: Map<string, string | null>): void {
   rows.push(historyPasses
     ? row('coverage', 'health:final-24h', 'PASS', 'no health-log FAIL follows the last PASS in the final 24 hours')
     : row('coverage', 'health:final-24h', 'FAIL', 'a health-log FAIL follows the last PASS in the final 24 hours', 'health-history-failed'));
@@ -134,7 +134,7 @@ function appendReceiptRows(rows: CutoverReportRow[], db: DatabaseSync, now: numb
   if (doctor.healthLogId == null) rows.push(row('coverage', 'doctor:health-log', 'FAIL', doctor.healthLogError ?? 'doctor health log was not appended', 'doctor-health-log-missing'));
   for (const provider of PI_PROVIDERS) {
     if (configValue(db, `pi.${provider}.state`) !== 'migrated') continue;
-    const recent = hasRecentPiService(configValue(db, `pi.${provider}.lastServedAt`), now);
+    const recent = hasRecentPiService(piLastServedAt.get(provider) ?? null, now);
     rows.push(recent
       ? row('coverage', `pi:${provider}:recent-service`, 'PASS', `Pi ${provider} served within the final 24 hours`)
       : row('coverage', `pi:${provider}:recent-service`, 'FAIL', `Pi ${provider} has no service record in the final 24 hours`, 'no-recent-pi-service'));
@@ -178,9 +178,10 @@ async function execute(args: string[], ctx: CommandContext, deps: ReportCutoverC
     if (now < lifecycle.windowEnd) { ctx.stderr(`report cutover refused: window-not-ended; windowEnd=${new Date(lifecycle.windowEnd).toISOString()}`); return 3; }
     const db = (store as unknown as { db: DatabaseSync }).db;
     const historyPasses = receiptHealthHistory(db, now).passes;
+    const piLastServedAt = new Map(PI_PROVIDERS.map((provider) => [provider, configValue(db, `pi.${provider}.lastServedAt`)]));
     const doctor = await (deps.doctor ?? doctorQlb)(ctx.config, { appendHealthLog: true, now: () => now });
     const receiptRows: CutoverReportRow[] = [];
-    appendReceiptRows(receiptRows, db, now, doctor, historyPasses);
+    appendReceiptRows(receiptRows, db, now, doctor, historyPasses, piLastServedAt);
     const report = buildCutoverReport(db, lifecycle, now, receiptRows);
     if (report.rows.some((value) => value.status === 'EXTEND')) {
       const extended = extendWindow(store, now);

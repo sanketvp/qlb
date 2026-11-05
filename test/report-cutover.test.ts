@@ -453,6 +453,30 @@ test('a migrated Pi provider requires service in the final 24 hours for a receip
   } finally { subject.close(); }
 });
 
+test('a Pi service recorded during doctor does not invalidate the receipt snapshot', async () => {
+  const subject = fixture();
+  try {
+    seed(subject, { piDeferred: true, drill: true });
+    const db = new DatabaseSync(subject.dbPath);
+    setPiMigrated(db, NOW - 1);
+    db.close();
+    const baseDoctor = passingDoctor(subject.dbPath)!;
+    const doctor: ReportCutoverCommandDeps['doctor'] = async (config, options) => {
+      const result = await baseDoctor(config, options);
+      const duringDoctor = new DatabaseSync(subject.dbPath);
+      duringDoctor.prepare("UPDATE config SET value = ? WHERE key = 'pi.anthropic.lastServedAt'").run(String(NOW + 1));
+      duringDoctor.close();
+      return result;
+    };
+    assert.equal(await run(subject, { doctor }), 0);
+    const report = JSON.parse(subject.output[0]!);
+    assert.equal(report.rows.find((value: { name: string }) => value.name === 'pi:anthropic:recent-service').status, 'PASS');
+    const receipt = new DatabaseSync(subject.dbPath, { readOnly: true });
+    assert.equal((receipt.prepare("SELECT value FROM config WHERE key = 'report.receiptAt'").get() as { value: string }).value, String(NOW));
+    receipt.close();
+  } finally { subject.close(); }
+});
+
 test('an invalid L13 receipt does not satisfy strict Codex coverage', async () => {
   const subject = fixture();
   try {
