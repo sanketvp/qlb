@@ -102,6 +102,7 @@ const USAGE = `Usage:
   qlb native-resync --provider anthropic|xai|kimi-coding|openai-codex|openrouter --account <id> [--json] [--db <path>]
   qlb status [--json] [--dashboard|--flat]
   qlb status --switches|--relogins [--window] [--json]
+  qlb report cutover [--json]
   qlb export --cache-only --json
   qlb setup pi|claude-code|codex-cli|generic|hermes [--json]
   qlb resolve --model <modelId> [--fallback m1,m2,...] [--session <id>] [--harness pi|claude-code|codex|dispatch] [--effort <lvl>] [--strategy headroom|spread|round-robin|failover] [--json]
@@ -2171,6 +2172,7 @@ export function gateLifecycleAdmissionCode(gateDbPath: string | undefined, defau
 function lifecycleOperationFor(command: string, args: string[]): LifecycleOperation | null {
   if (command === 'doctor') return 'doctor';
   if (command === 'status') return 'status';
+  if (command === 'report cutover') return 'report-cutover';
   if (command === 'gate') return 'gate';
   if (command === 'cutover') {
     if (args[0] === 'begin') return args.includes('--dry-run') ? 'cutover-begin:dry-run' : 'cutover-begin';
