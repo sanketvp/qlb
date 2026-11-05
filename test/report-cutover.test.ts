@@ -6,7 +6,7 @@ import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 
 import { defaultConfig } from '../src/config';
-import { createReportCutoverCommand } from '../src/commands/report-cutover';
+import { createReportCutoverCommand, type ReportCutoverCommandDeps } from '../src/commands/report-cutover';
 import { runExecutingCommand } from '../src/app';
 import type { CommandContext } from '../src/registry';
 import { openStore } from '../src/store';
@@ -53,18 +53,35 @@ function seed(subject: ReturnType<typeof fixture>, options: { piDeferred?: boole
   } finally { db.close(); }
 }
 
-function run(subject: ReturnType<typeof fixture>): Promise<number | null> {
-  return runExecutingCommand({ command: createReportCutoverCommand({ now: () => NOW }), args: ['--json'] }, subject.context);
+function passingDoctor(dbPath: string, options: { overall?: 'PASS' | 'FAIL'; autoAgent?: 'PASS' | 'FAIL' } = {}): ReportCutoverCommandDeps['doctor'] {
+  return async () => {
+    const db = new DatabaseSync(dbPath);
+    try {
+      const result = db.prepare(`INSERT INTO health_log (ts, phase, overall, failing_json, dead_slots_json)
+        VALUES (?, 'cutover', ?, '[]', '[]')`).run(NOW, options.overall ?? 'PASS');
+      return {
+        command: 'doctor', overall: 'PASS', checks: [], providers: [],
+        s64: { overall: options.overall ?? 'PASS', autoAgent: options.autoAgent ?? 'PASS' },
+        healthLogId: Number(result.lastInsertRowid),
+      };
+    } finally { db.close(); }
+  };
+}
+
+function run(subject: ReturnType<typeof fixture>, deps: ReportCutoverCommandDeps = {}): Promise<number | null> {
+  return runExecutingCommand({ command: createReportCutoverCommand({ now: () => NOW, ...deps }), args: ['--json'] }, subject.context);
 }
 
 function runText(subject: ReturnType<typeof fixture>): Promise<number | null> {
   return runExecutingCommand({ command: createReportCutoverCommand({ now: () => NOW }), args: [] }, subject.context);
 }
 
-function setPiMigrated(db: DatabaseSync): void {
+function setPiMigrated(db: DatabaseSync, lastServedAt?: number): void {
   for (const provider of ['anthropic', 'openai-codex', 'xai', 'kimi-coding', 'openrouter']) {
     db.prepare(`INSERT INTO config (key, value) VALUES (?, 'migrated')
       ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(`pi.${provider}.state`);
+    if (lastServedAt != null) db.prepare(`INSERT INTO config (key, value) VALUES (?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(`pi.${provider}.lastServedAt`, String(lastServedAt));
   }
 }
 
@@ -174,7 +191,7 @@ test('strict Pi and Codex coverage passes only with a valid L13 receipt and real
   try {
     seed(subject, { drill: true });
     const db = new DatabaseSync(subject.dbPath);
-    setPiMigrated(db);
+    setPiMigrated(db, NOW);
     db.prepare("INSERT INTO config (key, value) VALUES ('codex.l13VerifiedAt', ?)").run(String(NOW));
     db.prepare(`INSERT INTO switch_log (ts, provider, from_account, to_account, trigger, outcome, injected)
       VALUES (?, 'openai-codex', 'from', 'to', 'proactive', 'ok', 0)`).run(NOW - 9 * DAY);
@@ -183,6 +200,82 @@ test('strict Pi and Codex coverage passes only with a valid L13 receipt and real
     const report = JSON.parse(subject.output[0]!);
     assert.equal(report.rows.find((value: { name: string }) => value.name === 'codex:L13-switch').status, 'PASS');
     assert.equal(report.rows.filter((value: { name: string }) => value.name.startsWith('pi:')).every((value: { status: string }) => value.status === 'PASS'), true);
+  } finally { subject.close(); }
+});
+
+test('a receipt is created for lifecycle-bound deferred Pi/Codex coverage when doctor passes', async () => {
+  const subject = fixture();
+  try {
+    seed(subject, { piDeferred: true, drill: true });
+    assert.equal(await run(subject, { doctor: passingDoctor(subject.dbPath) }), 0);
+    const db = new DatabaseSync(subject.dbPath, { readOnly: true });
+    const receiptAt = db.prepare("SELECT value FROM config WHERE key = 'report.receiptAt'").get() as { value: string };
+    const receiptId = db.prepare("SELECT value FROM config WHERE key = 'report.receiptHealthLogId'").get() as { value: string };
+    const health = db.prepare('SELECT overall FROM health_log WHERE id = ?').get(Number(receiptId.value)) as { overall: string };
+    db.close();
+    assert.equal(receiptAt.value, String(NOW));
+    assert.equal(health.overall, 'PASS');
+  } finally { subject.close(); }
+});
+
+test('strict missing Pi or Codex evidence remains receipt-ineligible without the lifecycle deferred marker', async () => {
+  const subject = fixture();
+  try {
+    seed(subject, { drill: true });
+    assert.equal(await run(subject, { doctor: passingDoctor(subject.dbPath) }), 1);
+    const db = new DatabaseSync(subject.dbPath, { readOnly: true });
+    assert.equal((db.prepare("SELECT value FROM config WHERE key = 'report.receiptAt'").get() as { value: string }).value, '');
+    db.close();
+  } finally { subject.close(); }
+});
+
+test('a FAIL after the final-24-hour PASS prevents a receipt even when the report doctor passes', async () => {
+  const subject = fixture();
+  try {
+    seed(subject, { piDeferred: true, drill: true });
+    const db = new DatabaseSync(subject.dbPath);
+    db.prepare(`INSERT INTO health_log (ts, phase, overall, failing_json, dead_slots_json) VALUES (?, 'cutover', ?, '[]', '[]')`).run(NOW - 3 * 60 * 60 * 1000, 'PASS');
+    db.prepare(`INSERT INTO health_log (ts, phase, overall, failing_json, dead_slots_json) VALUES (?, 'cutover', ?, '[]', '[]')`).run(NOW - 2 * 60 * 60 * 1000, 'FAIL');
+    db.close();
+    assert.equal(await run(subject, { doctor: passingDoctor(subject.dbPath) }), 0);
+    const report = JSON.parse(subject.output[0]!);
+    assert.equal(report.rows.find((value: { name: string }) => value.name === 'health:final-24h').code, 'health-history-failed');
+  } finally { subject.close(); }
+});
+
+test('a failing doctor clears a prior receipt and a later passing run replaces it', async () => {
+  const subject = fixture();
+  try {
+    seed(subject, { piDeferred: true, drill: true });
+    assert.equal(await run(subject, { doctor: passingDoctor(subject.dbPath) }), 0);
+    assert.equal(await run(subject, { doctor: passingDoctor(subject.dbPath, { autoAgent: 'FAIL' }) }), 0);
+    let db = new DatabaseSync(subject.dbPath, { readOnly: true });
+    assert.equal((db.prepare("SELECT value FROM config WHERE key = 'report.receiptAt'").get() as { value: string }).value, '');
+    db.close();
+    assert.equal(await run(subject, { doctor: passingDoctor(subject.dbPath) }), 0);
+    db = new DatabaseSync(subject.dbPath, { readOnly: true });
+    assert.equal((db.prepare("SELECT value FROM config WHERE key = 'report.receiptAt'").get() as { value: string }).value, String(NOW));
+    db.close();
+  } finally { subject.close(); }
+});
+
+test('a migrated Pi provider requires service in the final 24 hours for a receipt', async () => {
+  const subject = fixture();
+  try {
+    seed(subject, { piDeferred: true, drill: true });
+    const db = new DatabaseSync(subject.dbPath);
+    db.prepare(`INSERT INTO config (key, value) VALUES ('pi.anthropic.state', 'migrated')`).run();
+    db.close();
+    assert.equal(await run(subject, { doctor: passingDoctor(subject.dbPath) }), 0);
+    let report = JSON.parse(subject.output[0]!);
+    assert.equal(report.rows.find((value: { name: string }) => value.name === 'pi:anthropic:recent-service').code, 'no-recent-pi-service');
+    subject.output.length = 0;
+    const db2 = new DatabaseSync(subject.dbPath);
+    db2.prepare("INSERT INTO config (key, value) VALUES ('pi.anthropic.lastServedAt', ?)").run(String(NOW));
+    db2.close();
+    assert.equal(await run(subject, { doctor: passingDoctor(subject.dbPath) }), 0);
+    report = JSON.parse(subject.output[0]!);
+    assert.equal(report.rows.find((value: { name: string }) => value.name === 'pi:anthropic:recent-service').status, 'PASS');
   } finally { subject.close(); }
 });
 

@@ -1,6 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
 
 import { codexL13ReceiptAt } from '../codex-l13-receipt';
+import { doctorQlb, type DoctorReport } from '../diagnostics';
 import { configValue, drillRowsPresent, extendWindow, phase, PI_PROVIDERS, type LifecycleRow } from '../lifecycle';
 import { redactSecrets } from '../redact';
 import { reloginsInWindow } from '../relogin';
@@ -21,7 +22,11 @@ export interface CutoverReport {
   rows: CutoverReportRow[];
 }
 
-export interface ReportCutoverCommandDeps { now?: () => number; }
+export interface ReportCutoverCommandDeps {
+  now?: () => number;
+  /** Test seam; production appends the doctor health-log row itself. */
+  doctor?: (config: CommandContext['config']) => Promise<DoctorReport>;
+}
 
 function row(group: CutoverReportRow['group'], name: string, status: CutoverReportStatus, message: string, code?: string): CutoverReportRow {
   return { group, name, status, ...(code ? { code } : {}), message };
@@ -112,6 +117,66 @@ export function buildCutoverReport(db: DatabaseSync, lifecycle: LifecycleRow, no
   };
 }
 
+function recentHealthHistoryPasses(db: DatabaseSync, now: number): boolean {
+  const since = now - 24 * 60 * 60 * 1000;
+  const lastPass = db.prepare("SELECT ts, id FROM health_log WHERE overall = 'PASS' AND ts >= ? AND ts <= ? ORDER BY ts DESC, id DESC LIMIT 1")
+    .get(since, now) as { ts: number; id: number } | undefined;
+  if (lastPass == null) return true;
+  const laterFailure = db.prepare("SELECT 1 FROM health_log WHERE overall = 'FAIL' AND ts >= ? AND ts <= ? AND (ts > ? OR (ts = ? AND id > ?)) LIMIT 1")
+    .get(since, now, lastPass.ts, lastPass.ts, lastPass.id);
+  return laterFailure == null;
+}
+
+function appendReceiptRows(rows: CutoverReportRow[], db: DatabaseSync, now: number, doctor: DoctorReport, historyPasses: boolean): void {
+  rows.push(historyPasses
+    ? row('coverage', 'health:final-24h', 'PASS', 'no health-log FAIL follows the last PASS in the final 24 hours')
+    : row('coverage', 'health:final-24h', 'FAIL', 'a health-log FAIL follows the last PASS in the final 24 hours', 'health-history-failed'));
+  rows.push(doctor.s64.overall === 'PASS'
+    ? row('coverage', 'doctor:S64', 'PASS', 'doctor S64 verdict passed')
+    : row('coverage', 'doctor:S64', 'FAIL', 'doctor S64 verdict failed', 'doctor-s64-failed'));
+  rows.push(doctor.s64.autoAgent === 'PASS'
+    ? row('coverage', 'doctor:auto-agent', 'PASS', 'doctor automatic-agent verdict passed')
+    : row('coverage', 'doctor:auto-agent', 'FAIL', 'doctor automatic-agent verdict failed', 'doctor-auto-agent-failed'));
+  for (const provider of PI_PROVIDERS) {
+    if (configValue(db, `pi.${provider}.state`) !== 'migrated') continue;
+    const servedAt = Number(configValue(db, `pi.${provider}.lastServedAt`));
+    const recent = Number.isSafeInteger(servedAt) && servedAt >= now - 24 * 60 * 60 * 1000 && servedAt <= now;
+    rows.push(recent
+      ? row('coverage', `pi:${provider}:recent-service`, 'PASS', `Pi ${provider} served within the final 24 hours`)
+      : row('coverage', `pi:${provider}:recent-service`, 'FAIL', `Pi ${provider} has no service record in the final 24 hours`, 'no-recent-pi-service'));
+  }
+}
+
+function receiptEligible(report: CutoverReport, lifecycle: LifecycleRow, db: DatabaseSync): boolean {
+  const lifecycleDeferred = configValue(db, 'cutover.piDeferredAt') === String(lifecycle.cutoverAt);
+  const deferredIsLifecycleBound = (value: CutoverReportRow): boolean => lifecycleDeferred
+    && value.status === 'DEFERRED'
+    && ((value.code === 'pi-deferred' && value.name.startsWith('pi:')) || (value.code === 'codex-deferred' && value.name === 'codex:L13-switch'))
+    && value.group === 'coverage';
+  return report.rows.every((value) => value.status === 'PASS' || deferredIsLifecycleBound(value));
+}
+
+function writeOrClearReceipt(db: DatabaseSync, now: number, healthLogId: number | undefined, eligible: boolean): void {
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    if (eligible && healthLogId != null) {
+      db.prepare(`INSERT INTO config (key, value) VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run('report.receiptAt', String(now));
+      db.prepare(`INSERT INTO config (key, value) VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run('report.receiptHealthLogId', String(healthLogId));
+    } else {
+      db.prepare(`INSERT INTO config (key, value) VALUES (?, '')
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run('report.receiptAt');
+      db.prepare(`INSERT INTO config (key, value) VALUES (?, '')
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run('report.receiptHealthLogId');
+    }
+    db.exec('COMMIT');
+  } catch (error) {
+    db.exec('ROLLBACK');
+    throw error;
+  }
+}
+
 function parse(args: string[]): boolean | null {
   return args.length === 0 ? false : args.length === 1 && args[0] === '--json' ? true : null;
 }
@@ -136,16 +201,24 @@ async function execute(args: string[], ctx: CommandContext, deps: ReportCutoverC
     const now = (deps.now ?? Date.now)();
     if (now < lifecycle.windowEnd) { ctx.stderr(`report cutover refused: window-not-ended; windowEnd=${new Date(lifecycle.windowEnd).toISOString()}`); return 3; }
     const db = (store as unknown as { db: DatabaseSync }).db;
+    const historyPasses = recentHealthHistoryPasses(db, now);
+    const doctor = deps.doctor == null
+      ? await doctorQlb(ctx.config, { appendHealthLog: true, now: () => now })
+      : await deps.doctor(ctx.config);
     const report = buildCutoverReport(db, lifecycle, now);
+    appendReceiptRows(report.rows, db, now, doctor, historyPasses);
     if (report.rows.some((value) => value.status === 'EXTEND')) {
       const extended = extendWindow(store, now);
       if (!extended.ok) { ctx.stderr(`report cutover refused: ${extended.code}`); return 3; }
       report.lifecycle.windowEnd = extended.row!.windowEnd!;
       report.lifecycle.extendedAt = extended.row!.extendedAt;
     }
+    const eligible = receiptEligible(report, lifecycle, db) && doctor.healthLogId != null;
+    writeOrClearReceipt(db, now, doctor.healthLogId, eligible);
     const redacted = JSON.parse(redactSecrets(JSON.stringify(report), ctx.knownSecrets())) as CutoverReport;
     if (json) ctx.stdout(JSON.stringify(redacted));
     else for (const line of formatText(redacted)) ctx.stdout(line);
+    if (!eligible) ctx.stderr(`no receipt (${redacted.rows.find((value) => value.status === 'FAIL' || value.status === 'EXTEND')?.name ?? 'doctor-health-log-missing'})`);
     return redacted.ok ? 0 : 1;
   } finally { store.close(); }
 }
