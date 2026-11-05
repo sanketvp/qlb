@@ -26,6 +26,7 @@ type Fixture = {
   stdout: string[];
   stderr: string[];
   lockCalls: () => number;
+  getConfig: (key: string) => string | null;
 };
 
 const credential = (tag: string): string => buildCredential(tag, {
@@ -127,7 +128,10 @@ async function fixture(
     switchClaude,
     ...overrides,
   });
-  return { command, ctx, stdout, stderr, lockCalls: () => calls };
+  return {
+    command, ctx, stdout, stderr, lockCalls: () => calls,
+    getConfig: (key) => store.getConfig(key),
+  };
 }
 
 async function execute(subject: Fixture, args = ['account-b']): Promise<number> {
@@ -183,6 +187,8 @@ describe('Claude switch lifecycle guards (K5-8)', () => {
       assert.equal(await runAutoCommand(['resume', 'anthropic'], subject.ctx), 3, state);
       assert.deepEqual(subject.stderr, [`qlb auto resume: refused: ${code}`], state);
       assert.equal(subject.lockCalls(), 0, state);
+      assert.equal(subject.getConfig('auto.anthropic.lastResumeAt'), null, state);
+      assert.equal(subject.getConfig('auto.anthropic.suspendedUntil'), null, state);
     }
   });
 

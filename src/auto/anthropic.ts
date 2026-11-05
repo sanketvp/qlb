@@ -394,41 +394,48 @@ function decisionInput(deps: AnthropicTickDeps): AutoswitchInput {
 }
 
 function persistTickState(store: Store, input: AutoswitchInput, decision: AutoswitchDecision, switched: boolean, committedAtMs?: number): void {
-  // After the idle hold, the engine deliberately returns `unknown` without
-  // repeating the start time. Keep that start while this same active
-  // credential remains expired, then clear it on a known reading/account
-  // change/switch.
-  const idleHoldSince = decision.kind === 'stay'
-    ? decision.idleHoldSinceMs ?? (input.activeCredentialExpired ? input.idleHoldSinceMs ?? undefined : undefined)
-    : decision.kind === 'switch' && !switched
-      ? input.idleHoldSinceMs ?? undefined
-      : undefined;
-  const health = decision.unhealthyTicks > 0 || idleHoldSince !== undefined;
-  const { activeAccountId, nowMs } = input;
-  if (health && activeAccountId !== null) {
-    store.setConfig(`${AUTO_PREFIX}unhealthyTicks`, String(decision.unhealthyTicks));
-    store.setConfig(`${AUTO_PREFIX}healthAccount`, activeAccountId);
-    store.setConfig(`${AUTO_PREFIX}healthTickAt`, String(nowMs));
-    setOrDelete(store, `${AUTO_PREFIX}idleHoldSince`, idleHoldSince);
-  } else {
-    for (const key of ['unhealthyTicks', 'idleHoldSince', 'healthAccount', 'healthTickAt']) setOrDelete(store, `${AUTO_PREFIX}${key}`, undefined);
-  }
+  store.runImmediate(() => {
+    // After the idle hold, the engine deliberately returns `unknown` without
+    // repeating the start time. Keep that start while this same active
+    // credential remains expired, then clear it on a known reading/account
+    // change/switch.
+    const idleHoldSince = decision.kind === 'stay'
+      ? decision.idleHoldSinceMs ?? (input.activeCredentialExpired ? input.idleHoldSinceMs ?? undefined : undefined)
+      : decision.kind === 'switch' && !switched
+        ? input.idleHoldSinceMs ?? undefined
+        : undefined;
+    const health = decision.unhealthyTicks > 0 || idleHoldSince !== undefined;
+    const { activeAccountId, nowMs } = input;
+    if (health && activeAccountId !== null) {
+      store.setConfig(`${AUTO_PREFIX}unhealthyTicks`, String(decision.unhealthyTicks));
+      store.setConfig(`${AUTO_PREFIX}healthAccount`, activeAccountId);
+      store.setConfig(`${AUTO_PREFIX}healthTickAt`, String(nowMs));
+      setOrDelete(store, `${AUTO_PREFIX}idleHoldSince`, idleHoldSince);
+    } else {
+      for (const key of ['unhealthyTicks', 'idleHoldSince', 'healthAccount', 'healthTickAt']) setOrDelete(store, `${AUTO_PREFIX}${key}`, undefined);
+    }
 
-  if (decision.kind === 'parked') {
-    setOrDelete(store, `${AUTO_PREFIX}parkedUntil`, decision.parkedUntilMs);
-  } else if (decision.kind === 'switch' && decision.reason === 'parked' && !switched) {
-    // A failed parked operation has not consumed this reset; retaining the
-    // prior value makes the engine retry it on the next tick.
-  } else {
-    setOrDelete(store, `${AUTO_PREFIX}parkedUntil`, decision.kind === 'switch' && switched ? decision.parkedUntilMs : undefined);
-  }
-  const suspendedUntil = decision.kind === 'stay' ? decision.suspendedUntilMs : undefined;
-  if (suspendedUntil !== undefined) store.setConfig(`${AUTO_PREFIX}suspendedUntil`, String(suspendedUntil));
-  else if (configNumber(store, `${AUTO_PREFIX}suspendedUntil`) !== undefined && configNumber(store, `${AUTO_PREFIX}suspendedUntil`)! <= nowMs) {
-    setOrDelete(store, `${AUTO_PREFIX}suspendedUntil`, undefined);
-    store.setConfig(`${AUTO_PREFIX}lastSuspensionEnd`, String(nowMs));
-  }
-  if (switched) store.setConfig(`${AUTO_PREFIX}lastSwitchAt`, String(committedAtMs ?? nowMs));
+    if (decision.kind === 'parked') {
+      setOrDelete(store, `${AUTO_PREFIX}parkedUntil`, decision.parkedUntilMs);
+    } else if (decision.kind === 'switch' && decision.reason === 'parked' && !switched) {
+      // A failed parked operation has not consumed this reset; retaining the
+      // prior value makes the engine retry it on the next tick.
+    } else {
+      setOrDelete(store, `${AUTO_PREFIX}parkedUntil`, decision.kind === 'switch' && switched ? decision.parkedUntilMs : undefined);
+    }
+    const suspendedUntil = decision.kind === 'stay' ? decision.suspendedUntilMs : undefined;
+    // A resume can commit after this tick derived a breaker decision. Re-read
+    // both keys while holding the write transaction so this tick never puts
+    // back a suspension that the operator has just cleared.
+    const suspensionStateUnchanged = configNumber(store, `${AUTO_PREFIX}suspendedUntil`) === (input.suspendedUntilMs ?? undefined)
+      && configNumber(store, `${AUTO_PREFIX}lastResumeAt`) === (input.lastResumeAtMs ?? undefined);
+    if (suspendedUntil !== undefined && suspensionStateUnchanged) store.setConfig(`${AUTO_PREFIX}suspendedUntil`, String(suspendedUntil));
+    else if (configNumber(store, `${AUTO_PREFIX}suspendedUntil`) !== undefined && configNumber(store, `${AUTO_PREFIX}suspendedUntil`)! <= nowMs) {
+      setOrDelete(store, `${AUTO_PREFIX}suspendedUntil`, undefined);
+      store.setConfig(`${AUTO_PREFIX}lastSuspensionEnd`, String(nowMs));
+    }
+    if (switched) store.setConfig(`${AUTO_PREFIX}lastSwitchAt`, String(committedAtMs ?? nowMs));
+  });
 }
 
 /**
