@@ -318,7 +318,7 @@ test('a production keychain-helper warning prevents a receipt', async () => {
     assert.equal(await runProduction(subject, {
       command: () => '', hostCommand: () => '', hostPlatform: 'darwin', piProcessList: () => '',
       cswapAgentStatus: () => 'not-loaded', cswapProcesses: () => [], keychain: new MockKeychain(),
-      configReader: (key) => key === 'keychain.liveItemsReadAuthorizedAt'
+      configReader: (key: string) => key === 'keychain.liveItemsReadAuthorizedAt'
         ? String(NOW)
         : key === 'keychain.liveItemsReadAuthorizedIdentityHash' ? 'fixture' : null,
       helperSigning: () => ({ authority: 'QLB Keychain Helper', binaryHash: 'fixture', identityHash: 'fixture' }),
