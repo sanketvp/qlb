@@ -133,8 +133,7 @@ export function cacheOnlyExport(now = Date.now(), dbPath = exportDbPath()): Cach
       : [];
     const legacyTargets = inventory ? [] : targetRows;
     const members = inventory ? inventoryMembers : legacyTargets;
-    const complete = inventory !== undefined && inventory.complete !== 0 && inventoryMembers.length > 0
-      && inventoryMembers.every((member) => member.slot_account_id !== null);
+    const complete = inventory !== undefined && inventory.complete !== 0;
     const targets = new Map(targetRows.map((target) => [target.target, target.slot_account_id]));
     const observed = new Map(inventoryMembers.map((member) => [member.target, member.slot_account_id]));
     const drift = inventory ? {

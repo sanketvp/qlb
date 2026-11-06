@@ -49,18 +49,19 @@ function fixtureDb(): { path: string; freshAt: number; staleAt: number; poolReco
     beginCutover(store, now);
     store.upsertAccount('anthropic-a', 'anthropic', 'account-a');
     store.upsertAccount('anthropic-b', 'anthropic', 'account-b');
-    store.replacePiExportTargets('anthropic', [
-      { provider: 'anthropic', target: 'pi-a', slotAccountId: 'anthropic-a', lineageFp: 'not-exported-a', recordedAt: poolRecordedAt },
-      { provider: 'anthropic', target: 'pi-b', slotAccountId: 'anthropic-b', lineageFp: 'not-exported-b', recordedAt: poolRecordedAt },
-    ]);
-    const db = (store as unknown as { db: DatabaseSync }).db;
-    db.prepare(`INSERT INTO pi_export_inventories (provider, recorded_at, complete) VALUES ('anthropic', ?, 1)`)
-      .run(poolRecordedAt);
-    const insertMember = db.prepare(`INSERT INTO pi_export_inventory_members (provider, target, slot_account_id)
-      VALUES ('anthropic', ?, ?)`);
-    insertMember.run('pi-a', 'anthropic-a');
-    insertMember.run('pi-b', 'anthropic-b');
-    insertMember.run('pi-unmatched', null);
+    store.recordPiExportTargetsIfEmptyClassified('anthropic', () => ({
+      recordedAt: poolRecordedAt,
+      complete: false,
+      targets: [
+        { provider: 'anthropic' as const, target: 'pi-a', slotAccountId: 'anthropic-a', lineageFp: 'not-exported-a', recordedAt: poolRecordedAt },
+        { provider: 'anthropic' as const, target: 'pi-b', slotAccountId: 'anthropic-b', lineageFp: 'not-exported-b', recordedAt: poolRecordedAt },
+      ],
+      members: [
+        { target: 'pi-a', slotAccountId: 'anthropic-a' },
+        { target: 'pi-b', slotAccountId: 'anthropic-b' },
+        { target: 'pi-unmatched', slotAccountId: null },
+      ],
+    }), () => ({ ok: true }));
     store.upsertSnapshot('anthropic-a', 'five-hour', {
       usedPct: 12,
       remaining: 88,
@@ -199,20 +200,6 @@ describe('cache-only export', () => {
       store.close();
     }
     assert.equal(cacheOnlyExport(Date.now(), fixture.path).surfaces.length, 1);
-  });
-
-  it('downgrades a legacy empty inventory to incomplete', () => {
-    const fixture = fixtureDb();
-    const db = new DatabaseSync(fixture.path);
-    try {
-      db.exec("DELETE FROM pi_export_inventory_members WHERE provider = 'anthropic'");
-    } finally {
-      db.close();
-    }
-    assert.deepEqual(cacheOnlyExport(Date.now(), fixture.path).surfaces, [{
-      id: 'anthropic-pi-pool', source: 'pool-inventory', recordedAt: fixture.poolRecordedAt,
-      complete: false, drift: { added: 0, removed: 2, remapped: 0 }, members: [],
-    }]);
   });
 
   it('refuses a database schema newer than this build without output rows', () => {
