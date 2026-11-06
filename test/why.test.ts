@@ -18,7 +18,7 @@ function reading(
 ): BucketReading {
   return {
     usedPct,
-    source: 'poll',
+    source: 'provider-poll',
     confidence,
     fetchedAt: Date.now(),
   };
@@ -417,22 +417,22 @@ describe('qlb why CLI', () => {
     const dir = mkdtempSync(join(tmpdir(), 'qlb-why-model-'));
     const dbPath = join(dir, 'qlb.db');
     const store = openStore(dbPath);
-    store.upsertAccount('B', 'xai', 'B');
+    store.upsertAccount('B', 'openai-codex', 'B');
     store.upsertAccount('A', 'anthropic', 'A');
-    store.upsertSnapshot('B', 'tokens', {
+    store.upsertSnapshot('B', 'primary', {
       usedPct: 10,
-      source: 'headers',
-      confidence: 'advisory',
+      source: 'provider-poll',
+      confidence: 'authoritative',
       fetchedAt: Date.now(),
     });
-    store.upsertSnapshot('B', 'requests', {
+    store.upsertSnapshot('B', 'secondary', {
       usedPct: 10,
-      source: 'headers',
-      confidence: 'advisory',
+      source: 'provider-poll',
+      confidence: 'authoritative',
       fetchedAt: Date.now(),
     });
     resolveFromSnapshots({
-      model: 'grok-4.6',
+      model: 'gpt-5.4',
       snapshots: snapshotsFromStore(store),
       store,
     });
@@ -441,7 +441,7 @@ describe('qlb why CLI', () => {
     const result = runCli(['why', '--json'], env);
     assert.equal(result.status, 0, result.stderr);
     const body = JSON.parse(result.stdout) as { model: string; modelSource: string };
-    assert.equal(body.model, 'grok-4.6');
+    assert.equal(body.model, 'gpt-5.4');
     assert.equal(body.modelSource, 'last routing decision');
   });
 

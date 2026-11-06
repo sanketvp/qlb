@@ -1662,6 +1662,11 @@ export class Store {
     );
   }
 
+  /** Retain failed-probe fallback rows for display, but never let them route. */
+  markSnapshotsNonActionable(accountId: string): void {
+    this.db.prepare("UPDATE snapshots SET confidence = 'unknown' WHERE account_id = ?").run(accountId);
+  }
+
   getSnapshot(accountId: string, bucket: string): BucketReading | null {
     const row = this.getSnapStmt.get(accountId, bucket) as
       | {

@@ -11,7 +11,7 @@ function reading(
 ): BucketReading {
   const r: BucketReading = {
     usedPct,
-    source: 'poll',
+    source: 'provider-poll',
     confidence,
     fetchedAt: Date.now(),
   };
@@ -32,11 +32,17 @@ function seed(
 }
 
 function codex(accountId: string): AccountSnapshot {
+  const reading: BucketReading = {
+    usedPct: 10,
+    source: 'provider-poll',
+    confidence: 'authoritative',
+    fetchedAt: Date.now(),
+  };
   return {
     accountId,
     provider: 'openai-codex',
     label: accountId,
-    buckets: {},
+    buckets: { primary: reading, secondary: { ...reading } },
   };
 }
 
@@ -377,12 +383,7 @@ describe('qlb resolve — Codex bare-id aliases', () => {
 });
 
 describe('qlb resolve — Codex account ownership', () => {
-  const codexSnapshot: AccountSnapshot = {
-    accountId: 'fixture-user:fixture-account',
-    provider: 'openai-codex',
-    label: 'fixture-user:fixture-account',
-    buckets: {},
-  };
+  const codexSnapshot: AccountSnapshot = codex('fixture-user:fixture-account');
 
   it('resolve skips a Codex slot-id snapshot that has no accounts row', () => {
     const store = openStore(':memory:');
@@ -395,8 +396,8 @@ describe('qlb resolve — Codex account ownership', () => {
 
       assert.equal(decision.ok, false);
       if (decision.ok) return;
-      assert.equal(decision.error, 'EXHAUSTED');
-      assert.equal(store.listRoutingDecisions(1)[0]?.account_id, null);
+      assert.equal(decision.error, 'UNAVAILABLE');
+      assert.equal(store.listRoutingDecisions(1)[0]?.account_id ?? null, null);
     } finally {
       store.close();
     }
@@ -447,7 +448,7 @@ describe('qlb resolve — Codex account ownership', () => {
     assert.equal(decision.accountId, codexSnapshot.accountId);
   });
 
-  it('non-Codex snapshots without an accounts row are unchanged', () => {
+  it('non-Codex snapshots without a provider quota reading are unavailable', () => {
     const store = openStore(':memory:');
     try {
       const xaiSnapshot: AccountSnapshot = {
@@ -462,9 +463,9 @@ describe('qlb resolve — Codex account ownership', () => {
         store,
       });
 
-      assert.equal(decision.ok, true);
-      if (!decision.ok) return;
-      assert.equal(decision.accountId, xaiSnapshot.accountId);
+      assert.equal(decision.ok, false);
+      if (decision.ok) return;
+      assert.equal(decision.error, 'UNAVAILABLE');
     } finally {
       store.close();
     }

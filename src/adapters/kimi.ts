@@ -70,7 +70,7 @@ function toReading(amount: KimiAmount, fetchedAt: number, windowMin?: number): B
     limit,
     remaining,
     resetAt: parseResetAt(amount.resetTime),
-    source: 'poll',
+    source: 'provider-poll',
     confidence: 'authoritative',
     fetchedAt,
   };
@@ -176,6 +176,9 @@ export const kimiAdapter: Adapter = {
         },
       });
 
+      if (probeOutcome === 'cached-after-failure') {
+        getStore().markSnapshotsNonActionable(claimId);
+      }
       const probe = probeOutcome
         ? {
             outcome: probeOutcome,

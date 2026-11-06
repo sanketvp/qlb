@@ -259,7 +259,7 @@ export function parseUsageHeaders(
     if (!Number.isFinite(usedPct)) continue;
     const reading: BucketReading = {
       usedPct,
-      source: 'headers',
+      source: 'provider-headers',
       confidence: 'authoritative',
       fetchedAt: now,
     };
@@ -276,7 +276,7 @@ export function parseUsageHeaders(
       used: reqLim - reqRem,
       limit: reqLim,
       remaining: reqRem,
-      source: 'headers',
+      source: 'provider-headers',
       confidence: 'advisory',
       fetchedAt: now,
     };
@@ -679,6 +679,13 @@ export class LoopbackProxy {
         sendJson(req, res, 503, {
           error: 'PINNED_UNAVAILABLE',
           accountId: decision.accountId,
+          reason: decision.reason,
+        });
+        return;
+      }
+      if (decision.error === 'UNAVAILABLE') {
+        sendJson(req, res, 503, {
+          error: 'UNAVAILABLE',
           reason: decision.reason,
         });
         return;

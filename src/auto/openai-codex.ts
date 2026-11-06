@@ -50,7 +50,7 @@ function readingsFrom(result: CodexUsageProbeResult, nowMs: number): Record<stri
     usedPct: window.usedPct,
     ...(window.resetAt === undefined ? {} : { resetAt: window.resetAt }),
     fetchedAt: nowMs,
-    source: 'poll' as const,
+    source: 'provider-poll' as const,
     confidence: 'authoritative' as const,
   }]));
 }

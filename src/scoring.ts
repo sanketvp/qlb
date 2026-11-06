@@ -1,8 +1,6 @@
 import { createHash } from 'node:crypto';
 import type { AccountSnapshot, Adapter, BucketReading } from './types';
 
-/** Spec §4.3.1 Rule S / §4.4. Far below any real (positive) headroom score. */
-export const UNKNOWN_SCORE = 1;
 export const STALE_DISCOUNT = 0.5;
 export const WEEKLY_SCARCITY = 0.6;
 export const FIVE_H_SCARCITY = 1.0;
@@ -118,7 +116,7 @@ export function confidenceFactor(confidence: BucketReading['confidence']): numbe
  *   headroom_b = ceiling − usedPct_b
  *   discount_b = 1.0 (5h-class) | 0.6 (weekly-class)
  *   f_b        = 1.0 (authoritative) | 0.5 (stale)
- * If no bucket is scored, return unknownScore (default 1).
+ * If no bucket is scored, return negative infinity so it cannot select a route.
  */
 export function scoreAccount(
   snapshot: AccountSnapshot,
@@ -138,7 +136,7 @@ export function scoreAccount(
     const headroom = ceiling - bucket.usedPct;
     terms.push(discount * headroom * f);
   }
-  if (terms.length === 0) return UNKNOWN_SCORE;
+  if (terms.length === 0) return Number.NEGATIVE_INFINITY;
   // Collapse IEEE dust (e.g. 0.6×62 → 37.199999999999996) so reason strings stay readable.
   return Math.round(Math.min(...terms) * 1e10) / 1e10;
 }

@@ -6,6 +6,7 @@ import {
   type Strategy,
 } from './scoring';
 import { findUniqueCodexAlias, isFullyExhausted, pickAccount } from './strategies';
+import { routingAuthority } from './routing-authority';
 import { ROUTING_DECISION_MODES, type Store } from './store';
 
 export { ROUTING_DECISION_MODES };
@@ -54,6 +55,15 @@ export interface ResolveExhausted {
   decisionId?: number;
 }
 
+export interface ResolveUnavailable {
+  ok: false;
+  error: 'UNAVAILABLE';
+  requestedModel: string;
+  reason: string;
+  candidates: AccountSnapshot[];
+  decisionId?: number;
+}
+
 export interface ResolvePinnedUnavailable {
   ok: false;
   error: 'PINNED_UNAVAILABLE';
@@ -63,7 +73,9 @@ export interface ResolvePinnedUnavailable {
   decisionId?: number;
 }
 
-export type ResolveDecision = ResolveOk | ResolveExhausted | ResolvePinnedUnavailable;
+export type ResolveDecision = ResolveOk | ResolveExhausted | ResolveUnavailable | ResolvePinnedUnavailable;
+
+export const PROVIDER_REFRESH_REQUIRED = 'fresh provider quota reading required; run qlb refresh --allow-probe';
 
 export function findEarliestReset(snapshots: AccountSnapshot[]): EarliestReset | null {
   let best: EarliestReset | null = null;
@@ -96,6 +108,24 @@ function snapshotJson(decision: ResolveDecision): string {
         error: 'PINNED_UNAVAILABLE',
         accountId: decision.accountId,
         reason: decision.reason,
+      });
+    }
+    if (decision.error === 'UNAVAILABLE') {
+      return JSON.stringify({
+        error: 'UNAVAILABLE',
+        reason: decision.reason,
+        candidates: decision.candidates.map((s) => ({
+          accountId: s.accountId,
+          provider: s.provider,
+          buckets: Object.fromEntries(Object.entries(s.buckets).map(([k, v]) => [k, {
+            usedPct: v.usedPct,
+            confidence: v.confidence,
+            source: v.source,
+            fetchedAt: v.fetchedAt,
+            ageMs: v.fetchedAt ? now - v.fetchedAt : null,
+            resetAt: v.resetAt,
+          }])),
+        })),
       });
     }
     return JSON.stringify({
@@ -182,8 +212,8 @@ function record(store: Store | undefined, req: ResolveRequest, decision: Resolve
     effort: req.effort,
     served_model: null,
     account_id: null,
-    mode: 'exhausted',
-    reason: 'EXHAUSTED',
+    mode: decision.error === 'UNAVAILABLE' ? 'unavailable' : 'exhausted',
+    reason: decision.error === 'UNAVAILABLE' ? decision.reason : 'EXHAUSTED',
     snapshot_json: snapshotJson(decision),
     strategy: req.strategy ?? 'headroom',
     provider: providerForModel(req.model),
@@ -247,6 +277,10 @@ function resolvePinned(
     const candidateModel = chain[i];
     const provider = providerForModel(candidateModel);
     if (!provider || snap.provider !== provider) continue;
+    const authority = routingAuthority(snap, candidateModel);
+    if (!authority.eligible) {
+      return unavailable(`pinned account unavailable: ${pinnedId} ${PROVIDER_REFRESH_REQUIRED} (${authority.reason})`);
+    }
     if (isFullyExhausted(snap, candidateModel)) continue;
     const score = scoreAccount(snap, candidateModel, ALL_IN_CEILING);
     const substituted = i > 0;
@@ -291,7 +325,7 @@ export function resolveFromSnapshots(req: ResolveRequest): ResolveDecision {
   if (pinned) return pinned;
 
   const { reserved, drainFirst } = activeOverrideSets(req.store);
-  let lastCandidates: AccountSnapshot[] = [];
+  let authorityCandidates: AccountSnapshot[] = [];
 
   for (let i = 0; i < chain.length; i++) {
     const candidateModel = chain[i];
@@ -305,13 +339,15 @@ export function resolveFromSnapshots(req: ResolveRequest): ResolveDecision {
           s.provider !== 'openai-codex' ||
           req.store.getAccount(s.accountId)?.provider === 'openai-codex'),
     );
-    lastCandidates = candidates;
+    const eligible = candidates.filter((snapshot) => routingAuthority(snapshot, candidateModel).eligible);
+    authorityCandidates = authorityCandidates.concat(eligible);
     const picked = pickAccount(strategy, {
-      snapshots: candidates,
+      snapshots: eligible,
       model: candidateModel,
       session: req.session,
       store: req.store,
       drainFirstIds: drainFirst,
+      aliasSnapshots: candidates,
       persist: req.persist,
     });
     if (!picked) continue;
@@ -348,11 +384,23 @@ export function resolveFromSnapshots(req: ResolveRequest): ResolveDecision {
     return decision;
   }
 
+  if (authorityCandidates.length === 0) {
+    const unavailable: ResolveUnavailable = {
+      ok: false,
+      error: 'UNAVAILABLE',
+      requestedModel: req.model,
+      reason: PROVIDER_REFRESH_REQUIRED,
+      candidates: req.snapshots,
+    };
+    unavailable.decisionId = record(req.store, req, unavailable);
+    return unavailable;
+  }
+
   const exhausted: ResolveExhausted = {
     ok: false,
     error: 'EXHAUSTED',
     requestedModel: req.model,
-    earliestReset: findEarliestReset(req.snapshots.length ? req.snapshots : lastCandidates),
+    earliestReset: findEarliestReset(authorityCandidates),
     candidates: req.snapshots,
   };
   exhausted.decisionId = record(req.store, req, exhausted);

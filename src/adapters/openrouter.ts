@@ -72,7 +72,7 @@ export function parseOpenRouterCredits(
       used: totalUsage,
       limit: totalCredits,
       remaining: totalCredits - totalUsage,
-      source: 'poll',
+      source: 'provider-poll',
       confidence: 'authoritative',
       fetchedAt,
       detail: CREDIT_DETAIL,
@@ -151,6 +151,9 @@ export function createOpenRouterAdapter(
           },
         });
 
+        if (probeOutcome === 'cached-after-failure') {
+          getStore().markSnapshotsNonActionable(ACCOUNT_ID);
+        }
         const probe = probeOutcome
           ? {
               outcome: probeOutcome,

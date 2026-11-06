@@ -1387,6 +1387,11 @@ function printResolveHuman(decision: ReturnType<typeof resolveFromSnapshots>): v
       console.log(decision.reason);
       return;
     }
+    if (decision.error === 'UNAVAILABLE') {
+      console.log('UNAVAILABLE');
+      console.log(decision.reason);
+      return;
+    }
     console.log('EXHAUSTED');
     if (decision.earliestReset) {
       console.log(
@@ -1424,6 +1429,21 @@ function printResolveJson(decision: ReturnType<typeof resolveFromSnapshots>): vo
             error: 'PINNED_UNAVAILABLE',
             requestedModel: decision.requestedModel,
             accountId: decision.accountId,
+            reason: decision.reason,
+            decisionId: decision.decisionId,
+          },
+          null,
+          2,
+        ),
+      );
+      return;
+    }
+    if (decision.error === 'UNAVAILABLE') {
+      console.log(
+        JSON.stringify(
+          {
+            error: 'UNAVAILABLE',
+            requestedModel: decision.requestedModel,
             reason: decision.reason,
             decisionId: decision.decisionId,
           },

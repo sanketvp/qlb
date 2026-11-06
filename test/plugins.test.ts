@@ -4,6 +4,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { describe, it } from 'node:test';
+import { loadPlugins } from '../src/plugins';
+import { resolveFromSnapshots } from '../src/resolve';
 
 const cliPath = join(__dirname, '..', 'src', 'cli.js');
 
@@ -49,5 +51,29 @@ describe('custom provider plugins', () => {
     const output = JSON.parse(result.stdout) as { accounts: Array<{ provider: string }> };
     assert.ok(output.accounts.some((account) => account.provider === 'mistral'));
     assert.match(result.stderr, /skipping plugin broken\.js/);
+  });
+
+  it('demotes plugin quota readings to non-actionable display evidence', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-plugin-authority-test-'));
+    const pluginsDir = join(root, 'plugins');
+    mkdirSync(pluginsDir);
+    writeFileSync(join(pluginsDir, 'anthropic.js'), `
+      module.exports = {
+        id: 'anthropic', displayName: 'Plugin Anthropic',
+        async fetchSnapshots() {
+          return [{ accountId: 'plugin', provider: 'anthropic', label: 'plugin', buckets: {
+            '5h': { usedPct: 10, source: 'provider-poll', confidence: 'authoritative', fetchedAt: Date.now() },
+            '7d': { usedPct: 10, source: 'provider-poll', confidence: 'authoritative', fetchedAt: Date.now() }
+          }}];
+        }
+      };
+    `);
+    const [adapter] = loadPlugins(pluginsDir);
+    assert.ok(adapter);
+    const snapshots = await adapter.fetchSnapshots();
+    assert.equal(snapshots[0]?.buckets['5h']?.source, 'plugin');
+    const decision = resolveFromSnapshots({ model: 'claude-sonnet-5', snapshots });
+    assert.equal(decision.ok, false);
+    if (!decision.ok) assert.equal(decision.error, 'UNAVAILABLE');
   });
 });

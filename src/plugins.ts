@@ -35,7 +35,17 @@ function safePluginAdapter(adapter: Adapter, fileName: string, warn: PluginWarni
         if (!Array.isArray(snapshots)) {
           throw new Error('fetchSnapshots() did not return an array');
         }
-        return snapshots;
+        // Plugin-provided readings remain visible, but cannot self-assert the
+        // core-owned provider receipt required for routing authority.
+        return snapshots.map((snapshot) => ({
+          ...snapshot,
+          buckets: Object.fromEntries(
+            Object.entries(snapshot.buckets ?? {}).map(([bucket, reading]) => [
+              bucket,
+              { ...reading, source: 'plugin' as const, confidence: 'unknown' as const },
+            ]),
+          ),
+        }));
       } catch (err) {
         const reason = err instanceof Error ? err.message : String(err);
         warn(`qlb: plugin ${fileName} failed: ${reason}`);

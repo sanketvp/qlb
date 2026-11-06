@@ -67,7 +67,7 @@ function newestFetchedAt(
   include: (label: string) => boolean,
 ): number | undefined {
   return Object.entries(snapshot).reduce<number | undefined>((newest, [label, reading]) =>
-    reading.source !== 'poll' || !include(label) ? newest : newest === undefined ? reading.fetchedAt : Math.max(newest, reading.fetchedAt), undefined);
+    (reading.source !== 'poll' && reading.source !== 'provider-poll') || !include(label) ? newest : newest === undefined ? reading.fetchedAt : Math.max(newest, reading.fetchedAt), undefined);
 }
 
 function earliestResetAt(
@@ -76,7 +76,7 @@ function earliestResetAt(
   newest: number | undefined,
 ): number | undefined {
   return Object.entries(snapshot).reduce<number | undefined>((earliest, [label, reading]) =>
-    reading.source !== 'poll' || !include(label) || reading.fetchedAt !== newest || reading.resetAt === undefined
+    (reading.source !== 'poll' && reading.source !== 'provider-poll') || !include(label) || reading.fetchedAt !== newest || reading.resetAt === undefined
       ? earliest
       : earliest === undefined ? reading.resetAt : Math.min(earliest, reading.resetAt), undefined);
 }
@@ -106,7 +106,7 @@ export function projectAnthropicUsageReadings(
   const newest = newestFetchedAt(snapshot, include);
   const snapshotResetAt = earliestResetAt(snapshot, include, newest);
   return Object.fromEntries(Object.entries(snapshot).flatMap(([label, reading]) => {
-    if (reading.source !== 'poll' || !include(label)) return [];
+    if ((reading.source !== 'poll' && reading.source !== 'provider-poll') || !include(label)) return [];
     const confidence = anthropicUsageConfidence(row, reading, snapshotResetAt, nowS);
     return confidence === 'unknown' ? [] : [[label, { ...reading, confidence }]];
   }));
@@ -259,7 +259,7 @@ function readOnlyStoreData(dbPath: string): {
       FROM claude_slots`).all() as Array<Record<string, unknown>>;
     const snapshots = new Map<string, Record<string, BucketReading>>();
     const snapshotRows = db.prepare(`SELECT account_id, bucket, used_pct, used, limit_val, remaining,
-      reset_at, fetched_at, source, confidence FROM snapshots WHERE source = 'poll'`).all() as Array<Record<string, unknown>>;
+      reset_at, fetched_at, source, confidence FROM snapshots WHERE source IN ('poll', 'provider-poll')`).all() as Array<Record<string, unknown>>;
     for (const row of snapshotRows) {
       const accountId = String(row.account_id);
       const reading: BucketReading = {
