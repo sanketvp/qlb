@@ -44,7 +44,7 @@ module.exports = {
       buckets: {
         monthly: {
           usedPct,
-          source: 'poll',
+          source: 'provider-poll',
           confidence: 'authoritative',
           fetchedAt
         }
@@ -76,8 +76,12 @@ The returned `accounts` list will include `provider: "mistral"`. Syntax errors, 
 A bucket requires:
 
 - `usedPct`: percentage consumed, or `null` when unknown
-- `source`: `poll`, `headers`, or `error`
+- `source`: `provider-poll`, `provider-headers`, `poll`, `headers`, or `error`
 - `confidence`: `authoritative`, `advisory`, `stale`, or `unknown`
 - `fetchedAt`: Unix epoch milliseconds
 
 Optional fields include `used`, `limit`, `remaining`, `resetAt`, `windowMin`, and `detail`. Do not return secrets in labels, errors, details, or other snapshot fields because status output may be logged.
+
+Only fresh `authoritative` readings with source `provider-poll` or
+`provider-headers` can admit an account for routing. Other source labels remain
+available for display and diagnostic data.

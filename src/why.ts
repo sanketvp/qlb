@@ -6,6 +6,7 @@ import {
 } from './resolve';
 import { ALL_IN_CEILING, scoreAccount, type Strategy } from './scoring';
 import { isFullyExhausted } from './strategies';
+import { routingAuthority } from './routing-authority';
 import type { Store } from './store';
 import type { AccountSnapshot } from './types';
 
@@ -26,7 +27,7 @@ export interface WhyReport {
   strategy: Strategy | 'pin';
   score: number | null;
   mode?: string;
-  error: 'EXHAUSTED' | 'PINNED_UNAVAILABLE' | null;
+  error: 'EXHAUSTED' | 'UNAVAILABLE' | 'PINNED_UNAVAILABLE' | null;
   reason: string | null;
   losers: WhyLoser[];
   observations: ObservationSummary[];
@@ -117,6 +118,14 @@ function describeLoser(
       detail: `provider ${snap.provider} does not serve ${ctx.model}`,
     };
   }
+  const authority = routingAuthority(snap, ctx.model);
+  if (!authority.eligible) {
+    return {
+      accountId: snap.accountId,
+      reason: 'unavailable',
+      detail: `non-actionable: ${authority.reason}`,
+    };
+  }
   if (isFullyExhausted(snap, ctx.model)) {
     return {
       accountId: snap.accountId,
@@ -189,16 +198,12 @@ export function explainWhy(req: WhyRequest): WhyReport {
   const ceiling = decision.ok ? decision.ceiling : ALL_IN_CEILING;
   const servedModel = decision.ok ? decision.servedModel : req.model;
   const reportStrategy = decision.ok ? decision.strategy : pinnedTo ? 'pin' : strategy;
-  const error = decision.ok
-    ? null
-    : decision.error === 'PINNED_UNAVAILABLE'
-      ? 'PINNED_UNAVAILABLE'
-      : 'EXHAUSTED';
+  const error = decision.ok ? null : decision.error;
   const reason = decision.ok
     ? decision.reason
-    : decision.error === 'PINNED_UNAVAILABLE'
-      ? decision.reason
-      : 'EXHAUSTED';
+    : decision.error === 'EXHAUSTED'
+      ? 'EXHAUSTED'
+      : decision.reason;
 
   const losers = req.snapshots
     .filter((s) => s.accountId !== winnerId)

@@ -31,9 +31,7 @@ import {
   type ResyncResult,
 } from './native-resync';
 import {
-  CSWAP_ACTIVE_ID,
   CSWAP_ANTHROPIC_STORE,
-  fingerprintAccess,
   isConsumedState,
   prepareConsumeSnapshots,
 } from './cswap-consume';
@@ -102,7 +100,6 @@ export interface ProxyOptions {
    * Optional. When set, an upstream 401 triggers exactly one native-resync
    * attempt and, if the credential actually drifted, one retry of the same
    * request. Tests inject a mock; production wires `bindDetectAndResync`.
-   * Never used for `cswap-active` (consume re-GET instead).
    */
   resyncFromNative?: ResyncFromNative;
   upstreams?: {
@@ -259,7 +256,7 @@ export function parseUsageHeaders(
     if (!Number.isFinite(usedPct)) continue;
     const reading: BucketReading = {
       usedPct,
-      source: 'headers',
+      source: 'provider-headers',
       confidence: 'authoritative',
       fetchedAt: now,
     };
@@ -276,7 +273,7 @@ export function parseUsageHeaders(
       used: reqLim - reqRem,
       limit: reqLim,
       remaining: reqRem,
-      source: 'headers',
+      source: 'provider-headers',
       confidence: 'advisory',
       fetchedAt: now,
     };
@@ -683,6 +680,13 @@ export class LoopbackProxy {
         });
         return;
       }
+      if (decision.error === 'UNAVAILABLE') {
+        sendJson(req, res, 503, {
+          error: 'UNAVAILABLE',
+          reason: decision.reason,
+        });
+        return;
+      }
       sendJson(req, res, 503, {
         error: 'EXHAUSTED',
         earliestReset: decision.earliestReset,
@@ -722,15 +726,6 @@ export class LoopbackProxy {
 
     const target = upstreamUrl(harness, pathname, this.upstreams);
     const t0 = Date.now();
-    const sendWithCredential = async (token: string): Promise<IncomingMessage> => {
-      extra.authorization = `Bearer ${token}`;
-      return requestUpstream(
-        target,
-        'POST',
-        forwardHeaders(req.headers, extra, forwardBody.length),
-        forwardBody,
-      );
-    };
     const requestOnce = async (): Promise<IncomingMessage> => {
       extra.authorization = `Bearer ${await this.getCredential(decision.accountId)}`;
       return requestUpstream(
@@ -742,45 +737,7 @@ export class LoopbackProxy {
     };
     let upRes: IncomingMessage;
     try {
-      if (decision.accountId === CSWAP_ACTIVE_ID) {
-        // First attempt uses the request-time credential already read above.
-        // A 401 triggers exactly one reread; the retry reuses that value.
-        let sent = credential;
-        const wrapped = await attemptWithNativeResyncRetry({
-          attempt: () => sendWithCredential(sent),
-          isAuthFailure: (res) => res.statusCode === 401,
-          resync: async () => {
-            const next = await this.getCredential(decision.accountId);
-            if (fingerprintAccess(next) !== fingerprintAccess(sent)) {
-              sent = next;
-              return { resynced: true, reason: 'cswap-active access fingerprint changed' };
-            }
-            return { resynced: false, reason: 'cswap-active access fingerprint unchanged' };
-          },
-          onResync: (result) => {
-            try {
-              this.store.recordDecision({
-                session: sid,
-                harness,
-                requested_model: policy.realModel,
-                effort: policy.effort,
-                served_model: decision.servedModel,
-                account_id: decision.accountId,
-                mode: 'consume_resync',
-                reason: result.reason,
-                snapshot_json: JSON.stringify({
-                  kind: 'consume_resync',
-                  resynced: result.resynced,
-                }),
-              });
-            } catch {
-              // store errors must not crash the proxy
-            }
-          },
-          discardFirst: discardIncoming,
-        });
-        upRes = wrapped.result;
-      } else if (this.resyncFromNative) {
+      if (this.resyncFromNative) {
         const provider =
           this.store.getAccount(decision.accountId)?.provider ?? 'unknown';
         const wrapped = await attemptWithNativeResyncRetry({

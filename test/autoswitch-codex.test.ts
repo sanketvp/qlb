@@ -180,6 +180,22 @@ describe('C8 Codex poll and refresh', () => {
     assert.equal((h.records.at(-1)?.result.readings?.primary as { confidence: string }).confidence, 'authoritative');
   });
 
+  it('keeps rollout fallback readings advisory', async () => {
+    const h = autoHarness({
+      probeUsage: async () => ({
+        status: 500,
+        source: 'codex-rollout',
+        keys: ['rate_limits'],
+        windows: [{ bucket: 'primary', usedPct: 12 }],
+      }),
+    });
+
+    await codexAutoTick(h.deps);
+
+    const reading = h.records.at(-1)?.result.readings?.primary as { source: string; confidence: string };
+    assert.deepEqual(reading, { source: 'poll', confidence: 'advisory', usedPct: 12, fetchedAt: NOW });
+  });
+
   it('refreshes an active near-expiry login before its usage poll', async () => {
     const calls: CodexActiveInput[] = [];
     const h = autoHarness({

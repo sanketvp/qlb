@@ -1,22 +1,21 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { describe, it } from 'node:test';
-import { setTimeout as delay } from 'node:timers/promises';
-
 import { resolveConfig } from '../src/config';
+import { QLB_RUNTIME_AUTH_SENTINEL } from '../extensions/qlb-pi/providers/openai-codex';
 import { redactEvent, redactSecrets } from '../src/redact';
 import {
   activeCcSecurityArgs as srcArgs,
   getActiveClaudeCodeAccess,
   SECURITY_BIN as SRC_SECURITY_BIN,
 } from '../src/cswap-native-read';
+
 import {
   activeCcSecurityArgs,
   canSkipJournal,
   conflictMessage,
-  consumeAccessSource,
   consumeMarkerPath,
   CONSUME_ERRORS,
   CSWAP_ACTIVE_ID,
@@ -35,21 +34,24 @@ import {
   registerConflictProvider,
   registerConsumeProvider,
   type AnthropicNativeProvider,
-  type Builtin,
-  type ConsumeDeps,
   type EventSink,
   type ModelLike,
   type ProviderApi,
 } from '../extensions/qlb-pi/consume-provider';
-import { QLB_RUNTIME_AUTH_SENTINEL } from '../extensions/qlb-pi/providers/openai-codex';
 
-const FUTURE = 4102444800000;
-const REFRESH_SENTINEL = 'REFRESH-SENTINEL-must-never-leak';
+interface Sink extends EventSink {
+  events: unknown[];
+  ended: boolean;
+}
 
-function blob(accessToken: unknown, expiresAt: unknown = FUTURE): string {
-  return JSON.stringify({
-    claudeAiOauth: { accessToken, refreshToken: REFRESH_SENTINEL, expiresAt },
-  });
+function sink(): Sink {
+  const output: Sink = {
+    events: [],
+    ended: false,
+    push(event) { output.events.push(event); },
+    end() { output.ended = true; },
+  };
+  return output;
 }
 
 describe('qlb-pi consume reader parity with src/cswap-native-read', () => {
@@ -203,22 +205,6 @@ describe('qlb-pi mode decision', () => {
   });
 });
 
-function access(value: string): CswapActiveAccess {
-  return { access: value, fingerprint: fingerprintAccess(value) };
-}
-
-function sequence(values: string[]): { read: () => CswapActiveAccess; reads: () => number } {
-  let n = 0;
-  return {
-    read: () => {
-      const v = values[Math.min(n, values.length - 1)]!;
-      n += 1;
-      return access(v);
-    },
-    reads: () => n,
-  };
-}
-
 describe('consume marker path parity with the CLI', () => {
   it('resolves the marker beside the same database the CLI uses', () => {
     const home = mkdtempSync(join(tmpdir(), 'qlb-pi-marker-'));
@@ -248,7 +234,6 @@ describe('consume marker path parity with the CLI', () => {
         JSON.stringify(env),
       );
     }
-    // Default config file location is honored as well.
     writeFileSync(join(home, '.qlb', 'config.json'), JSON.stringify({ dbPath: join(home, 'cfg', 'q.db') }));
     assert.equal(consumeMarkerPath({}, home), join(home, 'cfg', 'consume-anthropic.json'));
     assert.equal(
@@ -258,301 +243,111 @@ describe('consume marker path parity with the CLI', () => {
   });
 });
 
-describe('qlb-pi consume 401 reread source', () => {
-  it('A→B: one reread, retry sends exactly B', async () => {
-    const seq = sequence(['A', 'B', 'C']);
-    const src = consumeAccessSource(seq.read);
-    assert.equal(src.readAccess(), 'A');
-    assert.deepEqual(await src.resync(), { resynced: true, reason: 'cswap-active access fingerprint changed' });
-    assert.equal(src.readAccess(), 'B');
-    assert.equal(seq.reads(), 2);
-    assert.deepEqual(src.sent(), ['A', 'B']);
+
+const model: ModelLike = {
+  id: 'claude-sonnet-5', api: 'anthropic-messages', provider: 'anthropic',
+};
+
+const FUTURE = 4102444800000;
+const REFRESH_SENTINEL = 'REFRESH-SENTINEL-must-never-leak';
+
+function blob(accessToken: unknown, expiresAt: unknown = FUTURE): string {
+  return JSON.stringify({
+    claudeAiOauth: { accessToken, refreshToken: REFRESH_SENTINEL, expiresAt },
   });
-
-  it('A→A: reread unchanged, no retry value change', async () => {
-    const seq = sequence(['A', 'A']);
-    const src = consumeAccessSource(seq.read);
-    src.readAccess();
-    assert.equal((await src.resync()).resynced, false);
-    assert.equal(seq.reads(), 2);
-  });
-
-  it('reread failure reports not resynced', async () => {
-    let n = 0;
-    const src = consumeAccessSource(() => {
-      n += 1;
-      if (n > 1) throw new Error('gone');
-      return access('A');
-    });
-    src.readAccess();
-    assert.deepEqual(await src.resync(), { resynced: false, reason: 'cswap-active reread failed' });
-  });
-});
-
-// ---- provider factory through a fake Pi API -------------------------------------
-
-interface Sink extends EventSink {
-  events: unknown[];
-  ended: boolean;
 }
 
-function sink(): Sink {
-  const s: Sink = {
-    events: [],
-    ended: false,
-    push(e) { s.events.push(e); },
-    end() { s.ended = true; },
-  };
-  return s;
-}
+describe('qlb-pi consume provider', () => {
+  it('fails unavailable without calling the replaced provider', () => {
+    let replacedProviderCalls = 0;
+    const providers = new Map<string, AnthropicNativeProvider>();
+    const previous: AnthropicNativeProvider = {
+      id: 'anthropic',
+      name: 'anthropic-pool',
+      auth: { apiKey: {
+        name: 'pool',
+        async check() { return { type: 'api_key', source: 'pool' }; },
+        async resolve() { return { auth: { apiKey: 'pool' }, source: 'pool' }; },
+      } },
+      getModels: () => [],
+      stream: () => { replacedProviderCalls += 1; return sink(); },
+      streamSimple: () => { replacedProviderCalls += 1; return sink(); },
+    };
+    providers.set('anthropic', previous);
+    const pi: ProviderApi = {
+      unregisterProvider(name) { providers.delete(name); },
+      registerProvider(provider) { providers.set(provider.id, provider); },
+    };
+    const outcomes: Array<Record<string, unknown>> = [];
 
-function fakePi(): ProviderApi & { providers: Map<string, AnthropicNativeProvider>; poolCalls: () => number } {
-  let poolCalls = 0;
-  const providers = new Map<string, AnthropicNativeProvider>();
-  // Pre-existing provider (anthropic-pool): any call through it is a fail-open defect.
-  providers.set('anthropic', {
-    id: 'anthropic', name: 'anthropic-pool', auth: { apiKey: {
-      name: 'pool', async check() { return { type: 'api_key', source: 'pool' }; },
-      async resolve() { return { auth: { apiKey: 'pool' }, source: 'pool' }; },
-    } }, getModels: () => [],
-    stream: () => { poolCalls += 1; return sink(); },
-    streamSimple: () => { poolCalls += 1; return sink(); },
-  });
-  return {
-    providers,
-    poolCalls: () => poolCalls,
-    unregisterProvider: (name) => { providers.delete(name); },
-    registerProvider: (provider) => { providers.set(provider.id, provider); },
-  };
-}
-
-const MODEL: ModelLike = { id: 'claude-sonnet-5', api: 'anthropic-messages', provider: 'anthropic' };
-
-function authError(token: string): Record<string, unknown> {
-  return {
-    type: 'error',
-    reason: 'error',
-    error: { errorMessage: `401 unauthorized for ${token} fp=${fingerprintAccess(token)}` },
-  };
-}
-
-function fakeBuiltin(reject: Set<string>): { builtin: Builtin; keys: string[]; payloads: unknown[] } {
-  const keys: string[] = [];
-  const payloads: unknown[] = [];
-  const builtin: Builtin = (_model, _context, options) => {
-    const key = String(options.apiKey);
-    keys.push(key);
-    return (async function* () {
-      const onPayload = options.onPayload as (p: unknown, m: unknown) => Promise<unknown>;
-      payloads.push(await onPayload({ original: true }, _model));
-      if (reject.has(key)) {
-        yield authError(key);
-        return;
-      }
-      yield { type: 'text_delta', delta: 'hi' };
-      yield { type: 'done', reason: 'stop' };
-    })();
-  };
-  return { builtin, keys, payloads };
-}
-
-async function run(pi: ReturnType<typeof fakePi>): Promise<Sink> {
-  const stream = pi.providers.get('anthropic')!.streamSimple(MODEL, {}, {}) as Sink;
-  for (let i = 0; i < 200 && !stream.ended; i++) await delay(5);
-  assert.ok(stream.ended, 'stream must end');
-  return stream;
-}
-
-function deps(over: Partial<ConsumeDeps> & { read: () => CswapActiveAccess }): {
-  deps: ConsumeDeps;
-  audit: Array<Record<string, unknown>>;
-} {
-  const audit: Array<Record<string, unknown>> = [];
-  return {
-    audit,
-    deps: {
+    registerConsumeProvider(pi, {
       createStream: sink,
-      consumeJournal: async () => 'CONSUMED',
-      ownerState: () => 'absent',
-      readAccess: over.read,
-      shapePayload: (p) => ({ shaped: p }),
-      recordOutcome: (e) => { audit.push(e); },
-      ...over,
-    },
-  };
-}
-
-describe('qlb-pi consume provider (fake Pi with pre-existing anthropic provider)', () => {
-  it('registers Anthropic with QLB-managed api-key auth and sends cswap access, never the sentinel', async () => {
-    const pi = fakePi();
-    const fake = fakeBuiltin(new Set());
-    const d = deps({ read: () => access('cswap-active-access') });
-    registerConsumeProvider(pi, fake.builtin, {
-      ...d.deps,
-      models: [MODEL],
-      baseUrl: 'https://anthropic.example.test',
+      models: [model],
+      recordOutcome(outcome) { outcomes.push(outcome); },
     });
 
-    const provider = pi.providers.get('anthropic')!;
-    assert.equal(provider.id, 'anthropic');
-    assert.equal(provider.baseUrl, 'https://anthropic.example.test');
-    assert.deepEqual(provider.getModels(), [MODEL]);
-    assert.equal(provider.auth.apiKey.name, 'QLB consume');
-    assert.equal('oauth' in provider.auth, false);
-    assert.deepEqual(await provider.auth.apiKey.resolve(), {
-      auth: { apiKey: QLB_RUNTIME_AUTH_SENTINEL }, source: 'QLB consume',
-    });
-
-    await run(pi);
-    assert.deepEqual(fake.keys, ['cswap-active-access']);
-    assert.equal(fake.keys.includes(QLB_RUNTIME_AUTH_SENTINEL), false);
+    const output = providers.get('anthropic')!.stream(model, {}) as Sink;
+    assert.equal(output.ended, true);
+    assert.equal(replacedProviderCalls, 0);
+    assert.deepEqual(output.events.map((event) => (event as { error: { errorMessage: string } }).error.errorMessage), [
+      CONSUME_ERRORS.quotaUnavailable,
+    ]);
+    assert.deepEqual(outcomes, [{
+      accountId: CSWAP_ACTIVE_ID,
+      provider: 'anthropic',
+      model: model.id,
+      outcome: 'unavailable',
+      error: CONSUME_ERRORS.quotaUnavailable,
+    }]);
   });
 
-  it('delegates stream API options to the full builtin transport, not streamSimple', async () => {
-    const pi = fakePi();
-    let simpleCalls = 0;
-    let streamCalls = 0;
-    let streamOptions: Record<string, unknown> | undefined;
-    const simple: Builtin = () => {
-      simpleCalls += 1;
-      return (async function* () { yield { type: 'done' }; })();
+  it('conflict provider replaces the pool with an error-only provider', () => {
+    const providers = new Map<string, AnthropicNativeProvider>();
+    const pi: ProviderApi = {
+      unregisterProvider(name) { providers.delete(name); },
+      registerProvider(provider) { providers.set(provider.id, provider); },
     };
-    const full: Builtin = (_model, _context, options) => {
-      streamCalls += 1;
-      streamOptions = options;
-      return (async function* () { yield { type: 'done' }; })();
-    };
-    registerConsumeProvider(pi, simple, deps({ read: () => access('cswap-active-access') }).deps, full);
-
-    const output = pi.providers.get('anthropic')!.stream(MODEL, {}, { thinkingEnabled: true }) as Sink;
-    for (let i = 0; i < 200 && !output.ended; i++) await delay(5);
-    assert.ok(output.ended, 'stream must end');
-    assert.equal(streamCalls, 1);
-    assert.equal(simpleCalls, 0);
-    assert.equal(streamOptions?.thinkingEnabled, true);
-    assert.equal(streamOptions?.apiKey, 'cswap-active-access');
-  });
-
-  it('401 with rotated credential: two reads, retry with B, recovered 401 hidden, pool never used', async () => {
-    const pi = fakePi();
-    const seq = sequence(['A', 'B']);
-    const fake = fakeBuiltin(new Set(['A']));
-    const d = deps({ read: seq.read });
-    registerConsumeProvider(pi, fake.builtin, d.deps);
-    const out = await run(pi);
-    assert.equal(seq.reads(), 2);
-    assert.deepEqual(fake.keys, ['A', 'B']);
-    assert.deepEqual(fake.payloads, [{ shaped: { original: true } }, { shaped: { original: true } }]);
-    assert.equal(out.events.some((e) => (e as { type?: string }).type === 'error'), false);
-    assert.equal((out.events.at(-1) as { type?: string }).type, 'done');
-    assert.equal(pi.poolCalls(), 0);
-    assert.deepEqual(d.audit.map((e) => e.kind ?? e.outcome), ['consume_reread', 'ok']);
-    assert.equal(d.audit[1]!.accountId, CSWAP_ACTIVE_ID);
-    assert.equal(d.audit[1]!.retriedAfterConsumeReread, true);
-  });
-
-  it('401 with unchanged credential: no retry, 401 surfaced with token and fingerprint redacted', async () => {
-    const pi = fakePi();
-    const seq = sequence(['A', 'A']);
-    const fake = fakeBuiltin(new Set(['A']));
-    const d = deps({ read: seq.read });
-    registerConsumeProvider(pi, fake.builtin, d.deps);
-    const out = await run(pi);
-    assert.equal(seq.reads(), 2);
-    assert.deepEqual(fake.keys, ['A']);
-    const text = JSON.stringify(out.events) + JSON.stringify(d.audit);
-    assert.match(text, /401/);
-    assert.doesNotMatch(text, /for A /);
-    assert.equal(text.includes(fingerprintAccess('A')), false);
-    assert.equal(text.includes(REFRESH_SENTINEL), false);
-  });
-
-  it('second 401 after retry reads nothing more', async () => {
-    const pi = fakePi();
-    const seq = sequence(['A', 'B', 'C']);
-    const fake = fakeBuiltin(new Set(['A', 'B', 'C']));
-    registerConsumeProvider(pi, fake.builtin, deps({ read: seq.read }).deps);
-    await run(pi);
-    assert.equal(seq.reads(), 2);
-    assert.deepEqual(fake.keys, ['A', 'B']);
-  });
-
-  it('journal no longer CONSUMED or owner file appearing: fixed error, zero reads, zero upstream', async () => {
-    for (const [over, message] of [
-      [{ consumeJournal: async () => 'NATIVE' as const }, CONSUME_ERRORS.disabled],
-      [{ consumeJournal: async () => 'unknown' as const }, CONSUME_ERRORS.stateUnknown],
-      [{ ownerState: () => 'valid' as const }, CONSUME_ERRORS.conflict],
-      [{ ownerState: () => 'malformed' as const }, CONSUME_ERRORS.conflict],
-    ] as const) {
-      const pi = fakePi();
-      const seq = sequence(['A']);
-      const fake = fakeBuiltin(new Set());
-      registerConsumeProvider(pi, fake.builtin, deps({ read: seq.read, ...over }).deps);
-      const out = await run(pi);
-      assert.equal(seq.reads(), 0);
-      assert.deepEqual(fake.keys, []);
-      assert.equal(pi.poolCalls(), 0);
-      assert.equal((out.events[0] as { error: { errorMessage: string } }).error.errorMessage, message);
-    }
-  });
-
-  it('Keychain read failure: fixed message, no upstream call', async () => {
-    const pi = fakePi();
-    const fake = fakeBuiltin(new Set());
-    registerConsumeProvider(pi, fake.builtin, deps({
-      read: () => { throw new Error(CONSUME_ERRORS.expired); },
-    }).deps);
-    const out = await run(pi);
-    assert.deepEqual(fake.keys, []);
-    assert.equal(out.events.length, 1);
-    assert.equal((out.events[0] as { error: { errorMessage: string } }).error.errorMessage, CONSUME_ERRORS.expired);
-  });
-
-  it('unexpected errors never cross a sink verbatim', async () => {
-    const pi = fakePi();
-    const fake = fakeBuiltin(new Set());
-    const d = deps({
-      read: () => access('A'),
-      consumeJournal: async () => { throw new Error(`spawn failed ${REFRESH_SENTINEL}`); },
-    });
-    registerConsumeProvider(pi, fake.builtin, d.deps);
-    const out = await run(pi);
-    const text = JSON.stringify(out.events) + JSON.stringify(d.audit);
-    assert.equal(text.includes(REFRESH_SENTINEL), false);
-    assert.match(text, /cswap-active request failed/);
+    registerConflictProvider(pi, sink, CONSUME_ERRORS.conflict, { models: [model] });
+    const output = providers.get('anthropic')!.streamSimple(model, {}) as Sink;
+    assert.equal(output.ended, true);
+    assert.deepEqual(output.events.map((event) => (event as { error: { errorMessage: string } }).error.errorMessage), [
+      CONSUME_ERRORS.conflict,
+    ]);
   });
 
   it('conflict provider registers QLB-managed auth and never resolves stored OAuth', async () => {
-    const pi = fakePi();
+    const providers = new Map<string, AnthropicNativeProvider>();
+    const pi: ProviderApi = {
+      unregisterProvider(name) { providers.delete(name); },
+      registerProvider(provider) { providers.set(provider.id, provider); },
+    };
     registerConflictProvider(pi, sink, CONSUME_ERRORS.conflict, {
-      models: [MODEL], baseUrl: 'https://anthropic.example.test',
+      models: [model], baseUrl: 'https://anthropic.example.test',
     });
-    const provider = pi.providers.get('anthropic')!;
+    const provider = providers.get('anthropic')!;
     assert.equal(provider.baseUrl, 'https://anthropic.example.test');
-    assert.deepEqual(provider.getModels(), [MODEL]);
+    assert.deepEqual(provider.getModels(), [model]);
     assert.equal('oauth' in provider.auth, false);
     assert.deepEqual(await provider.auth.apiKey.check(), { type: 'api_key', source: 'QLB consume' });
     assert.deepEqual(await provider.auth.apiKey.resolve(), {
       auth: { apiKey: QLB_RUNTIME_AUTH_SENTINEL }, source: 'QLB consume',
     });
-    const out = await run(pi);
-    assert.equal(pi.poolCalls(), 0);
-    assert.equal(out.events.length, 1);
-    assert.equal((out.events[0] as { error: { errorMessage: string } }).error.errorMessage, CONSUME_ERRORS.conflict);
   });
 
   it('a missing Anthropic catalog fails closed without native auth', async () => {
-    const pi = fakePi();
+    const providers = new Map<string, AnthropicNativeProvider>();
+    const pi: ProviderApi = {
+      unregisterProvider(name) { providers.delete(name); },
+      registerProvider(provider) { providers.set(provider.id, provider); },
+    };
     registerConflictProvider(pi, sink, 'catalog unavailable');
-    const provider = pi.providers.get('anthropic')!;
+    const provider = providers.get('anthropic')!;
     assert.deepEqual(provider.getModels(), []);
     assert.equal(provider.baseUrl, undefined);
     assert.equal('oauth' in provider.auth, false);
     assert.deepEqual(await provider.auth.apiKey.resolve(), {
       auth: { apiKey: QLB_RUNTIME_AUTH_SENTINEL }, source: 'QLB consume',
     });
-    const out = await run(pi);
-    assert.equal((out.events[0] as { error: { errorMessage: string } }).error.errorMessage, 'catalog unavailable');
   });
 });
 

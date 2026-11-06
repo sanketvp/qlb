@@ -29,10 +29,10 @@ Two optional `Adapter` fields (`src/types.ts`) tailor refresh behavior; absent m
 ## OpenAI Codex (`openai-codex`)
 
 - **Credential source:** Codex CLI's own `~/.codex/auth.json` (`tokens.access_token`; account id and label parsed from the `id_token` JWT claims). Configurable via `QLB_CODEX_AUTH_JSON_PATH`.
-- **Usage signal:** response headers only. Codex exposes no standalone usage GET; `x-codex-primary-used-percent` (5-hour), `x-codex-secondary-used-percent` (weekly), and related reset/pool headers arrive on real requests to the Codex backend. The adapter itself therefore reports an authenticated account with **no buckets** — numbers populate when real traffic flows through `qlb proxy` (whose `parseUsageHeaders` writes header-derived readings into the same snapshot cache).
+- **Usage signal:** scheduled or explicit provider usage polling through wham/codex-api writes `provider-poll` readings. Quota-bearing proxy response headers — `x-codex-primary-used-percent` (5-hour), `x-codex-secondary-used-percent` (weekly), and related reset/pool headers — write `provider-headers` readings when real traffic flows through `qlb proxy`.
 - **Buckets:** `primary` (5-hour), `secondary` (weekly).
-- **Confidence:** `authoritative` once a header-derived reading exists; `unknown` before that (which makes the account a cold-start candidate only, never excluded by a missing number).
-- **Caveats:** because every reading requires a real request, Codex data is exactly as fresh as the last request that went through. There is no free refresh, and QLB does not send probe requests on its own in the CLI path.
+- **Confidence:** `authoritative` once a provider-poll or quota-bearing header reading exists; `unknown` before that. Rollout fallback remains advisory and display-only. Unknown readings remain visible but make routing unavailable.
+- **Caveats:** Codex data is actionable only while its provider reading is fresh. QLB does not route from rollout fallback data.
 
 ### Pi OAuth source compatibility (P3)
 
@@ -43,7 +43,7 @@ Pi's `pi-ai/auth/oauth/openai-codex.js` was not present in this repository's `no
 - **Credential source:** the `xai` entry (OAuth `access`/`expires`) in Pi's `auth.json` (configurable via `QLB_PI_AUTH_JSON_PATH`). Read-only: if the grant is expired, the adapter reports `xai grant expired — run pi once to refresh it` rather than refreshing it itself.
 - **Usage signal:** response headers of a minimal real request — a single 1-token `POST https://api.x.ai/v1/chat/completions` (hard 15-second timeout, no retries), with `x-ratelimit-limit-tokens` / `x-ratelimit-remaining-tokens` and the request-counter equivalents parsed into percentages. There is no free gauge endpoint.
 - **Buckets:** `tokens`, `requests`.
-- **Confidence:** always `advisory`. This is a deliberate, documented choice: xAI's headers describe a *refilling* developer-API bucket with no reset timestamp, and it is not proven that the numbers match the SuperGrok in-app meter a user actually sees. Advisory buckets are displayed (as `~NN%`) and used only as tie-breakers — they never exclude an account, and a reactive `429` from xAI is treated as the authoritative exhaustion signal.
+- **Confidence:** always `advisory`. This is a deliberate, documented choice: xAI's headers describe a *refilling* developer-API bucket with no reset timestamp, and it is not proven that the numbers match the SuperGrok in-app meter a user actually sees. Advisory buckets remain displayed (as `~NN%`) but are unavailable for routing.
 - **Caveats:** each refresh of the reading consumes a (tiny) real request. Concurrent callers share one probe through the single-flight claim, and readings are cached so repeated `status`/`resolve` calls do not re-probe.
 
 ## Kimi Coding (`kimi-coding`)
@@ -73,6 +73,6 @@ Additional providers can be added as local JavaScript plugins in `~/.qlb/plugins
 The design doc's provider matrix (verified against live endpoints before implementation) is the template for onboarding a provider:
 
 1. Identify a **real gauge**: a free usage GET (best), or response headers on real requests (acceptable — but the reading is then only as fresh as the traffic), or nothing (then the account can only be managed reactively, via 429s).
-2. Decide the **confidence** honestly: if the gauge cannot be proven to be the billing meter, mark it `advisory` so it can never exclude an account.
+2. Decide the **confidence** honestly: if the gauge cannot be proven to be the billing meter, mark it `advisory`; it remains display-only and cannot route an account.
 3. Map buckets to **window classes** (5-hour vs weekly) so the scarcity discount weights them correctly.
 4. Never write credentials; report errors as snapshots, never as throws.

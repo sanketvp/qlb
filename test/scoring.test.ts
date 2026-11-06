@@ -3,7 +3,6 @@ import { describe, it } from 'node:test';
 import type { AccountSnapshot, BucketReading, Confidence } from '../src/types';
 import {
   DEFAULT_CEILING,
-  UNKNOWN_SCORE,
   scoreAccount,
 } from '../src/scoring';
 
@@ -96,9 +95,9 @@ describe('Rule S — spec §4.3.1', () => {
     assert.equal(scoreAccount(G, 'claude-fable-5', DEFAULT_CEILING), 12);
   });
 
-  it('all-unknown / all-advisory account gets unknownScore', () => {
+  it('all-unknown / all-advisory account cannot receive a selection score', () => {
     const unknown = anthropic('I', {});
-    assert.equal(scoreAccount(unknown, 'claude-fable-5', DEFAULT_CEILING), UNKNOWN_SCORE);
+    assert.equal(scoreAccount(unknown, 'claude-fable-5', DEFAULT_CEILING), Number.NEGATIVE_INFINITY);
 
     const advisoryOnly = anthropic('I-adv', {
       '5h': reading(40, 'advisory'),
@@ -106,7 +105,7 @@ describe('Rule S — spec §4.3.1', () => {
     });
     assert.equal(
       scoreAccount(advisoryOnly, 'claude-fable-5', DEFAULT_CEILING),
-      UNKNOWN_SCORE,
+      Number.NEGATIVE_INFINITY,
     );
 
     const xai: AccountSnapshot = {
@@ -118,10 +117,10 @@ describe('Rule S — spec §4.3.1', () => {
         requests: reading(5, 'advisory'),
       },
     };
-    assert.equal(scoreAccount(xai, 'grok-4.6', DEFAULT_CEILING), UNKNOWN_SCORE);
+    assert.equal(scoreAccount(xai, 'grok-4.6', DEFAULT_CEILING), Number.NEGATIVE_INFINITY);
   });
 
-  it('unknown Fable bucket does not drag an otherwise-scored account to unknownScore', () => {
+  it('unknown Fable bucket does not drag an otherwise-scored account to a non-selection score', () => {
     const mixed = anthropic('mix', {
       '5h': reading(50), // 30
       '7d': reading(30), // 0.6×50 = 30

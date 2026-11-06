@@ -2,6 +2,7 @@
 
 import { DatabaseSync } from 'node:sqlite';
 import { redactSecrets } from './redact';
+import { currentProviderObservation, failedProviderAttemptAfterReadings } from './routing-authority';
 import type { AccountSnapshot, BucketReading, Confidence } from './types';
 import { STALE_OK_S } from './usage-freshness';
 export { STALE_OK_S };
@@ -67,7 +68,7 @@ function newestFetchedAt(
   include: (label: string) => boolean,
 ): number | undefined {
   return Object.entries(snapshot).reduce<number | undefined>((newest, [label, reading]) =>
-    reading.source !== 'poll' || !include(label) ? newest : newest === undefined ? reading.fetchedAt : Math.max(newest, reading.fetchedAt), undefined);
+    (reading.source !== 'poll' && reading.source !== 'provider-poll') || !include(label) ? newest : newest === undefined ? reading.fetchedAt : Math.max(newest, reading.fetchedAt), undefined);
 }
 
 function earliestResetAt(
@@ -76,7 +77,7 @@ function earliestResetAt(
   newest: number | undefined,
 ): number | undefined {
   return Object.entries(snapshot).reduce<number | undefined>((earliest, [label, reading]) =>
-    reading.source !== 'poll' || !include(label) || reading.fetchedAt !== newest || reading.resetAt === undefined
+    (reading.source !== 'poll' && reading.source !== 'provider-poll') || !include(label) || reading.fetchedAt !== newest || reading.resetAt === undefined
       ? earliest
       : earliest === undefined ? reading.resetAt : Math.min(earliest, reading.resetAt), undefined);
 }
@@ -106,7 +107,7 @@ export function projectAnthropicUsageReadings(
   const newest = newestFetchedAt(snapshot, include);
   const snapshotResetAt = earliestResetAt(snapshot, include, newest);
   return Object.fromEntries(Object.entries(snapshot).flatMap(([label, reading]) => {
-    if (reading.source !== 'poll' || !include(label)) return [];
+    if ((reading.source !== 'poll' && reading.source !== 'provider-poll') || !include(label)) return [];
     const confidence = anthropicUsageConfidence(row, reading, snapshotResetAt, nowS);
     return confidence === 'unknown' ? [] : [[label, { ...reading, confidence }]];
   }));
@@ -199,13 +200,15 @@ export function anthropicStoreSnapshots(
           nowS,
         );
       }
-      const buckets = projectAnthropicUsageReadings(
-        store.getAllSnapshots(slot.accountId), row, nowS,
-      );
+      const observed = currentProviderObservation(store.getAllSnapshots(slot.accountId));
+      const buckets = projectAnthropicUsageReadings(observed, row, nowS);
       return statusSnapshot(
         slot,
         Object.keys(buckets).length > 0
-          ? { accountId: slot.accountId, provider: 'anthropic', label, buckets }
+          ? {
+            accountId: slot.accountId, provider: 'anthropic', label, buckets,
+            ...(failedProviderAttemptAfterReadings(observed, row) ? { failed: true } : {}),
+          }
           : { accountId: slot.accountId, provider: 'anthropic', label, buckets: {}, error: 'unavailable' },
         row,
         nowS,
@@ -223,8 +226,10 @@ export function hasFreshAnthropicUsagePoll(
   const polls = store.listUsagePolls('anthropic');
   return slots.filter((slot) => slot.archivedAt == null).some((slot) => {
     const row = polls[slot.accountId];
+    const observed = currentProviderObservation(store.getAllSnapshots(slot.accountId));
     return row !== undefined
-      && Object.keys(projectAnthropicUsageReadings(store.getAllSnapshots(slot.accountId), row, nowS)).length > 0;
+      && !failedProviderAttemptAfterReadings(observed, row)
+      && Object.keys(projectAnthropicUsageReadings(observed, row, nowS)).length > 0;
   });
 }
 
@@ -259,7 +264,7 @@ function readOnlyStoreData(dbPath: string): {
       FROM claude_slots`).all() as Array<Record<string, unknown>>;
     const snapshots = new Map<string, Record<string, BucketReading>>();
     const snapshotRows = db.prepare(`SELECT account_id, bucket, used_pct, used, limit_val, remaining,
-      reset_at, fetched_at, source, confidence FROM snapshots WHERE source = 'poll'`).all() as Array<Record<string, unknown>>;
+      reset_at, fetched_at, source, confidence FROM snapshots WHERE source IN ('poll', 'provider-poll')`).all() as Array<Record<string, unknown>>;
     for (const row of snapshotRows) {
       const accountId = String(row.account_id);
       const reading: BucketReading = {

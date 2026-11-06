@@ -40,7 +40,7 @@ export interface Adapter {
 
 Adapters are strictly read-only with respect to credentials: Phase-0 adapters discover credential sources (a pool JSON file, an `auth.json`, a Keychain service) and never modify them. Credential *ownership* — where QLB holds and refreshes a grant itself — is a separate, explicitly confirmed migration flow (see [CREDENTIAL-SAFETY.md](CREDENTIAL-SAFETY.md)).
 
-**Consume Option B (v1, code only until live-change approval):** Anthropic *status* is a cache-only projection of cswap `sequence.json` + `usage.json` (never `cswap list`, never the Anthropic usage URL). Serving does not use that cache to pick a Claude slot. When `cswap-anthropic=CONSUMED`, `resolveFromSnapshots` sees one synthetic Anthropic snapshot `cswap-active` so cross-provider fallback and pin semantics stay in the existing resolver. Inject is a read-only Keychain GET of the active Claude Code item; audit identity is always `cswap-active`. A consume 401 re-GETs that item once and never POSTs `refresh_token`. The supervising wrapper (`harness/claude`) holds a shared loopback proxy on `127.0.0.1:47391 --no-idle`; it is not PATH-installed in this PR. Pi follows the same journal: with `cswap-anthropic=CONSUMED` and no Pi owner file, the `qlb-pi` extension serves Anthropic from the active Claude Code login as `cswap-active` (read-only, one re-read on 401, never refreshed), so switching accounts in cswap takes effect on Pi's next request. A Pi owner file (or an unreadable journal/owner file) together with consume is a conflict: Anthropic is replaced by an error-only stub rather than falling back to `anthropic-pool`.
+**Consume Option B (v1, code only until live-change approval):** Anthropic *status* is a cache-only projection of cswap `sequence.json` + `usage.json` (never `cswap list`, never the Anthropic usage URL). Serving does not use that cache to pick a Claude slot. When `cswap-anthropic=CONSUMED`, `resolveFromSnapshots` sees one synthetic Anthropic snapshot `cswap-active`; because its credential is unattributed, the snapshot has no routing-authoritative quota reading and Anthropic requests return `UNAVAILABLE`. The supervising wrapper (`harness/claude`) holds a shared loopback proxy on `127.0.0.1:47391 --no-idle`; it is not PATH-installed in this PR. Pi follows the same journal and the same fail-closed admission rule. A Pi owner file (or an unreadable journal/owner file) together with consume is a conflict: Anthropic is replaced by an error-only stub rather than falling back to `anthropic-pool`.
 
 Each adapter returns `AccountSnapshot`s containing named **buckets** (`5h`, `7d`, `7d:Fable`, `weekly`, `primary`, `tokens`, `credits`, …). Every bucket reading carries a `confidence` level and a `fetchedAt` timestamp, and those two fields drive everything downstream.
 
@@ -62,12 +62,12 @@ Every bucket reading carries one of four confidence levels (`src/types.ts`):
 
 | Level | Meaning | Role in scoring |
 |---|---|---|
-| `authoritative` | Value came from the provider's own gauge and is the freshest observation | Scored at full weight |
-| `stale` | An authoritative value that has aged past its freshness bound | Scored at half weight (`STALE_DISCOUNT = 0.5`) |
-| `advisory` | Provider gauge exists but is unproven to be the billing meter (all xAI buckets today) | Never scored; tie-breaker only |
-| `unknown` | Never observed | Gates candidacy only; cannot exclude an account |
+| `authoritative` | Fresh value from a direct provider receipt | Eligible for routing |
+| `stale` | A provider value past its routing freshness bound | Display only |
+| `advisory` | Provider gauge exists but is unproven to be the billing meter (all xAI buckets today) | Display only |
+| `unknown` | Never observed | Display only |
 
-The xAI case is the concrete example of why `advisory` exists: xAI's rate-limit headers describe a refilling developer-API bucket with no reset timestamp, and there is no evidence it matches the in-app meter a user actually sees. QLB displays those numbers (`~NN%`) but never lets them exclude an account — a reactive `429` from the provider is the authoritative signal there.
+The xAI case is the concrete example of why `advisory` exists: xAI's rate-limit headers describe a refilling developer-API bucket with no reset timestamp, and there is no evidence it matches the in-app meter a user actually sees. QLB displays those numbers (`~NN%`), but xAI remains unavailable for routing until it has a direct provider quota reading.
 
 ## Scoring: headroom-then-all-in
 
@@ -80,8 +80,10 @@ headroom_b = ceiling − usedPct_b            ceiling defaults to 80
 discount_b = 1.0 (5-hour-class buckets)
            = 0.6 (weekly-class buckets)     WEEKLY_SCARCITY
 f_b        = 1.0 (authoritative) | 0.5 (stale)
-score      = UNKNOWN_SCORE (1) when no bucket is scored
+score      = -Infinity when no eligible bucket is scored
 ```
+
+The scoring layer retains the stale factor for display and diagnostic calculations, but routing authority rejects stale readings before selection, so stale readings never route.
 
 The scarcity discount is the part that is easy to get backwards, and an earlier revision of the design *did* get it backwards. Weekly capacity recovers slowly (up to 7 days), 5-hour capacity recovers quickly, so a thin *weekly* margin should drive an account's score down faster than a thin 5-hour margin. That is achieved by multiplying the weekly headroom by a number **less than 1** (0.6), which makes the weekly term the first to hit the minimum — not by weighting it above 1.
 
@@ -94,22 +96,22 @@ The scarcity discount is the part that is easy to get backwards, and an earlier 
 
 A wins. B's raw headrooms (40 and 15) look fine, but its weekly margin of 15 is the scarcest resource in the system, and the 0.6 discount surfaces that.
 
-**Worked example 2 — mixed confidence** (the case that motivated explicit confidence states):
+**Worked example 2 — authoritative readings only**:
 
 | Account | 5h | 7d | per-model pool | terms in `min()` | score |
 |---|---|---|---|---|---|
-| G | authoritative, 50 used → 30 | stale, 40 used → 40 | unknown | min(1.0×30, 0.6×40×0.5=12) | **12** |
+| G | authoritative, 50 used → 30 | stale, 40 used → 40 | unknown | unavailable | **not routable** |
 | H | authoritative, 60 → 20 | authoritative, 30 → 50 | authoritative, 45 → 35 | min(20, 30, 21) | **20** |
-| I | unknown | unknown | advisory ~40% | nothing scored | **1** (unknown account) |
+| I | unknown | unknown | advisory ~40% | unavailable | **not routable** |
 
-H wins (20 > 12). G's stale weekly bucket is neither ignored nor disqualifying — it is scored at half its discounted headroom. G's unknown pool bucket neither helps nor hurts. I is only a candidate when no other account scores above `UNKNOWN_SCORE` (1), so a cold-start account still gets tried, last.
+H is the only routable account. Fresh direct provider readings are required for both selection and an exhaustion claim; stale, unknown, and advisory values remain visible but cannot establish capacity.
 
 Selection then proceeds in a fixed ladder (`src/resolve.ts`):
 
-1. Score at ceiling 80. Any candidate with `score > 0` wins (ties: advisory headroom, then least-recently-decided).
+1. Score at ceiling 80. The first candidate at the maximum authoritative score in candidate order wins. The `spread` strategy instead hashes a session over near-tied candidates.
 2. None → **all-in mode**: recompute at ceiling 100, pick the max. Logged as `mode: "all-in"`.
 3. Still none → walk the caller's fallback list (`--fallback m1,m2`), repeating per model. The served model is always reported (`servedModel` vs `requestedModel`); effort is never silently downgraded.
-4. Still none → `EXHAUSTED` with the earliest known reset across all candidates and buckets.
+4. Still none → `EXHAUSTED` only when every relevant live account has fresh direct readings; otherwise `UNAVAILABLE`.
 
 Every decision is persisted to the `decisions` table with a per-bucket `snapshot_json` (value, confidence, source, `ageMs`) so any past decision can be audited after the fact.
 

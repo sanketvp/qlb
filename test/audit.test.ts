@@ -95,7 +95,7 @@ function runCli(
 function reading(usedPct: number): BucketReading {
   return {
     usedPct,
-    source: 'poll',
+    source: 'provider-poll',
     confidence: 'authoritative',
     fetchedAt: Date.now(),
   };
