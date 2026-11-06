@@ -559,3 +559,120 @@ describe('fs:stray-temps doctor check', () => {
     }
   });
 });
+
+describe('doctor lifecycle phase fixtures (HP-H3-11)', () => {
+  const PHASES = ['pre-cutover', 'cutting-over', 'cutover', 'undoing', 'rolled-back', 'retired'] as const;
+  type Phase = (typeof PHASES)[number];
+
+  function level(report: Awaited<ReturnType<typeof doctorQlb>>, name: string): string | undefined {
+    return report.checks.find((row) => row.name === name)?.level;
+  }
+
+  async function runFixture(phase: Phase): Promise<Awaited<ReturnType<typeof doctorQlb>>> {
+    const home = mkdtempSync(join(tmpdir(), `qlb-doctor-phase-${phase}-`));
+    const config = defaultConfig(home);
+    const store = openStore(config.dbPath);
+    store.close();
+    const db = new DatabaseSync(config.dbPath);
+    try {
+      db.prepare('INSERT INTO lifecycle (state, began_at, undo_began_at) VALUES (?, ?, ?)')
+        .run(phase, NOW, phase === 'undoing' || phase === 'rolled-back' ? NOW : null);
+      if (phase === 'cutover') {
+        db.prepare("INSERT INTO claude_slots (account_id, config_json, dead, added_at) VALUES ('dead-slot', '{}', 1, ?)").run(NOW);
+        db.prepare("INSERT INTO config (key, value) VALUES ('auto.anthropic.suspendedUntil', ?)").run(String(Date.UTC(2099, 0, 1)));
+      }
+      if (phase === 'retired') {
+        db.prepare("INSERT INTO config (key, value) VALUES ('auto.heartbeatAt', ?)").run(String(NOW));
+      }
+    } finally {
+      db.close();
+    }
+    return withTestQlbHome(home, async () => {
+      const report = await doctorQlb(config, {
+        appendHealthLog: true,
+        command: () => '',
+        hostCommand: () => '',
+        hostPlatform: 'linux',
+        hostShell: undefined,
+        hostShellExists: () => false,
+        keychain: keychain(),
+        now: () => NOW,
+        piProcessList: () => '',
+        cswapProcesses: () => [],
+        cswapAgentStatus: () => 'not-loaded',
+      });
+      const healthRows = new DatabaseSync(config.dbPath);
+      try {
+        const { count } = healthRows.prepare('SELECT COUNT(*) AS count FROM health_log').get() as { count: number };
+        assert.equal(count, 1, phase);
+        const healthLogId = report.healthLogId;
+        assert.ok(healthLogId !== undefined, phase);
+        const row = healthRows.prepare('SELECT ts, phase, overall, dead_slots_json AS deadSlotsJson FROM health_log WHERE id = ?')
+          .get(healthLogId) as { ts: number; phase: string; overall: string; deadSlotsJson: string } | undefined;
+        assert.ok(row, phase);
+        assert.equal(row.ts, NOW, phase);
+        assert.equal(row.phase, phase, phase);
+        assert.equal(row.overall, report.s64.overall, phase);
+        assert.deepEqual(JSON.parse(row.deadSlotsJson), phase === 'cutover' ? ['dead-slot'] : [], phase);
+      } finally {
+        healthRows.close();
+      }
+      assert.equal(level(report, 'doctor:registry'), 'PASS', phase);
+      return report;
+    });
+  }
+
+  it('covers each phase class with controlled health-log, applicability, and S64 fixtures', async () => {
+    const reports = new Map<Phase, Awaited<ReturnType<typeof doctorQlb>>>();
+    for (const phase of PHASES) {
+      reports.set(phase, await runFixture(phase));
+    }
+
+    for (const [phase, report] of reports) {
+      for (const name of ['claude:login-expiry', 'fs:stray-temps', 'claude:version-drift', 'claude:locks', 'hosts:env', 'release:current']) {
+        assert.notEqual(level(report, name), 'N/A', `${phase}: ${name} applies in every phase`);
+      }
+      const alwaysApplicable = report.checks.filter((row) => row.name.startsWith('claude:config-') || row.name.startsWith('keychain:'));
+      assert.ok(alwaysApplicable.length > 0, `${phase}: expected config and keychain rows`);
+      for (const row of alwaysApplicable) assert.notEqual(row.level, 'N/A', `${phase}: ${row.name} applies in every phase`);
+    }
+
+    const pre = reports.get('pre-cutover')!;
+    for (const name of ['claude:slots', 'codex:slots', 'claude:active', 'relogin:7d', 'auto:parked', 'auto:agent', 'claude:switch-journal', 'journal:in-progress', 'journal:orphaned', 'undo:incomplete', 'undo:lineage-match']) {
+      assert.equal(level(pre, name), 'N/A', `pre-cutover ${name}`);
+    }
+    for (const row of pre.checks.filter((row) => row.level === 'N/A')) {
+      assert.equal(s64DoctorVerdict({ checks: [row], providers: [] }).overall, 'PASS', row.name);
+    }
+    assert.equal(pre.s64.overall, 'PASS');
+    assert.deepEqual(
+      s64DoctorVerdict({ checks: pre.checks.filter((row) => row.level !== 'N/A'), providers: pre.providers }),
+      pre.s64,
+      'N/A rows do not affect the aggregate S64 verdict',
+    );
+
+    assert.equal(reports.get('cutting-over')!.s64.overall, 'PASS');
+
+    const cutover = reports.get('cutover')!;
+    assert.equal(level(cutover, 'claude:slots'), 'FAIL', JSON.stringify(cutover.checks.find((row) => row.name === 'claude:slots')));
+    assert.equal(level(cutover, 'auto:anthropic:breaker'), 'FAIL', JSON.stringify(cutover.checks.find((row) => row.name === 'auto:anthropic:breaker')));
+    assert.equal(cutover.s64.overall, 'FAIL');
+
+    const undoing = reports.get('undoing')!;
+    assert.equal(level(undoing, 'undo:incomplete'), 'FAIL');
+    assert.equal(undoing.s64.overall, 'FAIL');
+    for (const name of ['undo:lineage-match', 'journal:in-progress', 'journal:orphaned', 'claude:slots', 'claude:active']) {
+      assert.equal(level(undoing, name), 'N/A', `undoing ${name}`);
+    }
+
+    const rolledBack = reports.get('rolled-back')!;
+    assert.equal(level(rolledBack, 'undo:incomplete'), 'PASS');
+    assert.equal(level(rolledBack, 'undo:lineage-match'), 'PASS');
+    assert.equal(rolledBack.s64.overall, 'PASS');
+    const retired = reports.get('retired')!;
+    assert.equal(level(retired, 'auto:agent'), 'PASS');
+    assert.equal(level(retired, 'cswap:agent'), 'PASS');
+    assert.equal(level(retired, 'cswap:processes'), 'PASS');
+    assert.equal(retired.s64.overall, 'PASS');
+  });
+});
