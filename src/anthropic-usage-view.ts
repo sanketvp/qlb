@@ -2,7 +2,7 @@
 
 import { DatabaseSync } from 'node:sqlite';
 import { redactSecrets } from './redact';
-import { currentProviderObservation } from './routing-authority';
+import { currentProviderObservation, failedProviderAttemptAfterReadings } from './routing-authority';
 import type { AccountSnapshot, BucketReading, Confidence } from './types';
 import { STALE_OK_S } from './usage-freshness';
 export { STALE_OK_S };
@@ -200,13 +200,15 @@ export function anthropicStoreSnapshots(
           nowS,
         );
       }
-      const buckets = projectAnthropicUsageReadings(
-        currentProviderObservation(store.getAllSnapshots(slot.accountId)), row, nowS,
-      );
+      const observed = currentProviderObservation(store.getAllSnapshots(slot.accountId));
+      const buckets = projectAnthropicUsageReadings(observed, row, nowS);
       return statusSnapshot(
         slot,
         Object.keys(buckets).length > 0
-          ? { accountId: slot.accountId, provider: 'anthropic', label, buckets }
+          ? {
+            accountId: slot.accountId, provider: 'anthropic', label, buckets,
+            ...(failedProviderAttemptAfterReadings(observed, row) ? { failed: true } : {}),
+          }
           : { accountId: slot.accountId, provider: 'anthropic', label, buckets: {}, error: 'unavailable' },
         row,
         nowS,
@@ -224,8 +226,10 @@ export function hasFreshAnthropicUsagePoll(
   const polls = store.listUsagePolls('anthropic');
   return slots.filter((slot) => slot.archivedAt == null).some((slot) => {
     const row = polls[slot.accountId];
+    const observed = currentProviderObservation(store.getAllSnapshots(slot.accountId));
     return row !== undefined
-      && Object.keys(projectAnthropicUsageReadings(currentProviderObservation(store.getAllSnapshots(slot.accountId)), row, nowS)).length > 0;
+      && !failedProviderAttemptAfterReadings(observed, row)
+      && Object.keys(projectAnthropicUsageReadings(observed, row, nowS)).length > 0;
   });
 }
 

@@ -7,7 +7,7 @@ import {
   type Strategy,
 } from './scoring';
 import { findUniqueCodexAlias, isFullyExhausted, pickAccount } from './strategies';
-import { currentProviderObservation, routingAuthority } from './routing-authority';
+import { currentProviderObservation, failedProviderAttemptAfterReadings, routingAuthority } from './routing-authority';
 import { ROUTING_DECISION_MODES, type Store } from './store';
 
 export { ROUTING_DECISION_MODES };
@@ -122,12 +122,22 @@ export function snapshotsFromStore(store: Store, provider?: string): AccountSnap
   const accounts = store.listAccounts(provider).filter((row) =>
     (row.status === 'active' || row.status === 'validated')
     && store.isAccountLiveForRouting(row.provider, row.id) !== false);
-  return accounts.map((row) => ({
-    accountId: row.id,
-    provider: row.provider as AccountSnapshot['provider'],
-    label: row.label,
-    buckets: currentProviderObservation(store.getAllSnapshots(row.id)),
-  }));
+  const pollsByProvider = new Map<string, ReturnType<Store['listUsagePolls']>>();
+  return accounts.map((row) => {
+    const buckets = currentProviderObservation(store.getAllSnapshots(row.id));
+    let polls = pollsByProvider.get(row.provider);
+    if (!polls) {
+      polls = store.listUsagePolls(row.provider);
+      pollsByProvider.set(row.provider, polls);
+    }
+    return {
+      accountId: row.id,
+      provider: row.provider as AccountSnapshot['provider'],
+      label: row.label,
+      buckets,
+      ...(failedProviderAttemptAfterReadings(buckets, polls[row.id]) ? { failed: true } : {}),
+    };
+  });
 }
 
 function isLiveRoutingSnapshot(snapshot: AccountSnapshot): boolean {

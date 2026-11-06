@@ -81,6 +81,50 @@ describe('qlb resolve — store-backed end-to-end', () => {
     store.close();
   });
 
+  it('keeps other fresh poll buckets after a partial provider header observation', () => {
+    const store = openStore(':memory:');
+    const now = Date.now();
+    store.upsertAccount('account', 'anthropic', 'account');
+    store.upsertSnapshot('account', '5h', { ...reading(10), fetchedAt: now - 60_000 });
+    store.upsertSnapshot('account', '7d', { ...reading(100), fetchedAt: now - 60_000 });
+    store.upsertSnapshot('account', '5h', { ...reading(10), source: 'provider-headers', fetchedAt: now });
+    const decision = resolveFromSnapshots({
+      model: 'claude-sonnet-5', snapshots: snapshotsFromStore(store, 'anthropic'), store,
+    });
+    assert.equal(decision.ok, false);
+    if (!decision.ok) assert.equal(decision.error, 'EXHAUSTED');
+    store.close();
+  });
+
+  it('fails closed after a later failed provider poll and recovers after a reading', () => {
+    const store = openStore(':memory:');
+    const now = Date.now();
+    store.upsertAccount('account', 'anthropic', 'account');
+    store.upsertSnapshot('account', '5h', { ...reading(10), fetchedAt: now - 10_000 });
+    store.upsertSnapshot('account', '7d', { ...reading(10), fetchedAt: now - 10_000 });
+    store.recordUsagePollResult('anthropic', 'account', {
+      attemptedAt: Math.floor(now / 1000), status: 'http-500',
+    });
+    let decision = resolveFromSnapshots({
+      model: 'claude-sonnet-5', snapshots: snapshotsFromStore(store, 'anthropic'), store,
+    });
+    assert.equal(decision.ok, false);
+    if (!decision.ok) assert.equal(decision.error, 'UNAVAILABLE');
+    store.recordUsagePollResult('anthropic', 'account', {
+      attemptedAt: Math.floor(now / 1000) + 1,
+      status: 'ok',
+      readings: {
+        '5h': { ...reading(10), fetchedAt: now + 1_000 },
+        '7d': { ...reading(10), fetchedAt: now + 1_000 },
+      },
+    });
+    decision = resolveFromSnapshots({
+      model: 'claude-sonnet-5', snapshots: snapshotsFromStore(store, 'anthropic'), store,
+    });
+    assert.equal(decision.ok, true);
+    store.close();
+  });
+
   it('excludes inactive accounts from store-backed pool measurement', () => {
     const store = openStore(':memory:');
     seed(store, 'active', { '5h': reading(100), '7d': reading(100) });
