@@ -1,5 +1,10 @@
 import assert from 'node:assert/strict';
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
 import { describe, it } from 'node:test';
+import { resolveConfig } from '../src/config';
 
 import {
   canSkipJournal,
@@ -8,6 +13,8 @@ import {
   CSWAP_ACTIVE_ID,
   decidePiMode,
   parseConsumeStatus,
+  consumeMarkerPath,
+  readOwnerFileState,
 } from '../extensions/qlb-pi/consume';
 import {
   registerConflictProvider,
@@ -38,6 +45,29 @@ const model: ModelLike = {
 };
 
 describe('qlb-pi consume provider', () => {
+  it('matches the fail-closed mode table', () => {
+    for (const rehearsal of [undefined, '0', '1']) for (const owner of ['absent', 'valid', 'malformed'] as const) for (const journal of ['CONSUMED', 'NATIVE', 'unknown'] as const) for (const marker of [false, true]) {
+      const expected = rehearsal === '0' ? 'inert' : owner === 'malformed' || rehearsal === '1' || owner === 'valid'
+        ? journal === 'NATIVE' && owner !== 'malformed' ? 'owned' : 'conflict'
+        : journal === 'CONSUMED' ? 'consume' : marker ? 'conflict' : 'inert';
+      assert.equal(decidePiMode({ rehearsal, owner, journal, marker }), expected);
+    }
+  });
+
+  it('classifies owner files, status, and marker paths', () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-pi-'));
+    assert.equal(readOwnerFileState(join(home, 'missing')), 'absent');
+    writeFileSync(join(home, 'valid'), '{"accounts":[]}');
+    assert.equal(readOwnerFileState(join(home, 'valid')), 'valid');
+    writeFileSync(join(home, 'bad'), '{');
+    assert.equal(readOwnerFileState(join(home, 'bad')), 'malformed');
+    mkdirSync(join(home, 'dir'));
+    assert.equal(readOwnerFileState(join(home, 'dir')), 'malformed');
+    assert.equal(parseConsumeStatus(0, '{"state":"NATIVE"}'), 'NATIVE');
+    assert.equal(parseConsumeStatus(0, 'bad'), 'unknown');
+    const env = { QLB_DB_PATH: join(home, 'db', 'q.db') };
+    assert.equal(consumeMarkerPath(env, home), join(dirname(resolveConfig({ argv: [], env, home, warn: () => undefined }).dbPath), 'consume-anthropic.json'));
+  });
   it('keeps every incomplete consume transition out of the native pool', () => {
     for (const journal of ['unknown', 'NATIVE'] as const) {
       assert.equal(decidePiMode({ rehearsal: undefined, owner: 'absent', journal, marker: true }), 'conflict');

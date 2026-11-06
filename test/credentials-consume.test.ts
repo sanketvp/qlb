@@ -26,7 +26,10 @@ describe('credentials consume gating', () => {
       ['pi-openrouter', 'openrouter-default'],
     ] as const) {
       store.upsertMigration(storeName, CONSUME_STATE, '{}');
-      await assert.rejects(() => source(accountId), (err: unknown) => err instanceof Error);
+      await assert.rejects(
+        () => source(accountId),
+        (err: unknown) => err instanceof Error && err.message.includes('not yet owned'),
+      );
     }
     store.close();
     void notOwnedError;
