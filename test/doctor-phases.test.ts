@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { describe, it } from 'node:test';
@@ -417,5 +417,62 @@ describe('claude:unpersisted-token doctor check', () => {
     assert.deepEqual(claudeUnpersistedTokenCheck(fixture(), 'pre-cutover'), {
       name: 'claude:unpersisted-token', level: 'N/A', message: 'not applicable in phase=pre-cutover',
     });
+  });
+});
+
+describe('fs:stray-temps doctor check', () => {
+  it('WARNs with every published-target path in every lifecycle phase without deleting files', async () => {
+    for (const state of LIFECYCLE_STATES) {
+      const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-stray-temps-phase-'));
+      try {
+        await withTestQlbHome(home, async () => {
+          const config = defaultConfig(home);
+          const store = openStore(config.dbPath);
+          store.close();
+          const db = new DatabaseSync(config.dbPath);
+          try {
+            db.prepare('INSERT INTO lifecycle (state, began_at) VALUES (?, ?)').run(state, NOW);
+          } finally {
+            db.close();
+          }
+          const directories = [join(home, '.qlb'), join(home, '.claude'), join(home, 'Library', 'LaunchAgents')];
+          const paths = directories.map((directory, index) => {
+            mkdirSync(directory, { recursive: true });
+            const path = join(directory, `.qlb-target-${index}.999999999.aaaaaaaaaaaaaaaa.tmp`);
+            writeFileSync(path, 'not a credential');
+            const old = new Date(Date.now() - 61_000);
+            utimesSync(path, old, old);
+            return path;
+          });
+
+          const report = await doctorQlb(config, { command: () => '', hostCommand: () => '' });
+          const row = report.checks.find((check) => check.name === 'fs:stray-temps');
+          assert.equal(row?.level, 'WARN', state);
+          for (const path of paths) {
+            assert.match(row?.message ?? '', new RegExp(path.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+            assert.equal(existsSync(path), true, state);
+          }
+        });
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it('PASSes when published targets contain no qualifying temporary files', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-stray-temps-none-'));
+    try {
+      await withTestQlbHome(home, async () => {
+        const config = defaultConfig(home);
+        const store = openStore(config.dbPath);
+        store.close();
+        const report = await doctorQlb(config, { command: () => '', hostCommand: () => '' });
+        assert.deepEqual(report.checks.find((check) => check.name === 'fs:stray-temps'), {
+          name: 'fs:stray-temps', level: 'PASS', message: 'no stray temporary files found',
+        });
+      });
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 });

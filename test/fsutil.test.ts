@@ -25,6 +25,7 @@ type Fsutil = {
   atomicWriteText(path: string, text: string, options?: { mode?: number; followSymlinks?: boolean }): number;
   fsyncDirSync(dir: string): void;
   publishTarget(path: string): string;
+  listStrayTemps(dir: string, options?: { isProcessAlive?: (pid: number) => boolean }): string[];
   sweepStrayTemps(dir: string, options?: { isProcessAlive?: (pid: number) => boolean }): number;
 };
 
@@ -325,6 +326,23 @@ describe('fsutil atomic publish primitives', () => {
     assert.deepEqual(readdirSync(dir).sort(), ['.qlb-link.31415.cccccccccccccccc.tmp', '.qlb-other.31415.bbbbbbbbbbbbbbbb.tmp', 'protected.json']);
     assert.equal(lstatSync(tempSymlink).isSymbolicLink(), true);
     assert.equal(readFileSync(protectedTarget, 'utf8'), 'keep');
+  }));
+
+  it('lists exactly the temps sweep would remove without deleting them', () => withFixture((dir) => {
+    const removable = join(dir, '.qlb-config.json.31415.aaaaaaaaaaaaaaaa.tmp');
+    const live = join(dir, '.qlb-other.31416.bbbbbbbbbbbbbbbb.tmp');
+    writeFileSync(removable, 'orphan');
+    writeFileSync(live, 'live writer');
+    const old = new Date(Date.now() - 61_000);
+    utimesSync(removable, old, old);
+    utimesSync(live, old, old);
+    const options = { isProcessAlive: (pid: number) => pid === 31416 };
+
+    assert.deepEqual(fsutil.listStrayTemps(dir, options), [removable]);
+    assert.equal(readFileSync(removable, 'utf8'), 'orphan');
+    assert.equal(fsutil.sweepStrayTemps(dir, options), 1);
+    assert.equal(readFileSync(live, 'utf8'), 'live writer');
+    assert.equal(fsutil.sweepStrayTemps(dir, options), 0);
   }));
 
   it('leaves unrelated old look-alike names untouched', () => withFixture((dir) => {
