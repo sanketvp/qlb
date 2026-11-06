@@ -16,7 +16,8 @@ export interface StrayTempsCheckOptions {
 
 /** Published directories where QLB's atomic writes can leave an interrupted temp. */
 export function strayTempDirectories(home = qlbHomeDir()): string[] {
-  const backupRoot = join(home, '.qlb', 'backups', 'pi-auth', 'by-auth');
+  const backupDir = join(home, '.qlb', 'backups', 'pi-auth');
+  const backupRoot = join(backupDir, 'by-auth');
   const directories = [
     join(home, '.qlb'),
     join(home, '.qlb', 'journal'),
@@ -25,6 +26,7 @@ export function strayTempDirectories(home = qlbHomeDir()): string[] {
     join(home, 'Library', 'LaunchAgents'),
     join(home, '.codex'),
     join(home, '.pi', 'agent'),
+    backupDir,
   ];
   try {
     if (lstatSync(backupRoot).isDirectory()) {
@@ -33,7 +35,7 @@ export function strayTempDirectories(home = qlbHomeDir()): string[] {
       }
     }
   } catch {}
-  return [...new Set(directories.map((directory) => resolve(directory)))];
+  return directories;
 }
 
 /** Lists abandoned QLB atomic-write temps without reading their contents or mutating the filesystem. */

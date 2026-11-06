@@ -866,7 +866,14 @@ export async function doctorQlb(
     claudeConfigPathCheck(),
     claudeConfigFileCheck(),
     claudeLocksCheck(),
-    strayTempsCheck(),
+    strayTempsCheck({
+      directories: [
+        ...strayTempDirectories(),
+        dirname(config.codexAuthJsonPath),
+        dirname(config.piAuthJsonPath),
+        dirname(config.anthropicPoolPath),
+      ],
+    }),
     autoBreakerCheck(config.dbPath, 'anthropic', lifecycle),
     autoParkedCheck(config.dbPath, lifecycle, options.now?.() ?? Date.now()),
     autoAgentCheck(config.dbPath, lifecycle, options.now?.() ?? Date.now()),
