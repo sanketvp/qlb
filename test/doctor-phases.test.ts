@@ -363,6 +363,14 @@ describe('claude:unpersisted-token doctor check', () => {
     assert.equal(claudeUnpersistedTokenCheck(dbPath, 'cutover').level, 'PASS');
   });
 
+  it('claude:unpersisted-token retains poll evidence after a later successful poll', () => {
+    const dbPath = fixture();
+    insertSlot(dbPath, 'active');
+    recordUsage(dbPath, 'active', 'consume-consume-gate-unpersisted', Math.floor(NOW / 1000));
+    recordUsage(dbPath, 'active', 'ok', Math.floor(NOW / 1000) + 1, true);
+    assert.equal(claudeUnpersistedTokenCheck(dbPath, 'cutover').level, 'FAIL');
+  });
+
   it('claude:unpersisted-token does not recover from another slot lineage', () => {
     const dbPath = fixture();
     insertSlot(dbPath, 'lost');

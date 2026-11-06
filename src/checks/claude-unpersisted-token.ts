@@ -10,7 +10,6 @@ export default check('claude:unpersisted-token');
 
 const APPLICABLE_PHASES = new Set(['cutover', 'retired']);
 const SWITCH_REFUSAL_DETAIL = 'freshen-consume-gate-unpersisted';
-const USAGE_STATUS = 'consume-consume-gate-unpersisted';
 const AUTO_LOG_LINE = /^claude:unpersisted-token provider=anthropic account=([^\s]+) at=(\d+)$/;
 
 interface Evidence {
@@ -42,10 +41,10 @@ export function claudeUnpersistedTokenCheck(
     try {
       const switchEvidence = db.prepare(`SELECT to_account AS accountId, ts AS at
         FROM switch_log
-        WHERE provider = 'anthropic' AND outcome = 'refused' AND detail = ?`).all(SWITCH_REFUSAL_DETAIL) as Evidence[];
-      const pollEvidence = db.prepare(`SELECT account_id AS accountId, last_attempt_at * 1000 AS at
+        WHERE provider = 'anthropic' AND outcome = 'refused' AND detail = ?`).all(SWITCH_REFUSAL_DETAIL) as unknown as Evidence[];
+      const pollEvidence = db.prepare(`SELECT account_id AS accountId, unpersisted_at AS at
         FROM usage_polls
-        WHERE provider = 'anthropic' AND last_status = ?`).all(USAGE_STATUS) as Evidence[];
+        WHERE provider = 'anthropic' AND unpersisted_at IS NOT NULL`).all() as unknown as Evidence[];
       const evidence: Evidence[] = [...switchEvidence, ...pollEvidence];
 
       const autoLogPath = join(dirname(dbPath), 'auto.log');

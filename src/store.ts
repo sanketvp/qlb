@@ -424,7 +424,7 @@ const V5_SCHEMA_DDL = `
   CREATE TABLE IF NOT EXISTS codex_slots (account_id TEXT PRIMARY KEY, chatgpt_user_id TEXT NOT NULL, chatgpt_account_id TEXT NOT NULL, email TEXT, alias TEXT, fingerprint TEXT, prev_fingerprint TEXT, threshold REAL, last_refresh TEXT, dead INTEGER NOT NULL DEFAULT 0, dead_reason TEXT, dead_at INTEGER, healed_at INTEGER, pending_adopt INTEGER NOT NULL DEFAULT 0, added_at INTEGER NOT NULL, last_active_at INTEGER, source TEXT, archived_at INTEGER);
   CREATE TABLE IF NOT EXISTS active_login (provider TEXT PRIMARY KEY, account_id TEXT, since INTEGER NOT NULL, set_by TEXT NOT NULL);
   CREATE TABLE IF NOT EXISTS switch_log (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, provider TEXT NOT NULL, from_account TEXT, to_account TEXT NOT NULL, trigger TEXT NOT NULL, outcome TEXT NOT NULL, outgoing_kind TEXT, binding_json TEXT, steps_json TEXT, open_sessions_json TEXT, error TEXT, injected INTEGER NOT NULL DEFAULT 0, detail TEXT, published_at INTEGER, committed_at INTEGER);
-  CREATE TABLE IF NOT EXISTS usage_polls (provider TEXT NOT NULL, account_id TEXT NOT NULL, last_fetch_at INTEGER, last_attempt_at INTEGER, next_due_at INTEGER, poll_interval_s REAL, last_status TEXT, consecutive_failures INTEGER NOT NULL DEFAULT 0, backoff_until INTEGER, last_429_at INTEGER, held_until INTEGER, PRIMARY KEY (provider, account_id));
+  CREATE TABLE IF NOT EXISTS usage_polls (provider TEXT NOT NULL, account_id TEXT NOT NULL, last_fetch_at INTEGER, last_attempt_at INTEGER, next_due_at INTEGER, poll_interval_s REAL, last_status TEXT, consecutive_failures INTEGER NOT NULL DEFAULT 0, backoff_until INTEGER, last_429_at INTEGER, held_until INTEGER, unpersisted_at INTEGER, PRIMARY KEY (provider, account_id));
   CREATE TABLE IF NOT EXISTS relogin_events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, provider TEXT NOT NULL, account_id TEXT, kind TEXT NOT NULL, detail TEXT, evidence TEXT, user_denied_at INTEGER);
   CREATE TABLE IF NOT EXISTS health_log (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, phase TEXT NOT NULL, overall TEXT NOT NULL, failing_json TEXT NOT NULL, dead_slots_json TEXT NOT NULL, release_sha TEXT);
   CREATE TABLE IF NOT EXISTS lineage_log (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, provider TEXT NOT NULL, account_id TEXT NOT NULL, from_fp TEXT, to_fp TEXT NOT NULL, cause TEXT NOT NULL, by TEXT NOT NULL, evidence TEXT);
@@ -1498,6 +1498,9 @@ export class Store {
         ensureDecisionColumnsOn(this.db);
         this.migrateV5Schema(verifiedBackupPath);
         repairMissingV5Columns(this.db, verifiedBackupPath);
+        this.db.prepare(`UPDATE usage_polls SET unpersisted_at = last_attempt_at * 1000
+          WHERE provider = 'anthropic' AND last_status = 'consume-consume-gate-unpersisted'
+            AND unpersisted_at IS NULL`).run();
         if (!lifecycleOneOpenIndexMatches(this.db)) {
           this.db.exec('DROP INDEX IF EXISTS lifecycle_one_open');
           this.db.exec(`${LIFECYCLE_ONE_OPEN_INDEX_SQL};`);
@@ -1554,12 +1557,12 @@ export class Store {
           -- Spec §3.2 usage_polls.poll_interval_s (D-B11).
           last_fetch_at INTEGER, last_attempt_at INTEGER, next_due_at INTEGER, poll_interval_s REAL,
           last_status TEXT, consecutive_failures INTEGER NOT NULL DEFAULT 0,
-          backoff_until INTEGER, last_429_at INTEGER, held_until INTEGER,
+          backoff_until INTEGER, last_429_at INTEGER, held_until INTEGER, unpersisted_at INTEGER,
           PRIMARY KEY (provider, account_id)
         )
       `);
-      const copy = this.db.prepare(`INSERT INTO usage_polls_v5 (provider, account_id, last_fetch_at, last_attempt_at, next_due_at, poll_interval_s, last_status, consecutive_failures, backoff_until, last_429_at, held_until)
-        SELECT ?, account_id, last_fetch_at, last_attempt_at, next_due_at, ${pollIntervalValue}, last_status, consecutive_failures, backoff_until, last_429_at, held_until FROM usage_polls WHERE account_id = ?`);
+      const copy = this.db.prepare(`INSERT INTO usage_polls_v5 (provider, account_id, last_fetch_at, last_attempt_at, next_due_at, poll_interval_s, last_status, consecutive_failures, backoff_until, last_429_at, held_until, unpersisted_at)
+        SELECT ?, account_id, last_fetch_at, last_attempt_at, next_due_at, ${pollIntervalValue}, last_status, consecutive_failures, backoff_until, last_429_at, held_until, NULL FROM usage_polls WHERE account_id = ?`);
       for (const row of rows) {
         const provider = (providerFor.get(row.account_id) as { provider: string }).provider;
         copy.run(provider, row.account_id);
@@ -1879,13 +1882,17 @@ export class Store {
           .get(provider, accountId) as { consecutive_failures: number } | undefined;
         const failures = (prior?.consecutive_failures ?? 0) + 1;
         const backoffUntil = result.attemptedAt + usageFailureBackoffS(failures, result.retryAfterS, result.http429 === true);
-        this.db.prepare(`INSERT INTO usage_polls (provider, account_id, last_attempt_at, last_status, consecutive_failures, backoff_until, last_429_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?)
+        const unpersistedAt = provider === 'anthropic' && status === 'consume-consume-gate-unpersisted'
+          ? result.attemptedAt * 1000
+          : null;
+        this.db.prepare(`INSERT INTO usage_polls (provider, account_id, last_attempt_at, last_status, consecutive_failures, backoff_until, last_429_at, unpersisted_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
           ON CONFLICT(provider, account_id) DO UPDATE SET last_attempt_at = excluded.last_attempt_at,
             last_status = excluded.last_status, consecutive_failures = excluded.consecutive_failures,
             backoff_until = excluded.backoff_until,
-            last_429_at = CASE WHEN excluded.last_429_at IS NULL THEN usage_polls.last_429_at ELSE excluded.last_429_at END`)
-          .run(provider, accountId, result.attemptedAt, status, failures, backoffUntil, result.http429 ? result.attemptedAt : null);
+            last_429_at = CASE WHEN excluded.last_429_at IS NULL THEN usage_polls.last_429_at ELSE excluded.last_429_at END,
+            unpersisted_at = CASE WHEN excluded.unpersisted_at IS NULL THEN usage_polls.unpersisted_at ELSE excluded.unpersisted_at END`)
+          .run(provider, accountId, result.attemptedAt, status, failures, backoffUntil, result.http429 ? result.attemptedAt : null, unpersistedAt);
       }
     });
   }
