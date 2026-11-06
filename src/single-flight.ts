@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { BucketReading, FetchOutcome } from './types';
+import { currentProviderObservation } from './routing-authority';
 
 export type { FetchOutcome };
 import {
@@ -149,6 +150,7 @@ export async function fetchAndCache(
   const cached = store.getAllSnapshots(accountId);
   const seen = newestFetchedAt(cached);
   const result = await singleFlightFetch(accountId, seen, doFetch, { ...opts, store });
-  if (result) return result;
-  return nonempty(cached);
+  if (result) return currentProviderObservation(result);
+  const fallback = nonempty(cached);
+  return fallback ? currentProviderObservation(fallback) : null;
 }

@@ -19,6 +19,15 @@ describe('credentials consume gating', () => {
       assert.match(err.message, /not yet owned/);
       return true;
     });
+    for (const [storeName, accountId] of [
+      ['pi-xai', 'xai-default'],
+      ['pi-openai-codex', 'codex-default'],
+      ['pi-kimi-coding', 'kimi-default'],
+      ['pi-openrouter', 'openrouter-default'],
+    ] as const) {
+      store.upsertMigration(storeName, CONSUME_STATE, '{}');
+      await assert.rejects(() => source(accountId), (err: unknown) => err instanceof Error);
+    }
     store.close();
     void notOwnedError;
   });

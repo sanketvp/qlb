@@ -40,14 +40,14 @@ const model: ModelLike = {
 describe('qlb-pi consume provider', () => {
   it('keeps every incomplete consume transition out of the native pool', () => {
     for (const journal of ['unknown', 'NATIVE'] as const) {
-      assert.equal(decidePiMode({ owner: 'absent', journal, marker: true }), 'conflict');
+      assert.equal(decidePiMode({ rehearsal: undefined, owner: 'absent', journal, marker: true }), 'conflict');
     }
-    assert.equal(decidePiMode({ owner: 'valid', journal: 'CONSUMED', marker: false }), 'conflict');
-    assert.equal(decidePiMode({ owner: 'absent', journal: 'CONSUMED', marker: false }), 'consume');
-    assert.equal(canSkipJournal({ owner: 'absent', marker: false, dbExists: false }), true);
-    assert.equal(canSkipJournal({ owner: 'absent', marker: false, dbExists: true }), false);
+    assert.equal(decidePiMode({ rehearsal: undefined, owner: 'valid', journal: 'CONSUMED', marker: false }), 'conflict');
+    assert.equal(decidePiMode({ rehearsal: undefined, owner: 'absent', journal: 'CONSUMED', marker: false }), 'consume');
+    assert.equal(canSkipJournal({ rehearsal: undefined, owner: 'absent', marker: false, dbExists: false }), true);
+    assert.equal(canSkipJournal({ rehearsal: undefined, owner: 'absent', marker: false, dbExists: true }), false);
     assert.equal(parseConsumeStatus(1, '{"state":"CONSUMED"}'), 'unknown');
-    assert.equal(conflictMessage({ owner: 'absent', journal: 'unknown', marker: true }), CONSUME_ERRORS.stateUnknown);
+    assert.equal(conflictMessage({ rehearsal: undefined, owner: 'absent', journal: 'unknown', marker: true }), CONSUME_ERRORS.stateUnknown);
   });
 
   it('fails unavailable without calling the replaced provider', () => {

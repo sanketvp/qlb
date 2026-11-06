@@ -115,7 +115,6 @@ import { registerKimiCodingProvider } from "./providers/kimi-coding.js";
 import {
   registerConflictProvider,
   registerConsumeProvider,
-  type Builtin,
   type ProviderApi,
 } from "./consume-provider.js";
 

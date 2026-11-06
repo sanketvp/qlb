@@ -224,10 +224,7 @@ interface ConsumeRun {
  * `createOwnedCredentialSource` (CONSUMED → consumedAccessString → execFileSync
  * `/usr/bin/security`). Upstream answers 401 first, then 200.
  */
-async function runConsumeThroughProxy(
-  blobs: string[],
-  getConsumedAccess?: () => string,
-): Promise<ConsumeRun> {
+async function runConsumeThroughProxy(blobs: string[]): Promise<ConsumeRun> {
   secFindQueue = [...blobs];
   const store = openStore(':memory:');
   store.upsertMigration(CSWAP_ANTHROPIC_STORE, CONSUME_STATE, '{}');
@@ -252,7 +249,6 @@ async function runConsumeThroughProxy(
     getCredentialForAccount: createOwnedCredentialSource({
       store,
       keychain: refusingKeychain,
-      getConsumedAccess: getConsumedAccess ?? fakeConsumedAccess,
     }),
     upstreams: { anthropicBase: mock.url, codexBase: mock.url },
   });
