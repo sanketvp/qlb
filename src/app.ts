@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, realpathSync, unlinkSync, writeFileSync } from '
 import * as net from 'node:net';
 import { dirname, join, resolve } from 'node:path';
 import { adapters } from './adapters';
+import { createCodexAdapter } from './adapters/codex';
 import { assertTestHomeIsIsolated } from './bootstrap';
 import { CSWAP_RESTORE_PENDING, FINISH_CSWAP_RESTORE_FIRST, FINISH_RETIREMENT_FIRST, RETIREMENT_IN_PROGRESS, assertAdmitted, assertAdmittedInConnection, phase, phaseForConnection, type LifecycleOperation } from './lifecycle';
 import { createDefaultCodexGateDeps, runCodexGate } from './codex-gate';
@@ -83,6 +84,7 @@ import { formatRefresh, refreshCommand, runRefresh } from './refresh';
 import { DEFAULT_AUDIT_LIMIT, formatAudit, toAuditDecision } from './audit';
 import { DEFAULT_WHY_MODEL, explainWhy, formatWhyHuman } from './why';
 import { collectCandidates, recordObservation, safeFetch } from './candidates';
+import { probeCodexUsage } from './usage/openai-codex';
 import {
   getStore,
   isWalSidecarUnreadableError,
@@ -2308,7 +2310,9 @@ export async function main(): Promise<void> {
   }
   if (opts.cmd === 'refresh') {
     try {
-      const refreshAdapters = filterRefreshAdapters(adapters, opts.provider);
+      const refreshAdapters = opts.provider === 'openai-codex'
+        ? [createCodexAdapter({ probeUsage: probeCodexUsage, getStore })]
+        : filterRefreshAdapters(adapters, opts.provider);
       if (opts.allowProbe) {
         const store = getStore();
         const report = await runRefresh(refreshAdapters, { allowProbe: true });

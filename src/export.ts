@@ -41,13 +41,14 @@ export type CacheExportReading = {
 
 export type CacheExportSurfaceMember = {
   target: string;
-  accountId: string;
-  recordedAt: number;
+  accountId: string | null;
   readings: CacheExportReading[];
 };
 
 export type CacheExportSurface = {
   id: 'anthropic-pi-pool';
+  recordedAt: number;
+  complete: boolean;
   members: CacheExportSurfaceMember[];
 };
 
@@ -103,24 +104,28 @@ export function cacheOnlyExport(now = Date.now(), dbPath = exportDbPath()): Cach
       status: row.status,
       stale: now - row.fetched_at > STALE_OK_S * 1000,
     }));
-    const targets = db.prepare(`
-      SELECT target, slot_account_id, recorded_at
-      FROM pi_export_targets
-      WHERE provider = 'anthropic'
-      ORDER BY target
-    `).all() as Array<{ target: string; slot_account_id: string; recorded_at: number }>;
-    const surfaces: CacheExportSurface[] = targets.length === 0
-      ? []
-      : [{
-        id: 'anthropic-pi-pool',
-        members: targets.map((target) => ({
-          target: target.target,
-          accountId: target.slot_account_id,
-          recordedAt: target.recorded_at,
-          readings: readings.filter((reading) =>
-            reading.provider === 'anthropic' && reading.accountId === target.slot_account_id),
-        })),
-      }];
+    const hasInventory = Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pi_export_inventories'").get());
+    const hasMembers = Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pi_export_inventory_members'").get());
+    const inventory = hasInventory && hasMembers
+      ? db.prepare(`SELECT recorded_at, complete FROM pi_export_inventories WHERE provider = 'anthropic'`).get() as
+        | { recorded_at: number; complete: number }
+        | undefined
+      : undefined;
+    const members = inventory
+      ? db.prepare(`SELECT target, slot_account_id FROM pi_export_inventory_members
+          WHERE provider = 'anthropic' ORDER BY target`).all() as Array<{ target: string; slot_account_id: string | null }>
+      : [];
+    const surfaces: CacheExportSurface[] = inventory ? [{
+      id: 'anthropic-pi-pool',
+      recordedAt: inventory.recorded_at,
+      complete: inventory.complete !== 0,
+      members: members.map((member) => ({
+        target: member.target,
+        accountId: member.slot_account_id,
+        readings: member.slot_account_id === null ? [] : readings.filter((reading) =>
+          reading.provider === 'anthropic' && reading.accountId === member.slot_account_id),
+      })),
+    }] : [];
     return { exportedAt: now, readings, surfaces };
   } finally {
     db.close();

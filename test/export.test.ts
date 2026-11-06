@@ -51,6 +51,15 @@ function fixtureDb(): { path: string; freshAt: number; staleAt: number; poolReco
       { provider: 'anthropic', target: 'pi-a', slotAccountId: 'anthropic-a', lineageFp: 'not-exported-a', recordedAt: poolRecordedAt },
       { provider: 'anthropic', target: 'pi-b', slotAccountId: 'anthropic-b', lineageFp: 'not-exported-b', recordedAt: poolRecordedAt },
     ]);
+    store.replacePiExportInventory('anthropic', {
+      recordedAt: poolRecordedAt,
+      complete: true,
+      members: [
+        { target: 'pi-a', slotAccountId: 'anthropic-a' },
+        { target: 'pi-b', slotAccountId: 'anthropic-b' },
+        { target: 'pi-unmatched', slotAccountId: null },
+      ],
+    });
     store.upsertSnapshot('anthropic-a', 'five-hour', {
       usedPct: 12,
       remaining: 88,
@@ -81,7 +90,7 @@ describe('cache-only export', () => {
     const body = JSON.parse(result.stdout) as {
       exportedAt: number;
       readings: Array<{ bucket: string; fetchedAt: number; stale: boolean; accountId: string; provider: string; status: string }>;
-      surfaces: Array<{ id: string; members: Array<{ target: string; accountId: string; recordedAt: number; readings: unknown[] }> }>;
+      surfaces: Array<{ id: string; recordedAt: number; complete: boolean; members: Array<{ target: string; accountId: string | null; readings: unknown[] }> }>;
     };
     assert.equal(typeof body.exportedAt, 'number');
     assert.deepEqual(body.readings.map((reading) => ({
@@ -97,9 +106,12 @@ describe('cache-only export', () => {
     ]);
     assert.deepEqual(body.surfaces, [{
       id: 'anthropic-pi-pool',
+      recordedAt: fixture.poolRecordedAt,
+      complete: true,
       members: [
-        { target: 'pi-a', accountId: 'anthropic-a', recordedAt: fixture.poolRecordedAt, readings: body.readings },
-        { target: 'pi-b', accountId: 'anthropic-b', recordedAt: fixture.poolRecordedAt, readings: [] },
+        { target: 'pi-a', accountId: 'anthropic-a', readings: body.readings },
+        { target: 'pi-b', accountId: 'anthropic-b', readings: [] },
+        { target: 'pi-unmatched', accountId: null, readings: [] },
       ],
     }]);
     assert.doesNotMatch(result.stdout, /lineage/i);
@@ -111,6 +123,26 @@ describe('cache-only export', () => {
     const store = openStore(path);
     store.close();
     assert.deepEqual(cacheOnlyExport(Date.now(), path).surfaces, []);
+  });
+
+  it('preserves ordinary readings when an older database lacks inventory tables', () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-export-legacy-'));
+    const path = join(root, 'qlb.db');
+    const db = new DatabaseSync(path);
+    try {
+      db.exec(`
+        CREATE TABLE accounts (id TEXT PRIMARY KEY, provider TEXT NOT NULL, label TEXT NOT NULL, status TEXT NOT NULL);
+        CREATE TABLE snapshots (account_id TEXT NOT NULL, bucket TEXT NOT NULL, used_pct REAL, used REAL, limit_val REAL, remaining REAL, reset_at INTEGER, fetched_at INTEGER NOT NULL, source TEXT NOT NULL, confidence TEXT NOT NULL);
+      `);
+      db.prepare(`INSERT INTO accounts VALUES ('legacy-anthropic', 'anthropic', 'legacy', 'active')`).run();
+      db.prepare(`INSERT INTO snapshots VALUES ('legacy-anthropic', '5h', 25, NULL, NULL, NULL, NULL, 1700000000000, 'poll', 'authoritative')`).run();
+    } finally {
+      db.close();
+    }
+    const result = runExport(path);
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout).surfaces, []);
+    assert.equal(JSON.parse(result.stdout).readings[0].accountId, 'legacy-anthropic');
   });
 
   it('refuses a database schema newer than this build without output rows', () => {

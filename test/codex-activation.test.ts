@@ -161,6 +161,46 @@ describe('Codex S29 activation', () => {
     }
   });
 
+  it('records a provider Retry-After as a 429 backoff', async () => {
+    const store = openStore(':memory:');
+    try {
+      const adapter = createCodexAdapter({
+        readAuth: async () => JSON.stringify(document()),
+        store,
+        now: () => 1_700_000_000_000,
+        probeUsage: async () => ({ status: 429, source: 'unknown', keys: [], retryAfterS: 900 }),
+      });
+      const [snapshot] = await adapter.fetchSnapshots();
+      assert.equal(snapshot?.error, 'Codex usage probe returned no live provider reading');
+      assert.deepEqual(store.listUsagePolls('openai-codex')['fixture-user:fixture-account'], {
+        accountId: 'fixture-user:fixture-account',
+        lastFetchAt: null,
+        lastAttemptAt: 1_700_000_000,
+        nextDueAt: null,
+        pollIntervalS: null,
+        lastStatus: 'http-429',
+        consecutiveFailures: 1,
+        backoffUntil: 1_700_000_900,
+        last429At: 1_700_000_000,
+        heldUntil: null,
+      });
+    } finally {
+      store.close();
+    }
+  });
+
+  it('reports store failures without probing or mislabelling credentials', async () => {
+    let probes = 0;
+    const adapter = createCodexAdapter({
+      readAuth: async () => JSON.stringify(document()),
+      getStore: () => { throw new Error('SQLITE_BUSY'); },
+      probeUsage: async () => { probes += 1; return { status: 200, source: 'unknown', keys: [] }; },
+    });
+    const [snapshot] = await adapter.fetchSnapshots();
+    assert.equal(snapshot?.error, 'Codex usage store unavailable');
+    assert.equal(probes, 0);
+  });
+
   it('redacts Codex probe failures and retains existing snapshots', async () => {
     const store = openStore(':memory:');
     const secret = 'Bearer fixture-secret-token request-body-fixture';

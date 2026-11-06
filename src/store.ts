@@ -432,6 +432,8 @@ const V5_SCHEMA_DDL = `
   CREATE TABLE IF NOT EXISTS codex_watch (switch_id INTEGER PRIMARY KEY, provider TEXT NOT NULL, outgoing TEXT NOT NULL, target TEXT NOT NULL, next_at INTEGER NOT NULL, until INTEGER NOT NULL);
   CREATE TABLE IF NOT EXISTS import_runs (run_id TEXT PRIMARY KEY, started_at INTEGER NOT NULL, committed_at INTEGER);
   CREATE TABLE IF NOT EXISTS pi_export_targets (provider TEXT NOT NULL, target TEXT NOT NULL, slot_account_id TEXT NOT NULL, lineage_fp TEXT NOT NULL, recorded_at INTEGER NOT NULL, recorded_by TEXT NOT NULL DEFAULT 'pool-inventory', PRIMARY KEY (provider, target));
+  CREATE TABLE IF NOT EXISTS pi_export_inventories (provider TEXT PRIMARY KEY, recorded_at INTEGER NOT NULL, complete INTEGER NOT NULL);
+  CREATE TABLE IF NOT EXISTS pi_export_inventory_members (provider TEXT NOT NULL, target TEXT NOT NULL, slot_account_id TEXT, PRIMARY KEY (provider, target));
   CREATE TABLE IF NOT EXISTS codex_live_observations (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, identity TEXT, lineage_fp TEXT, by TEXT NOT NULL);
 `;
 
@@ -3245,6 +3247,22 @@ export class Store {
     });
   }
 
+  replacePiExportInventory(provider: string, inventory: {
+    recordedAt: number;
+    complete: boolean;
+    members: Array<{ target: string; slotAccountId: string | null }>;
+  }): void {
+    this.runImmediate(() => {
+      this.db.prepare('DELETE FROM pi_export_inventory_members WHERE provider = ?').run(provider);
+      this.db.prepare(`INSERT INTO pi_export_inventories (provider, recorded_at, complete) VALUES (?, ?, ?)
+        ON CONFLICT(provider) DO UPDATE SET recorded_at = excluded.recorded_at, complete = excluded.complete`)
+        .run(provider, inventory.recordedAt, inventory.complete ? 1 : 0);
+      const insert = this.db.prepare(`INSERT INTO pi_export_inventory_members (provider, target, slot_account_id)
+        VALUES (?, ?, ?)`);
+      for (const member of inventory.members) insert.run(provider, member.target, member.slotAccountId);
+    });
+  }
+
   deletePiExportTargets(provider: string, recordedBy: PiExportTargetRecordedBy): number {
     return Number(this.db.prepare('DELETE FROM pi_export_targets WHERE provider = ? AND recorded_by = ?').run(provider, recordedBy).changes);
   }
@@ -3262,7 +3280,8 @@ export class Store {
     return this.runImmediate(() => {
       const admission = admit(this.db);
       if (!admission.ok) return admission;
-      if (this.db.prepare('SELECT 1 FROM pi_export_targets WHERE provider = ? LIMIT 1').get(provider)) {
+      if (this.db.prepare('SELECT 1 FROM pi_export_targets WHERE provider = ? LIMIT 1').get(provider)
+        || this.db.prepare('SELECT 1 FROM pi_export_inventories WHERE provider = ? LIMIT 1').get(provider)) {
         return { ok: false, code: 'pi-export-targets-exist' };
       }
       const insert = this.db.prepare(`INSERT INTO pi_export_targets
@@ -3289,7 +3308,8 @@ export class Store {
       const classified = classifyInTransaction();
       const admission = admit(this.db);
       if (!admission.ok) return { ok: false, code: admission.code };
-      if (this.db.prepare('SELECT 1 FROM pi_export_targets WHERE provider = ? LIMIT 1').get(provider)) {
+      if (this.db.prepare('SELECT 1 FROM pi_export_targets WHERE provider = ? LIMIT 1').get(provider)
+        || this.db.prepare('SELECT 1 FROM pi_export_inventories WHERE provider = ? LIMIT 1').get(provider)) {
         return { ok: false, code: 'pi-export-targets-exist' };
       }
       const insert = this.db.prepare(`INSERT INTO pi_export_targets
@@ -3297,6 +3317,21 @@ export class Store {
       for (const target of classified.targets) {
         if (target.provider !== provider) throw new Error('pi export target provider mismatch');
         insert.run(target.provider, target.target, target.slotAccountId, target.lineageFp, target.recordedAt, 'pool-inventory');
+      }
+      const members = (classified as T & {
+        recordedAt?: number;
+        members?: Array<{ target: string; slotAccountId: string | null }>;
+      }).members;
+      if (members) {
+        const recordedAt = (classified as T & { recordedAt?: number }).recordedAt
+          ?? classified.targets[0]?.recordedAt
+          ?? Date.now();
+        this.db.prepare(`INSERT INTO pi_export_inventories (provider, recorded_at, complete) VALUES (?, ?, 1)
+          ON CONFLICT(provider) DO UPDATE SET recorded_at = excluded.recorded_at, complete = excluded.complete`)
+          .run(provider, recordedAt);
+        const insertMember = this.db.prepare(`INSERT INTO pi_export_inventory_members (provider, target, slot_account_id)
+          VALUES (?, ?, ?)`);
+        for (const member of members) insertMember.run(provider, member.target, member.slotAccountId);
       }
       return { ok: true, result: classified };
     });

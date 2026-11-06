@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
@@ -535,12 +535,73 @@ function runCli(
 }
 
 describe('qlb refresh observation recording', () => {
+  it('does not probe Codex during an unscoped refresh', () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-refresh-codex-unscoped-'));
+    const pluginsDir = join(root, 'plugins');
+    const fetchLog = join(root, 'fetch-called');
+    mkdirSync(pluginsDir);
+    writeFileSync(join(pluginsDir, 'fetch-hook.js'), `
+      const fs = require('node:fs');
+      globalThis.fetch = async () => { fs.writeFileSync(${JSON.stringify(fetchLog)}, 'called'); throw new Error('unexpected fetch'); };
+      module.exports = { id: 'test-fetch-hook', displayName: 'Fetch hook', async fetchSnapshots() { return []; } };
+    `);
+    const claims = Buffer.from(JSON.stringify({
+      'https://api.openai.com/auth': { chatgpt_user_id: 'fixture-user', chatgpt_account_id: 'fixture-account' },
+    })).toString('base64url');
+    const authPath = join(root, 'auth.json');
+    writeFileSync(authPath, JSON.stringify({
+      tokens: { id_token: `header.${claims}.signature`, access_token: 'fixture-access', account_id: 'fixture-account' },
+    }));
+    const result = runCli(['refresh', '--allow-probe', '--json'], {
+      ...isolatedEnv(root, join(root, 'qlb.db'), pluginsDir), QLB_CODEX_AUTH_JSON_PATH: authPath,
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const codex = (JSON.parse(result.stdout) as { results: Array<{ provider: string; status: string }> }).results
+      .find((entry) => entry.provider === 'openai-codex');
+    assert.equal(codex?.status, 'no-probe');
+    assert.equal(existsSync(fetchLog), false);
+  });
+
   it('accepts a scoped Codex refresh without probing until --allow-probe is supplied', () => {
     const root = mkdtempSync(join(tmpdir(), 'qlb-refresh-codex-provider-'));
     const result = runCli(['refresh', '--provider', 'openai-codex', '--json'],
       isolatedEnv(root, join(root, 'qlb.db'), join(root, 'plugins')));
     assert.equal(result.status, 0, result.stderr);
     assert.deepEqual(JSON.parse(result.stdout), { probed: false, results: [] });
+  });
+
+  it('probes and exports Codex only for an authorized scoped refresh', () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-refresh-codex-scoped-'));
+    const pluginsDir = join(root, 'plugins');
+    mkdirSync(pluginsDir);
+    writeFileSync(join(pluginsDir, 'fetch-hook.js'), `
+      globalThis.fetch = async () => new Response(JSON.stringify({
+        primary: { used_percent: 12, window_minutes: 300 },
+        secondary: { used_percent: 34, window_minutes: 10080 }
+      }), { status: 200 });
+      module.exports = { id: 'test-fetch-hook', displayName: 'Fetch hook', async fetchSnapshots() { return []; } };
+    `);
+    const claims = Buffer.from(JSON.stringify({
+      'https://api.openai.com/auth': { chatgpt_user_id: 'fixture-user', chatgpt_account_id: 'fixture-account' },
+    })).toString('base64url');
+    const authPath = join(root, 'auth.json');
+    writeFileSync(authPath, JSON.stringify({
+      tokens: { id_token: `header.${claims}.signature`, access_token: 'fixture-access', account_id: 'fixture-account' },
+    }));
+    const dbPath = join(root, 'qlb.db');
+    const result = runCli(['refresh', '--provider', 'openai-codex', '--allow-probe', '--json'], {
+      ...isolatedEnv(root, dbPath, pluginsDir), QLB_CODEX_AUTH_JSON_PATH: authPath,
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const report = JSON.parse(result.stdout) as { results: Array<{ provider: string; status: string }> };
+    assert.deepEqual(report.results.map(({ provider, status }) => ({ provider, status })), [{ provider: 'openai-codex', status: 'ok' }]);
+    const readings = cacheOnlyExport(Date.now(), dbPath).readings
+      .filter((reading) => reading.provider === 'openai-codex')
+      .map(({ bucket, usedPct, stale }) => ({ bucket, usedPct, stale }));
+    assert.deepEqual(readings, [
+      { bucket: 'primary', usedPct: 12, stale: false },
+      { bucket: 'secondary', usedPct: 34, stale: false },
+    ]);
   });
 
   it('refuses provider-scoped refreshes other than Kimi or Codex', () => {
@@ -589,6 +650,47 @@ describe('qlb refresh observation recording', () => {
     assert.deepEqual(readings.map((reading) => ({ bucket: reading.bucket, fetchedAt: reading.fetchedAt, stale: reading.stale })), [
       { bucket: '5h', fetchedAt: staleAt, stale: true },
       { bucket: 'weekly', fetchedAt: staleAt, stale: true },
+    ]);
+  });
+
+  it('Kimi scoped refresh replaces stale 5h and weekly rows for cache-only export', () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-refresh-kimi-success-'));
+    const pluginsDir = join(root, 'plugins');
+    mkdirSync(pluginsDir);
+    writeFileSync(join(pluginsDir, 'fetch-hook.js'), `
+      globalThis.fetch = async () => new Response(JSON.stringify({
+        user: { userId: 'kimi-default', membership: { level: 'pro' } },
+        usage: { limit: '100', used: '35', remaining: '65' },
+        limits: [{ window: { duration: 5, timeUnit: 'TIME_UNIT_HOUR' }, detail: { limit: '20', used: '4', remaining: '16' } }]
+      }), { status: 200 });
+      module.exports = { id: 'test-fetch-hook', displayName: 'Fetch hook', async fetchSnapshots() { return []; } };
+    `);
+    const dbPath = join(root, 'qlb.db');
+    const staleAt = Date.now() - 301_000;
+    const store = openStore(dbPath);
+    try {
+      store.upsertAccount('kimi-default', 'kimi-coding', 'Kimi K3');
+      for (const bucket of ['5h', 'weekly']) {
+        store.upsertSnapshot('kimi-default', bucket, {
+          usedPct: 99, fetchedAt: staleAt, source: 'poll', confidence: 'authoritative',
+        });
+      }
+    } finally {
+      store.close();
+    }
+    const keyFile = join(root, 'kimi.md');
+    writeFileSync(keyFile, 'sk-kimi-TESTKEY123');
+    const env = { ...isolatedEnv(root, dbPath, pluginsDir), QLB_KIMI_CREDENTIALS_FILE: keyFile };
+
+    const result = runCli(['refresh', '--provider', 'kimi-coding', '--allow-probe', '--json'], env);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal((JSON.parse(result.stdout) as { results: Array<{ status: string }> }).results[0]?.status, 'ok');
+    const readings = cacheOnlyExport(Date.now(), dbPath).readings
+      .filter((reading) => reading.provider === 'kimi-coding')
+      .map(({ bucket, usedPct, stale }) => ({ bucket, usedPct, stale }));
+    assert.deepEqual(readings, [
+      { bucket: '5h', usedPct: 20, stale: false },
+      { bucket: 'weekly', usedPct: 35, stale: false },
     ]);
   });
 

@@ -12,6 +12,7 @@ export const CODEX_USAGE_FALLBACK_URL = 'https://chatgpt.com/backend-api/api/cod
 /** Bound passive fallback work when Codex has accumulated a large session history. */
 export const MAX_ROLLOUT_FILES = 50;
 const MAX_ROLLOUT_LINE_BYTES = 1024 * 1024;
+const USAGE_REQUEST_TIMEOUT_MS = 10_000;
 
 export type CodexUsageSource = 'wham' | 'codex-api' | 'codex-rollout' | 'unknown';
 
@@ -87,7 +88,11 @@ async function attemptUsage(
 ): Promise<Attempt> {
   try {
     const request = buildUsageRequest(accessToken, activeAccountId);
-    const response = await fetchFn(url, { method: request.method, headers: request.headers });
+    const response = await fetchFn(url, {
+      method: request.method,
+      headers: request.headers,
+      signal: AbortSignal.timeout(USAGE_REQUEST_TIMEOUT_MS),
+    });
     const body = await response.text();
     return { status: response.status, keys: objectKeys(body), parsed: parseUsage(response.status, body, response.headers) };
   } catch {

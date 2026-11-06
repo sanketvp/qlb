@@ -41,8 +41,10 @@ export interface PoolInventoryEntryReport {
 }
 
 export interface PoolInventoryResult {
+  recordedAt: number;
   entries: PoolInventoryEntryReport[];
   targets: PiExportTarget[];
+  members: Array<{ target: string; slotAccountId: string | null }>;
 }
 
 /** Typed, redaction-safe failures at this credential-classification boundary. */
@@ -56,6 +58,11 @@ export class PoolInventoryError extends Error {
 /** The small persistence boundary makes every test effect injectable. */
 export interface PoolInventoryStore {
   replacePiExportTargets(provider: string, targets: PiExportTarget[]): void;
+  replacePiExportInventory?(provider: string, inventory: {
+    recordedAt: number;
+    complete: boolean;
+    members: Array<{ target: string; slotAccountId: string | null }>;
+  }): void;
 }
 
 function fail(code: string): never {
@@ -121,6 +128,7 @@ export function classify(
 
   const reports: PoolInventoryEntryReport[] = [];
   const targets: PiExportTarget[] = [];
+  const members: Array<{ target: string; slotAccountId: string | null }> = [];
   const slotTargets = new Map<string, string>();
   for (const [target, value] of targetEntries) {
     // A pool target can hold several generations of one slot's chain (its
@@ -137,6 +145,7 @@ export function classify(
       lineageShared: source !== undefined,
       expiresInMs: value.expiresAt == null ? null : Math.max(0, value.expiresAt - now),
     });
+    members.push({ target, slotAccountId: source?.slotAccountId ?? null });
     if (source) {
       const priorTarget = slotTargets.get(source.slotAccountId);
       if (priorTarget !== undefined && priorTarget !== target) fail('slot-maps-to-multiple-targets');
@@ -147,7 +156,7 @@ export function classify(
       });
     }
   }
-  return { entries: reports, targets };
+  return { recordedAt: now, entries: reports, targets, members };
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -305,8 +314,14 @@ export function recordPoolInventoryForPiMigrate(options: {
   store: PoolInventoryStore;
   now?: () => number;
 }): PoolInventoryResult {
-  const result = classify(options.entries, options.lineages, options.now?.() ?? Date.now());
+  const recordedAt = options.now?.() ?? Date.now();
+  const result = classify(options.entries, options.lineages, recordedAt);
   options.store.replacePiExportTargets('anthropic', result.targets);
+  options.store.replacePiExportInventory?.('anthropic', {
+    recordedAt: result.recordedAt,
+    complete: true,
+    members: result.members,
+  });
   return result;
 }
 

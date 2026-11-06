@@ -1,13 +1,14 @@
 import { readFile } from 'node:fs/promises';
 import { config } from '../config';
 import { codexIdentity, type CodexAuthDocument } from '../codex-auth';
-import { getStore, type Store } from '../store';
-import { probeCodexUsage, type CodexUsageProbeDeps, type CodexUsageProbeResult } from '../usage/openai-codex';
+import type { Store } from '../store';
+import type { CodexUsageProbeDeps, CodexUsageProbeResult } from '../usage/openai-codex';
 import type { Adapter, BucketReading } from '../types';
 
 const PROVIDER = 'openai-codex';
 const AUTH_PATH = config.codexAuthJsonPath;
 const INVALID_CREDENTIALS_ERROR = `no valid Codex credentials found in ${AUTH_PATH}`;
+const STORE_ERROR = 'Codex usage store unavailable';
 
 type JsonObject = Record<string, unknown>;
 
@@ -114,26 +115,49 @@ export function createCodexAdapter(deps: CodexAdapterDeps = {}): Adapter {
           }];
         }
         const label = stringClaim(payload, 'email') ?? accountId;
-        const store = deps.store ?? deps.getStore?.();
-        if (!deps.probeUsage || !store) {
+        if (!deps.probeUsage) {
           return [{ accountId, provider: PROVIDER, label, buckets: {} }];
         }
 
-        const attemptedAt = Math.floor(now() / 1_000);
-        store.upsertAccount(accountId, PROVIDER, label);
+        let store: CodexStore | undefined;
         try {
-          const result = await deps.probeUsage({ auth: auth as CodexAuthDocument, authPath });
-          const buckets = readingsFrom(result, now());
-          if (Object.keys(buckets).length === 0) {
-            store.recordUsagePollResult(PROVIDER, accountId, { attemptedAt, status: 'usage-unknown' });
-            return [{ accountId, provider: PROVIDER, label, buckets: {}, error: 'Codex usage probe returned no live provider reading' }];
-          }
-          store.recordUsagePollResult(PROVIDER, accountId, { attemptedAt, status: 'ok', readings: buckets });
-          return [{ accountId, provider: PROVIDER, label, buckets }];
+          store = deps.store ?? deps.getStore?.();
+          if (!store) throw new Error('store unavailable');
+          store.upsertAccount(accountId, PROVIDER, label);
         } catch {
-          store.recordUsagePollResult(PROVIDER, accountId, { attemptedAt, status: 'usage-unknown' });
+          return [{ accountId, provider: PROVIDER, label, buckets: {}, error: STORE_ERROR }];
+        }
+
+        const attemptedAt = Math.floor(now() / 1_000);
+        let result: CodexUsageProbeResult;
+        try {
+          result = await deps.probeUsage({ auth: auth as CodexAuthDocument, authPath });
+        } catch {
+          try {
+            store.recordUsagePollResult(PROVIDER, accountId, { attemptedAt, status: 'usage-unknown' });
+          } catch {
+            return [{ accountId, provider: PROVIDER, label, buckets: {}, error: STORE_ERROR }];
+          }
           return [{ accountId, provider: PROVIDER, label, buckets: {}, error: 'Codex usage probe failed' }];
         }
+        const buckets = readingsFrom(result, now());
+        try {
+          if (result.status === 429) {
+            store.recordUsagePollResult(PROVIDER, accountId, {
+              attemptedAt, status: 'http-429', http429: true, retryAfterS: result.retryAfterS,
+            });
+          } else if (Object.keys(buckets).length === 0) {
+            store.recordUsagePollResult(PROVIDER, accountId, { attemptedAt, status: 'usage-unknown' });
+          } else {
+            store.recordUsagePollResult(PROVIDER, accountId, { attemptedAt, status: 'ok', readings: buckets });
+          }
+        } catch {
+          return [{ accountId, provider: PROVIDER, label, buckets: {}, error: STORE_ERROR }];
+        }
+        if (Object.keys(buckets).length === 0) {
+          return [{ accountId, provider: PROVIDER, label, buckets: {}, error: 'Codex usage probe returned no live provider reading' }];
+        }
+        return [{ accountId, provider: PROVIDER, label, buckets }];
       } catch {
         return [{
           accountId: 'codex-default',
@@ -147,4 +171,4 @@ export function createCodexAdapter(deps: CodexAdapterDeps = {}): Adapter {
   };
 }
 
-export const codexAdapter = createCodexAdapter({ probeUsage: probeCodexUsage, getStore });
+export const codexAdapter = createCodexAdapter();
